@@ -1,0 +1,17 @@
+// Hash the official test-vector input at a given length and print the hex,
+// for `scripts/blake3test.sh` to compare against the reference.
+//
+// The input is the one the specification uses: byte `i` is `i % 251`, which
+// is prime so the pattern does not line up with any block or chunk boundary.
+import blake3
+
+fn main() / {io} {
+    let n = (args().get(0) ?? "0").parse_int() ?? 0
+    var data = bytes_filled(n, 0)
+    var i = 0
+    while i < n {
+        data.set(i, i % 251)
+        i = i + 1
+    }
+    print(blake3.hex(data))
+}

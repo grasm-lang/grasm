@@ -1,0 +1,8 @@
+[package]
+name = "blake3_demo"
+version = "1.0.0"
+capabilities = ["io"]
+
+[dependencies.blake3]
+path = "../blake3"
+version = "^1.0.0"

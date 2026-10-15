@@ -1,0 +1,6 @@
+[package]
+name = "blake3"
+version = "1.0.0"
+
+# Hashes bytes. Reaches nothing.
+capabilities = []

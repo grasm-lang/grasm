@@ -1,0 +1,394 @@
+// BLAKE3: a Merkle tree over BLAKE2s's mixing function.
+//
+// The repository had blake2b, blake2s, sha1, sha3 and sha512 and not this
+// one, which is the hash written since: a binary tree over 1 KiB chunks, so
+// the work parallelises and a subtree can be verified without the whole
+// input.
+//
+// ## One integer width
+//
+// BLAKE3 is 32-bit arithmetic and Grasm has one integer type, `i64`
+// ([T-INT-ALIAS]). So every add is masked back to 32 bits and every rotation
+// is written out of a shift pair -- `add32` and `rotr32` below, and nothing
+// else in this file may use `+` on a state word. That is the whole cost of
+// the missing width here, and it is a real cost: the mask is an instruction
+// per add that a `u32` would not need.
+//
+// ## Checked against the reference
+//
+// `scripts/blake3test.sh` hashes the official test-vector lengths and
+// compares against the BLAKE3 reference implementation, including the lengths
+// where the tree shape changes -- 1024, 1025, 2049 and 3072, which are one
+// chunk, two chunks with a one-byte right leg, and the first inputs whose
+// tree is not balanced. A hash that is right on short inputs and wrong on
+// those is a hash that passes a careless test.
+//
+// **One line here is not covered and cannot be.** The chunk counter is 64
+// bits and `compress` splits it into two words; the high word is zero until
+// the input passes 2^32 chunks, which is four tebibytes. Replacing it with a
+// literal zero leaves every vector in the gate passing. It is written
+// correctly because the specification says so, not because a test proves it,
+// and saying that is better than a gate that implies otherwise.
+
+/// 2^32 - 1. Every state word is kept inside this.
+pub fn mask32() -> i64 {
+    4294967295
+}
+
+/// The SHA-256 initialisation vector, which BLAKE3 reuses.
+pub fn iv() -> [i64] {
+    [
+        1779033703, 3144134277, 1013904242, 2773480762,
+        1359893119, 2600822924, 528734635, 1541459225,
+    ]
+}
+
+/// The message word order for each round after the first.
+pub fn permutation() -> [i64] {
+    [2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8]
+}
+
+pub fn flag_chunk_start() -> i64 {
+    1
+}
+
+pub fn flag_chunk_end() -> i64 {
+    2
+}
+
+pub fn flag_parent() -> i64 {
+    4
+}
+
+pub fn flag_root() -> i64 {
+    8
+}
+
+/// Bytes in a chunk, which is where the tree's leaves are.
+pub fn chunk_len() -> i64 {
+    1024
+}
+
+pub fn block_len() -> i64 {
+    64
+}
+
+/// Addition in 32 bits.
+pub fn add32(a: i64, b: i64) -> i64 {
+    (a + b).bit_and(mask32())
+}
+
+/// Rotation right in 32 bits, written out of two shifts because there is no
+/// 32-bit word to rotate.
+pub fn rotr32(x: i64, n: i64) -> i64 {
+    x.bit_and(mask32()).shr(n).bit_or(x.shl(32 - n).bit_and(mask32()))
+}
+
+/// BLAKE3's G: the quarter-round, over four of the sixteen state words.
+fn g(inout s: [i64], a: i64, b: i64, c: i64, d: i64, mx: i64, my: i64) {
+    s[a] = add32(add32(s.get(a).unwrap_or(0), s.get(b).unwrap_or(0)), mx)
+    s[d] = rotr32(s.get(d).unwrap_or(0).bit_xor(s.get(a).unwrap_or(0)), 16)
+    s[c] = add32(s.get(c).unwrap_or(0), s.get(d).unwrap_or(0))
+    s[b] = rotr32(s.get(b).unwrap_or(0).bit_xor(s.get(c).unwrap_or(0)), 12)
+    s[a] = add32(add32(s.get(a).unwrap_or(0), s.get(b).unwrap_or(0)), my)
+    s[d] = rotr32(s.get(d).unwrap_or(0).bit_xor(s.get(a).unwrap_or(0)), 8)
+    s[c] = add32(s.get(c).unwrap_or(0), s.get(d).unwrap_or(0))
+    s[b] = rotr32(s.get(b).unwrap_or(0).bit_xor(s.get(c).unwrap_or(0)), 7)
+}
+
+/// One round: four columns, then four diagonals.
+fn round(inout s: [i64], m: [i64]) {
+    g(s, 0, 4, 8, 12, m.get(0).unwrap_or(0), m.get(1).unwrap_or(0))
+    g(s, 1, 5, 9, 13, m.get(2).unwrap_or(0), m.get(3).unwrap_or(0))
+    g(s, 2, 6, 10, 14, m.get(4).unwrap_or(0), m.get(5).unwrap_or(0))
+    g(s, 3, 7, 11, 15, m.get(6).unwrap_or(0), m.get(7).unwrap_or(0))
+    g(s, 0, 5, 10, 15, m.get(8).unwrap_or(0), m.get(9).unwrap_or(0))
+    g(s, 1, 6, 11, 12, m.get(10).unwrap_or(0), m.get(11).unwrap_or(0))
+    g(s, 2, 7, 8, 13, m.get(12).unwrap_or(0), m.get(13).unwrap_or(0))
+    g(s, 3, 4, 9, 14, m.get(14).unwrap_or(0), m.get(15).unwrap_or(0))
+}
+
+fn permute(m: [i64]) -> [i64] {
+    let p = permutation()
+    var out: [i64] = []
+    var i = 0
+    while i < 16 {
+        out.push(m.get(p.get(i).unwrap_or(0)).unwrap_or(0))
+        i = i + 1
+    }
+    out
+}
+
+/// The compression function: seven rounds, then the feed-forward.
+///
+/// Returns all sixteen words. The first eight are a chaining value; the full
+/// sixteen are the root output, which is why this does not truncate.
+pub fn compress(cv: [i64], block: [i64], counter: i64, len: i64, flags: i64) -> [i64] {
+    var s: [i64] = []
+    var i = 0
+    while i < 8 {
+        s.push(cv.get(i).unwrap_or(0))
+        i = i + 1
+    }
+    let ivv = iv()
+    s.push(ivv.get(0).unwrap_or(0))
+    s.push(ivv.get(1).unwrap_or(0))
+    s.push(ivv.get(2).unwrap_or(0))
+    s.push(ivv.get(3).unwrap_or(0))
+    // The counter is 64 bits, split low word first.
+    s.push(counter.bit_and(mask32()))
+    s.push(counter.shr(32).bit_and(mask32()))
+    s.push(len)
+    s.push(flags)
+
+    var m = block
+    var r = 0
+    while r < 7 {
+        round(s, m)
+        if r < 6 {
+            m = permute(m)
+        }
+        r = r + 1
+    }
+    // Feed-forward: the first half takes the second, the second takes the
+    // chaining value.
+    var out: [i64] = []
+    var k = 0
+    while k < 8 {
+        out.push(s.get(k).unwrap_or(0).bit_xor(s.get(k + 8).unwrap_or(0)))
+        k = k + 1
+    }
+    k = 0
+    while k < 8 {
+        out.push(s.get(k + 8).unwrap_or(0).bit_xor(cv.get(k).unwrap_or(0)))
+        k = k + 1
+    }
+    out
+}
+
+/// Sixteen little-endian words from 64 bytes, zero-padded.
+fn words_at(data: bytes, at: i64, len: i64) -> [i64] {
+    var m: [i64] = []
+    var i = 0
+    while i < 16 {
+        var w = 0
+        var b = 3
+        while b >= 0 {
+            let p = at + i * 4 + b
+            let v = if p < at + len and p < data.len() { data.at(p) } else { 0 }
+            w = w.shl(8).bit_or(v)
+            b = b - 1
+        }
+        m.push(w)
+        i = i + 1
+    }
+    m
+}
+
+/// The chaining value of one chunk: up to sixteen blocks, the first flagged
+/// `CHUNK_START` and the last `CHUNK_END`.
+fn chunk_cv(data: bytes, at: i64, len: i64, counter: i64, flags: i64) -> [i64] {
+    var cv = iv()
+    var done = 0
+    var first = true
+    while done < len or (len == 0 and first) {
+        var take = len - done
+        if take > block_len() {
+            take = block_len()
+        }
+        var f = flags
+        if first {
+            f = f.bit_or(flag_chunk_start())
+        }
+        if done + take >= len {
+            f = f.bit_or(flag_chunk_end())
+        }
+        let m = words_at(data, at + done, take)
+        let full = compress(cv, m, counter, take, f)
+        var next: [i64] = []
+        var i = 0
+        while i < 8 {
+            next.push(full.get(i).unwrap_or(0))
+            i = i + 1
+        }
+        cv = next
+        done = done + take
+        first = false
+        if take == 0 {
+            done = len + 1
+        }
+    }
+    cv
+}
+
+/// Two chaining values into one, as a parent node.
+fn parent_words(left: [i64], right: [i64]) -> [i64] {
+    var m: [i64] = []
+    for w in left {
+        m.push(w)
+    }
+    for w in right {
+        m.push(w)
+    }
+    m
+}
+
+/// The largest power of two, in chunks, strictly inside `chunks`.
+///
+/// BLAKE3's tree is not balanced for an input that is not a power of two
+/// chunks: the left subtree takes the largest power of two below the total,
+/// and the right takes the rest. Getting this wrong gives a hash that is
+/// correct for 1 and 2 chunks and wrong for 3.
+pub fn left_chunks(chunks: i64) -> i64 {
+    var n = 1
+    while n * 2 < chunks {
+        n = n * 2
+    }
+    n
+}
+
+/// The chaining value of a range of the input.
+fn range_cv(data: bytes, at: i64, len: i64, counter: i64, flags: i64) -> [i64] {
+    if len <= chunk_len() {
+        return chunk_cv(data, at, len, counter, flags)
+    }
+    let chunks = (len + chunk_len() - 1) / chunk_len()
+    let lchunks = left_chunks(chunks)
+    let llen = lchunks * chunk_len()
+    let left = range_cv(data, at, llen, counter, 0)
+    let right = range_cv(data, at + llen, len - llen, counter + lchunks, 0)
+    let full = compress(iv(), parent_words(left, right), 0, block_len(),
+        flags.bit_or(flag_parent()))
+    var out: [i64] = []
+    var i = 0
+    while i < 8 {
+        out.push(full.get(i).unwrap_or(0))
+        i = i + 1
+    }
+    out
+}
+
+/// The sixteen words of the root node, before truncation.
+fn root_words(data: bytes) -> [i64] {
+    let len = data.len()
+    if len <= chunk_len() {
+        // A single chunk is its own root, so the last block carries ROOT.
+        return root_of_chunk(data, len)
+    }
+    let chunks = (len + chunk_len() - 1) / chunk_len()
+    let lchunks = left_chunks(chunks)
+    let llen = lchunks * chunk_len()
+    let left = range_cv(data, 0, llen, 0, 0)
+    let right = range_cv(data, llen, len - llen, lchunks, 0)
+    compress(iv(), parent_words(left, right), 0, block_len(),
+        flag_parent().bit_or(flag_root()))
+}
+
+/// A one-chunk input, where ROOT lands on the chunk's last block.
+fn root_of_chunk(data: bytes, len: i64) -> [i64] {
+    var cv = iv()
+    var done = 0
+    var first = true
+    var out = compress(cv, words_at(data, 0, 0), 0, 0,
+        flag_chunk_start().bit_or(flag_chunk_end()).bit_or(flag_root()))
+    while done < len {
+        var take = len - done
+        if take > block_len() {
+            take = block_len()
+        }
+        var f = 0
+        if first {
+            f = f.bit_or(flag_chunk_start())
+        }
+        let last = done + take >= len
+        if last {
+            f = f.bit_or(flag_chunk_end()).bit_or(flag_root())
+        }
+        let full = compress(cv, words_at(data, done, take), 0, take, f)
+        if last {
+            out = full
+        }
+        var next: [i64] = []
+        var i = 0
+        while i < 8 {
+            next.push(full.get(i).unwrap_or(0))
+            i = i + 1
+        }
+        cv = next
+        done = done + take
+        first = false
+    }
+    out
+}
+
+/// The 32-byte digest.
+pub fn hash(data: bytes) -> bytes {
+    let w = root_words(data)
+    var out: [i64] = []
+    var i = 0
+    while i < 8 {
+        let v = w.get(i).unwrap_or(0)
+        out.push(v.bit_and(255))
+        out.push(v.shr(8).bit_and(255))
+        out.push(v.shr(16).bit_and(255))
+        out.push(v.shr(24).bit_and(255))
+        i = i + 1
+    }
+    bytes_of(out)
+}
+
+/// The digest as lowercase hex, which is how a BLAKE3 hash is written down.
+pub fn hex(data: bytes) -> str {
+    let digits = "0123456789abcdef"
+    let cs = digits.chars()
+    var out: [str] = []
+    for b in hash(data).to_list() {
+        out.push(cs.get(b.shr(4)).unwrap_or("0"))
+        out.push(cs.get(b.bit_and(15)).unwrap_or("0"))
+    }
+    out.join("")
+}
+
+test "32-bit addition wraps rather than growing" {
+    assert_eq(add32(mask32(), 1), 0)
+    assert_eq(add32(mask32(), 2), 1)
+    assert_eq(add32(1, 2), 3)
+    // The point of the mask: `i64` would have carried on past 2^32.
+    assert_eq(add32(4000000000, 4000000000), 3705032704)
+}
+
+test "rotation right is a rotation, not a shift" {
+    assert_eq(rotr32(1, 1), 2147483648)
+    assert_eq(rotr32(2, 1), 1)
+    assert_eq(rotr32(mask32(), 7), mask32())
+    // Rotating a full turn in pieces returns the value.
+    assert_eq(rotr32(rotr32(305419896, 16), 16), 305419896)
+}
+
+test "the left subtree takes the largest power of two inside the total" {
+    assert_eq(left_chunks(2), 1)
+    assert_eq(left_chunks(3), 2)
+    assert_eq(left_chunks(4), 2)
+    assert_eq(left_chunks(5), 4)
+    assert_eq(left_chunks(8), 4)
+    assert_eq(left_chunks(9), 8)
+}
+
+test "the empty input hashes to the published value" {
+    assert_eq(
+        hex(bytes_of([])),
+        "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262",
+    )
+}
+
+test "a one-byte input hashes to the published value" {
+    assert_eq(
+        hex(bytes_of([0])),
+        "2d3adedff11b61f14c886e35afa036736dcd87a74d27b5c1510225d0f592e213",
+    )
+}
+
+test "the digest is thirty-two bytes and its hex is sixty-four characters" {
+    assert_eq(hash(bytes_of([1, 2, 3])).len(), 32)
+    assert_eq(hex(bytes_of([1, 2, 3])).len(), 64)
+}
