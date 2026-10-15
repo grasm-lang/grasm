@@ -25,8 +25,8 @@ fn contract_clause(text: str) -> bool {
         if text.starts_with(kw) {
             let rest = text.substr(kw.len(), text.len() - kw.len()).trim_start()
             let assign = (rest.starts_with("=") and not rest.starts_with("==")) or
-                rest.starts_with("+=") or rest.starts_with("-=") or
-                rest.starts_with("*=") or rest.starts_with("/=")
+            rest.starts_with("+=") or rest.starts_with("-=") or
+            rest.starts_with("*=") or rest.starts_with("/=")
             if not assign {
                 return true
             }
