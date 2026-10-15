@@ -1,0 +1,7 @@
+[package]
+name = "jpeg"
+version = "1.0.0"
+
+# Decodes pixels. Reads no files and reaches nothing: the caller hands over
+# the bytes.
+capabilities = []

@@ -1,0 +1,19 @@
+// Decode a JPEG and write the samples out, for `scripts/jpegtest.sh` to
+// compare against a reference decoder.
+import jpeg
+
+fn main() -> () ! JpegPixelError / {io} {
+    let a = args()
+    let src = a.get(0) ?? ""
+    let dst = a.get(1) ?? ""
+    match read_bytes(src) {
+        Err(_e) -> print("could not read {src}")
+        Ok(data) -> {
+            let img = try jpeg.decode(data)
+            match write_bytes(dst, img.pixels) {
+                Err(_e) -> print("could not write {dst}")
+                Ok(_) -> print("{img.width} {img.height} {img.comps}")
+            }
+        }
+    }
+}

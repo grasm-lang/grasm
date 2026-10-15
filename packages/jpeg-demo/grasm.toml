@@ -1,0 +1,8 @@
+[package]
+name = "jpeg_demo"
+version = "1.0.0"
+capabilities = ["io"]
+
+[dependencies.jpeg]
+path = "../jpeg"
+version = "^1.0.0"

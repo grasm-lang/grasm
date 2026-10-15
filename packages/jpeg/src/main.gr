@@ -1,0 +1,846 @@
+// Baseline JPEG decode, to pixels.
+//
+// `jpegmeta` reads the headers of a JPEG and stops there, which was the
+// biggest single hole in this library set: a format every camera writes, and
+// nothing here could get the pixels out of one.
+//
+// Baseline sequential DCT, Huffman-coded, 8-bit, which is what `cjpeg`,
+// every phone and every browser produce by default. Progressive and
+// arithmetic-coded files are refused by name rather than decoded wrongly --
+// see `jpegmeta.is_progressive`.
+//
+// The planes are `bytes` rather than `[i64]`: a 24-megapixel YCbCr image is
+// three planes of one byte a sample, and at eight bytes a sample the same
+// decode would need 576 MB of them ([L-LIB-BYTES-WRITE]).
+//
+// Checked against libjpeg-turbo through `scripts/jpegtest.sh`, which decodes
+// the same files with a reference decoder and compares every channel of every
+// pixel. An IDCT is allowed to differ by a little -- the specification does
+// not fix one -- and the gate states the tolerance it holds rather than
+// asserting equality it cannot have.
+
+/// Zigzag position to natural position in an 8x8 block.
+pub fn zigzag() -> [i64] {
+    [
+        0, 1, 8, 16, 9, 2, 3, 10,
+        17, 24, 32, 25, 18, 11, 4, 5,
+        12, 19, 26, 33, 40, 48, 41, 34,
+        27, 20, 13, 6, 7, 14, 21, 28,
+        35, 42, 49, 56, 57, 50, 43, 36,
+        29, 22, 15, 23, 30, 37, 44, 51,
+        58, 59, 52, 45, 38, 31, 39, 46,
+        53, 60, 61, 54, 47, 55, 62, 63,
+    ]
+}
+
+type JpegPixelError =
+    | NotJpeg
+    | Truncated(at: i64)
+    | Progressive
+    | Unsupported(what: str, value: i64)
+    | BadTable(kind: str, id: i64)
+    | NoFrame
+    | NoScan
+
+/// A canonical Huffman table in the shape T.81's DECODE procedure wants:
+/// `maxcode[l]` is -1 when no code has length `l`.
+type HuffTable = {
+    mincode: [i64],
+    maxcode: [i64],
+    valptr: [i64],
+    symbols: [i64],
+}
+
+type Component = {
+    id: i64,
+    h: i64,
+    v: i64,
+    tq: i64,
+    td: i64,
+    ta: i64,
+}
+
+/// Where the entropy-coded data has got to: a byte position, and the bits of
+/// the current byte that are left.
+type Bits = {
+    pos: i64,
+    buf: i64,
+    cnt: i64,
+    hit_marker: bool,
+}
+
+/// A decoded image. `comps` is 1 for grayscale and 3 for colour, and
+/// `pixels` holds that many bytes a pixel, row by row with no padding.
+type Decoded = {
+    width: i64,
+    height: i64,
+    comps: i64,
+    pixels: bytes,
+}
+
+pub fn empty_huff() -> HuffTable {
+    HuffTable{ mincode: [], maxcode: [], valptr: [], symbols: [] }
+}
+
+fn u16_at(d: bytes, i: i64) -> i64 {
+    d.at(i) * 256 + d.at(i + 1)
+}
+
+/// Build the DECODE tables from a DHT segment's 16 counts and its symbols.
+pub fn build_huff(counts: [i64], symbols: [i64]) -> HuffTable {
+    var mincode: [i64] = [0]
+    var maxcode: [i64] = [0]
+    var valptr: [i64] = [0]
+    var code = 0
+    var k = 0
+    for l in 1..17 {
+        let n = counts.get(l - 1).unwrap_or(0)
+        valptr.push(k)
+        mincode.push(code)
+        if n == 0 {
+            maxcode.push(-1)
+        } else {
+            code = code + n
+            k = k + n
+            maxcode.push(code - 1)
+        }
+        code = code.shl(1)
+    }
+    HuffTable{ mincode: mincode, maxcode: maxcode, valptr: valptr, symbols: symbols }
+}
+
+/// One bit, MSB first.
+///
+/// A 0xFF in entropy-coded data is followed by a stuffed 0x00, which is
+/// skipped. A 0xFF followed by anything else is a marker, and the scan has
+/// ended: that is recorded and zero bits are served from then on, because a
+/// decoder that read the marker as data would produce an image rather than an
+/// error.
+fn next_bit(data: bytes, inout b: Bits) -> i64 {
+    if b.cnt == 0 {
+        if b.pos >= data.len() {
+            b.hit_marker = true
+            return 0
+        }
+        var byte = data.at(b.pos)
+        b.pos = b.pos + 1
+        if byte == 255 {
+            if b.pos < data.len() and data.at(b.pos) == 0 {
+                b.pos = b.pos + 1
+            } else {
+                b.hit_marker = true
+                b.pos = b.pos - 1
+                return 0
+            }
+        }
+        b.buf = byte
+        b.cnt = 8
+    }
+    b.cnt = b.cnt - 1
+    b.buf.shr(b.cnt).bit_and(1)
+}
+
+/// `n` bits as an unsigned value.
+fn receive(data: bytes, inout b: Bits, n: i64) -> i64 {
+    var v = 0
+    var i = 0
+    while i < n {
+        v = v.shl(1).bit_or(next_bit(data, b))
+        i = i + 1
+    }
+    v
+}
+
+/// T.81's EXTEND: an `n`-bit value whose top half is negative.
+pub fn extend(v: i64, n: i64) -> i64 {
+    if n == 0 {
+        return 0
+    }
+    if v < 1.shl(n - 1) {
+        return v - 1.shl(n) + 1
+    }
+    v
+}
+
+/// T.81's DECODE: read bits until the code is one this table holds.
+fn decode_huff(data: bytes, inout b: Bits, t: HuffTable) -> i64 {
+    var code = next_bit(data, b)
+    var l = 1
+    while l <= 16 {
+        let mx = t.maxcode.get(l).unwrap_or(-1)
+        if mx >= 0 and code <= mx {
+            let idx = t.valptr.get(l).unwrap_or(0) + code - t.mincode.get(l).unwrap_or(0)
+            return t.symbols.get(idx).unwrap_or(0)
+        }
+        code = code.shl(1).bit_or(next_bit(data, b))
+        l = l + 1
+    }
+    0
+}
+
+/// One 8x8 block of quantised coefficients, in natural order.
+fn decode_block(
+    data: bytes,
+    inout b: Bits,
+    dc: HuffTable,
+    ac: HuffTable,
+    quant: [i64],
+    qbase: i64,
+    inout pred: i64,
+) -> [f64] {
+    let zz = zigzag()
+    var coef: [f64] = []
+    for _i in 0..64 {
+        coef.push(0.0)
+    }
+    let s = decode_huff(data, b, dc)
+    let diff = extend(receive(data, b, s), s)
+    pred = pred + diff
+    coef[0] = (pred * quant.get(qbase).unwrap_or(1)).as_f64()
+    var k = 1
+    while k < 64 {
+        let rs = decode_huff(data, b, ac)
+        let r = rs.shr(4)
+        let sz = rs.bit_and(15)
+        if sz == 0 {
+            // 0 ends the block; 15 is a run of sixteen zeroes (ZRL).
+            if r != 15 {
+                k = 64
+            } else {
+                k = k + 16
+            }
+        } else {
+            k = k + r
+            if k < 64 {
+                let v = extend(receive(data, b, sz), sz)
+                let nat = zz.get(k).unwrap_or(0)
+                coef[nat] = (v * quant.get(qbase + k).unwrap_or(1)).as_f64()
+            }
+            k = k + 1
+        }
+    }
+    coef
+}
+
+/// `C(u) * cos((2x+1) * u * pi / 16) / 2`, as `ct[u * 8 + x]`.
+///
+/// Built once per decode and threaded through rather than recomputed per
+/// block: there are no mutable globals to cache it in, which is deliberate
+/// ([E-REPLAY]), and 64 cosines per block would dominate the decode.
+pub fn cos_table() -> [f64] {
+    let pi = 3.14159265358979323846
+    var ct: [f64] = []
+    var u = 0
+    while u < 8 {
+        let cu = if u == 0 { 1.0 / 2.0.sqrt() } else { 1.0 }
+        var x = 0
+        while x < 8 {
+            let a = (2 * x + 1).as_f64() * u.as_f64() * pi / 16.0
+            ct.push(cu * a.cos() / 2.0)
+            x = x + 1
+        }
+        u = u + 1
+    }
+    ct
+}
+
+/// The separable inverse DCT: rows, then columns.
+///
+/// Separable rather than the 2D sum, which is the same answer for 4096
+/// multiplications a block instead of 1024.
+fn idct_block(coef: [f64], ct: [f64]) -> [f64] {
+    var tmp: [f64] = []
+    for _i in 0..64 {
+        tmp.push(0.0)
+    }
+    var y = 0
+    while y < 8 {
+        var x = 0
+        while x < 8 {
+            var s = 0.0
+            var u = 0
+            while u < 8 {
+                s = s + ct[u * 8 + x] * coef[y * 8 + u]
+                u = u + 1
+            }
+            tmp[y * 8 + x] = s
+            x = x + 1
+        }
+        y = y + 1
+    }
+    var out: [f64] = []
+    for _i in 0..64 {
+        out.push(0.0)
+    }
+    var x2 = 0
+    while x2 < 8 {
+        var y2 = 0
+        while y2 < 8 {
+            var s = 0.0
+            var v = 0
+            while v < 8 {
+                s = s + ct[v * 8 + y2] * tmp[v * 8 + x2]
+                v = v + 1
+            }
+            out[y2 * 8 + x2] = s
+            y2 = y2 + 1
+        }
+        x2 = x2 + 1
+    }
+    out
+}
+
+/// A sample, levelled up by 128 and clamped, as a byte.
+fn clamp8(v: f64) -> i64 {
+    let n = (v + 128.5).floor()
+    if n < 0.0 {
+        return 0
+    }
+    if n > 255.0 {
+        return 255
+    }
+    n.as_i64()
+}
+
+/// JFIF YCbCr to RGB, in the integer form every decoder uses.
+fn ycbcr(y: i64, cb: i64, cr: i64) -> [i64] {
+    let yf = y.as_f64()
+    let b = cb.as_f64() - 128.0
+    let r = cr.as_f64() - 128.0
+    var out: [i64] = []
+    for v in [yf + 1.402 * r, yf - 0.344136 * b - 0.714136 * r, yf + 1.772 * b] {
+        let n = (v + 0.5).floor()
+        if n < 0.0 {
+            out.push(0)
+        } else if n > 255.0 {
+            out.push(255)
+        } else {
+            out.push(n.as_i64())
+        }
+    }
+    out
+}
+
+/// Write one 8x8 block into a component's plane at `(bx, by)` in blocks.
+fn blit_block(inout plane: bytes, pw: i64, ph: i64, bx: i64, by: i64, px: [f64]) {
+    var y = 0
+    while y < 8 {
+        let row = by * 8 + y
+        if row < ph {
+            var x = 0
+            while x < 8 {
+                let col = bx * 8 + x
+                if col < pw {
+                    plane.set(row * pw + col, clamp8(px[y * 8 + x]))
+                }
+                x = x + 1
+            }
+        }
+        y = y + 1
+    }
+}
+
+/// One minimum coded unit: every block of every component, in order.
+fn decode_mcu(
+    data: bytes,
+    inout b: Bits,
+    comps: [Component],
+    tabs: [HuffTable],
+    quant: [i64],
+    ct: [f64],
+    inout planes: [bytes],
+    inout preds: [i64],
+    dims: [i64],
+    mx: i64,
+    my: i64,
+) {
+    var ci = 0
+    while ci < comps.len() {
+        let c = comps.get(ci).unwrap_or(Component{ id: 0, h: 1, v: 1, tq: 0, td: 0, ta: 0 })
+        let dc = tabs.get(c.td).unwrap_or(empty_huff())
+        let ac = tabs.get(4 + c.ta).unwrap_or(empty_huff())
+        var vy = 0
+        while vy < c.v {
+            var vx = 0
+            while vx < c.h {
+                var p = preds.get(ci).unwrap_or(0)
+                let coef = decode_block(data, b, dc, ac, quant, c.tq * 64, p)
+                preds[ci] = p
+                let px = idct_block(coef, ct)
+                var plane = planes.get(ci).unwrap_or(bytes_filled(0, 0))
+                blit_block(
+                    plane,
+                    dims.get(ci * 2).unwrap_or(0),
+                    dims.get(ci * 2 + 1).unwrap_or(0),
+                    mx * c.h + vx,
+                    my * c.v + vy,
+                    px,
+                )
+                planes[ci] = plane
+                vx = vx + 1
+            }
+            vy = vy + 1
+        }
+        ci = ci + 1
+    }
+}
+
+/// Step over a restart marker and begin a fresh entropy segment.
+fn restart(data: bytes, inout b: Bits, inout preds: [i64]) {
+    b.cnt = 0
+    b.hit_marker = false
+    // The marker is 0xFFD0..0xFFD7, and the scan resumes after it.
+    while b.pos + 1 < data.len() {
+        if data.at(b.pos) == 255 {
+            let m = data.at(b.pos + 1)
+            if m >= 208 and m <= 215 {
+                b.pos = b.pos + 2
+                var i = 0
+                while i < preds.len() {
+                    preds[i] = 0
+                    i = i + 1
+                }
+                return
+            }
+        }
+        b.pos = b.pos + 1
+    }
+}
+
+/// Sample a component's plane at an output pixel, replicating when the
+/// component is subsampled.
+///
+/// Nearest-neighbour, which is what the specification's own
+/// "box filter" upsampling is. A smoother one changes the answer, so it is
+/// not what a decoder checked against another decoder should do.
+fn sample(plane: bytes, pw: i64, ph: i64, x: i64, y: i64, h: i64, v: i64, hmax: i64, vmax: i64) -> i64 {
+    var sx = x * h / hmax
+    var sy = y * v / vmax
+    if sx >= pw {
+        sx = pw - 1
+    }
+    if sy >= ph {
+        sy = ph - 1
+    }
+    if sx < 0 or sy < 0 {
+        return 0
+    }
+    plane.at(sy * pw + sx)
+}
+
+/// Decode a baseline JPEG to interleaved samples.
+pub fn decode(data: bytes) -> Decoded ! JpegPixelError {
+    if data.len() < 4 or data.at(0) != 255 or data.at(1) != 216 {
+        fail(NotJpeg)
+    }
+    var quant: [i64] = []
+    for _i in 0..256 {
+        quant.push(1)
+    }
+    var tabs: [HuffTable] = []
+    for _i in 0..8 {
+        tabs.push(empty_huff())
+    }
+    var comps: [Component] = []
+    var width = 0
+    var height = 0
+    var interval = 0
+    var scan_at = -1
+    var at = 2
+    while at + 3 < data.len() and scan_at < 0 {
+        if data.at(at) != 255 {
+            at = at + 1
+        } else {
+            let marker = data.at(at + 1)
+            if marker == 216 or (marker >= 208 and marker <= 215) or marker == 1 {
+                at = at + 2
+            } else {
+                let seglen = u16_at(data, at + 2)
+                let body = at + 4
+                if marker == 219 {
+                    read_dqt(data, body, at + 2 + seglen, quant)
+                } else if marker == 196 {
+                    read_dht(data, body, at + 2 + seglen, tabs)
+                } else if marker == 192 {
+                    let got = try read_sof(data, body)
+                    height = got.get(0).unwrap_or(0)
+                    width = got.get(1).unwrap_or(0)
+                    comps = read_sof_comps(data, body)
+                } else if marker == 193 or marker == 194 or marker == 199 or marker == 201 {
+                    fail(Progressive)
+                } else if marker == 221 {
+                    interval = u16_at(data, body)
+                } else if marker == 218 {
+                    read_sos(data, body, comps)
+                    scan_at = at + 2 + seglen
+                }
+                at = at + 2 + seglen
+            }
+        }
+    }
+    if comps.len() == 0 or width == 0 or height == 0 {
+        fail(NoFrame)
+    }
+    if scan_at < 0 {
+        fail(NoScan)
+    }
+    return try run_scan(data, scan_at, width, height, comps, quant, tabs, interval)
+}
+
+/// DQT: one or more tables, each a id/precision byte then 64 or 128 values in
+/// zigzag order. Stored in zigzag order, because that is the order the block
+/// decode walks them in.
+fn read_dqt(data: bytes, from: i64, end: i64, inout quant: [i64]) {
+    var p = from
+    while p < end and p < data.len() {
+        let pq = data.at(p).shr(4)
+        let tq = data.at(p).bit_and(15)
+        p = p + 1
+        var k = 0
+        while k < 64 and p < data.len() {
+            if pq == 1 {
+                quant[tq * 64 + k] = u16_at(data, p)
+                p = p + 2
+            } else {
+                quant[tq * 64 + k] = data.at(p)
+                p = p + 1
+            }
+            k = k + 1
+        }
+    }
+}
+
+/// DHT: a class/id byte, 16 counts, then that many symbols. `tabs` holds the
+/// DC tables at 0..3 and the AC tables at 4..7.
+fn read_dht(data: bytes, from: i64, end: i64, inout tabs: [HuffTable]) {
+    var p = from
+    while p + 16 < end and p + 16 < data.len() {
+        let tc = data.at(p).shr(4)
+        let th = data.at(p).bit_and(15)
+        p = p + 1
+        var counts: [i64] = []
+        var total = 0
+        var i = 0
+        while i < 16 {
+            let n = data.at(p + i)
+            counts.push(n)
+            total = total + n
+            i = i + 1
+        }
+        p = p + 16
+        var symbols: [i64] = []
+        var j = 0
+        while j < total and p + j < data.len() {
+            symbols.push(data.at(p + j))
+            j = j + 1
+        }
+        p = p + total
+        let slot = if tc == 0 { th } else { 4 + th }
+        if slot >= 0 and slot < 8 {
+            tabs[slot] = build_huff(counts, symbols)
+        }
+    }
+}
+
+/// SOF0: precision, height, width, then a component count.
+fn read_sof(data: bytes, from: i64) -> [i64] ! JpegPixelError {
+    if from + 5 >= data.len() {
+        fail(Truncated(from))
+    }
+    let precision = data.at(from)
+    if precision != 8 {
+        fail(Unsupported("sample precision", precision))
+    }
+    return [u16_at(data, from + 1), u16_at(data, from + 3)]
+}
+
+/// The component descriptors of a SOF0 segment.
+fn read_sof_comps(data: bytes, from: i64) -> [Component] {
+    var out: [Component] = []
+    let n = data.at(from + 5)
+    var i = 0
+    while i < n and from + 6 + i * 3 + 2 < data.len() {
+        let at = from + 6 + i * 3
+        out.push(Component{
+            id: data.at(at),
+            h: data.at(at + 1).shr(4),
+            v: data.at(at + 1).bit_and(15),
+            tq: data.at(at + 2),
+            td: 0,
+            ta: 0,
+        })
+        i = i + 1
+    }
+    out
+}
+
+/// SOS: which Huffman tables each component uses in this scan.
+fn read_sos(data: bytes, from: i64, inout comps: [Component]) {
+    let ns = data.at(from)
+    var i = 0
+    while i < ns and from + 1 + i * 2 + 1 < data.len() {
+        let cs = data.at(from + 1 + i * 2)
+        let tdta = data.at(from + 2 + i * 2)
+        var ci = 0
+        while ci < comps.len() {
+            var c = comps.get(ci).unwrap_or(Component{ id: 0, h: 1, v: 1, tq: 0, td: 0, ta: 0 })
+            if c.id == cs {
+                c.td = tdta.shr(4)
+                c.ta = tdta.bit_and(15)
+                comps[ci] = c
+            }
+            ci = ci + 1
+        }
+        i = i + 1
+    }
+}
+
+/// Allocate one plane per component, sized to whole MCUs so a block never
+/// writes past the end, and return the planes with their dimensions.
+fn make_planes(comps: [Component], mcux: i64, mcuy: i64) -> [bytes] {
+    var planes: [bytes] = []
+    for c in comps {
+        planes.push(bytes_filled(mcux * c.h * 8 * mcuy * c.v * 8, 0))
+    }
+    planes
+}
+
+fn plane_dims(comps: [Component], mcux: i64, mcuy: i64) -> [i64] {
+    var dims: [i64] = []
+    for c in comps {
+        dims.push(mcux * c.h * 8)
+        dims.push(mcuy * c.v * 8)
+    }
+    dims
+}
+
+/// Walk every MCU, then upsample and convert to interleaved samples.
+fn run_scan(
+    data: bytes,
+    from: i64,
+    width: i64,
+    height: i64,
+    comps: [Component],
+    quant: [i64],
+    tabs: [HuffTable],
+    interval: i64,
+) -> Decoded ! JpegPixelError {
+    var hmax = 1
+    var vmax = 1
+    for c in comps {
+        if c.h > hmax {
+            hmax = c.h
+        }
+        if c.v > vmax {
+            vmax = c.v
+        }
+    }
+    let mcux = (width + hmax * 8 - 1) / (hmax * 8)
+    let mcuy = (height + vmax * 8 - 1) / (vmax * 8)
+    var planes = make_planes(comps, mcux, mcuy)
+    let dims = plane_dims(comps, mcux, mcuy)
+    var preds: [i64] = []
+    for _c in comps {
+        preds.push(0)
+    }
+    let ct = cos_table()
+    var bits = Bits{ pos: from, buf: 0, cnt: 0, hit_marker: false }
+    var done = 0
+    var my = 0
+    while my < mcuy {
+        var mx = 0
+        while mx < mcux {
+            if interval > 0 and done > 0 and done % interval == 0 {
+                restart(data, bits, preds)
+            }
+            decode_mcu(data, bits, comps, tabs, quant, ct, planes, preds, dims, mx, my)
+            done = done + 1
+            mx = mx + 1
+        }
+        my = my + 1
+    }
+    return Decoded{
+        width: width,
+        height: height,
+        comps: comps.len(),
+        pixels: interleave(planes, dims, comps, width, height, hmax, vmax),
+    }
+}
+
+/// Planes to interleaved samples: grayscale straight through, three
+/// components through YCbCr.
+///
+/// Every plane is brought to full resolution first rather than sampled per
+/// pixel, because the filter that matches libjpeg reads a pixel's neighbours
+/// and a per-pixel sampler has none.
+fn interleave(
+    planes: [bytes],
+    dims: [i64],
+    comps: [Component],
+    width: i64,
+    height: i64,
+    hmax: i64,
+    vmax: i64,
+) -> bytes {
+    let n = comps.len()
+    var full: [bytes] = []
+    var fw: [i64] = []
+    var ci = 0
+    while ci < n {
+        let c = comps.get(ci).unwrap_or(Component{ id: 0, h: 1, v: 1, tq: 0, td: 0, ta: 0 })
+        let pw = dims.get(ci * 2).unwrap_or(1)
+        let ph = dims.get(ci * 2 + 1).unwrap_or(1)
+        full.push(full_plane(planes.get(ci).unwrap_or(bytes_filled(0, 0)), pw, ph, c.h, c.v, hmax, vmax))
+        fw.push(pw * hmax / c.h)
+        ci = ci + 1
+    }
+    var out = bytes_filled(width * height * n, 0)
+    var y = 0
+    while y < height {
+        var x = 0
+        while x < width {
+            let base = (y * width + x) * n
+            if n == 1 {
+                out.set(base, full.get(0).unwrap_or(bytes_filled(1, 0)).at(y * fw.get(0).unwrap_or(1) + x))
+            } else {
+                let yy = full.get(0).unwrap_or(bytes_filled(1, 0)).at(y * fw.get(0).unwrap_or(1) + x)
+                let cb = full.get(1).unwrap_or(bytes_filled(1, 128)).at(y * fw.get(1).unwrap_or(1) + x)
+                let cr = full.get(2).unwrap_or(bytes_filled(1, 128)).at(y * fw.get(2).unwrap_or(1) + x)
+                let rgb = ycbcr(yy, cb, cr)
+                var k = 0
+                while k < 3 {
+                    out.set(base + k, rgb.get(k).unwrap_or(0))
+                    k = k + 1
+                }
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+    out
+}
+
+/// libjpeg's `h2v1_fancy_upsample`: a 3:1 triangle filter across the row.
+///
+/// Box replication is what the specification describes and it is not what
+/// anything produces. Measured against libjpeg on a 16x16 4:2:2 fixture, box
+/// upsampling is off by as much as **42** on a chroma edge and this is off by
+/// **1**, so matching the filter is the difference between a decoder that
+/// agrees with every other decoder and one that does not.
+fn fancy_h2v1(src: bytes, sw: i64, sh: i64) -> bytes {
+    let dw = sw * 2
+    var out = bytes_filled(dw * sh, 0)
+    var y = 0
+    while y < sh {
+        let si = y * sw
+        let di = y * dw
+        out.set(di, src.at(si))
+        if sw > 1 {
+            out.set(di + 1, (src.at(si) * 3 + src.at(si + 1) + 2).shr(2))
+        } else {
+            out.set(di + 1, src.at(si))
+        }
+        var x = 1
+        while x < sw - 1 {
+            let c = src.at(si + x) * 3
+            out.set(di + 2 * x, (c + src.at(si + x - 1) + 1).shr(2))
+            out.set(di + 2 * x + 1, (c + src.at(si + x + 1) + 2).shr(2))
+            x = x + 1
+        }
+        if sw > 1 {
+            let last = sw - 1
+            out.set(di + 2 * last, (src.at(si + last) * 3 + src.at(si + last - 1) + 1).shr(2))
+            out.set(di + 2 * last + 1, src.at(si + last))
+        }
+        y = y + 1
+    }
+    out
+}
+
+/// One output row of `fancy_h2v2`, from the column sums of two source rows.
+fn fancy_row(cs: [i64], sw: i64, inout out: bytes, di: i64) {
+    let c0 = cs.get(0).unwrap_or(0)
+    out.set(di, (c0 * 4 + 8).shr(4))
+    if sw > 1 {
+        out.set(di + 1, (c0 * 3 + cs.get(1).unwrap_or(0) + 7).shr(4))
+    } else {
+        out.set(di + 1, (c0 * 4 + 7).shr(4))
+    }
+    var x = 1
+    while x < sw - 1 {
+        let c = cs.get(x).unwrap_or(0) * 3
+        out.set(di + 2 * x, (c + cs.get(x - 1).unwrap_or(0) + 8).shr(4))
+        out.set(di + 2 * x + 1, (c + cs.get(x + 1).unwrap_or(0) + 7).shr(4))
+        x = x + 1
+    }
+    if sw > 1 {
+        let last = sw - 1
+        let c = cs.get(last).unwrap_or(0)
+        out.set(di + 2 * last, (c * 3 + cs.get(last - 1).unwrap_or(0) + 8).shr(4))
+        out.set(di + 2 * last + 1, (c * 4 + 7).shr(4))
+    }
+}
+
+/// libjpeg's `h2v2_fancy_upsample`: the triangle filter in both directions,
+/// done as one pass over column sums so the rounding matches.
+fn fancy_h2v2(src: bytes, sw: i64, sh: i64) -> bytes {
+    let dw = sw * 2
+    var out = bytes_filled(dw * sh * 2, 0)
+    var v = 0
+    while v < sh {
+        var pass = 0
+        while pass < 2 {
+            var far = v
+            if pass == 0 and v > 0 {
+                far = v - 1
+            }
+            if pass == 1 and v < sh - 1 {
+                far = v + 1
+            }
+            var cs: [i64] = []
+            var x = 0
+            while x < sw {
+                cs.push(src.at(v * sw + x) * 3 + src.at(far * sw + x))
+                x = x + 1
+            }
+            fancy_row(cs, sw, out, (v * 2 + pass) * dw)
+            pass = pass + 1
+        }
+        v = v + 1
+    }
+    out
+}
+
+/// Replication, for a ratio libjpeg does not filter either.
+fn box_upsample(src: bytes, sw: i64, sh: i64, fx: i64, fy: i64) -> bytes {
+    let dw = sw * fx
+    var out = bytes_filled(dw * sh * fy, 0)
+    var y = 0
+    while y < sh * fy {
+        var x = 0
+        while x < dw {
+            out.set(y * dw + x, src.at((y / fy) * sw + x / fx))
+            x = x + 1
+        }
+        y = y + 1
+    }
+    out
+}
+
+/// A component's plane at the image's full resolution.
+///
+/// The two ratios libjpeg filters are the two worth filtering: 2x1 and 2x2
+/// are what every subsampled file in the world uses. Anything else replicates,
+/// which is what libjpeg does too.
+fn full_plane(plane: bytes, pw: i64, ph: i64, h: i64, v: i64, hmax: i64, vmax: i64) -> bytes {
+    if h == hmax and v == vmax {
+        return plane
+    }
+    if h * 2 == hmax and v == vmax {
+        return fancy_h2v1(plane, pw, ph)
+    }
+    if h * 2 == hmax and v * 2 == vmax {
+        return fancy_h2v2(plane, pw, ph)
+    }
+    return box_upsample(plane, pw, ph, hmax / h, vmax / v)
+}
