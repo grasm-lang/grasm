@@ -498,22 +498,24 @@ PAGE = """<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{title}</title>
 <meta name="description" content="{desc}">
+<link rel="preload" href="vendor/fonts/figtree.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="preload" href="vendor/fonts/sora.woff2" as="font" type="font/woff2" crossorigin>
 <link rel="stylesheet" href="style.css">
 <script src="vendor/motion.js" defer></script>
 <script src="vendor/lottie.js" defer></script>
 <script type="module" src="app.js"></script>
 </head><body data-page="{page}">
 <header class="topbar">
-  <a class="brand" href="index.html">{markicon}<span>grasm</span></a>
+  <a class="brand" href="index.html">{markicon}<span>Grasm</span></a>
   <span class="ver">v{version}</span>
   <nav>
-    <a href="different.html">Why</a>
+    <a href="different.html">Why Grasm</a>
     <a href="start.html">Docs</a>
-    <a href="syntax.html">Syntax</a>
     <a href="security.html">Security</a>
     <a href="achieved.html">Scorecard</a>
-    <a href="status.html">Status</a>
+    <a href="playground.html">Playground</a>
   </nav>
+  <a class="cta" href="start.html">Get started</a>
 </header>
 <div class="frame">
 <nav class="rail">

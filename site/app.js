@@ -147,10 +147,10 @@ function engines() {
     ctx.textBaseline = 'middle';
     for (let i = 0; i < 4; i++) {
       const y = laneY(i);
-      ctx.strokeStyle = '#1b2320';
+      ctx.strokeStyle = 'rgba(255,255,255,.14)';
       ctx.lineWidth = 1;
       ctx.beginPath(); ctx.moveTo(left, y); ctx.lineTo(right, y); ctx.stroke();
-      ctx.fillStyle = '#61706a';
+      ctx.fillStyle = '#8c95bf';
       ctx.textAlign = 'right';
       ctx.fillText(NAMES[i], left - 14, y);
     }
@@ -165,7 +165,7 @@ function engines() {
       if (d.t > 1.3) d.t = -0.1;
       if (d.t < 0) continue;
       const p = Math.min(d.t, 1);
-      ctx.fillStyle = '#46c88b';
+      ctx.fillStyle = '#6ee7d8';
       ctx.globalAlpha = p >= 1 ? 1 : 0.8;
       ctx.beginPath();
       ctx.arc(left + (right - left) * p, laneY(d.lane), 2, 0, Math.PI * 2);
@@ -173,13 +173,13 @@ function engines() {
       ctx.globalAlpha = 1;
     }
 
-    ctx.fillStyle = '#46c88b';
+    ctx.fillStyle = '#6ee7d8';
     ctx.beginPath(); ctx.arc(right + 34, h / 2, 4.5, 0, Math.PI * 2); ctx.fill();
-    ctx.fillStyle = '#e7ece9';
+    ctx.fillStyle = '#ffffff';
     ctx.textAlign = 'left';
     ctx.font = '600 12px -apple-system, system-ui, sans-serif';
     ctx.fillText('one answer', right + 46, h / 2 - 7);
-    ctx.fillStyle = '#61706a';
+    ctx.fillStyle = '#8c95bf';
     ctx.font = '11px ui-monospace, Menlo, monospace';
     ctx.fillText(total + ' programs', right + 46, h / 2 + 9);
 

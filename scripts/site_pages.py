@@ -135,25 +135,57 @@ def verdicts():
 PAGES["index.html"] = (
     "Grasm is a systems language where a dependency cannot reach further than its manifest allows.",
     """
-<div class="hero">
-  <p class="eyebrow">Systems language · v«version»</p>
-  <h1>Your dependencies can read every file you can.</h1>
-  <p class="lede">In Python, Go, Rust and Zig, a library that claims to do
-  arithmetic can open your files and your sockets, and nothing in the toolchain
-  will say a word. Grasm makes that a compile error.</p>
-  <div class="actions">
-    <a class="btn" href="start.html">Get started</a>
-    <a class="btn ghost" href="security.html">How it works</a>
-    <a class="btn ghost" href="syntax.html">Syntax</a>
+<section class="lp-hero">
+  <div class="lp-wrap">
+    <div class="lp-hero-grid">
+      <div>
+        <span class="pill"><b>v«version»</b> Now available — read the status</span>
+        <h1>Code that can’t overstep.</h1>
+        <p class="lede">Grasm is a systems language where a dependency cannot
+        reach further than its manifest allows. Overstep, and it is a compile
+        error.</p>
+        <div class="actions">
+          <a class="btn" href="start.html">Get started</a>
+          <a class="btn ghost" href="#try">Try to break it</a>
+        </div>
+      </div>
+      <div class="lp-art">
+        <div class="head"><i></i><i></i><i></i> mathlib/grasm.toml</div>
+        <div class="toml"><span class="cm">[package]</span>
+<span class="k">name</span> = <span class="v">"mathlib"</span>
+<span class="k">version</span> = <span class="v">"1.0.1"</span>
+<span class="k">capabilities</span> = <span class="v">[]</span></div>
+        <div class="deny">
+          <span><b>read_file("/etc/passwd")</b>
+          performs [io], permits []</span>
+          <span>build failed</span>
+        </div>
+      </div>
+    </div>
+    <div class="lp-stats">
+      <div><b>«difftest»</b><span>programs, every engine identical</span></div>
+      <div><b>«hello_kb» KB</b><span>hello-world, statically linked</span></div>
+      <div><b>«packages»</b><span>libraries, all written in Grasm</span></div>
+      <div><b>«gates»</b><span>gates, judged by exit code alone</span></div>
+    </div>
   </div>
-</div>
+</section>
 
-<div class="split">
-  <div>
-    <h3>The manifest is the ceiling</h3>
-    <p>A package declares what it may reach. The compiler infers what it
-    actually does — through every call, into every dependency — and
-    refuses to build when the two disagree.</p>
+<section class="lp-sec" id="try">
+  <div class="lp-wrap lp-center">
+    <span class="pill">Interactive</span>
+    <h2>Sneak one past the compiler.</h2>
+    <p class="sub">A trusted math library ships a patch release. Same name,
+    same signature, same result — and one new line that reads a file. This is
+    the whole build.</p>
+  </div>
+  <div class="lp-wrap">
+    <div class="split">
+      <div>
+        <h3>The manifest is the ceiling</h3>
+        <p>A package declares what it may reach. The compiler infers what it
+        actually does — through every call, into every dependency — and
+        refuses to build when the two disagree.</p>
 """
     + code(
         """[package]
@@ -163,62 +195,105 @@ capabilities = []          # reaches nothing at all""",
         "mathlib/grasm.toml — the ceiling, in one line a reviewer can see.",
     )
     + """
-  </div>
-  <div>
-    <h3>A patch release tries to grow teeth</h3>
-    <p>Same name, same signature, same result — and one new line that reads
-    a file. This is the whole build:</p>
-    <div class="term">
-      <div class="chrome"><span class="dot"></span><span class="dot"></span><span class="dot"></span>
-        <span>app — grasm build</span></div>
-      <div class="body"></div>
+      </div>
+      <div>
+        <h3>A patch release tries to grow teeth</h3>
+        <p>Same library, one new line, and four toolchains asked the same
+        question:</p>
+        <div class="term">
+          <div class="chrome"><span class="dot"></span><span class="dot"></span><span class="dot"></span>
+            <span>app — grasm build</span></div>
+          <div class="body"></div>
+        </div>
+      </div>
     </div>
-  </div>
-</div>
 
-<h2 class="reveal">The same attack, four toolchains</h2>
-<p class="reveal">A trusted pure library’s 1.0.1 starts reading
-<code>/etc/passwd</code>. <code>scripts/security_bench.sh</code> runs it against
-four toolchains on every green build. Three of them ship it.</p>
+    <h2 class="reveal">The same attack, four toolchains</h2>
+    <p class="reveal">A trusted pure library’s 1.0.1 starts reading
+    <code>/etc/passwd</code>. <code>scripts/security_bench.sh</code> runs it
+    against four toolchains on every green build. Three of them ship it.</p>
 """
     + verdicts()
     + """
-<p class="note"><strong>This is the reason the language exists.</strong>
-xz-utils, event-stream, SolarWinds: the attack is always the same shape, and
-the answer everywhere else is a runtime sandbox or a human reading the diff.
-Here it is a type error.</p>
+    <p class="note"><strong>This is the reason the language exists.</strong>
+    xz-utils, event-stream, SolarWinds: the attack is always the same shape,
+    and the answer everywhere else is a runtime sandbox or a human reading the
+    diff. Here it is a type error.</p>
+  </div>
+</section>
 
-<h2 class="reveal">Three ideas, and they compose</h2>
-<div class="grid three reveal">
-  <div class="card">
-    <span class="ico">«icon_lock»</span>
-    <h3>Capabilities</h3>
-    <p>A package states the effects it may perform. Exceeding it fails the
-    build in every consumer — not in a review, not at run time.</p>
-    <div class="lottie" data-lottie="ceiling"></div>
+<section class="lp-sec">
+  <div class="lp-wrap">
+    <h2>Three ideas. One language.</h2>
+    <p class="sub">They were built to compose. Each one closes a hole the
+    other two leave open.</p>
+    <div class="grid three reveal">
+      <div class="card">
+        <span class="ico">«icon_lock»</span>
+        <h3>Capabilities</h3>
+        <p>A package states the effects it may perform. Exceeding it fails the
+        build in every consumer — not in a review, not at run time.</p>
+        <div class="lottie" data-lottie="ceiling"></div>
+      </div>
+      <div class="card">
+        <span class="ico">«icon_layers»</span>
+        <h3>Ownership in tiers</h3>
+        <p>Value semantics by default, a region when a scope should own its
+        allocations, a generational reference when a graph needs one. No
+        lifetime annotations anywhere.</p>
+        <div class="lottie" data-lottie="tiers"></div>
+      </div>
+      <div class="card">
+        <span class="ico">«icon_flow»</span>
+        <h3>Four engines, one answer</h3>
+        <p>Interpreter, bundle, ahead-of-time native, and wasm. Develop
+        against instant feedback, ship a binary, run the same program in a
+        browser.</p>
+        <div class="lottie" data-lottie="engines"></div>
+      </div>
+    </div>
   </div>
-  <div class="card">
-    <span class="ico">«icon_layers»</span>
-    <h3>Ownership in tiers</h3>
-    <p>Value semantics by default, a region when a scope should own its
-    allocations, a generational reference when a graph needs one. No lifetime
-    annotations anywhere.</p>
-    <div class="lottie" data-lottie="tiers"></div>
-  </div>
-  <div class="card">
-    <span class="ico">«icon_flow»</span>
-    <h3>Four engines, one answer</h3>
-    <p>Interpreter, bundle, ahead-of-time native, and wasm. Develop against
-    instant feedback, ship a binary, run the same program in a browser.</p>
-    <div class="lottie" data-lottie="engines"></div>
-  </div>
-</div>
+</section>
 
-<h2 class="reveal">Effects are in the type, and inferred</h2>
-<p class="reveal">You do not write the row. The compiler works it out from the
-body and checks it against what you declared, so a function that starts
-touching the network stops compiling — and so does every caller that was
-not given the same permission.</p>
+<section class="lp-sec lp-dark">
+  <div class="lp-wrap lp-center">
+    <h2>Four engines. One answer.</h2>
+    <p class="sub">The interpreter is normative. The other three have to match
+    it, byte for byte, on every green build.</p>
+  </div>
+  <div class="lp-wrap">
+    <div class="lp-engines reveal">
+      <div><b>Interpreter</b><span>the reference, and the specification’s own
+        executable form</span></div>
+      <div><b>Bundle</b><span>one file, run anywhere the runtime goes</span></div>
+      <div><b>Native</b><span>Cranelift, ahead of time, no standard library
+        linked</span></div>
+      <div><b>Wasm</b><span>the same program in a browser, with no operating
+        system underneath</span></div>
+    </div>
+    <div class="lp-center">
+      <span class="lp-verdict"><i>0</i><span><b>mismatches</b>
+        <span>difftest · crosstest · wasmtest</span></span></span>
+    </div>
+    <div class="viz reveal">
+      <canvas id="engines" data-programs="«difftest»"
+        aria-label="Programs flowing through four engines to one answer"></canvas>
+      <div class="cap">difftest · crosstest · wasmtest — «difftest» programs, 0 mismatched</div>
+    </div>
+  </div>
+</section>
+
+<section class="lp-sec">
+  <div class="lp-wrap">
+    <div class="split">
+      <div>
+        <h2>Effects live in the type.</h2>
+        <p>You never write the row. The compiler infers it from the body and
+        checks it against what you declared. Touch the network, and the
+        function stops compiling — along with every caller that was not given
+        the same permission.</p>
+      </div>
+      <div>
 """
     + code(
         """fn safe_div(a: i64, b: i64) -> i64 ! MathError {
@@ -234,53 +309,54 @@ fn load(path: str) -> str ! IoError / {io} {
         "! MathError is a failure the caller must handle. / {io} is a permission the caller must have.",
     )
     + """
-<h2 class="reveal">The same program, every engine</h2>
-<p class="reveal">The interpreter is normative and the other three have to match
-it. Every gate here exists to hold them to the same bytes.</p>
-<div class="viz reveal">
-  <canvas id="engines" data-programs="«difftest»"
-    aria-label="Programs flowing through four engines to one answer"></canvas>
-  <div class="cap">difftest · crosstest · wasmtest — «difftest» programs, 0 mismatched</div>
-</div>
+      </div>
+    </div>
+  </div>
+</section>
 
-<div class="figures reveal">
-  <div class="fig"><b>«difftest»</b><span>programs, engines identical</span></div>
-  <div class="fig"><b>«packages»</b><span>libraries, all written in Grasm</span></div>
-  <div class="fig"><b>«clauses»</b><span>normative clauses, each with a conformance program</span></div>
-  <div class="fig"><b>«gates»</b><span>gates, judged by exit code alone</span></div>
-</div>
+<section class="lp-sec">
+  <div class="lp-wrap">
+    <h2>Honest numbers.</h2>
+    <p class="sub">«goals_distinct» measurable goals, «goals_total» rows once
+    «goals_split» of them split in half. <strong>«goals_met» are met</strong>,
+    «goals_over» are over by 4% and 2%, and «goals_blocked» cannot be read at
+    all without users. <a href="achieved.html">The scorecard</a> puts every
+    qualification beside its number rather than underneath it.</p>
+    <div class="figures reveal">
+      <div class="fig"><b>«hello_kb» KB</b><span>hello-world, static, down from «hello_was» KB</span></div>
+      <div class="fig"><b>«tasks»</b><span>tasks in «tasks_s» s, natively</span></div>
+      <div class="fig"><b>«geomean»×</b><span>of Rust, geomean — not ahead of it</span></div>
+      <div class="fig"><b>«locs_low»k</b><span>lines a second, front end</span></div>
+    </div>
+    <div class="actions">
+      <a class="btn ghost" href="achieved.html">The scorecard, all «goals_total» rows</a>
+      <a class="btn ghost" href="different.html">What makes it different</a>
+      <a class="btn ghost" href="performance.html">Every benchmark</a>
+    </div>
+  </div>
+</section>
 
-<h2 class="reveal">Where it actually stands</h2>
-<p class="reveal">«goals_distinct» measurable goals, «goals_total» rows
-once «goals_split» of them split in half. <strong>«goals_met» are met</strong>,
-«goals_over» are over by 4% and 2%, and «goals_blocked» cannot
-be read at all without users. Three of the met rows carry a qualification, and
-<a href="achieved.html">the scorecard</a> states each one beside its number
-rather than underneath it.</p>
-<div class="figures reveal">
-  <div class="fig"><b>«hello_kb» KB</b><span>hello-world, static, down from «hello_was» KB</span></div>
-  <div class="fig"><b>«tasks»</b><span>tasks in «tasks_s» s, natively</span></div>
-  <div class="fig"><b>«geomean»×</b><span>of Rust, geomean — not ahead of it</span></div>
-  <div class="fig"><b>«locs_low»k</b><span>lines a second, front end</span></div>
-</div>
-<div class="actions">
-  <a class="btn ghost" href="achieved.html">The scorecard, all «goals_total» rows</a>
-  <a class="btn ghost" href="different.html">What makes it different</a>
-  <a class="btn ghost" href="performance.html">Every benchmark</a>
-</div>
-
-<h2 class="reveal">Start here</h2>
-<div class="grid three reveal">
-  <div class="card"><span class="ico">«icon_shield»</span><h3>Why Grasm</h3>
-    <p>The seven things the other four toolchains do not give you.
-    <a href="different.html">Read it →</a></p></div>
-  <div class="card"><span class="ico">«icon_terminal»</span><h3>Getting started</h3>
-    <p>Install, first program, first package.
-    <a href="start.html">Begin →</a></p></div>
-  <div class="card"><span class="ico">«icon_gauge»</span><h3>Scorecard</h3>
-    <p>«goals_distinct» goals, every measurement, and what is still open.
-    <a href="achieved.html">See it →</a></p></div>
-</div>
+<section class="lp-sec tight">
+  <div class="lp-wrap">
+    <div class="lp-cta">
+      <div>
+        <h2>Start building.</h2>
+        <p>Install, first program, first package. Ten minutes.</p>
+        <div class="actions">
+          <a class="btn" href="start.html">Getting started</a>
+          <a class="btn ghost" href="different.html">Why Grasm</a>
+        </div>
+      </div>
+      <div class="term">
+        <div class="chrome"><span class="dot"></span><span class="dot"></span><span class="dot"></span>
+          <span>Terminal</span></div>
+        <div class="body">$ cargo build --release --workspace
+$ ./target/release/grasm run examples/hello.gr
+<span class="ok">hello from grasm</span></div>
+      </div>
+    </div>
+  </div>
+</section>
 """
 )
 
@@ -1540,11 +1616,12 @@ operating system.</p>
 </ul>
 
 <h2>Prior art</h2>
-<p>None of this is invented here. <a href="about.html">Austral</a> pioneered
+<p>This stands on proven ground. <a href="about.html">Austral</a> pioneered
 capability-secure modules, Wyvern did capability-safe modules before that, and
-the effect row is <a href="about.html">Koka</a>’s. What is uncommon is
-shipping the combination with a gate that proves it: <code>security_bench.sh</code>
-runs the attack on every green build.</p>
+the effect row is <a href="about.html">Koka</a>’s. What no one had shipped is
+the combination, with a gate that proves it:
+<code>security_bench.sh</code> runs the real attack against four toolchains on
+every green build, and three of them wave it through.</p>
 """
 )
 
@@ -1639,19 +1716,20 @@ the real world instead.</p>
 # ---------------------------------------------------------------- about
 
 PAGES["about.html"] = (
-    "What Grasm is, what it borrowed, and who should not use it.",
+    "What Grasm is, the research it ships, and exactly where it stands.",
     """
 <p class="eyebrow">More</p>
-<h1>What this is, and what it is not.</h1>
+<h1>A language built on twenty years of research.</h1>
 <p class="lede">Grasm is a systems language with an effect system, capability
 ceilings on packages, and tiered ownership without lifetime annotations. It is
 version «version», it has «packages» libraries, and every one of them was
 written inside this repository.</p>
 
-<h2>Nothing here was invented</h2>
-<p>It is worth being direct about this, because a language site is the last
-place anyone expects to read it. Every idea in Grasm exists elsewhere, usually
-first and usually with more research behind it.</p>
+<h2>The lineage</h2>
+<p>Every mechanism in Grasm has a research pedigree — a decade or two of papers
+and prototypes behind it, in languages most working programmers never get to
+use. Grasm is where they arrive together, in one toolchain, with gates that
+prove the combination holds.</p>
 <table>
   <tr><th>In Grasm</th><th>Where it came from</th></tr>
   <tr><td><code>let</code> / <code>inout</code> / <code>own</code>, value semantics, no lifetimes</td>
@@ -1665,38 +1743,43 @@ first and usually with more research behind it.</p>
   <tr><td>Generational references</td>
       <td>The slotmap pattern, in every entity-component system.</td></tr>
   <tr><td>A reference interpreter as the specification</td>
-      <td><b>WebAssembly</b> does this, and does it better.</td></tr>
+      <td><b>WebAssembly</b> set the precedent: a reference implementation that <em>is</em> the specification.</td></tr>
 </table>
 <p>The closest single comparison is <b>Hylo plus Koka, tied to a manifest the
-way Austral does it</b>. What is uncommon is not the ideas but shipping them
-together with gates that prove the combination holds.</p>
+way Austral does it</b> — and that combination has never shipped as one
+language before. Each of those ideas is proven on its own; putting all of them
+in the same type system, and holding them there with «gates» gates on every
+build, is the part that is new.</p>
 
-<h2>Who should not use this</h2>
-<p>Most people, today. Specifically:</p>
+<h2>The honest edge</h2>
+<p>Version 1.0, built inside one repository. Everything above is real and
+gated; here is precisely where the edge of it sits today, so nobody finds out
+the hard way:</p>
 <ul>
-  <li><b>If you need libraries.</b> There are «packages», all written here.
-  Python has hundreds of thousands.</li>
-  <li><b>If you need speed.</b> Rust and Zig are faster, and
-  <a href="achieved.html">the numbers here</a> say by how much: «geomean»× of
-  Rust on the benchmark geomean, and a systems suite Grasm loses on time and
-  wins on memory.</li>
-  <li><b>If you need to hire.</b> Nobody outside this repository has written
-  Grasm.</li>
-  <li><b>If you need a native debugger.</b> There is a Debug Adapter Protocol
-  server, and it works against the interpreter. The Cranelift backend emits no
-  DWARF, so GDB and LLDB cannot meaningfully inspect a compiled binary.</li>
-  <li><b>If you need async I/O.</b> There are threads, channels, structured
+  <li><b>The library set is young.</b> «packages» of them, every one written
+  in Grasm and every one capability-declared — which is why they exist at all.
+  Python has hundreds of thousands, and none of them can tell you what they
+  reach for.</li>
+  <li><b>Rust and Zig are still faster.</b> «geomean»× of Rust on the
+  benchmark geomean — close, and not ahead.
+  <a href="achieved.html">The numbers</a> say exactly where, including the
+  systems suite Grasm loses on time and wins on memory.</li>
+  <li><b>You would be early.</b> Nobody outside this repository has written
+  Grasm yet.</li>
+  <li><b>Native debugging is not there yet.</b> The Debug Adapter Protocol
+  server works against the interpreter. The Cranelift backend emits no DWARF,
+  so GDB and LLDB cannot meaningfully inspect a compiled binary.</li>
+  <li><b>Concurrency without async/await.</b> Threads, channels, structured
   concurrency and non-blocking I/O on a single thread — «tasks» tasks in
-  «tasks_s» s — and no async/await. A task also refuses every effect, so the
-  concurrency you have is not the concurrency the plan asks for.</li>
+  «tasks_s» s. A task refuses every effect, which is deliberate and which is
+  also not yet the concurrency the plan asks for.</li>
 </ul>
 
-<h2>Who might</h2>
-<p>Someone who genuinely models an untrusted dependency reaching the network or
-the filesystem as a threat, and who wants the compiler to enforce the boundary
-rather than a sandbox at run time. That is a real gap in Rust, Go, Zig and
-Python, and it is the one thing here that is not catching up to somebody
-else.</p>
+<h2>Who it is for</h2>
+<p>Anyone who treats an untrusted dependency reaching the network or the
+filesystem as a threat, and who wants the compiler to enforce that boundary
+rather than a sandbox at run time. Rust, Go, Zig and Python all leave that gap
+wide open. Closing it is the whole point of this language.</p>
 
 <h2>How it is built</h2>
 <p>«clauses» normative clauses in «spec_lines» lines of specification, under a
@@ -1998,17 +2081,17 @@ PAGES["different.html"] = (
     "What Grasm does that Python, Go, Rust and Zig do not.",
     """
 <p class="eyebrow">Start</p>
-<h1>One of these is not catching up to anybody.</h1>
-<p class="lede">Most of Grasm is a careful assembly of ideas that already
-exist — <a href="about.html">the table on the About page names every one and
-where it came from</a>. This page is the short list of things you cannot get
-from the four languages a working programmer would otherwise reach for, and
-each entry says what checks it.</p>
+<h1>Seven things nothing else gives you.</h1>
+<p class="lede">Seven capabilities you cannot get from the four languages a
+working programmer would otherwise reach for — each one shipped, and each one
+with the gate that proves it holds. Every idea here has a lineage, and
+<a href="about.html">the About page names it</a>; what follows is what only
+Grasm puts in your hands.</p>
 
 <h2>1. A dependency cannot reach further than its manifest</h2>
-<p>This is the reason the language exists, and it is the only entry here that
-is not available elsewhere in some form. A package writes down the effects it
-may perform. The compiler infers what the code <em>actually</em> does, through
+<p>This is the reason the language exists, and no production toolchain a
+working programmer would reach for enforces it. A package writes down the
+effects it may perform. The compiler infers what the code <em>actually</em> does, through
 every call and into every dependency, and refuses to build when the two
 disagree — in the package, and in every consumer of it.</p>
 """
@@ -2169,7 +2252,7 @@ PAGES["achieved.html"] = (
     "The eleven north-star goals, what each measures, and where each one stands.",
     """
 <p class="eyebrow">More</p>
-<h1>How far it got.</h1>
+<h1>Every goal, measured.</h1>
 <p class="lede"><code>MASTERPLAN.md</code> §2.3 sets ten measurable goals and
 §19.3 adds an eleventh; two of them split in two, so the scorecard has
 «goals_total» rows. <strong>«goals_met» are met</strong>, «goals_over» are

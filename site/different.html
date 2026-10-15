@@ -4,22 +4,24 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>What makes it different</title>
 <meta name="description" content="What Grasm does that Python, Go, Rust and Zig do not.">
+<link rel="preload" href="vendor/fonts/figtree.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="preload" href="vendor/fonts/sora.woff2" as="font" type="font/woff2" crossorigin>
 <link rel="stylesheet" href="style.css">
 <script src="vendor/motion.js" defer></script>
 <script src="vendor/lottie.js" defer></script>
 <script type="module" src="app.js"></script>
 </head><body data-page="different">
 <header class="topbar">
-  <a class="brand" href="index.html"><svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3 4 7.5v9L12 21l8-4.5v-9L12 3Z"/><path d="M12 12 4 7.5M12 12l8-4.5M12 12v9"/></svg><span>grasm</span></a>
+  <a class="brand" href="index.html"><svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3 4 7.5v9L12 21l8-4.5v-9L12 3Z"/><path d="M12 12 4 7.5M12 12l8-4.5M12 12v9"/></svg><span>Grasm</span></a>
   <span class="ver">v1.0.0</span>
   <nav>
-    <a href="different.html">Why</a>
+    <a href="different.html">Why Grasm</a>
     <a href="start.html">Docs</a>
-    <a href="syntax.html">Syntax</a>
     <a href="security.html">Security</a>
     <a href="achieved.html">Scorecard</a>
-    <a href="status.html">Status</a>
+    <a href="playground.html">Playground</a>
   </nav>
+  <a class="cta" href="start.html">Get started</a>
 </header>
 <div class="frame">
 <nav class="rail">
@@ -55,17 +57,17 @@
 <main>
 
 <p class="eyebrow">Start</p>
-<h1>One of these is not catching up to anybody.</h1>
-<p class="lede">Most of Grasm is a careful assembly of ideas that already
-exist — <a href="about.html">the table on the About page names every one and
-where it came from</a>. This page is the short list of things you cannot get
-from the four languages a working programmer would otherwise reach for, and
-each entry says what checks it.</p>
+<h1>Seven things nothing else gives you.</h1>
+<p class="lede">Seven capabilities you cannot get from the four languages a
+working programmer would otherwise reach for — each one shipped, and each one
+with the gate that proves it holds. Every idea here has a lineage, and
+<a href="about.html">the About page names it</a>; what follows is what only
+Grasm puts in your hands.</p>
 
 <h2>1. A dependency cannot reach further than its manifest</h2>
-<p>This is the reason the language exists, and it is the only entry here that
-is not available elsewhere in some form. A package writes down the effects it
-may perform. The compiler infers what the code <em>actually</em> does, through
+<p>This is the reason the language exists, and no production toolchain a
+working programmer would reach for enforces it. A package writes down the
+effects it may perform. The compiler infers what the code <em>actually</em> does, through
 every call and into every dependency, and refuses to build when the two
 disagree — in the package, and in every consumer of it.</p>
 <figure class="code"><pre><code><span class="op">[</span>package<span class="op">]</span>

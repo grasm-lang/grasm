@@ -28,11 +28,11 @@ def rgb(h):
     return [int(h[i:i + 2], 16) / 255 for i in (0, 2, 4)] + [1]
 
 
-ACCENT = rgb("46c88b")
-BRAND = rgb("0a6e48")
-RED = rgb("e0705c")
-FAINT = rgb("61706a")
-DIM = rgb("94a29b")
+ACCENT = rgb("1a4dff")
+BRAND = rgb("0a1033")
+RED = rgb("ff7a55")
+FAINT = rgb("8c95bf")
+DIM = rgb("b9c9ff")
 
 
 def val(v):

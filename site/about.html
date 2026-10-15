@@ -3,23 +3,25 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>About</title>
-<meta name="description" content="What Grasm is, what it borrowed, and who should not use it.">
+<meta name="description" content="What Grasm is, the research it ships, and exactly where it stands.">
+<link rel="preload" href="vendor/fonts/figtree.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="preload" href="vendor/fonts/sora.woff2" as="font" type="font/woff2" crossorigin>
 <link rel="stylesheet" href="style.css">
 <script src="vendor/motion.js" defer></script>
 <script src="vendor/lottie.js" defer></script>
 <script type="module" src="app.js"></script>
 </head><body data-page="about">
 <header class="topbar">
-  <a class="brand" href="index.html"><svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3 4 7.5v9L12 21l8-4.5v-9L12 3Z"/><path d="M12 12 4 7.5M12 12l8-4.5M12 12v9"/></svg><span>grasm</span></a>
+  <a class="brand" href="index.html"><svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3 4 7.5v9L12 21l8-4.5v-9L12 3Z"/><path d="M12 12 4 7.5M12 12l8-4.5M12 12v9"/></svg><span>Grasm</span></a>
   <span class="ver">v1.0.0</span>
   <nav>
-    <a href="different.html">Why</a>
+    <a href="different.html">Why Grasm</a>
     <a href="start.html">Docs</a>
-    <a href="syntax.html">Syntax</a>
     <a href="security.html">Security</a>
     <a href="achieved.html">Scorecard</a>
-    <a href="status.html">Status</a>
+    <a href="playground.html">Playground</a>
   </nav>
+  <a class="cta" href="start.html">Get started</a>
 </header>
 <div class="frame">
 <nav class="rail">
@@ -55,16 +57,17 @@
 <main>
 
 <p class="eyebrow">More</p>
-<h1>What this is, and what it is not.</h1>
+<h1>A language built on twenty years of research.</h1>
 <p class="lede">Grasm is a systems language with an effect system, capability
 ceilings on packages, and tiered ownership without lifetime annotations. It is
 version 1.0.0, it has 651 libraries, and every one of them was
 written inside this repository.</p>
 
-<h2>Nothing here was invented</h2>
-<p>It is worth being direct about this, because a language site is the last
-place anyone expects to read it. Every idea in Grasm exists elsewhere, usually
-first and usually with more research behind it.</p>
+<h2>The lineage</h2>
+<p>Every mechanism in Grasm has a research pedigree — a decade or two of papers
+and prototypes behind it, in languages most working programmers never get to
+use. Grasm is where they arrive together, in one toolchain, with gates that
+prove the combination holds.</p>
 <table>
   <tr><th>In Grasm</th><th>Where it came from</th></tr>
   <tr><td><code>let</code> / <code>inout</code> / <code>own</code>, value semantics, no lifetimes</td>
@@ -78,38 +81,43 @@ first and usually with more research behind it.</p>
   <tr><td>Generational references</td>
       <td>The slotmap pattern, in every entity-component system.</td></tr>
   <tr><td>A reference interpreter as the specification</td>
-      <td><b>WebAssembly</b> does this, and does it better.</td></tr>
+      <td><b>WebAssembly</b> set the precedent: a reference implementation that <em>is</em> the specification.</td></tr>
 </table>
 <p>The closest single comparison is <b>Hylo plus Koka, tied to a manifest the
-way Austral does it</b>. What is uncommon is not the ideas but shipping them
-together with gates that prove the combination holds.</p>
+way Austral does it</b> — and that combination has never shipped as one
+language before. Each of those ideas is proven on its own; putting all of them
+in the same type system, and holding them there with 105 gates on every
+build, is the part that is new.</p>
 
-<h2>Who should not use this</h2>
-<p>Most people, today. Specifically:</p>
+<h2>The honest edge</h2>
+<p>Version 1.0, built inside one repository. Everything above is real and
+gated; here is precisely where the edge of it sits today, so nobody finds out
+the hard way:</p>
 <ul>
-  <li><b>If you need libraries.</b> There are 651, all written here.
-  Python has hundreds of thousands.</li>
-  <li><b>If you need speed.</b> Rust and Zig are faster, and
-  <a href="achieved.html">the numbers here</a> say by how much: 0.965× of
-  Rust on the benchmark geomean, and a systems suite Grasm loses on time and
-  wins on memory.</li>
-  <li><b>If you need to hire.</b> Nobody outside this repository has written
-  Grasm.</li>
-  <li><b>If you need a native debugger.</b> There is a Debug Adapter Protocol
-  server, and it works against the interpreter. The Cranelift backend emits no
-  DWARF, so GDB and LLDB cannot meaningfully inspect a compiled binary.</li>
-  <li><b>If you need async I/O.</b> There are threads, channels, structured
+  <li><b>The library set is young.</b> 651 of them, every one written
+  in Grasm and every one capability-declared — which is why they exist at all.
+  Python has hundreds of thousands, and none of them can tell you what they
+  reach for.</li>
+  <li><b>Rust and Zig are still faster.</b> 0.965× of Rust on the
+  benchmark geomean — close, and not ahead.
+  <a href="achieved.html">The numbers</a> say exactly where, including the
+  systems suite Grasm loses on time and wins on memory.</li>
+  <li><b>You would be early.</b> Nobody outside this repository has written
+  Grasm yet.</li>
+  <li><b>Native debugging is not there yet.</b> The Debug Adapter Protocol
+  server works against the interpreter. The Cranelift backend emits no DWARF,
+  so GDB and LLDB cannot meaningfully inspect a compiled binary.</li>
+  <li><b>Concurrency without async/await.</b> Threads, channels, structured
   concurrency and non-blocking I/O on a single thread — 1,000,000 tasks in
-  22 s — and no async/await. A task also refuses every effect, so the
-  concurrency you have is not the concurrency the plan asks for.</li>
+  22 s. A task refuses every effect, which is deliberate and which is
+  also not yet the concurrency the plan asks for.</li>
 </ul>
 
-<h2>Who might</h2>
-<p>Someone who genuinely models an untrusted dependency reaching the network or
-the filesystem as a threat, and who wants the compiler to enforce the boundary
-rather than a sandbox at run time. That is a real gap in Rust, Go, Zig and
-Python, and it is the one thing here that is not catching up to somebody
-else.</p>
+<h2>Who it is for</h2>
+<p>Anyone who treats an untrusted dependency reaching the network or the
+filesystem as a threat, and who wants the compiler to enforce that boundary
+rather than a sandbox at run time. Rust, Go, Zig and Python all leave that gap
+wide open. Closing it is the whole point of this language.</p>
 
 <h2>How it is built</h2>
 <p>253 normative clauses in 3,561 lines of specification, under a

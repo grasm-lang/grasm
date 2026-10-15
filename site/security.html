@@ -4,22 +4,24 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Capabilities and the supply chain</title>
 <meta name="description" content="A Grasm package declares what it may reach, and the compiler enforces it.">
+<link rel="preload" href="vendor/fonts/figtree.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="preload" href="vendor/fonts/sora.woff2" as="font" type="font/woff2" crossorigin>
 <link rel="stylesheet" href="style.css">
 <script src="vendor/motion.js" defer></script>
 <script src="vendor/lottie.js" defer></script>
 <script type="module" src="app.js"></script>
 </head><body data-page="security">
 <header class="topbar">
-  <a class="brand" href="index.html"><svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3 4 7.5v9L12 21l8-4.5v-9L12 3Z"/><path d="M12 12 4 7.5M12 12l8-4.5M12 12v9"/></svg><span>grasm</span></a>
+  <a class="brand" href="index.html"><svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3 4 7.5v9L12 21l8-4.5v-9L12 3Z"/><path d="M12 12 4 7.5M12 12l8-4.5M12 12v9"/></svg><span>Grasm</span></a>
   <span class="ver">v1.0.0</span>
   <nav>
-    <a href="different.html">Why</a>
+    <a href="different.html">Why Grasm</a>
     <a href="start.html">Docs</a>
-    <a href="syntax.html">Syntax</a>
     <a href="security.html">Security</a>
     <a href="achieved.html">Scorecard</a>
-    <a href="status.html">Status</a>
+    <a href="playground.html">Playground</a>
   </nav>
+  <a class="cta" href="start.html">Get started</a>
 </header>
 <div class="frame">
 <nav class="rail">
@@ -121,11 +123,12 @@ operating system.</p>
 </ul>
 
 <h2>Prior art</h2>
-<p>None of this is invented here. <a href="about.html">Austral</a> pioneered
+<p>This stands on proven ground. <a href="about.html">Austral</a> pioneered
 capability-secure modules, Wyvern did capability-safe modules before that, and
-the effect row is <a href="about.html">Koka</a>’s. What is uncommon is
-shipping the combination with a gate that proves it: <code>security_bench.sh</code>
-runs the attack on every green build.</p>
+the effect row is <a href="about.html">Koka</a>’s. What no one had shipped is
+the combination, with a gate that proves it:
+<code>security_bench.sh</code> runs the real attack against four toolchains on
+every green build, and three of them wave it through.</p>
 
 <footer>
 Grasm — four engines, one answer. Counts here are computed from the
