@@ -1,5 +1,10 @@
 # The packages a first release needs
 
+The registry these are published to is **Blade**. There is no separate package
+manager to install: `grasm add` pulls from Blade, `grasm publish` pushes to it,
+and `grasm deps` resolves against it and writes `grasm.lock` — all inside the
+one binary.
+
 Written 2026-08-27, extended the same day with a second list. Four exist. This
 is the whole programme, in the order it gets built, with the reason each entry
 is on it — and, at the end, the five things that are **not** buildable today

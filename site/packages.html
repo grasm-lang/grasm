@@ -143,8 +143,12 @@ every other language, depending on the HTTP library means depending on
 something that can.</p>
 
 <h2>Where packages come from</h2>
-<p>Two sources work today: a <code>path</code> dependency, and a local registry
-under <code>.grasm/registry</code> (or wherever <code>GRASM_REGISTRY</code>
+<p>The registry is called <b>Blade</b>. It is not a separate program —
+<code>grasm add</code> pulls from it, <code>grasm publish</code> pushes to it,
+and <code>grasm deps</code> resolves against it, all from the one binary.</p>
+
+<p>Two sources work today: a <code>path</code> dependency, and a local Blade
+registry under <code>.grasm/registry</code> (or wherever <code>GRASM_REGISTRY</code>
 points). Both resolve, lock and check ceilings.</p>
 
 <div class="note"><b>There is no remote registry.</b> Nothing fetches, publishes

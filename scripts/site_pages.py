@@ -1259,8 +1259,12 @@ every other language, depending on the HTTP library means depending on
 something that can.</p>
 
 <h2>Where packages come from</h2>
-<p>Two sources work today: a <code>path</code> dependency, and a local registry
-under <code>.grasm/registry</code> (or wherever <code>GRASM_REGISTRY</code>
+<p>The registry is called <b>Blade</b>. It is not a separate program —
+<code>grasm add</code> pulls from it, <code>grasm publish</code> pushes to it,
+and <code>grasm deps</code> resolves against it, all from the one binary.</p>
+
+<p>Two sources work today: a <code>path</code> dependency, and a local Blade
+registry under <code>.grasm/registry</code> (or wherever <code>GRASM_REGISTRY</code>
 points). Both resolve, lock and check ceilings.</p>
 
 <div class="note"><b>There is no remote registry.</b> Nothing fetches, publishes
@@ -1466,7 +1470,7 @@ table because the margin moved once already with nothing noticing: see
 <div class="scroll"><table>
 <tr><th>Limit</th><th>Detail</th></tr>
 <tr><td>«packages» libraries, all first-party</td><td>See <a href="packages.html">Packages</a>; the plan for the rest is in <code>docs/packages-plan.md</code>. Anything else you need, you write, or bind to C with <code>extern fn</code>.</td></tr>
-<tr><td>No remote registry</td><td>Path and local-registry dependencies work. Nothing fetches or publishes.</td></tr>
+<tr><td>Blade is local only</td><td>A <code>path</code> dependency and a local Blade registry both work. Nothing fetches from or publishes to a remote one yet.</td></tr>
 <tr><td>Downloads are not code-signed</td><td>macOS binaries for both architectures are published on the <a href="https://github.com/grasm-lang/grasm/releases/latest">releases page</a> with SHA-256 sums, but they carry no Apple Developer signature, so Gatekeeper will ask before the first run. Notarisation is release work, not language work.</td></tr>
 <tr><td>Not faster than Rust</td><td>The geomean is «geomean»× of it, «geomean_floor»× with the harness floor taken out of both sides, against a 0.95× target — so the goal is met and the claim is not available. <code>tree</code> at «tree_ratio»× is the worst row. On the systems suite Grasm loses <code>etl</code> by «etl_ratio»×, and wins memory everywhere — «chat_mem_ratio»× on <code>chat</code>. <a href="performance.html">Every row →</a></td></tr>
 <tr><td>One integer width, one float width</td><td><code>i8</code>…<code>u64</code>, <code>usize</code> and <code>int</code> are aliases for <code>i64</code>; <code>f32</code> is an alias for <code>f64</code> (<code>spec/types.md</code> [T-INT-ALIAS]). No unsigned and no wrapping arithmetic.</td></tr>

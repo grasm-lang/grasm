@@ -102,6 +102,24 @@ Honest about the trade: on eight benchmark programs Grasm's geomean is
 **0.965× of Rust `-O3`**. That is **3.5% behind**. It is not a win over Rust,
 and the chart below shows exactly which program carries the deficit.
 
+## Packages: Blade, and no second tool to install
+
+Every other ecosystem hands you a second program — `pip`, `npm`, `cargo`,
+`maven`, `gem`, `conan`. Grasm folds it in, the way `go`, `zig`, `deno` and
+`bun` do:
+
+| Elsewhere | Here |
+|---|---|
+| `pip install` · `npm i` · `cargo add` | `grasm add` |
+| `cargo publish` · `npm publish` · `gem push` | `grasm publish` |
+| `cargo update` · `npm ci` · `bundle install` | `grasm deps` → `grasm.lock` |
+| crates.io · PyPI · npm registry | **Blade** |
+
+**Blade** is the registry packages live in. It is a name for the place, not a
+program to install — the commands above are subcommands of the one binary you
+already have, and every package in Blade declares its capability ceiling, which
+is the thing no other registry can tell you.
+
 ## Is this a Rust wrapper?
 
 No. A `.gr` file never becomes Rust source and never touches `rustc`.
