@@ -1,0 +1,75 @@
+// A photograph on the screen: decode, composite, upload, present.
+//
+// Four packages and no new builtin. `jpeg` turns the file into samples,
+// `pcframe` turns those into an RGBA surface and draws a panel over it with
+// alpha, `sdl` puts the surface in a window, `sdlevent` says when to stop.
+//
+//     pcview <file.jpg> [frames]
+//
+// With `SDL_VIDEODRIVER=dummy` it runs with no display, which is how
+// `scripts/pcviewtest.sh` checks the whole stack.
+import jpeg
+import pcframe
+import sdl
+import sdlevent
+
+fn main() -> () ! (JpegPixelError | SdlError) / {io, unsafe} {
+    let a = args()
+    let path = a.get(0) ?? ""
+    let frames = match a.get(1) {
+        Some(n) -> n.parse_int() ?? 0
+        None -> 0
+    }
+
+    let data = match read_bytes(path) {
+        Err(_e) -> {
+            print("cannot read {path}")
+            return
+        }
+        Ok(d) -> d
+    }
+    let img = try jpeg.decode(data)
+    var canvas = if img.comps == 1 {
+        pcframe.from_gray(img.pixels, img.width, img.height)
+    } else {
+        pcframe.from_rgb(img.pixels, img.width, img.height)
+    }
+
+    // A half-transparent panel down the left, the way a tool palette sits
+    // over a photograph.
+    let panel = Rect{ x: 0, y: 0, w: img.width / 5, h: img.height }
+    var overlay = pcframe.new(img.width, img.height)
+    pcframe.fill_rect(overlay, panel, 20, 24, 40, 160)
+    pcframe.blend(canvas, overlay, pcframe.whole(overlay), 0, 0)
+
+    try sdl.init_video()
+    let win = try sdl.create_window("Grasm", img.width, img.height)
+    let ren = try sdl.create_renderer(win)
+    let tex = try sdl.create_texture(ren, img.width, img.height)
+    var ev = sdl.event_buffer()
+    var drawn = 0
+    var running = true
+    while running {
+        while sdl.poll_event(ev) {
+            if sdlevent.is_exit(sdlevent.decode(ev)) {
+                running = false
+            }
+        }
+        try sdl.update_texture(tex, pcframe.pixels(canvas), pcframe.pitch(canvas))
+        try sdl.render_clear(ren)
+        try sdl.render_copy(ren, tex)
+        sdl.render_present(ren)
+        drawn = drawn + 1
+        if frames > 0 and drawn >= frames {
+            running = false
+        }
+        if frames == 0 {
+            sdl.delay(16)
+        }
+    }
+    sdl.destroy_texture(tex)
+    sdl.destroy_renderer(ren)
+    sdl.destroy_window(win)
+    sdl.quit()
+    print("{img.width}x{img.height} {img.comps}ch, {drawn} frames")
+}

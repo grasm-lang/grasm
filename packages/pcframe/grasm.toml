@@ -1,0 +1,6 @@
+[package]
+name = "pcframe"
+version = "1.0.0"
+
+# Pixels in memory. Reads no files and calls no C.
+capabilities = []

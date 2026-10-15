@@ -1,0 +1,379 @@
+// An RGBA surface, and the rectangles of it that changed.
+//
+// The bridge between a decoder and a screen: `packages/jpeg` produces three
+// bytes a pixel, SDL's streaming texture wants four in memory order R, G, B,
+// A, and a compositor wants to know which rows actually changed so it can
+// upload those instead of the frame.
+//
+// Everything here is a `bytes` buffer written in place
+// ([L-LIB-BYTES-WRITE]). At four bytes a pixel a 24-megapixel surface is
+// 96 MB; the same surface as `[i64]` would be 768 MB, which is the reason
+// this package can exist at all.
+
+type Surface = {
+    width: i64,
+    height: i64,
+    px: bytes,
+}
+
+/// A rectangle, as `x`, `y`, `w`, `h`. Empty when `w` or `h` is zero.
+type Rect = {
+    x: i64,
+    y: i64,
+    w: i64,
+    h: i64,
+}
+
+/// A transparent surface.
+pub fn new(width: i64, height: i64) -> Surface {
+    Surface{ width: width, height: height, px: bytes_filled(width * height * 4, 0) }
+}
+
+/// An opaque surface of one colour.
+pub fn filled(width: i64, height: i64, r: i64, g: i64, b: i64) -> Surface {
+    var s = new(width, height)
+    let all = Rect{ x: 0, y: 0, w: width, h: height }
+    fill_rect(s, all, r, g, b, 255)
+    s
+}
+
+pub fn width_of(s: Surface) -> i64 {
+    s.width
+}
+
+pub fn height_of(s: Surface) -> i64 {
+    s.height
+}
+
+/// The RGBA bytes, ready for `sdl.update_texture` with a pitch of `width * 4`.
+pub fn pixels(s: Surface) -> bytes {
+    s.px
+}
+
+pub fn pitch(s: Surface) -> i64 {
+    s.width * 4
+}
+
+/// The rectangle covering the whole surface.
+pub fn whole(s: Surface) -> Rect {
+    Rect{ x: 0, y: 0, w: s.width, h: s.height }
+}
+
+pub fn is_empty(r: Rect) -> bool {
+    r.w <= 0 or r.h <= 0
+}
+
+/// A rectangle clipped to a surface, which may be empty.
+pub fn clip(s: Surface, r: Rect) -> Rect {
+    var x = r.x
+    var y = r.y
+    var w = r.w
+    var h = r.h
+    if x < 0 {
+        w = w + x
+        x = 0
+    }
+    if y < 0 {
+        h = h + y
+        y = 0
+    }
+    if x + w > s.width {
+        w = s.width - x
+    }
+    if y + h > s.height {
+        h = s.height - y
+    }
+    if w < 0 {
+        w = 0
+    }
+    if h < 0 {
+        h = 0
+    }
+    Rect{ x: x, y: y, w: w, h: h }
+}
+
+/// The smallest rectangle covering both, which is what a damage list
+/// collapses to when uploading one region is cheaper than uploading two.
+pub fn union(a: Rect, b: Rect) -> Rect {
+    if is_empty(a) {
+        return b
+    }
+    if is_empty(b) {
+        return a
+    }
+    let x = if a.x < b.x { a.x } else { b.x }
+    let y = if a.y < b.y { a.y } else { b.y }
+    let ax = a.x + a.w
+    let bx = b.x + b.w
+    let ay = a.y + a.h
+    let by = b.y + b.h
+    let right = if ax > bx { ax } else { bx }
+    let bottom = if ay > by { ay } else { by }
+    Rect{ x: x, y: y, w: right - x, h: bottom - y }
+}
+
+/// Every rectangle in a damage list, collapsed into one.
+pub fn cover(rs: [Rect]) -> Rect {
+    var out = Rect{ x: 0, y: 0, w: 0, h: 0 }
+    for r in rs {
+        out = union(out, r)
+    }
+    out
+}
+
+/// One pixel, as `[r, g, b, a]`. Out of range gives a transparent pixel
+/// rather than panicking: a compositor samples outside a layer constantly.
+pub fn pixel(s: Surface, x: i64, y: i64) -> [i64] {
+    if x < 0 or y < 0 or x >= s.width or y >= s.height {
+        return [0, 0, 0, 0]
+    }
+    let i = (y * s.width + x) * 4
+    [s.px.at(i), s.px.at(i + 1), s.px.at(i + 2), s.px.at(i + 3)]
+}
+
+pub fn set_pixel(inout s: Surface, x: i64, y: i64, r: i64, g: i64, b: i64, a: i64) {
+    if x < 0 or y < 0 or x >= s.width or y >= s.height {
+        return
+    }
+    let i = (y * s.width + x) * 4
+    s.px.set(i, r)
+    s.px.set(i + 1, g)
+    s.px.set(i + 2, b)
+    s.px.set(i + 3, a)
+}
+
+/// Paint a rectangle one colour.
+pub fn fill_rect(inout s: Surface, r: Rect, red: i64, green: i64, blue: i64, alpha: i64) {
+    let c = clip(s, r)
+    if is_empty(c) {
+        return
+    }
+    var y = c.y
+    while y < c.y + c.h {
+        var x = c.x
+        while x < c.x + c.w {
+            let i = (y * s.width + x) * 4
+            s.px.set(i, red)
+            s.px.set(i + 1, green)
+            s.px.set(i + 2, blue)
+            s.px.set(i + 3, alpha)
+            x = x + 1
+        }
+        y = y + 1
+    }
+}
+
+/// A surface from three-bytes-a-pixel RGB, which is what `jpeg.decode` and
+/// `png.decode` produce. Alpha is opaque.
+///
+/// `copy_from` per row rather than per byte: one call writes a row, and the
+/// rows are the only place the two layouts agree, because three bytes a pixel
+/// and four do not line up anywhere else.
+pub fn from_rgb(rgb: bytes, width: i64, height: i64) -> Surface {
+    var s = new(width, height)
+    var i = 0
+    let n = width * height
+    while i < n {
+        let src = i * 3
+        let dst = i * 4
+        s.px.set(dst, rgb.at(src))
+        s.px.set(dst + 1, rgb.at(src + 1))
+        s.px.set(dst + 2, rgb.at(src + 2))
+        s.px.set(dst + 3, 255)
+        i = i + 1
+    }
+    s
+}
+
+/// A surface from one byte a pixel, which is what a grayscale decode gives.
+pub fn from_gray(gray: bytes, width: i64, height: i64) -> Surface {
+    var s = new(width, height)
+    var i = 0
+    let n = width * height
+    while i < n {
+        let v = gray.at(i)
+        let dst = i * 4
+        s.px.set(dst, v)
+        s.px.set(dst + 1, v)
+        s.px.set(dst + 2, v)
+        s.px.set(dst + 3, 255)
+        i = i + 1
+    }
+    s
+}
+
+/// Copy a rectangle of `src` onto `dst` at `(dx, dy)`, ignoring alpha.
+///
+/// A row at a time through `copy_from`, which is the whole reason the surface
+/// is a byte buffer: the rows are contiguous in both, so one call moves
+/// `w * 4` bytes instead of a loop moving them one at a time.
+pub fn blit(inout dst: Surface, src: Surface, from: Rect, dx: i64, dy: i64) {
+    let c = clip(src, from)
+    if is_empty(c) {
+        return
+    }
+    var y = 0
+    while y < c.h {
+        let ty = dy + y
+        if ty >= 0 and ty < dst.height {
+            let sx = c.x
+            var w = c.w
+            var tx = dx
+            if tx < 0 {
+                w = w + tx
+                tx = 0
+            }
+            if tx + w > dst.width {
+                w = dst.width - tx
+            }
+            if w > 0 {
+                let row = src.px.slice(
+                    ((c.y + y) * src.width + sx) * 4,
+                    ((c.y + y) * src.width + sx + w) * 4,
+                )
+                dst.px.copy_from((ty * dst.width + tx) * 4, row)
+            }
+        }
+        y = y + 1
+    }
+}
+
+/// Copy a rectangle of `src` onto `dst`, weighting by `src`'s alpha.
+///
+/// Straight alpha, not premultiplied, and the destination keeps its own
+/// alpha: this is a layer over an opaque background, which is what a
+/// compositor does most of.
+pub fn blend(inout dst: Surface, src: Surface, from: Rect, dx: i64, dy: i64) {
+    let c = clip(src, from)
+    if is_empty(c) {
+        return
+    }
+    var y = 0
+    while y < c.h {
+        var x = 0
+        while x < c.w {
+            let s = pixel(src, c.x + x, c.y + y)
+            let a = s.get(3).unwrap_or(255)
+            if a > 0 {
+                let d = pixel(dst, dx + x, dy + y)
+                var out: [i64] = []
+                var k = 0
+                while k < 3 {
+                    let sv = s.get(k).unwrap_or(0)
+                    let dv = d.get(k).unwrap_or(0)
+                    out.push((sv * a + dv * (255 - a) + 127) / 255)
+                    k = k + 1
+                }
+                set_pixel(
+                    dst, dx + x, dy + y,
+                    out.get(0).unwrap_or(0),
+                    out.get(1).unwrap_or(0),
+                    out.get(2).unwrap_or(0),
+                    d.get(3).unwrap_or(255),
+                )
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+}
+
+test "a filled surface is that colour everywhere" {
+    let s = filled(4, 3, 10, 20, 30)
+    assert_eq(pixels(s).len(), 48)
+    assert_eq(pitch(s), 16)
+    for p in [pixel(s, 0, 0), pixel(s, 3, 2), pixel(s, 2, 1)] {
+        assert_eq(p.get(0).unwrap_or(0), 10)
+        assert_eq(p.get(1).unwrap_or(0), 20)
+        assert_eq(p.get(2).unwrap_or(0), 30)
+        assert_eq(p.get(3).unwrap_or(0), 255)
+    }
+}
+
+test "sampling outside a surface is transparent rather than a panic" {
+    let s = filled(2, 2, 1, 2, 3)
+    for p in [pixel(s, -1, 0), pixel(s, 0, -1), pixel(s, 2, 0), pixel(s, 0, 2)] {
+        assert_eq(p.get(3).unwrap_or(9), 0)
+    }
+}
+
+test "a rectangle past the edge is clipped, not wrapped" {
+    let s = new(4, 4)
+    let c = clip(s, Rect{ x: 2, y: 2, w: 10, h: 10 })
+    assert_eq(c.x, 2)
+    assert_eq(c.w, 2)
+    assert_eq(c.h, 2)
+    let n = clip(s, Rect{ x: -3, y: 0, w: 2, h: 2 })
+    assert(is_empty(n))
+}
+
+test "a fill past the edge leaves the rest alone" {
+    var s = filled(4, 2, 0, 0, 0)
+    fill_rect(s, Rect{ x: 3, y: 0, w: 10, h: 10 }, 9, 9, 9, 255)
+    assert_eq(pixel(s, 3, 0).get(0).unwrap_or(0), 9)
+    assert_eq(pixel(s, 3, 1).get(0).unwrap_or(0), 9)
+    assert_eq(pixel(s, 2, 0).get(0).unwrap_or(9), 0)
+}
+
+test "rgb becomes opaque rgba" {
+    let s = from_rgb(bytes_of([1, 2, 3, 4, 5, 6]), 2, 1)
+    assert_eq(pixel(s, 0, 0), [1, 2, 3, 255])
+    assert_eq(pixel(s, 1, 0), [4, 5, 6, 255])
+}
+
+test "gray becomes rgba on all three channels" {
+    let s = from_gray(bytes_of([7, 200]), 2, 1)
+    assert_eq(pixel(s, 0, 0), [7, 7, 7, 255])
+    assert_eq(pixel(s, 1, 0), [200, 200, 200, 255])
+}
+
+test "a blit moves a rectangle and nothing else" {
+    let src = filled(2, 2, 9, 8, 7)
+    var dst = filled(4, 4, 1, 1, 1)
+    blit(dst, src, whole(src), 1, 1)
+    assert_eq(pixel(dst, 1, 1).get(0).unwrap_or(0), 9)
+    assert_eq(pixel(dst, 2, 2).get(2).unwrap_or(0), 7)
+    assert_eq(pixel(dst, 0, 0).get(0).unwrap_or(0), 1)
+    assert_eq(pixel(dst, 3, 3).get(0).unwrap_or(0), 1)
+}
+
+test "a blit landing partly outside copies only the part inside" {
+    let src = filled(3, 1, 5, 5, 5)
+    var dst = filled(4, 1, 0, 0, 0)
+    blit(dst, src, whole(src), 2, 0)
+    assert_eq(pixel(dst, 2, 0).get(0).unwrap_or(0), 5)
+    assert_eq(pixel(dst, 3, 0).get(0).unwrap_or(0), 5)
+    assert_eq(pixel(dst, 1, 0).get(0).unwrap_or(5), 0)
+}
+
+test "a half-transparent layer is half of each" {
+    var src = new(1, 1)
+    set_pixel(src, 0, 0, 200, 100, 0, 128)
+    var dst = filled(1, 1, 0, 200, 100)
+    blend(dst, src, whole(src), 0, 0)
+    let p = dst |> pixel(0, 0)
+    // 200*128 + 0*127, rounded: 100. And the destination keeps its alpha.
+    assert_eq(p.get(0).unwrap_or(0), 100)
+    assert_eq(p.get(1).unwrap_or(0), 150)
+    assert_eq(p.get(2).unwrap_or(0), 50)
+    assert_eq(p.get(3).unwrap_or(0), 255)
+}
+
+test "a fully transparent layer changes nothing" {
+    let src = new(2, 2)
+    var dst = filled(2, 2, 3, 4, 5)
+    blend(dst, src, whole(src), 0, 0)
+    assert_eq(pixel(dst, 1, 1), [3, 4, 5, 255])
+}
+
+test "a damage list collapses to one rectangle" {
+    let r = cover([
+        Rect{ x: 10, y: 10, w: 5, h: 5 },
+        Rect{ x: 0, y: 20, w: 2, h: 2 },
+    ])
+    assert_eq(r.x, 0)
+    assert_eq(r.y, 10)
+    assert_eq(r.w, 15)
+    assert_eq(r.h, 12)
+    assert(is_empty(cover([])))
+}

@@ -71,6 +71,28 @@ fi
 per=$(python3 -c "print(f'{($end - $start) * 1000 / $frames:.2f}')")
 echo "    frames: $frames   per frame: ${per} ms   (16.67 ms is 60 fps)"
 
+# The whole stack, not just the window: a JPEG decoded by `packages/jpeg`,
+# composited by `packages/pcframe` with a half-transparent panel over it, and
+# uploaded to the texture. Four packages, and if any of them stops agreeing
+# with the others this is where it shows.
+if ! "$GRASM" build packages/pcview-demo/src/main.gr --native --link SDL2 \
+    -o "$work/pcview" >"$work/pcview.log" 2>&1; then
+    echo "    the viewer did not build:"
+    sed 's/^/      /' "$work/pcview.log"
+    exit 1
+fi
+view=$(SDL_VIDEODRIVER=dummy "$work/pcview" scripts/fixtures/jpeg/g32_420.jpg 30 2>&1) || {
+    echo "    the viewer did not run:"
+    echo "$view" | sed 's/^/      /'
+    exit 1
+}
+if [ "$view" != "32x24 3ch, 30 frames" ]; then
+    echo "    expected: 32x24 3ch, 30 frames"
+    echo "    got:      $view"
+    exit 1
+fi
+echo "    jpeg -> pcframe -> texture: $view"
+
 # A frame budget rather than a bare timing, so this fails if the path becomes
 # too slow to drive a window rather than merely getting slower. Generous
 # against the ~0.4 ms measured, because this shares a machine with the other
