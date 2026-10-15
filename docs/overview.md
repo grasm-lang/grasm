@@ -195,10 +195,19 @@ rows are mostly floor: C's 5 ms `fib` is about 3 ms of work and Grasm's 10 ms
 about 8, which is nearer 2.7x than the 2x the raw numbers show. Subtract 2 from
 every cell before taking a ratio on a short row.
 
+> **This table is the 2026-08-25 run and has been superseded.** On 2026-10-02,
+> on an idle machine, `scripts/bench.sh` printed a geometric mean of
+> **0.965x** against Rust — **0.955x** with the floor subtracted — against the
+> same 0.95x target, with five of the eight programs at or above parity and
+> `tree` at 0.51x rather than the 5.1x below. `docs/performance.md` holds the
+> run and what changed; `docs/northstar.md` holds the G2 row the site cites.
+> The figures below are kept because the ledger in `docs/performance.md`
+> refers back to them, not because they are current.
+
 `scripts/bench.sh` prints the geometric mean against Rust from these numbers
-rather than leaving it to be worked out by hand: **0.45x**, or **0.39x** with
-the floor subtracted, against a target of 0.95x. `tree` alone is 5.1x behind and
-carries most of it.
+rather than leaving it to be worked out by hand: at the time of this table,
+**0.45x**, or **0.39x** with the floor subtracted, against a target of 0.95x.
+`tree` alone was 5.1x behind and carried most of it.
 
 Against the previous run no compiled cell moved by more than 7 ms, and that one
 was Rust's `parmap` — the reference languages moved with Grasm rather than
