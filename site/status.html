@@ -153,6 +153,23 @@ table because the margin moved once already with nothing noticing: see
 <tr><td>Region sweep not implemented</td><td>Tier 1's rule is enforced; the bulk deallocation it makes sound is not built.</td></tr>
 </table></div>
 
+<h2>Deliberate, and still surprising</h2>
+<p>Four things an outside port tripped over in its first week. None is a
+defect and each one refuses with a diagnostic that explains itself — they are
+here because a reader arriving from Rust, npm or Go will write all four by
+reflex, and finding out one at a time costs an afternoon.</p>
+<div class="scroll"><table>
+<tr><th>You write</th><th>What happens</th><th>Why</th></tr>
+<tr><td><code>pub type Shape = …</code></td><td>refused</td>
+    <td>Types are one namespace across the whole program, so every type is already reachable from every module. There is nothing for <code>pub</code> to change.</td></tr>
+<tr><td><code>let own = 1</code></td><td>refused</td>
+    <td><code>own</code> is a parameter mode and one of the 37 Core constructs, so it is reserved. It is a common variable name, and that is a real cost of spending the word here.</td></tr>
+<tr><td><code>name = "my-pkg"</code></td><td>refused</td>
+    <td>A consumer writes <code>import my_pkg</code> with the name bare, so the name has to be a Grasm identifier. Registries whose import syntax quotes the name — npm, PyPI — can afford hyphens; this one cannot.</td></tr>
+<tr><td><code>let x = fallible()</code></td><td>refused</td>
+    <td>A failure cannot be dropped on the floor. Use <code>try</code> to propagate, <code>match</code> to handle both arms, or annotate the binding <code>: T ! E</code> to hold the failure as a value.</td></tr>
+</table></div>
+
 <h2>What is not claimed</h2>
 <p>Grasm is not faster than Rust, Go or Zig, and no benchmark here says it is.
 It is not battle-tested. Defects are still being found at roughly one per
