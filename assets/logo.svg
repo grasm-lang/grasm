@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 200" width="880" height="200" role="img" aria-label="Grasm">
+  <defs>
+    <linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#3DDC97"/>
+      <stop offset="1" stop-color="#17A2A2"/>
+    </linearGradient>
+  </defs>
+  <!-- Mark: three engines, one answer. Three paths converging on one node. -->
+  <g fill="none" stroke="url(#g)" stroke-width="11" stroke-linecap="round">
+    <path d="M44 48 H104 Q150 48 150 100 Q150 152 104 152 H44"/>
+    <path d="M44 100 H112"/>
+  </g>
+  <circle cx="150" cy="100" r="13" fill="url(#g)"/>
+  <text x="206" y="131" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace"
+        font-size="104" font-weight="700" fill="url(#g)" letter-spacing="-3">grasm</text>
+  <text x="212" y="170" font-family="ui-sans-serif,system-ui,-apple-system,Segoe UI,sans-serif"
+        font-size="25" fill="#8B96A5" letter-spacing="5">EFFECTS · OWNERSHIP · ONE BINARY</text>
+</svg>

@@ -387,11 +387,13 @@ them is being kept up to date and the other is not.",
 the same number — that is exactly the drift this test exists for"
     );
 
-    // And in the README, which is what a reader meets first.
-    let readme =
-        std::fs::read_to_string(repo_root().join("README.md")).expect("README.md should exist");
+    // And in the guide a reader is sent to for the detail. This was README.md
+    // until the README became a landing page; the number belongs wherever the
+    // prose explaining it lives, not wherever it used to live.
+    let guide = std::fs::read_to_string(repo_root().join("docs/overview.md"))
+        .expect("docs/overview.md should exist");
     assert!(
-        readme.contains(&format!("{core} constructs against a budget of 30")),
-        "README.md disagrees with spec/core.md about the Core count ({core})"
+        guide.contains(&format!("{core} constructs against a budget of 30")),
+        "docs/overview.md disagrees with spec/core.md about the Core count ({core})"
     );
 }
