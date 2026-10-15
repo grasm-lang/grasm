@@ -155,6 +155,74 @@ This file is not empty because nothing is wrong — it is empty because what was
 wrong is listed above as closed. The next round of evaluation is what refills
 it.
 
+## Representation limits
+
+These are not defects. Nothing here is broken against a clause, and no gate is
+red because of them -- they are things the language does not have yet, and the
+reason a program can be correct here and still not be the right program to
+write here. They are collected because the first person outside this repository
+to port a real application hit every one of them in a week, and the list is
+more useful than the sum of the clauses that imply it.
+
+**One integer width, one float width.** `spec/types.md` [T-INT-ALIAS]: `i8`,
+`i16`, `i32`, `u8`, `u16`, `u32`, `u64`, `usize` and `int` are aliases for
+`i64`, and `f32` and `float` are aliases for `f64`. Distinct fixed-width types
+are designed and unimplemented. There is no unsigned arithmetic, no wrapping
+`u8`/`u16`/`u32`, and a `u32` hash wants masking by hand. Code that packs
+binary32 writes the bit layout itself.
+
+**No mutable byte buffer.** `bytes` is immutable: no element assignment, no
+fill, no slice-assign. A buffer of samples is therefore `[i64]` or `[f64]` at
+eight bytes a sample, and that is an eightfold difference in memory for
+anything that holds pixels. The arithmetic, which follows from the widths above
+rather than from a measurement: an 8-bit RGBA tile of 256x256 is 256 KiB
+packed and **2 MiB** here; a 24-megapixel RGBA document is about 96 MB packed
+and **about 768 MB** here. An image editor whose architecture is copy-on-write
+byte tiles cannot be written against this today, and that is the clearest
+example of a program this language is not yet for.
+
+**No SIMD.** No intrinsics and no autovectoriser. `docs/performance.md`
+records the one measurement taken against this: the flat struct-list sum is
+scalar in both Grasm and Rust, so vectorisation is not what the geomean gap is
+made of -- but it is also not available when a program wants it.
+
+**No shared mutable state across threads.** `par_map` and `par_filter` require
+an empty effect row and will not reach a `ref` from an enclosing scope, and a
+task cannot be spawned per element of a list. A worker pool over a shared
+tile cache -- `rayon` plus an `Arc<Tile>` -- has no direct expression. This is
+the ordering guarantee and the replay guarantee being paid for, not an
+oversight, but the cost is real and belongs here.
+
+**No mutable globals, statics or thread-locals.** A handler cannot hold state
+between invocations. A fresh-id counter, a lazily built transform cache and a
+thread-local "current colour space" all have to be restructured -- the state
+moves onto the value it belongs to and the context is threaded explicitly.
+This is what makes a recording replayable, and it is also a rewrite of any
+code that assumed otherwise.
+
+**No pointer identity.** No address-keyed memo table and no weak map, so a
+cache over a graph needs keys the program invents and maintains.
+
+**No file handles.** Whole-file reads and writes plus ranged access --
+`read_bytes_at`, `append_bytes`, `file_size`, `sync_file`, `rename_file`.
+There is no reader object, no `seek`, no `mmap` and no streaming encoder.
+Random-access container parsing works, by offset arithmetic rather than by a
+cursor.
+
+**No string builder.** `str` is immutable, so `s = s + x` in a loop is
+quadratic; the external port measured roughly 2.4 s for 400,000 appends.
+Collect into a list and `join`.
+
+**A union error cannot be narrowed.** `(A|B)` can be raised, propagated and
+printed, but not destructured back into its arms. The way to branch on which
+failure occurred is to declare one sum type and match it.
+
+**No GUI, no GPU, no DOM.** There is no windowing or toolkit binding, no FFI
+shaped to bind one, nothing addressing the GPU in any package, and the wasm
+build ships the interpreter without reach into the DOM. Platform input devices
+are likewise absent. An application whose shell is any of those has no target
+here, whatever its core is written in.
+
 ## Nothing open
 
 The six defects that were open on 2026-08-17 are closed:
