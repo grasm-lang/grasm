@@ -459,9 +459,77 @@ fn mutate_in_place(
             };
             Value::Bool(Rc::make_mut(entries).remove(&key).is_some())
         }
+        // Writing into a `bytes` ([L-LIB-BYTES-WRITE]). Through `make_mut`
+        // like every other container, so a buffer shared with anything else
+        // is copied and value semantics hold ([E-COW]).
+        //
+        // These three and no more: each writes a fixed number of bytes into a
+        // buffer of fixed length. Growing one would have to move the
+        // allocation, and in the compiled runtime a `bytes` may be a *window*
+        // on a larger buffer whose address is held separately -- see
+        // `RtBytes::sub`.
+        (Value::Bytes(b), "set") => {
+            let v = args.pop().unwrap();
+            let i = args.pop().unwrap();
+            let (Value::Int(i), Value::Int(v)) = (i, v) else {
+                return Err(Flow::Panic("set expects two integers".into()));
+            };
+            let buf = Rc::make_mut(b);
+            if i < 0 || i as usize >= buf.len() {
+                return Err(Flow::Panic(format!(
+                    "index {i} out of bounds (len {})",
+                    buf.len()
+                )));
+            }
+            buf[i as usize] = byte_or_panic(v, "set")?;
+            Value::Unit
+        }
+        (Value::Bytes(b), "fill") => {
+            let Value::Int(v) = args.pop().unwrap() else {
+                return Err(Flow::Panic("fill expects an integer".into()));
+            };
+            let v = byte_or_panic(v, "fill")?;
+            Rc::make_mut(b).fill(v);
+            Value::Unit
+        }
+        (Value::Bytes(b), "copy_from") => {
+            let src = args.pop().unwrap();
+            let Value::Int(at) = args.pop().unwrap() else {
+                return Err(Flow::Panic("copy_from expects an integer".into()));
+            };
+            let Value::Bytes(src) = src else {
+                return Err(Flow::Panic("copy_from expects bytes".into()));
+            };
+            // Read the source out before taking the destination mutably: the
+            // two can be the same buffer, and `b.copy_from(0, b)` is a
+            // program somebody will write.
+            let m = src.len();
+            let buf = Rc::make_mut(b);
+            let n = buf.len();
+            if at < 0 || at as usize > n || at as usize + m > n {
+                return Err(Flow::Panic(format!(
+                    "copy_from writes {m} bytes at {at}, past the end (len {n})"
+                )));
+            }
+            buf[at as usize..at as usize + m].copy_from_slice(&src);
+            Value::Unit
+        }
         _ => return Ok(None),
     };
     Ok(Some(r))
+}
+
+/// A byte, or the panic both engines print for a value that is not one.
+///
+/// `op` is in the message because the value came from a call the programmer
+/// wrote, and "set takes values in 0..255" says which call.
+fn byte_or_panic(n: i64, op: &str) -> Result<u8, Flow> {
+    if !(0..=255).contains(&n) {
+        return Err(Flow::Panic(format!(
+            "{n} is not a byte — {op} takes values in 0..255"
+        )));
+    }
+    Ok(n as u8)
 }
 
 /// The binding a place expression is rooted at, if it is a place at all.
@@ -3262,6 +3330,38 @@ uses to mark the end of a string"
                         }
                         return Ok(Value::Bytes(Rc::new(out)));
                     }
+                    // A buffer of `n` copies of one byte, allocated once
+                    // ([L-LIB-BYTES-WRITE]).
+                    "bytes_filled" => {
+                        let Value::Int(n) = self.eval_expr(&args[0])? else {
+                            return Err(Flow::Panic(
+                                "bytes_filled expects an integer count".into(),
+                            ));
+                        };
+                        let Value::Int(v) = self.eval_expr(&args[1])? else {
+                            return Err(Flow::Panic("bytes_filled expects an integer".into()));
+                        };
+                        if n < 0 {
+                            return Err(Flow::Panic(format!(
+                                "bytes_filled: a buffer cannot have {n} bytes"
+                            )));
+                        }
+                        // A count past what can be allocated is a sentence,
+                        // not the allocator aborting ([E-PANIC-EXIT]) -- the
+                        // same guard `repeat` has, for the same reason. The
+                        // compiled runtime's panic handler cannot format a
+                        // message, so an allocator abort there prints
+                        // "(message needs formatting)" and the two engines
+                        // disagree about a program that merely asked for too
+                        // much.
+                        if n as usize > MAX_ALLOC {
+                            return Err(Flow::Panic(format!(
+                                "bytes_filled would need more memory than a buffer can hold ({n} bytes)"
+                            )));
+                        }
+                        let v = byte_or_panic(v, "bytes_filled")?;
+                        return Ok(Value::Bytes(Rc::new(vec![v; n as usize])));
+                    }
                     "random_bytes" => {
                         use std::io::Read;
                         let n = match self.eval_expr(&args[0])? {
@@ -4030,10 +4130,12 @@ uses to mark the end of a string"
             }
             return Ok(Value::Unit);
         }
-        if matches!(
-            name.name.as_str(),
-            "push" | "pop" | "sort" | "set" | "delete" | "remove"
-        ) {
+        // The same list the checker's guards use, rather than a fourth copy.
+        // `sort_by` is in it and never arrives: the block above answers it
+        // and returns, because it has to call a closure per element and this
+        // path cannot. Entering here would cost nothing but would evaluate
+        // its argument and discard it.
+        if grasm_sema::builtins::MUTATING_METHODS.contains(&name.name.as_str()) {
             if let Some(r) = self.try_mutating_method(recv, name, args)? {
                 return Ok(r);
             }

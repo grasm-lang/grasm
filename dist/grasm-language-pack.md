@@ -1606,9 +1606,9 @@ number, so `^1.2.3` stops below `2.0.0`, `^0.2.3` stops below `0.3.0`, and
 reaching one name through two different directories is an error, not a choice
 the toolchain makes on the program's behalf.
 
-A dependency with a `version` and no `path` comes from the **registry**, a
-directory of `<name>/<version>/` packages located by `GRASM_REGISTRY` or the
-nearest enclosing `.grasm/registry`. Versions are chosen by **minimal version
+A dependency with a `version` and no `path` comes from the **registry** —
+**Blade** — a directory of `<name>/<version>/` packages located by
+`GRASM_REGISTRY` or the nearest enclosing `.grasm/registry`. Versions are chosen by **minimal version
 selection**: for each package, take the highest floor any requirement stated,
 select the lowest version the registry holds at or above it, and then check
 that selection against every requirement. There is no search — requirements
@@ -2037,8 +2037,12 @@ panics. `chan_select(chs)` is the index of the first channel in `chs` that a
 `chan_recv` would not wait on, and waits until there is one.
 
 **[E-SCHEDULE]** A task runs alone until it ends or a channel operation has to
-wait; then the next task, in the order the `go`s ran, takes over. So output is
-the same on every run. A channel operation outside every task that has to wait
+wait; then the next **runnable** task takes over, in the order the `go`s ran
+among those that have never waited, and otherwise in the order they were
+woken. A send wakes the task that has waited longest for room to send;
+a receive wakes the one that has waited longest for a value; closing wakes
+every task waiting on that channel. So output is the same on every run.
+A channel operation outside every task that has to wait
 panics, since there is nothing to wait for. `grasm test --schedules N` reruns a
 test under `N` other orders, each named by a seed `--schedule-seed` replays.
 
@@ -2956,6 +2960,10 @@ cannot emit an object file.
 | `b.slice(from, end)` | `(bytes, i64, i64) -> bytes` | `end` exclusive, as `list.slice`; out of range panics rather than clamping |
 | `b.index_of(byte, from)` | `(bytes, i64, i64) -> Option[i64]` | first position `>= from` holding `byte`; `None` when absent or `byte` is outside `0..255`; `from` outside `0..=len` panics |
 | `b.concat(other)` | `(bytes, bytes) -> bytes` | |
+| `bytes_filled(n, byte)` | `(i64, i64) -> bytes` | `n` copies of `byte`; a negative `n`, or a byte outside `0..255`, panics |
+| `b.set(i, byte)` | `(bytes, i64, i64) -> ()` | writes one byte; out of range panics |
+| `b.fill(byte)` | `(bytes, i64) -> ()` | writes every byte |
+| `b.copy_from(at, src)` | `(bytes, i64, bytes) -> ()` | writes all of `src` from `at`; past the end panics |
 | `b.to_list()` | `(bytes) -> [i64]` | |
 | `read_bytes(path)` | `(str) -> bytes ! IoError` | the whole file |
 | `write_bytes(path, b)` | `(str, bytes) -> () ! IoError` | replaces it |
@@ -2968,6 +2976,11 @@ cannot emit an object file.
 **The last five exist because whole-file calls cannot express data**: a table
 larger than memory is unreadable, a log rewritten per record is quadratic, and a
 crash-safe commit is write-beside, `sync_file`, `rename_file`.
+
+**[L-LIB-BYTES-WRITE]** The last four write in place. A write needs a mutable
+binding and copies the buffer first when another value can see it ([E-COW]), so
+a `slice` taken before one is unaffected. **The length never changes**: a
+`bytes` may be a window on an allocation `slice` did not copy. `concat` grows one.
 
 **`bytes` is distinct from `[i64]` on purpose.** A list of integers cannot
 promise its elements are bytes, stores eight per element, and cannot be handed

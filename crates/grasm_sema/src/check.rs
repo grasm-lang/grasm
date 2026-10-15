@@ -316,6 +316,7 @@ pub const BUILTIN_FREE_FNS: &[&str] = &[
     "remove_file",
     "make_dir",
     "bytes_of",
+    "bytes_filled",
     "read_bytes",
     "read_bytes_at",
     "append_bytes",
@@ -5882,6 +5883,17 @@ only a number or a `bool` can come out — compute what you need and yield that"
                         self.check_expr(&args[0], &Type::List(Box::new(Type::I64)));
                         return Type::Bytes;
                     }
+                    "bytes_filled" => {
+                        if args.len() != 2 {
+                            return self.error(
+                                span,
+                                "bytes_filled takes exactly 2 arguments (a count, and a byte in 0..255)",
+                            );
+                        }
+                        self.check_expr(&args[0], &Type::I64);
+                        self.check_expr(&args[1], &Type::I64);
+                        return Type::Bytes;
+                    }
                     "random_bytes" => {
                         if args.len() != 1 {
                             return self
@@ -7044,10 +7056,7 @@ Perform the effect after the closing brace, or yield a number and do the work ou
         // value cannot be used inside a region" about `keep`, with help
         // asking for a closure written inside the region — which it was.
         if self.region_depth > 0
-            && matches!(
-                name.name.as_str(),
-                "push" | "pop" | "set" | "delete" | "sort" | "sort_by" | "remove"
-            )
+            && crate::builtins::MUTATING_METHODS.contains(&name.name.as_str())
         {
             let mut root = recv;
             while let Expr::Field { recv, .. } | Expr::Index { recv, .. } = root {
@@ -7058,10 +7067,7 @@ Perform the effect after the closing brace, or yield a number and do the work ou
             }
         }
         if self.go_floor.is_some()
-            && matches!(
-                name.name.as_str(),
-                "push" | "pop" | "set" | "delete" | "sort" | "sort_by" | "remove"
-            )
+            && crate::builtins::MUTATING_METHODS.contains(&name.name.as_str())
         {
             let mut root = recv;
             while let Expr::Field { recv, .. } | Expr::Index { recv, .. } = root {
@@ -7822,6 +7828,35 @@ Perform the effect after the closing brace, or yield a number and do the work ou
                         self.check_expr(&args[1], &Type::I64);
                     }
                     self.defs.option_some(Type::I64)
+                }
+                // Writing into the buffer ([L-LIB-BYTES-WRITE]). Each writes a
+                // fixed number of bytes into a buffer whose length does not
+                // change, which is what lets a `bytes` keep being a window on
+                // a larger allocation in the compiled runtime.
+                "set" => {
+                    if check_arity(self, 2) {
+                        self.check_expr(&args[0], &Type::I64);
+                        self.check_expr(&args[1], &Type::I64);
+                        self.require_mutable(recv, name);
+                    }
+                    Type::Unit
+                }
+                "fill" => {
+                    if check_arity(self, 1) {
+                        self.check_expr(&args[0], &Type::I64);
+                        self.require_mutable(recv, name);
+                    }
+                    Type::Unit
+                }
+                // `(at, src)` rather than `(src, at)`: the destination offset
+                // reads first because the receiver is the destination.
+                "copy_from" => {
+                    if check_arity(self, 2) {
+                        self.check_expr(&args[0], &Type::I64);
+                        self.check_expr(&args[1], &Type::Bytes);
+                        self.require_mutable(recv, name);
+                    }
+                    Type::Unit
                 }
                 "to_list" => {
                     check_arity(self, 0);

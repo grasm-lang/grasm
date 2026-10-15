@@ -1,0 +1,61 @@
+//! tag: L-LIB-BYTES-WRITE
+//! expect: panic
+//! filled: [9, 9, 9, 9]
+//! set: [9, 1, 9, 2]
+//! fill: [7, 7, 7, 7]
+//! copy_from: [0, 0, 3, 4, 5, 0]
+//! a write does not reach a value taken before it: [7, 7, 7, 7] [9, 1, 9, 2]
+//! nor a window on the same buffer: [1, 1] [9, 1]
+//! onto itself: [3, 4, 5]
+//! a nested place: [0, 8, 0]
+//! length is unchanged by every write: true
+//! index 4 out of bounds (len 4)
+// Writing into a `bytes` ([L-LIB-BYTES-WRITE]). The length never changes, and
+// a write copies the buffer first when anything else can see it ([E-COW]).
+type Tile = { px: bytes }
+
+fn main() {
+    var b = bytes_filled(4, 9)
+    print("filled: {b.to_list()}")
+
+    b.set(1, 1)
+    b.set(3, 2)
+    print("set: {b.to_list()}")
+
+    // Taken before the `fill`, and therefore unaffected by it.
+    let taken = b
+
+    b.fill(7)
+    print("fill: {b.to_list()}")
+
+    var dst = bytes_filled(6, 0)
+    dst.copy_from(2, bytes_of([3, 4, 5]))
+    print("copy_from: {dst.to_list()}")
+
+    print("a write does not reach a value taken before it: {b.to_list()} {taken.to_list()}")
+
+    // A window shares the allocation until one side is written.
+    var w = bytes_filled(2, 1)
+    let win = w.slice(0, 2)
+    w.set(0, 9)
+    print("nor a window on the same buffer: {win.to_list()} {w.to_list()}")
+
+    // The source and the destination being one buffer is a program somebody
+    // writes, and at offset zero it is already done.
+    var same = bytes_of([3, 4, 5])
+    same.copy_from(0, same)
+    print("onto itself: {same.to_list()}")
+
+    var t = Tile{ px: bytes_filled(3, 0) }
+    t.px.set(1, 8)
+    print("a nested place: {t.px.to_list()}")
+
+    let before = b.len()
+    b.set(0, 1)
+    b.fill(2)
+    b.copy_from(0, bytes_of([3, 4, 5, 6]))
+    print("length is unchanged by every write: {before == b.len()}")
+
+    // Out of range panics, as `at` does.
+    b.set(4, 0)
+}

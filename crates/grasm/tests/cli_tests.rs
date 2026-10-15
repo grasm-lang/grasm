@@ -2078,3 +2078,144 @@ fn a_literal_shift_count_outside_the_width_is_linted_but_still_runs() {
         "masking is specified behaviour and must be untouched"
     );
 }
+
+/// Writing into a `bytes` ([L-LIB-BYTES-WRITE]), and the value semantics that
+/// make it safe to.
+///
+/// The window case is the one worth a test. In the compiled runtime `slice`
+/// does not copy -- it takes a window on the same allocation -- so a write
+/// that did not copy first would be visible through a slice taken before it,
+/// which is the one thing `bytes` being immutable used to guarantee for free.
+#[test]
+fn writing_a_bytes_buffer_does_not_reach_a_slice_taken_before_the_write() {
+    let work = Work::new("byteswrite");
+    let dir = work.package(
+        "painter",
+        "[package]\nname = \"painter\"\nversion = \"1.0.0\"\n",
+        "fn main() {\n    \
+         var b = bytes_filled(4, 9)\n    \
+         let win = b.slice(0, 2)\n    \
+         b.set(0, 1)\n    \
+         b.fill(7)\n    \
+         b.copy_from(0, bytes_of([3, 4]))\n    \
+         print(\"{b.to_list()} {win.to_list()} {b.len()}\")\n}\n",
+    );
+    let src = dir.join("src/main.gr");
+
+    let run = Command::new(GRASM)
+        .args(["run", src.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout),
+        "[3, 4, 7, 7] [9, 9] 4\n",
+        "a write reached a value that was taken before it"
+    );
+
+    // And the compiled engine must answer the same, because it is the one
+    // whose `slice` shares the allocation.
+    let exe = dir.join("painter.exe");
+    let built = Command::new(GRASM)
+        .args([
+            "build",
+            src.to_str().unwrap(),
+            "--native",
+            "-o",
+            exe.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        built.status.success(),
+        "the native build failed:\n{}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+    let native = Command::new(&exe).output().unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&native.stdout),
+        "[3, 4, 7, 7] [9, 9] 4\n",
+        "the two engines disagree about a write through a shared buffer"
+    );
+}
+
+/// A buffer larger than this implementation will allocate is refused with a
+/// sentence, by both engines, rather than by the allocator.
+///
+/// The compiled runtime's panic handler cannot format a message -- formatting
+/// allocates, and the panic may *be* the allocator failing -- so an allocator
+/// abort there prints "(message needs formatting)" while the interpreter
+/// prints Rust's own text. Two engines, two answers, for a program that only
+/// asked for too much.
+#[test]
+fn a_bytes_buffer_too_large_to_allocate_is_refused_the_same_way_by_both_engines() {
+    let work = Work::new("bytesbig");
+    let dir = work.package(
+        "painter",
+        "[package]\nname = \"painter\"\nversion = \"1.0.0\"\n",
+        "fn main() {\n    \
+         let b = bytes_filled(4611686018427387904, 0)\n    \
+         print(\"{b.len()}\")\n}\n",
+    );
+    let src = dir.join("src/main.gr");
+    let want = "bytes_filled would need more memory than a buffer can hold";
+
+    let run = Command::new(GRASM)
+        .args(["run", src.to_str().unwrap()])
+        .output()
+        .unwrap();
+    let interp = String::from_utf8_lossy(&run.stderr).to_string();
+    assert!(
+        interp.contains(want),
+        "the interpreter let the allocator answer:\n{interp}"
+    );
+
+    let exe = dir.join("painter.exe");
+    assert!(
+        Command::new(GRASM)
+            .args([
+                "build",
+                src.to_str().unwrap(),
+                "--native",
+                "-o",
+                exe.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap()
+            .status
+            .success(),
+        "the native build failed"
+    );
+    let native = Command::new(&exe).output().unwrap();
+    let text = String::from_utf8_lossy(&native.stderr).to_string();
+    assert!(
+        text.contains(want),
+        "the compiled engine let the allocator answer:\n{text}"
+    );
+}
+
+/// A write to an immutable binding is refused, as every other in-place write
+/// is.
+#[test]
+fn writing_a_bytes_buffer_needs_a_mutable_binding() {
+    let work = Work::new("byteslet");
+    let dir = work.package(
+        "painter",
+        "[package]\nname = \"painter\"\nversion = \"1.0.0\"\n",
+        "fn main() {\n    \
+         let b = bytes_filled(2, 0)\n    \
+         b.set(0, 1)\n}\n",
+    );
+    let out = Command::new(GRASM)
+        .args(["check", dir.join("src/main.gr").to_str().unwrap()])
+        .output()
+        .unwrap();
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        text.contains("cannot mutate `b`") && text.contains("declare it with `var b`"),
+        "writing through a `let` was not refused with the usual message:\n{text}"
+    );
+}

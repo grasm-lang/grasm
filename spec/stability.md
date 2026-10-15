@@ -7,17 +7,7 @@ before it is listed as stable.
 `crates/grasm_spec` fails if a clause here is missing, unknown, or listed twice,
 so this file cannot drift away from the specification it describes.
 
-**Five clauses were demoted from `stable` to `experimental` on 2026-08-16**:
-`T-FN-TYPE-ROW`, `T-FN-TYPE-ROW-PARAM`, `T-FN-TYPE-ROW-CARRIED`,
-`T-FN-VALUE-ROW` and `T-UNSAFE-UFCS`. Their meaning had not changed; their
-implementation moved in nearly every evaluation round, which is what
-criterion 5 forbids. Saying so was cheaper than defending the listing.
-
-**53 clauses promoted, 2026-09-10 and 2026-09-13**, each on its evidence against
-the five-part test in `docs/stability.md`. The audit is reproducible and 26
-clauses did not pass it; the commit that promoted these says why each failed.
-
-Today: 167 stable, 26 provisional, 64 experimental, of 257.
+Today: 167 stable, 26 provisional, 65 experimental, of 258.
 
 ## Stable
 
@@ -260,6 +250,7 @@ May change or be removed in any release. New surface starts here.
 - `L-LIB-BASE` — experimental
 - `L-LIB-BITS` — experimental
 - `L-LIB-BYTES` — experimental
+- `L-LIB-BYTES-WRITE` — experimental
 - `L-LIB-EPRINT` — experimental
 - `L-LIB-FS` — experimental
 - `L-LIB-NET` — experimental
@@ -288,9 +279,9 @@ May change or be removed in any release. New surface starts here.
 - `T-FN-VALUE-ROW` — experimental
 - `T-INTERFACE` — experimental
 - `T-INTERFACE-BOUND` — experimental
-- `T-INTERFACE-IMPL` — experimental
 - `T-INTERFACE-EFFECTS` — experimental
 - `T-INTERFACE-GENERIC` — experimental
+- `T-INTERFACE-IMPL` — experimental
 - `T-INTERFACE-UNSATISFIED` — experimental
 - `T-LINEAR` — experimental
 - `T-LINEAR-CONTAIN` — experimental

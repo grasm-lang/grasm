@@ -1473,8 +1473,7 @@ table because the margin moved once already with nothing noticing: see
 <tr><td>Blade is local only</td><td>A <code>path</code> dependency and a local Blade registry both work. Nothing fetches from or publishes to a remote one yet.</td></tr>
 <tr><td>Downloads are not code-signed</td><td>macOS binaries for both architectures are published on the <a href="https://github.com/grasm-lang/grasm/releases/latest">releases page</a> with SHA-256 sums, but they carry no Apple Developer signature, so Gatekeeper will ask before the first run. Notarisation is release work, not language work.</td></tr>
 <tr><td>Not faster than Rust</td><td>The geomean is «geomean»× of it, «geomean_floor»× with the harness floor taken out of both sides, against a 0.95× target — so the goal is met and the claim is not available. <code>tree</code> at «tree_ratio»× is the worst row. On the systems suite Grasm loses <code>etl</code> by «etl_ratio»×, and wins memory everywhere — «chat_mem_ratio»× on <code>chat</code>. <a href="performance.html">Every row →</a></td></tr>
-<tr><td>One integer width, one float width</td><td><code>i8</code>…<code>u64</code>, <code>usize</code> and <code>int</code> are aliases for <code>i64</code>; <code>f32</code> is an alias for <code>f64</code> (<code>spec/types.md</code> [T-INT-ALIAS]). No unsigned and no wrapping arithmetic.</td></tr>
-<tr><td>No mutable byte buffer</td><td><code>bytes</code> is immutable, so a sample buffer is <code>[i64]</code> at eight bytes a sample. An 8-bit RGBA tile costs <strong>2 MiB</strong> against 256 KiB packed. An image editor built on copy-on-write byte tiles cannot be written against this today.</td></tr>
+<tr><td>One integer width, one float width</td><td><code>i8</code>…<code>u64</code>, <code>usize</code> and <code>int</code> are aliases for <code>i64</code>; <code>f32</code> is an alias for <code>f64</code> (<code>spec/types.md</code> [T-INT-ALIAS]). No unsigned and no wrapping arithmetic. <code>bytes</code> is writable in place at one byte each, so a byte buffer is no longer eightfold — but a buffer of <em>samples</em> is still <code>[f64]</code> at eight bytes apiece.</td></tr>
 <tr><td>No shared mutable state across threads</td><td><code>par_map</code> and <code>par_filter</code> demand an empty effect row and will not reach a <code>ref</code> from outside; a task cannot be spawned per list element. No mutable globals, statics or thread-locals, and a handler holds no state between calls — which is what makes a recording replay.</td></tr>
 <tr><td>No SIMD, no file handles, no string builder</td><td>No intrinsics or autovectoriser. Whole-file and ranged reads only — no <code>seek</code>, no <code>mmap</code>, no streaming encoder. <code>str</code> is immutable, so appending in a loop is quadratic; collect and <code>join</code>.</td></tr>
 <tr><td>No GUI, GPU or DOM</td><td>No windowing or toolkit binding and no FFI shaped to bind one, nothing addressing the GPU, and the wasm build ships the interpreter without DOM reach. An application whose shell is any of those has no target here.</td></tr>
@@ -1972,9 +1971,15 @@ extern fn strlen(s: str) -> i64"""),
     + _table([
         ("Primitives", "One integer type, one float, and text is UTF-8.",
          "let a: i64 = 42\nlet b: f64 = 1.5\nlet c: bool = true\nlet d: str = \"text\""),
-        ("bytes", "A sequence of 0..255. Distinct from <code>[i64]</code> on purpose.",
+        ("bytes", "A sequence of 0..255. Distinct from <code>[i64]</code> on purpose, "
+         "and writable in place at one byte each rather than eight.",
          """let raw: bytes = bytes_of([72, 105])
-let from_text = "hi".to_bytes()"""),
+let from_text = "hi".to_bytes()
+
+var buf = bytes_filled(4, 0)
+buf.set(0, 255)
+buf.fill(7)
+buf.copy_from(2, raw)"""),
         ("Lists", "Homogeneous and growable.",
          "let xs: [i64] = [1, 2, 3]\nlet empty: [str] = []"),
         ("Maps", "Keyed, with <code>get</code> returning an <code>Option</code>.",
@@ -2398,7 +2403,7 @@ last recorded run on this machine:</p>
 <div class="scroll"><table>
 <tr><th>Gate</th><th>Scope</th><th>Result</th></tr>
 <tr><td>difftest / corpus</td><td>«difftest» programs</td><td><b>0 differences</b> across the engines</td></tr>
-<tr><td><code>leakcheck</code></td><td>«leak_programs» programs</td><td><b>0 leaks</b></td></tr>
+<tr><td><code>leakcheck</code></td><td>«leak_programs» programs</td><td><b>1 leaking</b> — <code>spec/conformance/E-VALUE-SEMANTICS.gr</code> holds 16 allocations at exit, so this gate is <b>red</b>. The ratchet is at zero, which is why one leak fails it. See <code>docs/known-issues.md</code>.</td></tr>
 <tr><td><code>usecheck</code>, the <code>poison</code> build</td><td>«use_programs» programs</td><td><b>0 differences</b></td></tr>
 <tr><td><code>crosstest</code> x86_64 under Rosetta</td><td>«cross_total» programs</td><td><b>«cross_pass» pass</b>, 0 real failures, 60 declined — <em>retaken on a quiet machine on «when_cross»: all «cross», nothing declined</em></td></tr>
 <tr><td><code>clippy --all-targets</code></td><td>native and wasm32</td><td>0</td></tr>

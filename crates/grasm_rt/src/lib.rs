@@ -1983,11 +1983,14 @@ impl RtBytes {
     /// A window on the same buffer: the bytes `from..end` of this value,
     /// sharing its allocation instead of copying it.
     ///
-    /// Sound because `bytes` has no mutating operation *in Grasm* -- the
-    /// buffer is filled when it is made and no safe operation writes it
-    /// again -- so two windows on one buffer cannot observe each other
-    /// change. The cost is that a window keeps the whole buffer alive; see
-    /// `grasm_bytes_slice`.
+    /// Sound because a window and a write cannot meet. `bytes` does have
+    /// writing operations ([L-LIB-BYTES-WRITE]), and every one of them goes
+    /// through `cow_bytes`, which writes in place only when `Arc::get_mut`
+    /// proves the allocation is held once *and* this value spans all of it.
+    /// Taking a window clones the `Arc`, so from then on neither side can be
+    /// written without copying first, and no write ever lands in a buffer
+    /// another value can see. The cost is that a window keeps the whole
+    /// buffer alive; see `grasm_bytes_slice`.
     ///
     /// One exception, and it is Tier 3: a `bytes` handed to an `extern fn`
     /// crosses as a pointer, and C may write through it -- which is how
@@ -2004,6 +2007,27 @@ impl RtBytes {
             len: end - from,
             owner: alloc::sync::Arc::clone(&self.owner),
         }
+    }
+
+    /// The buffer, writable, or `None` when anything else can see it.
+    ///
+    /// Two things share a buffer: another `RtBytes` holding a window on the
+    /// same allocation, which `Arc::get_mut` detects, and -- for a partial
+    /// window -- the bytes outside it, which exist because some other value
+    /// is the reason for them. Only a value that is both sole owner and the
+    /// whole allocation is written where it lies.
+    ///
+    /// `get_mut` is the check rather than `strong_count`, because it is the
+    /// one that is atomic: `RtBytes` is `Send`, so a count read and a later
+    /// write are two steps a second thread can get between.
+    fn as_mut_slice(&mut self) -> Option<&mut [u8]> {
+        if self.ptr != self.owner.as_ptr() || self.len != self.owner.len() {
+            return None;
+        }
+        let v = alloc::sync::Arc::get_mut(&mut self.owner)?;
+        // Nothing is resized here, so the allocation cannot have moved and
+        // `self.ptr` still describes it.
+        Some(v.as_mut_slice())
     }
 
     fn as_slice(&self) -> &[u8] {
@@ -9396,6 +9420,15 @@ pub unsafe extern "C" fn grasm_str_c_free(p: *mut core::ffi::c_char) {
 /// and appending a NUL would change its length. How long it is stays the
 /// program's to pass, because C has no way to ask.
 ///
+/// The pointer names the buffer this value holds *now*. Since
+/// [L-LIB-BYTES-WRITE] a later write can copy -- `cow_bytes` does, when a
+/// window or a second value shares the allocation -- and the Grasm value then
+/// refers to the copy while C still holds the original. Nothing dangles: the
+/// value that forced the copy keeps the old buffer alive. But C's writes stop
+/// being visible through the Grasm value, so a buffer handed to C to fill
+/// should not also be sliced. This is Tier 3, and it is the same class of
+/// hazard as `RtBytes::sub` describes.
+///
 /// # Safety: called from compiled Grasm with a boxed value that outlives the
 /// call the pointer is passed to.
 #[no_mangle]
@@ -9857,6 +9890,128 @@ pub unsafe extern "C" fn grasm_bytes_concat(a: *mut RtVal, b: *mut RtVal) -> *mu
     let mut out = as_bytes(a).to_vec();
     out.extend_from_slice(as_bytes(b));
     alloc(RtPayload::Bytes(RtBytes::new(out)))
+}
+
+/// The value a write may land in, copying first when it may not.
+///
+/// Mirrors `cow_list`: the incoming reference is consumed and an owned one is
+/// returned, so a caller stores the result back over the variable it read.
+///
+/// # Safety: live runtime pointer to a `Bytes`.
+unsafe fn cow_bytes(v: *mut RtVal) -> *mut RtVal {
+    if (*v).rc.load(Relaxed) == 1 {
+        if let RtPayload::Bytes(b) = &mut (*v).payload {
+            if b.as_mut_slice().is_some() {
+                return v;
+            }
+        }
+    }
+    let fresh = match &(*v).payload {
+        RtPayload::Bytes(b) => alloc(RtPayload::Bytes(RtBytes::new(b.as_slice().to_vec()))),
+        _ => grasm_panic_msg_str("a write to a value that is not bytes"),
+    };
+    dec(v);
+    fresh
+}
+
+/// The buffer of a value `cow_bytes` just returned.
+///
+/// # Safety: `v` came from `cow_bytes`, so it is a sole-owner full window.
+unsafe fn bytes_mut<'a>(v: *mut RtVal) -> &'a mut [u8] {
+    match &mut (*v).payload {
+        RtPayload::Bytes(b) => match b.as_mut_slice() {
+            Some(s) => core::mem::transmute::<&mut [u8], &'a mut [u8]>(s),
+            // `cow_bytes` either proved this or built a buffer that satisfies
+            // it, so reaching here is a bug in this file, not bad input.
+            None => grasm_panic_msg_str("a bytes buffer that cow_bytes did not make writable"),
+        },
+        _ => grasm_panic_msg_str("a write to a value that is not bytes"),
+    }
+}
+
+/// A byte, or the panic the interpreter prints for the same value.
+fn byte_or_panic(n: i64, op: &str) -> u8 {
+    if !(0..=255).contains(&n) {
+        rt_panic(&format!("{n} is not a byte — {op} takes values in 0..255"));
+    }
+    n as u8
+}
+
+/// `b.set(i, v)` ([L-LIB-BYTES-WRITE]).
+///
+/// # Safety: boxed values.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_bytes_set(v: *mut RtVal, i: i64, b: i64) -> *mut RtVal {
+    let n = as_bytes(v).len();
+    if i < 0 || i as usize >= n {
+        rt_panic(&format!("index {i} out of bounds (len {n})"));
+    }
+    let byte = byte_or_panic(b, "set");
+    let target = cow_bytes(v);
+    bytes_mut(target)[i as usize] = byte;
+    target
+}
+
+/// `b.fill(v)` ([L-LIB-BYTES-WRITE]).
+///
+/// # Safety: boxed values.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_bytes_fill(v: *mut RtVal, b: i64) -> *mut RtVal {
+    let byte = byte_or_panic(b, "fill");
+    let target = cow_bytes(v);
+    bytes_mut(target).fill(byte);
+    target
+}
+
+/// `b.copy_from(at, src)` ([L-LIB-BYTES-WRITE]).
+///
+/// # Safety: boxed values.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_bytes_copy_from(
+    v: *mut RtVal,
+    at: i64,
+    src: *mut RtVal,
+) -> *mut RtVal {
+    let n = as_bytes(v).len();
+    let m = as_bytes(src).len();
+    if at < 0 || at as usize > n || at as usize + m > n {
+        rt_panic(&format!(
+            "copy_from writes {m} bytes at {at}, past the end (len {n})"
+        ));
+    }
+    // `b.copy_from(0, b)`. Decided before `cow_bytes` rather than after: the
+    // bounds above force `m == n` and `at == 0` when the two are one value, so
+    // the copy is already done -- and asking afterwards would mean reading a
+    // source that the copy may just have been the last owner of.
+    if core::ptr::eq(v, src) {
+        return v;
+    }
+    let target = cow_bytes(v);
+    // `cow_bytes` leaves the destination held once and spanning its whole
+    // allocation, so nothing else aliases it and the copy cannot overlap.
+    let bytes = as_bytes(src);
+    bytes_mut(target)[at as usize..at as usize + m].copy_from_slice(bytes);
+    target
+}
+
+/// `bytes_filled(n, v)` ([L-LIB-BYTES-WRITE]).
+///
+/// # Safety: no boxed arguments.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_bytes_filled(n: i64, b: i64) -> *mut RtVal {
+    if n < 0 {
+        rt_panic(&format!("bytes_filled: a buffer cannot have {n} bytes"));
+    }
+    // See the interpreter: the panic handler in `grasm_rt_abi` cannot format
+    // a message, so letting the allocator abort would print
+    // "(message needs formatting)" rather than what went wrong.
+    if n as usize > MAX_ALLOC {
+        rt_panic(&format!(
+            "bytes_filled would need more memory than a buffer can hold ({n} bytes)"
+        ));
+    }
+    let byte = byte_or_panic(b, "bytes_filled");
+    alloc(RtPayload::Bytes(RtBytes::new(vec![byte; n as usize])))
 }
 
 /// # Safety: boxed values.

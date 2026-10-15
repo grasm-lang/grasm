@@ -2899,6 +2899,8 @@ fn main() {
 ```grasm
 //! tag: E-VALUE-SEMANTICS
 //! expect: output
+//! holds 8
+//! rebuilt 8
 //! 2 3
 //! 1 99
 //! hi! hi hi
@@ -2917,6 +2919,46 @@ fn main() {
 //! 3.0 3 false
 //! 8 3.0 3 false 3.0 3 false
 //! [2] [1] [3] [3, 3] []
+
+// A value struct returned as a function's tail, with a second one alive.
+//
+// `room` is a local whose words live in a slot and whose *fields* are counted.
+// It was left out of the tail-move analysis, which only considered values that
+// are `boxed()`, so the scope released it on the way out -- between the store
+// of the new value and the copy into the caller's slot. The result was a
+// silent wrong answer on this shape and a crash on bigger ones, in safe code
+// with no `unsafe` anywhere.
+type Room = { conns: [i64] }
+
+fn joined(r: Room, h: i64) -> Room {
+    Room{ conns: r.conns + [h] }
+}
+
+/// A local bound from a parameter, reassigned, and returned.
+fn step(r: Room, h: i64) -> Room {
+    var room = r
+    room = joined(room, h)
+    room
+}
+
+/// A local bound from a call, returned. This one answered 2 rather than 8.
+fn rebuild(r: Room, h: i64) -> Room {
+    let b = joined(r, h)
+    b
+}
+
+fn value_struct_tail() / {io} {
+    var a = Room{ conns: [] }
+    for i in 0..8 {
+        a = step(a, i)
+    }
+    print("holds {a.conns.len()}")
+    var b = Room{ conns: [] }
+    for i in 0..8 {
+        b = rebuild(b, i)
+    }
+    print("rebuilt {b.conns.len()}")
+}
 type Box = { n: i64 }
 type Bag = { items: [i64] }
 type Two = { a: [i64], b: [i64] }
@@ -3021,6 +3063,7 @@ fn pick_halves(n: i64) -> Halves {
 }
 
 fn main() {
+    value_struct_tail()
     var a = [1, 2]
     var b = a
     b.push(3)

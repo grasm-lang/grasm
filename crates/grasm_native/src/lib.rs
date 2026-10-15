@@ -1070,6 +1070,13 @@ impl<'m> Codegen<'m> {
             ("grasm_bytes_slice_to_str", vec![i64t, i64t, i64t], Some(i64t)),
             ("grasm_bytes_index_of", vec![i64t, i64t, i64t], Some(i64t)),
             ("grasm_bytes_concat", vec![i64t, i64t], Some(i64t)),
+            // Writes ([L-LIB-BYTES-WRITE]). Each consumes the receiver's
+            // reference and returns the value to keep, as the list mutators
+            // do: the buffer is copied first when anything else can see it.
+            ("grasm_bytes_set", vec![i64t, i64t, i64t], Some(i64t)),
+            ("grasm_bytes_fill", vec![i64t, i64t], Some(i64t)),
+            ("grasm_bytes_copy_from", vec![i64t, i64t, i64t], Some(i64t)),
+            ("grasm_bytes_filled", vec![i64t, i64t], Some(i64t)),
             ("grasm_bytes_to_list", vec![i64t], Some(i64t)),
             ("grasm_bytes_to_str", vec![i64t], Some(i64t)),
             ("grasm_str_to_bytes", vec![i64t], Some(i64t)),
@@ -13716,6 +13723,50 @@ this case",
         Ok(Some(Some((v, vt))))
     }
 
+    /// The runtime function for a `bytes` write, and its arguments after the
+    /// receiver.
+    ///
+    /// Shared by the two receivers a write can have -- a plain variable and a
+    /// nested place -- because the arguments do not depend on which, and
+    /// evaluating them in two places is how the two forms come to disagree.
+    fn bytes_write_args(
+        &mut self,
+        name: &Ident,
+        args: &[Expr],
+        span: Span,
+    ) -> CResult<(&'static str, Vec<Value>)> {
+        match name.name.as_str() {
+            "set" => {
+                let (iv, it) = self.eval_expr_val(&args[0])?;
+                let (bv, bt) = self.eval_expr_val(&args[1])?;
+                if it != VType::I64 || bt != VType::I64 {
+                    return nope(span, "a non-integer index or byte");
+                }
+                Ok(("grasm_bytes_set", vec![iv, bv]))
+            }
+            "fill" => {
+                let (bv, bt) = self.eval_expr_val(&args[0])?;
+                if bt != VType::I64 {
+                    return nope(span, "a non-integer byte");
+                }
+                Ok(("grasm_bytes_fill", vec![bv]))
+            }
+            "copy_from" => {
+                let (at, att) = self.eval_expr_val(&args[0])?;
+                if att != VType::I64 {
+                    return nope(span, "a non-integer offset");
+                }
+                let (src, srct) = self.eval_expr_val(&args[1])?;
+                if srct != VType::Bytes {
+                    return nope(span, "a source that is not bytes");
+                }
+                // Released by the caller once the write is done, below.
+                Ok(("grasm_bytes_copy_from", vec![at, src]))
+            }
+            _ => nope(span, "this write to a bytes buffer"),
+        }
+    }
+
     fn eval_method(
         &mut self,
         recv: &Expr,
@@ -14047,10 +14098,12 @@ this case",
         // The same mutating methods on a nested place: `bag.seen.set(k, v)`.
         // Reached only when the receiver is not a plain variable, so the
         // variable case above still takes the shorter path.
-        if matches!(
-            name.name.as_str(),
-            "set" | "delete" | "sort" | "sort_by" | "pop" | "remove"
-        ) && matches!(recv, Expr::Field { .. } | Expr::Index { .. })
+        // The same list the checker and the interpreter use. `push` is
+        // handled separately below, so it is filtered out rather than left
+        // out of the shared list.
+        if grasm_sema::builtins::MUTATING_METHODS.contains(&name.name.as_str())
+            && name.name != "push"
+            && matches!(recv, Expr::Field { .. } | Expr::Index { .. })
         {
             let (root, path) = self.place_path(recv)?;
             self.pin_place_indices(&path)?;
@@ -14220,7 +14273,48 @@ this case",
                     let (v, vt) = self.unbox(boxed, &et)?;
                     return Ok(Some((v, vt)));
                 }
+                // Writing into a `bytes` ([L-LIB-BYTES-WRITE]). The runtime
+                // function returns the value to keep, which is a fresh buffer
+                // when the old one was shared, so the result is written back
+                // over the place exactly as a list push is.
+                (VType::Bytes, "set" | "fill" | "copy_from") => {
+                    let (f, rt_args) = self.bytes_write_args(name, args, span)?;
+                    // The boxed source of a `copy_from`, which this owns and
+                    // has to release once the write has read it.
+                    let owned_src = (name.name == "copy_from").then(|| rt_args[1]);
+                    let cur = self.b.use_var(var);
+                    let bv = self.read_place_boxed(cur, &path, &root_t, true)?;
+                    let mut call = vec![bv];
+                    call.extend(rt_args);
+                    let newb = self.call_rt(f, &call).unwrap();
+                    if let Some(src) = owned_src {
+                        self.call_rt("grasm_val_dec", &[src]);
+                    }
+                    let cur2 = self.b.use_var(var);
+                    self.begin_write();
+                    let updated = self.write_place(span, cur2, &path, &root_t, newb)?;
+                    self.b.def_var(var, updated);
+                    return Ok(None);
+                }
                 _ => return nope(span, "this mutating method on this place"),
+            }
+        }
+        // Writing into a `bytes` held in a plain variable.
+        if matches!(name.name.as_str(), "set" | "fill" | "copy_from") {
+            if let Expr::Ident(id) = recv {
+                if let Some((var, VType::Bytes)) = self.lookup(&id.name) {
+                    let (f, rt_args) = self.bytes_write_args(name, args, span)?;
+                    let owned_src = (name.name == "copy_from").then(|| rt_args[1]);
+                    let cur = self.b.use_var(var);
+                    let mut call = vec![cur];
+                    call.extend(rt_args);
+                    let newb = self.call_rt(f, &call).unwrap();
+                    if let Some(src) = owned_src {
+                        self.call_rt("grasm_val_dec", &[src]);
+                    }
+                    self.b.def_var(var, newb);
+                    return Ok(None);
+                }
             }
         }
         // Mutating list push on a nested place: `bag.items.push(v)`.
@@ -17040,6 +17134,17 @@ checker did",
                 self.call_rt("grasm_val_dec", &[lv]);
                 return Ok(Some((v, VType::Bytes)));
             }
+            // No list to build and throw away, which is the reason it exists
+            // ([L-LIB-BYTES-WRITE]).
+            "bytes_filled" => {
+                let (nv, nt) = self.eval_expr_val(&args[0])?;
+                let (bv, bt) = self.eval_expr_val(&args[1])?;
+                if nt != VType::I64 || bt != VType::I64 {
+                    return nope(call_span, "a non-integer count or byte");
+                }
+                let v = self.call_rt("grasm_bytes_filled", &[nv, bv]).unwrap();
+                return Ok(Some((v, VType::Bytes)));
+            }
             "random_bytes" => {
                 let (nv, nt) = self.eval_expr_val(&args[0])?;
                 let boxed = self.box_value(nv, &nt);
@@ -19175,7 +19280,7 @@ fields, not the type this is bound to, not an enclosing generic",
                                 Box::new(VType::Unit),
                                 Box::new(VType::Sum("IoError".into())),
                             )),
-                            "bytes_of" => Some(VType::Bytes),
+                            "bytes_of" | "bytes_filled" => Some(VType::Bytes),
                             "random_bytes" => Some(VType::Fallible(
                                 Box::new(VType::Bytes),
                                 Box::new(VType::Sum("IoError".into())),

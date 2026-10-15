@@ -31,6 +31,23 @@
 //! * and the row here is the row the checker charges, because the effect system
 //!   reads this table and has no list of its own.
 
+/// Every method that writes through its receiver rather than returning a new
+/// value.
+///
+/// Here because it was written out in four places -- twice in the checker's
+/// region and task guards, once in the interpreter's gate on the in-place
+/// mutation path, once in the backend's -- and the four could disagree.
+/// Adding `fill` and `copy_from` to `bytes` is how that was found: both were
+/// in the checker, so a program using them typechecked, and neither was in
+/// the interpreter's gate, so `b.fill(0)` reported "no method `fill`" at run
+/// time on a value that has one.
+///
+/// A method listed here must be implemented in `mutate_in_place`, and the
+/// checker must call `require_mutable` for it.
+pub const MUTATING_METHODS: &[&str] = &[
+    "push", "pop", "set", "delete", "sort", "sort_by", "remove", "fill", "copy_from",
+];
+
 /// The effects a builtin performs. Empty means it reaches nothing outside the
 /// program — `bytes_of` converts a list, and `panic` ends the process without
 /// observing anything.
@@ -354,6 +371,15 @@ pub const BUILTINS: &[Builtin] = &[
     // omission, which is exactly the distinction F35 turned on.
     Builtin {
         name: "bytes_of",
+        row: PURE,
+        journal: Journal::Untouched,
+    },
+    // A buffer of a given size, every byte the same ([L-LIB-BYTES-WRITE]).
+    // The constructor the writing methods need: `bytes_of` builds from a list,
+    // which costs the list, and a program that wants a megabyte of zeroes to
+    // write pixels into should not build a million boxed integers to get it.
+    Builtin {
+        name: "bytes_filled",
         row: PURE,
         journal: Journal::Untouched,
     },

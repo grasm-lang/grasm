@@ -131,6 +131,24 @@ silently mix old objects into new binaries. With a cold cache both programs run
 clean, `usecheck` reports no use-after-free, and the previously failing
 difftest slice is 71 of 71.
 
+**`leakcheck` is red: `E-VALUE-SEMANTICS.gr` holds 16 allocations at exit.**
+Found on 2026-10-15 and present at `HEAD` before that day's work, so it is not
+new that day -- but it was not written down, and the site's gate table said
+"0 leaks", which is the only reason it was not. The ratchet is at zero by
+design: 27 programs leaked the day the gate was written and none did
+afterwards, so one leak fails it.
+
+```
+grasm build spec/conformance/E-VALUE-SEMANTICS.gr --native -o /tmp/evs
+GRASM_LEAK_CHECK=1 /tmp/evs        # exit 7, 16 allocations
+```
+
+The program uses no `bytes`; it pushes into lists, structs and a nested place
+(`bag.items.push(7)`), which is where `write_place` is already recorded above
+as leaking intermediates. That is the first place to look, and the three
+repairs tried against it are described in `scripts/leakcheck.sh` -- each was
+wrong in a different way, which is why this is open rather than quick.
+
 `scripts/usecheck.sh` and the `poison` feature stay. They are what turned an
 intermittent segfault into a named, repeatable `use after free`, and the gate
 `leakcheck` cannot replace.
@@ -171,15 +189,25 @@ are designed and unimplemented. There is no unsigned arithmetic, no wrapping
 `u8`/`u16`/`u32`, and a `u32` hash wants masking by hand. Code that packs
 binary32 writes the bit layout itself.
 
-**No mutable byte buffer.** `bytes` is immutable: no element assignment, no
-fill, no slice-assign. A buffer of samples is therefore `[i64]` or `[f64]` at
-eight bytes a sample, and that is an eightfold difference in memory for
-anything that holds pixels. The arithmetic, which follows from the widths above
-rather than from a measurement: an 8-bit RGBA tile of 256x256 is 256 KiB
-packed and **2 MiB** here; a 24-megapixel RGBA document is about 96 MB packed
-and **about 768 MB** here. An image editor whose architecture is copy-on-write
-byte tiles cannot be written against this today, and that is the clearest
-example of a program this language is not yet for.
+**No mutable byte buffer.** *Closed on 2026-10-15 by [L-LIB-BYTES-WRITE].*
+`bytes_filled(n, byte)` makes a buffer and `set`, `fill` and `copy_from` write
+into it, under both engines, with the same panics from each. Measured on 24
+million bytes, each written and then read: **25 MB** of resident memory and
+0.37 s, against **196 MB** and 0.79 s for the same loop over a `[i64]`. So the
+eightfold memory difference this entry used to predict is gone, and the byte
+buffer is also about twice as fast, because a byte of cache is a byte.
+
+What a write costs, and why there is no `push`: a `bytes` may be a *window* on
+a larger allocation, since `slice` does not copy, so every write first checks
+that nothing else can see the buffer and copies it when something can
+([E-COW]). The check is one atomic refcount test and two comparisons, which is
+what the timing above includes. Growing a buffer would move the allocation out
+from under every window on it, so the length is fixed and `concat` is how a
+program grows one.
+
+What remains is the integer width above, not the buffer: a `[f64]` of samples
+is still eight bytes a sample, and packing binary32 still means writing the bit
+layout by hand.
 
 **No SIMD.** No intrinsics and no autovectoriser. `docs/performance.md`
 records the one measurement taken against this: the flat struct-list sum is

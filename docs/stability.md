@@ -9,6 +9,21 @@ minor release with a migration note, `experimental` in any release. Raising the
 version number promoted nothing — a clause is promoted when it passes the
 five-part test below, one at a time, on its own evidence.
 
+## What has moved, and why
+
+Moved here from `spec/stability.md`, which lists the levels and is held to a
+page budget; these are the record of two decisions rather than a rule.
+
+**Five clauses were demoted from `stable` to `experimental` on 2026-08-16**:
+`T-FN-TYPE-ROW`, `T-FN-TYPE-ROW-PARAM`, `T-FN-TYPE-ROW-CARRIED`,
+`T-FN-VALUE-ROW` and `T-UNSAFE-UFCS`. Their meaning had not changed; their
+implementation moved in nearly every evaluation round, which is what
+criterion 5 forbids. Saying so was cheaper than defending the listing.
+
+**53 clauses promoted, 2026-09-10 and 2026-09-13**, each on its evidence against
+the five-part test below. The audit is reproducible and 26
+clauses did not pass it; the commit that promoted these says why each failed.
+
 The unit of stability is the **normative clause**: every rule in `spec/` carries
 a tag like `[E-MAP-ORDER]`, and every tag has a stability level recorded in
 `spec/stability.md`. A clause with no recorded level fails the test suite, so
