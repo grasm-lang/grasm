@@ -1,0 +1,8 @@
+[package]
+name = "image_demo"
+version = "1.0.0"
+capabilities = ["io"]
+
+[dependencies.image]
+path = "../image"
+version = "^1.0.0"

@@ -1,0 +1,18 @@
+[package]
+name = "image"
+version = "1.0.0"
+
+# Decodes whatever the caller hands over. Reaches nothing itself.
+capabilities = []
+
+[dependencies.jpeg]
+path = "../jpeg"
+version = "^1.0.0"
+
+[dependencies.png]
+path = "../png"
+version = "^1.0.0"
+
+[dependencies.tiff]
+path = "../tiff"
+version = "^1.0.0"

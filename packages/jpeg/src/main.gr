@@ -62,7 +62,12 @@ type Component = {
 
 /// Where the entropy-coded data has got to: a byte position, and the bits of
 /// the current byte that are left.
-type Bits = {
+///
+/// `JpegBits` rather than `Bits` because types share one namespace across the
+/// whole program ([T-MODULE-NS]), and `zlib` already declares a `Bits`. The
+/// two never met until `packages/image` imported this and `png` together,
+/// which is what a facade package is for.
+type JpegBits = {
     pos: i64,
     buf: i64,
     cnt: i64,
@@ -116,7 +121,7 @@ pub fn build_huff(counts: [i64], symbols: [i64]) -> HuffTable {
 /// ended: that is recorded and zero bits are served from then on, because a
 /// decoder that read the marker as data would produce an image rather than an
 /// error.
-fn next_bit(data: bytes, inout b: Bits) -> i64 {
+fn next_bit(data: bytes, inout b: JpegBits) -> i64 {
     if b.cnt == 0 {
         if b.pos >= data.len() {
             b.hit_marker = true
@@ -141,7 +146,7 @@ fn next_bit(data: bytes, inout b: Bits) -> i64 {
 }
 
 /// `n` bits as an unsigned value.
-fn receive(data: bytes, inout b: Bits, n: i64) -> i64 {
+fn receive(data: bytes, inout b: JpegBits, n: i64) -> i64 {
     var v = 0
     var i = 0
     while i < n {
@@ -163,7 +168,7 @@ pub fn extend(v: i64, n: i64) -> i64 {
 }
 
 /// T.81's DECODE: read bits until the code is one this table holds.
-fn decode_huff(data: bytes, inout b: Bits, t: HuffTable) -> i64 {
+fn decode_huff(data: bytes, inout b: JpegBits, t: HuffTable) -> i64 {
     var code = next_bit(data, b)
     var l = 1
     while l <= 16 {
@@ -181,7 +186,7 @@ fn decode_huff(data: bytes, inout b: Bits, t: HuffTable) -> i64 {
 /// One 8x8 block of quantised coefficients, in natural order.
 fn decode_block(
     data: bytes,
-    inout b: Bits,
+    inout b: JpegBits,
     dc: HuffTable,
     ac: HuffTable,
     quant: [i64],
@@ -343,7 +348,7 @@ fn blit_block(inout plane: bytes, pw: i64, ph: i64, bx: i64, by: i64, px: [f64])
 /// One minimum coded unit: every block of every component, in order.
 fn decode_mcu(
     data: bytes,
-    inout b: Bits,
+    inout b: JpegBits,
     comps: [Component],
     tabs: [HuffTable],
     quant: [i64],
@@ -386,7 +391,7 @@ fn decode_mcu(
 }
 
 /// Step over a restart marker and begin a fresh entropy segment.
-fn restart(data: bytes, inout b: Bits, inout preds: [i64]) {
+fn restart(data: bytes, inout b: JpegBits, inout preds: [i64]) {
     b.cnt = 0
     b.hit_marker = false
     // The marker is 0xFFD0..0xFFD7, and the scan resumes after it.
@@ -644,7 +649,7 @@ fn run_scan(
         preds.push(0)
     }
     let ct = cos_table()
-    var bits = Bits{ pos: from, buf: 0, cnt: 0, hit_marker: false }
+    var bits = JpegBits{ pos: from, buf: 0, cnt: 0, hit_marker: false }
     var done = 0
     var my = 0
     while my < mcuy {

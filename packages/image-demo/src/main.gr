@@ -1,0 +1,14 @@
+// Decode any image and write its RGB out, for `scripts/imagetest.sh`.
+import image
+
+fn main() -> () ! ImageError / {io} {
+    let a = args()
+    let data = read_bytes(a.get(0) ?? "") ?? bytes_of([])
+    let f = image.format_name(image.sniff(data))
+    let img = try image.decode(data)
+    let rgb = image.to_rgb(img)
+    match write_bytes(a.get(1) ?? "", rgb) {
+        Err(_e) -> print("could not write")
+        Ok(_w) -> print("{f} {img.width} {img.height} {img.comps}")
+    }
+}

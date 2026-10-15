@@ -1,0 +1,191 @@
+// One entry point for a file whose format the caller does not know.
+//
+// A program that opens an image should not have to ask which decoder to
+// call. `sniff` reads the first bytes, `decode` dispatches, and the answer is
+// always the same shape: 8-bit samples, one byte each, row-major with no
+// padding ([L-LIB-BYTES-WRITE]).
+//
+// The normalisation is the point. `png` hands back `[i64]` samples with six
+// possible colour types and a palette to resolve; `jpeg` hands back one or
+// three channels; `tiff` one, three or four. A caller that wants pixels wants
+// none of that, so this package resolves palettes, drops 16-bit samples to 8,
+// and reports a channel count of 1, 3 or 4 and nothing else.
+import jpeg
+import png
+import tiff
+
+type Format =
+    | Jpeg
+    | Png
+    | Tiff
+    | Unknown
+
+type ImageError =
+    | UnknownFormat
+    | JpegFailed(why: JpegPixelError)
+    | PngFailed(why: PngError)
+    | TiffFailed(why: TiffError)
+    | Unsupported(what: str, value: i64)
+
+/// A decoded image: `comps` is 1, 3 or 4, and `pixels` holds that many bytes
+/// a pixel.
+type Image = {
+    width: i64,
+    height: i64,
+    comps: i64,
+    pixels: bytes,
+}
+
+/// Which format a file is, from its first bytes.
+///
+/// By magic rather than by extension: a caller that trusted the name would
+/// hand a PNG to the JPEG decoder the first time somebody renamed a file.
+pub fn sniff(data: bytes) -> Format {
+    if data.len() >= 3 and data.at(0) == 255 and data.at(1) == 216 and data.at(2) == 255 {
+        return Jpeg
+    }
+    if data.len() >= 8 and data.at(0) == 137 and data.at(1) == 80 and
+    data.at(2) == 78 and data.at(3) == 71 {
+        return Png
+    }
+    if tiff.is_tiff(data) {
+        return Tiff
+    }
+    Unknown
+}
+
+pub fn format_name(f: Format) -> str {
+    match f {
+        Jpeg -> "jpeg"
+        Png -> "png"
+        Tiff -> "tiff"
+        Unknown -> "unknown"
+    }
+}
+
+/// PNG's samples, normalised to one byte a channel with palettes resolved.
+fn from_png(img: PngImage) -> Image ! ImageError {
+    if img.bit_depth != 8 and img.bit_depth != 16 {
+        fail(Unsupported("png bit depth", img.bit_depth))
+    }
+    let step = if img.bit_depth == 16 { 2 } else { 1 }
+    let n = img.width * img.height
+    if img.colour_type == 3 {
+        // A palette index becomes the RGB triple it names.
+        var out = bytes_filled(n * 3, 0)
+        var i = 0
+        while i < n {
+            let idx = img.sample.get(i * step).unwrap_or(0)
+            var c = 0
+            while c < 3 {
+                out.set(i * 3 + c, img.palette.get(idx * 3 + c).unwrap_or(0))
+                c = c + 1
+            }
+            i = i + 1
+        }
+        return Image{ width: img.width, height: img.height, comps: 3, pixels: out }
+    }
+    let ch = png.channels_for(img.colour_type)
+    var out = bytes_filled(n * ch, 0)
+    var i = 0
+    while i < n * ch {
+        // A 16-bit sample keeps its high byte, which is what dropping to
+        // eight bits means; the low byte is below what the output can hold.
+        out.set(i, img.sample.get(i * step).unwrap_or(0).bit_and(255))
+        i = i + 1
+    }
+    return Image{ width: img.width, height: img.height, comps: ch, pixels: out }
+}
+
+/// Decode a file of any format this package knows.
+pub fn decode(data: bytes) -> Image ! ImageError {
+    match sniff(data) {
+        Unknown -> fail(UnknownFormat)
+        Jpeg -> {
+            match jpeg.decode(data) {
+                Err(e) -> fail(JpegFailed(e))
+                Ok(img) -> return Image {
+                    width: img.width,
+                    height: img.height,
+                    comps: img.comps,
+                    pixels: img.pixels,
+                }
+            }
+        }
+        Tiff -> {
+            match tiff.decode(data) {
+                Err(e) -> fail(TiffFailed(e))
+                Ok(img) -> return Image {
+                    width: img.width,
+                    height: img.height,
+                    comps: img.comps,
+                    pixels: img.pixels,
+                }
+            }
+        }
+        Png -> {
+            match png.decode(data) {
+                Err(e) -> fail(PngFailed(e))
+                Ok(img) -> return try from_png(img)
+            }
+        }
+    }
+}
+
+/// The samples as RGB, whatever the file carried.
+///
+/// Grayscale is replicated across three channels and alpha is dropped, which
+/// is what a caller that only wants to show the picture means.
+pub fn to_rgb(img: Image) -> bytes {
+    if img.comps == 3 {
+        return img.pixels
+    }
+    let n = img.width * img.height
+    var out = bytes_filled(n * 3, 0)
+    var i = 0
+    while i < n {
+        if img.comps == 1 {
+            let v = img.pixels.at(i)
+            out.set(i * 3, v)
+            out.set(i * 3 + 1, v)
+            out.set(i * 3 + 2, v)
+        } else {
+            var c = 0
+            while c < 3 {
+                out.set(i * 3 + c, img.pixels.at(i * img.comps + c))
+                c = c + 1
+            }
+        }
+        i = i + 1
+    }
+    out
+}
+
+test "a format is recognised by its magic, not its name" {
+    assert_eq(format_name(sniff(bytes_of([255, 216, 255, 224]))), "jpeg")
+    assert_eq(format_name(sniff(bytes_of([137, 80, 78, 71, 13, 10, 26, 10]))), "png")
+    assert_eq(format_name(sniff(bytes_of([73, 73, 42, 0, 8, 0, 0, 0]))), "tiff")
+    assert_eq(format_name(sniff(bytes_of([77, 77, 0, 42, 0, 0, 0, 8]))), "tiff")
+    assert_eq(format_name(sniff(bytes_of([80, 75, 3, 4]))), "unknown")
+    assert_eq(format_name(sniff(bytes_of([]))), "unknown")
+}
+
+test "a truncated magic is not a format" {
+    assert_eq(format_name(sniff(bytes_of([255, 216]))), "unknown")
+    assert_eq(format_name(sniff(bytes_of([137, 80, 78]))), "unknown")
+}
+
+test "grayscale becomes three equal channels" {
+    let g = Image{ width: 2, height: 1, comps: 1, pixels: bytes_of([7, 200]) }
+    assert_eq(to_rgb(g).to_list(), [7, 7, 7, 200, 200, 200])
+}
+
+test "alpha is dropped rather than multiplied in" {
+    let a = Image{ width: 1, height: 1, comps: 4, pixels: bytes_of([10, 20, 30, 128]) }
+    assert_eq(to_rgb(a).to_list(), [10, 20, 30])
+}
+
+test "rgb is handed back as it came" {
+    let r = Image{ width: 1, height: 1, comps: 3, pixels: bytes_of([1, 2, 3]) }
+    assert_eq(to_rgb(r).to_list(), [1, 2, 3])
+}
