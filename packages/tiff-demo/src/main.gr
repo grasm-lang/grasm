@@ -1,0 +1,13 @@
+// Decode a TIFF and write its samples out, for `scripts/tifftest.sh`.
+import tiff
+
+fn main() -> () ! TiffError / {io} {
+    let a = args()
+    let src = a.get(0) ?? ""
+    let dst = a.get(1) ?? ""
+    let img = try tiff.decode(read_bytes(src) ?? bytes_of([]))
+    match write_bytes(dst, img.pixels) {
+        Err(_e) -> print("could not write {dst}")
+        Ok(_w) -> print("{img.width} {img.height} {img.comps}")
+    }
+}

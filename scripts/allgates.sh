@@ -62,6 +62,7 @@ run_gate grammar       python3 scripts/grammar.py --check
 run_gate sdltest       scripts/sdltest.sh
 run_gate jpegtest      scripts/jpegtest.sh
 run_gate fonttest      scripts/fonttest.sh
+run_gate tifftest      scripts/tifftest.sh
 run_gate grasmwire     scripts/grasmwire_e2e.sh
 run_gate cryptodiff    scripts/crypto_diff.sh
 run_gate certdiff      scripts/cert_diff.sh

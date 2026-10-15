@@ -1,0 +1,8 @@
+[package]
+name = "tiff_demo"
+version = "1.0.0"
+capabilities = ["io"]
+
+[dependencies.tiff]
+path = "../tiff"
+version = "^1.0.0"

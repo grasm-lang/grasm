@@ -1,0 +1,14 @@
+[package]
+name = "tiff"
+version = "1.0.0"
+
+# Decodes pixels from bytes the caller supplies.
+capabilities = []
+
+[dependencies.lzw]
+path = "../lzw"
+version = "^1.0.0"
+
+[dependencies.zlib]
+path = "../zlib"
+version = "^1.0.0"
