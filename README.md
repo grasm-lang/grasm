@@ -1,53 +1,121 @@
 <p align="center">
-  <img src="assets/logo.svg" alt="Grasm" width="440">
+  <img src="assets/hero.svg" alt="Grasm — nothing happens that the code didn't declare" width="100%">
 </p>
 
 <p align="center">
-  <b>Rust-class safety at Go-class effort.</b><br>
-  Effects you can audit · ownership without lifetimes · three engines that agree byte for byte
+  <a href="https://grasm-lang.github.io"><img src="https://img.shields.io/badge/grasm--lang.github.io-visit-3DDC97?style=for-the-badge&labelColor=0A101C" alt="website"></a>
+  <img src="https://img.shields.io/badge/v1.0.0-pre--alpha-17A2A2?style=for-the-badge&labelColor=0A101C" alt="v1.0.0">
+  <img src="https://img.shields.io/badge/gates-103%20green%20·%201%20red-F6AE2D?style=for-the-badge&labelColor=0A101C" alt="gates">
+  <img src="https://img.shields.io/badge/GC-none-3DDC97?style=for-the-badge&labelColor=0A101C" alt="no GC">
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-1.0.0-3DDC97?style=flat-square" alt="version 1.0.0">
-  <img src="https://img.shields.io/badge/hello_world-85.7%20KB-3DDC97?style=flat-square" alt="85.7 KB">
-  <img src="https://img.shields.io/badge/GC-none-3DDC97?style=flat-square" alt="no GC">
-  <img src="https://img.shields.io/badge/engines-interpreter%20%7C%20native%20%7C%20wasm-17A2A2?style=flat-square" alt="three engines">
-  <img src="https://img.shields.io/badge/gates-103%20green%20%C2%B7%201%20red-F6AE2D?style=flat-square" alt="gates">
+  <b><a href="https://grasm-lang.github.io">Website</a></b> ·
+  <a href="https://grasm-lang.github.io/playground.html">Playground</a> ·
+  <a href="docs/overview.md">Guide</a> ·
+  <a href="spec/">Spec</a> ·
+  <a href="docs/northstar.md">Scorecard</a>
 </p>
 
 ---
 
-## Why Grasm
+# Three stories. One compiler that answers them.
 
-| | Everywhere else | Grasm |
-|---|---|---|
-| **Dependency can read your disk** | Nothing stops it | `capabilities = []` and the compiler refuses. A tampered package fails as `performs [io] permits []` |
-| **Memory safety costs lifetimes** | Annotations, or a GC | `own` / `inout`, value semantics, **no lifetime syntax and no collector** |
-| **"Works on my machine"** | Logs and guesswork | `GRASM_RECORD` journals every read from outside. `GRASM_REPLAY` reproduces it — *on a different engine, in a sandbox with no sockets, no filesystem, no processes* |
-| **Errors** | Exceptions or `Result` boilerplate | `T ! E` unions. Ignoring a fallible is a **compile error** |
-| **Toolchain** | compiler + formatter + linter + LSP + fuzzer + bench | **one binary**, 15 subcommands |
-| **Does the backend match the interpreter?** | Hope | **511 programs proven identical** across interpreter, native and wasm — and again on x86_64 |
+<br>
+
+### I. The dependency you never read
+
+> A patch release lands. Four thousand lines of transitive diff, and one of them
+> opens `~/.aws/credentials`. You find out from a bill.
+
+<img src="assets/capability.svg" alt="Packages that declare no capabilities are refused at the manifest boundary" width="100%">
+
+In Grasm, reach is a **declaration**, not a convention. A package that says
+`capabilities = []` cannot open a socket, read a file, spawn a process or ask
+the time — and it isn't a sandbox catching it at runtime, it's the compiler
+refusing to build it.
+
+```toml
+# grasm.toml — a crypto library has no business outside its own arithmetic
+[package]
+name = "crypto-core"
+capabilities = []          # ← the whole attack surface, on one line
+```
+```
+error: package `crypto-core` performs [io] but permits []
+```
+
+<br>
+
+### II. "Cannot reproduce"
+
+> It crashed once, at 03:14, on a machine you can't log into. You have a stack
+> trace, a log line, and a week.
+
+<img src="assets/replay.svg" alt="A recorded journal replays byte-identically on the interpreter, native binary and wasm" width="100%">
+
+Every read from outside the program goes through **28 builtins**, and
+`GRASM_RECORD` writes down what each one returned. That journal *is* the bug
+report. `GRASM_REPLAY` runs it back — on a different engine, in a sandbox with
+no sockets, no filesystem, no clock and no processes.
+
+```sh
+GRASM_RECORD=crash.j ./server      # production
+GRASM_REPLAY=crash.j grasm run server.gr   # your laptop, same bytes out
+```
+
+<br>
+
+### III. The backend that miscompiles
+
+> It worked in the interpreter. It worked in debug. Then the optimiser got it,
+> and now one branch in ten thousand is wrong.
+
+<img src="assets/engines.svg" alt="Three engines on two architectures produce one answer" width="100%">
+
+Three engines, two architectures, **one answer**. Every program in the corpus
+runs on all of them every gate run, and the outputs are compared byte for byte.
+When they disagree, nothing ships — that is the release blocker, not a filed
+issue.
+
+<br>
+
+---
 
 ## The niche nobody else fills
 
-**A library you can prove is inert.** Capabilities are per package and checked at the boundary, so "this crypto crate cannot phone home" stops being a promise.
+- 🔒 &nbsp;**A library you can prove is inert.** Capabilities are per package and checked at the boundary. "This crate cannot phone home" stops being a promise.
+- 🔁 &nbsp;**A bug report that runs.** A recording made by a native binary replays inside a wasm module that has no OS underneath it.
+- 📐 &nbsp;**A spec small enough to hand to a machine.** `spec/` fits in one context window *on purpose* — designed to be a language an agent gets right, not one it guesses at.
+- ⚖️ &nbsp;**Differential correctness as the product.** Not a test suite bolted on. The thing being sold.
 
-**A bug report that replays.** The journal is the whole interface to the outside world — 28 builtins across all four engines. A recording made by a native binary replays byte-identically *inside a wasm module that has no OS underneath it*.
+## If you already write something else
 
-**A spec small enough to hand to a machine.** `spec/` fits in one context window on purpose — the language is designed to be one an agent gets right, not one it guesses at.
+| You write | What carries over | What's gone |
+|---|---|---|
+| **Rust** | ownership, ADTs, exhaustive matching, typed error flow | lifetime annotations, `Send`/`Sync` puzzles, six separate tools |
+| **Go** | fast builds, one static binary, cheap concurrent tasks | the garbage collector, `interface{}`, nil at runtime |
+| **Zig** | nothing hidden, no allocation you didn't ask for | hand-threaded allocators and `defer` for memory |
+| **TypeScript / Python** | ADTs, inference, iteration speed | a runtime to install, and type errors that wait until production |
 
-**Differential correctness as a product, not a test suite.** Three engines, two architectures, one answer. When they disagree, that is the release blocker.
+Honest about the trade: on eight benchmark programs Grasm's geomean is
+**0.965× of Rust `-O3`**. That is **3.5% behind**. It is not a win over Rust,
+and the chart below shows exactly which program carries the deficit.
 
-## Proof, measured 15 October 2026
+## Speed, stated honestly
 
-| Gate | Checks | Result |
+<img src="assets/speed.svg" alt="Eight benchmark programs against Rust -O3, geomean 0.965×" width="100%">
+
+## Measured, 15 October 2026
+
+| Gate | What it compares | Programs |
 |---|---|---:|
-| `difftest` | interpreter · native · bundle identical | **511** |
-| `crosstest` | cross-compiled x86_64, identical under Rosetta | **511** |
-| `wasmtest` | identical in the browser engine | **415** (96 need an OS) |
-| `ProjectGold` | whole applications agreeing on every engine | **44** |
-| `fuzz_laws` | algebraic laws held against arithmetic | **205** |
-| `depth` | nested calls reached, against 10,000 promised | **31,444** |
+| `difftest` | interpreter · native · bundle agree | **511** |
+| `crosstest` | cross-compiled x86_64, identical | **511** |
+| `wasmtest` | identical in the browser engine | **415** |
+| `ProjectGold` | whole applications, every engine | **44** |
+| `fuzz_laws` | algebraic laws against arithmetic | **205** |
+| `depth` | nested calls reached, 10,000 promised | **31,444** |
 
 | Goal | Target | Measured |
 |---|---|---|
@@ -55,11 +123,10 @@
 | Frontend throughput | ≥ 500k LOC/s | **535–547k** |
 | Edit → diagnostic | ≤ 50 ms | **p50 21 ms** |
 | Lightweight tasks | 1M per node | **1,000,000 in 22 s** |
-| Speed vs Rust (geomean, 8 programs) | ≥ 0.95× | **0.965×** — five of eight at or above parity |
 
-Not a win over Rust. `0.965×` means **3.5% behind**, and `docs/northstar.md` names which program carries it and why.
-
-**One gate is red on purpose:** the specification is 71 pages against the 50 it binds itself to. Raising the ceiling would meet the number by redefining it. [`docs/known-issues.md`](docs/known-issues.md) has the cost of closing it.
+> **One gate is red on purpose.** The specification is 71 pages against the 50
+> it binds itself to. Raising the ceiling would meet the number by redefining
+> it. [`docs/known-issues.md`](docs/known-issues.md) prices the fix.
 
 ## Taste
 
@@ -88,11 +155,18 @@ fn main() {
 
 ## Built in it
 
-**GrasmWire** — a VPN protocol written entirely in Grasm. Field arithmetic, cipher, authenticator, hash, key schedule, handshake, protocol. **3,099 lines, nothing underneath but this compiler.**
+**GrasmWire** — a VPN protocol written entirely in Grasm. Field arithmetic,
+cipher, authenticator, hash, key schedule, handshake, protocol: **3,099 lines,
+nothing underneath but this compiler.**
 
-Checked against RFC 8439, 7693, 7748, 5869 and the XChaCha20 draft, then checked again against an implementation sharing no code with it — 753 random cases a run, whole handshake included. Two processes bring a tunnel up over real UDP, rekey, follow a roaming peer, refuse a replayed handshake.
+Checked against RFC 8439, 7693, 7748 and 5869, then checked again against an
+implementation sharing no code with it — 753 random cases a run, whole handshake
+included. Two processes bring a tunnel up over real UDP, rekey, follow a roaming
+peer, and refuse a replayed handshake.
 
-**Every package below the endpoint declares no capabilities at all.** The curve, the hash, the AEAD and the handshake cannot open a socket or read a clock. Randomness and time arrive as arguments. → [`docs/grasmwire.md`](docs/grasmwire.md)
+**Every package below the endpoint declares no capabilities at all.** The curve,
+the hash, the AEAD and the handshake cannot open a socket or read a clock.
+Randomness and time arrive as arguments. → [`docs/grasmwire.md`](docs/grasmwire.md)
 
 ## Start
 
@@ -102,13 +176,14 @@ cargo build --release --workspace          # the runtime needs --workspace
 ./scripts/allgates.sh                      # 104 gates, ~2 h
 ```
 
-| | |
+| What | Where |
 |---|---|
-| Full guide, install, every subcommand | [`docs/overview.md`](docs/overview.md) |
-| Language specification | [`spec/`](spec/) |
-| Goals against measurements | [`docs/northstar.md`](docs/northstar.md) |
-| Strategy and roadmap | [`MASTERPLAN.md`](MASTERPLAN.md) |
-| Open defects, with reproducers | [`docs/known-issues.md`](docs/known-issues.md) |
-| 101 findings from building it | [`ProjectGold/FINDINGS.md`](ProjectGold/FINDINGS.md) |
+| 🌐 Website, tour, playground | **[grasm-lang.github.io](https://grasm-lang.github.io)** |
+| 📘 Full guide, install, every subcommand | [`docs/overview.md`](docs/overview.md) |
+| 📐 Language specification | [`spec/`](spec/) |
+| 📊 Goals against measurements | [`docs/northstar.md`](docs/northstar.md) |
+| 🗺️ Strategy and roadmap | [`MASTERPLAN.md`](MASTERPLAN.md) |
+| 🐛 Open defects, with reproducers | [`docs/known-issues.md`](docs/known-issues.md) |
+| 🔎 101 findings from building it | [`ProjectGold/FINDINGS.md`](ProjectGold/FINDINGS.md) |
 
-<p align="center"><sub>Pre-alpha. One platform exercised (arm64 macOS); Linux type-checks and has never been linked.<br>Every number above comes from the gate run that produced it, recorded in <code>site/facts.json</code>.</sub></p>
+<p align="center"><sub>Pre-alpha. One platform exercised (arm64 macOS); Linux type-checks and has never been linked.<br>Every number on this page comes from the gate run that produced it, recorded in <code>site/facts.json</code>.</sub></p>

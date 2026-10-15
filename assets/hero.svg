@@ -1,0 +1,58 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 360" width="1200" height="360" role="img" aria-label="Grasm — nothing happens that the code did not declare">
+  <defs>
+    <linearGradient id="wm" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#5BF0AE"/>
+      <stop offset="1" stop-color="#17A2A2"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0.14" cy="0.08" r="0.75">
+      <stop offset="0" stop-color="#3DDC97" stop-opacity="0.20"/>
+      <stop offset="1" stop-color="#3DDC97" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="rule" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#3DDC97" stop-opacity="0.9"/>
+      <stop offset="1" stop-color="#17A2A2" stop-opacity="0"/>
+    </linearGradient>
+  </defs>
+
+  <rect x="0" y="0" width="1200" height="360" rx="20" fill="#0A101C"/>
+  <rect x="0" y="0" width="1200" height="360" rx="20" fill="url(#glow)"/>
+  <rect x="0.75" y="0.75" width="1198.5" height="358.5" rx="19.25" fill="none" stroke="#1C2838" stroke-width="1.5"/>
+
+  <g transform="translate(72,96)">
+    <path d="M12 0 0 6.9v13.8L12 27.6l12-6.9V6.9L12 0Z" fill="none" stroke="#3DDC97" stroke-width="1.8" stroke-linejoin="round" transform="translate(0,-21)"/>
+    <text x="38" y="2" font-family="ui-monospace,SFMono-Regular,Menlo,monospace" font-size="72" font-weight="700" fill="url(#wm)" letter-spacing="-2">grasm</text>
+    <rect x="266" y="-30" width="78" height="26" rx="13" fill="#132031" stroke="#24364C"/>
+    <text x="305" y="-11" text-anchor="middle" font-family="ui-monospace,SFMono-Regular,Menlo,monospace" font-size="13" fill="#7F94AB">v1.0.0</text>
+  </g>
+
+  <rect x="74" y="122" width="300" height="2" fill="url(#rule)"/>
+
+  <text x="74" y="176" font-family="system-ui,-apple-system,Segoe UI,Helvetica,sans-serif" font-size="29" font-weight="600" fill="#EAF2FA">Nothing happens that the code</text>
+  <text x="74" y="212" font-family="system-ui,-apple-system,Segoe UI,Helvetica,sans-serif" font-size="29" font-weight="600" fill="#EAF2FA">didn&#8217;t declare.</text>
+
+  <text x="74" y="256" font-family="ui-monospace,SFMono-Regular,Menlo,monospace" font-size="14" fill="#6E829A" letter-spacing="0.4">effects you can audit &#183; ownership without lifetimes &#183; no collector</text>
+  <text x="74" y="280" font-family="ui-monospace,SFMono-Regular,Menlo,monospace" font-size="14" fill="#6E829A" letter-spacing="0.4">one binary &#183; three engines that agree byte for byte</text>
+
+  <g font-family="ui-monospace,SFMono-Regular,Menlo,monospace" text-anchor="middle">
+    <g transform="translate(700,56)">
+      <rect width="222" height="112" rx="14" fill="#0E1726" stroke="#1E2C3E"/>
+      <text x="111" y="58" font-size="40" font-weight="700" fill="#3DDC97">511</text>
+      <text x="111" y="84" font-size="12" fill="#788CA3">programs, identical</text>
+    </g>
+    <g transform="translate(946,56)">
+      <rect width="182" height="112" rx="14" fill="#0E1726" stroke="#1E2C3E"/>
+      <text x="91" y="58" font-size="34" font-weight="700" fill="#3DDC97">85.7<tspan font-size="18" fill="#8FA3B8"> KB</tspan></text>
+      <text x="91" y="84" font-size="12" fill="#788CA3">hello world, static</text>
+    </g>
+    <g transform="translate(700,192)">
+      <rect width="222" height="112" rx="14" fill="#0E1726" stroke="#1E2C3E"/>
+      <text x="111" y="58" font-size="40" font-weight="700" fill="#17C8B0">0</text>
+      <text x="111" y="84" font-size="12" fill="#788CA3">garbage collectors</text>
+    </g>
+    <g transform="translate(946,192)">
+      <rect width="182" height="112" rx="14" fill="#0E1726" stroke="#1E2C3E"/>
+      <text x="91" y="58" font-size="34" font-weight="700" fill="#17C8B0">31,444</text>
+      <text x="91" y="84" font-size="12" fill="#788CA3">call depth reached</text>
+    </g>
+  </g>
+</svg>

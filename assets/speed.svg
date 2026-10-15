@@ -1,0 +1,46 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 420" width="1200" height="420" role="img" aria-label="Speed against Rust, eight programs, geomean 0.965 times">
+  <defs>
+    <pattern id="hatch" width="7" height="7" patternTransform="rotate(45)" patternUnits="userSpaceOnUse">
+      <rect width="7" height="7" fill="#17212F"/><line x1="0" y1="0" x2="0" y2="7" stroke="#3B5068" stroke-width="2.5"/>
+    </pattern>
+  </defs>
+  <rect width="1200" height="420" rx="20" fill="#0A101C"/>
+  <rect x="0.75" y="0.75" width="1198.5" height="418.5" rx="19.25" fill="none" stroke="#1C2838" stroke-width="1.5"/>
+  <text x="56" y="46" font-family="ui-monospace,SFMono-Regular,Menlo,monospace" font-size="12" letter-spacing="2.6" fill="#3DDC97">SPEED, STATED HONESTLY</text>
+  <text x="56" y="74" font-family="system-ui,-apple-system,Segoe UI,Helvetica,sans-serif" font-size="17" fill="#8FA3B8">against Rust <tspan font-family="ui-monospace,Menlo,monospace" font-size="15">-O3</tspan>, same machine, same work &#8212; higher is Grasm ahead</text>
+  <line x1="90" y1="216.0" x2="1004" y2="216.0" stroke="#4C627C" stroke-width="1.5" stroke-dasharray="5 5"/>
+  <text x="1012" y="220.0" font-family="ui-monospace,SFMono-Regular,Menlo,monospace" font-size="11.5" fill="#7F94AB">1.00&#215; parity</text>
+  <line x1="90" y1="334.0" x2="1144" y2="334.0" stroke="#1E2C3E" stroke-width="1.5"/>
+  <rect x="117" y="136.9" width="60" height="197.1" rx="6" fill="#3DDC97"/>
+  <text x="147" y="125.9" text-anchor="middle" font-family="ui-monospace,SFMono-Regular,Menlo,monospace" font-size="13" font-weight="700" fill="#DCE8F4">1.67&#215;</text>
+  <text x="147" y="357.0" text-anchor="middle" font-family="ui-monospace,SFMono-Regular,Menlo,monospace" font-size="12" fill="#8FA3B8">wordfreq</text>
+  <rect x="231" y="201.8" width="60" height="132.2" rx="6" fill="#3DDC97"/>
+  <text x="261" y="190.8" text-anchor="middle" font-family="ui-monospace,SFMono-Regular,Menlo,monospace" font-size="13" font-weight="700" fill="#DCE8F4">1.12&#215;</text>
+  <text x="261" y="357.0" text-anchor="middle" font-family="ui-monospace,SFMono-Regular,Menlo,monospace" font-size="12" fill="#8FA3B8">sort</text>
+  <rect x="344" y="212.5" width="60" height="121.5" rx="6" fill="#3DDC97"/>
+  <text x="374" y="201.5" text-anchor="middle" font-family="ui-monospace,SFMono-Regular,Menlo,monospace" font-size="13" font-weight="700" fill="#DCE8F4">1.03&#215;</text>
+  <text x="374" y="357.0" text-anchor="middle" font-family="ui-monospace,SFMono-Regular,Menlo,monospace" font-size="12" fill="#8FA3B8">sieve</text>
+  <rect x="458" y="214.8" width="60" height="119.2" rx="6" fill="#3DDC97"/>
+  <text x="488" y="203.8" text-anchor="middle" font-family="ui-monospace,SFMono-Regular,Menlo,monospace" font-size="13" font-weight="700" fill="#DCE8F4">1.01&#215;</text>
+  <text x="488" y="357.0" text-anchor="middle" font-family="ui-monospace,SFMono-Regular,Menlo,monospace" font-size="12" fill="#8FA3B8">fib</text>
+  <rect x="572" y="214.8" width="60" height="119.2" rx="6" fill="#3DDC97"/>
+  <text x="602" y="203.8" text-anchor="middle" font-family="ui-monospace,SFMono-Regular,Menlo,monospace" font-size="13" font-weight="700" fill="#DCE8F4">1.01&#215;</text>
+  <text x="602" y="357.0" text-anchor="middle" font-family="ui-monospace,SFMono-Regular,Menlo,monospace" font-size="12" fill="#8FA3B8">parwords</text>
+  <rect x="686" y="225.4" width="60" height="108.6" rx="6" fill="#F6AE2D"/>
+  <text x="716" y="214.4" text-anchor="middle" font-family="ui-monospace,SFMono-Regular,Menlo,monospace" font-size="13" font-weight="700" fill="#DCE8F4">0.92&#215;</text>
+  <text x="716" y="357.0" text-anchor="middle" font-family="ui-monospace,SFMono-Regular,Menlo,monospace" font-size="12" fill="#8FA3B8">matmul</text>
+  <rect x="799" y="237.2" width="60" height="96.8" rx="6" fill="url(#hatch)" stroke="#3B5068"/>
+  <text x="829" y="226.2" text-anchor="middle" font-family="ui-monospace,SFMono-Regular,Menlo,monospace" font-size="13" font-weight="700" fill="#7F94AB">&#177;10%</text>
+  <text x="829" y="357.0" text-anchor="middle" font-family="ui-monospace,SFMono-Regular,Menlo,monospace" font-size="12" fill="#8FA3B8">parmap</text>
+  <rect x="913" y="273.8" width="60" height="60.2" rx="6" fill="#E2563F"/>
+  <text x="943" y="262.8" text-anchor="middle" font-family="ui-monospace,SFMono-Regular,Menlo,monospace" font-size="13" font-weight="700" fill="#DCE8F4">0.51&#215;</text>
+  <text x="943" y="357.0" text-anchor="middle" font-family="ui-monospace,SFMono-Regular,Menlo,monospace" font-size="12" fill="#8FA3B8">tree</text>
+  <text x="943" y="372" text-anchor="middle" font-family="ui-monospace,SFMono-Regular,Menlo,monospace" font-size="10.5" fill="#B4543F">carries the geomean</text>
+  <g transform="translate(1022,236)">
+    <rect width="126" height="98" rx="13" fill="#0E1726" stroke="#22354A"/>
+    <text x="63" y="30" text-anchor="middle" font-family="ui-monospace,SFMono-Regular,Menlo,monospace" font-size="11" fill="#788CA3">geomean</text>
+    <text x="63" y="62" text-anchor="middle" font-family="ui-monospace,SFMono-Regular,Menlo,monospace" font-size="26" font-weight="700" fill="#F6AE2D">0.965&#215;</text>
+    <text x="63" y="84" text-anchor="middle" font-family="ui-monospace,SFMono-Regular,Menlo,monospace" font-size="11" fill="#788CA3">3.5% behind</text>
+  </g>
+  <text x="56" y="400" font-family="ui-monospace,SFMono-Regular,Menlo,monospace" font-size="11.5" fill="#5D7189">2026-10-02, load 2.09 &#183; bench.sh refuses to run above a third of the cores being busy &#183; this is not a win over Rust</text>
+</svg>

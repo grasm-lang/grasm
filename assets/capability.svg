@@ -1,0 +1,90 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 420" width="1200" height="420" role="img" aria-label="Packages declaring no capabilities are refused at the manifest boundary">
+  <defs>
+    <linearGradient id="wall" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#17A2A2" stop-opacity="0.15"/>
+      <stop offset="0.5" stop-color="#3DDC97" stop-opacity="0.85"/>
+      <stop offset="1" stop-color="#17A2A2" stop-opacity="0.15"/>
+    </linearGradient>
+    <marker id="deny" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0 5h9" stroke="#E2563F" stroke-width="2"/>
+    </marker>
+    <marker id="allow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0 1l7 4-7 4z" fill="#3DDC97"/>
+    </marker>
+  </defs>
+
+  <rect width="1200" height="420" rx="20" fill="#0A101C"/>
+  <rect x="0.75" y="0.75" width="1198.5" height="418.5" rx="19.25" fill="none" stroke="#1C2838" stroke-width="1.5"/>
+
+  <text x="56" y="46" font-family="ui-monospace,SFMono-Regular,Menlo,monospace" font-size="12" letter-spacing="2.6" fill="#3DDC97">ACT I &#8212; THE DEPENDENCY YOU NEVER READ</text>
+  <text x="56" y="72" font-family="system-ui,-apple-system,Segoe UI,Helvetica,sans-serif" font-size="17" fill="#8FA3B8">reach is declared in the manifest, and the compiler is the one enforcing it</text>
+
+  <g font-family="ui-monospace,SFMono-Regular,Menlo,monospace">
+    <g fill="#0E1726" stroke="#22354A">
+      <rect x="56" y="110" width="252" height="56" rx="11"/>
+      <rect x="56" y="182" width="252" height="56" rx="11"/>
+      <rect x="56" y="254" width="252" height="56" rx="11"/>
+    </g>
+    <rect x="56" y="326" width="252" height="56" rx="11" fill="#0E1C19" stroke="#2C6B55"/>
+
+    <g font-size="15" fill="#DCE8F4">
+      <text x="76" y="136">crypto-core</text>
+      <text x="76" y="208">http-parse</text>
+      <text x="76" y="280">log-pretty</text>
+      <text x="76" y="352">wire-endpoint</text>
+    </g>
+    <g font-size="11.5" fill="#64788F">
+      <text x="76" y="155">capabilities = []</text>
+      <text x="76" y="227">capabilities = []</text>
+      <text x="76" y="299">capabilities = []</text>
+    </g>
+    <text x="76" y="371" font-size="11.5" fill="#4FC38C">capabilities = [&#34;net&#34;]</text>
+  </g>
+
+  <g stroke-width="2" fill="none">
+    <path d="M316 138h150" stroke="#E2563F" stroke-opacity="0.75" stroke-dasharray="6 5" marker-end="url(#deny)"/>
+    <path d="M316 210h150" stroke="#E2563F" stroke-opacity="0.75" stroke-dasharray="6 5" marker-end="url(#deny)"/>
+    <path d="M316 282h150" stroke="#E2563F" stroke-opacity="0.75" stroke-dasharray="6 5" marker-end="url(#deny)"/>
+    <path d="M316 354h404" stroke="#3DDC97" stroke-opacity="0.9" marker-end="url(#allow)"/>
+  </g>
+  <g stroke="#2A3A4E" stroke-width="2" stroke-dasharray="4 7" fill="none">
+    <path d="M498 138h226M498 210h226M498 282h226"/>
+  </g>
+
+  <rect x="474" y="100" width="16" height="292" rx="8" fill="url(#wall)"/>
+  <rect x="470" y="336" width="24" height="36" fill="#0A101C"/>
+  <g stroke="#3DDC97" stroke-width="2.5" stroke-linecap="round" opacity="0.85">
+    <path d="M476 330v6M488 330v6M476 378v-6M488 378v-6"/>
+  </g>
+  <text x="482" y="92" text-anchor="middle" font-family="ui-monospace,SFMono-Regular,Menlo,monospace" font-size="12" fill="#8FA3B8">the manifest</text>
+
+  <g stroke="#E2563F" stroke-width="2.4" stroke-linecap="round">
+    <path d="M474 130l16 16M490 130l-16 16"/>
+    <path d="M474 202l16 16M490 202l-16 16"/>
+    <path d="M474 274l16 16M490 274l-16 16"/>
+  </g>
+
+  <g font-family="ui-monospace,SFMono-Regular,Menlo,monospace" font-size="14">
+    <g fill="#0E1726" stroke="#22354A">
+      <rect x="730" y="114" width="200" height="48" rx="10"/>
+      <rect x="730" y="186" width="200" height="48" rx="10"/>
+      <rect x="730" y="258" width="200" height="48" rx="10"/>
+    </g>
+    <rect x="730" y="330" width="200" height="48" rx="10" fill="#0E1C19" stroke="#2C6B55"/>
+    <g fill="#8FA3B8">
+      <text x="756" y="144">fs.read</text>
+      <text x="756" y="216">proc.spawn</text>
+      <text x="756" y="288">clock.now</text>
+    </g>
+    <text x="756" y="360" fill="#5BF0AE">net.connect</text>
+  </g>
+
+  <g transform="translate(960,114)" font-family="ui-monospace,SFMono-Regular,Menlo,monospace" font-size="11.5" fill="#64788F">
+    <text x="0" y="30">the operating</text>
+    <text x="0" y="48">system, reachable</text>
+    <text x="0" y="66">only through</text>
+    <text x="0" y="84">these 28 builtins</text>
+  </g>
+
+  <rect x="56" y="398" width="0" height="0" fill="none"/>
+</svg>

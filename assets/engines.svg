@@ -1,0 +1,71 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 420" width="1200" height="420" role="img" aria-label="Three engines on two architectures produce one answer">
+  <defs>
+    <linearGradient id="hub" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#3DDC97" stop-opacity="0.18"/>
+      <stop offset="1" stop-color="#17A2A2" stop-opacity="0.18"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="1200" height="420" rx="20" fill="#0A101C"/>
+  <rect x="0.75" y="0.75" width="1198.5" height="418.5" rx="19.25" fill="none" stroke="#1C2838" stroke-width="1.5"/>
+
+  <text x="56" y="46" font-family="ui-monospace,SFMono-Regular,Menlo,monospace" font-size="12" letter-spacing="2.6" fill="#3DDC97">ACT III &#8212; THE BACKEND THAT MISCOMPILES</text>
+  <text x="56" y="72" font-family="system-ui,-apple-system,Segoe UI,Helvetica,sans-serif" font-size="17" fill="#8FA3B8">three engines, two architectures, one answer &#8212; a disagreement is the release blocker</text>
+
+  <g font-family="ui-monospace,SFMono-Regular,Menlo,monospace">
+    <g fill="#0E1726" stroke="#22354A">
+      <rect x="56" y="104" width="246" height="76" rx="12"/>
+      <rect x="337" y="104" width="246" height="76" rx="12"/>
+      <rect x="618" y="104" width="246" height="76" rx="12"/>
+      <rect x="898" y="104" width="246" height="76" rx="12"/>
+    </g>
+    <g font-size="15" fill="#DCE8F4">
+      <text x="80" y="136">interpreter</text>
+      <text x="361" y="136">native</text>
+      <text x="642" y="136">wasm</text>
+      <text x="922" y="136">native</text>
+    </g>
+    <g font-size="11.5" fill="#64788F">
+      <text x="80" y="158">tree-walking, the reference</text>
+      <text x="361" y="158">cranelift &#183; arm64 macOS</text>
+      <text x="642" y="158">the browser, no OS below</text>
+      <text x="922" y="158">x86_64, cross-compiled</text>
+    </g>
+  </g>
+
+  <g stroke="#3DDC97" stroke-opacity="0.45" stroke-width="2" fill="none">
+    <path d="M179 182v12q0 10 10 10h361q10 0 10 10v34"/>
+    <path d="M460 182v12q0 10 10 10h80q10 0 10 10v34"/>
+    <path d="M741 182v12q0 10-10 10h-81q-10 0-10 10v34"/>
+    <path d="M1021 182v12q0 10-10 10H650q-10 0-10 10v34"/>
+  </g>
+
+  <g>
+    <rect x="474" y="248" width="252" height="66" rx="14" fill="url(#hub)" stroke="#3DDC97" stroke-opacity="0.55"/>
+    <text x="600" y="282" text-anchor="middle" font-family="system-ui,-apple-system,Segoe UI,Helvetica,sans-serif" font-size="20" font-weight="600" fill="#EAF2FA">one answer</text>
+    <text x="600" y="302" text-anchor="middle" font-family="ui-monospace,SFMono-Regular,Menlo,monospace" font-size="11.5" fill="#7FA8A0">byte for byte, or the gate is red</text>
+  </g>
+
+  <g font-family="ui-monospace,SFMono-Regular,Menlo,monospace" text-anchor="middle">
+    <g transform="translate(120,336)">
+      <text x="0" y="26" font-size="26" font-weight="700" fill="#3DDC97">511</text>
+      <text x="0" y="46" font-size="11.5" fill="#64788F">difftest</text>
+    </g>
+    <g transform="translate(360,336)">
+      <text x="0" y="26" font-size="26" font-weight="700" fill="#3DDC97">511</text>
+      <text x="0" y="46" font-size="11.5" fill="#64788F">crosstest, x86_64</text>
+    </g>
+    <g transform="translate(600,336)">
+      <text x="0" y="26" font-size="26" font-weight="700" fill="#17C8B0">415</text>
+      <text x="0" y="46" font-size="11.5" fill="#64788F">wasmtest &#183; 96 need an OS</text>
+    </g>
+    <g transform="translate(840,336)">
+      <text x="0" y="26" font-size="26" font-weight="700" fill="#17C8B0">44</text>
+      <text x="0" y="46" font-size="11.5" fill="#64788F">whole applications</text>
+    </g>
+    <g transform="translate(1066,336)">
+      <text x="0" y="26" font-size="26" font-weight="700" fill="#17C8B0">205</text>
+      <text x="0" y="46" font-size="11.5" fill="#64788F">algebraic laws</text>
+    </g>
+  </g>
+</svg>
