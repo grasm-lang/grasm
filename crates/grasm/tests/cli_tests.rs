@@ -2025,3 +2025,56 @@ fn contracts_are_fuzzed_on_request() {
     assert_eq!(code, 0, "{out}");
     assert!(!out.contains("contracts of"), "{out}");
 }
+
+/// A literal shift count outside `0..63` is masked, not refused -- and the
+/// lint is the only thing that says so.
+///
+/// `[L-LIB-BITS]` makes the masking deliberate, so the program must keep
+/// running and printing what the clause promises. What this checks is that
+/// the three shapes a reader actually writes are all seen: a count past the
+/// width, a negative count (which parses as a negation of a literal, not as a
+/// negative literal, and was missed the first time), and a count in range,
+/// which must stay silent.
+#[test]
+fn a_literal_shift_count_outside_the_width_is_linted_but_still_runs() {
+    let work = Work::new("shiftcount");
+    let dir = work.package(
+        "shifty",
+        "[package]\nname = \"shifty\"\nversion = \"1.0.0\"\n",
+        "fn main() {\n    \
+         print(\"{1.shl(64)}\")\n    \
+         print(\"{256.shr(-1)}\")\n    \
+         print(\"{1.shl(63)}\")\n}\n",
+    );
+    let src = dir.join("src/main.gr");
+
+    let lint = Command::new(GRASM)
+        .args(["lint", src.to_str().unwrap(), "--only", "shift-count"])
+        .output()
+        .unwrap();
+    let out = String::from_utf8_lossy(&lint.stdout);
+    assert!(
+        out.contains("shift count 64 is masked to 0"),
+        "a count past the width was not reported:\n{out}"
+    );
+    assert!(
+        out.contains("shift count -1 is masked to 63"),
+        "a negated literal was not reported:\n{out}"
+    );
+    assert_eq!(
+        out.matches("shift-count").count(),
+        2,
+        "63 is in range and must not be reported:\n{out}"
+    );
+
+    // The clause promises these values. Linting them must not change them.
+    let run = Command::new(GRASM)
+        .args(["run", src.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout),
+        "1\n0\n-9223372036854775808\n",
+        "masking is specified behaviour and must be untouched"
+    );
+}

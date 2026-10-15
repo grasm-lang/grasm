@@ -217,6 +217,16 @@ Collect into a list and `join`.
 printed, but not destructured back into its arms. The way to branch on which
 failure occurred is to declare one sum type and match it.
 
+**The C boundary takes four types.** `extern fn` exists and the C ABI import
+is zero-cost, but `[T-EXTERN-POINTER]` allows a parameter to be `i64`, `f64`,
+`str` or `bytes` and nothing else. No struct by value, no callback, no opaque
+pointer handed back and forth. That is enough for `cos` and for a syscall and
+not enough for most real C libraries, which hand you a `struct` or want a
+function pointer. A review called this "hard isolation from the C ecosystem",
+which overstates it -- the boundary exists and declaring it is how a package
+admits to crossing it -- but the narrow type set is the real limit behind that
+complaint.
+
 **No GUI, no GPU, no DOM.** There is no windowing or toolkit binding, no FFI
 shaped to bind one, nothing addressing the GPU in any package, and the wasm
 build ships the interpreter without reach into the DOM. Platform input devices

@@ -353,7 +353,10 @@ impl<'a> Linter<'a> {
                     self.expr(a);
                 }
             }
-            Expr::MethodCall { recv, args, .. } => {
+            Expr::MethodCall {
+                recv, name, args, ..
+            } => {
+                self.shift_count(name, args);
                 self.expr(recv);
                 for a in args {
                     self.expr(a);
@@ -443,6 +446,43 @@ impl<'a> Linter<'a> {
         }
     }
 
+    /// A shift by a constant the hardware will mask away.
+    ///
+    /// `[L-LIB-BITS]` masks the count to `0..63` deliberately: Rust's `<<`
+    /// panics in a debug build and wraps in a release one, and Cranelift
+    /// leaves an out-of-range count undefined, so masking is the only choice
+    /// that keeps four engines printing the same bytes. That is the right
+    /// call, and it is still silent at the call site -- `1.shl(64)` is `1`,
+    /// and a program that wanted `0` gets no diagnostic at all. A literal
+    /// count is the case the compiler can see, so it is the case it should
+    /// say something about.
+    fn shift_count(&mut self, name: &Ident, args: &[Expr]) {
+        if !matches!(name.name.as_str(), "shl" | "shr" | "ushr") {
+            return;
+        }
+        // A negative literal is a negation applied to a literal, not a
+        // literal that is negative -- and `256.shr(-1)` is the example the
+        // clause itself reaches for, so matching only `Expr::Int` would miss
+        // the case most worth catching.
+        let (n, span) = match args {
+            [Expr::Int(n, span)] => (*n, *span),
+            [Expr::Unary { op: UnaryOp::Neg, expr, span }] => match expr.as_ref() {
+                Expr::Int(n, _) => (-*n, *span),
+                _ => return,
+            },
+            _ => return,
+        };
+        if (0..=63).contains(&n) {
+            return;
+        }
+        let masked = n.rem_euclid(64);
+        let msg = format!(
+            "shift count {n} is masked to {masked}, \
+             so this shifts by {masked} rather than {n} ([L-LIB-BITS])"
+        );
+        self.report(span, "shift-count", msg);
+    }
+
     pub fn finish(mut self) -> Vec<Finding> {
         self.findings.sort_by_key(|f| (f.line, f.col));
         std::mem::take(&mut self.findings)
@@ -508,5 +548,9 @@ pub const RULES: &[(&str, &str)] = &[
     (
         "long-function",
         "more statements than the limit — a line is not a statement",
+    ),
+    (
+        "shift-count",
+        "a literal shift count outside 0..63 — masked, never an error",
     ),
 ];
