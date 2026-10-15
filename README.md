@@ -102,6 +102,31 @@ Honest about the trade: on eight benchmark programs Grasm's geomean is
 **0.965× of Rust `-O3`**. That is **3.5% behind**. It is not a win over Rust,
 and the chart below shows exactly which program carries the deficit.
 
+## Is this a Rust wrapper?
+
+No. A `.gr` file never becomes Rust source and never touches `rustc`.
+
+| Stage | What it produces |
+|---|---|
+| `grasm_syntax` | its own lexer, parser and formatter |
+| `grasm_sema` | its own types, **effect rows**, ownership, exhaustiveness |
+| `grasm_interp` | the normative answer every other engine must match |
+| `grasm_native` | **Cranelift IR → an object file** |
+| `grasm_sys` | the operating system over **raw syscalls and libc — no `std`** |
+
+Cranelift is a code generator, the way LLVM is one for Clang, Swift and Rust
+itself. Nobody calls Rust C++-based because LLVM is written in C++.
+
+**Nothing of the host survives into what you ship.** All four crates a compiled
+program links are `#![no_std]`; `grasm_rt_abi` supplies Grasm's own
+`#[global_allocator]` and `#[panic_handler]`. A hello-world is **85.7 KB**
+and `nm` finds no Rust standard library in it.
+
+The compiler is *written in* Rust today, the way Rust's first compiler was
+written in OCaml and Go's in C. That is a bootstrap, and it is the one thing
+here designed to be replaced — [`MASTERPLAN.md`](MASTERPLAN.md) puts
+self-hosting at Phase 4. The language does not depend on it.
+
 ## Speed, stated honestly
 
 <img src="assets/speed.svg" alt="Eight benchmark programs against Rust -O3, geomean 0.965×" width="100%">
