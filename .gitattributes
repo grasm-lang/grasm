@@ -1,0 +1,43 @@
+# What GitHub's language bar should be counting.
+#
+# Linguist measures bytes of source, and without help it measures the wrong
+# bytes here: the comparison programs that exist so a benchmark has something
+# to compare against, the fixtures a fuzzer reads, and three directories whose
+# contents are written by a script in this repository rather than by a person.
+# None of that is the project's source, and all of it was being reported as
+# though it were.
+#
+# What stays counted is what somebody actually wrote: the compiler in
+# crates/ and the gates and generators in scripts/. The compiler being Rust is
+# a fact about the bootstrap, not something to hide behind an attribute.
+#
+# The language that will still not appear is Grasm. There are 1,218 .gr files
+# and roughly 286,000 lines of it in this repository, and Linguist reports 0%,
+# because Linguist has no entry for the extension. That needs a pull request
+# to github/linguist, and their bar is adoption across many repositories --
+# so it is a thing that becomes possible after users, not before them.
+
+# Benchmarks: the same eight programs written in six other languages, so that
+# `scripts/bench.sh` has a baseline. Fixtures, not implementation.
+benchmarks/c/**        linguist-vendored
+benchmarks/go/**       linguist-vendored
+benchmarks/nim/**      linguist-vendored
+benchmarks/python/**   linguist-vendored
+benchmarks/rust/**     linguist-vendored
+benchmarks/zig/**      linguist-vendored
+benchmarks/external/** linguist-vendored
+benchmarks/systems/**  linguist-vendored
+benchmarks/security/** linguist-vendored
+
+# Inputs a fuzzer or a conformance run reads. Nobody wrote these as prose.
+scripts/fixtures/**    linguist-vendored
+
+# Written by scripts/site.py, scripts/language_pack.sh and the wasm build.
+# Checking them in is deliberate -- the site is served from the repository --
+# but they are output.
+site/**                linguist-generated
+dist/**                linguist-generated
+ProjectGold/web/**     linguist-generated
+
+# Grasm source, for the day the extension is recognised.
+*.gr                   linguist-detectable
