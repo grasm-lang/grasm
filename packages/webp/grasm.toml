@@ -1,0 +1,6 @@
+[package]
+name = "webp"
+version = "1.0.0"
+
+# Decodes pixels from bytes the caller supplies.
+capabilities = []

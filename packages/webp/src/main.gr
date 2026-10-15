@@ -1,0 +1,919 @@
+// WebP lossless decode, to pixels.
+//
+// A lossless WebP is a RIFF container around a `VP8L` chunk, and that chunk
+// is four things stacked:
+//
+//   * **transforms** -- up to four, each a reversible recolouring or
+//     repacking applied before compression and undone after;
+//   * **meta-Huffman** -- the image divided into blocks, each naming its own
+//     set of prefix codes through a second, smaller image;
+//   * **five prefix codes** per block, for green-with-length, red, blue,
+//     alpha, and backward-reference distance;
+//   * **LZ77** over the pixels, with a colour cache and a 120-entry table
+//     mapping short distances to nearby pixels rather than to byte offsets.
+//
+// Lossy WebP is not here and is not a smaller job: it is VP8, a video codec's
+// intra frame, with a boolean arithmetic coder, four transform sizes, ten
+// intra prediction modes and a loop filter. It is refused by name.
+//
+// ## Checked against libwebp
+//
+// `scripts/webptest.sh` decodes each fixture and compares against what
+// Pillow reads from the same file. The reference is read *back from the
+// file*, not kept from what was handed to the encoder, because lossless
+// WebP zeroes the colour of fully transparent pixels -- the two are not the
+// same image, and a fixture that keeps the input reports a decoder bug that
+// is not there.
+
+type WebpError =
+    | NotWebp
+    | Lossy
+    | Truncated(at: i64)
+    | BadVersion(version: i64)
+    | BadHuffman(at: i64)
+    | BadDistance(distance: i64, at: i64)
+    | Unsupported(what: str, value: i64)
+
+/// A decoded image: four bytes a pixel, R, G, B, A, row by row.
+type WebpImage = {
+    width: i64,
+    height: i64,
+    pixels: bytes,
+}
+
+/// A forward, least-significant-bit-first cursor.
+///
+/// The other direction from zstd's sequence streams, and the same as its
+/// table descriptions.
+///
+/// `WebpBits` rather than `Bits` because types share one namespace across the
+/// whole program ([T-MODULE-NS]) and `zlib` already has a `Bits`. The two met
+/// the moment `packages/image` imported this and `png` together -- the same
+/// collision `jpeg` hit, which is the lesson a package set learns once: a
+/// library's types want a prefix before anything has collided.
+type WebpBits = {
+    data: bytes,
+    pos: i64,
+}
+
+fn read_bits(inout b: WebpBits, n: i64) -> i64 {
+    var v = 0
+    var k = 0
+    while k < n {
+        let i = b.pos + k
+        let byte = i / 8
+        var bit = 0
+        if byte < b.data.len() {
+            bit = b.data.at(byte).shr(i % 8).bit_and(1)
+        }
+        v = v.bit_or(bit.shl(k))
+        k = k + 1
+    }
+    b.pos = b.pos + n
+    v
+}
+
+/// A canonical prefix code, held as counts per length and symbols in order.
+///
+/// Decoding walks the lengths rather than indexing a table: it needs no
+/// table memory and is the same arithmetic a table would bake in. `single`
+/// is the symbol of a code with exactly one of them, which consumes **zero**
+/// bits -- there is nothing to distinguish, so the encoder writes nothing,
+/// and giving it a one-bit code reads a bit that was never written.
+type Code = {
+    counts: [i64],
+    symbols: [i64],
+    single: i64,
+}
+
+pub fn empty_code() -> Code {
+    Code{ counts: [], symbols: [], single: 0 - 1 }
+}
+
+/// Build a code from its per-symbol lengths.
+pub fn build_code(lengths: [i64]) -> Code {
+    var used = 0 - 1
+    var count = 0
+    var i = 0
+    while i < lengths.len() {
+        if lengths.get(i).unwrap_or(0) > 0 {
+            used = i
+            count = count + 1
+        }
+        i = i + 1
+    }
+    if count == 1 {
+        return Code{ counts: [], symbols: [], single: used }
+    }
+    var maxlen = 0
+    for l in lengths {
+        if l > maxlen {
+            maxlen = l
+        }
+    }
+    var counts: [i64] = []
+    for _k in 0..(maxlen + 1) {
+        counts.push(0)
+    }
+    for l in lengths {
+        if l > 0 {
+            counts[l] = counts.get(l).unwrap_or(0) + 1
+        }
+    }
+    // Symbols ordered by length, then by symbol, which is what makes the
+    // walk below find them in canonical order.
+    var symbols: [i64] = []
+    var len = 1
+    while len <= maxlen {
+        var s = 0
+        while s < lengths.len() {
+            if lengths.get(s).unwrap_or(0) == len {
+                symbols.push(s)
+            }
+            s = s + 1
+        }
+        len = len + 1
+    }
+    Code{ counts: counts, symbols: symbols, single: 0 - 1 }
+}
+
+/// Read one symbol.
+pub fn read_symbol(inout b: WebpBits, c: Code) -> i64 ! WebpError {
+    if c.single >= 0 {
+        return c.single
+    }
+    var code = 0
+    var first = 0
+    var index = 0
+    var len = 1
+    while len < c.counts.len() {
+        code = code.bit_or(read_bits(b, 1))
+        let n = c.counts.get(len).unwrap_or(0)
+        if code - first < n {
+            return c.symbols.get(index + code - first).unwrap_or(0)
+        }
+        index = index + n
+        first = (first + n).shl(1)
+        code = code.shl(1)
+        len = len + 1
+    }
+    fail(BadHuffman(b.pos))
+}
+
+/// The order the nineteen code-length code lengths arrive in.
+pub fn length_order() -> [i64] {
+    [17, 18, 0, 1, 2, 3, 4, 5, 16, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+}
+
+/// Read one prefix code: either two symbols written out, or lengths that are
+/// themselves prefix-coded.
+pub fn read_code(inout b: WebpBits, alphabet: i64) -> Code ! WebpError {
+    if read_bits(b, 1) == 1 {
+        let two = read_bits(b, 1) == 1
+        let wide = read_bits(b, 1) == 1
+        let first = read_bits(b, if wide { 8 } else { 1 })
+        if not two {
+            return Code{ counts: [], symbols: [], single: first }
+        }
+        let second = read_bits(b, 8)
+        var lengths: [i64] = []
+        for _k in 0..alphabet {
+            lengths.push(0)
+        }
+        if first < alphabet {
+            lengths[first] = 1
+        }
+        if second < alphabet {
+            lengths[second] = 1
+        }
+        return build_code(lengths)
+    }
+    let n = read_bits(b, 4) + 4
+    var cl: [i64] = []
+    for _k in 0..19 {
+        cl.push(0)
+    }
+    let order = length_order()
+    var i = 0
+    while i < n {
+        cl[order.get(i).unwrap_or(0)] = read_bits(b, 3)
+        i = i + 1
+    }
+    let cl_code = build_code(cl)
+    // A length limit may be given, after which every remaining symbol is
+    // unused. Without it the whole alphabet is read.
+    var budget = alphabet
+    if read_bits(b, 1) == 1 {
+        let nbits = 2 + 2 * read_bits(b, 3)
+        budget = 2 + read_bits(b, nbits)
+    }
+    return build_code(try read_lengths(b, cl_code, alphabet, budget))
+}
+
+/// The per-symbol lengths of a code, with the three repeat forms.
+fn read_lengths(
+    inout b: WebpBits,
+    cl_code: Code,
+    alphabet: i64,
+    budget_in: i64,
+) -> [i64] ! WebpError {
+    var lengths: [i64] = []
+    for _k in 0..alphabet {
+        lengths.push(0)
+    }
+    var budget = budget_in
+    var prev = 8
+    var at = 0
+    while at < alphabet and budget > 0 {
+        budget = budget - 1
+        let sym = try read_symbol(b, cl_code)
+        if sym < 16 {
+            lengths[at] = sym
+            at = at + 1
+            if sym != 0 {
+                prev = sym
+            }
+        } else if sym == 16 {
+            // The previous *nonzero* length again, three to six times.
+            let rep = 3 + read_bits(b, 2)
+            var k = 0
+            while k < rep and at < alphabet {
+                lengths[at] = prev
+                at = at + 1
+                k = k + 1
+            }
+        } else if sym == 17 {
+            at = at + 3 + read_bits(b, 3)
+        } else {
+            at = at + 11 + read_bits(b, 7)
+        }
+    }
+    lengths
+}
+
+/// The five codes a block uses, for every block.
+fn read_groups(inout b: WebpBits, groups: i64, cache_bits: i64) -> [Code] ! WebpError {
+    var out: [Code] = []
+    var g = 0
+    while g < groups {
+        var j = 0
+        while j < 5 {
+            var alphabet = 256
+            if j == 0 {
+                alphabet = 256 + 24
+                if cache_bits > 0 {
+                    alphabet = alphabet + 1.shl(cache_bits)
+                }
+            } else if j == 4 {
+                alphabet = 40
+            }
+            out.push(try read_code(b, alphabet))
+            j = j + 1
+        }
+        g = g + 1
+    }
+    out
+}
+
+/// A length or distance from its prefix code and extra bits.
+pub fn prefix_value(inout b: WebpBits, prefix: i64) -> i64 {
+    if prefix < 4 {
+        return prefix + 1
+    }
+    let extra = (prefix - 2).shr(1)
+    let offset = (2 + prefix.bit_and(1)).shl(extra)
+    offset + read_bits(b, extra) + 1
+}
+
+/// The 120 short distances, as `x + y * 8` pairs packed one a slot.
+///
+/// A distance of 1 to 120 names a *nearby pixel* rather than a count of
+/// pixels back, so a decoder that treats it as a count produces an image
+/// that is almost right near the top and wrong everywhere else.
+pub fn distance_map() -> [i64] {
+    [
+        0x01, 0x10, 0x11, 0xF1, 0x02, 0x20, 0x12, 0xF2,
+        0x21, 0xE1, 0x22, 0xE2, 0x03, 0x30, 0x13, 0xF3,
+        0x31, 0xD1, 0x23, 0xE3, 0x32, 0xD2, 0x04, 0x40,
+        0x14, 0xF4, 0x41, 0xC1, 0x33, 0xD3, 0x24, 0xE4,
+        0x42, 0xC2, 0x05, 0x34, 0xD4, 0x43, 0xC3, 0x50,
+        0x15, 0xF5, 0x51, 0xB1, 0x25, 0xE5, 0x52, 0xB2,
+        0x44, 0xC4, 0x35, 0xD5, 0x53, 0xB3, 0x06, 0x60,
+        0x16, 0xF6, 0x61, 0xA1, 0x26, 0xE6, 0x62, 0xA2,
+        0x45, 0xC5, 0x54, 0xB4, 0x36, 0xD6, 0x63, 0xA3,
+        0x07, 0x70, 0x17, 0xF7, 0x55, 0xB5, 0x71, 0x91,
+        0x46, 0xC6, 0x64, 0xA4, 0x27, 0xE7, 0x72, 0x92,
+        0x37, 0xD7, 0x73, 0x93, 0x56, 0xB6, 0x65, 0xA5,
+        0x80, 0x47, 0xC7, 0x74, 0x94, 0x81, 0x82, 0x66,
+        0xA6, 0x83, 0x57, 0xB7, 0x75, 0x95, 0x84, 0x67,
+        0xA7, 0x76, 0x96, 0x85, 0x77, 0x97, 0x86, 0x87,
+    ]
+}
+
+/// Turn a distance code into a pixel distance.
+pub fn map_distance(code: i64, width: i64) -> i64 {
+    if code > 120 {
+        return code - 120
+    }
+    let packed = distance_map().get(code - 1).unwrap_or(1)
+    var xi = packed.shr(4)
+    if xi > 8 {
+        xi = xi - 16
+    }
+    let yi = packed.bit_and(15)
+    let d = xi + yi * width
+    if d < 1 {
+        return 1
+    }
+    d
+}
+
+/// Where a colour lands in the cache.
+///
+/// One lookup and no conflict resolution: a collision simply replaces the
+/// entry, and both sides agree because both compute the same hash.
+pub fn cache_slot(colour: i64, bits: i64) -> i64 {
+    let mixed = (506832829 * colour).bit_and(4294967295)
+    mixed.shr(32 - bits)
+}
+
+/// The pixels of one image, as packed ARGB words.
+fn decode_pixels(
+    inout b: WebpBits,
+    width: i64,
+    height: i64,
+    cache_bits: i64,
+    codes: [Code],
+    meta: [i64],
+    meta_bits: i64,
+    meta_w: i64,
+) -> [i64] ! WebpError {
+    let total = width * height
+    var px: [i64] = []
+    for _k in 0..total {
+        px.push(0)
+    }
+    var cache: [i64] = []
+    if cache_bits > 0 {
+        for _k in 0..1.shl(cache_bits) {
+            cache.push(0)
+        }
+    }
+    var i = 0
+    while i < total {
+        var g = 0
+        if meta.len() > 0 {
+            let x = i % width
+            let y = i / width
+            g = meta.get((y.shr(meta_bits)) * meta_w + x.shr(meta_bits)).unwrap_or(0)
+        }
+        let base = g * 5
+        let green = try read_symbol(b, codes.get(base).unwrap_or(empty_code()))
+        if green < 256 {
+            let red = try read_symbol(b, codes.get(base + 1).unwrap_or(empty_code()))
+            let blue = try read_symbol(b, codes.get(base + 2).unwrap_or(empty_code()))
+            let alpha = try read_symbol(b, codes.get(base + 3).unwrap_or(empty_code()))
+            let c = alpha.shl(24).bit_or(red.shl(16)).bit_or(green.shl(8)).bit_or(blue)
+            px[i] = c
+            if cache_bits > 0 {
+                cache[cache_slot(c, cache_bits)] = c
+            }
+            i = i + 1
+        } else if green < 256 + 24 {
+            let length = prefix_value(b, green - 256)
+            let dcode = try read_symbol(b, codes.get(base + 4).unwrap_or(empty_code()))
+            let dist = map_distance(prefix_value(b, dcode), width)
+            if dist > i {
+                fail(BadDistance(dist, i))
+            }
+            var k = 0
+            while k < length and i < total {
+                let c = px.get(i - dist).unwrap_or(0)
+                px[i] = c
+                if cache_bits > 0 {
+                    cache[cache_slot(c, cache_bits)] = c
+                }
+                i = i + 1
+                k = k + 1
+            }
+        } else {
+            px[i] = cache.get(green - 256 - 24).unwrap_or(0)
+            i = i + 1
+        }
+    }
+    px
+}
+
+fn clip255(v: i64) -> i64 {
+    if v < 0 {
+        return 0
+    }
+    if v > 255 {
+        return 255
+    }
+    v
+}
+
+/// Per-channel average of two packed colours.
+fn ave2(a: i64, c: i64) -> i64 {
+    a.bit_xor(c).bit_and(4278124286).shr(1) + a.bit_and(c)
+}
+
+fn chan(v: i64, shift: i64) -> i64 {
+    v.shr(shift).bit_and(255)
+}
+
+/// A signed byte from an unsigned one.
+fn signed(v: i64) -> i64 {
+    if v > 127 {
+        return v - 256
+    }
+    v
+}
+
+fn abs_of(v: i64) -> i64 {
+    if v < 0 {
+        return 0 - v
+    }
+    v
+}
+
+/// libwebp's `Select(top, left, top_left)`: whichever of the first two is
+/// closer to the third, summed over the channels.
+fn select_near(a: i64, c: i64, d: i64) -> i64 {
+    var total = 0
+    for shift in [24, 16, 8, 0] {
+        let av = chan(a, shift)
+        let cv = chan(c, shift)
+        let dv = chan(d, shift)
+        total = total + abs_of(cv - dv) - abs_of(av - dv)
+    }
+    if total <= 0 {
+        return a
+    }
+    c
+}
+
+fn clamp_full(c0: i64, c1: i64, c2: i64) -> i64 {
+    var out = 0
+    for shift in [24, 16, 8, 0] {
+        out = out.bit_or(clip255(chan(c0, shift) + chan(c1, shift) - chan(c2, shift)).shl(shift))
+    }
+    out
+}
+
+fn clamp_half(ave: i64, c2: i64) -> i64 {
+    var out = 0
+    for shift in [24, 16, 8, 0] {
+        let a = chan(ave, shift)
+        let d = chan(c2, shift)
+        // C divides toward zero, which matters because this difference is
+        // signed: flooring instead is off by one on every negative half.
+        var half = 0
+        if a >= d {
+            half = (a - d) / 2
+        } else {
+            half = 0 - ((d - a) / 2)
+        }
+        out = out.bit_or(clip255(a + half).shl(shift))
+    }
+    out
+}
+
+/// The fourteen predictors.
+pub fn predict(mode: i64, left: i64, top: i64, top_left: i64, top_right: i64) -> i64 {
+    if mode == 0 {
+        return 4278190080
+    }
+    if mode == 1 {
+        return left
+    }
+    if mode == 2 {
+        return top
+    }
+    if mode == 3 {
+        return top_right
+    }
+    if mode == 4 {
+        return top_left
+    }
+    if mode == 5 {
+        return ave2(ave2(left, top_right), top)
+    }
+    if mode == 6 {
+        return ave2(left, top_left)
+    }
+    if mode == 7 {
+        return ave2(left, top)
+    }
+    if mode == 8 {
+        return ave2(top_left, top)
+    }
+    if mode == 9 {
+        return ave2(top, top_right)
+    }
+    if mode == 10 {
+        return ave2(ave2(left, top_left), ave2(top, top_right))
+    }
+    if mode == 11 {
+        return select_near(top, left, top_left)
+    }
+    if mode == 12 {
+        return clamp_full(left, top, top_left)
+    }
+    clamp_half(ave2(left, top), top_left)
+}
+
+/// Per-channel byte addition, which is how a predictor residual applies.
+pub fn add_pixels(a: i64, c: i64) -> i64 {
+    let ag = a.bit_and(4278255360) + c.bit_and(4278255360)
+    let rb = a.bit_and(16711935) + c.bit_and(16711935)
+    ag.bit_and(4278255360).bit_or(rb.bit_and(16711935))
+}
+
+fn subsample(size: i64, bits: i64) -> i64 {
+    (size + 1.shl(bits) - 1).shr(bits)
+}
+
+/// Undo the predictor transform.
+///
+/// The first pixel uses black, the rest of the first row uses the pixel to
+/// the left, and the first of every later row uses the pixel above --
+/// regardless of what the mode image says, because those neighbours do not
+/// exist.
+fn undo_predictor(inout px: [i64], w: i64, h: i64, bits: i64, modes: [i64], mw: i64) {
+    var y = 0
+    while y < h {
+        var x = 0
+        while x < w {
+            let i = y * w + x
+            var p = 0
+            if x == 0 and y == 0 {
+                p = 4278190080
+            } else if y == 0 {
+                p = px.get(i - 1).unwrap_or(0)
+            } else if x == 0 {
+                p = px.get(i - w).unwrap_or(0)
+            } else {
+                let mode = modes.get((y.shr(bits)) * mw + x.shr(bits)).unwrap_or(0).shr(8).bit_and(15)
+                var tr = px.get(i - w).unwrap_or(0)
+                if x + 1 < w {
+                    tr = px.get(i - w + 1).unwrap_or(0)
+                }
+                p = predict(
+                    mode,
+                    px.get(i - 1).unwrap_or(0),
+                    px.get(i - w).unwrap_or(0),
+                    px.get(i - w - 1).unwrap_or(0),
+                    tr,
+                )
+            }
+            px[i] = add_pixels(px.get(i).unwrap_or(0), p)
+            x = x + 1
+        }
+        y = y + 1
+    }
+}
+
+/// Undo the cross-colour transform.
+///
+/// Three signed multipliers per block, and they are *not* in the order a
+/// reader expects: green-to-red is the low byte, green-to-blue the next, and
+/// red-to-blue the next. Swapping the last two decodes an image whose
+/// greens are right and whose reds and blues drift.
+fn undo_cross_colour(inout px: [i64], w: i64, h: i64, bits: i64, data: [i64], dw: i64) {
+    var y = 0
+    while y < h {
+        var x = 0
+        while x < w {
+            let i = y * w + x
+            let m = data.get((y.shr(bits)) * dw + x.shr(bits)).unwrap_or(0)
+            let green_to_red = m.bit_and(255)
+            let green_to_blue = m.shr(8).bit_and(255)
+            let red_to_blue = m.shr(16).bit_and(255)
+            let argb = px.get(i).unwrap_or(0)
+            let green = chan(argb, 8)
+            var red = chan(argb, 16)
+            var blue = argb.bit_and(255)
+            red = (red + (signed(green_to_red) * signed(green)).shr(5)).bit_and(255)
+            blue = (blue + (signed(green_to_blue) * signed(green)).shr(5)).bit_and(255)
+            blue = (blue + (signed(red_to_blue) * signed(red)).shr(5)).bit_and(255)
+            px[i] = argb.bit_and(4278255360).bit_or(red.shl(16)).bit_or(blue)
+            x = x + 1
+        }
+        y = y + 1
+    }
+}
+
+/// Undo the subtract-green transform: green was taken out of red and blue.
+fn undo_subtract_green(inout px: [i64]) {
+    var i = 0
+    while i < px.len() {
+        let c = px.get(i).unwrap_or(0)
+        let g = chan(c, 8)
+        let r = (chan(c, 16) + g).bit_and(255)
+        let b = (c.bit_and(255) + g).bit_and(255)
+        px[i] = c.bit_and(4278255360).bit_or(r.shl(16)).bit_or(b)
+        i = i + 1
+    }
+}
+
+/// Undo colour indexing: each stored byte is one or more palette indices.
+fn undo_indexing(px: [i64], packed_w: i64, h: i64, bits: i64, palette: [i64], w: i64) -> [i64] {
+    var out: [i64] = []
+    for _k in 0..(w * h) {
+        out.push(0)
+    }
+    let per = 1.shl(bits)
+    let width_bits = 8.shr(bits)
+    let mask = 1.shl(width_bits) - 1
+    var y = 0
+    while y < h {
+        var x = 0
+        while x < w {
+            let word = px.get(y * packed_w + x.shr(bits)).unwrap_or(0)
+            var idx = word.shr(8).bit_and(255)
+            if bits > 0 {
+                idx = word.shr(8).shr((x.bit_and(per - 1)) * width_bits).bit_and(mask)
+            }
+            out[y * w + x] = palette.get(idx).unwrap_or(0)
+            x = x + 1
+        }
+        y = y + 1
+    }
+    out
+}
+
+/// One transform, kept until the pixels are decoded and then undone.
+type Transform = {
+    kind: i64,
+    bits: i64,
+    data: [i64],
+    data_w: i64,
+    /// The image width before this transform narrowed it, which only colour
+    /// indexing does.
+    width: i64,
+}
+
+/// Decode one image stream, which may recurse: a transform's data and the
+/// meta-Huffman block map are themselves image streams.
+///
+/// The order is fixed and easy to get wrong: transforms first and only at the
+/// top level, then the colour cache, then the block map, then the codes, then
+/// the pixels. Reading the cache after the block map decodes a plausible
+/// image from the wrong bits.
+pub fn decode_stream(inout b: WebpBits, w: i64, h: i64, top: bool) -> [i64] ! WebpError {
+    var transforms: [Transform] = []
+    var tw = w
+    if top {
+        var more = read_bits(b, 1) == 1
+        while more {
+            let kind = read_bits(b, 2)
+            if kind == 0 or kind == 1 {
+                let bits = read_bits(b, 3) + 2
+                let dw = subsample(tw, bits)
+                let dh = subsample(h, bits)
+                let data = try decode_stream(b, dw, dh, false)
+                transforms.push(Transform{ kind: kind, bits: bits, data: data, data_w: dw, width: tw })
+            } else if kind == 3 {
+                let colours = read_bits(b, 8) + 1
+                var bits = 0
+                if colours <= 2 {
+                    bits = 3
+                } else if colours <= 4 {
+                    bits = 2
+                } else if colours <= 16 {
+                    bits = 1
+                }
+                var palette = try decode_stream(b, colours, 1, false)
+                // The palette is stored as differences from the entry before.
+                var k = 1
+                while k < colours {
+                    palette[k] = add_pixels(
+                        palette.get(k).unwrap_or(0),
+                        palette.get(k - 1).unwrap_or(0),
+                    )
+                    k = k + 1
+                }
+                transforms.push(Transform{
+                    kind: kind,
+                    bits: bits,
+                    data: palette,
+                    data_w: 0,
+                    width: tw,
+                })
+                tw = subsample(tw, bits)
+            } else {
+                transforms.push(Transform{ kind: kind, bits: 0, data: [], data_w: 0, width: tw })
+            }
+            more = read_bits(b, 1) == 1
+        }
+    }
+    var cache_bits = 0
+    if read_bits(b, 1) == 1 {
+        cache_bits = read_bits(b, 4)
+        if cache_bits < 1 or cache_bits > 11 {
+            fail(Unsupported("colour cache bits", cache_bits))
+        }
+    }
+    var meta: [i64] = []
+    var meta_bits = 0
+    var meta_w = 0
+    var groups = 1
+    if top and read_bits(b, 1) == 1 {
+        meta_bits = read_bits(b, 3) + 2
+        meta_w = subsample(tw, meta_bits)
+        let meta_h = subsample(h, meta_bits)
+        let sub = try decode_stream(b, meta_w, meta_h, false)
+        var biggest = 0
+        for p in sub {
+            let g = p.shr(8).bit_and(65535)
+            meta.push(g)
+            if g > biggest {
+                biggest = g
+            }
+        }
+        groups = biggest + 1
+    }
+    let codes = try read_groups(b, groups, cache_bits)
+    var px = try decode_pixels(b, tw, h, cache_bits, codes, meta, meta_bits, meta_w)
+    // Undone in reverse, because each was applied over the result of the one
+    // before it.
+    var t = transforms.len() - 1
+    while t >= 0 {
+        let tr = transforms.get(t).unwrap_or(
+            Transform{ kind: 2, bits: 0, data: [], data_w: 0, width: tw },
+        )
+        if tr.kind == 2 {
+            undo_subtract_green(px)
+        } else if tr.kind == 0 {
+            undo_predictor(px, tr.width, h, tr.bits, tr.data, tr.data_w)
+        } else if tr.kind == 1 {
+            undo_cross_colour(px, tr.width, h, tr.bits, tr.data, tr.data_w)
+        } else {
+            px = undo_indexing(px, subsample(tr.width, tr.bits), h, tr.bits, tr.data, tr.width)
+        }
+        t = t - 1
+    }
+    px
+}
+
+fn le32(d: bytes, at: i64) -> i64 {
+    d.at(at) + d.at(at + 1) * 256 + d.at(at + 2) * 65536 + d.at(at + 3) * 16777216
+}
+
+fn tag_at(d: bytes, at: i64) -> str {
+    d.slice(at, at + 4).to_str()
+}
+
+pub fn is_webp(d: bytes) -> bool {
+    d.len() >= 12 and tag_at(d, 0) == "RIFF" and tag_at(d, 8) == "WEBP"
+}
+
+/// Decode a lossless WebP to four bytes a pixel.
+pub fn decode(d: bytes) -> WebpImage ! WebpError {
+    if not is_webp(d) {
+        fail(NotWebp)
+    }
+    var at = 12
+    while at + 8 <= d.len() {
+        let tag = tag_at(d, at)
+        let size = le32(d, at + 4)
+        if tag == "VP8 " {
+            fail(Lossy)
+        }
+        if tag == "VP8L" {
+            if at + 8 + size > d.len() {
+                fail(Truncated(at))
+            }
+            let chunk = d.slice(at + 8, at + 8 + size)
+            if chunk.len() < 5 or chunk.at(0) != 47 {
+                fail(NotWebp)
+            }
+            var b = WebpBits{ data: chunk, pos: 8 }
+            let w = read_bits(b, 14) + 1
+            let h = read_bits(b, 14) + 1
+            let _alpha = read_bits(b, 1)
+            let version = read_bits(b, 3)
+            if version != 0 {
+                fail(BadVersion(version))
+            }
+            let px = try decode_stream(b, w, h, true)
+            var out = bytes_filled(w * h * 4, 0)
+            var i = 0
+            while i < w * h {
+                let c = px.get(i).unwrap_or(0)
+                out.set(i * 4, chan(c, 16))
+                out.set(i * 4 + 1, chan(c, 8))
+                out.set(i * 4 + 2, c.bit_and(255))
+                out.set(i * 4 + 3, chan(c, 24))
+                i = i + 1
+            }
+            return WebpImage{ width: w, height: h, pixels: out }
+        }
+        at = at + 8 + size + size.bit_and(1)
+    }
+    fail(NotWebp)
+}
+
+test "a file that is not a WebP is not mistaken for one" {
+    assert(is_webp(bytes_of([82, 73, 70, 70, 0, 0, 0, 0, 87, 69, 66, 80])))
+    assert(not is_webp(bytes_of([82, 73, 70, 70, 0, 0, 0, 0, 65, 86, 73, 32])))
+    assert(not is_webp(bytes_of([])))
+    assert(not is_webp(bytes_of([137, 80, 78, 71])))
+}
+
+test "the distance map holds a hundred and twenty nearby pixels" {
+    assert_eq(distance_map().len(), 120)
+    // Code 1 is the pixel directly above: one row back.
+    assert_eq(map_distance(1, 10), 10)
+    // Code 2 is the pixel to the left.
+    assert_eq(map_distance(2, 10), 1)
+    // Code 3 is up and left.
+    assert_eq(map_distance(3, 10), 11)
+    // Code 4 is up and right, which is one row back minus one.
+    assert_eq(map_distance(4, 10), 9)
+    // Past 120 the code is a plain pixel count.
+    assert_eq(map_distance(121, 10), 1)
+    assert_eq(map_distance(200, 10), 80)
+}
+
+test "a distance that would reach before the first pixel is clamped to one" {
+    // Up-and-right on a one-pixel-wide image would be zero or negative.
+    assert_eq(map_distance(4, 1), 1)
+}
+
+test "a prefix value is its code until four, then takes extra bits" {
+    var b = WebpBits{ data: bytes_of([0, 0, 0, 0]), pos: 0 }
+    for pair in [[0, 1], [1, 2], [2, 3], [3, 4]] {
+        assert_eq(prefix_value(b, pair.get(0).unwrap_or(0)), pair.get(1).unwrap_or(0))
+    }
+}
+
+test "a code with one symbol consumes no bits" {
+    // There is nothing to distinguish, so the encoder writes nothing.
+    // Reading one bit here desynchronises every symbol after it.
+    var lengths: [i64] = []
+    for _k in 0..8 {
+        lengths.push(0)
+    }
+    lengths[5] = 1
+    let c = build_code(lengths)
+    assert_eq(c.single, 5)
+    var b = WebpBits{ data: bytes_of([255]), pos: 0 }
+    match read_symbol(b, c) {
+        Ok(s) -> {
+            assert_eq(s, 5)
+            assert_eq(b.pos, 0)
+        }
+        Err(_e) -> assert(false)
+    }
+}
+
+test "a two-symbol code consumes one bit" {
+    var lengths: [i64] = []
+    for _k in 0..4 {
+        lengths.push(0)
+    }
+    lengths[1] = 1
+    lengths[3] = 1
+    let c = build_code(lengths)
+    assert_eq(c.single, 0 - 1)
+    var b = WebpBits{ data: bytes_of([2]), pos: 0 }
+    // Bit 0 is 0 -> the first symbol; bit 1 is 1 -> the second.
+    match read_symbol(b, c) {
+        Ok(s) -> assert_eq(s, 1)
+        Err(_e) -> assert(false)
+    }
+    match read_symbol(b, c) {
+        Ok(s) -> assert_eq(s, 3)
+        Err(_e) -> assert(false)
+    }
+}
+
+test "the colour cache hash is the constant the format fixes" {
+    // 0x1e35a7bd. One bit wrong puts every colour in a different slot, and
+    // a transmitted index then fetches the wrong one.
+    assert_eq(cache_slot(1, 11), 506832829.shr(21))
+    assert_eq(cache_slot(0, 11), 0)
+}
+
+test "the predictors that are not averages" {
+    // Mode 0 is opaque black whatever the neighbours are.
+    assert_eq(predict(0, 1, 2, 3, 4), 4278190080)
+    assert_eq(predict(1, 11, 22, 33, 44), 11)
+    assert_eq(predict(2, 11, 22, 33, 44), 22)
+    assert_eq(predict(3, 11, 22, 33, 44), 44)
+    assert_eq(predict(4, 11, 22, 33, 44), 33)
+    // Mode 12 is left + top - top_left, per channel, clamped.
+    assert_eq(predict(12, 10, 20, 5, 0), 25)
+    // And it clamps rather than wrapping.
+    assert_eq(predict(12, 255, 255, 0, 0).bit_and(255), 255)
+}
+
+test "per-channel addition does not carry between channels" {
+    // 0x00FF0000 plus 0x00010000 would carry into the alpha byte if the
+    // channels were added as one integer.
+    assert_eq(add_pixels(16711680, 65536).shr(24).bit_and(255), 0)
+    assert_eq(add_pixels(16711680, 65536).shr(16).bit_and(255), 0)
+}

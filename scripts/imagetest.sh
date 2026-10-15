@@ -30,7 +30,9 @@ for pair in \
     "scripts/fixtures/image/gray.png:scripts/fixtures/image/gray.rgb:png" \
     "scripts/fixtures/image/rgba.png:scripts/fixtures/image/rgba.rgb:png" \
     "scripts/fixtures/tiff/raw_rgb.tif:scripts/fixtures/tiff/raw_rgb.raw:tiff" \
-    "scripts/fixtures/tiff/be_rgb.tif:scripts/fixtures/tiff/be_rgb.raw:tiff"
+    "scripts/fixtures/tiff/be_rgb.tif:scripts/fixtures/tiff/be_rgb.raw:tiff" \
+    "scripts/fixtures/webp/gradient.webp:scripts/fixtures/webp/gradient.rgb:webp" \
+    "scripts/fixtures/webp/palette.webp:scripts/fixtures/webp/palette.rgb:webp"
 do
     src=${pair%%:*}
     rest=${pair#*:}
@@ -66,5 +68,5 @@ if "$work/dec" scripts/fixtures/font/shapes.ttf "$work/out.raw" >/dev/null 2>&1;
 fi
 checked=$((checked + 1))
 
-echo "    files: $checked   formats: png (4 colour types), tiff, jpeg, and one refused"
-[ "$checked" -ge 8 ]
+echo "    files: $checked   formats: png (4 colour types), tiff, webp, jpeg, one refused"
+[ "$checked" -ge 10 ]

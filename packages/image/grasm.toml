@@ -16,3 +16,7 @@ version = "^1.0.0"
 [dependencies.tiff]
 path = "../tiff"
 version = "^1.0.0"
+
+[dependencies.webp]
+path = "../webp"
+version = "^1.0.0"

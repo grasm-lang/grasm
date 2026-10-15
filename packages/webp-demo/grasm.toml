@@ -1,0 +1,8 @@
+[package]
+name = "webp_demo"
+version = "1.0.0"
+capabilities = ["io"]
+
+[dependencies.webp]
+path = "../webp"
+version = "^1.0.0"

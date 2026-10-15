@@ -1,0 +1,11 @@
+// Decode a lossless WebP and write its RGBA out, for `scripts/webptest.sh`.
+import webp
+
+fn main() -> () ! WebpError / {io} {
+    let a = args()
+    let img = try webp.decode(read_bytes(a.get(0) ?? "") ?? bytes_of([]))
+    match write_bytes(a.get(1) ?? "", img.pixels) {
+        Err(_e) -> print("could not write")
+        Ok(_w) -> print("{img.width} {img.height}")
+    }
+}
