@@ -1,0 +1,256 @@
+// `gfmt` — the formatter, written in Grasm.
+//
+// This is the same algorithm `crates/grasm_syntax/src/fmt.rs` runs, ported
+// across. It exists to answer one question with a gate rather than a promise:
+// can this language host a piece of its own toolchain? The formatter is the
+// right first answer because it needs no parser — it is a character-level
+// state machine over lines, which is exactly what the Rust one is.
+//
+// The port is held to the Rust formatter byte for byte over the whole corpus
+// by `scripts/gfmttest.sh`. A difference is a defect in one of them, and the
+// test does not say which, only that they disagree.
+
+type Mode =
+    | Code
+    | Str
+    | Interp(n: i64)
+    | RawStr
+    | LineComment
+    | BlockComment(n: i64)
+
+/// `requires`/`ensures` continue the signature above them, but `requires = 1`
+/// is an assignment to a variable that happens to be called `requires`.
+fn contract_clause(text: str) -> bool {
+    for kw in ["requires ", "ensures "] {
+        if text.starts_with(kw) {
+            let rest = text.substr(kw.len(), text.len() - kw.len()).trim_start()
+            let assign = (rest.starts_with("=") and not rest.starts_with("==")) or
+                rest.starts_with("+=") or rest.starts_with("-=") or
+                rest.starts_with("*=") or rest.starts_with("/=")
+            if not assign {
+                return true
+            }
+        }
+    }
+    false
+}
+
+/// A line that continues the one above it sits one level deeper.
+fn continues(text: str) -> bool {
+    text.starts_with("|") or text.starts_with(".") or contract_clause(text)
+}
+
+/// Two more characters of `cs` from `i`, as a string, for `"""` detection.
+fn peek2(cs: [str], i: i64) -> str {
+    var out = ""
+    for k in i..(i + 2) {
+        if k < cs.len() {
+            out = out + cs.get(k).unwrap_or("")
+        }
+    }
+    out
+}
+
+fn format_src(src: str) -> str {
+    // Collected and joined at the end: `str` is immutable, so appending in a
+    // loop is quadratic. The Rust side reserves a String and pushes into it.
+    var out: [str] = []
+    var depth = 0
+    var levels: [i64] = []
+    var stack: [Mode] = [Code]
+
+    let parts = src.split("\n")
+    let last = parts.len() - 1
+
+    var index = 0
+    while index <= last {
+        let content = parts.get(index).unwrap_or("")
+        let newline = if index == last { "" } else { "\n" }
+        let trimmed = content.trim_start()
+
+        let top = stack.last().unwrap_or(Code)
+        let in_block = match top {
+            BlockComment(_) -> true
+            RawStr -> true
+            _ -> false
+        }
+
+        let cs = trimmed.chars()
+        var lead_closers = 0
+        if not in_block {
+            var k = 0
+            var stop = false
+            while k < cs.len() and not stop {
+                let c = cs.get(k).unwrap_or("")
+                if c == "}" or c == ")" or c == "]" {
+                    lead_closers = lead_closers + 1
+                    k = k + 1
+                } else {
+                    stop = true
+                }
+            }
+        }
+
+        let raw_now = match top {
+            RawStr -> true
+            _ -> false
+        }
+        if trimmed == "" and not raw_now {
+            out.push(newline)
+        } else if in_block {
+            out.push(content + newline)
+        } else {
+            // A comment takes the level of the next line that is neither
+            // blank nor a comment, so a doc comment above a declaration does
+            // not inherit the indentation of a sum type above it.
+            var pipe_extra = 0
+            if trimmed.starts_with("//") {
+                var j = index + 1
+                var found = false
+                while j <= last and not found {
+                    let nxt = parts.get(j).unwrap_or("").trim()
+                    if nxt != "" and not nxt.starts_with("//") {
+                        found = true
+                        if continues(nxt) { pipe_extra = 1 }
+                    }
+                    j = j + 1
+                }
+            } else if continues(trimmed) {
+                pipe_extra = 1
+            }
+
+            let after_closers = depth - lead_closers
+            var open_levels = 0
+            for d in levels {
+                if d <= after_closers { open_levels = open_levels + 1 }
+            }
+            var this_indent = open_levels + pipe_extra
+            if this_indent < 0 { this_indent = 0 }
+            out.push("    ".repeat(this_indent) + trimmed + newline)
+        }
+
+        // Scan the line for brackets and mode changes.
+        var i = 0
+        while i < cs.len() {
+            let ch = cs.get(i).unwrap_or("")
+            let m = stack.last().unwrap_or(Code)
+            match m {
+                Code -> {
+                    if ch == "\"" and peek2(cs, i + 1) == "\"\"" {
+                        i = i + 2
+                        stack.push(RawStr)
+                    } else if ch == "\"" {
+                        stack.push(Str)
+                    } else if ch == "/" and peek2(cs, i + 1).starts_with("/") {
+                        stack.push(LineComment)
+                        i = i + 1
+                    } else if ch == "/" and peek2(cs, i + 1).starts_with("*") {
+                        stack.push(BlockComment(1))
+                        i = i + 1
+                    } else if ch == "\{" or ch == "(" or ch == "[" {
+                        depth = depth + 1
+                    } else if ch == "}" or ch == ")" or ch == "]" {
+                        depth = depth - 1
+                    }
+                }
+                Interp(n) -> {
+                    if ch == "\"" and peek2(cs, i + 1) == "\"\"" {
+                        i = i + 2
+                        stack.push(RawStr)
+                    } else if ch == "\"" {
+                        stack.push(Str)
+                    } else if ch == "\{" {
+                        stack.pop()
+                        stack.push(Interp(n + 1))
+                    } else if ch == "}" {
+                        stack.pop()
+                        if n != 0 { stack.push(Interp(n - 1)) }
+                    }
+                }
+                Str -> {
+                    if ch == "\\" {
+                        i = i + 1
+                    } else if ch == "\"" {
+                        let _ = stack.pop()
+                    } else if ch == "\{" {
+                        stack.push(Interp(0))
+                    }
+                }
+                RawStr -> {
+                    if ch == "\"" and peek2(cs, i + 1) == "\"\"" {
+                        i = i + 2
+                        stack.pop()
+                    }
+                }
+                LineComment -> {}
+                BlockComment(n) -> {
+                    if ch == "*" and peek2(cs, i + 1).starts_with("/") {
+                        i = i + 1
+                        stack.pop()
+                        if n != 1 { stack.push(BlockComment(n - 1)) }
+                    } else if ch == "/" and peek2(cs, i + 1).starts_with("*") {
+                        i = i + 1
+                        stack.pop()
+                        stack.push(BlockComment(n + 1))
+                    }
+                }
+            }
+            i = i + 1
+        }
+
+        // A line comment, a string and an interpolation all end with the line.
+        var popping = true
+        while popping {
+            let t = stack.last().unwrap_or(Code)
+            let transient = match t {
+                LineComment -> true
+                Str -> true
+                Interp(_) -> true
+                _ -> false
+            }
+            if transient and stack.len() > 1 { stack.pop() } else { popping = false }
+        }
+
+        if not in_block {
+            var trimming = true
+            while trimming {
+                match levels.last() {
+                    Some(d) -> {
+                        if d > depth {
+                            let _ = levels.pop()
+                        } else {
+                            trimming = false
+                        }
+                    }
+                    None -> trimming = false
+                }
+            }
+            if levels.last().unwrap_or(0) < depth { levels.push(depth) }
+        }
+        if depth < 0 { depth = 0 }
+        index = index + 1
+    }
+
+    out.join("")
+}
+
+fn main() {
+    // An output path rather than stdout: `print` appends a newline, and a
+    // formatter that cannot reproduce a file byte for byte is not one.
+    let a = args()
+    if a.len() < 2 {
+        print("usage: gfmt <in.gr> <out.gr>")
+        return
+    }
+    let inp = a.get(0).unwrap_or("")
+    let outp = a.get(1).unwrap_or("")
+    match read_file(inp) {
+        Ok(src) -> {
+            match write_file(outp, format_src(src)) {
+                Ok(_) -> {}
+                Err(e) -> print("gfmt: cannot write {outp}: {e}")
+            }
+        }
+        Err(e) -> print("gfmt: cannot read {inp}: {e}")
+    }
+}

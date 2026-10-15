@@ -90,7 +90,13 @@ impl<'a> Linter<'a> {
         // A name a writer opened with `_` is unused on purpose. Without this
         // the rule fires on every deliberately-ignored binding and the only
         // way to silence it is to delete code that was written to be read.
-        let exempt = name.name.starts_with('_');
+        //
+        // `let _ = f()` is the same intent, and the parser desugars it to a
+        // synthesized name beginning with U+0001 so that no source text can
+        // name it. "Never read" is not a finding about a binding nothing is
+        // able to read: the rule fired on every deliberate discard, which is
+        // how the self-hosted formatter found it.
+        let exempt = name.name.starts_with('_') || name.name.starts_with('\u{1}');
         if !exempt && what != "import" {
             // A name that hides one already in scope is reported where it is
             // written, naming where the hidden one was — the pair is the
