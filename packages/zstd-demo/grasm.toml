@@ -1,0 +1,8 @@
+[package]
+name = "zstd_demo"
+version = "1.0.0"
+capabilities = ["io"]
+
+[dependencies.zstd]
+path = "../zstd"
+version = "^1.0.0"

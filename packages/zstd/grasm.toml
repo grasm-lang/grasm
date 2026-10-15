@@ -1,0 +1,6 @@
+[package]
+name = "zstd"
+version = "1.0.0"
+
+# Decompresses bytes the caller supplies. Reaches nothing.
+capabilities = []

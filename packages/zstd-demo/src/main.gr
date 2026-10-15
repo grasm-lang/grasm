@@ -1,0 +1,13 @@
+// Decompress a .zst file, for `scripts/zstdtest.sh`.
+import zstd
+
+fn main() -> () ! ZstdError / {io} {
+    let a = args()
+    let data = read_bytes(a.get(0) ?? "") ?? bytes_of([])
+    let h = try zstd.header(data)
+    let out = try zstd.decode(data)
+    match write_bytes(a.get(1) ?? "", out) {
+        Err(_e) -> print("could not write")
+        Ok(_w) -> print("{out.len()} declared {h.content_size} checksum {h.has_checksum}")
+    }
+}

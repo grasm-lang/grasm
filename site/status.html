@@ -81,7 +81,7 @@ code and diagnostics. All 511 are also compiled for x86_64 and run under
 Rosetta, every one of them agreeing, on 15 October 2026. Every generated program
 is checked for what it keeps as well as for what it prints.</p>
 <h2>Which run wrote which figure</h2>
-<p>The corpus is <b>520</b> standalone programs, counted as this page is
+<p>The corpus is <b>521</b> standalone programs, counted as this page is
 written and by difftest's own filter — so a program added today is in that
 number today. Everything below it needs a run, and these are not all from one
 run. <code>site/facts.json</code> used to carry no date at all, which is how a
@@ -133,7 +133,7 @@ table because the margin moved once already with nothing noticing: see
 <h2>What does not work</h2>
 <div class="scroll"><table>
 <tr><th>Limit</th><th>Detail</th></tr>
-<tr><td>660 libraries, all first-party</td><td>See <a href="packages.html">Packages</a>; the plan for the rest is in <code>docs/packages-plan.md</code>. Anything else you need, you write, or bind to C with <code>extern fn</code>.</td></tr>
+<tr><td>661 libraries, all first-party</td><td>See <a href="packages.html">Packages</a>; the plan for the rest is in <code>docs/packages-plan.md</code>. Anything else you need, you write, or bind to C with <code>extern fn</code>.</td></tr>
 <tr><td>Blade is local only</td><td>A <code>path</code> dependency and a local Blade registry both work. Nothing fetches from or publishes to a remote one yet.</td></tr>
 <tr><td>Downloads are not code-signed</td><td>macOS binaries for both architectures are published on the <a href="https://github.com/grasm-lang/grasm/releases/latest">releases page</a> with SHA-256 sums, but they carry no Apple Developer signature, so Gatekeeper will ask before the first run. Notarisation is release work, not language work.</td></tr>
 <tr><td>Not faster than Rust</td><td>The geomean is 0.965× of it, 0.955× with the harness floor taken out of both sides, against a 0.95× target — so the goal is met and the claim is not available. <code>tree</code> at 0.51× is the worst row. On the systems suite Grasm loses <code>etl</code> by 3.6×, and wins memory everywhere — 8× on <code>chat</code>. <a href="performance.html">Every row →</a></td></tr>

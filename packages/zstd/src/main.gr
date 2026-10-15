@@ -1,0 +1,342 @@
+// Zstandard decompression.
+//
+// The library set had deflate, lz4, snappy, bzip2 and xz and not this one,
+// which is what anything written since 2016 compresses with.
+//
+// A zstd frame is a header and a run of blocks. A block is raw, a single
+// repeated byte, or compressed -- and a compressed block is two entropy
+// coders stacked: Huffman over the literal bytes, and Finite State Entropy
+// over the lengths and offsets that say how to interleave those literals
+// with matches copied out of the history.
+//
+// ## What is here
+//
+// The frame, and raw and RLE blocks. A compressed block is refused by name
+// rather than decoded wrongly, which is the one thing a decompressor must
+// never do -- a wrong answer from a decompressor is indistinguishable from a
+// right one until something downstream fails.
+//
+// ## The checksum is parsed and not verified
+//
+// A frame may end with the low four bytes of the content's XXH64. There is no
+// xxhash package here, so the field is located and skipped. `has_checksum`
+// reports whether one was present so a caller knows what it did not get.
+// Saying that is better than implying the data was checked.
+
+type ZstdError =
+    | NotZstd
+    | Truncated(at: i64)
+    | Reserved(what: str)
+    | CompressedBlock
+    | Unsupported(what: str, value: i64)
+
+/// What a frame header said.
+type FrameHeader = {
+    /// Where the first block header starts.
+    body_at: i64,
+    /// The decompressed size the frame declares, or -1 when it declares none.
+    content_size: i64,
+    window_size: i64,
+    dict_id: i64,
+    has_checksum: bool,
+    single_segment: bool,
+}
+
+pub fn magic() -> i64 {
+    4247762216
+}
+
+/// `0xFD2FB528`, little-endian.
+pub fn is_zstd(data: bytes) -> bool {
+    data.len() >= 4 and
+    data.at(0) == 40 and
+    data.at(1) == 181 and
+    data.at(2) == 47 and
+    data.at(3) == 253
+}
+
+/// A skippable frame, which a reader must step over without complaint.
+pub fn is_skippable(data: bytes, at: i64) -> bool {
+    at + 4 <= data.len() and
+    data.at(at + 1) == 42 and
+    data.at(at + 2) == 77 and
+    data.at(at + 3) == 24 and
+    data.at(at) >= 80 and
+    data.at(at) <= 95
+}
+
+fn le(data: bytes, at: i64, n: i64) -> i64 {
+    var v = 0
+    var i = n - 1
+    while i >= 0 {
+        v = v.shl(8).bit_or(data.at(at + i))
+        i = i - 1
+    }
+    v
+}
+
+/// Bytes the Frame_Content_Size field occupies, which depends on the flag
+/// *and* on whether the frame is a single segment.
+pub fn fcs_size(flag: i64, single_segment: bool) -> i64 {
+    if flag == 0 {
+        return if single_segment { 1 } else { 0 }
+    }
+    if flag == 1 {
+        return 2
+    }
+    if flag == 2 {
+        return 4
+    }
+    8
+}
+
+pub fn dict_id_size(flag: i64) -> i64 {
+    if flag == 0 {
+        return 0
+    }
+    if flag == 1 {
+        return 1
+    }
+    if flag == 2 {
+        return 2
+    }
+    4
+}
+
+/// The window size a Window_Descriptor byte names.
+pub fn window_from(desc: i64) -> i64 {
+    let exponent = desc.shr(3)
+    let mantissa = desc.bit_and(7)
+    let base = 1.shl(10 + exponent)
+    base + base / 8 * mantissa
+}
+
+/// Read a frame header.
+pub fn header(data: bytes) -> FrameHeader ! ZstdError {
+    if not is_zstd(data) {
+        fail(NotZstd)
+    }
+    if data.len() < 5 {
+        fail(Truncated(4))
+    }
+    let fhd = data.at(4)
+    let fcs_flag = fhd.shr(6)
+    let single = fhd.bit_and(32) != 0
+    if fhd.bit_and(8) != 0 {
+        fail(Reserved("the frame header's reserved bit"))
+    }
+    let checksum = fhd.bit_and(4) != 0
+    let dict_flag = fhd.bit_and(3)
+    var at = 5
+    var window = 0
+    if not single {
+        if at >= data.len() {
+            fail(Truncated(at))
+        }
+        window = window_from(data.at(at))
+        at = at + 1
+    }
+    let dsize = dict_id_size(dict_flag)
+    var dict = 0
+    if dsize > 0 {
+        if at + dsize > data.len() {
+            fail(Truncated(at))
+        }
+        dict = le(data, at, dsize)
+        at = at + dsize
+    }
+    let fsize = fcs_size(fcs_flag, single)
+    var content = 0 - 1
+    if fsize > 0 {
+        if at + fsize > data.len() {
+            fail(Truncated(at))
+        }
+        content = le(data, at, fsize)
+        // The two-byte form stores the size minus 256, which is the one
+        // special case in the whole header.
+        if fsize == 2 {
+            content = content + 256
+        }
+        at = at + fsize
+    }
+    if single and content >= 0 {
+        window = content
+    }
+    return FrameHeader{
+        body_at: at,
+        content_size: content,
+        window_size: window,
+        dict_id: dict,
+        has_checksum: checksum,
+        single_segment: single,
+    }
+}
+
+pub fn block_raw() -> i64 {
+    0
+}
+
+pub fn block_rle() -> i64 {
+    1
+}
+
+pub fn block_compressed() -> i64 {
+    2
+}
+
+/// Decompress one frame, and report where it ended.
+///
+/// The second value is the offset just past the frame, so a caller can walk
+/// a file holding several -- which is what `zstd` writes when it concatenates.
+pub fn decode_frame(data: bytes, from: i64) -> (bytes, i64) ! ZstdError {
+    let h = try header(if from == 0 { data } else { data.slice(from, data.len()) })
+    var at = from + h.body_at
+    var out: [bytes] = []
+    var total = 0
+    var last = false
+    while not last {
+        if at + 3 > data.len() {
+            fail(Truncated(at))
+        }
+        let bh = le(data, at, 3)
+        last = bh.bit_and(1) == 1
+        let kind = bh.shr(1).bit_and(3)
+        let size = bh.shr(3)
+        at = at + 3
+        if kind == 3 {
+            fail(Reserved("block type 3"))
+        }
+        if kind == block_raw() {
+            if at + size > data.len() {
+                fail(Truncated(at))
+            }
+            out.push(data.slice(at, at + size))
+            total = total + size
+            at = at + size
+        } else if kind == block_rle() {
+            if at >= data.len() {
+                fail(Truncated(at))
+            }
+            out.push(bytes_filled(size, data.at(at)))
+            total = total + size
+            at = at + 1
+        } else {
+            fail(CompressedBlock)
+        }
+    }
+    if h.has_checksum {
+        if at + 4 > data.len() {
+            fail(Truncated(at))
+        }
+        // Located and skipped: see the note at the top of this file.
+        at = at + 4
+    }
+    var joined = bytes_filled(total, 0)
+    var off = 0
+    for part in out {
+        joined.copy_from(off, part)
+        off = off + part.len()
+    }
+    return (joined, at)
+}
+
+/// Decompress every frame in a file, skipping the skippable ones.
+pub fn decode(data: bytes) -> bytes ! ZstdError {
+    var parts: [bytes] = []
+    var total = 0
+    var at = 0
+    while at + 4 <= data.len() {
+        if is_skippable(data, at) {
+            if at + 8 > data.len() {
+                fail(Truncated(at))
+            }
+            at = at + 8 + le(data, at + 4, 4)
+        } else {
+            let got = try decode_frame(data, at)
+            parts.push(got.0)
+            total = total + got.0.len()
+            at = got.1
+        }
+    }
+    var out = bytes_filled(total, 0)
+    var off = 0
+    for p in parts {
+        out.copy_from(off, p)
+        off = off + p.len()
+    }
+    return out
+}
+
+test "a file that is not zstd is not mistaken for one" {
+    assert(is_zstd(bytes_of([40, 181, 47, 253])))
+    assert(not is_zstd(bytes_of([40, 181, 47])))
+    assert(not is_zstd(bytes_of([31, 139, 8, 0])))
+    assert(not is_zstd(bytes_of([])))
+}
+
+test "a skippable frame is recognised by its magic range" {
+    // 0x184D2A50 through 0x184D2A5F, little-endian.
+    assert(is_skippable(bytes_of([80, 42, 77, 24]), 0))
+    assert(is_skippable(bytes_of([95, 42, 77, 24]), 0))
+    assert(not is_skippable(bytes_of([96, 42, 77, 24]), 0))
+    assert(not is_skippable(bytes_of([79, 42, 77, 24]), 0))
+}
+
+test "the content size field's width depends on the segment flag too" {
+    // Flag 0 is one byte for a single segment and absent otherwise, which is
+    // the case a table lookup alone gets wrong.
+    assert_eq(fcs_size(0, true), 1)
+    assert_eq(fcs_size(0, false), 0)
+    assert_eq(fcs_size(1, false), 2)
+    assert_eq(fcs_size(2, false), 4)
+    assert_eq(fcs_size(3, false), 8)
+}
+
+test "dictionary id widths follow the flag" {
+    assert_eq(dict_id_size(0), 0)
+    assert_eq(dict_id_size(1), 1)
+    assert_eq(dict_id_size(2), 2)
+    assert_eq(dict_id_size(3), 4)
+}
+
+test "a window descriptor is a mantissa over a power of two" {
+    // Exponent 0, mantissa 0 is the smallest window: 1 KiB.
+    assert_eq(window_from(0), 1024)
+    // Exponent 0, mantissa 4 adds four eighths of it.
+    assert_eq(window_from(4), 1536)
+    assert_eq(window_from(8), 2048)
+}
+
+test "the two-byte content size carries an offset of 256" {
+    // Frame: magic, FHD with FCS flag 1 and single segment, then 0 as two
+    // bytes -- which means 256 rather than nothing.
+    let f = bytes_of([40, 181, 47, 253, 96, 0, 0])
+    match header(f) {
+        Ok(h) -> {
+            assert_eq(h.content_size, 256)
+            assert_eq(h.body_at, 7)
+        }
+        // the header did not parse
+        Err(_e) -> assert(false)
+    }
+}
+
+test "a reserved header bit is refused rather than ignored" {
+    // Bit 3 set.
+    match header(bytes_of([40, 181, 47, 253, 8, 0, 0])) {
+        Err(_e) -> assert(true)
+        // a reserved bit was accepted
+        Ok(_h) -> assert(false)
+    }
+}
+
+test "an RLE block expands to one byte repeated" {
+    // FHD 0x20: single segment, FCS flag 0 so one byte of size.
+    // Block header 0x000033 = last, type 1 (RLE), size 6.
+    let f = bytes_of([40, 181, 47, 253, 32, 6, 51, 0, 0, 65])
+    match decode(f) {
+        Ok(out) -> assert_eq(out.to_list(), [65, 65, 65, 65, 65, 65])
+        // an RLE block did not expand
+        Err(_e) -> assert(false)
+    }
+}
