@@ -145,8 +145,8 @@ PAGES["index.html"] = (
         reach further than its manifest allows. Overstep, and it is a compile
         error.</p>
         <div class="actions">
-          <a class="btn" href="start.html">Get started</a>
-          <a class="btn ghost" href="#try">Try to break it</a>
+          <a class="btn" href="start.html">Get started <svg class="gl" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h13M13 6l6 6-6 6"/></svg></a>
+          <a class="btn ghost" href="#try"><svg class="gl" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg> Try to break it</a>
         </div>
       </div>
       <div class="lp-art">
@@ -175,36 +175,32 @@ PAGES["index.html"] = (
   <div class="lp-wrap lp-center">
     <span class="pill">Interactive</span>
     <h2>Sneak one past the compiler.</h2>
-    <p class="sub">A trusted math library ships a patch release. Same name,
-    same signature, same result — and one new line that reads a file. This is
-    the whole build.</p>
+    <p class="sub">A trusted math library ships a patch release. Add the line
+    that reads a file, loosen the manifest, and watch four toolchains react.</p>
   </div>
   <div class="lp-wrap">
-    <div class="split">
-      <div>
-        <h3>The manifest is the ceiling</h3>
-        <p>A package declares what it may reach. The compiler infers what it
-        actually does — through every call, into every dependency — and
-        refuses to build when the two disagree.</p>
-"""
-    + code(
-        """[package]
-name = "mathlib"
-
-capabilities = []          # reaches nothing at all""",
-        "mathlib/grasm.toml — the ceiling, in one line a reviewer can see.",
-    )
-    + """
+    <div class="demo">
+      <div class="ed">
+        <div class="bar"><i></i><i></i><i></i><b>mathlib</b></div>
+        <div class="file">grasm.toml</div>
+        <pre><span class="cm">[package]</span>
+<span class="kw">name</span> = <span class="st">"mathlib"</span>
+<span class="kw">version</span> = <span class="st">"1.0.1"</span>
+<span class="kw">capabilities</span> = <span class="st">[]</span></pre>
+        <div class="rule"></div>
+        <div class="file">src/lib.gr</div>
+        <pre><span class="kw">fn</span> <span class="fn">add</span>(a: <span class="ty">i64</span>, b: <span class="ty">i64</span>) -&gt; <span class="ty">i64</span> {
+    a + b
+}</pre>
       </div>
-      <div>
-        <h3>A patch release tries to grow teeth</h3>
-        <p>Same library, one new line, and four toolchains asked the same
-        question:</p>
+      <div class="run">
+        <h4>grasm build &#183; and the same patch elsewhere</h4>
         <div class="term">
           <div class="chrome"><span class="dot"></span><span class="dot"></span><span class="dot"></span>
             <span>app — grasm build</span></div>
           <div class="body"></div>
         </div>
+        <p class="more"><a href="playground.html">Open the full playground &#8594;</a></p>
       </div>
     </div>
 
@@ -227,29 +223,32 @@ capabilities = []          # reaches nothing at all""",
     <h2>Three ideas. One language.</h2>
     <p class="sub">They were built to compose. Each one closes a hole the
     other two leave open.</p>
-    <div class="grid three reveal">
-      <div class="card">
-        <span class="ico">«icon_lock»</span>
-        <h3>Capabilities</h3>
-        <p>A package states the effects it may perform. Exceeding it fails the
-        build in every consumer — not in a review, not at run time.</p>
-        <div class="lottie" data-lottie="ceiling"></div>
+    <div class="ideas reveal">
+      <div class="idea">
+        <img class="art" src="art/capabilities.svg" alt="An effect reaching the ceiling a package declared, and stopping there" width="440" height="200">
+        <div class="say">
+          <h3>Capabilities</h3>
+          <p>A package states the effects it may perform. Exceed it, and the
+          build fails in every consumer. Not in review. Not at run time.</p>
+        </div>
       </div>
-      <div class="card">
-        <span class="ico">«icon_layers»</span>
-        <h3>Ownership in tiers</h3>
-        <p>Value semantics by default, a region when a scope should own its
-        allocations, a generational reference when a graph needs one. No
-        lifetime annotations anywhere.</p>
-        <div class="lottie" data-lottie="tiers"></div>
+      <div class="idea">
+        <img class="art" src="art/tiers.svg" alt="Three tiers of ownership, stacked" width="440" height="200">
+        <div class="say">
+          <h3>Ownership in tiers</h3>
+          <p>Values by default. A region when a scope owns its allocations. A
+          generational reference when a graph needs one. No lifetime
+          annotations, anywhere.</p>
+        </div>
       </div>
-      <div class="card">
-        <span class="ico">«icon_flow»</span>
-        <h3>Four engines, one answer</h3>
-        <p>Interpreter, bundle, ahead-of-time native, and wasm. Develop
-        against instant feedback, ship a binary, run the same program in a
-        browser.</p>
-        <div class="lottie" data-lottie="engines"></div>
+      <div class="idea">
+        <img class="art" src="art/engines.svg" alt="Four engines converging on one answer" width="440" height="200">
+        <div class="say">
+          <h3>Four engines, one answer</h3>
+          <p>Interpreter, bundle, ahead-of-time native, and wasm. Instant
+          feedback while you build, a binary when you ship, the same program in
+          a browser.</p>
+        </div>
       </div>
     </div>
   </div>
@@ -319,23 +318,28 @@ capabilities = []          # reaches nothing at all""",
         checks it against what you declared. Touch the network, and the
         function stops compiling — along with every caller that was not given
         the same permission.</p>
+        <div class="saycards">
+          <div class="saycard"><code class="warn">! MathError</code>
+            <span>A failure the caller must handle.</span></div>
+          <div class="saycard"><code>/ {io}</code>
+            <span>A permission the caller must have.</span></div>
+        </div>
       </div>
-      <div>
-"""
-    + code(
-        """fn safe_div(a: i64, b: i64) -> i64 ! MathError {
-    if b == 0 {
-        fail(DivByZero)
+      <div class="slab">
+        <div class="term">
+          <div class="chrome"><span class="dot"></span><span class="dot"></span><span class="dot"></span>
+            <span>effects.gr</span></div>
+          <div class="body"><span class="kw">fn</span> <span class="fn">safe_div</span>(a: <span class="ty">i64</span>, b: <span class="ty">i64</span>) -&gt; <span class="ty">i64</span> <span class="st">! MathError</span> {
+    <span class="kw">if</span> b == <span class="nu">0</span> {
+        <span class="fn">fail</span>(<span class="ty">DivByZero</span>)
     }
     a / b
 }
 
-fn load(path: str) -> str ! IoError / {io} {
-    try read_file(path)
-}""",
-        "! MathError is a failure the caller must handle. / {io} is a permission the caller must have.",
-    )
-    + """
+<span class="kw">fn</span> <span class="fn">load</span>(path: <span class="ty">str</span>) -&gt; <span class="ty">str</span> <span class="st">! IoError</span> <span class="kw">/ {io}</span> {
+    <span class="kw">try</span> <span class="fn">read_file</span>(path)
+}</div>
+        </div>
       </div>
     </div>
   </div>

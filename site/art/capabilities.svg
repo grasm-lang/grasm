@@ -1,0 +1,33 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 440 200" width="440" height="200" role="img" aria-label="An effect reaching the ceiling a package declared, and stopping there">
+  <defs>
+    <linearGradient id="cg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#1A4DFF"/><stop offset="1" stop-color="#0F35E8"/>
+    </linearGradient>
+    <radialGradient id="cglow" cx="0.78" cy="0.12" r="0.7">
+      <stop offset="0" stop-color="#5FB0FF" stop-opacity=".55"/><stop offset="1" stop-color="#5FB0FF" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="ball" cx="0.35" cy="0.3" r="0.8">
+      <stop offset="0" stop-color="#FF9B7D"/><stop offset="1" stop-color="#E2563F"/>
+    </radialGradient>
+    <linearGradient id="chip" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff"/><stop offset="1" stop-color="#E4ECFF"/>
+    </linearGradient>
+  </defs>
+  <rect width="440" height="200" fill="url(#cg)"/>
+  <rect width="440" height="200" fill="url(#cglow)"/>
+  <text x="414" y="32" text-anchor="end" font-family="ui-monospace,Menlo,monospace" font-size="12" fill="#ffffff" fill-opacity=".72">ceiling = []</text>
+  <rect x="42" y="56" width="356" height="12" rx="6" fill="#ffffff" fill-opacity=".92"/>
+  <rect x="42" y="56" width="356" height="12" rx="6" fill="none" stroke="#ffffff" stroke-opacity=".5"/>
+  <circle cx="268" cy="41" r="13" fill="url(#ball)"/>
+  <g transform="translate(78,96)">
+    <rect width="76" height="76" rx="20" fill="url(#chip)" fill-opacity=".96"/>
+    <g transform="translate(38,38)" fill="none" stroke="#1A4DFF" stroke-width="2.1" stroke-linejoin="round">
+      <path d="M0-17 15-8.5v17L0 17-15 8.5v-17Z"/>
+      <path d="M0 0-15-8.5M0 0l15-8.5M0 0v17"/>
+    </g>
+  </g>
+  <g transform="translate(330,122)">
+    <rect width="62" height="28" rx="14" fill="#0A1033" fill-opacity=".42"/>
+    <text x="31" y="19" text-anchor="middle" font-family="ui-monospace,Menlo,monospace" font-size="12.5" fill="#ffffff">io &#215;</text>
+  </g>
+</svg>
