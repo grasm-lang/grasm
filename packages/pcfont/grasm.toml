@@ -1,0 +1,18 @@
+[package]
+name = "pcfont"
+version = "1.0.0"
+
+# Rasterises outlines already in memory. No files, no C.
+capabilities = []
+
+[dependencies.sfnt]
+path = "../sfnt"
+version = "^1.0.0"
+
+[dependencies.cmap]
+path = "../cmap"
+version = "^1.0.0"
+
+[dependencies.glyf]
+path = "../glyf"
+version = "^1.0.0"

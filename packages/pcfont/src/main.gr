@@ -1,0 +1,357 @@
+// Glyph outlines to an alpha bitmap.
+//
+// The last piece between this language and text on a screen. `sfnt` finds the
+// tables, `cmap` maps a character to a glyph, `glyf` gives the contours --
+// and nothing turned contours into pixels, so a program could read a font and
+// not draw with it. SDL2_ttf would also do it, at the price of another system
+// library and a second font stack; this needs neither.
+//
+// Quadratic Beziers flattened to line segments, then scanline coverage with
+// the nonzero winding rule, which is the rule TrueType specifies. Coverage is
+// sampled on a grid rather than computed exactly: `samples()` per axis, so 4
+// gives 16 coverage levels a pixel, which is what a 4x4 box filter in a
+// hinting-free rasteriser gives.
+//
+// The bitmap is `bytes`, one byte of coverage a pixel
+// ([L-LIB-BYTES-WRITE]). A 64-pixel glyph is 4 KB; as `[i64]` it would be
+// 32 KB, and a page of text holds hundreds of them.
+import glyf
+
+/// An alpha bitmap: `cov` is one byte a pixel, row by row.
+type Raster = {
+    width: i64,
+    height: i64,
+    /// Where the bitmap sits relative to the pen, in pixels, y up.
+    left: i64,
+    top: i64,
+    cov: bytes,
+}
+
+/// A flattened contour: x and y interleaved, in 26.6-ish fixed point scaled
+/// to the output grid.
+type Edge = {
+    x0: f64,
+    y0: f64,
+    x1: f64,
+    y1: f64,
+}
+
+/// Coverage samples per axis. Four gives sixteen levels, which is enough that
+/// a diagonal reads as a diagonal rather than a staircase.
+pub fn samples() -> i64 {
+    4
+}
+
+pub fn empty_raster() -> Raster {
+    Raster{ width: 0, height: 0, left: 0, top: 0, cov: bytes_filled(0, 0) }
+}
+
+/// Split a quadratic Bezier into line segments.
+///
+/// A fixed sixteen segments rather than an error bound: a glyph is drawn at a
+/// known pixel size, the curve spans a few pixels, and sixteen is past the
+/// point where more changes a byte of coverage.
+fn flatten_quad(
+    inout edges: [Edge],
+    x0: f64, y0: f64,
+    cx: f64, cy: f64,
+    x1: f64, y1: f64,
+) {
+    let steps = 16
+    var px = x0
+    var py = y0
+    var i = 1
+    while i <= steps {
+        let t = i.as_f64() / steps.as_f64()
+        let u = 1.0 - t
+        let qx = u * u * x0 + 2.0 * u * t * cx + t * t * x1
+        let qy = u * u * y0 + 2.0 * u * t * cy + t * t * y1
+        edges.push(Edge{ x0: px, y0: py, x1: qx, y1: qy })
+        px = qx
+        py = qy
+        i = i + 1
+    }
+}
+
+/// Every edge of a glyph, in output pixels, with y pointing down.
+///
+/// `glyf.contour_with_implied` has already inserted the on-curve points that
+/// TrueType leaves implied between two control points, so a run here is
+/// either a line or one quadratic.
+fn glyph_edges(g: Glyph, scale: f64, ox: f64, oy: f64) -> [Edge] {
+    var edges: [Edge] = []
+    var c = 0
+    let n = glyf.contour_count(g)
+    while c < n {
+        let pts = glyf.contour_with_implied(g, c)
+        if pts.len() >= 2 {
+            var i = 0
+            while i < pts.len() {
+                let a = pts.get(i).unwrap_or(GlyphPoint{ x: 0, y: 0, on_curve: true })
+                let bi = (i + 1) % pts.len()
+                let b = pts.get(bi).unwrap_or(a)
+                let ax = a.x.as_f64() * scale + ox
+                let ay = oy - a.y.as_f64() * scale
+                if b.on_curve {
+                    let bx = b.x.as_f64() * scale + ox
+                    let by = oy - b.y.as_f64() * scale
+                    edges.push(Edge{ x0: ax, y0: ay, x1: bx, y1: by })
+                    i = i + 1
+                } else {
+                    // `b` is a control point, so the next point ends the curve.
+                    let ci = (i + 2) % pts.len()
+                    let cp = pts.get(ci).unwrap_or(a)
+                    flatten_quad(
+                        edges,
+                        ax, ay,
+                        b.x.as_f64() * scale + ox, oy - b.y.as_f64() * scale,
+                        cp.x.as_f64() * scale + ox, oy - cp.y.as_f64() * scale,
+                    )
+                    i = i + 2
+                }
+            }
+        }
+        c = c + 1
+    }
+    edges
+}
+
+/// The winding number crossings of one horizontal sample line, as x positions
+/// paired with a direction of +1 or -1.
+fn crossings(edges: [Edge], y: f64) -> [(f64, i64)] {
+    var out: [(f64, i64)] = []
+    for e in edges {
+        let top = if e.y0 < e.y1 { e.y0 } else { e.y1 }
+        let bot = if e.y0 < e.y1 { e.y1 } else { e.y0 }
+        // Half-open in y, so a vertex shared by two edges is counted once.
+        if y >= top and y < bot and e.y1 != e.y0 {
+            let t = (y - e.y0) / (e.y1 - e.y0)
+            let x = e.x0 + t * (e.x1 - e.x0)
+            let dir = if e.y1 > e.y0 { 1 } else { -1 }
+            out.push((x, dir))
+        }
+    }
+    out
+}
+
+/// Insertion sort by x. The lists here are a handful of crossings long, which
+/// is where insertion sort is the right answer.
+fn sort_crossings(xs: [(f64, i64)]) -> [(f64, i64)] {
+    var out: [(f64, i64)] = []
+    for c in xs {
+        var at = out.len()
+        var i = 0
+        while i < out.len() {
+            let here = out.get(i).unwrap_or(c)
+            if c.0 < here.0 and at == out.len() {
+                at = i
+            }
+            i = i + 1
+        }
+        out.push(c)
+        var j = out.len() - 1
+        while j > at {
+            let prev = out.get(j - 1).unwrap_or(c)
+            out[j] = prev
+            out[j - 1] = c
+            j = j - 1
+        }
+    }
+    out
+}
+
+/// Accumulate coverage for one sample row into a row of counters.
+///
+/// Nonzero winding: a span is inside where the running sum of directions is
+/// not zero. The even-odd rule gives a ring the wrong interior, which is
+/// exactly what the `ring` glyph in the fixture font is for.
+fn fill_row(edges: [Edge], y: f64, width: i64, sub: i64, inout acc: [i64]) {
+    let xs = sort_crossings(crossings(edges, y))
+    var wind = 0
+    var i = 0
+    while i + 1 <= xs.len() - 1 {
+        let a = xs.get(i).unwrap_or((0.0, 0))
+        wind = wind + a.1
+        if wind != 0 {
+            let b = xs.get(i + 1).unwrap_or(a)
+            // Sample at pixel centres on the sub-grid.
+            var sx = 0
+            while sx < width * sub {
+                let px = (sx.as_f64() + 0.5) / sub.as_f64()
+                if px >= a.0 and px < b.0 {
+                    let col = sx / sub
+                    acc[col] = acc.get(col).unwrap_or(0) + 1
+                }
+                sx = sx + 1
+            }
+        }
+        i = i + 1
+    }
+}
+
+/// Rasterise a glyph at a pixel size.
+///
+/// `upm` is the font's units per em, from `head`. The bitmap is the glyph's
+/// bounding box grown by a pixel on each side, so a curve that reaches just
+/// past its own bounds is not clipped.
+pub fn raster_glyph(g: Glyph, upm: i64, size: i64) -> Raster {
+    // A contour count with no points behind it is a malformed glyph, and a
+    // font full of them should draw nothing rather than a smudge per glyph.
+    if glyf.contour_count(g) <= 0 or glyf.point_count(g) < 3 or upm <= 0 or size <= 0 {
+        return empty_raster()
+    }
+    let scale = size.as_f64() / upm.as_f64()
+    let bb = glyf.bounds(g)
+    let x0 = (bb.0.as_f64() * scale).floor() - 1.0
+    let y1 = (bb.3.as_f64() * scale).floor() + 1.0
+    let w = ((bb.2.as_f64() * scale).floor() + 1.0 - x0).as_i64() + 1
+    let h = (y1 - ((bb.1.as_f64() * scale).floor() - 1.0)).as_i64() + 1
+    if w <= 0 or h <= 0 or w > 4096 or h > 4096 {
+        return empty_raster()
+    }
+    let edges = glyph_edges(g, scale, 0.0 - x0, y1)
+    let sub = samples()
+    var cov = bytes_filled(w * h, 0)
+    var row = 0
+    while row < h {
+        var acc: [i64] = []
+        var k = 0
+        while k < w {
+            acc.push(0)
+            k = k + 1
+        }
+        var s = 0
+        while s < sub {
+            let y = row.as_f64() + (s.as_f64() + 0.5) / sub.as_f64()
+            fill_row(edges, y, w, sub, acc)
+            s = s + 1
+        }
+        var x = 0
+        while x < w {
+            let hits = acc.get(x).unwrap_or(0)
+            let full = sub * sub
+            var v = hits * 255 / full
+            if v > 255 {
+                v = 255
+            }
+            cov.set(row * w + x, v)
+            x = x + 1
+        }
+        row = row + 1
+    }
+    Raster{ width: w, height: h, left: x0.as_i64(), top: y1.as_i64(), cov: cov }
+}
+
+pub fn width_of(r: Raster) -> i64 {
+    r.width
+}
+
+pub fn height_of(r: Raster) -> i64 {
+    r.height
+}
+
+pub fn coverage(r: Raster) -> bytes {
+    r.cov
+}
+
+/// Coverage at a pixel; zero outside.
+pub fn at(r: Raster, x: i64, y: i64) -> i64 {
+    if x < 0 or y < 0 or x >= r.width or y >= r.height {
+        return 0
+    }
+    r.cov.at(y * r.width + x)
+}
+
+/// How many pixels carry any ink. The cheapest thing that distinguishes a
+/// glyph that drew from one that did not.
+pub fn inked(r: Raster) -> i64 {
+    var n = 0
+    var i = 0
+    while i < r.cov.len() {
+        if r.cov.at(i) > 0 {
+            n = n + 1
+        }
+        i = i + 1
+    }
+    n
+}
+
+/// A closed contour from `(x, y)` pairs, all on-curve.
+fn poly(xs: [i64]) -> Glyph {
+    var pts: [GlyphPoint] = []
+    var i = 0
+    while i + 1 < xs.len() {
+        pts.push(GlyphPoint{ x: xs.get(i).unwrap_or(0), y: xs.get(i + 1).unwrap_or(0), on_curve: true })
+        i = i + 2
+    }
+    var xmin = 0
+    var ymin = 0
+    var xmax = 0
+    var ymax = 0
+    for p in pts {
+        if p.x < xmin { xmin = p.x }
+        if p.y < ymin { ymin = p.y }
+        if p.x > xmax { xmax = p.x }
+        if p.y > ymax { ymax = p.y }
+    }
+    Glyph{
+        contour_count: 1,
+        x_min: xmin,
+        y_min: ymin,
+        x_max: xmax,
+        y_max: ymax,
+        contour_ends: [pts.len() - 1],
+        points: pts,
+        components: [],
+    }
+}
+
+test "a glyph with no contours rasterises to nothing" {
+    let r = raster_glyph(poly([]), 1000, 16)
+    assert_eq(width_of(r), 0)
+    assert_eq(inked(r), 0)
+}
+
+test "a square is solid in the middle and bounded at the edges" {
+    // 0..1000 units at 1000 upm and 10 pixels is the whole 10x10 cell.
+    let r = raster_glyph(poly([0, 0, 1000, 0, 1000, 1000, 0, 1000]), 1000, 10)
+    assert(width_of(r) >= 10)
+    assert_eq(at(r, 5, 5), 255)
+    assert(inked(r) >= 100)
+    // Coverage is a byte, everywhere.
+    var i = 0
+    var worst = 0
+    while i < coverage(r).len() {
+        let v = coverage(r).at(i)
+        if v > worst { worst = v }
+        i = i + 1
+    }
+    assert_eq(worst, 255)
+}
+
+test "a bigger size inks more pixels" {
+    let small = raster_glyph(poly([0, 0, 500, 0, 500, 500, 0, 500]), 1000, 8)
+    let big = raster_glyph(poly([0, 0, 500, 0, 500, 500, 0, 500]), 1000, 32)
+    assert(inked(big) > inked(small) * 4)
+}
+
+test "a narrow shape is narrower than a wide one" {
+    let narrow = raster_glyph(poly([0, 0, 100, 0, 100, 700, 0, 700]), 1000, 20)
+    let wide = raster_glyph(poly([0, 0, 700, 0, 700, 700, 0, 700]), 1000, 20)
+    assert(inked(narrow) < inked(wide))
+    assert(width_of(narrow) < width_of(wide))
+}
+
+test "coverage outside the bitmap is zero rather than a panic" {
+    let r = raster_glyph(poly([0, 0, 100, 0, 100, 100, 0, 100]), 1000, 8)
+    for p in [at(r, -1, 0), at(r, 0, -1), at(r, 9999, 0), at(r, 0, 9999)] {
+        assert_eq(p, 0)
+    }
+}
+
+test "a degenerate size or em is refused rather than guessed" {
+    let g = poly([0, 0, 100, 0, 100, 100, 0, 100])
+    for r in [raster_glyph(g, 0, 16), raster_glyph(g, 1000, 0), raster_glyph(g, 1000, 0 - 5)] {
+        assert_eq(width_of(r), 0)
+    }
+}

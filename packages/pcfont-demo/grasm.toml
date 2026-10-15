@@ -1,0 +1,20 @@
+[package]
+name = "pcfont_demo"
+version = "1.0.0"
+capabilities = ["io"]
+
+[dependencies.pcfont]
+path = "../pcfont"
+version = "^1.0.0"
+
+[dependencies.sfnt]
+path = "../sfnt"
+version = "^1.0.0"
+
+[dependencies.cmap]
+path = "../cmap"
+version = "^1.0.0"
+
+[dependencies.glyf]
+path = "../glyf"
+version = "^1.0.0"

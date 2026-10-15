@@ -1,0 +1,44 @@
+// Rasterise a character from a font and print the coverage as text, so the
+// shape can be checked by reading it.
+import pcfont
+import sfnt
+import cmap
+import glyf
+
+fn table(data: bytes, font: SfntFont, tag: str) -> bytes ! SfntError {
+    let t = try sfnt.table_named(font, tag)
+    return data.slice(t.offset, t.offset + t.length)
+}
+
+fn main() -> () ! (SfntError | CmapError | GlyfError) / {io} {
+    let a = args()
+    let path = a.get(0) ?? ""
+    let ch = (a.get(1) ?? "A").chars().get(0) ?? "A"
+    let size = (a.get(2) ?? "16").parse_int() ?? 16
+    let data = read_bytes(path) ?? bytes_of([])
+    let font = try sfnt.parse(data)
+    let head = try table(data, font, "head")
+    let upm = head.at(18) * 256 + head.at(19)
+    let long_loca = head.at(51) == 1
+    let gid = try cmap.glyph_of(try table(data, font, "cmap"), ch.codes().get(0) ?? 65)
+    let g = try glyf.parse_glyph(
+        try table(data, font, "glyf"),
+        try table(data, font, "loca"),
+        long_loca,
+        gid,
+    )
+    let r = pcfont.raster_glyph(g, upm, size)
+    print("upm {upm} gid {gid} size {pcfont.width_of(r)}x{pcfont.height_of(r)} inked {pcfont.inked(r)}")
+    var y = 0
+    while y < pcfont.height_of(r) {
+        var line = ""
+        var x = 0
+        while x < pcfont.width_of(r) {
+            let v = pcfont.at(r, x, y)
+            line = line + if v > 200 { "#" } else if v > 100 { "+" } else if v > 20 { "." } else { " " }
+            x = x + 1
+        }
+        print("|{line}|")
+        y = y + 1
+    }
+}
