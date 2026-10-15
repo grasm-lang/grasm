@@ -1540,10 +1540,20 @@ rendered when the site is written rather than summarised here.</p>
 <h2>2. Speed</h2>
 <p>«geomean»× of native Rust against a 0.95× target, computed by
 <code>scripts/bench.sh</code> from the numbers it prints, so the goal is met and
-the suite still has a worst row at «tree_ratio»×: <code>tree</code>, which pays a box
-per node in tree-shaped data. Storing those nodes inline was built and measured
-at <em>1.33× slower</em> — a node's release turns into a runtime call — so the
-release has to get cheaper before the representation can change. Binary size is
+the suite still has a worst row at «tree_ratio»×: <code>tree</code>. On
+2026-10-15 that row was measured apart rather than reasoned about, and the
+answer moved. The deficit is the <em>walk</em>, not the building: a traversal
+over a tree built outside the timed loop reads the same ratio. Allocation is
+not it — interposing <code>malloc</code> counts 206,721 calls and 13.2 MB
+against Rust's 196,852 and 18.9 MB, so Grasm allocates no more often and fewer
+bytes. The box per node is not it either: the same traversal written in C with
+the words inline, with a box between them, and with a header before them all
+measure within 0.01 ns of each other. What is left is 3.68 ns a node against
+C's 1.63 for identical work, and it is in the emitted code — an accumulator
+loop comes out seven instructions of which four are avoidable. The earlier
+reading on this page, that storing nodes inline measured <em>1.33× slower</em>,
+described the <em>build</em> path, which the profile puts at 28 samples of
+4,131. Binary size is
 no longer on this list: «hello_kb» KB against a 300 KB target. What is left, in
 order: the release path, the atomic reference count every boxed value carries
 because a <code>parallel</code> body may hold one, and borrowed string views,
