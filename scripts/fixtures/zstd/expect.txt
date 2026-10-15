@@ -1,14 +1,28 @@
 # Which fixtures this decoder handles today.
 #
-# `ok` must decompress to the matching .bin exactly. `refused` must fail: a
+# `ok` must decompress to the matching .bin exactly; the name before the first
+# dot is the source file, so `text.9` checks `text.bin`. `refused` must fail: a
 # decompressor that guesses is worse than one that stops, because a wrong
 # answer from a decompressor is indistinguishable from a right one until
 # something downstream fails.
 #
-# Moving a line from `refused` to `ok` is how progress on compressed blocks
-# shows up here.
-random   ok        raw block
-tiny     ok        raw block
-empty    ok        raw block, zero length
-zeros    refused   compressed block
-text     refused   compressed block
+# Moving a line from `refused` to `ok` is how progress shows up here. What is
+# still refused needs the two entropy coders a block may carry in-stream
+# rather than by reference: an FSE *table description* for the sequence
+# symbols, and Huffman-coded literals.
+empty      ok        raw block, zero length
+empty.9    ok        raw block, zero length
+onebyte    ok        raw block, one byte
+onebyte.9  ok        raw block, one byte
+tiny       ok        raw block
+tiny.9     ok        raw block
+random     ok        raw block, incompressible
+random.9   ok        raw block, incompressible
+halfrand   ok        raw and compressed blocks in one frame
+halfrand.9 ok        raw and compressed blocks in one frame
+zeros      ok        compressed: one match of 3998 at offset 1
+zeros.9    ok        compressed: one match of 3998 at offset 1
+text       ok        compressed: raw literals, two sequences, a repeat offset
+text.9     ok        compressed: raw literals, two sequences, a repeat offset
+runs       refused   needs an FSE-described sequence table
+runs.9     refused   needs an FSE-described sequence table

@@ -11,50 +11,30 @@
 //
 // ## What is here
 //
-// The frame, and raw and RLE blocks. A compressed block is refused by name
-// rather than decoded wrongly, which is the one thing a decompressor must
-// never do -- a wrong answer from a decompressor is indistinguishable from a
-// right one until something downstream fails.
+// The frame, raw and RLE blocks, and compressed blocks whose sequence tables
+// are the predefined ones and whose literals are stored directly -- which is
+// Finite State Entropy over the lengths and offsets, the repeat-offset rules,
+// and sequence execution including a match that overlaps itself.
 //
-// ## What an attempt at FSE learned, and where it stopped
+// Two things are refused by name: an FSE *table description* carried in the
+// stream rather than referenced, and Huffman-coded literals. Those are the
+// entropy coders a block may bring with it instead of inheriting, and
+// `expect.txt` lists the fixtures that need them so the refusal stays a
+// checked fact rather than a gap. A compressed block is never decoded
+// wrongly, which is the one thing a decompressor must not do -- a wrong
+// answer from a decompressor is indistinguishable from a right one until
+// something downstream fails.
 //
-// An FSE decoder was written and then removed, because it produced 15,985
-// bytes where the frame declares 4,000. Writing down where it broke is worth
-// more than that code was: the arithmetic is unambiguous, and the next
-// attempt should not have to redo it.
+// ## The miscount that cost the most
 //
-// `scripts/fixtures/zstd/zeros.zst` holds one block of nine bytes:
-//
-//     10 00 00 01 00 9b f7 01 16
-//     ~~ raw literals, size format 0, regenerated size 2
-//           ~~ ~~ the two literal bytes
-//                 ~~ nbSeq = 1
-//                    ~~ all three tables predefined
-//                       ~~~~~~~~~~~ the bitstream, four bytes
-//
-// The last byte is 0x16, whose highest set bit is bit 4, so three padding
-// bits and a marker leave **28 data bits**. One sequence over two literals
-// has to produce 4,000 bytes, so it is literals length 2 and match length
-// 3,998 at offset 1 -- and those decompose exactly:
-//
-//     6 + 5 + 6 = 17 bits of initial state (LL, OF, ML)
-//     match length 3,998 is code 47: base 2,051 and 11 extra bits
-//     literals length 2 is code 2 and offset 1 is code 0, neither with extra
-//     17 + 11 = 28
-//
-// So the stream is being read correctly. The three states come out 24, 0 and
-// 62; 24 and 0 give literals code 2 and offset code 0, which the budget
-// confirms. **The match-length state does not.** Slot 62 has to yield code
-// 47, and building the predefined distribution the way the reference
-// describes -- the five `-1` symbols laid at the top of the table, then the
-// rest spread by `(size >> 1) + (size >> 3) + 3` -- puts code **49** there,
-// whose base of 8,195 is already past the whole frame.
-//
-// Every bit-order model and every ordering of the state and extra-bit reads
-// was tried against those three constraints and none fits, so the error is in
-// a table rather than in the stream reading. Either the match-length
-// distribution written here is wrong, or the table is not indexed by the
-// state the way that attempt assumed.
+// `ml_default` had five low-probability symbols where the specification gives
+// seven. Those symbols are laid at the *top* of the table, so their number
+// decides which symbol every high state maps to: with five, state 62 gives
+// match-length code 49, whose baseline of 8,195 is past the whole test frame.
+// Nothing else was wrong -- not the bit order, not the state order, not the
+// extra-bit order -- so every symptom pointed at the stream reading rather
+// than at one array. An earlier attempt was deleted rather than shipped while
+// that was still true.
 //
 // ## The checksum is parsed and not verified
 //
@@ -261,7 +241,18 @@ pub fn decode_frame(data: bytes, from: i64) -> (bytes, i64) ! ZstdError {
             total = total + size
             at = at + 1
         } else {
-            fail(CompressedBlock)
+            // A match may reach back into earlier blocks, so the output so
+            // far is the history this block copies from.
+            var so_far = bytes_filled(total, 0)
+            var o = 0
+            for part in out {
+                so_far.copy_from(o, part)
+                o = o + part.len()
+            }
+            let got = try compressed_block(data, at, size, so_far)
+            out.push(got)
+            total = total + got.len()
+            at = at + size
         }
     }
     if h.has_checksum {
@@ -378,5 +369,569 @@ test "an RLE block expands to one byte repeated" {
         Ok(out) -> assert_eq(out.to_list(), [65, 65, 65, 65, 65, 65])
         // an RLE block did not expand
         Err(_e) -> assert(false)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Finite State Entropy, and the sequences a compressed block is made of.
+// ---------------------------------------------------------------------------
+
+/// The predefined literal-length distribution, accuracy log 6.
+///
+/// A count of -1 means "less than one": the symbol is possible but rare, and
+/// gets a single slot at the top of the table rather than a share of it.
+pub fn ll_default() -> [i64] {
+    [
+        4, 3, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1,
+        2, 2, 2, 2, 2, 2, 2, 2, 2, 3, 2, 1, 1, 1, 1, 1,
+        0 - 1, 0 - 1, 0 - 1, 0 - 1,
+    ]
+}
+
+/// The predefined match-length distribution, accuracy log 6.
+///
+/// The ones stop at symbol 45 and **seven** symbols carry -1, not five. That
+/// one miscount is what an earlier attempt at this decoder got wrong, and it
+/// is worth saying why it was so hard to see: the low-probability symbols are
+/// laid at the *top* of the table, so their number decides which symbol every
+/// high state maps to. With five, state 62 gives match-length code 49, whose
+/// baseline of 8,195 is past the whole test frame; with seven it gives code
+/// 47, which is right. Nothing else about the decode was wrong -- not the
+/// bit order, not the state order, not the extra-bit order -- so every
+/// symptom pointed at the stream rather than at this array.
+pub fn ml_default() -> [i64] {
+    [
+        1, 4, 3, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1,
+        1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+        1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+        0 - 1, 0 - 1, 0 - 1, 0 - 1, 0 - 1, 0 - 1, 0 - 1,
+    ]
+}
+
+/// The predefined offset distribution, accuracy log 5.
+pub fn of_default() -> [i64] {
+    [
+        1, 1, 1, 1, 1, 1, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1,
+        1, 1, 1, 1, 1, 1, 1, 1, 0 - 1, 0 - 1, 0 - 1, 0 - 1, 0 - 1,
+    ]
+}
+
+/// Baseline and extra-bit count for each literal-length code.
+pub fn ll_bits() -> [i64] {
+    [
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        1, 1, 1, 1, 2, 2, 3, 3, 4, 6, 7, 8, 9, 10, 11, 12,
+        13, 14, 15, 16,
+    ]
+}
+
+pub fn ll_base() -> [i64] {
+    [
+        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+        16, 18, 20, 22, 24, 28, 32, 40, 48, 64, 128, 256, 512, 1024, 2048, 4096,
+        8192, 16384, 32768, 65536,
+    ]
+}
+
+pub fn ml_bits() -> [i64] {
+    [
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        1, 1, 1, 1, 2, 2, 3, 3, 4, 4, 5, 7, 8, 9, 10, 11,
+        12, 13, 14, 15, 16,
+    ]
+}
+
+pub fn ml_base() -> [i64] {
+    [
+        3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18,
+        19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34,
+        35, 37, 39, 41, 43, 47, 51, 59, 67, 83, 99, 131, 259, 515, 1027, 2051,
+        4099, 8195, 16387, 32771, 65539,
+    ]
+}
+
+/// One entry of a decoding table: which symbol, how many bits to read next,
+/// and the state those bits are added to.
+type FseEntry = {
+    symbol: i64,
+    nbits: i64,
+    newstate: i64,
+}
+
+/// Build a decoding table from a normalised distribution.
+///
+/// The spreading step is the part worth reading twice. Symbols are not laid
+/// out in order: the position advances by `(size >> 1) + (size >> 3) + 3`
+/// modulo the table size, skipping the slots already taken by the -1 symbols
+/// at the top. That ordering is part of the format -- a table built by
+/// filling left to right decodes every stream wrongly.
+pub fn fse_build(counts: [i64], log: i64) -> [FseEntry] {
+    let size = 1.shl(log)
+    var symbols: [i64] = []
+    var i = 0
+    while i < size {
+        symbols.push(0)
+        i = i + 1
+    }
+    var high = size - 1
+    var next: [i64] = []
+    var s = 0
+    while s < counts.len() {
+        let c = counts.get(s).unwrap_or(0)
+        if c == 0 - 1 {
+            symbols[high] = s
+            high = high - 1
+            next.push(1)
+        } else {
+            next.push(c)
+        }
+        s = s + 1
+    }
+    let step = size.shr(1) + size.shr(3) + 3
+    let mask = size - 1
+    var pos = 0
+    s = 0
+    while s < counts.len() {
+        let c = counts.get(s).unwrap_or(0)
+        if c > 0 {
+            var k = 0
+            while k < c {
+                symbols[pos] = s
+                pos = (pos + step).bit_and(mask)
+                while pos > high {
+                    pos = (pos + step).bit_and(mask)
+                }
+                k = k + 1
+            }
+        }
+        s = s + 1
+    }
+    var table: [FseEntry] = []
+    var u = 0
+    while u < size {
+        let sym = symbols.get(u).unwrap_or(0)
+        let n = next.get(sym).unwrap_or(1)
+        next[sym] = n + 1
+        var hb = 0
+        var v = n
+        while v > 1 {
+            v = v.shr(1)
+            hb = hb + 1
+        }
+        let nb = log - hb
+        table.push(FseEntry{ symbol: sym, nbits: nb, newstate: n.shl(nb) - size })
+        u = u + 1
+    }
+    table
+}
+
+/// Where the data bits start in a backward bitstream.
+///
+/// The last byte carries an end marker: its highest set bit. Bits above that
+/// are padding, and the data runs downward from just below it, byte by byte
+/// towards the front of the stream. A stream whose last byte is zero has no
+/// marker and is malformed.
+pub fn bits_start(last: i64) -> i64 {
+    var h = 7
+    while h > 0 and last.shr(h).bit_and(1) == 0 {
+        h = h - 1
+    }
+    8 - h
+}
+
+/// Read `n` bits from a backward bitstream.
+///
+/// `pos` counts bits from the most significant bit of the *last* byte, so
+/// advancing it walks towards the front of the stream. Within a byte the bits
+/// come most significant first, which is how they were written.
+fn read_back(data: bytes, start: i64, end: i64, inout pos: i64, n: i64) -> i64 {
+    var v = 0
+    var k = 0
+    while k < n {
+        let i = pos + k
+        let at = end - 1 - i / 8
+        var b = 0
+        if at >= start {
+            b = data.at(at).shr(7 - i % 8).bit_and(1)
+        }
+        v = v.shl(1).bit_or(b)
+        k = k + 1
+    }
+    pos = pos + n
+    v
+}
+
+/// One decoded sequence: literals to copy, then a match to copy from behind.
+type Sequence = {
+    literal_length: i64,
+    match_length: i64,
+    offset: i64,
+}
+
+/// Resolve an offset code against the three repeat offsets.
+///
+/// Codes 1, 2 and 3 do not mean offsets 1, 2 and 3 -- they name the last
+/// three offsets used, and the meaning shifts by one when the sequence has no
+/// literals. Getting this wrong decodes the first sequences correctly and
+/// then drifts, which is the hardest kind of bug to read.
+fn resolve_offset(value: i64, literal_length: i64, inout rep: [i64]) -> i64 {
+    if value > 3 {
+        let actual = value - 3
+        rep[2] = rep.get(1).unwrap_or(4)
+        rep[1] = rep.get(0).unwrap_or(1)
+        rep[0] = actual
+        return actual
+    }
+    var idx = value
+    if literal_length == 0 {
+        idx = idx + 1
+    }
+    if idx == 1 {
+        return rep.get(0).unwrap_or(1)
+    }
+    if idx == 2 {
+        let actual = rep.get(1).unwrap_or(4)
+        rep[1] = rep.get(0).unwrap_or(1)
+        rep[0] = actual
+        return actual
+    }
+    if idx == 3 {
+        let actual = rep.get(2).unwrap_or(8)
+        rep[2] = rep.get(1).unwrap_or(4)
+        rep[1] = rep.get(0).unwrap_or(1)
+        rep[0] = actual
+        return actual
+    }
+    // idx 4: one less than the most recent offset, which is only reachable
+    // from code 3 with no literals.
+    let actual = rep.get(0).unwrap_or(1) - 1
+    rep[2] = rep.get(1).unwrap_or(4)
+    rep[1] = rep.get(0).unwrap_or(1)
+    rep[0] = actual
+    actual
+}
+
+/// A literals section: the bytes themselves, and where the section ended.
+type Literals = {
+    data: bytes,
+    /// Offset just past the section.
+    next: i64,
+}
+
+/// Read a literals section.
+///
+/// Four types; the two that store bytes directly are here. Huffman-coded
+/// literals are refused by name -- the two fixtures in the gate use raw
+/// literals, and a Huffman decoder that was never run against a real stream
+/// is not worth claiming.
+pub fn literals(data: bytes, at: i64, block_end: i64) -> Literals ! ZstdError {
+    if at >= block_end {
+        fail(Truncated(at))
+    }
+    let b0 = data.at(at)
+    let kind = b0.bit_and(3)
+    let sf = b0.shr(2).bit_and(3)
+    if kind == 2 or kind == 3 {
+        fail(Unsupported("huffman-coded literals", kind))
+    }
+    // For raw and RLE the size format is 1, 2 or 3 bytes of regenerated size.
+    var size = 0
+    var head = 0
+    if sf == 0 or sf == 2 {
+        size = b0.shr(3)
+        head = 1
+    } else if sf == 1 {
+        if at + 1 >= block_end {
+            fail(Truncated(at))
+        }
+        size = b0.shr(4).bit_or(data.at(at + 1).shl(4))
+        head = 2
+    } else {
+        if at + 2 >= block_end {
+            fail(Truncated(at))
+        }
+        size = b0.shr(4).bit_or(data.at(at + 1).shl(4)).bit_or(data.at(at + 2).shl(12))
+        head = 3
+    }
+    if kind == 0 {
+        if at + head + size > block_end {
+            fail(Truncated(at + head))
+        }
+        return Literals{ data: data.slice(at + head, at + head + size), next: at + head + size }
+    }
+    if at + head >= block_end {
+        fail(Truncated(at + head))
+    }
+    return Literals{ data: bytes_filled(size, data.at(at + head)), next: at + head + 1 }
+}
+
+/// How many sequences a sequences section declares, and where its header ends.
+pub fn sequence_count(data: bytes, at: i64) -> (i64, i64) ! ZstdError {
+    if at >= data.len() {
+        fail(Truncated(at))
+    }
+    let b0 = data.at(at)
+    if b0 < 128 {
+        return (b0, at + 1)
+    }
+    if b0 < 255 {
+        if at + 1 >= data.len() {
+            fail(Truncated(at))
+        }
+        return ((b0 - 128).shl(8) + data.at(at + 1), at + 2)
+    }
+    if at + 2 >= data.len() {
+        fail(Truncated(at))
+    }
+    return (data.at(at + 1) + data.at(at + 2).shl(8) + 32512, at + 3)
+}
+
+/// Decode every sequence of a compressed block.
+fn sequences(
+    data: bytes,
+    at: i64,
+    block_end: i64,
+    count: i64,
+) -> [Sequence] ! ZstdError {
+    if at >= block_end {
+        fail(Truncated(at))
+    }
+    let modes = data.at(at)
+    let ll_mode = modes.shr(6)
+    let of_mode = modes.shr(4).bit_and(3)
+    let ml_mode = modes.shr(2).bit_and(3)
+    if modes.bit_and(3) != 0 {
+        fail(Reserved("the sequence header's reserved bits"))
+    }
+    // Only the predefined tables are built here. The other three modes carry
+    // a table in the stream, which wants the FSE *table* decoder as well as
+    // the FSE stream decoder.
+    for m in [ll_mode, of_mode, ml_mode] {
+        if m != 0 {
+            fail(Unsupported("a sequence table that is not predefined", m))
+        }
+    }
+    let ll_t = fse_build(ll_default(), 6)
+    let of_t = fse_build(of_default(), 5)
+    let ml_t = fse_build(ml_default(), 6)
+    let start = at + 1
+    if start >= block_end {
+        fail(Truncated(start))
+    }
+    var pos = bits_start(data.at(block_end - 1))
+    var ll_s = read_back(data, start, block_end, pos, 6)
+    var of_s = read_back(data, start, block_end, pos, 5)
+    var ml_s = read_back(data, start, block_end, pos, 6)
+    var out: [Sequence] = []
+    var rep: [i64] = [1, 4, 8]
+    var n = 0
+    while n < count {
+        let of_e = of_t.get(of_s).unwrap_or(FseEntry{ symbol: 0, nbits: 0, newstate: 0 })
+        let ml_e = ml_t.get(ml_s).unwrap_or(FseEntry{ symbol: 0, nbits: 0, newstate: 0 })
+        let ll_e = ll_t.get(ll_s).unwrap_or(FseEntry{ symbol: 0, nbits: 0, newstate: 0 })
+        // The extra bits come offset first, then match length, then literals.
+        let off_raw = 1.shl(of_e.symbol) + read_back(data, start, block_end, pos, of_e.symbol)
+        let ml = ml_base().get(ml_e.symbol).unwrap_or(3) +
+        read_back(data, start, block_end, pos, ml_bits().get(ml_e.symbol).unwrap_or(0))
+        let ll = ll_base().get(ll_e.symbol).unwrap_or(0) +
+        read_back(data, start, block_end, pos, ll_bits().get(ll_e.symbol).unwrap_or(0))
+        let off = resolve_offset(off_raw, ll, rep)
+        out.push(Sequence{ literal_length: ll, match_length: ml, offset: off })
+        n = n + 1
+        if n < count {
+            // And the state updates come literals, match, offset.
+            ll_s = ll_e.newstate + read_back(data, start, block_end, pos, ll_e.nbits)
+            ml_s = ml_e.newstate + read_back(data, start, block_end, pos, ml_e.nbits)
+            of_s = of_e.newstate + read_back(data, start, block_end, pos, of_e.nbits)
+        }
+    }
+    out
+}
+
+/// Run the sequences: literals, then a match copied from behind the cursor.
+///
+/// The match copy must be byte at a time when the offset is shorter than the
+/// length, because then it overlaps itself -- that is how run-length coding
+/// falls out of a match, and a block copy would read bytes that have not been
+/// written yet.
+pub fn execute(lit: bytes, seqs: [Sequence], history: bytes) -> bytes ! ZstdError {
+    var out: [i64] = []
+    for b in history.to_list() {
+        out.push(b)
+    }
+    let base = out.len()
+    var lit_at = 0
+    for s in seqs {
+        var k = 0
+        while k < s.literal_length {
+            if lit_at >= lit.len() {
+                fail(Truncated(lit_at))
+            }
+            out.push(lit.at(lit_at))
+            lit_at = lit_at + 1
+            k = k + 1
+        }
+        if s.offset <= 0 or s.offset > out.len() {
+            fail(Unsupported("an offset reaching before the start", s.offset))
+        }
+        var from = out.len() - s.offset
+        var m = 0
+        while m < s.match_length {
+            out.push(out.get(from).unwrap_or(0))
+            from = from + 1
+            m = m + 1
+        }
+    }
+    // Whatever literals are left follow the last match.
+    while lit_at < lit.len() {
+        out.push(lit.at(lit_at))
+        lit_at = lit_at + 1
+    }
+    var res = bytes_filled(out.len() - base, 0)
+    var i = base
+    while i < out.len() {
+        res.set(i - base, out.get(i).unwrap_or(0))
+        i = i + 1
+    }
+    res
+}
+
+/// Decode one compressed block, given the history before it.
+pub fn compressed_block(
+    data: bytes,
+    at: i64,
+    size: i64,
+    history: bytes,
+) -> bytes ! ZstdError {
+    let block_end = at + size
+    if block_end > data.len() {
+        fail(Truncated(at))
+    }
+    let lit = try literals(data, at, block_end)
+    if lit.next >= block_end {
+        // A block with literals and no sequences is just the literals.
+        return lit.data
+    }
+    let got = try sequence_count(data, lit.next)
+    if got.0 == 0 {
+        return lit.data
+    }
+    let seqs = try sequences(data, got.1, block_end, got.0)
+    return try execute(lit.data, seqs, history)
+}
+
+test "every predefined distribution fills its table exactly" {
+    // A distribution that does not sum to the table size is not a
+    // distribution, and this is the check that would have caught the
+    // match-length miscount on the day it was written.
+    for pair in [[0, 64], [1, 64], [2, 32]] {
+        let which = pair.get(0).unwrap_or(0)
+        let want = pair.get(1).unwrap_or(0)
+        let counts = if which == 0 {
+            ll_default()
+        } else if which == 1 {
+            ml_default()
+        } else {
+            of_default()
+        }
+        var total = 0
+        for c in counts {
+            if c > 0 {
+                total = total + c
+            } else {
+                total = total + 1
+            }
+        }
+        assert_eq(total, want)
+    }
+}
+
+test "the distributions have the symbol counts the format fixes" {
+    assert_eq(ll_default().len(), 36)
+    assert_eq(ml_default().len(), 53)
+    assert_eq(of_default().len(), 29)
+}
+
+test "low-probability symbols sit at the top of the table" {
+    // Seven of them in the match-length table, so the top seven slots are
+    // the last seven symbols, in order. Five instead of seven moves every
+    // one of these and decodes long matches as absurd ones.
+    let t = fse_build(ml_default(), 6)
+    for pair in [[63, 46], [62, 47], [61, 48], [60, 49], [59, 50], [58, 51], [57, 52]] {
+        let slot = pair.get(0).unwrap_or(0)
+        let want = pair.get(1).unwrap_or(0)
+        assert_eq(t.get(slot).unwrap_or(FseEntry{ symbol: 0 - 1, nbits: 0, newstate: 0 }).symbol, want)
+    }
+}
+
+test "a built table is the size its accuracy log names" {
+    assert_eq(fse_build(ll_default(), 6).len(), 64)
+    assert_eq(fse_build(ml_default(), 6).len(), 64)
+    assert_eq(fse_build(of_default(), 5).len(), 32)
+}
+
+test "the bitstream starts after the marker in the last byte" {
+    // 0x16 has its highest bit at position 4, so three padding bits and the
+    // marker leave the data starting four bits in.
+    assert_eq(bits_start(22), 4)
+    // A lone 1 bit in the low position means the whole byte is overhead.
+    assert_eq(bits_start(1), 8)
+    // A marker in the top bit means one bit of overhead.
+    assert_eq(bits_start(128), 1)
+}
+
+test "a repeat offset code names a previous offset, not a distance" {
+    var rep: [i64] = [7, 11, 13]
+    // Code 4 and above is a literal distance, three less than the code.
+    assert_eq(resolve_offset(10, 5, rep), 7)
+    assert_eq(rep.get(0).unwrap_or(0), 7)
+    // Code 1 is the most recent offset and does not reorder it.
+    var r2: [i64] = [7, 11, 13]
+    assert_eq(resolve_offset(1, 5, r2), 7)
+    assert_eq(r2, [7, 11, 13])
+    // Code 2 promotes the second to the front.
+    var r3: [i64] = [7, 11, 13]
+    assert_eq(resolve_offset(2, 5, r3), 11)
+    assert_eq(r3.get(0).unwrap_or(0), 11)
+    assert_eq(r3.get(1).unwrap_or(0), 7)
+}
+
+test "a sequence with no literals shifts what a repeat code means" {
+    // This is the rule that decodes the first sequences correctly and then
+    // drifts if it is missing: with no literals, code 1 means the *second*
+    // most recent offset rather than the most recent.
+    var rep: [i64] = [7, 11, 13]
+    assert_eq(resolve_offset(1, 0, rep), 11)
+    var r2: [i64] = [7, 11, 13]
+    assert_eq(resolve_offset(1, 1, r2), 7)
+}
+
+test "a match that overlaps itself repeats rather than reading ahead" {
+    // Offset 1 with a length of 5 is run-length coding, and a block copy
+    // would read bytes that have not been written yet.
+    let seqs = [Sequence{ literal_length: 1, match_length: 5, offset: 1 }]
+    match execute(bytes_of([65]), seqs, bytes_of([])) {
+        Ok(out) -> assert_eq(out.to_list(), [65, 65, 65, 65, 65, 65])
+        // an overlapping match did not repeat
+        Err(_e) -> assert(false)
+    }
+}
+
+test "a match reaches back into an earlier block" {
+    let seqs = [Sequence{ literal_length: 0, match_length: 4, offset: 3 }]
+    match execute(bytes_of([]), seqs, bytes_of([1, 2, 3])) {
+        Ok(out) -> assert_eq(out.to_list(), [1, 2, 3, 1])
+        // history was not reachable
+        Err(_e) -> assert(false)
+    }
+}
+
+test "an offset reaching before the start is refused" {
+    let seqs = [Sequence{ literal_length: 1, match_length: 2, offset: 99 }]
+    match execute(bytes_of([65]), seqs, bytes_of([])) {
+        Err(_e) -> assert(true)
+        // an offset past the beginning was accepted
+        Ok(_o) -> assert(false)
     }
 }

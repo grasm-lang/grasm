@@ -7,6 +7,9 @@
 # flag that changes how wide that field is, and the trailing checksum that
 # has to be stepped over.
 #
+# Two compression levels for every input, because the level changes the block
+# and entropy choices rather than only the ratio.
+#
 # `scripts/fixtures/zstd/expect.txt` says which fixtures must decode and which
 # must be refused. The refusals are checked too: a decompressor that guesses
 # is worse than one that stops, because a wrong answer from a decompressor is
@@ -31,6 +34,8 @@ refused=0
 while read -r name status _rest; do
     case "$name" in ''|\#*) continue ;; esac
     zst="$FIX/$name.zst"
+    # The name before the first dot is the source: `text.9` checks `text.bin`.
+    src="$FIX/${name%%.*}.bin"
     [ -f "$zst" ] || { echo "    $zst is missing; run $FIX/make.sh"; exit 1; }
     if [ "$status" = "refused" ]; then
         if "$work/dec" "$zst" "$work/out" >/dev/null 2>&1; then
@@ -45,9 +50,9 @@ while read -r name status _rest; do
         echo "    $name did not decode: $(cat "$work/said")"
         exit 1
     fi
-    if ! cmp -s "$FIX/$name.bin" "$work/out"; then
+    if ! cmp -s "$src" "$work/out"; then
         echo "    $name does not round-trip:"
-        echo "      $(wc -c <"$FIX/$name.bin") bytes in, $(wc -c <"$work/out") out"
+        echo "      $(wc -c <"$src") bytes in, $(wc -c <"$work/out") out"
         exit 1
     fi
     ok=$((ok + 1))
@@ -55,4 +60,4 @@ done < "$FIX/expect.txt"
 
 echo "    frames: $ok exact   $refused refused as declared"
 # A manifest that shrank is a gate that stopped checking (F76).
-[ "$((ok + refused))" -ge 5 ]
+[ "$ok" -ge 14 ] && [ "$refused" -ge 2 ]
