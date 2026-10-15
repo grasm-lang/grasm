@@ -532,34 +532,6 @@ variable names keeps compiling.
 - **Exhaustive matching** — sums, bools, Ok/Err, and bool-tuple products are
   coverage-checked with precise missing-case messages.
 
-## A window on the screen
-
-`packages/sdl` binds SDL2 — window, renderer, streaming texture, event poll —
-with no new builtin. A frame is generated into a mutable `bytes` buffer at one
-byte a channel and crosses to the texture as a raw pointer; events come back
-through another one. `packages/sdl-demo` is the whole path:
-
-```
-brew install sdl2                     # a system library, not vendored
-LIBRARY_PATH=$(brew --prefix)/lib \
-  grasm build packages/sdl-demo/src/main.gr --native --link SDL2 -o /tmp/demo
-/tmp/demo                             # a window; Esc or close to quit
-SDL_VIDEODRIVER=dummy /tmp/demo 600   # the same path with no display
-```
-
-`scripts/sdltest.sh` is the gate, and it really creates the window and pushes
-the frames — the dummy video driver needs no display, so this is not a compile
-check. It measures **0.4 ms a frame** for generate-upload-clear-copy-present at
-256×256 RGBA, against the 16.67 ms a 60 fps budget allows.
-
-SDL2 is the first binding because every call it needs takes handles and
-integers. [T-EXTERN-POINTER] allows an `extern fn` parameter to be `i64`,
-`f64`, `str` or `bytes`, and a return to be `i64`, `f64` or nothing, so a
-library that passes a structure by value — raylib's `Color` — cannot cross at
-all, and one that wants a callback cannot either, because C cannot call into
-Grasm. SDL2 asks for neither, and it already polls, so the loop belonging to
-the program costs nothing.
-
 ## Packages and capabilities
 
 A package carries a `grasm.toml` manifest declaring its version, path
