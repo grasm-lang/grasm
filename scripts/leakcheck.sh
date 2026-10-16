@@ -130,7 +130,7 @@ for src in $programs; do
     if [ $code -eq 124 ]; then
         timedout=$((timedout + 1))
         TIMEDOUT+=("$src")
-        echo "TIMED OUT: $src after ${GRASM_RUN_LIMIT:-120}s"
+        echo "TIMED OUT: $src after ${RUN_LIMIT_SECONDS}s"
     elif [ $code -eq 7 ]; then
         leaked=$((leaked + 1))
         LEAKS+=("$src — $(grep -o 'leak: .*' <<<"$err" | head -1)")

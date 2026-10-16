@@ -91,7 +91,7 @@ for src in $(corpus_programs); do
     if [ "$code" -eq 124 ]; then
         timedout=$((timedout + 1))
         TIMEDOUT+=("$src")
-        echo "TIMED OUT: $src after ${GRASM_RUN_LIMIT:-120}s"
+        echo "TIMED OUT: $src after ${RUN_LIMIT_SECONDS}s"
         continue
     fi
     # `grep -c … >/dev/null` rather than `grep -q`: under `pipefail` a `-q`

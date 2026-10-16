@@ -106,7 +106,7 @@ for src in $programs; do
     if [ "$interp_code" = 124 ] || [ "$native_code" = 124 ]; then
         timedout=$((timedout + 1))
         TIMEDOUT+=("$src — interpreter $interp_code, native $native_code")
-        echo "TIMED OUT: $src after ${GRASM_RUN_LIMIT:-120}s"
+        echo "TIMED OUT: $src after ${RUN_LIMIT_SECONDS}s"
         continue
     fi
 

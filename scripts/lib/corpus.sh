@@ -84,10 +84,33 @@ corpus_external_covered() {
 #
 # `timeout` is not on a stock macOS, so this is empty when it is absent
 # rather than a new requirement. Unquoted on purpose: empty must expand to
-# no argument at all. A timed-out program exits 124 with partial output,
-# which the gates already report as a mismatch -- loudly, which is the point.
+# no argument at all.
+#
+# The limit is deliberately far above anything legitimate, because it exists
+# to turn "forever" into "a failure" and not to police speed. A performance
+# budget belongs in a bench gate, where a number means something; here a
+# tight limit only produces false failures on work that is slow on purpose.
+#
+# 120s was the first guess and it failed three real programs, each of them
+# under the interpreter while the native build finished. Measured rather
+# than guessed the second time, on a machine at a load average near 20:
+#
+#     packages/crypto_hash-demo     134s
+#     examples/parallel_map.gr      144s
+#     packages/password-demo        163s
+#
+# A password KDF is expensive by design -- being slow is the feature -- and
+# it is slower again interpreted. 1800s is eleven times the slowest of them
+# and still bounds a hang, which is the whole difference from the hour of
+# silence this replaced. Raise it before trimming it: a false failure here
+# costs a two-hour rerun, and the only thing a tight limit buys is finding a
+# hang sooner than nobody needs it found.
+# The number lives here and the gates' messages read it back, so raising it
+# does not leave four "after 120s" lines saying something that is no longer
+# true.
+RUN_LIMIT_SECONDS=${GRASM_RUN_LIMIT:-1800}
 if command -v timeout >/dev/null 2>&1; then
-    RUN_LIMIT="timeout ${GRASM_RUN_LIMIT:-120}"
+    RUN_LIMIT="timeout $RUN_LIMIT_SECONDS"
 else
     RUN_LIMIT=""
 fi
