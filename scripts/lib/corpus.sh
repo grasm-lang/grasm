@@ -28,3 +28,48 @@ corpus_programs() {
     # shellcheck disable=SC2086
     find $CORPUS_DIRS -name '*.gr' | sort
 }
+
+# Whether a program needs a system library on the link line.
+#
+# A program whose package graph declares `links` calls an `extern fn` that the
+# system linker resolves, so two separate things are true of it:
+#
+#   * it cannot be built without that library's search path, which is a
+#     property of the machine rather than of the code;
+#   * it cannot be compared against the interpreter at all, because
+#     `grasm run` reaches only symbols already loaded in its own process.
+#
+# Asked of the compiler -- `grasm links` -- so no gate carries a list of
+# filenames that rots, and none of them matches on a build failure's text,
+# which would make the gate agree with whatever the message happens to say.
+#
+# One definition because three gates needed it: `difftest.sh` found the hole,
+# and `leakcheck.sh` and `crosstest.sh` had the same one. A copied rule drifts
+# the way a copied count drifts.
+corpus_external() {
+    [ -n "$("${GRASM:-./target/release/grasm}" links "$1" 2>/dev/null)" ]
+}
+
+# Fails unless every program named in "$@" is one `scripts/sdltest.sh` builds.
+#
+# An excluded program is only excluded honestly if something else checks it.
+# Counting the excluded and printing the count is what F76 was about: the
+# number was there and nobody compared it to anything. So a new program that
+# calls into C and that nobody gated fails the gate that skipped it.
+corpus_external_covered() {
+    local covered prog
+    # One padded string matched with `case`, not a pipe into `grep -q`: under
+    # `pipefail` that fails the pipeline when the pattern *matches*, so a
+    # covered program would read as uncovered.
+    covered=" $(grep -oE 'packages/[a-z0-9-]+/src/main\.gr' scripts/sdltest.sh |
+        sort -u | tr '\n' ' ')"
+    for prog in "$@"; do
+        case "$covered" in
+            *" $prog "*) continue ;;
+        esac
+        echo "    $prog calls into a C library and no gate checks it."
+        echo "    Add it to scripts/sdltest.sh, or this is unchecked code."
+        return 1
+    done
+    return 0
+}

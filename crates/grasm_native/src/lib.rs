@@ -12373,6 +12373,21 @@ this case",
                         // Its last read: the reference the local held is the
                         // one handed out, and its scope will not release it.
                         self.moved.insert(var.as_u32());
+                        // A value struct is counted by its *fields*, and
+                        // `move_or_copy_val` decides between moving them and
+                        // copying-and-retaining them by whether the source is
+                        // a temporary. A moved local is one for this purpose:
+                        // without this it was copied, its fields retained, and
+                        // the scope's release already suppressed above -- so
+                        // every call leaked one allocation. `fn step(r, h) {
+                        // var room = r; room = joined(room, h); room }` leaked
+                        // one per call and `leakcheck` has been red on
+                        // `E-VALUE-SEMANTICS.gr` since the use-after-free
+                        // above it was fixed, because the move was honoured at
+                        // the release and not at the copy.
+                        if matches!(vt, VType::Val(_)) {
+                            self.fresh_vals.insert(v);
+                        }
                     } else if vt.boxed() {
                         self.call_rt("grasm_val_inc", &[v]);
                     }

@@ -49,8 +49,10 @@ fi
 pass=0
 fail=0
 skip=0
+external=0
 declare -a FAILED=()
 declare -a SKIPPED=()
+declare -a EXTERNAL=()
 
 # Same scan roots as difftest.sh: a program the host backend is held to must
 # hold on every other target too, or "portable" means only what was sampled.
@@ -58,6 +60,16 @@ for src in $(corpus_programs); do
     grep -qE '^[[:space:]]*(pub )?fn main\(' "$src" || continue
     # Conformance programs tagged `expect: error` are meant not to compile.
     grep -q '^//! expect: error$' "$src" && continue
+    # A program needing a system library needs *that target's* copy of it,
+    # which is a second machine-shaped requirement on top of the search path:
+    # the SDL2 installed here is arm64 and this builds for x86_64. Excluded
+    # the same way `difftest.sh` and `leakcheck.sh` exclude it, through the
+    # one definition in lib/corpus.sh.
+    if corpus_external "$src"; then
+        external=$((external + 1))
+        EXTERNAL+=("$src")
+        continue
+    fi
     name=$(echo "$src" | tr '/.' '__')
 
     # A skip says the toolchain could not produce a binary, so it has to say
@@ -115,7 +127,7 @@ done
 echo
 echo "=========================================="
 echo "target: $TARGET"
-echo "identical: $pass   mismatched: $fail   unsupported: $skip"
+echo "identical: $pass   mismatched: $fail   unsupported: $skip   external: $external"
 echo "=========================================="
 
 # "Coverage this run did not get" and then exit 0 was the same shape as a
@@ -142,5 +154,13 @@ fi
 if [ "$fail" -gt 0 ]; then
     printf 'FAILED: %s\n' "${FAILED[@]}"
     exit 1
+fi
+# A program needing a system library was not cross-compiled, so it was not
+# checked here. Only honest if another gate builds it, which is asserted.
+if [ "$external" -gt 0 ]; then
+    echo
+    echo "needs a system library for the target, so built by sdltest instead:"
+    printf '  %s\n' "${EXTERNAL[@]}"
+    corpus_external_covered "${EXTERNAL[@]}" || exit 1
 fi
 exit 0

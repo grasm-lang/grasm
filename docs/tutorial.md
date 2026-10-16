@@ -709,6 +709,28 @@ quietly starts reading the filesystem exceeds its declared ceiling and fails
 to build **in every consumer** — a compile error, not a runtime surprise, and
 not something a reviewer has to happen to notice.
 
+A package that calls an `extern fn` names the library those symbols come
+from:
+
+```toml
+[package]
+name = "sdl"
+version = "1.0.0"
+capabilities = ["io", "unsafe"]
+links = ["SDL2"]           # `-lSDL2` on the link line
+```
+
+An `extern fn` is resolved by the system linker, so without this the library
+has to be named at every call site -- `grasm build --link SDL2` -- and
+forgetting it fails with one error per missing symbol rather than one naming
+the library. The libraries of every package in the graph go on the line, each
+one once. Where that library *lives* is still the machine's business: a
+search path belongs in `--link -L...`, not in a manifest that other people
+check out.
+
+`grasm links <file.gr>` prints what a program needs, which is how the gates
+tell a program they structurally cannot run from one the backend declined.
+
 A capability is what a package needs from **outside** itself, so what counts is
 what *escapes*: the effects `main` performs, the effects left in a `pub`
 function's row for a consumer to handle, and the effects its `test` and `bench`

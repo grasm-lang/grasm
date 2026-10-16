@@ -55,7 +55,7 @@ for src in $programs; do
     # Asked of the compiler rather than inferred from a build failure or kept
     # as a list of filenames here. A list rots, and matching on the error text
     # would make this gate agree with whatever the message happens to say.
-    if [ -n "$("$GRASM" links "$src" 2>/dev/null)" ]; then
+    if corpus_external "$src"; then
         external=$((external + 1))
         EXTERNAL+=("$src — $("$GRASM" links "$src" 2>/dev/null | tr '\n' ' ')")
         continue
@@ -135,25 +135,11 @@ if [ "$external" -gt 0 ]; then
     echo
     echo "not comparable, so checked by scripts/sdltest.sh instead:"
     printf '  %s\n' "${EXTERNAL[@]}"
-    # Collected into one padded string and matched with `case`, because
-    # piping into `grep -q` under `pipefail` fails the pipeline when the
-    # pattern *matches*: grep exits at the first hit, the writer takes
-    # SIGPIPE, and a covered program would be reported as uncovered. It
-    # happened to work here only because the list fits a pipe buffer.
-    covered=" $(grep -oE 'packages/[a-z0-9-]+/src/main\.gr' scripts/sdltest.sh |
-        sort -u | tr '\n' ' ')"
+    progs=()
     for entry in "${EXTERNAL[@]}"; do
-        prog=${entry%% —*}
-        case "$covered" in
-            *" $prog "*) continue ;;
-        esac
-        if true; then
-            echo
-            echo "    $prog calls into a C library and no gate checks it."
-            echo "    Add it to scripts/sdltest.sh, or this is unchecked code."
-            exit 1
-        fi
+        progs+=("${entry%% —*}")
     done
+    corpus_external_covered "${progs[@]}" || exit 1
 fi
 if [ "$fail" -gt 0 ] || [ "$skip" -gt 0 ]; then
     exit 1

@@ -82,14 +82,24 @@ fi
 clean=0
 leaked=0
 skipped=0
+external=0
 declare -a SKIPPED=()
 declare -a LEAKS=()
+declare -a EXTERNAL=()
 
 programs=$(corpus_programs)
 
 for src in $programs; do
     grep -qE '^\s*(pub )?fn main\(' "$src" || continue
     grep -q '^//! expect: error$' "$src" && continue
+    # A program needing a system library cannot be linked here: the search
+    # path is a property of the machine. `scripts/sdltest.sh` builds these
+    # with it and `corpus_external_covered` below checks that it still does.
+    if corpus_external "$src"; then
+        external=$((external + 1))
+        EXTERNAL+=("$src")
+        continue
+    fi
     # One reused file for every program in the corpus, so macOS admits a new
     # executable once instead of ~500 times (see lib/native.sh).
     bin="$WORK/p"
@@ -114,7 +124,7 @@ done
 
 echo
 echo "=========================================="
-echo "leak-free: $clean   leaking: $leaked   not compiled: $skipped"
+echo "leak-free: $clean   leaking: $leaked   not compiled: $skipped   external: $external"
 echo "=========================================="
 
 # The list is empty: every program in the corpus frees everything it allocates,
@@ -157,5 +167,15 @@ if [ "$skipped" -gt 0 ]; then
     echo "the native backend declined these, so they were never run:"
     printf '  %s\n' "${SKIPPED[@]}"
     exit 1
+fi
+
+# A program needing a system library was not linked here, so it was not
+# checked for leaks here either. That is only honest if another gate builds
+# it, which is asserted rather than assumed.
+if [ "$external" -gt 0 ]; then
+    echo
+    echo "not linkable without a library search path, so built by sdltest:"
+    printf '  %s\n' "${EXTERNAL[@]}"
+    corpus_external_covered "${EXTERNAL[@]}" || exit 1
 fi
 exit 0
