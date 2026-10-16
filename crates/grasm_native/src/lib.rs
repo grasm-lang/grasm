@@ -1063,6 +1063,7 @@ impl<'m> Codegen<'m> {
             ("grasm_file_exists", vec![i64t], Some(i8t)),
             ("grasm_remove_file", vec![i64t], Some(i64t)),
             ("grasm_make_dir", vec![i64t], Some(i64t)),
+            ("grasm_make_dir_new", vec![i64t], Some(i64t)),
             ("grasm_bytes_of", vec![i64t], Some(i64t)),
             ("grasm_bytes_len", vec![i64t], Some(i64t)),
             ("grasm_bytes_at", vec![i64t, i64t], Some(i64t)),
@@ -17268,12 +17269,12 @@ checker did",
                     ),
                 )));
             }
-            "make_dir" | "remove_file" => {
+            "make_dir" | "make_dir_new" | "remove_file" => {
                 let (pv, _) = self.eval_expr_val(&args[0])?;
-                let sym = if id.name == "make_dir" {
-                    "grasm_make_dir"
-                } else {
-                    "grasm_remove_file"
+                let sym = match id.name.as_str() {
+                    "make_dir" => "grasm_make_dir",
+                    "make_dir_new" => "grasm_make_dir_new",
+                    _ => "grasm_remove_file",
                 };
                 let v = self.call_rt(sym, &[pv]).unwrap();
                 self.call_rt("grasm_val_dec", &[pv]);
@@ -19291,7 +19292,8 @@ fields, not the type this is bound to, not an enclosing generic",
                                 Box::new(VType::Str),
                                 Box::new(VType::Sum("IoError".into())),
                             )),
-                            "write_file" | "remove_file" | "make_dir" => Some(VType::Fallible(
+                            "write_file" | "remove_file" | "make_dir"
+                            | "make_dir_new" => Some(VType::Fallible(
                                 Box::new(VType::Unit),
                                 Box::new(VType::Sum("IoError".into())),
                             )),

@@ -1,0 +1,8 @@
+[package]
+name = "tempdir_demo"
+version = "1.0.0"
+capabilities = ["io"]
+
+[dependencies.tempdir]
+path = "../tempdir"
+version = "^1.0.0"

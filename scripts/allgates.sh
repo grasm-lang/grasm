@@ -74,6 +74,7 @@ run_gate xxhashtest    scripts/xxhashtest.sh
 run_gate tiffwrite     scripts/tiffwritetest.sh
 run_gate multisearch   scripts/multisearchtest.sh
 run_gate walkdirtest   scripts/walkdirtest.sh
+run_gate tempdirtest   scripts/tempdirtest.sh
 run_gate grasmwire     scripts/grasmwire_e2e.sh
 run_gate cryptodiff    scripts/crypto_diff.sh
 run_gate certdiff      scripts/cert_diff.sh

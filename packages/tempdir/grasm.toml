@@ -1,0 +1,7 @@
+[package]
+name = "tempdir"
+version = "1.0.0"
+
+# Claims a name on disk and reads `TMPDIR`. Reading the environment is part
+# of the `io` row here, not a row of its own.
+capabilities = ["io"]

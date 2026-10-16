@@ -1764,7 +1764,8 @@ pub mod net {
                     continue;
                 }
             };
-            let mut failed = None;
+            // `EINTR` means the attempt was interrupted, not that it
+            // failed, so it retries this address rather than moving on.
             loop {
                 let r = unsafe {
                     connect(sock.fd, addr.bytes.as_ptr(), addr.bytes.len() as u32)
@@ -1773,12 +1774,9 @@ pub mod net {
                     return Ok(sock);
                 }
                 if errno() != EINTR {
-                    failed = Some(Error::last_os_error());
+                    last = Error::last_os_error();
                     break;
                 }
-            }
-            if let Some(e) = failed {
-                last = e;
             }
         }
         Err(last)
@@ -2155,6 +2153,27 @@ pub mod fs {
             }
         }
         Ok(())
+    }
+
+    /// One directory, failing if the name is already taken.
+    ///
+    /// This is the atomic primitive a temporary directory needs.
+    /// `create_dir_all` treats "already there" as success, which is what
+    /// makes it `_all` -- and what makes it useless for claiming a name:
+    /// a caller that generates a random name and calls it cannot tell
+    /// whether it got the name or walked into something another process
+    /// (or an attacker) put there first.
+    ///
+    /// `mkdir` is atomic and reports `EEXIST`, so the race has an answer
+    /// at the system call. Only the parent has to exist; this creates no
+    /// intermediate components, because creating them would reintroduce
+    /// exactly the ambiguity it is here to remove.
+    pub fn create_dir_new(path: &str) -> Result<()> {
+        let at = c_path(path);
+        // 0o700: a temporary directory is for the process that made it, and
+        // the mode is not left to the umask because a world-readable one is
+        // how a secret written inside it leaks.
+        check(unsafe { mkdir(at.as_ptr(), 0o700) })
     }
 
     /// `Path::exists`, which is one `access` call and does not need the

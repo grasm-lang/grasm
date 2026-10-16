@@ -3560,6 +3560,21 @@ uses to mark the end of a string"
                             },
                         ));
                     }
+                    "make_dir_new" => {
+                        let p = self.eval_expr(&args[0])?.to_string();
+                        if let Some(v) = journal::gated("make_dir_new") {
+                            return Ok(v);
+                        }
+                        // `create_dir`, not `create_dir_all`: the point of
+                        // this builtin is that an existing name is an error.
+                        return Ok(journal::recorded(
+                            "make_dir_new",
+                            match std::fs::create_dir(&p) {
+                                Ok(()) => Value::Ok(Rc::new(Value::Unit)),
+                                Err(e) => Value::Err(Rc::new(io_error("IoFailed", e.to_string()))),
+                            },
+                        ));
+                    }
                     "remove_file" => {
                         let p = self.eval_expr(&args[0])?.to_string();
                         if let Some(v) = journal::gated("remove_file") {

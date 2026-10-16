@@ -218,6 +218,11 @@ pub const BUILTINS: &[Builtin] = &[
         journal: Journal::Recorded,
     },
     Builtin {
+        name: "make_dir_new",
+        row: IO_ROW,
+        journal: Journal::Recorded,
+    },
+    Builtin {
         name: "list_dir",
         row: IO_ROW,
         journal: Journal::Recorded,

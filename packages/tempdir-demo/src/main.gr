@@ -1,0 +1,34 @@
+// Claims temporary directories and reports them, for
+// `scripts/tempdirtest.sh` to check the properties that matter: the names
+// are distinct, unguessable, under the right root, and the directory is
+// usable and private.
+import tempdir
+
+fn main() -> () ! TempError / {io} {
+    print("root {tempdir.temp_root()}")
+    // Several in a row: the names must all differ, which is the property a
+    // sequential or pid-based name would fail.
+    for _i in 0..8 {
+        let d = try tempdir.create("grasmtest-")
+        print("made {tempdir.path_of(d)}")
+    }
+    // One that is written to, so the gate can check a file inside it.
+    let d = try tempdir.create("grasmtest-")
+    let inner = tempdir.join(d, "note.txt")
+    match write_bytes(inner, "written inside\n".to_bytes()) {
+        Err(_e) -> print("could not write inside")
+        Ok(_n) -> print("wrote {inner}")
+    }
+    // And one under a root the caller names, which must not consult TMPDIR.
+    let a = args()
+    let chosen = a.get(0) ?? ""
+    if chosen != "" {
+        let e = try tempdir.create_in(chosen, "own-")
+        print("under {tempdir.path_of(e)}")
+    }
+    // A root that cannot be written to must fail rather than spin.
+    match tempdir.create_in("/this/does/not/exist", "x-") {
+        Ok(_t) -> print("BAD: claimed a directory under a missing root")
+        Err(_e) -> print("missing root refused")
+    }
+}

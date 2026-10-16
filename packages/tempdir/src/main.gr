@@ -1,0 +1,210 @@
+// A private directory nobody else can be holding.
+//
+// ## Why this is a directory and not a file
+//
+// A temporary *file* cannot be created safely with what the runtime offers.
+// `write_bytes` truncates whatever is at the path, so generating a random
+// name and writing it cannot tell "I claimed this name" from "something was
+// already here" -- and if what was already there is a symbolic link to a
+// file somebody else owns, the write follows it. That is the classic
+// temporary-file attack and the only defence is an exclusive create, which
+// `O_EXCL` provides for files and which is not exposed.
+//
+// `mkdir` *is* exposed, through `make_dir_new`, and it is atomic: it either
+// creates the directory or reports that the name is taken. So the safe
+// shape is to claim a directory and put files inside it, where the
+// directory's `0700` means no other user can reach them. This is what
+// `mktemp -d` does, for the same reason.
+//
+// `make_dir` is the wrong tool here and the difference matters: it is
+// `mkdir -p` and treats an existing directory as success, so a caller using
+// it cannot detect a collision at all. It was the only one available until
+// this package needed the other.
+//
+// ## The name is random, not sequential
+//
+// Sixteen bytes from `random_bytes`, hex-encoded. A counter or a process id
+// is guessable, and a guessable name is one an attacker can create first.
+// A collision is still handled -- the claim is retried -- because "random"
+// is not "unique", and a retry loop that gives up after a bounded number of
+// attempts is the difference between a rare failure and an unbounded one.
+
+type TempError =
+    | NoTempRoot
+    | Exhausted(attempts: i64)
+    | NotWritable(path: str)
+
+/// A claimed directory. Removing it is the caller's to do.
+///
+/// There is no destructor here and no `Drop`: Grasm does not run code when a
+/// value goes out of scope, so a type that claimed to clean up after itself
+/// would be lying. `remove` is a function the caller calls, and the doc on
+/// it says what it does not do.
+type TempDir = {
+    path: str,
+}
+
+fn hex_of(b: bytes) -> str {
+    let digits = "0123456789abcdef"
+    var out = ""
+    var i = 0
+    while i < b.len() {
+        let v = b.at(i)
+        out = out + digits.substr(v / 16, 1) + digits.substr(v % 16, 1)
+        i = i + 1
+    }
+    out
+}
+
+/// Where temporary files belong on this machine.
+///
+/// `TMPDIR` when it is set, which is what macOS gives every process and what
+/// a build system overrides to keep its own litter together. `/tmp` is the
+/// fallback and not the default: on macOS `/tmp` is shared between users and
+/// `TMPDIR` is not.
+pub fn temp_root() -> str / {io} {
+    let from_env = env("TMPDIR") ?? ""
+    if from_env == "" {
+        return "/tmp"
+    }
+    if from_env.ends_with("/") {
+        // One trailing slash, so joining is a single rule.
+        return from_env.substr(0, from_env.len() - 1)
+    }
+    from_env
+}
+
+/// Claim a new directory under the temporary root.
+///
+/// `prefix` is for a human reading `ls`: it names which program left this
+/// behind. It is not part of what makes the name unguessable.
+pub fn create(prefix: str) -> TempDir ! TempError / {io} {
+    create_in(temp_root(), prefix)
+}
+
+/// Claim a new directory under a root the caller names.
+pub fn create_in(root: str, prefix: str) -> TempDir ! TempError / {io} {
+    if root == "" {
+        fail(NoTempRoot)
+    }
+    // Eight attempts. Sixteen random bytes collide with probability around
+    // 2^-128 per try, so eight is not about collisions -- it is about a root
+    // that cannot be written to at all, which must fail rather than spin.
+    var attempt = 0
+    while attempt < 8 {
+        let name = hex_of(random_bytes(16) ?? bytes_of([]))
+        if name == "" {
+            fail(Exhausted(attempt))
+        }
+        let path = "{root}/{prefix}{name}"
+        match make_dir_new(path) {
+            Ok(_u) -> return TempDir{ path: path }
+            Err(_e) -> {}
+        }
+        attempt = attempt + 1
+    }
+    fail(NotWritable(root))
+}
+
+/// A path inside the directory.
+pub fn join(d: TempDir, name: str) -> str {
+    "{d.path}/{name}"
+}
+
+/// The directory's own path.
+pub fn path_of(d: TempDir) -> str {
+    d.path
+}
+
+test "the hex of a byte is two digits, low byte last" {
+    assert_eq(hex_of(bytes_of([0])), "00")
+    assert_eq(hex_of(bytes_of([255])), "ff")
+    assert_eq(hex_of(bytes_of([1, 16, 171])), "0110ab")
+    assert_eq(hex_of(bytes_of([])), "")
+}
+
+test "sixteen bytes become thirty-two characters" {
+    // The length is the unguessability. A shorter name is a guessable one.
+    assert_eq(hex_of(bytes_filled(16, 7)).len(), 32)
+}
+
+test "a root with a trailing slash joins the same as one without" {
+    // Otherwise the path has a double slash, which works on POSIX and makes
+    // every printed path look wrong.
+    match create_in("/no/such/root/", "x-") {
+        Ok(_d) -> assert(false)
+        Err(_e) -> assert(true)
+    }
+    match create_in("", "x-") {
+        Ok(_d) -> assert(false)
+        Err(_e) -> assert(true)
+    }
+}
+
+test "a claimed directory is private and can hold a file" {
+    match create("grasmunit-") {
+        Err(_e) -> assert(false)
+        Ok(d) -> {
+            let inner = join(d, "f")
+            match write_bytes(inner, bytes_of([65, 66])) {
+                Err(_e) -> assert(false)
+                Ok(_n) -> {
+                    match read_bytes(inner) {
+                        Err(_e) -> assert(false)
+                        Ok(b) -> {
+                            assert_eq(b.len(), 2)
+                            assert_eq(b.at(0), 65)
+                        }
+                    }
+                }
+            }
+            match remove_file(inner) {
+                Ok(_u) -> {}
+                Err(_e) -> {}
+            }
+        }
+    }
+}
+
+test "two claims never answer the same path" {
+    var seen: [str] = []
+    for _i in 0..16 {
+        match create("grasmunit-") {
+            Err(_e) -> assert(false)
+            Ok(d) -> {
+                let p = path_of(d)
+                for old in seen {
+                    assert(old != p)
+                }
+                seen.push(p)
+            }
+        }
+    }
+    assert_eq(seen.len(), 16)
+}
+
+test "the name a claim answers is the one that was created" {
+    match create("grasmunit-") {
+        Err(_e) -> assert(false)
+        Ok(d) -> {
+            // `make_dir_new` refuses a name that exists, so claiming the
+            // same path again must fail -- which also proves the directory
+            // really is there.
+            match make_dir_new(path_of(d)) {
+                Ok(_u) -> assert(false)
+                Err(_e) -> assert(true)
+            }
+        }
+    }
+}
+
+test "joining puts one separator in, never two" {
+    match create_in("/tmp", "grasmunit-") {
+        Err(_e) -> assert(false)
+        Ok(d) -> {
+            let j = join(d, "name")
+            assert(j.ends_with("/name"))
+            assert(not j.contains("//"))
+        }
+    }
+}

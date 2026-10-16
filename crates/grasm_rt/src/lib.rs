@@ -10281,6 +10281,25 @@ unsafe fn grasm_make_dir_now(path: *mut RtVal) -> *mut RtVal {
     }
 }
 
+/// Creates one directory, failing if the name is taken.
+///
+/// The atomic half of a temporary directory: `make_dir` is `mkdir -p` and
+/// cannot tell "I made it" from "it was already there", which is exactly
+/// the distinction a caller claiming a random name needs.
+///
+/// # Safety: called from compiled Grasm with a boxed value.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_make_dir_new(path: *mut RtVal) -> *mut RtVal {
+    journaled("make_dir_new", || grasm_make_dir_new_now(path))
+}
+
+unsafe fn grasm_make_dir_new_now(path: *mut RtVal) -> *mut RtVal {
+    match crate::fs::create_dir_new(as_str(path)) {
+        Ok(()) => ok_of(alloc(RtPayload::Unit)),
+        Err(e) => err_of(io_err("IoFailed", e.to_string())),
+    }
+}
+
 /// # Safety: called from compiled Grasm with a boxed value.
 #[no_mangle]
 pub unsafe extern "C" fn grasm_remove_file(path: *mut RtVal) -> *mut RtVal {

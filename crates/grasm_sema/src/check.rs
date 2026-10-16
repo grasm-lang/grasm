@@ -315,6 +315,7 @@ pub const BUILTIN_FREE_FNS: &[&str] = &[
     "file_exists",
     "remove_file",
     "make_dir",
+    "make_dir_new",
     "bytes_of",
     "bytes_filled",
     "read_bytes",
@@ -6000,7 +6001,7 @@ only a number or a `bool` can come out — compute what you need and yield that"
                         };
                         return Type::Fallible(Box::new(Type::Unit), Box::new(io_err));
                     }
-                    "make_dir" | "remove_file" => {
+                    "make_dir" | "make_dir_new" | "remove_file" => {
                         if args.len() != 1 {
                             return self.error(
                                 span,

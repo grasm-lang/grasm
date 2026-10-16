@@ -29,6 +29,7 @@ prog() {
     file_exists)    echo 'if file_exists("/tmp") { print("y") } else { print("n") }' ;;
     remove_file)    echo 'match remove_file("'"$WORK"'/gone") { Ok(u) -> print("y") Err(e) -> print("n") }' ;;
     make_dir)       echo 'match make_dir("'"$WORK"'/d") { Ok(u) -> print("y") Err(e) -> print("n") }' ;;
+    make_dir_new)   echo 'match make_dir_new("'"$WORK"'/n") { Ok(u) -> print("y") Err(e) -> print("n") }' ;;
     list_dir)       echo 'match list_dir("/tmp") { Ok(n) -> print("y") Err(e) -> print("n") }' ;;
     args)           echo 'print(args().len().to_str())' ;;
     env)            echo 'match env("HOME") { Some(v) -> print("y") None -> print("n") }' ;;
