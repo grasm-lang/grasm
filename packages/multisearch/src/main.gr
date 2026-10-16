@@ -1,0 +1,292 @@
+// Aho-Corasick: find every one of many patterns in one pass.
+//
+// Searching for `n` patterns by running a single-pattern search `n` times
+// costs `n` passes over the text. This costs one, whatever `n` is, because
+// the patterns are compiled into an automaton first: a trie of every
+// pattern, plus a **failure link** on each node pointing at the longest
+// proper suffix of that node which is also a prefix of some pattern.
+//
+// When a byte does not continue the current match, the failure link says
+// where to carry on from without re-reading anything. That is the whole
+// idea, and it is why the text is read once.
+//
+// ## Overlaps are reported, not resolved
+//
+// Searching `ab` and `b` in `ab` finds both. A caller wanting
+// leftmost-longest can filter, and a caller scanning for forbidden words
+// wants every hit -- the one thing a library must not do here is pick
+// silently, because the two callers disagree and neither is wrong.
+//
+// `find_all` reports matches in the order they *end*, which is the order
+// the single pass produces them. Two patterns ending at the same byte come
+// out shortest-first.
+
+/// A compiled set of patterns.
+///
+/// `next` is the trie, as `node * 256 + byte -> node` with -1 for absent;
+/// `fail` is the failure link of each node; `out` lists the pattern indices
+/// that end at each node, including those reached through failure links so
+/// a match never needs the chain walked twice.
+type Automaton = {
+    next: [i64],
+    fail: [i64],
+    out: [[i64]],
+    lengths: [i64],
+}
+
+/// Where a pattern was found.
+type Match = {
+    /// Which pattern, as an index into the list that was compiled.
+    pattern: i64,
+    /// The byte offset where it starts.
+    start: i64,
+    /// One past its last byte.
+    end: i64,
+}
+
+fn new_node(inout a: Automaton) -> i64 {
+    let id = a.fail.len()
+    for _k in 0..256 {
+        a.next.push(0 - 1)
+    }
+    a.fail.push(0)
+    a.out.push([])
+    id
+}
+
+/// Compile the patterns into an automaton.
+///
+/// An empty pattern is dropped rather than matched everywhere: it would
+/// report a hit at every offset and bury the real ones. A caller who wants
+/// that behaviour does not need a search.
+pub fn compile(patterns: [bytes]) -> Automaton {
+    var a = Automaton{ next: [], fail: [], out: [], lengths: [] }
+    let _root = new_node(a)
+    var p = 0
+    while p < patterns.len() {
+        let pat = patterns.get(p).unwrap_or(bytes_of([]))
+        a.lengths.push(pat.len())
+        if pat.len() > 0 {
+            var node = 0
+            var i = 0
+            while i < pat.len() {
+                let slot = node * 256 + pat.at(i)
+                var to = a.next.get(slot).unwrap_or(0 - 1)
+                if to < 0 {
+                    to = new_node(a)
+                    a.next[slot] = to
+                }
+                node = to
+                i = i + 1
+            }
+            var ends = a.out.get(node).unwrap_or([])
+            ends.push(p)
+            a.out[node] = ends
+        }
+        p = p + 1
+    }
+    build_links(a)
+    a
+}
+
+/// Breadth-first, because a node's failure link is defined in terms of its
+/// parent's, so every node at depth `d` needs depth `d - 1` finished first.
+fn build_links(inout a: Automaton) {
+    var queue: [i64] = []
+    var b = 0
+    while b < 256 {
+        let to = a.next.get(b).unwrap_or(0 - 1)
+        if to >= 0 {
+            a.fail[to] = 0
+            queue.push(to)
+        } else {
+            // The root is complete: a byte that matches nothing stays at the
+            // root rather than failing, which is what lets the scan loop be
+            // a single lookup with no inner while.
+            a.next[b] = 0
+        }
+        b = b + 1
+    }
+    var head = 0
+    while head < queue.len() {
+        let node = queue.get(head).unwrap_or(0)
+        head = head + 1
+        var c = 0
+        while c < 256 {
+            let slot = node * 256 + c
+            let to = a.next.get(slot).unwrap_or(0 - 1)
+            let failed = a.next.get(a.fail.get(node).unwrap_or(0) * 256 + c).unwrap_or(0)
+            if to < 0 {
+                // Absent edges are filled in with where failing would land,
+                // so the scan never walks a chain.
+                a.next[slot] = failed
+            } else {
+                a.fail[to] = failed
+                // The outputs of the failure target belong here too: a node
+                // matching `she` also matches `he`, and copying once at
+                // build time saves walking the chain at every hit.
+                var mine = a.out.get(to).unwrap_or([])
+                for q in a.out.get(failed).unwrap_or([]) {
+                    mine.push(q)
+                }
+                a.out[to] = mine
+                queue.push(to)
+            }
+            c = c + 1
+        }
+    }
+}
+
+/// Every match of every pattern, in the order they end.
+pub fn find_all(a: Automaton, text: bytes) -> [Match] {
+    var found: [Match] = []
+    var node = 0
+    var i = 0
+    while i < text.len() {
+        node = a.next.get(node * 256 + text.at(i)).unwrap_or(0)
+        for p in a.out.get(node).unwrap_or([]) {
+            let len = a.lengths.get(p).unwrap_or(0)
+            found.push(Match{ pattern: p, start: i + 1 - len, end: i + 1 })
+        }
+        i = i + 1
+    }
+    found
+}
+
+/// Whether any pattern appears, stopping at the first.
+pub fn contains_any(a: Automaton, text: bytes) -> bool {
+    var node = 0
+    var i = 0
+    while i < text.len() {
+        node = a.next.get(node * 256 + text.at(i)).unwrap_or(0)
+        if a.out.get(node).unwrap_or([]).len() > 0 {
+            return true
+        }
+        i = i + 1
+    }
+    false
+}
+
+/// The first match only, or `None`.
+pub fn find_first(a: Automaton, text: bytes) -> Option[Match] {
+    var node = 0
+    var i = 0
+    while i < text.len() {
+        node = a.next.get(node * 256 + text.at(i)).unwrap_or(0)
+        var best = 0 - 1
+        for p in a.out.get(node).unwrap_or([]) {
+            if best < 0 or a.lengths.get(p).unwrap_or(0) > a.lengths.get(best).unwrap_or(0) {
+                best = p
+            }
+        }
+        if best >= 0 {
+            let len = a.lengths.get(best).unwrap_or(0)
+            return Some(Match{ pattern: best, start: i + 1 - len, end: i + 1 })
+        }
+        i = i + 1
+    }
+    None
+}
+
+/// How many nodes the automaton has, which is what its memory is.
+pub fn node_count(a: Automaton) -> i64 {
+    a.fail.len()
+}
+
+fn of(s: str) -> bytes {
+    s.to_bytes()
+}
+
+test "a pattern that is a suffix of another is still found" {
+    // `she` reaches a node whose failure link is the node for `he`, so its
+    // outputs have to include `he`'s. This is the case that silently loses
+    // matches when the links are built without copying outputs.
+    let a = compile([of("he"), of("she")])
+    let hits = find_all(a, of("she"))
+    assert_eq(hits.len(), 2)
+}
+
+test "the text is read once, whatever the pattern count" {
+    // Not a timing claim: the scan is one `while` over the bytes with a
+    // single table lookup inside it, so this is structural. What is checked
+    // here is that adding patterns does not change what a scan finds in the
+    // text they do not appear in.
+    let one = compile([of("zz")])
+    let many = compile([of("zz"), of("qq"), of("xyzzy"), of("aaa")])
+    assert_eq(find_all(one, of("abcdef")).len(), 0)
+    assert_eq(find_all(many, of("abcdef")).len(), 0)
+}
+
+test "overlapping matches are all reported" {
+    // `a`, `aa` and `aaa` in `aaaa` is nine matches, and a library that
+    // resolved the overlap silently would answer fewer. Resolving is the
+    // caller's to do because the two callers who want this disagree.
+    let a = compile([of("a"), of("aa"), of("aaa")])
+    assert_eq(find_all(a, of("aaaa")).len(), 9)
+}
+
+test "an empty pattern is dropped rather than matched everywhere" {
+    // It would report a hit at every offset and bury the real ones.
+    let a = compile([of(""), of("b")])
+    let hits = find_all(a, of("abc"))
+    assert_eq(hits.len(), 1)
+    assert_eq(hits.get(0).unwrap_or(Match{ pattern: 0 - 1, start: 0, end: 0 }).pattern, 1)
+}
+
+test "the trie shares prefixes" {
+    // `he`, `hers`, `his` share `h`; a list of patterns would need one node
+    // a byte. Ten nodes for thirteen bytes is the sharing working.
+    assert_eq(node_count(compile([of("he"), of("she"), of("his"), of("hers")])), 10)
+    // Nothing to share: one node a byte, plus the root.
+    assert_eq(node_count(compile([of("abc")])), 4)
+}
+
+test "a match reports the offsets its bytes actually occupy" {
+    let a = compile([of("ana")])
+    let hits = find_all(a, of("banana"))
+    assert_eq(hits.len(), 2)
+    let first = hits.get(0).unwrap_or(Match{ pattern: 0, start: 0, end: 0 })
+    assert_eq(first.start, 1)
+    assert_eq(first.end, 4)
+    let second = hits.get(1).unwrap_or(Match{ pattern: 0, start: 0, end: 0 })
+    assert_eq(second.start, 3)
+    assert_eq(second.end, 6)
+}
+
+test "contains_any stops at the first hit and agrees with find_all" {
+    let a = compile([of("needle")])
+    assert(contains_any(a, of("a needle here")))
+    assert(not contains_any(a, of("nothing here")))
+    assert_eq(contains_any(a, of("x")), find_all(a, of("x")).len() > 0)
+}
+
+test "find_first answers the longest match ending soonest" {
+    // At the end of `she` both `he` and `she` match; the longer is the one
+    // a caller scanning for a keyword wants.
+    let a = compile([of("he"), of("she")])
+    match find_first(a, of("she")) {
+        None -> assert(false)
+        Some(m) -> {
+            assert_eq(m.pattern, 1)
+            assert_eq(m.start, 0)
+            assert_eq(m.end, 3)
+        }
+    }
+    match find_first(a, of("xyz")) {
+        Some(_m) -> assert(false)
+        None -> assert(true)
+    }
+}
+
+test "bytes above 127 are bytes like any other" {
+    // The table is indexed 0..256, so a signed byte would wrap into it.
+    let a = compile([bytes_of([200, 201])])
+    assert_eq(find_all(a, bytes_of([199, 200, 201, 202])).len(), 1)
+    assert_eq(find_all(a, bytes_of([200, 200, 201])).len(), 1)
+}
+
+test "an empty text finds nothing and does not fail" {
+    let a = compile([of("a")])
+    assert_eq(find_all(a, of("")).len(), 0)
+    assert(not contains_any(a, of("")))
+}

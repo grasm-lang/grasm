@@ -1,0 +1,50 @@
+// Random pattern sets and texts, printed with every match, for
+// `scripts/multisearchtest.sh` to check against brute force.
+//
+// The alphabet is three letters on purpose. Failure links only matter when
+// patterns overlap, and over 256 bytes a random pattern set almost never
+// does -- a fuzzer over the full alphabet would run thousands of cases and
+// exercise the trie while never touching the part that is hard to get
+// right. Three letters and patterns of one to four bytes collide
+// constantly.
+//
+// The generator is a plain linear congruential sequence so the checker can
+// read the patterns and text back off the line rather than reproducing the
+// sequence.
+import multisearch
+fn main() / {io} {
+    // A deterministic generator both sides can reproduce, over a tiny
+    // alphabet so patterns actually collide.
+    var seed = 20261016
+    for case in 0..200 {
+        seed = (seed * 1103515245 + 12345).bit_and(2147483647)
+        let npat = seed.shr(7).bit_and(3) + 1
+        var pats: [bytes] = []
+        for _p in 0..npat {
+            seed = (seed * 1103515245 + 12345).bit_and(2147483647)
+            let plen = seed.shr(5).bit_and(3) + 1
+            var b: [i64] = []
+            for _k in 0..plen {
+                seed = (seed * 1103515245 + 12345).bit_and(2147483647)
+                b.push(97 + seed.shr(9).bit_and(2))
+            }
+            pats.push(bytes_of(b))
+        }
+        seed = (seed * 1103515245 + 12345).bit_and(2147483647)
+        let tlen = seed.shr(3).bit_and(15)
+        var t: [i64] = []
+        for _k in 0..tlen {
+            seed = (seed * 1103515245 + 12345).bit_and(2147483647)
+            t.push(97 + seed.shr(9).bit_and(2))
+        }
+        let text = bytes_of(t)
+        var line = "{case}"
+        for p in pats { line = "{line} {p.to_str()}" }
+        line = "{line} | {text.to_str()} |"
+        let a = multisearch.compile(pats)
+        for m in multisearch.find_all(a, text) {
+            line = "{line} {m.pattern}:{m.start}:{m.end}"
+        }
+        print(line)
+    }
+}

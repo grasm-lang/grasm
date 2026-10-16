@@ -1,0 +1,8 @@
+[package]
+name = "multisearch_fuzz"
+version = "1.0.0"
+capabilities = ["io"]
+
+[dependencies.multisearch]
+path = "../multisearch"
+version = "^1.0.0"

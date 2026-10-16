@@ -1,0 +1,43 @@
+// Prints every match of a pattern set over generated texts, for
+// `scripts/multisearchtest.sh` to compare against brute force.
+//
+// The cases are the ones Aho-Corasick gets wrong when the failure links are
+// built carelessly: patterns that are suffixes of each other (`he`/`she`),
+// patterns that are prefixes of each other (`ab`/`abc`), a pattern that
+// appears inside another match, overlapping runs of one byte, and a pattern
+// longer than the text.
+import multisearch
+
+fn pat(s: str) -> bytes {
+    s.to_bytes()
+}
+
+fn show(name: str, patterns: [bytes], text: bytes) -> () / {io} {
+    let a = multisearch.compile(patterns)
+    var line = "{name}"
+    for m in multisearch.find_all(a, text) {
+        line = "{line} {m.pattern}:{m.start}:{m.end}"
+    }
+    print(line)
+}
+
+fn main() -> () / {io} {
+    // The classic set: `he` and `hers` share a prefix, `she` contains `he`.
+    show("classic", [pat("he"), pat("she"), pat("his"), pat("hers")], pat("ushers"))
+    show("nested", [pat("ab"), pat("abc"), pat("bc"), pat("c")], pat("xabcy"))
+    show("suffixes", [pat("a"), pat("aa"), pat("aaa")], pat("aaaa"))
+    show("absent", [pat("zz"), pat("qq")], pat("abcdef"))
+    show("empty_text", [pat("a")], pat(""))
+    show("longer_than_text", [pat("abcdefgh")], pat("abc"))
+    show("one_byte", [pat("x")], pat("xxx"))
+    show("whole", [pat("abc")], pat("abc"))
+    show("repeat", [pat("ana")], pat("bananana"))
+    show("high_bytes", [bytes_of([200, 201]), bytes_of([201, 202])],
+        bytes_of([199, 200, 201, 202, 200, 201]))
+    show("many", [pat("the"), pat("he"), pat("e"), pat("there"), pat("her")],
+        pat("there is the heather"))
+    // A pattern set with a duplicate: both indices must be reported.
+    show("duplicate", [pat("ab"), pat("ab")], pat("abab"))
+    let classic = multisearch.compile([pat("he"), pat("she"), pat("his"), pat("hers")])
+    print("nodes {multisearch.node_count(classic)}")
+}

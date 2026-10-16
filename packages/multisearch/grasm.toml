@@ -1,0 +1,6 @@
+[package]
+name = "multisearch"
+version = "1.0.0"
+
+# Bytes in, positions out.
+capabilities = []
