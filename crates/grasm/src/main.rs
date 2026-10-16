@@ -132,6 +132,7 @@ fn run() -> ExitCode {
             "lint" => (&["--json", "--rules"], &["--only"]),
             "journal" => (&["--full"], &[]),
             "deps" => (&["--locked"], &[]),
+            "links" => (&[], &[]),
             "publish" => (&[], &["--registry"]),
             "add" => (&[], &["--registry"]),
             _ => (&[], &[]),
@@ -372,12 +373,20 @@ fn run() -> ExitCode {
             };
             // Collected before anything is compiled, since the link is the
             // last thing to happen and the flag is read there.
-            let links: Vec<String> = args
+            let mut links: Vec<String> = args
                 .iter()
                 .enumerate()
                 .filter(|(_, a)| *a == "--link")
                 .filter_map(|(i, _)| args.get(i + 1).cloned())
                 .collect();
+            // Then whatever the packages themselves declared. `--link` stays
+            // first so a caller can put a search path before the libraries
+            // that need it, and a library named twice is passed once.
+            for lib in declared_links(std::path::Path::new(path)) {
+                if !links.contains(&lib) {
+                    links.push(lib);
+                }
+            }
             let _ = LINK_ARGS.set(links);
             let out_path = args
                 .iter()
@@ -734,6 +743,22 @@ fn run() -> ExitCode {
                 ExitCode::SUCCESS
             }
         }
+        // What system libraries a program needs, one a line, so a tool can
+        // ask rather than infer. `scripts/difftest.sh` uses it to tell a
+        // program it structurally cannot check -- the interpreter cannot call
+        // into a C library at all -- from one the backend declined, which is
+        // a defect. Inferring that from a build failure's text would make the
+        // gate agree with whatever the message happens to say.
+        Some("links") => {
+            let Some(path) = first_operand(&args[1..], &[]) else {
+                eprintln!("usage: grasm links <file.gr>");
+                return ExitCode::FAILURE;
+            };
+            for lib in declared_links(std::path::Path::new(&path)) {
+                println!("{lib}");
+            }
+            ExitCode::SUCCESS
+        }
         Some("deps") => {
             let locked = args.iter().any(|a| a == "--locked");
             let dir = first_operand(&args[1..], &[])
@@ -1088,6 +1113,43 @@ fn same_dir(a: &std::path::Path, b: &std::path::Path) -> bool {
         (Ok(x), Ok(y)) => x == y,
         _ => a == b,
     }
+}
+
+/// Every system library the packages in this graph declared, unioned.
+///
+/// An `extern fn` is resolved by the system linker ([T-EXTERN]), so the
+/// library defining it has to be on the link line. Leaving that to the
+/// caller meant `packages/sdl` built only when whoever invoked the compiler
+/// remembered `--link SDL2`, and forgetting it produced a linker error
+/// naming fourteen missing symbols rather than one missing library. A
+/// package that calls into C now says which library in its manifest, and
+/// this collects them.
+///
+/// A failure to resolve is not an error here: the build is about to resolve
+/// the same graph and will report it with the context this cannot. Answering
+/// an empty set means the link line is only what `--link` asked for, which
+/// is what happened before this existed.
+fn declared_links(path: &std::path::Path) -> Vec<String> {
+    let mut here = path.parent().map(std::path::Path::to_path_buf);
+    let pkg_dir = loop {
+        match here {
+            Some(ref d) if d.join(grasm_pkg::MANIFEST_NAME).is_file() => break d.clone(),
+            Some(ref d) => here = d.parent().map(std::path::Path::to_path_buf),
+            None => return Vec::new(),
+        }
+    };
+    let Ok(resolution) = grasm_pkg::resolve(&pkg_dir) else {
+        // A graph of paths that does not need the registry still resolves;
+        // anything else is the build's to report.
+        return grasm_pkg::Manifest::load(&pkg_dir)
+            .map(|m| m.links.into_iter().collect())
+            .unwrap_or_default();
+    };
+    let mut all: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for pkg in &resolution.packages {
+        all.extend(pkg.links.iter().cloned());
+    }
+    all.into_iter().collect()
 }
 
 /// The package graph, as name → directory — *excluding* the package being

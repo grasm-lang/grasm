@@ -140,6 +140,19 @@ pub struct Manifest {
     /// The effect ceiling. `None` means "unrestricted" (with a lint);
     /// `Some(set)` is enforced against what the code actually does.
     pub capabilities: Option<BTreeSet<String>>,
+    /// System libraries this package's `extern fn`s are resolved from.
+    ///
+    /// An `extern fn` is resolved by the system linker, so a package calling
+    /// one needs its library on the link line. Before this existed the
+    /// requirement was undeclared: `packages/sdl` built only if the caller
+    /// remembered `--link SDL2`, and forgot it meant a linker error naming
+    /// fourteen symbols rather than the one missing library. A package that
+    /// says what it needs is the whole point of the manifest.
+    ///
+    /// Sorted and deduplicated, because the link line is assembled from every
+    /// package in the graph and two of them asking for the same library must
+    /// not put it there twice.
+    pub links: BTreeSet<String>,
     pub dependencies: Vec<Dependency>,
     /// Entry source file, relative to the manifest. Defaults to `src/main.gr`.
     pub entry: String,
@@ -175,6 +188,46 @@ impl Manifest {
                     .as_str_array()
                     .ok_or("`capabilities` must be an array of strings")?;
                 Some(list.into_iter().map(|s| s.to_string()).collect())
+            }
+        };
+
+        let links: BTreeSet<String> = match pkg.get("links") {
+            None => BTreeSet::new(),
+            Some(v) => {
+                let list = v
+                    .as_str_array()
+                    .ok_or("`links` must be an array of strings")?;
+                for name in &list {
+                    // This goes on a linker command line as `-l<name>`, so a
+                    // name carrying a flag, a path or a shell character would
+                    // be the manifest choosing linker arguments. A library is
+                    // an identifier.
+                    // `-` and `.` are allowed inside a name -- `SDL2-2.0`
+                    // is a real library -- but not as the first character,
+                    // where `-` would make the entry a linker flag and `.`
+                    // the start of a relative path. The first character
+                    // being checked separately is the whole difference
+                    // between rejecting `-lSDL2` and accepting it.
+                    let shape_ok = !name.is_empty()
+                        && name
+                            .chars()
+                            .all(|c| {
+                                c.is_ascii_alphanumeric()
+                                    || c == '_'
+                                    || c == '-'
+                                    || c == '.'
+                                    || c == '+'
+                            })
+                        && name.starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_');
+                    if !shape_ok {
+                        return Err(format!(
+                            "`links` entry `{name}` is not a library name — \
+                             letters, digits, `_`, `-`, `.` and `+`, and it \
+                             must start with a letter, a digit or `_`"
+                        ));
+                    }
+                }
+                list.into_iter().map(|s| s.to_string()).collect()
             }
         };
 
@@ -256,7 +309,7 @@ outside that set is executed but recorded nowhere"
         // column said so. `entrypoint` for `entry` silently kept the default.
         // A key in no table at all — written above `[package]` — was ignored
         // the same way.
-        const PACKAGE_KEYS: &[&str] = &["name", "version", "capabilities", "entry"];
+        const PACKAGE_KEYS: &[&str] = &["name", "version", "capabilities", "entry", "links"];
         if let Some(pkg) = doc.table("package") {
             if let Some(k) = pkg.keys().find(|k| !PACKAGE_KEYS.contains(&k.as_str())) {
                 return Err(format!(
@@ -321,6 +374,7 @@ and not a keyword"
             name,
             version,
             capabilities,
+            links,
             dependencies,
             entry,
             dir: dir.to_path_buf(),
@@ -1622,4 +1676,101 @@ pub fn diff_lock(previous: &str, current: &[LockEntry]) -> Vec<LockChange> {
         }
     }
     changes
+}
+
+#[cfg(test)]
+mod links_tests {
+    use super::*;
+
+    fn parse(body: &str) -> Result<Manifest, String> {
+        Manifest::parse(body, Path::new("/tmp/x"))
+    }
+
+    const HEAD: &str = "[package]\nname = \"p\"\nversion = \"1.0.0\"\n";
+
+    #[test]
+    fn a_package_declares_the_libraries_it_links() {
+        let m = parse(&format!("{HEAD}links = [\"SDL2\", \"m\"]\n")).unwrap();
+        assert_eq!(
+            m.links.iter().cloned().collect::<Vec<_>>(),
+            vec!["SDL2".to_string(), "m".to_string()]
+        );
+    }
+
+    #[test]
+    fn no_links_is_an_empty_set_not_an_error() {
+        // The overwhelming majority of packages call no C at all.
+        assert!(parse(HEAD).unwrap().links.is_empty());
+    }
+
+    #[test]
+    fn a_library_named_twice_is_held_once() {
+        // The link line is assembled from every package in the graph, so two
+        // of them wanting the same library must not pass it twice.
+        let m = parse(&format!("{HEAD}links = [\"SDL2\", \"SDL2\"]\n")).unwrap();
+        assert_eq!(m.links.len(), 1);
+    }
+
+    #[test]
+    fn a_links_entry_is_a_library_name_and_not_a_linker_flag() {
+        // This becomes `-l<name>` on a command line. Anything that could be
+        // read as a flag, a path or a shell word would be the manifest
+        // choosing linker arguments, which is not what it is for.
+        for bad in [
+            "-lSDL2",
+            "/usr/lib/libSDL2.dylib",
+            "SDL2 -rpath /tmp",
+            "a;b",
+            "$(whoami)",
+            "`id`",
+            "",
+            "a\nb",
+        ] {
+            let body = format!("{HEAD}links = [{:?}]\n", bad);
+            assert!(
+                parse(&body).is_err(),
+                "`links = [{bad:?}]` was accepted and should not be"
+            );
+        }
+    }
+
+    #[test]
+    fn links_must_be_an_array_of_strings() {
+        assert!(parse(&format!("{HEAD}links = \"SDL2\"\n")).is_err());
+        assert!(parse(&format!("{HEAD}links = 3\n")).is_err());
+    }
+
+    #[test]
+    fn a_misspelled_key_is_refused_rather_than_ignored() {
+        // `link` instead of `links` would silently leave the library off the
+        // line, which is the failure this whole field exists to remove.
+        assert!(parse(&format!("{HEAD}link = [\"SDL2\"]\n")).is_err());
+    }
+}
+
+#[cfg(test)]
+mod links_shape_tests {
+    use super::*;
+
+    const HEAD: &str = "[package]\nname = \"p\"\nversion = \"1.0.0\"\n";
+
+    #[test]
+    fn a_name_may_carry_a_dash_or_dot_but_not_lead_with_one() {
+        // Real libraries have both in them, and `-lSDL2` has a dash too --
+        // which is why only the first character decides.
+        for good in ["SDL2-2.0", "stdc++abi", "z", "a.b", "_x", "SDL2_ttf"] {
+            let body = format!("{HEAD}links = [{good:?}]\n");
+            assert!(
+                Manifest::parse(&body, Path::new("/tmp/x")).is_ok(),
+                "`{good}` is a library name and was refused"
+            );
+        }
+        for bad in ["-lSDL2", "-L/usr/lib", ".hidden", "./lib", "-"] {
+            let body = format!("{HEAD}links = [{bad:?}]\n");
+            assert!(
+                Manifest::parse(&body, Path::new("/tmp/x")).is_err(),
+                "`{bad}` is a flag or a path and was accepted"
+            );
+        }
+    }
 }

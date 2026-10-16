@@ -51,13 +51,27 @@ if ! "$GRASM" build packages/sdl-demo/src/main.gr --native --link SDL2 \
 fi
 
 frames=600
-start=$(python3 -c 'import time; print(time.time())')
-out=$(SDL_VIDEODRIVER=dummy "$work/sdldemo" "$frames" 2>&1) || {
-    echo "    the demo did not run:"
-    echo "$out" | sed 's/^/      /'
-    exit 1
-}
-end=$(python3 -c 'import time; print(time.time())')
+# The best of three, not one run. Load inflates a timing and can never
+# deflate it, so the fastest of several runs is the honest measure of the code
+# and the slowest says more about the machine. A single run read 10.20 ms --
+# past the budget below -- at a load average of 32, most of it from work that
+# had nothing to do with this repo. Widening the budget would have hidden a
+# real slowdown just as well as a load spike; taking the minimum keeps it
+# tight.
+best=""
+for _attempt in 1 2 3; do
+    start=$(python3 -c 'import time; print(time.time())')
+    out=$(SDL_VIDEODRIVER=dummy "$work/sdldemo" "$frames" 2>&1) || {
+        echo "    the demo did not run:"
+        echo "$out" | sed 's/^/      /'
+        exit 1
+    }
+    end=$(python3 -c 'import time; print(time.time())')
+    this=$(python3 -c "print(f'{($end - $start) * 1000 / $frames:.4f}')")
+    best=$(python3 -c "
+b = '$best'
+print(min(float(b), $this) if b else $this)")
+done
 
 # The program prints what it drew, and the count is checked rather than
 # trusted: a loop that exited early would otherwise read as a pass.
@@ -68,8 +82,8 @@ if [ "$out" != "$want" ]; then
     exit 1
 fi
 
-per=$(python3 -c "print(f'{($end - $start) * 1000 / $frames:.2f}')")
-echo "    frames: $frames   per frame: ${per} ms   (16.67 ms is 60 fps)"
+per=$(python3 -c "print(f'{$best:.2f}')")
+echo "    frames: $frames   per frame: ${per} ms   best of 3   (16.67 ms is 60 fps)"
 
 # The whole stack, not just the window: a JPEG decoded by `packages/jpeg`,
 # composited by `packages/pcframe` with a half-transparent panel over it, and
@@ -113,10 +127,13 @@ echo "    editor shell: $edit"
 # A frame budget rather than a bare timing, so this fails if the path becomes
 # too slow to drive a window rather than merely getting slower.
 #
-# 10 ms against the ~0.4 ms measured idle. The margin is not politeness: this
-# shares a machine with the other gates and read 4.55 ms under load, so a 5 ms
-# budget would have failed for the load rather than for the code. A gate that
-# flakes is a gate people learn to rerun.
+# 10 ms against the ~0.4 ms measured idle, over the best of three runs. The
+# margin is not politeness: this shares a machine with whatever else is
+# running on it. One run read 4.55 ms under light load and 10.20 ms at a load
+# average of 32 -- past this budget -- so the fix was to stop letting one
+# unlucky run decide, not to widen the budget until nothing could fail it. A
+# gate that flakes is a gate people learn to rerun; a budget loose enough
+# never to flake is a gate that cannot fail.
 python3 -c "
 import sys
 per = $per

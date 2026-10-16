@@ -6,3 +6,10 @@ version = "1.0.0"
 # That is C, so it is Tier 3 and says so here as well as in the source -- a
 # consumer can refuse this package by reading one line.
 capabilities = ["io", "unsafe"]
+
+# The library those `extern fn`s are resolved from. An `extern fn` is found by
+# the system linker, so without this line a program using this package links
+# only if its caller remembers `--link SDL2` -- and forgetting it fails with
+# fourteen missing symbols rather than one missing library. SDL2 is a system
+# library and is not vendored; `scripts/sdltest.sh` says how to install it.
+links = ["SDL2"]

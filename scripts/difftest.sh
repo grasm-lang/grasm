@@ -26,8 +26,10 @@ fi
 pass=0
 fail=0
 skip=0
+external=0
 declare -a FAILED=()
 declare -a SKIPPED=()
+declare -a EXTERNAL=()
 
 . "$(dirname "$0")/lib/corpus.sh"
 CORPUS_DIRS=${DIRS:-$CORPUS_DIRS}
@@ -41,6 +43,21 @@ for src in $programs; do
     # Conformance programs tagged `expect: error` are meant not to compile;
     # there is no runtime behaviour for the two engines to disagree about.
     if grep -q '^//! expect: error$' "$src"; then
+        continue
+    fi
+    # A program whose package graph declares a system library cannot be
+    # compared by this gate at all: `grasm run` reaches only symbols already
+    # loaded in its own process, so the interpreter side of the comparison
+    # cannot call into C and there is no second opinion to have. That is
+    # structural, not a gap -- `scripts/sdltest.sh` checks these against real
+    # SDL2 instead.
+    #
+    # Asked of the compiler rather than inferred from a build failure or kept
+    # as a list of filenames here. A list rots, and matching on the error text
+    # would make this gate agree with whatever the message happens to say.
+    if [ -n "$("$GRASM" links "$src" 2>/dev/null)" ]; then
+        external=$((external + 1))
+        EXTERNAL+=("$src — $("$GRASM" links "$src" 2>/dev/null | tr '\n' ' ')")
         continue
     fi
     # One reused file for the whole corpus, so macOS admits a new executable
@@ -87,7 +104,7 @@ done
 
 echo
 echo "=========================================="
-echo "identical: $pass   mismatched: $fail   unsupported: $skip"
+echo "identical: $pass   mismatched: $fail   unsupported: $skip   external: $external"
 echo "=========================================="
 
 # A program the backend declines is not a program this gate has checked, and
@@ -107,6 +124,36 @@ if [ "$fail" -gt 0 ]; then
     echo
     echo "FAILURES:"
     printf '  %s\n' "${FAILED[@]}"
+fi
+
+# An excluded program is only excluded honestly if something else checks it.
+# Counting them and printing the count is what F76 was about: the number was
+# there and nobody compared it to anything. So the set this gate skipped must
+# be exactly the set `sdltest.sh` builds -- a new program calling into C that
+# nobody added to that gate fails here instead of quietly going unchecked.
+if [ "$external" -gt 0 ]; then
+    echo
+    echo "not comparable, so checked by scripts/sdltest.sh instead:"
+    printf '  %s\n' "${EXTERNAL[@]}"
+    # Collected into one padded string and matched with `case`, because
+    # piping into `grep -q` under `pipefail` fails the pipeline when the
+    # pattern *matches*: grep exits at the first hit, the writer takes
+    # SIGPIPE, and a covered program would be reported as uncovered. It
+    # happened to work here only because the list fits a pipe buffer.
+    covered=" $(grep -oE 'packages/[a-z0-9-]+/src/main\.gr' scripts/sdltest.sh |
+        sort -u | tr '\n' ' ')"
+    for entry in "${EXTERNAL[@]}"; do
+        prog=${entry%% —*}
+        case "$covered" in
+            *" $prog "*) continue ;;
+        esac
+        if true; then
+            echo
+            echo "    $prog calls into a C library and no gate checks it."
+            echo "    Add it to scripts/sdltest.sh, or this is unchecked code."
+            exit 1
+        fi
+    done
 fi
 if [ "$fail" -gt 0 ] || [ "$skip" -gt 0 ]; then
     exit 1

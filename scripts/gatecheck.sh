@@ -95,9 +95,15 @@ for f in scripts/*.sh ProjectGold/run.sh; do
         piped=$((piped + 1))
     fi
 done
+# Kept apart from the total. The summary used to print the running total
+# under the label `undefined`, so one `grep -q` finding read as "undefined: 1"
+# and sent a reader looking for a helper that did not exist -- the count was
+# right and the name was wrong, which is worse than a wrong count because it
+# is believed.
+undefined=$bad
 bad=$((bad + piped))
 
 echo "=========================================="
-echo "gate helpers checked: $checked   undefined: $bad   corpus copied: $copied   grep -q under pipefail: $piped"
+echo "gate helpers checked: $checked   undefined: $undefined   corpus copied: $copied   grep -q under pipefail: $piped"
 echo "=========================================="
 [ "$bad" = 0 ]
