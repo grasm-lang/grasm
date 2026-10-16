@@ -31,3 +31,4 @@ skew        ok       compressed: four-stream Huffman literals
 skew.9      ok       compressed: four-stream Huffman literals
 skew.blocks ok       three blocks: a reused tree and carried repeat offsets
 carry.blocks ok      several blocks: a repeat offset crossing a boundary
+badsum refused

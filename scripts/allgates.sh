@@ -70,6 +70,7 @@ run_gate rontest       scripts/rontest.sh
 run_gate webptest      scripts/webptest.sh
 run_gate rmcptest      scripts/rmcptest.sh
 run_gate pngwrite      scripts/pngwritetest.sh
+run_gate xxhashtest    scripts/xxhashtest.sh
 run_gate grasmwire     scripts/grasmwire_e2e.sh
 run_gate cryptodiff    scripts/crypto_diff.sh
 run_gate certdiff      scripts/cert_diff.sh

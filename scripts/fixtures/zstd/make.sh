@@ -95,3 +95,13 @@ printf '%-12s %7s -> %5s bytes (several blocks, reused trees)\n' \
 zstd -q -f -5 --target-compressed-block-size=1500 carry.bin -o carry.blocks.zst
 printf '%-12s %7s -> %5s bytes (repeat offset across a block)\n' \
     "carry.blocks" "$(wc -c <carry.bin)" "$(wc -c <carry.blocks.zst)"
+
+# A frame whose stored checksum is wrong by one bit. The compressed data is
+# intact and decodes; only the XXH64 at the end disagrees, so this is the one
+# fixture that fails if the checksum is parsed and not verified -- which is
+# what this decoder did until `packages/xxhash` existed.
+python3 -c "
+d = bytearray(open('$OUT/prose.zst','rb').read())
+d[-1] ^= 1
+open('$OUT/badsum.zst','wb').write(bytes(d))
+"

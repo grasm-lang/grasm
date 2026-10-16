@@ -45,17 +45,25 @@
 // decoder *with* the bug and searching for the smallest input the two
 // disagree on. `carry.blocks.zst` is that input.
 //
-// ## The checksum is parsed and not verified
+// ## The checksum is verified
 //
-// A frame may end with the low four bytes of the content's XXH64. There is no
-// xxhash package here, so the field is located and skipped. `has_checksum`
-// reports whether one was present so a caller knows what it did not get.
-// Saying that is better than implying the data was checked.
+// A frame may end with the low four bytes of the content's XXH64, and
+// `packages/xxhash` computes it, so it is checked rather than skipped. A
+// frame whose checksum does not match the bytes decoded from it fails with
+// `ChecksumFailed` carrying both values.
+//
+// This was skipped for as long as there was no xxhash here, and the comment
+// said so rather than implying the data had been checked. `has_checksum`
+// still reports whether a frame carried one, because a frame without one is
+// unverified and the caller should be able to tell.
+
+import xxhash
 
 type ZstdError =
     | NotZstd
     | Truncated(at: i64)
     | Reserved(what: str)
+    | ChecksumFailed(want: i64, got: i64)
     | CompressedBlock
     | BadNCount
     | BadHuffman
@@ -268,11 +276,15 @@ pub fn decode_frame(data: bytes, from: i64) -> (bytes, i64) ! ZstdError {
             at = at + size
         }
     }
+    var want = 0 - 1
     if h.has_checksum {
         if at + 4 > data.len() {
             fail(Truncated(at))
         }
-        // Located and skipped: see the note at the top of this file.
+        want = data.at(at)
+            .bit_or(data.at(at + 1).shl(8))
+            .bit_or(data.at(at + 2).shl(16))
+            .bit_or(data.at(at + 3).shl(24))
         at = at + 4
     }
     var joined = bytes_filled(total, 0)
@@ -280,6 +292,13 @@ pub fn decode_frame(data: bytes, from: i64) -> (bytes, i64) ! ZstdError {
     for part in out {
         joined.copy_from(off, part)
         off = off + part.len()
+    }
+    if want >= 0 {
+        // The low four bytes of the XXH64 of everything the frame decoded to.
+        let got = xxhash.xxh64(joined, 0).bit_and(4294967295)
+        if got != want {
+            fail(ChecksumFailed(want, got))
+        }
     }
     return (joined, at)
 }

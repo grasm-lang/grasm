@@ -1,0 +1,285 @@
+// XXH32 and XXH64, the non-cryptographic hashes zstd and LZ4 carry.
+//
+// ## Not for anything that must resist an attacker
+//
+// These are checksums. They detect a stream that arrived damaged and they
+// do not detect one that was changed on purpose -- finding two inputs with
+// the same XXH64 is cheap. `blake3` is the one to reach for when the other
+// side might be hostile, and `siphash` when a hash table must not be
+// flooded.
+//
+// ## A u64 is an i64 holding the same bits
+//
+// Grasm has no unsigned 64-bit integer, so a u64 lives in an `i64` as the
+// same sixty-four bits and prints as a negative number above 2^63. That is
+// the convention `siphash` already uses here.
+//
+// Arithmetic is done in halves rather than letting `i64` wrap. Wrapping is
+// what the interpreter and a release build do, so the shorter version would
+// pass every gate -- and a **debug** build turns on Rust's overflow checks,
+// where every multiply in this file would abort. A hash that works in one
+// build and not the other is worse than one that is slower everywhere.
+
+/// Addition modulo 2^64, in halves so nothing overflows.
+pub fn add64(a: i64, b: i64) -> i64 {
+    let low = a.bit_and(4294967295) + b.bit_and(4294967295)
+    let high = a.ushr(32) + b.ushr(32) + low.ushr(32)
+    high.shl(32).bit_or(low.bit_and(4294967295))
+}
+
+/// `(a * b)` modulo 2^32, with both sides taken modulo 2^32 first.
+///
+/// Split into sixteen-bit pieces because the plain product of two numbers
+/// near 2^32 needs sixty-four bits and `i64` has sixty-three to spare.
+fn mul32(a: i64, b: i64) -> i64 {
+    let a0 = a.bit_and(65535)
+    let a1 = a.ushr(16).bit_and(65535)
+    let b0 = b.bit_and(65535)
+    let b1 = b.ushr(16).bit_and(65535)
+    let mid = (a1 * b0 + a0 * b1).bit_and(65535)
+    (a0 * b0 + mid.shl(16)).bit_and(4294967295)
+}
+
+/// The full 64-bit product of two 32-bit numbers, as high and low halves.
+fn mul32_wide(a: i64, b: i64) -> [i64] {
+    let a0 = a.bit_and(65535)
+    let a1 = a.ushr(16).bit_and(65535)
+    let b0 = b.bit_and(65535)
+    let b1 = b.ushr(16).bit_and(65535)
+    let lo = a0 * b0
+    let mid = a1 * b0 + a0 * b1
+    let hi = a1 * b1
+    let t = lo + mid.bit_and(65535).shl(16)
+    let low = t.bit_and(4294967295)
+    let high = (hi + mid.ushr(16) + t.ushr(32)).bit_and(4294967295)
+    [high, low]
+}
+
+/// Multiplication modulo 2^64.
+///
+/// `a*b mod 2^64` keeps the full product of the low halves and only the low
+/// half of each cross term, because anything the cross terms carry past bit
+/// 63 is gone anyway.
+pub fn mul64(a: i64, b: i64) -> i64 {
+    let al = a.bit_and(4294967295)
+    let ah = a.ushr(32).bit_and(4294967295)
+    let bl = b.bit_and(4294967295)
+    let bh = b.ushr(32).bit_and(4294967295)
+    let full = mul32_wide(al, bl)
+    let cross = (mul32(ah, bl) + mul32(al, bh)).bit_and(4294967295)
+    let high = (full.get(0).unwrap_or(0) + cross).bit_and(4294967295)
+    high.shl(32).bit_or(full.get(1).unwrap_or(0))
+}
+
+pub fn rotl64(x: i64, n: i64) -> i64 {
+    x.shl(n).bit_or(x.ushr(64 - n))
+}
+
+pub fn rotl32(x: i64, n: i64) -> i64 {
+    let v = x.bit_and(4294967295)
+    v.shl(n).bit_or(v.ushr(32 - n)).bit_and(4294967295)
+}
+
+fn prime64_1() -> i64 {
+    0 - 7046029288634856825
+}
+
+fn prime64_2() -> i64 {
+    0 - 4417276706812531889
+}
+
+fn prime64_3() -> i64 {
+    1609587929392839161
+}
+
+fn prime64_4() -> i64 {
+    0 - 8796714831421723037
+}
+
+fn prime64_5() -> i64 {
+    2870177450012600261
+}
+
+fn read64(d: bytes, at: i64) -> i64 {
+    var v = 0
+    var k = 7
+    while k >= 0 {
+        v = v.shl(8).bit_or(d.at(at + k))
+        k = k - 1
+    }
+    v
+}
+
+fn read32(d: bytes, at: i64) -> i64 {
+    d.at(at)
+        .bit_or(d.at(at + 1).shl(8))
+        .bit_or(d.at(at + 2).shl(16))
+        .bit_or(d.at(at + 3).shl(24))
+}
+
+fn round64(acc: i64, input: i64) -> i64 {
+    var a = add64(acc, mul64(input, prime64_2()))
+    a = rotl64(a, 31)
+    mul64(a, prime64_1())
+}
+
+fn merge64(acc: i64, val: i64) -> i64 {
+    let a = acc.bit_xor(round64(0, val))
+    add64(mul64(a, prime64_1()), prime64_4())
+}
+
+/// XXH64, as zstd writes it in a frame's checksum field.
+pub fn xxh64(data: bytes, seed: i64) -> i64 {
+    let len = data.len()
+    var acc = 0
+    if len >= 32 {
+        var v1 = add64(add64(seed, prime64_1()), prime64_2())
+        var v2 = add64(seed, prime64_2())
+        var v3 = seed
+        var v4 = add64(seed, 0 - prime64_1())
+        var at = 0
+        while at + 32 <= len {
+            v1 = round64(v1, read64(data, at))
+            v2 = round64(v2, read64(data, at + 8))
+            v3 = round64(v3, read64(data, at + 16))
+            v4 = round64(v4, read64(data, at + 24))
+            at = at + 32
+        }
+        acc = add64(
+            add64(rotl64(v1, 1), rotl64(v2, 7)),
+            add64(rotl64(v3, 12), rotl64(v4, 18)),
+        )
+        acc = merge64(acc, v1)
+        acc = merge64(acc, v2)
+        acc = merge64(acc, v3)
+        acc = merge64(acc, v4)
+    } else {
+        acc = add64(seed, prime64_5())
+    }
+    acc = add64(acc, len)
+    var at = len - (len % 32)
+    if len < 32 {
+        at = 0
+    }
+    while at + 8 <= len {
+        acc = acc.bit_xor(round64(0, read64(data, at)))
+        acc = add64(mul64(rotl64(acc, 27), prime64_1()), prime64_4())
+        at = at + 8
+    }
+    if at + 4 <= len {
+        acc = acc.bit_xor(mul64(read32(data, at).bit_and(4294967295), prime64_1()))
+        acc = add64(mul64(rotl64(acc, 23), prime64_2()), prime64_3())
+        at = at + 4
+    }
+    while at < len {
+        acc = acc.bit_xor(mul64(data.at(at), prime64_5()))
+        acc = mul64(rotl64(acc, 11), prime64_1())
+        at = at + 1
+    }
+    acc = acc.bit_xor(acc.ushr(33))
+    acc = mul64(acc, prime64_2())
+    acc = acc.bit_xor(acc.ushr(29))
+    acc = mul64(acc, prime64_3())
+    acc.bit_xor(acc.ushr(32))
+}
+
+fn add32(a: i64, b: i64) -> i64 {
+    (a + b).bit_and(4294967295)
+}
+
+fn round32(acc: i64, input: i64) -> i64 {
+    // PRIME32_2 then PRIME32_1.
+    let a = add32(acc, mul32(input, 2246822519))
+    mul32(rotl32(a, 13), 2654435761)
+}
+
+/// XXH32, which LZ4's frame format carries.
+pub fn xxh32(data: bytes, seed: i64) -> i64 {
+    let len = data.len()
+    var acc = 0
+    var at = 0
+    if len >= 16 {
+        var v1 = add32(add32(seed, 2654435761), 2246822519)
+        var v2 = add32(seed, 2246822519)
+        var v3 = seed.bit_and(4294967295)
+        var v4 = add32(seed, 4294967295 - 2654435761 + 1)
+        while at + 16 <= len {
+            v1 = round32(v1, read32(data, at))
+            v2 = round32(v2, read32(data, at + 4))
+            v3 = round32(v3, read32(data, at + 8))
+            v4 = round32(v4, read32(data, at + 12))
+            at = at + 16
+        }
+        acc = add32(
+            add32(rotl32(v1, 1), rotl32(v2, 7)),
+            add32(rotl32(v3, 12), rotl32(v4, 18)),
+        )
+    } else {
+        // PRIME32_5.
+        acc = add32(seed, 374761393)
+    }
+    acc = add32(acc, len)
+    while at + 4 <= len {
+        // PRIME32_3 then PRIME32_4.
+        acc = add32(acc, mul32(read32(data, at), 3266489917))
+        acc = mul32(rotl32(acc, 17), 668265263)
+        at = at + 4
+    }
+    while at < len {
+        acc = add32(acc, mul32(data.at(at), 374761393))
+        acc = mul32(rotl32(acc, 11), 2654435761)
+        at = at + 1
+    }
+    acc = acc.bit_xor(acc.ushr(15))
+    acc = mul32(acc, 2246822519)
+    acc = acc.bit_xor(acc.ushr(13))
+    acc = mul32(acc, 3266489917)
+    acc.bit_xor(acc.ushr(16)).bit_and(4294967295)
+}
+
+test "the arithmetic stays inside i64 where a plain multiply would not" {
+    // Both near 2^32, so `a * b` as one expression needs 64 unsigned bits.
+    // This is the case a debug build's overflow checks would abort on.
+    let a = 4294967295
+    let b = 4294967295
+    // (2^32-1)^2 mod 2^64 = 2^64 - 2^33 + 1, which as an i64 is this.
+    assert_eq(mul64(a, b), 0 - 8589934591)
+    assert_eq(mul64(0, 12345), 0)
+    assert_eq(mul64(1, 12345), 12345)
+    assert_eq(mul64(12345, 1), 12345)
+}
+
+test "multiplication wraps the way a u64 does" {
+    // 2^63 * 2 is 2^64, which is zero in sixty-four bits.
+    assert_eq(mul64(0 - 9223372036854775807 - 1, 2), 0)
+    // -1 as a u64 is 2^64-1; squared it is 1.
+    assert_eq(mul64(0 - 1, 0 - 1), 1)
+}
+
+test "addition carries between the halves" {
+    // The low half overflowing must reach the high half.
+    assert_eq(add64(4294967295, 1), 4294967296)
+    assert_eq(add64(0 - 1, 1), 0)
+}
+
+test "a rotate moves bits around the end, not off it" {
+    assert_eq(rotl64(1, 1), 2)
+    assert_eq(rotl64(0 - 9223372036854775807 - 1, 1), 1)
+    assert_eq(rotl32(1, 1), 2)
+    assert_eq(rotl32(2147483648, 1), 1)
+}
+
+test "the published vectors" {
+    // From the author's test suite: the empty input and "abc".
+    assert_eq(xxh32(bytes_of([]), 0), 46947589)
+    assert_eq(xxh64(bytes_of([]), 0), 0 - 1205034819632174695)
+    let abc = bytes_of([97, 98, 99])
+    assert_eq(xxh32(abc, 0), 852579327)
+    assert_eq(xxh64(abc, 0), 4952883123889572249)
+}
+
+test "the seed changes the answer" {
+    let d = bytes_of([1, 2, 3, 4, 5, 6, 7, 8, 9])
+    assert(xxh64(d, 0) != xxh64(d, 1))
+    assert(xxh32(d, 0) != xxh32(d, 1))
+}

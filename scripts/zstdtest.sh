@@ -59,5 +59,10 @@ while read -r name status _rest; do
 done < "$FIX/expect.txt"
 
 echo "    frames: $ok exact   $refused refused as declared"
+# One of those refusals is a frame whose data is intact and whose checksum is
+# wrong by a bit. It is the only fixture that fails when the checksum is
+# parsed and not verified, which is what this decoder did for as long as
+# there was no xxhash here.
+[ -f "$FIX/badsum.zst" ] || { echo "    the checksum fixture is missing"; exit 1; }
 # A manifest that shrank is a gate that stopped checking (F76).
 [ "$ok" -ge 22 ]

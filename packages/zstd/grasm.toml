@@ -4,3 +4,7 @@ version = "1.0.0"
 
 # Decompresses bytes the caller supplies. Reaches nothing.
 capabilities = []
+
+[dependencies.xxhash]
+path = "../xxhash"
+version = "^1.0.0"

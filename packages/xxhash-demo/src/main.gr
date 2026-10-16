@@ -1,0 +1,23 @@
+// Prints XXH32 and XXH64 over a spread of lengths and seeds, for
+// `scripts/xxhashtest.sh` to compare against the reference library.
+//
+// The lengths are chosen for the branches: under 16 and under 32 skip the
+// four-lane loop entirely, and the tails take 8, then 4, then single bytes.
+import xxhash
+
+fn main() -> () / {io} {
+    let lengths = [
+        0, 1, 2, 3, 4, 5, 7, 8, 9, 11, 15, 16, 17, 23, 24, 31, 32, 33,
+        40, 63, 64, 65, 100, 127, 128, 255, 256, 1000,
+    ]
+    for n in lengths {
+        var b: [i64] = []
+        for i in 0..n {
+            b.push((i * 37 + 11) % 256)
+        }
+        let d = bytes_of(b)
+        for seed in [0, 1, 12345, 2654435761] {
+            print("{n} {seed} {xxhash.xxh32(d, seed)} {xxhash.xxh64(d, seed)}")
+        }
+    }
+}

@@ -1,0 +1,8 @@
+[package]
+name = "xxhash_demo"
+version = "1.0.0"
+capabilities = ["io"]
+
+[dependencies.xxhash]
+path = "../xxhash"
+version = "^1.0.0"
