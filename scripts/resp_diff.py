@@ -152,6 +152,20 @@ def main():
         print(f"  {name}: got {got!r}, wanted {want!r}")
     print(f"checks: {len(checks)}   agreeing: {len(checks) - len(wrong)}   "
           f"differing: {len(wrong)}   server said: {said}")
+    # `1 if wrong else 0` alone passes when nothing ran: no checks means no
+    # wrong ones. The count is asserted against the number of `check(` calls
+    # in this file, read from the source, so adding a case raises the bar
+    # without anyone remembering to raise it.
+    #
+    # Anchored to the start of a line, which is not fussiness: written as a
+    # plain substring count it matched the pattern inside this very
+    # expression, put the bar one above what can ever run, and failed every
+    # time.
+    expected = len(re.findall(r"(?m)^    check\(", open(__file__).read()))
+    if len(checks) < expected:
+        print(f"  only {len(checks)} of {expected} checks ran -- "
+              f"the rest were skipped, not passed")
+        return 1
     return 1 if wrong else 0
 
 

@@ -136,7 +136,13 @@ def main():
         server.kill()
         return 1
     port = int(found.group(1))
-    results = [None] * clients
+    # Not `[None] * clients`. `talk` writes `None` only after it has got
+    # through every message, and a thread that raises writes nothing at all --
+    # `threading.Thread` prints the traceback and keeps going. Starting at
+    # `None` made a client that crashed on its first frame indistinguishable
+    # from one that passed, so forty crashed clients reported "agreeing: 40".
+    # Starting at a complaint means only an explicit success clears it.
+    results = ["the client did not finish"] * clients
     threads = [threading.Thread(target=talk, args=(port, results, i))
                for i in range(clients)]
     for t in threads:
@@ -153,6 +159,9 @@ def main():
         print(f"  {one}")
     print(f"clients: {clients}   agreeing: {clients - len(wrong)}   "
           f"differing: {len(wrong)}   server said: {said}")
+    if clients < 1:
+        print("  no clients ran, so nothing was checked")
+        return 1
     return 1 if wrong else 0
 
 
