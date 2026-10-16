@@ -1,0 +1,72 @@
+// Writes TIFFs for `scripts/tiffwritetest.sh`, which reads them with Pillow.
+//
+// Each shape is paired with each codec, because PackBits and Deflate fail
+// in different places: PackBits on runs and on the boundary where a run
+// stops being worth coding, Deflate on nothing in particular but on the
+// whole buffer at once.
+import tiff
+
+fn make(w: i64, h: i64, comps: i64, kind: str) -> bytes {
+    var b = bytes_filled(w * h * comps, 0)
+    var i = 0
+    while i < w * h {
+        var c = 0
+        while c < comps {
+            var v = 0
+            if kind == "flat" {
+                v = 70 + c * 40
+            } else if kind == "runs" {
+                // Long stretches of one value, which is PackBits' whole job.
+                v = ((i / 17) % 3) * 90 + c
+            } else if kind == "gradient" {
+                v = (i % w) * 255 / w
+            } else {
+                var seed = (i * 7 + c * 13 + 1) * 1103515245 + 12345
+                v = seed.bit_and(2147483647).shr(16).bit_and(255)
+            }
+            b.set(i * comps + c, v.bit_and(255))
+            c = c + 1
+        }
+        i = i + 1
+    }
+    b
+}
+
+fn write_one(
+    dir: str,
+    name: str,
+    w: i64,
+    h: i64,
+    comps: i64,
+    kind: str,
+    codec: i64,
+) -> () ! TiffError / {io} {
+    let img = TiffImage{ width: w, height: h, comps: comps, pixels: make(w, h, comps, kind) }
+    let encoded = try tiff.encode(img, codec)
+    let path = "{dir}/{name}.tif"
+    match write_bytes(path, encoded) {
+        Err(_e) -> print("could not write {path}")
+        Ok(_n) -> print("{name} {w} {h} {comps} {codec} {encoded.len()}")
+    }
+}
+
+fn main() -> () ! TiffError / {io} {
+    let a = args()
+    let dir = a.get(0) ?? "."
+    for codec in [1, 8, 32773] {
+        // PackBits codes runs of identical *bytes*. An RGB flat fill has
+        // none -- 70,110,150 repeating never repeats a byte -- so the
+        // single-component shapes are the ones that exercise it, and the
+        // first set of fixtures here compressed nothing because every one
+        // of them was RGB.
+        let kinds = ["flat", "runs", "gradient", "noise", "flat", "runs"]
+        let comps_of = [3, 3, 1, 3, 1, 1]
+        for i in 0..kinds.len() {
+            let kind = kinds.get(i) ?? "flat"
+            let comps = comps_of.get(i) ?? 3
+            try write_one(dir, "{kind}{comps}_{comps}_{codec}", 37, 23, comps, kind, codec)
+        }
+        try write_one(dir, "rgba_4_{codec}", 16, 9, 4, "gradient", codec)
+        try write_one(dir, "one_1_{codec}", 1, 1, 1, "flat", codec)
+    }
+}

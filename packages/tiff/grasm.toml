@@ -12,3 +12,7 @@ version = "^1.0.0"
 [dependencies.zlib]
 path = "../zlib"
 version = "^1.0.0"
+
+[dependencies.deflate]
+path = "../deflate"
+version = "^1.0.0"

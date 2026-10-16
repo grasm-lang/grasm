@@ -17,6 +17,7 @@
 // The planes are `bytes` at one byte a sample ([L-LIB-BYTES-WRITE]). A
 // 24-megapixel RGB TIFF is 72 MB of samples; as `[i64]` the same decode
 // would want 576 MB.
+import deflate
 import lzw
 import zlib
 
@@ -27,6 +28,8 @@ type TiffError =
     | Unsupported(what: str, value: i64)
     | Tiled
     | NoImage
+    /// Writing only: the pixel buffer is not `width * height * comps`.
+    | WrongSize(want: i64, got: i64)
 
 type TiffImage = {
     width: i64,
@@ -450,4 +453,284 @@ test "differencing wraps at a byte, as the stored difference does" {
     var row = bytes_of([250, 0, 0, 10, 0, 0])
     unpredict(row, 2, 3)
     assert_eq(row.at(3), 4)
+}
+
+// --- writing ---------------------------------------------------------------
+
+/// PackBits, the run-length coding TIFF calls 32773.
+///
+/// A run of two or more identical bytes becomes `(257 - n, byte)`; anything
+/// else becomes a literal `(n - 1, bytes)`. Both counts cap at 128, and the
+/// byte 128 is a no-op that is never written -- the decoder in this file has
+/// a note about reading one.
+///
+/// A run of exactly two costs the same as two literals, so it is only worth
+/// coding when it is longer, except at the start of a literal where breaking
+/// out is free.
+pub fn packbits_encode(data: bytes) -> bytes {
+    var out: [i64] = []
+    var at = 0
+    while at < data.len() {
+        let run = run_length(data, at)
+        if run >= 3 {
+            out.push(257 - run)
+            out.push(data.at(at))
+            at = at + run
+        } else {
+            let n = literal_length(data, at)
+            out.push(n - 1)
+            var k = 0
+            while k < n {
+                out.push(data.at(at + k))
+                k = k + 1
+            }
+            at = at + n
+        }
+    }
+    bytes_of(out)
+}
+
+/// How many identical bytes start at `at`, capped where the count field ends.
+fn run_length(data: bytes, at: i64) -> i64 {
+    var run = 1
+    while at + run < data.len() and run < 128 and data.at(at + run) == data.at(at) {
+        run = run + 1
+    }
+    run
+}
+
+/// How many bytes to emit literally before a run of three is worth coding.
+///
+/// A run of two costs the same either way, so it stays inside the literal;
+/// breaking out for it would make the output longer, not shorter.
+fn literal_length(data: bytes, at: i64) -> i64 {
+    var n = 0
+    while at + n < data.len() and n < 128 {
+        if run_length(data, at + n) >= 3 {
+            break
+        }
+        n = n + 1
+    }
+    if n == 0 {
+        return 1
+    }
+    n
+}
+
+fn put16(inout out: [i64], v: i64) {
+    out.push(v.bit_and(255))
+    out.push(v.shr(8).bit_and(255))
+}
+
+fn put32(inout out: [i64], v: i64) {
+    out.push(v.bit_and(255))
+    out.push(v.shr(8).bit_and(255))
+    out.push(v.shr(16).bit_and(255))
+    out.push(v.shr(24).bit_and(255))
+}
+
+/// One IFD entry: tag, type, count, and either the value or an offset to it.
+///
+/// A value of four bytes or fewer lives in the entry; anything longer is an
+/// offset. Getting that boundary wrong writes a file whose tags point at the
+/// middle of the pixels, which readers report as a corrupt image rather than
+/// as a bad tag.
+fn entry(inout out: [i64], tag: i64, kind: i64, count: i64, value: i64) {
+    put16(out, tag)
+    put16(out, kind)
+    put32(out, count)
+    if kind == 3 and count == 1 {
+        // A SHORT sits in the first two bytes of the field, not the last.
+        put16(out, value)
+        put16(out, 0)
+    } else {
+        put32(out, value)
+    }
+}
+
+/// Write a baseline striped TIFF, little-endian, one strip.
+///
+/// `compression` is 1 (none), 8 (Deflate) or 32773 (PackBits) -- three of
+/// the four this file reads. LZW is not written: `lzw` can code it, but the
+/// patent-era packing has enough corners that writing one without a reader
+/// to check against is how a subtly wrong file gets shipped, and Pillow
+/// reads what this writes.
+///
+/// One strip rather than several. A striped file with `RowsPerStrip` equal
+/// to the height is valid and is what most writers emit for a small image;
+/// several strips would be a second thing to get wrong for no gain here.
+pub fn encode(image: TiffImage, compression: i64) -> bytes ! TiffError {
+    if image.comps != 1 and image.comps != 3 and image.comps != 4 {
+        fail(Unsupported("samples per pixel", image.comps))
+    }
+    let expect = image.width * image.height * image.comps
+    if image.pixels.len() != expect {
+        fail(WrongSize(expect, image.pixels.len()))
+    }
+    var body = image.pixels
+    if compression == 32773 {
+        body = packbits_encode(image.pixels)
+    } else if compression == 8 {
+        body = deflate.compress_zlib(image.pixels, zlib.adler32(image.pixels))
+    } else if compression != 1 {
+        fail(Unsupported("compression for writing", compression))
+    }
+
+    // Header, then the pixels, then the tag table. The table goes last so
+    // its offsets are known without a second pass.
+    var out: [i64] = [73, 73]
+    put16(out, 42)
+    put32(out, 8 + body.len())
+    var i = 0
+    while i < body.len() {
+        out.push(body.at(i))
+        i = i + 1
+    }
+
+    let ifd_at = 8 + body.len()
+    // Tags must be written in ascending order, and a reader is entitled to
+    // binary-search them. Twelve bytes an entry, two for the count, four for
+    // the next-IFD pointer.
+    var count = 10
+    if image.comps == 4 {
+        count = 11
+    }
+    let after = ifd_at + 2 + count * 12 + 4
+    // BitsPerSample is one SHORT a sample, so it only fits in the entry when
+    // there are two or fewer.
+    var bits_value = 8
+    if image.comps > 2 {
+        bits_value = after
+    }
+
+    put16(out, count)
+    entry(out, tag_width(), 4, 1, image.width)
+    entry(out, tag_height(), 4, 1, image.height)
+    entry(out, tag_bits(), 3, image.comps, bits_value)
+    entry(out, tag_compression(), 3, 1, compression)
+    // 1 is black-is-zero, 2 is RGB.
+    entry(out, tag_photometric(), 3, 1, if image.comps == 1 { 1 } else { 2 })
+    entry(out, tag_strip_offsets(), 4, 1, 8)
+    entry(out, tag_samples(), 3, 1, image.comps)
+    entry(out, tag_rows_per_strip(), 4, 1, image.height)
+    entry(out, tag_strip_counts(), 4, 1, body.len())
+    entry(out, tag_planar(), 3, 1, 1)
+    if image.comps == 4 {
+        // ExtraSamples: 2 is unassociated alpha. Without it a reader is
+        // within its rights to treat the fourth sample as premultiplied and
+        // divide the colour by it.
+        entry(out, 338, 3, 1, 2)
+    }
+    // No second IFD.
+    put32(out, 0)
+    if image.comps > 2 {
+        var k = 0
+        while k < image.comps {
+            put16(out, 8)
+            k = k + 1
+        }
+    }
+    bytes_of(out)
+}
+
+test "PackBits codes a run as a count and a byte" {
+    // Five of the same: 257 - 5 = 252, then the byte.
+    let coded = packbits_encode(bytes_of([9, 9, 9, 9, 9]))
+    assert_eq(coded.len(), 2)
+    assert_eq(coded.at(0), 252)
+    assert_eq(coded.at(1), 9)
+}
+
+test "PackBits leaves bytes that do not repeat alone" {
+    // Four literals: the count is n - 1, then the bytes.
+    let coded = packbits_encode(bytes_of([1, 2, 3, 4]))
+    assert_eq(coded.len(), 5)
+    assert_eq(coded.at(0), 3)
+    assert_eq(coded.at(1), 1)
+    assert_eq(coded.at(4), 4)
+}
+
+test "a run of two stays inside a literal" {
+    // Coding it costs two bytes and leaving it costs two, so breaking the
+    // literal to code it would only add a header.
+    let coded = packbits_encode(bytes_of([1, 2, 2, 3]))
+    assert_eq(coded.at(0), 3)
+    assert_eq(coded.len(), 5)
+}
+
+test "what PackBits writes, this file reads back" {
+    for src in [
+        [5, 5, 5, 5, 5, 1, 2, 3],
+        [1],
+        [7, 7],
+        [0, 0, 0, 1, 1, 1, 2, 2, 2],
+    ] {
+        let original = bytes_of(src)
+        let coded = packbits_encode(original)
+        let back = unpackbits(coded, original.len())
+        assert_eq(back.len(), original.len())
+        for i in 0..original.len() {
+            assert_eq(back.at(i), original.at(i))
+        }
+    }
+}
+
+test "a run longer than the count field is split" {
+    // 300 identical bytes cannot be one run: the count stops at 128.
+    var src: [i64] = []
+    for _i in 0..300 {
+        src.push(42)
+    }
+    let coded = packbits_encode(bytes_of(src))
+    // Three runs at most, two bytes each, and far smaller than the input.
+    assert(coded.len() <= 8)
+    assert(coded.len() * 10 < 300)
+}
+
+test "writing refuses a pixel buffer of the wrong size" {
+    let img = TiffImage{ width: 4, height: 4, comps: 3, pixels: bytes_filled(10, 0) }
+    match encode(img, 1) {
+        Ok(_b) -> assert(false)
+        Err(_e) -> assert(true)
+    }
+}
+
+test "a written TIFF starts with the little-endian magic" {
+    let img = TiffImage{ width: 2, height: 2, comps: 1, pixels: bytes_filled(4, 7) }
+    match encode(img, 1) {
+        Err(_e) -> assert(false)
+        Ok(b) -> {
+            assert_eq(b.at(0), 73)
+            assert_eq(b.at(1), 73)
+            assert_eq(b.at(2), 42)
+            assert_eq(b.at(3), 0)
+            assert(is_tiff(b))
+        }
+    }
+}
+
+test "what is written reads back through this package too" {
+    var px: [i64] = []
+    for i in 0..(6 * 5 * 3) {
+        px.push((i * 11) % 256)
+    }
+    let img = TiffImage{ width: 6, height: 5, comps: 3, pixels: bytes_of(px) }
+    for codec in [1, 8, 32773] {
+        match encode(img, codec) {
+            Err(_e) -> assert(false)
+            Ok(b) -> {
+                match decode(b) {
+                    Err(_e) -> assert(false)
+                    Ok(back) -> {
+                        assert_eq(back.width, 6)
+                        assert_eq(back.height, 5)
+                        assert_eq(back.comps, 3)
+                        for i in 0..px.len() {
+                            assert_eq(back.pixels.at(i), px.get(i).unwrap_or(0))
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
