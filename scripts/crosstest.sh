@@ -50,12 +50,21 @@ pass=0
 fail=0
 skip=0
 external=0
+timedout=0
 declare -a FAILED=()
 declare -a SKIPPED=()
 declare -a EXTERNAL=()
+declare -a TIMEDOUT=()
 
 # Same scan roots as difftest.sh: a program the host backend is held to must
 # hold on every other target too, or "portable" means only what was sampled.
+# Every program below runs with stdin closed. A program that reads stdin
+# otherwise inherits this script's, and `packages/rmcp-demo` -- an MCP server
+# whose loop runs until end of input -- hung the whole suite for an hour with
+# nothing printed, because this gate buffers its output until the end. Closed
+# stdin is also the only comparable choice: `input()` answers "" at end of
+# input, so both engines see the same thing instead of whatever a terminal
+# happened to supply.
 for src in $(corpus_programs); do
     grep -qE '^[[:space:]]*(pub )?fn main\(' "$src" || continue
     # Conformance programs tagged `expect: error` are meant not to compile.
@@ -93,13 +102,23 @@ for src in $(corpus_programs); do
     # is stripped before stderr is compared — same rule as difftest.sh.
     native_err=$(mktemp)
     interp_err=$(mktemp)
-    native_out=$("$WORK/$name.exe" 2>"$native_err")
+    native_out=$($RUN_LIMIT "$WORK/$name.exe" 2>"$native_err" </dev/null)
     native_code=$?
-    interp_out=$("$GRASM" run "$src" 2>"$interp_err")
+    interp_out=$($RUN_LIMIT "$GRASM" run "$src" 2>"$interp_err" </dev/null)
     interp_code=$?
     interp_diag=$(strip_trace "$(cat "$interp_err")")
     native_diag=$(cat "$native_err")
     rm -f "$native_err" "$interp_err"
+
+    # Both engines stopping at the wall clock is not agreement: no output,
+    # no output, exit 124 both sides, and the comparison below calls it
+    # identical. A program that does not finish is its own outcome.
+    if [ "$native_code" = 124 ] || [ "$interp_code" = 124 ]; then
+        timedout=$((timedout + 1))
+        TIMEDOUT+=("$src — interpreter $interp_code, native $native_code")
+        echo "TIMED OUT: $src after ${GRASM_RUN_LIMIT:-120}s"
+        continue
+    fi
 
     if [ "$native_out" == "$interp_out" ] \
         && [ "$native_code" == "$interp_code" ] \
@@ -127,7 +146,8 @@ done
 echo
 echo "=========================================="
 echo "target: $TARGET"
-echo "identical: $pass   mismatched: $fail   unsupported: $skip   external: $external"
+echo "identical: $pass   mismatched: $fail   unsupported: $skip   \
+external: $external   timed out: $timedout"
 echo "=========================================="
 
 # "Coverage this run did not get" and then exit 0 was the same shape as a
@@ -153,6 +173,13 @@ fi
 
 if [ "$fail" -gt 0 ]; then
     printf 'FAILED: %s\n' "${FAILED[@]}"
+    exit 1
+fi
+
+if [ "$timedout" -gt 0 ]; then
+    echo
+    echo "TIMED OUT (not agreement -- these did not finish):"
+    printf '  %s\n' "${TIMEDOUT[@]}"
     exit 1
 fi
 # A program needing a system library was not cross-compiled, so it was not

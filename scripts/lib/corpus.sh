@@ -73,3 +73,21 @@ corpus_external_covered() {
     done
     return 0
 }
+
+# A per-program wall clock for the gates that run every corpus program.
+#
+# Closing stdin stops the one hang that happened; this stops the class. A
+# program that loops forever -- or waits on something that is not stdin --
+# otherwise stalls the gate, and these gates buffer their output until the
+# end, so the symptom is an hour of silence rather than a failure. That is
+# what `packages/rmcp-demo` did, and the next one will not be a server.
+#
+# `timeout` is not on a stock macOS, so this is empty when it is absent
+# rather than a new requirement. Unquoted on purpose: empty must expand to
+# no argument at all. A timed-out program exits 124 with partial output,
+# which the gates already report as a mismatch -- loudly, which is the point.
+if command -v timeout >/dev/null 2>&1; then
+    RUN_LIMIT="timeout ${GRASM_RUN_LIMIT:-120}"
+else
+    RUN_LIMIT=""
+fi

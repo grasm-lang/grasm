@@ -83,12 +83,21 @@ clean=0
 leaked=0
 skipped=0
 external=0
+timedout=0
 declare -a SKIPPED=()
 declare -a LEAKS=()
 declare -a EXTERNAL=()
+declare -a TIMEDOUT=()
 
 programs=$(corpus_programs)
 
+# Every program below runs with stdin closed. A program that reads stdin
+# otherwise inherits this script's, and `packages/rmcp-demo` -- an MCP server
+# whose loop runs until end of input -- hung the whole suite for an hour with
+# nothing printed, because this gate buffers its output until the end. Closed
+# stdin is also the only comparable choice: `input()` answers "" at end of
+# input, so both engines see the same thing instead of whatever a terminal
+# happened to supply.
 for src in $programs; do
     grep -qE '^\s*(pub )?fn main\(' "$src" || continue
     grep -q '^//! expect: error$' "$src" && continue
@@ -112,9 +121,17 @@ for src in $programs; do
         SKIPPED+=("$src — ${reason:-$(echo "$build_log" | head -1)}")
         continue
     fi
-    err=$(GRASM_LEAK_CHECK=1 "$bin" 2>&1 >/dev/null)
+    err=$(GRASM_LEAK_CHECK=1 $RUN_LIMIT "$bin" 2>&1 >/dev/null </dev/null)
     code=$?
-    if [ $code -eq 7 ]; then
+    # Exit 7 is a leak and 0 is clean. 124 is neither: the program was
+    # stopped at its wall clock and never reached the check, so it leaked
+    # nothing only in the sense that it never finished. `else clean` counted
+    # it as leak-free.
+    if [ $code -eq 124 ]; then
+        timedout=$((timedout + 1))
+        TIMEDOUT+=("$src")
+        echo "TIMED OUT: $src after ${GRASM_RUN_LIMIT:-120}s"
+    elif [ $code -eq 7 ]; then
         leaked=$((leaked + 1))
         LEAKS+=("$src — $(grep -o 'leak: .*' <<<"$err" | head -1)")
     else
@@ -124,7 +141,8 @@ done
 
 echo
 echo "=========================================="
-echo "leak-free: $clean   leaking: $leaked   not compiled: $skipped   external: $external"
+echo "leak-free: $clean   leaking: $leaked   not compiled: $skipped   \
+external: $external   timed out: $timedout"
 echo "=========================================="
 
 # The list is empty: every program in the corpus frees everything it allocates,
@@ -162,6 +180,13 @@ fi
 # A program that did not compile is a program this gate did not run. §11's
 # list is one entry long and nothing in the corpus is on it, so a skip is a
 # defect rather than a fact about the language.
+if [ "$timedout" -gt 0 ]; then
+    echo
+    echo "these did not finish, so they were not checked for leaks:"
+    printf '  %s\n' "${TIMEDOUT[@]}"
+    exit 1
+fi
+
 if [ "$skipped" -gt 0 ]; then
     echo
     echo "the native backend declined these, so they were never run:"

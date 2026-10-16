@@ -44,9 +44,22 @@ trap 'rm -f "$WORK/$PREFIX"_*; cargo build --release --workspace >/dev/null 2>&1
 n=0
 clean=0
 caught=0
+external=0
+declined=0
+timedout=0
 exhausted=0
 declare -a CAUGHT=()
+declare -a EXTERNAL=()
+declare -a DECLINED=()
+declare -a TIMEDOUT=()
 
+# Every program below runs with stdin closed. A program that reads stdin
+# otherwise inherits this script's, and `packages/rmcp-demo` -- an MCP server
+# whose loop runs until end of input -- hung the whole suite for an hour with
+# nothing printed, because this gate buffers its output until the end. Closed
+# stdin is also the only comparable choice: `input()` answers "" at end of
+# input, so both engines see the same thing instead of whatever a terminal
+# happened to supply.
 for src in $(corpus_programs); do
     grep -qE '^\s*(pub )?fn main\(' "$src" || continue
     grep -q 'expect: error' "$src" && continue
@@ -55,9 +68,32 @@ for src in $(corpus_programs); do
     # sixty characters on its own and hides the bug again.
     n=$((n + 1))
     bin="$WORK/${PREFIX}_$n"
-    "$GRASM" build "$src" --native -o "$bin" >/dev/null 2>&1 || continue
-    err=$("$bin" 2>&1 >/dev/null)
+    # A program that does not build is a program this gate did not check.
+    # `|| continue` counted it as nothing at all, so it vanished rather than
+    # failing -- which is why this said "clean: 521" while three programs in
+    # the corpus could not be linked. Classified instead: needing a system
+    # library is a fact about the machine, anything else is a defect.
+    if ! "$GRASM" build "$src" --native -o "$bin" >/dev/null 2>&1; then
+        if corpus_external "$src"; then
+            external=$((external + 1))
+            EXTERNAL+=("$src")
+        else
+            declined=$((declined + 1))
+            DECLINED+=("$src")
+        fi
+        continue
+    fi
+    err=$($RUN_LIMIT "$bin" 2>&1 >/dev/null </dev/null)
     code=$?
+    # A program stopped at its wall clock did not finish, so nothing was
+    # learned about whether it frees what it allocates. Counting it as clean
+    # is the same mistake as counting a build failure as nothing.
+    if [ "$code" -eq 124 ]; then
+        timedout=$((timedout + 1))
+        TIMEDOUT+=("$src")
+        echo "TIMED OUT: $src after ${GRASM_RUN_LIMIT:-120}s"
+        continue
+    fi
     # `grep -c … >/dev/null` rather than `grep -q`: under `pipefail` a `-q`
     # that matches exits early, the writer takes SIGPIPE, and the pipeline
     # reports failure for a pattern that was found. `gatecheck.sh` watches for
@@ -76,6 +112,24 @@ done
 
 echo
 echo "=========================================="
-echo "clean: $clean   use-after-free: $caught   out of memory: $exhausted"
+echo "clean: $clean   use-after-free: $caught   out of memory: $exhausted   \
+external: $external   declined: $declined   timed out: $timedout"
 echo "=========================================="
-[ "$caught" -eq 0 ]
+
+if [ "$declined" -gt 0 ]; then
+    echo
+    echo "the native backend declined these, so they were never run:"
+    printf '  %s\n' "${DECLINED[@]}"
+fi
+if [ "$timedout" -gt 0 ]; then
+    echo
+    echo "these did not finish, so nothing was learned about them:"
+    printf '  %s\n' "${TIMEDOUT[@]}"
+fi
+if [ "$external" -gt 0 ]; then
+    echo
+    echo "needs a system library, so checked by sdltest instead:"
+    printf '  %s\n' "${EXTERNAL[@]}"
+    corpus_external_covered "${EXTERNAL[@]}" || exit 1
+fi
+[ "$caught" -eq 0 ] && [ "$declined" -eq 0 ] && [ "$timedout" -eq 0 ]

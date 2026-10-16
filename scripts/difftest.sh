@@ -27,14 +27,23 @@ pass=0
 fail=0
 skip=0
 external=0
+timedout=0
 declare -a FAILED=()
 declare -a SKIPPED=()
 declare -a EXTERNAL=()
+declare -a TIMEDOUT=()
 
 . "$(dirname "$0")/lib/corpus.sh"
 CORPUS_DIRS=${DIRS:-$CORPUS_DIRS}
 programs=$(corpus_programs)
 
+# Every program below runs with stdin closed. A program that reads stdin
+# otherwise inherits this script's, and `packages/rmcp-demo` -- an MCP server
+# whose loop runs until end of input -- hung the whole suite for an hour with
+# nothing printed, because this gate buffers its output until the end. Closed
+# stdin is also the only comparable choice: `input()` answers "" at end of
+# input, so both engines see the same thing instead of whatever a terminal
+# happened to supply.
 for src in $programs; do
     # Library modules (no `main`) are not standalone programs.
     if ! grep -qE '^\s*(pub )?fn main\(' "$src"; then
@@ -81,13 +90,25 @@ for src in $programs; do
     # line included, has to be identical.
     interp_err=$(mktemp)
     native_err=$(mktemp)
-    interp_out=$("$GRASM" run "$src" 2>"$interp_err")
+    interp_out=$($RUN_LIMIT "$GRASM" run "$src" 2>"$interp_err" </dev/null)
     interp_code=$?
-    native_out=$("$bin" 2>"$native_err")
+    native_out=$($RUN_LIMIT "$bin" 2>"$native_err" </dev/null)
     native_code=$?
     interp_diag=$(strip_trace "$(cat "$interp_err")")
     native_diag=$(cat "$native_err")
     rm -f "$interp_err" "$native_err"
+
+    # A program that ran out of its wall clock agrees with itself: both
+    # engines produce no output and both exit 124, so the comparison below
+    # calls it identical. That turns a hang into a pass, which is worse than
+    # the hang -- the hang at least stalls visibly. Timed out is its own
+    # outcome and it is a failure.
+    if [ "$interp_code" = 124 ] || [ "$native_code" = 124 ]; then
+        timedout=$((timedout + 1))
+        TIMEDOUT+=("$src — interpreter $interp_code, native $native_code")
+        echo "TIMED OUT: $src after ${GRASM_RUN_LIMIT:-120}s"
+        continue
+    fi
 
     if [ "$interp_out" == "$native_out" ] \
         && [ "$interp_code" == "$native_code" ] \
@@ -104,7 +125,7 @@ done
 
 echo
 echo "=========================================="
-echo "identical: $pass   mismatched: $fail   unsupported: $skip   external: $external"
+echo "identical: $pass   mismatched: $fail   unsupported: $skip   external: $external   timed out: $timedout"
 echo "=========================================="
 
 # A program the backend declines is not a program this gate has checked, and
@@ -126,6 +147,13 @@ if [ "$fail" -gt 0 ]; then
     printf '  %s\n' "${FAILED[@]}"
 fi
 
+if [ "$timedout" -gt 0 ]; then
+    echo
+    echo "TIMED OUT (a program that does not finish is not a program that"
+    echo "agreed; both engines stopping at the limit is not agreement):"
+    printf '  %s\n' "${TIMEDOUT[@]}"
+fi
+
 # An excluded program is only excluded honestly if something else checks it.
 # Counting them and printing the count is what F76 was about: the number was
 # there and nobody compared it to anything. So the set this gate skipped must
@@ -141,7 +169,7 @@ if [ "$external" -gt 0 ]; then
     done
     corpus_external_covered "${progs[@]}" || exit 1
 fi
-if [ "$fail" -gt 0 ] || [ "$skip" -gt 0 ]; then
+if [ "$fail" -gt 0 ] || [ "$skip" -gt 0 ] || [ "$timedout" -gt 0 ]; then
     exit 1
 fi
 exit 0
