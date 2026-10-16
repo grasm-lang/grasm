@@ -165,6 +165,25 @@ a design question before it is a package.
 **Numeric and data (7).** `num-traits`, `num-integer`, `itertools`,
 `indexmap`, `bitflags`, `constant_time_eq`, `hmac`.
 
+`indexmap` was measured before being built, and the measurement says not to
+build it as a package. Grasm's `Map` iterates in sorted key order on
+purpose, so insertion order genuinely is unavailable -- but the thing that
+would want an ordered map with fast lookup is `json`, whose `get` is a
+linear scan over parallel key and value arrays.
+
+On a 1000-key object, 20,000 lookups take 0.49s: 24.5us each, which is bad.
+On a 10- to 50-key object -- which is what a configuration file or an API
+response actually is -- a scan of five to twenty-five string comparisons
+beats hashing the key. (The first number measured was 0.55s for the 10-key
+case, which looked like a flat cost and was: 0.45s of it is macOS charging
+for the first execution of a new binary. The same binary run twice is
+0.00s. See `docs/performance.md`.)
+
+So the work is making `json.get` not linear for wide objects, which is a
+change to that package's representation with a real API cost, and not a
+standalone container nobody would wire in. Written down here so the
+measurement does not have to be taken twice.
+
 **Observability (4).** `tracing`, `tracing-subscriber`, `slog`,
 `env_logger` — all above the existing `log`.
 

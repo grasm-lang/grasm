@@ -1,0 +1,19 @@
+// Walks a tree and prints what it found, for `scripts/walkdirtest.sh` to
+// compare against `find`.
+import walkdir
+
+fn main() -> () ! WalkError / {io} {
+    let a = args()
+    let root = a.get(0) ?? "."
+    let limit = (a.get(1) ?? "16").parse_int() ?? 16
+    let w = try walkdir.walk(root, limit)
+    print("files {w.files.len()}")
+    for f in w.files {
+        print("F {f}")
+    }
+    print("dirs {w.dirs.len()}")
+    for d in w.dirs {
+        print("D {d}")
+    }
+    print("hit_limit {w.hit_limit}")
+}

@@ -1,0 +1,6 @@
+[package]
+name = "walkdir"
+version = "1.0.0"
+
+# Reading a directory tree is `io`, and the caller's ceiling has to say so.
+capabilities = ["io"]

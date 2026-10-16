@@ -1,0 +1,8 @@
+[package]
+name = "walkdir_demo"
+version = "1.0.0"
+capabilities = ["io"]
+
+[dependencies.walkdir]
+path = "../walkdir"
+version = "^1.0.0"

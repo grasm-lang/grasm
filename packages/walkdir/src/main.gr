@@ -1,0 +1,256 @@
+// Walk a directory tree.
+//
+// `list_dir` gives one directory's names. This gives every path under a
+// root, in a deterministic order, with files and directories told apart.
+//
+// ## A symlink loop is bounded, not detected
+//
+// This is the part a caller must know. The runtime offers no way to ask
+// whether a path is a symbolic link -- there is no `lstat`, no `read_link`,
+// and `list_dir` follows a link to a directory without saying it did. So a
+// link pointing at its own parent produces an unbounded descent, and each
+// step has a *different* path, which means remembering visited paths does
+// not stop it either.
+//
+// The defence is therefore a depth limit, and it is not optional: `walk`
+// takes one and stops there, reporting that it stopped. A caller who sees
+// `hit_limit` on a tree they expected to be shallow has found a loop.
+//
+// Detecting the loop properly needs the inode of each directory, which
+// needs `stat`. That is a runtime addition, and until it exists a limit is
+// the honest answer rather than a walk that hangs.
+//
+// ## Order is deterministic
+//
+// The two result lists are sorted before they are answered, so two runs
+// over an unchanged tree produce byte-identical output -- which is what
+// makes a walk usable in a gate.
+//
+// The order the tree is *descended* in is deliberately not promised. An
+// earlier version sorted each directory's names as well, and the comment
+// here claimed the descent order was what callers saw. Removing that sort
+// changed no output at all, because the final sort already decides it: the
+// claim was describing a design this did not have. Anything that streamed
+// results instead of collecting them would need the descent ordered, and
+// would need this comment changed with it.
+
+type WalkError =
+    | Unreadable(path: str)
+    | BadLimit(depth: i64)
+
+/// What a walk found.
+type Walk = {
+    /// Every file, root-relative paths joined to the root as given.
+    files: [str],
+    /// Every directory below the root, not including the root itself.
+    dirs: [str],
+    /// True when the depth limit stopped the descent, which on a tree that
+    /// should be shallow means a symlink loop.
+    hit_limit: bool,
+}
+
+/// Whether a path is a directory.
+///
+/// Asked by listing it, because that is what the runtime offers. The answer
+/// costs a directory read, which a walk is about to do anyway.
+pub fn is_dir(path: str) -> bool / {io} {
+    match list_dir(path) {
+        Ok(_items) -> true
+        Err(_e) -> false
+    }
+}
+
+fn join(dir: str, name: str) -> str {
+    if dir == "" {
+        return name
+    }
+    if dir.ends_with("/") {
+        return "{dir}{name}"
+    }
+    "{dir}/{name}"
+}
+
+/// Every path under `root`, to a depth of at most `limit`.
+///
+/// A `limit` of 1 reports the root's own entries and descends no further.
+/// Zero or negative is refused rather than treated as unlimited: a walk
+/// with no limit is the thing this type exists to prevent.
+pub fn walk(root: str, limit: i64) -> Walk ! WalkError / {io} {
+    if limit < 1 {
+        fail(BadLimit(limit))
+    }
+    match list_dir(root) {
+        Err(_e) -> fail(Unreadable(root))
+        Ok(_items) -> {}
+    }
+    var out = Walk{ files: [], dirs: [], hit_limit: false }
+    // An explicit stack rather than recursion: a deep tree would otherwise
+    // be bounded by the call stack instead of by `limit`, and the two are
+    // not the same number.
+    var pending: [str] = [root]
+    var depths: [i64] = [0]
+    while pending.len() > 0 {
+        let here = pending.pop() ?? ""
+        let depth = depths.pop() ?? 0
+        let names = list_dir(here) ?? []
+        var subdirs: [str] = []
+        for name in names {
+            let full = join(here, name)
+            if is_dir(full) {
+                out.dirs.push(full)
+                subdirs.push(full)
+            } else {
+                out.files.push(full)
+            }
+        }
+        if depth + 1 >= limit {
+            if subdirs.len() > 0 {
+                out.hit_limit = true
+            }
+        } else {
+            // Pushed in reverse so the stack pops them in sorted order.
+            var i = subdirs.len() - 1
+            while i >= 0 {
+                pending.push(subdirs.get(i).unwrap_or(""))
+                depths.push(depth + 1)
+                i = i - 1
+            }
+        }
+    }
+    out.files.sort()
+    out.dirs.sort()
+    out
+}
+
+/// Only the files, which is what most callers want.
+pub fn files(root: str, limit: i64) -> [str] ! WalkError / {io} {
+    let w = try walk(root, limit)
+    w.files
+}
+
+/// Files whose name ends with `suffix`.
+///
+/// A plain suffix test, not a glob: `packages/glob` is the one that matches
+/// patterns, and a function called `files_with` that quietly accepted `*`
+/// would be the worse of two spellings.
+pub fn files_ending(root: str, limit: i64, suffix: str) -> [str] ! WalkError / {io} {
+    let all = try files(root, limit)
+    var kept: [str] = []
+    for f in all {
+        if f.ends_with(suffix) {
+            kept.push(f)
+        }
+    }
+    kept
+}
+
+test "a depth limit below one is refused" {
+    // Zero would read as "no limit", which is the one thing this must not
+    // mean: without a limit a symlink loop never returns.
+    for bad in [0, 0 - 1, 0 - 100] {
+        match walk(".", bad) {
+            Ok(_w) -> assert(false)
+            Err(_e) -> assert(true)
+        }
+    }
+}
+
+test "a path that is not a directory is not walked" {
+    match walk("packages/walkdir/grasm.toml", 4) {
+        Ok(_w) -> assert(false)
+        Err(_e) -> assert(true)
+    }
+    match walk("no/such/place/at/all", 4) {
+        Ok(_w) -> assert(false)
+        Err(_e) -> assert(true)
+    }
+}
+
+test "a directory is told from a file" {
+    assert(is_dir("packages"))
+    assert(is_dir("packages/walkdir"))
+    assert(not is_dir("packages/walkdir/grasm.toml"))
+    assert(not is_dir("nothing here"))
+}
+
+test "a walk of this package finds its own source" {
+    match walk("packages/walkdir", 4) {
+        Err(_e) -> assert(false)
+        Ok(w) -> {
+            assert(w.files.len() >= 2)
+            var found_manifest = false
+            var found_source = false
+            for f in w.files {
+                if f.ends_with("grasm.toml") {
+                    found_manifest = true
+                }
+                if f.ends_with("src/main.gr") {
+                    found_source = true
+                }
+            }
+            assert(found_manifest)
+            assert(found_source)
+            // `src` is the one directory below this package.
+            assert_eq(w.dirs.len(), 1)
+            assert(not w.hit_limit)
+        }
+    }
+}
+
+test "a limit of one reads the root and descends no further" {
+    match walk("packages/walkdir", 1) {
+        Err(_e) -> assert(false)
+        Ok(w) -> {
+            // The manifest is at the root; the source is one level down.
+            for f in w.files {
+                assert(f.ends_with("grasm.toml"))
+            }
+            // `src` is seen but not entered, which is what the limit means.
+            assert_eq(w.dirs.len(), 1)
+            assert(w.hit_limit)
+        }
+    }
+}
+
+test "the result is sorted, so two walks agree" {
+    match walk("packages/walkdir", 4) {
+        Err(_e) -> assert(false)
+        Ok(first) -> {
+            match walk("packages/walkdir", 4) {
+                Err(_e) -> assert(false)
+                Ok(second) -> {
+                    assert_eq(first.files.len(), second.files.len())
+                    for i in 0..first.files.len() {
+                        assert_eq(
+                            first.files.get(i).unwrap_or(""),
+                            second.files.get(i).unwrap_or("x"),
+                        )
+                    }
+                    var sorted = true
+                    for i in 1..first.files.len() {
+                        if first.files.get(i - 1).unwrap_or("") > first.files.get(i).unwrap_or("") {
+                            sorted = false
+                        }
+                    }
+                    assert(sorted)
+                }
+            }
+        }
+    }
+}
+
+test "a suffix filter keeps only what ends that way" {
+    match files_ending("packages/walkdir", 4, ".gr") {
+        Err(_e) -> assert(false)
+        Ok(found) -> {
+            assert(found.len() >= 1)
+            for f in found {
+                assert(f.ends_with(".gr"))
+            }
+        }
+    }
+    match files_ending("packages/walkdir", 4, ".nothing") {
+        Err(_e) -> assert(false)
+        Ok(found) -> assert_eq(found.len(), 0)
+    }
+}
