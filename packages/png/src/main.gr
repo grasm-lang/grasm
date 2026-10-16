@@ -19,6 +19,7 @@
 // The Paeth predictor in point 2 is the one worth reading: it picks whichever
 // of left, above and above-left is closest to their linear combination, which
 // is a one-line edge detector that happens to be exactly right for images.
+import deflate
 import zlib
 import crc32
 
@@ -223,7 +224,13 @@ pub fn encode(image: PngImage) -> bytes ! PngError {
         }
         chunk(out, "PLTE", image.palette)
     }
-    chunk(out, "IDAT", zlib.compress_stored(filtered(image)).to_list())
+    // Real DEFLATE, not stored blocks. `zlib.compress_stored` writes a valid
+    // stream that no reader has to guess at -- and compresses nothing, so
+    // every PNG this wrote was larger than the pixels it held. `deflate`
+    // has had a back-reference finder and a Huffman coder the whole time;
+    // this was simply not calling it.
+    let raw = filtered(image)
+    chunk(out, "IDAT", deflate.compress_zlib(raw, zlib.adler32(raw)).to_list())
     chunk(out, "IEND", [])
     return bytes_of(out)
 }
@@ -438,5 +445,98 @@ pub fn filters_used(data: bytes) -> [i64] ! PngError {
             return out
         }
         Err(_e) -> fail(Corrupt("the pixel stream does not inflate"))
+    }
+}
+
+test "a written PNG starts with the signature and ends with IEND" {
+    let img = PngImage{
+        width: 2,
+        height: 2,
+        colour_type: 2,
+        bit_depth: 8,
+        sample: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+        palette: [],
+    }
+    match encode(img) {
+        Err(_e) -> assert(false)
+        Ok(b) -> {
+            // The eight signature bytes are fixed by the format.
+            for pair in [[0, 137], [1, 80], [2, 78], [3, 71], [4, 13], [5, 10], [6, 26], [7, 10]] {
+                assert_eq(b.at(pair.get(0).unwrap_or(0)), pair.get(1).unwrap_or(0))
+            }
+            let tail = b.slice(b.len() - 8, b.len() - 4).to_str()
+            assert_eq(tail, "IEND")
+        }
+    }
+}
+
+test "what is written reads back the same" {
+    var s: [i64] = []
+    for i in 0..(5 * 4 * 3) {
+        s.push((i * 7) % 256)
+    }
+    let img = PngImage{
+        width: 5,
+        height: 4,
+        colour_type: 2,
+        bit_depth: 8,
+        sample: s,
+        palette: [],
+    }
+    match encode(img) {
+        Err(_e) -> assert(false)
+        Ok(b) -> {
+            match decode(b) {
+                Err(_e) -> assert(false)
+                Ok(back) -> {
+                    assert_eq(back.width, 5)
+                    assert_eq(back.height, 4)
+                    assert_eq(back.sample.len(), s.len())
+                    for i in 0..s.len() {
+                        assert_eq(back.sample.get(i).unwrap_or(0 - 1), s.get(i).unwrap_or(0))
+                    }
+                }
+            }
+        }
+    }
+}
+
+test "a compressible image is smaller than its pixels" {
+    // The check that was missing for this package's whole life. Stored
+    // DEFLATE blocks are valid PNG and every reader accepts them, so a round
+    // trip passes while each file comes out *larger* than the samples in it.
+    // Only a size assertion can tell the two apart.
+    var s: [i64] = []
+    for _i in 0..(64 * 64) {
+        s.push(40)
+        s.push(90)
+        s.push(200)
+    }
+    let img = PngImage{
+        width: 64,
+        height: 64,
+        colour_type: 2,
+        bit_depth: 8,
+        sample: s,
+        palette: [],
+    }
+    match encode(img) {
+        Err(_e) -> assert(false)
+        Ok(b) -> assert(b.len() * 4 < s.len())
+    }
+}
+
+test "a palette image needs whole RGB triples" {
+    let img = PngImage{
+        width: 1,
+        height: 1,
+        colour_type: 3,
+        bit_depth: 8,
+        sample: [0],
+        palette: [1, 2],
+    }
+    match encode(img) {
+        Ok(_b) -> assert(false)
+        Err(_e) -> assert(true)
     }
 }

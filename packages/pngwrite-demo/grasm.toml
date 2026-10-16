@@ -1,0 +1,8 @@
+[package]
+name = "pngwrite_demo"
+version = "1.0.0"
+capabilities = ["io"]
+
+[dependencies.png]
+path = "../png"
+version = "^1.0.0"

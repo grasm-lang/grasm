@@ -117,7 +117,7 @@ output change". Grasm has four engines — interpreter, bundle, ahead-of-time
 native, and wasm — and the interpreter is <em>normative</em>: the specification
 is written against it and the other three have to match it byte for byte on
 stdout, exit code and diagnostics.</p>
-<p>That turns a test suite into an oracle. All 524 standalone
+<p>That turns a test suite into an oracle. All 525 standalone
 programs in the corpus run through the interpreter, the bundle and the native
 build and are compared on every build; the last recorded run of that gate
 covered 511 of them. 415 also run in the browser engine

@@ -1,0 +1,109 @@
+// Writes PNGs for `scripts/pngwritetest.sh`, which reads them back with
+// Pillow rather than with `packages/png` -- a decoder agreeing with the
+// encoder that wrote it proves neither one right.
+//
+// The shapes are chosen for what they make the DEFLATE coder do: a flat
+// fill is one long back-reference, a gradient is mostly literals, noise
+// cannot be compressed at all, and a repeated tile is back-references at a
+// fixed distance.
+import png
+
+fn flat(w: i64, h: i64) -> [i64] {
+    var s: [i64] = []
+    for _i in 0..(w * h) {
+        s.push(40)
+        s.push(90)
+        s.push(200)
+    }
+    s
+}
+
+fn gradient(w: i64, h: i64) -> [i64] {
+    // A one-pixel-wide or one-row image makes the span zero, and dividing by
+    // it panics. `row.png` is exactly that case and found it.
+    let wspan = if w > 1 { w - 1 } else { 1 }
+    let hspan = if h > 1 { h - 1 } else { 1 }
+    var s: [i64] = []
+    for y in 0..h {
+        for x in 0..w {
+            s.push(x * 255 / wspan)
+            s.push(y * 255 / hspan)
+            s.push((x + y) % 256)
+        }
+    }
+    s
+}
+
+/// A pseudo-random field, so the coder has nothing to find.
+fn noise(w: i64, h: i64) -> [i64] {
+    var s: [i64] = []
+    var seed = 12345
+    for _i in 0..(w * h * 3) {
+        seed = (seed * 1103515245 + 12345).bit_and(2147483647)
+        s.push(seed.shr(16).bit_and(255))
+    }
+    s
+}
+
+fn tiled(w: i64, h: i64) -> [i64] {
+    var s: [i64] = []
+    for y in 0..h {
+        for x in 0..w {
+            let on = (x / 8 + y / 8) % 2 == 0
+            s.push(if on { 230 } else { 20 })
+            s.push(if on { 180 } else { 60 })
+            s.push(if on { 10 } else { 140 })
+        }
+    }
+    s
+}
+
+fn grey(w: i64, h: i64) -> [i64] {
+    var s: [i64] = []
+    for y in 0..h {
+        for x in 0..w {
+            s.push((x * y) % 256)
+        }
+    }
+    s
+}
+
+fn write_one(path: str, w: i64, h: i64, kind: str) -> () ! PngError / {io} {
+    var colour = 2
+    var samples = flat(w, h)
+    if kind == "gradient" {
+        samples = gradient(w, h)
+    } else if kind == "noise" {
+        samples = noise(w, h)
+    } else if kind == "tiled" {
+        samples = tiled(w, h)
+    } else if kind == "grey" {
+        colour = 0
+        samples = grey(w, h)
+    }
+    let img = PngImage{
+        width: w,
+        height: h,
+        colour_type: colour,
+        bit_depth: 8,
+        sample: samples,
+        palette: [],
+    }
+    let encoded = try png.encode(img)
+    match write_bytes(path, encoded) {
+        Err(_e) -> print("could not write {path}")
+        Ok(_n) -> print("{kind} {w} {h} {encoded.len()} {samples.len()}")
+    }
+}
+
+fn main() -> () ! PngError / {io} {
+    let a = args()
+    let dir = a.get(0) ?? "."
+    try write_one("{dir}/flat.png", 64, 64, "flat")
+    try write_one("{dir}/gradient.png", 64, 48, "gradient")
+    try write_one("{dir}/noise.png", 48, 48, "noise")
+    try write_one("{dir}/tiled.png", 64, 64, "tiled")
+    try write_one("{dir}/grey.png", 40, 32, "grey")
+    try write_one("{dir}/one.png", 1, 1, "flat")
+    try write_one("{dir}/row.png", 97, 1, "gradient")
+}
