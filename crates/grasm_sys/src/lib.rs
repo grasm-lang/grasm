@@ -1465,6 +1465,53 @@ pub mod net {
         family: i32,
     }
 
+    /// Every address a name resolves to, in the order the resolver gave them.
+    ///
+    /// `getaddrinfo` answers a *list*, and which entry comes first is the
+    /// system's business: on macOS `localhost` is `::1` and then
+    /// `127.0.0.1`. A caller that takes the first and stops cannot reach a
+    /// server listening on the second, which is every IPv4-only service on
+    /// a machine whose resolver prefers IPv6 -- `connect_to` did exactly
+    /// that and could not reach a local HTTPS server at all.
+    pub fn resolve_all(host: &str, port: u16) -> Result<Vec<Addr>> {
+        let (h, p) = (c_str(host), c_str(&alloc::format!("{port}")));
+        let hint = AddrInfo {
+            flags: 0,
+            family: 0,
+            socktype: SOCK_STREAM,
+            protocol: 0,
+            addrlen: 0,
+            addr: core::ptr::null(),
+            canonname: core::ptr::null(),
+            next: core::ptr::null(),
+        };
+        let mut found: *const AddrInfo = core::ptr::null();
+        let r = unsafe { getaddrinfo(h.as_ptr(), p.as_ptr(), &hint, &mut found) };
+        if r != 0 || found.is_null() {
+            // `getaddrinfo` reports through its own return value, not errno.
+            return Err(Error::from_raw_os_error(crate::io::ENOENT));
+        }
+        let mut out = Vec::new();
+        let mut node = found;
+        while !node.is_null() {
+            unsafe {
+                let len = (*node).addrlen as usize;
+                if !(*node).addr.is_null() && len > 0 {
+                    out.push(Addr {
+                        bytes: core::slice::from_raw_parts((*node).addr, len).to_vec(),
+                        family: (*node).family,
+                    });
+                }
+                node = (*node).next;
+            }
+        }
+        unsafe { freeaddrinfo(found) };
+        if out.is_empty() {
+            return Err(Error::from_raw_os_error(crate::io::ENOENT));
+        }
+        Ok(out)
+    }
+
     pub fn resolve(host: &str, port: u16) -> Result<Addr> {
         let (h, p) = (c_str(host), c_str(&alloc::format!("{port}")));
         let hint = AddrInfo {
@@ -1694,20 +1741,47 @@ pub mod net {
         Ok(sock)
     }
 
+    /// Connect to the first address of `host` that accepts.
+    ///
+    /// Every address is tried, not just the first the resolver returned.
+    /// `localhost` on macOS is `::1` and then `127.0.0.1`, and a server
+    /// bound to IPv4 refuses the first -- so stopping there made every
+    /// connection to a local service fail with "connection refused" while
+    /// the service was running and reachable. The error reported when they
+    /// all fail is the last one, which is the one about the address most
+    /// likely to have been right.
     pub fn connect_to(host: &str, port: u16) -> Result<Socket> {
-        let addr = resolve(host, port)?;
-        let sock = open_socket(SOCK_STREAM, addr.family)?;
-        loop {
-            let r = unsafe {
-                connect(sock.fd, addr.bytes.as_ptr(), addr.bytes.len() as u32)
+        let addrs = resolve_all(host, port)?;
+        let mut last = Error::from_raw_os_error(crate::io::ENOENT);
+        for addr in addrs {
+            let sock = match open_socket(SOCK_STREAM, addr.family) {
+                Ok(s) => s,
+                Err(e) => {
+                    // A family the kernel will not give a socket for -- an
+                    // IPv6 address on a host with IPv6 switched off -- is a
+                    // reason to try the next address, not to stop.
+                    last = e;
+                    continue;
+                }
             };
-            if r >= 0 {
-                return Ok(sock);
+            let mut failed = None;
+            loop {
+                let r = unsafe {
+                    connect(sock.fd, addr.bytes.as_ptr(), addr.bytes.len() as u32)
+                };
+                if r >= 0 {
+                    return Ok(sock);
+                }
+                if errno() != EINTR {
+                    failed = Some(Error::last_os_error());
+                    break;
+                }
             }
-            if errno() != EINTR {
-                return Err(Error::last_os_error());
+            if let Some(e) = failed {
+                last = e;
             }
         }
+        Err(last)
     }
 
     pub fn udp_on(host: &str, port: u16) -> Result<Socket> {
@@ -3369,5 +3443,46 @@ mod tests {
         let (code, _out, _err) =
             crate::process::run("sh", &["-c".to_string(), "exit 7".to_string()]).unwrap();
         assert_eq!(code, 7);
+    }
+}
+
+#[cfg(test)]
+mod resolve_tests {
+    use crate::net;
+
+    #[test]
+    fn a_name_resolves_to_every_address_the_system_knows() {
+        // `localhost` is two addresses on any dual-stack machine: `::1` and
+        // `127.0.0.1`. Answering one of them is what made `connect_to`
+        // unable to reach a server listening on the other.
+        let all = net::resolve_all("localhost", 80).expect("localhost resolves");
+        assert!(
+            !all.is_empty(),
+            "localhost resolved to nothing, which means /etc/hosts was not read"
+        );
+    }
+
+    #[test]
+    fn connecting_to_localhost_reaches_an_ipv4_only_listener() {
+        // The regression this guards: a listener bound to 127.0.0.1 only,
+        // reached by the name `localhost`. When the resolver puts `::1`
+        // first -- which macOS does -- taking the first address and stopping
+        // gives "connection refused" against a server that is running.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let accepted = std::thread::spawn(move || listener.accept().is_ok());
+        let sock = net::connect_to("localhost", port);
+        assert!(
+            sock.is_ok(),
+            "could not reach an IPv4 listener by name: {:?}",
+            sock.err()
+        );
+        assert!(accepted.join().expect("thread"), "the listener saw nothing");
+    }
+
+    #[test]
+    fn a_name_that_resolves_to_nothing_is_an_error_not_a_hang() {
+        assert!(net::resolve_all("no-such-host.invalid", 80).is_err());
+        assert!(net::connect_to("no-such-host.invalid", 80).is_err());
     }
 }
