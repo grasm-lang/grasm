@@ -1,0 +1,607 @@
+// A Model Context Protocol server.
+//
+// MCP is JSON-RPC 2.0 with a fixed set of methods. A client connects, both
+// sides say what they can do, and then the client lists and calls what the
+// server offers: **tools** it can run, **resources** it can read, and
+// **prompts** it can fill in.
+//
+// The transport here is stdio: one JSON object a line in, one a line out,
+// which is what a client that launches a server as a subprocess uses. The
+// framing is the part worth stating plainly, because getting it wrong looks
+// like the protocol failing rather than the framing:
+//
+//   * one object a line, and **no newline inside an object** -- so replies
+//     are rendered compact, never pretty-printed;
+//   * a request carries an `id` and gets exactly one reply;
+//   * a **notification** carries no `id` and gets **no reply at all**. A
+//     server that answers one anyway sends a message the client has no
+//     pending request for, and a strict client closes the connection.
+//
+// ## Checked against the real client
+//
+// `scripts/rmcptest.sh` drives this with the official MCP Python SDK -- the
+// same library a real client uses -- over the same stdio transport. It
+// completes the handshake, lists and calls tools, reads resources, gets
+// prompts, and checks that the errors come back as JSON-RPC errors rather
+// than as crashes. An agreement with my own idea of the protocol would prove
+// nothing.
+import json
+
+/// What the server tells a client about itself.
+type McpServer = {
+    name: str,
+    version: str,
+    tools: [McpTool],
+    resources: [McpResource],
+    prompts: [McpPrompt],
+}
+
+/// A tool the client can call.
+///
+/// `run` takes the arguments object and answers the text to return. A tool
+/// that fails answers an error through `McpToolResult.is_error` rather than
+/// through a JSON-RPC error: a tool that ran and refused is not the same as
+/// a method that does not exist, and a client shows them differently --
+/// the first to the model, the second to the user.
+type McpTool = {
+    name: str,
+    description: str,
+    /// A JSON Schema for the arguments, as text, so a caller can write the
+    /// schema the way the spec documents it rather than building it up.
+    schema: str,
+    run: fn(ref Json) -> McpToolResult,
+}
+
+type McpToolResult = {
+    text: str,
+    is_error: bool,
+}
+
+pub fn ok_result(text: str) -> McpToolResult {
+    McpToolResult{ text: text, is_error: false }
+}
+
+pub fn err_result(text: str) -> McpToolResult {
+    McpToolResult{ text: text, is_error: true }
+}
+
+/// Something the client can read by URI.
+type McpResource = {
+    uri: str,
+    name: str,
+    description: str,
+    mime: str,
+    read: fn() -> str,
+}
+
+/// A prompt the client can fetch, filled in from its arguments.
+type McpPrompt = {
+    name: str,
+    description: str,
+    arguments: [McpPromptArg],
+    fill: fn(ref Json) -> str,
+}
+
+type McpPromptArg = {
+    name: str,
+    description: str,
+    required: bool,
+}
+
+/// The handshake revisions this speaks, newest last.
+///
+/// The handshake negotiates among these. Later revisions exist and are
+/// adopted *after* the handshake through capability claims rather than by
+/// naming them here, so a server that answers `initialize` with one of those
+/// is rejected outright -- the official client raises "Unsupported protocol
+/// version from the server" and closes, which is what happened here before
+/// this was a negotiation rather than a constant.
+pub fn supported_versions() -> [str] {
+    ["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"]
+}
+
+/// The newest revision this speaks.
+pub fn protocol_version() -> str {
+    let all = supported_versions()
+    all.get(all.len() - 1).unwrap_or("2025-11-25")
+}
+
+/// Pick the revision to answer `initialize` with.
+///
+/// The spec's rule, and it is not "answer with ours": if the client's
+/// requested revision is one we speak, **echo it back** -- that is the
+/// agreement. Only when it is not do we name our own newest and let the
+/// client decide whether it can live with it.
+pub fn negotiate(requested: str) -> str {
+    for v in supported_versions() {
+        if v == requested {
+            return v
+        }
+    }
+    protocol_version()
+}
+
+// --- JSON-RPC ------------------------------------------------------------
+
+/// The error codes JSON-RPC 2.0 fixes. A client matches on the number, so
+/// these are not ours to choose.
+pub fn parse_error() -> i64 {
+    0 - 32700
+}
+
+pub fn invalid_request() -> i64 {
+    0 - 32600
+}
+
+pub fn method_not_found() -> i64 {
+    0 - 32601
+}
+
+pub fn invalid_params() -> i64 {
+    0 - 32602
+}
+
+pub fn internal_error() -> i64 {
+    0 - 32603
+}
+
+/// A reply carrying a result.
+pub fn reply(id: ref Json, result: ref Json) -> ref Json {
+    json.object(["jsonrpc", "id", "result"], [json.text("2.0"), id, result])
+}
+
+/// A reply carrying an error.
+pub fn reply_error(id: ref Json, code: i64, message: str) -> ref Json {
+    let err = json.object(
+        ["code", "message"],
+        [json.number(code.as_f64()), json.text(message)],
+    )
+    json.object(["jsonrpc", "id", "error"], [json.text("2.0"), id, err])
+}
+
+// --- the methods ---------------------------------------------------------
+
+/// What `initialize` answers.
+fn initialize_result(s: McpServer, requested: str) -> ref Json {
+    // Only the capabilities that are actually backed are announced. A server
+    // that claims `tools` with none of them makes a client offer the model a
+    // list that is always empty.
+    var keys: [str] = []
+    var vals: [ref Json] = []
+    if s.tools.len() > 0 {
+        keys.push("tools")
+        vals.push(json.object(["listChanged"], [json.boolean(false)]))
+    }
+    if s.resources.len() > 0 {
+        keys.push("resources")
+        vals.push(json.object(
+            ["subscribe", "listChanged"],
+            [json.boolean(false), json.boolean(false)],
+        ))
+    }
+    if s.prompts.len() > 0 {
+        keys.push("prompts")
+        vals.push(json.object(["listChanged"], [json.boolean(false)]))
+    }
+    json.object(
+        ["protocolVersion", "capabilities", "serverInfo"],
+        [
+            json.text(negotiate(requested)),
+            json.object(keys, vals),
+            json.object(
+                ["name", "version"],
+                [json.text(s.name), json.text(s.version)],
+            ),
+        ],
+    )
+}
+
+fn tools_list_result(s: McpServer) -> ref Json {
+    var items: [ref Json] = []
+    for t in s.tools {
+        // The schema arrives as text so a caller can write it the way the
+        // spec documents it. Text that does not parse would put a string
+        // where the client expects an object, so it becomes the empty object
+        // instead -- a tool that takes nothing, which is at least valid.
+        var schema = json.object(["type"], [json.text("object")])
+        match json.parse(t.schema) {
+            Ok(v) -> schema = v
+            Err(_e) -> {}
+        }
+        items.push(json.object(
+            ["name", "description", "inputSchema"],
+            [json.text(t.name), json.text(t.description), schema],
+        ))
+    }
+    json.object(["tools"], [json.list(items)])
+}
+
+fn resources_list_result(s: McpServer) -> ref Json {
+    var items: [ref Json] = []
+    for r in s.resources {
+        items.push(json.object(
+            ["uri", "name", "description", "mimeType"],
+            [
+                json.text(r.uri),
+                json.text(r.name),
+                json.text(r.description),
+                json.text(r.mime),
+            ],
+        ))
+    }
+    json.object(["resources"], [json.list(items)])
+}
+
+fn prompts_list_result(s: McpServer) -> ref Json {
+    var items: [ref Json] = []
+    for p in s.prompts {
+        var args: [ref Json] = []
+        for a in p.arguments {
+            args.push(json.object(
+                ["name", "description", "required"],
+                [
+                    json.text(a.name),
+                    json.text(a.description),
+                    json.boolean(a.required),
+                ],
+            ))
+        }
+        items.push(json.object(
+            ["name", "description", "arguments"],
+            [json.text(p.name), json.text(p.description), json.list(args)],
+        ))
+    }
+    json.object(["prompts"], [json.list(items)])
+}
+
+/// A block of text, which is how every one of these returns its content.
+fn text_content(text: str) -> ref Json {
+    json.object(["type", "text"], [json.text("text"), json.text(text)])
+}
+
+fn tool_call_result(r: McpToolResult) -> ref Json {
+    json.object(
+        ["content", "isError"],
+        [json.list([text_content(r.text)]), json.boolean(r.is_error)],
+    )
+}
+
+fn params_of(req: ref Json) -> ref Json {
+    json.get(req, "params") ?? json.object([], [])
+}
+
+fn string_param(params: ref Json, key: str) -> str {
+    json.as_str(json.get(params, key) ?? json.null()) ?? ""
+}
+
+fn arguments_of(params: ref Json) -> ref Json {
+    json.get(params, "arguments") ?? json.object([], [])
+}
+
+// --- dispatch ------------------------------------------------------------
+
+/// Whether a *well-formed* message is a notification, which gets no reply.
+///
+/// JSON-RPC decides this by the absence of `id`, not by the method name. A
+/// server that checks the name instead answers `notifications/initialized`
+/// and sends a message the client has no pending request for.
+///
+/// The order matters and is easy to get backwards: this may only be asked
+/// **after** the message is known to be a valid request. A malformed message
+/// also has no `id`, and a server that checks for a notification first falls
+/// silent on every one of them -- `{}`, a bare array, a bare string, a
+/// number, `null`. The client has a pending request for each and waits for a
+/// reply that never comes, so a protocol error becomes a hang. That is what
+/// this did until a fuzz over malformed lines counted 15 replies to 20
+/// requests.
+pub fn is_notification(req: ref Json) -> bool {
+    json.get(req, "id").is_none()
+}
+
+/// Answer one request. `None` means send nothing, which is the whole of what
+/// a notification is owed.
+pub fn handle(s: McpServer, req: ref Json) -> Option[ref Json] {
+    // Validate the shape before deciding whether anything is owed, because a
+    // malformed message has no `id` either. An invalid request answers under
+    // a null id, which is what the spec says to do when there is no id to
+    // answer under.
+    if json.kind(req) != "object" {
+        return Some(reply_error(
+            json.null(),
+            invalid_request(),
+            "a request must be an object",
+        ))
+    }
+    let id = json.get(req, "id") ?? json.null()
+    if json.as_str(json.get(req, "jsonrpc") ?? json.null()) ?? "" != "2.0" {
+        return Some(reply_error(id, invalid_request(), "jsonrpc must be \"2.0\""))
+    }
+    let named = json.as_str(json.get(req, "method") ?? json.null())
+    if named.is_none() {
+        return Some(reply_error(id, invalid_request(), "a request needs a method"))
+    }
+    if is_notification(req) {
+        return None
+    }
+    let method = named ?? ""
+    if method == "initialize" {
+        let want = string_param(params_of(req), "protocolVersion")
+        return Some(reply(id, initialize_result(s, want)))
+    }
+    if method == "ping" {
+        // An empty result, which is the whole of the reply the spec asks for.
+        return Some(reply(id, json.object([], [])))
+    }
+    if method == "tools/list" {
+        return Some(reply(id, tools_list_result(s)))
+    }
+    if method == "resources/list" {
+        return Some(reply(id, resources_list_result(s)))
+    }
+    if method == "prompts/list" {
+        return Some(reply(id, prompts_list_result(s)))
+    }
+    if method == "resources/templates/list" {
+        // Nothing here is templated, and a client that asks deserves an empty
+        // list rather than "no such method".
+        return Some(reply(id, json.object(["resourceTemplates"], [json.list([])])))
+    }
+    if method == "tools/call" {
+        return Some(call_tool(s, id, params_of(req)))
+    }
+    if method == "resources/read" {
+        return Some(read_resource(s, id, params_of(req)))
+    }
+    if method == "prompts/get" {
+        return Some(get_prompt(s, id, params_of(req)))
+    }
+    Some(reply_error(id, method_not_found(), "no method {method}"))
+}
+
+fn call_tool(s: McpServer, id: ref Json, params: ref Json) -> ref Json {
+    let name = string_param(params, "name")
+    for t in s.tools {
+        if t.name == name {
+            return reply(id, tool_call_result(t.run(arguments_of(params))))
+        }
+    }
+    // A tool that does not exist is the client's mistake about the server, so
+    // it is a JSON-RPC error. A tool that exists and refuses is the model's
+    // mistake about the tool, so it comes back through `isError` where the
+    // model can read it.
+    reply_error(id, invalid_params(), "no tool {name}")
+}
+
+fn read_resource(s: McpServer, id: ref Json, params: ref Json) -> ref Json {
+    let uri = string_param(params, "uri")
+    for r in s.resources {
+        if r.uri == uri {
+            let one = json.object(
+                ["uri", "mimeType", "text"],
+                [json.text(r.uri), json.text(r.mime), json.text(r.read())],
+            )
+            return reply(id, json.object(["contents"], [json.list([one])]))
+        }
+    }
+    reply_error(id, invalid_params(), "no resource {uri}")
+}
+
+fn get_prompt(s: McpServer, id: ref Json, params: ref Json) -> ref Json {
+    let name = string_param(params, "name")
+    for p in s.prompts {
+        if p.name == name {
+            let args = arguments_of(params)
+            for a in p.arguments {
+                if a.required and json.get(args, a.name).is_none() {
+                    return reply_error(
+                        id,
+                        invalid_params(),
+                        "prompt {name} needs {a.name}",
+                    )
+                }
+            }
+            let msg = json.object(
+                ["role", "content"],
+                [json.text("user"), text_content(p.fill(args))],
+            )
+            return reply(
+                id,
+                json.object(
+                    ["description", "messages"],
+                    [json.text(p.description), json.list([msg])],
+                ),
+            )
+        }
+    }
+    reply_error(id, invalid_params(), "no prompt {name}")
+}
+
+/// Answer one line of input with one line of output, or `None`.
+///
+/// Separated from the loop so a test can drive it without a subprocess.
+pub fn handle_line(s: McpServer, line: str) -> Option[str] {
+    match json.parse(line) {
+        Err(_e) -> {
+            // Nothing parsed, so there is no `id` to answer under, and the
+            // spec says to use null rather than to stay silent.
+            Some(json.render(reply_error(json.null(), parse_error(), "not JSON")))
+        }
+        Ok(req) -> {
+            match handle(s, req) {
+                None -> None
+                Some(res) -> Some(json.render(res))
+            }
+        }
+    }
+}
+
+/// Serve over stdio until the input ends.
+///
+/// `input()` answers an empty string at end of input. A blank line is never a
+/// valid message on this transport -- the framing is one object a line -- so
+/// the two need not be told apart.
+pub fn serve_stdio(s: McpServer) -> () / {io} {
+    var line = input()
+    while line != "" {
+        match handle_line(s, line) {
+            None -> {}
+            Some(out) -> print(out)
+        }
+        line = input()
+    }
+}
+
+/// A JSON Schema for an object's arguments, as `tools/list` wants it.
+///
+/// `schema` is text because the spec documents schemas as JSON and a caller
+/// with one already written should be able to paste it. Writing one inline in
+/// Grasm is another matter: `{` opens a string interpolation, so every brace
+/// needs escaping and the result is unreadable. This builds the common
+/// shape -- named properties of a primitive type, some of them required --
+/// and renders it.
+pub fn object_schema(names: [str], types: [str], required: [str]) -> str {
+    var keys: [str] = []
+    var vals: [ref Json] = []
+    for i in 0..names.len().min(types.len()) {
+        keys.push(names[i])
+        vals.push(json.object(["type"], [json.text(types[i])]))
+    }
+    var req: [ref Json] = []
+    for r in required {
+        req.push(json.text(r))
+    }
+    json.render(json.object(
+        ["type", "properties", "required"],
+        [json.text("object"), json.object(keys, vals), json.list(req)],
+    ))
+}
+
+// --- tests ---------------------------------------------------------------
+
+fn no_tools() -> McpServer {
+    McpServer{
+        name: "t",
+        version: "0",
+        tools: [],
+        resources: [],
+        prompts: [],
+    }
+}
+
+fn echo_tool(args: ref Json) -> McpToolResult {
+    ok_result(json.as_str(json.get(args, "x") ?? json.null()) ?? "nothing")
+}
+
+fn one_tool() -> McpServer {
+    McpServer{
+        name: "t",
+        version: "0",
+        tools: [
+            McpTool{
+                name: "echo",
+                description: "d",
+                schema: object_schema(["x"], ["string"], ["x"]),
+                run: echo_tool,
+            },
+        ],
+        resources: [],
+        prompts: [],
+    }
+}
+
+fn line_of(s: McpServer, src: str) -> str {
+    handle_line(s, src) ?? "<silent>"
+}
+
+test "a notification is owed no reply" {
+    // The absence of `id` decides this, not the method name.
+    let out = handle_line(
+        one_tool(),
+        "\{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}",
+    )
+    assert(out.is_none())
+}
+
+test "a malformed message is answered, not met with silence" {
+    // Each of these also has no `id`. A server that tests for a notification
+    // before validating falls silent and the client waits forever.
+    for bad in ["[1,2,3]", "\"hello\"", "42", "null", "\{}"] {
+        let out = handle_line(one_tool(), bad)
+        assert(out.is_some())
+    }
+}
+
+test "a line that is not JSON is answered under a null id" {
+    let out = line_of(one_tool(), "\{not json")
+    assert(out.contains("-32700"))
+    assert(out.contains("\"id\":null"))
+}
+
+test "the wrong jsonrpc version is an invalid request" {
+    let out = line_of(one_tool(), "\{\"jsonrpc\":\"1.0\",\"id\":1,\"method\":\"ping\"}")
+    assert(out.contains("-32600"))
+}
+
+test "a method that does not exist says so, and names it" {
+    let out = line_of(one_tool(), "\{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"nope\"}")
+    assert(out.contains("-32601"))
+    assert(out.contains("no method nope"))
+}
+
+test "a tool that does not exist is a protocol error" {
+    // The client is wrong about the server, so the user should see it.
+    let out = line_of(
+        one_tool(),
+        "\{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\","
+        + "\"params\":\{\"name\":\"nope\"}}",
+    )
+    assert(out.contains("-32602"))
+}
+
+test "a tool that ran and refused is a result, not a protocol error" {
+    // The model is wrong about the tool, so the model should see it and
+    // retry. These two are different failures and a client shows them in
+    // different places.
+    let out = line_of(
+        one_tool(),
+        "\{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\","
+        + "\"params\":\{\"name\":\"echo\",\"arguments\":\{\"x\":\"hi\"}}}",
+    )
+    assert(out.contains("\"result\""))
+    assert(out.contains("hi"))
+    assert(not out.contains("\"error\""))
+}
+
+test "the handshake echoes a version the client offered" {
+    // The spec puts the agreement on what the client asked for, when we
+    // speak it. Answering with our own newest regardless is what made the
+    // official client refuse this server outright.
+    assert_eq(negotiate("2025-06-18"), "2025-06-18")
+    assert_eq(negotiate("2024-11-05"), "2024-11-05")
+    // And only then our own newest.
+    assert_eq(negotiate("2026-07-28"), protocol_version())
+    assert_eq(negotiate(""), protocol_version())
+}
+
+test "only the capabilities that are backed are announced" {
+    // A server that claims `tools` with none makes a client offer the model
+    // an empty list.
+    let bare = line_of(no_tools(), "\{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\"}")
+    assert(not bare.contains("\"tools\""))
+    let armed = line_of(one_tool(), "\{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\"}")
+    assert(armed.contains("\"tools\""))
+}
+
+test "a reply never contains a newline" {
+    // The framing is one object a line, so a newline inside one splits it
+    // into two messages and desynchronises everything after it.
+    let out = line_of(one_tool(), "\{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}")
+    assert(not out.contains("\n"))
+}
+
+test "a schema built here is the shape tools/list wants" {
+    let s = object_schema(["a"], ["number"], ["a"])
+    assert(s.contains("\"type\":\"object\""))
+    assert(s.contains("\"properties\""))
+    assert(s.contains("\"required\":[\"a\"]"))
+}

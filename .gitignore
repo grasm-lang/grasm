@@ -18,3 +18,10 @@ __pycache__/
 # into the working tree -- caches, session files, automation logs -- belongs
 # in your own global ignore file rather than this one, which describes the
 # project and not the machine it is built on.
+
+# The MCP SDK, which `scripts/rmcptest.sh` drives the server in
+# `packages/rmcp` against. This one is not machine state -- the gate needs it
+# to run at all -- but it stays out of the tree on purpose: an oracle kept in
+# the repo can be edited until it agrees with us, which is the one thing an
+# oracle must not do. The gate says how to install it.
+.mcpvenv/

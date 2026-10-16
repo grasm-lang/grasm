@@ -1,0 +1,138 @@
+// An MCP server with three tools, a resource and a prompt, driven by the
+// official MCP client in `scripts/rmcptest.sh`.
+import json
+import rmcp
+
+fn arg_num(args: ref Json, key: str) -> Option[f64] {
+    json.as_num(json.get(args, key) ?? json.null())
+}
+
+fn tool_add(args: ref Json) -> McpToolResult {
+    match arg_num(args, "a") {
+        None -> rmcp.err_result("a must be a number")
+        Some(a) -> {
+            match arg_num(args, "b") {
+                None -> rmcp.err_result("b must be a number")
+                Some(b) -> rmcp.ok_result(json.number_text(a + b))
+            }
+        }
+    }
+}
+
+fn tool_divide(args: ref Json) -> McpToolResult {
+    match arg_num(args, "a") {
+        None -> rmcp.err_result("a must be a number")
+        Some(a) -> {
+            match arg_num(args, "b") {
+                None -> rmcp.err_result("b must be a number")
+                Some(b) -> {
+                    // A tool that ran and refused, which the model should see
+                    // and retry -- not a JSON-RPC error, which it should not.
+                    if b == 0.0 {
+                        return rmcp.err_result("cannot divide by zero")
+                    }
+                    rmcp.ok_result(json.number_text(a / b))
+                }
+            }
+        }
+    }
+}
+
+/// ASCII upper-case, over the bytes.
+///
+/// Only ASCII: a byte with the high bit set is part of a multi-byte
+/// character and is copied through untouched, so text outside ASCII comes
+/// back unchanged rather than corrupted. Case outside ASCII is not a byte
+/// operation at all -- it needs the Unicode tables, and a function that
+/// pretends otherwise turns valid text into invalid text.
+fn ascii_upper(s: str) -> str {
+    var b = s.to_bytes()
+    var out = bytes_filled(b.len(), 0)
+    var i = 0
+    while i < b.len() {
+        let c = b.at(i)
+        if c >= 97 and c <= 122 {
+            out.set(i, c - 32)
+        } else {
+            out.set(i, c)
+        }
+        i = i + 1
+    }
+    out.to_str()
+}
+
+fn tool_shout(args: ref Json) -> McpToolResult {
+    let text = json.as_str(json.get(args, "text") ?? json.null()) ?? ""
+    rmcp.ok_result(ascii_upper(text))
+}
+
+fn read_motd() -> str {
+    "every effect this server has is declared where it happens"
+}
+
+fn fill_review(args: ref Json) -> str {
+    let lang = json.as_str(json.get(args, "language") ?? json.null()) ?? "the code"
+    "Review this {lang} for correctness before style."
+}
+
+fn demo_server() -> McpServer {
+    McpServer{
+        name: "grasm-demo",
+        version: "1.0.0",
+        tools: [
+            McpTool{
+                name: "add",
+                description: "Add two numbers.",
+                schema: rmcp.object_schema(
+                    ["a", "b"],
+                    ["number", "number"],
+                    ["a", "b"],
+                ),
+                run: tool_add,
+            },
+            McpTool{
+                name: "divide",
+                description: "Divide one number by another.",
+                schema: rmcp.object_schema(
+                    ["a", "b"],
+                    ["number", "number"],
+                    ["a", "b"],
+                ),
+                run: tool_divide,
+            },
+            McpTool{
+                name: "shout",
+                description: "Upper-case some text.",
+                schema: rmcp.object_schema(["text"], ["string"], ["text"]),
+                run: tool_shout,
+            },
+        ],
+        resources: [
+            McpResource{
+                uri: "grasm://motd",
+                name: "Message of the day",
+                description: "One line, fixed.",
+                mime: "text/plain",
+                read: read_motd,
+            },
+        ],
+        prompts: [
+            McpPrompt{
+                name: "review",
+                description: "Ask for a correctness-first review.",
+                arguments: [
+                    McpPromptArg{
+                        name: "language",
+                        description: "The language the code is in.",
+                        required: true,
+                    },
+                ],
+                fill: fill_review,
+            },
+        ],
+    }
+}
+
+fn main() -> () / {io} {
+    rmcp.serve_stdio(demo_server())
+}

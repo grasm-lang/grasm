@@ -1,0 +1,12 @@
+[package]
+name = "rmcp_demo"
+version = "1.0.0"
+capabilities = ["io"]
+
+[dependencies.rmcp]
+path = "../rmcp"
+version = "^1.0.0"
+
+[dependencies.json]
+path = "../json"
+version = "^1.0.0"

@@ -1,0 +1,11 @@
+[package]
+name = "rmcp"
+version = "1.0.0"
+
+# A server reads requests and writes replies; what a tool does is the
+# caller's effect, declared where the tool is written, not here.
+capabilities = ["io"]
+
+[dependencies.json]
+path = "../json"
+version = "^1.0.0"
