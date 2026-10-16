@@ -6,7 +6,14 @@ audit, in the same shape as `docs/ecosystem.md`, because the same thing is
 true again — it is a good list, and planning against it without counting
 first would have produced a year of work that was already done.
 
-**There are 780 packages.** Against the 200:
+**There are 667 packages**, plus 203 `-demo` directories that exist to be
+run by the gates rather than imported. (An earlier draft of this document
+said 780. That number came from stripping `-demo` from every directory name
+and counting what was left, which counts a demo whose base name is not a
+package as though it were one. `scripts/site.py` counts the manifests, and
+667 is what it has always said.)
+
+Against the 200:
 
 | | count | what it means |
 |---|---|---|
