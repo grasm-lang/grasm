@@ -1,0 +1,352 @@
+// Suffix arrays, built in linear time, and substring search over them --
+// Go's `index/suffixarray`, plus the LCP array.
+//
+// A suffix array is every suffix of a text, sorted, held as the positions
+// where they start. Once built, every occurrence of any pattern is one
+// contiguous run of it, found by two binary searches -- so a text searched
+// many times is searched in `O(m log n)` per pattern instead of `O(n)`. It
+// is what `bzip2`'s transform, genome aligners, `grep`-like indexes over a
+// large file and plagiarism detectors are built on.
+//
+// ## SA-IS, not sorting
+//
+// Sorting the suffixes with a comparison sort is `O(n² log n)` in the worst
+// case -- a text of one repeated byte -- and that case is common in real
+// data. This is SA-IS (Nong, Zhang and Chan, 2009): classify each position
+// as smaller or larger than the one after it, sort only the positions where
+// that changes, and induce the rest in two sweeps. Linear in the length,
+// whatever the text.
+//
+// The array is unique for a given text, so it is checked against the
+// definition -- every suffix, sorted -- and `lookup` against Go's.
+
+type SuffixIndex = {
+    data: bytes,
+    sa: [i64],
+}
+
+fn naive(s: [i64]) -> [i64] {
+    let n = s.len()
+    var sa: [i64] = []
+    for i in 0..n {
+        sa.push(i)
+    }
+    // Insertion sort by suffix: only used below ten elements.
+    var i = 1
+    while i < n {
+        let v = sa[i]
+        var j = i - 1
+        while j >= 0 and suffix_less(s, v, sa[j]) {
+            sa[j + 1] = sa[j]
+            j = j - 1
+        }
+        sa[j + 1] = v
+        i = i + 1
+    }
+    sa
+}
+
+fn suffix_less(s: [i64], a: i64, b: i64) -> bool {
+    var i = a
+    var j = b
+    while i < s.len() and j < s.len() {
+        if s[i] != s[j] {
+            return s[i] < s[j]
+        }
+        i = i + 1
+        j = j + 1
+    }
+    i == s.len()
+}
+
+/// The induced sort: LMS positions in the order given, then L positions
+/// from the left, then S positions from the right.
+fn induce(s: [i64], ls: [bool], sum_s: [i64], sum_l: [i64], lms: [i64]) -> [i64] {
+    let n = s.len()
+    var sa: [i64] = []
+    for _ in 0..n {
+        sa.push(-1)
+    }
+    var buf = sum_s
+    for d in lms {
+        if d == n {
+            continue
+        }
+        sa[buf[s[d]]] = d
+        buf[s[d]] = buf[s[d]] + 1
+    }
+    buf = sum_l
+    sa[buf[s[n - 1]]] = n - 1
+    buf[s[n - 1]] = buf[s[n - 1]] + 1
+    for i in 0..n {
+        let v = sa[i]
+        if v >= 1 and not ls[v - 1] {
+            sa[buf[s[v - 1]]] = v - 1
+            buf[s[v - 1]] = buf[s[v - 1]] + 1
+        }
+    }
+    buf = sum_l
+    var i = n - 1
+    while i >= 0 {
+        let v = sa[i]
+        if v >= 1 and ls[v - 1] {
+            let c = s[v - 1] + 1
+            buf[c] = buf[c] - 1
+            sa[buf[c]] = v - 1
+        }
+        i = i - 1
+    }
+    sa
+}
+
+/// `ls[i]`: the suffix at `i` is smaller than the one at `i + 1` (S-type).
+/// The last suffix is larger than the empty one after it (L-type).
+fn classify(s: [i64]) -> [bool] {
+    let n = s.len()
+    var ls: [bool] = []
+    for _ in 0..n {
+        ls.push(false)
+    }
+    var i = n - 2
+    while i >= 0 {
+        ls[i] = if s[i] == s[i + 1] { ls[i + 1] } else { s[i] < s[i + 1] }
+        i = i - 1
+    }
+    ls
+}
+
+/// Where each symbol's bucket starts, for the S-type and L-type passes.
+fn buckets(s: [i64], ls: [bool], upper: i64) -> ([i64], [i64]) {
+    var sum_l: [i64] = []
+    var sum_s: [i64] = []
+    for _ in 0..upper + 1 {
+        sum_l.push(0)
+        sum_s.push(0)
+    }
+    for k in 0..s.len() {
+        if not ls[k] {
+            sum_s[s[k]] = sum_s[s[k]] + 1
+        } else {
+            sum_l[s[k] + 1] = sum_l[s[k] + 1] + 1
+        }
+    }
+    for c in 0..upper + 1 {
+        sum_s[c] = sum_s[c] + sum_l[c]
+        if c < upper {
+            sum_l[c + 1] = sum_l[c + 1] + sum_s[c]
+        }
+    }
+    (sum_s, sum_l)
+}
+
+/// Whether the LMS substrings starting at `l` and `r` are equal.
+fn same_lms(s: [i64], lms: [i64], lms_map: [i64], left: i64, right: i64) -> bool {
+    let n = s.len()
+    let m = lms.len()
+    var l = left
+    var r = right
+    let end_l = if lms_map[l] + 1 < m { lms[lms_map[l] + 1] } else { n }
+    let end_r = if lms_map[r] + 1 < m { lms[lms_map[r] + 1] } else { n }
+    if end_l - l != end_r - r {
+        return false
+    }
+    while l < end_l {
+        if s[l] != s[r] {
+            break
+        }
+        l = l + 1
+        r = r + 1
+    }
+    not (l == n or s[l] != s[r])
+}
+
+/// The reduced string: each LMS substring named by its rank among the
+/// distinct ones, in text order, and the largest name.
+fn reduce(s: [i64], sa: [i64], lms: [i64], lms_map: [i64]) -> ([i64], i64) {
+    let m = lms.len()
+    var sorted: [i64] = []
+    for v in sa {
+        if lms_map[v] != -1 {
+            sorted.push(v)
+        }
+    }
+    var rec: [i64] = []
+    for _ in 0..m {
+        rec.push(0)
+    }
+    var rec_upper = 0
+    for k in 1..m {
+        if not same_lms(s, lms, lms_map, sorted[k - 1], sorted[k]) {
+            rec_upper = rec_upper + 1
+        }
+        rec[lms_map[sorted[k]]] = rec_upper
+    }
+    (rec, rec_upper)
+}
+
+/// SA-IS over symbols in `0..=upper`.
+fn sa_is(s: [i64], upper: i64) -> [i64] {
+    let n = s.len()
+    if n == 0 {
+        return []
+    }
+    if n == 1 {
+        return [0]
+    }
+    if n < 10 {
+        return naive(s)
+    }
+    let ls = classify(s)
+    let sums = buckets(s, ls, upper)
+    var lms_map: [i64] = []
+    for _ in 0..n + 1 {
+        lms_map.push(-1)
+    }
+    var lms: [i64] = []
+    for k in 1..n {
+        if not ls[k - 1] and ls[k] {
+            lms_map[k] = lms.len()
+            lms.push(k)
+        }
+    }
+    let sa = induce(s, ls, sums.0, sums.1, lms)
+    if lms.len() == 0 {
+        return sa
+    }
+    let reduced = reduce(s, sa, lms, lms_map)
+    let rec_sa = sa_is(reduced.0, reduced.1)
+    var sorted: [i64] = []
+    for k in 0..lms.len() {
+        sorted.push(lms[rec_sa[k]])
+    }
+    induce(s, ls, sums.0, sums.1, sorted)
+}
+
+/// The suffix array of `data`: `sa[k]` is where the `k`-th smallest suffix
+/// begins. A shorter suffix sorts before a longer one it is a prefix of.
+pub fn suffix_array(data: bytes) -> [i64] {
+    sa_is(data.to_list(), 255)
+}
+
+/// `suffixarray.New`: the index, ready to be searched.
+pub fn new_index(data: bytes) -> SuffixIndex {
+    SuffixIndex{ data: data, sa: suffix_array(data) }
+}
+
+/// -1, 0 or 1: the suffix at `at` against the pattern, comparing only as
+/// far as the pattern goes -- so a suffix that starts with the pattern is 0.
+fn compare_prefix(data: bytes, at: i64, pattern: bytes) -> i64 {
+    var k = 0
+    while k < pattern.len() {
+        if at + k >= data.len() {
+            return -1
+        }
+        let a = data.at(at + k)
+        let b = pattern.at(k)
+        if a != b {
+            return if a < b { -1 } else { 1 }
+        }
+        k = k + 1
+    }
+    0
+}
+
+/// Where in the array the run of suffixes starting with `pattern` begins
+/// and ends.
+pub fn range_of(idx: SuffixIndex, pattern: bytes) -> (i64, i64) {
+    var lo = 0
+    var hi = idx.sa.len()
+    while lo < hi {
+        let mid = (lo + hi) / 2
+        if compare_prefix(idx.data, idx.sa[mid], pattern) < 0 {
+            lo = mid + 1
+        } else {
+            hi = mid
+        }
+    }
+    let start = lo
+    hi = idx.sa.len()
+    while lo < hi {
+        let mid = (lo + hi) / 2
+        if compare_prefix(idx.data, idx.sa[mid], pattern) <= 0 {
+            lo = mid + 1
+        } else {
+            hi = mid
+        }
+    }
+    (start, lo)
+}
+
+/// `Lookup(pattern, n)`: up to `n` positions where `pattern` occurs, every
+/// one when `n` is negative, in suffix order rather than text order. An
+/// empty pattern, or `n` of zero, finds nothing, as in Go.
+pub fn lookup(idx: SuffixIndex, pattern: bytes, n: i64) -> [i64] {
+    var out: [i64] = []
+    if pattern.len() == 0 or n == 0 {
+        return out
+    }
+    let r = range_of(idx, pattern)
+    var k = r.0
+    while k < r.1 and (n < 0 or out.len() < n) {
+        out.push(idx.sa[k])
+        k = k + 1
+    }
+    out
+}
+
+/// How many times `pattern` occurs, overlaps included.
+pub fn count(idx: SuffixIndex, pattern: bytes) -> i64 {
+    if pattern.len() == 0 {
+        return 0
+    }
+    let r = range_of(idx, pattern)
+    r.1 - r.0
+}
+
+/// The LCP array (Kasai et al.): `lcp[k]` is the length of the common
+/// prefix of the suffixes at `sa[k - 1]` and `sa[k]`, and `lcp[0]` is 0.
+/// Linear time.
+pub fn lcp_array(data: bytes, sa: [i64]) -> [i64] {
+    let n = sa.len()
+    var rank: [i64] = []
+    var lcp: [i64] = []
+    for _ in 0..n {
+        rank.push(0)
+        lcp.push(0)
+    }
+    for k in 0..n {
+        rank[sa[k]] = k
+    }
+    var h = 0
+    for i in 0..n {
+        if rank[i] > 0 {
+            let j = sa[rank[i] - 1]
+            while i + h < n and j + h < n and data.at(i + h) == data.at(j + h) {
+                h = h + 1
+            }
+            lcp[rank[i]] = h
+            if h > 0 {
+                h = h - 1
+            }
+        } else {
+            h = 0
+        }
+    }
+    lcp
+}
+
+/// The longest substring that occurs at least twice, as (start, length);
+/// (0, 0) when nothing repeats.
+pub fn longest_repeat(data: bytes) -> (i64, i64) {
+    let sa = suffix_array(data)
+    let lcp = lcp_array(data, sa)
+    var best = 0
+    var at = 0
+    for k in 1..lcp.len() {
+        if lcp[k] > best {
+            best = lcp[k]
+            at = sa[k]
+        }
+    }
+    (at, best)
+}

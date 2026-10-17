@@ -1,0 +1,358 @@
+// Elastic tabstops: Go's `text/tabwriter`.
+//
+// Text whose cells are ended by tabs is laid out so the cells of a column
+// line up, with each column as wide as its widest cell plus padding. It is
+// what `go doc`, `kubectl get`, `docker ps` and `gofmt`'s alignment of
+// comments use, and it differs from a table printer in one way that is the
+// whole point: **a column is only as tall as the run of lines that have
+// it.** A line with fewer cells ends the column block above it, so the
+// alignment of one paragraph does not leak into the next. That rule --
+// Nick Gravgaard's, as Go implements it -- is the part a hand-rolled
+// version gets wrong, and this follows Go's `format` exactly to get it
+// right.
+//
+// The details are Go's:
+//
+// - A cell is ended by `\t`, or by `\v` -- the same, except a column of
+//   only `\v`-ended empty cells may be discarded. `\n` ends a line; a line
+//   with a single cell ends every column block. `\f` ends a line and
+//   flushes, which ends every block too.
+// - Widths count runes, not bytes, and a byte that is not part of valid
+//   UTF-8 counts as one.
+// - Text between two `0xff` bytes is escaped: its tabs are not cell
+//   boundaries, and its width is its own. With `FilterHTML`, a `<…>` tag is
+//   zero wide and an `&…;` entity is one.
+// - The last cell of a line is not part of any column, so it is never
+//   padded, and the text after the last newline comes out as it went in.
+//
+// The writer takes the whole input and returns the whole output, which is
+// what Go's `Write` followed by `Flush` produces however the writes were
+// split.
+
+type TabConfig = {
+    minwidth: i64,
+    tabwidth: i64,
+    padding: i64,
+    padchar: i64,
+    flags: i64,
+}
+
+type TabCell = {
+    size: i64,
+    width: i64,
+    htab: bool,
+}
+
+/// Go's flag bits, by Go's names.
+pub fn filter_html() -> i64 { 1 }
+pub fn strip_escape() -> i64 { 2 }
+pub fn align_right() -> i64 { 4 }
+pub fn discard_empty_columns() -> i64 { 8 }
+pub fn tab_indent() -> i64 { 16 }
+pub fn debug() -> i64 { 32 }
+
+fn escape_byte() -> i64 { 255 }
+
+/// `tabwriter.NewWriter`'s settings. A tab as the padding character turns
+/// off right alignment, as in Go, since tabs cannot pad on the left.
+pub fn config(minwidth: i64, tabwidth: i64, padding: i64, padchar: i64, flags: i64) -> TabConfig {
+    var f = flags
+    if padchar == 9 and f.bit_and(align_right()) != 0 {
+        f = f - align_right()
+    }
+    TabConfig{ minwidth: minwidth, tabwidth: tabwidth, padding: padding, padchar: padchar, flags: f }
+}
+
+type TabState = {
+    cfg: TabConfig,
+    buf: [i64],
+    pos: i64,
+    cell: TabCell,
+    end_char: i64,
+    lines: [[TabCell]],
+    widths: [i64],
+    out: [i64],
+}
+
+fn empty_cell() -> TabCell {
+    TabCell{ size: 0, width: 0, htab: false }
+}
+
+fn has_flag(st: TabState, f: i64) -> bool {
+    st.cfg.flags.bit_and(f) != 0
+}
+
+fn reset(inout st: TabState) {
+    st.buf = []
+    st.pos = 0
+    st.cell = empty_cell()
+    st.end_char = 0
+    st.lines = [[]]
+    st.widths = []
+}
+
+/// `utf8.RuneCount`: a byte outside a complete sequence counts once.
+fn rune_count(b: [i64], from: i64, end: i64) -> i64 {
+    var n = 0
+    var i = from
+    while i < end {
+        let c = b[i]
+        var w = 1
+        if c >= 194 and c <= 244 {
+            let need = if c < 224 { 2 } else if c < 240 { 3 } else { 4 }
+            let lo = if c == 224 { 160 } else if c == 240 { 144 } else { 128 }
+            let hi = if c == 237 { 159 } else if c == 244 { 143 } else { 191 }
+            var ok = i + need <= end
+            if ok {
+                ok = b[i + 1] >= lo and b[i + 1] <= hi
+                var k = 2
+                while ok and k < need {
+                    ok = b[i + k] >= 128 and b[i + k] <= 191
+                    k = k + 1
+                }
+            }
+            if ok {
+                w = need
+            }
+        }
+        n = n + 1
+        i = i + w
+    }
+    n
+}
+
+fn append_text(inout st: TabState, text: bytes, from: i64, end: i64) {
+    var i = from
+    while i < end {
+        st.buf.push(text.at(i))
+        i = i + 1
+    }
+    st.cell.size = st.cell.size + (end - from)
+}
+
+fn update_width(inout st: TabState) {
+    st.cell.width = st.cell.width + rune_count(st.buf, st.pos, st.buf.len())
+    st.pos = st.buf.len()
+}
+
+fn start_escape(inout st: TabState, ch: i64) {
+    if ch == escape_byte() {
+        st.end_char = escape_byte()
+    } else if ch == 60 {
+        st.end_char = 62
+    } else if ch == 38 {
+        st.end_char = 59
+    }
+}
+
+fn end_escape(inout st: TabState) {
+    if st.end_char == escape_byte() {
+        update_width(st)
+        if not has_flag(st, strip_escape()) {
+            st.cell.width = st.cell.width - 2
+        }
+    } else if st.end_char == 59 {
+        st.cell.width = st.cell.width + 1
+    }
+    st.pos = st.buf.len()
+    st.end_char = 0
+}
+
+fn terminate_cell(inout st: TabState, htab: bool) -> i64 {
+    st.cell.htab = htab
+    let last = st.lines.len() - 1
+    var line = st.lines[last]
+    line.push(st.cell)
+    st.lines[last] = line
+    st.cell = empty_cell()
+    line.len()
+}
+
+fn write_n(inout st: TabState, ch: i64, n: i64) {
+    var k = 0
+    while k < n {
+        st.out.push(ch)
+        k = k + 1
+    }
+}
+
+fn write_padding(inout st: TabState, textw: i64, cellw: i64, use_tabs: bool) {
+    if st.cfg.padchar == 9 or use_tabs {
+        if st.cfg.tabwidth == 0 {
+            return
+        }
+        let tw = st.cfg.tabwidth
+        let rounded = (cellw + tw - 1) / tw * tw
+        let n = rounded - textw
+        write_n(st, 9, (n + tw - 1) / tw)
+        return
+    }
+    write_n(st, st.cfg.padchar, cellw - textw)
+}
+
+fn write_lines(inout st: TabState, pos0: i64, line0: i64, line1: i64) -> i64 {
+    var pos = pos0
+    var i = line0
+    while i < line1 {
+        let line = st.lines[i]
+        var use_tabs = has_flag(st, tab_indent())
+        var j = 0
+        while j < line.len() {
+            let c = line[j]
+            if j > 0 and has_flag(st, debug()) {
+                st.out.push(124)
+            }
+            if c.size == 0 {
+                if j < st.widths.len() {
+                    write_padding(st, c.width, st.widths[j], use_tabs)
+                }
+            } else {
+                use_tabs = false
+                if not has_flag(st, align_right()) {
+                    var k = 0
+                    while k < c.size {
+                        st.out.push(st.buf[pos + k])
+                        k = k + 1
+                    }
+                    pos = pos + c.size
+                    if j < st.widths.len() {
+                        write_padding(st, c.width, st.widths[j], false)
+                    }
+                } else {
+                    if j < st.widths.len() {
+                        write_padding(st, c.width, st.widths[j], false)
+                    }
+                    var k = 0
+                    while k < c.size {
+                        st.out.push(st.buf[pos + k])
+                        k = k + 1
+                    }
+                    pos = pos + c.size
+                }
+            }
+            j = j + 1
+        }
+        if i + 1 == st.lines.len() {
+            var k = 0
+            while k < st.cell.size {
+                st.out.push(st.buf[pos + k])
+                k = k + 1
+            }
+            pos = pos + st.cell.size
+        } else {
+            st.out.push(10)
+        }
+        i = i + 1
+    }
+    pos
+}
+
+/// Go's `format`: find each column block, give it the width of its widest
+/// cell, and recurse into the lines that have a column further right.
+fn format_block(inout st: TabState, pos0: i64, start: i64, line1: i64) -> i64 {
+    var pos = pos0
+    var line0 = start
+    let column = st.widths.len()
+    var this = line0
+    while this < line1 {
+        if column >= st.lines[this].len() - 1 {
+            this = this + 1
+            continue
+        }
+        pos = write_lines(st, pos, line0, this)
+        line0 = this
+        var width = st.cfg.minwidth
+        var discardable = true
+        while this < line1 {
+            let line = st.lines[this]
+            if column >= line.len() - 1 {
+                break
+            }
+            let c = line[column]
+            let w = c.width + st.cfg.padding
+            if w > width {
+                width = w
+            }
+            if c.width > 0 or c.htab {
+                discardable = false
+            }
+            this = this + 1
+        }
+        if discardable and has_flag(st, discard_empty_columns()) {
+            width = 0
+        }
+        st.widths.push(width)
+        pos = format_block(st, pos, line0, this)
+        let _ = st.widths.pop()
+        line0 = this
+    }
+    write_lines(st, pos, line0, line1)
+}
+
+fn flush(inout st: TabState) {
+    if st.cell.size > 0 {
+        if st.end_char != 0 {
+            end_escape(st)
+        }
+        let _ = terminate_cell(st, false)
+    }
+    let n = st.lines.len()
+    let _ = format_block(st, 0, 0, n)
+    reset(st)
+}
+
+/// The whole of `text` written to a `tabwriter.Writer` with these settings,
+/// then flushed.
+pub fn format(cfg: TabConfig, text: bytes) -> bytes {
+    var st = TabState{ cfg: cfg, buf: [], pos: 0, cell: empty_cell(), end_char: 0,
+        lines: [[]], widths: [], out: [] }
+    var n = 0
+    var i = 0
+    while i < text.len() {
+        let ch = text.at(i)
+        if st.end_char == 0 {
+            if ch == 9 or ch == 11 or ch == 10 or ch == 12 {
+                append_text(st, text, n, i)
+                update_width(st)
+                n = i + 1
+                let ncells = terminate_cell(st, ch == 9)
+                if ch == 10 or ch == 12 {
+                    st.lines.push([])
+                    if ch == 12 or ncells == 1 {
+                        flush(st)
+                        if ch == 12 and has_flag(st, debug()) {
+                            for b in [45, 45, 45, 10] {
+                                st.out.push(b)
+                            }
+                        }
+                    }
+                }
+            } else if ch == escape_byte() {
+                append_text(st, text, n, i)
+                update_width(st)
+                n = i
+                if has_flag(st, strip_escape()) {
+                    n = n + 1
+                }
+                start_escape(st, escape_byte())
+            } else if (ch == 60 or ch == 38) and has_flag(st, filter_html()) {
+                append_text(st, text, n, i)
+                update_width(st)
+                n = i
+                start_escape(st, ch)
+            }
+        } else if ch == st.end_char {
+            var j = i + 1
+            if ch == escape_byte() and has_flag(st, strip_escape()) {
+                j = i
+            }
+            append_text(st, text, n, j)
+            n = i + 1
+            end_escape(st)
+        }
+        i = i + 1
+    }
+    append_text(st, text, n, text.len())
+    flush(st)
+    bytes_of(st.out)
+}

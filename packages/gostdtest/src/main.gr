@@ -1,0 +1,297 @@
+// The Grasm side of scripts/gostd_diff.py: arguments come in threes --
+// an operation and two hex fields, each with a leading `x` so neither is
+// ever empty -- and each answer is one line, in the form the Go oracle in
+// scripts/lib/gostd prints.
+import fnv
+import rc4
+import des
+import goquote
+import gotimefmt
+import tabwriter
+import textproto
+import suffixarray
+
+fn from_hex(text: str) -> bytes {
+    var out: [i64] = []
+    var i = 1
+    while i + 1 < text.len() {
+        out.push(text.substr(i, 2).parse_int_base(16) ?? 0)
+        i = i + 2
+    }
+    bytes_of(out)
+}
+
+fn hex(raw: bytes) -> str {
+    let digits = "0123456789abcdef"
+    var out = ""
+    var i = 0
+    while i < raw.len() {
+        out = out + digits.substr(raw.at(i) / 16, 1) + digits.substr(raw.at(i) % 16, 1)
+        i = i + 1
+    }
+    out
+}
+
+fn text_hex(text: str) -> str {
+    hex(text.to_bytes())
+}
+
+fn ints(xs: [i64]) -> str {
+    var parts: [str] = []
+    for x in xs {
+        parts.push("{x}")
+    }
+    parts.join(",")
+}
+
+fn des_cipher(key: bytes) -> Option[DesCipher] {
+    if key.len() == 8 {
+        return match des.new_cipher(key) {
+            Ok(c) -> Some(c)
+            Err(_) -> None
+        }
+    }
+    if key.len() == 24 {
+        return match des.new_triple(key) {
+            Ok(c) -> Some(c)
+            Err(_) -> None
+        }
+    }
+    None
+}
+
+fn des_hex(r: bytes ! DesError) -> str {
+    match r {
+        Ok(out) -> hex(out)
+        Err(_) -> "ERR"
+    }
+}
+
+fn resp_text(r: (TextResponse, i64) ! TextprotoError) -> str {
+    match r {
+        Ok(got) -> "{got.0.code}|{text_hex(got.0.message)}|{got.1}"
+        Err(e) -> tp_err(e)
+    }
+}
+
+fn des_op(what: str, key: bytes, data: bytes) -> str {
+    match des_cipher(key) {
+        None -> "ERR"
+        Some(c) -> {
+            if what == "desecb" or what == "desecbd" {
+                if what == "desecb" {
+                    return des_hex(des.encrypt_ecb(c, data))
+                }
+                return des_hex(des.decrypt_ecb(c, data))
+            }
+            if data.len() < 8 {
+                return "ERR"
+            }
+            let iv = data.slice(0, 8)
+            let body = data.slice(8, data.len())
+            if what == "descbc" {
+                return des_hex(des.encrypt_cbc(c, iv, body))
+            }
+            des_hex(des.decrypt_cbc(c, iv, body))
+        }
+    }
+}
+
+fn tp_err(e: TextprotoError) -> str {
+    match e {
+        Truncated -> "ERR:trunc"
+        Malformed(_) -> "ERR:malformed"
+        Unexpected(code, message) -> "ERR:unexpected:{code}:{text_hex(message)}"
+    }
+}
+
+fn header_text(h: TextHeader) -> str {
+    var keys = h.keys
+    keys.sort()
+    var parts: [str] = []
+    for k in keys {
+        parts.push(k + "=" + textproto.get_all(h, k).join("\u{1}"))
+    }
+    parts.join("\u{2}")
+}
+
+fn time_of(spec: str) -> GoTime {
+    let f = spec.split(",")
+    gotimefmt.new_time(f[0].parse_int() ?? 0, f[1].parse_int() ?? 0, f[2].parse_int() ?? 0,
+        f.get(3) ?? "")
+}
+
+fn answer_hash(what: str, a: bytes, b: bytes) -> str {
+    if what == "fnv32" {
+        return hex(fnv.to_bytes(fnv.fnv32(a), 32))
+    }
+    if what == "fnv32a" {
+        return hex(fnv.to_bytes(fnv.fnv32a(a), 32))
+    }
+    if what == "fnv64" {
+        return hex(fnv.to_bytes(fnv.fnv64(a), 64))
+    }
+    if what == "fnv64a" {
+        return hex(fnv.to_bytes(fnv.fnv64a(a), 64))
+    }
+    if what == "fnv128" {
+        return hex(fnv.fnv128(a))
+    }
+    if what == "fnv128a" {
+        return hex(fnv.fnv128a(a))
+    }
+    if what == "rc4" {
+        return match rc4.apply(a, b) {
+            Ok(out) -> hex(out)
+            Err(_) -> "ERR"
+        }
+    }
+    if what.starts_with("des") {
+        return des_op(what, a, b)
+    }
+    "UNKNOWN {what}"
+}
+
+fn answer_quote(what: str, a: bytes) -> str {
+    if what == "gq" {
+        return text_hex(goquote.quote(a))
+    }
+    if what == "gqa" {
+        return text_hex(goquote.quote_ascii(a))
+    }
+    if what == "gqg" {
+        return text_hex(goquote.quote_graphic(a))
+    }
+    if what == "gqr" or what == "gqra" or what == "gqrg" {
+        let r = a.to_str().parse_int() ?? 0
+        let q = if what == "gqr" {
+            goquote.quote_rune(r)
+        } else if what == "gqra" {
+            goquote.quote_rune_ascii(r)
+        } else {
+            goquote.quote_rune_graphic(r)
+        }
+        return text_hex(q)
+    }
+    if what == "guq" {
+        return match goquote.unquote(a) {
+            Ok(v) -> hex(v)
+            Err(_) -> "ERR"
+        }
+    }
+    if what == "gqp" {
+        return match goquote.quoted_prefix(a) {
+            Ok(v) -> hex(v)
+            Err(_) -> "ERR"
+        }
+    }
+    if what == "gcb" {
+        return if goquote.can_backquote(a) { "yes" } else { "no" }
+    }
+    if what == "gpr" {
+        let r = a.to_str().parse_int() ?? 0
+        return "{goquote.is_print(r)},{goquote.is_graphic(r)}"
+    }
+    "UNKNOWN {what}"
+}
+
+fn answer_text(what: str, a: bytes, b: bytes) -> str {
+    if what == "gtf" {
+        return text_hex(gotimefmt.format(time_of(b.to_str()), a.to_str()))
+    }
+    if what == "gtp" {
+        return match gotimefmt.parse(a.to_str(), b.to_str()) {
+            Ok(t) -> text_hex("{t.unix},{t.nanos},{t.offset},{t.zone}")
+            Err(_) -> "ERR"
+        }
+    }
+    if what == "tw" {
+        let f = b.to_str().split(",")
+        let cfg = tabwriter.config(f[0].parse_int() ?? 0, f[1].parse_int() ?? 0,
+            f[2].parse_int() ?? 0, f[3].parse_int() ?? 0, f[4].parse_int() ?? 0)
+        return hex(tabwriter.format(cfg, a))
+    }
+    "UNKNOWN {what}"
+}
+
+fn answer_proto(what: str, a: bytes, b: bytes) -> str {
+    if what == "tpkey" {
+        return text_hex(textproto.canonical_key(a.to_str()))
+    }
+    if what == "tptrim" {
+        return text_hex(textproto.trim_string(a.to_str()))
+    }
+    if what == "tphdr" {
+        return match textproto.read_header(a, 0) {
+            Ok(got) -> text_hex(header_text(got.0)) + "|{got.1}"
+            Err(e) -> tp_err(e)
+        }
+    }
+    if what == "tpcont" {
+        return match textproto.read_continued_line(a, 0) {
+            Ok(got) -> text_hex(got.0) + "|{got.1}"
+            Err(e) -> tp_err(e)
+        }
+    }
+    if what == "tpresp" or what == "tpcode" {
+        let expect = b.to_str().parse_int() ?? 0
+        if what == "tpresp" {
+            return resp_text(textproto.read_response(a, 0, expect))
+        }
+        return resp_text(textproto.read_code_line(a, 0, expect))
+    }
+    if what == "tpdotd" {
+        return match textproto.dot_decode(a, 0) {
+            Ok(got) -> hex(got.0) + "|{got.1}"
+            Err(e) -> tp_err(e)
+        }
+    }
+    if what == "tpdote" {
+        return hex(textproto.dot_encode(a))
+    }
+    "UNKNOWN {what}"
+}
+
+fn answer_sa(what: str, a: bytes, b: bytes) -> str {
+    if what == "sa" {
+        return ints(suffixarray.suffix_array(a))
+    }
+    if what == "lcp" {
+        return ints(suffixarray.lcp_array(a, suffixarray.suffix_array(a)))
+    }
+    if what == "salook" {
+        var got = suffixarray.lookup(suffixarray.new_index(a), b, -1)
+        got.sort()
+        return ints(got)
+    }
+    if what == "sarep" {
+        let r = suffixarray.longest_repeat(a)
+        return "{r.0},{r.1}"
+    }
+    "UNKNOWN {what}"
+}
+
+fn answer(what: str, a: bytes, b: bytes) -> str {
+    if what.starts_with("fnv") or what == "rc4" or what.starts_with("des") {
+        return answer_hash(what, a, b)
+    }
+    if what.starts_with("gq") or what == "guq" or what == "gcb" or what == "gpr" {
+        return answer_quote(what, a)
+    }
+    if what.starts_with("gt") or what == "tw" {
+        return answer_text(what, a, b)
+    }
+    if what.starts_with("tp") {
+        return answer_proto(what, a, b)
+    }
+    answer_sa(what, a, b)
+}
+
+fn main() / {io} {
+    let argv = args()
+    var i = 0
+    while i + 2 < argv.len() {
+        print(answer(argv[i], from_hex(argv[i + 1]), from_hex(argv[i + 2])))
+        i = i + 3
+    }
+}

@@ -1,0 +1,36 @@
+[package]
+name = "gostdtest"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.fnv]
+path = "../fnv"
+version = "^1.0.0"
+
+[dependencies.rc4]
+path = "../rc4"
+version = "^1.0.0"
+
+[dependencies.des]
+path = "../des"
+version = "^1.0.0"
+
+[dependencies.goquote]
+path = "../goquote"
+version = "^1.0.0"
+
+[dependencies.gotimefmt]
+path = "../gotimefmt"
+version = "^1.0.0"
+
+[dependencies.tabwriter]
+path = "../tabwriter"
+version = "^1.0.0"
+
+[dependencies.textproto]
+path = "../textproto"
+version = "^1.0.0"
+
+[dependencies.suffixarray]
+path = "../suffixarray"
+version = "^1.0.0"

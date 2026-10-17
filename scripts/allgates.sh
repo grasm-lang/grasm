@@ -24,6 +24,14 @@ cd "$(dirname "$0")/.."
 # A subset run says so on its last line and never says "every gate passed",
 # because a partial green quoted as a full one is the mistake this whole
 # script exists to prevent.
+#
+# `sitefacts` reads other gates' logs to record their figures, and each run
+# writes to a fresh `mktemp -d` unless `LOGS` is set. So splitting the suite
+# across runs leaves it unable to find them -- it failed with "the crosstest
+# gate left no log, so its figure cannot be recorded", which is the gate
+# being right. Set `LOGS` to one directory across the slices, or run
+# `sitefacts` in the same slice as the gates it reads: difftest, wasmtest,
+# crosstest, gold, fuzz_laws and depth.
 ONLY=("$@")
 matches() {
     [ ${#ONLY[@]} -eq 0 ] && return 0
@@ -104,6 +112,7 @@ run_gate tiffwrite     scripts/tiffwritetest.sh
 run_gate multisearch   scripts/multisearchtest.sh
 run_gate walkdirtest   scripts/walkdirtest.sh
 run_gate tempdirtest   scripts/tempdirtest.sh
+run_gate gostddiff     scripts/gostd_diff.sh
 run_gate grasmwire     scripts/grasmwire_e2e.sh
 run_gate cryptodiff    scripts/crypto_diff.sh
 run_gate certdiff      scripts/cert_diff.sh

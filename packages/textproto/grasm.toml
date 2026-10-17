@@ -1,0 +1,6 @@
+[package]
+name = "textproto"
+version = "1.0.0"
+
+# Bytes in, values out. The caller owns the connection.
+capabilities = []

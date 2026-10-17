@@ -1,0 +1,6 @@
+[package]
+name = "fnv"
+version = "1.0.0"
+
+# Bytes in, a number out.
+capabilities = []

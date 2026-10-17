@@ -1,0 +1,5 @@
+[package]
+name = "goquote"
+version = "1.0.0"
+
+capabilities = []

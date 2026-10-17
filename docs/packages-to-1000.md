@@ -217,11 +217,25 @@ projection library), `flexlayout` (no layout engine outside a browser),
 `ndarray` (no NumPy), `quic` `http3` (no peer). Each becomes buildable the
 day its reference is installed.
 
+## Landed
+
+- [x] **B1, first half: Go's library, the parts with no keys** — `fnv`
+  `rc4` `des` `goquote` `gotimefmt` `tabwriter` `textproto` `suffixarray`,
+  and the harness `gostdtest`. 126,265 cases against Go 1.25's `hash/fnv`,
+  `crypto/rc4`, `crypto/des`, `strconv`, `time`, `text/tabwriter`,
+  `net/textproto` and `index/suffixarray`; the suffix array itself against
+  every suffix sorted. Go's printable-rune table is generated from Go by
+  `scripts/gen_goprint.go` and the gate fails when it is stale. Found on the
+  way: a mistyped limb of FNV-128's offset basis, and `canonical_key`
+  half-canonicalising a key that Go returns untouched because of a byte
+  later in it.
+
 ## Where it stands
 
 | | |
 |---|---|
 | At the start | 669 |
+| Now | 678 |
 | Candidates above | 314 packages in 27 batches |
 | Harnesses, one a batch | 27 |
 | If every candidate lands | 1010 |

@@ -1,0 +1,77 @@
+// RC4, for reading what was written with it -- Go's `crypto/rc4`.
+//
+// ## Broken. Do not encrypt anything new with this.
+//
+// RC4's first output bytes are biased toward the key, and the bias is enough
+// to recover plaintext from enough ciphertexts: it was banned from TLS by
+// RFC 7465 in 2015. It is here because data already encrypted with it still
+// has to be opened -- PDF's standard security handler before AES, Kerberos'
+// RC4-HMAC enctype, MS-CHAPv2 and old NTLM sessions, WEP captures. For
+// anything new, `chachapoly` or `aes`'s GCM.
+//
+// Encrypting and decrypting are the same operation: the keystream is XORed
+// in. A state is consumed as it is used, so it is passed `inout`, and two
+// messages under one key must never share one keystream.
+
+type Rc4State = {
+    s: [i64],
+    i: i64,
+    j: i64,
+}
+
+type Rc4Error =
+    | KeyLength(got: i64)
+
+/// The key schedule. Go accepts keys of 1 to 256 bytes and refuses the rest,
+/// and so does this.
+pub fn new_state(key: bytes) -> Rc4State ! Rc4Error {
+    let n = key.len()
+    if n < 1 or n > 256 {
+        fail(KeyLength(n))
+    }
+    var s: [i64] = []
+    for v in 0..256 {
+        s.push(v)
+    }
+    var j = 0
+    for i in 0..256 {
+        j = (j + s[i] + key.at(i % n)).bit_and(255)
+        let t = s[i]
+        s[i] = s[j]
+        s[j] = t
+    }
+    Rc4State{ s: s, i: 0, j: 0 }
+}
+
+/// XORs the next `data.len()` keystream bytes into `data`, advancing the
+/// state -- the same call encrypts and decrypts.
+pub fn xor_stream(inout st: Rc4State, data: bytes) -> bytes {
+    var out = bytes_filled(data.len(), 0)
+    var s = st.s
+    var i = st.i
+    var j = st.j
+    var k = 0
+    while k < data.len() {
+        i = (i + 1).bit_and(255)
+        j = (j + s[i]).bit_and(255)
+        let t = s[i]
+        s[i] = s[j]
+        s[j] = t
+        out.set(k, data.at(k).bit_xor(s[(s[i] + s[j]).bit_and(255)]))
+        k = k + 1
+    }
+    st = Rc4State{ s: s, i: i, j: j }
+    out
+}
+
+/// One message under a fresh state: `xor_stream(new_state(key), data)`.
+pub fn apply(key: bytes, data: bytes) -> bytes ! Rc4Error {
+    var st = try new_state(key)
+    xor_stream(st, data)
+}
+
+/// RC4-drop[n]: discards the first `n` keystream bytes, which is where the
+/// worst of the bias sits. RFC 4345 names 1536 for SSH's `arcfour128`.
+pub fn skip(inout st: Rc4State, n: i64) {
+    let _ = xor_stream(st, bytes_filled(n, 0))
+}

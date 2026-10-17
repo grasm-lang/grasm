@@ -1,0 +1,174 @@
+// FNV-1 and FNV-1a, at 32, 64 and 128 bits -- Go's `hash/fnv`.
+//
+// ## Not for anything that must resist an attacker
+//
+// FNV is small, fast to write and well distributed on ordinary keys, which is
+// why file formats and protocols name it: DNS cookies, the Go linker,
+// Varnish, a dozen hash-table layouts on disk. Two inputs with the same FNV
+// are easy to construct on purpose, so a table keyed by untrusted input wants
+// `siphash`, and a checksum against tampering wants `blake3`.
+//
+// ## A u64 is an i64 holding the same bits
+//
+// As in `siphash` and `xxhash`: the 64-bit results are the same sixty-four
+// bits in an `i64`, negative above 2^63. Every product is built from shifts
+// and `add64`, never a wrapping `*`, so a debug build -- where Rust checks
+// for overflow -- computes the same thing a release build does.
+//
+// The 128-bit results are `bytes`, big-endian, as Go's `Sum` writes them.
+
+fn mask32() -> i64 {
+    4294967295
+}
+
+/// Addition modulo 2^64, in halves so nothing overflows.
+fn add64(a: i64, b: i64) -> i64 {
+    let low = a.bit_and(mask32()) + b.bit_and(mask32())
+    let high = a.ushr(32) + b.ushr(32) + low.ushr(32)
+    high.shl(32).bit_or(low.bit_and(mask32()))
+}
+
+/// `h * 1099511628211` modulo 2^64. The prime is 2^40 + 0x1b3, and 0x1b3
+/// has its bits at 0, 1, 4, 5, 7 and 8, so the product is seven shifted
+/// copies of `h` added together.
+fn mul_prime64(h: i64) -> i64 {
+    var acc = h.shl(40)
+    for s in [8, 7, 5, 4, 1, 0] {
+        acc = add64(acc, h.shl(s))
+    }
+    acc
+}
+
+/// `h * 16777619` modulo 2^32. `h` is below 2^32 and the prime below 2^25,
+/// so the plain product fits in an `i64` with room to spare.
+fn mul_prime32(h: i64) -> i64 {
+    (h * 16777619).bit_and(mask32())
+}
+
+/// FNV-1, 32 bits: multiply, then mix the byte in.
+pub fn fnv32(data: bytes) -> i64 {
+    var h = 2166136261
+    var i = 0
+    while i < data.len() {
+        h = mul_prime32(h).bit_xor(data.at(i))
+        i = i + 1
+    }
+    h
+}
+
+/// FNV-1a, 32 bits: mix the byte in, then multiply. The better-distributed
+/// of the two, and the one to pick when nothing else decides.
+pub fn fnv32a(data: bytes) -> i64 {
+    var h = 2166136261
+    var i = 0
+    while i < data.len() {
+        h = mul_prime32(h.bit_xor(data.at(i)))
+        i = i + 1
+    }
+    h
+}
+
+/// 14695981039346656037, the 64-bit offset basis, as the same bits.
+fn offset64() -> i64 {
+    0 - 3750763034362895579
+}
+
+pub fn fnv64(data: bytes) -> i64 {
+    var h = offset64()
+    var i = 0
+    while i < data.len() {
+        h = mul_prime64(h).bit_xor(data.at(i))
+        i = i + 1
+    }
+    h
+}
+
+pub fn fnv64a(data: bytes) -> i64 {
+    var h = offset64()
+    var i = 0
+    while i < data.len() {
+        h = mul_prime64(h.bit_xor(data.at(i)))
+        i = i + 1
+    }
+    h
+}
+
+/// The 128-bit state as four 32-bit limbs, least significant first.
+fn offset128() -> [i64] {
+    // 0x6c62272e_07bb0142_62b82175_6295c58d
+    [1653982605, 1656234357, 129696066, 1818371886]
+}
+
+/// `h * (2^88 + 315)` modulo 2^128.
+///
+/// The small part is a limb-by-limb multiply with carry; each limb times 315
+/// is under 2^41. The 2^88 part is `h` shifted up by two limbs and 24 bits,
+/// of which only the low 40 bits of `h` survive -- they land in the top two
+/// limbs.
+fn mul_prime128(h: [i64]) -> [i64] {
+    var out: [i64] = []
+    var carry = 0
+    for w in h {
+        let t = w * 315 + carry
+        out.push(t.bit_and(mask32()))
+        carry = t.ushr(32)
+    }
+    let s2 = h[0].shl(24).bit_and(mask32())
+    let s3 = h[0].ushr(8).bit_or(h[1].shl(24)).bit_and(mask32())
+    let t2 = out[2] + s2
+    out[2] = t2.bit_and(mask32())
+    out[3] = (out[3] + s3 + t2.ushr(32)).bit_and(mask32())
+    out
+}
+
+fn xor_low(h: [i64], b: i64) -> [i64] {
+    var out = h
+    out[0] = out[0].bit_xor(b)
+    out
+}
+
+fn limbs_bytes(h: [i64]) -> bytes {
+    var out: [i64] = []
+    var k = 3
+    while k >= 0 {
+        out.push(h[k].ushr(24).bit_and(255))
+        out.push(h[k].ushr(16).bit_and(255))
+        out.push(h[k].ushr(8).bit_and(255))
+        out.push(h[k].bit_and(255))
+        k = k - 1
+    }
+    bytes_of(out)
+}
+
+/// FNV-1, 128 bits, as sixteen big-endian bytes.
+pub fn fnv128(data: bytes) -> bytes {
+    var h = offset128()
+    var i = 0
+    while i < data.len() {
+        h = xor_low(mul_prime128(h), data.at(i))
+        i = i + 1
+    }
+    limbs_bytes(h)
+}
+
+/// FNV-1a, 128 bits, as sixteen big-endian bytes.
+pub fn fnv128a(data: bytes) -> bytes {
+    var h = offset128()
+    var i = 0
+    while i < data.len() {
+        h = mul_prime128(xor_low(h, data.at(i)))
+        i = i + 1
+    }
+    limbs_bytes(h)
+}
+
+/// A 32- or 64-bit result as the bytes Go's `Sum` appends: big-endian.
+pub fn to_bytes(h: i64, width: i64) -> bytes {
+    var out: [i64] = []
+    var k = width / 8 - 1
+    while k >= 0 {
+        out.push(h.ushr(k * 8).bit_and(255))
+        k = k - 1
+    }
+    bytes_of(out)
+}

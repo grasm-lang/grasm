@@ -1,0 +1,5 @@
+[package]
+name = "suffixarray"
+version = "1.0.0"
+
+capabilities = []

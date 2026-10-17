@@ -1,0 +1,1182 @@
+// Go's time layouts: `time.Format` and `time.Parse` by reference time.
+//
+// Go does not write `%Y-%m-%d`. It writes the moment `Mon Jan 2 15:04:05 MST
+// 2006` the way it wants any time written -- `2006-01-02` -- and every
+// number in that moment means a field: `01` the month, `15` the 24-hour
+// hour, `.000` milliseconds. Helm templates, Hugo, Caddy, Terraform, Docker's
+// `--format`, `kubectl` and most Go programs' log configuration take a
+// layout in this form, so reading one is a thing any tool around them needs.
+//
+// ## Go's rules, including the surprising ones
+//
+// The scanner is Go's `nextStdChunk`, in its order, so the same layout
+// splits the same way: `Jan` is a month only when the next byte is not a
+// lower-case letter (so `January` and `Janet` are not), `1` is the month and
+// `15` the hour, `_2006` is a literal underscore and the year, and `.000`
+// is a fraction only when no digit follows the run. Anything that is not a
+// field is copied as it is.
+//
+// ## The local zone is UTC
+//
+// `time.Parse` consults the machine's local zone in two places: a parsed
+// numeric offset that matches it takes its name, and a zone abbreviation is
+// looked up in it. This answers as Go does on a machine whose local zone is
+// UTC -- a container, a CI runner, most servers -- and is checked that way.
+// A zone abbreviation other than `UTC` therefore parses with offset 0, or
+// with the hours in `GMT+3`; Go documents the same.
+//
+// Bytes throughout, because Go's layouts are byte strings, and the result of
+// formatting is text because every byte written is either from the layout or
+// ASCII.
+
+/// A moment and the zone it is shown in: Unix seconds, the nanoseconds
+/// within that second, the zone's offset east of UTC in seconds, and its
+/// abbreviation (empty for a zone with none).
+type GoTime = {
+    unix: i64,
+    nanos: i64,
+    offset: i64,
+    zone: str,
+}
+
+type GoTimeError =
+    | Bad(element: str, at: str)
+    | OutOfRange(what: str)
+    | ExtraText(text: str)
+
+pub fn new_time(unix: i64, nanos: i64, offset: i64, zone: str) -> GoTime {
+    GoTime{ unix: unix, nanos: nanos, offset: offset, zone: zone }
+}
+
+// ---------------------------------------------------------------------------
+// The layout scanner
+
+// Codes, as Go numbers them minus the flag bits it keeps alongside.
+fn long_month() -> i64 { 1 }
+fn month_c() -> i64 { 2 }
+fn num_month() -> i64 { 3 }
+fn zero_month() -> i64 { 4 }
+fn long_weekday() -> i64 { 5 }
+fn weekday_c() -> i64 { 6 }
+fn day_c() -> i64 { 7 }
+fn under_day() -> i64 { 8 }
+fn zero_day() -> i64 { 9 }
+fn under_yday() -> i64 { 10 }
+fn zero_yday() -> i64 { 11 }
+fn hour_c() -> i64 { 12 }
+fn hour12() -> i64 { 13 }
+fn zero_hour12() -> i64 { 14 }
+fn minute_c() -> i64 { 15 }
+fn zero_minute() -> i64 { 16 }
+fn second_c() -> i64 { 17 }
+fn zero_second() -> i64 { 18 }
+fn long_year() -> i64 { 19 }
+fn year_c() -> i64 { 20 }
+fn pm_upper() -> i64 { 21 }
+fn pm_lower() -> i64 { 22 }
+fn tz_name() -> i64 { 23 }
+fn iso_tz() -> i64 { 24 }
+fn iso_seconds_tz() -> i64 { 25 }
+fn iso_short_tz() -> i64 { 26 }
+fn iso_colon_tz() -> i64 { 27 }
+fn iso_colon_seconds_tz() -> i64 { 28 }
+fn num_tz() -> i64 { 29 }
+fn num_seconds_tz() -> i64 { 30 }
+fn num_short_tz() -> i64 { 31 }
+fn num_colon_tz() -> i64 { 32 }
+fn num_colon_seconds_tz() -> i64 { 33 }
+fn frac0() -> i64 { 34 }
+fn frac9() -> i64 { 35 }
+
+/// One step of `nextStdChunk`: the literal before the field ends at
+/// `prefix_end`, the field is `code` (0 for none), and the layout resumes at
+/// `next`. A fraction carries its digit count and separator.
+type GoChunk = {
+    prefix_end: i64,
+    code: i64,
+    digits: i64,
+    separator: i64,
+    next: i64,
+}
+
+fn has(b: bytes, at: i64, lit: str) -> bool {
+    let l = lit.to_bytes()
+    if at + l.len() > b.len() {
+        return false
+    }
+    var k = 0
+    while k < l.len() {
+        if b.at(at + k) != l.at(k) {
+            return false
+        }
+        k = k + 1
+    }
+    true
+}
+
+fn is_digit_at(b: bytes, at: i64) -> bool {
+    at < b.len() and b.at(at) >= 48 and b.at(at) <= 57
+}
+
+fn lower_at(b: bytes, at: i64) -> bool {
+    at < b.len() and b.at(at) >= 97 and b.at(at) <= 122
+}
+
+fn chunk(at: i64, code: i64, next: i64) -> GoChunk {
+    GoChunk{ prefix_end: at, code: code, digits: 0, separator: 0, next: next }
+}
+
+/// The field starting at `i` when it begins with a letter or a sign: a
+/// month or weekday name, `MST`, `PM`, or a zone offset.
+fn chunk_named(l: bytes, i: i64) -> Option[GoChunk] {
+    let c = l.at(i)
+    if c == 74 and has(l, i, "Jan") {
+        if has(l, i, "January") {
+            return Some(chunk(i, long_month(), i + 7))
+        }
+        if not lower_at(l, i + 3) {
+            return Some(chunk(i, month_c(), i + 3))
+        }
+    } else if c == 77 {
+        if has(l, i, "Mon") {
+            if has(l, i, "Monday") {
+                return Some(chunk(i, long_weekday(), i + 6))
+            }
+            if not lower_at(l, i + 3) {
+                return Some(chunk(i, weekday_c(), i + 3))
+            }
+        }
+        if has(l, i, "MST") {
+            return Some(chunk(i, tz_name(), i + 3))
+        }
+    } else if c == 80 and has(l, i, "PM") {
+        return Some(chunk(i, pm_upper(), i + 2))
+    } else if c == 112 and has(l, i, "pm") {
+        return Some(chunk(i, pm_lower(), i + 2))
+    } else if c == 45 or c == 90 {
+        return chunk_offset(l, i)
+    }
+    None
+}
+
+/// `-0700` and `Z07:00` and their kin, longest first, as Go tries them.
+fn chunk_offset(l: bytes, i: i64) -> Option[GoChunk] {
+    let numeric = l.at(i) == 45
+    let shapes = ["070000", "07:00:00", "0700", "07:00", "07"]
+    let num_codes = [num_seconds_tz(), num_colon_seconds_tz(), num_tz(), num_colon_tz(),
+        num_short_tz()]
+    let iso_codes = [iso_seconds_tz(), iso_colon_seconds_tz(), iso_tz(), iso_colon_tz(),
+        iso_short_tz()]
+    for k in 0..5 {
+        if has(l, i + 1, shapes[k]) {
+            let code = if numeric { num_codes[k] } else { iso_codes[k] }
+            return Some(chunk(i, code, i + 1 + shapes[k].len()))
+        }
+    }
+    None
+}
+
+/// The field starting at `i` when it begins with a digit or `_`.
+fn chunk_numeric(l: bytes, i: i64) -> Option[GoChunk] {
+    let c = l.at(i)
+    if c == 48 {
+        if i + 1 < l.len() and l.at(i + 1) >= 49 and l.at(i + 1) <= 54 {
+            let codes = [zero_month(), zero_day(), zero_hour12(), zero_minute(),
+                zero_second(), year_c()]
+            return Some(chunk(i, codes[l.at(i + 1) - 49], i + 2))
+        }
+        if has(l, i, "002") {
+            return Some(chunk(i, zero_yday(), i + 3))
+        }
+    } else if c == 49 {
+        if i + 1 < l.len() and l.at(i + 1) == 53 {
+            return Some(chunk(i, hour_c(), i + 2))
+        }
+        return Some(chunk(i, num_month(), i + 1))
+    } else if c == 50 {
+        if has(l, i, "2006") {
+            return Some(chunk(i, long_year(), i + 4))
+        }
+        return Some(chunk(i, day_c(), i + 1))
+    } else if c == 95 {
+        if i + 1 < l.len() and l.at(i + 1) == 50 {
+            if has(l, i + 1, "2006") {
+                // The underscore is literal; Go returns it in the prefix.
+                return Some(chunk(i + 1, long_year(), i + 5))
+            }
+            return Some(chunk(i, under_day(), i + 2))
+        }
+        if has(l, i, "__2") {
+            return Some(chunk(i, under_yday(), i + 3))
+        }
+    } else if c == 51 {
+        return Some(chunk(i, hour12(), i + 1))
+    } else if c == 52 {
+        return Some(chunk(i, minute_c(), i + 1))
+    } else if c == 53 {
+        return Some(chunk(i, second_c(), i + 1))
+    }
+    None
+}
+
+/// `.000` or `,999`: a run of one digit, not followed by another digit.
+fn chunk_fraction(l: bytes, i: i64) -> Option[GoChunk] {
+    let c = l.at(i)
+    if (c != 46 and c != 44) or i + 1 >= l.len() {
+        return None
+    }
+    let ch = l.at(i + 1)
+    if ch != 48 and ch != 57 {
+        return None
+    }
+    var j = i + 1
+    while j < l.len() and l.at(j) == ch {
+        j = j + 1
+    }
+    if is_digit_at(l, j) {
+        return None
+    }
+    let code = if ch == 57 { frac9() } else { frac0() }
+    Some(GoChunk{ prefix_end: i, code: code, digits: (j - i - 1).bit_and(4095), separator: c,
+        next: j })
+}
+
+fn next_chunk(l: bytes, from: i64) -> GoChunk {
+    var i = from
+    while i < l.len() {
+        let found = chunk_named(l, i) ?? chunk_numeric(l, i) ?? chunk_fraction(l, i) ?? chunk(-1, 0, 0)
+        if found.prefix_end >= 0 {
+            return found
+        }
+        i = i + 1
+    }
+    chunk(l.len(), 0, l.len())
+}
+
+// ---------------------------------------------------------------------------
+// Calendar arithmetic
+
+fn fdiv(a: i64, b: i64) -> i64 {
+    let q = a / b
+    if (a % b != 0) and ((a < 0) != (b < 0)) {
+        q - 1
+    } else {
+        q
+    }
+}
+
+fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let y = if month <= 2 { year - 1 } else { year }
+    let era = fdiv(y, 400)
+    let yoe = y - era * 400
+    let mp = if month > 2 { month - 3 } else { month + 9 }
+    let doy = (153 * mp + 2) / 5 + day - 1
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy
+    era * 146097 + doe - 719468
+}
+
+/// `(year, month, day)` of a count of days since 1970-01-01.
+fn civil(days: i64) -> (i64, i64, i64) {
+    let z = days + 719468
+    let era = fdiv(z, 146097)
+    let doe = z - era * 146097
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100)
+    let mp = (5 * doy + 2) / 153
+    let d = doy - (153 * mp + 2) / 5 + 1
+    let m = if mp < 10 { mp + 3 } else { mp - 9 }
+    let y = yoe + era * 400 + if m <= 2 { 1 } else { 0 }
+    (y, m, d)
+}
+
+fn is_leap(y: i64) -> bool {
+    y % 4 == 0 and (y % 100 != 0 or y % 400 == 0)
+}
+
+fn days_in(month: i64, year: i64) -> i64 {
+    if month == 2 {
+        return if is_leap(year) { 29 } else { 28 }
+    }
+    [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][month - 1]
+}
+
+fn days_before(month: i64) -> i64 {
+    [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334, 365][month - 1]
+}
+
+fn long_months() -> [str] {
+    ["January", "February", "March", "April", "May", "June", "July", "August",
+        "September", "October", "November", "December"]
+}
+
+fn long_days() -> [str] {
+    ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]
+}
+
+// ---------------------------------------------------------------------------
+// Formatting
+
+/// Go's `appendInt`: the sign, then zeros to `width` digits, then the
+/// digits.
+fn put_int(inout out: str, x: i64, width: i64) {
+    var u = x
+    if x < 0 {
+        out = out + "-"
+        u = 0 - x
+    }
+    let digits = "{u}"
+    var pad = width - digits.len()
+    while pad > 0 {
+        out = out + "0"
+        pad = pad - 1
+    }
+    out = out + digits
+}
+
+fn put_nanos(inout out: str, nanos: i64, ch: GoChunk) {
+    let trim = ch.code == frac9()
+    let n = ch.digits
+    if trim and (n == 0 or nanos == 0) {
+        return
+    }
+    var text = ""
+    put_int(text, nanos, 9)
+    if n < 9 {
+        text = text.substr(0, n)
+    }
+    let dot = if ch.separator == 44 { "," } else { "." }
+    var piece = dot + text
+    if trim {
+        while piece.len() > 0 and piece.ends_with("0") {
+            piece = piece.substr(0, piece.len() - 1)
+        }
+        if piece == dot {
+            piece = ""
+        }
+    }
+    out = out + piece
+}
+
+fn is_iso(code: i64) -> bool {
+    code == iso_tz() or code == iso_colon_tz() or code == iso_seconds_tz() or
+    code == iso_short_tz() or code == iso_colon_seconds_tz()
+}
+
+/// Everything a layout can ask for, worked out once.
+type GoFields = {
+    year: i64,
+    month: i64,
+    day: i64,
+    yday: i64,
+    weekday: i64,
+    hour: i64,
+    min: i64,
+    sec: i64,
+}
+
+fn fields_of(t: GoTime) -> GoFields {
+    let local = t.unix + t.offset
+    let days = fdiv(local, 86400)
+    let secs = local - days * 86400
+    let date = civil(days)
+    GoFields{ year: date.0, month: date.1, day: date.2,
+        yday: days - days_from_civil(date.0, 1, 1) + 1,
+        weekday: days + 4 - fdiv(days + 4, 7) * 7, hour: secs / 3600, min: secs / 60 % 60,
+        sec: secs % 60 }
+}
+
+/// The date fields; false when `c` is not one of them.
+fn put_date(inout out: str, c: i64, f: GoFields) -> bool {
+    if c == year_c() {
+        let y = if f.year < 0 { 0 - f.year } else { f.year }
+        put_int(out, y % 100, 2)
+    } else if c == long_year() {
+        put_int(out, f.year, 4)
+    } else if c == month_c() {
+        out = out + long_months()[f.month - 1].substr(0, 3)
+    } else if c == long_month() {
+        out = out + long_months()[f.month - 1]
+    } else if c == num_month() or c == zero_month() {
+        put_int(out, f.month, if c == num_month() { 0 } else { 2 })
+    } else if c == weekday_c() {
+        out = out + long_days()[f.weekday].substr(0, 3)
+    } else if c == long_weekday() {
+        out = out + long_days()[f.weekday]
+    } else if c == day_c() or c == zero_day() {
+        put_int(out, f.day, if c == day_c() { 0 } else { 2 })
+    } else if c == under_day() {
+        if f.day < 10 {
+            out = out + " "
+        }
+        put_int(out, f.day, 0)
+    } else if c == under_yday() {
+        if f.yday < 100 {
+            out = out + if f.yday < 10 { "  " } else { " " }
+        }
+        put_int(out, f.yday, 0)
+    } else if c == zero_yday() {
+        put_int(out, f.yday, 3)
+    } else {
+        return false
+    }
+    true
+}
+
+/// The clock fields; false when `c` is not one of them.
+fn put_clock(inout out: str, c: i64, f: GoFields) -> bool {
+    if c == hour_c() {
+        put_int(out, f.hour, 2)
+    } else if c == hour12() or c == zero_hour12() {
+        var hr = f.hour % 12
+        if hr == 0 {
+            hr = 12
+        }
+        put_int(out, hr, if c == hour12() { 0 } else { 2 })
+    } else if c == minute_c() or c == zero_minute() {
+        put_int(out, f.min, if c == minute_c() { 0 } else { 2 })
+    } else if c == second_c() or c == zero_second() {
+        put_int(out, f.sec, if c == second_c() { 0 } else { 2 })
+    } else if c == pm_upper() {
+        out = out + if f.hour >= 12 { "PM" } else { "AM" }
+    } else if c == pm_lower() {
+        out = out + if f.hour >= 12 { "pm" } else { "am" }
+    } else {
+        return false
+    }
+    true
+}
+
+fn has_colon(c: i64) -> bool {
+    c == iso_colon_tz() or c == num_colon_tz() or c == iso_colon_seconds_tz() or
+    c == num_colon_seconds_tz()
+}
+
+fn has_seconds(c: i64) -> bool {
+    c == iso_seconds_tz() or c == num_seconds_tz() or c == num_colon_seconds_tz() or
+    c == iso_colon_seconds_tz()
+}
+
+/// A numeric offset in one of Go's ten shapes.
+fn put_offset(inout out: str, c: i64, offset: i64) {
+    if offset == 0 and is_iso(c) {
+        out = out + "Z"
+        return
+    }
+    var zone = offset / 60
+    var absoffset = offset
+    if zone < 0 {
+        out = out + "-"
+        zone = 0 - zone
+        absoffset = 0 - absoffset
+    } else {
+        out = out + "+"
+    }
+    put_int(out, zone / 60, 2)
+    if has_colon(c) {
+        out = out + ":"
+    }
+    if c != num_short_tz() and c != iso_short_tz() {
+        put_int(out, zone % 60, 2)
+    }
+    if has_seconds(c) {
+        if c == num_colon_seconds_tz() or c == iso_colon_seconds_tz() {
+            out = out + ":"
+        }
+        put_int(out, absoffset % 60, 2)
+    }
+}
+
+/// `MST`: the zone's name, or its offset as `-0700` when it has none.
+fn put_zone_name(inout out: str, t: GoTime) {
+    if t.zone.len() > 0 {
+        out = out + t.zone
+        return
+    }
+    var zone = t.offset / 60
+    if zone < 0 {
+        out = out + "-"
+        zone = 0 - zone
+    } else {
+        out = out + "+"
+    }
+    put_int(out, zone / 60, 2)
+    put_int(out, zone % 60, 2)
+}
+
+/// `t.Format(layout)`.
+pub fn format(t: GoTime, layout: str) -> str {
+    let l = layout.to_bytes()
+    let f = fields_of(t)
+    var out = ""
+    var at = 0
+    while at <= l.len() {
+        let ch = next_chunk(l, at)
+        if ch.prefix_end > at {
+            out = out + l.slice(at, ch.prefix_end).to_str()
+        }
+        if ch.code == 0 {
+            break
+        }
+        at = ch.next
+        let c = ch.code
+        if put_date(out, c, f) or put_clock(out, c, f) {
+            continue
+        }
+        if c >= iso_tz() and c <= num_colon_seconds_tz() {
+            put_offset(out, c, t.offset)
+        } else if c == tz_name() {
+            put_zone_name(out, t)
+        } else {
+            put_nanos(out, t.nanos, ch)
+        }
+    }
+    out
+}
+
+/// The layouts Go names, by their Go name: `RFC3339`, `Kitchen`,
+/// `DateTime` and the rest.
+pub fn named(name: str) -> Option[str] {
+    let names = ["Layout", "ANSIC", "UnixDate", "RubyDate", "RFC822", "RFC822Z",
+        "RFC850", "RFC1123", "RFC1123Z", "RFC3339", "RFC3339Nano", "Kitchen", "Stamp",
+        "StampMilli", "StampMicro", "StampNano", "DateTime", "DateOnly", "TimeOnly"]
+    let layouts = ["01/02 03:04:05PM '06 -0700", "Mon Jan _2 15:04:05 2006",
+        "Mon Jan _2 15:04:05 MST 2006", "Mon Jan 02 15:04:05 -0700 2006",
+        "02 Jan 06 15:04 MST", "02 Jan 06 15:04 -0700", "Monday, 02-Jan-06 15:04:05 MST",
+        "Mon, 02 Jan 2006 15:04:05 MST", "Mon, 02 Jan 2006 15:04:05 -0700",
+        "2006-01-02T15:04:05Z07:00", "2006-01-02T15:04:05.999999999Z07:00", "3:04PM",
+        "Jan _2 15:04:05", "Jan _2 15:04:05.000", "Jan _2 15:04:05.000000",
+        "Jan _2 15:04:05.000000000", "2006-01-02 15:04:05", "2006-01-02", "15:04:05"]
+    for k in 0..names.len() {
+        if names[k] == name {
+            return Some(layouts[k])
+        }
+    }
+    None
+}
+
+// ---------------------------------------------------------------------------
+// Parsing
+
+/// A value being read: the bytes and how far in.
+type GoCursor = {
+    v: bytes,
+    at: i64,
+}
+
+fn rest(c: GoCursor) -> str {
+    c.v.slice(c.at, c.v.len()).to_str()
+}
+
+fn left(c: GoCursor) -> i64 {
+    c.v.len() - c.at
+}
+
+fn digit_at(c: GoCursor, k: i64) -> bool {
+    is_digit_at(c.v, c.at + k)
+}
+
+/// `atoi` over `[from, end)`: an optional sign and at least one digit,
+/// nothing else. `None` for anything else, as Go's `errAtoi`.
+fn atoi(b: bytes, from: i64, end: i64) -> Option[i64] {
+    var i = from
+    var neg = false
+    if i < end and (b.at(i) == 45 or b.at(i) == 43) {
+        neg = b.at(i) == 45
+        i = i + 1
+    }
+    if i >= end {
+        // Go's leadingInt accepts no digits and atoi then sees no remainder.
+        return Some(0)
+    }
+    var x = 0
+    while i < end {
+        let ch = b.at(i)
+        if ch < 48 or ch > 57 {
+            return None
+        }
+        if x > 922337203685477580 {
+            return None
+        }
+        x = x * 10 + ch - 48
+        i = i + 1
+    }
+    Some(if neg { 0 - x } else { x })
+}
+
+/// `getnum`: one or two digits; with `fixed`, exactly two.
+fn getnum(inout c: GoCursor, fixed: bool) -> Option[i64] {
+    if not digit_at(c, 0) {
+        return None
+    }
+    if not digit_at(c, 1) {
+        if fixed {
+            return None
+        }
+        let v = c.v.at(c.at) - 48
+        c.at = c.at + 1
+        return Some(v)
+    }
+    let v = (c.v.at(c.at) - 48) * 10 + c.v.at(c.at + 1) - 48
+    c.at = c.at + 2
+    Some(v)
+}
+
+fn getnum3(inout c: GoCursor, fixed: bool) -> Option[i64] {
+    var n = 0
+    var i = 0
+    while i < 3 and digit_at(c, i) {
+        n = n * 10 + c.v.at(c.at + i) - 48
+        i = i + 1
+    }
+    if i == 0 or (fixed and i != 3) {
+        return None
+    }
+    c.at = c.at + i
+    Some(n)
+}
+
+fn fold(x: i64) -> i64 {
+    x.bit_or(32)
+}
+
+/// `lookup`: the first name in the table the value starts with, ignoring
+/// ASCII case.
+fn lookup(table: [str], inout c: GoCursor) -> Option[i64] {
+    for k in 0..table.len() {
+        let n = table[k].to_bytes()
+        if left(c) >= n.len() {
+            var same = true
+            var i = 0
+            while i < n.len() {
+                let a = c.v.at(c.at + i)
+                let b = n.at(i)
+                if a != b {
+                    let fa = fold(a)
+                    if fa != fold(b) or fa < 97 or fa > 122 {
+                        same = false
+                        break
+                    }
+                }
+                i = i + 1
+            }
+            if same {
+                c.at = c.at + n.len()
+                return Some(k)
+            }
+        }
+    }
+    None
+}
+
+fn short_names(names: [str]) -> [str] {
+    var out: [str] = []
+    for n in names {
+        out.push(n.substr(0, 3))
+    }
+    out
+}
+
+/// `skip`: the literal between fields, where a run of spaces in the layout
+/// matches any run of spaces, including none.
+fn skip(inout c: GoCursor, l: bytes, from: i64, end: i64) -> bool {
+    var p = from
+    while p < end {
+        if l.at(p) == 32 {
+            if left(c) > 0 and c.v.at(c.at) != 32 {
+                return false
+            }
+            while p < end and l.at(p) == 32 {
+                p = p + 1
+            }
+            while left(c) > 0 and c.v.at(c.at) == 32 {
+                c.at = c.at + 1
+            }
+            continue
+        }
+        if left(c) == 0 or c.v.at(c.at) != l.at(p) {
+            return false
+        }
+        p = p + 1
+        c.at = c.at + 1
+    }
+    true
+}
+
+/// `parseNanoseconds`: `nbytes` from the cursor, separator included.
+fn nanoseconds(c: GoCursor, count: i64) -> Option[i64] {
+    let first = c.v.at(c.at)
+    if first != 46 and first != 44 {
+        return None
+    }
+    let n = if count > 10 { 10 } else { count }
+    var ns = atoi(c.v, c.at + 1, c.at + n) ?? -1
+    if ns < 0 {
+        return None
+    }
+    var scale = 10 - n
+    while scale > 0 {
+        ns = ns * 10
+        scale = scale - 1
+    }
+    Some(ns)
+}
+
+/// `parseSignedOffset`: how many bytes a `+h`/`-hh` takes, or 0.
+fn signed_offset_len(b: bytes, from: i64) -> i64 {
+    if from >= b.len() {
+        return 0
+    }
+    let sign = b.at(from)
+    if sign != 45 and sign != 43 {
+        return 0
+    }
+    var i = from + 1
+    var x = 0
+    while i < b.len() and b.at(i) >= 48 and b.at(i) <= 57 {
+        if x > 922337203685477580 {
+            return 0
+        }
+        x = x * 10 + b.at(i) - 48
+        i = i + 1
+    }
+    if i == from + 1 or x > 23 {
+        return 0
+    }
+    i - from
+}
+
+/// `parseTimeZone`: how long the abbreviation at the cursor is, or 0.
+fn zone_len(c: GoCursor) -> i64 {
+    let v = c.v
+    let at = c.at
+    if left(c) < 3 {
+        return 0
+    }
+    if has(v, at, "ChST") or has(v, at, "MeST") {
+        return 4
+    }
+    if has(v, at, "GMT") {
+        return 3 + signed_offset_len(v, at + 3)
+    }
+    if v.at(at) == 43 or v.at(at) == 45 {
+        return signed_offset_len(v, at)
+    }
+    var upper = 0
+    while upper < 6 and at + upper < v.len() and v.at(at + upper) >= 65 and
+    v.at(at + upper) <= 90 {
+        upper = upper + 1
+    }
+    if upper == 5 and v.at(at + 4) == 84 {
+        return 5
+    }
+    if upper == 4 and (v.at(at + 3) == 84 or has(v, at, "WITA")) {
+        return 4
+    }
+    if upper == 3 {
+        return 3
+    }
+    0
+}
+
+/// What has been read so far, and whether the field just read was bad
+/// (`ok`) or out of range (`range_err`, empty when not).
+type GoParse = {
+    year: i64,
+    month: i64,
+    day: i64,
+    yday: i64,
+    hour: i64,
+    min: i64,
+    sec: i64,
+    nsec: i64,
+    am: bool,
+    pm: bool,
+    utc_named: bool,
+    zone_offset: i64,
+    zone_name: str,
+    ok: bool,
+    range_err: str,
+}
+
+fn year_field(inout st: GoParse, inout c: GoCursor, code: i64) {
+    let width = if code == year_c() { 2 } else { 4 }
+    if left(c) < width or (width == 4 and not digit_at(c, 0)) {
+        st.ok = false
+        return
+    }
+    match atoi(c.v, c.at, c.at + width) {
+        Some(y) -> {
+            st.year = if width == 4 { y } else if y >= 69 { y + 1900 } else { y + 2000 }
+            c.at = c.at + width
+        }
+        None -> st.ok = false
+    }
+}
+
+/// A one- or two-digit field, kept when present and range-checked:
+/// `limit` is the first value out of range.
+fn small_field(inout st: GoParse, inout c: GoCursor, fixed: bool, limit: i64, what: str) -> i64 {
+    match getnum(c, fixed) {
+        Some(v) -> {
+            if v >= limit {
+                st.range_err = what
+            }
+            v
+        }
+        None -> {
+            st.ok = false
+            0
+        }
+    }
+}
+
+/// The date fields; false when `code` is not one of them.
+fn date_field(inout st: GoParse, inout c: GoCursor, code: i64) -> bool {
+    if code == year_c() or code == long_year() {
+        year_field(st, c, code)
+    } else if code == month_c() or code == long_month() {
+        let table = if code == month_c() { short_names(long_months()) } else { long_months() }
+        match lookup(table, c) {
+            Some(m) -> st.month = m + 1
+            None -> st.ok = false
+        }
+    } else if code == num_month() or code == zero_month() {
+        match getnum(c, code == zero_month()) {
+            Some(m) -> {
+                st.month = m
+                if m <= 0 or 12 < m {
+                    st.range_err = "month"
+                }
+            }
+            None -> st.ok = false
+        }
+    } else if code == weekday_c() or code == long_weekday() {
+        let table = if code == weekday_c() { short_names(long_days()) } else { long_days() }
+        if lookup(table, c).is_none() {
+            st.ok = false
+        }
+    } else if code == day_c() or code == under_day() or code == zero_day() {
+        if code == under_day() and left(c) > 0 and c.v.at(c.at) == 32 {
+            c.at = c.at + 1
+        }
+        match getnum(c, code == zero_day()) {
+            Some(d) -> st.day = d
+            None -> st.ok = false
+        }
+    } else if code == under_yday() or code == zero_yday() {
+        for _ in 0..2 {
+            if code == under_yday() and left(c) > 0 and c.v.at(c.at) == 32 {
+                c.at = c.at + 1
+            }
+        }
+        match getnum3(c, code == zero_yday()) {
+            Some(d) -> st.yday = d
+            None -> st.ok = false
+        }
+    } else {
+        return false
+    }
+    true
+}
+
+/// A fraction that follows the seconds without a fraction field in the
+/// layout, which Go reads anyway.
+fn trailing_fraction(inout st: GoParse, inout c: GoCursor, l: bytes, at: i64) {
+    if left(c) < 2 or (c.v.at(c.at) != 46 and c.v.at(c.at) != 44) or not digit_at(c, 1) {
+        return
+    }
+    let peek = next_chunk(l, at).code
+    if peek == frac0() or peek == frac9() {
+        return
+    }
+    var n = 2
+    while n < left(c) and digit_at(c, n) {
+        n = n + 1
+    }
+    match nanoseconds(c, n) {
+        Some(ns) -> st.nsec = ns
+        None -> st.ok = false
+    }
+    c.at = c.at + n
+}
+
+fn meridian(inout st: GoParse, inout c: GoCursor, upper: bool) {
+    if left(c) < 2 {
+        st.ok = false
+        return
+    }
+    let p = c.v.slice(c.at, c.at + 2).to_str()
+    c.at = c.at + 2
+    if p == (if upper { "PM" } else { "pm" }) {
+        st.pm = true
+    } else if p == (if upper { "AM" } else { "am" }) {
+        st.am = true
+    } else {
+        st.ok = false
+    }
+}
+
+/// The clock fields; false when `code` is not one of them.
+fn clock_field(inout st: GoParse, inout c: GoCursor, code: i64, l: bytes, at: i64) -> bool {
+    if code == hour_c() {
+        st.hour = small_field(st, c, false, 24, "hour")
+    } else if code == hour12() or code == zero_hour12() {
+        st.hour = small_field(st, c, code == zero_hour12(), 13, "hour")
+    } else if code == minute_c() or code == zero_minute() {
+        st.min = small_field(st, c, code == zero_minute(), 60, "minute")
+    } else if code == second_c() or code == zero_second() {
+        st.sec = small_field(st, c, code == zero_second(), 60, "second")
+        if st.ok and st.range_err.len() == 0 {
+            trailing_fraction(st, c, l, at)
+        }
+    } else if code == pm_upper() or code == pm_lower() {
+        meridian(st, c, code == pm_upper())
+    } else {
+        return false
+    }
+    true
+}
+
+/// Two fixed digits at `from` in the value, or `None`.
+fn two_digits(v: bytes, from: i64) -> Option[i64] {
+    var part = GoCursor{ v: v.slice(from, from + 2), at: 0 }
+    getnum(part, true)
+}
+
+/// A numeric offset: where its hours, minutes and seconds sit, how long it
+/// is, and which bytes must be colons.
+fn offset_field(inout st: GoParse, inout c: GoCursor, code: i64) {
+    var need = 5
+    var mm_at = 3
+    var ss_at = -1
+    var colons: [i64] = []
+    if code == iso_colon_tz() or code == num_colon_tz() {
+        need = 6
+        mm_at = 4
+        colons = [3]
+    } else if code == num_short_tz() or code == iso_short_tz() {
+        need = 3
+        mm_at = -1
+    } else if code == iso_colon_seconds_tz() or code == num_colon_seconds_tz() {
+        need = 9
+        mm_at = 4
+        ss_at = 7
+        colons = [3, 6]
+    } else if code == iso_seconds_tz() or code == num_seconds_tz() {
+        need = 7
+        ss_at = 5
+    }
+    if left(c) < need {
+        st.ok = false
+        return
+    }
+    for k in colons {
+        if c.v.at(c.at + k) != 58 {
+            st.ok = false
+            return
+        }
+    }
+    let sign = c.v.at(c.at)
+    let hr = two_digits(c.v, c.at + 1)
+    let mm = if mm_at >= 0 { two_digits(c.v, c.at + mm_at) } else { Some(0) }
+    let ss = if ss_at >= 0 { two_digits(c.v, c.at + ss_at) } else { Some(0) }
+    c.at = c.at + need
+    // Go stops reading at the first part that fails and counts the rest as
+    // zero, but still range-checks what it has -- so `+25:xx` is out of
+    // range rather than malformed.
+    var good = hr.is_some()
+    let h = hr ?? 0
+    var m = 0
+    var sx = 0
+    if good {
+        m = mm ?? 0
+        good = mm.is_some()
+    }
+    if good {
+        sx = ss ?? 0
+        good = ss.is_some()
+    }
+    if not good {
+        st.ok = false
+    }
+    if h > 24 {
+        st.range_err = "time zone offset hour"
+    }
+    if m > 60 {
+        st.range_err = "time zone offset minute"
+    }
+    if sx > 60 {
+        st.range_err = "time zone offset second"
+    }
+    st.zone_offset = (h * 60 + m) * 60 + sx
+    if sign == 45 {
+        st.zone_offset = 0 - st.zone_offset
+    } else if sign != 43 {
+        st.ok = false
+    }
+}
+
+/// The zone fields and fractions; false when `ch` is neither.
+fn zone_field(inout st: GoParse, inout c: GoCursor, ch: GoChunk) -> bool {
+    let code = ch.code
+    if code >= iso_tz() and code <= num_colon_seconds_tz() {
+        if is_iso(code) and left(c) >= 1 and c.v.at(c.at) == 90 {
+            c.at = c.at + 1
+            st.utc_named = true
+        } else {
+            offset_field(st, c, code)
+        }
+    } else if code == tz_name() {
+        if has(c.v, c.at, "UTC") {
+            st.utc_named = true
+            c.at = c.at + 3
+            return true
+        }
+        let n = zone_len(c)
+        if n == 0 {
+            st.ok = false
+        } else {
+            st.zone_name = c.v.slice(c.at, c.at + n).to_str()
+            c.at = c.at + n
+        }
+    } else if code == frac0() {
+        let ndigit = 1 + ch.digits
+        if left(c) < ndigit {
+            st.ok = false
+            return true
+        }
+        match nanoseconds(c, ndigit) {
+            Some(ns) -> st.nsec = ns
+            None -> st.ok = false
+        }
+        c.at = c.at + ndigit
+    } else if code == frac9() {
+        if left(c) >= 2 and (c.v.at(c.at) == 46 or c.v.at(c.at) == 44) and digit_at(c, 1) {
+            var i = 0
+            while i + 1 < left(c) and digit_at(c, i + 1) {
+                i = i + 1
+            }
+            match nanoseconds(c, 1 + i) {
+                Some(ns) -> st.nsec = ns
+                None -> st.ok = false
+            }
+            c.at = c.at + 1 + i
+        }
+    } else {
+        return false
+    }
+    true
+}
+
+/// A day of the year turned into a month and day, checked against any
+/// month and day also given.
+fn resolve_day(inout st: GoParse) -> () ! GoTimeError {
+    if st.yday < 0 {
+        if st.month < 0 {
+            st.month = 1
+        }
+        if st.day < 0 {
+            st.day = 1
+        }
+        return
+    }
+    var yday = st.yday
+    var d = 0
+    var m = 0
+    if is_leap(st.year) {
+        if yday == 60 {
+            m = 2
+            d = 29
+        } else if yday > 60 {
+            yday = yday - 1
+        }
+    }
+    if yday < 1 or yday > 365 {
+        fail(OutOfRange("day-of-year"))
+    }
+    if m == 0 {
+        m = (yday - 1) / 31 + 1
+        if days_before(m + 1) < yday {
+            m = m + 1
+        }
+        d = yday - days_before(m)
+    }
+    if st.month >= 0 and st.month != m {
+        fail(OutOfRange("day-of-year does not match month"))
+    }
+    if st.day >= 0 and st.day != d {
+        fail(OutOfRange("day-of-year does not match day"))
+    }
+    st.month = m
+    st.day = d
+}
+
+/// The moment, in the zone the value named -- with the local zone UTC.
+fn build_time(st: GoParse) -> GoTime {
+    var hour = st.hour
+    if st.pm and hour < 12 {
+        hour = hour + 12
+    } else if st.am and hour == 12 {
+        hour = 0
+    }
+    let wall = days_from_civil(st.year, st.month, st.day) * 86400 + hour * 3600 + st.min * 60 +
+    st.sec
+    if st.utc_named {
+        return GoTime{ unix: wall, nanos: st.nsec, offset: 0, zone: "UTC" }
+    }
+    if st.zone_offset != -1 {
+        // An offset of zero with no name, or named UTC, is the local zone;
+        // anything else is a fixed zone of its own.
+        if st.zone_offset == 0 and (st.zone_name.len() == 0 or st.zone_name == "UTC") {
+            return GoTime{ unix: wall, nanos: st.nsec, offset: 0, zone: "UTC" }
+        }
+        return GoTime{ unix: wall - st.zone_offset, nanos: st.nsec, offset: st.zone_offset,
+            zone: st.zone_name }
+    }
+    if st.zone_name.len() > 0 {
+        var offset = 0
+        if st.zone_name.len() > 3 and st.zone_name.starts_with("GMT") {
+            let zb = st.zone_name.to_bytes()
+            offset = (atoi(zb, 3, zb.len()) ?? 0) * 3600
+        }
+        return GoTime{ unix: wall, nanos: st.nsec, offset: offset, zone: st.zone_name }
+    }
+    GoTime{ unix: wall, nanos: st.nsec, offset: 0, zone: "UTC" }
+}
+
+/// `time.Parse(layout, value)`, on a machine whose local zone is UTC.
+pub fn parse(layout: str, value: str) -> GoTime ! GoTimeError {
+    let l = layout.to_bytes()
+    var c = GoCursor{ v: value.to_bytes(), at: 0 }
+    var st = GoParse{ year: 0, month: -1, day: -1, yday: -1, hour: 0, min: 0, sec: 0, nsec: 0,
+        am: false, pm: false, utc_named: false, zone_offset: -1, zone_name: "", ok: true,
+        range_err: "" }
+    var at = 0
+    while true {
+        let ch = next_chunk(l, at)
+        if not skip(c, l, at, ch.prefix_end) {
+            fail(Bad(l.slice(at, ch.prefix_end).to_str(), rest(c)))
+        }
+        if ch.code == 0 {
+            if left(c) != 0 {
+                fail(ExtraText(rest(c)))
+            }
+            break
+        }
+        at = ch.next
+        let hold = c
+        let _ = date_field(st, c, ch.code) or clock_field(st, c, ch.code, l, at) or
+        zone_field(st, c, ch)
+        if st.range_err.len() > 0 {
+            fail(OutOfRange(st.range_err))
+        }
+        if not st.ok {
+            fail(Bad(l.slice(ch.prefix_end, ch.next).to_str(), rest(hold)))
+        }
+    }
+    try resolve_day(st)
+    if st.day < 1 or st.day > days_in(st.month, st.year) {
+        fail(OutOfRange("day"))
+    }
+    build_time(st)
+}

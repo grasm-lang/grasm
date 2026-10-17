@@ -1,0 +1,540 @@
+// The line protocols under SMTP, HTTP/1, NNTP and POP3: Go's
+// `net/textproto`.
+//
+// Four pieces, each a place where reading these protocols by hand goes
+// wrong:
+//
+// - **MIME headers** -- `Name: value` lines, a line that begins with a
+//   space or tab continuing the one before, a blank line ending the block.
+//   Keys come back canonical (`content-TYPE` is `Content-Type`), values
+//   keep their order, and a key with a space in it is kept as it was rather
+//   than "fixed" -- Go's rule, because rewriting it would merge two headers
+//   a server meant to keep apart.
+// - **Numbered replies** -- `250-first` … `250 last`, the multi-line form
+//   SMTP and FTP share, with the expected-code check: `2` means any 2xx,
+//   `25` any 25x, `250` exactly that.
+// - **Dot-stuffing** -- a message body ends at a line holding one `.`, and
+//   a body line that begins with `.` is sent with another in front. Both
+//   directions, with Go's handling of a lone `\r`.
+// - **Line ends** -- `\r\n` or a bare `\n`, both accepted, as every real
+//   server sends one or the other.
+//
+// Everything reads from `bytes` at an offset and says how far it got, so a
+// caller holding a buffer from `tcp_read` can carry on after the header to
+// the body. The behaviour is Go's, edge cases included: the gate runs the
+// same inputs through Go and compares.
+
+type TextHeader = {
+    /// Canonical keys, in the order each was first seen.
+    keys: [str],
+    /// Every value of each key, in order.
+    values: [[str]],
+}
+
+type TextResponse = {
+    code: i64,
+    message: str,
+}
+
+type TextprotoError =
+    | Truncated
+    | Malformed(line: str)
+    /// The reply parsed, but its code was not the one expected. The code and
+    /// message are kept, as Go's `*Error` keeps them.
+    | Unexpected(code: i64, message: str)
+
+// ---------------------------------------------------------------------------
+// Bytes
+
+fn valid_field_byte(c: i64) -> bool {
+    (c >= 48 and c <= 57) or (c >= 97 and c <= 122) or (c >= 65 and c <= 90) or
+    c == 33 or c == 35 or c == 36 or c == 37 or c == 38 or c == 39 or c == 42 or
+    c == 43 or c == 45 or c == 46 or c == 94 or c == 95 or c == 96 or c == 124 or
+    c == 126
+}
+
+/// Go's `validHeaderValueByte`: visible ASCII, space, tab, and any byte
+/// above 127. Controls and DEL are refused.
+fn valid_value_byte(c: i64) -> bool {
+    c == 9 or (c >= 32 and c != 127)
+}
+
+fn canon(a: bytes) -> str {
+    var out: [i64] = []
+    var upper = true
+    var i = 0
+    while i < a.len() {
+        var c = a.at(i)
+        if upper and c >= 97 and c <= 122 {
+            c = c - 32
+        } else if not upper and c >= 65 and c <= 90 {
+            c = c + 32
+        }
+        out.push(c)
+        upper = c == 45
+        i = i + 1
+    }
+    bytes_of(out).to_str()
+}
+
+/// `CanonicalMIMEHeaderKey`: the first letter and every letter after a
+/// hyphen upper-case, the rest lower. A key holding anything that cannot be
+/// in a header name -- a space, a colon, a non-ASCII byte -- comes back
+/// unchanged, wherever in the key it is.
+pub fn canonical_key(key: str) -> str {
+    let s = key.to_bytes()
+    var upper = true
+    var i = 0
+    while i < s.len() {
+        let c = s.at(i)
+        if not valid_field_byte(c) {
+            return key
+        }
+        if (upper and c >= 97 and c <= 122) or (not upper and c >= 65 and c <= 90) {
+            // Go hands the whole key to the stricter reader here, which
+            // gives it back unchanged if anything later in it is not a
+            // name byte -- so `content-type x` is not half-canonicalised.
+            return canonical_name(s) ?? key
+        }
+        upper = c == 45
+        i = i + 1
+    }
+    key
+}
+
+/// The header-reading form, which is stricter: an empty name or a byte
+/// outside a name is malformed, and a name with a space is kept as it is.
+fn canonical_name(a: bytes) -> Option[str] {
+    if a.len() == 0 {
+        return None
+    }
+    var spaced = false
+    var i = 0
+    while i < a.len() {
+        let c = a.at(i)
+        if not valid_field_byte(c) {
+            if c == 32 {
+                spaced = true
+            } else {
+                return None
+            }
+        }
+        i = i + 1
+    }
+    if spaced {
+        return Some(a.to_str())
+    }
+    Some(canon(a))
+}
+
+fn is_space(c: i64) -> bool {
+    c == 32 or c == 9 or c == 10 or c == 13
+}
+
+/// `TrimString`: ASCII space, tab, CR and LF off both ends.
+pub fn trim_string(s: str) -> str {
+    let b = s.to_bytes()
+    var from = 0
+    var end = b.len()
+    while from < end and is_space(b.at(from)) {
+        from = from + 1
+    }
+    while end > from and is_space(b.at(end - 1)) {
+        end = end - 1
+    }
+    b.slice(from, end).to_str()
+}
+
+fn trim_blank(b: bytes) -> bytes {
+    var from = 0
+    var end = b.len()
+    while from < end and (b.at(from) == 32 or b.at(from) == 9) {
+        from = from + 1
+    }
+    while end > from and (b.at(end - 1) == 32 or b.at(end - 1) == 9) {
+        end = end - 1
+    }
+    b.slice(from, end)
+}
+
+// ---------------------------------------------------------------------------
+// Lines
+
+/// One line from `at`: its bytes without `\n` or `\r\n`, and where the next
+/// begins. `None` at the end of the data, as `bufio.ReadLine` reports EOF.
+fn read_line(data: bytes, at: i64) -> Option[(bytes, i64)] {
+    if at >= data.len() {
+        return None
+    }
+    match data.index_of(10, at) {
+        Some(nl) -> {
+            var end = nl
+            if end > at and data.at(end - 1) == 13 {
+                end = end - 1
+            }
+            Some((data.slice(at, end), nl + 1))
+        }
+        None -> Some((data.slice(at, data.len()), data.len()))
+    }
+}
+
+/// `readContinuedLineSlice`: a line and every following line that begins
+/// with a space or tab, trimmed and joined by single spaces.
+fn read_continued(data: bytes, at: i64, need_colon: bool) -> Option[(bytes, i64)] ! TextprotoError {
+    let first = read_line(data, at)
+    if first.is_none() {
+        return None
+    }
+    let got = first ?? (bytes_of([]), at)
+    let line = got.0
+    var pos = got.1
+    if line.len() == 0 {
+        return Some((line, pos))
+    }
+    if need_colon and line.index_of(58, 0).is_none() {
+        fail(Malformed(line.to_str()))
+    }
+    var buf = trim_blank(line)
+    while true {
+        var n = 0
+        while pos < data.len() and (data.at(pos) == 32 or data.at(pos) == 9) {
+            pos = pos + 1
+            n = n + 1
+        }
+        if n == 0 {
+            break
+        }
+        buf = buf.concat(bytes_of([32]))
+        match read_line(data, pos) {
+            Some(next) -> {
+                buf = buf.concat(trim_blank(next.0))
+                pos = next.1
+            }
+            None -> break
+        }
+    }
+    Some((buf, pos))
+}
+
+/// `ReadContinuedLine` from `at`: the joined line and where reading stopped.
+pub fn read_continued_line(data: bytes, at: i64) -> (str, i64) ! TextprotoError {
+    match try read_continued(data, at, false) {
+        Some(got) -> (got.0.to_str(), got.1)
+        None -> fail(Truncated)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Headers
+
+fn add_value(inout h: TextHeader, key: str, value: str) {
+    var k = 0
+    while k < h.keys.len() {
+        if h.keys[k] == key {
+            var vs = h.values[k]
+            vs.push(value)
+            h.values[k] = vs
+            return
+        }
+        k = k + 1
+    }
+    h.keys.push(key)
+    h.values.push([value])
+}
+
+/// `ReadMIMEHeader` from `at`: the header block and the offset just past the
+/// blank line that ended it. Data that ends before the blank line is
+/// `Truncated`.
+pub fn read_header(data: bytes, at: i64) -> (TextHeader, i64) ! TextprotoError {
+    var h = TextHeader{ keys: [], values: [] }
+    if at < data.len() and (data.at(at) == 32 or data.at(at) == 9) {
+        let first = read_line(data, at) ?? (bytes_of([]), at)
+        fail(Malformed(first.0.to_str()))
+    }
+    var pos = at
+    while true {
+        let got = try read_continued(data, pos, true)
+        if got.is_none() {
+            fail(Truncated)
+        }
+        let kv = got ?? (bytes_of([]), pos)
+        pos = kv.1
+        let line = kv.0
+        if line.len() == 0 {
+            return (h, pos)
+        }
+        let colon = line.index_of(58, 0) ?? -1
+        if colon < 0 {
+            fail(Malformed(line.to_str()))
+        }
+        let key = canonical_name(line.slice(0, colon))
+        if key.is_none() {
+            fail(Malformed(line.to_str()))
+        }
+        var i = colon + 1
+        while i < line.len() {
+            if not valid_value_byte(line.at(i)) {
+                fail(Malformed(line.to_str()))
+            }
+            i = i + 1
+        }
+        var v = colon + 1
+        while v < line.len() and (line.at(v) == 32 or line.at(v) == 9) {
+            v = v + 1
+        }
+        add_value(h, key ?? "", line.slice(v, line.len()).to_str())
+    }
+    (h, pos)
+}
+
+/// The first value of `key`, given in any case.
+pub fn get(h: TextHeader, key: str) -> Option[str] {
+    let want = canonical_key(key)
+    for k in 0..h.keys.len() {
+        if h.keys[k] == want {
+            return h.values[k].first()
+        }
+    }
+    None
+}
+
+/// Every value of `key`, in order.
+pub fn get_all(h: TextHeader, key: str) -> [str] {
+    let want = canonical_key(key)
+    for k in 0..h.keys.len() {
+        if h.keys[k] == want {
+            return h.values[k]
+        }
+    }
+    []
+}
+
+// ---------------------------------------------------------------------------
+// Numbered replies
+
+/// `parseCodeLine`: the code, whether more lines follow, the message, and
+/// what was wrong with it, if anything: 0 none, 1 malformed, 2 unexpected.
+type TextCodeLine = {
+    code: i64,
+    continued: bool,
+    message: str,
+    problem: i64,
+}
+
+fn parse_code_line(line: bytes, expect: i64) -> TextCodeLine {
+    if line.len() < 4 or (line.at(3) != 32 and line.at(3) != 45) {
+        return TextCodeLine{ code: 0, continued: false, message: "", problem: 1 }
+    }
+    let continued = line.at(3) == 45
+    // `strconv.Atoi` of three bytes: a sign is allowed, and any value it
+    // gives is below 100 and refused.
+    var code = 0
+    var ok = true
+    var i = 0
+    var neg = false
+    if line.at(0) == 43 or line.at(0) == 45 {
+        neg = line.at(0) == 45
+        i = 1
+    }
+    while i < 3 {
+        let c = line.at(i)
+        if c < 48 or c > 57 {
+            ok = false
+        }
+        code = code * 10 + c - 48
+        i = i + 1
+    }
+    if not ok {
+        code = 0
+    } else if neg {
+        code = 0 - code
+    }
+    if not ok or code < 100 {
+        return TextCodeLine{ code: code, continued: continued, message: "", problem: 1 }
+    }
+    let message = line.slice(4, line.len()).to_str()
+    var wrong = false
+    if expect >= 1 and expect < 10 and code / 100 != expect {
+        wrong = true
+    }
+    if expect >= 10 and expect < 100 and code / 10 != expect {
+        wrong = true
+    }
+    if expect >= 100 and expect < 1000 and code != expect {
+        wrong = true
+    }
+    TextCodeLine{ code: code, continued: continued, message: message,
+        problem: if wrong { 2 } else { 0 } }
+}
+
+/// `ReadCodeLine`: one reply line, which must not be the first of several.
+pub fn read_code_line(data: bytes, at: i64, expect: i64) -> (TextResponse, i64) ! TextprotoError {
+    let got = read_line(data, at)
+    if got.is_none() {
+        fail(Truncated)
+    }
+    let l = got ?? (bytes_of([]), at)
+    let p = parse_code_line(l.0, expect)
+    if p.problem == 1 {
+        fail(Malformed(l.0.to_str()))
+    }
+    if p.problem == 2 {
+        fail(Unexpected(p.code, p.message))
+    }
+    if p.continued {
+        fail(Malformed(p.message))
+    }
+    (TextResponse{ code: p.code, message: p.message }, l.1)
+}
+
+/// `ReadResponse`: a reply of one or more lines. The message is the lines'
+/// text joined by `\n`. A continuation line that does not carry the same
+/// code is kept whole, as Go keeps it, rather than ending the reply.
+pub fn read_response(data: bytes, at: i64, expect: i64) -> (TextResponse, i64) ! TextprotoError {
+    let got = read_line(data, at)
+    if got.is_none() {
+        fail(Truncated)
+    }
+    let l = got ?? (bytes_of([]), at)
+    let first = parse_code_line(l.0, expect)
+    var pos = l.1
+    var continued = first.continued
+    let multi = continued
+    var message = first.message
+    while continued {
+        let next = read_line(data, pos)
+        if next.is_none() {
+            fail(Truncated)
+        }
+        let n = next ?? (bytes_of([]), pos)
+        pos = n.1
+        let p = parse_code_line(n.0, 0)
+        if p.problem != 0 or p.code != first.code {
+            var text = n.0
+            while text.len() > 0 and (text.at(text.len() - 1) == 13 or text.at(text.len() - 1) == 10) {
+                text = text.slice(0, text.len() - 1)
+            }
+            message = message + "\n" + text.to_str()
+            continued = true
+            continue
+        }
+        message = message + "\n" + p.message
+        continued = p.continued
+    }
+    if first.problem != 0 and multi and message.len() > 0 {
+        fail(Unexpected(first.code, message))
+    }
+    if first.problem == 1 {
+        fail(Malformed(l.0.to_str()))
+    }
+    if first.problem == 2 {
+        fail(Unexpected(first.code, message))
+    }
+    (TextResponse{ code: first.code, message: message }, pos)
+}
+
+// ---------------------------------------------------------------------------
+// Dot-stuffing
+
+/// `ReadDotBytes` from `at`: the body up to the `.` line, with `\r\n`
+/// turned to `\n` and the stuffed dots removed, and where reading stopped.
+/// Data that ends first is `Truncated`.
+pub fn dot_decode(data: bytes, at: i64) -> (bytes, i64) ! TextprotoError {
+    // States: 0 line start, 1 after a dot there, 2 after ".\r", 3 after
+    // "\r", 4 inside a line.
+    var state = 0
+    var out: [i64] = []
+    var i = at
+    while i < data.len() {
+        var c = data.at(i)
+        i = i + 1
+        if state == 0 {
+            if c == 46 {
+                state = 1
+                continue
+            }
+            if c == 13 {
+                state = 3
+                continue
+            }
+            state = 4
+        } else if state == 1 {
+            if c == 13 {
+                state = 2
+                continue
+            }
+            if c == 10 {
+                return (bytes_of(out), i)
+            }
+            state = 4
+        } else if state == 2 {
+            if c == 10 {
+                return (bytes_of(out), i)
+            }
+            i = i - 1
+            c = 13
+            state = 4
+        } else if state == 3 {
+            if c == 10 {
+                state = 0
+            } else {
+                i = i - 1
+                c = 13
+                state = 4
+            }
+        } else {
+            if c == 13 {
+                state = 3
+                continue
+            }
+            if c == 10 {
+                state = 0
+            }
+        }
+        out.push(c)
+    }
+    fail(Truncated)
+}
+
+/// `DotWriter`: `body` written and closed -- every line ending made `\r\n`,
+/// a dot doubled at the start of a line, and the `.` line appended.
+pub fn dot_encode(body: bytes) -> bytes {
+    // States: 0 nothing yet, 1 line start, 2 after "\r", 3 inside a line.
+    var state = 0
+    var out: [i64] = []
+    var i = 0
+    while i < body.len() {
+        let c = body.at(i)
+        if state == 0 or state == 1 {
+            state = 3
+            if c == 46 {
+                out.push(46)
+            }
+        }
+        if state == 3 {
+            if c == 13 {
+                state = 2
+            } else if c == 10 {
+                out.push(13)
+                state = 1
+            }
+        } else if state == 2 {
+            state = 3
+            if c == 10 {
+                state = 1
+            }
+        }
+        out.push(c)
+        i = i + 1
+    }
+    if state == 0 or state == 3 {
+        out.push(13)
+        out.push(10)
+    } else if state == 2 {
+        out.push(10)
+    }
+    out.push(46)
+    out.push(13)
+    out.push(10)
+    bytes_of(out)
+}
