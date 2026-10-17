@@ -14,14 +14,43 @@
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
+# A subset, by name match, so the suite can be run in parts. The whole thing
+# takes longer than some runners allow in one go, and the alternative to
+# splitting it was a run that gets killed partway and reports nothing.
+#
+# `./scripts/allgates.sh diff` runs every gate whose name contains "diff".
+# Several patterns may be given and a gate matching any of them runs.
+#
+# A subset run says so on its last line and never says "every gate passed",
+# because a partial green quoted as a full one is the mistake this whole
+# script exists to prevent.
+ONLY=("$@")
+matches() {
+    [ ${#ONLY[@]} -eq 0 ] && return 0
+    local pat
+    for pat in "${ONLY[@]}"; do
+        case "$1" in
+            *"$pat"*) return 0 ;;
+        esac
+    done
+    return 1
+}
+
 LOGS=${LOGS:-$(mktemp -d)}
 mkdir -p "$LOGS"
 failed=0
+ran=0
+skipped=0
 declare -a FAILED=()
 
 # Runs one gate and reports it. `$1` is the label, the rest is the command.
 run_gate() {
     local name="$1"; shift
+    if ! matches "$name"; then
+        skipped=$((skipped + 1))
+        return 0
+    fi
+    ran=$((ran + 1))
     local log="$LOGS/$name.log"
     printf '%-16s ' "$name"
     if "$@" >"$log" 2>&1; then
@@ -209,4 +238,18 @@ if [ "$failed" -gt 0 ]; then
     echo "logs under $LOGS"
     exit 1
 fi
-echo "every gate passed"
+if [ "$ran" -eq 0 ]; then
+    # Nothing matched, which is a typo in the pattern and not a pass.
+    echo "no gate matched ${ONLY[*]}, so nothing ran"
+    exit 1
+fi
+if [ "$skipped" -gt 0 ]; then
+    echo "$ran gate(s) passed, $skipped skipped by ${ONLY[*]} — this is a subset"
+    echo "the whole suite is $((ran + skipped)) gates"
+    exit 0
+fi
+# The count comes from here and not from counting `run_gate` lines. Fifteen
+# of the gates come out of a loop over `scripts/fuzz_*.py`, so a grep for
+# the call sees one where there are fifteen -- which is how this was being
+# quoted as 110 when it is 123.
+echo "every gate passed — $ran of them"
