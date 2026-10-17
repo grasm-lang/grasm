@@ -1,0 +1,24 @@
+[package]
+name = "pubkey_demo"
+version = "1.0.0"
+capabilities = ["io"]
+
+[dependencies.modarith]
+path = "../modarith"
+version = "^1.0.0"
+
+[dependencies.ecdh]
+path = "../ecdh"
+version = "^1.0.0"
+
+[dependencies.ecdsa]
+path = "../ecdsa"
+version = "^1.0.0"
+
+[dependencies.mlkem]
+path = "../mlkem"
+version = "^1.0.0"
+
+[dependencies.sha3]
+path = "../sha3"
+version = "^1.0.0"

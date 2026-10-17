@@ -1,0 +1,226 @@
+// DSA, FIPS 186-4: signing with deterministic nonces, and verifying.
+//
+// ## Legacy. Verify with it; sign with something else.
+//
+// FIPS 186-5 (2023) withdrew DSA for new signatures and kept it only for
+// checking old ones, and OpenSSH dropped `ssh-dss` by default in 2015. What
+// is still around is a great deal of signed material: old PGP keys, Java
+// archives, SSH host keys on long-lived equipment, X.509 chains from before
+// ECDSA took over. This reads all of it and can produce it, for tests and
+// for the systems that still ask. New keys belong in `ed25519` or `ecdsa`.
+//
+// ## As ECDSA, but in a multiplicative group
+//
+// The private key `x` is below the subgroup order `q`, the public key is
+// `y = g^x mod p`, and a signature is `r = (g^k mod p) mod q`,
+// `s = k^-1 (z + x r) mod q`. The nonce `k` comes from `rfc6979`, so a
+// signature is deterministic and is checked against OpenSSL's
+// `nonce-type:1` byte for byte. The exponentiations that touch `x` or `k`
+// are `modarith.pow_secret` -- a fixed-length ladder; read `modarith`'s
+// caveat about what that does and does not promise.
+import modarith
+import rfc6979
+
+type DsaParams = {
+    p: bytes,
+    q: bytes,
+    g: bytes,
+}
+
+type DsaSignature = {
+    r: bytes,
+    s: bytes,
+}
+
+type DsaError =
+    | Params
+    | PrivateKey
+    | PublicKey
+    | Hash(name: str)
+    | Encoding
+
+fn field_of(m: bytes) -> ModField ! DsaError {
+    match modarith.field(m) {
+        Ok(f) -> f
+        Err(_) -> fail(Params)
+    }
+}
+
+fn below(a: bytes, f: ModField) -> bool {
+    if modarith.bit_length(a) > f.bits {
+        return false
+    }
+    modarith.sub_borrow(modarith.limbs_of(a, f.limbs), f.m).1 == 1
+}
+
+fn positive_below(a: bytes, f: ModField) -> bool {
+    below(a, f) and modarith.bit_length(a) > 0
+}
+
+/// Domain parameters, checked for shape: `p` and `q` odd, `q` of 160, 224
+/// or 256 bits, and `1 < g < p`. Primality is not tested; parameters come
+/// from somewhere that generated them.
+pub fn params(p: bytes, q: bytes, g: bytes) -> DsaParams ! DsaError {
+    let fp = try field_of(p)
+    let fq = try field_of(q)
+    if fq.bits != 160 and fq.bits != 224 and fq.bits != 256 {
+        fail(Params)
+    }
+    if fp.bits < 512 or not below(g, fp) or modarith.bit_length(g) < 2 {
+        fail(Params)
+    }
+    DsaParams{ p: p, q: q, g: g }
+}
+
+/// `y = g^x mod p`, as many bytes as `p`.
+pub fn public_key(dp: DsaParams, x: bytes) -> bytes ! DsaError {
+    let fp = try field_of(dp.p)
+    let fq = try field_of(dp.q)
+    if not positive_below(x, fq) {
+        fail(PrivateKey)
+    }
+    let g = modarith.from_bytes(fp, dp.g)
+    modarith.to_bytes(fp, modarith.pow_secret(fp, g, x, fq.bits))
+}
+
+/// Sign a digest made by `hash_name` (`SHA-1`, `SHA-256`, `SHA-384`,
+/// `SHA-512`). A digest longer than `q` is cut to its leftmost bits.
+pub fn sign(dp: DsaParams, x: bytes, hash_name: str, hash: bytes) -> DsaSignature ! DsaError {
+    let fp = try field_of(dp.p)
+    let fq = try field_of(dp.q)
+    if not positive_below(x, fq) {
+        fail(PrivateKey)
+    }
+    var gen = match rfc6979.start(dp.q, x, hash_name, hash) {
+        Ok(found) -> found
+        Err(_) -> fail(Hash(hash_name))
+    }
+    let g = modarith.from_bytes(fp, dp.g)
+    let z = modarith.from_bytes(fq, rfc6979.bits2int(hash, fq.bits, fq.size))
+    let xm = modarith.from_bytes(fq, x)
+    while true {
+        let k = rfc6979.next(gen)
+        let gk = modarith.to_bytes(fp, modarith.pow_secret(fp, g, k, fq.bits))
+        let r = modarith.from_bytes(fq, gk)
+        if modarith.is_zero(r) {
+            continue
+        }
+        let kinv = modarith.inverse_prime(fq, modarith.from_bytes(fq, k))
+        let s = modarith.mul(fq, kinv, modarith.add(fq, z, modarith.mul(fq, xm, r)))
+        if not modarith.is_zero(s) {
+            return DsaSignature{ r: modarith.to_bytes(fq, r), s: modarith.to_bytes(fq, s) }
+        }
+    }
+    fail(PrivateKey)
+}
+
+/// Whether `sig` is a signature of `hash` under the public key `y`. Every
+/// malformed input is simply `false`.
+pub fn verify(dp: DsaParams, y: bytes, hash: bytes, sig: DsaSignature) -> bool {
+    let fp = match modarith.field(dp.p) {
+        Ok(f) -> f
+        Err(_) -> return false
+    }
+    let fq = match modarith.field(dp.q) {
+        Ok(f) -> f
+        Err(_) -> return false
+    }
+    if not positive_below(sig.r, fq) or not positive_below(sig.s, fq) {
+        return false
+    }
+    if not below(y, fp) or modarith.bit_length(y) < 2 {
+        return false
+    }
+    let w = modarith.inverse_prime(fq, modarith.from_bytes(fq, sig.s))
+    let z = modarith.from_bytes(fq, rfc6979.bits2int(hash, fq.bits, fq.size))
+    let u1 = modarith.to_bytes(fq, modarith.mul(fq, z, w))
+    let u2 = modarith.to_bytes(fq, modarith.mul(fq, modarith.from_bytes(fq, sig.r), w))
+    let gu = modarith.pow(fp, modarith.from_bytes(fp, dp.g), u1)
+    let yu = modarith.pow(fp, modarith.from_bytes(fp, y), u2)
+    let v = modarith.from_bytes(fq, modarith.to_bytes(fp, modarith.mul(fp, gu, yu)))
+    modarith.equal(v, modarith.from_bytes(fq, sig.r))
+}
+
+// ---------------------------------------------------------------------------
+// The DER form, `SEQUENCE { INTEGER r, INTEGER s }`
+
+fn der_length(n: i64) -> bytes {
+    if n < 128 {
+        return bytes_of([n])
+    }
+    if n < 256 {
+        return bytes_of([129, n])
+    }
+    bytes_of([130, n.ushr(8), n.bit_and(255)])
+}
+
+fn der_integer(v: bytes) -> bytes {
+    var i = 0
+    while i + 1 < v.len() and v.at(i) == 0 {
+        i = i + 1
+    }
+    var body = v.slice(i, v.len())
+    if body.at(0) >= 128 {
+        body = bytes_of([0]).concat(body)
+    }
+    bytes_of([2]).concat(der_length(body.len())).concat(body)
+}
+
+pub fn to_der(sig: DsaSignature) -> bytes {
+    let body = der_integer(sig.r).concat(der_integer(sig.s))
+    bytes_of([48]).concat(der_length(body.len())).concat(body)
+}
+
+fn read_length(b: bytes, at: i64) -> (i64, i64) ! DsaError {
+    if at >= b.len() {
+        fail(Encoding)
+    }
+    let first = b.at(at)
+    if first < 128 {
+        return (first, at + 1)
+    }
+    if first == 129 and at + 1 < b.len() and b.at(at + 1) >= 128 {
+        return (b.at(at + 1), at + 2)
+    }
+    fail(Encoding)
+}
+
+fn read_integer(b: bytes, at: i64, size: i64) -> (bytes, i64) ! DsaError {
+    if at >= b.len() or b.at(at) != 2 {
+        fail(Encoding)
+    }
+    let l = try read_length(b, at + 1)
+    let start = l.1
+    let end = start + l.0
+    if l.0 == 0 or end > b.len() or b.at(start) >= 128 {
+        fail(Encoding)
+    }
+    if l.0 > 1 and b.at(start) == 0 and b.at(start + 1) < 128 {
+        fail(Encoding)
+    }
+    var body = b.slice(start, end)
+    if body.at(0) == 0 {
+        body = body.slice(1, body.len())
+    }
+    if body.len() > size {
+        fail(Encoding)
+    }
+    (bytes_filled(size - body.len(), 0).concat(body), end)
+}
+
+/// A DER signature for parameters whose `q` is `q_size` bytes.
+pub fn from_der(q_size: i64, der: bytes) -> DsaSignature ! DsaError {
+    if der.len() < 2 or der.at(0) != 48 {
+        fail(Encoding)
+    }
+    let l = try read_length(der, 1)
+    if l.1 + l.0 != der.len() {
+        fail(Encoding)
+    }
+    let r = try read_integer(der, l.1, q_size)
+    let s = try read_integer(der, r.1, q_size)
+    if s.1 != der.len() {
+        fail(Encoding)
+    }
+    DsaSignature{ r: r.0, s: s.0 }
+}

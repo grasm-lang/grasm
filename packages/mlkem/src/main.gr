@@ -1,0 +1,520 @@
+// ML-KEM, FIPS 203: the post-quantum key encapsulation NIST standardised in
+// 2024, at all three sizes -- ML-KEM-512, -768 and -1024.
+//
+// A key encapsulation mechanism is what replaces Diffie-Hellman when the
+// adversary may one day own a quantum computer: one side publishes an
+// encapsulation key, the other uses it to produce a ciphertext and a shared
+// 32-byte secret, and the first recovers the same secret from the
+// ciphertext with its decapsulation key. TLS 1.3's `X25519MLKEM768` -- in
+// Chrome, Firefox, Cloudflare and OpenSSH by default since 2024 -- runs
+// ML-KEM-768 beside X25519, so that breaking the session needs breaking
+// both.
+//
+// ## What is deterministic, and why that matters for checking it
+//
+// FIPS 203 defines the randomised operations through deterministic inner
+// ones: `KeyGen_internal(d, z)` and `Encaps_internal(ek, m)`. This exposes
+// those, taking the randomness as arguments, so the same inputs give the
+// same keys and ciphertexts everywhere -- which is how it is checked
+// against Go's `crypto/mlkem` and OpenSSL's ML-KEM byte for byte. A caller
+// draws `d`, `z` and `m` from `random_bytes(32)` -- fresh for every key and
+// every encapsulation -- and passes them in, which keeps this package free
+// of any capability: it computes, and nothing else.
+//
+// ## WARNING -- what this is not
+//
+// The source is written to be constant-time: no branch, no table index and
+// no division depends on a secret. Reduction modulo q is Barrett's, by
+// multiply and shift; compression is a multiply and shift whose constant
+// was checked exhaustively against the division it replaces (the
+// "KyberSlash" timing leaks in 2024 were exactly a division left in this
+// place); decapsulation's comparison and its choice between the real and
+// the implicit-rejection key are masks. **Grasm cannot promise the compiler
+// keeps that**, as `x25519` says of itself. Not audited.
+import sha3
+
+type MlkemParams = {
+    k: i64,
+    eta1: i64,
+    du: i64,
+    dv: i64,
+}
+
+type MlkemKeys = {
+    encapsulation: bytes,
+    decapsulation: bytes,
+}
+
+type MlkemEncapsulated = {
+    shared: bytes,
+    ciphertext: bytes,
+}
+
+type MlkemError =
+    | Variant(name: str)
+    | Length(what: str, got: i64)
+    | Modulus
+    | HashCheck
+
+fn q() -> i64 {
+    3329
+}
+
+/// ML-KEM-512, -768 or -1024.
+pub fn params(name: str) -> MlkemParams ! MlkemError {
+    if name == "ML-KEM-512" {
+        return MlkemParams{ k: 2, eta1: 3, du: 10, dv: 4 }
+    }
+    if name == "ML-KEM-768" {
+        return MlkemParams{ k: 3, eta1: 2, du: 10, dv: 4 }
+    }
+    if name == "ML-KEM-1024" {
+        return MlkemParams{ k: 4, eta1: 2, du: 11, dv: 5 }
+    }
+    fail(Variant(name))
+}
+
+pub fn encapsulation_key_size(p: MlkemParams) -> i64 {
+    384 * p.k + 32
+}
+
+pub fn decapsulation_key_size(p: MlkemParams) -> i64 {
+    768 * p.k + 96
+}
+
+pub fn ciphertext_size(p: MlkemParams) -> i64 {
+    32 * (p.du * p.k + p.dv)
+}
+
+// ---------------------------------------------------------------------------
+// Arithmetic modulo q, without division
+
+/// `x mod q` for `0 <= x < 2^31`: Barrett's quotient, then one masked
+/// subtraction.
+fn reduce(x: i64) -> i64 {
+    let r = x - (x * 1290167).ushr(32) * 3329
+    let s = r - 3329
+    s + s.shr(63).bit_and(3329)
+}
+
+fn mulq(a: i64, b: i64) -> i64 {
+    reduce(a * b)
+}
+
+fn bitrev7(i: i64) -> i64 {
+    var out = 0
+    for b in 0..7 {
+        out = out.bit_or(i.ushr(b).bit_and(1).shl(6 - b))
+    }
+    out
+}
+
+fn powq(base: i64, e: i64) -> i64 {
+    var r = 1
+    for _ in 0..e {
+        r = mulq(r, base)
+    }
+    r
+}
+
+fn load_zetas() -> [i64] {
+    var out: [i64] = []
+    for i in 0..128 {
+        out.push(powq(17, bitrev7(i)))
+    }
+    out
+}
+
+fn load_gammas() -> [i64] {
+    var out: [i64] = []
+    for i in 0..128 {
+        out.push(powq(17, 2 * bitrev7(i) + 1))
+    }
+    out
+}
+
+let MLKEM_ZETAS = load_zetas()
+let MLKEM_GAMMAS = load_gammas()
+
+fn zero_poly() -> [i64] {
+    var out: [i64] = []
+    for _ in 0..256 {
+        out.push(0)
+    }
+    out
+}
+
+/// Algorithm 9.
+fn ntt(poly: [i64]) -> [i64] {
+    var f = poly
+    var i = 1
+    var len = 128
+    while len >= 2 {
+        var start = 0
+        while start < 256 {
+            let zeta = MLKEM_ZETAS[i]
+            i = i + 1
+            for j in start..start + len {
+                let t = mulq(zeta, f[j + len])
+                f[j + len] = reduce(f[j] - t + 3329)
+                f[j] = reduce(f[j] + t)
+            }
+            start = start + 2 * len
+        }
+        len = len / 2
+    }
+    f
+}
+
+/// Algorithm 10, with the final scaling by 128^-1 = 3303.
+fn ntt_inverse(poly: [i64]) -> [i64] {
+    var f = poly
+    var i = 127
+    var len = 2
+    while len <= 128 {
+        var start = 0
+        while start < 256 {
+            let zeta = MLKEM_ZETAS[i]
+            i = i - 1
+            for j in start..start + len {
+                let t = f[j]
+                f[j] = reduce(t + f[j + len])
+                f[j + len] = mulq(zeta, f[j + len] - t + 3329)
+            }
+            start = start + 2 * len
+        }
+        len = len * 2
+    }
+    for j in 0..256 {
+        f[j] = mulq(f[j], 3303)
+    }
+    f
+}
+
+/// Algorithms 11 and 12: the product of two polynomials in the NTT domain,
+/// as 128 products of degree-one polynomials.
+fn multiply_ntts(f: [i64], g: [i64]) -> [i64] {
+    var h = zero_poly()
+    for i in 0..128 {
+        let a0 = f[2 * i]
+        let a1 = f[2 * i + 1]
+        let b0 = g[2 * i]
+        let b1 = g[2 * i + 1]
+        h[2 * i] = reduce(mulq(a0, b0) + mulq(mulq(a1, b1), MLKEM_GAMMAS[i]))
+        h[2 * i + 1] = reduce(mulq(a0, b1) + mulq(a1, b0))
+    }
+    h
+}
+
+fn add_poly(a: [i64], b: [i64]) -> [i64] {
+    var out = a
+    for i in 0..256 {
+        out[i] = reduce(a[i] + b[i])
+    }
+    out
+}
+
+fn sub_poly(a: [i64], b: [i64]) -> [i64] {
+    var out = a
+    for i in 0..256 {
+        out[i] = reduce(a[i] - b[i] + 3329)
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Sampling
+
+/// Algorithm 7: uniform coefficients by rejection from SHAKE128. The input
+/// is public, so the loop's length may depend on it.
+fn sample_ntt(seed: bytes) -> [i64] {
+    var want = 840
+    while true {
+        let stream = sha3.shake128(seed, want)
+        var a = zero_poly()
+        var j = 0
+        var at = 0
+        while j < 256 and at + 3 <= stream.len() {
+            let c0 = stream.at(at)
+            let c1 = stream.at(at + 1)
+            let c2 = stream.at(at + 2)
+            at = at + 3
+            let d1 = c0 + 256 * c1.bit_and(15)
+            let d2 = c1.ushr(4) + 16 * c2
+            if d1 < 3329 {
+                a[j] = d1
+                j = j + 1
+            }
+            if d2 < 3329 and j < 256 {
+                a[j] = d2
+                j = j + 1
+            }
+        }
+        if j == 256 {
+            return a
+        }
+        want = want * 2
+    }
+    zero_poly()
+}
+
+/// Algorithm 8: a centred binomial distribution with parameter `eta`.
+fn sample_cbd(b: bytes, eta: i64) -> [i64] {
+    var f = zero_poly()
+    for i in 0..256 {
+        var x = 0
+        var y = 0
+        for j in 0..eta {
+            let p = 2 * i * eta + j
+            let r = 2 * i * eta + eta + j
+            x = x + b.at(p / 8).ushr(p % 8).bit_and(1)
+            y = y + b.at(r / 8).ushr(r % 8).bit_and(1)
+        }
+        f[i] = reduce(x - y + 3329)
+    }
+    f
+}
+
+fn prf(eta: i64, s: bytes, n: i64) -> bytes {
+    sha3.shake256(s.concat(bytes_of([n])), 64 * eta)
+}
+
+/// Â, as a list of rows; entry `[i][j]` is SampleNTT(ρ ‖ j ‖ i).
+fn matrix(rho: bytes, k: i64) -> [[[i64]]] {
+    var out: [[[i64]]] = []
+    for i in 0..k {
+        var row: [[i64]] = []
+        for j in 0..k {
+            row.push(sample_ntt(rho.concat(bytes_of([j, i]))))
+        }
+        out.push(row)
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Encodings
+
+/// Algorithm 5: 256 `d`-bit numbers, little-endian bit order.
+fn byte_encode(f: [i64], d: i64) -> bytes {
+    var out = bytes_filled(32 * d, 0)
+    var bit = 0
+    for i in 0..256 {
+        let v = f[i]
+        for b in 0..d {
+            let at = bit / 8
+            out.set(at, out.at(at).bit_or(v.ushr(b).bit_and(1).shl(bit % 8)))
+            bit = bit + 1
+        }
+    }
+    out
+}
+
+/// Algorithm 6. Twelve-bit values are reduced modulo q, as the standard
+/// says; the caller checks whether that changed anything when it matters.
+fn byte_decode(b: bytes, from: i64, d: i64) -> [i64] {
+    var f = zero_poly()
+    var bit = from * 8
+    for i in 0..256 {
+        var v = 0
+        for j in 0..d {
+            v = v.bit_or(b.at(bit / 8).ushr(bit % 8).bit_and(1).shl(j))
+            bit = bit + 1
+        }
+        f[i] = if d == 12 { reduce(v) } else { v }
+    }
+    f
+}
+
+/// `round(2^d x / q) mod 2^d` as `floor((2^(d+1) x + q) / 2q)`, by a
+/// multiply and shift exact for every `x < q` and `d <= 11`.
+fn compress(x: i64, d: i64) -> i64 {
+    let n = x.shl(d + 1) + 3329
+    (n * 10321340).ushr(36).bit_and(1.shl(d) - 1)
+}
+
+fn decompress(y: i64, d: i64) -> i64 {
+    (y * 3329 + 1.shl(d - 1)).ushr(d)
+}
+
+fn compress_poly(f: [i64], d: i64) -> [i64] {
+    var out = f
+    for i in 0..256 {
+        out[i] = compress(f[i], d)
+    }
+    out
+}
+
+fn decompress_poly(f: [i64], d: i64) -> [i64] {
+    var out = f
+    for i in 0..256 {
+        out[i] = decompress(f[i], d)
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// K-PKE
+
+fn pke_keygen(p: MlkemParams, d: bytes) -> (bytes, bytes) {
+    let g = sha3.sha3_512(d.concat(bytes_of([p.k])))
+    let rho = g.slice(0, 32)
+    let sigma = g.slice(32, 64)
+    let a = matrix(rho, p.k)
+    var n = 0
+    var s: [[i64]] = []
+    for _ in 0..p.k {
+        s.push(ntt(sample_cbd(prf(p.eta1, sigma, n), p.eta1)))
+        n = n + 1
+    }
+    var e: [[i64]] = []
+    for _ in 0..p.k {
+        e.push(ntt(sample_cbd(prf(p.eta1, sigma, n), p.eta1)))
+        n = n + 1
+    }
+    var ek = bytes_of([])
+    var dk = bytes_of([])
+    for i in 0..p.k {
+        var t = e[i]
+        for j in 0..p.k {
+            t = add_poly(t, multiply_ntts(a[i][j], s[j]))
+        }
+        ek = ek.concat(byte_encode(t, 12))
+        dk = dk.concat(byte_encode(s[i], 12))
+    }
+    (ek.concat(rho), dk)
+}
+
+fn pke_encrypt(p: MlkemParams, ek: bytes, m: bytes, r: bytes) -> bytes {
+    var t: [[i64]] = []
+    for i in 0..p.k {
+        t.push(byte_decode(ek, 384 * i, 12))
+    }
+    let rho = ek.slice(384 * p.k, 384 * p.k + 32)
+    let a = matrix(rho, p.k)
+    var n = 0
+    var y: [[i64]] = []
+    for _ in 0..p.k {
+        y.push(ntt(sample_cbd(prf(p.eta1, r, n), p.eta1)))
+        n = n + 1
+    }
+    var c = bytes_of([])
+    for i in 0..p.k {
+        var acc = zero_poly()
+        for j in 0..p.k {
+            acc = add_poly(acc, multiply_ntts(a[j][i], y[j]))
+        }
+        let e1 = sample_cbd(prf(2, r, n), 2)
+        n = n + 1
+        let u = add_poly(ntt_inverse(acc), e1)
+        c = c.concat(byte_encode(compress_poly(u, p.du), p.du))
+    }
+    let e2 = sample_cbd(prf(2, r, n), 2)
+    var acc = zero_poly()
+    for j in 0..p.k {
+        acc = add_poly(acc, multiply_ntts(t[j], y[j]))
+    }
+    let mu = decompress_poly(byte_decode(m, 0, 1), 1)
+    let v = add_poly(add_poly(ntt_inverse(acc), e2), mu)
+    c.concat(byte_encode(compress_poly(v, p.dv), p.dv))
+}
+
+fn pke_decrypt(p: MlkemParams, dk: bytes, c: bytes) -> bytes {
+    var acc = zero_poly()
+    for i in 0..p.k {
+        let u = decompress_poly(byte_decode(c, 32 * p.du * i, p.du), p.du)
+        let s = byte_decode(dk, 384 * i, 12)
+        acc = add_poly(acc, multiply_ntts(s, ntt(u)))
+    }
+    let v = decompress_poly(byte_decode(c, 32 * p.du * p.k, p.dv), p.dv)
+    let w = sub_poly(v, ntt_inverse(acc))
+    byte_encode(compress_poly(w, 1), 1)
+}
+
+// ---------------------------------------------------------------------------
+// ML-KEM
+
+fn check_length(what: str, b: bytes, want: i64) -> () ! MlkemError {
+    if b.len() != want {
+        fail(Length(what, b.len()))
+    }
+}
+
+/// `ML-KEM.KeyGen_internal(d, z)`: both seeds 32 bytes.
+pub fn keygen(variant: str, d: bytes, z: bytes) -> MlkemKeys ! MlkemError {
+    let p = try params(variant)
+    try check_length("d", d, 32)
+    try check_length("z", z, 32)
+    let pair = pke_keygen(p, d)
+    let ek = pair.0
+    let dk = pair.1.concat(ek).concat(sha3.sha3_256(ek)).concat(z)
+    MlkemKeys{ encapsulation: ek, decapsulation: dk }
+}
+
+/// Keys from a 64-byte seed `d ‖ z` -- the form Go's
+/// `NewDecapsulationKey768` and FIPS 203's private-key seed take.
+pub fn keygen_from_seed(variant: str, seed: bytes) -> MlkemKeys ! MlkemError {
+    try check_length("seed", seed, 64)
+    try keygen(variant, seed.slice(0, 32), seed.slice(32, 64))
+}
+
+/// FIPS 203's input check: every coefficient of the encapsulation key is
+/// already reduced, so decoding and re-encoding gives it back unchanged.
+fn modulus_check(p: MlkemParams, ek: bytes) -> bool {
+    var same = 0
+    for i in 0..p.k {
+        let chunk = ek.slice(384 * i, 384 * i + 384)
+        let again = byte_encode(byte_decode(chunk, 0, 12), 12)
+        for b in 0..384 {
+            same = same.bit_or(chunk.at(b).bit_xor(again.at(b)))
+        }
+    }
+    same == 0
+}
+
+/// `ML-KEM.Encaps_internal(ek, m)`: the shared secret and the ciphertext,
+/// for a 32-byte message `m`.
+pub fn encapsulate_with(variant: str, ek: bytes, m: bytes) -> MlkemEncapsulated ! MlkemError {
+    let p = try params(variant)
+    try check_length("encapsulation key", ek, encapsulation_key_size(p))
+    try check_length("m", m, 32)
+    if not modulus_check(p, ek) {
+        fail(Modulus)
+    }
+    let g = sha3.sha3_512(m.concat(sha3.sha3_256(ek)))
+    let c = pke_encrypt(p, ek, m, g.slice(32, 64))
+    MlkemEncapsulated{ shared: g.slice(0, 32), ciphertext: c }
+}
+
+/// `ML-KEM.Decaps_internal(dk, c)`. A ciphertext that does not re-encrypt
+/// to itself yields the implicit-rejection key `J(z ‖ c)` -- a value that
+/// looks like a secret and agrees with nothing -- rather than an error,
+/// because an error would tell an attacker which ciphertexts were wrong.
+pub fn decapsulate(variant: str, dk: bytes, c: bytes) -> bytes ! MlkemError {
+    let p = try params(variant)
+    try check_length("decapsulation key", dk, decapsulation_key_size(p))
+    try check_length("ciphertext", c, ciphertext_size(p))
+    let dk_pke = dk.slice(0, 384 * p.k)
+    let ek = dk.slice(384 * p.k, 768 * p.k + 32)
+    let h = dk.slice(768 * p.k + 32, 768 * p.k + 64)
+    let z = dk.slice(768 * p.k + 64, 768 * p.k + 96)
+    if sha3.sha3_256(ek).to_list() != h.to_list() {
+        fail(HashCheck)
+    }
+    let m = pke_decrypt(p, dk_pke, c)
+    let g = sha3.sha3_512(m.concat(h))
+    let real = g.slice(0, 32)
+    let rejected = sha3.shake256(z.concat(c), 32)
+    let again = pke_encrypt(p, ek, m, g.slice(32, 64))
+    var diff = 0
+    for i in 0..c.len() {
+        diff = diff.bit_or(c.at(i).bit_xor(again.at(i)))
+    }
+    // 0 when equal, -1 when not, without a branch.
+    let mask = 0 - (0 - diff).ushr(63)
+    var out = bytes_filled(32, 0)
+    for i in 0..32 {
+        out.set(i, real.at(i).bit_xor(mask.bit_and(real.at(i).bit_xor(rejected.at(i)))))
+    }
+    out
+}

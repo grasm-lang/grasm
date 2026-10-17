@@ -1,0 +1,159 @@
+// The Grasm side of scripts/pubkey_diff.py: arguments in threes -- an
+// operation, a text field and a hex field with a leading `x` -- and one
+// answer line each, in the form the driver builds from OpenSSL.
+import ecc
+import ecdh
+import ecdsa
+import dsa
+import modarith
+
+fn from_hex(text: str) -> bytes {
+    var out: [i64] = []
+    var i = 1
+    while i + 1 < text.len() {
+        out.push(text.substr(i, 2).parse_int_base(16) ?? 0)
+        i = i + 2
+    }
+    bytes_of(out)
+}
+
+fn hex(raw: bytes) -> str {
+    let digits = "0123456789abcdef"
+    var out = ""
+    var i = 0
+    while i < raw.len() {
+        out = out + digits.substr(raw.at(i) / 16, 1) + digits.substr(raw.at(i) % 16, 1)
+        i = i + 1
+    }
+    out
+}
+
+fn hex_or_err(r: bytes ! EcdhError) -> str {
+    match r {
+        Ok(b) -> hex(b)
+        Err(_) -> "ERR"
+    }
+}
+
+fn size_of(curve: str) -> i64 {
+    match ecc.curve(curve) {
+        Ok(c) -> ecc.scalar_size(c)
+        Err(_) -> 0
+    }
+}
+
+/// Fields packed with a two-byte big-endian length before each.
+fn fields(b: bytes) -> [bytes] {
+    var out: [bytes] = []
+    var at = 0
+    while at + 2 <= b.len() {
+        let n = b.at(at) * 256 + b.at(at + 1)
+        out.push(b.slice(at + 2, at + 2 + n))
+        at = at + 2 + n
+    }
+    out
+}
+
+fn answer_dsa(what: str, text: str, b: bytes) -> str {
+    let f = fields(b)
+    let dp = match dsa.params(f[0], f[1], f[2]) {
+        Ok(found) -> found
+        Err(_) -> return "ERR"
+    }
+    if what == "dsapub" {
+        return match dsa.public_key(dp, f[3]) {
+            Ok(y) -> hex(y)
+            Err(_) -> "ERR"
+        }
+    }
+    if what == "dsasign" {
+        return match dsa.sign(dp, f[3], text, f[4]) {
+            Ok(sig) -> hex(dsa.to_der(sig))
+            Err(_) -> "ERR"
+        }
+    }
+    let qsize = (f[1].len())
+    match dsa.from_der(qsize, f[5]) {
+        Ok(sig) -> if dsa.verify(dp, f[3], f[4], sig) { "yes" } else { "no" }
+        Err(_) -> "no"
+    }
+}
+
+fn answer_mod(what: str, b: bytes) -> str {
+    let f = fields(b)
+    if what == "modpow" {
+        return match modarith.mod_pow(f[0], f[1], f[2]) {
+            Ok(v) -> hex(v)
+            Err(_) -> "ERR"
+        }
+    }
+    if what == "modmul" {
+        return match modarith.mod_mul(f[0], f[1], f[2]) {
+            Ok(v) -> hex(v)
+            Err(_) -> "ERR"
+        }
+    }
+    if what == "modpowsecret" {
+        return match modarith.field(f[2]) {
+            Ok(m) -> hex(modarith.to_bytes(m, modarith.pow_secret(m, modarith.from_bytes(m, f[0]),
+                f[1], f[1].len() * 8)))
+            Err(_) -> "ERR"
+        }
+    }
+    match modarith.mod_inverse(f[0], f[1]) {
+        Ok(found) -> match found {
+            Some(v) -> hex(v)
+            None -> "NONE"
+        }
+        Err(_) -> "ERR"
+    }
+}
+
+fn answer(what: str, text: str, b: bytes) -> str {
+    if what.starts_with("dsa") {
+        return answer_dsa(what, text, b)
+    }
+    if what.starts_with("mod") {
+        return answer_mod(what, b)
+    }
+    if what == "pub" {
+        return hex_or_err(ecdh.public_key(text, b)) + "|" +
+        hex_or_err(ecdh.public_key_compressed(text, b))
+    }
+    if what == "dh" {
+        let n = size_of(text)
+        return hex_or_err(ecdh.shared_secret(text, b.slice(0, n), b.slice(n, b.len())))
+    }
+    if what == "valid" {
+        return if ecdh.valid_public_key(text, b) { "yes" } else { "no" }
+    }
+    let f = text.split(",")
+    if what == "sign" {
+        let n = size_of(f[0])
+        return match ecdsa.sign(f[0], b.slice(0, n), f[1], b.slice(n, b.len())) {
+            Ok(sig) -> hex(ecdsa.to_der(sig))
+            Err(_) -> "ERR"
+        }
+    }
+    if what == "verify" {
+        let publen = f[1].parse_int() ?? 0
+        let hashlen = f[2].parse_int() ?? 0
+        let public = b.slice(0, publen)
+        let hash = b.slice(publen, publen + hashlen)
+        let der = b.slice(publen + hashlen, b.len())
+        return match ecdsa.from_der(f[0], der) {
+            Ok(sig) -> if ecdsa.verify(f[0], public, hash, sig) { "yes" } else { "no" }
+            Err(_) -> "no"
+        }
+    }
+    "UNKNOWN {what}"
+}
+
+fn main() / {io} {
+    let argv = args()
+    var i = 0
+    while i + 2 < argv.len() {
+        print(answer(argv[i], argv[i + 1], from_hex(argv[i + 2])))
+        i = i + 3
+    }
+}

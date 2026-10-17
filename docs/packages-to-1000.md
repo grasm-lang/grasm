@@ -121,7 +121,10 @@ Java `BigDecimal`, Go `math/big`) —
 `md4`
 
 **B9. Curves** (OpenSSL) —
-`ed448` `x448` `secp256k1` `p384` `p521` `brainpool` `sm2` `ffdh`
+`ed448` `x448` `sm2` `ffdh`
+
+P-384, P-521, secp256k1 and the Brainpool curves were four candidates
+here; they landed as one package, `ecc`, with B1 -- see below.
 
 **B10. Key and certificate files** (OpenSSL, `keytool`, `gpg`,
 `ssh-agent`) —
@@ -219,6 +222,22 @@ day its reference is installed.
 
 ## Landed
 
+- [x] **B1, second half: the public-key half** — `modarith` `ecc`
+  `ecdh` `ecdsa` `rfc6979` `dsa` `mlkem`, and the harnesses `pubkeytest` and
+  `pqctest`. 2,711 cases against OpenSSL 3.6 and Python, and 189 against
+  OpenSSL's ML-KEM: public keys and shared secrets on P-256, P-384, P-521,
+  secp256k1, three Brainpool curves and SM2; ECDSA and DSA signatures
+  byte-identical to OpenSSL's RFC 6979 `nonce-type:1`; verdicts on damaged
+  signatures and off-curve points; ML-KEM-512/768/1024 keys, ciphertexts and
+  implicit-rejection keys byte for byte; `modarith` against Python's `pow`.
+  One generic curve package replaced four per-curve candidates from B9: the
+  parts that go wrong -- reduction, the special cases of addition, the
+  scalar loop -- are better written once and checked on eight curves.
+  `rfc6979` was not on the list and is now: `ecdsa` and `dsa` both need
+  it, and Rust ships it as its own crate. Everything that touches a secret
+  is constant-time in the source, with `x25519`'s caveat that the compiler
+  does not promise to keep it.
+
 - [x] **B1, first half: Go's library, the parts with no keys** — `fnv`
   `rc4` `des` `goquote` `gotimefmt` `tabwriter` `textproto` `suffixarray`,
   and the harness `gostdtest`. 126,265 cases against Go 1.25's `hash/fnv`,
@@ -235,13 +254,13 @@ day its reference is installed.
 | | |
 |---|---|
 | At the start | 669 |
-| Now | 678 |
-| Candidates above | 314 packages in 27 batches |
+| Now | 687 |
+| Candidates above | 310 packages in 27 batches, plus `ecc` and `rfc6979` |
 | Harnesses, one a batch | 27 |
-| If every candidate lands | 1010 |
+| If every candidate lands | 1008 |
 | Target | 1000 |
 
-The margin over 1000 is 10. It is there because some
+The margin over 1000 is 8. It is there because some
 candidate will turn out to exist already under a name the grep missed, or to
 disagree with its oracle in a way that says the oracle is the better
 package, and the plan should not need rewriting when that happens.

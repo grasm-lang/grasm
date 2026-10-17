@@ -1,0 +1,92 @@
+// Elliptic-curve Diffie-Hellman over the curves in `ecc` -- Go's
+// `crypto/ecdh` for the NIST curves, and the same for secp256k1 and
+// Brainpool.
+//
+// Two parties each hold a private scalar and publish its multiple of the
+// base point; each multiplies the other's public point by its own scalar and
+// both arrive at the same point, whose x coordinate is the shared secret.
+// TLS 1.2 and 1.3, SSH, Signal's X3DH and every ECIES scheme rest on it.
+// X25519 is in `x25519`.
+//
+// ## What is checked, and why it matters
+//
+// A peer's public key is **validated before it is used**: the right length,
+// coordinates below the field prime, and on the curve. Skipping the last
+// check is the invalid-curve attack -- a point on a weaker curve that shares
+// the formulas leaks the private key a few bits at a time -- and it is the
+// check most often left out. A private key must be in `1..n-1`, and a shared
+// secret at infinity is refused, as Go refuses both.
+//
+// The secret is the raw x coordinate. Feed it to `hkdf`; never use it as a
+// key directly.
+//
+// Read the WARNING in `ecc` before protecting anything with this.
+import ecc
+
+type EcdhError =
+    | Curve(name: str)
+    | PrivateKey
+    | PublicKey
+    | Infinity
+
+fn curve_of(name: str) -> EcCurve ! EcdhError {
+    match ecc.curve(name) {
+        Ok(c) -> c
+        Err(_) -> fail(Curve(name))
+    }
+}
+
+/// The private key's length must be exactly the scalar size, as Go asks:
+/// a key of the wrong length is a key from somewhere else.
+fn checked_private(c: EcCurve, private: bytes) -> () ! EcdhError {
+    if private.len() != ecc.scalar_size(c) or not ecc.scalar_valid(c, private) {
+        fail(PrivateKey)
+    }
+}
+
+/// The uncompressed public key, `04 || X || Y`, for a private scalar.
+pub fn public_key(curve: str, private: bytes) -> bytes ! EcdhError {
+    let c = try curve_of(curve)
+    try checked_private(c, private)
+    match ecc.encode(c, ecc.base_mul(c, private), false) {
+        Ok(b) -> b
+        Err(_) -> fail(Infinity)
+    }
+}
+
+/// The same point, compressed: `02` or `03`, then `X`.
+pub fn public_key_compressed(curve: str, private: bytes) -> bytes ! EcdhError {
+    let c = try curve_of(curve)
+    try checked_private(c, private)
+    match ecc.encode(c, ecc.base_mul(c, private), true) {
+        Ok(b) -> b
+        Err(_) -> fail(Infinity)
+    }
+}
+
+/// The shared secret with a peer: the x coordinate of `private * peer`,
+/// `field_size` bytes. The peer's key is validated first; compressed and
+/// uncompressed forms are both accepted.
+pub fn shared_secret(curve: str, private: bytes, peer: bytes) -> bytes ! EcdhError {
+    let c = try curve_of(curve)
+    try checked_private(c, private)
+    let q = match ecc.decode(c, peer) {
+        Ok(p) -> p
+        Err(_) -> fail(PublicKey)
+    }
+    match ecc.affine_x(c, ecc.mul(c, q, private)) {
+        Some(x) -> x
+        None -> fail(Infinity)
+    }
+}
+
+/// Whether `peer` would be accepted by `shared_secret` on this curve.
+pub fn valid_public_key(curve: str, peer: bytes) -> bool {
+    match ecc.curve(curve) {
+        Ok(c) -> match ecc.decode(c, peer) {
+            Ok(_) -> true
+            Err(_) -> false
+        }
+        Err(_) -> false
+    }
+}

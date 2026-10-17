@@ -35,6 +35,7 @@ declare -a TIMEDOUT=()
 
 . "$(dirname "$0")/lib/corpus.sh"
 CORPUS_DIRS=${DIRS:-$CORPUS_DIRS}
+corpus_require
 programs=$(corpus_programs)
 
 # Every program below runs with stdin closed. A program that reads stdin

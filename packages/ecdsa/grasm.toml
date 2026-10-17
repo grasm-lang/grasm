@@ -1,0 +1,13 @@
+[package]
+name = "ecdsa"
+version = "1.0.0"
+
+capabilities = []
+
+[dependencies.ecc]
+path = "../ecc"
+version = "^1.0.0"
+
+[dependencies.rfc6979]
+path = "../rfc6979"
+version = "^1.0.0"

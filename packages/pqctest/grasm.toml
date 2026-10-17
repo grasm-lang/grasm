@@ -1,0 +1,8 @@
+[package]
+name = "pqctest"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.mlkem]
+path = "../mlkem"
+version = "^1.0.0"

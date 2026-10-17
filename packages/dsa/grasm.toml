@@ -1,0 +1,13 @@
+[package]
+name = "dsa"
+version = "1.0.0"
+
+capabilities = []
+
+[dependencies.modarith]
+path = "../modarith"
+version = "^1.0.0"
+
+[dependencies.rfc6979]
+path = "../rfc6979"
+version = "^1.0.0"

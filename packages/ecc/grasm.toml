@@ -1,0 +1,9 @@
+[package]
+name = "ecc"
+version = "1.0.0"
+
+capabilities = []
+
+[dependencies.modarith]
+path = "../modarith"
+version = "^1.0.0"

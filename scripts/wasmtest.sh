@@ -89,6 +89,7 @@ trap 'rm -rf "$WORK"' EXIT
 
 . "$(dirname "$0")/lib/corpus.sh"
 CORPUS_DIRS=${DIRS:-$CORPUS_DIRS}
+corpus_require
 # shellcheck disable=SC2086
 programs=$(corpus_programs)
 

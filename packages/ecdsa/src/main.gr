@@ -1,0 +1,232 @@
+// ECDSA over the curves in `ecc`: signing with deterministic nonces
+// (RFC 6979), verifying, and both signature encodings.
+//
+// `p256` verifies P-256 signatures and holds no secret. This signs, on every
+// curve `ecc` has, and verifies on all of them.
+//
+// ## The nonce is derived, never drawn
+//
+// An ECDSA signature needs a one-time secret `k`, and a `k` that repeats, or
+// that leaks a few bits, gives the private key away -- the PlayStation 3's
+// signing key was recovered from two signatures with the same `k`, and
+// biased nonces have broken Bitcoin wallets and TPMs since. So `k` is not
+// random here: it is RFC 6979's HMAC-DRBG over the private key and the
+// message hash. The same key and hash always give the same signature, a
+// broken random-number generator cannot hurt, and the result is checked
+// byte for byte against OpenSSL's `nonce-type:1`.
+//
+// ## Hash and curve are separate
+//
+// The caller hashes; `sign` takes the digest and the name of the hash that
+// made it, because RFC 6979 runs HMAC with that same hash. A digest longer
+// than the order is cut to its leftmost bits, as the standard says -- so
+// P-256 with SHA-512 is legal and means something specific.
+//
+// Read the WARNING in `ecc` before protecting anything with this.
+import ecc
+import rfc6979
+
+type EcdsaSignature = {
+    r: bytes,
+    s: bytes,
+}
+
+type EcdsaError =
+    | Curve(name: str)
+    | Hash(name: str)
+    | PrivateKey
+    | PublicKey
+    | Encoding
+
+fn curve_of(name: str) -> EcCurve ! EcdsaError {
+    match ecc.curve(name) {
+        Ok(c) -> c
+        Err(_) -> fail(Curve(name))
+    }
+}
+
+fn digest(name: str, message: bytes) -> bytes ! EcdsaError {
+    match rfc6979.digest(name, message) {
+        Ok(h) -> h
+        Err(_) -> fail(Hash(name))
+    }
+}
+
+/// RFC 6979's candidates in turn, until one makes a signature with neither
+/// half zero -- which for a curve of this size never happens twice.
+fn sign_with(c: EcCurve, hash_name: str, x: bytes, h1: bytes) -> EcdsaSignature ! EcdsaError {
+    var g = match rfc6979.start(ecc.order(c), x, hash_name, h1) {
+        Ok(found) -> found
+        Err(_) -> fail(Hash(hash_name))
+    }
+    let size = ecc.scalar_size(c)
+    let z = ecc.scalar_reduce(c, rfc6979.bits2int(h1, ecc.order_bits(c), size))
+    while true {
+        let k = rfc6979.next(g)
+        let rx = ecc.affine_x(c, ecc.base_mul(c, k)) ?? bytes_of([0])
+        let r = ecc.scalar_reduce(c, rx)
+        if ecc.scalar_is_zero(r) {
+            continue
+        }
+        let kinv = ecc.scalar_inverse(c, k)
+        let s = ecc.scalar_mul(c, kinv, ecc.scalar_add(c, z, ecc.scalar_mul(c, r, x)))
+        if not ecc.scalar_is_zero(s) {
+            return EcdsaSignature{ r: r, s: s }
+        }
+    }
+    fail(PrivateKey)
+}
+
+/// Sign a digest made by `hash_name` (`SHA-256`, `SHA-384`, `SHA-512`) with
+/// a private scalar of exactly `scalar_size` bytes.
+pub fn sign(curve: str, private: bytes, hash_name: str, hash: bytes) -> EcdsaSignature ! EcdsaError {
+    let c = try curve_of(curve)
+    if private.len() != ecc.scalar_size(c) or not ecc.scalar_valid(c, private) {
+        fail(PrivateKey)
+    }
+    try sign_with(c, hash_name, private, hash)
+}
+
+/// Hash `message` and sign the digest.
+pub fn sign_message(curve: str, private: bytes, hash_name: str, message: bytes) -> EcdsaSignature ! EcdsaError {
+    let h = try digest(hash_name, message)
+    try sign(curve, private, hash_name, h)
+}
+
+/// Whether `sig` is a signature of `hash` by the holder of `public` (SEC 1,
+/// either form). Every malformed input is simply `false`.
+pub fn verify(curve: str, public: bytes, hash: bytes, sig: EcdsaSignature) -> bool {
+    let c = match ecc.curve(curve) {
+        Ok(found) -> found
+        Err(_) -> return false
+    }
+    let q = match ecc.decode(c, public) {
+        Ok(p) -> p
+        Err(_) -> return false
+    }
+    let size = ecc.scalar_size(c)
+    if sig.r.len() != size or sig.s.len() != size {
+        return false
+    }
+    if not ecc.scalar_valid(c, sig.r) or not ecc.scalar_valid(c, sig.s) {
+        return false
+    }
+    let z = ecc.scalar_reduce(c, rfc6979.bits2int(hash, ecc.order_bits(c), size))
+    let w = ecc.scalar_inverse(c, sig.s)
+    let u1 = ecc.scalar_mul(c, z, w)
+    let u2 = ecc.scalar_mul(c, sig.r, w)
+    let point = ecc.add(c, ecc.base_mul(c, u1), ecc.mul(c, q, u2))
+    match ecc.affine_x(c, point) {
+        Some(x) -> ecc.scalar_reduce(c, x).to_list() == sig.r.to_list()
+        None -> false
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Encodings
+
+/// The fixed-width form, `r || s`: JWS, WebAuthn's COSE, PKCS#11.
+pub fn to_raw(sig: EcdsaSignature) -> bytes {
+    sig.r.concat(sig.s)
+}
+
+pub fn from_raw(curve: str, raw: bytes) -> EcdsaSignature ! EcdsaError {
+    let c = try curve_of(curve)
+    let size = ecc.scalar_size(c)
+    if raw.len() != 2 * size {
+        fail(Encoding)
+    }
+    EcdsaSignature{ r: raw.slice(0, size), s: raw.slice(size, raw.len()) }
+}
+
+fn der_length(n: i64) -> bytes {
+    if n < 128 {
+        return bytes_of([n])
+    }
+    if n < 256 {
+        return bytes_of([129, n])
+    }
+    bytes_of([130, n.ushr(8), n.bit_and(255)])
+}
+
+fn der_integer(v: bytes) -> bytes {
+    var i = 0
+    while i + 1 < v.len() and v.at(i) == 0 {
+        i = i + 1
+    }
+    var body = v.slice(i, v.len())
+    if body.at(0) >= 128 {
+        body = bytes_of([0]).concat(body)
+    }
+    bytes_of([2]).concat(der_length(body.len())).concat(body)
+}
+
+/// The DER form, `SEQUENCE { INTEGER r, INTEGER s }`: X.509, TLS, OpenSSL.
+pub fn to_der(sig: EcdsaSignature) -> bytes {
+    let body = der_integer(sig.r).concat(der_integer(sig.s))
+    bytes_of([48]).concat(der_length(body.len())).concat(body)
+}
+
+/// Reads a length at `at`: the value and where the content starts. Only the
+/// minimal forms DER allows are accepted.
+fn read_length(b: bytes, at: i64) -> (i64, i64) ! EcdsaError {
+    if at >= b.len() {
+        fail(Encoding)
+    }
+    let first = b.at(at)
+    if first < 128 {
+        return (first, at + 1)
+    }
+    if first == 129 and at + 1 < b.len() and b.at(at + 1) >= 128 {
+        return (b.at(at + 1), at + 2)
+    }
+    if first == 130 and at + 2 < b.len() and b.at(at + 1) > 0 {
+        return (b.at(at + 1).shl(8).bit_or(b.at(at + 2)), at + 3)
+    }
+    fail(Encoding)
+}
+
+/// One INTEGER at `at`, positive and minimally encoded, as `size` bytes.
+fn read_integer(b: bytes, at: i64, size: i64) -> (bytes, i64) ! EcdsaError {
+    if at >= b.len() or b.at(at) != 2 {
+        fail(Encoding)
+    }
+    let l = try read_length(b, at + 1)
+    let start = l.1
+    let end = start + l.0
+    if l.0 == 0 or end > b.len() {
+        fail(Encoding)
+    }
+    if b.at(start) >= 128 {
+        fail(Encoding)
+    }
+    if l.0 > 1 and b.at(start) == 0 and b.at(start + 1) < 128 {
+        fail(Encoding)
+    }
+    var body = b.slice(start, end)
+    if body.at(0) == 0 {
+        body = body.slice(1, body.len())
+    }
+    if body.len() > size {
+        fail(Encoding)
+    }
+    (bytes_filled(size - body.len(), 0).concat(body), end)
+}
+
+pub fn from_der(curve: str, der: bytes) -> EcdsaSignature ! EcdsaError {
+    let c = try curve_of(curve)
+    let size = ecc.scalar_size(c)
+    if der.len() < 2 or der.at(0) != 48 {
+        fail(Encoding)
+    }
+    let l = try read_length(der, 1)
+    if l.1 + l.0 != der.len() {
+        fail(Encoding)
+    }
+    let r = try read_integer(der, l.1, size)
+    let s = try read_integer(der, r.1, size)
+    if s.1 != der.len() {
+        fail(Encoding)
+    }
+    EcdsaSignature{ r: r.0, s: s.0 }
+}

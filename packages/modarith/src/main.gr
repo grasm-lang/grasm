@@ -1,0 +1,453 @@
+// Arithmetic modulo a large odd number: the layer under elliptic curves,
+// DSA, Diffie-Hellman over finite fields, RSA, and anything else that
+// multiplies big numbers and keeps the remainder.
+//
+// `bigint` is for numbers that grow without bound. This is for the other
+// kind -- every value below one fixed modulus -- where the modulus is known
+// up front and the same multiplication happens millions of times. It uses
+// Montgomery's method: values are kept as `aR mod m`, and a product is
+// reduced by a multiply and a shift instead of a division.
+//
+// ## Constant-time in the source, with the usual caveat
+//
+// A value is a fixed array of limbs whatever its size, and `add`, `sub`,
+// `mul`, `pow_secret` and `inverse_prime` take the same path whatever the
+// values are: reductions subtract under a mask, never under an `if`. That is
+// what lets `ecc`, `dsa` and `ffdh` hold secrets in it. **Grasm cannot
+// promise the compiler keeps that**, as `x25519` says; not audited. `pow`
+// (public exponent) and `inverse` (extended Euclid) branch on their
+// arguments and say so.
+//
+// A limb is 26 bits, the most that keeps two limb products and the carries
+// inside a signed 64-bit integer, so no multiply is ever split in halves.
+
+type ModField = {
+    m: [i64],
+    /// `-m^-1 mod 2^26`.
+    ninv: i64,
+    /// `R^2 mod m`, to bring a value into Montgomery form.
+    r2: [i64],
+    /// `R mod m`: one, in Montgomery form.
+    one: [i64],
+    limbs: i64,
+    /// The modulus's length in bits, and in bytes.
+    bits: i64,
+    size: i64,
+}
+
+type ModError =
+    | EvenModulus
+    | TooSmall
+
+fn mask26() -> i64 {
+    67108863
+}
+
+// ---------------------------------------------------------------------------
+// Limbs
+
+pub fn zeros(n: i64) -> [i64] {
+    var out: [i64] = []
+    for _ in 0..n {
+        out.push(0)
+    }
+    out
+}
+
+/// Big-endian bytes to `limbs` limbs. Bits beyond them are dropped.
+pub fn limbs_of(b: bytes, limbs: i64) -> [i64] {
+    var out = zeros(limbs)
+    var acc = 0
+    var accbits = 0
+    var k = 0
+    var i = b.len() - 1
+    while i >= 0 and k < limbs {
+        acc = acc.bit_or(b.at(i).shl(accbits))
+        accbits = accbits + 8
+        if accbits >= 26 {
+            out[k] = acc.bit_and(mask26())
+            k = k + 1
+            acc = acc.ushr(26)
+            accbits = accbits - 26
+        }
+        i = i - 1
+    }
+    if k < limbs {
+        out[k] = acc.bit_and(mask26())
+    }
+    out
+}
+
+/// Limbs to `n` big-endian bytes.
+pub fn bytes_of_limbs(x: [i64], n: i64) -> bytes {
+    var out = bytes_filled(n, 0)
+    var acc = 0
+    var accbits = 0
+    var k = 0
+    var i = n - 1
+    while i >= 0 {
+        if accbits < 8 and k < x.len() {
+            acc = acc.bit_or(x[k].shl(accbits))
+            accbits = accbits + 26
+            k = k + 1
+        }
+        out.set(i, acc.bit_and(255))
+        acc = acc.ushr(8)
+        accbits = accbits - 8
+        i = i - 1
+    }
+    out
+}
+
+/// `mask` is 0 or -1: `a` where it is -1, `b` where it is 0.
+pub fn select(mask: i64, a: [i64], b: [i64]) -> [i64] {
+    var out = b
+    for i in 0..a.len() {
+        out[i] = b[i].bit_xor(mask.bit_and(a[i].bit_xor(b[i])))
+    }
+    out
+}
+
+/// `a - b` and the borrow out, 0 or 1.
+pub fn sub_borrow(a: [i64], b: [i64]) -> ([i64], i64) {
+    var out = a
+    var borrow = 0
+    for i in 0..a.len() {
+        let v = a[i] - b[i] - borrow
+        out[i] = v.bit_and(mask26())
+        borrow = v.ushr(63)
+    }
+    (out, borrow)
+}
+
+pub fn add_carry(a: [i64], b: [i64]) -> ([i64], i64) {
+    var out = a
+    var carry = 0
+    for i in 0..a.len() {
+        let v = a[i] + b[i] + carry
+        out[i] = v.bit_and(mask26())
+        carry = v.ushr(26)
+    }
+    (out, carry)
+}
+
+// ---------------------------------------------------------------------------
+// The field
+
+pub fn add(f: ModField, a: [i64], b: [i64]) -> [i64] {
+    let s = add_carry(a, b)
+    let d = sub_borrow(s.0, f.m)
+    // Keep the sum only when it did not carry and subtracting borrowed.
+    let keep = 0 - (1 - s.1) * d.1
+    select(keep, s.0, d.0)
+}
+
+pub fn sub(f: ModField, a: [i64], b: [i64]) -> [i64] {
+    let d = sub_borrow(a, b)
+    let back = select(0 - d.1, f.m, zeros(f.limbs))
+    add_carry(d.0, back).0
+}
+
+pub fn neg(f: ModField, a: [i64]) -> [i64] {
+    sub(f, zeros(f.limbs), a)
+}
+
+/// Montgomery multiplication, CIOS: `a * b / R mod m`.
+pub fn mul(f: ModField, a: [i64], b: [i64]) -> [i64] {
+    let l = f.limbs
+    let m = f.m
+    var t = zeros(l + 2)
+    for i in 0..l {
+        let ai = a[i]
+        var carry = 0
+        for j in 0..l {
+            let v = t[j] + ai * b[j] + carry
+            t[j] = v.bit_and(mask26())
+            carry = v.ushr(26)
+        }
+        var v = t[l] + carry
+        t[l] = v.bit_and(mask26())
+        t[l + 1] = v.ushr(26)
+        let q = (t[0] * f.ninv).bit_and(mask26())
+        v = t[0] + q * m[0]
+        carry = v.ushr(26)
+        for j in 1..l {
+            v = t[j] + q * m[j] + carry
+            t[j - 1] = v.bit_and(mask26())
+            carry = v.ushr(26)
+        }
+        v = t[l] + carry
+        t[l - 1] = v.bit_and(mask26())
+        t[l] = t[l + 1] + v.ushr(26)
+        t[l + 1] = 0
+    }
+    var low = zeros(l)
+    for i in 0..l {
+        low[i] = t[i]
+    }
+    let d = sub_borrow(low, m)
+    let keep = 0 - (1 - t[l]) * d.1
+    select(keep, low, d.0)
+}
+
+pub fn sqr(f: ModField, a: [i64]) -> [i64] {
+    mul(f, a, a)
+}
+
+/// `a^e` for a public exponent `e`, given as limbs.
+fn pow_limbs(f: ModField, a: [i64], e: [i64]) -> [i64] {
+    var r = f.one
+    var i = e.len() * 26 - 1
+    while i >= 0 {
+        r = sqr(f, r)
+        if e[i / 26].ushr(i % 26).bit_and(1) == 1 {
+            r = mul(f, r, a)
+        }
+        i = i - 1
+    }
+    r
+}
+
+/// The modulus minus a small number, as limbs.
+fn m_minus(f: ModField, k: i64) -> [i64] {
+    var small = zeros(f.limbs)
+    small[0] = k
+    sub_borrow(f.m, small).0
+}
+
+/// `a^-1` by Fermat: `a^(m-2)`. The exponent is public; `a` is not, and
+/// nothing branches on it.
+pub fn inverse_prime(f: ModField, a: [i64]) -> [i64] {
+    pow_limbs(f, a, m_minus(f, 2))
+}
+
+pub fn enter(f: ModField, a: [i64]) -> [i64] {
+    mul(f, a, f.r2)
+}
+
+fn leave(f: ModField, a: [i64]) -> [i64] {
+    var one = zeros(f.limbs)
+    one[0] = 1
+    mul(f, a, one)
+}
+
+pub fn is_zero(a: [i64]) -> bool {
+    var acc = 0
+    for v in a {
+        acc = acc.bit_or(v)
+    }
+    acc == 0
+}
+
+pub fn equal(a: [i64], b: [i64]) -> bool {
+    var acc = 0
+    for i in 0..a.len() {
+        acc = acc.bit_or(a[i].bit_xor(b[i]))
+    }
+    acc == 0
+}
+
+/// `-m^-1 mod 2^26` by Newton's iteration, which doubles the correct bits
+/// each round: five rounds take one bit to thirty-two.
+fn neg_inverse(m0: i64) -> i64 {
+    var x = 1
+    for _ in 0..5 {
+        let y = (m0 * x).bit_and(mask26())
+        x = (x * (2 - y).bit_and(mask26())).bit_and(mask26())
+    }
+    (67108864 - x).bit_and(mask26())
+}
+
+pub fn bit_length(b: bytes) -> i64 {
+    var i = 0
+    while i < b.len() and b.at(i) == 0 {
+        i = i + 1
+    }
+    if i == b.len() {
+        return 0
+    }
+    var top = b.at(i)
+    var n = 0
+    while top > 0 {
+        n = n + 1
+        top = top.ushr(1)
+    }
+    (b.len() - i - 1) * 8 + n
+}
+
+fn make_field(modulus: bytes) -> ModField {
+    let bits = bit_length(modulus)
+    let limbs = (bits + 25) / 26 + if bits % 26 == 0 { 1 } else { 0 }
+    let m = limbs_of(modulus, limbs)
+    var f = ModField{ m: m, ninv: neg_inverse(m[0]), r2: zeros(limbs), one: zeros(limbs),
+        limbs: limbs, bits: bits, size: (bits + 7) / 8 }
+    // R mod m and R^2 mod m by doubling one, 26L and then 52L times.
+    var x = zeros(limbs)
+    x[0] = 1
+    for _ in 0..26 * limbs {
+        x = add(f, x, x)
+    }
+    f.one = x
+    for _ in 0..26 * limbs {
+        x = add(f, x, x)
+    }
+    f.r2 = x
+    f
+}
+
+// ---------------------------------------------------------------------------
+// The public surface
+
+/// The arithmetic modulo `modulus`, an odd number above 1, big-endian.
+pub fn field(modulus: bytes) -> ModField ! ModError {
+    if bit_length(modulus) < 2 {
+        fail(TooSmall)
+    }
+    if modulus.at(modulus.len() - 1).bit_and(1) == 0 {
+        fail(EvenModulus)
+    }
+    make_field(modulus)
+}
+
+/// A big-endian value of any length, reduced, in Montgomery form.
+pub fn from_bytes(f: ModField, b: bytes) -> [i64] {
+    var x = zeros(f.limbs)
+    for i in 0..b.len() {
+        for _ in 0..8 {
+            x = add(f, x, x)
+        }
+        var small = zeros(f.limbs)
+        small[0] = b.at(i)
+        x = add(f, x, small)
+    }
+    enter(f, x)
+}
+
+/// A value out of Montgomery form, as `size` big-endian bytes.
+pub fn to_bytes(f: ModField, x: [i64]) -> bytes {
+    bytes_of_limbs(leave(f, x), f.size)
+}
+
+pub fn one(f: ModField) -> [i64] {
+    f.one
+}
+
+/// `x^e` for a **public** exponent: square-and-multiply, skipping the
+/// multiply for a zero bit.
+pub fn pow(f: ModField, x: [i64], e: bytes) -> [i64] {
+    pow_limbs(f, x, limbs_of(e, (e.len() * 8 + 25) / 26 + 1))
+}
+
+/// `x^e` for a **secret** exponent: a Montgomery ladder over exactly `bits`
+/// bits of `e`, with the same squarings and multiplications whatever `e`
+/// is.
+pub fn pow_secret(f: ModField, x: [i64], e: bytes, bits: i64) -> [i64] {
+    let el = limbs_of(e, (bits + 25) / 26 + 1)
+    var r0 = f.one
+    var r1 = x
+    var i = bits - 1
+    while i >= 0 {
+        let mask = 0 - el[i / 26].ushr(i % 26).bit_and(1)
+        let a = select(mask, r1, r0)
+        let b = select(mask, r0, r1)
+        let prod = mul(f, a, b)
+        let sq = sqr(f, a)
+        r0 = select(mask, prod, sq)
+        r1 = select(mask, sq, prod)
+        i = i - 1
+    }
+    r0
+}
+
+fn is_odd(a: [i64]) -> bool {
+    a[0].bit_and(1) == 1
+}
+
+fn half(a: [i64]) -> [i64] {
+    var out = a
+    for i in 0..a.len() {
+        let high = if i + 1 < a.len() { a[i + 1].bit_and(1) } else { 0 }
+        out[i] = a[i].ushr(1).bit_or(high.shl(25))
+    }
+    out
+}
+
+fn is_one(a: [i64]) -> bool {
+    var rest = 0
+    for i in 1..a.len() {
+        rest = rest.bit_or(a[i])
+    }
+    a[0] == 1 and rest == 0
+}
+
+/// `x^-1` for any odd modulus, by binary extended Euclid, or `None` when
+/// `x` shares a factor with it. Variable-time: for public values.
+pub fn inverse(f: ModField, x: [i64]) -> Option[[i64]] {
+    let a = leave(f, x)
+    if is_zero(a) {
+        return None
+    }
+    var u = a
+    var v = f.m
+    var x1 = zeros(f.limbs)
+    x1[0] = 1
+    var x2 = zeros(f.limbs)
+    while not is_one(u) and not is_one(v) {
+        if is_zero(u) or is_zero(v) {
+            return None
+        }
+        while not is_odd(u) {
+            u = half(u)
+            x1 = if is_odd(x1) { half_sum(x1, f.m) } else { half(x1) }
+        }
+        while not is_odd(v) {
+            v = half(v)
+            x2 = if is_odd(x2) { half_sum(x2, f.m) } else { half(x2) }
+        }
+        if sub_borrow(u, v).1 == 0 {
+            u = sub_borrow(u, v).0
+            x1 = sub(f, x1, x2)
+        } else {
+            v = sub_borrow(v, u).0
+            x2 = sub(f, x2, x1)
+        }
+    }
+    let r = if is_one(u) { x1 } else { x2 }
+    Some(enter(f, r))
+}
+
+/// `(a + m) / 2` without losing the carry out of the top limb.
+fn half_sum(a: [i64], m: [i64]) -> [i64] {
+    let s = add_carry(a, m)
+    var out = half(s.0)
+    let top = out.len() - 1
+    out[top] = out[top].bit_or(s.1.shl(25))
+    out
+}
+
+// Whole operations on big-endian bytes, for when a field is used once.
+
+pub fn mod_reduce(a: bytes, m: bytes) -> bytes ! ModError {
+    let f = try field(m)
+    to_bytes(f, from_bytes(f, a))
+}
+
+pub fn mod_mul(a: bytes, b: bytes, m: bytes) -> bytes ! ModError {
+    let f = try field(m)
+    to_bytes(f, mul(f, from_bytes(f, a), from_bytes(f, b)))
+}
+
+/// `base^e mod m`, with the exponent treated as public.
+pub fn mod_pow(base_value: bytes, e: bytes, m: bytes) -> bytes ! ModError {
+    let f = try field(m)
+    to_bytes(f, pow(f, from_bytes(f, base_value), e))
+}
+
+/// `a^-1 mod m`, or `None` when there is none.
+pub fn mod_inverse(a: bytes, m: bytes) -> Option[bytes] ! ModError {
+    let f = try field(m)
+    match inverse(f, from_bytes(f, a)) {
+        Some(r) -> Some(to_bytes(f, r))
+        None -> None
+    }
+}

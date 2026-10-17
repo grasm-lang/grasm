@@ -113,6 +113,8 @@ run_gate multisearch   scripts/multisearchtest.sh
 run_gate walkdirtest   scripts/walkdirtest.sh
 run_gate tempdirtest   scripts/tempdirtest.sh
 run_gate gostddiff     scripts/gostd_diff.sh
+run_gate pubkeydiff    scripts/pubkey_diff.sh
+run_gate pqcdiff       scripts/pqc_diff.sh
 run_gate grasmwire     scripts/grasmwire_e2e.sh
 run_gate cryptodiff    scripts/crypto_diff.sh
 run_gate certdiff      scripts/cert_diff.sh

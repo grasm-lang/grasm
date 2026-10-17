@@ -29,6 +29,24 @@ corpus_programs() {
     find $CORPUS_DIRS -name '*.gr' | sort
 }
 
+# Stops the gate when the corpus is not what it says: a named directory is
+# missing, or there are no programs at all.
+#
+# `corpus_programs` reports a missing directory, but every gate calls it as
+# `for src in $(corpus_programs)`, where a failure is just a loop over
+# nothing. So a mistyped `DIRS=` ran all five corpus gates on zero programs
+# and each printed "identical: 0 ... mismatched: 0" and exited 0 -- found when
+# a zsh variable that was never word-split was passed as one directory name.
+# Each gate calls this once, after it has settled `CORPUS_DIRS`.
+corpus_require() {
+    local listed
+    listed=$(corpus_programs) || exit 1
+    if [ -z "$listed" ]; then
+        echo "the corpus ($CORPUS_DIRS) holds no programs, so nothing would be checked"
+        exit 1
+    fi
+}
+
 # Whether a program needs a system library on the link line.
 #
 # A program whose package graph declares `links` calls an `extern fn` that the

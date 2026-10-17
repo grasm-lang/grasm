@@ -1,0 +1,24 @@
+[package]
+name = "pubkeytest"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.ecc]
+path = "../ecc"
+version = "^1.0.0"
+
+[dependencies.ecdh]
+path = "../ecdh"
+version = "^1.0.0"
+
+[dependencies.ecdsa]
+path = "../ecdsa"
+version = "^1.0.0"
+
+[dependencies.dsa]
+path = "../dsa"
+version = "^1.0.0"
+
+[dependencies.modarith]
+path = "../modarith"
+version = "^1.0.0"

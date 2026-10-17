@@ -64,6 +64,7 @@ set -uo pipefail
 
 cd "$(dirname "$0")/.."
 . scripts/lib/corpus.sh
+corpus_require
 # Overridable so a gate can be run against a debug build, where Cranelift
 # keeps its own assertions on and the runtime checks integer overflow.
 GRASM=${GRASM:-./target/release/grasm}

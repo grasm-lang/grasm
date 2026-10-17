@@ -17,6 +17,7 @@ set -uo pipefail
 cd "$(dirname "$0")/.."
 . "$(dirname "$0")/lib/corpus.sh"
 CORPUS_DIRS=${DIRS:-$CORPUS_DIRS}
+corpus_require
 
 echo "building the runtime with poisoning on"
 if ! cargo build --release --workspace --features grasm_rt/poison >/dev/null 2>&1; then

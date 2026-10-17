@@ -1,0 +1,9 @@
+[package]
+name = "ecdh"
+version = "1.0.0"
+
+capabilities = []
+
+[dependencies.ecc]
+path = "../ecc"
+version = "^1.0.0"

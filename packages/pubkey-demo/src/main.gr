@@ -1,0 +1,82 @@
+// Public-key arithmetic, each asserted against an answer OpenSSL or Python
+// gave: a modular power, a P-256 public key, a deterministic ECDSA
+// signature, and an ML-KEM-512 exchange. scripts/pubkey_diff.sh and
+// scripts/pqc_diff.sh hold these packages to OpenSSL case for case; this is
+// the short version that every engine runs.
+import modarith
+import ecdh
+import ecdsa
+import mlkem
+import sha3
+
+fn hex(raw: bytes) -> str {
+    let digits = "0123456789abcdef"
+    var out = ""
+    var i = 0
+    while i < raw.len() {
+        out = out + digits.substr(raw.at(i) / 16, 1) + digits.substr(raw.at(i) % 16, 1)
+        i = i + 1
+    }
+    out
+}
+
+fn unhex(text: str) -> bytes {
+    var out: [i64] = []
+    var i = 0
+    while i + 1 < text.len() {
+        out.push(text.substr(i, 2).parse_int_base(16) ?? 0)
+        i = i + 2
+    }
+    bytes_of(out)
+}
+
+fn counting(from: i64, n: i64) -> bytes {
+    var out: [i64] = []
+    for i in 0..n {
+        out.push(from + i)
+    }
+    bytes_of(out)
+}
+
+fn main() / {io} {
+    // 3^(2^100 + 7) mod (2^127 - 1), from Python's pow.
+    let p = modarith.mod_pow(bytes_of([3]), unhex("10000000000000000000000007"), unhex("7fffffffffffffffffffffffffffffff")) ?? bytes_of([])
+    assert_eq(hex(p), "1b05a6dc0d646d0a2c72f7da985c4e98")
+
+    let private = counting(1, 32)
+    let public = ecdh.public_key("P-256", private) ?? bytes_of([])
+    assert_eq(hex(public),
+        "04515c3d6eb9e396b904d3feca7f54fdcd0cc1e997bf375dca515ad0a6c3b4035f" +
+        "4536be3a50f318fbf9a5475902a221502bef0d57e08c53b2cc0a56f17d9f9354")
+
+    // RFC 6979 makes the signature a fixed value: OpenSSL's nonce-type:1
+    // gives exactly these bytes for this key and "abc".
+    match ecdsa.sign_message("P-256", private, "SHA-256", "abc".to_bytes()) {
+        Ok(sig) -> {
+            assert_eq(hex(ecdsa.to_der(sig)),
+                "30450220679c4b47969121bd17ebc20be6cdf12fcd2d89923d39a1df9594234f2301e598" +
+                "022100e64cef3ec49b260b5529a6285cc075b193afd86b10c6b9192941316e6d0a0533")
+            let digest = sha3.sha3_256(bytes_of([]))
+            assert(not ecdsa.verify("P-256", public, digest, sig))
+        }
+        Err(_) -> panic("ecdsa refused a valid key")
+    }
+
+    match mlkem.keygen_from_seed("ML-KEM-512", counting(0, 64)) {
+        Ok(keys) -> {
+            assert_eq(hex(sha3.sha3_256(keys.encapsulation)),
+                "82f101ff648063b376e2bb6c5b7455f655a50c2feadade150efa0e0e6f365aea")
+            let e = mlkem.encapsulate_with("ML-KEM-512", keys.encapsulation, counting(100, 32)) ??
+            MlkemEncapsulated{ shared: bytes_of([]), ciphertext: bytes_of([]) }
+            assert_eq(hex(e.shared),
+                "3a607cff6eafff95c45dcfb474aba90719265620a28c465f3f6ffe39d5dc5f18")
+            assert_eq(hex(sha3.sha3_256(e.ciphertext)),
+                "144d39e2ea1f02e0404dc85dca8ef2b51f1813212ab2af4d8a1d0362c4c60ae8")
+            let back = mlkem.decapsulate("ML-KEM-512", keys.decapsulation, e.ciphertext) ??
+            bytes_of([])
+            assert_eq(hex(back), hex(e.shared))
+        }
+        Err(_) -> panic("mlkem refused a 64-byte seed")
+    }
+    print("pubkey: ok")
+}

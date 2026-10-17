@@ -14,6 +14,7 @@ set -uo pipefail
 . "$(dirname "$0")/lib/fresh.sh"
 cd "$(dirname "$0")/.."
 . scripts/lib/corpus.sh
+corpus_require
 TARGET="${1:-x86_64-apple-darwin}"
 ARCH="${TARGET%%-*}"
 GRASM=./target/release/grasm

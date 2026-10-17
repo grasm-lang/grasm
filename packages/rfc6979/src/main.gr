@@ -1,0 +1,167 @@
+// Deterministic nonces for DSA and ECDSA: RFC 6979.
+//
+// Both signature schemes need a one-time secret `k` per signature, and both
+// give the private key away if `k` ever repeats or leaks a handful of bits
+// -- the PlayStation 3 key, the 2013 Android Bitcoin wallets and a run of
+// TPMs were all recovered that way. RFC 6979 removes the random number
+// generator from the question: `k` is the output of HMAC-DRBG seeded with
+// the private key and the message hash, so the same key and message always
+// give the same `k`, and different messages give unrelated ones.
+//
+// This is the generator alone, shared by `ecdsa` and `dsa`, so the subtle
+// parts -- `bits2int`'s truncation to the order's bit length, `bits2octets`'
+// reduction, and the state update after a rejected candidate -- exist once.
+// It is checked through both: their signatures match OpenSSL's
+// `nonce-type:1` byte for byte, which they cannot unless every candidate
+// here does.
+import modarith
+import crypto_hash
+import sha512
+import sha1
+
+type Rfc6979 = {
+    hash: str,
+    k: bytes,
+    v: bytes,
+    qlen: i64,
+    rlen: i64,
+    order: ModField,
+    /// Whether a candidate has been handed out, so the next call must move
+    /// the state on first.
+    handed: bool,
+}
+
+type Rfc6979Error =
+    | Hash(name: str)
+    | Order
+
+/// `SHA-1`, `SHA-256`, `SHA-384` or `SHA-512`, by name.
+pub fn digest(name: str, message: bytes) -> bytes ! Rfc6979Error {
+    if name == "SHA-256" {
+        return crypto_hash.sha256_of(message)
+    }
+    if name == "SHA-384" {
+        return sha512.sha384(message)
+    }
+    if name == "SHA-512" {
+        return sha512.sha512(message)
+    }
+    if name == "SHA-1" {
+        return sha1.hash(message)
+    }
+    fail(Hash(name))
+}
+
+fn block_size(name: str) -> i64 {
+    if name == "SHA-384" or name == "SHA-512" { 128 } else { 64 }
+}
+
+/// HMAC (RFC 2104) with the named hash.
+pub fn hmac(name: str, key: bytes, message: bytes) -> bytes ! Rfc6979Error {
+    let block = block_size(name)
+    var k = key
+    if k.len() > block {
+        k = try digest(name, k)
+    }
+    var inner = bytes_filled(block, 54)
+    var outer = bytes_filled(block, 92)
+    for i in 0..k.len() {
+        inner.set(i, k.at(i).bit_xor(54))
+        outer.set(i, k.at(i).bit_xor(92))
+    }
+    let h = try digest(name, inner.concat(message))
+    try digest(name, outer.concat(h))
+}
+
+fn shift_right(b: bytes, n: i64) -> bytes {
+    let whole = n / 8
+    let part = n % 8
+    let keep = b.len() - whole
+    var out = bytes_filled(keep, 0)
+    for i in 0..keep {
+        var v = b.at(i).ushr(part)
+        if part > 0 and i > 0 {
+            v = v.bit_or(b.at(i - 1).shl(8 - part).bit_and(255))
+        }
+        out.set(i, v)
+    }
+    out
+}
+
+/// `bits2int`: the leftmost `qlen` bits of `b` as a number, written in
+/// `rlen` big-endian bytes. A hash longer than the order is cut, not
+/// reduced -- the rule both DSA and ECDSA use for the message too.
+pub fn bits2int(b: bytes, qlen: i64, rlen: i64) -> bytes {
+    var v = b
+    if b.len() * 8 > qlen {
+        v = shift_right(b, b.len() * 8 - qlen)
+    }
+    if v.len() > rlen {
+        return v.slice(v.len() - rlen, v.len())
+    }
+    bytes_filled(rlen - v.len(), 0).concat(v)
+}
+
+/// `int2octets`: a number below the order, as exactly `rlen` bytes.
+fn int2octets(x: bytes, rlen: i64) -> bytes {
+    var i = 0
+    while i < x.len() - rlen and x.at(i) == 0 {
+        i = i + 1
+    }
+    let v = x.slice(i, x.len())
+    bytes_filled(rlen - v.len(), 0).concat(v)
+}
+
+/// The generator for one signature: the order `q`, the private key `x` and
+/// the message hash `h1`, made with `hash_name`.
+pub fn start(q: bytes, x: bytes, hash_name: str, h1: bytes) -> Rfc6979 ! Rfc6979Error {
+    let order = match modarith.field(q) {
+        Ok(f) -> f
+        Err(_) -> fail(Order)
+    }
+    let qlen = order.bits
+    let rlen = order.size
+    let xo = int2octets(x, rlen)
+    let ho = modarith.to_bytes(order, modarith.from_bytes(order, bits2int(h1, qlen, rlen)))
+    let hlen = (try digest(hash_name, bytes_of([]))).len()
+    var v = bytes_filled(hlen, 1)
+    var k = bytes_filled(hlen, 0)
+    let seed = xo.concat(ho)
+    k = try hmac(hash_name, k, v.concat(bytes_of([0])).concat(seed))
+    v = try hmac(hash_name, k, v)
+    k = try hmac(hash_name, k, v.concat(bytes_of([1])).concat(seed))
+    v = try hmac(hash_name, k, v)
+    Rfc6979{ hash: hash_name, k: k, v: v, qlen: qlen, rlen: rlen, order: order, handed: false }
+}
+
+fn advance(inout g: Rfc6979) {
+    g.k = hmac(g.hash, g.k, g.v.concat(bytes_of([0]))) ?? g.k
+    g.v = hmac(g.hash, g.k, g.v) ?? g.v
+}
+
+fn in_range(g: Rfc6979, k: bytes) -> bool {
+    let kl = modarith.limbs_of(k, g.order.limbs)
+    not modarith.is_zero(kl) and modarith.sub_borrow(kl, g.order.m).1 == 1
+}
+
+/// The next candidate `k`, already in `1..q-1`, as `rlen` bytes. Call it
+/// again only if the signature it led to had `r` or `s` zero.
+pub fn next(inout g: Rfc6979) -> bytes {
+    if g.handed {
+        advance(g)
+    }
+    g.handed = true
+    while true {
+        var t = bytes_of([])
+        while t.len() * 8 < g.qlen {
+            g.v = hmac(g.hash, g.k, g.v) ?? g.v
+            t = t.concat(g.v)
+        }
+        let k = bits2int(t, g.qlen, g.rlen)
+        if in_range(g, k) {
+            return k
+        }
+        advance(g)
+    }
+    bytes_of([])
+}
