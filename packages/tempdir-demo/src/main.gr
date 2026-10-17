@@ -1,34 +1,82 @@
-// Claims temporary directories and reports them, for
-// `scripts/tempdirtest.sh` to check the properties that matter: the names
-// are distinct, unguessable, under the right root, and the directory is
-// usable and private.
+// Claims temporary directories, for `scripts/tempdirtest.sh`.
+//
+// ## Nothing random is printed
+//
+// `difftest.sh` requires the interpreter and the native build to produce
+// byte-identical stdout, and `random_bytes` is genuinely random -- the two
+// engines get different bytes, as they should. So a demo that printed the
+// names it claimed could never pass, and the first version of this one did
+// exactly that and failed with `mismatched: 1`.
+//
+// The paths go to a file the gate reads; stdout carries only what is the
+// same every run: how many were claimed, how many were distinct, and the
+// length of each name.
 import tempdir
 
 fn main() -> () ! TempError / {io} {
-    print("root {tempdir.temp_root()}")
-    // Several in a row: the names must all differ, which is the property a
-    // sequential or pid-based name would fail.
+    let a = args()
+    let listing = a.get(0) ?? ""
+    let root = a.get(1) ?? ""
+    var claimed: [str] = []
     for _i in 0..8 {
         let d = try tempdir.create("grasmtest-")
-        print("made {tempdir.path_of(d)}")
+        claimed.push(tempdir.path_of(d))
     }
-    // One that is written to, so the gate can check a file inside it.
+    // One written to, so the gate can read a file back out of it.
     let d = try tempdir.create("grasmtest-")
     let inner = tempdir.join(d, "note.txt")
+    var wrote = false
     match write_bytes(inner, "written inside\n".to_bytes()) {
-        Err(_e) -> print("could not write inside")
-        Ok(_n) -> print("wrote {inner}")
+        Err(_e) -> wrote = false
+        Ok(_n) -> wrote = true
     }
-    // And one under a root the caller names, which must not consult TMPDIR.
-    let a = args()
-    let chosen = a.get(0) ?? ""
-    if chosen != "" {
-        let e = try tempdir.create_in(chosen, "own-")
-        print("under {tempdir.path_of(e)}")
+    claimed.push(tempdir.path_of(d))
+    // And one under a caller-named root, which must not consult TMPDIR.
+    var under = ""
+    if root != "" {
+        let e = try tempdir.create_in(root, "own-")
+        under = tempdir.path_of(e)
     }
-    // A root that cannot be written to must fail rather than spin.
+    // Every name the same length, which is the unguessability.
+    var lengths = ""
+    var distinct = 0
+    for i in 0..claimed.len() {
+        let p = claimed.get(i) ?? ""
+        lengths = "{lengths} {p.len()}"
+        var seen_before = false
+        for j in 0..i {
+            if (claimed.get(j) ?? "") == p {
+                seen_before = true
+            }
+        }
+        if not seen_before {
+            distinct = distinct + 1
+        }
+    }
+    print("claimed {claimed.len()}")
+    print("distinct {distinct}")
+    print("same_length {lengths.len() > 0}")
+    print("wrote_inside {wrote}")
+    let named_root = root != ""
+    print("used_root {named_root}")
     match tempdir.create_in("/this/does/not/exist", "x-") {
-        Ok(_t) -> print("BAD: claimed a directory under a missing root")
-        Err(_e) -> print("missing root refused")
+        Ok(_t) -> print("missing_root claimed")
+        Err(_e) -> print("missing_root refused")
+    }
+    // The paths, where difftest cannot see them.
+    var body = ""
+    for p in claimed {
+        body = "{body}{p}\n"
+    }
+    if under != "" {
+        body = "{body}UNDER {under}\n"
+    }
+    body = "{body}INNER {inner}\n"
+    body = "{body}ROOT {tempdir.temp_root()}\n"
+    if listing != "" {
+        match write_bytes(listing, body.to_bytes()) {
+            Err(_e) -> print("could not write the listing")
+            Ok(_n) -> {}
+        }
     }
 }

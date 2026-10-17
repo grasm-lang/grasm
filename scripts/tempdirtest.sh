@@ -37,23 +37,39 @@ fi
 mkdir -p "$work/root"
 TMPDIR="$work/tmp" && mkdir -p "$TMPDIR"
 export TMPDIR
-"$work/td" "$work/root" >"$work/out.txt" 2>&1 || {
+# The paths go to a listing rather than to stdout: the demo is in the
+# corpus `difftest.sh` walks, which requires both engines to print the same
+# bytes, and a random name never will. stdout carries only the counts.
+"$work/td" "$work/listing.txt" "$work/root" >"$work/out.txt" 2>&1 || {
     echo "    the demo did not run:"
     sed 's/^/      /' "$work/out.txt"
     exit 1
 }
 
 # TMPDIR is honoured, not /tmp.
-grep -q "^root $work/tmp$" "$work/out.txt" || {
+grep -q "^ROOT $work/tmp$" "$work/listing.txt" || {
     echo "    TMPDIR was not used as the root:"
-    grep "^root " "$work/out.txt" | sed 's/^/      /'
+    grep "^ROOT " "$work/listing.txt" | sed 's/^/      /'
     exit 1
 }
 
-made=$(sed -n 's/^made //p' "$work/out.txt")
+# The counts stdout reports must agree with the listing, or the demo is
+# describing work it did not do.
+grep -q "^claimed 9$" "$work/out.txt" || { echo "    the demo did not claim 9"; exit 1; }
+grep -q "^distinct 9$" "$work/out.txt" || {
+    echo "    9 claims were not 9 distinct names -- a sequential name would do this"
+    exit 1
+}
+grep -q "^wrote_inside true$" "$work/out.txt" || { echo "    nothing was written inside"; exit 1; }
+grep -q "^missing_root refused$" "$work/out.txt" || {
+    echo "    a missing root did not fail"
+    exit 1
+}
+
+made=$(grep -vE "^(UNDER|INNER|ROOT) " "$work/listing.txt")
 count=$(echo "$made" | grep -c .)
 distinct=$(echo "$made" | sort -u | grep -c .)
-[ "$count" -ge 8 ] || { echo "    only $count directories were claimed"; exit 1; }
+[ "$count" -ge 9 ] || { echo "    only $count directories were claimed"; exit 1; }
 [ "$count" = "$distinct" ] || {
     echo "    $count claims produced only $distinct distinct names"
     exit 1
@@ -77,20 +93,14 @@ echo "$made" | while read -r d; do
 done
 
 # A file written inside it is there and readable by us.
-inner=$(sed -n 's/^wrote //p' "$work/out.txt")
+inner=$(sed -n 's/^INNER //p' "$work/listing.txt")
 [ -f "$inner" ] || { echo "    the file written inside is not there: $inner"; exit 1; }
 grep -q "written inside" "$inner" || { echo "    the file inside has the wrong contents"; exit 1; }
 
 # A caller-named root is used instead of TMPDIR.
-grep -q "^under $work/root/own-" "$work/out.txt" || {
+grep -q "^UNDER $work/root/own-" "$work/listing.txt" || {
     echo "    a caller-named root was not honoured:"
-    grep "^under " "$work/out.txt" | sed 's/^/      /'
-    exit 1
-}
-
-# An unwritable root fails rather than spinning.
-grep -q "^missing root refused$" "$work/out.txt" || {
-    echo "    a missing root did not fail"
+    grep "^UNDER " "$work/listing.txt" | sed 's/^/      /'
     exit 1
 }
 
