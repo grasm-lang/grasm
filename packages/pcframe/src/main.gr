@@ -17,7 +17,7 @@ type Surface = {
 }
 
 /// A rectangle, as `x`, `y`, `w`, `h`. Empty when `w` or `h` is zero.
-type Rect = {
+type PcRect = {
     x: i64,
     y: i64,
     w: i64,
@@ -32,7 +32,7 @@ pub fn new(width: i64, height: i64) -> Surface {
 /// An opaque surface of one colour.
 pub fn filled(width: i64, height: i64, r: i64, g: i64, b: i64) -> Surface {
     var s = new(width, height)
-    let all = Rect{ x: 0, y: 0, w: width, h: height }
+    let all = PcRect{ x: 0, y: 0, w: width, h: height }
     fill_rect(s, all, r, g, b, 255)
     s
 }
@@ -55,16 +55,16 @@ pub fn pitch(s: Surface) -> i64 {
 }
 
 /// The rectangle covering the whole surface.
-pub fn whole(s: Surface) -> Rect {
-    Rect{ x: 0, y: 0, w: s.width, h: s.height }
+pub fn whole(s: Surface) -> PcRect {
+    PcRect{ x: 0, y: 0, w: s.width, h: s.height }
 }
 
-pub fn is_empty(r: Rect) -> bool {
+pub fn is_empty(r: PcRect) -> bool {
     r.w <= 0 or r.h <= 0
 }
 
 /// A rectangle clipped to a surface, which may be empty.
-pub fn clip(s: Surface, r: Rect) -> Rect {
+pub fn clip(s: Surface, r: PcRect) -> PcRect {
     var x = r.x
     var y = r.y
     var w = r.w
@@ -89,12 +89,12 @@ pub fn clip(s: Surface, r: Rect) -> Rect {
     if h < 0 {
         h = 0
     }
-    Rect{ x: x, y: y, w: w, h: h }
+    PcRect{ x: x, y: y, w: w, h: h }
 }
 
 /// The smallest rectangle covering both, which is what a damage list
 /// collapses to when uploading one region is cheaper than uploading two.
-pub fn union(a: Rect, b: Rect) -> Rect {
+pub fn union(a: PcRect, b: PcRect) -> PcRect {
     if is_empty(a) {
         return b
     }
@@ -109,12 +109,12 @@ pub fn union(a: Rect, b: Rect) -> Rect {
     let by = b.y + b.h
     let right = if ax > bx { ax } else { bx }
     let bottom = if ay > by { ay } else { by }
-    Rect{ x: x, y: y, w: right - x, h: bottom - y }
+    PcRect{ x: x, y: y, w: right - x, h: bottom - y }
 }
 
 /// Every rectangle in a damage list, collapsed into one.
-pub fn cover(rs: [Rect]) -> Rect {
-    var out = Rect{ x: 0, y: 0, w: 0, h: 0 }
+pub fn cover(rs: [PcRect]) -> PcRect {
+    var out = PcRect{ x: 0, y: 0, w: 0, h: 0 }
     for r in rs {
         out = union(out, r)
     }
@@ -143,7 +143,7 @@ pub fn set_pixel(inout s: Surface, x: i64, y: i64, r: i64, g: i64, b: i64, a: i6
 }
 
 /// Paint a rectangle one colour.
-pub fn fill_rect(inout s: Surface, r: Rect, red: i64, green: i64, blue: i64, alpha: i64) {
+pub fn fill_rect(inout s: Surface, r: PcRect, red: i64, green: i64, blue: i64, alpha: i64) {
     let c = clip(s, r)
     if is_empty(c) {
         return
@@ -207,7 +207,7 @@ pub fn from_gray(gray: bytes, width: i64, height: i64) -> Surface {
 /// A row at a time through `copy_from`, which is the whole reason the surface
 /// is a byte buffer: the rows are contiguous in both, so one call moves
 /// `w * 4` bytes instead of a loop moving them one at a time.
-pub fn blit(inout dst: Surface, src: Surface, from: Rect, dx: i64, dy: i64) {
+pub fn blit(inout dst: Surface, src: Surface, from: PcRect, dx: i64, dy: i64) {
     let c = clip(src, from)
     if is_empty(c) {
         return
@@ -243,7 +243,7 @@ pub fn blit(inout dst: Surface, src: Surface, from: Rect, dx: i64, dy: i64) {
 /// Straight alpha, not premultiplied, and the destination keeps its own
 /// alpha: this is a layer over an opaque background, which is what a
 /// compositor does most of.
-pub fn blend(inout dst: Surface, src: Surface, from: Rect, dx: i64, dy: i64) {
+pub fn blend(inout dst: Surface, src: Surface, from: PcRect, dx: i64, dy: i64) {
     let c = clip(src, from)
     if is_empty(c) {
         return
@@ -299,17 +299,17 @@ test "sampling outside a surface is transparent rather than a panic" {
 
 test "a rectangle past the edge is clipped, not wrapped" {
     let s = new(4, 4)
-    let c = clip(s, Rect{ x: 2, y: 2, w: 10, h: 10 })
+    let c = clip(s, PcRect{ x: 2, y: 2, w: 10, h: 10 })
     assert_eq(c.x, 2)
     assert_eq(c.w, 2)
     assert_eq(c.h, 2)
-    let n = clip(s, Rect{ x: -3, y: 0, w: 2, h: 2 })
+    let n = clip(s, PcRect{ x: -3, y: 0, w: 2, h: 2 })
     assert(is_empty(n))
 }
 
 test "a fill past the edge leaves the rest alone" {
     var s = filled(4, 2, 0, 0, 0)
-    fill_rect(s, Rect{ x: 3, y: 0, w: 10, h: 10 }, 9, 9, 9, 255)
+    fill_rect(s, PcRect{ x: 3, y: 0, w: 10, h: 10 }, 9, 9, 9, 255)
     assert_eq(pixel(s, 3, 0).get(0).unwrap_or(0), 9)
     assert_eq(pixel(s, 3, 1).get(0).unwrap_or(0), 9)
     assert_eq(pixel(s, 2, 0).get(0).unwrap_or(9), 0)
@@ -368,8 +368,8 @@ test "a fully transparent layer changes nothing" {
 
 test "a damage list collapses to one rectangle" {
     let r = cover([
-        Rect{ x: 10, y: 10, w: 5, h: 5 },
-        Rect{ x: 0, y: 20, w: 2, h: 2 },
+        PcRect{ x: 10, y: 10, w: 5, h: 5 },
+        PcRect{ x: 0, y: 20, w: 2, h: 2 },
     ])
     assert_eq(r.x, 0)
     assert_eq(r.y, 10)

@@ -95,7 +95,7 @@ type Edits = {
 
 /// Draw the palette and take this frame's changes.
 fn palette(inout ui: Ui, inout e: Edits, img_w: i64, win_h: i64) {
-    pcui.panel(ui, Rect{ x: img_w, y: 0, w: PALETTE, h: win_h })
+    pcui.panel(ui, PcRect{ x: img_w, y: 0, w: PALETTE, h: win_h })
     pcui.stack(ui, img_w + 10, 10, PALETTE - 20)
 
     let _t = pcui.label(ui, img_w + 10, 0, 24, "LAYERS")

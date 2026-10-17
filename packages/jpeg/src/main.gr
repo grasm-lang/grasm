@@ -76,7 +76,7 @@ type JpegBits = {
 
 /// A decoded image. `comps` is 1 for grayscale and 3 for colour, and
 /// `pixels` holds that many bytes a pixel, row by row with no padding.
-type Decoded = {
+type JpegDecoded = {
     width: i64,
     height: i64,
     comps: i64,
@@ -434,7 +434,7 @@ fn sample(plane: bytes, pw: i64, ph: i64, x: i64, y: i64, h: i64, v: i64, hmax: 
 }
 
 /// Decode a baseline JPEG to interleaved samples.
-pub fn decode(data: bytes) -> Decoded ! JpegPixelError {
+pub fn decode(data: bytes) -> JpegDecoded ! JpegPixelError {
     if data.len() < 4 or data.at(0) != 255 or data.at(1) != 216 {
         fail(NotJpeg)
     }
@@ -629,7 +629,7 @@ fn run_scan(
     quant: [i64],
     tabs: [HuffTable],
     interval: i64,
-) -> Decoded ! JpegPixelError {
+) -> JpegDecoded ! JpegPixelError {
     var hmax = 1
     var vmax = 1
     for c in comps {
@@ -664,7 +664,7 @@ fn run_scan(
         }
         my = my + 1
     }
-    return Decoded{
+    return JpegDecoded{
         width: width,
         height: height,
         comps: comps.len(),

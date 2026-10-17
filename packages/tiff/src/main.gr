@@ -40,7 +40,7 @@ type TiffImage = {
 }
 
 /// A tag's value, already resolved from inline bytes or an offset.
-type Field = {
+type TiffField = {
     tag: i64,
     kind: i64,
     count: i64,
@@ -170,7 +170,7 @@ fn value_at(data: bytes, at: i64, kind: i64, little: bool) -> i64 {
 /// A field's values sit inside the entry when they fit in four bytes and at
 /// an offset when they do not, which is the one thing about TIFF that catches
 /// every first implementation.
-pub fn fields(data: bytes) -> [Field] ! TiffError {
+pub fn fields(data: bytes) -> [TiffField] ! TiffError {
     if not is_tiff(data) {
         fail(NotTiff)
     }
@@ -180,7 +180,7 @@ pub fn fields(data: bytes) -> [Field] ! TiffError {
         fail(Truncated(ifd))
     }
     let n = u16_at(data, ifd, little)
-    var out: [Field] = []
+    var out: [TiffField] = []
     var i = 0
     while i < n {
         let e = ifd + 2 + i * 12
@@ -206,14 +206,14 @@ pub fn fields(data: bytes) -> [Field] ! TiffError {
                 k = k + 1
             }
         }
-        out.push(Field{ tag: u16_at(data, e, little), kind: kind, count: count, values: values })
+        out.push(TiffField{ tag: u16_at(data, e, little), kind: kind, count: count, values: values })
         i = i + 1
     }
     out
 }
 
 /// The first value of a tag, or `fallback` when the file does not carry it.
-pub fn tag_or(fs: [Field], tag: i64, fallback: i64) -> i64 {
+pub fn tag_or(fs: [TiffField], tag: i64, fallback: i64) -> i64 {
     for f in fs {
         if f.tag == tag {
             return f.values.get(0).unwrap_or(fallback)
@@ -223,7 +223,7 @@ pub fn tag_or(fs: [Field], tag: i64, fallback: i64) -> i64 {
 }
 
 /// Every value of a tag.
-pub fn tag_all(fs: [Field], tag: i64) -> [i64] {
+pub fn tag_all(fs: [TiffField], tag: i64) -> [i64] {
     for f in fs {
         if f.tag == tag {
             return f.values

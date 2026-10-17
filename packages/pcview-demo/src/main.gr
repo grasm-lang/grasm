@@ -37,7 +37,7 @@ fn main() -> () ! (JpegPixelError | SdlError) / {io, unsafe} {
 
     // A half-transparent panel down the left, the way a tool palette sits
     // over a photograph.
-    let panel = Rect{ x: 0, y: 0, w: img.width / 5, h: img.height }
+    let panel = PcRect{ x: 0, y: 0, w: img.width / 5, h: img.height }
     var overlay = pcframe.new(img.width, img.height)
     pcframe.fill_rect(overlay, panel, 20, 24, 40, 160)
     pcframe.blend(canvas, overlay, pcframe.whole(overlay), 0, 0)

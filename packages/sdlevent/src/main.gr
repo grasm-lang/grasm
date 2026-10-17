@@ -19,7 +19,7 @@
 
 /// What a poll produced. `Other` carries the raw type so a program can log an
 /// event this package does not decode rather than lose it.
-type Event =
+type SdlEvent =
     | Quit
     | KeyDown(sym: i64)
     | MouseDown(button: i64, x: i64, y: i64)
@@ -62,7 +62,7 @@ pub fn kind_of(buf: bytes) -> i64 {
 }
 
 /// Decode one event.
-pub fn decode(buf: bytes) -> Event {
+pub fn decode(buf: bytes) -> SdlEvent {
     let kind = kind_of(buf)
     if kind == TYPE_QUIT {
         return Quit
@@ -86,7 +86,7 @@ pub fn decode(buf: bytes) -> Event {
 }
 
 /// Whether this event should end the program: the window closed, or Escape.
-pub fn is_exit(e: Event) -> bool {
+pub fn is_exit(e: SdlEvent) -> bool {
     match e {
         Quit -> true
         KeyDown(sym) -> sym == KEY_ESCAPE

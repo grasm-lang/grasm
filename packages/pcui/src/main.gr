@@ -10,7 +10,7 @@
 // Immediate mode wants none of that. A widget is a function of this frame's
 // input that draws and returns what happened:
 //
-//     if pcui.button(ui, Rect{...}, "Save") { save() }
+//     if pcui.button(ui, PcRect{...}, "Save") { save() }
 //
 // There is no widget to keep, so there is nothing to keep it in. The state
 // that must persist -- which layer is selected, where a slider sits -- is the
@@ -106,29 +106,29 @@ pub fn surface_of(ui: Ui) -> Surface {
     ui.surface
 }
 
-pub fn is_inside(r: Rect, x: i64, y: i64) -> bool {
+pub fn is_inside(r: PcRect, x: i64, y: i64) -> bool {
     x >= r.x and y >= r.y and x < r.x + r.w and y < r.y + r.h
 }
 
 /// Whether the pointer is over a rectangle this frame.
-pub fn hot(ui: Ui, r: Rect) -> bool {
+pub fn hot(ui: Ui, r: PcRect) -> bool {
     is_inside(r, ui.input.mx, ui.input.my)
 }
 
-fn paint(inout ui: Ui, r: Rect, c: Color) {
+fn paint(inout ui: Ui, r: PcRect, c: Color) {
     pcframe.fill_rect(ui.surface, r, c.r, c.g, c.b, 255)
 }
 
 /// A one-pixel border, drawn as four fills.
-fn outline(inout ui: Ui, r: Rect, c: Color) {
-    paint(ui, Rect{ x: r.x, y: r.y, w: r.w, h: 1 }, c)
-    paint(ui, Rect{ x: r.x, y: r.y + r.h - 1, w: r.w, h: 1 }, c)
-    paint(ui, Rect{ x: r.x, y: r.y, w: 1, h: r.h }, c)
-    paint(ui, Rect{ x: r.x + r.w - 1, y: r.y, w: 1, h: r.h }, c)
+fn outline(inout ui: Ui, r: PcRect, c: Color) {
+    paint(ui, PcRect{ x: r.x, y: r.y, w: r.w, h: 1 }, c)
+    paint(ui, PcRect{ x: r.x, y: r.y + r.h - 1, w: r.w, h: 1 }, c)
+    paint(ui, PcRect{ x: r.x, y: r.y, w: 1, h: r.h }, c)
+    paint(ui, PcRect{ x: r.x + r.w - 1, y: r.y, w: 1, h: r.h }, c)
 }
 
 /// A background panel, which is what a palette or a toolbar sits on.
-pub fn panel(inout ui: Ui, r: Rect) {
+pub fn panel(inout ui: Ui, r: PcRect) {
     paint(ui, r, ui.theme.panel)
 }
 
@@ -141,7 +141,7 @@ pub fn label(inout ui: Ui, x: i64, y: i64, h: i64, text: str) -> i64 {
 }
 
 /// Text centred in a rectangle.
-pub fn label_centred(inout ui: Ui, r: Rect, text: str) {
+pub fn label_centred(inout ui: Ui, r: PcRect, text: str) {
     let w = pcfont.text_width(ui.font, text, ui.size)
     let _ = label(ui, r.x + (r.w - w) / 2, r.y, r.h, text)
 }
@@ -151,7 +151,7 @@ pub fn label_centred(inout ui: Ui, r: Rect, text: str) {
 /// The press rather than the release, so a drag that starts on a button and
 /// ends elsewhere still counts -- which is what a toolbar wants, and the
 /// opposite of what a dialog's OK wants. A dialog can test `released` itself.
-pub fn button(inout ui: Ui, r: Rect, text: str) -> bool {
+pub fn button(inout ui: Ui, r: PcRect, text: str) -> bool {
     let over = hot(ui, r)
     var fill = ui.theme.raised
     if over and ui.input.down {
@@ -171,7 +171,7 @@ pub fn button(inout ui: Ui, r: Rect, text: str) -> bool {
 /// Separate from the drawing because this is the part that can be wrong in a
 /// way nobody sees until a value is off by one at an end stop, and it is
 /// testable without a font or a surface.
-pub fn slider_value(r: Rect, mx: i64, value: i64, lo: i64, hi: i64, dragging: bool) -> i64 {
+pub fn slider_value(r: PcRect, mx: i64, value: i64, lo: i64, hi: i64, dragging: bool) -> i64 {
     var v = value
     if dragging and hi > lo and r.w > 0 {
         v = lo + (mx - r.x) * (hi - lo) / r.w
@@ -191,23 +191,23 @@ pub fn slider_value(r: Rect, mx: i64, value: i64, lo: i64, hi: i64, dragging: bo
 /// The value is the caller's, passed in and returned: there is nowhere here
 /// to keep it, and a frame that cannot remember is a frame that can be
 /// replayed.
-pub fn slider(inout ui: Ui, r: Rect, value: i64, lo: i64, hi: i64) -> i64 {
-    let track = Rect{ x: r.x, y: r.y + r.h / 2 - 2, w: r.w, h: 4 }
+pub fn slider(inout ui: Ui, r: PcRect, value: i64, lo: i64, hi: i64) -> i64 {
+    let track = PcRect{ x: r.x, y: r.y + r.h / 2 - 2, w: r.w, h: 4 }
     paint(ui, track, ui.theme.track)
     let dragging = hot(ui, r) and ui.input.down
     let v = slider_value(r, ui.input.mx, value, lo, hi, dragging)
     // The filled part, then the knob over it.
     let span = if hi > lo { (v - lo) * (r.w - 10) / (hi - lo) } else { 0 }
-    paint(ui, Rect{ x: r.x, y: track.y, w: span + 5, h: track.h }, ui.theme.accent)
-    let knob = Rect{ x: r.x + span, y: r.y + 2, w: 10, h: r.h - 4 }
+    paint(ui, PcRect{ x: r.x, y: track.y, w: span + 5, h: track.h }, ui.theme.accent)
+    let knob = PcRect{ x: r.x + span, y: r.y + 2, w: 10, h: r.h - 4 }
     paint(ui, knob, if hot(ui, r) { ui.theme.text } else { ui.theme.raised })
     outline(ui, knob, ui.theme.track)
     v
 }
 
 /// A checkbox. Returns what it should hold after this frame.
-pub fn checkbox(inout ui: Ui, r: Rect, text: str, on: bool) -> bool {
-    let box = Rect{ x: r.x, y: r.y + (r.h - 12) / 2, w: 12, h: 12 }
+pub fn checkbox(inout ui: Ui, r: PcRect, text: str, on: bool) -> bool {
+    let box = PcRect{ x: r.x, y: r.y + (r.h - 12) / 2, w: 12, h: 12 }
     paint(ui, box, if on { ui.theme.accent } else { ui.theme.raised })
     outline(ui, box, ui.theme.track)
     let _ = label(ui, r.x + 18, r.y, r.h, text)
@@ -219,7 +219,7 @@ pub fn checkbox(inout ui: Ui, r: Rect, text: str, on: bool) -> bool {
 
 /// One row of a list. True on the frame it is pressed, so a caller selects by
 /// assigning the index it returns true for.
-pub fn list_item(inout ui: Ui, r: Rect, text: str, selected: bool) -> bool {
+pub fn list_item(inout ui: Ui, r: PcRect, text: str, selected: bool) -> bool {
     let over = hot(ui, r)
     if selected {
         paint(ui, r, ui.theme.active)
@@ -240,8 +240,8 @@ pub fn stack(inout ui: Ui, x: i64, y: i64, w: i64) {
 }
 
 /// The next row of height `h` in the current stack.
-pub fn row(inout ui: Ui, h: i64) -> Rect {
-    let r = Rect{ x: ui.cx, y: ui.cy, w: ui.cw, h: h }
+pub fn row(inout ui: Ui, h: i64) -> PcRect {
+    let r = PcRect{ x: ui.cx, y: ui.cy, w: ui.cw, h: h }
     ui.cy = ui.cy + h + ui.gap
     r
 }
@@ -252,7 +252,7 @@ pub fn space(inout ui: Ui, h: i64) {
 }
 
 test "a point inside a rectangle is inside, and the far edges are not" {
-    let r = Rect{ x: 10, y: 10, w: 5, h: 5 }
+    let r = PcRect{ x: 10, y: 10, w: 5, h: 5 }
     assert(is_inside(r, 10, 10))
     assert(is_inside(r, 14, 14))
     assert(not is_inside(r, 15, 14))
@@ -261,19 +261,19 @@ test "a point inside a rectangle is inside, and the far edges are not" {
 }
 
 test "an undragged slider keeps its value" {
-    let r = Rect{ x: 0, y: 0, w: 100, h: 20 }
+    let r = PcRect{ x: 0, y: 0, w: 100, h: 20 }
     assert_eq(slider_value(r, 50, 37, 0, 100, false), 37)
 }
 
 test "a dragged slider follows the pointer" {
-    let r = Rect{ x: 0, y: 0, w: 100, h: 20 }
+    let r = PcRect{ x: 0, y: 0, w: 100, h: 20 }
     assert_eq(slider_value(r, 0, 50, 0, 100, true), 0)
     assert_eq(slider_value(r, 50, 0, 0, 100, true), 50)
     assert_eq(slider_value(r, 100, 0, 0, 100, true), 100)
 }
 
 test "a slider clamps at both ends rather than running past them" {
-    let r = Rect{ x: 20, y: 0, w: 100, h: 20 }
+    let r = PcRect{ x: 20, y: 0, w: 100, h: 20 }
     assert_eq(slider_value(r, 0, 50, 0, 100, true), 0)
     assert_eq(slider_value(r, 9999, 50, 0, 100, true), 100)
     // And a value handed in out of range is brought back.
@@ -282,13 +282,13 @@ test "a slider clamps at both ends rather than running past them" {
 }
 
 test "a slider over a shifted range maps from its own left edge" {
-    let r = Rect{ x: 100, y: 0, w: 200, h: 20 }
+    let r = PcRect{ x: 100, y: 0, w: 200, h: 20 }
     assert_eq(slider_value(r, 100, 0, 0 - 50, 50, true), 0 - 50)
     assert_eq(slider_value(r, 200, 0, 0 - 50, 50, true), 0)
     assert_eq(slider_value(r, 300, 0, 0 - 50, 50, true), 50)
 }
 
 test "a degenerate slider does not divide by zero" {
-    assert_eq(slider_value(Rect{ x: 0, y: 0, w: 0, h: 10 }, 5, 3, 0, 10, true), 3)
-    assert_eq(slider_value(Rect{ x: 0, y: 0, w: 10, h: 10 }, 5, 7, 5, 5, true), 5)
+    assert_eq(slider_value(PcRect{ x: 0, y: 0, w: 0, h: 10 }, 5, 3, 0, 10, true), 3)
+    assert_eq(slider_value(PcRect{ x: 0, y: 0, w: 10, h: 10 }, 5, 7, 5, 5, true), 5)
 }
