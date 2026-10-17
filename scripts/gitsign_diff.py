@@ -29,7 +29,7 @@ if built.returncode != 0:
 
 patches = os.path.join(work, "patches")
 os.makedirs(patches)
-argv, expected, labels = patchid_corpus.build(patches)
+argv, expected, labels, not_utf8 = patchid_corpus.build(patches)
 signatures = os.path.join(work, "signatures")
 os.makedirs(signatures)
 more_argv, more_expected, more_labels = sshsig_corpus.build(signatures)
@@ -68,5 +68,18 @@ for i, want in enumerate(expected):
             print(f"  {labels[i]}")
             print(f"    want {want}")
             print(f"    got  {mine}")
-print(f"cases: {len(expected)}   agreeing: {agree}   differing: {differ}")
+print(f"cases: {len(expected)}   agreeing: {agree}   differing: {differ}"
+      f"   not UTF-8: {len(not_utf8)}")
+# The corpus is this repository's own history, so the number of diffs that
+# are not valid UTF-8 moves when a binary fixture is committed. It is
+# asserted rather than printed: a limitation that grows quietly is one
+# nobody fixes. See docs/known-issues.md for why these cannot be hashed.
+LIMIT = 8
+if len(not_utf8) > LIMIT:
+    print(f"  {len(not_utf8)} diffs are not UTF-8, over the {LIMIT} allowed:")
+    for label in not_utf8[:6]:
+        print(f"    {label}")
+    print("  `bytes.to_str()` mangles them, so patchid cannot hash what git")
+    print("  hashed. Either fix that or raise this limit deliberately.")
+    sys.exit(1)
 sys.exit(1 if differ else 0)

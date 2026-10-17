@@ -437,3 +437,46 @@ away from the defect:
 An intermittent memory corruption that disappears without a diagnosis is not
 the same as one that was fixed. Until a bisect names the commit, the bug class
 cannot be called gone -- only this reproducer can.
+
+## `bytes.to_str()` is lossy without saying so
+
+`bytes_of([65, 200, 201, 66]).to_str().to_bytes()` answers
+`[65, 239, 191, 189, 239, 191, 189, 66]`: each byte that is not valid UTF-8
+on its own becomes U+FFFD, the replacement character. The round trip is not
+one.
+
+What makes it a defect rather than a documented conversion is that nothing
+says so at the time. The `str` reports `len()` of 4 -- the number of bytes
+that went in -- so a caller measuring it sees no loss. The three-byte
+replacements only appear on the way back out.
+
+`read_file` refuses a file that is not valid UTF-8, which is the right
+answer for something that must produce a `str`. `bytes.to_str()` accepts the
+same bytes and quietly mangles them, so the two disagree about whether a
+`str` is UTF-8.
+
+Found through `gitsigndiff`: `packages/patchid` must hash the bytes git
+hashed, and `git show` of a commit adding a file with no NUL bytes in its
+first few thousand treats that file as text and emits its bytes as added
+lines. Four diffs out of a hundred and five in that corpus contain such
+bytes, and the patch-id came out wrong for exactly those four -- not because
+`canonical` is wrong, but because the diff it was given was no longer the
+diff git read. An ASCII diff of the same shape agrees to the character.
+
+Two ways out, and it is a language decision rather than a local fix:
+
+* `to_str()` refuses invalid UTF-8, matching `read_file`, and a caller
+  wanting raw bytes keeps them as `bytes`;
+* or the round trip is made exact, which means a `str` may hold bytes that
+  are not text, and every operation on it has to say what it does with
+  them.
+
+Until that is settled, a Grasm program cannot compute a patch-id over a
+diff that is not valid UTF-8, and `packages/pidtest` therefore uses
+`read_file`, which refuses one, rather than `read_bytes().to_str()`, which
+would read it and hash the wrong bytes. A refusal is the honest answer; the
+alternative was a confident wrong id.
+
+`scripts/patchid_corpus.py` keeps such diffs out of the corpus and counts
+them, and `gitsign_diff.py` asserts the count against a limit, so the
+limitation cannot grow quietly.

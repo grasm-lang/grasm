@@ -53,6 +53,17 @@ fn main() / {io} {
         }
         // Diffs are read from a file rather than an argument: a real one
         // runs to megabytes and does not fit in an argument list.
+        // `read_file`, deliberately, and it refuses a diff that is not
+        // valid UTF-8. That looks like the wrong choice -- `read_bytes`
+        // would read anything -- and it is the right one, because
+        // `bytes.to_str()` replaces every invalid byte with U+FFFD without
+        // saying so (docs/known-issues.md). Reading such a diff that way
+        // produces a patch-id over bytes git never saw: a confident wrong
+        // answer where a refusal belongs.
+        //
+        // So a diff this cannot hash is one it declines to hash.
+        // `scripts/patchid_corpus.py` keeps those out of the corpus and
+        // counts them, and the gate asserts the count.
         var diff = ""
         match read_file(args()[i + 1]) {
             Ok(text) -> diff = text
