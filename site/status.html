@@ -70,15 +70,15 @@ where each one stands.</p>
 <h2>What holds</h2>
 <div class="figures">
   <div class="fig"><b>511</b><span>programs, engines identical</span></div>
-  <div class="fig"><b>415</b><span>identical in wasm</span></div>
-  <div class="fig"><b>511</b><span>cross-compiled, agreeing</span></div>
+  <div class="fig"><b>421</b><span>identical in wasm</span></div>
+  <div class="fig"><b>528</b><span>cross-compiled, agreeing</span></div>
   <div class="fig"><b>258</b><span>conformance programs</span></div>
   <div class="fig"><b>101</b><span>findings recorded</span></div>
   <div class="fig"><b>15</b><span>fuzz generators</span></div>
 </div>
 <p>Interpreter, bundle and native builds agree byte for byte on stdout, exit
-code and diagnostics. All 511 are also compiled for x86_64 and run under
-Rosetta, every one of them agreeing, on 15 October 2026. Every generated program
+code and diagnostics. All 528 are also compiled for x86_64 and run under
+Rosetta, every one of them agreeing, on 18 October 2026. Every generated program
 is checked for what it keeps as well as for what it prints.</p>
 <h2>Which run wrote which figure</h2>
 <p>The corpus is <b>531</b> standalone programs, counted as this page is
@@ -90,13 +90,13 @@ from the run that proved it; it carries one per figure now, and this is the
 whole record:</p>
 <div class="scroll"><table>
 <tr><th>Gate</th><th>What it compared</th><th>Figure</th><th>Taken</th></tr>
-<tr><td><code>difftest</code></td><td>interpreter, bundle and native identical</td><td>511</td><td>15 October 2026</td></tr>
-<tr><td><code>wasmtest</code></td><td>identical in the browser engine</td><td>415</td><td>15 October 2026</td></tr>
-<tr><td><code>wasmtest</code></td><td>skipped: no filesystem, socket, process or thread</td><td>96</td><td>15 October 2026</td></tr>
-<tr><td><code>crosstest</code></td><td>cross-compiled to x86_64, identical under Rosetta</td><td>511</td><td>15 October 2026</td></tr>
-<tr><td><code>ProjectGold</code></td><td>whole programs agreeing on every engine</td><td>44</td><td>15 October 2026</td></tr>
-<tr><td><code>fuzz_laws</code></td><td>laws that held against arithmetic</td><td>205</td><td>15 October 2026</td></tr>
-<tr><td><code>depth</code></td><td>nested calls the interpreter reaches, against 10,000 promised</td><td>31,444</td><td>15 October 2026</td></tr>
+<tr><td><code>difftest</code></td><td>interpreter, bundle and native identical</td><td>528</td><td>18 October 2026</td></tr>
+<tr><td><code>wasmtest</code></td><td>identical in the browser engine</td><td>421</td><td>18 October 2026</td></tr>
+<tr><td><code>wasmtest</code></td><td>skipped: no filesystem, socket, process or thread</td><td>110</td><td>18 October 2026</td></tr>
+<tr><td><code>crosstest</code></td><td>cross-compiled to x86_64, identical under Rosetta</td><td>528</td><td>18 October 2026</td></tr>
+<tr><td><code>ProjectGold</code></td><td>whole programs agreeing on every engine</td><td>44</td><td>18 October 2026</td></tr>
+<tr><td><code>fuzz_laws</code></td><td>laws that held against arithmetic</td><td>207</td><td>18 October 2026</td></tr>
+<tr><td><code>depth</code></td><td>nested calls the interpreter reaches, against 10,000 promised</td><td>31,093</td><td>18 October 2026</td></tr>
 </table></div>
 <p class="note"><b>Every figure in this table was taken today</b>, which has
 not been true before and is the only reason the paragraphs that used to sit
@@ -121,7 +121,7 @@ measured was the load, not the gate.</p>
 <p class="note">The <code>depth</code> figure is a capacity, not a limit, and
 it is only comparable with itself. A frame holds the locals of whatever
 function is recursing, so the number moves with the <em>shape</em> of the
-program measuring it: the gate's own function reaches 31444, where the
+program measuring it: the gate's own function reaches 31093, where the
 one in <code>ProjectGold/08-fibonacci</code> reached about 42,000 on the same
 build. That is why the gate pins one shape and asks not to have it tidied.
 What the specification promises is <b>10,000</b>, and what the gate fails on is

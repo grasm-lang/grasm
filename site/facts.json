@@ -1,18 +1,18 @@
 {
   "agreeing": 44,
-  "corpus": 511,
-  "cross": 511,
-  "depth_cap": 31444,
-  "laws": 205,
+  "corpus": 528,
+  "cross": 528,
+  "depth_cap": 31093,
+  "laws": 207,
   "taken": {
-    "agreeing": "2026-10-15",
-    "corpus": "2026-10-15",
-    "cross": "2026-10-15",
-    "depth_cap": "2026-10-15",
-    "laws": "2026-10-15",
-    "wasm_ok": "2026-10-15",
-    "wasm_skip": "2026-10-15"
+    "agreeing": "2026-10-18",
+    "corpus": "2026-10-18",
+    "cross": "2026-10-18",
+    "depth_cap": "2026-10-18",
+    "laws": "2026-10-18",
+    "wasm_ok": "2026-10-18",
+    "wasm_skip": "2026-10-18"
   },
-  "wasm_ok": 415,
-  "wasm_skip": 96
+  "wasm_ok": 421,
+  "wasm_skip": 110
 }
