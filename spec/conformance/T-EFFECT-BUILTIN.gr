@@ -55,6 +55,7 @@ fn every_world_touching_builtin(path: str) / {io} {
     match rename_file(path, path) { Ok(v) -> {} Err(e) -> {} }
     match remove_file(path) { Ok(v) -> {} Err(e) -> {} }
     match make_dir(path) { Ok(v) -> {} Err(e) -> {} }
+    match make_dir_new(path) { Ok(v) -> {} Err(e) -> {} }
     match list_dir(path) { Ok(v) -> {} Err(e) -> {} }
     let _e = file_exists(path)
     // Never reached, so this does not wait for a line — the function is
