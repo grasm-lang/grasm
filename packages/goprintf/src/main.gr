@@ -1,0 +1,1227 @@
+// Go's `fmt.Sprintf`, `Sprint` and `Sprintln`, and `strconv.FormatFloat`.
+//
+// Go programs print their values one way, and every tool that reads or
+// imitates them has to print them the same way: Helm and Hugo templates
+// (whose `printf` *is* this), log lines, `%v` in error messages, test
+// output a script compares. So this is Go's formatter, verb for verb and
+// flag for flag, including what it does wrong on purpose:
+//
+// - `%d` given a string prints `%!d(string=hi)` rather than failing, and a
+//   missing argument prints `%!d(MISSING)`, an unused one
+//   `%!(EXTRA int=3)`.
+// - A `float64` under `%v` is `%g` with Go's shortest digits, which turns
+//   to an exponent at six places: `1000000.0` prints as `1e+06`. That is why
+//   a Helm chart's `replicas: 1000000` renders wrongly, and it is reproduced
+//   here because a template engine that printed `1000000` would disagree
+//   with the one the chart was written for.
+// - Maps print with their keys sorted; `nil` prints `<nil>`.
+//
+// ## The values
+//
+// Go's `any` is modelled by `GoValue`: the scalar kinds, `[]byte`,
+// `[]any` and `map[string]any` -- exactly what `encoding/json` produces
+// when it decodes into `any`, which is what a template's data is.
+// `from_json` makes one from a `json` value the way Go would. A Go string
+// may hold bytes that are not UTF-8; a `GoValue` string cannot, so that one
+// corner of Go is not represented.
+import shortestfloat
+import goquote
+import json
+
+type GoValue =
+    | GoNil
+    | GoBool(b: bool)
+    | GoInt(n: i64)
+    /// A `uint`: the 64 bits of an unsigned value, held in an `i64`.
+    | GoUint(n: i64)
+    | GoFloat(f: f64)
+    | GoString(s: str)
+    | GoBytes(b: bytes)
+    | GoList(items: [ref GoValue])
+    | GoMap(keys: [str], values: [ref GoValue])
+
+/// The state of one conversion: Go's `fmt` flags, width and precision.
+type GoFlags = {
+    plus: bool,
+    minus: bool,
+    sharp: bool,
+    space: bool,
+    zero: bool,
+    plus_v: bool,
+    sharp_v: bool,
+    wid: i64,
+    wid_present: bool,
+    prec: i64,
+    prec_present: bool,
+}
+
+fn no_flags() -> GoFlags {
+    GoFlags{ plus: false, minus: false, sharp: false, space: false, zero: false, plus_v: false,
+        sharp_v: false, wid: 0, wid_present: false, prec: 0, prec_present: false }
+}
+
+// ---------------------------------------------------------------------------
+// Constructors
+
+pub fn nil_value() -> ref GoValue {
+    ref(GoNil)
+}
+
+pub fn bool_value(b: bool) -> ref GoValue {
+    ref(GoBool(b))
+}
+
+pub fn int_value(n: i64) -> ref GoValue {
+    ref(GoInt(n))
+}
+
+pub fn uint_value(n: i64) -> ref GoValue {
+    ref(GoUint(n))
+}
+
+pub fn float_value(f: f64) -> ref GoValue {
+    ref(GoFloat(f))
+}
+
+pub fn string_value(s: str) -> ref GoValue {
+    ref(GoString(s))
+}
+
+pub fn bytes_value(b: bytes) -> ref GoValue {
+    ref(GoBytes(b))
+}
+
+pub fn list_value(items: [ref GoValue]) -> ref GoValue {
+    ref(GoList(items))
+}
+
+/// A map. A key given twice keeps its last value, as a Go map would.
+pub fn map_value(keys: [str], values: [ref GoValue]) -> ref GoValue {
+    var ks: [str] = []
+    var vs: [ref GoValue] = []
+    for i in 0..keys.len() {
+        var found = -1
+        for j in 0..ks.len() {
+            if ks[j] == keys[i] {
+                found = j
+            }
+        }
+        if found >= 0 {
+            vs[found] = values[i]
+        } else {
+            ks.push(keys[i])
+            vs.push(values[i])
+        }
+    }
+    ref(GoMap(ks, vs))
+}
+
+/// What `json.Unmarshal` into an `any` makes of a JSON value: numbers are
+/// `float64`, arrays `[]any`, objects `map[string]any` -- and a key an
+/// object repeats keeps its last value, as a Go map does.
+pub fn from_json(j: ref Json) -> ref GoValue {
+    match j {
+        JNull -> nil_value()
+        JBool(b) -> bool_value(b)
+        JNum(n) -> float_value(n)
+        JStr(text) -> string_value(text)
+        JList(items) -> {
+            var out: [ref GoValue] = []
+            for item in items {
+                out.push(from_json(item))
+            }
+            list_value(out)
+        }
+        JObj(keys, values) -> {
+            var out: [ref GoValue] = []
+            for v in values {
+                out.push(from_json(v))
+            }
+            map_value(keys, out)
+        }
+    }
+}
+
+/// JSON text decoded as Go's `json.Unmarshal` into an `any` would, or
+/// `None` when it is not JSON.
+pub fn parse_json(text: str) -> Option[ref GoValue] {
+    match json.parse(text) {
+        Ok(j) -> Some(from_json(j))
+        Err(_) -> None
+    }
+}
+
+/// Go's name for the value's dynamic type, as `%T` prints it.
+pub fn type_name(v: ref GoValue) -> str {
+    match v {
+        GoNil -> "<nil>"
+        GoBool(_) -> "bool"
+        GoInt(_) -> "int"
+        GoUint(_) -> "uint"
+        GoFloat(_) -> "float64"
+        GoString(_) -> "string"
+        GoBytes(_) -> "[]uint8"
+        GoList(_) -> "[]interface \{}"
+        GoMap(_, _) -> "map[string]interface \{}"
+    }
+}
+
+// ---------------------------------------------------------------------------
+// strconv.FormatFloat
+
+/// Decimal digits with trailing zeros removed, and where the point goes:
+/// `d` "125", `dp` 1 is 1.25. Zero is no digits at all, as in Go.
+type GoDigits = {
+    d: str,
+    dp: i64,
+}
+
+fn trimmed(digits: str, point: i64) -> GoDigits {
+    var end = digits.len()
+    while end > 0 and digits.substr(end - 1, 1) == "0" {
+        end = end - 1
+    }
+    if end == 0 {
+        return GoDigits{ d: "", dp: 0 }
+    }
+    GoDigits{ d: digits.substr(0, end), dp: point }
+}
+
+fn shortest_digits(v: f64) -> GoDigits {
+    let p = shortestfloat.parts(v)
+    trimmed(p.digits, p.point)
+}
+
+fn rounded_digits(v: f64, count: i64) -> GoDigits {
+    let p = shortestfloat.significant(v, count)
+    trimmed(p.digits, p.point)
+}
+
+fn digit_at(g: GoDigits, i: i64) -> str {
+    if i >= 0 and i < g.d.len() {
+        g.d.substr(i, 1)
+    } else {
+        "0"
+    }
+}
+
+fn exponent_text(exp: i64) -> str {
+    var e = exp
+    var sign = "+"
+    if e < 0 {
+        sign = "-"
+        e = 0 - e
+    }
+    if e < 10 {
+        return sign + "0{e}"
+    }
+    sign + "{e}"
+}
+
+/// `fmtE`: one digit, `prec` more after the point, and the exponent.
+fn fmt_e(neg: bool, g: GoDigits, prec: i64, letter: str) -> str {
+    var out = if neg { "-" } else { "" }
+    out = out + digit_at(g, 0)
+    if prec > 0 {
+        out = out + "."
+        for i in 1..prec + 1 {
+            out = out + digit_at(g, i)
+        }
+    }
+    let exp = if g.d.len() == 0 { 0 } else { g.dp - 1 }
+    out + letter + exponent_text(exp)
+}
+
+/// `fmtF`: the integer part, then `prec` digits after the point.
+fn fmt_f(neg: bool, g: GoDigits, prec: i64) -> str {
+    var out = if neg { "-" } else { "" }
+    if g.dp > 0 {
+        for i in 0..g.dp {
+            out = out + digit_at(g, i)
+        }
+    } else {
+        out = out + "0"
+    }
+    if prec > 0 {
+        out = out + "."
+        for i in 0..prec {
+            out = out + digit_at(g, g.dp + i)
+        }
+    }
+    out
+}
+
+fn format_digits(neg: bool, g: GoDigits, shortest: bool, prec_in: i64, verb: str) -> str {
+    var prec = prec_in
+    if verb == "e" or verb == "E" {
+        return fmt_e(neg, g, prec, verb)
+    }
+    if verb == "f" {
+        return fmt_f(neg, g, prec)
+    }
+    let nd = g.d.len()
+    var eprec = prec
+    if eprec > nd and nd >= g.dp {
+        eprec = nd
+    }
+    if shortest {
+        eprec = 6
+    }
+    let exp = g.dp - 1
+    if exp < -4 or exp >= eprec {
+        if prec > nd {
+            prec = nd
+        }
+        return fmt_e(neg, g, prec - 1, if verb == "g" { "e" } else { "E" })
+    }
+    if prec > g.dp {
+        prec = nd
+    }
+    let after = prec - g.dp
+    fmt_f(neg, g, if after > 0 { after } else { 0 })
+}
+
+fn bits_parts(v: f64) -> (bool, i64, i64) {
+    let bits = v.to_bits()
+    let neg = bits.ushr(63) == 1
+    var exp = bits.ushr(52).bit_and(2047)
+    var mant = bits.bit_and(4503599627370495)
+    if exp == 0 {
+        exp = 1
+    } else {
+        mant = mant.bit_or(4503599627370496)
+    }
+    (neg, mant, exp - 1023)
+}
+
+/// `%b`: the mantissa in decimal and a power of two.
+fn fmt_b(v: f64) -> str {
+    let p = bits_parts(v)
+    let e = p.2 - 52
+    var out = if p.0 { "-" } else { "" }
+    out = out + "{p.1}p"
+    if e >= 0 {
+        out = out + "+"
+    }
+    out + "{e}"
+}
+
+/// `%x`: hexadecimal mantissa with one digit before the point, and a
+/// binary exponent of at least two digits. Rounds half to even when a
+/// precision cuts it.
+fn fmt_x(v: f64, prec: i64, upper: bool) -> str {
+    let p = bits_parts(v)
+    var mant = p.1
+    var exp = p.2
+    if mant == 0 {
+        exp = 0
+    }
+    mant = mant.shl(8)
+    while mant != 0 and mant.bit_and(1.shl(60)) == 0 {
+        mant = mant.shl(1)
+        exp = exp - 1
+    }
+    if prec >= 0 and prec < 15 {
+        let shift = prec * 4
+        let extra = mant.shl(shift).bit_and(1.shl(60) - 1)
+        mant = mant.ushr(60 - shift)
+        if extra.bit_or(mant.bit_and(1)) > 1.shl(59) {
+            mant = mant + 1
+        }
+        mant = mant.shl(60 - shift)
+        if mant.bit_and(1.shl(61)) != 0 {
+            mant = mant.ushr(1)
+            exp = exp + 1
+        }
+    }
+    let hex = if upper { "0123456789ABCDEF" } else { "0123456789abcdef" }
+    var out = if p.0 { "-" } else { "" }
+    out = out + "0" + (if upper { "X" } else { "x" }) + "{mant.ushr(60).bit_and(1)}"
+    mant = mant.shl(4)
+    if prec < 0 and mant != 0 {
+        out = out + "."
+        while mant != 0 {
+            out = out + hex.substr(mant.ushr(60).bit_and(15), 1)
+            mant = mant.shl(4)
+        }
+    } else if prec > 0 {
+        out = out + "."
+        for _ in 0..prec {
+            out = out + hex.substr(mant.ushr(60).bit_and(15), 1)
+            mant = mant.shl(4)
+        }
+    }
+    out = out + (if upper { "P" } else { "p" })
+    var e = exp
+    if e < 0 {
+        out = out + "-"
+        e = 0 - e
+    } else {
+        out = out + "+"
+    }
+    if e < 10 {
+        out = out + "0"
+    }
+    out + "{e}"
+}
+
+/// `strconv.FormatFloat(v, verb, prec, 64)`: `verb` is one of `b e E f g G
+/// x X`, and a negative `prec` asks for the fewest digits that read back as
+/// the same number.
+pub fn format_float(v: f64, verb: str, prec: i64) -> str {
+    let bits = v.to_bits()
+    if bits.ushr(52).bit_and(2047) == 2047 {
+        if bits.bit_and(4503599627370495) != 0 {
+            return "NaN"
+        }
+        return if bits.ushr(63) == 1 { "-Inf" } else { "+Inf" }
+    }
+    if verb == "b" {
+        return fmt_b(v)
+    }
+    if verb == "x" or verb == "X" {
+        return fmt_x(v, prec, verb == "X")
+    }
+    let neg = bits.ushr(63) == 1
+    if prec < 0 {
+        let g = shortest_digits(v)
+        let nd = g.d.len()
+        var p = 0
+        if verb == "e" or verb == "E" {
+            p = if nd > 1 { nd - 1 } else { 0 }
+        } else if verb == "f" {
+            p = if nd - g.dp > 0 { nd - g.dp } else { 0 }
+        } else {
+            p = nd
+        }
+        return format_digits(neg, g, true, p, verb)
+    }
+    if verb == "f" {
+        return shortestfloat.fixed(v, prec)
+    }
+    if verb == "e" or verb == "E" {
+        return format_digits(neg, rounded_digits(v, prec + 1), false, prec, verb)
+    }
+    if verb == "g" or verb == "G" {
+        let p = if prec == 0 { 1 } else { prec }
+        return format_digits(neg, rounded_digits(v, p), false, p, verb)
+    }
+    "%" + verb
+}
+
+// ---------------------------------------------------------------------------
+// Integers, as unsigned 64-bit values held in an i64
+
+/// `u / 10` and `u % 10` for `u` read as unsigned, without an overflow in
+/// any intermediate.
+fn udiv10(u: i64) -> (i64, i64) {
+    let half = u.ushr(1)
+    let q = half / 5
+    let r = u.bit_and(1) + 2 * (half - q * 5)
+    (q, r)
+}
+
+/// The digits of `u`, read as unsigned, in base 2, 8, 10 or 16.
+fn unsigned_digits(u: i64, base: i64, digits: str) -> str {
+    if u == 0 {
+        return "0"
+    }
+    var out = ""
+    var x = u
+    if base == 10 {
+        while x != 0 {
+            let qr = udiv10(x)
+            out = digits.substr(qr.1, 1) + out
+            x = qr.0
+        }
+        return out
+    }
+    let shift = if base == 16 { 4 } else if base == 8 { 3 } else { 1 }
+    while x != 0 {
+        out = digits.substr(x.bit_and(base - 1), 1) + out
+        x = x.ushr(shift)
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// fmt's padding and verbs
+
+fn write_padding(inout out: str, f: GoFlags, n: i64) {
+    if n <= 0 {
+        return
+    }
+    let pad_char = if f.zero and not f.minus { "0" } else { " " }
+    for _ in 0..n {
+        out = out + pad_char
+    }
+}
+
+fn pad(inout out: str, f: GoFlags, s: str) {
+    if not f.wid_present or f.wid == 0 {
+        out = out + s
+        return
+    }
+    let width = f.wid - s.len()
+    if not f.minus {
+        write_padding(out, f, width)
+        out = out + s
+    } else {
+        out = out + s
+        write_padding(out, f, width)
+    }
+}
+
+fn no_zero(f: GoFlags) -> GoFlags {
+    var g = f
+    g.zero = false
+    g
+}
+
+/// `fmtInteger`: `u` holds the bits; `signed` says how to read them.
+fn fmt_integer(inout out: str, f: GoFlags, bits: i64, base: i64, signed: bool, verb: str, upper: bool) {
+    let negative = signed and bits < 0
+    let u = if negative { 0 - bits } else { bits }
+    var prec = 0
+    if f.prec_present {
+        prec = f.prec
+        if prec == 0 and u == 0 {
+            write_padding(out, no_zero(f), f.wid)
+            return
+        }
+    } else if f.zero and not f.minus and f.wid_present {
+        prec = f.wid
+        if negative or f.plus or f.space {
+            prec = prec - 1
+        }
+    }
+    let digits = if upper { "0123456789ABCDEF" } else { "0123456789abcdef" }
+    var s = unsigned_digits(u, base, digits)
+    while s.len() < prec {
+        s = "0" + s
+    }
+    if f.sharp {
+        if base == 2 {
+            s = "0b" + s
+        } else if base == 8 {
+            if not s.starts_with("0") {
+                s = "0" + s
+            }
+        } else if base == 16 {
+            s = (if upper { "0X" } else { "0x" }) + s
+        }
+    }
+    if verb == "O" {
+        s = "0o" + s
+    }
+    if negative {
+        s = "-" + s
+    } else if f.plus {
+        s = "+" + s
+    } else if f.space {
+        s = " " + s
+    }
+    pad(out, no_zero(f), s)
+}
+
+fn rune_or_error(c: i64) -> i64 {
+    if c < 0 or c > 1114111 or (c >= 55296 and c <= 57343) { 65533 } else { c }
+}
+
+fn encode_rune(r: i64) -> str {
+    var b: [i64] = []
+    if r < 128 {
+        b.push(r)
+    } else if r < 2048 {
+        b.push(192 + r.ushr(6))
+        b.push(128 + r.bit_and(63))
+    } else if r < 65536 {
+        b.push(224 + r.ushr(12))
+        b.push(128 + r.ushr(6).bit_and(63))
+        b.push(128 + r.bit_and(63))
+    } else {
+        b.push(240 + r.ushr(18))
+        b.push(128 + r.ushr(12).bit_and(63))
+        b.push(128 + r.ushr(6).bit_and(63))
+        b.push(128 + r.bit_and(63))
+    }
+    bytes_of(b).to_str()
+}
+
+/// `%U`: `U+` and at least four upper-case hex digits; with `#`, the
+/// character itself after, when Go calls it printable.
+fn fmt_unicode(inout out: str, f: GoFlags, u: i64) {
+    var prec = 4
+    if f.prec_present and f.prec > 4 {
+        prec = f.prec
+    }
+    var s = unsigned_digits(u, 16, "0123456789ABCDEF")
+    while s.len() < prec {
+        s = "0" + s
+    }
+    s = "U+" + s
+    if f.sharp and u >= 0 and u <= 1114111 and goquote.is_print(u) {
+        s = s + " '" + encode_rune(u) + "'"
+    }
+    pad(out, no_zero(f), s)
+}
+
+/// The first `prec` characters, when a precision was given.
+fn truncated(f: GoFlags, s: str) -> str {
+    if f.prec_present and f.prec < s.len() {
+        return s.substr(0, f.prec)
+    }
+    s
+}
+
+/// `fmtSbx`: hex of the bytes, with `#` and space flags.
+fn fmt_sbx(inout out: str, f: GoFlags, b: bytes, upper: bool) {
+    let digits = if upper { "0123456789ABCDEF" } else { "0123456789abcdef" }
+    let x = if upper { "X" } else { "x" }
+    var length = b.len()
+    if f.prec_present and f.prec < length {
+        length = f.prec
+    }
+    var width = 2 * length
+    if width > 0 {
+        if f.space {
+            if f.sharp {
+                width = width * 2
+            }
+            width = width + length - 1
+        } else if f.sharp {
+            width = width + 2
+        }
+    } else {
+        if f.wid_present {
+            write_padding(out, f, f.wid)
+        }
+        return
+    }
+    if f.wid_present and f.wid > width and not f.minus {
+        write_padding(out, f, f.wid - width)
+    }
+    if f.sharp {
+        out = out + "0" + x
+    }
+    for i in 0..length {
+        if f.space and i > 0 {
+            out = out + " "
+            if f.sharp {
+                out = out + "0" + x
+            }
+        }
+        let c = b.at(i)
+        out = out + digits.substr(c.ushr(4), 1) + digits.substr(c.bit_and(15), 1)
+    }
+    if f.wid_present and f.wid > width and f.minus {
+        write_padding(out, f, f.wid - width)
+    }
+}
+
+fn fmt_q(inout out: str, f: GoFlags, s: str) {
+    let t = truncated(f, s)
+    if f.sharp and goquote.can_backquote(t.to_bytes()) {
+        pad(out, f, "`" + t + "`")
+        return
+    }
+    if f.plus {
+        pad(out, f, goquote.quote_ascii(t.to_bytes()))
+    } else {
+        pad(out, f, goquote.quote(t.to_bytes()))
+    }
+}
+
+/// `fmtFloat` from Go's `format.go`: the sign, the `#` flag's decimal point
+/// and trailing zeros, and zero padding after the sign.
+fn fmt_float(inout out: str, f: GoFlags, v: f64, verb: str, default_prec: i64) {
+    let prec = if f.prec_present { f.prec } else { default_prec }
+    var num = format_float(v, verb, prec)
+    if not (num.starts_with("-") or num.starts_with("+")) {
+        num = "+" + num
+    }
+    if f.space and num.starts_with("+") and not f.plus {
+        num = " " + num.substr(1, num.len() - 1)
+    }
+    let second = num.substr(1, 1)
+    if second == "I" or second == "N" {
+        if second == "N" and not f.space and not f.plus {
+            num = num.substr(1, num.len() - 1)
+        }
+        pad(out, no_zero(f), num)
+        return
+    }
+    if f.sharp and verb != "b" {
+        num = sharp_float(num, verb, prec)
+    }
+    if f.plus or not num.starts_with("+") {
+        if f.zero and not f.minus and f.wid_present and f.wid > num.len() {
+            out = out + num.substr(0, 1)
+            write_padding(out, f, f.wid - num.len())
+            out = out + num.substr(1, num.len() - 1)
+            return
+        }
+        pad(out, f, num)
+        return
+    }
+    pad(out, f, num.substr(1, num.len() - 1))
+}
+
+/// The `#` flag on a float: always a decimal point, and for `%g` and `%x`
+/// the trailing zeros that bring it to its precision.
+fn sharp_float(text: str, verb: str, prec: i64) -> str {
+    var digits = 0
+    if verb == "v" or verb == "g" or verb == "G" or verb == "x" {
+        digits = if prec == -1 { 6 } else { prec }
+    }
+    var num = text
+    var tail = ""
+    var has_point = false
+    var saw_nonzero = false
+    var i = 1
+    while i < num.len() {
+        let c = num.substr(i, 1)
+        if c == "." {
+            has_point = true
+        } else if c == "p" or c == "P" {
+            tail = num.substr(i, num.len() - i)
+            num = num.substr(0, i)
+            break
+        } else if (c == "e" or c == "E") and verb != "x" and verb != "X" {
+            tail = num.substr(i, num.len() - i)
+            num = num.substr(0, i)
+            break
+        } else {
+            if c != "0" {
+                saw_nonzero = true
+            }
+            if saw_nonzero {
+                digits = digits - 1
+            }
+        }
+        i = i + 1
+    }
+    if not has_point {
+        if num.len() == 2 and num.substr(1, 1) == "0" {
+            digits = digits - 1
+        }
+        num = num + "."
+    }
+    while digits > 0 {
+        num = num + "0"
+        digits = digits - 1
+    }
+    num + tail
+}
+
+// ---------------------------------------------------------------------------
+// Printing a value under a verb
+
+fn bad_verb(inout out: str, f: GoFlags, verb: str, v: ref GoValue, nil_arg: bool) {
+    out = out + "%!" + verb + "("
+    if nil_arg {
+        out = out + "<nil>"
+    } else {
+        out = out + type_name(v) + "="
+        print_value(out, f, v, "v", 0)
+    }
+    out = out + ")"
+}
+
+fn fmt_bool(inout out: str, f: GoFlags, b: bool, verb: str, v: ref GoValue) {
+    if verb == "t" or verb == "v" {
+        pad(out, f, if b { "true" } else { "false" })
+    } else {
+        bad_verb(out, f, verb, v, false)
+    }
+}
+
+fn fmt_int_verb(inout out: str, f: GoFlags, bits: i64, signed: bool, verb: str, v: ref GoValue) {
+    if verb == "v" {
+        if f.sharp_v and not signed {
+            var g = f
+            g.sharp = true
+            fmt_integer(out, g, bits, 16, false, "v", false)
+        } else {
+            fmt_integer(out, f, bits, 10, signed, verb, false)
+        }
+    } else if verb == "d" {
+        fmt_integer(out, f, bits, 10, signed, verb, false)
+    } else if verb == "b" {
+        fmt_integer(out, f, bits, 2, signed, verb, false)
+    } else if verb == "o" or verb == "O" {
+        fmt_integer(out, f, bits, 8, signed, verb, false)
+    } else if verb == "x" or verb == "X" {
+        fmt_integer(out, f, bits, 16, signed, verb, verb == "X")
+    } else if verb == "c" {
+        pad(out, f, encode_rune(rune_or_error(bits)))
+    } else if verb == "q" {
+        let r = rune_or_error(bits)
+        pad(out, f, if f.plus { goquote.quote_rune_ascii(r) } else { goquote.quote_rune(r) })
+    } else if verb == "U" {
+        fmt_unicode(out, f, bits)
+    } else {
+        bad_verb(out, f, verb, v, false)
+    }
+}
+
+fn fmt_float_verb(inout out: str, f: GoFlags, x: f64, verb: str, v: ref GoValue) {
+    if verb == "v" {
+        fmt_float(out, f, x, "g", -1)
+    } else if verb == "b" or verb == "g" or verb == "G" or verb == "x" or verb == "X" {
+        fmt_float(out, f, x, verb, -1)
+    } else if verb == "f" or verb == "e" or verb == "E" {
+        fmt_float(out, f, x, verb, 6)
+    } else if verb == "F" {
+        fmt_float(out, f, x, "f", 6)
+    } else {
+        bad_verb(out, f, verb, v, false)
+    }
+}
+
+fn fmt_string_verb(inout out: str, f: GoFlags, s: str, verb: str, v: ref GoValue) {
+    if verb == "v" {
+        if f.sharp_v {
+            fmt_q(out, f, s)
+        } else {
+            pad(out, f, truncated(f, s))
+        }
+    } else if verb == "s" {
+        pad(out, f, truncated(f, s))
+    } else if verb == "x" or verb == "X" {
+        fmt_sbx(out, f, s.to_bytes(), verb == "X")
+    } else if verb == "q" {
+        fmt_q(out, f, s)
+    } else {
+        bad_verb(out, f, verb, v, false)
+    }
+}
+
+fn int_verb(verb: str) -> bool {
+    "vdbOoxXcqU".index_of(verb).is_some()
+}
+
+fn fmt_bytes_verb(inout out: str, f: GoFlags, b: bytes, verb: str, depth: i64) {
+    if verb == "v" or verb == "d" {
+        if f.sharp_v {
+            out = out + (if depth == 0 { "[]byte\{" } else { "[]uint8\{" })
+            var g = f
+            g.sharp = true
+            for i in 0..b.len() {
+                if i > 0 {
+                    out = out + ", "
+                }
+                fmt_integer(out, g, b.at(i), 16, false, "v", false)
+            }
+            out = out + "}"
+            return
+        }
+        out = out + "["
+        for i in 0..b.len() {
+            if i > 0 {
+                out = out + " "
+            }
+            fmt_integer(out, f, b.at(i), 10, false, verb, false)
+        }
+        out = out + "]"
+    } else if verb == "s" {
+        pad(out, f, truncated(f, b.to_str()))
+    } else if verb == "x" or verb == "X" {
+        fmt_sbx(out, f, b, verb == "X")
+    } else if verb == "q" {
+        fmt_q(out, f, b.to_str())
+    } else {
+        // Any other verb prints the bytes as a list of uint8 under it, and a
+        // verb no integer takes names the element's type, `uint8`.
+        out = out + (if f.sharp_v { "[]uint8\{" } else { "[" })
+        for i in 0..b.len() {
+            if i > 0 {
+                out = out + (if f.sharp_v { ", " } else { " " })
+            }
+            if int_verb(verb) {
+                fmt_int_verb(out, f, b.at(i), false, verb, uint_value(b.at(i)))
+            } else {
+                out = out + "%!" + verb + "(uint8="
+                fmt_int_verb(out, f, b.at(i), false, "v", uint_value(b.at(i)))
+                out = out + ")"
+            }
+        }
+        out = out + (if f.sharp_v { "}" } else { "]" })
+    }
+}
+
+fn print_list(inout out: str, f: GoFlags, items: [ref GoValue], verb: str, depth: i64) {
+    if f.sharp_v {
+        out = out + "[]interface \{}\{"
+        for i in 0..items.len() {
+            if i > 0 {
+                out = out + ", "
+            }
+            print_elem(out, f, items[i], verb, depth + 1)
+        }
+        out = out + "}"
+        return
+    }
+    out = out + "["
+    for i in 0..items.len() {
+        if i > 0 {
+            out = out + " "
+        }
+        print_elem(out, f, items[i], verb, depth + 1)
+    }
+    out = out + "]"
+}
+
+fn print_map(inout out: str, f: GoFlags, keys: [str], values: [ref GoValue], verb: str, depth: i64) {
+    var order: [(str, i64)] = []
+    for i in 0..keys.len() {
+        order.push((keys[i], i))
+    }
+    order.sort()
+    out = out + (if f.sharp_v { "map[string]interface \{}\{" } else { "map[" })
+    for n in 0..order.len() {
+        if n > 0 {
+            out = out + (if f.sharp_v { ", " } else { " " })
+        }
+        print_value(out, f, string_value(order[n].0), verb, depth + 1)
+        out = out + ":"
+        print_elem(out, f, values[order[n].1], verb, depth + 1)
+    }
+    out = out + (if f.sharp_v { "}" } else { "]" })
+}
+
+/// An element of a `[]any` or a `map[string]any`: an interface, so a nil
+/// one prints as `<nil>` whatever the verb.
+fn print_elem(inout out: str, f: GoFlags, v: ref GoValue, verb: str, depth: i64) {
+    match v {
+        GoNil -> out = out + (if f.sharp_v { "interface \{}(nil)" } else { "<nil>" })
+        _ -> print_value(out, f, v, verb, depth)
+    }
+}
+
+fn print_value(inout out: str, f: GoFlags, v: ref GoValue, verb: str, depth: i64) {
+    match v {
+        GoNil -> {
+            if verb == "v" {
+                pad(out, f, "<nil>")
+            } else {
+                bad_verb(out, f, verb, v, true)
+            }
+        }
+        GoBool(b) -> fmt_bool(out, f, b, verb, v)
+        GoInt(n) -> fmt_int_verb(out, f, n, true, verb, v)
+        GoUint(n) -> fmt_int_verb(out, f, n, false, verb, v)
+        GoFloat(x) -> fmt_float_verb(out, f, x, verb, v)
+        GoString(s) -> fmt_string_verb(out, f, s, verb, v)
+        GoBytes(b) -> fmt_bytes_verb(out, f, b, verb, depth)
+        GoList(items) -> print_list(out, f, items, verb, depth)
+        GoMap(keys, values) -> print_map(out, f, keys, values, verb, depth)
+    }
+}
+
+/// `printArg`: one operand at the top level, where `%T` and `%w` are
+/// handled before the value is looked at.
+fn print_arg(inout out: str, f: GoFlags, v: ref GoValue, verb: str) {
+    if verb == "T" {
+        // Go answers a nil operand before looking at the precision.
+        match v {
+            GoNil -> pad(out, f, "<nil>")
+            _ -> pad(out, f, truncated(f, type_name(v)))
+        }
+        return
+    }
+    // Sprintf has no error to wrap. A list or a map reaches Go's method
+    // check, which calls `%w` a bad verb outright; every other kind goes on
+    // to its own formatter, which refuses the verb in its own way.
+    let wraps = match v {
+        GoList(_) -> true
+        GoMap(_, _) -> true
+        _ -> false
+    }
+    if verb == "w" and wraps {
+        bad_verb(out, f, verb, v, false)
+        return
+    }
+    print_value(out, f, v, verb, 0)
+}
+
+// ---------------------------------------------------------------------------
+// Sprintf
+
+fn too_large(n: i64) -> bool {
+    n > 1000000 or n < -1000000
+}
+
+/// `parsenum` over characters: the number, whether there was one, and where
+/// it stopped.
+fn parse_num(s: str, start: i64, end: i64) -> (i64, bool, i64) {
+    if start >= end {
+        return (0, false, end)
+    }
+    var num = 0
+    var found = false
+    var i = start
+    while i < end {
+        let c = s.substr(i, 1)
+        if c < "0" or c > "9" {
+            break
+        }
+        if too_large(num) {
+            return (0, false, end)
+        }
+        num = num * 10 + (c.parse_int() ?? 0)
+        found = true
+        i = i + 1
+    }
+    (num, found, i)
+}
+
+type GoState = {
+    arg_num: i64,
+    reordered: bool,
+    good: bool,
+    after_index: bool,
+}
+
+/// `argNumber`: an `[n]` index at `i`, if there is one.
+fn arg_number(inout st: GoState, format: str, i: i64, nargs: i64) -> i64 {
+    if i >= format.len() or format.substr(i, 1) != "[" {
+        st.after_index = false
+        return i
+    }
+    st.reordered = true
+    // parseArgNumber
+    if format.len() - i < 3 {
+        st.good = false
+        st.after_index = false
+        return i + 1
+    }
+    var j = i + 1
+    while j < format.len() {
+        if format.substr(j, 1) == "]" {
+            let n = parse_num(format, i + 1, j)
+            if not n.1 or n.2 != j {
+                st.good = false
+                st.after_index = false
+                return j + 1
+            }
+            let index = n.0 - 1
+            if index >= 0 and index < nargs {
+                st.arg_num = index
+                st.after_index = true
+                return j + 1
+            }
+            st.good = false
+            st.after_index = true
+            return j + 1
+        }
+        j = j + 1
+    }
+    st.good = false
+    st.after_index = false
+    i + 1
+}
+
+/// `intFromArg`: a `*` width or precision from the operands.
+fn int_from_arg(args: [ref GoValue], inout st: GoState) -> (i64, bool) {
+    if st.arg_num >= args.len() {
+        return (0, false)
+    }
+    var num = 0
+    var ok = false
+    match args[st.arg_num] {
+        GoInt(n) -> {
+            num = n
+            ok = true
+        }
+        GoUint(n) -> if n >= 0 {
+            num = n
+            ok = true
+        }
+        _ -> {}
+    }
+    st.arg_num = st.arg_num + 1
+    if too_large(num) {
+        return (0, false)
+    }
+    (num, ok)
+}
+
+fn flag_of(inout f: GoFlags, c: str) -> bool {
+    if c == "#" {
+        f.sharp = true
+    } else if c == "0" {
+        f.zero = true
+    } else if c == "+" {
+        f.plus = true
+    } else if c == "-" {
+        f.minus = true
+    } else if c == " " {
+        f.space = true
+    } else {
+        return false
+    }
+    true
+}
+
+/// Width and precision, starting at `i`, either may be `*` or follow an
+/// `[n]`. Returns where the verb should be.
+fn width_and_precision(inout out: str, inout f: GoFlags, inout st: GoState, format: str,
+    start: i64, args: [ref GoValue]) -> i64 {
+    var i = arg_number(st, format, start, args.len())
+    let end = format.len()
+    if i < end and format.substr(i, 1) == "*" {
+        i = i + 1
+        let w = int_from_arg(args, st)
+        f.wid = w.0
+        f.wid_present = w.1
+        if not f.wid_present {
+            out = out + "%!(BADWIDTH)"
+        }
+        if f.wid < 0 {
+            f.wid = 0 - f.wid
+            f.minus = true
+            f.zero = false
+        }
+        st.after_index = false
+    } else {
+        let n = parse_num(format, i, end)
+        f.wid = n.0
+        f.wid_present = n.1
+        i = n.2
+        if st.after_index and f.wid_present {
+            st.good = false
+        }
+    }
+    if i + 1 < end and format.substr(i, 1) == "." {
+        i = i + 1
+        if st.after_index {
+            st.good = false
+        }
+        i = arg_number(st, format, i, args.len())
+        if i < end and format.substr(i, 1) == "*" {
+            i = i + 1
+            let p = int_from_arg(args, st)
+            f.prec = p.0
+            f.prec_present = p.1
+            if f.prec < 0 {
+                f.prec = 0
+                f.prec_present = false
+            }
+            if not f.prec_present {
+                out = out + "%!(BADPREC)"
+            }
+            st.after_index = false
+        } else {
+            let n = parse_num(format, i, end)
+            f.prec = n.0
+            f.prec_present = true
+            i = n.2
+        }
+    }
+    if not st.after_index {
+        i = arg_number(st, format, i, args.len())
+    }
+    i
+}
+
+/// `fmt.Sprintf(format, args...)`.
+pub fn sprintf(format: str, args: [ref GoValue]) -> str {
+    var out = ""
+    var st = GoState{ arg_num: 0, reordered: false, good: true, after_index: false }
+    let end = format.len()
+    var i = 0
+    while i < end {
+        st.good = true
+        let last = i
+        while i < end and format.substr(i, 1) != "%" {
+            i = i + 1
+        }
+        if i > last {
+            out = out + format.substr(last, i - last)
+        }
+        if i >= end {
+            break
+        }
+        i = i + 1
+        var f = no_flags()
+        while i < end and flag_of(f, format.substr(i, 1)) {
+            i = i + 1
+        }
+        i = width_and_precision(out, f, st, format, i, args)
+        if i >= end {
+            out = out + "%!(NOVERB)"
+            break
+        }
+        let verb = format.substr(i, 1)
+        i = i + 1
+        if verb == "%" {
+            out = out + "%"
+        } else if not st.good {
+            out = out + "%!" + verb + "(BADINDEX)"
+        } else if st.arg_num >= args.len() {
+            out = out + "%!" + verb + "(MISSING)"
+        } else {
+            if verb == "v" or verb == "w" {
+                f.sharp_v = f.sharp
+                f.sharp = false
+                f.plus_v = f.plus
+                f.plus = false
+            }
+            print_arg(out, f, args[st.arg_num], verb)
+            st.arg_num = st.arg_num + 1
+        }
+    }
+    if not st.reordered and st.arg_num < args.len() {
+        out = out + "%!(EXTRA "
+        for k in st.arg_num..args.len() {
+            if k > st.arg_num {
+                out = out + ", "
+            }
+            match args[k] {
+                GoNil -> out = out + "<nil>"
+                _ -> {
+                    out = out + type_name(args[k]) + "="
+                    print_arg(out, no_flags(), args[k], "v")
+                }
+            }
+        }
+        out = out + ")"
+    }
+    out
+}
+
+fn is_string(v: ref GoValue) -> bool {
+    match v {
+        GoString(_) -> true
+        _ -> false
+    }
+}
+
+/// `fmt.Sprint`: operands in `%v`, with a space between two only when
+/// neither is a string.
+pub fn sprint(args: [ref GoValue]) -> str {
+    var out = ""
+    var prev_string = false
+    for k in 0..args.len() {
+        let this_string = is_string(args[k])
+        if k > 0 and not this_string and not prev_string {
+            out = out + " "
+        }
+        print_arg(out, no_flags(), args[k], "v")
+        prev_string = this_string
+    }
+    out
+}
+
+/// `fmt.Sprintln`: operands in `%v`, always spaced, and a newline.
+pub fn sprintln(args: [ref GoValue]) -> str {
+    var out = ""
+    for k in 0..args.len() {
+        if k > 0 {
+            out = out + " "
+        }
+        print_arg(out, no_flags(), args[k], "v")
+    }
+    out + "\n"
+}

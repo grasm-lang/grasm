@@ -1,0 +1,27 @@
+// Go's formatter, asserted against what Go printed for the same operands.
+// scripts/gostd2_diff.sh holds it to Go case for case; this is the short
+// version every engine runs.
+import goprintf
+
+fn main() / {io} {
+    let args = [goprintf.float_value(1000000.0), goprintf.float_value(3.141592653589793),
+        goprintf.int_value(7), goprintf.string_value("hi"), goprintf.string_value("a\"b"),
+        goprintf.list_value([]), goprintf.string_value("x")]
+    // A float64 under %v turns to an exponent at 1e+06 -- the Helm
+    // `replicas: 1000000` surprise -- and %d on a string is not an error
+    // but a marker in the output.
+    assert_eq(goprintf.sprintf("%v|%5.2f|%-4d|%x|%q|%T|%d", args),
+        "1e+06| 3.14|7   |6869|\"a\\\"b\"|[]interface \{}|%!d(string=x)")
+
+    let m = goprintf.map_value(["b", "a"], [goprintf.int_value(2), goprintf.nil_value()])
+    assert_eq(goprintf.sprintf("%v", [m]), "map[a:<nil> b:2]")
+
+    assert_eq(goprintf.format_float(0.1, "e", 3), "1.000e-01")
+    assert_eq(goprintf.sprint([goprintf.int_value(1), goprintf.int_value(2),
+        goprintf.string_value("a"), goprintf.int_value(3)]), "1 2a3")
+    match goprintf.parse_json("\{\"n\": 3, \"l\": [true, null]}") {
+        Some(v) -> assert_eq(goprintf.sprintf("%v", [v]), "map[l:[true <nil>] n:3]")
+        None -> panic("goprintf could not read JSON")
+    }
+    print("gostd2: ok")
+}

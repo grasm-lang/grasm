@@ -1,0 +1,8 @@
+[package]
+name = "gostd2_demo"
+version = "1.0.0"
+capabilities = ["io"]
+
+[dependencies.goprintf]
+path = "../goprintf"
+version = "^1.0.0"

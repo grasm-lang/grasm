@@ -6,6 +6,8 @@ package main
 
 import (
 	"bufio"
+	"encoding/json"
+	"math"
 	"bytes"
 	"crypto/cipher"
 	"crypto/des"
@@ -78,6 +80,58 @@ func tpErr(err error) string {
 		return "ERR:trunc"
 	}
 	return "ERR:other:" + err.Error()
+}
+
+// goValue decodes the driver's tagged JSON into the Go value it names, so
+// both sides format exactly the same operands.
+func goValue(raw any) any {
+	t := raw.([]any)
+	switch t[0].(string) {
+	case "n":
+		return nil
+	case "t":
+		return t[1].(bool)
+	case "i":
+		v, _ := strconv.ParseInt(t[1].(string), 10, 64)
+		return int(v)
+	case "u":
+		v, _ := strconv.ParseUint(t[1].(string), 10, 64)
+		return uint(v)
+	case "f":
+		v, _ := strconv.ParseUint(t[1].(string), 16, 64)
+		return math.Float64frombits(v)
+	case "s":
+		return t[1].(string)
+	case "b":
+		v, _ := hex.DecodeString(t[1].(string))
+		return v
+	case "l":
+		out := []any{}
+		for _, item := range t[1].([]any) {
+			out = append(out, goValue(item))
+		}
+		return out
+	case "m":
+		out := map[string]any{}
+		for _, pair := range t[1].([]any) {
+			kv := pair.([]any)
+			out[kv[0].(string)] = goValue(kv[1])
+		}
+		return out
+	}
+	panic("unknown tag " + t[0].(string))
+}
+
+func goArgs(b []byte) []any {
+	var raw []any
+	if err := json.Unmarshal(b, &raw); err != nil {
+		panic(err)
+	}
+	out := []any{}
+	for _, r := range raw {
+		out = append(out, goValue(r))
+	}
+	return out
 }
 
 func answer(op string, a, b []byte) string {
@@ -251,6 +305,17 @@ func answer(op string, a, b []byte) string {
 		w.Write(a)
 		w.Close()
 		return h(out.Bytes())
+	case "gpf":
+		return h([]byte(fmt.Sprintf(string(a), goArgs(b)...)))
+	case "gps":
+		return h([]byte(fmt.Sprint(goArgs(b)...)))
+	case "gpl":
+		return h([]byte(fmt.Sprintln(goArgs(b)...)))
+	case "gff":
+		f := strings.Split(string(a), ",")
+		bits, _ := strconv.ParseUint(f[0], 16, 64)
+		prec, _ := strconv.Atoi(f[2])
+		return h([]byte(strconv.FormatFloat(math.Float64frombits(bits), f[1][0], prec, 64)))
 	case "salook":
 		idx := suffixarray.New(a)
 		got := idx.Lookup(b, -1)

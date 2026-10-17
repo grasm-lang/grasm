@@ -1,0 +1,130 @@
+// The Grasm side of scripts/gostd2_diff.py: arguments in threes -- an
+// operation and two hex fields, each with a leading `x` -- and one answer
+// line each, in the form the Go oracle in scripts/lib/gostd prints.
+//
+// Operands arrive as tagged JSON -- `["i", "5"]`, `["f", "<bits>"]`,
+// `["m", [["k", v], ...]]` -- which the oracle decodes into the same Go
+// values, so both sides format exactly the same thing.
+import goprintf
+import json
+
+fn from_hex(text: str) -> bytes {
+    var out: [i64] = []
+    var i = 1
+    while i + 1 < text.len() {
+        out.push(text.substr(i, 2).parse_int_base(16) ?? 0)
+        i = i + 2
+    }
+    bytes_of(out)
+}
+
+fn hex(raw: bytes) -> str {
+    let digits = "0123456789abcdef"
+    var out = ""
+    var i = 0
+    while i < raw.len() {
+        out = out + digits.substr(raw.at(i) / 16, 1) + digits.substr(raw.at(i) % 16, 1)
+        i = i + 1
+    }
+    out
+}
+
+fn text_hex(text: str) -> str {
+    hex(text.to_bytes())
+}
+
+fn unsigned_of(text: str) -> i64 {
+    var v = 0
+    for i in 0..text.len() {
+        v = v * 10 + (text.substr(i, 1).parse_int() ?? 0)
+    }
+    v
+}
+
+/// Sixteen hex digits as the 64 bits they spell -- in halves, since the
+/// top bit set would overflow a signed parse.
+fn bits_of(text: str) -> i64 {
+    let high = text.substr(0, 8).parse_int_base(16) ?? 0
+    let low = text.substr(8, 8).parse_int_base(16) ?? 0
+    high.shl(32).bit_or(low)
+}
+
+fn tagged(t: ref Json) -> ref GoValue {
+    let tag = json.as_str(json.at(t, 0) ?? json.null()) ?? ""
+    let body = json.at(t, 1) ?? json.null()
+    if tag == "t" {
+        return goprintf.bool_value(json.as_bool(body) ?? false)
+    }
+    if tag == "i" {
+        return goprintf.int_value((json.as_str(body) ?? "0").parse_int() ?? 0)
+    }
+    if tag == "u" {
+        return goprintf.uint_value(unsigned_of(json.as_str(body) ?? "0"))
+    }
+    if tag == "f" {
+        return goprintf.float_value(bits_of(json.as_str(body) ?? "0000000000000000").from_bits())
+    }
+    if tag == "s" {
+        return goprintf.string_value(json.as_str(body) ?? "")
+    }
+    if tag == "b" {
+        return goprintf.bytes_value(from_hex("x" + (json.as_str(body) ?? "")))
+    }
+    if tag == "l" {
+        var items: [ref GoValue] = []
+        for item in json.items_of(body) {
+            items.push(tagged(item))
+        }
+        return goprintf.list_value(items)
+    }
+    if tag == "m" {
+        var keys: [str] = []
+        var values: [ref GoValue] = []
+        for pair in json.items_of(body) {
+            keys.push(json.as_str(json.at(pair, 0) ?? json.null()) ?? "")
+            values.push(tagged(json.at(pair, 1) ?? json.null()))
+        }
+        return goprintf.map_value(keys, values)
+    }
+    goprintf.nil_value()
+}
+
+fn operands(b: bytes) -> [ref GoValue] {
+    var out: [ref GoValue] = []
+    match json.parse(b.to_str()) {
+        Ok(list) -> {
+            for item in json.items_of(list) {
+                out.push(tagged(item))
+            }
+        }
+        Err(_) -> {}
+    }
+    out
+}
+
+fn answer(what: str, a: bytes, b: bytes) -> str {
+    if what == "gpf" {
+        return text_hex(goprintf.sprintf(a.to_str(), operands(b)))
+    }
+    if what == "gps" {
+        return text_hex(goprintf.sprint(operands(b)))
+    }
+    if what == "gpl" {
+        return text_hex(goprintf.sprintln(operands(b)))
+    }
+    if what == "gff" {
+        let f = a.to_str().split(",")
+        let v = bits_of(f[0]).from_bits()
+        return text_hex(goprintf.format_float(v, f[1], f[2].parse_int() ?? 0))
+    }
+    "UNKNOWN {what}"
+}
+
+fn main() / {io} {
+    let argv = args()
+    var i = 0
+    while i + 2 < argv.len() {
+        print(answer(argv[i], from_hex(argv[i + 1]), from_hex(argv[i + 2])))
+        i = i + 3
+    }
+}

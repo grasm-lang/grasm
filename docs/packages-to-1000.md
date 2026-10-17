@@ -222,6 +222,14 @@ day its reference is installed.
 
 ## Landed
 
+- [x] **B1, Go's formatter** — `goprintf`, and the harness `gostdtest2`.
+  58,000 cases against Go's `fmt.Sprintf`, `Sprint`, `Sprintln` and
+  `strconv.FormatFloat`: random format strings over every flag, width,
+  precision, `*` and `[n]` form and verb, on operands of every kind --
+  including the `%!d(string=x)`, `%!(MISSING)`, `%!(EXTRA ...)` and
+  `%!(BADINDEX)` forms. Not on the list; `gotemplate` needs it for `printf`
+  and for printing any value at all.
+
 - [x] **B1, second half: the public-key half** — `modarith` `ecc`
   `ecdh` `ecdsa` `rfc6979` `dsa` `mlkem`, and the harnesses `pubkeytest` and
   `pqctest`. 2,711 cases against OpenSSL 3.6 and Python, and 189 against
@@ -254,7 +262,7 @@ day its reference is installed.
 | | |
 |---|---|
 | At the start | 669 |
-| Now | 687 |
+| Now | 689 |
 | Candidates above | 310 packages in 27 batches, plus `ecc` and `rfc6979` |
 | Harnesses, one a batch | 27 |
 | If every candidate lands | 1008 |

@@ -1,0 +1,12 @@
+[package]
+name = "gostdtest2"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.goprintf]
+path = "../goprintf"
+version = "^1.0.0"
+
+[dependencies.json]
+path = "../json"
+version = "^1.0.0"
