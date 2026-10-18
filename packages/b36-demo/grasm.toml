@@ -1,0 +1,20 @@
+[package]
+name = "b36_demo"
+version = "1.0.0"
+capabilities = ["io"]
+
+[dependencies.pkcs12]
+path = "../pkcs12"
+version = "^1.0.0"
+
+[dependencies.jks]
+path = "../jks"
+version = "^1.0.0"
+
+[dependencies.pbes]
+path = "../pbes"
+version = "^1.0.0"
+
+[dependencies.pkcs1]
+path = "../pkcs1"
+version = "^1.0.0"

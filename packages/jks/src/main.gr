@@ -1,0 +1,300 @@
+// Java KeyStore files (JKS), the format of Java's `keytool` before Java 9
+// made PKCS#12 the default, and still of countless `.jks` and `cacerts`
+// files: Tomcat, Jetty, Kafka, Elasticsearch, Android signing keys and
+// every JVM's trust store.
+//
+// The format is Sun's own: a magic number (0xFEEDFEED), version 2, and a
+// list of entries, each a private key with its certificate chain or a
+// trusted certificate, under a lower-cased alias (written as Java's
+// "modified UTF-8") with a timestamp in milliseconds. The file ends with a
+// SHA-1 over the password (as UTF-16 code units), the words "Mighty
+// Aphrodite" and everything before it -- an integrity check, not
+// encryption: the certificates are in the clear.
+//
+// Private keys are protected by Sun's KeyProtector: a 20-byte salt, the
+// PKCS#8 key XORed with a stream of chained SHA-1 hashes of the password
+// and the salt, and a SHA-1 of the password and the key to check it,
+// wrapped in an EncryptedPrivateKeyInfo with Sun's OID. That stream is one
+// SHA-1 per 20 bytes, so a JKS password is cheap to guess; prefer PKCS#12.
+//
+// Checked against Java 17's `keytool`.
+import asn1
+import derwrite
+import sha1
+import bytes_codec
+
+type JksEntry = { alias: str, time_ms: i64, is_key: bool, key: bytes, certs: [bytes] }
+
+type JksError =
+    | JksMalformed(why: str)
+    | JksBadPassword
+    | JksBadKeyPassword(alias: str)
+    | JksUnsupported(what: str)
+
+let PROTECTOR_OID = "1.3.6.1.4.1.42.2.17.1.1"
+
+/// A password as Java hashes it: each UTF-16 code unit, big-endian.
+fn password_bytes(password: str) -> bytes {
+    var out: [i64] = []
+    for c in password.codes() {
+        if c >= 65536 {
+            let v = c - 65536
+            let hi = 55296 + v.ushr(10)
+            let lo = 56320 + v.bit_and(1023)
+            out = out + [hi.ushr(8), hi.bit_and(255), lo.ushr(8), lo.bit_and(255)]
+        } else {
+            out = out + [c.ushr(8), c.bit_and(255)]
+        }
+    }
+    return bytes_of(out)
+}
+
+/// Java's modified UTF-8: NUL as two bytes, and characters beyond the BMP
+/// as their surrogate pair, three bytes each.
+fn modified_utf8(s: str) -> [i64] {
+    var units: [i64] = []
+    for c in s.codes() {
+        if c >= 65536 {
+            let v = c - 65536
+            units = units + [55296 + v.ushr(10), 56320 + v.bit_and(1023)]
+        } else {
+            units.push(c)
+        }
+    }
+    var out: [i64] = []
+    for u in units {
+        if u >= 1 and u < 128 {
+            out.push(u)
+        } else if u < 2048 {
+            out = out + [192 + u.ushr(6), 128 + u.bit_and(63)]
+        } else {
+            out = out + [224 + u.ushr(12), 128 + u.ushr(6).bit_and(63), 128 + u.bit_and(63)]
+        }
+    }
+    return out
+}
+
+fn from_modified_utf8(b: bytes) -> str ! JksError {
+    var units: [i64] = []
+    var i = 0
+    while i < b.len() {
+        let c = b.at(i)
+        if c < 128 {
+            units.push(c)
+            i = i + 1
+        } else if c >= 192 and c < 224 and i + 1 < b.len() {
+            units.push((c - 192).shl(6) + b.at(i + 1).bit_and(63))
+            i = i + 2
+        } else if c >= 224 and c < 240 and i + 2 < b.len() {
+            units.push((c - 224).shl(12) + b.at(i + 1).bit_and(63).shl(6) + b.at(i + 2).bit_and(63))
+            i = i + 3
+        } else {
+            fail(JksMalformed("an alias that is not modified UTF-8"))
+        }
+    }
+    var out = ""
+    var k = 0
+    while k < units.len() {
+        let u = units[k]
+        if u >= 55296 and u <= 56319 and k + 1 < units.len() {
+            out = out + (65536 + (u - 55296) * 1024 + (units[k + 1] - 56320)).to_char()
+            k = k + 2
+        } else {
+            out = out + u.to_char()
+            k = k + 1
+        }
+    }
+    return out
+}
+
+// --- the key protector ------------------------------------------------------------------------
+
+fn keystream(pw: bytes, salt: bytes, n: i64) -> [i64] {
+    var out: [i64] = []
+    var digest = salt
+    while out.len() < n {
+        digest = sha1.hash(pw.concat(digest))
+        out = out + digest.to_list()
+    }
+    return out.slice(0, n)
+}
+
+fn xor_list(a: bytes, k: [i64]) -> bytes {
+    var out: [i64] = []
+    for i in 0..a.len() {
+        out.push(a.at(i).bit_xor(k[i]))
+    }
+    return bytes_of(out)
+}
+
+/// A PKCS#8 key protected with a 20-byte salt, as the DER Java stores.
+pub fn protect(pkcs8: bytes, password: str, salt: bytes) -> bytes ! JksError {
+    if salt.len() != 20 {
+        fail(JksMalformed("the salt must be 20 bytes"))
+    }
+    let pw = password_bytes(password)
+    let body = salt.concat(xor_list(pkcs8, keystream(pw, salt, pkcs8.len()))).concat(sha1.hash(pw.concat(pkcs8)))
+    let alg = derwrite.algorithm_with_null(PROTECTOR_OID) ?? fail(JksMalformed("DER"))
+    let data = derwrite.octet_string(body) ?? fail(JksMalformed("DER"))
+    return derwrite.sequence([alg, data]) ?? fail(JksMalformed("DER"))
+}
+
+/// The PKCS#8 key inside a protected one.
+pub fn recover(protected: bytes, password: str) -> bytes ! JksError {
+    let nodes = asn1.parse(protected) ?? fail(JksMalformed("a protected key that is not DER"))
+    let k = asn1.child_indices(nodes, 0)
+    if k.len() != 2 or nodes[k[1]].tag != 4 {
+        fail(JksMalformed("not an EncryptedPrivateKeyInfo"))
+    }
+    let a = asn1.child_indices(nodes, k[0])
+    if a.len() < 1 or asn1.oid_of(protected, nodes[a[0]]) != PROTECTOR_OID {
+        fail(JksUnsupported("a key protector other than Sun's"))
+    }
+    let body = asn1.value(protected, nodes[k[1]])
+    if body.len() < 40 {
+        fail(JksMalformed("a protected key too short to hold its salt and check"))
+    }
+    let pw = password_bytes(password)
+    let salt = body.slice(0, 20)
+    let enc = body.slice(20, body.len() - 20)
+    let key = xor_list(enc, keystream(pw, salt, enc.len()))
+    if not bytes_codec.equal_constant_time(sha1.hash(pw.concat(key)), body.slice(body.len() - 20, body.len())) {
+        fail(JksBadPassword)
+    }
+    return key
+}
+
+// --- the file ---------------------------------------------------------------------------------
+
+type JksReader = { data: bytes, at: i64 }
+
+fn take(inout r: JksReader, n: i64) -> bytes ! JksError {
+    if n < 0 or r.at + n > r.data.len() {
+        fail(JksMalformed("truncated"))
+    }
+    let out = r.data.slice(r.at, r.at + n)
+    r.at = r.at + n
+    return out
+}
+
+fn int_of(b: bytes) -> i64 {
+    var v = 0
+    for i in 0..b.len() {
+        v = v.shl(8).bit_or(b.at(i))
+    }
+    return v
+}
+
+fn u32(inout r: JksReader) -> i64 ! JksError {
+    return int_of(try take(r, 4))
+}
+
+fn utf(inout r: JksReader) -> str ! JksError {
+    let n = int_of(try take(r, 2))
+    return try from_modified_utf8(try take(r, n))
+}
+
+fn cert(inout r: JksReader) -> bytes ! JksError {
+    let kind = try utf(r)
+    if kind != "X.509" {
+        fail(JksUnsupported("a certificate of type " + kind))
+    }
+    return try take(r, try u32(r))
+}
+
+fn digest_of(password: str, body: bytes) -> bytes {
+    return sha1.hash(password_bytes(password).concat("Mighty Aphrodite".to_bytes()).concat(body))
+}
+
+/// The entries of a keystore, its integrity checked with the store password
+/// and its keys recovered with the key password (usually the same).
+pub fn parse(data: bytes, store_password: str, key_password: str) -> [JksEntry] ! JksError {
+    if data.len() < 32 {
+        fail(JksMalformed("too short"))
+    }
+    let body = data.slice(0, data.len() - 20)
+    if not bytes_codec.equal_constant_time(digest_of(store_password, body), data.slice(data.len() - 20, data.len())) {
+        fail(JksBadPassword)
+    }
+    var r = JksReader{ data: body, at: 0 }
+    if try u32(r) != 4277010157 {
+        fail(JksMalformed("not a JKS file"))
+    }
+    if try u32(r) != 2 {
+        fail(JksUnsupported("a version other than 2"))
+    }
+    let count = try u32(r)
+    var out: [JksEntry] = []
+    for _i in 0..count {
+        let tag = try u32(r)
+        let alias = try utf(r)
+        let time = int_of(try take(r, 8))
+        if tag == 1 {
+            let protected = try take(r, try u32(r))
+            let key = recover(protected, key_password) ?? fail(JksBadKeyPassword(alias))
+            var chain: [bytes] = []
+            for _c in 0..(try u32(r)) {
+                chain.push(try cert(r))
+            }
+            out.push(JksEntry{ alias: alias, time_ms: time, is_key: true, key: key, certs: chain })
+        } else if tag == 2 {
+            out.push(JksEntry{ alias: alias, time_ms: time, is_key: false, key: bytes_of([]), certs: [try cert(r)] })
+        } else {
+            fail(JksUnsupported("an entry of type {tag}"))
+        }
+    }
+    if r.at != body.len() {
+        fail(JksMalformed("bytes after the last entry"))
+    }
+    return out
+}
+
+fn be(v: i64, n: i64) -> [i64] {
+    var out: [i64] = []
+    var i = n - 1
+    while i >= 0 {
+        out.push(v.ushr(8 * i).bit_and(255))
+        i = i - 1
+    }
+    return out
+}
+
+fn utf_out(s: str) -> [i64] ! JksError {
+    let b = modified_utf8(s)
+    if b.len() > 65535 {
+        fail(JksMalformed("an alias over 65535 bytes"))
+    }
+    return be(b.len(), 2) + b
+}
+
+fn cert_out(der: bytes) -> [i64] ! JksError {
+    return (try utf_out("X.509")) + be(der.len(), 4) + der.to_list()
+}
+
+/// A keystore of these entries. Aliases are lower-cased, as JKS stores
+/// them. Each key entry takes the next 20-byte salt from `salts`.
+pub fn build(entries: [JksEntry], store_password: str, key_password: str, salts: [bytes]) -> bytes ! JksError {
+    var out = be(4277010157, 4) + be(2, 4) + be(entries.len(), 4)
+    var s = 0
+    for e in entries {
+        out = out + be(if e.is_key { 1 } else { 2 }, 4) + (try utf_out(e.alias.to_lower())) + be(e.time_ms, 8)
+        if e.is_key {
+            if s >= salts.len() {
+                fail(JksMalformed("a salt for every key"))
+            }
+            let p = try protect(e.key, key_password, salts[s])
+            s = s + 1
+            out = out + be(p.len(), 4) + p.to_list() + be(e.certs.len(), 4)
+            for c in e.certs {
+                out = out + (try cert_out(c))
+            }
+        } else {
+            if e.certs.len() != 1 {
+                fail(JksMalformed("a trusted entry holds one certificate"))
+            }
+            out = out + (try cert_out(e.certs[0]))
+        }
+    }
+    let body = bytes_of(out)
+    return body.concat(digest_of(store_password, body))
+}

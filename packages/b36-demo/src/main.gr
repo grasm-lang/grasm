@@ -1,0 +1,48 @@
+// A key and certificate into a PKCS#12 file and a Java KeyStore, and back
+// out. scripts/b36_diff.sh holds them to OpenSSL and keytool.
+import pkcs12
+import jks
+import pbes
+import pkcs1
+
+fn filled(n: i64, v: i64) -> bytes {
+    var out: [i64] = []
+    while out.len() < n {
+        out.push(v)
+    }
+    bytes_of(out)
+}
+
+fn main() / {io} {
+    let none = bytes_of([])
+    // The textbook RSA key (n = 3233) as PKCS#8, and a stand-in certificate.
+    let rsa = pkcs1.write_private(Pkcs1Private{ n: bytes_of([12, 161]), e: bytes_of([17]), d: bytes_of([11, 3]),
+        p: bytes_of([61]), q: bytes_of([53]), dp: bytes_of([53]), dq: bytes_of([49]), qinv: bytes_of([38]), others: [] }) ?? none
+    let key = pkcs1.to_pkcs8(rsa) ?? none
+    let cert = bytes_of([48, 3, 2, 1, 1])
+    let pw = "changeit".to_bytes()
+
+    // PKCS#12: the key under PBES2, the certificate under the 40-bit RC2
+    // scheme old Windows exports use, and a SHA-256 MAC.
+    let o = PfxOptions{ key_alg: pbes.pbes2("aes-256-cbc", "hmacWithSHA256", filled(16, 1), 10, filled(16, 2)) ?? none,
+        cert_alg: pbes.pbe("pbeWithSHAAnd40BitRC2-CBC", filled(8, 3), 10) ?? none, mac_hash: "sha256", mac_salt: filled(16, 4),
+        mac_iterations: 10 }
+    let contents = PfxContents{ keys: [PfxKey{ pkcs8: key, name: "server", key_id: filled(20, 5) }],
+        certs: [PfxCert{ der: cert, name: "server", key_id: filled(20, 5) }] }
+    let pfx = pkcs12.build(contents, pw, o) ?? none
+    let back = pkcs12.parse(pfx, pw) ?? panic("parse")
+    assert_eq(back.keys[0].pkcs8, key)
+    assert_eq(back.certs[0].name, "server")
+    assert_eq((pkcs12.parse(pfx, "wrong".to_bytes()) ?? PfxContents{ keys: [], certs: [] }).keys.len(), 0)
+
+    // JKS: the same key and a trusted certificate.
+    let entries = [JksEntry{ alias: "Server", time_ms: 1760000000000, is_key: true, key: key, certs: [cert] },
+        JksEntry{ alias: "root", time_ms: 1760000000000, is_key: false, key: none, certs: [cert] }]
+    let store = jks.build(entries, "changeit", "changeit", [filled(20, 6)]) ?? none
+    let read = jks.parse(store, "changeit", "changeit") ?? []
+    assert_eq(read.len(), 2)
+    assert_eq(read[0].alias, "server")
+    assert_eq(read[0].key, key)
+    assert_eq((jks.parse(store, "wrong", "changeit") ?? []).len(), 0)
+    print("b36: ok")
+}

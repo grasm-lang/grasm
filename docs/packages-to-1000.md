@@ -256,6 +256,20 @@ day its reference is installed.
 
 ## Landed
 
+- [x] **B36: PKCS#12 and Java keystores** — B10's `pkcs12` and `jks`, with
+  the harness `b36test`; the new gate `b36diff` runs 206 cases on fresh
+  identities each run (a CA and leaf certificates for RSA, EC and Ed25519
+  keys): files `openssl pkcs12 -export` wrote under eight key schemes,
+  four certificate schemes and four MAC hashes, or no MAC, read here with
+  the key, both certificates, the friendly name and the local key id as
+  they went in; files built here read by OpenSSL; keystores keytool
+  converted read here, and keystores built here listed and converted back
+  by keytool. A wrong password on a file with no MAC and an RC4-shrouded
+  key decrypts to garbage with nothing to say so; OpenSSL refuses it when
+  the garbage is not a key, and `pkcs12` now checks the same. Java 17
+  refuses non-ASCII passwords for PBES2 key protection, so the keytool
+  cases use ASCII ones. One break per package turned it red.
+
 - [x] **B35: key files** — B10's `pkcs1`, with `pbkdf2` `pbes` `encpkcs8`
   `sec1` `pemcrypt`, which were not on the list (B10 named the files these
   read; `pkcs8` had left encrypted keys, PKCS#1 and SEC1 to other
@@ -651,7 +665,7 @@ day its reference is installed.
 | | |
 |---|---|
 | At the start | 669 |
-| Now | 885 |
+| Now | 888 |
 | Candidates above | 316 packages in 28 batches, plus `ecc`, `rfc6979` and `goprintf` |
 | Harnesses, one a batch | 28 |
 | If every candidate lands | 1016 |

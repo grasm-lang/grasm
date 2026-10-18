@@ -1,0 +1,40 @@
+[package]
+name = "pkcs12"
+version = "1.0.0"
+capabilities = []
+
+[dependencies.asn1]
+path = "../asn1"
+version = "^1.0.0"
+
+[dependencies.derwrite]
+path = "../derwrite"
+version = "^1.0.0"
+
+[dependencies.pbes]
+path = "../pbes"
+version = "^1.0.0"
+
+[dependencies.pkcs12kdf]
+path = "../pkcs12kdf"
+version = "^1.0.0"
+
+[dependencies.hmac]
+path = "../hmac"
+version = "^1.0.0"
+
+[dependencies.sha1]
+path = "../sha1"
+version = "^1.0.0"
+
+[dependencies.crypto_hash]
+path = "../crypto_hash"
+version = "^1.0.0"
+
+[dependencies.sha512]
+path = "../sha512"
+version = "^1.0.0"
+
+[dependencies.bytes_codec]
+path = "../bytes"
+version = "^1.0.0"

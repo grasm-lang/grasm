@@ -1,0 +1,115 @@
+// The Grasm side of scripts/b36_diff.py: `<op> x x<fields>`, the fields
+// `|`-separated, bytes in hex. Answers are hex, or ERR.
+import pkcs12
+import jks
+import pbes
+
+fn from_hex(text: str) -> bytes {
+    var out: [i64] = []
+    var i = 1
+    while i + 1 < text.len() {
+        let v = text.substr(i, 2).parse_int_base(16) ?? 0
+        out.push(if v < 0 or v > 255 { 0 } else { v })
+        i = i + 2
+    }
+    bytes_of(out)
+}
+
+fn unhex(text: str) -> bytes {
+    from_hex(":" + text)
+}
+
+fn hex(raw: bytes) -> str {
+    let digits = "0123456789abcdef"
+    var out = ""
+    var i = 0
+    while i < raw.len() {
+        out = out + digits.substr(raw.at(i) / 16, 1) + digits.substr(raw.at(i) % 16, 1)
+        i = i + 1
+    }
+    out
+}
+
+fn int(s: str) -> i64 {
+    s.parse_int() ?? 0
+}
+
+/// A pbes algorithm from `pbes2:cipher:prf:salt:iter:iv`, `pbe:scheme:salt:iter`,
+/// or nothing.
+fn alg(spec: str) -> bytes ! str {
+    if spec.len() == 0 {
+        return bytes_of([])
+    }
+    let p = spec.split(":")
+    if p[0] == "pbes2" {
+        return pbes.pbes2(p[1], p[2], unhex(p[3]), int(p[4]), unhex(p[5])) ?? fail("x")
+    }
+    return pbes.pbe(p[1], unhex(p[2]), int(p[3])) ?? fail("x")
+}
+
+fn list(s: str) -> [bytes] {
+    if s.len() == 0 { [] } else { s.split(",").map(|x| unhex(x)) }
+}
+
+fn summary_pfx(c: PfxContents) -> str {
+    var parts: [str] = []
+    for k in c.keys {
+        parts.push("k:" + hex(k.pkcs8) + ":" + hex(k.name.to_bytes()) + ":" + hex(k.key_id))
+    }
+    for x in c.certs {
+        parts.push("c:" + hex(x.der) + ":" + hex(x.name.to_bytes()) + ":" + hex(x.key_id))
+    }
+    parts.sort()
+    parts.join(";")
+}
+
+fn summary_jks(es: [JksEntry]) -> str {
+    var parts: [str] = []
+    for e in es {
+        parts.push((if e.is_key { "k:" } else { "c:" }) + hex(e.alias.to_bytes()) + ":" + hex(e.key) + ":" + e.certs.map(|c| hex(c)).join(","))
+    }
+    parts.sort()
+    parts.join(";")
+}
+
+fn run(op: str, g: [str]) -> bytes ! str {
+    if op == "pfx.parse" {
+        return summary_pfx(pkcs12.parse(unhex(g[0]), unhex(g[1])) ?? fail("x")).to_bytes()
+    }
+    if op == "pfx.build" {
+        let key = PfxKey{ pkcs8: unhex(g[0]), name: unhex(g[2]).to_str(), key_id: unhex(g[3]) }
+        var certs: [PfxCert] = []
+        var first = true
+        for c in list(g[1]) {
+            certs.push(PfxCert{ der: c, name: if first { key.name } else { "" }, key_id: if first { key.key_id } else { bytes_of([]) } })
+            first = false
+        }
+        let o = PfxOptions{ key_alg: try alg(g[5]), cert_alg: try alg(g[6]), mac_hash: g[7], mac_salt: unhex(g[8]), mac_iterations: int(g[9]) }
+        return pkcs12.build(PfxContents{ keys: [key], certs: certs }, unhex(g[4]), o) ?? fail("x")
+    }
+    if op == "jks.parse" {
+        return summary_jks(jks.parse(unhex(g[0]), unhex(g[1]).to_str(), unhex(g[2]).to_str()) ?? fail("x")).to_bytes()
+    }
+    // jks.build: entries `alias~kind~key~certs~time` joined by `;`, then
+    // the store password, the key password and the salts.
+    var entries: [JksEntry] = []
+    for e in g[0].split(";") {
+        let f = e.split("~")
+        entries.push(JksEntry{ alias: unhex(f[0]).to_str(), time_ms: int(f[4]), is_key: f[1] == "k", key: unhex(f[2]),
+            certs: if f[3].len() == 0 { [] } else { f[3].split("+").map(|x| unhex(x)) } })
+    }
+    return jks.build(entries, unhex(g[1]).to_str(), unhex(g[2]).to_str(), list(g[3])) ?? fail("x")
+}
+
+fn main() / {io} {
+    let argv = args()
+    var i = 0
+    while i + 2 < argv.len() {
+        let g = from_hex(argv[i + 2]).to_str().split("|")
+        print(match run(argv[i], g) {
+            Ok(b) -> hex(b)
+            Err(_) -> "ERR"
+        })
+        i = i + 3
+    }
+}

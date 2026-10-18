@@ -1,0 +1,332 @@
+// PKCS#12 files (.p12, .pfx), RFC 7292: a private key and its certificate
+// chain in one password-protected file.
+//
+// This is how keys move between systems: Windows' certificate export,
+// macOS Keychain Access, Java (its default keystore type since 9), browsers,
+// Azure and AWS certificate imports, code-signing and S/MIME tools all read
+// and write it. The structure is nested several deep:
+//
+//     PFX { version 3, authSafe ContentInfo, macData }
+//       authSafe: data holding an AuthenticatedSafe, a SEQUENCE OF ContentInfo,
+//         each plain data or encryptedData, holding SafeContents:
+//           SafeBag { bagId, bagValue [0], bagAttributes }
+//             keyBag              a PrivateKeyInfo
+//             pkcs8ShroudedKeyBag an EncryptedPrivateKeyInfo
+//             certBag             an X.509 certificate
+//           attributes: friendlyName (a BMPString) and localKeyId, which
+//           pairs a key with its certificate
+//       macData: an HMAC over the AuthenticatedSafe, keyed by the PKCS#12
+//         KDF (purpose 3) from the password, salt and iteration count
+//
+// `parse` checks the MAC first (in constant time), then decrypts what is
+// encrypted, with the same password: encrypted parts and shrouded keys may
+// use any scheme `pbes` reads. `build` writes the layout OpenSSL writes:
+// certificates in an encrypted ContentInfo (or plain, if no scheme is
+// given for them), keys as shrouded bags in a plain one, and a MAC.
+//
+// Checked against OpenSSL's `pkcs12`.
+import asn1
+import derwrite
+import pbes
+import pkcs12kdf
+import hmac
+import sha1
+import crypto_hash
+import sha512
+import bytes_codec
+
+type PfxKey = { pkcs8: bytes, name: str, key_id: bytes }
+
+type PfxCert = { der: bytes, name: str, key_id: bytes }
+
+type PfxContents = { keys: [PfxKey], certs: [PfxCert] }
+
+/// How to write a file: a pbes AlgorithmIdentifier for the keys, one for the
+/// certificates (empty for none), and the MAC's hash name, salt and count.
+type PfxOptions = { key_alg: bytes, cert_alg: bytes, mac_hash: str, mac_salt: bytes, mac_iterations: i64 }
+
+type PfxError =
+    | PfxMalformed(why: str)
+    | PfxBadMac
+    | PfxBadPassword
+    | PfxUnsupported(what: str)
+
+let DATA = "1.2.840.113549.1.7.1"
+let ENCRYPTED_DATA = "1.2.840.113549.1.7.6"
+let BAGS = "1.2.840.113549.1.12.10.1."
+let FRIENDLY_NAME = "1.2.840.113549.1.9.20"
+let LOCAL_KEY_ID = "1.2.840.113549.1.9.21"
+let X509_CERT = "1.2.840.113549.1.9.22.1"
+
+/// A MAC hash: its OID, function, block size and output size.
+fn mac_hash(name: str) -> (str, fn(bytes) -> bytes, i64, i64) ! PfxError {
+    if name == "sha1" {
+        return ("1.3.14.3.2.26", |x| sha1.hash(x), 64, 20)
+    }
+    if name == "sha256" {
+        return ("2.16.840.1.101.3.4.2.1", |x| crypto_hash.sha256_of(x), 64, 32)
+    }
+    if name == "sha384" {
+        return ("2.16.840.1.101.3.4.2.2", |x| sha512.sha384(x), 128, 48)
+    }
+    if name == "sha512" {
+        return ("2.16.840.1.101.3.4.2.3", |x| sha512.sha512(x), 128, 64)
+    }
+    fail(PfxUnsupported(name))
+}
+
+fn mac_name(oid: str) -> str {
+    let names = [("1.3.14.3.2.26", "sha1"), ("2.16.840.1.101.3.4.2.1", "sha256"), ("2.16.840.1.101.3.4.2.2", "sha384"),
+        ("2.16.840.1.101.3.4.2.3", "sha512")]
+    for n in names {
+        if n.0 == oid {
+            return n.1
+        }
+    }
+    return ""
+}
+
+fn compute_mac(hash_name: str, password: bytes, salt: bytes, iterations: i64, data: bytes) -> bytes ! PfxError {
+    let (_oid, h, block, size) = try mac_hash(hash_name)
+    let key = pkcs12kdf.derive(h, block, pkcs12kdf.bmp_password(password.to_str()), salt, 3, iterations, size) ?? fail(PfxMalformed("MAC key"))
+    return hmac.hmac(h, block, key, data)
+}
+
+// --- Reading --------------------------------------------------------------------------------
+
+fn kids(nodes: [DerNode], i: i64) -> [i64] {
+    return asn1.child_indices(nodes, i)
+}
+
+fn need(ok: bool, why: str) -> () ! PfxError {
+    if not ok {
+        fail(PfxMalformed(why))
+    }
+}
+
+/// The content of a ContentInfo of type data: [0] EXPLICIT OCTET STRING.
+fn data_content(der: bytes, nodes: [DerNode], ci: i64) -> bytes ! PfxError {
+    let k = kids(nodes, ci)
+    try need(k.len() == 2 and nodes[k[1]].tag == 160, "a ContentInfo")
+    let inner = kids(nodes, k[1])
+    try need(inner.len() == 1 and nodes[inner[0]].tag == 4, "data content")
+    return asn1.value(der, nodes[inner[0]])
+}
+
+/// The decrypted SafeContents of an encryptedData ContentInfo.
+fn encrypted_content(der: bytes, nodes: [DerNode], ci: i64, password: bytes) -> bytes ! PfxError {
+    let k = kids(nodes, ci)
+    try need(k.len() == 2 and nodes[k[1]].tag == 160, "an encryptedData ContentInfo")
+    let ed = kids(nodes, k[1])
+    try need(ed.len() == 1 and nodes[ed[0]].tag == 48, "EncryptedData")
+    let f = kids(nodes, ed[0])
+    try need(f.len() >= 2 and nodes[f[1]].tag == 48, "EncryptedData fields")
+    let eci = kids(nodes, f[1])
+    try need(eci.len() == 3 and nodes[eci[1]].tag == 48 and nodes[eci[2]].tag == 128, "EncryptedContentInfo")
+    let alg = asn1.raw(der, nodes[eci[1]])
+    return pbes.decrypt(alg, password, asn1.value(der, nodes[eci[2]])) ?? fail(PfxBadPassword)
+}
+
+fn bmp_text(raw: bytes) -> str {
+    var out = ""
+    var i = 0
+    while i + 1 < raw.len() {
+        var c = raw.at(i) * 256 + raw.at(i + 1)
+        if c >= 55296 and c <= 56319 and i + 3 < raw.len() {
+            let lo = raw.at(i + 2) * 256 + raw.at(i + 3)
+            c = 65536 + (c - 55296) * 1024 + (lo - 56320)
+            i = i + 2
+        }
+        out = out + c.to_char()
+        i = i + 2
+    }
+    return out
+}
+
+/// friendlyName and localKeyId from a bag's attribute SET.
+fn attributes(der: bytes, nodes: [DerNode], set: i64) -> (str, bytes) {
+    var name = ""
+    var key_id = bytes_of([])
+    for a in kids(nodes, set) {
+        let f = kids(nodes, a)
+        if f.len() == 2 and nodes[f[0]].tag == 6 {
+            let values = kids(nodes, f[1])
+            let oid = asn1.oid_of(der, nodes[f[0]])
+            if values.len() > 0 {
+                let v = asn1.value(der, nodes[values[0]])
+                if oid == FRIENDLY_NAME {
+                    name = bmp_text(v)
+                } else if oid == LOCAL_KEY_ID {
+                    key_id = v
+                }
+            }
+        }
+    }
+    return (name, key_id)
+}
+
+/// Whether decrypted bytes are a PrivateKeyInfo: a SEQUENCE beginning with
+/// version 0 or 1. With no MAC and a stream cipher (RC4) nothing else
+/// tells a wrong password from a right one.
+fn is_private_key(der: bytes) -> bool {
+    return match asn1.parse(der) {
+        Ok(nodes) -> {
+            if nodes.len() < 2 or nodes[0].tag != 48 or nodes[1].tag != 2 or nodes[1].depth != 1 {
+                return false
+            }
+            let v = asn1.integer_of(der, nodes[1])
+            v == 0 or v == 1
+        }
+        Err(_) -> false
+    }
+}
+
+fn read_bags(contents: bytes, password: bytes, inout out: PfxContents) -> () ! PfxError {
+    let nodes = asn1.parse(contents) ?? fail(PfxMalformed("SafeContents"))
+    try need(nodes.len() > 0 and nodes[0].tag == 48, "SafeContents")
+    for bag in kids(nodes, 0) {
+        let f = kids(nodes, bag)
+        try need(f.len() >= 2 and nodes[f[0]].tag == 6 and nodes[f[1]].tag == 160, "a SafeBag")
+        let value = kids(nodes, f[1])
+        try need(value.len() == 1, "a SafeBag value")
+        let (name, key_id) = if f.len() > 2 { attributes(contents, nodes, f[2]) } else { ("", bytes_of([])) }
+        let kind = asn1.oid_of(contents, nodes[f[0]])
+        let raw = asn1.raw(contents, nodes[value[0]])
+        if kind == BAGS + "1" {
+            out.keys.push(PfxKey{ pkcs8: raw, name: name, key_id: key_id })
+        } else if kind == BAGS + "2" {
+            let ek = kids(nodes, value[0])
+            try need(ek.len() == 2, "an EncryptedPrivateKeyInfo")
+            let alg = asn1.raw(contents, nodes[ek[0]])
+            let key = pbes.decrypt(alg, password, asn1.value(contents, nodes[ek[1]])) ?? fail(PfxBadPassword)
+            if not is_private_key(key) {
+                fail(PfxBadPassword)
+            }
+            out.keys.push(PfxKey{ pkcs8: key, name: name, key_id: key_id })
+        } else if kind == BAGS + "3" {
+            let cb = kids(nodes, value[0])
+            try need(cb.len() == 2 and nodes[cb[1]].tag == 160, "a CertBag")
+            let inner = kids(nodes, cb[1])
+            try need(inner.len() == 1 and nodes[inner[0]].tag == 4, "a certificate")
+            if asn1.oid_of(contents, nodes[cb[0]]) == X509_CERT {
+                out.certs.push(PfxCert{ der: asn1.value(contents, nodes[inner[0]]), name: name, key_id: key_id })
+            }
+        } else if kind == BAGS + "6" {
+            try read_bags(raw, password, out)
+        }
+    }
+}
+
+/// The keys and certificates in a PFX, its MAC checked first.
+pub fn parse(der: bytes, password: bytes) -> PfxContents ! PfxError {
+    let nodes = asn1.parse(der) ?? fail(PfxMalformed("not DER"))
+    try need(nodes.len() > 0 and nodes[0].tag == 48, "not a SEQUENCE")
+    let top = kids(nodes, 0)
+    try need(top.len() >= 2 and nodes[top[0]].tag == 2 and asn1.integer_of(der, nodes[top[0]]) == 3, "not a version 3 PFX")
+    let ci = kids(nodes, top[1])
+    try need(ci.len() == 2 and nodes[ci[0]].tag == 6 and asn1.oid_of(der, nodes[ci[0]]) == DATA, "a public-key-protected PFX")
+    let safe = try data_content(der, nodes, top[1])
+    if top.len() > 2 {
+        let m = kids(nodes, top[2])
+        try need(m.len() >= 2, "MacData")
+        let di = kids(nodes, m[0])
+        try need(di.len() == 2 and nodes[di[1]].tag == 4, "the MAC")
+        let alg = kids(nodes, di[0])
+        let hash = mac_name(asn1.oid_of(der, nodes[alg[0]]))
+        if hash.len() == 0 {
+            fail(PfxUnsupported(asn1.oid_of(der, nodes[alg[0]])))
+        }
+        let iterations = if m.len() > 2 { asn1.integer_of(der, nodes[m[2]]) } else { 1 }
+        let want = try compute_mac(hash, password, asn1.value(der, nodes[m[1]]), iterations, safe)
+        if not bytes_codec.equal_constant_time(want, asn1.value(der, nodes[di[1]])) {
+            fail(PfxBadMac)
+        }
+    }
+    var out = PfxContents{ keys: [], certs: [] }
+    let an = asn1.parse(safe) ?? fail(PfxMalformed("AuthenticatedSafe"))
+    try need(an.len() > 0 and an[0].tag == 48, "AuthenticatedSafe")
+    for c in kids(an, 0) {
+        let t = kids(an, c)
+        try need(t.len() >= 1 and an[t[0]].tag == 6, "a ContentInfo")
+        let kind = asn1.oid_of(safe, an[t[0]])
+        if kind == DATA {
+            try read_bags(try data_content(safe, an, c), password, out)
+        } else if kind == ENCRYPTED_DATA {
+            try read_bags(try encrypted_content(safe, an, c, password), password, out)
+        } else {
+            fail(PfxUnsupported(kind))
+        }
+    }
+    return out
+}
+
+// --- Writing --------------------------------------------------------------------------------
+
+fn der_or(r: bytes ! DerWriteError) -> bytes ! PfxError {
+    return r ?? fail(PfxMalformed("DER"))
+}
+
+fn bag_attributes(name: str, key_id: bytes) -> [bytes] ! PfxError {
+    var attrs: [bytes] = []
+    if name.len() > 0 {
+        let bmp = pkcs12kdf.bmp_password(name)
+        let value = try der_or(derwrite.tlv(30, bmp.slice(0, bmp.len() - 2)))
+        attrs.push(try der_or(derwrite.sequence([try der_or(derwrite.oid(FRIENDLY_NAME)), try der_or(derwrite.set_of([value]))])))
+    }
+    if key_id.len() > 0 {
+        let value = try der_or(derwrite.octet_string(key_id))
+        attrs.push(try der_or(derwrite.sequence([try der_or(derwrite.oid(LOCAL_KEY_ID)), try der_or(derwrite.set_of([value]))])))
+    }
+    return attrs
+}
+
+fn bag(kind: str, value: bytes, name: str, key_id: bytes) -> bytes ! PfxError {
+    var items = [try der_or(derwrite.oid(BAGS + kind)), try der_or(derwrite.explicit(0, value))]
+    let attrs = try bag_attributes(name, key_id)
+    if attrs.len() > 0 {
+        items.push(try der_or(derwrite.set_of(attrs)))
+    }
+    return try der_or(derwrite.sequence(items))
+}
+
+fn data_info(content: bytes) -> bytes ! PfxError {
+    return try der_or(derwrite.sequence([try der_or(derwrite.oid(DATA)), try der_or(derwrite.explicit(0, try der_or(derwrite.octet_string(content))))]))
+}
+
+fn encrypted_info(content: bytes, alg: bytes, password: bytes) -> bytes ! PfxError {
+    let enc = pbes.encrypt(alg, password, content) ?? fail(PfxMalformed("the certificate scheme"))
+    let eci = try der_or(derwrite.sequence([try der_or(derwrite.oid(DATA)), alg, try der_or(derwrite.tlv(128, enc))]))
+    let ed = try der_or(derwrite.sequence([try der_or(derwrite.integer(0)), eci]))
+    return try der_or(derwrite.sequence([try der_or(derwrite.oid(ENCRYPTED_DATA)), try der_or(derwrite.explicit(0, ed))]))
+}
+
+/// A PFX holding the keys (shrouded under options.key_alg) and the
+/// certificates (encrypted under options.cert_alg, or plain if it is empty).
+pub fn build(c: PfxContents, password: bytes, o: PfxOptions) -> bytes ! PfxError {
+    var cert_bags: [bytes] = []
+    for cert in c.certs {
+        let cb = try der_or(derwrite.sequence([try der_or(derwrite.oid(X509_CERT)),
+            try der_or(derwrite.explicit(0, try der_or(derwrite.octet_string(cert.der))))]))
+        cert_bags.push(try bag("3", cb, cert.name, cert.key_id))
+    }
+    var key_bags: [bytes] = []
+    for k in c.keys {
+        let enc = pbes.encrypt(o.key_alg, password, k.pkcs8) ?? fail(PfxMalformed("the key scheme"))
+        let epki = try der_or(derwrite.sequence([o.key_alg, try der_or(derwrite.octet_string(enc))]))
+        key_bags.push(try bag("2", epki, k.name, k.key_id))
+    }
+    var infos: [bytes] = []
+    if cert_bags.len() > 0 {
+        let sc = try der_or(derwrite.sequence(cert_bags))
+        infos.push(if o.cert_alg.len() > 0 { try encrypted_info(sc, o.cert_alg, password) } else { try data_info(sc) })
+    }
+    if key_bags.len() > 0 {
+        infos.push(try data_info(try der_or(derwrite.sequence(key_bags))))
+    }
+    let safe = try der_or(derwrite.sequence(infos))
+    let (oid, _h, _b, _s) = try mac_hash(o.mac_hash)
+    let mac = try compute_mac(o.mac_hash, password, o.mac_salt, o.mac_iterations, safe)
+    let digest_info = try der_or(derwrite.sequence([try der_or(derwrite.algorithm_with_null(oid)), try der_or(derwrite.octet_string(mac))]))
+    let mac_data = try der_or(derwrite.sequence([digest_info, try der_or(derwrite.octet_string(o.mac_salt)), try der_or(derwrite.integer(o.mac_iterations))]))
+    return try der_or(derwrite.sequence([try der_or(derwrite.integer(3)), try data_info(safe), mac_data]))
+}
