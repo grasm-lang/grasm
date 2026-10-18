@@ -1,0 +1,157 @@
+// Apple icon images (.icns).
+//
+// An "icns" header and its total length, then typed entries, each a
+// four-character type and a length. Modern entries hold a PNG (or
+// JPEG 2000) of one size: ic07 128, ic08 256, ic09 512, ic10 1024 (512 at
+// 2x), ic11 to ic14 the 2x versions of 16 to 256, icp4 to icp6 16 to 64.
+// Legacy entries hold 24-bit colour run-length encoded per channel -- is32
+// (16), il32 (32), ih32 (48), it32 (128) -- with 8-bit alpha in separate
+// mask entries (s8mk, l8mk, h8mk, t8mk). The RLE is a count byte: below
+// 128, copy the next count + 1 bytes; otherwise repeat the next byte
+// count - 125 times. Every macOS application's icon is one of these.
+//
+// `sizes` lists what a file holds; `decode` returns one size as RGBA.
+// JPEG 2000 entries and PNGs other than 8-bit are refused.
+//
+// Checked against Pillow's ICNS reader and writer.
+import png
+
+type IcnsImage = { width: i64, height: i64, pixels: bytes }
+
+type IcnsError =
+    | IcnsMalformed(why: str)
+    | IcnsUnsupported(what: str)
+    | IcnsNoSize(width: i64, scale: i64)
+
+fn be32(b: bytes, at: i64) -> i64 {
+    return b.at(at).shl(24).bit_or(b.at(at + 1).shl(16)).bit_or(b.at(at + 2).shl(8)).bit_or(b.at(at + 3))
+}
+
+fn entries(data: bytes) -> [(str, i64, i64)] ! IcnsError {
+    if data.len() < 8 or data.slice(0, 4).to_str() != "icns" {
+        fail(IcnsMalformed("not an ICNS file"))
+    }
+    var out: [(str, i64, i64)] = []
+    var at = 8
+    let end = if be32(data, 4) < data.len() { be32(data, 4) } else { data.len() }
+    while at + 8 <= end {
+        let n = be32(data, at + 4)
+        if n < 8 or at + n > end {
+            fail(IcnsMalformed("an entry that runs past the file"))
+        }
+        out.push((data.slice(at, at + 4).to_str(), at + 8, n - 8))
+        at = at + n
+    }
+    return out
+}
+
+/// Entry types by (pixel size, scale): PNG ones, then the legacy pair.
+fn kinds() -> [(i64, i64, str, str, str)] {
+    return [(1024, 1, "ic10", "", ""), (512, 2, "ic10", "", ""), (512, 1, "ic09", "", ""), (256, 2, "ic14", "", ""), (256, 1, "ic08", "", ""),
+        (128, 2, "ic13", "", ""), (128, 1, "ic07", "it32", "t8mk"), (64, 1, "icp6", "", ""), (32, 2, "ic12", "", ""),
+        (48, 1, "", "ih32", "h8mk"), (32, 1, "icp5", "il32", "l8mk"), (16, 2, "ic11", "", ""), (16, 1, "icp4", "is32", "s8mk")]
+}
+
+/// The (size, scale) pairs present, largest first.
+pub fn sizes(data: bytes) -> [(i64, i64)] ! IcnsError {
+    let es = try entries(data)
+    var out: [(i64, i64)] = []
+    for k in kinds() {
+        var found = false
+        for e in es {
+            if e.0 == k.2 and k.2.len() > 0 or e.0 == k.3 and k.3.len() > 0 {
+                found = true
+            }
+        }
+        if found and not (k.0 == 1024 and k.1 == 1) {
+            out.push((k.0, k.1))
+        }
+    }
+    return out
+}
+
+fn unrle(d: bytes, at: i64, end: i64, n: i64) -> ([i64], i64) ! IcnsError {
+    var out: [i64] = []
+    var p = at
+    while out.len() < n {
+        if p >= end {
+            fail(IcnsMalformed("a channel shorter than the image"))
+        }
+        let c = d.at(p)
+        if c < 128 {
+            if p + 1 + c + 1 > end {
+                fail(IcnsMalformed("a run past the entry"))
+            }
+            for item in d.slice(p + 1, p + 2 + c).to_list() {
+                out.push(item)
+            }
+            p = p + 2 + c
+        } else {
+            if p + 1 >= end {
+                fail(IcnsMalformed("a run past the entry"))
+            }
+            for _k in 0..(c - 125) {
+                out.push(d.at(p + 1))
+            }
+            p = p + 2
+        }
+    }
+    return (out.slice(0, n), p)
+}
+
+fn from_png(d: bytes) -> IcnsImage ! IcnsError {
+    let img = png.decode(d) ?? fail(IcnsUnsupported("a PNG this reader cannot decode"))
+    let ch = png.channels_for(img.colour_type)
+    var out: [i64] = []
+    for i in 0..(img.width * img.height) {
+        let s = img.sample.slice(i * ch, i * ch + ch)
+        let px = if img.colour_type == 6 { s } else if img.colour_type == 2 { s + [255] } else if img.colour_type == 4 { [s[0], s[0], s[0], s[1]] }
+        else if img.colour_type == 0 { [s[0], s[0], s[0], 255] } else { [img.palette[3 * s[0]], img.palette[3 * s[0] + 1], img.palette[3 * s[0] + 2], 255] }
+        for item in px {
+            out.push(item)
+        }
+    }
+    return IcnsImage{ width: img.width, height: img.height, pixels: bytes_of(out) }
+}
+
+/// One size as RGBA.
+pub fn decode(data: bytes, size: i64, scale: i64) -> IcnsImage ! IcnsError {
+    let es = try entries(data)
+    for k in kinds() {
+        if k.0 == size and k.1 == scale {
+            for e in es {
+                if e.0 == k.2 and k.2.len() > 0 {
+                    let body = data.slice(e.1, e.1 + e.2)
+                    if body.len() >= 8 and body.at(0) == 137 and body.slice(1, 4).to_str() == "PNG" {
+                        return try from_png(body)
+                    }
+                    fail(IcnsUnsupported("JPEG 2000 entries"))
+                }
+            }
+            for e in es {
+                if e.0 == k.3 and k.3.len() > 0 {
+                    let n = size * size
+                    let skip = if e.0 == "it32" { 4 } else { 0 }
+                    let end = e.1 + e.2
+                    let (r, p1) = try unrle(data, e.1 + skip, end, n)
+                    let (g, p2) = try unrle(data, p1, end, n)
+                    let (b, _p3) = try unrle(data, p2, end, n)
+                    var alpha: [i64] = []
+                    for m in es {
+                        if m.0 == k.4 and m.2 >= n {
+                            alpha = data.slice(m.1, m.1 + n).to_list()
+                        }
+                    }
+                    var out: [i64] = []
+                    for i in 0..n {
+                        for item in [r[i], g[i], b[i], if alpha.len() == n { alpha[i] } else { 255 }] {
+                            out.push(item)
+                        }
+                    }
+                    return IcnsImage{ width: size, height: size, pixels: bytes_of(out) }
+                }
+            }
+        }
+    }
+    fail(IcnsNoSize(size, scale))
+}

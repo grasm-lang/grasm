@@ -1,0 +1,46 @@
+// One small image through eleven formats and back.
+// scripts/b37_diff.sh holds them to Pillow.
+import qoi
+import pnm
+import tga
+import pcx
+import xbm
+import xpm
+import sgiimage
+import dds
+import icns
+import sunraster
+import apng
+
+fn main() / {io} {
+    // A 2x2 RGB image: red, green, blue, white.
+    let rgb = bytes_of([255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 255])
+    let rgba = bytes_of([255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 128])
+    let q = qoi.encode(QoiImage{ width: 2, height: 2, channels: 4, colorspace: 0, pixels: rgba }) ?? bytes_of([])
+    assert_eq((qoi.decode(q) ?? panic("qoi")).pixels, rgba)
+
+    let p = pnm.encode(PnmImage{ width: 2, height: 2, channels: 3, maxval: 255, bitmap: false, samples: rgb.to_list() }) ?? bytes_of([])
+    assert_eq((pnm.decode(p) ?? panic("pnm")).samples, rgb.to_list())
+    assert_eq(pnm.to_pillow(pnm.decode("P2 2 1 100 50 70".to_bytes()) ?? panic("pgm")), [128, 178])
+
+    let t = tga.encode(TgaImage{ width: 2, height: 2, channels: 4, pixels: rgba }, true) ?? bytes_of([])
+    assert_eq((tga.decode(t) ?? panic("tga")).pixels, rgba)
+    let c = pcx.encode_rgb(PcxImage{ width: 2, height: 2, pixels: rgb }) ?? bytes_of([])
+    assert_eq((pcx.decode(c) ?? panic("pcx")).pixels, rgb)
+    let s = sgiimage.encode(SgiImage{ width: 2, height: 2, channels: 3, bytes_per: 1, samples: rgb.to_list() }, true) ?? bytes_of([])
+    assert_eq((sgiimage.decode(s) ?? panic("sgi")).samples, rgb.to_list())
+    let r = sunraster.encode(RasImage{ width: 2, height: 2, channels: 3, pixels: rgb }, true) ?? bytes_of([])
+    assert_eq((sunraster.decode(r) ?? panic("sun")).pixels, rgb)
+
+    let bits = xbm.encode(XbmImage{ width: 3, height: 1, hot_x: -1, hot_y: -1, pixels: bytes_of([255, 0, 255]) }, "dot") ?? ""
+    assert_eq((xbm.decode(bits) ?? panic("xbm")).pixels, bytes_of([255, 0, 255]))
+    let pix = xpm.decode("/* XPM */\nstatic char *x[] = \{\n\"2 1 2 1\",\n\". c #FF0000\",\n\"  c None\",\n\". \"};\n") ?? panic("xpm")
+    assert_eq(pix.pixels, bytes_of([255, 0, 0, 255, 0, 0, 0, 0]))
+
+    // Formats that are read here and written elsewhere: refused when not
+    // what they claim to be.
+    assert_eq((dds.decode("not a texture".to_bytes()) ?? DdsImage{ width: 0, height: 0, channels: 0, pixels: bytes_of([]) }).width, 0)
+    assert_eq((icns.sizes(bytes_of([105, 99, 110, 115, 0, 0, 0, 8])) ?? [(1, 1)]).len(), 0)
+    assert_eq((apng.decode(q) ?? Apng{ width: 0, height: 0, plays: 0, frames: [] }).frames.len(), 0)
+    print("b37: ok")
+}

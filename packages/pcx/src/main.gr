@@ -1,0 +1,190 @@
+// ZSoft PCX images.
+//
+// A 128-byte header, then each scanline run-length encoded: a byte with its
+// top two bits set says to repeat the next byte (count in the low six
+// bits), anything else is itself. A scanline is every colour plane's bytes
+// in turn. Depths: 1-bit monochrome, 1-bit planes for EGA's 16 colours
+// from the header palette, 8-bit indices into a 256-colour VGA palette
+// stored after the pixels (marked by 0x0C), and 24-bit colour as three
+// 8-bit planes. PC Paintbrush, early Windows and DOS games, fax and scanner
+// software wrote PCX for two decades, and it is still in archives and
+// game data.
+//
+// `decode` returns RGB, palettes resolved (a monochrome image's 1 bits
+// white). `encode` writes 8-bit paletted or 24-bit RGB images.
+//
+// Checked against Pillow's PCX reader and writer.
+
+type PcxImage = { width: i64, height: i64, pixels: bytes }
+
+type PcxError =
+    | PcxMalformed(why: str)
+    | PcxUnsupported(what: str)
+    | PcxTruncated
+
+fn le16(b: bytes, at: i64) -> i64 {
+    return b.at(at) + 256 * b.at(at + 1)
+}
+
+pub fn decode(data: bytes) -> PcxImage ! PcxError {
+    if data.len() < 128 or data.at(0) != 10 {
+        fail(PcxMalformed("not a PCX file"))
+    }
+    let bits = data.at(3)
+    let w = le16(data, 8) - le16(data, 4) + 1
+    let h = le16(data, 10) - le16(data, 6) + 1
+    let planes = data.at(65)
+    let stride = le16(data, 66)
+    if w <= 0 or h <= 0 {
+        fail(PcxMalformed("an empty image"))
+    }
+    let ok = bits == 8 and (planes == 1 or planes == 3) or bits == 1 and (planes == 1 or planes == 2 or planes == 3 or planes == 4) or
+    bits == 4 and planes == 1 or bits == 2 and planes == 1
+    if not ok {
+        fail(PcxUnsupported("{bits} bits in {planes} planes"))
+    }
+    if stride * 8 < w * bits {
+        fail(PcxMalformed("lines shorter than the image"))
+    }
+    let line = stride * planes
+    var rows: [i64] = []
+    var at = 128
+    while rows.len() < line * h {
+        if at >= data.len() {
+            fail(PcxTruncated)
+        }
+        let b = data.at(at)
+        at = at + 1
+        if b >= 192 {
+            if at >= data.len() {
+                fail(PcxTruncated)
+            }
+            let v = data.at(at)
+            at = at + 1
+            for _k in 0..(b - 192) {
+                rows.push(v)
+            }
+        } else {
+            rows.push(b)
+        }
+    }
+    // The 256-colour palette, if any, is the last 769 bytes.
+    var vga: [i64] = []
+    if bits == 8 and planes == 1 and data.len() >= 769 + 128 and data.at(data.len() - 769) == 12 {
+        vga = data.slice(data.len() - 768, data.len()).to_list()
+    }
+    var out: [i64] = []
+    for y in 0..h {
+        let r = y * line
+        for x in 0..w {
+            if planes == 3 and bits == 8 {
+                for item in [rows[r + x], rows[r + stride + x], rows[r + 2 * stride + x]] {
+                    out.push(item)
+                }
+            } else if bits == 8 {
+                let i = rows[r + x]
+                for item in (if vga.len() == 768 { [vga[3 * i], vga[3 * i + 1], vga[3 * i + 2]] } else { [i, i, i] }) {
+                    out.push(item)
+                }
+            } else if bits == 1 and planes == 1 {
+                let v = if rows[r + x / 8].ushr(7 - x % 8).bit_and(1) == 1 { 255 } else { 0 }
+                for item in [v, v, v] {
+                    out.push(item)
+                }
+            } else {
+                // Indices into the header's 16-colour palette: packed 2 or
+                // 4 bits, or one bit from each plane.
+                var i = 0
+                if bits == 1 {
+                    for p in 0..planes {
+                        i = i.bit_or(rows[r + p * stride + x / 8].ushr(7 - x % 8).bit_and(1).shl(p))
+                    }
+                } else {
+                    let per = 8 / bits
+                    i = rows[r + x / per].ushr(8 - bits * (x % per + 1)).bit_and(1.shl(bits) - 1)
+                }
+                for item in [data.at(16 + 3 * i), data.at(17 + 3 * i), data.at(18 + 3 * i)] {
+                    out.push(item)
+                }
+            }
+        }
+    }
+    return PcxImage{ width: w, height: h, pixels: bytes_of(out) }
+}
+
+fn rle_line(row: [i64]) -> [i64] {
+    var out: [i64] = []
+    var i = 0
+    while i < row.len() {
+        var run = 1
+        while i + run < row.len() and run < 63 and row[i + run] == row[i] {
+            run = run + 1
+        }
+        if run > 1 or row[i] >= 192 {
+            for item in [192 + run, row[i]] {
+                out.push(item)
+            }
+        } else {
+            out.push(row[i])
+        }
+        i = i + run
+    }
+    return out
+}
+
+fn header(w: i64, h: i64, planes: i64, stride: i64) -> [i64] {
+    var head = [10, 5, 1, 8, 0, 0, 0, 0, (w - 1).bit_and(255), (w - 1).ushr(8), (h - 1).bit_and(255), (h - 1).ushr(8), 72, 0, 72, 0]
+    for _i in 0..48 {
+        head.push(0)
+    }
+    head = head + [0, planes, stride.bit_and(255), stride.ushr(8), 1, 0, 0, 0, 0, 0]
+    while head.len() < 128 {
+        head.push(0)
+    }
+    return head
+}
+
+/// 24-bit RGB as three planes.
+pub fn encode_rgb(img: PcxImage) -> bytes ! PcxError {
+    if img.pixels.len() != img.width * img.height * 3 or img.width < 1 or img.height < 1 or img.width > 65535 {
+        fail(PcxMalformed("pixels that do not fill the image"))
+    }
+    let stride = img.width + img.width % 2
+    var out = header(img.width, img.height, 3, stride)
+    for y in 0..img.height {
+        for c in 0..3 {
+            var row: [i64] = []
+            for x in 0..stride {
+                row.push(if x < img.width { img.pixels.at(3 * (y * img.width + x) + c) } else { 0 })
+            }
+            for item in rle_line(row) {
+                out.push(item)
+            }
+        }
+    }
+    return bytes_of(out)
+}
+
+/// 8-bit indices with a 256-colour palette (up to 768 bytes of RGB).
+pub fn encode_paletted(width: i64, height: i64, indices: bytes, palette: bytes) -> bytes ! PcxError {
+    if indices.len() != width * height or palette.len() > 768 or width < 1 or height < 1 or width > 65535 {
+        fail(PcxMalformed("indices that do not fill the image"))
+    }
+    let stride = width + width % 2
+    var out = header(width, height, 1, stride)
+    for y in 0..height {
+        var row: [i64] = []
+        for x in 0..stride {
+            row.push(if x < width { indices.at(y * width + x) } else { 0 })
+        }
+        for item in rle_line(row) {
+            out.push(item)
+        }
+    }
+    out.push(12)
+    var pal = palette.to_list()
+    while pal.len() < 768 {
+        pal.push(0)
+    }
+    return bytes_of(out + pal)
+}

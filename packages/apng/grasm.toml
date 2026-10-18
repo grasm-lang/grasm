@@ -1,0 +1,12 @@
+[package]
+name = "apng"
+version = "1.0.0"
+capabilities = []
+
+[dependencies.png]
+path = "../png"
+version = "^1.0.0"
+
+[dependencies.crc32]
+path = "../crc32"
+version = "^1.0.0"

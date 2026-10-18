@@ -1,0 +1,216 @@
+// Truevision TGA (TARGA) images.
+//
+// An 18-byte header, an optional ID string, an optional colour map, and
+// pixels: colour-mapped, true-colour or greyscale, each raw or run-length
+// encoded (a packet header's top bit says whether the next 1 to 128 pixels
+// repeat one value or follow one by one; this reads runs that cross rows,
+// which TGA 1.0 allowed and Pillow refuses). True-colour
+// pixels are BGR(A) in 16, 24 or 32 bits; 16-bit ones are 5 bits a
+// channel and a top attribute bit, which TGA 2.0 leaves undefined; this
+// reads it as Pillow does, set for transparent, whatever the descriptor's
+// alpha-bit count says, and scales 5-bit channels as v * 255 / 31.
+// The descriptor's bits 4 and 5 say whether rows run right to left and top
+// to bottom. Game textures (id Software's, Unreal's), 3D tools and video
+// pipelines still write TGA for its simplicity and alpha.
+//
+// `decode` returns 8-bit samples top to bottom, left to right, with
+// colour maps resolved: 1 channel for greyscale, 2 for greyscale with
+// alpha, 3 for RGB and 4 for RGBA. `encode` writes greyscale, RGB or RGBA,
+// raw or run-length encoded, top-to-bottom.
+//
+// Checked against Pillow's TGA reader and writer.
+
+type TgaImage = { width: i64, height: i64, channels: i64, pixels: bytes }
+
+type TgaError =
+    | TgaMalformed(why: str)
+    | TgaUnsupported(what: str)
+    | TgaTruncated
+
+fn le16(b: bytes, at: i64) -> i64 {
+    return b.at(at) + 256 * b.at(at + 1)
+}
+
+/// One pixel's bytes to samples: `depth` bits, `grey` for greyscale.
+fn sample(d: bytes, at: i64, depth: i64, grey: bool) -> [i64] {
+    if grey {
+        return if depth == 16 { [d.at(at), d.at(at + 1)] } else { [d.at(at)] }
+    }
+    if depth == 16 {
+        let v = d.at(at) + 256 * d.at(at + 1)
+        return [v.ushr(10).bit_and(31) * 255 / 31, v.ushr(5).bit_and(31) * 255 / 31, v.bit_and(31) * 255 / 31,
+            if v >= 32768 { 0 } else { 255 }]
+    }
+    if depth == 24 {
+        return [d.at(at + 2), d.at(at + 1), d.at(at)]
+    }
+    return [d.at(at + 2), d.at(at + 1), d.at(at), d.at(at + 3)]
+}
+
+/// The pixels as stored, before the colour map and orientation: colour-map
+/// indices, or samples.
+fn stored_pixels(data: bytes, from: i64, n: i64, rle: bool, depth: i64, mapped: bool, grey: bool) -> [[i64]] ! TgaError {
+    let bpp = (depth + 7) / 8
+    var at = from
+    var raw: [[i64]] = []
+    while raw.len() < n {
+        var count = 1
+        var repeat = false
+        if rle {
+            if at >= data.len() {
+                fail(TgaTruncated)
+            }
+            let head = data.at(at)
+            at = at + 1
+            count = head.bit_and(127) + 1
+            repeat = head >= 128
+        }
+        for k in 0..count {
+            if raw.len() >= n {
+                break
+            }
+            let p = at + (if repeat { 0 } else { k * bpp })
+            if p + bpp > data.len() {
+                fail(TgaTruncated)
+            }
+            raw.push(if mapped { [if bpp == 2 { le16(data, p) } else { data.at(p) }] } else { sample(data, p, depth, grey) })
+        }
+        at = at + (if repeat { bpp } else { count * bpp })
+    }
+    return raw
+}
+
+fn colour_map(data: bytes, at: i64, map_len: i64, map_depth: i64) -> [[i64]] ! TgaError {
+    if map_depth != 16 and map_depth != 24 and map_depth != 32 {
+        fail(TgaUnsupported("colour map entries of {map_depth} bits"))
+    }
+    let entry = (map_depth + 7) / 8
+    if at + map_len * entry > data.len() {
+        fail(TgaTruncated)
+    }
+    var palette: [[i64]] = []
+    for i in 0..map_len {
+        palette.push(sample(data, at + i * entry, map_depth, false))
+    }
+    return palette
+}
+
+pub fn decode(data: bytes) -> TgaImage ! TgaError {
+    if data.len() < 18 {
+        fail(TgaTruncated)
+    }
+    let kind = data.at(2)
+    let map_first = le16(data, 3)
+    let map_len = le16(data, 5)
+    let w = le16(data, 12)
+    let h = le16(data, 14)
+    let depth = data.at(16)
+    let desc = data.at(17)
+    let base = kind.bit_and(7)
+    if base < 1 or base > 3 or (kind > 3 and kind < 9) or kind > 11 {
+        fail(TgaUnsupported("image type {kind}"))
+    }
+    if w == 0 or h == 0 {
+        fail(TgaMalformed("an empty image"))
+    }
+    let grey = base == 3
+    let mapped = base == 1
+    if grey and depth != 8 and depth != 16 or mapped and depth != 8 and depth != 16 or base == 2 and depth != 16 and depth != 24 and depth != 32 {
+        fail(TgaUnsupported("pixel depth {depth}"))
+    }
+    let at = 18 + data.at(0)
+    var palette: [[i64]] = []
+    if data.at(1) == 1 {
+        palette = try colour_map(data, at, map_len, data.at(7))
+    } else if mapped {
+        fail(TgaMalformed("a colour-mapped image without a colour map"))
+    }
+    let skip = if data.at(1) == 1 { map_len * ((data.at(7) + 7) / 8) } else { 0 }
+    let raw = try stored_pixels(data, at + skip, w * h, kind >= 8, depth, mapped, grey)
+    let channels = if mapped { (if palette.len() > 0 { palette[0].len() } else { 3 }) } else { raw[0].len() }
+    let top = desc.bit_and(32) != 0
+    let right = desc.bit_and(16) != 0
+    var out: [i64] = []
+    for y in 0..h {
+        let sy = if top { y } else { h - 1 - y }
+        for x in 0..w {
+            let v = raw[sy * w + (if right { w - 1 - x } else { x })]
+            if mapped {
+                let i = v[0] - map_first
+                if i < 0 or i >= palette.len() {
+                    fail(TgaMalformed("an index outside the colour map"))
+                }
+                for item in palette[i] {
+                    out.push(item)
+                }
+            } else {
+                for item in v {
+                    out.push(item)
+                }
+            }
+        }
+    }
+    return TgaImage{ width: w, height: h, channels: channels, pixels: bytes_of(out) }
+}
+
+fn pixel_bytes(img: TgaImage, i: i64) -> [i64] {
+    let c = img.channels
+    let p = img.pixels.slice(i * c, i * c + c).to_list()
+    if c == 1 or c == 2 {
+        return p
+    }
+    return if c == 3 { [p[2], p[1], p[0]] } else { [p[2], p[1], p[0], p[3]] }
+}
+
+/// Greyscale (1 channel), greyscale with alpha (2), RGB (3) or RGBA (4),
+/// top to bottom, run-length encoded or raw.
+pub fn encode(img: TgaImage, rle: bool) -> bytes ! TgaError {
+    let c = img.channels
+    if c < 1 or c > 4 or img.pixels.len() != img.width * img.height * c or img.width > 65535 or img.height > 65535 {
+        fail(TgaMalformed("pixels that do not fill the image"))
+    }
+    let base = if c <= 2 { 3 } else { 2 }
+    let alpha = if c == 2 or c == 4 { 8 } else { 0 }
+    var out = [0, 0, base + (if rle { 8 } else { 0 }), 0, 0, 0, 0, 0, 0, 0, 0, 0, img.width.bit_and(255), img.width.ushr(8),
+        img.height.bit_and(255), img.height.ushr(8), 8 * c, 32 + alpha]
+    let n = img.width * img.height
+    if not rle {
+        for i in 0..n {
+            for item in pixel_bytes(img, i) {
+                out.push(item)
+            }
+        }
+        return bytes_of(out)
+    }
+    // Packets never cross a row, which every reader accepts.
+    for y in 0..img.height {
+        var x = 0
+        while x < img.width {
+            let here = pixel_bytes(img, y * img.width + x)
+            var run = 1
+            while x + run < img.width and run < 128 and pixel_bytes(img, y * img.width + x + run) == here {
+                run = run + 1
+            }
+            if run > 1 {
+                for item in [127 + run] + here {
+                    out.push(item)
+                }
+                x = x + run
+            } else {
+                var lit = 1
+                while x + lit < img.width and lit < 128 and
+                (x + lit + 1 >= img.width or pixel_bytes(img, y * img.width + x + lit) != pixel_bytes(img, y * img.width + x + lit + 1)) {
+                    lit = lit + 1
+                }
+                out.push(lit - 1)
+                for k in 0..lit {
+                    for item in pixel_bytes(img, y * img.width + x + k) {
+                        out.push(item)
+                    }
+                }
+                x = x + lit
+            }
+        }
+    }
+    return bytes_of(out)
+}

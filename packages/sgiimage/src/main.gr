@@ -1,0 +1,222 @@
+// SGI images (.rgb, .sgi, .bw), Silicon Graphics' format.
+//
+// A 512-byte header (magic 474, storage, bytes per channel, dimensions,
+// width, height, channel count, name) and the image stored as separate
+// channel planes, rows bottom to top, either verbatim or run-length
+// encoded. In the RLE form a table gives every row's offset and length;
+// within a row, a count byte's top bit says whether the next count values
+// are copied or the next one repeated, and 0 ends the row. Values are one
+// or two bytes (big-endian). IRIX, Maya and older film and VFX pipelines
+// wrote these, and texture libraries still carry them.
+//
+// `decode` returns interleaved samples top to bottom (1 to 4 channels,
+// 8 or 16 bits). `encode` writes verbatim or RLE files.
+//
+// Checked against Pillow's SGI reader and writer.
+
+type SgiImage = { width: i64, height: i64, channels: i64, bytes_per: i64, samples: [i64] }
+
+type SgiError =
+    | SgiMalformed(why: str)
+    | SgiUnsupported(what: str)
+    | SgiTruncated
+
+fn be16(b: bytes, at: i64) -> i64 {
+    return b.at(at) * 256 + b.at(at + 1)
+}
+
+fn be32(b: bytes, at: i64) -> i64 {
+    return be16(b, at) * 65536 + be16(b, at + 2)
+}
+
+fn value(b: bytes, at: i64, bpc: i64) -> i64 ! SgiError {
+    if at + bpc > b.len() {
+        fail(SgiTruncated)
+    }
+    return if bpc == 2 { be16(b, at) } else { b.at(at) }
+}
+
+fn rle_row(data: bytes, start: i64, w: i64, bpc: i64) -> [i64] ! SgiError {
+    var out: [i64] = []
+    var at = start
+    while out.len() < w {
+        let head = try value(data, at, bpc)
+        at = at + bpc
+        let count = head.bit_and(127)
+        if count == 0 {
+            break
+        }
+        if head >= 128 {
+            for _k in 0..count {
+                out.push(try value(data, at, bpc))
+                at = at + bpc
+            }
+        } else {
+            let v = try value(data, at, bpc)
+            at = at + bpc
+            for _k in 0..count {
+                out.push(v)
+            }
+        }
+    }
+    if out.len() < w {
+        fail(SgiMalformed("a row shorter than the image"))
+    }
+    return out.slice(0, w)
+}
+
+pub fn decode(data: bytes) -> SgiImage ! SgiError {
+    if data.len() < 512 or be16(data, 0) != 474 {
+        fail(SgiMalformed("not an SGI image"))
+    }
+    let rle = data.at(2)
+    let bpc = data.at(3)
+    let dims = be16(data, 4)
+    let w = be16(data, 6)
+    let h = if dims == 1 { 1 } else { be16(data, 8) }
+    let z = if dims < 3 { 1 } else { be16(data, 10) }
+    if bpc != 1 and bpc != 2 or rle > 1 or dims < 1 or dims > 3 {
+        fail(SgiUnsupported("storage {rle}, {bpc} bytes a channel, {dims} dimensions"))
+    }
+    if w == 0 or h == 0 or z < 1 or z > 4 {
+        fail(SgiMalformed("an empty image or more than four channels"))
+    }
+    var planes: [[i64]] = []
+    for c in 0..z {
+        var plane: [i64] = []
+        for y in 0..h {
+            let row = if rle == 1 {
+                let k = c * h + y
+                try rle_row(data, try value(data, 512 + 4 * k, 2) * 65536 + try value(data, 514 + 4 * k, 2), w, bpc)
+            } else {
+                var r: [i64] = []
+                let base = 512 + ((c * h + y) * w) * bpc
+                for x in 0..w {
+                    r.push(try value(data, base + x * bpc, bpc))
+                }
+                r
+            }
+            for item in row {
+                plane.push(item)
+            }
+        }
+        planes.push(plane)
+    }
+    var out: [i64] = []
+    for y in 0..h {
+        let sy = h - 1 - y
+        for x in 0..w {
+            for c in 0..z {
+                out.push(planes[c][sy * w + x])
+            }
+        }
+    }
+    return SgiImage{ width: w, height: h, channels: z, bytes_per: bpc, samples: out }
+}
+
+fn be(v: i64, n: i64) -> [i64] {
+    var out: [i64] = []
+    var i = n - 1
+    while i >= 0 {
+        out.push(v.ushr(8 * i).bit_and(255))
+        i = i - 1
+    }
+    return out
+}
+
+fn put(v: i64, bpc: i64) -> [i64] {
+    return if bpc == 2 { be(v, 2) } else { [v] }
+}
+
+fn row_of(img: SgiImage, c: i64, y: i64) -> [i64] {
+    var r: [i64] = []
+    let sy = img.height - 1 - y
+    for x in 0..img.width {
+        r.push(img.samples[(sy * img.width + x) * img.channels + c])
+    }
+    return r
+}
+
+fn rle_encode(row: [i64]) -> [i64] {
+    var out: [i64] = []
+    var i = 0
+    while i < row.len() {
+        var run = 1
+        while i + run < row.len() and run < 127 and row[i + run] == row[i] {
+            run = run + 1
+        }
+        if run > 2 {
+            for item in [run, row[i]] {
+                out.push(item)
+            }
+            i = i + run
+        } else {
+            var lit = 1
+            while i + lit < row.len() and lit < 127 and not (i + lit + 2 < row.len() and row[i + lit] == row[i + lit + 1] and row[i + lit] == row[i + lit + 2]) {
+                lit = lit + 1
+            }
+            for item in [128 + lit] + row.slice(i, i + lit) {
+                out.push(item)
+            }
+            i = i + lit
+        }
+    }
+    return out + [0]
+}
+
+pub fn encode(img: SgiImage, rle: bool) -> bytes ! SgiError {
+    let z = img.channels
+    if z < 1 or z > 4 or img.samples.len() != img.width * img.height * z or (img.bytes_per != 1 and img.bytes_per != 2) {
+        fail(SgiMalformed("samples that do not fill the image"))
+    }
+    let bpc = img.bytes_per
+    let dims = if z == 1 { 2 } else { 3 }
+    var head = be(474, 2) + [if rle { 1 } else { 0 }, bpc] + be(dims, 2) + be(img.width, 2) + be(img.height, 2) + be(z, 2) + be(0, 4) +
+    be(if bpc == 2 { 65535 } else { 255 }, 4)
+    while head.len() < 512 {
+        head.push(0)
+    }
+    var out = head
+    if not rle {
+        for c in 0..z {
+            for y in 0..img.height {
+                for v in row_of(img, c, y) {
+                    for item in put(v, bpc) {
+                        out.push(item)
+                    }
+                }
+            }
+        }
+        return bytes_of(out)
+    }
+    let rows = z * img.height
+    var body: [i64] = []
+    var starts: [i64] = []
+    var lengths: [i64] = []
+    for c in 0..z {
+        for y in 0..img.height {
+            var enc: [i64] = []
+            for v in rle_encode(row_of(img, c, y)) {
+                for item in put(v, bpc) {
+                    enc.push(item)
+                }
+            }
+            starts.push(512 + 8 * rows + body.len())
+            lengths.push(enc.len())
+            for item in enc {
+                body.push(item)
+            }
+        }
+    }
+    for s in starts {
+        for item in be(s, 4) {
+            out.push(item)
+        }
+    }
+    for l in lengths {
+        for item in be(l, 4) {
+            out.push(item)
+        }
+    }
+    return bytes_of(out + body)
+}

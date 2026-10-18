@@ -256,6 +256,26 @@ day its reference is installed.
 
 ## Landed
 
+- [x] **B37: image formats** — B12's `qoi` `pnm` `tga` `pcx` `xbm` `xpm`
+  `sgiimage` `dds` `icns` `apng`, with `sunraster`, which was not on the
+  list, and the harness `b37test`; the new gate `b37diff` runs 1,667 cases
+  against Pillow 12: files Pillow writes in every mode and compression it
+  offers decoded here to Pillow's pixels, files written here decoded by
+  Pillow, variants Pillow reads but does not write (16-bit TGA in every
+  orientation, Sun rasters of every depth and colour map, legacy RLE icons,
+  XPM, PNM with comments) made by small Python writers, and QOI's encoder
+  equal to Pillow's byte for byte. Where Pillow reads a file wrongly or
+  refuses what the format allows, the package follows the format and those
+  inputs are left out: odd-width 24-bit PCX (Pillow, even reading its own,
+  unpacks the planes by width rather than bytes-per-line), Sun RLE rows
+  that need padding, TGA run packets crossing rows, XPM colours other than
+  #RRGGBB, APNG blending with partial alpha. Pillow's own conventions were
+  matched where the format leaves them open: PNM scaling rounds halves to
+  even; a 16-bit TGA's top bit means transparent. Writing these found that
+  `out = out + [...]` copies the whole list each time, quadratic (100,000
+  appends 11 s against 0.01 s for `push`); the new packages push. One break
+  per package turned it red. The count reaches 900.
+
 - [x] **B36: PKCS#12 and Java keystores** — B10's `pkcs12` and `jks`, with
   the harness `b36test`; the new gate `b36diff` runs 206 cases on fresh
   identities each run (a CA and leaf certificates for RSA, EC and Ed25519
@@ -665,7 +685,7 @@ day its reference is installed.
 | | |
 |---|---|
 | At the start | 669 |
-| Now | 888 |
+| Now | 900 |
 | Candidates above | 316 packages in 28 batches, plus `ecc`, `rfc6979` and `goprintf` |
 | Harnesses, one a batch | 28 |
 | If every candidate lands | 1016 |

@@ -1,0 +1,108 @@
+// X BitMap images (X11 XBM): a bitmap written as C source.
+//
+//     #define name_width 16
+//     #define name_height 7
+//     static char name_bits[] = {
+//        0xff, 0x00, ... };
+//
+// X11's cursors, window-manager icons and toolbar images are XBM, and
+// browsers once rendered it inline; because it is C, programs `#include`
+// their images. Bits are least significant first within each byte, rows
+// are padded to a whole byte, and a 1 bit is the foreground. Optional
+// `_x_hot` and `_y_hot` defines give a cursor's hotspot.
+//
+// `decode` returns one sample a pixel: 255 for a set bit, 0 for a clear
+// one, as Pillow presents it. `encode` writes the X11 form.
+//
+// Checked against Pillow's XBM reader and writer.
+
+type XbmImage = { width: i64, height: i64, hot_x: i64, hot_y: i64, pixels: bytes }
+
+type XbmError =
+    | XbmMalformed(why: str)
+
+fn define(text: str, suffix: str) -> i64 {
+    for line in text.split("\n") {
+        let t = line.trim()
+        if t.starts_with("#define") {
+            let f = t.split(" ").filter(|p| p.len() > 0)
+            if f.len() == 3 and f[1].ends_with(suffix) {
+                return f[2].parse_int() ?? -1
+            }
+        }
+    }
+    return 0 - 1
+}
+
+fn hex_value(s: str) -> i64 {
+    let t = s.trim()
+    if t.starts_with("0x") or t.starts_with("0X") {
+        return t.substr(2, t.len() - 2).parse_int_base(16) ?? -1
+    }
+    return t.parse_int() ?? -1
+}
+
+pub fn decode(text: str) -> XbmImage ! XbmError {
+    let w = define(text, "_width")
+    let h = define(text, "_height")
+    if w <= 0 or h <= 0 {
+        fail(XbmMalformed("no width and height"))
+    }
+    let open = text.index_of("\{") ?? fail(XbmMalformed("no data"))
+    let close = text.index_of("}") ?? fail(XbmMalformed("unterminated data"))
+    var values: [i64] = []
+    for v in text.substr(open + 1, close - open - 1).split(",") {
+        if v.trim().len() > 0 {
+            let n = hex_value(v)
+            if n < 0 or n > 255 {
+                fail(XbmMalformed("a value that is not a byte"))
+            }
+            values.push(n)
+        }
+    }
+    let row = (w + 7) / 8
+    if values.len() < row * h {
+        fail(XbmMalformed("too few bytes for the size"))
+    }
+    var out: [i64] = []
+    for y in 0..h {
+        for x in 0..w {
+            out.push(if values[y * row + x / 8].ushr(x % 8).bit_and(1) == 1 { 255 } else { 0 })
+        }
+    }
+    return XbmImage{ width: w, height: h, hot_x: define(text, "_x_hot"), hot_y: define(text, "_y_hot"), pixels: bytes_of(out) }
+}
+
+/// The X11 form, twelve bytes a line; pixels are 0 or not.
+pub fn encode(img: XbmImage, name: str) -> str ! XbmError {
+    if img.pixels.len() != img.width * img.height or img.width < 1 or img.height < 1 {
+        fail(XbmMalformed("pixels that do not fill the image"))
+    }
+    var out = "#define {name}_width {img.width}\n#define {name}_height {img.height}\n"
+    if img.hot_x >= 0 and img.hot_y >= 0 {
+        out = out + "#define {name}_x_hot {img.hot_x}\n#define {name}_y_hot {img.hot_y}\n"
+    }
+    out = out + "static char {name}_bits[] = \{\n"
+    let row = (img.width + 7) / 8
+    let digits = "0123456789abcdef"
+    var items: [str] = []
+    for y in 0..img.height {
+        for b in 0..row {
+            var v = 0
+            for k in 0..8 {
+                let x = 8 * b + k
+                if x < img.width and img.pixels.at(y * img.width + x) != 0 {
+                    v = v.bit_or(1.shl(k))
+                }
+            }
+            items.push("0x" + digits.substr(v / 16, 1) + digits.substr(v % 16, 1))
+        }
+    }
+    var i = 0
+    while i < items.len() {
+        let end = if i + 12 < items.len() { i + 12 } else { items.len() }
+        out = out + "   " + items.slice(i, end).join(", ") + (if end < items.len() { ",\n" } else { " };\n" })
+        i = end
+    }
+    return out
+}

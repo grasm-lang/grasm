@@ -1,0 +1,159 @@
+// X PixMap images (XPM3): a colour image written as a C array of strings.
+//
+//     /* XPM */
+//     static char *name[] = {
+//     "4 2 2 1",
+//     ". c #FF0000",
+//     "# c None",
+//     "..##",
+//     "#..#"};
+//
+// The first string gives the width, height, number of colours and
+// characters per pixel; then one string per colour (its characters and
+// keyed values, of which `c` is the colour visual); then one string per
+// row. X11 applications, window managers, GTK and Emacs icons, and
+// countless Unix tools ship their icons this way.
+//
+// `decode` returns RGBA, `None` as transparent. Colours are `#RGB`,
+// `#RRGGBB` or `#RRRRGGGGBBBB` (each channel's top byte); named colours
+// other than `None`, `black` and `white` are refused, since resolving
+// them needs X11's rgb.txt.
+//
+// Checked against Pillow's XPM reader.
+
+type XpmImage = { width: i64, height: i64, pixels: bytes }
+
+type XpmError =
+    | XpmMalformed(why: str)
+    | XpmUnsupported(what: str)
+
+/// The quoted strings of the array, in order.
+fn strings(text: str) -> [str] ! XpmError {
+    var out: [str] = []
+    var i = 0
+    let n = text.len()
+    while i < n {
+        if text.substr(i, 2) == "/*" {
+            let rest = text.substr(i + 2, n - i - 2)
+            let end = rest.index_of("*/") ?? fail(XpmMalformed("an unterminated comment"))
+            i = i + 4 + end
+        } else if text.substr(i, 1) == "\"" {
+            var j = i + 1
+            while j < n and text.substr(j, 1) != "\"" {
+                j = j + 1
+            }
+            if j >= n {
+                fail(XpmMalformed("an unterminated string"))
+            }
+            out.push(text.substr(i + 1, j - i - 1))
+            i = j + 1
+        } else {
+            i = i + 1
+        }
+    }
+    return out
+}
+
+fn hexes(s: str) -> [i64] ! XpmError {
+    let n = s.len()
+    if n != 3 and n != 6 and n != 12 {
+        fail(XpmUnsupported("colour #" + s))
+    }
+    let per = n / 3
+    var out: [i64] = []
+    for c in 0..3 {
+        let part = s.substr(c * per, per)
+        let v = part.parse_int_base(16) ?? -1
+        if v < 0 or part.starts_with("-") or part.starts_with("+") {
+            fail(XpmMalformed("colour #" + s))
+        }
+        out.push(if per == 1 { v * 17 } else if per == 2 { v } else { v.ushr(8) })
+    }
+    return out
+}
+
+fn colour(spec: str) -> [i64] ! XpmError {
+    let t = spec.trim().to_lower()
+    if t == "none" {
+        return [0, 0, 0, 0]
+    }
+    if t == "black" {
+        return [0, 0, 0, 255]
+    }
+    if t == "white" {
+        return [255, 255, 255, 255]
+    }
+    if t.starts_with("#") {
+        return (try hexes(t.substr(1, t.len() - 1))) + [255]
+    }
+    fail(XpmUnsupported("colour name " + spec))
+}
+
+pub fn decode(text: str) -> XpmImage ! XpmError {
+    let s = try strings(text)
+    if s.len() == 0 {
+        fail(XpmMalformed("no values line"))
+    }
+    let v = s[0].split(" ").filter(|p| p.len() > 0)
+    if v.len() < 4 {
+        fail(XpmMalformed("a values line without four numbers"))
+    }
+    let w = v[0].parse_int() ?? 0
+    let h = v[1].parse_int() ?? 0
+    let ncolors = v[2].parse_int() ?? 0
+    let cpp = v[3].parse_int() ?? 0
+    if w < 1 or h < 1 or ncolors < 1 or cpp < 1 or s.len() < 1 + ncolors + h {
+        fail(XpmMalformed("sizes that do not fit the strings"))
+    }
+    var keys: [str] = []
+    var values: [[i64]] = []
+    for i in 0..ncolors {
+        let line = s[1 + i]
+        let key = line.substr(0, cpp)
+        let parts = line.substr(cpp, line.len() - cpp).split("\t").join(" ").split(" ").filter(|p| p.len() > 0)
+        var found: [i64] = []
+        var k = 0
+        while k + 1 < parts.len() {
+            if parts[k] == "c" {
+                // A colour value may itself contain spaces ("light blue");
+                // it runs to the next key.
+                var j = k + 1
+                var val = parts[j]
+                while j + 1 < parts.len() and parts[j + 1] != "m" and parts[j + 1] != "g" and parts[j + 1] != "g4" and parts[j + 1] != "s" {
+                    j = j + 1
+                    val = val + " " + parts[j]
+                }
+                found = try colour(val)
+            }
+            k = k + 1
+        }
+        if found.len() == 0 {
+            fail(XpmUnsupported("a colour without a c key"))
+        }
+        keys.push(key)
+        values.push(found)
+    }
+    var out: [i64] = []
+    for y in 0..h {
+        let row = s[1 + ncolors + y]
+        if row.len() < w * cpp {
+            fail(XpmMalformed("a short row"))
+        }
+        for x in 0..w {
+            let key = row.substr(x * cpp, cpp)
+            var hit = 0 - 1
+            for i in 0..keys.len() {
+                if keys[i] == key {
+                    hit = i
+                }
+            }
+            if hit < 0 {
+                fail(XpmMalformed("a pixel of no colour"))
+            }
+            for item in values[hit] {
+                out.push(item)
+            }
+        }
+    }
+    return XpmImage{ width: w, height: h, pixels: bytes_of(out) }
+}

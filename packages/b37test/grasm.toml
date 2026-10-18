@@ -1,0 +1,48 @@
+[package]
+name = "b37test"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.qoi]
+path = "../qoi"
+version = "^1.0.0"
+
+[dependencies.pnm]
+path = "../pnm"
+version = "^1.0.0"
+
+[dependencies.tga]
+path = "../tga"
+version = "^1.0.0"
+
+[dependencies.pcx]
+path = "../pcx"
+version = "^1.0.0"
+
+[dependencies.xbm]
+path = "../xbm"
+version = "^1.0.0"
+
+[dependencies.xpm]
+path = "../xpm"
+version = "^1.0.0"
+
+[dependencies.sgiimage]
+path = "../sgiimage"
+version = "^1.0.0"
+
+[dependencies.dds]
+path = "../dds"
+version = "^1.0.0"
+
+[dependencies.icns]
+path = "../icns"
+version = "^1.0.0"
+
+[dependencies.sunraster]
+path = "../sunraster"
+version = "^1.0.0"
+
+[dependencies.apng]
+path = "../apng"
+version = "^1.0.0"

@@ -1,0 +1,258 @@
+// DirectDraw Surface (DDS) textures: uncompressed and BC1 to BC5.
+//
+// The texture container of Direct3D, and of most PC and console game
+// assets: "DDS ", a 124-byte header (size, mipmap count, a pixel-format
+// block with channel masks or a FourCC), an optional DX10 header naming a
+// DXGI format, then the surfaces, largest first. Block compression stores
+// each 4x4 texel block in 8 or 16 bytes:
+//
+// - BC1 (DXT1): two RGB565 endpoints and 2-bit indices; with the first
+//   endpoint not above the second, index 3 is transparent black.
+// - BC2 (DXT3): explicit 4-bit alpha, then a BC1 colour block.
+// - BC3 (DXT5): an interpolated alpha block (two endpoints, 3-bit
+//   indices), then a BC1 colour block.
+// - BC4 (ATI1): one interpolated channel; BC5 (ATI2): two, for normal maps.
+//
+// `decode` returns the top mipmap: RGBA for BC1-BC3, grey for BC4, RGB (blue
+// 0) for BC5, and RGB, RGBA, grey or grey with alpha for uncompressed
+// surfaces with 8-bit masks. Endpoints expand from 5 and 6 bits by
+// replicating their top bits, and interpolated values divide rounding
+// down, as Pillow's decoder does. BC6H and BC7 are refused.
+//
+// Checked against Pillow's DDS reader and writer.
+
+type DdsImage = { width: i64, height: i64, channels: i64, pixels: bytes }
+
+type DdsError =
+    | DdsMalformed(why: str)
+    | DdsUnsupported(what: str)
+    | DdsTruncated
+
+fn le32(b: bytes, at: i64) -> i64 {
+    return b.at(at) + b.at(at + 1).shl(8) + b.at(at + 2).shl(16) + b.at(at + 3).shl(24)
+}
+
+fn rgb565(v: i64) -> [i64] {
+    let r = v.bit_and(63488).ushr(8)
+    let g = v.bit_and(2016).ushr(3)
+    let b = v.bit_and(31).shl(3)
+    return [r.bit_or(r.ushr(5)), g.bit_or(g.ushr(6)), b.bit_or(b.ushr(5)), 255]
+}
+
+/// A BC1 colour block's 16 texels as RGBA; `four` forces the four-colour
+/// mode, as BC2 and BC3 do.
+fn colour_block(d: bytes, at: i64, four: bool) -> [[i64]] {
+    let c0 = d.at(at) + 256 * d.at(at + 1)
+    let c1 = d.at(at + 2) + 256 * d.at(at + 3)
+    let p0 = rgb565(c0)
+    let p1 = rgb565(c1)
+    var p = [p0, p1]
+    if c0 > c1 or four {
+        p.push([(2 * p0[0] + p1[0]) / 3, (2 * p0[1] + p1[1]) / 3, (2 * p0[2] + p1[2]) / 3, 255])
+        p.push([(p0[0] + 2 * p1[0]) / 3, (p0[1] + 2 * p1[1]) / 3, (p0[2] + 2 * p1[2]) / 3, 255])
+    } else {
+        p.push([(p0[0] + p1[0]) / 2, (p0[1] + p1[1]) / 2, (p0[2] + p1[2]) / 2, 255])
+        p.push([0, 0, 0, 0])
+    }
+    let lut = le32(d, at + 4)
+    var out: [[i64]] = []
+    for n in 0..16 {
+        out.push(p[lut.ushr(2 * n).bit_and(3)])
+    }
+    return out
+}
+
+/// A BC3-style interpolated single-channel block: 16 values.
+fn value_block(d: bytes, at: i64) -> [i64] {
+    let a0 = d.at(at)
+    let a1 = d.at(at + 1)
+    var a = [a0, a1]
+    if a0 > a1 {
+        for i in 1..7 {
+            a.push(((7 - i) * a0 + i * a1) / 7)
+        }
+    } else {
+        for i in 1..5 {
+            a.push(((5 - i) * a0 + i * a1) / 5)
+        }
+        a = a + [0, 255]
+    }
+    let lo = d.at(at + 2) + d.at(at + 3).shl(8) + d.at(at + 4).shl(16)
+    let hi = d.at(at + 5) + d.at(at + 6).shl(8) + d.at(at + 7).shl(16)
+    var out: [i64] = []
+    for n in 0..16 {
+        let bits = if n < 8 { lo.ushr(3 * n) } else { hi.ushr(3 * (n - 8)) }
+        out.push(a[bits.bit_and(7)])
+    }
+    return out
+}
+
+/// Texels of block-compressed data, `kind` 1 to 5, as `channels` per texel.
+fn blocks(d: bytes, start: i64, w: i64, h: i64, kind: i64) -> [i64] ! DdsError {
+    let size = if kind == 1 or kind == 4 { 8 } else { 16 }
+    let bw = (w + 3) / 4
+    let bh = (h + 3) / 4
+    if start + bw * bh * size > d.len() {
+        fail(DdsTruncated)
+    }
+    let channels = if kind == 4 { 1 } else if kind == 5 { 3 } else { 4 }
+    var out: [i64] = []
+    for _i in 0..(w * h * channels) {
+        out.push(0)
+    }
+    for by in 0..bh {
+        for bx in 0..bw {
+            let at = start + (by * bw + bx) * size
+            var texels: [[i64]] = []
+            if kind == 1 {
+                texels = colour_block(d, at, false)
+            } else if kind == 2 or kind == 3 {
+                texels = colour_block(d, at + 8, true)
+                let alpha = if kind == 3 { value_block(d, at) } else {
+                    var ex: [i64] = []
+                    for n in 0..16 {
+                        let v = d.at(at + n / 2).ushr(4 * (n % 2)).bit_and(15)
+                        ex.push(v.bit_or(v.shl(4)))
+                    }
+                    ex
+                }
+                var t2: [[i64]] = []
+                for n in 0..16 {
+                    t2.push([texels[n][0], texels[n][1], texels[n][2], alpha[n]])
+                }
+                texels = t2
+            } else if kind == 4 {
+                texels = value_block(d, at).map(|v| [v])
+            } else {
+                let r = value_block(d, at)
+                let g = value_block(d, at + 8)
+                for n in 0..16 {
+                    texels.push([r[n], g[n], 0])
+                }
+            }
+            for n in 0..16 {
+                let x = 4 * bx + n % 4
+                let y = 4 * by + n / 4
+                if x < w and y < h {
+                    for c in 0..channels {
+                        out[(y * w + x) * channels + c] = texels[n][c]
+                    }
+                }
+            }
+        }
+    }
+    return out
+}
+
+fn mask_value(v: i64, mask: i64) -> i64 {
+    if mask == 0 {
+        return 0
+    }
+    var m = mask
+    var shift = 0
+    while m.bit_and(1) == 0 {
+        m = m.ushr(1)
+        shift = shift + 1
+    }
+    return v.ushr(shift).bit_and(m)
+}
+
+fn uncompressed(d: bytes, start: i64, w: i64, h: i64, bits: i64, masks: [i64], channels: i64) -> [i64] ! DdsError {
+    let bpp = bits / 8
+    if bits != 8 and bits != 16 and bits != 24 and bits != 32 {
+        fail(DdsUnsupported("{bits}-bit pixels"))
+    }
+    for m in masks {
+        if m != 0 and mask_value(m, m) != 255 {
+            fail(DdsUnsupported("a channel mask of other than 8 bits"))
+        }
+    }
+    if start + w * h * bpp > d.len() {
+        fail(DdsTruncated)
+    }
+    var out: [i64] = []
+    for i in 0..(w * h) {
+        var v = 0
+        for k in 0..bpp {
+            v = v.bit_or(d.at(start + i * bpp + k).shl(8 * k))
+        }
+        for c in 0..channels {
+            out.push(mask_value(v, masks[c]))
+        }
+    }
+    return out
+}
+
+pub fn decode(data: bytes) -> DdsImage ! DdsError {
+    if data.len() < 128 or data.slice(0, 4).to_str() != "DDS " or le32(data, 4) != 124 {
+        fail(DdsMalformed("not a DDS file"))
+    }
+    let h = le32(data, 12)
+    let w = le32(data, 16)
+    let pf_flags = le32(data, 80)
+    let fourcc = data.slice(84, 88).to_str()
+    let bits = le32(data, 88)
+    let masks = [le32(data, 92), le32(data, 96), le32(data, 100), le32(data, 104)]
+    if w < 1 or h < 1 or w * h > 400000000 {
+        fail(DdsMalformed("an empty or oversized surface"))
+    }
+    var start = 128
+    var kind = 0
+    if pf_flags.bit_and(4) != 0 {
+        if fourcc == "DXT1" {
+            kind = 1
+        } else if fourcc == "DXT2" or fourcc == "DXT3" {
+            kind = 2
+        } else if fourcc == "DXT4" or fourcc == "DXT5" {
+            kind = 3
+        } else if fourcc == "ATI1" or fourcc == "BC4U" {
+            kind = 4
+        } else if fourcc == "ATI2" or fourcc == "BC5U" {
+            kind = 5
+        } else if fourcc == "DX10" {
+            if data.len() < 148 {
+                fail(DdsTruncated)
+            }
+            let dxgi = le32(data, 128)
+            start = 148
+            // UNORM, sRGB and TYPELESS forms of BC1 to BC5.
+            let table = [(70, 1), (71, 1), (72, 1), (73, 2), (74, 2), (75, 2), (76, 3), (77, 3), (78, 3), (79, 4), (80, 4), (82, 5), (83, 5)]
+            for t in table {
+                if t.0 == dxgi {
+                    kind = t.1
+                }
+            }
+            if kind == 0 {
+                if dxgi == 28 or dxgi == 29 {
+                    return DdsImage{ width: w, height: h, channels: 4, pixels: bytes_of(try uncompressed(data, start, w, h, 32,
+                        [255, 65280, 16711680, 4278190080], 4)) }
+                }
+                if dxgi == 87 or dxgi == 91 {
+                    return DdsImage{ width: w, height: h, channels: 4, pixels: bytes_of(try uncompressed(data, start, w, h, 32,
+                        [16711680, 65280, 255, 4278190080], 4)) }
+                }
+                fail(DdsUnsupported("DXGI format {dxgi}"))
+            }
+        } else {
+            fail(DdsUnsupported("FourCC " + fourcc))
+        }
+        let px = try blocks(data, start, w, h, kind)
+        return DdsImage{ width: w, height: h, channels: if kind == 4 { 1 } else if kind == 5 { 3 } else { 4 }, pixels: bytes_of(px) }
+    }
+    let has_alpha = pf_flags.bit_and(1) != 0
+    if pf_flags.bit_and(131072) != 0 {
+        // Luminance: the bytes as they come, grey then alpha. Writers
+        // (Pillow among them) put masks here that do not fit the pixel
+        // size, and readers ignore them.
+        let ch = if has_alpha and bits == 16 { 2 } else { 1 }
+        if bits != 8 * ch or start + w * h * ch > data.len() {
+            fail(if bits != 8 * ch { DdsUnsupported("{bits}-bit luminance") } else { DdsTruncated })
+        }
+        return DdsImage{ width: w, height: h, channels: ch, pixels: data.slice(start, start + w * h * ch) }
+    }
+    if pf_flags.bit_and(64) != 0 {
+        let ch = if has_alpha { 4 } else { 3 }
+        return DdsImage{ width: w, height: h, channels: ch, pixels: bytes_of(try uncompressed(data, start, w, h, bits, masks, ch)) }
+    }
+    fail(DdsUnsupported("a pixel format with neither FourCC nor RGB"))
+}

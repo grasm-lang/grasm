@@ -1,0 +1,176 @@
+// The Grasm side of scripts/b37_diff.py: `<op> x x<fields>`, the fields
+// `|`-separated, bytes in hex and numbers in decimal. Answers are
+// `|`-separated summaries, hex-encoded, or ERR.
+import qoi
+import pnm
+import tga
+import pcx
+import xbm
+import xpm
+import sgiimage
+import dds
+import icns
+import sunraster
+import apng
+
+fn from_hex(text: str) -> bytes {
+    var out: [i64] = []
+    var i = 1
+    while i + 1 < text.len() {
+        let v = text.substr(i, 2).parse_int_base(16) ?? 0
+        out.push(if v < 0 or v > 255 { 0 } else { v })
+        i = i + 2
+    }
+    bytes_of(out)
+}
+
+fn unhex(text: str) -> bytes {
+    from_hex(":" + text)
+}
+
+fn hex(raw: bytes) -> str {
+    let digits = "0123456789abcdef"
+    var out = ""
+    var i = 0
+    while i < raw.len() {
+        out = out + digits.substr(raw.at(i) / 16, 1) + digits.substr(raw.at(i) % 16, 1)
+        i = i + 1
+    }
+    out
+}
+
+fn int(s: str) -> i64 {
+    s.parse_int() ?? 0
+}
+
+/// Samples as hex, two bytes each when `wide`.
+fn samples_hex(v: [i64], wide: bool) -> str {
+    var out: [i64] = []
+    for x in v {
+        if wide {
+            out.push(x.ushr(8))
+        }
+        out.push(x.bit_and(255))
+    }
+    hex(bytes_of(out))
+}
+
+fn samples_of(h: str, wide: bool) -> [i64] {
+    let b = unhex(h)
+    var out: [i64] = []
+    if wide {
+        var i = 0
+        while i + 1 < b.len() {
+            out.push(b.at(i) * 256 + b.at(i + 1))
+            i = i + 2
+        }
+        return out
+    }
+    return b.to_list()
+}
+
+fn images(op: str, g: [str]) -> str ! str {
+    let d = unhex(g[0])
+    if op == "qoi.dec" {
+        let i = qoi.decode(d) ?? fail("x")
+        return "{i.width}|{i.height}|{i.channels}|{i.colorspace}|" + hex(i.pixels)
+    }
+    if op == "qoi.enc" {
+        return hex(qoi.encode(QoiImage{ width: int(g[1]), height: int(g[2]), channels: int(g[3]), colorspace: int(g[4]), pixels: d }) ?? fail("x"))
+    }
+    if op == "pnm.dec" {
+        let i = pnm.decode(d) ?? fail("x")
+        let wide = i.maxval > 255 and not i.bitmap and i.channels == 1
+        return "{i.width}|{i.height}|{i.channels}|" + (if wide { "16|" } else { "8|" }) + samples_hex(pnm.to_pillow(i), wide)
+    }
+    if op == "pnm.enc" or op == "pnm.plain" {
+        let i = PnmImage{ width: int(g[1]), height: int(g[2]), channels: int(g[3]), maxval: int(g[4]), bitmap: g[5] == "1",
+            samples: samples_of(g[0], int(g[4]) > 255) }
+        return hex(if op == "pnm.enc" { pnm.encode(i) ?? fail("x") } else { pnm.encode_plain(i) ?? fail("x") })
+    }
+    if op == "tga.dec" {
+        let i = tga.decode(d) ?? fail("x")
+        return "{i.width}|{i.height}|{i.channels}|" + hex(i.pixels)
+    }
+    if op == "tga.enc" {
+        return hex(tga.encode(TgaImage{ width: int(g[1]), height: int(g[2]), channels: int(g[3]), pixels: d }, g[4] == "1") ?? fail("x"))
+    }
+    if op == "pcx.dec" {
+        let i = pcx.decode(d) ?? fail("x")
+        return "{i.width}|{i.height}|" + hex(i.pixels)
+    }
+    if op == "pcx.rgb" {
+        return hex(pcx.encode_rgb(PcxImage{ width: int(g[1]), height: int(g[2]), pixels: d }) ?? fail("x"))
+    }
+    if op == "pcx.pal" {
+        return hex(pcx.encode_paletted(int(g[1]), int(g[2]), d, unhex(g[3])) ?? fail("x"))
+    }
+    return try more(op, g, d)
+}
+
+fn more(op: str, g: [str], d: bytes) -> str ! str {
+    if op == "xbm.dec" {
+        let i = xbm.decode(d.to_str()) ?? fail("x")
+        return "{i.width}|{i.height}|" + hex(i.pixels)
+    }
+    if op == "xbm.enc" {
+        return hex((xbm.encode(XbmImage{ width: int(g[1]), height: int(g[2]), hot_x: -1, hot_y: -1, pixels: d }, g[3]) ?? fail("x")).to_bytes())
+    }
+    if op == "xpm.dec" {
+        let i = xpm.decode(d.to_str()) ?? fail("x")
+        return "{i.width}|{i.height}|" + hex(i.pixels)
+    }
+    if op == "sgi.dec" {
+        let i = sgiimage.decode(d) ?? fail("x")
+        return "{i.width}|{i.height}|{i.channels}|{i.bytes_per}|" + samples_hex(i.samples, i.bytes_per == 2)
+    }
+    if op == "sgi.enc" {
+        let i = SgiImage{ width: int(g[1]), height: int(g[2]), channels: int(g[3]), bytes_per: int(g[4]), samples: samples_of(g[0], int(g[4]) == 2) }
+        return hex(sgiimage.encode(i, g[5] == "1") ?? fail("x"))
+    }
+    if op == "dds.dec" {
+        let i = dds.decode(d) ?? fail("x")
+        return "{i.width}|{i.height}|{i.channels}|" + hex(i.pixels)
+    }
+    if op == "icns.sizes" {
+        return (icns.sizes(d) ?? fail("x")).map(|s| "{s.0}x{s.1}").join(",")
+    }
+    if op == "icns.dec" {
+        let i = icns.decode(d, int(g[1]), int(g[2])) ?? fail("x")
+        return "{i.width}|{i.height}|" + hex(i.pixels)
+    }
+    if op == "sun.dec" {
+        let i = sunraster.decode(d) ?? fail("x")
+        return "{i.width}|{i.height}|{i.channels}|" + hex(i.pixels)
+    }
+    if op == "sun.enc" {
+        return hex(sunraster.encode(RasImage{ width: int(g[1]), height: int(g[2]), channels: int(g[3]), pixels: d }, g[4] == "1") ?? fail("x"))
+    }
+    let a = apng.decode(d) ?? fail("x")
+    return "{a.width}|{a.height}|{a.plays}|" + a.frames.map(|f| "{f.delay_num}/{f.delay_den}:" + hex(f.pixels)).join(",")
+}
+
+/// The fields of a case: `x<hex>` inline, or `@<path>` for a file of the
+/// same hex when the case is too large for an argument.
+fn fields_of(arg: str) -> str / {io} {
+    if arg.starts_with("@") {
+        return match read_bytes(arg.substr(1, arg.len() - 1)) {
+            Ok(b) -> from_hex(":" + b.to_str()).to_str()
+            Err(_) -> ""
+        }
+    }
+    from_hex(arg).to_str()
+}
+
+fn main() / {io} {
+    let argv = args()
+    var i = 0
+    while i + 2 < argv.len() {
+        let g = fields_of(argv[i + 2]).split("|")
+        print(match images(argv[i], g) {
+            Ok(s) -> hex(s.to_bytes())
+            Err(_) -> "ERR"
+        })
+        i = i + 3
+    }
+}

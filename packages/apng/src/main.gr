@@ -1,0 +1,179 @@
+// Animated PNG (APNG): frames, timing and composition.
+//
+// An APNG is a PNG whose ordinary image is its first frame (or a fallback
+// for viewers that know nothing of animation), plus an acTL chunk with the
+// frame and loop counts, and for each frame an fcTL chunk -- size, offset,
+// delay as a fraction of a second, how to dispose of the frame afterwards
+// and how to blend it in -- followed by its pixels in fdAT chunks, IDAT
+// with a sequence number in front. Firefox, Safari and Chrome play it, and
+// it replaced GIF where alpha and 24-bit colour matter (stickers, emoji,
+// app animations).
+//
+// `decode` returns every frame as the full canvas in RGBA, composed as
+// the specification says: disposal to transparent black, to the previous
+// canvas, or not at all; blending by replacing pixels, or by Porter-Duff
+// "over". Each frame's pixels are decoded by wrapping its fdAT data as an
+// IDAT stream in a PNG of the frame's size and handing it to `png`.
+// Frames are 8-bit; a palette's transparency (tRNS) is applied.
+//
+// Checked against Pillow's APNG reader.
+import png
+import crc32
+
+type ApngFrame = { delay_num: i64, delay_den: i64, pixels: bytes }
+
+type Apng = { width: i64, height: i64, plays: i64, frames: [ApngFrame] }
+
+type ApngError =
+    | ApngMalformed(why: str)
+    | ApngNotAnimated
+    | ApngBadFrame(why: str)
+
+fn be32(b: bytes, at: i64) -> i64 {
+    return b.at(at).shl(24).bit_or(b.at(at + 1).shl(16)).bit_or(b.at(at + 2).shl(8)).bit_or(b.at(at + 3))
+}
+
+fn be16(b: bytes, at: i64) -> i64 {
+    return b.at(at) * 256 + b.at(at + 1)
+}
+
+fn be32_out(v: i64) -> [i64] {
+    return [v.ushr(24).bit_and(255), v.ushr(16).bit_and(255), v.ushr(8).bit_and(255), v.bit_and(255)]
+}
+
+fn chunk(kind: str, data: [i64]) -> [i64] {
+    let body = kind.to_bytes().concat(bytes_of(data))
+    return be32_out(data.len()) + body.to_list() + be32_out(crc32.of(body))
+}
+
+type ApngControl = { w: i64, h: i64, x: i64, y: i64, num: i64, den: i64, dispose: i64, blend: i64, data: [i64] }
+
+fn frame_rgba(ihdr: [i64], plte: [i64], trns: [i64], c: ApngControl) -> [i64] ! ApngError {
+    var head = ihdr
+    for i in 0..4 {
+        head[i] = be32_out(c.w)[i]
+        head[4 + i] = be32_out(c.h)[i]
+    }
+    var file = [137, 80, 78, 71, 13, 10, 26, 10] + chunk("IHDR", head)
+    if plte.len() > 0 {
+        file = file + chunk("PLTE", plte)
+    }
+    file = file + chunk("IDAT", c.data) + chunk("IEND", [])
+    let img = png.decode(bytes_of(file)) ?? fail(ApngBadFrame("a frame png cannot decode"))
+    let ch = png.channels_for(img.colour_type)
+    var out: [i64] = []
+    for i in 0..(img.width * img.height) {
+        let s = img.sample.slice(i * ch, i * ch + ch)
+        let px = if img.colour_type == 6 { s } else if img.colour_type == 4 { [s[0], s[0], s[0], s[1]] } else if img.colour_type == 2 {
+            let opaque = trns.len() < 6 or [trns[1], trns[3], trns[5]] != s
+            s + [if opaque { 255 } else { 0 }]
+        } else if img.colour_type == 0 {
+            let opaque = trns.len() < 2 or trns[1] != s[0]
+            [s[0], s[0], s[0], if opaque { 255 } else { 0 }]
+        } else {
+            [img.palette[3 * s[0]], img.palette[3 * s[0] + 1], img.palette[3 * s[0] + 2], if s[0] < trns.len() { trns[s[0]] } else { 255 }]
+        }
+        for item in px {
+            out.push(item)
+        }
+    }
+    return out
+}
+
+fn over(dst: [i64], src: [i64]) -> [i64] {
+    let sa = src[3]
+    if sa == 255 {
+        return src
+    }
+    if sa == 0 {
+        return dst
+    }
+    // Porter-Duff over, in 0..255 with rounding.
+    let da = dst[3] * (255 - sa) / 255
+    let oa = sa + da
+    var out: [i64] = []
+    for c in 0..3 {
+        out.push((src[c] * sa + dst[c] * da + oa / 2) / oa)
+    }
+    return out + [oa]
+}
+
+pub fn decode(data: bytes) -> Apng ! ApngError {
+    let found = png.chunks(data) ?? fail(ApngMalformed("not a PNG"))
+    var ihdr: [i64] = []
+    var plte: [i64] = []
+    var trns: [i64] = []
+    var plays = 0
+    var controls: [ApngControl] = []
+    var current = 0 - 1
+    var animated = false
+    for c in found {
+        let body = data.slice(c.1, c.1 + c.2)
+        if c.0 == "IHDR" {
+            ihdr = body.to_list()
+        } else if c.0 == "PLTE" {
+            plte = body.to_list()
+        } else if c.0 == "tRNS" {
+            trns = body.to_list()
+        } else if c.0 == "acTL" {
+            animated = true
+            plays = be32(body, 4)
+        } else if c.0 == "fcTL" {
+            if body.len() != 26 {
+                fail(ApngMalformed("an fcTL of the wrong size"))
+            }
+            controls.push(ApngControl{ w: be32(body, 4), h: be32(body, 8), x: be32(body, 12), y: be32(body, 16), num: be16(body, 20),
+                den: be16(body, 22), dispose: body.at(24), blend: body.at(25), data: [] })
+            current = controls.len() - 1
+        } else if c.0 == "IDAT" and current >= 0 {
+            controls[current].data = controls[current].data + body.to_list()
+        } else if c.0 == "fdAT" and current >= 0 {
+            controls[current].data = controls[current].data + body.slice(4, body.len()).to_list()
+        }
+    }
+    if not animated or controls.len() == 0 {
+        fail(ApngNotAnimated)
+    }
+    let w = be32(bytes_of(ihdr), 0)
+    let h = be32(bytes_of(ihdr), 4)
+    var canvas: [[i64]] = []
+    for _i in 0..(w * h) {
+        canvas.push([0, 0, 0, 0])
+    }
+    var frames: [ApngFrame] = []
+    for i in 0..controls.len() {
+        let c = controls[i]
+        if c.x + c.w > w or c.y + c.h > h or c.w < 1 or c.h < 1 {
+            fail(ApngMalformed("a frame outside the canvas"))
+        }
+        let saved = canvas
+        let px = try frame_rgba(ihdr, plte, trns, c)
+        for y in 0..c.h {
+            for x in 0..c.w {
+                let k = (c.y + y) * w + c.x + x
+                let src = px.slice(4 * (y * c.w + x), 4 * (y * c.w + x) + 4)
+                // On the first frame the two blend modes are equivalent (the
+                // canvas starts cleared), and the frame is taken as it is.
+                canvas[k] = if c.blend == 1 and i > 0 { over(canvas[k], src) } else { src }
+            }
+        }
+        var flat: [i64] = []
+        for p in canvas {
+            for item in p {
+                flat.push(item)
+            }
+        }
+        frames.push(ApngFrame{ delay_num: c.num, delay_den: if c.den == 0 { 100 } else { c.den }, pixels: bytes_of(flat) })
+        // Disposal; "previous" on the first frame means "background".
+        if c.dispose == 1 or c.dispose == 2 and i == 0 {
+            for y in 0..c.h {
+                for x in 0..c.w {
+                    canvas[(c.y + y) * w + c.x + x] = [0, 0, 0, 0]
+                }
+            }
+        } else if c.dispose == 2 {
+            canvas = saved
+        }
+    }
+    return Apng{ width: w, height: h, plays: plays, frames: frames }
+}
