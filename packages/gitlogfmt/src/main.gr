@@ -1,0 +1,283 @@
+// `git log --format`: the placeholders of git's pretty formats, expanded
+// for one commit exactly as git expands them.
+//
+// Names and dates of author (%a) and committer (%c) -- name, email, local
+// part, and the date as git's default, RFC 2822, ISO, strict ISO, short
+// and Unix forms; hashes full and abbreviated (%H %h %T %t %P %p); the
+// subject (%s: the first paragraph, its lines joined by spaces), the
+// sanitised subject for a file name (%f), the body (%b) and the raw
+// message (%B); %n, %%, %x followed by two hex digits. A placeholder git
+// does not know is written out as it stands, as git does. Relative dates,
+// colours, padding, decorations and trailers are not supported; they
+// come out as written.
+import gitobj
+import gitdate
+
+type LogCommit = {
+    oid: str,
+    tree: str,
+    parents: [str],
+    author: str,
+    committer: str,
+    message: str,
+}
+
+type LogFormatError =
+    | NotACommit(why: str)
+
+pub fn from_object(oid: str, content: bytes) -> LogCommit ! LogFormatError {
+    match gitobj.read_commit(content) {
+        Ok(GitCommit(tree, parents, author, committer, message)) -> LogCommit{ oid: oid, tree: tree, parents: parents,
+            author: author, committer: committer, message: message }
+        Ok(_) -> fail(NotACommit("not a commit"))
+        Err(_) -> fail(NotACommit("malformed"))
+    }
+}
+
+/// (name, email, stamp) of an author or committer line.
+fn ident(line: str) -> (str, str, str) {
+    let lt = line.index_of(" <") ?? -1
+    let gt = line.index_of("> ") ?? -1
+    if lt < 0 or gt < lt {
+        return (line, "", "")
+    }
+    (line.substr(0, lt), line.substr(lt + 2, gt - lt - 2), line.substr(gt + 2, line.len() - gt - 2))
+}
+
+fn weekday(days: i64) -> str {
+    ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"][((days % 7) + 7) % 7]
+}
+
+fn month_name(m: i64) -> str {
+    ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"][m - 1]
+}
+
+fn two(n: i64) -> str {
+    if n < 10 { "0{n}" } else { "{n}" }
+}
+
+/// git's default date format: "Thu Oct 16 12:00:00 2026 +0400".
+pub fn default_date(stamp: GitStamp) -> str {
+    let t = gitdate.local_time(stamp)
+    let local = stamp.seconds + gitdate.offset_minutes(stamp) * 60
+    let days = if local >= 0 { local / 86400 } else { (local - 86399) / 86400 }
+    "{weekday(days)} {month_name(t.month)} {t.day} {two(t.hour)}:{two(t.minute)}:{two(t.second)} {t.year} {stamp.offset}"
+}
+
+fn date(stamp_text: str, form: str) -> str {
+    match gitdate.parse(stamp_text) {
+        None -> ""
+        Some(s) -> {
+            if form == "d" {
+                default_date(s)
+            } else if form == "D" {
+                gitdate.rfc2822(s)
+            } else if form == "t" {
+                gitdate.unix(s)
+            } else if form == "i" {
+                gitdate.iso(s)
+            } else if form == "I" {
+                gitdate.iso_strict(s)
+            } else {
+                gitdate.short(s)
+            }
+        }
+    }
+}
+
+fn person(line: str, what: str) -> Option[str] {
+    let (name, email, stamp) = ident(line)
+    if what == "n" or what == "N" {
+        return Some(name)
+    }
+    if what == "e" or what == "E" {
+        return Some(email)
+    }
+    if what == "l" or what == "L" {
+        let at = email.index_of("@") ?? -1
+        return Some(if at < 0 { email } else { email.substr(0, at) })
+    }
+    if "dDtiIs".contains(what) and what.len() == 1 {
+        return Some(date(stamp, what))
+    }
+    None
+}
+
+/// Lines of the message, with where each starts.
+fn is_blank(line: str) -> bool {
+    line.trim().len() == 0
+}
+
+/// (subject region start, body start) in the message, as pretty.c finds
+/// them: past leading blank lines, then past the first paragraph and the
+/// blank lines after it.
+fn regions(msg: str) -> (i64, i64, i64) {
+    let lines = msg.split("\n")
+    var pos = 0
+    var i = 0
+    while i < lines.len() - 1 and is_blank(lines[i]) {
+        pos = pos + lines[i].len() + 1
+        i = i + 1
+    }
+    let subject_start = pos
+    while i < lines.len() and not is_blank(lines[i]) {
+        pos = pos + lines[i].len() + if i < lines.len() - 1 { 1 } else { 0 }
+        i = i + 1
+    }
+    let subject_end = pos
+    while i < lines.len() - 1 and is_blank(lines[i]) {
+        pos = pos + lines[i].len() + 1
+        i = i + 1
+    }
+    (subject_start, subject_end, pos.min(msg.len()))
+}
+
+pub fn subject(c: LogCommit) -> str {
+    let (s, e, _) = regions(c.message)
+    var parts: [str] = []
+    for l in c.message.substr(s, e - s).split("\n") {
+        if not is_blank(l) {
+            parts.push(l.trim_end())
+        }
+    }
+    parts.join(" ")
+}
+
+pub fn body(c: LogCommit) -> str {
+    let (_, _, b) = regions(c.message)
+    c.message.substr(b, c.message.len() - b)
+}
+
+fn title_char(c: i64) -> bool {
+    (c >= 97 and c <= 122) or (c >= 65 and c <= 90) or (c >= 48 and c <= 57) or c == 46 or c == 95
+}
+
+/// %f: the subject made fit for a file name, as format_sanitized_subject.
+pub fn sanitized_subject(c: LogCommit) -> str {
+    // Only the first line of the subject paragraph: git's %f of
+    // "a b\nc d" is "a-b".
+    let (s, e, _) = regions(c.message)
+    let region = c.message.substr(s, e - s)
+    let nl = region.index_of("\n") ?? region.len()
+    let raw = region.substr(0, nl).to_bytes()
+    var out: [i64] = []
+    var space = 2
+    var i = 0
+    while i < raw.len() {
+        let ch = raw.at(i)
+        if title_char(ch) {
+            if space == 1 {
+                out.push(45)
+            }
+            space = 0
+            out.push(ch)
+            if ch == 46 {
+                while i + 1 < raw.len() and raw.at(i + 1) == 46 {
+                    i = i + 1
+                }
+            }
+        } else {
+            space = space.bit_or(1)
+        }
+        i = i + 1
+    }
+    while out.len() > 0 and (out[out.len() - 1] == 46 or out[out.len() - 1] == 45) {
+        out = out.slice(0, out.len() - 1)
+    }
+    bytes_of(out).to_str()
+}
+
+fn abbrev(id: str, n: i64) -> str {
+    id.substr(0, n.min(id.len()))
+}
+
+fn hex_value(c: str) -> i64 {
+    let v = c.to_lower()
+    if v >= "0" and v <= "9" {
+        return v.code_at(0) - 48
+    }
+    if v >= "a" and v <= "f" { v.code_at(0) - 87 } else { -1 }
+}
+
+/// One placeholder at text[i] (just past '%'): (expansion, characters used),
+/// or None when git would leave it as it stands.
+fn expand(c: LogCommit, f: str, i: i64, n: i64) -> Option[(str, i64)] {
+    let ch = f.substr(i, 1)
+    if ch == "%" {
+        return Some(("%", 1))
+    }
+    if ch == "n" {
+        return Some(("\n", 1))
+    }
+    if ch == "H" {
+        return Some((c.oid, 1))
+    }
+    if ch == "h" {
+        return Some((abbrev(c.oid, n), 1))
+    }
+    if ch == "T" {
+        return Some((c.tree, 1))
+    }
+    if ch == "t" {
+        return Some((abbrev(c.tree, n), 1))
+    }
+    if ch == "P" {
+        return Some((c.parents.join(" "), 1))
+    }
+    if ch == "p" {
+        return Some((c.parents.map(|p| abbrev(p, n)).join(" "), 1))
+    }
+    if ch == "s" {
+        return Some((subject(c), 1))
+    }
+    if ch == "f" {
+        return Some((sanitized_subject(c), 1))
+    }
+    if ch == "b" {
+        return Some((body(c), 1))
+    }
+    if ch == "B" {
+        return Some((c.message, 1))
+    }
+    if ch == "e" {
+        return Some(("", 1))
+    }
+    if ch == "x" and i + 2 < f.len() + 1 and hex_value(f.substr(i + 1, 1)) >= 0 and hex_value(f.substr(i + 2, 1)) >= 0 {
+        let v = hex_value(f.substr(i + 1, 1)) * 16 + hex_value(f.substr(i + 2, 1))
+        return Some((bytes_of([v]).to_str(), 3))
+    }
+    if (ch == "a" or ch == "c") and i + 1 < f.len() {
+        let line = if ch == "a" { c.author } else { c.committer }
+        return match person(line, f.substr(i + 1, 1)) {
+            Some(v) -> Some((v, 2))
+            None -> None
+        }
+    }
+    None
+}
+
+/// The commit formatted as `git log --format=<format>` would, with hashes
+/// abbreviated to `abbrev_len` characters.
+pub fn format(c: LogCommit, f: str, abbrev_len: i64) -> str {
+    var out = ""
+    var i = 0
+    while i < f.len() {
+        let ch = f.substr(i, 1)
+        if ch != "%" or i + 1 >= f.len() {
+            out = out + ch
+            i = i + 1
+            continue
+        }
+        match expand(c, f, i + 1, abbrev_len) {
+            Some((text, used)) -> {
+                out = out + text
+                i = i + 1 + used
+            }
+            None -> {
+                out = out + "%"
+                i = i + 1
+            }
+        }
+    }
+    out
+}

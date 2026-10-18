@@ -1,0 +1,16 @@
+[package]
+name = "git2_demo"
+version = "1.0.0"
+capabilities = ["io"]
+
+[dependencies.packidx]
+path = "../packidx"
+version = "^1.0.0"
+
+[dependencies.packrev]
+path = "../packrev"
+version = "^1.0.0"
+
+[dependencies.gitlogfmt]
+path = "../gitlogfmt"
+version = "^1.0.0"

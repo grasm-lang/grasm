@@ -162,9 +162,12 @@ Ethernet, IPv4, IPv6, TCP and UDP were candidates here and are already
 `snmp` `radius` `netflow` `kerberos` `ldapwire` `smb2` `dcerpc` `modbus`
 
 **B17. Git, further down** (`git`) —
-`commitgraph` `midx` `ewah` `mergefile` `gitapply` `gitblame` `gitlogfmt`
-`gitstatus` `gitnotes` `ignorewalk`
-`reftable` `packrev`
+`commitgraph` `midx` `ewah` `mergefile` `gitblame` `gitlogfmt`
+`gitstatus` `gitnotes` `ignorewalk` `reftable` `packrev` `packidx`
+
+`gitapply` was a candidate here and came off by rule 7: `patchfile`
+applies unified diffs already. `packidx`, the pack index itself, was
+found missing and added.
 
 **B18. Package ecosystems** (Go's x/mod, npm's own modules, Bundler, pip,
 importlib.metadata) —
@@ -247,6 +250,23 @@ projection library), `flexlayout` (no layout engine outside a browser),
 day its reference is installed.
 
 ## Landed
+
+- [x] **B17, first part** — `packidx` `packrev` `midx` `commitgraph`
+  `gitlogfmt`, with the harness `gittest`; the new gate `gitdiff` runs 949
+  cases on twelve repositories built with `git commit-tree` -- exact
+  messages, time zones, octopus merges, children dated before their
+  parents, several packs -- against `git show-index` (version 1, version
+  2, and version 2 with every offset in the 64-bit table), the .rev files
+  git wrote, each pack's own index for the multi-pack-index, `git log` for
+  the commit-graph and `git log -1 --format` for the pretty formats.
+  Found on the way, in git 2.48 itself: a corrected-date offset of 2^32 or
+  more is written to the commit-graph's overflow chunk with its high word
+  lost, and commits dated past 2^32 get corrected dates below their
+  parents'; `git commit-graph verify` reports both, and the package's
+  `verify` reports the same commits (checked against it). The gate
+  compares those dates only where git writes them correctly. `%f`
+  sanitises only the first line of a subject. One break per package turned
+  its family red.
 
 - [x] **B18, first part** — `sri` `npmname` `gosum` `gemfilelock`
   `pkgmetadata`, with the harness `b18test`; the new gate `b18diff` runs
@@ -412,7 +432,7 @@ day its reference is installed.
 | | |
 |---|---|
 | At the start | 669 |
-| Now | 785 |
+| Now | 791 |
 | Candidates above | 316 packages in 28 batches, plus `ecc`, `rfc6979` and `goprintf` |
 | Harnesses, one a batch | 28 |
 | If every candidate lands | 1016 |

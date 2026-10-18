@@ -1,0 +1,195 @@
+// Git's commit-graph file: the commit history in a form that answers
+// "what are this commit's parents, its tree, its date, its generation"
+// without inflating a single object -- what makes `git log --graph`,
+// merge-base and reachability fast on large repositories.
+//
+// "CGPH", version, hash version, chunk count, base-graph count; a chunk
+// table; OIDF and OIDL, the fan-out and sorted commit names; CDAT, per
+// commit its root tree, two parent positions (0x70000000 for none; the
+// second, with its top bit set, an index into EDGE for an octopus merge),
+// and 8 bytes holding the topological level in 30 bits and the commit
+// time in 34; GDA2 and GDO2, the corrected commit date as an offset from
+// the commit time (overflowing to 8 bytes). Bloom filter chunks are
+// skipped. Chains of incremental graphs are not read.
+//
+// `read` reports what the file holds. git 2.48 itself can write an
+// overflow offset of 2^32 or more with its high word lost, which `git
+// commit-graph verify` then reports as a generation smaller than a
+// parent's; `verify` finds the same commits.
+import sha1
+import crypto_hash
+
+type CgCommit = {
+    oid: bytes,
+    tree: bytes,
+    parents: [i64],
+    level: i64,
+    time: i64,
+    /// The corrected commit date (generation v2), or -1 without GDA2.
+    corrected: i64,
+}
+
+type CommitGraph = {
+    version: i64,
+    hash_id: i64,
+    chunks: [str],
+    commits: [CgCommit],
+}
+
+type CommitGraphError =
+    | BadMagic
+    | BadVersion(found: i64)
+    | Truncated
+    | MissingChunk(id: str)
+    | Chained
+    | BadChecksum
+    | BadEdge(commit: i64)
+
+fn u32(b: bytes, at: i64) -> i64 {
+    b.at(at).shl(24).bit_or(b.at(at + 1).shl(16)).bit_or(b.at(at + 2).shl(8)).bit_or(b.at(at + 3))
+}
+
+fn u64(b: bytes, at: i64) -> i64 {
+    u32(b, at).shl(32).bit_or(u32(b, at + 4))
+}
+
+fn digest(data: bytes, size: i64) -> bytes {
+    if size == 32 { crypto_hash.sha256_of(data) } else { sha1.hash(data) }
+}
+
+fn chunk(data: bytes, count: i64, limit: i64, id: str) -> (i64, i64) ! CommitGraphError {
+    for k in 0..count {
+        let p = 8 + 12 * k
+        if p + 24 > limit {
+            fail(Truncated)
+        }
+        if data.slice(p, p + 4).to_str() == id {
+            let s = u64(data, p + 4)
+            let e = u64(data, p + 16)
+            if s > e or e > limit {
+                fail(Truncated)
+            }
+            return (s, e)
+        }
+    }
+    (-1, -1)
+}
+
+fn chunk_ids(data: bytes, count: i64) -> [str] {
+    var out: [str] = []
+    for k in 0..count {
+        out.push(data.slice(8 + 12 * k, 12 + 12 * k).to_str())
+    }
+    out
+}
+
+fn parents_of(data: bytes, at: i64, edges: (i64, i64), i: i64) -> [i64] ! CommitGraphError {
+    var out: [i64] = []
+    let p1 = u32(data, at)
+    let p2 = u32(data, at + 4)
+    if p1 != 1879048192 {
+        out.push(p1)
+    }
+    if p2 == 1879048192 {
+        return out
+    }
+    if p2.bit_and(2147483648) == 0 {
+        out.push(p2)
+        return out
+    }
+    var e = edges.0 + 4 * p2.bit_and(2147483647)
+    while true {
+        if edges.0 < 0 or e + 4 > edges.1 {
+            fail(BadEdge(i))
+        }
+        let v = u32(data, e)
+        out.push(v.bit_and(2147483647))
+        if v.bit_and(2147483648) != 0 {
+            break
+        }
+        e = e + 4
+    }
+    out
+}
+
+pub fn read(data: bytes) -> CommitGraph ! CommitGraphError {
+    if data.len() < 8 {
+        fail(Truncated)
+    }
+    if data.slice(0, 4).to_list() != [67, 71, 80, 72] {
+        fail(BadMagic)
+    }
+    if data.at(4) != 1 {
+        fail(BadVersion(data.at(4)))
+    }
+    if data.at(7) != 0 {
+        fail(Chained)
+    }
+    let hash_id = data.at(5)
+    let h = if hash_id == 2 { 32 } else { 20 }
+    let end = data.len() - h
+    if end < 8 or digest(data.slice(0, end), h).to_list() != data.slice(end, data.len()).to_list() {
+        fail(BadChecksum)
+    }
+    let count = data.at(6)
+    let (ls, le) = try chunk(data, count, end, "OIDL")
+    let (cs, _) = try chunk(data, count, end, "CDAT")
+    if ls < 0 {
+        fail(MissingChunk("OIDL"))
+    }
+    if cs < 0 {
+        fail(MissingChunk("CDAT"))
+    }
+    let edges = try chunk(data, count, end, "EDGE")
+    let (gs, _) = try chunk(data, count, end, "GDA2")
+    let (gos, goe) = try chunk(data, count, end, "GDO2")
+    let n = (le - ls) / h
+    var commits: [CgCommit] = []
+    for i in 0..n {
+        let at = cs + i * (h + 16)
+        let packed = u64(data, at + h + 8)
+        let time = packed.bit_and(17179869183)
+        var corrected = -1
+        if gs >= 0 {
+            var off = u32(data, gs + 4 * i)
+            if off.bit_and(2147483648) != 0 {
+                let p = gos + 8 * off.bit_and(2147483647)
+                if gos < 0 or p + 8 > goe {
+                    fail(Truncated)
+                }
+                off = u64(data, p)
+            }
+            corrected = time + off
+        }
+        commits.push(CgCommit{ oid: data.slice(ls + h * i, ls + h * (i + 1)), tree: data.slice(at, at + h),
+            parents: try parents_of(data, at + h, edges, i), level: packed.ushr(34), time: time, corrected: corrected })
+    }
+    CommitGraph{ version: 1, hash_id: hash_id, chunks: chunk_ids(data, count), commits: commits }
+}
+
+type CgProblem = {
+    oid: bytes,
+    have: i64,
+    want: i64,
+}
+
+/// Commits whose corrected commit date is not above every parent's, as
+/// `git commit-graph verify` reports them (only with generation data).
+pub fn verify(g: CommitGraph) -> [CgProblem] {
+    var out: [CgProblem] = []
+    for c in g.commits {
+        if c.corrected < 0 {
+            continue
+        }
+        var most = -1
+        for p in c.parents {
+            if p < g.commits.len() {
+                most = most.max(g.commits[p].corrected)
+            }
+        }
+        if most >= 0 and c.corrected < most + 1 {
+            out.push(CgProblem{ oid: c.oid, have: c.corrected, want: most + 1 })
+        }
+    }
+    out
+}

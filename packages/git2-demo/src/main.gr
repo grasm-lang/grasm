@@ -1,0 +1,42 @@
+// git's pack index, reverse index and pretty formats on inputs built here.
+// scripts/git_diff.sh holds them, with midx and commitgraph, to git on
+// real repositories.
+import packidx
+import packrev
+import gitlogfmt
+
+fn name(b: i64) -> bytes {
+    bytes_filled(20, b)
+}
+
+fn main() / {io} {
+    // Three objects, one past 2 GiB: written, read back, found.
+    let entries = [PackIndexEntry{ name: name(9), offset: 12, crc: 7 },
+        PackIndexEntry{ name: name(1), offset: 5000000000, crc: 8 }, PackIndexEntry{ name: name(4), offset: 300, crc: 9 }]
+    let file = packidx.write(entries, bytes_filled(20, 0))
+    match packidx.read(file, 20) {
+        Ok(idx) -> {
+            assert_eq(idx.entries.map(|e| e.offset), [5000000000, 300, 12])
+            match packidx.find(idx, name(4)) {
+                Some(e) -> assert_eq(e.crc, 9)
+                None -> panic("an object was not found")
+            }
+        }
+        Err(_) -> panic("an index it wrote was refused")
+    }
+
+    // In pack order the third index entry comes first.
+    assert_eq(packrev.order([5000000000, 300, 12]), [2, 1, 0])
+
+    let raw = "tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904\nauthor A U Thor <a@example.com> 1700000000 +0530\n" +
+    "committer C <c@example.com> 1700000000 +0000\n\nFix the thing\nacross two lines\n\nBody.\n"
+    match gitlogfmt.from_object("0123456789abcdef0123456789abcdef01234567", raw.to_bytes()) {
+        Ok(c) -> {
+            assert_eq(gitlogfmt.format(c, "%h %s", 7), "0123456 Fix the thing across two lines")
+            assert_eq(gitlogfmt.format(c, "%f|%al|%as", 7), "Fix-the-thing|a|2023-11-15")
+            assert_eq(gitlogfmt.format(c, "%ad", 7), "Wed Nov 15 03:43:20 2023 +0530")
+        }
+        Err(_) -> panic("a commit was refused")
+    }
+    print("git2: ok")
+}

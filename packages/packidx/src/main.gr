@@ -1,0 +1,174 @@
+// Git's pack index (.idx), versions 1 and 2: how git finds an object in
+// a packfile without reading the pack.
+//
+// A fan-out table of 256 cumulative counts narrows a lookup to the objects
+// whose name starts with a given byte; the names follow, sorted, so the
+// rest is a binary search; then each object's offset in the pack (in
+// version 2 with a CRC-32 of its packed bytes, and offsets past 2 GiB in a
+// table of 8-byte ones). The file ends with the pack's checksum and its
+// own. SHA-1 and SHA-256 repositories differ only in the name length,
+// which `read` takes as an argument.
+import sha1
+import crypto_hash
+
+type PackIndexEntry = {
+    name: bytes,
+    offset: i64,
+    crc: i64,
+}
+
+type PackIndex = {
+    version: i64,
+    entries: [PackIndexEntry],
+    pack_checksum: bytes,
+    checksum: bytes,
+}
+
+type PackIndexError =
+    | Truncated
+    | BadVersion(found: i64)
+    | BadFanout
+    | BadChecksum
+    | BadOffset(entry: i64)
+
+fn u32(b: bytes, at: i64) -> i64 {
+    b.at(at).shl(24).bit_or(b.at(at + 1).shl(16)).bit_or(b.at(at + 2).shl(8)).bit_or(b.at(at + 3))
+}
+
+fn digest(data: bytes, hash_size: i64) -> bytes {
+    if hash_size == 32 { crypto_hash.sha256_of(data) } else { sha1.hash(data) }
+}
+
+fn fanout_total(data: bytes, start: i64) -> i64 ! PackIndexError {
+    var last = 0
+    for k in 0..256 {
+        let v = u32(data, start + 4 * k)
+        if v < last {
+            fail(BadFanout)
+        }
+        last = v
+    }
+    last
+}
+
+/// Reads an index; `hash_size` is 20 for SHA-1, 32 for SHA-256.
+pub fn read(data: bytes, hash_size: i64) -> PackIndex ! PackIndexError {
+    if data.len() < 8 + 1024 + 2 * hash_size {
+        fail(Truncated)
+    }
+    let v2 = data.at(0) == 255 and data.at(1) == 116 and data.at(2) == 79 and data.at(3) == 99
+    if v2 and u32(data, 4) != 2 {
+        fail(BadVersion(u32(data, 4)))
+    }
+    let table = if v2 { 8 } else { 0 }
+    let n = try fanout_total(data, table)
+    let body = table + 1024
+    let need = if v2 { body + n * (hash_size + 8) + 2 * hash_size } else { body + n * (hash_size + 4) + 2 * hash_size }
+    if data.len() < need {
+        fail(Truncated)
+    }
+    let end = data.len() - hash_size
+    if digest(data.slice(0, end), hash_size).to_list() != data.slice(end, data.len()).to_list() {
+        fail(BadChecksum)
+    }
+    var entries: [PackIndexEntry] = []
+    if not v2 {
+        for i in 0..n {
+            let at = body + i * (hash_size + 4)
+            entries.push(PackIndexEntry{ name: data.slice(at + 4, at + 4 + hash_size), offset: u32(data, at), crc: -1 })
+        }
+        return PackIndex{ version: 1, entries: entries, pack_checksum: data.slice(end - hash_size, end),
+            checksum: data.slice(end, data.len()) }
+    }
+    let crcs = body + n * hash_size
+    let offs = crcs + 4 * n
+    let large = offs + 4 * n
+    for i in 0..n {
+        var off = u32(data, offs + 4 * i)
+        if off.bit_and(2147483648) != 0 {
+            let k = off.bit_and(2147483647)
+            let at = large + 8 * k
+            if at + 8 > end - hash_size {
+                fail(BadOffset(i))
+            }
+            off = u32(data, at).shl(32).bit_or(u32(data, at + 4))
+        }
+        entries.push(PackIndexEntry{ name: data.slice(body + i * hash_size, body + (i + 1) * hash_size), offset: off,
+            crc: u32(data, crcs + 4 * i) })
+    }
+    PackIndex{ version: 2, entries: entries, pack_checksum: data.slice(end - hash_size, end),
+        checksum: data.slice(end, data.len()) }
+}
+
+fn compare_names(a: bytes, b: bytes) -> i64 {
+    for k in 0..a.len().min(b.len()) {
+        if a.at(k) != b.at(k) {
+            return if a.at(k) < b.at(k) { -1 } else { 1 }
+        }
+    }
+    a.len() - b.len()
+}
+
+/// The entry for an object name, by fan-out and binary search.
+pub fn find(idx: PackIndex, name: bytes) -> Option[PackIndexEntry] {
+    var lo = 0
+    var hi = idx.entries.len()
+    while lo < hi {
+        let mid = (lo + hi) / 2
+        let c = compare_names(idx.entries[mid].name, name)
+        if c == 0 {
+            return Some(idx.entries[mid])
+        }
+        if c < 0 { lo = mid + 1 } else { hi = mid }
+    }
+    None
+}
+
+fn be32(v: i64) -> [i64] {
+    [v.ushr(24).bit_and(255), v.ushr(16).bit_and(255), v.ushr(8).bit_and(255), v.bit_and(255)]
+}
+
+/// A version 2 index for the entries, which need not be sorted.
+pub fn write(entries: [PackIndexEntry], pack_checksum: bytes) -> bytes {
+    var sorted = entries
+    var i = 1
+    while i < sorted.len() {
+        var j = i
+        while j > 0 and compare_names(sorted[j - 1].name, sorted[j].name) > 0 {
+            let t = sorted[j]
+            sorted[j] = sorted[j - 1]
+            sorted[j - 1] = t
+            j = j - 1
+        }
+        i = i + 1
+    }
+    var out: [i64] = [255, 116, 79, 99, 0, 0, 0, 2]
+    var count = 0
+    for b in 0..256 {
+        while count < sorted.len() and sorted[count].name.at(0) == b {
+            count = count + 1
+        }
+        out = out + be32(count)
+    }
+    var data = bytes_of(out)
+    for e in sorted {
+        data = data.concat(e.name)
+    }
+    var tail: [i64] = []
+    for e in sorted {
+        tail = tail + be32(e.crc)
+    }
+    var large: [i64] = []
+    var nlarge = 0
+    for e in sorted {
+        if e.offset >= 2147483648 {
+            tail = tail + be32(nlarge.bit_or(2147483648))
+            large = large + be32(e.offset.ushr(32)) + be32(e.offset.bit_and(4294967295))
+            nlarge = nlarge + 1
+        } else {
+            tail = tail + be32(e.offset)
+        }
+    }
+    data = data.concat(bytes_of(tail + large)).concat(pack_checksum)
+    data.concat(digest(data, pack_checksum.len()))
+}

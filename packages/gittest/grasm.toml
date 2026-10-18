@@ -1,0 +1,24 @@
+[package]
+name = "gittest"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.packidx]
+path = "../packidx"
+version = "^1.0.0"
+
+[dependencies.packrev]
+path = "../packrev"
+version = "^1.0.0"
+
+[dependencies.midx]
+path = "../midx"
+version = "^1.0.0"
+
+[dependencies.commitgraph]
+path = "../commitgraph"
+version = "^1.0.0"
+
+[dependencies.gitlogfmt]
+path = "../gitlogfmt"
+version = "^1.0.0"

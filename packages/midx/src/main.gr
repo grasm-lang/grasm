@@ -1,0 +1,173 @@
+// Git's multi-pack-index: one index over many packfiles, so a repository
+// with hundreds of packs looks an object up once instead of once a pack.
+//
+// "MIDX", a version, a hash version (1 SHA-1, 2 SHA-256), a chunk count,
+// the number of base files (0 -- incremental chains are not read), the
+// number of packs; then a table of chunks by four-letter id and offset.
+// PNAM lists the pack names, OIDF and OIDL are the fan-out and the sorted
+// object names, OOFF gives each object's pack and offset (offsets past
+// 2 GiB in LOFF), and an optional RIDX orders the objects as a bitmap
+// would. A checksum of everything before it ends the file.
+import sha1
+import crypto_hash
+
+type MidxEntry = {
+    name: bytes,
+    pack: i64,
+    offset: i64,
+}
+
+type Midx = {
+    version: i64,
+    hash_id: i64,
+    chunks: [str],
+    packs: [str],
+    entries: [MidxEntry],
+    reverse: [i64],
+}
+
+type MidxError =
+    | BadMagic
+    | BadVersion(found: i64)
+    | Truncated
+    | MissingChunk(id: str)
+    | Incremental
+    | BadChecksum
+    | BadOffset(entry: i64)
+
+fn u32(b: bytes, at: i64) -> i64 {
+    b.at(at).shl(24).bit_or(b.at(at + 1).shl(16)).bit_or(b.at(at + 2).shl(8)).bit_or(b.at(at + 3))
+}
+
+fn u64(b: bytes, at: i64) -> i64 {
+    u32(b, at).shl(32).bit_or(u32(b, at + 4))
+}
+
+fn digest(data: bytes, size: i64) -> bytes {
+    if size == 32 { crypto_hash.sha256_of(data) } else { sha1.hash(data) }
+}
+
+/// The chunk table: (id, start, end) for each chunk.
+pub fn chunk_table(data: bytes, at: i64, count: i64, limit: i64) -> [(str, i64, i64)] ! MidxError {
+    var out: [(str, i64, i64)] = []
+    for k in 0..count {
+        let p = at + 12 * k
+        if p + 24 > limit {
+            fail(Truncated)
+        }
+        let start = u64(data, p + 4)
+        let end = u64(data, p + 16)
+        if start > end or end > limit {
+            fail(Truncated)
+        }
+        out.push((data.slice(p, p + 4).to_str(), start, end))
+    }
+    out
+}
+
+fn chunk(table: [(str, i64, i64)], id: str) -> (i64, i64) {
+    for (name, s, e) in table {
+        if name == id {
+            return (s, e)
+        }
+    }
+    (-1, -1)
+}
+
+fn need(table: [(str, i64, i64)], id: str) -> (i64, i64) ! MidxError {
+    let c = chunk(table, id)
+    if c.0 < 0 {
+        fail(MissingChunk(id))
+    }
+    c
+}
+
+fn pack_names(data: bytes, start: i64, end: i64) -> [str] {
+    var out: [str] = []
+    var cur: [i64] = []
+    for k in start..end {
+        if data.at(k) == 0 {
+            if cur.len() > 0 {
+                out.push(bytes_of(cur).to_str())
+            }
+            cur = []
+        } else {
+            cur.push(data.at(k))
+        }
+    }
+    out
+}
+
+pub fn read(data: bytes) -> Midx ! MidxError {
+    if data.len() < 12 {
+        fail(Truncated)
+    }
+    if data.slice(0, 4).to_list() != [77, 73, 68, 88] {
+        fail(BadMagic)
+    }
+    let version = data.at(4)
+    if version != 1 and version != 2 {
+        fail(BadVersion(version))
+    }
+    let hash_id = data.at(5)
+    let h = if hash_id == 2 { 32 } else { 20 }
+    if data.at(7) != 0 {
+        fail(Incremental)
+    }
+    let end = data.len() - h
+    if end < 12 or digest(data.slice(0, end), h).to_list() != data.slice(end, data.len()).to_list() {
+        fail(BadChecksum)
+    }
+    let table = try chunk_table(data, 12, data.at(6), end)
+    let (pn, pe) = try need(table, "PNAM")
+    let (ls, le) = try need(table, "OIDL")
+    let (os, _) = try need(table, "OOFF")
+    let n = (le - ls) / h
+    let (lo, lend) = chunk(table, "LOFF")
+    var entries: [MidxEntry] = []
+    for i in 0..n {
+        var off = u32(data, os + 8 * i + 4)
+        if off.bit_and(2147483648) != 0 {
+            let at = lo + 8 * off.bit_and(2147483647)
+            if lo < 0 or at + 8 > lend {
+                fail(BadOffset(i))
+            }
+            off = u64(data, at)
+        }
+        entries.push(MidxEntry{ name: data.slice(ls + h * i, ls + h * (i + 1)), pack: u32(data, os + 8 * i), offset: off })
+    }
+    var reverse: [i64] = []
+    let (rs, re) = chunk(table, "RIDX")
+    if rs >= 0 {
+        var at = rs
+        while at + 4 <= re {
+            reverse.push(u32(data, at))
+            at = at + 4
+        }
+    }
+    Midx{ version: version, hash_id: hash_id, chunks: table.map(|t| t.0), packs: pack_names(data, pn, pe),
+        entries: entries, reverse: reverse }
+}
+
+fn compare_names(a: bytes, b: bytes) -> i64 {
+    for k in 0..a.len().min(b.len()) {
+        if a.at(k) != b.at(k) {
+            return if a.at(k) < b.at(k) { -1 } else { 1 }
+        }
+    }
+    a.len() - b.len()
+}
+
+pub fn find(m: Midx, name: bytes) -> Option[MidxEntry] {
+    var lo = 0
+    var hi = m.entries.len()
+    while lo < hi {
+        let mid = (lo + hi) / 2
+        let c = compare_names(m.entries[mid].name, name)
+        if c == 0 {
+            return Some(m.entries[mid])
+        }
+        if c < 0 { lo = mid + 1 } else { hi = mid }
+    }
+    None
+}

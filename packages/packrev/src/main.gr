@@ -1,0 +1,88 @@
+// Git's pack reverse index (.rev): the objects of a pack in the order they
+// sit in it, as positions in its .idx -- so `git cat-file --batch-check` can
+// give an object's on-disk size (the gap to the next offset) and bitmaps
+// can number objects, without sorting the index each time.
+//
+// "RIDX", version 1, a hash identifier (1 SHA-1, 2 SHA-256), one 4-byte
+// index position per object, then the pack's checksum and the file's own.
+// `build` makes one from the offsets an .idx lists, which is all git does.
+import sha1
+import crypto_hash
+
+type PackRev = {
+    hash_id: i64,
+    positions: [i64],
+    pack_checksum: bytes,
+}
+
+type PackRevError =
+    | BadMagic
+    | BadVersion(found: i64)
+    | BadHashId(found: i64)
+    | Truncated
+    | BadChecksum
+
+fn u32(b: bytes, at: i64) -> i64 {
+    b.at(at).shl(24).bit_or(b.at(at + 1).shl(16)).bit_or(b.at(at + 2).shl(8)).bit_or(b.at(at + 3))
+}
+
+fn hash_size(id: i64) -> i64 {
+    if id == 2 { 32 } else { 20 }
+}
+
+fn digest(data: bytes, size: i64) -> bytes {
+    if size == 32 { crypto_hash.sha256_of(data) } else { sha1.hash(data) }
+}
+
+pub fn read(data: bytes) -> PackRev ! PackRevError {
+    if data.len() < 12 {
+        fail(Truncated)
+    }
+    if data.slice(0, 4).to_list() != [82, 73, 68, 88] {
+        fail(BadMagic)
+    }
+    if u32(data, 4) != 1 {
+        fail(BadVersion(u32(data, 4)))
+    }
+    let id = u32(data, 8)
+    if id != 1 and id != 2 {
+        fail(BadHashId(id))
+    }
+    let h = hash_size(id)
+    if data.len() < 12 + 2 * h or (data.len() - 12 - 2 * h) % 4 != 0 {
+        fail(Truncated)
+    }
+    let end = data.len() - h
+    if digest(data.slice(0, end), h).to_list() != data.slice(end, data.len()).to_list() {
+        fail(BadChecksum)
+    }
+    var positions: [i64] = []
+    var at = 12
+    while at < end - h {
+        positions.push(u32(data, at))
+        at = at + 4
+    }
+    PackRev{ hash_id: id, positions: positions, pack_checksum: data.slice(end - h, end) }
+}
+
+/// The index positions in pack order, from each object's pack offset in
+/// index order.
+pub fn order(offsets: [i64]) -> [i64] {
+    var idx: [i64] = []
+    for i in 0..offsets.len() {
+        idx.push(i)
+    }
+    idx.sort_by(|i| offsets[i])
+    idx
+}
+
+/// The .rev file for a pack whose .idx lists `offsets`, in index order.
+pub fn build(offsets: [i64], pack_checksum: bytes) -> bytes {
+    let id = if pack_checksum.len() == 32 { 2 } else { 1 }
+    var out: [i64] = [82, 73, 68, 88, 0, 0, 0, 1, 0, 0, 0, id]
+    for p in order(offsets) {
+        out = out + [p.ushr(24).bit_and(255), p.ushr(16).bit_and(255), p.ushr(8).bit_and(255), p.bit_and(255)]
+    }
+    let data = bytes_of(out).concat(pack_checksum)
+    data.concat(digest(data, pack_checksum.len()))
+}

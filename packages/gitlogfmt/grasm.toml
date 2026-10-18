@@ -1,0 +1,13 @@
+[package]
+name = "gitlogfmt"
+version = "1.0.0"
+
+capabilities = []
+
+[dependencies.gitobj]
+path = "../gitobj"
+version = "^1.0.0"
+
+[dependencies.gitdate]
+path = "../gitdate"
+version = "^1.0.0"
