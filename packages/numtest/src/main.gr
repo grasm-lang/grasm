@@ -171,6 +171,12 @@ fn cbits(z: Cplx) -> str {
 fn answer_cx(what: str, a: [i64]) -> str {
     let z = complexnum.make(f(a[0]), f(a[1]))
     let name = what.substr(3, what.len() - 3)
+    if name == "nsqrt" {
+        return cbits(complexnum.sqrt(z))
+    }
+    if name == "nconj" {
+        return cbits(complexnum.conjugate(z)) + "," + cbits(complexnum.negate(z))
+    }
     if name == "polar" {
         let (r, p) = complexfn.polar(z)
         return "{r.to_bits()},{p.to_bits()}"

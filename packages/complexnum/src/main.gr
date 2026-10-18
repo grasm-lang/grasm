@@ -57,12 +57,15 @@ pub fn scale(a: Cplx, by: f64) -> Cplx {
     return Cplx{ re: a.re * by, im: a.im * by }
 }
 
+/// The imaginary part negated -- with `* -1.0`, so that a zero changes
+/// sign as IEEE negation does; `0.0 - x` would leave +0.0 alone and put
+/// the result on the wrong side of a branch cut.
 pub fn conjugate(a: Cplx) -> Cplx {
-    return Cplx{ re: a.re, im: 0.0 - a.im }
+    return Cplx{ re: a.re, im: a.im * -1.0 }
 }
 
 pub fn negate(a: Cplx) -> Cplx {
-    return Cplx{ re: 0.0 - a.re, im: 0.0 - a.im }
+    return Cplx{ re: a.re * -1.0, im: a.im * -1.0 }
 }
 
 /// Division by Smith's method.
@@ -132,7 +135,8 @@ pub fn sqrt(a: Cplx) -> Cplx {
     let r = magnitude(a)
     let re = ((r + a.re) / 2.0).sqrt()
     var im = ((r - a.re) / 2.0).sqrt()
-    if a.im < 0.0 {
+    // The sign bit, not `< 0.0`: sqrt(-1 - 0i) is -i, as C99 and cmath say.
+    if a.im.to_bits() < 0 {
         im = 0.0 - im
     }
     return Cplx{ re: re, im: im }

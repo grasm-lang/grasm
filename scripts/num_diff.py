@@ -518,6 +518,18 @@ for _ in range(110):
               (lambda w: lambda got: None if close_c(got, w) else f"want {w!r}")(cmath.rect(abs(z.real), z.imag)))
 
 
+# complexnum itself: signs of zero must survive conjugation and negation,
+# and its square root must take the branch cut from the zero's sign.
+for re_, im_ in [(-1.0, 0.0), (-1.0, -0.0), (-4.0, -0.0), (2.0, -0.0), (0.0, -0.0), (-0.0, 0.0), (3.0, 4.0), (-3.0, -4.0)] * 15:
+    z = complex(re_, im_)
+    exact = f"{bits(z.real)},{bits(-z.imag)},{bits(-z.real)},{bits(-z.imag)}"
+    add("cx.nconj", [bits(z.real), bits(z.imag)], exact)
+    if z != 0:
+        add_check("cx.nsqrt", [bits(z.real), bits(z.imag)],
+                  (lambda w: lambda got: None if close_c(got, w) and (dbl(int(got.split(",")[1])) < 0) == (w.imag < 0)
+                   else f"want {w!r}")(cmath.sqrt(z)))
+
+
 def run(picked):
     argv = []
     for op, a, b, _ in picked:
