@@ -1,0 +1,105 @@
+// Rendezvous hashing (highest random weight, Thaler and Ravishankar, 1996):
+// which of a set of named nodes a key belongs to, such that removing a
+// node moves only that node's keys, and adding one takes keys only for
+// itself.
+//
+// Each node scores each key; the highest score wins. Unlike `jumphash`
+// the nodes are names, any of which can leave, and `ranked` gives the
+// fallback order for replicas. The score is that of dgryski's
+// go-rendezvous with cespare's xxhash, so a Go service and this one agree
+// on placement: XXH64 of the key XORed with XXH64 of the node, through an
+// xorshift and a multiply, compared as unsigned. Ties go to the node added
+// first.
+import xxhash
+
+type Rendezvous = {
+    nodes: [str],
+    hashes: [i64],
+}
+
+pub fn new_rendezvous(nodes: [str]) -> Rendezvous {
+    var r = Rendezvous{ nodes: [], hashes: [] }
+    for n in nodes {
+        add(r, n)
+    }
+    r
+}
+
+pub fn add(inout r: Rendezvous, node: str) {
+    r.nodes.push(node)
+    r.hashes.push(xxhash.xxh64(node.to_bytes(), 0))
+}
+
+/// Removes the node; false when it was not there. The others keep their
+/// order.
+pub fn remove(inout r: Rendezvous, node: str) -> bool {
+    var nodes: [str] = []
+    var hashes: [i64] = []
+    var found = false
+    for i in 0..r.nodes.len() {
+        if r.nodes[i] == node and not found {
+            found = true
+        } else {
+            nodes.push(r.nodes[i])
+            hashes.push(r.hashes[i])
+        }
+    }
+    r.nodes = nodes
+    r.hashes = hashes
+    found
+}
+
+fn score(key_hash: i64, node_hash: i64) -> i64 {
+    var x = key_hash.bit_xor(node_hash)
+    x = x.bit_xor(x.ushr(12))
+    x = x.bit_xor(x.shl(25))
+    x = x.bit_xor(x.ushr(27))
+    xxhash.mul64(x, 2685821657736338717)
+}
+
+/// Unsigned comparison of two 64-bit values held in `i64`.
+fn above(a: i64, b: i64) -> bool {
+    a.bit_xor(-9223372036854775807 - 1) > b.bit_xor(-9223372036854775807 - 1)
+}
+
+/// The node for `key`, or "" with no nodes.
+pub fn lookup(r: Rendezvous, key: str) -> str {
+    if r.nodes.len() == 0 {
+        return ""
+    }
+    let k = xxhash.xxh64(key.to_bytes(), 0)
+    var best = 0
+    var best_score = score(k, r.hashes[0])
+    for i in 1..r.nodes.len() {
+        let s = score(k, r.hashes[i])
+        if above(s, best_score) {
+            best = i
+            best_score = s
+        }
+    }
+    r.nodes[best]
+}
+
+/// Every node, best first: where `key`'s replicas go, in order.
+pub fn ranked(r: Rendezvous, key: str) -> [str] {
+    let k = xxhash.xxh64(key.to_bytes(), 0)
+    var order: [i64] = []
+    for i in 0..r.nodes.len() {
+        var at = order.len()
+        while at > 0 and above(score(k, r.hashes[i]), score(k, r.hashes[order[at - 1]])) {
+            at = at - 1
+        }
+        var next: [i64] = []
+        for j in 0..order.len() {
+            if j == at {
+                next.push(i)
+            }
+            next.push(order[j])
+        }
+        if at == order.len() {
+            next.push(i)
+        }
+        order = next
+    }
+    order.map(|i| r.nodes[i])
+}

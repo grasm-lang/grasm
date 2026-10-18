@@ -1,0 +1,13 @@
+[package]
+name = "jumphash"
+version = "1.0.0"
+
+capabilities = []
+
+[dependencies.fnv]
+path = "../fnv"
+version = "^1.0.0"
+
+[dependencies.xxhash]
+path = "../xxhash"
+version = "^1.0.0"

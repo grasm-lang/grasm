@@ -1,0 +1,155 @@
+// An xor filter (Graf and Lemire, 2020): a static set membership test
+// with no false negatives, about 0.4% false positives, and 9.84 bits a key
+// -- smaller and faster to query than a Bloom filter of the same error.
+//
+// Each key hashes to three slots, one in each third of a table of 8-bit
+// fingerprints, and is a member when the three XOR to its own fingerprint.
+// Building is the clever part: peel keys off slots that only one key
+// touches until none are left, then assign fingerprints in reverse so each
+// key's equation holds. With 1.23 n + 32 slots peeling almost always
+// succeeds; when it does not, a new seed is drawn. The construction is
+// that of Lemire's xorfilter package (murmur64 mixing, SplitMix64 seeds).
+//
+// Static: built once from all its keys. `bloom` and `cuckoo` take keys one
+// at a time. Keys are 64-bit; `key_of` hashes a string to one.
+import fnv
+import xxhash
+
+type Xor8 = {
+    seed: i64,
+    block: i64,
+    fingerprints: bytes,
+}
+
+type XorError =
+    | TooManyAttempts
+
+fn murmur64(x: i64) -> i64 {
+    var h = x.bit_xor(x.ushr(33))
+    h = xxhash.mul64(h, -49064778989728563)
+    h = h.bit_xor(h.ushr(33))
+    h = xxhash.mul64(h, -4265267296055464877)
+    h.bit_xor(h.ushr(33))
+}
+
+fn splitmix(state: i64) -> i64 {
+    var z = state
+    z = xxhash.mul64(z.bit_xor(z.ushr(30)), -4658895280553007687)
+    z = xxhash.mul64(z.bit_xor(z.ushr(27)), -7723592293110705685)
+    z.bit_xor(z.ushr(31))
+}
+
+fn reduce(hash: i64, n: i64) -> i64 {
+    (hash.bit_and(4294967295) * n).ushr(32)
+}
+
+fn rotl(x: i64, n: i64) -> i64 {
+    x.shl(n).bit_or(x.ushr(64 - n))
+}
+
+/// The three slots a hash lands in.
+fn slots(hash: i64, block: i64) -> [i64] {
+    [reduce(hash, block), reduce(rotl(hash, 21), block) + block, reduce(rotl(hash, 42), block) + 2 * block]
+}
+
+fn fingerprint(hash: i64) -> i64 {
+    hash.bit_xor(hash.ushr(32)).bit_and(255)
+}
+
+pub fn key_of(s: str) -> i64 {
+    fnv.fnv64a(s.to_bytes())
+}
+
+fn distinct(keys: [i64]) -> [i64] {
+    var sorted = keys
+    sorted.sort()
+    var out: [i64] = []
+    for k in sorted {
+        if out.len() == 0 or out[out.len() - 1] != k {
+            out.push(k)
+        }
+    }
+    out
+}
+
+/// Peels the keys under one seed: the (hash, slot) order to assign in, or
+/// an empty list when some key could not be peeled.
+fn peel(keys: [i64], seed: i64, block: i64) -> [(i64, i64)] {
+    var count: [i64] = []
+    var xors: [i64] = []
+    for _i in 0..3 * block {
+        count.push(0)
+        xors.push(0)
+    }
+    for k in keys {
+        let h = murmur64(xxhash.add64(k, seed))
+        for s in slots(h, block) {
+            count[s] = count[s] + 1
+            xors[s] = xors[s].bit_xor(h)
+        }
+    }
+    var queue: [i64] = []
+    for s in 0..3 * block {
+        if count[s] == 1 {
+            queue.push(s)
+        }
+    }
+    var order: [(i64, i64)] = []
+    while queue.len() > 0 {
+        let s = queue.pop() ?? 0
+        if count[s] != 1 {
+            continue
+        }
+        let h = xors[s]
+        order.push((h, s))
+        for t in slots(h, block) {
+            count[t] = count[t] - 1
+            xors[t] = xors[t].bit_xor(h)
+            if count[t] == 1 {
+                queue.push(t)
+            }
+        }
+    }
+    if order.len() == keys.len() { order } else { [] }
+}
+
+/// The filter for `keys`; repeated keys count once.
+pub fn new_xor8(keys: [i64]) -> Xor8 ! XorError {
+    let unique = distinct(keys)
+    let capacity = (32 + (1.23 * unique.len().as_f64()).ceil().as_i64()) / 3 * 3
+    let block = capacity / 3
+    var state = 1
+    for _attempt in 0..100 {
+        state = xxhash.add64(state, -7046029254386353131)
+        let seed = splitmix(state)
+        let order = peel(unique, seed, block)
+        if order.len() == unique.len() {
+            var fp = bytes_filled(capacity, 0)
+            var i = order.len() - 1
+            while i >= 0 {
+                let (h, s) = order[i]
+                var v = fingerprint(h)
+                for t in slots(h, block) {
+                    v = v.bit_xor(fp.at(t))
+                }
+                fp.set(s, v)
+                i = i - 1
+            }
+            return Xor8{ seed: seed, block: block, fingerprints: fp }
+        }
+    }
+    fail(TooManyAttempts)
+}
+
+pub fn contains(f: Xor8, key: i64) -> bool {
+    let h = murmur64(xxhash.add64(key, f.seed))
+    var v = fingerprint(h)
+    for s in slots(h, f.block) {
+        v = v.bit_xor(f.fingerprints.at(s))
+    }
+    v == 0
+}
+
+pub fn size_in_bytes(f: Xor8) -> i64 {
+    f.fingerprints.len()
+}

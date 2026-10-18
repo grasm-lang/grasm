@@ -1,0 +1,152 @@
+// An adaptive replacement cache (ARC; Megiddo and Modha, 2003).
+//
+// LRU keeps what was used recently and LFU what was used often; which is
+// right depends on the workload, and the workload changes. ARC keeps two
+// lists of cached keys -- T1, seen once recently, and T2, seen at least
+// twice -- and two ghost lists, B1 and B2, of keys recently evicted from
+// each, without their values. A miss that hits a ghost says the matching
+// list was too short, and the target size p of T1 moves toward it. ZFS
+// and IBM's storage controllers cache with it.
+//
+// The algorithm is the paper's, cases I to IV, with p an integer and its
+// steps rounded down. Lists are kept least recent first; each operation
+// is O(capacity), which at the sizes a cache in one process has is less
+// than the bookkeeping an O(1) version would cost here. A read that
+// misses changes nothing; only `set` brings a key in.
+
+type ArcCache[V] = {
+    capacity: i64,
+    p: i64,
+    t1: [str],
+    t2: [str],
+    b1: [str],
+    b2: [str],
+    values: Map[str, V],
+}
+
+type ArcLists = {
+    t1: [str],
+    t2: [str],
+    b1: [str],
+    b2: [str],
+    p: i64,
+}
+
+pub fn new_arc[V](capacity: i64) -> ArcCache[V] {
+    ArcCache{ capacity: capacity.max(1), p: 0, t1: [], t2: [], b1: [], b2: [], values: {} }
+}
+
+pub fn len[V](c: ArcCache[V]) -> i64 {
+    c.t1.len() + c.t2.len()
+}
+
+fn without(list: [str], key: str) -> [str] {
+    var out: [str] = []
+    for k in list {
+        if k != key {
+            out.push(k)
+        }
+    }
+    out
+}
+
+fn holds(list: [str], key: str) -> bool {
+    for k in list {
+        if k == key {
+            return true
+        }
+    }
+    false
+}
+
+fn rest(list: [str]) -> [str] {
+    list.slice(1, list.len())
+}
+
+/// Evicts one cached key into its ghost list, from T1 or T2 as p says.
+fn replace[V](inout c: ArcCache[V], hit_b2: bool) -> str {
+    let t1 = c.t1.len()
+    if t1 >= 1 and ((hit_b2 and t1 == c.p) or t1 > c.p) {
+        let victim = c.t1[0]
+        c.t1 = rest(c.t1)
+        c.b1.push(victim)
+        c.values.delete(victim)
+        return victim
+    }
+    let victim = c.t2[0]
+    c.t2 = rest(c.t2)
+    c.b2.push(victim)
+    c.values.delete(victim)
+    victim
+}
+
+/// The value under `key`; a hit moves it to the frequent list.
+pub fn get[V](inout c: ArcCache[V], key: str) -> Option[V] {
+    let found = c.values.get(key)
+    if found != None {
+        c.t1 = without(c.t1, key)
+        c.t2 = without(c.t2, key)
+        c.t2.push(key)
+    }
+    found
+}
+
+fn admit_ghost[V](inout c: ArcCache[V], key: str, value: V, from_b2: bool) -> Option[str] {
+    let n1 = c.b1.len()
+    let n2 = c.b2.len()
+    if from_b2 {
+        let step = if n2 >= n1 { 1 } else { n1 / n2 }
+        c.p = (c.p - step).max(0)
+    } else {
+        let step = if n1 >= n2 { 1 } else { n2 / n1 }
+        c.p = (c.p + step).min(c.capacity)
+    }
+    let evicted = replace(c, from_b2)
+    if from_b2 { c.b2 = without(c.b2, key) } else { c.b1 = without(c.b1, key) }
+    c.t2.push(key)
+    c.values.set(key, value)
+    Some(evicted)
+}
+
+/// Stores `value` under `key`; the cached key evicted to make room, if any.
+pub fn set[V](inout c: ArcCache[V], key: str, value: V) -> Option[str] {
+    if c.values.get(key) != None {
+        c.values.set(key, value)
+        c.t1 = without(c.t1, key)
+        c.t2 = without(c.t2, key)
+        c.t2.push(key)
+        return None
+    }
+    if holds(c.b1, key) {
+        return admit_ghost(c, key, value, false)
+    }
+    if holds(c.b2, key) {
+        return admit_ghost(c, key, value, true)
+    }
+    var evicted: Option[str] = None
+    let total = c.t1.len() + c.t2.len() + c.b1.len() + c.b2.len()
+    if c.t1.len() + c.b1.len() == c.capacity {
+        if c.t1.len() < c.capacity {
+            c.b1 = rest(c.b1)
+            evicted = Some(replace(c, false))
+        } else {
+            let victim = c.t1[0]
+            c.t1 = rest(c.t1)
+            c.values.delete(victim)
+            evicted = Some(victim)
+        }
+    } else if total >= c.capacity {
+        if total == 2 * c.capacity {
+            c.b2 = rest(c.b2)
+        }
+        evicted = Some(replace(c, false))
+    }
+    c.t1.push(key)
+    c.values.set(key, value)
+    evicted
+}
+
+/// The four lists, least recent first, and the target size of T1.
+pub fn lists[V](c: ArcCache[V]) -> ArcLists {
+    ArcLists{ t1: c.t1, t2: c.t2, b1: c.b1, b2: c.b2, p: c.p }
+}

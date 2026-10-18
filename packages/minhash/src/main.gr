@@ -1,0 +1,142 @@
+// MinHash (Broder, 1997): a short signature of a set such that the share
+// of positions where two signatures agree estimates how much the sets
+// overlap (their Jaccard similarity) -- without the sets.
+//
+// It is how near-duplicate web pages, documents and code are found at
+// scale; with locality-sensitive banding, similar sets land in the same
+// bucket and the rest are never compared. `similarity` computes Jaccard
+// exactly from the sets; this estimates it from a fixed-size summary.
+//
+// Elements are hashed with FNV-1a 64 and reduced modulo the Mersenne prime
+// p = 2^31 - 1; signature position i is the minimum of (a_i x + b_i) mod p
+// over the set, with a_i and b_i drawn from a SplitMix64 stream from the
+// seed. Everything is exact integer arithmetic, so a signature is the same
+// on every machine. The error of the estimate is about 1/sqrt(k) for k
+// positions.
+import fnv
+
+type MinHasher = {
+    a: [i64],
+    b: [i64],
+}
+
+fn prime() -> i64 {
+    2147483647
+}
+
+/// SplitMix64's output for state `s`, reduced to 1..p (for a) or 0..p.
+fn mix(s: i64) -> i64 {
+    var z = s
+    z = z.bit_xor(z.ushr(30))
+    z = mul_wrap(z, -4658895280553007687)
+    z = z.bit_xor(z.ushr(27))
+    z = mul_wrap(z, -7723592293110705685)
+    z.bit_xor(z.ushr(31))
+}
+
+/// Addition modulo 2^64 from 32-bit halves, so nothing overflows. The
+/// SplitMix64 increment 0x9E3779B97F4A7C15 is -7046029254386353131 here.
+fn add_wrap(a: i64, b: i64) -> i64 {
+    let low = a.bit_and(4294967295) + b.bit_and(4294967295)
+    let high = a.ushr(32) + b.ushr(32) + low.ushr(32)
+    high.shl(32).bit_or(low.bit_and(4294967295))
+}
+
+/// Multiplication modulo 2^64 from 32-bit pieces, so nothing overflows.
+fn mul_wrap(a: i64, b: i64) -> i64 {
+    let al = a.bit_and(4294967295)
+    let ah = a.ushr(32)
+    let bl = b.bit_and(4294967295)
+    let bh = b.ushr(32)
+    let lo = mul32_wide(al, bl)
+    let cross = (mul32(ah, bl) + mul32(al, bh)).bit_and(4294967295)
+    lo.0.bit_or((lo.1 + cross).bit_and(4294967295).shl(32))
+}
+
+fn mul32(a: i64, b: i64) -> i64 {
+    let a0 = a.bit_and(65535)
+    let a1 = a.ushr(16).bit_and(65535)
+    let b0 = b.bit_and(65535)
+    let b1 = b.ushr(16).bit_and(65535)
+    (a0 * b0 + ((a1 * b0 + a0 * b1).bit_and(65535)).shl(16)).bit_and(4294967295)
+}
+
+/// The full product of two 32-bit values as (low 32 bits, high 32 bits).
+fn mul32_wide(a: i64, b: i64) -> (i64, i64) {
+    let a0 = a.bit_and(65535)
+    let a1 = a.ushr(16)
+    let b0 = b.bit_and(65535)
+    let b1 = b.ushr(16)
+    let mid = a1 * b0 + a0 * b1
+    let t = a0 * b0 + mid.bit_and(65535).shl(16)
+    (t.bit_and(4294967295), (a1 * b1 + mid.ushr(16) + t.ushr(32)).bit_and(4294967295))
+}
+
+/// A hasher with `k` positions, its functions drawn from `seed`.
+pub fn new_minhasher(k: i64, seed: i64) -> MinHasher {
+    var a: [i64] = []
+    var b: [i64] = []
+    var state = seed
+    for _i in 0..k {
+        state = add_wrap(state, -7046029254386353131)
+        a.push(1 + mix(state).ushr(1) % (prime() - 1))
+        state = add_wrap(state, -7046029254386353131)
+        b.push(mix(state).ushr(1) % prime())
+    }
+    MinHasher{ a: a, b: b }
+}
+
+pub fn element_hash(element: str) -> i64 {
+    fnv.fnv64a(element.to_bytes()).ushr(1) % prime()
+}
+
+/// The signature of a set of strings. An empty set's signature is every
+/// position at p, larger than any real minimum.
+pub fn signature(h: MinHasher, elements: [str]) -> [i64] {
+    var sig: [i64] = []
+    for _i in 0..h.a.len() {
+        sig.push(prime())
+    }
+    for e in elements {
+        let x = element_hash(e)
+        for i in 0..h.a.len() {
+            let v = (h.a[i] * x + h.b[i]) % prime()
+            if v < sig[i] {
+                sig[i] = v
+            }
+        }
+    }
+    sig
+}
+
+/// The estimated Jaccard similarity: the share of positions that agree.
+pub fn estimate(a: [i64], b: [i64]) -> f64 {
+    if a.len() == 0 or a.len() != b.len() {
+        return 0.0
+    }
+    var same = 0
+    for i in 0..a.len() {
+        if a[i] == b[i] {
+            same = same + 1
+        }
+    }
+    same.as_f64() / a.len().as_f64()
+}
+
+/// Locality-sensitive banding: the signature cut into `bands` bands of
+/// `rows` positions, each hashed with FNV-1a 64. Two sets sharing any band
+/// hash are candidates to compare.
+pub fn band_hashes(sig: [i64], bands: i64, rows: i64) -> [i64] {
+    var out: [i64] = []
+    for band in 0..bands {
+        var parts: [str] = []
+        for r in 0..rows {
+            let at = band * rows + r
+            if at < sig.len() {
+                parts.push("{sig[at]}")
+            }
+        }
+        out.push(fnv.fnv64a("{band}:".to_bytes().concat(parts.join(",").to_bytes())))
+    }
+    out
+}

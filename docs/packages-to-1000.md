@@ -240,6 +240,19 @@ day its reference is installed.
 
 ## Landed
 
+- [x] **B21, second part** — `lfu` `arccache` `jumphash` `rendezvous`
+  `minhash` `xorfilter` `quotientfilter`, with the harness `dstest2`; the
+  new gate `ds2diff` runs 1,190 cases: the caches against Python models,
+  `jumphash` against the paper's loop, `rendezvous` against
+  dgryski/go-rendezvous and cespare/xxhash built offline from the module
+  cache (`scripts/lib/gomods`), `minhash` against its hash family and the
+  true Jaccard similarity, `xorfilter` by its guarantees (no member
+  missed; 189 of 45,000 strangers let in, against 1 in 256 expected), and
+  `quotientfilter` against a multiset of fingerprints. One break in each
+  package turned all seven families red. go-rendezvous's own `Remove`
+  indexes one past the end of its slice, so only `New` and `Lookup` are
+  used as the reference.
+
 - [x] **B21, first part** — `fenwick` `segtree` `intervaltree`
   `rankselect` `wavelet` `sparseset` `slotmap` `timerwheel`, with the
   harness `dstest`; the new gate `dsdiff` runs 1,860 random scripts of
@@ -349,7 +362,7 @@ day its reference is installed.
 | | |
 |---|---|
 | At the start | 669 |
-| Now | 755 |
+| Now | 763 |
 | Candidates above | 313 packages in 28 batches, plus `ecc`, `rfc6979` and `goprintf` |
 | Harnesses, one a batch | 28 |
 | If every candidate lands | 1013 |

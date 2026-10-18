@@ -1,0 +1,34 @@
+// Jump consistent hashing (Lamping and Veach, 2014): which of n buckets a
+// key belongs in, such that growing to n + 1 buckets moves only 1/(n + 1)
+// of the keys -- and every one of those to the new bucket.
+//
+// No ring, no table, no memory: a loop of about ln n steps per lookup.
+// It is what shards a cache or a database across a numbered set of
+// servers, when servers are added at the end and none leaves from the
+// middle (for that, `rendezvous`). The loop is the paper's, step for
+// step: a 64-bit linear congruential generator, and a jump computed in
+// double precision.
+import fnv
+import xxhash
+
+/// The bucket, 0..buckets, for a 64-bit key. Fewer than one bucket is -1.
+pub fn bucket(key: i64, buckets: i64) -> i64 {
+    if buckets < 1 {
+        return -1
+    }
+    var k = key
+    var b = -1
+    var j = 0
+    while j < buckets {
+        b = j
+        k = xxhash.add64(xxhash.mul64(k, 2862933555777941757), 1)
+        let r = k.ushr(33) + 1
+        j = ((b + 1).as_f64() * (2147483648.0 / r.as_f64())).as_i64()
+    }
+    b
+}
+
+/// The bucket for a string key, hashed with FNV-1a 64 first.
+pub fn bucket_of(key: str, buckets: i64) -> i64 {
+    bucket(fnv.fnv64a(key.to_bytes()), buckets)
+}

@@ -1,0 +1,65 @@
+// Caches, consistent hashing, MinHash and filters, on inputs small enough
+// to follow. scripts/ds2_diff.sh holds them to Python models, Go and their
+// guarantees on thousands of cases.
+import lfu
+import arccache
+import jumphash
+import rendezvous
+import minhash
+import xorfilter
+import quotientfilter
+
+fn main() / {io} {
+    // "a" is read twice; a scan of new keys evicts "b" and "c", not "a".
+    var c: LfuCache[i64] = lfu.new_lfu(2)
+    let _ = lfu.set(c, "a", 1)
+    let _ = lfu.get(c, "a")
+    let _ = lfu.set(c, "b", 2)
+    assert_eq(lfu.set(c, "c", 3), Some("b"))
+    assert_eq(lfu.set(c, "d", 4), Some("c"))
+    assert_eq(lfu.get(c, "a"), Some(1))
+
+    // A key read twice moves to ARC's frequent list.
+    var arc: ArcCache[i64] = arccache.new_arc(2)
+    let _ = arccache.set(arc, "x", 1)
+    let _ = arccache.get(arc, "x")
+    assert_eq(arccache.lists(arc).t2, ["x"])
+
+    // The paper's property: from n to n + 1 buckets a key stays or moves
+    // to the new bucket.
+    for key in [1, 99, 123456789, -5] {
+        let before = jumphash.bucket(key, 10)
+        let after = jumphash.bucket(key, 11)
+        assert_eq(after == before or after == 10, true)
+    }
+
+    // Removing a node moves only its own keys.
+    let ring = rendezvous.new_rendezvous(["a", "b", "c"])
+    var smaller = ring
+    let gone = rendezvous.lookup(ring, "user:42")
+    let _ = rendezvous.remove(smaller, gone)
+    assert_eq(rendezvous.lookup(smaller, "user:42") == rendezvous.ranked(ring, "user:42")[1], true)
+
+    let h = minhash.new_minhasher(128, 1)
+    let s = minhash.signature(h, ["the", "quick", "brown", "fox"])
+    assert_eq(minhash.estimate(s, s), 1.0)
+
+    match xorfilter.new_xor8([10, 20, 30]) {
+        Ok(f) -> assert_eq(xorfilter.contains(f, 20), true)
+        Err(_) -> panic("three keys did not build")
+    }
+
+    match quotientfilter.new_quotient_filter(4, 8) {
+        Ok(start) -> {
+            var qf = start
+            assert_eq(quotientfilter.insert(qf, 7), true)
+            assert_eq(quotientfilter.insert(qf, 7), true)
+            assert_eq(quotientfilter.remove(qf, 7), true)
+            assert_eq(quotientfilter.contains(qf, 7), true)
+            assert_eq(quotientfilter.remove(qf, 7), true)
+            assert_eq(quotientfilter.contains(qf, 7), false)
+        }
+        Err(_) -> panic("a valid size was refused")
+    }
+    print("ds2: ok")
+}

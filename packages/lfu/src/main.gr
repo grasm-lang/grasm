@@ -1,0 +1,194 @@
+// A least-frequently-used cache, every operation O(1) (Shah, Mitra and
+// Matani, 2010).
+//
+// `lru` evicts what was used longest ago, which a one-off scan through
+// more keys than fit flushes completely. This evicts what was used least
+// often, and among those, longest ago: a key read a hundred times survives
+// a scan of a thousand keys read once. It suits content with a stable
+// popularity -- CDN objects, compiled templates, DNS answers.
+//
+// Keys sharing a use count live in one bucket, buckets in a list by count,
+// keys in each bucket by when they last arrived there. A hit moves a key
+// to the next bucket up, creating it when missing and dropping the old one
+// when empty; eviction takes the first key of the first bucket. Nodes and
+// buckets are parallel arrays reused through free lists. Storing a value
+// under a key already present counts as a use.
+
+type LfuCache[V] = {
+    capacity: i64,
+    index: Map[str, i64],
+    keys: [str],
+    values: [V],
+    bucket_of: [i64],
+    prev: [i64],
+    next: [i64],
+    free_nodes: [i64],
+    freq: [i64],
+    head: [i64],
+    tail: [i64],
+    bprev: [i64],
+    bnext: [i64],
+    free_buckets: [i64],
+    first: i64,
+}
+
+/// A cache of at most `capacity` keys (at least one).
+pub fn new_lfu[V](capacity: i64) -> LfuCache[V] {
+    LfuCache{ capacity: capacity.max(1), index: {}, keys: [], values: [], bucket_of: [], prev: [], next: [],
+        free_nodes: [], freq: [], head: [], tail: [], bprev: [], bnext: [], free_buckets: [], first: -1 }
+}
+
+pub fn len[V](c: LfuCache[V]) -> i64 {
+    c.index.len()
+}
+
+/// A bucket for `count` uses, linked after `after` (-1: at the front).
+fn new_bucket[V](inout c: LfuCache[V], count: i64, after: i64) -> i64 {
+    var b = -1
+    if c.free_buckets.len() > 0 {
+        b = c.free_buckets.pop() ?? 0
+        c.freq[b] = count
+    } else {
+        c.freq.push(count)
+        c.head.push(-1)
+        c.tail.push(-1)
+        c.bprev.push(-1)
+        c.bnext.push(-1)
+        b = c.freq.len() - 1
+    }
+    c.head[b] = -1
+    c.tail[b] = -1
+    let following = if after == -1 { c.first } else { c.bnext[after] }
+    c.bprev[b] = after
+    c.bnext[b] = following
+    if following != -1 {
+        c.bprev[following] = b
+    }
+    if after == -1 { c.first = b } else { c.bnext[after] = b }
+    b
+}
+
+fn drop_bucket[V](inout c: LfuCache[V], b: i64) {
+    let p = c.bprev[b]
+    let n = c.bnext[b]
+    if p == -1 { c.first = n } else { c.bnext[p] = n }
+    if n != -1 {
+        c.bprev[n] = p
+    }
+    c.free_buckets.push(b)
+}
+
+fn unlink[V](inout c: LfuCache[V], n: i64) {
+    let b = c.bucket_of[n]
+    let p = c.prev[n]
+    let q = c.next[n]
+    if p == -1 { c.head[b] = q } else { c.next[p] = q }
+    if q == -1 { c.tail[b] = p } else { c.prev[q] = p }
+    if c.head[b] == -1 {
+        drop_bucket(c, b)
+    }
+}
+
+fn append[V](inout c: LfuCache[V], n: i64, b: i64) {
+    c.bucket_of[n] = b
+    c.prev[n] = c.tail[b]
+    c.next[n] = -1
+    if c.tail[b] == -1 { c.head[b] = n } else { c.next[c.tail[b]] = n }
+    c.tail[b] = n
+}
+
+fn touch[V](inout c: LfuCache[V], n: i64) {
+    let b = c.bucket_of[n]
+    let up = c.bnext[b]
+    let target = if up != -1 and c.freq[up] == c.freq[b] + 1 { up } else { new_bucket(c, c.freq[b] + 1, b) }
+    unlink(c, n)
+    append(c, n, target)
+}
+
+fn evict[V](inout c: LfuCache[V]) -> str {
+    let n = c.head[c.first]
+    let key = c.keys[n]
+    unlink(c, n)
+    c.index.delete(key)
+    c.free_nodes.push(n)
+    key
+}
+
+/// The value under `key`, counting a use.
+pub fn get[V](inout c: LfuCache[V], key: str) -> Option[V] {
+    match c.index.get(key) {
+        None -> None
+        Some(n) -> {
+            touch(c, n)
+            Some(c.values[n])
+        }
+    }
+}
+
+/// Stores `value` under `key`; the key evicted to make room, if any.
+pub fn set[V](inout c: LfuCache[V], key: str, value: V) -> Option[str] {
+    match c.index.get(key) {
+        Some(n) -> {
+            c.values[n] = value
+            touch(c, n)
+            return None
+        }
+        None -> {}
+    }
+    var evicted: Option[str] = None
+    if c.index.len() >= c.capacity {
+        evicted = Some(evict(c))
+    }
+    var n = -1
+    if c.free_nodes.len() > 0 {
+        n = c.free_nodes.pop() ?? 0
+        c.keys[n] = key
+        c.values[n] = value
+    } else {
+        c.keys.push(key)
+        c.values.push(value)
+        c.bucket_of.push(-1)
+        c.prev.push(-1)
+        c.next.push(-1)
+        n = c.keys.len() - 1
+    }
+    let b = if c.first != -1 and c.freq[c.first] == 1 { c.first } else { new_bucket(c, 1, -1) }
+    append(c, n, b)
+    c.index.set(key, n)
+    evicted
+}
+
+pub fn remove[V](inout c: LfuCache[V], key: str) -> bool {
+    match c.index.get(key) {
+        None -> false
+        Some(n) -> {
+            unlink(c, n)
+            c.index.delete(key)
+            c.free_nodes.push(n)
+            true
+        }
+    }
+}
+
+/// How many times `key` has been used since it was stored; 0 when absent.
+pub fn frequency[V](c: LfuCache[V], key: str) -> i64 {
+    match c.index.get(key) {
+        None -> 0
+        Some(n) -> c.freq[c.bucket_of[n]]
+    }
+}
+
+/// The keys in the order they would be evicted.
+pub fn eviction_order[V](c: LfuCache[V]) -> [str] {
+    var out: [str] = []
+    var b = c.first
+    while b != -1 {
+        var n = c.head[b]
+        while n != -1 {
+            out.push(c.keys[n])
+            n = c.next[n]
+        }
+        b = c.bnext[b]
+    }
+    out
+}

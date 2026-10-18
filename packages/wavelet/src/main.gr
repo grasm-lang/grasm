@@ -1,4 +1,4 @@
-// A wavelet matrix (Claude, Navarro and Ordonez, 2012): a sequence of
+// A wavelet matrix ("The Wavelet Matrix", SPIRE 2012): a sequence of
 // integers that answers, in O(log of the largest value) and without
 // scanning, what is at position i, how often a value occurs before i,
 // where its k-th occurrence is, the k-th smallest value in a range, and

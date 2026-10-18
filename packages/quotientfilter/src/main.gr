@@ -1,0 +1,236 @@
+// A quotient filter (Bender et al., 2012): approximate set membership that,
+// unlike a Bloom filter, supports deletion, counts duplicates, and keeps
+// its entries in one table it scans in order.
+//
+// Each key becomes a p-bit fingerprint; its top q bits (the quotient) name
+// a slot, its low r bits (the remainder) are stored. A remainder lands in
+// its slot or, when that is taken, in the next free one after the entries
+// before it, and three bits per slot -- occupied, continuation, shifted --
+// let a reader rebuild which quotient each stored remainder belongs to.
+// Answers are exact for fingerprints: a false positive is two keys with
+// the same p bits, with probability about n / 2^p.
+//
+// A change rebuilds the cluster it touches (the run of filled slots around
+// the quotient) rather than shifting slot by slot, and merges a following
+// cluster that the change runs into. Clusters stay short below about 75%
+// load. A fourth bit marks a slot as in use, which keeps the rules plain.
+// The table holds at most 2^q - 1 fingerprints, so one slot is always free
+// and a cluster never wraps onto itself.
+import xxhash
+
+type QuotientFilter = {
+    qbits: i64,
+    rbits: i64,
+    remainder: [i64],
+    occupied: [bool],
+    continuation: [bool],
+    shifted: [bool],
+    used: [bool],
+    count: i64,
+}
+
+type QuotientError =
+    | BadSize(qbits: i64, rbits: i64)
+
+pub fn new_quotient_filter(qbits: i64, rbits: i64) -> QuotientFilter ! QuotientError {
+    if qbits < 1 or rbits < 1 or qbits > 30 or qbits + rbits > 62 {
+        fail(BadSize(qbits, rbits))
+    }
+    let m = 1.shl(qbits)
+    var rem: [i64] = []
+    var flags: [bool] = []
+    for _i in 0..m {
+        rem.push(0)
+        flags.push(false)
+    }
+    QuotientFilter{ qbits: qbits, rbits: rbits, remainder: rem, occupied: flags, continuation: flags,
+        shifted: flags, used: flags, count: 0 }
+}
+
+pub fn len(f: QuotientFilter) -> i64 {
+    f.count
+}
+
+pub fn capacity(f: QuotientFilter) -> i64 {
+    1.shl(f.qbits) - 1
+}
+
+/// The key's fingerprint: murmur64's finaliser, cut to q + r bits.
+pub fn fingerprint(f: QuotientFilter, key: i64) -> i64 {
+    var h = key.bit_xor(key.ushr(33))
+    h = xxhash.mul64(h, -49064778989728563)
+    h = h.bit_xor(h.ushr(33))
+    h = xxhash.mul64(h, -4265267296055464877)
+    h = h.bit_xor(h.ushr(33))
+    h.bit_and(1.shl(f.qbits + f.rbits) - 1)
+}
+
+fn slot(f: QuotientFilter, v: i64) -> i64 {
+    v.bit_and(1.shl(f.qbits) - 1)
+}
+
+/// The first slot of the cluster holding slot `q`, as a virtual position
+/// no greater than q.
+fn cluster_start(f: QuotientFilter, q: i64) -> i64 {
+    var v = q
+    var steps = 0
+    while f.shifted[slot(f, v)] and steps < f.remainder.len() {
+        v = v - 1
+        steps = steps + 1
+    }
+    v
+}
+
+/// The entries stored from virtual position `v0` up to the next empty
+/// slot, as (virtual quotient, remainder) in order, and that empty slot.
+fn decode(f: QuotientFilter, v0: i64) -> ([(i64, i64)], i64) {
+    var out: [(i64, i64)] = []
+    var v = v0
+    var quotient = v0
+    while f.used[slot(f, v)] and out.len() < f.remainder.len() {
+        if v != v0 and not f.continuation[slot(f, v)] {
+            quotient = quotient + 1
+            while not f.occupied[slot(f, quotient)] {
+                quotient = quotient + 1
+            }
+        }
+        out.push((quotient, f.remainder[slot(f, v)]))
+        v = v + 1
+    }
+    (out, v)
+}
+
+fn last_position(entries: [(i64, i64)], start: i64) -> i64 {
+    var pos = start - 1
+    for (q, _) in entries {
+        pos = q.max(pos + 1)
+    }
+    pos
+}
+
+/// Clears virtual positions start..end and writes `entries` back from
+/// `start`, fixing the occupied bits of the quotients involved.
+fn rewrite(inout f: QuotientFilter, start: i64, end: i64, old: [(i64, i64)], entries: [(i64, i64)]) {
+    for (q, _) in old {
+        f.occupied[slot(f, q)] = false
+    }
+    for v in start..end {
+        let s = slot(f, v)
+        f.used[s] = false
+        f.continuation[s] = false
+        f.shifted[s] = false
+    }
+    var pos = start - 1
+    for i in 0..entries.len() {
+        let (q, r) = entries[i]
+        pos = q.max(pos + 1)
+        let s = slot(f, pos)
+        f.used[s] = true
+        f.remainder[s] = r
+        f.shifted[s] = pos != q
+        f.continuation[s] = i > 0 and entries[i - 1].0 == q
+        f.occupied[slot(f, q)] = true
+    }
+}
+
+fn split(f: QuotientFilter, fp: i64) -> (i64, i64) {
+    (fp.ushr(f.rbits), fp.bit_and(1.shl(f.rbits) - 1))
+}
+
+/// The virtual quotient of `q` seen from a cluster starting at `start`.
+fn virtual_quotient(f: QuotientFilter, q: i64, start: i64) -> i64 {
+    let m = 1.shl(f.qbits)
+    var v = q
+    while v < start {
+        v = v + m
+    }
+    v
+}
+
+pub fn insert_fingerprint(inout f: QuotientFilter, fp: i64) -> bool {
+    if f.count >= capacity(f) {
+        return false
+    }
+    let (q, r) = split(f, fp)
+    let start = cluster_start(f, q)
+    let (found, first_end) = decode(f, start)
+    var old = found
+    var end = first_end
+    let vq = virtual_quotient(f, q, start)
+    var entries: [(i64, i64)] = []
+    var placed = false
+    for e in found {
+        if not placed and (vq < e.0 or (vq == e.0 and r < e.1)) {
+            entries.push((vq, r))
+            placed = true
+        }
+        entries.push(e)
+    }
+    if not placed {
+        entries.push((vq, r))
+    }
+    while last_position(entries, start) >= end and f.used[slot(f, end + 1)] {
+        let (more, next_end) = decode(f, end + 1)
+        entries = entries + more
+        old = old + more
+        end = next_end
+    }
+    rewrite(f, start, end.max(last_position(entries, start) + 1), old, entries)
+    f.count = f.count + 1
+    true
+}
+
+/// Stores the key's fingerprint; false when the filter is full.
+pub fn insert(inout f: QuotientFilter, key: i64) -> bool {
+    insert_fingerprint(f, fingerprint(f, key))
+}
+
+pub fn contains_fingerprint(f: QuotientFilter, fp: i64) -> bool {
+    let (q, r) = split(f, fp)
+    if not f.occupied[q] {
+        return false
+    }
+    let start = cluster_start(f, q)
+    let (entries, _) = decode(f, start)
+    let vq = virtual_quotient(f, q, start)
+    for (eq, er) in entries {
+        if eq == vq and er == r {
+            return true
+        }
+    }
+    false
+}
+
+pub fn contains(f: QuotientFilter, key: i64) -> bool {
+    contains_fingerprint(f, fingerprint(f, key))
+}
+
+pub fn remove_fingerprint(inout f: QuotientFilter, fp: i64) -> bool {
+    let (q, r) = split(f, fp)
+    if not f.occupied[q] {
+        return false
+    }
+    let start = cluster_start(f, q)
+    let (entries, end) = decode(f, start)
+    let vq = virtual_quotient(f, q, start)
+    var kept: [(i64, i64)] = []
+    var removed = false
+    for e in entries {
+        if not removed and e.0 == vq and e.1 == r {
+            removed = true
+        } else {
+            kept.push(e)
+        }
+    }
+    if not removed {
+        return false
+    }
+    rewrite(f, start, end, entries, kept)
+    f.count = f.count - 1
+    true
+}
+
+/// Removes one copy of the key's fingerprint; false when it was not there.
+pub fn remove(inout f: QuotientFilter, key: i64) -> bool {
+    remove_fingerprint(f, fingerprint(f, key))
+}

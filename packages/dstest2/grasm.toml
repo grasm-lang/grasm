@@ -1,0 +1,32 @@
+[package]
+name = "dstest2"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.lfu]
+path = "../lfu"
+version = "^1.0.0"
+
+[dependencies.arccache]
+path = "../arccache"
+version = "^1.0.0"
+
+[dependencies.jumphash]
+path = "../jumphash"
+version = "^1.0.0"
+
+[dependencies.rendezvous]
+path = "../rendezvous"
+version = "^1.0.0"
+
+[dependencies.minhash]
+path = "../minhash"
+version = "^1.0.0"
+
+[dependencies.xorfilter]
+path = "../xorfilter"
+version = "^1.0.0"
+
+[dependencies.quotientfilter]
+path = "../quotientfilter"
+version = "^1.0.0"

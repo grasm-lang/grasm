@@ -1,0 +1,195 @@
+// The Grasm side of scripts/ds2_diff.py: a structure, how to build it,
+// and a script `op arg arg;...` whose answers, space-separated, the driver
+// compares with Python models, go-rendezvous, and the filters' guarantees.
+import lfu
+import arccache
+import jumphash
+import rendezvous
+import minhash
+import xorfilter
+import quotientfilter
+
+fn words(script: str) -> [[str]] {
+    var out: [[str]] = []
+    if script.len() == 0 {
+        return out
+    }
+    for c in script.split(";") {
+        out.push(c.split(" "))
+    }
+    out
+}
+
+fn num(s: str) -> i64 {
+    s.parse_int() ?? 0
+}
+
+fn opt_str(v: Option[str]) -> str {
+    match v {
+        Some(x) -> x
+        None -> "-"
+    }
+}
+
+fn opt_int(v: Option[i64]) -> str {
+    match v {
+        Some(x) -> "{x}"
+        None -> "none"
+    }
+}
+
+fn run_lfu(setup: str, script: str) -> str {
+    var c: LfuCache[i64] = lfu.new_lfu(num(setup))
+    var out: [str] = []
+    for w in words(script) {
+        if w[0] == "set" {
+            out.push(opt_str(lfu.set(c, w[1], num(w[2]))))
+        } else if w[0] == "get" {
+            out.push(opt_int(lfu.get(c, w[1])))
+        } else if w[0] == "del" {
+            out.push("{lfu.remove(c, w[1])}")
+        } else if w[0] == "freq" {
+            out.push("{lfu.frequency(c, w[1])}")
+        } else {
+            out.push(lfu.eviction_order(c).join(",") + "#{lfu.len(c)}")
+        }
+    }
+    out.join(" ")
+}
+
+fn run_arc(setup: str, script: str) -> str {
+    var c: ArcCache[i64] = arccache.new_arc(num(setup))
+    var out: [str] = []
+    for w in words(script) {
+        if w[0] == "set" {
+            out.push(opt_str(arccache.set(c, w[1], num(w[2]))))
+        } else if w[0] == "get" {
+            out.push(opt_int(arccache.get(c, w[1])))
+        } else {
+            let l = arccache.lists(c)
+            out.push(l.t1.join(",") + "|" + l.t2.join(",") + "|" + l.b1.join(",") + "|" + l.b2.join(",") + "|{l.p}")
+        }
+    }
+    out.join(" ")
+}
+
+fn run_jump(script: str) -> str {
+    var out: [str] = []
+    for w in words(script) {
+        if w[0] == "s" {
+            out.push("{jumphash.bucket_of(w[1], num(w[2]))}")
+        } else {
+            out.push("{jumphash.bucket(num(w[1]), num(w[2]))}")
+        }
+    }
+    out.join(" ")
+}
+
+fn run_rdv(setup: str, script: str) -> str {
+    var r = rendezvous.new_rendezvous(if setup.len() == 0 { [] } else { setup.split(",") })
+    var out: [str] = []
+    for w in words(script) {
+        if w[0] == "add" {
+            rendezvous.add(r, w[1])
+        } else if w[0] == "rm" {
+            let _ = rendezvous.remove(r, w[1])
+        } else {
+            out.push(rendezvous.lookup(r, w[1]) + "/" + rendezvous.ranked(r, w[1]).join(","))
+        }
+    }
+    out.join(" ")
+}
+
+fn run_minhash(setup: str, script: str) -> str {
+    let ks = setup.split(",")
+    let h = minhash.new_minhasher(num(ks[0]), num(ks[1]))
+    var out: [str] = []
+    var last: [i64] = []
+    for w in words(script) {
+        let elements = if w[1] == "_" { [] } else { w[1].split(",") }
+        let sig = minhash.signature(h, elements)
+        let bands = minhash.band_hashes(sig, num(w[2]), num(w[3]))
+        let same = if last.len() == sig.len() { minhash.estimate(last, sig) } else { 0.0 }
+        out.push(sig.map(|x| "{x}").join(",") + "/" + bands.map(|x| "{x}").join(",") + "/{(same * 1000000.0).round().as_i64()}")
+        last = sig
+    }
+    out.join(" ")
+}
+
+fn run_xor(setup: str, script: str) -> str {
+    var keys: [i64] = []
+    if setup.len() > 0 {
+        for k in setup.split(",") {
+            keys.push(num(k))
+        }
+    }
+    match xorfilter.new_xor8(keys) {
+        Err(_) -> "ERR"
+        Ok(f) -> {
+            var bits = ""
+            for w in words(script) {
+                bits = bits + if xorfilter.contains(f, num(w[0])) { "1" } else { "0" }
+            }
+            bits + " {xorfilter.size_in_bytes(f)}"
+        }
+    }
+}
+
+fn run_qf(setup: str, script: str) -> str {
+    let qr = setup.split(",")
+    match quotientfilter.new_quotient_filter(num(qr[0]), num(qr[1])) {
+        Err(_) -> "ERR"
+        Ok(start) -> {
+            var f = start
+            var out: [str] = []
+            for w in words(script) {
+                let x = num(w[1])
+                if w[0] == "ins" {
+                    out.push("{quotientfilter.insert_fingerprint(f, x)}")
+                } else if w[0] == "del" {
+                    out.push("{quotientfilter.remove_fingerprint(f, x)}")
+                } else if w[0] == "has" {
+                    out.push("{quotientfilter.contains_fingerprint(f, x)}")
+                } else if w[0] == "kins" {
+                    out.push("{quotientfilter.insert(f, x)}")
+                } else if w[0] == "khas" {
+                    out.push("{quotientfilter.contains(f, x)}")
+                } else {
+                    out.push("{quotientfilter.fingerprint(f, x)}#{quotientfilter.len(f)}")
+                }
+            }
+            out.join(" ")
+        }
+    }
+}
+
+fn answer(what: str, setup: str, script: str) -> str {
+    if what == "lfu" {
+        return run_lfu(setup, script)
+    }
+    if what == "arc" {
+        return run_arc(setup, script)
+    }
+    if what == "jump" {
+        return run_jump(script)
+    }
+    if what == "rdv" {
+        return run_rdv(setup, script)
+    }
+    if what == "minhash" {
+        return run_minhash(setup, script)
+    }
+    if what == "xor" {
+        return run_xor(setup, script)
+    }
+    run_qf(setup, script)
+}
+
+fn main() / {io} {
+    let argv = args()
+    var i = 0
+    while i + 2 < argv.len() {
+        print(answer(argv[i], argv[i + 1], argv[i + 2]))
+        i = i + 3
+    }
+}
