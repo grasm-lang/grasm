@@ -1,0 +1,4 @@
+[package]
+name = "blowfish"
+version = "1.0.0"
+capabilities = []

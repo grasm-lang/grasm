@@ -1,0 +1,206 @@
+// Block cipher modes over any block cipher: ECB, CBC, CFB (full-block and
+// 8-bit), OFB and CTR, with PKCS#7 padding (NIST SP 800-38A, RFC 5652).
+//
+// A block cipher encrypts one block; a mode says how a message of many
+// blocks uses it. Every function here takes the cipher as its block
+// function (`encrypt_block` of `sm4`, `camellia`, `aria`, `seed`,
+// `blowfish`, `cast5`, `idea`, `rc2`, `des` or `aes`, partially applied to
+// a key) and the block size, so each cipher package stays one block wide
+// and every cipher gets every mode.
+//
+// - ECB encrypts blocks independently, so equal blocks stay equal: it is
+//   for reading old data and for single blocks, not for messages.
+// - CBC chains each block into the next; decryption needs the inverse
+//   block function. A random IV per message is required.
+// - CFB and OFB turn the cipher into a stream; CFB8 shifts by one byte at a
+//   time (slow, but self-synchronising, as old serial links wanted).
+// - CTR encrypts a counter, the whole IV incremented as one big-endian
+//   number; a nonce and counter pair must never repeat.
+//
+// None of these authenticates. Anything that may be tampered with also
+// needs a MAC, or an AEAD instead (`aes`'s GCM, `ccm`, `ocb`, `gcmsiv`).
+//
+// Checked against OpenSSL's *-ECB, -CBC, -CFB, -CFB8, -OFB and -CTR.
+
+type ModeError =
+    | ModeNotWholeBlocks(length: i64)
+    | ModeBadIv(length: i64)
+    | ModeBadPadding
+
+fn xor(a: bytes, b: bytes) -> bytes {
+    var out: [i64] = []
+    for i in 0..a.len() {
+        out.push(a.at(i).bit_xor(b.at(i)))
+    }
+    return bytes_of(out)
+}
+
+fn whole(bs: i64, data: bytes) -> () ! ModeError {
+    if data.len() % bs != 0 {
+        fail(ModeNotWholeBlocks(data.len()))
+    }
+}
+
+fn iv_ok(bs: i64, iv: bytes) -> () ! ModeError {
+    if iv.len() != bs {
+        fail(ModeBadIv(iv.len()))
+    }
+}
+
+pub fn ecb(bs: i64, block: fn(bytes) -> bytes, data: bytes) -> bytes ! ModeError {
+    try whole(bs, data)
+    var out: [i64] = []
+    var at = 0
+    while at < data.len() {
+        out = out + block(data.slice(at, at + bs)).to_list()
+        at = at + bs
+    }
+    return bytes_of(out)
+}
+
+pub fn cbc_encrypt(bs: i64, encrypt: fn(bytes) -> bytes, iv: bytes, data: bytes) -> bytes ! ModeError {
+    try whole(bs, data)
+    try iv_ok(bs, iv)
+    var prev = iv
+    var out: [i64] = []
+    var at = 0
+    while at < data.len() {
+        prev = encrypt(xor(data.slice(at, at + bs), prev))
+        out = out + prev.to_list()
+        at = at + bs
+    }
+    return bytes_of(out)
+}
+
+pub fn cbc_decrypt(bs: i64, decrypt: fn(bytes) -> bytes, iv: bytes, data: bytes) -> bytes ! ModeError {
+    try whole(bs, data)
+    try iv_ok(bs, iv)
+    var prev = iv
+    var out: [i64] = []
+    var at = 0
+    while at < data.len() {
+        let c = data.slice(at, at + bs)
+        out = out + xor(decrypt(c), prev).to_list()
+        prev = c
+        at = at + bs
+    }
+    return bytes_of(out)
+}
+
+/// Full-block CFB (CFB128 for 16-byte blocks, CFB64 for 8-byte ones).
+fn cfb(bs: i64, encrypt: fn(bytes) -> bytes, iv: bytes, data: bytes, decrypting: bool) -> bytes ! ModeError {
+    try iv_ok(bs, iv)
+    var reg = iv
+    var out: [i64] = []
+    var at = 0
+    while at < data.len() {
+        let n = if data.len() - at < bs { data.len() - at } else { bs }
+        let piece = data.slice(at, at + n)
+        let res = xor(piece, encrypt(reg).slice(0, n))
+        out = out + res.to_list()
+        reg = if decrypting { piece } else { res }
+        at = at + n
+    }
+    return bytes_of(out)
+}
+
+pub fn cfb_encrypt(bs: i64, encrypt: fn(bytes) -> bytes, iv: bytes, data: bytes) -> bytes ! ModeError {
+    return try cfb(bs, encrypt, iv, data, false)
+}
+
+/// CFB decryption also uses the cipher's encryption direction.
+pub fn cfb_decrypt(bs: i64, encrypt: fn(bytes) -> bytes, iv: bytes, data: bytes) -> bytes ! ModeError {
+    return try cfb(bs, encrypt, iv, data, true)
+}
+
+/// CFB8: one byte of keystream per block operation, the register shifted
+/// by the ciphertext byte.
+fn cfb8(bs: i64, encrypt: fn(bytes) -> bytes, iv: bytes, data: bytes, decrypting: bool) -> bytes ! ModeError {
+    try iv_ok(bs, iv)
+    var reg = iv.to_list()
+    var out: [i64] = []
+    for i in 0..data.len() {
+        let k = encrypt(bytes_of(reg)).at(0)
+        let v = data.at(i).bit_xor(k)
+        out.push(v)
+        reg = reg.slice(1, bs) + [if decrypting { data.at(i) } else { v }]
+    }
+    return bytes_of(out)
+}
+
+pub fn cfb8_encrypt(bs: i64, encrypt: fn(bytes) -> bytes, iv: bytes, data: bytes) -> bytes ! ModeError {
+    return try cfb8(bs, encrypt, iv, data, false)
+}
+
+pub fn cfb8_decrypt(bs: i64, encrypt: fn(bytes) -> bytes, iv: bytes, data: bytes) -> bytes ! ModeError {
+    return try cfb8(bs, encrypt, iv, data, true)
+}
+
+/// OFB, the same in both directions.
+pub fn ofb(bs: i64, encrypt: fn(bytes) -> bytes, iv: bytes, data: bytes) -> bytes ! ModeError {
+    try iv_ok(bs, iv)
+    var reg = iv
+    var out: [i64] = []
+    var at = 0
+    while at < data.len() {
+        reg = encrypt(reg)
+        let n = if data.len() - at < bs { data.len() - at } else { bs }
+        out = out + xor(data.slice(at, at + n), reg.slice(0, n)).to_list()
+        at = at + n
+    }
+    return bytes_of(out)
+}
+
+/// CTR, the same in both directions: the IV is the first counter block,
+/// incremented as one big-endian number, wrapping.
+pub fn ctr(bs: i64, encrypt: fn(bytes) -> bytes, iv: bytes, data: bytes) -> bytes ! ModeError {
+    try iv_ok(bs, iv)
+    var counter = iv.to_list()
+    var out: [i64] = []
+    var at = 0
+    while at < data.len() {
+        let stream = encrypt(bytes_of(counter))
+        let n = if data.len() - at < bs { data.len() - at } else { bs }
+        out = out + xor(data.slice(at, at + n), stream.slice(0, n)).to_list()
+        at = at + n
+        var i = bs - 1
+        var carry = true
+        while carry and i >= 0 {
+            counter[i] = (counter[i] + 1).bit_and(255)
+            carry = counter[i] == 0
+            i = i - 1
+        }
+    }
+    return bytes_of(out)
+}
+
+/// PKCS#7 padding: 1 to bs bytes, each holding the count.
+pub fn pad(data: bytes, bs: i64) -> bytes {
+    let n = bs - data.len() % bs
+    var out = data.to_list()
+    for _i in 0..n {
+        out.push(n)
+    }
+    return bytes_of(out)
+}
+
+/// The data with its PKCS#7 padding checked and removed. A padding error
+/// reported to an attacker who can submit ciphertexts is a decryption
+/// oracle (Vaudenay, 2002): authenticate first.
+pub fn unpad(data: bytes, bs: i64) -> bytes ! ModeError {
+    if data.len() == 0 or data.len() % bs != 0 {
+        fail(ModeBadPadding)
+    }
+    let n = data.at(data.len() - 1)
+    if n < 1 or n > bs {
+        fail(ModeBadPadding)
+    }
+    var bad = 0
+    for i in (data.len() - n)..data.len() {
+        bad = bad.bit_or(data.at(i).bit_xor(n))
+    }
+    if bad != 0 {
+        fail(ModeBadPadding)
+    }
+    return data.slice(0, data.len() - n)
+}

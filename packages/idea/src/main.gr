@@ -1,0 +1,132 @@
+// IDEA, the International Data Encryption Algorithm (Lai and Massey, 1991).
+//
+// A 64-bit block and 128-bit key, eight and a half rounds that mix three
+// incompatible group operations on 16-bit words: XOR, addition modulo
+// 2^16, and multiplication modulo 2^16 + 1 (with 0 standing for 2^16). No
+// S-boxes and no tables; the key schedule is the key rotated left by 25
+// bits between each run of eight subkeys.
+//
+// IDEA was PGP 2's cipher and OpenPGP's first, so old PGP keyrings and
+// messages need it (the patents expired in 2012), as do some archive
+// formats and old SSL. Decryption uses the same rounds with the subkeys
+// inverted: multiplicative inverses modulo 65537, additive negations, and
+// the two middle words swapped back. The 64-bit block limits how much one
+// key may protect. Modes come from `blockmodes`.
+//
+// Checked against OpenSSL's IDEA-*.
+
+type IdeaCipher = { ek: [i64], dk: [i64] }
+
+type IdeaError =
+    | IdeaBadKey(length: i64)
+
+let M16 = 65535
+
+/// Multiplication modulo 65537, where 0 means 65536.
+fn mul(a: i64, b: i64) -> i64 {
+    let x = if a == 0 { 65536 } else { a }
+    let y = if b == 0 { 65536 } else { b }
+    let p = x * y % 65537
+    return if p == 65536 { 0 } else { p }
+}
+
+/// The inverse under that multiplication (0 and 1 are their own).
+fn mul_inv(a: i64) -> i64 {
+    if a <= 1 {
+        return a
+    }
+    // a^(65537 - 2) mod 65537, by Fermat.
+    var result = 1
+    var base = a
+    var e = 65535
+    while e > 0 {
+        if e % 2 == 1 {
+            result = result * base % 65537
+        }
+        base = base * base % 65537
+        e = e / 2
+    }
+    return result
+}
+
+fn neg(a: i64) -> i64 {
+    return (65536 - a).bit_and(M16)
+}
+
+pub fn new_cipher(key: bytes) -> IdeaCipher ! IdeaError {
+    if key.len() != 16 {
+        fail(IdeaBadKey(key.len()))
+    }
+    var k: [i64] = []
+    for i in 0..8 {
+        k.push(key.at(2 * i).shl(8).bit_or(key.at(2 * i + 1)))
+    }
+    var ek: [i64] = []
+    while ek.len() < 52 {
+        for w in k {
+            if ek.len() < 52 {
+                ek.push(w)
+            }
+        }
+        // Rotate the 128-bit key left by 25 bits: one word and 9 bits.
+        var r: [i64] = []
+        for i in 0..8 {
+            r.push(k[(i + 1) % 8].shl(9).bit_or(k[(i + 2) % 8].ushr(7)).bit_and(M16))
+        }
+        k = r
+    }
+    // Decryption subkeys: each round's in reverse, inverted, with the two
+    // additive keys swapped except in the first and last.
+    var dk: [i64] = []
+    for r in 0..9 {
+        let at = 48 - 6 * r
+        let swap = r != 0 and r != 8
+        dk = dk + [mul_inv(ek[at]), neg(ek[if swap { at + 2 } else { at + 1 }]), neg(ek[if swap { at + 1 } else { at + 2 }]),
+            mul_inv(ek[at + 3])]
+        if r < 8 {
+            dk = dk + [ek[at - 2], ek[at - 1]]
+        }
+    }
+    return IdeaCipher{ ek: ek, dk: dk }
+}
+
+fn run(z: [i64], block: bytes) -> bytes {
+    if block.len() != 8 {
+        panic("IDEA works on 8-byte blocks")
+    }
+    var x1 = block.at(0).shl(8).bit_or(block.at(1))
+    var x2 = block.at(2).shl(8).bit_or(block.at(3))
+    var x3 = block.at(4).shl(8).bit_or(block.at(5))
+    var x4 = block.at(6).shl(8).bit_or(block.at(7))
+    for r in 0..8 {
+        let k = 6 * r
+        x1 = mul(x1, z[k])
+        x2 = (x2 + z[k + 1]).bit_and(M16)
+        x3 = (x3 + z[k + 2]).bit_and(M16)
+        x4 = mul(x4, z[k + 3])
+        var t0 = mul(x1.bit_xor(x3), z[k + 4])
+        let t1 = mul((t0 + x2.bit_xor(x4)).bit_and(M16), z[k + 5])
+        t0 = (t0 + t1).bit_and(M16)
+        x1 = x1.bit_xor(t1)
+        x4 = x4.bit_xor(t0)
+        let a = x2.bit_xor(t0)
+        x2 = x3.bit_xor(t1)
+        x3 = a
+    }
+    // The output transformation undoes the last round's swap.
+    let y = [mul(x1, z[48]), (x3 + z[49]).bit_and(M16), (x2 + z[50]).bit_and(M16), mul(x4, z[51])]
+    var out: [i64] = []
+    for w in y {
+        out = out + [w.ushr(8), w.bit_and(255)]
+    }
+    return bytes_of(out)
+}
+
+/// One 8-byte block.
+pub fn encrypt_block(c: IdeaCipher, block: bytes) -> bytes {
+    return run(c.ek, block)
+}
+
+pub fn decrypt_block(c: IdeaCipher, block: bytes) -> bytes {
+    return run(c.dk, block)
+}

@@ -1,0 +1,248 @@
+// Camellia, the 128-bit block cipher of RFC 3713 (NTT and Mitsubishi,
+// 2000).
+//
+// Camellia is AES's peer: chosen by NESSIE and CRYPTREC, in ISO/IEC 18033-3,
+// with TLS suites (RFC 4132, 6367), IPsec (RFC 4312), Kerberos (RFC 6803)
+// and OpenPGP (RFC 9580). It is an 18-round Feistel network (24 rounds for
+// 192- and 256-bit keys) on two 64-bit halves, with a key-dependent FL
+// layer every six rounds. The F function is eight S-boxes, all derived from
+// one (s1, rotated and with its input rotated), and a byte-wise linear map.
+//
+// The key schedule derives KA (and KB for longer keys) by running the F
+// function with six constants, the hexadecimal digits of the square roots
+// of the first six primes, and takes every subkey as a rotation of KL, KR,
+// KA or KB. Decryption is the same network with the subkeys reversed.
+// Modes come from `blockmodes`.
+//
+// Checked against OpenSSL's CAMELLIA-*.
+
+type CamelliaCipher = {
+    boxes: [[i64]],
+    kw: [i64],
+    k: [i64],
+    ke: [i64],
+    dkw: [i64],
+    dk: [i64],
+    dke: [i64],
+}
+
+type CamelliaError =
+    | CamelliaBadKey(length: i64)
+
+let M32 = 4294967295
+
+fn rot8(v: i64, n: i64) -> i64 {
+    return v.shl(n).bit_or(v.ushr(8 - n)).bit_and(255)
+}
+
+fn rotl32(v: i64, n: i64) -> i64 {
+    return v.shl(n).bit_or(v.ushr(32 - n)).bit_and(M32)
+}
+
+/// s1 and the three S-boxes derived from it.
+fn boxes() -> [[i64]] {
+    let s1 = CAMELLIA_S1
+    var s2: [i64] = []
+    var s3: [i64] = []
+    var s4: [i64] = []
+    for x in 0..256 {
+        s2.push(rot8(s1[x], 1))
+        s3.push(rot8(s1[x], 7))
+        s4.push(s1[rot8(x, 1)])
+    }
+    return [s1, s2, s3, s4]
+}
+
+fn f(b: [[i64]], input: i64, key: i64) -> i64 {
+    let x = input.bit_xor(key)
+    let t1 = b[0][x.ushr(56).bit_and(255)]
+    let t2 = b[1][x.ushr(48).bit_and(255)]
+    let t3 = b[2][x.ushr(40).bit_and(255)]
+    let t4 = b[3][x.ushr(32).bit_and(255)]
+    let t5 = b[1][x.ushr(24).bit_and(255)]
+    let t6 = b[2][x.ushr(16).bit_and(255)]
+    let t7 = b[3][x.ushr(8).bit_and(255)]
+    let t8 = b[0][x.bit_and(255)]
+    let y = [
+        t1.bit_xor(t3).bit_xor(t4).bit_xor(t6).bit_xor(t7).bit_xor(t8),
+        t1.bit_xor(t2).bit_xor(t4).bit_xor(t5).bit_xor(t7).bit_xor(t8),
+        t1.bit_xor(t2).bit_xor(t3).bit_xor(t5).bit_xor(t6).bit_xor(t8),
+        t2.bit_xor(t3).bit_xor(t4).bit_xor(t5).bit_xor(t6).bit_xor(t7),
+        t1.bit_xor(t2).bit_xor(t6).bit_xor(t7).bit_xor(t8),
+        t2.bit_xor(t3).bit_xor(t5).bit_xor(t7).bit_xor(t8),
+        t3.bit_xor(t4).bit_xor(t5).bit_xor(t6).bit_xor(t8),
+        t1.bit_xor(t4).bit_xor(t5).bit_xor(t6).bit_xor(t7),
+    ]
+    var out = 0
+    for v in y {
+        out = out.shl(8).bit_or(v)
+    }
+    return out
+}
+
+fn fl(x: i64, k: i64) -> i64 {
+    var x1 = x.ushr(32)
+    var x2 = x.bit_and(M32)
+    x2 = x2.bit_xor(rotl32(x1.bit_and(k.ushr(32)), 1))
+    x1 = x1.bit_xor(x2.bit_or(k.bit_and(M32)))
+    return x1.shl(32).bit_or(x2)
+}
+
+fn fl_inv(y: i64, k: i64) -> i64 {
+    var y1 = y.ushr(32)
+    var y2 = y.bit_and(M32)
+    y1 = y1.bit_xor(y2.bit_or(k.bit_and(M32)))
+    y2 = y2.bit_xor(rotl32(y1.bit_and(k.ushr(32)), 1))
+    return y1.shl(32).bit_or(y2)
+}
+
+/// A 128-bit value, as its two 64-bit halves, rotated left by n.
+fn rot128(v: (i64, i64), n: i64) -> (i64, i64) {
+    let (h, l) = if n >= 64 { (v.1, v.0) } else { (v.0, v.1) }
+    let m = n % 64
+    if m == 0 {
+        return (h, l)
+    }
+    return (h.shl(m).bit_or(l.ushr(64 - m)), l.shl(m).bit_or(h.ushr(64 - m)))
+}
+
+fn be64(b: bytes, at: i64) -> i64 {
+    var v = 0
+    for i in 0..8 {
+        v = v.shl(8).bit_or(b.at(at + i))
+    }
+    return v
+}
+
+/// The six key-schedule constants: hex digits 2 to 17 of the fractional
+/// parts of the square roots of 2, 3, 5, 7, 11 and 13.
+fn sigma(i: i64) -> i64 {
+    let halves = [0xA09E667F, 0x3BCC908B, 0xB67AE858, 0x4CAA73B2, 0xC6EF372F, 0xE94F82BE, 0x54FF53A5, 0xF1D36F1C,
+        0x10E527FA, 0xDE682D1D, 0xB05688C2, 0xB3E6C1FD]
+    return halves[2 * i].shl(32).bit_or(halves[2 * i + 1])
+}
+
+pub fn new_cipher(key: bytes) -> CamelliaCipher ! CamelliaError {
+    let n = key.len()
+    if n != 16 and n != 24 and n != 32 {
+        fail(CamelliaBadKey(n))
+    }
+    let b = boxes()
+    let kl = (be64(key, 0), be64(key, 8))
+    let kr = if n == 16 {
+        (0, 0)
+    } else if n == 24 {
+        (be64(key, 16), be64(key, 16).bit_not())
+    } else {
+        (be64(key, 16), be64(key, 24))
+    }
+    var d1 = kl.0.bit_xor(kr.0)
+    var d2 = kl.1.bit_xor(kr.1)
+    d2 = d2.bit_xor(f(b, d1, sigma(0)))
+    d1 = d1.bit_xor(f(b, d2, sigma(1)))
+    d1 = d1.bit_xor(kl.0)
+    d2 = d2.bit_xor(kl.1)
+    d2 = d2.bit_xor(f(b, d1, sigma(2)))
+    d1 = d1.bit_xor(f(b, d2, sigma(3)))
+    let ka = (d1, d2)
+    d1 = ka.0.bit_xor(kr.0)
+    d2 = ka.1.bit_xor(kr.1)
+    d2 = d2.bit_xor(f(b, d1, sigma(4)))
+    d1 = d1.bit_xor(f(b, d2, sigma(5)))
+    let kb = (d1, d2)
+    let (kw, k, ke) = if n == 16 { schedule128(kl, ka) } else { schedule256(kl, kr, ka, kb) }
+    // Decryption runs the same network with every list reversed and the
+    // whitening keys exchanged.
+    var dk: [i64] = []
+    var i = k.len() - 1
+    while i >= 0 {
+        dk.push(k[i])
+        i = i - 1
+    }
+    var dke: [i64] = []
+    i = ke.len() - 1
+    while i >= 0 {
+        dke.push(ke[i])
+        i = i - 1
+    }
+    return CamelliaCipher{ boxes: b, kw: kw, k: k, ke: ke, dkw: [kw[2], kw[3], kw[0], kw[1]], dk: dk, dke: dke }
+}
+
+fn pair(v: (i64, i64)) -> [i64] {
+    return [v.0, v.1]
+}
+
+fn schedule128(kl: (i64, i64), ka: (i64, i64)) -> ([i64], [i64], [i64]) {
+    let kw = pair(kl) + pair(rot128(ka, 111))
+    let k = pair(ka) + pair(rot128(kl, 15)) + pair(rot128(ka, 15)) + pair(rot128(kl, 45)) + [rot128(ka, 45).0, rot128(kl, 60).1] +
+    pair(rot128(ka, 60)) + pair(rot128(kl, 94)) + pair(rot128(ka, 94)) + pair(rot128(kl, 111))
+    let ke = pair(rot128(ka, 30)) + pair(rot128(kl, 77))
+    return (kw, k, ke)
+}
+
+fn schedule256(kl: (i64, i64), kr: (i64, i64), ka: (i64, i64), kb: (i64, i64)) -> ([i64], [i64], [i64]) {
+    let kw = pair(kl) + pair(rot128(kb, 111))
+    let k = pair(kb) + pair(rot128(kr, 15)) + pair(rot128(ka, 15)) + pair(rot128(kb, 30)) + pair(rot128(kl, 45)) +
+    pair(rot128(ka, 45)) + pair(rot128(kr, 60)) + pair(rot128(kb, 60)) + pair(rot128(kl, 77)) + pair(rot128(kr, 94)) +
+    pair(rot128(ka, 94)) + pair(rot128(kl, 111))
+    let ke = pair(rot128(kr, 30)) + pair(rot128(kl, 60)) + pair(rot128(ka, 77))
+    return (kw, k, ke)
+}
+
+fn run(b: [[i64]], kw: [i64], k: [i64], ke: [i64], block: bytes) -> bytes {
+    if block.len() != 16 {
+        panic("Camellia works on 16-byte blocks")
+    }
+    var d1 = be64(block, 0).bit_xor(kw[0])
+    var d2 = be64(block, 8).bit_xor(kw[1])
+    var r = 0
+    while r < k.len() {
+        d2 = d2.bit_xor(f(b, d1, k[r]))
+        d1 = d1.bit_xor(f(b, d2, k[r + 1]))
+        r = r + 2
+        if r % 6 == 0 and r < k.len() {
+            let layer = r / 6 - 1
+            d1 = fl(d1, ke[2 * layer])
+            d2 = fl_inv(d2, ke[2 * layer + 1])
+        }
+    }
+    d2 = d2.bit_xor(kw[2])
+    d1 = d1.bit_xor(kw[3])
+    var out: [i64] = []
+    for v in [d2, d1] {
+        for i in 0..8 {
+            out.push(v.ushr(8 * (7 - i)).bit_and(255))
+        }
+    }
+    return bytes_of(out)
+}
+
+/// One 16-byte block.
+pub fn encrypt_block(c: CamelliaCipher, block: bytes) -> bytes {
+    return run(c.boxes, c.kw, c.k, c.ke, block)
+}
+
+pub fn decrypt_block(c: CamelliaCipher, block: bytes) -> bytes {
+    return run(c.boxes, c.dkw, c.dk, c.dke, block)
+}
+
+// --- Generated by scripts/gen_cipher_tables.py; do not edit below this line. ---
+
+let CAMELLIA_S1 = [
+    112, 130, 44, 236, 179, 39, 192, 229, 228, 133, 87, 53, 234, 12, 174, 65,
+    35, 239, 107, 147, 69, 25, 165, 33, 237, 14, 79, 78, 29, 101, 146, 189,
+    134, 184, 175, 143, 124, 235, 31, 206, 62, 48, 220, 95, 94, 197, 11, 26,
+    166, 225, 57, 202, 213, 71, 93, 61, 217, 1, 90, 214, 81, 86, 108, 77,
+    139, 13, 154, 102, 251, 204, 176, 45, 116, 18, 43, 32, 240, 177, 132, 153,
+    223, 76, 203, 194, 52, 126, 118, 5, 109, 183, 169, 49, 209, 23, 4, 215,
+    20, 88, 58, 97, 222, 27, 17, 28, 50, 15, 156, 22, 83, 24, 242, 34,
+    254, 68, 207, 178, 195, 181, 122, 145, 36, 8, 232, 168, 96, 252, 105, 80,
+    170, 208, 160, 125, 161, 137, 98, 151, 84, 91, 30, 149, 224, 255, 100, 210,
+    16, 196, 0, 72, 163, 247, 117, 219, 138, 3, 230, 218, 9, 63, 221, 148,
+    135, 92, 131, 2, 205, 74, 144, 51, 115, 103, 246, 243, 157, 127, 191, 226,
+    82, 155, 216, 38, 200, 55, 198, 59, 129, 150, 111, 75, 19, 190, 99, 46,
+    233, 121, 167, 140, 159, 110, 188, 142, 41, 245, 249, 182, 47, 253, 180, 89,
+    120, 152, 6, 106, 231, 70, 113, 186, 212, 37, 171, 66, 136, 162, 141, 250,
+    114, 7, 185, 85, 248, 238, 172, 10, 54, 73, 42, 104, 60, 56, 241, 164,
+    64, 40, 211, 123, 187, 201, 67, 193, 21, 227, 173, 244, 119, 199, 128, 158,
+]

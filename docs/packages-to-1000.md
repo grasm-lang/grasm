@@ -256,6 +256,25 @@ day its reference is installed.
 
 ## Landed
 
+- [x] **B33: block ciphers** — B8's `camellia` `aria` `sm4` `seed`
+  `blowfish` `cast5` `idea` `rc2`, with `blockmodes` (ECB, CBC, CFB, CFB8,
+  OFB, CTR and PKCS#7 over any block function), which was not on the
+  list, and the harness `b33test`; the new gate `b33diff` runs 7,173
+  cases against OpenSSL 3.6's libcrypto: every cipher at every key size
+  it allows (Blowfish 1 to 72 bytes, CAST5 5 to 16, RC2 1 to 128 at
+  effective lengths of 1 to 1,024 bits) in every mode, both directions,
+  with CTR counters that carry and wrap. No table was typed from memory:
+  `scripts/gen_cipher_tables.py` computes Blowfish's from pi and compares
+  them with x/crypto's, reads CAST5's and RC2's from x/crypto's source,
+  and finds SM4's, Camellia's, ARIA's and SEED's S-boxes in libcrypto by
+  shape alone, keeping a candidate only if a Python model of the cipher
+  built on it encrypts as OpenSSL does at every key size; the gate
+  re-derives them all. OpenSSL ignores parameter names it does not know,
+  so RC2's effective length was silently unset until the name was found
+  to be `keybits`. Blowfish keys over 72 bytes, CAST5 keys under 40 bits
+  and RC2 keys over 128 bytes are refused here and accepted there. One
+  break per package turned it red.
+
 - [x] **B32: AES modes and MACs** — B8's `cmac` `gmac` `kmac` `ccm` `ocb`
   `aessiv` `keywrap` `xts`, with `gcmsiv` and `cbccts`, which were not on
   the list, and the harness `b32test`; the new gate `b32diff` runs 7,604
@@ -594,7 +613,7 @@ day its reference is installed.
 | | |
 |---|---|
 | At the start | 669 |
-| Now | 853 |
+| Now | 863 |
 | Candidates above | 316 packages in 28 batches, plus `ecc`, `rfc6979` and `goprintf` |
 | Harnesses, one a batch | 28 |
 | If every candidate lands | 1016 |

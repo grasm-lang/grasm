@@ -117,8 +117,16 @@ class _Ctx:
 def cipher(name, key, iv, data, encrypt=True, padding=False, params=()):
     """A whole message through a cipher, or None if OpenSSL refuses."""
     with _Ctx(name) as c:
-        arr, keep = _params(list(params)) if params else (None, None)
-        if L.EVP_CipherInit_ex2(c.ctx, c.cipher, key, iv, 1 if encrypt else 0, arr) != 1:
+        enc = 1 if encrypt else 0
+        if params:
+            # Parameters such as the key length have to be in place before
+            # the key is: set them on a keyless init, then give the key.
+            arr, keep = _params(list(params))
+            if L.EVP_CipherInit_ex2(c.ctx, c.cipher, None, None, enc, arr) != 1:
+                return None
+            if L.EVP_CipherInit_ex2(c.ctx, None, key, iv, enc, None) != 1:
+                return None
+        elif L.EVP_CipherInit_ex2(c.ctx, c.cipher, key, iv, enc, None) != 1:
             return None
         L.EVP_CIPHER_CTX_set_padding(c.ctx, 1 if padding else 0)
         body = c.update(data)

@@ -1,0 +1,185 @@
+// ARIA, Korea's national block cipher (KS X 1213, RFC 5794).
+//
+// A 128-bit block with 128-, 192- or 256-bit keys and 12, 14 or 16 rounds
+// of a substitution-permutation network, like AES but involutional: the
+// diffusion layer is a 16x16 binary matrix that is its own inverse, and
+// odd and even rounds use the S-boxes in opposite orders, so decryption is
+// encryption with transformed round keys. Its first S-box is AES's; the
+// second is another inversion-based box, and the other two are their
+// inverses.
+//
+// ARIA is mandatory in Korean government and banking systems, has TLS
+// suites (RFC 6209), SRTP (RFC 8269) and is in ISO/IEC 18033-3's
+// neighbourhood through KS X 1213. Modes come from `blockmodes`.
+//
+// The key schedule runs three rounds of the cipher over the key with
+// constants from the fractional part of 1/pi, then rotates and combines the
+// four results into the round keys.
+//
+// Checked against OpenSSL's ARIA-*.
+import aes
+
+type AriaCipher = { boxes: [[i64]], ek: [[i64]], dk: [[i64]] }
+
+type AriaError =
+    | AriaBadKey(length: i64)
+
+/// Each output byte of the diffusion layer is the XOR of seven input bytes.
+let DIFFUSION = [
+    [3, 4, 6, 8, 9, 13, 14], [2, 5, 7, 8, 9, 12, 15], [1, 4, 6, 10, 11, 12, 15], [0, 5, 7, 10, 11, 13, 14],
+    [0, 2, 5, 8, 11, 14, 15], [1, 3, 4, 9, 10, 14, 15], [0, 2, 7, 9, 10, 12, 13], [1, 3, 6, 8, 11, 12, 13],
+    [0, 1, 4, 7, 10, 13, 15], [0, 1, 5, 6, 11, 12, 14], [2, 3, 5, 6, 8, 13, 15], [2, 3, 4, 7, 9, 12, 14],
+    [1, 2, 6, 7, 9, 11, 12], [0, 3, 6, 7, 8, 10, 13], [0, 3, 4, 5, 9, 11, 14], [1, 2, 4, 5, 8, 10, 15],
+]
+
+fn inverse(s: [i64]) -> [i64] {
+    var out: [i64] = []
+    for _i in 0..256 {
+        out.push(0)
+    }
+    for i in 0..256 {
+        out[s[i]] = i
+    }
+    return out
+}
+
+fn xor(a: [i64], b: [i64]) -> [i64] {
+    var out: [i64] = []
+    for i in 0..16 {
+        out.push(a[i].bit_xor(b[i]))
+    }
+    return out
+}
+
+fn diffuse(m: [[i64]], x: [i64]) -> [i64] {
+    var out: [i64] = []
+    for row in m {
+        var v = 0
+        for i in row {
+            v = v.bit_xor(x[i])
+        }
+        out.push(v)
+    }
+    return out
+}
+
+/// The substitution layer: SB1, SB2, SB3, SB4 repeating in odd rounds,
+/// SB3, SB4, SB1, SB2 in even ones.
+fn substitute(b: [[i64]], x: [i64], odd: bool) -> [i64] {
+    var out: [i64] = []
+    for i in 0..16 {
+        let which = if odd { i % 4 } else { (i + 2) % 4 }
+        out.push(b[which][x[i]])
+    }
+    return out
+}
+
+/// Rotate a 128-bit value right by n bits.
+fn rotr(x: [i64], n: i64) -> [i64] {
+    let by = n / 8
+    let bits = n % 8
+    var out: [i64] = []
+    for i in 0..16 {
+        let hi = x[(i - by + 16) % 16]
+        let lo = x[(i - by - 1 + 32) % 16]
+        out.push(if bits == 0 { hi } else { hi.ushr(bits).bit_or(lo.shl(8 - bits).bit_and(255)) })
+    }
+    return out
+}
+
+fn hex16(s: str) -> [i64] {
+    var out: [i64] = []
+    for i in 0..16 {
+        out.push(s.substr(2 * i, 2).parse_int_base(16) ?? 0)
+    }
+    return out
+}
+
+pub fn new_cipher(key: bytes) -> AriaCipher ! AriaError {
+    let n = key.len()
+    if n != 16 and n != 24 and n != 32 {
+        fail(AriaBadKey(n))
+    }
+    let s1 = aes.sbox()
+    let s2 = ARIA_S2
+    let b = [s1, s2, inverse(s1), inverse(s2)]
+    let m = DIFFUSION
+    // The fractional part of 1/pi, in three 128-bit pieces, taken in an
+    // order that depends on the key size.
+    let c = [hex16("517cc1b727220a94fe13abe8fa9a6ee0"), hex16("6db14acc9e21c820ff28b1d5ef5de2b0"),
+        hex16("db92371d2126e9700324977504e8c90e")]
+    let first = if n == 16 { 0 } else if n == 24 { 1 } else { 2 }
+    var kl: [i64] = []
+    var kr: [i64] = []
+    for i in 0..16 {
+        kl.push(key.at(i))
+        kr.push(if 16 + i < n { key.at(16 + i) } else { 0 })
+    }
+    let w0 = kl
+    let w1 = xor(diffuse(m, substitute(b, xor(w0, c[first]), true)), kr)
+    let w2 = xor(diffuse(m, substitute(b, xor(w1, c[(first + 1) % 3]), false)), w0)
+    let w3 = xor(diffuse(m, substitute(b, xor(w2, c[(first + 2) % 3]), true)), w1)
+    let w = [w0, w1, w2, w3]
+    var ek: [[i64]] = []
+    // Rotations right by 19 and 31, then left by 61 and 31 (right by 67 and
+    // 97), and one more key, left by 19 (right by 109).
+    for r in [19, 31, 67, 97] {
+        for i in 0..4 {
+            ek.push(xor(w[i], rotr(w[(i + 1) % 4], r)))
+        }
+    }
+    ek.push(xor(w0, rotr(w1, 109)))
+    let rounds = if n == 16 { 12 } else if n == 24 { 14 } else { 16 }
+    let keys = ek.slice(0, rounds + 1)
+    var dk: [[i64]] = [keys[rounds]]
+    var i = rounds - 1
+    while i >= 1 {
+        dk.push(diffuse(m, keys[i]))
+        i = i - 1
+    }
+    dk.push(keys[0])
+    return AriaCipher{ boxes: b, ek: keys, dk: dk }
+}
+
+fn run(b: [[i64]], keys: [[i64]], block: bytes) -> bytes {
+    if block.len() != 16 {
+        panic("ARIA works on 16-byte blocks")
+    }
+    let m = DIFFUSION
+    let rounds = keys.len() - 1
+    var p = block.to_list()
+    for i in 0..(rounds - 1) {
+        p = diffuse(m, substitute(b, xor(p, keys[i]), i % 2 == 0))
+    }
+    return bytes_of(xor(substitute(b, xor(p, keys[rounds - 1]), false), keys[rounds]))
+}
+
+/// One 16-byte block.
+pub fn encrypt_block(c: AriaCipher, block: bytes) -> bytes {
+    return run(c.boxes, c.ek, block)
+}
+
+pub fn decrypt_block(c: AriaCipher, block: bytes) -> bytes {
+    return run(c.boxes, c.dk, block)
+}
+
+// --- Generated by scripts/gen_cipher_tables.py; do not edit below this line. ---
+
+let ARIA_S2 = [
+    226, 78, 84, 252, 148, 194, 74, 204, 98, 13, 106, 70, 60, 77, 139, 209,
+    94, 250, 100, 203, 180, 151, 190, 43, 188, 119, 46, 3, 211, 25, 89, 193,
+    29, 6, 65, 107, 85, 240, 153, 105, 234, 156, 24, 174, 99, 223, 231, 187,
+    0, 115, 102, 251, 150, 76, 133, 228, 58, 9, 69, 170, 15, 238, 16, 235,
+    45, 127, 244, 41, 172, 207, 173, 145, 141, 120, 200, 149, 249, 47, 206, 205,
+    8, 122, 136, 56, 92, 131, 42, 40, 71, 219, 184, 199, 147, 164, 18, 83,
+    255, 135, 14, 49, 54, 33, 88, 72, 1, 142, 55, 116, 50, 202, 233, 177,
+    183, 171, 12, 215, 196, 86, 66, 38, 7, 152, 96, 217, 182, 185, 17, 64,
+    236, 32, 140, 189, 160, 201, 132, 4, 73, 35, 241, 79, 80, 31, 19, 220,
+    216, 192, 158, 87, 227, 195, 123, 101, 59, 2, 143, 62, 232, 37, 146, 229,
+    21, 221, 253, 23, 169, 191, 212, 154, 126, 197, 57, 103, 254, 118, 157, 67,
+    167, 225, 208, 245, 104, 242, 27, 52, 112, 5, 163, 138, 213, 121, 134, 168,
+    48, 198, 81, 75, 30, 166, 39, 246, 53, 210, 110, 36, 22, 130, 95, 218,
+    230, 117, 162, 239, 44, 178, 28, 159, 93, 111, 128, 10, 114, 68, 155, 108,
+    144, 11, 91, 51, 125, 90, 82, 243, 97, 161, 247, 176, 214, 63, 124, 109,
+    237, 20, 224, 165, 61, 34, 179, 248, 137, 222, 113, 26, 175, 186, 181, 129,
+]

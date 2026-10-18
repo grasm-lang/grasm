@@ -1,0 +1,58 @@
+// Eight block ciphers, each through a mode from blockmodes and back.
+// scripts/b33_diff.sh holds them to OpenSSL.
+import sm4
+import camellia
+import aria
+import seed
+import blowfish
+import cast5
+import rc2
+import idea
+import blockmodes
+
+fn filled(n: i64, v: i64) -> bytes {
+    var out: [i64] = []
+    while out.len() < n {
+        out.push(v)
+    }
+    bytes_of(out)
+}
+
+fn main() / {io} {
+    let msg = "an old archive, still readable".to_bytes()
+    let none = bytes_of([])
+
+    // 128-bit ciphers: CBC with PKCS#7 padding, then CTR.
+    let s = sm4.new_cipher(filled(16, 1)) ?? panic("sm4")
+    let iv = filled(16, 9)
+    let sealed = blockmodes.cbc_encrypt(16, |b| sm4.encrypt_block(s, b), iv, blockmodes.pad(msg, 16)) ?? none
+    let opened = blockmodes.cbc_decrypt(16, |b| sm4.decrypt_block(s, b), iv, sealed) ?? none
+    assert_eq(blockmodes.unpad(opened, 16) ?? none, msg)
+    let cam = camellia.new_cipher(filled(32, 2)) ?? panic("camellia")
+    let ct = blockmodes.ctr(16, |b| camellia.encrypt_block(cam, b), iv, msg) ?? none
+    assert_eq(ct.len(), msg.len())
+    assert_eq(blockmodes.ctr(16, |b| camellia.encrypt_block(cam, b), iv, ct) ?? none, msg)
+    let ar = aria.new_cipher(filled(24, 3)) ?? panic("aria")
+    assert_eq(aria.decrypt_block(ar, aria.encrypt_block(ar, iv)), iv)
+    let sd = seed.new_cipher(filled(16, 4)) ?? panic("seed")
+    assert_eq(seed.decrypt_block(sd, seed.encrypt_block(sd, iv)), iv)
+
+    // 64-bit ciphers: CFB and OFB, which need no padding.
+    let bf = blowfish.new_cipher("a pgp passphrase".to_bytes()) ?? panic("blowfish")
+    let iv8 = filled(8, 7)
+    let c1 = blockmodes.cfb_encrypt(8, |b| blowfish.encrypt_block(bf, b), iv8, msg) ?? none
+    assert_eq(blockmodes.cfb_decrypt(8, |b| blowfish.encrypt_block(bf, b), iv8, c1) ?? none, msg)
+    let c5 = cast5.new_cipher(filled(10, 5)) ?? panic("cast5")
+    let c2 = blockmodes.ofb(8, |b| cast5.encrypt_block(c5, b), iv8, msg) ?? none
+    assert_eq(blockmodes.ofb(8, |b| cast5.encrypt_block(c5, b), iv8, c2) ?? none, msg)
+    let r = rc2.new_cipher(filled(5, 6), 40) ?? panic("rc2")
+    assert_eq(rc2.decrypt_block(r, rc2.encrypt_block(r, iv8)), iv8)
+    let id = idea.new_cipher(filled(16, 8)) ?? panic("idea")
+    assert_eq(idea.decrypt_block(id, idea.encrypt_block(id, iv8)), iv8)
+
+    // A bad padding byte is refused.
+    var tampered = opened.to_list()
+    tampered[tampered.len() - 1] = 0
+    assert_eq((blockmodes.unpad(bytes_of(tampered), 16) ?? none).len(), 0)
+    print("b33: ok")
+}

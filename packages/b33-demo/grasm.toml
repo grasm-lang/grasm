@@ -1,0 +1,40 @@
+[package]
+name = "b33_demo"
+version = "1.0.0"
+capabilities = ["io"]
+
+[dependencies.sm4]
+path = "../sm4"
+version = "^1.0.0"
+
+[dependencies.camellia]
+path = "../camellia"
+version = "^1.0.0"
+
+[dependencies.aria]
+path = "../aria"
+version = "^1.0.0"
+
+[dependencies.seed]
+path = "../seed"
+version = "^1.0.0"
+
+[dependencies.blowfish]
+path = "../blowfish"
+version = "^1.0.0"
+
+[dependencies.cast5]
+path = "../cast5"
+version = "^1.0.0"
+
+[dependencies.rc2]
+path = "../rc2"
+version = "^1.0.0"
+
+[dependencies.idea]
+path = "../idea"
+version = "^1.0.0"
+
+[dependencies.blockmodes]
+path = "../blockmodes"
+version = "^1.0.0"

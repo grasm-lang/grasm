@@ -1,0 +1,132 @@
+// The Grasm side of scripts/b33_diff.py: `<cipher>.<mode>.<enc|dec> x
+// x<fields>`, the fields `key|iv|data|rc2 bits` in hex (bits in decimal).
+// Answers are hex, or ERR.
+import sm4
+import camellia
+import aria
+import seed
+import blowfish
+import cast5
+import rc2
+import idea
+import blockmodes
+
+type B33Cipher = { bs: i64, enc: fn(bytes) -> bytes, dec: fn(bytes) -> bytes }
+
+fn from_hex(text: str) -> bytes {
+    var out: [i64] = []
+    var i = 1
+    while i + 1 < text.len() {
+        out.push(text.substr(i, 2).parse_int_base(16) ?? 0)
+        i = i + 2
+    }
+    bytes_of(out)
+}
+
+fn unhex(text: str) -> bytes {
+    from_hex(":" + text)
+}
+
+fn hex(raw: bytes) -> str {
+    let digits = "0123456789abcdef"
+    var out = ""
+    var i = 0
+    while i < raw.len() {
+        out = out + digits.substr(raw.at(i) / 16, 1) + digits.substr(raw.at(i) % 16, 1)
+        i = i + 1
+    }
+    out
+}
+
+fn cipher_of(name: str, key: bytes, bits: i64) -> Option[B33Cipher] {
+    if name == "sm4" {
+        return match sm4.new_cipher(key) {
+            Ok(c) -> Some(B33Cipher{ bs: 16, enc: |b| sm4.encrypt_block(c, b), dec: |b| sm4.decrypt_block(c, b) })
+            Err(_) -> None
+        }
+    }
+    if name == "camellia" {
+        return match camellia.new_cipher(key) {
+            Ok(c) -> Some(B33Cipher{ bs: 16, enc: |b| camellia.encrypt_block(c, b), dec: |b| camellia.decrypt_block(c, b) })
+            Err(_) -> None
+        }
+    }
+    if name == "aria" {
+        return match aria.new_cipher(key) {
+            Ok(c) -> Some(B33Cipher{ bs: 16, enc: |b| aria.encrypt_block(c, b), dec: |b| aria.decrypt_block(c, b) })
+            Err(_) -> None
+        }
+    }
+    if name == "seed" {
+        return match seed.new_cipher(key) {
+            Ok(c) -> Some(B33Cipher{ bs: 16, enc: |b| seed.encrypt_block(c, b), dec: |b| seed.decrypt_block(c, b) })
+            Err(_) -> None
+        }
+    }
+    if name == "bf" {
+        return match blowfish.new_cipher(key) {
+            Ok(c) -> Some(B33Cipher{ bs: 8, enc: |b| blowfish.encrypt_block(c, b), dec: |b| blowfish.decrypt_block(c, b) })
+            Err(_) -> None
+        }
+    }
+    if name == "cast5" {
+        return match cast5.new_cipher(key) {
+            Ok(c) -> Some(B33Cipher{ bs: 8, enc: |b| cast5.encrypt_block(c, b), dec: |b| cast5.decrypt_block(c, b) })
+            Err(_) -> None
+        }
+    }
+    if name == "rc2" {
+        return match rc2.new_cipher(key, bits) {
+            Ok(c) -> Some(B33Cipher{ bs: 8, enc: |b| rc2.encrypt_block(c, b), dec: |b| rc2.decrypt_block(c, b) })
+            Err(_) -> None
+        }
+    }
+    return match idea.new_cipher(key) {
+        Ok(c) -> Some(B33Cipher{ bs: 8, enc: |b| idea.encrypt_block(c, b), dec: |b| idea.decrypt_block(c, b) })
+        Err(_) -> None
+    }
+}
+
+fn run(c: B33Cipher, mode: str, encrypt: bool, iv: bytes, data: bytes) -> bytes ! ModeError {
+    if mode == "ecb" {
+        return try blockmodes.ecb(c.bs, if encrypt { c.enc } else { c.dec }, data)
+    }
+    if mode == "cbc" {
+        return if encrypt { try blockmodes.cbc_encrypt(c.bs, c.enc, iv, data) } else { try blockmodes.cbc_decrypt(c.bs, c.dec, iv, data) }
+    }
+    if mode == "cfb" {
+        return if encrypt { try blockmodes.cfb_encrypt(c.bs, c.enc, iv, data) } else { try blockmodes.cfb_decrypt(c.bs, c.enc, iv, data) }
+    }
+    if mode == "cfb8" {
+        return if encrypt { try blockmodes.cfb8_encrypt(c.bs, c.enc, iv, data) } else { try blockmodes.cfb8_decrypt(c.bs, c.enc, iv, data) }
+    }
+    if mode == "ofb" {
+        return try blockmodes.ofb(c.bs, c.enc, iv, data)
+    }
+    if mode == "pad" {
+        return if encrypt { blockmodes.pad(data, c.bs) } else { try blockmodes.unpad(data, c.bs) }
+    }
+    return try blockmodes.ctr(c.bs, c.enc, iv, data)
+}
+
+fn answer(op: str, text: str) -> str {
+    let parts = op.split(".")
+    let g = text.split("|")
+    let bits = if g.len() > 3 { g[3].parse_int() ?? 0 } else { 0 }
+    match cipher_of(parts[0], unhex(g[0]), bits) {
+        Some(c) -> match run(c, parts[1], parts[2] == "enc", unhex(g[1]), unhex(g[2])) {
+            Ok(b) -> hex(b)
+            Err(_) -> "ERR"
+        }
+        None -> "ERR"
+    }
+}
+
+fn main() / {io} {
+    let argv = args()
+    var i = 0
+    while i + 2 < argv.len() {
+        print(answer(argv[i], from_hex(argv[i + 2]).to_str()))
+        i = i + 3
+    }
+}
