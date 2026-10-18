@@ -1,0 +1,154 @@
+// Strongly connected components of a directed graph (Tarjan, 1972).
+//
+// Two vertices share a component when each can reach the other. Collapsing
+// every component to a single vertex leaves a DAG -- the condensation --
+// which is how a dependency graph with cycles is still ordered, how a
+// package manager finds mutually recursive modules, and how 2-SAT is
+// solved.
+//
+// Iterative, with explicit stacks: the textbook recursion overflows the
+// call stack on a path a few hundred thousand vertices long, and graphs
+// that size are exactly the ones this is for.
+import graphs
+
+type SccState = {
+    index: [i64],
+    low: [i64],
+    comp: [i64],
+    on_stack: [bool],
+    stack: [i64],
+    next: i64,
+    count: i64,
+}
+
+fn filled(n: i64, v: i64) -> [i64] {
+    var out: [i64] = []
+    for _i in 0..n {
+        out.push(v)
+    }
+    out
+}
+
+fn enter(inout st: SccState, v: i64) {
+    st.index[v] = st.next
+    st.low[v] = st.next
+    st.next = st.next + 1
+    st.stack.push(v)
+    st.on_stack[v] = true
+}
+
+/// Closes `v` once its edges are done: if nothing below it reached higher,
+/// it is the root of a component, and the stack down to it is that
+/// component.
+fn leave(inout st: SccState, v: i64) {
+    if st.low[v] != st.index[v] {
+        return
+    }
+    var done = false
+    while not done {
+        let u = st.stack.pop() ?? v
+        st.on_stack[u] = false
+        st.comp[u] = st.count
+        done = u == v
+    }
+    st.count = st.count + 1
+}
+
+fn search(g: Digraph, inout st: SccState, root: i64) {
+    enter(st, root)
+    var frames: [i64] = [root]
+    var edge_at: [i64] = [0]
+    while frames.len() > 0 {
+        let top = frames.len() - 1
+        let v = frames[top]
+        let e = edge_at[top]
+        if e < g.to[v].len() {
+            edge_at[top] = e + 1
+            let w = g.to[v][e]
+            if st.index[w] == -1 {
+                enter(st, w)
+                frames.push(w)
+                edge_at.push(0)
+            } else if st.on_stack[w] {
+                st.low[v] = st.low[v].min(st.index[w])
+            }
+        } else {
+            frames = frames.slice(0, top)
+            edge_at = edge_at.slice(0, top)
+            leave(st, v)
+            if top > 0 {
+                let parent = frames[top - 1]
+                st.low[parent] = st.low[parent].min(st.low[v])
+            }
+        }
+    }
+}
+
+/// Each vertex's component. Components are numbered in the order they
+/// close, which is reverse topological order of the condensation: an edge
+/// never leads to a higher-numbered component.
+pub fn component_of(g: Digraph) -> [i64] {
+    let n = graphs.order(g)
+    var flags: [bool] = []
+    for _i in 0..n {
+        flags.push(false)
+    }
+    var st = SccState{ index: filled(n, -1), low: filled(n, 0), comp: filled(n, -1), on_stack: flags, stack: [],
+        next: 0, count: 0 }
+    for v in 0..n {
+        if st.index[v] == -1 {
+            search(g, st, v)
+        }
+    }
+    st.comp
+}
+
+/// The components, numbered as `component_of` numbers them, each listing
+/// its vertices in ascending order.
+pub fn components(g: Digraph) -> [[i64]] {
+    let comp = component_of(g)
+    var count = 0
+    for c in comp {
+        count = count.max(c + 1)
+    }
+    var out: [[i64]] = []
+    for _i in 0..count {
+        out.push([])
+    }
+    for v in 0..comp.len() {
+        out[comp[v]].push(v)
+    }
+    out
+}
+
+/// The condensation: one vertex per component and one edge for each pair
+/// of components joined by any edge, weighted by how many edges join them.
+/// It has no cycles.
+pub fn condensation(g: Digraph) -> Digraph {
+    let comp = component_of(g)
+    let groups = components(g)
+    var out = graphs.new_graph(groups.len())
+    for c in 0..groups.len() {
+        var counts = filled(groups.len(), 0)
+        var order: [i64] = []
+        for v in groups[c] {
+            for w in g.to[v] {
+                let d = comp[w]
+                if d != c {
+                    if counts[d] == 0 {
+                        order.push(d)
+                    }
+                    counts[d] = counts[d] + 1
+                }
+            }
+        }
+        for d in order {
+            graphs.add_edge(out, c, d, counts[d])
+        }
+    }
+    out
+}
+
+pub fn is_strongly_connected(g: Digraph) -> bool {
+    components(g).len() <= 1
+}

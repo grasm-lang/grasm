@@ -1,0 +1,166 @@
+// Minimum-cost flow: send flow from a source to a sink through arcs with
+// capacities and per-unit costs, as cheaply as possible.
+//
+// Transportation, assignment with costs, scheduling with penalties and
+// optimal transport are all this problem. `maxflow` answers how much can
+// move; this answers what moving it costs at best.
+//
+// ## Successive shortest paths
+//
+// Repeatedly find the cheapest path from source to sink in the residual
+// network (Bellman-Ford, so arcs may cost less than nothing) and push as
+// much as it carries. With no cycle of negative total cost, each step's
+// flow is the cheapest flow of its size (Busacker and Gowen, 1961), so
+// stopping at any `limit` gives the cheapest flow of that size. A network
+// with a negative cycle has no such answer -- flow round the cycle forever
+// gets cheaper -- and is refused rather than half-solved.
+//
+// Pseudo-polynomial: each step moves at least one unit. Costs and
+// capacities are `i64`; a total cost beyond 2^63 overflows.
+
+type CostArc = {
+    from: i64,
+    to: i64,
+    capacity: i64,
+    cost: i64,
+    flow: i64,
+}
+
+type CostNetwork = {
+    /// Arc 2k is the k-th arc added; arc 2k + 1 is its reverse.
+    arcs: [CostArc],
+    vertices: i64,
+}
+
+type CostFlow = {
+    flow: i64,
+    cost: i64,
+}
+
+type CostFlowError =
+    | NoSuchVertex(v: i64)
+    | NegativeCapacity(capacity: i64)
+    | NegativeCycle
+
+pub fn new_network(vertices: i64) -> CostNetwork {
+    CostNetwork{ arcs: [], vertices: vertices }
+}
+
+/// Adds an arc and returns its number, counted from 0 in order of adding.
+pub fn add_arc(inout net: CostNetwork, from: i64, to: i64, capacity: i64, cost: i64) -> i64 ! CostFlowError {
+    if from < 0 or from >= net.vertices {
+        fail(NoSuchVertex(from))
+    }
+    if to < 0 or to >= net.vertices {
+        fail(NoSuchVertex(to))
+    }
+    if capacity < 0 {
+        fail(NegativeCapacity(capacity))
+    }
+    net.arcs.push(CostArc{ from: from, to: to, capacity: capacity, cost: cost, flow: 0 })
+    net.arcs.push(CostArc{ from: to, to: from, capacity: 0, cost: 0 - cost, flow: 0 })
+    net.arcs.len() / 2 - 1
+}
+
+fn residual(a: CostArc) -> i64 {
+    a.capacity - a.flow
+}
+
+fn unreached() -> i64 {
+    4611686018427387904
+}
+
+/// Bellman-Ford from every vertex at once: true when some cycle of arcs
+/// with room left costs less than nothing.
+fn has_negative_cycle(net: CostNetwork) -> bool {
+    var dist: [i64] = []
+    for _v in 0..net.vertices {
+        dist.push(0)
+    }
+    for pass in 0..net.vertices + 1 {
+        var relaxed = false
+        for a in net.arcs {
+            if residual(a) > 0 and dist[a.from] + a.cost < dist[a.to] {
+                dist[a.to] = dist[a.from] + a.cost
+                relaxed = true
+            }
+        }
+        if not relaxed {
+            return false
+        }
+        if pass == net.vertices {
+            return true
+        }
+    }
+    false
+}
+
+/// The arc by which each vertex is reached on a cheapest residual path
+/// from `source`, and the distances.
+fn cheapest(net: CostNetwork, source: i64) -> ([i64], [i64]) {
+    var dist: [i64] = []
+    var via: [i64] = []
+    for _v in 0..net.vertices {
+        dist.push(unreached())
+        via.push(-1)
+    }
+    dist[source] = 0
+    var relaxed = true
+    var pass = 0
+    while relaxed and pass < net.vertices {
+        relaxed = false
+        for k in 0..net.arcs.len() {
+            let a = net.arcs[k]
+            if residual(a) > 0 and dist[a.from] != unreached() and dist[a.from] + a.cost < dist[a.to] {
+                dist[a.to] = dist[a.from] + a.cost
+                via[a.to] = k
+                relaxed = true
+            }
+        }
+        pass = pass + 1
+    }
+    (dist, via)
+}
+
+/// Sends up to `limit` units from `source` to `sink` at least cost; the
+/// flow on each arc is left in the network for `flow_on`.
+pub fn min_cost_flow(inout net: CostNetwork, source: i64, sink: i64, limit: i64) -> CostFlow ! CostFlowError {
+    if source < 0 or source >= net.vertices {
+        fail(NoSuchVertex(source))
+    }
+    if sink < 0 or sink >= net.vertices {
+        fail(NoSuchVertex(sink))
+    }
+    if has_negative_cycle(net) {
+        fail(NegativeCycle)
+    }
+    var total = CostFlow{ flow: 0, cost: 0 }
+    while total.flow < limit and source != sink {
+        let (dist, via) = cheapest(net, source)
+        if dist[sink] == unreached() {
+            break
+        }
+        var push = limit - total.flow
+        var v = sink
+        while v != source {
+            push = push.min(residual(net.arcs[via[v]]))
+            v = net.arcs[via[v]].from
+        }
+        v = sink
+        while v != source {
+            let k = via[v]
+            net.arcs[k].flow = net.arcs[k].flow + push
+            let back = k.bit_xor(1)
+            net.arcs[back].flow = net.arcs[back].flow - push
+            v = net.arcs[k].from
+        }
+        total.flow = total.flow + push
+        total.cost = total.cost + push * dist[sink]
+    }
+    total
+}
+
+/// The flow on the arc `add_arc` numbered `arc`.
+pub fn flow_on(net: CostNetwork, arc: i64) -> i64 {
+    net.arcs[2 * arc].flow
+}

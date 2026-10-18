@@ -189,8 +189,11 @@ Ethernet, IPv4, IPv6, TCP and UDP were candidates here and are already
 `pairingheap`
 
 **B22. Graphs** (Python `graphlib`, brute force) —
-`toposort` `scc` `dominators` `mincostflow` `graphiso` `cliques`
-`graphcolor` `eulerpath` `bridges` `lca`
+`scc` `mincostflow` `graphiso` `cliques` `graphcolor` `eulerpath`
+`bridges` `lca`
+
+`toposort` and `dominators` were candidates here and came off by rule 7:
+`graphs.topological` and `ssaform.immediate_dominators` are them.
 
 **B23. Text** (Python `re` and its parser, libc `regcomp` through `ctypes`) —
 `pyregex` `regexsyntax`
@@ -222,6 +225,16 @@ projection library), `flexlayout` (no layout engine outside a browser),
 day its reference is installed.
 
 ## Landed
+
+- [x] **B22: graphs** — `scc` `bridges` `eulerpath` `lca` `graphcolor`
+  `cliques` `graphiso` `mincostflow`, with the harness `graphtest`; the new
+  gate `graphdiff` runs 1,806 cases against brute force written in Python:
+  reachability from every vertex, a bridge as an edge whose removal splits
+  a component, every subset, every permutation, every colouring, every
+  integer flow. Where the answer is not unique -- an Euler walk, an
+  isomorphism, a flow -- it is checked for being one, and the brute force
+  decides whether one exists. Breaking the bridge test, the isomorphism
+  check and the negative-cycle refusal turned 113 cases red.
 
 - [x] **B16, first part** — `snmp` `radius` `netflow` `modbus`, with `md4`
   from B8, and the harness `packettest3`; the packet gate runs 26,608
@@ -313,13 +326,13 @@ day its reference is installed.
 | | |
 |---|---|
 | At the start | 669 |
-| Now | 737 |
-| Candidates above | 304 packages in 27 batches, plus `ecc`, `rfc6979` and `goprintf` |
+| Now | 746 |
+| Candidates above | 302 packages in 27 batches, plus `ecc`, `rfc6979` and `goprintf` |
 | Harnesses, one a batch | 27 |
-| If every candidate lands | 1003 |
+| If every candidate lands | 1001 |
 | Target | 1000 |
 
-The margin over 1000 is 3. It is there because some
+The margin over 1000 is 1. It is there because some
 candidate will turn out to exist already under a name the grep missed, or to
 disagree with its oracle in a way that says the oracle is the better
 package, and the plan should not need rewriting when that happens.

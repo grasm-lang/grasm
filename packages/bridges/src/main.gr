@@ -1,0 +1,174 @@
+// Bridges and articulation points of an undirected graph (Tarjan, 1974).
+//
+// A bridge is an edge whose removal disconnects its two ends; an
+// articulation point (cut vertex) is a vertex whose removal disconnects
+// something. They are the single points of failure of a network -- the one
+// link, the one router -- and the seams along which a graph splits into
+// two-edge-connected and biconnected pieces.
+//
+// The graph is `n` vertices and a list of edges; an edge is named by its
+// index in that list. Parallel edges are handled: two edges between the
+// same pair are never bridges, which is why the search remembers the edge
+// it arrived by rather than the vertex. Self-loops are never bridges.
+// Iterative, so a long path does not overflow the call stack.
+
+type BridgeReport = {
+    bridges: [i64],
+    articulation: [i64],
+}
+
+type BridgeSearch = {
+    tin: [i64],
+    low: [i64],
+    is_bridge: [bool],
+    is_cut: [bool],
+    clock: i64,
+}
+
+fn adjacency(n: i64, edges: [(i64, i64)]) -> [[(i64, i64)]] {
+    var adj: [[(i64, i64)]] = []
+    for _i in 0..n {
+        adj.push([])
+    }
+    for k in 0..edges.len() {
+        let (a, b) = edges[k]
+        adj[a].push((b, k))
+        if a != b {
+            adj[b].push((a, k))
+        }
+    }
+    adj
+}
+
+fn finish(inout s: BridgeSearch, parent: i64, child: i64, via: i64, root: i64) {
+    s.low[parent] = s.low[parent].min(s.low[child])
+    if s.low[child] > s.tin[parent] {
+        s.is_bridge[via] = true
+    }
+    if parent != root and s.low[child] >= s.tin[parent] {
+        s.is_cut[parent] = true
+    }
+}
+
+fn search(adj: [[(i64, i64)]], inout s: BridgeSearch, root: i64) {
+    s.tin[root] = s.clock
+    s.low[root] = s.clock
+    s.clock = s.clock + 1
+    var frames: [(i64, i64)] = [(root, -1)]
+    var at: [i64] = [0]
+    var root_children = 0
+    while frames.len() > 0 {
+        let top = frames.len() - 1
+        let (v, via) = frames[top]
+        if at[top] < adj[v].len() {
+            let (w, id) = adj[v][at[top]]
+            at[top] = at[top] + 1
+            if id == via {
+                continue
+            }
+            if s.tin[w] != -1 {
+                s.low[v] = s.low[v].min(s.tin[w])
+            } else {
+                s.tin[w] = s.clock
+                s.low[w] = s.clock
+                s.clock = s.clock + 1
+                frames.push((w, id))
+                at.push(0)
+                if v == root {
+                    root_children = root_children + 1
+                }
+            }
+        } else {
+            frames = frames.slice(0, top)
+            at = at.slice(0, top)
+            if top > 0 {
+                finish(s, frames[top - 1].0, v, via, root)
+            }
+        }
+    }
+    if root_children >= 2 {
+        s.is_cut[root] = true
+    }
+}
+
+/// Every bridge (as an edge index) and articulation point, each ascending.
+pub fn analyse(n: i64, edges: [(i64, i64)]) -> BridgeReport {
+    let adj = adjacency(n, edges)
+    var tin: [i64] = []
+    var low: [i64] = []
+    var cut: [bool] = []
+    for _i in 0..n {
+        tin.push(-1)
+        low.push(0)
+        cut.push(false)
+    }
+    var flags: [bool] = []
+    for _k in 0..edges.len() {
+        flags.push(false)
+    }
+    var s = BridgeSearch{ tin: tin, low: low, is_bridge: flags, is_cut: cut, clock: 0 }
+    for v in 0..n {
+        if s.tin[v] == -1 {
+            search(adj, s, v)
+        }
+    }
+    var bridges: [i64] = []
+    for k in 0..edges.len() {
+        if s.is_bridge[k] {
+            bridges.push(k)
+        }
+    }
+    var points: [i64] = []
+    for v in 0..n {
+        if s.is_cut[v] {
+            points.push(v)
+        }
+    }
+    BridgeReport{ bridges: bridges, articulation: points }
+}
+
+pub fn bridges(n: i64, edges: [(i64, i64)]) -> [i64] {
+    analyse(n, edges).bridges
+}
+
+pub fn articulation_points(n: i64, edges: [(i64, i64)]) -> [i64] {
+    analyse(n, edges).articulation
+}
+
+/// Each vertex's two-edge-connected component: what is left connected
+/// once every bridge is removed, numbered from 0 in order of the smallest
+/// vertex in each.
+pub fn two_edge_components(n: i64, edges: [(i64, i64)]) -> [i64] {
+    let report = analyse(n, edges)
+    var cut: [bool] = []
+    for _k in 0..edges.len() {
+        cut.push(false)
+    }
+    for k in report.bridges {
+        cut[k] = true
+    }
+    let adj = adjacency(n, edges)
+    var label: [i64] = []
+    for _i in 0..n {
+        label.push(-1)
+    }
+    var next = 0
+    for s in 0..n {
+        if label[s] != -1 {
+            continue
+        }
+        label[s] = next
+        var todo: [i64] = [s]
+        while todo.len() > 0 {
+            let v = todo.pop() ?? s
+            for (w, id) in adj[v] {
+                if not cut[id] and label[w] == -1 {
+                    label[w] = next
+                    todo.push(w)
+                }
+            }
+        }
+        next = next + 1
+    }
+    label
+}

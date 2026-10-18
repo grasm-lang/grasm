@@ -1,0 +1,64 @@
+// Graph algorithms on graphs small enough to check by eye.
+// scripts/graph_diff.sh holds them to brute force on thousands of random
+// graphs; this is the short version every engine runs.
+import graphs
+import scc
+import bridges
+import eulerpath
+import lca
+import graphcolor
+import cliques
+import graphiso
+import mincostflow
+
+fn main() / {io} {
+    // 0 -> 1 -> 2 -> 0 is one component; 3 hangs off it.
+    var g = graphs.new_graph(4)
+    for (a, b) in [(0, 1), (1, 2), (2, 0), (2, 3)] {
+        graphs.add_edge(g, a, b, 1)
+    }
+    assert_eq(scc.components(g), [[3], [0, 1, 2]])
+
+    // Two triangles joined by one edge: that edge is the only bridge, and
+    // its two ends are the cut vertices.
+    let pair = [(0, 1), (1, 2), (2, 0), (2, 3), (3, 4), (4, 5), (5, 3)]
+    assert_eq(bridges.bridges(6, pair), [3])
+    assert_eq(bridges.articulation_points(6, pair), [2, 3])
+
+    // The seven bridges of Konigsberg: four land masses, every one of odd
+    // degree, so no walk crosses each bridge once.
+    let konigsberg = [(0, 1), (0, 1), (0, 2), (0, 2), (0, 3), (1, 3), (2, 3)]
+    assert_eq(eulerpath.undirected(4, konigsberg) == None, true)
+
+    // root 0 with children 1 and 2; 3 and 4 under 1.
+    match lca.new_table([-1, 0, 0, 1, 1]) {
+        Ok(t) -> {
+            assert_eq(lca.lca(t, 3, 4), 1)
+            assert_eq(lca.distance(t, 3, 2), 3)
+        }
+        Err(_) -> panic("a tree was refused")
+    }
+
+    // An odd cycle needs three colours; add a hub joined to all five (the
+    // wheel W5) and it needs four.
+    let c5 = [(0, 1), (1, 2), (2, 3), (3, 4), (4, 0)]
+    assert_eq(graphcolor.chromatic_number(5, c5), 3)
+    assert_eq(graphcolor.chromatic_number(6, c5 + [(5, 0), (5, 1), (5, 2), (5, 3), (5, 4)]), 4)
+
+    assert_eq(cliques.maximal(4, [(0, 1), (1, 2), (0, 2), (2, 3)]), [[0, 1, 2], [2, 3]])
+    assert_eq(graphiso.is_isomorphic(4, [(0, 1), (1, 2), (2, 3)], 4, [(3, 1), (1, 0), (0, 2)]), true)
+
+    // Two routes from 0 to 3: cheap with room for 1, dear with room for 2.
+    var net = mincostflow.new_network(4)
+    for (a, b, cap, cost) in [(0, 1, 1, 1), (1, 3, 1, 1), (0, 2, 2, 5), (2, 3, 2, 5)] {
+        match mincostflow.add_arc(net, a, b, cap, cost) {
+            Ok(_) -> {}
+            Err(_) -> panic("an arc was refused")
+        }
+    }
+    match mincostflow.min_cost_flow(net, 0, 3, 2) {
+        Ok(r) -> assert_eq((r.flow, r.cost), (2, 12))
+        Err(_) -> panic("a flow was refused")
+    }
+    print("graph: ok")
+}

@@ -1,0 +1,170 @@
+// Graph colouring: give each vertex a colour so no edge joins two of the
+// same, with as few colours as possible.
+//
+// It is register allocation, exam timetabling, frequency assignment and
+// Sudoku. Finding the fewest colours is NP-hard, so there are two answers:
+//
+// - `dsatur` (Brelaz, 1979) colours greedily, always next taking the vertex
+//   whose neighbours already use the most colours. Fast, usually close,
+//   not always optimal.
+// - `optimal` finds a colouring with the chromatic number by trying k = 1,
+//   2, ... colours with backtracking in DSatur's order. It is exponential:
+//   for the tens of vertices of a timetable, not the thousands of a
+//   compiler's interference graph.
+//
+// Colours are 0, 1, 2 ... A self-loop makes a graph uncolourable, and the
+// answers say so: `chromatic_number` is -1 and `optimal` returns `None`.
+
+fn neighbours(n: i64, edges: [(i64, i64)]) -> [[i64]] {
+    var adj: [[i64]] = []
+    for _i in 0..n {
+        adj.push([])
+    }
+    for (a, b) in edges {
+        adj[a].push(b)
+        adj[b].push(a)
+    }
+    adj
+}
+
+fn has_loop(edges: [(i64, i64)]) -> bool {
+    for (a, b) in edges {
+        if a == b {
+            return true
+        }
+    }
+    false
+}
+
+fn saturation(adj: [[i64]], colour: [i64], v: i64) -> i64 {
+    var seen: [i64] = []
+    for w in adj[v] {
+        if colour[w] >= 0 and not seen.contains(colour[w]) {
+            seen.push(colour[w])
+        }
+    }
+    seen.len()
+}
+
+/// The uncoloured vertex DSatur takes next: most distinct neighbour
+/// colours, then highest degree, then lowest number.
+fn pick(adj: [[i64]], colour: [i64]) -> i64 {
+    var best = -1
+    var best_sat = -1
+    for v in 0..adj.len() {
+        if colour[v] >= 0 {
+            continue
+        }
+        let s = saturation(adj, colour, v)
+        if s > best_sat or (s == best_sat and adj[v].len() > adj[best].len()) {
+            best = v
+            best_sat = s
+        }
+    }
+    best
+}
+
+fn lowest_free(adj: [[i64]], colour: [i64], v: i64) -> i64 {
+    var c = 0
+    var clash = true
+    while clash {
+        clash = false
+        for w in adj[v] {
+            if w != v and colour[w] == c {
+                clash = true
+            }
+        }
+        if clash {
+            c = c + 1
+        }
+    }
+    c
+}
+
+/// A colouring by DSatur. Self-loops are ignored here.
+pub fn dsatur(n: i64, edges: [(i64, i64)]) -> [i64] {
+    let adj = neighbours(n, edges)
+    var colour: [i64] = []
+    for _i in 0..n {
+        colour.push(-1)
+    }
+    for _k in 0..n {
+        let v = pick(adj, colour)
+        colour[v] = lowest_free(adj, colour, v)
+    }
+    colour
+}
+
+fn fits(adj: [[i64]], colour: [i64], v: i64, c: i64) -> bool {
+    for w in adj[v] {
+        if colour[w] == c {
+            return false
+        }
+    }
+    true
+}
+
+fn extend(adj: [[i64]], inout colour: [i64], k: i64, left: i64) -> bool {
+    if left == 0 {
+        return true
+    }
+    let v = pick(adj, colour)
+    var used = 0
+    for c in colour {
+        used = used.max(c + 1)
+    }
+    for c in 0..k.min(used + 1) {
+        if fits(adj, colour, v, c) {
+            colour[v] = c
+            if extend(adj, colour, k, left - 1) {
+                return true
+            }
+            colour[v] = -1
+        }
+    }
+    false
+}
+
+/// A colouring with the fewest colours, or `None` with a self-loop.
+pub fn optimal(n: i64, edges: [(i64, i64)]) -> Option[[i64]] {
+    if has_loop(edges) {
+        return None
+    }
+    let adj = neighbours(n, edges)
+    var k = 1
+    while k <= n {
+        var colour: [i64] = []
+        for _i in 0..n {
+            colour.push(-1)
+        }
+        if extend(adj, colour, k, n) {
+            return Some(colour)
+        }
+        k = k + 1
+    }
+    Some([])
+}
+
+/// The fewest colours a proper colouring needs; -1 with a self-loop.
+pub fn chromatic_number(n: i64, edges: [(i64, i64)]) -> i64 {
+    match optimal(n, edges) {
+        None -> -1
+        Some(colour) -> {
+            var k = 0
+            for c in colour {
+                k = k.max(c + 1)
+            }
+            k
+        }
+    }
+}
+
+/// Whether `colour` gives every edge two different colours.
+pub fn is_proper(edges: [(i64, i64)], colour: [i64]) -> bool {
+    for (a, b) in edges {
+        if colour[a] == colour[b] {
+            return false
+        }
+    }
+    true
+}

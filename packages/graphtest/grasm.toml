@@ -1,0 +1,40 @@
+[package]
+name = "graphtest"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.graphs]
+path = "../graphs"
+version = "^1.0.0"
+
+[dependencies.scc]
+path = "../scc"
+version = "^1.0.0"
+
+[dependencies.bridges]
+path = "../bridges"
+version = "^1.0.0"
+
+[dependencies.eulerpath]
+path = "../eulerpath"
+version = "^1.0.0"
+
+[dependencies.lca]
+path = "../lca"
+version = "^1.0.0"
+
+[dependencies.graphcolor]
+path = "../graphcolor"
+version = "^1.0.0"
+
+[dependencies.cliques]
+path = "../cliques"
+version = "^1.0.0"
+
+[dependencies.graphiso]
+path = "../graphiso"
+version = "^1.0.0"
+
+[dependencies.mincostflow]
+path = "../mincostflow"
+version = "^1.0.0"

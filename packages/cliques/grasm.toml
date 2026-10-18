@@ -1,0 +1,5 @@
+[package]
+name = "cliques"
+version = "1.0.0"
+
+capabilities = []

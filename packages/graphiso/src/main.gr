@@ -1,0 +1,149 @@
+// Graph isomorphism: whether two undirected graphs are the same graph with
+// the vertices renamed, and the renaming.
+//
+// It is how a chemistry tool decides two drawings are one molecule, how a
+// circuit checker matches a netlist against its layout, and how a
+// compiler finds a known instruction pattern. No polynomial algorithm is
+// known; this is backtracking with the pruning that makes ordinary graphs
+// fast (VF2's idea, simplified): vertices are matched in breadth-first
+// order so each new one touches those already matched, and a candidate
+// must agree in degree, in self-loops, and in the number of edges to every
+// vertex matched so far. Repeated edges and self-loops count.
+
+fn counts(n: i64, edges: [(i64, i64)]) -> [i64] {
+    var m: [i64] = []
+    for _k in 0..n * n {
+        m.push(0)
+    }
+    for (a, b) in edges {
+        m[a * n + b] = m[a * n + b] + 1
+        if a != b {
+            m[b * n + a] = m[b * n + a] + 1
+        }
+    }
+    m
+}
+
+fn degrees(n: i64, m: [i64]) -> [i64] {
+    var out: [i64] = []
+    for v in 0..n {
+        var d = 0
+        for w in 0..n {
+            d = d + m[v * n + w]
+        }
+        out.push(d)
+    }
+    out
+}
+
+/// Breadth-first from the highest-degree vertex of each component, so
+/// every vertex after a component's first has a matched neighbour.
+fn search_order(n: i64, m: [i64], deg: [i64]) -> [i64] {
+    var placed: [bool] = []
+    for _v in 0..n {
+        placed.push(false)
+    }
+    var order: [i64] = []
+    while order.len() < n {
+        var start = -1
+        for v in 0..n {
+            if not placed[v] and (start == -1 or deg[v] > deg[start]) {
+                start = v
+            }
+        }
+        placed[start] = true
+        var queue: [i64] = [start]
+        var head = 0
+        while head < queue.len() {
+            let v = queue[head]
+            head = head + 1
+            order.push(v)
+            for w in 0..n {
+                if not placed[w] and m[v * n + w] > 0 {
+                    placed[w] = true
+                    queue.push(w)
+                }
+            }
+        }
+    }
+    order
+}
+
+type IsoSearch = {
+    n: i64,
+    m1: [i64],
+    m2: [i64],
+    deg1: [i64],
+    deg2: [i64],
+    order: [i64],
+    map: [i64],
+    used: [bool],
+}
+
+fn consistent(s: IsoSearch, depth: i64, w: i64) -> bool {
+    let v = s.order[depth]
+    let n = s.n
+    if s.used[w] or s.deg1[v] != s.deg2[w] or s.m1[v * n + v] != s.m2[w * n + w] {
+        return false
+    }
+    for k in 0..depth {
+        let u = s.order[k]
+        if s.m1[v * n + u] != s.m2[w * n + s.map[u]] {
+            return false
+        }
+    }
+    true
+}
+
+fn extend(inout s: IsoSearch, depth: i64) -> bool {
+    if depth == s.n {
+        return true
+    }
+    let v = s.order[depth]
+    for w in 0..s.n {
+        if consistent(s, depth, w) {
+            s.map[v] = w
+            s.used[w] = true
+            if extend(s, depth + 1) {
+                return true
+            }
+            s.used[w] = false
+            s.map[v] = -1
+        }
+    }
+    false
+}
+
+fn sorted_copy(list: [i64]) -> [i64] {
+    var out = list
+    out.sort()
+    out
+}
+
+/// A renaming `f` with an edge a-b in the first graph exactly when there
+/// is one f(a)-f(b) in the second, as often; `None` when there is none.
+pub fn isomorphism(n1: i64, edges1: [(i64, i64)], n2: i64, edges2: [(i64, i64)]) -> Option[[i64]] {
+    if n1 != n2 or edges1.len() != edges2.len() {
+        return None
+    }
+    let m1 = counts(n1, edges1)
+    let m2 = counts(n2, edges2)
+    let deg1 = degrees(n1, m1)
+    let deg2 = degrees(n2, m2)
+    if sorted_copy(deg1) != sorted_copy(deg2) {
+        return None
+    }
+    var map: [i64] = []
+    var used: [bool] = []
+    for _v in 0..n1 {
+        map.push(-1)
+        used.push(false)
+    }
+    var s = IsoSearch{ n: n1, m1: m1, m2: m2, deg1: deg1, deg2: deg2, order: search_order(n1, m1, deg1), map: map,
+        used: used }
+    if extend(s, 0) { Some(s.map) } else { None }
+}
+
+pub fn is_isomorphic(n1: i64, edges1: [(i64, i64)], n2: i64, edges2: [(i64, i64)]) -> bool {
+    isomorphism(n1, edges1, n2, edges2) != None
+}

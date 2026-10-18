@@ -1,0 +1,170 @@
+// The Grasm side of scripts/graph_diff.py: each case is an operation and a
+// graph written `n;a-b,c-d` (flow arcs `a-b-capacity-cost`), and one line
+// of answer that the driver checks against brute force.
+import graphs
+import scc
+import bridges
+import eulerpath
+import lca
+import graphcolor
+import cliques
+import graphiso
+import mincostflow
+
+fn ints(text: str, sep: str) -> [i64] {
+    var out: [i64] = []
+    if text.len() == 0 {
+        return out
+    }
+    for p in text.split(sep) {
+        out.push(p.parse_int() ?? 0)
+    }
+    out
+}
+
+fn order_of(text: str) -> i64 {
+    text.split(";")[0].parse_int() ?? 0
+}
+
+fn edges_of(text: str) -> [(i64, i64)] {
+    var out: [(i64, i64)] = []
+    let parts = text.split(";")
+    if parts.len() < 2 or parts[1].len() == 0 {
+        return out
+    }
+    for e in parts[1].split(",") {
+        let ab = ints(e, "-")
+        out.push((ab[0], ab[1]))
+    }
+    out
+}
+
+fn show(list: [i64]) -> str {
+    list.map(|x| "{x}").join(",")
+}
+
+fn answer_scc(text: str) -> str {
+    let n = order_of(text)
+    var g = graphs.new_graph(n)
+    for (a, b) in edges_of(text) {
+        graphs.add_edge(g, a, b, 1)
+    }
+    let cond = scc.condensation(g)
+    var arcs: [str] = []
+    for c in 0..graphs.order(cond) {
+        for k in 0..cond.to[c].len() {
+            arcs.push("{c}-{cond.to[c][k]}-{cond.weight[c][k]}")
+        }
+    }
+    show(scc.component_of(g)) + ";" + arcs.join(",") + ";{scc.is_strongly_connected(g)}"
+}
+
+fn answer_euler(what: str, text: str) -> str {
+    let n = order_of(text)
+    let found = if what == "euler.d" { eulerpath.directed(n, edges_of(text)) } else {
+        eulerpath.undirected(n, edges_of(text))
+    }
+    match found {
+        None -> "none"
+        Some(w) -> show(w.vertices) + ";" + show(w.edges) + ";{eulerpath.is_circuit(w)}"
+    }
+}
+
+fn answer_lca(text: str) -> str {
+    let parts = text.split(";")
+    match lca.new_table(ints(parts[0], ",")) {
+        Err(_) -> "ERR"
+        Ok(t) -> {
+            var out: [str] = []
+            for q in parts[1].split(",") {
+                let abk = ints(q, ":")
+                out.push("{lca.lca(t, abk[0], abk[1])}/{lca.distance(t, abk[0], abk[1])}/" +
+                    "{lca.ancestor(t, abk[0], abk[2])}/{lca.depth(t, abk[0])}")
+            }
+            out.join(",")
+        }
+    }
+}
+
+fn answer_colour(text: str) -> str {
+    let n = order_of(text)
+    let e = edges_of(text)
+    let best = match graphcolor.optimal(n, e) {
+        None -> "none"
+        Some(c) -> show(c)
+    }
+    show(graphcolor.dsatur(n, e)) + ";" + "{graphcolor.chromatic_number(n, e)};" + best
+}
+
+fn answer_cliques(text: str) -> str {
+    let n = order_of(text)
+    let e = edges_of(text)
+    let all = cliques.maximal(n, e).map(|c| c.map(|x| "{x}").join("."))
+    all.join("|") + ";" + show(cliques.maximum(n, e)) + ";{cliques.clique_number(n, e)}"
+}
+
+fn answer_iso(a: str, b: str) -> str {
+    match graphiso.isomorphism(order_of(a), edges_of(a), order_of(b), edges_of(b)) {
+        None -> "none"
+        Some(m) -> show(m)
+    }
+}
+
+fn run_flow(text: str, query: str) -> str ! CostFlowError {
+    let parts = text.split(";")
+    var net = mincostflow.new_network(parts[0].parse_int() ?? 0)
+    var count = 0
+    if parts[1].len() > 0 {
+        for a in parts[1].split(",") {
+            let f = ints(a, ":")
+            let _ = try mincostflow.add_arc(net, f[0], f[1], f[2], f[3])
+            count = count + 1
+        }
+    }
+    let q = ints(query, ",")
+    let r = try mincostflow.min_cost_flow(net, q[0], q[1], q[2])
+    var flows: [i64] = []
+    for k in 0..count {
+        flows.push(mincostflow.flow_on(net, k))
+    }
+    "{r.flow};{r.cost};" + show(flows)
+}
+
+fn answer(what: str, a: str, b: str) -> str {
+    if what == "scc" {
+        return answer_scc(a)
+    }
+    if what == "bridges" {
+        let r = bridges.analyse(order_of(a), edges_of(a))
+        return show(r.bridges) + ";" + show(r.articulation) + ";" + show(bridges.two_edge_components(order_of(a), edges_of(a)))
+    }
+    if what.starts_with("euler") {
+        return answer_euler(what, a)
+    }
+    if what == "lca" {
+        return answer_lca(a)
+    }
+    if what == "colour" {
+        return answer_colour(a)
+    }
+    if what == "cliques" {
+        return answer_cliques(a)
+    }
+    if what == "iso" {
+        return answer_iso(a, b)
+    }
+    match run_flow(a, b) {
+        Ok(text) -> text
+        Err(NegativeCycle) -> "NEGCYCLE"
+        Err(_) -> "ERR"
+    }
+}
+
+fn main() / {io} {
+    let argv = args()
+    var i = 0
+    while i + 2 < argv.len() {
+        print(answer(argv[i], argv[i + 1], argv[i + 2]))
+        i = i + 3
+    }
+}

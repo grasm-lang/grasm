@@ -1,0 +1,153 @@
+// Cliques: sets of vertices every two of which are joined by an edge.
+//
+// `maximal` lists every clique that cannot be grown (Bron and Kerbosch,
+// 1973, with Tomita's pivot, which keeps it within the 3^(n/3) bound on
+// how many there can be). That list is what community detection, protein
+// complex finding and register coalescing start from; the largest clique
+// in it is the clique number.
+//
+// Exponential in the worst case, as it must be: a graph can have 3^(n/3)
+// maximal cliques. Self-loops and repeated edges are ignored.
+
+fn matrix(n: i64, edges: [(i64, i64)]) -> [[bool]] {
+    var m: [[bool]] = []
+    for _i in 0..n {
+        var row: [bool] = []
+        for _j in 0..n {
+            row.push(false)
+        }
+        m.push(row)
+    }
+    for (a, b) in edges {
+        if a != b {
+            m[a][b] = true
+            m[b][a] = true
+        }
+    }
+    m
+}
+
+fn keep_adjacent(adj: [[bool]], list: [i64], v: i64) -> [i64] {
+    var out: [i64] = []
+    for w in list {
+        if adj[v][w] {
+            out.push(w)
+        }
+    }
+    out
+}
+
+fn pivot(adj: [[bool]], p: [i64], x: [i64]) -> i64 {
+    var best = -1
+    var best_count = -1
+    for u in p + x {
+        let c = keep_adjacent(adj, p, u).len()
+        if c > best_count {
+            best = u
+            best_count = c
+        }
+    }
+    best
+}
+
+fn expand(adj: [[bool]], r: [i64], p: [i64], x: [i64]) -> [[i64]] {
+    if p.len() == 0 {
+        if x.len() == 0 {
+            var done = r
+            done.sort()
+            return [done]
+        }
+        return []
+    }
+    let u = pivot(adj, p, x)
+    var out: [[i64]] = []
+    var rest = p
+    var excluded = x
+    for v in p {
+        if adj[u][v] {
+            continue
+        }
+        out = out + expand(adj, r + [v], keep_adjacent(adj, rest, v), keep_adjacent(adj, excluded, v))
+        var without: [i64] = []
+        for w in rest {
+            if w != v {
+                without.push(w)
+            }
+        }
+        rest = without
+        excluded.push(v)
+    }
+    out
+}
+
+fn before(a: [i64], b: [i64]) -> bool {
+    var i = 0
+    while i < a.len() and i < b.len() {
+        if a[i] != b[i] {
+            return a[i] < b[i]
+        }
+        i = i + 1
+    }
+    a.len() < b.len()
+}
+
+fn sort_lists(items: [[i64]]) -> [[i64]] {
+    if items.len() <= 1 {
+        return items
+    }
+    let mid = items.len() / 2
+    let left = sort_lists(items.slice(0, mid))
+    let right = sort_lists(items.slice(mid, items.len()))
+    var out: [[i64]] = []
+    var i = 0
+    var j = 0
+    while i < left.len() or j < right.len() {
+        if j >= right.len() or (i < left.len() and before(left[i], right[j])) {
+            out.push(left[i])
+            i = i + 1
+        } else {
+            out.push(right[j])
+            j = j + 1
+        }
+    }
+    out
+}
+
+/// Every maximal clique, each in ascending order, the list in
+/// lexicographic order. A graph with no vertices has one, the empty one.
+pub fn maximal(n: i64, edges: [(i64, i64)]) -> [[i64]] {
+    let adj = matrix(n, edges)
+    var all: [i64] = []
+    for v in 0..n {
+        all.push(v)
+    }
+    sort_lists(expand(adj, [], all, []))
+}
+
+/// A largest clique: of the largest, the first in lexicographic order.
+pub fn maximum(n: i64, edges: [(i64, i64)]) -> [i64] {
+    var best: [i64] = []
+    for c in maximal(n, edges) {
+        if c.len() > best.len() {
+            best = c
+        }
+    }
+    best
+}
+
+pub fn clique_number(n: i64, edges: [(i64, i64)]) -> i64 {
+    maximum(n, edges).len()
+}
+
+/// Whether `vertices` are pairwise adjacent.
+pub fn is_clique(n: i64, edges: [(i64, i64)], vertices: [i64]) -> bool {
+    let adj = matrix(n, edges)
+    for a in vertices {
+        for b in vertices {
+            if a != b and not adj[a][b] {
+                return false
+            }
+        }
+    }
+    true
+}

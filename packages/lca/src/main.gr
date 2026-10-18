@@ -1,0 +1,118 @@
+// Lowest common ancestors in a rooted forest, by binary lifting.
+//
+// The lowest common ancestor of two vertices is the deepest vertex that is
+// an ancestor of both. It answers distance in a tree in O(log n) after
+// O(n log n) preparation, and with it the questions built on that: the
+// nearest shared directory, the merge base in a history without merges,
+// the closest common taxon.
+//
+// The forest is given as a parent array, `-1` for each root. A vertex's
+// ancestors include itself. Two vertices in different trees have no common
+// ancestor, and the answer is -1.
+
+type LcaTable = {
+    /// `up[j][v]` is the 2^j-th ancestor of v, or -1.
+    up: [[i64]],
+    depth: [i64],
+}
+
+type LcaError =
+    | BadParent(vertex: i64)
+    | Cycle(vertex: i64)
+
+/// Prepares the table; refuses a parent out of range or a cycle.
+pub fn new_table(parent: [i64]) -> LcaTable ! LcaError {
+    let n = parent.len()
+    var children: [[i64]] = []
+    var depth: [i64] = []
+    for _i in 0..n {
+        children.push([])
+        depth.push(-1)
+    }
+    var todo: [i64] = []
+    for v in 0..n {
+        let p = parent[v]
+        if p < -1 or p >= n {
+            fail(BadParent(v))
+        }
+        if p == -1 {
+            depth[v] = 0
+            todo.push(v)
+        } else {
+            children[p].push(v)
+        }
+    }
+    while todo.len() > 0 {
+        let v = todo.pop() ?? 0
+        for c in children[v] {
+            depth[c] = depth[v] + 1
+            todo.push(c)
+        }
+    }
+    for v in 0..n {
+        if depth[v] == -1 {
+            fail(Cycle(v))
+        }
+    }
+    var up: [[i64]] = [parent]
+    var span = 1
+    while span < n {
+        let last = up[up.len() - 1]
+        var next: [i64] = []
+        for v in 0..n {
+            next.push(if last[v] == -1 { -1 } else { last[last[v]] })
+        }
+        up.push(next)
+        span = span * 2
+    }
+    LcaTable{ up: up, depth: depth }
+}
+
+pub fn depth(t: LcaTable, v: i64) -> i64 {
+    t.depth[v]
+}
+
+/// The ancestor `k` levels above `v`, or -1 when there is none.
+pub fn ancestor(t: LcaTable, v: i64, k: i64) -> i64 {
+    if k < 0 or k > t.depth[v] {
+        return -1
+    }
+    var u = v
+    var j = 0
+    while j < t.up.len() and u != -1 {
+        if k.ushr(j).bit_and(1) == 1 {
+            u = t.up[j][u]
+        }
+        j = j + 1
+    }
+    u
+}
+
+/// The lowest common ancestor of `a` and `b`, or -1 in different trees.
+pub fn lca(t: LcaTable, a: i64, b: i64) -> i64 {
+    var x = a
+    var y = b
+    if t.depth[x] < t.depth[y] {
+        x = b
+        y = a
+    }
+    x = ancestor(t, x, t.depth[x] - t.depth[y])
+    if x == y {
+        return x
+    }
+    var j = t.up.len() - 1
+    while j >= 0 {
+        if t.up[j][x] != t.up[j][y] {
+            x = t.up[j][x]
+            y = t.up[j][y]
+        }
+        j = j - 1
+    }
+    t.up[0][x]
+}
+
+/// The number of edges between `a` and `b`, or -1 in different trees.
+pub fn distance(t: LcaTable, a: i64, b: i64) -> i64 {
+    let c = lca(t, a, b)
+    if c == -1 { -1 } else { t.depth[a] + t.depth[b] - 2 * t.depth[c] }
+}

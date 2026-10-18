@@ -1,0 +1,9 @@
+[package]
+name = "scc"
+version = "1.0.0"
+
+capabilities = []
+
+[dependencies.graphs]
+path = "../graphs"
+version = "^1.0.0"
