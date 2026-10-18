@@ -1,0 +1,5 @@
+[package]
+name = "copticcal"
+version = "1.0.0"
+
+capabilities = []

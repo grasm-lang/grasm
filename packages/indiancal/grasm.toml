@@ -1,0 +1,9 @@
+[package]
+name = "indiancal"
+version = "1.0.0"
+
+capabilities = []
+
+[dependencies.time]
+path = "../time"
+version = "^1.0.0"

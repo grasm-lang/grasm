@@ -1,0 +1,62 @@
+// The Thai solar calendar: the Gregorian calendar with years of the
+// Buddhist Era (BE), 543 more than the Common Era -- Thailand's official
+// calendar, also used in Cambodia, Laos and Myanmar for religious dates.
+//
+// It is also where this package keeps the calendar ICU puts under every
+// Gregorian-based one (this, ROC, Japanese): Gregorian from 15 October
+// 1582, Julian before it, so the day before 15 October 1582 is 4 October.
+// Day numbers count from 1 January 1970.
+import time
+
+type CivilDay = {
+    year: i64,
+    month: i64,
+    day: i64,
+}
+
+fn floor_div(a: i64, b: i64) -> i64 {
+    let q = a / b
+    if a % b != 0 and ((a < 0) != (b < 0)) { q - 1 } else { q }
+}
+
+/// The first Gregorian day, 15 October 1582.
+fn changeover() -> i64 {
+    -141427
+}
+
+/// The date in the Julian calendar for a day number.
+pub fn julian_of(d: i64) -> CivilDay {
+    let c = d + 2440588 + 32082
+    let dd = floor_div(4 * c + 3, 1461)
+    let e = c - floor_div(1461 * dd, 4)
+    let m = floor_div(5 * e + 2, 153)
+    CivilDay{ year: dd - 4800 + floor_div(m, 10), month: m + 3 - 12 * floor_div(m, 10),
+        day: e - floor_div(153 * m + 2, 5) + 1 }
+}
+
+/// The day number of a Julian calendar date.
+pub fn julian_day(c: CivilDay) -> i64 {
+    let a = floor_div(14 - c.month, 12)
+    let y = c.year + 4800 - a
+    let m = c.month + 12 * a - 3
+    c.day + floor_div(153 * m + 2, 5) + 365 * y + floor_div(y, 4) - 32083 - 2440588
+}
+
+/// The date ICU's Gregorian calendar gives: Julian before the changeover.
+pub fn civil_of(d: i64) -> CivilDay {
+    if d < changeover() {
+        return julian_of(d)
+    }
+    let g = time.civil_from_days(d)
+    CivilDay{ year: g.year, month: g.month, day: g.day }
+}
+
+pub fn day_of(c: CivilDay) -> i64 {
+    let g = time.days_from_civil(Date{ year: c.year, month: c.month, day: c.day })
+    if g >= changeover() { g } else { julian_day(c) }
+}
+
+/// The Buddhist Era year of a day.
+pub fn be_year(d: i64) -> i64 {
+    civil_of(d).year + 543
+}

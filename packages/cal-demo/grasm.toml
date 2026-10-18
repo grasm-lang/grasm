@@ -1,0 +1,44 @@
+[package]
+name = "cal_demo"
+version = "1.0.0"
+capabilities = ["io"]
+
+[dependencies.hijri]
+path = "../hijri"
+version = "^1.0.0"
+
+[dependencies.hebrewcal]
+path = "../hebrewcal"
+version = "^1.0.0"
+
+[dependencies.persiancal]
+path = "../persiancal"
+version = "^1.0.0"
+
+[dependencies.japaneseera]
+path = "../japaneseera"
+version = "^1.0.0"
+
+[dependencies.buddhistcal]
+path = "../buddhistcal"
+version = "^1.0.0"
+
+[dependencies.roccal]
+path = "../roccal"
+version = "^1.0.0"
+
+[dependencies.ethiopiccal]
+path = "../ethiopiccal"
+version = "^1.0.0"
+
+[dependencies.indiancal]
+path = "../indiancal"
+version = "^1.0.0"
+
+[dependencies.copticcal]
+path = "../copticcal"
+version = "^1.0.0"
+
+[dependencies.chinesecal]
+path = "../chinesecal"
+version = "^1.0.0"

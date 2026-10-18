@@ -1,0 +1,57 @@
+// The Indian national calendar (Saka calendar): India's official civil
+// calendar since 1957, beside the Gregorian, in the Gazette of India and
+// on government documents.
+//
+// Years of the Saka era, 78 behind the Gregorian; the year begins with
+// Chaitra on 22 March (21 March in a Gregorian leap year); Chaitra has 30
+// days (31 in a leap year), the next five months 31, the last six 30.
+// Leap years are the Gregorian year's. Computed as ICU's IndianCalendar.
+import time
+
+type IndianDate = {
+    year: i64,
+    month: i64,
+    day: i64,
+}
+
+fn is_gregorian_leap(y: i64) -> bool {
+    (y % 4 == 0 and y % 100 != 0) or y % 400 == 0
+}
+
+pub fn from_unix_day(d: i64) -> IndianDate {
+    let g = time.civil_from_days(d)
+    var yday = d - time.days_from_civil(Date{ year: g.year, month: 1, day: 1 })
+    var year = g.year - 78
+    var chaitra = 0
+    if yday < 80 {
+        year = year - 1
+        chaitra = if is_gregorian_leap(g.year - 1) { 31 } else { 30 }
+        yday = yday + chaitra + 31 * 5 + 30 * 3 + 10
+    } else {
+        chaitra = if is_gregorian_leap(g.year) { 31 } else { 30 }
+        yday = yday - 80
+    }
+    if yday < chaitra {
+        return IndianDate{ year: year, month: 1, day: yday + 1 }
+    }
+    let rest = yday - chaitra
+    if rest < 31 * 5 {
+        return IndianDate{ year: year, month: rest / 31 + 2, day: rest % 31 + 1 }
+    }
+    let late = rest - 31 * 5
+    IndianDate{ year: year, month: late / 30 + 7, day: late % 30 + 1 }
+}
+
+pub fn to_unix_day(i: IndianDate) -> i64 {
+    let gy = i.year + 78
+    let leap = is_gregorian_leap(gy)
+    let start = time.days_from_civil(Date{ year: gy, month: 3, day: if leap { 21 } else { 22 } })
+    let chaitra = if leap { 31 } else { 30 }
+    if i.month == 1 {
+        return start + i.day - 1
+    }
+    if i.month <= 6 {
+        return start + chaitra + 31 * (i.month - 2) + i.day - 1
+    }
+    start + chaitra + 31 * 5 + 30 * (i.month - 7) + i.day - 1
+}

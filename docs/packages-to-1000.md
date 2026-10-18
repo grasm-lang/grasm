@@ -108,9 +108,13 @@ Java `BigDecimal`, Go `math/big`) —
 `decimal` `bigfloat` `modarith` `numtheory` `contfrac` `specialfn` `float16`
 `bfloat16` `complexfn` `ntt` `bitops`
 
-**B7. Calendars** (Node ICU `Intl.DateTimeFormat`, Python `datetime`) —
+**B7. Calendars** (Node ICU `Intl.DateTimeFormat`) —
 `hijri` `hebrewcal` `persiancal` `chinesecal` `japaneseera` `buddhistcal`
-`ethiopiccal` `indiancal` `copticcal` `isoweek`
+`ethiopiccal` `indiancal` `copticcal` `roccal`
+
+`isoweek` was a candidate here and came off by rule 7: `iso8601` has the
+ISO week date. `roccal`, Taiwan's Minguo calendar, which ICU also has,
+went on.
 
 ### Tier 2 — what serious programs reach for
 
@@ -250,6 +254,23 @@ projection library), `flexlayout` (no layout engine outside a browser),
 day its reference is installed.
 
 ## Landed
+
+- [x] **B7: calendars** — `hijri` `hebrewcal` `persiancal` `chinesecal`
+  `japaneseera` `buddhistcal` `ethiopiccal` `indiancal` `copticcal`
+  `roccal`, with the harness `caltest`; the new gate `caldiff` holds 69,090
+  dates across three thousand years to ICU 78.1 through Node -- random
+  days, runs around year ends, leap months, era changes, the Umm al-Qura
+  table's edges, the 1582 changeover ICU's Gregorian-based calendars keep,
+  and every Rosh Hashanah from 4200 to 6329 AM. Umm al-Qura's months, the
+  237 Japanese eras and the Chinese and Korean months of 1900 to 2100 are
+  tables generated from ICU (`scripts/gen_calendars.py`, with `--check`).
+  The Hebrew calendar was wrong before it was tested: GaTaRaD and
+  BeTUTaKPaT were re-applied after a Sunday molad moved to Monday,
+  postponing 38 years in 7000 by a day, 5807 among them -- found when ICU
+  disagreed on three dates and *Calendrical Calculations*' own formula,
+  written out in Python, sided with ICU over 20,000 years. One break per
+  package turned its calendar red, the Indian one after a first break that
+  cancels itself was replaced.
 
 - [x] **B17, first part** — `packidx` `packrev` `midx` `commitgraph`
   `gitlogfmt`, with the harness `gittest`; the new gate `gitdiff` runs 949
@@ -432,7 +453,7 @@ day its reference is installed.
 | | |
 |---|---|
 | At the start | 669 |
-| Now | 791 |
+| Now | 802 |
 | Candidates above | 316 packages in 28 batches, plus `ecc`, `rfc6979` and `goprintf` |
 | Harnesses, one a batch | 28 |
 | If every candidate lands | 1016 |

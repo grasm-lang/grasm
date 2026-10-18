@@ -1,0 +1,38 @@
+// The Ethiopian calendar: Ethiopia's civil calendar, and Eritrea's.
+//
+// The Coptic calendar's arithmetic -- twelve 30-day months and a short
+// thirteenth -- with an epoch of 29 August 8 (Julian), the Incarnation
+// era: Amete Mihret, "year of mercy", which runs seven or eight years
+// behind the Gregorian count. Amete Alem, "year of the world", adds 5500.
+// As ICU's `ethiopic` calendar, years of 0 or less are given in Amete
+// Alem; its `ethioaa` calendar uses Amete Alem throughout.
+import copticcal
+
+type EthiopicDate = {
+    year: i64,
+    month: i64,
+    day: i64,
+}
+
+fn epoch() -> i64 {
+    -716367
+}
+
+pub fn from_unix_day(d: i64) -> EthiopicDate {
+    let (y, m, day) = copticcal.date_of(epoch(), d)
+    EthiopicDate{ year: y, month: m, day: day }
+}
+
+pub fn to_unix_day(e: EthiopicDate) -> i64 {
+    copticcal.days_of(epoch(), e.year, e.month, e.day)
+}
+
+/// (era, year) as ICU's `ethiopic` calendar shows it.
+pub fn era_year(e: EthiopicDate) -> (str, i64) {
+    if e.year >= 1 { ("AM", e.year) } else { ("AA", e.year + 5500) }
+}
+
+/// The Amete Alem year, as ICU's `ethioaa` calendar counts it.
+pub fn amete_alem_year(e: EthiopicDate) -> i64 {
+    e.year + 5500
+}

@@ -1,0 +1,5 @@
+[package]
+name = "persiancal"
+version = "1.0.0"
+
+capabilities = []

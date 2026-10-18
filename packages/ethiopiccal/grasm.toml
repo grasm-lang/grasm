@@ -1,0 +1,9 @@
+[package]
+name = "ethiopiccal"
+version = "1.0.0"
+
+capabilities = []
+
+[dependencies.copticcal]
+path = "../copticcal"
+version = "^1.0.0"

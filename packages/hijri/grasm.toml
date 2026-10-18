@@ -1,0 +1,5 @@
+[package]
+name = "hijri"
+version = "1.0.0"
+
+capabilities = []

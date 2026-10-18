@@ -1,0 +1,55 @@
+// The Coptic calendar: the church calendar of Egypt's Coptic Orthodox
+// Church, and still the farmers' calendar of the Nile valley.
+//
+// Twelve months of 30 days and a thirteenth, the epagomenal days, of 5 --
+// 6 in the year before a Julian leap year (year % 4 == 3). Years count
+// from 29 August 284 (Julian), the start of Diocletian's reign: Anno
+// Martyrum. Dates are converted through day numbers counted from 1 January
+// 1970, as ICU does; a year of 0 or less is given by `era_year` as year
+// 1 - y of the era before, which ICU names with nothing.
+
+type CopticDate = {
+    year: i64,
+    month: i64,
+    day: i64,
+}
+
+fn floor_div(a: i64, b: i64) -> i64 {
+    let q = a / b
+    if a % b != 0 and ((a < 0) != (b < 0)) { q - 1 } else { q }
+}
+
+/// The epoch's day number (1 Thout 1 AM), in days from 1970-01-01.
+fn epoch() -> i64 {
+    -615558
+}
+
+/// The day number of a date in a 13-month 30-day calendar with this epoch.
+pub fn days_of(epoch_day: i64, year: i64, month: i64, day: i64) -> i64 {
+    epoch_day - 1 + 365 * (year - 1) + floor_div(year, 4) + 30 * (month - 1) + day
+}
+
+/// The date with this epoch for a day number.
+pub fn date_of(epoch_day: i64, d: i64) -> (i64, i64, i64) {
+    let year = floor_div(4 * (d - epoch_day) + 1463, 1461)
+    let month = 1 + floor_div(d - days_of(epoch_day, year, 1, 1), 30)
+    (year, month, d + 1 - days_of(epoch_day, year, month, 1))
+}
+
+pub fn from_unix_day(d: i64) -> CopticDate {
+    let (y, m, day) = date_of(epoch(), d)
+    CopticDate{ year: y, month: m, day: day }
+}
+
+pub fn to_unix_day(c: CopticDate) -> i64 {
+    days_of(epoch(), c.year, c.month, c.day)
+}
+
+pub fn is_leap_year(year: i64) -> bool {
+    ((year % 4) + 4) % 4 == 3
+}
+
+/// (era, year) as ICU shows it: "AM" for year 1 on, "" before.
+pub fn era_year(c: CopticDate) -> (str, i64) {
+    if c.year >= 1 { ("AM", c.year) } else { ("", 1 - c.year) }
+}

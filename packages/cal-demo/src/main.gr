@@ -1,0 +1,37 @@
+// One day, 18 October 2026 (day 20744 from 1970-01-01), in every calendar
+// here, as ICU gives it. scripts/cal_diff.sh holds them to ICU on tens of
+// thousands of days across three thousand years.
+import hijri
+import hebrewcal
+import persiancal
+import japaneseera
+import buddhistcal
+import roccal
+import ethiopiccal
+import indiancal
+import copticcal
+import chinesecal
+
+fn main() / {io} {
+    let d = 20744
+    assert_eq(hijri.from_unix_day(UmmAlQura, d), HijriDate{ year: 1448, month: 5, day: 7 })
+    assert_eq(hijri.from_unix_day(Civil, d), HijriDate{ year: 1448, month: 5, day: 6 })
+    let h = hebrewcal.from_unix_day(d)
+    assert_eq((h.year, hebrewcal.month_name(h.year, h.month), h.day), (5787, "Heshvan", 7))
+    assert_eq(persiancal.from_unix_day(d), PersianDate{ year: 1405, month: 7, day: 26 })
+    let j = japaneseera.from_unix_day(d)
+    assert_eq((j.era, j.year), ("Reiwa", 8))
+    assert_eq(buddhistcal.be_year(d), 2569)
+    assert_eq(roccal.from_unix_day(d), ("Minguo", 115, 10, 18))
+    assert_eq(ethiopiccal.from_unix_day(d), EthiopicDate{ year: 2019, month: 2, day: 8 })
+    assert_eq(indiancal.from_unix_day(d), IndianDate{ year: 1948, month: 7, day: 26 })
+    assert_eq(copticcal.from_unix_day(d), CopticDate{ year: 1743, month: 2, day: 8 })
+    match chinesecal.from_unix_day(China, d) {
+        Some(c) -> assert_eq((c.related_year, c.month, c.leap, c.day), (2026, 9, false, 9))
+        None -> panic("2026 is in the table")
+    }
+    // Rosh Hashanah 5807 is Monday 1 October 2046: a year that a misread
+    // postponement rule moves to Tuesday.
+    assert_eq(hebrewcal.to_unix_day(HebrewDate{ year: 5807, month: 1, day: 1 }), 28032)
+    print("cal: ok")
+}

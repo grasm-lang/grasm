@@ -1,0 +1,16 @@
+// The Minguo calendar: the Republic of China's, in official use in Taiwan.
+// Gregorian months and days; years counted from 1912, the founding of the
+// Republic -- Minguo 1 is 1912 -- and before it "B.R.O.C.", counting back
+// from 1, as ICU writes them. Built on `buddhistcal`'s Gregorian-Julian
+// calendar, as ICU's is.
+import buddhistcal
+
+/// (era, year, month, day) of a day number.
+pub fn from_unix_day(d: i64) -> (str, i64, i64, i64) {
+    let c = buddhistcal.civil_of(d)
+    if c.year >= 1912 { ("Minguo", c.year - 1911, c.month, c.day) } else { ("B.R.O.C.", 1912 - c.year, c.month, c.day) }
+}
+
+pub fn to_unix_day(minguo_year: i64, month: i64, day: i64) -> i64 {
+    buddhistcal.day_of(CivilDay{ year: minguo_year + 1911, month: month, day: day })
+}

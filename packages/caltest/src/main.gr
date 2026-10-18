@@ -1,0 +1,82 @@
+// The Grasm side of scripts/cal_diff.py: for a calendar and a list of day
+// numbers, each date as "era|year|month|day" the way ICU's formatToParts
+// gives it, with "!" added when converting back does not return the day.
+import hijri
+import hebrewcal
+import persiancal
+import japaneseera
+import buddhistcal
+import roccal
+import ethiopiccal
+import indiancal
+import copticcal
+import chinesecal
+
+fn mark(ok: bool) -> str {
+    if ok { "" } else { "!" }
+}
+
+fn one(cal: str, d: i64) -> str {
+    if cal == "coptic" {
+        let c = copticcal.from_unix_day(d)
+        let (era, y) = copticcal.era_year(c)
+        return "{era}|{y}|{c.month}|{c.day}" + mark(copticcal.to_unix_day(c) == d)
+    }
+    if cal == "ethiopic" or cal == "ethioaa" {
+        let e = ethiopiccal.from_unix_day(d)
+        let (era, y) = if cal == "ethioaa" { ("AA", ethiopiccal.amete_alem_year(e)) } else { ethiopiccal.era_year(e) }
+        return "{era}|{y}|{e.month}|{e.day}" + mark(ethiopiccal.to_unix_day(e) == d)
+    }
+    if cal == "persian" {
+        let p = persiancal.from_unix_day(d)
+        return "AP|{p.year}|{p.month}|{p.day}" + mark(persiancal.to_unix_day(p) == d)
+    }
+    if cal == "indian" {
+        let i = indiancal.from_unix_day(d)
+        return "Śaka|{i.year}|{i.month}|{i.day}" + mark(indiancal.to_unix_day(i) == d)
+    }
+    if cal.starts_with("islamic") {
+        let k = if cal == "islamic-tbla" { Tabular } else if cal == "islamic-umalqura" { UmmAlQura } else { Civil }
+        let h = hijri.from_unix_day(k, d)
+        return "AH|{h.year}|{h.month}|{h.day}" + mark(hijri.to_unix_day(k, h) == d)
+    }
+    if cal == "hebrew" {
+        let h = hebrewcal.from_unix_day(d)
+        return "AM|{h.year}|" + hebrewcal.month_name(h.year, h.month) + "|{h.day}" + mark(hebrewcal.to_unix_day(h) == d)
+    }
+    if cal == "japanese" {
+        let j = japaneseera.from_unix_day(d)
+        let back = japaneseera.to_unix_day(j) ?? -999999999
+        return j.era + "|{j.year}|{j.month}|{j.day}" + mark(back == d)
+    }
+    if cal == "buddhist" {
+        let c = buddhistcal.civil_of(d)
+        return "BE|{buddhistcal.be_year(d)}|{c.month}|{c.day}" + mark(buddhistcal.day_of(c) == d)
+    }
+    if cal == "roc" {
+        let (era, y, m, day) = roccal.from_unix_day(d)
+        let my = if era == "Minguo" { y } else { 1 - y }
+        return era + "|{y}|{m}|{day}" + mark(roccal.to_unix_day(my, m, day) == d)
+    }
+    let kind = if cal == "dangi" { Korea } else { China }
+    match chinesecal.from_unix_day(kind, d) {
+        None -> "none"
+        Some(c) -> {
+            let back = chinesecal.to_unix_day(kind, c) ?? -999999999
+            "|{c.related_year}|{c.month}" + if c.leap { "bis" } else { "" } + "|{c.day}" + mark(back == d)
+        }
+    }
+}
+
+fn main() / {io} {
+    let argv = args()
+    var i = 0
+    while i + 1 < argv.len() {
+        var out: [str] = []
+        for d in argv[i + 1].split(",") {
+            out.push(one(argv[i], d.parse_int() ?? 0))
+        }
+        print(out.join(","))
+        i = i + 2
+    }
+}

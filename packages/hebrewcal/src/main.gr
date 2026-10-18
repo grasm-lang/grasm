@@ -1,0 +1,122 @@
+// The Hebrew calendar: lunisolar, Israel's official calendar beside the
+// Gregorian, and the calendar of Jewish religious life everywhere.
+//
+// Months follow the mean lunar month (29 days, 12 hours, 793 parts of
+// 1080); seven years in nineteen add a second Adar; the new year, Rosh
+// Hashanah, starts at the molad of Tishri, moved by the four postponement
+// rules (never on Sunday, Wednesday or Friday, and the two GaTaRaD and
+// BeTUTaKPaT rules), which also set whether Heshvan and Kislev have 29 or
+// 30 days. The arithmetic is ICU's HebrewCalendar.
+//
+// Months are numbered as ICU numbers them, Tishri first: 1 Tishri, 2
+// Heshvan, 3 Kislev, 4 Tevet, 5 Shevat, 6 Adar I (only in a leap year), 7
+// Adar (Adar II in a leap year), 8 Nisan, 9 Iyar, 10 Sivan, 11 Tamuz, 12
+// Av, 13 Elul.
+
+type HebrewDate = {
+    year: i64,
+    month: i64,
+    day: i64,
+}
+
+fn floor_div(a: i64, b: i64) -> i64 {
+    let q = a / b
+    if a % b != 0 and ((a < 0) != (b < 0)) { q - 1 } else { q }
+}
+
+fn modulo(a: i64, b: i64) -> i64 {
+    a - b * floor_div(a, b)
+}
+
+pub fn is_leap_year(year: i64) -> bool {
+    modulo(12 * year + 17, 19) >= 12
+}
+
+/// Days from the Hebrew epoch to 1 Tishri of the year.
+fn start_of_year(year: i64) -> i64 {
+    let months = floor_div(235 * year - 234, 19)
+    let frac = months * 13753 + 12084
+    let day = months * 29 + floor_div(frac, 25920)
+    let parts = modulo(frac, 25920)
+    // Every rule reads the weekday of the molad itself (0 is Monday, the
+    // day counted from the previous noon): testing GaTaRaD or BeTUTaKPaT
+    // again after a Sunday molad moved to Monday postpones 38 years in
+    // 7000 a day too far, 5807 among them.
+    let wd = modulo(day, 7)
+    if wd == 1 and parts > 15 * 1080 + 204 and not is_leap_year(year) {
+        return day + 2
+    }
+    if wd == 0 and parts > 21 * 1080 + 589 and is_leap_year(year - 1) {
+        return day + 1
+    }
+    if wd == 2 or wd == 4 or wd == 6 { day + 1 } else { day }
+}
+
+fn year_length(year: i64) -> i64 {
+    start_of_year(year + 1) - start_of_year(year)
+}
+
+pub fn month_length(year: i64, month: i64) -> i64 {
+    let len = year_length(year)
+    let short_year = if len > 380 { len - 30 } else { len }
+    if month == 2 {
+        return if short_year == 355 { 30 } else { 29 }
+    }
+    if month == 3 {
+        return if short_year == 353 { 29 } else { 30 }
+    }
+    [30, 29, 30, 29, 30, 30, 29, 30, 29, 30, 29, 30, 29][month - 1]
+}
+
+fn months_in(year: i64) -> [i64] {
+    if is_leap_year(year) { [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13] } else { [1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 12, 13] }
+}
+
+/// The Hebrew epoch as a day number from 1970-01-01: ICU counts it as
+/// Julian Day 347997 on its own scale, which puts 1970-01-01 at 2440587.
+fn epoch() -> i64 {
+    347997 - 2440587
+}
+
+pub fn from_unix_day(d: i64) -> HebrewDate {
+    let since = d - epoch()
+    var year = floor_div(since * 98496, 35975351) + 1
+    while start_of_year(year) > since {
+        year = year - 1
+    }
+    while start_of_year(year + 1) <= since {
+        year = year + 1
+    }
+    var rest = since - start_of_year(year)
+    for m in months_in(year) {
+        let len = month_length(year, m)
+        if rest < len {
+            return HebrewDate{ year: year, month: m, day: rest + 1 }
+        }
+        rest = rest - len
+    }
+    HebrewDate{ year: year, month: 13, day: rest + 1 }
+}
+
+pub fn to_unix_day(h: HebrewDate) -> i64 {
+    var d = start_of_year(h.year) + epoch()
+    for m in months_in(h.year) {
+        if m == h.month {
+            return d + h.day - 1
+        }
+        d = d + month_length(h.year, m)
+    }
+    d + h.day - 1
+}
+
+/// The month's English name as ICU gives it.
+pub fn month_name(year: i64, month: i64) -> str {
+    let leap = is_leap_year(year)
+    if month == 7 {
+        return if leap { "Adar II" } else { "Adar" }
+    }
+    if month == 6 {
+        return "Adar I"
+    }
+    ["Tishri", "Heshvan", "Kislev", "Tevet", "Shevat", "", "", "Nisan", "Iyar", "Sivan", "Tamuz", "Av", "Elul"][month - 1]
+}
