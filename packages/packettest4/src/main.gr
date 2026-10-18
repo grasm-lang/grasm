@@ -1,0 +1,317 @@
+// The Grasm side of scripts/packet4_diff.py. Each case is `<op> x<hex>
+// x<hex>`; ops that end in `.ts` answer in the form tshark prints its
+// fields, so the driver can compare with tshark directly.
+import pcapng
+import dot11
+import dot15d4
+import btle
+import ikev2
+
+fn from_hex(text: str) -> bytes {
+    var out: [i64] = []
+    var i = 1
+    while i + 1 < text.len() {
+        out.push(text.substr(i, 2).parse_int_base(16) ?? 0)
+        i = i + 2
+    }
+    bytes_of(out)
+}
+
+fn hex(raw: bytes) -> str {
+    let digits = "0123456789abcdef"
+    var out = ""
+    var i = 0
+    while i < raw.len() {
+        out = out + digits.substr(raw.at(i) / 16, 1) + digits.substr(raw.at(i) % 16, 1)
+        i = i + 1
+    }
+    out
+}
+
+fn hexn(v: i64, width: i64) -> str {
+    let digits = "0123456789abcdef"
+    var out = ""
+    var i = width - 1
+    while i >= 0 {
+        out = out + digits.substr(v.ushr(4 * i).bit_and(15), 1)
+        i = i - 1
+    }
+    "0x" + out
+}
+
+fn flag(b: bool) -> str {
+    if b { "True" } else { "False" }
+}
+
+fn bit(b: bool) -> str {
+    if b { "1" } else { "0" }
+}
+
+// --- pcapng --------------------------------------------------------------
+
+fn pad9(n: i64) -> str {
+    var text = "{n}"
+    while text.len() < 9 {
+        text = "0" + text
+    }
+    text
+}
+
+fn answer_pcapng(what: str, a: bytes) -> str {
+    match pcapng.read(a) {
+        Err(_) -> "ERR"
+        Ok(sections) -> {
+            if what == "pcapng.rt" {
+                return hex(pcapng.write(sections))
+            }
+            var lines: [str] = []
+            for s in sections {
+                for p in s.packets {
+                    let iface = s.interfaces[p.iface]
+                    var time = ""
+                    if p.kind != 3 {
+                        let (secs, nanos) = pcapng.time_of(iface, s.big_endian, p.timestamp)
+                        time = "{secs}.{pad9(nanos)}"
+                    }
+                    let d = pcapng.direction(p, s.big_endian)
+                    let dir = if d == 1 { "1" } else if d == 2 { "0" } else { "" }
+                    // tshark names an interface by its description when it has no name.
+                    var name = pcapng.interface_name(iface)
+                    if name.len() == 0 {
+                        name = pcapng.interface_description(iface)
+                    }
+                    lines.push("{p.iface}|{time}|{p.original_len}|{p.captured.len()}|" + pcapng.comments(p.options).join(",") +
+                        "|{dir}|" + (if name.len() == 0 { "unknown" } else { name }) + "|" + pcapng.interface_description(iface) +
+                        "|" + hex(p.captured))
+                }
+            }
+            lines.join("#")
+        }
+    }
+}
+
+// --- 802.11 --------------------------------------------------------------
+
+fn answer_dot11(what: str, a: bytes) -> str {
+    if what == "dot11.fcs" {
+        return flag(dot11.check_fcs(a))
+    }
+    if what == "dot11.addfcs" {
+        return hex(dot11.append_fcs(a))
+    }
+    match dot11.decode(a) {
+        Err(_) -> "ERR"
+        Ok(f) -> {
+            if what == "dot11.rt" {
+                return hex(dot11.encode(f))
+            }
+            if what == "dot11.ds" {
+                return dot11.source(f) + "|" + dot11.destination(f) + "|" + dot11.bssid(f)
+            }
+            if what == "dot11.mgmt" {
+                return match dot11.management(f) {
+                    Err(_) -> "ERR"
+                    Ok(m) -> {
+                        let els = m.elements.map(|e| "{e.id}:" + hex(e.info)).join(",")
+                        let ssid = match dot11.ssid(m.elements) {
+                            Some(s) -> s
+                            None -> "-"
+                        }
+                        "ts={m.timestamp};iv={m.interval};cap={m.capability};li={m.listen_interval};ap={m.current_ap};" +
+                        "st={m.status};aid={m.aid};rs={m.reason};al={m.algorithm};tr={m.transaction};cat={m.category};" +
+                        "el={els};rest=" + hex(m.rest) + ";ssid={ssid};ch={dot11.channel(m.elements)};rates=" +
+                        dot11.rates(m.elements).map(|r| "{r}").join(",")
+                    }
+                }
+            }
+            "v={f.version};t={f.kind};s={f.subtype};f={f.flags};d={f.duration};a1={f.addr1};a2={f.addr2};a3={f.addr3};" +
+            "a4={f.addr4};sc={f.sequence};q={f.qos};h={f.ht_control};body=" + hex(f.body)
+        }
+    }
+}
+
+// --- 802.15.4 ------------------------------------------------------------
+
+fn pan_text(p: i64) -> str {
+    if p < 0 { "" } else { hexn(p, 4) }
+}
+
+fn answer_wpan(what: str, a: bytes) -> str {
+    if what == "wpan.fcs" {
+        return flag(dot15d4.check_fcs(a))
+    }
+    match dot15d4.decode(a, true) {
+        Err(_) -> "ERR"
+        Ok(f) -> {
+            if what == "wpan.rt" {
+                return hex(dot15d4.encode(f, true))
+            }
+            let s = f.secure
+            if what == "wpan.ts" {
+                let seq = if f.sequence < 0 { "" } else { "{f.sequence}" }
+                let d16 = if f.dest_mode == 2 { dot15d4.address_text(2, f.dest_addr) } else { "" }
+                let d64 = if f.dest_mode == 3 { dot15d4.address_text(3, f.dest_addr) } else { "" }
+                let s16 = if f.src_mode == 2 { dot15d4.address_text(2, f.src_addr) } else { "" }
+                let s64 = if f.src_mode == 3 { dot15d4.address_text(3, f.src_addr) } else { "" }
+                var sec = "||||"
+                if f.security and f.version > 0 {
+                    sec = hexn(s.level, 2) + "|" + hexn(s.key_mode, 2) + "|" +
+                    (if s.counter < 0 { "" } else { "{s.counter}" }) + "|" + (if s.key_index < 0 { "" } else { hexn(s.key_index, 2) }) +
+                    "|" + flag(s.counter_suppressed)
+                }
+                return hexn(f.frame_type, 4) + "|{seq}|" + pan_text(f.dest_pan) + "|{d16}|{d64}|" + pan_text(f.src_pan) + "|{s16}|{s64}|" +
+                sec + "|{f.version}"
+            }
+            if what == "wpan.beacon" {
+                return match dot15d4.beacon(f) {
+                    Err(_) -> "ERR"
+                    Ok(b) -> "bo={b.beacon_order};so={b.superframe_order};fcs={b.final_cap_slot};ble=" + bit(b.battery_extension) +
+                    ";pc=" + bit(b.pan_coordinator) + ";ap=" + bit(b.association_permit) + ";gp=" + bit(b.gts_permit) +
+                    ";ps=" + b.pending_short.map(|x| dot15d4.address_text(2, x)).join(",") + ";pl=" +
+                    b.pending_long.map(|x| dot15d4.address_text(3, x)).join(",") + ";payload=" + hex(b.payload)
+                }
+            }
+            "t={f.frame_type};sec=" + bit(f.security) + ";pend=" + bit(f.pending) + ";ack=" + bit(f.ack_request) + ";comp=" +
+            bit(f.pan_compression) + ";dm={f.dest_mode};ver={f.version};sm={f.src_mode};seq={f.sequence};dp={f.dest_pan};da=" +
+            dot15d4.address_text(f.dest_mode, f.dest_addr) + ";sp={f.src_pan};sa=" + dot15d4.address_text(f.src_mode, f.src_addr) +
+            ";lvl={s.level};km={s.key_mode};ctr={s.counter};ks=" + hex(s.key_source) + ";ki={s.key_index};cmd=" +
+            (if f.frame_type == 3 { "{dot15d4.command_id(f)}" } else { "-" }) + ";pl=" + hex(f.payload)
+        }
+    }
+}
+
+// --- Bluetooth LE --------------------------------------------------------
+
+fn answer_btle(what: str, a: bytes, b: bytes) -> str {
+    if what == "btle.crc" {
+        return hex(bytes_of([0, 1, 2].map(|i| btle.crc24(b.at(0) + b.at(1) * 256 + b.at(2) * 65536, a).ushr(8 * i).bit_and(255))))
+    }
+    match btle.split_packet(a) {
+        Err(_) -> "ERR"
+        Ok(parts) -> {
+            let (aa, pdu, crc) = parts
+            if aa != btle.advertising_access_address() {
+                return match btle.decode_data(pdu) {
+                    Err(_) -> "ERR"
+                    Ok(d) -> {
+                        if what == "btle.rt" {
+                            return hex(btle.encode_data(d))
+                        }
+                        hexn(d.llid, 2) + "|{d.nesn}|{d.sn}|" + flag(d.more_data) + "|{d.length}|" + hexn(aa, 8)
+                    }
+                }
+            }
+            match btle.decode_advertising(pdu) {
+                Err(_) -> "ERR"
+                Ok(adv) -> {
+                    if what == "btle.rt" {
+                        return hex(btle.encode_advertising(adv))
+                    }
+                    let k = adv.pdu_type
+                    let rx = if k == 1 or k == 3 or k == 5 { flag(adv.rx_random) } else { "" }
+                    let ok = btle.crc24(5592405, pdu) == crc
+                    let target = if k == 1 or k == 5 { adv.target } else { "" }
+                    let scanner = if k == 3 { adv.target } else { "" }
+                    let ads = match btle.ad_structures(adv.data) {
+                        Ok(list) -> list
+                        Err(_) -> []
+                    }
+                    let types = if k == 0 or k == 2 or k == 4 or k == 6 { ads.map(|x| hexn(x.kind, 2)).join(",") } else { "" }
+                    let lens = if k == 0 or k == 2 or k == 4 or k == 6 { ads.map(|x| "{x.data.len() + 1}").join(",") } else { "" }
+                    var ll = "|||||||||"
+                    if k == 5 {
+                        let c = adv.connect
+                        ll = hexn(c.access_address, 8) + "|" + hexn(c.crc_init, 6) + "|{c.window_size}|{c.window_offset}|" +
+                        "{c.interval}|{c.latency}|{c.timeout}|" + hex(bytes_of([0, 1, 2, 3, 4].map(|i| c.channel_map.ushr(8 * i).bit_and(255)))) +
+                        "|{c.hop}|{c.sleep_clock_accuracy}"
+                    }
+                    hexn(aa, 8) + "|" + hexn(k, 2) + "|" + flag(adv.tx_random) + "|{rx}|{adv.length}|{adv.advertiser}|{target}|" +
+                    "{scanner}|" + (if ok { "" } else { "1" }) + "|" + ll + "|{types}|{lens}"
+                }
+            }
+        }
+    }
+}
+
+// --- IKEv2 ---------------------------------------------------------------
+
+fn ike_payload(p: IkePayload) -> str {
+    let head = "{p.kind}/" + bit(p.critical) + "/{p.reserved}/"
+    let k = p.kind
+    let body = if k == 33 {
+        match ikev2.proposals(p) {
+            Err(_) -> "ERR"
+            Ok(props) -> props.map(|x| "{x.number},{x.protocol}," + hex(x.spi) + ",[" + x.transforms.map(|t|
+                "{t.kind}.{t.id}." + t.attributes.map(|at| if at.short { "{at.kind}:{at.value}" } else { "{at.kind}=" + hex(at.data) }).join("+")
+            ).join(" ") + "]").join(" ")
+        }
+    } else if k == 34 or k == 35 or k == 36 or k == 37 or k == 38 or k == 39 {
+        match ikev2.typed_body(p) {
+            Err(_) -> "ERR"
+            Ok(tb) -> "{tb.0}:" + hex(tb.1)
+        }
+    } else if k == 41 {
+        match ikev2.notify(p) {
+            Err(_) -> "ERR"
+            Ok(n) -> "{n.protocol}," + hex(n.spi) + ",{n.kind}," + hex(n.data)
+        }
+    } else if k == 42 {
+        match ikev2.delete(p) {
+            Err(_) -> "ERR"
+            Ok(d) -> "{d.protocol},{d.spi_size}," + d.spis.map(|s| hex(s)).join(".")
+        }
+    } else if k == 44 or k == 45 {
+        match ikev2.traffic_selectors(p) {
+            Err(_) -> "ERR"
+            Ok(ts) -> ts.map(|t| "{t.kind},{t.protocol},{t.start_port},{t.end_port},{t.start},{t.end}").join(" ")
+        }
+    } else if k == 47 {
+        match ikev2.configuration(p) {
+            Err(_) -> "ERR"
+            Ok(cp) -> "{cp.0}:" + cp.1.map(|x| "{x.0}=" + hex(x.1)).join(",")
+        }
+    } else {
+        hex(p.body)
+    }
+    head + body
+}
+
+fn answer_ike(what: str, a: bytes) -> str {
+    match ikev2.decode(a) {
+        Err(_) -> "ERR"
+        Ok(m) -> {
+            if what == "ike.rt" {
+                return hex(ikev2.encode(m))
+            }
+            let h = m.header
+            "spii=" + hex(h.spi_i) + ";spir=" + hex(h.spi_r) + ";np={h.next};v={h.major}.{h.minor};x={h.exchange};f={h.flags};" +
+            "id={h.message_id};len={h.length};i=" + bit(ikev2.is_initiator(h)) + ";r=" + bit(ikev2.is_response(h)) + ";inside={m.next_inside};" +
+            m.payloads.map(|p| ike_payload(p)).join(";")
+        }
+    }
+}
+
+fn answer(what: str, a: bytes, b: bytes) -> str {
+    if what.starts_with("pcapng") {
+        return answer_pcapng(what, a)
+    }
+    if what.starts_with("dot11") {
+        return answer_dot11(what, a)
+    }
+    if what.starts_with("wpan") {
+        return answer_wpan(what, a)
+    }
+    if what.starts_with("btle") {
+        return answer_btle(what, a, b)
+    }
+    answer_ike(what, a)
+}
+
+fn main() / {io} {
+    let argv = args()
+    var i = 0
+    while i + 2 < argv.len() {
+        print(answer(argv[i], from_hex(argv[i + 1]), from_hex(argv[i + 2])))
+        i = i + 3
+    }
+}

@@ -1,0 +1,406 @@
+// IEEE 802.15.4: the radio frame under Zigbee, Thread, 6LoWPAN and
+// Wi-SUN.
+//
+// Every low-power mesh in a smart-home or industrial sensor network sends
+// these frames, and a sniffer capture of one (Wireshark link type 195,
+// or 230 without the checksum) is the first thing anyone debugging it
+// reads. The header is short and almost every field is optional:
+//
+// - the 16-bit frame control says the frame type (beacon, data, ack,
+//   command), whether a security header follows, and the addressing mode
+//   of each end: none, a 16-bit short address or a 64-bit extended one;
+// - which PAN identifiers are present depends on those modes and the PAN
+//   ID compression bit, by one rule in the 2003 and 2006 editions and by
+//   a fourteen-row table in 2015 (frame version 2), which this follows;
+// - 2015 frames may also suppress the sequence number;
+// - the auxiliary security header's length depends on its key identifier
+//   mode, and in 2015 frames the frame counter may be suppressed; 2003
+//   frames (version 0) have no such header, their security material
+//   being the start of the payload, where it is left;
+// - the two-byte frame check sequence is CRC-16/KERMIT.
+//
+// Beacons carry a superframe specification, GTS fields and pending
+// addresses before their payload, which `beacon` reads. Header and
+// payload information elements (2015's IE Present bit) are left in the
+// payload.
+//
+// Checked against scapy, which builds frames from random fields, and
+// against tshark's reading of 2015 frames.
+
+type Dot15d4Error =
+    | Dot15d4Truncated(need: i64, have: i64)
+    | Dot15d4BadMode(mode: i64)
+
+/// The auxiliary security header. `counter` is -1 when suppressed; the key
+/// source is empty and the index -1 when the key identifier mode has none.
+type Dot15d4Security = {
+    level: i64,
+    key_mode: i64,
+    counter_suppressed: bool,
+    asn_in_nonce: bool,
+    counter: i64,
+    key_source: bytes,
+    key_index: i64,
+}
+
+/// A frame. Addresses are numbers, a short address in 16 bits and an
+/// extended one in all 64; a PAN identifier or address that is absent is
+/// -1 with its mode saying so. `sequence` is -1 when suppressed.
+type Dot15d4Frame = {
+    frame_type: i64,
+    security: bool,
+    pending: bool,
+    ack_request: bool,
+    pan_compression: bool,
+    sequence_suppressed: bool,
+    ie_present: bool,
+    dest_mode: i64,
+    version: i64,
+    src_mode: i64,
+    sequence: i64,
+    dest_pan: i64,
+    dest_addr: i64,
+    src_pan: i64,
+    src_addr: i64,
+    secure: Dot15d4Security,
+    payload: bytes,
+}
+
+/// A beacon's fields before its payload.
+type Dot15d4Beacon = {
+    beacon_order: i64,
+    superframe_order: i64,
+    final_cap_slot: i64,
+    battery_extension: bool,
+    pan_coordinator: bool,
+    association_permit: bool,
+    gts_permit: bool,
+    gts_directions: i64,
+    gts: [i64],
+    pending_short: [i64],
+    pending_long: [i64],
+    payload: bytes,
+}
+
+fn le(data: bytes, at: i64, n: i64) -> i64 {
+    var v = 0
+    var i = n - 1
+    while i >= 0 {
+        v = v.shl(8) + data.at(at + i)
+        i = i - 1
+    }
+    return v
+}
+
+fn addr_len(mode: i64) -> i64 {
+    return if mode == 2 { 2 } else if mode == 3 { 8 } else { 0 }
+}
+
+/// Which PAN identifiers a frame carries: destination, source.
+fn pans(version: i64, dest_mode: i64, src_mode: i64, compression: bool) -> (bool, bool) {
+    let d = dest_mode != 0
+    let s = src_mode != 0
+    if version < 2 {
+        return (d, s and not (compression and d))
+    }
+    if not d and not s {
+        return (compression, false)
+    }
+    if d and not s {
+        return (not compression, false)
+    }
+    if not d {
+        return (false, not compression)
+    }
+    if dest_mode == 3 and src_mode == 3 {
+        return (not compression, false)
+    }
+    return (true, not compression)
+}
+
+/// CRC-16/KERMIT, the frame check sequence.
+pub fn fcs(data: bytes) -> i64 {
+    var crc = 0
+    var i = 0
+    while i < data.len() {
+        crc = crc.bit_xor(data.at(i))
+        var k = 0
+        while k < 8 {
+            if crc % 2 == 1 {
+                crc = (crc / 2).bit_xor(33800)
+            } else {
+                crc = crc / 2
+            }
+            k = k + 1
+        }
+        i = i + 1
+    }
+    return crc
+}
+
+/// Whether the last two bytes are the frame check sequence of the rest.
+pub fn check_fcs(frame: bytes) -> bool {
+    if frame.len() < 2 {
+        return false
+    }
+    let n = frame.len() - 2
+    return fcs(frame.slice(0, n)) == le(frame, n, 2)
+}
+
+fn no_security() -> Dot15d4Security {
+    return Dot15d4Security{ level: 0, key_mode: 0, counter_suppressed: false, asn_in_nonce: false, counter: 0 - 1,
+        key_source: bytes_of([]), key_index: 0 - 1 }
+}
+
+fn need(frame: bytes, n: i64) -> () ! Dot15d4Error {
+    if frame.len() < n {
+        fail(Dot15d4Truncated(n, frame.len()))
+    }
+}
+
+/// The auxiliary security header at `at`, and where it ends.
+fn security_header(data: bytes, from: i64, version: i64) -> (Dot15d4Security, i64) ! Dot15d4Error {
+    var at = from
+    try need(data, at + 1)
+    let sc = data.at(at)
+    var s = no_security()
+    s.level = sc % 8
+    s.key_mode = sc / 8 % 4
+    s.counter_suppressed = version == 2 and sc / 32 % 2 == 1
+    s.asn_in_nonce = version == 2 and sc / 64 % 2 == 1
+    at = at + 1
+    if not s.counter_suppressed {
+        try need(data, at + 4)
+        s.counter = le(data, at, 4)
+        at = at + 4
+    }
+    let source = if s.key_mode == 2 { 4 } else if s.key_mode == 3 { 8 } else { 0 }
+    if s.key_mode != 0 {
+        try need(data, at + source + 1)
+        s.key_source = data.slice(at, at + source)
+        s.key_index = data.at(at + source)
+        at = at + source + 1
+    }
+    return (s, at)
+}
+
+/// A frame's header and payload; with `has_fcs` the last two bytes are
+/// the frame check sequence and are left out of the payload (not checked:
+/// `check_fcs` does that).
+pub fn decode(frame: bytes, has_fcs: bool) -> Dot15d4Frame ! Dot15d4Error {
+    let end = if has_fcs { frame.len() - 2 } else { frame.len() }
+    try need(frame, if has_fcs { 4 } else { 2 })
+    let data = frame.slice(0, end)
+    let fc = le(data, 0, 2)
+    let dest_mode = fc.ushr(10) % 4
+    let src_mode = fc.ushr(14) % 4
+    if dest_mode == 1 {
+        fail(Dot15d4BadMode(dest_mode))
+    }
+    if src_mode == 1 {
+        fail(Dot15d4BadMode(src_mode))
+    }
+    let version = fc.ushr(12) % 4
+    let compression = fc.ushr(6) % 2 == 1
+    let suppressed = version == 2 and fc.ushr(8) % 2 == 1
+    var at = 2
+    var sequence = 0 - 1
+    if not suppressed {
+        try need(data, 3)
+        sequence = data.at(2)
+        at = 3
+    }
+    let (dp, sp) = pans(version, dest_mode, src_mode, compression)
+    var f = Dot15d4Frame{ frame_type: fc % 8, security: fc.ushr(3) % 2 == 1, pending: fc.ushr(4) % 2 == 1,
+        ack_request: fc.ushr(5) % 2 == 1, pan_compression: compression, sequence_suppressed: suppressed,
+        ie_present: version == 2 and fc.ushr(9) % 2 == 1, dest_mode: dest_mode, version: version,
+        src_mode: src_mode, sequence: sequence, dest_pan: 0 - 1, dest_addr: 0 - 1, src_pan: 0 - 1,
+        src_addr: 0 - 1, secure: no_security(), payload: bytes_of([]) }
+    if dp {
+        try need(data, at + 2)
+        f.dest_pan = le(data, at, 2)
+        at = at + 2
+    }
+    if dest_mode != 0 {
+        let n = addr_len(dest_mode)
+        try need(data, at + n)
+        f.dest_addr = le(data, at, n)
+        at = at + n
+    }
+    if sp {
+        try need(data, at + 2)
+        f.src_pan = le(data, at, 2)
+        at = at + 2
+    }
+    if src_mode != 0 {
+        let n = addr_len(src_mode)
+        try need(data, at + n)
+        f.src_addr = le(data, at, n)
+        at = at + n
+    }
+    if f.security and version > 0 {
+        let (secure, after) = try security_header(data, at, version)
+        f.secure = secure
+        at = after
+    }
+    f.payload = data.slice(at, data.len())
+    return f
+}
+
+fn put(out: [i64], v: i64, n: i64) -> [i64] {
+    var o = out
+    var i = 0
+    while i < n {
+        o.push(v.ushr(8 * i).bit_and(255))
+        i = i + 1
+    }
+    return o
+}
+
+/// A frame back to bytes, with its frame check sequence when asked.
+/// Fields the frame control leaves out are not written.
+pub fn encode(f: Dot15d4Frame, with_fcs: bool) -> bytes {
+    var fc = f.frame_type + f.dest_mode * 1024 + f.version * 4096 + f.src_mode * 16384
+    if f.security {
+        fc = fc + 8
+    }
+    if f.pending {
+        fc = fc + 16
+    }
+    if f.ack_request {
+        fc = fc + 32
+    }
+    if f.pan_compression {
+        fc = fc + 64
+    }
+    let suppressed = f.version == 2 and f.sequence_suppressed
+    if suppressed {
+        fc = fc + 256
+    }
+    if f.version == 2 and f.ie_present {
+        fc = fc + 512
+    }
+    var out = put([], fc, 2)
+    if not suppressed {
+        out.push(f.sequence % 256)
+    }
+    let (dp, sp) = pans(f.version, f.dest_mode, f.src_mode, f.pan_compression)
+    if dp {
+        out = put(out, f.dest_pan, 2)
+    }
+    out = put(out, f.dest_addr, addr_len(f.dest_mode))
+    if sp {
+        out = put(out, f.src_pan, 2)
+    }
+    out = put(out, f.src_addr, addr_len(f.src_mode))
+    if f.security and f.version > 0 {
+        let s = f.secure
+        let cs = f.version == 2 and s.counter_suppressed
+        var sc = s.level + s.key_mode * 8
+        if cs {
+            sc = sc + 32
+        }
+        if f.version == 2 and s.asn_in_nonce {
+            sc = sc + 64
+        }
+        out.push(sc)
+        if not cs {
+            out = put(out, s.counter, 4)
+        }
+        if s.key_mode != 0 {
+            var i = 0
+            while i < s.key_source.len() {
+                out.push(s.key_source.at(i))
+                i = i + 1
+            }
+            out.push(s.key_index)
+        }
+    }
+    let body = bytes_of(out).concat(f.payload)
+    if not with_fcs {
+        return body
+    }
+    let c = fcs(body)
+    return body.concat(bytes_of([c % 256, c / 256]))
+}
+
+/// A beacon frame's superframe specification, GTS fields, pending
+/// addresses and payload. GTS descriptors are three bytes each, kept as
+/// `address * 256 + slot info`.
+pub fn beacon(f: Dot15d4Frame) -> Dot15d4Beacon ! Dot15d4Error {
+    let p = f.payload
+    try need(p, 4)
+    let sf = le(p, 0, 2)
+    let gts_spec = p.at(2)
+    let count = gts_spec % 8
+    var at = 3
+    var directions = 0
+    var gts: [i64] = []
+    if count > 0 {
+        try need(p, at + 1 + 3 * count + 1)
+        directions = p.at(at) % 128
+        at = at + 1
+        var i = 0
+        while i < count {
+            gts.push(le(p, at, 2) * 256 + p.at(at + 2))
+            at = at + 3
+            i = i + 1
+        }
+    }
+    try need(p, at + 1)
+    let pending = p.at(at)
+    at = at + 1
+    let shorts = pending % 8
+    let longs = pending / 16 % 8
+    try need(p, at + 2 * shorts + 8 * longs)
+    var short_addrs: [i64] = []
+    var i = 0
+    while i < shorts {
+        short_addrs.push(le(p, at, 2))
+        at = at + 2
+        i = i + 1
+    }
+    var long_addrs: [i64] = []
+    i = 0
+    while i < longs {
+        long_addrs.push(le(p, at, 8))
+        at = at + 8
+        i = i + 1
+    }
+    return Dot15d4Beacon{ beacon_order: sf % 16, superframe_order: sf / 16 % 16, final_cap_slot: sf / 256 % 16,
+        battery_extension: sf / 4096 % 2 == 1, pan_coordinator: sf / 16384 % 2 == 1,
+        association_permit: sf / 32768 % 2 == 1, gts_permit: gts_spec / 128 == 1, gts_directions: directions,
+        gts: gts, pending_short: short_addrs, pending_long: long_addrs, payload: p.slice(at, p.len()) }
+}
+
+/// A MAC command frame's command identifier, or -1 for an empty payload.
+pub fn command_id(f: Dot15d4Frame) -> i64 {
+    return if f.payload.len() > 0 { f.payload.at(0) } else { 0 - 1 }
+}
+
+/// An address as Wireshark writes it: `0x1234` for a short address, eight
+/// colon-separated bytes, most significant first, for an extended one,
+/// "" for none.
+pub fn address_text(mode: i64, addr: i64) -> str {
+    let digits = "0123456789abcdef"
+    if mode == 2 {
+        var out = "0x"
+        var shift = 12
+        while shift >= 0 {
+            out = out + digits.substr(addr.ushr(shift).bit_and(15), 1)
+            shift = shift - 4
+        }
+        return out
+    }
+    if mode != 3 {
+        return ""
+    }
+    var parts: [str] = []
+    var i = 7
+    while i >= 0 {
+        let b = addr.ushr(8 * i).bit_and(255)
+        parts.push(digits.substr(b / 16, 1) + digits.substr(b % 16, 1))
+        i = i - 1
+    }
+    return parts.join(":")
+}

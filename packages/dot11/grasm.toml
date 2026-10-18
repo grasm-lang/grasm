@@ -1,0 +1,8 @@
+[package]
+name = "dot11"
+version = "1.0.0"
+capabilities = []
+
+[dependencies.crc32]
+path = "../crc32"
+version = "^1.0.0"

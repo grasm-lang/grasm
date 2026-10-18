@@ -1,0 +1,4 @@
+[package]
+name = "pcapng"
+version = "1.0.0"
+capabilities = []

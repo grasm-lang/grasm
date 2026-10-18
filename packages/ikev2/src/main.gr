@@ -1,0 +1,407 @@
+// IKEv2 messages: the key exchange in front of every IPsec VPN.
+//
+// strongSwan, libreswan, Windows' built-in VPN and every cloud provider's
+// site-to-site tunnel negotiate IPsec with IKEv2 (RFC 7296) on UDP ports
+// 500 and 4500. When a tunnel will not come up, the answer is in these
+// messages: which proposals each side offered, which Diffie-Hellman group,
+// which identities, and which Notify said no.
+//
+// A message is a 28-byte header (both SPIs, the exchange type, the
+// initiator and response flags, the message ID and the length) and a
+// chain of payloads, each naming the type of the one after it in a
+// generic header that also carries the critical bit and the length. The
+// Encrypted payload (SK) ends the chain: what it names as next is the
+// first payload inside the ciphertext, which this package leaves alone.
+//
+// The typed readers cover what a negotiation is made of: Security
+// Associations (proposals, transforms, and attributes in both their
+// type-value and type-length-value forms), Key Exchange, Identification,
+// Certificate, Authentication, Nonce, Notify, Delete, Vendor ID, Traffic
+// Selectors and Configuration.
+//
+// Checked against scapy, which builds every message from random payloads
+// and fields.
+
+type IkeError =
+    | IkeTruncated(at: i64, need: i64)
+    | IkeBadLength(at: i64)
+
+type IkeHeader = {
+    spi_i: bytes,
+    spi_r: bytes,
+    next: i64,
+    major: i64,
+    minor: i64,
+    exchange: i64,
+    flags: i64,
+    message_id: i64,
+    length: i64,
+}
+
+/// One payload: its type, the critical bit, the seven reserved bits, and
+/// its body after the generic header.
+type IkePayload = { kind: i64, critical: bool, reserved: i64, body: bytes }
+
+/// The header and payloads. `next_inside` is what the last payload names
+/// as next: 0 unless it is an Encrypted payload.
+type IkeMessage = { header: IkeHeader, payloads: [IkePayload], next_inside: i64 }
+
+/// A transform attribute. `short` attributes (the top bit of the type set)
+/// hold a 16-bit value in `value`; the others hold bytes in `data`.
+type IkeAttribute = { kind: i64, short: bool, value: i64, data: bytes }
+
+type IkeTransform = { kind: i64, id: i64, attributes: [IkeAttribute] }
+
+type IkeProposal = { number: i64, protocol: i64, spi: bytes, transforms: [IkeTransform] }
+
+type IkeNotify = { protocol: i64, spi: bytes, kind: i64, data: bytes }
+
+type IkeDelete = { protocol: i64, spi_size: i64, spis: [bytes] }
+
+/// A traffic selector. Addresses are written in the usual text form.
+type IkeSelector = { kind: i64, protocol: i64, start_port: i64, end_port: i64, start: str, end: str }
+
+pub fn sa_type() -> i64 {
+    return 33
+}
+
+pub fn encrypted_type() -> i64 {
+    return 46
+}
+
+fn be(data: bytes, at: i64, n: i64) -> i64 {
+    var v = 0
+    var i = 0
+    while i < n {
+        v = v.shl(8) + data.at(at + i)
+        i = i + 1
+    }
+    return v
+}
+
+fn put(out: [i64], v: i64, n: i64) -> [i64] {
+    var o = out
+    var i = n - 1
+    while i >= 0 {
+        o.push(v.ushr(8 * i).bit_and(255))
+        i = i - 1
+    }
+    return o
+}
+
+fn need(data: bytes, at: i64, n: i64) -> () ! IkeError {
+    if at + n > data.len() {
+        fail(IkeTruncated(at, n))
+    }
+}
+
+/// A message's header and payload chain. The header's length is reported,
+/// not enforced: a message read from a capture is often cut short or
+/// padded, and the chain's own lengths are what is followed.
+pub fn decode(data: bytes) -> IkeMessage ! IkeError {
+    try need(data, 0, 28)
+    let header = IkeHeader{ spi_i: data.slice(0, 8), spi_r: data.slice(8, 16), next: data.at(16),
+        major: data.at(17) / 16, minor: data.at(17) % 16, exchange: data.at(18), flags: data.at(19),
+        message_id: be(data, 20, 4), length: be(data, 24, 4) }
+    var payloads: [IkePayload] = []
+    var kind = header.next
+    var at = 28
+    while kind != 0 {
+        try need(data, at, 4)
+        let len = be(data, at + 2, 2)
+        if len < 4 {
+            fail(IkeBadLength(at))
+        }
+        try need(data, at, len)
+        payloads.push(IkePayload{ kind: kind, critical: data.at(at + 1) >= 128, reserved: data.at(at + 1) % 128,
+            body: data.slice(at + 4, at + len) })
+        let next = data.at(at)
+        at = at + len
+        if kind == 46 {
+            return IkeMessage{ header: header, payloads: payloads, next_inside: next }
+        }
+        kind = next
+    }
+    return IkeMessage{ header: header, payloads: payloads, next_inside: 0 }
+}
+
+/// A message back to bytes: the chain's next-payload fields, every length
+/// and the header's length recomputed.
+pub fn encode(m: IkeMessage) -> bytes {
+    var body: [i64] = []
+    var i = 0
+    while i < m.payloads.len() {
+        let p = m.payloads[i]
+        let next = if i + 1 < m.payloads.len() { m.payloads[i + 1].kind } else { m.next_inside }
+        body.push(next)
+        body.push(if p.critical { 128 } else { 0 } + p.reserved % 128)
+        body = put(body, p.body.len() + 4, 2)
+        var k = 0
+        while k < p.body.len() {
+            body.push(p.body.at(k))
+            k = k + 1
+        }
+        i = i + 1
+    }
+    let h = m.header
+    var out: [i64] = []
+    var k = 0
+    while k < 8 {
+        out.push(h.spi_i.at(k))
+        k = k + 1
+    }
+    k = 0
+    while k < 8 {
+        out.push(h.spi_r.at(k))
+        k = k + 1
+    }
+    out.push(if m.payloads.len() > 0 { m.payloads[0].kind } else { 0 })
+    out.push(h.major * 16 + h.minor)
+    out.push(h.exchange)
+    out.push(h.flags)
+    out = put(put(out, h.message_id, 4), body.len() + 28, 4)
+    return bytes_of(out + body)
+}
+
+/// The Initiator flag: the sender is the original initiator.
+pub fn is_initiator(h: IkeHeader) -> bool {
+    return h.flags.bit_and(8) != 0
+}
+
+/// The Response flag.
+pub fn is_response(h: IkeHeader) -> bool {
+    return h.flags.bit_and(32) != 0
+}
+
+fn attributes(data: bytes, from: i64, to: i64) -> [IkeAttribute] ! IkeError {
+    var out: [IkeAttribute] = []
+    var at = from
+    while at < to {
+        if at + 4 > to {
+            fail(IkeTruncated(at, 4))
+        }
+        let t = be(data, at, 2)
+        if t >= 32768 {
+            out.push(IkeAttribute{ kind: t - 32768, short: true, value: be(data, at + 2, 2), data: bytes_of([]) })
+            at = at + 4
+        } else {
+            let n = be(data, at + 2, 2)
+            if at + 4 + n > to {
+                fail(IkeTruncated(at, 4 + n))
+            }
+            out.push(IkeAttribute{ kind: t, short: false, value: 0 - 1, data: data.slice(at + 4, at + 4 + n) })
+            at = at + 4 + n
+        }
+    }
+    return out
+}
+
+fn substructures(data: bytes, header: i64) -> [(i64, i64)] ! IkeError {
+    // Proposals and transforms each start with a last-or-more byte, a
+    // reserved byte and a length; `header` is how far in their length is.
+    var out: [(i64, i64)] = []
+    var at = 0
+    while at < data.len() {
+        try need(data, at, header)
+        let len = be(data, at + 2, 2)
+        if len < header or at + len > data.len() {
+            fail(IkeBadLength(at))
+        }
+        out.push((at, at + len))
+        let more = data.at(at)
+        at = at + len
+        if more == 0 {
+            break
+        }
+    }
+    return out
+}
+
+/// A Security Association payload's proposals.
+pub fn proposals(p: IkePayload) -> [IkeProposal] ! IkeError {
+    var out: [IkeProposal] = []
+    let b = p.body
+    for span in try substructures(b, 8) {
+        let at = span.0
+        let spi_size = b.at(at + 6)
+        try need(b, at, 8 + spi_size)
+        let tdata = b.slice(at + 8 + spi_size, span.1)
+        var transforms: [IkeTransform] = []
+        for t in try substructures(tdata, 8) {
+            transforms.push(IkeTransform{ kind: tdata.at(t.0 + 4), id: be(tdata, t.0 + 6, 2),
+                attributes: try attributes(tdata, t.0 + 8, t.1) })
+        }
+        out.push(IkeProposal{ number: b.at(at + 4), protocol: b.at(at + 5), spi: b.slice(at + 8, at + 8 + spi_size),
+            transforms: transforms })
+    }
+    return out
+}
+
+/// Proposals back to a Security Association payload's body.
+pub fn encode_proposals(props: [IkeProposal]) -> bytes {
+    var out: [i64] = []
+    var i = 0
+    while i < props.len() {
+        let p = props[i]
+        var tbytes: [i64] = []
+        var k = 0
+        while k < p.transforms.len() {
+            let t = p.transforms[k]
+            var attrs: [i64] = []
+            for a in t.attributes {
+                if a.short {
+                    attrs = put(put(attrs, a.kind + 32768, 2), a.value, 2)
+                } else {
+                    attrs = put(put(attrs, a.kind, 2), a.data.len(), 2) + a.data.to_list()
+                }
+            }
+            tbytes = put(put(tbytes + [if k + 1 < p.transforms.len() { 3 } else { 0 }, 0], 8 + attrs.len(), 2) +
+                [t.kind, 0], t.id, 2) + attrs
+            k = k + 1
+        }
+        out = put(out + [if i + 1 < props.len() { 2 } else { 0 }, 0], 8 + p.spi.len() + tbytes.len(), 2) +
+        [p.number, p.protocol, p.spi.len(), p.transforms.len()] + p.spi.to_list() + tbytes
+        i = i + 1
+    }
+    return bytes_of(out)
+}
+
+/// A payload whose body is a one- or two-byte type, reserved bytes, then
+/// data: Key Exchange (group, 2 + 2), Identification (type, 1 + 3),
+/// Certificate and Certificate Request (encoding, 1 + 0), Authentication
+/// (method, 1 + 3).
+pub fn typed_body(p: IkePayload) -> (i64, bytes) ! IkeError {
+    let b = p.body
+    let (width, skip) = if p.kind == 34 { (2, 4) } else if p.kind == 37 or p.kind == 38 { (1, 1) } else { (1, 4) }
+    try need(b, 0, skip)
+    return (be(b, 0, width), b.slice(skip, b.len()))
+}
+
+/// A Notify payload.
+pub fn notify(p: IkePayload) -> IkeNotify ! IkeError {
+    let b = p.body
+    try need(b, 0, 4)
+    let spi_size = b.at(1)
+    try need(b, 0, 4 + spi_size)
+    return IkeNotify{ protocol: b.at(0), spi: b.slice(4, 4 + spi_size), kind: be(b, 2, 2),
+        data: b.slice(4 + spi_size, b.len()) }
+}
+
+/// A Delete payload.
+pub fn delete(p: IkePayload) -> IkeDelete ! IkeError {
+    let b = p.body
+    try need(b, 0, 4)
+    let size = b.at(1)
+    let count = be(b, 2, 2)
+    try need(b, 4, size * count)
+    var spis: [bytes] = []
+    var i = 0
+    while i < count {
+        spis.push(b.slice(4 + i * size, 4 + (i + 1) * size))
+        i = i + 1
+    }
+    return IkeDelete{ protocol: b.at(0), spi_size: size, spis: spis }
+}
+
+fn ip_text(b: bytes, at: i64, n: i64) -> str {
+    if n == 4 {
+        return "{b.at(at)}.{b.at(at + 1)}.{b.at(at + 2)}.{b.at(at + 3)}"
+    }
+    // IPv6, compressed the way RFC 5952 says: the longest run of two or
+    // more zero groups, the first if tied, becomes "::".
+    let digits = "0123456789abcdef"
+    var groups: [i64] = []
+    var i = 0
+    while i < 8 {
+        groups.push(be(b, at + 2 * i, 2))
+        i = i + 1
+    }
+    var best = 0 - 1
+    var best_len = 1
+    i = 0
+    while i < 8 {
+        if groups[i] == 0 {
+            var j = i
+            while j < 8 and groups[j] == 0 {
+                j = j + 1
+            }
+            if j - i > best_len {
+                best = i
+                best_len = j - i
+            }
+            i = j
+        } else {
+            i = i + 1
+        }
+    }
+    var parts: [str] = []
+    i = 0
+    while i < 8 {
+        if i == best {
+            parts.push(if i == 0 { ":" } else { "" })
+            i = i + best_len
+            if i == 8 {
+                parts.push("")
+            }
+            continue
+        }
+        var g = groups[i]
+        var text = ""
+        if g == 0 {
+            text = "0"
+        }
+        while g > 0 {
+            text = digits.substr(g % 16, 1) + text
+            g = g / 16
+        }
+        parts.push(text)
+        i = i + 1
+    }
+    return parts.join(":")
+}
+
+/// A Traffic Selector payload's selectors: types 7 (IPv4 range) and 8
+/// (IPv6 range); a selector of another type is kept with empty addresses.
+pub fn traffic_selectors(p: IkePayload) -> [IkeSelector] ! IkeError {
+    let b = p.body
+    try need(b, 0, 4)
+    let count = b.at(0)
+    var out: [IkeSelector] = []
+    var at = 4
+    var i = 0
+    while i < count {
+        try need(b, at, 4)
+        let kind = b.at(at)
+        let len = be(b, at + 2, 2)
+        if len < 8 {
+            fail(IkeBadLength(at))
+        }
+        try need(b, at, len)
+        let n = if kind == 7 { 4 } else if kind == 8 { 16 } else { 0 }
+        if n > 0 and len < 8 + 2 * n {
+            fail(IkeBadLength(at))
+        }
+        out.push(IkeSelector{ kind: kind, protocol: b.at(at + 1), start_port: be(b, at + 4, 2), end_port: be(b, at + 6, 2),
+            start: if n > 0 { ip_text(b, at + 8, n) } else { "" }, end: if n > 0 { ip_text(b, at + 8 + n, n) } else { "" } })
+        at = at + len
+        i = i + 1
+    }
+    return out
+}
+
+/// A Configuration payload's type and attributes, each a 15-bit type and
+/// its value.
+pub fn configuration(p: IkePayload) -> (i64, [(i64, bytes)]) ! IkeError {
+    let b = p.body
+    try need(b, 0, 4)
+    var out: [(i64, bytes)] = []
+    var at = 4
+    while at < b.len() {
+        try need(b, at, 4)
+        let n = be(b, at + 2, 2)
+        try need(b, at + 4, n)
+        out.push((be(b, at, 2) % 32768, b.slice(at + 4, at + 4 + n)))
+        at = at + 4 + n
+    }
+    return (b.at(0), out)
+}

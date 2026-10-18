@@ -1,0 +1,347 @@
+// Bluetooth Low Energy link-layer packets: what a BLE sniffer captures.
+//
+// An nRF Sniffer, an Ubertooth or a btlejack capture (Wireshark link type
+// 251) holds packets as they went over the air: a four-byte access
+// address, a PDU, and a 24-bit CRC. Two kinds of PDU share the format:
+//
+// - advertising PDUs, on access address 0x8E89BED6: a header with the PDU
+//   type, the channel-selection bit and whether each address is public or
+//   random, then the advertiser's address and, depending on the type, a
+//   target, a scanner or an initiator address, advertising data, or the
+//   23 bytes of a CONNECT_IND that set up a connection;
+// - data PDUs, on the access address a CONNECT_IND chose: a header with
+//   the logical link identifier, the two sequence bits and more-data.
+//
+// Advertising data is a list of length-type-value structures (flags, the
+// device name, service UUIDs, manufacturer data) that `ad_structures`
+// splits and the helpers read. Addresses travel least significant byte
+// first and are written here the way people write them, most significant
+// first.
+//
+// The CRC is CRC-24 with polynomial 0x65B, shifted LSB first and seeded
+// 0x555555 on advertising channels or with a connection's CRCInit; every
+// multi-byte field, CRCInit included, is little-endian on the air.
+//
+// Checked against tshark's reading of every PDU type, and the CRC against
+// scapy's.
+
+type BleError =
+    | BleTruncated(need: i64, have: i64)
+    | BleBadAd(at: i64)
+
+/// The 22 bytes of link-layer data a CONNECT_IND carries.
+type BleConnect = {
+    access_address: i64,
+    crc_init: i64,
+    window_size: i64,
+    window_offset: i64,
+    interval: i64,
+    latency: i64,
+    timeout: i64,
+    channel_map: i64,
+    hop: i64,
+    sleep_clock_accuracy: i64,
+}
+
+/// An advertising PDU. Addresses a type does not carry are "".
+type BleAdvertising = {
+    pdu_type: i64,
+    channel_selection: bool,
+    tx_random: bool,
+    rx_random: bool,
+    length: i64,
+    advertiser: str,
+    target: str,
+    data: bytes,
+    connect: BleConnect,
+}
+
+/// A data PDU.
+type BleData = { llid: i64, nesn: i64, sn: i64, more_data: bool, length: i64, payload: bytes }
+
+/// One advertising data structure.
+type BleAd = { kind: i64, data: bytes }
+
+/// The access address of every advertising channel.
+pub fn advertising_access_address() -> i64 {
+    return 2391391958
+}
+
+fn le(data: bytes, at: i64, n: i64) -> i64 {
+    var v = 0
+    var i = n - 1
+    while i >= 0 {
+        v = v.shl(8) + data.at(at + i)
+        i = i - 1
+    }
+    return v
+}
+
+fn put(out: [i64], v: i64, n: i64) -> [i64] {
+    var o = out
+    var i = 0
+    while i < n {
+        o.push(v.ushr(8 * i).bit_and(255))
+        i = i + 1
+    }
+    return o
+}
+
+fn address_at(data: bytes, at: i64) -> str {
+    let digits = "0123456789abcdef"
+    var parts: [str] = []
+    var i = 5
+    while i >= 0 {
+        let b = data.at(at + i)
+        parts.push(digits.substr(b / 16, 1) + digits.substr(b % 16, 1))
+        i = i - 1
+    }
+    return parts.join(":")
+}
+
+fn address_bytes(text: str) -> [i64] {
+    var out: [i64] = []
+    let parts = text.split(":")
+    var i = parts.len() - 1
+    while i >= 0 {
+        out.push(parts[i].parse_int_base(16) ?? 0)
+        i = i - 1
+    }
+    return out
+}
+
+/// The CRC of a PDU as it is sent: the three bytes, first byte lowest.
+pub fn crc24(init: i64, pdu: bytes) -> i64 {
+    // The register holds the CRC bit-reversed, so the seed is reversed in.
+    var state = 0
+    var k = 0
+    while k < 24 {
+        if init.ushr(k) % 2 == 1 {
+            state = state + 1.shl(23 - k)
+        }
+        k = k + 1
+    }
+    var i = 0
+    while i < pdu.len() {
+        var b = pdu.at(i)
+        var j = 0
+        while j < 8 {
+            let bit = (state.bit_xor(b)) % 2
+            b = b / 2
+            state = state / 2
+            if bit == 1 {
+                state = (state + 8388608).bit_xor(5922816)
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return state
+}
+
+/// An over-the-air packet's access address, PDU and CRC.
+pub fn split_packet(packet: bytes) -> (i64, bytes, i64) ! BleError {
+    if packet.len() < 9 {
+        fail(BleTruncated(9, packet.len()))
+    }
+    let n = packet.len()
+    return (le(packet, 0, 4), packet.slice(4, n - 3), le(packet, n - 3, 3))
+}
+
+/// An access address, a PDU and the CRC it should have.
+pub fn build_packet(access_address: i64, pdu: bytes, crc_init: i64) -> bytes {
+    return bytes_of(put([], access_address, 4)).concat(pdu).concat(bytes_of(put([], crc24(crc_init, pdu), 3)))
+}
+
+/// Whether a packet's CRC is right for a seed.
+pub fn check_crc(packet: bytes, crc_init: i64) -> bool {
+    return match split_packet(packet) {
+        Ok(parts) -> crc24(crc_init, parts.1) == parts.2
+        Err(_) -> false
+    }
+}
+
+fn no_connect() -> BleConnect {
+    return BleConnect{ access_address: 0 - 1, crc_init: 0 - 1, window_size: 0 - 1, window_offset: 0 - 1,
+        interval: 0 - 1, latency: 0 - 1, timeout: 0 - 1, channel_map: 0 - 1, hop: 0 - 1, sleep_clock_accuracy: 0 - 1 }
+}
+
+/// An advertising PDU: header and payload, no access address or CRC.
+pub fn decode_advertising(pdu: bytes) -> BleAdvertising ! BleError {
+    if pdu.len() < 2 {
+        fail(BleTruncated(2, pdu.len()))
+    }
+    let h = pdu.at(0)
+    let length = pdu.at(1)
+    if pdu.len() < 2 + length {
+        fail(BleTruncated(2 + length, pdu.len()))
+    }
+    let kind = h % 16
+    var a = BleAdvertising{ pdu_type: kind, channel_selection: h / 32 % 2 == 1, tx_random: h / 64 % 2 == 1,
+        rx_random: h / 128 == 1, length: length, advertiser: "", target: "", data: bytes_of([]), connect: no_connect() }
+    let body = pdu.slice(2, 2 + length)
+    let two = kind == 1 or kind == 3 or kind == 5
+    let need = if kind == 5 { 34 } else if two { 12 } else if kind <= 6 { 6 } else { 0 }
+    if body.len() < need {
+        fail(BleTruncated(2 + need, pdu.len()))
+    }
+    if kind > 6 {
+        a.data = body
+        return a
+    }
+    // SCAN_REQ and CONNECT_IND put the scanner or initiator first.
+    if kind == 3 or kind == 5 {
+        a.target = address_at(body, 0)
+        a.advertiser = address_at(body, 6)
+    } else {
+        a.advertiser = address_at(body, 0)
+        if kind == 1 {
+            a.target = address_at(body, 6)
+        }
+    }
+    if kind == 5 {
+        let ll = body.slice(12, 34)
+        a.connect = BleConnect{ access_address: le(ll, 0, 4), crc_init: le(ll, 4, 3), window_size: ll.at(7),
+            window_offset: le(ll, 8, 2), interval: le(ll, 10, 2), latency: le(ll, 12, 2), timeout: le(ll, 14, 2),
+            channel_map: le(ll, 16, 5), hop: ll.at(21) % 32, sleep_clock_accuracy: ll.at(21) / 32 }
+        a.data = body.slice(34, body.len())
+    } else {
+        a.data = body.slice(need, body.len())
+    }
+    return a
+}
+
+/// An advertising PDU back to bytes, its length recomputed.
+pub fn encode_advertising(a: BleAdvertising) -> bytes {
+    let kind = a.pdu_type
+    var body: [i64] = []
+    if kind == 3 or kind == 5 {
+        body = address_bytes(a.target) + address_bytes(a.advertiser)
+    } else if kind <= 6 {
+        body = address_bytes(a.advertiser)
+        if kind == 1 {
+            body = body + address_bytes(a.target)
+        }
+    }
+    if kind == 5 {
+        let c = a.connect
+        body = put(put(put(put(put(put(put(body, c.access_address, 4), c.crc_init, 3), c.window_size, 1),
+            c.window_offset, 2), c.interval, 2), c.latency, 2), c.timeout, 2)
+        body = put(body, c.channel_map, 5)
+        body.push(c.hop % 32 + c.sleep_clock_accuracy % 8 * 32)
+    }
+    var h = kind
+    if a.channel_selection {
+        h = h + 32
+    }
+    if a.tx_random {
+        h = h + 64
+    }
+    if a.rx_random {
+        h = h + 128
+    }
+    let payload = bytes_of(body).concat(a.data)
+    return bytes_of([h, payload.len()]).concat(payload)
+}
+
+/// A data PDU: header and payload.
+pub fn decode_data(pdu: bytes) -> BleData ! BleError {
+    if pdu.len() < 2 {
+        fail(BleTruncated(2, pdu.len()))
+    }
+    let h = pdu.at(0)
+    let length = pdu.at(1)
+    if pdu.len() < 2 + length {
+        fail(BleTruncated(2 + length, pdu.len()))
+    }
+    return BleData{ llid: h % 4, nesn: h / 4 % 2, sn: h / 8 % 2, more_data: h / 16 % 2 == 1, length: length,
+        payload: pdu.slice(2, 2 + length) }
+}
+
+/// A data PDU back to bytes, its length recomputed.
+pub fn encode_data(d: BleData) -> bytes {
+    var h = d.llid % 4 + d.nesn % 2 * 4 + d.sn % 2 * 8
+    if d.more_data {
+        h = h + 16
+    }
+    return bytes_of([h, d.payload.len()]).concat(d.payload)
+}
+
+/// Advertising data split into its structures. A zero length ends it, as
+/// the specification allows for padding.
+pub fn ad_structures(data: bytes) -> [BleAd] ! BleError {
+    var out: [BleAd] = []
+    var at = 0
+    while at < data.len() {
+        let n = data.at(at)
+        if n == 0 {
+            break
+        }
+        if at + 1 + n > data.len() {
+            fail(BleBadAd(at))
+        }
+        out.push(BleAd{ kind: data.at(at + 1), data: data.slice(at + 2, at + 1 + n) })
+        at = at + 1 + n
+    }
+    return out
+}
+
+/// Structures back to bytes.
+pub fn encode_ad(ads: [BleAd]) -> bytes {
+    var out = bytes_of([])
+    for a in ads {
+        out = out.concat(bytes_of([a.data.len() + 1, a.kind])).concat(a.data)
+    }
+    return out
+}
+
+/// The complete local name, or the shortened one when that is all there
+/// is.
+pub fn local_name(ads: [BleAd]) -> Option[str] {
+    var short: Option[str] = None
+    for a in ads {
+        if a.kind == 9 {
+            return Some(a.data.to_str())
+        }
+        if a.kind == 8 {
+            short = Some(a.data.to_str())
+        }
+    }
+    return short
+}
+
+/// The flags byte, or -1.
+pub fn flags(ads: [BleAd]) -> i64 {
+    for a in ads {
+        if a.kind == 1 and a.data.len() >= 1 {
+            return a.data.at(0)
+        }
+    }
+    return 0 - 1
+}
+
+/// Every 16-bit service UUID, complete or incomplete lists.
+pub fn uuids16(ads: [BleAd]) -> [i64] {
+    var out: [i64] = []
+    for a in ads {
+        if a.kind == 2 or a.kind == 3 {
+            var i = 0
+            while i + 1 < a.data.len() {
+                out.push(le(a.data, i, 2))
+                i = i + 2
+            }
+        }
+    }
+    return out
+}
+
+/// Manufacturer-specific data: the company identifier and the rest, or
+/// (-1, empty).
+pub fn manufacturer(ads: [BleAd]) -> (i64, bytes) {
+    for a in ads {
+        if a.kind == 255 and a.data.len() >= 2 {
+            return (le(a.data, 0, 2), a.data.slice(2, a.data.len()))
+        }
+    }
+    return (0 - 1, bytes_of([]))
+}

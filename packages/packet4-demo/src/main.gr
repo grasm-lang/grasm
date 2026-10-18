@@ -1,0 +1,94 @@
+// A capture file, a Wi-Fi beacon, a Zigbee frame, a BLE advertisement and
+// an IKEv2 message, each read and written back. scripts/packet4_diff.sh
+// holds the packages to tshark and scapy.
+import pcapng
+import dot11
+import dot15d4
+import btle
+import ikev2
+
+fn main() / {io} {
+    // A pcapng file with one millisecond-resolution interface and one packet.
+    let iface = PcapngInterface{ link_type: 1, snap_len: 65535,
+        options: [PcapngOption{ code: 2, value: "en0".to_bytes() }, PcapngOption{ code: 9, value: bytes_of([3]) }] }
+    let packet = PcapngPacket{ kind: 6, iface: 0, timestamp: 1700000000123, captured: "hello".to_bytes(), original_len: 5,
+        drops: -1, options: [PcapngOption{ code: 1, value: "a comment".to_bytes() }] }
+    let section = PcapngSection{ big_endian: false, major: 1, minor: 0, options: [], interfaces: [iface], packets: [packet],
+        names: [], name_options: [], stats: [], other: [] }
+    match pcapng.read(pcapng.write([section])) {
+        Ok(back) -> {
+            let p = back[0].packets[0]
+            assert_eq(pcapng.time_of(back[0].interfaces[0], false, p.timestamp), (1700000000, 123000000))
+            assert_eq(pcapng.comments(p.options), ["a comment"])
+            assert_eq(pcapng.interface_name(back[0].interfaces[0]), "en0")
+        }
+        Err(_) -> panic("the file was refused")
+    }
+
+    // A beacon for "cafe" on channel 6.
+    let body = bytes_of([0, 0, 0, 0, 0, 0, 0, 0, 100, 0, 1, 4]).concat(
+        dot11.encode_elements([Dot11Element{ id: 0, info: "cafe".to_bytes() }, Dot11Element{ id: 3, info: bytes_of([6]) }]))
+    let beacon = Dot11Frame{ version: 0, kind: 0, subtype: 8, flags: 0, duration: 0, addr1: "ff:ff:ff:ff:ff:ff",
+        addr2: "02:00:00:00:00:01", addr3: "02:00:00:00:00:01", addr4: "", sequence: 16, qos: -1, ht_control: -1, body: body }
+    let air = dot11.append_fcs(dot11.encode(beacon))
+    assert_eq(dot11.check_fcs(air), true)
+    match dot11.decode(dot11.strip_fcs(air)) {
+        Ok(f) -> match dot11.management(f) {
+            Ok(m) -> {
+                assert_eq(dot11.ssid(m.elements), Some("cafe"))
+                assert_eq(dot11.channel(m.elements), 6)
+                assert_eq(m.interval, 100)
+            }
+            Err(_) -> panic("the beacon body was refused")
+        }
+        Err(_) -> panic("the beacon was refused")
+    }
+
+    // An 802.15.4 data frame between two short addresses in one PAN.
+    let raw = bytes_of([65, 136, 7, 52, 18, 255, 255, 1, 0, 104, 105])
+    match dot15d4.decode(dot15d4.encode(dot15d4.decode(raw, false) ?? panic("refused"), true), true) {
+        Ok(f) -> {
+            assert_eq(dot15d4.address_text(f.dest_mode, f.dest_addr), "0xffff")
+            assert_eq(f.dest_pan, 4660)
+            assert_eq(f.src_pan, -1)
+            assert_eq(f.payload, "hi".to_bytes())
+        }
+        Err(_) -> panic("the frame was refused")
+    }
+
+    // A BLE advertisement carrying a name, with the CRC every receiver checks.
+    let adv = BleAdvertising{ pdu_type: 0, channel_selection: false, tx_random: true, rx_random: false, length: 0,
+        advertiser: "c0:ff:ee:00:00:01", target: "", data: btle.encode_ad([BleAd{ kind: 9, data: "grasm".to_bytes() }]),
+        connect: BleConnect{ access_address: 0, crc_init: 0, window_size: 0, window_offset: 0, interval: 0, latency: 0,
+            timeout: 0, channel_map: 0, hop: 0, sleep_clock_accuracy: 0 } }
+    let over_air = btle.build_packet(btle.advertising_access_address(), btle.encode_advertising(adv), 5592405)
+    assert_eq(btle.check_crc(over_air, 5592405), true)
+    match btle.split_packet(over_air) {
+        Ok(parts) -> match btle.decode_advertising(parts.1) {
+            Ok(a) -> assert_eq(btle.local_name(btle.ad_structures(a.data) ?? []), Some("grasm"))
+            Err(_) -> panic("the advertisement was refused")
+        }
+        Err(_) -> panic("the packet was refused")
+    }
+
+    // An IKE_SA_INIT offering AES-256 and SHA-256 with group 19.
+    let sa = IkePayload{ kind: 33, critical: false, reserved: 0, body: ikev2.encode_proposals([IkeProposal{ number: 1, protocol: 1,
+        spi: bytes_of([]), transforms: [IkeTransform{ kind: 1, id: 12, attributes: [IkeAttribute{ kind: 14, short: true, value: 256,
+            data: bytes_of([]) }] }, IkeTransform{ kind: 2, id: 5, attributes: [] }, IkeTransform{ kind: 4, id: 19, attributes: [] }] }]) }
+    let header = IkeHeader{ spi_i: bytes_of([1, 2, 3, 4, 5, 6, 7, 8]), spi_r: bytes_of([0, 0, 0, 0, 0, 0, 0, 0]), next: 33,
+        major: 2, minor: 0, exchange: 34, flags: 8, message_id: 0, length: 0 }
+    match ikev2.decode(ikev2.encode(IkeMessage{ header: header, payloads: [sa], next_inside: 0 })) {
+        Ok(m) -> {
+            assert_eq(ikev2.is_initiator(m.header), true)
+            match ikev2.proposals(m.payloads[0]) {
+                Ok(props) -> {
+                    assert_eq(props[0].transforms.len(), 3)
+                    assert_eq(props[0].transforms[0].attributes[0].value, 256)
+                }
+                Err(_) -> panic("the proposals were refused")
+            }
+        }
+        Err(_) -> panic("the message was refused")
+    }
+    print("packet4: ok")
+}

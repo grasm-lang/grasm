@@ -1,0 +1,493 @@
+// pcapng: the capture file Wireshark, tcpdump and dumpcap write today.
+//
+// `packages/pcapfile` reads the classic libpcap format: one link type, one
+// snapshot length and microsecond timestamps for the whole file. pcapng
+// replaced it as Wireshark's default in 2012 because a capture is rarely
+// that simple: several interfaces at once, each with its own link type and
+// timestamp resolution, comments on a packet, which direction a packet
+// went, the names the capturing machine resolved, and drop counters.
+//
+// A file is a run of sections, each opening with a Section Header Block
+// whose byte-order magic says whether the section is little- or big-endian
+// (a file can hold both). Every block is type, total length, body, total
+// length again, padded to four bytes, so a reader can skip a block it does
+// not know; this one keeps them. Bodies end in options: code, length,
+// value, padded, closed by code 0.
+//
+// Timestamps are 64-bit counts of a unit each interface chooses with its
+// `if_tsresol` option: 10^-n seconds, or 2^-n when the top bit of the
+// byte is set, microseconds when absent, shifted by `if_tsoffset` seconds.
+// `time_of` turns a count into seconds and nanoseconds the way Wireshark
+// does.
+//
+// Checked against tshark: every packet's interface, time, lengths, bytes,
+// comments and direction, in files built with random block mixes and both
+// byte orders, and the files `write` produces read back identically.
+
+type PcapngError =
+    | PcapngTruncated(at: i64)
+    | PcapngBadMagic(at: i64)
+    | PcapngBadBlock(at: i64, reason: str)
+    | PcapngNoInterface(at: i64, iface: i64)
+
+/// One option: its code and its value, padding removed.
+type PcapngOption = { code: i64, value: bytes }
+
+/// An Interface Description Block.
+type PcapngInterface = { link_type: i64, snap_len: i64, options: [PcapngOption] }
+
+/// A packet from an Enhanced, Simple or obsolete Packet Block. A Simple
+/// Packet Block names no interface (it is interface 0), no timestamp and no
+/// options; `kind` says which block it came from.
+type PcapngPacket = {
+    kind: i64,
+    iface: i64,
+    timestamp: i64,
+    captured: bytes,
+    original_len: i64,
+    drops: i64,
+    options: [PcapngOption],
+}
+
+/// One record of a Name Resolution Block: an IPv4 or IPv6 address and the
+/// names it resolved to.
+type PcapngName = { kind: i64, address: bytes, names: [str] }
+
+/// An Interface Statistics Block.
+type PcapngStats = { iface: i64, timestamp: i64, options: [PcapngOption] }
+
+/// A block this package does not interpret, kept whole.
+type PcapngBlock = { kind: i64, body: bytes }
+
+type PcapngSection = {
+    big_endian: bool,
+    major: i64,
+    minor: i64,
+    options: [PcapngOption],
+    interfaces: [PcapngInterface],
+    packets: [PcapngPacket],
+    names: [PcapngName],
+    name_options: [PcapngOption],
+    stats: [PcapngStats],
+    other: [PcapngBlock],
+}
+
+let SHB = 168627466
+let BYTE_ORDER = 439041101
+let IDB = 1
+let OPB = 2
+let SPB = 3
+let NRB = 4
+let ISB = 5
+let EPB = 6
+
+/// Option codes every block shares.
+pub fn opt_comment() -> i64 {
+    return 1
+}
+
+fn u16(data: bytes, at: i64, big: bool) -> i64 {
+    if big {
+        return data.at(at) * 256 + data.at(at + 1)
+    }
+    return data.at(at + 1) * 256 + data.at(at)
+}
+
+fn u32(data: bytes, at: i64, big: bool) -> i64 {
+    if big {
+        return u16(data, at, true) * 65536 + u16(data, at + 2, true)
+    }
+    return u16(data, at + 2, false) * 65536 + u16(data, at, false)
+}
+
+fn pad4(n: i64) -> i64 {
+    return (n + 3) / 4 * 4
+}
+
+/// The options from `at` to `end` of a block body.
+fn parse_options(data: bytes, at: i64, end: i64, big: bool) -> [PcapngOption] ! PcapngError {
+    var out: [PcapngOption] = []
+    var i = at
+    while i + 4 <= end {
+        let code = u16(data, i, big)
+        let len = u16(data, i + 2, big)
+        if code == 0 {
+            break
+        }
+        if i + 4 + len > end {
+            fail(PcapngBadBlock(i, "option runs past its block"))
+        }
+        out.push(PcapngOption{ code: code, value: data.slice(i + 4, i + 4 + len) })
+        i = i + 4 + pad4(len)
+    }
+    return out
+}
+
+fn zero_terminated(data: bytes, at: i64, end: i64) -> [str] {
+    var out: [str] = []
+    var start = at
+    var i = at
+    while i < end {
+        if data.at(i) == 0 {
+            if i > start {
+                out.push(data.slice(start, i).to_str())
+            }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn parse_names(data: bytes, at: i64, end: i64, big: bool) -> ([PcapngName], i64) ! PcapngError {
+    var out: [PcapngName] = []
+    var i = at
+    while i + 4 <= end {
+        let kind = u16(data, i, big)
+        let len = u16(data, i + 2, big)
+        if kind == 0 {
+            return (out, i + 4)
+        }
+        if i + 4 + len > end {
+            fail(PcapngBadBlock(i, "name record runs past its block"))
+        }
+        let width = if kind == 1 { 4 } else if kind == 2 { 16 } else { 0 }
+        if width > 0 and len >= width {
+            out.push(PcapngName{ kind: kind, address: data.slice(i + 4, i + 4 + width),
+                names: zero_terminated(data, i + 4 + width, i + 4 + len) })
+        } else {
+            out.push(PcapngName{ kind: kind, address: data.slice(i + 4, i + 4 + len), names: [] })
+        }
+        i = i + 4 + pad4(len)
+    }
+    return (out, end)
+}
+
+fn new_section(big: bool, major: i64, minor: i64, options: [PcapngOption]) -> PcapngSection {
+    return PcapngSection{ big_endian: big, major: major, minor: minor, options: options, interfaces: [],
+        packets: [], names: [], name_options: [], stats: [], other: [] }
+}
+
+/// One block that is not a Section Header, added to its section.
+fn read_block(sec: PcapngSection, kind: i64, data: bytes, at: i64, total: i64, big: bool) -> PcapngSection ! PcapngError {
+    var s = sec
+    let body = at + 8
+    let end = at + total - 4
+    if kind == IDB {
+        if end - body < 8 {
+            fail(PcapngBadBlock(at, "interface block too short"))
+        }
+        s.interfaces.push(PcapngInterface{ link_type: u16(data, body, big), snap_len: u32(data, body + 4, big),
+            options: try parse_options(data, body + 8, end, big) })
+    } else if kind == EPB or kind == OPB {
+        if end - body < 20 {
+            fail(PcapngBadBlock(at, "packet block too short"))
+        }
+        let iface = if kind == EPB { u32(data, body, big) } else { u16(data, body, big) }
+        let drops = if kind == EPB { -1 } else { u16(data, body + 2, big) }
+        if iface >= s.interfaces.len() {
+            fail(PcapngNoInterface(at, iface))
+        }
+        let captured = u32(data, body + 12, big)
+        if body + 20 + captured > end {
+            fail(PcapngBadBlock(at, "captured length runs past its block"))
+        }
+        s.packets.push(PcapngPacket{ kind: kind, iface: iface,
+            timestamp: u32(data, body + 4, big).shl(32) + u32(data, body + 8, big),
+            captured: data.slice(body + 20, body + 20 + captured), original_len: u32(data, body + 16, big),
+            drops: drops, options: try parse_options(data, body + 20 + pad4(captured), end, big) })
+    } else if kind == SPB {
+        if s.interfaces.len() == 0 {
+            fail(PcapngNoInterface(at, 0))
+        }
+        if end - body < 4 {
+            fail(PcapngBadBlock(at, "simple packet block too short"))
+        }
+        let original = u32(data, body, big)
+        let snap = s.interfaces[0].snap_len
+        var captured = original
+        if snap > 0 and snap < captured {
+            captured = snap
+        }
+        if body + 4 + captured > end {
+            captured = end - body - 4
+        }
+        s.packets.push(PcapngPacket{ kind: kind, iface: 0, timestamp: 0,
+            captured: data.slice(body + 4, body + 4 + captured), original_len: original, drops: -1, options: [] })
+    } else if kind == NRB {
+        let (names, after) = try parse_names(data, body, end, big)
+        for n in names {
+            s.names.push(n)
+        }
+        for o in try parse_options(data, after, end, big) {
+            s.name_options.push(o)
+        }
+    } else if kind == ISB {
+        if end - body < 12 {
+            fail(PcapngBadBlock(at, "statistics block too short"))
+        }
+        s.stats.push(PcapngStats{ iface: u32(data, body, big),
+            timestamp: u32(data, body + 4, big).shl(32) + u32(data, body + 8, big),
+            options: try parse_options(data, body + 12, end, big) })
+    } else {
+        s.other.push(PcapngBlock{ kind: kind, body: data.slice(body, end) })
+    }
+    return s
+}
+
+/// Every section of a pcapng file.
+pub fn read(data: bytes) -> [PcapngSection] ! PcapngError {
+    var sections: [PcapngSection] = []
+    var at = 0
+    var big = false
+    while at < data.len() {
+        if at + 12 > data.len() {
+            fail(PcapngTruncated(at))
+        }
+        let kind_le = u32(data, at, false)
+        if kind_le == SHB {
+            if at + 28 > data.len() {
+                fail(PcapngTruncated(at))
+            }
+            if u32(data, at + 8, false) == BYTE_ORDER {
+                big = false
+            } else if u32(data, at + 8, true) == BYTE_ORDER {
+                big = true
+            } else {
+                fail(PcapngBadMagic(at + 8))
+            }
+        } else if sections.len() == 0 {
+            fail(PcapngBadMagic(at))
+        }
+        let kind = u32(data, at, big)
+        let total = u32(data, at + 4, big)
+        if total < 12 or total % 4 != 0 {
+            fail(PcapngBadBlock(at, "block length is not a multiple of four of at least twelve"))
+        }
+        if at + total > data.len() {
+            fail(PcapngTruncated(at))
+        }
+        if u32(data, at + total - 4, big) != total {
+            fail(PcapngBadBlock(at, "trailing length differs"))
+        }
+        let body = at + 8
+        let end = at + total - 4
+        if kind == SHB {
+            let options = try parse_options(data, body + 16, end, big)
+            sections.push(new_section(big, u16(data, body + 4, big), u16(data, body + 6, big), options))
+            at = at + total
+            continue
+        }
+        let s = try read_block(sections.pop() ?? new_section(big, 1, 0, []), kind, data, at, total, big)
+        sections.push(s)
+        at = at + total
+    }
+    return sections
+}
+
+/// The first value of an option, if present.
+pub fn option(options: [PcapngOption], code: i64) -> Option[bytes] {
+    for o in options {
+        if o.code == code {
+            return Some(o.value)
+        }
+    }
+    return None
+}
+
+/// Every comment among the options, in order.
+pub fn comments(options: [PcapngOption]) -> [str] {
+    var out: [str] = []
+    for o in options {
+        if o.code == 1 {
+            out.push(o.value.to_str())
+        }
+    }
+    return out
+}
+
+fn option_text(options: [PcapngOption], code: i64) -> str {
+    return match option(options, code) {
+        Some(v) -> v.to_str()
+        None -> ""
+    }
+}
+
+/// An interface's `if_name`, or "".
+pub fn interface_name(iface: PcapngInterface) -> str {
+    return option_text(iface.options, 2)
+}
+
+/// An interface's `if_description`, or "".
+pub fn interface_description(iface: PcapngInterface) -> str {
+    return option_text(iface.options, 3)
+}
+
+/// The raw `if_tsresol` byte, 6 (microseconds) when absent.
+pub fn resolution(iface: PcapngInterface) -> i64 {
+    return match option(iface.options, 9) {
+        Some(v) -> if v.len() >= 1 { v.at(0) } else { 6 }
+        None -> 6
+    }
+}
+
+/// `if_tsoffset` in seconds, 0 when absent.
+pub fn offset(iface: PcapngInterface, big: bool) -> i64 {
+    return match option(iface.options, 14) {
+        Some(v) -> if v.len() >= 8 {
+            if big { u32(v, 0, true).shl(32) + u32(v, 4, true) } else { u32(v, 4, false).shl(32) + u32(v, 0, false) }
+        } else { 0 }
+        None -> 0
+    }
+}
+
+fn ten_to(n: i64) -> i64 {
+    var v = 1
+    var i = 0
+    while i < n {
+        v = v * 10
+        i = i + 1
+    }
+    return v
+}
+
+/// A timestamp's seconds and nanoseconds since 1970 for an interface,
+/// truncated toward zero as Wireshark truncates. Counts of 2^63 or more,
+/// and resolutions finer than 2^-32 or 10^-18 seconds, are refused with
+/// (-1, -1).
+pub fn time_of(iface: PcapngInterface, big: bool, ticks: i64) -> (i64, i64) {
+    if ticks < 0 {
+        return (0 - 1, 0 - 1)
+    }
+    let r = resolution(iface)
+    let shift = offset(iface, big)
+    if r >= 128 {
+        let n = r - 128
+        if n > 32 {
+            return (0 - 1, 0 - 1)
+        }
+        var units = 1
+        var i = 0
+        while i < n {
+            units = units * 2
+            i = i + 1
+        }
+        let frac = ticks.bit_and(units - 1)
+        return (ticks.ushr(n) + shift, frac * 1000000000 / units)
+    }
+    if r > 18 {
+        return (0 - 1, 0 - 1)
+    }
+    let units = ten_to(r)
+    let frac = ticks % units
+    let nanos = if r <= 9 { frac * ten_to(9 - r) } else { frac / ten_to(r - 9) }
+    return (ticks / units + shift, nanos)
+}
+
+/// The direction from an Enhanced Packet Block's `epb_flags`: 0 unknown,
+/// 1 inbound, 2 outbound; -1 when the packet has no flags.
+pub fn direction(p: PcapngPacket, big: bool) -> i64 {
+    return match option(p.options, 2) {
+        Some(v) -> if v.len() >= 4 { u32(v, 0, big) % 4 } else { 0 - 1 }
+        None -> 0 - 1
+    }
+}
+
+fn put16(out: [i64], v: i64, big: bool) -> [i64] {
+    var o = out
+    if big {
+        o.push(v / 256 % 256)
+        o.push(v % 256)
+    } else {
+        o.push(v % 256)
+        o.push(v / 256 % 256)
+    }
+    return o
+}
+
+fn put32(out: [i64], v: i64, big: bool) -> [i64] {
+    if big {
+        return put16(put16(out, v / 65536 % 65536, true), v % 65536, true)
+    }
+    return put16(put16(out, v % 65536, false), v / 65536 % 65536, false)
+}
+
+fn put_bytes(out: [i64], data: bytes) -> [i64] {
+    var o = out
+    var i = 0
+    while i < data.len() {
+        o.push(data.at(i))
+        i = i + 1
+    }
+    while o.len() % 4 != 0 {
+        o.push(0)
+    }
+    return o
+}
+
+fn put_options(out: [i64], options: [PcapngOption], big: bool) -> [i64] {
+    if options.len() == 0 {
+        return out
+    }
+    var o = out
+    for opt in options {
+        o = put_bytes(put16(put16(o, opt.code, big), opt.value.len(), big), opt.value)
+    }
+    return put32(o, 0, big)
+}
+
+fn block(kind: i64, body: [i64], big: bool) -> [i64] {
+    let total = body.len() + 12
+    return put32(put32(put32([], kind, big), total, big) + body, total, big)
+}
+
+/// Sections back to bytes, each in its own byte order, every option closed
+/// by an end-of-options and every block padded and length-framed.
+pub fn write(sections: [PcapngSection]) -> bytes {
+    var out: [i64] = []
+    for s in sections {
+        let big = s.big_endian
+        var shb = put16(put16(put32([], BYTE_ORDER, big), s.major, big), s.minor, big)
+        shb = put32(put32(shb, 4294967295, big), 4294967295, big)
+        out = out + block(SHB, put_options(shb, s.options, big), big)
+        for iface in s.interfaces {
+            let body = put32(put16(put16([], iface.link_type, big), 0, big), iface.snap_len, big)
+            out = out + block(IDB, put_options(body, iface.options, big), big)
+        }
+        for p in s.packets {
+            if p.kind == SPB {
+                out = out + block(SPB, put_bytes(put32([], p.original_len, big), p.captured), big)
+                continue
+            }
+            var body: [i64] = []
+            if p.kind == OPB {
+                body = put16(put16(body, p.iface, big), p.drops, big)
+            } else {
+                body = put32(body, p.iface, big)
+            }
+            body = put32(put32(body, p.timestamp.ushr(32), big), p.timestamp.bit_and(4294967295), big)
+            body = put_bytes(put32(put32(body, p.captured.len(), big), p.original_len, big), p.captured)
+            out = out + block(p.kind, put_options(body, p.options, big), big)
+        }
+        if s.names.len() > 0 or s.name_options.len() > 0 {
+            var body: [i64] = []
+            for n in s.names {
+                var value = n.address
+                for name in n.names {
+                    value = value.concat(name.to_bytes()).concat(bytes_of([0]))
+                }
+                body = put_bytes(put16(put16(body, n.kind, big), value.len(), big), value)
+            }
+            body = put32(body, 0, big)
+            out = out + block(NRB, put_options(body, s.name_options, big), big)
+        }
+        for st in s.stats {
+            let body = put32(put32(put32([], st.iface, big), st.timestamp.ushr(32), big), st.timestamp.bit_and(4294967295), big)
+            out = out + block(ISB, put_options(body, st.options, big), big)
+        }
+        for b in s.other {
+            out = out + block(b.kind, put_bytes([], b.body), big)
+        }
+    }
+    return bytes_of(out)
+}

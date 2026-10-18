@@ -1,0 +1,24 @@
+[package]
+name = "packet4_demo"
+version = "1.0.0"
+capabilities = ["io"]
+
+[dependencies.pcapng]
+path = "../pcapng"
+version = "^1.0.0"
+
+[dependencies.dot11]
+path = "../dot11"
+version = "^1.0.0"
+
+[dependencies.dot15d4]
+path = "../dot15d4"
+version = "^1.0.0"
+
+[dependencies.btle]
+path = "../btle"
+version = "^1.0.0"
+
+[dependencies.ikev2]
+path = "../ikev2"
+version = "^1.0.0"

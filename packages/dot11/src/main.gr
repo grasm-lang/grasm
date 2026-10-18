@@ -1,0 +1,380 @@
+// IEEE 802.11 frames: the MAC header every Wi-Fi capture starts with.
+//
+// A monitor-mode capture, a radiotap file from `airodump-ng`, or the
+// frames a Wi-Fi driver hands up for debugging are all 802.11 frames, and
+// reading one is mostly knowing which fields are there. The first two
+// bytes decide: the type (management, control, data, extension), the
+// subtype, and eight flags. From those:
+//
+// - management and data frames carry three addresses and a sequence
+//   control field; a data frame going between two access points (both
+//   to-DS and from-DS set) carries a fourth;
+// - control frames carry only what they need: an ACK or CTS just the
+//   receiver, an RTS, PS-Poll, Block Ack or CF-End the transmitter too;
+// - QoS data subtypes (8 to 15, but not 13) add a QoS control field, and
+//   with the Order flag set a QoS data or management frame adds an HT
+//   control field after it.
+//
+// Which address is the source, the destination or the BSSID depends on
+// the to-DS and from-DS bits, which `source`, `destination` and `bssid`
+// work out. Management bodies have fixed fields that depend on the
+// subtype (a beacon's timestamp, interval and capabilities) followed by
+// information elements, which is where the SSID, rates and channel are.
+//
+// The 802.11ax Trigger and TACK control frames (subtypes 2 and 3) carry a
+// transmitter address; extension frames (type 3) are returned with only
+// their first address and the rest as body.
+//
+// Checked against scapy, which builds every frame from random fields, and
+// against the CRC-32 frame check sequence it appends.
+import crc32
+
+type Dot11Error =
+    | Dot11Truncated(need: i64, have: i64)
+    | Dot11BadElement(at: i64)
+
+type Dot11Frame = {
+    version: i64,
+    kind: i64,
+    subtype: i64,
+    flags: i64,
+    duration: i64,
+    addr1: str,
+    addr2: str,
+    addr3: str,
+    addr4: str,
+    sequence: i64,
+    qos: i64,
+    ht_control: i64,
+    body: bytes,
+}
+
+/// An information element.
+type Dot11Element = { id: i64, info: bytes }
+
+/// A management frame's fixed fields, -1 or "" where the subtype has none,
+/// and its information elements.
+type Dot11Management = {
+    timestamp: i64,
+    interval: i64,
+    capability: i64,
+    listen_interval: i64,
+    current_ap: str,
+    status: i64,
+    aid: i64,
+    reason: i64,
+    algorithm: i64,
+    transaction: i64,
+    category: i64,
+    elements: [Dot11Element],
+    rest: bytes,
+}
+
+pub fn to_ds() -> i64 {
+    return 1
+}
+
+pub fn from_ds() -> i64 {
+    return 2
+}
+
+pub fn order_flag() -> i64 {
+    return 128
+}
+
+fn mac_at(data: bytes, at: i64) -> str {
+    let digits = "0123456789abcdef"
+    var parts: [str] = []
+    var i = 0
+    while i < 6 {
+        let b = data.at(at + i)
+        parts.push(digits.substr(b / 16, 1) + digits.substr(b % 16, 1))
+        i = i + 1
+    }
+    return parts.join(":")
+}
+
+fn mac_bytes(text: str) -> [i64] {
+    return text.split(":").map(|p| p.parse_int_base(16) ?? 0)
+}
+
+fn le16(data: bytes, at: i64) -> i64 {
+    return data.at(at) + data.at(at + 1) * 256
+}
+
+fn le32(data: bytes, at: i64) -> i64 {
+    return le16(data, at) + le16(data, at + 2) * 65536
+}
+
+fn le64(data: bytes, at: i64) -> i64 {
+    return le32(data, at) + le32(data, at + 4).shl(32)
+}
+
+/// Whether a control subtype carries a transmitter address.
+fn control_has_ta(subtype: i64) -> bool {
+    return subtype >= 2 and subtype <= 6 or subtype >= 8 and subtype <= 11 or subtype >= 14
+}
+
+fn has_qos(kind: i64, subtype: i64) -> bool {
+    return kind == 2 and subtype >= 8 and subtype != 13
+}
+
+fn has_htc(kind: i64, subtype: i64, flags: i64) -> bool {
+    return flags.bit_and(128) != 0 and (kind == 0 or has_qos(kind, subtype))
+}
+
+/// A frame's header and body. The frame check sequence, if the capture has
+/// one, is part of the body; `strip_fcs` removes it first.
+pub fn decode(frame: bytes) -> Dot11Frame ! Dot11Error {
+    if frame.len() < 10 {
+        fail(Dot11Truncated(10, frame.len()))
+    }
+    let fc = frame.at(0)
+    let kind = fc / 4 % 4
+    let subtype = fc / 16
+    let flags = frame.at(1)
+    var need = 10
+    let two = kind == 0 or kind == 2 or kind == 1 and control_has_ta(subtype)
+    let three = kind == 0 or kind == 2
+    let four = kind == 2 and flags % 4 == 3
+    if two {
+        need = 16
+    }
+    if three {
+        need = 24
+    }
+    if four {
+        need = 30
+    }
+    if has_qos(kind, subtype) {
+        need = need + 2
+    }
+    if has_htc(kind, subtype, flags) {
+        need = need + 4
+    }
+    if frame.len() < need {
+        fail(Dot11Truncated(need, frame.len()))
+    }
+    var at = if four { 30 } else if three { 24 } else if two { 16 } else { 10 }
+    var qos = 0 - 1
+    if has_qos(kind, subtype) {
+        qos = le16(frame, at)
+        at = at + 2
+    }
+    var htc = 0 - 1
+    if has_htc(kind, subtype, flags) {
+        htc = le32(frame, at)
+        at = at + 4
+    }
+    return Dot11Frame{ version: fc % 4, kind: kind, subtype: subtype, flags: flags, duration: le16(frame, 2),
+        addr1: mac_at(frame, 4), addr2: if two { mac_at(frame, 10) } else { "" },
+        addr3: if three { mac_at(frame, 16) } else { "" }, addr4: if four { mac_at(frame, 24) } else { "" },
+        sequence: if three { le16(frame, 22) } else { 0 - 1 }, qos: qos, ht_control: htc,
+        body: frame.slice(at, frame.len()) }
+}
+
+fn push16(out: [i64], v: i64) -> [i64] {
+    var o = out
+    o.push(v % 256)
+    o.push(v / 256 % 256)
+    return o
+}
+
+/// A frame back to bytes. Fields the type and flags leave out are not
+/// written, whatever they hold.
+pub fn encode(f: Dot11Frame) -> bytes {
+    var out: [i64] = [f.subtype * 16 + f.kind * 4 + f.version, f.flags]
+    out = push16(out, f.duration) + mac_bytes(f.addr1)
+    let two = f.kind == 0 or f.kind == 2 or f.kind == 1 and control_has_ta(f.subtype)
+    let three = f.kind == 0 or f.kind == 2
+    if two {
+        out = out + mac_bytes(f.addr2)
+    }
+    if three {
+        out = push16(out + mac_bytes(f.addr3), f.sequence)
+    }
+    if f.kind == 2 and f.flags % 4 == 3 {
+        out = out + mac_bytes(f.addr4)
+    }
+    if has_qos(f.kind, f.subtype) {
+        out = push16(out, f.qos)
+    }
+    if has_htc(f.kind, f.subtype, f.flags) {
+        out = push16(push16(out, f.ht_control % 65536), f.ht_control / 65536)
+    }
+    return bytes_of(out).concat(f.body)
+}
+
+/// The fragment number, from the sequence control field.
+pub fn fragment_number(f: Dot11Frame) -> i64 {
+    return f.sequence % 16
+}
+
+/// The sequence number, from the sequence control field.
+pub fn sequence_number(f: Dot11Frame) -> i64 {
+    return f.sequence / 16
+}
+
+/// The traffic identifier, from the QoS control field.
+pub fn tid(f: Dot11Frame) -> i64 {
+    return f.qos % 16
+}
+
+/// The final source address, which the DS bits place.
+pub fn source(f: Dot11Frame) -> str {
+    let ds = f.flags % 4
+    return if ds == 0 { f.addr2 } else if ds == 1 { f.addr2 } else if ds == 2 { f.addr3 } else { f.addr4 }
+}
+
+/// The final destination address.
+pub fn destination(f: Dot11Frame) -> str {
+    let ds = f.flags % 4
+    return if ds == 0 { f.addr1 } else if ds == 1 { f.addr3 } else if ds == 2 { f.addr1 } else { f.addr3 }
+}
+
+/// The BSSID, or "" for a frame between access points, which has none.
+pub fn bssid(f: Dot11Frame) -> str {
+    let ds = f.flags % 4
+    return if ds == 0 { f.addr3 } else if ds == 1 { f.addr1 } else if ds == 2 { f.addr2 } else { "" }
+}
+
+/// Information elements from `at` to the end.
+pub fn elements(body: bytes, at: i64) -> [Dot11Element] ! Dot11Error {
+    var out: [Dot11Element] = []
+    var i = at
+    while i < body.len() {
+        if i + 2 > body.len() or i + 2 + body.at(i + 1) > body.len() {
+            fail(Dot11BadElement(i))
+        }
+        out.push(Dot11Element{ id: body.at(i), info: body.slice(i + 2, i + 2 + body.at(i + 1)) })
+        i = i + 2 + body.at(i + 1)
+    }
+    return out
+}
+
+/// Elements back to bytes.
+pub fn encode_elements(elems: [Dot11Element]) -> bytes {
+    var out = bytes_of([])
+    for e in elems {
+        out = out.concat(bytes_of([e.id, e.info.len()])).concat(e.info)
+    }
+    return out
+}
+
+/// The SSID element's text, or None when there is none. A hidden network
+/// sends an empty one.
+pub fn ssid(elems: [Dot11Element]) -> Option[str] {
+    for e in elems {
+        if e.id == 0 {
+            return Some(e.info.to_str())
+        }
+    }
+    return None
+}
+
+/// The channel from the DS Parameter Set element, or -1.
+pub fn channel(elems: [Dot11Element]) -> i64 {
+    for e in elems {
+        if e.id == 3 and e.info.len() >= 1 {
+            return e.info.at(0)
+        }
+    }
+    return 0 - 1
+}
+
+/// Supported and extended supported rates, in units of 500 kbit/s, the
+/// basic-rate bit removed.
+pub fn rates(elems: [Dot11Element]) -> [i64] {
+    var out: [i64] = []
+    for e in elems {
+        if e.id == 1 or e.id == 50 {
+            var i = 0
+            while i < e.info.len() {
+                out.push(e.info.at(i) % 128)
+                i = i + 1
+            }
+        }
+    }
+    return out
+}
+
+fn empty_management() -> Dot11Management {
+    return Dot11Management{ timestamp: 0 - 1, interval: 0 - 1, capability: 0 - 1, listen_interval: 0 - 1,
+        current_ap: "", status: 0 - 1, aid: 0 - 1, reason: 0 - 1, algorithm: 0 - 1, transaction: 0 - 1,
+        category: 0 - 1, elements: [], rest: bytes_of([]) }
+}
+
+/// A management frame's fixed fields and elements. An Action frame's body
+/// after its category, and a Disassociation or Deauthentication frame's
+/// after the reason, are `rest`.
+pub fn management(f: Dot11Frame) -> Dot11Management ! Dot11Error {
+    var m = empty_management()
+    let b = f.body
+    let s = f.subtype
+    var fixed = 0
+    if s == 8 or s == 5 {
+        fixed = 12
+    } else if s == 0 {
+        fixed = 4
+    } else if s == 2 {
+        fixed = 10
+    } else if s == 1 or s == 3 or s == 11 {
+        fixed = 6
+    } else if s == 10 or s == 12 {
+        fixed = 2
+    } else if s == 13 or s == 14 {
+        fixed = 1
+    }
+    if b.len() < fixed {
+        fail(Dot11Truncated(fixed, b.len()))
+    }
+    if s == 8 or s == 5 {
+        m.timestamp = le64(b, 0)
+        m.interval = le16(b, 8)
+        m.capability = le16(b, 10)
+    } else if s == 0 or s == 2 {
+        m.capability = le16(b, 0)
+        m.listen_interval = le16(b, 2)
+        if s == 2 {
+            m.current_ap = mac_at(b, 4)
+        }
+    } else if s == 1 or s == 3 {
+        m.capability = le16(b, 0)
+        m.status = le16(b, 2)
+        m.aid = le16(b, 4)
+    } else if s == 11 {
+        m.algorithm = le16(b, 0)
+        m.transaction = le16(b, 2)
+        m.status = le16(b, 4)
+    } else if s == 10 or s == 12 {
+        m.reason = le16(b, 0)
+    } else if s == 13 or s == 14 {
+        m.category = b.at(0)
+    }
+    if s == 10 or s == 12 or s == 13 or s == 14 {
+        m.rest = b.slice(fixed, b.len())
+    } else {
+        m.elements = try elements(b, fixed)
+    }
+    return m
+}
+
+/// Whether the last four bytes are the CRC-32 of the rest.
+pub fn check_fcs(frame: bytes) -> bool {
+    if frame.len() < 4 {
+        return false
+    }
+    let n = frame.len() - 4
+    return crc32.of(frame.slice(0, n)) == le32(frame, n)
+}
+
+/// The frame with its frame check sequence appended.
+pub fn append_fcs(frame: bytes) -> bytes {
+    let c = crc32.of(frame)
+    return frame.concat(bytes_of([c % 256, c / 256 % 256, c / 65536 % 256, c / 16777216 % 256]))
+}
+
+/// The frame without its last four bytes.
+pub fn strip_fcs(frame: bytes) -> bytes {
+    return if frame.len() < 4 { frame } else { frame.slice(0, frame.len() - 4) }
+}

@@ -255,6 +255,21 @@ day its reference is installed.
 
 ## Landed
 
+- [x] **B14 and B15, the radio and capture leftovers** — `pcapng` `dot11`
+  `dot15d4` `btle` `ikev2`, with the harness `packettest4`; the new gate
+  `packet4diff` runs 11,787 cases. tshark reads random pcapng files (two
+  sections, both byte orders, decimal and binary resolutions, offsets,
+  Simple and obsolete packet blocks, name and statistics blocks) and
+  reads what `write` makes of them the same; tshark also reads 802.15.4
+  frames under 2015's PAN ID compression table and every BLE PDU type;
+  scapy builds 802.11, 2006 802.15.4 and IKEv2 from random fields, and its
+  CRC-24 holds BLE's. Scapy was wrong three times and the packages kept
+  the standard: the 802.11 capability field is little-endian, BLE's
+  CRCInit and access address go least significant byte first, and an
+  IPv6 traffic selector is 40 bytes long, not 20. A 64-bit address with
+  the top bit set made `x.ushr(0) % 256` negative and crashed the first
+  run; byte extraction now masks. One break per package turned it red.
+
 - [x] **B25: codecs** — `johab` `cp950` `jisx0212` `jisx0213`, with the
   harness `cjktest`; the new gate `cjkdiff` runs 312,023 cases against
   Python's codecs: every byte, every pair a lead byte can start (refusals
@@ -477,7 +492,7 @@ day its reference is installed.
 | | |
 |---|---|
 | At the start | 669 |
-| Now | 812 |
+| Now | 818 |
 | Candidates above | 316 packages in 28 batches, plus `ecc`, `rfc6979` and `goprintf` |
 | Harnesses, one a batch | 28 |
 | If every candidate lands | 1016 |
