@@ -1,0 +1,38 @@
+// An ML-DSA signature and an SLH-DSA signature, each bound to a context.
+// scripts/b30_diff.sh holds them to NIST's ACVP vectors and Cloudflare's circl.
+import mldsa
+import slhdsa
+
+fn filled(n: i64, v: i64) -> bytes {
+    var out: [i64] = []
+    while out.len() < n {
+        out.push(v)
+    }
+    bytes_of(out)
+}
+
+fn main() / {io} {
+    let msg = "release 1.0".to_bytes()
+    let none = bytes_of([])
+
+    // ML-DSA-44: a lattice signature, deterministic when rnd is zero.
+    let keys = mldsa.keygen("ML-DSA-44", filled(32, 1)) ?? panic("keygen")
+    let sizes = mldsa.sizes("ML-DSA-44") ?? panic("sizes")
+    assert_eq(keys.public.len(), sizes.0)
+    let sig = mldsa.sign("ML-DSA-44", keys.private, msg, "builds".to_bytes(), filled(32, 0)) ?? none
+    assert_eq(sig.len(), sizes.2)
+    assert_eq(mldsa.verify("ML-DSA-44", keys.public, msg, "builds".to_bytes(), sig), true)
+    assert_eq(mldsa.verify("ML-DSA-44", keys.public, msg, "logins".to_bytes(), sig), false)
+
+    // SLH-DSA-SHAKE-128f, a hash-based signature. Signing makes some
+    // hundred thousand hashes, so this shows the key and the sizes; the
+    // gate signs and verifies in every parameter set.
+    let name = "SLH-DSA-SHAKE-128f"
+    let sk = slhdsa.keygen(name, filled(16, 2), filled(16, 3), filled(16, 4)) ?? panic("keygen")
+    assert_eq(sk.public.len(), 32)
+    assert_eq(sk.private.len(), 64)
+    assert_eq(sk.private.slice(32, 64), sk.public)
+    assert_eq(slhdsa.signature_size(slhdsa.params(name) ?? panic("params")), 17088)
+    assert_eq(slhdsa.verify(name, sk.public, msg, "builds".to_bytes(), filled(100, 0)), false)
+    print("b30: ok")
+}

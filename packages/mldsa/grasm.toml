@@ -1,0 +1,8 @@
+[package]
+name = "mldsa"
+version = "1.0.0"
+capabilities = []
+
+[dependencies.sha3]
+path = "../sha3"
+version = "^1.0.0"

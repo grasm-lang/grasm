@@ -1,0 +1,654 @@
+// SLH-DSA (FIPS 205): the post-quantum signature built from hashes alone.
+//
+// SPHINCS+, standardized. Where ML-DSA rests on lattice assumptions,
+// SLH-DSA rests only on the hash function, which is why it is the
+// conservative choice for long-lived roots: firmware signing keys,
+// certificate authorities, the trust anchors that must outlast a
+// cryptanalytic surprise. The cost is size and speed: signatures of 8 to
+// 50 KB, and signing that hashes millions of times in the small variants.
+//
+// A signature is a randomizer R, a FORS few-time signature of the message
+// digest, and a hypertree: d layers of XMSS trees whose leaves are WOTS+
+// one-time keys, each layer signing the root of the one below, up to a
+// public root. Every hash call is keyed by a 32-byte address naming the
+// layer, tree, key pair, chain and position it computes, which is what
+// makes the many one-time keys independent.
+//
+// All twelve parameter sets: SHA2 and SHAKE at 128, 192 and 256 bits,
+// each small (s, smaller signatures, slower signing) and fast (f). The
+// SHA2 sets use SHA-256 for the chains and SHA-512 for the trees and
+// message hash above 128 bits, with the 22-byte compressed address, as
+// FIPS 205 section 11.2 specifies.
+//
+// `sign` and `verify` are the standard interface with a context of up to
+// 255 bytes; `sign_prehashed` signs a digest under its OID (SHA-256,
+// SHA-384, SHA-512, SHA-512/256, SHA3, SHAKE128, SHAKE256; SHA-224 and
+// SHA-512/224 are refused, there being no implementation of them here);
+// `sign_internal` takes the message as is, as NIST's test vectors do.
+// Without `addrnd` signing is deterministic.
+//
+// Checked against NIST's ACVP vectors for key generation, signing and
+// verification and against Cloudflare's circl.
+import sha3
+import crypto_hash
+import sha512
+
+type SlhError =
+    | SlhUnknown(name: str)
+    | SlhBadLength(what: str, length: i64)
+    | SlhBadContext(length: i64)
+    | SlhUnsupportedHash(name: str)
+
+type SlhParams = { name: str, shake: bool, n: i64, h: i64, d: i64, hp: i64, a: i64, k: i64, m: i64 }
+
+type SlhKeys = { public: bytes, private: bytes }
+
+pub fn params(name: str) -> SlhParams ! SlhError {
+    let shake = name.starts_with("SLH-DSA-SHAKE-")
+    let size = name.substr(name.len() - 4, 4)
+    if not shake and not name.starts_with("SLH-DSA-SHA2-") {
+        fail(SlhUnknown(name))
+    }
+    if size == "128s" {
+        return SlhParams{ name: name, shake: shake, n: 16, h: 63, d: 7, hp: 9, a: 12, k: 14, m: 30 }
+    }
+    if size == "128f" {
+        return SlhParams{ name: name, shake: shake, n: 16, h: 66, d: 22, hp: 3, a: 6, k: 33, m: 34 }
+    }
+    if size == "192s" {
+        return SlhParams{ name: name, shake: shake, n: 24, h: 63, d: 7, hp: 9, a: 14, k: 17, m: 39 }
+    }
+    if size == "192f" {
+        return SlhParams{ name: name, shake: shake, n: 24, h: 66, d: 22, hp: 3, a: 8, k: 33, m: 42 }
+    }
+    if size == "256s" {
+        return SlhParams{ name: name, shake: shake, n: 32, h: 64, d: 8, hp: 8, a: 14, k: 22, m: 47 }
+    }
+    if size == "256f" {
+        return SlhParams{ name: name, shake: shake, n: 32, h: 68, d: 17, hp: 4, a: 9, k: 35, m: 49 }
+    }
+    fail(SlhUnknown(name))
+}
+
+/// WOTS+ chain count for n bytes with w = 16: 2n message digits and 3 of
+/// checksum.
+fn wots_len(p: SlhParams) -> i64 {
+    return 2 * p.n + 3
+}
+
+/// The signature size of a parameter set.
+pub fn signature_size(p: SlhParams) -> i64 {
+    return (1 + p.k * (1 + p.a) + p.h + p.d * wots_len(p)) * p.n
+}
+
+// --- Addresses ------------------------------------------------------------------------
+
+let WOTS_HASH = 0
+let WOTS_PK = 1
+let TREE = 2
+let FORS_TREE = 3
+let FORS_ROOTS = 4
+let WOTS_PRF = 5
+let FORS_PRF = 6
+
+fn put_word(adrs: [i64], at: i64, v: i64) -> [i64] {
+    var a = adrs
+    a[at] = v.ushr(24).bit_and(255)
+    a[at + 1] = v.ushr(16).bit_and(255)
+    a[at + 2] = v.ushr(8).bit_and(255)
+    a[at + 3] = v.bit_and(255)
+    return a
+}
+
+fn get_word(adrs: [i64], at: i64) -> i64 {
+    return adrs[at] * 16777216 + adrs[at + 1] * 65536 + adrs[at + 2] * 256 + adrs[at + 3]
+}
+
+fn new_adrs() -> [i64] {
+    var a: [i64] = []
+    while a.len() < 32 {
+        a.push(0)
+    }
+    return a
+}
+
+fn set_layer(a: [i64], v: i64) -> [i64] {
+    return put_word(a, 0, v)
+}
+
+/// The 96-bit tree address; trees here need at most 64 bits.
+fn set_tree(a: [i64], v: i64) -> [i64] {
+    return put_word(put_word(put_word(a, 4, 0), 8, v.ushr(32)), 12, v.bit_and(4294967295))
+}
+
+fn set_type_clear(a: [i64], t: i64) -> [i64] {
+    return put_word(put_word(put_word(put_word(a, 16, t), 20, 0), 24, 0), 28, 0)
+}
+
+fn set_keypair(a: [i64], v: i64) -> [i64] {
+    return put_word(a, 20, v)
+}
+
+fn set_chain(a: [i64], v: i64) -> [i64] {
+    return put_word(a, 24, v)
+}
+
+fn set_hash(a: [i64], v: i64) -> [i64] {
+    return put_word(a, 28, v)
+}
+
+fn set_height(a: [i64], v: i64) -> [i64] {
+    return put_word(a, 24, v)
+}
+
+fn set_index(a: [i64], v: i64) -> [i64] {
+    return put_word(a, 28, v)
+}
+
+fn get_index(a: [i64]) -> i64 {
+    return get_word(a, 28)
+}
+
+fn get_keypair(a: [i64]) -> i64 {
+    return get_word(a, 20)
+}
+
+/// The 22-byte compressed address the SHA2 sets hash.
+fn compressed(a: [i64]) -> bytes {
+    var out: [i64] = [a[3]]
+    var i = 8
+    while i < 16 {
+        out.push(a[i])
+        i = i + 1
+    }
+    out.push(a[19])
+    i = 20
+    while i < 32 {
+        out.push(a[i])
+        i = i + 1
+    }
+    return bytes_of(out)
+}
+
+// --- The hash functions of section 11 ---------------------------------------------------
+
+fn zeros(n: i64) -> bytes {
+    var out: [i64] = []
+    while out.len() < n {
+        out.push(0)
+    }
+    return bytes_of(out)
+}
+
+fn trunc(b: bytes, n: i64) -> bytes {
+    return b.slice(0, n)
+}
+
+/// F, H and T: one keyed hash of the address and the input. `wide` picks
+/// SHA-512 for H and T above 128 bits in the SHA2 sets.
+fn thash(p: SlhParams, seed: bytes, adrs: [i64], m: bytes, wide: bool) -> bytes {
+    if p.shake {
+        return sha3.shake256(seed.concat(bytes_of(adrs)).concat(m), p.n)
+    }
+    if wide and p.n > 16 {
+        return trunc(sha512.sha512(seed.concat(zeros(128 - p.n)).concat(compressed(adrs)).concat(m)), p.n)
+    }
+    return trunc(crypto_hash.sha256_of(seed.concat(zeros(64 - p.n)).concat(compressed(adrs)).concat(m)), p.n)
+}
+
+fn f(p: SlhParams, seed: bytes, adrs: [i64], m: bytes) -> bytes {
+    return thash(p, seed, adrs, m, false)
+}
+
+fn hh(p: SlhParams, seed: bytes, adrs: [i64], m: bytes) -> bytes {
+    return thash(p, seed, adrs, m, true)
+}
+
+fn prf(p: SlhParams, pk_seed: bytes, sk_seed: bytes, adrs: [i64]) -> bytes {
+    return thash(p, pk_seed, adrs, sk_seed, false)
+}
+
+fn prf_msg(p: SlhParams, sk_prf: bytes, opt: bytes, m: bytes) -> bytes {
+    if p.shake {
+        return sha3.shake256(sk_prf.concat(opt).concat(m), p.n)
+    }
+    if p.n > 16 {
+        return trunc(sha512.hmac_sha512(sk_prf, opt.concat(m)), p.n)
+    }
+    return trunc(crypto_hash.hmac_sha256(sk_prf, opt.concat(m)), p.n)
+}
+
+fn mgf1(p: SlhParams, seed: bytes, length: i64) -> bytes {
+    var out = bytes_of([])
+    var counter = 0
+    while out.len() < length {
+        let block = seed.concat(bytes_of([counter.ushr(24).bit_and(255), counter.ushr(16).bit_and(255), counter.ushr(8).bit_and(255), counter.bit_and(255)]))
+        out = out.concat(if p.n > 16 { sha512.sha512(block) } else { crypto_hash.sha256_of(block) })
+        counter = counter + 1
+    }
+    return out.slice(0, length)
+}
+
+fn h_msg(p: SlhParams, r: bytes, pk_seed: bytes, pk_root: bytes, m: bytes) -> bytes {
+    if p.shake {
+        return sha3.shake256(r.concat(pk_seed).concat(pk_root).concat(m), p.m)
+    }
+    let inner = r.concat(pk_seed).concat(pk_root).concat(m)
+    let digest = if p.n > 16 { sha512.sha512(inner) } else { crypto_hash.sha256_of(inner) }
+    return mgf1(p, r.concat(pk_seed).concat(digest), p.m)
+}
+
+// --- WOTS+ ---------------------------------------------------------------------------------
+
+/// The message as base-16 digits followed by the checksum's three digits.
+fn wots_digits(p: SlhParams, m: bytes) -> [i64] {
+    var out: [i64] = []
+    var csum = 0
+    var i = 0
+    while i < p.n {
+        let b = m.at(i)
+        out.push(b / 16)
+        out.push(b % 16)
+        csum = csum + (15 - b / 16) + (15 - b % 16)
+        i = i + 1
+    }
+    // len2 * lg_w = 12 bits: shifted left by 4 into two bytes, three digits.
+    csum = csum.shl(4)
+    out.push(csum.ushr(12).bit_and(15))
+    out.push(csum.ushr(8).bit_and(15))
+    out.push(csum.ushr(4).bit_and(15))
+    return out
+}
+
+fn chain(p: SlhParams, x: bytes, start: i64, steps: i64, seed: bytes, adrs: [i64]) -> bytes {
+    var tmp = x
+    var a = adrs
+    var j = start
+    while j < start + steps {
+        a = set_hash(a, j)
+        tmp = f(p, seed, a, tmp)
+        j = j + 1
+    }
+    return tmp
+}
+
+fn wots_sk_adrs(adrs: [i64]) -> [i64] {
+    return set_keypair(set_type_clear(adrs, WOTS_PRF), get_keypair(adrs))
+}
+
+fn wots_pk_from(p: SlhParams, tops: bytes, seed: bytes, adrs: [i64]) -> bytes {
+    return hh(p, seed, set_keypair(set_type_clear(adrs, WOTS_PK), get_keypair(adrs)), tops)
+}
+
+fn wots_pkgen(p: SlhParams, sk_seed: bytes, seed: bytes, adrs: [i64]) -> bytes {
+    var sk_adrs = wots_sk_adrs(adrs)
+    var a = adrs
+    var tops = bytes_of([])
+    var i = 0
+    while i < wots_len(p) {
+        sk_adrs = set_chain(sk_adrs, i)
+        let sk = prf(p, seed, sk_seed, sk_adrs)
+        a = set_chain(a, i)
+        tops = tops.concat(chain(p, sk, 0, 15, seed, a))
+        i = i + 1
+    }
+    return wots_pk_from(p, tops, seed, adrs)
+}
+
+fn wots_sign(p: SlhParams, m: bytes, sk_seed: bytes, seed: bytes, adrs: [i64]) -> bytes {
+    let digits = wots_digits(p, m)
+    var sk_adrs = wots_sk_adrs(adrs)
+    var a = adrs
+    var out = bytes_of([])
+    var i = 0
+    while i < wots_len(p) {
+        sk_adrs = set_chain(sk_adrs, i)
+        let sk = prf(p, seed, sk_seed, sk_adrs)
+        a = set_chain(a, i)
+        out = out.concat(chain(p, sk, 0, digits[i], seed, a))
+        i = i + 1
+    }
+    return out
+}
+
+fn wots_pk_from_sig(p: SlhParams, sig: bytes, m: bytes, seed: bytes, adrs: [i64]) -> bytes {
+    let digits = wots_digits(p, m)
+    var a = adrs
+    var tops = bytes_of([])
+    var i = 0
+    while i < wots_len(p) {
+        a = set_chain(a, i)
+        tops = tops.concat(chain(p, sig.slice(i * p.n, (i + 1) * p.n), digits[i], 15 - digits[i], seed, a))
+        i = i + 1
+    }
+    return wots_pk_from(p, tops, seed, adrs)
+}
+
+// --- XMSS and the hypertree ------------------------------------------------------------------
+
+fn xmss_node(p: SlhParams, sk_seed: bytes, i: i64, z: i64, seed: bytes, adrs: [i64]) -> bytes {
+    if z == 0 {
+        return wots_pkgen(p, sk_seed, seed, set_keypair(set_type_clear(adrs, WOTS_HASH), i))
+    }
+    let left = xmss_node(p, sk_seed, 2 * i, z - 1, seed, adrs)
+    let right = xmss_node(p, sk_seed, 2 * i + 1, z - 1, seed, adrs)
+    return hh(p, seed, set_index(set_height(set_type_clear(adrs, TREE), z), i), left.concat(right))
+}
+
+fn xmss_sign(p: SlhParams, m: bytes, sk_seed: bytes, idx: i64, seed: bytes, adrs: [i64]) -> bytes {
+    var auth = bytes_of([])
+    var j = 0
+    while j < p.hp {
+        let k = idx.ushr(j).bit_xor(1)
+        auth = auth.concat(xmss_node(p, sk_seed, k, j, seed, adrs))
+        j = j + 1
+    }
+    let sig = wots_sign(p, m, sk_seed, seed, set_keypair(set_type_clear(adrs, WOTS_HASH), idx))
+    return sig.concat(auth)
+}
+
+fn xmss_pk_from_sig(p: SlhParams, idx: i64, sig: bytes, m: bytes, seed: bytes, adrs: [i64]) -> bytes {
+    let wl = wots_len(p) * p.n
+    var node = wots_pk_from_sig(p, sig.slice(0, wl), m, seed, set_keypair(set_type_clear(adrs, WOTS_HASH), idx))
+    var a = set_index(set_type_clear(adrs, TREE), idx)
+    var k = 0
+    while k < p.hp {
+        a = set_height(a, k + 1)
+        let auth = sig.slice(wl + k * p.n, wl + (k + 1) * p.n)
+        if idx.ushr(k).bit_and(1) == 0 {
+            a = set_index(a, get_index(a) / 2)
+            node = hh(p, seed, a, node.concat(auth))
+        } else {
+            a = set_index(a, (get_index(a) - 1) / 2)
+            node = hh(p, seed, a, auth.concat(node))
+        }
+        k = k + 1
+    }
+    return node
+}
+
+fn xmss_size(p: SlhParams) -> i64 {
+    return (wots_len(p) + p.hp) * p.n
+}
+
+fn ht_sign(p: SlhParams, m: bytes, sk_seed: bytes, seed: bytes, tree: i64, leaf: i64) -> bytes {
+    var t = tree
+    var l = leaf
+    var adrs = set_tree(new_adrs(), t)
+    var sig = xmss_sign(p, m, sk_seed, l, seed, adrs)
+    var out = sig
+    var root = xmss_pk_from_sig(p, l, sig, m, seed, adrs)
+    var j = 1
+    while j < p.d {
+        l = t.bit_and(1.shl(p.hp) - 1)
+        t = t.ushr(p.hp)
+        adrs = set_tree(set_layer(adrs, j), t)
+        sig = xmss_sign(p, root, sk_seed, l, seed, adrs)
+        out = out.concat(sig)
+        if j < p.d - 1 {
+            root = xmss_pk_from_sig(p, l, sig, root, seed, adrs)
+        }
+        j = j + 1
+    }
+    return out
+}
+
+fn ht_verify(p: SlhParams, m: bytes, sig: bytes, seed: bytes, tree: i64, leaf: i64, root: bytes) -> bool {
+    var t = tree
+    var l = leaf
+    var adrs = set_tree(new_adrs(), t)
+    let size = xmss_size(p)
+    var node = xmss_pk_from_sig(p, l, sig.slice(0, size), m, seed, adrs)
+    var j = 1
+    while j < p.d {
+        l = t.bit_and(1.shl(p.hp) - 1)
+        t = t.ushr(p.hp)
+        adrs = set_tree(set_layer(adrs, j), t)
+        node = xmss_pk_from_sig(p, l, sig.slice(j * size, (j + 1) * size), node, seed, adrs)
+        j = j + 1
+    }
+    return node == root
+}
+
+// --- FORS ---------------------------------------------------------------------------------------
+
+/// `count` integers of `bits` bits each, read big-endian from the front.
+fn base_2b(x: bytes, bits: i64, count: i64) -> [i64] {
+    var out: [i64] = []
+    var acc = 0
+    var have = 0
+    var at = 0
+    while out.len() < count {
+        while have < bits {
+            acc = acc.shl(8) + x.at(at)
+            at = at + 1
+            have = have + 8
+        }
+        have = have - bits
+        out.push(acc.ushr(have).bit_and(1.shl(bits) - 1))
+        acc = acc.bit_and(1.shl(have) - 1)
+    }
+    return out
+}
+
+fn fors_sk(p: SlhParams, sk_seed: bytes, seed: bytes, adrs: [i64], idx: i64) -> bytes {
+    return prf(p, seed, sk_seed, set_index(set_keypair(set_type_clear(adrs, FORS_PRF), get_keypair(adrs)), idx))
+}
+
+fn fors_node(p: SlhParams, sk_seed: bytes, i: i64, z: i64, seed: bytes, adrs: [i64]) -> bytes {
+    if z == 0 {
+        let sk = fors_sk(p, sk_seed, seed, adrs, i)
+        return f(p, seed, set_index(set_height(adrs, 0), i), sk)
+    }
+    let left = fors_node(p, sk_seed, 2 * i, z - 1, seed, adrs)
+    let right = fors_node(p, sk_seed, 2 * i + 1, z - 1, seed, adrs)
+    return hh(p, seed, set_index(set_height(adrs, z), i), left.concat(right))
+}
+
+fn fors_sign(p: SlhParams, md: bytes, sk_seed: bytes, seed: bytes, adrs: [i64]) -> bytes {
+    let idx = base_2b(md, p.a, p.k)
+    var out = bytes_of([])
+    var i = 0
+    while i < p.k {
+        out = out.concat(fors_sk(p, sk_seed, seed, adrs, i.shl(p.a) + idx[i]))
+        var j = 0
+        while j < p.a {
+            let s = idx[i].ushr(j).bit_xor(1)
+            out = out.concat(fors_node(p, sk_seed, i.shl(p.a - j) + s, j, seed, adrs))
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn fors_pk_from_sig(p: SlhParams, sig: bytes, md: bytes, seed: bytes, adrs: [i64]) -> bytes {
+    let idx = base_2b(md, p.a, p.k)
+    var roots = bytes_of([])
+    var a = adrs
+    var i = 0
+    while i < p.k {
+        let base = i * (p.a + 1) * p.n
+        a = set_index(set_height(a, 0), i.shl(p.a) + idx[i])
+        var node = f(p, seed, a, sig.slice(base, base + p.n))
+        var j = 0
+        while j < p.a {
+            let auth = sig.slice(base + (j + 1) * p.n, base + (j + 2) * p.n)
+            a = set_height(a, j + 1)
+            if idx[i].ushr(j).bit_and(1) == 0 {
+                a = set_index(a, get_index(a) / 2)
+                node = hh(p, seed, a, node.concat(auth))
+            } else {
+                a = set_index(a, (get_index(a) - 1) / 2)
+                node = hh(p, seed, a, auth.concat(node))
+            }
+            j = j + 1
+        }
+        roots = roots.concat(node)
+        i = i + 1
+    }
+    return hh(p, seed, set_keypair(set_type_clear(adrs, FORS_ROOTS), get_keypair(adrs)), roots)
+}
+
+// --- Keys, signing, verification ------------------------------------------------------------------
+
+/// A key pair from SK.seed, SK.prf and PK.seed, n bytes each (algorithm 18).
+pub fn keygen(name: str, sk_seed: bytes, sk_prf: bytes, pk_seed: bytes) -> SlhKeys ! SlhError {
+    let p = try params(name)
+    if sk_seed.len() != p.n or sk_prf.len() != p.n or pk_seed.len() != p.n {
+        fail(SlhBadLength("seed", sk_seed.len()))
+    }
+    let root = xmss_node(p, sk_seed, 0, p.hp, pk_seed, set_layer(new_adrs(), p.d - 1))
+    return SlhKeys{ public: pk_seed.concat(root), private: sk_seed.concat(sk_prf).concat(pk_seed).concat(root) }
+}
+
+fn be_int(b: bytes) -> i64 {
+    var v = 0
+    var i = 0
+    while i < b.len() {
+        v = v.shl(8) + b.at(i)
+        i = i + 1
+    }
+    return v
+}
+
+/// The digest split into the FORS message, the tree index and the leaf.
+fn split_digest(p: SlhParams, digest: bytes) -> (bytes, i64, i64) {
+    let md_len = (p.k * p.a + 7) / 8
+    let tree_bits = p.h - p.hp
+    let tree_len = (tree_bits + 7) / 8
+    let leaf_len = (p.hp + 7) / 8
+    let md = digest.slice(0, md_len)
+    var tree = be_int(digest.slice(md_len, md_len + tree_len))
+    if tree_bits < 64 {
+        tree = tree.bit_and(1.shl(tree_bits) - 1)
+    }
+    let leaf = be_int(digest.slice(md_len + tree_len, md_len + tree_len + leaf_len)).bit_and(1.shl(p.hp) - 1)
+    return (md, tree, leaf)
+}
+
+/// A signature over the message as given (algorithm 19). An empty
+/// `addrnd` signs deterministically.
+pub fn sign_internal(name: str, private: bytes, message: bytes, addrnd: bytes) -> bytes ! SlhError {
+    let p = try params(name)
+    if private.len() != 4 * p.n {
+        fail(SlhBadLength("private key", private.len()))
+    }
+    if addrnd.len() != 0 and addrnd.len() != p.n {
+        fail(SlhBadLength("addrnd", addrnd.len()))
+    }
+    let sk_seed = private.slice(0, p.n)
+    let sk_prf = private.slice(p.n, 2 * p.n)
+    let pk_seed = private.slice(2 * p.n, 3 * p.n)
+    let pk_root = private.slice(3 * p.n, 4 * p.n)
+    let opt = if addrnd.len() == 0 { pk_seed } else { addrnd }
+    let r = prf_msg(p, sk_prf, opt, message)
+    let (md, tree, leaf) = split_digest(p, h_msg(p, r, pk_seed, pk_root, message))
+    let adrs = set_keypair(set_type_clear(set_tree(new_adrs(), tree), FORS_TREE), leaf)
+    let fors = fors_sign(p, md, sk_seed, pk_seed, adrs)
+    let pk_fors = fors_pk_from_sig(p, fors, md, pk_seed, adrs)
+    return r.concat(fors).concat(ht_sign(p, pk_fors, sk_seed, pk_seed, tree, leaf))
+}
+
+/// Whether a signature verifies over the message as given (algorithm 20).
+pub fn verify_internal(name: str, public: bytes, message: bytes, signature: bytes) -> bool {
+    let p = match params(name) {
+        Ok(x) -> x
+        Err(_) -> return false
+    }
+    if public.len() != 2 * p.n or signature.len() != signature_size(p) {
+        return false
+    }
+    let pk_seed = public.slice(0, p.n)
+    let pk_root = public.slice(p.n, 2 * p.n)
+    let r = signature.slice(0, p.n)
+    let fors_end = p.n + p.k * (1 + p.a) * p.n
+    let (md, tree, leaf) = split_digest(p, h_msg(p, r, pk_seed, pk_root, message))
+    let adrs = set_keypair(set_type_clear(set_tree(new_adrs(), tree), FORS_TREE), leaf)
+    let pk_fors = fors_pk_from_sig(p, signature.slice(p.n, fors_end), md, pk_seed, adrs)
+    return ht_verify(p, pk_fors, signature.slice(fors_end, signature.len()), pk_seed, tree, leaf, pk_root)
+}
+
+fn framed(prefix: i64, message: bytes, ctx: bytes) -> bytes ! SlhError {
+    if ctx.len() > 255 {
+        fail(SlhBadContext(ctx.len()))
+    }
+    return bytes_of([prefix, ctx.len()]).concat(ctx).concat(message)
+}
+
+/// An SLH-DSA signature with a context (algorithm 22).
+pub fn sign(name: str, private: bytes, message: bytes, ctx: bytes, addrnd: bytes) -> bytes ! SlhError {
+    return try sign_internal(name, private, try framed(0, message, ctx), addrnd)
+}
+
+/// Whether an SLH-DSA signature verifies with its context (algorithm 24).
+pub fn verify(name: str, public: bytes, message: bytes, ctx: bytes, signature: bytes) -> bool {
+    return match framed(0, message, ctx) {
+        Ok(m) -> verify_internal(name, public, m, signature)
+        Err(_) -> false
+    }
+}
+
+fn oid(hex: str) -> bytes {
+    var out: [i64] = []
+    var i = 0
+    while i + 1 < hex.len() {
+        out.push(hex.substr(i, 2).parse_int_base(16) ?? 0)
+        i = i + 2
+    }
+    return bytes_of(out)
+}
+
+/// The DER OID and digest of a pre-hash function, by its ACVP name.
+fn prehash(hash: str, message: bytes) -> bytes ! SlhError {
+    let arc = "0609608648016503040"
+    if hash == "SHA2-256" {
+        return oid(arc + "201").concat(crypto_hash.sha256_of(message))
+    }
+    if hash == "SHA2-384" {
+        return oid(arc + "202").concat(sha512.sha384(message))
+    }
+    if hash == "SHA2-512" {
+        return oid(arc + "203").concat(sha512.sha512(message))
+    }
+    if hash == "SHA2-512/256" {
+        return oid(arc + "206").concat(sha512.sha512_256(message))
+    }
+    if hash == "SHA3-224" {
+        return oid(arc + "207").concat(sha3.sha3_224(message))
+    }
+    if hash == "SHA3-256" {
+        return oid(arc + "208").concat(sha3.sha3_256(message))
+    }
+    if hash == "SHA3-384" {
+        return oid(arc + "209").concat(sha3.sha3_384(message))
+    }
+    if hash == "SHA3-512" {
+        return oid(arc + "20a").concat(sha3.sha3_512(message))
+    }
+    if hash == "SHAKE-128" {
+        return oid(arc + "20b").concat(sha3.shake128(message, 32))
+    }
+    if hash == "SHAKE-256" {
+        return oid(arc + "20c").concat(sha3.shake256(message, 64))
+    }
+    fail(SlhUnsupportedHash(hash))
+}
+
+/// A HashSLH-DSA signature: the message is hashed with `hash` and the
+/// digest signed under its OID (algorithm 23).
+pub fn sign_prehashed(name: str, private: bytes, message: bytes, ctx: bytes, hash: str, addrnd: bytes) -> bytes ! SlhError {
+    return try sign_internal(name, private, try framed(1, try prehash(hash, message), ctx), addrnd)
+}
+
+/// Whether a HashSLH-DSA signature verifies (algorithm 25).
+pub fn verify_prehashed(name: str, public: bytes, message: bytes, ctx: bytes, hash: str, signature: bytes) -> bool {
+    let digest = match prehash(hash, message) {
+        Ok(d) -> d
+        Err(_) -> return false
+    }
+    return match framed(1, digest, ctx) {
+        Ok(m) -> verify_internal(name, public, m, signature)
+        Err(_) -> false
+    }
+}

@@ -82,7 +82,7 @@ func answer4(r request) string {
 		}
 		return id.String() + "|" + id.Recipient().String()
 	}
-	return "UNKNOWN"
+	return answer5(r)
 }
 
 func suiteOf(r request) (hpke.Suite, hpke.KEM, int) {

@@ -1,0 +1,761 @@
+// ML-DSA (FIPS 204): the post-quantum signature NIST standardized from
+// CRYSTALS-Dilithium.
+//
+// It is what a signature has to be once a quantum computer can run Shor's
+// algorithm against RSA and elliptic curves, and it is already in use:
+// Chrome and Cloudflare's post-quantum certificates, OpenSSH's and
+// Signal's plans, Apple's iMessage PQ3 roadmap, the IETF's composite
+// signatures for X.509. Security rests on Module-LWE and Module-SIS over
+// polynomials of degree 256 with coefficients modulo q = 8,380,417.
+//
+// - Key generation expands a 32-byte seed with SHAKE256 into a public seed
+//   for the matrix A, a seed for the short secrets s1 and s2, and a key K;
+//   t = A s1 + s2 is split into a public high part t1 and a secret low
+//   part t0.
+// - Signing hashes the public key into tr and the message into mu, then
+//   tries masks y until z = y + c s1 is small enough to reveal nothing:
+//   the challenge c is a sparse +-1 polynomial derived from the hash of
+//   mu and the high bits of A y, and hints let the verifier recover those
+//   high bits without t0.
+// - Verification recomputes A z - c t1 2^13, applies the hints, and checks
+//   the challenge hash.
+//
+// All three parameter sets: ML-DSA-44, -65 and -87 (NIST levels 2, 3, 5).
+// `sign` and `verify` are the standard interface, which prefixes the
+// message with a context of up to 255 bytes; `sign_internal` and
+// `verify_internal` take the prefixed message directly, as NIST's test
+// vectors do. Signing is deterministic with `rnd` all zeros and hedged
+// with fresh random bytes; the pre-hashed HashML-DSA variant is not here.
+//
+// Checked against NIST's ACVP vectors for key generation, signing and
+// verification, and against Cloudflare's circl on random keys and
+// messages.
+import sha3
+
+type MldsaError =
+    | MldsaUnknown(name: str)
+    | MldsaBadLength(what: str, length: i64)
+    | MldsaBadContext(length: i64)
+
+type MldsaParams = {
+    name: str,
+    k: i64,
+    l: i64,
+    eta: i64,
+    tau: i64,
+    beta: i64,
+    gamma1_bits: i64,
+    gamma2: i64,
+    omega: i64,
+    ctilde: i64,
+}
+
+/// A parameter set and the NTT's twiddle factors, built once per call.
+type MldsaCtx = { p: MldsaParams, zetas: [i64] }
+
+/// The signature key pair: public and private keys as bytes.
+type MldsaKeys = { public: bytes, private: bytes }
+
+let Q = 8380417
+let D = 13
+
+pub fn params(name: str) -> MldsaParams ! MldsaError {
+    if name == "ML-DSA-44" {
+        return MldsaParams{ name: name, k: 4, l: 4, eta: 2, tau: 39, beta: 78, gamma1_bits: 17, gamma2: 95232, omega: 80, ctilde: 32 }
+    }
+    if name == "ML-DSA-65" {
+        return MldsaParams{ name: name, k: 6, l: 5, eta: 4, tau: 49, beta: 196, gamma1_bits: 19, gamma2: 261888, omega: 55, ctilde: 48 }
+    }
+    if name == "ML-DSA-87" {
+        return MldsaParams{ name: name, k: 8, l: 7, eta: 2, tau: 60, beta: 120, gamma1_bits: 19, gamma2: 261888, omega: 75, ctilde: 64 }
+    }
+    fail(MldsaUnknown(name))
+}
+
+fn modq(a: i64) -> i64 {
+    let r = a % Q
+    return if r < 0 { r + Q } else { r }
+}
+
+fn powq(b: i64, e: i64) -> i64 {
+    var r = 1
+    var x = b
+    var n = e
+    while n > 0 {
+        if n % 2 == 1 {
+            r = r * x % Q
+        }
+        x = x * x % Q
+        n = n / 2
+    }
+    return r
+}
+
+fn bitrev8(v: i64) -> i64 {
+    var r = 0
+    var i = 0
+    while i < 8 {
+        r = r * 2 + v.ushr(i).bit_and(1)
+        i = i + 1
+    }
+    return r
+}
+
+fn context(name: str) -> MldsaCtx ! MldsaError {
+    let p = try params(name)
+    var z: [i64] = []
+    var i = 0
+    while i < 256 {
+        z.push(powq(1753, bitrev8(i)))
+        i = i + 1
+    }
+    return MldsaCtx{ p: p, zetas: z }
+}
+
+/// The key, private-key and signature sizes of a parameter set.
+pub fn sizes(name: str) -> (i64, i64, i64) ! MldsaError {
+    let p = try params(name)
+    let eta_bytes = if p.eta == 2 { 96 } else { 128 }
+    return (32 + 320 * p.k, 128 + eta_bytes * (p.k + p.l) + 416 * p.k,
+        p.ctilde + 32 * (p.gamma1_bits + 1) * p.l + p.omega + p.k)
+}
+
+fn zero() -> [i64] {
+    var out: [i64] = []
+    while out.len() < 256 {
+        out.push(0)
+    }
+    return out
+}
+
+// --- NTT ---------------------------------------------------------------------------
+
+fn ntt(c: MldsaCtx, poly: [i64]) -> [i64] {
+    var w = poly
+    var m = 0
+    var len = 128
+    while len >= 1 {
+        var start = 0
+        while start < 256 {
+            m = m + 1
+            let z = c.zetas[m]
+            var j = start
+            while j < start + len {
+                let t = z * w[j + len] % Q
+                w[j + len] = modq(w[j] - t)
+                w[j] = modq(w[j] + t)
+                j = j + 1
+            }
+            start = start + 2 * len
+        }
+        len = len / 2
+    }
+    return w
+}
+
+fn ntt_inverse(c: MldsaCtx, poly: [i64]) -> [i64] {
+    var w = poly
+    var m = 256
+    var len = 1
+    while len < 256 {
+        var start = 0
+        while start < 256 {
+            m = m - 1
+            let z = Q - c.zetas[m]
+            var j = start
+            while j < start + len {
+                let t = w[j]
+                w[j] = modq(t + w[j + len])
+                w[j + len] = modq(t - w[j + len]) * z % Q
+                j = j + 1
+            }
+            start = start + 2 * len
+        }
+        len = len * 2
+    }
+    var j = 0
+    while j < 256 {
+        w[j] = w[j] * 8347681 % Q
+        j = j + 1
+    }
+    return w
+}
+
+fn pointwise(a: [i64], b: [i64]) -> [i64] {
+    var out = a
+    var i = 0
+    while i < 256 {
+        out[i] = a[i] * b[i] % Q
+        i = i + 1
+    }
+    return out
+}
+
+fn add(a: [i64], b: [i64]) -> [i64] {
+    var out = a
+    var i = 0
+    while i < 256 {
+        out[i] = modq(a[i] + b[i])
+        i = i + 1
+    }
+    return out
+}
+
+fn sub(a: [i64], b: [i64]) -> [i64] {
+    var out = a
+    var i = 0
+    while i < 256 {
+        out[i] = modq(a[i] - b[i])
+        i = i + 1
+    }
+    return out
+}
+
+/// A matrix (k rows of l NTT-domain polynomials) times a vector of l
+/// NTT-domain polynomials.
+fn mat_vec(c: MldsaCtx, a: [[[i64]]], v: [[i64]]) -> [[i64]] {
+    var out: [[i64]] = []
+    for row in a {
+        var acc = zero()
+        var s = 0
+        while s < c.p.l {
+            acc = add(acc, pointwise(row[s], v[s]))
+            s = s + 1
+        }
+        out.push(acc)
+    }
+    return out
+}
+
+// --- Sampling ------------------------------------------------------------------------
+
+/// SHAKE output as needed: `want` bytes, regrown when a rejection loop runs
+/// past them.
+fn rej_ntt_poly(seed: bytes) -> [i64] {
+    var want = 840
+    while true {
+        let s = sha3.shake128(seed, want)
+        var a: [i64] = []
+        var at = 0
+        while a.len() < 256 and at + 3 <= s.len() {
+            let v = s.at(at) + 256 * s.at(at + 1) + 65536 * s.at(at + 2).bit_and(127)
+            if v < Q {
+                a.push(v)
+            }
+            at = at + 3
+        }
+        if a.len() == 256 {
+            return a
+        }
+        want = want * 2
+    }
+    return zero()
+}
+
+fn rej_bounded_poly(seed: bytes, eta: i64) -> [i64] {
+    var want = 272
+    while true {
+        let s = sha3.shake256(seed, want)
+        var a: [i64] = []
+        var at = 0
+        while a.len() < 256 and at < s.len() {
+            let z = s.at(at)
+            at = at + 1
+            var k = 0
+            while k < 2 and a.len() < 256 {
+                let b = if k == 0 { z % 16 } else { z / 16 }
+                if eta == 2 and b < 15 {
+                    a.push(modq(2 - b % 5))
+                } else if eta == 4 and b < 9 {
+                    a.push(modq(4 - b))
+                }
+                k = k + 1
+            }
+        }
+        if a.len() == 256 {
+            return a
+        }
+        want = want * 2
+    }
+    return zero()
+}
+
+fn expand_a(c: MldsaCtx, rho: bytes) -> [[[i64]]] {
+    var out: [[[i64]]] = []
+    var r = 0
+    while r < c.p.k {
+        var row: [[i64]] = []
+        var s = 0
+        while s < c.p.l {
+            row.push(rej_ntt_poly(rho.concat(bytes_of([s, r]))))
+            s = s + 1
+        }
+        out.push(row)
+        r = r + 1
+    }
+    return out
+}
+
+fn sample_in_ball(c: MldsaCtx, seed: bytes) -> [i64] {
+    var want = 136
+    while true {
+        let s = sha3.shake256(seed, want)
+        var poly = zero()
+        var at = 8
+        var i = 256 - c.p.tau
+        var ok = true
+        while i < 256 {
+            var j = 256
+            while j > i {
+                if at >= s.len() {
+                    ok = false
+                    break
+                }
+                j = s.at(at)
+                at = at + 1
+            }
+            if not ok {
+                break
+            }
+            let bit_index = i + c.p.tau - 256
+            let sign = s.at(bit_index / 8).ushr(bit_index % 8).bit_and(1)
+            poly[i] = poly[j]
+            poly[j] = if sign == 1 { Q - 1 } else { 1 }
+            i = i + 1
+        }
+        if ok {
+            return poly
+        }
+        want = want * 2
+    }
+    return zero()
+}
+
+fn expand_mask(c: MldsaCtx, rho: bytes, kappa: i64) -> [[i64]] {
+    let bits = c.p.gamma1_bits + 1
+    let gamma1 = 1.shl(c.p.gamma1_bits)
+    var out: [[i64]] = []
+    var r = 0
+    while r < c.p.l {
+        let n = kappa + r
+        let v = sha3.shake256(rho.concat(bytes_of([n % 256, n / 256 % 256])), 32 * bits)
+        out.push(bit_unpack(v, 0, bits).map(|x| modq(gamma1 - x)))
+        r = r + 1
+    }
+    return out
+}
+
+// --- Packing ------------------------------------------------------------------------------
+
+fn bit_pack(values: [i64], bits: i64) -> [i64] {
+    var out: [i64] = []
+    var acc = 0
+    var have = 0
+    for v in values {
+        acc = acc + v.shl(have)
+        have = have + bits
+        while have >= 8 {
+            out.push(acc.bit_and(255))
+            acc = acc.ushr(8)
+            have = have - 8
+        }
+    }
+    return out
+}
+
+fn bit_unpack(data: bytes, from: i64, bits: i64) -> [i64] {
+    var out: [i64] = []
+    var acc = 0
+    var have = 0
+    var at = from
+    let mask = 1.shl(bits) - 1
+    while out.len() < 256 {
+        while have < bits {
+            acc = acc + data.at(at).shl(have)
+            at = at + 1
+            have = have + 8
+        }
+        out.push(acc.bit_and(mask))
+        acc = acc.ushr(bits)
+        have = have - bits
+    }
+    return out
+}
+
+fn centered(v: i64) -> i64 {
+    return if v > Q / 2 { v - Q } else { v }
+}
+
+fn eta_bits(eta: i64) -> i64 {
+    return if eta == 2 { 3 } else { 4 }
+}
+
+fn pk_encode(rho: bytes, t1: [[i64]]) -> bytes {
+    var out = rho.to_list()
+    for p in t1 {
+        out = out + bit_pack(p, 10)
+    }
+    return bytes_of(out)
+}
+
+fn sk_encode(c: MldsaCtx, rho: bytes, key: bytes, tr: bytes, s1: [[i64]], s2: [[i64]], t0: [[i64]]) -> bytes {
+    var out = rho.concat(key).concat(tr).to_list()
+    let eb = eta_bits(c.p.eta)
+    for p in s1 + s2 {
+        out = out + bit_pack(p.map(|x| c.p.eta - centered(x)), eb)
+    }
+    for p in t0 {
+        out = out + bit_pack(p.map(|x| 4096 - centered(x)), 13)
+    }
+    return bytes_of(out)
+}
+
+type MldsaSecret = { rho: bytes, key: bytes, tr: bytes, s1: [[i64]], s2: [[i64]], t0: [[i64]] }
+
+fn sk_decode(c: MldsaCtx, sk: bytes) -> MldsaSecret {
+    let eb = eta_bits(c.p.eta)
+    var at = 128
+    var s1: [[i64]] = []
+    var s2: [[i64]] = []
+    var i = 0
+    while i < c.p.l + c.p.k {
+        let p = bit_unpack(sk, at, eb).map(|x| modq(c.p.eta - x))
+        if i < c.p.l { s1.push(p) } else { s2.push(p) }
+        at = at + 32 * eb
+        i = i + 1
+    }
+    var t0: [[i64]] = []
+    i = 0
+    while i < c.p.k {
+        t0.push(bit_unpack(sk, at, 13).map(|x| modq(4096 - x)))
+        at = at + 416
+        i = i + 1
+    }
+    return MldsaSecret{ rho: sk.slice(0, 32), key: sk.slice(32, 64), tr: sk.slice(64, 128), s1: s1, s2: s2, t0: t0 }
+}
+
+// --- Rounding -------------------------------------------------------------------------------
+
+/// High and low parts of r: r = r1 (2 gamma2) + r0, r0 centered.
+fn decompose(c: MldsaCtx, r: i64) -> (i64, i64) {
+    let rp = modq(r)
+    let alpha = 2 * c.p.gamma2
+    var r0 = rp % alpha
+    if r0 > alpha / 2 {
+        r0 = r0 - alpha
+    }
+    if rp - r0 == Q - 1 {
+        return (0, r0 - 1)
+    }
+    return ((rp - r0) / alpha, r0)
+}
+
+fn high_bits(c: MldsaCtx, r: i64) -> i64 {
+    return decompose(c, r).0
+}
+
+fn low_bits(c: MldsaCtx, r: i64) -> i64 {
+    return decompose(c, r).1
+}
+
+fn use_hint(c: MldsaCtx, h: i64, r: i64) -> i64 {
+    let m = (Q - 1) / (2 * c.p.gamma2)
+    let (r1, r0) = decompose(c, r)
+    if h == 1 {
+        return if r0 > 0 { (r1 + 1) % m } else { (r1 - 1 + m) % m }
+    }
+    return r1
+}
+
+fn w1_encode(c: MldsaCtx, w1: [[i64]]) -> bytes {
+    let bits = if c.p.gamma2 == 95232 { 6 } else { 4 }
+    var out: [i64] = []
+    for p in w1 {
+        out = out + bit_pack(p, bits)
+    }
+    return bytes_of(out)
+}
+
+fn inf_norm(p: [i64]) -> i64 {
+    var m = 0
+    for v in p {
+        let a = centered(v)
+        let b = if a < 0 { 0 - a } else { a }
+        if b > m {
+            m = b
+        }
+    }
+    return m
+}
+
+// --- Key generation -------------------------------------------------------------------------
+
+/// A key pair from a 32-byte seed (FIPS 204 algorithm 6).
+pub fn keygen(name: str, seed: bytes) -> MldsaKeys ! MldsaError {
+    if seed.len() != 32 {
+        fail(MldsaBadLength("seed", seed.len()))
+    }
+    let c = try context(name)
+    let h = sha3.shake256(seed.concat(bytes_of([c.p.k, c.p.l])), 128)
+    let rho = h.slice(0, 32)
+    let rho2 = h.slice(32, 96)
+    let key = h.slice(96, 128)
+    let a = expand_a(c, rho)
+    var s1: [[i64]] = []
+    var s2: [[i64]] = []
+    var r = 0
+    while r < c.p.l + c.p.k {
+        let p = rej_bounded_poly(rho2.concat(bytes_of([r % 256, r / 256])), c.p.eta)
+        if r < c.p.l { s1.push(p) } else { s2.push(p) }
+        r = r + 1
+    }
+    let as1 = mat_vec(c, a, s1.map(|p| ntt(c, p)))
+    var t1: [[i64]] = []
+    var t0: [[i64]] = []
+    var i = 0
+    while i < c.p.k {
+        let t = add(ntt_inverse(c, as1[i]), s2[i])
+        var hi = zero()
+        var lo = zero()
+        var j = 0
+        while j < 256 {
+            var r0 = t[j] % 8192
+            if r0 > 4096 {
+                r0 = r0 - 8192
+            }
+            hi[j] = (t[j] - r0) / 8192
+            lo[j] = modq(r0)
+            j = j + 1
+        }
+        t1.push(hi)
+        t0.push(lo)
+        i = i + 1
+    }
+    let pk = pk_encode(rho, t1)
+    let tr = sha3.shake256(pk, 64)
+    return MldsaKeys{ public: pk, private: sk_encode(c, rho, key, tr, s1, s2, t0) }
+}
+
+// --- Signing ---------------------------------------------------------------------------------
+
+fn hint_pack(c: MldsaCtx, h: [[i64]]) -> [i64] {
+    var y: [i64] = []
+    while y.len() < c.p.omega + c.p.k {
+        y.push(0)
+    }
+    var index = 0
+    var i = 0
+    while i < c.p.k {
+        var j = 0
+        while j < 256 {
+            if h[i][j] != 0 {
+                y[index] = j
+                index = index + 1
+            }
+            j = j + 1
+        }
+        y[c.p.omega + i] = index
+        i = i + 1
+    }
+    return y
+}
+
+/// MakeHint(-ct0, w - cs2 + ct0) over a polynomial: a 1 wherever adding
+/// ct0 moves the high bits, and how many there are.
+fn make_hint(c: MldsaCtx, r: [i64], rz: [i64]) -> ([i64], i64) {
+    var hi = zero()
+    var ones = 0
+    var j = 0
+    while j < 256 {
+        if high_bits(c, rz[j]) != high_bits(c, r[j]) {
+            hi[j] = 1
+            ones = ones + 1
+        }
+        j = j + 1
+    }
+    return (hi, ones)
+}
+
+/// A signature over the message as given (FIPS 204 algorithm 7): `rnd` is
+/// 32 bytes, all zeros for the deterministic variant.
+pub fn sign_internal(name: str, private: bytes, message: bytes, rnd: bytes) -> bytes ! MldsaError {
+    let c = try context(name)
+    let (_pk_size, sk_size, _sig_size) = try sizes(name)
+    if private.len() != sk_size {
+        fail(MldsaBadLength("private key", private.len()))
+    }
+    if rnd.len() != 32 {
+        fail(MldsaBadLength("rnd", rnd.len()))
+    }
+    let sk = sk_decode(c, private)
+    let s1 = sk.s1.map(|p| ntt(c, p))
+    let s2 = sk.s2.map(|p| ntt(c, p))
+    let t0 = sk.t0.map(|p| ntt(c, p))
+    let a = expand_a(c, sk.rho)
+    let mu = sha3.shake256(sk.tr.concat(message), 64)
+    let rho2 = sha3.shake256(sk.key.concat(rnd).concat(mu), 64)
+    let gamma1 = 1.shl(c.p.gamma1_bits)
+    var kappa = 0
+    while true {
+        let y = expand_mask(c, rho2, kappa)
+        kappa = kappa + c.p.l
+        let w = mat_vec(c, a, y.map(|p| ntt(c, p))).map(|p| ntt_inverse(c, p))
+        let w1 = w.map(|p| p.map(|x| high_bits(c, x)))
+        let ctilde = sha3.shake256(mu.concat(w1_encode(c, w1)), c.p.ctilde)
+        let ch = ntt(c, sample_in_ball(c, ctilde))
+        var z: [[i64]] = []
+        var reject = false
+        var i = 0
+        while i < c.p.l {
+            let zi = add(y[i], ntt_inverse(c, pointwise(ch, s1[i])))
+            if inf_norm(zi) >= gamma1 - c.p.beta {
+                reject = true
+            }
+            z.push(zi)
+            i = i + 1
+        }
+        if reject {
+            continue
+        }
+        var h: [[i64]] = []
+        var ones = 0
+        i = 0
+        while i < c.p.k {
+            let cs2 = ntt_inverse(c, pointwise(ch, s2[i]))
+            let r = sub(w[i], cs2)
+            if inf_norm(r.map(|x| modq(low_bits(c, x)))) >= c.p.gamma2 - c.p.beta {
+                reject = true
+                break
+            }
+            let ct0 = ntt_inverse(c, pointwise(ch, t0[i]))
+            if inf_norm(ct0) >= c.p.gamma2 {
+                reject = true
+                break
+            }
+            let (hi, n) = make_hint(c, r, add(r, ct0))
+            h.push(hi)
+            ones = ones + n
+            i = i + 1
+        }
+        if reject or ones > c.p.omega {
+            continue
+        }
+        var out = ctilde.to_list()
+        for zi in z {
+            out = out + bit_pack(zi.map(|x| gamma1 - centered(x)), c.p.gamma1_bits + 1)
+        }
+        return bytes_of(out + hint_pack(c, h))
+    }
+    return bytes_of([])
+}
+
+/// The context-prefixed message the standard interface signs.
+fn framed(message: bytes, ctx: bytes) -> bytes ! MldsaError {
+    if ctx.len() > 255 {
+        fail(MldsaBadContext(ctx.len()))
+    }
+    return bytes_of([0, ctx.len()]).concat(ctx).concat(message)
+}
+
+/// An ML-DSA signature (FIPS 204 algorithm 2) with a context of up to 255
+/// bytes; `rnd` is 32 random bytes, or zeros to sign deterministically.
+pub fn sign(name: str, private: bytes, message: bytes, ctx: bytes, rnd: bytes) -> bytes ! MldsaError {
+    return try sign_internal(name, private, try framed(message, ctx), rnd)
+}
+
+// --- Verification -----------------------------------------------------------------------------
+
+/// The hints, or None when they are not encoded canonically.
+fn hint_unpack(c: MldsaCtx, y: bytes) -> Option[[[i64]]] {
+    var h: [[i64]] = []
+    var index = 0
+    var i = 0
+    while i < c.p.k {
+        var hi = zero()
+        let end = y.at(c.p.omega + i)
+        if end < index or end > c.p.omega {
+            return None
+        }
+        let first = index
+        while index < end {
+            if index > first and y.at(index - 1) >= y.at(index) {
+                return None
+            }
+            hi[y.at(index)] = 1
+            index = index + 1
+        }
+        h.push(hi)
+        i = i + 1
+    }
+    while index < c.p.omega {
+        if y.at(index) != 0 {
+            return None
+        }
+        index = index + 1
+    }
+    return Some(h)
+}
+
+/// Whether a signature verifies over the message as given (algorithm 8).
+pub fn verify_internal(name: str, public: bytes, message: bytes, signature: bytes) -> bool {
+    let c = match context(name) {
+        Ok(x) -> x
+        Err(_) -> return false
+    }
+    let (pk_size, _sk, sig_size) = sizes(name) ?? (0, 0, 0)
+    if public.len() != pk_size or signature.len() != sig_size {
+        return false
+    }
+    let rho = public.slice(0, 32)
+    var t1: [[i64]] = []
+    var i = 0
+    while i < c.p.k {
+        t1.push(bit_unpack(public, 32 + 320 * i, 10))
+        i = i + 1
+    }
+    let ctilde = signature.slice(0, c.p.ctilde)
+    let bits = c.p.gamma1_bits + 1
+    let gamma1 = 1.shl(c.p.gamma1_bits)
+    var z: [[i64]] = []
+    i = 0
+    while i < c.p.l {
+        let zi = bit_unpack(signature, c.p.ctilde + 32 * bits * i, bits).map(|x| modq(gamma1 - x))
+        if inf_norm(zi) >= gamma1 - c.p.beta {
+            return false
+        }
+        z.push(zi)
+        i = i + 1
+    }
+    let h = match hint_unpack(c, signature.slice(c.p.ctilde + 32 * bits * c.p.l, signature.len())) {
+        Some(x) -> x
+        None -> return false
+    }
+    let a = expand_a(c, rho)
+    let tr = sha3.shake256(public, 64)
+    let mu = sha3.shake256(tr.concat(message), 64)
+    let ch = ntt(c, sample_in_ball(c, ctilde))
+    let az = mat_vec(c, a, z.map(|p| ntt(c, p)))
+    var w1: [[i64]] = []
+    i = 0
+    while i < c.p.k {
+        let ct1 = pointwise(ch, ntt(c, t1[i].map(|x| x * 8192 % Q)))
+        let w = ntt_inverse(c, sub(az[i], ct1))
+        var hi = zero()
+        var j = 0
+        while j < 256 {
+            hi[j] = use_hint(c, h[i][j], w[j])
+            j = j + 1
+        }
+        w1.push(hi)
+        i = i + 1
+    }
+    return sha3.shake256(mu.concat(w1_encode(c, w1)), c.p.ctilde) == ctilde
+}
+
+/// Whether an ML-DSA signature verifies, with its context.
+pub fn verify(name: str, public: bytes, message: bytes, ctx: bytes, signature: bytes) -> bool {
+    return match framed(message, ctx) {
+        Ok(m) -> verify_internal(name, public, m, signature)
+        Err(_) -> false
+    }
+}

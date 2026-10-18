@@ -38,15 +38,25 @@ fn rotl(x: i64, n: i64) -> i64 {
 }
 
 /// Keccak-f[1600]: 24 rounds of theta, rho, pi, chi and iota.
-fn permute(inout lane: [i64]) {
+///
+/// The round constants and rotations come in as arguments: a top-level
+/// `let` read inside a function is built again on every read, and reading
+/// the tables in place rebuilt them some 600 times per permutation, which
+/// was nine-tenths of what hashing cost.
+fn permute(inout lane: [i64], rc: [i64], rho: [i64]) {
+    var parity = [0, 0, 0, 0, 0]
+    var moved: [i64] = []
+    for _i in 0..25 {
+        moved.push(0)
+    }
+    var row = [0, 0, 0, 0, 0]
     for round in 0..24 {
         // Theta: each column's parity is folded into every lane of the two
         // columns beside it, which is what makes one flipped bit reach the
         // whole state within two rounds.
-        var parity: [i64] = []
         for x in 0..5 {
-            parity.push(lane[x].bit_xor(lane[x + 5]).bit_xor(lane[x + 10])
-                    .bit_xor(lane[x + 15]).bit_xor(lane[x + 20]))
+            parity[x] = lane[x].bit_xor(lane[x + 5]).bit_xor(lane[x + 10])
+                .bit_xor(lane[x + 15]).bit_xor(lane[x + 20])
         }
         for x in 0..5 {
             let d = parity[(x + 4) % 5].bit_xor(rotl(parity[(x + 1) % 5], 1))
@@ -55,22 +65,17 @@ fn permute(inout lane: [i64]) {
             }
         }
         // Rho and pi together: rotate each lane, then move it.
-        var moved: [i64] = []
-        for _i in 0..25 {
-            moved.push(0)
-        }
         for x in 0..5 {
             for y in 0..5 {
                 let to_x = y
                 let to_y = (2 * x + 3 * y) % 5
-                moved[to_x + 5 * to_y] = rotl(lane[x + 5 * y], KECCAK_RHO[x + 5 * y])
+                moved[to_x + 5 * to_y] = rotl(lane[x + 5 * y], rho[x + 5 * y])
             }
         }
         // Chi: the only non-linear step in the whole permutation.
         for y in 0..5 {
-            var row: [i64] = []
             for x in 0..5 {
-                row.push(moved[x + 5 * y])
+                row[x] = moved[x + 5 * y]
             }
             for x in 0..5 {
                 lane[x + 5 * y] = row[x].bit_xor(
@@ -78,7 +83,7 @@ fn permute(inout lane: [i64]) {
             }
         }
         // Iota: break the symmetry between rounds.
-        lane[0] = lane[0].bit_xor(KECCAK_RC[round])
+        lane[0] = lane[0].bit_xor(rc[round])
     }
 }
 
@@ -89,6 +94,8 @@ fn permute(inout lane: [i64]) {
 /// of SHAKE256 of the same message, and one function's output would be the
 /// other's.
 fn sponge(message: bytes, rate: i64, pad: i64, want: i64) -> bytes {
+    let rc = KECCAK_RC
+    let rho = KECCAK_RHO
     var lane: [i64] = []
     for _i in 0..25 {
         lane.push(0)
@@ -113,7 +120,7 @@ fn sponge(message: bytes, rate: i64, pad: i64, want: i64) -> bytes {
             }
             lane[i] = lane[i].bit_xor(word)
         }
-        permute(lane)
+        permute(lane, rc, rho)
         at = at + rate
     }
     var out: [i64] = []
@@ -130,7 +137,7 @@ fn sponge(message: bytes, rate: i64, pad: i64, want: i64) -> bytes {
             }
         }
         if out.len() < want {
-            permute(lane)
+            permute(lane, rc, rho)
         }
     }
     return bytes_of(out)

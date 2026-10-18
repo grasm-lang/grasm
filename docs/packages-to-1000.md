@@ -256,6 +256,20 @@ day its reference is installed.
 
 ## Landed
 
+- [x] **B30: post-quantum signatures** — B2's `mldsa` and `slhdsa`, with
+  the harness `b30test`; the new gate `b30diff` runs 1,334 cases against
+  NIST's ACVP vectors (as Cloudflare's circl ships them) and circl itself,
+  from the module cache: ML-DSA-44/65/87 key generation, signing and
+  verification, internal and external, with contexts and pre-hashing;
+  SLH-DSA in all twelve SHA2 and SHAKE parameter sets, deterministic and
+  randomised, likewise. Signatures are byte-identical, and damaged ones
+  are refused alike. Pre-hashing with SHA-224 and SHA-512/224 is refused,
+  circl having neither to check it by. `sha3` read its Keccak round
+  constants and rotations from top-level `let`s inside the permutation,
+  rebuilding them about 600 times a call; passed in, one SHAKE call is 2.8
+  times faster and SLH-DSA signing nearly five. One break per package
+  turned it red.
+
 - [x] **B29: modern public-key crypto** — `x448` `ed448` `hpke` `age`, with
   the harness `b29test`; the new gate `b29diff` runs 2,765 cases against
   Cloudflare's circl and metacubex/age, from the module cache: X448 over
@@ -542,7 +556,7 @@ day its reference is installed.
 | | |
 |---|---|
 | At the start | 669 |
-| Now | 834 |
+| Now | 837 |
 | Candidates above | 316 packages in 28 batches, plus `ecc`, `rfc6979` and `goprintf` |
 | Harnesses, one a batch | 28 |
 | If every candidate lands | 1016 |

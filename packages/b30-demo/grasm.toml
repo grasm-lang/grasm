@@ -1,0 +1,12 @@
+[package]
+name = "b30_demo"
+version = "1.0.0"
+capabilities = ["io"]
+
+[dependencies.mldsa]
+path = "../mldsa"
+version = "^1.0.0"
+
+[dependencies.slhdsa]
+path = "../slhdsa"
+version = "^1.0.0"
