@@ -1,0 +1,214 @@
+// NetBIOS Name Service (RFC 1002): how Windows hosts found each other by
+// name before DNS was everywhere, and how they still do on a LAN with no
+// DNS -- and what a penetration test's name-poisoning tools answer to.
+//
+// A message has DNS's shape -- a transaction ID, flags, four counts,
+// questions and resource records -- but names are NetBIOS names: fifteen
+// characters padded with spaces plus a one-byte suffix saying what the
+// name is (0x00 workstation, 0x20 file server, 0x1C domain controllers),
+// "first-level encoded" so each byte becomes two letters from A to P, and
+// then written as a 32-character DNS label with an optional scope after.
+// A NB record's data is a list of six-byte entries: flags and an IPv4
+// address.
+
+type NbnsQuestion = {
+    name: str,
+    suffix: i64,
+    scope: str,
+    qtype: i64,
+    qclass: i64,
+}
+
+type NbnsRecord = {
+    name: str,
+    suffix: i64,
+    scope: str,
+    rtype: i64,
+    rclass: i64,
+    ttl: i64,
+    rdata: bytes,
+}
+
+type NbnsMessage = {
+    id: i64,
+    flags: i64,
+    questions: [NbnsQuestion],
+    answers: [NbnsRecord],
+    authority: [NbnsRecord],
+    additional: [NbnsRecord],
+}
+
+type NbnsError =
+    | TooShort(at: i64)
+    | BadName(at: i64)
+
+fn u16(b: bytes, at: i64) -> i64 {
+    b.at(at) * 256 + b.at(at + 1)
+}
+
+fn be16(v: i64) -> bytes {
+    bytes_of([v.ushr(8).bit_and(255), v.bit_and(255)])
+}
+
+/// First-level encoding: the name as given (NetBIOS names are upper case by
+/// convention, and this does not change them), padded with spaces to
+/// fifteen bytes, the suffix, then each byte as two letters.
+pub fn encode_name(name: str, suffix: i64, scope: str) -> bytes {
+    var raw = name.to_bytes()
+    if raw.len() > 15 {
+        raw = raw.slice(0, 15)
+    }
+    raw = raw.concat(bytes_filled(15 - raw.len(), 32)).concat(bytes_of([suffix.bit_and(255)]))
+    var label: [i64] = [32]
+    for i in 0..16 {
+        label.push(65 + raw.at(i).ushr(4))
+        label.push(65 + raw.at(i).bit_and(15))
+    }
+    var out = bytes_of(label)
+    if scope.len() > 0 {
+        for part in scope.split(".") {
+            out = out.concat(bytes_of([part.byte_len()])).concat(part.to_bytes())
+        }
+    }
+    out.concat(bytes_of([0]))
+}
+
+/// A name at `at`, following compression pointers: (name with trailing
+/// spaces removed, suffix, scope, where the name ended).
+fn read_name(data: bytes, from: i64) -> (str, i64, str, i64) ! NbnsError {
+    var at = from
+    var end = -1
+    var hops = 0
+    var labels: [bytes] = []
+    while true {
+        if at >= data.len() {
+            fail(TooShort(at))
+        }
+        let n = data.at(at)
+        if n.bit_and(192) == 192 {
+            if at + 1 >= data.len() or hops > 16 {
+                fail(BadName(at))
+            }
+            if end < 0 {
+                end = at + 2
+            }
+            at = n.bit_and(63) * 256 + data.at(at + 1)
+            hops = hops + 1
+            continue
+        }
+        if n == 0 {
+            if end < 0 {
+                end = at + 1
+            }
+            break
+        }
+        if at + 1 + n > data.len() {
+            fail(TooShort(at))
+        }
+        labels.push(data.slice(at + 1, at + 1 + n))
+        at = at + 1 + n
+    }
+    if labels.len() == 0 or labels[0].len() != 32 {
+        fail(BadName(from))
+    }
+    var raw: [i64] = []
+    for i in 0..16 {
+        let hi = labels[0].at(2 * i) - 65
+        let lo = labels[0].at(2 * i + 1) - 65
+        if hi < 0 or hi > 15 or lo < 0 or lo > 15 {
+            fail(BadName(from))
+        }
+        raw.push(hi * 16 + lo)
+    }
+    var name_end = 15
+    while name_end > 0 and raw[name_end - 1] == 32 {
+        name_end = name_end - 1
+    }
+    var scope: [str] = []
+    for k in 1..labels.len() {
+        scope.push(labels[k].to_str())
+    }
+    (bytes_of(raw).slice(0, name_end).to_str(), raw[15], scope.join("."), end)
+}
+
+fn read_records(data: bytes, from: i64, count: i64) -> ([NbnsRecord], i64) ! NbnsError {
+    var out: [NbnsRecord] = []
+    var at = from
+    for _ in 0..count {
+        let n = try read_name(data, at)
+        at = n.3
+        if at + 10 > data.len() {
+            fail(TooShort(at))
+        }
+        let len = u16(data, at + 8)
+        if at + 10 + len > data.len() {
+            fail(TooShort(at))
+        }
+        out.push(NbnsRecord{ name: n.0, suffix: n.1, scope: n.2, rtype: u16(data, at),
+            rclass: u16(data, at + 2), ttl: u16(data, at + 4) * 65536 + u16(data, at + 6),
+            rdata: data.slice(at + 10, at + 10 + len) })
+        at = at + 10 + len
+    }
+    (out, at)
+}
+
+pub fn decode(data: bytes) -> NbnsMessage ! NbnsError {
+    if data.len() < 12 {
+        fail(TooShort(0))
+    }
+    var at = 12
+    var questions: [NbnsQuestion] = []
+    for _ in 0..u16(data, 4) {
+        let n = try read_name(data, at)
+        at = n.3
+        if at + 4 > data.len() {
+            fail(TooShort(at))
+        }
+        questions.push(NbnsQuestion{ name: n.0, suffix: n.1, scope: n.2, qtype: u16(data, at),
+            qclass: u16(data, at + 2) })
+        at = at + 4
+    }
+    let an = try read_records(data, at, u16(data, 6))
+    let ns = try read_records(data, an.1, u16(data, 8))
+    let ar = try read_records(data, ns.1, u16(data, 10))
+    NbnsMessage{ id: u16(data, 0), flags: u16(data, 2), questions: questions, answers: an.0,
+        authority: ns.0, additional: ar.0 }
+}
+
+fn record_bytes(r: NbnsRecord) -> bytes {
+    encode_name(r.name, r.suffix, r.scope).concat(be16(r.rtype)).concat(be16(r.rclass))
+        .concat(be16(r.ttl.ushr(16))).concat(be16(r.ttl.bit_and(65535))).concat(be16(r.rdata.len()))
+        .concat(r.rdata)
+}
+
+/// The message, every name written in full (no compression).
+pub fn encode(m: NbnsMessage) -> bytes {
+    var out = be16(m.id).concat(be16(m.flags)).concat(be16(m.questions.len()))
+        .concat(be16(m.answers.len())).concat(be16(m.authority.len()))
+        .concat(be16(m.additional.len()))
+    for q in m.questions {
+        out = out.concat(encode_name(q.name, q.suffix, q.scope)).concat(be16(q.qtype))
+            .concat(be16(q.qclass))
+    }
+    for r in m.answers {
+        out = out.concat(record_bytes(r))
+    }
+    for r in m.authority {
+        out = out.concat(record_bytes(r))
+    }
+    for r in m.additional {
+        out = out.concat(record_bytes(r))
+    }
+    out
+}
+
+/// The addresses in an NB record's data, with their flags.
+pub fn nb_entries(rdata: bytes) -> [(i64, bytes)] {
+    var out: [(i64, bytes)] = []
+    var at = 0
+    while at + 6 <= rdata.len() {
+        out.push((u16(rdata, at), rdata.slice(at + 2, at + 6)))
+        at = at + 6
+    }
+    out
+}

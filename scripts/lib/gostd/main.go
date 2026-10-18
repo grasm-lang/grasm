@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"math"
 	"bytes"
+	"crypto/aes"
 	"crypto/cipher"
 	"crypto/des"
 	"crypto/rc4"
@@ -331,6 +332,25 @@ func answer(op string, a, b []byte) string {
 			return "ERR"
 		}
 		return h(out.Bytes())
+	case "espgcm":
+		// RFC 4106 ESP with AES-GCM: the sealing is Go's crypto/cipher; the
+		// framing is the RFC's.
+		key, salt := a[:len(a)-4], a[len(a)-4:]
+		head, iv, nh, payload := b[:8], b[8:16], b[16], b[17:]
+		pad := (4 - (len(payload)+2)%4) % 4
+		plain := append([]byte{}, payload...)
+		for k := 1; k <= pad; k++ {
+			plain = append(plain, byte(k))
+		}
+		plain = append(plain, byte(pad), nh)
+		block, err := aes.NewCipher(key)
+		if err != nil {
+			return "ERR"
+		}
+		g, _ := cipher.NewGCM(block)
+		nonce := append(append([]byte{}, salt...), iv...)
+		sealed := g.Seal(nil, nonce, plain, head)
+		return h(append(append(append([]byte{}, head...), iv...), sealed...))
 	case "salook":
 		idx := suffixarray.New(a)
 		got := idx.Lookup(b, -1)

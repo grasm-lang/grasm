@@ -1,0 +1,174 @@
+// DHCP (RFC 2131, on BOOTP's RFC 951 layout): how nearly every device gets
+// an address.
+//
+// A fixed 236-byte BOOTP header -- operation, hardware type and length,
+// relay hops, transaction ID, seconds, flags, four addresses, the client's
+// hardware address in sixteen bytes, server name and boot file -- then the
+// magic cookie 99.130.83.99 and the options: code, length, value, with
+// code 0 a single pad byte and 255 the end. The DHCP message type (53) is
+// what makes a BOOTP packet a DHCPDISCOVER, OFFER, REQUEST or ACK.
+//
+// Options are kept in order and as bytes, because their meanings are many
+// and a relay must forward the ones it does not understand unchanged; the
+// common ones have readers.
+
+type DhcpOption = {
+    code: i64,
+    value: bytes,
+}
+
+type DhcpPacket = {
+    op: i64,
+    htype: i64,
+    hlen: i64,
+    hops: i64,
+    xid: i64,
+    secs: i64,
+    flags: i64,
+    ciaddr: bytes,
+    yiaddr: bytes,
+    siaddr: bytes,
+    giaddr: bytes,
+    chaddr: bytes,
+    sname: bytes,
+    file: bytes,
+    has_cookie: bool,
+    options: [DhcpOption],
+    /// Whether an end option (255) closed the options, and the bytes after
+    /// it -- usually zeros padding the packet to BOOTP's 300 bytes.
+    has_end: bool,
+    tail: bytes,
+}
+
+type DhcpError =
+    | TooShort(found: i64)
+    | BadOption(at: i64)
+
+fn u16(b: bytes, at: i64) -> i64 {
+    b.at(at) * 256 + b.at(at + 1)
+}
+
+pub fn decode(data: bytes) -> DhcpPacket ! DhcpError {
+    if data.len() < 236 {
+        fail(TooShort(data.len()))
+    }
+    var p = DhcpPacket{ op: data.at(0), htype: data.at(1), hlen: data.at(2), hops: data.at(3),
+        xid: u16(data, 4) * 65536 + u16(data, 6), secs: u16(data, 8), flags: u16(data, 10),
+        ciaddr: data.slice(12, 16), yiaddr: data.slice(16, 20), siaddr: data.slice(20, 24),
+        giaddr: data.slice(24, 28), chaddr: data.slice(28, 44), sname: data.slice(44, 108),
+        file: data.slice(108, 236), has_cookie: false, options: [], has_end: false,
+        tail: bytes_of([]) }
+    if data.len() < 240 or data.slice(236, 240).to_list() != [99, 130, 83, 99] {
+        return p
+    }
+    p.has_cookie = true
+    var at = 240
+    while at < data.len() {
+        let code = data.at(at)
+        if code == 0 {
+            // A pad byte, kept so the packet re-encodes exactly.
+            p.options.push(DhcpOption{ code: 0, value: bytes_of([]) })
+            at = at + 1
+            continue
+        }
+        if code == 255 {
+            p.has_end = true
+            p.tail = data.slice(at + 1, data.len())
+            break
+        }
+        if at + 2 > data.len() or at + 2 + data.at(at + 1) > data.len() {
+            fail(BadOption(at))
+        }
+        let n = data.at(at + 1)
+        p.options.push(DhcpOption{ code: code, value: data.slice(at + 2, at + 2 + n) })
+        at = at + 2 + n
+    }
+    p
+}
+
+fn fixed(b: bytes, n: i64) -> bytes {
+    if b.len() >= n { b.slice(0, n) } else { b.concat(bytes_filled(n - b.len(), 0)) }
+}
+
+/// The packet: header fields cut or zero-padded to their widths, the cookie,
+/// the options, the end option and what followed it.
+pub fn encode(p: DhcpPacket) -> bytes {
+    var out = bytes_of([p.op, p.htype, p.hlen, p.hops, p.xid.ushr(24).bit_and(255),
+        p.xid.ushr(16).bit_and(255), p.xid.ushr(8).bit_and(255), p.xid.bit_and(255),
+        p.secs.ushr(8).bit_and(255), p.secs.bit_and(255), p.flags.ushr(8).bit_and(255),
+        p.flags.bit_and(255)])
+    out = out.concat(fixed(p.ciaddr, 4)).concat(fixed(p.yiaddr, 4)).concat(fixed(p.siaddr, 4))
+        .concat(fixed(p.giaddr, 4)).concat(fixed(p.chaddr, 16)).concat(fixed(p.sname, 64))
+        .concat(fixed(p.file, 128))
+    if not p.has_cookie {
+        return out
+    }
+    out = out.concat(bytes_of([99, 130, 83, 99]))
+    for o in p.options {
+        if o.code == 0 {
+            out = out.concat(bytes_of([0]))
+        } else {
+            out = out.concat(bytes_of([o.code.bit_and(255), o.value.len().bit_and(255)]))
+                .concat(o.value)
+        }
+    }
+    if p.has_end {
+        out = out.concat(bytes_of([255])).concat(p.tail)
+    }
+    out
+}
+
+/// A new packet's options closed by an end option, with no padding.
+pub fn finish(p: DhcpPacket) -> DhcpPacket {
+    var q = p
+    q.has_cookie = true
+    q.has_end = true
+    q
+}
+
+pub fn option(p: DhcpPacket, code: i64) -> Option[bytes] {
+    for o in p.options {
+        if o.code == code {
+            return Some(o.value)
+        }
+    }
+    None
+}
+
+/// Option 53: 1 DISCOVER, 2 OFFER, 3 REQUEST, 4 DECLINE, 5 ACK, 6 NAK,
+/// 7 RELEASE, 8 INFORM; 0 when absent.
+pub fn message_type(p: DhcpPacket) -> i64 {
+    match option(p, 53) {
+        Some(v) -> if v.len() == 1 { v.at(0) } else { 0 }
+        None -> 0
+    }
+}
+
+pub fn message_type_name(t: i64) -> str {
+    let names = ["", "DISCOVER", "OFFER", "REQUEST", "DECLINE", "ACK", "NAK", "RELEASE", "INFORM"]
+    if t >= 1 and t <= 8 { names[t] } else { "unknown" }
+}
+
+/// Options 3 (routers) and 6 (DNS servers): a list of four-byte addresses.
+pub fn addresses(p: DhcpPacket, code: i64) -> [bytes] {
+    var out: [bytes] = []
+    match option(p, code) {
+        Some(v) -> {
+            var at = 0
+            while at + 4 <= v.len() {
+                out.push(v.slice(at, at + 4))
+                at = at + 4
+            }
+        }
+        None -> {}
+    }
+    out
+}
+
+/// Option 51, the lease in seconds; -1 when absent.
+pub fn lease_seconds(p: DhcpPacket) -> i64 {
+    match option(p, 51) {
+        Some(v) -> if v.len() == 4 { u16(v, 0) * 65536 + u16(v, 2) } else { -1 }
+        None -> -1
+    }
+}

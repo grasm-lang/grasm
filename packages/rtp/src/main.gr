@@ -1,0 +1,120 @@
+// RTP (RFC 3550): the header on every packet of a voice or video call --
+// WebRTC, SIP phones, RTSP cameras, broadcast contribution links.
+//
+// Twelve fixed bytes -- version 2, padding and extension bits, how many
+// contributing sources follow, the marker bit, the payload type, a 16-bit
+// sequence number, a 32-bit timestamp and the synchronisation source --
+// then the contributing sources, an optional header extension (a profile
+// word and a length in 32-bit words), the payload, and, when the padding
+// bit is set, padding whose last byte says how much there is. A count or
+// length that runs past the packet is refused.
+
+type RtpPacket = {
+    version: i64,
+    padding: i64,
+    extension: i64,
+    marker: i64,
+    payload_type: i64,
+    sequence: i64,
+    timestamp: i64,
+    ssrc: i64,
+    csrc: [i64],
+    ext_profile: i64,
+    ext_data: bytes,
+    payload: bytes,
+    pad: bytes,
+}
+
+type RtpError =
+    | TooShort(found: i64)
+    | BadPadding
+
+fn u32(b: bytes, at: i64) -> i64 {
+    b.at(at).shl(24).bit_or(b.at(at + 1).shl(16)).bit_or(b.at(at + 2).shl(8)).bit_or(b.at(at + 3))
+}
+
+fn put32(inout out: [i64], v: i64) {
+    out.push(v.ushr(24).bit_and(255))
+    out.push(v.ushr(16).bit_and(255))
+    out.push(v.ushr(8).bit_and(255))
+    out.push(v.bit_and(255))
+}
+
+pub fn decode(data: bytes) -> RtpPacket ! RtpError {
+    if data.len() < 12 {
+        fail(TooShort(data.len()))
+    }
+    let b0 = data.at(0)
+    let cc = b0.bit_and(15)
+    var at = 12 + 4 * cc
+    if data.len() < at {
+        fail(TooShort(data.len()))
+    }
+    var csrc: [i64] = []
+    for k in 0..cc {
+        csrc.push(u32(data, 12 + 4 * k))
+    }
+    var p = RtpPacket{ version: b0.ushr(6), padding: b0.ushr(5).bit_and(1),
+        extension: b0.ushr(4).bit_and(1), marker: data.at(1).ushr(7),
+        payload_type: data.at(1).bit_and(127), sequence: data.at(2) * 256 + data.at(3),
+        timestamp: u32(data, 4), ssrc: u32(data, 8), csrc: csrc, ext_profile: 0,
+        ext_data: bytes_of([]), payload: bytes_of([]), pad: bytes_of([]) }
+    if p.extension == 1 {
+        if data.len() < at + 4 {
+            fail(TooShort(data.len()))
+        }
+        p.ext_profile = data.at(at) * 256 + data.at(at + 1)
+        let words = data.at(at + 2) * 256 + data.at(at + 3)
+        if data.len() < at + 4 + 4 * words {
+            fail(TooShort(data.len()))
+        }
+        p.ext_data = data.slice(at + 4, at + 4 + 4 * words)
+        at = at + 4 + 4 * words
+    }
+    var end = data.len()
+    if p.padding == 1 {
+        let n = if end > at { data.at(end - 1) } else { 0 }
+        if n == 0 or end - n < at {
+            fail(BadPadding)
+        }
+        p.pad = data.slice(end - n, end)
+        end = end - n
+    }
+    p.payload = data.slice(at, end)
+    p
+}
+
+/// The packet. The contributing-source count and extension length are
+/// taken from the lists; padding is written as given, so its last byte
+/// must be its length.
+pub fn encode(p: RtpPacket) -> bytes {
+    var out: [i64] = []
+    out.push(p.version.bit_and(3).shl(6).bit_or(p.padding.bit_and(1).shl(5))
+            .bit_or(p.extension.bit_and(1).shl(4)).bit_or(p.csrc.len().bit_and(15)))
+    out.push(p.marker.bit_and(1).shl(7).bit_or(p.payload_type.bit_and(127)))
+    out.push(p.sequence.ushr(8).bit_and(255))
+    out.push(p.sequence.bit_and(255))
+    put32(out, p.timestamp)
+    put32(out, p.ssrc)
+    for c in p.csrc {
+        put32(out, c)
+    }
+    if p.extension == 1 {
+        let words = (p.ext_data.len() + 3) / 4
+        out.push(p.ext_profile.ushr(8).bit_and(255))
+        out.push(p.ext_profile.bit_and(255))
+        out.push(words.ushr(8).bit_and(255))
+        out.push(words.bit_and(255))
+        for i in 0..words * 4 {
+            out.push(if i < p.ext_data.len() { p.ext_data.at(i) } else { 0 })
+        }
+    }
+    bytes_of(out).concat(p.payload).concat(p.pad)
+}
+
+/// Sequence numbers wrap at 65536; `a` is newer than `b` when it is less
+/// than half the circle ahead (RFC 3550, appendix A.1).
+pub fn seq_newer(a: i64, b: i64) -> bool {
+    let d = (a - b + 65536) % 65536
+    d != 0 and d < 32768
+}

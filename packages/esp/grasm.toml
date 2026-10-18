@@ -1,0 +1,9 @@
+[package]
+name = "esp"
+version = "1.0.0"
+
+capabilities = []
+
+[dependencies.aes]
+path = "../aes"
+version = "^1.0.0"

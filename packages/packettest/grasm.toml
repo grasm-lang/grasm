@@ -34,3 +34,35 @@ version = "^1.0.0"
 [dependencies.sllcap]
 path = "../sllcap"
 version = "^1.0.0"
+
+[dependencies.rtp]
+path = "../rtp"
+version = "^1.0.0"
+
+[dependencies.stun]
+path = "../stun"
+version = "^1.0.0"
+
+[dependencies.sctp]
+path = "../sctp"
+version = "^1.0.0"
+
+[dependencies.dhcp]
+path = "../dhcp"
+version = "^1.0.0"
+
+[dependencies.dhcpv6]
+path = "../dhcpv6"
+version = "^1.0.0"
+
+[dependencies.esp]
+path = "../esp"
+version = "^1.0.0"
+
+[dependencies.nbns]
+path = "../nbns"
+version = "^1.0.0"
+
+[dependencies.pflog]
+path = "../pflog"
+version = "^1.0.0"

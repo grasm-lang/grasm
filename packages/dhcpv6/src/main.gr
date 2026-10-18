@@ -1,0 +1,105 @@
+// DHCPv6 (RFC 8415): address and prefix assignment for IPv6, and the
+// relay messages that carry it across links.
+//
+// A client or server message is a type, a 24-bit transaction ID and
+// options; a relay message (types 12 and 13) is a type, a hop count, a link
+// address, a peer address and options -- among them option 9, holding the
+// relayed message whole. Every option is a 16-bit code, a 16-bit length and
+// a value; IA_NA, IA_PD and their addresses nest further options inside
+// their values, which `options_in` reads.
+
+type Dhcpv6Option = {
+    code: i64,
+    value: bytes,
+}
+
+type Dhcpv6Message = {
+    msg_type: i64,
+    transaction_id: i64,
+    hop_count: i64,
+    link_address: bytes,
+    peer_address: bytes,
+    options: [Dhcpv6Option],
+}
+
+type Dhcpv6Error =
+    | TooShort(found: i64)
+    | BadOption(at: i64)
+
+pub fn is_relay(msg_type: i64) -> bool {
+    msg_type == 12 or msg_type == 13
+}
+
+fn u16(b: bytes, at: i64) -> i64 {
+    b.at(at) * 256 + b.at(at + 1)
+}
+
+/// Options from `at` to the end of `data`.
+pub fn options_in(data: bytes, from: i64) -> [Dhcpv6Option] ! Dhcpv6Error {
+    var out: [Dhcpv6Option] = []
+    var at = from
+    while at < data.len() {
+        if at + 4 > data.len() {
+            fail(BadOption(at))
+        }
+        let n = u16(data, at + 2)
+        if at + 4 + n > data.len() {
+            fail(BadOption(at))
+        }
+        out.push(Dhcpv6Option{ code: u16(data, at), value: data.slice(at + 4, at + 4 + n) })
+        at = at + 4 + n
+    }
+    out
+}
+
+pub fn decode(data: bytes) -> Dhcpv6Message ! Dhcpv6Error {
+    if data.len() < 4 {
+        fail(TooShort(data.len()))
+    }
+    let t = data.at(0)
+    if is_relay(t) {
+        if data.len() < 34 {
+            fail(TooShort(data.len()))
+        }
+        return Dhcpv6Message{ msg_type: t, transaction_id: 0, hop_count: data.at(1),
+            link_address: data.slice(2, 18), peer_address: data.slice(18, 34),
+            options: try options_in(data, 34) }
+    }
+    Dhcpv6Message{ msg_type: t, transaction_id: data.at(1) * 65536 + u16(data, 2), hop_count: 0,
+        link_address: bytes_of([]), peer_address: bytes_of([]), options: try options_in(data, 4) }
+}
+
+pub fn encode_options(options: [Dhcpv6Option]) -> bytes {
+    var out = bytes_of([])
+    for o in options {
+        let n = o.value.len()
+        out = out.concat(bytes_of([o.code.ushr(8).bit_and(255), o.code.bit_and(255),
+            n.ushr(8).bit_and(255), n.bit_and(255)])).concat(o.value)
+    }
+    out
+}
+
+pub fn encode(m: Dhcpv6Message) -> bytes {
+    if is_relay(m.msg_type) {
+        return bytes_of([m.msg_type, m.hop_count.bit_and(255)]).concat(m.link_address)
+            .concat(m.peer_address).concat(encode_options(m.options))
+    }
+    let x = m.transaction_id
+    bytes_of([m.msg_type.bit_and(255), x.ushr(16).bit_and(255), x.ushr(8).bit_and(255),
+        x.bit_and(255)]).concat(encode_options(m.options))
+}
+
+pub fn option(m: Dhcpv6Message, code: i64) -> Option[bytes] {
+    for o in m.options {
+        if o.code == code {
+            return Some(o.value)
+        }
+    }
+    None
+}
+
+pub fn type_name(t: i64) -> str {
+    let names = ["", "SOLICIT", "ADVERTISE", "REQUEST", "CONFIRM", "RENEW", "REBIND", "REPLY",
+        "RELEASE", "DECLINE", "RECONFIGURE", "INFORMATION-REQUEST", "RELAY-FORW", "RELAY-REPL"]
+    if t >= 1 and t <= 13 { names[t] } else { "unknown" }
+}

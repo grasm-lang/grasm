@@ -1,0 +1,154 @@
+// SCTP (RFC 9260, formerly 4960): the transport under WebRTC data
+// channels, Diameter, SIGTRAN and the 4G/5G core's S1 and NG interfaces.
+//
+// A twelve-byte common header -- ports, the verification tag, a checksum
+// -- then chunks, each a type, flags, a length counting its own header,
+// and a value padded to four bytes. The chunk that carries data has its own
+// fields (TSN, stream, stream sequence, payload protocol) and is decoded
+// through `data_chunk`.
+//
+// ## The checksum is CRC-32C, stored backwards
+//
+// RFC 3309 replaced Adler-32 with CRC-32C (Castagnoli) over the whole
+// packet with the checksum field zeroed, and the result goes on the wire
+// least significant byte first -- unlike every other field in the header.
+// `encode` computes it; `checksum_holds` checks one that arrived.
+
+type SctpChunk = {
+    kind: i64,
+    flags: i64,
+    value: bytes,
+}
+
+type SctpPacket = {
+    sport: i64,
+    dport: i64,
+    tag: i64,
+    checksum: i64,
+    chunks: [SctpChunk],
+}
+
+type SctpData = {
+    unordered: bool,
+    beginning: bool,
+    ending: bool,
+    tsn: i64,
+    stream_id: i64,
+    stream_seq: i64,
+    proto_id: i64,
+    data: bytes,
+}
+
+type SctpError =
+    | TooShort(found: i64)
+    | BadChunk(at: i64)
+
+fn u16(b: bytes, at: i64) -> i64 {
+    b.at(at) * 256 + b.at(at + 1)
+}
+
+fn u32(b: bytes, at: i64) -> i64 {
+    u16(b, at) * 65536 + u16(b, at + 2)
+}
+
+fn be32(v: i64) -> bytes {
+    bytes_of([v.ushr(24).bit_and(255), v.ushr(16).bit_and(255), v.ushr(8).bit_and(255),
+        v.bit_and(255)])
+}
+
+fn castagnoli_table() -> [i64] {
+    var t: [i64] = []
+    for n in 0..256 {
+        var c = n
+        for _ in 0..8 {
+            c = if c.bit_and(1) == 1 { c.ushr(1).bit_xor(2197175160) } else { c.ushr(1) }
+        }
+        t.push(c)
+    }
+    t
+}
+
+let SCTP_CRC32C = castagnoli_table()
+
+/// CRC-32C of `data`, as the number the RFC computes.
+pub fn crc32c(data: bytes) -> i64 {
+    var crc = 4294967295
+    for i in 0..data.len() {
+        crc = crc.ushr(8).bit_xor(SCTP_CRC32C[crc.bit_xor(data.at(i)).bit_and(255)])
+    }
+    crc.bit_xor(4294967295)
+}
+
+pub fn decode(data: bytes) -> SctpPacket ! SctpError {
+    if data.len() < 12 {
+        fail(TooShort(data.len()))
+    }
+    var chunks: [SctpChunk] = []
+    var at = 12
+    while at < data.len() {
+        if at + 4 > data.len() {
+            fail(BadChunk(at))
+        }
+        let n = u16(data, at + 2)
+        if n < 4 or at + n > data.len() {
+            fail(BadChunk(at))
+        }
+        chunks.push(SctpChunk{ kind: data.at(at), flags: data.at(at + 1),
+            value: data.slice(at + 4, at + n) })
+        at = at + (n + 3) / 4 * 4
+    }
+    SctpPacket{ sport: u16(data, 0), dport: u16(data, 2), tag: u32(data, 4),
+        checksum: u32(data, 8), chunks: chunks }
+}
+
+/// The packet with every chunk padded and the CRC-32C computed.
+pub fn encode(p: SctpPacket) -> bytes {
+    var out = bytes_of([p.sport.ushr(8).bit_and(255), p.sport.bit_and(255),
+        p.dport.ushr(8).bit_and(255), p.dport.bit_and(255)]).concat(be32(p.tag))
+        .concat(bytes_filled(4, 0))
+    for c in p.chunks {
+        let n = 4 + c.value.len()
+        out = out.concat(bytes_of([c.kind.bit_and(255), c.flags.bit_and(255), n.ushr(8).bit_and(255),
+            n.bit_and(255)])).concat(c.value).concat(bytes_filled((n + 3) / 4 * 4 - n, 0))
+    }
+    let crc = crc32c(out)
+    out.set(8, crc.bit_and(255))
+    out.set(9, crc.ushr(8).bit_and(255))
+    out.set(10, crc.ushr(16).bit_and(255))
+    out.set(11, crc.ushr(24).bit_and(255))
+    out
+}
+
+pub fn checksum_holds(data: bytes) -> bool {
+    if data.len() < 12 {
+        return false
+    }
+    var zeroed = data
+    for i in 8..12 {
+        zeroed.set(i, 0)
+    }
+    let crc = crc32c(zeroed)
+    data.at(8) == crc.bit_and(255) and data.at(9) == crc.ushr(8).bit_and(255) and
+    data.at(10) == crc.ushr(16).bit_and(255) and data.at(11) == crc.ushr(24)
+}
+
+/// A DATA chunk's fields (type 0).
+pub fn data_chunk(c: SctpChunk) -> SctpData ! SctpError {
+    if c.value.len() < 12 {
+        fail(BadChunk(0))
+    }
+    SctpData{ unordered: c.flags.bit_and(4) != 0, beginning: c.flags.bit_and(2) != 0,
+        ending: c.flags.bit_and(1) != 0, tsn: u32(c.value, 0), stream_id: u16(c.value, 4),
+        stream_seq: u16(c.value, 6), proto_id: u32(c.value, 8),
+        data: c.value.slice(12, c.value.len()) }
+}
+
+/// A DATA chunk carrying one whole message.
+pub fn make_data(d: SctpData) -> SctpChunk {
+    let flags = (if d.unordered { 4 } else { 0 }) + (if d.beginning { 2 } else { 0 }) +
+    (if d.ending { 1 } else { 0 })
+    SctpChunk{ kind: 0, flags: flags,
+        value: be32(d.tsn).concat(bytes_of([d.stream_id.ushr(8).bit_and(255), d.stream_id.bit_and(255),
+            d.stream_seq.ushr(8).bit_and(255), d.stream_seq.bit_and(255)])).concat(be32(d.proto_id))
+            .concat(d.data) }
+}

@@ -6,6 +6,9 @@ import icmpv6
 import arp
 import gre
 import vxlan
+import stun
+import sctp
+import esp
 
 fn hex(raw: bytes) -> str {
     let digits = "0123456789abcdef"
@@ -51,5 +54,31 @@ fn main() / {io} {
     assert(not icmpv6.checksum_holds(wire, src, other))
 
     assert_eq(hex(vxlan.encode(vxlan.for_vni(4242, bytes_of([])))), "0800000000109200")
+    // CRC-32C's published check value.
+    assert_eq(sctp.crc32c("123456789".to_bytes()), 3808858755)
+
+    // NULL ESP of a UDP datagram, as scapy's SecurityAssociation wrote it.
+    let udp = bytes_of([0, 1, 0, 2, 0, 13, 181, 249]).concat("hello".to_bytes())
+    assert_eq(hex(esp.seal_null(4660, 1, udp, 17)),
+        "000012340000000100010002000db5f968656c6c6f010111")
+
+    // XOR-MAPPED-ADDRESS hides the address from the NATs it is about.
+    var binding = StunMessage{ msg_type: stun.message_type(1, 2), cookie: stun.magic_cookie(),
+        transaction_id: bytes_filled(12, 7), attributes: [] }
+    let mapped = StunAddress{ family: 1, port: 3478, address: bytes_of([192, 0, 2, 1]) }
+    binding.attributes = [stun.attribute(stun.xor_mapped_address(), stun.xor_address_value(binding, mapped)),
+        stun.attribute(stun.fingerprint(), bytes_of([]))]
+    let message = stun.encode(binding)
+    assert(stun.fingerprint_holds(message))
+    match stun.decode(message) {
+        Ok(back) -> match stun.xor_address(back, back.attributes[0].value) {
+            Ok(a) -> {
+                assert_eq(a.port, 3478)
+                assert_eq(hex(a.address), "c0000201")
+            }
+            Err(_) -> panic("stun could not read back its address")
+        }
+        Err(_) -> panic("stun could not read back its message")
+    }
     print("packet: ok")
 }

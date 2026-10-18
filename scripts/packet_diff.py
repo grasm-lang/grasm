@@ -26,12 +26,32 @@ from scapy.layers.inet6 import (IPv6, ICMPv6EchoRequest, ICMPv6EchoReply, ICMPv6
                                 ICMPv6TimeExceeded)
 from scapy.layers.vxlan import VXLAN  # noqa: E402
 from scapy.utils import checksum  # noqa: E402
+from scapy.layers.rtp import RTP  # noqa: E402
+from scapy.contrib.stun import (STUN, STUNXorMappedAddress, STUNUsername,  # noqa: E402
+                                STUNPriority, STUNFingerprint)
+from scapy.layers.sctp import (SCTP, SCTPChunkData, SCTPChunkInit, SCTPChunkSACK,  # noqa: E402
+                               SCTPChunkHeartbeatReq)
+from scapy.layers.dhcp import BOOTP, DHCP  # noqa: E402
+from scapy.layers.dhcp6 import (DHCP6_Solicit, DHCP6_Reply, DHCP6_RelayForward,  # noqa: E402
+                                DHCP6OptClientId, DHCP6OptElapsedTime, DHCP6OptIA_NA,
+                                DHCP6OptRelayMsg, DUID_LL)
+from scapy.layers.ipsec import SecurityAssociation, ESP  # noqa: E402
+from scapy.layers.inet import IP, UDP  # noqa: E402
+from scapy.layers.netbios import NBNSHeader, NBNSQueryRequest, NBNSQueryResponse  # noqa: E402
+from scapy.layers.pflog import PFLog  # noqa: E402
+import struct  # noqa: E402
+import zlib  # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 GRASM = os.environ.get("GRASM", os.path.join(ROOT, "target/release/grasm"))
 rng = random.Random(20261018)
 work = tempfile.mkdtemp()
 harness = os.path.join(work, "packettest")
+oracle = os.path.join(work, "gostdoracle")
+go_built = subprocess.run(["go", "build", "-o", oracle, "."], cwd=os.path.join(ROOT, "scripts/lib/gostd"),
+                          capture_output=True, text=True)
+if go_built.returncode != 0:
+    print(go_built.stderr[-1500:]); sys.exit(1)
 built = subprocess.run([GRASM, "build", "packages/packettest/src/main.gr", "--native", "-o",
                         harness], cwd=ROOT, capture_output=True, text=True)
 if built.returncode != 0:
@@ -253,6 +273,276 @@ for _ in range(300):
         add("sll2", raw, text)
         add("sll2.rt", raw, raw.hex())
 
+
+# --- RTP ----------------------------------------------------------------
+for _ in range(300):
+    csrc = [rng.randrange(1 << 32) for _ in range(rng.randrange(0, 4))]
+    ext = rng.random() < 0.3
+    padn = rng.choice([0, 0, 0, 1, 4, 7])
+    payload = rb(rng.randrange(0, 30))
+    body = b""
+    ext_profile, ext_data = 0, b""
+    if ext:
+        ext_profile = rng.randrange(65536)
+        ext_data = rb(4 * rng.randrange(0, 3))
+        body += struct.pack(">HH", ext_profile, len(ext_data) // 4) + ext_data
+    pad = (bytes(padn - 1) + bytes([padn])) if padn else b""
+    hdr = RTP(version=2, padding=1 if padn else 0, extension=1 if ext else 0, marker=rng.randrange(2),
+              payload_type=rng.randrange(128), sequence=rng.randrange(65536),
+              timestamp=rng.randrange(1 << 32), sourcesync=rng.randrange(1 << 32), sync=csrc)
+    raw = bytes(hdr / Raw(body + payload + pad))
+    p = RTP(raw)
+    text = (f"version={p.version};padding={p.padding};extension={p.extension};marker={p.marker};"
+            f"payload_type={p.payload_type};sequence={p.sequence};timestamp={p.timestamp};"
+            f"ssrc={p.sourcesync};csrc={','.join(str(c) for c in p.sync)};ext_profile={ext_profile};"
+            f"ext_data={ext_data.hex()};payload={payload.hex()};pad={pad.hex()}")
+    add("rtp", raw, text)
+    add("rtp.rt", raw, raw.hex())
+
+# --- STUN ---------------------------------------------------------------
+COOKIE = 0x2112A442
+for _ in range(300):
+    txid = rng.getrandbits(96)
+    method, cls = 1, rng.randrange(4)
+    mtype = (method & 0xF) | ((method & 0x70) << 1) | ((method & 0xF80) << 2) | ((cls & 1) << 4) | ((cls & 2) << 7)
+    attrs = []
+    port = rng.randrange(65536)
+    ipaddr = ip4()
+    # scapy's xport and xip are the real port and address; it XORs them.
+    if rng.random() < 0.7:
+        attrs.append(STUNXorMappedAddress(xport=port, xip=ipaddr))
+    if rng.random() < 0.5:
+        attrs.append(STUNUsername(username=rb(rng.randrange(1, 10)).hex()[: rng.randrange(1, 10)].encode()))
+    if rng.random() < 0.4:
+        attrs.append(STUNPriority(priority=rng.randrange(1 << 32)))
+    msg = STUN(stun_message_type=mtype, transaction_id=txid, attributes=attrs)
+    raw = bytes(msg)
+    if rng.random() < 0.5:
+        # A FINGERPRINT, computed here with zlib's CRC-32 over the message
+        # whose length already counts it.
+        body = raw[20:]
+        head = raw[:2] + struct.pack(">H", len(body) + 8) + raw[4:20]
+        crc = zlib.crc32(head + body) ^ 0x5354554E
+        raw = head + body + struct.pack(">HHI", 0x8028, 4, crc)
+    parsed = []
+    at = 20
+    xma = ""
+    while at < len(raw):
+        t, n = struct.unpack(">HH", raw[at:at + 4])
+        v = raw[at + 4:at + 4 + n]
+        parsed.append(f"{t}:{v.hex()}")
+        if t == 0x20:
+            xma = f"1:{port}:{socket.inet_aton(ipaddr).hex()}"
+        at += 4 + (n + 3) // 4 * 4
+    fp = 0
+    if len(raw) >= 28 and raw[-8:-6] == b"\x80\x28":
+        fp = 1 if zlib.crc32(raw[:-8]) ^ 0x5354554E == struct.unpack(">I", raw[-4:])[0] else 0
+    text = (f"type={mtype};class={cls};method={method};cookie={COOKIE};txid={txid:024x};"
+            f"attrs={'|'.join(parsed)};xma={xma};fp={fp}")
+    add("stun", raw, text)
+    add("stun.rt", raw, raw.hex())
+
+# --- SCTP ---------------------------------------------------------------
+for _ in range(300):
+    chunks = []
+    for _ in range(rng.randrange(1, 4)):
+        k = rng.choice(["data", "data", "init", "sack", "hb"])
+        if k == "data":
+            chunks.append(SCTPChunkData(tsn=rng.randrange(1 << 32), stream_id=rng.randrange(65536),
+                                        stream_seq=rng.randrange(65536), proto_id=rng.randrange(1 << 32),
+                                        beginning=rng.randrange(2), ending=rng.randrange(2),
+                                        unordered=rng.randrange(2), data=rb(rng.randrange(0, 20))))
+        elif k == "init":
+            chunks.append(SCTPChunkInit(init_tag=rng.randrange(1 << 32), a_rwnd=rng.randrange(1 << 32),
+                                        n_out_streams=rng.randrange(65536), n_in_streams=rng.randrange(65536),
+                                        init_tsn=rng.randrange(1 << 32)))
+        elif k == "sack":
+            chunks.append(SCTPChunkSACK(cumul_tsn_ack=rng.randrange(1 << 32), a_rwnd=rng.randrange(1 << 32)))
+        else:
+            chunks.append(SCTPChunkHeartbeatReq())
+    pkt = SCTP(sport=rng.randrange(65536), dport=rng.randrange(65536), tag=rng.randrange(1 << 32))
+    for c in chunks:
+        pkt = pkt / c
+    raw = bytes(pkt)
+    good = raw
+    corrupt = rng.random() < 0.2
+    if corrupt:
+        raw = raw[:9] + bytes([raw[9] ^ 0x11]) + raw[10:]
+    p = SCTP(raw)
+    parts = []
+    at = 12
+    while at < len(raw):
+        t, f, n = raw[at], raw[at + 1], struct.unpack(">H", raw[at + 2:at + 4])[0]
+        v = raw[at + 4:at + n]
+        extra = ""
+        if t == 0:
+            tsn, sid, ssn, ppid = struct.unpack(">IHHI", v[:12])
+            extra = f":{tsn}/{sid}/{ssn}/{ppid}/{v[12:].hex()}"
+        parts.append(f"{t}:{f}:{v.hex()}" + extra)
+        at += (n + 3) // 4 * 4
+    text = (f"sport={p.sport};dport={p.dport};tag={p.tag};chksum={p.chksum};ok={0 if corrupt else 1};"
+            f"chunks={'|'.join(parts)}")
+    add("sctp", raw, text)
+    add("sctp.rt", raw, good.hex())
+
+# --- DHCP ---------------------------------------------------------------
+DHCP_OPTS = [("message-type", lambda: rng.randrange(1, 9)), ("lease_time", lambda: rng.randrange(1 << 32)),
+             ("router", ip4), ("name_server", ip4), ("hostname", lambda: b"host-" + rb(2).hex().encode()),
+             ("server_id", ip4), ("requested_addr", ip4), ("subnet_mask", ip4)]
+for _ in range(300):
+    opts = []
+    for name, val in rng.sample(DHCP_OPTS, rng.randrange(0, 6)):
+        opts.append((name, val()))
+    if rng.random() < 0.2:
+        opts.append("pad")
+    opts.append("end")
+    pkt = BOOTP(op=rng.choice([1, 2]), xid=rng.randrange(1 << 32), secs=rng.randrange(65536),
+                flags=rng.choice([0, 0x8000]), ciaddr=ip4(), yiaddr=ip4(), siaddr=ip4(), giaddr=ip4(),
+                chaddr=rb(6)) / DHCP(options=opts)
+    raw = bytes(pkt)
+    p = BOOTP(raw)
+    olist = []
+    at = 240
+    mtype, lease, has_end = 0, -1, 0
+    while at < len(raw):
+        c = raw[at]
+        if c == 0:
+            olist.append("0:")
+            at += 1
+            continue
+        if c == 255:
+            has_end = 1
+            break
+        n = raw[at + 1]
+        v = raw[at + 2:at + 2 + n]
+        olist.append(f"{c}:{v.hex()}")
+        if c == 53 and n == 1 and mtype == 0:
+            mtype = v[0]
+        if c == 51 and n == 4 and lease == -1:
+            lease = struct.unpack(">I", v)[0]
+        at += 2 + n
+    text = (f"op={p.op};htype={p.htype};hlen={p.hlen};hops={p.hops};xid={p.xid};secs={p.secs};"
+            f"flags={int(p.flags)};ciaddr={raw[12:16].hex()};yiaddr={raw[16:20].hex()};"
+            f"siaddr={raw[20:24].hex()};giaddr={raw[24:28].hex()};chaddr={raw[28:44].hex()};cookie=1;"
+            f"opts={'|'.join(olist)};end={has_end};type={mtype};lease={lease}")
+    add("dhcp", raw, text)
+    add("dhcp.rt", raw, raw.hex())
+
+# --- DHCPv6 -------------------------------------------------------------
+for _ in range(300):
+    opts = DHCP6OptClientId(duid=DUID_LL(lladdr=mac())) / DHCP6OptElapsedTime(elapsedtime=rng.randrange(65536))
+    if rng.random() < 0.5:
+        opts = opts / DHCP6OptIA_NA(iaid=rng.randrange(1 << 32), T1=rng.randrange(1 << 32), T2=rng.randrange(1 << 32))
+    kind = rng.choice(["sol", "reply", "relay"])
+    if kind == "sol":
+        msg = DHCP6_Solicit(trid=rng.randrange(1 << 24)) / opts
+    elif kind == "reply":
+        msg = DHCP6_Reply(trid=rng.randrange(1 << 24)) / opts
+    else:
+        inner = DHCP6_Solicit(trid=rng.randrange(1 << 24)) / opts
+        msg = DHCP6_RelayForward(hopcount=rng.randrange(32), linkaddr=ip6(), peeraddr=ip6()) / DHCP6OptRelayMsg(message=inner)
+    raw = bytes(msg)
+    t = raw[0]
+    start = 34 if t in (12, 13) else 4
+    olist = []
+    at = start
+    while at < len(raw):
+        c, n = struct.unpack(">HH", raw[at:at + 4])
+        olist.append(f"{c}:{raw[at + 4:at + 4 + n].hex()}")
+        at += 4 + n
+    trid = 0 if t in (12, 13) else int.from_bytes(raw[1:4], "big")
+    hops = raw[1] if t in (12, 13) else 0
+    link = raw[2:18].hex() if t in (12, 13) else ""
+    peer = raw[18:34].hex() if t in (12, 13) else ""
+    add("dhcpv6", raw, f"type={t};trid={trid};hops={hops};link={link};peer={peer};opts={'|'.join(olist)}")
+    add("dhcpv6.rt", raw, raw.hex())
+
+# --- ESP ----------------------------------------------------------------
+for _ in range(300):
+    sa = SecurityAssociation(ESP, spi=rng.randrange(1, 1 << 32), crypt_algo="NULL", crypt_key=None)
+    inner = IP(src=ip4(), dst=ip4()) / UDP(sport=rng.randrange(65536), dport=rng.randrange(65536)) / Raw(rb(rng.randrange(0, 30)))
+    enc = sa.encrypt(inner)
+    raw = bytes(enc[ESP])
+    payload = bytes(inner[UDP])
+    padn = raw[-2]
+    add("espn", raw, f"spi={sa.spi};seq={struct.unpack('>I', raw[4:8])[0]};payload={payload.hex()};"
+                     f"padding={raw[-2 - padn:-2].hex()};nh=17")
+    add("espn.rt", raw, raw.hex())
+gcm = []
+for _ in range(200):
+    key = rb(rng.choice([16, 24, 32]) + 4)
+    head = rb(8)
+    iv = rb(8)
+    nh = rng.randrange(256)
+    payload = rb(rng.randrange(0, 40))
+    gcm.append((key, head + iv + bytes([nh]) + payload, head, nh, payload))
+feed = "".join(f"espgcm x{k.hex()} x{b.hex()}\n" for k, b, _, _, _ in gcm)
+sealed = subprocess.run([oracle], input=feed, capture_output=True, text=True).stdout.split("\n")[:-1]
+for (key, b, head, nh, payload), out in zip(gcm, sealed):
+    add("espg.s", key, out, b)
+    data = bytes.fromhex(out)
+    spi, seq = struct.unpack(">II", head)
+    add("espg", key, f"spi={spi};seq={seq};payload={payload.hex()};nh={nh}", data)
+    tampered = bytearray(data)
+    tampered[rng.randrange(len(tampered))] ^= 1
+    add("espg", key, "ERR", bytes(tampered))
+
+# --- NBNS ---------------------------------------------------------------
+def enc_suffix(v):
+    """scapy's SUFFIX field holds the suffix already encoded as two letters."""
+    return ((0x41 + (v >> 4)) << 8) | (0x41 + (v & 15))
+
+
+for _ in range(300):
+    name = "".join(rng.choice("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-") for _ in range(rng.randrange(1, 16)))
+    suffix = rng.choice([0x00, 0x20, 0x1C, 0x1B, 0x03])
+    if rng.random() < 0.5:
+        pkt = NBNSHeader(NAME_TRN_ID=rng.randrange(65536)) / NBNSQueryRequest(QUESTION_NAME=name.encode(), SUFFIX=enc_suffix(suffix))
+        raw = bytes(pkt)
+        q = f"{name}/{suffix}//32/1"
+        add("nbns", raw, f"id={pkt.NAME_TRN_ID};flags={struct.unpack('>H', raw[2:4])[0]};q={q};an=")
+    else:
+        addr = ip4()
+        ttl = rng.randrange(1 << 32)
+        pkt = NBNSHeader(NAME_TRN_ID=rng.randrange(65536), RESPONSE=1, QDCOUNT=0, ANCOUNT=1) / \
+            NBNSQueryResponse(RR_NAME=name.encode(), SUFFIX=enc_suffix(suffix), TTL=ttl, ADDR_ENTRY=[])
+        raw = bytes(pkt)
+        try:
+            parsed = NBNSHeader(raw)
+        except Exception:
+            continue
+        rdlen = struct.unpack(">H", raw[12 + 34 + 8:12 + 34 + 10])[0]
+        rdata = raw[12 + 34 + 10:12 + 34 + 10 + rdlen]
+        an = f"{name}/{suffix}/32/1/{ttl}/{rdata.hex()}"
+        add("nbns", raw, f"id={pkt.NAME_TRN_ID};flags={struct.unpack('>H', raw[2:4])[0]};q=;an={an}")
+    add("nbns.rt", raw, raw.hex())
+
+# --- pflog --------------------------------------------------------------
+for _ in range(300):
+    v6 = rng.random() < 0.3
+    kw = dict(addrfamily=24 if v6 else 2, action=rng.randrange(14), reason=rng.randrange(20),
+              iface=("em" + str(rng.randrange(10))).encode(), ruleset=b"" if rng.random() < 0.5 else b"main",
+              rulenumber=rng.randrange(-5, 1000), subrulenumber=rng.randrange(-1, 10),
+              uid=rng.randrange(-1, 1000), pid=rng.randrange(1 << 31), ruleuid=rng.randrange(-1, 100),
+              rulepid=rng.randrange(1 << 31), direction=rng.randrange(3), rewritten=rng.randrange(2),
+              naddrfamily=24 if v6 else 2, sport=rng.randrange(65536), dport=rng.randrange(65536))
+    if v6:
+        kw.update(saddr=ip6(), daddr=ip6())
+    else:
+        kw.update(saddr=ip4(), daddr=ip4())
+    raw = bytes(PFLog(**kw) / Raw(rb(rng.randrange(0, 20))))
+    p = PFLog(raw)
+    n = 16 if v6 else 4
+    fam = socket.AF_INET6 if v6 else socket.AF_INET
+    text = (f"hdrlen={p.hdrlen};af={p.addrfamily};action={p.action};reason={p.reason};"
+            f"iface={p.iface.rstrip(b'\x00').decode()};ruleset={p.ruleset.rstrip(b'\x00').decode()};"
+            f"rule={p.rulenumber};subrule={p.subrulenumber};uid={p.uid};pid={p.pid};ruleuid={p.ruleuid};"
+            f"rulepid={p.rulepid};dir={raw[60]};rewritten={p.rewritten};naf={p.naddrfamily};"
+            f"saddr={socket.inet_pton(fam, p.saddr).hex()};daddr={socket.inet_pton(fam, p.daddr).hex()};"
+            f"sport={p.sport};dport={p.dport};payload={raw[max(p.hdrlen, 100):].hex()}")
+    add("pflog", raw, text)
+    add("pflog.rt", raw, raw.hex())
+
 argv = []
 for op, a, b, _ in cases:
     argv += [op, "x" + a.hex(), "x" + b.hex()]
@@ -274,7 +564,9 @@ for i, (op, a, b, want) in enumerate(cases):
     else:
         differ += 1
         fam[1] += 1
-        if differ <= 10:
+        only = os.environ.get("ONLY", "")
+        if op.startswith(only) and (differ <= 10 or only):
+            shown_now = sum(1 for _ in [0])
             print(f"  {op} {a.hex()[:80]}")
             print(f"    scapy {want[:200]}")
             print(f"    grasm {mine[:200]}")
@@ -282,7 +574,7 @@ bad = [f"{k}:{d}" for k, (a, d) in sorted(families.items()) if d]
 if bad:
     print("disagreeing:", " ".join(bad))
 thin = [k for k, (a, d) in families.items() if a + d < 100]
-if thin or len(families) < 16:
+if thin or len(families) < 32:
     print(f"too few cases to mean anything: {thin}")
     sys.exit(1)
 print(f"cases: {len(cases)}   agreeing: {agree}   differing: {differ}")

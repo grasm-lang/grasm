@@ -11,6 +11,14 @@ import gre
 import vxlan
 import geneve
 import sllcap
+import rtp
+import stun
+import sctp
+import dhcp
+import dhcpv6
+import esp
+import nbns
+import pflog
 
 fn from_hex(text: str) -> bytes {
     var out: [i64] = []
@@ -167,7 +175,182 @@ fn answer_tunnel(what: str, a: bytes) -> str {
     }
 }
 
+fn ints(xs: [i64]) -> str {
+    var parts: [str] = []
+    for x in xs {
+        parts.push("{x}")
+    }
+    parts.join(",")
+}
+
+fn answer_media(what: str, a: bytes) -> str {
+    if what.starts_with("rtp") {
+        return match rtp.decode(a) {
+            Err(_) -> "ERR"
+            Ok(p) -> if what == "rtp.rt" {
+                hex(rtp.encode(p))
+            } else {
+                "version={p.version};padding={p.padding};extension={p.extension};marker={p.marker};" +
+                "payload_type={p.payload_type};sequence={p.sequence};timestamp={p.timestamp};" +
+                "ssrc={p.ssrc};csrc={ints(p.csrc)};ext_profile={p.ext_profile};" +
+                "ext_data={hex(p.ext_data)};payload={hex(p.payload)};pad={hex(p.pad)}"
+            }
+        }
+    }
+    match stun.decode(a) {
+        Err(_) -> "ERR"
+        Ok(m) -> {
+            if what == "stun.rt" {
+                return hex(stun.encode(m))
+            }
+            var attrs: [str] = []
+            var xma = ""
+            for at in m.attributes {
+                attrs.push("{at.kind}:{hex(at.value)}")
+                if at.kind == stun.xor_mapped_address() {
+                    xma = match stun.xor_address(m, at.value) {
+                        Ok(x) -> "{x.family}:{x.port}:{hex(x.address)}"
+                        Err(_) -> "ERR"
+                    }
+                }
+            }
+            "type={m.msg_type};class={stun.class_of(m.msg_type)};method={stun.method_of(m.msg_type)};" +
+            "cookie={m.cookie};txid={hex(m.transaction_id)};attrs=" + attrs.join("|") +
+            ";xma={xma};fp=" + flag(stun.fingerprint_holds(a))
+        }
+    }
+}
+
+fn answer_transport(what: str, a: bytes, b: bytes) -> str {
+    if what.starts_with("sctp") {
+        return match sctp.decode(a) {
+            Err(_) -> "ERR"
+            Ok(p) -> {
+                if what == "sctp.rt" {
+                    return hex(sctp.encode(p))
+                }
+                var chunks: [str] = []
+                for c in p.chunks {
+                    var extra = ""
+                    if c.kind == 0 {
+                        extra = match sctp.data_chunk(c) {
+                            Ok(d) -> ":{d.tsn}/{d.stream_id}/{d.stream_seq}/{d.proto_id}/{hex(d.data)}"
+                            Err(_) -> ":ERR"
+                        }
+                    }
+                    chunks.push("{c.kind}:{c.flags}:{hex(c.value)}" + extra)
+                }
+                "sport={p.sport};dport={p.dport};tag={p.tag};chksum={p.checksum};ok=" +
+                flag(sctp.checksum_holds(a)) + ";chunks=" + chunks.join("|")
+            }
+        }
+    }
+    if what == "espn" or what == "espn.rt" {
+        return match esp.open_null(a) {
+            Err(_) -> "ERR"
+            Ok(p) -> if what == "espn.rt" {
+                hex(esp.seal_null(p.spi, p.seq, p.payload, p.next_header))
+            } else {
+                "spi={p.spi};seq={p.seq};payload={hex(p.payload)};padding={hex(p.padding)};nh={p.next_header}"
+            }
+        }
+    }
+    if what == "espg" {
+        return match esp.open_gcm(a, b) {
+            Ok(p) -> "spi={p.spi};seq={p.seq};payload={hex(p.payload)};nh={p.next_header}"
+            Err(_) -> "ERR"
+        }
+    }
+    if what == "espg.s" {
+        let spi = b.at(0).shl(24).bit_or(b.at(1).shl(16)).bit_or(b.at(2).shl(8)).bit_or(b.at(3))
+        let seq = b.at(4).shl(24).bit_or(b.at(5).shl(16)).bit_or(b.at(6).shl(8)).bit_or(b.at(7))
+        return match esp.seal_gcm(a, spi, seq, b.slice(8, 16), b.slice(17, b.len()), b.at(16)) {
+            Ok(out) -> hex(out)
+            Err(_) -> "ERR"
+        }
+    }
+    match pflog.decode(a) {
+        Err(_) -> "ERR"
+        Ok(h) -> if what == "pflog.rt" {
+            hex(pflog.encode(h))
+        } else {
+            "hdrlen={h.hdrlen};af={h.addrfamily};action={h.action};reason={h.reason};iface={h.iface};" +
+            "ruleset={h.ruleset};rule={h.rulenumber};subrule={h.subrulenumber};uid={h.uid};pid={h.pid};" +
+            "ruleuid={h.ruleuid};rulepid={h.rulepid};dir={h.direction};rewritten={h.rewritten};" +
+            "naf={h.naddrfamily};saddr={hex(h.saddr)};daddr={hex(h.daddr)};sport={h.sport};" +
+            "dport={h.dport};payload={hex(h.payload)}"
+        }
+    }
+}
+
+fn opts_text(opts: [DhcpOption]) -> str {
+    var parts: [str] = []
+    for o in opts {
+        parts.push("{o.code}:{hex(o.value)}")
+    }
+    parts.join("|")
+}
+
+fn answer_config(what: str, a: bytes) -> str {
+    if what.starts_with("dhcpv6") {
+        return match dhcpv6.decode(a) {
+            Err(_) -> "ERR"
+            Ok(m) -> {
+                if what == "dhcpv6.rt" {
+                    return hex(dhcpv6.encode(m))
+                }
+                var parts: [str] = []
+                for o in m.options {
+                    parts.push("{o.code}:{hex(o.value)}")
+                }
+                "type={m.msg_type};trid={m.transaction_id};hops={m.hop_count};" +
+                "link={hex(m.link_address)};peer={hex(m.peer_address)};opts=" + parts.join("|")
+            }
+        }
+    }
+    if what.starts_with("dhcp") {
+        return match dhcp.decode(a) {
+            Err(_) -> "ERR"
+            Ok(p) -> if what == "dhcp.rt" {
+                hex(dhcp.encode(p))
+            } else {
+                "op={p.op};htype={p.htype};hlen={p.hlen};hops={p.hops};xid={p.xid};secs={p.secs};" +
+                "flags={p.flags};ciaddr={hex(p.ciaddr)};yiaddr={hex(p.yiaddr)};siaddr={hex(p.siaddr)};" +
+                "giaddr={hex(p.giaddr)};chaddr={hex(p.chaddr)};cookie=" + flag(p.has_cookie) +
+                ";opts=" + opts_text(p.options) + ";end=" + flag(p.has_end) +
+                ";type={dhcp.message_type(p)};lease={dhcp.lease_seconds(p)}"
+            }
+        }
+    }
+    match nbns.decode(a) {
+        Err(_) -> "ERR"
+        Ok(m) -> {
+            if what == "nbns.rt" {
+                return hex(nbns.encode(m))
+            }
+            var qs: [str] = []
+            for q in m.questions {
+                qs.push("{q.name}/{q.suffix}/{q.scope}/{q.qtype}/{q.qclass}")
+            }
+            var rs: [str] = []
+            for r in m.answers {
+                rs.push("{r.name}/{r.suffix}/{r.rtype}/{r.rclass}/{r.ttl}/{hex(r.rdata)}")
+            }
+            "id={m.id};flags={m.flags};q=" + qs.join("|") + ";an=" + rs.join("|")
+        }
+    }
+}
+
 fn answer(what: str, a: bytes, b: bytes) -> str {
+    if what.starts_with("rtp") or what.starts_with("stun") {
+        return answer_media(what, a)
+    }
+    if what.starts_with("sctp") or what.starts_with("esp") or what.starts_with("pflog") {
+        return answer_transport(what, a, b)
+    }
+    if what.starts_with("dhcp") or what.starts_with("nbns") {
+        return answer_config(what, a)
+    }
     if what.starts_with("icmp") {
         return answer_icmp(what, a, b)
     }

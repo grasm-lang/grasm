@@ -1,0 +1,184 @@
+// STUN (RFC 5389, updating 3489): how a WebRTC peer, a SIP phone or a VPN
+// client behind NAT learns the address the outside world sees, and the
+// message format TURN (RFC 5766) and ICE (RFC 8445) are built on.
+//
+// Twenty header bytes -- the message type (method and class interleaved in
+// its bits), the length of the attributes, the magic cookie 0x2112A442 and
+// a 96-bit transaction ID -- then attributes, each a type, a length and a
+// value padded to four bytes. Two attributes matter most and are easy to
+// get wrong:
+//
+// - **XOR-MAPPED-ADDRESS** hides the address from middleboxes that rewrite
+//   any IP they see: the port is XORed with the cookie's top half, an IPv4
+//   address with the cookie, an IPv6 address with the cookie and the
+//   transaction ID.
+// - **FINGERPRINT** is the CRC-32 of everything before it, XORed with
+//   0x5354554E, computed with the length field already counting the
+//   fingerprint itself.
+import crc32
+
+type StunAttribute = {
+    kind: i64,
+    value: bytes,
+    /// The bytes that pad the value to four, as they arrived. RFC 5389 lets
+    /// a sender put anything there (scapy writes spaces); keeping them is
+    /// what lets a message re-encode exactly, and a fingerprint over it
+    /// still hold.
+    padding: bytes,
+}
+
+type StunMessage = {
+    msg_type: i64,
+    cookie: i64,
+    transaction_id: bytes,
+    attributes: [StunAttribute],
+}
+
+type StunAddress = {
+    family: i64,
+    port: i64,
+    address: bytes,
+}
+
+type StunError =
+    | TooShort(found: i64)
+    | BadLength
+    | BadAddress
+
+pub fn magic_cookie() -> i64 { 554869826 }
+pub fn xor_mapped_address() -> i64 { 32 }
+pub fn mapped_address() -> i64 { 1 }
+pub fn username() -> i64 { 6 }
+pub fn fingerprint() -> i64 { 32808 }
+pub fn software() -> i64 { 32802 }
+
+fn u16(b: bytes, at: i64) -> i64 {
+    b.at(at) * 256 + b.at(at + 1)
+}
+
+fn u32(b: bytes, at: i64) -> i64 {
+    u16(b, at) * 65536 + u16(b, at + 2)
+}
+
+pub fn decode(data: bytes) -> StunMessage ! StunError {
+    if data.len() < 20 {
+        fail(TooShort(data.len()))
+    }
+    let length = u16(data, 2)
+    if data.len() < 20 + length or length % 4 != 0 {
+        fail(BadLength)
+    }
+    var attrs: [StunAttribute] = []
+    var at = 20
+    while at < 20 + length {
+        if at + 4 > 20 + length {
+            fail(BadLength)
+        }
+        let n = u16(data, at + 2)
+        if at + 4 + n > 20 + length {
+            fail(BadLength)
+        }
+        let padded = (n + 3) / 4 * 4
+        let pad_end = if at + 4 + padded <= 20 + length { at + 4 + padded } else { at + 4 + n }
+        attrs.push(StunAttribute{ kind: u16(data, at), value: data.slice(at + 4, at + 4 + n),
+            padding: data.slice(at + 4 + n, pad_end) })
+        at = at + 4 + padded
+    }
+    StunMessage{ msg_type: u16(data, 0), cookie: u32(data, 4), transaction_id: data.slice(8, 20),
+        attributes: attrs }
+}
+
+fn header(m: StunMessage, length: i64) -> bytes {
+    let c = m.cookie
+    bytes_of([m.msg_type.ushr(8).bit_and(255), m.msg_type.bit_and(255), length.ushr(8).bit_and(255),
+        length.bit_and(255), c.ushr(24).bit_and(255), c.ushr(16).bit_and(255),
+        c.ushr(8).bit_and(255), c.bit_and(255)]).concat(m.transaction_id)
+}
+
+fn attribute_bytes(a: StunAttribute) -> bytes {
+    let n = a.value.len()
+    let padded = (n + 3) / 4 * 4
+    let pad = if a.padding.len() == padded - n { a.padding } else { bytes_filled(padded - n, 0) }
+    bytes_of([a.kind.ushr(8).bit_and(255), a.kind.bit_and(255), n.ushr(8).bit_and(255),
+        n.bit_and(255)]).concat(a.value).concat(pad)
+}
+
+/// An attribute with zero padding.
+pub fn attribute(kind: i64, value: bytes) -> StunAttribute {
+    StunAttribute{ kind: kind, value: value, padding: bytes_of([]) }
+}
+
+/// The message, attributes padded and the length computed. A FINGERPRINT
+/// attribute, wherever it sits, is recomputed over what precedes it.
+pub fn encode(m: StunMessage) -> bytes {
+    var body = bytes_of([])
+    for a in m.attributes {
+        if a.kind == 32808 {
+            let length = body.len() + 8
+            let crc = crc32.of(header(m, length).concat(body)).bit_xor(1398035790)
+            body = body.concat(attribute_bytes(attribute(a.kind,
+                bytes_of([crc.ushr(24).bit_and(255), crc.ushr(16).bit_and(255),
+                    crc.ushr(8).bit_and(255), crc.bit_and(255)]))))
+        } else {
+            body = body.concat(attribute_bytes(a))
+        }
+    }
+    header(m, body.len()).concat(body)
+}
+
+/// The message class: 0 request, 1 indication, 2 success, 3 error.
+pub fn class_of(msg_type: i64) -> i64 {
+    msg_type.ushr(4).bit_and(1).bit_or(msg_type.ushr(7).bit_and(2))
+}
+
+/// The method, with the class bits taken out: 1 is Binding.
+pub fn method_of(msg_type: i64) -> i64 {
+    msg_type.bit_and(15).bit_or(msg_type.ushr(1).bit_and(112)).bit_or(msg_type.ushr(2).bit_and(3968))
+}
+
+pub fn message_type(method: i64, class: i64) -> i64 {
+    method.bit_and(15).bit_or(method.bit_and(112).shl(1)).bit_or(method.bit_and(3968).shl(2))
+        .bit_or(class.bit_and(1).shl(4)).bit_or(class.bit_and(2).shl(7))
+}
+
+/// The address an XOR-MAPPED-ADDRESS value carries, un-XORed.
+pub fn xor_address(m: StunMessage, value: bytes) -> StunAddress ! StunError {
+    if value.len() < 4 {
+        fail(BadAddress)
+    }
+    let family = value.at(1)
+    let port = u16(value, 2).bit_xor(m.cookie.ushr(16))
+    let mask = bytes_of([m.cookie.ushr(24).bit_and(255), m.cookie.ushr(16).bit_and(255),
+        m.cookie.ushr(8).bit_and(255), m.cookie.bit_and(255)]).concat(m.transaction_id)
+    let n = if family == 1 { 4 } else if family == 2 { 16 } else { -1 }
+    if n < 0 or value.len() < 4 + n {
+        fail(BadAddress)
+    }
+    var addr = bytes_filled(n, 0)
+    for i in 0..n {
+        addr.set(i, value.at(4 + i).bit_xor(mask.at(i)))
+    }
+    StunAddress{ family: family, port: port, address: addr }
+}
+
+/// An XOR-MAPPED-ADDRESS value for an address, for message `m`.
+pub fn xor_address_value(m: StunMessage, a: StunAddress) -> bytes {
+    let mask = bytes_of([m.cookie.ushr(24).bit_and(255), m.cookie.ushr(16).bit_and(255),
+        m.cookie.ushr(8).bit_and(255), m.cookie.bit_and(255)]).concat(m.transaction_id)
+    let port = a.port.bit_xor(m.cookie.ushr(16))
+    var out = bytes_of([0, a.family, port.ushr(8).bit_and(255), port.bit_and(255)])
+    var addr = a.address
+    for i in 0..addr.len() {
+        addr.set(i, addr.at(i).bit_xor(mask.at(i)))
+    }
+    out.concat(addr)
+}
+
+/// Whether a FINGERPRINT attribute that ends the message holds.
+pub fn fingerprint_holds(data: bytes) -> bool {
+    if data.len() < 28 or u16(data, data.len() - 8) != 32808 {
+        return false
+    }
+    let want = u32(data, data.len() - 4)
+    crc32.of(data.slice(0, data.len() - 8)).bit_xor(1398035790) == want
+}

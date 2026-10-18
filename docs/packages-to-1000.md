@@ -224,6 +224,14 @@ day its reference is installed.
 
 ## Landed
 
+- [x] **B14, second part: transports and services** — `rtp` `stun` `sctp`
+  `dhcp` `dhcpv6` `esp` `nbns` `pflog`, checked through `packettest`; the
+  gate now runs 10,602 cases. ESP with the NULL cipher is held to scapy and
+  with AES-GCM to Go's `crypto/cipher`, tampered packets refused. Found on
+  the way: a `pf_addr` is sixteen bytes for every family, which the first
+  `pflog` had as four for IPv4; STUN padding may be any byte, and scapy
+  writes spaces, so `stun` keeps what it read.
+
 - [x] **B14, first part: links and tunnels** — `icmp` `icmpv6` `arp` `vlan`
   `gre` `vxlan` `geneve` `sllcap`, and the harness `packettest`. 5,202 cases
   against scapy: every packet built by scapy from random fields, decoded to
@@ -280,7 +288,7 @@ day its reference is installed.
 | | |
 |---|---|
 | At the start | 669 |
-| Now | 699 |
+| Now | 707 |
 | Candidates above | 305 packages in 27 batches, plus `ecc`, `rfc6979` and `goprintf` |
 | Harnesses, one a batch | 27 |
 | If every candidate lands | 1004 |

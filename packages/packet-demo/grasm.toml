@@ -22,3 +22,15 @@ version = "^1.0.0"
 [dependencies.vxlan]
 path = "../vxlan"
 version = "^1.0.0"
+
+[dependencies.stun]
+path = "../stun"
+version = "^1.0.0"
+
+[dependencies.sctp]
+path = "../sctp"
+version = "^1.0.0"
+
+[dependencies.esp]
+path = "../esp"
+version = "^1.0.0"

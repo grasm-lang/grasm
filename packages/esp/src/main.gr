@@ -1,0 +1,125 @@
+// IPsec ESP (RFC 4303), with the NULL cipher (RFC 2410) and AES-GCM
+// (RFC 4106): the packet format of every IPsec VPN, strongSwan, Windows,
+// cloud site-to-site tunnels.
+//
+// An ESP packet is a security parameter index and a sequence number, then
+// the protected payload. Before protection the payload is followed by
+// padding (the bytes 1, 2, 3...), the padding length and the next-header
+// number, together a multiple of four bytes. With AES-GCM the protected
+// part is an eight-byte explicit IV, the ciphertext and a sixteen-byte
+// ICV; the nonce is the key's last four bytes (the salt) followed by the
+// IV, and the SPI and sequence number are the additional authenticated
+// data -- so a packet whose header was altered fails to open.
+//
+// The IV must never repeat under one key; the sequence number is the usual
+// choice, and this takes it as an argument rather than inventing one.
+import aes
+
+type EspPacket = {
+    spi: i64,
+    seq: i64,
+    body: bytes,
+}
+
+type EspPlain = {
+    spi: i64,
+    seq: i64,
+    payload: bytes,
+    padding: bytes,
+    next_header: i64,
+}
+
+type EspError =
+    | TooShort(found: i64)
+    | BadPadding
+    | NotAuthentic
+    | BadKey(length: i64)
+
+fn be32(v: i64) -> bytes {
+    bytes_of([v.ushr(24).bit_and(255), v.ushr(16).bit_and(255), v.ushr(8).bit_and(255),
+        v.bit_and(255)])
+}
+
+fn u32(b: bytes, at: i64) -> i64 {
+    b.at(at).shl(24).bit_or(b.at(at + 1).shl(16)).bit_or(b.at(at + 2).shl(8)).bit_or(b.at(at + 3))
+}
+
+pub fn decode(data: bytes) -> EspPacket ! EspError {
+    if data.len() < 8 {
+        fail(TooShort(data.len()))
+    }
+    EspPacket{ spi: u32(data, 0), seq: u32(data, 4), body: data.slice(8, data.len()) }
+}
+
+/// The payload with its trailer: monotone padding to a multiple of four,
+/// the padding length, the next header.
+pub fn trailer(payload: bytes, next_header: i64) -> bytes {
+    let pad = (4 - (payload.len() + 2) % 4) % 4
+    var out: [i64] = []
+    for k in 1..pad + 1 {
+        out.push(k)
+    }
+    out.push(pad)
+    out.push(next_header.bit_and(255))
+    payload.concat(bytes_of(out))
+}
+
+/// Splits a decrypted body into payload, padding and next header, and
+/// checks the padding is the sequence RFC 4303 prescribes.
+fn untrail(spi: i64, seq: i64, body: bytes) -> EspPlain ! EspError {
+    if body.len() < 2 {
+        fail(BadPadding)
+    }
+    let pad = body.at(body.len() - 2)
+    if body.len() < 2 + pad {
+        fail(BadPadding)
+    }
+    let start = body.len() - 2 - pad
+    for k in 0..pad {
+        if body.at(start + k) != k + 1 {
+            fail(BadPadding)
+        }
+    }
+    EspPlain{ spi: spi, seq: seq, payload: body.slice(0, start), padding: body.slice(start, start + pad),
+        next_header: body.at(body.len() - 1) }
+}
+
+/// NULL encryption: the trailer and nothing else.
+pub fn seal_null(spi: i64, seq: i64, payload: bytes, next_header: i64) -> bytes {
+    be32(spi).concat(be32(seq)).concat(trailer(payload, next_header))
+}
+
+pub fn open_null(data: bytes) -> EspPlain ! EspError {
+    let p = try decode(data)
+    try untrail(p.spi, p.seq, p.body)
+}
+
+/// AES-GCM with a sixteen-byte ICV. `key` is the AES key followed by the
+/// four-byte salt: 20, 28 or 36 bytes. `iv` is eight bytes.
+pub fn seal_gcm(key: bytes, spi: i64, seq: i64, iv: bytes, payload: bytes, next_header: i64) -> bytes ! EspError {
+    let n = key.len()
+    if n != 20 and n != 28 and n != 36 {
+        fail(BadKey(n))
+    }
+    let head = be32(spi).concat(be32(seq))
+    let nonce = key.slice(n - 4, n).concat(iv)
+    let sealed = aes.gcm_seal(key.slice(0, n - 4), nonce, head, trailer(payload, next_header))
+    head.concat(iv).concat(sealed)
+}
+
+pub fn open_gcm(key: bytes, data: bytes) -> EspPlain ! EspError {
+    let n = key.len()
+    if n != 20 and n != 28 and n != 36 {
+        fail(BadKey(n))
+    }
+    if data.len() < 8 + 8 + 16 {
+        fail(TooShort(data.len()))
+    }
+    let p = try decode(data)
+    let nonce = key.slice(n - 4, n).concat(data.slice(8, 16))
+    let body = match aes.gcm_open(key.slice(0, n - 4), nonce, data.slice(0, 8), data.slice(16, data.len())) {
+        Ok(b) -> b
+        Err(_) -> fail(NotAuthentic)
+    }
+    try untrail(p.spi, p.seq, body)
+}
