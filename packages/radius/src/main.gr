@@ -1,0 +1,148 @@
+// RADIUS (RFC 2865, accounting in RFC 2866): how Wi-Fi controllers, VPN
+// concentrators and switches ask a server whether a user may connect.
+//
+// A code (Access-Request, -Accept, -Reject, -Challenge, accounting), an
+// identifier, a length, a sixteen-byte authenticator, then attributes:
+// type, length, value. Three computations depend on a secret shared with
+// the server, and each is easy to get subtly wrong:
+//
+// - the **Response Authenticator**: MD5 of the response with the
+//   *request's* authenticator in place, followed by the secret;
+// - **User-Password hiding**: the password, padded to sixteen-byte blocks,
+//   XORed with MD5(secret + request authenticator) and then MD5(secret +
+//   previous ciphertext block);
+// - the **Message-Authenticator** (RFC 3579): HMAC-MD5 over the packet with
+//   that attribute's value zeroed.
+//
+// MD5 here is as RADIUS uses it; the protocol's security rests on the
+// secret, and RFC 6614 (RADIUS over TLS) is the way out of it.
+import md5
+
+type RadiusAttribute = {
+    kind: i64,
+    value: bytes,
+}
+
+type RadiusPacket = {
+    code: i64,
+    id: i64,
+    authenticator: bytes,
+    attributes: [RadiusAttribute],
+}
+
+type RadiusError =
+    | TooShort(found: i64)
+    | BadLength(declared: i64)
+    | BadAttribute(at: i64)
+
+pub fn access_request() -> i64 { 1 }
+pub fn access_accept() -> i64 { 2 }
+pub fn access_reject() -> i64 { 3 }
+pub fn user_name() -> i64 { 1 }
+pub fn user_password() -> i64 { 2 }
+pub fn message_authenticator() -> i64 { 80 }
+
+pub fn decode(data: bytes) -> RadiusPacket ! RadiusError {
+    if data.len() < 20 {
+        fail(TooShort(data.len()))
+    }
+    let n = data.at(2) * 256 + data.at(3)
+    if n < 20 or n > data.len() {
+        fail(BadLength(n))
+    }
+    var attrs: [RadiusAttribute] = []
+    var at = 20
+    while at < n {
+        if at + 2 > n or data.at(at + 1) < 2 or at + data.at(at + 1) > n {
+            fail(BadAttribute(at))
+        }
+        attrs.push(RadiusAttribute{ kind: data.at(at), value: data.slice(at + 2, at + data.at(at + 1)) })
+        at = at + data.at(at + 1)
+    }
+    RadiusPacket{ code: data.at(0), id: data.at(1), authenticator: data.slice(4, 20), attributes: attrs }
+}
+
+pub fn encode(p: RadiusPacket) -> bytes {
+    var attrs = bytes_of([])
+    for a in p.attributes {
+        attrs = attrs.concat(bytes_of([a.kind.bit_and(255), a.value.len() + 2])).concat(a.value)
+    }
+    let n = 20 + attrs.len()
+    bytes_of([p.code.bit_and(255), p.id.bit_and(255), n.ushr(8).bit_and(255), n.bit_and(255)])
+        .concat(p.authenticator).concat(attrs)
+}
+
+/// The authenticator a response must carry: MD5 over the response as
+/// encoded, with the request's authenticator in its place, then the secret.
+pub fn response_authenticator(response: RadiusPacket, request_authenticator: bytes, secret: bytes) -> bytes {
+    var r = response
+    r.authenticator = request_authenticator
+    md5.hash(encode(r).concat(secret))
+}
+
+/// The response with its authenticator set.
+pub fn sign_response(response: RadiusPacket, request_authenticator: bytes, secret: bytes) -> RadiusPacket {
+    var r = response
+    r.authenticator = response_authenticator(response, request_authenticator, secret)
+    r
+}
+
+/// User-Password hiding (RFC 2865 section 5.2).
+pub fn hide_password(password: bytes, secret: bytes, request_authenticator: bytes) -> bytes {
+    var p = password
+    if p.len() == 0 or p.len() % 16 != 0 {
+        p = p.concat(bytes_filled(16 - p.len() % 16, 0))
+    }
+    var out = bytes_of([])
+    var prev = request_authenticator
+    var at = 0
+    while at < p.len() {
+        let mask = md5.hash(secret.concat(prev))
+        var block = bytes_filled(16, 0)
+        for i in 0..16 {
+            block.set(i, p.at(at + i).bit_xor(mask.at(i)))
+        }
+        out = out.concat(block)
+        prev = block
+        at = at + 16
+    }
+    out
+}
+
+/// The password back, its zero padding removed.
+pub fn reveal_password(hidden: bytes, secret: bytes, request_authenticator: bytes) -> bytes {
+    var out = bytes_of([])
+    var prev = request_authenticator
+    var at = 0
+    while at + 16 <= hidden.len() {
+        let mask = md5.hash(secret.concat(prev))
+        for i in 0..16 {
+            out = out.concat(bytes_of([hidden.at(at + i).bit_xor(mask.at(i))]))
+        }
+        prev = hidden.slice(at, at + 16)
+        at = at + 16
+    }
+    var end = out.len()
+    while end > 0 and out.at(end - 1) == 0 {
+        end = end - 1
+    }
+    out.slice(0, end)
+}
+
+/// The packet with its Message-Authenticator attribute (which must be
+/// present) set to HMAC-MD5 of the packet with that value zeroed.
+pub fn with_message_authenticator(p: RadiusPacket, secret: bytes) -> RadiusPacket {
+    var q = p
+    for k in 0..q.attributes.len() {
+        if q.attributes[k].kind == 80 {
+            q.attributes[k] = RadiusAttribute{ kind: 80, value: bytes_filled(16, 0) }
+        }
+    }
+    let mac = md5.hmac(secret, encode(q))
+    for k in 0..q.attributes.len() {
+        if q.attributes[k].kind == 80 {
+            q.attributes[k] = RadiusAttribute{ kind: 80, value: mac }
+        }
+    }
+    q
+}

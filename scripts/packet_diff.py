@@ -67,6 +67,17 @@ from scapy.layers.dot11 import RadioTap  # noqa: E402
 from scapy.layers.can import CAN  # noqa: E402
 from scapy.layers.usb import USBpcap  # noqa: E402
 from scapy.layers.bluetooth import HCI_Hdr, HCI_Command_Hdr, HCI_ACL_Hdr, HCI_Event_Hdr  # noqa: E402
+from scapy.layers.radius import Radius, RadiusAttribute  # noqa: E402
+from scapy.layers.netflow import (NetflowHeader, NetflowHeaderV5, NetflowRecordV5, NetflowHeaderV9,  # noqa: E402
+                                  NetflowFlowsetV9, NetflowTemplateV9, NetflowTemplateFieldV9)
+from scapy.contrib.modbus import (ModbusADURequest, ModbusADUResponse,  # noqa: E402
+                                  ModbusPDU03ReadHoldingRegistersRequest,
+                                  ModbusPDU03ReadHoldingRegistersResponse,
+                                  ModbusPDU06WriteSingleRegisterRequest)
+from scapy.layers.snmp import SNMP, SNMPget, SNMPnext, SNMPresponse, SNMPset, SNMPbulk, SNMPvarbind  # noqa: E402
+from scapy.asn1.asn1 import (ASN1_OID, ASN1_INTEGER, ASN1_STRING, ASN1_NULL, ASN1_IPADDRESS,  # noqa: E402
+                             ASN1_COUNTER32, ASN1_GAUGE32, ASN1_TIME_TICKS, ASN1_COUNTER64)
+import hashlib  # noqa: E402
 import struct  # noqa: E402
 import zlib  # noqa: E402
 
@@ -85,6 +96,12 @@ for src, out in [("packages/packettest/src/main.gr", harness), ("packages/packet
     built = subprocess.run([GRASM, "build", src, "--native", "-o", out], cwd=ROOT, capture_output=True, text=True)
     if built.returncode != 0:
         print(built.stderr[-1500:]); sys.exit(1)
+harness3 = os.path.join(work, "packettest3")
+built = subprocess.run([GRASM, "build", "packages/packettest3/src/main.gr", "--native", "-o", harness3],
+                       cwd=ROOT, capture_output=True, text=True)
+if built.returncode != 0:
+    print(built.stderr[-1500:]); sys.exit(1)
+THIRD = ("radius", "radauth", "radhide", "radreveal", "nf5", "nf9", "mbtcp", "mbrtu", "snmp", "md4")
 # The protocols the second harness answers for.
 SECOND = ("igmp", "mpls", "lldp", "stp", "cdp", "rip", "vrrp", "bfd", "hsrp", "nsh", "erspan", "l2tp", "pppoe",
           "ospf", "lsack", "bgp", "eigrp", "pim", "isis", "eapol", "radiotap", "can", "usbpcap", "hci")
@@ -1060,6 +1077,186 @@ for _ in range(250):
     add("hci.rt", raw, raw.hex())
 
 
+# --- B16: the enterprise ---------------------------------------------------
+for _ in range(250):
+    attrs = []
+    for _ in range(rng.randrange(0, 4)):
+        attrs.append(RadiusAttribute(type=rng.choice([1, 4, 5, 6, 18, 26, 31, 32]), value=rb(rng.randrange(0, 20))))
+    pkt = Radius(code=rng.choice([1, 2, 3, 4, 5, 11]), id=rng.randrange(256), authenticator=rb(16), attributes=attrs)
+    raw = bytes(pkt)
+    parts, at = [], 20
+    while at < len(raw):
+        parts.append(f"{raw[at]}:{raw[at + 2:at + raw[at + 1]].hex()}")
+        at += raw[at + 1]
+    add("radius", raw, f"code={raw[0]};id={raw[1]};auth={raw[4:20].hex()};attrs={'|'.join(parts)}")
+    add("radius.rt", raw, raw.hex())
+    req_auth, secret = rb(16), rb(rng.randrange(1, 20))
+    add("radauth", raw, Radius(raw).compute_authenticator(req_auth, secret).hex(), req_auth + secret)
+    # User-Password hiding, RFC 2865 5.2, against hashlib's MD5.
+    pw = bytes(rng.randrange(1, 256) for _ in range(rng.randrange(1, 40)))
+    padded = pw + bytes((16 - len(pw) % 16) % 16)
+    out, prev = b"", req_auth
+    for k in range(0, len(padded), 16):
+        mask = hashlib.md5(secret + prev).digest()
+        block = bytes(x ^ y for x, y in zip(padded[k:k + 16], mask))
+        out += block
+        prev = block
+    add("radhide", pw, out.hex(), req_auth + secret)
+    add("radreveal", out, pw.hex(), req_auth + secret)
+
+for _ in range(200):
+    n = rng.randrange(0, 4)
+    pkt = NetflowHeader(version=5) / NetflowHeaderV5(count=n, sysUptime=rng.randrange(1 << 32), unixSecs=rng.randrange(1 << 32),
+                                                     flowSequence=rng.randrange(1 << 32))
+    for _ in range(n):
+        pkt = pkt / NetflowRecordV5(src=ip4(), dst=ip4(), nexthop=ip4(), dpkts=rng.randrange(1 << 32),
+                                    dOctets=rng.randrange(1 << 32), srcport=rng.randrange(65536), dstport=rng.randrange(65536),
+                                    prot=rng.choice([6, 17, 1]), tcpFlags=rng.randrange(256), src_as=rng.randrange(65536),
+                                    dst_as=rng.randrange(65536))
+    raw = bytes(pkt)
+    recs = []
+    for k in range(n):
+        r = raw[24 + 48 * k:72 + 48 * k]
+        dp, do = struct.unpack(">II", r[16:24])
+        sp, dpt = struct.unpack(">HH", r[32:36])
+        sa, da = struct.unpack(">HH", r[40:44])
+        recs.append(f"{r[0:4].hex()}/{r[4:8].hex()}/{dp}/{do}/{sp}/{dpt}/{r[38]}/{r[37]}/{sa}/{da}")
+    h = struct.unpack(">HHIIII", raw[:20])
+    add("nf5", raw, f"count={h[1]};uptime={h[2]};secs={h[3]};seq={h[5]};records={'|'.join(recs)}")
+    add("nf5.rt", raw, raw.hex())
+
+for _ in range(200):
+    fields = [(rng.choice([1, 2, 4, 7, 8, 11, 12]), rng.choice([1, 2, 4])) for _ in range(rng.randrange(1, 5))]
+    tmpl = NetflowTemplateV9(templateID=256 + rng.randrange(10), template_fields=[
+        NetflowTemplateFieldV9(fieldType=t, fieldLength=l) for t, l in fields])
+    pkt = NetflowHeader(version=9) / NetflowHeaderV9(count=2, sysUptime=rng.randrange(1 << 32), unixSecs=rng.randrange(1 << 32),
+                                                     packageSequence=rng.randrange(1 << 32), SourceID=rng.randrange(1 << 32)) / \
+        NetflowFlowsetV9(templates=[tmpl])
+    raw = bytes(pkt)
+    width = sum(l for _, l in fields)
+    data = rb(width * rng.randrange(1, 4))
+    raw += struct.pack(">HH", tmpl.templateID, 4 + len(data)) + data
+    sets, at = [], 20
+    while at + 4 <= len(raw):
+        sid, n = struct.unpack(">HH", raw[at:at + 4])
+        content = raw[at + 4:at + n]
+        if sid == 0:
+            c = 0
+            while c + 4 <= len(content):
+                tid, cnt = struct.unpack(">HH", content[c:c + 4])
+                if tid == 0 and cnt == 0:
+                    break
+                fl = [f"{struct.unpack('>H', content[c + 4 + 4 * k:c + 6 + 4 * k])[0]}:"
+                      f"{struct.unpack('>H', content[c + 6 + 4 * k:c + 8 + 4 * k])[0]}" for k in range(cnt)]
+                sets.append(f"T{tid}=" + ",".join(fl))
+                c += 4 + 4 * cnt
+        else:
+            sets.append(f"D{sid}={content.hex()}")
+        at += n
+    h = struct.unpack(">HHIIII", raw[:20])
+    add("nf9", raw, f"count={h[1]};seq={h[4]};source={h[5]};sets={'|'.join(sets)}")
+    add("nf9.rt", raw, raw.hex())
+
+def crc16_modbus(b):
+    crc = 0xFFFF
+    for x in b:
+        crc ^= x
+        for _ in range(8):
+            crc = (crc >> 1) ^ 0xA001 if crc & 1 else crc >> 1
+    return crc
+
+
+for _ in range(250):
+    kind = rng.choice(["req", "resp", "write"])
+    if kind == "req":
+        pdu = ModbusPDU03ReadHoldingRegistersRequest(startAddr=rng.randrange(65536), quantity=rng.randrange(1, 126))
+        raw = bytes(ModbusADURequest(transId=rng.randrange(65536), unitId=rng.randrange(256)) / pdu)
+    elif kind == "resp":
+        pdu = ModbusPDU03ReadHoldingRegistersResponse(registerVal=[rng.randrange(65536) for _ in range(rng.randrange(1, 6))])
+        raw = bytes(ModbusADUResponse(transId=rng.randrange(65536), unitId=rng.randrange(256)) / pdu)
+    else:
+        pdu = ModbusPDU06WriteSingleRegisterRequest(registerAddr=rng.randrange(65536), registerValue=rng.randrange(65536))
+        raw = bytes(ModbusADURequest(transId=rng.randrange(65536), unitId=rng.randrange(256)) / pdu)
+    t, pr, n = struct.unpack(">HHH", raw[:6])
+    add("mbtcp", raw, f"trans={t};proto={pr};unit={raw[6]};fn={raw[7]};data={raw[8:6 + n].hex()}")
+    add("mbtcp.rt", raw, raw.hex())
+    body = bytes([rng.randrange(1, 248), rng.choice([1, 3, 4, 6, 16])]) + rb(rng.randrange(0, 12))
+    crc = crc16_modbus(body)
+    frame = body + bytes([crc & 255, crc >> 8])
+    add("mbrtu.e", b"", frame.hex(), body)
+    add("mbrtu", frame, f"unit={body[0]};fn={body[1]};data={body[2:].hex()}")
+    bad = bytearray(frame)
+    bad[rng.randrange(len(bad))] ^= 1
+    add("mbrtu", bytes(bad), "ERR")
+
+
+def ber(b, at):
+    tag, n = b[at], b[at + 1]
+    at += 2
+    if n & 0x80:
+        k = n & 0x7F
+        n = int.from_bytes(b[at:at + k], "big")
+        at += k
+    return tag, at, at + n
+
+
+def oid_text(c):
+    arcs, acc = [], 0
+    for x in c:
+        acc = (acc << 7) | (x & 127)
+        if x < 128:
+            arcs.append(acc)
+            acc = 0
+    a = 0 if arcs[0] < 40 else 1 if arcs[0] < 80 else 2
+    return ".".join(str(v) for v in [a, arcs[0] - 40 * a] + arcs[1:])
+
+
+VALUES = [lambda: ASN1_INTEGER(rng.randrange(-1000, 1 << 31)), lambda: ASN1_STRING(rb(rng.randrange(0, 10))),
+          lambda: ASN1_NULL(0), lambda: ASN1_IPADDRESS(ip4()), lambda: ASN1_COUNTER32(rng.randrange(1 << 32)),
+          lambda: ASN1_GAUGE32(rng.randrange(1 << 32)), lambda: ASN1_TIME_TICKS(rng.randrange(1 << 32)),
+          lambda: ASN1_COUNTER64(rng.randrange(1 << 63)), lambda: ASN1_OID("1.3.6.1.4.1." + str(rng.randrange(99999)))]
+for _ in range(250):
+    vbs = [SNMPvarbind(oid=ASN1_OID("1.3.6.1.2.1." + ".".join(str(rng.randrange(300)) for _ in range(rng.randrange(1, 5)))),
+                       value=rng.choice(VALUES)()) for _ in range(rng.randrange(0, 4))]
+    kind = rng.choice([SNMPget, SNMPnext, SNMPresponse, SNMPset, SNMPbulk])
+    if kind is SNMPbulk:
+        pdu = SNMPbulk(id=rng.randrange(1 << 31), non_repeaters=rng.randrange(5), max_repetitions=rng.randrange(50), varbindlist=vbs)
+    else:
+        pdu = kind(id=rng.randrange(1 << 31), varbindlist=vbs)
+    raw = bytes(SNMP(version=rng.choice([0, 1]), community=("c" + str(rng.randrange(1000))).encode(), PDU=pdu))
+    _, b0, _ = ber(raw, 0)
+    _, vs, ve = ber(raw, b0)
+    version = int.from_bytes(raw[vs:ve], "big", signed=True)
+    _, cs, ce = ber(raw, ve)
+    ptag, ps, pe = ber(raw, ce)
+    ints = []
+    at = ps
+    for _ in range(3):
+        _, is_, ie = ber(raw, at)
+        ints.append(int.from_bytes(raw[is_:ie], "big", signed=True))
+        at = ie
+    _, ls, le = ber(raw, at)
+    out = []
+    at = ls
+    while at < le:
+        _, ss, se = ber(raw, at)
+        _, os_, oe = ber(raw, ss)
+        vt, vs2, ve2 = ber(raw, oe)
+        out.append(f"{oid_text(raw[os_:oe])}/{vt}/{raw[vs2:ve2].hex()}")
+        at = se
+    add("snmp", raw, f"version={version};community={raw[cs:ce].hex()};pdu={ptag};id={ints[0]};err={ints[1]};"
+                     f"idx={ints[2]};vbs={'|'.join(out)}")
+    add("snmp.rt", raw, raw.hex())
+
+for n in list(range(0, 70)) + [rng.randrange(0, 300) for _ in range(60)]:
+    data = rb(n)
+    p = os.path.join(work, "md4in")
+    open(p, "wb").write(data)
+    digest = subprocess.run(["openssl", "dgst", "-md4", "-binary", "-provider", "legacy", "-provider", "default", p],
+                            capture_output=True).stdout
+    add("md4", data, digest.hex())
+
+
 def run(which, picked):
     argv = []
     for op, a, b, _ in picked:
@@ -1073,10 +1270,10 @@ def run(which, picked):
     return lines
 
 
-second = [c[0].startswith(SECOND) for c in cases]
-got1 = iter(run(harness, [c for c, s2 in zip(cases, second) if not s2]))
-got2 = iter(run(harness2, [c for c, s2 in zip(cases, second) if s2]))
-got = [next(got2, "<missing>") if s2 else next(got1, "<missing>") for s2 in second]
+which = [3 if c[0].startswith(THIRD) else 2 if c[0].startswith(SECOND) else 1 for c in cases]
+streams = {k: iter(run(h, [c for c, w in zip(cases, which) if w == k]))
+           for k, h in [(1, harness), (2, harness2), (3, harness3)]}
+got = [next(streams[w], "<missing>") for w in which]
 
 families = {}
 agree = differ = 0
@@ -1099,7 +1296,7 @@ bad = [f"{k}:{d}" for k, (a, d) in sorted(families.items()) if d]
 if bad:
     print("disagreeing:", " ".join(bad))
 thin = [k for k, (a, d) in families.items() if a + d < 100]
-if thin or len(families) < 79:
+if thin or len(families) < 92:
     print(f"too few cases to mean anything: {thin}")
     sys.exit(1)
 print(f"cases: {len(cases)}   agreeing: {agree}   differing: {differ}")

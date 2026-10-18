@@ -1,0 +1,24 @@
+[package]
+name = "packettest3"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.radius]
+path = "../radius"
+version = "^1.0.0"
+
+[dependencies.netflow]
+path = "../netflow"
+version = "^1.0.0"
+
+[dependencies.modbus]
+path = "../modbus"
+version = "^1.0.0"
+
+[dependencies.snmp]
+path = "../snmp"
+version = "^1.0.0"
+
+[dependencies.md4]
+path = "../md4"
+version = "^1.0.0"

@@ -1,0 +1,5 @@
+[package]
+name = "md4"
+version = "1.0.0"
+
+capabilities = []

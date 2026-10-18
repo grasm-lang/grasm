@@ -1,0 +1,13 @@
+[package]
+name = "snmp"
+version = "1.0.0"
+
+capabilities = []
+
+[dependencies.asn1]
+path = "../asn1"
+version = "^1.0.0"
+
+[dependencies.derwrite]
+path = "../derwrite"
+version = "^1.0.0"

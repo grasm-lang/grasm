@@ -159,8 +159,7 @@ Ethernet, IPv4, IPv6, TCP and UDP were candidates here and are already
 `btle` `canframe` `usbpcap` `radiotap`
 
 **B16. Packets, the enterprise** (scapy) —
-`snmp` `radius` `netflow` `kerberos` `ldapwire` `smb2` `ntlm` `dcerpc`
-`modbus`
+`snmp` `radius` `netflow` `kerberos` `ldapwire` `smb2` `dcerpc` `modbus`
 
 **B17. Git, further down** (`git`) —
 `commitgraph` `midx` `ewah` `mergefile` `gitapply` `gitblame` `gitlogfmt`
@@ -223,6 +222,16 @@ projection library), `flexlayout` (no layout engine outside a browser),
 day its reference is installed.
 
 ## Landed
+
+- [x] **B16, first part** — `snmp` `radius` `netflow` `modbus`, with `md4`
+  from B8, and the harness `packettest3`; the packet gate runs 26,608
+  cases. SNMP v1/v2c against scapy, RADIUS's response authenticator against
+  scapy's and its password hiding against Python's `hashlib`, NetFlow v5 and
+  v9 templates, Modbus TCP and RTU with CRC-16, MD4 against OpenSSL's
+  legacy provider. On the way, `asn1.integer_of` read an INTEGER as
+  unsigned and by multiplication -- a negative one came back wrong, and a
+  twenty-octet CRL number trapped a debug build; it is two's complement
+  and shift-built now. `ntlm` is left out of this batch.
 
 - [x] **B15, second part: interior routing and the air** — `ospf` `bgp`
   `eigrp` `pim` `isis` `eap` `radiotap` `canframe` `usbpcap` `hci`, checked
@@ -304,13 +313,13 @@ day its reference is installed.
 | | |
 |---|---|
 | At the start | 669 |
-| Now | 731 |
-| Candidates above | 305 packages in 27 batches, plus `ecc`, `rfc6979` and `goprintf` |
+| Now | 737 |
+| Candidates above | 304 packages in 27 batches, plus `ecc`, `rfc6979` and `goprintf` |
 | Harnesses, one a batch | 27 |
-| If every candidate lands | 1004 |
+| If every candidate lands | 1003 |
 | Target | 1000 |
 
-The margin over 1000 is 4. It is there because some
+The margin over 1000 is 3. It is there because some
 candidate will turn out to exist already under a name the grep missed, or to
 disagree with its oracle in a way that says the oracle is the better
 package, and the plan should not need rewriting when that happens.

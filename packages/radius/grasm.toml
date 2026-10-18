@@ -1,0 +1,9 @@
+[package]
+name = "radius"
+version = "1.0.0"
+
+capabilities = []
+
+[dependencies.md5]
+path = "../md5"
+version = "^1.0.0"

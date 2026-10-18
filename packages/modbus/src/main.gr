@@ -1,0 +1,105 @@
+// Modbus (modbus.org's application protocol, 1979 and still everywhere in
+// industrial control): over TCP with the MBAP header, and over serial lines
+// as RTU frames with a CRC.
+//
+// A PDU is a function code and its data: read coils (1), discrete inputs
+// (2), holding registers (3) and input registers (4); write a single coil
+// (5) or register (6), or several (15, 16). A response with the function's
+// top bit set is an exception, carrying a code. Over TCP the PDU follows
+// seven bytes -- transaction ID, protocol ID 0, a length counting the unit
+// ID and the PDU, and the unit ID. Over RTU it is the slave address, the
+// PDU and a CRC-16 (polynomial 0xA001 reflected, initial 0xFFFF) sent least
+// significant byte first.
+
+type ModbusAdu = {
+    transaction: i64,
+    protocol: i64,
+    unit: i64,
+    function: i64,
+    data: bytes,
+}
+
+type ModbusError =
+    | TooShort(found: i64)
+    | BadLength(declared: i64)
+    | BadCrc
+
+fn u16(b: bytes, at: i64) -> i64 {
+    b.at(at) * 256 + b.at(at + 1)
+}
+
+fn be16(v: i64) -> bytes {
+    bytes_of([v.ushr(8).bit_and(255), v.bit_and(255)])
+}
+
+pub fn decode_tcp(b: bytes) -> ModbusAdu ! ModbusError {
+    if b.len() < 8 {
+        fail(TooShort(b.len()))
+    }
+    let n = u16(b, 4)
+    if n < 2 or 6 + n > b.len() {
+        fail(BadLength(n))
+    }
+    ModbusAdu{ transaction: u16(b, 0), protocol: u16(b, 2), unit: b.at(6), function: b.at(7), data: b.slice(8, 6 + n) }
+}
+
+pub fn encode_tcp(a: ModbusAdu) -> bytes {
+    be16(a.transaction).concat(be16(a.protocol)).concat(be16(2 + a.data.len()))
+        .concat(bytes_of([a.unit.bit_and(255), a.function.bit_and(255)])).concat(a.data)
+}
+
+/// CRC-16/MODBUS.
+pub fn crc16(b: bytes) -> i64 {
+    var crc = 65535
+    for i in 0..b.len() {
+        crc = crc.bit_xor(b.at(i))
+        for _ in 0..8 {
+            crc = if crc.bit_and(1) == 1 { crc.ushr(1).bit_xor(40961) } else { crc.ushr(1) }
+        }
+    }
+    crc
+}
+
+/// An RTU frame: address, PDU, CRC low byte first.
+pub fn encode_rtu(unit: i64, function: i64, data: bytes) -> bytes {
+    let body = bytes_of([unit.bit_and(255), function.bit_and(255)]).concat(data)
+    let crc = crc16(body)
+    body.concat(bytes_of([crc.bit_and(255), crc.ushr(8)]))
+}
+
+/// An RTU frame's address, function and data, its CRC checked.
+pub fn decode_rtu(b: bytes) -> ModbusAdu ! ModbusError {
+    if b.len() < 4 {
+        fail(TooShort(b.len()))
+    }
+    let crc = crc16(b.slice(0, b.len() - 2))
+    if b.at(b.len() - 2) != crc.bit_and(255) or b.at(b.len() - 1) != crc.ushr(8) {
+        fail(BadCrc)
+    }
+    ModbusAdu{ transaction: 0, protocol: 0, unit: b.at(0), function: b.at(1), data: b.slice(2, b.len() - 2) }
+}
+
+pub fn is_exception(a: ModbusAdu) -> bool {
+    a.function >= 128
+}
+
+/// A request to read `count` registers or coils from `start`: functions 1
+/// to 4 share this layout.
+pub fn read_request(start: i64, count: i64) -> bytes {
+    be16(start).concat(be16(count))
+}
+
+/// The register values in a read response (functions 3 and 4).
+pub fn registers(a: ModbusAdu) -> [i64] {
+    var out: [i64] = []
+    if a.data.len() < 1 {
+        return out
+    }
+    let n = a.data.at(0)
+    var at = 1
+    while at + 1 < 1 + n and at + 1 < a.data.len() {
+        out.push(u16(a.data, at))
+        at = at + 2
+    }
+    out
+}

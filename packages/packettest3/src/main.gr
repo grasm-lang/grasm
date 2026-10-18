@@ -1,0 +1,160 @@
+// The Grasm side of scripts/packet_diff.py for the enterprise protocols:
+// `<proto>` decodes what scapy built and prints its fields, `<proto>.rt`
+// decodes and re-encodes it; the rest compute what a reference computes.
+import radius
+import netflow
+import modbus
+import snmp
+import md4
+
+fn from_hex(text: str) -> bytes {
+    var out: [i64] = []
+    var i = 1
+    while i + 1 < text.len() {
+        out.push(text.substr(i, 2).parse_int_base(16) ?? 0)
+        i = i + 2
+    }
+    bytes_of(out)
+}
+
+fn hex(raw: bytes) -> str {
+    let digits = "0123456789abcdef"
+    var out = ""
+    var i = 0
+    while i < raw.len() {
+        out = out + digits.substr(raw.at(i) / 16, 1) + digits.substr(raw.at(i) % 16, 1)
+        i = i + 1
+    }
+    out
+}
+
+fn answer_radius(what: str, a: bytes, b: bytes) -> str {
+    if what == "radhide" {
+        return hex(radius.hide_password(a, b.slice(16, b.len()), b.slice(0, 16)))
+    }
+    if what == "radreveal" {
+        return hex(radius.reveal_password(a, b.slice(16, b.len()), b.slice(0, 16)))
+    }
+    match radius.decode(a) {
+        Err(_) -> "ERR"
+        Ok(p) -> {
+            if what == "radius.rt" {
+                return hex(radius.encode(p))
+            }
+            if what == "radauth" {
+                return hex(radius.response_authenticator(p, b.slice(0, 16), b.slice(16, b.len())))
+            }
+            var parts: [str] = []
+            for x in p.attributes {
+                parts.push("{x.kind}:{hex(x.value)}")
+            }
+            "code={p.code};id={p.id};auth={hex(p.authenticator)};attrs=" + parts.join("|")
+        }
+    }
+}
+
+fn answer_netflow(what: str, a: bytes) -> str {
+    if what.starts_with("nf5") {
+        return match netflow.decode_v5(a) {
+            Err(_) -> "ERR"
+            Ok(p) -> {
+                if what == "nf5.rt" {
+                    return hex(netflow.encode_v5(p))
+                }
+                var parts: [str] = []
+                for r in p.records {
+                    parts.push("{hex(r.src)}/{hex(r.dst)}/{r.packets}/{r.octets}/{r.srcport}/{r.dstport}/{r.proto}/" +
+                        "{r.tcp_flags}/{r.src_as}/{r.dst_as}")
+                }
+                "count={p.count};uptime={p.uptime};secs={p.secs};seq={p.sequence};records=" + parts.join("|")
+            }
+        }
+    }
+    match netflow.decode_v9(a) {
+        Err(_) -> "ERR"
+        Ok(p) -> {
+            if what == "nf9.rt" {
+                return hex(netflow.encode_v9(p))
+            }
+            var sets: [str] = []
+            for s in p.flowsets {
+                if s.id == 0 {
+                    match netflow.templates(s) {
+                        Ok(ts) -> {
+                            for t in ts {
+                                var fs: [str] = []
+                                for f in t.fields {
+                                    fs.push("{f.0}:{f.1}")
+                                }
+                                sets.push("T{t.id}=" + fs.join(","))
+                            }
+                        }
+                        Err(_) -> sets.push("TERR")
+                    }
+                } else {
+                    sets.push("D{s.id}={hex(s.content)}")
+                }
+            }
+            "count={p.count};seq={p.sequence};source={p.source_id};sets=" + sets.join("|")
+        }
+    }
+}
+
+fn answer_misc(what: str, a: bytes, b: bytes) -> str {
+    if what == "md4" {
+        return hex(md4.hash(a))
+    }
+    if what == "mbrtu.e" {
+        return hex(modbus.encode_rtu(b.at(0), b.at(1), b.slice(2, b.len())))
+    }
+    if what == "mbrtu" {
+        return match modbus.decode_rtu(a) {
+            Ok(m) -> "unit={m.unit};fn={m.function};data={hex(m.data)}"
+            Err(_) -> "ERR"
+        }
+    }
+    if what.starts_with("mbtcp") {
+        return match modbus.decode_tcp(a) {
+            Err(_) -> "ERR"
+            Ok(m) -> if what == "mbtcp.rt" { hex(modbus.encode_tcp(m)) } else {
+                "trans={m.transaction};proto={m.protocol};unit={m.unit};fn={m.function};data={hex(m.data)}"
+            }
+        }
+    }
+    match snmp.decode(a) {
+        Err(_) -> "ERR"
+        Ok(m) -> {
+            if what == "snmp.rt" {
+                return match snmp.encode(m) {
+                    Ok(out) -> hex(out)
+                    Err(_) -> "ERR"
+                }
+            }
+            var parts: [str] = []
+            for vb in m.varbinds {
+                parts.push("{vb.oid}/{vb.tag}/{hex(vb.value)}")
+            }
+            "version={m.version};community={hex(m.community)};pdu={m.pdu_type};id={m.request_id};" +
+            "err={m.error_status};idx={m.error_index};vbs=" + parts.join("|")
+        }
+    }
+}
+
+fn answer(what: str, a: bytes, b: bytes) -> str {
+    if what.starts_with("rad") {
+        return answer_radius(what, a, b)
+    }
+    if what.starts_with("nf") {
+        return answer_netflow(what, a)
+    }
+    answer_misc(what, a, b)
+}
+
+fn main() / {io} {
+    let argv = args()
+    var i = 0
+    while i + 2 < argv.len() {
+        print(answer(argv[i], from_hex(argv[i + 1]), from_hex(argv[i + 2])))
+        i = i + 3
+    }
+}

@@ -157,10 +157,19 @@ pub fn raw(der: bytes, n: DerNode) -> bytes {
 /// An INTEGER's value, for the small ones. DER writes them big-endian and
 /// two's complement, with a leading zero where the top bit would otherwise
 /// make a positive number look negative.
+/// An INTEGER, two's complement as DER writes it, so `-1` reads as -1.
+///
+/// Built with shifts rather than `v * 256`: a CRL number may be twenty
+/// octets (RFC 5280, 5.2.3), and multiplying that out overflowed -- which a
+/// debug build turns into a trap. A value wider than 64 bits comes back as
+/// its low 64 bits; read `value` for the whole of one.
 pub fn integer_of(der: bytes, n: DerNode) -> i64 {
     var v = 0
+    if n.len > 0 and der.at(n.body) >= 128 {
+        v = -1
+    }
     for k in 0..n.len {
-        v = v * 256 + der.at(n.body + k)
+        v = v.shl(8).bit_or(der.at(n.body + k))
     }
     return v
 }

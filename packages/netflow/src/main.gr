@@ -1,0 +1,213 @@
+// NetFlow versions 5 and 9: the flow records routers export -- who talked
+// to whom, how many packets and bytes, which ports and protocols -- and
+// what every traffic-accounting and DDoS-detection system ingests.
+//
+// Version 5 is fixed: a 24-byte header and 48-byte records. Version 9 (RFC
+// 3954) is self-describing: after a 20-byte header come flowsets, each an
+// ID and a length; flowset 0 holds templates (a template ID and its fields'
+// types and lengths), and a flowset whose ID is a template's carries
+// records laid out by it. Records can only be read once their template has
+// been seen, so `v9_records` takes the templates as an argument. IPFIX
+// (RFC 7011) is version 9's successor and differs in ways not covered here.
+
+type NetflowV5Record = {
+    src: bytes,
+    dst: bytes,
+    nexthop: bytes,
+    input: i64,
+    output: i64,
+    packets: i64,
+    octets: i64,
+    first: i64,
+    last: i64,
+    srcport: i64,
+    dstport: i64,
+    pad1: i64,
+    tcp_flags: i64,
+    proto: i64,
+    tos: i64,
+    src_as: i64,
+    dst_as: i64,
+    src_mask: i64,
+    dst_mask: i64,
+    pad2: i64,
+}
+
+type NetflowV5 = {
+    count: i64,
+    uptime: i64,
+    secs: i64,
+    nsecs: i64,
+    sequence: i64,
+    engine_type: i64,
+    engine_id: i64,
+    sampling: i64,
+    records: [NetflowV5Record],
+}
+
+type NetflowFlowset = {
+    id: i64,
+    content: bytes,
+}
+
+type NetflowTemplate = {
+    id: i64,
+    fields: [(i64, i64)],
+}
+
+type NetflowV9 = {
+    count: i64,
+    uptime: i64,
+    secs: i64,
+    sequence: i64,
+    source_id: i64,
+    flowsets: [NetflowFlowset],
+}
+
+type NetflowError =
+    | TooShort(found: i64)
+    | BadVersion(found: i64)
+    | BadFlowset(at: i64)
+
+fn u16(b: bytes, at: i64) -> i64 {
+    b.at(at) * 256 + b.at(at + 1)
+}
+
+fn u32(b: bytes, at: i64) -> i64 {
+    u16(b, at) * 65536 + u16(b, at + 2)
+}
+
+fn be16(v: i64) -> bytes {
+    bytes_of([v.ushr(8).bit_and(255), v.bit_and(255)])
+}
+
+fn be32(v: i64) -> bytes {
+    be16(v.ushr(16).bit_and(65535)).concat(be16(v.bit_and(65535)))
+}
+
+pub fn version(data: bytes) -> i64 {
+    if data.len() < 2 { -1 } else { u16(data, 0) }
+}
+
+pub fn decode_v5(data: bytes) -> NetflowV5 ! NetflowError {
+    if data.len() < 24 {
+        fail(TooShort(data.len()))
+    }
+    if u16(data, 0) != 5 {
+        fail(BadVersion(u16(data, 0)))
+    }
+    let count = u16(data, 2)
+    if data.len() < 24 + 48 * count {
+        fail(TooShort(data.len()))
+    }
+    var records: [NetflowV5Record] = []
+    for k in 0..count {
+        let r = 24 + 48 * k
+        records.push(NetflowV5Record{ src: data.slice(r, r + 4), dst: data.slice(r + 4, r + 8),
+            nexthop: data.slice(r + 8, r + 12), input: u16(data, r + 12), output: u16(data, r + 14),
+            packets: u32(data, r + 16), octets: u32(data, r + 20), first: u32(data, r + 24), last: u32(data, r + 28),
+            srcport: u16(data, r + 32), dstport: u16(data, r + 34), pad1: data.at(r + 36), tcp_flags: data.at(r + 37),
+            proto: data.at(r + 38), tos: data.at(r + 39), src_as: u16(data, r + 40), dst_as: u16(data, r + 42),
+            src_mask: data.at(r + 44), dst_mask: data.at(r + 45), pad2: u16(data, r + 46) })
+    }
+    NetflowV5{ count: count, uptime: u32(data, 4), secs: u32(data, 8), nsecs: u32(data, 12), sequence: u32(data, 16),
+        engine_type: data.at(20), engine_id: data.at(21), sampling: u16(data, 22), records: records }
+}
+
+/// The export packet, its count taken from the records.
+pub fn encode_v5(p: NetflowV5) -> bytes {
+    var out = be16(5).concat(be16(p.records.len())).concat(be32(p.uptime)).concat(be32(p.secs)).concat(be32(p.nsecs))
+        .concat(be32(p.sequence)).concat(bytes_of([p.engine_type.bit_and(255), p.engine_id.bit_and(255)]))
+        .concat(be16(p.sampling))
+    for r in p.records {
+        out = out.concat(r.src).concat(r.dst).concat(r.nexthop).concat(be16(r.input)).concat(be16(r.output))
+            .concat(be32(r.packets)).concat(be32(r.octets)).concat(be32(r.first)).concat(be32(r.last))
+            .concat(be16(r.srcport)).concat(be16(r.dstport))
+            .concat(bytes_of([r.pad1.bit_and(255), r.tcp_flags.bit_and(255), r.proto.bit_and(255), r.tos.bit_and(255)]))
+            .concat(be16(r.src_as)).concat(be16(r.dst_as))
+            .concat(bytes_of([r.src_mask.bit_and(255), r.dst_mask.bit_and(255)])).concat(be16(r.pad2))
+    }
+    out
+}
+
+pub fn decode_v9(data: bytes) -> NetflowV9 ! NetflowError {
+    if data.len() < 20 {
+        fail(TooShort(data.len()))
+    }
+    if u16(data, 0) != 9 {
+        fail(BadVersion(u16(data, 0)))
+    }
+    var sets: [NetflowFlowset] = []
+    var at = 20
+    while at + 4 <= data.len() {
+        let n = u16(data, at + 2)
+        if n < 4 or at + n > data.len() {
+            fail(BadFlowset(at))
+        }
+        sets.push(NetflowFlowset{ id: u16(data, at), content: data.slice(at + 4, at + n) })
+        at = at + n
+    }
+    NetflowV9{ count: u16(data, 2), uptime: u32(data, 4), secs: u32(data, 8), sequence: u32(data, 12),
+        source_id: u32(data, 16), flowsets: sets }
+}
+
+pub fn encode_v9(p: NetflowV9) -> bytes {
+    var out = be16(9).concat(be16(p.count)).concat(be32(p.uptime)).concat(be32(p.secs)).concat(be32(p.sequence))
+        .concat(be32(p.source_id))
+    for s in p.flowsets {
+        out = out.concat(be16(s.id)).concat(be16(s.content.len() + 4)).concat(s.content)
+    }
+    out
+}
+
+/// The templates in a template flowset (ID 0).
+pub fn templates(s: NetflowFlowset) -> [NetflowTemplate] ! NetflowError {
+    var out: [NetflowTemplate] = []
+    let b = s.content
+    var at = 0
+    while at + 4 <= b.len() {
+        let id = u16(b, at)
+        let count = u16(b, at + 2)
+        if id == 0 and count == 0 {
+            break
+        }
+        if at + 4 + 4 * count > b.len() {
+            fail(BadFlowset(at))
+        }
+        var fields: [(i64, i64)] = []
+        for k in 0..count {
+            fields.push((u16(b, at + 4 + 4 * k), u16(b, at + 6 + 4 * k)))
+        }
+        out.push(NetflowTemplate{ id: id, fields: fields })
+        at = at + 4 + 4 * count
+    }
+    out
+}
+
+/// A data flowset's records, each a list of field values, laid out by the
+/// matching template; trailing padding shorter than a record is ignored.
+pub fn v9_records(s: NetflowFlowset, known: [NetflowTemplate]) -> Option[[[bytes]]] {
+    for t in known {
+        if t.id == s.id {
+            var width = 0
+            for f in t.fields {
+                width = width + f.1
+            }
+            var out: [[bytes]] = []
+            if width == 0 {
+                return Some(out)
+            }
+            var at = 0
+            while at + width <= s.content.len() {
+                var rec: [bytes] = []
+                for f in t.fields {
+                    rec.push(s.content.slice(at, at + f.1))
+                    at = at + f.1
+                }
+                out.push(rec)
+            }
+            return Some(out)
+        }
+    }
+    None
+}

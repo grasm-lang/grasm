@@ -1,0 +1,20 @@
+[package]
+name = "packet3_demo"
+version = "1.0.0"
+capabilities = ["io"]
+
+[dependencies.md4]
+path = "../md4"
+version = "^1.0.0"
+
+[dependencies.modbus]
+path = "../modbus"
+version = "^1.0.0"
+
+[dependencies.snmp]
+path = "../snmp"
+version = "^1.0.0"
+
+[dependencies.radius]
+path = "../radius"
+version = "^1.0.0"

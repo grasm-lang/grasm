@@ -1,0 +1,145 @@
+// SNMP versions 1 and 2c (RFC 1157, RFC 3416): how monitoring systems poll
+// routers, switches, printers and UPSes for their counters.
+//
+// A message is BER: SEQUENCE { version, community, PDU }, the PDU tagged by
+// its kind -- GetRequest (0xA0), GetNextRequest, GetResponse, SetRequest,
+// GetBulkRequest (0xA5), InformRequest, SNMPv2-Trap, Report -- and holding
+// a request ID, two integers (error status and index, or for GetBulk the
+// non-repeaters and max-repetitions) and the variable bindings: pairs of an
+// OID and a value. A value is kept as its tag and content: INTEGER, OCTET
+// STRING, NULL, OID, and the application types IpAddress (0x40),
+// Counter32 (0x41), Gauge32 (0x42), TimeTicks (0x43), Counter64 (0x46),
+// plus v2c's noSuchObject, noSuchInstance and endOfMibView exceptions.
+//
+// The version-1 Trap PDU (0xA4) has a different body; its content is kept
+// as bytes rather than misread as bindings.
+import asn1
+import derwrite
+
+type SnmpVarbind = {
+    oid: str,
+    tag: i64,
+    value: bytes,
+}
+
+type SnmpMessage = {
+    version: i64,
+    community: bytes,
+    pdu_type: i64,
+    request_id: i64,
+    error_status: i64,
+    error_index: i64,
+    varbinds: [SnmpVarbind],
+    trap_body: bytes,
+}
+
+type SnmpError =
+    | Malformed(why: str)
+
+pub fn get_request() -> i64 { 160 }
+pub fn get_next() -> i64 { 161 }
+pub fn response() -> i64 { 162 }
+pub fn set_request() -> i64 { 163 }
+pub fn get_bulk() -> i64 { 165 }
+
+/// An OID's content in dotted form, the first subidentifier split into its
+/// two arcs as X.690 says -- including a first arc of 2 with a second above
+/// 39.
+pub fn oid_text(content: bytes) -> str {
+    var arcs: [i64] = []
+    var acc = 0
+    for k in 0..content.len() {
+        let b = content.at(k)
+        acc = acc.shl(7).bit_or(b.bit_and(127))
+        if b < 128 {
+            arcs.push(acc)
+            acc = 0
+        }
+    }
+    if arcs.len() == 0 {
+        return ""
+    }
+    let first = arcs[0]
+    let a = if first < 40 { 0 } else if first < 80 { 1 } else { 2 }
+    var parts: [str] = ["{a}", "{first - 40 * a}"]
+    for k in 1..arcs.len() {
+        parts.push("{arcs[k]}")
+    }
+    parts.join(".")
+}
+
+fn kids(nodes: [DerNode], i: i64) -> [i64] {
+    asn1.child_indices(nodes, i)
+}
+
+pub fn decode(der: bytes) -> SnmpMessage ! SnmpError {
+    let nodes = match asn1.parse(der) {
+        Ok(found) -> found
+        Err(_) -> fail(Malformed("not BER"))
+    }
+    if nodes.len() == 0 or nodes[0].tag != 48 {
+        fail(Malformed("not a SEQUENCE"))
+    }
+    let top = kids(nodes, 0)
+    if top.len() != 3 or nodes[top[0]].tag != 2 or nodes[top[1]].tag != 4 {
+        fail(Malformed("not version, community, PDU"))
+    }
+    let pdu = top[2]
+    var m = SnmpMessage{ version: asn1.integer_of(der, nodes[top[0]]), community: asn1.value(der, nodes[top[1]]),
+        pdu_type: nodes[pdu].tag, request_id: 0, error_status: 0, error_index: 0, varbinds: [],
+        trap_body: bytes_of([]) }
+    if m.pdu_type == 164 {
+        m.trap_body = asn1.value(der, nodes[pdu])
+        return m
+    }
+    let fields = kids(nodes, pdu)
+    if fields.len() != 4 or nodes[fields[3]].tag != 48 {
+        fail(Malformed("PDU is not id, two integers, bindings"))
+    }
+    m.request_id = asn1.integer_of(der, nodes[fields[0]])
+    m.error_status = asn1.integer_of(der, nodes[fields[1]])
+    m.error_index = asn1.integer_of(der, nodes[fields[2]])
+    for vb in kids(nodes, fields[3]) {
+        let pair = kids(nodes, vb)
+        if pair.len() != 2 or nodes[pair[0]].tag != 6 {
+            fail(Malformed("a binding is not OID and value"))
+        }
+        m.varbinds.push(SnmpVarbind{ oid: oid_text(asn1.value(der, nodes[pair[0]])), tag: nodes[pair[1]].tag,
+            value: asn1.value(der, nodes[pair[1]]) })
+    }
+    m
+}
+
+fn encode_inner(m: SnmpMessage) -> bytes ! DerWriteError {
+    var body = bytes_of([])
+    if m.pdu_type == 164 {
+        body = m.trap_body
+    } else {
+        var binds: [bytes] = []
+        for vb in m.varbinds {
+            binds.push(try derwrite.sequence([try derwrite.oid(vb.oid), try derwrite.tlv(vb.tag, vb.value)]))
+        }
+        body = (try derwrite.integer(m.request_id)).concat(try derwrite.integer(m.error_status))
+            .concat(try derwrite.integer(m.error_index)).concat(try derwrite.sequence(binds))
+    }
+    try derwrite.sequence([try derwrite.integer(m.version), try derwrite.octet_string(m.community),
+        try derwrite.tlv(m.pdu_type, body)])
+}
+
+/// The message in BER with minimal lengths.
+pub fn encode(m: SnmpMessage) -> bytes ! SnmpError {
+    match encode_inner(m) {
+        Ok(b) -> b
+        Err(_) -> fail(Malformed("could not encode"))
+    }
+}
+
+/// An unsigned application value -- Counter32, Gauge32, TimeTicks,
+/// Counter64 -- as a number (its low 64 bits).
+pub fn unsigned_value(vb: SnmpVarbind) -> i64 {
+    var v = 0
+    for k in 0..vb.value.len() {
+        v = v.shl(8).bit_or(vb.value.at(k))
+    }
+    v
+}
