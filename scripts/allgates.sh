@@ -125,6 +125,7 @@ run_gate numdiff       scripts/num_diff.sh
 run_gate b18diff       scripts/b18_diff.sh
 run_gate gitdiff       scripts/git_diff.sh
 run_gate caldiff       scripts/cal_diff.sh
+run_gate sigdiff       scripts/sig_diff.sh
 run_gate grasmwire     scripts/grasmwire_e2e.sh
 run_gate cryptodiff    scripts/crypto_diff.sh
 run_gate certdiff      scripts/cert_diff.sh

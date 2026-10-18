@@ -1,0 +1,42 @@
+// Signal transforms, windows and splines on inputs whose answers are known.
+// scripts/sig_diff.sh holds them to gonum and to their definitions.
+import dct
+import dwt
+import spline
+import windowfn
+
+fn near(a: f64, b: f64) -> bool {
+    (a - b).abs() < 1e-9
+}
+
+fn main() / {io} {
+    // A constant block has all its energy in the DC coefficient.
+    let c = dct.dct2([3.0, 3.0, 3.0, 3.0], true)
+    assert_eq(near(c[0], 6.0) and near(c[1], 0.0) and near(c[3], 0.0), true)
+    // DCT-III undoes DCT-II, orthonormally.
+    let back = dct.dct3(dct.dct2([1.0, -2.0, 5.0], true), true)
+    assert_eq(near(back[2], 5.0), true)
+
+    // JPEG 2000's lossless wavelet round-trips integers exactly.
+    let (low, high) = dwt.legall_forward([10, 12, 15, 9, 7, 8])
+    assert_eq(dwt.legall_inverse(low, high), [10, 12, 15, 9, 7, 8])
+    let (a, d) = dwt.analyse("haar", [4.0, 4.0, 2.0, 0.0])
+    assert_eq(near(d[0], 0.0) and near(a[0], 8.0 / 2.0.sqrt()), true)
+
+    // A natural spline through a straight line is the line.
+    match spline.fit(Natural, [0.0, 1.0, 2.0, 3.0], [1.0, 3.0, 5.0, 7.0]) {
+        Ok(s) -> assert_eq(near(spline.predict(s, 1.5), 4.0) and near(spline.derivative(s, 2.5), 2.0), true)
+        Err(_) -> panic("a fit was refused")
+    }
+    // Fritsch-Butland never overshoots a step.
+    match spline.fit(FritschButland, [0.0, 1.0, 2.0, 3.0], [0.0, 0.0, 1.0, 1.0]) {
+        Ok(s) -> assert_eq(spline.predict(s, 2.5) <= 1.0 and spline.predict(s, 0.5) >= 0.0, true)
+        Err(_) -> panic("a fit was refused")
+    }
+
+    match windowfn.weights("hann", 5) {
+        Ok(w) -> assert_eq(near(w[0], 0.0) and near(w[2], 1.0), true)
+        Err(_) -> panic("hann is known")
+    }
+    print("sig: ok")
+}

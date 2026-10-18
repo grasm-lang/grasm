@@ -1,0 +1,97 @@
+// The Grasm side of scripts/sig_diff.py. Doubles travel as their 64 bits
+// read as integers, comma-separated.
+import dct
+import dwt
+import spline
+import windowfn
+
+fn floats(text: str) -> [f64] {
+    if text.len() == 0 { [] } else { text.split(",").map(|b| (b.parse_int() ?? 0).from_bits()) }
+}
+
+fn ints(text: str) -> [i64] {
+    if text.len() == 0 { [] } else { text.split(",").map(|b| b.parse_int() ?? 0) }
+}
+
+fn bits(v: [f64]) -> str {
+    v.map(|x| "{x.to_bits()}").join(",")
+}
+
+fn answer_dwt(name: str, data: str) -> str {
+    if name == "legall" {
+        let x = ints(data)
+        let (low, high) = dwt.legall_forward(x)
+        let back = dwt.legall_inverse(low, high)
+        return low.map(|v| "{v}").join(",") + "|" + high.map(|v| "{v}").join(",") + "|" + back.map(|v| "{v}").join(",")
+    }
+    let x = floats(data)
+    if name == "cdf97" {
+        let (low, high) = dwt.cdf97_forward(x)
+        return bits(low) + "|" + bits(high) + "|" + bits(dwt.cdf97_inverse(low, high))
+    }
+    let parts = dwt.forward(name, x, 3)
+    parts.map(|p| bits(p)).join(";") + "|" + bits(dwt.inverse(name, parts))
+}
+
+fn answer_spline(kind: str, data: str) -> str {
+    let v = floats(data)
+    let n = v[0].as_i64()
+    let k = if kind == "natural" { Natural } else if kind == "clamped" { Clamped } else if kind == "notaknot" { NotAKnot } else if kind == "akima" {
+        Akima
+    } else { FritschButland }
+    match spline.fit(k, v.slice(1, 1 + n), v.slice(1 + n, 1 + 2 * n)) {
+        Err(_) -> "ERR"
+        Ok(s) -> {
+            var out: [f64] = []
+            for q in v.slice(1 + 2 * n, v.len()) {
+                out.push(spline.predict(s, q))
+                out.push(spline.derivative(s, q))
+            }
+            bits(out)
+        }
+    }
+}
+
+fn answer(what: str, a: str, b: str) -> str {
+    if what == "dct1" {
+        return bits(dct.dct1(floats(a)))
+    }
+    if what == "dst1" {
+        return bits(dct.dst1(floats(a)))
+    }
+    if what.starts_with("dct") {
+        let ortho = b == "ortho"
+        let x = floats(a)
+        return bits(if what == "dct2" { dct.dct2(x, ortho) } else if what == "dct3" { dct.dct3(x, ortho) } else { dct.dct4(x, ortho) })
+    }
+    if what == "win" {
+        let p = floats(b)
+        let n = p[0].as_i64()
+        if a == "gaussian" {
+            return bits(windowfn.gaussian(n, p[1]))
+        }
+        if a == "tukey" {
+            return bits(windowfn.tukey(n, p[1]))
+        }
+        if a == "kaiser" {
+            return bits(windowfn.kaiser(n, p[1]))
+        }
+        return match windowfn.weights(a, n) {
+            Ok(w) -> bits(w)
+            Err(_) -> "ERR"
+        }
+    }
+    if what == "dwt" {
+        return answer_dwt(a, b)
+    }
+    answer_spline(a, b)
+}
+
+fn main() / {io} {
+    let argv = args()
+    var i = 0
+    while i + 2 < argv.len() {
+        print(answer(argv[i], argv[i + 1], argv[i + 2]))
+        i = i + 3
+    }
+}

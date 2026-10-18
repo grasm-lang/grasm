@@ -255,6 +255,17 @@ day its reference is installed.
 
 ## Landed
 
+- [x] **B24: signals** — `dct` `dwt` `spline` `windowfn`, with the
+  harness `sigtest`; the new gate `sigdiff` runs 2,340 cases: DCT-I and
+  DST-I, every window, and five kinds of cubic spline (values and
+  derivatives, past both ends too) against gonum, run offline from the
+  module cache; DCT-II to IV and the Kaiser window against their
+  definitions summed in Python; Haar and Daubechies-4 against the
+  orthogonal matrix built from the filter; LeGall 5/3 and CDF 9/7 against
+  JPEG 2000's lifting steps and reconstruction. A single sample through
+  the 5/3 transform could not be inverted until JPEG 2000's own rule --
+  it passes unchanged -- was followed. One break per package turned it red.
+
 - [x] **B7: calendars** — `hijri` `hebrewcal` `persiancal` `chinesecal`
   `japaneseera` `buddhistcal` `ethiopiccal` `indiancal` `copticcal`
   `roccal`, with the harness `caltest`; the new gate `caldiff` holds 69,090
@@ -453,7 +464,7 @@ day its reference is installed.
 | | |
 |---|---|
 | At the start | 669 |
-| Now | 802 |
+| Now | 807 |
 | Candidates above | 316 packages in 28 batches, plus `ecc`, `rfc6979` and `goprintf` |
 | Harnesses, one a batch | 28 |
 | If every candidate lands | 1016 |

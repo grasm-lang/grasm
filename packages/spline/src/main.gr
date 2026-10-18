@@ -1,0 +1,292 @@
+// Cubic splines through data points: natural, clamped and not-a-knot
+// splines (one smooth curve, second derivatives continuous), Akima's
+// (local, resists the wiggles one outlier causes) and Fritsch-Butland's
+// (monotone: never overshoots monotone data). `interpolate` has linear,
+// Catmull-Rom and a monotone curve over evenly spaced keys; this fits
+// arbitrary increasing x.
+//
+// The definitions are gonum's `interp`, which this is checked against:
+// "clamped" fixes the end slopes at zero; beyond the data the curve holds
+// its end values; not-a-knot needs four points. Global splines solve
+// their tridiagonal system by the Thomas algorithm -- the not-a-knot
+// one's first and last rows reduced to tridiagonal first.
+
+type SplineCurve = {
+    xs: [f64],
+    /// Four coefficients a0..a3 per segment, in a row.
+    coeffs: [f64],
+    last_y: f64,
+    last_slope: f64,
+}
+
+type SplineKind =
+    | Natural
+    | Clamped
+    | NotAKnot
+    | Akima
+    | FritschButland
+
+type SplineError =
+    | LengthMismatch
+    | TooFewPoints(needed: i64)
+    | NotIncreasing(at: i64)
+
+fn check(xs: [f64], ys: [f64], needed: i64) -> () ! SplineError {
+    if xs.len() != ys.len() {
+        fail(LengthMismatch)
+    }
+    if xs.len() < needed {
+        fail(TooFewPoints(needed))
+    }
+    for i in 1..xs.len() {
+        if not (xs[i] > xs[i - 1]) {
+            fail(NotIncreasing(i))
+        }
+    }
+    ()
+}
+
+fn with_slopes(xs: [f64], ys: [f64], d: [f64]) -> SplineCurve {
+    var c: [f64] = []
+    for i in 0..xs.len() - 1 {
+        let dx = xs[i + 1] - xs[i]
+        let dy = ys[i + 1] - ys[i]
+        c = c + [ys[i], d[i], (3.0 * dy - (2.0 * d[i] + d[i + 1]) * dx) / dx / dx, (-2.0 * dy + (d[i] + d[i + 1]) * dx) / dx / dx / dx]
+    }
+    SplineCurve{ xs: xs, coeffs: c, last_y: ys[ys.len() - 1], last_slope: d[d.len() - 1] }
+}
+
+fn with_second(xs: [f64], ys: [f64], m2: [f64]) -> SplineCurve {
+    let m = xs.len() - 1
+    var c: [f64] = []
+    for i in 0..m {
+        let dx = xs[i + 1] - xs[i]
+        let dy = ys[i + 1] - ys[i]
+        let dm = m2[i + 1] - m2[i]
+        c = c + [ys[i], (dy - (m2[i] + dm / 3.0) * dx * dx / 2.0) / dx, m2[i] / 2.0, dm / 6.0 / dx]
+    }
+    let last = xs[m] - xs[m - 1]
+    let k = 4 * (m - 1)
+    SplineCurve{ xs: xs, coeffs: c, last_y: ys[m],
+        last_slope: c[k + 1] + 2.0 * c[k + 2] * last + 3.0 * c[k + 3] * last * last }
+}
+
+/// Thomas algorithm: sub-, main and super-diagonals, right-hand side.
+fn solve_tridiagonal(lower: [f64], main: [f64], upper: [f64], rhs: [f64]) -> [f64] {
+    let n = main.len()
+    var c: [f64] = []
+    var d: [f64] = []
+    for i in 0..n {
+        let denom = main[i] - if i > 0 { lower[i] * c[i - 1] } else { 0.0 }
+        c.push(if i < n - 1 { upper[i] / denom } else { 0.0 })
+        d.push((rhs[i] - if i > 0 { lower[i] * d[i - 1] } else { 0.0 }) / denom)
+    }
+    var x = d
+    var i = n - 2
+    while i >= 0 {
+        x[i] = d[i] - c[i] * x[i + 1]
+        i = i - 1
+    }
+    x
+}
+
+/// The interior equations for the second derivatives, gonum's
+/// makeCubicSplineSecondDerivativeEquations, as three diagonals.
+fn interior(xs: [f64], ys: [f64]) -> ([f64], [f64], [f64], [f64]) {
+    let n = xs.len()
+    var lower: [f64] = []
+    var main: [f64] = []
+    var upper: [f64] = []
+    var rhs: [f64] = []
+    for _i in 0..n {
+        lower.push(0.0)
+        main.push(0.0)
+        upper.push(0.0)
+        rhs.push(0.0)
+    }
+    let m = n - 1
+    if n > 2 {
+        for i in 0..m {
+            let dx = xs[i + 1] - xs[i]
+            let slope = (ys[i + 1] - ys[i]) / dx
+            if i > 0 {
+                rhs[i] = rhs[i] + slope
+                main[i] = main[i] + dx / 3.0
+                upper[i] = dx / 6.0
+            }
+            if i < m - 1 {
+                rhs[i + 1] = rhs[i + 1] - slope
+                main[i + 1] = main[i + 1] + dx / 3.0
+                lower[i + 1] = dx / 6.0
+            }
+        }
+    }
+    (lower, main, upper, rhs)
+}
+
+fn global(kind: SplineKind, xs: [f64], ys: [f64]) -> SplineCurve {
+    let n = xs.len()
+    let m = n - 1
+    var (lower, main, upper, rhs) = interior(xs, ys)
+    match kind {
+        Natural -> {
+            main[0] = 1.0
+            main[m] = 1.0
+            rhs[0] = 0.0
+            rhs[m] = 0.0
+        }
+        Clamped -> {
+            let dl = xs[1] - xs[0]
+            rhs[0] = (ys[1] - ys[0]) / dl
+            main[0] = dl / 3.0
+            upper[0] = dl / 6.0
+            let dr = xs[m] - xs[m - 1]
+            rhs[m] = (ys[m] - ys[m - 1]) / dr
+            main[m] = 0.0 - dr / 3.0
+            lower[m] = 0.0 - dr / 6.0
+        }
+        _ -> {
+            // Not-a-knot: row 0 is (1/h0, -1/h0 - 1/h1, 1/h1); take row 1
+            // times (1/h1) / upper[1] from it to clear the third entry, and
+            // the same at the other end with row m - 1.
+            let h0 = xs[1] - xs[0]
+            let h1 = xs[2] - xs[1]
+            let f = (1.0 / h1) / upper[1]
+            main[0] = 1.0 / h0 - f * lower[1]
+            upper[0] = -1.0 / h0 - 1.0 / h1 - f * main[1]
+            rhs[0] = 0.0 - f * rhs[1]
+            let ho = xs[m] - xs[m - 1]
+            let hi = xs[m - 1] - xs[m - 2]
+            let g = (1.0 / hi) / lower[m - 1]
+            main[m] = 1.0 / ho - g * upper[m - 1]
+            lower[m] = -1.0 / ho - 1.0 / hi - g * main[m - 1]
+            rhs[m] = 0.0 - g * rhs[m - 1]
+        }
+    }
+    with_second(xs, ys, solve_tridiagonal(lower, main, upper, rhs))
+}
+
+fn slopes_of(xs: [f64], ys: [f64]) -> [f64] {
+    var out: [f64] = []
+    for i in 0..xs.len() - 1 {
+        out.push((ys[i + 1] - ys[i]) / (xs[i + 1] - xs[i]))
+    }
+    out
+}
+
+fn akima(xs: [f64], ys: [f64]) -> SplineCurve {
+    let n = xs.len()
+    let base = slopes_of(xs, ys)
+    if n == 2 {
+        return with_slopes(xs, ys, [base[0], base[0]])
+    }
+    let mlen = n + 3
+    var s: [f64] = [0.0, 0.0] + base + [0.0, 0.0]
+    s[0] = 3.0 * s[2] - 2.0 * s[3]
+    s[1] = 2.0 * s[2] - s[3]
+    s[mlen - 2] = 2.0 * s[mlen - 3] - s[mlen - 4]
+    s[mlen - 1] = 3.0 * s[mlen - 3] - 2.0 * s[mlen - 4]
+    var d: [f64] = []
+    for i in 0..n {
+        let wl = (s[i + 2] - s[i + 3]).abs()
+        let wr = (s[i + 1] - s[i]).abs()
+        let w = wl + wr
+        d.push(if w > 0.0 { (s[i + 1] * wl + s[i + 2] * wr) / w } else { 0.5 * s[i + 1] + 0.5 * s[i + 2] })
+    }
+    with_slopes(xs, ys, d)
+}
+
+fn edge(xs: [f64], s: [f64], left: bool) -> f64 {
+    let n = xs.len()
+    let (de, di, he, h, f) = if left {
+        (s[0], s[1], xs[1] - xs[0], xs[2] - xs[0], xs[1] + xs[2] - 2.0 * xs[0])
+    } else {
+        (s[n - 2], s[n - 3], xs[n - 1] - xs[n - 2], xs[n - 1] - xs[n - 3], 2.0 * xs[n - 1] - xs[n - 3] - xs[n - 2])
+    }
+    let g = (f * de - he * di) / h
+    if g * de <= 0.0 {
+        return 0.0
+    }
+    if de * di <= 0.0 and g.abs() > 3.0 * de.abs() {
+        return 3.0 * de
+    }
+    g
+}
+
+fn fritsch_butland(xs: [f64], ys: [f64]) -> SplineCurve {
+    let s = slopes_of(xs, ys)
+    if xs.len() == 2 {
+        return with_slopes(xs, ys, [s[0], s[0]])
+    }
+    var d: [f64] = [0.0]
+    for i in 1..s.len() {
+        if s[i] * s[i - 1] > 0.0 {
+            d.push(3.0 * (xs[i + 1] - xs[i - 1]) /
+                ((2.0 * xs[i + 1] - xs[i - 1] - xs[i]) / s[i - 1] + (xs[i + 1] + xs[i] - 2.0 * xs[i - 1]) / s[i]))
+        } else {
+            d.push(0.0)
+        }
+    }
+    d.push(0.0)
+    d[0] = edge(xs, s, true)
+    d[s.len()] = edge(xs, s, false)
+    with_slopes(xs, ys, d)
+}
+
+pub fn fit(kind: SplineKind, xs: [f64], ys: [f64]) -> SplineCurve ! SplineError {
+    let needed = match kind {
+        NotAKnot -> 4
+        Akima -> 2
+        FritschButland -> 2
+        _ -> 2
+    }
+    try check(xs, ys, needed)
+    match kind {
+        Akima -> akima(xs, ys)
+        FritschButland -> fritsch_butland(xs, ys)
+        _ -> global(kind, xs, ys)
+    }
+}
+
+/// gonum's findSegment: the last knot at or below x, or -1.
+fn segment(xs: [f64], x: f64) -> i64 {
+    var lo = 0
+    var hi = xs.len()
+    while lo < hi {
+        let mid = (lo + hi) / 2
+        if xs[mid] < x { lo = mid + 1 } else { hi = mid }
+    }
+    if lo < xs.len() and xs[lo] == x { lo } else { lo - 1 }
+}
+
+pub fn predict(s: SplineCurve, x: f64) -> f64 {
+    let i = segment(s.xs, x)
+    let m = s.xs.len() - 1
+    if i < 0 {
+        return s.coeffs[0]
+    }
+    if i >= m {
+        return s.last_y
+    }
+    if x == s.xs[i] {
+        return s.coeffs[4 * i]
+    }
+    let dx = x - s.xs[i]
+    ((s.coeffs[4 * i + 3] * dx + s.coeffs[4 * i + 2]) * dx + s.coeffs[4 * i + 1]) * dx + s.coeffs[4 * i]
+}
+
+pub fn derivative(s: SplineCurve, x: f64) -> f64 {
+    let i = segment(s.xs, x)
+    let m = s.xs.len() - 1
+    if i < 0 {
+        return s.coeffs[1]
+    }
+    if i >= m {
+        return s.last_slope
+    }
+    if x == s.xs[i] {
+        return s.coeffs[4 * i + 1]
+    }
+    let dx = x - s.xs[i]
+    (3.0 * s.coeffs[4 * i + 3] * dx + 2.0 * s.coeffs[4 * i + 2]) * dx + s.coeffs[4 * i + 1]
+}

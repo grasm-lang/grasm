@@ -1,0 +1,195 @@
+// Discrete wavelet transforms: a signal split into a coarse half and a
+// detail half, recursively -- the transform of JPEG 2000 (the reversible
+// LeGall 5/3 and the irreversible CDF 9/7), of signal denoising, and of
+// multi-resolution analysis.
+//
+// - Haar and Daubechies-4 (D4) with periodic extension, as filter banks.
+// - LeGall 5/3 by integer lifting with symmetric extension, exactly as
+//   JPEG 2000 Part 1 (Annex F) specifies -- lossless, integers in and out.
+// - CDF 9/7 by lifting with JPEG 2000's coefficients.
+//
+// A level splits an even-length signal into (approximation, detail) of
+// half the length; `forward` takes several levels and returns the
+// coefficients coarsest first. Each inverse undoes its forward exactly
+// (5/3) or to rounding (the others).
+
+fn floor_div(a: i64, b: i64) -> i64 {
+    let q = a / b
+    if a % b != 0 and ((a < 0) != (b < 0)) { q - 1 } else { q }
+}
+
+fn haar_low() -> [f64] {
+    let r = 0.5.sqrt()
+    [r, r]
+}
+
+fn d4_low() -> [f64] {
+    let s3 = 3.0.sqrt()
+    let d = 4.0 * 2.0.sqrt()
+    [(1.0 + s3) / d, (3.0 + s3) / d, (3.0 - s3) / d, (1.0 - s3) / d]
+}
+
+fn filters(wavelet: str) -> [f64] {
+    if wavelet == "d4" { d4_low() } else { haar_low() }
+}
+
+/// One periodic filter-bank level: (approximation, detail).
+pub fn analyse(wavelet: str, x: [f64]) -> ([f64], [f64]) {
+    let h = filters(wavelet)
+    let n = x.len()
+    var a: [f64] = []
+    var d: [f64] = []
+    for k in 0..n / 2 {
+        var s = 0.0
+        var t = 0.0
+        for j in 0..h.len() {
+            let v = x[(2 * k + j) % n]
+            s = s + h[j] * v
+            let g = if j % 2 == 0 { h[h.len() - 1 - j] } else { 0.0 - h[h.len() - 1 - j] }
+            t = t + g * v
+        }
+        a.push(s)
+        d.push(t)
+    }
+    (a, d)
+}
+
+pub fn synthesise(wavelet: str, a: [f64], d: [f64]) -> [f64] {
+    let h = filters(wavelet)
+    let n = 2 * a.len()
+    var x: [f64] = []
+    for _i in 0..n {
+        x.push(0.0)
+    }
+    for k in 0..a.len() {
+        for j in 0..h.len() {
+            let g = if j % 2 == 0 { h[h.len() - 1 - j] } else { 0.0 - h[h.len() - 1 - j] }
+            let i = (2 * k + j) % n
+            x[i] = x[i] + h[j] * a[k] + g * d[k]
+        }
+    }
+    x
+}
+
+/// The index of position i under JPEG 2000's symmetric extension.
+fn mirror(i: i64, n: i64) -> i64 {
+    if n == 1 {
+        return 0
+    }
+    let period = 2 * (n - 1)
+    let r = ((i % period) + period) % period
+    if r < n { r } else { period - r }
+}
+
+/// LeGall 5/3 forward lifting (JPEG 2000 F.3.8): (low, high), integers.
+pub fn legall_forward(x: [i64]) -> ([i64], [i64]) {
+    let n = x.len()
+    // A lone sample passes unchanged (JPEG 2000 F.3.7): lifting it against
+    // its own mirror image could not be undone.
+    if n == 1 {
+        return (x, [])
+    }
+    var y = x
+    var i = 1
+    while i < n {
+        y[i] = x[i] - floor_div(x[mirror(i - 1, n)] + x[mirror(i + 1, n)], 2)
+        i = i + 2
+    }
+    var out = y
+    i = 0
+    while i < n {
+        out[i] = y[i] + floor_div(y[mirror(i - 1, n)] + y[mirror(i + 1, n)] + 2, 4)
+        i = i + 2
+    }
+    var low: [i64] = []
+    var high: [i64] = []
+    for k in 0..n {
+        if k % 2 == 0 { low.push(out[k]) } else { high.push(out[k]) }
+    }
+    (low, high)
+}
+
+pub fn legall_inverse(low: [i64], high: [i64]) -> [i64] {
+    let n = low.len() + high.len()
+    if n == 1 {
+        return low
+    }
+    var y: [i64] = []
+    for k in 0..n {
+        y.push(if k % 2 == 0 { low[k / 2] } else { high[k / 2] })
+    }
+    var even = y
+    var i = 0
+    while i < n {
+        even[i] = y[i] - floor_div(y[mirror(i - 1, n)] + y[mirror(i + 1, n)] + 2, 4)
+        i = i + 2
+    }
+    var x = even
+    i = 1
+    while i < n {
+        x[i] = even[i] + floor_div(even[mirror(i - 1, n)] + even[mirror(i + 1, n)], 2)
+        i = i + 2
+    }
+    x
+}
+
+fn lift(y: [f64], start: i64, c: f64) -> [f64] {
+    let n = y.len()
+    var out = y
+    var i = start
+    while i < n {
+        out[i] = y[i] + c * (y[mirror(i - 1, n)] + y[mirror(i + 1, n)])
+        i = i + 2
+    }
+    out
+}
+
+/// CDF 9/7 forward lifting with JPEG 2000's constants: (low, high).
+pub fn cdf97_forward(x: [f64]) -> ([f64], [f64]) {
+    var y = lift(x, 1, -1.586134342059924)
+    y = lift(y, 0, -0.052980118572961)
+    y = lift(y, 1, 0.882911075530934)
+    y = lift(y, 0, 0.443506852043971)
+    let k = 1.230174104914001
+    var low: [f64] = []
+    var high: [f64] = []
+    for i in 0..y.len() {
+        if i % 2 == 0 { low.push(y[i] / k) } else { high.push(y[i] * k) }
+    }
+    (low, high)
+}
+
+pub fn cdf97_inverse(low: [f64], high: [f64]) -> [f64] {
+    let k = 1.230174104914001
+    var y: [f64] = []
+    for i in 0..low.len() + high.len() {
+        y.push(if i % 2 == 0 { low[i / 2] * k } else { high[i / 2] / k })
+    }
+    y = lift(y, 0, -0.443506852043971)
+    y = lift(y, 1, -0.882911075530934)
+    y = lift(y, 0, 0.052980118572961)
+    lift(y, 1, 1.586134342059924)
+}
+
+/// Several periodic levels: [approximation, detail_coarsest, ..., detail_finest].
+pub fn forward(wavelet: str, x: [f64], levels: i64) -> [[f64]] {
+    var details: [[f64]] = []
+    var a = x
+    for _l in 0..levels {
+        if a.len() < 2 or a.len() % 2 != 0 {
+            break
+        }
+        let (na, d) = analyse(wavelet, a)
+        details = [d] + details
+        a = na
+    }
+    [a] + details
+}
+
+pub fn inverse(wavelet: str, parts: [[f64]]) -> [f64] {
+    var a = parts[0]
+    for k in 1..parts.len() {
+        a = synthesise(wavelet, a, parts[k])
+    }
+    a
+}

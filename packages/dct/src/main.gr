@@ -1,0 +1,113 @@
+// Discrete cosine and sine transforms: the transforms under JPEG (DCT-II
+// on 8x8 blocks), MP3 and AAC (DCT-IV in the MDCT), Vorbis and Opus, and
+// spectral methods for differential equations.
+//
+// Types I to IV of the DCT and type I of the DST, in the conventions of
+// SciPy's `scipy.fft.dct` -- unnormalised, or orthonormal with `ortho` --
+// and, for types I, of FFTPACK's `cost` and `sint` as gonum has them:
+//
+//   DCT-I    y_k = x_0 + (-1)^k x_{n-1} + 2 sum_{j=1}^{n-2} x_j cos(pi j k / (n-1))
+//   DCT-II   y_k = 2 sum x_j cos(pi (2j+1) k / 2n)
+//   DCT-III  y_k = x_0 + 2 sum_{j>=1} x_j cos(pi j (2k+1) / 2n)
+//   DCT-IV   y_k = 2 sum x_j cos(pi (2j+1)(2k+1) / 4n)
+//   DST-I    y_k = 2 sum x_j sin(pi (j+1)(k+1) / (n+1))
+//
+// Computed directly, O(n^2), with the cosines tabulated once: exact to a
+// few units in the last place, and quick at the block sizes codecs use.
+
+fn cosine(num: i64, den: i64) -> f64 {
+    (pi() * num.as_f64() / den.as_f64()).cos()
+}
+
+/// cos(pi * m / den) for m in 0..2 den, so every product index reduces.
+fn table(den: i64) -> [f64] {
+    var out: [f64] = []
+    for m in 0..2 * den {
+        out.push(cosine(m, den))
+    }
+    out
+}
+
+fn at(t: [f64], m: i64) -> f64 {
+    t[((m % t.len()) + t.len()) % t.len()]
+}
+
+pub fn dct1(x: [f64]) -> [f64] {
+    let n = x.len()
+    if n < 2 {
+        return x
+    }
+    let t = table(n - 1)
+    var out: [f64] = []
+    for k in 0..n {
+        var s = x[0] + if k % 2 == 0 { x[n - 1] } else { 0.0 - x[n - 1] }
+        for j in 1..n - 1 {
+            s = s + 2.0 * x[j] * at(t, j * k)
+        }
+        out.push(s)
+    }
+    out
+}
+
+pub fn dst1(x: [f64]) -> [f64] {
+    let n = x.len()
+    var out: [f64] = []
+    for k in 0..n {
+        var s = 0.0
+        for j in 0..n {
+            s = s + 2.0 * x[j] * (pi() * ((j + 1) * (k + 1)).as_f64() / (n + 1).as_f64()).sin()
+        }
+        out.push(s)
+    }
+    out
+}
+
+/// DCT-II; `ortho` scales y_0 by sqrt(1/4n) and the rest by sqrt(1/2n).
+pub fn dct2(x: [f64], ortho: bool) -> [f64] {
+    let n = x.len()
+    let t = table(2 * n)
+    var out: [f64] = []
+    for k in 0..n {
+        var s = 0.0
+        for j in 0..n {
+            s = s + x[j] * at(t, (2 * j + 1) * k)
+        }
+        s = 2.0 * s
+        if ortho {
+            s = s * if k == 0 { (1.0 / (4.0 * n.as_f64())).sqrt() } else { (1.0 / (2.0 * n.as_f64())).sqrt() }
+        }
+        out.push(s)
+    }
+    out
+}
+
+/// DCT-III, the inverse of DCT-II up to a factor 2n (none with `ortho`).
+pub fn dct3(x: [f64], ortho: bool) -> [f64] {
+    let n = x.len()
+    let t = table(2 * n)
+    var out: [f64] = []
+    for k in 0..n {
+        var s = if ortho { x[0] / n.as_f64().sqrt() } else { x[0] }
+        for j in 1..n {
+            let w = if ortho { (2.0 / n.as_f64()).sqrt() } else { 2.0 }
+            s = s + w * x[j] * at(t, j * (2 * k + 1))
+        }
+        out.push(s)
+    }
+    out
+}
+
+/// DCT-IV, its own inverse up to a factor 2n (none with `ortho`).
+pub fn dct4(x: [f64], ortho: bool) -> [f64] {
+    let n = x.len()
+    let t = table(4 * n)
+    var out: [f64] = []
+    for k in 0..n {
+        var s = 0.0
+        for j in 0..n {
+            s = s + x[j] * at(t, (2 * j + 1) * (2 * k + 1))
+        }
+        out.push(if ortho { s * (2.0 / n.as_f64()).sqrt() } else { 2.0 * s })
+    }
+    out
+}

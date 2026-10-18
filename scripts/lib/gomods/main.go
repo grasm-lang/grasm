@@ -26,6 +26,11 @@ import (
 	"golang.org/x/net/bpf"
 	"golang.org/x/net/http/httpproxy"
 	"golang.org/x/tools/txtar"
+	"gonum.org/v1/gonum/dsp/fourier"
+	"gonum.org/v1/gonum/dsp/window"
+	"gonum.org/v1/gonum/interp"
+	"math"
+	"strconv"
 )
 
 type request struct {
@@ -104,6 +109,56 @@ func answer(r request) string {
 		return proxyAnswer(r.Hex)
 	case "tile":
 		return tileAnswer(r)
+	case "dct1", "dst1":
+		var out []float64
+		if r.Op == "dct1" {
+			out = fourier.NewDCT(len(r.Nums)).Transform(nil, r.Nums)
+		} else {
+			out = fourier.NewDST(len(r.Nums)).Transform(nil, r.Nums)
+		}
+		return floats(out)
+	case "win":
+		seq := make([]float64, int(r.Nums[0]))
+		for i := range seq {
+			seq[i] = 1
+		}
+		fns := map[string]func([]float64) []float64{"rectangular": window.Rectangular, "sine": window.Sine,
+			"lanczos": window.Lanczos, "triangular": window.Triangular, "hann": window.Hann,
+			"bartlett_hann": window.BartlettHann, "hamming": window.Hamming, "blackman": window.Blackman,
+			"blackman_harris": window.BlackmanHarris, "nuttall": window.Nuttall, "blackman_nuttall": window.BlackmanNuttall,
+			"flat_top": window.FlatTop}
+		switch r.Args[0] {
+		case "gaussian":
+			return floats(window.Gaussian{Sigma: r.Nums[1]}.Transform(seq))
+		case "tukey":
+			return floats(window.Tukey{Alpha: r.Nums[1]}.Transform(seq))
+		}
+		return floats(fns[r.Args[0]](seq))
+	case "spline":
+		n := int(r.Nums[0])
+		xs, ys, qs := r.Nums[1:1+n], r.Nums[1+n:1+2*n], r.Nums[1+2*n:]
+		var p interp.FittablePredictor
+		switch r.Args[0] {
+		case "natural":
+			p = &interp.NaturalCubic{}
+		case "clamped":
+			p = &interp.ClampedCubic{}
+		case "notaknot":
+			p = &interp.NotAKnotCubic{}
+		case "akima":
+			p = &interp.AkimaSpline{}
+		default:
+			p = &interp.FritschButland{}
+		}
+		if err := safeFit(p, xs, ys); err != nil {
+			return "ERR"
+		}
+		d := p.(interp.DerivativePredictor)
+		var out []float64
+		for _, q := range qs {
+			out = append(out, p.Predict(q), d.PredictDerivative(q))
+		}
+		return floats(out)
 	case "h1":
 		files := map[string][]byte{}
 		var names []string
@@ -255,4 +310,22 @@ func main() {
 		out[i] = answer(r)
 	}
 	json.NewEncoder(os.Stdout).Encode(out)
+}
+
+func floats(v []float64) string {
+	parts := make([]string, len(v))
+	for i, x := range v {
+		parts[i] = strconv.FormatUint(math.Float64bits(x), 10)
+	}
+	return strings.Join(parts, ",")
+}
+
+// safeFit turns gonum's panics on bad input into an error.
+func safeFit(p interp.FittablePredictor, xs, ys []float64) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("%v", r)
+		}
+	}()
+	return p.Fit(xs, ys)
 }

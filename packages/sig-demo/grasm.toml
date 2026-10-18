@@ -1,0 +1,20 @@
+[package]
+name = "sig_demo"
+version = "1.0.0"
+capabilities = ["io"]
+
+[dependencies.dct]
+path = "../dct"
+version = "^1.0.0"
+
+[dependencies.dwt]
+path = "../dwt"
+version = "^1.0.0"
+
+[dependencies.spline]
+path = "../spline"
+version = "^1.0.0"
+
+[dependencies.windowfn]
+path = "../windowfn"
+version = "^1.0.0"

@@ -1,0 +1,131 @@
+// Window functions: the tapers applied to a block of samples before a
+// Fourier transform, so the block's abrupt ends do not smear energy
+// across the spectrum. Which one to use trades main-lobe width against
+// side-lobe height -- Hann for most work, flat-top for measuring
+// amplitudes, Blackman-Harris for dynamic range.
+//
+// The symmetric forms, with n - 1 in the denominator, exactly as gonum's
+// `dsp/window` defines them -- rectangular, sine, Lanczos, triangular,
+// Hann, Bartlett-Hann, Hamming, Blackman, Blackman-Harris, Nuttall,
+// Blackman-Nuttall, flat-top, Gaussian and Tukey -- and the Kaiser window,
+// whose I0 Bessel function is summed as a series. `weights(name, n)` gives
+// the window; multiply a block by it.
+
+type WindowError =
+    | UnknownWindow(name: str)
+
+fn generalised(n: i64, a: [f64]) -> [f64] {
+    let k = 2.0 * pi() / (n - 1).as_f64()
+    var out: [f64] = []
+    for i in 0..n {
+        let x = k * i.as_f64()
+        var w = 0.0
+        var sign = 1.0
+        for j in 0..a.len() {
+            w = w + sign * a[j] * (x * j.as_f64()).cos()
+            sign = 0.0 - sign
+        }
+        out.push(w)
+    }
+    out
+}
+
+fn each(n: i64, f: fn(i64) -> f64) -> [f64] {
+    var out: [f64] = []
+    for i in 0..n {
+        out.push(f(i))
+    }
+    out
+}
+
+fn shaped(name: str, n: i64) -> Option[[f64]] {
+    let m = (n - 1).as_f64()
+    if name == "rectangular" {
+        return Some(each(n, |_i| 1.0))
+    }
+    if name == "sine" {
+        return Some(each(n, |i| (pi() / m * i.as_f64()).sin()))
+    }
+    if name == "lanczos" {
+        return Some(each(n, |i| {
+            let x = pi() * (2.0 / m * i.as_f64() - 1.0)
+            if x == 0.0 { 1.0 } else { x.sin() / x }
+        }))
+    }
+    if name == "triangular" {
+        return Some(each(n, |i| 1.0 - (i.as_f64() / (m / 2.0) - 1.0).abs()))
+    }
+    if name == "bartlett_hann" {
+        return Some(each(n, |i| 0.62 - 0.48 * (i.as_f64() / m - 0.5).abs() - 0.38 * (2.0 * pi() / m * i.as_f64()).cos()))
+    }
+    None
+}
+
+/// The named window of length n (n >= 2).
+pub fn weights(name: str, n: i64) -> [f64] ! WindowError {
+    match shaped(name, n) {
+        Some(w) -> return w
+        None -> {}
+    }
+    let sums = [("hann", [0.5, 0.5]), ("hamming", [0.54, 0.46]), ("blackman", [0.42, 0.5, 0.08]),
+        ("blackman_harris", [0.35875, 0.48829, 0.14128, 0.01168]), ("nuttall", [0.355768, 0.487396, 0.144232, 0.012604]),
+        ("blackman_nuttall", [0.3635819, 0.4891775, 0.1365995, 0.0106411]),
+        ("flat_top", [0.21557895, 0.41663158, 0.277263158, 0.083578947, 0.006947368])]
+    for (k, a) in sums {
+        if k == name {
+            return generalised(n, a)
+        }
+    }
+    fail(UnknownWindow(name))
+}
+
+/// The Gaussian window, exp(-((i - a) / (sigma a))^2 / 2) with a = (n-1)/2.
+pub fn gaussian(n: i64, sigma: f64) -> [f64] {
+    let a = (n - 1).as_f64() / 2.0
+    each(n, |i| {
+        let r = (i.as_f64() - a) / (sigma * a)
+        (-0.5 * r * r).exp()
+    })
+}
+
+/// The Tukey (tapered cosine) window: alpha 0 is rectangular, 1 is Hann.
+pub fn tukey(n: i64, alpha: f64) -> [f64] {
+    if alpha <= 0.0 {
+        return each(n, |_i| 1.0)
+    }
+    if alpha >= 1.0 {
+        return generalised(n, [0.5, 0.5])
+    }
+    var w = each(n, |_i| 1.0)
+    let span = alpha * (n - 1).as_f64()
+    let width = (0.5 * span).as_i64() + 1
+    for i in 0..width.min(n) {
+        let v = 0.5 * (1.0 - (2.0 * pi() * i.as_f64() / span).cos())
+        w[i] = w[i] * v
+        w[n - 1 - i] = w[n - 1 - i] * v
+    }
+    w
+}
+
+/// I0, the modified Bessel function of the first kind and order zero.
+fn bessel_i0(x: f64) -> f64 {
+    var sum = 1.0
+    var term = 1.0
+    let q = x * x / 4.0
+    var k = 1
+    while term > 1e-17 * sum and k < 500 {
+        term = term * q / (k * k).as_f64()
+        sum = sum + term
+        k = k + 1
+    }
+    sum
+}
+
+/// The Kaiser window with shape beta: I0(beta sqrt(1 - r^2)) / I0(beta).
+pub fn kaiser(n: i64, beta: f64) -> [f64] {
+    let m = (n - 1).as_f64()
+    each(n, |i| {
+        let r = 2.0 * i.as_f64() / m - 1.0
+        bessel_i0(beta * (1.0 - r * r).max(0.0).sqrt()) / bessel_i0(beta)
+    })
+}
