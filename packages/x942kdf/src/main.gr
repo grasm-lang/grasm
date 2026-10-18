@@ -1,0 +1,95 @@
+// The X9.42 key derivation of RFC 2631 (Diffie-Hellman for CMS), in its
+// ASN.1 form.
+//
+// Each block is H(ZZ || OtherInfo), where OtherInfo is a DER structure
+// naming the key-encryption algorithm the derived key is for, a 32-bit
+// counter, and optionally the parties' information and supplementary
+// public and private information:
+//
+//     OtherInfo ::= SEQUENCE {
+//         keyInfo SEQUENCE { algorithm OBJECT IDENTIFIER, counter OCTET STRING (4) },
+//         partyUInfo   [0] EXPLICIT OCTET STRING OPTIONAL,
+//         partyVInfo   [1] EXPLICIT OCTET STRING OPTIONAL,
+//         suppPubInfo  [2] EXPLICIT OCTET STRING OPTIONAL,
+//         suppPrivInfo [3] EXPLICIT OCTET STRING OPTIONAL }
+//
+// RFC 2631 has [0] and [2] (the key length in bits); [1] and [3] are
+// OpenSSL's, from X9.42 itself. By default [2] holds the algorithm's key
+// length in bits; supplementary public information given explicitly
+// replaces it. CMS (S/MIME) messages encrypted to Diffie-Hellman
+// recipients derive their key-encryption keys this way.
+//
+// Checked against OpenSSL's X942KDF-ASN1.
+
+type X942Kek =
+    | X942Aes128Wrap
+    | X942Aes192Wrap
+    | X942Aes256Wrap
+    | X942Des3Wrap
+
+type X942Info = { party_u: bytes, party_v: bytes, supp_pub: bytes, supp_priv: bytes, use_keybits: bool }
+
+/// No optional information, and the key length in suppPubInfo.
+pub fn info() -> X942Info {
+    let none = bytes_of([])
+    return X942Info{ party_u: none, party_v: none, supp_pub: none, supp_priv: none, use_keybits: true }
+}
+
+fn der(tag: i64, body: [i64]) -> [i64] {
+    let n = body.len()
+    if n < 128 {
+        return [tag, n] + body
+    }
+    var len: [i64] = []
+    var v = n
+    while v > 0 {
+        len = [v.bit_and(255)] + len
+        v = v.ushr(8)
+    }
+    return [tag, 128 + len.len()] + len + body
+}
+
+/// The algorithm's OID (DER contents) and key length in bits.
+fn kek(k: X942Kek) -> ([i64], i64) {
+    let aes = [96, 134, 72, 1, 101, 3, 4, 1]
+    return match k {
+        X942Aes128Wrap -> (aes + [5], 128)
+        X942Aes192Wrap -> (aes + [25], 192)
+        X942Aes256Wrap -> (aes + [45], 256)
+        X942Des3Wrap -> ([42, 134, 72, 134, 247, 13, 1, 9, 16, 3, 6], 192)
+    }
+}
+
+fn be32(v: i64) -> [i64] {
+    return [v.ushr(24).bit_and(255), v.ushr(16).bit_and(255), v.ushr(8).bit_and(255), v.bit_and(255)]
+}
+
+fn other_info(k: X942Kek, i: X942Info, counter: i64) -> [i64] {
+    let (oid, bits) = kek(k)
+    var body = der(48, der(6, oid) + der(4, be32(counter)))
+    if i.party_u.len() > 0 {
+        body = body + der(160, der(4, i.party_u.to_list()))
+    }
+    if i.party_v.len() > 0 {
+        body = body + der(161, der(4, i.party_v.to_list()))
+    }
+    if i.supp_pub.len() > 0 {
+        body = body + der(162, der(4, i.supp_pub.to_list()))
+    } else if i.use_keybits {
+        body = body + der(162, der(4, be32(bits)))
+    }
+    if i.supp_priv.len() > 0 {
+        body = body + der(163, der(4, i.supp_priv.to_list()))
+    }
+    return der(48, body)
+}
+
+pub fn derive(hash: fn(bytes) -> bytes, zz: bytes, k: X942Kek, i: X942Info, length: i64) -> bytes {
+    var out: [i64] = []
+    var counter = 1
+    while out.len() < length {
+        out = out + hash(zz.concat(bytes_of(other_info(k, i, counter)))).to_list()
+        counter = counter + 1
+    }
+    return bytes_of(out.slice(0, length))
+}

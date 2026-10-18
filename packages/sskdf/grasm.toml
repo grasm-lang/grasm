@@ -1,0 +1,4 @@
+[package]
+name = "sskdf"
+version = "1.0.0"
+capabilities = []

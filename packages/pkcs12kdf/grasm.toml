@@ -1,0 +1,4 @@
+[package]
+name = "pkcs12kdf"
+version = "1.0.0"
+capabilities = []

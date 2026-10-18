@@ -1,0 +1,8 @@
+[package]
+name = "hmac"
+version = "1.0.0"
+capabilities = []
+
+[dependencies.bytes_codec]
+path = "../bytes"
+version = "^1.0.0"

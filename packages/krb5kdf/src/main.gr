@@ -1,0 +1,144 @@
+// Kerberos key derivation, RFC 3961's DK with RFC 3962's AES and RFC
+// 3961's Triple DES.
+//
+// Every Kerberos session derives its encryption, integrity and checksum
+// keys from the base key with DK(key, constant): the constant (a key
+// usage number and a purpose byte, or a string like "kerberos") is
+// "n-folded" to the cipher's block length -- copies of it rotated by 13
+// bits each and added with end-around carry -- and then encrypted again
+// and again, each output block the input to the next, until there is a
+// key's worth. Triple DES keys then get their parity bits: each 7 bytes
+// become 8, the eighth built from the low bits of the seven.
+//
+// Active Directory, MIT and Heimdal Kerberos all derive keys this way for
+// the aes128-cts, aes256-cts and des3-cbc-sha1 encryption types. (RFC 8009's
+// SHA-2 types use `kbkdf` instead.)
+//
+// Checked against OpenSSL's KRB5KDF.
+import aes
+import des
+
+type Krb5Cipher =
+    | Krb5Aes128
+    | Krb5Aes256
+    | Krb5Des3
+
+type Krb5Error =
+    | Krb5BadKey(length: i64)
+    | Krb5BadConstant(length: i64)
+
+fn bits_of(data: bytes) -> [i64] {
+    var out: [i64] = []
+    for i in 0..data.len() {
+        for j in 0..8 {
+            out.push(data.at(i).ushr(7 - j).bit_and(1))
+        }
+    }
+    return out
+}
+
+fn gcd(a: i64, b: i64) -> i64 {
+    return if b == 0 { a } else { gcd(b, a % b) }
+}
+
+/// RFC 3961's n-fold of data to n bytes.
+pub fn nfold(data: bytes, n: i64) -> bytes {
+    let k = data.len() * 8
+    let lcm = n * 8 / gcd(n * 8, k) * k
+    let src = bits_of(data)
+    var acc: [i64] = []
+    for _i in 0..n {
+        acc.push(0)
+    }
+    var copy: [i64] = []
+    for i in 0..(lcm / k) {
+        let r = 13 * i % k
+        for j in 0..k {
+            copy.push(src[(j - r + k * 2) % k])
+        }
+    }
+    // Add the n-byte chunks, ones' complement: the carry out of the top
+    // wraps around to the bottom.
+    var at = 0
+    while at < copy.len() {
+        var carry = 0
+        var j = n - 1
+        while j >= 0 {
+            var byte = 0
+            for b in 0..8 {
+                byte = byte.shl(1).bit_or(copy[at + 8 * j + b])
+            }
+            let s = acc[j] + byte + carry
+            acc[j] = s.bit_and(255)
+            carry = s.ushr(8)
+            j = j - 1
+        }
+        while carry > 0 {
+            j = n - 1
+            while j >= 0 and carry > 0 {
+                let s = acc[j] + carry
+                acc[j] = s.bit_and(255)
+                carry = s.ushr(8)
+                j = j - 1
+            }
+        }
+        at = at + 8 * n
+    }
+    return bytes_of(acc)
+}
+
+fn parity(v: i64) -> i64 {
+    let b = v.bit_and(254)
+    var ones = 0
+    for i in 1..8 {
+        ones = ones + b.ushr(i).bit_and(1)
+    }
+    return if ones % 2 == 0 { b + 1 } else { b }
+}
+
+/// Seven random bytes to an eight-byte DES key with odd parity.
+fn des_key(seven: [i64]) -> [i64] {
+    var last = 0
+    for j in 0..7 {
+        last = last.bit_or(seven[j].bit_and(1).shl(j + 1))
+    }
+    var out: [i64] = []
+    for v in seven + [last] {
+        out.push(parity(v))
+    }
+    return out
+}
+
+/// The derived key for a base key and a constant.
+pub fn derive(c: Krb5Cipher, key: bytes, constant: bytes) -> bytes ! Krb5Error {
+    let (key_len, block) = match c {
+        Krb5Aes128 -> (16, 16)
+        Krb5Aes256 -> (32, 16)
+        Krb5Des3 -> (24, 8)
+    }
+    if key.len() != key_len {
+        fail(Krb5BadKey(key.len()))
+    }
+    // RFC 3961 n-folds a constant shorter than the block up to it, and
+    // says nothing of longer ones; OpenSSL refuses them, and so does this.
+    if constant.len() == 0 or constant.len() > block {
+        fail(Krb5BadConstant(constant.len()))
+    }
+    let raw_len = if block == 8 { 21 } else { key_len }
+    var prev = if constant.len() == block { constant } else { nfold(constant, block) }
+    var out: [i64] = []
+    let a = aes.new_cipher(if block == 16 { key } else { bytes_filled(16, 0) })
+    let d = des.new_triple(if block == 8 { key } else { bytes_filled(24, 0) }) ?? panic("a 24-byte key")
+    while out.len() < raw_len {
+        prev = if block == 16 { aes.encrypt_with(a, prev) } else { des.encrypt_block(d, prev) ?? panic("an 8-byte block") }
+        out = out + prev.to_list()
+    }
+    if block == 16 {
+        return bytes_of(out.slice(0, raw_len))
+    }
+    var key_out: [i64] = []
+    for i in 0..3 {
+        key_out = key_out + des_key(out.slice(7 * i, 7 * i + 7))
+    }
+    return bytes_of(key_out)
+}

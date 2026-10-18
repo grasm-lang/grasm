@@ -1,0 +1,52 @@
+// The TLS pseudorandom function: TLS 1.2's P_hash (RFC 5246 section 5)
+// and the TLS 1.0 and 1.1 PRF that XORs P_MD5 with P_SHA1 (RFC 2246).
+//
+// P_hash chains HMAC: A(0) is the seed, A(i) = HMAC(secret, A(i-1)), and
+// the output is HMAC(secret, A(i) || seed) for i = 1, 2, ... until enough
+// exists. The PRF's seed is the label followed by the caller's seed. TLS
+// 1.2 turns its premaster secret into the master secret, and that into the
+// key block and the Finished messages, this way; DTLS 1.2, EAP-TLS's keys
+// (RFC 5216) and RFC 5705 keying-material exporters do too.
+//
+// TLS 1.0 and 1.1 split the secret into halves (overlapping by a byte
+// when its length is odd) and XOR the two P_hash outputs: still needed to
+// read captures and talk to old devices. TLS 1.3 uses HKDF instead
+// (`hkdf`, `tls13`).
+//
+// Checked against OpenSSL's TLS1-PRF.
+import hmac
+import md5
+import sha1
+
+/// P_hash with an HMAC given as a function of (key, message).
+pub fn p_hash(mac: fn(bytes, bytes) -> bytes, secret: bytes, seed: bytes, length: i64) -> bytes {
+    var out: [i64] = []
+    var a = seed
+    while out.len() < length {
+        a = mac(secret, a)
+        out = out + mac(secret, a.concat(seed)).to_list()
+    }
+    return bytes_of(out.slice(0, length))
+}
+
+/// The TLS 1.2 PRF over the given HMAC (SHA-256 unless the cipher suite
+/// names another).
+pub fn prf(mac: fn(bytes, bytes) -> bytes, secret: bytes, label: bytes, seed: bytes, length: i64) -> bytes {
+    return p_hash(mac, secret, label.concat(seed), length)
+}
+
+/// The TLS 1.0 and 1.1 PRF: P_MD5 over the first half of the secret XOR
+/// P_SHA1 over the second.
+pub fn prf_tls10(secret: bytes, label: bytes, seed: bytes, length: i64) -> bytes {
+    let half = (secret.len() + 1) / 2
+    let s1 = secret.slice(0, half)
+    let s2 = secret.slice(secret.len() - half, secret.len())
+    let both = label.concat(seed)
+    let a = p_hash(|k, m| hmac.hmac(|x| md5.hash(x), 64, k, m), s1, both, length)
+    let b = p_hash(|k, m| hmac.hmac(|x| sha1.hash(x), 64, k, m), s2, both, length)
+    var out: [i64] = []
+    for i in 0..length {
+        out.push(a.at(i).bit_xor(b.at(i)))
+    }
+    return bytes_of(out)
+}

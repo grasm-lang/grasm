@@ -1,0 +1,44 @@
+// The one-step key derivation of NIST SP 800-56C (section 4), "SSKDF".
+//
+// After a key agreement, each block of key is H(counter || Z || FixedInfo)
+// with a 32-bit big-endian counter from 1, Z the shared secret and
+// FixedInfo the agreed context; the HMAC variant keys the HMAC with a salt
+// instead of hashing bare. It is the KDF NIST approves for turning ECDH and
+// FFDH results into keys in FIPS-validated modules, and the "Concat KDF"
+// of JOSE's ECDH-ES (RFC 7518 section 4.6), where FixedInfo is the
+// algorithm and party identifiers.
+//
+// For the HMAC variant SP 800-56C says an absent salt is a block of zeros
+// of the hash's block length; the caller passes that explicitly here.
+//
+// Checked against OpenSSL's SSKDF with digests and with HMAC.
+
+type SskdfError =
+    | SskdfTooLong
+
+fn counter(i: i64) -> bytes {
+    return bytes_of([i.ushr(24).bit_and(255), i.ushr(16).bit_and(255), i.ushr(8).bit_and(255), i.bit_and(255)])
+}
+
+fn run(block: fn(bytes) -> bytes, z: bytes, info: bytes, length: i64) -> bytes ! SskdfError {
+    var out: [i64] = []
+    var i = 1
+    while out.len() < length {
+        if i > 4294967295 {
+            fail(SskdfTooLong)
+        }
+        out = out + block(counter(i).concat(z).concat(info)).to_list()
+        i = i + 1
+    }
+    return bytes_of(out.slice(0, length))
+}
+
+/// The hash variant.
+pub fn hash_derive(hash: fn(bytes) -> bytes, z: bytes, info: bytes, length: i64) -> bytes ! SskdfError {
+    return try run(hash, z, info, length)
+}
+
+/// The HMAC variant, the HMAC given as a function of (key, message).
+pub fn hmac_derive(mac: fn(bytes, bytes) -> bytes, salt: bytes, z: bytes, info: bytes, length: i64) -> bytes ! SskdfError {
+    return try run(|m| mac(salt, m), z, info, length)
+}

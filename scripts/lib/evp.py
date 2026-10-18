@@ -228,3 +228,52 @@ def mac(name, key, data, params=(), size=None, xof=False):
         L.EVP_MAC_CTX_free(ctx)
         L.EVP_MAC_free(m)
         L.ERR_clear_error()
+
+
+L.EVP_KDF_fetch.restype = vp
+L.EVP_KDF_fetch.argtypes = [vp, cp, cp]
+L.EVP_KDF_free.argtypes = [vp]
+L.EVP_KDF_CTX_new.restype = vp
+L.EVP_KDF_CTX_new.argtypes = [vp]
+L.EVP_KDF_CTX_free.argtypes = [vp]
+L.EVP_KDF_derive.argtypes = [vp, vp, sz, vp]
+L.EVP_MD_fetch.restype = vp
+L.EVP_MD_fetch.argtypes = [vp, cp, cp]
+L.EVP_MD_free.argtypes = [vp]
+L.EVP_Digest.argtypes = [cp, sz, vp, ctypes.POINTER(ctypes.c_uint), vp, vp]
+
+
+def kdf(name, length, params):
+    """`length` bytes from a KDF, or None if OpenSSL refuses. A param given
+    as a list repeats it (TLS1-PRF's seeds, X942's info)."""
+    k = L.EVP_KDF_fetch(None, name.encode(), None)
+    if not k:
+        raise KeyError(name)
+    ctx = L.EVP_KDF_CTX_new(k)
+    try:
+        items = []
+        for key, value in params:
+            items += [(key, v) for v in value] if isinstance(value, list) else [(key, value)]
+        arr, keep = _params(items)
+        out = ctypes.create_string_buffer(max(length, 1))
+        if L.EVP_KDF_derive(ctx, out, length, arr) != 1:
+            return None
+        return out.raw[:length]
+    finally:
+        L.EVP_KDF_CTX_free(ctx)
+        L.EVP_KDF_free(k)
+        L.ERR_clear_error()
+
+
+def digest(name, data):
+    md = L.EVP_MD_fetch(None, name.encode(), None)
+    if not md:
+        raise KeyError(name)
+    out = ctypes.create_string_buffer(64)
+    n = ctypes.c_uint(0)
+    try:
+        if L.EVP_Digest(data, len(data), out, ctypes.byref(n), md, None) != 1:
+            return None
+        return out.raw[:n.value]
+    finally:
+        L.EVP_MD_free(md)

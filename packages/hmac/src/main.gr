@@ -1,0 +1,34 @@
+// HMAC over any hash function (RFC 2104, FIPS 198-1).
+//
+// The hash packages each carry an HMAC for their own function; this one
+// takes the hash as an argument, with its block size, so that any hash --
+// SM3, RIPEMD-160, Whirlpool, SHA-3, MD5 -- has an HMAC, and the key
+// derivation functions (`kbkdf`, `tls12prf`, `sskdf` and others) can be
+// written once over all of them.
+//
+// A key longer than the block is hashed first; the key is padded with
+// zeros to the block and XORed with 0x36 for the inner hash and 0x5C for
+// the outer. The block size is the hash's input block, not its output:
+// 64 bytes for MD5, SHA-1, SHA-256, SM3, RIPEMD-160 and Whirlpool, 128 for
+// SHA-384 and SHA-512, and the rate for SHA-3 (144, 136, 104 or 72).
+//
+// Checked against OpenSSL's EVP_MAC HMAC with thirteen digests.
+import bytes_codec
+
+pub fn hmac(hash: fn(bytes) -> bytes, block_size: i64, key: bytes, message: bytes) -> bytes {
+    let k = if key.len() > block_size { hash(key) } else { key }
+    var inner: [i64] = []
+    var outer: [i64] = []
+    for i in 0..block_size {
+        let b = if i < k.len() { k.at(i) } else { 0 }
+        inner.push(b.bit_xor(54))
+        outer.push(b.bit_xor(92))
+    }
+    return hash(bytes_of(outer).concat(hash(bytes_of(inner).concat(message))))
+}
+
+/// Whether a tag (possibly truncated, never empty) is the message's HMAC.
+pub fn verify(hash: fn(bytes) -> bytes, block_size: i64, key: bytes, message: bytes, tag: bytes) -> bool {
+    let full = hmac(hash, block_size, key, message)
+    return tag.len() > 0 and tag.len() <= full.len() and bytes_codec.equal_constant_time(full.slice(0, tag.len()), tag)
+}

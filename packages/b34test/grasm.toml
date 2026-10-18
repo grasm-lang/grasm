@@ -1,0 +1,88 @@
+[package]
+name = "b34test"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.ripemd160]
+path = "../ripemd160"
+version = "^1.0.0"
+
+[dependencies.whirlpool]
+path = "../whirlpool"
+version = "^1.0.0"
+
+[dependencies.sm3]
+path = "../sm3"
+version = "^1.0.0"
+
+[dependencies.mdc2]
+path = "../mdc2"
+version = "^1.0.0"
+
+[dependencies.hmac]
+path = "../hmac"
+version = "^1.0.0"
+
+[dependencies.kbkdf]
+path = "../kbkdf"
+version = "^1.0.0"
+
+[dependencies.x963kdf]
+path = "../x963kdf"
+version = "^1.0.0"
+
+[dependencies.tls12prf]
+path = "../tls12prf"
+version = "^1.0.0"
+
+[dependencies.sshkdf]
+path = "../sshkdf"
+version = "^1.0.0"
+
+[dependencies.sskdf]
+path = "../sskdf"
+version = "^1.0.0"
+
+[dependencies.x942kdf]
+path = "../x942kdf"
+version = "^1.0.0"
+
+[dependencies.pkcs12kdf]
+path = "../pkcs12kdf"
+version = "^1.0.0"
+
+[dependencies.krb5kdf]
+path = "../krb5kdf"
+version = "^1.0.0"
+
+[dependencies.pbkdf1]
+path = "../pbkdf1"
+version = "^1.0.0"
+
+[dependencies.md5]
+path = "../md5"
+version = "^1.0.0"
+
+[dependencies.sha1]
+path = "../sha1"
+version = "^1.0.0"
+
+[dependencies.crypto_hash]
+path = "../crypto_hash"
+version = "^1.0.0"
+
+[dependencies.sha512]
+path = "../sha512"
+version = "^1.0.0"
+
+[dependencies.sha3]
+path = "../sha3"
+version = "^1.0.0"
+
+[dependencies.cmac]
+path = "../cmac"
+version = "^1.0.0"
+
+[dependencies.aes]
+path = "../aes"
+version = "^1.0.0"

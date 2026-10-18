@@ -1,0 +1,92 @@
+// The PKCS#12 key derivation, RFC 7292 appendix B.2.
+//
+// PKCS#12 files (.p12, .pfx: every exported certificate and private key on
+// Windows, macOS keychains, Java keystores, browsers) derive their
+// encryption keys, IVs and MAC keys from the password with this function:
+// a diversifier byte (1 for a key, 2 for an IV, 3 for a MAC key) repeated
+// to the hash's block length, then the salt and the password each
+// repeated to whole blocks, hashed `iterations` times, and the salt and
+// password blocks updated by adding the result plus one before the next
+// block of output.
+//
+// The password is hashed as a BMPString: UTF-16 big-endian with two zero
+// bytes at the end. `bmp_password` writes one; `derive` takes the bytes
+// as they will be hashed, because files from different tools disagree
+// about the empty password (no bytes, or just the two zeros).
+//
+// Checked against OpenSSL's PKCS12KDF.
+
+type Pkcs12Error =
+    | Pkcs12BadId(id: i64)
+
+/// A password as RFC 7292 hashes it: UTF-16BE and a two-byte terminator.
+pub fn bmp_password(password: str) -> bytes {
+    var out: [i64] = []
+    for c in password.codes() {
+        if c >= 65536 {
+            let v = c - 65536
+            let hi = 55296 + v.ushr(10)
+            let lo = 56320 + v.bit_and(1023)
+            out = out + [hi.ushr(8), hi.bit_and(255), lo.ushr(8), lo.bit_and(255)]
+        } else {
+            out = out + [c.ushr(8), c.bit_and(255)]
+        }
+    }
+    return bytes_of(out + [0, 0])
+}
+
+fn repeated(src: bytes, v: i64) -> [i64] {
+    var out: [i64] = []
+    if src.len() == 0 {
+        return out
+    }
+    let n = v * ((src.len() + v - 1) / v)
+    for i in 0..n {
+        out.push(src.at(i % src.len()))
+    }
+    return out
+}
+
+/// `length` bytes for purpose `id` (1 key, 2 IV, 3 MAC key) from a hash
+/// with input block `v` bytes.
+pub fn derive(hash: fn(bytes) -> bytes, v: i64, password: bytes, salt: bytes, id: i64, iterations: i64,
+    length: i64) -> bytes ! Pkcs12Error {
+    if id < 1 or id > 3 {
+        fail(Pkcs12BadId(id))
+    }
+    var d: [i64] = []
+    for _j in 0..v {
+        d.push(id)
+    }
+    var input = repeated(salt, v) + repeated(password, v)
+    var out: [i64] = []
+    while out.len() < length {
+        var a = hash(bytes_of(d + input))
+        for _r in 1..iterations {
+            a = hash(a)
+        }
+        out = out + a.to_list()
+        if out.len() >= length {
+            break
+        }
+        // B is A repeated to v bytes; each v-byte block of I becomes
+        // I_j + B + 1, modulo 2^(8v).
+        var b: [i64] = []
+        for j in 0..v {
+            b.push(a.at(j % a.len()))
+        }
+        var block = 0
+        while block < input.len() {
+            var carry = 1
+            var j = v - 1
+            while j >= 0 {
+                let s = input[block + j] + b[j] + carry
+                input[block + j] = s.bit_and(255)
+                carry = s.ushr(8)
+                j = j - 1
+            }
+            block = block + v
+        }
+    }
+    return bytes_of(out.slice(0, length))
+}

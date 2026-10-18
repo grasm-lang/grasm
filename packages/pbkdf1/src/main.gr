@@ -1,0 +1,29 @@
+// PBKDF1, the password-based key derivation of PKCS #5 v1.5 (RFC 8018
+// section 5.1).
+//
+// The hash of the password and salt, hashed again `iterations` times, cut
+// to the length wanted, which can be no longer than the hash. PBKDF2
+// replaced it in 2000 because of that limit, but it is what PKCS #5 v1.5
+// encryption (pbeWithMD5AndDES-CBC, pbeWithSHA1AndDES-CBC) uses, so old
+// PKCS #8 private-key files and Java keystores need it to be read. The
+// salt is 8 bytes in those schemes; any length is accepted.
+//
+// Checked against OpenSSL's PBKDF1.
+
+type Pbkdf1Error =
+    | Pbkdf1TooLong(length: i64)
+    | Pbkdf1BadIterations(count: i64)
+
+pub fn derive(hash: fn(bytes) -> bytes, password: bytes, salt: bytes, iterations: i64, length: i64) -> bytes ! Pbkdf1Error {
+    if iterations < 1 {
+        fail(Pbkdf1BadIterations(iterations))
+    }
+    var t = hash(password.concat(salt))
+    if length > t.len() {
+        fail(Pbkdf1TooLong(length))
+    }
+    for _i in 1..iterations {
+        t = hash(t)
+    }
+    return t.slice(0, length)
+}

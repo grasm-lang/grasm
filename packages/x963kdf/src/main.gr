@@ -1,0 +1,30 @@
+// The ANSI X9.63 key derivation function (SEC 1 section 3.6.1).
+//
+// Hash of the shared secret, a 32-bit big-endian counter starting at 1,
+// and optional shared information, repeated until enough key exists. It
+// turns an elliptic-curve Diffie-Hellman result into keys for ECIES (SEC
+// 1), for Apple's iMessage and CryptoKit ECIES and for ICAO e-passports,
+// and is the concatenation KDF of X9.42 and of CMS ECDH (RFC 5753, which
+// calls the same construction its "ECC-CMS-SharedInfo" KDF).
+//
+// The hash is a parameter; the output is limited to (2^32 - 1) hash
+// lengths, which is never reached in practice and is refused here.
+//
+// Checked against OpenSSL's X963KDF.
+
+type X963Error =
+    | X963TooLong
+
+pub fn derive(hash: fn(bytes) -> bytes, secret: bytes, shared_info: bytes, length: i64) -> bytes ! X963Error {
+    var out: [i64] = []
+    var counter = 1
+    while out.len() < length {
+        if counter > 4294967295 {
+            fail(X963TooLong)
+        }
+        let c = [counter.ushr(24).bit_and(255), counter.ushr(16).bit_and(255), counter.ushr(8).bit_and(255), counter.bit_and(255)]
+        out = out + hash(secret.concat(bytes_of(c)).concat(shared_info)).to_list()
+        counter = counter + 1
+    }
+    return bytes_of(out.slice(0, length))
+}

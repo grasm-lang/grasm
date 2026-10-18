@@ -1,0 +1,38 @@
+// SSH's key derivation, RFC 4253 section 7.2.
+//
+// After key exchange both sides hold the shared secret K and the exchange
+// hash H; each of the six keys -- the IVs, the encryption keys and the MAC
+// keys, for each direction -- is the hash of K, H, a letter from 'A' to
+// 'F' and the session identifier, extended when longer key is needed by
+// hashing K, H and everything produced so far. Every SSH implementation
+// derives its keys this way, whatever the key exchange.
+//
+// K is hashed as an SSH mpint: a 32-bit length, then the number's
+// big-endian bytes with a zero in front if the top bit is set. `mpint`
+// writes one; `derive` takes K already written, as the exchange produces
+// it.
+//
+// Checked against OpenSSL's SSHKDF.
+
+/// A non-negative number, given as its big-endian magnitude, as an SSH
+/// mpint.
+pub fn mpint(magnitude: bytes) -> bytes {
+    var v = magnitude.to_list()
+    while v.len() > 0 and v[0] == 0 {
+        v = v.slice(1, v.len())
+    }
+    if v.len() > 0 and v[0] >= 128 {
+        v = [0] + v
+    }
+    let n = v.len()
+    return bytes_of([n.ushr(24).bit_and(255), n.ushr(16).bit_and(255), n.ushr(8).bit_and(255), n.bit_and(255)] + v)
+}
+
+/// `length` bytes of the key named by `letter` (65 to 70, 'A' to 'F').
+pub fn derive(hash: fn(bytes) -> bytes, k: bytes, h: bytes, letter: i64, session_id: bytes, length: i64) -> bytes {
+    var out = hash(k.concat(h).concat(bytes_of([letter])).concat(session_id)).to_list()
+    while out.len() < length {
+        out = out + hash(k.concat(h).concat(bytes_of(out))).to_list()
+    }
+    return bytes_of(out.slice(0, length))
+}

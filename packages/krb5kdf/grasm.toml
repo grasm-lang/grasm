@@ -1,0 +1,12 @@
+[package]
+name = "krb5kdf"
+version = "1.0.0"
+capabilities = []
+
+[dependencies.aes]
+path = "../aes"
+version = "^1.0.0"
+
+[dependencies.des]
+path = "../des"
+version = "^1.0.0"

@@ -1,0 +1,4 @@
+[package]
+name = "ripemd160"
+version = "1.0.0"
+capabilities = []

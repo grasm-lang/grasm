@@ -1,0 +1,55 @@
+// MDC-2, the double-length hash built from DES (ISO/IEC 10118-2, the
+// Meyer-Schilling construction).
+//
+// Two DES encryptions per 8-byte block, each keyed by one half of a
+// 128-bit chaining value, run in Matyas-Meyer-Oseas mode and then
+// crossed: the left halves of the two results and their right halves
+// swap, so the two lines cannot be attacked separately. Two bits of each
+// key byte are fixed first (0x40 and 0x20 set in the first byte) so the
+// keys are never weak or equal.
+//
+// It is here for what still names it: old IBM and banking systems, some
+// smart-card and EMV-era formats, and X.509 certificates signed with
+// mdc2WithRSA. The message is padded with zeros to a whole block and no
+// length is appended (OpenSSL's padding type 1), so messages that differ
+// only in trailing zeros collide; nothing new should use it.
+//
+// Checked against OpenSSL's MDC2.
+import des
+
+fn crossed(m: bytes, d: bytes, dd: bytes, left_from_d: bool) -> bytes {
+    var out: [i64] = []
+    for i in 0..8 {
+        let first = i < 4
+        let src = if first == left_from_d { d } else { dd }
+        out.push(m.at(i).bit_xor(src.at(i)))
+    }
+    return bytes_of(out)
+}
+
+fn key_with(h: bytes, bits: i64) -> bytes {
+    var k = h.to_list()
+    k[0] = k[0].bit_and(159).bit_or(bits)
+    return bytes_of(k)
+}
+
+pub fn hash(message: bytes) -> bytes {
+    var h = bytes_filled(8, 82)
+    var hh = bytes_filled(8, 37)
+    var data = message.to_list()
+    while data.len() % 8 != 0 {
+        data.push(0)
+    }
+    var at = 0
+    while at < data.len() {
+        let m = bytes_of(data.slice(at, at + 8))
+        let c1 = des.new_cipher(key_with(h, 64)) ?? panic("an 8-byte key")
+        let c2 = des.new_cipher(key_with(hh, 32)) ?? panic("an 8-byte key")
+        let d = des.encrypt_block(c1, m) ?? panic("an 8-byte block")
+        let dd = des.encrypt_block(c2, m) ?? panic("an 8-byte block")
+        h = crossed(m, d, dd, true)
+        hh = crossed(m, d, dd, false)
+        at = at + 8
+    }
+    return h.concat(hh)
+}

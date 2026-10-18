@@ -1,0 +1,80 @@
+// Four hashes, HMAC over any of them, and the key derivations of TPM,
+// ECIES, TLS 1.2, SSH, NIST's one-step KDF, CMS, PKCS#12, Kerberos and
+// PKCS #5 v1.5. scripts/b34_diff.sh holds them to OpenSSL.
+import ripemd160
+import whirlpool
+import sm3
+import mdc2
+import hmac
+import kbkdf
+import x963kdf
+import tls12prf
+import sshkdf
+import sskdf
+import x942kdf
+import pkcs12kdf
+import krb5kdf
+import pbkdf1
+import crypto_hash
+import cmac
+import aes
+
+fn filled(n: i64, v: i64) -> bytes {
+    var out: [i64] = []
+    while out.len() < n {
+        out.push(v)
+    }
+    bytes_of(out)
+}
+
+fn main() / {io} {
+    let none = bytes_of([])
+    let sha256 = |x| crypto_hash.sha256_of(x)
+    let msg = "abc".to_bytes()
+    assert_eq(ripemd160.hash(msg).len(), 20)
+    assert_eq(whirlpool.hash(msg).len(), 64)
+    assert_eq(sm3.hash(msg).len(), 32)
+    assert_eq(mdc2.hash(msg).len(), 16)
+    // HMAC-SM3 and HMAC-SHA-256 from the same function.
+    let tag = hmac.hmac(|x| sm3.hash(x), 64, "key".to_bytes(), msg)
+    assert_eq(hmac.verify(|x| sm3.hash(x), 64, "key".to_bytes(), msg, tag), true)
+    assert_eq(hmac.hmac(sha256, 64, "key".to_bytes(), msg), crypto_hash.hmac_sha256("key".to_bytes(), msg))
+
+    // A TPM-style KDFa key, and a CMAC-based one, from SP 800-108.
+    let seed = filled(32, 1)
+    let k1 = kbkdf.derive(|m| hmac.hmac(sha256, 64, seed, m), KbkdfCounter, "STORAGE".to_bytes(), "obj".to_bytes(), none, 16,
+        kbkdf.options()) ?? none
+    assert_eq(k1.len(), 16)
+    let c = aes.new_cipher(filled(16, 2))
+    let k2 = kbkdf.derive(|m| cmac.cmac_with(16, |b| aes.encrypt_with(c, b), m), KbkdfFeedback, "label".to_bytes(),
+        none, filled(16, 3), 32, kbkdf.options()) ?? none
+    assert_eq(k2.len(), 32)
+
+    // ECDH result to keys, four ways.
+    let z = filled(32, 4)
+    assert_eq((x963kdf.derive(sha256, z, "ecies".to_bytes(), 48) ?? none).len(), 48)
+    assert_eq((sskdf.hash_derive(sha256, z, "jose".to_bytes(), 32) ?? none).len(), 32)
+    assert_eq(x942kdf.derive(sha256, z, X942Aes128Wrap, x942kdf.info(), 16).len(), 16)
+    let master = tls12prf.prf(|k, m| hmac.hmac(sha256, 64, k, m), z, "master secret".to_bytes(), filled(64, 5), 48)
+    assert_eq(master.len(), 48)
+
+    // SSH's six keys differ by letter.
+    let kk = sshkdf.mpint(filled(32, 200))
+    let iv_c2s = sshkdf.derive(sha256, kk, filled(32, 6), 65, filled(32, 7), 16)
+    let iv_s2c = sshkdf.derive(sha256, kk, filled(32, 6), 66, filled(32, 7), 16)
+    assert_eq(iv_c2s == iv_s2c, false)
+
+    // Passwords: PKCS#12 and PKCS #5 v1.5.
+    let pw = pkcs12kdf.bmp_password("secret")
+    assert_eq(pw.len(), 14)
+    let key = pkcs12kdf.derive(|x| crypto_hash.sha256_of(x), 64, pw, filled(8, 8), 1, 100, 32) ?? none
+    assert_eq(key.len(), 32)
+    assert_eq((pbkdf1.derive(sha256, "pw".to_bytes(), filled(8, 9), 100, 16) ?? none).len(), 16)
+    assert_eq((pbkdf1.derive(sha256, "pw".to_bytes(), filled(8, 9), 100, 33) ?? none).len(), 0)
+
+    // A Kerberos key-usage key, and RFC 3961's n-fold example.
+    let ke = krb5kdf.derive(Krb5Aes128, filled(16, 10), bytes_of([0, 0, 0, 2, 170])) ?? none
+    assert_eq(ke.len(), 16)
+    assert_eq(krb5kdf.nfold("012345".to_bytes(), 8), bytes_of([190, 7, 38, 49, 39, 107, 25, 85]))
+    print("b34: ok")
+}

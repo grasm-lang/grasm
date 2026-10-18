@@ -256,6 +256,26 @@ day its reference is installed.
 
 ## Landed
 
+- [x] **B34: hashes, HMAC and key derivation** — B8's `ripemd160`
+  `whirlpool` `sm3`, B10's `kbkdf` `x963kdf` `tls12prf` `sshkdf`, and
+  `mdc2` `hmac` `sskdf` `x942kdf` `pkcs12kdf` `krb5kdf` `pbkdf1`, which
+  were not on the list, with the harness `b34test`; the new gate
+  `b34diff` runs 5,020 cases against OpenSSL 3.6's libcrypto: the four
+  hashes around every block and padding boundary, HMAC over thirteen
+  hashes with keys either side of each block size, and every KDF with
+  every option varied (OpenSSL ignores a parameter name it does not know,
+  so an ignored one shows up as disagreement). RIPEMD-160's tables come
+  from x/crypto; Whirlpool's S-box is found in libcrypto, where OpenSSL
+  stores each round-table entry in all eight rotations 64 bytes apart,
+  and kept only because a model built on it hashes as OpenSSL does. Four
+  OpenSSL behaviours were checked rather than copied: a KBKDF feedback IV
+  must be empty or one PRF output long (as SP 800-108 defines K(0)), and
+  `kbkdf` refuses other lengths; Kerberos constants longer than the block
+  are refused there and here, RFC 3961 defining only shorter ones; an
+  empty TLS PRF seed and an empty PKCS#12 salt and password together are
+  refused by OpenSSL alone and kept out of the corpus. One break per
+  package turned it red.
+
 - [x] **B33: block ciphers** — B8's `camellia` `aria` `sm4` `seed`
   `blowfish` `cast5` `idea` `rc2`, with `blockmodes` (ECB, CBC, CFB, CFB8,
   OFB, CTR and PKCS#7 over any block function), which was not on the
@@ -613,7 +633,7 @@ day its reference is installed.
 | | |
 |---|---|
 | At the start | 669 |
-| Now | 863 |
+| Now | 878 |
 | Candidates above | 316 packages in 28 batches, plus `ecc`, `rfc6979` and `goprintf` |
 | Harnesses, one a batch | 28 |
 | If every candidate lands | 1016 |

@@ -1,0 +1,86 @@
+// Key derivation in counter and feedback modes, NIST SP 800-108.
+//
+// A pseudorandom function keyed with the key-derivation key is run over a
+// counter, a label naming the purpose, a zero byte, a context binding the
+// parties and session, and the output length in bits; the blocks are
+// concatenated until enough key exists. Feedback mode also feeds each
+// block (starting from an IV) into the next. Because the label, context
+// and length are all inside the PRF, keys for different purposes or of
+// different lengths are unrelated.
+//
+// SP 800-108 is how TPM 2.0 derives every key (KDFa is counter mode with
+// HMAC), how SMB 3 derives its signing and encryption keys, how Kerberos'
+// RFC 8009 enctypes and IKEv2 under some profiles derive theirs, and how
+// smart-card and HSM key diversification works with CMAC.
+//
+// The PRF is a function of the message only, already keyed by the caller:
+// HMAC from `hmac` or CMAC from `cmac`, partially applied to the key. The
+// counter width (8, 16, 24 or 32 bits) and whether the length field and
+// the zero separator are present are options, because the protocols
+// above disagree about them.
+//
+// Checked against OpenSSL's KBKDF with HMAC and CMAC.
+
+type KbkdfMode =
+    | KbkdfCounter
+    | KbkdfFeedback
+
+type KbkdfOptions = { counter_bits: i64, use_length: bool, use_separator: bool }
+
+type KbkdfError =
+    | KbkdfBadCounter(bits: i64)
+    | KbkdfBadIv(length: i64)
+    | KbkdfTooLong
+
+/// The usual framing: a 32-bit counter, the separator and the length.
+pub fn options() -> KbkdfOptions {
+    return KbkdfOptions{ counter_bits: 32, use_length: true, use_separator: true }
+}
+
+fn be(v: i64, n: i64) -> [i64] {
+    var out: [i64] = []
+    var i = n - 1
+    while i >= 0 {
+        out.push(v.ushr(8 * i).bit_and(255))
+        i = i - 1
+    }
+    return out
+}
+
+/// `length` bytes of key. `iv` is used in feedback mode only: empty, or as
+/// long as one PRF output (K(0) in SP 800-108).
+pub fn derive(prf: fn(bytes) -> bytes, mode: KbkdfMode, label: bytes, context: bytes, iv: bytes, length: i64,
+    o: KbkdfOptions) -> bytes ! KbkdfError {
+    let r = o.counter_bits
+    if r != 8 and r != 16 and r != 24 and r != 32 {
+        fail(KbkdfBadCounter(r))
+    }
+    let feedback = match mode {
+        KbkdfFeedback -> true
+        KbkdfCounter -> false
+    }
+    if feedback and iv.len() > 0 and iv.len() != prf(bytes_of([])).len() {
+        fail(KbkdfBadIv(iv.len()))
+    }
+    var tail = label.to_list()
+    if o.use_separator {
+        tail.push(0)
+    }
+    tail = tail + context.to_list()
+    if o.use_length {
+        tail = tail + be(length * 8, 4)
+    }
+    var out: [i64] = []
+    var previous = iv
+    var i = 1
+    while out.len() < length {
+        if i >= 1.shl(r) {
+            fail(KbkdfTooLong)
+        }
+        let input = (if feedback { previous.to_list() } else { [] }) + be(i, r / 8) + tail
+        previous = prf(bytes_of(input))
+        out = out + previous.to_list()
+        i = i + 1
+    }
+    return bytes_of(out.slice(0, length))
+}

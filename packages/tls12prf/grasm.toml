@@ -1,0 +1,16 @@
+[package]
+name = "tls12prf"
+version = "1.0.0"
+capabilities = []
+
+[dependencies.hmac]
+path = "../hmac"
+version = "^1.0.0"
+
+[dependencies.md5]
+path = "../md5"
+version = "^1.0.0"
+
+[dependencies.sha1]
+path = "../sha1"
+version = "^1.0.0"

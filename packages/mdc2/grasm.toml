@@ -1,0 +1,8 @@
+[package]
+name = "mdc2"
+version = "1.0.0"
+capabilities = []
+
+[dependencies.des]
+path = "../des"
+version = "^1.0.0"
