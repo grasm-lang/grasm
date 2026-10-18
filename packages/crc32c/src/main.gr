@@ -1,0 +1,76 @@
+// CRC-32C: the Castagnoli polynomial, the checksum newer formats chose.
+//
+// `packages/crc32` is the IEEE polynomial of Ethernet, zip and PNG. When
+// iSCSI, SCTP and later ext4, Btrfs, Kafka's record batches, gRPC's
+// compressors and the Snappy and S2 framing formats needed a 32-bit check
+// they took Castagnoli's instead (0x1EDC6F41, reflected 0x82F63B78): it
+// detects more error patterns at the lengths those formats carry, and
+// x86 and ARM grew instructions for it.
+//
+// Snappy's framing does not store the CRC as is: it stores it rotated
+// right by 15 bits and offset by 0xA282EAD8, so that a checksum of data
+// that itself contains checksums does not degenerate. `masked` and
+// `unmasked` do that.
+//
+// Checked against Go's hash/crc32 with the Castagnoli table.
+
+fn mask32(v: i64) -> i64 {
+    return v.bit_and(4294967295)
+}
+
+/// The 256-entry table for the reflected polynomial 0x82F63B78.
+pub fn table() -> [i64] {
+    var t: [i64] = []
+    var i = 0
+    while i < 256 {
+        var c = i
+        var k = 0
+        while k < 8 {
+            c = if c.bit_and(1) == 1 { c.ushr(1).bit_xor(2197175160) } else { c.ushr(1) }
+            k = k + 1
+        }
+        t.push(c)
+        i = i + 1
+    }
+    return t
+}
+
+let TABLE: [i64] = table()
+
+/// A running checksum's starting value.
+pub fn start() -> i64 {
+    return 4294967295
+}
+
+/// More bytes into a running checksum.
+pub fn update(running: i64, data: bytes) -> i64 {
+    var c = running
+    var i = 0
+    while i < data.len() {
+        c = TABLE[c.bit_xor(data.at(i)).bit_and(255)].bit_xor(c.ushr(8))
+        i = i + 1
+    }
+    return c
+}
+
+/// A running checksum's final value.
+pub fn finish(running: i64) -> i64 {
+    return mask32(running.bit_xor(4294967295))
+}
+
+/// The CRC-32C of some bytes.
+pub fn of(data: bytes) -> i64 {
+    return finish(update(start(), data))
+}
+
+/// A CRC as the Snappy framing format stores it.
+pub fn masked(crc: i64) -> i64 {
+    let rotated = mask32(crc.ushr(15).bit_or(crc.shl(17)))
+    return mask32(rotated + 2726488792)
+}
+
+/// A stored, masked CRC back to the CRC.
+pub fn unmasked(stored: i64) -> i64 {
+    let rotated = mask32(stored - 2726488792)
+    return mask32(rotated.ushr(17).bit_or(rotated.shl(15)))
+}

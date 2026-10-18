@@ -1,0 +1,127 @@
+// NAT-PMP (RFC 6886): asking the home router for a port.
+//
+// A peer-to-peer program behind a home router cannot be reached until the
+// router forwards a port to it. NAT-PMP, which Apple's AirPort routers
+// introduced and which most consumer routers, Tailscale, BitTorrent clients
+// and Syncthing still speak, is the simplest way to ask: two bytes to learn
+// the router's public address, twelve to ask for a mapping, sent to the
+// gateway on UDP port 5351. The answers carry a result code and the
+// router's seconds since its epoch, which drops when the router restarts
+// and its mappings are gone.
+//
+// This builds the requests and reads the answers; sending them is the
+// caller's (the router answers on the same port, and RFC 6886 says to
+// retry at 250 ms, doubling, nine times). An answer is accepted only if it
+// is exactly the size its type defines, version 0, and the request's
+// opcode with the top bit set, and a non-zero result code is reported as
+// what it means.
+//
+// Checked against `github.com/jackpal/go-nat-pmp`, whose client sends to a
+// responder on the loopback interface that answers with each case's bytes.
+
+type NatPmpError =
+    | NatPmpSize(have: i64, want: i64)
+    | NatPmpVersion(version: i64)
+    | NatPmpOpcode(have: i64, want: i64)
+    | NatPmpRefused(code: i64, meaning: str)
+    | NatPmpProtocol(name: str)
+
+type NatPmpExternal = { epoch: i64, address: str }
+
+type NatPmpMapping = { epoch: i64, internal_port: i64, external_port: i64, lifetime: i64 }
+
+/// The port a gateway listens on.
+pub fn port() -> i64 {
+    return 5351
+}
+
+/// What a result code means.
+pub fn result_name(code: i64) -> str {
+    let names = ["success", "unsupported version", "not authorized or refused", "network failure", "out of resources",
+        "unsupported opcode"]
+    return if code >= 0 and code < names.len() { names[code] } else { "result code {code}" }
+}
+
+fn be(data: bytes, at: i64, n: i64) -> i64 {
+    var v = 0
+    var i = 0
+    while i < n {
+        v = v * 256 + data.at(at + i)
+        i = i + 1
+    }
+    return v
+}
+
+fn put(out: [i64], v: i64, n: i64) -> [i64] {
+    var o = out
+    var i = n - 1
+    while i >= 0 {
+        o.push(v.ushr(8 * i).bit_and(255))
+        i = i - 1
+    }
+    return o
+}
+
+/// The request for the gateway's external address.
+pub fn external_address_request() -> bytes {
+    return bytes_of([0, 0])
+}
+
+fn opcode(protocol: str) -> i64 ! NatPmpError {
+    if protocol == "udp" {
+        return 1
+    }
+    if protocol == "tcp" {
+        return 2
+    }
+    fail(NatPmpProtocol(protocol))
+}
+
+/// A request to map a port: `udp` or `tcp`, the internal port, the
+/// external port wanted (0 for any), and the lifetime in seconds (0 to
+/// delete the mapping).
+pub fn mapping_request(protocol: str, internal_port: i64, external_port: i64, lifetime: i64) -> bytes ! NatPmpError {
+    let op = try opcode(protocol)
+    return bytes_of(put(put(put([0, op, 0, 0], internal_port, 2), external_port, 2), lifetime, 4))
+}
+
+fn check(answer: bytes, size: i64, op: i64) -> () ! NatPmpError {
+    if answer.len() != size {
+        fail(NatPmpSize(answer.len(), size))
+    }
+    if answer.at(0) != 0 {
+        fail(NatPmpVersion(answer.at(0)))
+    }
+    if answer.at(1) != op + 128 {
+        fail(NatPmpOpcode(answer.at(1), op + 128))
+    }
+    let code = be(answer, 2, 2)
+    if code != 0 {
+        fail(NatPmpRefused(code, result_name(code)))
+    }
+}
+
+/// The gateway's answer to an external address request.
+pub fn decode_external(answer: bytes) -> NatPmpExternal ! NatPmpError {
+    try check(answer, 12, 0)
+    return NatPmpExternal{ epoch: be(answer, 4, 4),
+        address: "{answer.at(8)}.{answer.at(9)}.{answer.at(10)}.{answer.at(11)}" }
+}
+
+/// The gateway's answer to a mapping request for `udp` or `tcp`.
+pub fn decode_mapping(answer: bytes, protocol: str) -> NatPmpMapping ! NatPmpError {
+    try check(answer, 16, try opcode(protocol))
+    return NatPmpMapping{ epoch: be(answer, 4, 4), internal_port: be(answer, 8, 2), external_port: be(answer, 10, 2),
+        lifetime: be(answer, 12, 4) }
+}
+
+/// The gateway's answer to the request it answers, with the request: the
+/// opcode in the request decides which answer is expected.
+pub fn decode_answer(request: bytes, answer: bytes) -> str ! NatPmpError {
+    if request.len() >= 2 and request.at(1) == 0 {
+        let e = try decode_external(answer)
+        return "epoch={e.epoch};ip=" + e.address
+    }
+    let m = try decode_mapping(answer, if request.len() >= 2 and request.at(1) == 2 { "tcp" } else { "udp" })
+    return "epoch={m.epoch};in={m.internal_port};out={m.external_port};life={m.lifetime}"
+}

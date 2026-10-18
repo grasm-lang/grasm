@@ -1,0 +1,664 @@
+// Canonical XML: one byte sequence for every way of writing the same
+// document.
+//
+// An XML signature (SAML assertions, SOAP's WS-Security, ebXML, the
+// Office and OpenDocument signature parts, Apple's plists in some signed
+// bundles) is computed over bytes, but XML lets the same document be
+// written many ways: attribute order, quote style, `<a/>` or `<a></a>`,
+// CDATA or escapes, character references, redundant namespace
+// declarations, the XML declaration, the DOCTYPE. Canonicalization fixes
+// all of them so a signer and a verifier hash the same thing:
+//
+// - the XML declaration and DOCTYPE go; line ends become LF;
+// - CDATA sections and character references become plain characters, and
+//   only `&`, `<`, `>` and CR are escaped in text; in attribute values `&`,
+//   `<`, `"`, tab, LF and CR;
+// - attributes are written with double quotes, sorted by namespace URI and
+//   then local name; namespace declarations come first, sorted by prefix;
+// - empty elements are written as a start tag and an end tag;
+// - processing instructions and comments outside the document element are
+//   separated from it by a line feed.
+//
+// Inclusive canonicalization (Canonical XML 1.0) keeps a namespace
+// declaration wherever its value differs from the one in scope at the
+// parent. Exclusive canonicalization, which SAML and WS-Security use so a
+// signed fragment survives being moved into another document, writes a
+// declaration only on an element that uses the prefix (in its own name or
+// an attribute's) and where no ancestor already wrote it.
+//
+// Canonical XML fails on a namespace name that is a relative URI, and so
+// does this, along with one that is not a URI at all (libxml2 refuses
+// those too). One difference from libxml2 is deliberate: the
+// specification writes a namespace declaration like an attribute, so an
+// `&` in a namespace URI comes out as `&amp;`, where libxml2 writes it
+// bare.
+//
+// This canonicalizes whole documents, with or without comments. It reads
+// UTF-8 XML 1.0 with namespaces; a DOCTYPE is skipped, so documents that
+// rely on entities or default attributes declared there are refused or
+// differ. Document subsets (the XPath node-sets of enveloped signatures)
+// are the caller's to cut out before calling.
+//
+// Checked against libxml2's `xmllint --c14n` and `--exc-c14n`.
+
+type C14nError =
+    | C14nSyntax(at: i64, why: str)
+    | C14nNamespace(at: i64, prefix: str)
+
+/// A parsed node: elements keep their attributes as written (namespace
+/// declarations included) and their children.
+type C14nNode =
+    | C14nElement(name: str, attrs: [(str, str)], kids: [ref C14nNode])
+    | C14nText(text: str)
+    | C14nComment(text: str)
+    | C14nPi(target: str, data: str)
+
+let XML_NS = "http://www.w3.org/XML/1998/namespace"
+
+// --- Parsing -----------------------------------------------------------------
+
+type C14nParser = { s: str, at: i64 }
+
+fn starts(p: C14nParser, w: str) -> bool {
+    return p.s.len() - p.at >= w.len() and p.s.substr(p.at, w.len()) == w
+}
+
+fn is_space(c: i64) -> bool {
+    return c == 32 or c == 9 or c == 10 or c == 13
+}
+
+fn is_name_start(c: i64) -> bool {
+    return c >= 65 and c <= 90 or c >= 97 and c <= 122 or c == 95 or c == 58 or c >= 192 and c != 215 and c != 247
+}
+
+fn is_name_char(c: i64) -> bool {
+    return is_name_start(c) or c >= 48 and c <= 57 or c == 45 or c == 46 or c == 183
+}
+
+/// Whether a character may appear in an XML 1.0 document at all.
+fn is_char(c: i64) -> bool {
+    return c == 9 or c == 10 or c == 13 or c >= 32 and c <= 55295 or c >= 57344 and c <= 65533 or c >= 65536 and c <= 1114111
+}
+
+fn skip_space(inout p: C14nParser) {
+    while p.at < p.s.len() and is_space(p.s.code_at(p.at)) {
+        p.at = p.at + 1
+    }
+}
+
+fn name(inout p: C14nParser) -> str ! C14nError {
+    let start = p.at
+    if p.at >= p.s.len() or not is_name_start(p.s.code_at(p.at)) {
+        fail(C14nSyntax(p.at, "a name was expected"))
+    }
+    while p.at < p.s.len() and is_name_char(p.s.code_at(p.at)) {
+        p.at = p.at + 1
+    }
+    return p.s.substr(start, p.at - start)
+}
+
+fn find(p: C14nParser, w: str) -> i64 {
+    let rest = p.s.substr(p.at, p.s.len() - p.at)
+    let i = rest.index_of(w) ?? -1
+    return if i < 0 { 0 - 1 } else { p.at + i }
+}
+
+/// A reference after `&`: the character it stands for.
+fn reference(inout p: C14nParser) -> str ! C14nError {
+    let semi = find(p, ";")
+    if semi < 0 {
+        fail(C14nSyntax(p.at, "an unterminated reference"))
+    }
+    let body = p.s.substr(p.at + 1, semi - p.at - 1)
+    p.at = semi + 1
+    if body == "lt" {
+        return "<"
+    }
+    if body == "gt" {
+        return ">"
+    }
+    if body == "amp" {
+        return "&"
+    }
+    if body == "apos" {
+        return "'"
+    }
+    if body == "quot" {
+        return "\""
+    }
+    var code = 0 - 1
+    if body.starts_with("#x") and body.len() > 2 {
+        code = body.substr(2, body.len() - 2).parse_int_base(16) ?? -1
+        for c in body.substr(2, body.len() - 2).codes() {
+            if not (c >= 48 and c <= 57 or c >= 97 and c <= 102 or c >= 65 and c <= 70) {
+                code = 0 - 1
+            }
+        }
+    } else if body.starts_with("#") and body.len() > 1 {
+        code = body.substr(1, body.len() - 1).parse_int() ?? -1
+        for c in body.substr(1, body.len() - 1).codes() {
+            if c < 48 or c > 57 {
+                code = 0 - 1
+            }
+        }
+    } else {
+        fail(C14nSyntax(p.at, "an entity that is not declared: &" + body + ";"))
+    }
+    if code < 0 or not is_char(code) {
+        fail(C14nSyntax(p.at, "a character reference to a character XML does not allow"))
+    }
+    return code.to_char()
+}
+
+fn attribute_value(inout p: C14nParser) -> str ! C14nError {
+    if p.at >= p.s.len() {
+        fail(C14nSyntax(p.at, "an attribute value was expected"))
+    }
+    let q = p.s.code_at(p.at)
+    if q != 34 and q != 39 {
+        fail(C14nSyntax(p.at, "an attribute value must be quoted"))
+    }
+    p.at = p.at + 1
+    var out = ""
+    while true {
+        if p.at >= p.s.len() {
+            fail(C14nSyntax(p.at, "an unterminated attribute value"))
+        }
+        let c = p.s.code_at(p.at)
+        if c == q {
+            p.at = p.at + 1
+            return out
+        }
+        if c == 60 {
+            fail(C14nSyntax(p.at, "a < in an attribute value"))
+        }
+        if c == 38 {
+            out = out + try reference(p)
+            continue
+        }
+        // Attribute-value normalization: a literal tab or line end is a space.
+        out = out + if c == 9 or c == 10 or c == 13 { " " } else { p.s.substr(p.at, 1) }
+        p.at = p.at + 1
+    }
+    return out
+}
+
+fn comment(inout p: C14nParser) -> str ! C14nError {
+    p.at = p.at + 4
+    let end = find(p, "--")
+    if end < 0 {
+        fail(C14nSyntax(p.at, "an unterminated comment"))
+    }
+    if end + 2 >= p.s.len() or p.s.code_at(end + 2) != 62 {
+        fail(C14nSyntax(end, "-- inside a comment"))
+    }
+    let text = p.s.substr(p.at, end - p.at)
+    p.at = end + 3
+    return text
+}
+
+fn pi(inout p: C14nParser) -> (str, str) ! C14nError {
+    p.at = p.at + 2
+    let target = try name(p)
+    if target.to_lower() == "xml" {
+        fail(C14nSyntax(p.at, "a processing instruction named xml"))
+    }
+    let end = find(p, "?>")
+    if end < 0 {
+        fail(C14nSyntax(p.at, "an unterminated processing instruction"))
+    }
+    if p.at < end and not is_space(p.s.code_at(p.at)) {
+        fail(C14nSyntax(p.at, "a processing instruction target runs into its data"))
+    }
+    skip_space(p)
+    let data = if p.at < end { p.s.substr(p.at, end - p.at) } else { "" }
+    p.at = end + 2
+    return (target, data)
+}
+
+fn element(inout p: C14nParser, depth: i64) -> ref C14nNode ! C14nError {
+    if depth > 512 {
+        fail(C14nSyntax(p.at, "nesting deeper than 512"))
+    }
+    p.at = p.at + 1
+    let tag = try name(p)
+    var attrs: [(str, str)] = []
+    var seen: Map[str, bool] = {}
+    while true {
+        let before = p.at
+        skip_space(p)
+        if starts(p, "/>") {
+            p.at = p.at + 2
+            return ref(C14nElement(tag, attrs, []))
+        }
+        if starts(p, ">") {
+            p.at = p.at + 1
+            break
+        }
+        if p.at == before {
+            fail(C14nSyntax(p.at, "attributes must be separated by white space"))
+        }
+        let key = try name(p)
+        skip_space(p)
+        if not starts(p, "=") {
+            fail(C14nSyntax(p.at, "an attribute without a value"))
+        }
+        p.at = p.at + 1
+        skip_space(p)
+        let value = try attribute_value(p)
+        if seen.has(key) {
+            fail(C14nSyntax(p.at, "a repeated attribute: " + key))
+        }
+        seen.set(key, true)
+        attrs.push((key, value))
+    }
+    let kids = try content(p, depth)
+    if not starts(p, "</") {
+        fail(C14nSyntax(p.at, "a missing end tag for " + tag))
+    }
+    p.at = p.at + 2
+    let closing = try name(p)
+    skip_space(p)
+    if closing != tag or not starts(p, ">") {
+        fail(C14nSyntax(p.at, "an end tag that does not match " + tag))
+    }
+    p.at = p.at + 1
+    return ref(C14nElement(tag, attrs, kids))
+}
+
+fn content(inout p: C14nParser, depth: i64) -> [ref C14nNode] ! C14nError {
+    var kids: [ref C14nNode] = []
+    var text = ""
+    while true {
+        if p.at >= p.s.len() {
+            fail(C14nSyntax(p.at, "the document ends inside an element"))
+        }
+        if starts(p, "</") {
+            break
+        }
+        let c = p.s.code_at(p.at)
+        if c == 60 {
+            if text.len() > 0 {
+                kids.push(ref(C14nText(text)))
+                text = ""
+            }
+            if starts(p, "<!--") {
+                kids.push(ref(C14nComment(try comment(p))))
+            } else if starts(p, "<![CDATA[") {
+                p.at = p.at + 9
+                let end = find(p, "]]>")
+                if end < 0 {
+                    fail(C14nSyntax(p.at, "an unterminated CDATA section"))
+                }
+                text = p.s.substr(p.at, end - p.at)
+                p.at = end + 3
+            } else if starts(p, "<?") {
+                let (t, d) = try pi(p)
+                kids.push(ref(C14nPi(t, d)))
+            } else {
+                kids.push(try element(p, depth + 1))
+            }
+            continue
+        }
+        if c == 38 {
+            text = text + try reference(p)
+            continue
+        }
+        if starts(p, "]]>") {
+            fail(C14nSyntax(p.at, "]]> in text"))
+        }
+        if not is_char(c) {
+            fail(C14nSyntax(p.at, "a character XML does not allow"))
+        }
+        text = text + p.s.substr(p.at, 1)
+        p.at = p.at + 1
+    }
+    if text.len() > 0 {
+        kids.push(ref(C14nText(text)))
+    }
+    return kids
+}
+
+fn skip_doctype(inout p: C14nParser) -> () ! C14nError {
+    p.at = p.at + 9
+    var depth = 0
+    while p.at < p.s.len() {
+        // A comment or a processing instruction in the internal subset may
+        // hold brackets and `>`.
+        if depth > 0 and starts(p, "<!--") {
+            let end = find(p, "-->")
+            if end < 0 {
+                fail(C14nSyntax(p.at, "an unterminated comment in the DOCTYPE"))
+            }
+            p.at = end + 3
+            continue
+        }
+        if depth > 0 and starts(p, "<?") {
+            let end = find(p, "?>")
+            if end < 0 {
+                fail(C14nSyntax(p.at, "an unterminated processing instruction in the DOCTYPE"))
+            }
+            p.at = end + 2
+            continue
+        }
+        let c = p.s.code_at(p.at)
+        if c == 34 or c == 39 {
+            let rest = p.s.substr(p.at + 1, p.s.len() - p.at - 1)
+            let close = rest.index_of(c.to_char()) ?? -1
+            if close < 0 {
+                fail(C14nSyntax(p.at, "an unterminated literal in the DOCTYPE"))
+            }
+            p.at = p.at + close + 2
+            continue
+        }
+        if c == 91 {
+            depth = depth + 1
+        } else if c == 93 {
+            depth = depth - 1
+        } else if c == 62 and depth == 0 {
+            p.at = p.at + 1
+            return
+        }
+        p.at = p.at + 1
+    }
+    fail(C14nSyntax(p.at, "an unterminated DOCTYPE"))
+}
+
+/// One pseudo-attribute of the XML declaration: `name`, `=`, and a quoted
+/// value, whose text is returned.
+fn pseudo(inout p: C14nParser, key: str) -> str ! C14nError {
+    if not starts(p, key) {
+        fail(C14nSyntax(p.at, "the XML declaration needs " + key))
+    }
+    p.at = p.at + key.len()
+    skip_space(p)
+    if not starts(p, "=") {
+        fail(C14nSyntax(p.at, "the XML declaration needs = after " + key))
+    }
+    p.at = p.at + 1
+    skip_space(p)
+    if p.at >= p.s.len() or p.s.code_at(p.at) != 34 and p.s.code_at(p.at) != 39 {
+        fail(C14nSyntax(p.at, "a quoted value in the XML declaration"))
+    }
+    let q = p.s.substr(p.at, 1)
+    let rest = p.s.substr(p.at + 1, p.s.len() - p.at - 1)
+    let close = rest.index_of(q) ?? -1
+    if close < 0 {
+        fail(C14nSyntax(p.at, "an unterminated value in the XML declaration"))
+    }
+    p.at = p.at + close + 2
+    return rest.substr(0, close)
+}
+
+/// `<?xml version="1.x" encoding="..." standalone="yes|no"?>`, in that
+/// order, the last two optional, nothing else.
+fn xml_declaration(inout p: C14nParser) -> () ! C14nError {
+    p.at = 5
+    skip_space(p)
+    let version = try pseudo(p, "version")
+    if not version.starts_with("1.") or version.len() < 3 or not version.substr(2, version.len() - 2).codes().all(|c| c >= 48 and c <= 57) {
+        fail(C14nSyntax(p.at, "a bad XML version"))
+    }
+    var spaced = p.at < p.s.len() and is_space(p.s.code_at(p.at))
+    skip_space(p)
+    if spaced and starts(p, "encoding") {
+        let enc = try pseudo(p, "encoding")
+        if enc.len() == 0 or not enc.codes().all(|c| c >= 65 and c <= 90 or c >= 97 and c <= 122 or c >= 48 and c <= 57 or c == 46 or c == 95 or c == 45) {
+            fail(C14nSyntax(p.at, "a bad encoding name"))
+        }
+        let first = enc.code_at(0)
+        if not (first >= 65 and first <= 90 or first >= 97 and first <= 122) {
+            fail(C14nSyntax(p.at, "a bad encoding name"))
+        }
+        spaced = p.at < p.s.len() and is_space(p.s.code_at(p.at))
+        skip_space(p)
+    }
+    if spaced and starts(p, "standalone") {
+        let sa = try pseudo(p, "standalone")
+        if sa != "yes" and sa != "no" {
+            fail(C14nSyntax(p.at, "standalone must be yes or no"))
+        }
+        skip_space(p)
+    }
+    if not starts(p, "?>") {
+        fail(C14nSyntax(p.at, "something else in the XML declaration"))
+    }
+    p.at = p.at + 2
+}
+
+/// The nodes before the document element, the element, and the nodes after.
+fn document(source: str) -> ([ref C14nNode], ref C14nNode, [ref C14nNode]) ! C14nError {
+    var s = source.replace("\r\n", "\n").replace("\r", "\n")
+    if s.starts_with("\u{FEFF}") {
+        s = s.substr(1, s.len() - 1)
+    }
+    var p = C14nParser{ s: s, at: 0 }
+    if starts(p, "<?xml") and p.s.len() > 5 and is_space(p.s.code_at(5)) {
+        try xml_declaration(p)
+    }
+    var before: [ref C14nNode] = []
+    var after: [ref C14nNode] = []
+    var root: Option[ref C14nNode] = None
+    var doctype = false
+    while true {
+        skip_space(p)
+        if p.at >= p.s.len() {
+            break
+        }
+        if starts(p, "<!--") {
+            let c = ref(C14nComment(try comment(p)))
+            if root == None { before.push(c) } else { after.push(c) }
+        } else if starts(p, "<?") {
+            let (t, d) = try pi(p)
+            let n = ref(C14nPi(t, d))
+            if root == None { before.push(n) } else { after.push(n) }
+        } else if starts(p, "<!DOCTYPE") and root == None and not doctype {
+            try skip_doctype(p)
+            doctype = true
+        } else if starts(p, "<") and root == None {
+            root = Some(try element(p, 0))
+        } else {
+            fail(C14nSyntax(p.at, "content outside the document element"))
+        }
+    }
+    return match root {
+        Some(r) -> (before, r, after)
+        None -> fail(C14nSyntax(0, "no document element"))
+    }
+}
+
+// --- Namespaces and output ---------------------------------------------------
+
+fn prefix_of(qname: str) -> str {
+    let i = qname.index_of(":") ?? -1
+    return if i < 0 { "" } else { qname.substr(0, i) }
+}
+
+fn local_of(qname: str) -> str {
+    let i = qname.index_of(":") ?? -1
+    return if i < 0 { qname } else { qname.substr(i + 1, qname.len() - i - 1) }
+}
+
+fn escape_text(s: str) -> str {
+    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\r", "&#xD;")
+}
+
+fn escape_attr(s: str) -> str {
+    return s.replace("&", "&amp;").replace("<", "&lt;").replace("\"", "&quot;").replace("\t", "&#x9;").replace("\n", "&#xA;")
+        .replace("\r", "&#xD;")
+}
+
+fn is_uri_char(c: i64) -> bool {
+    return c >= 65 and c <= 90 or c >= 97 and c <= 122 or c >= 48 and c <= 57 or "-._~:/?#[]@!$&'()*+,;=%".contains(c.to_char())
+}
+
+/// Whether a namespace name is an absolute URI: a scheme, a colon, and
+/// only the characters RFC 3986 allows, `%` followed by two hex digits.
+/// Canonical XML fails on a relative one, and libxml2 on an invalid one.
+fn is_absolute_uri(u: str) -> bool {
+    let colon = u.index_of(":") ?? -1
+    if colon < 1 or not (u.code_at(0) >= 65 and u.code_at(0) <= 90 or u.code_at(0) >= 97 and u.code_at(0) <= 122) {
+        return false
+    }
+    var i = 0
+    while i < colon {
+        let c = u.code_at(i)
+        if not (c >= 65 and c <= 90 or c >= 97 and c <= 122 or c >= 48 and c <= 57 or c == 43 or c == 45 or c == 46) {
+            return false
+        }
+        i = i + 1
+    }
+    i = 0
+    while i < u.len() {
+        let c = u.code_at(i)
+        if not is_uri_char(c) {
+            return false
+        }
+        if c == 37 {
+            if i + 2 >= u.len() or not is_hex(u.code_at(i + 1)) or not is_hex(u.code_at(i + 2)) {
+                return false
+            }
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn is_hex(c: i64) -> bool {
+    return c >= 48 and c <= 57 or c >= 65 and c <= 70 or c >= 97 and c <= 102
+}
+
+/// The namespace declarations an element makes, as (prefix, uri), the
+/// default namespace with prefix "".
+fn declarations(at: i64, attrs: [(str, str)]) -> [(str, str)] ! C14nError {
+    var out: [(str, str)] = []
+    for (key, value) in attrs {
+        if (key == "xmlns" or key.starts_with("xmlns:")) and value.len() > 0 and not is_absolute_uri(value) {
+            fail(C14nNamespace(at, value))
+        }
+        if key == "xmlns" {
+            out.push(("", value))
+        } else if key.starts_with("xmlns:") {
+            let p = key.substr(6, key.len() - 6)
+            if p == "xmlns" or p == "xml" and value != XML_NS or p != "xml" and value == XML_NS or value.len() == 0 {
+                fail(C14nNamespace(at, p))
+            }
+            out.push((p, value))
+        }
+    }
+    return out
+}
+
+fn uri_of(scope: Map[str, str], prefix: str, at: i64) -> str ! C14nError {
+    if prefix == "xml" {
+        return XML_NS
+    }
+    return match scope.get(prefix) {
+        Some(u) -> u
+        None -> if prefix == "" { "" } else { fail(C14nNamespace(at, prefix)) }
+    }
+}
+
+fn render(node: ref C14nNode, scope: Map[str, str], rendered: Map[str, str], exclusive: bool, comments: bool) -> str ! C14nError {
+    return match node {
+        C14nText(t) -> escape_text(t)
+        C14nComment(t) -> if comments { "<!--" + t + "-->" } else { "" }
+        C14nPi(target, data) -> "<?" + target + (if data.len() > 0 { " " + data } else { "" }) + "?>"
+        C14nElement(name, attrs, kids) -> {
+            var inner = scope
+            let decls = try declarations(0, attrs)
+            for (p, u) in decls {
+                inner.set(p, u)
+            }
+            // Resolve the element's and its attributes' prefixes now: an
+            // undeclared prefix is an error whether or not it is rendered.
+            let own_uri = try uri_of(inner, prefix_of(name), 0)
+            var plain: [(str, str, str, str)] = []
+            for (key, value) in attrs {
+                if key == "xmlns" or key.starts_with("xmlns:") {
+                    continue
+                }
+                let p = prefix_of(key)
+                let u = if p == "" { "" } else { try uri_of(inner, p, 0) }
+                plain.push((u, local_of(key), key, value))
+            }
+            var out_ns: [(str, str)] = []
+            var next = rendered
+            if exclusive {
+                var used: [str] = [prefix_of(name)]
+                for (_u, _l, key, _v) in plain {
+                    let p = prefix_of(key)
+                    if p != "" and p != "xml" and not used.contains(p) {
+                        used.push(p)
+                    }
+                }
+                for p in used {
+                    if p == "xml" {
+                        continue
+                    }
+                    let u = if p == "" { inner.get("") ?? "" } else { try uri_of(inner, p, 0) }
+                    let have = rendered.get(p) ?? ""
+                    if have != u {
+                        out_ns.push((p, u))
+                        next.set(p, u)
+                    }
+                }
+            } else {
+                for (p, u) in decls {
+                    if p == "xml" {
+                        continue
+                    }
+                    let have = scope.get(p) ?? ""
+                    if have != u {
+                        out_ns.push((p, u))
+                    }
+                }
+            }
+            out_ns.sort_by(|d| d.0)
+            plain.sort_by(|a| a.0 + "\u{0}" + a.1)
+            let _ = own_uri
+            var out = "<" + name
+            for (p, u) in out_ns {
+                out = out + " xmlns" + (if p == "" { "" } else { ":" + p }) + "=\"" + escape_attr(u) + "\""
+            }
+            for (_u, _l, key, value) in plain {
+                out = out + " " + key + "=\"" + escape_attr(value) + "\""
+            }
+            out = out + ">"
+            for k in kids {
+                out = out + try render(k, inner, next, exclusive, comments)
+            }
+            out + "</" + name + ">"
+        }
+    }
+}
+
+fn canonical(source: str, exclusive: bool, comments: bool) -> str ! C14nError {
+    let (before, root, after) = try document(source)
+    var out = ""
+    for n in before {
+        let text = try render(n, {}, {}, exclusive, comments)
+        if text.len() > 0 {
+            out = out + text + "\n"
+        }
+    }
+    out = out + try render(root, {}, {}, exclusive, comments)
+    for n in after {
+        let text = try render(n, {}, {}, exclusive, comments)
+        if text.len() > 0 {
+            out = out + "\n" + text
+        }
+    }
+    return out
+}
+
+/// A document in Canonical XML 1.0 form, with or without its comments.
+pub fn canonicalize(source: str, with_comments: bool) -> str ! C14nError {
+    return try canonical(source, false, with_comments)
+}
+
+/// A document in Exclusive XML Canonicalization form, with or without its
+/// comments.
+pub fn canonicalize_exclusive(source: str, with_comments: bool) -> str ! C14nError {
+    return try canonical(source, true, with_comments)
+}

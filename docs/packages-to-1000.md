@@ -250,11 +250,28 @@ reference on this machine. `langtag` and `ssdp` were looked at and are
 `dbuswire` (no bus), `json5` `hjson` `edn` (no reference parser), `stl`
 `ply` `obj` `gltf` (no mesh library), `proj4` `s2cell` `h3cell` (no
 projection library), `flexlayout` (no layout engine outside a browser),
-`ndarray` (no NumPy), `quic` `http3` (no peer), `osmpbf` (no
+`ndarray` (no NumPy), `quic` `http3` (no peer), `osmpbf` `mvt` (no
 `paulmach/protoscan` in the module cache). Each becomes buildable the
 day its reference is installed.
 
 ## Landed
+
+- [x] **B28, third part** — `s2compress` `crc32c` `natpmp` `xmlc14n`, with
+  the harness `b28test3`; the new gate `b28cdiff` runs 8,921 cases:
+  klauspost/compress's four block encoders and its stream writer read
+  here and what is written here read there, hand-built blocks for every
+  repeat-length class, and damaged blocks and streams judged alike; Go's
+  Castagnoli CRC; go-nat-pmp's client talking to a loopback responder
+  that answers with each case's bytes; and `xmllint --c14n` and
+  `--exc-c14n` on random documents, with the no-comment forms held to
+  xmllint on the same documents written without comments. `crc32c` was
+  found missing (only `sctp` computed it, privately) and added. Three
+  oracle quirks were kept out of the corpus rather than copied: libxml2
+  writes `&` bare in a namespace URI, go-nat-pmp accepts a long mapping
+  answer only because a 16-byte read truncates it, and klauspost's writer
+  given nothing and an index option writes a stream its own reader
+  refuses. One break per package turned it red. `mvt` moved to deferred:
+  orb's vector-tile code needs the same missing `paulmach/protoscan`.
 
 - [x] **B28, second part** — `htmlcharset` `svcb` `dnssec` `wkb`, with the
   harness `b28test2`; the new gate `b28bdiff` runs 10,597 cases against
@@ -510,7 +527,7 @@ day its reference is installed.
 | | |
 |---|---|
 | At the start | 669 |
-| Now | 823 |
+| Now | 828 |
 | Candidates above | 316 packages in 28 batches, plus `ecc`, `rfc6979` and `goprintf` |
 | Harnesses, one a batch | 28 |
 | If every candidate lands | 1016 |

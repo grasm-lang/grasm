@@ -1,0 +1,4 @@
+[package]
+name = "crc32c"
+version = "1.0.0"
+capabilities = []

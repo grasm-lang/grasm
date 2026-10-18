@@ -1,0 +1,4 @@
+[package]
+name = "xmlc14n"
+version = "1.0.0"
+capabilities = []

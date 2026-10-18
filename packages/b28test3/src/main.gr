@@ -1,0 +1,102 @@
+// The Grasm side of scripts/b28c_diff.py: `<op> x<hex> x<hex>`, answers
+// in hex where they could hold a line break.
+import s2compress
+import crc32c
+import natpmp
+import xmlc14n
+import snappy
+
+fn from_hex(text: str) -> bytes {
+    var out: [i64] = []
+    var i = 1
+    while i + 1 < text.len() {
+        out.push(text.substr(i, 2).parse_int_base(16) ?? 0)
+        i = i + 2
+    }
+    bytes_of(out)
+}
+
+fn hex(raw: bytes) -> str {
+    let digits = "0123456789abcdef"
+    var out = ""
+    var i = 0
+    while i < raw.len() {
+        out = out + digits.substr(raw.at(i) / 16, 1) + digits.substr(raw.at(i) % 16, 1)
+        i = i + 1
+    }
+    out
+}
+
+let LIMIT = 67108864
+
+fn answer(what: str, a: bytes, b: bytes) -> str {
+    if what == "crc32c" {
+        let c = crc32c.of(a)
+        return "{c}|{crc32c.masked(c)}|{crc32c.unmasked(crc32c.masked(c))}"
+    }
+    if what == "s2.dec" {
+        return match s2compress.decode(a, LIMIT) {
+            Ok(d) -> hex(d)
+            Err(_) -> "ERR"
+        }
+    }
+    if what == "s2.enc" {
+        return hex(s2compress.encode(a))
+    }
+    if what == "s2.encsnappy" {
+        // What is written for Snappy must read back with the Snappy decoder.
+        let packed = s2compress.encode_snappy(a)
+        return match snappy.decompress(packed, LIMIT) {
+            Ok(d) -> if d == a { hex(packed) } else { "SNAPPY-MISREAD" }
+            Err(_) -> "SNAPPY-REFUSED"
+        }
+    }
+    if what == "s2.stream.dec" {
+        return match s2compress.decode_stream(a) {
+            Ok(d) -> hex(d)
+            Err(_) -> "ERR"
+        }
+    }
+    if what == "s2.stream.enc" {
+        return hex(s2compress.encode_stream(a, b.to_str().parse_int() ?? 65536))
+    }
+    if what == "natpmp.req" {
+        let f = b.to_str().split("|")
+        if f[0] == "ext" {
+            return hex(natpmp.external_address_request())
+        }
+        return match natpmp.mapping_request(f[1], f[2].parse_int() ?? 0, f[3].parse_int() ?? 0, f[4].parse_int() ?? 0) {
+            Ok(r) -> hex(r)
+            Err(_) -> "ERR"
+        }
+    }
+    if what == "natpmp.ans" {
+        return natpmp.decode_answer(b, a) ?? "ERR"
+    }
+    match canon(what, a.to_str()) {
+        Ok(text) -> hex(text.to_bytes())
+        Err(_) -> "ERR"
+    }
+}
+
+fn canon(what: str, doc: str) -> str ! C14nError {
+    if what == "c14n" {
+        return try xmlc14n.canonicalize(doc, true)
+    }
+    if what == "c14n.nc" {
+        return try xmlc14n.canonicalize(doc, false)
+    }
+    if what == "exc" {
+        return try xmlc14n.canonicalize_exclusive(doc, true)
+    }
+    try xmlc14n.canonicalize_exclusive(doc, false)
+}
+
+fn main() / {io} {
+    let argv = args()
+    var i = 0
+    while i + 2 < argv.len() {
+        print(answer(argv[i], from_hex(argv[i + 1]), from_hex(argv[i + 2])))
+        i = i + 3
+    }
+}

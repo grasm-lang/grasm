@@ -1,0 +1,399 @@
+// S2: Snappy with repeat offsets, as klauspost/compress defined it.
+//
+// S2 is what `github.com/klauspost/compress` offers as a faster, smaller
+// Snappy, and it turns up in NATS, MinIO, CockroachDB's Pebble, Dgraph and
+// anything else that took that library's advice. It keeps Snappy's block
+// format — a varint length, then literals and copies chosen by the two low
+// bits of each tag — and changes one thing: a one-byte-offset copy whose
+// offset is zero means "the same offset as last time", with a length that
+// can run to sixteen megabytes in five bytes. A long match no longer costs a
+// copy per 64 bytes, and a structure that repeats at a fixed stride costs
+// two bytes a match.
+//
+// Every Snappy block is therefore an S2 block, and `decode` reads both.
+// `encode` writes S2, with repeats; `encode_snappy` writes blocks a
+// Snappy decoder can read. The first copy of a block cannot be a repeat,
+// since there is nothing to repeat.
+//
+// Streams use Snappy's framing with a different identifier, `S2sTwO`
+// rather than `sNaPpY`, and blocks of up to 4 MB rather than 64 KB; each
+// chunk carries the masked CRC-32C of its uncompressed bytes. The reader
+// takes either identifier, and the limits that go with it; chunk types
+// 0x80 to 0xFE (padding, S2's seek index and anything else skippable) are
+// skipped and 0x02 to 0x7F are refused, as the framing format requires.
+//
+// Checked against klauspost/compress: its four block encoders and its
+// stream writer read here, what is written here read there, and both
+// readers fed the same damaged blocks and streams.
+import crc32c
+
+type S2Error =
+    | S2Corrupt(at: i64, why: str)
+    | S2TooLarge(length: i64, limit: i64)
+
+fn le(data: bytes, at: i64, n: i64) -> i64 {
+    var v = 0
+    var i = n - 1
+    while i >= 0 {
+        v = v * 256 + data.at(at + i)
+        i = i - 1
+    }
+    return v
+}
+
+/// The uncompressed length a block declares, and how many bytes the
+/// declaration took.
+fn length_header(block: bytes) -> (i64, i64) ! S2Error {
+    var v = 0
+    var shift = 1
+    var i = 0
+    while i < block.len() and i < 5 {
+        let b = block.at(i)
+        v = v + b.bit_and(127) * shift
+        i = i + 1
+        if b < 128 {
+            if v > 4294967295 {
+                fail(S2Corrupt(0, "a length over 32 bits"))
+            }
+            return (v, i)
+        }
+        shift = shift * 128
+    }
+    fail(S2Corrupt(0, "a bad length header"))
+}
+
+/// The uncompressed length a block declares.
+pub fn decoded_len(block: bytes) -> i64 ! S2Error {
+    return (try length_header(block)).0
+}
+
+/// A copy tag at `s`: its length, the offset it uses (the last one again
+/// for a repeat), and where the next tag starts.
+fn copy_tag(block: bytes, at: i64, tag: i64, last: i64) -> (i64, i64, i64) ! S2Error {
+    let end = block.len()
+    var s = at
+    var offset = last
+    var len = 0
+    let kind = tag % 4
+    if kind == 1 {
+        if s + 2 > end {
+            fail(S2Corrupt(s, "a copy runs off the block"))
+        }
+        let toffset = tag / 32 * 256 + block.at(s + 1)
+        len = tag / 4 % 8
+        s = s + 2
+        if toffset == 0 {
+            // A repeat: the last offset again, with a longer length.
+            let extra = if len == 5 { 1 } else if len == 6 { 2 } else if len == 7 { 3 } else { 0 }
+            if s + extra > end {
+                fail(S2Corrupt(s, "a repeat length runs off the block"))
+            }
+            if len == 5 {
+                len = block.at(s) + 4
+            } else if len == 6 {
+                len = le(block, s, 2) + 256
+            } else if len == 7 {
+                len = le(block, s, 3) + 65536
+            }
+            s = s + extra
+        } else {
+            offset = toffset
+        }
+        return (len + 4, offset, s)
+    }
+    if kind == 2 {
+        if s + 3 > end {
+            fail(S2Corrupt(s, "a copy runs off the block"))
+        }
+        return (1 + tag / 4, le(block, s + 1, 2), s + 3)
+    }
+    if s + 5 > end {
+        fail(S2Corrupt(s, "a copy runs off the block"))
+    }
+    return (1 + tag / 4, le(block, s + 1, 4), s + 5)
+}
+
+/// A block (S2 or Snappy) to its bytes, refusing one that declares more
+/// than `limit`.
+pub fn decode(block: bytes, limit: i64) -> bytes ! S2Error {
+    let (n, start) = try length_header(block)
+    if n > limit {
+        fail(S2TooLarge(n, limit))
+    }
+    var out: [i64] = []
+    var s = start
+    var offset = 0
+    let end = block.len()
+    while s < end {
+        let tag = block.at(s)
+        let kind = tag % 4
+        if kind == 0 {
+            var x = tag / 4
+            var head = 1
+            if x >= 60 {
+                head = 1 + x - 59
+                if s + head > end {
+                    fail(S2Corrupt(s, "a literal length runs off the block"))
+                }
+                x = le(block, s + 1, x - 59)
+            }
+            let len = x + 1
+            s = s + head
+            if len > n - out.len() or len > end - s {
+                fail(S2Corrupt(s, "a literal runs past the output or the block"))
+            }
+            var k = 0
+            while k < len {
+                out.push(block.at(s + k))
+                k = k + 1
+            }
+            s = s + len
+            continue
+        }
+        let (len, next_offset, after) = try copy_tag(block, s, tag, offset)
+        offset = next_offset
+        s = after
+        let d = out.len()
+        if offset <= 0 or d < offset or len > n - d {
+            fail(S2Corrupt(s, "a copy reaches before the start or past the end"))
+        }
+        var k = 0
+        while k < len {
+            out.push(out[d - offset + k])
+            k = k + 1
+        }
+    }
+    if out.len() != n {
+        fail(S2Corrupt(s, "the block is shorter than it declares"))
+    }
+    return bytes_of(out)
+}
+
+// --- Encoding --------------------------------------------------------------
+
+fn put_varint(out: [i64], v: i64) -> [i64] {
+    var o = out
+    var x = v
+    while x >= 128 {
+        o.push(x % 128 + 128)
+        x = x / 128
+    }
+    o.push(x)
+    return o
+}
+
+fn put_le(out: [i64], v: i64, n: i64) -> [i64] {
+    var o = out
+    var i = 0
+    while i < n {
+        o.push(v.ushr(8 * i).bit_and(255))
+        i = i + 1
+    }
+    return o
+}
+
+fn put_literal(out: [i64], data: bytes, from: i64, to: i64) -> [i64] {
+    if to <= from {
+        return out
+    }
+    var o = out
+    let n = to - from - 1
+    if n < 60 {
+        o.push(n * 4)
+    } else if n < 256 {
+        o = put_le(o + [240], n, 1)
+    } else if n < 65536 {
+        o = put_le(o + [244], n, 2)
+    } else if n < 16777216 {
+        o = put_le(o + [248], n, 3)
+    } else {
+        o = put_le(o + [252], n, 4)
+    }
+    var i = from
+    while i < to {
+        o.push(data.at(i))
+        i = i + 1
+    }
+    return o
+}
+
+/// A copy of at most 64 bytes (11 for the one-byte form) at a new offset.
+fn put_copy(out: [i64], offset: i64, len: i64) -> [i64] {
+    if len >= 4 and len <= 11 and offset < 2048 {
+        return out + [offset / 256 * 32 + (len - 4) * 4 + 1, offset % 256]
+    }
+    if offset < 65536 {
+        return put_le(out + [(len - 1) * 4 + 2], offset, 2)
+    }
+    return put_le(out + [(len - 1) * 4 + 3], offset, 4)
+}
+
+/// A repeat of the last offset, any length from 4 up.
+fn put_repeat(out: [i64], len: i64) -> [i64] {
+    if len <= 8 {
+        return out + [(len - 4) * 4 + 1, 0]
+    }
+    if len < 264 {
+        return out + [21, 0, len - 8]
+    }
+    if len < 65796 {
+        return put_le(out + [25, 0], len - 260, 2)
+    }
+    return put_le(out + [29, 0], len - 65540, 3)
+}
+
+fn hash4(data: bytes, at: i64) -> i64 {
+    let v = data.at(at) + data.at(at + 1) * 256 + data.at(at + 2) * 65536 + data.at(at + 3) * 16777216
+    // Snappy's multiplier, small enough that the product stays below 2^63.
+    return (v * 506832829).ushr(18).bit_and(16383)
+}
+
+/// A match: a greedy LZ77 over a 16,384-entry table of last positions.
+fn compress(data: bytes, repeats: bool) -> bytes {
+    var out = put_varint([], data.len())
+    let n = data.len()
+    var table: [i64] = []
+    var i = 0
+    while i < 16384 {
+        table.push(0 - 1)
+        i = i + 1
+    }
+    var lit = 0
+    var pos = 0
+    var last = 0
+    while pos + 4 <= n {
+        let h = hash4(data, pos)
+        let cand = table[h]
+        table[h] = pos
+        if cand < 0 or data.at(cand) != data.at(pos) or data.at(cand + 1) != data.at(pos + 1) or
+        data.at(cand + 2) != data.at(pos + 2) or data.at(cand + 3) != data.at(pos + 3) {
+            pos = pos + 1
+            continue
+        }
+        var len = 4
+        while pos + len < n and data.at(cand + len) == data.at(pos + len) {
+            len = len + 1
+        }
+        out = put_literal(out, data, lit, pos)
+        let offset = pos - cand
+        var left = len
+        if repeats and offset == last {
+            out = put_repeat(out, left)
+            left = 0
+        }
+        while left > 0 {
+            var take = if left > 64 { 64 } else { left }
+            // Never leave a tail a copy cannot express.
+            if left > 64 and left - 64 < 4 {
+                take = left - 4
+            }
+            if repeats and offset == last and left >= 4 {
+                out = put_repeat(out, left)
+                left = 0
+            } else {
+                out = put_copy(out, offset, take)
+                left = left - take
+                last = offset
+            }
+        }
+        pos = pos + len
+        lit = pos
+    }
+    return bytes_of(put_literal(out, data, lit, n))
+}
+
+/// Bytes as an S2 block, repeats included.
+pub fn encode(data: bytes) -> bytes {
+    return compress(data, true)
+}
+
+/// Bytes as a block any Snappy decoder reads: no repeats.
+pub fn encode_snappy(data: bytes) -> bytes {
+    return compress(data, false)
+}
+
+// --- Streams ---------------------------------------------------------------
+
+let MAX_BLOCK = 4194304
+let MAX_SNAPPY_BLOCK = 65536
+
+/// A framed stream to its bytes. An empty stream is empty; the first chunk
+/// must name the format.
+pub fn decode_stream(stream: bytes) -> bytes ! S2Error {
+    var out: [i64] = []
+    var at = 0
+    var started = false
+    var snappy = false
+    let n = stream.len()
+    while at < n {
+        if at + 4 > n {
+            fail(S2Corrupt(at, "a chunk header runs off the stream"))
+        }
+        let kind = stream.at(at)
+        let len = le(stream, at + 1, 3)
+        let body = at + 4
+        if not started and kind != 255 {
+            fail(S2Corrupt(at, "the stream does not start with its identifier"))
+        }
+        started = true
+        if body + len > n {
+            fail(S2Corrupt(at, "a chunk runs off the stream"))
+        }
+        if kind == 255 {
+            let id = stream.slice(body, body + len)
+            if len != 6 or (id != "S2sTwO".to_bytes() and id != "sNaPpY".to_bytes()) {
+                fail(S2Corrupt(at, "an unknown stream identifier"))
+            }
+            snappy = id == "sNaPpY".to_bytes()
+        } else if kind == 0 or kind == 1 {
+            if len < 4 {
+                fail(S2Corrupt(at, "a data chunk too short for its checksum"))
+            }
+            let stored = le(stream, body, 4)
+            let limit = if snappy { MAX_SNAPPY_BLOCK } else { MAX_BLOCK }
+            var data = stream.slice(body + 4, body + len)
+            if kind == 0 {
+                let declared = try decoded_len(data)
+                if declared > limit {
+                    fail(S2Corrupt(at, "a block larger than the format allows"))
+                }
+                data = try decode(data, limit)
+            } else if data.len() > limit {
+                fail(S2Corrupt(at, "a block larger than the format allows"))
+            }
+            if crc32c.masked(crc32c.of(data)) != stored {
+                fail(S2Corrupt(at, "a checksum mismatch"))
+            }
+            out = out + data.to_list()
+        } else if kind < 128 {
+            fail(S2Corrupt(at, "a reserved chunk that must not be skipped"))
+        }
+        at = body + len
+    }
+    return bytes_of(out)
+}
+
+fn put_chunk(out: [i64], kind: i64, body: [i64]) -> [i64] {
+    return put_le(out + [kind], body.len(), 3) + body
+}
+
+/// Bytes as a stream of blocks of `block_size` (at most 4 MB), each
+/// compressed unless that would make it larger.
+pub fn encode_stream(data: bytes, block_size: i64) -> bytes {
+    let size = if block_size < 1 or block_size > MAX_BLOCK { MAX_BLOCK } else { block_size }
+    var out: [i64] = [255, 6, 0, 0] + "S2sTwO".to_bytes().to_list()
+    var at = 0
+    while at < data.len() {
+        let end = if at + size < data.len() { at + size } else { data.len() }
+        let piece = data.slice(at, end)
+        let crc = put_le([], crc32c.masked(crc32c.of(piece)), 4)
+        let packed = encode(piece)
+        if packed.len() < piece.len() {
+            out = put_chunk(out, 0, crc + packed.to_list())
+        } else {
+            out = put_chunk(out, 1, crc + piece.to_list())
+        }
+        at = end
+    }
+    return bytes_of(out)
+}

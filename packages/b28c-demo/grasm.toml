@@ -1,0 +1,20 @@
+[package]
+name = "b28c_demo"
+version = "1.0.0"
+capabilities = ["io"]
+
+[dependencies.s2compress]
+path = "../s2compress"
+version = "^1.0.0"
+
+[dependencies.crc32c]
+path = "../crc32c"
+version = "^1.0.0"
+
+[dependencies.natpmp]
+path = "../natpmp"
+version = "^1.0.0"
+
+[dependencies.xmlc14n]
+path = "../xmlc14n"
+version = "^1.0.0"

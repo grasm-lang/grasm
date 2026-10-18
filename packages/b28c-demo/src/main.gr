@@ -1,0 +1,42 @@
+// S2 compression, CRC-32C, a NAT-PMP exchange and canonical XML.
+// scripts/b28c_diff.sh holds them to klauspost/compress, Go's hash/crc32,
+// go-nat-pmp and xmllint.
+import s2compress
+import crc32c
+import natpmp
+import xmlc14n
+
+fn main() / {io} {
+    // The standard check value.
+    assert_eq(crc32c.of("123456789".to_bytes()), 3808858755)
+    assert_eq(crc32c.unmasked(crc32c.masked(12345)), 12345)
+
+    // Records at a fixed stride: repeat offsets make them small.
+    var text = ""
+    var i = 0
+    while i < 200 {
+        text = text + "id={i % 10};name=sensor;value=42\n"
+        i = i + 1
+    }
+    let data = text.to_bytes()
+    let block = s2compress.encode(data)
+    assert_eq(block.len() < data.len() / 4, true)
+    assert_eq(s2compress.decode(block, 1000000) ?? bytes_of([]), data)
+    assert_eq(s2compress.decode_stream(s2compress.encode_stream(data, 4096)) ?? bytes_of([]), data)
+
+    // Ask for UDP port 51413 for an hour, and read the router's yes.
+    let req = natpmp.mapping_request("udp", 51413, 51413, 3600) ?? bytes_of([])
+    assert_eq(req.len(), 12)
+    let answer = bytes_of([0, 129, 0, 0, 0, 0, 1, 0, 200, 213, 200, 213, 0, 0, 14, 16])
+    match natpmp.decode_mapping(answer, "udp") {
+        Ok(m) -> assert_eq((m.external_port, m.lifetime), (51413, 3600))
+        Err(_) -> panic("the answer was refused")
+    }
+
+    // Two spellings of one document canonicalize to the same bytes.
+    let a = "<?xml version=\"1.0\"?><doc xmlns='urn:x' b='2' a=\"1\"><e/></doc>"
+    let b = "<doc a=\"1\" b=\"2\" xmlns=\"urn:x\"><e></e></doc>"
+    assert_eq(xmlc14n.canonicalize(a, true) ?? "", xmlc14n.canonicalize(b, true) ?? "x")
+    assert_eq(xmlc14n.canonicalize(b, true) ?? "", "<doc xmlns=\"urn:x\" a=\"1\" b=\"2\"><e></e></doc>")
+    print("b28c: ok")
+}

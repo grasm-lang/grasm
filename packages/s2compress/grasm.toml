@@ -1,0 +1,8 @@
+[package]
+name = "s2compress"
+version = "1.0.0"
+capabilities = []
+
+[dependencies.crc32c]
+path = "../crc32c"
+version = "^1.0.0"

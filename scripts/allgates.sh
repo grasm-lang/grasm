@@ -129,6 +129,7 @@ run_gate sigdiff       scripts/sig_diff.sh
 run_gate cjkdiff       scripts/cjk_diff.sh
 run_gate packet4diff   scripts/packet4_diff.sh
 run_gate b28bdiff      scripts/b28b_diff.sh
+run_gate b28cdiff      scripts/b28c_diff.sh
 run_gate grasmwire     scripts/grasmwire_e2e.sh
 run_gate cryptodiff    scripts/crypto_diff.sh
 run_gate certdiff      scripts/cert_diff.sh

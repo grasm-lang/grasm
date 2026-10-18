@@ -137,7 +137,7 @@ func answer2(r request) string {
 		}
 		return fmt.Sprintf("%d|%s", srid, canonical(g))
 	}
-	return "UNKNOWN"
+	return answer3(r)
 }
 
 // labels lists every label htmlindex knows with its canonical name, from
