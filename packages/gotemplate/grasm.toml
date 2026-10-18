@@ -1,0 +1,13 @@
+[package]
+name = "gotemplate"
+version = "1.0.0"
+
+capabilities = []
+
+[dependencies.goprintf]
+path = "../goprintf"
+version = "^1.0.0"
+
+[dependencies.goquote]
+path = "../goquote"
+version = "^1.0.0"

@@ -6,3 +6,7 @@ capabilities = ["io"]
 [dependencies.goprintf]
 path = "../goprintf"
 version = "^1.0.0"
+
+[dependencies.gotemplate]
+path = "../gotemplate"
+version = "^1.0.0"

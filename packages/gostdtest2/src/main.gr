@@ -6,6 +6,7 @@
 // `["m", [["k", v], ...]]` -- which the oracle decodes into the same Go
 // values, so both sides format exactly the same thing.
 import goprintf
+import gotemplate
 import json
 
 fn from_hex(text: str) -> bytes {
@@ -111,6 +112,13 @@ fn answer(what: str, a: bytes, b: bytes) -> str {
     }
     if what == "gpl" {
         return text_hex(goprintf.sprintln(operands(b)))
+    }
+    if what == "tpl" {
+        let data = goprintf.parse_json(b.to_str()) ?? goprintf.nil_value()
+        return match gotemplate.render(a.to_str(), data) {
+            Ok(out) -> text_hex(out)
+            Err(_) -> "ERR"
+        }
     }
     if what == "gff" {
         let f = a.to_str().split(",")

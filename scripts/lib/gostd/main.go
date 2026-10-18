@@ -25,6 +25,7 @@ import (
 	"strconv"
 	"strings"
 	"text/tabwriter"
+	"text/template"
 	"time"
 )
 
@@ -316,6 +317,20 @@ func answer(op string, a, b []byte) string {
 		bits, _ := strconv.ParseUint(f[0], 16, 64)
 		prec, _ := strconv.Atoi(f[2])
 		return h([]byte(strconv.FormatFloat(math.Float64frombits(bits), f[1][0], prec, 64)))
+	case "tpl":
+		t, err := template.New("t").Parse(string(a))
+		if err != nil {
+			return "ERR"
+		}
+		var data any
+		if err := json.Unmarshal(b, &data); err != nil {
+			return "BADDATA"
+		}
+		var out bytes.Buffer
+		if err := t.Execute(&out, data); err != nil {
+			return "ERR"
+		}
+		return h(out.Bytes())
 	case "salook":
 		idx := suffixarray.New(a)
 		got := idx.Lookup(b, -1)

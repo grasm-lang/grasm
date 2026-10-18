@@ -222,6 +222,15 @@ day its reference is installed.
 
 ## Landed
 
+- [x] **B1, Go's template language** — `gotemplate`, checked through
+  `gostdtest2`. 12,000 templates against Go's `text/template` -- 9,000
+  generated from every construct, half of them well-typed for one Helm-like
+  document, and 3,000 of those damaged -- run on JSON decoded as Go decodes
+  it: 5,320 render to identical output and 6,680 are refused by both. Found
+  on the way: `''` as a character constant, which Go refuses and a quoting
+  routine accepts as empty, and `{{$x := $x}}`, which parses and fails only
+  when run.
+
 - [x] **B1, Go's formatter** — `goprintf`, and the harness `gostdtest2`.
   58,000 cases against Go's `fmt.Sprintf`, `Sprint`, `Sprintln` and
   `strconv.FormatFloat`: random format strings over every flag, width,
@@ -262,7 +271,7 @@ day its reference is installed.
 | | |
 |---|---|
 | At the start | 669 |
-| Now | 689 |
+| Now | 690 |
 | Candidates above | 310 packages in 27 batches, plus `ecc` and `rfc6979` |
 | Harnesses, one a batch | 27 |
 | If every candidate lands | 1008 |

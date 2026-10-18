@@ -1,0 +1,2561 @@
+// Go's `text/template`: the template language of Helm charts, Hugo sites,
+// `kubectl -o go-template`, `docker --format`, `gh --template` and every Go
+// program that renders text.
+//
+// ## Go's language, Go's answers
+//
+// The lexer, parser and executor follow Go's `text/template` and
+// `text/template/parse` step for step, because the details are the
+// language: `{{- ` and ` -}}` trim the whitespace beside them; `.a.b` on a
+// missing key prints `<no value>` but on a key holding `null` is an error;
+// `eq 1 1.0` is an error ("incompatible types") rather than false; a float
+// prints as `fmt` prints it, so a chart's `replicas: 1000000` renders as
+// `1e+06`; `and` and `or` stop at the first decisive argument and return
+// it rather than a boolean; a map ranges in sorted key order; `break` and
+// `continue` work inside `range`. All of it is checked against Go running
+// the same template on the same data.
+//
+// ## The data
+//
+// A template runs over a `GoValue` (from `goprintf`) -- in practice the
+// result of decoding JSON or YAML into `any`, which is what Helm's
+// `.Values` is. Go programs also pass structs with methods; there is
+// nothing here to call, so `call`, struct fields and methods have no
+// counterpart, and a template asking for them gets the same error Go gives
+// for a field a map does not have.
+//
+// ## Limits, stated
+//
+// Identifiers are ASCII letters, digits and `_` (Go also accepts any
+// Unicode letter). `slice` treats a list's capacity as its length -- Go
+// lets `slice` reach past the length into spare capacity, which depends on
+// how the list was built and is not reproducible. Template recursion stops
+// at a depth of 10,000, where Go allows 100,000.
+import goprintf
+import goquote
+
+// ---------------------------------------------------------------------------
+// Lexing
+
+type TplItem = {
+    kind: i64,
+    val: str,
+}
+
+/// Item kinds, in Go's names.
+fn i_error() -> i64 { 0 }
+fn i_bool() -> i64 { 1 }
+fn i_char() -> i64 { 2 }
+fn i_char_constant() -> i64 { 3 }
+fn i_complex() -> i64 { 4 }
+fn i_assign() -> i64 { 5 }
+fn i_declare() -> i64 { 6 }
+fn i_eof() -> i64 { 7 }
+fn i_field() -> i64 { 8 }
+fn i_identifier() -> i64 { 9 }
+fn i_left_delim() -> i64 { 10 }
+fn i_left_paren() -> i64 { 11 }
+fn i_number() -> i64 { 12 }
+fn i_pipe() -> i64 { 13 }
+fn i_raw_string() -> i64 { 14 }
+fn i_right_delim() -> i64 { 15 }
+fn i_right_paren() -> i64 { 16 }
+fn i_space() -> i64 { 17 }
+fn i_string() -> i64 { 18 }
+fn i_text() -> i64 { 19 }
+fn i_variable() -> i64 { 20 }
+fn i_comment() -> i64 { 21 }
+// Keywords.
+fn i_block() -> i64 { 30 }
+fn i_break() -> i64 { 31 }
+fn i_continue() -> i64 { 32 }
+fn i_dot() -> i64 { 33 }
+fn i_define() -> i64 { 34 }
+fn i_else() -> i64 { 35 }
+fn i_end() -> i64 { 36 }
+fn i_if() -> i64 { 37 }
+fn i_nil() -> i64 { 38 }
+fn i_range() -> i64 { 39 }
+fn i_template() -> i64 { 40 }
+fn i_with() -> i64 { 41 }
+
+fn keyword(word: str) -> i64 {
+    let words = [".", "block", "break", "continue", "define", "else", "end", "if", "range",
+        "nil", "template", "with"]
+    let kinds = [i_dot(), i_block(), i_break(), i_continue(), i_define(), i_else(), i_end(),
+        i_if(), i_range(), i_nil(), i_template(), i_with()]
+    for k in 0..words.len() {
+        if words[k] == word {
+            return kinds[k]
+        }
+    }
+    -1
+}
+
+type TplLexer = {
+    input: bytes,
+    pos: i64,
+    start: i64,
+    paren_depth: i64,
+    inside: bool,
+    items: [TplItem],
+    failed: bool,
+}
+
+fn is_space(c: i64) -> bool {
+    c == 32 or c == 9 or c == 13 or c == 10
+}
+
+fn is_alnum(c: i64) -> bool {
+    c == 95 or (c >= 48 and c <= 57) or (c >= 65 and c <= 90) or (c >= 97 and c <= 122)
+}
+
+fn at(l: TplLexer, i: i64) -> i64 {
+    if i < l.input.len() { l.input.at(i) } else { -1 }
+}
+
+fn has_at(b: bytes, i: i64, lit: str) -> bool {
+    let s = lit.to_bytes()
+    if i < 0 or i + s.len() > b.len() {
+        return false
+    }
+    for k in 0..s.len() {
+        if b.at(i + k) != s.at(k) {
+            return false
+        }
+    }
+    true
+}
+
+fn emit(inout l: TplLexer, kind: i64) {
+    l.items.push(TplItem{ kind: kind, val: l.input.slice(l.start, l.pos).to_str() })
+    l.start = l.pos
+}
+
+fn lex_error(inout l: TplLexer, why: str) {
+    l.items.push(TplItem{ kind: i_error(), val: why })
+    l.failed = true
+}
+
+fn left_trim(b: bytes, from: i64) -> bool {
+    from + 1 < b.len() and b.at(from) == 45 and is_space(b.at(from + 1))
+}
+
+fn right_trim(b: bytes, from: i64) -> bool {
+    from >= 0 and from + 1 < b.len() and is_space(b.at(from)) and b.at(from + 1) == 45
+}
+
+/// `atRightDelim`: whether the action ends here, and whether with ` -`.
+fn at_right_delim(l: TplLexer) -> (bool, bool) {
+    if right_trim(l.input, l.pos) and has_at(l.input, l.pos + 2, "}}") {
+        return (true, true)
+    }
+    if has_at(l.input, l.pos, "}}") {
+        return (true, false)
+    }
+    (false, false)
+}
+
+fn space_run_left(b: bytes, from: i64, end: i64) -> i64 {
+    var n = 0
+    var i = end - 1
+    while i >= from and is_space(b.at(i)) {
+        n = n + 1
+        i = i - 1
+    }
+    n
+}
+
+fn space_run_right(b: bytes, from: i64) -> i64 {
+    var i = from
+    while i < b.len() and is_space(b.at(i)) {
+        i = i + 1
+    }
+    i - from
+}
+
+fn find(b: bytes, from: i64, lit: str) -> i64 {
+    var i = from
+    while i < b.len() {
+        if has_at(b, i, lit) {
+            return i
+        }
+        i = i + 1
+    }
+    -1
+}
+
+/// `lexText` up to and including the next left delimiter.
+fn lex_text(inout l: TplLexer) {
+    let x = find(l.input, l.pos, "\{\{")
+    if x < 0 {
+        l.pos = l.input.len()
+        if l.pos > l.start {
+            emit(l, i_text())
+        }
+        emit(l, i_eof())
+        return
+    }
+    if x > l.pos {
+        l.pos = x
+        var trim = 0
+        if left_trim(l.input, x + 2) {
+            trim = space_run_left(l.input, l.start, l.pos)
+        }
+        l.pos = l.pos - trim
+        if l.pos > l.start {
+            emit(l, i_text())
+        }
+        l.pos = x
+        l.start = l.pos
+    }
+    lex_left_delim(l)
+}
+
+fn lex_left_delim(inout l: TplLexer) {
+    l.pos = l.pos + 2
+    let trim = left_trim(l.input, l.pos)
+    let after = if trim { 2 } else { 0 }
+    if has_at(l.input, l.pos + after, "/*") {
+        l.pos = l.pos + after
+        l.start = l.pos
+        lex_comment(l)
+        return
+    }
+    emit(l, i_left_delim())
+    l.inside = true
+    l.pos = l.pos + after
+    l.start = l.pos
+    l.paren_depth = 0
+}
+
+fn lex_comment(inout l: TplLexer) {
+    l.pos = l.pos + 2
+    let x = find(l.input, l.pos, "*/")
+    if x < 0 {
+        lex_error(l, "unclosed comment")
+        return
+    }
+    l.pos = x + 2
+    let d = at_right_delim(l)
+    if not d.0 {
+        lex_error(l, "comment ends before closing delimiter")
+        return
+    }
+    if d.1 {
+        l.pos = l.pos + 2
+    }
+    l.pos = l.pos + 2
+    if d.1 {
+        l.pos = l.pos + space_run_right(l.input, l.pos)
+    }
+    l.start = l.pos
+}
+
+fn lex_right_delim(inout l: TplLexer) {
+    let d = at_right_delim(l)
+    if d.1 {
+        l.pos = l.pos + 2
+        l.start = l.pos
+    }
+    l.pos = l.pos + 2
+    emit(l, i_right_delim())
+    if d.1 {
+        l.pos = l.pos + space_run_right(l.input, l.pos)
+        l.start = l.pos
+    }
+    l.inside = false
+}
+
+/// `atTerminator`: what may follow a field, variable or identifier.
+fn at_terminator(l: TplLexer) -> bool {
+    let r = at(l, l.pos)
+    if is_space(r) or r == -1 or r == 46 or r == 44 or r == 124 or r == 58 or r == 41 or r == 40 {
+        return true
+    }
+    has_at(l.input, l.pos, "}}")
+}
+
+fn lex_word(inout l: TplLexer, kind: i64) {
+    if at_terminator(l) {
+        emit(l, if kind == i_variable() { i_variable() } else { i_dot() })
+        return
+    }
+    while is_alnum(at(l, l.pos)) {
+        l.pos = l.pos + 1
+    }
+    if not at_terminator(l) {
+        lex_error(l, "bad character")
+        return
+    }
+    emit(l, kind)
+}
+
+fn lex_identifier(inout l: TplLexer) {
+    while is_alnum(at(l, l.pos)) {
+        l.pos = l.pos + 1
+    }
+    if not at_terminator(l) {
+        lex_error(l, "bad character")
+        return
+    }
+    let word = l.input.slice(l.start, l.pos).to_str()
+    let k = keyword(word)
+    if k > 0 {
+        emit(l, k)
+    } else if word == "true" or word == "false" {
+        emit(l, i_bool())
+    } else {
+        emit(l, i_identifier())
+    }
+}
+
+fn accept(inout l: TplLexer, valid: str) -> bool {
+    let c = at(l, l.pos)
+    if c >= 0 and valid.to_bytes().index_of(c, 0).is_some() {
+        l.pos = l.pos + 1
+        return true
+    }
+    false
+}
+
+fn accept_run(inout l: TplLexer, valid: str) {
+    while accept(l, valid) {}
+}
+
+/// `scanNumber`: Go's number syntax -- signs, bases, underscores, a
+/// fraction, an exponent, an imaginary `i` -- and nothing alphanumeric
+/// straight after.
+fn scan_number(inout l: TplLexer) -> bool {
+    let _ = accept(l, "+-")
+    var digits = "0123456789_"
+    if accept(l, "0") {
+        if accept(l, "xX") {
+            digits = "0123456789abcdefABCDEF_"
+        } else if accept(l, "oO") {
+            digits = "01234567_"
+        } else if accept(l, "bB") {
+            digits = "01_"
+        }
+    }
+    accept_run(l, digits)
+    if accept(l, ".") {
+        accept_run(l, digits)
+    }
+    if digits.len() == 11 and accept(l, "eE") {
+        let _ = accept(l, "+-")
+        accept_run(l, "0123456789_")
+    }
+    if digits.len() == 23 and accept(l, "pP") {
+        let _ = accept(l, "+-")
+        accept_run(l, "0123456789_")
+    }
+    let _ = accept(l, "i")
+    if is_alnum(at(l, l.pos)) {
+        l.pos = l.pos + 1
+        return false
+    }
+    true
+}
+
+fn lex_number(inout l: TplLexer) {
+    if not scan_number(l) {
+        lex_error(l, "bad number syntax")
+        return
+    }
+    let sign = at(l, l.pos)
+    if sign == 43 or sign == 45 {
+        if not scan_number(l) or l.input.at(l.pos - 1) != 105 {
+            lex_error(l, "bad number syntax")
+            return
+        }
+        emit(l, i_complex())
+        return
+    }
+    emit(l, i_number())
+}
+
+/// A quoted string or character constant, up to its closing `close`.
+fn lex_quoted(inout l: TplLexer, close: i64, kind: i64) {
+    while true {
+        let c = at(l, l.pos)
+        l.pos = l.pos + 1
+        if c == 92 {
+            let r = at(l, l.pos)
+            l.pos = l.pos + 1
+            if r != -1 and r != 10 {
+                continue
+            }
+            lex_error(l, "unterminated quoted string")
+            return
+        }
+        if c == -1 or c == 10 {
+            lex_error(l, "unterminated quoted string")
+            return
+        }
+        if c == close {
+            break
+        }
+    }
+    emit(l, kind)
+}
+
+fn lex_raw(inout l: TplLexer) {
+    while true {
+        let c = at(l, l.pos)
+        l.pos = l.pos + 1
+        if c == -1 {
+            lex_error(l, "unterminated raw quoted string")
+            return
+        }
+        if c == 96 {
+            break
+        }
+    }
+    emit(l, i_raw_string())
+}
+
+fn lex_space(inout l: TplLexer) {
+    var n = 0
+    while is_space(at(l, l.pos)) {
+        l.pos = l.pos + 1
+        n = n + 1
+    }
+    if right_trim(l.input, l.pos - 1) and has_at(l.input, l.pos + 1, "}}") {
+        l.pos = l.pos - 1
+        if n == 1 {
+            lex_right_delim(l)
+            return
+        }
+    }
+    emit(l, i_space())
+}
+
+/// `lexInsideAction`: one item inside `{{ }}`.
+fn lex_action(inout l: TplLexer) {
+    let d = at_right_delim(l)
+    if d.0 {
+        if l.paren_depth == 0 {
+            lex_right_delim(l)
+        } else {
+            lex_error(l, "unclosed left paren")
+        }
+        return
+    }
+    let r = at(l, l.pos)
+    l.pos = l.pos + 1
+    if r == -1 {
+        lex_error(l, "unclosed action")
+    } else if is_space(r) {
+        l.pos = l.pos - 1
+        lex_space(l)
+    } else if r == 61 {
+        emit(l, i_assign())
+    } else if r == 58 {
+        if at(l, l.pos) != 61 {
+            lex_error(l, "expected :=")
+            return
+        }
+        l.pos = l.pos + 1
+        emit(l, i_declare())
+    } else if r == 124 {
+        emit(l, i_pipe())
+    } else if r == 34 {
+        lex_quoted(l, 34, i_string())
+    } else if r == 96 {
+        lex_raw(l)
+    } else if r == 36 {
+        lex_word(l, i_variable())
+    } else if r == 39 {
+        lex_quoted(l, 39, i_char_constant())
+    } else if r == 46 and not (at(l, l.pos) >= 48 and at(l, l.pos) <= 57) {
+        lex_word(l, i_field())
+    } else if r == 46 or r == 43 or r == 45 or (r >= 48 and r <= 57) {
+        l.pos = l.pos - 1
+        lex_number(l)
+    } else if is_alnum(r) {
+        l.pos = l.pos - 1
+        lex_identifier(l)
+    } else if r == 40 {
+        l.paren_depth = l.paren_depth + 1
+        emit(l, i_left_paren())
+    } else if r == 41 {
+        l.paren_depth = l.paren_depth - 1
+        if l.paren_depth < 0 {
+            lex_error(l, "unexpected right paren")
+            return
+        }
+        emit(l, i_right_paren())
+    } else if r >= 32 and r < 127 {
+        emit(l, i_char())
+    } else {
+        lex_error(l, "unrecognized character in action")
+    }
+}
+
+/// Every item of `text`, ending with EOF or with the first error.
+fn lex_all(text: str) -> [TplItem] {
+    var l = TplLexer{ input: text.to_bytes(), pos: 0, start: 0, paren_depth: 0, inside: false,
+        items: [], failed: false }
+    while not l.failed {
+        let before = l.items.len()
+        if l.inside {
+            lex_action(l)
+        } else {
+            lex_text(l)
+        }
+        if l.items.len() > 0 and l.items[l.items.len() - 1].kind == i_eof() {
+            break
+        }
+        if l.items.len() == before and not l.inside and l.pos >= l.input.len() {
+            emit(l, i_eof())
+            break
+        }
+    }
+    l.items
+}
+
+// ---------------------------------------------------------------------------
+// The tree
+
+type TplNum = {
+    text: str,
+    is_int: bool,
+    int_val: i64,
+    is_uint: bool,
+    is_float: bool,
+    float_val: f64,
+    is_complex: bool,
+}
+
+type TplArg =
+    | TplField(idents: [str])
+    | TplVariable(idents: [str])
+    | TplDot
+    | TplNil
+    | TplBool(b: bool)
+    | TplNumber(num: TplNum)
+    | TplString(text: str)
+    | TplIdent(name: str)
+    | TplSub(pipe: ref TplPipe)
+    | TplChain(node: ref TplArg, fields: [str])
+
+type TplPipe = {
+    decl: [str],
+    is_assign: bool,
+    cmds: [[ref TplArg]],
+}
+
+type TplNode =
+    | TplText(text: str)
+    | TplAction(pipe: ref TplPipe)
+    | TplIf(pipe: ref TplPipe, list: [ref TplNode], else_list: [ref TplNode])
+    | TplRange(pipe: ref TplPipe, list: [ref TplNode], else_list: [ref TplNode], has_else: bool)
+    | TplWith(pipe: ref TplPipe, list: [ref TplNode], else_list: [ref TplNode])
+    | TplTemplate(name: str, pipe: ref TplPipe, has_pipe: bool)
+    | TplBreak
+    | TplContinue
+
+/// A parsed set: every template by name, the first being the one parsed.
+type GoTemplate = {
+    names: [str],
+    bodies: [[ref TplNode]],
+}
+
+type TplParser = {
+    items: [TplItem],
+    i: i64,
+    vars: [str],
+    range_depth: i64,
+    stack_depth: i64,
+    names: [str],
+    bodies: [[ref TplNode]],
+    failed: bool,
+    why: str,
+}
+
+fn perr(inout p: TplParser, why: str) {
+    if not p.failed {
+        p.failed = true
+        p.why = why
+    }
+}
+
+fn next(inout p: TplParser) -> TplItem {
+    if p.i >= p.items.len() {
+        return TplItem{ kind: i_eof(), val: "" }
+    }
+    let it = p.items[p.i]
+    p.i = p.i + 1
+    if it.kind == i_error() {
+        perr(p, it.val)
+    }
+    it
+}
+
+fn peek(p: TplParser) -> TplItem {
+    if p.i >= p.items.len() {
+        return TplItem{ kind: i_eof(), val: "" }
+    }
+    p.items[p.i]
+}
+
+fn next_non_space(inout p: TplParser) -> TplItem {
+    var it = next(p)
+    while it.kind == i_space() {
+        it = next(p)
+    }
+    it
+}
+
+fn peek_non_space(inout p: TplParser) -> TplItem {
+    while peek(p).kind == i_space() {
+        p.i = p.i + 1
+    }
+    peek(p)
+}
+
+fn builtin_names() -> [str] {
+    ["and", "call", "html", "index", "slice", "js", "len", "not", "or", "print", "printf",
+        "println", "urlquery", "eq", "ge", "gt", "le", "lt", "ne"]
+}
+
+fn is_builtin(name: str) -> bool {
+    for n in builtin_names() {
+        if n == name {
+            return true
+        }
+    }
+    false
+}
+
+fn empty_pipe() -> ref TplPipe {
+    ref(TplPipe{ decl: [], is_assign: false, cmds: [] })
+}
+
+// Numbers, by Go's strconv rules.
+
+/// `underscoreOK`: underscores only between digits, or after a base prefix.
+fn underscore_ok(s: str) -> bool {
+    let b = s.to_bytes()
+    var saw = 94
+    var i = 0
+    if b.len() >= 1 and (b.at(0) == 45 or b.at(0) == 43) {
+        i = 1
+    }
+    var hex = false
+    if b.len() - i >= 2 and b.at(i) == 48 {
+        let c = b.at(i + 1).bit_or(32)
+        if c == 98 or c == 111 or c == 120 {
+            hex = c == 120
+            i = i + 2
+            saw = 48
+        }
+    }
+    while i < b.len() {
+        let c = b.at(i)
+        let digit = (c >= 48 and c <= 57) or (hex and c.bit_or(32) >= 97 and c.bit_or(32) <= 102)
+        if digit {
+            saw = 48
+        } else if c == 95 {
+            if saw != 48 {
+                return false
+            }
+            saw = 95
+        } else {
+            if saw == 95 {
+                return false
+            }
+            saw = 33
+        }
+        i = i + 1
+    }
+    saw != 95
+}
+
+/// `ParseUint(s, 0, 64)` as the bits of the result, or `None`.
+fn parse_uint0(text: str) -> Option[i64] {
+    let b = text.to_bytes()
+    if b.len() == 0 or b.at(0) == 45 or b.at(0) == 43 {
+        return None
+    }
+    var base = 10
+    var i = 0
+    if b.at(0) == 48 {
+        if b.len() > 1 and b.at(1).bit_or(32) == 120 {
+            base = 16
+            i = 2
+        } else if b.len() > 1 and b.at(1).bit_or(32) == 111 {
+            base = 8
+            i = 2
+        } else if b.len() > 1 and b.at(1).bit_or(32) == 98 {
+            base = 2
+            i = 2
+        } else {
+            base = 8
+            i = 1
+        }
+    }
+    if base != 10 and i == 2 and i >= b.len() {
+        return None
+    }
+    var v = 0
+    var any = i > 0
+    while i < b.len() {
+        let c = b.at(i)
+        i = i + 1
+        if c == 95 {
+            continue
+        }
+        var d = 99
+        if c >= 48 and c <= 57 {
+            d = c - 48
+        } else if c.bit_or(32) >= 97 and c.bit_or(32) <= 122 {
+            d = c.bit_or(32) - 87
+        }
+        if d >= base {
+            return None
+        }
+        // Overflow of the unsigned 64-bit value: compare against the limit
+        // for this base before multiplying, and build the product from
+        // shifts and wrap-free additions so a debug build's overflow checks
+        // see nothing to trap.
+        if ucmp(v, max_before(base)) > 0 {
+            return None
+        }
+        let shifted = if base == 10 { add64(v.shl(3), v.shl(1)) } else { v.shl(shift_of(base)) }
+        let total = add64(shifted, d)
+        if ucmp(total, shifted) < 0 {
+            return None
+        }
+        v = total
+        any = true
+    }
+    if not any or not underscore_ok(text) {
+        return None
+    }
+    Some(v)
+}
+
+/// Unsigned comparison of two 64-bit patterns.
+fn ucmp(a: i64, b: i64) -> i64 {
+    let x = a.bit_xor(0 - 9223372036854775807 - 1)
+    let y = b.bit_xor(0 - 9223372036854775807 - 1)
+    if x < y { -1 } else if x > y { 1 } else { 0 }
+}
+
+/// The largest value that can be multiplied by `base` within 64 unsigned
+/// bits: `floor((2^64 - 1) / base)`.
+fn max_before(base: i64) -> i64 {
+    if base == 10 {
+        1844674407370955161
+    } else if base == 16 {
+        1152921504606846975
+    } else if base == 8 {
+        2305843009213693951
+    } else {
+        9223372036854775807
+    }
+}
+
+fn shift_of(base: i64) -> i64 {
+    if base == 16 { 4 } else if base == 8 { 3 } else { 1 }
+}
+
+/// Addition modulo 2^64, in halves so nothing overflows.
+fn add64(a: i64, b: i64) -> i64 {
+    let low = a.bit_and(4294967295) + b.bit_and(4294967295)
+    let high = a.ushr(32) + b.ushr(32) + low.ushr(32)
+    high.shl(32).bit_or(low.bit_and(4294967295))
+}
+
+/// `ParseInt(s, 0, 64)`, or `None`.
+fn parse_int0(text: str) -> Option[i64] {
+    var s = text
+    var neg = false
+    if s.starts_with("-") or s.starts_with("+") {
+        neg = s.starts_with("-")
+        s = s.substr(1, s.len() - 1)
+    }
+    match parse_uint0(s) {
+        None -> None
+        Some(u) -> {
+            if not underscore_ok(text) {
+                return None
+            }
+            if not neg {
+                return if u < 0 { None } else { Some(u) }
+            }
+            let min = 0 - 9223372036854775807 - 1
+            if u == min {
+                return Some(min)
+            }
+            if u < 0 {
+                return None
+            }
+            Some(0 - u)
+        }
+    }
+}
+
+/// `ParseFloat(s, 64)` for the decimal forms the lexer can produce.
+fn parse_float0(text: str) -> Option[f64] {
+    if not underscore_ok(text) {
+        return None
+    }
+    let clean = text.replace("_", "")
+    let lower = clean.to_lower()
+    if lower.index_of("0x").is_some() or lower.index_of("0b").is_some() or
+    lower.index_of("0o").is_some() {
+        return None
+    }
+    // Go's ParseFloat calls a finite literal that overflows an error, where
+    // `parse_float` gives an infinity.
+    match clean.parse_float() {
+        Some(f) -> if f.is_finite() { Some(f) } else { None }
+        None -> None
+    }
+}
+
+fn new_number(inout p: TplParser, text: str, kind: i64) -> TplNum {
+    var n = TplNum{ text: text, is_int: false, int_val: 0, is_uint: false, is_float: false,
+        float_val: 0.0, is_complex: false }
+    if kind == i_char_constant() {
+        match goquote.unquote(text.to_bytes()) {
+            Ok(b) -> {
+                // `''` unquotes to nothing, where Go's UnquoteChar finds no
+                // character and refuses it.
+                if b.len() == 0 {
+                    perr(p, "malformed character constant")
+                    return n
+                }
+                let r = if b.len() == 1 { b.at(0) } else { decode_first(b) }
+                n.is_int = true
+                n.int_val = r
+                n.is_uint = true
+                n.is_float = true
+                n.float_val = r.as_f64()
+            }
+            Err(_) -> perr(p, "malformed character constant")
+        }
+        return n
+    }
+    if kind == i_complex() or text.ends_with("i") {
+        // Complex constants have nothing to become here.
+        n.is_complex = true
+        return n
+    }
+    let u = parse_uint0(text)
+    if u.is_some() {
+        n.is_uint = true
+    }
+    match parse_int0(text) {
+        Some(i) -> {
+            n.is_int = true
+            n.int_val = i
+            if i == 0 {
+                n.is_uint = true
+            }
+        }
+        None -> {}
+    }
+    if n.is_int {
+        n.is_float = true
+        n.float_val = n.int_val.as_f64()
+    } else if n.is_uint {
+        n.is_float = true
+    } else {
+        match parse_float0(text) {
+            Some(f) -> {
+                let lower = text.to_lower()
+                if lower.index_of(".").is_none() and lower.index_of("e").is_none() and
+                lower.index_of("p").is_none() {
+                    perr(p, "integer overflow")
+                    return n
+                }
+                n.is_float = true
+                n.float_val = f
+                if f == f.floor() and f >= -9223372036854775808.0 and f < 9223372036854775808.0 {
+                    n.is_int = true
+                    n.int_val = f.as_i64()
+                }
+                if f == f.floor() and f >= 0.0 and f < 18446744073709551616.0 {
+                    n.is_uint = true
+                }
+            }
+            None -> {}
+        }
+    }
+    if not n.is_int and not n.is_uint and not n.is_float {
+        perr(p, "illegal number syntax")
+    }
+    n
+}
+
+fn decode_first(b: bytes) -> i64 {
+    let c = b.at(0)
+    if c < 224 {
+        return c.bit_and(31).shl(6).bit_or(b.at(1).bit_and(63))
+    }
+    if c < 240 {
+        return c.bit_and(15).shl(12).bit_or(b.at(1).bit_and(63).shl(6)).bit_or(b.at(2).bit_and(63))
+    }
+    c.bit_and(7).shl(18).bit_or(b.at(1).bit_and(63).shl(12)).bit_or(b.at(2).bit_and(63).shl(6))
+        .bit_or(b.at(3).bit_and(63))
+}
+
+fn unquoted(inout p: TplParser, text: str) -> str {
+    match goquote.unquote(text.to_bytes()) {
+        Ok(b) -> b.to_str()
+        Err(_) -> {
+            perr(p, "bad string")
+            ""
+        }
+    }
+}
+
+fn split_dots(text: str) -> [str] {
+    var out: [str] = []
+    for part in text.split(".") {
+        if part.len() > 0 {
+            out.push(part)
+        }
+    }
+    out
+}
+
+// Operands and commands.
+
+fn use_var(inout p: TplParser, text: str) -> ref TplArg {
+    let parts = text.split(".")
+    let name = parts[0]
+    var found = false
+    for v in p.vars {
+        if v == name {
+            found = true
+        }
+    }
+    if not found {
+        perr(p, "undefined variable")
+    }
+    var idents: [str] = [name]
+    for k in 1..parts.len() {
+        idents.push(parts[k])
+    }
+    ref(TplVariable(idents))
+}
+
+fn term(inout p: TplParser) -> Option[ref TplArg] {
+    let mark = p.i
+    let t = next_non_space(p)
+    if p.failed {
+        return None
+    }
+    let k = t.kind
+    if k == i_identifier() {
+        if not is_builtin(t.val) {
+            perr(p, "function not defined")
+        }
+        return Some(ref(TplIdent(t.val)))
+    }
+    if k == i_dot() {
+        return Some(ref(TplDot))
+    }
+    if k == i_nil() {
+        return Some(ref(TplNil))
+    }
+    if k == i_variable() {
+        return Some(use_var(p, t.val))
+    }
+    if k == i_field() {
+        return Some(ref(TplField(split_dots(t.val))))
+    }
+    if k == i_bool() {
+        return Some(ref(TplBool(t.val == "true")))
+    }
+    if k == i_char_constant() or k == i_complex() or k == i_number() {
+        return Some(ref(TplNumber(new_number(p, t.val, k))))
+    }
+    if k == i_left_paren() {
+        if p.stack_depth >= 10000 {
+            perr(p, "max expression depth exceeded")
+            return None
+        }
+        p.stack_depth = p.stack_depth + 1
+        let pipe = pipeline(p, "parenthesized pipeline", i_right_paren())
+        p.stack_depth = p.stack_depth - 1
+        return Some(ref(TplSub(pipe)))
+    }
+    if k == i_string() or k == i_raw_string() {
+        return Some(ref(TplString(unquoted(p, t.val))))
+    }
+    p.i = mark
+    None
+}
+
+fn operand(inout p: TplParser) -> Option[ref TplArg] {
+    let found = term(p)
+    if found.is_none() or p.failed {
+        return found
+    }
+    let node = found ?? ref(TplNil)
+    if peek(p).kind != i_field() {
+        return Some(node)
+    }
+    var fields: [str] = []
+    while peek(p).kind == i_field() {
+        for f in split_dots(next(p).val) {
+            fields.push(f)
+        }
+    }
+    match node {
+        TplField(idents) -> {
+            var all = idents
+            for f in fields {
+                all.push(f)
+            }
+            Some(ref(TplField(all)))
+        }
+        TplVariable(idents) -> {
+            var all = idents
+            for f in fields {
+                all.push(f)
+            }
+            Some(ref(TplVariable(all)))
+        }
+        TplBool(_) -> {
+            perr(p, "unexpected . after term")
+            None
+        }
+        TplString(_) -> {
+            perr(p, "unexpected . after term")
+            None
+        }
+        TplNumber(_) -> {
+            perr(p, "unexpected . after term")
+            None
+        }
+        TplNil -> {
+            perr(p, "unexpected . after term")
+            None
+        }
+        TplDot -> {
+            perr(p, "unexpected . after term")
+            None
+        }
+        _ -> Some(ref(TplChain(node, fields)))
+    }
+}
+
+fn command(inout p: TplParser) -> [ref TplArg] {
+    var args: [ref TplArg] = []
+    while not p.failed {
+        let _ = peek_non_space(p)
+        match operand(p) {
+            Some(a) -> args.push(a)
+            None -> {}
+        }
+        if p.failed {
+            break
+        }
+        let t = next(p)
+        if t.kind == i_space() {
+            continue
+        }
+        if t.kind == i_right_delim() or t.kind == i_right_paren() {
+            p.i = p.i - 1
+        } else if t.kind != i_pipe() {
+            perr(p, "unexpected in operand")
+        }
+        break
+    }
+    if args.len() == 0 {
+        perr(p, "empty command")
+    }
+    args
+}
+
+fn starts_command(k: i64) -> bool {
+    k == i_bool() or k == i_char_constant() or k == i_complex() or k == i_dot() or
+    k == i_field() or k == i_identifier() or k == i_number() or k == i_nil() or
+    k == i_raw_string() or k == i_string() or k == i_variable() or k == i_left_paren()
+}
+
+/// The declarations at the start of a pipeline: `$x :=`, `$x =`, or
+/// `$i, $v :=` in a range.
+fn declarations(inout p: TplParser, inout pipe: TplPipe, context: str) {
+    while not p.failed {
+        let v = peek_non_space(p)
+        if v.kind != i_variable() {
+            return
+        }
+        let mark = p.i
+        p.i = p.i + 1
+        let next_tok = peek_non_space(p)
+        if next_tok.kind == i_assign() or next_tok.kind == i_declare() {
+            pipe.is_assign = next_tok.kind == i_assign()
+            p.i = p.i + 1
+            pipe.decl.push(v.val)
+            p.vars.push(v.val)
+            return
+        }
+        if next_tok.kind == i_char() and next_tok.val == "," {
+            p.i = p.i + 1
+            pipe.decl.push(v.val)
+            p.vars.push(v.val)
+            if context == "range" and pipe.decl.len() < 2 {
+                let after = peek_non_space(p).kind
+                if after == i_variable() or after == i_right_delim() or after == i_right_paren() {
+                    continue
+                }
+                perr(p, "range can only initialize variables")
+                return
+            }
+            perr(p, "too many declarations")
+            return
+        }
+        p.i = mark
+        return
+    }
+}
+
+fn pipeline(inout p: TplParser, context: str, end: i64) -> ref TplPipe {
+    var pipe = TplPipe{ decl: [], is_assign: false, cmds: [] }
+    declarations(p, pipe, context)
+    while not p.failed {
+        let t = next_non_space(p)
+        if p.failed {
+            break
+        }
+        if t.kind == end {
+            if pipe.cmds.len() == 0 {
+                perr(p, "missing value")
+            }
+            for k in 1..pipe.cmds.len() {
+                match pipe.cmds[k][0] {
+                    TplBool(_) -> perr(p, "non executable command in pipeline")
+                    TplDot -> perr(p, "non executable command in pipeline")
+                    TplNil -> perr(p, "non executable command in pipeline")
+                    TplNumber(_) -> perr(p, "non executable command in pipeline")
+                    TplString(_) -> perr(p, "non executable command in pipeline")
+                    _ -> {}
+                }
+            }
+            break
+        }
+        if starts_command(t.kind) {
+            p.i = p.i - 1
+            pipe.cmds.push(command(p))
+        } else {
+            perr(p, "unexpected in " + context)
+        }
+    }
+    ref(pipe)
+}
+
+// Control structures. A list ends at `{{end}}` or `{{else}}`, which come
+// back as markers rather than nodes.
+
+/// What ended a list: 0 end of input, 1 `{{end}}`, 2 `{{else}}`.
+type TplListEnd = {
+    nodes: [ref TplNode],
+    ended_by: i64,
+}
+
+fn expect(inout p: TplParser, kind: i64, context: str) {
+    let t = next_non_space(p)
+    if t.kind != kind {
+        perr(p, "unexpected in " + context)
+    }
+}
+
+fn item_list(inout p: TplParser) -> TplListEnd {
+    var nodes: [ref TplNode] = []
+    while not p.failed and peek_non_space(p).kind != i_eof() {
+        let r = text_or_action(p)
+        if r.1 != 0 {
+            return TplListEnd{ nodes: nodes, ended_by: r.1 }
+        }
+        match r.0 {
+            Some(n) -> nodes.push(n)
+            None -> {}
+        }
+    }
+    perr(p, "unexpected EOF")
+    TplListEnd{ nodes: nodes, ended_by: 0 }
+}
+
+/// A text node, an action, or a marker (1 end, 2 else).
+fn text_or_action(inout p: TplParser) -> (Option[ref TplNode], i64) {
+    let t = next_non_space(p)
+    if p.failed {
+        return (None, 0)
+    }
+    if t.kind == i_text() {
+        return (Some(ref(TplText(t.val))), 0)
+    }
+    if t.kind == i_left_delim() {
+        return action(p)
+    }
+    perr(p, "unexpected in input")
+    (None, 0)
+}
+
+fn action(inout p: TplParser) -> (Option[ref TplNode], i64) {
+    let t = next_non_space(p)
+    let k = t.kind
+    if k == i_block() {
+        return (Some(block_control(p)), 0)
+    }
+    if k == i_break() or k == i_continue() {
+        if next_non_space(p).kind != i_right_delim() {
+            perr(p, "unexpected in break/continue")
+        }
+        if p.range_depth == 0 {
+            perr(p, "break or continue outside range")
+        }
+        return (Some(ref(if k == i_break() { TplBreak } else { TplContinue })), 0)
+    }
+    if k == i_else() {
+        let after = peek_non_space(p).kind
+        if after != i_if() and after != i_with() {
+            expect(p, i_right_delim(), "else")
+        }
+        return (None, 2)
+    }
+    if k == i_end() {
+        expect(p, i_right_delim(), "end")
+        return (None, 1)
+    }
+    if k == i_if() or k == i_range() or k == i_with() {
+        return (Some(control(p, k)), 0)
+    }
+    if k == i_template() {
+        return (Some(template_control(p)), 0)
+    }
+    p.i = p.i - 1
+    (Some(ref(TplAction(pipeline(p, "command", i_right_delim())))), 0)
+}
+
+/// `parseControl` for `if`, `range` and `with`, including `{{else if}}`
+/// and `{{else with}}` chains.
+fn control(inout p: TplParser, kind: i64) -> ref TplNode {
+    let saved = p.vars.len()
+    let context = if kind == i_if() { "if" } else if kind == i_range() { "range" } else { "with" }
+    let pipe = pipeline(p, context, i_right_delim())
+    if kind == i_range() {
+        p.range_depth = p.range_depth + 1
+    }
+    let body = item_list(p)
+    if kind == i_range() {
+        p.range_depth = p.range_depth - 1
+    }
+    var else_list: [ref TplNode] = []
+    var has_else = false
+    if body.ended_by == 2 and not p.failed {
+        has_else = true
+        let follow = peek(p).kind
+        if kind == i_if() and follow == i_if() {
+            p.i = p.i + 1
+            else_list = [control(p, i_if())]
+        } else if kind == i_with() and follow == i_with() {
+            p.i = p.i + 1
+            else_list = [control(p, i_with())]
+        } else {
+            let rest = item_list(p)
+            if rest.ended_by != 1 {
+                perr(p, "expected end")
+            }
+            else_list = rest.nodes
+        }
+    }
+    var keep: [str] = []
+    for k in 0..saved {
+        keep.push(p.vars[k])
+    }
+    p.vars = keep
+    if kind == i_if() {
+        return ref(TplIf(pipe, body.nodes, else_list))
+    }
+    if kind == i_range() {
+        return ref(TplRange(pipe, body.nodes, else_list, has_else))
+    }
+    ref(TplWith(pipe, body.nodes, else_list))
+}
+
+fn template_name(inout p: TplParser, t: TplItem) -> str {
+    if t.kind == i_string() or t.kind == i_raw_string() {
+        return unquoted(p, t.val)
+    }
+    perr(p, "unexpected in template clause")
+    ""
+}
+
+fn template_control(inout p: TplParser) -> ref TplNode {
+    let name = template_name(p, next_non_space(p))
+    if next_non_space(p).kind != i_right_delim() {
+        p.i = p.i - 1
+        let pipe = pipeline(p, "template clause", i_right_delim())
+        return ref(TplTemplate(name, pipe, true))
+    }
+    ref(TplTemplate(name, empty_pipe(), false))
+}
+
+fn is_empty_tree(nodes: [ref TplNode]) -> bool {
+    for n in nodes {
+        match n {
+            TplText(text) -> if text.trim().len() > 0 {
+                return false
+            }
+            _ -> return false
+        }
+    }
+    true
+}
+
+/// `Tree.add`: a name defined twice is an error unless one of the two is
+/// empty, and an empty one does not replace a full one.
+fn add_tree(inout p: TplParser, name: str, body: [ref TplNode]) {
+    for k in 0..p.names.len() {
+        if p.names[k] == name {
+            if is_empty_tree(p.bodies[k]) {
+                p.bodies[k] = body
+                return
+            }
+            if not is_empty_tree(body) {
+                perr(p, "multiple definition of template")
+            }
+            return
+        }
+    }
+    p.names.push(name)
+    p.bodies.push(body)
+}
+
+/// A nested definition has its own variables: only `$`.
+fn nested_list(inout p: TplParser) -> TplListEnd {
+    let saved_vars = p.vars
+    let saved_depth = p.range_depth
+    p.vars = ["$"]
+    p.range_depth = 0
+    let body = item_list(p)
+    p.vars = saved_vars
+    p.range_depth = saved_depth
+    body
+}
+
+fn block_control(inout p: TplParser) -> ref TplNode {
+    let name = template_name(p, next_non_space(p))
+    let pipe = pipeline(p, "block clause", i_right_delim())
+    let body = nested_list(p)
+    if body.ended_by != 1 {
+        perr(p, "unexpected in block clause")
+    }
+    add_tree(p, name, body.nodes)
+    ref(TplTemplate(name, pipe, true))
+}
+
+fn definition(inout p: TplParser) {
+    let t = next_non_space(p)
+    if t.kind != i_string() and t.kind != i_raw_string() {
+        perr(p, "unexpected in define clause")
+        return
+    }
+    let name = unquoted(p, t.val)
+    expect(p, i_right_delim(), "define clause")
+    let body = nested_list(p)
+    if body.ended_by != 1 {
+        perr(p, "unexpected in define clause")
+    }
+    add_tree(p, name, body.nodes)
+}
+
+/// `template.New(name).Parse(text)`: the template and every `define` and
+/// `block` in it, or the reason it does not parse.
+pub fn parse(name: str, text: str) -> GoTemplate ! str {
+    var p = TplParser{ items: lex_all(text), i: 0, vars: ["$"], range_depth: 0, stack_depth: 0,
+        names: [], bodies: [], failed: false, why: "" }
+    var root: [ref TplNode] = []
+    while not p.failed and peek(p).kind != i_eof() {
+        if peek(p).kind == i_left_delim() {
+            let mark = p.i
+            p.i = p.i + 1
+            if next_non_space(p).kind == i_define() {
+                definition(p)
+                continue
+            }
+            p.i = mark
+        }
+        let r = text_or_action(p)
+        if r.1 != 0 {
+            perr(p, "unexpected end or else")
+        }
+        match r.0 {
+            Some(n) -> root.push(n)
+            None -> {}
+        }
+    }
+    if peek(p).kind == i_error() {
+        perr(p, peek(p).val)
+    }
+    if p.failed {
+        fail(p.why)
+    }
+    // The template itself goes in first, so that it is found first; a
+    // `define` of the same name follows Go's rule about empty trees.
+    var named = TplParser{ items: [], i: 0, vars: [], range_depth: 0, stack_depth: 0,
+        names: [name], bodies: [root], failed: false, why: "" }
+    for k in 0..p.names.len() {
+        add_tree(named, p.names[k], p.bodies[k])
+    }
+    if named.failed {
+        fail(named.why)
+    }
+    GoTemplate{ names: named.names, bodies: named.bodies }
+}
+
+// ---------------------------------------------------------------------------
+// Execution
+
+/// A value as Go's `reflect.Value` sees it: no value at all (state 0, what
+/// a missing map key gives), a nil interface (state 1, what a JSON `null`
+/// inside a map or list gives), or a value (state 2).
+type TplValue = {
+    state: i64,
+    v: ref GoValue,
+}
+
+type TplExec = {
+    tmpl: GoTemplate,
+    var_names: [str],
+    var_values: [TplValue],
+    out: str,
+    err: str,
+    depth: i64,
+}
+
+fn no_value() -> TplValue {
+    TplValue{ state: 0, v: goprintf.nil_value() }
+}
+
+fn nil_iface() -> TplValue {
+    TplValue{ state: 1, v: goprintf.nil_value() }
+}
+
+fn value_of(v: ref GoValue) -> TplValue {
+    TplValue{ state: 2, v: v }
+}
+
+/// An element of a list or map: an interface, nil when it holds `nil`.
+fn element(v: ref GoValue) -> TplValue {
+    match v {
+        GoNil -> nil_iface()
+        _ -> value_of(v)
+    }
+}
+
+/// `indirectInterface`: a nil interface becomes no value.
+fn indirect(v: TplValue) -> TplValue {
+    if v.state == 1 { no_value() } else { v }
+}
+
+fn xerr(inout st: TplExec, why: str) {
+    if st.err.len() == 0 {
+        st.err = why
+    }
+}
+
+fn failed(st: TplExec) -> bool {
+    st.err.len() > 0
+}
+
+/// Go's `isTrue`.
+fn truth(v: TplValue) -> bool {
+    if v.state != 2 {
+        return false
+    }
+    match v.v {
+        GoBool(b) -> b
+        GoInt(n) -> n != 0
+        GoUint(n) -> n != 0
+        GoFloat(f) -> f != 0.0
+        GoString(s) -> s.len() > 0
+        GoBytes(b) -> b.len() > 0
+        GoList(items) -> items.len() > 0
+        GoMap(keys, _) -> keys.len() > 0
+        GoNil -> false
+    }
+}
+
+fn kind_name(v: TplValue) -> str {
+    goprintf.type_name(v.v)
+}
+
+// Variables.
+
+/// A variable's value. The parser lets `{{$x := $x}}` through, since `$x`
+/// is declared by the time the right side is read; it is only at run time,
+/// before the declaration has happened, that the lookup fails.
+fn var_value(inout st: TplExec, name: str) -> TplValue {
+    var k = st.var_names.len() - 1
+    while k >= 0 {
+        if st.var_names[k] == name {
+            return st.var_values[k]
+        }
+        k = k - 1
+    }
+    xerr(st, "undefined variable: " + name)
+    no_value()
+}
+
+fn set_var(inout st: TplExec, name: str, v: TplValue) {
+    var k = st.var_names.len() - 1
+    while k >= 0 {
+        if st.var_names[k] == name {
+            st.var_values[k] = v
+            return
+        }
+        k = k - 1
+    }
+    xerr(st, "undefined variable: " + name)
+}
+
+fn push_var(inout st: TplExec, name: str, v: TplValue) {
+    st.var_names.push(name)
+    st.var_values.push(v)
+}
+
+fn pop_to(inout st: TplExec, mark: i64) {
+    while st.var_names.len() > mark {
+        let _ = st.var_names.pop()
+        let _ = st.var_values.pop()
+    }
+}
+
+// Constants.
+
+fn ideal_constant(inout st: TplExec, n: TplNum) -> TplValue {
+    if n.is_complex {
+        xerr(st, "complex constants are not supported")
+        return no_value()
+    }
+    let t = n.text
+    let hex_int = t.len() > 2 and t.starts_with("0") and (t.substr(1, 1) == "x" or t.substr(1, 1) == "X") and
+    not t.contains("p") and not t.contains("P")
+    let rune_int = t.starts_with("'")
+    if n.is_float and not hex_int and not rune_int and
+    (t.contains(".") or t.contains("e") or t.contains("E") or t.contains("p") or t.contains("P")) {
+        return value_of(goprintf.float_value(n.float_val))
+    }
+    if n.is_int {
+        return value_of(goprintf.int_value(n.int_val))
+    }
+    if n.is_uint {
+        xerr(st, t + " overflows int")
+    }
+    no_value()
+}
+
+// Fields.
+
+fn eval_field(inout st: TplExec, name: str, receiver: TplValue, has_args: bool) -> TplValue {
+    if receiver.state == 0 {
+        return no_value()
+    }
+    if receiver.state == 1 {
+        xerr(st, "nil pointer evaluating interface \{}." + name)
+        return no_value()
+    }
+    match receiver.v {
+        GoMap(keys, values) -> {
+            if has_args {
+                xerr(st, name + " is not a method but has arguments")
+                return no_value()
+            }
+            for k in 0..keys.len() {
+                if keys[k] == name {
+                    return element(values[k])
+                }
+            }
+            no_value()
+        }
+        _ -> {
+            xerr(st, "can't evaluate field " + name + " in type " + kind_name(receiver))
+            no_value()
+        }
+    }
+}
+
+fn eval_field_chain(inout st: TplExec, receiver_in: TplValue, idents: [str], has_args: bool) -> TplValue {
+    var receiver = receiver_in
+    for k in 0..idents.len() {
+        if failed(st) {
+            return no_value()
+        }
+        let last = k == idents.len() - 1
+        receiver = eval_field(st, idents[k], receiver, last and has_args)
+    }
+    receiver
+}
+
+fn not_a_function(inout st: TplExec, nargs: i64, has_final: bool) {
+    if nargs > 1 or has_final {
+        xerr(st, "can't give argument to non-function")
+    }
+}
+
+fn eval_variable(inout st: TplExec, idents: [str], nargs: i64, has_final: bool) -> TplValue {
+    let value = var_value(st, idents[0])
+    if idents.len() == 1 {
+        not_a_function(st, nargs, has_final)
+        return value
+    }
+    var rest: [str] = []
+    for k in 1..idents.len() {
+        rest.push(idents[k])
+    }
+    eval_field_chain(st, value, rest, nargs > 1 or has_final)
+}
+
+// Arguments, by the kind of parameter they are going to: 0 a
+// `reflect.Value`, 1 an `any`, 2 a `string`.
+
+fn validate(inout st: TplExec, v: TplValue, ptype: i64) -> TplValue {
+    if ptype == 0 {
+        return v
+    }
+    if ptype == 1 {
+        return if v.state == 0 { nil_iface() } else { v }
+    }
+    if v.state == 2 {
+        match v.v {
+            GoString(_) -> return v
+            _ -> {}
+        }
+        xerr(st, "wrong type for value; expected string; got " + kind_name(v))
+    } else {
+        xerr(st, "invalid value; expected string")
+    }
+    no_value()
+}
+
+fn eval_arg(inout st: TplExec, dot: TplValue, ptype: i64, node: ref TplArg) -> TplValue {
+    match node {
+        TplDot -> validate(st, dot, ptype)
+        TplNil -> {
+            if ptype == 2 {
+                xerr(st, "cannot assign nil to string")
+            }
+            if ptype == 1 { nil_iface() } else { no_value() }
+        }
+        TplField(idents) -> validate(st, eval_field_chain(st, dot, idents, false), ptype)
+        TplVariable(idents) -> validate(st, eval_variable(st, idents, 0, false), ptype)
+        TplSub(pipe) -> validate(st, eval_pipeline(st, dot, pipe), ptype)
+        TplIdent(name) -> validate(st, eval_call(st, dot, name, [], no_value(), false), ptype)
+        TplChain(inner, fields) -> validate(st, eval_chain(st, dot, inner, fields, 0, false), ptype)
+        TplString(text) -> value_of(goprintf.string_value(text))
+        TplBool(b) -> {
+            if ptype == 2 {
+                xerr(st, "expected string")
+            }
+            value_of(goprintf.bool_value(b))
+        }
+        TplNumber(n) -> {
+            if ptype == 2 {
+                xerr(st, "expected string")
+                return no_value()
+            }
+            ideal_constant(st, n)
+        }
+    }
+}
+
+fn eval_chain(inout st: TplExec, dot: TplValue, inner: ref TplArg, fields: [str], nargs: i64,
+    has_final: bool) -> TplValue {
+    match inner {
+        TplNil -> {
+            xerr(st, "indirection through explicit nil")
+            no_value()
+        }
+        _ -> {
+            let base_value = eval_arg(st, dot, 0, inner)
+            if failed(st) {
+                return no_value()
+            }
+            eval_field_chain(st, base_value, fields, nargs > 1 or has_final)
+        }
+    }
+}
+
+// Commands and pipelines.
+
+fn eval_command(inout st: TplExec, dot: TplValue, cmd: [ref TplArg], final: TplValue,
+    has_final: bool) -> TplValue {
+    let first = cmd[0]
+    let nargs = cmd.len()
+    match first {
+        TplField(idents) -> eval_field_chain(st, dot, idents, nargs > 1 or has_final)
+        TplChain(inner, fields) -> eval_chain(st, dot, inner, fields, nargs, has_final)
+        TplIdent(name) -> {
+            var args: [ref TplArg] = []
+            for k in 1..cmd.len() {
+                args.push(cmd[k])
+            }
+            eval_call(st, dot, name, args, final, has_final)
+        }
+        TplSub(pipe) -> {
+            not_a_function(st, nargs, has_final)
+            if failed(st) {
+                return no_value()
+            }
+            eval_pipeline(st, dot, pipe)
+        }
+        TplVariable(idents) -> eval_variable(st, idents, nargs, has_final)
+        _ -> {
+            not_a_function(st, nargs, has_final)
+            if failed(st) {
+                return no_value()
+            }
+            match first {
+                TplBool(b) -> value_of(goprintf.bool_value(b))
+                TplDot -> dot
+                TplNil -> {
+                    xerr(st, "nil is not a command")
+                    no_value()
+                }
+                TplNumber(n) -> ideal_constant(st, n)
+                TplString(text) -> value_of(goprintf.string_value(text))
+                _ -> no_value()
+            }
+        }
+    }
+}
+
+fn eval_pipeline(inout st: TplExec, dot: TplValue, pipe: ref TplPipe) -> TplValue {
+    var value = no_value()
+    var first = true
+    for cmd in pipe.cmds {
+        value = eval_command(st, dot, cmd, value, not first)
+        if failed(st) {
+            return no_value()
+        }
+        // An interface is unwrapped after every command; a nil one becomes
+        // no value at all.
+        value = indirect(value)
+        first = false
+    }
+    for name in pipe.decl {
+        if pipe.is_assign {
+            set_var(st, name, value)
+        } else {
+            push_var(st, name, value)
+        }
+    }
+    value
+}
+
+// Builtins. Each has Go's signature: the kinds of its fixed parameters
+// and of its variadic one (-1 for none).
+
+fn signature(name: str) -> ([i64], i64) {
+    if name == "and" or name == "or" or name == "index" or name == "slice" or name == "eq" or
+    name == "call" {
+        return ([0], 0)
+    }
+    if name == "not" or name == "len" {
+        return ([0], -1)
+    }
+    if name == "ne" or name == "lt" or name == "le" or name == "gt" or name == "ge" {
+        return ([0, 0], -1)
+    }
+    if name == "printf" {
+        return ([2], 1)
+    }
+    ([], 1)
+}
+
+fn as_any(v: TplValue) -> ref GoValue {
+    if v.state == 2 { v.v } else { goprintf.nil_value() }
+}
+
+fn as_str(v: TplValue) -> str {
+    match v.v {
+        GoString(s) -> s
+        _ -> ""
+    }
+}
+
+fn eval_call(inout st: TplExec, dot: TplValue, name: str, args: [ref TplArg], final: TplValue,
+    has_final: bool) -> TplValue {
+    let sig = signature(name)
+    let fixed = sig.0
+    let num_in = args.len() + if has_final { 1 } else { 0 }
+    if sig.1 >= 0 {
+        if num_in < fixed.len() {
+            xerr(st, "wrong number of args for " + name)
+            return no_value()
+        }
+    } else if num_in != fixed.len() {
+        xerr(st, "wrong number of args for " + name)
+        return no_value()
+    }
+    if name == "and" or name == "or" {
+        var v = no_value()
+        for a in args {
+            v = eval_arg(st, dot, 0, a)
+            if failed(st) {
+                return no_value()
+            }
+            if truth(indirect(v)) == (name == "or") {
+                return v
+            }
+        }
+        if has_final {
+            v = final
+        }
+        return v
+    }
+    var argv: [TplValue] = []
+    for k in 0..args.len() {
+        let ptype = if k < fixed.len() { fixed[k] } else { sig.1 }
+        argv.push(eval_arg(st, dot, ptype, args[k]))
+        if failed(st) {
+            return no_value()
+        }
+    }
+    if has_final {
+        let ptype = if argv.len() < fixed.len() { fixed[argv.len()] } else { sig.1 }
+        argv.push(validate(st, final, ptype))
+        if failed(st) {
+            return no_value()
+        }
+    }
+    call_builtin(st, name, argv)
+}
+
+fn call_builtin(inout st: TplExec, name: str, argv: [TplValue]) -> TplValue {
+    if name == "not" {
+        return value_of(goprintf.bool_value(not truth(indirect(argv[0]))))
+    }
+    if name == "len" {
+        return length(st, argv[0])
+    }
+    if name == "index" {
+        return index_of(st, argv)
+    }
+    if name == "slice" {
+        return slice_of(st, argv)
+    }
+    if name == "eq" or name == "ne" or name == "lt" or name == "le" or name == "gt" or name == "ge" {
+        return compare_call(st, name, argv)
+    }
+    if name == "call" {
+        xerr(st, if argv[0].state == 2 { "non-function of type " + kind_name(argv[0]) } else { "call of nil" })
+        return no_value()
+    }
+    var values: [ref GoValue] = []
+    for k in 0..argv.len() {
+        if name == "printf" and k == 0 {
+            continue
+        }
+        values.push(as_any(argv[k]))
+    }
+    if name == "print" {
+        return value_of(goprintf.string_value(goprintf.sprint(values)))
+    }
+    if name == "println" {
+        return value_of(goprintf.string_value(goprintf.sprintln(values)))
+    }
+    if name == "printf" {
+        return value_of(goprintf.string_value(goprintf.sprintf(as_str(argv[0]), values)))
+    }
+    let text = eval_args(values)
+    if name == "html" {
+        return value_of(goprintf.string_value(html_escape(text)))
+    }
+    if name == "js" {
+        return value_of(goprintf.string_value(js_escape(text)))
+    }
+    value_of(goprintf.string_value(query_escape(text)))
+}
+
+/// `evalArgs`: one string as it is, otherwise everything printed with
+/// `Sprint`, a nil printed as `<no value>`.
+fn eval_args(values: [ref GoValue]) -> str {
+    if values.len() == 1 {
+        match values[0] {
+            GoString(s) -> return s
+            _ -> {}
+        }
+    }
+    var shown: [ref GoValue] = []
+    for v in values {
+        match v {
+            GoNil -> shown.push(goprintf.string_value("<no value>"))
+            _ -> shown.push(v)
+        }
+    }
+    goprintf.sprint(shown)
+}
+
+fn html_escape(s: str) -> str {
+    var out = ""
+    for c in s.chars() {
+        if c == "\u{0}" {
+            out = out + "\u{fffd}"
+        } else if c == "\"" {
+            out = out + "&#34;"
+        } else if c == "'" {
+            out = out + "&#39;"
+        } else if c == "&" {
+            out = out + "&amp;"
+        } else if c == "<" {
+            out = out + "&lt;"
+        } else if c == ">" {
+            out = out + "&gt;"
+        } else {
+            out = out + c
+        }
+    }
+    out
+}
+
+fn hex_upper(v: i64, digits: i64) -> str {
+    let table = "0123456789ABCDEF"
+    var out = ""
+    var k = digits - 1
+    while k >= 0 {
+        out = out + table.substr(v.ushr(4 * k).bit_and(15), 1)
+        k = k - 1
+    }
+    out
+}
+
+fn js_escape(s: str) -> str {
+    var out = ""
+    for c in s.chars() {
+        let r = c.code_at(0)
+        if c == "\\" {
+            out = out + "\\\\"
+        } else if c == "'" {
+            out = out + "\\'"
+        } else if c == "\"" {
+            out = out + "\\\""
+        } else if c == "<" {
+            out = out + "\\u003C"
+        } else if c == ">" {
+            out = out + "\\u003E"
+        } else if c == "&" {
+            out = out + "\\u0026"
+        } else if c == "=" {
+            out = out + "\\u003D"
+        } else if r < 32 {
+            out = out + "\\u00" + hex_upper(r, 2)
+        } else if r >= 128 and not goquote.is_print(r) {
+            out = out + "\\u" + hex_upper(r, 4)
+        } else {
+            out = out + c
+        }
+    }
+    out
+}
+
+/// `url.QueryEscape`: unreserved bytes kept, space as `+`, the rest `%XX`.
+fn query_escape(s: str) -> str {
+    var out = ""
+    let b = s.to_bytes()
+    for i in 0..b.len() {
+        let c = b.at(i)
+        let keep = (c >= 48 and c <= 57) or (c >= 65 and c <= 90) or (c >= 97 and c <= 122) or
+        c == 45 or c == 95 or c == 46 or c == 126
+        if keep {
+            out = out + bytes_of([c]).to_str()
+        } else if c == 32 {
+            out = out + "+"
+        } else {
+            out = out + "%" + hex_upper(c, 2)
+        }
+    }
+    out
+}
+
+fn length(inout st: TplExec, v: TplValue) -> TplValue {
+    if v.state == 1 {
+        xerr(st, "len of nil pointer")
+        return no_value()
+    }
+    if v.state == 0 {
+        xerr(st, "len of invalid value")
+        return no_value()
+    }
+    match v.v {
+        GoString(s) -> value_of(goprintf.int_value(s.byte_len()))
+        GoBytes(b) -> value_of(goprintf.int_value(b.len()))
+        GoList(items) -> value_of(goprintf.int_value(items.len()))
+        GoMap(keys, _) -> value_of(goprintf.int_value(keys.len()))
+        _ -> {
+            xerr(st, "len of type " + kind_name(v))
+            no_value()
+        }
+    }
+}
+
+/// `indexArg`: an integer index no greater than `cap`.
+fn index_arg(inout st: TplExec, idx: TplValue, cap: i64) -> i64 {
+    var x = 0
+    if idx.state != 2 {
+        xerr(st, "cannot index slice/array with nil")
+        return -1
+    }
+    match idx.v {
+        GoInt(n) -> x = n
+        GoUint(n) -> x = n
+        _ -> {
+            xerr(st, "cannot index slice/array with type " + kind_name(idx))
+            return -1
+        }
+    }
+    if x < 0 or x > cap {
+        xerr(st, "index out of range")
+        return -1
+    }
+    x
+}
+
+fn index_of(inout st: TplExec, argv: [TplValue]) -> TplValue {
+    var item = indirect(argv[0])
+    if item.state == 0 {
+        xerr(st, "index of untyped nil")
+        return no_value()
+    }
+    for k in 1..argv.len() {
+        let idx = indirect(argv[k])
+        if item.state == 1 {
+            xerr(st, "index of nil pointer")
+            return no_value()
+        }
+        if item.state == 0 {
+            xerr(st, "index of invalid value")
+            return no_value()
+        }
+        match item.v {
+            GoList(items) -> {
+                let x = index_arg(st, idx, items.len())
+                if failed(st) {
+                    return no_value()
+                }
+                if x >= items.len() {
+                    xerr(st, "index out of range")
+                    return no_value()
+                }
+                item = element(items[x])
+            }
+            GoString(s) -> {
+                let b = s.to_bytes()
+                let x = index_arg(st, idx, b.len())
+                if failed(st) {
+                    return no_value()
+                }
+                if x >= b.len() {
+                    xerr(st, "index out of range")
+                    return no_value()
+                }
+                item = value_of(goprintf.uint_value(b.at(x)))
+            }
+            GoBytes(b) -> {
+                let x = index_arg(st, idx, b.len())
+                if failed(st) {
+                    return no_value()
+                }
+                if x >= b.len() {
+                    xerr(st, "index out of range")
+                    return no_value()
+                }
+                item = value_of(goprintf.uint_value(b.at(x)))
+            }
+            GoMap(keys, values) -> {
+                if idx.state != 2 {
+                    xerr(st, "value is nil; should be of type string")
+                    return no_value()
+                }
+                let key = match idx.v {
+                    GoString(s) -> s
+                    _ -> {
+                        xerr(st, "value has type " + kind_name(idx) + "; should be string")
+                        return no_value()
+                    }
+                }
+                var found = nil_iface()
+                for j in 0..keys.len() {
+                    if keys[j] == key {
+                        found = element(values[j])
+                    }
+                }
+                item = found
+            }
+            _ -> {
+                xerr(st, "can't index item of type " + kind_name(item))
+                return no_value()
+            }
+        }
+    }
+    item
+}
+
+fn slice_of(inout st: TplExec, argv: [TplValue]) -> TplValue {
+    let item = indirect(argv[0])
+    if item.state == 0 {
+        xerr(st, "slice of untyped nil")
+        return no_value()
+    }
+    let n = argv.len() - 1
+    if n > 3 {
+        xerr(st, "too many slice indexes")
+        return no_value()
+    }
+    var length_of = 0
+    match item.v {
+        GoString(s) -> {
+            if n == 3 {
+                xerr(st, "cannot 3-index slice a string")
+                return no_value()
+            }
+            length_of = s.byte_len()
+        }
+        GoList(items) -> length_of = items.len()
+        GoBytes(b) -> length_of = b.len()
+        _ -> {
+            xerr(st, "can't slice item of type " + kind_name(item))
+            return no_value()
+        }
+    }
+    var idx = [0, length_of, length_of]
+    for k in 0..n {
+        idx[k] = index_arg(st, indirect(argv[k + 1]), length_of)
+        if failed(st) {
+            return no_value()
+        }
+    }
+    if idx[0] > idx[1] {
+        xerr(st, "invalid slice index")
+        return no_value()
+    }
+    if n == 3 and idx[1] > idx[2] {
+        xerr(st, "invalid slice index")
+        return no_value()
+    }
+    match item.v {
+        GoString(s) -> value_of(goprintf.string_value(s.to_bytes().slice(idx[0], idx[1]).to_str()))
+        GoBytes(b) -> value_of(goprintf.bytes_value(b.slice(idx[0], idx[1])))
+        GoList(items) -> {
+            var out: [ref GoValue] = []
+            for k in idx[0]..idx[1] {
+                out.push(items[k])
+            }
+            value_of(goprintf.list_value(out))
+        }
+        _ -> no_value()
+    }
+}
+
+// Comparisons: Go's `eq`, `ne`, `lt`, `le`, `gt`, `ge`.
+
+/// Go's `basicKind`: 1 bool, 3 int, 4 float, 5 string, 6 uint, 0 none.
+fn basic_kind(v: TplValue) -> i64 {
+    if v.state != 2 {
+        return 0
+    }
+    match v.v {
+        GoBool(_) -> 1
+        GoInt(_) -> 3
+        GoFloat(_) -> 4
+        GoString(_) -> 5
+        GoUint(_) -> 6
+        _ -> 0
+    }
+}
+
+/// The reflect kind of a value that is not basic: 0 invalid, 1 slice, 2 map.
+fn other_kind(v: TplValue) -> i64 {
+    if v.state != 2 {
+        return 0
+    }
+    match v.v {
+        GoMap(_, _) -> 2
+        _ -> 1
+    }
+}
+
+fn int_of(v: TplValue) -> i64 {
+    match v.v {
+        GoInt(n) -> n
+        GoUint(n) -> n
+        _ -> 0
+    }
+}
+
+fn float_of(v: TplValue) -> f64 {
+    match v.v {
+        GoFloat(f) -> f
+        _ -> 0.0
+    }
+}
+
+fn bool_of(v: TplValue) -> bool {
+    match v.v {
+        GoBool(b) -> b
+        _ -> false
+    }
+}
+
+/// `eq arg1 arg2...`: true when `arg1` equals any of the rest.
+fn eq_values(inout st: TplExec, a1: TplValue, rest: [TplValue]) -> bool {
+    let a = indirect(a1)
+    if rest.len() == 0 {
+        xerr(st, "missing argument for comparison")
+        return false
+    }
+    let k1 = basic_kind(a)
+    for raw in rest {
+        let b = indirect(raw)
+        let k2 = basic_kind(b)
+        var same = false
+        if k1 != k2 {
+            if k1 == 3 and k2 == 6 {
+                same = int_of(a) >= 0 and int_of(a) == int_of(b)
+            } else if k1 == 6 and k2 == 3 {
+                same = int_of(b) >= 0 and int_of(a) == int_of(b)
+            } else if a.state == 2 and b.state == 2 {
+                xerr(st, "incompatible types for comparison")
+                return false
+            }
+        } else if k1 == 1 {
+            same = bool_of(a) == bool_of(b)
+        } else if k1 == 4 {
+            same = float_of(a) == float_of(b)
+        } else if k1 == 3 or k1 == 6 {
+            same = int_of(a) == int_of(b)
+        } else if k1 == 5 {
+            same = as_str(a) == as_str(b)
+        } else {
+            let o1 = other_kind(a)
+            let o2 = other_kind(b)
+            if o1 != o2 and o1 != 0 and o2 != 0 {
+                xerr(st, "non-comparable types")
+                return false
+            }
+            if a.state != 2 or b.state != 2 {
+                same = a.state != 2 and b.state != 2
+            } else {
+                xerr(st, "non-comparable type")
+                return false
+            }
+        }
+        if same {
+            return true
+        }
+    }
+    false
+}
+
+/// Unsigned comparison of two 64-bit patterns, -1, 0 or 1.
+fn ucompare(a: i64, b: i64) -> i64 {
+    ucmp(a, b)
+}
+
+fn lt_values(inout st: TplExec, a1: TplValue, b1: TplValue) -> bool {
+    let a = indirect(a1)
+    let b = indirect(b1)
+    let k1 = basic_kind(a)
+    let k2 = basic_kind(b)
+    if k1 == 0 or k2 == 0 {
+        xerr(st, "invalid type for comparison")
+        return false
+    }
+    if k1 != k2 {
+        if k1 == 3 and k2 == 6 {
+            return int_of(a) < 0 or ucompare(int_of(a), int_of(b)) < 0
+        }
+        if k1 == 6 and k2 == 3 {
+            return int_of(b) >= 0 and ucompare(int_of(a), int_of(b)) < 0
+        }
+        xerr(st, "incompatible types for comparison")
+        return false
+    }
+    if k1 == 1 {
+        xerr(st, "invalid type for comparison")
+        return false
+    }
+    if k1 == 4 {
+        return float_of(a) < float_of(b)
+    }
+    if k1 == 3 {
+        return int_of(a) < int_of(b)
+    }
+    if k1 == 5 {
+        return as_str(a) < as_str(b)
+    }
+    ucompare(int_of(a), int_of(b)) < 0
+}
+
+fn compare_call(inout st: TplExec, name: str, argv: [TplValue]) -> TplValue {
+    var result = false
+    if name == "eq" {
+        var rest: [TplValue] = []
+        for k in 1..argv.len() {
+            rest.push(argv[k])
+        }
+        result = eq_values(st, argv[0], rest)
+    } else if name == "ne" {
+        result = not eq_values(st, argv[0], [argv[1]])
+    } else if name == "lt" {
+        result = lt_values(st, argv[0], argv[1])
+    } else if name == "ge" {
+        result = not lt_values(st, argv[0], argv[1])
+    } else {
+        // le, and gt as its negation: less, or else equal.
+        var le = lt_values(st, argv[0], argv[1])
+        if not le and not failed(st) {
+            le = eq_values(st, argv[0], [argv[1]])
+        }
+        result = if name == "le" { le } else { not le }
+    }
+    if failed(st) {
+        return no_value()
+    }
+    value_of(goprintf.bool_value(result))
+}
+
+// Walking the tree. A walk answers 0 to carry on, 1 for `break`, 2 for
+// `continue`, and 3 when execution has failed.
+
+fn print_value(inout st: TplExec, v: TplValue) {
+    if v.state != 2 {
+        st.out = st.out + "<no value>"
+        return
+    }
+    st.out = st.out + goprintf.sprint([v.v])
+}
+
+fn walk(inout st: TplExec, dot: TplValue, nodes: [ref TplNode]) -> i64 {
+    for node in nodes {
+        let signal = walk_node(st, dot, node)
+        if failed(st) {
+            return 3
+        }
+        if signal != 0 {
+            return signal
+        }
+    }
+    0
+}
+
+fn walk_node(inout st: TplExec, dot: TplValue, node: ref TplNode) -> i64 {
+    match node {
+        TplText(text) -> {
+            st.out = st.out + text
+            0
+        }
+        TplAction(pipe) -> {
+            let v = eval_pipeline(st, dot, pipe)
+            if not failed(st) and pipe.decl.len() == 0 {
+                print_value(st, v)
+            }
+            0
+        }
+        TplIf(pipe, list, else_list) -> walk_if_with(st, dot, pipe, list, else_list, false)
+        TplWith(pipe, list, else_list) -> walk_if_with(st, dot, pipe, list, else_list, true)
+        TplRange(pipe, list, else_list, _) -> walk_range(st, dot, pipe, list, else_list)
+        TplTemplate(name, pipe, has_pipe) -> walk_template(st, dot, name, pipe, has_pipe)
+        TplBreak -> 1
+        TplContinue -> 2
+    }
+}
+
+fn walk_if_with(inout st: TplExec, dot: TplValue, pipe: ref TplPipe, list: [ref TplNode],
+    else_list: [ref TplNode], is_with: bool) -> i64 {
+    let mark = st.var_names.len()
+    let v = eval_pipeline(st, dot, pipe)
+    var signal = 0
+    if failed(st) {
+        signal = 3
+    } else if truth(indirect(v)) {
+        signal = walk(st, if is_with { v } else { dot }, list)
+    } else {
+        signal = walk(st, dot, else_list)
+    }
+    pop_to(st, mark)
+    signal
+}
+
+/// One pass of a range body, with its variables set as Go sets them.
+fn one_iteration(inout st: TplExec, pipe: ref TplPipe, list: [ref TplNode], mark: i64,
+    index: TplValue, elem: TplValue) -> i64 {
+    let n = pipe.decl.len()
+    if n > 0 {
+        if pipe.is_assign {
+            set_var(st, pipe.decl[0], if n > 1 { index } else { elem })
+        } else {
+            st.var_values[st.var_values.len() - 1] = elem
+        }
+    }
+    if n > 1 {
+        if pipe.is_assign {
+            set_var(st, pipe.decl[1], elem)
+        } else {
+            st.var_values[st.var_values.len() - 2] = index
+        }
+    }
+    let signal = walk(st, elem, list)
+    pop_to(st, mark)
+    signal
+}
+
+fn walk_range(inout st: TplExec, dot: TplValue, pipe: ref TplPipe, list: [ref TplNode],
+    else_list: [ref TplNode]) -> i64 {
+    let outer = st.var_names.len()
+    let v = indirect(eval_pipeline(st, dot, pipe))
+    if failed(st) {
+        pop_to(st, outer)
+        return 3
+    }
+    let mark = st.var_names.len()
+    var ran = false
+    var stop = false
+    if v.state == 2 {
+        match v.v {
+            GoInt(n) -> {
+                if pipe.decl.len() > 1 {
+                    xerr(st, "can't use an integer to iterate over more than one variable")
+                } else {
+                    var i = 0
+                    while i < n and not stop {
+                        ran = true
+                        let s = one_iteration(st, pipe, list, mark, no_value(),
+                            value_of(goprintf.int_value(i)))
+                        stop = s == 1 or s == 3
+                        i = i + 1
+                    }
+                }
+            }
+            GoList(items) -> {
+                var i = 0
+                while i < items.len() and not stop {
+                    ran = true
+                    let s = one_iteration(st, pipe, list, mark, value_of(goprintf.int_value(i)),
+                        element(items[i]))
+                    stop = s == 1 or s == 3
+                    i = i + 1
+                }
+            }
+            GoBytes(b) -> {
+                var i = 0
+                while i < b.len() and not stop {
+                    ran = true
+                    let s = one_iteration(st, pipe, list, mark, value_of(goprintf.int_value(i)),
+                        value_of(goprintf.uint_value(b.at(i))))
+                    stop = s == 1 or s == 3
+                    i = i + 1
+                }
+            }
+            GoMap(keys, values) -> {
+                var order: [(str, i64)] = []
+                for k in 0..keys.len() {
+                    order.push((keys[k], k))
+                }
+                order.sort()
+                var i = 0
+                while i < order.len() and not stop {
+                    ran = true
+                    let s = one_iteration(st, pipe, list, mark,
+                        value_of(goprintf.string_value(order[i].0)), element(values[order[i].1]))
+                    stop = s == 1 or s == 3
+                    i = i + 1
+                }
+            }
+            _ -> xerr(st, "range can't iterate over " + goprintf.sprint([v.v]))
+        }
+    }
+    var signal = if failed(st) { 3 } else { 0 }
+    if not ran and not failed(st) {
+        signal = walk(st, dot, else_list)
+        // Go recovers a `break` anywhere inside the range statement, the
+        // else branch included, so one there ends only this range; a
+        // `continue` there belongs to the enclosing one.
+        if signal == 1 {
+            signal = 0
+        }
+    }
+    pop_to(st, outer)
+    signal
+}
+
+fn walk_template(inout st: TplExec, dot: TplValue, name: str, pipe: ref TplPipe, has_pipe: bool) -> i64 {
+    var body: [ref TplNode] = []
+    var found = false
+    for k in 0..st.tmpl.names.len() {
+        if st.tmpl.names[k] == name {
+            body = st.tmpl.bodies[k]
+            found = true
+        }
+    }
+    if not found {
+        xerr(st, "template " + name + " not defined")
+        return 3
+    }
+    if st.depth >= 10000 {
+        xerr(st, "exceeded maximum template depth")
+        return 3
+    }
+    let inner = if has_pipe { eval_pipeline(st, dot, pipe) } else { no_value() }
+    if failed(st) {
+        return 3
+    }
+    let saved_names = st.var_names
+    let saved_values = st.var_values
+    st.var_names = ["$"]
+    st.var_values = [inner]
+    st.depth = st.depth + 1
+    let _ = walk(st, inner, body)
+    st.depth = st.depth - 1
+    st.var_names = saved_names
+    st.var_values = saved_values
+    if failed(st) { 3 } else { 0 }
+}
+
+/// `t.ExecuteTemplate(w, name, data)`: the output, or why execution
+/// stopped. Go writes the output up to the error; this keeps none of it.
+pub fn execute_template(t: GoTemplate, name: str, data: ref GoValue) -> str ! str {
+    var body: [ref TplNode] = []
+    var found = false
+    for k in 0..t.names.len() {
+        if t.names[k] == name {
+            body = t.bodies[k]
+            found = true
+        }
+    }
+    if not found {
+        fail("no template " + name)
+    }
+    let dot = match data {
+        GoNil -> no_value()
+        _ -> value_of(data)
+    }
+    var st = TplExec{ tmpl: t, var_names: ["$"], var_values: [dot], out: "", err: "", depth: 0 }
+    let _ = walk(st, dot, body)
+    if failed(st) {
+        fail(st.err)
+    }
+    st.out
+}
+
+/// `t.Execute(w, data)`: the template that was parsed, run on `data`.
+pub fn execute(t: GoTemplate, data: ref GoValue) -> str ! str {
+    try execute_template(t, t.names[0], data)
+}
+
+/// Parse and run in one step.
+pub fn render(text: str, data: ref GoValue) -> str ! str {
+    let t = try parse("t", text)
+    try execute(t, data)
+}

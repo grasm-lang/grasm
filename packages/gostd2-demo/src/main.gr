@@ -2,6 +2,7 @@
 // scripts/gostd2_diff.sh holds it to Go case for case; this is the short
 // version every engine runs.
 import goprintf
+import gotemplate
 
 fn main() / {io} {
     let args = [goprintf.float_value(1000000.0), goprintf.float_value(3.141592653589793),
@@ -22,6 +23,24 @@ fn main() / {io} {
     match goprintf.parse_json("\{\"n\": 3, \"l\": [true, null]}") {
         Some(v) -> assert_eq(goprintf.sprintf("%v", [v]), "map[l:[true <nil>] n:3]")
         None -> panic("goprintf could not read JSON")
+    }
+    // A Helm-shaped template: ranges in sorted key order, `and` with a
+    // comparison, and the two surprises a chart author meets -- a float that
+    // prints as 1e+06, and a missing key that prints as <no value>.
+    let chart = "replicas: \{\{ .replicas }}\n\{\{- range $k, $v := .labels }}\n  \{\{ $k }}: " +
+    "\{\{ printf \"%q\" $v }}\n\{\{- end }}\n\{\{ if and .enabled (gt (len .ports) 1) }}ports: " +
+    "\{\{ range $i, $p := .ports }}\{\{ if $i }}, \{\{ end }}\{\{ $p }}\{\{ end }}\{\{ end }}\n" +
+    "missing: \{\{ .nothing }}"
+    let values = goprintf.parse_json("\{\"replicas\": 1000000, \"labels\": \{\"tier\": \"web\", " +
+        "\"app\": \"shop\"}, \"enabled\": true, \"ports\": [80, 443]}") ?? goprintf.nil_value()
+    match gotemplate.render(chart, values) {
+        Ok(out) -> assert_eq(out,
+            "replicas: 1e+06\n  app: \"shop\"\n  tier: \"web\"\nports: 80, 443\nmissing: <no value>")
+        Err(why) -> panic("gotemplate refused the chart: " + why)
+    }
+    match gotemplate.render("\{\{ eq 1 1.0 }}", goprintf.nil_value()) {
+        Ok(_) -> panic("eq of an int and a float should be an error, as in Go")
+        Err(_) -> {}
     }
     print("gostd2: ok")
 }
