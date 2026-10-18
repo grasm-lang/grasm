@@ -1,0 +1,93 @@
+// Encrypted private keys: PKCS#8's EncryptedPrivateKeyInfo (RFC 5208
+// section 6, RFC 5958 section 3), the `-----BEGIN ENCRYPTED PRIVATE KEY-----`
+// file.
+//
+//     EncryptedPrivateKeyInfo ::= SEQUENCE {
+//         encryptionAlgorithm  AlgorithmIdentifier,
+//         encryptedData        OCTET STRING }
+//
+// The algorithm is a password-based scheme from `pbes` (PBES2 with PBKDF2
+// or scrypt and AES, or an older PBES1 or PKCS#12 scheme), and the
+// encrypted data is a PrivateKeyInfo, which `pkcs8` reads. `openssl
+// genpkey -aes256`, `openssl pkcs8 -topk8`, Java's keytool, Go's and
+// Python's libraries and most HSM exports write this.
+//
+// A wrong password is reported as one, never as some other error, and the
+// decrypted bytes must be a PrivateKeyInfo (a SEQUENCE starting with
+// version 0 or 1) before they are returned: padding that happens to come
+// out right under a wrong password is caught there.
+//
+// Checked against OpenSSL's `pkcs8`.
+import asn1
+import derwrite
+import pbes
+import pemfile
+
+type EncPkcs8Error =
+    | EncPkcs8Malformed(why: str)
+    | EncPkcs8Unsupported(oid: str)
+    | EncPkcs8BadPassword
+
+/// The AlgorithmIdentifier DER and the encrypted data.
+pub fn parts(der: bytes) -> (bytes, bytes) ! EncPkcs8Error {
+    let nodes = asn1.parse(der) ?? fail(EncPkcs8Malformed("not DER"))
+    if nodes.len() == 0 or nodes[0].tag != 48 {
+        fail(EncPkcs8Malformed("not a SEQUENCE"))
+    }
+    let k = asn1.child_indices(nodes, 0)
+    if k.len() != 2 or nodes[k[0]].tag != 48 or nodes[k[1]].tag != 4 {
+        fail(EncPkcs8Malformed("not an EncryptedPrivateKeyInfo"))
+    }
+    return (asn1.raw(der, nodes[k[0]]), asn1.value(der, nodes[k[1]]))
+}
+
+fn looks_like_private_key(der: bytes) -> bool {
+    return match asn1.parse(der) {
+        Ok(nodes) -> {
+            if nodes.len() < 2 or nodes[0].tag != 48 or nodes[1].tag != 2 or nodes[1].depth != 1 {
+                return false
+            }
+            let v = asn1.integer_of(der, nodes[1])
+            v == 0 or v == 1
+        }
+        Err(_) -> false
+    }
+}
+
+/// The PrivateKeyInfo DER inside.
+pub fn decrypt(der: bytes, password: bytes) -> bytes ! EncPkcs8Error {
+    let (alg, data) = try parts(der)
+    let plain = match pbes.decrypt(alg, password, data) {
+        Ok(p) -> p
+        Err(PbesUnsupported(oid)) -> fail(EncPkcs8Unsupported(oid))
+        Err(PbesMalformed(why)) -> fail(EncPkcs8Malformed(why))
+        Err(_) -> fail(EncPkcs8BadPassword)
+    }
+    if not looks_like_private_key(plain) {
+        fail(EncPkcs8BadPassword)
+    }
+    return plain
+}
+
+/// A PrivateKeyInfo encrypted under the scheme an AlgorithmIdentifier from
+/// `pbes` names.
+pub fn encrypt(private_key_info: bytes, password: bytes, alg: bytes) -> bytes ! EncPkcs8Error {
+    let data = pbes.encrypt(alg, password, private_key_info) ?? fail(EncPkcs8Malformed("the scheme"))
+    let body = derwrite.octet_string(data) ?? fail(EncPkcs8Malformed("DER"))
+    return derwrite.sequence([alg, body]) ?? fail(EncPkcs8Malformed("DER"))
+}
+
+/// The key from a PEM file's ENCRYPTED PRIVATE KEY block.
+pub fn decrypt_pem(text: str, password: bytes) -> bytes ! EncPkcs8Error {
+    let blocks = pemfile.parse(text) ?? fail(EncPkcs8Malformed("not PEM"))
+    for b in blocks {
+        if b.label == "ENCRYPTED PRIVATE KEY" {
+            return try decrypt(b.data, password)
+        }
+    }
+    fail(EncPkcs8Malformed("no ENCRYPTED PRIVATE KEY block"))
+}
+
+pub fn to_pem(der: bytes) -> str {
+    return pemfile.render(pemfile.block("ENCRYPTED PRIVATE KEY", der))
+}

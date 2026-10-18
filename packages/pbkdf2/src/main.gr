@@ -1,0 +1,45 @@
+// PBKDF2, the password-based key derivation of PKCS #5 v2 (RFC 8018
+// section 5.2), over any HMAC.
+//
+// Each block of output is U1 XOR U2 XOR ... XOR Uc, where U1 is the HMAC
+// (keyed with the password) of the salt and the block's 32-bit index, and
+// each later U is the HMAC of the one before; c, the iteration count, is
+// what makes guessing passwords slow. It protects encrypted PKCS#8 and
+// PKCS#12 files (PBES2), WPA2 passphrases (4096 rounds of HMAC-SHA1), Django
+// and many other password stores, iOS and Android backups, LUKS1 and
+// VeraCrypt volumes, and BIP-39 seeds.
+//
+// `crypto_hash.pbkdf2_sha256` covers the common case; this takes the HMAC
+// as a function, so PBKDF2 with HMAC-SHA1, -SHA-512, -SHA3 or -SM3 is the
+// same code. `hmac.hmac` partially applied to a hash is the usual argument.
+//
+// Checked against OpenSSL's PBKDF2.
+
+type Pbkdf2Error =
+    | Pbkdf2BadIterations(count: i64)
+    | Pbkdf2TooLong
+
+pub fn derive(mac: fn(bytes, bytes) -> bytes, password: bytes, salt: bytes, iterations: i64, length: i64) -> bytes ! Pbkdf2Error {
+    if iterations < 1 {
+        fail(Pbkdf2BadIterations(iterations))
+    }
+    var out: [i64] = []
+    var block = 1
+    while out.len() < length {
+        if block > 4294967295 {
+            fail(Pbkdf2TooLong)
+        }
+        let index = bytes_of([block.ushr(24).bit_and(255), block.ushr(16).bit_and(255), block.ushr(8).bit_and(255), block.bit_and(255)])
+        var u = mac(password, salt.concat(index))
+        var t = u.to_list()
+        for _i in 1..iterations {
+            u = mac(password, u)
+            for j in 0..t.len() {
+                t[j] = t[j].bit_xor(u.at(j))
+            }
+        }
+        out = out + t
+        block = block + 1
+    }
+    return bytes_of(out.slice(0, length))
+}

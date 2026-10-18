@@ -1,0 +1,36 @@
+[package]
+name = "pemcrypt"
+version = "1.0.0"
+capabilities = []
+
+[dependencies.pemfile]
+path = "../pemfile"
+version = "^1.0.0"
+
+[dependencies.md5]
+path = "../md5"
+version = "^1.0.0"
+
+[dependencies.aes]
+path = "../aes"
+version = "^1.0.0"
+
+[dependencies.des]
+path = "../des"
+version = "^1.0.0"
+
+[dependencies.camellia]
+path = "../camellia"
+version = "^1.0.0"
+
+[dependencies.aria]
+path = "../aria"
+version = "^1.0.0"
+
+[dependencies.blockmodes]
+path = "../blockmodes"
+version = "^1.0.0"
+
+[dependencies.asn1]
+path = "../asn1"
+version = "^1.0.0"

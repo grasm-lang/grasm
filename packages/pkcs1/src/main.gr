@@ -1,0 +1,161 @@
+// RSA keys as PKCS#1 writes them (RFC 8017 appendix A.1): the
+// `-----BEGIN RSA PRIVATE KEY-----` and `-----BEGIN RSA PUBLIC KEY-----`
+// structures, and their conversion to and from PKCS#8 and
+// SubjectPublicKeyInfo.
+//
+//     RSAPrivateKey ::= SEQUENCE {
+//         version Version, modulus n, publicExponent e, privateExponent d,
+//         prime1 p, prime2 q, exponent1 d mod (p-1), exponent2 d mod (q-1),
+//         coefficient q^-1 mod p, otherPrimeInfos OtherPrimeInfos OPTIONAL }
+//     RSAPublicKey ::= SEQUENCE { modulus n, publicExponent e }
+//
+// OpenSSL's "traditional" key files, SSH's RSA keys before its own format,
+// and a PKCS#8 key's inner `privateKey` for RSA are all RSAPrivateKey.
+// Multi-prime keys (version 1) carry their extra primes in
+// otherPrimeInfos, each a prime, its exponent and its coefficient, and
+// are read and written too.
+//
+// Integers are big-endian magnitudes without leading zeros; the DER
+// encoder adds the zero a set top bit needs. Encrypted traditional files
+// (DEK-Info headers) are `pemcrypt`'s.
+//
+// Checked against OpenSSL's `rsa` and `pkey`.
+import asn1
+import derwrite
+
+type Pkcs1Private = { n: bytes, e: bytes, d: bytes, p: bytes, q: bytes, dp: bytes, dq: bytes, qinv: bytes, others: [[bytes]] }
+
+type Pkcs1Public = { n: bytes, e: bytes }
+
+type Pkcs1Error =
+    | Pkcs1Malformed(why: str)
+
+let RSA_OID = "1.2.840.113549.1.1.1"
+
+fn magnitude(der: bytes, n: DerNode) -> bytes ! Pkcs1Error {
+    if n.tag != 2 or n.len == 0 {
+        fail(Pkcs1Malformed("an INTEGER was expected"))
+    }
+    let v = asn1.value(der, n)
+    if v.at(0) >= 128 {
+        fail(Pkcs1Malformed("a negative number"))
+    }
+    var i = 0
+    while i < v.len() - 1 and v.at(i) == 0 {
+        i = i + 1
+    }
+    return v.slice(i, v.len())
+}
+
+fn top(der: bytes) -> ([DerNode], [i64]) ! Pkcs1Error {
+    let nodes = asn1.parse(der) ?? fail(Pkcs1Malformed("not DER"))
+    if nodes.len() == 0 or nodes[0].tag != 48 {
+        fail(Pkcs1Malformed("not a SEQUENCE"))
+    }
+    return (nodes, asn1.child_indices(nodes, 0))
+}
+
+pub fn parse_private(der: bytes) -> Pkcs1Private ! Pkcs1Error {
+    let (nodes, k) = try top(der)
+    if k.len() < 9 or nodes[k[0]].tag != 2 {
+        fail(Pkcs1Malformed("not an RSAPrivateKey"))
+    }
+    let version = asn1.integer_of(der, nodes[k[0]])
+    var f: [bytes] = []
+    for i in 1..9 {
+        f.push(try magnitude(der, nodes[k[i]]))
+    }
+    var others: [[bytes]] = []
+    if version == 1 {
+        if k.len() != 10 or nodes[k[9]].tag != 48 {
+            fail(Pkcs1Malformed("a version 1 key without its other primes"))
+        }
+        for o in asn1.child_indices(nodes, k[9]) {
+            let t = asn1.child_indices(nodes, o)
+            if t.len() != 3 {
+                fail(Pkcs1Malformed("an OtherPrimeInfo"))
+            }
+            others.push([try magnitude(der, nodes[t[0]]), try magnitude(der, nodes[t[1]]), try magnitude(der, nodes[t[2]])])
+        }
+    } else if version != 0 or k.len() != 9 {
+        fail(Pkcs1Malformed("an unknown version"))
+    }
+    return Pkcs1Private{ n: f[0], e: f[1], d: f[2], p: f[3], q: f[4], dp: f[5], dq: f[6], qinv: f[7], others: others }
+}
+
+fn der_or(r: bytes ! DerWriteError) -> bytes ! Pkcs1Error {
+    return r ?? fail(Pkcs1Malformed("DER"))
+}
+
+fn int(v: bytes) -> bytes ! Pkcs1Error {
+    return try der_or(derwrite.integer_unsigned(v))
+}
+
+pub fn write_private(k: Pkcs1Private) -> bytes ! Pkcs1Error {
+    var items = [try der_or(derwrite.integer(if k.others.len() > 0 { 1 } else { 0 }))]
+    for v in [k.n, k.e, k.d, k.p, k.q, k.dp, k.dq, k.qinv] {
+        items.push(try int(v))
+    }
+    if k.others.len() > 0 {
+        var infos: [bytes] = []
+        for o in k.others {
+            infos.push(try der_or(derwrite.sequence([try int(o[0]), try int(o[1]), try int(o[2])])))
+        }
+        items.push(try der_or(derwrite.sequence(infos)))
+    }
+    return try der_or(derwrite.sequence(items))
+}
+
+pub fn parse_public(der: bytes) -> Pkcs1Public ! Pkcs1Error {
+    let (nodes, k) = try top(der)
+    if k.len() != 2 {
+        fail(Pkcs1Malformed("not an RSAPublicKey"))
+    }
+    return Pkcs1Public{ n: try magnitude(der, nodes[k[0]]), e: try magnitude(der, nodes[k[1]]) }
+}
+
+pub fn write_public(k: Pkcs1Public) -> bytes ! Pkcs1Error {
+    return try der_or(derwrite.sequence([try int(k.n), try int(k.e)]))
+}
+
+pub fn public_of(k: Pkcs1Private) -> Pkcs1Public {
+    return Pkcs1Public{ n: k.n, e: k.e }
+}
+
+/// RSAPrivateKey DER wrapped as a PKCS#8 PrivateKeyInfo.
+pub fn to_pkcs8(rsa_private: bytes) -> bytes ! Pkcs1Error {
+    return try der_or(derwrite.sequence([try der_or(derwrite.integer(0)), try der_or(derwrite.algorithm_with_null(RSA_OID)),
+        try der_or(derwrite.octet_string(rsa_private))]))
+}
+
+fn algorithm_oid(der: bytes, nodes: [DerNode], i: i64) -> str {
+    let a = asn1.child_indices(nodes, i)
+    return if a.len() > 0 and nodes[a[0]].tag == 6 { asn1.oid_of(der, nodes[a[0]]) } else { "" }
+}
+
+/// The RSAPrivateKey DER inside a PKCS#8 PrivateKeyInfo for RSA.
+pub fn from_pkcs8(pkcs8: bytes) -> bytes ! Pkcs1Error {
+    let (nodes, k) = try top(pkcs8)
+    if k.len() < 3 or nodes[k[1]].tag != 48 or nodes[k[2]].tag != 4 or algorithm_oid(pkcs8, nodes, k[1]) != RSA_OID {
+        fail(Pkcs1Malformed("not an RSA PrivateKeyInfo"))
+    }
+    return asn1.value(pkcs8, nodes[k[2]])
+}
+
+/// RSAPublicKey DER wrapped as a SubjectPublicKeyInfo.
+pub fn to_spki(rsa_public: bytes) -> bytes ! Pkcs1Error {
+    return try der_or(derwrite.sequence([try der_or(derwrite.algorithm_with_null(RSA_OID)), try der_or(derwrite.bit_string(rsa_public, 0))]))
+}
+
+/// The RSAPublicKey DER inside a SubjectPublicKeyInfo for RSA.
+pub fn from_spki(spki: bytes) -> bytes ! Pkcs1Error {
+    let (nodes, k) = try top(spki)
+    if k.len() != 2 or nodes[k[1]].tag != 3 or algorithm_oid(spki, nodes, k[0]) != RSA_OID {
+        fail(Pkcs1Malformed("not an RSA SubjectPublicKeyInfo"))
+    }
+    let bits = asn1.value(spki, nodes[k[1]])
+    if bits.len() < 1 or bits.at(0) != 0 {
+        fail(Pkcs1Malformed("a BIT STRING with unused bits"))
+    }
+    return bits.slice(1, bits.len())
+}

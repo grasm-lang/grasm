@@ -1,0 +1,329 @@
+// Password-based encryption as PKCS#8, PKCS#12 and CMS name it: PBES2
+// (RFC 8018), PBES1 (PKCS #5 v1.5) and the PKCS#12 PBE schemes (RFC 7292
+// appendix C), each read from its DER AlgorithmIdentifier.
+//
+// An encrypted private key or PKCS#12 bag says how it was encrypted in an
+// AlgorithmIdentifier: an OID, and parameters holding the salt, the
+// iteration count and whatever else that scheme needs. `decrypt` and
+// `encrypt` take that DER and a password; the builders below write one.
+//
+// - PBES2 derives the key with PBKDF2 (HMAC-SHA-1, -SHA-256, -SHA-384,
+//   -SHA-512 or -SHA-512/256) or scrypt, and encrypts with AES, Triple DES,
+//   DES, Camellia or ARIA in CBC mode with PKCS#7 padding. It is what
+//   `openssl pkcs8 -topk8` and current PKCS#12 files use.
+// - PBES1 derives key and IV together with PBKDF1 over MD5 or SHA-1, for
+//   DES or 64-bit RC2: old Java keystores and PKCS#8 files.
+// - The PKCS#12 schemes derive with pkcs12kdf over SHA-1 (purposes 1 and 2)
+//   for RC4, two- and three-key Triple DES, and 40- and 128-bit RC2. Their
+//   password is hashed as a BMPString; the others hash the password bytes.
+//
+// A wrong password almost always shows up as bad padding. A refusal does
+// not say which, so it cannot be used to tell the two apart.
+//
+// Checked against OpenSSL's `pkcs8 -topk8` and its decryption.
+import asn1
+import derwrite
+import pbkdf2
+import pbkdf1
+import pkcs12kdf
+import scrypt
+import hmac
+import sha1
+import md5
+import crypto_hash
+import sha512
+import aes
+import des
+import rc2
+import rc4
+import camellia
+import aria
+import blockmodes
+
+type PbesError =
+    | PbesUnsupported(oid: str)
+    | PbesMalformed(why: str)
+    | PbesBadPadding
+    | PbesBadArgument(why: str)
+
+/// How a key is made and what it encrypts with, once the DER is read.
+type PbesPlan = { cipher: str, key: bytes, iv: bytes }
+
+let PKCS5 = "1.2.840.113549.1.5."
+let PKCS12_PBE = "1.2.840.113549.1.12.1."
+let HMAC_OID = "1.2.840.113549.2."
+let SCRYPT_OID = "1.3.6.1.4.1.11591.4.11"
+
+/// Cipher names and OIDs for PBES2.
+fn ciphers() -> [(str, str, i64)] {
+    let aes_arc = "2.16.840.1.101.3.4.1."
+    let cam = "1.2.392.200011.61.1.1.1."
+    let ar = "1.2.410.200046.1.1."
+    return [("aes-128-cbc", aes_arc + "2", 16), ("aes-192-cbc", aes_arc + "22", 24), ("aes-256-cbc", aes_arc + "42", 32),
+        ("des-ede3-cbc", "1.2.840.113549.3.7", 24), ("des-cbc", "1.3.14.3.2.7", 8), ("camellia-128-cbc", cam + "2", 16),
+        ("camellia-192-cbc", cam + "3", 24), ("camellia-256-cbc", cam + "4", 32), ("aria-128-cbc", ar + "2", 16),
+        ("aria-192-cbc", ar + "7", 24), ("aria-256-cbc", ar + "12", 32)]
+}
+
+/// PBKDF2 PRFs: name, OID suffix under 1.2.840.113549.2, hash, block size.
+fn prfs() -> [(str, str, fn(bytes) -> bytes, i64)] {
+    return [("hmacWithSHA1", "7", |x| sha1.hash(x), 64), ("hmacWithSHA256", "9", |x| crypto_hash.sha256_of(x), 64),
+        ("hmacWithSHA384", "10", |x| sha512.sha384(x), 128), ("hmacWithSHA512", "11", |x| sha512.sha512(x), 128),
+        ("hmacWithSHA512-256", "13", |x| sha512.sha512_256(x), 128)]
+}
+
+/// PBES1 and PKCS#12 schemes: name, OID, cipher, key length.
+fn schemes() -> [(str, str, str, i64)] {
+    return [("pbeWithMD5AndDES-CBC", PKCS5 + "3", "des-cbc", 8), ("pbeWithMD5AndRC2-CBC", PKCS5 + "6", "rc2-64", 8),
+        ("pbeWithSHA1AndDES-CBC", PKCS5 + "10", "des-cbc", 8), ("pbeWithSHA1AndRC2-CBC", PKCS5 + "11", "rc2-64", 8),
+        ("pbeWithSHAAnd128BitRC4", PKCS12_PBE + "1", "rc4", 16), ("pbeWithSHAAnd40BitRC4", PKCS12_PBE + "2", "rc4", 5),
+        ("pbeWithSHAAnd3-KeyTripleDES-CBC", PKCS12_PBE + "3", "des-ede3-cbc", 24),
+        ("pbeWithSHAAnd2-KeyTripleDES-CBC", PKCS12_PBE + "4", "des-ede2-cbc", 16),
+        ("pbeWithSHAAnd128BitRC2-CBC", PKCS12_PBE + "5", "rc2-128", 16), ("pbeWithSHAAnd40BitRC2-CBC", PKCS12_PBE + "6", "rc2-40", 5)]
+}
+
+// --- Ciphers --------------------------------------------------------------------------------
+
+fn block_fns(cipher: str, key: bytes) -> (i64, fn(bytes) -> bytes, fn(bytes) -> bytes) ! PbesError {
+    if cipher.starts_with("aes") {
+        let c = aes.new_cipher(key)
+        return (16, |b| aes.encrypt_with(c, b), |b| aes.decrypt_with(c, b))
+    }
+    if cipher.starts_with("camellia") {
+        let c = camellia.new_cipher(key) ?? fail(PbesBadArgument("key"))
+        return (16, |b| camellia.encrypt_block(c, b), |b| camellia.decrypt_block(c, b))
+    }
+    if cipher.starts_with("aria") {
+        let c = aria.new_cipher(key) ?? fail(PbesBadArgument("key"))
+        return (16, |b| aria.encrypt_block(c, b), |b| aria.decrypt_block(c, b))
+    }
+    if cipher.starts_with("rc2") {
+        let bits = if cipher == "rc2-40" { 40 } else if cipher == "rc2-64" { 64 } else { 128 }
+        let c = rc2.new_cipher(key, bits) ?? fail(PbesBadArgument("key"))
+        return (8, |b| rc2.encrypt_block(c, b), |b| rc2.decrypt_block(c, b))
+    }
+    let full = if cipher == "des-ede2-cbc" { key.concat(key.slice(0, 8)) } else { key }
+    let c = if cipher == "des-cbc" { des.new_cipher(full) ?? fail(PbesBadArgument("key")) } else {
+        des.new_triple(full) ?? fail(PbesBadArgument("key"))
+    }
+    return (8, |b| des.encrypt_block(c, b) ?? b, |b| des.decrypt_block(c, b) ?? b)
+}
+
+fn run(p: PbesPlan, data: bytes, encrypting: bool) -> bytes ! PbesError {
+    if p.cipher == "rc4" {
+        return rc4.apply(p.key, data) ?? fail(PbesBadArgument("key"))
+    }
+    let (bs, enc, dec) = try block_fns(p.cipher, p.key)
+    if p.iv.len() != bs {
+        fail(PbesMalformed("an IV of the wrong length"))
+    }
+    if encrypting {
+        return blockmodes.cbc_encrypt(bs, enc, p.iv, blockmodes.pad(data, bs)) ?? fail(PbesBadArgument("data"))
+    }
+    let padded = blockmodes.cbc_decrypt(bs, dec, p.iv, data) ?? fail(PbesBadPadding)
+    return blockmodes.unpad(padded, bs) ?? fail(PbesBadPadding)
+}
+
+// --- Reading the AlgorithmIdentifier --------------------------------------------------------
+
+fn octets(der: bytes, nodes: [DerNode], i: i64) -> bytes ! PbesError {
+    if i >= nodes.len() or nodes[i].tag != 4 {
+        fail(PbesMalformed("an OCTET STRING was expected"))
+    }
+    return asn1.value(der, nodes[i])
+}
+
+fn small_int(der: bytes, nodes: [DerNode], i: i64) -> i64 ! PbesError {
+    if i >= nodes.len() or nodes[i].tag != 2 or nodes[i].len > 8 {
+        fail(PbesMalformed("an INTEGER was expected"))
+    }
+    let v = asn1.integer_of(der, nodes[i])
+    if v < 1 {
+        fail(PbesMalformed("a count below 1"))
+    }
+    return v
+}
+
+/// The OID and the index of the parameters node of the AlgorithmIdentifier
+/// at node i.
+fn algorithm_at(der: bytes, nodes: [DerNode], i: i64) -> (str, i64) ! PbesError {
+    let kids = asn1.child_indices(nodes, i)
+    if nodes[i].tag != 48 or kids.len() < 1 or nodes[kids[0]].tag != 6 {
+        fail(PbesMalformed("an AlgorithmIdentifier was expected"))
+    }
+    return (asn1.oid_of(der, nodes[kids[0]]), if kids.len() > 1 { kids[1] } else { 0 - 1 })
+}
+
+fn pbes2_key(der: bytes, nodes: [DerNode], kdf: i64, password: bytes, key_len: i64) -> bytes ! PbesError {
+    let (oid, at) = try algorithm_at(der, nodes, kdf)
+    if at < 0 {
+        fail(PbesMalformed("no key derivation parameters"))
+    }
+    let k = asn1.child_indices(nodes, at)
+    if oid == SCRYPT_OID {
+        if k.len() < 4 {
+            fail(PbesMalformed("scrypt parameters"))
+        }
+        let salt = try octets(der, nodes, k[0])
+        return scrypt.derive(password, salt, try small_int(der, nodes, k[1]), try small_int(der, nodes, k[2]),
+            try small_int(der, nodes, k[3]), key_len) ?? fail(PbesMalformed("scrypt parameters"))
+    }
+    if oid != PKCS5 + "12" {
+        fail(PbesUnsupported(oid))
+    }
+    if k.len() < 2 {
+        fail(PbesMalformed("PBKDF2 parameters"))
+    }
+    let salt = try octets(der, nodes, k[0])
+    let iterations = try small_int(der, nodes, k[1])
+    var prf_oid = HMAC_OID + "7"
+    for idx in k.slice(2, k.len()) {
+        if nodes[idx].tag == 48 {
+            let (o, _p) = try algorithm_at(der, nodes, idx)
+            prf_oid = o
+        } else if nodes[idx].tag == 2 and asn1.integer_of(der, nodes[idx]) != key_len {
+            fail(PbesMalformed("a key length that does not fit the cipher"))
+        }
+    }
+    for p in prfs() {
+        if HMAC_OID + p.1 == prf_oid {
+            let h = p.2
+            let block = p.3
+            return pbkdf2.derive(|key, m| hmac.hmac(h, block, key, m), password, salt, iterations, key_len) ?? fail(PbesMalformed("PBKDF2"))
+        }
+    }
+    fail(PbesUnsupported(prf_oid))
+}
+
+fn pbes2_plan(der: bytes, nodes: [DerNode], params: i64, password: bytes) -> PbesPlan ! PbesError {
+    let k = asn1.child_indices(nodes, params)
+    if k.len() != 2 {
+        fail(PbesMalformed("PBES2 parameters"))
+    }
+    let (enc_oid, iv_at) = try algorithm_at(der, nodes, k[1])
+    for c in ciphers() {
+        if c.1 == enc_oid {
+            let iv = try octets(der, nodes, iv_at)
+            return PbesPlan{ cipher: c.0, key: try pbes2_key(der, nodes, k[0], password, c.2), iv: iv }
+        }
+    }
+    fail(PbesUnsupported(enc_oid))
+}
+
+fn bmp(password: bytes) -> bytes {
+    return pkcs12kdf.bmp_password(password.to_str())
+}
+
+fn legacy_plan(der: bytes, nodes: [DerNode], oid: str, params: i64, password: bytes) -> PbesPlan ! PbesError {
+    let k = asn1.child_indices(nodes, params)
+    if params < 0 or k.len() != 2 {
+        fail(PbesMalformed("PBE parameters"))
+    }
+    let salt = try octets(der, nodes, k[0])
+    let iterations = try small_int(der, nodes, k[1])
+    for s in schemes() {
+        if s.1 == oid {
+            if oid.starts_with(PKCS5) {
+                let h: fn(bytes) -> bytes = if s.0.starts_with("pbeWithMD5") { |x| md5.hash(x) } else { |x| sha1.hash(x) }
+                let dk = pbkdf1.derive(h, password, salt, iterations, 16) ?? fail(PbesMalformed("PBKDF1"))
+                return PbesPlan{ cipher: s.2, key: dk.slice(0, 8), iv: dk.slice(8, 16) }
+            }
+            let p = bmp(password)
+            let h = |x| sha1.hash(x)
+            let key = pkcs12kdf.derive(h, 64, p, salt, 1, iterations, s.3) ?? fail(PbesMalformed("PKCS#12 KDF"))
+            let iv = if s.2 == "rc4" { bytes_of([]) } else {
+                pkcs12kdf.derive(h, 64, p, salt, 2, iterations, 8) ?? fail(PbesMalformed("PKCS#12 KDF"))
+            }
+            return PbesPlan{ cipher: s.2, key: key, iv: iv }
+        }
+    }
+    fail(PbesUnsupported(oid))
+}
+
+fn plan(alg: bytes, password: bytes) -> PbesPlan ! PbesError {
+    let nodes = asn1.parse(alg) ?? fail(PbesMalformed("not DER"))
+    if nodes.len() == 0 {
+        fail(PbesMalformed("empty"))
+    }
+    let (oid, params) = try algorithm_at(alg, nodes, 0)
+    if oid == PKCS5 + "13" {
+        if params < 0 {
+            fail(PbesMalformed("no PBES2 parameters"))
+        }
+        return try pbes2_plan(alg, nodes, params, password)
+    }
+    return try legacy_plan(alg, nodes, oid, params, password)
+}
+
+/// The plaintext of data encrypted as the AlgorithmIdentifier says.
+pub fn decrypt(alg: bytes, password: bytes, data: bytes) -> bytes ! PbesError {
+    return try run(try plan(alg, password), data, false)
+}
+
+/// Data encrypted as the AlgorithmIdentifier says.
+pub fn encrypt(alg: bytes, password: bytes, data: bytes) -> bytes ! PbesError {
+    return try run(try plan(alg, password), data, true)
+}
+
+// --- Writing one ----------------------------------------------------------------------------
+
+fn der_or(r: bytes ! DerWriteError) -> bytes ! PbesError {
+    return r ?? fail(PbesBadArgument("DER"))
+}
+
+/// PBES2 with PBKDF2: a cipher name ("aes-256-cbc"), a PRF name
+/// ("hmacWithSHA256"), the salt, the iteration count and the IV.
+pub fn pbes2(cipher: str, prf: str, salt: bytes, iterations: i64, iv: bytes) -> bytes ! PbesError {
+    var cipher_oid = ""
+    for c in ciphers() {
+        if c.0 == cipher {
+            cipher_oid = c.1
+        }
+    }
+    var prf_oid = ""
+    for p in prfs() {
+        if p.0 == prf {
+            prf_oid = HMAC_OID + p.1
+        }
+    }
+    if cipher_oid.len() == 0 or prf_oid.len() == 0 {
+        fail(PbesBadArgument("an unknown cipher or PRF"))
+    }
+    var kdf_params = [try der_or(derwrite.octet_string(salt)), try der_or(derwrite.integer(iterations))]
+    // hmacWithSHA1 is the default, and DER leaves a default out.
+    if prf != "hmacWithSHA1" {
+        kdf_params.push(try der_or(derwrite.algorithm_with_null(prf_oid)))
+    }
+    let kdf = try der_or(derwrite.algorithm_with(PKCS5 + "12", try der_or(derwrite.sequence(kdf_params))))
+    let enc = try der_or(derwrite.algorithm_with(cipher_oid, try der_or(derwrite.octet_string(iv))))
+    return try der_or(derwrite.algorithm_with(PKCS5 + "13", try der_or(derwrite.sequence([kdf, enc]))))
+}
+
+/// PBES2 with scrypt (RFC 7914 section 7).
+pub fn pbes2_scrypt(cipher: str, salt: bytes, n: i64, r: i64, p: i64, iv: bytes) -> bytes ! PbesError {
+    var cipher_oid = ""
+    for c in ciphers() {
+        if c.0 == cipher {
+            cipher_oid = c.1
+        }
+    }
+    if cipher_oid.len() == 0 {
+        fail(PbesBadArgument("an unknown cipher"))
+    }
+    let params = try der_or(derwrite.sequence([try der_or(derwrite.octet_string(salt)), try der_or(derwrite.integer(n)),
+        try der_or(derwrite.integer(r)), try der_or(derwrite.integer(p))]))
+    let kdf = try der_or(derwrite.algorithm_with(SCRYPT_OID, params))
+    let enc = try der_or(derwrite.algorithm_with(cipher_oid, try der_or(derwrite.octet_string(iv))))
+    return try der_or(derwrite.algorithm_with(PKCS5 + "13", try der_or(derwrite.sequence([kdf, enc]))))
+}
+
+/// A PBES1 or PKCS#12 scheme by name ("pbeWithSHAAnd3-KeyTripleDES-CBC").
+pub fn pbe(scheme: str, salt: bytes, iterations: i64) -> bytes ! PbesError {
+    for s in schemes() {
+        if s.0 == scheme {
+            let params = try der_or(derwrite.sequence([try der_or(derwrite.octet_string(salt)), try der_or(derwrite.integer(iterations))]))
+            return try der_or(derwrite.algorithm_with(s.1, params))
+        }
+    }
+    fail(PbesBadArgument("an unknown scheme"))
+}

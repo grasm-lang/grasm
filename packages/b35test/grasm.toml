@@ -1,0 +1,56 @@
+[package]
+name = "b35test"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.pbkdf2]
+path = "../pbkdf2"
+version = "^1.0.0"
+
+[dependencies.pbes]
+path = "../pbes"
+version = "^1.0.0"
+
+[dependencies.encpkcs8]
+path = "../encpkcs8"
+version = "^1.0.0"
+
+[dependencies.pkcs1]
+path = "../pkcs1"
+version = "^1.0.0"
+
+[dependencies.sec1]
+path = "../sec1"
+version = "^1.0.0"
+
+[dependencies.pemcrypt]
+path = "../pemcrypt"
+version = "^1.0.0"
+
+[dependencies.pemfile]
+path = "../pemfile"
+version = "^1.0.0"
+
+[dependencies.hmac]
+path = "../hmac"
+version = "^1.0.0"
+
+[dependencies.sha1]
+path = "../sha1"
+version = "^1.0.0"
+
+[dependencies.crypto_hash]
+path = "../crypto_hash"
+version = "^1.0.0"
+
+[dependencies.sha512]
+path = "../sha512"
+version = "^1.0.0"
+
+[dependencies.sha3]
+path = "../sha3"
+version = "^1.0.0"
+
+[dependencies.sm3]
+path = "../sm3"
+version = "^1.0.0"

@@ -1,0 +1,162 @@
+// OpenSSL's legacy PEM encryption: `Proc-Type: 4,ENCRYPTED` and `DEK-Info`
+// headers (RFC 1421's format, as OpenSSL writes it).
+//
+//     -----BEGIN RSA PRIVATE KEY-----
+//     Proc-Type: 4,ENCRYPTED
+//     DEK-Info: AES-256-CBC,6B0C0BB8A3D12F6F2E9D25F6E3B7F0F1
+//
+//     ...base64...
+//
+// `openssl genrsa -aes256`, `openssl rsa -des3`, and every tool that wrote
+// "traditional" keys before PKCS#8 produced these, and Apache, nginx and
+// OpenVPN still read them. The key is OpenSSL's EVP_BytesToKey with MD5
+// and one round: MD5 of the password and the IV's first 8 bytes, then MD5
+// of that, the password and the salt again, until there is enough key.
+// The body is the DER encrypted in CBC mode with PKCS#7 padding.
+//
+// A wrong password is reported as one: the decrypted bytes must be a single
+// DER SEQUENCE, since wrong-key padding is valid about once in 256 tries.
+//
+// That derivation is a single MD5 per 16 bytes of key, so these files are
+// easy to brute-force; `encpkcs8` with PBES2 is the replacement. This
+// reads them, and writes them for the systems that still want them.
+//
+// Checked against OpenSSL's `rsa` and `ec` with -aes*, -des3, -des,
+// -camellia* and -aria*.
+import asn1
+import pemfile
+import md5
+import aes
+import des
+import camellia
+import aria
+import blockmodes
+
+type PemCryptError =
+    | PemCryptNotEncrypted
+    | PemCryptUnsupported(cipher: str)
+    | PemCryptMalformed(why: str)
+    | PemCryptBadPassword
+
+fn key_length(cipher: str) -> i64 {
+    if cipher == "DES-CBC" {
+        return 8
+    }
+    if cipher == "DES-EDE3-CBC" {
+        return 24
+    }
+    for size in [128, 192, 256] {
+        for family in ["AES", "CAMELLIA", "ARIA"] {
+            if cipher == "{family}-{size}-CBC" {
+                return size / 8
+            }
+        }
+    }
+    return 0
+}
+
+/// EVP_BytesToKey with MD5, one round, and the IV's first 8 bytes as salt.
+pub fn bytes_to_key(password: bytes, salt: bytes, length: i64) -> bytes {
+    var out: [i64] = []
+    var prev: [i64] = []
+    while out.len() < length {
+        prev = md5.hash(bytes_of(prev).concat(password).concat(salt)).to_list()
+        out = out + prev
+    }
+    return bytes_of(out.slice(0, length))
+}
+
+fn block_fns(cipher: str, key: bytes) -> (i64, fn(bytes) -> bytes, fn(bytes) -> bytes) ! PemCryptError {
+    if cipher.starts_with("AES") {
+        let c = aes.new_cipher(key)
+        return (16, |b| aes.encrypt_with(c, b), |b| aes.decrypt_with(c, b))
+    }
+    if cipher.starts_with("CAMELLIA") {
+        let c = camellia.new_cipher(key) ?? fail(PemCryptUnsupported(cipher))
+        return (16, |b| camellia.encrypt_block(c, b), |b| camellia.decrypt_block(c, b))
+    }
+    if cipher.starts_with("ARIA") {
+        let c = aria.new_cipher(key) ?? fail(PemCryptUnsupported(cipher))
+        return (16, |b| aria.encrypt_block(c, b), |b| aria.decrypt_block(c, b))
+    }
+    let c = if cipher == "DES-CBC" { des.new_cipher(key) ?? fail(PemCryptUnsupported(cipher)) } else {
+        des.new_triple(key) ?? fail(PemCryptUnsupported(cipher))
+    }
+    return (8, |b| des.encrypt_block(c, b) ?? b, |b| des.decrypt_block(c, b) ?? b)
+}
+
+fn unhex(s: str) -> bytes ! PemCryptError {
+    if s.len() % 2 != 0 {
+        fail(PemCryptMalformed("an odd-length IV"))
+    }
+    var out: [i64] = []
+    var i = 0
+    while i < s.len() {
+        let v = s.substr(i, 2).parse_int_base(16) ?? -1
+        if v < 0 or v > 255 or s.substr(i, 1) == "-" or s.substr(i, 1) == "+" {
+            fail(PemCryptMalformed("an IV that is not hex"))
+        }
+        out.push(v)
+        i = i + 2
+    }
+    return bytes_of(out)
+}
+
+fn hex_upper(b: bytes) -> str {
+    let d = "0123456789ABCDEF"
+    var out = ""
+    for i in 0..b.len() {
+        out = out + d.substr(b.at(i) / 16, 1) + d.substr(b.at(i) % 16, 1)
+    }
+    return out
+}
+
+/// The DER inside an encrypted block.
+pub fn decrypt(b: PemBlock, password: bytes) -> bytes ! PemCryptError {
+    let proc = pemfile.header(b, "Proc-Type") ?? fail(PemCryptNotEncrypted)
+    if proc != "4,ENCRYPTED" {
+        fail(PemCryptNotEncrypted)
+    }
+    let info = pemfile.header(b, "DEK-Info") ?? fail(PemCryptMalformed("no DEK-Info"))
+    let comma = info.index_of(",") ?? fail(PemCryptMalformed("DEK-Info without an IV"))
+    let cipher = info.substr(0, comma)
+    let iv = try unhex(info.substr(comma + 1, info.len() - comma - 1))
+    let n = key_length(cipher)
+    if n == 0 {
+        fail(PemCryptUnsupported(cipher))
+    }
+    let key = bytes_to_key(password, iv.slice(0, if iv.len() < 8 { iv.len() } else { 8 }), n)
+    let (bs, _enc, dec) = try block_fns(cipher, key)
+    if iv.len() != bs {
+        fail(PemCryptMalformed("an IV of the wrong length"))
+    }
+    let padded = blockmodes.cbc_decrypt(bs, dec, iv, b.data) ?? fail(PemCryptBadPassword)
+    let der = blockmodes.unpad(padded, bs) ?? fail(PemCryptBadPassword)
+    // About one wrong password in 256 still leaves valid padding; what it
+    // decrypts to is then not one DER SEQUENCE, which is what a key is.
+    let whole = match asn1.parse(der) {
+        Ok(nodes) -> nodes.len() > 0 and nodes[0].tag == 48 and nodes[0].body + nodes[0].len == der.len()
+        Err(_) -> false
+    }
+    if not whole {
+        fail(PemCryptBadPassword)
+    }
+    return der
+}
+
+/// DER encrypted under a password, as a block with the given label. The IV
+/// must be the cipher's block size and random.
+pub fn encrypt(label: str, der: bytes, password: bytes, cipher: str, iv: bytes) -> PemBlock ! PemCryptError {
+    let n = key_length(cipher)
+    if n == 0 {
+        fail(PemCryptUnsupported(cipher))
+    }
+    let key = bytes_to_key(password, iv.slice(0, if iv.len() < 8 { iv.len() } else { 8 }), n)
+    let (bs, enc, _dec) = try block_fns(cipher, key)
+    if iv.len() != bs {
+        fail(PemCryptMalformed("an IV of the wrong length"))
+    }
+    let data = blockmodes.cbc_encrypt(bs, enc, iv, blockmodes.pad(der, bs)) ?? fail(PemCryptMalformed("CBC"))
+    return PemBlock{ label: label, data: data, header_key: ["Proc-Type", "DEK-Info"],
+        header_value: ["4,ENCRYPTED", cipher + "," + hex_upper(iv)] }
+}

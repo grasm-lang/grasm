@@ -1,0 +1,117 @@
+// Elliptic-curve private keys as SEC 1 writes them (RFC 5915): the
+// `-----BEGIN EC PRIVATE KEY-----` structure, and its conversion to and from
+// PKCS#8.
+//
+//     ECPrivateKey ::= SEQUENCE {
+//         version        INTEGER { ecPrivkeyVer1(1) },
+//         privateKey     OCTET STRING,
+//         parameters [0] ECParameters {{ NamedCurve }} OPTIONAL,
+//         publicKey  [1] BIT STRING OPTIONAL }
+//
+// The private key is the scalar as a fixed-length big-endian string (as
+// long as the curve's order, leading zeros kept); the public key is the
+// encoded point. OpenSSL's `ec` writes the curve and the public key; inside
+// a PKCS#8 PrivateKeyInfo the curve moves to the AlgorithmIdentifier and
+// the [0] field is left out. Only named curves are read: explicit curve
+// parameters (RFC 5480 forbids them in certificates) are refused.
+//
+// Checked against OpenSSL's `ec` and `pkcs8`.
+import asn1
+import derwrite
+
+type Sec1Key = { private: bytes, curve: str, public: bytes }
+
+type Sec1Error =
+    | Sec1Malformed(why: str)
+    | Sec1ExplicitCurve
+
+let EC_OID = "1.2.840.10045.2.1"
+
+fn top(der: bytes) -> ([DerNode], [i64]) ! Sec1Error {
+    let nodes = asn1.parse(der) ?? fail(Sec1Malformed("not DER"))
+    if nodes.len() == 0 or nodes[0].tag != 48 {
+        fail(Sec1Malformed("not a SEQUENCE"))
+    }
+    return (nodes, asn1.child_indices(nodes, 0))
+}
+
+pub fn parse(der: bytes) -> Sec1Key ! Sec1Error {
+    let (nodes, k) = try top(der)
+    if k.len() < 2 or nodes[k[0]].tag != 2 or asn1.integer_of(der, nodes[k[0]]) != 1 or nodes[k[1]].tag != 4 {
+        fail(Sec1Malformed("not an ECPrivateKey"))
+    }
+    var curve = ""
+    var public = bytes_of([])
+    var last = 0
+    for i in k.slice(2, k.len()) {
+        let tag = nodes[i].tag
+        if tag <= last or (tag != 160 and tag != 161) {
+            fail(Sec1Malformed("fields out of order"))
+        }
+        last = tag
+        let inner = asn1.child_indices(nodes, i)
+        if inner.len() != 1 {
+            fail(Sec1Malformed("an explicit tag with other than one value"))
+        }
+        let v = nodes[inner[0]]
+        if tag == 160 {
+            if v.tag != 6 {
+                fail(Sec1ExplicitCurve)
+            }
+            curve = asn1.oid_of(der, v)
+        } else {
+            let bits = asn1.value(der, v)
+            if v.tag != 3 or bits.len() < 1 or bits.at(0) != 0 {
+                fail(Sec1Malformed("a public key that is not a whole-byte BIT STRING"))
+            }
+            public = bits.slice(1, bits.len())
+        }
+    }
+    return Sec1Key{ private: asn1.value(der, nodes[k[1]]), curve: curve, public: public }
+}
+
+fn der_or(r: bytes ! DerWriteError) -> bytes ! Sec1Error {
+    return r ?? fail(Sec1Malformed("DER"))
+}
+
+/// The ECPrivateKey DER; the curve and public key are written when present.
+pub fn write(k: Sec1Key) -> bytes ! Sec1Error {
+    var items = [try der_or(derwrite.integer(1)), try der_or(derwrite.octet_string(k.private))]
+    if k.curve.len() > 0 {
+        items.push(try der_or(derwrite.explicit(0, try der_or(derwrite.oid(k.curve)))))
+    }
+    if k.public.len() > 0 {
+        items.push(try der_or(derwrite.explicit(1, try der_or(derwrite.bit_string(k.public, 0)))))
+    }
+    return try der_or(derwrite.sequence(items))
+}
+
+/// An ECPrivateKey (which must name its curve) as a PKCS#8 PrivateKeyInfo:
+/// the curve moves into the AlgorithmIdentifier.
+pub fn to_pkcs8(sec1: bytes) -> bytes ! Sec1Error {
+    let k = try parse(sec1)
+    if k.curve.len() == 0 {
+        fail(Sec1Malformed("no curve to name"))
+    }
+    let inner = try write(Sec1Key{ private: k.private, curve: "", public: k.public })
+    let alg = try der_or(derwrite.algorithm_with(EC_OID, try der_or(derwrite.oid(k.curve))))
+    return try der_or(derwrite.sequence([try der_or(derwrite.integer(0)), alg, try der_or(derwrite.octet_string(inner))]))
+}
+
+/// The ECPrivateKey inside a PKCS#8 PrivateKeyInfo, with the curve put
+/// back into its [0] field.
+pub fn from_pkcs8(pkcs8: bytes) -> bytes ! Sec1Error {
+    let (nodes, k) = try top(pkcs8)
+    if k.len() < 3 or nodes[k[1]].tag != 48 or nodes[k[2]].tag != 4 {
+        fail(Sec1Malformed("not a PrivateKeyInfo"))
+    }
+    let a = asn1.child_indices(nodes, k[1])
+    if a.len() != 2 or nodes[a[0]].tag != 6 or asn1.oid_of(pkcs8, nodes[a[0]]) != EC_OID {
+        fail(Sec1Malformed("not an EC PrivateKeyInfo"))
+    }
+    if nodes[a[1]].tag != 6 {
+        fail(Sec1ExplicitCurve)
+    }
+    let inner = try parse(asn1.value(pkcs8, nodes[k[2]]))
+    return try write(Sec1Key{ private: inner.private, curve: asn1.oid_of(pkcs8, nodes[a[1]]), public: inner.public })
+}

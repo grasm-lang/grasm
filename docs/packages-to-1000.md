@@ -256,6 +256,24 @@ day its reference is installed.
 
 ## Landed
 
+- [x] **B35: key files** — B10's `pkcs1`, with `pbkdf2` `pbes` `encpkcs8`
+  `sec1` `pemcrypt`, which were not on the list (B10 named the files these
+  read; `pkcs8` had left encrypted keys, PKCS#1 and SEC1 to other
+  packages), and the harness `b35test`; the new gate `b35diff` runs 1,781
+  cases against OpenSSL 3.6 on a fresh key pool each run (RSA of five
+  sizes, three-prime RSA, e = 3, EC on five curves, Ed25519, X25519 and
+  Ed448): every PKCS#1 and SEC1 structure read and written back byte for
+  byte and converted to and from PKCS#8 and SubjectPublicKeyInfo as
+  OpenSSL converts it; keys OpenSSL encrypted with PBES2 (five PRFs,
+  eleven ciphers, scrypt) and the ten PBES1 and PKCS#12 schemes opened
+  here, and keys encrypted here with `pbes`'s builders opened there;
+  traditional `DEK-Info` PEM both ways with eleven ciphers; PBKDF2 over
+  six hashes; and wrong passwords refused by both. A wrong password
+  leaves valid padding about once in 256 tries, so the first run caught
+  `pemcrypt` returning the garbage where OpenSSL, parsing it, refuses;
+  both `pemcrypt` and `encpkcs8` now require the result to be a key. One
+  break per package turned it red.
+
 - [x] **B34: hashes, HMAC and key derivation** — B8's `ripemd160`
   `whirlpool` `sm3`, B10's `kbkdf` `x963kdf` `tls12prf` `sshkdf`, and
   `mdc2` `hmac` `sskdf` `x942kdf` `pkcs12kdf` `krb5kdf` `pbkdf1`, which
@@ -633,7 +651,7 @@ day its reference is installed.
 | | |
 |---|---|
 | At the start | 669 |
-| Now | 878 |
+| Now | 885 |
 | Candidates above | 316 packages in 28 batches, plus `ecc`, `rfc6979` and `goprintf` |
 | Harnesses, one a batch | 28 |
 | If every candidate lands | 1016 |

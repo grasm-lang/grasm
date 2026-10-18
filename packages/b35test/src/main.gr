@@ -1,0 +1,145 @@
+// The Grasm side of scripts/b35_diff.py: `<op> x x<fields>`, the fields
+// `|`-separated, bytes in hex and numbers in decimal. Answers are hex, or
+// ERR.
+import pbkdf2
+import pbes
+import encpkcs8
+import pkcs1
+import sec1
+import pemcrypt
+import pemfile
+import hmac
+import sha1
+import crypto_hash
+import sha512
+import sha3
+import sm3
+
+fn from_hex(text: str) -> bytes {
+    var out: [i64] = []
+    var i = 1
+    while i + 1 < text.len() {
+        let v = text.substr(i, 2).parse_int_base(16) ?? 0
+        out.push(if v < 0 or v > 255 { 0 } else { v })
+        i = i + 2
+    }
+    bytes_of(out)
+}
+
+fn unhex(text: str) -> bytes {
+    from_hex(":" + text)
+}
+
+fn hex(raw: bytes) -> str {
+    let digits = "0123456789abcdef"
+    var out = ""
+    var i = 0
+    while i < raw.len() {
+        out = out + digits.substr(raw.at(i) / 16, 1) + digits.substr(raw.at(i) % 16, 1)
+        i = i + 1
+    }
+    out
+}
+
+fn int(s: str) -> i64 {
+    s.parse_int() ?? 0
+}
+
+fn mac_of(name: str) -> fn(bytes, bytes) -> bytes {
+    if name == "sha1" {
+        return |k, m| hmac.hmac(|x| sha1.hash(x), 64, k, m)
+    }
+    if name == "sha256" {
+        return |k, m| hmac.hmac(|x| crypto_hash.sha256_of(x), 64, k, m)
+    }
+    if name == "sha384" {
+        return |k, m| hmac.hmac(|x| sha512.sha384(x), 128, k, m)
+    }
+    if name == "sha512" {
+        return |k, m| hmac.hmac(|x| sha512.sha512(x), 128, k, m)
+    }
+    if name == "sha3-256" {
+        return |k, m| hmac.hmac(|x| sha3.sha3_256(x), 136, k, m)
+    }
+    return |k, m| hmac.hmac(|x| sm3.hash(x), 64, k, m)
+}
+
+fn keys(op: str, f: [bytes]) -> bytes ! str {
+    if op == "pkcs1.round" {
+        return pkcs1.write_private(pkcs1.parse_private(f[0]) ?? fail("x")) ?? fail("x")
+    }
+    if op == "pkcs1.public" {
+        return pkcs1.write_public(pkcs1.public_of(pkcs1.parse_private(f[0]) ?? fail("x"))) ?? fail("x")
+    }
+    if op == "pkcs1.pubround" {
+        return pkcs1.write_public(pkcs1.parse_public(f[0]) ?? fail("x")) ?? fail("x")
+    }
+    if op == "pkcs1.to8" {
+        return pkcs1.to_pkcs8(f[0]) ?? fail("x")
+    }
+    if op == "pkcs1.from8" {
+        return pkcs1.from_pkcs8(f[0]) ?? fail("x")
+    }
+    if op == "pkcs1.tospki" {
+        return pkcs1.to_spki(f[0]) ?? fail("x")
+    }
+    if op == "pkcs1.fromspki" {
+        return pkcs1.from_spki(f[0]) ?? fail("x")
+    }
+    if op == "sec1.round" {
+        return sec1.write(sec1.parse(f[0]) ?? fail("x")) ?? fail("x")
+    }
+    if op == "sec1.to8" {
+        return sec1.to_pkcs8(f[0]) ?? fail("x")
+    }
+    return sec1.from_pkcs8(f[0]) ?? fail("x")
+}
+
+fn run(op: str, g: [str], f: [bytes]) -> bytes ! str {
+    if op.starts_with("pbkdf2.") {
+        return pbkdf2.derive(mac_of(op.substr(7, op.len() - 7)), f[0], f[1], int(g[2]), int(g[3])) ?? fail("x")
+    }
+    if op == "pbes.dec" {
+        return pbes.decrypt(f[0], f[1], f[2]) ?? fail("x")
+    }
+    if op == "pbes2.build" {
+        return pbes.pbes2(f[0].to_str(), f[1].to_str(), f[2], int(g[3]), f[4]) ?? fail("x")
+    }
+    if op == "pbes2s.build" {
+        return pbes.pbes2_scrypt(f[0].to_str(), f[1], int(g[2]), int(g[3]), int(g[4]), f[5]) ?? fail("x")
+    }
+    if op == "pbe.build" {
+        return pbes.pbe(f[0].to_str(), f[1], int(g[2])) ?? fail("x")
+    }
+    if op == "enc8.dec" {
+        return encpkcs8.decrypt(f[0], f[1]) ?? fail("x")
+    }
+    if op == "enc8.enc" {
+        return encpkcs8.encrypt(f[0], f[1], f[2]) ?? fail("x")
+    }
+    if op == "pem.dec" {
+        let blocks = pemfile.parse(f[0].to_str()) ?? fail("x")
+        return pemcrypt.decrypt(blocks[0], f[1]) ?? fail("x")
+    }
+    if op == "pem.enc" {
+        return pemfile.render(pemcrypt.encrypt(f[0].to_str(), f[1], f[2], f[3].to_str(), f[4]) ?? fail("x")).to_bytes()
+    }
+    return try keys(op, f)
+}
+
+fn answer(op: str, text: str) -> str {
+    let g = text.split("|")
+    match run(op, g, g.map(|x| unhex(x))) {
+        Ok(b) -> hex(b)
+        Err(_) -> "ERR"
+    }
+}
+
+fn main() / {io} {
+    let argv = args()
+    var i = 0
+    while i + 2 < argv.len() {
+        print(answer(argv[i], from_hex(argv[i + 2]).to_str()))
+        i = i + 3
+    }
+}

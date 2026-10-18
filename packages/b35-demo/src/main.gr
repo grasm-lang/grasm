@@ -1,0 +1,57 @@
+// A private key encrypted with PBES2, opened with the password and refused
+// without it; an RSA key between PKCS#1 and PKCS#8; an EC key between SEC1
+// and PKCS#8; and a traditional encrypted PEM file.
+// scripts/b35_diff.sh holds them to OpenSSL.
+import pbkdf2
+import pbes
+import encpkcs8
+import pkcs1
+import sec1
+import pemcrypt
+import pemfile
+import hmac
+import crypto_hash
+
+fn filled(n: i64, v: i64) -> bytes {
+    var out: [i64] = []
+    while out.len() < n {
+        out.push(v)
+    }
+    bytes_of(out)
+}
+
+fn main() / {io} {
+    let none = bytes_of([])
+    // PBKDF2 over HMAC-SHA-256 is crypto_hash's own PBKDF2.
+    let mac = |k, m| hmac.hmac(|x| crypto_hash.sha256_of(x), 64, k, m)
+    assert_eq(pbkdf2.derive(mac, "password".to_bytes(), "salt".to_bytes(), 1, 32) ?? none,
+        crypto_hash.pbkdf2_sha256("password".to_bytes(), "salt".to_bytes(), 1, 32))
+
+    // A tiny RSA key (n = 3233, the textbook example) as PKCS#1, then PKCS#8.
+    let rsa = pkcs1.write_private(Pkcs1Private{ n: bytes_of([12, 161]), e: bytes_of([17]), d: bytes_of([11, 3]),
+        p: bytes_of([61]), q: bytes_of([53]), dp: bytes_of([53]), dq: bytes_of([49]), qinv: bytes_of([38]), others: [] }) ?? none
+    let p8 = pkcs1.to_pkcs8(rsa) ?? none
+    assert_eq(pkcs1.from_pkcs8(p8) ?? none, rsa)
+    assert_eq((pkcs1.parse_private(rsa) ?? panic("parse")).e, bytes_of([17]))
+
+    // Encrypted with PBES2 (PBKDF2-HMAC-SHA256, AES-256-CBC).
+    let alg = pbes.pbes2("aes-256-cbc", "hmacWithSHA256", filled(16, 1), 10, filled(16, 2)) ?? none
+    let locked = encpkcs8.encrypt(p8, "hunter2".to_bytes(), alg) ?? none
+    assert_eq(encpkcs8.decrypt(locked, "hunter2".to_bytes()) ?? none, p8)
+    assert_eq((encpkcs8.decrypt(locked, "hunter3".to_bytes()) ?? none).len(), 0)
+    assert_eq(encpkcs8.to_pem(locked).starts_with("-----BEGIN ENCRYPTED PRIVATE KEY-----"), true)
+
+    // An EC key (a made-up P-256 scalar) between SEC1 and PKCS#8.
+    let ec = sec1.write(Sec1Key{ private: filled(32, 7), curve: "1.2.840.10045.3.1.7", public: none }) ?? none
+    let ec8 = sec1.to_pkcs8(ec) ?? none
+    assert_eq(sec1.from_pkcs8(ec8) ?? none, ec)
+
+    // A traditional key file encrypted the old OpenSSL way.
+    let pem = pemcrypt.encrypt("RSA PRIVATE KEY", rsa, "hunter2".to_bytes(), "AES-128-CBC", filled(16, 3)) ?? panic("encrypt")
+    let text = pemfile.render(pem)
+    assert_eq(text.contains("DEK-Info: AES-128-CBC,03030303030303030303030303030303"), true)
+    let back = pemfile.parse(text) ?? []
+    assert_eq(pemcrypt.decrypt(back[0], "hunter2".to_bytes()) ?? none, rsa)
+    assert_eq((pemcrypt.decrypt(back[0], "nope".to_bytes()) ?? none).len(), 0)
+    print("b35: ok")
+}

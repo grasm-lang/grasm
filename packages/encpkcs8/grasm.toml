@@ -1,0 +1,20 @@
+[package]
+name = "encpkcs8"
+version = "1.0.0"
+capabilities = []
+
+[dependencies.asn1]
+path = "../asn1"
+version = "^1.0.0"
+
+[dependencies.derwrite]
+path = "../derwrite"
+version = "^1.0.0"
+
+[dependencies.pbes]
+path = "../pbes"
+version = "^1.0.0"
+
+[dependencies.pemfile]
+path = "../pemfile"
+version = "^1.0.0"
