@@ -1,0 +1,62 @@
+// KMAC: the Keccak MAC of NIST SP 800-185.
+//
+// HMAC exists because SHA-2 is vulnerable to length extension; a sponge is
+// not, so a MAC on SHA-3 can simply hash the key in front of the message.
+// KMAC does that with framing: the key padded to a whole block of the
+// sponge, the message, and the output length, all through cSHAKE with the
+// function name "KMAC" and an optional customisation string, so a KMAC
+// output is unrelated to any SHAKE or cSHAKE output and asking for a
+// different length gives a different answer, not a prefix.
+//
+// KMACXOF writes a zero length instead, so its output is an extendable
+// stream whose prefixes agree. KMAC128 has 128-bit security, KMAC256
+// 256-bit. Both are in the CNSA 2.0 suite and in ML-KEM-based hybrids'
+// key derivation; SP 800-108 and SP 800-56C name KMAC as a KDF.
+//
+// A key of any length is taken, as SP 800-185 allows, though one shorter
+// than the security level wanted (16 or 32 bytes) gives less than that.
+//
+// Checked against OpenSSL's EVP_MAC KMAC128 and KMAC256, with keys of 4
+// bytes or more: OpenSSL refuses shorter ones, which the standard does not.
+import sha3
+import bytes_codec
+
+fn kmac(rate: i64, key: bytes, message: bytes, out_len: i64, custom: bytes, xof: bool) -> bytes {
+    let framed = sha3.bytepad(sha3.encode_string(key), rate).concat(message)
+        .concat(sha3.right_encode(if xof { 0 } else { out_len * 8 }))
+    return if rate == 168 {
+        sha3.cshake128(framed, out_len, "KMAC".to_bytes(), custom)
+    } else {
+        sha3.cshake256(framed, out_len, "KMAC".to_bytes(), custom)
+    }
+}
+
+/// KMAC128: out_len bytes of MAC of the message under the key, with an
+/// optional customisation string.
+pub fn kmac128(key: bytes, message: bytes, out_len: i64, custom: bytes) -> bytes {
+    return kmac(168, key, message, out_len, custom, false)
+}
+
+pub fn kmac256(key: bytes, message: bytes, out_len: i64, custom: bytes) -> bytes {
+    return kmac(136, key, message, out_len, custom, false)
+}
+
+/// KMACXOF128: as KMAC128 with the length left out, so shorter outputs are
+/// prefixes of longer ones.
+pub fn kmacxof128(key: bytes, message: bytes, out_len: i64, custom: bytes) -> bytes {
+    return kmac(168, key, message, out_len, custom, true)
+}
+
+pub fn kmacxof256(key: bytes, message: bytes, out_len: i64, custom: bytes) -> bytes {
+    return kmac(136, key, message, out_len, custom, true)
+}
+
+/// Whether a tag is the message's KMAC256 of the tag's own length.
+pub fn verify256(key: bytes, message: bytes, custom: bytes, tag: bytes) -> bool {
+    return tag.len() > 0 and bytes_codec.equal_constant_time(kmac256(key, message, tag.len(), custom), tag)
+}
+
+/// Whether a tag is the message's KMAC128 of the tag's own length.
+pub fn verify128(key: bytes, message: bytes, custom: bytes, tag: bytes) -> bool {
+    return tag.len() > 0 and bytes_codec.equal_constant_time(kmac128(key, message, tag.len(), custom), tag)
+}

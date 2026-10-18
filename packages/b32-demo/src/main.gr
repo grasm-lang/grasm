@@ -1,0 +1,69 @@
+// AES modes and MACs: each one sealing or tagging something and getting
+// it back. scripts/b32_diff.sh holds them to OpenSSL.
+import cmac
+import gmac
+import kmac
+import ccm
+import ocb
+import aessiv
+import keywrap
+import xts
+import gcmsiv
+import cbccts
+
+fn filled(n: i64, v: i64) -> bytes {
+    var out: [i64] = []
+    while out.len() < n {
+        out.push(v)
+    }
+    bytes_of(out)
+}
+
+fn main() / {io} {
+    let key = filled(16, 1)
+    let msg = "transfer 100 to alice".to_bytes()
+    let none = bytes_of([])
+
+    // MACs, and their tags refused for a changed message.
+    let t = cmac.aes_cmac(key, msg) ?? none
+    assert_eq(cmac.verify_aes(key, msg, t.slice(0, 8)), true)
+    assert_eq(cmac.verify_aes(key, "transfer 900 to alice".to_bytes(), t), false)
+    let g = gmac.gmac(key, filled(12, 2), msg) ?? none
+    assert_eq(gmac.verify(key, filled(12, 2), msg, g), true)
+    let k = kmac.kmac256(key, msg, 32, "app".to_bytes())
+    assert_eq(k.len(), 32)
+    assert_eq(kmac.verify256(key, msg, "app".to_bytes(), k), true)
+    assert_eq(kmac.kmac256(key, msg, 16, "app".to_bytes()) == k.slice(0, 16), false)
+
+    // AEADs: sealed, opened, and a flipped byte refused.
+    let header = "v1".to_bytes()
+    let c1 = ccm.seal(key, filled(13, 3), header, msg, 8) ?? none
+    assert_eq(ccm.open(key, filled(13, 3), header, c1, 8) ?? none, msg)
+    let c2 = ocb.seal(key, filled(12, 4), header, msg, 16) ?? none
+    assert_eq(ocb.open(key, filled(12, 4), header, c2, 16) ?? none, msg)
+    let c3 = gcmsiv.seal(key, filled(12, 5), header, msg) ?? none
+    assert_eq(gcmsiv.open(key, filled(12, 5), header, c3) ?? none, msg)
+    var bad = c3.to_list()
+    bad[0] = bad[0].bit_xor(1)
+    assert_eq((gcmsiv.open(key, filled(12, 5), header, bytes_of(bad)) ?? none).len(), 0)
+    let c4 = aessiv.seal(filled(32, 6), [header], msg) ?? none
+    assert_eq(aessiv.open(filled(32, 6), [header], c4) ?? none, msg)
+
+    // A key wrapped under another, and a sector encrypted in place.
+    let data_key = filled(32, 7)
+    let w = keywrap.wrap(key, data_key) ?? none
+    assert_eq(w.len(), 40)
+    assert_eq(keywrap.unwrap(key, w) ?? none, data_key)
+    assert_eq(keywrap.unwrap_pad(key, keywrap.wrap_pad(key, "abc".to_bytes()) ?? none) ?? none, "abc".to_bytes())
+    let xkey = filled(16, 8).concat(filled(16, 9))
+    let sector = filled(40, 10)
+    let enc = xts.encrypt(xkey, xts.sector_tweak(7), sector) ?? none
+    assert_eq(enc.len(), 40)
+    assert_eq(xts.decrypt(xkey, xts.sector_tweak(7), enc) ?? none, sector)
+
+    // Ciphertext stealing keeps the length.
+    let cts = cbccts.encrypt(key, filled(16, 0), msg, Cs3) ?? none
+    assert_eq(cts.len(), msg.len())
+    assert_eq(cbccts.decrypt(key, filled(16, 0), cts, Cs3) ?? none, msg)
+    print("b32: ok")
+}

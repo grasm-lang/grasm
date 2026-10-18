@@ -256,6 +256,25 @@ day its reference is installed.
 
 ## Landed
 
+- [x] **B32: AES modes and MACs** — B8's `cmac` `gmac` `kmac` `ccm` `ocb`
+  `aessiv` `keywrap` `xts`, with `gcmsiv` and `cbccts`, which were not on
+  the list, and the harness `b32test`; the new gate `b32diff` runs 7,604
+  cases against OpenSSL 3.6's libcrypto called in-process through ctypes
+  (`scripts/lib/evp.py`, which later cipher batches reuse): AES and
+  Triple-DES CMAC, GMAC with IVs of 1 to 40 bytes, KMAC and KMACXOF
+  across the sponge's rate, CCM at every nonce and tag length (and
+  associated data long enough for the 6-byte length framing), OCB, SIV
+  with vectors of associated data, GCM-SIV, KW and KWP, XTS with
+  ciphertext stealing, and CBC-CS1/CS2/CS3. Sealing is compared byte for
+  byte, and opening on good, tampered and truncated inputs; every open,
+  unwrap and decrypt family must see both verdicts. `sha3` gained cSHAKE
+  and SP 800-185's encodings for KMAC. Three OpenSSL behaviours were
+  checked rather than assumed: XTS refuses equal key halves for
+  encryption but not decryption, and `xts` does the same; EVP "wraps" an
+  empty key to nothing, which RFC 3394 and 5649 refuse and so does
+  `keywrap`; and KMAC keys under 4 bytes are refused there and accepted
+  here, as SP 800-185 allows. One break per package turned it red.
+
 - [x] **B31: Go's module tooling** — B18's `gomod`, with `signednote`,
   `tlog` and `coverprofile`, which were not on the list, and the harness
   `b31test`; the new gate `b31diff` runs 3,270 cases against
@@ -575,7 +594,7 @@ day its reference is installed.
 | | |
 |---|---|
 | At the start | 669 |
-| Now | 842 |
+| Now | 853 |
 | Candidates above | 316 packages in 28 batches, plus `ecc`, `rfc6979` and `goprintf` |
 | Harnesses, one a batch | 28 |
 | If every candidate lands | 1016 |

@@ -1,0 +1,123 @@
+// GMAC: GCM's authentication without its encryption (NIST SP 800-38D).
+//
+// GMAC is AES-GCM over a message that is all associated data and no
+// plaintext, so the tag is GHASH of the message, masked with AES of the
+// counter block J0. It is the MAC of IPsec's ENCR_NULL_AUTH_AES_GMAC
+// (RFC 4543), of MACsec's GCM-AES integrity-only mode, and wherever a
+// system already holds an AES-GCM key and wants a MAC from it.
+//
+// Unlike `aes.gcm_seal`, which takes the usual 12-byte nonce, this takes an
+// IV of any non-zero length, as SP 800-38D allows: a 12-byte IV is J0
+// directly with a counter of 1, and any other is first hashed with GHASH,
+// its length in bits appended. An IV must never repeat under one key: two
+// tags under the same key and IV give away the hash key.
+//
+// Checked against OpenSSL's EVP_MAC GMAC.
+import aes
+import bytes_codec
+
+type GmacError =
+    | GmacBadKey(length: i64)
+    | GmacBadIv
+
+fn word(b: bytes, at: i64) -> i64 {
+    var v = 0
+    for i in 0..8 {
+        v = v.shl(8).bit_or(b.at(at + i))
+    }
+    return v
+}
+
+/// Multiplication in GHASH's field: bit 0 of the first byte is the most
+/// significant coefficient, so the shift is to the right and the reduction
+/// (0xE1 in the top byte) enters at the top.
+fn mul(x: (i64, i64), y: (i64, i64)) -> (i64, i64) {
+    var zh = 0
+    var zl = 0
+    var vh = y.0
+    var vl = y.1
+    for i in 0..128 {
+        let bit = if i < 64 { x.0.ushr(63 - i).bit_and(1) } else { x.1.ushr(127 - i).bit_and(1) }
+        if bit != 0 {
+            zh = zh.bit_xor(vh)
+            zl = zl.bit_xor(vl)
+        }
+        let lsb = vl.bit_and(1)
+        vl = vl.ushr(1).bit_or(vh.shl(63))
+        vh = vh.ushr(1)
+        if lsb != 0 {
+            vh = vh.bit_xor(0 - 2233785415175766016)
+        }
+    }
+    return (zh, zl)
+}
+
+/// GHASH over data padded with zeros to whole blocks.
+fn ghash_into(h: (i64, i64), y0: (i64, i64), data: bytes) -> (i64, i64) {
+    var y = y0
+    var at = 0
+    while at < data.len() {
+        var block = data.slice(at, if at + 16 < data.len() { at + 16 } else { data.len() }).to_list()
+        while block.len() < 16 {
+            block.push(0)
+        }
+        let b = bytes_of(block)
+        y = mul((y.0.bit_xor(word(b, 0)), y.1.bit_xor(word(b, 8))), h)
+        at = at + 16
+    }
+    return y
+}
+
+fn be8(v: i64) -> [i64] {
+    var out: [i64] = []
+    for i in 0..8 {
+        out.push(v.ushr((7 - i) * 8).bit_and(255))
+    }
+    return out
+}
+
+fn block_of(v: (i64, i64)) -> bytes {
+    return bytes_of(be8(v.0) + be8(v.1))
+}
+
+/// The pre-counter block J0 for an IV of any length.
+fn j0(h: (i64, i64), iv: bytes) -> bytes {
+    if iv.len() == 12 {
+        return iv.concat(bytes_of([0, 0, 0, 1]))
+    }
+    let y = ghash_into(h, (0, 0), iv)
+    return block_of(mul((y.0, y.1.bit_xor(iv.len() * 8)), h))
+}
+
+/// The 16-byte GMAC tag of a message under a 16-, 24- or 32-byte key.
+pub fn gmac(key: bytes, iv: bytes, message: bytes) -> bytes ! GmacError {
+    if key.len() != 16 and key.len() != 24 and key.len() != 32 {
+        fail(GmacBadKey(key.len()))
+    }
+    if iv.len() == 0 {
+        fail(GmacBadIv)
+    }
+    let c = aes.new_cipher(key)
+    let hb = aes.encrypt_with(c, bytes_filled(16, 0))
+    let h = (word(hb, 0), word(hb, 8))
+    let y = ghash_into(h, (0, 0), message)
+    // The length block: the message's length in bits, and zero ciphertext.
+    let s = block_of(mul((y.0.bit_xor(message.len() * 8), y.1), h))
+    let mask = aes.encrypt_with(c, j0(h, iv))
+    var out: [i64] = []
+    for i in 0..16 {
+        out.push(s.at(i).bit_xor(mask.at(i)))
+    }
+    return bytes_of(out)
+}
+
+/// Whether a tag, possibly truncated, is the message's GMAC.
+pub fn verify(key: bytes, iv: bytes, message: bytes, tag: bytes) -> bool {
+    if tag.len() == 0 or tag.len() > 16 {
+        return false
+    }
+    return match gmac(key, iv, message) {
+        Ok(t) -> bytes_codec.equal_constant_time(t.slice(0, tag.len()), tag)
+        Err(_) -> false
+    }
+}

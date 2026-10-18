@@ -1,0 +1,132 @@
+// AES-SIV: synthetic-IV authenticated encryption, RFC 5297.
+//
+// SIV derives its IV from everything it protects: S2V, a CMAC-based PRF
+// over a vector of associated-data strings and the plaintext, gives a
+// 16-byte value that is both the tag and the counter-mode IV. So it needs
+// no nonce, and reusing one (or having none) reveals only whether two
+// messages were identical -- "misuse resistance". That is why it wraps keys
+// (deterministic encryption is what a key wrap wants), why NTS for NTP
+// (RFC 8915) uses it to seal cookies, and why it backs deterministic
+// encryption in databases and in tink.
+//
+// The key is two AES keys end to end (32, 48 or 64 bytes): the first half
+// for S2V, the second for counter mode. Associated data is a list of up to
+// 126 strings, each authenticated separately, so ("ab", "c") and ("a",
+// "bc") differ; a nonce, if used, is simply the last of them. Output is
+// the 16-byte IV followed by the ciphertext.
+//
+// `open` recomputes the IV from the decrypted text and compares it in
+// constant time before returning anything.
+//
+// Checked against OpenSSL's AES-SIV.
+import aes
+import cmac
+import bytes_codec
+
+type SivError =
+    | SivBadKey(length: i64)
+    | SivTooManyStrings(count: i64)
+    | SivNotAuthentic
+
+fn xor(a: bytes, b: bytes) -> bytes {
+    var out: [i64] = []
+    for i in 0..a.len() {
+        out.push(a.at(i).bit_xor(b.at(i)))
+    }
+    return bytes_of(out)
+}
+
+fn dbl(s: bytes) -> bytes {
+    var out: [i64] = []
+    for i in 0..16 {
+        let next = if i < 15 { s.at(i + 1).ushr(7) } else { 0 }
+        out.push(s.at(i).shl(1).bit_and(255).bit_or(next))
+    }
+    if s.at(0) >= 128 {
+        out[15] = out[15].bit_xor(135)
+    }
+    return bytes_of(out)
+}
+
+/// S2V of section 2.4: a PRF over a vector of strings, the last one the
+/// plaintext.
+fn s2v(mac: Cipher, strings: [bytes]) -> bytes {
+    let f = |b| aes.encrypt_with(mac, b)
+    var d = cmac.cmac_with(16, f, bytes_filled(16, 0))
+    let n = strings.len()
+    for i in 0..(n - 1) {
+        d = xor(dbl(d), cmac.cmac_with(16, f, strings[i]))
+    }
+    let last = strings[n - 1]
+    let t = if last.len() >= 16 {
+        let cut = last.len() - 16
+        last.slice(0, cut).concat(xor(last.slice(cut, last.len()), d))
+    } else {
+        var padded = last.to_list()
+        padded.push(128)
+        while padded.len() < 16 {
+            padded.push(0)
+        }
+        xor(dbl(d), bytes_of(padded))
+    }
+    return cmac.cmac_with(16, f, t)
+}
+
+/// Counter mode from the IV with bits 63 and 31 cleared, the whole 128
+/// bits counting.
+fn ctr(c: Cipher, v: bytes, data: bytes) -> bytes {
+    var q = v.to_list()
+    q[8] = q[8].bit_and(127)
+    q[12] = q[12].bit_and(127)
+    var out: [i64] = []
+    var at = 0
+    while at < data.len() {
+        let s = aes.encrypt_with(c, bytes_of(q))
+        var k = 0
+        while k < 16 and at + k < data.len() {
+            out.push(data.at(at + k).bit_xor(s.at(k)))
+            k = k + 1
+        }
+        at = at + 16
+        var i = 15
+        var carry = true
+        while carry and i >= 0 {
+            q[i] = (q[i] + 1).bit_and(255)
+            carry = q[i] == 0
+            i = i - 1
+        }
+    }
+    return bytes_of(out)
+}
+
+fn keys(key: bytes, ads: [bytes]) -> (Cipher, Cipher) ! SivError {
+    if key.len() != 32 and key.len() != 48 and key.len() != 64 {
+        fail(SivBadKey(key.len()))
+    }
+    if ads.len() > 126 {
+        fail(SivTooManyStrings(ads.len()))
+    }
+    let half = key.len() / 2
+    return (aes.new_cipher(key.slice(0, half)), aes.new_cipher(key.slice(half, key.len())))
+}
+
+/// The 16-byte synthetic IV followed by the ciphertext.
+pub fn seal(key: bytes, ads: [bytes], plaintext: bytes) -> bytes ! SivError {
+    let (mac, enc) = try keys(key, ads)
+    let v = s2v(mac, ads + [plaintext])
+    return v.concat(ctr(enc, v, plaintext))
+}
+
+/// The plaintext, if the IV verifies.
+pub fn open(key: bytes, ads: [bytes], sealed: bytes) -> bytes ! SivError {
+    let (mac, enc) = try keys(key, ads)
+    if sealed.len() < 16 {
+        fail(SivNotAuthentic)
+    }
+    let v = sealed.slice(0, 16)
+    let plaintext = ctr(enc, v, sealed.slice(16, sealed.len()))
+    if not bytes_codec.equal_constant_time(s2v(mac, ads + [plaintext]), v) {
+        fail(SivNotAuthentic)
+    }
+    return plaintext
+}

@@ -1,0 +1,44 @@
+[package]
+name = "b32_demo"
+version = "1.0.0"
+capabilities = ["io"]
+
+[dependencies.cmac]
+path = "../cmac"
+version = "^1.0.0"
+
+[dependencies.gmac]
+path = "../gmac"
+version = "^1.0.0"
+
+[dependencies.kmac]
+path = "../kmac"
+version = "^1.0.0"
+
+[dependencies.ccm]
+path = "../ccm"
+version = "^1.0.0"
+
+[dependencies.ocb]
+path = "../ocb"
+version = "^1.0.0"
+
+[dependencies.aessiv]
+path = "../aessiv"
+version = "^1.0.0"
+
+[dependencies.keywrap]
+path = "../keywrap"
+version = "^1.0.0"
+
+[dependencies.xts]
+path = "../xts"
+version = "^1.0.0"
+
+[dependencies.gcmsiv]
+path = "../gcmsiv"
+version = "^1.0.0"
+
+[dependencies.cbccts]
+path = "../cbccts"
+version = "^1.0.0"

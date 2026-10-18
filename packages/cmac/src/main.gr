@@ -1,0 +1,106 @@
+// CMAC, the block-cipher MAC of NIST SP 800-38B (RFC 4493 for AES).
+//
+// A message authentication code from nothing but a block cipher: CBC over
+// the message with a zero IV, the last block first masked with one of two
+// subkeys derived from the cipher itself. The subkeys are what make it safe
+// where plain CBC-MAC is not: CBC-MAC of a message and of that message
+// extended can be forged from each other, and the mask on the last block,
+// different for complete and padded blocks, stops that.
+//
+// CMAC authenticates EAP, IKEv2's AES-XCBC successor suites, 802.11's
+// management frames, LoRaWAN, Bluetooth mesh, payment terminals (on Triple
+// DES there) and the KDF of SP 800-108, and it is the S2V core of AES-SIV.
+//
+// `cmac_with` takes any block cipher as its encryption function; AES and
+// Triple DES are given directly. A tag may be truncated (`verify` compares
+// however many bytes it is given, in constant time), though SP 800-38B
+// asks for at least 64 bits.
+//
+// Checked against OpenSSL's EVP_MAC CMAC.
+import aes
+import des
+import bytes_codec
+
+type CmacError =
+    | CmacBadKey(length: i64)
+
+fn xor(a: bytes, b: bytes) -> bytes {
+    var out: [i64] = []
+    for i in 0..a.len() {
+        out.push(a.at(i).bit_xor(b.at(i)))
+    }
+    return bytes_of(out)
+}
+
+/// Multiplication by x in GF(2^b): a shift left, with the reduction
+/// constant folded in when the top bit falls off (0x87 for 128-bit blocks,
+/// 0x1B for 64-bit ones).
+fn double(block: bytes) -> bytes {
+    let n = block.len()
+    var out: [i64] = []
+    for i in 0..n {
+        let next = if i + 1 < n { block.at(i + 1).ushr(7) } else { 0 }
+        out.push(block.at(i).shl(1).bit_and(255).bit_or(next))
+    }
+    if block.at(0) >= 128 {
+        out[n - 1] = out[n - 1].bit_xor(if n == 16 { 135 } else { 27 })
+    }
+    return bytes_of(out)
+}
+
+/// The two subkeys of SP 800-38B section 6.1.
+pub fn subkeys(block_size: i64, encrypt: fn(bytes) -> bytes) -> (bytes, bytes) {
+    let k1 = double(encrypt(bytes_filled(block_size, 0)))
+    return (k1, double(k1))
+}
+
+/// CMAC over a block cipher given as its block-encryption function.
+pub fn cmac_with(block_size: i64, encrypt: fn(bytes) -> bytes, message: bytes) -> bytes {
+    let bs = block_size
+    let (k1, k2) = subkeys(bs, encrypt)
+    let n = if message.len() == 0 { 1 } else { (message.len() + bs - 1) / bs }
+    let complete = message.len() > 0 and message.len() % bs == 0
+    var x = bytes_filled(bs, 0)
+    for i in 0..(n - 1) {
+        x = encrypt(xor(x, message.slice(i * bs, i * bs + bs)))
+    }
+    let last = message.slice((n - 1) * bs, message.len())
+    let masked = if complete {
+        xor(last, k1)
+    } else {
+        var padded = last.to_list()
+        padded.push(128)
+        while padded.len() < bs {
+            padded.push(0)
+        }
+        xor(bytes_of(padded), k2)
+    }
+    return encrypt(xor(x, masked))
+}
+
+/// AES-CMAC with a 16-, 24- or 32-byte key.
+pub fn aes_cmac(key: bytes, message: bytes) -> bytes ! CmacError {
+    if key.len() != 16 and key.len() != 24 and key.len() != 32 {
+        fail(CmacBadKey(key.len()))
+    }
+    let c = aes.new_cipher(key)
+    return cmac_with(16, |b| aes.encrypt_with(c, b), message)
+}
+
+/// Triple-DES CMAC with a 24-byte key (a two-key one repeats its first
+/// eight bytes at the end).
+pub fn tdes_cmac(key: bytes, message: bytes) -> bytes ! CmacError {
+    let c = des.new_triple(key) ?? fail(CmacBadKey(key.len()))
+    return cmac_with(8, |b| des.encrypt_block(c, b) ?? bytes_filled(8, 0), message)
+}
+
+/// Whether a tag, possibly truncated to its first bytes, is AES-CMAC's.
+pub fn verify_aes(key: bytes, message: bytes, tag: bytes) -> bool {
+    if tag.len() == 0 or tag.len() > 16 {
+        return false
+    }
+    return match aes_cmac(key, message) {
+        Ok(t) -> bytes_codec.equal_constant_time(t.slice(0, tag.len()), tag)
+        Err(_) -> false
+    }
+}

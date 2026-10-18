@@ -1,0 +1,119 @@
+// XTS-AES: the disk-encryption mode of IEEE 1619 and NIST SP 800-38E.
+//
+// A disk sector has nowhere to put an IV or a tag, and its ciphertext must
+// be exactly as long as its plaintext. XTS encrypts each 16-byte block
+// between two copies of a tweak: the sector's tweak encrypted under a
+// second key, then multiplied by x in GF(2^128) from block to block, so the
+// same data in two places or two sectors encrypts differently. A sector
+// whose length is not a multiple of 16 borrows the tail of its last whole
+// block's ciphertext ("ciphertext stealing").
+//
+// It is the mode of BitLocker, FileVault 2, LUKS and dm-crypt
+// (aes-xts-plain64), VeraCrypt, Android's and iOS's file-based encryption
+// and self-encrypting drives. It gives confidentiality only: a changed
+// ciphertext block decrypts to garbage, undetected.
+//
+// The key is two AES keys end to end (32 or 64 bytes), the first for data
+// and the second for the tweak. Halves that are equal are refused for
+// encryption, as SP 800-38E requires, and accepted for decryption, as
+// OpenSSL accepts them, so that data written that way can still be read:
+// refusing to read it protects nothing. The tweak is 16 bytes, for a sector usually its
+// number little-endian (`sector_tweak`). Data is at least 16 bytes.
+//
+// Checked against OpenSSL's AES-XTS.
+import aes
+
+type XtsError =
+    | XtsBadKey(length: i64)
+    | XtsSameHalves
+    | XtsBadTweak(length: i64)
+    | XtsTooShort(length: i64)
+
+fn xor(a: bytes, b: bytes) -> bytes {
+    var out: [i64] = []
+    for i in 0..a.len() {
+        out.push(a.at(i).bit_xor(b.at(i)))
+    }
+    return bytes_of(out)
+}
+
+/// Multiplication by x, little-endian: byte 0 holds the lowest bits, and
+/// the bit carried out of byte 15 folds back as 0x87.
+fn times_x(t: bytes) -> bytes {
+    var out: [i64] = []
+    var carry = 0
+    for i in 0..16 {
+        out.push(t.at(i).shl(1).bit_and(255).bit_or(carry))
+        carry = t.at(i).ushr(7)
+    }
+    if carry == 1 {
+        out[0] = out[0].bit_xor(135)
+    }
+    return bytes_of(out)
+}
+
+/// The tweak for a sector number: the number in 16 little-endian bytes.
+pub fn sector_tweak(sector: i64) -> bytes {
+    var out: [i64] = []
+    for i in 0..16 {
+        out.push(if i < 8 { sector.ushr(8 * i).bit_and(255) } else { 0 })
+    }
+    return bytes_of(out)
+}
+
+fn setup(key: bytes, tweak: bytes, data: bytes, encrypt: bool) -> (Cipher, bytes) ! XtsError {
+    if key.len() != 32 and key.len() != 64 {
+        fail(XtsBadKey(key.len()))
+    }
+    let half = key.len() / 2
+    if encrypt and key.slice(0, half) == key.slice(half, key.len()) {
+        fail(XtsSameHalves)
+    }
+    if tweak.len() != 16 {
+        fail(XtsBadTweak(tweak.len()))
+    }
+    if data.len() < 16 {
+        fail(XtsTooShort(data.len()))
+    }
+    let t = aes.encrypt_with(aes.new_cipher(key.slice(half, key.len())), tweak)
+    return (aes.new_cipher(key.slice(0, half)), t)
+}
+
+fn block(c: Cipher, t: bytes, b: bytes, encrypt: bool) -> bytes {
+    let inner = xor(b, t)
+    return xor(if encrypt { aes.encrypt_with(c, inner) } else { aes.decrypt_with(c, inner) }, t)
+}
+
+fn run(key: bytes, tweak: bytes, data: bytes, encrypt: bool) -> bytes ! XtsError {
+    let (c, t0) = try setup(key, tweak, data, encrypt)
+    let full = data.len() / 16
+    let tail = data.len() % 16
+    // With a partial block, the last whole block is handled with stealing.
+    let plain_blocks = if tail == 0 { full } else { full - 1 }
+    var t = t0
+    var out: [i64] = []
+    for j in 0..plain_blocks {
+        out = out + block(c, t, data.slice(16 * j, 16 * j + 16), encrypt).to_list()
+        t = times_x(t)
+    }
+    if tail == 0 {
+        return bytes_of(out)
+    }
+    let t_next = times_x(t)
+    let last_whole = data.slice(16 * plain_blocks, 16 * plain_blocks + 16)
+    let part = data.slice(16 * full, data.len())
+    // Encrypting, the whole block uses this tweak and the stolen one the
+    // next; decrypting, the other way round.
+    let first = block(c, if encrypt { t } else { t_next }, last_whole, encrypt)
+    let stolen = part.concat(first.slice(tail, 16))
+    let second = block(c, if encrypt { t_next } else { t }, stolen, encrypt)
+    return bytes_of(out + second.to_list() + first.slice(0, tail).to_list())
+}
+
+pub fn encrypt(key: bytes, tweak: bytes, data: bytes) -> bytes ! XtsError {
+    return try run(key, tweak, data, true)
+}
+
+pub fn decrypt(key: bytes, tweak: bytes, data: bytes) -> bytes ! XtsError {
+    return try run(key, tweak, data, false)
+}

@@ -1,0 +1,12 @@
+[package]
+name = "ccm"
+version = "1.0.0"
+capabilities = []
+
+[dependencies.aes]
+path = "../aes"
+version = "^1.0.0"
+
+[dependencies.bytes_codec]
+path = "../bytes"
+version = "^1.0.0"

@@ -1,0 +1,127 @@
+// CBC with ciphertext stealing: the three variants of the addendum to NIST
+// SP 800-38A (CBC-CS1, CS2 and CS3).
+//
+// CBC needs whole blocks, and padding makes the ciphertext longer than the
+// plaintext. Ciphertext stealing pads the last partial block with the tail
+// of the ciphertext before it, then drops that tail, so any message of at
+// least one block encrypts to exactly its own length. Kerberos (RFC 3962's
+// aes*-cts-hmac-sha1 and RFC 8009's sha2 types) uses CS3, which is what the
+// Kerberos specs call "CBC-CTS"; OpenSSL's `cts_mode` names all three.
+//
+// The variants differ only in the order of the last two blocks:
+//
+// - CS1 keeps CBC's order: the shortened next-to-last block, then the last.
+// - CS2 swaps them when the message is not whole blocks, and is plain CBC
+//   when it is.
+// - CS3 always swaps them, so a message of whole blocks still changes
+//   order (which keeps the layout of a block-aligned message the same as
+//   any other).
+//
+// Like CBC, this gives confidentiality only.
+//
+// Checked against OpenSSL's AES-*-CBC-CTS.
+import aes
+
+type CtsVariant =
+    | Cs1
+    | Cs2
+    | Cs3
+
+type CtsError =
+    | CtsBadKey(length: i64)
+    | CtsBadIv(length: i64)
+    | CtsTooShort(length: i64)
+
+fn xor(a: bytes, b: bytes) -> bytes {
+    var out: [i64] = []
+    for i in 0..a.len() {
+        out.push(a.at(i).bit_xor(b.at(i)))
+    }
+    return bytes_of(out)
+}
+
+fn setup(key: bytes, iv: bytes, data: bytes) -> Cipher ! CtsError {
+    if key.len() != 16 and key.len() != 24 and key.len() != 32 {
+        fail(CtsBadKey(key.len()))
+    }
+    if iv.len() != 16 {
+        fail(CtsBadIv(iv.len()))
+    }
+    if data.len() < 16 {
+        fail(CtsTooShort(data.len()))
+    }
+    return aes.new_cipher(key)
+}
+
+/// Whether the variant swaps the last two blocks for this length.
+fn swaps(variant: CtsVariant, n: i64) -> bool {
+    if n == 16 {
+        return false
+    }
+    return match variant {
+        Cs1 -> false
+        Cs2 -> n % 16 != 0
+        Cs3 -> true
+    }
+}
+
+pub fn encrypt(key: bytes, iv: bytes, data: bytes, variant: CtsVariant) -> bytes ! CtsError {
+    let c = try setup(key, iv, data)
+    let n = data.len()
+    let d = if n % 16 == 0 { 16 } else { n % 16 }
+    let blocks = (n + 15) / 16
+    var prev = iv
+    var out: [bytes] = []
+    for i in 0..blocks {
+        var b = data.slice(16 * i, if 16 * i + 16 < n { 16 * i + 16 } else { n }).to_list()
+        while b.len() < 16 {
+            b.push(0)
+        }
+        prev = aes.encrypt_with(c, xor(bytes_of(b), prev))
+        out.push(prev)
+    }
+    var result: [i64] = []
+    for i in 0..(blocks - 2) {
+        result = result + out[i].to_list()
+    }
+    if blocks == 1 {
+        return out[0]
+    }
+    let shortened = out[blocks - 2].slice(0, d)
+    let last = out[blocks - 1]
+    if swaps(variant, n) {
+        return bytes_of(result + last.to_list() + shortened.to_list())
+    }
+    return bytes_of(result + shortened.to_list() + last.to_list())
+}
+
+pub fn decrypt(key: bytes, iv: bytes, data: bytes, variant: CtsVariant) -> bytes ! CtsError {
+    let c = try setup(key, iv, data)
+    let n = data.len()
+    let d = if n % 16 == 0 { 16 } else { n % 16 }
+    let blocks = (n + 15) / 16
+    if blocks == 1 {
+        return xor(aes.decrypt_with(c, data), iv)
+    }
+    let head = 16 * (blocks - 2)
+    // Put the last two blocks back into CS1's order: shortened, then last.
+    let (shortened, last) = if swaps(variant, n) {
+        (data.slice(head + 16, n), data.slice(head, head + 16))
+    } else {
+        (data.slice(head, head + d), data.slice(head + d, n))
+    }
+    var out: [i64] = []
+    var prev = iv
+    for i in 0..(blocks - 2) {
+        let b = data.slice(16 * i, 16 * i + 16)
+        out = out + xor(aes.decrypt_with(c, b), prev).to_list()
+        prev = b
+    }
+    // The last block decrypts to the padded final plaintext XOR the full
+    // next-to-last ciphertext, whose stolen tail it therefore reveals.
+    let z = aes.decrypt_with(c, last)
+    let full = shortened.concat(z.slice(d, 16))
+    let final_part = xor(z.slice(0, d), shortened)
+    out = out + xor(aes.decrypt_with(c, full), prev).to_list()
+    return bytes_of(out + final_part.to_list())
+}

@@ -1,0 +1,199 @@
+// AES-GCM-SIV: nonce-misuse-resistant authenticated encryption, RFC 8452.
+//
+// GCM fails badly when a nonce repeats: the keystream repeats, and the
+// GHASH key leaks, so tags can be forged from then on. GCM-SIV keeps GCM's
+// speed and gives up only what a repeated nonce must give up: two
+// identical messages under the same nonce encrypt identically, and nothing
+// else leaks. It derives fresh keys from the key and nonce for every
+// message, computes the tag over the plaintext first (POLYVAL, GHASH's
+// little-endian twin), and uses the tag as the counter-mode IV.
+//
+// It seals session tickets and cookies where a counter cannot be kept
+// (Google's servers, Cloudflare), backs tink's deterministic AEAD, and is
+// the AEAD of the ECH and HPKE drafts that want misuse resistance.
+//
+// The key is 16 or 32 bytes, the nonce 12, the tag 16 (appended).
+// Plaintext and associated data are each limited to 2^36 bytes.
+//
+// `open` decrypts with the received tag, then recomputes the tag and
+// compares in constant time before returning anything.
+//
+// Checked against OpenSSL's AES-GCM-SIV.
+import aes
+import bytes_codec
+
+type GcmSivError =
+    | GcmSivBadKey(length: i64)
+    | GcmSivBadNonce(length: i64)
+    | GcmSivTooLong
+    | GcmSivNotAuthentic
+
+fn word(b: [i64], at: i64) -> i64 {
+    var v = 0
+    for i in 0..8 {
+        v = v.shl(8).bit_or(b[at + i])
+    }
+    return v
+}
+
+fn be8(v: i64) -> [i64] {
+    var out: [i64] = []
+    for i in 0..8 {
+        out.push(v.ushr((7 - i) * 8).bit_and(255))
+    }
+    return out
+}
+
+fn reversed(b: [i64]) -> [i64] {
+    var out: [i64] = []
+    var i = b.len() - 1
+    while i >= 0 {
+        out.push(b[i])
+        i = i - 1
+    }
+    return out
+}
+
+/// Multiplication in GHASH's field (most significant coefficient in bit 0
+/// of the first byte).
+fn ghash_mul(x: (i64, i64), y: (i64, i64)) -> (i64, i64) {
+    var zh = 0
+    var zl = 0
+    var vh = y.0
+    var vl = y.1
+    for i in 0..128 {
+        let bit = if i < 64 { x.0.ushr(63 - i).bit_and(1) } else { x.1.ushr(127 - i).bit_and(1) }
+        if bit != 0 {
+            zh = zh.bit_xor(vh)
+            zl = zl.bit_xor(vl)
+        }
+        let lsb = vl.bit_and(1)
+        vl = vl.ushr(1).bit_or(vh.shl(63))
+        vh = vh.ushr(1)
+        if lsb != 0 {
+            vh = vh.bit_xor(0 - 2233785415175766016)
+        }
+    }
+    return (zh, zl)
+}
+
+/// POLYVAL by way of GHASH (RFC 8452 appendix A): reverse the bytes of the
+/// key and of every block, multiply the key by x in GHASH's field, run
+/// GHASH, and reverse the result.
+fn polyval(h: bytes, data: [i64]) -> [i64] {
+    let hr = reversed(h.to_list())
+    var kh = word(hr, 0)
+    var kl = word(hr, 8)
+    let lsb = kl.bit_and(1)
+    kl = kl.ushr(1).bit_or(kh.shl(63))
+    kh = kh.ushr(1)
+    if lsb != 0 {
+        kh = kh.bit_xor(0 - 2233785415175766016)
+    }
+    var y = (0, 0)
+    var at = 0
+    while at < data.len() {
+        let x = reversed(data.slice(at, at + 16))
+        y = ghash_mul((y.0.bit_xor(word(x, 0)), y.1.bit_xor(word(x, 8))), (kh, kl))
+        at = at + 16
+    }
+    return reversed(be8(y.0) + be8(y.1))
+}
+
+fn le(v: i64, n: i64) -> [i64] {
+    var out: [i64] = []
+    for i in 0..n {
+        out.push(if i < 8 { v.ushr(8 * i).bit_and(255) } else { 0 })
+    }
+    return out
+}
+
+fn pad16(v: [i64]) -> [i64] {
+    var out = v
+    while out.len() % 16 != 0 {
+        out.push(0)
+    }
+    return out
+}
+
+/// The per-message authentication and encryption keys of section 4.
+fn derive(key: bytes, nonce: bytes) -> (bytes, Cipher) {
+    let c = aes.new_cipher(key)
+    var parts: [i64] = []
+    let count = if key.len() == 16 { 4 } else { 6 }
+    for i in 0..count {
+        parts = parts + aes.encrypt_with(c, bytes_of(le(i, 4) + nonce.to_list())).slice(0, 8).to_list()
+    }
+    return (bytes_of(parts.slice(0, 16)), aes.new_cipher(bytes_of(parts.slice(16, parts.len()))))
+}
+
+fn tag_of(auth: bytes, enc: Cipher, nonce: bytes, aad: bytes, plaintext: bytes) -> bytes {
+    let input = pad16(aad.to_list()) + pad16(plaintext.to_list()) + le(aad.len() * 8, 8) + le(plaintext.len() * 8, 8)
+    var s = polyval(auth, input)
+    for i in 0..12 {
+        s[i] = s[i].bit_xor(nonce.at(i))
+    }
+    s[15] = s[15].bit_and(127)
+    return aes.encrypt_with(enc, bytes_of(s))
+}
+
+/// Counter mode from the tag with its top bit set; the first four bytes
+/// count, little-endian, wrapping at 2^32.
+fn ctr(enc: Cipher, tag: bytes, data: bytes) -> bytes {
+    var block = tag.to_list()
+    block[15] = block[15].bit_or(128)
+    var counter = word(reversed(block.slice(0, 4)) + [0, 0, 0, 0], 0).ushr(32)
+    var out: [i64] = []
+    var at = 0
+    while at < data.len() {
+        let c = le(counter, 4)
+        for i in 0..4 {
+            block[i] = c[i]
+        }
+        let s = aes.encrypt_with(enc, bytes_of(block))
+        var k = 0
+        while k < 16 and at + k < data.len() {
+            out.push(data.at(at + k).bit_xor(s.at(k)))
+            k = k + 1
+        }
+        at = at + 16
+        counter = (counter + 1).bit_and(4294967295)
+    }
+    return bytes_of(out)
+}
+
+fn check(key: bytes, nonce: bytes, aad: bytes, n: i64) -> () ! GcmSivError {
+    if key.len() != 16 and key.len() != 32 {
+        fail(GcmSivBadKey(key.len()))
+    }
+    if nonce.len() != 12 {
+        fail(GcmSivBadNonce(nonce.len()))
+    }
+    if aad.len() > 68719476736 or n > 68719476736 {
+        fail(GcmSivTooLong)
+    }
+}
+
+/// The ciphertext followed by the 16-byte tag.
+pub fn seal(key: bytes, nonce: bytes, aad: bytes, plaintext: bytes) -> bytes ! GcmSivError {
+    try check(key, nonce, aad, plaintext.len())
+    let (auth, enc) = derive(key, nonce)
+    let tag = tag_of(auth, enc, nonce, aad, plaintext)
+    return ctr(enc, tag, plaintext).concat(tag)
+}
+
+/// The plaintext, if the tag verifies.
+pub fn open(key: bytes, nonce: bytes, aad: bytes, sealed: bytes) -> bytes ! GcmSivError {
+    if sealed.len() < 16 {
+        fail(GcmSivNotAuthentic)
+    }
+    let n = sealed.len() - 16
+    try check(key, nonce, aad, n)
+    let (auth, enc) = derive(key, nonce)
+    let tag = sealed.slice(n, sealed.len())
+    let plaintext = ctr(enc, tag, sealed.slice(0, n))
+    if not bytes_codec.equal_constant_time(tag_of(auth, enc, nonce, aad, plaintext), tag) {
+        fail(GcmSivNotAuthentic)
+    }
+    return plaintext
+}

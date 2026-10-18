@@ -1,0 +1,159 @@
+// AES key wrap: RFC 3394 (KW) and RFC 5649 (KWP, with padding), NIST
+// SP 800-38F.
+//
+// A key encrypted under another key, deterministically and with integrity:
+// six passes of AES over the key's 64-bit halves, a running 64-bit value
+// mixed with a counter at every step, which must come back to a fixed
+// constant on unwrapping. A single changed bit anywhere scrambles the
+// whole result, so the check catches tampering without a separate MAC.
+//
+// It is how CMS and S/MIME carry content-encryption keys (with ECDH and
+// password recipients), how PKCS#11 tokens export keys, how JWE's
+// A128KW/A256KW and ECDH-ES+A*KW work, how KMIP and cloud KMSes hand out
+// data keys, and how TPMs and HSMs move keys between each other.
+//
+// KW wraps a multiple of 8 bytes, at least 16. KWP wraps 1 byte or more:
+// its 8-byte check value carries the length, the plaintext is padded with
+// zeros to a multiple of 8, and a single padded block is wrapped with one
+// AES call.
+//
+// Checked against OpenSSL's AES-WRAP and AES-WRAP-PAD.
+import aes
+import bytes_codec
+
+type KeyWrapError =
+    | KeyWrapBadKek(length: i64)
+    | KeyWrapBadLength(length: i64)
+    | KeyWrapNotAuthentic
+
+let KW_IV = [166, 166, 166, 166, 166, 166, 166, 166]
+
+fn kek(key: bytes) -> Cipher ! KeyWrapError {
+    if key.len() != 16 and key.len() != 24 and key.len() != 32 {
+        fail(KeyWrapBadKek(key.len()))
+    }
+    return aes.new_cipher(key)
+}
+
+fn xor_t(a: [i64], t: i64) -> [i64] {
+    var out = a
+    for i in 0..8 {
+        out[i] = out[i].bit_xor(t.ushr(8 * (7 - i)).bit_and(255))
+    }
+    return out
+}
+
+/// W of SP 800-38F: six rounds over the semiblocks.
+fn wrap_core(c: Cipher, iv: [i64], plain: bytes) -> bytes {
+    let n = plain.len() / 8
+    var a = iv
+    var r: [[i64]] = []
+    for i in 0..n {
+        r.push(plain.slice(8 * i, 8 * i + 8).to_list())
+    }
+    for j in 0..6 {
+        for i in 0..n {
+            let b = aes.encrypt_with(c, bytes_of(a + r[i]))
+            a = xor_t(b.slice(0, 8).to_list(), n * j + i + 1)
+            r[i] = b.slice(8, 16).to_list()
+        }
+    }
+    var out = a
+    for x in r {
+        out = out + x
+    }
+    return bytes_of(out)
+}
+
+/// W^-1: the semiblocks and the check value they decrypt to.
+fn unwrap_core(c: Cipher, wrapped: bytes) -> ([i64], bytes) {
+    let n = wrapped.len() / 8 - 1
+    var a = wrapped.slice(0, 8).to_list()
+    var r: [[i64]] = []
+    for i in 0..n {
+        r.push(wrapped.slice(8 * i + 8, 8 * i + 16).to_list())
+    }
+    var j = 5
+    while j >= 0 {
+        var i = n - 1
+        while i >= 0 {
+            let b = aes.decrypt_with(c, bytes_of(xor_t(a, n * j + i + 1) + r[i]))
+            a = b.slice(0, 8).to_list()
+            r[i] = b.slice(8, 16).to_list()
+            i = i - 1
+        }
+        j = j - 1
+    }
+    var out: [i64] = []
+    for x in r {
+        out = out + x
+    }
+    return (a, bytes_of(out))
+}
+
+/// KW: a key of 16 bytes or more, a multiple of 8.
+pub fn wrap(kek_key: bytes, key: bytes) -> bytes ! KeyWrapError {
+    let c = try kek(kek_key)
+    if key.len() < 16 or key.len() % 8 != 0 {
+        fail(KeyWrapBadLength(key.len()))
+    }
+    return wrap_core(c, KW_IV, key)
+}
+
+/// The key a KW-wrapped value holds, if its check value is intact.
+pub fn unwrap(kek_key: bytes, wrapped: bytes) -> bytes ! KeyWrapError {
+    let c = try kek(kek_key)
+    if wrapped.len() < 24 or wrapped.len() % 8 != 0 {
+        fail(KeyWrapBadLength(wrapped.len()))
+    }
+    let (a, key) = unwrap_core(c, wrapped)
+    if not bytes_codec.equal_constant_time(bytes_of(a), bytes_of(KW_IV)) {
+        fail(KeyWrapNotAuthentic)
+    }
+    return key
+}
+
+/// KWP: a key of any non-zero length.
+pub fn wrap_pad(kek_key: bytes, key: bytes) -> bytes ! KeyWrapError {
+    let c = try kek(kek_key)
+    let m = key.len()
+    if m == 0 or m >= 4294967296 {
+        fail(KeyWrapBadLength(m))
+    }
+    let aiv = [166, 89, 89, 166, m.ushr(24).bit_and(255), m.ushr(16).bit_and(255), m.ushr(8).bit_and(255), m.bit_and(255)]
+    var padded = key.to_list()
+    while padded.len() % 8 != 0 {
+        padded.push(0)
+    }
+    if padded.len() == 8 {
+        return aes.encrypt_with(c, bytes_of(aiv + padded))
+    }
+    return wrap_core(c, aiv, bytes_of(padded))
+}
+
+/// The key a KWP-wrapped value holds, if its check value, length and
+/// padding are intact.
+pub fn unwrap_pad(kek_key: bytes, wrapped: bytes) -> bytes ! KeyWrapError {
+    let c = try kek(kek_key)
+    if wrapped.len() < 16 or wrapped.len() % 8 != 0 {
+        fail(KeyWrapBadLength(wrapped.len()))
+    }
+    let (a, padded) = if wrapped.len() == 16 {
+        let b = aes.decrypt_with(c, wrapped)
+        (b.slice(0, 8).to_list(), b.slice(8, 16))
+    } else {
+        unwrap_core(c, wrapped)
+    }
+    let m = a[4].shl(24) + a[5].shl(16) + a[6].shl(8) + a[7]
+    var ok = a[0] == 166 and a[1] == 89 and a[2] == 89 and a[3] == 166
+    ok = ok and m > padded.len() - 8 and m <= padded.len()
+    if ok {
+        for i in m..padded.len() {
+            ok = ok and padded.at(i) == 0
+        }
+    }
+    if not ok {
+        fail(KeyWrapNotAuthentic)
+    }
+    return padded.slice(0, m)
+}

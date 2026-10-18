@@ -1,0 +1,188 @@
+// AES-OCB: offset codebook mode, OCB3 of RFC 7253.
+//
+// One AES call per block for both secrecy and authenticity, where GCM and
+// CCM need a second pass: each block is enciphered between two copies of
+// an offset that changes from block to block, and a checksum of the
+// plaintext, enciphered at the end, is the tag. It is the fastest AEAD in
+// software that uses only the block cipher; its patents, which kept it out
+// of most protocols, were released in 2021. OpenPGP's RFC 9580 encrypts
+// with it, as does OpenSSL's `enc -aes-*-ocb`.
+//
+// The nonce is 1 to 15 bytes and the tag 1 to 16. A nonce must never
+// repeat under one key. The offsets come from the nonce through the
+// "stretch" of section 4.2 and from multiples L_i of the encryption of
+// zero, which are doublings in GF(2^128).
+//
+// `open` checks the tag in constant time before returning any plaintext.
+//
+// Checked against OpenSSL's AES-OCB.
+import aes
+import bytes_codec
+
+type OcbError =
+    | OcbBadKey(length: i64)
+    | OcbBadNonce(length: i64)
+    | OcbBadTag(length: i64)
+    | OcbNotAuthentic
+
+type OcbKey = { c: Cipher, l_star: bytes, l_dollar: bytes, l: [bytes] }
+
+fn xor(a: bytes, b: bytes) -> bytes {
+    var out: [i64] = []
+    for i in 0..a.len() {
+        out.push(a.at(i).bit_xor(b.at(i)))
+    }
+    return bytes_of(out)
+}
+
+fn double(s: bytes) -> bytes {
+    var out: [i64] = []
+    for i in 0..16 {
+        let next = if i < 15 { s.at(i + 1).ushr(7) } else { 0 }
+        out.push(s.at(i).shl(1).bit_and(255).bit_or(next))
+    }
+    if s.at(0) >= 128 {
+        out[15] = out[15].bit_xor(135)
+    }
+    return bytes_of(out)
+}
+
+fn ntz(i: i64) -> i64 {
+    var v = i
+    var n = 0
+    while v % 2 == 0 {
+        v = v / 2
+        n = n + 1
+    }
+    return n
+}
+
+/// The key's L values, enough for `blocks` blocks.
+fn setup(key: bytes, blocks: i64) -> OcbKey {
+    let c = aes.new_cipher(key)
+    let l_star = aes.encrypt_with(c, bytes_filled(16, 0))
+    let l_dollar = double(l_star)
+    var l: [bytes] = [double(l_dollar)]
+    var n = 1
+    while 1.shl(n) <= blocks + 1 {
+        l.push(double(l[n - 1]))
+        n = n + 1
+    }
+    return OcbKey{ c: c, l_star: l_star, l_dollar: l_dollar, l: l }
+}
+
+/// Offset_0 from the nonce: the "stretch" of section 4.2, shifted by the
+/// nonce's last six bits.
+fn first_offset(k: OcbKey, nonce: bytes, tag_len: i64) -> bytes {
+    let n = nonce.len()
+    var full = bytes_filled(16, 0).to_list()
+    for i in 0..n {
+        full[16 - n + i] = nonce.at(i)
+    }
+    full[15 - n] = full[15 - n].bit_or(1)
+    full[0] = full[0].bit_or((tag_len * 8 % 128).shl(1))
+    let bottom = full[15].bit_and(63)
+    full[15] = full[15].bit_and(192)
+    let top = aes.encrypt_with(k.c, bytes_of(full))
+    var stretch = top.to_list()
+    for i in 0..8 {
+        stretch.push(top.at(i).bit_xor(top.at(i + 1)))
+    }
+    let by = bottom / 8
+    let bits = bottom % 8
+    var out: [i64] = []
+    for i in 0..16 {
+        let hi = stretch[i + by].shl(bits).bit_and(255)
+        let lo = if bits == 0 { 0 } else { stretch[i + by + 1].ushr(8 - bits) }
+        out.push(hi.bit_or(lo))
+    }
+    return bytes_of(out)
+}
+
+fn pad_one(part: bytes) -> bytes {
+    var v = part.to_list()
+    v.push(128)
+    while v.len() < 16 {
+        v.push(0)
+    }
+    return bytes_of(v)
+}
+
+/// HASH(K, A) of section 4.1.
+fn hash(k: OcbKey, aad: bytes) -> bytes {
+    var sum = bytes_filled(16, 0)
+    var offset = bytes_filled(16, 0)
+    let m = aad.len() / 16
+    for i in 1..(m + 1) {
+        offset = xor(offset, k.l[ntz(i)])
+        sum = xor(sum, aes.encrypt_with(k.c, xor(aad.slice((i - 1) * 16, i * 16), offset)))
+    }
+    if aad.len() % 16 != 0 {
+        offset = xor(offset, k.l_star)
+        sum = xor(sum, aes.encrypt_with(k.c, xor(pad_one(aad.slice(m * 16, aad.len())), offset)))
+    }
+    return sum
+}
+
+fn check(key: bytes, nonce: bytes, tag_len: i64) -> () ! OcbError {
+    if key.len() != 16 and key.len() != 24 and key.len() != 32 {
+        fail(OcbBadKey(key.len()))
+    }
+    if nonce.len() < 1 or nonce.len() > 15 {
+        fail(OcbBadNonce(nonce.len()))
+    }
+    if tag_len < 1 or tag_len > 16 {
+        fail(OcbBadTag(tag_len))
+    }
+}
+
+/// Encrypt or decrypt; returns the output and the full 16-byte tag.
+fn run(key: bytes, nonce: bytes, aad: bytes, input: bytes, tag_len: i64, encrypt: bool) -> (bytes, bytes) {
+    let m = input.len() / 16
+    let k = setup(key, m + aad.len() / 16)
+    var offset = first_offset(k, nonce, tag_len)
+    var checksum = bytes_filled(16, 0)
+    var out: [i64] = []
+    for i in 1..(m + 1) {
+        offset = xor(offset, k.l[ntz(i)])
+        let block = input.slice((i - 1) * 16, i * 16)
+        let res = if encrypt {
+            xor(offset, aes.encrypt_with(k.c, xor(block, offset)))
+        } else {
+            xor(offset, aes.decrypt_with(k.c, xor(block, offset)))
+        }
+        checksum = xor(checksum, if encrypt { block } else { res })
+        out = out + res.to_list()
+    }
+    if input.len() % 16 != 0 {
+        let part = input.slice(m * 16, input.len())
+        offset = xor(offset, k.l_star)
+        let pad = aes.encrypt_with(k.c, offset)
+        let res = xor(part, pad.slice(0, part.len()))
+        checksum = xor(checksum, pad_one(if encrypt { part } else { res }))
+        out = out + res.to_list()
+    }
+    let tag = xor(aes.encrypt_with(k.c, xor(xor(checksum, offset), k.l_dollar)), hash(k, aad))
+    return (bytes_of(out), tag)
+}
+
+/// The ciphertext followed by a tag_len-byte tag.
+pub fn seal(key: bytes, nonce: bytes, aad: bytes, plaintext: bytes, tag_len: i64) -> bytes ! OcbError {
+    try check(key, nonce, tag_len)
+    let (ct, tag) = run(key, nonce, aad, plaintext, tag_len, true)
+    return ct.concat(tag.slice(0, tag_len))
+}
+
+/// The plaintext, if the tag verifies.
+pub fn open(key: bytes, nonce: bytes, aad: bytes, sealed: bytes, tag_len: i64) -> bytes ! OcbError {
+    try check(key, nonce, tag_len)
+    if sealed.len() < tag_len {
+        fail(OcbNotAuthentic)
+    }
+    let n = sealed.len() - tag_len
+    let (pt, tag) = run(key, nonce, aad, sealed.slice(0, n), tag_len, false)
+    if not bytes_codec.equal_constant_time(tag.slice(0, tag_len), sealed.slice(n, sealed.len())) {
+        fail(OcbNotAuthentic)
+    }
+    return pt
+}

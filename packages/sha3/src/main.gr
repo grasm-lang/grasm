@@ -168,6 +168,71 @@ pub fn shake256(message: bytes, want: i64) -> bytes {
     return sponge(message, 136, 31, want)
 }
 
+// --- SP 800-185 ---------------------------------------------------------------
+//
+// cSHAKE is SHAKE with a function name and a customisation string absorbed
+// first, so KMAC, TupleHash and an application's own uses of SHAKE give
+// unrelated outputs for the same input. The strings are framed with the
+// encodings below, which make every framing unambiguous: a length always
+// says how many bytes its own number takes.
+
+/// x as its byte count followed by its big-endian bytes (at least one).
+pub fn left_encode(x: i64) -> bytes {
+    let body = encode_bytes(x)
+    return bytes_of([body.len()]).concat(body)
+}
+
+/// x as its big-endian bytes followed by their count.
+pub fn right_encode(x: i64) -> bytes {
+    let body = encode_bytes(x)
+    return body.concat(bytes_of([body.len()]))
+}
+
+fn encode_bytes(x: i64) -> bytes {
+    var out: [i64] = []
+    var v = x
+    while v > 0 {
+        out = [v.bit_and(255)] + out
+        v = v.ushr(8)
+    }
+    if out.len() == 0 {
+        out.push(0)
+    }
+    return bytes_of(out)
+}
+
+/// A string preceded by its length in bits.
+pub fn encode_string(s: bytes) -> bytes {
+    return left_encode(s.len() * 8).concat(s)
+}
+
+/// x preceded by w's encoding and padded with zeros to a multiple of w.
+pub fn bytepad(x: bytes, w: i64) -> bytes {
+    var out = left_encode(w).concat(x).to_list()
+    while out.len() % w != 0 {
+        out.push(0)
+    }
+    return bytes_of(out)
+}
+
+fn cshake(message: bytes, rate: i64, want: i64, name: bytes, custom: bytes) -> bytes {
+    if name.len() == 0 and custom.len() == 0 {
+        return sponge(message, rate, 31, want)
+    }
+    let prefix = bytepad(encode_string(name).concat(encode_string(custom)), rate)
+    return sponge(prefix.concat(message), rate, 4, want)
+}
+
+/// cSHAKE128 with a function name and a customisation string; with both
+/// empty it is SHAKE128.
+pub fn cshake128(message: bytes, want: i64, name: bytes, custom: bytes) -> bytes {
+    return cshake(message, 168, want, name, custom)
+}
+
+pub fn cshake256(message: bytes, want: i64, name: bytes, custom: bytes) -> bytes {
+    return cshake(message, 136, want, name, custom)
+}
+
 /// The original Keccak padding, which is what Ethereum's `keccak256` uses.
 ///
 /// It is here because the difference is a single byte and mistaking one for

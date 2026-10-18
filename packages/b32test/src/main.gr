@@ -1,0 +1,197 @@
+// The Grasm side of scripts/b32_diff.py: `<op> x<unused> x<fields>`, the
+// fields `|`-separated, bytes in hex and numbers in decimal. Answers are
+// hex, or ERR.
+import cmac
+import gmac
+import kmac
+import ccm
+import ocb
+import aessiv
+import keywrap
+import xts
+import gcmsiv
+import cbccts
+
+fn from_hex(text: str) -> bytes {
+    var out: [i64] = []
+    var i = 1
+    while i + 1 < text.len() {
+        out.push(text.substr(i, 2).parse_int_base(16) ?? 0)
+        i = i + 2
+    }
+    bytes_of(out)
+}
+
+fn unhex(text: str) -> bytes {
+    from_hex(":" + text)
+}
+
+fn hex(raw: bytes) -> str {
+    let digits = "0123456789abcdef"
+    var out = ""
+    var i = 0
+    while i < raw.len() {
+        out = out + digits.substr(raw.at(i) / 16, 1) + digits.substr(raw.at(i) % 16, 1)
+        i = i + 1
+    }
+    out
+}
+
+fn int(s: str) -> i64 {
+    s.parse_int() ?? 0
+}
+
+/// A list of strings: `x<hex>` items, comma-separated; empty for none.
+fn strings(s: str) -> [bytes] {
+    if s.len() == 0 { [] } else { s.split(",").map(|x| unhex(x.substr(1, x.len() - 1))) }
+}
+
+fn variant(s: str) -> CtsVariant {
+    if s == "1" { Cs1 } else if s == "2" { Cs2 } else { Cs3 }
+}
+
+fn answer_fallible(op: str, f: [bytes], g: [str]) -> str {
+    if op == "ccm.seal" {
+        return match ccm.seal(f[0], f[1], f[2], f[3], int(g[4])) {
+            Ok(b) -> hex(b)
+            Err(_) -> "ERR"
+        }
+    }
+    if op == "ccm.open" {
+        return match ccm.open(f[0], f[1], f[2], f[3], int(g[4])) {
+            Ok(b) -> hex(b)
+            Err(_) -> "ERR"
+        }
+    }
+    if op == "ocb.seal" {
+        return match ocb.seal(f[0], f[1], f[2], f[3], int(g[4])) {
+            Ok(b) -> hex(b)
+            Err(_) -> "ERR"
+        }
+    }
+    if op == "ocb.open" {
+        return match ocb.open(f[0], f[1], f[2], f[3], int(g[4])) {
+            Ok(b) -> hex(b)
+            Err(_) -> "ERR"
+        }
+    }
+    if op == "gcmsiv.seal" {
+        return match gcmsiv.seal(f[0], f[1], f[2], f[3]) {
+            Ok(b) -> hex(b)
+            Err(_) -> "ERR"
+        }
+    }
+    if op == "gcmsiv.open" {
+        return match gcmsiv.open(f[0], f[1], f[2], f[3]) {
+            Ok(b) -> hex(b)
+            Err(_) -> "ERR"
+        }
+    }
+    if op == "siv.seal" {
+        return match aessiv.seal(f[0], strings(g[2]), f[1]) {
+            Ok(b) -> hex(b)
+            Err(_) -> "ERR"
+        }
+    }
+    if op == "siv.open" {
+        return match aessiv.open(f[0], strings(g[2]), f[1]) {
+            Ok(b) -> hex(b)
+            Err(_) -> "ERR"
+        }
+    }
+    if op == "kw.wrap" {
+        return match keywrap.wrap(f[0], f[1]) {
+            Ok(b) -> hex(b)
+            Err(_) -> "ERR"
+        }
+    }
+    if op == "kw.unwrap" {
+        return match keywrap.unwrap(f[0], f[1]) {
+            Ok(b) -> hex(b)
+            Err(_) -> "ERR"
+        }
+    }
+    if op == "kwp.wrap" {
+        return match keywrap.wrap_pad(f[0], f[1]) {
+            Ok(b) -> hex(b)
+            Err(_) -> "ERR"
+        }
+    }
+    if op == "kwp.unwrap" {
+        return match keywrap.unwrap_pad(f[0], f[1]) {
+            Ok(b) -> hex(b)
+            Err(_) -> "ERR"
+        }
+    }
+    if op == "xts.enc" {
+        return match xts.encrypt(f[0], f[1], f[2]) {
+            Ok(b) -> hex(b)
+            Err(_) -> "ERR"
+        }
+    }
+    if op == "xts.dec" {
+        return match xts.decrypt(f[0], f[1], f[2]) {
+            Ok(b) -> hex(b)
+            Err(_) -> "ERR"
+        }
+    }
+    if op == "cts.enc" {
+        return match cbccts.encrypt(f[0], f[1], f[2], variant(g[3])) {
+            Ok(b) -> hex(b)
+            Err(_) -> "ERR"
+        }
+    }
+    if op == "cts.dec" {
+        return match cbccts.decrypt(f[0], f[1], f[2], variant(g[3])) {
+            Ok(b) -> hex(b)
+            Err(_) -> "ERR"
+        }
+    }
+    if op == "cmac.aes" {
+        return match cmac.aes_cmac(f[0], f[1]) {
+            Ok(b) -> hex(b)
+            Err(_) -> "ERR"
+        }
+    }
+    if op == "cmac.tdes" {
+        return match cmac.tdes_cmac(f[0], f[1]) {
+            Ok(b) -> hex(b)
+            Err(_) -> "ERR"
+        }
+    }
+    if op == "gmac" {
+        return match gmac.gmac(f[0], f[1], f[2]) {
+            Ok(b) -> hex(b)
+            Err(_) -> "ERR"
+        }
+    }
+    "UNKNOWN"
+}
+
+fn answer(op: str, text: str) -> str {
+    let g = text.split("|")
+    let f = g.map(|x| unhex(x))
+    if op.starts_with("kmac") {
+        let n = int(g[3])
+        let r = if op == "kmac128" {
+            kmac.kmac128(f[0], f[1], n, f[2])
+        } else if op == "kmac256" {
+            kmac.kmac256(f[0], f[1], n, f[2])
+        } else if op == "kmacxof128" {
+            kmac.kmacxof128(f[0], f[1], n, f[2])
+        } else {
+            kmac.kmacxof256(f[0], f[1], n, f[2])
+        }
+        return hex(r)
+    }
+    answer_fallible(op, f, g)
+}
+
+fn main() / {io} {
+    let argv = args()
+    var i = 0
+    while i + 2 < argv.len() {
+        print(answer(argv[i], from_hex(argv[i + 2]).to_str()))
+        i = i + 3
+    }
+}

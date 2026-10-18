@@ -1,0 +1,153 @@
+// AES-CCM: counter mode with CBC-MAC (RFC 3610, NIST SP 800-38C).
+//
+// Authenticated encryption from one AES key: a CBC-MAC over a header block,
+// the associated data and the plaintext gives the tag, and counter mode
+// encrypts the plaintext and the tag. It is the AEAD of WPA2's CCMP,
+// Bluetooth LE, Zigbee and 802.15.4, Thread, Matter, TLS's CCM suites and
+// DTLS on constrained devices -- wherever one AES engine in hardware has to
+// do both jobs.
+//
+// The nonce is 7 to 13 bytes, and its length fixes how long a message can
+// be: the 15 - n bytes left in a block count the message's length and the
+// blocks of keystream. The tag is 4 to 16 bytes, even. Associated data of
+// any length is framed by its own length in 2, 6 or 10 bytes. A nonce must
+// never repeat under one key.
+//
+// `open` checks the tag in constant time before returning any plaintext.
+//
+// Checked against OpenSSL's AES-CCM.
+import aes
+import bytes_codec
+
+type CcmError =
+    | CcmBadKey(length: i64)
+    | CcmBadNonce(length: i64)
+    | CcmBadTag(length: i64)
+    | CcmTooLong
+    | CcmNotAuthentic
+
+fn check(key: bytes, nonce: bytes, tag_len: i64) -> () ! CcmError {
+    if key.len() != 16 and key.len() != 24 and key.len() != 32 {
+        fail(CcmBadKey(key.len()))
+    }
+    if nonce.len() < 7 or nonce.len() > 13 {
+        fail(CcmBadNonce(nonce.len()))
+    }
+    if tag_len < 4 or tag_len > 16 or tag_len % 2 != 0 {
+        fail(CcmBadTag(tag_len))
+    }
+}
+
+/// n as `width` big-endian bytes.
+fn be(n: i64, width: i64) -> [i64] {
+    var out: [i64] = []
+    var i = width - 1
+    while i >= 0 {
+        out.push(if i >= 8 { 0 } else { n.ushr(8 * i).bit_and(255) })
+        i = i - 1
+    }
+    return out
+}
+
+fn pad16(v: [i64]) -> [i64] {
+    var out = v
+    while out.len() % 16 != 0 {
+        out.push(0)
+    }
+    return out
+}
+
+/// The CBC-MAC input: B0, the framed associated data and the plaintext,
+/// each padded to whole blocks.
+fn mac_input(nonce: bytes, aad: bytes, plaintext: bytes, tag_len: i64) -> [i64] {
+    let l = 15 - nonce.len()
+    let flags = (if aad.len() > 0 { 64 } else { 0 }) + 8 * ((tag_len - 2) / 2) + (l - 1)
+    var b = [flags] + nonce.to_list() + be(plaintext.len(), l)
+    if aad.len() > 0 {
+        let a = aad.len()
+        let framed = if a < 65280 { be(a, 2) } else if a < 4294967296 { [255, 254] + be(a, 4) } else { [255, 255] + be(a, 8) }
+        b = b + pad16(framed + aad.to_list())
+    }
+    return b + pad16(plaintext.to_list())
+}
+
+fn cbc_mac(c: Cipher, input: [i64], tag_len: i64) -> [i64] {
+    var x = bytes_filled(16, 0)
+    var at = 0
+    while at < input.len() {
+        var block: [i64] = []
+        for i in 0..16 {
+            block.push(x.at(i).bit_xor(input[at + i]))
+        }
+        x = aes.encrypt_with(c, bytes_of(block))
+        at = at + 16
+    }
+    return x.slice(0, tag_len).to_list()
+}
+
+/// Counter block i: the flags (L - 1), the nonce, and i in L bytes.
+fn keystream(c: Cipher, nonce: bytes, i: i64) -> bytes {
+    let l = 15 - nonce.len()
+    return aes.encrypt_with(c, bytes_of([l - 1] + nonce.to_list() + be(i, l)))
+}
+
+fn ctr(c: Cipher, nonce: bytes, data: bytes) -> [i64] {
+    var out: [i64] = []
+    var at = 0
+    var i = 1
+    while at < data.len() {
+        let s = keystream(c, nonce, i)
+        var k = 0
+        while k < 16 and at + k < data.len() {
+            out.push(data.at(at + k).bit_xor(s.at(k)))
+            k = k + 1
+        }
+        at = at + 16
+        i = i + 1
+    }
+    return out
+}
+
+fn masked_tag(c: Cipher, nonce: bytes, aad: bytes, plaintext: bytes, tag_len: i64) -> [i64] {
+    let t = cbc_mac(c, mac_input(nonce, aad, plaintext, tag_len), tag_len)
+    let s0 = keystream(c, nonce, 0)
+    var out: [i64] = []
+    for i in 0..tag_len {
+        out.push(t[i].bit_xor(s0.at(i)))
+    }
+    return out
+}
+
+fn fits(nonce: bytes, n: i64) -> bool {
+    let l = 15 - nonce.len()
+    return l >= 8 or n < 1.shl(8 * l)
+}
+
+/// The ciphertext followed by a tag_len-byte tag.
+pub fn seal(key: bytes, nonce: bytes, aad: bytes, plaintext: bytes, tag_len: i64) -> bytes ! CcmError {
+    try check(key, nonce, tag_len)
+    if not fits(nonce, plaintext.len()) {
+        fail(CcmTooLong)
+    }
+    let c = aes.new_cipher(key)
+    return bytes_of(ctr(c, nonce, plaintext) + masked_tag(c, nonce, aad, plaintext, tag_len))
+}
+
+/// The plaintext, if the tag verifies.
+pub fn open(key: bytes, nonce: bytes, aad: bytes, sealed: bytes, tag_len: i64) -> bytes ! CcmError {
+    try check(key, nonce, tag_len)
+    if sealed.len() < tag_len {
+        fail(CcmNotAuthentic)
+    }
+    let n = sealed.len() - tag_len
+    if not fits(nonce, n) {
+        fail(CcmTooLong)
+    }
+    let c = aes.new_cipher(key)
+    let plaintext = bytes_of(ctr(c, nonce, sealed.slice(0, n)))
+    let want = bytes_of(masked_tag(c, nonce, aad, plaintext, tag_len))
+    if not bytes_codec.equal_constant_time(want, sealed.slice(n, sealed.len())) {
+        fail(CcmNotAuthentic)
+    }
+    return plaintext
+}
