@@ -1,0 +1,66 @@
+// NSH, the Network Service Header (RFC 8300): the header service function
+// chaining puts on a packet so it visits a firewall, a load balancer and a
+// DPI box in order, each knowing where it is in the chain.
+//
+// A base header -- version, the OAM bit, a TTL, the header's length in
+// 4-byte words, the metadata type and the next protocol -- then the
+// service path: a 24-bit path ID and an 8-bit index that each hop
+// decrements. Metadata type 1 adds sixteen fixed bytes of context; type 2
+// adds variable TLVs, kept here as bytes.
+
+type NshHeader = {
+    ver: i64,
+    oam: i64,
+    unused1: i64,
+    ttl: i64,
+    unused2: i64,
+    mdtype: i64,
+    nextproto: i64,
+    spi: i64,
+    si: i64,
+    context: bytes,
+    payload: bytes,
+}
+
+type NshError =
+    | TooShort(found: i64)
+    | BadLength(words: i64)
+
+pub fn decode(data: bytes) -> NshHeader ! NshError {
+    if data.len() < 8 {
+        fail(TooShort(data.len()))
+    }
+    let b0 = data.at(0)
+    let b1 = data.at(1)
+    let words = b1.bit_and(63)
+    if words < 2 or words * 4 > data.len() {
+        fail(BadLength(words))
+    }
+    NshHeader{ ver: b0.ushr(6), oam: b0.ushr(5).bit_and(1), unused1: b0.ushr(4).bit_and(1),
+        ttl: b0.bit_and(15).shl(2).bit_or(b1.ushr(6)), unused2: data.at(2).ushr(4),
+        mdtype: data.at(2).bit_and(15), nextproto: data.at(3),
+        spi: data.at(4).shl(16).bit_or(data.at(5).shl(8)).bit_or(data.at(6)), si: data.at(7),
+        context: data.slice(8, words * 4), payload: data.slice(words * 4, data.len()) }
+}
+
+/// The header with its length taken from the context, padded to a word.
+pub fn encode(h: NshHeader) -> bytes {
+    let pad = (4 - h.context.len() % 4) % 4
+    let words = 2 + (h.context.len() + pad) / 4
+    bytes_of([h.ver.bit_and(3).shl(6).bit_or(h.oam.bit_and(1).shl(5)).bit_or(h.unused1.bit_and(1).shl(4))
+            .bit_or(h.ttl.ushr(2).bit_and(15)),
+        h.ttl.bit_and(3).shl(6).bit_or(words.bit_and(63)), h.unused2.bit_and(15).shl(4).bit_or(h.mdtype.bit_and(15)),
+        h.nextproto.bit_and(255), h.spi.ushr(16).bit_and(255), h.spi.ushr(8).bit_and(255), h.spi.bit_and(255),
+        h.si.bit_and(255)]).concat(h.context).concat(bytes_filled(pad, 0)).concat(h.payload)
+}
+
+/// The next hop's header: the same path one index further on, or `None`
+/// when the index has run out (RFC 8300 drops the packet then).
+pub fn next_hop(h: NshHeader) -> Option[NshHeader] {
+    if h.si == 0 {
+        return None
+    }
+    var n = h
+    n.si = h.si - 1
+    Some(n)
+}

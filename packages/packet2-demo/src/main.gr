@@ -1,0 +1,56 @@
+// Routing and LAN protocols, each asserted against bytes scapy built for
+// the same fields. scripts/packet_diff.sh holds them to scapy case for
+// case; this is the short version every engine runs.
+import cdp
+import mpls
+import pppoe
+import bfd
+import lldp
+
+fn hex(raw: bytes) -> str {
+    let digits = "0123456789abcdef"
+    var out = ""
+    var i = 0
+    while i < raw.len() {
+        out = out + digits.substr(raw.at(i) / 16, 1) + digits.substr(raw.at(i) % 16, 1)
+        i = i + 1
+    }
+    out
+}
+
+fn main() / {io} {
+    // An odd-length CDP packet, whose checksum needs Cisco's rule.
+    let announce = CdpPacket{ version: 2, ttl: 180, checksum: 0,
+        tlvs: [CdpTlv{ kind: cdp.device_id(), value: "sw1".to_bytes() }] }
+    let wire = cdp.encode(announce)
+    assert_eq(hex(wire), "02b4899b00010007737731")
+    assert(cdp.checksum_holds(wire))
+
+    assert_eq(hex(mpls.encode([MplsEntry{ label: 16, cos: 0, s: 0, ttl: 64 }])), "00010140")
+
+    let padi = PppoePacket{ version: 1, kind: 1, code: 9, session_id: 0, length: 0,
+        payload: pppoe.encode_tags([PppoeTag{ kind: 257, value: bytes_of([]) }]), trailer: bytes_of([]) }
+    assert_eq(hex(pppoe.encode(padi)), "11090000000401010000")
+    assert_eq(pppoe.code_name(9), "PADI")
+
+    let up = BfdPacket{ version: 1, diag: 0, state: 3, flags: 0, detect_mult: 3, length: 24,
+        my_discriminator: 1, your_discriminator: 2, min_tx_interval: 300000, min_rx_interval: 300000,
+        echo_rx_interval: 0, auth: bytes_of([]) }
+    assert_eq(hex(bfd.encode(up)), "20c003180000000100000002000493e0000493e000000000")
+    assert_eq(bfd.state_name(up.state), "Up")
+
+    let tlvs = [LldpTlv{ kind: lldp.chassis_id(), value: bytes_of([4, 1, 2, 3, 4, 5, 6]) },
+        LldpTlv{ kind: lldp.port_id(), value: "\u{5}eth0".to_bytes() },
+        LldpTlv{ kind: lldp.ttl(), value: bytes_of([0, 120]) }, LldpTlv{ kind: 0, value: bytes_of([]) }]
+    match lldp.decode(lldp.encode(tlvs)) {
+        Ok(back) -> {
+            assert_eq(lldp.ttl_seconds(back), 120)
+            match lldp.check(back) {
+                Ok(_) -> {}
+                Err(_) -> panic("lldp refused a well-formed LLDPDU")
+            }
+        }
+        Err(_) -> panic("lldp could not read back its own LLDPDU")
+    }
+    print("packet2: ok")
+}

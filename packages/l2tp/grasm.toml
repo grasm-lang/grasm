@@ -1,0 +1,5 @@
+[package]
+name = "l2tp"
+version = "1.0.0"
+
+capabilities = []

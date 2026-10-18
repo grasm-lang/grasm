@@ -1,0 +1,68 @@
+// RIP versions 1 and 2 (RFC 1058, RFC 2453): the oldest routing protocol
+// still running, on small networks, in labs, and in every routing course.
+//
+// A four-byte header -- command (1 request, 2 response), version, zero --
+// then up to twenty-five route entries of twenty bytes: address family,
+// route tag, address, mask, next hop and metric (16 meaning unreachable).
+// Version 2 authentication is an entry with family 0xFFFF; it is kept as an
+// entry, with its fields read as the bytes they are.
+
+type RipEntry = {
+    af: i64,
+    route_tag: i64,
+    addr: bytes,
+    mask: bytes,
+    next_hop: bytes,
+    metric: i64,
+}
+
+type RipPacket = {
+    cmd: i64,
+    version: i64,
+    zero: i64,
+    entries: [RipEntry],
+    rest: bytes,
+}
+
+type RipError =
+    | TooShort(found: i64)
+
+fn u16(b: bytes, at: i64) -> i64 {
+    b.at(at) * 256 + b.at(at + 1)
+}
+
+fn be16(v: i64) -> bytes {
+    bytes_of([v.ushr(8).bit_and(255), v.bit_and(255)])
+}
+
+pub fn decode(data: bytes) -> RipPacket ! RipError {
+    if data.len() < 4 {
+        fail(TooShort(data.len()))
+    }
+    var entries: [RipEntry] = []
+    var at = 4
+    while at + 20 <= data.len() {
+        entries.push(RipEntry{ af: u16(data, at), route_tag: u16(data, at + 2),
+            addr: data.slice(at + 4, at + 8), mask: data.slice(at + 8, at + 12),
+            next_hop: data.slice(at + 12, at + 16),
+            metric: u16(data, at + 16) * 65536 + u16(data, at + 18) })
+        at = at + 20
+    }
+    RipPacket{ cmd: data.at(0), version: data.at(1), zero: u16(data, 2), entries: entries,
+        rest: data.slice(at, data.len()) }
+}
+
+pub fn encode(p: RipPacket) -> bytes {
+    var out = bytes_of([p.cmd.bit_and(255), p.version.bit_and(255)]).concat(be16(p.zero))
+    for e in p.entries {
+        out = out.concat(be16(e.af)).concat(be16(e.route_tag)).concat(e.addr).concat(e.mask)
+            .concat(e.next_hop).concat(be16(e.metric.ushr(16))).concat(be16(e.metric.bit_and(65535)))
+    }
+    out.concat(p.rest)
+}
+
+pub fn infinity() -> i64 { 16 }
+
+pub fn is_authentication(e: RipEntry) -> bool {
+    e.af == 65535
+}

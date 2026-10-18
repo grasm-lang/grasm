@@ -1,0 +1,102 @@
+// L2TP version 2 (RFC 2661): the tunnel under L2TP/IPsec VPNs and every
+// DSL access concentrator.
+//
+// Two bytes of flags and version -- T (control message), L (length
+// present), S (sequence numbers present), O (offset present), P (priority)
+// -- then the optional length, the tunnel and session IDs, the optional
+// Ns and Nr, and the optional offset size with that many bytes of padding.
+// Control messages must carry the length and sequence numbers; the decoder
+// reads what the flags say is there, and the encoder writes the length
+// computed from the payload.
+
+type L2tpHeader = {
+    flags: i64,
+    version: i64,
+    length: i64,
+    tunnel_id: i64,
+    session_id: i64,
+    ns: i64,
+    nr: i64,
+    offset: i64,
+    offset_pad: bytes,
+    payload: bytes,
+}
+
+type L2tpError =
+    | TooShort(found: i64)
+
+fn u16(b: bytes, at: i64) -> i64 {
+    b.at(at) * 256 + b.at(at + 1)
+}
+
+fn be16(v: i64) -> bytes {
+    bytes_of([v.ushr(8).bit_and(255), v.bit_and(255)])
+}
+
+pub fn control_bit() -> i64 { 2048 }
+pub fn length_bit() -> i64 { 1024 }
+pub fn sequence_bit() -> i64 { 128 }
+pub fn offset_bit() -> i64 { 32 }
+
+pub fn decode(data: bytes) -> L2tpHeader ! L2tpError {
+    if data.len() < 6 {
+        fail(TooShort(data.len()))
+    }
+    let w = u16(data, 0)
+    var h = L2tpHeader{ flags: w.ushr(4), version: w.bit_and(15), length: 0, tunnel_id: 0, session_id: 0,
+        ns: 0, nr: 0, offset: 0, offset_pad: bytes_of([]), payload: bytes_of([]) }
+    var at = 2
+    let need = header_length(h.flags)
+    if data.len() < need {
+        fail(TooShort(data.len()))
+    }
+    if h.flags.bit_and(1024) != 0 {
+        h.length = u16(data, at)
+        at = at + 2
+    }
+    h.tunnel_id = u16(data, at)
+    h.session_id = u16(data, at + 2)
+    at = at + 4
+    if h.flags.bit_and(128) != 0 {
+        h.ns = u16(data, at)
+        h.nr = u16(data, at + 2)
+        at = at + 4
+    }
+    if h.flags.bit_and(32) != 0 {
+        h.offset = u16(data, at)
+        at = at + 2
+        if data.len() < at + h.offset {
+            fail(TooShort(data.len()))
+        }
+        h.offset_pad = data.slice(at, at + h.offset)
+        at = at + h.offset
+    }
+    h.payload = data.slice(at, data.len())
+    h
+}
+
+fn header_length(flags: i64) -> i64 {
+    6 + (if flags.bit_and(1024) != 0 { 2 } else { 0 }) + (if flags.bit_and(128) != 0 { 4 } else { 0 }) +
+    (if flags.bit_and(32) != 0 { 2 } else { 0 })
+}
+
+pub fn encode(h: L2tpHeader) -> bytes {
+    var rest = be16(h.tunnel_id).concat(be16(h.session_id))
+    if h.flags.bit_and(128) != 0 {
+        rest = rest.concat(be16(h.ns)).concat(be16(h.nr))
+    }
+    if h.flags.bit_and(32) != 0 {
+        let pad = if h.offset_pad.len() == h.offset { h.offset_pad } else { bytes_filled(h.offset, 0) }
+        rest = rest.concat(be16(h.offset)).concat(pad)
+    }
+    rest = rest.concat(h.payload)
+    let head = be16(h.flags.bit_and(4095).shl(4).bit_or(h.version.bit_and(15)))
+    if h.flags.bit_and(1024) != 0 {
+        return head.concat(be16(rest.len() + 4)).concat(rest)
+    }
+    head.concat(rest)
+}
+
+pub fn is_control(h: L2tpHeader) -> bool {
+    h.flags.bit_and(2048) != 0
+}

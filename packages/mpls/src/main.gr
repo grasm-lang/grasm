@@ -1,0 +1,66 @@
+// MPLS label stacks (RFC 3032): four bytes per entry -- a 20-bit label, a
+// 3-bit traffic class, the bottom-of-stack bit and a TTL -- repeated until
+// an entry with the bottom bit set. What carrier networks, segment routing
+// and L3VPNs put in front of the packets they carry.
+
+type MplsEntry = {
+    label: i64,
+    cos: i64,
+    s: i64,
+    ttl: i64,
+}
+
+type MplsError =
+    | TooShort(found: i64)
+    | NoBottom
+
+pub fn decode_entry(b: bytes, at: i64) -> MplsEntry {
+    let v = b.at(at).shl(24).bit_or(b.at(at + 1).shl(16)).bit_or(b.at(at + 2).shl(8)).bit_or(b.at(at + 3))
+    MplsEntry{ label: v.ushr(12), cos: v.ushr(9).bit_and(7), s: v.ushr(8).bit_and(1), ttl: v.bit_and(255) }
+}
+
+pub fn encode_entry(e: MplsEntry) -> bytes {
+    let v = e.label.bit_and(1048575).shl(12).bit_or(e.cos.bit_and(7).shl(9)).bit_or(e.s.bit_and(1).shl(8))
+        .bit_or(e.ttl.bit_and(255))
+    bytes_of([v.ushr(24).bit_and(255), v.ushr(16).bit_and(255), v.ushr(8).bit_and(255), v.bit_and(255)])
+}
+
+/// Every entry down to the bottom of the stack, and where the payload
+/// starts. A stack that runs out of bytes before its bottom is refused.
+pub fn decode(data: bytes) -> ([MplsEntry], i64) ! MplsError {
+    var out: [MplsEntry] = []
+    var at = 0
+    while true {
+        if at + 4 > data.len() {
+            if out.len() == 0 {
+                fail(TooShort(data.len()))
+            }
+            fail(NoBottom)
+        }
+        let e = decode_entry(data, at)
+        out.push(e)
+        at = at + 4
+        if e.s == 1 {
+            break
+        }
+    }
+    (out, at)
+}
+
+/// The stack, with the bottom bit set on the last entry and cleared on the
+/// others, whatever they said.
+pub fn encode(entries: [MplsEntry]) -> bytes {
+    var out = bytes_of([])
+    for k in 0..entries.len() {
+        var e = entries[k]
+        e.s = if k == entries.len() - 1 { 1 } else { 0 }
+        out = out.concat(encode_entry(e))
+    }
+    out
+}
+
+/// The labels RFC 3032 reserves: 0 IPv4 explicit null, 1 router alert,
+/// 2 IPv6 explicit null, 3 implicit null, 7 entropy indicator, 13 OAM alert.
+pub fn is_reserved(label: i64) -> bool {
+    label < 16
+}

@@ -1,0 +1,52 @@
+// HSRP version 1 (RFC 2281): Cisco's predecessor to VRRP, still the
+// default first-hop redundancy on a great deal of Cisco gear.
+//
+// Twenty bytes on UDP port 1985: version, opcode (hello, coup, resign),
+// state (initial through active), hello and hold times in seconds, priority,
+// group, eight bytes of plaintext authentication ("cisco" padded with zeros
+// by default) and the virtual IP address.
+
+type HsrpMessage = {
+    version: i64,
+    opcode: i64,
+    state: i64,
+    hellotime: i64,
+    holdtime: i64,
+    priority: i64,
+    group: i64,
+    reserved: i64,
+    auth: bytes,
+    virtual_ip: bytes,
+    rest: bytes,
+}
+
+type HsrpError =
+    | TooShort(found: i64)
+
+pub fn decode(data: bytes) -> HsrpMessage ! HsrpError {
+    if data.len() < 20 {
+        fail(TooShort(data.len()))
+    }
+    HsrpMessage{ version: data.at(0), opcode: data.at(1), state: data.at(2), hellotime: data.at(3),
+        holdtime: data.at(4), priority: data.at(5), group: data.at(6), reserved: data.at(7),
+        auth: data.slice(8, 16), virtual_ip: data.slice(16, 20), rest: data.slice(20, data.len()) }
+}
+
+pub fn encode(m: HsrpMessage) -> bytes {
+    let auth = if m.auth.len() >= 8 { m.auth.slice(0, 8) } else { m.auth.concat(bytes_filled(8 - m.auth.len(), 0)) }
+    bytes_of([m.version, m.opcode, m.state, m.hellotime, m.holdtime, m.priority, m.group, m.reserved])
+        .concat(auth).concat(m.virtual_ip).concat(m.rest)
+}
+
+/// The state by number: 0 initial, 1 learn, 2 listen, 4 speak,
+/// 8 standby, 16 active.
+pub fn state_name(s: i64) -> str {
+    let codes = [0, 1, 2, 4, 8, 16]
+    let names = ["initial", "learn", "listen", "speak", "standby", "active"]
+    for k in 0..codes.len() {
+        if codes[k] == s {
+            return names[k]
+        }
+    }
+    "unknown"
+}

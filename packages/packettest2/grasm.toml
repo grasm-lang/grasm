@@ -1,0 +1,56 @@
+[package]
+name = "packettest2"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.igmp]
+path = "../igmp"
+version = "^1.0.0"
+
+[dependencies.mpls]
+path = "../mpls"
+version = "^1.0.0"
+
+[dependencies.lldp]
+path = "../lldp"
+version = "^1.0.0"
+
+[dependencies.stp]
+path = "../stp"
+version = "^1.0.0"
+
+[dependencies.cdp]
+path = "../cdp"
+version = "^1.0.0"
+
+[dependencies.rip]
+path = "../rip"
+version = "^1.0.0"
+
+[dependencies.vrrp]
+path = "../vrrp"
+version = "^1.0.0"
+
+[dependencies.hsrp]
+path = "../hsrp"
+version = "^1.0.0"
+
+[dependencies.bfd]
+path = "../bfd"
+version = "^1.0.0"
+
+[dependencies.nsh]
+path = "../nsh"
+version = "^1.0.0"
+
+[dependencies.erspan]
+path = "../erspan"
+version = "^1.0.0"
+
+[dependencies.l2tp]
+path = "../l2tp"
+version = "^1.0.0"
+
+[dependencies.pppoe]
+path = "../pppoe"
+version = "^1.0.0"

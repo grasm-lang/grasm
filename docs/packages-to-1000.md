@@ -224,6 +224,14 @@ day its reference is installed.
 
 ## Landed
 
+- [x] **B15, first part: routing, links and LANs** — `igmp` `mpls` `lldp`
+  `stp` `cdp` `rip` `vrrp` `hsrp` `bfd` `nsh` `erspan` `l2tp` `pppoe`, and
+  the harness `packettest2`; the packet gate now runs 17,502 cases against
+  scapy, every one of these thirteen agreeing on first contact. VRRPv3's
+  checksum over an IPv4 or IPv6 pseudo-header, and CDP's checksum with
+  Cisco's rule for an odd final byte, which a control removed and the gate
+  caught.
+
 - [x] **B14, second part: transports and services** — `rtp` `stun` `sctp`
   `dhcp` `dhcpv6` `esp` `nbns` `pflog`, checked through `packettest`; the
   gate now runs 10,602 cases. ESP with the NULL cipher is held to scapy and
@@ -288,7 +296,7 @@ day its reference is installed.
 | | |
 |---|---|
 | At the start | 669 |
-| Now | 707 |
+| Now | 721 |
 | Candidates above | 305 packages in 27 batches, plus `ecc`, `rfc6979` and `goprintf` |
 | Harnesses, one a batch | 27 |
 | If every candidate lands | 1004 |

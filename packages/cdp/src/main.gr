@@ -1,0 +1,98 @@
+// CDP, the Cisco Discovery Protocol: what Cisco gear announces on every
+// port -- device ID, addresses, port, platform, native VLAN, duplex --
+// read by every network inventory tool that has met a Cisco switch.
+//
+// A version byte, a hold time, a checksum, then TLVs whose length includes
+// their own four-byte header. The checksum is the Internet checksum with
+// Cisco's twist for an odd length: the last byte is not padded with a zero
+// after it but folded in as if preceded by 0x00 -- or by 0xFF, one less,
+// when it is above 0x80. `encode` computes it that way, as Cisco devices
+// and scapy do.
+import packets
+
+type CdpTlv = {
+    kind: i64,
+    value: bytes,
+}
+
+type CdpPacket = {
+    version: i64,
+    ttl: i64,
+    checksum: i64,
+    tlvs: [CdpTlv],
+}
+
+type CdpError =
+    | TooShort(at: i64)
+    | BadLength(at: i64)
+
+pub fn device_id() -> i64 { 1 }
+pub fn port_id() -> i64 { 3 }
+pub fn platform() -> i64 { 6 }
+pub fn native_vlan() -> i64 { 10 }
+
+fn u16(b: bytes, at: i64) -> i64 {
+    b.at(at) * 256 + b.at(at + 1)
+}
+
+/// The checksum as Cisco computes it.
+pub fn cisco_checksum(data: bytes) -> i64 {
+    if data.len() % 2 == 0 {
+        return packets.checksum(data)
+    }
+    let last = data.at(data.len() - 1)
+    let tail = if last <= 128 { bytes_of([0, last]) } else { bytes_of([255, last - 1]) }
+    packets.checksum(data.slice(0, data.len() - 1).concat(tail))
+}
+
+pub fn decode(data: bytes) -> CdpPacket ! CdpError {
+    if data.len() < 4 {
+        fail(TooShort(0))
+    }
+    var tlvs: [CdpTlv] = []
+    var at = 4
+    while at < data.len() {
+        if at + 4 > data.len() {
+            fail(TooShort(at))
+        }
+        let n = u16(data, at + 2)
+        if n < 4 or at + n > data.len() {
+            fail(BadLength(at))
+        }
+        tlvs.push(CdpTlv{ kind: u16(data, at), value: data.slice(at + 4, at + n) })
+        at = at + n
+    }
+    CdpPacket{ version: data.at(0), ttl: data.at(1), checksum: u16(data, 2), tlvs: tlvs }
+}
+
+pub fn encode(p: CdpPacket) -> bytes {
+    var out = bytes_of([p.version.bit_and(255), p.ttl.bit_and(255), 0, 0])
+    for t in p.tlvs {
+        let n = t.value.len() + 4
+        out = out.concat(bytes_of([t.kind.ushr(8).bit_and(255), t.kind.bit_and(255), n.ushr(8).bit_and(255),
+            n.bit_and(255)])).concat(t.value)
+    }
+    let sum = cisco_checksum(out)
+    out.set(2, sum.ushr(8))
+    out.set(3, sum.bit_and(255))
+    out
+}
+
+pub fn checksum_holds(data: bytes) -> bool {
+    if data.len() < 4 {
+        return false
+    }
+    var zeroed = data
+    zeroed.set(2, 0)
+    zeroed.set(3, 0)
+    cisco_checksum(zeroed) == u16(data, 2)
+}
+
+pub fn find(p: CdpPacket, kind: i64) -> Option[bytes] {
+    for t in p.tlvs {
+        if t.kind == kind {
+            return Some(t.value)
+        }
+    }
+    None
+}

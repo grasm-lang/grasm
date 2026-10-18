@@ -1,0 +1,5 @@
+[package]
+name = "nsh"
+version = "1.0.0"
+
+capabilities = []

@@ -1,0 +1,93 @@
+// PPPoE (RFC 2516): how DSL and fibre broadband carries PPP over Ethernet.
+//
+// Six bytes -- version and type (both 1), a code, a session ID and the
+// payload length -- then the payload. Code 0 is a session packet whose
+// payload is PPP; the discovery codes (PADI 0x09, PADO 0x07, PADR 0x19,
+// PADS 0x65, PADT 0xA7) carry tags, each a type, a length and a value:
+// service name, AC name, host uniq, AC cookie. The declared length decides
+// where the payload ends -- Ethernet padding after it is not payload.
+
+type PppoeTag = {
+    kind: i64,
+    value: bytes,
+}
+
+type PppoePacket = {
+    version: i64,
+    kind: i64,
+    code: i64,
+    session_id: i64,
+    length: i64,
+    payload: bytes,
+    trailer: bytes,
+}
+
+type PppoeError =
+    | TooShort(found: i64)
+    | BadTag(at: i64)
+
+fn u16(b: bytes, at: i64) -> i64 {
+    b.at(at) * 256 + b.at(at + 1)
+}
+
+fn be16(v: i64) -> bytes {
+    bytes_of([v.ushr(8).bit_and(255), v.bit_and(255)])
+}
+
+pub fn decode(data: bytes) -> PppoePacket ! PppoeError {
+    if data.len() < 6 {
+        fail(TooShort(data.len()))
+    }
+    let n = u16(data, 4)
+    if 6 + n > data.len() {
+        fail(TooShort(data.len()))
+    }
+    PppoePacket{ version: data.at(0).ushr(4), kind: data.at(0).bit_and(15), code: data.at(1),
+        session_id: u16(data, 2), length: n, payload: data.slice(6, 6 + n),
+        trailer: data.slice(6 + n, data.len()) }
+}
+
+/// The packet with its length computed from the payload; the trailer, if
+/// any, follows.
+pub fn encode(p: PppoePacket) -> bytes {
+    bytes_of([p.version.bit_and(15).shl(4).bit_or(p.kind.bit_and(15)), p.code.bit_and(255)])
+        .concat(be16(p.session_id)).concat(be16(p.payload.len())).concat(p.payload).concat(p.trailer)
+}
+
+/// A discovery packet's tags, up to the end-of-list tag (0) if one is
+/// there.
+pub fn tags(p: PppoePacket) -> [PppoeTag] ! PppoeError {
+    var out: [PppoeTag] = []
+    var at = 0
+    let b = p.payload
+    while at < b.len() {
+        if at + 4 > b.len() {
+            fail(BadTag(at))
+        }
+        let n = u16(b, at + 2)
+        if at + 4 + n > b.len() {
+            fail(BadTag(at))
+        }
+        let kind = u16(b, at)
+        out.push(PppoeTag{ kind: kind, value: b.slice(at + 4, at + 4 + n) })
+        at = at + 4 + n
+        if kind == 0 {
+            break
+        }
+    }
+    out
+}
+
+pub fn encode_tags(list: [PppoeTag]) -> bytes {
+    var out = bytes_of([])
+    for t in list {
+        out = out.concat(be16(t.kind)).concat(be16(t.value.len())).concat(t.value)
+    }
+    out
+}
+
+pub fn code_name(code: i64) -> str {
+    if code == 0 { "session" } else if code == 9 { "PADI" } else if code == 7 { "PADO" } else if code == 25 {
+        "PADR"
+    } else if code == 101 { "PADS" } else if code == 167 { "PADT" } else { "unknown" }
+}

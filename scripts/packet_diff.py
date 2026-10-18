@@ -39,6 +39,23 @@ from scapy.layers.ipsec import SecurityAssociation, ESP  # noqa: E402
 from scapy.layers.inet import IP, UDP  # noqa: E402
 from scapy.layers.netbios import NBNSHeader, NBNSQueryRequest, NBNSQueryResponse  # noqa: E402
 from scapy.layers.pflog import PFLog  # noqa: E402
+from scapy.contrib.igmp import IGMP  # noqa: E402
+from scapy.contrib.mpls import MPLS  # noqa: E402
+from scapy.contrib.lldp import (LLDPDUChassisID, LLDPDUPortID, LLDPDUTimeToLive,  # noqa: E402
+                                LLDPDUSystemName, LLDPDUEndOfLLDPDU)
+from scapy.layers.l2 import STP  # noqa: E402
+from scapy.config import conf  # noqa: E402
+# Out-of-order LLDPDUs are built on purpose, to check they are reported.
+conf.contribs["LLDP"].strict_mode_disable()
+from scapy.contrib.cdp import CDPv2_HDR, CDPMsgDeviceID, CDPMsgPortID, CDPMsgPlatform  # noqa: E402
+from scapy.layers.rip import RIP, RIPEntry  # noqa: E402
+from scapy.layers.vrrp import VRRP, VRRPv3  # noqa: E402
+from scapy.layers.hsrp import HSRP  # noqa: E402
+from scapy.contrib.bfd import BFD  # noqa: E402
+from scapy.contrib.nsh import NSH  # noqa: E402
+from scapy.contrib.erspan import ERSPAN_II, ERSPAN_III  # noqa: E402
+from scapy.layers.l2tp import L2TP  # noqa: E402
+from scapy.layers.ppp import PPPoE, PPPoED, PPP  # noqa: E402
 import struct  # noqa: E402
 import zlib  # noqa: E402
 
@@ -52,10 +69,13 @@ go_built = subprocess.run(["go", "build", "-o", oracle, "."], cwd=os.path.join(R
                           capture_output=True, text=True)
 if go_built.returncode != 0:
     print(go_built.stderr[-1500:]); sys.exit(1)
-built = subprocess.run([GRASM, "build", "packages/packettest/src/main.gr", "--native", "-o",
-                        harness], cwd=ROOT, capture_output=True, text=True)
-if built.returncode != 0:
-    print(built.stderr[-1500:]); sys.exit(1)
+harness2 = os.path.join(work, "packettest2")
+for src, out in [("packages/packettest/src/main.gr", harness), ("packages/packettest2/src/main.gr", harness2)]:
+    built = subprocess.run([GRASM, "build", src, "--native", "-o", out], cwd=ROOT, capture_output=True, text=True)
+    if built.returncode != 0:
+        print(built.stderr[-1500:]); sys.exit(1)
+# The protocols the second harness answers for.
+SECOND = ("igmp", "mpls", "lldp", "stp", "cdp", "rip", "vrrp", "bfd", "hsrp", "nsh", "erspan", "l2tp", "pppoe")
 
 
 def rb(n):
@@ -543,15 +563,261 @@ for _ in range(300):
     add("pflog", raw, text)
     add("pflog.rt", raw, raw.hex())
 
-argv = []
-for op, a, b, _ in cases:
-    argv += [op, "x" + a.hex(), "x" + b.hex()]
-got = []
-for start in range(0, len(argv), 3 * 1000):
-    ran = subprocess.run([harness] + argv[start:start + 3000], capture_output=True, text=True)
-    if ran.returncode != 0:
-        print(ran.stderr[-2000:]); sys.exit(1)
-    got += ran.stdout.split("\n")[:-1]
+
+# --- B15: routing, links and LANs ---------------------------------------
+def tlvs16(raw, start):
+    """LLDP's 7-bit type, 9-bit length TLVs, up to the end TLV."""
+    out, at = [], start
+    while at < len(raw):
+        head = struct.unpack(">H", raw[at:at + 2])[0]
+        t, n = head >> 9, head & 511
+        out.append(f"{t}:{raw[at + 2:at + 2 + n].hex()}")
+        at += 2 + n
+        if t == 0:
+            break
+    return out
+
+
+for _ in range(250):
+    raw = bytes(IGMP(type=rng.choice([0x11, 0x16, 0x17, 0x12]), mrcode=rng.randrange(256), gaddr=ip4()) /
+                Raw(rb(rng.choice([0, 0, 4]))))
+    good = raw
+    if rng.random() < 0.2:
+        raw = raw[:2] + bytes([raw[2] ^ 1]) + raw[3:]
+    p = IGMP(raw)
+    add("igmp", raw, f"type={p.type};mrcode={p.mrcode};chksum={p.chksum};gaddr={socket.inet_aton(p.gaddr).hex()};"
+                     f"rest={raw[8:].hex()};ok={1 if checksum(raw) == 0 else 0}")
+    add("igmp.rt", raw, good.hex())
+
+for _ in range(250):
+    n = rng.randrange(1, 5)
+    pkt = None
+    for k in range(n):
+        e = MPLS(label=rng.randrange(1 << 20), cos=rng.randrange(8), s=1 if k == n - 1 else 0, ttl=rng.randrange(256))
+        pkt = e if pkt is None else pkt / e
+    raw = bytes(pkt / Raw(rb(rng.randrange(0, 20))))
+    stack = []
+    for k in range(n):
+        v = struct.unpack(">I", raw[4 * k:4 * k + 4])[0]
+        stack.append(f"{v >> 12}:{(v >> 9) & 7}:{(v >> 8) & 1}:{v & 255}")
+    add("mpls", raw, f"stack={'|'.join(stack)};payload_at={4 * n}")
+    add("mpls.rt", raw, raw.hex())
+
+for _ in range(250):
+    parts = [LLDPDUChassisID(subtype=4, id=mac()), LLDPDUPortID(subtype=5, id=rb(rng.randrange(1, 8)).hex()),
+             LLDPDUTimeToLive(ttl=rng.randrange(65536))]
+    if rng.random() < 0.5:
+        parts.append(LLDPDUSystemName(system_name=("sw" + str(rng.randrange(100))).encode()))
+    if rng.random() < 0.15:
+        parts[0], parts[1] = parts[1], parts[0]
+    parts.append(LLDPDUEndOfLLDPDU())
+    pkt = Ether(dst="01:80:c2:00:00:0e", src=mac(), type=0x88CC)
+    for q in parts:
+        pkt = pkt / q
+    raw = bytes(pkt)[14:]
+    tl = tlvs16(raw, 0)
+    kinds = [int(t.split(":")[0]) for t in tl]
+    ok = 1 if kinds[:3] == [1, 2, 3] else 0
+    ttl = next((int(t.split(":")[1][:4], 16) for t in tl if t.startswith("3:")), -1)
+    add("lldp", raw, f"tlvs={'|'.join(tl)};ok={ok};ttl={ttl}")
+    # Ethernet pads a short frame after the end TLV; that is not LLDPDU.
+    end = sum(2 + len(bytes.fromhex(t.split(":")[1])) for t in tl)
+    add("lldp.rt", raw, raw[:end].hex())
+
+for _ in range(250):
+    tcn = rng.random() < 0.2
+    pkt = STP(version=rng.choice([0, 2]), bpdutype=0x80 if tcn else rng.choice([0, 2]), bpduflags=rng.randrange(256),
+              rootid=rng.randrange(65536), rootmac=mac(), pathcost=rng.randrange(1 << 32), bridgeid=rng.randrange(65536),
+              bridgemac=mac(), portid=rng.randrange(65536), age=rng.randrange(256), maxage=rng.randrange(256),
+              hellotime=rng.randrange(256), fwddelay=rng.randrange(256))
+    raw = bytes(pkt / Raw(rb(rng.choice([0, 0, 1]))))
+    if tcn:
+        text = (f"proto={struct.unpack('>H', raw[:2])[0]};version={raw[2]};bpdutype=128;flags=0;rootid=0;rootmac=;"
+                f"pathcost=0;bridgeid=0;bridgemac=;portid=0;age=0;maxage=0;hello=0;fwd=0;rest={raw[4:].hex()}")
+    else:
+        q = STP(raw)
+        text = (f"proto={q.proto};version={q.version};bpdutype={q.bpdutype};flags={int(q.bpduflags)};rootid={q.rootid};"
+                f"rootmac={q.rootmac.replace(':', '')};pathcost={q.pathcost};bridgeid={q.bridgeid};"
+                f"bridgemac={q.bridgemac.replace(':', '')};portid={q.portid};"
+                # The timers on the wire are 1/256ths of a second.
+                f"age={struct.unpack('>H', raw[27:29])[0]};maxage={struct.unpack('>H', raw[29:31])[0]};"
+                f"hello={struct.unpack('>H', raw[31:33])[0]};fwd={struct.unpack('>H', raw[33:35])[0]};"
+                f"rest={raw[35:].hex()}")
+    add("stp", raw, text)
+    add("stp.rt", raw, raw.hex())
+
+for _ in range(250):
+    msgs = [CDPMsgDeviceID(val=("dev" + str(rng.randrange(1000))).encode())]
+    if rng.random() < 0.7:
+        msgs.append(CDPMsgPortID(iface=("Gi0/" + str(rng.randrange(48))).encode()))
+    if rng.random() < 0.5:
+        msgs.append(CDPMsgPlatform(val=rb(rng.randrange(1, 6)).hex()[: rng.randrange(1, 9)].encode()))
+    raw = bytes(CDPv2_HDR(vers=2, ttl=rng.randrange(256), msg=msgs))
+    good = raw
+    corrupt = rng.random() < 0.2
+    if corrupt:
+        raw = raw[:2] + bytes([raw[2] ^ 4]) + raw[3:]
+    tl, at = [], 4
+    while at < len(raw):
+        t, n = struct.unpack(">HH", raw[at:at + 4])
+        tl.append(f"{t}:{raw[at + 4:at + n].hex()}")
+        at += n
+    add("cdp", raw, f"vers={raw[0]};ttl={raw[1]};cksum={struct.unpack('>H', raw[2:4])[0]};ok={0 if corrupt else 1};"
+                    f"tlvs={'|'.join(tl)}")
+    add("cdp.rt", raw, good.hex())
+
+for _ in range(250):
+    pkt = RIP(cmd=rng.choice([1, 2]), version=rng.choice([1, 2]))
+    entries = []
+    for _ in range(rng.randrange(0, 4)):
+        e = RIPEntry(AF=2, RouteTag=rng.randrange(65536), addr=ip4(), mask=ip4(), nextHop=ip4(), metric=rng.randrange(1, 17))
+        pkt = pkt / e
+    raw = bytes(pkt)
+    ents = []
+    at = 4
+    while at + 20 <= len(raw):
+        af, tag = struct.unpack(">HH", raw[at:at + 4])
+        metric = struct.unpack(">I", raw[at + 16:at + 20])[0]
+        ents.append(f"{af}:{tag}:{raw[at + 4:at + 8].hex()}:{raw[at + 8:at + 12].hex()}:{raw[at + 12:at + 16].hex()}:{metric}")
+        at += 20
+    add("rip", raw, f"cmd={raw[0]};version={raw[1]};entries={'|'.join(ents)}")
+    add("rip.rt", raw, raw.hex())
+
+for _ in range(450):
+    kind = rng.choice(["v2", "v3", "v3six"])
+    if kind == "v2":
+        addrs = [ip4() for _ in range(rng.randrange(1, 4))]
+        auth = rb(8)
+        pkt = VRRP(vrid=rng.randrange(256), priority=rng.randrange(256), addrlist=addrs, authtype=rng.randrange(3),
+                   adv=rng.randrange(256), auth1=int.from_bytes(auth[:4], "big"), auth2=int.from_bytes(auth[4:], "big"))
+        raw = bytes(pkt)
+        op, n, srcdst = "vrrp4", 4, rb(8)
+        alist = [socket.inet_aton(x).hex() for x in addrs]
+        text = (f"version=2;type=1;vrid={raw[1]};priority={raw[2]};authtype={raw[4]};adv={raw[5]};"
+                f"chksum={struct.unpack('>H', raw[6:8])[0]};addrs={','.join(alist)};auth={raw[8 + 4 * len(addrs):].hex()}")
+    else:
+        six = kind == "v3six"
+        if six:
+            src, dst = ip6(), ip6()
+            addrs = [ip6() for _ in range(rng.randrange(1, 3))]
+            outer = IPv6(src=src, dst=dst)
+            fam, n = socket.AF_INET6, 16
+        else:
+            src, dst = ip4(), ip4()
+            addrs = [ip4() for _ in range(rng.randrange(1, 4))]
+            outer = IP(src=src, dst=dst)
+            fam, n = socket.AF_INET, 4
+        full = outer / VRRPv3(vrid=rng.randrange(256), priority=rng.randrange(256), adv=rng.randrange(4096), addrlist=addrs)
+        raw = bytes(full[VRRPv3])
+        op = "vrrp6" if six else "vrrp4"
+        srcdst = socket.inet_pton(fam, src) + socket.inet_pton(fam, dst)
+        alist = [socket.inet_pton(fam, x).hex() for x in addrs]
+        adv = struct.unpack(">H", raw[4:6])[0] & 4095
+        text = (f"version=3;type=1;vrid={raw[1]};priority={raw[2]};authtype=0;adv={adv};"
+                f"chksum={struct.unpack('>H', raw[6:8])[0]};addrs={','.join(alist)};auth=")
+    add(op, raw, text, srcdst)
+    add(op + ".rt", raw, raw.hex(), srcdst)
+
+for _ in range(250):
+    raw = bytes(HSRP(opcode=rng.randrange(3), state=rng.choice([0, 1, 2, 4, 8, 16]), hellotime=rng.randrange(256),
+                     holdtime=rng.randrange(256), priority=rng.randrange(256), group=rng.randrange(256),
+                     auth=rb(8), virtualIP=ip4()))
+    add("hsrp", raw, f"version={raw[0]};opcode={raw[1]};state={raw[2]};hello={raw[3]};hold={raw[4]};priority={raw[5]};"
+                     f"group={raw[6]};auth={raw[8:16].hex()};vip={raw[16:20].hex()}")
+    add("hsrp.rt", raw, raw.hex())
+
+for _ in range(250):
+    raw = bytes(BFD(version=1, diag=rng.randrange(32), sta=rng.randrange(4), flags=rng.randrange(64) & ~4,
+                    detect_mult=rng.randrange(256), my_discriminator=rng.randrange(1 << 32),
+                    your_discriminator=rng.randrange(1 << 32), min_tx_interval=rng.randrange(1 << 32),
+                    min_rx_interval=rng.randrange(1 << 32), echo_rx_interval=rng.randrange(1 << 32)))
+    q = BFD(raw)
+    add("bfd", raw, f"version={q.version};diag={q.diag};sta={q.sta};flags={int(q.flags)};detect_mult={q.detect_mult};"
+                    f"len={q.len};my={q.my_discriminator};your={q.your_discriminator};tx={q.min_tx_interval};"
+                    f"rx={q.min_rx_interval};echo={q.echo_rx_interval};auth=")
+    add("bfd.rt", raw, raw.hex())
+
+for _ in range(250):
+    ctx = rb(16)
+    raw = bytes(NSH(mdtype=1, ttl=rng.randrange(64), nextproto=rng.choice([1, 2, 3]), spi=rng.randrange(1 << 24),
+                    si=rng.randrange(256), oam=rng.randrange(2), context_header=ctx) / Raw(rb(rng.randrange(0, 20))))
+    q = NSH(raw)
+    add("nsh", raw, f"ver={q.ver};oam={q.oam};ttl={q.ttl};mdtype={q.mdtype};nextproto={q.nextproto};spi={q.spi};"
+                    f"si={q.si};context={raw[8:24].hex()};payload={raw[24:].hex()}")
+    add("nsh.rt", raw, raw.hex())
+
+for _ in range(250):
+    payload = rb(rng.randrange(0, 20))
+    if rng.random() < 0.5:
+        raw = bytes(ERSPAN_II(vlan=rng.randrange(4096), cos=rng.randrange(8), en=rng.randrange(4), t=rng.randrange(2),
+                              session_id=rng.randrange(1024), index=rng.randrange(1 << 20)) / Raw(payload))
+        q = ERSPAN_II(raw)
+        text = (f"ver=1;vlan={q.vlan};cos={q.cos};en={q.en};t={q.t};session={q.session_id};index={q.index};"
+                f"ts=0;sgt=0;p=0;ft=0;hw=0;d=0;gra=0;o=0;platform=;payload={raw[8:].hex()}")
+    else:
+        raw = bytes(ERSPAN_III(vlan=rng.randrange(4096), cos=rng.randrange(8), bso=rng.randrange(4), t=rng.randrange(2),
+                               session_id=rng.randrange(1024), timestamp=rng.randrange(1 << 32),
+                               sgt_other=rng.randrange(65536), p=rng.randrange(2), ft=rng.randrange(32),
+                               hw=rng.randrange(64), d=rng.randrange(2), gra=rng.randrange(4), o=0) / Raw(payload))
+        q = ERSPAN_III(raw)
+        text = (f"ver=2;vlan={q.vlan};cos={q.cos};en={q.bso};t={q.t};session={q.session_id};index=0;"
+                f"ts={q.timestamp};sgt={q.sgt_other};p={q.p};ft={q.ft};hw={q.hw};d={q.d};gra={q.gra};o=0;platform=;"
+                f"payload={raw[12:].hex()}")
+    add("erspan", raw, text)
+    add("erspan.rt", raw, raw.hex())
+
+for _ in range(250):
+    choice = rng.choice(["data", "len", "seq", "lenseq", "offset", "control"])
+    flags = {"data": 0, "len": 0x400, "seq": 0x80, "lenseq": 0x480, "offset": 0x20, "control": 0xC80}[choice]
+    kw = dict(hdr=flags, tunnel_id=rng.randrange(65536), session_id=rng.randrange(65536))
+    if flags & 0x80:
+        kw.update(ns=rng.randrange(65536), nr=rng.randrange(65536))
+    if flags & 0x20:
+        kw.update(offset=2)
+    payload = rb(rng.randrange(0, 20))
+    raw = bytes(L2TP(**kw) / Raw(payload))
+    length = struct.unpack(">H", raw[2:4])[0] if flags & 0x400 else 0
+    add("l2tp", raw, f"flags={flags};version=2;len={length};tunnel={kw['tunnel_id']};session={kw['session_id']};"
+                     f"ns={kw.get('ns', 0)};nr={kw.get('nr', 0)};offset={kw.get('offset', 0)};payload={payload.hex()}")
+    add("l2tp.rt", raw, raw.hex())
+
+for _ in range(250):
+    if rng.random() < 0.5:
+        code = rng.choice([0x09, 0x07, 0x19, 0x65, 0xA7])
+        tags = b""
+        tl = []
+        for _ in range(rng.randrange(0, 4)):
+            t = rng.choice([0x0101, 0x0102, 0x0103, 0x0104])
+            v = rb(rng.randrange(0, 8))
+            tags += struct.pack(">HH", t, len(v)) + v
+            tl.append(f"{t}:{v.hex()}")
+        raw = bytes(PPPoED(code=code, sessionid=rng.randrange(65536)) / Raw(tags))
+    else:
+        code = 0
+        tl = []
+        raw = bytes(PPPoE(sessionid=rng.randrange(65536)) / PPP(proto=0x0021) / Raw(rb(rng.randrange(0, 20))))
+    n = struct.unpack(">H", raw[4:6])[0]
+    add("pppoe", raw, f"version=1;type=1;code={code};session={struct.unpack('>H', raw[2:4])[0]};len={n};"
+                      f"payload={raw[6:6 + n].hex()};tags={'|'.join(tl)}")
+    add("pppoe.rt", raw, raw.hex())
+
+def run(which, picked):
+    argv = []
+    for op, a, b, _ in picked:
+        argv += [op, "x" + a.hex(), "x" + b.hex()]
+    lines = []
+    for start in range(0, len(argv), 3 * 1000):
+        ran = subprocess.run([which] + argv[start:start + 3000], capture_output=True, text=True)
+        if ran.returncode != 0:
+            print(ran.stderr[-2000:]); sys.exit(1)
+        lines += ran.stdout.split("\n")[:-1]
+    return lines
+
+
+second = [c[0].startswith(SECOND) for c in cases]
+got1 = iter(run(harness, [c for c, s2 in zip(cases, second) if not s2]))
+got2 = iter(run(harness2, [c for c, s2 in zip(cases, second) if s2]))
+got = [next(got2, "<missing>") if s2 else next(got1, "<missing>") for s2 in second]
 
 families = {}
 agree = differ = 0
@@ -574,7 +840,7 @@ bad = [f"{k}:{d}" for k, (a, d) in sorted(families.items()) if d]
 if bad:
     print("disagreeing:", " ".join(bad))
 thin = [k for k, (a, d) in families.items() if a + d < 100]
-if thin or len(families) < 32:
+if thin or len(families) < 58:
     print(f"too few cases to mean anything: {thin}")
     sys.exit(1)
 print(f"cases: {len(cases)}   agreeing: {agree}   differing: {differ}")

@@ -1,0 +1,66 @@
+// BFD control packets (RFC 5880): the sub-second liveness check routers
+// run beside BGP, OSPF and static routes, so a dead link is noticed in
+// tens of milliseconds rather than in a routing protocol's seconds.
+//
+// Twenty-four bytes: version and diagnostic, state and the six flags
+// (Poll, Final, Control plane independent, Authentication present,
+// Demand, Multipoint), the detection multiplier, the length, both
+// discriminators and three intervals in microseconds -- then, with the A
+// flag set, the authentication section, kept as bytes.
+
+type BfdPacket = {
+    version: i64,
+    diag: i64,
+    state: i64,
+    flags: i64,
+    detect_mult: i64,
+    length: i64,
+    my_discriminator: i64,
+    your_discriminator: i64,
+    min_tx_interval: i64,
+    min_rx_interval: i64,
+    echo_rx_interval: i64,
+    auth: bytes,
+}
+
+type BfdError =
+    | TooShort(found: i64)
+    | BadLength(declared: i64)
+
+fn u32(b: bytes, at: i64) -> i64 {
+    b.at(at).shl(24).bit_or(b.at(at + 1).shl(16)).bit_or(b.at(at + 2).shl(8)).bit_or(b.at(at + 3))
+}
+
+fn be32(v: i64) -> bytes {
+    bytes_of([v.ushr(24).bit_and(255), v.ushr(16).bit_and(255), v.ushr(8).bit_and(255), v.bit_and(255)])
+}
+
+pub fn decode(data: bytes) -> BfdPacket ! BfdError {
+    if data.len() < 24 {
+        fail(TooShort(data.len()))
+    }
+    let n = data.at(3)
+    if n < 24 or n > data.len() {
+        fail(BadLength(n))
+    }
+    BfdPacket{ version: data.at(0).ushr(5), diag: data.at(0).bit_and(31), state: data.at(1).ushr(6),
+        flags: data.at(1).bit_and(63), detect_mult: data.at(2), length: n,
+        my_discriminator: u32(data, 4), your_discriminator: u32(data, 8), min_tx_interval: u32(data, 12),
+        min_rx_interval: u32(data, 16), echo_rx_interval: u32(data, 20), auth: data.slice(24, n) }
+}
+
+/// The packet, its length computed from the authentication section.
+pub fn encode(p: BfdPacket) -> bytes {
+    bytes_of([p.version.bit_and(7).shl(5).bit_or(p.diag.bit_and(31)),
+        p.state.bit_and(3).shl(6).bit_or(p.flags.bit_and(63)), p.detect_mult.bit_and(255), 24 + p.auth.len()])
+        .concat(be32(p.my_discriminator)).concat(be32(p.your_discriminator)).concat(be32(p.min_tx_interval))
+        .concat(be32(p.min_rx_interval)).concat(be32(p.echo_rx_interval)).concat(p.auth)
+}
+
+pub fn state_name(s: i64) -> str {
+    ["AdminDown", "Down", "Init", "Up"][s.bit_and(3)]
+}
+
+pub fn poll(p: BfdPacket) -> bool { p.flags.bit_and(32) != 0 }
+pub fn final_bit(p: BfdPacket) -> bool { p.flags.bit_and(16) != 0 }
+pub fn auth_present(p: BfdPacket) -> bool { p.flags.bit_and(4) != 0 }

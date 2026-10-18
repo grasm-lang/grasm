@@ -1,0 +1,100 @@
+// VRRP versions 2 and 3 (RFC 3768, RFC 5798): how two routers share one
+// gateway address, so a LAN's default route survives one of them dying.
+//
+// Both versions start with version and type, the virtual router ID, the
+// priority (255 for the address owner, 0 for "I am leaving") and the count
+// of addresses. Version 2 then has an authentication type, an advertisement
+// interval in seconds, the checksum, IPv4 addresses and eight bytes of
+// authentication data, and its checksum covers the message alone. Version 3
+// has a 12-bit interval in centiseconds, no authentication, IPv4 or IPv6
+// addresses, and a checksum over an IP pseudo-header -- so `encode` takes
+// the addresses of the packet that carries it.
+import packets
+
+type VrrpMessage = {
+    version: i64,
+    kind: i64,
+    vrid: i64,
+    priority: i64,
+    authtype: i64,
+    adv: i64,
+    checksum: i64,
+    addresses: [bytes],
+    auth: bytes,
+}
+
+type VrrpError =
+    | TooShort(found: i64)
+
+fn u16(b: bytes, at: i64) -> i64 {
+    b.at(at) * 256 + b.at(at + 1)
+}
+
+/// `addr_len` is 4 for IPv4 and 16 for IPv6 (version 3 only).
+pub fn decode(data: bytes, addr_len: i64) -> VrrpMessage ! VrrpError {
+    if data.len() < 8 {
+        fail(TooShort(data.len()))
+    }
+    let version = data.at(0).ushr(4)
+    let count = data.at(3)
+    let auth_len = if version == 2 { 8 } else { 0 }
+    if data.len() < 8 + count * addr_len + auth_len {
+        fail(TooShort(data.len()))
+    }
+    var addrs: [bytes] = []
+    for k in 0..count {
+        addrs.push(data.slice(8 + k * addr_len, 8 + (k + 1) * addr_len))
+    }
+    let end = 8 + count * addr_len
+    VrrpMessage{ version: version, kind: data.at(0).bit_and(15), vrid: data.at(1), priority: data.at(2),
+        authtype: if version == 2 { data.at(4) } else { 0 },
+        adv: if version == 2 { data.at(5) } else { u16(data, 4).bit_and(4095) },
+        checksum: u16(data, 6), addresses: addrs, auth: data.slice(end, end + auth_len) }
+}
+
+fn body(m: VrrpMessage) -> bytes {
+    var out = bytes_of([m.version.bit_and(15).shl(4).bit_or(m.kind.bit_and(15)), m.vrid.bit_and(255),
+        m.priority.bit_and(255), m.addresses.len()])
+    if m.version == 2 {
+        out = out.concat(bytes_of([m.authtype.bit_and(255), m.adv.bit_and(255), 0, 0]))
+    } else {
+        out = out.concat(bytes_of([m.adv.ushr(8).bit_and(15), m.adv.bit_and(255), 0, 0]))
+    }
+    for a in m.addresses {
+        out = out.concat(a)
+    }
+    if m.version == 2 {
+        let a = if m.auth.len() >= 8 { m.auth.slice(0, 8) } else { m.auth.concat(bytes_filled(8 - m.auth.len(), 0)) }
+        out = out.concat(a)
+    }
+    out
+}
+
+/// The message with its checksum. For version 3, `src` and `dst` are the
+/// carrying packet's addresses (4 or 16 bytes); version 2 ignores them.
+pub fn encode(m: VrrpMessage, src: bytes, dst: bytes) -> bytes {
+    var out = body(m)
+    var sum = 0
+    if m.version == 2 {
+        sum = packets.checksum(out)
+    } else if src.len() == 16 {
+        let n = out.len()
+        sum = packets.checksum(src.concat(dst).concat(bytes_of([0, 0, n.ushr(8).bit_and(255), n.bit_and(255),
+            0, 0, 0, 112])).concat(out))
+    } else {
+        let n = out.len()
+        sum = packets.checksum(src.concat(dst).concat(bytes_of([0, 112, n.ushr(8).bit_and(255),
+            n.bit_and(255)])).concat(out))
+    }
+    out.set(6, sum.ushr(8))
+    out.set(7, sum.bit_and(255))
+    out
+}
+
+pub fn is_owner(m: VrrpMessage) -> bool {
+    m.priority == 255
+}
+
+pub fn is_leaving(m: VrrpMessage) -> bool {
+    m.priority == 0
+}

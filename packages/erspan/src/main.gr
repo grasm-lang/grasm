@@ -1,0 +1,108 @@
+// ERSPAN types II and III: the header on mirrored traffic that a Cisco,
+// Arista or cloud traffic-mirroring session sends over GRE to a collector.
+//
+// Type II is eight bytes -- version 1, the original VLAN, class of service,
+// encapsulation type, truncated bit, a 10-bit session ID and a 20-bit port
+// index. Type III is twelve -- version 2, the same first word with a
+// bad/short/oversized field in place of the encapsulation type, a 32-bit
+// timestamp, the security group tag, and flags for the frame type, the
+// hardware ID, direction, timestamp granularity and whether an eight-byte
+// platform subheader follows, which is kept as bytes.
+
+type ErspanHeader = {
+    ver: i64,
+    vlan: i64,
+    cos: i64,
+    en: i64,
+    t: i64,
+    session_id: i64,
+    reserved: i64,
+    index: i64,
+    timestamp: i64,
+    sgt: i64,
+    p: i64,
+    ft: i64,
+    hw: i64,
+    d: i64,
+    gra: i64,
+    o: i64,
+    platform: bytes,
+    payload: bytes,
+}
+
+type ErspanError =
+    | TooShort(found: i64)
+    | UnknownVersion(found: i64)
+
+fn u16(b: bytes, at: i64) -> i64 {
+    b.at(at) * 256 + b.at(at + 1)
+}
+
+fn u32(b: bytes, at: i64) -> i64 {
+    u16(b, at) * 65536 + u16(b, at + 2)
+}
+
+fn be32(v: i64) -> bytes {
+    bytes_of([v.ushr(24).bit_and(255), v.ushr(16).bit_and(255), v.ushr(8).bit_and(255), v.bit_and(255)])
+}
+
+pub fn decode(data: bytes) -> ErspanHeader ! ErspanError {
+    if data.len() < 8 {
+        fail(TooShort(data.len()))
+    }
+    let w0 = u32(data, 0)
+    var h = ErspanHeader{ ver: w0.ushr(28), vlan: w0.ushr(16).bit_and(4095), cos: w0.ushr(13).bit_and(7),
+        en: w0.ushr(11).bit_and(3), t: w0.ushr(10).bit_and(1), session_id: w0.bit_and(1023), reserved: 0,
+        index: 0, timestamp: 0, sgt: 0, p: 0, ft: 0, hw: 0, d: 0, gra: 0, o: 0, platform: bytes_of([]),
+        payload: bytes_of([]) }
+    if h.ver == 1 {
+        let w1 = u32(data, 4)
+        h.reserved = w1.ushr(20)
+        h.index = w1.bit_and(1048575)
+        h.payload = data.slice(8, data.len())
+        return h
+    }
+    if h.ver != 2 {
+        fail(UnknownVersion(h.ver))
+    }
+    if data.len() < 12 {
+        fail(TooShort(data.len()))
+    }
+    h.timestamp = u32(data, 4)
+    h.sgt = u16(data, 8)
+    let f = u16(data, 10)
+    h.p = f.ushr(15)
+    h.ft = f.ushr(10).bit_and(31)
+    h.hw = f.ushr(4).bit_and(63)
+    h.d = f.ushr(3).bit_and(1)
+    h.gra = f.ushr(1).bit_and(3)
+    h.o = f.bit_and(1)
+    var at = 12
+    if h.o == 1 {
+        if data.len() < 20 {
+            fail(TooShort(data.len()))
+        }
+        h.platform = data.slice(12, 20)
+        at = 20
+    }
+    h.payload = data.slice(at, data.len())
+    h
+}
+
+pub fn encode(h: ErspanHeader) -> bytes {
+    let w0 = h.ver.bit_and(15).shl(28).bit_or(h.vlan.bit_and(4095).shl(16)).bit_or(h.cos.bit_and(7).shl(13))
+        .bit_or(h.en.bit_and(3).shl(11)).bit_or(h.t.bit_and(1).shl(10)).bit_or(h.session_id.bit_and(1023))
+    if h.ver == 1 {
+        return be32(w0).concat(be32(h.reserved.bit_and(4095).shl(20).bit_or(h.index.bit_and(1048575))))
+            .concat(h.payload)
+    }
+    let f = h.p.bit_and(1).shl(15).bit_or(h.ft.bit_and(31).shl(10)).bit_or(h.hw.bit_and(63).shl(4))
+        .bit_or(h.d.bit_and(1).shl(3)).bit_or(h.gra.bit_and(3).shl(1)).bit_or(h.o.bit_and(1))
+    var out = be32(w0).concat(be32(h.timestamp)).concat(bytes_of([h.sgt.ushr(8).bit_and(255), h.sgt.bit_and(255),
+        f.ushr(8), f.bit_and(255)]))
+    if h.o == 1 {
+        out = out.concat(if h.platform.len() >= 8 { h.platform.slice(0, 8) } else {
+            h.platform.concat(bytes_filled(8 - h.platform.len(), 0)) })
+    }
+    out.concat(h.payload)
+}

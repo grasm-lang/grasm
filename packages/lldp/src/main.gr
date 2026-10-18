@@ -1,0 +1,83 @@
+// LLDP (IEEE 802.1AB): what every managed switch says about itself on
+// each port -- its chassis and port IDs, name, capabilities and management
+// address -- and what network maps and `lldpctl` are built from.
+//
+// An LLDPDU is a list of TLVs, each a 7-bit type and 9-bit length followed
+// by the value, ending with a TLV of type 0 and length 0. The first three
+// must be the chassis ID, port ID and time-to-live, in that order, which
+// `check` verifies. Values are kept as bytes; the common ones have readers.
+
+type LldpTlv = {
+    kind: i64,
+    value: bytes,
+}
+
+type LldpError =
+    | TooShort(at: i64)
+    | Missing(what: str)
+
+pub fn chassis_id() -> i64 { 1 }
+pub fn port_id() -> i64 { 2 }
+pub fn ttl() -> i64 { 3 }
+pub fn system_name() -> i64 { 5 }
+pub fn end_of_lldpdu() -> i64 { 0 }
+
+/// Every TLV up to and including the end TLV; bytes after it are padding
+/// and are not read.
+pub fn decode(data: bytes) -> [LldpTlv] ! LldpError {
+    var out: [LldpTlv] = []
+    var at = 0
+    while at < data.len() {
+        if at + 2 > data.len() {
+            fail(TooShort(at))
+        }
+        let head = data.at(at) * 256 + data.at(at + 1)
+        let kind = head.ushr(9)
+        let n = head.bit_and(511)
+        if at + 2 + n > data.len() {
+            fail(TooShort(at))
+        }
+        out.push(LldpTlv{ kind: kind, value: data.slice(at + 2, at + 2 + n) })
+        at = at + 2 + n
+        if kind == 0 {
+            break
+        }
+    }
+    out
+}
+
+pub fn encode(tlvs: [LldpTlv]) -> bytes {
+    var out = bytes_of([])
+    for t in tlvs {
+        let head = t.kind.bit_and(127).shl(9).bit_or(t.value.len().bit_and(511))
+        out = out.concat(bytes_of([head.ushr(8), head.bit_and(255)])).concat(t.value)
+    }
+    out
+}
+
+/// The three mandatory TLVs, first and in order.
+pub fn check(tlvs: [LldpTlv]) -> () ! LldpError {
+    let need = ["chassis ID", "port ID", "time to live"]
+    for k in 0..3 {
+        if tlvs.len() <= k or tlvs[k].kind != k + 1 {
+            fail(Missing(need[k]))
+        }
+    }
+}
+
+pub fn find(tlvs: [LldpTlv], kind: i64) -> Option[bytes] {
+    for t in tlvs {
+        if t.kind == kind {
+            return Some(t.value)
+        }
+    }
+    None
+}
+
+/// The time-to-live in seconds; -1 when the TLV is missing.
+pub fn ttl_seconds(tlvs: [LldpTlv]) -> i64 {
+    match find(tlvs, 3) {
+        Some(v) -> if v.len() >= 2 { v.at(0) * 256 + v.at(1) } else { -1 }
+        None -> -1
+    }
+}

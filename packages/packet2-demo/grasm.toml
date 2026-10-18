@@ -1,0 +1,24 @@
+[package]
+name = "packet2_demo"
+version = "1.0.0"
+capabilities = ["io"]
+
+[dependencies.cdp]
+path = "../cdp"
+version = "^1.0.0"
+
+[dependencies.mpls]
+path = "../mpls"
+version = "^1.0.0"
+
+[dependencies.pppoe]
+path = "../pppoe"
+version = "^1.0.0"
+
+[dependencies.bfd]
+path = "../bfd"
+version = "^1.0.0"
+
+[dependencies.lldp]
+path = "../lldp"
+version = "^1.0.0"

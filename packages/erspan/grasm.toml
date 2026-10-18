@@ -1,0 +1,5 @@
+[package]
+name = "erspan"
+version = "1.0.0"
+
+capabilities = []

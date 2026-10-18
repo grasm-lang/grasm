@@ -1,0 +1,55 @@
+// IGMP (RFC 2236, with RFC 3376's version 3): how hosts tell routers which
+// multicast groups they want -- IPTV, market data feeds, mDNS on routed
+// networks.
+//
+// Version 1 and 2 messages are eight bytes: type, maximum response time
+// (in tenths of a second), checksum, group address. Version 3 queries add a
+// source list, and version 3 reports carry group records. The checksum
+// covers the whole message; `encode` computes it, and anything after the
+// first eight bytes is kept as it is.
+import packets
+
+type IgmpMessage = {
+    kind: i64,
+    mrcode: i64,
+    checksum: i64,
+    group: bytes,
+    rest: bytes,
+}
+
+type IgmpError =
+    | TooShort(found: i64)
+
+pub fn membership_query() -> i64 { 17 }
+pub fn v2_report() -> i64 { 22 }
+pub fn leave_group() -> i64 { 23 }
+pub fn v3_report() -> i64 { 34 }
+
+pub fn decode(data: bytes) -> IgmpMessage ! IgmpError {
+    if data.len() < 8 {
+        fail(TooShort(data.len()))
+    }
+    IgmpMessage{ kind: data.at(0), mrcode: data.at(1), checksum: data.at(2) * 256 + data.at(3),
+        group: data.slice(4, 8), rest: data.slice(8, data.len()) }
+}
+
+pub fn encode(m: IgmpMessage) -> bytes {
+    var out = bytes_of([m.kind.bit_and(255), m.mrcode.bit_and(255), 0, 0]).concat(m.group).concat(m.rest)
+    let sum = packets.checksum(out)
+    out.set(2, sum.ushr(8))
+    out.set(3, sum.bit_and(255))
+    out
+}
+
+pub fn checksum_holds(data: bytes) -> bool {
+    data.len() >= 8 and packets.checksum(data) == 0
+}
+
+/// A version 3 code of 128 or more is a floating-point value; below that it
+/// is the time itself. In tenths of a second.
+pub fn max_response(code: i64) -> i64 {
+    if code < 128 {
+        return code
+    }
+    (code.bit_and(15) + 16).shl(code.ushr(4).bit_and(7) + 3)
+}

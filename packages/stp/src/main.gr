@@ -1,0 +1,89 @@
+// Spanning Tree BPDUs (IEEE 802.1D, with 802.1w's Rapid STP): how
+// switches agree which links to block so an Ethernet with loops does not
+// melt down.
+//
+// A configuration BPDU names the root bridge, the cost to reach it, the
+// sending bridge and port, and four timers in 1/256ths of a second. A
+// topology-change notification is the first four bytes alone. Rapid STP
+// sets version 2 and adds one byte (the version 1 length, always 0), which
+// is kept with anything else after the 35 bytes.
+
+type StpBpdu = {
+    proto: i64,
+    version: i64,
+    bpdutype: i64,
+    bpduflags: i64,
+    rootid: i64,
+    rootmac: bytes,
+    pathcost: i64,
+    bridgeid: i64,
+    bridgemac: bytes,
+    portid: i64,
+    age: i64,
+    maxage: i64,
+    hellotime: i64,
+    fwddelay: i64,
+    rest: bytes,
+}
+
+type StpError =
+    | TooShort(found: i64)
+
+fn u16(b: bytes, at: i64) -> i64 {
+    b.at(at) * 256 + b.at(at + 1)
+}
+
+fn be16(v: i64) -> bytes {
+    bytes_of([v.ushr(8).bit_and(255), v.bit_and(255)])
+}
+
+pub fn decode(data: bytes) -> StpBpdu ! StpError {
+    if data.len() < 4 {
+        fail(TooShort(data.len()))
+    }
+    var b = StpBpdu{ proto: u16(data, 0), version: data.at(2), bpdutype: data.at(3), bpduflags: 0,
+        rootid: 0, rootmac: bytes_of([]), pathcost: 0, bridgeid: 0, bridgemac: bytes_of([]),
+        portid: 0, age: 0, maxage: 0, hellotime: 0, fwddelay: 0, rest: data.slice(4, data.len()) }
+    if b.bpdutype == 128 {
+        return b
+    }
+    if data.len() < 35 {
+        fail(TooShort(data.len()))
+    }
+    b.bpduflags = data.at(4)
+    b.rootid = u16(data, 5)
+    b.rootmac = data.slice(7, 13)
+    b.pathcost = u16(data, 13) * 65536 + u16(data, 15)
+    b.bridgeid = u16(data, 17)
+    b.bridgemac = data.slice(19, 25)
+    b.portid = u16(data, 25)
+    b.age = u16(data, 27)
+    b.maxage = u16(data, 29)
+    b.hellotime = u16(data, 31)
+    b.fwddelay = u16(data, 33)
+    b.rest = data.slice(35, data.len())
+    b
+}
+
+pub fn encode(b: StpBpdu) -> bytes {
+    let head = be16(b.proto).concat(bytes_of([b.version.bit_and(255), b.bpdutype.bit_and(255)]))
+    if b.bpdutype == 128 {
+        return head.concat(b.rest)
+    }
+    head.concat(bytes_of([b.bpduflags.bit_and(255)])).concat(be16(b.rootid)).concat(b.rootmac)
+        .concat(be16(b.pathcost.ushr(16))).concat(be16(b.pathcost.bit_and(65535)))
+        .concat(be16(b.bridgeid)).concat(b.bridgemac).concat(be16(b.portid)).concat(be16(b.age))
+        .concat(be16(b.maxage)).concat(be16(b.hellotime)).concat(be16(b.fwddelay)).concat(b.rest)
+}
+
+/// The bridge priority: the top four bits of a bridge ID's first word, in
+/// units of 4096 (802.1t). The rest is the VLAN or instance.
+pub fn priority(id: i64) -> i64 {
+    id.bit_and(61440)
+}
+
+/// A Rapid STP flags byte's port role: 0 unknown, 1 alternate/backup,
+/// 2 root, 3 designated.
+pub fn port_role(flags: i64) -> i64 {
+    flags.ushr(2).bit_and(3)
+}
