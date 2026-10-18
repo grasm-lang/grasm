@@ -1,0 +1,70 @@
+// A sparse set (Briggs and Torczon, 1993): a set of integers below a
+// fixed bound with O(1) insert, remove, membership and -- the point --
+// clear, and iteration in time proportional to the members rather than to
+// the bound.
+//
+// A bitset clears in O(bound / 64) and iterates over every word; this
+// clears by forgetting its length. It is how a register allocator keeps
+// its live set and how an ECS keeps which entities have a component.
+// Two arrays: `dense` lists the members, `sparse[x]` is where x sits in
+// `dense`, and x is a member exactly when the two agree.
+//
+// Removing swaps the last member into the gap, so `members` is in
+// insertion order only until something is removed.
+
+type SparseSet = {
+    dense: [i64],
+    sparse: [i64],
+    count: i64,
+}
+
+/// A set that can hold 0..universe.
+pub fn new_sparse_set(universe: i64) -> SparseSet {
+    var d: [i64] = []
+    var s: [i64] = []
+    for _i in 0..universe {
+        d.push(0)
+        s.push(0)
+    }
+    SparseSet{ dense: d, sparse: s, count: 0 }
+}
+
+pub fn contains(s: SparseSet, x: i64) -> bool {
+    x >= 0 and x < s.sparse.len() and s.sparse[x] < s.count and s.dense[s.sparse[x]] == x
+}
+
+/// Adds `x`; false when already there or outside the universe.
+pub fn insert(inout s: SparseSet, x: i64) -> bool {
+    if x < 0 or x >= s.sparse.len() or contains(s, x) {
+        return false
+    }
+    s.dense[s.count] = x
+    s.sparse[x] = s.count
+    s.count = s.count + 1
+    true
+}
+
+/// Removes `x`; false when it was not there.
+pub fn remove(inout s: SparseSet, x: i64) -> bool {
+    if not contains(s, x) {
+        return false
+    }
+    let at = s.sparse[x]
+    let last = s.dense[s.count - 1]
+    s.dense[at] = last
+    s.sparse[last] = at
+    s.count = s.count - 1
+    true
+}
+
+pub fn clear(inout s: SparseSet) {
+    s.count = 0
+}
+
+pub fn len(s: SparseSet) -> i64 {
+    s.count
+}
+
+pub fn members(s: SparseSet) -> [i64] {
+    s.dense.slice(0, s.count)
+}

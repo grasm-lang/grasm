@@ -1,0 +1,196 @@
+// A wavelet matrix (Claude, Navarro and Ordonez, 2012): a sequence of
+// integers that answers, in O(log of the largest value) and without
+// scanning, what is at position i, how often a value occurs before i,
+// where its k-th occurrence is, the k-th smallest value in a range, and
+// how many values in a range fall between two bounds.
+//
+// It is the engine of FM-indexes (full-text search over compressed text),
+// of range-quantile queries in column stores, and of 2D range counting.
+// One bit vector per bit of the values, from the top bit down: level l
+// holds bit l of the sequence as the level above rearranged it -- values
+// with a 0 there first, in order, then those with a 1 -- and `rankselect`
+// moves a position from one level to the next.
+//
+// Values must not be negative.
+import rankselect
+
+type WaveletMatrix = {
+    levels: [RankBits],
+    zeros: [i64],
+    bits: i64,
+    n: i64,
+}
+
+type WaveletError =
+    | NegativeValue(at: i64)
+
+pub fn new_wavelet(values: [i64]) -> WaveletMatrix ! WaveletError {
+    var top = 0
+    for i in 0..values.len() {
+        if values[i] < 0 {
+            fail(NegativeValue(i))
+        }
+        top = top.max(values[i])
+    }
+    var bits = 1
+    while bits < 63 and top.ushr(bits) > 0 {
+        bits = bits + 1
+    }
+    var seq = values
+    var levels: [RankBits] = []
+    var zeros: [i64] = []
+    var l = bits - 1
+    while l >= 0 {
+        var flags: [bool] = []
+        var low: [i64] = []
+        var high: [i64] = []
+        for v in seq {
+            let one = v.ushr(l).bit_and(1) == 1
+            flags.push(one)
+            if one { high.push(v) } else { low.push(v) }
+        }
+        levels.push(rankselect.new_bits(flags))
+        zeros.push(low.len())
+        seq = low + high
+        l = l - 1
+    }
+    WaveletMatrix{ levels: levels, zeros: zeros, bits: bits, n: values.len() }
+}
+
+pub fn len(w: WaveletMatrix) -> i64 {
+    w.n
+}
+
+/// The bit of `value` that level `k` (counted from the top) holds.
+fn bit_at(w: WaveletMatrix, value: i64, k: i64) -> i64 {
+    value.ushr(w.bits - 1 - k).bit_and(1)
+}
+
+pub fn access(w: WaveletMatrix, i: i64) -> i64 {
+    var at = i
+    var value = 0
+    for k in 0..w.bits {
+        let b = w.levels[k]
+        if rankselect.get(b, at) {
+            value = value.shl(1).bit_or(1)
+            at = w.zeros[k] + rankselect.rank1(b, at)
+        } else {
+            value = value.shl(1)
+            at = rankselect.rank0(b, at)
+        }
+    }
+    value
+}
+
+/// Where the run of `value` starts at the bottom level, and where the
+/// first `i` positions' share of it ends.
+fn descend(w: WaveletMatrix, value: i64, i: i64) -> (i64, i64) {
+    var start = 0
+    var end = i
+    for k in 0..w.bits {
+        let b = w.levels[k]
+        if bit_at(w, value, k) == 1 {
+            start = w.zeros[k] + rankselect.rank1(b, start)
+            end = w.zeros[k] + rankselect.rank1(b, end)
+        } else {
+            start = rankselect.rank0(b, start)
+            end = rankselect.rank0(b, end)
+        }
+    }
+    (start, end)
+}
+
+fn fits(w: WaveletMatrix, value: i64) -> bool {
+    value >= 0 and (w.bits >= 63 or value.ushr(w.bits) == 0)
+}
+
+/// How often `value` occurs in positions 0..i.
+pub fn rank(w: WaveletMatrix, value: i64, i: i64) -> i64 {
+    if not fits(w, value) {
+        return 0
+    }
+    let (start, end) = descend(w, value, i.max(0).min(w.n))
+    end - start
+}
+
+/// The position of the k-th occurrence of `value` (k from 0), or -1.
+pub fn select(w: WaveletMatrix, value: i64, k: i64) -> i64 {
+    if k < 0 or k >= rank(w, value, w.n) {
+        return -1
+    }
+    let (start, _) = descend(w, value, w.n)
+    var at = start + k
+    var lvl = w.bits - 1
+    while lvl >= 0 {
+        let b = w.levels[lvl]
+        if bit_at(w, value, lvl) == 1 {
+            at = rankselect.select1(b, at - w.zeros[lvl])
+        } else {
+            at = rankselect.select0(b, at)
+        }
+        lvl = lvl - 1
+    }
+    at
+}
+
+/// The k-th smallest value (k from 0) in positions lo..hi, or -1 when the
+/// range holds fewer than k + 1.
+pub fn quantile(w: WaveletMatrix, lo: i64, hi: i64, k: i64) -> i64 {
+    var a = lo.max(0)
+    var b = hi.min(w.n)
+    if k < 0 or k >= b - a {
+        return -1
+    }
+    var left = k
+    var value = 0
+    for lvl in 0..w.bits {
+        let bv = w.levels[lvl]
+        let z = rankselect.rank0(bv, b) - rankselect.rank0(bv, a)
+        if left < z {
+            a = rankselect.rank0(bv, a)
+            b = rankselect.rank0(bv, b)
+            value = value.shl(1)
+        } else {
+            left = left - z
+            a = w.zeros[lvl] + rankselect.rank1(bv, a)
+            b = w.zeros[lvl] + rankselect.rank1(bv, b)
+            value = value.shl(1).bit_or(1)
+        }
+    }
+    value
+}
+
+/// How many values in positions lo..hi are less than `bound`.
+fn count_below(w: WaveletMatrix, lo: i64, hi: i64, bound: i64) -> i64 {
+    if bound <= 0 {
+        return 0
+    }
+    if not fits(w, bound) {
+        return hi - lo
+    }
+    var a = lo
+    var b = hi
+    var count = 0
+    for lvl in 0..w.bits {
+        let bv = w.levels[lvl]
+        if bit_at(w, bound, lvl) == 1 {
+            count = count + rankselect.rank0(bv, b) - rankselect.rank0(bv, a)
+            a = w.zeros[lvl] + rankselect.rank1(bv, a)
+            b = w.zeros[lvl] + rankselect.rank1(bv, b)
+        } else {
+            a = rankselect.rank0(bv, a)
+            b = rankselect.rank0(bv, b)
+        }
+    }
+    count
+}
+
+/// How many values in positions lo..hi lie in low..high.
+pub fn range_count(w: WaveletMatrix, lo: i64, hi: i64, low: i64, high: i64) -> i64 {
+    let a = lo.max(0)
+    let b = hi.min(w.n)
+    if a >= b or low >= high {
+        return 0
+    }
+    count_below(w, a, b, high) - count_below(w, a, b, low.max(0))
+}

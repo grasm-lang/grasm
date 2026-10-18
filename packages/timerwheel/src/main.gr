@@ -1,0 +1,206 @@
+// A hierarchical timing wheel (Varghese and Lauck, 1987): many timers,
+// each started, cancelled and expired in O(1) amortised, however far out
+// its deadline.
+//
+// A heap of deadlines costs O(log n) a timer; the kernels of Linux and
+// FreeBSD, Kafka, Netty and every server with a timeout per connection use
+// a wheel instead. Six levels of 64 slots: level l holds timers due within
+// 64^(l+1) ticks, in the slot their deadline's l-th base-64 digit names.
+// When the clock crosses into a new slot of a level, that slot's timers
+// cascade down to finer levels, until at level 0 they are due. Deadlines
+// beyond the six levels (2^36 ticks) wait in an overflow list.
+//
+// Time is in ticks, an integer chosen by the caller. `advance` returns the
+// timers that came due, in order of deadline and, within one deadline, of
+// starting. A deadline at or before now comes due at the next `advance`.
+// Ranges of empty slots are skipped rather than stepped through.
+
+type TimerWheel = {
+    now: i64,
+    slots: [[i64]],
+    /// Timers filed in each level, cancelled ones included until removed.
+    filed: [i64],
+    deadline: [i64],
+    alive: [bool],
+    overflow: [i64],
+    due: [i64],
+    live: i64,
+}
+
+fn levels() -> i64 {
+    6
+}
+
+pub fn new_wheel(start: i64) -> TimerWheel {
+    var slots: [[i64]] = []
+    for _i in 0..64 * levels() {
+        slots.push([])
+    }
+    var filed: [i64] = []
+    for _l in 0..levels() {
+        filed.push(0)
+    }
+    TimerWheel{ now: start, slots: slots, filed: filed, deadline: [], alive: [], overflow: [], due: [], live: 0 }
+}
+
+pub fn now(w: TimerWheel) -> i64 {
+    w.now
+}
+
+pub fn pending(w: TimerWheel) -> i64 {
+    w.live
+}
+
+/// Files a timer by its distance from now. A new timer already due waits
+/// for the next `advance`; one cascading down onto the current tick goes
+/// in the current level-0 slot, which this tick fires next.
+fn file(inout w: TimerWheel, id: i64, cascading: bool) {
+    let d = w.deadline[id]
+    let delta = d - w.now
+    if delta < 0 or (delta == 0 and not cascading) {
+        w.due.push(id)
+        return
+    }
+    var level = 0
+    while level < levels() and delta.ushr(6 * (level + 1)) > 0 {
+        level = level + 1
+    }
+    if level == levels() {
+        w.overflow.push(id)
+        return
+    }
+    w.slots[64 * level + d.ushr(6 * level).bit_and(63)].push(id)
+    w.filed[level] = w.filed[level] + 1
+}
+
+/// Starts a timer due at `deadline` and returns its id.
+pub fn schedule(inout w: TimerWheel, deadline: i64) -> i64 {
+    w.deadline.push(deadline)
+    w.alive.push(true)
+    w.live = w.live + 1
+    let id = w.deadline.len() - 1
+    file(w, id, false)
+    id
+}
+
+/// Stops a pending timer; false when it already fired or was cancelled.
+pub fn cancel(inout w: TimerWheel, id: i64) -> bool {
+    if id < 0 or id >= w.alive.len() or not w.alive[id] {
+        return false
+    }
+    w.alive[id] = false
+    w.live = w.live - 1
+    true
+}
+
+fn cascade(inout w: TimerWheel, level: i64) {
+    let at = 64 * level + w.now.ushr(6 * level).bit_and(63)
+    let moving = w.slots[at]
+    w.slots[at] = []
+    w.filed[level] = w.filed[level] - moving.len()
+    for id in moving {
+        if w.alive[id] {
+            file(w, id, true)
+        }
+    }
+}
+
+fn refile_overflow(inout w: TimerWheel) {
+    let waiting = w.overflow
+    w.overflow = []
+    for id in waiting {
+        if w.alive[id] {
+            file(w, id, true)
+        }
+    }
+}
+
+fn fire(inout w: TimerWheel, ids: [i64], inout out: [i64]) {
+    var live: [i64] = []
+    for id in ids {
+        if w.alive[id] {
+            live.push(id)
+        }
+    }
+    live.sort()
+    for id in live {
+        w.alive[id] = false
+        w.live = w.live - 1
+        out.push(id)
+    }
+}
+
+/// How far the clock can jump from now without passing a slot that holds
+/// anything: to the next boundary of the lowest level that is not empty.
+fn stride(w: TimerWheel) -> i64 {
+    var level = 0
+    while level < levels() and w.filed[level] == 0 {
+        level = level + 1
+    }
+    let span = 1.shl(6 * level.min(levels() - 1))
+    if level == 0 { 1 } else { span - w.now.bit_and(span - 1) }
+}
+
+fn tick(inout w: TimerWheel, inout out: [i64]) {
+    var level = 1
+    while level < levels() and w.now.bit_and(1.shl(6 * level) - 1) == 0 {
+        level = level + 1
+    }
+    var l = level - 1
+    while l >= 1 {
+        cascade(w, l)
+        l = l - 1
+    }
+    if level == levels() {
+        refile_overflow(w)
+    }
+    let at = w.now.bit_and(63)
+    let ready = w.slots[at]
+    w.slots[at] = []
+    w.filed[0] = w.filed[0] - ready.len()
+    fire(w, ready, out)
+}
+
+/// Moves the clock to `to` and returns the timers that came due, by
+/// deadline and then by starting order. A time before now is now.
+pub fn advance(inout w: TimerWheel, to: i64) -> [i64] {
+    var out: [i64] = []
+    var overdue: [(i64, i64)] = []
+    for id in w.due {
+        if w.alive[id] {
+            overdue.push((w.deadline[id], id))
+        }
+    }
+    w.due = []
+    fire_overdue(w, overdue, out)
+    while w.now < to {
+        let step = stride(w).min(to - w.now)
+        w.now = w.now + step
+        tick(w, out)
+    }
+    out
+}
+
+/// Timers already due before the clock moves: by deadline, then id.
+fn fire_overdue(inout w: TimerWheel, items: [(i64, i64)], inout out: [i64]) {
+    var rest = items
+    while rest.len() > 0 {
+        var best = 0
+        for k in 1..rest.len() {
+            if rest[k].0 < rest[best].0 or (rest[k].0 == rest[best].0 and rest[k].1 < rest[best].1) {
+                best = k
+            }
+        }
+        let id = rest[best].1
+        w.alive[id] = false
+        w.live = w.live - 1
+        out.push(id)
+        var kept: [(i64, i64)] = []
+        for k in 0..rest.len() {
+            if k != best {
+                kept.push(rest[k])
+            }
+        }
+        rest = kept
+    }
+}

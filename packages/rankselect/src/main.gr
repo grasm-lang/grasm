@@ -1,0 +1,136 @@
+// A bit vector with rank and select (Jacobson, 1989): how many ones come
+// before position i, and where the k-th one is.
+//
+// Those two questions are what succinct data structures are built from --
+// wavelet trees, compressed suffix arrays, Elias-Fano lists, FM-indexes --
+// and both are answered without scanning: rank by a cumulative count per
+// 64-bit word plus one popcount, select by binary search over those
+// counts and a walk through one word.
+//
+// Bits are numbered from 0; bit i lives in word i / 64 at bit i % 64,
+// least significant first. Counting avoids 64-bit arithmetic that could
+// overflow by popcounting each word as two 32-bit halves.
+
+type RankBits = {
+    words: [i64],
+    /// `before[k]` is the number of ones in words 0..k.
+    before: [i64],
+    bits: i64,
+}
+
+fn popcount32(x: i64) -> i64 {
+    var v = x - x.ushr(1).bit_and(1431655765)
+    v = v.bit_and(858993459) + v.ushr(2).bit_and(858993459)
+    v = (v + v.ushr(4)).bit_and(252645135)
+    (v * 16843009).ushr(24).bit_and(255)
+}
+
+fn popcount(x: i64) -> i64 {
+    popcount32(x.bit_and(4294967295)) + popcount32(x.ushr(32))
+}
+
+/// The low `r` bits of a word set, for r in 0..64.
+fn low_mask(r: i64) -> i64 {
+    if r == 0 { 0 } else { (-1).ushr(64 - r) }
+}
+
+pub fn new_bits(bits: [bool]) -> RankBits {
+    var words: [i64] = []
+    for i in 0..bits.len() {
+        if i % 64 == 0 {
+            words.push(0)
+        }
+        if bits[i] {
+            words[i / 64] = words[i / 64].bit_or(1.shl(i % 64))
+        }
+    }
+    var before: [i64] = [0]
+    for w in words {
+        before.push(before[before.len() - 1] + popcount(w))
+    }
+    RankBits{ words: words, before: before, bits: bits.len() }
+}
+
+/// The bit vector of length `n` with ones at `positions`.
+pub fn from_positions(n: i64, positions: [i64]) -> RankBits {
+    var bits: [bool] = []
+    for _i in 0..n {
+        bits.push(false)
+    }
+    for p in positions {
+        bits[p] = true
+    }
+    new_bits(bits)
+}
+
+pub fn len(b: RankBits) -> i64 {
+    b.bits
+}
+
+pub fn count_ones(b: RankBits) -> i64 {
+    b.before[b.before.len() - 1]
+}
+
+pub fn get(b: RankBits, i: i64) -> bool {
+    b.words[i / 64].ushr(i % 64).bit_and(1) == 1
+}
+
+/// Ones in positions 0..i.
+pub fn rank1(b: RankBits, i: i64) -> i64 {
+    let at = i.max(0).min(b.bits)
+    let w = at / 64
+    if w == b.words.len() {
+        return b.before[w]
+    }
+    b.before[w] + popcount(b.words[w].bit_and(low_mask(at % 64)))
+}
+
+/// Zeros in positions 0..i.
+pub fn rank0(b: RankBits, i: i64) -> i64 {
+    i.max(0).min(b.bits) - rank1(b, i)
+}
+
+/// The position of the k-th bit equal to `bit` (k from 0) within the
+/// word `w`, given how many such bits come before it.
+fn within(b: RankBits, w: i64, k: i64, bit: i64) -> i64 {
+    var left = k
+    for j in 0..64 {
+        if b.words[w].ushr(j).bit_and(1) == bit {
+            if left == 0 {
+                return 64 * w + j
+            }
+            left = left - 1
+        }
+    }
+    -1
+}
+
+/// The position of the k-th one, counting from 0; -1 when there are not
+/// that many.
+pub fn select1(b: RankBits, k: i64) -> i64 {
+    if k < 0 or k >= count_ones(b) {
+        return -1
+    }
+    var lo = 0
+    var hi = b.words.len() - 1
+    while lo < hi {
+        let mid = (lo + hi + 1) / 2
+        if b.before[mid] <= k { lo = mid } else { hi = mid - 1 }
+    }
+    within(b, lo, k - b.before[lo], 1)
+}
+
+/// The position of the k-th zero, counting from 0; -1 when there are not
+/// that many.
+pub fn select0(b: RankBits, k: i64) -> i64 {
+    if k < 0 or k >= b.bits - count_ones(b) {
+        return -1
+    }
+    var lo = 0
+    var hi = b.words.len() - 1
+    while lo < hi {
+        let mid = (lo + hi + 1) / 2
+        if 64 * mid - b.before[mid] <= k { lo = mid } else { hi = mid - 1 }
+    }
+    within(b, lo, k - (64 * lo - b.before[lo]), 0)
+}

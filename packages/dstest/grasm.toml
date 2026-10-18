@@ -1,0 +1,36 @@
+[package]
+name = "dstest"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.fenwick]
+path = "../fenwick"
+version = "^1.0.0"
+
+[dependencies.segtree]
+path = "../segtree"
+version = "^1.0.0"
+
+[dependencies.intervaltree]
+path = "../intervaltree"
+version = "^1.0.0"
+
+[dependencies.rankselect]
+path = "../rankselect"
+version = "^1.0.0"
+
+[dependencies.wavelet]
+path = "../wavelet"
+version = "^1.0.0"
+
+[dependencies.sparseset]
+path = "../sparseset"
+version = "^1.0.0"
+
+[dependencies.slotmap]
+path = "../slotmap"
+version = "^1.0.0"
+
+[dependencies.timerwheel]
+path = "../timerwheel"
+version = "^1.0.0"

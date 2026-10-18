@@ -1,0 +1,242 @@
+// An interval tree: a changing set of intervals that answers which of them
+// contain a point, or overlap a range, in O(log n + answers).
+//
+// Calendars ask it which bookings overlap a slot, genome browsers which
+// features cover a base, schedulers which leases are live at time t, and
+// memory checkers which allocation an address falls in. `intervals` does
+// set algebra on lists of intervals; this indexes a large, changing set.
+//
+// An AVL tree ordered by (start, end, id), each node also holding the
+// largest end in its subtree, so a search skips every subtree that ends
+// before the query begins. Nodes live in parallel arrays and are reused
+// through a free list.
+//
+// Intervals are half-open, `start..end`: [10, 20) contains 10 and not 20,
+// and an empty interval contains and overlaps nothing.
+
+type IntervalEntry = {
+    start: i64,
+    end: i64,
+    id: i64,
+}
+
+type IntervalTree = {
+    entry: [IntervalEntry],
+    left: [i64],
+    right: [i64],
+    height: [i64],
+    reach: [i64],
+    root: i64,
+    count: i64,
+    free: [i64],
+}
+
+pub fn new_interval_tree() -> IntervalTree {
+    IntervalTree{ entry: [], left: [], right: [], height: [], reach: [], root: -1, count: 0, free: [] }
+}
+
+pub fn len(t: IntervalTree) -> i64 {
+    t.count
+}
+
+fn h(t: IntervalTree, n: i64) -> i64 {
+    if n == -1 { 0 } else { t.height[n] }
+}
+
+fn r(t: IntervalTree, n: i64) -> i64 {
+    if n == -1 { -9223372036854775807 } else { t.reach[n] }
+}
+
+fn fix(inout t: IntervalTree, n: i64) {
+    t.height[n] = 1 + h(t, t.left[n]).max(h(t, t.right[n]))
+    t.reach[n] = t.entry[n].end.max(r(t, t.left[n])).max(r(t, t.right[n]))
+}
+
+fn rotate_right(inout t: IntervalTree, n: i64) -> i64 {
+    let l = t.left[n]
+    t.left[n] = t.right[l]
+    t.right[l] = n
+    fix(t, n)
+    fix(t, l)
+    l
+}
+
+fn rotate_left(inout t: IntervalTree, n: i64) -> i64 {
+    let rr = t.right[n]
+    t.right[n] = t.left[rr]
+    t.left[rr] = n
+    fix(t, n)
+    fix(t, rr)
+    rr
+}
+
+fn balance(inout t: IntervalTree, n: i64) -> i64 {
+    fix(t, n)
+    let b = h(t, t.left[n]) - h(t, t.right[n])
+    if b > 1 {
+        if h(t, t.left[t.left[n]]) < h(t, t.right[t.left[n]]) {
+            t.left[n] = rotate_left(t, t.left[n])
+        }
+        return rotate_right(t, n)
+    }
+    if b < -1 {
+        if h(t, t.right[t.right[n]]) < h(t, t.left[t.right[n]]) {
+            t.right[n] = rotate_right(t, t.right[n])
+        }
+        return rotate_left(t, n)
+    }
+    n
+}
+
+fn before(a: IntervalEntry, b: IntervalEntry) -> bool {
+    if a.start != b.start {
+        return a.start < b.start
+    }
+    if a.end != b.end {
+        return a.end < b.end
+    }
+    a.id < b.id
+}
+
+fn new_node(inout t: IntervalTree, e: IntervalEntry) -> i64 {
+    if t.free.len() > 0 {
+        let n = t.free.pop() ?? 0
+        t.entry[n] = e
+        t.left[n] = -1
+        t.right[n] = -1
+        t.height[n] = 1
+        t.reach[n] = e.end
+        return n
+    }
+    t.entry.push(e)
+    t.left.push(-1)
+    t.right.push(-1)
+    t.height.push(1)
+    t.reach.push(e.end)
+    t.entry.len() - 1
+}
+
+fn insert_at(inout t: IntervalTree, n: i64, e: IntervalEntry) -> i64 {
+    if n == -1 {
+        return new_node(t, e)
+    }
+    if before(e, t.entry[n]) {
+        t.left[n] = insert_at(t, t.left[n], e)
+    } else {
+        t.right[n] = insert_at(t, t.right[n], e)
+    }
+    balance(t, n)
+}
+
+/// Adds the interval start..end under `id`; false when start > end or the
+/// same (start, end, id) is already there.
+pub fn insert(inout t: IntervalTree, start: i64, end: i64, id: i64) -> bool {
+    if start > end or holds(t, start, end, id) {
+        return false
+    }
+    t.root = insert_at(t, t.root, IntervalEntry{ start: start, end: end, id: id })
+    t.count = t.count + 1
+    true
+}
+
+pub fn holds(t: IntervalTree, start: i64, end: i64, id: i64) -> bool {
+    let e = IntervalEntry{ start: start, end: end, id: id }
+    var n = t.root
+    while n != -1 {
+        let here = t.entry[n]
+        if here.start == start and here.end == end and here.id == id {
+            return true
+        }
+        n = if before(e, here) { t.left[n] } else { t.right[n] }
+    }
+    false
+}
+
+/// Detaches the smallest node of the subtree at `n`: (new subtree, node).
+fn take_min(inout t: IntervalTree, n: i64) -> (i64, i64) {
+    if t.left[n] == -1 {
+        return (t.right[n], n)
+    }
+    let (rest, m) = take_min(t, t.left[n])
+    t.left[n] = rest
+    (balance(t, n), m)
+}
+
+fn remove_at(inout t: IntervalTree, n: i64, e: IntervalEntry) -> i64 {
+    let here = t.entry[n]
+    if here.start == e.start and here.end == e.end and here.id == e.id {
+        t.free.push(n)
+        if t.left[n] == -1 {
+            return t.right[n]
+        }
+        if t.right[n] == -1 {
+            return t.left[n]
+        }
+        let (rest, m) = take_min(t, t.right[n])
+        t.left[m] = t.left[n]
+        t.right[m] = rest
+        return balance(t, m)
+    }
+    if before(e, here) {
+        t.left[n] = remove_at(t, t.left[n], e)
+    } else {
+        t.right[n] = remove_at(t, t.right[n], e)
+    }
+    balance(t, n)
+}
+
+/// Removes the interval; false when it was not there.
+pub fn remove(inout t: IntervalTree, start: i64, end: i64, id: i64) -> bool {
+    if not holds(t, start, end, id) {
+        return false
+    }
+    t.root = remove_at(t, t.root, IntervalEntry{ start: start, end: end, id: id })
+    t.count = t.count - 1
+    true
+}
+
+fn collect(t: IntervalTree, n: i64, lo: i64, hi: i64, inout out: [IntervalEntry]) {
+    if n == -1 or t.reach[n] <= lo {
+        return
+    }
+    collect(t, t.left[n], lo, hi, out)
+    let e = t.entry[n]
+    if e.start >= hi {
+        return
+    }
+    if e.start < e.end and e.end > lo {
+        out.push(e)
+    }
+    collect(t, t.right[n], lo, hi, out)
+}
+
+/// The intervals overlapping lo..hi, in (start, end, id) order.
+pub fn overlapping(t: IntervalTree, lo: i64, hi: i64) -> [IntervalEntry] {
+    var out: [IntervalEntry] = []
+    if lo < hi {
+        collect(t, t.root, lo, hi, out)
+    }
+    out
+}
+
+/// The intervals containing `point`, in (start, end, id) order.
+pub fn stabbing(t: IntervalTree, point: i64) -> [IntervalEntry] {
+    overlapping(t, point, point + 1)
+}
+
+/// Every interval, in (start, end, id) order.
+pub fn entries(t: IntervalTree) -> [IntervalEntry] {
+    var out: [IntervalEntry] = []
+    var stack: [i64] = []
+    var n = t.root
+    while n != -1 or stack.len() > 0 {
+        while n != -1 {
+            stack.push(n)
+            n = t.left[n]
+        }
+        let top = stack.pop() ?? -1
+        out.push(t.entry[top])
+        n = t.right[top]
+    }
+    out
+}

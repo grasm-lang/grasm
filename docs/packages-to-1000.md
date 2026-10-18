@@ -183,10 +183,13 @@ Ethernet, IPv4, IPv6, TCP and UDP were candidates here and are already
 ### Tier 3 — the long tail a large ecosystem has
 
 **B21. Data structures** (a brute-force Python model of each, fuzzed) —
-`fenwick` `segtree` `intervaltree` `hamt` `adaptiveradix` `treap` `avlmap`
-`lfu` `arccache` `jumphash` `rendezvous` `rankselect` `wavelet` `sparseset`
-`xorfilter` `quotientfilter` `minhash` `hnsw` `timerwheel` `slotmap`
-`pairingheap`
+`fenwick` `segtree` `intervaltree` `hamt` `lfu` `arccache` `jumphash`
+`rendezvous` `rankselect` `wavelet` `sparseset` `xorfilter`
+`quotientfilter` `minhash` `hnsw` `timerwheel` `slotmap`
+
+`avlmap` and `treap` were candidates here and came off by rule 7, as
+ordered maps `btree` and `skiplist` already are; so did `adaptiveradix`
+(`trie`, `btree`) and `pairingheap` (`heap`).
 
 **B22. Graphs** (Python `graphlib`, brute force) —
 `scc` `mincostflow` `graphiso` `cliques` `graphcolor` `eulerpath`
@@ -199,7 +202,8 @@ Ethernet, IPv4, IPv6, TCP and UDP were candidates here and are already
 `pyregex` `regexsyntax`
 `posixregex`
 
-**B24. Signals** (brute-force definitions, `ffmpeg` filters) —
+**B24. Signals** (gonum's `dsp/fourier`, `dsp/window` and `interp`,
+brute-force definitions) —
 `dct` `dwt` `spline` `windowfn`
 
 **B25. Codecs Python has and the set does not** (Python `codecs`) —
@@ -214,6 +218,16 @@ Ethernet, IPv4, IPv6, TCP and UDP were candidates here and are already
 **B27. Documents** (`textutil`) —
 `rtf` `docx` `odt`
 
+**B28. What the Go module cache and the system can check** (`golang.org/x/net`
+`x/tools`, `miekg/dns`, `paulmach/orb` and `osm`, `pires/go-proxyproto`,
+`jackpal/go-nat-pmp`, `klauspost/compress`, Python `ntpath`, `xmllint`) —
+`winpath` `xmlc14n` `txtar` `httpproxy` `bpf` `htmlcharset` `proxyproto`
+`natpmp` `dnssec` `svcb` `wkb` `mvt` `maptile` `osmpbf` `s2compress`
+
+Found on 2026-10-18 by listing the module cache: every one has its
+reference on this machine. `langtag` and `ssdp` were looked at and are
+`locale` and `netdiscovery` already.
+
 ## Deferred, for want of an oracle
 
 `parquet` `arrowipc` `orc` `hdf5` `netcdf` (no pyarrow, h5py or netCDF4),
@@ -225,6 +239,15 @@ projection library), `flexlayout` (no layout engine outside a browser),
 day its reference is installed.
 
 ## Landed
+
+- [x] **B21, first part** — `fenwick` `segtree` `intervaltree`
+  `rankselect` `wavelet` `sparseset` `slotmap` `timerwheel`, with the
+  harness `dstest`; the new gate `dsdiff` runs 1,860 random scripts of
+  operations against Python models. The wheel had a defect before its first
+  run: a timer cascading down onto its own deadline was filed as overdue
+  and fired one `advance` late. Reverting that fix turned 25 cases red;
+  breaking interval pruning, the rank mask and the quantile step turned
+  540 more.
 
 - [x] **B22: graphs** — `scc` `bridges` `eulerpath` `lca` `graphcolor`
   `cliques` `graphiso` `mincostflow`, with the harness `graphtest`; the new
@@ -326,13 +349,13 @@ day its reference is installed.
 | | |
 |---|---|
 | At the start | 669 |
-| Now | 746 |
-| Candidates above | 302 packages in 27 batches, plus `ecc`, `rfc6979` and `goprintf` |
-| Harnesses, one a batch | 27 |
-| If every candidate lands | 1001 |
+| Now | 755 |
+| Candidates above | 313 packages in 28 batches, plus `ecc`, `rfc6979` and `goprintf` |
+| Harnesses, one a batch | 28 |
+| If every candidate lands | 1013 |
 | Target | 1000 |
 
-The margin over 1000 is 1. It is there because some
+The margin over 1000 is 13. It is there because some
 candidate will turn out to exist already under a name the grep missed, or to
 disagree with its oracle in a way that says the oracle is the better
 package, and the plan should not need rewriting when that happens.

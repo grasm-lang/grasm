@@ -1,0 +1,187 @@
+// Segment trees: a list whose elements change and whose ranges are asked
+// about -- the minimum of these, the sum of those -- each in O(log n).
+//
+// `SegTree` takes any associative operation and its identity, so the same
+// tree answers range minimum, range maximum, gcd, or the composition of a
+// run of affine maps; the operation need not commute, and ranges combine
+// left to right. `RangeAddTree` adds a value to a whole range at once
+// (lazy propagation) and answers sum, minimum and maximum over a range.
+//
+// Ranges are half-open: `lo..hi`.
+
+type SegTree = {
+    n: i64,
+    size: i64,
+    tree: [i64],
+    combine: fn(i64, i64) -> i64,
+    identity: i64,
+}
+
+type RangeAddTree = {
+    n: i64,
+    sum: [i64],
+    low: [i64],
+    high: [i64],
+    pending: [i64],
+}
+
+pub fn new_seg_tree(values: [i64], combine: fn(i64, i64) -> i64, identity: i64) -> SegTree {
+    var size = 1
+    while size < values.len() {
+        size = size * 2
+    }
+    var t: [i64] = []
+    for _i in 0..2 * size {
+        t.push(identity)
+    }
+    for i in 0..values.len() {
+        t[size + i] = values[i]
+    }
+    var k = size - 1
+    while k >= 1 {
+        t[k] = combine(t[2 * k], t[2 * k + 1])
+        k = k - 1
+    }
+    SegTree{ n: values.len(), size: size, tree: t, combine: combine, identity: identity }
+}
+
+pub fn sum_tree(values: [i64]) -> SegTree {
+    new_seg_tree(values, |a, b| a + b, 0)
+}
+
+pub fn min_tree(values: [i64]) -> SegTree {
+    new_seg_tree(values, |a, b| a.min(b), 9223372036854775807)
+}
+
+pub fn max_tree(values: [i64]) -> SegTree {
+    new_seg_tree(values, |a, b| a.max(b), -9223372036854775807 - 1)
+}
+
+pub fn get(t: SegTree, i: i64) -> i64 {
+    t.tree[t.size + i]
+}
+
+pub fn set(inout t: SegTree, i: i64, value: i64) {
+    var k = t.size + i
+    t.tree[k] = value
+    k = k / 2
+    while k >= 1 {
+        t.tree[k] = (t.combine)(t.tree[2 * k], t.tree[2 * k + 1])
+        k = k / 2
+    }
+}
+
+/// The elements lo..hi combined in order; the identity when empty.
+pub fn query(t: SegTree, lo: i64, hi: i64) -> i64 {
+    var left = t.identity
+    var right = t.identity
+    var a = t.size + lo.max(0)
+    var b = t.size + hi.min(t.n)
+    while a < b {
+        if a % 2 == 1 {
+            left = (t.combine)(left, t.tree[a])
+            a = a + 1
+        }
+        if b % 2 == 1 {
+            b = b - 1
+            right = (t.combine)(t.tree[b], right)
+        }
+        a = a / 2
+        b = b / 2
+    }
+    (t.combine)(left, right)
+}
+
+pub fn new_range_add_tree(values: [i64]) -> RangeAddTree {
+    let n = values.len()
+    var z: [i64] = []
+    for _i in 0..4 * n.max(1) {
+        z.push(0)
+    }
+    var t = RangeAddTree{ n: n, sum: z, low: z, high: z, pending: z }
+    if n > 0 {
+        build(t, values, 1, 0, n)
+    }
+    t
+}
+
+fn build(inout t: RangeAddTree, values: [i64], node: i64, lo: i64, hi: i64) {
+    if hi - lo == 1 {
+        t.sum[node] = values[lo]
+        t.low[node] = values[lo]
+        t.high[node] = values[lo]
+        return
+    }
+    let mid = (lo + hi) / 2
+    build(t, values, 2 * node, lo, mid)
+    build(t, values, 2 * node + 1, mid, hi)
+    pull(t, node)
+}
+
+fn pull(inout t: RangeAddTree, node: i64) {
+    t.sum[node] = t.sum[2 * node] + t.sum[2 * node + 1]
+    t.low[node] = t.low[2 * node].min(t.low[2 * node + 1])
+    t.high[node] = t.high[2 * node].max(t.high[2 * node + 1])
+}
+
+fn apply(inout t: RangeAddTree, node: i64, width: i64, delta: i64) {
+    t.sum[node] = t.sum[node] + delta * width
+    t.low[node] = t.low[node] + delta
+    t.high[node] = t.high[node] + delta
+    t.pending[node] = t.pending[node] + delta
+}
+
+fn push_down(inout t: RangeAddTree, node: i64, lo: i64, hi: i64) {
+    let d = t.pending[node]
+    if d != 0 {
+        let mid = (lo + hi) / 2
+        apply(t, 2 * node, mid - lo, d)
+        apply(t, 2 * node + 1, hi - mid, d)
+        t.pending[node] = 0
+    }
+}
+
+fn add_at(inout t: RangeAddTree, node: i64, lo: i64, hi: i64, a: i64, b: i64, delta: i64) {
+    if b <= lo or hi <= a {
+        return
+    }
+    if a <= lo and hi <= b {
+        apply(t, node, hi - lo, delta)
+        return
+    }
+    push_down(t, node, lo, hi)
+    let mid = (lo + hi) / 2
+    add_at(t, 2 * node, lo, mid, a, b, delta)
+    add_at(t, 2 * node + 1, mid, hi, a, b, delta)
+    pull(t, node)
+}
+
+/// Adds `delta` to every element lo..hi.
+pub fn add_range(inout t: RangeAddTree, lo: i64, hi: i64, delta: i64) {
+    if t.n > 0 and lo < hi {
+        add_at(t, 1, 0, t.n, lo, hi, delta)
+    }
+}
+
+/// (sum, minimum, maximum) of lo..hi, which must not be empty.
+fn ask(inout t: RangeAddTree, node: i64, lo: i64, hi: i64, a: i64, b: i64) -> (i64, i64, i64) {
+    if a <= lo and hi <= b {
+        return (t.sum[node], t.low[node], t.high[node])
+    }
+    push_down(t, node, lo, hi)
+    let mid = (lo + hi) / 2
+    if b <= mid {
+        return ask(t, 2 * node, lo, mid, a, b)
+    }
+    if a >= mid {
+        return ask(t, 2 * node + 1, mid, hi, a, b)
+    }
+    let (s1, l1, h1) = ask(t, 2 * node, lo, mid, a, b)
+    let (s2, l2, h2) = ask(t, 2 * node + 1, mid, hi, a, b)
+    (s1 + s2, l1.min(l2), h1.max(h2))
+}
+
+/// The sum, minimum and maximum of the non-empty range lo..hi.
+pub fn summary(inout t: RangeAddTree, lo: i64, hi: i64) -> (i64, i64, i64) {
+    ask(t, 1, 0, t.n, lo, hi)
+}

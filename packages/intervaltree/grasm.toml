@@ -1,0 +1,5 @@
+[package]
+name = "intervaltree"
+version = "1.0.0"
+
+capabilities = []

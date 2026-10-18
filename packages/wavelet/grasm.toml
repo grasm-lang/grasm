@@ -1,0 +1,9 @@
+[package]
+name = "wavelet"
+version = "1.0.0"
+
+capabilities = []
+
+[dependencies.rankselect]
+path = "../rankselect"
+version = "^1.0.0"

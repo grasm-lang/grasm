@@ -1,0 +1,261 @@
+// The Grasm side of scripts/ds_diff.py: each case is a structure, how to
+// build it, and a script of operations `name arg arg;...`; the answer is
+// every operation's result, space-separated, which the driver compares
+// with a Python model of the same structure.
+import fenwick
+import segtree
+import intervaltree
+import rankselect
+import wavelet
+import sparseset
+import slotmap
+import timerwheel
+
+fn ints(text: str, sep: str) -> [i64] {
+    var out: [i64] = []
+    if text.len() == 0 {
+        return out
+    }
+    for p in text.split(sep) {
+        out.push(p.parse_int() ?? 0)
+    }
+    out
+}
+
+fn show(list: [i64]) -> str {
+    "[" + list.map(|x| "{x}").join(",") + "]"
+}
+
+fn commands(script: str) -> [[i64]] {
+    var out: [[i64]] = []
+    if script.len() == 0 {
+        return out
+    }
+    for c in script.split(";") {
+        out.push(ints(c, " "))
+    }
+    out
+}
+
+fn run_fenwick(setup: str, script: str) -> str {
+    let values = ints(setup.substr(1, setup.len() - 1), ",")
+    var f = if setup.starts_with("L") { fenwick.from_list(values) } else { fenwick.new_fenwick(values.len()) }
+    if not setup.starts_with("L") {
+        for i in 0..values.len() {
+            fenwick.add(f, i, values[i])
+        }
+    }
+    var out: [str] = []
+    for c in commands(script) {
+        let v = if c[0] == 0 {
+            fenwick.add(f, c[1], c[2])
+            0
+        } else if c[0] == 1 {
+            fenwick.set(f, c[1], c[2])
+            0
+        } else if c[0] == 2 { fenwick.prefix_sum(f, c[1]) } else if c[0] == 3 {
+            fenwick.range_sum(f, c[1], c[2])
+        } else if c[0] == 4 { fenwick.get(f, c[1]) } else { fenwick.lower_bound(f, c[1]) }
+        out.push("{v}")
+    }
+    out.join(" ")
+}
+
+fn affine(x: i64, y: i64) -> i64 {
+    let p = 1000003
+    let a1 = x.ushr(20)
+    let b1 = x.bit_and(1048575)
+    let a2 = y.ushr(20)
+    let b2 = y.bit_and(1048575)
+    ((a1 * a2) % p).shl(20).bit_or((a2 * b1 + b2) % p)
+}
+
+fn run_segtree(setup: str, script: str) -> str {
+    let kind = setup.substr(0, 1)
+    let values = ints(setup.substr(1, setup.len() - 1), ",")
+    var t = if kind == "A" { segtree.new_seg_tree(values, |x, y| affine(x, y), 1048576) } else if kind == "S" {
+        segtree.sum_tree(values)
+    } else if kind == "N" { segtree.min_tree(values) } else { segtree.max_tree(values) }
+    var out: [str] = []
+    for c in commands(script) {
+        if c[0] == 0 {
+            segtree.set(t, c[1], c[2])
+            out.push("-")
+        } else {
+            out.push("{segtree.query(t, c[1], c[2])}")
+        }
+    }
+    out.join(" ")
+}
+
+fn run_lazy(setup: str, script: str) -> str {
+    var t = segtree.new_range_add_tree(ints(setup, ","))
+    var out: [str] = []
+    for c in commands(script) {
+        if c[0] == 0 {
+            segtree.add_range(t, c[1], c[2], c[3])
+            out.push("-")
+        } else {
+            let (s, l, h) = segtree.summary(t, c[1], c[2])
+            out.push("{s}/{l}/{h}")
+        }
+    }
+    out.join(" ")
+}
+
+fn entries(list: [IntervalEntry]) -> str {
+    "[" + list.map(|e| "{e.start}:{e.end}:{e.id}").join(",") + "]"
+}
+
+fn run_intervals(script: str) -> str {
+    var t = intervaltree.new_interval_tree()
+    var out: [str] = []
+    for c in commands(script) {
+        if c[0] == 0 {
+            out.push("{intervaltree.insert(t, c[1], c[2], c[3])}")
+        } else if c[0] == 1 {
+            out.push("{intervaltree.remove(t, c[1], c[2], c[3])}")
+        } else if c[0] == 2 {
+            out.push(entries(intervaltree.stabbing(t, c[1])))
+        } else if c[0] == 3 {
+            out.push(entries(intervaltree.overlapping(t, c[1], c[2])))
+        } else {
+            out.push(entries(intervaltree.entries(t)) + "#{intervaltree.len(t)}")
+        }
+    }
+    out.join(" ")
+}
+
+fn run_bits(setup: str, script: str) -> str {
+    var flags: [bool] = []
+    for ch in setup.chars() {
+        flags.push(ch == "1")
+    }
+    let b = rankselect.new_bits(flags)
+    var out: [str] = []
+    for c in commands(script) {
+        let v = if c[0] == 0 { rankselect.rank1(b, c[1]) } else if c[0] == 1 { rankselect.rank0(b, c[1]) } else if c[0] == 2 {
+            rankselect.select1(b, c[1])
+        } else if c[0] == 3 { rankselect.select0(b, c[1]) } else if rankselect.get(b, c[1]) { 1 } else { 0 }
+        out.push("{v}")
+    }
+    out.join(" ") + " {rankselect.count_ones(b)}"
+}
+
+fn run_wavelet(setup: str, script: str) -> str {
+    match wavelet.new_wavelet(ints(setup, ",")) {
+        Err(_) -> "ERR"
+        Ok(w) -> {
+            var out: [str] = []
+            for c in commands(script) {
+                let v = if c[0] == 0 { wavelet.access(w, c[1]) } else if c[0] == 1 { wavelet.rank(w, c[1], c[2]) } else if c[0] == 2 {
+                    wavelet.select(w, c[1], c[2])
+                } else if c[0] == 3 { wavelet.quantile(w, c[1], c[2], c[3]) } else {
+                    wavelet.range_count(w, c[1], c[2], c[3], c[4])
+                }
+                out.push("{v}")
+            }
+            out.join(" ")
+        }
+    }
+}
+
+fn run_sparse(setup: str, script: str) -> str {
+    var s = sparseset.new_sparse_set(setup.parse_int() ?? 0)
+    var out: [str] = []
+    for c in commands(script) {
+        if c[0] == 0 {
+            out.push("{sparseset.insert(s, c[1])}")
+        } else if c[0] == 1 {
+            out.push("{sparseset.remove(s, c[1])}")
+        } else if c[0] == 2 {
+            out.push("{sparseset.contains(s, c[1])}")
+        } else if c[0] == 3 {
+            sparseset.clear(s)
+            out.push("-")
+        } else {
+            out.push(show(sparseset.members(s)) + "#{sparseset.len(s)}")
+        }
+    }
+    out.join(" ")
+}
+
+fn opt(v: Option[i64]) -> str {
+    match v {
+        Some(x) -> "{x}"
+        None -> "none"
+    }
+}
+
+fn run_slots(script: str) -> str {
+    var m: SlotMap[i64] = slotmap.new_slot_map()
+    var out: [str] = []
+    for c in commands(script) {
+        let key = SlotKey{ index: if c.len() > 1 { c[1] } else { 0 }, generation: if c.len() > 2 { c[2] } else { 0 } }
+        if c[0] == 0 {
+            let k = slotmap.insert(m, c[1])
+            out.push("{k.index}.{k.generation}")
+        } else if c[0] == 1 {
+            out.push(opt(slotmap.get(m, key)))
+        } else if c[0] == 2 {
+            out.push(opt(slotmap.remove(m, key)))
+        } else if c[0] == 3 {
+            out.push("{slotmap.set(m, key, c[3])}")
+        } else {
+            out.push(slotmap.keys(m).map(|k| "{k.index}.{k.generation}").join(",") + "#{slotmap.len(m)}")
+        }
+    }
+    out.join(" ")
+}
+
+fn run_wheel(setup: str, script: str) -> str {
+    var w = timerwheel.new_wheel(setup.parse_int() ?? 0)
+    var out: [str] = []
+    for c in commands(script) {
+        if c[0] == 0 {
+            out.push("{timerwheel.schedule(w, c[1])}")
+        } else if c[0] == 1 {
+            out.push("{timerwheel.cancel(w, c[1])}")
+        } else {
+            out.push(show(timerwheel.advance(w, c[1])) + "@{timerwheel.now(w)}#{timerwheel.pending(w)}")
+        }
+    }
+    out.join(" ")
+}
+
+fn answer(what: str, setup: str, script: str) -> str {
+    if what == "fenwick" {
+        return run_fenwick(setup, script)
+    }
+    if what == "segtree" {
+        return run_segtree(setup, script)
+    }
+    if what == "lazyseg" {
+        return run_lazy(setup, script)
+    }
+    if what == "intervals" {
+        return run_intervals(script)
+    }
+    if what == "rankselect" {
+        return run_bits(setup, script)
+    }
+    if what == "wavelet" {
+        return run_wavelet(setup, script)
+    }
+    if what == "sparseset" {
+        return run_sparse(setup, script)
+    }
+    if what == "slotmap" {
+        return run_slots(script)
+    }
+    run_wheel(setup, script)
+}
+
+fn main() / {io} {
+    let argv = args()
+    var i = 0
+    while i + 2 < argv.len() {
+        print(answer(argv[i], argv[i + 1], argv[i + 2]))
+        i = i + 3
+    }
+}

@@ -1,0 +1,94 @@
+// A Fenwick tree (binary indexed tree, Fenwick 1994): prefix sums of a
+// list that keeps changing, each update and each sum in O(log n).
+//
+// A plain list answers a prefix sum in O(n); a list of prefix sums answers
+// it in O(1) but takes O(n) to update. This is the middle: cumulative
+// frequency tables for arithmetic coding, inversion counts, order
+// statistics over a bounded range of keys, running totals on a
+// leaderboard.
+//
+// Indices are 0..n. `tree[k]` (1-based inside) holds the sum of the
+// `k & -k` elements ending at k; walking up adds that low bit, walking
+// down removes it.
+
+type Fenwick = {
+    tree: [i64],
+}
+
+pub fn new_fenwick(n: i64) -> Fenwick {
+    var t: [i64] = []
+    for _i in 0..n + 1 {
+        t.push(0)
+    }
+    Fenwick{ tree: t }
+}
+
+/// Built in O(n) rather than n updates.
+pub fn from_list(values: [i64]) -> Fenwick {
+    var t: [i64] = [0] + values
+    for k in 1..t.len() {
+        let up = k + k.bit_and(0 - k)
+        if up < t.len() {
+            t[up] = t[up] + t[k]
+        }
+    }
+    Fenwick{ tree: t }
+}
+
+pub fn len(f: Fenwick) -> i64 {
+    f.tree.len() - 1
+}
+
+/// Adds `delta` to element `i`.
+pub fn add(inout f: Fenwick, i: i64, delta: i64) {
+    var k = i + 1
+    while k < f.tree.len() {
+        f.tree[k] = f.tree[k] + delta
+        k = k + k.bit_and(0 - k)
+    }
+}
+
+/// The sum of elements 0..i (`i` itself excluded).
+pub fn prefix_sum(f: Fenwick, i: i64) -> i64 {
+    var total = 0
+    var k = i.min(f.tree.len() - 1)
+    while k > 0 {
+        total = total + f.tree[k]
+        k = k - k.bit_and(0 - k)
+    }
+    total
+}
+
+/// The sum of elements lo..hi.
+pub fn range_sum(f: Fenwick, lo: i64, hi: i64) -> i64 {
+    if hi <= lo { 0 } else { prefix_sum(f, hi) - prefix_sum(f, lo) }
+}
+
+pub fn get(f: Fenwick, i: i64) -> i64 {
+    range_sum(f, i, i + 1)
+}
+
+pub fn set(inout f: Fenwick, i: i64, value: i64) {
+    add(f, i, value - get(f, i))
+}
+
+/// The smallest `i` whose prefix through `i` reaches `target` -- the
+/// element a cumulative frequency lands in -- or `len` when none does.
+/// Meaningful only while no element is negative.
+pub fn lower_bound(f: Fenwick, target: i64) -> i64 {
+    let n = f.tree.len() - 1
+    var step = 1
+    while step * 2 <= n {
+        step = step * 2
+    }
+    var pos = 0
+    var left = target
+    while step > 0 {
+        if pos + step <= n and f.tree[pos + step] < left {
+            pos = pos + step
+            left = left - f.tree[pos]
+        }
+        step = step / 2
+    }
+    pos
+}

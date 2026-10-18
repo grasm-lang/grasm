@@ -1,0 +1,85 @@
+// A slot map (generational arena): store values, get back keys that stay
+// valid until their value is removed -- and become detectably invalid
+// after, even when the slot is reused.
+//
+// Grasm has no pointers to hand out, so a graph, an entity store or a
+// cache that wants stable handles needs something like this; an index
+// into a list goes stale silently when the list is compacted. A key is a
+// slot and that slot's generation; removing bumps the generation, so an
+// old key no longer matches and `get` says `None` instead of returning
+// whatever moved in.
+//
+// Freed slots are reused most recently freed first.
+
+type SlotKey = {
+    index: i64,
+    generation: i64,
+}
+
+type SlotMap[V] = {
+    values: [Option[V]],
+    generations: [i64],
+    free: [i64],
+    count: i64,
+}
+
+pub fn new_slot_map[V]() -> SlotMap[V] {
+    SlotMap{ values: [], generations: [], free: [], count: 0 }
+}
+
+pub fn insert[V](inout m: SlotMap[V], value: V) -> SlotKey {
+    m.count = m.count + 1
+    if m.free.len() > 0 {
+        let i = m.free.pop() ?? 0
+        m.values[i] = Some(value)
+        return SlotKey{ index: i, generation: m.generations[i] }
+    }
+    m.values.push(Some(value))
+    m.generations.push(0)
+    SlotKey{ index: m.values.len() - 1, generation: 0 }
+}
+
+pub fn contains[V](m: SlotMap[V], key: SlotKey) -> bool {
+    key.index >= 0 and key.index < m.values.len() and m.generations[key.index] == key.generation and
+    m.values[key.index] != None
+}
+
+pub fn get[V](m: SlotMap[V], key: SlotKey) -> Option[V] {
+    if contains(m, key) { m.values[key.index] } else { None }
+}
+
+/// Replaces the value under a live key; false when the key is stale.
+pub fn set[V](inout m: SlotMap[V], key: SlotKey, value: V) -> bool {
+    if not contains(m, key) {
+        return false
+    }
+    m.values[key.index] = Some(value)
+    true
+}
+
+pub fn remove[V](inout m: SlotMap[V], key: SlotKey) -> Option[V] {
+    if not contains(m, key) {
+        return None
+    }
+    let old = m.values[key.index]
+    m.values[key.index] = None
+    m.generations[key.index] = m.generations[key.index] + 1
+    m.free.push(key.index)
+    m.count = m.count - 1
+    old
+}
+
+pub fn len[V](m: SlotMap[V]) -> i64 {
+    m.count
+}
+
+/// The live keys, by slot.
+pub fn keys[V](m: SlotMap[V]) -> [SlotKey] {
+    var out: [SlotKey] = []
+    for i in 0..m.values.len() {
+        if m.values[i] != None {
+            out.push(SlotKey{ index: i, generation: m.generations[i] })
+        }
+    }
+    out
+}
