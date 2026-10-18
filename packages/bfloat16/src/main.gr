@@ -1,0 +1,99 @@
+// bfloat16 ("brain floating point"): the top 16 bits of an IEEE single --
+// 1 sign, 8 exponent, 7 fraction bits -- so it keeps single precision's
+// range and gives up its precision. TPUs, recent CPUs (AVX-512 BF16, ARM
+// BF16) and every ML framework store weights and gradients in it.
+//
+// A value is held as its 16 bits in an `i64`. `from_f32_bits` rounds to
+// nearest, ties to even, by adding 0x7FFF plus the lowest kept bit, as
+// TensorFlow, PyTorch and the hardware do; a NaN stays a NaN, made quiet.
+// Grasm has no `f32`, so `f32_bits_of` rounds a double to single
+// precision first (to nearest, ties to even, with subnormals) -- `from_f64`
+// is the two together, as when a framework casts float32 to bfloat16.
+
+fn round_shift(full: i64, shift: i64) -> i64 {
+    if shift >= 62 {
+        return 0
+    }
+    let q = full.ushr(shift)
+    let rem = full.bit_and(1.shl(shift) - 1)
+    let half = 1.shl(shift - 1)
+    if rem > half or (rem == half and q.bit_and(1) == 1) { q + 1 } else { q }
+}
+
+/// The IEEE single nearest to x, as its 32 bits.
+pub fn f32_bits_of(x: f64) -> i64 {
+    let b = x.to_bits()
+    let sign = if b < 0 { 2147483648 } else { 0 }
+    let exp = b.ushr(52).bit_and(2047)
+    let mant = b.bit_and(4503599627370495)
+    if exp == 2047 {
+        return sign + if mant == 0 { 2139095040 } else { 2143289344 }
+    }
+    if exp == 0 {
+        return sign
+    }
+    let e = exp - 1023
+    let full = mant.bit_or(4503599627370496)
+    if e > 127 {
+        return sign + 2139095040
+    }
+    if e >= -126 {
+        var q = round_shift(full, 29)
+        var biased = e + 127
+        if q == 16777216 {
+            q = 8388608
+            biased = biased + 1
+        }
+        if biased >= 255 {
+            return sign + 2139095040
+        }
+        return sign + biased.shl(23) + (q - 8388608)
+    }
+    sign + round_shift(full, 29 + (-126 - e))
+}
+
+/// The double whose value an IEEE single's bits hold.
+pub fn f32_from_bits(bits: i64) -> f64 {
+    let negative = bits.bit_and(2147483648) != 0
+    let exp = bits.ushr(23).bit_and(255)
+    let mant = bits.bit_and(8388607)
+    var d = 0
+    if exp == 255 {
+        d = 9218868437227405312 + if mant == 0 { 0 } else { mant.shl(29).bit_or(2251799813685248) }
+    } else if exp == 0 {
+        if mant == 0 {
+            d = 0
+        } else {
+            var m = mant
+            var e = -126
+            while m.bit_and(8388608) == 0 {
+                m = m.shl(1)
+                e = e - 1
+            }
+            d = (e + 1023).shl(52) + (m - 8388608).shl(29)
+        }
+    } else {
+        d = (exp - 127 + 1023).shl(52) + mant.shl(29)
+    }
+    if negative { d.bit_or(-9223372036854775807 - 1).from_bits() } else { d.from_bits() }
+}
+
+pub fn from_f32_bits(bits: i64) -> i64 {
+    let b = bits.bit_and(4294967295)
+    if b.bit_and(2139095040) == 2139095040 and b.bit_and(8388607) != 0 {
+        return b.ushr(16).bit_or(64)
+    }
+    (b + 32767 + b.ushr(16).bit_and(1)).ushr(16).bit_and(65535)
+}
+
+pub fn to_f32_bits(h: i64) -> i64 {
+    h.bit_and(65535).shl(16)
+}
+
+pub fn from_f64(x: f64) -> i64 {
+    from_f32_bits(f32_bits_of(x))
+}
+
+pub fn to_f64(h: i64) -> f64 {
+    f32_from_bits(to_f32_bits(h))
+}

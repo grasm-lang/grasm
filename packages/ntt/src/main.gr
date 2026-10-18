@@ -1,0 +1,116 @@
+// The number-theoretic transform: the FFT over integers modulo a prime,
+// so polynomials and big numbers multiply in O(n log n) with exact
+// answers -- no rounding, unlike `fft`.
+//
+// It needs a prime p = c * 2^k + 1 and a primitive root g; the default is
+// 998244353 = 119 * 2^23 + 1 with g = 3, which transforms up to 2^23
+// points. Iterative, in place: a bit-reversal permutation, then
+// butterflies. Products of two residues stay below 2^62, so every prime
+// must be below 2^31.
+
+type NttField = {
+    p: i64,
+    g: i64,
+}
+
+pub fn default_field() -> NttField {
+    NttField{ p: 998244353, g: 3 }
+}
+
+fn pow_mod(b: i64, e: i64, p: i64) -> i64 {
+    var result = 1
+    var base = b % p
+    var k = e
+    while k > 0 {
+        if k.bit_and(1) == 1 {
+            result = result * base % p
+        }
+        base = base * base % p
+        k = k.ushr(1)
+    }
+    result
+}
+
+/// The transform of `a`, whose length must be a power of two dividing
+/// p - 1; `inverse` undoes it, scaling by 1/n.
+pub fn transform(f: NttField, a: [i64], inverse: bool) -> [i64] {
+    let n = a.len()
+    var x = a.map(|v| ((v % f.p) + f.p) % f.p)
+    var j = 0
+    for i in 1..n {
+        var bit = n.ushr(1)
+        while j.bit_and(bit) != 0 {
+            j = j.bit_xor(bit)
+            bit = bit.ushr(1)
+        }
+        j = j.bit_xor(bit)
+        if i < j {
+            let t = x[i]
+            x[i] = x[j]
+            x[j] = t
+        }
+    }
+    var len = 2
+    while len <= n {
+        var w = pow_mod(f.g, (f.p - 1) / len, f.p)
+        if inverse {
+            w = pow_mod(w, f.p - 2, f.p)
+        }
+        var start = 0
+        while start < n {
+            var wn = 1
+            for k in 0..len / 2 {
+                let u = x[start + k]
+                let v = x[start + k + len / 2] * wn % f.p
+                x[start + k] = (u + v) % f.p
+                x[start + k + len / 2] = (u - v + f.p) % f.p
+                wn = wn * w % f.p
+            }
+            start = start + len
+        }
+        len = len * 2
+    }
+    if inverse {
+        let inv_n = pow_mod(n, f.p - 2, f.p)
+        x = x.map(|v| v * inv_n % f.p)
+    }
+    x
+}
+
+/// The product of two polynomials (coefficients lowest first) mod p.
+pub fn multiply(f: NttField, a: [i64], b: [i64]) -> [i64] {
+    if a.len() == 0 or b.len() == 0 {
+        return []
+    }
+    let want = a.len() + b.len() - 1
+    var n = 1
+    while n < want {
+        n = n * 2
+    }
+    var pa = a
+    var pb = b
+    while pa.len() < n {
+        pa.push(0)
+    }
+    while pb.len() < n {
+        pb.push(0)
+    }
+    let fa = transform(f, pa, false)
+    let fb = transform(f, pb, false)
+    var prod: [i64] = []
+    for i in 0..n {
+        prod.push(fa[i] * fb[i] % f.p)
+    }
+    transform(f, prod, true).slice(0, want)
+}
+
+/// The cyclic convolution of two equal power-of-two-length lists mod p.
+pub fn cyclic(f: NttField, a: [i64], b: [i64]) -> [i64] {
+    let fa = transform(f, a, false)
+    let fb = transform(f, b, false)
+    var prod: [i64] = []
+    for i in 0..a.len() {
+        prod.push(fa[i] * fb[i] % f.p)
+    }
+    transform(f, prod, true)
+}

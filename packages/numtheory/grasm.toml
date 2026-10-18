@@ -1,0 +1,9 @@
+[package]
+name = "numtheory"
+version = "1.0.0"
+
+capabilities = []
+
+[dependencies.primes]
+path = "../primes"
+version = "^1.0.0"

@@ -1,0 +1,40 @@
+[package]
+name = "num_demo"
+version = "1.0.0"
+capabilities = ["io"]
+
+[dependencies.numtheory]
+path = "../numtheory"
+version = "^1.0.0"
+
+[dependencies.contfrac]
+path = "../contfrac"
+version = "^1.0.0"
+
+[dependencies.specialfn]
+path = "../specialfn"
+version = "^1.0.0"
+
+[dependencies.float16]
+path = "../float16"
+version = "^1.0.0"
+
+[dependencies.bfloat16]
+path = "../bfloat16"
+version = "^1.0.0"
+
+[dependencies.complexfn]
+path = "../complexfn"
+version = "^1.0.0"
+
+[dependencies.complexnum]
+path = "../complexnum"
+version = "^1.0.0"
+
+[dependencies.ntt]
+path = "../ntt"
+version = "^1.0.0"
+
+[dependencies.bitops]
+path = "../bitops"
+version = "^1.0.0"

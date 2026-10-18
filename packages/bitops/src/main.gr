@@ -1,0 +1,169 @@
+// Bit manipulation on 64-bit words, every word read as unsigned: what
+// hardware gives as single instructions (POPCNT, LZCNT, TZCNT, RBIT,
+// BSWAP, ROR, PDEP, PEXT) and what hash tables, bitboards, spatial
+// indexes and codecs build from them -- Gray codes, Morton order, the next
+// power of two.
+//
+// Words live in `i64`; every shift right is `ushr`, so the top bit is just
+// another bit.
+
+fn top() -> i64 {
+    -9223372036854775807 - 1
+}
+
+pub fn popcount(x: i64) -> i64 {
+    var n = 0
+    for i in 0..64 {
+        n = n + x.ushr(i).bit_and(1)
+    }
+    n
+}
+
+pub fn parity(x: i64) -> i64 {
+    popcount(x) % 2
+}
+
+/// Leading zeros, 64 for zero.
+pub fn clz(x: i64) -> i64 {
+    if x == 0 {
+        return 64
+    }
+    var n = 0
+    while x.shl(n).bit_and(top()) == 0 {
+        n = n + 1
+    }
+    n
+}
+
+/// Trailing zeros, 64 for zero.
+pub fn ctz(x: i64) -> i64 {
+    if x == 0 {
+        return 64
+    }
+    var n = 0
+    while x.ushr(n).bit_and(1) == 0 {
+        n = n + 1
+    }
+    n
+}
+
+pub fn bit_length(x: i64) -> i64 {
+    64 - clz(x)
+}
+
+pub fn rotl(x: i64, n: i64) -> i64 {
+    let k = ((n % 64) + 64) % 64
+    if k == 0 { x } else { x.shl(k).bit_or(x.ushr(64 - k)) }
+}
+
+pub fn rotr(x: i64, n: i64) -> i64 {
+    rotl(x, 0 - n)
+}
+
+/// The low `width` bits reversed (width 1 to 64); higher bits dropped.
+pub fn reverse(x: i64, width: i64) -> i64 {
+    var out = 0
+    for i in 0..width {
+        out = out.shl(1).bit_or(x.ushr(i).bit_and(1))
+    }
+    out
+}
+
+/// The low `width` bytes in the other order (width 2, 4 or 8).
+pub fn byte_swap(x: i64, width: i64) -> i64 {
+    var out = 0
+    for i in 0..width {
+        out = out.shl(8).bit_or(x.ushr(8 * i).bit_and(255))
+    }
+    out
+}
+
+/// The smallest power of two at least x (unsigned): 1 for 0 and 1, 2^63
+/// (the top bit) up to it, and 0 past it, where none fits.
+pub fn next_power_of_two(x: i64) -> i64 {
+    if x < 0 {
+        return if x == top() { top() } else { 0 }
+    }
+    if x > 4611686018427387904 {
+        return top()
+    }
+    var p = 1
+    while p < x {
+        p = p * 2
+    }
+    p
+}
+
+pub fn is_power_of_two(x: i64) -> bool {
+    x != 0 and (x == top() or x.bit_and(x - 1) == 0)
+}
+
+pub fn gray_encode(x: i64) -> i64 {
+    x.bit_xor(x.ushr(1))
+}
+
+pub fn gray_decode(g: i64) -> i64 {
+    var x = g
+    var shift = 1
+    while shift < 64 {
+        x = x.bit_xor(x.ushr(shift))
+        shift = shift * 2
+    }
+    x
+}
+
+/// Deposits the low bits of x into the positions set in mask (PDEP).
+pub fn deposit(x: i64, mask: i64) -> i64 {
+    var out = 0
+    var k = 0
+    for i in 0..64 {
+        if mask.ushr(i).bit_and(1) == 1 {
+            if x.ushr(k).bit_and(1) == 1 {
+                out = out.bit_or(1.shl(i))
+            }
+            k = k + 1
+        }
+    }
+    out
+}
+
+/// Gathers the bits of x at the positions set in mask, low first (PEXT).
+pub fn extract(x: i64, mask: i64) -> i64 {
+    var out = 0
+    var k = 0
+    for i in 0..64 {
+        if mask.ushr(i).bit_and(1) == 1 {
+            if x.ushr(i).bit_and(1) == 1 {
+                out = out.bit_or(1.shl(k))
+            }
+            k = k + 1
+        }
+    }
+    out
+}
+
+/// Morton order: x's 32 bits in the even positions, y's in the odd.
+pub fn interleave(x: i64, y: i64) -> i64 {
+    deposit(x.bit_and(4294967295), 6148914691236517205).bit_or(deposit(y.bit_and(4294967295), -6148914691236517206))
+}
+
+pub fn deinterleave(z: i64) -> (i64, i64) {
+    (extract(z, 6148914691236517205), extract(z, -6148914691236517206))
+}
+
+/// The lowest set bit alone, 0 for zero.
+pub fn lowest_bit(x: i64) -> i64 {
+    if x == 0 { 0 } else { 1.shl(ctz(x)) }
+}
+
+/// The highest set bit alone, 0 for zero.
+pub fn highest_bit(x: i64) -> i64 {
+    if x == 0 { 0 } else { top().ushr(clz(x)) }
+}
+
+/// Unsigned comparison: -1, 0 or 1.
+pub fn compare_unsigned(a: i64, b: i64) -> i64 {
+    let x = a.bit_xor(top())
+    let y = b.bit_xor(top())
+    if x < y { -1 } else if x > y { 1 } else { 0 }
+}

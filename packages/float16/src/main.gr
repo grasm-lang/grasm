@@ -1,0 +1,93 @@
+// IEEE 754 half precision (binary16): 1 sign bit, 5 exponent bits, 10
+// fraction bits -- the format of GPU textures, ML weights and activations,
+// OpenEXR images, and Python's `struct` format `e`.
+//
+// A half is held as its 16 bits in an `i64`. `from_f64` rounds to nearest,
+// ties to even, as IEEE and Python's `struct.pack('e', ...)` do: values
+// past 65519.99... become infinity, values below the smallest subnormal
+// (2^-24) round to zero or to it, and NaN becomes the quiet NaN 0x7e00
+// with its sign kept. `to_f64` is exact.
+
+fn bits_of(x: f64) -> i64 {
+    x.to_bits()
+}
+
+fn from_bits(b: i64) -> f64 {
+    b.from_bits()
+}
+
+/// Rounds the 53-bit significand `full` right by `shift` bits, to nearest
+/// with ties to even.
+fn round_shift(full: i64, shift: i64) -> i64 {
+    if shift >= 62 {
+        return 0
+    }
+    let q = full.ushr(shift)
+    let rem = full.bit_and(1.shl(shift) - 1)
+    let half = 1.shl(shift - 1)
+    if rem > half or (rem == half and q.bit_and(1) == 1) { q + 1 } else { q }
+}
+
+pub fn from_f64(x: f64) -> i64 {
+    let b = bits_of(x)
+    let sign = if b < 0 { 32768 } else { 0 }
+    let exp = b.ushr(52).bit_and(2047)
+    let mant = b.bit_and(4503599627370495)
+    if exp == 2047 {
+        return sign + if mant == 0 { 31744 } else { 32256 }
+    }
+    if exp == 0 {
+        return sign
+    }
+    let e = exp - 1023
+    let full = mant.bit_or(4503599627370496)
+    if e > 15 {
+        return sign + 31744
+    }
+    if e >= -14 {
+        var q = round_shift(full, 42)
+        var biased = e + 15
+        if q == 2048 {
+            q = 1024
+            biased = biased + 1
+        }
+        if biased >= 31 {
+            return sign + 31744
+        }
+        return sign + biased.shl(10) + (q - 1024)
+    }
+    sign + round_shift(full, 42 + (-14 - e))
+}
+
+/// 2^k as a double, for -1074 <= k <= 1023.
+fn pow2(k: i64) -> f64 {
+    if k >= -1022 { from_bits((k + 1023).shl(52)) } else { from_bits(1.shl(k + 1074)) }
+}
+
+pub fn to_f64(h: i64) -> f64 {
+    let negative = h.bit_and(32768) != 0
+    let exp = h.ushr(10).bit_and(31)
+    let mant = h.bit_and(1023)
+    var v = 0.0
+    if exp == 31 {
+        v = if mant == 0 { 1.0 / 0.0 } else { 0.0 / 0.0 }
+    } else if exp == 0 {
+        v = mant.as_f64() * pow2(-24)
+    } else {
+        v = (mant + 1024).as_f64() * pow2(exp - 25)
+    }
+    if negative { from_bits(bits_of(v).bit_or(-9223372036854775807 - 1)) } else { v }
+}
+
+pub fn is_nan(h: i64) -> bool {
+    h.bit_and(31744) == 31744 and h.bit_and(1023) != 0
+}
+
+pub fn is_infinite(h: i64) -> bool {
+    h.bit_and(32767) == 31744
+}
+
+/// The largest finite half, 65504.
+pub fn max_value() -> f64 {
+    65504.0
+}

@@ -1,0 +1,5 @@
+[package]
+name = "float16"
+version = "1.0.0"
+
+capabilities = []

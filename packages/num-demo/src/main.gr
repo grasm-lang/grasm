@@ -1,0 +1,51 @@
+// The number packages on answers known by heart. scripts/num_diff.sh holds
+// them to Python on eleven thousand cases.
+import numtheory
+import contfrac
+import specialfn
+import float16
+import bfloat16
+import complexfn
+import complexnum
+import ntt
+import bitops
+
+fn near(a: f64, b: f64) -> bool {
+    (a - b).abs() <= 1e-12 * b.abs().max(1.0)
+}
+
+fn main() / {io} {
+    // Fermat: 3^(p-1) = 1 mod p; 2 is a primitive root of 11; the
+    // Chinese remainder theorem's own example, 23.
+    assert_eq(numtheory.mod_pow(3, 1000000006, 1000000007), 1)
+    assert_eq(numtheory.primitive_root(11), 2)
+    assert_eq(numtheory.crt([2, 3, 2], [3, 5, 7]), Some((23, 105)))
+    assert_eq(numtheory.discrete_log(2, 9, 11), 6)
+    assert_eq(numtheory.sqrt_mod(10, 13), Some(6))
+
+    // 355/113, the best approximation of pi with a denominator under 1000.
+    assert_eq(contfrac.limit_denominator(314159265358979, 100000000000000, 1000), (355, 113))
+    assert_eq(contfrac.sqrt_expansion(7), (2, [1, 1, 1, 4]))
+
+    assert_eq(near(specialfn.gamma(5.0), 24.0), true)
+    assert_eq(near(specialfn.gamma(0.5), pi().sqrt()), true)
+    assert_eq(near(specialfn.erf(1.0), 0.8427007929497149), true)
+
+    assert_eq(float16.from_f64(1.0), 15360)
+    assert_eq(float16.from_f64(65520.0), 31744)
+    assert_eq(bfloat16.from_f64(1.0), 16256)
+
+    // sqrt(-1) is i, and the branch cut is taken from the zero's sign.
+    let up = complexfn.sqrt(complexnum.make(-1.0, 0.0))
+    assert_eq((up.re, up.im), (0.0, 1.0))
+    let down = complexfn.sqrt(complexnum.make(-1.0, -0.0))
+    assert_eq(down.im, -1.0)
+
+    // (1 + 2x)(3 + 4x) = 3 + 10x + 8x^2.
+    assert_eq(ntt.multiply(ntt.default_field(), [1, 2], [3, 4]), [3, 10, 8])
+
+    assert_eq(bitops.popcount(255), 8)
+    assert_eq(bitops.deposit(5, 26), 18)
+    assert_eq(bitops.interleave(3, 0), 5)
+    print("num: ok")
+}

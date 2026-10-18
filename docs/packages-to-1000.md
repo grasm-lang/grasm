@@ -240,6 +240,21 @@ day its reference is installed.
 
 ## Landed
 
+- [x] **B6, most of it** — `numtheory` `contfrac` `specialfn` `float16`
+  `bfloat16` `complexfn` `ntt` `bitops`, with the harness `numtest`; the
+  new gate `numdiff` runs 11,453 cases against Python: brute force for
+  number theory, `fractions` for continued fractions, `decimal` for
+  square-root expansions, schoolbook products for the NTT, bit-by-bit
+  definitions, `struct` for half and single precision, `math` and `cmath`
+  within stated tolerances. Found on the way: negating with `0.0 - x`
+  loses the sign of a zero, which put complex `asin(2 + 0i)` on the wrong
+  side of its branch cut; baby-step giant-step kept the first baby step of
+  each value and so could miss the smallest logarithm when the base has
+  small order; and erfc lost 5e-14 near x = 27 to the rounding of x^2,
+  until the square was split as libm splits it. Every control turned its
+  family red, two only after the generator was given small-order bases
+  and exact ties for `limit_denominator`. `decimal` and `bigfloat` remain.
+
 - [x] **B28, first part** — `winpath` `txtar` `httpproxy` `bpf`
   `proxyproto` `maptile`, with the harness `b28test`; the new gate
   `b28diff` runs 3,900 cases against CPython's `ntpath` and, through
@@ -376,7 +391,7 @@ day its reference is installed.
 | | |
 |---|---|
 | At the start | 669 |
-| Now | 770 |
+| Now | 779 |
 | Candidates above | 313 packages in 28 batches, plus `ecc`, `rfc6979` and `goprintf` |
 | Harnesses, one a batch | 28 |
 | If every candidate lands | 1013 |

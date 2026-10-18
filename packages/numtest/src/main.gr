@@ -1,0 +1,233 @@
+// The Grasm side of scripts/num_diff.py. Arguments are integers separated
+// by commas; a double travels as its 64 bits read as an integer, so the
+// driver sees every bit of every answer.
+import numtheory
+import contfrac
+import specialfn
+import float16
+import bfloat16
+import complexfn
+import complexnum
+import ntt
+import bitops
+
+fn ints(text: str) -> [i64] {
+    var out: [i64] = []
+    if text.len() == 0 {
+        return out
+    }
+    for p in text.split(",") {
+        out.push(p.parse_int() ?? 0)
+    }
+    out
+}
+
+fn f(bits: i64) -> f64 {
+    bits.from_bits()
+}
+
+fn show(list: [i64]) -> str {
+    list.map(|x| "{x}").join(",")
+}
+
+fn pair(t: (i64, i64)) -> str {
+    "{t.0},{t.1}"
+}
+
+fn answer_nt(what: str, a: [i64]) -> str {
+    if what == "nt.egcd" {
+        let (g, x, y) = numtheory.egcd(a[0], a[1])
+        return "{g},{x},{y}"
+    }
+    if what == "nt.powmod" {
+        return "{numtheory.mod_pow(a[0], a[1], a[2])}"
+    }
+    if what == "nt.mulmod" {
+        return "{numtheory.mod_mul(a[0], a[1], a[2])}"
+    }
+    if what == "nt.inverse" {
+        return match numtheory.mod_inverse(a[0], a[1]) {
+            Some(v) -> "{v}"
+            None -> "none"
+        }
+    }
+    if what == "nt.crt" {
+        let n = a.len() / 2
+        return match numtheory.crt(a.slice(0, n), a.slice(n, a.len())) {
+            Some(r) -> pair(r)
+            None -> "none"
+        }
+    }
+    if what == "nt.jacobi" {
+        return "{numtheory.jacobi(a[0], a[1])}"
+    }
+    if what == "nt.sqrtmod" {
+        return match numtheory.sqrt_mod(a[0], a[1]) {
+            Some(v) -> "{v}"
+            None -> "none"
+        }
+    }
+    if what == "nt.order" {
+        return "{numtheory.multiplicative_order(a[0], a[1])}"
+    }
+    if what == "nt.root" {
+        return "{numtheory.primitive_root(a[0])}"
+    }
+    if what == "nt.dlog" {
+        return "{numtheory.discrete_log(a[0], a[1], a[2])}"
+    }
+    if what == "nt.carmichael" {
+        return "{numtheory.carmichael(a[0])}"
+    }
+    if what == "nt.mobius" {
+        return "{numtheory.mobius(a[0])}"
+    }
+    if what == "nt.divisors" {
+        return show(numtheory.divisors(a[0]))
+    }
+    if what == "nt.isqrt" {
+        return "{numtheory.isqrt(a[0])}"
+    }
+    if what == "nt.iroot" {
+        return "{numtheory.iroot(a[0], a[1])}"
+    }
+    "{numtheory.is_perfect_power(a[0])}"
+}
+
+fn answer_cf(what: str, a: [i64]) -> str {
+    if what == "cf.of" {
+        let terms = contfrac.of_fraction(a[0], a[1])
+        return show(terms) + "/" + contfrac.convergents(terms).map(|c| pair(c)).join(";") + "/" +
+        pair(contfrac.evaluate(terms))
+    }
+    if what == "cf.limit" {
+        return pair(contfrac.limit_denominator(a[0], a[1], a[2]))
+    }
+    let (a0, period) = contfrac.sqrt_expansion(a[0])
+    "{a0}/" + show(period)
+}
+
+fn answer_bits(what: str, a: [i64]) -> str {
+    let x = a[0]
+    if what == "bit.pop" {
+        return "{bitops.popcount(x)},{bitops.parity(x)},{bitops.clz(x)},{bitops.ctz(x)},{bitops.bit_length(x)}"
+    }
+    if what == "bit.rot" {
+        return "{bitops.rotl(x, a[1])},{bitops.rotr(x, a[1])}"
+    }
+    if what == "bit.rev" {
+        return "{bitops.reverse(x, a[1])},{bitops.byte_swap(x, 2)},{bitops.byte_swap(x, 4)},{bitops.byte_swap(x, 8)}"
+    }
+    if what == "bit.pow2" {
+        return "{bitops.next_power_of_two(x)},{bitops.is_power_of_two(x)},{bitops.lowest_bit(x)},{bitops.highest_bit(x)}"
+    }
+    if what == "bit.gray" {
+        return "{bitops.gray_encode(x)},{bitops.gray_decode(x)}"
+    }
+    if what == "bit.pdep" {
+        return "{bitops.deposit(x, a[1])},{bitops.extract(x, a[1])}"
+    }
+    if what == "bit.morton" {
+        let (p, q) = bitops.deinterleave(x)
+        return "{bitops.interleave(x, a[1])},{p},{q}"
+    }
+    "{bitops.compare_unsigned(x, a[1])}"
+}
+
+fn answer_float(what: str, a: [i64]) -> str {
+    if what == "f16.from" {
+        return "{float16.from_f64(f(a[0]))}"
+    }
+    if what == "f16.to" {
+        return "{float16.to_f64(a[0]).to_bits()}"
+    }
+    if what == "bf.f32" {
+        return "{bfloat16.f32_bits_of(f(a[0]))}"
+    }
+    if what == "bf.f32back" {
+        return "{bfloat16.f32_from_bits(a[0]).to_bits()}"
+    }
+    if what == "bf.from" {
+        return "{bfloat16.from_f32_bits(a[0])}"
+    }
+    if what == "bf.to" {
+        return "{bfloat16.to_f64(a[0]).to_bits()}"
+    }
+    let x = f(a[0])
+    let r = if what == "sf.gamma" { specialfn.gamma(x) } else if what == "sf.lgamma" { specialfn.lgamma(x) } else if what == "sf.erf" {
+        specialfn.erf(x)
+    } else if what == "sf.erfc" { specialfn.erfc(x) } else if what == "sf.expm1" { specialfn.expm1(x) } else if what == "sf.log1p" {
+        specialfn.log1p(x)
+    } else if what == "sf.asinh" { specialfn.asinh(x) } else if what == "sf.exp2" { specialfn.exp2(x) } else {
+        specialfn.beta(x, f(a[1]))
+    }
+    "{r.to_bits()}"
+}
+
+fn cbits(z: Cplx) -> str {
+    "{z.re.to_bits()},{z.im.to_bits()}"
+}
+
+fn answer_cx(what: str, a: [i64]) -> str {
+    let z = complexnum.make(f(a[0]), f(a[1]))
+    let name = what.substr(3, what.len() - 3)
+    if name == "polar" {
+        let (r, p) = complexfn.polar(z)
+        return "{r.to_bits()},{p.to_bits()}"
+    }
+    if name == "rect" {
+        return cbits(complexfn.rect(z.re, z.im))
+    }
+    if name == "logb" {
+        return cbits(complexfn.log_base(z, complexnum.make(f(a[2]), f(a[3]))))
+    }
+    let fns = [("sqrt", |w| complexfn.sqrt(w)), ("log", |w| complexfn.log(w)), ("log10", |w| complexfn.log10(w)),
+        ("exp", |w| complexfn.exp(w)), ("sin", |w| complexfn.sin(w)), ("cos", |w| complexfn.cos(w)),
+        ("tan", |w| complexfn.tan(w)), ("sinh", |w| complexfn.sinh(w)), ("cosh", |w| complexfn.cosh(w)),
+        ("tanh", |w| complexfn.tanh(w)), ("asin", |w| complexfn.asin(w)), ("acos", |w| complexfn.acos(w)),
+        ("atan", |w| complexfn.atan(w)), ("asinh", |w| complexfn.asinh(w)), ("acosh", |w| complexfn.acosh(w)),
+        ("atanh", |w| complexfn.atanh(w))]
+    for (n, g) in fns {
+        if n == name {
+            return cbits(g(z))
+        }
+    }
+    "?"
+}
+
+fn answer(what: str, a: str, b: str) -> str {
+    if what.starts_with("nt.") {
+        return answer_nt(what, ints(a))
+    }
+    if what.starts_with("cf.") {
+        return answer_cf(what, ints(a))
+    }
+    if what.starts_with("bit.") {
+        return answer_bits(what, ints(a))
+    }
+    if what.starts_with("cx.") {
+        return answer_cx(what, ints(a))
+    }
+    if what.starts_with("ntt.") {
+        let field = ntt.default_field()
+        let x = ints(a)
+        let y = ints(b)
+        if what == "ntt.mul" {
+            return show(ntt.multiply(field, x, y))
+        }
+        if what == "ntt.cyc" {
+            return show(ntt.cyclic(field, x, y))
+        }
+        return show(ntt.transform(field, ntt.transform(field, x, false), true))
+    }
+    answer_float(what, ints(a))
+}
+
+fn main() / {io} {
+    let argv = args()
+    var i = 0
+    while i + 2 < argv.len() {
+        print(answer(argv[i], argv[i + 1], argv[i + 2]))
+        i = i + 3
+    }
+}

@@ -1,0 +1,9 @@
+[package]
+name = "complexfn"
+version = "1.0.0"
+
+capabilities = []
+
+[dependencies.complexnum]
+path = "../complexnum"
+version = "^1.0.0"

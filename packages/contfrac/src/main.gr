@@ -1,0 +1,145 @@
+// Continued fractions: a number as a0 + 1/(a1 + 1/(a2 + ...)).
+//
+// Their convergents are the best rational approximations there are --
+// 355/113 for pi, 1.414 as 99/70 -- which is how a gear train, a screen's
+// aspect ratio, a music tuning or a timebase like 30000/1001 gets its
+// numbers, and what Python's `Fraction.limit_denominator` computes.
+// Square roots have periodic expansions, which is how Pell's equation is
+// solved. Integer arithmetic throughout; terms and convergents must fit in
+// 64 bits; the one comparison that would not is made with `bigint`.
+import bigint
+
+/// The terms of num/den, the first floored (so -7/2 is [-4, 2]).
+pub fn of_fraction(num: i64, den: i64) -> [i64] {
+    var out: [i64] = []
+    var a = num
+    var b = den
+    if b < 0 {
+        a = 0 - a
+        b = 0 - b
+    }
+    while b != 0 {
+        var q = a / b
+        if a % b != 0 and a < 0 {
+            q = q - 1
+        }
+        out.push(q)
+        let r = a - q * b
+        a = b
+        b = r
+    }
+    out
+}
+
+/// The convergents h_k/k_k of the terms, in order.
+pub fn convergents(terms: [i64]) -> [(i64, i64)] {
+    var out: [(i64, i64)] = []
+    var (h1, h2) = (1, 0)
+    var (k1, k2) = (0, 1)
+    for a in terms {
+        let h = a * h1 + h2
+        let k = a * k1 + k2
+        out.push((h, k))
+        h2 = h1
+        h1 = h
+        k2 = k1
+        k1 = k
+    }
+    out
+}
+
+/// The value of the terms as a fraction in lowest terms.
+pub fn evaluate(terms: [i64]) -> (i64, i64) {
+    let c = convergents(terms)
+    if c.len() == 0 { (0, 1) } else { c[c.len() - 1] }
+}
+
+/// The closest fraction to num/den with denominator at most `max_den`,
+/// by Python's `Fraction.limit_denominator`: the last convergent or the
+/// best semiconvergent, whichever is nearer (the semiconvergent on a tie).
+pub fn limit_denominator(num: i64, den: i64, max_den: i64) -> (i64, i64) {
+    var n = num
+    var d = den
+    if d < 0 {
+        n = 0 - n
+        d = 0 - d
+    }
+    let g = gcd(if n < 0 { 0 - n } else { n }, d)
+    n = n / g
+    d = d / g
+    if d <= max_den {
+        return (n, d)
+    }
+    var (p0, q0, p1, q1) = (0, 1, 1, 0)
+    var (a, b) = (n, d)
+    while true {
+        let q = floor_div(a, b)
+        let q2 = q0 + q * q1
+        if q2 > max_den {
+            break
+        }
+        let np = p0 + q * p1
+        p0 = p1
+        q0 = q1
+        p1 = np
+        q1 = q2
+        let r = a - q * b
+        a = b
+        b = r
+    }
+    let k = (max_den - q0) / q1
+    let (bp, bq) = (p0 + k * p1, q0 + k * q1)
+    // |bound1 - x| <= |bound2 - x|, compared exactly by cross-multiplying.
+    let e1 = abs_diff(bp, bq, n, d)
+    let e2 = abs_diff(p1, q1, n, d)
+    if compare_ratio(e2.0, e2.1, e1.0, e1.1) <= 0 { (p1, q1) } else { (bp, bq) }
+}
+
+fn gcd(a: i64, b: i64) -> i64 {
+    if b == 0 { a } else { gcd(b, a % b) }
+}
+
+fn floor_div(a: i64, b: i64) -> i64 {
+    let q = a / b
+    if a % b != 0 and ((a < 0) != (b < 0)) { q - 1 } else { q }
+}
+
+fn big(v: i64) -> BigInt {
+    bigint.from_i64(v)
+}
+
+/// |p/q - n/d| as a fraction (numerator, denominator), exactly.
+fn abs_diff(p: i64, q: i64, n: i64, d: i64) -> (BigInt, BigInt) {
+    let num = bigint.sub(bigint.mul(big(p), big(d)), bigint.mul(big(n), big(q)))
+    (if bigint.sign(num) < 0 { bigint.negate(num) } else { num }, bigint.mul(big(q), big(d)))
+}
+
+fn compare_ratio(a: BigInt, b: BigInt, c: BigInt, d: BigInt) -> i64 {
+    bigint.compare(bigint.mul(a, d), bigint.mul(c, b))
+}
+
+/// The continued fraction of sqrt(n): the integer part and the period,
+/// empty when n is a square.
+pub fn sqrt_expansion(n: i64) -> (i64, [i64]) {
+    var a0 = n.as_f64().sqrt().as_i64()
+    while a0 * a0 > n {
+        a0 = a0 - 1
+    }
+    while (a0 + 1) * (a0 + 1) <= n {
+        a0 = a0 + 1
+    }
+    var period: [i64] = []
+    if a0 * a0 == n {
+        return (a0, period)
+    }
+    var m = 0
+    var d = 1
+    var a = a0
+    while a != 2 * a0 {
+        m = d * a - m
+        d = (n - m * m) / d
+        a = (a0 + m) / d
+        period.push(a)
+    }
+    (a0, period)
+}

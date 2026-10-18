@@ -1,0 +1,284 @@
+// Special functions of a real variable: the gamma function and its
+// logarithm, the error function and its complement, the beta function,
+// and the elementary functions that lose accuracy when written naively --
+// exp(x) - 1, log(1 + x), asinh -- and 2^x.
+//
+// The error functions are CPython's own former algorithms: a series with
+// all-positive terms below 1.5, a 50-term continued fraction above.
+// Gamma is Lanczos's approximation (g = 7, nine terms) with reflection,
+// sin(pi x) reduced exactly so that gamma near a negative integer stays
+// accurate. Accuracy is a few units in the last place for erf and a
+// relative 1e-13 or so for gamma; poles and domain errors give what C99
+// says -- gamma(0) is +infinity with the sign of the zero, gamma of a
+// negative integer is NaN, lgamma at any pole is +infinity.
+
+fn sqrtpi() -> f64 {
+    1.772453850905516
+}
+
+fn inf() -> f64 {
+    1.0 / 0.0
+}
+
+fn nan() -> f64 {
+    0.0 / 0.0
+}
+
+fn erf_series(x: f64) -> f64 {
+    let x2 = x * x
+    var acc = 0.0
+    var fk = 25.5
+    for _i in 0..25 {
+        acc = 2.0 + x2 * acc / fk
+        fk = fk - 1.0
+    }
+    acc * x * (0.0 - x2).exp() / sqrtpi()
+}
+
+/// e^(-x^2) without the error of rounding x^2 first: x is split into a
+/// head of 26 bits, whose square is exact, and the rest, so the large
+/// part of the exponent is exact (as fdlibm does). Rounding x^2 would
+/// cost x^2 units in the last place -- 729 of them at x = 27.
+fn exp_neg_square(x: f64) -> f64 {
+    let head = x.to_bits().bit_and(-134217728).from_bits()
+    let tail = x - head
+    (0.0 - head * head).exp() * (0.0 - (2.0 * head * tail + tail * tail)).exp()
+}
+
+/// erfc(x) for x >= 1.5 by continued fraction.
+fn erfc_contfrac(x: f64) -> f64 {
+    if x >= 30.0 {
+        return 0.0
+    }
+    let x2 = x * x
+    var a = 0.0
+    var da = 0.5
+    var p = 1.0
+    var p_last = 0.0
+    var q = da + x2
+    var q_last = 1.0
+    for _i in 0..50 {
+        a = a + da
+        da = da + 2.0
+        let b = da + x2
+        let tp = p
+        p = b * p - a * p_last
+        p_last = tp
+        let tq = q
+        q = b * q - a * q_last
+        q_last = tq
+    }
+    p / q * x * exp_neg_square(x) / sqrtpi()
+}
+
+pub fn erf(x: f64) -> f64 {
+    if x.is_nan() {
+        return x
+    }
+    let ax = x.abs()
+    if ax < 1.5 {
+        return erf_series(x)
+    }
+    let cf = erfc_contfrac(ax)
+    if x > 0.0 { 1.0 - cf } else { cf - 1.0 }
+}
+
+pub fn erfc(x: f64) -> f64 {
+    if x.is_nan() {
+        return x
+    }
+    let ax = x.abs()
+    if ax < 1.5 {
+        return 1.0 - erf_series(x)
+    }
+    let cf = erfc_contfrac(ax)
+    if x > 0.0 { cf } else { 2.0 - cf }
+}
+
+fn lanczos() -> [f64] {
+    [0.99999999999980993, 676.5203681218851, -1259.1392167224028, 771.32342877765313, -176.61502916214059,
+        12.507343278686905, -0.13857109526572012, 9.9843695780195716e-6, 1.5056327351493116e-7]
+}
+
+/// sin(pi x), with x reduced exactly first.
+fn sinpi(x: f64) -> f64 {
+    let y = x.abs() % 2.0
+    let n = (2.0 * y).round().as_i64()
+    let r = y - n.as_f64() / 2.0
+    var v = 0.0
+    if n == 0 {
+        v = (pi() * r).sin()
+    } else if n == 1 {
+        v = (pi() * r).cos()
+    } else if n == 2 {
+        v = (0.0 - (pi() * r)).sin()
+    } else if n == 3 {
+        v = 0.0 - (pi() * r).cos()
+    } else {
+        v = (pi() * r).sin()
+    }
+    if x < 0.0 { 0.0 - v } else { v }
+}
+
+fn is_integer(x: f64) -> bool {
+    x.is_finite() and x.floor() == x
+}
+
+/// For x >= 0.5: (log of the Lanczos sum, t = x - 1 + g + 0.5).
+fn lanczos_parts(x: f64) -> (f64, f64) {
+    let c = lanczos()
+    let z = x - 1.0
+    var a = c[0]
+    for i in 1..9 {
+        a = a + c[i] / (z + i.as_f64())
+    }
+    (a, z + 7.5)
+}
+
+pub fn gamma(x: f64) -> f64 {
+    if x.is_nan() {
+        return x
+    }
+    if not x.is_finite() {
+        return if x > 0.0 { x } else { nan() }
+    }
+    if x == 0.0 {
+        return if x.to_bits() < 0 { 0.0 - inf() } else { inf() }
+    }
+    if x < 0.0 and is_integer(x) {
+        return nan()
+    }
+    if x > 171.7 {
+        return inf()
+    }
+    if x < 0.5 {
+        return pi() / (sinpi(x) * gamma(1.0 - x))
+    }
+    let (a, t) = lanczos_parts(x)
+    let z = x - 1.0
+    // t^(z + 0.5) e^-t, split in two so neither half overflows early.
+    let half = t.ln() * (z + 0.5) / 2.0
+    let p = half.exp()
+    (2.0 * pi()).sqrt() * a * p * (p * (0.0 - t).exp())
+}
+
+pub fn lgamma(x: f64) -> f64 {
+    if x.is_nan() {
+        return x
+    }
+    if not x.is_finite() {
+        return inf()
+    }
+    if is_integer(x) and x <= 0.0 {
+        return inf()
+    }
+    if x == 1.0 or x == 2.0 {
+        return 0.0
+    }
+    if x < 0.5 {
+        return (pi() / sinpi(x).abs()).ln() - lgamma(1.0 - x)
+    }
+    let (a, t) = lanczos_parts(x)
+    let z = x - 1.0
+    0.5 * (2.0 * pi()).ln() + a.ln() + (z + 0.5) * t.ln() - t
+}
+
+/// log(1 + x), accurate for small x.
+pub fn log1p(x: f64) -> f64 {
+    if x.is_nan() or x == inf() {
+        return x
+    }
+    if x == -1.0 {
+        return 0.0 - inf()
+    }
+    if x < -1.0 {
+        return nan()
+    }
+    let u = 1.0 + x
+    if u == 1.0 {
+        return x
+    }
+    u.ln() * x / (u - 1.0)
+}
+
+/// e^x - 1, accurate for small x.
+pub fn expm1(x: f64) -> f64 {
+    if x.is_nan() {
+        return x
+    }
+    if x.abs() < 1e-5 {
+        return x + x * x / 2.0 + x * x * x / 6.0
+    }
+    let u = x.exp()
+    if u == inf() {
+        return u
+    }
+    if u == 1.0 {
+        return x
+    }
+    let um1 = u - 1.0
+    if um1 == -1.0 {
+        return -1.0
+    }
+    um1 * x / u.ln()
+}
+
+pub fn asinh(x: f64) -> f64 {
+    let ax = x.abs()
+    if not ax.is_finite() or ax == 0.0 {
+        return x
+    }
+    var r = 0.0
+    if ax > 268435456.0 {
+        r = ax.ln() + 2.0.ln()
+    } else {
+        r = log1p(ax + ax * ax / (1.0 + (1.0 + ax * ax).sqrt()))
+    }
+    if x < 0.0 { 0.0 - r } else { r }
+}
+
+/// 2^x.
+pub fn exp2(x: f64) -> f64 {
+    if x.is_nan() {
+        return x
+    }
+    if x >= 1024.0 {
+        return inf()
+    }
+    if x < -1075.0 {
+        return 0.0
+    }
+    let n = x.floor()
+    let f = x - n
+    let k = n.as_i64()
+    // 2^f by exp, then the integer power exactly, in two steps so the
+    // subnormal range is reached without an intermediate underflow.
+    var v = (f * 2.0.ln()).exp()
+    var e = k
+    while e > 0 {
+        let step = e.min(1000)
+        v = v * pow2(step)
+        e = e - step
+    }
+    while e < 0 {
+        let step = e.max(-1000)
+        v = v * pow2(step)
+        e = e - step
+    }
+    v
+}
+
+fn pow2(k: i64) -> f64 {
+    (k + 1023).shl(52).from_bits()
+}
+
+/// B(a, b) = Gamma(a) Gamma(b) / Gamma(a + b), through lgamma for a, b > 0.
+pub fn beta(a: f64, b: f64) -> f64 {
+    if a <= 0.0 or b <= 0.0 {
+        return nan()
+    }
+    if a + b < 171.0 {
+        return gamma(a) * gamma(b) / gamma(a + b)
+    }
+    (lgamma(a) + lgamma(b) - lgamma(a + b)).exp()
+}

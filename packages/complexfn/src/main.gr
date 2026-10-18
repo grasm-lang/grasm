@@ -1,0 +1,179 @@
+// The functions of a complex variable that Python's `cmath` has and
+// `complexnum` does not: trigonometric, hyperbolic and inverse, square
+// root and logarithm on their principal branches, log10, phase, polar and
+// rect -- on `complexnum`'s `Cplx`.
+//
+// The inverse functions are W. Kahan's formulas as CPython writes them:
+// built from two square roots so that they are accurate near the branch
+// points and land on the right side of each branch cut -- a cut is read
+// from the sign of the imaginary part, so asin(2 + 0i) and asin(2 - 0i)
+// differ. Arguments of ordinary size only: CPython's scaled paths for
+// magnitudes near the overflow threshold are not reproduced.
+import complexnum
+
+fn c(re: f64, im: f64) -> Cplx {
+    complexnum.make(re, im)
+}
+
+/// -x with the sign of zero kept: `0.0 - x` would turn -0.0 into +0.0,
+/// and the sign of a zero imaginary part picks the side of a branch cut.
+fn neg(x: f64) -> f64 {
+    x * -1.0
+}
+
+fn copysign(magnitude: f64, sign: f64) -> f64 {
+    let m = magnitude.to_bits().bit_and(9223372036854775807)
+    let s = sign.to_bits().bit_and(-9223372036854775807 - 1)
+    m.bit_or(s).from_bits()
+}
+
+fn log1p(x: f64) -> f64 {
+    let u = 1.0 + x
+    if u == 1.0 { x } else { u.ln() * x / (u - 1.0) }
+}
+
+fn real_asinh(x: f64) -> f64 {
+    let ax = x.abs()
+    if ax == 0.0 {
+        return x
+    }
+    let r = if ax > 268435456.0 { ax.ln() + 2.0.ln() } else { log1p(ax + ax * ax / (1.0 + (1.0 + ax * ax).sqrt())) }
+    copysign(r, x)
+}
+
+/// The principal square root, its imaginary part signed like z's.
+pub fn sqrt(z: Cplx) -> Cplx {
+    if z.re == 0.0 and z.im == 0.0 {
+        return c(0.0, z.im)
+    }
+    let ax = z.re.abs() / 8.0
+    let s = 2.0 * (ax + ax.hypot(z.im.abs() / 8.0)).sqrt()
+    let d = z.im.abs() / (2.0 * s)
+    if z.re >= 0.0 { c(s, copysign(d, z.im)) } else { c(d, copysign(s, z.im)) }
+}
+
+/// The principal natural logarithm.
+pub fn log(z: Cplx) -> Cplx {
+    let ax = z.re.abs()
+    let ay = z.im.abs()
+    let h = ax.hypot(ay)
+    var re = h.ln()
+    if h >= 0.71 and h <= 1.73 {
+        let am = ax.max(ay)
+        let an = ax.min(ay)
+        re = log1p((am - 1.0) * (am + 1.0) + an * an) / 2.0
+    }
+    c(re, z.im.atan2(z.re))
+}
+
+pub fn log10(z: Cplx) -> Cplx {
+    let l = log(z)
+    c(l.re / 10.0.ln(), l.im / 10.0.ln())
+}
+
+/// The logarithm to a complex base, log(z) / log(base).
+pub fn log_base(z: Cplx, base: Cplx) -> Cplx {
+    complexnum.div(log(z), log(base))
+}
+
+pub fn exp(z: Cplx) -> Cplx {
+    let m = z.re.exp()
+    c(m * z.im.cos(), m * z.im.sin())
+}
+
+pub fn sinh(z: Cplx) -> Cplx {
+    c(z.re.sinh() * z.im.cos(), z.re.cosh() * z.im.sin())
+}
+
+pub fn cosh(z: Cplx) -> Cplx {
+    c(z.re.cosh() * z.im.cos(), z.re.sinh() * z.im.sin())
+}
+
+pub fn tanh(z: Cplx) -> Cplx {
+    if z.re.abs() > 354.0 {
+        return c(copysign(1.0, z.re), 4.0 * z.im.sin() * z.im.cos() * (-2.0 * z.re.abs()).exp())
+    }
+    let tx = z.re.tanh()
+    let ty = z.im.tan()
+    let cx = 1.0 / z.re.cosh()
+    let txty = tx * ty
+    let denom = 1.0 + txty * txty
+    c(tx * (1.0 + ty * ty) / denom, ty / denom * cx * cx)
+}
+
+/// sin(z) = -i sinh(iz).
+pub fn sin(z: Cplx) -> Cplx {
+    let s = sinh(c(neg(z.im), z.re))
+    c(s.im, neg(s.re))
+}
+
+pub fn cos(z: Cplx) -> Cplx {
+    cosh(c(neg(z.im), z.re))
+}
+
+pub fn tan(z: Cplx) -> Cplx {
+    let t = tanh(c(neg(z.im), z.re))
+    c(t.im, neg(t.re))
+}
+
+pub fn asinh(z: Cplx) -> Cplx {
+    let s1 = sqrt(c(1.0 + z.im, neg(z.re)))
+    let s2 = sqrt(c(1.0 - z.im, z.re))
+    c(real_asinh(s1.re * s2.im - s2.re * s1.im), z.im.atan2(s1.re * s2.re - s1.im * s2.im))
+}
+
+pub fn asin(z: Cplx) -> Cplx {
+    let s = asinh(c(neg(z.im), z.re))
+    c(s.im, neg(s.re))
+}
+
+pub fn acos(z: Cplx) -> Cplx {
+    let s1 = sqrt(c(1.0 - z.re, neg(z.im)))
+    let s2 = sqrt(c(1.0 + z.re, z.im))
+    c(2.0 * s1.re.atan2(s2.re), real_asinh(s2.re * s1.im - s2.im * s1.re))
+}
+
+pub fn acosh(z: Cplx) -> Cplx {
+    let s1 = sqrt(c(z.re - 1.0, z.im))
+    let s2 = sqrt(c(z.re + 1.0, z.im))
+    c(real_asinh(s1.re * s2.re + s1.im * s2.im), 2.0 * s1.im.atan2(s2.re))
+}
+
+pub fn atanh(z: Cplx) -> Cplx {
+    if z.re < 0.0 {
+        let r = atanh(c(neg(z.re), neg(z.im)))
+        return c(neg(r.re), neg(r.im))
+    }
+    let ay = z.im.abs()
+    let one_minus = 1.0 - z.re
+    c(log1p(4.0 * z.re / (one_minus * one_minus + ay * ay)) / 4.0,
+        neg((-2.0 * z.im).atan2(one_minus * (1.0 + z.re) - ay * ay) / 2.0))
+}
+
+pub fn atan(z: Cplx) -> Cplx {
+    let s = atanh(c(neg(z.im), z.re))
+    c(s.im, neg(s.re))
+}
+
+pub fn phase(z: Cplx) -> f64 {
+    z.im.atan2(z.re)
+}
+
+/// (modulus, phase).
+pub fn polar(z: Cplx) -> (f64, f64) {
+    (z.re.hypot(z.im), phase(z))
+}
+
+pub fn rect(r: f64, phi: f64) -> Cplx {
+    c(r * phi.cos(), r * phi.sin())
+}
+
+/// Whether a and b are close, as cmath.isclose: within `rel` of the larger
+/// modulus or within `abs` absolutely.
+pub fn isclose(a: Cplx, b: Cplx, rel: f64, abs: f64) -> bool {
+    if a.re == b.re and a.im == b.im {
+        return true
+    }
+    let d = (a.re - b.re).hypot(a.im - b.im)
+    d <= rel * a.re.hypot(a.im) or d <= rel * b.re.hypot(b.im) or d <= abs
+}

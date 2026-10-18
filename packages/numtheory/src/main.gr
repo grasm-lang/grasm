@@ -1,0 +1,421 @@
+// Number theory on 64-bit integers: the modular arithmetic, residues and
+// roots that hashing, cryptographic toy models, puzzle solvers and
+// competitive programming reach for.
+//
+// `primes` has primality, factoring, gcd, lcm and the totient; this
+// builds on it with the extended Euclidean algorithm, modular powers and
+// inverses (exact for any modulus below 2^62 -- products are formed by
+// doubling rather than overflowing), the Chinese remainder theorem for
+// moduli that need not be coprime, Jacobi and Legendre symbols,
+// Tonelli-Shanks square roots, multiplicative order, primitive roots,
+// discrete logarithms (baby-step giant-step, with the reduction that
+// handles a base sharing factors with the modulus), the Carmichael
+// function, the Mobius function, divisors, and integer roots.
+import primes
+
+pub fn egcd(a: i64, b: i64) -> (i64, i64, i64) {
+    var (r0, r1) = (a, b)
+    var (s0, s1) = (1, 0)
+    var (t0, t1) = (0, 1)
+    while r1 != 0 {
+        let q = floor_div(r0, r1)
+        let (nr, ns, nt) = (r0 - q * r1, s0 - q * s1, t0 - q * t1)
+        r0 = r1
+        r1 = nr
+        s0 = s1
+        s1 = ns
+        t0 = t1
+        t1 = nt
+    }
+    if r0 < 0 { (0 - r0, 0 - s0, 0 - t0) } else { (r0, s0, t0) }
+}
+
+fn floor_div(a: i64, b: i64) -> i64 {
+    let q = a / b
+    if (a % b != 0) and ((a < 0) != (b < 0)) { q - 1 } else { q }
+}
+
+/// `a mod m` in 0..m.
+pub fn modulo(a: i64, m: i64) -> i64 {
+    let r = a % m
+    if r < 0 { r + m } else { r }
+}
+
+/// (a * b) mod m, for m below 2^62.
+pub fn mod_mul(a: i64, b: i64, m: i64) -> i64 {
+    let x = modulo(a, m)
+    let y = modulo(b, m)
+    if m < 2147483648 {
+        return x * y % m
+    }
+    var result = 0
+    var acc = x
+    var k = y
+    while k > 0 {
+        if k.bit_and(1) == 1 {
+            result = result + acc
+            if result >= m {
+                result = result - m
+            }
+        }
+        acc = acc + acc
+        if acc >= m {
+            acc = acc - m
+        }
+        k = k.ushr(1)
+    }
+    result
+}
+
+/// base^exponent mod m, for exponent >= 0.
+pub fn mod_pow(base: i64, exponent: i64, m: i64) -> i64 {
+    if m == 1 {
+        return 0
+    }
+    var result = 1
+    var b = modulo(base, m)
+    var e = exponent
+    while e > 0 {
+        if e.bit_and(1) == 1 {
+            result = mod_mul(result, b, m)
+        }
+        b = mod_mul(b, b, m)
+        e = e.ushr(1)
+    }
+    result
+}
+
+pub fn mod_inverse(a: i64, m: i64) -> Option[i64] {
+    let (g, x, _) = egcd(modulo(a, m), m)
+    if g != 1 { None } else { Some(modulo(x, m)) }
+}
+
+/// The x in 0..lcm with x = r_i (mod m_i) for every i, and the lcm; `None`
+/// when they disagree or the lcm passes 2^62.
+pub fn crt(residues: [i64], moduli: [i64]) -> Option[(i64, i64)] {
+    var x = 0
+    var m = 1
+    for i in 0..residues.len() {
+        let (g, p, _) = egcd(m, moduli[i])
+        let r = modulo(residues[i], moduli[i])
+        if modulo(r - x, g) != 0 {
+            return None
+        }
+        let step = moduli[i] / g
+        if m > 4611686018427387904 / step {
+            return None
+        }
+        let k = mod_mul(modulo(r - x, moduli[i]) / g, p, step)
+        let next = m * step
+        x = modulo(x + mod_mul(m, k, next), next)
+        m = next
+    }
+    Some((x, m))
+}
+
+/// The Jacobi symbol (a/n) for odd n > 0.
+pub fn jacobi(a: i64, n: i64) -> i64 {
+    var x = modulo(a, n)
+    var y = n
+    var result = 1
+    while x != 0 {
+        while x % 2 == 0 {
+            x = x / 2
+            if y % 8 == 3 or y % 8 == 5 {
+                result = 0 - result
+            }
+        }
+        let t = x
+        x = y
+        y = t
+        if x % 4 == 3 and y % 4 == 3 {
+            result = 0 - result
+        }
+        x = x % y
+    }
+    if y == 1 { result } else { 0 }
+}
+
+/// The Legendre symbol (a/p) for an odd prime p: 0, 1 or -1.
+pub fn legendre(a: i64, p: i64) -> i64 {
+    let r = mod_pow(a, (p - 1) / 2, p)
+    if r == p - 1 { -1 } else { r }
+}
+
+/// The smaller square root of a modulo an odd prime p (Tonelli-Shanks),
+/// or `None` when a is not a square.
+pub fn sqrt_mod(a: i64, p: i64) -> Option[i64] {
+    let n = modulo(a, p)
+    if n == 0 {
+        return Some(0)
+    }
+    if p == 2 {
+        return Some(n)
+    }
+    if legendre(n, p) != 1 {
+        return None
+    }
+    var q = p - 1
+    var s = 0
+    while q % 2 == 0 {
+        q = q / 2
+        s = s + 1
+    }
+    var z = 2
+    while legendre(z, p) != -1 {
+        z = z + 1
+    }
+    var m = s
+    var c = mod_pow(z, q, p)
+    var t = mod_pow(n, q, p)
+    var r = mod_pow(n, (q + 1) / 2, p)
+    while t != 1 {
+        var i = 0
+        var t2 = t
+        while t2 != 1 {
+            t2 = mod_mul(t2, t2, p)
+            i = i + 1
+        }
+        let b = mod_pow(c, 1.shl(m - i - 1), p)
+        m = i
+        c = mod_mul(b, b, p)
+        t = mod_mul(t, c, p)
+        r = mod_mul(r, b, p)
+    }
+    Some(r.min(p - r))
+}
+
+fn lcm(a: i64, b: i64) -> i64 {
+    a / primes.gcd(a, b) * b
+}
+
+/// The Carmichael function: the exponent of the group of units mod n.
+pub fn carmichael(n: i64) -> i64 {
+    if n == 1 {
+        return 1
+    }
+    var result = 1
+    var rest = n
+    for p in primes.distinct_factors(n) {
+        var pk = 1
+        var k = 0
+        while rest % p == 0 {
+            rest = rest / p
+            pk = pk * p
+            k = k + 1
+        }
+        var lam = pk / p * (p - 1)
+        if p == 2 and k >= 3 {
+            lam = lam / 2
+        }
+        result = lcm(result, lam)
+    }
+    result
+}
+
+/// The smallest k > 0 with a^k = 1 (mod n); 0 when a is not a unit.
+pub fn multiplicative_order(a: i64, n: i64) -> i64 {
+    if n == 1 {
+        return 1
+    }
+    if primes.gcd(modulo(a, n), n) != 1 {
+        return 0
+    }
+    var order = carmichael(n)
+    for p in primes.distinct_factors(order) {
+        while order % p == 0 and mod_pow(a, order / p, n) == 1 {
+            order = order / p
+        }
+    }
+    order
+}
+
+/// The smallest primitive root modulo n, or -1 when n has none.
+pub fn primitive_root(n: i64) -> i64 {
+    if n == 1 {
+        return 0
+    }
+    let phi = primes.totient(n)
+    if carmichael(n) != phi {
+        return -1
+    }
+    let ps = primes.distinct_factors(phi)
+    for g in 1..n {
+        if primes.gcd(g, n) != 1 {
+            continue
+        }
+        var ok = true
+        for p in ps {
+            if mod_pow(g, phi / p, n) == 1 {
+                ok = false
+            }
+        }
+        if ok {
+            return g
+        }
+    }
+    -1
+}
+
+fn isqrt_ceil(n: i64) -> i64 {
+    let r = isqrt(n)
+    if r * r == n { r } else { r + 1 }
+}
+
+/// The smallest x >= 0 with base^x = target (mod m), or -1.
+pub fn discrete_log(base: i64, target: i64, m: i64) -> i64 {
+    if m == 1 {
+        return 0
+    }
+    var a = modulo(base, m)
+    var b = modulo(target, m)
+    var mod = m
+    var k = 0
+    var t = 1 % mod
+    while true {
+        let g = primes.gcd(a, mod)
+        if g == 1 {
+            break
+        }
+        if b == t {
+            return k
+        }
+        if b % g != 0 {
+            return -1
+        }
+        b = b / g
+        mod = mod / g
+        k = k + 1
+        t = mod_mul(t, a / g, mod)
+        a = modulo(a, mod)
+    }
+    if b == t {
+        return k
+    }
+    let n = isqrt_ceil(mod)
+    var table: Map[i64, i64] = {}
+    var e = b
+    // The largest j for each value: with x = i * n - j, that makes the
+    // first giant step i that hits give the smallest x.
+    for j in 0..n {
+        table.set(e, j)
+        e = mod_mul(e, a, mod)
+    }
+    table.set(e, n)
+    let giant = mod_pow(a, n, mod)
+    var cur = t
+    var best = -1
+    for i in 1..n + 2 {
+        cur = mod_mul(cur, giant, mod)
+        match table.get(cur) {
+            Some(j) -> {
+                let x = i * n - j
+                if x >= 0 and (best < 0 or x < best) and mod_mul(t, mod_pow(a, x, mod), mod) == b {
+                    best = x
+                }
+            }
+            None -> {}
+        }
+        if best >= 0 {
+            break
+        }
+    }
+    if best < 0 { -1 } else { best + k }
+}
+
+pub fn mobius(n: i64) -> i64 {
+    var result = 1
+    var rest = n
+    for p in primes.distinct_factors(n) {
+        rest = rest / p
+        if rest % p == 0 {
+            return 0
+        }
+        result = 0 - result
+    }
+    result
+}
+
+/// The divisors of n > 0, ascending.
+pub fn divisors(n: i64) -> [i64] {
+    var low: [i64] = []
+    var high: [i64] = []
+    var d = 1
+    while d * d <= n {
+        if n % d == 0 {
+            low.push(d)
+            if d != n / d {
+                high.push(n / d)
+            }
+        }
+        d = d + 1
+    }
+    var out = low
+    var i = high.len() - 1
+    while i >= 0 {
+        out.push(high[i])
+        i = i - 1
+    }
+    out
+}
+
+/// The largest r with r * r <= n, for n >= 0.
+pub fn isqrt(n: i64) -> i64 {
+    if n < 2 {
+        return n
+    }
+    var x = n.as_f64().sqrt().as_i64()
+    while x > 3037000499 or x * x > n {
+        x = x - 1
+    }
+    while x + 1 <= 3037000499 and (x + 1) * (x + 1) <= n {
+        x = x + 1
+    }
+    x
+}
+
+/// The largest r with r^k <= n, for n >= 0 and k >= 1.
+pub fn iroot(n: i64, k: i64) -> i64 {
+    if k == 1 or n < 2 {
+        return n
+    }
+    var lo = 0
+    var hi = 1
+    while pow_at_most(hi, k, n) {
+        hi = hi * 2
+    }
+    while hi - lo > 1 {
+        let mid = lo + (hi - lo) / 2
+        if pow_at_most(mid, k, n) { lo = mid } else { hi = mid }
+    }
+    lo
+}
+
+/// Whether r^k <= n, without overflowing.
+fn pow_at_most(r: i64, k: i64, n: i64) -> bool {
+    var acc = 1
+    for _i in 0..k {
+        if r != 0 and acc > n / r {
+            return false
+        }
+        acc = acc * r
+    }
+    acc <= n
+}
+
+/// Whether n = r^k for some r >= 2 and k >= 2.
+pub fn is_perfect_power(n: i64) -> bool {
+    if n < 4 {
+        return false
+    }
+    for k in 2..63 {
+        let r = iroot(n, k)
+        if r < 2 {
+            return false
+        }
+        if pow_at_most(r, k, n) and not pow_at_most(r, k, n - 1) {
+            return true
+        }
+    }
+    false
+}
