@@ -256,6 +256,21 @@ day its reference is installed.
 
 ## Landed
 
+- [x] **B29: modern public-key crypto** — `x448` `ed448` `hpke` `age`, with
+  the harness `b29test`; the new gate `b29diff` runs 2,765 cases against
+  Cloudflare's circl and metacubex/age, from the module cache: X448 over
+  random and non-canonical u-coordinates and small-order points; Ed448 and
+  Ed448ph keys and signatures equal to circl's byte for byte, and circl's
+  verifying here and refused once tampered; HPKE in every KEM, KDF, AEAD
+  and mode, ciphertexts and exported secrets identical both ways; age
+  files in both directions (keys, passphrases, armor, payloads around the
+  64 KiB chunk) and damaged ones refused alike. A 12-byte nonce built by
+  shifting 8i bits put the sequence number in the wrong byte, since shifts
+  wrap at 64; and every field operation in Ed448 rebuilt R^2 mod p from a
+  top-level `let` until the context was threaded through (43 s to 0.15 s).
+  HPKE's export-only mode is refused, circl having none to check it by.
+  One break per package turned it red.
+
 - [x] **B28, third part** — `s2compress` `crc32c` `natpmp` `xmlc14n`, with
   the harness `b28test3`; the new gate `b28cdiff` runs 8,921 cases:
   klauspost/compress's four block encoders and its stream writer read
@@ -527,7 +542,7 @@ day its reference is installed.
 | | |
 |---|---|
 | At the start | 669 |
-| Now | 828 |
+| Now | 834 |
 | Candidates above | 316 packages in 28 batches, plus `ecc`, `rfc6979` and `goprintf` |
 | Harnesses, one a batch | 28 |
 | If every candidate lands | 1016 |

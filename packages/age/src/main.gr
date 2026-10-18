@@ -1,0 +1,472 @@
+// age: the file encryption format of `age` and `rage` (age-encryption.org/v1).
+//
+// age replaced GPG for encrypting a file to someone: sops, chezmoi,
+// Kubernetes sealed secrets, NixOS's agenix and restic-adjacent backup
+// tools store secrets in it. A file is a text header and a binary payload:
+//
+//     age-encryption.org/v1
+//     -> X25519 <ephemeral share>
+//     <the 16-byte file key, wrapped for this recipient>
+//     -> scrypt <salt> <log2 N>
+//     <the file key, wrapped with a passphrase>
+//     --- <HMAC of the header>
+//     <payload>
+//
+// - Each recipient stanza wraps the same random file key with
+//   ChaCha20-Poly1305. An X25519 recipient gets an ephemeral
+//   Diffie-Hellman share and a key from HKDF over the shared secret; a
+//   passphrase recipient gets a key from scrypt with r = 8, p = 1 and a work
+//   factor written in the stanza, and must be the only stanza.
+// - The header ends with an HMAC-SHA256 over everything before it, keyed
+//   from the file key, so a recipient can tell the header was not altered.
+// - The payload is a 16-byte nonce and then the STREAM construction: 64 KiB
+//   chunks sealed with ChaCha20-Poly1305 under a key from HKDF, each nonce an
+//   11-byte counter and a byte that is 1 only on the last chunk, so a file
+//   cut short at a chunk boundary is still refused.
+//
+// Keys are Bech32: `age1...` for recipients and `AGE-SECRET-KEY-1...` for
+// identities. Base64 in the header is unpadded and canonical, wrapped at 64
+// columns. `armor` and `dearmor` are the PEM-like text form.
+//
+// `encrypt` takes its randomness as an argument (the file key, each
+// ephemeral key, each salt and the payload nonce, read in that order), so
+// a caller passes fresh random bytes and a test passes fixed ones.
+//
+// Checked against `github.com/metacubex/age`, a fork of filippo.io/age:
+// files it writes are read here, files written here are read there, and
+// both refuse the same damaged ones.
+import hkdf
+import crypto_hash
+import chachapoly
+import x25519
+import scrypt
+import bech32
+import bytes_codec
+
+type AgeError =
+    | AgeBadKey(why: str)
+    | AgeBadHeader(why: str)
+    | AgeNoMatch
+    | AgeBadMac
+    | AgeBadPayload(why: str)
+    | AgeNotEnoughRandomness
+
+type AgeRecipient =
+    | AgeToKey(public: bytes)
+    | AgeToPassphrase(password: bytes, log_n: i64)
+
+type AgeIdentity =
+    | AgeKey(secret: bytes)
+    | AgePassphrase(password: bytes, max_log_n: i64)
+
+type AgeStanza = { kind: str, args: [str], body: bytes }
+
+let CHUNK = 65536
+
+// --- Keys --------------------------------------------------------------------
+
+/// A public key as an `age1...` recipient.
+pub fn recipient_text(public: bytes) -> str {
+    let groups = bech32.regroup(public.to_list(), 8, 5, true) ?? []
+    return bech32.encode("age", groups, bech32.bech32_constant()) ?? ""
+}
+
+/// A secret key as an `AGE-SECRET-KEY-1...` identity.
+pub fn identity_text(secret: bytes) -> str {
+    let groups = bech32.regroup(secret.to_list(), 8, 5, true) ?? []
+    return (bech32.encode("age-secret-key-", groups, bech32.bech32_constant()) ?? "").to_upper()
+}
+
+fn key_of(text: str, prefix: str) -> bytes ! AgeError {
+    let parts = bech32.decode(text) ?? fail(AgeBadKey("not Bech32"))
+    if parts.prefix != prefix or parts.constant != bech32.bech32_constant() {
+        fail(AgeBadKey("not an age key"))
+    }
+    let data = bech32.regroup(parts.data, 5, 8, false) ?? fail(AgeBadKey("bad padding"))
+    if data.len() != 32 {
+        fail(AgeBadKey("not 32 bytes"))
+    }
+    return bytes_of(data)
+}
+
+/// An `age1...` recipient.
+pub fn parse_recipient(text: str) -> AgeRecipient ! AgeError {
+    return AgeToKey(try key_of(text, "age"))
+}
+
+/// An `AGE-SECRET-KEY-1...` identity; it must be upper case.
+pub fn parse_identity(text: str) -> AgeIdentity ! AgeError {
+    if text.to_upper() != text {
+        fail(AgeBadKey("an identity is written in upper case"))
+    }
+    return AgeKey(try key_of(text, "age-secret-key-"))
+}
+
+/// The recipient an X25519 identity decrypts for.
+pub fn public_of(secret: bytes) -> bytes {
+    return x25519.public_key(secret)
+}
+
+// --- Base64, as age writes it: unpadded, canonical -----------------------------
+
+fn b64(data: bytes) -> str {
+    return bytes_codec.encode_base64(data).replace("=", "")
+}
+
+fn unb64(text: str) -> bytes ! AgeError {
+    if text.contains("=") or text.contains("\n") or text.contains("\r") {
+        fail(AgeBadHeader("non-canonical base64"))
+    }
+    var padded = text
+    while padded.len() % 4 != 0 {
+        padded = padded + "="
+    }
+    let out = bytes_codec.decode_base64(padded) ?? fail(AgeBadHeader("bad base64"))
+    if b64(out) != text {
+        fail(AgeBadHeader("non-canonical base64"))
+    }
+    return out
+}
+
+// --- Header -----------------------------------------------------------------------
+
+fn wrap_lines(text: str) -> str {
+    var out = ""
+    var at = 0
+    while text.len() - at >= 64 {
+        out = out + text.substr(at, 64) + "\n"
+        at = at + 64
+    }
+    return out + text.substr(at, text.len() - at) + "\n"
+}
+
+fn stanza_text(s: AgeStanza) -> str {
+    return "-> " + s.kind + (if s.args.len() > 0 { " " + s.args.join(" ") } else { "" }) + "\n" + wrap_lines(b64(s.body))
+}
+
+fn hmac_key(file_key: bytes) -> bytes {
+    return hkdf.derive(|k, m| crypto_hash.hmac_sha256(k, m), bytes_of([]), file_key, "header".to_bytes(), 32)
+}
+
+fn is_arg_char(c: i64) -> bool {
+    return c >= 33 and c <= 126
+}
+
+/// The header's stanzas, its MAC, the bytes the MAC covers, and where the
+/// payload starts.
+fn parse_header(data: bytes) -> ([AgeStanza], bytes, bytes, i64) ! AgeError {
+    let version = "age-encryption.org/v1\n"
+    if data.len() < version.len() or data.slice(0, version.len()).to_str() != version {
+        fail(AgeBadHeader("not an age file"))
+    }
+    var at = version.len()
+    var stanzas: [AgeStanza] = []
+    while true {
+        let nl = index_from(data, at, 10)
+        if nl < 0 {
+            fail(AgeBadHeader("the header ends without its MAC"))
+        }
+        let line = data.slice(at, nl).to_str()
+        if line.starts_with("--- ") {
+            let mac = try unb64(line.substr(4, line.len() - 4))
+            if mac.len() != 32 {
+                fail(AgeBadHeader("a MAC that is not 32 bytes"))
+            }
+            return (stanzas, mac, data.slice(0, at + 3), nl + 1)
+        }
+        if not line.starts_with("-> ") {
+            fail(AgeBadHeader("a line that is neither a stanza nor the MAC"))
+        }
+        let words = line.substr(3, line.len() - 3).split(" ")
+        for w in words {
+            if w.len() == 0 or not w.codes().all(|c| is_arg_char(c)) {
+                fail(AgeBadHeader("an empty or unprintable stanza argument"))
+            }
+        }
+        at = nl + 1
+        var body = ""
+        while true {
+            let end = index_from(data, at, 10)
+            if end < 0 {
+                fail(AgeBadHeader("a stanza body runs off the header"))
+            }
+            let piece = data.slice(at, end).to_str()
+            if piece.len() > 64 {
+                fail(AgeBadHeader("a body line longer than 64 columns"))
+            }
+            body = body + piece
+            at = end + 1
+            if piece.len() < 64 {
+                break
+            }
+        }
+        stanzas.push(AgeStanza{ kind: words[0], args: words.slice(1, words.len()), body: try unb64(body) })
+    }
+    fail(AgeBadHeader("unreachable"))
+}
+
+fn index_from(data: bytes, from: i64, b: i64) -> i64 {
+    var i = from
+    while i < data.len() {
+        if data.at(i) == b {
+            return i
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+// --- Wrapping the file key ------------------------------------------------------
+
+let X25519_LABEL = "age-encryption.org/v1/X25519"
+let SCRYPT_LABEL = "age-encryption.org/v1/scrypt"
+
+fn zero_nonce() -> bytes {
+    return bytes_of([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+}
+
+fn x25519_wrap_key(secret: bytes, share: bytes, public: bytes) -> bytes ! AgeError {
+    let shared = x25519.scalarmult(secret, share)
+    if shared.to_list().all(|b| b == 0) {
+        fail(AgeBadKey("a share of small order"))
+    }
+    return hkdf.derive(|k, m| crypto_hash.hmac_sha256(k, m), share.concat(public), shared, X25519_LABEL.to_bytes(), 32)
+}
+
+fn scrypt_key(password: bytes, salt: bytes, log_n: i64) -> bytes ! AgeError {
+    var n = 1
+    var i = 0
+    while i < log_n {
+        n = n * 2
+        i = i + 1
+    }
+    return scrypt.derive(password, SCRYPT_LABEL.to_bytes().concat(salt), n, 8, 1, 32) ?? fail(AgeBadKey("a bad work factor"))
+}
+
+fn unwrap(stanza: AgeStanza, id: AgeIdentity, only: bool) -> Option[bytes] ! AgeError {
+    return match id {
+        AgeKey(secret) -> {
+            if stanza.kind != "X25519" {
+                return None
+            }
+            if stanza.args.len() != 1 {
+                fail(AgeBadHeader("an X25519 stanza with the wrong arguments"))
+            }
+            let share = try unb64(stanza.args[0])
+            if share.len() != 32 or stanza.body.len() != 32 {
+                fail(AgeBadHeader("an X25519 stanza of the wrong size"))
+            }
+            let key = try x25519_wrap_key(secret, share, x25519.public_key(secret))
+            match chachapoly.open_combined(key, zero_nonce(), bytes_of([]), stanza.body) {
+                Ok(fk) -> Some(fk)
+                Err(_) -> None
+            }
+        }
+        AgePassphrase(password, max_log_n) -> {
+            if stanza.kind != "scrypt" {
+                return None
+            }
+            if not only {
+                fail(AgeBadHeader("a passphrase stanza alongside others"))
+            }
+            if stanza.args.len() != 2 {
+                fail(AgeBadHeader("a scrypt stanza with the wrong arguments"))
+            }
+            let salt = try unb64(stanza.args[0])
+            let w = stanza.args[1]
+            if salt.len() != 16 or stanza.body.len() != 32 or w.len() == 0 or w.len() > 2 or w.code_at(0) == 48 or
+            not w.codes().all(|c| c >= 48 and c <= 57) {
+                fail(AgeBadHeader("a malformed scrypt stanza"))
+            }
+            let log_n = w.parse_int() ?? 0
+            if log_n > max_log_n {
+                fail(AgeBadKey("a work factor above the limit"))
+            }
+            let key = try scrypt_key(password, salt, log_n)
+            match chachapoly.open_combined(key, zero_nonce(), bytes_of([]), stanza.body) {
+                Ok(fk) -> Some(fk)
+                Err(_) -> None
+            }
+        }
+    }
+}
+
+// --- Payload ------------------------------------------------------------------------
+
+fn chunk_nonce(counter: i64, last: bool) -> bytes {
+    var out: [i64] = [0, 0, 0]
+    var i = 7
+    while i >= 0 {
+        out.push(counter.ushr(8 * i).bit_and(255))
+        i = i - 1
+    }
+    out.push(if last { 1 } else { 0 })
+    return bytes_of(out)
+}
+
+fn payload_key(file_key: bytes, nonce: bytes) -> bytes {
+    return hkdf.derive(|k, m| crypto_hash.hmac_sha256(k, m), nonce, file_key, "payload".to_bytes(), 32)
+}
+
+fn seal_payload(key: bytes, plaintext: bytes) -> bytes {
+    var out = bytes_of([])
+    var at = 0
+    var counter = 0
+    while true {
+        let end = if at + CHUNK < plaintext.len() { at + CHUNK } else { plaintext.len() }
+        let last = end == plaintext.len()
+        out = out.concat(chachapoly.seal_combined(key, chunk_nonce(counter, last), bytes_of([]), plaintext.slice(at, end)))
+        if last {
+            return out
+        }
+        at = end
+        counter = counter + 1
+    }
+    return out
+}
+
+fn open_payload(key: bytes, data: bytes) -> bytes ! AgeError {
+    var out = bytes_of([])
+    var at = 0
+    var counter = 0
+    let full = CHUNK + 16
+    while true {
+        let left = data.len() - at
+        if left < 16 {
+            fail(AgeBadPayload("a chunk shorter than its tag"))
+        }
+        let last = left <= full
+        let piece = data.slice(at, at + (if last { left } else { full }))
+        let plain = match chachapoly.open_combined(key, chunk_nonce(counter, last), bytes_of([]), piece) {
+            Ok(p) -> p
+            Err(_) -> fail(AgeBadPayload("a chunk that does not open"))
+        }
+        if last and plain.len() == 0 and counter > 0 {
+            fail(AgeBadPayload("an empty last chunk after others"))
+        }
+        out = out.concat(plain)
+        if last {
+            return out
+        }
+        at = at + full
+        counter = counter + 1
+    }
+    return out
+}
+
+// --- Encrypt and decrypt -----------------------------------------------------------
+
+fn take(random: bytes, inout at: i64, n: i64) -> bytes ! AgeError {
+    if at + n > random.len() {
+        fail(AgeNotEnoughRandomness)
+    }
+    let out = random.slice(at, at + n)
+    at = at + n
+    return out
+}
+
+/// A file encrypted to recipients, drawing on `random`: 16 bytes for the
+/// file key, 32 for each key recipient, 16 for each passphrase, 16 for the
+/// payload nonce.
+pub fn encrypt(recipients: [AgeRecipient], plaintext: bytes, random: bytes) -> bytes ! AgeError {
+    if recipients.len() == 0 {
+        fail(AgeBadKey("no recipients"))
+    }
+    var at = 0
+    let file_key = try take(random, at, 16)
+    var header = "age-encryption.org/v1\n"
+    for r in recipients {
+        let s = match r {
+            AgeToKey(public) -> {
+                let e = try take(random, at, 32)
+                let share = x25519.public_key(e)
+                let shared = x25519.scalarmult(e, public)
+                if shared.to_list().all(|b| b == 0) {
+                    fail(AgeBadKey("a recipient of small order"))
+                }
+                // The wrap key's salt is the share and the recipient's key.
+                let key = hkdf.derive(|k, m| crypto_hash.hmac_sha256(k, m), share.concat(public), shared, X25519_LABEL.to_bytes(), 32)
+                AgeStanza{ kind: "X25519", args: [b64(share)], body: chachapoly.seal_combined(key, zero_nonce(), bytes_of([]), file_key) }
+            }
+            AgeToPassphrase(password, log_n) -> {
+                if recipients.len() != 1 {
+                    fail(AgeBadKey("a passphrase must be the only recipient"))
+                }
+                let salt = try take(random, at, 16)
+                let key = try scrypt_key(password, salt, log_n)
+                AgeStanza{ kind: "scrypt", args: [b64(salt), "{log_n}"], body: chachapoly.seal_combined(key, zero_nonce(), bytes_of([]), file_key) }
+            }
+        }
+        header = header + stanza_text(s)
+    }
+    header = header + "---"
+    let mac = crypto_hash.hmac_sha256(hmac_key(file_key), header.to_bytes())
+    let nonce = try take(random, at, 16)
+    let body = seal_payload(payload_key(file_key, nonce), plaintext)
+    return (header + " " + b64(mac) + "\n").to_bytes().concat(nonce).concat(body)
+}
+
+/// A file decrypted with any of the identities that matches a stanza.
+pub fn decrypt(identities: [AgeIdentity], file: bytes) -> bytes ! AgeError {
+    let (stanzas, mac, covered, start) = try parse_header(file)
+    var file_key: Option[bytes] = None
+    for id in identities {
+        for s in stanzas {
+            if file_key != None {
+                break
+            }
+            file_key = try unwrap(s, id, stanzas.len() == 1)
+        }
+    }
+    let fk = file_key ?? fail(AgeNoMatch)
+    if not crypto_hash.equal_constant_time(crypto_hash.hmac_sha256(hmac_key(fk), covered), mac) {
+        fail(AgeBadMac)
+    }
+    if file.len() - start < 16 {
+        fail(AgeBadPayload("no payload nonce"))
+    }
+    let nonce = file.slice(start, start + 16)
+    return try open_payload(payload_key(fk, nonce), file.slice(start + 16, file.len()))
+}
+
+// --- Armor -----------------------------------------------------------------------------
+
+let BEGIN = "-----BEGIN AGE ENCRYPTED FILE-----"
+let END = "-----END AGE ENCRYPTED FILE-----"
+
+/// A file in age's ASCII armor.
+pub fn armor(file: bytes) -> str {
+    let text = bytes_codec.encode_base64(file)
+    var out = BEGIN + "\n"
+    var at = 0
+    while at < text.len() {
+        let n = if text.len() - at < 64 { text.len() - at } else { 64 }
+        out = out + text.substr(at, n) + "\n"
+        at = at + n
+    }
+    return out + END + "\n"
+}
+
+/// Armored text back to the file: whitespace around it is allowed, lines
+/// are 64 columns but the last, and the base64 is padded and canonical.
+pub fn dearmor(text: str) -> bytes ! AgeError {
+    let lines = text.trim().replace("\r\n", "\n").split("\n")
+    if lines.len() < 2 or lines[0] != BEGIN or lines[lines.len() - 1] != END {
+        fail(AgeBadHeader("not armored age"))
+    }
+    var body = ""
+    var i = 1
+    while i < lines.len() - 1 {
+        let l = lines[i]
+        if l.len() > 64 or l.len() < 64 and i != lines.len() - 2 {
+            fail(AgeBadHeader("armor lines must be 64 columns but the last"))
+        }
+        body = body + l
+        i = i + 1
+    }
+    let out = bytes_codec.decode_base64(body) ?? fail(AgeBadHeader("bad armor base64"))
+    if bytes_codec.encode_base64(out) != body {
+        fail(AgeBadHeader("non-canonical armor base64"))
+    }
+    return out
+}

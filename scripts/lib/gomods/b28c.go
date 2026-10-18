@@ -77,7 +77,7 @@ func answer3(r request) string {
 	case "natpmp":
 		return natpmpCase(r)
 	}
-	return "UNKNOWN"
+	return answer4(r)
 }
 
 // natpmpCase runs one request through the client against a responder on

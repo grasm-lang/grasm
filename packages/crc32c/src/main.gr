@@ -35,8 +35,6 @@ pub fn table() -> [i64] {
     return t
 }
 
-let TABLE: [i64] = table()
-
 /// A running checksum's starting value.
 pub fn start() -> i64 {
     return 4294967295
@@ -44,10 +42,13 @@ pub fn start() -> i64 {
 
 /// More bytes into a running checksum.
 pub fn update(running: i64, data: bytes) -> i64 {
+    // Built here, once per call: a top-level table would be rebuilt on
+    // every read.
+    let t = table()
     var c = running
     var i = 0
     while i < data.len() {
-        c = TABLE[c.bit_xor(data.at(i)).bit_and(255)].bit_xor(c.ushr(8))
+        c = t[c.bit_xor(data.at(i)).bit_and(255)].bit_xor(c.ushr(8))
         i = i + 1
     }
     return c

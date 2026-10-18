@@ -1,0 +1,20 @@
+[package]
+name = "b29test"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.x448]
+path = "../x448"
+version = "^1.0.0"
+
+[dependencies.ed448]
+path = "../ed448"
+version = "^1.0.0"
+
+[dependencies.hpke]
+path = "../hpke"
+version = "^1.0.0"
+
+[dependencies.age]
+path = "../age"
+version = "^1.0.0"

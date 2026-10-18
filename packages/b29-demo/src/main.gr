@@ -1,0 +1,55 @@
+// X448 key agreement, an Ed448 signature, an HPKE message and an age file.
+// scripts/b29_diff.sh holds them to Cloudflare's circl and metacubex/age.
+import x448
+import ed448
+import hpke
+import age
+
+fn filled(n: i64, v: i64) -> bytes {
+    var out: [i64] = []
+    while out.len() < n {
+        out.push(v)
+    }
+    bytes_of(out)
+}
+
+fn main() / {io} {
+    // Two sides agree on a secret.
+    let a = filled(56, 7)
+    let b = filled(56, 9)
+    let ab = x448.shared(a, x448.public_key(b))
+    let ba = x448.shared(b, x448.public_key(a))
+    assert_eq(ab.secret, ba.secret)
+    assert_eq(ab.all_zero, false)
+
+    // A signature bound to its context.
+    let seed = filled(57, 1)
+    let pk = ed448.public_key(seed) ?? bytes_of([])
+    let sig = ed448.sign(seed, "release 1.0".to_bytes(), "builds".to_bytes()) ?? bytes_of([])
+    assert_eq(ed448.verify(pk, "release 1.0".to_bytes(), sig, "builds".to_bytes()), true)
+    assert_eq(ed448.verify(pk, "release 1.0".to_bytes(), sig, "logins".to_bytes()), false)
+
+    // HPKE base mode, X25519 with ChaCha20-Poly1305.
+    let suite = HpkeSuite{ kem: 32, kdf: 1, aead: 3 }
+    let r = hpke.derive_key_pair(32, filled(32, 3)) ?? panic("key")
+    let none = bytes_of([])
+    match hpke.setup_sender(suite, 0, r.public, "app".to_bytes(), filled(32, 4), none, none, none) {
+        Ok(es) -> {
+            var sender = es.1
+            let ct = hpke.seal(sender, none, "hello".to_bytes()) ?? none
+            var receiver = hpke.setup_receiver(suite, 0, r.private, es.0, "app".to_bytes(), none, none, none) ?? panic("setup")
+            assert_eq(hpke.open(receiver, none, ct) ?? none, "hello".to_bytes())
+        }
+        Err(_) -> panic("the sender could not set up")
+    }
+
+    // An age file to a key, opened with the identity.
+    let secret = filled(32, 5)
+    let id = age.identity_text(secret)
+    let to = age.parse_recipient(age.recipient_text(age.public_of(secret))) ?? panic("recipient")
+    let file = age.encrypt([to], "a secret".to_bytes(), filled(80, 6)) ?? none
+    let me = age.parse_identity(id) ?? panic("identity")
+    assert_eq(age.decrypt([me], file) ?? none, "a secret".to_bytes())
+    assert_eq(age.dearmor(age.armor(file)) ?? none, file)
+    print("b29: ok")
+}

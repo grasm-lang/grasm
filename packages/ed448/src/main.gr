@@ -1,0 +1,312 @@
+// Ed448 (RFC 8032): signatures on the Edwards form of Curve448.
+//
+// Ed25519's larger sibling, at 224-bit security: 57-byte keys, 114-byte
+// signatures, SHAKE256 where Ed25519 has SHA-512. TLS 1.3 and X.509 list it
+// (OID 1.3.101.113), and so do OpenPGP, DNSSEC (algorithm 16) and COSE.
+//
+// - A private key is a 57-byte seed. SHAKE256 stretches it to 114 bytes;
+//   the first 57, with the two lowest bits cleared, the top byte zeroed and
+//   the bit below it set, are the secret scalar, and the rest is a prefix
+//   that makes signing deterministic.
+// - A public key is the scalar times the base point, written as y in 56
+//   little-endian bytes and a last byte holding the low bit of x.
+// - Every hash is prefixed with `dom4`: "SigEd448", a flag, and a context of
+//   up to 255 bytes, so a signature made for one purpose cannot be replayed
+//   for another. Ed448ph signs SHAKE256 of the message (64 bytes) instead
+//   of the message, with the flag set.
+// - Verification checks the cofactored equation [4][S]B = [4]R + [4][k]A,
+//   as RFC 8032 says, and refuses S of L or more.
+//
+// The field is `packages/modarith`; scalars modulo L use `packages/bigint`.
+// Signing walks the secret scalar with a ladder whose steps do not depend
+// on its bits; nothing here is audited for timing.
+//
+// Checked against Cloudflare's circl.
+import modarith
+import sha3
+import bigint
+
+type Ed448Error =
+    | Ed448BadSeed(length: i64)
+    | Ed448BadContext(length: i64)
+
+type Ed448Point = { x: [i64], y: [i64], z: [i64] }
+
+fn unhex(s: str) -> bytes {
+    var out: [i64] = []
+    var i = 0
+    while i + 1 < s.len() {
+        out.push(s.substr(i, 2).parse_int_base(16) ?? 0)
+        i = i + 2
+    }
+    return bytes_of(out)
+}
+
+fn prime() -> bytes {
+    var out: [i64] = []
+    var i = 0
+    while i < 56 {
+        out.push(if i == 27 { 254 } else { 255 })
+        i = i + 1
+    }
+    return bytes_of(out)
+}
+
+let ORDER_HEX = "3fffffffffffffffffffffffffffffffffffffffffffffffffffffff7cca23e9c44edb49aed63690216cc2728dc58f552378c292ab5844f3"
+let SQRT_EXP: bytes = unhex("3fffffffffffffffffffffffffffffffffffffffffffffffffffffffbfffffffffffffffffffffffffffffffffffffffffffffffffffffff")
+
+fn element_be(c: Ed448Ctx, b: bytes) -> [i64] {
+    return modarith.from_bytes(c.f, b)
+}
+
+fn reverse(b: bytes) -> bytes {
+    var out: [i64] = []
+    var i = b.len() - 1
+    while i >= 0 {
+        out.push(b.at(i))
+        i = i - 1
+    }
+    return bytes_of(out)
+}
+
+fn order() -> BigInt {
+    return bigint.from_bytes(unhex(ORDER_HEX))
+}
+
+/// The field and d = -39081, built once per public call: a top-level
+/// `let` would be rebuilt on every read.
+type Ed448Ctx = { f: ModField, d: [i64] }
+
+/// What the arithmetic needs; build it once and pass it along.
+pub fn curve() -> Ed448Ctx {
+    let f = modarith.field(prime()) ?? panic("2^448 - 2^224 - 1 is an odd modulus")
+    return Ed448Ctx{ f: f, d: modarith.sub(f, modarith.zeros(f.limbs), modarith.from_bytes(f, bytes_of([152, 169]))) }
+}
+
+fn identity(c: Ed448Ctx) -> Ed448Point {
+    return Ed448Point{ x: modarith.zeros(c.f.limbs), y: modarith.one(c.f), z: modarith.one(c.f) }
+}
+
+/// The base point.
+pub fn base(c: Ed448Ctx) -> Ed448Point {
+    return Ed448Point{
+        x: element_be(c, unhex("4f1970c66bed0ded221d15a622bf36da9e146570470f1767ea6de324a3d3a46412ae1af72ab66511433b80e18b00938e2626a82bc70cc05e")),
+        y: element_be(c, unhex("693f46716eb6bc248876203756c9c7624bea73736ca3984087789c1e05a0c2d73ad3ff1ce67c39c4fdbd132c4ed7c8ad9808795bf230fa14")),
+        z: modarith.one(c.f) }
+}
+
+/// Two points added (RFC 8032 section 5.2.4; complete, so doubling works).
+pub fn add(c: Ed448Ctx, p: Ed448Point, q: Ed448Point) -> Ed448Point {
+    let a = modarith.mul(c.f, p.z, q.z)
+    let b = modarith.sqr(c.f, a)
+    let cc = modarith.mul(c.f, p.x, q.x)
+    let d = modarith.mul(c.f, p.y, q.y)
+    let e = modarith.mul(c.f, modarith.mul(c.f, c.d, cc), d)
+    let f = modarith.sub(c.f, b, e)
+    let g = modarith.add(c.f, b, e)
+    let h = modarith.mul(c.f, modarith.add(c.f, p.x, p.y), modarith.add(c.f, q.x, q.y))
+    return Ed448Point{ x: modarith.mul(c.f, modarith.mul(c.f, a, f), modarith.sub(c.f, modarith.sub(c.f, h, cc), d)),
+        y: modarith.mul(c.f, modarith.mul(c.f, a, g), modarith.sub(c.f, d, cc)), z: modarith.mul(c.f, f, g) }
+}
+
+/// A point doubled.
+pub fn double(c: Ed448Ctx, p: Ed448Point) -> Ed448Point {
+    let b = modarith.sqr(c.f, modarith.add(c.f, p.x, p.y))
+    let cc = modarith.sqr(c.f, p.x)
+    let d = modarith.sqr(c.f, p.y)
+    let e = modarith.add(c.f, cc, d)
+    let h = modarith.sqr(c.f, p.z)
+    let j = modarith.sub(c.f, e, modarith.add(c.f, h, h))
+    return Ed448Point{ x: modarith.mul(c.f, modarith.sub(c.f, b, e), j), y: modarith.mul(c.f, e, modarith.sub(c.f, cc, d)),
+        z: modarith.mul(c.f, e, j) }
+}
+
+fn select(mask: i64, a: Ed448Point, b: Ed448Point) -> Ed448Point {
+    return Ed448Point{ x: modarith.select(mask, a.x, b.x), y: modarith.select(mask, a.y, b.y), z: modarith.select(mask, a.z, b.z) }
+}
+
+/// A little-endian scalar of any length times a point: a ladder, the same
+/// steps whatever the scalar's bits.
+pub fn mul(c: Ed448Ctx, k: bytes, p: Ed448Point) -> Ed448Point {
+    var r0 = identity(c)
+    var r1 = p
+    var t = k.len() * 8 - 1
+    while t >= 0 {
+        let bit = k.at(t / 8).ushr(t % 8).bit_and(1)
+        let mask = 0 - bit
+        let a = select(mask, r1, r0)
+        let b = select(mask, r0, r1)
+        let sum = add(c, a, b)
+        let twice = double(c, a)
+        r0 = select(mask, sum, twice)
+        r1 = select(mask, twice, sum)
+        t = t - 1
+    }
+    return r0
+}
+
+/// A point as 57 bytes: y little-endian, the low bit of x on top.
+pub fn encode(c: Ed448Ctx, p: Ed448Point) -> bytes {
+    let zi = modarith.inverse_prime(c.f, p.z)
+    let x = reverse(modarith.to_bytes(c.f, modarith.mul(c.f, p.x, zi)))
+    let y = reverse(modarith.to_bytes(c.f, modarith.mul(c.f, p.y, zi)))
+    return y.concat(bytes_of([x.at(0).bit_and(1) * 128]))
+}
+
+fn less_than_p(le: bytes) -> bool {
+    var i = 55
+    let p = reverse(prime())
+    while i >= 0 {
+        if le.at(i) != p.at(i) {
+            return le.at(i) < p.at(i)
+        }
+        i = i - 1
+    }
+    return false
+}
+
+/// 57 bytes to a point, or None when they are not one.
+pub fn decode(c: Ed448Ctx, b: bytes) -> Option[Ed448Point] {
+    if b.len() != 57 or b.at(56).bit_and(127) != 0 {
+        return None
+    }
+    let sign = b.at(56) / 128
+    let yb = b.slice(0, 56)
+    if not less_than_p(yb) {
+        return None
+    }
+    let y = element_be(c, reverse(yb))
+    let one = modarith.one(c.f)
+    let yy = modarith.sqr(c.f, y)
+    let u = modarith.sub(c.f, yy, one)
+    let v = modarith.sub(c.f, modarith.mul(c.f, c.d, yy), one)
+    // x = u^3 v (u^5 v^3)^((p-3)/4)
+    let u2 = modarith.sqr(c.f, u)
+    let u3 = modarith.mul(c.f, u2, u)
+    let u5 = modarith.mul(c.f, u3, u2)
+    let v3 = modarith.mul(c.f, modarith.sqr(c.f, v), v)
+    var x = modarith.mul(c.f, modarith.mul(c.f, u3, v), modarith.pow(c.f, modarith.mul(c.f, u5, v3), SQRT_EXP))
+    if not modarith.equal(modarith.mul(c.f, v, modarith.sqr(c.f, x)), u) {
+        return None
+    }
+    let xb = reverse(modarith.to_bytes(c.f, x))
+    let zero = modarith.is_zero(x)
+    if zero and sign == 1 {
+        return None
+    }
+    if xb.at(0).bit_and(1) != sign {
+        x = modarith.sub(c.f, modarith.zeros(c.f.limbs), x)
+    }
+    return Some(Ed448Point{ x: x, y: y, z: one })
+}
+
+fn equal(c: Ed448Ctx, p: Ed448Point, q: Ed448Point) -> bool {
+    let px = modarith.to_bytes(c.f, modarith.mul(c.f, p.x, q.z))
+    let qx = modarith.to_bytes(c.f, modarith.mul(c.f, q.x, p.z))
+    let py = modarith.to_bytes(c.f, modarith.mul(c.f, p.y, q.z))
+    let qy = modarith.to_bytes(c.f, modarith.mul(c.f, q.y, p.z))
+    return px == qx and py == qy
+}
+
+/// "SigEd448", the prehash flag, and the context.
+fn dom4(prehash: bool, context: bytes) -> bytes {
+    return "SigEd448".to_bytes().concat(bytes_of([if prehash { 1 } else { 0 }, context.len()])).concat(context)
+}
+
+/// A 114-byte hash, little-endian, reduced modulo L, as 57 bytes.
+fn reduce(h: bytes) -> bytes {
+    let n = bigint.rem(bigint.from_bytes(reverse(h)), order()) ?? bigint.zero()
+    return reverse(bigint.to_bytes(n, 57) ?? bytes_of([]))
+}
+
+fn le_big(b: bytes) -> BigInt {
+    return bigint.from_bytes(reverse(b))
+}
+
+/// The secret scalar and the prefix a seed expands to.
+fn expand(seed: bytes) -> (bytes, bytes) {
+    let h = sha3.shake256(seed, 114)
+    var s = h.slice(0, 57).to_list()
+    s[0] = s[0].bit_and(252)
+    s[56] = 0
+    s[55] = s[55].bit_or(128)
+    return (bytes_of(s), h.slice(57, 114))
+}
+
+/// The public key of a 57-byte seed.
+pub fn public_key(seed: bytes) -> bytes ! Ed448Error {
+    if seed.len() != 57 {
+        fail(Ed448BadSeed(seed.len()))
+    }
+    let c = curve()
+    let (s, _prefix) = expand(seed)
+    return encode(c, mul(c, s, base(c)))
+}
+
+fn message_of(message: bytes, prehash: bool) -> bytes {
+    return if prehash { sha3.shake256(message, 64) } else { message }
+}
+
+fn sign_with(seed: bytes, message: bytes, context: bytes, prehash: bool) -> bytes ! Ed448Error {
+    if seed.len() != 57 {
+        fail(Ed448BadSeed(seed.len()))
+    }
+    if context.len() > 255 {
+        fail(Ed448BadContext(context.len()))
+    }
+    let c = curve()
+    let (s, prefix) = expand(seed)
+    let a = encode(c, mul(c, s, base(c)))
+    let m = message_of(message, prehash)
+    let dom = dom4(prehash, context)
+    let r = reduce(sha3.shake256(dom.concat(prefix).concat(m), 114))
+    let rb = encode(c, mul(c, r, base(c)))
+    let k = reduce(sha3.shake256(dom.concat(rb).concat(a).concat(m), 114))
+    let sum = bigint.add(le_big(r), bigint.mul(le_big(k), le_big(s)))
+    let big_s = bigint.rem(sum, order()) ?? bigint.zero()
+    return rb.concat(reverse(bigint.to_bytes(big_s, 57) ?? bytes_of([])))
+}
+
+/// An Ed448 signature (114 bytes) over a message, with a context of up to
+/// 255 bytes (usually empty).
+pub fn sign(seed: bytes, message: bytes, context: bytes) -> bytes ! Ed448Error {
+    return try sign_with(seed, message, context, false)
+}
+
+/// An Ed448ph signature: over SHAKE256 of the message.
+pub fn sign_prehashed(seed: bytes, message: bytes, context: bytes) -> bytes ! Ed448Error {
+    return try sign_with(seed, message, context, true)
+}
+
+fn verify_with(public: bytes, message: bytes, signature: bytes, context: bytes, prehash: bool) -> bool {
+    if signature.len() != 114 or context.len() > 255 {
+        return false
+    }
+    let c = curve()
+    let a = match decode(c, public) {
+        Some(p) -> p
+        None -> return false
+    }
+    let r = match decode(c, signature.slice(0, 57)) {
+        Some(p) -> p
+        None -> return false
+    }
+    let sb = signature.slice(57, 114)
+    if bigint.compare(le_big(sb), order()) >= 0 {
+        return false
+    }
+    let k = reduce(sha3.shake256(dom4(prehash, context).concat(signature.slice(0, 57)).concat(public).concat(message_of(message, prehash)), 114))
+    let lhs = double(c, double(c, mul(c, sb, base(c))))
+    let rhs = double(c, double(c, add(c, r, mul(c, k, a))))
+    return equal(c, lhs, rhs)
+}
+
+/// Whether an Ed448 signature verifies.
+pub fn verify(public: bytes, message: bytes, signature: bytes, context: bytes) -> bool {
+    return verify_with(public, message, signature, context, false)
+}
+
+/// Whether an Ed448ph signature verifies.
+pub fn verify_prehashed(public: bytes, message: bytes, signature: bytes, context: bytes) -> bool {
+    return verify_with(public, message, signature, context, true)
+}

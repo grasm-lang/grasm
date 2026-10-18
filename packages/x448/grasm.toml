@@ -1,0 +1,8 @@
+[package]
+name = "x448"
+version = "1.0.0"
+capabilities = []
+
+[dependencies.modarith]
+path = "../modarith"
+version = "^1.0.0"

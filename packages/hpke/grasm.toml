@@ -1,0 +1,36 @@
+[package]
+name = "hpke"
+version = "1.0.0"
+capabilities = []
+
+[dependencies.hkdf]
+path = "../hkdf"
+version = "^1.0.0"
+
+[dependencies.crypto_hash]
+path = "../crypto_hash"
+version = "^1.0.0"
+
+[dependencies.sha512]
+path = "../sha512"
+version = "^1.0.0"
+
+[dependencies.aes]
+path = "../aes"
+version = "^1.0.0"
+
+[dependencies.chachapoly]
+path = "../chachapoly"
+version = "^1.0.0"
+
+[dependencies.x25519]
+path = "../x25519"
+version = "^1.0.0"
+
+[dependencies.x448]
+path = "../x448"
+version = "^1.0.0"
+
+[dependencies.ecc]
+path = "../ecc"
+version = "^1.0.0"

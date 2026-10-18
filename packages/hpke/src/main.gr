@@ -1,0 +1,315 @@
+// HPKE (RFC 9180): public-key encryption from a KEM, a KDF and an AEAD.
+//
+// Hybrid Public Key Encryption is what Encrypted Client Hello, Oblivious
+// HTTP, MLS and Apple's and Cloudflare's privacy relays encrypt with. A
+// sender who knows a recipient's public key runs a key encapsulation (an
+// ephemeral Diffie-Hellman), derives an AEAD key, a base nonce and an
+// exporter secret from the shared secret with a labelled HKDF schedule, and
+// then seals any number of messages in order, each nonce the base nonce
+// XORed with a sequence number.
+//
+// - KEMs: DHKEM over P-256 (0x0010), P-384 (0x0011) and P-521 (0x0012)
+//   with HKDF over SHA-256, -384 and -512, and over X25519 (0x0020) and
+//   X448 (0x0021) with SHA-256 and SHA-512;
+// - KDFs: HKDF-SHA256 (1), HKDF-SHA384 (2), HKDF-SHA512 (3);
+// - AEADs: AES-128-GCM (1), AES-256-GCM (2), ChaCha20-Poly1305 (3); the
+//   export-only identifier (0xFFFF) is refused, there being nothing here to
+//   hold its schedule to;
+// - modes: base (0), PSK (1), auth (2), where the sender proves its own
+//   static key, and auth-PSK (3).
+//
+// Key pairs are derived deterministically from input keying material
+// (`derive_key_pair`), with the rejection sampling the NIST curves need,
+// and so is the sender's ephemeral key: a caller passes fresh random bytes
+// as `ikm_e`, and a test passes fixed ones to reproduce RFC 9180's vectors.
+// A Diffie-Hellman result of all zeros, or a public key off the curve, is
+// refused.
+//
+// Checked against Cloudflare's circl in every mode and suite, both ways.
+import hkdf
+import crypto_hash
+import sha512
+import aes
+import chachapoly
+import x25519
+import x448
+import ecc
+
+type HpkeError =
+    | HpkeUnsupported(what: str)
+    | HpkeBadKey(why: str)
+    | HpkePskInputs(why: str)
+    | HpkeOpenFailed
+
+type HpkeSuite = { kem: i64, kdf: i64, aead: i64 }
+
+type HpkeKeyPair = { private: bytes, public: bytes }
+
+/// A sender's or receiver's context: what each message is sealed or opened
+/// with, and how many have been.
+type HpkeContext = { suite: HpkeSuite, key: bytes, base_nonce: bytes, exporter: bytes, seq: i64 }
+
+fn hmac_sha384(key: bytes, message: bytes) -> bytes {
+    var k = if key.len() > 128 { sha512.sha384(key).to_list() } else { key.to_list() }
+    while k.len() < 128 {
+        k.push(0)
+    }
+    let inner = bytes_of(k.map(|b| b.bit_xor(54))).concat(message)
+    let outer = bytes_of(k.map(|b| b.bit_xor(92)))
+    return sha512.sha384(outer.concat(sha512.sha384(inner)))
+}
+
+/// The HMAC for a KDF identifier (1, 2, 3) and its output length.
+fn hmac_for(kdf: i64) -> (fn(bytes, bytes) -> bytes, i64) ! HpkeError {
+    if kdf == 1 {
+        return (|k, m| crypto_hash.hmac_sha256(k, m), 32)
+    }
+    if kdf == 2 {
+        return (|k, m| hmac_sha384(k, m), 48)
+    }
+    if kdf == 3 {
+        return (|k, m| sha512.hmac_sha512(k, m), 64)
+    }
+    fail(HpkeUnsupported("KDF {kdf}"))
+}
+
+fn i2osp(v: i64, n: i64) -> bytes {
+    var out: [i64] = []
+    var i = n - 1
+    while i >= 0 {
+        // Shifts wrap at 64 bits, so the bytes above the eighth are zero
+        // rather than a shifted copy.
+        out.push(if i >= 8 { 0 } else { v.ushr(8 * i).bit_and(255) })
+        i = i - 1
+    }
+    return bytes_of(out)
+}
+
+fn labeled_extract(kdf: i64, suite_id: bytes, salt: bytes, label: str, ikm: bytes) -> bytes ! HpkeError {
+    let (h, _n) = try hmac_for(kdf)
+    return hkdf.extract(h, salt, "HPKE-v1".to_bytes().concat(suite_id).concat(label.to_bytes()).concat(ikm))
+}
+
+fn labeled_expand(kdf: i64, suite_id: bytes, prk: bytes, label: str, info: bytes, length: i64) -> bytes ! HpkeError {
+    let (h, _n) = try hmac_for(kdf)
+    let labeled = i2osp(length, 2).concat("HPKE-v1".to_bytes()).concat(suite_id).concat(label.to_bytes()).concat(info)
+    return hkdf.expand(h, prk, labeled, length)
+}
+
+// --- KEMs ----------------------------------------------------------------------
+
+/// A KEM's KDF, shared-secret length, private-key length and curve name.
+fn kem_params(kem: i64) -> (i64, i64, i64, str) ! HpkeError {
+    if kem == 16 {
+        return (1, 32, 32, "P-256")
+    }
+    if kem == 17 {
+        return (2, 48, 48, "P-384")
+    }
+    if kem == 18 {
+        return (3, 64, 66, "P-521")
+    }
+    if kem == 32 {
+        return (1, 32, 32, "X25519")
+    }
+    if kem == 33 {
+        return (3, 64, 56, "X448")
+    }
+    fail(HpkeUnsupported("KEM {kem}"))
+}
+
+fn kem_suite(kem: i64) -> bytes {
+    return "KEM".to_bytes().concat(i2osp(kem, 2))
+}
+
+fn public_of(kem: i64, private: bytes) -> bytes ! HpkeError {
+    let (_kdf, _ns, _nsk, curve) = try kem_params(kem)
+    if curve == "X25519" {
+        return x25519.public_key(private)
+    }
+    if curve == "X448" {
+        return x448.public_key(private)
+    }
+    let c = ecc.curve(curve) ?? fail(HpkeUnsupported(curve))
+    return ecc.encode(c, ecc.base_mul(c, private), false) ?? fail(HpkeBadKey("a private key of zero"))
+}
+
+/// A key pair from input keying material (RFC 9180 section 7.1.3).
+pub fn derive_key_pair(kem: i64, ikm: bytes) -> HpkeKeyPair ! HpkeError {
+    let (kdf, _ns, nsk, curve) = try kem_params(kem)
+    let sid = kem_suite(kem)
+    let prk = try labeled_extract(kdf, sid, bytes_of([]), "dkp_prk", ikm)
+    if curve == "X25519" or curve == "X448" {
+        let sk = try labeled_expand(kdf, sid, prk, "sk", bytes_of([]), nsk)
+        return HpkeKeyPair{ private: sk, public: try public_of(kem, sk) }
+    }
+    let c = ecc.curve(curve) ?? fail(HpkeUnsupported(curve))
+    let mask = if curve == "P-521" { 1 } else { 255 }
+    var counter = 0
+    while counter < 256 {
+        var candidate = (try labeled_expand(kdf, sid, prk, "candidate", i2osp(counter, 1), nsk)).to_list()
+        candidate[0] = candidate[0].bit_and(mask)
+        let sk = bytes_of(candidate)
+        if ecc.scalar_valid(c, sk) {
+            return HpkeKeyPair{ private: sk, public: try public_of(kem, sk) }
+        }
+        counter = counter + 1
+    }
+    fail(HpkeBadKey("no key pair from this material"))
+}
+
+/// Diffie-Hellman with a peer's public key, refused when the result is all
+/// zeros or the key is not a point on the curve.
+fn dh(kem: i64, private: bytes, public: bytes) -> bytes ! HpkeError {
+    let (_kdf, _ns, nsk, curve) = try kem_params(kem)
+    if curve == "X25519" or curve == "X448" {
+        if public.len() != nsk {
+            fail(HpkeBadKey("a public key of the wrong length"))
+        }
+        let out = if curve == "X25519" { x25519.scalarmult(private, public) } else { x448.scalarmult(private, public) }
+        var acc = 0
+        var i = 0
+        while i < out.len() {
+            acc = acc.bit_or(out.at(i))
+            i = i + 1
+        }
+        if acc == 0 {
+            fail(HpkeBadKey("a Diffie-Hellman result of all zeros"))
+        }
+        return out
+    }
+    let c = ecc.curve(curve) ?? fail(HpkeUnsupported(curve))
+    if public.len() != 1 + 2 * ecc.field_size(c) or public.at(0) != 4 {
+        fail(HpkeBadKey("a public key that is not an uncompressed point"))
+    }
+    let point = ecc.decode(c, public) ?? fail(HpkeBadKey("a public key off the curve"))
+    return ecc.affine_x(c, ecc.mul(c, point, private)) ?? fail(HpkeBadKey("a Diffie-Hellman result at infinity"))
+}
+
+fn extract_and_expand(kem: i64, dh_out: bytes, kem_context: bytes) -> bytes ! HpkeError {
+    let (kdf, ns, _nsk, _curve) = try kem_params(kem)
+    let sid = kem_suite(kem)
+    let prk = try labeled_extract(kdf, sid, bytes_of([]), "eae_prk", dh_out)
+    return try labeled_expand(kdf, sid, prk, "shared_secret", kem_context, ns)
+}
+
+// --- Key schedule ----------------------------------------------------------------
+
+/// The AEAD's key and nonce lengths.
+fn aead_params(aead: i64) -> (i64, i64) ! HpkeError {
+    if aead == 1 {
+        return (16, 12)
+    }
+    if aead == 2 or aead == 3 {
+        return (32, 12)
+    }
+    fail(HpkeUnsupported("AEAD {aead}"))
+}
+
+fn suite_id(s: HpkeSuite) -> bytes {
+    return "HPKE".to_bytes().concat(i2osp(s.kem, 2)).concat(i2osp(s.kdf, 2)).concat(i2osp(s.aead, 2))
+}
+
+fn check_psk(mode: i64, psk: bytes, psk_id: bytes) -> () ! HpkeError {
+    let got_psk = psk.len() > 0
+    if got_psk != (psk_id.len() > 0) {
+        fail(HpkePskInputs("a PSK and its identifier come together"))
+    }
+    if got_psk and (mode == 0 or mode == 2) {
+        fail(HpkePskInputs("a PSK in a mode without one"))
+    }
+    if not got_psk and (mode == 1 or mode == 3) {
+        fail(HpkePskInputs("a PSK mode without a PSK"))
+    }
+}
+
+fn key_schedule(s: HpkeSuite, mode: i64, shared: bytes, info: bytes, psk: bytes, psk_id: bytes) -> HpkeContext ! HpkeError {
+    try check_psk(mode, psk, psk_id)
+    let (_h, nh) = try hmac_for(s.kdf)
+    let (nk, nn) = try aead_params(s.aead)
+    let sid = suite_id(s)
+    let empty = bytes_of([])
+    let psk_id_hash = try labeled_extract(s.kdf, sid, empty, "psk_id_hash", psk_id)
+    let info_hash = try labeled_extract(s.kdf, sid, empty, "info_hash", info)
+    let context = bytes_of([mode]).concat(psk_id_hash).concat(info_hash)
+    let secret = try labeled_extract(s.kdf, sid, shared, "secret", psk)
+    let key = try labeled_expand(s.kdf, sid, secret, "key", context, nk)
+    let nonce = try labeled_expand(s.kdf, sid, secret, "base_nonce", context, nn)
+    return HpkeContext{ suite: s, key: key, base_nonce: nonce,
+        exporter: try labeled_expand(s.kdf, sid, secret, "exp", context, nh), seq: 0 }
+}
+
+/// The sender's side: the encapsulated key to send, and the context to seal
+/// with. `ikm_e` is fresh random bytes for the ephemeral key; `sk_s` is the
+/// sender's private key in the auth modes and ignored otherwise.
+pub fn setup_sender(s: HpkeSuite, mode: i64, pk_r: bytes, info: bytes, ikm_e: bytes, psk: bytes, psk_id: bytes,
+    sk_s: bytes) -> (bytes, HpkeContext) ! HpkeError {
+    let eph = try derive_key_pair(s.kem, ikm_e)
+    var dh_out = try dh(s.kem, eph.private, pk_r)
+    var kem_context = eph.public.concat(pk_r)
+    if mode == 2 or mode == 3 {
+        dh_out = dh_out.concat(try dh(s.kem, sk_s, pk_r))
+        kem_context = kem_context.concat(try public_of(s.kem, sk_s))
+    }
+    let shared = try extract_and_expand(s.kem, dh_out, kem_context)
+    return (eph.public, try key_schedule(s, mode, shared, info, psk, psk_id))
+}
+
+/// The receiver's side, from the encapsulated key; `pk_s` is the sender's
+/// public key in the auth modes and ignored otherwise.
+pub fn setup_receiver(s: HpkeSuite, mode: i64, sk_r: bytes, enc: bytes, info: bytes, psk: bytes, psk_id: bytes,
+    pk_s: bytes) -> HpkeContext ! HpkeError {
+    let pk_r = try public_of(s.kem, sk_r)
+    var dh_out = try dh(s.kem, sk_r, enc)
+    var kem_context = enc.concat(pk_r)
+    if mode == 2 or mode == 3 {
+        dh_out = dh_out.concat(try dh(s.kem, sk_r, pk_s))
+        kem_context = kem_context.concat(pk_s)
+    }
+    let shared = try extract_and_expand(s.kem, dh_out, kem_context)
+    return try key_schedule(s, mode, shared, info, psk, psk_id)
+}
+
+fn nonce_for(c: HpkeContext) -> bytes {
+    let seq = i2osp(c.seq, c.base_nonce.len())
+    var out: [i64] = []
+    var i = 0
+    while i < c.base_nonce.len() {
+        out.push(c.base_nonce.at(i).bit_xor(seq.at(i)))
+        i = i + 1
+    }
+    return bytes_of(out)
+}
+
+/// The next message, sealed; the sequence number moves on.
+pub fn seal(inout c: HpkeContext, aad: bytes, plaintext: bytes) -> bytes ! HpkeError {
+    let nonce = nonce_for(c)
+    let out = if c.suite.aead == 3 { chachapoly.seal_combined(c.key, nonce, aad, plaintext) } else {
+        aes.gcm_seal(c.key, nonce, aad, plaintext)
+    }
+    c.seq = c.seq + 1
+    return out
+}
+
+/// The next message, opened; the sequence number moves on only if it opens.
+pub fn open(inout c: HpkeContext, aad: bytes, ciphertext: bytes) -> bytes ! HpkeError {
+    let nonce = nonce_for(c)
+    let out = if c.suite.aead == 3 {
+        match chachapoly.open_combined(c.key, nonce, aad, ciphertext) {
+            Ok(p) -> p
+            Err(_) -> fail(HpkeOpenFailed)
+        }
+    } else {
+        match aes.gcm_open(c.key, nonce, aad, ciphertext) {
+            Ok(p) -> p
+            Err(_) -> fail(HpkeOpenFailed)
+        }
+    }
+    c.seq = c.seq + 1
+    return out
+}
+
+/// A secret derived from the context for another use.
+pub fn export(c: HpkeContext, exporter_context: bytes, length: i64) -> bytes ! HpkeError {
+    return try labeled_expand(c.suite.kdf, suite_id(c.suite), c.exporter, "sec", exporter_context, length)
+}

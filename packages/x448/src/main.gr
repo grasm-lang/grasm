@@ -1,0 +1,152 @@
+// X448 (RFC 7748): Diffie-Hellman on Curve448, the 224-bit-security sibling
+// of X25519.
+//
+// TLS 1.3 offers it as a key-exchange group, HPKE as a KEM (with HKDF over
+// SHA-512), and OpenSSH, Signal's PQXDH predecessors and the CFRG all list it
+// where X25519's 128-bit security margin is thought thin. The arithmetic is
+// X25519's with a different prime, 2^448 - 2^224 - 1, a "Goldilocks" prime
+// chosen so the reduction is cheap, and a different curve constant:
+//
+// - a private key is 56 bytes; the two lowest bits are cleared and the
+//   highest set, so every key is a multiple of the cofactor 4 of the same
+//   length;
+// - a public key is the u-coordinate of that multiple of the base point
+//   u = 5, 56 bytes little-endian;
+// - a shared secret is the u-coordinate of the private key times the
+//   other side's public key, computed with the Montgomery ladder, the same
+//   steps whatever the key's bits.
+//
+// A u-coordinate that is not reduced (2^448 - 2^224 - 1 up to 2^448 - 1)
+// is accepted and reduced, as RFC 7748 requires. A shared secret of all
+// zeros means the other side sent a point of small order; `shared` reports
+// it so a caller can refuse, as RFC 7748 section 6.2 advises.
+//
+// The field arithmetic is `packages/modarith`, whose operations take the
+// same path whatever the values; like `packages/x25519`, nothing here is
+// audited for timing.
+//
+// Checked against Cloudflare's circl.
+import modarith
+
+type X448Shared = { secret: bytes, all_zero: bool }
+
+fn prime() -> bytes {
+    // 2^448 - 2^224 - 1, big-endian: 28 bytes of 0xFF, one 0xFE, 27 of 0xFF.
+    var out: [i64] = []
+    var i = 0
+    while i < 56 {
+        out.push(if i == 27 { 254 } else { 255 })
+        i = i + 1
+    }
+    return bytes_of(out)
+}
+
+/// The field, built once per call: a top-level `let` would be rebuilt on
+/// every read.
+fn field() -> ModField {
+    return modarith.field(prime()) ?? panic("2^448 - 2^224 - 1 is an odd modulus")
+}
+
+fn reverse(b: bytes) -> bytes {
+    var out: [i64] = []
+    var i = b.len() - 1
+    while i >= 0 {
+        out.push(b.at(i))
+        i = i - 1
+    }
+    return bytes_of(out)
+}
+
+fn element(f: ModField, little: bytes) -> [i64] {
+    return modarith.from_bytes(f, reverse(little))
+}
+
+fn encode(f: ModField, x: [i64]) -> bytes {
+    return reverse(modarith.to_bytes(f, x))
+}
+
+/// A private key with the bits RFC 7748 fixes fixed.
+pub fn clamp(secret: bytes) -> bytes {
+    var k = secret.to_list()
+    k[0] = k[0].bit_and(252)
+    k[55] = k[55].bit_or(128)
+    return bytes_of(k)
+}
+
+fn small(f: ModField, v: i64) -> [i64] {
+    return modarith.from_bytes(f, bytes_of([v / 65536, v / 256 % 256, v % 256]))
+}
+
+/// The u-coordinate of `scalar` (56 bytes, clamped here) times the point
+/// with u-coordinate `point` (56 bytes).
+pub fn scalarmult(scalar: bytes, point: bytes) -> bytes {
+    let f = field()
+    let k = clamp(scalar)
+    let u = element(f, point)
+    let a24 = small(f, 39081)
+    var x2 = modarith.one(f)
+    var z2 = modarith.zeros(f.limbs)
+    var x3 = u
+    var z3 = modarith.one(f)
+    var swap = 0
+    var t = 447
+    while t >= 0 {
+        let bit = k.at(t / 8).ushr(t % 8).bit_and(1)
+        swap = swap.bit_xor(bit)
+        let mask = 0 - swap
+        let nx2 = modarith.select(mask, x3, x2)
+        let nx3 = modarith.select(mask, x2, x3)
+        let nz2 = modarith.select(mask, z3, z2)
+        let nz3 = modarith.select(mask, z2, z3)
+        x2 = nx2
+        x3 = nx3
+        z2 = nz2
+        z3 = nz3
+        swap = bit
+        let a = modarith.add(f, x2, z2)
+        let aa = modarith.sqr(f, a)
+        let b = modarith.sub(f, x2, z2)
+        let bb = modarith.sqr(f, b)
+        let e = modarith.sub(f, aa, bb)
+        let c = modarith.add(f, x3, z3)
+        let d = modarith.sub(f, x3, z3)
+        let da = modarith.mul(f, d, a)
+        let cb = modarith.mul(f, c, b)
+        x3 = modarith.sqr(f, modarith.add(f, da, cb))
+        z3 = modarith.mul(f, u, modarith.sqr(f, modarith.sub(f, da, cb)))
+        x2 = modarith.mul(f, aa, bb)
+        z2 = modarith.mul(f, e, modarith.add(f, aa, modarith.mul(f, a24, e)))
+        t = t - 1
+    }
+    let mask = 0 - swap
+    let fx2 = modarith.select(mask, x3, x2)
+    let fz2 = modarith.select(mask, z3, z2)
+    return encode(f, modarith.mul(f, fx2, modarith.inverse_prime(f, fz2)))
+}
+
+/// The base point's u-coordinate, 5.
+pub fn base_point() -> bytes {
+    var out: [i64] = [5]
+    while out.len() < 56 {
+        out.push(0)
+    }
+    return bytes_of(out)
+}
+
+/// A private key's public key.
+pub fn public_key(secret: bytes) -> bytes {
+    return scalarmult(secret, base_point())
+}
+
+/// The shared secret with another side's public key, and whether it came
+/// out all zeros.
+pub fn shared(secret: bytes, public: bytes) -> X448Shared {
+    let s = scalarmult(secret, public)
+    var zero = 0
+    var i = 0
+    while i < s.len() {
+        zero = zero.bit_or(s.at(i))
+        i = i + 1
+    }
+    return X448Shared{ secret: s, all_zero: zero == 0 }
+}

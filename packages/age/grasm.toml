@@ -1,0 +1,32 @@
+[package]
+name = "age"
+version = "1.0.0"
+capabilities = []
+
+[dependencies.hkdf]
+path = "../hkdf"
+version = "^1.0.0"
+
+[dependencies.crypto_hash]
+path = "../crypto_hash"
+version = "^1.0.0"
+
+[dependencies.chachapoly]
+path = "../chachapoly"
+version = "^1.0.0"
+
+[dependencies.x25519]
+path = "../x25519"
+version = "^1.0.0"
+
+[dependencies.scrypt]
+path = "../scrypt"
+version = "^1.0.0"
+
+[dependencies.bech32]
+path = "../bech32"
+version = "^1.0.0"
+
+[dependencies.bytes_codec]
+path = "../bytes"
+version = "^1.0.0"

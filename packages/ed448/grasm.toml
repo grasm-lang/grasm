@@ -1,0 +1,16 @@
+[package]
+name = "ed448"
+version = "1.0.0"
+capabilities = []
+
+[dependencies.modarith]
+path = "../modarith"
+version = "^1.0.0"
+
+[dependencies.sha3]
+path = "../sha3"
+version = "^1.0.0"
+
+[dependencies.bigint]
+path = "../bigint"
+version = "^1.0.0"

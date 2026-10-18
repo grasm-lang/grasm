@@ -1,0 +1,193 @@
+// The Grasm side of scripts/b29_diff.py: `<op> x<hex> x<hex>`, the second
+// argument usually UTF-8 text with fields separated by `|`.
+import x448
+import ed448
+import hpke
+import age
+
+fn from_hex(text: str) -> bytes {
+    var out: [i64] = []
+    var i = 1
+    while i + 1 < text.len() {
+        out.push(text.substr(i, 2).parse_int_base(16) ?? 0)
+        i = i + 2
+    }
+    bytes_of(out)
+}
+
+fn unhex(text: str) -> bytes {
+    from_hex(":" + text)
+}
+
+fn hex(raw: bytes) -> str {
+    let digits = "0123456789abcdef"
+    var out = ""
+    var i = 0
+    while i < raw.len() {
+        out = out + digits.substr(raw.at(i) / 16, 1) + digits.substr(raw.at(i) % 16, 1)
+        i = i + 1
+    }
+    out
+}
+
+fn int(s: str) -> i64 {
+    s.parse_int() ?? 0
+}
+
+fn answer_ed448(what: str, a: bytes, f: [str]) -> str {
+    let ctx = unhex(f[0])
+    let ph = f[1] == "ph"
+    if what == "ed448.pub" {
+        return hex(ed448.public_key(a) ?? bytes_of([]))
+    }
+    if what == "ed448.sign" {
+        let seed = a.slice(0, 57)
+        let msg = a.slice(57, a.len())
+        if ph {
+            return hex(ed448.sign_prehashed(seed, msg, ctx) ?? bytes_of([]))
+        }
+        return hex(ed448.sign(seed, msg, ctx) ?? bytes_of([]))
+    }
+    let pk = a.slice(0, 57)
+    let sig = a.slice(57, 171)
+    let msg = a.slice(171, a.len())
+    let ok = if ph { ed448.verify_prehashed(pk, msg, sig, ctx) } else { ed448.verify(pk, msg, sig, ctx) }
+    if ok { "true" } else { "false" }
+}
+
+fn answer_hpke(what: str, f: [str]) -> str {
+    let suite = HpkeSuite{ kem: int(f[0]), kdf: int(f[1]), aead: int(f[2]) }
+    let mode = int(f[3])
+    if what == "hpke.seal" {
+        // kem|kdf|aead|mode|explen|ikmR|ikmE|ikmS|info|psk|pskid|aad|pt|expctx
+        let r = match hpke.derive_key_pair(suite.kem, unhex(f[5])) {
+            Ok(k) -> k
+            Err(_) -> return "ERR"
+        }
+        let s = match hpke.derive_key_pair(suite.kem, unhex(f[7])) {
+            Ok(k) -> k
+            Err(_) -> return "ERR"
+        }
+        return match hpke.setup_sender(suite, mode, r.public, unhex(f[8]), unhex(f[6]), unhex(f[9]), unhex(f[10]), s.private) {
+            Ok(es) -> {
+                var c = es.1
+                let ct1: bytes ! HpkeError = hpke.seal(c, unhex(f[11]), unhex(f[12]))
+                let ct2: bytes ! HpkeError = hpke.seal(c, unhex(f[11]), unhex(f[12]))
+                let exp = hpke.export(c, unhex(f[13]), int(f[4])) ?? bytes_of([])
+                let c1 = match ct1 {
+                    Ok(x) -> hex(x)
+                    Err(_) -> "-"
+                }
+                let c2 = match ct2 {
+                    Ok(x) -> hex(x)
+                    Err(_) -> "-"
+                }
+                hex(r.public) + "|" + hex(es.0) + "|" + c1 + "|" + c2 + "|" + hex(exp)
+            }
+            Err(_) -> "ERR"
+        }
+    }
+    // kem|kdf|aead|mode|ikmR|ikmS|enc|info|psk|pskid|aad|ct
+    let r = match hpke.derive_key_pair(suite.kem, unhex(f[4])) {
+        Ok(k) -> k
+        Err(_) -> return "ERR"
+    }
+    let s = match hpke.derive_key_pair(suite.kem, unhex(f[5])) {
+        Ok(k) -> k
+        Err(_) -> return "ERR"
+    }
+    match hpke.setup_receiver(suite, mode, r.private, unhex(f[6]), unhex(f[7]), unhex(f[8]), unhex(f[9]), s.public) {
+        Ok(ctx) -> {
+            var c = ctx
+            match hpke.open(c, unhex(f[10]), unhex(f[11])) {
+                Ok(p) -> hex(p)
+                Err(_) -> "ERR"
+            }
+        }
+        Err(_) -> "ERR"
+    }
+}
+
+fn answer_age(what: str, a: bytes, text: str) -> str {
+    if what == "age.key" {
+        return match age.parse_identity(text) {
+            Ok(AgeKey(secret)) -> age.recipient_text(age.public_of(secret)) + "|" + age.identity_text(secret)
+            Ok(_) -> "ERR"
+            Err(_) -> "ERR"
+        }
+    }
+    let lines = text.split("\n")
+    if what == "age.decrypt" {
+        var ids: [AgeIdentity] = []
+        for l in lines {
+            if l.starts_with("scrypt:") {
+                ids.push(AgePassphrase(l.substr(7, l.len() - 7).to_bytes(), 22))
+            } else {
+                match age.parse_identity(l) {
+                    Ok(id) -> ids.push(id)
+                    Err(_) -> return "ERR"
+                }
+            }
+        }
+        var file = a
+        let lead = a.to_str().trim()
+        if lead.starts_with("-----BEGIN AGE ENCRYPTED FILE-----") {
+            file = match age.dearmor(a.to_str()) {
+                Ok(f) -> f
+                Err(_) -> return "ERR"
+            }
+        }
+        return match age.decrypt(ids, file) {
+            Ok(p) -> hex(p)
+            Err(_) -> "ERR"
+        }
+    }
+    // age.encrypt: armor|random hex, then recipients, one per line
+    let head = lines[0].split("|")
+    var recips: [AgeRecipient] = []
+    var i = 1
+    while i < lines.len() {
+        let l = lines[i]
+        if l.starts_with("scrypt:") {
+            let parts = l.split(":")
+            recips.push(AgeToPassphrase(parts[1].to_bytes(), int(parts[2])))
+        } else {
+            match age.parse_recipient(l) {
+                Ok(r) -> recips.push(r)
+                Err(_) -> return "ERR"
+            }
+        }
+        i = i + 1
+    }
+    match age.encrypt(recips, a, unhex(head[1])) {
+        Ok(file) -> if head[0] == "armor" { hex(age.armor(file).to_bytes()) } else { hex(file) }
+        Err(_) -> "ERR"
+    }
+}
+
+fn answer(what: str, a: bytes, b: bytes) -> str {
+    let text = b.to_str()
+    if what == "x448" {
+        let s = x448.shared(a.slice(0, 56), a.slice(56, 112))
+        return hex(s.secret) + "|" + (if s.all_zero { "false" } else { "true" })
+    }
+    if what == "x448.pub" {
+        return hex(x448.public_key(a))
+    }
+    if what.starts_with("ed448") {
+        return answer_ed448(what, a, text.split("|"))
+    }
+    if what.starts_with("hpke") {
+        return answer_hpke(what, text.split("|"))
+    }
+    answer_age(what, a, text)
+}
+
+fn main() / {io} {
+    let argv = args()
+    var i = 0
+    while i + 2 < argv.len() {
+        print(answer(argv[i], from_hex(argv[i + 1]), from_hex(argv[i + 2])))
+        i = i + 3
+    }
+}
