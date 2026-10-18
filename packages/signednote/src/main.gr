@@ -1,0 +1,285 @@
+// Signed notes: the text format the Go checksum database, Sigstore's
+// witnesses and the transparency-log ecosystem sign tree heads with.
+//
+// A note is UTF-8 text ending in a newline, a blank line, and one line per
+// signature:
+//
+//     go.sum database tree
+//     31897089
+//     xB1nDQ3uO6c3Ixa3QZ5qkEp0Du1Ae5jsCwAvbJrhEiA=
+//
+//     — sum.golang.org Az3grh6U8kMeBwOkiBEU+81YnGvo2IffK8MdmONBA2cnZOFhEgTrTfj9...
+//
+// Each signature line is an em dash, the key's name, and base64 of a
+// 4-byte key hash followed by the signature over the text. A key is named
+// and identified by that hash, the first four bytes of SHA-256 of the name,
+// a newline and the key, so a reader holding several keys knows which one
+// a line claims. Keys are written `name+hash+base64(algorithm, key)`, and a
+// signing key `PRIVATE+KEY+name+hash+base64(algorithm, seed)`; algorithm 1
+// is Ed25519, the only one defined.
+//
+// `open` follows `golang.org/x/mod/sumdb/note`: a note with a control
+// character or invalid UTF-8, a signature line out of form, or more than
+// 100 signatures is malformed; signatures from keys it does not hold are
+// kept as unverified (each distinct line once); a signature from a key it
+// holds must verify; and a note with no verified signature is an error
+// that still carries the note.
+//
+// Checked against golang.org/x/mod/sumdb/note.
+import crypto_hash
+import ed25519
+import bytes_codec
+
+type NoteSig = { name: str, hash: i64, b64: str }
+
+type NoteOpened = { text: str, sigs: [NoteSig], unverified: [NoteSig] }
+
+type NoteError =
+    | NoteMalformed(why: str)
+    | NoteBadKey(why: str)
+    | NoteInvalidSignature(name: str, hash: i64)
+    | NoteUnverified(note: NoteOpened)
+    | NoteAmbiguous(name: str, hash: i64)
+
+type NoteVerifier = { name: str, hash: i64, public: bytes }
+
+type NoteSigner = { name: str, hash: i64, seed: bytes }
+
+fn key_hash(name: str, key: bytes) -> i64 {
+    let h = crypto_hash.sha256_of(name.to_bytes().concat(bytes_of([10])).concat(key))
+    return h.at(0) * 16777216 + h.at(1) * 65536 + h.at(2) * 256 + h.at(3)
+}
+
+fn hex8(v: i64) -> str {
+    let d = "0123456789abcdef"
+    var out = ""
+    var i = 7
+    while i >= 0 {
+        out = out + d.substr(v.ushr(4 * i).bit_and(15), 1)
+        i = i - 1
+    }
+    return out
+}
+
+fn is_space(c: i64) -> bool {
+    return c == 32 or c >= 9 and c <= 13 or c == 133 or c == 160 or c == 5760 or c >= 8192 and c <= 8202 or c == 8232 or
+    c == 8233 or c == 8239 or c == 8287 or c == 12288
+}
+
+fn valid_name(name: str) -> bool {
+    return name.len() > 0 and not name.contains("+") and not name.codes().any(|c| is_space(c))
+}
+
+/// A new key pair from a 32-byte seed: the signing key and the verifier key.
+pub fn generate_key(seed: bytes, name: str) -> (str, str) ! NoteError {
+    if seed.len() != 32 or not valid_name(name) {
+        fail(NoteBadKey("a 32-byte seed and a name without spaces or '+'"))
+    }
+    let public = bytes_of([1]).concat(ed25519.public_key(seed) ?? fail(NoteBadKey("bad seed")))
+    let h = hex8(key_hash(name, public))
+    return ("PRIVATE+KEY+" + name + "+" + h + "+" + bytes_codec.encode_base64(bytes_of([1]).concat(seed)),
+        name + "+" + h + "+" + bytes_codec.encode_base64(public))
+}
+
+fn cut(s: str, sep: str) -> (str, str) {
+    let i = s.index_of(sep) ?? -1
+    return if i < 0 { (s, "") } else { (s.substr(0, i), s.substr(i + sep.len(), s.len() - i - sep.len())) }
+}
+
+fn parse_hex8(s: str) -> i64 {
+    if s.len() != 8 {
+        return 0 - 1
+    }
+    return s.parse_int_base(16) ?? -1
+}
+
+/// A verifier key, `name+hash+key`.
+pub fn parse_verifier(vkey: str) -> NoteVerifier ! NoteError {
+    let (name, rest) = cut(vkey, "+")
+    let (hash16, key64) = cut(rest, "+")
+    let hash = parse_hex8(hash16)
+    let key = bytes_codec.decode_base64_go(key64) ?? fail(NoteBadKey("malformed verifier id"))
+    if hash < 0 or not valid_name(name) or key.len() == 0 {
+        fail(NoteBadKey("malformed verifier id"))
+    }
+    if hash != key_hash(name, key) {
+        fail(NoteBadKey("invalid verifier hash"))
+    }
+    if key.at(0) != 1 {
+        fail(NoteBadKey("unknown verifier algorithm"))
+    }
+    if key.len() != 33 {
+        fail(NoteBadKey("malformed verifier id"))
+    }
+    return NoteVerifier{ name: name, hash: hash, public: key.slice(1, 33) }
+}
+
+/// A signing key, `PRIVATE+KEY+name+hash+key`.
+pub fn parse_signer(skey: str) -> NoteSigner ! NoteError {
+    let (p1, r1) = cut(skey, "+")
+    let (p2, r2) = cut(r1, "+")
+    let (name, r3) = cut(r2, "+")
+    let (hash16, key64) = cut(r3, "+")
+    let hash = parse_hex8(hash16)
+    let key = bytes_codec.decode_base64_go(key64) ?? fail(NoteBadKey("malformed signer id"))
+    if p1 != "PRIVATE" or p2 != "KEY" or hash < 0 or not valid_name(name) or key.len() == 0 {
+        fail(NoteBadKey("malformed signer id"))
+    }
+    if key.at(0) != 1 {
+        fail(NoteBadKey("unknown signer algorithm"))
+    }
+    if key.len() != 33 {
+        fail(NoteBadKey("malformed signer id"))
+    }
+    let seed = key.slice(1, 33)
+    let public = bytes_of([1]).concat(ed25519.public_key(seed) ?? fail(NoteBadKey("bad seed")))
+    if hash != key_hash(name, public) {
+        fail(NoteBadKey("invalid signer hash"))
+    }
+    return NoteSigner{ name: name, hash: hash, seed: seed }
+}
+
+fn be4(h: i64) -> bytes {
+    return bytes_of([h.ushr(24).bit_and(255), h.ushr(16).bit_and(255), h.ushr(8).bit_and(255), h.bit_and(255)])
+}
+
+let DASH = "\u{2014} "
+
+/// Text signed by each signer: the text, a blank line, a line per signature.
+pub fn sign(text: str, signers: [NoteSigner]) -> str ! NoteError {
+    if not text.ends_with("\n") {
+        fail(NoteMalformed("the text must end in a newline"))
+    }
+    var lines = ""
+    for s in signers {
+        if not valid_name(s.name) {
+            fail(NoteBadKey("invalid signer"))
+        }
+        let sig = ed25519.sign(s.seed, text.to_bytes()) ?? fail(NoteBadKey("bad seed"))
+        lines = lines + DASH + s.name + " " + bytes_codec.encode_base64(be4(s.hash).concat(sig)) + "\n"
+    }
+    return text + "\n" + lines
+}
+
+/// Whether bytes are UTF-8 with no control character but newline.
+fn clean(msg: bytes) -> bool {
+    var i = 0
+    let n = msg.len()
+    while i < n {
+        let b = msg.at(i)
+        if b < 32 and b != 10 {
+            return false
+        }
+        if b < 128 {
+            i = i + 1
+            continue
+        }
+        var need = 0
+        var low = 128
+        var high = 191
+        if b >= 194 and b <= 223 {
+            need = 1
+        } else if b >= 224 and b <= 239 {
+            need = 2
+            low = if b == 224 { 160 } else { 128 }
+            high = if b == 237 { 159 } else { 191 }
+        } else if b >= 240 and b <= 244 {
+            need = 3
+            low = if b == 240 { 144 } else { 128 }
+            high = if b == 244 { 143 } else { 191 }
+        } else {
+            return false
+        }
+        if i + need >= n {
+            return false
+        }
+        var k = 1
+        while k <= need {
+            let c = msg.at(i + k)
+            if k == 1 and (c < low or c > high) or k > 1 and (c < 128 or c > 191) {
+                return false
+            }
+            k = k + 1
+        }
+        i = i + need + 1
+    }
+    return true
+}
+
+fn last_blank_line(msg: bytes) -> i64 {
+    var i = msg.len() - 2
+    while i >= 0 {
+        if msg.at(i) == 10 and msg.at(i + 1) == 10 {
+            return i
+        }
+        i = i - 1
+    }
+    return 0 - 1
+}
+
+/// A signed note, checked against the verifiers held.
+pub fn open(msg: bytes, verifiers: [NoteVerifier]) -> NoteOpened ! NoteError {
+    if not clean(msg) {
+        fail(NoteMalformed("a control character or invalid UTF-8"))
+    }
+    let split = last_blank_line(msg)
+    if split < 0 {
+        fail(NoteMalformed("no blank line before the signatures"))
+    }
+    let text = msg.slice(0, split + 1)
+    let sigs = msg.slice(split + 2, msg.len())
+    if sigs.len() == 0 or sigs.at(sigs.len() - 1) != 10 {
+        fail(NoteMalformed("the signatures must end in a newline"))
+    }
+    var note = NoteOpened{ text: text.to_str(), sigs: [], unverified: [] }
+    var seen: Map[str, bool] = {}
+    var seen_lines: Map[str, bool] = {}
+    var count = 0
+    let all_lines = sigs.to_str().split("\n")
+    // The last piece is what follows the final newline: nothing.
+    for line in all_lines.slice(0, all_lines.len() - 1) {
+        if not line.starts_with(DASH) {
+            fail(NoteMalformed("a signature line without its dash"))
+        }
+        let body = line.substr(2, line.len() - 2)
+        let (name, b64) = cut(body, " ")
+        let raw = bytes_codec.decode_base64_go(b64) ?? fail(NoteMalformed("bad base64"))
+        if not valid_name(name) or b64.len() == 0 or raw.len() < 5 {
+            fail(NoteMalformed("a bad signature line"))
+        }
+        let hash = raw.at(0) * 16777216 + raw.at(1) * 65536 + raw.at(2) * 256 + raw.at(3)
+        count = count + 1
+        if count > 100 {
+            fail(NoteMalformed("more than 100 signatures"))
+        }
+        var matches: [NoteVerifier] = []
+        for v in verifiers {
+            if v.name == name and v.hash == hash {
+                matches.push(v)
+            }
+        }
+        if matches.len() == 0 {
+            if not seen_lines.has(body) {
+                seen_lines.set(body, true)
+                note.unverified.push(NoteSig{ name: name, hash: hash, b64: b64 })
+            }
+            continue
+        }
+        if matches.len() > 1 {
+            fail(NoteAmbiguous(name, hash))
+        }
+        let key = name + "+" + hex8(hash)
+        if seen.has(key) {
+            continue
+        }
+        seen.set(key, true)
+        if not ed25519.verify(matches[0].public, text, raw.slice(4, raw.len())) {
+            fail(NoteInvalidSignature(name, hash))
+        }
+        note.sigs.push(NoteSig{ name: name, hash: hash, b64: b64 })
+    }
+    if note.sigs.len() == 0 {
+        fail(NoteUnverified(note))
+    }
+    return note
+}

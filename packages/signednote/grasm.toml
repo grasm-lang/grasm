@@ -1,0 +1,16 @@
+[package]
+name = "signednote"
+version = "1.0.0"
+capabilities = []
+
+[dependencies.crypto_hash]
+path = "../crypto_hash"
+version = "^1.0.0"
+
+[dependencies.ed25519]
+path = "../ed25519"
+version = "^1.0.0"
+
+[dependencies.bytes_codec]
+path = "../bytes"
+version = "^1.0.0"

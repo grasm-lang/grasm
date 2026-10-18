@@ -1,0 +1,1231 @@
+// go.mod files, read and written as the go command does.
+//
+// Every Go module has one, and tools that are not the go command read them
+// all the time: dependency scanners, Renovate and Dependabot, SBOM
+// generators, monorepo build systems, license auditors. They need what the
+// file says (the module path, the Go version and toolchain, each required
+// module and whether it is indirect, replacements, exclusions, retracted
+// versions with their reasons, tools, godebug settings) and, to edit one,
+// the file written back the way `go mod edit -fmt` writes it.
+//
+// The syntax is small but particular:
+//
+// - a statement is a line of tokens, or a verb followed by `(` that opens
+//   a block of lines, closed by `)` on a line of its own;
+// - tokens are bare runs of printable characters or Go-quoted strings;
+//   comments are `//` to the end of the line, and a comment on a line of
+//   its own belongs to what follows it, one at the end of a line to what
+//   it ends;
+// - versions are written however the author liked (`v1.2`, `"v1.2.3"`)
+//   and read as canonical semantic versions; a module path ending in
+//   `/vN` takes only vN versions, and an old one only v0, v1 or
+//   `+incompatible`;
+// - `// indirect` after a requirement marks it indirect, a comment beside
+//   a `retract` gives the reason, and one beside `module` beginning
+//   `Deprecated:` deprecates the module.
+//
+// `parse` reads a file strictly, as the main module's go.mod is read;
+// `format` writes the parsed syntax back with tokens requoted and versions
+// made canonical, comments where they were.
+//
+// Checked against golang.org/x/mod/modfile.
+
+type GoModError = { line: i64, why: str }
+
+type ModComments = { before: [str], suffix: [str] }
+
+/// A line of tokens; positions are character offsets and line numbers.
+type ModLine = { tokens: [str], comments: ModComments, start: i64, end: i64, start_line: i64, end_line: i64 }
+
+type ModStmt =
+    | ModCommentBlock(comments: [str], at: i64)
+    | ModSingle(line: ModLine)
+    | ModBlock(head: ModLine, lparen: ModComments, lparen_at: i64, lparen_line: i64, lines: [ModLine], rparen: ModComments,
+    rparen_at: i64, rparen_line: i64)
+
+type ModRequire = { path: str, version: str, indirect: bool }
+type ModReplace = { old_path: str, old_version: str, new_path: str, new_version: str }
+type ModRetract = { low: str, high: str, rationale: str }
+
+type GoModFile = {
+    module: str,
+    module_seen: bool,
+    deprecated: str,
+    go: str,
+    toolchain: str,
+    godebug: [(str, str)],
+    require: [ModRequire],
+    exclude: [(str, str)],
+    replace: [ModReplace],
+    retract: [ModRetract],
+    tool: [str],
+    ignore: [str],
+    syntax: [ModStmt],
+    before: [str],
+}
+
+// --- Lexing ---------------------------------------------------------------------
+
+/// A token: kind ('i' identifier, 's' string, 'c' whole-line comment,
+/// 'e' end-of-line comment, 'n' newline, 'p' punctuation, 'z' end), text,
+/// start and end offsets, start and end lines.
+type ModToken = { kind: i64, text: str, start: i64, end: i64, line: i64, end_line: i64 }
+
+fn is_ident(c: i64) -> bool {
+    if c == 32 or c == 40 or c == 41 or c == 91 or c == 93 or c == 123 or c == 125 or c == 44 {
+        return false
+    }
+    return is_print(c) and not is_space(c)
+}
+
+fn is_space(c: i64) -> bool {
+    return c == 32 or c >= 9 and c <= 13 or c == 133 or c == 160 or c == 5760 or c >= 8192 and c <= 8202 or c == 8232 or
+    c == 8233 or c == 8239 or c == 8287 or c == 12288
+}
+
+/// Whether Go's unicode.IsPrint holds, closely enough for go.mod: no
+/// controls, no format characters, no spaces but the ASCII one, no
+/// surrogates or non-characters.
+fn is_print(c: i64) -> bool {
+    if c == 32 {
+        return true
+    }
+    if c < 32 or c >= 127 and c < 160 or c == 173 {
+        return false
+    }
+    if is_space(c) or c >= 8203 and c <= 8207 or c >= 8234 and c <= 8238 or c >= 8288 and c <= 8303 or c == 65279 {
+        return false
+    }
+    if c >= 55296 and c <= 57343 or c >= 57344 and c <= 63743 or c == 65534 or c == 65535 or c >= 983040 {
+        return false
+    }
+    return true
+}
+
+fn fail_at(line: i64, why: str) -> GoModError {
+    return GoModError{ line: line, why: why }
+}
+
+/// Whether only spaces come before position i on its line.
+fn alone_on_line(s: str, i: i64) -> bool {
+    var j = i - 1
+    while j >= 0 and s.code_at(j) != 10 {
+        if not is_space(s.code_at(j)) {
+            return false
+        }
+        j = j - 1
+    }
+    return true
+}
+
+/// Where a quoted string starting at i ends; a backslash escapes in "..."
+/// and not in `...`.
+fn string_end(s: str, from: i64, line: i64) -> i64 ! GoModError {
+    let n = s.len()
+    let c = s.code_at(from)
+    var i = from + 1
+    while true {
+        if i >= n {
+            fail(fail_at(line, "unexpected EOF in string"))
+        }
+        if s.code_at(i) == 10 {
+            fail(fail_at(line, "unexpected newline in string"))
+        }
+        let d = s.code_at(i)
+        i = i + 1
+        if d == c {
+            return i
+        }
+        if d == 92 and c != 96 {
+            if i >= n {
+                fail(fail_at(line, "unexpected EOF in string"))
+            }
+            i = i + 1
+        }
+    }
+    return i
+}
+
+fn lex(s: str) -> [ModToken] ! GoModError {
+    var out: [ModToken] = []
+    var i = 0
+    var line = 1
+    let n = s.len()
+    while true {
+        // Spaces.
+        while i < n and (s.code_at(i) == 32 or s.code_at(i) == 9 or s.code_at(i) == 13) {
+            i = i + 1
+        }
+        if i >= n {
+            out.push(ModToken{ kind: 122, text: "", start: i, end: i, line: line, end_line: line })
+            return out
+        }
+        if i + 1 < n and s.code_at(i) == 47 and s.code_at(i + 1) == 47 {
+            let alone = alone_on_line(s, i)
+            let start = i
+            while i < n and s.code_at(i) != 10 {
+                i = i + 1
+            }
+            var text = s.substr(start, i - start)
+            if text.ends_with("\r") {
+                text = text.substr(0, text.len() - 1)
+            }
+            let l0 = line
+            if i < n {
+                i = i + 1
+                line = line + 1
+            }
+            out.push(ModToken{ kind: if alone { 99 } else { 101 }, text: text, start: start, end: i, line: l0, end_line: line })
+            continue
+        }
+        if i + 1 < n and s.code_at(i) == 47 and s.code_at(i + 1) == 42 {
+            fail(fail_at(line, "mod files must use // comments (not /* */ comments)"))
+        }
+        let c = s.code_at(i)
+        if c == 10 or c == 40 or c == 41 or c == 91 or c == 93 or c == 123 or c == 125 or c == 44 {
+            out.push(ModToken{ kind: if c == 10 { 110 } else { 112 }, text: s.substr(i, 1), start: i, end: i + 1, line: line,
+                end_line: line })
+            i = i + 1
+            if c == 10 {
+                line = line + 1
+            }
+            continue
+        }
+        if c == 34 or c == 96 {
+            let start = i
+            i = try string_end(s, i, line)
+            out.push(ModToken{ kind: 115, text: s.substr(start, i - start), start: start, end: i, line: line, end_line: line })
+            continue
+        }
+        if not is_ident(c) {
+            fail(fail_at(line, "unexpected input character"))
+        }
+        let start = i
+        while i < n and is_ident(s.code_at(i)) {
+            if i + 1 < n and s.code_at(i) == 47 and s.code_at(i + 1) == 47 {
+                break
+            }
+            if i + 1 < n and s.code_at(i) == 47 and s.code_at(i + 1) == 42 {
+                fail(fail_at(line, "mod files must use // comments (not /* */ comments)"))
+            }
+            i = i + 1
+        }
+        out.push(ModToken{ kind: 105, text: s.substr(start, i - start), start: start, end: i, line: line, end_line: line })
+    }
+    return out
+}
+
+fn is_eol(t: ModToken) -> bool {
+    return t.kind == 122 or t.kind == 101 or t.kind == 110
+}
+
+fn no_comments() -> ModComments {
+    return ModComments{ before: [], suffix: [] }
+}
+
+// --- Parsing ---------------------------------------------------------------------
+
+type ModParser = { toks: [ModToken], at: i64, stmts: [ModStmt] }
+
+fn peek(p: ModParser) -> ModToken {
+    return p.toks[p.at]
+}
+
+fn next(inout p: ModParser) -> ModToken {
+    let t = p.toks[p.at]
+    if p.at < p.toks.len() - 1 {
+        p.at = p.at + 1
+    }
+    return t
+}
+
+fn parse_line(inout p: ModParser) -> ModLine {
+    let first = next(p)
+    var line = ModLine{ tokens: [first.text], comments: no_comments(), start: first.start, end: first.end, start_line: first.line,
+        end_line: first.line }
+    while true {
+        let t = next(p)
+        if is_eol(t) {
+            return line
+        }
+        line.tokens.push(t.text)
+        line.end = t.end
+        line.end_line = t.line
+    }
+    return line
+}
+
+fn parse_block(inout p: ModParser, head: ModLine, lparen: ModToken) -> ModStmt ! GoModError {
+    var lines: [ModLine] = []
+    var comments: [str] = []
+    while true {
+        let t = peek(p)
+        if t.kind == 101 {
+            next(p)
+        } else if t.kind == 110 {
+            next(p)
+            if comments.len() == 0 and lines.len() > 0 or comments.len() > 0 and comments[comments.len() - 1] != "" {
+                comments.push("")
+            }
+        } else if t.kind == 99 {
+            next(p)
+            comments.push(t.text)
+        } else if t.kind == 122 {
+            fail(fail_at(head.start_line, "syntax error (unterminated block)"))
+        } else if t.kind == 112 and t.text == ")" {
+            let r = next(p)
+            if comments.len() == 1 and comments[0] == "" {
+                comments = []
+            }
+            if not is_eol(peek(p)) {
+                fail(fail_at(r.line, "syntax error (expected newline after closing paren)"))
+            }
+            next(p)
+            return ModBlock(head, no_comments(), lparen.start, lparen.line, lines, ModComments{ before: comments, suffix: [] },
+                r.start, r.line)
+        } else {
+            var l = parse_line(p)
+            l.comments = ModComments{ before: comments, suffix: [] }
+            lines.push(l)
+            comments = []
+        }
+    }
+    fail(fail_at(0, "unreachable"))
+}
+
+fn parse_stmt(inout p: ModParser) -> ModStmt ! GoModError {
+    let first = next(p)
+    var head = ModLine{ tokens: [first.text], comments: no_comments(), start: first.start, end: first.end, start_line: first.line,
+        end_line: first.line }
+    while true {
+        let t = next(p)
+        if is_eol(t) {
+            return ModSingle(head)
+        }
+        if t.kind == 112 and t.text == "(" {
+            let n = peek(p)
+            if is_eol(n) {
+                return try parse_block(p, head, t)
+            }
+            if n.kind == 112 and n.text == ")" {
+                let r = next(p)
+                if is_eol(peek(p)) {
+                    next(p)
+                    return ModBlock(head, no_comments(), t.start, t.line, [], no_comments(), r.start, r.line)
+                }
+                head.tokens.push("(")
+                head.tokens.push(")")
+                continue
+            }
+            head.tokens.push("(")
+            continue
+        }
+        head.tokens.push(t.text)
+        head.end = t.end
+        head.end_line = t.line
+    }
+    fail(fail_at(0, "unreachable"))
+}
+
+/// Statements, with whole-line comments attached; end-of-line comments
+/// are attached afterwards.
+fn parse_file(toks: [ModToken]) -> [ModStmt] ! GoModError {
+    var p = ModParser{ toks: toks, at: 0, stmts: [] }
+    var block: [str] = []
+    var block_at = 0 - 1
+    while true {
+        let t = peek(p)
+        if t.kind == 110 {
+            next(p)
+            if block.len() > 0 {
+                p.stmts.push(ModCommentBlock(block, block_at))
+                block = []
+            }
+        } else if t.kind == 99 {
+            next(p)
+            if block.len() == 0 {
+                block_at = t.start
+            }
+            block.push(t.text)
+        } else if t.kind == 122 {
+            if block.len() > 0 {
+                p.stmts.push(ModCommentBlock(block, block_at))
+            }
+            return p.stmts
+        } else {
+            var s = try parse_stmt(p)
+            if block.len() > 0 {
+                s = match s {
+                    ModSingle(l) -> {
+                        var l2 = l
+                        l2.comments.before = block
+                        ModSingle(l2)
+                    }
+                    ModBlock(h, lp, lpa, lpl, ls, rp, rpa, rpl) -> {
+                        var h2 = h
+                        h2.comments.before = block
+                        ModBlock(h2, lp, lpa, lpl, ls, rp, rpa, rpl)
+                    }
+                    other -> other
+                }
+                block = []
+            }
+            p.stmts.push(s)
+        }
+    }
+    return p.stmts
+}
+
+/// An end-of-line comment goes to the last one-line piece of syntax that
+/// ends before it: a line, a block's parentheses, or a block's head.
+fn attach_suffixes(stmts: [ModStmt], toks: [ModToken]) -> ([ModStmt], [str]) {
+    var pending: [ModToken] = []
+    for t in toks {
+        if t.kind == 101 {
+            pending.push(t)
+        }
+    }
+    var out: [ModStmt] = []
+    var used: Map[i64, bool] = {}
+    // Walk the syntax from the end, as x/mod walks its post-order list.
+    var i = stmts.len() - 1
+    var rev: [ModStmt] = []
+    while i >= 0 {
+        var s = stmts[i]
+        s = match s {
+            ModSingle(l) -> {
+                var l2 = l
+                if l.start_line == l.end_line {
+                    l2.comments.suffix = take_suffix(pending, used, l.end)
+                }
+                ModSingle(l2)
+            }
+            ModBlock(h, lp, lpa, lpl, ls, rp, rpa, rpl) -> {
+                var rp2 = rp
+                rp2.suffix = take_suffix(pending, used, rpa + 1)
+                var ls2 = ls
+                var k = ls.len() - 1
+                while k >= 0 {
+                    var l = ls[k]
+                    if l.start_line == l.end_line {
+                        l.comments.suffix = take_suffix(pending, used, l.end)
+                    }
+                    ls2[k] = l
+                    k = k - 1
+                }
+                var lp2 = lp
+                lp2.suffix = take_suffix(pending, used, lpa + 1)
+                var h2 = h
+                if h.start_line == rpl {
+                    h2.comments.suffix = take_suffix(pending, used, rpa + 1)
+                }
+                ModBlock(h2, lp2, lpa, lpl, ls2, rp2, rpa, rpl)
+            }
+            other -> other
+        }
+        rev.push(s)
+        i = i - 1
+    }
+    var k = rev.len() - 1
+    while k >= 0 {
+        out.push(rev[k])
+        k = k - 1
+    }
+    var leftover: [str] = []
+    for t in pending {
+        if not used.has(t.start) {
+            leftover.push(t.text)
+        }
+    }
+    return (out, leftover)
+}
+
+/// The unused end-of-line comments that start at or after `end`, in order.
+fn take_suffix(pending: [ModToken], inout used: Map[i64, bool], end: i64) -> [str] {
+    var out: [str] = []
+    for t in pending {
+        if t.start >= end and not used.has(t.start) {
+            out.push(t.text)
+        }
+    }
+    for t in pending {
+        if t.start >= end {
+            used.set(t.start, true)
+        }
+    }
+    return out
+}
+
+// --- Semantic versions, as golang.org/x/mod/semver reads them ----------------------------
+
+fn is_num(s: str) -> bool {
+    if s.len() == 0 {
+        return false
+    }
+    for c in s.codes() {
+        if c < 48 or c > 57 {
+            return false
+        }
+    }
+    return s.len() == 1 or s.code_at(0) != 48
+}
+
+fn is_ident_part(s: str) -> bool {
+    if s.len() == 0 {
+        return false
+    }
+    for c in s.codes() {
+        if not (c >= 48 and c <= 57 or c >= 65 and c <= 90 or c >= 97 and c <= 122 or c == 45) {
+            return false
+        }
+    }
+    return true
+}
+
+fn is_pre_part(s: str) -> bool {
+    if not is_ident_part(s) {
+        return false
+    }
+    // A numeric identifier may not have a leading zero.
+    var numeric = true
+    for c in s.codes() {
+        if c < 48 or c > 57 {
+            numeric = false
+        }
+    }
+    return not numeric or is_num(s)
+}
+
+/// The canonical form of a Go semantic version (`v1.2` is `v1.2.0`, build
+/// metadata dropped), or "" for one that is not valid.
+pub fn canonical(v: str) -> str {
+    if not v.starts_with("v") {
+        return ""
+    }
+    var rest = v.substr(1, v.len() - 1)
+    var build = ""
+    let plus = rest.index_of("+") ?? -1
+    if plus >= 0 {
+        build = rest.substr(plus + 1, rest.len() - plus - 1)
+        rest = rest.substr(0, plus)
+        if build.len() == 0 or not build.split(".").all(|x| is_ident_part(x)) {
+            return ""
+        }
+    }
+    var pre = ""
+    let dash = rest.index_of("-") ?? -1
+    if dash >= 0 {
+        pre = rest.substr(dash + 1, rest.len() - dash - 1)
+        rest = rest.substr(0, dash)
+        if pre.len() == 0 or not pre.split(".").all(|x| is_pre_part(x)) {
+            return ""
+        }
+    }
+    let parts = rest.split(".")
+    if parts.len() > 3 or not parts.all(|x| is_num(x)) {
+        return ""
+    }
+    if parts.len() < 3 and (pre.len() > 0 or plus >= 0) {
+        return ""
+    }
+    var nums = parts
+    while nums.len() < 3 {
+        nums.push("0")
+    }
+    return "v" + nums.join(".") + (if pre.len() > 0 { "-" + pre } else { "" })
+}
+
+fn major(v: str) -> str {
+    let c = canonical(v)
+    if c.len() == 0 {
+        return ""
+    }
+    let dot = c.index_of(".") ?? c.len()
+    return c.substr(0, dot)
+}
+
+fn build_of(v: str) -> str {
+    let plus = v.index_of("+") ?? -1
+    return if plus < 0 or canonical(v).len() == 0 { "" } else { v.substr(plus, v.len() - plus) }
+}
+
+/// module.CanonicalVersion: canonical, keeping `+incompatible`.
+fn canonical_version(v: str) -> str {
+    let c = canonical(v)
+    if c.len() > 0 and build_of(v) == "+incompatible" {
+        return c + "+incompatible"
+    }
+    return c
+}
+
+fn split_path_version(path: str) -> (str, bool) {
+    if path.starts_with("gopkg.in/") {
+        var i = path.len()
+        if path.ends_with("-unstable") {
+            i = i - 9
+        }
+        while i > 0 and path.code_at(i - 1) >= 48 and path.code_at(i - 1) <= 57 {
+            i = i - 1
+        }
+        if i <= 1 or path.code_at(i - 1) != 118 or path.code_at(i - 2) != 46 {
+            return ("", false)
+        }
+        let pm = path.substr(i - 2, path.len() - i + 2)
+        if pm.len() <= 2 or pm.code_at(2) == 48 and pm != ".v0" {
+            return ("", false)
+        }
+        return (pm, true)
+    }
+    var i = path.len()
+    var dot = false
+    while i > 0 and (path.code_at(i - 1) >= 48 and path.code_at(i - 1) <= 57 or path.code_at(i - 1) == 46) {
+        if path.code_at(i - 1) == 46 {
+            dot = true
+        }
+        i = i - 1
+    }
+    if i <= 1 or i == path.len() or path.code_at(i - 1) != 118 or path.code_at(i - 2) != 47 {
+        return ("", true)
+    }
+    let pm = path.substr(i - 2, path.len() - i + 2)
+    if dot or pm.len() <= 2 or pm.code_at(2) == 48 or pm == "/v1" {
+        return ("", false)
+    }
+    return (pm, true)
+}
+
+fn check_path_major(v: str, path_major: str) -> bool {
+    var pm = path_major
+    if pm.starts_with(".v") and pm.ends_with("-unstable") {
+        pm = pm.substr(0, pm.len() - 9)
+    }
+    if v.starts_with("v0.0.0-") and pm == ".v1" {
+        return true
+    }
+    let m = major(v)
+    if pm.len() == 0 {
+        return m == "v0" or m == "v1" or build_of(v) == "+incompatible"
+    }
+    return m == pm.substr(1, pm.len() - 1)
+}
+
+// --- Quoting, as Go's strconv does it -------------------------------------------------------
+
+fn hex_digit(c: i64) -> i64 {
+    if c >= 48 and c <= 57 {
+        return c - 48
+    }
+    if c >= 97 and c <= 102 {
+        return c - 87
+    }
+    if c >= 65 and c <= 70 {
+        return c - 55
+    }
+    return 0 - 1
+}
+
+/// A Go double-quoted string's value, or None.
+/// The value of `count` digits in `base` (8 or 16) from position `from`,
+/// or -1 if one is not a digit.
+fn digits_value(t: str, from: i64, count: i64, base: i64) -> i64 {
+    var v = 0
+    var k = 0
+    while k < count {
+        let c = t.code_at(from + k)
+        let d = if base == 16 { hex_digit(c) } else if c >= 48 and c <= 55 { c - 48 } else { 0 - 1 }
+        if d < 0 {
+            return 0 - 1
+        }
+        v = v * base + d
+        k = k + 1
+    }
+    return v
+}
+
+fn unquote(t: str) -> Option[str] {
+    if t.len() < 2 or not t.starts_with("\"") or not t.ends_with("\"") {
+        return None
+    }
+    var out = ""
+    var i = 1
+    let end = t.len() - 1
+    while i < end {
+        let c = t.code_at(i)
+        if c == 34 or c == 10 {
+            return None
+        }
+        if c != 92 {
+            out = out + t.substr(i, 1)
+            i = i + 1
+            continue
+        }
+        if i + 1 >= end {
+            return None
+        }
+        let e = t.code_at(i + 1)
+        let simple = "abfnrtv\\\""
+        let mapped = [7, 8, 12, 10, 13, 9, 11, 92, 34]
+        let at = simple.index_of(e.to_char()) ?? -1
+        if at >= 0 {
+            out = out + mapped[at].to_char()
+            i = i + 2
+            continue
+        }
+        var width = 0
+        if e == 120 {
+            width = 2
+        } else if e == 117 {
+            width = 4
+        } else if e == 85 {
+            width = 8
+        }
+        if width > 0 {
+            if i + 2 + width > end {
+                return None
+            }
+            let v = digits_value(t, i + 2, width, 16)
+            if v < 0 {
+                return None
+            }
+            if width == 2 {
+                // A \x byte is a byte; only ASCII ones make text here.
+                if v >= 128 {
+                    return None
+                }
+            } else if v > 1114111 or v >= 55296 and v <= 57343 {
+                return None
+            }
+            out = out + v.to_char()
+            i = i + 2 + width
+            continue
+        }
+        if e >= 48 and e <= 55 {
+            if i + 4 > end {
+                return None
+            }
+            let v = digits_value(t, i + 1, 3, 8)
+            if v < 0 or v >= 128 {
+                return None
+            }
+            out = out + v.to_char()
+            i = i + 4
+            continue
+        }
+        return None
+    }
+    return Some(out)
+}
+
+fn must_quote(s: str) -> bool {
+    for c in s.codes() {
+        if c == 32 or c == 34 or c == 39 or c == 96 {
+            return true
+        }
+        if c == 40 or c == 41 or c == 91 or c == 93 or c == 123 or c == 125 or c == 44 {
+            if s.len() > 1 {
+                return true
+            }
+        } else if not is_print(c) {
+            return true
+        }
+    }
+    return s.len() == 0 or s.contains("//") or s.contains("/*")
+}
+
+fn quote(s: str) -> str {
+    let hex = "0123456789abcdef"
+    var out = "\""
+    for c in s.codes() {
+        if c == 34 {
+            out = out + "\\\""
+        } else if c == 92 {
+            out = out + "\\\\"
+        } else if c == 7 {
+            out = out + "\\a"
+        } else if c == 8 {
+            out = out + "\\b"
+        } else if c == 12 {
+            out = out + "\\f"
+        } else if c == 10 {
+            out = out + "\\n"
+        } else if c == 13 {
+            out = out + "\\r"
+        } else if c == 9 {
+            out = out + "\\t"
+        } else if c == 11 {
+            out = out + "\\v"
+        } else if is_print(c) {
+            out = out + c.to_char()
+        } else if c < 128 {
+            out = out + "\\x" + hex.substr(c / 16, 1) + hex.substr(c % 16, 1)
+        } else if c < 65536 {
+            out = out + "\\u" + hex.substr(c / 4096 % 16, 1) + hex.substr(c / 256 % 16, 1) + hex.substr(c / 16 % 16, 1) + hex.substr(c % 16, 1)
+        } else {
+            var t = ""
+            var k = 7
+            while k >= 0 {
+                t = t + hex.substr(c.ushr(4 * k).bit_and(15), 1)
+                k = k - 1
+            }
+            out = out + "\\U" + t
+        }
+    }
+    return out + "\""
+}
+
+fn auto_quote(s: str) -> str {
+    return if must_quote(s) { quote(s) } else { s }
+}
+
+/// A token's string value: unquoted when it starts with `"`, refused when
+/// it holds another quote.
+fn parse_string(t: str) -> Option[str] {
+    if t.starts_with("\"") {
+        return unquote(t)
+    }
+    if t.contains("\"") or t.contains("'") or t.contains("`") {
+        return None
+    }
+    return Some(t)
+}
+
+fn is_directory_path(s: str) -> bool {
+    if s == "." or s.starts_with("./") or s.starts_with(".\\") or s == ".." or s.starts_with("../") or s.starts_with("..\\") or
+    s.starts_with("/") or s.starts_with("\\") {
+        return true
+    }
+    if s.len() >= 2 and s.code_at(1) == 58 {
+        let c = s.code_at(0)
+        return c >= 65 and c <= 90 or c >= 97 and c <= 122
+    }
+    return false
+}
+
+fn is_go_version(v: str) -> bool {
+    // ^([1-9][0-9]*)\.(0|[1-9][0-9]*)(\.(0|[1-9][0-9]*))?([a-z]+[0-9]+)?$
+    var i = 0
+    let n = v.len()
+    var parts: [str] = []
+    var cur = ""
+    while i < n and (v.code_at(i) >= 48 and v.code_at(i) <= 57 or v.code_at(i) == 46) {
+        if v.code_at(i) == 46 {
+            parts.push(cur)
+            cur = ""
+        } else {
+            cur = cur + v.substr(i, 1)
+        }
+        i = i + 1
+    }
+    parts.push(cur)
+    if parts.len() < 2 or parts.len() > 3 or not parts.all(|x| is_num(x)) or parts[0] == "0" {
+        return false
+    }
+    if i == n {
+        return true
+    }
+    // A pre-release suffix: letters, then digits, then the end.
+    var letters = 0
+    while i < n and v.code_at(i) >= 97 and v.code_at(i) <= 122 {
+        i = i + 1
+        letters = letters + 1
+    }
+    var digits = 0
+    while i < n and v.code_at(i) >= 48 and v.code_at(i) <= 57 {
+        i = i + 1
+        digits = digits + 1
+    }
+    return letters > 0 and digits > 0 and i == n
+}
+
+// --- The directives --------------------------------------------------------------------
+
+fn empty_file() -> GoModFile {
+    return GoModFile{ module: "", module_seen: false, deprecated: "", go: "", toolchain: "", godebug: [], require: [], exclude: [], replace: [],
+        retract: [], tool: [], ignore: [], syntax: [], before: [] }
+}
+
+/// The text of the comments before and beside a line, or the block's when
+/// the line has none, each without `//`, joined by newlines.
+fn directive_comment(block: Option[ModLine], line: ModLine) -> str {
+    var c = line.comments
+    match block {
+        Some(b) -> if c.before.len() == 0 and c.suffix.len() == 0 {
+            c = b.comments
+        }
+        None -> {}
+    }
+    var lines: [str] = []
+    for t in c.before + c.suffix {
+        if t.starts_with("//") {
+            lines.push(t.substr(2, t.len() - 2).trim())
+        }
+    }
+    return lines.join("\n")
+}
+
+/// `Deprecated:` at the start of a paragraph, to the end of it.
+fn deprecation(text: str) -> str {
+    var i = 0
+    while i < text.len() {
+        if (i == 0 or i >= 2 and text.substr(i - 2, 2) == "\n\n") and text.substr(i, text.len() - i).starts_with("Deprecated:") {
+            var j = i + 11
+            while j < text.len() and text.code_at(j) == 32 {
+                j = j + 1
+            }
+            let rest = text.substr(j, text.len() - j)
+            let end = rest.index_of("\n\n") ?? rest.len()
+            return rest.substr(0, end)
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+fn is_indirect(line: ModLine) -> bool {
+    if line.comments.suffix.len() == 0 {
+        return false
+    }
+    var t = line.comments.suffix[0]
+    if t.starts_with("//") {
+        t = t.substr(2, t.len() - 2)
+    }
+    let f = t.split(" ").map(|x| x.trim()).filter(|x| x.len() > 0)
+    return f.len() == 1 and f[0] == "indirect" or f.len() > 1 and f[0] == "indirect;"
+}
+
+/// A version token: unquoted and canonical, or an error.
+fn version_of(tok: str, line: i64) -> str ! GoModError {
+    let t = parse_string(tok) ?? fail(fail_at(line, "invalid quoted version"))
+    let c = canonical_version(t)
+    if c.len() == 0 {
+        fail(fail_at(line, "version must be of the form v1.2.3"))
+    }
+    return c
+}
+
+/// A retracted version is kept as written, only unquoted (x/mod's
+/// dontFixRetract), so a retraction of a version that never canonicalised
+/// still names it.
+fn retract_version_of(tok: str, line: i64) -> str ! GoModError {
+    return parse_string(tok) ?? fail(fail_at(line, "invalid quoted version"))
+}
+
+fn add_replace(inout f: GoModFile, at: i64, args: [str]) -> [str] ! GoModError {
+    var toks = args
+    let arrow = if args.len() >= 2 and args[1] == "=>" { 1 } else { 2 }
+    if args.len() < arrow + 2 or args.len() > arrow + 3 or args[arrow] != "=>" {
+        fail(fail_at(at, "usage: replace module/path [v1.2.3] => other/module v1.4"))
+    }
+    let s = parse_string(args[0]) ?? fail(fail_at(at, "invalid quoted string"))
+    toks[0] = auto_quote(s)
+    let (pm, ok) = split_path_version(s)
+    if not ok {
+        fail(fail_at(at, "invalid module path"))
+    }
+    var v = ""
+    if arrow == 2 {
+        v = try version_of(args[1], at)
+        toks[1] = v
+        if not check_path_major(v, pm) {
+            fail(fail_at(at, "version does not match the module path's major version"))
+        }
+    }
+    let ns = parse_string(args[arrow + 1]) ?? fail(fail_at(at, "invalid quoted string"))
+    toks[arrow + 1] = auto_quote(ns)
+    var nv = ""
+    if args.len() == arrow + 2 {
+        if not is_directory_path(ns) {
+            fail(fail_at(at, "replacement module without version must be directory path"))
+        }
+        if ns.contains("\\") {
+            fail(fail_at(at, "replacement directory appears to be Windows path"))
+        }
+    } else {
+        nv = try version_of(args[arrow + 2], at)
+        toks[arrow + 2] = nv
+        if is_directory_path(ns) {
+            fail(fail_at(at, "replacement module directory path cannot have version"))
+        }
+    }
+    f.replace.push(ModReplace{ old_path: s, old_version: v, new_path: ns, new_version: nv })
+    return toks
+}
+
+fn add_retract(inout f: GoModFile, block: Option[ModLine], line: ModLine, at: i64, args: [str]) -> [str] ! GoModError {
+    var toks = args
+    let rationale = directive_comment(block, line)
+    if args.len() == 0 or args[0] == "(" {
+        fail(fail_at(at, "expected '[' or version"))
+    }
+    if args[0] != "[" {
+        let v = try retract_version_of(args[0], at)
+        toks[0] = v
+        if args.len() > 1 {
+            fail(fail_at(at, "unexpected token after version"))
+        }
+        f.retract.push(ModRetract{ low: v, high: v, rationale: rationale })
+    } else {
+        if args.len() < 5 or args[2] != "," or args[4] != "]" {
+            fail(fail_at(at, "expected [low, high]"))
+        }
+        let low = try retract_version_of(args[1], at)
+        let high = try retract_version_of(args[3], at)
+        toks[1] = low
+        toks[3] = high
+        if args.len() > 5 {
+            fail(fail_at(at, "unexpected token after version"))
+        }
+        f.retract.push(ModRetract{ low: low, high: high, rationale: rationale })
+    }
+    return toks
+}
+
+fn add_directive(inout f: GoModFile, block: Option[ModLine], line: ModLine, verb: str, args: [str]) -> [str] ! GoModError {
+    let at = line.start_line
+    var toks = args
+    if verb == "go" {
+        if f.go.len() > 0 {
+            fail(fail_at(at, "repeated go statement"))
+        }
+        if args.len() != 1 or not is_go_version(args[0]) {
+            fail(fail_at(at, "invalid go version"))
+        }
+        f.go = args[0]
+    } else if verb == "toolchain" {
+        if f.toolchain.len() > 0 {
+            fail(fail_at(at, "repeated toolchain statement"))
+        }
+        if args.len() != 1 or not (args[0] == "default" or args[0] == "go1" or args[0].starts_with("go1.")) {
+            fail(fail_at(at, "invalid toolchain version"))
+        }
+        f.toolchain = args[0]
+    } else if verb == "module" {
+        if f.module_seen {
+            fail(fail_at(at, "repeated module statement"))
+        }
+        f.module_seen = true
+        f.deprecated = deprecation(directive_comment(block, line))
+        if args.len() != 1 {
+            fail(fail_at(at, "usage: module module/path"))
+        }
+        let s = parse_string(args[0]) ?? fail(fail_at(at, "invalid quoted string"))
+        f.module = s
+        toks[0] = auto_quote(s)
+    } else if verb == "godebug" {
+        if args.len() != 1 or args[0].contains("\"") or args[0].contains("`") or args[0].contains("'") or args[0].contains(",") {
+            fail(fail_at(at, "usage: godebug key=value"))
+        }
+        let eq = args[0].index_of("=") ?? -1
+        if eq < 0 {
+            fail(fail_at(at, "usage: godebug key=value"))
+        }
+        f.godebug.push((args[0].substr(0, eq), args[0].substr(eq + 1, args[0].len() - eq - 1)))
+    } else if verb == "require" or verb == "exclude" {
+        if args.len() != 2 {
+            fail(fail_at(at, "usage: " + verb + " module/path v1.2.3"))
+        }
+        let s = parse_string(args[0]) ?? fail(fail_at(at, "invalid quoted string"))
+        toks[0] = auto_quote(s)
+        let v = try version_of(args[1], at)
+        toks[1] = v
+        let (pm, ok) = split_path_version(s)
+        if not ok {
+            fail(fail_at(at, "invalid module path"))
+        }
+        if not check_path_major(v, pm) {
+            fail(fail_at(at, "version does not match the module path's major version"))
+        }
+        if verb == "require" {
+            f.require.push(ModRequire{ path: s, version: v, indirect: is_indirect(line) })
+        } else {
+            f.exclude.push((s, v))
+        }
+    } else if verb == "replace" {
+        toks = try add_replace(f, at, args)
+    } else if verb == "retract" {
+        toks = try add_retract(f, block, line, at, args)
+    } else if verb == "tool" or verb == "ignore" {
+        if args.len() != 1 {
+            fail(fail_at(at, verb + " directive expects exactly one argument"))
+        }
+        let s = parse_string(args[0]) ?? fail(fail_at(at, "invalid quoted string"))
+        toks[0] = auto_quote(s)
+        if verb == "tool" {
+            f.tool.push(s)
+        } else {
+            f.ignore.push(s)
+        }
+    } else {
+        fail(fail_at(at, "unknown directive: " + verb))
+    }
+    return toks
+}
+
+/// A go.mod file, read strictly as the main module's is.
+pub fn parse(text: str) -> GoModFile ! GoModError {
+    let toks = try lex(text)
+    let (stmts, leftover) = attach_suffixes(try parse_file(toks), toks)
+    var f = empty_file()
+    var out: [ModStmt] = []
+    for s in stmts {
+        let rewritten = match s {
+            ModSingle(l) -> {
+                let args = try add_directive(f, None, l, l.tokens[0], l.tokens.slice(1, l.tokens.len()))
+                var l2 = l
+                l2.tokens = [l.tokens[0]] + args
+                ModSingle(l2)
+            }
+            ModBlock(h, lp, lpa, lpl, ls, rp, rpa, rpl) -> {
+                if h.tokens.len() > 1 or not ["module", "godebug", "require", "exclude", "replace", "retract", "tool", "ignore"].contains(h.tokens[0]) {
+                    fail(fail_at(h.start_line, "unknown block type: " + h.tokens.join(" ")))
+                }
+                var ls2: [ModLine] = []
+                for l in ls {
+                    var l2 = l
+                    l2.tokens = try add_directive(f, Some(h), l, h.tokens[0], l.tokens)
+                    ls2.push(l2)
+                }
+                ModBlock(h, lp, lpa, lpl, ls2, rp, rpa, rpl)
+            }
+            other -> other
+        }
+        out.push(rewritten)
+    }
+    f.syntax = out
+    f.before = leftover
+    return f
+}
+
+// --- Formatting -------------------------------------------------------------------------
+
+type ModPrinter = { out: str, pending: [str], margin: i64 }
+
+fn trim_end(inout p: ModPrinter) {
+    var n = p.out.len()
+    while n > 0 and (p.out.code_at(n - 1) == 9 or p.out.code_at(n - 1) == 32) {
+        n = n - 1
+    }
+    p.out = p.out.substr(0, n)
+}
+
+fn tabs(n: i64) -> str {
+    var out = ""
+    var i = 0
+    while i < n {
+        out = out + "\t"
+        i = i + 1
+    }
+    return out
+}
+
+fn newline(inout p: ModPrinter) {
+    if p.pending.len() > 0 {
+        p.out = p.out + " "
+        var i = 0
+        for c in p.pending {
+            if i > 0 {
+                trim_end(p)
+                p.out = p.out + "\n" + tabs(p.margin)
+            }
+            p.out = p.out + c.trim()
+            i = i + 1
+        }
+        p.pending = []
+    }
+    trim_end(p)
+    let n = p.out.len()
+    if not (n == 0 or n >= 2 and p.out.code_at(n - 1) == 10 and p.out.code_at(n - 2) == 10) {
+        p.out = p.out + "\n"
+    }
+    p.out = p.out + tabs(p.margin)
+}
+
+fn indent_of(p: ModPrinter) -> i64 {
+    var n = 0
+    while n < p.out.len() and p.out.code_at(p.out.len() - 1 - n) != 10 {
+        n = n + 1
+    }
+    return n
+}
+
+fn print_before(inout p: ModPrinter, before: [str]) {
+    if before.len() == 0 {
+        return
+    }
+    trim_end(p)
+    if indent_of(p) > 0 {
+        p.out = p.out + "\n"
+    }
+    p.out = p.out + tabs(p.margin)
+    for c in before {
+        p.out = p.out + c.trim()
+        newline(p)
+    }
+}
+
+fn print_tokens(inout p: ModPrinter, tokens: [str]) {
+    var sep = ""
+    for t in tokens {
+        if t == "," or t == ")" or t == "]" or t == "}" {
+            sep = ""
+        }
+        p.out = p.out + sep + t
+        sep = " "
+        if t == "(" or t == "[" or t == "\{" {
+            sep = ""
+        }
+    }
+}
+
+fn print_line(inout p: ModPrinter, l: ModLine) {
+    print_before(p, l.comments.before)
+    print_tokens(p, l.tokens)
+    p.pending = p.pending + l.comments.suffix
+}
+
+/// The parsed file written back as `go mod edit -fmt` writes it.
+pub fn format(f: GoModFile) -> str {
+    var p = ModPrinter{ out: "", pending: [], margin: 0 }
+    for c in f.before {
+        p.out = p.out + c.trim()
+        newline(p)
+    }
+    var i = 0
+    for s in f.syntax {
+        match s {
+            ModCommentBlock(cs, _at) -> print_before(p, cs)
+            ModSingle(l) -> {
+                print_line(p, l)
+                newline(p)
+            }
+            ModBlock(h, lp, _lpa, _lpl, ls, rp, _rpa, _rpl) -> {
+                print_before(p, h.comments.before)
+                print_tokens(p, h.tokens)
+                p.out = p.out + " "
+                print_before(p, lp.before)
+                p.out = p.out + "("
+                p.pending = p.pending + lp.suffix
+                p.margin = p.margin + 1
+                for l in ls {
+                    newline(p)
+                    print_line(p, l)
+                }
+                p.margin = p.margin - 1
+                newline(p)
+                print_before(p, rp.before)
+                p.out = p.out + ")"
+                p.pending = p.pending + rp.suffix + h.comments.suffix
+                newline(p)
+            }
+        }
+        if i + 1 < f.syntax.len() {
+            newline(p)
+        }
+        i = i + 1
+    }
+    var out = p.out
+    while out.len() > 0 and out.ends_with("\n") and (out.len() == 1 or out.code_at(out.len() - 2) == 10) {
+        out = out.substr(0, out.len() - 1)
+    }
+    return out
+}

@@ -256,6 +256,25 @@ day its reference is installed.
 
 ## Landed
 
+- [x] **B31: Go's module tooling** — B18's `gomod`, with `signednote`,
+  `tlog` and `coverprofile`, which were not on the list, and the harness
+  `b31test`; the new gate `b31diff` runs 3,270 cases against
+  golang.org/x/mod and x/tools from the module cache. go.mod files of
+  every directive, quoted and bare, with comments before, beside and
+  inside blocks, CRLF and broken ones: what Parse reads and what Format
+  writes, byte for byte. Signed notes: keys from seeds, notes signed by
+  several keys, opened with known, unknown, repeated and ambiguous keys,
+  tampered and malformed. Transparency logs of up to 300 records: tree
+  hashes, the stored-hash layout, record and tree proofs made there and
+  checked here whole and tampered, tile paths and tree heads. Coverage
+  profiles with repeated blocks in all three modes. Each family must see
+  both answers and refusals, or the gate fails. Go's base64 requires
+  padding and ignores the unused bits of the last group, the reverse of
+  `bytes_codec.decode_base64` on both; `decode_base64_go` reads it Go's
+  way for the formats Go defines. Retracted versions are kept as written
+  rather than canonicalised, as x/mod does. One break per package turned
+  it red.
+
 - [x] **B30: post-quantum signatures** — B2's `mldsa` and `slhdsa`, with
   the harness `b30test`; the new gate `b30diff` runs 1,334 cases against
   NIST's ACVP vectors (as Cloudflare's circl ships them) and circl itself,
@@ -556,7 +575,7 @@ day its reference is installed.
 | | |
 |---|---|
 | At the start | 669 |
-| Now | 837 |
+| Now | 842 |
 | Candidates above | 316 packages in 28 batches, plus `ecc`, `rfc6979` and `goprintf` |
 | Harnesses, one a batch | 28 |
 | If every candidate lands | 1016 |

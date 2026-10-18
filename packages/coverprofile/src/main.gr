@@ -1,0 +1,167 @@
+// Go coverage profiles: what `go test -coverprofile` writes.
+//
+// CI systems, Codecov and Coveralls uploaders, coverage gates in pull
+// requests and editor plugins all read this format:
+//
+//     mode: set
+//     example.com/pkg/file.go:12.34,15.2 3 1
+//
+// A mode line (`set`, `count` or `atomic`), then one line per basic block:
+// the file, the start line and column, the end line and column, the number
+// of statements in the block, and how many times it ran (0 or 1 in `set`
+// mode). Fields are found from the right, so a file name may contain any
+// character, colons included.
+//
+// `parse` groups blocks by file, sorts each file's blocks by start
+// position, and merges repeated blocks, as happens when profiles from
+// several test binaries are concatenated: counts add, or in `set` mode
+// combine, and a block repeated with a different statement count is an
+// error. Lines end at a newline, a carriage return before it dropped.
+//
+// Checked against golang.org/x/tools/cover.
+
+type CoverBlock = { start_line: i64, start_col: i64, end_line: i64, end_col: i64, statements: i64, count: i64 }
+
+type CoverProfile = { file: str, mode: str, blocks: [CoverBlock] }
+
+type CoverError =
+    | CoverBadMode(line: str)
+    | CoverBadLine(line: str, why: str)
+    | CoverInconsistent(file: str)
+
+/// A non-negative decimal as Go's strconv.Atoi reads it: a sign allowed,
+/// leading zeros allowed; -1 for anything else.
+fn atoi(s: str) -> i64 {
+    var t = s
+    var neg = false
+    if t.starts_with("+") or t.starts_with("-") {
+        neg = t.starts_with("-")
+        t = t.substr(1, t.len() - 1)
+    }
+    if t.len() == 0 or t.len() > 18 {
+        return 0 - 1
+    }
+    var v = 0
+    for c in t.codes() {
+        if c < 48 or c > 57 {
+            return 0 - 1
+        }
+        v = v * 10 + c - 48
+    }
+    return if neg and v > 0 { 0 - 2 } else { v }
+}
+
+fn seek_back(l: str, sep: i64, end: i64) -> (i64, i64) ! CoverError {
+    var start = end - 1
+    while start >= 0 {
+        if l.code_at(start) == sep {
+            let v = atoi(l.substr(start + 1, end - start - 1))
+            if v < 0 {
+                fail(CoverBadLine(l, "a field that is not a non-negative number"))
+            }
+            return (v, start)
+        }
+        start = start - 1
+    }
+    fail(CoverBadLine(l, "a missing separator"))
+}
+
+fn parse_line(l: str) -> (str, CoverBlock) ! CoverError {
+    let (count, e1) = try seek_back(l, 32, l.len())
+    let (stmts, e2) = try seek_back(l, 32, e1)
+    let (ec, e3) = try seek_back(l, 46, e2)
+    let (el, e4) = try seek_back(l, 44, e3)
+    let (sc, e5) = try seek_back(l, 46, e4)
+    let (sl, e6) = try seek_back(l, 58, e5)
+    if e6 == 0 {
+        fail(CoverBadLine(l, "a blank file name"))
+    }
+    return (l.substr(0, e6), CoverBlock{ start_line: sl, start_col: sc, end_line: el, end_col: ec, statements: stmts, count: count })
+}
+
+fn same_span(a: CoverBlock, b: CoverBlock) -> bool {
+    return a.start_line == b.start_line and a.start_col == b.start_col and a.end_line == b.end_line and a.end_col == b.end_col
+}
+
+/// A profile's text, one profile per file, sorted by file name.
+pub fn parse(text: str) -> [CoverProfile] ! CoverError {
+    var lines = text.split("\n")
+    if lines.len() > 0 and lines[lines.len() - 1].len() == 0 {
+        lines = lines.slice(0, lines.len() - 1)
+    }
+    var mode = ""
+    var files: Map[str, [CoverBlock]] = {}
+    var order: [str] = []
+    for raw in lines {
+        let line = if raw.ends_with("\r") { raw.substr(0, raw.len() - 1) } else { raw }
+        if mode.len() == 0 {
+            if not line.starts_with("mode: ") or line == "mode: " {
+                fail(CoverBadMode(line))
+            }
+            mode = line.substr(6, line.len() - 6)
+            continue
+        }
+        let (file, block) = try parse_line(line)
+        match files.get(file) {
+            Some(bs) -> {
+                var b2 = bs
+                b2.push(block)
+                files.set(file, b2)
+            }
+            None -> {
+                files.set(file, [block])
+                order.push(file)
+            }
+        }
+    }
+    order.sort()
+    var out: [CoverProfile] = []
+    for file in order {
+        var blocks = files.get(file) ?? []
+        blocks.sort_by(|b| b.start_line * 1000000000 + b.start_col)
+        var merged: [CoverBlock] = []
+        for b in blocks {
+            if merged.len() > 0 and same_span(merged[merged.len() - 1], b) {
+                var last = merged[merged.len() - 1]
+                if last.statements != b.statements {
+                    fail(CoverInconsistent(file))
+                }
+                last.count = if mode == "set" { last.count.bit_or(b.count) } else { last.count + b.count }
+                merged[merged.len() - 1] = last
+            } else {
+                merged.push(b)
+            }
+        }
+        out.push(CoverProfile{ file: file, mode: mode, blocks: merged })
+    }
+    return out
+}
+
+/// Statements covered and statements in all, over the profiles.
+pub fn statements(profiles: [CoverProfile]) -> (i64, i64) {
+    var covered = 0
+    var total = 0
+    for p in profiles {
+        for b in p.blocks {
+            total = total + b.statements
+            if b.count > 0 {
+                covered = covered + b.statements
+            }
+        }
+    }
+    return (covered, total)
+}
+
+/// The profiles written back, one mode line and then every block.
+pub fn format(profiles: [CoverProfile]) -> str {
+    if profiles.len() == 0 {
+        return ""
+    }
+    var out = "mode: " + profiles[0].mode + "\n"
+    for p in profiles {
+        for b in p.blocks {
+            out = out + p.file + ":{b.start_line}.{b.start_col},{b.end_line}.{b.end_col} {b.statements} {b.count}\n"
+        }
+    }
+    return out
+}

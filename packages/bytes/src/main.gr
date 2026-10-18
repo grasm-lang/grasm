@@ -164,6 +164,34 @@ pub fn decode_base64_url(s: str) -> Option[bytes] {
     decode_with(s, B64URL)
 }
 
+/// Base64 the way Go's `base64.StdEncoding` reads it, for formats whose
+/// reference reader is Go (signed notes, checksum-database tree heads):
+/// padding is required, carriage returns and line feeds anywhere are
+/// skipped, and the unused bits of the last group are ignored rather than
+/// refused. Prefer `decode_base64` anywhere a format does not say this.
+pub fn decode_base64_go(s: str) -> Option[bytes] {
+    let text = s.replace("\r", "").replace("\n", "")
+    if text.len() % 4 != 0 {
+        return None
+    }
+    var pad = 0
+    while pad < text.len() and text.substr(text.len() - 1 - pad, 1) == "=" {
+        pad = pad + 1
+    }
+    if pad == 0 or pad > 2 {
+        return decode_with(text, B64)
+    }
+    // Clear the bits the padding says are unused, then decode strictly.
+    let at = text.len() - 1 - pad
+    let v = value_of(text.substr(at, 1), B64)
+    if v < 0 {
+        return None
+    }
+    let unused = if pad == 1 { 4 } else { 16 }
+    let fixed = text.substr(0, at) + B64.substr(v - v % unused, 1) + text.substr(at + 1, pad)
+    decode_with(fixed, B64)
+}
+
 // --- comparing -------------------------------------------------------------
 
 /// Equal or not, in time that does not depend on where they differ.

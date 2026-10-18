@@ -127,5 +127,5 @@ func answer5(r request) string {
 		}
 		return fmt.Sprint(slhdsa.Verify(&pub, slhdsa.NewMessage(f[1]), f[2], unhex(r.Args[1])))
 	}
-	return "UNKNOWN"
+	return answer6(r)
 }

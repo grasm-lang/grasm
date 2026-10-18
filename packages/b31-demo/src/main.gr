@@ -1,0 +1,61 @@
+// A go.mod file read and written back, a transparency log with its proofs,
+// its tree head signed as a note, and a coverage profile summed up.
+// scripts/b31_diff.sh holds them to golang.org/x/mod and x/tools.
+import gomod
+import signednote
+import tlog
+import coverprofile
+
+fn filled(n: i64, v: i64) -> bytes {
+    var out: [i64] = []
+    while out.len() < n {
+        out.push(v)
+    }
+    bytes_of(out)
+}
+
+fn main() / {io} {
+    // go.mod: the file as written, and as `go mod edit -fmt` writes it.
+    let text = "module example.com/app\n\ngo 1.22\n\nrequire (\n\tgolang.org/x/net v0.20 // indirect\n\tgithub.com/a/b/v2 v2.1.0\n)\n"
+    let f = gomod.parse(text) ?? panic("go.mod")
+    assert_eq(f.module, "example.com/app")
+    assert_eq(f.require.len(), 2)
+    assert_eq(f.require[0].version, "v0.20.0")
+    assert_eq(f.require[0].indirect, true)
+    assert_eq(gomod.format(f).contains("golang.org/x/net v0.20.0 // indirect"), true)
+    assert_eq(gomod.canonical("v1.2"), "v1.2.0")
+
+    // A log of five records, and proofs a client checks against its root.
+    var records: [bytes] = []
+    for i in 0..5 {
+        records.push("record {i}\n".to_bytes())
+    }
+    let stored = tlog.store(records)
+    assert_eq(stored.len(), tlog.stored_count(5))
+    let root = tlog.tree_hash(stored, 5)
+    let proof = tlog.prove_record(stored, 5, 3) ?? panic("proof")
+    assert_eq(tlog.check_record(proof, 5, root, 3, tlog.record_hash(records[3])), true)
+    assert_eq(tlog.check_record(proof, 5, root, 2, tlog.record_hash(records[3])), false)
+    let grew = tlog.prove_tree(stored, 5, 3) ?? panic("tree proof")
+    assert_eq(tlog.check_tree(grew, 5, root, 3, tlog.tree_hash(stored, 3)), true)
+    assert_eq(tlog.tile_path(tlog.tile_for_index(2, 7)), "tile/2/0/001.p/1")
+
+    // The tree head, signed and opened.
+    let keys = signednote.generate_key(filled(32, 9), "log.example.com") ?? panic("key")
+    let signer = signednote.parse_signer(keys.0) ?? panic("signer")
+    let verifier = signednote.parse_verifier(keys.1) ?? panic("verifier")
+    let head = tlog.format_tree(5, root)
+    let note = signednote.sign(head, [signer]) ?? panic("sign")
+    let opened = signednote.open(note.to_bytes(), [verifier]) ?? panic("open")
+    assert_eq(opened.text, head)
+    assert_eq(opened.sigs.len(), 1)
+    assert_eq((tlog.parse_tree(opened.text) ?? panic("tree")).1, root)
+
+    // A coverage profile from two test binaries, merged.
+    let profile = "mode: set\nexample.com/app/main.go:3.14,5.2 2 1\nexample.com/app/main.go:7.1,9.2 3 0\nexample.com/app/main.go:3.14,5.2 2 0\n"
+    let ps = coverprofile.parse(profile) ?? panic("profile")
+    assert_eq(ps.len(), 1)
+    assert_eq(ps[0].blocks.len(), 2)
+    assert_eq(coverprofile.statements(ps), (2, 5))
+    print("b31: ok")
+}
