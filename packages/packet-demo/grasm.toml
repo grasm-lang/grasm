@@ -1,0 +1,24 @@
+[package]
+name = "packet_demo"
+version = "1.0.0"
+capabilities = ["io"]
+
+[dependencies.icmp]
+path = "../icmp"
+version = "^1.0.0"
+
+[dependencies.icmpv6]
+path = "../icmpv6"
+version = "^1.0.0"
+
+[dependencies.arp]
+path = "../arp"
+version = "^1.0.0"
+
+[dependencies.gre]
+path = "../gre"
+version = "^1.0.0"
+
+[dependencies.vxlan]
+path = "../vxlan"
+version = "^1.0.0"

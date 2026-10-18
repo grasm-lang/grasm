@@ -1,0 +1,81 @@
+// ARP (RFC 826): how a host on a LAN finds the hardware address behind an
+// IP address, and how it announces its own.
+//
+// The packet carries its own address lengths, so the same layout serves
+// Ethernet with IPv4 (6 and 4 bytes, by far the common case), InfiniBand,
+// and anything else; addresses are kept as bytes of whatever length the
+// header declares, and read as text by the caller who knows what they are.
+// A header that declares more address bytes than arrived is refused rather
+// than read short.
+
+type ArpPacket = {
+    hwtype: i64,
+    ptype: i64,
+    hwlen: i64,
+    plen: i64,
+    op: i64,
+    hwsrc: bytes,
+    psrc: bytes,
+    hwdst: bytes,
+    pdst: bytes,
+}
+
+type ArpError =
+    | TooShort(found: i64, needed: i64)
+
+pub fn request() -> i64 { 1 }
+pub fn reply() -> i64 { 2 }
+
+pub fn decode(data: bytes) -> ArpPacket ! ArpError {
+    if data.len() < 8 {
+        fail(TooShort(data.len(), 8))
+    }
+    let hwlen = data.at(4)
+    let plen = data.at(5)
+    let need = 8 + 2 * hwlen + 2 * plen
+    if data.len() < need {
+        fail(TooShort(data.len(), need))
+    }
+    var at = 8
+    let hwsrc = data.slice(at, at + hwlen)
+    at = at + hwlen
+    let psrc = data.slice(at, at + plen)
+    at = at + plen
+    let hwdst = data.slice(at, at + hwlen)
+    at = at + hwlen
+    ArpPacket{ hwtype: data.at(0) * 256 + data.at(1), ptype: data.at(2) * 256 + data.at(3),
+        hwlen: hwlen, plen: plen, op: data.at(6) * 256 + data.at(7), hwsrc: hwsrc, psrc: psrc,
+        hwdst: hwdst, pdst: data.slice(at, at + plen) }
+}
+
+fn pad(b: bytes, n: i64) -> bytes {
+    if b.len() >= n {
+        return b.slice(0, n)
+    }
+    b.concat(bytes_filled(n - b.len(), 0))
+}
+
+/// The packet, with each address cut or zero-padded to the declared length.
+pub fn encode(a: ArpPacket) -> bytes {
+    bytes_of([a.hwtype.ushr(8), a.hwtype.bit_and(255), a.ptype.ushr(8), a.ptype.bit_and(255),
+        a.hwlen, a.plen, a.op.ushr(8), a.op.bit_and(255)])
+        .concat(pad(a.hwsrc, a.hwlen)).concat(pad(a.psrc, a.plen))
+        .concat(pad(a.hwdst, a.hwlen)).concat(pad(a.pdst, a.plen))
+}
+
+/// An Ethernet/IPv4 request: who has `target`? Tell `sender`.
+pub fn who_has(sender_mac: bytes, sender_ip: bytes, target_ip: bytes) -> ArpPacket {
+    ArpPacket{ hwtype: 1, ptype: 2048, hwlen: 6, plen: 4, op: 1, hwsrc: sender_mac,
+        psrc: sender_ip, hwdst: bytes_filled(6, 0), pdst: target_ip }
+}
+
+/// A gratuitous ARP: a host announcing its own address, sender and target
+/// IP the same, as a reply to nobody.
+pub fn gratuitous(mac: bytes, ip: bytes) -> ArpPacket {
+    ArpPacket{ hwtype: 1, ptype: 2048, hwlen: 6, plen: 4, op: 2, hwsrc: mac, psrc: ip,
+        hwdst: bytes_filled(6, 255), pdst: ip }
+}
+
+pub fn is_gratuitous(a: ArpPacket) -> bool {
+    a.psrc.to_list() == a.pdst.to_list()
+}

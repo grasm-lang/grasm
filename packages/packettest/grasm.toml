@@ -1,0 +1,36 @@
+[package]
+name = "packettest"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.icmp]
+path = "../icmp"
+version = "^1.0.0"
+
+[dependencies.icmpv6]
+path = "../icmpv6"
+version = "^1.0.0"
+
+[dependencies.arp]
+path = "../arp"
+version = "^1.0.0"
+
+[dependencies.vlan]
+path = "../vlan"
+version = "^1.0.0"
+
+[dependencies.gre]
+path = "../gre"
+version = "^1.0.0"
+
+[dependencies.vxlan]
+path = "../vxlan"
+version = "^1.0.0"
+
+[dependencies.geneve]
+path = "../geneve"
+version = "^1.0.0"
+
+[dependencies.sllcap]
+path = "../sllcap"
+version = "^1.0.0"

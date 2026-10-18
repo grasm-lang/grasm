@@ -1,0 +1,46 @@
+// VXLAN (RFC 7348): the eight-byte header that carries an Ethernet frame
+// over UDP port 4789 between hypervisors, and its extensions -- the Group
+// Policy Option (a policy ID for microsegmentation) and VXLAN-GPE (a next
+// protocol, so the payload need not be Ethernet).
+//
+// The flags byte says which: `I` (0x08) that the VNI is valid, `G` (0x80)
+// group policy, `P` (0x04) GPE. The header is decoded field by field into
+// the one layout that covers all three, as Linux and scapy read it.
+
+type VxlanHeader = {
+    flags: i64,
+    gpflags: i64,
+    gpid: i64,
+    next_protocol: i64,
+    vni: i64,
+    reserved: i64,
+    payload: bytes,
+}
+
+type VxlanError =
+    | TooShort(found: i64)
+
+pub fn decode(data: bytes) -> VxlanHeader ! VxlanError {
+    if data.len() < 8 {
+        fail(TooShort(data.len()))
+    }
+    VxlanHeader{ flags: data.at(0), gpflags: data.at(1), gpid: data.at(2) * 256 + data.at(3),
+        next_protocol: data.at(3), vni: data.at(4).shl(16).bit_or(data.at(5).shl(8))
+            .bit_or(data.at(6)), reserved: data.at(7), payload: data.slice(8, data.len()) }
+}
+
+/// The header. With the GPE bit set, byte 3 is the next protocol; with the
+/// group-policy bit set, bytes 2 and 3 are the policy ID.
+pub fn encode(h: VxlanHeader) -> bytes {
+    let gpe = h.flags.bit_and(4) != 0
+    let b2 = if gpe { 0 } else { h.gpid.ushr(8).bit_and(255) }
+    let b3 = if gpe { h.next_protocol.bit_and(255) } else { h.gpid.bit_and(255) }
+    bytes_of([h.flags.bit_and(255), h.gpflags.bit_and(255), b2, b3, h.vni.ushr(16).bit_and(255),
+        h.vni.ushr(8).bit_and(255), h.vni.bit_and(255), h.reserved.bit_and(255)]).concat(h.payload)
+}
+
+/// A plain VXLAN header for a network identifier.
+pub fn for_vni(vni: i64, payload: bytes) -> VxlanHeader {
+    VxlanHeader{ flags: 8, gpflags: 0, gpid: 0, next_protocol: 0, vni: vni, reserved: 0,
+        payload: payload }
+}

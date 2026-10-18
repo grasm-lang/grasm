@@ -145,10 +145,12 @@ here; they landed as one package, `ecc`, with B1 -- see below.
 `svgpath` `hmtx` `os2table`
 
 **B14. Packets, the Internet** (scapy) —
-`ethernet` `vlan` `arp` `ipv4hdr` `ipv6hdr` `tcphdr` `udphdr` `icmp`
-`icmpv6` `dhcp` `dhcpv6` `gre` `vxlan` `geneve` `sctp` `esp` `ikev2`
+`vlan` `arp` `icmp` `icmpv6` `dhcp` `dhcpv6` `gre` `vxlan` `geneve` `sctp` `esp` `ikev2`
 `stun` `rtp` `sixlowpan` `llmnr` `nbns`
 `pcapng` `pflog` `sllcap`
+
+Ethernet, IPv4, IPv6, TCP and UDP were candidates here and are already
+`packets`; they came off the list by rule 7.
 
 **B15. Packets, routing, links and LANs** (scapy) —
 `igmp` `mpls` `lldp` `stp` `cdp` `rip` `ospf` `bgp` `eigrp` `isis` `pim`
@@ -222,6 +224,13 @@ day its reference is installed.
 
 ## Landed
 
+- [x] **B14, first part: links and tunnels** — `icmp` `icmpv6` `arp` `vlan`
+  `gre` `vxlan` `geneve` `sllcap`, and the harness `packettest`. 5,202 cases
+  against scapy: every packet built by scapy from random fields, decoded to
+  scapy's own reading of it, and re-encoded to scapy's bytes -- checksums,
+  lengths and ICMPv6's pseudo-header included -- with damaged checksums
+  reported as damaged.
+
 - [x] **B1, Go's template language** — `gotemplate`, checked through
   `gostdtest2`. 12,000 templates against Go's `text/template` -- 9,000
   generated from every construct, half of them well-typed for one Helm-like
@@ -271,13 +280,13 @@ day its reference is installed.
 | | |
 |---|---|
 | At the start | 669 |
-| Now | 690 |
-| Candidates above | 310 packages in 27 batches, plus `ecc` and `rfc6979` |
+| Now | 699 |
+| Candidates above | 305 packages in 27 batches, plus `ecc`, `rfc6979` and `goprintf` |
 | Harnesses, one a batch | 27 |
-| If every candidate lands | 1008 |
+| If every candidate lands | 1004 |
 | Target | 1000 |
 
-The margin over 1000 is 8. It is there because some
+The margin over 1000 is 4. It is there because some
 candidate will turn out to exist already under a name the grep missed, or to
 disagree with its oracle in a way that says the oracle is the better
 package, and the plan should not need rewriting when that happens.

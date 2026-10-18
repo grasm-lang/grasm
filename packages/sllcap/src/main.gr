@@ -1,0 +1,79 @@
+// Linux "cooked" capture headers, SLL and SLL2: what `tcpdump -i any`
+// records instead of an Ethernet header, since the "any" device has no one
+// link layer. A capture taken that way has link type 113 (SLL) or 276
+// (SLL2), and every packet starts with one of these.
+//
+// SLL is sixteen bytes: who the packet was for (to us, broadcast, sent by
+// us...), the link-layer address type and length, up to eight address
+// bytes, and the protocol. SLL2 is twenty and adds the interface index. The
+// address field is always eight bytes on the wire, whatever its length.
+
+type SllHeader = {
+    version: i64,
+    pkttype: i64,
+    lladdrtype: i64,
+    lladdrlen: i64,
+    src: bytes,
+    proto: i64,
+    ifindex: i64,
+    reserved: i64,
+    payload: bytes,
+}
+
+type SllError =
+    | TooShort(found: i64)
+
+fn word16(b: bytes, at: i64) -> i64 {
+    b.at(at) * 256 + b.at(at + 1)
+}
+
+/// An SLL header (link type 113).
+pub fn decode_v1(data: bytes) -> SllHeader ! SllError {
+    if data.len() < 16 {
+        fail(TooShort(data.len()))
+    }
+    SllHeader{ version: 1, pkttype: word16(data, 0), lladdrtype: word16(data, 2),
+        lladdrlen: word16(data, 4), src: data.slice(6, 14), proto: word16(data, 14), ifindex: 0,
+        reserved: 0, payload: data.slice(16, data.len()) }
+}
+
+/// An SLL2 header (link type 276).
+pub fn decode_v2(data: bytes) -> SllHeader ! SllError {
+    if data.len() < 20 {
+        fail(TooShort(data.len()))
+    }
+    SllHeader{ version: 2, proto: word16(data, 0), reserved: word16(data, 2),
+        ifindex: word16(data, 4) * 65536 + word16(data, 6), lladdrtype: word16(data, 8),
+        pkttype: data.at(10), lladdrlen: data.at(11), src: data.slice(12, 20),
+        payload: data.slice(20, data.len()) }
+}
+
+fn addr8(b: bytes) -> bytes {
+    if b.len() >= 8 {
+        return b.slice(0, 8)
+    }
+    b.concat(bytes_filled(8 - b.len(), 0))
+}
+
+fn be16(v: i64) -> bytes {
+    bytes_of([v.ushr(8).bit_and(255), v.bit_and(255)])
+}
+
+/// The header in the version it says, then the payload.
+pub fn encode(h: SllHeader) -> bytes {
+    if h.version == 2 {
+        return be16(h.proto).concat(be16(h.reserved)).concat(be16(h.ifindex.ushr(16)))
+            .concat(be16(h.ifindex.bit_and(65535))).concat(be16(h.lladdrtype))
+            .concat(bytes_of([h.pkttype.bit_and(255), h.lladdrlen.bit_and(255)]))
+            .concat(addr8(h.src)).concat(h.payload)
+    }
+    be16(h.pkttype).concat(be16(h.lladdrtype)).concat(be16(h.lladdrlen)).concat(addr8(h.src))
+        .concat(be16(h.proto)).concat(h.payload)
+}
+
+/// What `pkttype` means: 0 to us, 1 broadcast, 2 multicast, 3 to another
+/// host, 4 sent by us.
+pub fn direction(pkttype: i64) -> str {
+    let names = ["host", "broadcast", "multicast", "otherhost", "outgoing"]
+    if pkttype >= 0 and pkttype < 5 { names[pkttype] } else { "unknown" }
+}

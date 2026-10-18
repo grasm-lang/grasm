@@ -1,0 +1,84 @@
+// Geneve (RFC 8926): the overlay header OVN, AWS Gateway Load Balancer and
+// Antrea use, and VXLAN's successor -- because its options are typed and
+// variable, so a network can carry metadata VXLAN's fixed header cannot.
+//
+// Eight fixed bytes -- version, the options' length in 4-byte words, the
+// OAM and critical bits, the protocol of the payload, a 24-bit VNI -- then
+// the options, each a class, a type and a length in words before its data.
+// The declared options length is checked against the options themselves,
+// so a header that lies about its length is refused.
+
+type GeneveOption = {
+    classid: i64,
+    kind: i64,
+    reserved: i64,
+    data: bytes,
+}
+
+type GeneveHeader = {
+    version: i64,
+    oam: i64,
+    critical: i64,
+    reserved: i64,
+    proto: i64,
+    vni: i64,
+    reserved2: i64,
+    options: [GeneveOption],
+    payload: bytes,
+}
+
+type GeneveError =
+    | TooShort(found: i64)
+    | BadOptions
+
+pub fn decode(data: bytes) -> GeneveHeader ! GeneveError {
+    if data.len() < 8 {
+        fail(TooShort(data.len()))
+    }
+    let optlen = data.at(0).bit_and(63) * 4
+    if data.len() < 8 + optlen {
+        fail(TooShort(data.len()))
+    }
+    var options: [GeneveOption] = []
+    var at = 8
+    while at < 8 + optlen {
+        if at + 4 > 8 + optlen {
+            fail(BadOptions)
+        }
+        let n = data.at(at + 3).bit_and(31) * 4
+        if at + 4 + n > 8 + optlen {
+            fail(BadOptions)
+        }
+        options.push(GeneveOption{ classid: data.at(at) * 256 + data.at(at + 1),
+            kind: data.at(at + 2), reserved: data.at(at + 3).ushr(5),
+            data: data.slice(at + 4, at + 4 + n) })
+        at = at + 4 + n
+    }
+    GeneveHeader{ version: data.at(0).ushr(6), oam: data.at(1).ushr(7),
+        critical: data.at(1).ushr(6).bit_and(1), reserved: data.at(1).bit_and(63),
+        proto: data.at(2) * 256 + data.at(3),
+        vni: data.at(4).shl(16).bit_or(data.at(5).shl(8)).bit_or(data.at(6)),
+        reserved2: data.at(7), options: options, payload: data.slice(8 + optlen, data.len()) }
+}
+
+/// The header, with the options' length computed from the options. Each
+/// option's data is padded with zeros to a whole number of words.
+pub fn encode(h: GeneveHeader) -> bytes {
+    var opts: [i64] = []
+    for o in h.options {
+        let words = (o.data.len() + 3) / 4
+        opts.push(o.classid.ushr(8).bit_and(255))
+        opts.push(o.classid.bit_and(255))
+        opts.push(o.kind.bit_and(255))
+        opts.push(o.reserved.bit_and(7).shl(5).bit_or(words.bit_and(31)))
+        for i in 0..words * 4 {
+            opts.push(if i < o.data.len() { o.data.at(i) } else { 0 })
+        }
+    }
+    let words = opts.len() / 4
+    bytes_of([h.version.bit_and(3).shl(6).bit_or(words.bit_and(63)),
+        h.oam.bit_and(1).shl(7).bit_or(h.critical.bit_and(1).shl(6)).bit_or(h.reserved.bit_and(63)),
+        h.proto.ushr(8).bit_and(255), h.proto.bit_and(255), h.vni.ushr(16).bit_and(255),
+        h.vni.ushr(8).bit_and(255), h.vni.bit_and(255), h.reserved2.bit_and(255)])
+        .concat(bytes_of(opts)).concat(h.payload)
+}

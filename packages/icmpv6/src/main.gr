@@ -1,0 +1,143 @@
+// ICMPv6 (RFC 4443) and Neighbor Discovery (RFC 4861): IPv6's error
+// messages and ping, and the messages that replace ARP and DHCP's router
+// half -- router solicitation and advertisement, neighbor solicitation and
+// advertisement, redirect.
+//
+// ## The checksum needs the addresses
+//
+// Unlike ICMP for IPv4, the ICMPv6 checksum covers a pseudo-header: the
+// IPv6 source and destination, the message length and next-header 58. So
+// `encode` and `checksum_holds` take the two addresses, and a checker that
+// sums the message alone rejects every packet.
+//
+// ## Neighbor Discovery options
+//
+// The ND messages end in options -- the sender's link-layer address, the
+// prefixes a router advertises, the MTU, DNS servers -- each a type and a
+// length in eight-byte units. `nd_options` reads them from where each
+// message's fixed part ends, and refuses a zero length, which RFC 4861 says
+// to discard because it would loop forever.
+import packets
+
+type Icmpv6Message = {
+    kind: i64,
+    code: i64,
+    checksum: i64,
+    body: bytes,
+}
+
+type NdOption = {
+    kind: i64,
+    length: i64,
+    data: bytes,
+}
+
+type Icmpv6Error =
+    | TooShort(found: i64)
+    | BadOption
+
+pub fn decode(data: bytes) -> Icmpv6Message ! Icmpv6Error {
+    if data.len() < 4 {
+        fail(TooShort(data.len()))
+    }
+    Icmpv6Message{ kind: data.at(0), code: data.at(1), checksum: data.at(2) * 256 + data.at(3),
+        body: data.slice(4, data.len()) }
+}
+
+fn pseudo_sum(src: bytes, dst: bytes, msg: bytes) -> i64 {
+    let n = msg.len()
+    let pseudo = src.concat(dst).concat(bytes_of([n.ushr(24).bit_and(255), n.ushr(16).bit_and(255),
+        n.ushr(8).bit_and(255), n.bit_and(255), 0, 0, 0, 58]))
+    packets.checksum(pseudo.concat(msg))
+}
+
+/// The message with its checksum computed over the pseudo-header for
+/// these sixteen-byte addresses.
+pub fn encode(m: Icmpv6Message, src: bytes, dst: bytes) -> bytes {
+    var out = bytes_of([m.kind.bit_and(255), m.code.bit_and(255), 0, 0]).concat(m.body)
+    let sum = pseudo_sum(src, dst, out)
+    out.set(2, sum.ushr(8))
+    out.set(3, sum.bit_and(255))
+    out
+}
+
+pub fn checksum_holds(data: bytes, src: bytes, dst: bytes) -> bool {
+    data.len() >= 4 and pseudo_sum(src, dst, data) == 0
+}
+
+/// Where a message's options begin within its body, or -1 for a message
+/// that has none.
+fn options_at(kind: i64) -> i64 {
+    if kind == 133 { 4 } else if kind == 134 { 12 } else if kind == 135 or kind == 136 { 20 } else if kind == 137 { 36 } else { -1 }
+}
+
+/// The options of a Neighbor Discovery message.
+pub fn nd_options(m: Icmpv6Message) -> [NdOption] ! Icmpv6Error {
+    let start = options_at(m.kind)
+    var out: [NdOption] = []
+    if start < 0 {
+        return out
+    }
+    if m.body.len() < start {
+        fail(TooShort(m.body.len() + 4))
+    }
+    var at = start
+    while at < m.body.len() {
+        if at + 2 > m.body.len() {
+            fail(BadOption)
+        }
+        let units = m.body.at(at + 1)
+        if units == 0 or at + units * 8 > m.body.len() {
+            fail(BadOption)
+        }
+        out.push(NdOption{ kind: m.body.at(at), length: units,
+            data: m.body.slice(at + 2, at + units * 8) })
+        at = at + units * 8
+    }
+    out
+}
+
+/// Options laid out for a message: each padded with zeros to a whole
+/// number of eight-byte units, its length computed.
+pub fn encode_options(options: [NdOption]) -> bytes {
+    var out = bytes_of([])
+    for o in options {
+        let units = (o.data.len() + 2 + 7) / 8
+        out = out.concat(bytes_of([o.kind.bit_and(255), units])).concat(o.data)
+            .concat(bytes_filled(units * 8 - 2 - o.data.len(), 0))
+    }
+    out
+}
+
+fn word16(b: bytes, at: i64) -> i64 {
+    b.at(at) * 256 + b.at(at + 1)
+}
+
+pub fn echo_id(m: Icmpv6Message) -> i64 {
+    word16(m.body, 0)
+}
+
+pub fn echo_seq(m: Icmpv6Message) -> i64 {
+    word16(m.body, 2)
+}
+
+/// The target address of a neighbor solicitation, advertisement or
+/// redirect.
+pub fn target(m: Icmpv6Message) -> bytes {
+    m.body.slice(4, 20)
+}
+
+/// A neighbor advertisement's flags: router, solicited, override.
+pub fn na_flags(m: Icmpv6Message) -> (bool, bool, bool) {
+    let f = m.body.at(0)
+    (f.bit_and(128) != 0, f.bit_and(64) != 0, f.bit_and(32) != 0)
+}
+
+/// A router advertisement's hop limit and router lifetime in seconds.
+pub fn ra_hop_limit(m: Icmpv6Message) -> i64 {
+    m.body.at(0)
+}
+
+pub fn ra_lifetime(m: Icmpv6Message) -> i64 {
+    word16(m.body, 2)
+}

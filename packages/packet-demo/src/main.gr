@@ -1,0 +1,55 @@
+// Packet headers, each asserted against the bytes scapy built for the same
+// fields. scripts/packet_diff.sh holds them to scapy case for case; this is
+// the short version every engine runs.
+import icmp
+import icmpv6
+import arp
+import gre
+import vxlan
+
+fn hex(raw: bytes) -> str {
+    let digits = "0123456789abcdef"
+    var out = ""
+    var i = 0
+    while i < raw.len() {
+        out = out + digits.substr(raw.at(i) / 16, 1) + digits.substr(raw.at(i) % 16, 1)
+        i = i + 1
+    }
+    out
+}
+
+fn main() / {io} {
+    let ping = icmp.encode(icmp.echo(icmp.echo_request(), 4660, 1, "abc".to_bytes()))
+    assert_eq(hex(ping), "0800216812340001616263")
+    assert(icmp.checksum_holds(ping))
+
+    let who = arp.who_has(bytes_of([2, 0, 0, 0, 0, 1]), bytes_of([10, 0, 0, 1]),
+        bytes_of([10, 0, 0, 2]))
+    assert_eq(hex(arp.encode(who)), "00010800060400010200000000010a0000010000000000000a000002")
+
+    let tunnel = GreHeader{ chksum_present: 1, routing_present: 0, key_present: 1,
+        seqnum_present: 0, strict_route_source: 0, recursion_control: 0, flags: 0, version: 0,
+        proto: 2048, chksum: 0, offset: 0, key: 7, sequence_number: 0, payload: "x".to_bytes() }
+    assert_eq(hex(gre.encode(tunnel)), "a0000800dff700000000000778")
+
+    // The ICMPv6 checksum covers the addresses as well as the message.
+    var src = bytes_filled(16, 0)
+    src.set(0, 254)
+    src.set(1, 128)
+    src.set(15, 1)
+    var dst = bytes_filled(16, 0)
+    dst.set(0, 255)
+    dst.set(1, 2)
+    dst.set(15, 1)
+    let echo = Icmpv6Message{ kind: 128, code: 0, checksum: 0,
+        body: bytes_of([0, 1, 0, 2]).concat("hi".to_bytes()) }
+    let wire = icmpv6.encode(echo, src, dst)
+    assert_eq(hex(wire), "800019c9000100026869")
+    assert(icmpv6.checksum_holds(wire, src, dst))
+    var other = dst
+    other.set(15, 2)
+    assert(not icmpv6.checksum_holds(wire, src, other))
+
+    assert_eq(hex(vxlan.encode(vxlan.for_vni(4242, bytes_of([])))), "0800000000109200")
+    print("packet: ok")
+}

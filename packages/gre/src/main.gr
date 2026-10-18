@@ -1,0 +1,115 @@
+// GRE (RFC 2784, with RFC 2890's key and sequence number): the tunnel
+// header under PPTP, ERSPAN, many site-to-site VPNs and cloud overlays.
+//
+// Four bytes of flags, version and protocol type, then whichever optional
+// words the flags announce, in a fixed order: checksum and offset, key,
+// sequence number. The legacy RFC 1701 flags (routing present, strict
+// source route, recursion control) are kept as they arrived. The checksum,
+// when present, covers the GRE header and its payload; `encode` computes it.
+import packets
+
+type GreHeader = {
+    chksum_present: i64,
+    routing_present: i64,
+    key_present: i64,
+    seqnum_present: i64,
+    strict_route_source: i64,
+    recursion_control: i64,
+    flags: i64,
+    version: i64,
+    proto: i64,
+    chksum: i64,
+    offset: i64,
+    key: i64,
+    sequence_number: i64,
+    payload: bytes,
+}
+
+type GreError =
+    | TooShort(found: i64)
+
+fn word16(b: bytes, at: i64) -> i64 {
+    b.at(at) * 256 + b.at(at + 1)
+}
+
+fn word32(b: bytes, at: i64) -> i64 {
+    word16(b, at) * 65536 + word16(b, at + 2)
+}
+
+fn put16(inout out: [i64], v: i64) {
+    out.push(v.ushr(8).bit_and(255))
+    out.push(v.bit_and(255))
+}
+
+fn put32(inout out: [i64], v: i64) {
+    put16(out, v.ushr(16).bit_and(65535))
+    put16(out, v.bit_and(65535))
+}
+
+pub fn decode(data: bytes) -> GreHeader ! GreError {
+    if data.len() < 4 {
+        fail(TooShort(data.len()))
+    }
+    let b0 = data.at(0)
+    let b1 = data.at(1)
+    var h = GreHeader{ chksum_present: b0.ushr(7), routing_present: b0.ushr(6).bit_and(1),
+        key_present: b0.ushr(5).bit_and(1), seqnum_present: b0.ushr(4).bit_and(1),
+        strict_route_source: b0.ushr(3).bit_and(1), recursion_control: b0.bit_and(7),
+        flags: b1.ushr(3), version: b1.bit_and(7), proto: word16(data, 2), chksum: 0, offset: 0,
+        key: 0, sequence_number: 0, payload: bytes_of([]) }
+    var at = 4
+    if h.chksum_present == 1 or h.routing_present == 1 {
+        if data.len() < at + 4 {
+            fail(TooShort(data.len()))
+        }
+        h.chksum = word16(data, at)
+        h.offset = word16(data, at + 2)
+        at = at + 4
+    }
+    if h.key_present == 1 {
+        if data.len() < at + 4 {
+            fail(TooShort(data.len()))
+        }
+        h.key = word32(data, at)
+        at = at + 4
+    }
+    if h.seqnum_present == 1 {
+        if data.len() < at + 4 {
+            fail(TooShort(data.len()))
+        }
+        h.sequence_number = word32(data, at)
+        at = at + 4
+    }
+    h.payload = data.slice(at, data.len())
+    h
+}
+
+/// The header and payload. With the checksum bit set, the checksum is
+/// computed over everything, and `chksum` is ignored.
+pub fn encode(h: GreHeader) -> bytes {
+    var out: [i64] = []
+    out.push(h.chksum_present.shl(7).bit_or(h.routing_present.shl(6)).bit_or(h.key_present.shl(5))
+            .bit_or(h.seqnum_present.shl(4)).bit_or(h.strict_route_source.shl(3))
+            .bit_or(h.recursion_control.bit_and(7)))
+    out.push(h.flags.bit_and(31).shl(3).bit_or(h.version.bit_and(7)))
+    put16(out, h.proto)
+    var sum_at = -1
+    if h.chksum_present == 1 or h.routing_present == 1 {
+        sum_at = out.len()
+        put16(out, if h.chksum_present == 1 { 0 } else { h.chksum })
+        put16(out, h.offset)
+    }
+    if h.key_present == 1 {
+        put32(out, h.key)
+    }
+    if h.seqnum_present == 1 {
+        put32(out, h.sequence_number)
+    }
+    var whole = bytes_of(out).concat(h.payload)
+    if h.chksum_present == 1 {
+        let sum = packets.checksum(whole)
+        whole.set(sum_at, sum.ushr(8))
+        whole.set(sum_at + 1, sum.bit_and(255))
+    }
+    whole
+}

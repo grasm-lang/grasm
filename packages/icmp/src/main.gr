@@ -1,0 +1,90 @@
+// ICMP for IPv4 (RFC 792): what `ping` and `traceroute` speak, and how a
+// router says a packet could not be delivered.
+//
+// Every message is a type, a code, a checksum and four bytes whose meaning
+// depends on the type -- an identifier and sequence number for echo, a
+// gateway for a redirect, a pointer for a parameter problem, the next hop's
+// MTU for "fragmentation needed" -- followed by a body: the echo payload, or
+// the start of the packet that caused the error. The four bytes are kept as
+// they arrived and read through the accessor that fits the type, so a
+// message of a type this does not name still decodes and re-encodes exactly.
+//
+// The checksum covers the whole message and nothing else -- unlike TCP and
+// UDP there is no pseudo-header. `encode` computes it; `decode` reports
+// whether the one that arrived holds.
+import packets
+
+type IcmpMessage = {
+    kind: i64,
+    code: i64,
+    checksum: i64,
+    rest: bytes,
+    body: bytes,
+}
+
+type IcmpError =
+    | TooShort(found: i64)
+
+pub fn echo_request() -> i64 { 8 }
+pub fn echo_reply() -> i64 { 0 }
+pub fn unreachable() -> i64 { 3 }
+pub fn redirect() -> i64 { 5 }
+pub fn time_exceeded() -> i64 { 11 }
+pub fn parameter_problem() -> i64 { 12 }
+
+pub fn decode(data: bytes) -> IcmpMessage ! IcmpError {
+    if data.len() < 8 {
+        fail(TooShort(data.len()))
+    }
+    IcmpMessage{ kind: data.at(0), code: data.at(1), checksum: data.at(2) * 256 + data.at(3),
+        rest: data.slice(4, 8), body: data.slice(8, data.len()) }
+}
+
+/// The message on the wire, with its checksum computed.
+pub fn encode(m: IcmpMessage) -> bytes {
+    var out = bytes_of([m.kind, m.code, 0, 0]).concat(m.rest).concat(m.body)
+    let sum = packets.checksum(out)
+    out.set(2, sum.ushr(8))
+    out.set(3, sum.bit_and(255))
+    out
+}
+
+/// Whether the checksum that arrived is the one the message needs.
+pub fn checksum_holds(data: bytes) -> bool {
+    data.len() >= 8 and packets.checksum(data) == 0
+}
+
+fn word(b: bytes, at: i64) -> i64 {
+    b.at(at) * 256 + b.at(at + 1)
+}
+
+/// An echo request or reply with its identifier, sequence and payload.
+pub fn echo(kind: i64, id: i64, seq: i64, payload: bytes) -> IcmpMessage {
+    IcmpMessage{ kind: kind, code: 0, checksum: 0,
+        rest: bytes_of([id.ushr(8).bit_and(255), id.bit_and(255), seq.ushr(8).bit_and(255),
+            seq.bit_and(255)]), body: payload }
+}
+
+pub fn echo_id(m: IcmpMessage) -> i64 {
+    word(m.rest, 0)
+}
+
+pub fn echo_seq(m: IcmpMessage) -> i64 {
+    word(m.rest, 2)
+}
+
+/// A redirect's gateway, as four address bytes.
+pub fn gateway(m: IcmpMessage) -> bytes {
+    m.rest
+}
+
+/// A parameter problem's pointer to the offending byte.
+pub fn pointer(m: IcmpMessage) -> i64 {
+    m.rest.at(0)
+}
+
+/// "Fragmentation needed" (type 3, code 4): the next hop's MTU, which path
+/// MTU discovery runs on (RFC 1191).
+pub fn next_hop_mtu(m: IcmpMessage) -> i64 {
+    word(m.rest, 2)
+}

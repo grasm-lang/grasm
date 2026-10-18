@@ -1,0 +1,61 @@
+// IEEE 802.1Q VLAN tags, and 802.1ad's stacked tags (QinQ).
+//
+// A tag sits between an Ethernet frame's source address and its type: two
+// bytes saying a tag follows (0x8100 for 802.1Q, 0x88a8 for an 802.1ad
+// service tag), then a priority (3 bits), the drop-eligible bit, the
+// 12-bit VLAN number, and the type of what comes next -- which may be
+// another tag. `tags` reads the whole stack.
+
+type VlanTag = {
+    tpid: i64,
+    prio: i64,
+    dei: i64,
+    vlan: i64,
+    inner_type: i64,
+}
+
+type VlanError =
+    | TooShort(found: i64)
+
+pub fn dot1q() -> i64 { 33024 }
+pub fn dot1ad() -> i64 { 34984 }
+
+/// One tag's last four bytes -- the TCI and the inner type -- given the
+/// TPID already read.
+pub fn decode(tpid: i64, data: bytes) -> VlanTag ! VlanError {
+    if data.len() < 4 {
+        fail(TooShort(data.len()))
+    }
+    let tci = data.at(0) * 256 + data.at(1)
+    VlanTag{ tpid: tpid, prio: tci.ushr(13), dei: tci.ushr(12).bit_and(1),
+        vlan: tci.bit_and(4095), inner_type: data.at(2) * 256 + data.at(3) }
+}
+
+/// The four bytes after the TPID.
+pub fn encode(t: VlanTag) -> bytes {
+    let tci = t.prio.bit_and(7).shl(13).bit_or(t.dei.bit_and(1).shl(12)).bit_or(t.vlan.bit_and(4095))
+    bytes_of([tci.ushr(8), tci.bit_and(255), t.inner_type.ushr(8).bit_and(255),
+        t.inner_type.bit_and(255)])
+}
+
+pub fn is_tag_type(ethertype: i64) -> bool {
+    ethertype == 33024 or ethertype == 34984 or ethertype == 37120
+}
+
+/// Every tag in a frame, outermost first, and where the payload starts.
+/// `frame` is a whole Ethernet frame.
+pub fn tags(frame: bytes) -> ([VlanTag], i64) ! VlanError {
+    if frame.len() < 14 {
+        fail(TooShort(frame.len()))
+    }
+    var out: [VlanTag] = []
+    var at = 12
+    var tpid = frame.at(12) * 256 + frame.at(13)
+    while is_tag_type(tpid) {
+        let t = try decode(tpid, frame.slice(at + 2, frame.len()))
+        out.push(t)
+        at = at + 4
+        tpid = t.inner_type
+    }
+    (out, at + 2)
+}

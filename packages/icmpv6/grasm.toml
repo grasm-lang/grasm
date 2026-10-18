@@ -1,0 +1,9 @@
+[package]
+name = "icmpv6"
+version = "1.0.0"
+
+capabilities = []
+
+[dependencies.packets]
+path = "../packets"
+version = "^1.0.0"
