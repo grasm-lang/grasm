@@ -1,0 +1,32 @@
+[package]
+name = "dnssec"
+version = "1.0.0"
+capabilities = []
+
+[dependencies.sha1]
+path = "../sha1"
+version = "^1.0.0"
+
+[dependencies.crypto_hash]
+path = "../crypto_hash"
+version = "^1.0.0"
+
+[dependencies.sha512]
+path = "../sha512"
+version = "^1.0.0"
+
+[dependencies.base32hex]
+path = "../base32hex"
+version = "^1.0.0"
+
+[dependencies.rsa]
+path = "../rsa"
+version = "^1.0.0"
+
+[dependencies.ecdsa]
+path = "../ecdsa"
+version = "^1.0.0"
+
+[dependencies.ed25519]
+path = "../ed25519"
+version = "^1.0.0"

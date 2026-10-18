@@ -1,0 +1,316 @@
+// Well-Known Binary: geometry the way spatial databases store and send it.
+//
+// `packages/wkt` is the text form people type into a query. What comes
+// back over the wire from PostGIS, what a GeoPackage or SpatiaLite file
+// holds, what Shapely and GDAL exchange and what a Parquet "geometry"
+// column contains is the binary form: a byte order, a geometry type, and
+// counts and doubles. EWKB, PostGIS's extension, sets a flag in the type
+// and adds a spatial reference id after it, which is how a database says
+// which coordinate system the numbers are in.
+//
+// Each part of a multi-geometry and each member of a collection is a
+// complete WKB value with its own byte order, so one value can mix both.
+// Polygons are lists of rings, the first the outline and the rest holes;
+// rings are not closed or reoriented here, only carried.
+//
+// This reads and writes the seven two-dimensional types. Three- and
+// four-dimensional values (ISO types 1001 to 3007, or EWKB's Z and M
+// flags) and type codes outside the seven are refused rather than
+// misread, and so is data left over after the value; `decode_prefix` is
+// for values that run on into something else. A count larger than the
+// bytes that follow it is refused before anything is allocated for it.
+//
+// Checked against `github.com/paulmach/orb`'s wkb and ewkb encoders and
+// decoders, in both byte orders.
+
+type WkbError =
+    | WkbTruncated(at: i64)
+    | WkbBadOrder(at: i64, byte: i64)
+    | WkbBadType(at: i64, code: i64)
+    | WkbTrailing(at: i64)
+
+type WkbXY = { x: f64, y: f64 }
+
+type WkbGeometry =
+    | WkbPoint(x: f64, y: f64)
+    | WkbLineString(points: [WkbXY])
+    | WkbPolygon(rings: [[WkbXY]])
+    | WkbMultiPoint(points: [WkbXY])
+    | WkbMultiLineString(lines: [[WkbXY]])
+    | WkbMultiPolygon(polygons: [[[WkbXY]]])
+    | WkbCollection(items: [ref WkbGeometry])
+
+let SRID_FLAG = 536870912
+
+fn u32(data: bytes, at: i64, big: bool) -> i64 {
+    var v = 0
+    var i = 0
+    while i < 4 {
+        let b = if big { data.at(at + i) } else { data.at(at + 3 - i) }
+        v = v * 256 + b
+        i = i + 1
+    }
+    return v
+}
+
+fn f64_at(data: bytes, at: i64, big: bool) -> f64 {
+    var v = 0
+    var i = 0
+    while i < 8 {
+        let b = if big { data.at(at + i) } else { data.at(at + 7 - i) }
+        v = v.shl(8) + b
+        i = i + 1
+    }
+    return v.from_bits()
+}
+
+fn need(data: bytes, at: i64, n: i64) -> () ! WkbError {
+    if n < 0 or at + n > data.len() {
+        fail(WkbTruncated(at))
+    }
+}
+
+/// A header at `at`: byte order, type code, SRID (-1 when absent), and
+/// where the body starts.
+fn header(data: bytes, at: i64, allow_srid: bool) -> (bool, i64, i64, i64) ! WkbError {
+    try need(data, at, 5)
+    let order = data.at(at)
+    if order > 1 {
+        fail(WkbBadOrder(at, order))
+    }
+    let big = order == 0
+    let code = u32(data, at + 1, big)
+    if allow_srid and code.bit_and(SRID_FLAG) != 0 {
+        let plain = code - SRID_FLAG
+        if plain < 1 or plain > 7 {
+            fail(WkbBadType(at + 1, code))
+        }
+        try need(data, at + 5, 4)
+        return (big, plain, u32(data, at + 5, big), at + 9)
+    }
+    if code < 1 or code > 7 {
+        fail(WkbBadType(at + 1, code))
+    }
+    return (big, code, 0 - 1, at + 5)
+}
+
+fn points(data: bytes, at: i64, big: bool) -> ([WkbXY], i64) ! WkbError {
+    try need(data, at, 4)
+    let n = u32(data, at, big)
+    try need(data, at + 4, 16 * n)
+    var out: [WkbXY] = []
+    var i = 0
+    while i < n {
+        let p = at + 4 + 16 * i
+        out.push(WkbXY{ x: f64_at(data, p, big), y: f64_at(data, p + 8, big) })
+        i = i + 1
+    }
+    return (out, at + 4 + 16 * n)
+}
+
+fn rings(data: bytes, at: i64, big: bool) -> ([[WkbXY]], i64) ! WkbError {
+    try need(data, at, 4)
+    let n = u32(data, at, big)
+    // Every ring needs at least its four-byte count.
+    try need(data, at + 4, 4 * n)
+    var out: [[WkbXY]] = []
+    var p = at + 4
+    var i = 0
+    while i < n {
+        let (ring, after) = try points(data, p, big)
+        out.push(ring)
+        p = after
+        i = i + 1
+    }
+    return (out, p)
+}
+
+/// A count of members, each a whole value of `kind` (0 for any), and the
+/// smallest a member can be.
+fn members(data: bytes, at: i64, big: bool, kind: i64, smallest: i64) -> ([WkbGeometry], i64) ! WkbError {
+    try need(data, at, 4)
+    let n = u32(data, at, big)
+    try need(data, at + 4, smallest * n)
+    var out: [WkbGeometry] = []
+    var p = at + 4
+    var i = 0
+    while i < n {
+        let (_b, code, _s, _body) = try header(data, p, false)
+        if kind != 0 and code != kind {
+            fail(WkbBadType(p + 1, code))
+        }
+        let (g, after) = try value(data, p, false)
+        out.push(g)
+        p = after
+        i = i + 1
+    }
+    return (out, p)
+}
+
+fn value(data: bytes, at: i64, allow_srid: bool) -> (WkbGeometry, i64) ! WkbError {
+    let (big, code, _srid, body) = try header(data, at, allow_srid)
+    if code == 1 {
+        try need(data, body, 16)
+        return (WkbPoint(f64_at(data, body, big), f64_at(data, body + 8, big)), body + 16)
+    }
+    if code == 2 {
+        let (ps, after) = try points(data, body, big)
+        return (WkbLineString(ps), after)
+    }
+    if code == 3 {
+        let (rs, after) = try rings(data, body, big)
+        return (WkbPolygon(rs), after)
+    }
+    if code == 4 {
+        let (ms, after) = try members(data, body, big, 1, 21)
+        return (WkbMultiPoint(ms.map(|g| match g {
+            WkbPoint(x, y) -> WkbXY{ x: x, y: y }
+            _ -> WkbXY{ x: 0.0, y: 0.0 }
+        })), after)
+    }
+    if code == 5 {
+        let (ms, after) = try members(data, body, big, 2, 9)
+        return (WkbMultiLineString(ms.map(|g| match g {
+            WkbLineString(ps) -> ps
+            _ -> []
+        })), after)
+    }
+    if code == 6 {
+        let (ms, after) = try members(data, body, big, 3, 9)
+        return (WkbMultiPolygon(ms.map(|g| match g {
+            WkbPolygon(rs) -> rs
+            _ -> []
+        })), after)
+    }
+    let (ms, after) = try members(data, body, big, 0, 5)
+    return (WkbCollection(ms.map(|g| ref(g))), after)
+}
+
+/// A value at the start of `data`, and how many bytes it took.
+pub fn decode_prefix(data: bytes) -> (WkbGeometry, i64) ! WkbError {
+    return try value(data, 0, false)
+}
+
+/// Exactly one WKB value.
+pub fn decode(data: bytes) -> WkbGeometry ! WkbError {
+    let (g, used) = try value(data, 0, false)
+    if used != data.len() {
+        fail(WkbTrailing(used))
+    }
+    return g
+}
+
+/// Exactly one EWKB value: its SRID (0 when it has none) and its geometry.
+pub fn decode_ewkb(data: bytes) -> (i64, WkbGeometry) ! WkbError {
+    let (_big, _code, srid, _body) = try header(data, 0, true)
+    let (g, used) = try value(data, 0, true)
+    if used != data.len() {
+        fail(WkbTrailing(used))
+    }
+    return (if srid < 0 { 0 } else { srid }, g)
+}
+
+fn put32(out: [i64], v: i64, big: bool) -> [i64] {
+    var o = out
+    var i = 0
+    while i < 4 {
+        let shift = if big { 24 - 8 * i } else { 8 * i }
+        o.push(v.ushr(shift).bit_and(255))
+        i = i + 1
+    }
+    return o
+}
+
+fn put_f64(out: [i64], v: f64, big: bool) -> [i64] {
+    let b = v.to_bits()
+    var o = out
+    var i = 0
+    while i < 8 {
+        let shift = if big { 56 - 8 * i } else { 8 * i }
+        o.push(b.ushr(shift).bit_and(255))
+        i = i + 1
+    }
+    return o
+}
+
+fn put_points(out: [i64], ps: [WkbXY], big: bool) -> [i64] {
+    var o = put32(out, ps.len(), big)
+    for p in ps {
+        o = put_f64(put_f64(o, p.x, big), p.y, big)
+    }
+    return o
+}
+
+fn put_header(out: [i64], code: i64, big: bool, srid: i64) -> [i64] {
+    var o = out
+    o.push(if big { 0 } else { 1 })
+    if srid > 0 {
+        return put32(put32(o, code + SRID_FLAG, big), srid, big)
+    }
+    return put32(o, code, big)
+}
+
+fn put_value(out: [i64], g: ref WkbGeometry, big: bool, srid: i64) -> [i64] {
+    return match g {
+        WkbPoint(x, y) -> put_f64(put_f64(put_header(out, 1, big, srid), x, big), y, big)
+        WkbLineString(ps) -> put_points(put_header(out, 2, big, srid), ps, big)
+        WkbPolygon(rs) -> {
+            var o = put32(put_header(out, 3, big, srid), rs.len(), big)
+            for r in rs {
+                o = put_points(o, r, big)
+            }
+            o
+        }
+        WkbMultiPoint(ps) -> {
+            var o = put32(put_header(out, 4, big, srid), ps.len(), big)
+            for p in ps {
+                o = put_value(o, ref(WkbPoint(p.x, p.y)), big, 0)
+            }
+            o
+        }
+        WkbMultiLineString(ls) -> {
+            var o = put32(put_header(out, 5, big, srid), ls.len(), big)
+            for l in ls {
+                o = put_value(o, ref(WkbLineString(l)), big, 0)
+            }
+            o
+        }
+        WkbMultiPolygon(ps) -> {
+            var o = put32(put_header(out, 6, big, srid), ps.len(), big)
+            for p in ps {
+                o = put_value(o, ref(WkbPolygon(p)), big, 0)
+            }
+            o
+        }
+        WkbCollection(items) -> {
+            var o = put32(put_header(out, 7, big, srid), items.len(), big)
+            for item in items {
+                o = put_value(o, item, big, 0)
+            }
+            o
+        }
+    }
+}
+
+/// A geometry as WKB, big- or little-endian throughout.
+pub fn encode(g: WkbGeometry, big_endian: bool) -> bytes {
+    return bytes_of(put_value([], ref(g), big_endian, 0))
+}
+
+/// A geometry as EWKB with a SRID; SRID 0 writes plain WKB.
+pub fn encode_ewkb(g: WkbGeometry, srid: i64, big_endian: bool) -> bytes {
+    return bytes_of(put_value([], ref(g), big_endian, srid))
+}
+
+/// The OGC name of a geometry's type.
+pub fn kind_of(g: WkbGeometry) -> str {
+    return match g {
+        WkbPoint(_, _) -> "Point"
+        WkbLineString(_) -> "LineString"
+        WkbPolygon(_) -> "Polygon"
+        WkbMultiPoint(_) -> "MultiPoint"
+        WkbMultiLineString(_) -> "MultiLineString"
+        WkbMultiPolygon(_) -> "MultiPolygon"
+        WkbCollection(_) -> "GeometryCollection"
+    }
+}

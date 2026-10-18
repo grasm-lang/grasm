@@ -250,10 +250,28 @@ reference on this machine. `langtag` and `ssdp` were looked at and are
 `dbuswire` (no bus), `json5` `hjson` `edn` (no reference parser), `stl`
 `ply` `obj` `gltf` (no mesh library), `proj4` `s2cell` `h3cell` (no
 projection library), `flexlayout` (no layout engine outside a browser),
-`ndarray` (no NumPy), `quic` `http3` (no peer). Each becomes buildable the
+`ndarray` (no NumPy), `quic` `http3` (no peer), `osmpbf` (no
+`paulmach/protoscan` in the module cache). Each becomes buildable the
 day its reference is installed.
 
 ## Landed
+
+- [x] **B28, second part** — `htmlcharset` `svcb` `dnssec` `wkb`, with the
+  harness `b28test2`; the new gate `b28bdiff` runs 10,597 cases against
+  modules in the Go cache, offline: x/net's `DetermineEncoding` over
+  documents built from decoys (comments, raw-text elements, attributes
+  hiding `>`, the 1,024-byte cut) and the Encoding Standard's 228 labels,
+  generated into the package by `scripts/gen_htmlcharset.py`; miekg/dns
+  for SVCB in both forms (and the text the package writes, which miekg
+  must pack back the same), key tags, DS digests, NSEC3 hashes, type
+  bitmaps, validity windows, signatures it makes with random RSA, ECDSA
+  and Ed25519 keys over random record sets, and Ed25519 and P-256
+  signatures made here; orb for WKB and EWKB. Where miekg is lenient
+  (empty RDATA, a record cut before its target, RSA/MD5 key tags summed
+  like the rest) the package keeps RFC 9460 and RFC 4034, and the
+  generator stays clear. One break per package turned it red. `osmpbf`
+  moved to deferred: osm's PBF reader needs `paulmach/protoscan`, whose
+  source is not in the module cache.
 
 - [x] **B14 and B15, the radio and capture leftovers** — `pcapng` `dot11`
   `dot15d4` `btle` `ikev2`, with the harness `packettest4`; the new gate
@@ -492,7 +510,7 @@ day its reference is installed.
 | | |
 |---|---|
 | At the start | 669 |
-| Now | 818 |
+| Now | 823 |
 | Candidates above | 316 packages in 28 batches, plus `ecc`, `rfc6979` and `goprintf` |
 | Harnesses, one a batch | 28 |
 | If every candidate lands | 1016 |

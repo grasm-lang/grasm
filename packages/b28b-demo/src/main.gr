@@ -1,0 +1,41 @@
+// An HTML page's encoding, an HTTPS record, DNSSEC's arithmetic and a WKB
+// geometry. scripts/b28b_diff.sh holds them to Go's x/net, miekg/dns and
+// orb.
+import htmlcharset
+import svcb
+import dnssec
+import wkb
+
+fn main() / {io} {
+    // A meta declaration wins over the guess; the HTTP header wins over both.
+    let page = "<!doctype html><title>x</title><meta charset=\"Latin1\">".to_bytes()
+    assert_eq(htmlcharset.determine(page, ""), ("windows-1252", false))
+    assert_eq(htmlcharset.determine(page, "text/html; charset=utf-8"), ("utf-8", true))
+    assert_eq(htmlcharset.lookup(" X-SJIS "), Some("shift_jis"))
+
+    // An HTTPS record offering HTTP/3 and HTTP/2 on port 8443.
+    match svcb.parse("1 . alpn=\"h3,h2\" port=8443") {
+        Ok(r) -> {
+            assert_eq(svcb.alpn(r), ["h3", "h2"])
+            assert_eq(svcb.port(r), 8443)
+            let back = svcb.decode(svcb.encode(r) ?? bytes_of([])) ?? r
+            assert_eq(svcb.to_text(back), "1 . alpn=\"h3,h2\" port=\"8443\"")
+        }
+        Err(_) -> panic("the record was refused")
+    }
+
+    // RFC 5155's own example: "example", salt aabbccdd, 12 iterations.
+    assert_eq(dnssec.nsec3_hash("example.", bytes_of([170, 187, 204, 221]), 12) ?? "", "0P9MHAVEQVM6T7VBL5LOP2U3T2RP3TOM")
+    assert_eq(dnssec.read_type_bitmap(dnssec.type_bitmap([1, 15, 46])) ?? [], [1, 15, 46])
+
+    // A point in PostGIS's EWKB, with its SRID.
+    let p = wkb.encode_ewkb(WkbPoint(55.3, 25.2), 4326, false)
+    match wkb.decode_ewkb(p) {
+        Ok(sg) -> {
+            assert_eq(sg.0, 4326)
+            assert_eq(wkb.kind_of(sg.1), "Point")
+        }
+        Err(_) -> panic("the point was refused")
+    }
+    print("b28b: ok")
+}

@@ -1,0 +1,923 @@
+// SVCB and HTTPS records (RFC 9460): where a service is and how to reach it.
+//
+// Every major browser now asks DNS for an HTTPS record before it opens a
+// connection. The answer says which protocols the server speaks (so a
+// browser can go straight to HTTP/3), which port, which addresses to try
+// before the A and AAAA answers arrive, the Encrypted Client Hello keys,
+// and, for DNS-over-HTTPS servers, the URI template. SVCB is the same
+// record for other protocols.
+//
+// A record is a priority (0 means an alias to another name, like a CNAME
+// that works at the zone apex), a target name, and parameters, each a
+// numbered key and an opaque value whose meaning depends on the key:
+//
+//     1 . alpn="h3,h2" port="8443" ipv4hint="192.0.2.1" ech="AEX+DQBB..."
+//
+// On the wire the keys must strictly increase and key 65535 is reserved.
+// In text a value may be quoted, and the alpn list adds its own escaping
+// on top of the zone file's: a comma inside a protocol name is `\\,`.
+//
+// This reads and writes both forms as `github.com/miekg/dns` does, and
+// `problems` lists what RFC 9460 section 8 forbids but a parser lets
+// through: a `mandatory` that names itself, repeats a key or names one
+// that is missing, `no-default-alpn` without `alpn`, and parameters on an
+// alias.
+//
+// Checked against miekg/dns: wire records it accepts and refuses, text it
+// packs, and text written here that it must pack the same.
+import bytes_codec
+
+type SvcbError =
+    | SvcbTruncated(at: i64)
+    | SvcbBadName(why: str)
+    | SvcbBadKey(key: str)
+    | SvcbOrder(key: i64)
+    | SvcbBadValue(key: i64, why: str)
+    | SvcbSyntax(why: str)
+
+/// One parameter: its key and its wire value.
+type SvcParam = { key: i64, value: bytes }
+
+type SvcbRecord = { priority: i64, target: str, params: [SvcParam] }
+
+let NAMES: [str] = ["mandatory", "alpn", "no-default-alpn", "port", "ipv4hint", "ech", "ipv6hint", "dohpath", "ohttp"]
+
+/// A key's presentation name: one of the registered names, or `keyN`.
+pub fn key_name(key: i64) -> str {
+    if key >= 0 and key < NAMES.len() {
+        return NAMES[key]
+    }
+    return "key{key}"
+}
+
+/// A key's number from its presentation name, or -1: `keyN` must have no
+/// leading zero, must not be 65535 and must not name a registered key.
+pub fn key_code(name: str) -> i64 {
+    var i = 0
+    while i < NAMES.len() {
+        if NAMES[i] == name {
+            return i
+        }
+        i = i + 1
+    }
+    if not name.starts_with("key") or name.len() < 4 or name.len() > 8 {
+        return 0 - 1
+    }
+    let digits = name.substr(3, name.len() - 3)
+    if digits.code_at(0) == 48 {
+        return 0 - 1
+    }
+    for c in digits.codes() {
+        if c < 48 or c > 57 {
+            return 0 - 1
+        }
+    }
+    let n = digits.parse_int() ?? -1
+    if n < 0 or n >= 65535 or n < NAMES.len() {
+        return 0 - 1
+    }
+    return n
+}
+
+fn u16(data: bytes, at: i64) -> i64 {
+    return data.at(at) * 256 + data.at(at + 1)
+}
+
+fn hexdig(v: i64) -> str {
+    return "0123456789abcdef".substr(v, 1)
+}
+
+// --- Names ---------------------------------------------------------------
+
+fn escape_label_byte(b: i64) -> str {
+    if b < 33 or b > 126 {
+        var d = "{b}"
+        while d.len() < 3 {
+            d = "0" + d
+        }
+        return "\\" + d
+    }
+    let c = b.to_char()
+    if ".\"();@\\$".contains(c) {
+        return "\\" + c
+    }
+    return c
+}
+
+/// A wire name at `at`, uncompressed, and where it ends.
+fn read_name(data: bytes, from: i64) -> (str, i64) ! SvcbError {
+    var at = from
+    var labels: [str] = []
+    var total = 1
+    while true {
+        if at >= data.len() {
+            fail(SvcbTruncated(at))
+        }
+        let n = data.at(at)
+        if n == 0 {
+            break
+        }
+        if n > 63 {
+            fail(SvcbBadName("a compression pointer or a label over 63 bytes"))
+        }
+        if at + 1 + n > data.len() {
+            fail(SvcbTruncated(at))
+        }
+        total = total + n + 1
+        if total > 255 {
+            fail(SvcbBadName("longer than 255 bytes"))
+        }
+        var text = ""
+        var i = 0
+        while i < n {
+            text = text + escape_label_byte(data.at(at + 1 + i))
+            i = i + 1
+        }
+        labels.push(text)
+        at = at + 1 + n
+    }
+    if labels.len() == 0 {
+        return (".", at + 1)
+    }
+    return (labels.join(".") + ".", at + 1)
+}
+
+/// A presentation name's wire form; a relative name is taken as relative
+/// to the root.
+fn write_name(text: str) -> [i64] ! SvcbError {
+    if text == "." {
+        return [0]
+    }
+    var out: [i64] = []
+    var label: [i64] = []
+    var i = 0
+    while i < text.len() {
+        let c = text.code_at(i)
+        if c == 92 {
+            if i + 1 >= text.len() {
+                fail(SvcbBadName("a trailing backslash"))
+            }
+            let d = text.code_at(i + 1)
+            if d >= 48 and d <= 57 {
+                if i + 3 >= text.len() {
+                    fail(SvcbBadName("a short \\DDD escape"))
+                }
+                let v = text.substr(i + 1, 3).parse_int() ?? 256
+                if v > 255 {
+                    fail(SvcbBadName("a bad \\DDD escape"))
+                }
+                label.push(v)
+                i = i + 4
+            } else {
+                label.push(d)
+                i = i + 2
+            }
+            continue
+        }
+        if c == 46 {
+            if label.len() == 0 {
+                fail(SvcbBadName("an empty label"))
+            }
+            if label.len() > 63 {
+                fail(SvcbBadName("a label over 63 bytes"))
+            }
+            out = out + [label.len()] + label
+            label = []
+            i = i + 1
+            continue
+        }
+        if c > 255 {
+            fail(SvcbBadName("a character outside Latin-1"))
+        }
+        label.push(c)
+        i = i + 1
+    }
+    if label.len() > 0 {
+        if label.len() > 63 {
+            fail(SvcbBadName("a label over 63 bytes"))
+        }
+        out = out + [label.len()] + label
+    }
+    out.push(0)
+    if out.len() > 255 {
+        fail(SvcbBadName("longer than 255 bytes"))
+    }
+    return out
+}
+
+// --- Values --------------------------------------------------------------
+
+fn is_ipv4_mapped(v: bytes, at: i64) -> bool {
+    var i = 0
+    while i < 10 {
+        if v.at(at + i) != 0 {
+            return false
+        }
+        i = i + 1
+    }
+    return v.at(at + 10) == 255 and v.at(at + 11) == 255
+}
+
+/// Whether a wire value is acceptable for its key, as miekg/dns unpacks.
+fn check_value(key: i64, v: bytes) -> () ! SvcbError {
+    let n = v.len()
+    if key == 0 and n % 2 != 0 {
+        fail(SvcbBadValue(key, "mandatory is not a list of 16-bit keys"))
+    }
+    if key == 1 {
+        var i = 0
+        while i < n {
+            let len = v.at(i)
+            if len == 0 {
+                fail(SvcbBadValue(key, "an empty alpn identifier"))
+            }
+            if i + 1 + len > n {
+                fail(SvcbBadValue(key, "an alpn identifier runs past the value"))
+            }
+            i = i + 1 + len
+        }
+    }
+    if (key == 2 or key == 8) and n != 0 {
+        fail(SvcbBadValue(key, "takes no value"))
+    }
+    if key == 3 and n != 2 {
+        fail(SvcbBadValue(key, "a port is two bytes"))
+    }
+    if key == 4 and (n == 0 or n % 4 != 0) {
+        fail(SvcbBadValue(key, "ipv4hint is one or more four-byte addresses"))
+    }
+    if key == 6 {
+        if n == 0 or n % 16 != 0 {
+            fail(SvcbBadValue(key, "ipv6hint is one or more sixteen-byte addresses"))
+        }
+        var i = 0
+        while i < n {
+            if is_ipv4_mapped(v, i) {
+                fail(SvcbBadValue(key, "an IPv4-mapped address in ipv6hint"))
+            }
+            i = i + 16
+        }
+    }
+}
+
+/// RDATA to a record.
+pub fn decode(rdata: bytes) -> SvcbRecord ! SvcbError {
+    if rdata.len() < 2 {
+        fail(SvcbTruncated(0))
+    }
+    let (target, after) = try read_name(rdata, 2)
+    var params: [SvcParam] = []
+    var at = after
+    var last = 0 - 1
+    while at < rdata.len() {
+        if at + 4 > rdata.len() {
+            fail(SvcbTruncated(at))
+        }
+        let key = u16(rdata, at)
+        let len = u16(rdata, at + 2)
+        if at + 4 + len > rdata.len() {
+            fail(SvcbTruncated(at))
+        }
+        if key == 65535 {
+            fail(SvcbBadKey("key65535"))
+        }
+        let value = rdata.slice(at + 4, at + 4 + len)
+        try check_value(key, value)
+        if key <= last {
+            fail(SvcbOrder(key))
+        }
+        last = key
+        params.push(SvcParam{ key: key, value: value })
+        at = at + 4 + len
+    }
+    return SvcbRecord{ priority: u16(rdata, 0), target: target, params: params }
+}
+
+/// A record to RDATA: parameters sorted by key; a repeated key or a value
+/// wrong for its key is refused.
+pub fn encode(r: SvcbRecord) -> bytes ! SvcbError {
+    var out: [i64] = [r.priority / 256 % 256, r.priority % 256] + try write_name(r.target)
+    var sorted = r.params
+    sorted.sort_by(|p| p.key)
+    var last = 0 - 1
+    for p in sorted {
+        if p.key == last {
+            fail(SvcbBadKey(key_name(p.key)))
+        }
+        if p.key == 65535 or p.key < 0 {
+            fail(SvcbBadKey("key65535"))
+        }
+        last = p.key
+        try check_value(p.key, p.value)
+        // Mandatory's keys go out in increasing order, whatever order they
+        // were written in.
+        var value = p.value.to_list()
+        if p.key == 0 {
+            var keys: [i64] = []
+            var i = 0
+            while i + 1 < value.len() {
+                keys.push(value[i] * 256 + value[i + 1])
+                i = i + 2
+            }
+            keys.sort()
+            value = []
+            for k in keys {
+                value = value + [k / 256, k % 256]
+            }
+        }
+        out = out + [p.key / 256, p.key % 256, value.len() / 256, value.len() % 256] + value
+    }
+    return bytes_of(out)
+}
+
+// --- Presentation --------------------------------------------------------
+
+/// One byte of a value in zone-file escaping: `\DDD` for anything not
+/// printable, a backslash before `"`, `;`, space and backslash.
+fn escape_value_byte(b: i64) -> str {
+    if b < 32 or b > 126 {
+        var d = "{b}"
+        while d.len() < 3 {
+            d = "0" + d
+        }
+        return "\\" + d
+    }
+    let c = b.to_char()
+    if "\"; \\".contains(c) {
+        return "\\" + c
+    }
+    return c
+}
+
+fn ipv4_text(v: bytes, at: i64) -> str {
+    return "{v.at(at)}.{v.at(at + 1)}.{v.at(at + 2)}.{v.at(at + 3)}"
+}
+
+/// An IPv6 address as Go writes one: the longest run of two or more zero
+/// groups becomes `::`, and an address whose first 80 bits are zero and
+/// next 16 are zero or ones ends in dotted IPv4 (which ipv6hint refuses
+/// for the second, but allows for the first).
+fn ipv6_text(v: bytes, at: i64) -> str {
+    var groups: [i64] = []
+    var i = 0
+    while i < 8 {
+        groups.push(u16(v, at + 2 * i))
+        i = i + 1
+    }
+    var best = 0 - 1
+    var best_len = 1
+    i = 0
+    while i < 8 {
+        if groups[i] == 0 {
+            var j = i
+            while j < 8 and groups[j] == 0 {
+                j = j + 1
+            }
+            if j - i > best_len {
+                best = i
+                best_len = j - i
+            }
+            i = j
+        } else {
+            i = i + 1
+        }
+    }
+    var parts: [str] = []
+    i = 0
+    while i < 8 {
+        if i == best {
+            parts.push(if i == 0 { ":" } else { "" })
+            i = i + best_len
+            if i == 8 {
+                parts.push("")
+            }
+            continue
+        }
+        var g = groups[i]
+        var text = if g == 0 { "0" } else { "" }
+        while g > 0 {
+            text = hexdig(g % 16) + text
+            g = g / 16
+        }
+        parts.push(text)
+        i = i + 1
+    }
+    return parts.join(":")
+}
+
+fn value_text(p: SvcParam) -> str {
+    let v = p.value
+    let n = v.len()
+    if p.key == 0 {
+        var keys: [str] = []
+        var i = 0
+        while i + 1 < n {
+            keys.push(key_name(u16(v, i)))
+            i = i + 2
+        }
+        return keys.join(",")
+    }
+    if p.key == 1 {
+        var ids: [str] = []
+        var i = 0
+        while i < n {
+            let len = v.at(i)
+            var text = ""
+            var k = 0
+            while k < len {
+                let b = v.at(i + 1 + k)
+                text = text + if b == 44 { "\\\\\\044" } else if b == 92 { "\\\\\\092" } else { escape_value_byte(b) }
+                k = k + 1
+            }
+            ids.push(text)
+            i = i + 1 + len
+        }
+        return ids.join(",")
+    }
+    if p.key == 3 {
+        return "{u16(v, 0)}"
+    }
+    if p.key == 4 {
+        var addrs: [str] = []
+        var i = 0
+        while i + 3 < n {
+            addrs.push(ipv4_text(v, i))
+            i = i + 4
+        }
+        return addrs.join(",")
+    }
+    if p.key == 5 {
+        return bytes_codec.encode_base64(v)
+    }
+    if p.key == 6 {
+        var addrs: [str] = []
+        var i = 0
+        while i + 15 < n {
+            addrs.push(ipv6_text(v, i))
+            i = i + 16
+        }
+        return addrs.join(",")
+    }
+    var out = ""
+    var i = 0
+    while i < n {
+        out = out + escape_value_byte(v.at(i))
+        i = i + 1
+    }
+    return out
+}
+
+/// A record's RDATA in presentation form, every value quoted.
+pub fn to_text(r: SvcbRecord) -> str {
+    var out = "{r.priority} " + r.target
+    for p in r.params {
+        out = out + " " + key_name(p.key)
+        if p.key != 2 and p.key != 8 {
+            out = out + "=\"" + value_text(p) + "\""
+        }
+    }
+    return out
+}
+
+/// The next byte of an escaped value at `at`: `\DDD`, `\X` or a plain
+/// byte, and how many characters it took; 0 for an unfinished escape.
+fn next_byte(s: str, at: i64) -> (i64, i64) {
+    let c = s.code_at(at)
+    if c != 92 {
+        return (c, 1)
+    }
+    if at + 1 >= s.len() {
+        return (0, 0)
+    }
+    let d = s.code_at(at + 1)
+    if d >= 48 and d <= 57 {
+        if at + 3 < s.len() {
+            let v = s.substr(at + 1, 3).parse_int() ?? 256
+            if v <= 255 and is_digits(s.substr(at + 1, 3)) {
+                return (v, 4)
+            }
+        }
+        return (0, 0)
+    }
+    return (d, 2)
+}
+
+fn is_digits(s: str) -> bool {
+    for c in s.codes() {
+        if c < 48 or c > 57 {
+            return false
+        }
+    }
+    return s.len() > 0
+}
+
+fn unescape(s: str, key: i64) -> [i64] ! SvcbError {
+    var out: [i64] = []
+    var i = 0
+    while i < s.len() {
+        let (b, used) = next_byte(s, i)
+        if used == 0 {
+            fail(SvcbBadValue(key, "a bad escape"))
+        }
+        if b > 255 {
+            fail(SvcbBadValue(key, "a character outside Latin-1"))
+        }
+        out.push(b)
+        i = i + used
+    }
+    return out
+}
+
+fn parse_alpn(s: str) -> [i64] ! SvcbError {
+    if s.len() == 0 {
+        return []
+    }
+    var out: [i64] = []
+    var id: [i64] = []
+    var i = 0
+    while i < s.len() {
+        var (c, used) = next_byte(s, i)
+        if used == 0 {
+            fail(SvcbBadValue(1, "an unfinished escape"))
+        }
+        i = i + used
+        if c == 44 {
+            if id.len() == 0 {
+                fail(SvcbBadValue(1, "an empty protocol identifier"))
+            }
+            out = out + [id.len()] + id
+            id = []
+            continue
+        }
+        if c == 92 {
+            if i >= s.len() {
+                fail(SvcbBadValue(1, "an unfinished list escape"))
+            }
+            let (d, dused) = next_byte(s, i)
+            if dused == 0 or d != 92 and d != 44 {
+                fail(SvcbBadValue(1, "a bad list escape"))
+            }
+            i = i + dused
+            c = d
+        }
+        if c > 255 {
+            fail(SvcbBadValue(1, "a character outside Latin-1"))
+        }
+        id.push(c)
+    }
+    if id.len() == 0 {
+        fail(SvcbBadValue(1, "an empty last protocol identifier"))
+    }
+    if id.len() > 255 {
+        fail(SvcbBadValue(1, "an identifier over 255 bytes"))
+    }
+    return out + [id.len()] + id
+}
+
+fn parse_ipv4(s: str) -> [i64] {
+    let parts = s.split(".")
+    if parts.len() != 4 {
+        return []
+    }
+    var out: [i64] = []
+    for p in parts {
+        if not is_digits(p) or p.len() > 3 or p.len() > 1 and p.code_at(0) == 48 {
+            return []
+        }
+        let v = p.parse_int() ?? 256
+        if v > 255 {
+            return []
+        }
+        out.push(v)
+    }
+    return out
+}
+
+fn hex_value(c: i64) -> i64 {
+    if c >= 48 and c <= 57 {
+        return c - 48
+    }
+    if c >= 97 and c <= 102 {
+        return c - 87
+    }
+    if c >= 65 and c <= 70 {
+        return c - 55
+    }
+    return 0 - 1
+}
+
+/// An IPv6 address as Go's net.ParseIP reads one, or [].
+fn parse_ipv6(s: str) -> [i64] {
+    var groups: [i64] = []
+    var gap = 0 - 1
+    var i = 0
+    if s.starts_with("::") {
+        gap = 0
+        i = 2
+        if s.len() == 2 {
+            return [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+        }
+    } else if s.starts_with(":") {
+        return []
+    }
+    var tail: [i64] = []
+    while i < s.len() {
+        // An embedded IPv4 address ends the address.
+        let rest = s.substr(i, s.len() - i)
+        if rest.contains(".") and not rest.contains(":") {
+            let v4 = parse_ipv4(rest)
+            if v4.len() != 4 {
+                return []
+            }
+            groups.push(v4[0] * 256 + v4[1])
+            groups.push(v4[2] * 256 + v4[3])
+            i = s.len()
+            break
+        }
+        var v = 0
+        var k = 0
+        while i < s.len() and hex_value(s.code_at(i)) >= 0 {
+            v = v * 16 + hex_value(s.code_at(i))
+            i = i + 1
+            k = k + 1
+            if k > 4 {
+                return []
+            }
+        }
+        if k == 0 {
+            return []
+        }
+        groups.push(v)
+        if i >= s.len() {
+            break
+        }
+        if s.code_at(i) != 58 {
+            return []
+        }
+        i = i + 1
+        if i < s.len() and s.code_at(i) == 58 {
+            if gap >= 0 {
+                return []
+            }
+            gap = groups.len()
+            i = i + 1
+            if i >= s.len() {
+                break
+            }
+        } else if i >= s.len() {
+            return []
+        }
+    }
+    if gap >= 0 {
+        if groups.len() > 7 {
+            return []
+        }
+        groups = fill_gap(groups, gap)
+    } else if groups.len() != 8 {
+        return []
+    }
+    for gv in groups {
+        tail.push(gv / 256)
+        tail.push(gv % 256)
+    }
+    return tail
+}
+
+/// Groups with the zeros a `::` at `gap` stands for put back.
+fn fill_gap(groups: [i64], gap: i64) -> [i64] {
+    var filled: [i64] = []
+    var g = 0
+    while g < gap {
+        filled.push(groups[g])
+        g = g + 1
+    }
+    var z = 0
+    while z < 8 - groups.len() {
+        filled.push(0)
+        z = z + 1
+    }
+    while g < groups.len() {
+        filled.push(groups[g])
+        g = g + 1
+    }
+    return filled
+}
+
+/// A text value to its wire form for a key.
+fn parse_value(key: i64, s: str) -> [i64] ! SvcbError {
+    if key == 0 {
+        var out: [i64] = []
+        var rest = s
+        while rest.len() > 0 {
+            let cut = rest.index_of(",") ?? rest.len()
+            let code = key_code(rest.substr(0, cut))
+            if code < 0 {
+                fail(SvcbBadValue(0, "an unknown key in mandatory"))
+            }
+            out = out + [code / 256, code % 256]
+            rest = if cut < rest.len() { rest.substr(cut + 1, rest.len() - cut - 1) } else { "" }
+        }
+        return out
+    }
+    if key == 1 {
+        return try parse_alpn(s)
+    }
+    if key == 2 or key == 8 {
+        if s.len() > 0 {
+            fail(SvcbBadValue(key, "takes no value"))
+        }
+        return []
+    }
+    if key == 3 {
+        if not is_digits(s) {
+            fail(SvcbBadValue(3, "not a port"))
+        }
+        let v = s.parse_int() ?? 65536
+        if v > 65535 {
+            fail(SvcbBadValue(3, "port out of range"))
+        }
+        return [v / 256, v % 256]
+    }
+    if key == 4 or key == 6 {
+        if s.len() == 0 {
+            fail(SvcbBadValue(key, "an empty hint"))
+        }
+        if key == 4 and s.contains(":") {
+            fail(SvcbBadValue(4, "an IPv6 address in ipv4hint"))
+        }
+        var out: [i64] = []
+        var rest = s
+        while rest.len() > 0 {
+            let cut = rest.index_of(",") ?? rest.len()
+            let one = rest.substr(0, cut)
+            let addr = if key == 4 { parse_ipv4(one) } else { parse_ipv6(one) }
+            if addr.len() == 0 {
+                fail(SvcbBadValue(key, "a bad address"))
+            }
+            if key == 6 and is_ipv4_mapped(bytes_of(addr), 0) {
+                fail(SvcbBadValue(6, "an IPv4-mapped address in ipv6hint"))
+            }
+            out = out + addr
+            rest = if cut < rest.len() { rest.substr(cut + 1, rest.len() - cut - 1) } else { "" }
+        }
+        return out
+    }
+    if key == 5 {
+        return match bytes_codec.decode_base64(s) {
+            Some(b) -> b.to_list()
+            None -> fail(SvcbBadValue(5, "bad base64"))
+        }
+    }
+    return try unescape(s, key)
+}
+
+fn is_blank(c: i64) -> bool {
+    return c == 32 or c == 9
+}
+
+/// Presentation RDATA, `priority target key=value ...`, to a record.
+pub fn parse(text: str) -> SvcbRecord ! SvcbError {
+    var tokens: [(str, bool, bool)] = []
+    // Each token: its text (escapes kept), whether it was quoted, and
+    // whether whitespace came before it.
+    var i = 0
+    var spaced = true
+    while i < text.len() {
+        let c = text.code_at(i)
+        if is_blank(c) {
+            spaced = true
+            i = i + 1
+            continue
+        }
+        if c == 34 {
+            var j = i + 1
+            while j < text.len() and text.code_at(j) != 34 {
+                j = j + if text.code_at(j) == 92 and j + 1 < text.len() { 2 } else { 1 }
+            }
+            if j >= text.len() {
+                fail(SvcbSyntax("an unterminated quote"))
+            }
+            tokens.push((text.substr(i + 1, j - i - 1), true, spaced))
+            spaced = false
+            i = j + 1
+            continue
+        }
+        var j = i
+        while j < text.len() and not is_blank(text.code_at(j)) and text.code_at(j) != 34 {
+            j = j + if text.code_at(j) == 92 and j + 1 < text.len() { 2 } else { 1 }
+        }
+        tokens.push((text.substr(i, j - i), false, spaced))
+        spaced = false
+        i = j
+    }
+    if tokens.len() < 2 or tokens[0].1 or tokens[1].1 {
+        fail(SvcbSyntax("a priority and a target are needed"))
+    }
+    if not is_digits(tokens[0].0) or (tokens[0].0.parse_int() ?? 65536) > 65535 {
+        fail(SvcbSyntax("a bad priority"))
+    }
+    let target_wire = try write_name(tokens[1].0)
+    let target = (try read_name(bytes_of(target_wire), 0)).0
+    var params: [SvcParam] = []
+    var k = 2
+    while k < tokens.len() {
+        let (tok, quoted, before) = tokens[k]
+        if quoted {
+            fail(SvcbSyntax("a quoted string where a key belongs"))
+        }
+        if not before {
+            fail(SvcbSyntax("no space between a quoted value and the next key"))
+        }
+        let eq = tok.index_of("=") ?? -1
+        if eq == 0 {
+            fail(SvcbBadKey(tok))
+        }
+        var name = tok
+        var value = ""
+        if eq > 0 {
+            name = tok.substr(0, eq)
+            value = tok.substr(eq + 1, tok.len() - eq - 1)
+            if value.len() == 0 and k + 1 < tokens.len() and tokens[k + 1].1 and not tokens[k + 1].2 {
+                value = tokens[k + 1].0
+                k = k + 1
+            }
+        }
+        let code = key_code(name)
+        if code < 0 {
+            fail(SvcbBadKey(name))
+        }
+        params.push(SvcParam{ key: code, value: bytes_of(try parse_value(code, value)) })
+        k = k + 1
+    }
+    return SvcbRecord{ priority: tokens[0].0.parse_int() ?? 0, target: target, params: params }
+}
+
+/// The value of a key, if the record has it.
+pub fn param(r: SvcbRecord, key: i64) -> Option[bytes] {
+    for p in r.params {
+        if p.key == key {
+            return Some(p.value)
+        }
+    }
+    return None
+}
+
+/// The alpn protocol identifiers, in order.
+pub fn alpn(r: SvcbRecord) -> [str] {
+    return match param(r, 1) {
+        Some(v) -> {
+            var out: [str] = []
+            var i = 0
+            while i < v.len() {
+                out.push(v.slice(i + 1, i + 1 + v.at(i)).to_str())
+                i = i + 1 + v.at(i)
+            }
+            out
+        }
+        None -> []
+    }
+}
+
+/// The port, or -1.
+pub fn port(r: SvcbRecord) -> i64 {
+    return match param(r, 3) {
+        Some(v) -> if v.len() == 2 { u16(v, 0) } else { 0 - 1 }
+        None -> 0 - 1
+    }
+}
+
+/// What RFC 9460 section 8 forbids that parsing allows, one line each.
+pub fn problems(r: SvcbRecord) -> [str] {
+    var out: [str] = []
+    if r.priority == 0 and r.params.len() > 0 {
+        out.push("an alias record carries parameters")
+    }
+    match param(r, 0) {
+        Some(v) -> {
+            if v.len() == 0 {
+                out.push("mandatory lists no keys")
+            }
+            var seen: Map[i64, bool] = {}
+            var i = 0
+            while i + 1 < v.len() {
+                let key = u16(v, i)
+                if key == 0 {
+                    out.push("mandatory names itself")
+                }
+                if seen.has(key) {
+                    out.push("mandatory names " + key_name(key) + " twice")
+                }
+                seen.set(key, true)
+                if param(r, key) == None and key != 0 {
+                    out.push("mandatory names " + key_name(key) + ", which is missing")
+                }
+                i = i + 2
+            }
+        }
+        None -> {}
+    }
+    if param(r, 2) != None and param(r, 1) == None {
+        out.push("no-default-alpn without alpn")
+    }
+    return out
+}

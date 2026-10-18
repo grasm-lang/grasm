@@ -1,0 +1,737 @@
+// Which encoding an HTML document is in, decided the way a browser does.
+//
+// A crawler, a feed reader or an email client that shows HTML gets bytes
+// and has to turn them into text before it can do anything else, and the
+// bytes rarely say plainly what they are. The HTML standard's answer, in
+// order of trust:
+//
+// 1. a byte order mark, which settles it;
+// 2. the `charset` parameter of the HTTP `Content-Type`;
+// 3. a `<meta charset>` or `<meta http-equiv="Content-Type" content="...;
+//    charset=...">` in the first 1,024 bytes, found by a cheap pre-scan
+//    that skips comments and other tags without building a tree;
+// 4. a guess: here, as in Go's `x/net/html/charset` and most browsers,
+//    UTF-8 when the bytes have high bits set and are valid UTF-8, and
+//    windows-1252 otherwise.
+//
+// Every name goes through the Encoding Standard's label table: `latin1`,
+// `ascii` and `iso-8859-1` all mean windows-1252, `x-sjis` means
+// Shift_JIS, and a `<meta>` that claims UTF-16 is read as UTF-8, because a
+// document whose bytes could be scanned as ASCII is not UTF-16.
+//
+// The pre-scan follows Go's, which runs a real tokenizer: the contents of
+// `<style>`, `<title>`, `<textarea>` and the other raw-text elements are
+// skipped, and a tag cut off by the end of the 1,024 bytes ends the scan.
+// Two things Go does are not done here: decoding character references in
+// attribute values, and the escape rules for `<!--` inside `<script>`.
+// RFC 2231 `charset*` parameters are not read either.
+//
+// Checked against Go's `charset.DetermineEncoding` and the label table of
+// `x/text`, from which the table below is generated.
+
+/// The Encoding Standard name for a label, after trimming ASCII whitespace
+/// and lowering ASCII case, or None for a label it does not know.
+pub fn lookup(label: str) -> Option[str] {
+    var start = 0
+    var end = label.len()
+    while start < end and is_space(label.code_at(start)) {
+        start = start + 1
+    }
+    while end > start and is_space(label.code_at(end - 1)) {
+        end = end - 1
+    }
+    return LABELS.get(ascii_lower(label.substr(start, end - start)))
+}
+
+fn is_space(c: i64) -> bool {
+    return c == 32 or c == 9 or c == 10 or c == 12 or c == 13
+}
+
+fn ascii_lower(s: str) -> str {
+    var out = ""
+    for c in s.codes() {
+        out = out + (if c >= 65 and c <= 90 { c + 32 } else { c }).to_char()
+    }
+    return out
+}
+
+fn load_labels() -> Map[str, str] {
+    var out: Map[str, str] = {}
+    for entry in packed_labels().split(" ") {
+        let cut = entry.index_of("=") ?? -1
+        if cut > 0 {
+            out.set(entry.substr(0, cut), entry.substr(cut + 1, entry.len() - cut - 1))
+        }
+    }
+    return out
+}
+
+let LABELS: Map[str, str] = load_labels()
+
+/// The encoding a byte order mark names, or None.
+pub fn bom(data: bytes) -> Option[str] {
+    if data.len() >= 3 and data.at(0) == 239 and data.at(1) == 187 and data.at(2) == 191 {
+        return Some("utf-8")
+    }
+    if data.len() >= 2 and data.at(0) == 254 and data.at(1) == 255 {
+        return Some("utf-16be")
+    }
+    if data.len() >= 2 and data.at(0) == 255 and data.at(1) == 254 {
+        return Some("utf-16le")
+    }
+    return None
+}
+
+// --- Content-Type, as Go's mime.ParseMediaType reads it ------------------
+
+fn is_tspecial(c: i64) -> bool {
+    return "()<>@,;:\\\"/[]?=".contains(c.to_char())
+}
+
+fn is_token_char(c: i64) -> bool {
+    return c > 32 and c < 127 and not is_tspecial(c)
+}
+
+fn is_go_space(c: i64) -> bool {
+    return c == 32 or c >= 9 and c <= 13
+}
+
+fn token_end(s: str, from: i64) -> i64 {
+    var i = from
+    while i < s.len() and is_token_char(s.code_at(i)) {
+        i = i + 1
+    }
+    return i
+}
+
+fn skip_space(s: str, from: i64) -> i64 {
+    var i = from
+    while i < s.len() and is_go_space(s.code_at(i)) {
+        i = i + 1
+    }
+    return i
+}
+
+fn valid_media_type(base: str) -> bool {
+    let t = token_end(base, 0)
+    if t == 0 {
+        return false
+    }
+    if t == base.len() {
+        return true
+    }
+    if base.code_at(t) != 47 {
+        return false
+    }
+    let s = token_end(base, t + 1)
+    return s > t + 1 and s == base.len()
+}
+
+/// A parameter value at `from`: a token or a quoted string, and where it
+/// ends; ("", from) when there is none.
+fn param_value(s: str, from: i64) -> (str, i64) {
+    if from >= s.len() {
+        return ("", from)
+    }
+    if s.code_at(from) != 34 {
+        let end = token_end(s, from)
+        return (s.substr(from, end - from), end)
+    }
+    var out = ""
+    var i = from + 1
+    while i < s.len() {
+        let c = s.code_at(i)
+        if c == 34 {
+            return (out, i + 1)
+        }
+        // A backslash escapes only a special character; before anything
+        // else it is a literal backslash, as Internet Explorer wrote paths.
+        if c == 92 and i + 1 < s.len() and is_tspecial(s.code_at(i + 1)) {
+            out = out + s.substr(i + 1, 1)
+            i = i + 2
+            continue
+        }
+        if c == 13 or c == 10 {
+            return ("", from)
+        }
+        out = out + s.substr(i, 1)
+        i = i + 1
+    }
+    return ("", from)
+}
+
+/// The `charset` parameter of a Content-Type value, or None when there is
+/// none or the value does not parse as a media type.
+pub fn content_type_charset(value: str) -> Option[str] {
+    let semi = value.index_of(";") ?? value.len()
+    let base = ascii_lower(value.substr(0, semi)).trim()
+    if not valid_media_type(base) {
+        return None
+    }
+    var params: Map[str, str] = {}
+    var at = semi
+    while at < value.len() {
+        at = skip_space(value, at)
+        if at >= value.len() {
+            break
+        }
+        let restart = at
+        var ok = value.code_at(at) == 59
+        var key = ""
+        var val = ""
+        if ok {
+            var i = skip_space(value, at + 1)
+            let kend = token_end(value, i)
+            key = ascii_lower(value.substr(i, kend - i))
+            i = skip_space(value, kend)
+            ok = key.len() > 0 and i < value.len() and value.code_at(i) == 61
+            if ok {
+                i = skip_space(value, i + 1)
+                let (v, after) = param_value(value, i)
+                ok = not (v.len() == 0 and after == i)
+                val = v
+                at = after
+            }
+        }
+        if not ok {
+            // A lone trailing semicolon is allowed; anything else spoils
+            // every parameter.
+            if value.substr(restart, value.len() - restart).trim() == ";" {
+                break
+            }
+            return None
+        }
+        if key.contains("*") {
+            continue
+        }
+        match params.get(key) {
+            Some(old) -> if old != val {
+                return None
+            }
+            None -> params.set(key, val)
+        }
+    }
+    return params.get("charset")
+}
+
+// --- The pre-scan --------------------------------------------------------
+
+fn is_ws(b: i64) -> bool {
+    return b == 32 or b == 10 or b == 13 or b == 9 or b == 12
+}
+
+fn is_letter(b: i64) -> bool {
+    return b >= 65 and b <= 90 or b >= 97 and b <= 122
+}
+
+fn lower_byte(b: i64) -> i64 {
+    return if b >= 65 and b <= 90 { b + 32 } else { b }
+}
+
+fn text_of(data: bytes, from: i64, to: i64) -> str {
+    var out = ""
+    var i = from
+    while i < to {
+        out = out + data.at(i).to_char()
+        i = i + 1
+    }
+    return out
+}
+
+fn lower_text(data: bytes, from: i64, to: i64) -> str {
+    var out = ""
+    var i = from
+    while i < to {
+        out = out + lower_byte(data.at(i)).to_char()
+        i = i + 1
+    }
+    return out
+}
+
+fn skip_ws(data: bytes, from: i64) -> i64 {
+    var i = from
+    while i < data.len() and is_ws(data.at(i)) {
+        i = i + 1
+    }
+    return i
+}
+
+/// A tag at `from` (just after `<` or `</`): its lower-case name, its
+/// attributes (first of each name only, values lower-cased), and the
+/// position after its `>`, or -1 when the input ends inside it.
+fn read_tag(data: bytes, from: i64) -> (str, [(str, str)], i64) {
+    let n = data.len()
+    var i = from
+    while i < n and not is_ws(data.at(i)) and data.at(i) != 47 and data.at(i) != 62 {
+        i = i + 1
+    }
+    let name = lower_text(data, from, i)
+    var attrs: [(str, str)] = []
+    var seen: Map[str, bool] = {}
+    i = skip_ws(data, i)
+    while true {
+        if i >= n {
+            return (name, attrs, 0 - 1)
+        }
+        if data.at(i) == 62 {
+            return (name, attrs, i + 1)
+        }
+        // The attribute's name; an `=` that starts it is part of it.
+        let kstart = i
+        while i < n {
+            let c = data.at(i)
+            if c == 61 and i > kstart {
+                break
+            }
+            if is_ws(c) or c == 47 or c == 62 {
+                break
+            }
+            i = i + 1
+        }
+        let key = lower_text(data, kstart, i)
+        var value = ""
+        i = skip_ws(data, i)
+        if i < n and data.at(i) == 47 {
+            i = i + 1
+        } else if i < n and data.at(i) == 61 {
+            i = skip_ws(data, i + 1)
+            if i < n and data.at(i) != 62 {
+                let q = data.at(i)
+                if q == 34 or q == 39 {
+                    let vstart = i + 1
+                    i = vstart
+                    while i < n and data.at(i) != q {
+                        i = i + 1
+                    }
+                    value = lower_text(data, vstart, i)
+                    if i < n {
+                        i = i + 1
+                    }
+                } else {
+                    let vstart = i
+                    while i < n and not is_ws(data.at(i)) and data.at(i) != 62 {
+                        i = i + 1
+                    }
+                    value = lower_text(data, vstart, i)
+                }
+            }
+        }
+        if key.len() > 0 and not seen.has(key) {
+            seen.set(key, true)
+            attrs.push((key, value))
+        }
+        i = skip_ws(data, i)
+    }
+    return (name, attrs, 0 - 1)
+}
+
+/// The charset an `http-equiv` meta's `content` names: what follows the
+/// first `charset` that has an `=` after it, quoted or not.
+pub fn meta_content_charset(content: str) -> str {
+    var s = content
+    while s.len() > 0 {
+        let at = s.index_of("charset") ?? -1
+        if at < 0 {
+            return ""
+        }
+        s = s.substr(at + 7, s.len() - at - 7)
+        var i = 0
+        while i < s.len() and is_ws(s.code_at(i)) {
+            i = i + 1
+        }
+        if i >= s.len() or s.code_at(i) != 61 {
+            s = s.substr(i, s.len() - i)
+            continue
+        }
+        i = i + 1
+        while i < s.len() and is_ws(s.code_at(i)) {
+            i = i + 1
+        }
+        if i >= s.len() {
+            return ""
+        }
+        let q = s.code_at(i)
+        if q == 34 or q == 39 {
+            let rest = s.substr(i + 1, s.len() - i - 1)
+            let close = rest.index_of(q.to_char()) ?? -1
+            return if close < 0 { "" } else { rest.substr(0, close) }
+        }
+        var end = i
+        while end < s.len() and not is_ws(s.code_at(end)) and s.code_at(end) != 59 {
+            end = end + 1
+        }
+        return s.substr(i, end - i)
+    }
+    return ""
+}
+
+/// What a `<meta>` tag's attributes declare, or None.
+fn from_meta(attrs: [(str, str)]) -> Option[str] {
+    var pragma = false
+    // 0: no declaration yet; 1: needs http-equiv; 2: does not.
+    var need = 0
+    var found: Option[str] = None
+    for (key, value) in attrs {
+        if key == "http-equiv" {
+            if value == "content-type" {
+                pragma = true
+            }
+        } else if key == "content" {
+            if found == None {
+                let named = meta_content_charset(value)
+                if named.len() > 0 {
+                    found = lookup(named)
+                    if found != None {
+                        need = 1
+                    }
+                }
+            }
+        } else if key == "charset" {
+            found = lookup(value)
+            need = 2
+        }
+    }
+    if need == 0 or need == 1 and not pragma {
+        return None
+    }
+    return match found {
+        Some(name) -> if name.starts_with("utf-16") { Some("utf-8") } else { Some(name) }
+        None -> None
+    }
+}
+
+fn is_raw_text(name: str) -> bool {
+    return name == "script" or name == "style" or name == "textarea" or name == "title" or name == "xmp" or
+    name == "iframe" or name == "noembed" or name == "noframes" or name == "noscript" or name == "plaintext"
+}
+
+/// Where a raw-text element's text ends: the `<` of its end tag, or the
+/// end of the input.
+fn raw_text_end(data: bytes, from: i64, name: str) -> i64 {
+    let n = data.len()
+    if name == "plaintext" {
+        return n
+    }
+    var i = from
+    while i + 1 < n {
+        if data.at(i) == 60 and data.at(i + 1) == 47 {
+            var k = 0
+            while k < name.len() and i + 2 + k < n and lower_byte(data.at(i + 2 + k)) == name.code_at(k) {
+                k = k + 1
+            }
+            if k == name.len() and i + 2 + k < n {
+                let c = data.at(i + 2 + k)
+                if is_ws(c) or c == 47 or c == 62 {
+                    return i
+                }
+            }
+        }
+        i = i + 1
+    }
+    return n
+}
+
+fn index_from(data: bytes, from: i64, b: i64) -> i64 {
+    var i = from
+    while i < data.len() {
+        if data.at(i) == b {
+            return i
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+/// Where a comment that opened with `<!--` before `from` ends, or -1.
+fn comment_end(data: bytes, from: i64) -> i64 {
+    var dashes = 0
+    var beginning = true
+    var i = from
+    while i < data.len() {
+        let c = data.at(i)
+        i = i + 1
+        if c == 45 {
+            dashes = dashes + 1
+            continue
+        }
+        if c == 62 and (dashes >= 2 or beginning) {
+            return i
+        }
+        if c == 33 and dashes >= 2 {
+            if i >= data.len() {
+                return 0 - 1
+            }
+            if data.at(i) == 62 {
+                return i + 1
+            }
+            if data.at(i) == 45 {
+                i = i + 1
+                dashes = 1
+                beginning = false
+                continue
+            }
+        }
+        dashes = 0
+        beginning = false
+    }
+    return 0 - 1
+}
+
+/// The encoding the first `<meta>` that declares one names, scanning the
+/// bytes given (the caller limits them to 1,024).
+pub fn prescan(data: bytes) -> Option[str] {
+    let n = data.len()
+    var i = 0
+    while i + 1 < n {
+        if data.at(i) != 60 {
+            i = i + 1
+            continue
+        }
+        let c = data.at(i + 1)
+        if is_letter(c) {
+            let (name, attrs, after) = read_tag(data, i + 1)
+            if after < 0 {
+                return None
+            }
+            if name == "meta" {
+                match from_meta(attrs) {
+                    Some(found) -> return Some(found)
+                    None -> {}
+                }
+            }
+            i = if is_raw_text(name) { raw_text_end(data, after, name) } else { after }
+        } else if c == 47 {
+            if i + 2 >= n {
+                return None
+            }
+            let d = data.at(i + 2)
+            if d == 62 {
+                i = i + 3
+            } else if is_letter(d) {
+                let (_name, _attrs, after) = read_tag(data, i + 2)
+                if after < 0 {
+                    return None
+                }
+                i = after
+            } else {
+                let close = index_from(data, i + 2, 62)
+                if close < 0 {
+                    return None
+                }
+                i = close + 1
+            }
+        } else if c == 33 {
+            if i + 3 >= n {
+                return None
+            }
+            if data.at(i + 2) == 45 and data.at(i + 3) == 45 {
+                let end = comment_end(data, i + 4)
+                if end < 0 {
+                    return None
+                }
+                i = end
+            } else {
+                let close = index_from(data, i + 2, 62)
+                if close < 0 {
+                    return None
+                }
+                i = close + 1
+            }
+        } else if c == 63 {
+            let close = index_from(data, i + 2, 62)
+            if close < 0 {
+                return None
+            }
+            i = close + 1
+        } else {
+            i = i + 1
+        }
+    }
+    return None
+}
+
+/// Whether bytes are valid UTF-8: no overlong forms, no surrogates, nothing
+/// past U+10FFFF.
+pub fn is_utf8(data: bytes) -> bool {
+    let n = data.len()
+    var i = 0
+    while i < n {
+        let b = data.at(i)
+        if b < 128 {
+            i = i + 1
+            continue
+        }
+        var need = 0
+        var low = 128
+        var high = 191
+        if b >= 194 and b <= 223 {
+            need = 1
+        } else if b >= 224 and b <= 239 {
+            need = 2
+            if b == 224 {
+                low = 160
+            }
+            if b == 237 {
+                high = 159
+            }
+        } else if b >= 240 and b <= 244 {
+            need = 3
+            if b == 240 {
+                low = 144
+            }
+            if b == 244 {
+                high = 143
+            }
+        } else {
+            return false
+        }
+        if i + need >= n {
+            return false
+        }
+        var k = 1
+        while k <= need {
+            let c = data.at(i + k)
+            if k == 1 {
+                if c < low or c > high {
+                    return false
+                }
+            } else if c < 128 or c > 191 {
+                return false
+            }
+            k = k + 1
+        }
+        i = i + need + 1
+    }
+    return true
+}
+
+/// The encoding to read a document with, and whether it is certain: a byte
+/// order mark or a Content-Type charset is; a `<meta>` or a guess is not.
+pub fn determine(data: bytes, content_type: str) -> (str, bool) {
+    let head = if data.len() > 1024 { data.slice(0, 1024) } else { data }
+    match bom(head) {
+        Some(name) -> return (name, true)
+        None -> {}
+    }
+    match content_type_charset(content_type) {
+        Some(label) -> match lookup(label) {
+            Some(name) -> return (name, true)
+            None -> {}
+        }
+        None -> {}
+    }
+    if head.len() > 0 {
+        match prescan(head) {
+            Some(name) -> return (name, false)
+            None -> {}
+        }
+    }
+    // Drop a character cut off at the end before deciding it is UTF-8.
+    var end = head.len()
+    var i = head.len() - 1
+    while i >= 0 and i > head.len() - 4 {
+        let b = head.at(i)
+        if b < 128 {
+            break
+        }
+        if b >= 192 {
+            end = i
+            break
+        }
+        i = i - 1
+    }
+    let body = head.slice(0, end)
+    var high = false
+    var k = 0
+    while k < body.len() {
+        if body.at(k) >= 128 {
+            high = true
+            break
+        }
+        k = k + 1
+    }
+    if high and is_utf8(body) {
+        return ("utf-8", false)
+    }
+    return ("windows-1252", false)
+}
+
+// ---- Generated by scripts/gen_htmlcharset.py from x/text's label table. Do not edit below. ----
+fn packed_labels() -> str {
+    return "866=ibm866 ansi_x3.4-1968=windows-1252 arabic=iso-8859-6 " +
+    "ascii=windows-1252 asmo-708=iso-8859-6 big5-hkscs=big5 big5=big5 " +
+    "chinese=gbk cn-big5=big5 cp1250=windows-1250 cp1251=windows-1251 " +
+    "cp1252=windows-1252 cp1253=windows-1253 cp1254=windows-1254 " +
+    "cp1255=windows-1255 cp1256=windows-1256 cp1257=windows-1257 " +
+    "cp1258=windows-1258 cp819=windows-1252 cp866=ibm866 csbig5=big5 " +
+    "cseuckr=euc-kr cseucpkdfmtjapanese=euc-jp csgb2312=gbk csibm866=ibm866 " +
+    "csiso2022jp=iso-2022-jp csiso2022kr=replacement csiso58gb231280=gbk " +
+    "csiso88596e=iso-8859-6 csiso88596i=iso-8859-6 csiso88598e=iso-8859-8 " +
+    "csiso88598i=iso-8859-8-i csisolatin1=windows-1252 csisolatin2=iso-8859-2 " +
+    "csisolatin3=iso-8859-3 csisolatin4=iso-8859-4 csisolatin5=windows-1254 " +
+    "csisolatin6=iso-8859-10 csisolatin9=iso-8859-15 " +
+    "csisolatinarabic=iso-8859-6 csisolatincyrillic=iso-8859-5 " +
+    "csisolatingreek=iso-8859-7 csisolatinhebrew=iso-8859-8 cskoi8r=koi8-r " +
+    "csksc56011987=euc-kr csmacintosh=macintosh csshiftjis=shift_jis " +
+    "csunicode=utf-16le cyrillic=iso-8859-5 dos-874=windows-874 " +
+    "ecma-114=iso-8859-6 ecma-118=iso-8859-7 elot_928=iso-8859-7 " +
+    "euc-jp=euc-jp euc-kr=euc-kr gb18030=gb18030 gb2312=gbk gb_2312-80=gbk " +
+    "gb_2312=gbk gbk=gbk greek8=iso-8859-7 greek=iso-8859-7 hebrew=iso-8859-8 " +
+    "hz-gb-2312=replacement ibm819=windows-1252 ibm866=ibm866 " +
+    "iso-10646-ucs-2=utf-16le iso-2022-cn-ext=replacement " +
+    "iso-2022-cn=replacement iso-2022-jp=iso-2022-jp iso-2022-kr=replacement " +
+    "iso-8859-10=iso-8859-10 iso-8859-11=windows-874 iso-8859-13=iso-8859-13 " +
+    "iso-8859-14=iso-8859-14 iso-8859-15=iso-8859-15 iso-8859-16=iso-8859-16 " +
+    "iso-8859-1=windows-1252 iso-8859-2=iso-8859-2 iso-8859-3=iso-8859-3 " +
+    "iso-8859-4=iso-8859-4 iso-8859-5=iso-8859-5 iso-8859-6-e=iso-8859-6 " +
+    "iso-8859-6-i=iso-8859-6 iso-8859-6=iso-8859-6 iso-8859-7=iso-8859-7 " +
+    "iso-8859-8-e=iso-8859-8 iso-8859-8-i=iso-8859-8-i iso-8859-8=iso-8859-8 " +
+    "iso-8859-9=windows-1254 iso-ir-100=windows-1252 iso-ir-101=iso-8859-2 " +
+    "iso-ir-109=iso-8859-3 iso-ir-110=iso-8859-4 iso-ir-126=iso-8859-7 " +
+    "iso-ir-127=iso-8859-6 iso-ir-138=iso-8859-8 iso-ir-144=iso-8859-5 " +
+    "iso-ir-148=windows-1254 iso-ir-149=euc-kr iso-ir-157=iso-8859-10 " +
+    "iso-ir-58=gbk iso8859-10=iso-8859-10 iso8859-11=windows-874 " +
+    "iso8859-13=iso-8859-13 iso8859-14=iso-8859-14 iso8859-15=iso-8859-15 " +
+    "iso8859-1=windows-1252 iso8859-2=iso-8859-2 iso8859-3=iso-8859-3 " +
+    "iso8859-4=iso-8859-4 iso8859-5=iso-8859-5 iso8859-6=iso-8859-6 " +
+    "iso8859-7=iso-8859-7 iso8859-8=iso-8859-8 iso8859-9=windows-1254 " +
+    "iso885910=iso-8859-10 iso885911=windows-874 iso885913=iso-8859-13 " +
+    "iso885914=iso-8859-14 iso885915=iso-8859-15 iso88591=windows-1252 " +
+    "iso88592=iso-8859-2 iso88593=iso-8859-3 iso88594=iso-8859-4 " +
+    "iso88595=iso-8859-5 iso88596=iso-8859-6 iso88597=iso-8859-7 " +
+    "iso88598=iso-8859-8 iso88599=windows-1254 iso_8859-15=iso-8859-15 " +
+    "iso_8859-1:1987=windows-1252 iso_8859-1=windows-1252 " +
+    "iso_8859-2:1987=iso-8859-2 iso_8859-2=iso-8859-2 " +
+    "iso_8859-3:1988=iso-8859-3 iso_8859-3=iso-8859-3 " +
+    "iso_8859-4:1988=iso-8859-4 iso_8859-4=iso-8859-4 " +
+    "iso_8859-5:1988=iso-8859-5 iso_8859-5=iso-8859-5 " +
+    "iso_8859-6:1987=iso-8859-6 iso_8859-6=iso-8859-6 " +
+    "iso_8859-7:1987=iso-8859-7 iso_8859-7=iso-8859-7 " +
+    "iso_8859-8:1988=iso-8859-8 iso_8859-8=iso-8859-8 " +
+    "iso_8859-9:1989=windows-1254 iso_8859-9=windows-1254 koi8-r=koi8-r " +
+    "koi8-ru=koi8-u koi8-u=koi8-u koi8=koi8-r koi8_r=koi8-r koi=koi8-r " +
+    "korean=euc-kr ks_c_5601-1987=euc-kr ks_c_5601-1989=euc-kr ksc5601=euc-kr " +
+    "ksc_5601=euc-kr l1=windows-1252 l2=iso-8859-2 l3=iso-8859-3 " +
+    "l4=iso-8859-4 l5=windows-1254 l6=iso-8859-10 l9=iso-8859-15 " +
+    "latin1=windows-1252 latin2=iso-8859-2 latin3=iso-8859-3 " +
+    "latin4=iso-8859-4 latin5=windows-1254 latin6=iso-8859-10 " +
+    "logical=iso-8859-8-i mac=macintosh macintosh=macintosh ms932=shift_jis " +
+    "ms_kanji=shift_jis replacement=replacement shift-jis=shift_jis " +
+    "shift_jis=shift_jis sjis=shift_jis sun_eu_greek=iso-8859-7 " +
+    "tis-620=windows-874 ucs-2=utf-16le unicode-1-1-utf-8=utf-8 " +
+    "unicode11utf8=utf-8 unicode20utf8=utf-8 unicode=utf-16le " +
+    "unicodefeff=utf-16le unicodefffe=utf-16be us-ascii=windows-1252 " +
+    "utf-16=utf-16le utf-16be=utf-16be utf-16le=utf-16le utf-8=utf-8 " +
+    "utf8=utf-8 visual=iso-8859-8 windows-1250=windows-1250 " +
+    "windows-1251=windows-1251 windows-1252=windows-1252 " +
+    "windows-1253=windows-1253 windows-1254=windows-1254 " +
+    "windows-1255=windows-1255 windows-1256=windows-1256 " +
+    "windows-1257=windows-1257 windows-1258=windows-1258 " +
+    "windows-31j=shift_jis windows-874=windows-874 windows-949=euc-kr " +
+    "x-cp1250=windows-1250 x-cp1251=windows-1251 x-cp1252=windows-1252 " +
+    "x-cp1253=windows-1253 x-cp1254=windows-1254 x-cp1255=windows-1255 " +
+    "x-cp1256=windows-1256 x-cp1257=windows-1257 x-cp1258=windows-1258 " +
+    "x-euc-jp=euc-jp x-gbk=gbk x-mac-cyrillic=x-mac-cyrillic " +
+    "x-mac-roman=macintosh x-mac-ukrainian=x-mac-cyrillic x-sjis=shift_jis " +
+    "x-unicode20utf8=utf-8 x-user-defined=x-user-defined x-x-big5=big5 "
+}

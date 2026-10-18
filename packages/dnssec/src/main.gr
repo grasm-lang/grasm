@@ -1,0 +1,455 @@
+// DNSSEC: the arithmetic a validating resolver does on every answer.
+//
+// A signed zone publishes DNSKEY records, signs every record set with an
+// RRSIG, links the zone to its parent with a DS record (a digest of the
+// key), and proves that a name does not exist with NSEC or NSEC3 records.
+// Checking any of it is exact arithmetic that is easy to get almost
+// right:
+//
+// - the key tag is a 16-bit checksum of the DNSKEY's RDATA, with a
+//   different rule for the long-retired RSA/MD5;
+// - a DS digest covers the owner name in canonical form (lower case,
+//   uncompressed) followed by the DNSKEY RDATA;
+// - an NSEC3 owner is the base32hex of a SHA-1 iterated over the
+//   canonical name and a salt;
+// - NSEC and NSEC3 type bitmaps are split into 256-type windows, each
+//   trimmed after its last set bit;
+// - the data an RRSIG signs is its own RDATA without the signature,
+//   followed by every record of the set in canonical form: owner name
+//   lower-cased (or rebuilt as a wildcard when the RRSIG's label count is
+//   smaller), the RRSIG's original TTL, names inside the RDATA of the
+//   classic types lower-cased, the records sorted by RDATA and
+//   duplicates dropped;
+// - validity periods are compared in serial-number arithmetic, so a
+//   signature does not expire in 2106.
+//
+// Verification covers the algorithms a resolver must support today: RSA
+// with SHA-256 and SHA-512 (8 and 10), ECDSA P-256 and P-384 (13 and 14)
+// and Ed25519 (15).
+//
+// Checked against `github.com/miekg/dns`: key tags, DS digests, NSEC3
+// hashes, bitmaps and validity, and signatures it makes over random record
+// sets with random keys that this must accept, and refuse once tampered;
+// and Ed25519 and ECDSA signatures made here that it must accept.
+import sha1
+import crypto_hash
+import sha512
+import base32hex
+import rsa
+import ecdsa
+import ed25519
+
+type DnssecError =
+    | DnssecBadName(why: str)
+    | DnssecBadDigest(kind: i64)
+    | DnssecBadBitmap(at: i64)
+
+/// A record in wire form: the RDATA uncompressed.
+type DnssecRecord = { owner: str, kind: i64, class: i64, ttl: i64, rdata: bytes }
+
+/// An RRSIG's fields.
+type DnssecRrsig = {
+    type_covered: i64,
+    algorithm: i64,
+    labels: i64,
+    original_ttl: i64,
+    expiration: i64,
+    inception: i64,
+    key_tag: i64,
+    signer: str,
+    signature: bytes,
+}
+
+fn lower(c: i64) -> i64 {
+    return if c >= 65 and c <= 90 { c + 32 } else { c }
+}
+
+/// A presentation name's labels as bytes, `\DDD` and `\X` escapes undone;
+/// the root has none.
+fn labels_of(name: str) -> [[i64]] ! DnssecError {
+    var out: [[i64]] = []
+    if name == "." or name.len() == 0 {
+        return out
+    }
+    var label: [i64] = []
+    var i = 0
+    while i < name.len() {
+        let c = name.code_at(i)
+        if c == 92 {
+            if i + 1 >= name.len() {
+                fail(DnssecBadName("a trailing backslash"))
+            }
+            let d = name.code_at(i + 1)
+            if d >= 48 and d <= 57 {
+                let v = if i + 3 < name.len() { name.substr(i + 1, 3).parse_int() ?? 256 } else { 256 }
+                if v > 255 {
+                    fail(DnssecBadName("a bad \\DDD escape"))
+                }
+                label.push(v)
+                i = i + 4
+            } else {
+                label.push(d)
+                i = i + 2
+            }
+            continue
+        }
+        if c == 46 {
+            if label.len() == 0 or label.len() > 63 {
+                fail(DnssecBadName("an empty label or one over 63 bytes"))
+            }
+            out.push(label)
+            label = []
+        } else {
+            label.push(c)
+        }
+        i = i + 1
+    }
+    if label.len() > 0 {
+        out.push(label)
+    }
+    return out
+}
+
+/// A name in canonical wire form: uncompressed, ASCII letters lowered.
+pub fn canonical_name(name: str) -> bytes ! DnssecError {
+    var out: [i64] = []
+    for label in try labels_of(name) {
+        out.push(label.len())
+        for c in label {
+            out.push(lower(c))
+        }
+    }
+    out.push(0)
+    if out.len() > 255 {
+        fail(DnssecBadName("longer than 255 bytes"))
+    }
+    return bytes_of(out)
+}
+
+/// The number of labels an RRSIG counts for an owner: not the root, and
+/// not a leading `*`.
+pub fn label_count(name: str) -> i64 ! DnssecError {
+    let labels = try labels_of(name)
+    if labels.len() > 0 and labels[0] == [42] {
+        return labels.len() - 1
+    }
+    return labels.len()
+}
+
+/// A DNSKEY's RDATA.
+pub fn dnskey_rdata(flags: i64, protocol: i64, algorithm: i64, public_key: bytes) -> bytes {
+    return bytes_of([flags / 256 % 256, flags % 256, protocol, algorithm]).concat(public_key)
+}
+
+/// The key tag of a DNSKEY (RFC 4034 appendix B).
+pub fn key_tag(flags: i64, protocol: i64, algorithm: i64, public_key: bytes) -> i64 {
+    let rdata = dnskey_rdata(flags, protocol, algorithm, public_key)
+    if algorithm == 1 {
+        // RSA/MD5: the third-to-last and second-to-last bytes of the modulus.
+        let n = rdata.len()
+        return if n < 4 { 0 } else { rdata.at(n - 3) * 256 + rdata.at(n - 2) }
+    }
+    var sum = 0
+    var i = 0
+    while i < rdata.len() {
+        sum = sum + if i % 2 == 0 { rdata.at(i) * 256 } else { rdata.at(i) }
+        i = i + 1
+    }
+    sum = sum + sum.ushr(16).bit_and(65535)
+    return sum.bit_and(65535)
+}
+
+/// A DS record's digest of a DNSKEY: type 1 SHA-1, 2 SHA-256, 4 SHA-384.
+pub fn ds_digest(owner: str, dnskey: bytes, digest_type: i64) -> bytes ! DnssecError {
+    let data = (try canonical_name(owner)).concat(dnskey)
+    if digest_type == 1 {
+        return sha1.hash(data)
+    }
+    if digest_type == 2 {
+        return crypto_hash.sha256_of(data)
+    }
+    if digest_type == 4 {
+        return sha512.sha384(data)
+    }
+    fail(DnssecBadDigest(digest_type))
+}
+
+/// An NSEC3 hashed owner label: SHA-1 of the canonical name and the salt,
+/// iterated, in upper-case base32hex.
+pub fn nsec3_hash(name: str, salt: bytes, iterations: i64) -> str ! DnssecError {
+    var h = sha1.hash((try canonical_name(name)).concat(salt))
+    var i = 0
+    while i < iterations {
+        h = sha1.hash(h.concat(salt))
+        i = i + 1
+    }
+    return base32hex.encode_unpadded(h).to_upper()
+}
+
+/// Types to an NSEC or NSEC3 type bitmap.
+pub fn type_bitmap(types: [i64]) -> bytes {
+    var sorted = types
+    sorted.sort()
+    var out: [i64] = []
+    var window = 0 - 1
+    var bits: [i64] = []
+    for t in sorted {
+        let w = t / 256
+        if w != window {
+            if bits.len() > 0 {
+                out = out + [window, bits.len()] + bits
+            }
+            window = w
+            bits = []
+        }
+        let at = t % 256 / 8
+        while bits.len() <= at {
+            bits.push(0)
+        }
+        bits[at] = bits[at].bit_or(128.ushr(t % 8))
+    }
+    if bits.len() > 0 {
+        out = out + [window, bits.len()] + bits
+    }
+    return bytes_of(out)
+}
+
+/// An NSEC or NSEC3 type bitmap to its types. Windows must increase and
+/// each bitmap must be 1 to 32 bytes long.
+pub fn read_type_bitmap(data: bytes) -> [i64] ! DnssecError {
+    var out: [i64] = []
+    var at = 0
+    var last = 0 - 1
+    while at < data.len() {
+        if at + 2 > data.len() {
+            fail(DnssecBadBitmap(at))
+        }
+        let window = data.at(at)
+        let len = data.at(at + 1)
+        if window <= last or len == 0 or len > 32 or at + 2 + len > data.len() {
+            fail(DnssecBadBitmap(at))
+        }
+        last = window
+        var i = 0
+        while i < len {
+            let b = data.at(at + 2 + i)
+            var k = 0
+            while k < 8 {
+                if b.bit_and(128.ushr(k)) != 0 {
+                    out.push(window * 256 + i * 8 + k)
+                }
+                k = k + 1
+            }
+            i = i + 1
+        }
+        at = at + 2 + len
+    }
+    return out
+}
+
+/// Where the domain names sit inside the RDATA of the types whose names
+/// are lowered in canonical form (RFC 4034 section 6.2, as RFC 6840 left
+/// it): the offset of the first, or -1. Only the types whose names come
+/// at a fixed place are listed.
+fn rdata_name_at(kind: i64) -> i64 {
+    // NS, MD, MF, CNAME, MB, MG, MR, PTR, DNAME
+    if kind == 2 or kind == 3 or kind == 4 or kind == 5 or kind == 7 or kind == 8 or kind == 9 or kind == 12 or kind == 39 {
+        return 0
+    }
+    // MX, AFSDB, RT, KX
+    if kind == 15 or kind == 18 or kind == 21 or kind == 36 {
+        return 2
+    }
+    // SRV
+    if kind == 33 {
+        return 6
+    }
+    return 0 - 1
+}
+
+fn canonical_rdata(kind: i64, rdata: bytes) -> bytes {
+    let at = rdata_name_at(kind)
+    if at < 0 or at >= rdata.len() {
+        return rdata
+    }
+    var out = rdata.to_list()
+    var i = at
+    while i < out.len() and out[i] != 0 and out[i] < 64 {
+        let n = out[i]
+        var k = 1
+        while k <= n and i + k < out.len() {
+            out[i + k] = lower(out[i + k])
+            k = k + 1
+        }
+        i = i + n + 1
+    }
+    return bytes_of(out)
+}
+
+fn put(out: [i64], v: i64, n: i64) -> [i64] {
+    var o = out
+    var i = n - 1
+    while i >= 0 {
+        o.push(v.ushr(8 * i).bit_and(255))
+        i = i - 1
+    }
+    return o
+}
+
+fn less(a: bytes, b: bytes) -> bool {
+    var i = 0
+    while i < a.len() and i < b.len() {
+        if a.at(i) != b.at(i) {
+            return a.at(i) < b.at(i)
+        }
+        i = i + 1
+    }
+    return a.len() < b.len()
+}
+
+/// The owner name an RRSIG covers: the canonical owner, or the wildcard it
+/// was expanded from when the RRSIG counts fewer labels.
+fn signed_owner(owner: str, labels: i64) -> bytes ! DnssecError {
+    let all = try labels_of(owner)
+    var count = all.len()
+    var start = 0
+    if count > 0 and all[0] == [42] {
+        count = count - 1
+        start = 1
+    }
+    var out: [i64] = []
+    if labels < count {
+        out = [1, 42]
+        start = all.len() - labels
+    }
+    var i = start
+    while i < all.len() {
+        out.push(all[i].len())
+        for c in all[i] {
+            out.push(lower(c))
+        }
+        i = i + 1
+    }
+    out.push(0)
+    return bytes_of(out)
+}
+
+/// The bytes an RRSIG's signature covers.
+pub fn signed_data(sig: DnssecRrsig, rrset: [DnssecRecord]) -> bytes ! DnssecError {
+    var head = put(put([], sig.type_covered, 2), sig.algorithm, 1)
+    head = put(put(put(put(put(head, sig.labels, 1), sig.original_ttl, 4), sig.expiration, 4), sig.inception, 4), sig.key_tag, 2)
+    var out = bytes_of(head).concat(try canonical_name(sig.signer))
+    var rdatas: [bytes] = []
+    for r in rrset {
+        rdatas.push(canonical_rdata(r.kind, r.rdata))
+    }
+    // Insertion sort by RDATA, dropping exact duplicates.
+    var sorted: [bytes] = []
+    for d in rdatas {
+        var i = 0
+        while i < sorted.len() and less(sorted[i], d) {
+            i = i + 1
+        }
+        if i < sorted.len() and sorted[i] == d {
+            continue
+        }
+        var next: [bytes] = []
+        var k = 0
+        while k < i {
+            next.push(sorted[k])
+            k = k + 1
+        }
+        next.push(d)
+        while k < sorted.len() {
+            next.push(sorted[k])
+            k = k + 1
+        }
+        sorted = next
+    }
+    if rrset.len() == 0 {
+        return out
+    }
+    let first = rrset[0]
+    let owner = try signed_owner(first.owner, sig.labels)
+    for d in sorted {
+        out = out.concat(owner).concat(bytes_of(put(put(put(put([], first.kind, 2), first.class, 2), sig.original_ttl, 4), d.len(), 2))).concat(d)
+    }
+    return out
+}
+
+/// Whether `signature` over `data` verifies with a DNSKEY's public key, for
+/// algorithms 8, 10, 13, 14 and 15; false for any other.
+pub fn verify(algorithm: i64, public_key: bytes, data: bytes, signature: bytes) -> bool {
+    if algorithm == 8 or algorithm == 10 {
+        if public_key.len() < 3 {
+            return false
+        }
+        var elen = public_key.at(0)
+        var at = 1
+        if elen == 0 {
+            elen = public_key.at(1) * 256 + public_key.at(2)
+            at = 3
+        }
+        if elen == 0 or at + elen >= public_key.len() {
+            return false
+        }
+        let key = match rsa.key_from_bytes(public_key.slice(at + elen, public_key.len()), public_key.slice(at, at + elen)) {
+            Ok(k) -> k
+            Err(_) -> return false
+        }
+        return rsa.verify_pkcs1(key, if algorithm == 8 { "SHA256" } else { "SHA512" }, data, signature)
+    }
+    if algorithm == 13 or algorithm == 14 {
+        let size = if algorithm == 13 { 32 } else { 48 }
+        if public_key.len() != 2 * size or signature.len() != 2 * size {
+            return false
+        }
+        let curve = if algorithm == 13 { "P-256" } else { "P-384" }
+        let hash = if algorithm == 13 { crypto_hash.sha256_of(data) } else { sha512.sha384(data) }
+        return match ecdsa.from_raw(curve, signature) {
+            Ok(sig) -> ecdsa.verify(curve, bytes_of([4]).concat(public_key), hash, sig)
+            Err(_) -> false
+        }
+    }
+    if algorithm == 15 {
+        return ed25519.verify(public_key, data, signature)
+    }
+    return false
+}
+
+/// Whether an RRSIG verifies over a record set with a DNSKEY's public key.
+pub fn verify_rrset(public_key: bytes, sig: DnssecRrsig, rrset: [DnssecRecord]) -> bool {
+    return match signed_data(sig, rrset) {
+        Ok(data) -> verify(sig.algorithm, public_key, data, sig.signature)
+        Err(_) -> false
+    }
+}
+
+/// An Ed25519 signature over a record set, from a 32-byte seed.
+pub fn sign_ed25519(seed: bytes, sig: DnssecRrsig, rrset: [DnssecRecord]) -> bytes ! DnssecError {
+    let data = try signed_data(sig, rrset)
+    return match ed25519.sign(seed, data) {
+        Ok(s) -> s
+        Err(_) -> fail(DnssecBadName("the seed is not 32 bytes"))
+    }
+}
+
+/// An ECDSA P-256 signature over a record set, from a private scalar, as
+/// the 64 bytes r and s that RRSIG carries.
+pub fn sign_p256(private: bytes, sig: DnssecRrsig, rrset: [DnssecRecord]) -> bytes ! DnssecError {
+    let data = try signed_data(sig, rrset)
+    return match ecdsa.sign_message("P-256", private, "SHA-256", data) {
+        Ok(s) -> ecdsa.to_raw(s)
+        Err(_) -> fail(DnssecBadName("not a P-256 private key"))
+    }
+}
+
+/// Whether `now` (seconds since 1970) falls within an inception and an
+/// expiration that are 32-bit serial numbers (RFC 4034 section 3.1.5):
+/// each is taken in the 136-year window nearest `now`.
+pub fn valid_at(inception: i64, expiration: i64, now: i64) -> bool {
+    let year68 = 2147483648
+    let ti = inception + (inception - now) / year68 * year68
+    let te = expiration + (expiration - now) / year68 * year68
+    return ti <= now and now <= te
+}

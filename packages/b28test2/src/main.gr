@@ -1,0 +1,200 @@
+// The Grasm side of scripts/b28b_diff.py. Each case is `<op> x<hex>
+// x<hex>`: bytes, then a second argument that is bytes or, for most ops,
+// UTF-8 text with fields separated by `|`.
+import htmlcharset
+import svcb
+import dnssec
+import wkb
+
+fn from_hex(text: str) -> bytes {
+    var out: [i64] = []
+    var i = 1
+    while i + 1 < text.len() {
+        out.push(text.substr(i, 2).parse_int_base(16) ?? 0)
+        i = i + 2
+    }
+    bytes_of(out)
+}
+
+fn hex(raw: bytes) -> str {
+    let digits = "0123456789abcdef"
+    var out = ""
+    var i = 0
+    while i < raw.len() {
+        out = out + digits.substr(raw.at(i) / 16, 1) + digits.substr(raw.at(i) % 16, 1)
+        i = i + 1
+    }
+    out
+}
+
+fn int(s: str) -> i64 {
+    s.parse_int() ?? 0
+}
+
+// --- DNSSEC --------------------------------------------------------------
+
+fn records(text: str) -> [DnssecRecord] {
+    var out: [DnssecRecord] = []
+    for line in text.split(";") {
+        let f = line.split("/")
+        if f.len() == 5 {
+            out.push(DnssecRecord{ owner: f[0], kind: int(f[1]), class: int(f[2]), ttl: int(f[3]), rdata: from_hex(":" + f[4]) })
+        }
+    }
+    out
+}
+
+/// `alg|signer|inception|expiration|labels|origttl|keytag|covered|records`
+fn rrsig(f: [str], signature: bytes) -> DnssecRrsig {
+    DnssecRrsig{ type_covered: int(f[7]), algorithm: int(f[0]), labels: int(f[4]), original_ttl: int(f[5]),
+        expiration: int(f[3]), inception: int(f[2]), key_tag: int(f[6]), signer: f[1], signature: signature }
+}
+
+fn answer_dnssec(what: str, a: bytes, b: str) -> str {
+    let f = b.split("|")
+    if what == "keytag" {
+        return "{dnssec.key_tag(int(f[0]), int(f[1]), int(f[2]), a)}"
+    }
+    if what == "ds" {
+        let tag = dnssec.key_tag(int(f[0]), int(f[1]), int(f[2]), a)
+        let rdata = dnssec.dnskey_rdata(int(f[0]), int(f[1]), int(f[2]), a)
+        return [1, 2, 4].map(|t| match dnssec.ds_digest(f[3], rdata, t) {
+            Ok(d) -> "{tag}:" + hex(d)
+            Err(_) -> "ERR"
+        }).join(" ")
+    }
+    if what == "nsec3" {
+        return dnssec.nsec3_hash(f[0], a, int(f[1])) ?? "ERR"
+    }
+    if what == "bitmap" {
+        return hex(dnssec.type_bitmap(f.map(|t| int(t))))
+    }
+    if what == "bitmap.read" {
+        return match dnssec.read_type_bitmap(a) {
+            Ok(ts) -> ts.map(|t| "{t}").join(",")
+            Err(_) -> "ERR"
+        }
+    }
+    if what == "validity" {
+        return if dnssec.valid_at(int(f[0]), int(f[1]), int(f[2])) { "true" } else { "false" }
+    }
+    let rrs = records(f[8])
+    if what == "verify" {
+        let parts = f[9].split(",")
+        let ok = dnssec.verify_rrset(from_hex(":" + parts[0]), rrsig(f, from_hex(":" + parts[1])), rrs)
+        return if ok { "true" } else { "false" }
+    }
+    if what == "sign.ed" {
+        return hex(dnssec.sign_ed25519(a, rrsig(f, bytes_of([])), rrs) ?? bytes_of([]))
+    }
+    hex(dnssec.sign_p256(a, rrsig(f, bytes_of([])), rrs) ?? bytes_of([]))
+}
+
+// --- WKB -----------------------------------------------------------------
+
+fn bits(v: f64) -> str {
+    "{v.to_bits()}"
+}
+
+fn xy(p: WkbXY) -> str {
+    bits(p.x) + "," + bits(p.y)
+}
+
+fn ring(ps: [WkbXY]) -> str {
+    ps.map(|p| xy(p)).join(";")
+}
+
+fn rings(rs: [[WkbXY]]) -> str {
+    rs.map(|r| "(" + ring(r) + ")").join("")
+}
+
+fn canonical(g: ref WkbGeometry) -> str {
+    match g {
+        WkbPoint(x, y) -> "Point(" + bits(x) + "," + bits(y) + ")"
+        WkbLineString(ps) -> "LineString(" + ring(ps) + ")"
+        WkbPolygon(rs) -> "Polygon(" + rings(rs) + ")"
+        WkbMultiPoint(ps) -> "MultiPoint(" + ring(ps) + ")"
+        WkbMultiLineString(ls) -> "MultiLineString(" + rings(ls) + ")"
+        WkbMultiPolygon(ps) -> "MultiPolygon(" + ps.map(|p| "(" + rings(p) + ")").join("") + ")"
+        WkbCollection(items) -> "GeometryCollection(" + items.map(|i| canonical(i)).join(",") + ")"
+    }
+}
+
+fn answer_wkb(what: str, a: bytes, b: str) -> str {
+    if what == "wkb.dec" {
+        return match wkb.decode(a) {
+            Ok(g) -> canonical(ref(g))
+            Err(_) -> "ERR"
+        }
+    }
+    if what == "wkb.enc" {
+        return match wkb.decode(a) {
+            Ok(g) -> hex(wkb.encode(g, b == "big"))
+            Err(_) -> "ERR"
+        }
+    }
+    if what == "ewkb.dec" {
+        return match wkb.decode_ewkb(a) {
+            Ok(sg) -> "{sg.0}|" + canonical(ref(sg.1))
+            Err(_) -> "ERR"
+        }
+    }
+    let f = b.split("|")
+    match wkb.decode_ewkb(a) {
+        Ok(sg) -> hex(wkb.encode_ewkb(sg.1, int(f[1]), f[0] == "big"))
+        Err(_) -> "ERR"
+    }
+}
+
+// --- SVCB ----------------------------------------------------------------
+
+fn answer_svcb(what: str, a: bytes, b: str) -> str {
+    if what == "svcb.text" {
+        return match svcb.parse(b) {
+            Ok(r) -> match svcb.encode(r) {
+                Ok(w) -> hex(w)
+                Err(_) -> "ERR"
+            }
+            Err(_) -> "ERR"
+        }
+    }
+    match svcb.decode(a) {
+        Err(_) -> "ERR"
+        Ok(r) -> {
+            if what == "svcb.problems" {
+                return svcb.problems(r).join(";")
+            }
+            match svcb.encode(r) {
+                Ok(w) -> hex(w) + "|" + svcb.to_text(r)
+                Err(_) -> "ERR"
+            }
+        }
+    }
+}
+
+fn answer(what: str, a: bytes, b: bytes) -> str {
+    let text = b.to_str()
+    if what == "cs" {
+        let (name, certain) = htmlcharset.determine(a, text)
+        return name + "|" + (if certain { "true" } else { "false" })
+    }
+    if what == "label" {
+        return htmlcharset.lookup(text) ?? "ERR"
+    }
+    if what.starts_with("svcb") {
+        return answer_svcb(what, a, text)
+    }
+    if what.starts_with("wkb") or what.starts_with("ewkb") {
+        return answer_wkb(what, a, text)
+    }
+    answer_dnssec(what, a, text)
+}
+
+fn main() / {io} {
+    let argv = args()
+    var i = 0
+    while i + 2 < argv.len() {
+        print(answer(argv[i], from_hex(argv[i + 1]), from_hex(argv[i + 2])))
+        i = i + 3
+    }
+}

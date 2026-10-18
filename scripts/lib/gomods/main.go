@@ -193,7 +193,7 @@ func answer(r request) string {
 		}
 		return h
 	}
-	return "UNKNOWN"
+	return answer2(r)
 }
 
 func bpfAnswer(r request) string {
