@@ -224,6 +224,14 @@ day its reference is installed.
 
 ## Landed
 
+- [x] **B15, second part: interior routing and the air** — `ospf` `bgp`
+  `eigrp` `pim` `isis` `eap` `radiotap` `canframe` `usbpcap` `hci`, checked
+  through `packettest2`; the packet gate runs 22,678 cases against scapy.
+  OSPF's LSA Fletcher checksum (which a control moved by one byte and the
+  gate caught), BGP's UPDATE attributes with one- and two-byte lengths,
+  radiotap's per-field alignment counted from the header's start, EAPOL-Key
+  frames.
+
 - [x] **B15, first part: routing, links and LANs** — `igmp` `mpls` `lldp`
   `stp` `cdp` `rip` `vrrp` `hsrp` `bfd` `nsh` `erspan` `l2tp` `pppoe`, and
   the harness `packettest2`; the packet gate now runs 17,502 cases against
@@ -296,7 +304,7 @@ day its reference is installed.
 | | |
 |---|---|
 | At the start | 669 |
-| Now | 721 |
+| Now | 731 |
 | Candidates above | 305 packages in 27 batches, plus `ecc`, `rfc6979` and `goprintf` |
 | Harnesses, one a batch | 27 |
 | If every candidate lands | 1004 |

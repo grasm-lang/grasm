@@ -54,3 +54,43 @@ version = "^1.0.0"
 [dependencies.pppoe]
 path = "../pppoe"
 version = "^1.0.0"
+
+[dependencies.ospf]
+path = "../ospf"
+version = "^1.0.0"
+
+[dependencies.bgp]
+path = "../bgp"
+version = "^1.0.0"
+
+[dependencies.eigrp]
+path = "../eigrp"
+version = "^1.0.0"
+
+[dependencies.pim]
+path = "../pim"
+version = "^1.0.0"
+
+[dependencies.isis]
+path = "../isis"
+version = "^1.0.0"
+
+[dependencies.eap]
+path = "../eap"
+version = "^1.0.0"
+
+[dependencies.radiotap]
+path = "../radiotap"
+version = "^1.0.0"
+
+[dependencies.canframe]
+path = "../canframe"
+version = "^1.0.0"
+
+[dependencies.usbpcap]
+path = "../usbpcap"
+version = "^1.0.0"
+
+[dependencies.hci]
+path = "../hci"
+version = "^1.0.0"

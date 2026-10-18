@@ -6,6 +6,9 @@ import mpls
 import pppoe
 import bfd
 import lldp
+import hci
+import canframe
+import bgp
 
 fn hex(raw: bytes) -> str {
     let digits = "0123456789abcdef"
@@ -52,5 +55,16 @@ fn main() / {io} {
         }
         Err(_) -> panic("lldp could not read back its own LLDPDU")
     }
+    // HCI_Reset: group 3, command 3, no parameters -- what scapy writes.
+    let reset = HciPacket{ kind: hci.command(), opcode: hci.make_opcode(3, 3), handle: 0, pb: 0, bc: 0,
+        code: 0, payload: bytes_of([]) }
+    assert_eq(hex(hci.encode(reset)), "01030c00")
+
+    let frame = CanFrame{ extended: false, remote: false, error: false, id: 291, length: 2, flags: 0, res0: 0,
+        res1: 0, data: bytes_of([1, 2]), padding: bytes_of([]) }
+    assert_eq(hex(canframe.encode(frame)), "00000123020000000102")
+
+    let keep = BgpMessage{ marker: bytes_filled(16, 255), kind: bgp.keepalive(), body: bytes_of([]) }
+    assert_eq(hex(bgp.encode(keep)), "ffffffffffffffffffffffffffffffff001304")
     print("packet2: ok")
 }

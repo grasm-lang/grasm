@@ -1,0 +1,96 @@
+// IS-IS (ISO 10589, RFC 1195): the link-state protocol most large ISP
+// backbones run instead of OSPF.
+//
+// Every PDU starts with eight common bytes -- the protocol discriminator
+// 0x83, the header length, version, ID length, PDU type, version, a
+// reserved byte and the maximum area addresses -- then a fixed part whose
+// size the header length says, then TLVs: a one-byte type, a one-byte
+// length and the value. The fixed part is kept as bytes; the PDU length it
+// holds (for every type but the point-to-point hello at the same offset)
+// decides where the TLVs end.
+
+type IsisTlv = {
+    kind: i64,
+    value: bytes,
+}
+
+type IsisPdu = {
+    nlpid: i64,
+    hdrlen: i64,
+    version: i64,
+    idlen: i64,
+    pdutype: i64,
+    pduversion: i64,
+    reserved: i64,
+    maxareaaddr: i64,
+    fixed: bytes,
+    tlvs: [IsisTlv],
+}
+
+type IsisError =
+    | TooShort(found: i64)
+    | BadHeader(hdrlen: i64)
+    | BadTlv(at: i64)
+
+/// Where the two-byte PDU length sits, counted from the start of the PDU:
+/// at 17 in the hellos (after circuit type, source ID and holding time), at
+/// 8 -- straight after the common header -- in LSPs and sequence-number PDUs.
+fn pdu_length_at(kind: i64) -> i64 {
+    if kind == 15 or kind == 16 or kind == 17 { 17 } else { 8 }
+}
+
+pub fn decode(data: bytes) -> IsisPdu ! IsisError {
+    if data.len() < 8 {
+        fail(TooShort(data.len()))
+    }
+    let hdrlen = data.at(1)
+    let kind = data.at(4).bit_and(31)
+    if hdrlen < 8 or hdrlen > data.len() {
+        fail(BadHeader(hdrlen))
+    }
+    var end = data.len()
+    let at_len = pdu_length_at(kind)
+    if at_len + 2 <= hdrlen {
+        let declared = data.at(at_len) * 256 + data.at(at_len + 1)
+        if declared >= hdrlen and declared <= data.len() {
+            end = declared
+        }
+    }
+    var tlvs: [IsisTlv] = []
+    var at = hdrlen
+    while at < end {
+        if at + 2 > end or at + 2 + data.at(at + 1) > end {
+            fail(BadTlv(at))
+        }
+        tlvs.push(IsisTlv{ kind: data.at(at), value: data.slice(at + 2, at + 2 + data.at(at + 1)) })
+        at = at + 2 + data.at(at + 1)
+    }
+    IsisPdu{ nlpid: data.at(0), hdrlen: hdrlen, version: data.at(2), idlen: data.at(3), pdutype: kind,
+        pduversion: data.at(5), reserved: data.at(6), maxareaaddr: data.at(7), fixed: data.slice(8, hdrlen),
+        tlvs: tlvs }
+}
+
+/// The PDU, with the PDU length in its fixed part recomputed.
+pub fn encode(p: IsisPdu) -> bytes {
+    var out = bytes_of([p.nlpid.bit_and(255), p.hdrlen.bit_and(255), p.version.bit_and(255), p.idlen.bit_and(255),
+        p.pdutype.bit_and(31), p.pduversion.bit_and(255), p.reserved.bit_and(255), p.maxareaaddr.bit_and(255)])
+        .concat(p.fixed)
+    for t in p.tlvs {
+        out = out.concat(bytes_of([t.kind.bit_and(255), t.value.len()])).concat(t.value)
+    }
+    let at_len = pdu_length_at(p.pdutype)
+    if at_len + 2 <= p.hdrlen {
+        out.set(at_len, out.len().ushr(8).bit_and(255))
+        out.set(at_len + 1, out.len().bit_and(255))
+    }
+    out
+}
+
+pub fn find(p: IsisPdu, kind: i64) -> Option[bytes] {
+    for t in p.tlvs {
+        if t.kind == kind {
+            return Some(t.value)
+        }
+    }
+    None
+}

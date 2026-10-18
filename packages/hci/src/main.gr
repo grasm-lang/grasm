@@ -1,0 +1,118 @@
+// Bluetooth HCI packets in the H4 (UART) framing: what a Bluetooth
+// controller and its host exchange, and what `btmon`, Android's btsnoop
+// logs and pcap link type 201 record.
+//
+// A one-byte packet indicator, then by type: a command (a little-endian
+// opcode -- 6-bit group, 10-bit command -- a parameter length and the
+// parameters), ACL data (a 12-bit connection handle with packet-boundary
+// and broadcast flags, a 16-bit length and the data), SCO data (handle,
+// 8-bit length), an event (code, length, parameters) or ISO data. Lengths
+// are checked against what arrived.
+
+type HciPacket = {
+    kind: i64,
+    opcode: i64,
+    handle: i64,
+    pb: i64,
+    bc: i64,
+    code: i64,
+    payload: bytes,
+}
+
+type HciError =
+    | TooShort(found: i64)
+    | BadLength(declared: i64)
+    | UnknownType(found: i64)
+
+pub fn command() -> i64 { 1 }
+pub fn acl() -> i64 { 2 }
+pub fn sco() -> i64 { 3 }
+pub fn event() -> i64 { 4 }
+pub fn iso() -> i64 { 5 }
+
+fn le16(b: bytes, at: i64) -> i64 {
+    b.at(at).bit_or(b.at(at + 1).shl(8))
+}
+
+fn blank(kind: i64) -> HciPacket {
+    HciPacket{ kind: kind, opcode: 0, handle: 0, pb: 0, bc: 0, code: 0, payload: bytes_of([]) }
+}
+
+fn take(b: bytes, from: i64, n: i64) -> bytes ! HciError {
+    if from + n > b.len() {
+        fail(BadLength(n))
+    }
+    b.slice(from, from + n)
+}
+
+pub fn decode(b: bytes) -> HciPacket ! HciError {
+    if b.len() < 1 {
+        fail(TooShort(0))
+    }
+    let kind = b.at(0)
+    var p = blank(kind)
+    if kind == 1 {
+        if b.len() < 4 {
+            fail(TooShort(b.len()))
+        }
+        p.opcode = le16(b, 1)
+        p.payload = try take(b, 4, b.at(3))
+    } else if kind == 2 or kind == 5 {
+        if b.len() < 5 {
+            fail(TooShort(b.len()))
+        }
+        let h = le16(b, 1)
+        p.handle = h.bit_and(4095)
+        p.pb = h.ushr(12).bit_and(3)
+        p.bc = h.ushr(14).bit_and(3)
+        let n = if kind == 5 { le16(b, 3).bit_and(16383) } else { le16(b, 3) }
+        p.payload = try take(b, 5, n)
+    } else if kind == 3 {
+        if b.len() < 4 {
+            fail(TooShort(b.len()))
+        }
+        let h = le16(b, 1)
+        p.handle = h.bit_and(4095)
+        p.pb = h.ushr(12).bit_and(3)
+        p.payload = try take(b, 4, b.at(3))
+    } else if kind == 4 {
+        if b.len() < 3 {
+            fail(TooShort(b.len()))
+        }
+        p.code = b.at(1)
+        p.payload = try take(b, 3, b.at(2))
+    } else {
+        fail(UnknownType(kind))
+    }
+    p
+}
+
+pub fn encode(p: HciPacket) -> bytes {
+    let n = p.payload.len()
+    if p.kind == 1 {
+        return bytes_of([1, p.opcode.bit_and(255), p.opcode.ushr(8).bit_and(255), n.bit_and(255)]).concat(p.payload)
+    }
+    if p.kind == 2 or p.kind == 5 {
+        let h = p.handle.bit_and(4095).bit_or(p.pb.bit_and(3).shl(12)).bit_or(p.bc.bit_and(3).shl(14))
+        return bytes_of([p.kind, h.bit_and(255), h.ushr(8), n.bit_and(255), n.ushr(8).bit_and(255)]).concat(p.payload)
+    }
+    if p.kind == 3 {
+        let h = p.handle.bit_and(4095).bit_or(p.pb.bit_and(3).shl(12))
+        return bytes_of([3, h.bit_and(255), h.ushr(8), n.bit_and(255)]).concat(p.payload)
+    }
+    bytes_of([p.kind.bit_and(255), p.code.bit_and(255), n.bit_and(255)]).concat(p.payload)
+}
+
+/// A command's opcode group and command: OGF 3 is controller and baseband,
+/// so (3, 3) is HCI_Reset.
+pub fn ogf(opcode: i64) -> i64 {
+    opcode.ushr(10)
+}
+
+pub fn ocf(opcode: i64) -> i64 {
+    opcode.bit_and(1023)
+}
+
+pub fn make_opcode(group: i64, cmd: i64) -> i64 {
+    group.bit_and(63).shl(10).bit_or(cmd.bit_and(1023))
+}

@@ -1,0 +1,181 @@
+// OSPFv2 (RFC 2328): the link-state routing protocol inside most
+// enterprise and ISP networks.
+//
+// Every packet has a 24-byte header -- version, type, length, router ID,
+// area, checksum, authentication type and eight bytes of authentication
+// -- then a body by type: Hello, Database Description, Link State Request,
+// Update, Acknowledgment. Hello's fields and the LSA headers that Update
+// and Acknowledgment carry have readers.
+//
+// ## Two checksums
+//
+// The packet checksum is the Internet checksum over everything except the
+// eight authentication bytes, and is zero under cryptographic
+// authentication, where a digest replaces it. Each LSA has its own
+// checksum, a Fletcher checksum (ISO 8473) over the LSA without its age,
+// placed so the whole sums to zero -- `lsa_checksum` computes it.
+import packets
+
+type OspfPacket = {
+    version: i64,
+    kind: i64,
+    length: i64,
+    router_id: bytes,
+    area: bytes,
+    checksum: i64,
+    autype: i64,
+    auth: bytes,
+    body: bytes,
+}
+
+type OspfHello = {
+    mask: bytes,
+    interval: i64,
+    options: i64,
+    priority: i64,
+    dead_interval: i64,
+    dr: bytes,
+    bdr: bytes,
+    neighbors: [bytes],
+}
+
+type OspfLsaHeader = {
+    age: i64,
+    options: i64,
+    kind: i64,
+    id: bytes,
+    adv_router: bytes,
+    seq: i64,
+    checksum: i64,
+    length: i64,
+}
+
+type OspfError =
+    | TooShort(found: i64)
+    | BadLength(declared: i64)
+
+fn u16(b: bytes, at: i64) -> i64 {
+    b.at(at) * 256 + b.at(at + 1)
+}
+
+fn u32(b: bytes, at: i64) -> i64 {
+    u16(b, at) * 65536 + u16(b, at + 2)
+}
+
+fn be16(v: i64) -> bytes {
+    bytes_of([v.ushr(8).bit_and(255), v.bit_and(255)])
+}
+
+fn be32(v: i64) -> bytes {
+    be16(v.ushr(16).bit_and(65535)).concat(be16(v.bit_and(65535)))
+}
+
+pub fn decode(data: bytes) -> OspfPacket ! OspfError {
+    if data.len() < 24 {
+        fail(TooShort(data.len()))
+    }
+    let n = u16(data, 2)
+    if n < 24 or n > data.len() {
+        fail(BadLength(n))
+    }
+    OspfPacket{ version: data.at(0), kind: data.at(1), length: n, router_id: data.slice(4, 8),
+        area: data.slice(8, 12), checksum: u16(data, 12), autype: u16(data, 14), auth: data.slice(16, 24),
+        body: data.slice(24, n) }
+}
+
+/// The packet with its length, and -- unless the authentication is
+/// cryptographic (type 2) -- its checksum.
+pub fn encode(p: OspfPacket) -> bytes {
+    let n = 24 + p.body.len()
+    var out = bytes_of([p.version.bit_and(255), p.kind.bit_and(255)]).concat(be16(n)).concat(p.router_id)
+        .concat(p.area).concat(be16(0)).concat(be16(p.autype)).concat(p.auth).concat(p.body)
+    if p.autype != 2 {
+        let sum = packets.checksum(out.slice(0, 16).concat(out.slice(24, out.len())))
+        out.set(12, sum.ushr(8))
+        out.set(13, sum.bit_and(255))
+    } else {
+        out.set(12, p.checksum.ushr(8).bit_and(255))
+        out.set(13, p.checksum.bit_and(255))
+    }
+    out
+}
+
+pub fn hello(p: OspfPacket) -> OspfHello ! OspfError {
+    let b = p.body
+    if b.len() < 20 {
+        fail(TooShort(b.len()))
+    }
+    var neighbors: [bytes] = []
+    var at = 20
+    while at + 4 <= b.len() {
+        neighbors.push(b.slice(at, at + 4))
+        at = at + 4
+    }
+    OspfHello{ mask: b.slice(0, 4), interval: u16(b, 4), options: b.at(6), priority: b.at(7),
+        dead_interval: u32(b, 8), dr: b.slice(12, 16), bdr: b.slice(16, 20), neighbors: neighbors }
+}
+
+pub fn lsa_header(b: bytes, at: i64) -> OspfLsaHeader {
+    OspfLsaHeader{ age: u16(b, at), options: b.at(at + 2), kind: b.at(at + 3), id: b.slice(at + 4, at + 8),
+        adv_router: b.slice(at + 8, at + 12), seq: u32(b, at + 12), checksum: u16(b, at + 16),
+        length: u16(b, at + 18) }
+}
+
+/// The LSA headers of an Update (each LSA whole, its header read) or an
+/// Acknowledgment (headers alone).
+pub fn lsa_headers(p: OspfPacket) -> [OspfLsaHeader] ! OspfError {
+    var out: [OspfLsaHeader] = []
+    let b = p.body
+    if p.kind == 4 {
+        if b.len() < 4 {
+            fail(TooShort(b.len()))
+        }
+        var at = 4
+        for _ in 0..u32(b, 0) {
+            if at + 20 > b.len() {
+                fail(TooShort(b.len()))
+            }
+            let h = lsa_header(b, at)
+            if h.length < 20 or at + h.length > b.len() {
+                fail(BadLength(h.length))
+            }
+            out.push(h)
+            at = at + h.length
+        }
+    } else if p.kind == 5 {
+        var at = 0
+        while at + 20 <= b.len() {
+            out.push(lsa_header(b, at))
+            at = at + 20
+        }
+    }
+    out
+}
+
+/// The Fletcher checksum for an LSA (RFC 2328 section 12.1.7), computed
+/// over everything but the age, with the checksum field taken as zero, and
+/// solved so the whole sums to zero.
+pub fn lsa_checksum(lsa: bytes) -> i64 {
+    var data = lsa.slice(2, lsa.len())
+    data.set(14, 0)
+    data.set(15, 0)
+    var c0 = 0
+    var c1 = 0
+    for i in 0..data.len() {
+        c0 = (c0 + data.at(i)) % 255
+        c1 = (c1 + c0) % 255
+    }
+    // The checksum sits at byte 15 of the LSA counting from 1 after the
+    // age, which is position 14 counting from 0 of `data`.
+    let n = data.len()
+    let pos = 15
+    var x = ((n - pos) * c0 - c1) % 255
+    if x <= 0 {
+        x = x + 255
+    }
+    var y = 510 - c0 - x
+    if y > 255 {
+        y = y - 255
+    }
+    x.shl(8).bit_or(y)
+}

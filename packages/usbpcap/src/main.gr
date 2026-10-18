@@ -1,0 +1,72 @@
+// The USBPcap header: what Windows USB captures (link type 249) put before
+// each transfer -- the IRP, the USB status, the function, which bus,
+// device and endpoint, the transfer type and the data length, all
+// little-endian. A control transfer adds one byte, its stage; the header's
+// own length says where the data starts, so a newer, longer header still
+// parses.
+
+type UsbpcapHeader = {
+    header_len: i64,
+    irp_id: bytes,
+    status: i64,
+    function: i64,
+    info: i64,
+    bus: i64,
+    device: i64,
+    endpoint: i64,
+    transfer: i64,
+    data_length: i64,
+    extra: bytes,
+    data: bytes,
+}
+
+type UsbpcapError =
+    | TooShort(found: i64)
+    | BadLength(declared: i64)
+
+fn le16(b: bytes, at: i64) -> i64 {
+    b.at(at).bit_or(b.at(at + 1).shl(8))
+}
+
+fn le32(b: bytes, at: i64) -> i64 {
+    le16(b, at).bit_or(le16(b, at + 2).shl(16))
+}
+
+fn put16(v: i64) -> bytes {
+    bytes_of([v.bit_and(255), v.ushr(8).bit_and(255)])
+}
+
+fn put32(v: i64) -> bytes {
+    put16(v.bit_and(65535)).concat(put16(v.ushr(16).bit_and(65535)))
+}
+
+pub fn decode(b: bytes) -> UsbpcapHeader ! UsbpcapError {
+    if b.len() < 27 {
+        fail(TooShort(b.len()))
+    }
+    let n = le16(b, 0)
+    if n < 27 or n > b.len() {
+        fail(BadLength(n))
+    }
+    UsbpcapHeader{ header_len: n, irp_id: b.slice(2, 10), status: le32(b, 10), function: le16(b, 14),
+        info: b.at(16), bus: le16(b, 17), device: le16(b, 19), endpoint: b.at(21), transfer: b.at(22),
+        data_length: le32(b, 23), extra: b.slice(27, n), data: b.slice(n, b.len()) }
+}
+
+/// The header with its length computed from `extra`; the data length is
+/// written as given.
+pub fn encode(h: UsbpcapHeader) -> bytes {
+    put16(27 + h.extra.len()).concat(h.irp_id).concat(put32(h.status)).concat(put16(h.function))
+        .concat(bytes_of([h.info.bit_and(255)])).concat(put16(h.bus)).concat(put16(h.device))
+        .concat(bytes_of([h.endpoint.bit_and(255), h.transfer.bit_and(255)])).concat(put32(h.data_length))
+        .concat(h.extra).concat(h.data)
+}
+
+/// The endpoint's direction bit: device to host.
+pub fn is_in(h: UsbpcapHeader) -> bool {
+    h.endpoint.bit_and(128) != 0
+}
+
+pub fn transfer_name(t: i64) -> str {
+    ["isochronous", "interrupt", "control", "bulk"][t.bit_and(3)]
+}

@@ -14,6 +14,16 @@ import nsh
 import erspan
 import l2tp
 import pppoe
+import ospf
+import bgp
+import eigrp
+import pim
+import isis
+import eap
+import radiotap
+import canframe
+import usbpcap
+import hci
 
 fn from_hex(text: str) -> bytes {
     var out: [i64] = []
@@ -215,7 +225,216 @@ fn links(what: str, a: bytes) -> str {
     }
 }
 
+fn pfx(list: [BgpPrefix]) -> str {
+    var parts: [str] = []
+    for p in list {
+        parts.push("{p.length}/{hex(p.prefix)}")
+    }
+    parts.join(",")
+}
+
+fn interior(what: str, a: bytes) -> str {
+    let rt = what.ends_with(".rt")
+    if what.starts_with("ospf") {
+        return match ospf.decode(a) {
+            Err(_) -> "ERR"
+            Ok(p) -> {
+                if rt {
+                    return hex(ospf.encode(p))
+                }
+                var extra = ""
+                if p.kind == 1 {
+                    extra = match ospf.hello(p) {
+                        Ok(h) -> ";hello={hex(h.mask)}/{h.interval}/{h.options}/{h.priority}/{h.dead_interval}/" +
+                        "{hex(h.dr)}/{hex(h.bdr)}/{h.neighbors.len()}"
+                        Err(_) -> ";hello=ERR"
+                    }
+                }
+                if p.kind == 4 or p.kind == 5 {
+                    extra = match ospf.lsa_headers(p) {
+                        Ok(list) -> {
+                            var parts: [str] = []
+                            for h in list {
+                                parts.push("{h.age}/{h.kind}/{hex(h.id)}/{h.seq}/{h.checksum}/{h.length}")
+                            }
+                            ";lsas=" + parts.join(",")
+                        }
+                        Err(_) -> ";lsas=ERR"
+                    }
+                }
+                "version={p.version};type={p.kind};len={p.length};src={hex(p.router_id)};area={hex(p.area)};" +
+                "chksum={p.checksum};authtype={p.autype}" + extra
+            }
+        }
+    }
+    if what.starts_with("lsack") {
+        return "{ospf.lsa_checksum(a)}"
+    }
+    if what.starts_with("bgp") {
+        return match bgp.decode(a) {
+            Err(_) -> "ERR"
+            Ok(got) -> {
+                let m = got.0
+                if rt {
+                    return hex(bgp.encode(m))
+                }
+                var extra = ""
+                if m.kind == 1 {
+                    extra = match bgp.open(m) {
+                        Ok(o) -> ";open={o.version}/{o.my_as}/{o.hold_time}/{hex(o.bgp_id)}/{o.params.len()}"
+                        Err(_) -> ";open=ERR"
+                    }
+                }
+                if m.kind == 2 {
+                    extra = match bgp.update(m) {
+                        Ok(u) -> {
+                            var attrs: [str] = []
+                            for x in u.attributes {
+                                attrs.push("{x.flags}/{x.code}/{hex(x.value)}")
+                            }
+                            ";withdrawn=" + pfx(u.withdrawn) + ";attrs=" + attrs.join(",") + ";nlri=" + pfx(u.nlri)
+                        }
+                        Err(_) -> ";update=ERR"
+                    }
+                }
+                "type={m.kind};len={got.1}" + extra
+            }
+        }
+    }
+    if what.starts_with("eigrp") {
+        return match eigrp.decode(a) {
+            Err(_) -> "ERR"
+            Ok(p) -> {
+                if rt {
+                    return hex(eigrp.encode(p))
+                }
+                var parts: [str] = []
+                for t in p.tlvs {
+                    parts.push("{t.kind}:{hex(t.value)}")
+                }
+                "ver={p.version};opcode={p.opcode};chksum={p.checksum};flags={p.flags};seq={p.seq};ack={p.ack};" +
+                "asn={p.asn};tlvs=" + parts.join("|")
+            }
+        }
+    }
+    if what.starts_with("pim") {
+        return match pim.decode(a) {
+            Err(_) -> "ERR"
+            Ok(m) -> {
+                if rt {
+                    return hex(pim.encode(m))
+                }
+                var opts = ""
+                if m.kind == 0 {
+                    opts = match pim.hello_options(m) {
+                        Ok(list) -> {
+                            var parts: [str] = []
+                            for o in list {
+                                parts.push("{o.0}:{hex(o.1)}")
+                            }
+                            parts.join("|")
+                        }
+                        Err(_) -> "ERR"
+                    }
+                }
+                "version={m.version};type={m.kind};chksum={m.checksum};body={hex(m.body)};opts=" + opts
+            }
+        }
+    }
+    match isis.decode(a) {
+        Err(_) -> "ERR"
+        Ok(p) -> {
+            if rt {
+                return hex(isis.encode(p))
+            }
+            var parts: [str] = []
+            for t in p.tlvs {
+                parts.push("{t.kind}:{hex(t.value)}")
+            }
+            "nlpid={p.nlpid};hdrlen={p.hdrlen};pdutype={p.pdutype};fixed={hex(p.fixed)};tlvs=" + parts.join("|")
+        }
+    }
+}
+
+fn wireless(what: str, a: bytes) -> str {
+    let rt = what.ends_with(".rt")
+    if what.starts_with("eapol") {
+        return match eap.decode_eapol(a) {
+            Err(_) -> "ERR"
+            Ok(f) -> {
+                if rt {
+                    return hex(eap.encode_eapol(f))
+                }
+                var extra = ""
+                if f.kind == 3 {
+                    extra = match eap.key_frame(f) {
+                        Ok(k) -> ";key={k.descriptor}/{k.info}/{k.key_length}/{hex(k.replay_counter)}/{hex(k.nonce)}/" +
+                        "{hex(k.mic)}/{hex(k.data)}"
+                        Err(_) -> ";key=ERR"
+                    }
+                }
+                if f.kind == 0 {
+                    extra = match eap.decode_eap(f.body) {
+                        Ok(e) -> ";eap={e.code}/{e.id}/{e.length}/{e.method}/{hex(e.data)}"
+                        Err(_) -> ";eap=ERR"
+                    }
+                }
+                "version={f.version};type={f.kind};len={f.length}" + extra
+            }
+        }
+    }
+    if what.starts_with("radiotap") {
+        return match radiotap.decode(a) {
+            Err(_) -> "ERR"
+            Ok(h) -> {
+                if rt {
+                    return hex(radiotap.encode(h))
+                }
+                var parts: [str] = []
+                for f in h.fields {
+                    parts.push("{f.bit}:{hex(f.value)}")
+                }
+                "len={h.length};present={h.presents[0]};fields=" + parts.join("|") + ";frame={hex(h.frame)}"
+            }
+        }
+    }
+    if what.starts_with("can") {
+        return match canframe.decode(a) {
+            Err(_) -> "ERR"
+            Ok(f) -> if rt { hex(canframe.encode(f)) } else {
+                "ext=" + flag(f.extended) + ";rtr=" + flag(f.remote) + ";err=" + flag(f.error) +
+                ";id={f.id};len={f.length};data={hex(f.data)}"
+            }
+        }
+    }
+    if what.starts_with("usbpcap") {
+        return match usbpcap.decode(a) {
+            Err(_) -> "ERR"
+            Ok(h) -> if rt { hex(usbpcap.encode(h)) } else {
+                "hlen={h.header_len};irp={hex(h.irp_id)};status={h.status};function={h.function};info={h.info};" +
+                "bus={h.bus};device={h.device};endpoint={h.endpoint};transfer={h.transfer};dlen={h.data_length};" +
+                "data={hex(h.data)}"
+            }
+        }
+    }
+    match hci.decode(a) {
+        Err(_) -> "ERR"
+        Ok(p) -> if rt { hex(hci.encode(p)) } else {
+            "type={p.kind};ogf={hci.ogf(p.opcode)};ocf={hci.ocf(p.opcode)};handle={p.handle};pb={p.pb};bc={p.bc};" +
+            "code={p.code};payload={hex(p.payload)}"
+        }
+    }
+}
+
 fn answer(what: str, a: bytes, b: bytes) -> str {
+    if what.starts_with("ospf") or what.starts_with("lsack") or what.starts_with("bgp") or
+    what.starts_with("eigrp") or what.starts_with("pim") or what.starts_with("isis") {
+        return interior(what, a)
+    }
+    if what.starts_with("eapol") or what.starts_with("radiotap") or what.starts_with("can") or
+    what.starts_with("usbpcap") or what.starts_with("hci") {
+        return wireless(what, a)
+    }
     if what.starts_with("igmp") or what.starts_with("mpls") or what.starts_with("rip") or
     what.starts_with("vrrp") or what.starts_with("bfd") or what.starts_with("hsrp") {
         return routing(what, a, b)

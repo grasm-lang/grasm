@@ -56,6 +56,17 @@ from scapy.contrib.nsh import NSH  # noqa: E402
 from scapy.contrib.erspan import ERSPAN_II, ERSPAN_III  # noqa: E402
 from scapy.layers.l2tp import L2TP  # noqa: E402
 from scapy.layers.ppp import PPPoE, PPPoED, PPP  # noqa: E402
+from scapy.contrib.ospf import OSPF_Hdr, OSPF_Hello, OSPF_LSUpd, OSPF_Router_LSA, OSPF_LSAck, OSPF_LSA_Hdr  # noqa: E402
+from scapy.contrib.bgp import (BGPHeader, BGPOpen, BGPUpdate, BGPNotification, BGPPathAttr,  # noqa: E402
+                               BGPPAOrigin, BGPPANextHop, BGPPAMultiExitDisc, BGPNLRI_IPv4)
+from scapy.contrib.eigrp import EIGRP, EIGRPParam, EIGRPSwVer  # noqa: E402
+from scapy.contrib.pim import PIMv2Hdr, PIMv2Hello, PIMv2HelloHoldtime, PIMv2HelloDRPriority  # noqa: E402
+from scapy.contrib.isis import ISIS_CommonHdr, ISIS_L1_LAN_Hello, ISIS_AreaTlv, ISIS_GenericTlv  # noqa: E402
+from scapy.layers.eap import EAP, EAPOL, EAPOL_KEY  # noqa: E402
+from scapy.layers.dot11 import RadioTap  # noqa: E402
+from scapy.layers.can import CAN  # noqa: E402
+from scapy.layers.usb import USBpcap  # noqa: E402
+from scapy.layers.bluetooth import HCI_Hdr, HCI_Command_Hdr, HCI_ACL_Hdr, HCI_Event_Hdr  # noqa: E402
 import struct  # noqa: E402
 import zlib  # noqa: E402
 
@@ -75,7 +86,8 @@ for src, out in [("packages/packettest/src/main.gr", harness), ("packages/packet
     if built.returncode != 0:
         print(built.stderr[-1500:]); sys.exit(1)
 # The protocols the second harness answers for.
-SECOND = ("igmp", "mpls", "lldp", "stp", "cdp", "rip", "vrrp", "bfd", "hsrp", "nsh", "erspan", "l2tp", "pppoe")
+SECOND = ("igmp", "mpls", "lldp", "stp", "cdp", "rip", "vrrp", "bfd", "hsrp", "nsh", "erspan", "l2tp", "pppoe",
+          "ospf", "lsack", "bgp", "eigrp", "pim", "isis", "eapol", "radiotap", "can", "usbpcap", "hci")
 
 
 def rb(n):
@@ -801,6 +813,253 @@ for _ in range(250):
                       f"payload={raw[6:6 + n].hex()};tags={'|'.join(tl)}")
     add("pppoe.rt", raw, raw.hex())
 
+# --- B15, second part ---------------------------------------------------
+def tlv8(raw, start, end):
+    out, at = [], start
+    while at < end:
+        out.append(f"{raw[at]}:{raw[at + 2:at + 2 + raw[at + 1]].hex()}")
+        at += 2 + raw[at + 1]
+    return out
+
+
+for _ in range(250):
+    if rng.random() < 0.5:
+        nbrs = [ip4() for _ in range(rng.randrange(0, 3))]
+        pkt = OSPF_Hdr(type=1, src=ip4(), area=ip4(), authtype=rng.choice([0, 1]), authdata=rng.randrange(1 << 63)) / \
+            OSPF_Hello(mask=ip4(), hellointerval=rng.randrange(65536), prio=rng.randrange(256),
+                       deadinterval=rng.randrange(1 << 32), router=ip4(), backup=ip4(), neighbors=nbrs)
+    else:
+        lsas = [OSPF_Router_LSA(id=ip4(), adrouter=ip4(), seq=rng.randrange(1 << 31), age=rng.randrange(3600))
+                for _ in range(rng.randrange(1, 3))]
+        pkt = OSPF_Hdr(type=4, src=ip4(), area=ip4()) / OSPF_LSUpd(lsalist=lsas)
+    raw = bytes(pkt)
+    t = raw[1]
+    text = (f"version={raw[0]};type={t};len={struct.unpack('>H', raw[2:4])[0]};src={raw[4:8].hex()};"
+            f"area={raw[8:12].hex()};chksum={struct.unpack('>H', raw[12:14])[0]};authtype={struct.unpack('>H', raw[14:16])[0]}")
+    body = raw[24:]
+    if t == 1:
+        ncount = (len(body) - 20) // 4
+        text += (f";hello={body[0:4].hex()}/{struct.unpack('>H', body[4:6])[0]}/{body[6]}/{body[7]}/"
+                 f"{struct.unpack('>I', body[8:12])[0]}/{body[12:16].hex()}/{body[16:20].hex()}/{ncount}")
+    else:
+        heads, at = [], 4
+        for _ in range(struct.unpack(">I", body[:4])[0]):
+            age, _opt, kind = struct.unpack(">HBB", body[at:at + 4])
+            seq, ck, ln = struct.unpack(">IHH", body[at + 12:at + 20])
+            heads.append(f"{age}/{kind}/{body[at + 4:at + 8].hex()}/{seq}/{ck}/{ln}")
+            add("lsack", body[at:at + ln], str(ck))
+            at += ln
+        text += ";lsas=" + ",".join(heads)
+    add("ospf", raw, text)
+    add("ospf.rt", raw, raw.hex())
+
+for _ in range(250):
+    kind = rng.choice(["open", "update", "update", "keepalive", "notify"])
+    if kind == "open":
+        pkt = BGPHeader(type=1) / BGPOpen(my_as=rng.randrange(65536), hold_time=rng.randrange(65536), bgp_id=ip4())
+    elif kind == "update":
+        def nl():
+            bits = rng.randrange(0, 33)
+            addr = socket.inet_ntoa(struct.pack(">I", rng.getrandbits(32) & (((1 << bits) - 1) << (32 - bits)) if bits else 0))
+            return BGPNLRI_IPv4(prefix=f"{addr}/{bits}")
+        attrs = [BGPPathAttr(type_flags=0x40, type_code=1, attribute=BGPPAOrigin(origin=rng.randrange(3))),
+                 BGPPathAttr(type_flags=0x40, type_code=3, attribute=BGPPANextHop(next_hop=ip4()))]
+        if rng.random() < 0.5:
+            attrs.append(BGPPathAttr(type_flags=0x80, type_code=4, attribute=BGPPAMultiExitDisc(med=rng.randrange(1 << 32))))
+        pkt = BGPHeader(type=2) / BGPUpdate(withdrawn_routes=[nl() for _ in range(rng.randrange(0, 3))],
+                                            path_attr=attrs, nlri=[nl() for _ in range(rng.randrange(0, 3))])
+    elif kind == "notify":
+        pkt = BGPHeader(type=3) / BGPNotification(error_code=rng.randrange(1, 7), error_subcode=rng.randrange(10))
+    else:
+        pkt = BGPHeader(type=4)
+    raw = bytes(pkt)
+    t = raw[18]
+    text = f"type={t};len={len(raw)}"
+    body = raw[19:]
+    if t == 1:
+        text += f";open={body[0]}/{struct.unpack('>H', body[1:3])[0]}/{struct.unpack('>H', body[3:5])[0]}/{body[5:9].hex()}/0"
+    if t == 2:
+        def plist(b, a, e):
+            out = []
+            while a < e:
+                n = (b[a] + 7) // 8
+                out.append(f"{b[a]}/{b[a + 1:a + 1 + n].hex()}")
+                a += 1 + n
+            return out
+        wl = struct.unpack(">H", body[:2])[0]
+        al = struct.unpack(">H", body[2 + wl:4 + wl])[0]
+        attrs, at = [], 4 + wl
+        while at < 4 + wl + al:
+            fl, code = body[at], body[at + 1]
+            if fl & 16:
+                n, h = struct.unpack(">H", body[at + 2:at + 4])[0], 4
+            else:
+                n, h = body[at + 2], 3
+            attrs.append(f"{fl}/{code}/{body[at + h:at + h + n].hex()}")
+            at += h + n
+        text += (f";withdrawn={','.join(plist(body, 2, 2 + wl))};attrs={','.join(attrs)};"
+                 f"nlri={','.join(plist(body, 4 + wl + al, len(body)))}")
+    add("bgp", raw, text)
+    add("bgp.rt", raw, raw.hex())
+
+for _ in range(250):
+    tl = [EIGRPParam(k1=rng.randrange(256), k2=rng.randrange(256), k3=rng.randrange(256), holdtime=rng.randrange(65536))]
+    if rng.random() < 0.5:
+        tl.append(EIGRPSwVer())
+    raw = bytes(EIGRP(opcode=rng.choice([1, 3, 4, 5]), seq=rng.randrange(1 << 32), ack=rng.randrange(1 << 32),
+                      asn=rng.randrange(1 << 16), flags=rng.randrange(16), tlvlist=tl))
+    parts, at = [], 20
+    while at < len(raw):
+        t, n = struct.unpack(">HH", raw[at:at + 4])
+        parts.append(f"{t}:{raw[at + 4:at + n].hex()}")
+        at += n
+    f = struct.unpack(">IIII", raw[4:20])
+    add("eigrp", raw, f"ver={raw[0]};opcode={raw[1]};chksum={struct.unpack('>H', raw[2:4])[0]};flags={f[0]};"
+                      f"seq={f[1]};ack={f[2]};asn={f[3]};tlvs={'|'.join(parts)}")
+    add("eigrp.rt", raw, raw.hex())
+
+for _ in range(250):
+    if rng.random() < 0.6:
+        opts = [PIMv2HelloHoldtime(holdtime=rng.randrange(65536))]
+        if rng.random() < 0.5:
+            opts.append(PIMv2HelloDRPriority(dr_priority=rng.randrange(1 << 32)))
+        # scapy fills in the checksum only with an IP layer underneath.
+        raw = bytes((IP(src=ip4(), dst="224.0.0.13") / PIMv2Hdr(type=0) / PIMv2Hello(option=opts))[PIMv2Hdr])
+        olist, at = [], 4
+        while at < len(raw):
+            t, n = struct.unpack(">HH", raw[at:at + 4])
+            olist.append(f"{t}:{raw[at + 4:at + 4 + n].hex()}")
+            at += 4 + n
+        add("pim", raw, f"version=2;type=0;chksum={struct.unpack('>H', raw[2:4])[0]};body={raw[4:].hex()};"
+                        f"opts={'|'.join(olist)}")
+    else:
+        raw = bytes((IP(src=ip4(), dst="224.0.0.13") / PIMv2Hdr(type=3) / Raw(rb(rng.randrange(4, 30))))[PIMv2Hdr])
+        add("pim", raw, f"version=2;type=3;chksum={struct.unpack('>H', raw[2:4])[0]};body={raw[4:].hex()};opts=")
+    add("pim.rt", raw, raw.hex())
+
+for _ in range(250):
+    tlvs = [ISIS_AreaTlv(areas=["49.%04x" % rng.randrange(65536)])]
+    if rng.random() < 0.5:
+        tlvs.append(ISIS_GenericTlv(type=rng.choice([129, 132, 240]), val=rb(rng.randrange(1, 6))))
+    raw = bytes(ISIS_CommonHdr() / ISIS_L1_LAN_Hello(circuittype=rng.randrange(1, 4), sourceid="%04x.%04x.%04x" % tuple(rng.randrange(65536) for _ in range(3)),
+                                                     holdingtime=rng.randrange(65536), priority=rng.randrange(128),
+                                                     lanid="%04x.%04x.%04x.%02x" % (rng.randrange(65536), rng.randrange(65536), rng.randrange(65536), rng.randrange(256)),
+                                                     tlvs=tlvs))
+    hl = raw[1]
+    add("isis", raw, f"nlpid={raw[0]};hdrlen={hl};pdutype={raw[4] & 31};fixed={raw[8:hl].hex()};"
+                     f"tlvs={'|'.join(tlv8(raw, hl, len(raw)))}")
+    add("isis.rt", raw, raw.hex())
+
+for _ in range(250):
+    if rng.random() < 0.5:
+        e = EAP(code=2, id=rng.randrange(256), type=1, identity=("user" + str(rng.randrange(100))).encode())
+        raw = bytes(EAPOL(version=rng.choice([1, 2]), type=0) / e)
+        eb = raw[4:]
+        el = struct.unpack(">H", eb[2:4])[0]
+        add("eapol", raw, f"version={raw[0]};type=0;len={struct.unpack('>H', raw[2:4])[0]};"
+                          f"eap={eb[0]}/{eb[1]}/{el}/{eb[4]}/{eb[5:el].hex()}")
+    else:
+        kdata = rb(rng.randrange(0, 30))
+        key = EAPOL_KEY(key_descriptor_type=2, key_descriptor_type_version=2, key_type=1,
+                        key_ack=rng.randrange(2), has_key_mic=rng.randrange(2), install=rng.randrange(2),
+                        secure=rng.randrange(2), key_length=16, key_replay_counter=rng.randrange(1 << 32),
+                        key_nonce=rb(32), key_mic=rb(16), key_data=kdata)
+        raw = bytes(EAPOL(version=2, type=3) / key)
+        kb = raw[4:]
+        add("eapol", raw, f"version=2;type=3;len={struct.unpack('>H', raw[2:4])[0]};"
+                          f"key={kb[0]}/{struct.unpack('>H', kb[1:3])[0]}/{struct.unpack('>H', kb[3:5])[0]}/"
+                          f"{kb[5:13].hex()}/{kb[13:45].hex()}/{kb[77:93].hex()}/{kdata.hex()}")
+    add("eapol.rt", raw, raw.hex())
+
+for _ in range(250):
+    names = ["TSFT", "Flags", "Rate", "Channel", "dBm_AntSignal", "dBm_AntNoise", "Lock_Quality", "Antenna", "RXFlags", "TXFlags"]
+    chosen = [n for n in names if rng.random() < 0.6] or ["Flags"]
+    kw = dict(present="+".join(chosen))
+    vals = {}
+    if "TSFT" in chosen:
+        kw["mac_timestamp"] = vals[0] = rng.randrange(1 << 63)
+    if "Flags" in chosen:
+        kw["Flags"] = vals[1] = rng.randrange(256)
+    if "Rate" in chosen:
+        kw["Rate"] = vals[2] = rng.randrange(128)
+    if "Channel" in chosen:
+        kw["ChannelFrequency"] = rng.choice([2412, 2437, 5180, 5745])
+        kw["ChannelFlags"] = rng.randrange(65536)
+    if "dBm_AntSignal" in chosen:
+        kw["dBm_AntSignal"] = rng.randrange(-100, 0)
+    if "dBm_AntNoise" in chosen:
+        kw["dBm_AntNoise"] = rng.randrange(-100, 0)
+    if "Lock_Quality" in chosen:
+        kw["Lock_Quality"] = rng.randrange(65536)
+    if "Antenna" in chosen:
+        kw["Antenna"] = rng.randrange(256)
+    if "RXFlags" in chosen:
+        kw["RXFlags"] = rng.randrange(65536)
+    if "TXFlags" in chosen:
+        kw["TXFlags"] = rng.randrange(65536)
+    raw = bytes(RadioTap(**kw) / Raw(rb(rng.randrange(0, 20))))
+    hl = struct.unpack("<H", raw[2:4])[0]
+    present = struct.unpack("<I", raw[4:8])[0]
+    order = [("TSFT", 0, "<Q", None), ("Flags", 1, "<B", None), ("Rate", 2, "<B", None), ("Channel", 3, None, None),
+             ("dBm_AntSignal", 5, "<b", None), ("dBm_AntNoise", 6, "<b", None), ("Lock_Quality", 7, "<H", None),
+             ("Antenna", 11, "<B", None), ("RXFlags", 14, "<H", None), ("TXFlags", 15, "<H", None)]
+    fparts = []
+    for name, bit, fmt, _ in order:
+        if name not in chosen:
+            continue
+        if name == "Channel":
+            v = struct.pack("<HH", kw["ChannelFrequency"], kw["ChannelFlags"])
+        else:
+            key = "mac_timestamp" if name == "TSFT" else name
+            # scapy's Rate is in Mb/s and goes out in 500 kb/s units.
+            val = RadioTap().get_field("Rate").i2m(None, kw[key]) if name == "Rate" else kw[key]
+            v = struct.pack(fmt, val)
+        fparts.append(f"{bit}:{v.hex()}")
+    add("radiotap", raw, f"len={hl};present={present};fields={'|'.join(fparts)};frame={raw[hl:].hex()}")
+    add("radiotap.rt", raw, raw.hex())
+
+for _ in range(250):
+    ext = rng.random() < 0.5
+    rtr = rng.random() < 0.2
+    err = rng.random() < 0.1
+    flags = (4 if ext else 0) | (2 if rtr else 0) | (1 if err else 0)
+    ident = rng.randrange(1 << 29) if ext else rng.randrange(1 << 11)
+    data = rb(rng.randrange(0, 9))
+    raw = bytes(CAN(flags=flags, identifier=ident, length=len(data), data=data))
+    add("can", raw, f"ext={1 if ext else 0};rtr={1 if rtr else 0};err={1 if err else 0};id={ident};len={len(data)};data={data.hex()}")
+    add("can.rt", raw, raw.hex())
+
+for _ in range(250):
+    data = rb(rng.randrange(0, 20))
+    h = USBpcap(irpId=rng.randrange(1 << 63), usbd_status=rng.randrange(1 << 31), function=rng.randrange(65536),
+                info=rng.randrange(2), bus=rng.randrange(65536), device=rng.randrange(65536),
+                endpoint=rng.randrange(256), transfer=rng.choice([0, 1, 3]), dataLength=len(data))
+    raw = bytes(h / Raw(data))
+    q = USBpcap(raw)
+    add("usbpcap", raw, f"hlen={raw[0] | raw[1] << 8};irp={raw[2:10].hex()};status={q.usbd_status};function={q.function};"
+                        f"info={q.info};bus={q.bus};device={q.device};endpoint={q.endpoint};transfer={q.transfer};"
+                        f"dlen={q.dataLength};data={raw[27:].hex()}")
+    add("usbpcap.rt", raw, raw.hex())
+
+for _ in range(250):
+    kind = rng.choice(["cmd", "acl", "event"])
+    data = rb(rng.randrange(0, 20))
+    if kind == "cmd":
+        ogf, ocf = rng.randrange(64), rng.randrange(1024)
+        raw = bytes(HCI_Hdr(type=1) / HCI_Command_Hdr(ogf=ogf, ocf=ocf) / Raw(data))
+        text = f"type=1;ogf={ogf};ocf={ocf};handle=0;pb=0;bc=0;code=0;payload={data.hex()}"
+    elif kind == "acl":
+        hd, pb, bc = rng.randrange(4096), rng.randrange(4), rng.randrange(4)
+        raw = bytes(HCI_Hdr(type=2) / HCI_ACL_Hdr(handle=hd, PB=pb, BC=bc) / Raw(data))
+        text = f"type=2;ogf=0;ocf=0;handle={hd};pb={pb};bc={bc};code=0;payload={data.hex()}"
+    else:
+        code = rng.randrange(256)
+        raw = bytes(HCI_Hdr(type=4) / HCI_Event_Hdr(code=code) / Raw(data))
+        text = f"type=4;ogf=0;ocf=0;handle=0;pb=0;bc=0;code={code};payload={data.hex()}"
+    add("hci", raw, text)
+    add("hci.rt", raw, raw.hex())
+
+
 def run(which, picked):
     argv = []
     for op, a, b, _ in picked:
@@ -840,7 +1099,7 @@ bad = [f"{k}:{d}" for k, (a, d) in sorted(families.items()) if d]
 if bad:
     print("disagreeing:", " ".join(bad))
 thin = [k for k, (a, d) in families.items() if a + d < 100]
-if thin or len(families) < 58:
+if thin or len(families) < 79:
     print(f"too few cases to mean anything: {thin}")
     sys.exit(1)
 print(f"cases: {len(cases)}   agreeing: {agree}   differing: {differ}")

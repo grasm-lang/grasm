@@ -1,0 +1,133 @@
+// EAP (RFC 3748) and EAPOL (IEEE 802.1X): how a WPA2/WPA3-Enterprise
+// laptop or a wired 802.1X port authenticates, and -- in EAPOL-Key frames
+// -- the four-way handshake that derives every WPA session key.
+//
+// An EAP packet is a code (request, response, success, failure), an
+// identifier, a length and, for requests and responses, a method type and
+// its data. EAPOL wraps it with a version, a type (0 EAP, 1 start, 2
+// logoff, 3 key) and a length. An EAPOL-Key body is the 95-byte descriptor
+// -- key information bits, replay counter, nonce, IV, RSC, MIC -- and the
+// key data; `key_frame` reads it, and `handshake_message` says which of
+// the four messages it is from the bits alone.
+
+type EapPacket = {
+    code: i64,
+    id: i64,
+    length: i64,
+    method: i64,
+    data: bytes,
+}
+
+type EapolFrame = {
+    version: i64,
+    kind: i64,
+    length: i64,
+    body: bytes,
+    trailer: bytes,
+}
+
+type EapolKey = {
+    descriptor: i64,
+    info: i64,
+    key_length: i64,
+    replay_counter: bytes,
+    nonce: bytes,
+    iv: bytes,
+    rsc: bytes,
+    id: bytes,
+    mic: bytes,
+    data: bytes,
+}
+
+type EapError =
+    | TooShort(found: i64)
+    | BadLength(declared: i64)
+
+fn u16(b: bytes, at: i64) -> i64 {
+    b.at(at) * 256 + b.at(at + 1)
+}
+
+fn be16(v: i64) -> bytes {
+    bytes_of([v.ushr(8).bit_and(255), v.bit_and(255)])
+}
+
+pub fn decode_eap(data: bytes) -> EapPacket ! EapError {
+    if data.len() < 4 {
+        fail(TooShort(data.len()))
+    }
+    let n = u16(data, 2)
+    if n < 4 or n > data.len() {
+        fail(BadLength(n))
+    }
+    let has_type = (data.at(0) == 1 or data.at(0) == 2) and n >= 5
+    EapPacket{ code: data.at(0), id: data.at(1), length: n, method: if has_type { data.at(4) } else { 0 },
+        data: data.slice(if has_type { 5 } else { 4 }, n) }
+}
+
+pub fn encode_eap(p: EapPacket) -> bytes {
+    let typed = p.code == 1 or p.code == 2
+    let body = if typed { bytes_of([p.method.bit_and(255)]).concat(p.data) } else { p.data }
+    bytes_of([p.code.bit_and(255), p.id.bit_and(255)]).concat(be16(4 + body.len())).concat(body)
+}
+
+pub fn decode_eapol(data: bytes) -> EapolFrame ! EapError {
+    if data.len() < 4 {
+        fail(TooShort(data.len()))
+    }
+    let n = u16(data, 2)
+    if 4 + n > data.len() {
+        fail(BadLength(n))
+    }
+    EapolFrame{ version: data.at(0), kind: data.at(1), length: n, body: data.slice(4, 4 + n),
+        trailer: data.slice(4 + n, data.len()) }
+}
+
+pub fn encode_eapol(f: EapolFrame) -> bytes {
+    bytes_of([f.version.bit_and(255), f.kind.bit_and(255)]).concat(be16(f.body.len())).concat(f.body).concat(f.trailer)
+}
+
+pub fn key_frame(f: EapolFrame) -> EapolKey ! EapError {
+    let b = f.body
+    if b.len() < 95 {
+        fail(TooShort(b.len()))
+    }
+    let n = u16(b, 93)
+    if 95 + n > b.len() {
+        fail(BadLength(n))
+    }
+    EapolKey{ descriptor: b.at(0), info: u16(b, 1), key_length: u16(b, 3), replay_counter: b.slice(5, 13),
+        nonce: b.slice(13, 45), iv: b.slice(45, 61), rsc: b.slice(61, 69), id: b.slice(69, 77),
+        mic: b.slice(77, 93), data: b.slice(95, 95 + n) }
+}
+
+pub fn encode_key(k: EapolKey) -> bytes {
+    bytes_of([k.descriptor.bit_and(255)]).concat(be16(k.info)).concat(be16(k.key_length)).concat(k.replay_counter)
+        .concat(k.nonce).concat(k.iv).concat(k.rsc).concat(k.id).concat(k.mic).concat(be16(k.data.len()))
+        .concat(k.data)
+}
+
+/// Which of the four-way handshake's messages a pairwise key frame is, from
+/// its ACK, MIC, Install and Secure bits; 0 when it is none of them.
+pub fn handshake_message(k: EapolKey) -> i64 {
+    let pairwise = k.info.bit_and(8) != 0
+    let ack = k.info.bit_and(128) != 0
+    let mic = k.info.bit_and(256) != 0
+    let install = k.info.bit_and(64) != 0
+    let secure = k.info.bit_and(512) != 0
+    if not pairwise {
+        return 0
+    }
+    if ack and not mic {
+        return 1
+    }
+    if ack and mic and install {
+        return 3
+    }
+    if not ack and mic and not secure and k.data.len() > 0 {
+        return 2
+    }
+    if not ack and mic {
+        return if secure { 4 } else { 2 }
+    }
+    0
+}

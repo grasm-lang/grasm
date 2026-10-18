@@ -1,0 +1,88 @@
+// EIGRP (RFC 7868): Cisco's distance-vector routing protocol, published as
+// an informational RFC in 2016.
+//
+// A twenty-byte header -- version, opcode (update, request, query, reply,
+// hello...), checksum over the whole packet, flags, sequence and
+// acknowledgment numbers, and the autonomous system -- then TLVs, each a
+// two-byte type and a two-byte length that counts its own header. The
+// parameter TLV (type 1) carries the K-values that two routers must agree
+// on to become neighbours.
+import packets
+
+type EigrpTlv = {
+    kind: i64,
+    value: bytes,
+}
+
+type EigrpPacket = {
+    version: i64,
+    opcode: i64,
+    checksum: i64,
+    flags: i64,
+    seq: i64,
+    ack: i64,
+    asn: i64,
+    tlvs: [EigrpTlv],
+}
+
+type EigrpError =
+    | TooShort(found: i64)
+    | BadTlv(at: i64)
+
+fn u16(b: bytes, at: i64) -> i64 {
+    b.at(at) * 256 + b.at(at + 1)
+}
+
+fn u32(b: bytes, at: i64) -> i64 {
+    u16(b, at) * 65536 + u16(b, at + 2)
+}
+
+fn be16(v: i64) -> bytes {
+    bytes_of([v.ushr(8).bit_and(255), v.bit_and(255)])
+}
+
+fn be32(v: i64) -> bytes {
+    be16(v.ushr(16).bit_and(65535)).concat(be16(v.bit_and(65535)))
+}
+
+pub fn decode(data: bytes) -> EigrpPacket ! EigrpError {
+    if data.len() < 20 {
+        fail(TooShort(data.len()))
+    }
+    var tlvs: [EigrpTlv] = []
+    var at = 20
+    while at < data.len() {
+        if at + 4 > data.len() {
+            fail(BadTlv(at))
+        }
+        let n = u16(data, at + 2)
+        if n < 4 or at + n > data.len() {
+            fail(BadTlv(at))
+        }
+        tlvs.push(EigrpTlv{ kind: u16(data, at), value: data.slice(at + 4, at + n) })
+        at = at + n
+    }
+    EigrpPacket{ version: data.at(0), opcode: data.at(1), checksum: u16(data, 2), flags: u32(data, 4),
+        seq: u32(data, 8), ack: u32(data, 12), asn: u32(data, 16), tlvs: tlvs }
+}
+
+pub fn encode(p: EigrpPacket) -> bytes {
+    var out = bytes_of([p.version.bit_and(255), p.opcode.bit_and(255), 0, 0]).concat(be32(p.flags))
+        .concat(be32(p.seq)).concat(be32(p.ack)).concat(be32(p.asn))
+    for t in p.tlvs {
+        out = out.concat(be16(t.kind)).concat(be16(t.value.len() + 4)).concat(t.value)
+    }
+    let sum = packets.checksum(out)
+    out.set(2, sum.ushr(8))
+    out.set(3, sum.bit_and(255))
+    out
+}
+
+/// The K-values and hold time of a parameter TLV.
+pub fn parameters(t: EigrpTlv) -> ([i64], i64) {
+    var k: [i64] = []
+    for i in 0..5 {
+        k.push(t.value.at(i))
+    }
+    (k, u16(t.value, 6))
+}

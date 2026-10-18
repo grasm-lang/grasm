@@ -1,0 +1,54 @@
+// SocketCAN frames: how Linux, and a pcap with link type 227
+// (DLT_CAN_SOCKETCAN), carry a CAN bus frame -- the bus inside every car,
+// tractor, PLC cabinet and medical device.
+//
+// Eight bytes of header -- a 32-bit CAN ID whose top three bits say
+// extended (29-bit) frame, remote request and error frame; the data length;
+// the CAN FD flags; two reserved bytes (the second the length code for
+// frames longer than 8 in classic CAN) -- then the data. The ID is written
+// big-endian here, as pcap's link type defines it; Linux's own sockets use
+// host order. Bytes after the declared length are padding and are kept.
+
+type CanFrame = {
+    extended: bool,
+    remote: bool,
+    error: bool,
+    id: i64,
+    length: i64,
+    flags: i64,
+    res0: i64,
+    res1: i64,
+    data: bytes,
+    padding: bytes,
+}
+
+type CanError =
+    | TooShort(found: i64)
+    | BadLength(declared: i64)
+
+pub fn decode(b: bytes) -> CanFrame ! CanError {
+    if b.len() < 8 {
+        fail(TooShort(b.len()))
+    }
+    let raw = b.at(0).shl(24).bit_or(b.at(1).shl(16)).bit_or(b.at(2).shl(8)).bit_or(b.at(3))
+    let n = b.at(4)
+    if 8 + n > b.len() {
+        fail(BadLength(n))
+    }
+    let ext = raw.bit_and(2147483648) != 0
+    CanFrame{ extended: ext, remote: raw.bit_and(1073741824) != 0, error: raw.bit_and(536870912) != 0,
+        id: raw.bit_and(536870911), length: n, flags: b.at(5),
+        res0: b.at(6), res1: b.at(7), data: b.slice(8, 8 + n), padding: b.slice(8 + n, b.len()) }
+}
+
+pub fn encode(f: CanFrame) -> bytes {
+    let id = f.id.bit_and(536870911).bit_or(if f.extended { 2147483648 } else { 0 })
+        .bit_or(if f.remote { 1073741824 } else { 0 }).bit_or(if f.error { 536870912 } else { 0 })
+    bytes_of([id.ushr(24).bit_and(255), id.ushr(16).bit_and(255), id.ushr(8).bit_and(255), id.bit_and(255),
+        f.data.len(), f.flags.bit_and(255), f.res0.bit_and(255), f.res1.bit_and(255)]).concat(f.data).concat(f.padding)
+}
+
+/// Whether the ID fits its frame format: eleven bits for a standard frame.
+pub fn id_valid(f: CanFrame) -> bool {
+    if f.extended { f.id < 536870912 } else { f.id < 2048 }
+}

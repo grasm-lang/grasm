@@ -1,0 +1,147 @@
+// Radiotap (radiotap.org): the header a Wi-Fi capture puts before every
+// 802.11 frame -- signal strength, channel, data rate, timestamps -- and
+// what Wireshark, Kismet and every monitor-mode tool read.
+//
+// A version, a pad byte, the header's length and a bitmap of the fields
+// present (more bitmaps follow while bit 31 is set), then the fields in bit
+// order, each aligned to its own natural size **counted from the start of
+// the header**. That alignment rule is the whole difficulty: a field's
+// offset depends on every field before it, so a reader that skips one
+// unknown field cannot find the rest. This knows the sizes and alignments
+// of bits 0 to 27; at a vendor or radiotap namespace switch, or a field it
+// does not know, it stops reading fields, and the header's own length still
+// says where the frame starts. All values are little-endian.
+
+type RadiotapField = {
+    bit: i64,
+    value: bytes,
+}
+
+type RadiotapHeader = {
+    version: i64,
+    pad: i64,
+    length: i64,
+    presents: [i64],
+    fields: [RadiotapField],
+    complete: bool,
+    raw: bytes,
+    frame: bytes,
+}
+
+type RadiotapError =
+    | TooShort(found: i64)
+    | BadLength(declared: i64)
+
+/// (alignment, size) of each field bit 0 to 27, as radiotap.org defines
+/// them.
+fn layout() -> [(i64, i64)] {
+    [(8, 8), (1, 1), (1, 1), (2, 4), (1, 2), (1, 1), (1, 1), (2, 2), (2, 2), (2, 2), (1, 1), (1, 1), (1, 1),
+        (1, 1), (2, 2), (2, 2), (1, 1), (1, 1), (4, 8), (1, 3), (4, 8), (2, 12), (8, 12), (2, 12), (2, 12),
+        (2, 6), (1, 1), (2, 4)]
+}
+
+fn le32(b: bytes, at: i64) -> i64 {
+    b.at(at).bit_or(b.at(at + 1).shl(8)).bit_or(b.at(at + 2).shl(16)).bit_or(b.at(at + 3).shl(24))
+}
+
+pub fn decode(data: bytes) -> RadiotapHeader ! RadiotapError {
+    if data.len() < 8 {
+        fail(TooShort(data.len()))
+    }
+    let n = data.at(2).bit_or(data.at(3).shl(8))
+    if n < 8 or n > data.len() {
+        fail(BadLength(n))
+    }
+    var presents: [i64] = []
+    var at = 4
+    while true {
+        if at + 4 > n {
+            fail(BadLength(n))
+        }
+        let p = le32(data, at)
+        presents.push(p)
+        at = at + 4
+        if p.bit_and(2147483648) == 0 {
+            break
+        }
+    }
+    // Fields beyond the first word, or a namespace switch, cannot be
+    // located without knowing every vendor's layout.
+    let first = presents[0]
+    var complete = presents.len() == 1 and first.bit_and(1610612736) == 0
+    let table = layout()
+    var fields: [RadiotapField] = []
+    for bit in 0..29 {
+        if first.ushr(bit).bit_and(1) == 0 {
+            continue
+        }
+        if bit >= table.len() {
+            complete = false
+            break
+        }
+        let align = table[bit].0
+        let size = table[bit].1
+        at = (at + align - 1) / align * align
+        if at + size > n {
+            fail(BadLength(n))
+        }
+        fields.push(RadiotapField{ bit: bit, value: data.slice(at, at + size) })
+        at = at + size
+    }
+    RadiotapHeader{ version: data.at(0), pad: data.at(1), length: n, presents: presents, fields: fields,
+        complete: complete, raw: data.slice(0, n), frame: data.slice(n, data.len()) }
+}
+
+/// A header from its present words and fields, each aligned and padded with
+/// zeros; the length is computed. Built only from known fields: a header
+/// that was not `complete` is written back as it arrived.
+pub fn encode(h: RadiotapHeader) -> bytes {
+    if not h.complete {
+        return h.raw.concat(h.frame)
+    }
+    let table = layout()
+    var body: [i64] = []
+    var at = 4 + 4 * h.presents.len()
+    for f in h.fields {
+        let align = table[f.bit].0
+        while at % align != 0 {
+            body.push(0)
+            at = at + 1
+        }
+        for i in 0..f.value.len() {
+            body.push(f.value.at(i))
+        }
+        at = at + f.value.len()
+    }
+    var head = bytes_of([h.version.bit_and(255), h.pad.bit_and(255), at.bit_and(255), at.ushr(8).bit_and(255)])
+    for p in h.presents {
+        head = head.concat(bytes_of([p.bit_and(255), p.ushr(8).bit_and(255), p.ushr(16).bit_and(255),
+            p.ushr(24).bit_and(255)]))
+    }
+    head.concat(bytes_of(body)).concat(h.frame)
+}
+
+pub fn field(h: RadiotapHeader, bit: i64) -> Option[bytes] {
+    for f in h.fields {
+        if f.bit == bit {
+            return Some(f.value)
+        }
+    }
+    None
+}
+
+/// The antenna signal in dBm (field 5), signed.
+pub fn signal_dbm(h: RadiotapHeader) -> Option[i64] {
+    match field(h, 5) {
+        Some(v) -> Some(if v.at(0) >= 128 { v.at(0) - 256 } else { v.at(0) })
+        None -> None
+    }
+}
+
+/// The channel's centre frequency in MHz (field 3).
+pub fn frequency(h: RadiotapHeader) -> Option[i64] {
+    match field(h, 3) {
+        Some(v) -> Some(v.at(0).bit_or(v.at(1).shl(8)))
+        None -> None
+    }
+}

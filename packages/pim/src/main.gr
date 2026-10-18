@@ -1,0 +1,79 @@
+// PIM version 2 (RFC 7761): how routers build multicast distribution
+// trees -- Hello to find neighbours, Join/Prune to graft and cut branches,
+// Register to tunnel a source's first packets to the rendezvous point.
+//
+// Four bytes -- version 2 and type, a reserved byte, a checksum -- then
+// the message. The checksum covers the whole PIM message, except for a
+// Register, where it covers only the header (RFC 7761 section 4.9.3), so
+// the encapsulated packet need not be summed by every router. Hello
+// messages carry options, each a type, a length and a value.
+import packets
+
+type PimMessage = {
+    version: i64,
+    kind: i64,
+    reserved: i64,
+    checksum: i64,
+    body: bytes,
+}
+
+type PimError =
+    | TooShort(found: i64)
+    | BadOption(at: i64)
+
+pub fn decode(data: bytes) -> PimMessage ! PimError {
+    if data.len() < 4 {
+        fail(TooShort(data.len()))
+    }
+    PimMessage{ version: data.at(0).ushr(4), kind: data.at(0).bit_and(15), reserved: data.at(1),
+        checksum: data.at(2) * 256 + data.at(3), body: data.slice(4, data.len()) }
+}
+
+pub fn encode(m: PimMessage) -> bytes {
+    var out = bytes_of([m.version.bit_and(15).shl(4).bit_or(m.kind.bit_and(15)), m.reserved.bit_and(255), 0, 0])
+        .concat(m.body)
+    let covered = if m.kind == 1 { out.slice(0, if out.len() < 8 { out.len() } else { 8 }) } else { out }
+    let sum = packets.checksum(covered)
+    out.set(2, sum.ushr(8))
+    out.set(3, sum.bit_and(255))
+    out
+}
+
+/// A Hello's options: (type, value).
+pub fn hello_options(m: PimMessage) -> [(i64, bytes)] ! PimError {
+    var out: [(i64, bytes)] = []
+    let b = m.body
+    var at = 0
+    while at < b.len() {
+        if at + 4 > b.len() {
+            fail(BadOption(at))
+        }
+        let n = b.at(at + 2) * 256 + b.at(at + 3)
+        if at + 4 + n > b.len() {
+            fail(BadOption(at))
+        }
+        out.push((b.at(at) * 256 + b.at(at + 1), b.slice(at + 4, at + 4 + n)))
+        at = at + 4 + n
+    }
+    out
+}
+
+pub fn encode_options(opts: [(i64, bytes)]) -> bytes {
+    var out = bytes_of([])
+    for o in opts {
+        let n = o.1.len()
+        out = out.concat(bytes_of([o.0.ushr(8).bit_and(255), o.0.bit_and(255), n.ushr(8).bit_and(255), n.bit_and(255)]))
+            .concat(o.1)
+    }
+    out
+}
+
+/// Hello option 1, the hold time in seconds; -1 when absent.
+pub fn hold_time(opts: [(i64, bytes)]) -> i64 {
+    for o in opts {
+        if o.0 == 1 and o.1.len() == 2 {
+            return o.1.at(0) * 256 + o.1.at(1)
+        }
+    }
+    -1
+}

@@ -1,0 +1,214 @@
+// BGP-4 (RFC 4271): the protocol that routes the Internet between
+// networks, and the one route collectors, looking glasses and MRT archives
+// record.
+//
+// Every message is a 16-byte marker of ones, a length and a type: OPEN
+// (version, AS, hold time, BGP identifier, optional parameters carrying
+// capabilities), UPDATE (withdrawn prefixes, path attributes, announced
+// prefixes), NOTIFICATION (error code, subcode, data), KEEPALIVE (nothing)
+// and ROUTE-REFRESH. Prefixes are a bit length and just enough bytes to
+// hold it. A path attribute is flags, a type code and a length of one or,
+// with the extended-length flag, two bytes.
+//
+// AS_PATH's numbers are two or four bytes depending on whether both peers
+// negotiated four-byte ASNs, which nothing in the attribute says; the
+// reader takes the width as an argument.
+
+type BgpMessage = {
+    marker: bytes,
+    kind: i64,
+    body: bytes,
+}
+
+type BgpOpen = {
+    version: i64,
+    my_as: i64,
+    hold_time: i64,
+    bgp_id: bytes,
+    params: [(i64, bytes)],
+}
+
+type BgpPrefix = {
+    length: i64,
+    prefix: bytes,
+}
+
+type BgpAttribute = {
+    flags: i64,
+    code: i64,
+    value: bytes,
+}
+
+type BgpUpdate = {
+    withdrawn: [BgpPrefix],
+    attributes: [BgpAttribute],
+    nlri: [BgpPrefix],
+}
+
+type BgpError =
+    | TooShort(found: i64)
+    | BadLength(declared: i64)
+    | BadPrefix(at: i64)
+    | BadAttribute(at: i64)
+
+fn u16(b: bytes, at: i64) -> i64 {
+    b.at(at) * 256 + b.at(at + 1)
+}
+
+fn be16(v: i64) -> bytes {
+    bytes_of([v.ushr(8).bit_and(255), v.bit_and(255)])
+}
+
+pub fn keepalive() -> i64 { 4 }
+
+/// One message from the front of `data`, and where the next begins.
+pub fn decode(data: bytes) -> (BgpMessage, i64) ! BgpError {
+    if data.len() < 19 {
+        fail(TooShort(data.len()))
+    }
+    let n = u16(data, 16)
+    if n < 19 or n > 4096 or n > data.len() {
+        fail(BadLength(n))
+    }
+    (BgpMessage{ marker: data.slice(0, 16), kind: data.at(18), body: data.slice(19, n) }, n)
+}
+
+pub fn encode(m: BgpMessage) -> bytes {
+    let marker = if m.marker.len() == 16 { m.marker } else { bytes_filled(16, 255) }
+    marker.concat(be16(19 + m.body.len())).concat(bytes_of([m.kind.bit_and(255)])).concat(m.body)
+}
+
+pub fn open(m: BgpMessage) -> BgpOpen ! BgpError {
+    let b = m.body
+    if b.len() < 10 {
+        fail(TooShort(b.len()))
+    }
+    let plen = b.at(9)
+    if 10 + plen > b.len() {
+        fail(BadLength(plen))
+    }
+    var params: [(i64, bytes)] = []
+    var at = 10
+    while at < 10 + plen {
+        if at + 2 > 10 + plen or at + 2 + b.at(at + 1) > 10 + plen {
+            fail(BadAttribute(at))
+        }
+        params.push((b.at(at), b.slice(at + 2, at + 2 + b.at(at + 1))))
+        at = at + 2 + b.at(at + 1)
+    }
+    BgpOpen{ version: b.at(0), my_as: u16(b, 1), hold_time: u16(b, 3), bgp_id: b.slice(5, 9), params: params }
+}
+
+pub fn encode_open(o: BgpOpen) -> BgpMessage {
+    var params = bytes_of([])
+    for p in o.params {
+        params = params.concat(bytes_of([p.0.bit_and(255), p.1.len()])).concat(p.1)
+    }
+    BgpMessage{ marker: bytes_filled(16, 255), kind: 1,
+        body: bytes_of([o.version.bit_and(255)]).concat(be16(o.my_as)).concat(be16(o.hold_time)).concat(o.bgp_id)
+            .concat(bytes_of([params.len()])).concat(params) }
+}
+
+fn prefixes(b: bytes, from: i64, end: i64) -> [BgpPrefix] ! BgpError {
+    var out: [BgpPrefix] = []
+    var at = from
+    while at < end {
+        let bits = b.at(at)
+        let n = (bits + 7) / 8
+        if bits > 128 or at + 1 + n > end {
+            fail(BadPrefix(at))
+        }
+        out.push(BgpPrefix{ length: bits, prefix: b.slice(at + 1, at + 1 + n) })
+        at = at + 1 + n
+    }
+    out
+}
+
+fn prefix_bytes(list: [BgpPrefix]) -> bytes {
+    var out = bytes_of([])
+    for p in list {
+        out = out.concat(bytes_of([p.length.bit_and(255)])).concat(p.prefix)
+    }
+    out
+}
+
+pub fn update(m: BgpMessage) -> BgpUpdate ! BgpError {
+    let b = m.body
+    if b.len() < 4 {
+        fail(TooShort(b.len()))
+    }
+    let wlen = u16(b, 0)
+    if 2 + wlen + 2 > b.len() {
+        fail(BadLength(wlen))
+    }
+    let withdrawn = try prefixes(b, 2, 2 + wlen)
+    let alen = u16(b, 2 + wlen)
+    let astart = 4 + wlen
+    if astart + alen > b.len() {
+        fail(BadLength(alen))
+    }
+    var attrs: [BgpAttribute] = []
+    var at = astart
+    while at < astart + alen {
+        if at + 3 > astart + alen {
+            fail(BadAttribute(at))
+        }
+        let flags = b.at(at)
+        let extended = flags.bit_and(16) != 0
+        let head = if extended { 4 } else { 3 }
+        if at + head > astart + alen {
+            fail(BadAttribute(at))
+        }
+        let n = if extended { u16(b, at + 2) } else { b.at(at + 2) }
+        if at + head + n > astart + alen {
+            fail(BadAttribute(at))
+        }
+        attrs.push(BgpAttribute{ flags: flags, code: b.at(at + 1), value: b.slice(at + head, at + head + n) })
+        at = at + head + n
+    }
+    BgpUpdate{ withdrawn: withdrawn, attributes: attrs, nlri: try prefixes(b, astart + alen, b.len()) }
+}
+
+/// An UPDATE. An attribute's length is written in two bytes when its
+/// extended-length flag is set, and one otherwise.
+pub fn encode_update(u: BgpUpdate) -> BgpMessage {
+    let w = prefix_bytes(u.withdrawn)
+    var a = bytes_of([])
+    for x in u.attributes {
+        if x.flags.bit_and(16) != 0 {
+            a = a.concat(bytes_of([x.flags.bit_and(255), x.code.bit_and(255)])).concat(be16(x.value.len())).concat(x.value)
+        } else {
+            a = a.concat(bytes_of([x.flags.bit_and(255), x.code.bit_and(255), x.value.len()])).concat(x.value)
+        }
+    }
+    BgpMessage{ marker: bytes_filled(16, 255), kind: 2,
+        body: be16(w.len()).concat(w).concat(be16(a.len())).concat(a).concat(prefix_bytes(u.nlri)) }
+}
+
+/// AS_PATH segments: (segment type -- 1 set, 2 sequence -- and the ASNs),
+/// reading ASNs of `width` bytes, 2 or 4.
+pub fn as_path(value: bytes, width: i64) -> [(i64, [i64])] ! BgpError {
+    var out: [(i64, [i64])] = []
+    var at = 0
+    while at < value.len() {
+        if at + 2 > value.len() {
+            fail(BadAttribute(at))
+        }
+        let kind = value.at(at)
+        let count = value.at(at + 1)
+        if at + 2 + count * width > value.len() {
+            fail(BadAttribute(at))
+        }
+        var asns: [i64] = []
+        for k in 0..count {
+            var v = 0
+            for j in 0..width {
+                v = v.shl(8).bit_or(value.at(at + 2 + k * width + j))
+            }
+            asns.push(v)
+        }
+        out.push((kind, asns))
+        at = at + 2 + count * width
+    }
+    out
+}

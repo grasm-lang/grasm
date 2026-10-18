@@ -22,3 +22,15 @@ version = "^1.0.0"
 [dependencies.lldp]
 path = "../lldp"
 version = "^1.0.0"
+
+[dependencies.hci]
+path = "../hci"
+version = "^1.0.0"
+
+[dependencies.canframe]
+path = "../canframe"
+version = "^1.0.0"
+
+[dependencies.bgp]
+path = "../bgp"
+version = "^1.0.0"
