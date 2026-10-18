@@ -1,0 +1,504 @@
+// Gemfile.lock: what Bundler resolved for a Ruby project -- every gem,
+// its exact version and platform, where it came from (a gem server, a git
+// repository at a revision, a local path), and what it depends on.
+//
+// Read as Bundler's LockfileParser reads it, which is what this is checked
+// against: sections by their header line, entries by indentation (four
+// spaces a gem, six its dependencies, two a top-level dependency), a name
+// followed by `(version-platform)`, `!` for a dependency pinned to a
+// source. Versions are RubyGems versions -- " 1.0 " is 1.0 and "1.0-beta"
+// is 1.0.pre.beta -- platforms are normalised as Gem::Platform does
+// (i686-linux is x86-linux, x86_64-darwin19 is x86_64-darwin-19), and
+// requirements are sorted by version, then operator, as Gem::Requirement
+// writes them. Gems come out sorted by name, version and platform.
+import gemversion
+
+type GemLockSpec = {
+    name: str,
+    version: str,
+    platform: str,
+    /// "gem", "git" or "path".
+    source_kind: str,
+    /// The git remote and revision, or the path; empty for a gem server.
+    source: str,
+    dependencies: [(str, str)],
+}
+
+type GemLockDependency = {
+    name: str,
+    requirement: str,
+    /// The source kind of the gem it is pinned to by `!`, or "".
+    pinned: str,
+}
+
+type GemLockfile = {
+    specs: [GemLockSpec],
+    dependencies: [GemLockDependency],
+    platforms: [str],
+    ruby_version: str,
+    bundled_with: str,
+    gem_remotes: [str],
+}
+
+type GemLockError =
+    | MergeConflict
+    | BadVersion(text: str)
+
+type GemLockState = {
+    section: str,
+    kind: str,
+    options: [(str, str)],
+    source_kind: str,
+    source: str,
+    specs: [GemLockSpec],
+    current: i64,
+    deps: [GemLockDependency],
+    platforms: [str],
+    ruby: str,
+    bundled: str,
+    remotes: [str],
+}
+
+/// RubyGems' version string: stripped, and "-" read as ".pre.".
+pub fn version_string(text: str) -> str ! GemLockError {
+    let v = text.trim()
+    if not gemversion.is_correct(v) or v.len() == 0 {
+        fail(BadVersion(text))
+    }
+    v.replace("-", ".pre.")
+}
+
+fn digits_tail(s: str) -> str {
+    var i = s.len()
+    while i > 0 and s.substr(i - 1, 1) >= "0" and s.substr(i - 1, 1) <= "9" {
+        i = i - 1
+    }
+    s.substr(i, s.len() - i)
+}
+
+/// The text after the first run of digits that follows `word` in `os`,
+/// as Ruby's /word(\d+)?/ captures it.
+fn digits_after(os: str, word: str) -> str {
+    let at = os.index_of(word) ?? -1
+    var out = ""
+    var i = at + word.len()
+    while i < os.len() and os.substr(i, 1) >= "0" and os.substr(i, 1) <= "9" {
+        out = out + os.substr(i, 1)
+        i = i + 1
+    }
+    out
+}
+
+fn os_of(os: str, cpu: str) -> (str, str, str) {
+    let simple = [("aix", true), ("cygwin", false), ("darwin", true), ("freebsd", true), ("hpux", true)]
+    for (word, versioned) in simple {
+        if os.contains(word) {
+            return (cpu, word, if versioned { digits_after(os, word) } else { "" })
+        }
+    }
+    if os == "macruby" {
+        return (cpu, "macruby", "")
+    }
+    if os == "java" or os == "jruby" {
+        return (cpu, "java", "")
+    }
+    if os.starts_with("java") {
+        return (cpu, "java", digits_or_dots(os.substr(4, os.len() - 4)))
+    }
+    if os.starts_with("dalvik") and digits_or_dots(os.substr(6, os.len() - 6)) == os.substr(6, os.len() - 6) {
+        return (cpu, "dalvik", os.substr(6, os.len() - 6))
+    }
+    if os == "dotnet" {
+        return (cpu, "dotnet", "")
+    }
+    if os.starts_with("dotnet") {
+        return (cpu, "dotnet", digits_or_dots(os.substr(6, os.len() - 6)))
+    }
+    if os.contains("linux") {
+        return (cpu, "linux", "")
+    }
+    if os.contains("mingw32") {
+        return (cpu, "mingw32", "")
+    }
+    let ms = os.index_of("mswin") ?? -1
+    if ms >= 0 and digits_after(os, "mswin") != "" {
+        let name = "mswin" + digits_after(os, "mswin")
+        let after = os.substr(ms + name.len(), os.len() - ms - name.len())
+        let version = if after.starts_with("_") { digits_after(after, "_") } else { "" }
+        let c = if cpu == "" and name.ends_with("32") { "x86" } else { cpu }
+        return (c, name, version)
+    }
+    if os.contains("netbsdelf") {
+        return (cpu, "netbsdelf", "")
+    }
+    for word in ["openbsd", "bitrig", "solaris"] {
+        if os.contains(word) {
+            return (cpu, word, dotted_after(os, word))
+        }
+    }
+    (cpu, "unknown", "")
+}
+
+fn digits_or_dots(s: str) -> str {
+    var out = ""
+    for c in s.chars() {
+        if (c >= "0" and c <= "9") or c == "." {
+            out = out + c
+        } else {
+            return out
+        }
+    }
+    out
+}
+
+/// Ruby's /word(\d+\.\d+)?/: digits, a dot and digits right after `word`.
+fn dotted_after(os: str, word: str) -> str {
+    let at = os.index_of(word) ?? -1
+    let rest = os.substr(at + word.len(), os.len() - at - word.len())
+    let a = digits_after(rest, "")
+    if a.len() > 0 and rest.substr(a.len(), 1) == "." {
+        let b = digits_after(rest.substr(a.len() + 1, rest.len() - a.len() - 1), "")
+        if b.len() > 0 {
+            return a + "." + b
+        }
+    }
+    ""
+}
+
+/// Gem::Platform.new(text).to_s.
+pub fn platform_string(text: str) -> str {
+    if text == "ruby" or text == "" {
+        return "ruby"
+    }
+    var parts = text.split("-")
+    if parts.len() > 2 and not has_digit(parts[parts.len() - 1]) {
+        let extra = parts[parts.len() - 1]
+        parts = parts.slice(0, parts.len() - 1)
+        parts[parts.len() - 1] = parts[parts.len() - 1] + "-" + extra
+    }
+    var cpu = parts[0]
+    // Ruby's /i\d86/, anywhere in the cpu.
+    for j in 0..cpu.len() {
+        if j + 4 <= cpu.len() and cpu.substr(j, 1) == "i" and has_digit(cpu.substr(j + 1, 1)) and cpu.substr(j + 2, 2) == "86" {
+            cpu = "x86"
+            break
+        }
+    }
+    let rest = parts.slice(1, parts.len())
+    if rest.len() == 2 and is_version_number(rest[1]) {
+        return [cpu, rest[0], rest[1]].join("-")
+    }
+    var os = if rest.len() > 0 { rest[0] } else { "" }
+    if rest.len() == 0 {
+        os = cpu
+        cpu = ""
+    }
+    let (c, o, v) = os_of(os, cpu)
+    var out: [str] = []
+    for p in [c, o, v] {
+        if p != "" {
+            out.push(p)
+        }
+    }
+    out.join("-")
+}
+
+fn has_digit(s: str) -> bool {
+    for c in s.chars() {
+        if c >= "0" and c <= "9" {
+            return true
+        }
+    }
+    false
+}
+
+fn is_version_number(s: str) -> bool {
+    let parts = s.split(".")
+    if parts.len() > 2 or parts[0].len() == 0 {
+        return false
+    }
+    for p in parts {
+        if p.len() == 0 or digits_or_dots(p) != p or p.contains(".") {
+            return false
+        }
+    }
+    true
+}
+
+/// (operator, version) of one requirement, RubyGems style.
+fn requirement_part(text: str) -> (str, str) ! GemLockError {
+    var t = text.trim()
+    var op = "="
+    for o in ["~>", ">=", "<=", "!=", "=", ">", "<"] {
+        if t.starts_with(o) {
+            op = o
+            t = t.substr(o.len(), t.len() - o.len()).trim()
+            break
+        }
+    }
+    (op, try version_string(t))
+}
+
+/// Gem::Requirement#to_s for a list of requirement strings.
+pub fn requirement_string(parts: [str]) -> str ! GemLockError {
+    var reqs: [(str, str)] = []
+    var seen: [str] = []
+    for p in parts {
+        if seen.contains(p) {
+            continue
+        }
+        seen.push(p)
+        let r = try requirement_part(p)
+        if not (r.0 == ">=" and r.1 == "0" and p.trim().replace(" ", "") == ">=0") {
+            reqs.push(r)
+        } else {
+            reqs.push((">=", "0"))
+        }
+    }
+    if reqs.len() == 0 {
+        return ">= 0"
+    }
+    var sorted: [(str, str)] = []
+    for r in reqs {
+        var at = sorted.len()
+        while at > 0 and before(r, sorted[at - 1]) {
+            at = at - 1
+        }
+        sorted = sorted.slice(0, at) + [r] + sorted.slice(at, sorted.len())
+    }
+    sorted.map(|r| r.0 + " " + r.1).join(", ")
+}
+
+fn compare_versions(a: str, b: str) -> i64 {
+    match (gemversion.parse(a), gemversion.parse(b)) {
+        (Ok(x), Ok(y)) -> gemversion.compare(x, y)
+        _ -> 0
+    }
+}
+
+fn before(a: (str, str), b: (str, str)) -> bool {
+    let c = compare_versions(a.1, b.1)
+    c < 0 or (c == 0 and a.0 < b.0)
+}
+
+/// Bundler's NAME_VERSION: (indent, name, version, platform, pinned).
+fn name_version(line: str) -> Option[(i64, str, str, str, bool)] {
+    var indent = 0
+    while indent < line.len() and line.substr(indent, 1) == " " {
+        indent = indent + 1
+    }
+    if indent != 2 and indent != 4 and indent != 6 {
+        return None
+    }
+    let s = line.substr(indent, line.len() - indent)
+    for k in 0..s.len() + 1 {
+        let name = s.substr(0, k)
+        var rest = s.substr(k, s.len() - k)
+        var pinned = false
+        if rest.ends_with("!") {
+            pinned = true
+            rest = rest.substr(0, rest.len() - 1)
+        }
+        if rest == "" {
+            return Some((indent, name, "", "", pinned))
+        }
+        if rest.starts_with(" (") and rest.ends_with(")") {
+            let body = rest.substr(2, rest.len() - 3)
+            let dash = body.index_of("-") ?? -1
+            if dash < 0 {
+                return Some((indent, name, body, "", pinned))
+            }
+            return Some((indent, name, body.substr(0, dash), body.substr(dash + 1, body.len() - dash - 1), pinned))
+        }
+    }
+    None
+}
+
+fn option_of(st: GemLockState, key: str) -> str {
+    var v = ""
+    for (k, val) in st.options {
+        if k == key and v == "" {
+            v = val
+        }
+    }
+    v
+}
+
+fn start_specs(inout st: GemLockState) {
+    if st.kind == "GEM" {
+        // Bundler gathers every GEM remote into one source, giving each a
+        // trailing slash and putting each new one first.
+        for (k, v) in st.options {
+            let uri = if v.ends_with("/") { v } else { v + "/" }
+            if k == "remote" and not st.remotes.contains(uri) {
+                st.remotes = [uri] + st.remotes
+            }
+        }
+        st.source_kind = "gem"
+        st.source = ""
+    } else if st.kind == "GIT" {
+        st.source_kind = "git"
+        st.source = option_of(st, "remote") + "@" + option_of(st, "revision")
+    } else {
+        st.source_kind = if st.kind == "PATH" { "path" } else { "plugin" }
+        st.source = option_of(st, "remote")
+    }
+}
+
+fn source_line(inout st: GemLockState, line: str) -> () ! GemLockError {
+    if line == "  specs:" {
+        start_specs(st)
+        return ()
+    }
+    let colon = line.index_of(": ") ?? -1
+    if line.starts_with("  ") and colon > 2 and is_word(line.substr(2, colon - 2)) {
+        st.options.push((line.substr(2, colon - 2), line.substr(colon + 2, line.len() - colon - 2)))
+        return ()
+    }
+    match name_version(line) {
+        None -> ()
+        Some((indent, name, version, platform, _)) -> {
+            if indent == 4 {
+                let v = try version_string(version)
+                let p = if platform == "" { "ruby" } else { platform_string(platform) }
+                // Bundler keys gems by an identifier that includes the list of
+                // dependencies, still empty when the key is made; so a repeat
+                // folds into an earlier gem only while that one has none yet.
+                var exists = -1
+                for k in 0..st.specs.len() {
+                    let e = st.specs[k]
+                    if e.name == name and e.version == v and e.platform == p and e.source_kind == st.source_kind and
+                    e.source == st.source and e.dependencies.len() == 0 {
+                        exists = k
+                    }
+                }
+                if exists < 0 {
+                    st.specs.push(GemLockSpec{ name: name, version: v, platform: p, source_kind: st.source_kind,
+                        source: st.source, dependencies: [] })
+                    st.current = st.specs.len() - 1
+                } else {
+                    st.current = -2
+                }
+            } else if indent == 6 and st.current != -1 {
+                let req = try requirement_string(if version == "" { [] } else { version.split(",").map(|x| x.trim()) })
+                if st.current >= 0 {
+                    st.specs[st.current].dependencies.push((name, req))
+                }
+            }
+        }
+    }
+}
+
+fn is_word(s: str) -> bool {
+    for c in s.chars() {
+        if not ((c >= "a" and c <= "z") or (c >= "A" and c <= "Z")) {
+            return false
+        }
+    }
+    s.len() > 0
+}
+
+fn dependency_line(inout st: GemLockState, line: str) -> () ! GemLockError {
+    match name_version(line) {
+        None -> ()
+        Some((indent, name, version, _, pinned)) -> {
+            if indent != 2 {
+                return ()
+            }
+            let req = try requirement_string(if version == "" { [] } else { version.split(",").map(|x| x.trim()) })
+            var source = ""
+            if pinned and name != "bundler" {
+                for s in st.specs {
+                    if s.name == name and source == "" {
+                        source = s.source_kind
+                    }
+                }
+            }
+            var kept: [GemLockDependency] = []
+            var replaced = false
+            for d in st.deps {
+                if d.name == name {
+                    kept.push(GemLockDependency{ name: name, requirement: req, pinned: source })
+                    replaced = true
+                } else {
+                    kept.push(d)
+                }
+            }
+            if not replaced {
+                kept.push(GemLockDependency{ name: name, requirement: req, pinned: source })
+            }
+            st.deps = kept
+        }
+    }
+}
+
+fn line_of(inout st: GemLockState, line: str) -> () ! GemLockError {
+    if ["GIT", "GEM", "PATH", "PLUGIN SOURCE"].contains(line) {
+        st.section = "source"
+        st.kind = line
+        st.options = []
+        st.current = -1
+    } else if line == "DEPENDENCIES" or line == "PLATFORMS" or line == "RUBY VERSION" or line == "BUNDLED WITH" {
+        st.section = line
+    } else if line.len() > 0 and line.substr(0, 1) != " " and line.substr(0, 1) != "\t" {
+        st.section = ""
+    } else if st.section == "source" {
+        try source_line(st, line)
+    } else if st.section == "DEPENDENCIES" {
+        try dependency_line(st, line)
+    } else if st.section == "PLATFORMS" {
+        if line.starts_with("  ") {
+            st.platforms.push(platform_string(line.substr(2, line.len() - 2)))
+        }
+    } else if st.section == "RUBY VERSION" {
+        st.ruby = line.trim()
+    } else if st.section == "BUNDLED WITH" {
+        let v = line.trim()
+        if gemversion.is_correct(v) and v.len() > 0 {
+            st.bundled = v.replace("-", ".pre.")
+        }
+    }
+    ()
+}
+
+fn spec_before(a: GemLockSpec, b: GemLockSpec) -> bool {
+    if a.name != b.name {
+        return a.name < b.name
+    }
+    let c = compare_versions(a.version, b.version)
+    if c != 0 {
+        return c < 0
+    }
+    platform_key(a.platform) < platform_key(b.platform)
+}
+
+/// Bundler sorts the ruby platform as "\0", ahead of every other.
+fn platform_key(p: str) -> str {
+    if p == "ruby" { "\u{0}" } else { p }
+}
+
+pub fn parse(text: str) -> GemLockfile ! GemLockError {
+    for marker in ["<<<<<<<", "=======", ">>>>>>>", "|||||||"] {
+        if text.contains(marker) {
+            fail(MergeConflict)
+        }
+    }
+    var st = GemLockState{ section: "", kind: "", options: [], source_kind: "gem", source: "", specs: [], current: -1,
+        deps: [], platforms: [], ruby: "", bundled: "", remotes: [] }
+    for raw in text.replace("\r\n", "\n").split("\n") {
+        if raw.len() == 0 {
+            continue
+        }
+        try line_of(st, raw)
+    }
+    var sorted: [GemLockSpec] = []
+    for s in st.specs {
+        var at = sorted.len()
+        while at > 0 and spec_before(s, sorted[at - 1]) {
+            at = at - 1
+        }
+        sorted = sorted.slice(0, at) + [s] + sorted.slice(at, sorted.len())
+    }
+    GemLockfile{ specs: sorted, dependencies: st.deps, platforms: st.platforms, ruby_version: st.ruby,
+        bundled_with: st.bundled, gem_remotes: st.remotes }
+}

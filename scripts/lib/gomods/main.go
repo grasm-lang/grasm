@@ -5,12 +5,14 @@
 package main
 
 import (
+	"archive/zip"
 	"bufio"
 	"bytes"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/url"
+	"io"
 	"os"
 	"sort"
 	"strings"
@@ -20,6 +22,7 @@ import (
 	"github.com/paulmach/orb"
 	"github.com/paulmach/orb/maptile"
 	proxyproto "github.com/pires/go-proxyproto"
+	"golang.org/x/mod/sumdb/dirhash"
 	"golang.org/x/net/bpf"
 	"golang.org/x/net/http/httpproxy"
 	"golang.org/x/tools/txtar"
@@ -101,6 +104,39 @@ func answer(r request) string {
 		return proxyAnswer(r.Hex)
 	case "tile":
 		return tileAnswer(r)
+	case "h1":
+		files := map[string][]byte{}
+		var names []string
+		for i := 0; i+1 < len(r.Hexes); i += 2 {
+			n, _ := hex.DecodeString(r.Hexes[i])
+			d, _ := hex.DecodeString(r.Hexes[i+1])
+			names = append(names, string(n))
+			files[string(n)] = d
+		}
+		h, err := dirhash.Hash1(names, func(n string) (io.ReadCloser, error) {
+			return io.NopCloser(bytes.NewReader(files[n])), nil
+		})
+		if err != nil {
+			return "ERR"
+		}
+		return h
+	case "h1zip":
+		data, _ := hex.DecodeString(r.Hex)
+		f, err := os.CreateTemp("", "h1zip*.zip")
+		if err != nil {
+			return "ERR"
+		}
+		defer os.Remove(f.Name())
+		f.Write(data)
+		f.Close()
+		if _, err := zip.OpenReader(f.Name()); err != nil {
+			return "ERR"
+		}
+		h, err := dirhash.HashZip(f.Name(), dirhash.Hash1)
+		if err != nil {
+			return "ERR"
+		}
+		return h
 	}
 	return "UNKNOWN"
 }

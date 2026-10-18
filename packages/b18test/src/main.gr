@@ -1,0 +1,156 @@
+// The Grasm side of scripts/b18_diff.py. Text and bytes travel as hex;
+// records in an answer are separated by U+001E, fields by U+001F.
+import sri
+import npmname
+import gosum
+import gemfilelock
+import pkgmetadata
+
+fn rs() -> str {
+    "\u{1e}"
+}
+
+fn us() -> str {
+    "\u{1f}"
+}
+
+fn from_hex(text: str) -> bytes {
+    var out: [i64] = []
+    var i = 0
+    while i + 1 < text.len() {
+        out.push(text.substr(i, 2).parse_int_base(16) ?? 0)
+        i = i + 2
+    }
+    bytes_of(out)
+}
+
+fn text_of(h: str) -> str {
+    from_hex(h).to_str()
+}
+
+fn integrity_summary(i: Option[SriIntegrity]) -> str {
+    match i {
+        None -> "null"
+        Some(v) -> {
+            var groups: [str] = []
+            for (algo, hashes) in v.groups {
+                groups.push(algo + "=" + hashes.map(|h| h.digest + "?" + h.options.join("?")).join(","))
+            }
+            let pick = sri.pick_algorithm(v, []) ?? "-"
+            sri.to_string(v, false, " ") + us() + sri.to_string(v, true, " ") + us() + sri.to_string(v, true, ",x\t") + us() +
+            pick + us() + groups.join(";")
+        }
+    }
+}
+
+fn hash_text(h: Option[SriHash]) -> str {
+    match h {
+        None -> "false"
+        Some(x) -> sri.hash_to_string(x, false)
+    }
+}
+
+fn answer_sri(what: str, a: str, b: str) -> str {
+    if what == "sri.parse" {
+        return integrity_summary(sri.parse(text_of(a), b == "strict"))
+    }
+    if what == "sri.match" {
+        return match (sri.parse(text_of(a), false), sri.parse(text_of(b), false)) {
+            (Some(x), Some(y)) -> hash_text(sri.matches(x, y))
+            _ -> "false"
+        }
+    }
+    if what == "sri.check" {
+        return hash_text(sri.check_data(from_hex(a), text_of(b)))
+    }
+    let parts = b.split(us())
+    let algos = if parts[0].len() == 0 { [] } else { parts[0].split(",") }
+    let options = if parts.len() < 2 or parts[1].len() == 0 { [] } else { parts[1].split(",") }
+    match sri.from_data(from_hex(a), algos, options) {
+        None -> "null"
+        Some(i) -> sri.to_string(i, false, " ")
+    }
+}
+
+fn answer_gem(text: str) -> str {
+    match gemfilelock.parse(text) {
+        Err(_) -> "ERR"
+        Ok(l) -> {
+            var out: [str] = []
+            for s in l.specs {
+                out.push(["S", s.name, s.version, s.platform, s.source_kind, s.source,
+                    s.dependencies.map(|d| d.0 + "=" + d.1).join(";")].join(us()))
+            }
+            for d in l.dependencies {
+                out.push(["D", d.name, d.requirement, d.pinned].join(us()))
+            }
+            for p in l.platforms {
+                out.push("P" + us() + p)
+            }
+            out.push("R" + us() + l.ruby_version)
+            out.push("B" + us() + l.bundled_with)
+            out.push("G" + us() + l.gem_remotes.join(","))
+            out.join(rs())
+        }
+    }
+}
+
+fn answer_meta(text: str) -> str {
+    var out: [str] = []
+    for (k, v) in pkgmetadata.to_json(pkgmetadata.parse(text)) {
+        out.push(k + us() + match v {
+            MetaOne(x) -> "1" + us() + x
+            MetaMany(xs) -> "*" + us() + xs.join(us() + us())
+        })
+    }
+    out.join(rs())
+}
+
+fn answer(what: str, a: str, b: str) -> str {
+    if what.starts_with("sri.") {
+        return answer_sri(what, a, b)
+    }
+    if what == "npm.name" {
+        let r = npmname.validate(text_of(a))
+        return "{r.valid_for_new}" + us() + "{r.valid_for_old}" + us() + r.warnings.join(";") + us() + r.errors.join(";")
+    }
+    if what == "gosum.h1" {
+        var files: [(str, bytes)] = []
+        if a.len() > 0 {
+            for f in a.split(",") {
+                let nd = f.split(":")
+                files.push((text_of(nd[0]), from_hex(nd[1])))
+            }
+        }
+        return match gosum.hash1(files) {
+            Ok(h) -> h
+            Err(_) -> "ERR"
+        }
+    }
+    if what == "gosum.zip" {
+        return match gosum.hash_zip(from_hex(a)) {
+            Ok(h) -> h
+            Err(_) -> "ERR"
+        }
+    }
+    if what == "gosum.parse" {
+        return match gosum.parse(text_of(a)) {
+            Err(_) -> "ERR"
+            Ok(es) -> es.map(|e| e.module + us() + e.version + us() + "{e.go_mod}" + us() + e.hash).join(rs())
+        }
+    }
+    if what == "gem.lock" {
+        return answer_gem(text_of(a))
+    }
+    // A description spans lines; keep the answer on one.
+    answer_meta(text_of(a)).replace("\n", "\u{1d}")
+}
+
+fn main() / {io} {
+    let argv = args()
+    var i = 0
+    while i + 2 < argv.len() {
+        print(answer(argv[i], argv[i + 1], argv[i + 2]))
+        i = i + 3
+    }
+}

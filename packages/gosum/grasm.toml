@@ -1,0 +1,17 @@
+[package]
+name = "gosum"
+version = "1.0.0"
+
+capabilities = []
+
+[dependencies.bytes_codec]
+path = "../bytes"
+version = "^1.0.0"
+
+[dependencies.crypto_hash]
+path = "../crypto_hash"
+version = "^1.0.0"
+
+[dependencies.zip]
+path = "../zip"
+version = "^1.0.0"

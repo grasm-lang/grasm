@@ -1,0 +1,214 @@
+// Python core metadata: the METADATA file in every wheel's .dist-info and
+// the PKG-INFO of every source distribution -- name, version, summary,
+// Requires-Dist, Classifiers, Project-URLs -- in RFC 822 header form.
+//
+// Read as `importlib.metadata` reads it, and checked against it: email
+// headers (a line starting with a space or tab continues the one before,
+// keeping its line break), the body after the first blank line as the
+// Description, values that span lines de-indented as if the first line
+// had eight spaces too, and the JSON form of PEP 566 -- keys lower-cased
+// with `-` as `_`, the multiple-use fields (Classifier, Requires-Dist,
+// Project-URL, ...) as lists, Keywords split on white space, and for any
+// other field its first value.
+
+type PkgMetaValue =
+    | MetaOne(value: str)
+    | MetaMany(values: [str])
+
+type PkgMetadata = {
+    headers: [(str, str)],
+    body: str,
+}
+
+fn multiple_use() -> [str] {
+    ["classifier", "obsoletes-dist", "platform", "project-url", "provides-dist", "provides-extra", "requires-dist",
+        "requires-external", "supported-platform", "dynamic"]
+}
+
+/// Whether a line opens a header: a run of printable characters other
+/// than ':' and space, then ':' (email.feedparser's headerRE).
+fn header_name(line: str) -> Option[str] {
+    let colon = line.index_of(":") ?? -1
+    if colon < 0 {
+        return None
+    }
+    let name = line.substr(0, colon)
+    for c in name.chars() {
+        let v = c.code_at(0)
+        if v < 33 or v > 126 {
+            return None
+        }
+    }
+    Some(name)
+}
+
+/// textwrap.dedent of ' ' * 8 + value.
+fn redent(value: str) -> str {
+    if value.len() == 0 or not value.contains("\n") {
+        return value
+    }
+    let lines = ("        " + value).split("\n")
+    var cleaned: [str] = []
+    for l in lines {
+        cleaned.push(if l.trim_end().len() == 0 and only_blanks(l) { "" } else { l })
+    }
+    let margin = common_prefix(cleaned)
+    if margin == 0 {
+        return cleaned.join("\n")
+    }
+    var out: [str] = []
+    for l in cleaned {
+        out.push(if l.len() >= margin { l.substr(margin, l.len() - margin) } else { l })
+    }
+    out.join("\n")
+}
+
+fn only_blanks(l: str) -> bool {
+    for c in l.chars() {
+        if c != " " and c != "\t" {
+            return false
+        }
+    }
+    true
+}
+
+/// The length of the leading white space all non-empty lines share,
+/// compared character by character, so a tab and a space differ.
+fn common_prefix(lines: [str]) -> i64 {
+    var first = ""
+    var best = -1
+    for l in lines {
+        if l.len() == 0 {
+            continue
+        }
+        var n = 0
+        while n < l.len() and (l.substr(n, 1) == " " or l.substr(n, 1) == "\t") {
+            n = n + 1
+        }
+        let lead = l.substr(0, n)
+        if best < 0 {
+            first = lead
+            best = lead.len()
+        } else {
+            var k = 0
+            while k < best and k < lead.len() and first.substr(k, 1) == lead.substr(k, 1) {
+                k = k + 1
+            }
+            best = k
+        }
+    }
+    best.max(0)
+}
+
+/// Python's rstrip('\r\n').
+fn strip_line_ends(v: str) -> str {
+    var n = v.len()
+    while n > 0 and (v.substr(n - 1, 1) == "\n" or v.substr(n - 1, 1) == "\r") {
+        n = n - 1
+    }
+    v.substr(0, n)
+}
+
+pub fn parse(text: str) -> PkgMetadata {
+    let lines = text.split("\n")
+    var headers: [(str, str)] = []
+    var i = 0
+    while i < lines.len() {
+        let line = lines[i]
+        if line.len() == 0 or line == "\r" {
+            i = i + 1
+            break
+        }
+        if line.starts_with(" ") or line.starts_with("\t") {
+            // A continuation before any header is dropped, as email's
+            // FirstHeaderLineIsContinuationDefect.
+            if headers.len() > 0 {
+                let last = headers.len() - 1
+                headers[last] = (headers[last].0, headers[last].1 + "\n" + line)
+            }
+            i = i + 1
+            continue
+        }
+        match header_name(line) {
+            Some(name) -> {
+                var v = line.substr(name.len() + 1, line.len() - name.len() - 1)
+                while v.starts_with(" ") or v.starts_with("\t") {
+                    v = v.substr(1, v.len() - 1)
+                }
+                headers.push((name, v))
+                i = i + 1
+            }
+            None -> break
+        }
+    }
+    let body = lines.slice(i, lines.len()).join("\n")
+    var repaired: [(str, str)] = []
+    for (k, v) in headers {
+        repaired.push((k, redent(strip_line_ends(v))))
+    }
+    if body.len() > 0 {
+        repaired.push(("Description", body))
+    }
+    PkgMetadata{ headers: repaired, body: body }
+}
+
+pub fn get(m: PkgMetadata, name: str) -> Option[str] {
+    for (k, v) in m.headers {
+        if k.to_lower() == name.to_lower() {
+            return Some(v)
+        }
+    }
+    None
+}
+
+pub fn get_all(m: PkgMetadata, name: str) -> [str] {
+    var out: [str] = []
+    for (k, v) in m.headers {
+        if k.to_lower() == name.to_lower() {
+            out.push(v)
+        }
+    }
+    out
+}
+
+fn split_whitespace_regex(v: str) -> [str] {
+    var out: [str] = []
+    var cur = ""
+    var in_space = false
+    for c in v.chars() {
+        let space = c == " " or c == "\t" or c == "\n" or c == "\r" or c == "\u{b}" or c == "\u{c}"
+        if space {
+            if not in_space {
+                out.push(cur)
+                cur = ""
+            }
+            in_space = true
+        } else {
+            cur = cur + c
+            in_space = false
+        }
+    }
+    out.push(cur)
+    out
+}
+
+/// importlib.metadata's `json`: each field once, in first-seen order.
+pub fn to_json(m: PkgMetadata) -> [(str, PkgMetaValue)] {
+    var out: [(str, PkgMetaValue)] = []
+    var seen: [str] = []
+    for (k, _) in m.headers {
+        let key = k.to_lower().replace("-", "_")
+        if seen.contains(key) {
+            continue
+        }
+        seen.push(key)
+        if multiple_use().contains(k.to_lower()) {
+            out.push((key, MetaMany(get_all(m, k))))
+        } else if k.to_lower() == "keywords" {
+            out.push((key, MetaMany(split_whitespace_regex(get(m, k) ?? ""))))
+        } else {
+            out.push((key, MetaOne(get(m, k) ?? "")))
+        }
+    }
+    out
+}

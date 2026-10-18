@@ -1,0 +1,113 @@
+// go.sum: the hashes Go records for every module it uses, and the "h1:"
+// hash itself (golang.org/x/mod/sumdb/dirhash).
+//
+// h1 is SHA-256 over a listing: for each file, sorted by name, the hex
+// SHA-256 of its content, two spaces, its name, a newline -- then base64.
+// A module's zip is hashed through the names inside it; its go.mod alone
+// as the one file "go.mod". `go mod verify` and the checksum database
+// compare exactly these. A go.sum line is `module version hash`, the
+// version ending in `/go.mod` when the hash is of the go.mod file.
+import bytes_codec
+import crypto_hash
+import zip
+
+type GoSumEntry = {
+    module: str,
+    version: str,
+    go_mod: bool,
+    hash: str,
+}
+
+type GoSumError =
+    | NewlineInName(name: str)
+    | BadZip
+    | BadLine(line: i64)
+
+fn hex(b: bytes) -> str {
+    let digits = "0123456789abcdef"
+    var out = ""
+    for i in 0..b.len() {
+        out = out + digits.substr(b.at(i) / 16, 1) + digits.substr(b.at(i) % 16, 1)
+    }
+    out
+}
+
+/// dirhash's Hash1 over (name, content) pairs.
+pub fn hash1(files: [(str, bytes)]) -> str ! GoSumError {
+    var sorted = files
+    sorted.sort_by(|f| f.0)
+    var listing = ""
+    for (name, data) in sorted {
+        if name.contains("\n") {
+            fail(NewlineInName(name))
+        }
+        listing = listing + hex(crypto_hash.sha256_of(data)) + "  " + name + "\n"
+    }
+    "h1:" + bytes_codec.encode_base64(crypto_hash.sha256_of(listing.to_bytes()))
+}
+
+/// The h1 hash of a module zip, over every name in it.
+pub fn hash_zip(data: bytes) -> str ! GoSumError {
+    let entries = match zip.decode(data) {
+        Ok(e) -> e
+        Err(_) -> fail(BadZip)
+    }
+    var files: [(str, bytes)] = []
+    for e in entries {
+        // Go hashes each name with the content of the last entry by that name.
+        var content = e.data
+        for other in entries {
+            if other.name == e.name {
+                content = other.data
+            }
+        }
+        files.push((e.name, content))
+    }
+    try hash1(files)
+}
+
+/// The h1 hash of a go.mod file, as go.sum records it.
+pub fn hash_go_mod(content: bytes) -> str {
+    match hash1([("go.mod", content)]) {
+        Ok(h) -> h
+        Err(_) -> ""
+    }
+}
+
+/// The lines of a go.sum file; blank lines are skipped, and any other line
+/// must have exactly three fields.
+pub fn parse(text: str) -> [GoSumEntry] ! GoSumError {
+    var out: [GoSumEntry] = []
+    var n = 0
+    for line in text.split("\n") {
+        n = n + 1
+        var fields: [str] = []
+        for f in line.split(" ") {
+            for g in f.split("\t") {
+                let t = g.trim()
+                if t.len() > 0 {
+                    fields.push(t)
+                }
+            }
+        }
+        if fields.len() == 0 {
+            continue
+        }
+        if fields.len() != 3 {
+            fail(BadLine(n))
+        }
+        let go_mod = fields[1].ends_with("/go.mod")
+        let version = if go_mod { fields[1].substr(0, fields[1].len() - 7) } else { fields[1] }
+        out.push(GoSumEntry{ module: fields[0], version: version, go_mod: go_mod, hash: fields[2] })
+    }
+    out
+}
+
+/// go.sum's text for the entries, one per line, in the order given.
+pub fn format(entries: [GoSumEntry]) -> str {
+    var out = ""
+    for e in entries {
+        out = out + e.module + " " + e.version + if e.go_mod { "/go.mod" } else { "" } + " " + e.hash + "\n"
+    }
+    out
+}

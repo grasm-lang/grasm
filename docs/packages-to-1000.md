@@ -166,10 +166,18 @@ Ethernet, IPv4, IPv6, TCP and UDP were candidates here and are already
 `gitstatus` `gitnotes` `ignorewalk`
 `reftable` `packrev`
 
-**B18. Package ecosystems** (Go, npm's own `semver`, Bundler, pip) —
-`gomod` `gosum` `cargolock` `packagejson` `npmsemver` `npmlock` `yarnlock`
+**B18. Package ecosystems** (Go's x/mod, npm's own modules, Bundler, pip,
+importlib.metadata) —
+`gomod` `gosum` `cargolock` `packagejson` `npmlock` `yarnlock`
 `gemfilelock` `pyproject` `requirements` `pkgmetadata` `cyclonedx`
-`osvrecord` `ocimanifest`
+`osvrecord` `ocimanifest` `sri` `npmname` `hostedgit` `npmspec`
+
+`npmsemver` was a candidate here and came off by rule 7: `semverrange` is
+npm's range semantics already. npm's `semver` becomes an oracle for it
+instead. `sri`, `npmname`, `hostedgit` and `npmspec` were added on
+2026-10-18, once npm's own `ssri`, `validate-npm-package-name`,
+`hosted-git-info` and `npm-package-arg` were found in the npm that ships
+with Node.
 
 **B19. Archives** (`xar` `lsbom` `shar`, Python `zipfile`) —
 `xar` `pkgbom` `debfile` `zipcrypto` `shar`
@@ -239,6 +247,19 @@ projection library), `flexlayout` (no layout engine outside a browser),
 day its reference is installed.
 
 ## Landed
+
+- [x] **B18, first part** — `sri` `npmname` `gosum` `gemfilelock`
+  `pkgmetadata`, with the harness `b18test`; the new gate `b18diff` runs
+  1,830 cases against npm's own `ssri` and `validate-npm-package-name`
+  (scripts/lib/node), x/mod's dirhash (over file sets and Python-written
+  zips), Bundler's LockfileParser (scripts/lib/ruby) and
+  importlib.metadata. The quirks followed are the references' own:
+  ssri orders algorithms whose names are all digits first, as JavaScript
+  object keys; Bundler folds a repeated gem only while the earlier one has
+  no dependencies yet, because its key includes a list that grows after
+  hashing, and sorts the ruby platform as "\0"; RubyGems sorts a
+  requirement's parts by version. One break per package turned its family
+  red, npmname's after a first break that changed nothing was replaced.
 
 - [x] **B6, most of it** — `numtheory` `contfrac` `specialfn` `float16`
   `bfloat16` `complexfn` `ntt` `bitops`, with the harness `numtest`; the
@@ -391,13 +412,13 @@ day its reference is installed.
 | | |
 |---|---|
 | At the start | 669 |
-| Now | 779 |
-| Candidates above | 313 packages in 28 batches, plus `ecc`, `rfc6979` and `goprintf` |
+| Now | 785 |
+| Candidates above | 316 packages in 28 batches, plus `ecc`, `rfc6979` and `goprintf` |
 | Harnesses, one a batch | 28 |
-| If every candidate lands | 1013 |
+| If every candidate lands | 1016 |
 | Target | 1000 |
 
-The margin over 1000 is 13. It is there because some
+The margin over 1000 is 16. It is there because some
 candidate will turn out to exist already under a name the grep missed, or to
 disagree with its oracle in a way that says the oracle is the better
 package, and the plan should not need rewriting when that happens.

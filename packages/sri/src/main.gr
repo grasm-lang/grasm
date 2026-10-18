@@ -1,0 +1,391 @@
+// Subresource Integrity strings: `sha512-<base64 digest>`, possibly several
+// separated by white space, each with `?option`s -- the `integrity` of a
+// `<script>` tag (W3C SRI) and of every entry in a package-lock.json.
+//
+// This reads, writes, compares and checks them exactly as npm's own `ssri`
+// does, quirks included. The lenient reading accepts any lower-case
+// alphanumeric algorithm and any digest; the strict one only sha256,
+// sha384 and sha512 with 44 to 88 base64 characters. Algorithms keep the
+// order they first appear in -- except that names made only of digits come
+// first, ascending, because ssri keeps them as keys of a JavaScript
+// object. When an integrity names several algorithms, the strongest wins
+// (md5 < sha1 < sha224 < sha256 < sha384 < sha512 < sha3-256 < ...); data
+// can be hashed with md5, sha1, sha256, sha384 and sha512.
+import bytes_codec
+import md5
+import sha1
+import crypto_hash
+import sha512
+
+type SriHash = {
+    algorithm: str,
+    digest: str,
+    options: [str],
+}
+
+type SriIntegrity = {
+    /// Each algorithm with its hashes, in ssri's key order.
+    groups: [(str, [SriHash])],
+}
+
+fn priority() -> [str] {
+    ["md5", "sha1", "sha224", "sha256", "sha384", "sha512", "sha3-256", "sha3-384", "sha3-512"]
+}
+
+/// JavaScript's String.prototype.trim and \s.
+fn is_space(c: str) -> bool {
+    let v = c.code_at(0)
+    (v >= 9 and v <= 13) or v == 32 or v == 160 or v == 5760 or (v >= 8192 and v <= 8202) or v == 8232 or
+    v == 8233 or v == 8239 or v == 8287 or v == 12288 or v == 65279
+}
+
+fn trim(s: str) -> str {
+    let cs = s.chars()
+    var a = 0
+    var b = cs.len()
+    while a < b and is_space(cs[a]) {
+        a = a + 1
+    }
+    while b > a and is_space(cs[b - 1]) {
+        b = b - 1
+    }
+    cs.slice(a, b).join("")
+}
+
+fn is_alnum_lower(c: str) -> bool {
+    (c >= "a" and c <= "z") or (c >= "0" and c <= "9")
+}
+
+fn empty_hash() -> SriHash {
+    SriHash{ algorithm: "", digest: "", options: [] }
+}
+
+fn lenient(cs: [str], algo: str, start: i64) -> SriHash {
+    var limit = start
+    while limit < cs.len() and cs[limit] != "?" {
+        limit = limit + 1
+    }
+    var len = limit - start
+    while len >= 1 {
+        var ok = true
+        for k in start + len..cs.len() {
+            if is_space(cs[k]) {
+                ok = false
+            }
+        }
+        if ok {
+            let rest = cs.slice(start + len, cs.len())
+            let options = if rest.len() == 0 { [] } else { rest.slice(1, rest.len()).join("").split("?") }
+            return SriHash{ algorithm: algo, digest: cs.slice(start, start + len).join(""), options: options }
+        }
+        len = len - 1
+    }
+    empty_hash()
+}
+
+fn is_b64(c: str) -> bool {
+    (c >= "A" and c <= "Z") or (c >= "a" and c <= "z") or (c >= "0" and c <= "9") or c == "+" or c == "/" or c == "="
+}
+
+fn strict_hash(cs: [str], algo: str, start: i64) -> SriHash {
+    if not ["sha512", "sha384", "sha256"].contains(algo) {
+        return empty_hash()
+    }
+    var end = start
+    while end < cs.len() and is_b64(cs[end]) {
+        end = end + 1
+    }
+    let n = end - start
+    if n < 44 or n > 88 {
+        return empty_hash()
+    }
+    if end < cs.len() {
+        if cs[end] != "?" {
+            return empty_hash()
+        }
+        for k in end + 1..cs.len() {
+            let v = cs[k].code_at(0)
+            if v < 33 or v > 126 {
+                return empty_hash()
+            }
+        }
+    }
+    let options = if end < cs.len() { cs.slice(end + 1, cs.len()).join("").split("?") } else { [] }
+    SriHash{ algorithm: algo, digest: cs.slice(start, end).join(""), options: options }
+}
+
+/// One hash, as ssri's `Hash`: empty algorithm and digest when it does not
+/// match.
+pub fn parse_hash(text: str, strict: bool) -> SriHash {
+    let cs = trim(text).chars()
+    var i = 0
+    while i < cs.len() and is_alnum_lower(cs[i]) {
+        i = i + 1
+    }
+    if i == 0 or i >= cs.len() or cs[i] != "-" {
+        return empty_hash()
+    }
+    let algo = cs.slice(0, i).join("")
+    if strict { strict_hash(cs, algo, i + 1) } else { lenient(cs, algo, i + 1) }
+}
+
+fn is_index_key(k: str) -> bool {
+    if k.len() == 0 or k.len() > 10 {
+        return false
+    }
+    for c in k.chars() {
+        if c < "0" or c > "9" {
+            return false
+        }
+    }
+    if k.len() > 1 and k.substr(0, 1) == "0" {
+        return false
+    }
+    (k.parse_int() ?? 4294967295) < 4294967295
+}
+
+/// The groups in JavaScript's key order: array-index keys ascending, then
+/// the rest in insertion order.
+fn js_order(groups: [(str, [SriHash])]) -> [(str, [SriHash])] {
+    var numeric: [(str, [SriHash])] = []
+    var other: [(str, [SriHash])] = []
+    for g in groups {
+        if is_index_key(g.0) {
+            var at = numeric.len()
+            while at > 0 and (numeric[at - 1].0.parse_int() ?? 0) > (g.0.parse_int() ?? 0) {
+                at = at - 1
+            }
+            numeric = numeric.slice(0, at) + [g] + numeric.slice(at, numeric.len())
+        } else {
+            other.push(g)
+        }
+    }
+    numeric + other
+}
+
+fn split_space(s: str) -> [str] {
+    var out: [str] = []
+    var cur = ""
+    for c in s.chars() {
+        if is_space(c) {
+            out.push(cur)
+            cur = ""
+        } else {
+            cur = cur + c
+        }
+    }
+    out.push(cur)
+    out
+}
+
+/// An integrity string; `None` when no hash in it is valid.
+pub fn parse(text: str, strict: bool) -> Option[SriIntegrity] {
+    var groups: [(str, [SriHash])] = []
+    for word in split_space(trim(text)) {
+        let h = parse_hash(word, strict)
+        if h.algorithm == "" or h.digest == "" {
+            continue
+        }
+        var found = false
+        for k in 0..groups.len() {
+            if groups[k].0 == h.algorithm {
+                groups[k] = (h.algorithm, groups[k].1 + [h])
+                found = true
+            }
+        }
+        if not found {
+            groups.push((h.algorithm, [h]))
+        }
+    }
+    if groups.len() == 0 { None } else { Some(SriIntegrity{ groups: js_order(groups) }) }
+}
+
+fn option_string(options: [str]) -> str {
+    if options.len() == 0 { "" } else { "?" + options.join("?") }
+}
+
+fn base64_ok(d: str) -> bool {
+    let cs = d.chars()
+    var n = cs.len()
+    var pad = 0
+    while n > 0 and cs[n - 1] == "=" and pad < 2 {
+        n = n - 1
+        pad = pad + 1
+    }
+    if n == 0 {
+        return false
+    }
+    for k in 0..n {
+        let c = cs[k].to_lower()
+        if not (is_alnum_lower(c) or c == "+" or c == "/") {
+            return false
+        }
+    }
+    true
+}
+
+pub fn hash_to_string(h: SriHash, strict: bool) -> str {
+    if strict {
+        var ok = ["sha512", "sha384", "sha256"].contains(h.algorithm) and base64_ok(h.digest)
+        for o in h.options {
+            if o.len() == 0 {
+                ok = false
+            }
+            for c in o.chars() {
+                if c.code_at(0) < 33 or c.code_at(0) > 126 {
+                    ok = false
+                }
+            }
+        }
+        if not ok {
+            return ""
+        }
+    }
+    h.algorithm + "-" + h.digest + option_string(h.options)
+}
+
+/// The integrity as ssri writes it: hashes joined by `sep`; strictly, only
+/// sha512, sha384 and sha256, in that order, and any non-blank run in
+/// `sep` becomes one space.
+pub fn to_string(i: SriIntegrity, strict: bool, sep: str) -> str {
+    var parts: [str] = []
+    var s = sep
+    if strict {
+        var out = ""
+        var in_run = false
+        for c in sep.chars() {
+            if is_space(c) {
+                out = out + c
+                in_run = false
+            } else if not in_run {
+                out = out + " "
+                in_run = true
+            }
+        }
+        s = out
+        for algo in ["sha512", "sha384", "sha256"] {
+            for g in i.groups {
+                if g.0 == algo {
+                    for h in g.1 {
+                        let t = hash_to_string(h, true)
+                        if t != "" {
+                            parts.push(t)
+                        }
+                    }
+                }
+            }
+        }
+        return parts.join(s)
+    }
+    for g in i.groups {
+        for h in g.1 {
+            parts.push(hash_to_string(h, false))
+        }
+    }
+    parts.join(s)
+}
+
+fn rank(algo: str) -> i64 {
+    let p = priority()
+    for k in 0..p.len() {
+        if p[k] == algo.to_lower() {
+            return k
+        }
+    }
+    -1
+}
+
+/// The strongest algorithm present, among `among` when it is not empty.
+pub fn pick_algorithm(i: SriIntegrity, among: [str]) -> Option[str] {
+    var best: Option[str] = None
+    for g in i.groups {
+        if among.len() > 0 and not among.contains(g.0) {
+            continue
+        }
+        best = match best {
+            None -> Some(g.0)
+            Some(b) -> if rank(b) >= rank(g.0) { Some(b) } else { Some(g.0) }
+        }
+    }
+    best
+}
+
+fn hashes_of(i: SriIntegrity, algo: str) -> [SriHash] {
+    for g in i.groups {
+        if g.0 == algo {
+            return g.1
+        }
+    }
+    []
+}
+
+/// ssri's `match`: the first hash of `a`, under the strongest algorithm
+/// both share, whose digest also appears in `b`.
+pub fn matches(a: SriIntegrity, b: SriIntegrity) -> Option[SriHash] {
+    var keys: [str] = []
+    for g in a.groups {
+        keys.push(g.0)
+    }
+    match pick_algorithm(b, keys) {
+        None -> None
+        Some(algo) -> {
+            for h in hashes_of(a, algo) {
+                for o in hashes_of(b, algo) {
+                    if h.digest == o.digest {
+                        return Some(h)
+                    }
+                }
+            }
+            None
+        }
+    }
+}
+
+fn digest_of(algo: str, data: bytes) -> Option[bytes] {
+    if algo == "md5" {
+        return Some(md5.hash(data))
+    }
+    if algo == "sha1" {
+        return Some(sha1.hash(data))
+    }
+    if algo == "sha256" {
+        return Some(crypto_hash.sha256_of(data))
+    }
+    if algo == "sha384" {
+        return Some(sha512.sha384(data))
+    }
+    if algo == "sha512" { Some(sha512.sha512(data)) } else { None }
+}
+
+/// The integrity of `data` under each algorithm, each hash carrying
+/// `options`; algorithms it cannot compute are left out.
+pub fn from_data(data: bytes, algorithms: [str], options: [str]) -> Option[SriIntegrity] {
+    var words: [str] = []
+    for a in algorithms {
+        match digest_of(a, data) {
+            Some(d) -> words.push(a + "-" + bytes_codec.encode_base64(d) + option_string(options))
+            None -> {}
+        }
+    }
+    parse(words.join(" "), false)
+}
+
+/// Whether `data` has the integrity: the matching hash, as ssri's
+/// `checkData` returns it, or `None`.
+pub fn check_data(data: bytes, integrity: str) -> Option[SriHash] {
+    match parse(integrity, false) {
+        None -> None
+        Some(sri) -> {
+            match pick_algorithm(sri, []) {
+                None -> None
+                Some(algo) -> match digest_of(algo, data) {
+                    None -> None
+                    Some(d) -> match parse(algo + "-" + bytes_codec.encode_base64(d), false) {
+                        None -> None
+                        Some(mine) -> matches(mine, sri)
+                    }
+                }
+            }
+        }
+    }
+}

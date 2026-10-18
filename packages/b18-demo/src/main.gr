@@ -1,0 +1,43 @@
+// Package-ecosystem files on small inputs. scripts/b18_diff.sh holds them
+// to npm's ssri and validate-npm-package-name, Go's x/mod, Bundler and
+// Python's importlib.metadata.
+import sri
+import npmname
+import gosum
+import gemfilelock
+import pkgmetadata
+
+fn main() / {io} {
+    // The integrity npm writes for "hello" under sha256.
+    match sri.from_data("hello".to_bytes(), ["sha256"], []) {
+        Some(i) -> assert_eq(sri.to_string(i, false, " "), "sha256-LPJNul+wow4m6DsqxbninhsWHlwfp0JecwQzYpOLmCQ=")
+        None -> panic("no integrity")
+    }
+    assert_eq(sri.check_data("hello".to_bytes(), "sha256-LPJNul+wow4m6DsqxbninhsWHlwfp0JecwQzYpOLmCQ=") != None, true)
+
+    assert_eq(npmname.validate("@scope/pkg").valid_for_new, true)
+    assert_eq(npmname.validate("fs").warnings, ["fs is a core module name"])
+    assert_eq(npmname.validate(".hidden").valid_for_old, false)
+
+    match gosum.hash1([("go.mod", "module x\n".to_bytes())]) {
+        Ok(h) -> assert_eq(h, "h1:bKYNTh+vo5+F34HHOy4dca0+SoibMve/ocX8Qhd4v5Y=")
+        Err(_) -> panic("no hash")
+    }
+
+    let lock = "GEM\n  remote: https://rubygems.org\n  specs:\n    rake (13.0.1)\n\nPLATFORMS\n  i686-linux\n\n" +
+    "DEPENDENCIES\n  rake (< 14, >= 12)\n"
+    match gemfilelock.parse(lock) {
+        Ok(l) -> {
+            assert_eq(l.specs[0].version, "13.0.1")
+            assert_eq(l.platforms, ["x86-linux"])
+            assert_eq(l.dependencies[0].requirement, ">= 12, < 14")
+            assert_eq(l.gem_remotes, ["https://rubygems.org/"])
+        }
+        Err(_) -> panic("a lockfile was refused")
+    }
+
+    let meta = pkgmetadata.parse("Name: demo\nRequires-Dist: a\nRequires-Dist: b\nKeywords: x  y\n\nBody text\n")
+    assert_eq(pkgmetadata.get_all(meta, "requires-dist"), ["a", "b"])
+    assert_eq(pkgmetadata.get(meta, "Description"), Some("Body text\n"))
+    print("b18: ok")
+}
