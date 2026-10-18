@@ -1,0 +1,4 @@
+[package]
+name = "cp950"
+version = "1.0.0"
+capabilities = []

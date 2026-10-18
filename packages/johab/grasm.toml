@@ -1,0 +1,4 @@
+[package]
+name = "johab"
+version = "1.0.0"
+capabilities = []

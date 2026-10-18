@@ -1,0 +1,8 @@
+[package]
+name = "jisx0213"
+version = "1.0.0"
+capabilities = []
+
+[dependencies.jisx0212]
+path = "../jisx0212"
+version = "^1.0.0"

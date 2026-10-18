@@ -222,7 +222,7 @@ brute-force definitions) —
 `dct` `dwt` `spline` `windowfn`
 
 **B25. Codecs Python has and the set does not** (Python `codecs`) —
-`johab` `jisx0213` `cp950`
+`johab` `jisx0213` `cp950` `jisx0212`
 
 **B26. Object files and the tools under them** (`otool` `objdump` `nm`
 `codesign`, Go `go/parser`) —
@@ -254,6 +254,19 @@ projection library), `flexlayout` (no layout engine outside a browser),
 day its reference is installed.
 
 ## Landed
+
+- [x] **B25: codecs** — `johab` `cp950` `jisx0212` `jisx0213`, with the
+  harness `cjktest`; the new gate `cjkdiff` runs 312,023 cases against
+  Python's codecs: every byte, every pair a lead byte can start (refusals
+  included), every EUC triple, every character decoded and encoded back,
+  every encode-only code point and a sample of refused ones, in seven
+  forms: Johab, CP950, Shift_JIS-2004, EUC-JIS-2004, their 2000 editions,
+  and EUC-JP with JIS X 0212. `scripts/gen_dbcs.py` learned a trail base
+  (Johab's symbols start at 0x31) and still reproduces CP949 byte for byte;
+  `scripts/gen_jis.py` writes the JIS tables with a `--check` the gate
+  runs. One break per package turned it red; Johab's first, keep the last
+  of each duplicate, was neutral because Python does exactly that, and was
+  replaced by generating the table without its trail base.
 
 - [x] **B24: signals** — `dct` `dwt` `spline` `windowfn`, with the
   harness `sigtest`; the new gate `sigdiff` runs 2,340 cases: DCT-I and
@@ -464,7 +477,7 @@ day its reference is installed.
 | | |
 |---|---|
 | At the start | 669 |
-| Now | 807 |
+| Now | 812 |
 | Candidates above | 316 packages in 28 batches, plus `ecc`, `rfc6979` and `goprintf` |
 | Harnesses, one a batch | 28 |
 | If every candidate lands | 1016 |

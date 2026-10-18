@@ -9,11 +9,17 @@ decodes to the character. That last list is the one a hand-built table
 always gets wrong.
 
     python3 scripts/gen_dbcs.py cp932 Cp932 packages/cp932/src/main.gr header.txt
+
+An optional fifth argument is the lowest trail byte, in hexadecimal; it is
+0x40 unless given. Johab's symbol rows start their trail bytes at 0x31.
+
+The package's functions follow the tables: `scripts/dbcs_tail.gr`, with
+PREFIX replaced by the type prefix.
 """
 import sys
 
 
-def build(codec, prefix, header):
+def build(codec, prefix, header, trail_base=0x40):
     singles = {}
     for b in range(0x80, 0x100):
         try:
@@ -32,7 +38,7 @@ def build(codec, prefix, header):
             continue
         row = []
         any_valid = False
-        for trail in range(0x40, 0x100):
+        for trail in range(trail_base, 0x100):
             try:
                 text = bytes([lead, trail]).decode(codec)
             except Exception:
@@ -81,11 +87,14 @@ def build(codec, prefix, header):
     out.append("")
     out.append("let WIDTH = %d" % width)
     out.append("")
+    out.append("/// The trail byte the first entry of every row stands for.")
+    out.append("let TRAIL_BASE = %d" % trail_base)
+    out.append("")
     out.append("fn leads() -> [i64] {")
     out.append("    return [%s]" % ", ".join(str(l) for l in leads))
     out.append("}")
     out.append("")
-    out.append("/// One row per lead byte, one entry per trail byte from 0x40 to 0xFF,")
+    out.append("/// One row per lead byte, one entry per trail byte from 0x%02X to 0xFF," % trail_base)
     out.append("/// %d hexadecimal digits each, 0 where the pair is not a character." % width)
     out.append("fn rows() -> [str] {")
     out.append("    return [")
@@ -115,7 +124,7 @@ def build(codec, prefix, header):
             out.append('    return "%s "' % pieces[0])
             for piece in pieces[1:]:
                 out[-1] = out[-1] + " +"
-                out.append('        "%s "' % piece)
+                out.append('    "%s "' % piece)
         out.append("}")
         out.append("")
 
@@ -140,9 +149,12 @@ def build(codec, prefix, header):
 
 if __name__ == "__main__":
     codec, prefix, target, header_path = sys.argv[1:5]
+    trail_base = int(sys.argv[5], 16) if len(sys.argv) > 5 else 0x40
     header = open(header_path).read()
     text, leads, pairs, singles, multi, overrides = build(codec, prefix,
-                                                          header)
+                                                          header, trail_base)
+    tail = open(__file__.replace("gen_dbcs.py", "dbcs_tail.gr")).read()
+    text += tail.replace("PREFIX", prefix)
     open(target, "w").write(text)
     print(f"{codec}: {leads} leads, {pairs} pairs, {singles} single bytes, "
           f"{multi} sequences, {overrides} encoder preferences")

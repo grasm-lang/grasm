@@ -1,0 +1,30 @@
+// Korean, Traditional Chinese and Japanese text in the encodings older
+// files use. scripts/cjk_diff.sh holds every character to Python's codecs.
+import johab
+import cp950
+import jisx0212
+import jisx0213
+
+fn main() / {io} {
+    // Johab gives 힣, the last syllable, two bytes; EUC-KR has no bytes for it.
+    assert_eq(johab.encode("가힣") ?? bytes_of([]), bytes_of([136, 97, 211, 189]))
+    assert_eq(johab.decode(bytes_of([136, 97])) ?? "", "가")
+
+    // CP950 has the euro sign where Big5 has nothing.
+    assert_eq(cp950.encode("€") ?? bytes_of([]), bytes_of([163, 225]))
+
+    // JIS X 0212's 丂 needs EUC-JP's third byte.
+    assert_eq(jisx0212.encode_eucjp("丂") ?? bytes_of([]), bytes_of([143, 176, 161]))
+    assert_eq(jisx0212.decode_eucjp(bytes_of([143, 176, 161, 65])) ?? "", "丂A")
+
+    // か with a semi-voiced mark is one cell in JIS X 0213, and Shift_JIS-2004
+    // writes it as one pair.
+    assert_eq(jisx0213.encode(ShiftJis2004, "か゚") ?? bytes_of([]), bytes_of([130, 245]))
+    assert_eq(jisx0213.decode(EucJis2004, bytes_of([164, 247])) ?? "", "か゚")
+    // In Shift_JIS-2004, byte 0x5C is the yen sign.
+    assert_eq(jisx0213.decode(ShiftJis2004, bytes_of([92])) ?? "", "¥")
+    // 𠮟 arrived in the 2004 edition; the 2000 edition cannot write it.
+    assert_eq(jisx0213.encode(ShiftJisX0213, "𠮟") ?? bytes_of([]), bytes_of([]))
+    assert_eq(jisx0213.encode(ShiftJis2004, "𠮟") ?? bytes_of([]), bytes_of([152, 115]))
+    print("cjk: ok")
+}

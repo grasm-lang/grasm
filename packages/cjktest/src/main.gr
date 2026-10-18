@@ -1,0 +1,72 @@
+// The Grasm side of scripts/cjk_diff.py. The first argument names the
+// codec, so one run builds one encoder; then each case is `dec <hex>` or
+// `enc <hex>`, the hex being bytes to decode or the UTF-8 of text to
+// encode, and the answer is hex too.
+import johab
+import cp950
+import jisx0212
+import jisx0213
+
+fn from_hex(text: str) -> bytes {
+    var out: [i64] = []
+    var i = 1
+    while i + 1 < text.len() {
+        out.push(text.substr(i, 2).parse_int_base(16) ?? 0)
+        i = i + 2
+    }
+    return bytes_of(out)
+}
+
+fn to_hex(raw: bytes) -> str {
+    let digits = "0123456789abcdef"
+    var out = ""
+    var i = 0
+    while i < raw.len() {
+        out = out + digits.substr(raw.at(i) / 16, 1) + digits.substr(raw.at(i) % 16, 1)
+        i = i + 1
+    }
+    return out
+}
+
+let REFUSED = "?refused?"
+
+fn run(argv: [str], dec: fn(bytes) -> str, enc: fn(str) -> str) / {io} {
+    var i = 1
+    while i + 1 < argv.len() {
+        let raw = from_hex(argv[i + 1])
+        if argv[i] == "dec" {
+            print(to_hex(dec(raw).to_bytes()))
+        } else {
+            print(enc(raw.to_str()))
+        }
+        i = i + 2
+    }
+}
+
+fn jis(argv: [str], form: Jis0213Form) / {io} {
+    let t = jisx0213.encoder(form)
+    run(argv, |raw| jisx0213.decode(form, raw) ?? REFUSED, |text| to_hex(jisx0213.encode_with(t, text) ?? REFUSED.to_bytes()))
+}
+
+fn main() / {io} {
+    let argv = args()
+    let codec = argv[0]
+    if codec == "johab" {
+        let t = johab.encoder()
+        run(argv, |raw| johab.decode(raw) ?? REFUSED, |text| to_hex(johab.encode_with(t, text) ?? REFUSED.to_bytes()))
+    } else if codec == "cp950" {
+        let t = cp950.encoder()
+        run(argv, |raw| cp950.decode(raw) ?? REFUSED, |text| to_hex(cp950.encode_with(t, text) ?? REFUSED.to_bytes()))
+    } else if codec == "euc_jp" {
+        let t = jisx0212.eucjp_encoder()
+        run(argv, |raw| jisx0212.decode_eucjp(raw) ?? REFUSED, |text| to_hex(jisx0212.encode_eucjp_with(t, text) ?? REFUSED.to_bytes()))
+    } else if codec == "shift_jis_2004" {
+        jis(argv, ShiftJis2004)
+    } else if codec == "euc_jis_2004" {
+        jis(argv, EucJis2004)
+    } else if codec == "shift_jisx0213" {
+        jis(argv, ShiftJisX0213)
+    } else {
+        jis(argv, EucJisX0213)
+    }
+}

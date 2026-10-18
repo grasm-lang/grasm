@@ -1,0 +1,8 @@
+[package]
+name = "jisx0212"
+version = "1.0.0"
+capabilities = []
+
+[dependencies.shiftjis]
+path = "../shiftjis"
+version = "^1.0.0"

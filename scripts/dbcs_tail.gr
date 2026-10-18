@@ -55,10 +55,10 @@ pub fn is_lead(byte: i64) -> bool {
 /// The code point a lead and trail byte stand for, or -1.
 pub fn pair_to_code(lead: i64, trail: i64) -> i64 {
     let row = lead_index(lead)
-    if row < 0 or trail < 64 or trail > 255 {
+    if row < 0 or trail < TRAIL_BASE or trail > 255 {
         return 0 - 1
     }
-    let column = trail - 64
+    let column = trail - TRAIL_BASE
     let code = hex_value(rows()[row].substr(column * WIDTH, WIDTH))
     if code == 0 {
         return 0 - 1
@@ -123,7 +123,7 @@ pub fn encoder() -> PREFIXEncoder {
         while column * WIDTH < text.len() {
             let code = hex_value(text.substr(column * WIDTH, WIDTH))
             if code != 0 and not out.has(code) {
-                out.set(code, lead * 256 + 64 + column)
+                out.set(code, lead * 256 + TRAIL_BASE + column)
             }
             column = column + 1
         }

@@ -1,0 +1,20 @@
+[package]
+name = "cjktest"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.johab]
+path = "../johab"
+version = "^1.0.0"
+
+[dependencies.cp950]
+path = "../cp950"
+version = "^1.0.0"
+
+[dependencies.jisx0212]
+path = "../jisx0212"
+version = "^1.0.0"
+
+[dependencies.jisx0213]
+path = "../jisx0213"
+version = "^1.0.0"
