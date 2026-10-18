@@ -240,6 +240,20 @@ day its reference is installed.
 
 ## Landed
 
+- [x] **B28, first part** — `winpath` `txtar` `httpproxy` `bpf`
+  `proxyproto` `maptile`, with the harness `b28test`; the new gate
+  `b28diff` runs 3,900 cases against CPython's `ntpath` and, through
+  `scripts/lib/gomods` built offline with the module cache's Go 1.27
+  toolchain, against x/tools/txtar, x/net/http/httpproxy, x/net/bpf,
+  pires/go-proxyproto and paulmach/orb/maptile. Found on the way: Go reads
+  an IPv4-mapped CIDR in NO_PROXY (`::ffff:10.0.0.0/104`) as the IPv4 block
+  10.0.0.0/8, and the package now does too; and x/net/bpf's VM decodes
+  `neg` but cannot run it, where the kernel negates A -- the package
+  follows the kernel, and the gate compares only the text of programs
+  that reach a `neg`. One break in each package turned its family red,
+  after two first attempts that changed nothing observable were replaced
+  and the generators given UNC paths and programs that return A.
+
 - [x] **B21, second part** — `lfu` `arccache` `jumphash` `rendezvous`
   `minhash` `xorfilter` `quotientfilter`, with the harness `dstest2`; the
   new gate `ds2diff` runs 1,190 cases: the caches against Python models,
@@ -362,7 +376,7 @@ day its reference is installed.
 | | |
 |---|---|
 | At the start | 669 |
-| Now | 763 |
+| Now | 770 |
 | Candidates above | 313 packages in 28 batches, plus `ecc`, `rfc6979` and `goprintf` |
 | Harnesses, one a batch | 28 |
 | If every candidate lands | 1013 |

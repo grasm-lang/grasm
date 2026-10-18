@@ -1,0 +1,385 @@
+// Classic BPF (McCanne and Jacobson, 1993): the little filter language
+// that tcpdump compiles expressions to, that a socket attaches with
+// SO_ATTACH_FILTER, and that seccomp runs on every system call.
+//
+// An instruction is eight bytes -- a 16-bit opcode, two 8-bit jump
+// offsets, a 32-bit constant -- as Linux's `struct sock_filter` and
+// `tcpdump -dd` give them. This decodes and encodes them, prints each the
+// way golang.org/x/net/bpf does (`ldh [12]`, `jeq #2048,0,5`, `ret #65535`),
+// validates a program as its VM does -- jumps inside the program, no
+// division by a constant zero, only the `len` extension, a return at the
+// end -- and runs it: the result is how many bytes of the packet to
+// accept, and a load past the end of the packet or a division by X when X
+// is 0 ends the program with 0, as in the kernel.
+//
+// Registers are 32-bit; every result is reduced modulo 2^32, and a shift
+// by 32 or more gives 0, as Go defines it. One difference from x/net/bpf:
+// its VM decodes `neg` and then cannot run it ("unknown Instruction");
+// the kernel negates A, and so does this.
+
+type BpfInstruction = {
+    op: i64,
+    jt: i64,
+    jf: i64,
+    k: i64,
+}
+
+type BpfError =
+    | Empty
+    | BadLength(found: i64)
+    | JumpOutOfRange(at: i64)
+    | DivideByZero(at: i64)
+    | UnsupportedExtension(at: i64, number: i64)
+    | NoReturn
+    | Unknown(at: i64)
+
+/// What an opcode means, as x/net/bpf's Disassemble decides it.
+type BpfKind =
+    | LoadConstant(x: bool)
+    | LoadScratch(x: bool)
+    | LoadAbsolute(size: i64)
+    | LoadIndirect(size: i64)
+    | LoadExtension(number: i64)
+    | LoadMemShift
+    | StoreScratch(x: bool)
+    | AluConstant(operator: i64)
+    | AluX(operator: i64)
+    | Negate
+    | JumpAlways
+    | JumpIf(cond: str, x: bool, skip_true: i64, skip_false: i64)
+    | ReturnA
+    | ReturnConstant
+    | Tax
+    | Txa
+    | Raw
+
+fn mask() -> i64 {
+    4294967295
+}
+
+pub fn decode(raw: bytes) -> [BpfInstruction] ! BpfError {
+    if raw.len() % 8 != 0 {
+        fail(BadLength(raw.len()))
+    }
+    var out: [BpfInstruction] = []
+    var at = 0
+    while at < raw.len() {
+        out.push(BpfInstruction{ op: raw.at(at).bit_or(raw.at(at + 1).shl(8)), jt: raw.at(at + 2), jf: raw.at(at + 3),
+            k: raw.at(at + 4).bit_or(raw.at(at + 5).shl(8)).bit_or(raw.at(at + 6).shl(16)).bit_or(raw.at(at + 7).shl(24)) })
+        at = at + 8
+    }
+    out
+}
+
+pub fn encode(program: [BpfInstruction]) -> bytes {
+    var out: [i64] = []
+    for i in program {
+        out = out + [i.op.bit_and(255), i.op.ushr(8).bit_and(255), i.jt.bit_and(255), i.jf.bit_and(255)]
+        for s in [0, 8, 16, 24] {
+            out.push(i.k.ushr(s).bit_and(255))
+        }
+    }
+    bytes_of(out)
+}
+
+fn load_kind(i: BpfInstruction) -> BpfKind {
+    let width = i.op.bit_and(24)
+    let size = if width == 0 { 4 } else if width == 8 { 2 } else if width == 16 { 1 } else { 0 }
+    if size == 0 {
+        return Raw
+    }
+    let x = i.op.bit_and(1) == 1
+    let mode = i.op.bit_and(224)
+    if mode == 0 {
+        return if size == 4 { LoadConstant(x) } else { Raw }
+    }
+    if mode == 96 {
+        return if size == 4 and i.k <= 15 { LoadScratch(x) } else { Raw }
+    }
+    if mode == 32 {
+        if i.k > 4294963199 {
+            return LoadExtension((i.k + 4096).bit_and(mask()))
+        }
+        return LoadAbsolute(size)
+    }
+    if mode == 64 {
+        return LoadIndirect(size)
+    }
+    if mode == 128 {
+        return if size == 4 { LoadExtension(1) } else { Raw }
+    }
+    if mode == 160 { LoadMemShift } else { Raw }
+}
+
+fn jump_kind(i: BpfInstruction) -> BpfKind {
+    let operator = i.op.bit_and(240)
+    if operator == 0 {
+        return JumpAlways
+    }
+    if operator > 64 {
+        return Raw
+    }
+    let x = i.op.bit_and(8) == 8
+    let names = ["", "jeq", "jgt", "jge", "jset"]
+    let negated = ["", "jneq", "jle", "jlt", "jnset"]
+    if i.jt == 0 {
+        return JumpIf(negated[operator / 16], x, i.jf, 0)
+    }
+    JumpIf(names[operator / 16], x, i.jt, i.jf)
+}
+
+pub fn kind(i: BpfInstruction) -> BpfKind {
+    let cls = i.op.bit_and(7)
+    if cls <= 1 {
+        return load_kind(i)
+    }
+    if cls == 2 or cls == 3 {
+        return if i.op == cls and i.k <= 15 { StoreScratch(cls == 3) } else { Raw }
+    }
+    if cls == 4 {
+        let operator = i.op.bit_and(240)
+        if operator == 128 {
+            return Negate
+        }
+        if operator > 160 {
+            return Raw
+        }
+        return if i.op.bit_and(8) == 8 { AluX(operator) } else { AluConstant(operator) }
+    }
+    if cls == 5 {
+        return jump_kind(i)
+    }
+    if cls == 6 {
+        return if i.op == 22 { ReturnA } else if i.op == 6 { ReturnConstant } else { Raw }
+    }
+    if i.op == 7 { Tax } else if i.op == 135 { Txa } else { Raw }
+}
+
+fn alu_name(operator: i64) -> str {
+    ["add", "sub", "mul", "div", "or", "and", "lsh", "rsh", "neg", "mod", "xor"][operator / 16]
+}
+
+fn extension_name(n: i64) -> str {
+    let names = [(1, "len"), (0, "proto"), (4, "type"), (52, "poff"), (8, "ifidx"), (12, "nla"), (16, "nlan"), (20, "mark"),
+        (24, "queue"), (28, "hatype"), (32, "rxhash"), (36, "cpu"), (44, "vlan_tci"), (48, "vlan_avail"), (60, "vlan_tpid"),
+        (56, "rand")]
+    for (v, name) in names {
+        if v == n {
+            return "#" + name
+        }
+    }
+    "?"
+}
+
+fn jump_text(cond: str, operand: str, t: i64, f: i64) -> str {
+    if cond == "jneq" or cond == "jlt" or cond == "jle" {
+        return "{cond} {operand},{t}"
+    }
+    if cond == "jnset" {
+        return jump_text("jset", operand, f, t)
+    }
+    let negative = if cond == "jeq" { "jneq" } else if cond == "jgt" { "jle" } else if cond == "jge" { "jlt" } else { "" }
+    if cond == "jset" {
+        return if f > 0 { "jset {operand},{t},{f}" } else { "jset {operand},{t}" }
+    }
+    if t > 0 {
+        return if f > 0 { "{cond} {operand},{t},{f}" } else { "{cond} {operand},{t}" }
+    }
+    "{negative} {operand},{f}"
+}
+
+fn sized(size: i64) -> str {
+    if size == 1 { "ldb" } else if size == 2 { "ldh" } else { "ld" }
+}
+
+/// The instruction as x/net/bpf prints it; "?" for an opcode it does not
+/// decode.
+pub fn text(i: BpfInstruction) -> str {
+    match kind(i) {
+        LoadConstant(x) -> if x { "ldx #{i.k}" } else { "ld #{i.k}" }
+        LoadScratch(x) -> if x { "ldx M[{i.k}]" } else { "ld M[{i.k}]" }
+        LoadAbsolute(size) -> "{sized(size)} [{i.k}]"
+        LoadIndirect(size) -> "{sized(size)} [x + {i.k}]"
+        LoadExtension(n) -> {
+            let name = extension_name(n)
+            if name == "?" { "?" } else { "ld " + name }
+        }
+        LoadMemShift -> "ldx 4*([{i.k}]&0xf)"
+        StoreScratch(x) -> if x { "stx M[{i.k}]" } else { "st M[{i.k}]" }
+        AluConstant(op) -> "{alu_name(op)} #{i.k}"
+        AluX(op) -> "{alu_name(op)} x"
+        Negate -> "neg"
+        JumpAlways -> "ja {i.k}"
+        JumpIf(cond, x, t, f) -> jump_text(cond, if x { "x" } else { "#{i.k}" }, t, f)
+        ReturnA -> "ret a"
+        ReturnConstant -> "ret #{i.k}"
+        Tax -> "tax"
+        Txa -> "txa"
+        Raw -> "?"
+    }
+}
+
+/// The checks x/net/bpf's NewVM makes before running a program.
+pub fn validate(program: [BpfInstruction]) -> () ! BpfError {
+    if program.len() == 0 {
+        fail(Empty)
+    }
+    for at in 0..program.len() {
+        let room = program.len() - (at + 1)
+        match kind(program[at]) {
+            JumpAlways -> if room <= program[at].k {
+                fail(JumpOutOfRange(at))
+            }
+            JumpIf(_, _, t, f) -> if room <= t or room <= f {
+                fail(JumpOutOfRange(at))
+            }
+            AluConstant(op) -> if program[at].k == 0 and (op == 48 or op == 144) {
+                fail(DivideByZero(at))
+            }
+            LoadExtension(n) -> if n != 1 {
+                fail(UnsupportedExtension(at, n))
+            }
+            _ -> {}
+        }
+    }
+    match kind(program[program.len() - 1]) {
+        ReturnA -> ()
+        ReturnConstant -> ()
+        _ -> fail(NoReturn)
+    }
+}
+
+fn mul32(a: i64, b: i64) -> i64 {
+    let a0 = a.bit_and(65535)
+    let a1 = a.ushr(16)
+    let b0 = b.bit_and(65535)
+    let b1 = b.ushr(16)
+    (a0 * b0 + (a1 * b0 + a0 * b1).bit_and(65535).shl(16)).bit_and(mask())
+}
+
+fn alu(operator: i64, a: i64, v: i64) -> i64 {
+    if operator == 0 {
+        return (a + v).bit_and(mask())
+    }
+    if operator == 16 {
+        return (a - v).bit_and(mask())
+    }
+    if operator == 32 {
+        return mul32(a, v)
+    }
+    if operator == 48 {
+        return a / v
+    }
+    if operator == 64 {
+        return a.bit_or(v)
+    }
+    if operator == 80 {
+        return a.bit_and(v)
+    }
+    if operator == 96 {
+        return if v >= 32 { 0 } else { a.shl(v).bit_and(mask()) }
+    }
+    if operator == 112 {
+        return if v >= 32 { 0 } else { a.ushr(v) }
+    }
+    if operator == 144 {
+        return a % v
+    }
+    if operator == 160 { a.bit_xor(v) } else { a }
+}
+
+fn test_holds(cond: str, a: i64, v: i64) -> bool {
+    if cond == "jeq" { a == v } else if cond == "jneq" { a != v } else if cond == "jgt" { a > v } else if cond == "jle" {
+        a <= v
+    } else if cond == "jge" { a >= v } else if cond == "jlt" { a < v } else if cond == "jset" { a.bit_and(v) != 0 } else {
+        a.bit_and(v) == 0
+    }
+}
+
+/// (value, in bounds) of a big-endian load.
+fn load(packet: bytes, at: i64, size: i64) -> (i64, bool) {
+    if at < 0 or at + size > packet.len() {
+        return (0, false)
+    }
+    var v = 0
+    for k in 0..size {
+        v = v.shl(8).bit_or(packet.at(at + k))
+    }
+    (v, true)
+}
+
+type BpfMachine = {
+    a: i64,
+    x: i64,
+    scratch: [i64],
+}
+
+/// One instruction: (next index, still running, result when it returned).
+fn step(m: BpfMachine, i: BpfInstruction, at: i64, packet: bytes) -> (BpfMachine, i64, bool, i64) {
+    var s = m
+    match kind(i) {
+        LoadConstant(x) -> if x { s.x = i.k } else { s.a = i.k }
+        LoadScratch(x) -> if x { s.x = s.scratch[i.k] } else { s.a = s.scratch[i.k] }
+        LoadAbsolute(size) -> {
+            let (v, ok) = load(packet, i.k, size)
+            s.a = v
+            if not ok {
+                return (s, at, false, 0)
+            }
+        }
+        LoadIndirect(size) -> {
+            let (v, ok) = load(packet, i.k + s.x, size)
+            s.a = v
+            if not ok {
+                return (s, at, false, 0)
+            }
+        }
+        LoadExtension(_) -> s.a = packet.len()
+        LoadMemShift -> {
+            let (v, ok) = load(packet, i.k, 1)
+            if not ok {
+                return (s, at, false, 0)
+            }
+            s.x = v.bit_and(15) * 4
+        }
+        StoreScratch(x) -> s.scratch[i.k] = if x { s.x } else { s.a }
+        AluConstant(op) -> s.a = alu(op, s.a, i.k)
+        AluX(op) -> {
+            if s.x == 0 and (op == 48 or op == 144) {
+                return (s, at, false, 0)
+            }
+            s.a = alu(op, s.a, s.x)
+        }
+        Negate -> s.a = (0 - s.a).bit_and(mask())
+        JumpAlways -> return (s, at + 1 + i.k, true, -1)
+        JumpIf(cond, x, t, f) -> {
+            let v = if x { s.x } else { i.k }
+            return (s, at + 1 + if test_holds(cond, s.a, v) { t } else { f }, true, -1)
+        }
+        ReturnA -> return (s, at, false, s.a)
+        ReturnConstant -> return (s, at, false, i.k)
+        Tax -> s.x = s.a
+        Txa -> s.a = s.x
+        Raw -> return (s, at, false, -2)
+    }
+    (s, at + 1, true, -1)
+}
+
+/// Runs the program on a packet: how many bytes to accept.
+pub fn run(program: [BpfInstruction], packet: bytes) -> i64 ! BpfError {
+    try validate(program)
+    var m = BpfMachine{ a: 0, x: 0, scratch: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] }
+    var at = 0
+    while at < program.len() {
+        let r = step(m, program[at], at, packet)
+        m = r.0
+        if not r.2 {
+            if r.3 == -2 {
+                fail(Unknown(at))
+            }
+            return r.3.max(0)
+        }
+        at = r.1
+    }
+    0
+}

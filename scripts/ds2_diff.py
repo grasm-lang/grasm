@@ -38,12 +38,9 @@ built = subprocess.run([GRASM, "build", "packages/dstest2/src/main.gr", "--nativ
                        cwd=ROOT, capture_output=True, text=True)
 if built.returncode != 0:
     print(built.stderr[-1500:]); sys.exit(1)
-oracle = os.path.join(work, "gomods")
-env = dict(os.environ, GOFLAGS="-mod=mod", GOPROXY="off", GOSUMDB="off")
-built = subprocess.run(["go", "build", "-o", oracle, "."], cwd=os.path.join(ROOT, "scripts/lib/gomods"),
-                       capture_output=True, text=True, env=env)
-if built.returncode != 0:
-    print(built.stderr[-1500:]); sys.exit(1)
+sys.path.insert(0, os.path.join(ROOT, "scripts/lib/gomods"))
+import oracle as gomods  # noqa: E402
+oracle = gomods.build(os.path.join(work, "gomods"))
 
 cases = []
 

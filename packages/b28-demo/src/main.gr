@@ -1,0 +1,61 @@
+// Windows paths, txtar, proxies, BPF, the PROXY protocol and map tiles on
+// inputs small enough to check by eye. scripts/b28_diff.sh holds them to
+// Python's ntpath and to Go modules on thousands of cases.
+import winpath
+import txtar
+import httpproxy
+import bpf
+import proxyproto
+import maptile
+
+fn main() / {io} {
+    assert_eq(winpath.normpath("C:/Users/./me/../you\\docs"), "C:\\Users\\you\\docs")
+    assert_eq(winpath.splitroot("\\\\server\\share\\dir"), ("\\\\server\\share", "\\", "dir"))
+    assert_eq(winpath.isabs("C:foo"), false)
+    assert_eq(winpath.isreserved("logs\\nul.txt"), true)
+
+    let a = txtar.parse("notes\n-- hello.txt --\nhi\n-- sub/x.go --\npackage x".to_bytes())
+    assert_eq(a.files.len(), 2)
+    assert_eq(a.files[1].data.to_str(), "package x\n")
+
+    let cfg = ProxyConfig{ http_proxy: "proxy:3128", https_proxy: "", no_proxy: "internal.example,10.0.0.0/8", cgi: false }
+    match httpproxy.proxy_for(cfg, "http://api.internal.example/v1") {
+        Ok(p) -> assert_eq(p, None)
+        Err(_) -> panic("refused")
+    }
+    match httpproxy.proxy_for(cfg, "http://example.org/") {
+        Ok(p) -> assert_eq(p, Some("http://proxy:3128"))
+        Err(_) -> panic("refused")
+    }
+
+    // tcpdump -dd 'ip': accept IPv4 frames whole, drop the rest.
+    let ipv4 = [BpfInstruction{ op: 40, jt: 0, jf: 0, k: 12 }, BpfInstruction{ op: 21, jt: 0, jf: 1, k: 2048 },
+        BpfInstruction{ op: 6, jt: 0, jf: 0, k: 262144 }, BpfInstruction{ op: 6, jt: 0, jf: 0, k: 0 }]
+    assert_eq(ipv4.map(|i| bpf.text(i)), ["ldh [12]", "jneq #2048,1", "ret #262144", "ret #0"])
+    var frame = bytes_filled(14, 0)
+    frame.set(12, 8)
+    match bpf.run(ipv4, frame) {
+        Ok(n) -> assert_eq(n, 262144)
+        Err(_) -> panic("a valid filter was refused")
+    }
+    // `neg` as the kernel runs it: A = 0 - 5 modulo 2^32.
+    let negate = [BpfInstruction{ op: 0, jt: 0, jf: 0, k: 5 }, BpfInstruction{ op: 132, jt: 0, jf: 0, k: 0 },
+        BpfInstruction{ op: 22, jt: 0, jf: 0, k: 0 }]
+    match bpf.run(negate, bytes_of([])) {
+        Ok(n) -> assert_eq(n, 4294967291)
+        Err(_) -> panic("neg was refused")
+    }
+
+    match proxyproto.read("PROXY TCP4 192.0.2.1 198.51.100.2 56324 443\r\nGET /".to_bytes()) {
+        Ok((h, used)) -> {
+            assert_eq(h.source_port, 56324)
+            assert_eq(used, 45)
+        }
+        Err(_) -> panic("a v1 header was refused")
+    }
+
+    // Bing's documented example: tile (3, 5) at zoom 3 is "213".
+    assert_eq(maptile.quadkey(MapTile{ x: 3, y: 5, z: 3 }), "213")
+    assert_eq(maptile.tile_at(-0.1276, 51.5072, 10), MapTile{ x: 511, y: 340, z: 10 })
+    print("b28: ok")
+}

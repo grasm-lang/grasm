@@ -120,6 +120,7 @@ run_gate packetdiff    scripts/packet_diff.sh
 run_gate graphdiff     scripts/graph_diff.sh
 run_gate dsdiff        scripts/ds_diff.sh
 run_gate ds2diff       scripts/ds2_diff.sh
+run_gate b28diff       scripts/b28_diff.sh
 run_gate grasmwire     scripts/grasmwire_e2e.sh
 run_gate cryptodiff    scripts/crypto_diff.sh
 run_gate certdiff      scripts/cert_diff.sh

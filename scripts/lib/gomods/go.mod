@@ -1,8 +1,16 @@
 module gomodsoracle
 
-go 1.25
+go 1.26.0
 
 require (
 	github.com/cespare/xxhash/v2 v2.2.0
 	github.com/dgryski/go-rendezvous v0.0.0-20200823014737-9f7001d12a5f
+	github.com/paulmach/orb v0.12.0
+	github.com/pires/go-proxyproto v0.15.0
+	golang.org/x/net v0.61.0
+	golang.org/x/tools v0.52.0
 )
+
+require golang.org/x/text v0.43.0 // indirect
+
+require go.mongodb.org/mongo-driver v1.17.4

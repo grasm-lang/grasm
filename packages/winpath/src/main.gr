@@ -1,0 +1,338 @@
+// Windows paths, as Python's `ntpath` reads them, on any system.
+//
+// `path` handles POSIX paths. A tool that writes Windows installers, reads
+// a `.lnk` or a Visual Studio project, syncs files to a share, or checks a
+// filename a Windows user will see needs the other rules: two separators
+// (`\` and `/`), drive letters (`C:`), drive-relative paths (`C:foo`, which
+// is not absolute), UNC shares (`\\server\share`), device paths (`\\?\`,
+// `\\.\`), case-insensitive comparison, and names Windows reserves (`CON`,
+// `aux.txt`, a trailing dot). Every function is CPython 3.14's `ntpath`
+// rewritten, and is checked against it.
+//
+// `relpath` takes only absolute paths: `ntpath` would join a relative one
+// to the current directory, which a pure function does not have.
+
+type WinPathError =
+    | Empty
+    | DifferentDrives
+    | MixedRoots
+    | NotAbsolute(path: str)
+
+fn is_sep(c: str) -> bool {
+    c == "\\" or c == "/"
+}
+
+fn find_sep(s: str, from: i64) -> i64 {
+    var i = from
+    while i < s.len() {
+        if s.substr(i, 1) == "\\" {
+            return i
+        }
+        i = i + 1
+    }
+    -1
+}
+
+fn tail(s: str, from: i64) -> str {
+    if from >= s.len() { "" } else { s.substr(from, s.len() - from) }
+}
+
+fn head(s: str, n: i64) -> str {
+    s.substr(0, n.min(s.len()))
+}
+
+/// (drive, root, tail): `C:` `\` `Windows`, or `\\server\share` `\` `dir`.
+pub fn splitroot(p: str) -> (str, str, str) {
+    let normp = p.replace("/", "\\")
+    if head(normp, 1) == "\\" {
+        if normp.substr(1, 1) == "\\" {
+            let start = if head(normp, 8).to_upper() == "\\\\?\\UNC\\" { 8 } else { 2 }
+            let index = find_sep(normp, start)
+            if index == -1 {
+                return (p, "", "")
+            }
+            let index2 = find_sep(normp, index + 1)
+            if index2 == -1 {
+                return (p, "", "")
+            }
+            return (head(p, index2), p.substr(index2, 1), tail(p, index2 + 1))
+        }
+        return ("", head(p, 1), tail(p, 1))
+    }
+    if normp.substr(1, 1) == ":" {
+        if normp.substr(2, 1) == "\\" {
+            return (head(p, 2), p.substr(2, 1), tail(p, 3))
+        }
+        return (head(p, 2), "", tail(p, 2))
+    }
+    ("", "", p)
+}
+
+pub fn splitdrive(p: str) -> (str, str) {
+    let (d, r, t) = splitroot(p)
+    (d, r + t)
+}
+
+/// Whether the path is absolute: a drive and a root, or UNC or device.
+pub fn isabs(p: str) -> bool {
+    let s = head(p, 3).replace("/", "\\")
+    s.substr(1, 2) == ":\\" or s.starts_with("\\\\")
+}
+
+fn ends_with_any(s: str, set: str) -> bool {
+    s.len() > 0 and set.contains(s.substr(s.len() - 1, 1))
+}
+
+/// Joins paths as `ntpath.join(first, *rest)` does: an absolute part
+/// discards what came before, and a different drive starts over.
+pub fn join(parts: [str]) -> str {
+    if parts.len() == 0 {
+        return ""
+    }
+    var (rd, rr, rp) = splitroot(parts[0])
+    for k in 1..parts.len() {
+        let (pd, pr, pp) = splitroot(parts[k])
+        if pr != "" {
+            if pd != "" or rd == "" {
+                rd = pd
+            }
+            rr = pr
+            rp = pp
+            continue
+        }
+        if pd != "" and pd != rd {
+            if pd.to_lower() != rd.to_lower() {
+                rd = pd
+                rr = pr
+                rp = pp
+                continue
+            }
+            rd = pd
+        }
+        if rp != "" and not ends_with_any(rp, "\\/") {
+            rp = rp + "\\"
+        }
+        rp = rp + pp
+    }
+    if rp != "" and rr == "" and rd != "" and not ends_with_any(rd, ":\\/") {
+        return rd + "\\" + rp
+    }
+    rd + rr + rp
+}
+
+fn rstrip_seps(s: str) -> str {
+    var n = s.len()
+    while n > 0 and is_sep(s.substr(n - 1, 1)) {
+        n = n - 1
+    }
+    head(s, n)
+}
+
+/// (head, tail): everything up to the last separator, and after it.
+pub fn split(p: str) -> (str, str) {
+    let (d, r, rest) = splitroot(p)
+    var i = rest.len()
+    while i > 0 and not is_sep(rest.substr(i - 1, 1)) {
+        i = i - 1
+    }
+    (d + r + rstrip_seps(head(rest, i)), tail(rest, i))
+}
+
+pub fn basename(p: str) -> str {
+    split(p).1
+}
+
+pub fn dirname(p: str) -> str {
+    split(p).0
+}
+
+/// (root, extension): the extension starts at the last dot of the last
+/// component, unless that component is all leading dots before it.
+pub fn splitext(p: str) -> (str, str) {
+    var sep_index = -1
+    var dot_index = -1
+    for i in 0..p.len() {
+        let c = p.substr(i, 1)
+        if is_sep(c) {
+            sep_index = i
+        } else if c == "." {
+            dot_index = i
+        }
+    }
+    if dot_index > sep_index {
+        var f = sep_index + 1
+        while f < dot_index {
+            if p.substr(f, 1) != "." {
+                return (head(p, dot_index), tail(p, dot_index))
+            }
+            f = f + 1
+        }
+    }
+    (p, "")
+}
+
+/// Lower case with every `/` made `\`, for comparing.
+pub fn normcase(p: str) -> str {
+    p.replace("/", "\\").to_lower()
+}
+
+/// Collapses separators, `.` and `..` (never above the root), and
+/// makes every separator `\`.
+pub fn normpath(path: str) -> str {
+    let (drive, root, rest) = splitroot(path.replace("/", "\\"))
+    let prefix = drive + root
+    var comps: [str] = []
+    for c in rest.split("\\") {
+        if c == "" or c == "." {
+            continue
+        }
+        if c == ".." {
+            if comps.len() > 0 and comps[comps.len() - 1] != ".." {
+                comps = comps.slice(0, comps.len() - 1)
+            } else if comps.len() == 0 and root != "" {
+                continue
+            } else {
+                comps.push(c)
+            }
+        } else {
+            comps.push(c)
+        }
+    }
+    if prefix == "" and comps.len() == 0 {
+        comps.push(".")
+    }
+    prefix + comps.join("\\")
+}
+
+fn reserved_name(name: str) -> bool {
+    if name.len() > 0 {
+        let last = name.substr(name.len() - 1, 1)
+        if last == "." or last == " " {
+            return name != "." and name != ".."
+        }
+    }
+    for c in name.chars() {
+        if c.code_at(0) < 32 or "\"*:<>?|/\\".contains(c) {
+            return true
+        }
+    }
+    var stem = name
+    let dot = name.index_of(".") ?? -1
+    if dot >= 0 {
+        stem = head(name, dot)
+    }
+    var n = stem.len()
+    while n > 0 and stem.substr(n - 1, 1) == " " {
+        n = n - 1
+    }
+    let upper = head(stem, n).to_upper()
+    if upper == "CON" or upper == "PRN" or upper == "AUX" or upper == "NUL" or upper == "CONIN$" or upper == "CONOUT$" {
+        return true
+    }
+    if upper.len() == 4 and (head(upper, 3) == "COM" or head(upper, 3) == "LPT") {
+        return "123456789\u{b9}\u{b2}\u{b3}".contains(upper.substr(3, 1))
+    }
+    false
+}
+
+/// Whether Windows reserves any component: a device name like `NUL` or
+/// `com1.txt`, a trailing dot or space, or a forbidden character.
+pub fn isreserved(path: str) -> bool {
+    let rest = splitroot(path).2.replace("/", "\\")
+    for name in rest.split("\\") {
+        if reserved_name(name) {
+            return true
+        }
+    }
+    false
+}
+
+fn before_list(a: [str], b: [str]) -> bool {
+    var i = 0
+    while i < a.len() and i < b.len() {
+        if a[i] != b[i] {
+            return a[i] < b[i]
+        }
+        i = i + 1
+    }
+    a.len() < b.len()
+}
+
+fn kept(parts: [str]) -> [str] {
+    var out: [str] = []
+    for c in parts {
+        if c != "" and c != "." {
+            out.push(c)
+        }
+    }
+    out
+}
+
+/// The longest common sub-path, compared without case.
+pub fn commonpath(paths: [str]) -> str ! WinPathError {
+    if paths.len() == 0 {
+        fail(Empty)
+    }
+    var splits: [[str]] = []
+    for p in paths {
+        let (d, r, rest) = splitroot(p.replace("/", "\\").to_lower())
+        let (d0, r0, _) = splitroot(paths[0].replace("/", "\\").to_lower())
+        if d != d0 {
+            fail(DifferentDrives)
+        }
+        if r != r0 {
+            fail(MixedRoots)
+        }
+        splits.push(kept(rest.split("\\")))
+    }
+    let (drive, root, rest) = splitroot(paths[0].replace("/", "\\"))
+    let common = kept(rest.split("\\"))
+    var s1 = splits[0]
+    var s2 = splits[0]
+    for s in splits {
+        if before_list(s, s1) {
+            s1 = s
+        }
+        if before_list(s2, s) {
+            s2 = s
+        }
+    }
+    var n = s1.len()
+    for i in 0..s1.len() {
+        if s1[i] != s2[i] {
+            n = i
+            break
+        }
+    }
+    drive + root + common.slice(0, n.min(common.len())).join("\\")
+}
+
+/// `path` relative to `start`; both must be absolute and on one drive.
+pub fn relpath(path: str, start: str) -> str ! WinPathError {
+    if path == "" {
+        fail(Empty)
+    }
+    if not isabs(path) {
+        fail(NotAbsolute(path))
+    }
+    if not isabs(start) {
+        fail(NotAbsolute(start))
+    }
+    let (sd, _, srest) = splitroot(normpath(start))
+    let (pd, _, prest) = splitroot(normpath(path))
+    if normcase(sd) != normcase(pd) {
+        fail(DifferentDrives)
+    }
+    let sl = if srest == "" { [] } else { srest.split("\\") }
+    let pl = if prest == "" { [] } else { prest.split("\\") }
+    var i = 0
+    while i < sl.len() and i < pl.len() and normcase(sl[i]) == normcase(pl[i]) {
+        i = i + 1
+    }
+    var out: [str] = []
+    for _k in i..sl.len() {
+        out.push("..")
+    }
+    out = out + pl.slice(i, pl.len())
+    if out.len() == 0 { "." } else { out.join("\\") }
+}

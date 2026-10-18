@@ -1,0 +1,131 @@
+// txtar: Go's text archive format, from golang.org/x/tools/txtar.
+//
+// A comment, then files, each introduced by a line `-- name --`. Go's
+// own tests, the `go` command's script tests and many fuzz corpora are
+// txtar files, because a whole tree of small inputs and expected outputs
+// fits in one file a person can read and diff. This reads and writes them
+// exactly as x/tools does: a marker line may end in `\r\n`, a name is
+// trimmed of white space, a line that only looks like a marker (`-- --`)
+// is content, and the comment and every file's data are given a final
+// newline when they lack one.
+
+type TxtarFile = {
+    name: str,
+    data: bytes,
+}
+
+type TxtarArchive = {
+    comment: bytes,
+    files: [TxtarFile],
+}
+
+fn fix_newline(data: bytes) -> bytes {
+    if data.len() == 0 or data.at(data.len() - 1) == 10 {
+        return data
+    }
+    data.concat(bytes_of([10]))
+}
+
+fn starts_with(data: bytes, at: i64, prefix: [i64]) -> bool {
+    if at + prefix.len() > data.len() {
+        return false
+    }
+    for k in 0..prefix.len() {
+        if data.at(at + k) != prefix[k] {
+            return false
+        }
+    }
+    true
+}
+
+/// Go's unicode.IsSpace.
+fn is_space(c: str) -> bool {
+    let v = c.code_at(0)
+    (v >= 9 and v <= 13) or v == 32 or v == 133 or v == 160 or v == 5760 or (v >= 8192 and v <= 8202) or v == 8232 or
+    v == 8233 or v == 8239 or v == 8287 or v == 12288
+}
+
+fn trim_space(s: str) -> str {
+    let cs = s.chars()
+    var a = 0
+    var b = cs.len()
+    while a < b and is_space(cs[a]) {
+        a = a + 1
+    }
+    while b > a and is_space(cs[b - 1]) {
+        b = b - 1
+    }
+    cs.slice(a, b).join("")
+}
+
+/// The marker line at `at`: (name, where its content starts), or "" when
+/// the line is not a marker.
+fn marker(data: bytes, at: i64) -> (str, i64) {
+    if not starts_with(data, at, [45, 45, 32]) {
+        return ("", -1)
+    }
+    var end = data.len()
+    var after = data.len()
+    var nl = at
+    while nl < data.len() and data.at(nl) != 10 {
+        nl = nl + 1
+    }
+    if nl < data.len() {
+        end = nl
+        after = nl + 1
+        if data.at(nl - 1) == 13 {
+            end = nl - 1
+        }
+    }
+    if end - at < 6 or data.at(end - 3) != 32 or data.at(end - 2) != 45 or data.at(end - 1) != 45 {
+        return ("", -1)
+    }
+    (trim_space(data.slice(at + 3, end - 3).to_str()), after)
+}
+
+/// (text before the next marker, its name, where its content starts).
+fn next_marker(data: bytes, from: i64) -> (bytes, str, i64) {
+    var i = from
+    while true {
+        let (name, after) = marker(data, i)
+        if name != "" {
+            return (data.slice(from, i), name, after)
+        }
+        var j = i
+        var found = -1
+        while j + 3 < data.len() {
+            if data.at(j) == 10 and data.at(j + 1) == 45 and data.at(j + 2) == 45 and data.at(j + 3) == 32 {
+                found = j
+                break
+            }
+            j = j + 1
+        }
+        if found < 0 {
+            return (fix_newline(data.slice(from, data.len())), "", data.len())
+        }
+        i = found + 1
+    }
+    (bytes_of([]), "", data.len())
+}
+
+pub fn parse(data: bytes) -> TxtarArchive {
+    let (comment, first, start) = next_marker(data, 0)
+    var name = first
+    var at = start
+    var files: [TxtarFile] = []
+    while name != "" {
+        let (content, next_name, next_at) = next_marker(data, at)
+        files.push(TxtarFile{ name: name, data: content })
+        name = next_name
+        at = next_at
+    }
+    TxtarArchive{ comment: comment, files: files }
+}
+
+pub fn format(a: TxtarArchive) -> bytes {
+    var out = fix_newline(a.comment)
+    for f in a.files {
+        out = out.concat("-- {f.name} --\n".to_bytes()).concat(fix_newline(f.data))
+    }
+    out
+}

@@ -1,0 +1,432 @@
+// Which proxy a request should go through, from HTTP_PROXY, HTTPS_PROXY
+// and NO_PROXY, by the rules of golang.org/x/net/http/httpproxy -- the ones
+// Go's net/http uses, and close to what curl and most tools do.
+//
+// The proxy is chosen by the request's scheme. It is not used for
+// `localhost`, for a loopback address, or for a host NO_PROXY names:
+// NO_PROXY is a comma-separated list of `*` (nothing is proxied), IP
+// addresses and CIDR blocks, and domain names -- `example.com` matches it
+// and its subdomains, `.example.com` and `*.example.com` only the
+// subdomains -- each optionally with `:port`. Under CGI (REQUEST_METHOD
+// set) an HTTP_PROXY value could have come from a client's `Proxy:`
+// header, and is refused (httpoxy, CVE-2016-5385).
+//
+// A proxy written without a scheme gets `http://`. Host names are compared
+// lower-case; a non-ASCII one goes through `idna` (IDNA 2003) where Go
+// uses UTS #46, which agree on ordinary names.
+import idna
+
+type ProxyConfig = {
+    http_proxy: str,
+    https_proxy: str,
+    no_proxy: str,
+    cgi: bool,
+}
+
+type ProxyError =
+    | CgiRefused
+
+/// An address: 16 bytes, an IPv4 one held mapped (::ffff:a.b.c.d).
+type ProxyIp = {
+    octets: [i64],
+    v4: bool,
+}
+
+type ProxyNet = {
+    base: [i64],
+    prefix: i64,
+    v4: bool,
+}
+
+type NoProxyRule =
+    | Everything
+    | Address(ip: ProxyIp, port: str)
+    | Block(net: ProxyNet)
+    | Domain(suffix: str, port: str, whole: bool)
+
+fn digits_only(s: str) -> bool {
+    for c in s.chars() {
+        if c < "0" or c > "9" {
+            return false
+        }
+    }
+    true
+}
+
+fn parse_v4(s: str) -> Option[[i64]] {
+    let parts = s.split(".")
+    if parts.len() != 4 {
+        return None
+    }
+    var out: [i64] = []
+    for p in parts {
+        if p.len() == 0 or p.len() > 3 or not digits_only(p) or (p.len() > 1 and p.substr(0, 1) == "0") {
+            return None
+        }
+        let v = p.parse_int() ?? 256
+        if v > 255 {
+            return None
+        }
+        out.push(v)
+    }
+    Some(out)
+}
+
+fn hex_group(s: str) -> i64 {
+    if s.len() == 0 or s.len() > 4 {
+        return -1
+    }
+    s.parse_int_base(16) ?? -1
+}
+
+fn parse_v6(s: str) -> Option[[i64]] {
+    var text = s
+    var tail4: [i64] = []
+    let last_colon = text.split(":").len()
+    if text.contains(".") {
+        let pieces = text.split(":")
+        match parse_v4(pieces[pieces.len() - 1]) {
+            None -> return None
+            Some(v) -> tail4 = v
+        }
+        text = text.substr(0, text.len() - pieces[pieces.len() - 1].len()) + "0:0"
+    }
+    let halves = text.split("::")
+    if halves.len() > 2 or last_colon < 3 {
+        return None
+    }
+    var groups: [i64] = []
+    var gap = -1
+    for h in 0..halves.len() {
+        if h == 1 {
+            gap = groups.len()
+        }
+        if halves[h].len() == 0 {
+            continue
+        }
+        for g in halves[h].split(":") {
+            let v = hex_group(g)
+            if v < 0 {
+                return None
+            }
+            groups.push(v)
+        }
+    }
+    if (gap == -1 and groups.len() != 8) or (gap >= 0 and groups.len() > 7) {
+        return None
+    }
+    var full: [i64] = []
+    for i in 0..groups.len() {
+        if i == gap {
+            for _z in 0..8 - groups.len() {
+                full.push(0)
+            }
+        }
+        full.push(groups[i])
+    }
+    if gap == groups.len() {
+        for _z in 0..8 - groups.len() {
+            full.push(0)
+        }
+    }
+    var out: [i64] = []
+    for g in full {
+        out.push(g.ushr(8))
+        out.push(g.bit_and(255))
+    }
+    if tail4.len() == 4 {
+        out = out.slice(0, 12) + tail4
+    }
+    Some(out)
+}
+
+/// Go's net.ParseIP: dotted IPv4 without leading zeros, or IPv6.
+fn parse_ip(s: str) -> Option[ProxyIp] {
+    match parse_v4(s) {
+        Some(v) -> return Some(ProxyIp{ octets: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 255, 255] + v, v4: true })
+        None -> {}
+    }
+    if not s.contains(":") {
+        return None
+    }
+    match parse_v6(s) {
+        None -> None
+        Some(o) -> {
+            let mapped = o.slice(0, 12) == [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 255, 255]
+            Some(ProxyIp{ octets: o, v4: mapped })
+        }
+    }
+}
+
+fn parse_cidr(s: str) -> Option[ProxyNet] {
+    let at = s.index_of("/") ?? -1
+    if at < 0 {
+        return None
+    }
+    let bits = s.substr(at + 1, s.len() - at - 1)
+    if bits.len() == 0 or bits.len() > 3 or not digits_only(bits) {
+        return None
+    }
+    let prefix = bits.parse_int() ?? 999
+    let addr = s.substr(0, at)
+    match parse_v4(addr) {
+        Some(v) -> return if prefix > 32 { None } else { Some(ProxyNet{ base: v, prefix: prefix, v4: true }) }
+        None -> {}
+    }
+    if not addr.contains(":") {
+        return None
+    }
+    match parse_v6(addr) {
+        None -> None
+        Some(o) -> {
+            if prefix > 128 {
+                return None
+            }
+            // Go's IPNet.Contains reads a block whose base is IPv4-mapped as
+            // the IPv4 block under the last 32 bits of its mask.
+            if o.slice(0, 12) == [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 255, 255] {
+                return Some(ProxyNet{ base: o.slice(12, 16), prefix: (prefix - 96).max(0), v4: true })
+            }
+            Some(ProxyNet{ base: o, prefix: prefix, v4: false })
+        }
+    }
+}
+
+fn in_net(n: ProxyNet, ip: ProxyIp) -> bool {
+    if n.v4 != ip.v4 {
+        return false
+    }
+    let bytes = if ip.v4 { ip.octets.slice(12, 16) } else { ip.octets }
+    for i in 0..bytes.len() {
+        let keep = (n.prefix - 8 * i).max(0).min(8)
+        let mask = 255 - (1.shl(8 - keep) - 1)
+        if bytes[i].bit_and(mask) != n.base[i].bit_and(mask) {
+            return false
+        }
+    }
+    true
+}
+
+/// Go's net.SplitHostPort: (host, port), or None.
+fn split_host_port(s: str) -> Option[(str, str)] {
+    var i = -1
+    for k in 0..s.len() {
+        if s.substr(k, 1) == ":" {
+            i = k
+        }
+    }
+    if i < 0 {
+        return None
+    }
+    var host = ""
+    var j = 0
+    var k = 0
+    if s.substr(0, 1) == "[" {
+        let end = s.index_of("]") ?? -1
+        if end < 0 or end + 1 != i {
+            return None
+        }
+        host = s.substr(1, end - 1)
+        j = 1
+        k = end + 1
+    } else {
+        host = s.substr(0, i)
+        if host.contains(":") {
+            return None
+        }
+    }
+    if s.substr(j, s.len() - j).contains("[") or s.substr(k, s.len() - k).contains("]") {
+        return None
+    }
+    Some((host, s.substr(i + 1, s.len() - i - 1)))
+}
+
+fn ascii_name(s: str) -> str {
+    for c in s.chars() {
+        if c.code_at(0) > 127 {
+            return match idna.encode_domain(s) {
+                Ok(v) -> v
+                Err(_) -> s
+            }
+        }
+    }
+    s
+}
+
+fn rule_of(entry: str) -> Option[NoProxyRule] {
+    let p = entry.trim().to_lower()
+    if p.len() == 0 {
+        return None
+    }
+    if p == "*" {
+        return Some(Everything)
+    }
+    match parse_cidr(p) {
+        Some(n) -> return Some(Block(n))
+        None -> {}
+    }
+    var host = p
+    var port = ""
+    match split_host_port(p) {
+        Some((h, pt)) -> {
+            if h.len() == 0 {
+                return None
+            }
+            host = if h.starts_with("[") and h.ends_with("]") { h.substr(1, h.len() - 2) } else { h }
+            port = pt
+        }
+        None -> {}
+    }
+    match parse_ip(host) {
+        Some(ip) -> return Some(Address(ip, port))
+        None -> {}
+    }
+    if host.starts_with("*.") {
+        host = host.substr(1, host.len() - 1)
+    }
+    var whole = false
+    if not host.starts_with(".") {
+        whole = true
+        host = "." + host
+    }
+    Some(Domain(ascii_name(host), port, whole))
+}
+
+/// The NO_PROXY rules in order; `*` replaces every other.
+pub fn no_proxy_rules(no_proxy: str) -> [NoProxyRule] {
+    var out: [NoProxyRule] = []
+    for entry in no_proxy.split(",") {
+        match rule_of(entry) {
+            None -> {}
+            Some(Everything) -> return [Everything]
+            Some(r) -> out.push(r)
+        }
+    }
+    out
+}
+
+fn same_ip(a: ProxyIp, b: ProxyIp) -> bool {
+    a.octets == b.octets
+}
+
+fn is_loopback(ip: ProxyIp) -> bool {
+    if ip.v4 {
+        return ip.octets[12] == 127
+    }
+    ip.octets == [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]
+}
+
+/// Whether a request to host:port should go through the proxy.
+pub fn use_proxy(no_proxy: str, host: str, port: str) -> bool {
+    if host == "localhost" {
+        return false
+    }
+    let ip = parse_ip(host)
+    match ip {
+        Some(a) -> if is_loopback(a) {
+            return false
+        }
+        None -> {}
+    }
+    let name = host.trim().to_lower()
+    for rule in no_proxy_rules(no_proxy) {
+        let hit = match rule {
+            Everything -> true
+            Address(a, p) -> match ip {
+                Some(b) -> same_ip(a, b) and (p == "" or p == port)
+                None -> false
+            }
+            Block(n) -> match ip {
+                Some(b) -> in_net(n, b)
+                None -> false
+            }
+            Domain(suffix, p, whole) -> ip == None and (name.ends_with(suffix) or (whole and name == suffix.substr(1, suffix.len() - 1))) and
+            (p == "" or p == port)
+        }
+        if hit {
+            return false
+        }
+    }
+    true
+}
+
+/// A proxy setting as a URL: given `http://` when it has no scheme.
+pub fn proxy_url(setting: str) -> Option[str] {
+    if setting == "" {
+        return None
+    }
+    let at = setting.index_of("://") ?? -1
+    if at > 0 {
+        let scheme = setting.substr(0, at).to_lower()
+        let rest = setting.substr(at + 3, setting.len() - at - 3)
+        if rest.len() > 0 and not rest.starts_with("/") {
+            return Some(scheme + "://" + rest)
+        }
+    }
+    Some("http://" + setting)
+}
+
+/// (scheme, host, port) of a request URL, the port defaulted by scheme.
+fn request_parts(url: str) -> (str, str, str) {
+    let at = url.index_of("://") ?? -1
+    if at < 0 {
+        return ("", "", "")
+    }
+    let scheme = url.substr(0, at).to_lower()
+    var rest = url.substr(at + 3, url.len() - at - 3)
+    for stop in ["/", "?", "#"] {
+        let k = rest.index_of(stop) ?? -1
+        if k >= 0 {
+            rest = rest.substr(0, k)
+        }
+    }
+    var authority = rest
+    var k = authority.len() - 1
+    while k >= 0 {
+        if authority.substr(k, 1) == "@" {
+            authority = authority.substr(k + 1, authority.len() - k - 1)
+            break
+        }
+        k = k - 1
+    }
+    var host = authority
+    var port = ""
+    var colon = -1
+    for i in 0..host.len() {
+        if host.substr(i, 1) == ":" {
+            colon = i
+        }
+    }
+    if colon >= 0 and digits_only(host.substr(colon + 1, host.len() - colon - 1)) {
+        port = host.substr(colon + 1, host.len() - colon - 1)
+        host = host.substr(0, colon)
+    }
+    if host.starts_with("[") and host.ends_with("]") {
+        host = host.substr(1, host.len() - 2)
+    }
+    if port == "" {
+        port = if scheme == "https" { "443" } else if scheme == "http" { "80" } else if scheme == "socks5" { "1080" } else { "" }
+    }
+    (scheme, ascii_name(host), port)
+}
+
+/// The proxy for `request_url`, or `None` to connect directly.
+pub fn proxy_for(cfg: ProxyConfig, request_url: str) -> Option[str] ! ProxyError {
+    let (scheme, host, port) = request_parts(request_url)
+    var proxy: Option[str] = None
+    if scheme == "https" {
+        proxy = proxy_url(cfg.https_proxy)
+    } else if scheme == "http" {
+        proxy = proxy_url(cfg.http_proxy)
+        if proxy != None and cfg.cgi {
+            fail(CgiRefused)
+        }
+    }
+    if proxy == None {
+        return None
+    }
+    if not use_proxy(cfg.no_proxy, host, port) {
+        return None
+    }
+    proxy
+}

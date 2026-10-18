@@ -1,0 +1,5 @@
+[package]
+name = "txtar"
+version = "1.0.0"
+
+capabilities = []

@@ -1,0 +1,5 @@
+[package]
+name = "winpath"
+version = "1.0.0"
+
+capabilities = []

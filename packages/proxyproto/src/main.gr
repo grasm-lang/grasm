@@ -1,0 +1,394 @@
+// The PROXY protocol (HAProxy, versions 1 and 2): the header a load
+// balancer puts in front of a connection so the server behind it learns
+// the client's real address.
+//
+// HAProxy, Envoy, NGINX, AWS's Network Load Balancer, Cloudflare Spectrum
+// and most TCP proxies send it. Version 1 is a text line,
+// `PROXY TCP4 192.0.2.1 198.51.100.2 56324 443\r\n`. Version 2 is binary:
+// a twelve-byte signature, a version-and-command byte (LOCAL or PROXY), an
+// address-family-and-transport byte, a length, the addresses and ports
+// (IPv4, IPv6, or two 108-byte UNIX paths), then type-length-value
+// extensions -- ALPN, the TLS SNI, a CRC32C, a connection ID.
+//
+// Reading follows pires/go-proxyproto, which it is checked against: what
+// it accepts and refuses, and where the header ends -- `read` returns how
+// many bytes it used, and the connection's own data starts there.
+
+type ProxyHeader = {
+    version: i64,
+    /// 0x20 LOCAL or 0x21 PROXY (in version 1, PROXY unless UNKNOWN).
+    command: i64,
+    /// 0x00 unspecified, 0x11 TCP4, 0x12 UDP4, 0x21 TCP6, 0x22 UDP6,
+    /// 0x31 UNIX stream, 0x32 UNIX datagram.
+    transport: i64,
+    source: bytes,
+    destination: bytes,
+    source_port: i64,
+    destination_port: i64,
+    source_path: str,
+    destination_path: str,
+    tlvs: bytes,
+}
+
+type ProxyTlv = {
+    kind: i64,
+    value: bytes,
+}
+
+type ProxyProtoError =
+    | NoProxyProtocol
+    | TooLong
+    | Malformed
+
+fn sig_v2() -> [i64] {
+    [13, 10, 13, 10, 0, 13, 10, 81, 85, 73, 84, 10]
+}
+
+fn empty_header(version: i64, command: i64, transport: i64) -> ProxyHeader {
+    ProxyHeader{ version: version, command: command, transport: transport, source: bytes_of([]),
+        destination: bytes_of([]), source_port: 0, destination_port: 0, source_path: "", destination_path: "",
+        tlvs: bytes_of([]) }
+}
+
+fn has_prefix(data: bytes, prefix: [i64]) -> bool {
+    if data.len() < prefix.len() {
+        return false
+    }
+    for k in 0..prefix.len() {
+        if data.at(k) != prefix[k] {
+            return false
+        }
+    }
+    true
+}
+
+/// (header, bytes it took) from the start of a connection.
+pub fn read(data: bytes) -> (ProxyHeader, i64) ! ProxyProtoError {
+    if has_prefix(data, [80, 82, 79, 88, 89]) {
+        return try read_v1(data)
+    }
+    if has_prefix(data, sig_v2()) {
+        return try read_v2(data)
+    }
+    fail(NoProxyProtocol)
+}
+
+fn port_v1(s: str) -> i64 {
+    if s.len() == 0 or s.len() > 5 or (s.len() > 1 and s.substr(0, 1) == "0") {
+        return -1
+    }
+    for c in s.chars() {
+        if c < "0" or c > "9" {
+            return -1
+        }
+    }
+    let v = s.parse_int() ?? -1
+    if v > 65535 { -1 } else { v }
+}
+
+fn read_v1(data: bytes) -> (ProxyHeader, i64) ! ProxyProtoError {
+    var end = -1
+    for k in 0..data.len().min(107) {
+        if data.at(k) == 10 {
+            end = k
+            break
+        }
+    }
+    if end < 0 {
+        if data.len() >= 107 {
+            fail(TooLong)
+        }
+        fail(Malformed)
+    }
+    if end < 1 or data.at(end - 1) != 13 {
+        fail(Malformed)
+    }
+    let tokens = data.slice(0, end - 1).to_str().split(" ")
+    if tokens[0] != "PROXY" or tokens.len() < 2 {
+        fail(Malformed)
+    }
+    let family = tokens[1]
+    if family == "UNKNOWN" {
+        return (empty_header(1, 32, 0), end + 1)
+    }
+    if (family != "TCP4" and family != "TCP6") or tokens.len() != 6 {
+        fail(Malformed)
+    }
+    let v4 = family == "TCP4"
+    let src = try address_v1(tokens[2], v4)
+    let dst = try address_v1(tokens[3], v4)
+    let sp = port_v1(tokens[4])
+    let dp = port_v1(tokens[5])
+    if sp < 0 or dp < 0 {
+        fail(Malformed)
+    }
+    var h = empty_header(1, 33, if v4 { 17 } else { 33 })
+    h.source = src
+    h.destination = dst
+    h.source_port = sp
+    h.destination_port = dp
+    (h, end + 1)
+}
+
+fn v4_bytes(s: str) -> Option[[i64]] {
+    let parts = s.split(".")
+    if parts.len() != 4 {
+        return None
+    }
+    var out: [i64] = []
+    for p in parts {
+        if p.len() == 0 or p.len() > 3 or (p.len() > 1 and p.substr(0, 1) == "0") {
+            return None
+        }
+        for c in p.chars() {
+            if c < "0" or c > "9" {
+                return None
+            }
+        }
+        let v = p.parse_int() ?? 256
+        if v > 255 {
+            return None
+        }
+        out.push(v)
+    }
+    Some(out)
+}
+
+fn v6_bytes(s: str) -> Option[[i64]] {
+    var text = s
+    var tail: [i64] = []
+    if text.contains(".") {
+        let pieces = text.split(":")
+        match v4_bytes(pieces[pieces.len() - 1]) {
+            None -> return None
+            Some(v) -> tail = v
+        }
+        text = text.substr(0, text.len() - pieces[pieces.len() - 1].len()) + "0:0"
+    }
+    let halves = text.split("::")
+    if halves.len() > 2 or text.split(":").len() < 3 {
+        return None
+    }
+    var groups: [i64] = []
+    var gap = -1
+    for h in 0..halves.len() {
+        if h == 1 {
+            gap = groups.len()
+        }
+        if halves[h].len() == 0 {
+            continue
+        }
+        for g in halves[h].split(":") {
+            if g.len() == 0 or g.len() > 4 {
+                return None
+            }
+            match g.parse_int_base(16) {
+                None -> return None
+                Some(v) -> groups.push(v)
+            }
+        }
+    }
+    if (gap == -1 and groups.len() != 8) or (gap >= 0 and groups.len() > 7) {
+        return None
+    }
+    var full: [i64] = []
+    for i in 0..groups.len() + 1 {
+        if i == gap {
+            for _z in 0..8 - groups.len() {
+                full.push(0)
+            }
+        }
+        if i < groups.len() {
+            full.push(groups[i])
+        }
+    }
+    var out: [i64] = []
+    for g in full {
+        out.push(g.ushr(8))
+        out.push(g.bit_and(255))
+    }
+    if tail.len() == 4 {
+        out = out.slice(0, 12) + tail
+    }
+    Some(out)
+}
+
+fn address_v1(s: str, v4: bool) -> bytes ! ProxyProtoError {
+    if v4 {
+        return match v4_bytes(s) {
+            Some(v) -> bytes_of(v)
+            None -> fail(Malformed)
+        }
+    }
+    if s.contains("%") {
+        fail(Malformed)
+    }
+    match v6_bytes(s) {
+        Some(v) -> bytes_of(v)
+        None -> fail(Malformed)
+    }
+}
+
+fn u16(b: bytes, at: i64) -> i64 {
+    b.at(at) * 256 + b.at(at + 1)
+}
+
+fn unix_name(b: bytes) -> str {
+    var n = 0
+    while n < b.len() and b.at(n) != 0 {
+        n = n + 1
+    }
+    b.slice(0, n).to_str()
+}
+
+fn read_v2(data: bytes) -> (ProxyHeader, i64) ! ProxyProtoError {
+    if data.len() < 16 {
+        fail(Malformed)
+    }
+    let command = data.at(12)
+    let transport = data.at(13)
+    if command != 32 and command != 33 {
+        fail(Malformed)
+    }
+    if not [0, 17, 18, 33, 34, 49, 50].contains(transport) or (transport == 0 and command != 32) {
+        fail(Malformed)
+    }
+    let length = u16(data, 14)
+    let need = if transport == 0 { 0 } else if transport < 32 { 12 } else if transport < 48 { 36 } else { 216 }
+    if length > 4096 or 16 + length > data.len() {
+        fail(Malformed)
+    }
+    if length < need {
+        if command != 32 {
+            fail(Malformed)
+        }
+        return (empty_header(2, command, 0), 16 + length)
+    }
+    var h = empty_header(2, command, transport)
+    let body = data.slice(16, 16 + length)
+    if transport == 17 or transport == 18 {
+        h.source = body.slice(0, 4)
+        h.destination = body.slice(4, 8)
+        h.source_port = u16(body, 8)
+        h.destination_port = u16(body, 10)
+    } else if transport == 33 or transport == 34 {
+        h.source = body.slice(0, 16)
+        h.destination = body.slice(16, 32)
+        h.source_port = u16(body, 32)
+        h.destination_port = u16(body, 34)
+    } else if transport == 49 or transport == 50 {
+        h.source_path = unix_name(body.slice(0, 108))
+        h.destination_path = unix_name(body.slice(108, 216))
+    }
+    h.tlvs = body.slice(need, length)
+    (h, 16 + length)
+}
+
+/// The extensions after the addresses; NOOP (0x04) keeps no value.
+pub fn tlvs(h: ProxyHeader) -> [ProxyTlv] ! ProxyProtoError {
+    var out: [ProxyTlv] = []
+    let raw = h.tlvs
+    var i = 0
+    while i < raw.len() {
+        if raw.len() - i <= 2 {
+            fail(Malformed)
+        }
+        let n = u16(raw, i + 1)
+        if i + 3 + n > raw.len() {
+            fail(Malformed)
+        }
+        let value = if raw.at(i) == 4 { bytes_of([]) } else { raw.slice(i + 3, i + 3 + n) }
+        out.push(ProxyTlv{ kind: raw.at(i), value: value })
+        i = i + 3 + n
+    }
+    out
+}
+
+fn be16(v: i64) -> bytes {
+    bytes_of([v.ushr(8).bit_and(255), v.bit_and(255)])
+}
+
+fn path_bytes(p: str) -> bytes {
+    let b = p.to_bytes()
+    let n = b.len().min(108)
+    b.slice(0, n).concat(bytes_filled(108 - n, 0))
+}
+
+/// The header in its own version's form.
+pub fn format(h: ProxyHeader) -> bytes {
+    if h.version == 1 {
+        if h.transport != 17 and h.transport != 33 {
+            return "PROXY UNKNOWN\r\n".to_bytes()
+        }
+        let family = if h.transport == 17 { "TCP4" } else { "TCP6" }
+        return "PROXY {family} {render_ip(h.source)} {render_ip(h.destination)} {h.source_port} {h.destination_port}\r\n"
+            .to_bytes()
+    }
+    var body = bytes_of([])
+    if h.transport == 17 or h.transport == 18 or h.transport == 33 or h.transport == 34 {
+        body = h.source.concat(h.destination).concat(be16(h.source_port)).concat(be16(h.destination_port))
+    } else if h.transport == 49 or h.transport == 50 {
+        body = path_bytes(h.source_path).concat(path_bytes(h.destination_path))
+    }
+    body = body.concat(h.tlvs)
+    bytes_of(sig_v2() + [h.command, h.transport]).concat(be16(body.len())).concat(body)
+}
+
+fn hex_group(v: i64) -> str {
+    let digits = "0123456789abcdef"
+    if v == 0 {
+        return "0"
+    }
+    var out = ""
+    var n = v
+    while n > 0 {
+        out = digits.substr(n % 16, 1) + out
+        n = n / 16
+    }
+    out
+}
+
+/// An address the way Go's netip prints it: dotted IPv4, or RFC 5952
+/// IPv6 -- lower case, the longest run of two or more zero groups as
+/// `::`, and a mapped IPv4 address as `::ffff:a.b.c.d`.
+pub fn render_ip(b: bytes) -> str {
+    if b.len() == 4 {
+        return "{b.at(0)}.{b.at(1)}.{b.at(2)}.{b.at(3)}"
+    }
+    var mapped = true
+    for k in 0..10 {
+        if b.at(k) != 0 {
+            mapped = false
+        }
+    }
+    if mapped and b.at(10) == 255 and b.at(11) == 255 {
+        return "::ffff:{b.at(12)}.{b.at(13)}.{b.at(14)}.{b.at(15)}"
+    }
+    var groups: [i64] = []
+    for k in 0..8 {
+        groups.push(u16(b, 2 * k))
+    }
+    var best = -1
+    var best_len = 1
+    var k = 0
+    while k < 8 {
+        if groups[k] == 0 {
+            var e = k
+            while e < 8 and groups[e] == 0 {
+                e = e + 1
+            }
+            if e - k > best_len {
+                best = k
+                best_len = e - k
+            }
+            k = e
+        } else {
+            k = k + 1
+        }
+    }
+    let hexes = groups.map(|g| hex_group(g))
+    if best < 0 {
+        return hexes.join(":")
+    }
+    hexes.slice(0, best).join(":") + "::" + hexes.slice(best + best_len, 8).join(":")
+}

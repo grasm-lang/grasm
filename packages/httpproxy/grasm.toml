@@ -1,0 +1,9 @@
+[package]
+name = "httpproxy"
+version = "1.0.0"
+
+capabilities = []
+
+[dependencies.idna]
+path = "../idna"
+version = "^1.0.0"

@@ -1,0 +1,28 @@
+[package]
+name = "b28_demo"
+version = "1.0.0"
+capabilities = ["io"]
+
+[dependencies.winpath]
+path = "../winpath"
+version = "^1.0.0"
+
+[dependencies.txtar]
+path = "../txtar"
+version = "^1.0.0"
+
+[dependencies.httpproxy]
+path = "../httpproxy"
+version = "^1.0.0"
+
+[dependencies.bpf]
+path = "../bpf"
+version = "^1.0.0"
+
+[dependencies.proxyproto]
+path = "../proxyproto"
+version = "^1.0.0"
+
+[dependencies.maptile]
+path = "../maptile"
+version = "^1.0.0"

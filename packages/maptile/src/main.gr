@@ -1,0 +1,186 @@
+// Web map tiles: the z/x/y grid every slippy map (OpenStreetMap, Google,
+// Mapbox, Leaflet, MapLibre) cuts the world into, and Bing's quadkeys.
+//
+// At zoom z the Web Mercator square is 2^z tiles a side, x growing east
+// from the antimeridian and y growing south from about 85.0511 degrees
+// north. The arithmetic is paulmach/orb's maptile, which this is checked
+// against: a point to its tile (latitudes past the square clamp to its
+// edge rows), a tile to its bounds and centre, parents, children and
+// shared ancestors, the range of tiles under a tile at a deeper zoom, and
+// orb's interleaved quadkey number. Bing's quadkey string spells the same
+// interleaving as one base-4 digit per zoom level, most significant first.
+// Longitudes of 180 and beyond clamp to the last column, where orb would
+// return a tile that does not exist.
+
+type MapTile = {
+    x: i64,
+    y: i64,
+    z: i64,
+}
+
+type TileBounds = {
+    west: f64,
+    south: f64,
+    east: f64,
+    north: f64,
+}
+
+type MapTileError =
+    | BadQuadkey(key: str)
+
+fn side(z: i64) -> f64 {
+    1.shl(z).as_f64()
+}
+
+/// The fractional tile coordinates of a point at zoom z.
+pub fn fraction(lon: f64, lat: f64, z: i64) -> (f64, f64) {
+    let n = side(z)
+    let x = (lon / 360.0 + 0.5) * n
+    if lat < -85.0511 {
+        return (x, n - 1.0)
+    }
+    if lat > 85.0511 {
+        return (x, 0.0)
+    }
+    let s = (lat * pi() / 180.0).sin()
+    (x, (0.5 + 0.5 * ((1.0 + s) / (1.0 - s)).ln() / (-2.0 * pi())) * n)
+}
+
+pub fn tile_at(lon: f64, lat: f64, z: i64) -> MapTile {
+    let (fx, fy) = fraction(lon, lat, z)
+    let last = 1.shl(z) - 1
+    MapTile{ x: fx.as_i64().max(0).min(last), y: fy.as_i64().max(0).min(last), z: z }
+}
+
+fn to_geo(x: f64, y: f64, z: i64) -> (f64, f64) {
+    let n = side(z)
+    let lon = 360.0 * (x / n - 0.5)
+    let lat = 2.0 * (pi() - 2.0 * pi() * (y / n)).exp().atan() * (180.0 / pi()) + 0.0 - 90.0
+    (lon, lat)
+}
+
+pub fn bounds(t: MapTile) -> TileBounds {
+    let (west, north) = to_geo(t.x.as_f64(), t.y.as_f64(), t.z)
+    let (east, south) = to_geo(t.x.as_f64() + 1.0, (t.y.as_f64() + 1.0).min(side(t.z)), t.z)
+    TileBounds{ west: west, south: south, east: east, north: north }
+}
+
+/// The middle of the tile's bounds, (longitude, latitude).
+pub fn center(t: MapTile) -> (f64, f64) {
+    let b = bounds(t)
+    ((b.west + b.east) / 2.0, (b.south + b.north) / 2.0)
+}
+
+pub fn valid(t: MapTile) -> bool {
+    t.z >= 0 and t.z <= 31 and t.x >= 0 and t.y >= 0 and t.x < 1.shl(t.z) and t.y < 1.shl(t.z)
+}
+
+pub fn parent(t: MapTile) -> MapTile {
+    if t.z == 0 { t } else { MapTile{ x: t.x.ushr(1), y: t.y.ushr(1), z: t.z - 1 } }
+}
+
+/// The four children, in orb's order: top-left, top-right, bottom-right,
+/// bottom-left.
+pub fn children(t: MapTile) -> [MapTile] {
+    let x = 2 * t.x
+    let y = 2 * t.y
+    let z = t.z + 1
+    [MapTile{ x: x, y: y, z: z }, MapTile{ x: x + 1, y: y, z: z }, MapTile{ x: x + 1, y: y + 1, z: z },
+        MapTile{ x: x, y: y + 1, z: z }]
+}
+
+/// The tile above or below `t` at zoom z.
+pub fn at_zoom(t: MapTile, z: i64) -> MapTile {
+    if z > t.z {
+        return MapTile{ x: t.x.shl(z - t.z), y: t.y.shl(z - t.z), z: z }
+    }
+    MapTile{ x: t.x.ushr(t.z - z), y: t.y.ushr(t.z - z), z: z }
+}
+
+/// Whether `inner` is `outer` or lies inside it.
+pub fn contains(outer: MapTile, inner: MapTile) -> bool {
+    inner.z >= outer.z and at_zoom(inner, outer.z) == outer
+}
+
+fn bit_length(v: i64) -> i64 {
+    var n = 0
+    while v.ushr(n) > 0 {
+        n = n + 1
+    }
+    n
+}
+
+/// The smallest tile containing both.
+pub fn shared_parent(a: MapTile, b: MapTile) -> MapTile {
+    var p = a
+    var q = b
+    if p.z < q.z {
+        q = at_zoom(q, p.z)
+    } else if p.z > q.z {
+        p = at_zoom(p, q.z)
+    }
+    if p == q {
+        return p
+    }
+    let up = bit_length(p.x.bit_xor(q.x)).max(bit_length(p.y.bit_xor(q.y)))
+    MapTile{ x: p.x.ushr(up), y: p.y.ushr(up), z: p.z - up }
+}
+
+/// The first and last tile under `t` at zoom z (both `t` brought up to z
+/// when z is shallower).
+pub fn range(t: MapTile, z: i64) -> (MapTile, MapTile) {
+    if z < t.z {
+        let up = at_zoom(t, z)
+        return (up, up)
+    }
+    let d = z - t.z
+    (MapTile{ x: t.x.shl(d), y: t.y.shl(d), z: z }, MapTile{ x: (t.x + 1).shl(d) - 1, y: (t.y + 1).shl(d) - 1, z: z })
+}
+
+/// orb's quadkey: bit i of x at bit 2i, bit i of y at bit 2i + 1.
+pub fn quadkey_number(t: MapTile) -> i64 {
+    var out = 0
+    for i in 0..t.z {
+        out = out.bit_or(t.x.ushr(i).bit_and(1).shl(2 * i)).bit_or(t.y.ushr(i).bit_and(1).shl(2 * i + 1))
+    }
+    out
+}
+
+pub fn from_quadkey_number(k: i64, z: i64) -> MapTile {
+    var x = 0
+    var y = 0
+    for i in 0..z {
+        x = x.bit_or(k.ushr(2 * i).bit_and(1).shl(i))
+        y = y.bit_or(k.ushr(2 * i + 1).bit_and(1).shl(i))
+    }
+    MapTile{ x: x, y: y, z: z }
+}
+
+/// Bing's quadkey: one digit 0-3 per level, coarsest first.
+pub fn quadkey(t: MapTile) -> str {
+    var out = ""
+    var i = t.z
+    while i > 0 {
+        let d = t.x.ushr(i - 1).bit_and(1) + 2 * t.y.ushr(i - 1).bit_and(1)
+        out = out + "{d}"
+        i = i - 1
+    }
+    out
+}
+
+pub fn from_quadkey(key: str) -> MapTile ! MapTileError {
+    var x = 0
+    var y = 0
+    for c in key.chars() {
+        if c < "0" or c > "3" {
+            fail(BadQuadkey(key))
+        }
+        let d = c.code_at(0) - 48
+        x = x * 2 + d.bit_and(1)
+        y = y * 2 + d.ushr(1)
+    }
+    if key.len() > 31 {
+        fail(BadQuadkey(key))
+    }
+    MapTile{ x: x, y: y, z: key.len() }
+}
