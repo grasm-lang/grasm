@@ -1,0 +1,4 @@
+[package]
+name = "basetable"
+version = "1.0.0"
+capabilities = []

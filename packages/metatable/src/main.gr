@@ -1,0 +1,67 @@
+// The `meta` and `ltag` tables: what a font says about itself.
+//
+// `meta` maps four-letter tags to data: `dlng` (the scripts and languages
+// the font is designed for) and `slng` (the ones it supports) are
+// comma-separated lists of BCP 47 tags in UTF-8; other tags hold whatever
+// their owner defines. `ltag` is AAT's table of language tags, which the
+// `name` table's Unicode-platform records refer to by index.
+//
+// `parse_meta` and `parse_ltag` read them.
+
+type MetaEntry = { tag: str, data: bytes }
+
+type MetaError =
+    | MetaMalformed(why: str)
+
+fn uint(d: bytes, at: i64, n: i64) -> i64 ! MetaError {
+    if at < 0 or at + n > d.len() {
+        fail(MetaMalformed("a read past the end at {at}"))
+    }
+    var v = 0
+    for k in 0..n {
+        v = v.shl(8).bit_or(d.at(at + k))
+    }
+    return v
+}
+
+fn sint(d: bytes, at: i64, n: i64) -> i64 ! MetaError {
+    let v = try uint(d, at, n)
+    let top = 1.shl(8 * n - 1)
+    return if v >= top { v - 2 * top } else { v }
+}
+
+/// The data maps of a `meta` table, in table order.
+pub fn parse_meta(d: bytes) -> [MetaEntry] ! MetaError {
+    let n = try uint(d, 12, 4)
+    var out: [MetaEntry] = []
+    for i in 0..n {
+        let r = 16 + 12 * i
+        let off = try uint(d, r + 4, 4)
+        let len = try uint(d, r + 8, 4)
+        if off + len > d.len() {
+            fail(MetaMalformed("a data map past the end"))
+        }
+        out.push(MetaEntry{ tag: d.slice(r, r + 4).to_str(), data: d.slice(off, off + len) })
+    }
+    return out
+}
+
+/// The language tags of an `ltag` table, by index.
+pub fn parse_ltag(d: bytes) -> [str] ! MetaError {
+    let n = try uint(d, 8, 4)
+    var out: [str] = []
+    for i in 0..n {
+        let off = try uint(d, 12 + 4 * i, 2)
+        let len = try uint(d, 14 + 4 * i, 2)
+        if off + len > d.len() {
+            fail(MetaMalformed("a language tag past the end"))
+        }
+        out.push(d.slice(off, off + len).to_str())
+    }
+    return out
+}
+
+/// `dlng` or `slng` as its list of tags, trimmed.
+pub fn languages(e: MetaEntry) -> [str] {
+    return e.data.to_str().split(",").map(|s| s.trim()).filter(|s| s.len() > 0)
+}

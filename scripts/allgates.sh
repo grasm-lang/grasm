@@ -145,6 +145,7 @@ run_gate b40diff       scripts/b40_diff.sh
 run_gate b41diff       scripts/b41_diff.sh
 run_gate b42diff       scripts/b42_diff.sh
 run_gate b43diff       scripts/b43_diff.sh
+run_gate b44diff       scripts/b44_diff.sh
 run_gate grasmwire     scripts/grasmwire_e2e.sh
 run_gate cryptodiff    scripts/crypto_diff.sh
 run_gate certdiff      scripts/cert_diff.sh

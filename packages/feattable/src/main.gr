@@ -1,0 +1,56 @@
+// The AAT `feat` table: the font features a user can choose (ligatures,
+// letter case, number spacing...), each with its settings, as Apple's
+// font panel lists them.
+//
+// Each feature has a type, a count of settings and where they are,
+// flags (bit 15: settings are exclusive, one at a time; bit 14: the low
+// byte is the index of the default setting) and a `name` ID; each setting
+// is a value and a `name` ID.
+//
+// `parse` reads the table; `describe` writes lines for comparison.
+
+type FeatSetting = { value: i64, name_id: i64 }
+
+type FeatFeature = { kind: i64, flags: i64, name_id: i64, settings: [FeatSetting] }
+
+type FeatError =
+    | FeatMalformed(why: str)
+
+fn uint(d: bytes, at: i64, n: i64) -> i64 ! FeatError {
+    if at < 0 or at + n > d.len() {
+        fail(FeatMalformed("a read past the end at {at}"))
+    }
+    var v = 0
+    for k in 0..n {
+        v = v.shl(8).bit_or(d.at(at + k))
+    }
+    return v
+}
+
+fn sint(d: bytes, at: i64, n: i64) -> i64 ! FeatError {
+    let v = try uint(d, at, n)
+    let top = 1.shl(8 * n - 1)
+    return if v >= top { v - 2 * top } else { v }
+}
+
+/// Reads a `feat` table.
+pub fn parse(d: bytes) -> [FeatFeature] ! FeatError {
+    let n = try uint(d, 4, 2)
+    var out: [FeatFeature] = []
+    for i in 0..n {
+        let r = 12 + 12 * i
+        let count = try uint(d, r + 2, 2)
+        let at = try uint(d, r + 4, 4)
+        var settings: [FeatSetting] = []
+        for k in 0..count {
+            settings.push(FeatSetting{ value: try uint(d, at + 4 * k, 2), name_id: try sint(d, at + 4 * k + 2, 2) })
+        }
+        out.push(FeatFeature{ kind: try uint(d, r, 2), flags: try uint(d, r + 8, 2), name_id: try sint(d, r + 10, 2), settings: settings })
+    }
+    return out
+}
+
+/// The table as lines.
+pub fn describe(fs: [FeatFeature]) -> [str] {
+    return fs.map(|f| "feature {f.kind} {f.flags} {f.name_id} " + f.settings.map(|s| "{s.value}:{s.name_id}").join(","))
+}

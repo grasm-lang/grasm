@@ -1,0 +1,4 @@
+[package]
+name = "gpos"
+version = "1.0.0"
+capabilities = []

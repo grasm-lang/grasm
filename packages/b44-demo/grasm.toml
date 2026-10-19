@@ -1,0 +1,44 @@
+[package]
+name = "b44_demo"
+version = "1.0.0"
+capabilities = ["io"]
+
+[dependencies.cff]
+path = "../cff"
+version = "^1.0.0"
+
+[dependencies.gpos]
+path = "../gpos"
+version = "^1.0.0"
+
+[dependencies.gdef]
+path = "../gdef"
+version = "^1.0.0"
+
+[dependencies.varstore]
+path = "../varstore"
+version = "^1.0.0"
+
+[dependencies.gvar]
+path = "../gvar"
+version = "^1.0.0"
+
+[dependencies.traktable]
+path = "../traktable"
+version = "^1.0.0"
+
+[dependencies.feattable]
+path = "../feattable"
+version = "^1.0.0"
+
+[dependencies.metatable]
+path = "../metatable"
+version = "^1.0.0"
+
+[dependencies.vertmetrics]
+path = "../vertmetrics"
+version = "^1.0.0"
+
+[dependencies.basetable]
+path = "../basetable"
+version = "^1.0.0"

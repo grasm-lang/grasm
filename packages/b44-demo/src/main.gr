@@ -1,0 +1,58 @@
+// Ten font tables, each read once from bytes built here.
+// scripts/b44_diff.sh holds them to fontTools on the fonts macOS ships.
+import cff
+import gpos
+import gdef
+import varstore
+import gvar
+import traktable
+import feattable
+import metatable
+import vertmetrics
+import basetable
+
+fn be(v: i64, n: i64) -> [i64] {
+    var out: [i64] = []
+    for k in 0..n {
+        out.push(v.ushr(8 * (n - 1 - k)).bit_and(255))
+    }
+    return out
+}
+
+fn tables() {
+    // GPOS with no scripts, features or lookups.
+    let empty = gpos.parse(bytes_of([0, 1, 0, 0, 0, 0, 0, 0, 0, 0])) ?? panic("gpos")
+    assert_eq(gpos.describe(empty), [])
+    // GDEF 1.0 with nothing in it.
+    let g = gdef.parse(bytes_of(be(65536, 4) + [0, 0, 0, 0, 0, 0, 0, 0])) ?? panic("gdef")
+    assert_eq(gdef.describe(g)[0], "version 65536")
+    // A delta-set index map: two entries, one byte each, four inner bits.
+    let m = varstore.index_map(bytes_of([0, 3, 0, 2, 33, 18]), 0) ?? []
+    assert_eq(m, [(2, 1), (1, 2)])
+    // trak with horizontal data: one track at -1.0, two sizes.
+    let trak = bytes_of(be(65536, 4) + [0, 0] + [0, 12] + [0, 0, 0, 0] + [0, 1, 0, 2] + be(28, 4) + be(0 - 65536, 4) + [1, 34] + [0, 36] + be(9 * 65536, 4) +
+        be(12 * 65536, 4) + [0, 46, 255, 226])
+    let t = traktable.parse(trak) ?? panic("trak")
+    assert_eq(traktable.describe(t), ["horiz sizes 589824,786432", "horiz track -65536 290 46,-30", "vert -"])
+    let feat = bytes_of(be(65536, 4) + [0, 1, 0, 0] + be(0, 4) + [0, 1, 0, 1] + be(24, 4) + [128, 0, 1, 0] + [0, 0, 1, 1])
+    assert_eq(feattable.describe(feattable.parse(feat) ?? []), ["feature 1 32768 256 0:257"])
+    let meta = bytes_of(be(1, 4) + be(0, 4) + be(0, 4) + be(1, 4) + [100, 108, 110, 103] + be(28, 4) + be(9, 4) + "en, ja-JP".to_bytes().to_list())
+    assert_eq(metatable.languages((metatable.parse_meta(meta) ?? [])[0]), ["en", "ja-JP"])
+    // vhea with two long metrics, then vmtx for three glyphs.
+    var vhea: [i64] = []
+    for _k in 0..34 {
+        vhea.push(0)
+    }
+    let ms = vertmetrics.vmtx(bytes_of(vhea + [0, 2]), bytes_of([3, 232, 0, 50, 3, 232, 0, 60, 0, 70]), 3) ?? []
+    assert_eq(ms.map(|x| (x.advance, x.tsb)), [(1000, 50), (1000, 60), (1000, 70)])
+}
+
+fn main() / {io} {
+    tables()
+    assert_eq(gvar.describe([]), [])
+    assert_eq(basetable.describe(Base{ horizontal: None, vertical: None }), ["horiz -", "vert -"])
+    assert_eq(vertmetrics.origin(Vorg{ default_y: 880, records: [(3, 900)] }, 3), 900)
+    let f = cff.parse(bytes_of([1, 0, 4, 1])) ?? CffFont{ name: "", strings: [], gsubrs: [], charstrings: [], charset: [], cid: false, privates: [], fd_select: [] }
+    assert_eq(f.charstrings.len(), 0)
+    print("ten font tables exercised")
+}

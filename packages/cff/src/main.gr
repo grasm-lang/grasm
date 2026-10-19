@@ -1,0 +1,635 @@
+// Compact Font Format (CFF 1): the PostScript outlines inside an OpenType
+// font's `CFF ` table.
+//
+// A CFF is a run of INDEXes -- counted arrays of variable-length items --
+// and DICTs of operands and operators: the font's name, its top DICT
+// (where the charstrings, the charset and the private DICT are), the
+// strings beyond the 391 every CFF shares, and the global subroutines.
+// Glyphs are Type 2 charstrings, programs for a small stack machine:
+// numbers (as small integers in one byte, larger ones in two to five, and
+// 16.16 fixed point), hints that cost nothing to draw but must be counted
+// (a hintmask carries one bit per hint), relative moves, lines and
+// curves in a dozen shorthand forms that alternate horizontal and
+// vertical, four flex forms, and calls into local and global subroutines
+// with a bias that depends on how many there are. The first operator
+// that clears the stack may carry the glyph's width. A CID-keyed font
+// picks the private DICT (and so the subroutines and widths) per glyph
+// through FDSelect.
+//
+// `parse` reads the table; `glyph_names` gives the names as the charset
+// (or, in a CID-keyed font, `cid00042`) says; `outline` runs a glyph's
+// charstring and returns its width and its moves, lines, curves and
+// closes, in units of 1/65536 so nothing is rounded.
+
+type CffDict = { entries: [(i64, [i64])] }
+
+type CffPrivate = { subrs: [bytes], default_width: i64, nominal_width: i64 }
+
+type CffFont = {
+    name: str,
+    strings: [str],
+    gsubrs: [bytes],
+    charstrings: [bytes],
+    charset: [i64],
+    cid: bool,
+    privates: [CffPrivate],
+    fd_select: [i64],
+}
+
+/// One drawing command; points in 1/65536 units.
+type CffCommand = { op: str, points: [(i64, i64)] }
+
+type CffOutline = { width: i64, commands: [CffCommand] }
+
+type CffError =
+    | CffMalformed(why: str)
+
+fn be(d: bytes, at: i64, n: i64) -> i64 ! CffError {
+    if at < 0 or at + n > d.len() {
+        fail(CffMalformed("a read past the end at {at}"))
+    }
+    var v = 0
+    for k in 0..n {
+        v = v.shl(8).bit_or(d.at(at + k))
+    }
+    return v
+}
+
+/// An INDEX at `at`: its items and where it ends.
+fn index_at(d: bytes, at: i64) -> ([bytes], i64) ! CffError {
+    let count = try be(d, at, 2)
+    if count == 0 {
+        return ([], at + 2)
+    }
+    let size = try be(d, at + 2, 1)
+    if size < 1 or size > 4 {
+        fail(CffMalformed("an offset size of {size}"))
+    }
+    let base = at + 3 + (count + 1) * size - 1
+    var offs: [i64] = []
+    for k in 0..(count + 1) {
+        offs.push(try be(d, at + 3 + k * size, size))
+    }
+    var items: [bytes] = []
+    for k in 0..count {
+        if offs[k + 1] < offs[k] or base + offs[k + 1] > d.len() {
+            fail(CffMalformed("an INDEX item past the end"))
+        }
+        items.push(d.slice(base + offs[k], base + offs[k + 1]))
+    }
+    return (items, base + offs[count])
+}
+
+/// A DICT: (operator, operands), operands in 1/65536 units (reals are
+/// rounded there).
+fn dict(d: bytes) -> CffDict ! CffError {
+    var out: [(i64, [i64])] = []
+    var ops: [i64] = []
+    var p = 0
+    while p < d.len() {
+        let b = d.at(p)
+        if b <= 21 {
+            var op = b
+            p = p + 1
+            if b == 12 {
+                op = 1200 + (try be(d, p, 1))
+                p = p + 1
+            }
+            out.push((op, ops))
+            ops = []
+        } else if b == 28 {
+            ops.push(signed(try be(d, p + 1, 2), 16).shl(16))
+            p = p + 3
+        } else if b == 29 {
+            ops.push(signed(try be(d, p + 1, 4), 32).shl(16))
+            p = p + 5
+        } else if b == 30 {
+            let (v, next) = try real(d, p + 1)
+            ops.push(v)
+            p = next
+        } else if b >= 32 and b <= 246 {
+            ops.push((b - 139).shl(16))
+            p = p + 1
+        } else if b >= 247 and b <= 250 {
+            ops.push(((b - 247) * 256 + (try be(d, p + 1, 1)) + 108).shl(16))
+            p = p + 2
+        } else if b >= 251 and b <= 254 {
+            ops.push((0 - (b - 251) * 256 - (try be(d, p + 1, 1)) - 108).shl(16))
+            p = p + 2
+        } else {
+            fail(CffMalformed("a DICT byte {b}"))
+        }
+    }
+    return CffDict{ entries: out }
+}
+
+fn signed(v: i64, bits: i64) -> i64 {
+    let top = 1.shl(bits - 1)
+    return if v.bit_and(top) != 0 { v - 2 * top } else { v }
+}
+
+/// A DICT real (nibbles), in 1/65536 units.
+fn real(d: bytes, p0: i64) -> (i64, i64) ! CffError {
+    var text = ""
+    var p = p0
+    while true {
+        let b = try be(d, p, 1)
+        p = p + 1
+        var done = false
+        for nib in [b.ushr(4), b.bit_and(15)] {
+            if done {
+                continue
+            }
+            if nib <= 9 {
+                text = text + "{nib}"
+            } else if nib == 10 {
+                text = text + "."
+            } else if nib == 11 {
+                text = text + "e"
+            } else if nib == 12 {
+                text = text + "e-"
+            } else if nib == 14 {
+                text = text + "-"
+            } else if nib == 15 {
+                done = true
+            }
+        }
+        if done {
+            break
+        }
+    }
+    let f = (if text.len() == 0 { "0" } else { text }).parse_float() ?? 0.0
+    return ((f * 65536.0).round().as_i64(), p)
+}
+
+fn op_value(d: CffDict, op: i64) -> Option[[i64]] {
+    for (o, v) in d.entries {
+        if o == op {
+            return Some(v)
+        }
+    }
+    return None
+}
+
+fn int_of(d: CffDict, op: i64, default: i64) -> i64 {
+    return match op_value(d, op) {
+        Some(v) -> if v.len() > 0 { v[v.len() - 1].shr(16) } else { default }
+        None -> default
+    }
+}
+
+fn private_at(t: bytes, d: CffDict) -> CffPrivate ! CffError {
+    let pv = op_value(d, 18) ?? [0, 0]
+    if pv.len() < 2 {
+        fail(CffMalformed("a Private entry without size and offset"))
+    }
+    let size = pv[0].shr(16)
+    let off = pv[1].shr(16)
+    if off < 0 or off + size > t.len() {
+        fail(CffMalformed("a Private DICT past the end"))
+    }
+    let p = try dict(t.slice(off, off + size))
+    let subrs = match op_value(p, 19) {
+        Some(v) -> (try index_at(t, off + v[0].shr(16))).0
+        None -> []
+    }
+    let dw = match op_value(p, 20) {
+        Some(v) -> v[0]
+        None -> 0
+    }
+    let nw = match op_value(p, 21) {
+        Some(v) -> v[0]
+        None -> 0
+    }
+    return CffPrivate{ subrs: subrs, default_width: dw, nominal_width: nw }
+}
+
+fn charset(t: bytes, off: i64, n: i64) -> [i64] ! CffError {
+    var out = [0]
+    if off == 0 {
+        // ISOAdobe: glyph i is SID i.
+        for i in 1..n {
+            out.push(i)
+        }
+        return out
+    }
+    if off <= 2 {
+        fail(CffMalformed("a predefined Expert charset"))
+    }
+    let fmt = try be(t, off, 1)
+    var p = off + 1
+    while out.len() < n {
+        if fmt == 0 {
+            out.push(try be(t, p, 2))
+            p = p + 2
+        } else {
+            let first = try be(t, p, 2)
+            let left = try be(t, p + 2, if fmt == 1 { 1 } else { 2 })
+            p = p + (if fmt == 1 { 3 } else { 4 })
+            for k in 0..(left + 1) {
+                if out.len() < n {
+                    out.push(first + k)
+                }
+            }
+        }
+    }
+    return out
+}
+
+fn fd_select(t: bytes, off: i64, n: i64) -> [i64] ! CffError {
+    let fmt = try be(t, off, 1)
+    var out: [i64] = []
+    if fmt == 0 {
+        for g in 0..n {
+            out.push(try be(t, off + 1 + g, 1))
+        }
+        return out
+    }
+    if fmt != 3 {
+        fail(CffMalformed("an FDSelect format {fmt}"))
+    }
+    let ranges = try be(t, off + 1, 2)
+    for r in 0..ranges {
+        let first = try be(t, off + 3 + 3 * r, 2)
+        let fd = try be(t, off + 5 + 3 * r, 1)
+        let next = try be(t, off + 6 + 3 * r, 2)
+        while out.len() < next and out.len() < n {
+            if out.len() >= first {
+                out.push(fd)
+            } else {
+                out.push(0)
+            }
+        }
+    }
+    while out.len() < n {
+        out.push(0)
+    }
+    return out
+}
+
+/// Reads a `CFF ` table (the first font of its FontSet).
+pub fn parse(t: bytes) -> CffFont ! CffError {
+    let hdr = try be(t, 2, 1)
+    let (names, after_names) = try index_at(t, hdr)
+    let (tops, after_tops) = try index_at(t, after_names)
+    let (strs, after_strings) = try index_at(t, after_tops)
+    let (gsubrs, _end) = try index_at(t, after_strings)
+    if names.len() == 0 or tops.len() == 0 {
+        fail(CffMalformed("no font in the FontSet"))
+    }
+    let top = try dict(tops[0])
+    let cs_off = int_of(top, 17, 0 - 1)
+    if cs_off < 0 {
+        fail(CffMalformed("no CharStrings"))
+    }
+    let (charstrings, _e2) = try index_at(t, cs_off)
+    let n = charstrings.len()
+    let cid = op_value(top, 1230) != None
+    var privates: [CffPrivate] = []
+    var select: [i64] = []
+    if cid {
+        let (fds, _e3) = try index_at(t, int_of(top, 1236, 0))
+        for fd in fds {
+            privates.push(try private_at(t, try dict(fd)))
+        }
+        select = try fd_select(t, int_of(top, 1237, 0), n)
+    } else {
+        privates.push(try private_at(t, top))
+    }
+    return CffFont{ name: names[0].to_str(), strings: strs.map(|s| s.to_str()), gsubrs: gsubrs, charstrings: charstrings,
+        charset: try charset(t, int_of(top, 15, 0), n), cid: cid, privates: privates, fd_select: select }
+}
+
+fn zero_pad(v: i64) -> str {
+    var s = "{v}"
+    while s.len() < 5 {
+        s = "0" + s
+    }
+    return s
+}
+
+/// Glyph names by glyph index.
+pub fn glyph_names(f: CffFont) -> [str] {
+    let std = standard_strings()
+    var out: [str] = []
+    for g in 0..f.charset.len() {
+        let id = f.charset[g]
+        if g == 0 {
+            out.push(".notdef")
+        } else if f.cid {
+            out.push("cid" + zero_pad(id))
+        } else if id < 391 {
+            out.push(std[id])
+        } else if id - 391 < f.strings.len() {
+            out.push(f.strings[id - 391])
+        } else {
+            out.push("SID{id}")
+        }
+    }
+    return out
+}
+
+// --- Type 2 charstrings -----------------------------------------------------------
+
+type T2State = {
+    stack: [i64],
+    x: i64,
+    y: i64,
+    hints: i64,
+    mask_bytes: i64,
+    width: Option[i64],
+    open: bool,
+    out: [CffCommand],
+    depth: i64,
+    done: bool,
+}
+
+fn bias(n: i64) -> i64 {
+    return if n < 1240 { 107 } else if n < 33900 { 1131 } else { 32768 }
+}
+
+fn pop_all_width(inout s: T2State, odd_means_width: i64, p: CffPrivate) -> [i64] {
+    var args = s.stack
+    s.stack = []
+    if s.width == None {
+        if odd_means_width.bit_xor(args.len() % 2) == 1 {
+            s.width = Some(p.nominal_width + args[0])
+            args = args.slice(1, args.len())
+        } else {
+            s.width = Some(p.default_width)
+        }
+    }
+    return args
+}
+
+fn end_path(inout s: T2State) {
+    if s.open {
+        s.out.push(CffCommand{ op: "closePath", points: [] })
+        s.open = false
+    }
+}
+
+fn move_to(inout s: T2State, dx: i64, dy: i64) {
+    s.x = s.x + dx
+    s.y = s.y + dy
+    s.out.push(CffCommand{ op: "moveTo", points: [(s.x, s.y)] })
+    s.open = true
+}
+
+fn line_to(inout s: T2State, dx: i64, dy: i64) {
+    if not s.open {
+        move_to(s, 0, 0)
+    }
+    s.x = s.x + dx
+    s.y = s.y + dy
+    s.out.push(CffCommand{ op: "lineTo", points: [(s.x, s.y)] })
+}
+
+fn curve_to(inout s: T2State, a: (i64, i64), b: (i64, i64), c: (i64, i64)) {
+    if not s.open {
+        move_to(s, 0, 0)
+    }
+    let p1 = (s.x + a.0, s.y + a.1)
+    let p2 = (p1.0 + b.0, p1.1 + b.1)
+    let p3 = (p2.0 + c.0, p2.1 + c.1)
+    s.x = p3.0
+    s.y = p3.1
+    s.out.push(CffCommand{ op: "curveTo", points: [p1, p2, p3] })
+}
+
+fn pairs_lines(inout s: T2State, args: [i64], horizontal0: bool) {
+    var h = horizontal0
+    for a in args {
+        if h {
+            line_to(s, a, 0)
+        } else {
+            line_to(s, 0, a)
+        }
+        h = not h
+    }
+}
+
+/// vhcurveto and hvcurveto: alternating curves, the last with an extra
+/// final coordinate when the count is odd.
+fn alternating_curves(inout s: T2State, args0: [i64], vertical_first: bool) {
+    var args = args0
+    var vertical = vertical_first
+    while args.len() >= 4 {
+        let last = if args.len() == 5 { args[4] } else { 0 }
+        if vertical {
+            curve_to(s, (0, args[0]), (args[1], args[2]), (args[3], last))
+        } else {
+            curve_to(s, (args[0], 0), (args[1], args[2]), (last, args[3]))
+        }
+        args = args.slice(if args.len() == 5 { 5 } else { 4 }, args.len())
+        vertical = not vertical
+    }
+}
+
+fn flexes(inout s: T2State, op: i64, a: [i64]) -> () ! CffError {
+    if op == 34 and a.len() == 7 {
+        curve_to(s, (a[0], 0), (a[1], a[2]), (a[3], 0))
+        curve_to(s, (a[4], 0), (a[5], 0 - a[2]), (a[6], 0))
+    } else if op == 35 and a.len() == 13 {
+        curve_to(s, (a[0], a[1]), (a[2], a[3]), (a[4], a[5]))
+        curve_to(s, (a[6], a[7]), (a[8], a[9]), (a[10], a[11]))
+    } else if op == 36 and a.len() == 9 {
+        curve_to(s, (a[0], a[1]), (a[2], a[3]), (a[4], 0))
+        curve_to(s, (a[5], 0), (a[6], a[7]), (a[8], 0 - (a[1] + a[3] + a[7])))
+    } else if op == 37 and a.len() == 11 {
+        let dx = a[0] + a[2] + a[4] + a[6] + a[8]
+        let dy = a[1] + a[3] + a[5] + a[7] + a[9]
+        let (d6x, d6y) = if dx.abs() > dy.abs() { (a[10], 0 - dy) } else { (0 - dx, a[10]) }
+        curve_to(s, (a[0], a[1]), (a[2], a[3]), (a[4], a[5]))
+        curve_to(s, (a[6], a[7]), (a[8], a[9]), (d6x, d6y))
+    } else {
+        fail(CffMalformed("an operator 12 {op} with {a.len()} arguments"))
+    }
+}
+
+fn path_op(inout s: T2State, op: i64, p: CffPrivate) -> () ! CffError {
+    if op == 21 or op == 22 or op == 4 {
+        end_path(s)
+        let a = pop_all_width(s, if op == 21 { 0 } else { 1 }, p)
+        if (op == 21 and a.len() < 2) or (op != 21 and a.len() < 1) {
+            fail(CffMalformed("a moveto without its arguments"))
+        }
+        move_to(s, if op == 4 { 0 } else { a[0] }, if op == 21 { a[1] } else if op == 4 { a[0] } else { 0 })
+        return
+    }
+    let a = s.stack
+    s.stack = []
+    if op == 5 {
+        var i = 0
+        while i + 1 < a.len() {
+            line_to(s, a[i], a[i + 1])
+            i = i + 2
+        }
+    } else if op == 6 or op == 7 {
+        pairs_lines(s, a, op == 6)
+    } else if op == 8 or op == 24 {
+        var i = 0
+        while i + 6 <= a.len() - (if op == 24 { 2 } else { 0 }) {
+            curve_to(s, (a[i], a[i + 1]), (a[i + 2], a[i + 3]), (a[i + 4], a[i + 5]))
+            i = i + 6
+        }
+        if op == 24 and a.len() >= 2 {
+            line_to(s, a[a.len() - 2], a[a.len() - 1])
+        }
+    } else if op == 25 {
+        var i = 0
+        while i + 1 < a.len() - 6 {
+            line_to(s, a[i], a[i + 1])
+            i = i + 2
+        }
+        let k = a.len() - 6
+        curve_to(s, (a[k], a[k + 1]), (a[k + 2], a[k + 3]), (a[k + 4], a[k + 5]))
+    } else if op == 26 or op == 27 {
+        let odd = a.len() % 2 == 1
+        var first = if odd { a[0] } else { 0 }
+        var i = if odd { 1 } else { 0 }
+        while i + 4 <= a.len() {
+            if op == 26 {
+                curve_to(s, (first, a[i]), (a[i + 1], a[i + 2]), (0, a[i + 3]))
+            } else {
+                curve_to(s, (a[i], first), (a[i + 1], a[i + 2]), (a[i + 3], 0))
+            }
+            first = 0
+            i = i + 4
+        }
+    } else if op == 30 or op == 31 {
+        alternating_curves(s, a, op == 30)
+    } else {
+        fail(CffMalformed("an operator {op}"))
+    }
+}
+
+fn number_at(cs: bytes, i: i64, b: i64) -> (i64, i64) ! CffError {
+    if b >= 32 and b <= 246 {
+        return ((b - 139).shl(16), i + 1)
+    }
+    if b >= 247 and b <= 250 {
+        return (((b - 247) * 256 + (try be(cs, i + 1, 1)) + 108).shl(16), i + 2)
+    }
+    if b >= 251 and b <= 254 {
+        return ((0 - (b - 251) * 256 - (try be(cs, i + 1, 1)) - 108).shl(16), i + 2)
+    }
+    if b == 28 {
+        return (signed(try be(cs, i + 1, 2), 16).shl(16), i + 3)
+    }
+    return (signed(try be(cs, i + 1, 4), 32), i + 5)
+}
+
+fn run(f: CffFont, p: CffPrivate, cs: bytes, inout s: T2State) -> () ! CffError {
+    s.depth = s.depth + 1
+    if s.depth > 12 {
+        fail(CffMalformed("subroutines nested too deep"))
+    }
+    var i = 0
+    while i < cs.len() and not s.done {
+        let b = cs.at(i)
+        if b >= 32 or b == 28 {
+            let (v, next) = try number_at(cs, i, b)
+            s.stack.push(v)
+            i = next
+            continue
+        }
+        i = i + 1
+        if b == 1 or b == 3 or b == 18 or b == 23 {
+            let a = pop_all_width(s, 0, p)
+            s.hints = s.hints + a.len() / 2
+        } else if b == 19 or b == 20 {
+            if s.mask_bytes < 0 {
+                let a = pop_all_width(s, 0, p)
+                s.hints = s.hints + a.len() / 2
+                s.mask_bytes = (s.hints + 7) / 8
+            }
+            i = i + s.mask_bytes
+        } else if b == 10 or b == 29 {
+            let subrs = if b == 10 { p.subrs } else { f.gsubrs }
+            if s.stack.len() == 0 {
+                fail(CffMalformed("a subroutine call without its number"))
+            }
+            let k = s.stack[s.stack.len() - 1].shr(16) + bias(subrs.len())
+            s.stack = s.stack.slice(0, s.stack.len() - 1)
+            if k < 0 or k >= subrs.len() {
+                fail(CffMalformed("a subroutine {k} that is not there"))
+            }
+            try run(f, p, subrs[k], s)
+        } else if b == 11 {
+            break
+        } else if b == 14 {
+            end_path(s)
+            let a = pop_all_width(s, 0, p)
+            if a.len() > 0 {
+                fail(CffMalformed("an endchar that builds an accented glyph"))
+            }
+            s.done = true
+        } else if b == 12 {
+            let op = try be(cs, i, 1)
+            i = i + 1
+            let a = s.stack
+            s.stack = []
+            try flexes(s, op, a)
+        } else {
+            try path_op(s, b, p)
+        }
+    }
+    s.depth = s.depth - 1
+}
+
+/// A glyph's outline: its width and drawing commands (1/65536 units).
+pub fn outline(f: CffFont, glyph: i64) -> CffOutline ! CffError {
+    if glyph < 0 or glyph >= f.charstrings.len() {
+        fail(CffMalformed("no glyph {glyph}"))
+    }
+    let p = if f.cid { f.privates[f.fd_select[glyph]] } else { f.privates[0] }
+    var s = T2State{ stack: [], x: 0, y: 0, hints: 0, mask_bytes: 0 - 1, width: None, open: false, out: [], depth: 0, done: false }
+    try run(f, p, f.charstrings[glyph], s)
+    end_path(s)
+    return CffOutline{ width: s.width ?? p.default_width, commands: s.out }
+}
+
+/// CFF's 391 standard strings, SIDs 0 to 390.
+fn standard_strings() -> [str] {
+    return [
+        ".notdef", "space", "exclam", "quotedbl", "numbersign", "dollar", "percent", "ampersand", "quoteright", "parenleft",
+        "parenright", "asterisk", "plus", "comma", "hyphen", "period", "slash", "zero", "one", "two", "three", "four", "five",
+        "six", "seven", "eight", "nine", "colon", "semicolon", "less", "equal", "greater", "question", "at", "A", "B", "C", "D",
+        "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "P", "Q", "R", "S", "T", "U", "V", "W", "X", "Y", "Z", "bracketleft",
+        "backslash", "bracketright", "asciicircum", "underscore", "quoteleft", "a", "b", "c", "d", "e", "f", "g", "h", "i", "j",
+        "k", "l", "m", "n", "o", "p", "q", "r", "s", "t", "u", "v", "w", "x", "y", "z", "braceleft", "bar", "braceright",
+        "asciitilde", "exclamdown", "cent", "sterling", "fraction", "yen", "florin", "section", "currency", "quotesingle",
+        "quotedblleft", "guillemotleft", "guilsinglleft", "guilsinglright", "fi", "fl", "endash", "dagger", "daggerdbl",
+        "periodcentered", "paragraph", "bullet", "quotesinglbase", "quotedblbase", "quotedblright", "guillemotright", "ellipsis",
+        "perthousand", "questiondown", "grave", "acute", "circumflex", "tilde", "macron", "breve", "dotaccent", "dieresis", "ring",
+        "cedilla", "hungarumlaut", "ogonek", "caron", "emdash", "AE", "ordfeminine", "Lslash", "Oslash", "OE", "ordmasculine", "ae",
+        "dotlessi", "lslash", "oslash", "oe", "germandbls", "onesuperior", "logicalnot", "mu", "trademark", "Eth", "onehalf",
+        "plusminus", "Thorn", "onequarter", "divide", "brokenbar", "degree", "thorn", "threequarters", "twosuperior", "registered",
+        "minus", "eth", "multiply", "threesuperior", "copyright", "Aacute", "Acircumflex", "Adieresis", "Agrave", "Aring", "Atilde",
+        "Ccedilla", "Eacute", "Ecircumflex", "Edieresis", "Egrave", "Iacute", "Icircumflex", "Idieresis", "Igrave", "Ntilde",
+        "Oacute", "Ocircumflex", "Odieresis", "Ograve", "Otilde", "Scaron", "Uacute", "Ucircumflex", "Udieresis", "Ugrave",
+        "Yacute", "Ydieresis", "Zcaron", "aacute", "acircumflex", "adieresis", "agrave", "aring", "atilde", "ccedilla", "eacute",
+        "ecircumflex", "edieresis", "egrave", "iacute", "icircumflex", "idieresis", "igrave", "ntilde", "oacute", "ocircumflex",
+        "odieresis", "ograve", "otilde", "scaron", "uacute", "ucircumflex", "udieresis", "ugrave", "yacute", "ydieresis", "zcaron",
+        "exclamsmall", "Hungarumlautsmall", "dollaroldstyle", "dollarsuperior", "ampersandsmall", "Acutesmall", "parenleftsuperior",
+        "parenrightsuperior", "twodotenleader", "onedotenleader", "zerooldstyle", "oneoldstyle", "twooldstyle", "threeoldstyle",
+        "fouroldstyle", "fiveoldstyle", "sixoldstyle", "sevenoldstyle", "eightoldstyle", "nineoldstyle", "commasuperior",
+        "threequartersemdash", "periodsuperior", "questionsmall", "asuperior", "bsuperior", "centsuperior", "dsuperior",
+        "esuperior", "isuperior", "lsuperior", "msuperior", "nsuperior", "osuperior", "rsuperior", "ssuperior", "tsuperior", "ff",
+        "ffi", "ffl", "parenleftinferior", "parenrightinferior", "Circumflexsmall", "hyphensuperior", "Gravesmall", "Asmall",
+        "Bsmall", "Csmall", "Dsmall", "Esmall", "Fsmall", "Gsmall", "Hsmall", "Ismall", "Jsmall", "Ksmall", "Lsmall", "Msmall",
+        "Nsmall", "Osmall", "Psmall", "Qsmall", "Rsmall", "Ssmall", "Tsmall", "Usmall", "Vsmall", "Wsmall", "Xsmall", "Ysmall",
+        "Zsmall", "colonmonetary", "onefitted", "rupiah", "Tildesmall", "exclamdownsmall", "centoldstyle", "Lslashsmall",
+        "Scaronsmall", "Zcaronsmall", "Dieresissmall", "Brevesmall", "Caronsmall", "Dotaccentsmall", "Macronsmall", "figuredash",
+        "hypheninferior", "Ogoneksmall", "Ringsmall", "Cedillasmall", "questiondownsmall", "oneeighth", "threeeighths",
+        "fiveeighths", "seveneighths", "onethird", "twothirds", "zerosuperior", "foursuperior", "fivesuperior", "sixsuperior",
+        "sevensuperior", "eightsuperior", "ninesuperior", "zeroinferior", "oneinferior", "twoinferior", "threeinferior",
+        "fourinferior", "fiveinferior", "sixinferior", "seveninferior", "eightinferior", "nineinferior", "centinferior",
+        "dollarinferior", "periodinferior", "commainferior", "Agravesmall", "Aacutesmall", "Acircumflexsmall", "Atildesmall",
+        "Adieresissmall", "Aringsmall", "AEsmall", "Ccedillasmall", "Egravesmall", "Eacutesmall", "Ecircumflexsmall",
+        "Edieresissmall", "Igravesmall", "Iacutesmall", "Icircumflexsmall", "Idieresissmall", "Ethsmall", "Ntildesmall",
+        "Ogravesmall", "Oacutesmall", "Ocircumflexsmall", "Otildesmall", "Odieresissmall", "OEsmall", "Oslashsmall", "Ugravesmall",
+        "Uacutesmall", "Ucircumflexsmall", "Udieresissmall", "Yacutesmall", "Thornsmall", "Ydieresissmall", "001.000", "001.001",
+        "001.002", "001.003", "Black", "Bold", "Book", "Light", "Medium", "Regular", "Roman", "Semibold"]
+}

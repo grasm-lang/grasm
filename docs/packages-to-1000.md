@@ -260,6 +260,25 @@ becomes buildable the day its reference is installed.
 
 ## Landed
 
+- [x] **B44: the font tables still unread** — B13's `cff`, `gpos` and
+  `gvar`, with `gdef` `varstore` (item variation stores, HVAR, VVAR and
+  MVAR) `traktable` `feattable` `metatable` (meta and ltag) `vertmetrics`
+  (vmtx and VORG) `basetable`, and the harness `b44test`; the new gate
+  `b44diff` runs about 90 cases, each a table from a font macOS ships,
+  read here from its bytes and compared line for line with fontTools:
+  CFF outlines in name-keyed and CID-keyed fonts (every Type 2 operator
+  the system's fonts use, subroutine biases, hint masks, widths, flex,
+  coordinates in 1/65536 so nothing is rounded), GPOS lookups (single,
+  pair by glyph and by class matrix, cursive, mark to base, ligature and
+  mark, extension-wrapped), GDEF classes, attachment points, carets and
+  mark sets, variation stores with their delta-set index maps, gvar
+  tuples with point counts measured from glyf (phantom points
+  included), AAT tracking and feature names, meta data maps and ltag
+  language tags, vertical metrics and origins, and BASE baselines and
+  extents. A table fontTools cannot read (one font's truncated `feat`)
+  is left out and named. One break per package turned the gate red.
+  The count reaches 982.
+
 - [x] **B43: the web's URLs and the package managers' specifiers** —
   `uts46` `whatwgurl` `urlsearchparams` `whatwgmime` `dataurl` (B20's
   data URLs), `hostedgit` `nodesemver` `npmspec` `negotiator` `pytags`,
@@ -869,7 +888,7 @@ becomes buildable the day its reference is installed.
 | | |
 |---|---|
 | At the start | 669 |
-| Now | 971 |
+| Now | 982 |
 | Candidates above | 316 packages in 28 batches, plus `ecc`, `rfc6979` and `goprintf` |
 | Harnesses, one a batch | 28 |
 | If every candidate lands | 1016 |

@@ -1,0 +1,8 @@
+[package]
+name = "gdef"
+version = "1.0.0"
+capabilities = []
+
+[dependencies.gpos]
+path = "../gpos"
+version = "^1.0.0"

@@ -1,0 +1,144 @@
+// The harness scripts/b44_diff.py drives: each (op, path) pair reads a
+// font table (or a spec file naming several), writes what it found to
+// `<path>.out` as lines, and prints "ok" or "ERR".
+import cff
+import gpos
+import gdef
+import varstore
+import gvar
+import traktable
+import feattable
+import metatable
+import vertmetrics
+import basetable
+import glyf
+import fvar
+
+fn hexs(b: bytes) -> str {
+    let digits = "0123456789abcdef"
+    var parts: [str] = []
+    for x in b.to_list() {
+        parts.push(digits.substr(x.ushr(4), 1) + digits.substr(x.bit_and(15), 1))
+    }
+    return parts.join("")
+}
+
+fn read(path: str) -> bytes ! str / {io} {
+    return read_bytes(path) ?? fail("cannot read " + path)
+}
+
+fn u16(d: bytes, at: i64) -> i64 {
+    return if at + 2 <= d.len() { d.at(at) * 256 + d.at(at + 1) } else { 0 }
+}
+
+fn cff_lines(d: bytes, step: i64) -> [str] ! str {
+    let f = cff.parse(d) ?? fail("cff")
+    let names = cff.glyph_names(f)
+    var out: [str] = []
+    var g = 0
+    while g < names.len() {
+        let o = cff.outline(f, g) ?? fail("outline {g}")
+        out.push(names[g] + " {o.width} " + o.commands.map(|c| c.op + c.points.map(|p| "({p.0},{p.1})").join("")).join(" "))
+        g = g + step
+    }
+    return out
+}
+
+/// gvar with point counts measured from glyf: outline points (or
+/// components) plus four phantom points.
+fn gvar_lines(spec: [str]) -> [str] ! str / {io} {
+    let table = try read(spec[0])
+    let glyf_t = try read(spec[1])
+    let loca = try read(spec[2])
+    let head = try read(spec[3])
+    let maxp = try read(spec[4])
+    let fv = fvar.parse(try read(spec[5])) ?? fail("fvar")
+    let long = u16(head, 50) == 1
+    var counts: [i64] = []
+    for g in 0..u16(maxp, 4) {
+        let gl = glyf.parse_glyph(glyf_t, loca, long, g) ?? fail("glyph {g}")
+        counts.push(4 + if glyf.is_composite(gl) { gl.components.len() } else { glyf.point_count(gl) })
+    }
+    return gvar.describe(gvar.parse(table, counts, fv.axes.map(|a| a.tag)) ?? fail("gvar"))
+}
+
+fn vertical_lines(spec: [str], glyphs: i64) -> [str] ! str / {io} {
+    let ms = vertmetrics.vmtx(try read(spec[0]), try read(spec[1]), glyphs) ?? fail("vmtx")
+    var out = ms.map(|m| "{m.advance} {m.tsb}")
+    if spec.len() > 2 {
+        let v = vertmetrics.vorg(try read(spec[2])) ?? fail("vorg")
+        out.push("vorg {v.default_y} " + v.records.map(|r| "{r.0}:{r.1}").join(","))
+    }
+    return out
+}
+
+fn meta_lines(spec: [str]) -> [str] ! str / {io} {
+    var out: [str] = []
+    if spec[0] != "-" {
+        for e in metatable.parse_meta(try read(spec[0])) ?? fail("meta") {
+            out.push("meta " + e.tag + " " + hexs(e.data))
+        }
+    }
+    if spec.len() > 1 and spec[1] != "-" {
+        for t in metatable.parse_ltag(try read(spec[1])) ?? fail("ltag") {
+            out.push("ltag " + t)
+        }
+    }
+    return out
+}
+
+fn answer(op: [str], path: str) -> [str] ! str / {io} {
+    let o = op[0]
+    if o == "gvar" or o == "vertical" or o == "meta" {
+        let spec = (try read(path)).to_str().split("\n").filter(|l| l.len() > 0)
+        if o == "gvar" {
+            return try gvar_lines(spec)
+        }
+        if o == "vertical" {
+            return try vertical_lines(spec, op[1].parse_int() ?? 0)
+        }
+        return try meta_lines(spec)
+    }
+    let d = try read(path)
+    if o == "cff" {
+        return try cff_lines(d, op[1].parse_int() ?? 1)
+    }
+    if o == "gpos" {
+        return gpos.describe(gpos.parse(d) ?? fail("gpos"))
+    }
+    if o == "gdef" {
+        return gdef.describe(gdef.parse(d) ?? fail("gdef"))
+    }
+    if o == "var" {
+        if op[1] == "MVAR" {
+            return varstore.describe_mvar(varstore.mvar(d) ?? fail("mvar"))
+        }
+        return varstore.describe_hvar(varstore.hvar(d, op[1] == "VVAR") ?? fail("hvar"), op[2].parse_int() ?? 0, op[1] == "VVAR")
+    }
+    if o == "trak" {
+        return traktable.describe(traktable.parse(d) ?? fail("trak"))
+    }
+    if o == "feat" {
+        return feattable.describe(feattable.parse(d) ?? fail("feat"))
+    }
+    if o == "base" {
+        return basetable.describe(basetable.parse(d) ?? fail("base"))
+    }
+    fail("unknown op " + o)
+}
+
+fn main() / {io} {
+    let argv = args()
+    var i = 0
+    while i + 1 < argv.len() {
+        let path = argv[i + 1]
+        print(match answer(argv[i].split(":"), path) {
+            Ok(lines) -> match write_bytes(path + ".out", (lines.join("\n") + "\n").to_bytes()) {
+                Ok(_w) -> "ok"
+                Err(_e) -> "ERR"
+            }
+            Err(_e) -> "ERR"
+        })
+        i = i + 2
+    }
+}

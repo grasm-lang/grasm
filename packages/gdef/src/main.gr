@@ -1,0 +1,133 @@
+// The OpenType `GDEF` table: what kind of glyph each glyph is.
+//
+// A shaping engine needs to know which glyphs are base glyphs, which are
+// ligatures and which are marks before it can apply a lookup that skips
+// marks or attaches one -- that is the glyph class definition. GDEF also
+// holds the points on a glyph that marks attach to, the caret positions
+// inside each ligature for a text cursor (as a coordinate, a contour
+// point, or a coordinate with a device table), the mark attachment
+// classes a lookup flag can select, and (from version 1.2) the mark glyph
+// sets a lookup can filter by. Version 1.3 adds an item variation store,
+// which `packages/varstore` reads.
+//
+// `parse` reads it; `describe` writes it as lines for comparison.
+import gpos
+
+type GdefCaret = { format: i64, value: i64 }
+
+type Gdef = {
+    version: i64,
+    glyph_classes: [(i64, i64)],
+    attach_points: [(i64, [i64])],
+    lig_carets: [(i64, [GdefCaret])],
+    mark_classes: [(i64, i64)],
+    mark_sets: [[i64]],
+    var_store: i64,
+}
+
+type GdefError =
+    | GdefMalformed(why: str)
+
+fn u16(b: bytes, at: i64) -> i64 ! GdefError {
+    if at < 0 or at + 2 > b.len() {
+        fail(GdefMalformed("a read past the end"))
+    }
+    return b.at(at) * 256 + b.at(at + 1)
+}
+
+fn s16(b: bytes, at: i64) -> i64 ! GdefError {
+    let v = try u16(b, at)
+    return if v >= 32768 { v - 65536 } else { v }
+}
+
+fn u32(b: bytes, at: i64) -> i64 ! GdefError {
+    return (try u16(b, at)) * 65536 + (try u16(b, at + 2))
+}
+
+fn classes(d: bytes, base: i64, off: i64) -> [(i64, i64)] ! GdefError {
+    if off == 0 {
+        return []
+    }
+    return gpos.class_def(d, base + off) ?? fail(GdefMalformed("a class definition"))
+}
+
+fn coverage(d: bytes, at: i64) -> [i64] ! GdefError {
+    return gpos.coverage(d, at) ?? fail(GdefMalformed("a coverage table"))
+}
+
+fn attach_list(d: bytes, at: i64) -> [(i64, [i64])] ! GdefError {
+    let cov = try coverage(d, at + (try u16(d, at)))
+    let n = try u16(d, at + 2)
+    var out: [(i64, [i64])] = []
+    for i in 0..n {
+        if i >= cov.len() {
+            break
+        }
+        let p = at + (try u16(d, at + 4 + 2 * i))
+        var pts: [i64] = []
+        for k in 0..(try u16(d, p)) {
+            pts.push(try u16(d, p + 2 + 2 * k))
+        }
+        out.push((cov[i], pts))
+    }
+    return out
+}
+
+fn caret_list(d: bytes, at: i64) -> [(i64, [GdefCaret])] ! GdefError {
+    let cov = try coverage(d, at + (try u16(d, at)))
+    let n = try u16(d, at + 2)
+    var out: [(i64, [GdefCaret])] = []
+    for i in 0..n {
+        if i >= cov.len() {
+            break
+        }
+        let lig = at + (try u16(d, at + 4 + 2 * i))
+        var carets: [GdefCaret] = []
+        for k in 0..(try u16(d, lig)) {
+            let c = lig + (try u16(d, lig + 2 + 2 * k))
+            let format = try u16(d, c)
+            carets.push(GdefCaret{ format: format, value: if format == 2 { try u16(d, c + 2) } else { try s16(d, c + 2) } })
+        }
+        out.push((cov[i], carets))
+    }
+    return out
+}
+
+/// Reads a `GDEF` table.
+pub fn parse(d: bytes) -> Gdef ! GdefError {
+    let version = try u32(d, 0)
+    let attach = try u16(d, 6)
+    let carets = try u16(d, 8)
+    var sets: [[i64]] = []
+    if version >= 65538 {
+        let ms = try u16(d, 12)
+        if ms != 0 {
+            let n = try u16(d, ms + 2)
+            for i in 0..n {
+                sets.push(try coverage(d, ms + (try u32(d, ms + 4 + 4 * i))))
+            }
+        }
+    }
+    return Gdef{ version: version, glyph_classes: try classes(d, 0, try u16(d, 4)), attach_points: if attach == 0 { [] } else { try attach_list(d, attach) },
+        lig_carets: if carets == 0 { [] } else { try caret_list(d, carets) }, mark_classes: try classes(d, 0, try u16(d, 10)), mark_sets: sets,
+        var_store: if version >= 65539 { try u32(d, 14) } else { 0 } }
+}
+
+fn pairs(xs: [(i64, i64)]) -> str {
+    return xs.map(|gc| "{gc.0}:{gc.1}").join(",")
+}
+
+/// The table as lines.
+pub fn describe(g: Gdef) -> [str] {
+    var out = ["version {g.version}", "classes " + pairs(g.glyph_classes), "markclasses " + pairs(g.mark_classes)]
+    for (glyph, pts) in g.attach_points {
+        out.push("attach {glyph} " + pts.map(|p| "{p}").join(","))
+    }
+    for (glyph, cs) in g.lig_carets {
+        out.push("carets {glyph} " + cs.map(|c| "{c.format}:{c.value}").join(","))
+    }
+    for s in g.mark_sets {
+        out.push("markset " + s.map(|x| "{x}").join(","))
+    }
+    return out
+}

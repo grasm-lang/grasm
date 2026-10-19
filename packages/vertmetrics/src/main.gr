@@ -1,0 +1,71 @@
+// Vertical metrics: `vhea`, `vmtx` and `VORG`.
+//
+// Vertical text (CJK set top to bottom) needs, for each glyph, an advance
+// height and a top side bearing -- `vmtx`, whose first
+// numOfLongVerMetrics entries (a count `vhea` gives) carry both and the
+// rest only the bearing, sharing the last advance. A CFF font also gives
+// each glyph's vertical origin in `VORG`: a default, and the glyphs that
+// differ.
+//
+// `vmtx` reads the metrics for every glyph; `vorg` reads the origins.
+
+type VertMetric = { advance: i64, tsb: i64 }
+
+type Vorg = { default_y: i64, records: [(i64, i64)] }
+
+type VertError =
+    | VertMalformed(why: str)
+
+fn uint(d: bytes, at: i64, n: i64) -> i64 ! VertError {
+    if at < 0 or at + n > d.len() {
+        fail(VertMalformed("a read past the end at {at}"))
+    }
+    var v = 0
+    for k in 0..n {
+        v = v.shl(8).bit_or(d.at(at + k))
+    }
+    return v
+}
+
+fn sint(d: bytes, at: i64, n: i64) -> i64 ! VertError {
+    let v = try uint(d, at, n)
+    let top = 1.shl(8 * n - 1)
+    return if v >= top { v - 2 * top } else { v }
+}
+
+/// Every glyph's (advance height, top side bearing).
+pub fn vmtx(vhea: bytes, table: bytes, glyphs: i64) -> [VertMetric] ! VertError {
+    let long = try uint(vhea, 34, 2)
+    if long == 0 and glyphs > 0 {
+        fail(VertMalformed("no long metrics"))
+    }
+    var out: [VertMetric] = []
+    for g in 0..glyphs {
+        if g < long {
+            out.push(VertMetric{ advance: try uint(table, 4 * g, 2), tsb: try sint(table, 4 * g + 2, 2) })
+        } else {
+            out.push(VertMetric{ advance: out[long - 1].advance, tsb: try sint(table, 4 * long + 2 * (g - long), 2) })
+        }
+    }
+    return out
+}
+
+/// The `VORG` table.
+pub fn vorg(d: bytes) -> Vorg ! VertError {
+    let n = try uint(d, 6, 2)
+    var recs: [(i64, i64)] = []
+    for i in 0..n {
+        recs.push((try uint(d, 8 + 4 * i, 2), try sint(d, 10 + 4 * i, 2)))
+    }
+    return Vorg{ default_y: try sint(d, 4, 2), records: recs }
+}
+
+/// A glyph's vertical origin.
+pub fn origin(v: Vorg, glyph: i64) -> i64 {
+    for (g, y) in v.records {
+        if g == glyph {
+            return y
+        }
+    }
+    return v.default_y
+}

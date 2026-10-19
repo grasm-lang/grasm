@@ -1,0 +1,182 @@
+// OpenType item variation stores, and the HVAR, VVAR and MVAR tables that
+// use them.
+//
+// A variable font says how every number varies across its design space
+// the same way: a region is a box over the axes (start, peak and end per
+// axis, in F2Dot14), and an item variation data block lists, for each of
+// its items, one delta per region it uses -- packed as 16-bit words for
+// the first few regions and bytes for the rest, or 32-bit and 16-bit when
+// the long-words flag is set. A number's variation is named by an outer
+// index (the data block) and an inner one (the item). HVAR and VVAR map
+// each glyph's advance (and side bearings, and vertical origin) to such
+// an index through a delta-set index map -- entries of one to four bytes
+// whose low bits are the inner index -- or, with no map, glyph g to item
+// g of block 0. MVAR does the same for font-wide metrics by tag (`hasc`,
+// `xhgt`, `strs`...).
+//
+// `store` reads a store at an offset; `index_map` reads a map;
+// `hvar`/`mvar` read those tables; `describe_*` write lines for
+// comparison.
+
+type VarRegion = { axes: [(i64, i64, i64)] }
+
+type VarData = { regions: [i64], items: [[i64]] }
+
+type VarStore = { regions: [VarRegion], data: [VarData] }
+
+type HvarTable = { store: VarStore, advance: [(i64, i64)], lsb: [(i64, i64)], rsb: [(i64, i64)], origin: [(i64, i64)] }
+
+type MvarTable = { store: VarStore, records: [(str, i64, i64)] }
+
+type VarError =
+    | VarMalformed(why: str)
+
+fn uint(d: bytes, at: i64, n: i64) -> i64 ! VarError {
+    if at < 0 or at + n > d.len() {
+        fail(VarMalformed("a read past the end"))
+    }
+    var v = 0
+    for k in 0..n {
+        v = v.shl(8).bit_or(d.at(at + k))
+    }
+    return v
+}
+
+fn sint(d: bytes, at: i64, n: i64) -> i64 ! VarError {
+    let v = try uint(d, at, n)
+    let top = 1.shl(8 * n - 1)
+    return if v >= top { v - 2 * top } else { v }
+}
+
+fn data_at(d: bytes, at: i64) -> VarData ! VarError {
+    let items = try uint(d, at, 2)
+    let word = try uint(d, at + 2, 2)
+    let long = word.bit_and(32768) != 0
+    let words = word.bit_and(32767)
+    let nreg = try uint(d, at + 4, 2)
+    var regions: [i64] = []
+    for k in 0..nreg {
+        regions.push(try uint(d, at + 6 + 2 * k, 2))
+    }
+    let big = if long { 4 } else { 2 }
+    let small = if long { 2 } else { 1 }
+    var p = at + 6 + 2 * nreg
+    var rows: [[i64]] = []
+    for _i in 0..items {
+        var row: [i64] = []
+        for k in 0..nreg {
+            let n = if k < words { big } else { small }
+            row.push(try sint(d, p, n))
+            p = p + n
+        }
+        rows.push(row)
+    }
+    return VarData{ regions: regions, items: rows }
+}
+
+/// The item variation store at `at`.
+pub fn store(d: bytes, at: i64) -> VarStore ! VarError {
+    let rl = at + (try uint(d, at + 2, 4))
+    let axes = try uint(d, rl, 2)
+    let nreg = try uint(d, rl + 2, 2)
+    var regions: [VarRegion] = []
+    for r in 0..nreg {
+        var ax: [(i64, i64, i64)] = []
+        for a in 0..axes {
+            let p = rl + 4 + (r * axes + a) * 6
+            ax.push((try sint(d, p, 2), try sint(d, p + 2, 2), try sint(d, p + 4, 2)))
+        }
+        regions.push(VarRegion{ axes: ax })
+    }
+    var data: [VarData] = []
+    let n = try uint(d, at + 6, 2)
+    for i in 0..n {
+        data.push(try data_at(d, at + (try uint(d, at + 8 + 4 * i, 4))))
+    }
+    return VarStore{ regions: regions, data: data }
+}
+
+/// A delta-set index map: (outer, inner) by index.
+pub fn index_map(d: bytes, at: i64) -> [(i64, i64)] ! VarError {
+    let format = try uint(d, at, 1)
+    let entry = try uint(d, at + 1, 1)
+    let count = if format == 0 { try uint(d, at + 2, 2) } else { try uint(d, at + 2, 4) }
+    let size = entry.ushr(4).bit_and(3) + 1
+    let inner_bits = entry.bit_and(15) + 1
+    var p = at + (if format == 0 { 4 } else { 6 })
+    var out: [(i64, i64)] = []
+    for _i in 0..count {
+        let v = try uint(d, p, size)
+        out.push((v.ushr(inner_bits), v.bit_and(1.shl(inner_bits) - 1)))
+        p = p + size
+    }
+    return out
+}
+
+fn map_or_none(d: bytes, off: i64) -> [(i64, i64)] ! VarError {
+    return if off == 0 { [] } else { try index_map(d, off) }
+}
+
+/// HVAR or VVAR (`vertical` true adds the vertical-origin map).
+pub fn hvar(d: bytes, vertical: bool) -> HvarTable ! VarError {
+    return HvarTable{ store: try store(d, try uint(d, 4, 4)), advance: try map_or_none(d, try uint(d, 8, 4)), lsb: try map_or_none(d, try uint(d, 12, 4)),
+        rsb: try map_or_none(d, try uint(d, 16, 4)), origin: if vertical { try map_or_none(d, try uint(d, 20, 4)) } else { [] } }
+}
+
+/// MVAR.
+pub fn mvar(d: bytes) -> MvarTable ! VarError {
+    let size = try uint(d, 6, 2)
+    let count = try uint(d, 8, 2)
+    let off = try uint(d, 10, 2)
+    var recs: [(str, i64, i64)] = []
+    for i in 0..count {
+        let r = 12 + i * size
+        recs.push((d.slice(r, r + 4).to_str(), try uint(d, r + 4, 2), try uint(d, r + 6, 2)))
+    }
+    return MvarTable{ store: if off == 0 { VarStore{ regions: [], data: [] } } else { try store(d, off) }, records: recs }
+}
+
+/// The store as lines: regions (start,peak,end per axis), then each
+/// block's regions and items.
+pub fn describe_store(s: VarStore) -> [str] {
+    var out: [str] = []
+    for i in 0..s.regions.len() {
+        out.push("region {i} " + s.regions[i].axes.map(|a| "{a.0},{a.1},{a.2}").join(" "))
+    }
+    for i in 0..s.data.len() {
+        out.push("data {i} " + s.data[i].regions.map(|r| "{r}").join(","))
+        for j in 0..s.data[i].items.len() {
+            out.push("item {i} {j} " + s.data[i].items[j].map(|v| "{v}").join(","))
+        }
+    }
+    return out
+}
+
+/// A map applied to `glyphs` glyphs: an index past the end uses the last
+/// entry.
+pub fn describe_map(name: str, m: [(i64, i64)], glyphs: i64) -> str {
+    if m.len() == 0 {
+        return name + " -"
+    }
+    var parts: [str] = []
+    for g in 0..glyphs {
+        let e = if g < m.len() { m[g] } else { m[m.len() - 1] }
+        parts.push("{e.0}:{e.1}")
+    }
+    return name + " " + parts.join(",")
+}
+
+pub fn describe_hvar(h: HvarTable, glyphs: i64, vertical: bool) -> [str] {
+    var out = describe_store(h.store)
+    out.push(describe_map("advance", h.advance, glyphs))
+    out.push(describe_map(if vertical { "tsb" } else { "lsb" }, h.lsb, glyphs))
+    out.push(describe_map(if vertical { "bsb" } else { "rsb" }, h.rsb, glyphs))
+    if vertical {
+        out.push(describe_map("origin", h.origin, glyphs))
+    }
+    return out
+}
+
+pub fn describe_mvar(m: MvarTable) -> [str] {
+    return describe_store(m.store) + m.records.map(|r| "value " + r.0 + " {r.1} {r.2}")
+}

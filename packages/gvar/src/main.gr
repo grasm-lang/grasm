@@ -1,0 +1,221 @@
+// The OpenType `gvar` table: how a variable TrueType font's outlines move.
+//
+// For each glyph, a list of tuple variations: each has a peak in the
+// design space (embedded, or one of the table's shared tuples), an
+// optional intermediate region (start and end), and a delta for some of
+// the glyph's points -- every point, or the ones a packed point list
+// names, shared by all the glyph's tuples or private to one. Point
+// numbers are run-length packed as bytes or words and accumulated;
+// deltas are packed in runs of zeros, bytes or words, all the x deltas
+// first, then the y. Points include four phantom points after the
+// outline (or one per component of a composite glyph), which move the
+// side bearings and advance. A tuple with no intermediate region spans
+// from 0 to its peak on each axis.
+//
+// `parse` takes the table, every glyph's point count (phantoms included)
+// and the axis tags from `fvar`, and returns each glyph's tuples with a
+// delta per point (None for a point the tuple does not name; nothing is
+// interpolated). Coordinates are F2Dot14 integers.
+
+type GvarTuple = { axes: [(str, i64, i64, i64)], deltas: [Option[(i64, i64)]] }
+
+type GvarGlyph = { glyph: i64, tuples: [GvarTuple] }
+
+type GvarError =
+    | GvarMalformed(why: str)
+
+fn uint(d: bytes, at: i64, n: i64) -> i64 ! GvarError {
+    if at < 0 or at + n > d.len() {
+        fail(GvarMalformed("a read past the end at {at}"))
+    }
+    var v = 0
+    for k in 0..n {
+        v = v.shl(8).bit_or(d.at(at + k))
+    }
+    return v
+}
+
+fn sint(d: bytes, at: i64, n: i64) -> i64 ! GvarError {
+    let v = try uint(d, at, n)
+    let top = 1.shl(8 * n - 1)
+    return if v >= top { v - 2 * top } else { v }
+}
+
+fn tuple_at(d: bytes, at: i64, axes: i64) -> [i64] ! GvarError {
+    var out: [i64] = []
+    for a in 0..axes {
+        out.push(try sint(d, at + 2 * a, 2))
+    }
+    return out
+}
+
+/// Packed point numbers at `p`: (points, or None for all; next offset).
+fn points_at(d: bytes, p0: i64) -> (Option[[i64]], i64) ! GvarError {
+    var p = p0
+    var count = try uint(d, p, 1)
+    p = p + 1
+    if count.bit_and(128) != 0 {
+        count = count.bit_and(127).shl(8).bit_or(try uint(d, p, 1))
+        p = p + 1
+    }
+    if count == 0 {
+        return (None, p)
+    }
+    var out: [i64] = []
+    var last = 0
+    while out.len() < count {
+        let control = try uint(d, p, 1)
+        p = p + 1
+        let words = control.bit_and(128) != 0
+        for _k in 0..(control.bit_and(127) + 1) {
+            if out.len() >= count {
+                break
+            }
+            last = last + (try uint(d, p, if words { 2 } else { 1 }))
+            p = p + (if words { 2 } else { 1 })
+            out.push(last)
+        }
+    }
+    return (Some(out), p)
+}
+
+/// `n` packed deltas at `p`.
+fn deltas_at(d: bytes, p0: i64, n: i64) -> ([i64], i64) ! GvarError {
+    var p = p0
+    var out: [i64] = []
+    while out.len() < n {
+        let control = try uint(d, p, 1)
+        p = p + 1
+        let run = control.bit_and(63) + 1
+        for _k in 0..run {
+            if control.bit_and(128) != 0 {
+                out.push(0)
+            } else if control.bit_and(64) != 0 {
+                out.push(try sint(d, p, 2))
+                p = p + 2
+            } else {
+                out.push(try sint(d, p, 1))
+                p = p + 1
+            }
+        }
+    }
+    return (out.slice(0, n), p)
+}
+
+fn glyph_data(d: bytes, at: i64, points: i64, tags: [str], shared: [[i64]]) -> [GvarTuple] ! GvarError {
+    let axes = tags.len()
+    let header = try uint(d, at, 2)
+    let count = header.bit_and(4095)
+    var data = at + (try uint(d, at + 2, 2))
+    var shared_points: Option[[i64]] = None
+    if header.bit_and(32768) != 0 {
+        let (pts, next) = try points_at(d, data)
+        shared_points = pts
+        data = next
+    }
+    var out: [GvarTuple] = []
+    var h = at + 4
+    for _t in 0..count {
+        let size = try uint(d, h, 2)
+        let index = try uint(d, h + 2, 2)
+        h = h + 4
+        var peak: [i64] = []
+        if index.bit_and(32768) != 0 {
+            peak = try tuple_at(d, h, axes)
+            h = h + 2 * axes
+        } else {
+            let k = index.bit_and(4095)
+            if k >= shared.len() {
+                fail(GvarMalformed("a shared tuple {k} that is not there"))
+            }
+            peak = shared[k]
+        }
+        var start = peak.map(|v| if v < 0 { v } else { 0 })
+        var end = peak.map(|v| if v > 0 { v } else { 0 })
+        if index.bit_and(16384) != 0 {
+            start = try tuple_at(d, h, axes)
+            end = try tuple_at(d, h + 2 * axes, axes)
+            h = h + 4 * axes
+        }
+        var p = data
+        var pts = shared_points
+        if index.bit_and(8192) != 0 {
+            let (private, next) = try points_at(d, p)
+            pts = private
+            p = next
+        }
+        let which = pts ?? range_list(points)
+        let (xs, after_x) = try deltas_at(d, p, which.len())
+        let (ys, _after_y) = try deltas_at(d, after_x, which.len())
+        var deltas: [Option[(i64, i64)]] = []
+        for _i in 0..points {
+            deltas.push(None)
+        }
+        for i in 0..which.len() {
+            if which[i] < points {
+                deltas[which[i]] = Some((xs[i], ys[i]))
+            }
+        }
+        var region: [(str, i64, i64, i64)] = []
+        for a in 0..axes {
+            if not (start[a] == 0 and peak[a] == 0 and end[a] == 0) {
+                region.push((tags[a], start[a], peak[a], end[a]))
+            }
+        }
+        out.push(GvarTuple{ axes: region, deltas: deltas })
+        data = data + size
+    }
+    return out
+}
+
+fn range_list(n: i64) -> [i64] {
+    var out: [i64] = []
+    for i in 0..n {
+        out.push(i)
+    }
+    return out
+}
+
+/// Every glyph that varies, with its tuples.
+pub fn parse(d: bytes, point_counts: [i64], tags: [str]) -> [GvarGlyph] ! GvarError {
+    let axes = try uint(d, 4, 2)
+    if axes != tags.len() {
+        fail(GvarMalformed("{axes} axes in gvar, {tags.len()} in fvar"))
+    }
+    let nshared = try uint(d, 6, 2)
+    let shared_at = try uint(d, 8, 4)
+    var shared: [[i64]] = []
+    for i in 0..nshared {
+        shared.push(try tuple_at(d, shared_at + 2 * axes * i, axes))
+    }
+    let glyphs = try uint(d, 12, 2)
+    let long = (try uint(d, 14, 2)).bit_and(1) == 1
+    let array = try uint(d, 16, 4)
+    var out: [GvarGlyph] = []
+    for g in 0..glyphs {
+        let a = if long { try uint(d, 20 + 4 * g, 4) } else { 2 * (try uint(d, 20 + 2 * g, 2)) }
+        let b = if long { try uint(d, 24 + 4 * g, 4) } else { 2 * (try uint(d, 22 + 2 * g, 2)) }
+        if b > a {
+            let points = if g < point_counts.len() { point_counts[g] } else { 4 }
+            out.push(GvarGlyph{ glyph: g, tuples: try glyph_data(d, array + a, points, tags, shared) })
+        }
+    }
+    return out
+}
+
+/// The variations as lines: a glyph with any tuple, then each tuple's
+/// region and deltas.
+pub fn describe(gs: [GvarGlyph]) -> [str] {
+    var out: [str] = []
+    for g in gs.filter(|g| g.tuples.len() > 0) {
+        out.push("glyph {g.glyph}")
+        for t in g.tuples {
+            out.push("tuple " + t.axes.map(|a| a.0 + ":{a.1},{a.2},{a.3}").join(" "))
+            out.push("deltas " + t.deltas.map(|d| match d {
+                Some(xy) -> "{xy.0},{xy.1}"
+                None -> "-"
+            }).join(" "))
+        }
+    }
+    return out
+}

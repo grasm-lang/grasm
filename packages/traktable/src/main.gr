@@ -1,0 +1,76 @@
+// The AAT `trak` table: tracking -- how much looser or tighter to set
+// text at each point size, for each named track (tight, normal, loose).
+//
+// Horizontal and vertical track data each list their point sizes (16.16
+// fixed) once, then for each track its value (16.16), the `name` ID of its
+// name, and an offset to one adjustment per size, in font units. Apple's
+// text system interpolates between sizes; this reads the table as
+// stored.
+//
+// `parse` reads it; `describe` writes lines for comparison.
+
+type TrakTrack = { track: i64, name_id: i64, values: [i64] }
+
+type TrakData = { sizes: [i64], tracks: [TrakTrack] }
+
+type Trak = { horizontal: Option[TrakData], vertical: Option[TrakData] }
+
+type TrakError =
+    | TrakMalformed(why: str)
+
+fn uint(d: bytes, at: i64, n: i64) -> i64 ! TrakError {
+    if at < 0 or at + n > d.len() {
+        fail(TrakMalformed("a read past the end at {at}"))
+    }
+    var v = 0
+    for k in 0..n {
+        v = v.shl(8).bit_or(d.at(at + k))
+    }
+    return v
+}
+
+fn sint(d: bytes, at: i64, n: i64) -> i64 ! TrakError {
+    let v = try uint(d, at, n)
+    let top = 1.shl(8 * n - 1)
+    return if v >= top { v - 2 * top } else { v }
+}
+
+fn data_at(d: bytes, at: i64) -> TrakData ! TrakError {
+    let tracks = try uint(d, at, 2)
+    let sizes = try uint(d, at + 2, 2)
+    let size_table = try uint(d, at + 4, 4)
+    var sz: [i64] = []
+    for i in 0..sizes {
+        sz.push(try sint(d, size_table + 4 * i, 4))
+    }
+    var out: [TrakTrack] = []
+    for t in 0..tracks {
+        let e = at + 8 + 8 * t
+        let off = try uint(d, e + 6, 2)
+        var values: [i64] = []
+        for i in 0..sizes {
+            values.push(try sint(d, off + 2 * i, 2))
+        }
+        out.push(TrakTrack{ track: try sint(d, e, 4), name_id: try uint(d, e + 4, 2), values: values })
+    }
+    return TrakData{ sizes: sz, tracks: out }
+}
+
+/// Reads a `trak` table.
+pub fn parse(d: bytes) -> Trak ! TrakError {
+    let h = try uint(d, 6, 2)
+    let v = try uint(d, 8, 2)
+    return Trak{ horizontal: if h == 0 { None } else { Some(try data_at(d, h)) }, vertical: if v == 0 { None } else { Some(try data_at(d, v)) } }
+}
+
+fn data_lines(name: str, t: Option[TrakData]) -> [str] {
+    return match t {
+        Some(x) -> ["{name} sizes " + x.sizes.map(|s| "{s}").join(",")] + x.tracks.map(|tr| "{name} track {tr.track} {tr.name_id} " + tr.values.map(|v| "{v}").join(","))
+        None -> ["{name} -"]
+    }
+}
+
+/// The table as lines: sizes and tracks, horizontal then vertical.
+pub fn describe(t: Trak) -> [str] {
+    return data_lines("horiz", t.horizontal) + data_lines("vert", t.vertical)
+}

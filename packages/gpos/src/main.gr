@@ -1,0 +1,338 @@
+// The OpenType `GPOS` table: where glyphs go, as shaping engines read it.
+//
+// Kerning, mark placement, cursive joining: scripts and language systems
+// choose features (`kern`, `mark`, `mkmk`, `curs`, `dist`), features
+// name lookups, and each lookup is one kind of positioning:
+//
+// - type 1, single: one glyph moved or widened (a value record);
+// - type 2, pair: a value record for each glyph of a pair, listed pair by
+//   pair or as a matrix over two class definitions;
+// - type 3, cursive: an entry and exit anchor per glyph, joined end to
+//   start;
+// - types 4, 5 and 6: a mark's anchor attached to a base glyph's, to one
+//   component of a ligature, or to another mark, by mark class.
+//
+// Value records carry only the fields their format says (placement and
+// advance, x and y; device tables are skipped). Anchors are read in all
+// three formats for their coordinates. Extension lookups (type 9) are
+// unwrapped; contextual lookups (7 and 8) are kept by type.
+//
+// `parse` reads the table; `describe` writes it as lines, the form the
+// gate compares with fontTools.
+
+type GposLangSys = { script: str, language: str, required: i64, features: [i64] }
+
+type GposFeature = { tag: str, lookups: [i64] }
+
+/// A subtable, flattened to lines of numbers for comparison: each line
+/// begins with a word saying what it is.
+type GposSubtable = { kind: i64, format: i64, lines: [str] }
+
+type GposLookup = { kind: i64, flags: i64, mark_set: i64, subtables: [GposSubtable] }
+
+type Gpos = { langsys: [GposLangSys], features: [GposFeature], lookups: [GposLookup] }
+
+type GposError =
+    | GposMalformed(why: str)
+
+fn u16(b: bytes, at: i64) -> i64 ! GposError {
+    if at < 0 or at + 2 > b.len() {
+        fail(GposMalformed("a read past the end"))
+    }
+    return b.at(at) * 256 + b.at(at + 1)
+}
+
+fn s16(b: bytes, at: i64) -> i64 ! GposError {
+    let v = try u16(b, at)
+    return if v >= 32768 { v - 65536 } else { v }
+}
+
+fn u32(b: bytes, at: i64) -> i64 ! GposError {
+    return (try u16(b, at)) * 65536 + (try u16(b, at + 2))
+}
+
+fn tag(b: bytes, at: i64) -> str ! GposError {
+    if at + 4 > b.len() {
+        fail(GposMalformed("a tag past the end"))
+    }
+    return b.slice(at, at + 4).to_str()
+}
+
+/// The glyphs a coverage table covers, in coverage-index order.
+pub fn coverage(d: bytes, at: i64) -> [i64] ! GposError {
+    let format = try u16(d, at)
+    var out: [i64] = []
+    let n = try u16(d, at + 2)
+    if format == 1 {
+        for i in 0..n {
+            out.push(try u16(d, at + 4 + 2 * i))
+        }
+    } else if format == 2 {
+        for i in 0..n {
+            let r = at + 4 + 6 * i
+            for g in (try u16(d, r))..((try u16(d, r + 2)) + 1) {
+                out.push(g)
+            }
+        }
+    } else {
+        fail(GposMalformed("coverage format {format}"))
+    }
+    return out
+}
+
+/// A class definition: (glyph, class) for every glyph with a class other
+/// than 0, sorted by glyph.
+pub fn class_def(d: bytes, at: i64) -> [(i64, i64)] ! GposError {
+    let format = try u16(d, at)
+    var out: [(i64, i64)] = []
+    if format == 1 {
+        let start = try u16(d, at + 2)
+        let n = try u16(d, at + 4)
+        for i in 0..n {
+            let c = try u16(d, at + 6 + 2 * i)
+            if c != 0 {
+                out.push((start + i, c))
+            }
+        }
+    } else if format == 2 {
+        let n = try u16(d, at + 2)
+        for i in 0..n {
+            let r = at + 4 + 6 * i
+            let c = try u16(d, r + 4)
+            if c != 0 {
+                for g in (try u16(d, r))..((try u16(d, r + 2)) + 1) {
+                    out.push((g, c))
+                }
+            }
+        }
+    } else {
+        fail(GposMalformed("class definition format {format}"))
+    }
+    out.sort_by(|gc| gc.0)
+    return out
+}
+
+fn value_size(format: i64) -> i64 {
+    var n = 0
+    for bit in 0..8 {
+        if format.ushr(bit).bit_and(1) == 1 {
+            n = n + 2
+        }
+    }
+    return n
+}
+
+/// A value record as (x placement, y placement, x advance, y advance).
+fn value(d: bytes, at: i64, format: i64) -> str ! GposError {
+    var v = [0, 0, 0, 0]
+    var p = at
+    for bit in 0..4 {
+        if format.ushr(bit).bit_and(1) == 1 {
+            v[bit] = try s16(d, p)
+            p = p + 2
+        }
+    }
+    return "{v[0]},{v[1]},{v[2]},{v[3]}"
+}
+
+fn anchor(d: bytes, base: i64, off: i64) -> str ! GposError {
+    if off == 0 {
+        return "-"
+    }
+    return "{try s16(d, base + off + 2)},{try s16(d, base + off + 4)}"
+}
+
+fn single(d: bytes, at: i64, format: i64, inout lines: [str]) -> () ! GposError {
+    let cov = try coverage(d, at + (try u16(d, at + 2)))
+    let vf = try u16(d, at + 4)
+    for i in 0..cov.len() {
+        let v = if format == 1 { try value(d, at + 6, vf) } else { try value(d, at + 8 + i * value_size(vf), vf) }
+        lines.push("single {cov[i]} " + v)
+    }
+}
+
+fn pair(d: bytes, at: i64, format: i64, inout lines: [str]) -> () ! GposError {
+    let cov = try coverage(d, at + (try u16(d, at + 2)))
+    let vf1 = try u16(d, at + 4)
+    let vf2 = try u16(d, at + 6)
+    let rec = value_size(vf1) + value_size(vf2)
+    if format == 1 {
+        let n = try u16(d, at + 8)
+        for i in 0..cov.len() {
+            if i >= n {
+                break
+            }
+            let set = at + (try u16(d, at + 10 + 2 * i))
+            let count = try u16(d, set)
+            for k in 0..count {
+                let r = set + 2 + k * (2 + rec)
+                lines.push("pair {cov[i]} {try u16(d, r)} " + (try value(d, r + 2, vf1)) + " " + (try value(d, r + 2 + value_size(vf1), vf2)))
+            }
+        }
+        return ()
+    }
+    let c1 = try class_def(d, at + (try u16(d, at + 8)))
+    let c2 = try class_def(d, at + (try u16(d, at + 10)))
+    let n1 = try u16(d, at + 12)
+    let n2 = try u16(d, at + 14)
+    lines.push("coverage " + cov.map(|g| "{g}").join(","))
+    lines.push("class1 " + c1.map(|gc| "{gc.0}:{gc.1}").join(","))
+    lines.push("class2 " + c2.map(|gc| "{gc.0}:{gc.1}").join(","))
+    for i in 0..n1 {
+        for j in 0..n2 {
+            let r = at + 16 + (i * n2 + j) * rec
+            lines.push("cell {i} {j} " + (try value(d, r, vf1)) + " " + (try value(d, r + value_size(vf1), vf2)))
+        }
+    }
+}
+
+fn mark_array(d: bytes, at: i64, cov: [i64], inout lines: [str]) -> () ! GposError {
+    let n = try u16(d, at)
+    for i in 0..n {
+        if i < cov.len() {
+            let r = at + 2 + 4 * i
+            lines.push("mark {cov[i]} {try u16(d, r)} " + (try anchor(d, at, try u16(d, r + 2))))
+        }
+    }
+}
+
+/// Mark-to-base (4), to-ligature (5) and to-mark (6).
+fn attach(d: bytes, at: i64, kind: i64, inout lines: [str]) -> () ! GposError {
+    let marks = try coverage(d, at + (try u16(d, at + 2)))
+    let bases = try coverage(d, at + (try u16(d, at + 4)))
+    let classes = try u16(d, at + 6)
+    try mark_array(d, at + (try u16(d, at + 8)), marks, lines)
+    let arr = at + (try u16(d, at + 10))
+    let n = try u16(d, arr)
+    for i in 0..n {
+        if i >= bases.len() {
+            break
+        }
+        if kind == 5 {
+            let lig = arr + (try u16(d, arr + 2 + 2 * i))
+            let comps = try u16(d, lig)
+            for c in 0..comps {
+                var anchors: [str] = []
+                for k in 0..classes {
+                    anchors.push(try anchor(d, lig, try u16(d, lig + 2 + (c * classes + k) * 2)))
+                }
+                lines.push("ligature {bases[i]} {c} " + anchors.join(" "))
+            }
+        } else {
+            var anchors: [str] = []
+            for k in 0..classes {
+                anchors.push(try anchor(d, arr, try u16(d, arr + 2 + (i * classes + k) * 2)))
+            }
+            lines.push((if kind == 4 { "base" } else { "mark2" }) + " {bases[i]} " + anchors.join(" "))
+        }
+    }
+}
+
+fn subtable(d: bytes, kind: i64, at: i64) -> GposSubtable ! GposError {
+    let format = try u16(d, at)
+    var lines: [str] = []
+    if kind == 1 {
+        try single(d, at, format, lines)
+    } else if kind == 2 {
+        try pair(d, at, format, lines)
+    } else if kind == 3 {
+        let cov = try coverage(d, at + (try u16(d, at + 2)))
+        let n = try u16(d, at + 4)
+        for i in 0..n {
+            if i < cov.len() {
+                let r = at + 6 + 4 * i
+                lines.push("cursive {cov[i]} " + (try anchor(d, at, try u16(d, r))) + " " + (try anchor(d, at, try u16(d, r + 2))))
+            }
+        }
+    } else if kind >= 4 and kind <= 6 {
+        try attach(d, at, kind, lines)
+    }
+    return GposSubtable{ kind: kind, format: format, lines: lines }
+}
+
+fn lookup_at(d: bytes, at: i64) -> GposLookup ! GposError {
+    let declared = try u16(d, at)
+    var kind = declared
+    let flags = try u16(d, at + 2)
+    let n = try u16(d, at + 4)
+    var subs: [GposSubtable] = []
+    for i in 0..n {
+        var sub = at + (try u16(d, at + 6 + 2 * i))
+        var k = declared
+        if declared == 9 {
+            k = try u16(d, sub + 2)
+            sub = sub + (try u32(d, sub + 4))
+            if i == 0 {
+                kind = k
+            }
+        }
+        subs.push(try subtable(d, k, sub))
+    }
+    let mark_set = if flags.bit_and(16) != 0 { try u16(d, at + 6 + 2 * n) } else { 0 - 1 }
+    return GposLookup{ kind: kind, flags: flags, mark_set: mark_set, subtables: subs }
+}
+
+fn u16_list(d: bytes, at: i64) -> [i64] ! GposError {
+    let n = try u16(d, at)
+    var out: [i64] = []
+    for i in 0..n {
+        out.push(try u16(d, at + 2 + 2 * i))
+    }
+    return out
+}
+
+/// Reads a `GPOS` table.
+pub fn parse(d: bytes) -> Gpos ! GposError {
+    let scripts = try u16(d, 4)
+    let features = try u16(d, 6)
+    let lookups = try u16(d, 8)
+    var langsys: [GposLangSys] = []
+    // A list's offset may be 0: no scripts, features or lookups at all.
+    for i in 0..(if scripts == 0 { 0 } else { try u16(d, scripts) }) {
+        let r = scripts + 2 + 6 * i
+        let stag = try tag(d, r)
+        let s = scripts + (try u16(d, r + 4))
+        let def = try u16(d, s)
+        if def != 0 {
+            langsys.push(GposLangSys{ script: stag, language: "dflt", required: try u16(d, s + def + 2), features: try u16_list(d, s + def + 4) })
+        }
+        for k in 0..(try u16(d, s + 2)) {
+            let lr = s + 4 + 6 * k
+            let l = s + (try u16(d, lr + 4))
+            langsys.push(GposLangSys{ script: stag, language: try tag(d, lr), required: try u16(d, l + 2), features: try u16_list(d, l + 4) })
+        }
+    }
+    var feats: [GposFeature] = []
+    for i in 0..(if features == 0 { 0 } else { try u16(d, features) }) {
+        let r = features + 2 + 6 * i
+        feats.push(GposFeature{ tag: try tag(d, r), lookups: try u16_list(d, features + (try u16(d, r + 4)) + 2) })
+    }
+    var looks: [GposLookup] = []
+    for i in 0..(if lookups == 0 { 0 } else { try u16(d, lookups) }) {
+        looks.push(try lookup_at(d, lookups + (try u16(d, lookups + 2 + 2 * i))))
+    }
+    return Gpos{ langsys: langsys, features: feats, lookups: looks }
+}
+
+/// The table as lines: language systems, features, then each lookup and
+/// its subtables.
+pub fn describe(g: Gpos) -> [str] {
+    var out: [str] = []
+    for l in g.langsys {
+        out.push("langsys " + l.script + " " + l.language + " {l.required} " + l.features.map(|f| "{f}").join(","))
+    }
+    for f in g.features {
+        out.push("feature " + f.tag + " " + f.lookups.map(|x| "{x}").join(","))
+    }
+    for i in 0..g.lookups.len() {
+        let l = g.lookups[i]
+        out.push("lookup {i} {l.kind} {l.flags} {l.mark_set}")
+        for s in l.subtables {
+            out.push("subtable {s.kind} {s.format}")
+            for line in s.lines {
+                out.push(line)
+            }
+        }
+    }
+    return out
+}

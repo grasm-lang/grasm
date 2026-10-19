@@ -1,0 +1,126 @@
+// The OpenType `BASE` table: where each script's baselines sit, so a line
+// mixing scripts (Latin on its roman baseline, CJK on its ideographic
+// em-box, Devanagari hanging from its headline) can line them up.
+//
+// For the horizontal and the vertical axis: the baseline tags the font
+// uses (`romn`, `ideo`, `hang`, `icfb`...), then per script the default
+// baseline and a coordinate for each tag, and the extents (min and max)
+// for the script by default, per language system, and per feature.
+// Coordinates come in three formats (plain, tied to a glyph's contour
+// point, or with a device table); only the coordinate is read.
+//
+// `parse` reads the table; `describe` writes lines for comparison.
+
+type BaseScript = { tag: str, default_index: i64, coords: [i64], min_max: [str] }
+
+type BaseAxis = { tags: [str], scripts: [BaseScript] }
+
+type Base = { horizontal: Option[BaseAxis], vertical: Option[BaseAxis] }
+
+type BaseError =
+    | BaseMalformed(why: str)
+
+fn uint(d: bytes, at: i64, n: i64) -> i64 ! BaseError {
+    if at < 0 or at + n > d.len() {
+        fail(BaseMalformed("a read past the end at {at}"))
+    }
+    var v = 0
+    for k in 0..n {
+        v = v.shl(8).bit_or(d.at(at + k))
+    }
+    return v
+}
+
+fn sint(d: bytes, at: i64, n: i64) -> i64 ! BaseError {
+    let v = try uint(d, at, n)
+    let top = 1.shl(8 * n - 1)
+    return if v >= top { v - 2 * top } else { v }
+}
+
+fn coord(d: bytes, base: i64, off: i64) -> str ! BaseError {
+    return if off == 0 { "-" } else { "{try sint(d, base + off + 2, 2)}" }
+}
+
+/// A MinMax table as "min max feature:min:max ...".
+fn min_max(d: bytes, at: i64) -> str ! BaseError {
+    var parts = [try coord(d, at, try uint(d, at, 2)), try coord(d, at, try uint(d, at + 2, 2))]
+    let n = try uint(d, at + 4, 2)
+    for i in 0..n {
+        let r = at + 6 + 8 * i
+        parts.push(d.slice(r, r + 4).to_str() + ":" + (try coord(d, at, try uint(d, r + 4, 2))) + ":" + (try coord(d, at, try uint(d, r + 6, 2))))
+    }
+    return parts.join(" ")
+}
+
+fn script_at(d: bytes, tag: str, at: i64) -> BaseScript ! BaseError {
+    let values = try uint(d, at, 2)
+    let def_mm = try uint(d, at + 2, 2)
+    let n = try uint(d, at + 4, 2)
+    var default_index = 0 - 1
+    var coords: [i64] = []
+    if values != 0 {
+        let v = at + values
+        default_index = try uint(d, v, 2)
+        for k in 0..(try uint(d, v + 2, 2)) {
+            coords.push(try sint(d, v + (try uint(d, v + 4 + 2 * k, 2)) + 2, 2))
+        }
+    }
+    var mm: [str] = []
+    if def_mm != 0 {
+        mm.push("default " + (try min_max(d, at + def_mm)))
+    }
+    for i in 0..n {
+        let r = at + 6 + 6 * i
+        mm.push(d.slice(r, r + 4).to_str() + " " + (try min_max(d, at + (try uint(d, r + 4, 2)))))
+    }
+    return BaseScript{ tag: tag, default_index: default_index, coords: coords, min_max: mm }
+}
+
+fn axis_at(d: bytes, at: i64) -> BaseAxis ! BaseError {
+    let tag_list = try uint(d, at, 2)
+    let script_list = try uint(d, at + 2, 2)
+    var tags: [str] = []
+    if tag_list != 0 {
+        let t = at + tag_list
+        for k in 0..(try uint(d, t, 2)) {
+            tags.push(d.slice(t + 2 + 4 * k, t + 6 + 4 * k).to_str())
+        }
+    }
+    var scripts: [BaseScript] = []
+    if script_list != 0 {
+        let s = at + script_list
+        for k in 0..(try uint(d, s, 2)) {
+            let r = s + 2 + 6 * k
+            scripts.push(try script_at(d, d.slice(r, r + 4).to_str(), s + (try uint(d, r + 4, 2))))
+        }
+    }
+    return BaseAxis{ tags: tags, scripts: scripts }
+}
+
+/// Reads a `BASE` table.
+pub fn parse(d: bytes) -> Base ! BaseError {
+    let h = try uint(d, 4, 2)
+    let v = try uint(d, 6, 2)
+    return Base{ horizontal: if h == 0 { None } else { Some(try axis_at(d, h)) }, vertical: if v == 0 { None } else { Some(try axis_at(d, v)) } }
+}
+
+fn axis_lines(name: str, a: Option[BaseAxis]) -> [str] {
+    return match a {
+        Some(x) -> {
+            var out = [name + " tags " + x.tags.join(",")]
+            for s in x.scripts {
+                out.push(name + " script " + s.tag + " {s.default_index} " + s.coords.map(|c| "{c}").join(","))
+                for m in s.min_max {
+                    out.push(name + " minmax " + s.tag + " " + m)
+                }
+            }
+            out
+        }
+        None -> [name + " -"]
+    }
+}
+
+/// The table as lines, horizontal axis then vertical.
+pub fn describe(b: Base) -> [str] {
+    return axis_lines("horiz", b.horizontal) + axis_lines("vert", b.vertical)
+}

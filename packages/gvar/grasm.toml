@@ -1,0 +1,4 @@
+[package]
+name = "gvar"
+version = "1.0.0"
+capabilities = []
