@@ -1,0 +1,167 @@
+// Mach-O symbol tables: what `nm` prints.
+//
+// LC_SYMTAB points at an array of nlist entries -- a string-table offset,
+// a type byte, a section number, a description and a value -- and the
+// string table their names live in. The type byte holds the stab bits
+// (debugging entries, kept in linked binaries as the "debug map" that
+// tells dsymutil where each object's DWARF is), the private-external and
+// external bits, and the kind: undefined (a common symbol when it has a
+// value: its size), absolute, defined in a section, prebound undefined,
+// or indirect. LC_SEGMENT and LC_SEGMENT_64 name the sections the
+// section numbers count through. Linkers, profilers, crash symbolicators
+// and every tool that turns an address into a name read this.
+//
+// `symbols` reads the table of an image (at any offset, so a slice of a
+// universal binary works); `nm_letter` and `nm_line` render a symbol as
+// `nm -ap` does: "T" for __TEXT,__text, "D" for __DATA,__data, "B" for
+// __DATA,__bss, "S" for other sections, "U" undefined, "C" common, "A"
+// absolute, "I" indirect, lower case when not external, and stabs as
+// "-" with their type, section and description.
+//
+// Checked against `nm -ap` on objects, executables and libraries clang
+// builds, for arm64 and x86_64, with and without debug maps.
+import machoread
+
+type MachSymbol = { name: str, kind: i64, section: i64, desc: i64, value: i64 }
+
+type MachSection = { segment: str, name: str }
+
+type SymtabError =
+    | SymMalformed(why: str)
+
+fn word(d: bytes, at: i64, n: i64, big: bool) -> i64 ! SymtabError {
+    if at < 0 or at + n > d.len() {
+        fail(SymMalformed("a read past the end"))
+    }
+    var v = 0
+    for k in 0..n {
+        let b = if big { d.at(at + k) } else { d.at(at + n - 1 - k) }
+        v = v.shl(8).bit_or(b)
+    }
+    return v
+}
+
+fn cstr(d: bytes, from: i64, limit: i64) -> str {
+    var e = from
+    while e < limit and e < d.len() and d.at(e) != 0 {
+        e = e + 1
+    }
+    return d.slice(from, e).to_str()
+}
+
+/// The sections of an image, numbered from 1 in load-command order.
+pub fn sections(d: bytes, at: i64) -> [MachSection] ! SymtabError {
+    let h = machoread.header(d, at) ?? fail(SymMalformed("not a Mach-O image"))
+    var out: [MachSection] = []
+    for c in machoread.commands(d, at) ?? fail(SymMalformed("bad load commands")) {
+        if c.kind == 1 or c.kind == 25 {
+            let wide = c.kind == 25
+            let nsects = try word(d, c.at + (if wide { 64 } else { 48 }), 4, h.big_endian)
+            var p = c.at + (if wide { 72 } else { 56 })
+            for _k in 0..nsects {
+                out.push(MachSection{ segment: cstr(d, p + 16, p + 32), name: cstr(d, p, p + 16) })
+                p = p + (if wide { 80 } else { 68 })
+            }
+        }
+    }
+    return out
+}
+
+/// The symbols of an image, in table order.
+pub fn symbols(d: bytes, at: i64) -> [MachSymbol] ! SymtabError {
+    let h = machoread.header(d, at) ?? fail(SymMalformed("not a Mach-O image"))
+    var out: [MachSymbol] = []
+    for c in machoread.commands(d, at) ?? fail(SymMalformed("bad load commands")) {
+        if c.kind != 2 {
+            continue
+        }
+        let symoff = at + (try word(d, c.at + 8, 4, h.big_endian))
+        let nsyms = try word(d, c.at + 12, 4, h.big_endian)
+        let stroff = at + (try word(d, c.at + 16, 4, h.big_endian))
+        let strsize = try word(d, c.at + 20, 4, h.big_endian)
+        let size = if h.is_64 { 16 } else { 12 }
+        for k in 0..nsyms {
+            let p = symoff + k * size
+            let strx = try word(d, p, 4, h.big_endian)
+            out.push(MachSymbol{ name: if strx > 0 and strx < strsize { cstr(d, stroff + strx, stroff + strsize) } else { "" },
+                kind: try word(d, p + 4, 1, h.big_endian), section: try word(d, p + 5, 1, h.big_endian), desc: try word(d, p + 6, 2, h.big_endian),
+                value: try word(d, p + 8, if h.is_64 { 8 } else { 4 }, h.big_endian) })
+        }
+    }
+    return out
+}
+
+pub fn is_stab(s: MachSymbol) -> bool {
+    return s.kind.bit_and(224) != 0
+}
+
+pub fn is_external(s: MachSymbol) -> bool {
+    return s.kind.bit_and(1) != 0
+}
+
+/// The letter `nm` gives a symbol.
+pub fn nm_letter(s: MachSymbol, secs: [MachSection]) -> str {
+    if is_stab(s) {
+        return "-"
+    }
+    let t = s.kind.bit_and(14)
+    var c = "?"
+    if t == 0 {
+        c = if s.value != 0 { "C" } else { "U" }
+    } else if t == 2 {
+        c = "A"
+    } else if t == 14 {
+        c = "S"
+        if s.section >= 1 and s.section <= secs.len() {
+            let sec = secs[s.section - 1]
+            if sec.segment == "__TEXT" and sec.name == "__text" {
+                c = "T"
+            } else if sec.segment == "__DATA" and sec.name == "__data" {
+                c = "D"
+            } else if sec.segment == "__DATA" and sec.name == "__bss" {
+                c = "B"
+            }
+        }
+    } else if t == 12 {
+        c = "U"
+    } else if t == 10 {
+        c = "I"
+    }
+    return if is_external(s) { c } else { c.to_lower() }
+}
+
+fn hex_pad(v: i64, n: i64) -> str {
+    let digits = "0123456789abcdef"
+    var parts: [str] = []
+    for k in 0..n {
+        parts.push(digits.substr(v.ushr(4 * (n - 1 - k)).bit_and(15), 1))
+    }
+    return parts.join("")
+}
+
+/// Stab type names, as `nm` prints them.
+pub fn stab_name(kind: i64) -> str {
+    let names = [(32, "GSYM"), (34, "FNAME"), (36, "FUN"), (38, "STSYM"), (40, "LCSYM"), (46, "BNSYM"), (50, "AST"), (60, "OPT"), (64, "RSYM"),
+        (68, "SLINE"), (78, "ENSYM"), (96, "SSYM"), (100, "SO"), (102, "OSO"), (128, "LSYM"), (130, "BINCL"), (132, "SOL"), (134, "PARAMS"),
+        (136, "VERSION"), (138, "OLEVEL"), (160, "PSYM"), (162, "EINCL"), (164, "ENTRY"), (192, "LBRAC"), (194, "EXCL"), (224, "RBRAC"),
+        (226, "BCOMM"), (228, "ECOMM"), (232, "ECOML"), (254, "LENG")]
+    for (k, n) in names {
+        if k == kind {
+            return n
+        }
+    }
+    return hex_pad(kind, 2)
+}
+
+/// A symbol as `nm -ap` prints it.
+pub fn nm_line(s: MachSymbol, secs: [MachSection], is_64: bool) -> str {
+    let width = if is_64 { 16 } else { 8 }
+    let letter = nm_letter(s, secs)
+    if letter == "-" {
+        let st = stab_name(s.kind)
+        return hex_pad(s.value, width) + " - " + hex_pad(s.section, 2) + " " + hex_pad(s.desc, 4) + " " + " ".repeat(if st.len() < 5 { 5 - st.len() } else { 0 }) +
+        st + " " + s.name
+    }
+    let undefined = letter == "U" or letter == "u"
+    return (if undefined { " ".repeat(width) } else { hex_pad(s.value, width) }) + " " + letter + " " + s.name
+}

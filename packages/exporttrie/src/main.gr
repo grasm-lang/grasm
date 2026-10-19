@@ -1,0 +1,344 @@
+// The export trie of a Mach-O image: what a dylib offers to dyld.
+//
+// Every exported symbol is a path through a prefix tree whose edges are
+// strings. A node starts with the size of its terminal information (0 when
+// no symbol ends there), then that information -- flags, then either the
+// address as an offset from the image's base, a library ordinal and the
+// name a re-export imports, or a stub address and its resolver -- then a
+// child count and, per child, the edge's string and the child's offset
+// from the start of the trie, all numbers ULEB128. The low two flag bits
+// say regular, thread-local or absolute; 4 marks a weak definition, 8 a
+// re-export, 0x10 a stub with a resolver. The trie lives where
+// LC_DYLD_EXPORTS_TRIE, or LC_DYLD_INFO's export range, says.
+//
+// `exports` reads every entry in the trie's own order; `export_line`
+// renders one as `dyld_info -exports` does. `encode` builds a trie as
+// ld-prime (Xcode 15 on) writes it: names added in byte order, so every
+// node's edges are sorted; the root first, in room for a five-byte offset
+// per edge (zeros after it when the offsets come out shorter), then each
+// node after its children; the whole padded to eight bytes.
+import machoread
+
+type ExportEntry = {
+    name: str,
+    flags: i64,
+    /// The offset from the image base, the stub, or (re-exports) the
+    /// library ordinal.
+    value: i64,
+    resolver: i64,
+    import_name: str,
+}
+
+type TrieError =
+    | TrieMalformed(why: str)
+    | TrieMissing()
+
+fn uleb(d: bytes, at: i64) -> (i64, i64) ! TrieError {
+    var v = 0
+    var shift = 0
+    var p = at
+    while true {
+        if p >= d.len() or shift > 63 {
+            fail(TrieMalformed("a number past the end of the trie"))
+        }
+        let b = d.at(p)
+        v = v.bit_or(b.bit_and(127).shl(shift))
+        p = p + 1
+        shift = shift + 7
+        if b < 128 {
+            break
+        }
+    }
+    return (v, p)
+}
+
+fn cstr(d: bytes, at: i64) -> (str, i64) ! TrieError {
+    var e = at
+    while e < d.len() and d.at(e) != 0 {
+        e = e + 1
+    }
+    if e >= d.len() {
+        fail(TrieMalformed("an unterminated string"))
+    }
+    return (d.slice(at, e).to_str(), e + 1)
+}
+
+fn walk(d: bytes, node: i64, prefix: str, depth: i64, inout out: [ExportEntry]) -> () ! TrieError {
+    if depth > 512 or node >= d.len() {
+        fail(TrieMalformed("a node past the end, or a loop"))
+    }
+    let (size, body) = try uleb(d, node)
+    if size > 0 {
+        let (flags, p1) = try uleb(d, body)
+        if flags.bit_and(8) != 0 {
+            let (ordinal, p2) = try uleb(d, p1)
+            let (imp, _p3) = try cstr(d, p2)
+            out.push(ExportEntry{ name: prefix, flags: flags, value: ordinal, resolver: 0, import_name: imp })
+        } else {
+            let (value, p2) = try uleb(d, p1)
+            let (resolver, _p3) = if flags.bit_and(16) != 0 { try uleb(d, p2) } else { (0, p2) }
+            out.push(ExportEntry{ name: prefix, flags: flags, value: value, resolver: resolver, import_name: "" })
+        }
+    }
+    var p = body + size
+    if p >= d.len() {
+        fail(TrieMalformed("a node without its child count"))
+    }
+    let n = d.at(p)
+    p = p + 1
+    for _k in 0..n {
+        let (edge, q) = try cstr(d, p)
+        let (child, q2) = try uleb(d, q)
+        try walk(d, child, prefix + edge, depth + 1, out)
+        p = q2
+    }
+}
+
+/// Every entry of a trie, in the order a walk of it meets them.
+pub fn decode(trie: bytes) -> [ExportEntry] ! TrieError {
+    var out: [ExportEntry] = []
+    if trie.len() > 0 {
+        try walk(trie, 0, "", 0, out)
+    }
+    return out
+}
+
+fn word(d: bytes, at: i64, big: bool) -> i64 {
+    var v = 0
+    for k in 0..4 {
+        v = v.shl(8).bit_or(d.at(if big { at + k } else { at + 3 - k }))
+    }
+    return v
+}
+
+/// The trie of the image at `at`.
+pub fn trie_of(image: bytes, at: i64) -> bytes ! TrieError {
+    let h = machoread.header(image, at) ?? fail(TrieMalformed("not a Mach-O image"))
+    for c in machoread.commands(image, at) ?? fail(TrieMalformed("bad load commands")) {
+        let (off, size) = if c.kind == 2147483699 { (word(image, c.at + 8, h.big_endian), word(image, c.at + 12, h.big_endian)) }
+        else if c.kind == 2147483682 or c.kind == 34 { (word(image, c.at + 40, h.big_endian), word(image, c.at + 44, h.big_endian)) }
+        else { (0, 0) }
+        if size > 0 {
+            if at + off + size > image.len() {
+                fail(TrieMalformed("a trie past the end of the file"))
+            }
+            return image.slice(at + off, at + off + size)
+        }
+    }
+    fail(TrieMissing())
+}
+
+/// The exports of the image at `at` (0 for a thin file).
+pub fn exports(image: bytes, at: i64) -> [ExportEntry] ! TrieError {
+    return try decode(try trie_of(image, at))
+}
+
+fn hex8(v: i64) -> str {
+    let digits = "0123456789ABCDEF"
+    var s = ""
+    var x = v
+    var n = 0
+    while n < 8 or x > 0 {
+        s = digits.substr(x.bit_and(15), 1) + s
+        x = x.ushr(4)
+        n = n + 1
+    }
+    return s
+}
+
+/// One entry as `dyld_info -exports` prints it, `libs` being the leaf
+/// names of the image's libraries by ordinal (1 first).
+pub fn export_line(e: ExportEntry, libs: [str]) -> str {
+    if e.flags.bit_and(8) != 0 {
+        let lib = if e.value >= 1 and e.value <= libs.len() { libs[e.value - 1] } else { "{e.value}" }
+        return "[re-export] " + e.name + " (" + (if e.import_name.len() > 0 and e.import_name != e.name { e.import_name + " " } else { "" }) + "from " + lib + ")"
+    }
+    var tags: [str] = []
+    let kind = e.flags.bit_and(3)
+    if kind == 1 {
+        tags.push("per-thread")
+    }
+    if kind == 2 {
+        tags.push("absolute")
+    }
+    if e.flags.bit_and(4) != 0 {
+        tags.push("weak-def")
+    }
+    if e.flags.bit_and(16) != 0 {
+        tags.push("resolver=0x" + hex8(e.resolver))
+    }
+    return "0x" + hex8(e.value) + "  " + e.name + if tags.len() > 0 { " [" + tags.join(", ") + "]" } else { "" }
+}
+
+// --- encoding --------------------------------------------------------------
+
+type ExportNode = { edges: [(str, i64)], entry: i64, offset: i64 }
+
+fn common(a: str, b: str) -> i64 {
+    let x = a.to_bytes()
+    let y = b.to_bytes()
+    var n = 0
+    while n < x.len() and n < y.len() and x.at(n) == y.at(n) {
+        n = n + 1
+    }
+    return n
+}
+
+fn add(inout nodes: [ExportNode], name: str, entry: i64) {
+    var node = 0
+    var rest = name
+    while true {
+        var moved = false
+        for k in 0..nodes[node].edges.len() {
+            let (edge, child) = nodes[node].edges[k]
+            let n = common(edge, rest)
+            if n == edge.len() and n > 0 {
+                node = child
+                rest = rest.substr(n, rest.len() - n)
+                moved = true
+                break
+            }
+            if n > 0 {
+                // Split the edge where the names part.
+                nodes.push(ExportNode{ edges: [(edge.substr(n, edge.len() - n), child)], entry: 0 - 1, offset: 0 })
+                var edges = nodes[node].edges
+                edges[k] = (edge.substr(0, n), nodes.len() - 1)
+                var parent = nodes[node]
+                parent.edges = edges
+                nodes[node] = parent
+                node = nodes.len() - 1
+                rest = rest.substr(n, rest.len() - n)
+                moved = true
+                break
+            }
+        }
+        if not moved {
+            break
+        }
+        if rest.len() == 0 {
+            break
+        }
+    }
+    if rest.len() == 0 {
+        var at = nodes[node]
+        at.entry = entry
+        nodes[node] = at
+        return
+    }
+    nodes.push(ExportNode{ edges: [], entry: entry, offset: 0 })
+    var parent = nodes[node]
+    var edges = parent.edges
+    edges.push((rest, nodes.len() - 1))
+    parent.edges = edges
+    nodes[node] = parent
+}
+
+fn uleb_put(inout out: [i64], v: i64) {
+    var x = v
+    while true {
+        let b = x.bit_and(127)
+        x = x.ushr(7)
+        if x == 0 {
+            out.push(b)
+            break
+        }
+        out.push(b.bit_or(128))
+    }
+}
+
+fn terminal(e: ExportEntry) -> [i64] {
+    var t: [i64] = []
+    uleb_put(t, e.flags)
+    if e.flags.bit_and(8) != 0 {
+        uleb_put(t, e.value)
+        for b in e.import_name.to_bytes().to_list() {
+            t.push(b)
+        }
+        t.push(0)
+    } else {
+        uleb_put(t, e.value)
+        if e.flags.bit_and(16) != 0 {
+            uleb_put(t, e.resolver)
+        }
+    }
+    return t
+}
+
+fn node_bytes(nodes: [ExportNode], entries: [ExportEntry], i: i64) -> [i64] {
+    var out: [i64] = []
+    let n = nodes[i]
+    if n.entry >= 0 {
+        let t = terminal(entries[n.entry])
+        uleb_put(out, t.len())
+        for b in t {
+            out.push(b)
+        }
+    } else {
+        out.push(0)
+    }
+    out.push(n.edges.len())
+    for (edge, child) in n.edges {
+        for b in edge.to_bytes().to_list() {
+            out.push(b)
+        }
+        out.push(0)
+        uleb_put(out, nodes[child].offset)
+    }
+    return out
+}
+
+fn post_order(nodes: [ExportNode], i: i64, inout order: [i64]) {
+    for (_edge, child) in nodes[i].edges {
+        post_order(nodes, child, order)
+    }
+    order.push(i)
+}
+
+/// A trie of these entries as ld (ld-prime, Xcode 15 on) writes it.
+pub fn encode(entries: [ExportEntry]) -> bytes {
+    var sorted = entries
+    sorted.sort_by(|e| e.name)
+    var nodes = [ExportNode{ edges: [], entry: 0 - 1, offset: 0 }]
+    for i in 0..sorted.len() {
+        add(nodes, sorted[i].name, i)
+    }
+    // The root first, with room for a five-byte offset per edge since its
+    // children are not placed yet; then every other node after its
+    // children, so each offset is known when its parent is written.
+    var order: [i64] = []
+    for (_edge, child) in nodes[0].edges {
+        post_order(nodes, child, order)
+    }
+    // The terminal part (one zero byte when no name ends at the root),
+    // the child count, and the edges.
+    var reserved = 2
+    if nodes[0].entry >= 0 {
+        let t = terminal(sorted[nodes[0].entry])
+        var head: [i64] = []
+        uleb_put(head, t.len())
+        reserved = head.len() + t.len() + 1
+    }
+    for (edge, _child) in nodes[0].edges {
+        reserved = reserved + edge.to_bytes().len() + 1 + 5
+    }
+    var offset = reserved
+    for i in order {
+        var x = nodes[i]
+        x.offset = offset
+        nodes[i] = x
+        offset = offset + node_bytes(nodes, sorted, i).len()
+    }
+    var out = node_bytes(nodes, sorted, 0)
+    while out.len() < reserved {
+        out.push(0)
+    }
+    for i in order {
+        for b in node_bytes(nodes, sorted, i) {
+            out.push(b)
+        }
+    }
+    while out.len() % 8 != 0 {
+        out.push(0)
+    }
+    return bytes_of(out)
+}

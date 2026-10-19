@@ -1,0 +1,4 @@
+[package]
+name = "sqlitejournal"
+version = "1.0.0"
+capabilities = []

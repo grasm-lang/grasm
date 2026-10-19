@@ -1,0 +1,407 @@
+// DWARF line tables: which source line every machine address came from.
+//
+// A debugger setting a breakpoint on a line, a profiler naming the line a
+// sample hit, a crash reporter turning a backtrace into file:line -- all
+// read .debug_line. Each unit there is a header (versions 2 to 5: the
+// address and opcode parameters, then the directories and files -- in
+// version 5 as entries whose fields and their encodings the header itself
+// describes, names often pointing into .debug_line_str) and a program for
+// a small state machine. Special opcodes advance the address and line
+// together and emit a row in one byte; standard and extended opcodes set
+// the file, column, flags, discriminator and address, and end a sequence.
+//
+// `section` finds a section of a 64-bit Mach-O image (an object, or the
+// DWARF file inside a .dSYM); `tables` runs every unit's program; and
+// `row_text` prints a row as `dwarfdump --debug-line` does. Files count
+// from 0 in version 5 and from 1 before it, as each version says.
+import machoread
+
+type LineFile = { name: str, dir: i64, md5: str }
+
+type LineRow = {
+    address: i64,
+    line: i64,
+    column: i64,
+    file: i64,
+    isa: i64,
+    discriminator: i64,
+    op_index: i64,
+    is_stmt: bool,
+    basic_block: bool,
+    end_sequence: bool,
+    prologue_end: bool,
+    epilogue_begin: bool,
+}
+
+type LineTable = {
+    offset: i64,
+    version: i64,
+    address_size: i64,
+    min_inst: i64,
+    max_ops: i64,
+    default_is_stmt: bool,
+    line_base: i64,
+    line_range: i64,
+    opcode_base: i64,
+    dirs: [str],
+    files: [LineFile],
+    rows: [LineRow],
+}
+
+type DwarfError =
+    | DwarfMalformed(at: i64, why: str)
+
+type DwCursor = { d: bytes, at: i64 }
+
+fn need(c: DwCursor, n: i64) -> () ! DwarfError {
+    if c.at < 0 or c.at + n > c.d.len() {
+        fail(DwarfMalformed(c.at, "a read past the end"))
+    }
+}
+
+fn u(inout c: DwCursor, n: i64) -> i64 ! DwarfError {
+    try need(c, n)
+    var v = 0
+    for k in 0..n {
+        v = v.bit_or(c.d.at(c.at + k).shl(8 * k))
+    }
+    c.at = c.at + n
+    return v
+}
+
+fn uleb(inout c: DwCursor) -> i64 ! DwarfError {
+    var v = 0
+    var shift = 0
+    while true {
+        try need(c, 1)
+        let b = c.d.at(c.at)
+        c.at = c.at + 1
+        if shift < 64 {
+            v = v.bit_or(b.bit_and(127).shl(shift))
+        }
+        shift = shift + 7
+        if b < 128 {
+            break
+        }
+    }
+    return v
+}
+
+fn sleb(inout c: DwCursor) -> i64 ! DwarfError {
+    var v = 0
+    var shift = 0
+    var b = 128
+    while b >= 128 {
+        try need(c, 1)
+        b = c.d.at(c.at)
+        c.at = c.at + 1
+        if shift < 64 {
+            v = v.bit_or(b.bit_and(127).shl(shift))
+        }
+        shift = shift + 7
+    }
+    if shift < 64 and b.bit_and(64) != 0 {
+        v = v.bit_or((0 - 1).shl(shift))
+    }
+    return v
+}
+
+fn cstr_at(d: bytes, at: i64) -> str {
+    var e = at
+    while e < d.len() and d.at(e) != 0 {
+        e = e + 1
+    }
+    return d.slice(at, e).to_str()
+}
+
+fn cstr(inout c: DwCursor) -> str ! DwarfError {
+    try need(c, 1)
+    let s = cstr_at(c.d, c.at)
+    c.at = c.at + s.to_bytes().len() + 1
+    return s
+}
+
+/// A section's bytes from a 64-bit Mach-O image, empty when it has none.
+pub fn section(image: bytes, segment: str, name: str) -> bytes ! DwarfError {
+    for c in machoread.commands(image, 0) ?? fail(DwarfMalformed(0, "not a Mach-O image")) {
+        if c.kind == 25 {
+            var cur = DwCursor{ d: image, at: c.at + 64 }
+            let n = try u(cur, 4)
+            for k in 0..n {
+                let s = c.at + 72 + 80 * k
+                if cstr_at(image.slice(s, s + 16), 0) == name and cstr_at(image.slice(s + 16, s + 32), 0) == segment {
+                    var r = DwCursor{ d: image, at: s + 40 }
+                    let size = try u(r, 8)
+                    let off = try u(r, 4)
+                    if off + size > image.len() {
+                        fail(DwarfMalformed(s, "a section past the end of the file"))
+                    }
+                    return image.slice(off, off + size)
+                }
+            }
+        }
+    }
+    return bytes_of([])
+}
+
+fn hex2(b: i64) -> str {
+    let digits = "0123456789abcdef"
+    return digits.substr(b.ushr(4), 1) + digits.substr(b.bit_and(15), 1)
+}
+
+/// One field of a version-5 entry, by its form: a string, or a number as
+/// text.
+fn form_value(inout c: DwCursor, form: i64, offset_size: i64, line_str: bytes, strs: bytes) -> str ! DwarfError {
+    if form == 8 {
+        return try cstr(c)
+    }
+    if form == 31 or form == 14 {
+        let off = try u(c, offset_size)
+        let table = if form == 31 { line_str } else { strs }
+        if off >= table.len() {
+            fail(DwarfMalformed(c.at, "a string offset past its section"))
+        }
+        return cstr_at(table, off)
+    }
+    if form == 30 {
+        try need(c, 16)
+        var s = ""
+        for k in 0..16 {
+            s = s + hex2(c.d.at(c.at + k))
+        }
+        c.at = c.at + 16
+        return s
+    }
+    let n = if form == 15 { try uleb(c) } else if form == 11 { try u(c, 1) } else if form == 5 { try u(c, 2) } else if form == 6 { try u(c, 4) }
+    else if form == 7 { try u(c, 8) } else if form == 9 { 0 - 1 } else { fail(DwarfMalformed(c.at, "an entry form {form}")) }
+    if n == 0 - 1 {
+        let len = try uleb(c)
+        try need(c, len)
+        c.at = c.at + len
+        return ""
+    }
+    return "{n}"
+}
+
+/// Version 5 directory or file entries: (path, directory index, MD5).
+fn entries(inout c: DwCursor, offset_size: i64, line_str: bytes, strs: bytes) -> [(str, i64, str)] ! DwarfError {
+    let nformats = try u(c, 1)
+    var formats: [(i64, i64)] = []
+    for _k in 0..nformats {
+        let kind = try uleb(c)
+        let form = try uleb(c)
+        formats.push((kind, form))
+    }
+    let count = try uleb(c)
+    var out: [(str, i64, str)] = []
+    for _i in 0..count {
+        var path = ""
+        var dir = 0
+        var md5 = ""
+        for (kind, form) in formats {
+            let v = try form_value(c, form, offset_size, line_str, strs)
+            if kind == 1 {
+                path = v
+            } else if kind == 2 {
+                dir = v.parse_int() ?? 0
+            } else if kind == 5 {
+                md5 = v
+            }
+        }
+        out.push((path, dir, md5))
+    }
+    return out
+}
+
+fn fresh(t: LineTable) -> LineRow {
+    return LineRow{ address: 0, line: 1, column: 0, file: 1, isa: 0, discriminator: 0, op_index: 0, is_stmt: t.default_is_stmt, basic_block: false,
+        end_sequence: false, prologue_end: false, epilogue_begin: false }
+}
+
+fn emit(inout rows: [LineRow], inout r: LineRow) {
+    rows.push(r)
+    r.basic_block = false
+    r.prologue_end = false
+    r.epilogue_begin = false
+    r.discriminator = 0
+}
+
+fn advance(t: LineTable, inout r: LineRow, steps: i64) {
+    let total = r.op_index + steps
+    r.address = r.address + t.min_inst * (total / t.max_ops)
+    r.op_index = total % t.max_ops
+}
+
+fn run(inout c: DwCursor, end: i64, t: LineTable, lengths: [i64]) -> [LineRow] ! DwarfError {
+    var rows: [LineRow] = []
+    var r = fresh(t)
+    while c.at < end {
+        let op = try u(c, 1)
+        if op >= t.opcode_base {
+            let adj = op - t.opcode_base
+            advance(t, r, adj / t.line_range)
+            r.line = r.line + t.line_base + adj % t.line_range
+            emit(rows, r)
+        } else if op == 0 {
+            let len = try uleb(c)
+            let next = c.at + len
+            if len == 0 {
+                continue
+            }
+            let sub = try u(c, 1)
+            if sub == 1 {
+                r.end_sequence = true
+                emit(rows, r)
+                r = fresh(t)
+            } else if sub == 2 {
+                r.address = try u(c, len - 1)
+                r.op_index = 0
+            } else if sub == 4 {
+                r.discriminator = try uleb(c)
+            }
+            c.at = next
+        } else if op == 1 {
+            emit(rows, r)
+        } else if op == 2 {
+            advance(t, r, try uleb(c))
+        } else if op == 3 {
+            r.line = r.line + (try sleb(c))
+        } else if op == 4 {
+            r.file = try uleb(c)
+        } else if op == 5 {
+            r.column = try uleb(c)
+        } else if op == 6 {
+            r.is_stmt = not r.is_stmt
+        } else if op == 7 {
+            r.basic_block = true
+        } else if op == 8 {
+            advance(t, r, (255 - t.opcode_base) / t.line_range)
+        } else if op == 9 {
+            r.address = r.address + (try u(c, 2))
+            r.op_index = 0
+        } else if op == 10 {
+            r.prologue_end = true
+        } else if op == 11 {
+            r.epilogue_begin = true
+        } else if op == 12 {
+            r.isa = try uleb(c)
+        } else {
+            for _k in 0..lengths[op - 1] {
+                try uleb(c)
+            }
+        }
+    }
+    return rows
+}
+
+fn header_files(inout c: DwCursor, inout t: LineTable, offset_size: i64, line_str: bytes, strs: bytes) -> () ! DwarfError {
+    if t.version >= 5 {
+        t.dirs = (try entries(c, offset_size, line_str, strs)).map(|e| e.0)
+        t.files = (try entries(c, offset_size, line_str, strs)).map(|e| LineFile{ name: e.0, dir: e.1, md5: e.2 })
+        return
+    }
+    // Before version 5 the directories and files count from 1; the list
+    // here keeps slot 0 for the unit's own directory.
+    var dirs = [""]
+    while true {
+        let s = try cstr(c)
+        if s.len() == 0 {
+            break
+        }
+        dirs.push(s)
+    }
+    t.dirs = dirs
+    var files = [LineFile{ name: "", dir: 0, md5: "" }]
+    while true {
+        let s = try cstr(c)
+        if s.len() == 0 {
+            break
+        }
+        let dir = try uleb(c)
+        try uleb(c)
+        try uleb(c)
+        files.push(LineFile{ name: s, dir: dir, md5: "" })
+    }
+    t.files = files
+}
+
+/// One unit at `at`: its header and rows, and where the next begins.
+pub fn table_at(d: bytes, at: i64, line_str: bytes, strs: bytes) -> (LineTable, i64) ! DwarfError {
+    var c = DwCursor{ d: d, at: at }
+    var len = try u(c, 4)
+    var offset_size = 4
+    if len == 4294967295 {
+        len = try u(c, 8)
+        offset_size = 8
+    }
+    let end = c.at + len
+    if end > d.len() {
+        fail(DwarfMalformed(at, "a unit longer than the section"))
+    }
+    let version = try u(c, 2)
+    if version < 2 or version > 5 {
+        fail(DwarfMalformed(at, "line table version {version}"))
+    }
+    let asize = if version >= 5 { try u(c, 1) } else { 8 }
+    if version >= 5 {
+        try u(c, 1)
+    }
+    let header_len = try u(c, offset_size)
+    let program = c.at + header_len
+    let min_inst = try u(c, 1)
+    let max_ops = if version >= 4 { try u(c, 1) } else { 1 }
+    let is_stmt = (try u(c, 1)) != 0
+    let base = try u(c, 1)
+    var t = LineTable{ offset: at, version: version, address_size: asize, min_inst: min_inst, max_ops: if max_ops == 0 { 1 } else { max_ops },
+        default_is_stmt: is_stmt, line_base: if base > 127 { base - 256 } else { base }, line_range: try u(c, 1), opcode_base: try u(c, 1), dirs: [],
+        files: [], rows: [] }
+    if t.line_range == 0 {
+        fail(DwarfMalformed(at, "a line range of 0"))
+    }
+    var lengths: [i64] = []
+    for _k in 1..t.opcode_base {
+        lengths.push(try u(c, 1))
+    }
+    try header_files(c, t, offset_size, line_str, strs)
+    c.at = program
+    t.rows = try run(c, end, t, lengths)
+    return (t, end)
+}
+
+/// Every unit in a .debug_line section.
+pub fn tables(d: bytes, line_str: bytes, strs: bytes) -> [LineTable] ! DwarfError {
+    var out: [LineTable] = []
+    var at = 0
+    while at < d.len() {
+        let (t, next) = try table_at(d, at, line_str, strs)
+        out.push(t)
+        at = next
+    }
+    return out
+}
+
+/// The line tables of a Mach-O object or .dSYM DWARF file.
+pub fn tables_of(image: bytes) -> [LineTable] ! DwarfError {
+    return try tables(try section(image, "__DWARF", "__debug_line"), try section(image, "__DWARF", "__debug_line_str"), try section(image, "__DWARF", "__debug_str"))
+}
+
+fn pad(s: str, n: i64) -> str {
+    return if s.len() >= n { s } else { " ".repeat(n - s.len()) + s }
+}
+
+/// A row as `dwarfdump --debug-line` prints it.
+pub fn row_text(r: LineRow) -> str {
+    var a = ""
+    for k in 0..16 {
+        a = "0123456789abcdef".substr(r.address.ushr(4 * k).bit_and(15), 1) + a
+    }
+    var flags = ""
+    for (on, name) in [(r.is_stmt, "is_stmt"), (r.basic_block, "basic_block"), (r.end_sequence, "end_sequence"), (r.prologue_end, "prologue_end"),
+        (r.epilogue_begin, "epilogue_begin")] {
+        if on {
+            flags = flags + " " + name
+        }
+    }
+    return "0x" + a + " " + pad("{r.line}", 6) + " " + pad("{r.column}", 6) + " " + pad("{r.file}", 6) + " " + pad("{r.isa}", 3) + " " +
+    pad("{r.discriminator}", 13) + " " + pad("{r.op_index}", 7) + " " + flags
+}

@@ -1,0 +1,8 @@
+[package]
+name = "symtab"
+version = "1.0.0"
+capabilities = []
+
+[dependencies.machoread]
+path = "../machoread"
+version = "^1.0.0"

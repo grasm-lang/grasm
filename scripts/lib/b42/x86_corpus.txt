@@ -1,0 +1,193 @@
+# Instructions chosen for awkward encodings: prefixes, moffs, ENTER,
+# RET imm16, x87, VEX, EVEX (map 5 too), XOP, TBM, SSE4a, AMX, 3DNow!.
+movabsb 0x1122334455667788, %al
+movabsl %eax, 0x1122334455667788
+movabsq $0x123456789abcdef0, %rax
+movl (%eax), %ebx
+lock xaddl %eax, (%rbx)
+rep movsb
+repne scasb
+movw $0x1234, %ax
+addw $0x1234, (%rax)
+testb $1, (%rax)
+testw $0x100, %cx
+testl $0x10000, %ecx
+testq $1, 8(%rsp)
+notl %eax
+negq (%rdi)
+mull %ecx
+enter $16, $0
+leave
+retq $8
+lretq
+int $0x80
+int3
+ud2
+cpuid
+rdtsc
+syscall
+pause
+fldl (%rax)
+faddp %st, %st(1)
+fnstcw -2(%rsp)
+fxch %st(3)
+movq %fs:0x28, %rax
+movl %gs:(%rax), %ecx
+jmpq *%rax
+jmpq *(%rax,%rbx,8)
+callq *0x10(%rip)
+pushq $0x12345678
+pushq $5
+pushw %ax
+movzbl (%rax,%rcx,4), %edx
+movsbq -1(%rbp), %rax
+imull $1000, %eax, %ecx
+imulw $7, %ax, %cx
+shldl $3, %eax, %ebx
+shrdq %cl, %rax, %rbx
+btl $5, (%rax)
+btsq %rax, (%rbx)
+bswapl %eax
+bswapq %r9
+cmpxchg16b (%rdi)
+xchgl %eax, %r8d
+nop
+nopl 0(%rax,%rax,1)
+nopw %cs:0(%rax,%rax,1)
+movq (%r13), %rax
+movq (%r12), %rax
+leaq (,%rax,4), %rbx
+movl 0x12345678, %eax
+movb %ah, %bl
+movb %sil, %al
+addq $-1, %rax
+andl $0xffffff00, %eax
+inb $0x60, %al
+outb %al, $0x80
+1: loop 1b
+2: jrcxz 2b
+3: xbegin 3b
+xabort $1
+vzeroupper
+vzeroall
+vpxor %ymm0, %ymm1, %ymm2
+vpshufd $0x1b, %xmm1, %xmm2
+vcmpps $3, %ymm0, %ymm1, %ymm2
+vblendvps %xmm4, %xmm3, %xmm2, %xmm1
+vpermq $0x4e, %ymm1, %ymm2
+vgatherdps %xmm2, (%rax,%xmm1,4), %xmm3
+vpaddd %zmm0, %zmm1, %zmm2
+vpaddd 64(%rax), %zmm1, %zmm2 {%k1}
+vpternlogd $0xff, %zmm0, %zmm0, %zmm0
+kmovw %k1, %eax
+vpcmpeqd %zmm1, %zmm2, %k1
+vcvtph2ps %xmm1, %ymm2
+andnl %eax, %ebx, %ecx
+shlxq %rax, %rbx, %rcx
+rorxl $5, %eax, %ebx
+pdepq %rax, %rbx, %rcx
+adcxl %eax, %ebx
+crc32b %al, %ecx
+crc32q (%rax), %rcx
+popcntl %eax, %ebx
+lzcntq %rax, %rbx
+movbel (%rax), %ebx
+pshufb %xmm1, %xmm2
+palignr $3, %xmm1, %xmm2
+pextrb $1, %xmm0, %eax
+aesenc %xmm1, %xmm2
+pclmulqdq $0x11, %xmm1, %xmm2
+sha256rnds2 %xmm0, %xmm1, %xmm2
+sha1rnds4 $3, %xmm1, %xmm2
+roundsd $4, %xmm1, %xmm2
+endbr64
+rdrandl %eax
+rdseedq %rax
+xgetbv
+clflush (%rax)
+prefetcht0 (%rax)
+lfence
+mfence
+sfence
+movntdq %xmm0, (%rax)
+cmovneq %rax, %rbx
+setne %al
+cqto
+cltq
+cwtl
+movsq
+stosq
+lodsb
+xlatb
+sahf
+lahf
+cmc
+hlt
+wrmsr
+rdmsr
+swapgs
+sysretq
+iretq
+invlpg (%rax)
+lgdtq (%rax)
+movq %cr0, %rax
+movq %dr7, %rax
+monitor
+mwait
+vmcall
+xsave (%rax)
+xrstor64 (%rax)
+fxsave64 (%rax)
+ldmxcsr (%rax)
+vldmxcsr (%rax)
+tzcntl %eax, %ebx
+bextrl %eax, %ebx, %ecx
+vpdpbusd %zmm1, %zmm2, %zmm3
+vfmadd231ps %zmm1, %zmm2, %zmm3
+vaddph %zmm1, %zmm2, %zmm3
+vcvtsh2ss %xmm1, %xmm2, %xmm3
+movq %rax, %xmm0
+movd %xmm0, %eax
+pinsrw $2, %eax, %xmm0
+pextrw $1, %xmm0, %eax
+pmovmskb %xmm0, %eax
+psrlw $3, %xmm0
+psllq $7, %mm0
+pshufw $0x1b, %mm1, %mm2
+emms
+femms
+pfadd %mm1, %mm2
+extrq $5, $10, %xmm0
+insertq $5, $10, %xmm1, %xmm0
+vpcmov %xmm1, %xmm2, %xmm3, %xmm4
+vprotd $3, %xmm1, %xmm2
+vfrczps %xmm1, %xmm2
+bextr $0x1234, %eax, %ebx
+blcfill %eax, %ebx
+movl $1, %r15d
+addl $100, 0x7fffffff(%rip)
+cmpb $0x7f, -0x80(%rbp,%rsi,2)
+movq %rax, %es:(%rdi)
+data16 nop
+addr32 nop
+rex64 nop
+lock addl $1, %fs:(%eax,%ebx,4)
+vmovdqu8 %zmm1, (%rax) {%k2}
+vpbroadcastd (%rax), %zmm1
+vextracti64x4 $1, %zmm1, %ymm2
+tileloadd (%rax,%rbx,1), %tmm0
+ldtilecfg (%rax)
+vpmadd52luq %zmm1, %zmm2, %zmm3
+encodekey128 %eax, %ebx
+serialize
+xsusldtrk
+wbnoinvd
+clwb (%rax)
+cldemote (%rax)
+umonitor %rax
+tpause %eax
+movdiri %eax, (%rbx)
+enqcmd (%rax), %rbx
+uiret
+testui
+senduipi %rax

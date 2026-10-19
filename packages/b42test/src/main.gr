@@ -1,0 +1,191 @@
+// The harness scripts/b42_diff.py drives: one operation per (op, path)
+// pair, one answer line each. Text answers are hex, so any byte survives.
+import symtab
+import machofat
+import codesig
+import exporttrie
+import chainedfixups
+import dwarfline
+import sqlitewal
+import sqlitejournal
+import x86len
+import goscanner
+import machoread
+
+fn hex(b: bytes) -> str {
+    let digits = "0123456789abcdef"
+    var parts: [str] = []
+    for x in b.to_list() {
+        parts.push(digits.substr(x.ushr(4), 1) + digits.substr(x.bit_and(15), 1))
+    }
+    return parts.join("")
+}
+
+fn hs(s: str) -> str {
+    return hex(s.to_bytes())
+}
+
+fn lines_hex(ls: [str]) -> str {
+    return hs(ls.join("\n"))
+}
+
+fn spec(d: bytes) -> [[str]] {
+    return d.to_str().split("\n").filter(|l| l.len() > 0).map(|l| l.split(" "))
+}
+
+fn read_or_fail(path: str) -> bytes ! str / {io} {
+    return read_bytes(path) ?? fail("cannot read " + path)
+}
+
+fn nm(d: bytes) -> str ! str {
+    let h = machoread.header(d, 0) ?? fail("header")
+    let secs = symtab.sections(d, 0) ?? fail("sections")
+    let syms = symtab.symbols(d, 0) ?? fail("symbols")
+    return lines_hex(syms.map(|s| symtab.nm_line(s, secs, h.is_64)))
+}
+
+fn fat(op: [str], path: str, d: bytes) -> str ! str / {io} {
+    if op[0] == "fatcreate" {
+        var page = 16384
+        var wide = false
+        var images: [bytes] = []
+        for f in spec(d) {
+            if f[0] == "page" {
+                page = f[1].parse_int() ?? 16384
+            } else if f[0] == "fat64" {
+                wide = f[1] == "1"
+            } else {
+                images.push(try read_or_fail(f[0]))
+            }
+        }
+        write_bytes(path + ".fat", machofat.create(images, page, wide) ?? fail("create")) ?? fail("write")
+        return "ok"
+    }
+    if op[0] == "fatinfo" {
+        return (machofat.slices(d) ?? fail("slices")).map(|s| machofat.arch_name(s.cpu_type, s.cpu_subtype) + ":{s.offset}:{s.size}:{s.align}").join(",")
+    }
+    let cpu = op[1].parse_int() ?? 0
+    let sub = op[2].parse_int() ?? 0
+    if op[0] == "fatthin" {
+        write_bytes(path + ".thin", machofat.slice_of(d, cpu, sub) ?? fail("thin")) ?? fail("write")
+        return "ok"
+    }
+    write_bytes(path + ".rm", machofat.remove(d, cpu, sub) ?? fail("remove")) ?? fail("write")
+    return "ok"
+}
+
+fn sign(op: str, d: bytes) -> str ! str {
+    let sig = codesig.signature(d, 0) ?? fail("signature")
+    if op == "cs" {
+        return lines_hex(codesig.describe(sig) ?? fail("describe")) + "|" + lines_hex(codesig.problems(d, 0) ?? fail("problems"))
+    }
+    if op == "csproblems" {
+        return lines_hex(codesig.problems(d, 0) ?? fail("problems"))
+    }
+    let again = codesig.linker_sign(d, (codesig.primary(sig) ?? fail("primary")).identifier) ?? fail("sign")
+    return if again == d { "same" } else { "differs" }
+}
+
+fn objects(op: str, d: bytes) -> str ! str {
+    if op == "exports" {
+        let libs = chainedfixups.library_names(d, 0) ?? fail("libs")
+        return lines_hex((exporttrie.exports(d, 0) ?? fail("exports")).map(|e| exporttrie.export_line(e, libs)))
+    }
+    if op == "exportenc" {
+        let t = exporttrie.trie_of(d, 0) ?? fail("trie")
+        return if exporttrie.encode(exporttrie.decode(t) ?? fail("decode")) == t { "same" } else { "differs" }
+    }
+    if op == "fixups" {
+        return lines_hex(chainedfixups.describe(d, 0) ?? fail("fixups"))
+    }
+    var out: [str] = []
+    for t in dwarfline.tables_of(d) ?? fail("dwarf") {
+        out.push("table {t.version}")
+        for i in 0..t.files.len() {
+            let f = t.files[i]
+            out.push("file {i} {f.dir} " + f.name)
+        }
+        for r in t.rows {
+            out.push(dwarfline.row_text(r))
+        }
+    }
+    return lines_hex(out)
+}
+
+fn sqlite(op: str, path: str, d: bytes) -> str ! str / {io} {
+    let f = spec(d)
+    if op == "walapply" {
+        write_bytes(path + ".out", sqlitewal.apply(try read_or_fail(f[0][0]), try read_or_fail(f[0][1])) ?? fail("apply")) ?? fail("write")
+        return "ok"
+    }
+    if op == "journal" {
+        write_bytes(path + ".out", sqlitejournal.rollback(try read_or_fail(f[0][0]), try read_or_fail(f[0][1])) ?? fail("rollback")) ?? fail("write")
+        return "ok"
+    }
+    // walenc: "page_size checkpoint salt1 salt2 db_pages", then "page path" lines.
+    let h = f[0].map(|x| x.parse_int() ?? 0)
+    var frames: [(i64, bytes)] = []
+    for k in 1..f.len() {
+        frames.push((f[k][0].parse_int() ?? 0, try read_or_fail(f[k][1])))
+    }
+    write_bytes(path + ".wal", sqlitewal.encode(h[0], h[1], h[2], h[3], frames, h[4]) ?? fail("encode")) ?? fail("write")
+    return "ok"
+}
+
+fn x86(d: bytes) -> str ! str {
+    var out: [str] = []
+    var at = 0
+    while at < d.len() {
+        let n = x86len.length(d, at) ?? fail("decode at {at}")
+        out.push("{at}:{n}")
+        at = at + n
+    }
+    return out.join(",")
+}
+
+fn go(d: bytes) -> str {
+    let (toks, errs) = goscanner.tokens(d)
+    return lines_hex(toks.map(|t| "{t.offset} " + t.tok + " " + hex(t.lit))) + "|{errs}"
+}
+
+fn answer(op: [str], path: str, d: bytes) -> str ! str / {io} {
+    let o = op[0]
+    if o == "nm" {
+        return try nm(d)
+    }
+    if o.starts_with("fat") {
+        return try fat(op, path, d)
+    }
+    if o.starts_with("cs") {
+        return try sign(o, d)
+    }
+    if o == "exports" or o == "exportenc" or o == "fixups" or o == "dwarf" {
+        return try objects(o, d)
+    }
+    if o == "walapply" or o == "walenc" or o == "journal" {
+        return try sqlite(o, path, d)
+    }
+    if o == "x86" {
+        return try x86(d)
+    }
+    if o == "go" {
+        return go(d)
+    }
+    fail("unknown op " + o)
+}
+
+fn main() / {io} {
+    let argv = args()
+    var i = 0
+    while i + 1 < argv.len() {
+        let out = match read_bytes(argv[i + 1]) {
+            Ok(data) -> match answer(argv[i].split(":"), argv[i + 1], data) {
+                Ok(s) -> s
+                Err(_) -> "ERR"
+            }
+            Err(_) -> "NOFILE"
+        }
+        print(out)
+        i = i + 2
+    }
+}

@@ -1,0 +1,291 @@
+// Universal ("fat") Mach-O files: reading them, and writing them as
+// `lipo` does.
+//
+// A fat file is a big-endian header -- magic cafebabe, or cafebabf for the
+// 64-bit form whose offsets and sizes are 64 bits wide -- then one entry
+// per slice (CPU type, subtype, offset, size, alignment as a power of two),
+// then each slice at an offset rounded up to its alignment, zeros between.
+//
+// What `lipo -create` decides, and what this package decides the same way
+// (cctools misc/lipo.c and libstuff/align.c):
+//
+// - Alignment. An object file gets the host's page size (2^14 on Apple
+//   silicon, 2^12 on Intel), passed in here. Any other image gets, for each
+//   segment, the largest power of two dividing its vmaddr (a vmaddr of 0
+//   says nothing), clamped to 2^3 (2^2 for 32-bit) and 2^15, and the
+//   smallest of those. A static library gets 2^3 for a 64-bit CPU, else
+//   2^2; its CPU is that of its first Mach-O member.
+// - Order. Slices of one CPU type go by subtype; arm64 slices go after
+//   every other; the rest go by alignment. Input order does not matter.
+// - Slices that rewrite an existing fat file (`-remove`, `-replace`) keep
+//   the alignment recorded for them.
+//
+// `slices` reads a fat file, `slice_of` cuts one out (`lipo -thin`),
+// `create` builds one from thin images (`lipo -create`), `remove` drops an
+// architecture (`lipo -remove`), and `arch_name` names a CPU as `lipo
+// -archs` does.
+import machoread
+
+type FatSlice = { cpu_type: i64, cpu_subtype: i64, offset: i64, size: i64, align: i64 }
+
+type FatError =
+    | FatMalformed(why: str)
+    | FatDuplicate(arch: str)
+    | FatMissing(arch: str)
+
+/// A slice waiting to be laid out: its CPU, alignment and bytes.
+type FatPart = { cpu_type: i64, cpu_subtype: i64, align: i64, data: bytes }
+
+fn be(d: bytes, at: i64, n: i64) -> i64 ! FatError {
+    if at < 0 or at + n > d.len() {
+        fail(FatMalformed("a read past the end at {at}"))
+    }
+    var v = 0
+    for k in 0..n {
+        v = v.shl(8).bit_or(d.at(at + k))
+    }
+    return v
+}
+
+fn le_or_be(d: bytes, at: i64, n: i64, big: bool) -> i64 ! FatError {
+    if at < 0 or at + n > d.len() {
+        fail(FatMalformed("a read past the end at {at}"))
+    }
+    var v = 0
+    for k in 0..n {
+        v = v.shl(8).bit_or(d.at(if big { at + k } else { at + n - 1 - k }))
+    }
+    return v
+}
+
+pub fn is_fat(d: bytes) -> bool {
+    return d.len() >= 8 and d.at(0) == 202 and d.at(1) == 254 and d.at(2) == 186 and (d.at(3) == 190 or d.at(3) == 191)
+}
+
+/// The slices of a fat file, in the order its header lists them.
+pub fn slices(d: bytes) -> [FatSlice] ! FatError {
+    if not is_fat(d) {
+        fail(FatMalformed("not a fat file"))
+    }
+    let wide = d.at(3) == 191
+    let n = try be(d, 4, 4)
+    let entry = if wide { 32 } else { 20 }
+    if 8 + n * entry > d.len() {
+        fail(FatMalformed("more slices than the file holds"))
+    }
+    var out: [FatSlice] = []
+    for i in 0..n {
+        let p = 8 + i * entry
+        let w = if wide { 8 } else { 4 }
+        let s = FatSlice{ cpu_type: try be(d, p, 4), cpu_subtype: try be(d, p + 4, 4), offset: try be(d, p + 8, w), size: try be(d, p + 8 + w, w),
+            align: try be(d, p + 8 + 2 * w, 4) }
+        if s.offset + s.size > d.len() {
+            fail(FatMalformed("a slice past the end of the file"))
+        }
+        out.push(s)
+    }
+    return out
+}
+
+/// One slice's bytes.
+pub fn bytes_of_slice(d: bytes, s: FatSlice) -> bytes {
+    return d.slice(s.offset, s.offset + s.size)
+}
+
+fn masked(subtype: i64) -> i64 {
+    return subtype.bit_and(16777215)
+}
+
+/// The slice for an architecture, by CPU type and subtype (its capability
+/// bits ignored), as `lipo -thin` writes it.
+pub fn slice_of(d: bytes, cpu_type: i64, cpu_subtype: i64) -> bytes ! FatError {
+    for s in try slices(d) {
+        if s.cpu_type == cpu_type and masked(s.cpu_subtype) == masked(cpu_subtype) {
+            return bytes_of_slice(d, s)
+        }
+    }
+    fail(FatMissing(arch_name(cpu_type, cpu_subtype)))
+}
+
+/// The largest power of two dividing an address, clamped as cctools'
+/// guess_align clamps it.
+pub fn guess_align(vmaddr: i64, low: i64, high: i64) -> i64 {
+    if vmaddr == 0 {
+        return high
+    }
+    var a = 0
+    while vmaddr.ushr(a).bit_and(1) == 0 {
+        a = a + 1
+    }
+    return if a < low { low } else if a > high { high } else { a }
+}
+
+fn page_log(page_size: i64) -> i64 {
+    var a = 0
+    while 1.shl(a) < page_size {
+        a = a + 1
+    }
+    return a
+}
+
+/// The CPU of an `ar` archive: that of its first Mach-O member.
+fn archive_cpu(d: bytes) -> (i64, i64) ! FatError {
+    var at = 8
+    while at + 60 <= d.len() {
+        let size = d.slice(at + 48, at + 58).to_str().trim().parse_int() ?? fail(FatMalformed("an archive member size"))
+        let head = d.slice(at, at + 16).to_str()
+        let skip = if head.starts_with("#1/") { head.substr(3, head.len() - 3).trim().parse_int() ?? 0 } else { 0 }
+        let m = at + 60 + skip
+        if m + 4 <= d.len() {
+            let magic = try be(d, m, 4)
+            if magic == 3489328638 or magic == 4277009102 or magic == 3489328639 or magic == 4277009103 {
+                let h = machoread.header(d, m) ?? fail(FatMalformed("an archive member header"))
+                return (h.cpu_type, h.cpu_subtype)
+            }
+        }
+        at = at + 60 + size + size % 2
+    }
+    fail(FatMalformed("an archive with no Mach-O member"))
+}
+
+/// What `lipo -create` puts in a fat entry for a thin image: its CPU and
+/// alignment. `page_size` is the host's (16384 on Apple silicon).
+pub fn part(image: bytes, page_size: i64) -> FatPart ! FatError {
+    if image.len() >= 8 and image.slice(0, 8).to_str() == "!<arch>\n" {
+        let (cpu, sub) = try archive_cpu(image)
+        return FatPart{ cpu_type: cpu, cpu_subtype: sub, align: if cpu.bit_and(16777216) != 0 { 3 } else { 2 }, data: image }
+    }
+    let h = machoread.header(image, 0) ?? fail(FatMalformed("not a Mach-O image or archive"))
+    let low = if h.is_64 { 3 } else { 2 }
+    if h.file_type == 1 {
+        return FatPart{ cpu_type: h.cpu_type, cpu_subtype: h.cpu_subtype, align: guess_align(page_size, low, 15), data: image }
+    }
+    var align = 15
+    for c in machoread.commands(image, 0) ?? fail(FatMalformed("bad load commands")) {
+        if c.kind == 1 or c.kind == 25 {
+            let vmaddr = try le_or_be(image, c.at + 24, if c.kind == 25 { 8 } else { 4 }, h.big_endian)
+            let a = guess_align(vmaddr, low, 15)
+            if a < align {
+                align = a
+            }
+        }
+    }
+    return FatPart{ cpu_type: h.cpu_type, cpu_subtype: h.cpu_subtype, align: align, data: image }
+}
+
+/// lipo's order: by subtype within a CPU type, arm64 last, the rest by
+/// alignment.
+fn before(a: FatPart, b: FatPart) -> bool {
+    if a.cpu_type == b.cpu_type {
+        return masked(a.cpu_subtype) < masked(b.cpu_subtype)
+    }
+    if a.cpu_type == 16777228 {
+        return false
+    }
+    if b.cpu_type == 16777228 {
+        return true
+    }
+    return a.align < b.align
+}
+
+fn put(out: [i64], v: i64, n: i64) -> [i64] {
+    var o = out
+    for k in 0..n {
+        o.push(v.ushr(8 * (n - 1 - k)).bit_and(255))
+    }
+    return o
+}
+
+/// A fat file of these slices, laid out as lipo lays it out.
+pub fn layout(parts: [FatPart], fat64: bool) -> bytes ! FatError {
+    var sorted: [FatPart] = []
+    for p in parts {
+        for q in sorted {
+            if q.cpu_type == p.cpu_type and masked(q.cpu_subtype) == masked(p.cpu_subtype) {
+                fail(FatDuplicate(arch_name(p.cpu_type, p.cpu_subtype)))
+            }
+        }
+        var at = sorted.len()
+        while at > 0 and before(p, sorted[at - 1]) {
+            at = at - 1
+        }
+        var next: [FatPart] = []
+        for k in 0..sorted.len() {
+            if k == at {
+                next.push(p)
+            }
+            next.push(sorted[k])
+        }
+        if at == sorted.len() {
+            next.push(p)
+        }
+        sorted = next
+    }
+    let w = if fat64 { 8 } else { 4 }
+    var offsets: [i64] = []
+    var offset = 8 + sorted.len() * (if fat64 { 32 } else { 20 })
+    for p in sorted {
+        let unit = 1.shl(p.align)
+        offset = (offset + unit - 1) / unit * unit
+        offsets.push(offset)
+        offset = offset + p.data.len()
+    }
+    var out = put(put([], if fat64 { 3405691583 } else { 3405691582 }, 4), sorted.len(), 4)
+    for i in 0..sorted.len() {
+        let p = sorted[i]
+        out = put(put(put(put(put(out, p.cpu_type, 4), p.cpu_subtype, 4), offsets[i], w), p.data.len(), w), p.align, 4)
+        if fat64 {
+            out = put(out, 0, 4)
+        }
+    }
+    for i in 0..sorted.len() {
+        while out.len() < offsets[i] {
+            out.push(0)
+        }
+        for b in sorted[i].data.to_list() {
+            out.push(b)
+        }
+    }
+    return bytes_of(out)
+}
+
+/// `lipo -create`: a fat file from thin images (Mach-O or static library).
+pub fn create(images: [bytes], page_size: i64, fat64: bool) -> bytes ! FatError {
+    var parts: [FatPart] = []
+    for im in images {
+        parts.push(try part(im, page_size))
+    }
+    return try layout(parts, fat64)
+}
+
+/// `lipo -remove`: the fat file without one architecture; the others keep
+/// their recorded alignment.
+pub fn remove(d: bytes, cpu_type: i64, cpu_subtype: i64) -> bytes ! FatError {
+    var parts: [FatPart] = []
+    var found = false
+    for s in try slices(d) {
+        if s.cpu_type == cpu_type and masked(s.cpu_subtype) == masked(cpu_subtype) {
+            found = true
+        } else {
+            parts.push(FatPart{ cpu_type: s.cpu_type, cpu_subtype: s.cpu_subtype, align: s.align, data: bytes_of_slice(d, s) })
+        }
+    }
+    if not found {
+        fail(FatMissing(arch_name(cpu_type, cpu_subtype)))
+    }
+    return try layout(parts, d.at(3) == 191)
+}
+
+/// An architecture's name as `lipo -archs` prints it.
+pub fn arch_name(cpu_type: i64, cpu_subtype: i64) -> str {
+    let sub = masked(cpu_subtype)
+    let names = [(7, 3, "i386"), (16777223, 3, "x86_64"), (16777223, 8, "x86_64h"), (16777228, 0, "arm64"), (16777228, 1, "arm64v8"),
+        (16777228, 2, "arm64e"), (33554444, 1, "arm64_32"), (12, 0, "arm"), (12, 5, "armv4t"), (12, 6, "armv6"), (12, 7, "armv5"), (12, 9, "armv7"),
+        (12, 11, "armv7s"), (12, 12, "armv7k"), (12, 14, "armv6m"), (12, 15, "armv7m"), (12, 16, "armv7em"), (18, 0, "ppc"), (16777234, 0, "ppc64")]
+    for (t, s, n) in names {
+        if t == cpu_type and s == sub {
+            return n
+        }
+    }
+    return "(cputype ({cpu_type}) cpusubtype ({sub}))"
+}

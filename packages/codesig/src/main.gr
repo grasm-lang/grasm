@@ -1,0 +1,333 @@
+// Mach-O code signatures: reading them, checking them, and writing the
+// signature the linker writes.
+//
+// LC_CODE_SIGNATURE points at a SuperBlob (magic fade0cc0, big-endian like
+// everything in it): an index of (slot, offset) pairs, then the blobs. Slot
+// 0 is the CodeDirectory (fade0c02); slots 0x1000 on are alternate
+// CodeDirectories for other hash types; 2 holds the requirements
+// (fade0c01), 5 the entitlements plist (fade7171), 7 the DER entitlements
+// (fade7172), 0x10000 the CMS signature (fade0b01, empty when ad hoc).
+//
+// A CodeDirectory hashes the file in pages (2^pageSize bytes; the last
+// page is short) up to codeLimit, and stores those code slots after its
+// header. Before them, counting backwards, are the special slots: the
+// hash of the Info.plist (-1), requirements (-2), resource directory (-3),
+// entitlements (-5) and DER entitlements (-7), zeros where none. Its own
+// hash, cut to twenty bytes, is the CDHash the kernel and Gatekeeper use.
+//
+// `signature` reads one, `best`, `cdhash` and `describe` say what
+// `codesign -d -vvv` says, `problems` lists every page and special slot whose hash no
+// longer holds, and `linker_sign` rewrites the signature of an image as
+// ld writes it -- one SHA-256 CodeDirectory, flags adhoc|linker-signed,
+// 4 KiB pages, and (ld-prime's choice, not codesign's) an executable
+// segment limit equal to the size of __TEXT,__text.
+import machoread
+import sha1
+import crypto_hash
+import sha512
+
+type CsDirectory = {
+    slot: i64,
+    version: i64,
+    flags: i64,
+    hash_type: i64,
+    hash_size: i64,
+    page_log: i64,
+    platform: i64,
+    identifier: str,
+    team: str,
+    code_limit: i64,
+    /// special[k - 1] is the hash for slot -k.
+    special: [bytes],
+    code: [bytes],
+    exec_base: i64,
+    exec_limit: i64,
+    exec_flags: i64,
+    raw: bytes,
+}
+
+type CsSignature = { offset: i64, size: i64, directories: [CsDirectory], blobs: [(i64, bytes)] }
+
+type CodesigError =
+    | CsMalformed(why: str)
+    | CsUnsigned()
+
+fn be(d: bytes, at: i64, n: i64) -> i64 ! CodesigError {
+    if at < 0 or at + n > d.len() {
+        fail(CsMalformed("a read past the end at {at}"))
+    }
+    var v = 0
+    for k in 0..n {
+        v = v.shl(8).bit_or(d.at(at + k))
+    }
+    return v
+}
+
+fn le(d: bytes, at: i64, n: i64, big: bool) -> i64 ! CodesigError {
+    if at < 0 or at + n > d.len() {
+        fail(CsMalformed("a read past the end at {at}"))
+    }
+    var v = 0
+    for k in 0..n {
+        v = v.shl(8).bit_or(d.at(if big { at + k } else { at + n - 1 - k }))
+    }
+    return v
+}
+
+fn cstr(d: bytes, at: i64) -> str {
+    var e = at
+    while e < d.len() and d.at(e) != 0 {
+        e = e + 1
+    }
+    return d.slice(at, e).to_str()
+}
+
+fn directory(slot: i64, cd: bytes) -> CsDirectory ! CodesigError {
+    let version = try be(cd, 8, 4)
+    let hash_off = try be(cd, 16, 4)
+    let nspecial = try be(cd, 24, 4)
+    let ncode = try be(cd, 28, 4)
+    let size = try be(cd, 36, 1)
+    var special: [bytes] = []
+    for k in 1..(nspecial + 1) {
+        special.push(cd.slice(hash_off - k * size, hash_off - k * size + size))
+    }
+    var code: [bytes] = []
+    for k in 0..ncode {
+        if hash_off + (k + 1) * size > cd.len() {
+            fail(CsMalformed("code slots past the end of the directory"))
+        }
+        code.push(cd.slice(hash_off + k * size, hash_off + (k + 1) * size))
+    }
+    let team_off = if version >= 131584 { try be(cd, 48, 4) } else { 0 }
+    let limit64 = if version >= 131840 { try be(cd, 56, 8) } else { 0 }
+    let wide = version >= 132096
+    return CsDirectory{ slot: slot, version: version, flags: try be(cd, 12, 4), hash_type: try be(cd, 37, 1), hash_size: size,
+        page_log: try be(cd, 39, 1), platform: try be(cd, 38, 1), identifier: cstr(cd, try be(cd, 20, 4)),
+        team: if team_off > 0 { cstr(cd, team_off) } else { "" }, code_limit: if limit64 > 0 { limit64 } else { try be(cd, 32, 4) },
+        special: special, code: code, exec_base: if wide { try be(cd, 64, 8) } else { 0 }, exec_limit: if wide { try be(cd, 72, 8) } else { 0 },
+        exec_flags: if wide { try be(cd, 80, 8) } else { 0 }, raw: cd }
+}
+
+/// Where an image keeps its signature: (offset, size) from LC_CODE_SIGNATURE.
+pub fn location(image: bytes, at: i64) -> (i64, i64) ! CodesigError {
+    let h = machoread.header(image, at) ?? fail(CsMalformed("not a Mach-O image"))
+    for c in machoread.commands(image, at) ?? fail(CsMalformed("bad load commands")) {
+        if c.kind == 29 {
+            return (at + (try le(image, c.at + 8, 4, h.big_endian)), try le(image, c.at + 12, 4, h.big_endian))
+        }
+    }
+    fail(CsUnsigned())
+}
+
+/// The signature of the image at `at` (0 for a thin file).
+pub fn signature(image: bytes, at: i64) -> CsSignature ! CodesigError {
+    let (off, size) = try location(image, at)
+    if off + size > image.len() {
+        fail(CsMalformed("a signature past the end of the file"))
+    }
+    let blob = image.slice(off, off + size)
+    if (try be(blob, 0, 4)) != 4208856256 {
+        fail(CsMalformed("not a SuperBlob"))
+    }
+    let count = try be(blob, 8, 4)
+    var dirs: [CsDirectory] = []
+    var blobs: [(i64, bytes)] = []
+    for i in 0..count {
+        let slot = try be(blob, 12 + 8 * i, 4)
+        let o = try be(blob, 16 + 8 * i, 4)
+        let len = try be(blob, o + 4, 4)
+        if o + len > blob.len() {
+            fail(CsMalformed("a blob past the end of the SuperBlob"))
+        }
+        let b = blob.slice(o, o + len)
+        blobs.push((slot, b))
+        if (try be(b, 0, 4)) == 4208856066 {
+            dirs.push(try directory(slot, b))
+        }
+    }
+    return CsSignature{ offset: off, size: size, directories: dirs, blobs: blobs }
+}
+
+/// A digest by CodeDirectory hash type: 1 SHA-1, 2 SHA-256, 3 SHA-256 cut
+/// to 20 bytes, 4 SHA-384.
+pub fn digest(kind: i64, data: bytes) -> bytes {
+    return if kind == 1 { sha1.hash(data) } else if kind == 2 { crypto_hash.sha256_of(data) } else if kind == 3 { crypto_hash.sha256_of(data).slice(0, 20) } else { sha512.sha384(data) }
+}
+
+/// A directory's CDHash: its digest, cut to twenty bytes.
+pub fn cdhash(d: CsDirectory) -> bytes {
+    return digest(d.hash_type, d.raw).slice(0, 20)
+}
+
+pub fn hash_name(kind: i64) -> str {
+    return if kind == 1 { "sha1" } else if kind == 2 { "sha256" } else if kind == 3 { "sha256-truncated" } else if kind == 4 { "sha384" } else { "unknown{kind}" }
+}
+
+fn hexs(b: bytes) -> str {
+    let digits = "0123456789abcdef"
+    var parts: [str] = []
+    for x in b.to_list() {
+        parts.push(digits.substr(x.ushr(4), 1) + digits.substr(x.bit_and(15), 1))
+    }
+    return parts.join("")
+}
+
+fn lowhex(v: i64) -> str {
+    if v == 0 {
+        return "0"
+    }
+    let digits = "0123456789abcdef"
+    var s = ""
+    var x = v
+    while x > 0 {
+        s = digits.substr(x.bit_and(15), 1) + s
+        x = x.ushr(4)
+    }
+    return s
+}
+
+/// Flags as codesign names them: `0x20002(adhoc,linker-signed)`.
+pub fn flag_text(flags: i64) -> str {
+    let names = [(1, "host"), (2, "adhoc"), (256, "hard"), (512, "kill"), (1024, "expires"), (2048, "restrict"), (4096, "enforcement"),
+        (8192, "library-validation"), (65536, "runtime"), (131072, "linker-signed")]
+    var on: [str] = []
+    for (bit, name) in names {
+        if flags.bit_and(bit) != 0 {
+            on.push(name)
+        }
+    }
+    return "0x" + lowhex(flags) + if on.len() > 0 { "(" + on.join(",") + ")" } else { "" }
+}
+
+/// The directory codesign reports first: the one in slot 0.
+pub fn primary(sig: CsSignature) -> CsDirectory ! CodesigError {
+    for d in sig.directories {
+        if d.slot == 0 {
+            return d
+        }
+    }
+    fail(CsMalformed("no CodeDirectory"))
+}
+
+/// The directory codesign reports: of all of them, the one with the
+/// strongest hash.
+pub fn best(sig: CsSignature) -> CsDirectory ! CodesigError {
+    var b = try primary(sig)
+    for x in sig.directories {
+        if x.hash_type > b.hash_type {
+            b = x
+        }
+    }
+    return b
+}
+
+/// The lines `codesign -d -vvv` prints about the directory itself.
+pub fn describe(sig: CsSignature) -> [str] ! CodesigError {
+    let d = try best(sig)
+    return ["Identifier=" + d.identifier,
+        "CodeDirectory v=" + lowhex(d.version) + " size={d.raw.len()} flags=" + flag_text(d.flags) + " hashes={d.code.len()}+{d.special.len()} location=embedded",
+        "Hash type=" + hash_name(d.hash_type) + " size={d.hash_size}", "CDHash=" + hexs(cdhash(d)), "TeamIdentifier=" + if d.team.len() > 0 { d.team } else { "not set" }]
+}
+
+fn blob_in(sig: CsSignature, slot: i64) -> Option[bytes] {
+    for (s, b) in sig.blobs {
+        if s == slot {
+            return Some(b)
+        }
+    }
+    return None
+}
+
+/// Every hash that no longer holds: "page N" for code, "slot -K" for a
+/// special slot whose blob is in the signature.
+pub fn problems(image: bytes, at: i64) -> [str] ! CodesigError {
+    let sig = try signature(image, at)
+    var out: [str] = []
+    for d in sig.directories {
+        let page = if d.page_log == 0 { d.code_limit } else { 1.shl(d.page_log) }
+        for k in 0..d.code.len() {
+            let from = at + k * page
+            let to = if k * page + page > d.code_limit { at + d.code_limit } else { from + page }
+            if to > image.len() or digest(d.hash_type, image.slice(from, to)).slice(0, d.hash_size) != d.code[k] {
+                out.push(hash_name(d.hash_type) + " page {k}")
+            }
+        }
+        for k in [2, 5, 7] {
+            if k <= d.special.len() {
+                match blob_in(sig, k) {
+                    Some(b) -> {
+                        if digest(d.hash_type, b).slice(0, d.hash_size) != d.special[k - 1] {
+                            out.push(hash_name(d.hash_type) + " slot -{k}")
+                        }
+                    }
+                    None -> {}
+                }
+            }
+        }
+    }
+    return out
+}
+
+fn put(out: [i64], v: i64, n: i64) -> [i64] {
+    var o = out
+    for k in 0..n {
+        o.push(v.ushr(8 * (n - 1 - k)).bit_and(255))
+    }
+    return o
+}
+
+fn text_size(image: bytes) -> i64 ! CodesigError {
+    let h = machoread.header(image, 0) ?? fail(CsMalformed("not a Mach-O image"))
+    for c in machoread.commands(image, 0) ?? fail(CsMalformed("bad load commands")) {
+        if c.kind == 25 {
+            let n = try le(image, c.at + 64, 4, h.big_endian)
+            for k in 0..n {
+                let s = c.at + 72 + 80 * k
+                if cstr(image.slice(s, s + 16), 0) == "__text" and cstr(image.slice(s + 16, s + 32), 0) == "__TEXT" {
+                    return try le(image, s + 40, 8, h.big_endian)
+                }
+            }
+        }
+    }
+    return 0
+}
+
+/// The image with its signature written as ld writes it, for a thin
+/// 64-bit image whose LC_CODE_SIGNATURE space is already laid out.
+pub fn linker_sign(image: bytes, identifier: str) -> bytes ! CodesigError {
+    let (off, size) = try location(image, 0)
+    let h = machoread.header(image, 0) ?? fail(CsMalformed("not a Mach-O image"))
+    let ident = identifier.to_bytes().to_list()
+    let pages = (off + 4095) / 4096
+    let hash_off = 88 + ident.len() + 1
+    let cd_len = hash_off + 32 * pages
+    var cd = put(put(put(put(put(put(put(put(put([], 4208856066, 4), cd_len, 4), 132096, 4), 131074, 4), hash_off, 4), 88, 4), 0, 4), pages, 4), off, 4)
+    cd = put(put(put(put(put(put(put(put(cd, 32, 1), 2, 1), 0, 1), 12, 1), 0, 4), 0, 4), 0, 4), 0, 4)
+    cd = put(put(put(put(cd, 0, 8), 0, 8), try text_size(image), 8), if h.file_type == 2 { 1 } else { 0 }, 8)
+    for b in ident {
+        cd.push(b)
+    }
+    cd.push(0)
+    for k in 0..pages {
+        let to = if k * 4096 + 4096 > off { off } else { k * 4096 + 4096 }
+        for b in crypto_hash.sha256_of(image.slice(k * 4096, to)).to_list() {
+            cd.push(b)
+        }
+    }
+    var blob = put(put(put(put(put([], 4208856256, 4), 20 + cd.len(), 4), 1, 4), 0, 4), 20, 4) + cd
+    if blob.len() > size {
+        fail(CsMalformed("the signature does not fit the space reserved for it"))
+    }
+    while blob.len() < size {
+        blob.push(0)
+    }
+    var out = image.slice(0, off).to_list()
+    for b in blob {
+        out.push(b)
+    }
+    for b in image.slice(off + size, image.len()).to_list() {
+        out.push(b)
+    }
+    return bytes_of(out)
+}

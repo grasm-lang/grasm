@@ -260,6 +260,42 @@ becomes buildable the day its reference is installed.
 
 ## Landed
 
+- [x] **B42: object files, debug lines, SQLite's side files, machine
+  code and Go source** — B26's `symtab` `machofat` `x86len` `sqlitewal`
+  `sqlitejournal`, its `codesign` as `codesig` and `gosyntax` begun as
+  `goscanner`, with `exporttrie` `chainedfixups` and `dwarfline`, and the
+  harness `b42test`; the new gate `b42diff` runs about 260 cases in 16
+  families, every binary built fresh by clang for arm64, arm64e and
+  x86_64: symbols against `nm -ap`; universal files against `lipo`
+  (`-create` byte for byte, with and without `-fat64`, for objects,
+  executables, dylibs at odd image bases and static libraries;
+  `-detailed_info`, `-thin`, `-remove`); signatures against `codesign -d
+  -vvv` (ld's, and codesign's with identifiers, option flags,
+  entitlements and SHA-1 beside SHA-256) and against `codesign -v` after
+  a flipped bit, and ld's linker signature rebuilt byte for byte; export
+  tries (weak, thread-local, absolute, re-exported) against `dyld_info
+  -exports`, and rebuilt byte for byte; chained fixups (64-bit offset and
+  arm64e formats, all three import widths, flat and weak lookups,
+  addends) against `dyld_info -fixups`; DWARF 2, 4 and 5 line tables in
+  objects and multi-unit .dSYMs against `dwarfdump --debug-line`; WAL
+  files (torn, bit-flipped, with junk after them, with an uncommitted
+  tail) against the database SQLite checkpoints, logs written here read
+  back by SQLite, and hot journals (from a writer killed mid-transaction,
+  some damaged) against the database SQLite rolls back to; x86-64
+  lengths against `objdump -d`, on compiled code from SSE to AVX-512 FP16
+  and a corpus of awkward encodings (moffs, ENTER, x87, XOP, TBM, SSE4a,
+  AMX, 3DNow!); and Go tokens against go/scanner on the standard library
+  and on generated sources full of bad numbers, escapes, BOMs, NULs,
+  CRs and invalid UTF-8. On the way: lipo puts arm64 slices last and
+  takes an object's alignment from the host page size; ld-prime writes
+  the export trie root first with room for five-byte offsets, then every
+  other node after its children, and sets the executable-segment limit
+  of its signature to the size of `__TEXT,__text`; codesign reports the
+  strongest of several CodeDirectories; `dyld_info` shows an arm64e
+  pointer's 19-bit addend unsigned; `objdump` prints a lone `lock` on a
+  line of its own. One break per package turned the gate red. The count
+  reaches 960.
+
 - [x] **B41: archives, and git further down** — B19's `zipcrypto`
   `shar` `debfile` `xar` `pkgbom` and B17's `reftable` `ewah` `gitnotes`
   `gitstatus` `ignorewalk`, with the harness `b41test`; the new gate
@@ -807,7 +843,7 @@ becomes buildable the day its reference is installed.
 | | |
 |---|---|
 | At the start | 669 |
-| Now | 949 |
+| Now | 960 |
 | Candidates above | 316 packages in 28 batches, plus `ecc`, `rfc6979` and `goprintf` |
 | Harnesses, one a batch | 28 |
 | If every candidate lands | 1016 |

@@ -1,0 +1,318 @@
+// Chained fixups: how a modern Mach-O image tells dyld what to patch.
+//
+// Since macOS 12 the linker writes no list of rebases and binds. Each
+// pointer that needs fixing holds, in its own bits, either a target (a
+// rebase: slide it) or an index into an import table (a bind: look the
+// symbol up), plus the distance to the next such pointer on the page. The
+// LC_DYLD_CHAINED_FIXUPS payload says where each page's chain starts and
+// how its pointers are packed, and holds the imports -- library ordinal,
+// weak-import bit, name, addend -- in one of three widths.
+//
+// Pointer formats read here: DYLD_CHAINED_PTR_64 and _64_OFFSET (4-byte
+// stride, 36-bit target, 24-bit ordinal and 8-bit addend), and the arm64e
+// family -- ARM64E, ARM64E_USERLAND and ARM64E_USERLAND24 (8-byte stride;
+// authenticated pointers carry a 16-bit diversity, an address-diversity
+// bit and a key; plain binds a 19-bit signed addend). An ordinal of 0
+// means this image, -1 the main executable, -2 a flat-namespace lookup,
+// -3 a weak-definition lookup.
+//
+// `parse` reads the header, segments and imports; `fixups` walks every
+// chain; `describe` prints each fixup as `dyld_info -fixups` does (with
+// the true addend: dyld_info shows an arm64e pointer's 19-bit addend
+// without its sign).
+import machoread
+
+type ChainImport = { ordinal: i64, name: str, weak: bool, addend: i64 }
+
+type ChainSegment = { index: i64, page_size: i64, format: i64, segment_offset: i64, max_pointer: i64, page_starts: [i64] }
+
+type ChainInfo = { version: i64, imports_format: i64, symbols_format: i64, segments: [ChainSegment], imports: [ChainImport] }
+
+type ChainFixup = {
+    /// Where the pointer is, as a VM address.
+    address: i64,
+    bind: bool,
+    auth: bool,
+    /// A rebase's target as a VM address; a bind's import index.
+    target: i64,
+    addend: i64,
+    diversity: i64,
+    addr_div: bool,
+    key: i64,
+    high8: i64,
+}
+
+type MachSeg = { name: str, vmaddr: i64, fileoff: i64, sections: [(str, i64, i64)] }
+
+type FixupError =
+    | ChainMalformed(why: str)
+    | ChainMissing()
+    | ChainFormat(format: i64)
+
+fn le(d: bytes, at: i64, n: i64) -> i64 ! FixupError {
+    if at < 0 or at + n > d.len() {
+        fail(ChainMalformed("a read past the end at {at}"))
+    }
+    var v = 0
+    for k in 0..n {
+        v = v.shl(8).bit_or(d.at(at + n - 1 - k))
+    }
+    return v
+}
+
+fn cstr(d: bytes, at: i64) -> str {
+    var e = at
+    while e < d.len() and d.at(e) != 0 {
+        e = e + 1
+    }
+    return d.slice(at, e).to_str()
+}
+
+fn signed(v: i64, bits: i64) -> i64 {
+    let top = 1.shl(bits - 1)
+    return if v.bit_and(top) != 0 { v - 2 * top } else { v }
+}
+
+/// The 64-bit segments of an image, in load-command order, with their
+/// sections as (name, address, size).
+pub fn segments_of(image: bytes, at: i64) -> [MachSeg] ! FixupError {
+    var out: [MachSeg] = []
+    for c in machoread.commands(image, at) ?? fail(ChainMalformed("bad load commands")) {
+        if c.kind == 25 {
+            var secs: [(str, i64, i64)] = []
+            let n = try le(image, c.at + 64, 4)
+            for k in 0..n {
+                let s = c.at + 72 + 80 * k
+                secs.push((cstr(image.slice(s, s + 16), 0), try le(image, s + 32, 8), try le(image, s + 40, 8)))
+            }
+            out.push(MachSeg{ name: cstr(image.slice(c.at + 8, c.at + 24), 0), vmaddr: try le(image, c.at + 24, 8), fileoff: try le(image, c.at + 40, 8),
+                sections: secs })
+        }
+    }
+    return out
+}
+
+fn payload(image: bytes, at: i64) -> bytes ! FixupError {
+    for c in machoread.commands(image, at) ?? fail(ChainMalformed("bad load commands")) {
+        if c.kind == 2147483700 {
+            let off = at + (try le(image, c.at + 8, 4))
+            let size = try le(image, c.at + 12, 4)
+            if off + size > image.len() {
+                fail(ChainMalformed("fixups past the end of the file"))
+            }
+            return image.slice(off, off + size)
+        }
+    }
+    fail(ChainMissing())
+}
+
+fn imports(p: bytes, format: i64, at: i64, count: i64, symbols: i64) -> [ChainImport] ! FixupError {
+    var out: [ChainImport] = []
+    for i in 0..count {
+        if format == 1 or format == 2 {
+            let w = if format == 1 { 4 } else { 8 }
+            let v = try le(p, at + i * w, 4)
+            let ord = v.bit_and(255)
+            out.push(ChainImport{ ordinal: if ord > 240 { ord - 256 } else { ord }, weak: v.ushr(8).bit_and(1) == 1, name: cstr(p, symbols + v.ushr(9)),
+                addend: if format == 2 { signed(try le(p, at + i * w + 4, 4), 32) } else { 0 } })
+        } else if format == 3 {
+            let v = try le(p, at + i * 16, 8)
+            let ord = v.bit_and(65535)
+            out.push(ChainImport{ ordinal: if ord > 65520 { ord - 65536 } else { ord }, weak: v.ushr(16).bit_and(1) == 1,
+                name: cstr(p, symbols + v.ushr(32)), addend: try le(p, at + i * 16 + 8, 8) })
+        } else {
+            fail(ChainMalformed("imports format {format}"))
+        }
+    }
+    return out
+}
+
+/// The fixup header, the per-segment chain starts and the imports.
+pub fn parse(image: bytes, at: i64) -> ChainInfo ! FixupError {
+    let p = try payload(image, at)
+    let starts = try le(p, 4, 4)
+    let count = try le(p, 16, 4)
+    let fmt = try le(p, 20, 4)
+    let symfmt = try le(p, 24, 4)
+    if symfmt != 0 {
+        fail(ChainMalformed("compressed symbol names"))
+    }
+    var segs: [ChainSegment] = []
+    let nseg = try le(p, starts, 4)
+    for i in 0..nseg {
+        let off = try le(p, starts + 4 + 4 * i, 4)
+        if off == 0 {
+            continue
+        }
+        let s = starts + off
+        let pages = try le(p, s + 20, 2)
+        var page_starts: [i64] = []
+        for k in 0..pages {
+            page_starts.push(try le(p, s + 22 + 2 * k, 2))
+        }
+        segs.push(ChainSegment{ index: i, page_size: try le(p, s + 4, 2), format: try le(p, s + 6, 2), segment_offset: try le(p, s + 8, 8),
+            max_pointer: try le(p, s + 16, 4), page_starts: page_starts })
+    }
+    return ChainInfo{ version: try le(p, 0, 4), imports_format: fmt, symbols_format: symfmt, segments: segs,
+        imports: try imports(p, fmt, try le(p, 8, 4), count, try le(p, 12, 4)) }
+}
+
+/// One pointer, decoded; the second value is the distance to the next.
+fn decode(raw: i64, format: i64, base: i64, imports: [ChainImport]) -> (ChainFixup, i64) ! FixupError {
+    let (f, next) = try decode_bits(raw, format, base)
+    if not f.bind {
+        return (f, next)
+    }
+    if f.target >= imports.len() {
+        fail(ChainMalformed("an import index past the table"))
+    }
+    var b = f
+    b.addend = f.addend + imports[f.target].addend
+    return (b, next)
+}
+
+fn decode_bits(raw: i64, format: i64, base: i64) -> (ChainFixup, i64) ! FixupError {
+    var f = ChainFixup{ address: 0, bind: false, auth: false, target: 0, addend: 0, diversity: 0, addr_div: false, key: 0, high8: 0 }
+    if format == 2 or format == 6 {
+        f.bind = raw.ushr(63) == 1
+        if f.bind {
+            f.target = raw.bit_and(16777215)
+            f.addend = raw.ushr(24).bit_and(255)
+        } else {
+            f.target = raw.bit_and(68719476735) + if format == 6 { base } else { 0 }
+            f.high8 = raw.ushr(36).bit_and(255)
+        }
+        return (f, raw.ushr(51).bit_and(4095) * 4)
+    }
+    if format != 1 and format != 9 and format != 12 {
+        fail(ChainFormat(format))
+    }
+    let ord_mask = if format == 12 { 16777215 } else { 65535 }
+    f.auth = raw.ushr(63) == 1
+    f.bind = raw.ushr(62).bit_and(1) == 1
+    if f.auth {
+        f.diversity = raw.ushr(32).bit_and(65535)
+        f.addr_div = raw.ushr(48).bit_and(1) == 1
+        f.key = raw.ushr(49).bit_and(3)
+        f.target = if f.bind { raw.bit_and(ord_mask) } else { raw.bit_and(4294967295) + base }
+    } else if f.bind {
+        f.target = raw.bit_and(ord_mask)
+        f.addend = signed(raw.ushr(32).bit_and(524287), 19)
+    } else {
+        f.target = raw.bit_and(8796093022207) + if format == 1 { 0 } else { base }
+        f.high8 = raw.ushr(43).bit_and(255)
+    }
+    return (f, raw.ushr(51).bit_and(2047) * 8)
+}
+
+/// Every fixup of the image at `at`, segment by segment, page by page,
+/// in chain order.
+pub fn fixups(image: bytes, at: i64) -> [ChainFixup] ! FixupError {
+    let info = try parse(image, at)
+    let segs = try segments_of(image, at)
+    var base = 0
+    for s in segs {
+        if s.name == "__TEXT" {
+            base = s.vmaddr
+        }
+    }
+    var out: [ChainFixup] = []
+    for cs in info.segments {
+        if cs.index >= segs.len() {
+            fail(ChainMalformed("chain starts for a segment that is not there"))
+        }
+        let seg = segs[cs.index]
+        for page in 0..cs.page_starts.len() {
+            let start = cs.page_starts[page]
+            if start == 65535 {
+                continue
+            }
+            var off = page * cs.page_size + start
+            var guard = 0
+            while guard < 1000000 {
+                let raw = try le(image, at + seg.fileoff + off, 8)
+                let (f0, next) = try decode(raw, cs.format, base, info.imports)
+                var f = f0
+                f.address = seg.vmaddr + off
+                out.push(f)
+                if next == 0 {
+                    break
+                }
+                off = off + next
+                guard = guard + 1
+            }
+        }
+    }
+    return out
+}
+
+/// The leaf names of an image's libraries by ordinal (1 first), as dyld
+/// tools print them: no directory, nothing from the first dot.
+pub fn library_names(image: bytes, at: i64) -> [str] ! FixupError {
+    var out: [str] = []
+    for c in machoread.commands(image, at) ?? fail(ChainMalformed("bad load commands")) {
+        if c.kind == 12 or c.kind == 2147483672 or c.kind == 2147483679 or c.kind == 2147483683 or c.kind == 32 {
+            let path = cstr(image, c.at + (try le(image, c.at + 8, 4)))
+            let parts = path.split("/")
+            out.push(parts[parts.len() - 1].split(".")[0])
+        }
+    }
+    return out
+}
+
+fn hex(v: i64, width: i64) -> str {
+    let digits = "0123456789ABCDEF"
+    var s = ""
+    var n = 0
+    while n < 16 and (n < width or v.ushr(4 * n) != 0) {
+        s = digits.substr(v.ushr(4 * n).bit_and(15), 1) + s
+        n = n + 1
+    }
+    return s
+}
+
+fn pad(s: str, n: i64) -> str {
+    return if s.len() >= n { s } else { s + " ".repeat(n - s.len()) }
+}
+
+fn ordinal_name(ord: i64, libs: [str]) -> str {
+    return if ord == 0 { "<this-image>" } else if ord == 0 - 1 { "<main-executable>" } else if ord == 0 - 2 { "<flat-namespace>" }
+    else if ord == 0 - 3 { "<weak-def-coalesce>" } else if ord >= 1 and ord <= libs.len() { libs[ord - 1] } else { "<ordinal {ord}>" }
+}
+
+/// Every fixup as a line of `dyld_info -fixups`.
+pub fn describe(image: bytes, at: i64) -> [str] ! FixupError {
+    let info = try parse(image, at)
+    let segs = try segments_of(image, at)
+    let libs = try library_names(image, at)
+    let keys = ["IA", "IB", "DA", "DB"]
+    var out: [str] = []
+    for f in try fixups(image, at) {
+        var seg = segs[0]
+        for s in segs {
+            if f.address >= s.vmaddr {
+                seg = s
+            }
+        }
+        var sect = ""
+        for (name, addr, size) in seg.sections {
+            if f.address >= addr and f.address < addr + size {
+                sect = name
+            }
+        }
+        let kind = (if f.auth { "auth-" } else { "" }) + if f.bind { "bind" } else { "rebase" }
+        var target = ""
+        if f.bind {
+            let imp = info.imports[f.target]
+            target = ordinal_name(imp.ordinal, libs) + "/" + imp.name + (if f.addend != 0 { " + 0x" + hex(f.addend, 1) } else { "" }) +
+            if imp.weak { " [weak-import]" } else { "" }
+        } else {
+            target = "0x" + hex(f.target, 8)
+        }
+        if f.auth {
+            target = target + " (div=0x" + hex(f.diversity, 4) + " ad=" + (if f.addr_div { "1" } else { "0" }) + " key=" + keys[f.key] + ")"
+        }
+        out.push(pad(seg.name, 15) + " " + pad(sect, 16) + " 0x" + hex(f.address, 8) + " " + " ".repeat(13 - kind.len()) + kind + "  " + target)
+    }
+    return out
+}

@@ -1,0 +1,136 @@
+// SQLite rollback journals: undoing a transaction that never finished.
+//
+// Outside WAL mode SQLite copies every page it is about to change into
+// `db-journal` first. A process that dies mid-transaction leaves a "hot"
+// journal, and the next connection plays it back, putting the database
+// exactly as it was. The journal holds one or more segments, each a
+// header padded to the sector size -- the magic d9d505f920a163d7, a record
+// count (all ones: as many as the file holds), a checksum nonce, the
+// database's size in pages before the transaction, the sector size and
+// the page size -- then records: page number, the original page, and a
+// checksum that is the nonce plus every 200th byte of the page counted
+// back from its end (a cheap check, not a hash). Playback stops at the
+// first record whose checksum fails, which is how a torn journal write
+// shows; a zero record count in the first header means nothing to undo
+// (a journal emptied in PERSIST mode).
+//
+// `parse` reads the segments, `records` the records that count, and
+// `rollback` the database a playback leaves.
+
+type JournalHeader = { records: i64, nonce: i64, db_pages: i64, sector: i64, page_size: i64, at: i64 }
+
+type JournalRecord = { page: i64, data: bytes, checksum: i64 }
+
+type JournalError =
+    | JournalMalformed(why: str)
+
+fn be(d: bytes, at: i64) -> i64 {
+    return d.at(at).shl(24).bit_or(d.at(at + 1).shl(16)).bit_or(d.at(at + 2).shl(8)).bit_or(d.at(at + 3))
+}
+
+fn is_magic(d: bytes, at: i64) -> bool {
+    let m = [217, 213, 5, 249, 32, 161, 99, 215]
+    if at + 8 > d.len() {
+        return false
+    }
+    for k in 0..8 {
+        if d.at(at + k) != m[k] {
+            return false
+        }
+    }
+    return true
+}
+
+/// A record's checksum: the nonce plus every 200th byte from the end.
+pub fn record_checksum(nonce: i64, page: bytes) -> i64 {
+    var sum = nonce
+    var i = page.len() - 200
+    while i > 0 {
+        sum = sum + page.at(i)
+        i = i - 200
+    }
+    return sum.bit_and(4294967295)
+}
+
+fn header_at(j: bytes, at: i64) -> JournalHeader ! JournalError {
+    if at + 28 > j.len() or not is_magic(j, at) {
+        fail(JournalMalformed("no journal header at {at}"))
+    }
+    let h = JournalHeader{ records: be(j, at + 8), nonce: be(j, at + 12), db_pages: be(j, at + 16), sector: be(j, at + 20), page_size: be(j, at + 24), at: at }
+    if h.page_size < 512 or h.page_size > 65536 or h.page_size.bit_and(h.page_size - 1) != 0 {
+        fail(JournalMalformed("a page size of {h.page_size}"))
+    }
+    if h.sector < 32 or h.sector > 65536 or h.sector.bit_and(h.sector - 1) != 0 {
+        fail(JournalMalformed("a sector size of {h.sector}"))
+    }
+    return h
+}
+
+/// The segments' headers, and the records of each that count.
+pub fn parse(j: bytes) -> [(JournalHeader, [JournalRecord])] ! JournalError {
+    var out: [(JournalHeader, [JournalRecord])] = []
+    var at = 0
+    while at < j.len() and is_magic(j, at) {
+        let h = try header_at(j, at)
+        // Every segment uses the first header's page size.
+        let size = if out.len() > 0 { out[0].0.page_size } else { h.page_size }
+        let sector = if out.len() > 0 { out[0].0.sector } else { h.sector }
+        let body = at + sector
+        let room = (j.len() - body) / (size + 8)
+        let n = if h.records == 4294967295 { room } else { h.records }
+        var recs: [JournalRecord] = []
+        var p = body
+        var torn = false
+        for _k in 0..n {
+            if p + size + 8 > j.len() {
+                torn = true
+                break
+            }
+            let r = JournalRecord{ page: be(j, p), data: j.slice(p + 4, p + 4 + size), checksum: be(j, p + 4 + size) }
+            if r.checksum != record_checksum(h.nonce, r.data) or r.page == 0 {
+                torn = true
+                break
+            }
+            recs.push(r)
+            p = p + size + 8
+        }
+        out.push((h, recs))
+        if torn or n == 0 {
+            break
+        }
+        // The next segment starts at the next sector boundary.
+        at = (p + sector - 1) / sector * sector
+    }
+    return out
+}
+
+/// The database a playback of the journal leaves: each journalled page
+/// written back (the first copy of a page wins, as the later ones were
+/// taken after it changed), the file cut to its size before the
+/// transaction.
+pub fn rollback(db: bytes, j: bytes) -> bytes ! JournalError {
+    let segs = try parse(j)
+    if segs.len() == 0 or segs[0].0.records == 0 {
+        return db
+    }
+    let size = segs[0].0.page_size
+    let pages = segs[0].0.db_pages
+    var out = db.to_list()
+    while out.len() < pages * size {
+        out.push(0)
+    }
+    var done: Map[i64, bool] = {}
+    for (_h, recs) in segs {
+        for r in recs {
+            if r.page > pages or done.get(r.page) != None {
+                continue
+            }
+            done.set(r.page, true)
+            let from = (r.page - 1) * size
+            for k in 0..size {
+                out[from + k] = r.data.at(k)
+            }
+        }
+    }
+    return bytes_of(out.slice(0, pages * size))
+}

@@ -1,0 +1,48 @@
+[package]
+name = "b42test"
+version = "1.0.0"
+capabilities = ["io"]
+
+[dependencies.symtab]
+path = "../symtab"
+version = "^1.0.0"
+
+[dependencies.machofat]
+path = "../machofat"
+version = "^1.0.0"
+
+[dependencies.codesig]
+path = "../codesig"
+version = "^1.0.0"
+
+[dependencies.exporttrie]
+path = "../exporttrie"
+version = "^1.0.0"
+
+[dependencies.chainedfixups]
+path = "../chainedfixups"
+version = "^1.0.0"
+
+[dependencies.dwarfline]
+path = "../dwarfline"
+version = "^1.0.0"
+
+[dependencies.sqlitewal]
+path = "../sqlitewal"
+version = "^1.0.0"
+
+[dependencies.sqlitejournal]
+path = "../sqlitejournal"
+version = "^1.0.0"
+
+[dependencies.x86len]
+path = "../x86len"
+version = "^1.0.0"
+
+[dependencies.goscanner]
+path = "../goscanner"
+version = "^1.0.0"
+
+[dependencies.machoread]
+path = "../machoread"
+version = "^1.0.0"

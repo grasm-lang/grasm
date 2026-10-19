@@ -1,0 +1,248 @@
+// x86-64 instruction lengths: where each instruction ends.
+//
+// A debugger stepping over a call, a profiler attributing samples, a
+// hot-patcher copying the first instructions of a function, a linker
+// relaxing branches -- each must know where an instruction ends before it
+// knows what it does, and on x86 nothing says so but the instruction
+// itself. In 64-bit mode an instruction is: legacy prefixes (lock, rep,
+// segment, operand- and address-size), an optional REX byte, or a
+// two- or three-byte VEX, four-byte EVEX or three-byte XOP prefix that
+// also names the opcode map; the opcode, in the one-byte map or behind
+// 0F, 0F 38 or 0F 3A; a ModRM byte when the opcode takes one, then a SIB
+// byte and 1 or 4 displacement bytes as ModRM says; then an immediate
+// whose size depends on the opcode, the operand-size prefix and REX.W
+// (and for F6/F7, on ModRM's reg field).
+//
+// `decode` takes apart one instruction, `length` measures it, and
+// `lengths` walks a run of code. An opcode that does not exist in 64-bit
+// mode is an error, as it is to the processor.
+
+type X86Insn = {
+    length: i64,
+    prefixes: [i64],
+    rex: i64,
+    /// "", "0f", "0f38", "0f3a", "vex1".."vex3", "evex1".., "xop8"..
+    map: str,
+    opcode: i64,
+    modrm: i64,
+    disp_size: i64,
+    imm_size: i64,
+}
+
+type X86Error =
+    | X86Truncated(at: i64)
+    | X86Invalid(at: i64, opcode: i64)
+    | X86TooLong(at: i64)
+
+fn byte_at(code: bytes, p: i64, start: i64) -> i64 ! X86Error {
+    if p >= code.len() {
+        fail(X86Truncated(start))
+    }
+    if p - start >= 15 {
+        fail(X86TooLong(start))
+    }
+    return code.at(p)
+}
+
+fn in_list(x: i64, xs: [i64]) -> bool {
+    for v in xs {
+        if v == x {
+            return true
+        }
+    }
+    return false
+}
+
+fn one_byte_modrm(op: i64) -> bool {
+    if op < 64 {
+        return op.bit_and(7) < 4
+    }
+    return in_list(op, [99, 105, 107, 192, 193, 198, 199, 208, 209, 210, 211, 246, 247, 254, 255]) or (op >= 128 and op <= 143) or (op >= 216 and op <= 223)
+}
+
+fn invalid64(op: i64) -> bool {
+    return in_list(op, [6, 7, 14, 22, 23, 30, 31, 39, 47, 55, 63, 96, 97, 130, 154, 212, 213, 214, 234])
+}
+
+/// The immediate of a one-byte-map opcode: bytes, given the operand size
+/// (2, 4 or 8) and address size (4 or 8); -1 for "ask ModRM".
+fn one_byte_imm(op: i64, osize: i64, asize: i64) -> i64 {
+    let z = if osize == 2 { 2 } else { 4 }
+    if in_list(op, [4, 12, 20, 28, 36, 44, 52, 60, 106, 107, 128, 131, 168, 192, 193, 198, 205, 235]) or (op >= 112 and op <= 127) or (op >= 176 and op <= 183) or
+    (op >= 224 and op <= 231) {
+        return 1
+    }
+    if in_list(op, [5, 13, 21, 29, 37, 45, 53, 61, 104, 105, 129, 169, 199, 232, 233]) {
+        return if op == 232 or op == 233 { 4 } else { z }
+    }
+    if op == 194 or op == 202 {
+        return 2
+    }
+    if op == 200 {
+        return 3
+    }
+    if op >= 184 and op <= 191 {
+        return osize
+    }
+    if op >= 160 and op <= 163 {
+        return asize
+    }
+    if op == 246 or op == 247 {
+        return 0 - 1
+    }
+    return 0
+}
+
+fn map0f_modrm(op: i64) -> bool {
+    return not (in_list(op, [5, 6, 7, 8, 9, 11, 14, 119, 160, 161, 162, 168, 169, 170]) or (op >= 48 and op <= 55) or (op >= 128 and op <= 143) or
+        (op >= 200 and op <= 207))
+}
+
+fn map0f_imm(op: i64) -> i64 {
+    if (op >= 112 and op <= 115) or in_list(op, [15, 164, 172, 186, 194, 196, 197, 198]) {
+        return 1
+    }
+    if op >= 128 and op <= 143 {
+        return 4
+    }
+    return 0
+}
+
+/// ModRM's tail: SIB and displacement bytes.
+fn modrm_tail(code: bytes, p: i64, start: i64, modrm: i64) -> (i64, i64) ! X86Error {
+    let md = modrm.ushr(6)
+    let rm = modrm.bit_and(7)
+    if md == 3 {
+        return (0, 0)
+    }
+    var sib = 0
+    var disp = if md == 1 { 1 } else if md == 2 { 4 } else { 0 }
+    if rm == 4 {
+        sib = 1
+        let s = try byte_at(code, p, start)
+        if md == 0 and s.bit_and(7) == 5 {
+            disp = 4
+        }
+    } else if md == 0 and rm == 5 {
+        disp = 4
+    }
+    return (sib, disp)
+}
+
+fn vex_imm(map: i64, op: i64) -> i64 {
+    if map == 3 {
+        return 1
+    }
+    if map == 1 and ((op >= 112 and op <= 115) or in_list(op, [194, 196, 197, 198])) {
+        return 1
+    }
+    return 0
+}
+
+/// The legacy and REX prefixes at `at`: the prefixes, the REX byte (0 if
+/// none counts: a legacy prefix after REX cancels it) and where the
+/// opcode starts.
+fn prefixes_at(code: bytes, at: i64) -> ([i64], i64, i64) ! X86Error {
+    var p = at
+    var prefixes: [i64] = []
+    var rex = 0
+    var b = try byte_at(code, p, at)
+    while in_list(b, [240, 242, 243, 46, 54, 62, 38, 100, 101, 102, 103]) or (b >= 64 and b <= 79) {
+        if b >= 64 and b <= 79 {
+            rex = b
+        } else {
+            rex = 0
+            prefixes.push(b)
+        }
+        p = p + 1
+        b = try byte_at(code, p, at)
+    }
+    return (prefixes, rex, p)
+}
+
+/// The opcode at `p` (after the prefixes): the instruction so far, whether
+/// a ModRM byte follows, and where it would be.
+fn opcode_at(code: bytes, at: i64, p0: i64, insn0: X86Insn, osize: i64, asize: i64) -> (X86Insn, bool, i64) ! X86Error {
+    var insn = insn0
+    var p = p0
+    let b = try byte_at(code, p, at)
+    if b == 197 or b == 196 or b == 98 or (b == 143 and (try byte_at(code, p + 1, at)).ushr(3).bit_and(7) != 0) {
+        // VEX (C5: 2 bytes, C4: 3), EVEX (62: 4), XOP (8F: 3).
+        let m = if b == 197 { 1 } else { (try byte_at(code, p + 1, at)).bit_and(if b == 98 { 7 } else { 31 }) }
+        p = p + (if b == 197 { 2 } else if b == 98 { 4 } else { 3 })
+        insn.opcode = try byte_at(code, p, at)
+        insn.map = (if b == 98 { "evex" } else if b == 143 { "xop" } else { "vex" }) + "{m}"
+        insn.imm_size = if b == 143 { if m == 8 { 1 } else if m == 10 { 4 } else { 0 } } else { vex_imm(m, insn.opcode) }
+        return (insn, not (b == 197 or b == 196) or not (m == 1 and insn.opcode == 119), p + 1)
+    }
+    if b == 15 {
+        let b2 = try byte_at(code, p + 1, at)
+        if b2 == 56 or b2 == 58 {
+            insn.map = if b2 == 56 { "0f38" } else { "0f3a" }
+            insn.opcode = try byte_at(code, p + 2, at)
+            insn.imm_size = if b2 == 58 { 1 } else { 0 }
+            return (insn, true, p + 3)
+        }
+        insn.map = "0f"
+        insn.opcode = b2
+        insn.imm_size = map0f_imm(b2)
+        if b2 == 120 and (in_list(102, insn.prefixes) or in_list(242, insn.prefixes)) {
+            insn.imm_size = 2
+        }
+        return (insn, map0f_modrm(b2), p + 2)
+    }
+    if invalid64(b) {
+        fail(X86Invalid(at, b))
+    }
+    insn.opcode = b
+    insn.imm_size = one_byte_imm(b, osize, asize)
+    return (insn, one_byte_modrm(b), p + 1)
+}
+
+/// One instruction at `at`.
+pub fn decode(code: bytes, at: i64) -> X86Insn ! X86Error {
+    let (prefixes, rex, p0) = try prefixes_at(code, at)
+    let osize = if rex.bit_and(8) != 0 { 8 } else if in_list(102, prefixes) { 2 } else { 4 }
+    let asize = if in_list(103, prefixes) { 4 } else { 8 }
+    let start = X86Insn{ length: 0, prefixes: prefixes, rex: rex, map: "", opcode: 0, modrm: 0 - 1, disp_size: 0, imm_size: 0 }
+    let (insn0, has_modrm, p1) = try opcode_at(code, at, p0, start, osize, asize)
+    var insn = insn0
+    var p = p1
+    if has_modrm {
+        insn.modrm = try byte_at(code, p, at)
+        p = p + 1
+        let (sib, disp) = try modrm_tail(code, p, at, insn.modrm)
+        insn.disp_size = disp
+        p = p + sib + disp
+        if insn.imm_size == 0 - 1 {
+            let reg = insn.modrm.ushr(3).bit_and(7)
+            insn.imm_size = if reg > 1 { 0 } else if insn.opcode == 246 { 1 } else if osize == 2 { 2 } else { 4 }
+        }
+    }
+    p = p + insn.imm_size
+    if p - at > 15 {
+        fail(X86TooLong(at))
+    }
+    if p > code.len() {
+        fail(X86Truncated(at))
+    }
+    insn.length = p - at
+    return insn
+}
+
+/// The length of the instruction at `at`.
+pub fn length(code: bytes, at: i64) -> i64 ! X86Error {
+    return (try decode(code, at)).length
+}
+
+/// The lengths of the instructions of a run of code, one after another.
+pub fn lengths(code: bytes) -> [i64] ! X86Error {
+    var out: [i64] = []
+    var at = 0
+    while at < code.len() {
+        let n = try length(code, at)
+        out.push(n)
+        at = at + n
+    }
+    return out
+}

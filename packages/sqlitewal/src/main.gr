@@ -1,0 +1,184 @@
+// SQLite write-ahead logs: which frames count, and the database they make.
+//
+// In WAL mode a writer appends whole pages to `db-wal` instead of touching
+// the database. The file starts with a 32-byte header -- magic 377f0682
+// or 377f0683 (the low bit says the checksums read big-endian words), the
+// format version, the page size, the checkpoint sequence, two salts and a
+// checksum of the first 24 bytes. Each frame is a 24-byte header (page
+// number; the database size in pages when the frame commits a
+// transaction, else 0; the two salts; a checksum) and one page. The
+// checksum runs on from frame to frame over the first 8 header bytes and
+// the page: for each pair of 32-bit words, s0 += x0 + s1, s1 += x1 + s0.
+//
+// A frame counts only if its salts match the header's, its checksum
+// carries the chain, and a commit frame follows it -- so a torn write, a
+// frame left from before the last reset, and an uncommitted transaction
+// all fall away, exactly as SQLite's recovery drops them. `parse` reads
+// the frames, `committed` keeps those that count, `apply` gives the
+// database a checkpoint would leave, and `encode` writes a log SQLite
+// will read.
+
+type WalHeader = { big_endian: bool, version: i64, page_size: i64, checkpoint: i64, salt1: i64, salt2: i64, checksum1: i64, checksum2: i64 }
+
+type WalFrame = { page: i64, db_size: i64, salt1: i64, salt2: i64, checksum1: i64, checksum2: i64, data: bytes }
+
+type WalLog = { header: WalHeader, frames: [WalFrame] }
+
+type WalFileError =
+    | WalMalformed(why: str)
+
+fn be(d: bytes, at: i64) -> i64 {
+    return d.at(at).shl(24).bit_or(d.at(at + 1).shl(16)).bit_or(d.at(at + 2).shl(8)).bit_or(d.at(at + 3))
+}
+
+fn word(d: bytes, at: i64, big: bool) -> i64 {
+    return if big { be(d, at) } else { d.at(at + 3).shl(24).bit_or(d.at(at + 2).shl(16)).bit_or(d.at(at + 1).shl(8)).bit_or(d.at(at)) }
+}
+
+/// SQLite's WAL checksum of `d[from..to]` carried on from (s0, s1).
+pub fn checksum(d: bytes, from: i64, to: i64, big: bool, s: (i64, i64)) -> (i64, i64) {
+    var (s0, s1) = s
+    var i = from
+    while i + 8 <= to {
+        s0 = (s0 + word(d, i, big) + s1).bit_and(4294967295)
+        s1 = (s1 + word(d, i + 4, big) + s0).bit_and(4294967295)
+        i = i + 8
+    }
+    return (s0, s1)
+}
+
+/// The header and every whole frame, valid or not.
+pub fn parse(wal: bytes) -> WalLog ! WalFileError {
+    if wal.len() < 32 {
+        fail(WalMalformed("shorter than a WAL header"))
+    }
+    let magic = be(wal, 0)
+    if magic != 931071618 and magic != 931071619 {
+        fail(WalMalformed("not a WAL file"))
+    }
+    let size = be(wal, 8)
+    if size < 512 or size > 65536 or size.bit_and(size - 1) != 0 {
+        fail(WalMalformed("a page size of {size}"))
+    }
+    let h = WalHeader{ big_endian: magic == 931071619, version: be(wal, 4), page_size: size, checkpoint: be(wal, 12), salt1: be(wal, 16),
+        salt2: be(wal, 20), checksum1: be(wal, 24), checksum2: be(wal, 28) }
+    var frames: [WalFrame] = []
+    var at = 32
+    while at + 24 + size <= wal.len() {
+        frames.push(WalFrame{ page: be(wal, at), db_size: be(wal, at + 4), salt1: be(wal, at + 8), salt2: be(wal, at + 12), checksum1: be(wal, at + 16),
+            checksum2: be(wal, at + 20), data: wal.slice(at + 24, at + 24 + size) })
+        at = at + 24 + size
+    }
+    return WalLog{ header: h, frames: frames }
+}
+
+/// Whether the header's own checksum holds (SQLite ignores a log whose
+/// header fails it).
+pub fn header_holds(wal: bytes) -> bool {
+    if wal.len() < 32 {
+        return false
+    }
+    let big = be(wal, 0) == 931071619
+    let (s0, s1) = checksum(wal, 0, 24, big, (0, 0))
+    return s0 == be(wal, 24) and s1 == be(wal, 28)
+}
+
+/// The frames that count: salts and checksum chain intact, up to and
+/// including the last commit frame.
+pub fn committed(wal: bytes) -> [WalFrame] ! WalFileError {
+    let log = try parse(wal)
+    if not header_holds(wal) or (log.header.version != 3007000) {
+        return []
+    }
+    let h = log.header
+    var s = (h.checksum1, h.checksum2)
+    var out: [WalFrame] = []
+    var last = 0
+    var at = 32
+    for f in log.frames {
+        if f.salt1 != h.salt1 or f.salt2 != h.salt2 or f.page == 0 {
+            break
+        }
+        let s1 = checksum(wal, at, at + 8, h.big_endian, s)
+        let s2 = checksum(wal, at + 24, at + 24 + h.page_size, h.big_endian, s1)
+        if s2.0 != f.checksum1 or s2.1 != f.checksum2 {
+            break
+        }
+        s = s2
+        out.push(f)
+        if f.db_size > 0 {
+            last = out.len()
+        }
+        at = at + 24 + h.page_size
+    }
+    return out.slice(0, last)
+}
+
+/// The database a checkpoint leaves: the file's pages, each replaced by
+/// its last committed frame, cut or grown to the last commit's size.
+pub fn apply(db: bytes, wal: bytes) -> bytes ! WalFileError {
+    let frames = try committed(wal)
+    if frames.len() == 0 {
+        return db
+    }
+    let size = (try parse(wal)).header.page_size
+    let pages = frames[frames.len() - 1].db_size
+    var latest: Map[i64, i64] = {}
+    for i in 0..frames.len() {
+        latest.set(frames[i].page, i)
+    }
+    var out: [i64] = []
+    for p in 1..(pages + 1) {
+        match latest.get(p) {
+            Some(i) -> {
+                for b in frames[i].data.to_list() {
+                    out.push(b)
+                }
+            }
+            None -> {
+                let from = (p - 1) * size
+                for k in 0..size {
+                    out.push(if from + k < db.len() { db.at(from + k) } else { 0 })
+                }
+            }
+        }
+    }
+    return bytes_of(out)
+}
+
+fn put(inout out: [i64], v: i64) {
+    out.push(v.ushr(24).bit_and(255))
+    out.push(v.ushr(16).bit_and(255))
+    out.push(v.ushr(8).bit_and(255))
+    out.push(v.bit_and(255))
+}
+
+/// A log holding these (page number, page) frames as one transaction that
+/// leaves the database `db_pages` long, with big-endian checksums.
+pub fn encode(page_size: i64, checkpoint: i64, salt1: i64, salt2: i64, frames: [(i64, bytes)], db_pages: i64) -> bytes ! WalFileError {
+    var out: [i64] = []
+    for v in [931071619, 3007000, page_size, checkpoint, salt1, salt2] {
+        put(out, v)
+    }
+    var s = checksum(bytes_of(out), 0, 24, true, (0, 0))
+    put(out, s.0)
+    put(out, s.1)
+    for i in 0..frames.len() {
+        let (page, data) = frames[i]
+        if data.len() != page_size {
+            fail(WalMalformed("a frame of {data.len()} bytes for pages of {page_size}"))
+        }
+        var head: [i64] = []
+        put(head, page)
+        put(head, if i == frames.len() - 1 { db_pages } else { 0 })
+        s = checksum(data, 0, data.len(), true, checksum(bytes_of(head), 0, 8, true, s))
+        put(head, salt1)
+        put(head, salt2)
+        put(head, s.0)
+        put(head, s.1)
+        for b in head + data.to_list() {
+            out.push(b)
+        }
+    }
+    return bytes_of(out)
+}
