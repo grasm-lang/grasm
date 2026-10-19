@@ -7,11 +7,13 @@ makes shipping them honest rather than quiet.
 
 **Open S1: none. Open S2: none. Open S3: none. Open S4: none.**
 
-**One gate is red, and it is right to be: the specification is over the budget
-it binds itself to.** `unittests` fails on
-`the_kernel_budgets_do_not_regress`. That is not one of the severities above --
-nothing is wrong with the implementation -- but `docs/release-scope.md` asks
-for every gate green, so it is open and it is here.
+**One gate was red, and it was right to be: the specification is over the
+budget it binds itself to.** `unittests` failed on
+`the_kernel_budgets_do_not_regress` until 2026-10-19 (below); the spec is
+still twenty pages over its commitment. That is not one of the severities
+above -- nothing is wrong with the implementation -- but
+`docs/release-scope.md` asks for every gate green, so it stays here until the
+spec is within budget or the commitment is re-stated.
 
     the specification is ~71 pages against a §19.2 budget of 50. It has grown
     past the point where the gap is worth recording rather than closing.
@@ -53,6 +55,31 @@ deliberately.
 and from 2026-10-12 that suite did not fail -- it **hung**, on F101's panic
 deadlock, which landed the same day. Two defects from one day, and the first
 one hid the second.
+
+**Back to 70 pages on 2026-10-19, still 20 over.** `spec/core.md` carried the
+two paragraphs below -- how the page and interpreter figures moved, with
+dates -- which are a record, not a rule, and moved here. That took the spec
+from 3,561 lines to 3,546, which is 70 pages, the tripwire's ceiling, so
+`unittests` is green again; the ceiling was not raised and nothing was
+excluded from the count. The 50-page commitment is as far off as before, and
+the next normative clause will turn the gate red again unless prose pays for
+it, as `spec/core.md` says.
+
+> The page figure said ~70 while the gate computed 71, which is the drift
+> the table exists to make visible, caught on 2026-10-15. It crossed at
+> `03b8aad` on 2026-10-12 when [E-SCHEDULE] was rewritten, and
+> `crates/grasm_spec/tests/core.rs` failed from then: its ceiling is 70 pages,
+> because past that the gap is meant to be closed rather than recorded.
+>
+> The interpreter grew 6,009 → 6,667 for readiness and datagrams
+> ([L-LIB-NET], [L-LIB-UDP]), then → 9046 for the sender's address, the file
+> calls a crash-safe store needs ([L-LIB-BYTES]). Each is movement *away*
+> from the 5,000 target, recorded rather than absorbed quietly, which is what
+> the test forces. Each was honest -- the reference engine implements every
+> builtin -- and that is the point: **three times running, the library has
+> been the thing that grew**, the last two demanded by a program that hit a
+> wall. What would shrink it is moving builtins out of the engine into Grasm,
+> which needs a standard library written in the language.
 
 Closed on 2026-09-22: a second `var` of a name already bound in the same block
 leaked what the first binding owned. `FnCx::bind` inserted into the innermost

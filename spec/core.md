@@ -226,25 +226,10 @@ The budgets, measured rather than asserted:
 |---|---|---|
 | Core constructs | ≤ 30 | **37** |
 | Reference interpreter | ≤ 5,000 lines | **9046** |
-| Specification | ≤ 50 pages | **~71 pages** |
+| Specification | ≤ 50 pages | **~70 pages** |
 
 None of the three is met, and all three are measured on every run. The
 specification's is the binding one: a new clause is paid for out of prose.
 
-The page figure said ~70 while the gate computed 71, which is the drift this
-table exists to make visible, caught on 2026-10-15. It crossed at `03b8aad` on
-2026-10-12 when [E-SCHEDULE] was rewritten, and
-`crates/grasm_spec/tests/core.rs` has been failing since: its ceiling is 70
-pages, because past that the gap is meant to be closed rather than recorded.
-`docs/known-issues.md` carries what closing it would take and why the ceiling
-is not simply being raised.
-
-The interpreter grew 6,009 → 6,667 for readiness and datagrams ([L-LIB-NET],
-[L-LIB-UDP]), then → 9046 for the sender's address, the file calls a
-crash-safe store needs ([L-LIB-BYTES]). Each is movement *away* from the 5,000
-target, recorded rather than absorbed quietly, which is what this test forces.
-Each was honest — the reference engine implements every builtin — and that is
-the point: **three times running, the library has been the thing that grew**,
-the last two demanded by a program that hit a wall. What would shrink it is
-moving builtins out of the engine into Grasm, which needs a standard library
-written in the language: work this note has now asked for twice.
+How each figure got here, and what closing the gap would take, is history
+rather than specification: it is in `docs/known-issues.md`.
