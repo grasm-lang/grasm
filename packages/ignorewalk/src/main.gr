@@ -48,13 +48,17 @@ fn relative(base: str, path: str) -> Option[str] {
     return None
 }
 
-fn decide(srcs: [IgnoreSource], path: str, is_dir: bool) -> bool {
+/// The last matching rule of every source that applies. `as_parent` asks
+/// whether a directory is excluded as a whole (git's test before descending),
+/// which `a/**` does not do to `a` -- so `!a/keep` can bring a file back.
+fn decide(srcs: [IgnoreSource], path: str, is_dir: bool, as_parent: bool) -> bool {
     var ignored = false
     for s in srcs {
         match relative(s.base, path) {
             Some(rel) -> {
                 for r in s.rules {
-                    if gitignore.rule_matches(r, rel, is_dir) {
+                    let hit = if as_parent { gitignore.excludes_directory(r, rel) } else { gitignore.rule_matches(r, rel, is_dir) }
+                    if hit {
                         ignored = not r.negated
                     }
                 }
@@ -65,18 +69,28 @@ fn decide(srcs: [IgnoreSource], path: str, is_dir: bool) -> bool {
     return ignored
 }
 
+/// Whether git would not descend into a directory: it, or one above it, is
+/// excluded as a whole.
+fn excluded_dir(srcs: [IgnoreSource], dir: str) -> bool {
+    let parts = dir.split("/")
+    var prefix = ""
+    for i in 0..parts.len() {
+        prefix = if i == 0 { parts[0] } else { prefix + "/" + parts[i] }
+        if decide(srcs, prefix, true, true) {
+            return true
+        }
+    }
+    return false
+}
+
 /// Whether git ignores a path: some directory above it is ignored, or the
 /// last matching pattern of every source that applies says so.
 pub fn ignored(srcs: [IgnoreSource], path: str, is_dir: bool) -> bool {
     let parts = path.split("/")
-    var prefix = ""
-    for i in 0..(parts.len() - 1) {
-        prefix = if i == 0 { parts[0] } else { prefix + "/" + parts[i] }
-        if decide(srcs, prefix, true) {
-            return true
-        }
+    if parts.len() > 1 and excluded_dir(srcs, parts.slice(0, parts.len() - 1).join("/")) {
+        return true
     }
-    return decide(srcs, path, is_dir)
+    return decide(srcs, path, is_dir, false)
 }
 
 /// Each path of a listing with whether git ignores it. The .gitignore files
@@ -91,7 +105,7 @@ pub fn walk(paths: [(str, bool)], gitignores: [(str, str)], info_exclude: str, g
     files.sort_by(|f| "{depth(f.0) + 1000}" + f.0)
     var read: [(str, str)] = []
     for (dir, text) in files {
-        if dir.len() == 0 or not ignored(sources(global, info_exclude, read), dir, true) {
+        if dir.len() == 0 or not excluded_dir(sources(global, info_exclude, read), dir) {
             read.push((dir, text))
         }
     }

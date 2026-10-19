@@ -234,7 +234,14 @@ pub fn label_ok(t: Uts46Tables, cs: [i64]) -> bool {
     if lookup(t.marks, 2, cs[0]) >= 0 {
         return false
     }
-    return joiners_ok(t, cs) and bidi_ok(t, cs)
+    // ada returns from the label check at the first joiner, with that
+    // joiner's verdict: a label holding a ZWNJ or ZWJ never reaches the bidi
+    // rule. `-क्‌ـ` mixes L and AL and passes in Node, because the ZWNJ after
+    // a virama decided first.
+    if cs.contains(8204) or cs.contains(8205) {
+        return joiners_ok(t, cs)
+    }
+    return bidi_ok(t, cs)
 }
 
 fn ascii_only(s: str) -> bool {
@@ -249,6 +256,11 @@ fn ascii_only(s: str) -> bool {
 /// An `xn--` label's tail: it must decode to something beyond ASCII that
 /// mapping and NFC leave alone and that passes the label checks.
 fn punycode_ok(t: Uts46Tables, rest: str) -> bool {
+    // `xn--xn--...` is refused before decoding (whatwg/url#803): ada's
+    // decoder turns down a body that starts with `xn--` itself.
+    if rest.starts_with("xn--") {
+        return false
+    }
     match punycode.decode(rest) {
         Ok(decoded) -> {
             if ascii_only(decoded) {

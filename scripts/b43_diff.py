@@ -183,7 +183,14 @@ add_family("url-setters", "set", [setter_line() for _ in range(1200)], 12, keep=
 DOMAIN_PIECES = ["a", "B", "z9", "-", ".", "xn--", "ß", "ς", "Σ", "ﬁ", "Ａ", "。", "\u00ad", "\u200c", "\u200d", "\u0628", "\u0627", "\u0915\u094d", "é", "e\u0301",
                  "\u0301", "日本", "☃", "💩", "Ⅳ", "ı", "İ", "\uff0e", "xn--ls8h", "xn--a", "xn--mnchen-3ya", "Ö", "\u00bd", "\u0640", "\u05d0", "1", "\ufe0f", " ",
                  "%", "_", "\U0001d400", "\u1e9e", "\u212b", "0x7f", "[::1]", "/", "?x", "#", ":8", "[1::"]
-add_family("uts46", "domain", [hx("".join(rng.choice(DOMAIN_PIECES) for _ in range(rng.randrange(1, 8)))) for _ in range(800)], 10)
+# A joiner decides a label before the bidi rule is reached in ada: these mix
+# L and AL, and pass or fail on the joiner alone.
+JOINER_BIDI = ["-\u0915\u094d\u200c\u0640", "-i\u0915\u0640", "-i\u0307\u0915\u094d\u200c\u0640", "a\u200c\u0628", "\u0628\u200d\u0627x",
+               "-i\u0640", "x\u0915\u094d\u200d\u0627",
+               # A body that itself starts with xn-- is refused before decoding.
+               "xn--xn--ls8h", "a.xn--xn--ls8h", "xn--ls8h"]
+add_family("uts46", "domain", [hx(d) for d in JOINER_BIDI] +
+           [hx("".join(rng.choice(DOMAIN_PIECES) for _ in range(rng.randrange(1, 8)))) for _ in range(800)], 10)
 
 # --- forms, MIME types, data: URLs ----------------------------------------------------------
 

@@ -348,6 +348,8 @@ SOURCES = [
     "x = f'{y}'\n",
     "x = f'a{y}b'\n",
     "x = f'{y!r:>10}'\n",
+    # An f-string inside another's braces is tokenized in pieces too.
+    "x = f\"{','.join(f'{i}:{v.hex()}' for i, v in y)};{z}\"\n",
     "x = f'{{literal}}'\n",
     "x = f'{a+b}'\n",
     "x = f''\n",

@@ -278,6 +278,12 @@ fn is_fstring(line: str, from: i64) -> bool {
 fn emit_one(inout c: PyCursor, line: str, i: i64) -> i64 ! TokenizeError {
     let chars = line.chars()
     let ch = chars[i]
+    // An f-string inside the braces is an f-string again, tokenized in
+    // pieces: `{','.join(f'{i}' for i in xs)}` is what a real script writes,
+    // and it came out as one `STRING` where Python gives `FSTRING_START`...
+    if is_name_start(ch) and is_fstring(line, i) {
+        return try read_fstring(c, i)
+    }
     if is_quote(ch) or (is_name_start(ch) and prefix_length(line, i) > 0) {
         let found = try read_string(c, i)
         push(c, "STRING", found.0, c.at + 1, i, found.1 + 1, found.2)

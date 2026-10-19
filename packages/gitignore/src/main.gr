@@ -132,6 +132,15 @@ pub fn rule_matches(rule: IgnoreRule, path: str, is_dir: bool) -> bool {
     return matches_as(rule, path, is_dir, true)
 }
 
+/// Whether one rule excludes a directory as a whole -- the question git asks
+/// before descending into it, and the reason a file below can or cannot be
+/// brought back. `a/**` matches everything inside `a` but does not exclude
+/// `a` itself, so `!a/keep` still works; `rule_matches` asks the other
+/// question, about `a/` as a path in its own right.
+pub fn excludes_directory(rule: IgnoreRule, path: str) -> bool {
+    return matches_as(rule, path, true, false)
+}
+
 /// `own_path` is true when `path` is the path being asked about, and false
 /// when it is an ancestor being tested to see whether the whole subtree is
 /// out. The difference is the trailing `**`: `a/**` names the contents of

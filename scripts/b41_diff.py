@@ -541,7 +541,7 @@ for i in range(10):
             os.makedirs(os.path.dirname(p), exist_ok=True)
             open(p, "wb").write(blob(rng.randrange(1, 200)))
         git(repo, "add", "-A")
-        git(repo, "commit", "-q", "-m", f"c{k}")
+        git(repo, "commit", "-q", "--allow-empty", "-m", f"c{k}")
         if rng.random() < 0.2:
             git(repo, "tag", "-a", "-m", "t", f"t{k}")
     git(repo, "repack", "-adbq")
@@ -733,9 +733,62 @@ for i in range(30):
         return mine == want, str(want)[:200], str(mine)[:200]
     cases.append(("ignore", spec, check, "ignorewalk" if i < 20 else "ignore-precedence"))
 
+# Always one tree where `d/**` ignores everything inside d but does not
+# exclude d itself, so `!d/keep` brings that file back and git still reads
+# d's own .gitignore; an ignored directory above it (`x/`) keeps its files out.
+repo = os.path.join(work, "igfixed")
+run(GIT + ["init", "-q", repo])
+fixed_files = ["d/keep", "d/drop", "d/sub/keep", "d/.gitignore", "x/keep", "top"]
+fixed_ignores = [(".gitignore", "d/**\n!d/keep\n!d/.gitignore\nx/\n!x/keep\n"), ("d/.gitignore", "!sub/keep\n")]
+for f in fixed_files:
+    os.makedirs(os.path.join(repo, os.path.dirname(f) or "."), exist_ok=True)
+    open(os.path.join(repo, f), "w").write("u")
+for p, t in fixed_ignores:
+    open(os.path.join(repo, p), "w").write(t)
+lines = [f"P {f.encode().hex()} 0" for f in fixed_files + [".gitignore"]]
+lines += [f"G {p.encode().hex()} {t.encode().hex()}" for p, t in fixed_ignores] + [f"X {''.encode().hex()}"]
+spec = write("\n".join(lines) + "\n", "spec")
+want = sorted(git(repo, "ls-files", "-o", "-i", "--exclude-standard", "-z").split("\0")[:-1])
+cases.append(("ignore", spec, lambda got, want=want: (got != "ERR" and sorted(bytes.fromhex(h).decode() for h in got.split(",") if h) == want,
+                                                      str(want), got), "ignorewalk"))
+
 
 def blob_id(data):
     return hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest()
+
+
+def add_status_case(repo, gitignores, info):
+    head = git(repo, "ls-tree", "-r", "-z", "HEAD").split("\0")[:-1]
+    lines = []
+    for e in head:
+        meta, path = e.split("\t", 1)
+        mode, _t, oid = meta.split()
+        lines.append(f"H {path.encode().hex()} {mode} {oid}")
+    for d, dirs, files in os.walk(repo):
+        if ".git" in d.split(os.sep):
+            continue
+        dirs[:] = [x for x in dirs if x != ".git"]
+        for f in files:
+            p = os.path.join(d, f)
+            rel = os.path.relpath(p, repo)
+            if os.path.islink(p):
+                mode, data = "120000", os.readlink(p).encode()
+            else:
+                mode = "100755" if os.stat(p).st_mode & 0o100 else "100644"
+                data = open(p, "rb").read()
+            lines.append(f"W {rel.encode().hex()} {mode} {blob_id(data)}")
+    # Edits after the commit may have changed, removed or replaced a .gitignore by a
+    # link; git reads what the work tree holds now, so give the current text
+    # of a regular file, and the old text otherwise for gitstatus to discard.
+    def now(p, t):
+        q = os.path.join(repo, p)
+        return open(q).read() if os.path.isfile(q) and not os.path.islink(q) else t
+    lines += [f"G {p.encode().hex()} {now(p, t).encode().hex()}" for p, t in gitignores] + [f"X {info.encode().hex()}"]
+    lines.append("I " + os.path.join(repo, ".git/index").encode().hex())
+    spec = write("\n".join(lines) + "\n", "spec")
+    want = git(repo, "-c", "status.renames=false", "status", "--porcelain=v2", "--untracked-files=all").rstrip("\n")
+    cases.append(("status", spec, (lambda got, want=want: (got != "ERR" and bytes.fromhex(got).decode() == want, want[:300],
+                                                           bytes.fromhex(got).decode()[:300] if got != "ERR" else got)), "gitstatus"))
 
 
 for i in range(15):
@@ -766,31 +819,27 @@ for i in range(15):
         open(os.path.join(repo, f"new{k}.txt"), "w").write("n")
         if rng.random() < 0.5:
             git(repo, "add", "-f", f"new{k}.txt")
-    head = git(repo, "ls-tree", "-r", "-z", "HEAD").split("\0")[:-1]
-    lines = []
-    for e in head:
-        meta, path = e.split("\t", 1)
-        mode, _t, oid = meta.split()
-        lines.append(f"H {path.encode().hex()} {mode} {oid}")
-    for d, dirs, files in os.walk(repo):
-        if ".git" in d.split(os.sep):
-            continue
-        dirs[:] = [x for x in dirs if x != ".git"]
-        for f in files:
-            p = os.path.join(d, f)
-            rel = os.path.relpath(p, repo)
-            if os.path.islink(p):
-                mode, data = "120000", os.readlink(p).encode()
-            else:
-                mode = "100755" if os.stat(p).st_mode & 0o100 else "100644"
-                data = open(p, "rb").read()
-            lines.append(f"W {rel.encode().hex()} {mode} {blob_id(data)}")
-    lines += [f"G {p.encode().hex()} {t.encode().hex()}" for p, t in gitignores] + [f"X {info.encode().hex()}"]
-    lines.append("I " + os.path.join(repo, ".git/index").encode().hex())
-    spec = write("\n".join(lines) + "\n", "spec")
-    want = git(repo, "-c", "status.renames=false", "status", "--porcelain=v2", "--untracked-files=all").rstrip("\n")
-    cases.append(("status", spec, (lambda got, want=want: (got != "ERR" and bytes.fromhex(got).decode() == want, want[:300],
-                                                           bytes.fromhex(got).decode()[:300] if got != "ERR" else got)), "gitstatus"))
+    add_status_case(repo, gitignores, info)
+
+
+# Always one repository where the ignore files themselves changed after the
+# commit: git reads the work tree's .gitignore, so a link it will not follow
+# and a deleted file add no rules, and an edited one gives its new rules.
+repo = os.path.join(work, "stfixed")
+run(GIT + ["init", "-q", repo])
+fixed_ignores = [("ln/.gitignore", "a\n"), ("gone/.gitignore", "b\n"), ("edit/.gitignore", "c\n")]
+for p, t in fixed_ignores:
+    os.makedirs(os.path.join(repo, os.path.dirname(p)), exist_ok=True)
+    open(os.path.join(repo, p), "w").write(t)
+git(repo, "add", "-A")
+git(repo, "commit", "-q", "-m", "base")
+os.remove(os.path.join(repo, "ln/.gitignore"))
+os.symlink("target", os.path.join(repo, "ln/.gitignore"))
+os.remove(os.path.join(repo, "gone/.gitignore"))
+open(os.path.join(repo, "edit/.gitignore"), "a").write("d\n")
+for p in ["ln/a", "gone/b", "edit/c", "edit/d", "edit/e"]:
+    open(os.path.join(repo, p), "w").write("u")
+add_status_case(repo, fixed_ignores, "")
 
 
 # --- run --------------------------------------------------------------------------------------------

@@ -14,7 +14,8 @@
 // prompts and CI bots read this output; computing it without running
 // git is what a library like this is for.
 //
-// `status` takes the snapshots and the ignore files; `porcelain_v2`
+// `status` takes the snapshots and the ignore files (a .gitignore counts
+// only while the work tree holds it as a regular file); `porcelain_v2`
 // renders the lines in git's order: changed and unmerged paths sorted,
 // then untracked ones.
 //
@@ -134,7 +135,15 @@ pub fn status(head: [GsEntry], index: [GsIndexEntry], work: [GsEntry], gitignore
             listing.push((w.path, false))
         }
     }
-    for (p, ign) in ignorewalk.walk(listing, gitignores, info_exclude, global) {
+    // Git reads ignore files from the work tree, and since 2.32 refuses one
+    // that is a symbolic link ("unable to access ... Too many levels of
+    // symbolic links"). A .gitignore that was deleted, or replaced by a
+    // link, contributes no rules, whatever it held at HEAD.
+    let readable = gitignores.filter(|g| match works.get(g.0) {
+        Some(we) -> kind_of(we.mode) == 8
+        None -> false
+    })
+    for (p, ign) in ignorewalk.walk(listing, readable, info_exclude, global) {
         if not ign {
             out.push(GsUntracked(p))
         }
