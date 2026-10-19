@@ -1994,6 +1994,53 @@ fn an_incremental_rebuild_sees_a_changed_constant() {
     );
 }
 
+/// An incremental `--native` rebuild recompiles a module whose struct changed
+/// layout because of an edit somewhere else.
+///
+/// Whether a struct is a value struct is decided over the whole program:
+/// `main` capturing it in a closure keeps it boxed, `main` only reading a
+/// field lets it be a value. The helper's object was keyed on the helper's
+/// source and the program's signatures, neither of which moves when only
+/// `main`'s body does, so the second build linked the helper compiled for a
+/// box against a `main` reading a value -- and the binary segfaulted until
+/// the cache was deleted. Found through a library whose demo read a table
+/// struct after an earlier build had passed it to a closure.
+#[test]
+fn an_incremental_rebuild_sees_a_changed_struct_layout() {
+    let w = Work::new("inclayout");
+    let dir = w.0.join("proj");
+    std::fs::create_dir_all(&dir).unwrap();
+    let helper = dir.join("helper.gr");
+    let main = dir.join("main.gr");
+    let out = dir.join("app");
+    std::fs::write(
+        &helper,
+        "type TabH = { xs: [str], ys: [str] }\n\npub fn make() -> TabH {\n    return TabH{ xs: [\"a\", \"b\", \"c\"], ys: [\"d\"] }\n}\n\n\
+         pub fn has(t: TabH, s: str) -> bool {\n    return t.xs.contains(s)\n}\n",
+    )
+    .unwrap();
+
+    let build_and_run = |expect: &str, what: &str| {
+        let (code, msg) = run(&["build", main.to_str().unwrap(), "--native", "-o", out.to_str().unwrap()]);
+        assert_eq!(code, 0, "{what}: {msg}");
+        let got = Command::new(&out).output().expect("runs");
+        assert!(got.status.success(), "{what}: the binary failed with {:?}", got.status);
+        assert_eq!(String::from_utf8_lossy(&got.stdout).trim(), expect, "{what}");
+    };
+
+    // Captured in a closure: the struct stays boxed.
+    std::fs::write(
+        &main,
+        "import helper\n\nfn main() {\n    let t = helper.make()\n    print([\"a\", \"z\"].map(|s| if helper.has(t, s) { \"y\" } else { \"n\" }).join(\",\"))\n}\n",
+    )
+    .unwrap();
+    build_and_run("y,n", "boxed");
+
+    // Only read: now a value struct. The helper's source has not changed.
+    std::fs::write(&main, "import helper\n\nfn main() {\n    let t = helper.make()\n    print(\"{t.xs.len()} {t.ys.len()}\")\n}\n").unwrap();
+    build_and_run("3 1", "after main changed the layout");
+}
+
 /// `grasm test --contracts` fuzzes each function's `ensures` with inputs its
 /// `requires` accepts, and reports a counterexample when one is broken
 /// ([T-CONTRACT-ENSURES]; MASTERPLAN §9.5's third level).

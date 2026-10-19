@@ -1,0 +1,42 @@
+// Arms that bind a name and then fail on a later part of the pattern.
+//
+// `(Some(x), Some(y))` against `(Some(s), None)` binds `x` before it finds
+// the `None`, and `P(x, R())` against `P(s, Q())` binds `x` before it finds
+// the `Q`. The arm is abandoned either way, and the name it bound held a
+// reference nothing gave back: every such try leaked, so a two-option check
+// in a loop grew without bound. scripts/leakcheck.sh runs this.
+type Shape =
+    | P(name: str, rest: Shape)
+    | Q()
+    | R()
+
+fn both_longer(a: Option[str], b: Option[str]) -> bool {
+    match (a, b) {
+        (Some(x), Some(y)) -> x.len() > y.len()
+        _ -> false
+    }
+}
+
+fn describe(s: Shape) -> str {
+    match s {
+        P(x, R()) -> x
+        P(x, Q()) -> x + "!"
+        _ -> "?"
+    }
+}
+
+fn main() {
+    let word = "ab" + "c"
+    var hits = 0
+    var last = ""
+    for _i in 0..100 {
+        if both_longer(Some(word), None) {
+            hits += 1
+        }
+        if both_longer(Some(word), Some("a")) {
+            hits += 1
+        }
+        last = describe(P(word, Q())) + describe(P(word, R())) + describe(Q())
+    }
+    print("hits={hits} last={last}")
+}

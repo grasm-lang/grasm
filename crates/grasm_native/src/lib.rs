@@ -325,6 +325,40 @@ pub fn compile_module_object(
     compile_object_scoped(program, obj_out, target, Some(module))
 }
 
+/// The layout every module is compiled against, as text: which structs are
+/// value structs and which of their fields are held inline.
+///
+/// Both are decided over the whole program -- a struct some module captures
+/// in a closure stays boxed everywhere, one that is only read becomes a
+/// value -- so one module's object depends on how *other* modules use its
+/// types. An incremental build keyed on a module's own source and the
+/// program's signatures reused a library's object compiled while its struct
+/// was boxed after an edit to `main` made it a value: the library returned a
+/// box, the caller read it as a value, and the program segfaulted until the
+/// cache was deleted. The decisions themselves are what the key has to hold.
+///
+/// It reads the same switches as `compile_object_scoped`, so a build with
+/// value structs or inline fields turned off keys differently too.
+pub fn layout_fingerprint(program: &grasm_sema::loader::Program) -> String {
+    if std::env::var("GRASM_VALUES").is_ok_and(|v| v == "0") {
+        return "values off".to_string();
+    }
+    let analysis = grasm_sema::check::check_program(program);
+    let types: HashMap<(u32, u32), String> = analysis.resolved_types.into_iter().collect();
+    let modules: Vec<&AstModule> = program.files.iter().map(|f| &f.module).collect();
+    let ok = values::eligible(&modules, &types);
+    let mut out = format!("values: {}", ok.iter().cloned().collect::<Vec<_>>().join(","));
+    if std::env::var("GRASM_NO_INLINE").is_ok_and(|v| v == "1") {
+        out.push_str("\ninline off");
+    } else {
+        let fields = values::inline_fields(&modules, &types, &ok);
+        let shown: Vec<String> = fields.iter().map(|(t, f)| format!("{t}.{f}")).collect();
+        out.push_str("\ninline: ");
+        out.push_str(&shown.join(","));
+    }
+    out
+}
+
 fn compile_object_scoped(
     program: &grasm_sema::loader::Program,
     obj_out: &std::path::Path,
@@ -7214,6 +7248,28 @@ impl FnCx<'_, '_> {
             .last_mut()
             .unwrap()
             .insert(name.to_string(), (var, vt));
+    }
+
+    /// The innermost scope's bindings, by name, for `bound_since`.
+    fn scope_snapshot(&self) -> HashMap<String, u32> {
+        self.vars
+            .last()
+            .map(|scope| scope.iter().map(|(n, (v, _))| (n.clone(), v.as_u32())).collect())
+            .unwrap_or_default()
+    }
+
+    /// What a pattern test bound since `before`: the variables it made, each
+    /// owning a reference the failure path of an enclosing pattern has to give
+    /// back.
+    fn bound_since(&self, before: &HashMap<String, u32>) -> Vec<(Variable, VType)> {
+        let Some(scope) = self.vars.last() else {
+            return Vec::new();
+        };
+        scope
+            .iter()
+            .filter(|(n, (v, _))| before.get(*n) != Some(&v.as_u32()))
+            .map(|(_, (v, t))| (*v, t.clone()))
+            .collect()
     }
 
     /// Whether `e` is a name bound to a range.
@@ -22684,6 +22740,10 @@ binding, as in `let f: fn(i64) -> i64 = |x| x + 1`, or make it a top-level `fn`)
                     VType::Any => fields.iter().map(|_| VType::Any).collect(),
                     _ => return nope(*span, "variant patterns on this type"),
                 };
+                // Names the fields before this one bound, each owning a
+                // reference: a later field's nested test failing abandons the
+                // arm with them held, so `P(s, Q)` against `P(x, R)` leaked `x`.
+                let mut field_bound: Vec<(Variable, VType)> = Vec::new();
                 for (i, (fpat, ft)) in fields.iter().zip(&field_ts).enumerate() {
                     let sv2 = self.b.use_var(svar);
                     let idx = self.b.ins().iconst(types::I64, i as i64);
@@ -22698,6 +22758,7 @@ binding, as in `let f: fn(i64) -> i64 = |x| x + 1`, or make it a top-level `fn`)
                             let (v, vt) = self.unbox(boxed, ft)?;
                             let var = self.new_var(&vt);
                             self.b.def_var(var, v);
+                            field_bound.push((var, vt.clone()));
                             self.bind(&fid.name, var, vt);
                         }
                         Pattern::Wildcard(_) => {
@@ -22719,11 +22780,19 @@ binding, as in `let f: fn(i64) -> i64 = |x| x + 1`, or make it a top-level `fn`)
                             // leaked its payload, once per arm *tried*.
                             let cont = self.b.create_block();
                             let fail = self.b.create_block();
+                            let before = self.scope_snapshot();
                             self.lower_pattern_test(nested, fvar, &fvt, cont, fail)?;
+                            let newly = self.bound_since(&before);
                             self.goto_block(fail);
                             if fvt.boxed() {
                                 let t = self.b.use_var(fvar);
                                 self.call_rt("grasm_val_dec", &[t]);
+                            }
+                            for (tv, tt) in field_bound.iter() {
+                                if tt.boxed() {
+                                    let v = self.b.use_var(*tv);
+                                    self.call_rt("grasm_val_dec", &[v]);
+                                }
                             }
                             self.b.ins().jump(next_test, &[]);
                             self.filled = true;
@@ -22732,6 +22801,7 @@ binding, as in `let f: fn(i64) -> i64 = |x| x + 1`, or make it a top-level `fn`)
                                 let t = self.b.use_var(fvar);
                                 self.call_rt("grasm_val_dec", &[t]);
                             }
+                            field_bound.extend(newly);
                         }
                     }
                 }
@@ -22812,10 +22882,18 @@ binding, as in `let f: fn(i64) -> i64 = |x| x + 1`, or make it a top-level `fn`)
                 let n = chain.len();
                 let temps: Vec<(Variable, VType)> =
                     chain.iter().map(|(v, t, _)| (*v, t.clone())).collect();
+                // Names an *earlier* component's sub-pattern bound: `x` in
+                // `(Some(x), Some(y))`. Each owns a reference, and when a
+                // later component fails the arm is abandoned with them still
+                // held -- `(Some(s), None)` against that arm leaked `s` on
+                // every call, which is what a two-option check does in a loop.
+                let mut nested_bound: Vec<(Variable, VType)> = Vec::new();
                 for (k, (var, vt, pat_i)) in chain.into_iter().enumerate() {
                     let cont = self.b.create_block();
                     let fail = self.b.create_block();
+                    let before = self.scope_snapshot();
                     self.lower_pattern_test(pat_i, var, &vt, cont, fail)?;
+                    let newly = self.bound_since(&before);
                     // Failure: release *every* temp, not just the ones
                     // tested so far. All the components are read up front,
                     // before any of them is tested, so a mismatch at the first
@@ -22823,7 +22901,7 @@ binding, as in `let f: fn(i64) -> i64 = |x| x + 1`, or make it a top-level `fn`)
                     // why the arms *after* the first two leaked and the first
                     // two did not.
                     self.goto_block(fail);
-                    for (tv, tt) in temps.iter().chain(bound.iter()) {
+                    for (tv, tt) in temps.iter().chain(bound.iter()).chain(nested_bound.iter()) {
                         if tt.boxed() {
                             let v = self.b.use_var(*tv);
                             self.call_rt("grasm_val_dec", &[v]);
@@ -22832,6 +22910,7 @@ binding, as in `let f: fn(i64) -> i64 = |x| x + 1`, or make it a top-level `fn`)
                     self.b.ins().jump(next_test, &[]);
                     self.filled = true;
                     self.goto_block(cont);
+                    nested_bound.extend(newly);
                     if k + 1 == n {
                         // All components matched: release them and enter the
                         // body. A `Bind` component never reaches here — those

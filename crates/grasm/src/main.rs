@@ -2005,7 +2005,14 @@ fn build_native_incremental(
             .unwrap_or(std::path::Path::new("."))
             .join(".grasm-cache");
         std::fs::create_dir_all(&cache).map_err(|e| e.to_string())?;
-        let world = world_signature(program);
+        // The layout decisions are part of what each object read: which
+        // structs are values depends on every module's bodies, `main`'s
+        // included, and an object compiled for the other layout segfaults.
+        let world = format!(
+            "{}\n{}",
+            world_signature(program),
+            grasm_native::layout_fingerprint(program)
+        );
         let planned: Vec<(String, std::path::PathBuf)> = program
             .files
             .iter()
