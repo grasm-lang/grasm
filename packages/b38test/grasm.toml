@@ -1,0 +1,44 @@
+[package]
+name = "b38test"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.otfname]
+path = "../otfname"
+version = "^1.0.0"
+
+[dependencies.os2table]
+path = "../os2table"
+version = "^1.0.0"
+
+[dependencies.posttable]
+path = "../posttable"
+version = "^1.0.0"
+
+[dependencies.kern]
+path = "../kern"
+version = "^1.0.0"
+
+[dependencies.ttcfile]
+path = "../ttcfile"
+version = "^1.0.0"
+
+[dependencies.fvar]
+path = "../fvar"
+version = "^1.0.0"
+
+[dependencies.avar]
+path = "../avar"
+version = "^1.0.0"
+
+[dependencies.stat]
+path = "../stat"
+version = "^1.0.0"
+
+[dependencies.colrcpal]
+path = "../colrcpal"
+version = "^1.0.0"
+
+[dependencies.gsub]
+path = "../gsub"
+version = "^1.0.0"

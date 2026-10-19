@@ -1,0 +1,86 @@
+// The OpenType `avar` table (version 1): how a variable font bends each
+// axis between its normalised ends.
+//
+// After a user coordinate is normalised to -1..1 against `fvar`'s range,
+// `avar` remaps it piecewise-linearly through per-axis maps of
+// (from, to) points, so a designer can make "weight 500" sit wherever it
+// looks right rather than halfway. Every map holds -1 to -1, 0 to 0 and
+// 1 to 1. Values are F2Dot14 (2.14 fixed-point), returned raw.
+//
+// Checked against fontTools' `avar` table on fonts built by fontTools and
+// macOS's variable fonts.
+
+type AvarError =
+    | AvarMalformed(why: str)
+    | AvarUnsupported(version: i64)
+
+fn u16(b: bytes, at: i64) -> i64 {
+    return b.at(at) * 256 + b.at(at + 1)
+}
+
+fn f2dot14(b: bytes, at: i64) -> i64 {
+    let v = u16(b, at)
+    return if v >= 32768 { v - 65536 } else { v }
+}
+
+/// Each axis's map, as (from, to) pairs in F2Dot14, in `fvar`'s axis order.
+pub fn parse(d: bytes) -> [[(i64, i64)]] ! AvarError {
+    if d.len() < 8 {
+        fail(AvarMalformed("shorter than its header"))
+    }
+    if u16(d, 0) != 1 {
+        fail(AvarUnsupported(u16(d, 0)))
+    }
+    let n = u16(d, 6)
+    var at = 8
+    var out: [[(i64, i64)]] = []
+    for _i in 0..n {
+        if at + 2 > d.len() {
+            fail(AvarMalformed("an axis past the end"))
+        }
+        let count = u16(d, at)
+        if at + 2 + 4 * count > d.len() {
+            fail(AvarMalformed("a map past the end"))
+        }
+        var map: [(i64, i64)] = []
+        for k in 0..count {
+            map.push((f2dot14(d, at + 2 + 4 * k), f2dot14(d, at + 4 + 4 * k)))
+        }
+        out.push(map)
+        at = at + 2 + 4 * count
+    }
+    return out
+}
+
+fn round_div(n: i64, d: i64) -> i64 {
+    let num = 2 * n + d
+    let den = 2 * d
+    let q = num / den
+    return if num % den != 0 and (num < 0) != (den < 0) { q - 1 } else { q }
+}
+
+/// A normalised coordinate (F2Dot14) through one axis's map, rounded to
+/// F2Dot14. Beyond the map's ends the offset of the nearest end applies.
+pub fn apply(map: [(i64, i64)], v: i64) -> i64 {
+    if map.len() == 0 {
+        return v
+    }
+    if v <= map[0].0 {
+        return v + map[0].1 - map[0].0
+    }
+    let last = map[map.len() - 1]
+    if v >= last.0 {
+        return v + last.1 - last.0
+    }
+    for i in 1..map.len() {
+        if v <= map[i].0 {
+            let (a0, b0) = map[i - 1]
+            let (a1, b1) = map[i]
+            if v == a1 {
+                return b1
+            }
+            return b0 + round_div((v - a0) * (b1 - b0), a1 - a0)
+        }
+    }
+    return v
+}

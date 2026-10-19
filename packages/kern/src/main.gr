@@ -1,0 +1,91 @@
+// The `kern` table: pair kerning as TrueType and early OpenType fonts
+// carry it, in Microsoft's and Apple's versions.
+//
+// Before GPOS, a font's kerning was a list of glyph pairs and the
+// adjustment between them. Microsoft's table (version 0) has 16-bit
+// headers; Apple's (version 1.0) 32-bit ones and a tuple index for
+// variation. Both hold subtables whose coverage bits say horizontal or
+// vertical, minimum or cross-stream; format 0 is the sorted pair list,
+// which is what fonts ship and what this reads. Many macOS fonts and most
+// older TrueType fonts still kern only through this table, and PDF
+// generators and terminals read it because they do not run GPOS.
+//
+// Subtables of other formats are kept with their coverage, without pairs.
+//
+// Checked against fontTools' `kern` table on macOS's system fonts.
+
+/// `coverage` is the flags byte: horizontal, minimum, cross-stream,
+/// override (Microsoft) or vertical, cross-stream, variation (Apple).
+type KernSubtable = { format: i64, coverage: i64, pairs: [(i64, i64, i64)] }
+
+type KernError =
+    | KernMalformed(why: str)
+
+fn u16(b: bytes, at: i64) -> i64 {
+    return b.at(at) * 256 + b.at(at + 1)
+}
+
+fn u32(b: bytes, at: i64) -> i64 {
+    return u16(b, at) * 65536 + u16(b, at + 2)
+}
+
+fn pairs(d: bytes, at: i64, end: i64) -> [(i64, i64, i64)] ! KernError {
+    if at + 8 > end {
+        fail(KernMalformed("a format 0 header past the subtable"))
+    }
+    let n = u16(d, at)
+    if at + 8 + 6 * n > d.len() {
+        fail(KernMalformed("pairs past the end"))
+    }
+    var out: [(i64, i64, i64)] = []
+    for i in 0..n {
+        let p = at + 8 + 6 * i
+        let v = u16(d, p + 4)
+        out.push((u16(d, p), u16(d, p + 2), if v >= 32768 { v - 65536 } else { v }))
+    }
+    return out
+}
+
+pub fn parse(d: bytes) -> [KernSubtable] ! KernError {
+    if d.len() < 4 {
+        fail(KernMalformed("shorter than its header"))
+    }
+    var out: [KernSubtable] = []
+    let apple = u16(d, 0) == 1
+    let count = if apple { u32(d, 4) } else { u16(d, 2) }
+    var at = if apple { 8 } else { 4 }
+    for _i in 0..count {
+        let head = if apple { 8 } else { 6 }
+        if at + head > d.len() {
+            fail(KernMalformed("a subtable past the end"))
+        }
+        let length = if apple { u32(d, at) } else { u16(d, at + 2) }
+        // The format and the coverage flags share 16 bits, in opposite
+        // halves in the two versions.
+        let both = u16(d, at + 4)
+        let coverage = if apple { both.ushr(8) } else { both.bit_and(255) }
+        let format = if apple { both.bit_and(255) } else { both.ushr(8) }
+        let end = if length >= head and at + length <= d.len() { at + length } else { d.len() }
+        let ps = if format == 0 { try pairs(d, at + head, end) } else { [] }
+        out.push(KernSubtable{ format: format, coverage: coverage, pairs: ps })
+        // A lone Microsoft format 0 subtable may hold more pairs than its
+        // 16-bit length can count; there the pairs are what counts, and
+        // elsewhere the length, as fontTools reads it.
+        let lone = not apple and count == 1 and format == 0
+        at = if lone or length < head { at + head + 8 + 6 * ps.len() } else { at + length }
+    }
+    return out
+}
+
+/// The adjustment between two glyphs in horizontal format 0 subtables.
+pub fn value(t: [KernSubtable], left: i64, right: i64) -> i64 {
+    var total = 0
+    for s in t {
+        for p in s.pairs {
+            if p.0 == left and p.1 == right {
+                total = total + p.2
+            }
+        }
+    }
+    return total
+}

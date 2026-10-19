@@ -1,0 +1,84 @@
+// TrueType and OpenType collections (.ttc, .otc): several fonts sharing
+// tables in one file.
+//
+// A "ttcf" header, its version (1.0, or 2.0 with a DSIG signature
+// pointer), the number of fonts and each font's offset table offset. Each
+// font then has the usual sfnt directory -- version, table count and a
+// record per table (tag, checksum, offset, length) -- whose offsets are
+// from the start of the file, so fonts can point at the same glyph data.
+// macOS ships its CJK, Helvetica and system UI faces this way, and Noto CJK
+// and Source Han are distributed as collections.
+//
+// Checked against fontTools' TTCollection on macOS's system fonts.
+
+type TtcTable = { tag: str, checksum: i64, offset: i64, length: i64 }
+
+type TtcFont = { version: i64, tables: [TtcTable] }
+
+type TtcFile = { version: i64, fonts: [TtcFont], dsig: (i64, i64, i64) }
+
+type TtcError =
+    | TtcMalformed(why: str)
+
+fn u16(b: bytes, at: i64) -> i64 {
+    return b.at(at) * 256 + b.at(at + 1)
+}
+
+fn u32(b: bytes, at: i64) -> i64 {
+    return u16(b, at) * 65536 + u16(b, at + 2)
+}
+
+fn font_at(d: bytes, at: i64) -> TtcFont ! TtcError {
+    if at + 12 > d.len() {
+        fail(TtcMalformed("an offset table past the end"))
+    }
+    let n = u16(d, at + 4)
+    if at + 12 + 16 * n > d.len() {
+        fail(TtcMalformed("table records past the end"))
+    }
+    var tables: [TtcTable] = []
+    for i in 0..n {
+        let r = at + 12 + 16 * i
+        let t = TtcTable{ tag: d.slice(r, r + 4).to_str(), checksum: u32(d, r + 4), offset: u32(d, r + 8), length: u32(d, r + 12) }
+        if t.offset + t.length > d.len() {
+            fail(TtcMalformed("table " + t.tag + " past the end"))
+        }
+        tables.push(t)
+    }
+    return TtcFont{ version: u32(d, at), tables: tables }
+}
+
+pub fn is_collection(d: bytes) -> bool {
+    return d.len() >= 4 and d.slice(0, 4).to_str() == "ttcf"
+}
+
+pub fn parse(d: bytes) -> TtcFile ! TtcError {
+    if d.len() < 12 or not is_collection(d) {
+        fail(TtcMalformed("not a collection"))
+    }
+    let version = u32(d, 4)
+    let n = u32(d, 8)
+    if 12 + 4 * n > d.len() {
+        fail(TtcMalformed("font offsets past the end"))
+    }
+    var fonts: [TtcFont] = []
+    for i in 0..n {
+        fonts.push(try font_at(d, u32(d, 12 + 4 * i)))
+    }
+    var dsig = (0, 0, 0)
+    let at = 12 + 4 * n
+    if version >= 131072 and at + 12 <= d.len() {
+        dsig = (u32(d, at), u32(d, at + 4), u32(d, at + 8))
+    }
+    return TtcFile{ version: version, fonts: fonts, dsig: dsig }
+}
+
+/// One table's bytes from one font of the collection.
+pub fn table(d: bytes, f: TtcFont, tag: str) -> Option[bytes] {
+    for t in f.tables {
+        if t.tag == tag {
+            return Some(d.slice(t.offset, t.offset + t.length))
+        }
+    }
+    return None
+}

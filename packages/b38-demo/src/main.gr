@@ -1,0 +1,52 @@
+// OpenType tables, each from a few bytes built here.
+// scripts/b38_diff.sh holds them to fontTools on macOS's system fonts.
+import otfname
+import os2table
+import posttable
+import kern
+import ttcfile
+import fvar
+import avar
+import stat
+import colrcpal
+import gsub
+
+fn main() / {io} {
+    // A name table with one Windows record, "Hi", for name ID 1.
+    let name = bytes_of([0, 0, 0, 1, 0, 18, 0, 3, 0, 1, 4, 9, 0, 1, 0, 4, 0, 0, 0, 72, 0, 105])
+    let t = otfname.parse(name) ?? panic("name")
+    assert_eq(otfname.lookup(t, 1) ?? "", "Hi")
+
+    // A version 3 post table naming no glyphs.
+    var post = [0, 3, 0, 0, 255, 241, 0, 0]
+    while post.len() < 32 {
+        post.push(0)
+    }
+    let p = posttable.parse(bytes_of(post)) ?? panic("post")
+    assert_eq(p.names.len(), 0)
+    assert_eq(posttable.italic_degrees(p) < 0.0, true)
+
+    // Microsoft kern: glyph 1 then 2 tightens by 50 units.
+    let k = kern.parse(bytes_of([0, 0, 0, 1, 0, 0, 0, 20, 0, 1, 0, 1, 0, 6, 0, 0, 0, 0, 0, 1, 0, 2, 255, 206])) ?? panic("kern")
+    assert_eq(kern.value(k, 1, 2), -50)
+
+    // A weight axis from 100 to 900 (default 400), and its normalisation.
+    let w = FvarAxis{ tag: "wght", min: 100 * 65536, default: 400 * 65536, max: 900 * 65536, flags: 0, name_id: 256 }
+    assert_eq(fvar.normalise(w, 900 * 65536), 16384)
+    assert_eq(fvar.normalise(w, 250 * 65536), -8192)
+    // avar bending the midpoint of the upper half to a quarter.
+    assert_eq(avar.apply([(-16384, -16384), (0, 0), (8192, 4096), (16384, 16384)], 8192), 4096)
+    assert_eq(avar.apply([(-16384, -16384), (0, 0), (8192, 4096), (16384, 16384)], 12288), 10240)
+
+    // An empty GSUB, and a collection header that names nothing.
+    let g = gsub.parse(bytes_of([0, 1, 0, 0, 0, 0, 0, 0, 0, 0])) ?? panic("gsub")
+    assert_eq(g.lookups.len(), 0)
+    assert_eq(ttcfile.is_collection("ttcf".to_bytes()), true)
+    assert_eq((os2table.parse(bytes_of([0, 4])) ?? Os2Table{ version: -1, x_avg_char_width: 0, weight_class: 0, width_class: 0, fs_type: 0,
+        sub_super: [], strikeout_size: 0, strikeout_position: 0, family_class: 0, panose: [], unicode_ranges: [], vendor: "", fs_selection: 0,
+        first_char: 0, last_char: 0, typo_ascender: 0, typo_descender: 0, typo_line_gap: 0, win_ascent: 0, win_descent: 0, code_pages: [],
+        x_height: 0, cap_height: 0, default_char: 0, break_char: 0, max_context: 0, lower_optical_size: 0, upper_optical_size: 0 }).version, -1)
+    assert_eq((stat.parse(bytes_of([0, 2])) ?? Stat{ minor: -1, axes: [], values: [], elided_name_id: 0 }).minor, -1)
+    assert_eq((colrcpal.palettes(bytes_of([0, 0, 0, 1, 0, 1, 0, 1, 0, 0, 0, 14, 0, 0, 255, 0, 0, 255])) ?? [])[0].colors[0], (0, 0, 255, 255))
+    print("b38: ok")
+}

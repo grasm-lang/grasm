@@ -1,0 +1,89 @@
+// The OpenType `fvar` table: a variable font's axes and named instances.
+//
+// Each axis has a tag (`wght`, `wdth`, `opsz`, `ital`, `slnt`, or a
+// private one in capitals), its minimum, default and maximum on the
+// user scale, a flag for axes hidden from users, and the name ID of its
+// label. Each named instance -- "Bold", "Condensed Light" -- is a name ID,
+// a coordinate on every axis and, optionally, a PostScript name ID. CSS
+// `font-variation-settings`, font pickers' style lists and every
+// variable-font renderer start here.
+//
+// Coordinates are 16.16 fixed-point, returned raw; divide by 65536.
+//
+// Checked against fontTools' `fvar` table on macOS's variable fonts.
+
+type FvarAxis = { tag: str, min: i64, default: i64, max: i64, flags: i64, name_id: i64 }
+
+type FvarInstance = { name_id: i64, flags: i64, coords: [i64], postscript_name_id: i64 }
+
+type Fvar = { axes: [FvarAxis], instances: [FvarInstance] }
+
+type FvarError =
+    | FvarMalformed(why: str)
+
+fn u16(b: bytes, at: i64) -> i64 {
+    return b.at(at) * 256 + b.at(at + 1)
+}
+
+fn fixed(b: bytes, at: i64) -> i64 {
+    let v = u16(b, at) * 65536 + u16(b, at + 2)
+    return if v >= 2147483648 { v - 4294967296 } else { v }
+}
+
+pub fn parse(d: bytes) -> Fvar ! FvarError {
+    if d.len() < 16 or u16(d, 0) != 1 {
+        fail(FvarMalformed("not version 1"))
+    }
+    let axes_at = u16(d, 4)
+    let n = u16(d, 8)
+    let axis_size = u16(d, 10)
+    let count = u16(d, 12)
+    let size = u16(d, 14)
+    if axis_size < 20 or size < 4 + 4 * n {
+        fail(FvarMalformed("records smaller than their fields"))
+    }
+    if axes_at + n * axis_size + count * size > d.len() {
+        fail(FvarMalformed("records past the end"))
+    }
+    var axes: [FvarAxis] = []
+    for i in 0..n {
+        let a = axes_at + i * axis_size
+        axes.push(FvarAxis{ tag: d.slice(a, a + 4).to_str(), min: fixed(d, a + 4), default: fixed(d, a + 8), max: fixed(d, a + 12),
+            flags: u16(d, a + 16), name_id: u16(d, a + 18) })
+    }
+    var instances: [FvarInstance] = []
+    let base = axes_at + n * axis_size
+    for i in 0..count {
+        let r = base + i * size
+        var coords: [i64] = []
+        for k in 0..n {
+            coords.push(fixed(d, r + 4 + 4 * k))
+        }
+        instances.push(FvarInstance{ name_id: u16(d, r), flags: u16(d, r + 2), coords: coords,
+            postscript_name_id: if size >= 6 + 4 * n { u16(d, r + 4 + 4 * n) } else { 65535 } })
+    }
+    return Fvar{ axes: axes, instances: instances }
+}
+
+/// n / d rounded to the nearest integer, halves upward (floor(x + 0.5)).
+fn round_div(n: i64, d: i64) -> i64 {
+    let num = 2 * n + d
+    let den = 2 * d
+    let q = num / den
+    // Division truncates toward zero; floor for a negative quotient.
+    return if num % den != 0 and (num < 0) != (den < 0) { q - 1 } else { q }
+}
+
+/// A user coordinate (16.16) normalised to -1..1 against an axis, as
+/// F2Dot14, before `avar`: clamped to the axis, scaled on whichever side
+/// of the default it falls, and rounded.
+pub fn normalise(a: FvarAxis, value: i64) -> i64 {
+    let v = if value < a.min { a.min } else if value > a.max { a.max } else { value }
+    if v == a.default or a.min == a.max {
+        return 0
+    }
+    if v < a.default and a.min != a.default or v > a.default and a.max == a.default {
+        return round_div((v - a.default) * 16384, a.default - a.min)
+    }
+    return round_div((v - a.default) * 16384, a.max - a.default)
+}

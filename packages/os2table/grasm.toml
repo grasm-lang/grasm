@@ -1,0 +1,4 @@
+[package]
+name = "os2table"
+version = "1.0.0"
+capabilities = []

@@ -1,0 +1,107 @@
+// The OpenType `OS/2` table: weight, width, embedding rights, metrics,
+// Unicode and code-page coverage, and the vendor (versions 0 to 5).
+//
+// Font pickers group faces by `usWeightClass` and `usWidthClass`; PDF and
+// document tools honour `fsType`'s embedding permissions; renderers on
+// Windows clip to `usWinAscent` and `usWinDescent` and lay out lines with
+// the typographic metrics when `fsSelection` bit 7 says to; fallback
+// chains consult the Unicode ranges. Fields arrive in versions: the code
+// pages in 1, x-height, cap height and context in 2, and optical sizes in
+// 5. Signed fields are returned signed.
+//
+// Checked against fontTools' `OS/2` table on macOS's system fonts.
+
+type Os2Table = {
+    version: i64,
+    x_avg_char_width: i64,
+    weight_class: i64,
+    width_class: i64,
+    fs_type: i64,
+    sub_super: [i64],
+    strikeout_size: i64,
+    strikeout_position: i64,
+    family_class: i64,
+    panose: [i64],
+    unicode_ranges: [i64],
+    vendor: str,
+    fs_selection: i64,
+    first_char: i64,
+    last_char: i64,
+    typo_ascender: i64,
+    typo_descender: i64,
+    typo_line_gap: i64,
+    win_ascent: i64,
+    win_descent: i64,
+    code_pages: [i64],
+    x_height: i64,
+    cap_height: i64,
+    default_char: i64,
+    break_char: i64,
+    max_context: i64,
+    lower_optical_size: i64,
+    upper_optical_size: i64,
+}
+
+type Os2Error =
+    | Os2Truncated(version: i64, length: i64)
+
+fn u16(b: bytes, at: i64) -> i64 {
+    return b.at(at) * 256 + b.at(at + 1)
+}
+
+fn s16(b: bytes, at: i64) -> i64 {
+    let v = u16(b, at)
+    return if v >= 32768 { v - 65536 } else { v }
+}
+
+fn u32(b: bytes, at: i64) -> i64 {
+    return u16(b, at) * 65536 + u16(b, at + 2)
+}
+
+pub fn parse(d: bytes) -> Os2Table ! Os2Error {
+    if d.len() < 2 {
+        fail(Os2Truncated(0 - 1, d.len()))
+    }
+    let v = u16(d, 0)
+    // Version 0 tables of 68 bytes predate the typographic metrics.
+    let need = if v == 0 { 68 } else if v == 1 { 86 } else if v < 5 { 96 } else { 100 }
+    if d.len() < need {
+        fail(Os2Truncated(v, d.len()))
+    }
+    var sub: [i64] = []
+    for i in 0..8 {
+        sub.push(s16(d, 10 + 2 * i))
+    }
+    var panose: [i64] = []
+    for i in 0..10 {
+        panose.push(d.at(32 + i))
+    }
+    let long = d.len() >= 78
+    return Os2Table{
+        version: v, x_avg_char_width: s16(d, 2), weight_class: u16(d, 4), width_class: u16(d, 6), fs_type: u16(d, 8), sub_super: sub,
+        strikeout_size: s16(d, 26), strikeout_position: s16(d, 28), family_class: s16(d, 30), panose: panose,
+        unicode_ranges: [u32(d, 42), u32(d, 46), u32(d, 50), u32(d, 54)], vendor: d.slice(58, 62).to_str(), fs_selection: u16(d, 62),
+        first_char: u16(d, 64), last_char: u16(d, 66), typo_ascender: if long { s16(d, 68) } else { 0 },
+        typo_descender: if long { s16(d, 70) } else { 0 }, typo_line_gap: if long { s16(d, 72) } else { 0 },
+        win_ascent: if long { u16(d, 74) } else { 0 }, win_descent: if long { u16(d, 76) } else { 0 },
+        code_pages: if v >= 1 { [u32(d, 78), u32(d, 82)] } else { [] }, x_height: if v >= 2 { s16(d, 86) } else { 0 },
+        cap_height: if v >= 2 { s16(d, 88) } else { 0 }, default_char: if v >= 2 { u16(d, 90) } else { 0 },
+        break_char: if v >= 2 { u16(d, 92) } else { 0 }, max_context: if v >= 2 { u16(d, 94) } else { 0 },
+        lower_optical_size: if v >= 5 { u16(d, 96) } else { 0 }, upper_optical_size: if v >= 5 { u16(d, 98) } else { 0 },
+    }
+}
+
+/// Whether bit n of the 128-bit Unicode range field is set.
+pub fn covers_range(t: Os2Table, bit: i64) -> bool {
+    return bit >= 0 and bit < 128 and t.unicode_ranges[bit / 32].ushr(bit % 32).bit_and(1) == 1
+}
+
+/// Embedding is restricted (fsType bit 1 alone): the font may not be
+/// embedded at all.
+pub fn restricted(t: Os2Table) -> bool {
+    return t.fs_type.bit_and(15) == 2
+}
+
+pub fn uses_typo_metrics(t: Os2Table) -> bool {
+    return t.fs_selection.bit_and(128) != 0
+}

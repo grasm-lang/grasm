@@ -256,6 +256,24 @@ day its reference is installed.
 
 ## Landed
 
+- [x] **B38: OpenType tables** — B13's `kern`, with `otfname` `os2table`
+  `posttable` `ttcfile` `fvar` `avar` `stat` `colrcpal` `gsub` (B13 named
+  `otfname`, `os2table`, `colrcpal` and `ttcfile` too), and the harness
+  `b38test`; the new gate `b38diff` runs 3,734 cases against fontTools
+  4.63: every table of those ten in 200 of macOS's font files (each font
+  of a collection on its own) and in 40 fonts built here with fontTools'
+  FontBuilder to reach COLR versions 0 and 1, CPAL with palette types,
+  avar, every STAT axis-value format and fvar instances with and without
+  PostScript names; collection directories against fontTools' TTC reader;
+  and axis normalisation and avar mapping against fontTools'
+  `normalizeValue` and `piecewiseLinearMap`, rounded to F2Dot14 as
+  `otRound` rounds. Real fonts found three things: an extension lookup's
+  later subtables were read unwrapped (DecoType Nastaleeq), NULL list
+  offsets in GSUB mean empty lists (Noto), and fontTools reads only as many
+  `post` names as the indices need and ignores a lone Microsoft `kern`
+  subtable's overflowing 16-bit length, which the packages now do too. One
+  break per package turned it red.
+
 - [x] **B37: image formats** — B12's `qoi` `pnm` `tga` `pcx` `xbm` `xpm`
   `sgiimage` `dds` `icns` `apng`, with `sunraster`, which was not on the
   list, and the harness `b37test`; the new gate `b37diff` runs 1,667 cases
@@ -685,7 +703,7 @@ day its reference is installed.
 | | |
 |---|---|
 | At the start | 669 |
-| Now | 900 |
+| Now | 911 |
 | Candidates above | 316 packages in 28 batches, plus `ecc`, `rfc6979` and `goprintf` |
 | Harnesses, one a batch | 28 |
 | If every candidate lands | 1016 |

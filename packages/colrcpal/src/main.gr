@@ -1,0 +1,95 @@
+// Colour fonts' layers and palettes: the OpenType `COLR` (version 0
+// layers) and `CPAL` tables.
+//
+// A COLR version 0 glyph is drawn as a stack of ordinary glyphs, each
+// filled with a colour from a palette: the base glyph records say which
+// glyph has layers and where they start, and the layer records give each
+// layer's glyph and palette index (0xFFFF for the text colour). CPAL holds
+// one or more palettes of BGRA colours, with version 1 adding palette
+// types (for light or dark backgrounds) and name IDs. Windows' Segoe UI
+// Emoji, Twemoji's COLR builds and many icon and flag fonts draw this way.
+//
+// The version 0 records of a COLR version 1 table are read too; its paint
+// graphs are not.
+//
+// Checked against fontTools' `COLR` and `CPAL` tables on fonts built by
+// fontTools.
+
+type ColrLayer = { glyph: i64, palette_index: i64 }
+
+type CpalPalette = { colors: [(i64, i64, i64, i64)], kind: i64, label: i64 }
+
+type ColrError =
+    | ColrMalformed(why: str)
+
+fn u16(b: bytes, at: i64) -> i64 {
+    return b.at(at) * 256 + b.at(at + 1)
+}
+
+fn u32(b: bytes, at: i64) -> i64 {
+    return u16(b, at) * 65536 + u16(b, at + 2)
+}
+
+/// Each base glyph and its layers, bottom first.
+pub fn layers(d: bytes) -> [(i64, [ColrLayer])] ! ColrError {
+    if d.len() < 14 {
+        fail(ColrMalformed("shorter than its header"))
+    }
+    let n = u16(d, 2)
+    let base_at = u32(d, 4)
+    let layer_at = u32(d, 8)
+    let n_layers = u16(d, 12)
+    if n > 0 and base_at + 6 * n > d.len() or n_layers > 0 and layer_at + 4 * n_layers > d.len() {
+        fail(ColrMalformed("records past the end"))
+    }
+    var out: [(i64, [ColrLayer])] = []
+    for i in 0..n {
+        let r = base_at + 6 * i
+        let first = u16(d, r + 2)
+        let count = u16(d, r + 4)
+        if first + count > n_layers {
+            fail(ColrMalformed("layers past the layer records"))
+        }
+        var ls: [ColrLayer] = []
+        for k in 0..count {
+            let l = layer_at + 4 * (first + k)
+            ls.push(ColrLayer{ glyph: u16(d, l), palette_index: u16(d, l + 2) })
+        }
+        out.push((u16(d, r), ls))
+    }
+    return out
+}
+
+/// The palettes, each colour as (red, green, blue, alpha).
+pub fn palettes(d: bytes) -> [CpalPalette] ! ColrError {
+    if d.len() < 12 {
+        fail(ColrMalformed("shorter than its header"))
+    }
+    let version = u16(d, 0)
+    let entries = u16(d, 2)
+    let n = u16(d, 4)
+    let records = u16(d, 6)
+    let colors_at = u32(d, 8)
+    if 12 + 2 * n > d.len() or colors_at + 4 * records > d.len() {
+        fail(ColrMalformed("records past the end"))
+    }
+    let v1 = version >= 1 and d.len() >= 24 + 2 * n
+    let types_at = if v1 { u32(d, 12 + 2 * n) } else { 0 }
+    let labels_at = if v1 { u32(d, 16 + 2 * n) } else { 0 }
+    var out: [CpalPalette] = []
+    for i in 0..n {
+        let first = u16(d, 12 + 2 * i)
+        if first + entries > records {
+            fail(ColrMalformed("a palette past the colour records"))
+        }
+        var colors: [(i64, i64, i64, i64)] = []
+        for k in 0..entries {
+            let c = colors_at + 4 * (first + k)
+            colors.push((d.at(c + 2), d.at(c + 1), d.at(c), d.at(c + 3)))
+        }
+        let kind = if types_at > 0 and types_at + 4 * n <= d.len() { u32(d, types_at + 4 * i) } else { 0 }
+        let label = if labels_at > 0 and labels_at + 2 * n <= d.len() { u16(d, labels_at + 2 * i) } else { 65535 }
+        out.push(CpalPalette{ colors: colors, kind: kind, label: label })
+    }
+    return out
+}

@@ -139,6 +139,7 @@ run_gate b34diff       scripts/b34_diff.sh
 run_gate b35diff       scripts/b35_diff.sh
 run_gate b36diff       scripts/b36_diff.sh
 run_gate b37diff       scripts/b37_diff.sh
+run_gate b38diff       scripts/b38_diff.sh
 run_gate grasmwire     scripts/grasmwire_e2e.sh
 run_gate cryptodiff    scripts/crypto_diff.sh
 run_gate certdiff      scripts/cert_diff.sh

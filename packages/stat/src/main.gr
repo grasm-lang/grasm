@@ -1,0 +1,102 @@
+// The OpenType `STAT` table: style attributes, the names behind a
+// family's styles.
+//
+// Design axes (tag, name ID, ordering for building names) and axis
+// values that say what a position on them is called: format 1 names a
+// point ("Bold" at weight 700), format 2 a range, format 3 a point and
+// its style-linked partner (Regular to Bold), format 4 a combination of
+// axes. Flags mark values older applications should skip and values to
+// elide ("Regular"). OS font menus and CSS font matching name styles
+// from it, especially for variable fonts.
+//
+// Values are 16.16 fixed-point, returned raw.
+//
+// Checked against fontTools' `STAT` table on macOS's system fonts and
+// fonts built by fontTools.
+
+type StatAxis = { tag: str, name_id: i64, ordering: i64 }
+
+/// Format, flags, name ID, and the axis-and-value pairs: one pair for
+/// formats 1 and 3, with `extra` the range (format 2: nominal, min, max)
+/// or linked value (format 3).
+type StatValue = { format: i64, flags: i64, name_id: i64, axes: [(i64, i64)], extra: [i64] }
+
+type Stat = { minor: i64, axes: [StatAxis], values: [StatValue], elided_name_id: i64 }
+
+type StatError =
+    | StatMalformed(why: str)
+
+fn u16(b: bytes, at: i64) -> i64 {
+    return b.at(at) * 256 + b.at(at + 1)
+}
+
+fn u32(b: bytes, at: i64) -> i64 {
+    return u16(b, at) * 65536 + u16(b, at + 2)
+}
+
+fn fixed(b: bytes, at: i64) -> i64 {
+    let v = u32(b, at)
+    return if v >= 2147483648 { v - 4294967296 } else { v }
+}
+
+fn value_at(d: bytes, at: i64) -> StatValue ! StatError {
+    if at + 12 > d.len() {
+        fail(StatMalformed("an axis value past the end"))
+    }
+    let format = u16(d, at)
+    if format == 1 {
+        return StatValue{ format: 1, flags: u16(d, at + 4), name_id: u16(d, at + 6), axes: [(u16(d, at + 2), fixed(d, at + 8))], extra: [] }
+    }
+    if format == 2 {
+        if at + 20 > d.len() {
+            fail(StatMalformed("an axis value past the end"))
+        }
+        return StatValue{ format: 2, flags: u16(d, at + 4), name_id: u16(d, at + 6), axes: [(u16(d, at + 2), fixed(d, at + 8))],
+            extra: [fixed(d, at + 12), fixed(d, at + 16)] }
+    }
+    if format == 3 {
+        if at + 16 > d.len() {
+            fail(StatMalformed("an axis value past the end"))
+        }
+        return StatValue{ format: 3, flags: u16(d, at + 4), name_id: u16(d, at + 6), axes: [(u16(d, at + 2), fixed(d, at + 8))],
+            extra: [fixed(d, at + 12)] }
+    }
+    if format == 4 {
+        let n = u16(d, at + 2)
+        if at + 8 + 6 * n > d.len() {
+            fail(StatMalformed("an axis value past the end"))
+        }
+        var axes: [(i64, i64)] = []
+        for k in 0..n {
+            axes.push((u16(d, at + 8 + 6 * k), fixed(d, at + 10 + 6 * k)))
+        }
+        return StatValue{ format: 4, flags: u16(d, at + 4), name_id: u16(d, at + 6), axes: axes, extra: [] }
+    }
+    fail(StatMalformed("axis value format {format}"))
+}
+
+pub fn parse(d: bytes) -> Stat ! StatError {
+    if d.len() < 18 or u16(d, 0) != 1 {
+        fail(StatMalformed("not version 1"))
+    }
+    let minor = u16(d, 2)
+    let axis_size = u16(d, 4)
+    let n = u16(d, 6)
+    let axes_at = u32(d, 8)
+    let count = u16(d, 12)
+    let values_at = u32(d, 14)
+    if axis_size < 8 or (n > 0 and axes_at + n * axis_size > d.len()) or (count > 0 and values_at + 2 * count > d.len()) {
+        fail(StatMalformed("records past the end"))
+    }
+    var axes: [StatAxis] = []
+    for i in 0..n {
+        let a = axes_at + i * axis_size
+        axes.push(StatAxis{ tag: d.slice(a, a + 4).to_str(), name_id: u16(d, a + 4), ordering: u16(d, a + 6) })
+    }
+    var values: [StatValue] = []
+    for i in 0..count {
+        values.push(try value_at(d, values_at + u16(d, values_at + 2 * i)))
+    }
+    let elided = if minor >= 1 and d.len() >= 20 { u16(d, 18) } else { 2 }
+    return Stat{ minor: minor, axes: axes, values: values, elided_name_id: elided }
+}

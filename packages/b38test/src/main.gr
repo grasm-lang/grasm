@@ -1,0 +1,149 @@
+// The Grasm side of scripts/b38_diff.py: `<op> <path>`, the path a file
+// holding one table's bytes (or a whole collection). Answers are text
+// summaries, hex-encoded, or ERR.
+import otfname
+import os2table
+import posttable
+import kern
+import ttcfile
+import fvar
+import avar
+import stat
+import colrcpal
+import gsub
+
+fn hex(raw: bytes) -> str {
+    let digits = "0123456789abcdef"
+    var out = ""
+    for i in 0..raw.len() {
+        out = out + digits.substr(raw.at(i) / 16, 1) + digits.substr(raw.at(i) % 16, 1)
+    }
+    out
+}
+
+fn ints(v: [i64]) -> str {
+    v.map(|x| "{x}").join(",")
+}
+
+fn name_summary(t: NameTable) -> str {
+    var parts: [str] = []
+    for r in t.records {
+        parts.push("{r.platform},{r.encoding},{r.language},{r.name_id}:" + (if r.decoded { "t" + hex(r.text.to_bytes()) } else { "x" + hex(r.raw) }))
+    }
+    parts.sort()
+    "{t.format}|" + parts.join(";")
+}
+
+fn os2_summary(t: Os2Table) -> str {
+    let a = [t.version, t.x_avg_char_width, t.weight_class, t.width_class, t.fs_type] + t.sub_super +
+    [t.strikeout_size, t.strikeout_position, t.family_class] + t.panose + t.unicode_ranges + [t.fs_selection, t.first_char, t.last_char,
+        t.typo_ascender, t.typo_descender, t.typo_line_gap, t.win_ascent, t.win_descent] + t.code_pages
+    let b = if t.version >= 2 { [t.x_height, t.cap_height, t.default_char, t.break_char, t.max_context] } else { [] }
+    let c = if t.version >= 5 { [t.lower_optical_size, t.upper_optical_size] } else { [] }
+    ints(a + b + c) + "|" + hex(t.vendor.to_bytes())
+}
+
+fn gsub_summary(g: Gsub) -> str {
+    var parts: [str] = []
+    for l in g.langsys {
+        parts.push("S " + l.script + " " + l.language + " {l.required} " + ints(l.features))
+    }
+    for i in 0..g.features.len() {
+        parts.push("F {i} " + g.features[i].tag + " " + ints(g.features[i].lookups))
+    }
+    for i in 0..g.lookups.len() {
+        let l = g.lookups[i]
+        var es = l.entries.map(|e| ints(e.0) + ">" + ints(e.1))
+        es.sort()
+        parts.push("L {i} {l.kind} {l.flags} {l.mark_set} " + es.join(";"))
+    }
+    parts.join("\n")
+}
+
+fn run(op: str, d: bytes) -> str ! str {
+    if op == "name" {
+        return name_summary(otfname.parse(d) ?? fail("x"))
+    }
+    if op == "os2" {
+        return os2_summary(os2table.parse(d) ?? fail("x"))
+    }
+    if op == "post" {
+        let t = posttable.parse(d) ?? fail("x")
+        return ints([t.version, t.italic_angle, t.underline_position, t.underline_thickness, t.fixed_pitch] + t.memory) + "|" + t.names.join(" ")
+    }
+    if op == "kern" {
+        return (kern.parse(d) ?? fail("x")).map(|s| {
+            // fontTools keeps the pairs in a dictionary: the last of a
+            // repeated pair wins.
+            var last: Map[str, i64] = {}
+            for p in s.pairs {
+                last.set("{p.0},{p.1}", p.2)
+            }
+            var ps = last.keys().map(|k| k + ",{last.get(k) ?? 0}")
+            ps.sort()
+            "{s.format}:{s.coverage}:" + ps.join(";")
+        }).join("|")
+    }
+    if op == "ttc" {
+        let t = ttcfile.parse(d) ?? fail("x")
+        return "{t.version}|" + t.fonts.map(|f| "{f.version}:" + f.tables.map(|x| x.tag + "," + "{x.offset},{x.length}").join(";")).join("#")
+    }
+    if op == "fvar" {
+        let f = fvar.parse(d) ?? fail("x")
+        return f.axes.map(|a| a.tag + ",{a.min},{a.default},{a.max},{a.flags},{a.name_id}").join(";") + "|" +
+        f.instances.map(|i| "{i.name_id},{i.flags}," + ints(i.coords) + ",{i.postscript_name_id}").join(";")
+    }
+    if op == "avar" {
+        return (avar.parse(d) ?? fail("x")).map(|m| m.map(|p| "{p.0}:{p.1}").join(",")).join(";")
+    }
+    if op == "stat" {
+        let s = stat.parse(d) ?? fail("x")
+        return "{s.minor}|" + s.axes.map(|a| a.tag + ",{a.name_id},{a.ordering}").join(";") + "|" +
+        s.values.map(|v| "{v.format},{v.flags},{v.name_id}," + v.axes.map(|p| "{p.0}:{p.1}").join("+") + "," + ints(v.extra)).join(";") +
+        "|{s.elided_name_id}"
+    }
+    if op == "colr" {
+        return (colrcpal.layers(d) ?? fail("x")).map(|b| "{b.0}:" + b.1.map(|l| "{l.glyph},{l.palette_index}").join("+")).join(";")
+    }
+    if op == "cpal" {
+        return (colrcpal.palettes(d) ?? fail("x")).map(|p| p.colors.map(|c| "{c.0},{c.1},{c.2},{c.3}").join("+") + "/{p.kind}/{p.label}").join(";")
+    }
+    return gsub_summary(gsub.parse(d) ?? fail("x"))
+}
+
+/// `norm min,default,max,value` (16.16) and `amap from:to,...;value`
+/// (F2Dot14) take numbers instead of a file.
+fn numbers(op: str, arg: str) -> str {
+    if op == "norm" {
+        let v = arg.split(",").map(|x| x.parse_int() ?? 0)
+        let a = FvarAxis{ tag: "x", min: v[0], default: v[1], max: v[2], flags: 0, name_id: 0 }
+        return "{fvar.normalise(a, v[3])}"
+    }
+    let parts = arg.split(";")
+    let map = parts[0].split(",").map(|p| {
+        let f = p.split(":")
+        (f[0].parse_int() ?? 0, f[1].parse_int() ?? 0)
+    })
+    "{avar.apply(map, parts[1].parse_int() ?? 0)}"
+}
+
+fn main() / {io} {
+    let argv = args()
+    var i = 0
+    while i + 1 < argv.len() {
+        if argv[i] == "norm" or argv[i] == "amap" {
+            print(hex(numbers(argv[i], argv[i + 1]).to_bytes()))
+            i = i + 2
+            continue
+        }
+        let out = match read_bytes(argv[i + 1]) {
+            Ok(d) -> match run(argv[i], d) {
+                Ok(s) -> hex(s.to_bytes())
+                Err(_) -> "ERR"
+            }
+            Err(_) -> "NOFILE"
+        }
+        print(out)
+        i = i + 2
+    }
+}

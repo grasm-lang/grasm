@@ -1,0 +1,193 @@
+// The OpenType `GSUB` table: glyph substitution, as shaping engines read it.
+//
+// Scripts and their language systems choose features (`liga`, `smcp`,
+// `ccmp`, `init`...); each feature names lookups; each lookup is one kind
+// of substitution with flags (skip marks, ligatures or base glyphs; a mark
+// filtering set). This reads the whole structure and, for the four kinds
+// that map glyphs directly, the mapping:
+//
+// - type 1, single: one glyph for another (a delta, or a list);
+// - type 2, multiple: one glyph for a sequence (decomposition);
+// - type 3, alternate: one glyph for a choice (`salt`, `aalt`);
+// - type 4, ligature: a sequence for one glyph (`f` `i` to `fi`).
+//
+// Extension lookups (type 7) are unwrapped to the type they hold.
+// Contextual lookups (5, 6 and 8) are kept with their type and flags; the
+// rules inside them are not read. Coverage tables in both formats map the
+// covered glyphs in order.
+//
+// Checked against fontTools' `GSUB` table on macOS's system fonts.
+
+type GsubLangSys = { script: str, language: str, required: i64, features: [i64] }
+
+type GsubFeature = { tag: str, lookups: [i64] }
+
+/// `entries` are (input glyphs, output glyphs): one input for types 1 to
+/// 3, the component sequence for type 4.
+type GsubLookup = { kind: i64, flags: i64, mark_set: i64, entries: [([i64], [i64])] }
+
+type Gsub = { langsys: [GsubLangSys], features: [GsubFeature], lookups: [GsubLookup] }
+
+type GsubError =
+    | GsubMalformed(why: str)
+
+fn u16(b: bytes, at: i64) -> i64 ! GsubError {
+    if at < 0 or at + 2 > b.len() {
+        fail(GsubMalformed("a read past the end"))
+    }
+    return b.at(at) * 256 + b.at(at + 1)
+}
+
+fn u32(b: bytes, at: i64) -> i64 ! GsubError {
+    return (try u16(b, at)) * 65536 + (try u16(b, at + 2))
+}
+
+fn tag(b: bytes, at: i64) -> str ! GsubError {
+    if at + 4 > b.len() {
+        fail(GsubMalformed("a tag past the end"))
+    }
+    return b.slice(at, at + 4).to_str()
+}
+
+/// The glyphs a coverage table covers, in coverage-index order.
+pub fn coverage(d: bytes, at: i64) -> [i64] ! GsubError {
+    let format = try u16(d, at)
+    var out: [i64] = []
+    if format == 1 {
+        let n = try u16(d, at + 2)
+        for i in 0..n {
+            out.push(try u16(d, at + 4 + 2 * i))
+        }
+    } else if format == 2 {
+        let n = try u16(d, at + 2)
+        for i in 0..n {
+            let r = at + 4 + 6 * i
+            let start = try u16(d, r)
+            let end = try u16(d, r + 2)
+            for g in start..(end + 1) {
+                out.push(g)
+            }
+        }
+    } else {
+        fail(GsubMalformed("coverage format {format}"))
+    }
+    return out
+}
+
+fn glyph_list(d: bytes, at: i64) -> [i64] ! GsubError {
+    let n = try u16(d, at)
+    var out: [i64] = []
+    for i in 0..n {
+        out.push(try u16(d, at + 2 + 2 * i))
+    }
+    return out
+}
+
+fn subtable(d: bytes, kind: i64, at: i64, inout entries: [([i64], [i64])]) -> () ! GsubError {
+    let format = try u16(d, at)
+    if kind < 1 or kind > 4 {
+        return ()
+    }
+    let cov = try coverage(d, at + (try u16(d, at + 2)))
+    if kind == 1 {
+        if format == 1 {
+            let delta = try u16(d, at + 4)
+            for g in cov {
+                entries.push(([g], [(g + delta).bit_and(65535)]))
+            }
+        } else {
+            let subs = try glyph_list(d, at + 4)
+            for i in 0..cov.len() {
+                if i < subs.len() {
+                    entries.push(([cov[i]], [subs[i]]))
+                }
+            }
+        }
+        return ()
+    }
+    let n = try u16(d, at + 4)
+    for i in 0..cov.len() {
+        if i >= n {
+            break
+        }
+        let set = at + (try u16(d, at + 6 + 2 * i))
+        if kind == 2 or kind == 3 {
+            entries.push(([cov[i]], try glyph_list(d, set)))
+        } else {
+            let ligs = try u16(d, set)
+            for k in 0..ligs {
+                let l = set + (try u16(d, set + 2 + 2 * k))
+                let glyph = try u16(d, l)
+                let comps = try u16(d, l + 2)
+                var input = [cov[i]]
+                for c in 1..comps {
+                    input.push(try u16(d, l + 2 + 2 * c))
+                }
+                entries.push((input, [glyph]))
+            }
+        }
+    }
+}
+
+fn lookup_at(d: bytes, at: i64) -> GsubLookup ! GsubError {
+    let declared = try u16(d, at)
+    var kind = declared
+    let flags = try u16(d, at + 2)
+    let n = try u16(d, at + 4)
+    var entries: [([i64], [i64])] = []
+    for i in 0..n {
+        var sub = at + (try u16(d, at + 6 + 2 * i))
+        var k = declared
+        // Every subtable of an extension lookup is wrapped; the lookup's
+        // type is the one they wrap.
+        if declared == 7 {
+            k = try u16(d, sub + 2)
+            sub = sub + (try u32(d, sub + 4))
+            if i == 0 {
+                kind = k
+            }
+        }
+        try subtable(d, k, sub, entries)
+    }
+    let mark_set = if flags.bit_and(16) != 0 { try u16(d, at + 6 + 2 * n) } else { 0 - 1 }
+    return GsubLookup{ kind: kind, flags: flags, mark_set: mark_set, entries: entries }
+}
+
+fn lang_sys(d: bytes, at: i64, script: str, language: str) -> GsubLangSys ! GsubError {
+    return GsubLangSys{ script: script, language: language, required: try u16(d, at + 2), features: try glyph_list(d, at + 4) }
+}
+
+pub fn parse(d: bytes) -> Gsub ! GsubError {
+    if (try u16(d, 0)) != 1 {
+        fail(GsubMalformed("not version 1"))
+    }
+    let scripts = try u16(d, 4)
+    let features_at = try u16(d, 6)
+    let lookups_at = try u16(d, 8)
+    // A NULL list offset is an empty list.
+    var langsys: [GsubLangSys] = []
+    for i in 0..(if scripts == 0 { 0 } else { try u16(d, scripts) }) {
+        let rec = scripts + 2 + 6 * i
+        let stag = try tag(d, rec)
+        let s = scripts + (try u16(d, rec + 4))
+        let def = try u16(d, s)
+        if def != 0 {
+            langsys.push(try lang_sys(d, s + def, stag, "dflt"))
+        }
+        for k in 0..(try u16(d, s + 2)) {
+            let lr = s + 4 + 6 * k
+            langsys.push(try lang_sys(d, s + (try u16(d, lr + 4)), stag, try tag(d, lr)))
+        }
+    }
+    var features: [GsubFeature] = []
+    for i in 0..(if features_at == 0 { 0 } else { try u16(d, features_at) }) {
+        let rec = features_at + 2 + 6 * i
+        let f = features_at + (try u16(d, rec + 4))
+        features.push(GsubFeature{ tag: try tag(d, rec), lookups: try glyph_list(d, f + 2) })
+    }
+    var lookups: [GsubLookup] = []
+    for i in 0..(if lookups_at == 0 { 0 } else { try u16(d, lookups_at) }) {
+        lookups.push(try lookup_at(d, lookups_at + (try u16(d, lookups_at + 2 + 2 * i))))
+    }
+    return Gsub{ langsys: langsys, features: features, lookups: lookups }
+}
