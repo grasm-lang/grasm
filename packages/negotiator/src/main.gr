@@ -1,0 +1,561 @@
+// HTTP content negotiation as Node's servers do it (negotiator 1.0, the
+// library under Express, Koa and Fastify).
+//
+// `Accept: text/*;q=0.8, text/html, */*;q=0.1` against the types a
+// server can produce, and the same for Accept-Charset, Accept-Encoding
+// and Accept-Language: each offer gets the most specific range that
+// matches it (exact beats `type/*` beats `*/*`; a range with matching
+// parameters beats one without), that range's quality and its position
+// in the header break ties, quality 0 means "not acceptable", and a
+// stable sort orders the result. The small print is kept: `q` is read
+// with JavaScript's parseFloat (`q=.5x` is 0.5, `q=abc` makes the entry
+// unusable), commas inside quoted parameters do not split, identity is
+// acceptable unless the header says otherwise, and an absent header
+// means "anything" (an empty one, nothing).
+//
+// `media_types`, `charsets`, `encodings` and `languages` take the header
+// (None when absent) and the available values (None to list the
+// header's own preferences), and return them in order of preference.
+
+type NegAccept = { name: str, kind: str, sub: str, params: [(str, Option[str])], q: f64, i: i64 }
+
+type NegPriority = { index: i64, o: i64, q: f64, s: i64, name: str }
+
+fn nan() -> f64 {
+    return 0.0 / 0.0
+}
+
+fn is_ws(c: i64) -> bool {
+    return (c >= 9 and c <= 13) or c == 32 or c == 160 or c == 5760 or (c >= 8192 and c <= 8202) or c == 8232 or c == 8233 or c == 8239 or c == 8287 or
+    c == 12288 or c == 65279
+}
+
+fn text(cs: [i64]) -> str {
+    var out: [i64] = []
+    for c in cs {
+        if c < 128 {
+            out.push(c)
+        } else if c < 2048 {
+            out.push(192 + c.ushr(6))
+            out.push(128 + c.bit_and(63))
+        } else if c < 65536 {
+            out.push(224 + c.ushr(12))
+            out.push(128 + c.ushr(6).bit_and(63))
+            out.push(128 + c.bit_and(63))
+        } else {
+            out.push(240 + c.ushr(18))
+            out.push(128 + c.ushr(12).bit_and(63))
+            out.push(128 + c.ushr(6).bit_and(63))
+            out.push(128 + c.bit_and(63))
+        }
+    }
+    return bytes_of(out).to_str()
+}
+
+fn trim(s: str) -> str {
+    let cs = s.codes()
+    var a = 0
+    var z = cs.len()
+    while a < z and is_ws(cs[a]) {
+        a = a + 1
+    }
+    while z > a and is_ws(cs[z - 1]) {
+        z = z - 1
+    }
+    return text(cs.slice(a, z))
+}
+
+fn digits_at(cs: [i64], from: i64) -> i64 {
+    var k = from
+    while k < cs.len() and cs[k] >= 48 and cs[k] <= 57 {
+        k = k + 1
+    }
+    return k
+}
+
+/// JavaScript's parseFloat: the longest decimal prefix after leading
+/// white space, NaN when there is none.
+pub fn parse_float(v: Option[str]) -> f64 {
+    let s = match v {
+        Some(x) -> x
+        None -> return nan()
+    }
+    let cs = s.codes()
+    var p = 0
+    while p < cs.len() and is_ws(cs[p]) {
+        p = p + 1
+    }
+    var sign = ""
+    if p < cs.len() and (cs[p] == 43 or cs[p] == 45) {
+        sign = if cs[p] == 45 { "-" } else { "" }
+        p = p + 1
+    }
+    if text(cs.slice(p, if p + 8 < cs.len() { p + 8 } else { cs.len() })) == "Infinity" {
+        return if sign == "-" { 0.0 - 1.0 / 0.0 } else { 1.0 / 0.0 }
+    }
+    let int_end = digits_at(cs, p)
+    var frac_start = int_end
+    var frac_end = int_end
+    if int_end < cs.len() and cs[int_end] == 46 {
+        frac_start = int_end + 1
+        frac_end = digits_at(cs, frac_start)
+    }
+    if int_end == p and frac_end == frac_start {
+        return nan()
+    }
+    var exp = ""
+    if frac_end < cs.len() and (cs[frac_end] == 101 or cs[frac_end] == 69) {
+        var e = frac_end + 1
+        var es = ""
+        if e < cs.len() and (cs[e] == 43 or cs[e] == 45) {
+            es = if cs[e] == 45 { "-" } else { "" }
+            e = e + 1
+        }
+        let ee = digits_at(cs, e)
+        if ee > e {
+            exp = "e" + es + text(cs.slice(e, ee))
+        }
+    }
+    let ip = text(cs.slice(p, int_end))
+    let fp = text(cs.slice(frac_start, frac_end))
+    let lit = sign + (if ip.len() == 0 { "0" } else { ip }) + "." + (if fp.len() == 0 { "0" } else { fp }) + exp
+    return lit.parse_float() ?? nan()
+}
+
+/// `||` on a JavaScript number: zero and NaN are false.
+fn truthy(x: f64) -> bool {
+    return x == x and x != 0.0
+}
+
+fn quotes(s: str) -> i64 {
+    return s.to_bytes().to_list().filter(|b| b == 34).len()
+}
+
+/// Splits at `sep` except inside double quotes, as negotiator does.
+fn split_quoted(s: str, sep: str) -> [str] {
+    let parts = s.split(sep)
+    var out: [str] = [parts[0]]
+    for i in 1..parts.len() {
+        if quotes(out[out.len() - 1]) % 2 == 0 {
+            out.push(parts[i])
+        } else {
+            out[out.len() - 1] = out[out.len() - 1] + sep + parts[i]
+        }
+    }
+    return out
+}
+
+fn index_of(cs: [i64], c: i64) -> i64 {
+    for i in 0..cs.len() {
+        if cs[i] == c {
+            return i
+        }
+    }
+    return 0 - 1
+}
+
+/// /^\s*([^\s\/;]+)\/([^;\s]+)\s*(?:;(.*))?$/ on a trimmed entry.
+fn parse_media(str0: str, i: i64) -> Option[NegAccept] {
+    let cs = trim(str0).codes()
+    var p = 0
+    while p < cs.len() and not is_ws(cs[p]) and cs[p] != 47 and cs[p] != 59 {
+        p = p + 1
+    }
+    if p == 0 or p >= cs.len() or cs[p] != 47 {
+        return None
+    }
+    let kind = text(cs.slice(0, p))
+    var q = p + 1
+    while q < cs.len() and not is_ws(cs[q]) and cs[q] != 59 {
+        q = q + 1
+    }
+    if q == p + 1 {
+        return None
+    }
+    let sub = text(cs.slice(p + 1, q))
+    var r = q
+    while r < cs.len() and is_ws(cs[r]) {
+        r = r + 1
+    }
+    var params: [(str, Option[str])] = []
+    var quality = 1.0
+    if r < cs.len() {
+        if cs[r] != 59 {
+            return None
+        }
+        let rest = cs.slice(r + 1, cs.len())
+        for c in rest {
+            if c == 10 or c == 13 or c == 8232 or c == 8233 {
+                return None
+            }
+        }
+        if rest.len() > 0 {
+            for raw in split_quoted(text(rest), ";").map(|x| trim(x)) {
+                let pc = raw.codes()
+                let eq = index_of(pc, 61)
+                let key = (if eq < 0 { raw } else { text(pc.slice(0, eq)) }).to_lower()
+                let val0: Option[str] = if eq < 0 { None } else { Some(text(pc.slice(eq + 1, pc.len()))) }
+                let val = match val0 {
+                    Some(v) -> if v.len() >= 2 and v.starts_with("\"") and v.ends_with("\"") { Some(text(v.codes().slice(1, v.codes().len() - 1))) }
+                    else if v == "\"" { Some("") } else { Some(v) }
+                    None -> None
+                }
+                if key == "q" {
+                    quality = parse_float(val)
+                    break
+                }
+                params = params.filter(|kv| kv.0 != key) + [(key, val)]
+            }
+        }
+    }
+    return Some(NegAccept{ name: kind + "/" + sub, kind: kind, sub: sub, params: params, q: quality, i: i })
+}
+
+/// (priority.s - spec.s || priority.q - spec.q || priority.o - spec.o) < 0
+fn better(spec: NegPriority, than: NegPriority) -> bool {
+    let ds = than.s - spec.s
+    if ds != 0 {
+        return ds < 0
+    }
+    let dq = than.q - spec.q
+    if truthy(dq) {
+        return dq < 0.0
+    }
+    return than.o - spec.o < 0
+}
+
+/// compareSpecs: negative when `a` comes first.
+fn order(a: NegPriority, b: NegPriority) -> f64 {
+    let dq = b.q - a.q
+    if truthy(dq) {
+        return dq
+    }
+    if b.s != a.s {
+        return (b.s - a.s).as_f64()
+    }
+    if a.o != b.o {
+        return (a.o - b.o).as_f64()
+    }
+    return (a.index - b.index).as_f64()
+}
+
+/// A stable sort by `order`, as V8's.
+fn sort(xs: [NegPriority], by: fn(NegPriority, NegPriority) -> f64) -> [NegPriority] {
+    var out: [NegPriority] = []
+    for x in xs {
+        var at = out.len()
+        while at > 0 and by(out[at - 1], x) > 0.0 {
+            at = at - 1
+        }
+        var next: [NegPriority] = []
+        for k in 0..out.len() {
+            if k == at {
+                next.push(x)
+            }
+            next.push(out[k])
+        }
+        if at == out.len() {
+            next.push(x)
+        }
+        out = next
+    }
+    return out
+}
+
+fn media_specify(offer: str, spec: NegAccept, index: i64) -> Option[NegPriority] {
+    let p = match parse_media(offer, 0) {
+        Some(x) -> x
+        None -> return None
+    }
+    var s = 0
+    if spec.kind.to_lower() == p.kind.to_lower() {
+        s = s.bit_or(4)
+    } else if spec.kind != "*" {
+        return None
+    }
+    if spec.sub.to_lower() == p.sub.to_lower() {
+        s = s.bit_or(2)
+    } else if spec.sub != "*" {
+        return None
+    }
+    if spec.params.len() > 0 {
+        for (k, v) in spec.params {
+            let want = v ?? ""
+            var have = ""
+            for (pk, pv) in p.params {
+                if pk == k {
+                    have = pv ?? ""
+                }
+            }
+            if not (want == "*" or want.to_lower() == have.to_lower()) {
+                return None
+            }
+        }
+        s = s.bit_or(1)
+    }
+    return Some(NegPriority{ index: index, o: spec.i, q: spec.q, s: s, name: offer })
+}
+
+fn accepts_of(header: str, parse: fn(str, i64) -> Option[NegAccept], quoted: bool) -> [NegAccept] {
+    let parts = if quoted { split_quoted(header, ",") } else { header.split(",") }
+    var out: [NegAccept] = []
+    for i in 0..parts.len() {
+        match parse(trim(parts[i]), i) {
+            Some(a) -> out.push(a)
+            None -> {}
+        }
+    }
+    return out
+}
+
+fn choose(offers: [str], accepts: [NegAccept], specify: fn(str, NegAccept, i64) -> Option[NegPriority]) -> [str] {
+    var priorities: [NegPriority] = []
+    for idx in 0..offers.len() {
+        var best = NegPriority{ index: idx, o: 0 - 1, q: 0.0, s: 0, name: offers[idx] }
+        for a in accepts {
+            match specify(offers[idx], a, idx) {
+                Some(spec) -> {
+                    if better(spec, best) {
+                        best = spec
+                    }
+                }
+                None -> {}
+            }
+        }
+        best.index = idx
+        priorities.push(best)
+    }
+    return sort(priorities.filter(|p| p.q > 0.0), |a, b| order(a, b)).map(|p| offers[p.index])
+}
+
+fn listed(accepts: [NegAccept]) -> [str] {
+    let ps = accepts.filter(|a| a.q > 0.0).map(|a| NegPriority{ index: a.i, o: 0, q: a.q, s: 0, name: a.name })
+    return sort(ps, |a, b| order(a, b)).map(|p| p.name)
+}
+
+/// preferredMediaTypes(accept, provided).
+pub fn media_types(accept: Option[str], provided: Option[[str]]) -> [str] {
+    let accepts = accepts_of(accept ?? "*/*", |s, i| parse_media(s, i), true)
+    return match provided {
+        Some(offers) -> choose(offers, accepts, |o, a, i| media_specify(o, a, i))
+        None -> listed(accepts)
+    }
+}
+
+/// /^\s*([^\s;]+)\s*(?:;(.*))?$/ for Accept-Charset and
+/// Accept-Encoding entries: the name and what follows its `;`.
+fn name_and_params(str0: str) -> Option[(str, Option[[i64]])] {
+    let cs = trim(str0).codes()
+    var p = 0
+    while p < cs.len() and not is_ws(cs[p]) and cs[p] != 59 {
+        p = p + 1
+    }
+    if p == 0 {
+        return None
+    }
+    var r = p
+    while r < cs.len() and is_ws(cs[r]) {
+        r = r + 1
+    }
+    if r >= cs.len() {
+        return Some((text(cs.slice(0, p)), None))
+    }
+    if cs[r] != 59 {
+        return None
+    }
+    let rest = cs.slice(r + 1, cs.len())
+    for c in rest {
+        if c == 10 or c == 13 or c == 8232 or c == 8233 {
+            return None
+        }
+    }
+    return Some((text(cs.slice(0, p)), Some(rest)))
+}
+
+fn simple_q(rest: Option[[i64]]) -> f64 {
+    match rest {
+        Some(r) -> {
+            if r.len() == 0 {
+                return 1.0
+            }
+            for part in text(r).split(";") {
+                let kv = trim(part).split("=")
+                if kv[0] == "q" {
+                    return parse_float(if kv.len() > 1 { Some(kv[1]) } else { None })
+                }
+            }
+            return 1.0
+        }
+        None -> return 1.0
+    }
+}
+
+fn parse_simple(s: str, i: i64) -> Option[NegAccept] {
+    return match name_and_params(s) {
+        Some((name, rest)) -> Some(NegAccept{ name: name, kind: name, sub: "", params: [], q: simple_q(rest), i: i })
+        None -> None
+    }
+}
+
+fn simple_specify(offer: str, spec: NegAccept, index: i64) -> Option[NegPriority] {
+    if spec.name.to_lower() == offer.to_lower() {
+        return Some(NegPriority{ index: index, o: spec.i, q: spec.q, s: 1, name: offer })
+    }
+    if spec.name != "*" {
+        return None
+    }
+    return Some(NegPriority{ index: index, o: spec.i, q: spec.q, s: 0, name: offer })
+}
+
+/// preferredCharsets(accept, provided).
+pub fn charsets(accept: Option[str], provided: Option[[str]]) -> [str] {
+    let accepts = accepts_of(accept ?? "*", |s, i| parse_simple(s, i), false)
+    return match provided {
+        Some(offers) -> choose(offers, accepts, |o, a, i| simple_specify(o, a, i))
+        None -> listed(accepts)
+    }
+}
+
+fn encoding_accepts(header: str) -> [NegAccept] {
+    let parts = header.split(",")
+    var out: [NegAccept] = []
+    var identity = false
+    var min_q = 1.0
+    for i in 0..parts.len() {
+        match parse_simple(trim(parts[i]), i) {
+            Some(a) -> {
+                out.push(a)
+                identity = identity or simple_specify("identity", a, 0) != None
+                let q = if truthy(a.q) { a.q } else { 1.0 }
+                min_q = if q < min_q { q } else { min_q }
+            }
+            None -> {}
+        }
+    }
+    if not identity {
+        out.push(NegAccept{ name: "identity", kind: "identity", sub: "", params: [], q: min_q, i: parts.len() })
+    }
+    return out
+}
+
+fn preferred_order(a: NegPriority, b: NegPriority, preferred: [str]) -> f64 {
+    if a.q != b.q {
+        return b.q - a.q
+    }
+    var ap = 0 - 1
+    var bp = 0 - 1
+    for k in 0..preferred.len() {
+        if preferred[k] == a.name and ap < 0 {
+            ap = k
+        }
+        if preferred[k] == b.name and bp < 0 {
+            bp = k
+        }
+    }
+    if ap < 0 and bp < 0 {
+        return order(NegPriority{ index: a.index, o: a.o, q: 0.0, s: a.s, name: "" }, NegPriority{ index: b.index, o: b.o, q: 0.0, s: b.s, name: "" })
+    }
+    if ap >= 0 and bp >= 0 {
+        return (ap - bp).as_f64()
+    }
+    return if ap < 0 { 1.0 } else { 0.0 - 1.0 }
+}
+
+/// preferredEncodings(accept, provided, preferred).
+pub fn encodings(accept: Option[str], provided: Option[[str]], preferred: Option[[str]]) -> [str] {
+    let accepts = encoding_accepts(accept ?? "")
+    let pref = preferred ?? []
+    let by = |a, b| if preferred == None { order(a, b) } else { preferred_order(a, b, pref) }
+    return match provided {
+        Some(offers) -> {
+            var priorities: [NegPriority] = []
+            for idx in 0..offers.len() {
+                var best = NegPriority{ index: idx, o: 0 - 1, q: 0.0, s: 0, name: offers[idx] }
+                for a in accepts {
+                    match simple_specify(offers[idx], a, idx) {
+                        Some(spec) -> {
+                            if better(spec, best) {
+                                best = spec
+                            }
+                        }
+                        None -> {}
+                    }
+                }
+                priorities.push(best)
+            }
+            sort(priorities.filter(|p| p.q > 0.0), by).map(|p| offers[p.index])
+        }
+        None -> sort(accepts.filter(|a| a.q > 0.0).map(|a| NegPriority{ index: a.i, o: 0, q: a.q, s: 0, name: a.name }), by).map(|p| p.name)
+    }
+}
+
+/// /^\s*([^\s\-;]+)(?:-([^\s;]+))?\s*(?:;(.*))?$/: prefix, suffix, rest.
+fn parse_language(str0: str, i: i64) -> Option[NegAccept] {
+    let cs = trim(str0).codes()
+    var p = 0
+    while p < cs.len() and not is_ws(cs[p]) and cs[p] != 45 and cs[p] != 59 {
+        p = p + 1
+    }
+    if p == 0 {
+        return None
+    }
+    var suffix = ""
+    var r = p
+    if r < cs.len() and cs[r] == 45 {
+        var e = r + 1
+        while e < cs.len() and not is_ws(cs[e]) and cs[e] != 59 {
+            e = e + 1
+        }
+        if e > r + 1 {
+            suffix = text(cs.slice(r + 1, e))
+            r = e
+        }
+    }
+    while r < cs.len() and is_ws(cs[r]) {
+        r = r + 1
+    }
+    var q = 1.0
+    if r < cs.len() {
+        if cs[r] != 59 {
+            return None
+        }
+        let rest = cs.slice(r + 1, cs.len())
+        for c in rest {
+            if c == 10 or c == 13 or c == 8232 or c == 8233 {
+                return None
+            }
+        }
+        if rest.len() > 0 {
+            for part in text(rest).split(";") {
+                let kv = part.split("=")
+                if kv[0] == "q" {
+                    q = parse_float(if kv.len() > 1 { Some(kv[1]) } else { None })
+                }
+            }
+        }
+    }
+    let prefix = text(cs.slice(0, p))
+    return Some(NegAccept{ name: prefix + if suffix.len() > 0 { "-" + suffix } else { "" }, kind: prefix, sub: suffix, params: [], q: q, i: i })
+}
+
+fn language_specify(offer: str, spec: NegAccept, index: i64) -> Option[NegPriority] {
+    let p = match parse_language(offer, 0) {
+        Some(x) -> x
+        None -> return None
+    }
+    let s = if spec.name.to_lower() == p.name.to_lower() { 4 } else if spec.kind.to_lower() == p.name.to_lower() { 2 }
+    else if spec.name.to_lower() == p.kind.to_lower() { 1 } else if spec.name != "*" { 0 - 1 } else { 0 }
+    if s < 0 {
+        return None
+    }
+    return Some(NegPriority{ index: index, o: spec.i, q: spec.q, s: s, name: offer })
+}
+
+/// preferredLanguages(accept, provided).
+pub fn languages(accept: Option[str], provided: Option[[str]]) -> [str] {
+    let accepts = accepts_of(accept ?? "*", |s, i| parse_language(s, i), false)
+    return match provided {
+        Some(offers) -> choose(offers, accepts, |o, a, i| language_specify(o, a, i))
+        None -> listed(accepts)
+    }
+}

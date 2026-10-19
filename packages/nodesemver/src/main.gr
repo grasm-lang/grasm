@@ -1,0 +1,681 @@
+// Versions and ranges exactly as npm's semver (node-semver 7.7) reads
+// them, loose mode and prereleases included.
+//
+// `packages/semver` and `packages/semverrange` implement the SemVer
+// specification and npm's range grammar as written. npm itself runs
+// node-semver, which is defined by its regular expressions: `=v1.2.3`,
+// `v 1.2.3` and `1.2.3beta` are versions only in loose mode; `^1.2.x`,
+// `~>1.2`, `1.2 - 2`, `>=1.2.3 <2 || 3.x` and `*` rewrite to plain
+// comparators (`>=1.2.0 <2.0.0-0`); a build suffix in a range is
+// dropped; a range that cannot match collapses to `<0.0.0-0`; and a
+// prerelease only satisfies a range whose comparator names the same
+// major.minor.patch with a prerelease of its own.
+//
+// The expressions here are node-semver's own, built the same way
+// (including the length bounds its `safeRe` puts on `\s`, `\d` and
+// identifier runs) and run by `packages/regex`, whose matching has the
+// same priorities as JavaScript's. Compile them once with `regexes`.
+//
+// `valid`, `clean`, `compare`, `valid_range`, `satisfies`,
+// `max_satisfying` and `min_satisfying` are node-semver's functions of
+// the same names.
+import regex
+
+type NsIdent = { is_num: bool, num: i64, text: str }
+
+type NsVersion = { major: i64, minor: i64, patch: i64, prerelease: [NsIdent], build: [str], version: str }
+
+/// A comparator: an operator and a version, or ANY (`semver` None).
+type NsComparator = { operator: str, semver: Option[NsVersion], value: str }
+
+type NsRange = { set: [[NsComparator]], range: str }
+
+type NsRegexes = {
+    full: Regex,
+    loose: Regex,
+    comparator: Regex,
+    comparator_loose: Regex,
+    hyphen: Regex,
+    hyphen_loose: Regex,
+    comparator_trim: Regex,
+    tilde_trim: Regex,
+    caret_trim: Regex,
+    tilde: Regex,
+    tilde_loose: Regex,
+    caret: Regex,
+    caret_loose: Regex,
+    xrange: Regex,
+    xrange_loose: Regex,
+    star: Regex,
+    gte0: Regex,
+    gte0pre: Regex,
+    build: Regex,
+    numeric: Regex,
+}
+
+fn counted(lo: i64, hi: i64) -> str {
+    return "\{" + "{lo}," + "{hi}" + "\}"
+}
+
+/// node-semver's makeSafeRegex: bounded runs of `\s`, `\d` and
+/// `[a-zA-Z0-9-]`. With `exact` false only the `\s` bounds are applied:
+/// the others change nothing for runs shorter than 250 characters, and
+/// cost a great deal to run.
+fn safe(src: str, exact: bool) -> str {
+    var s = src
+    for (tok, max) in [("\\s", 1), ("\\d", 256), ("[a-zA-Z0-9-]", 250)] {
+        if exact or max == 1 {
+            s = s.split(tok + "*").join(tok + counted(0, max))
+            s = s.split(tok + "+").join(tok + counted(1, max))
+        }
+    }
+    return s
+}
+
+fn rx(src: str, exact: bool) -> Regex {
+    return regex.compile(safe(src, exact)) ?? panic("node-semver expression: " + src)
+}
+
+/// The expressions, compiled once, for inputs with no run of letters,
+/// digits and hyphens longer than 250 characters.
+pub fn regexes() -> NsRegexes {
+    return build_regexes(false)
+}
+
+/// Whether text has a run that only the exact expressions measure.
+fn long_run(s: str) -> bool {
+    var run = 0
+    for b in s.to_bytes().to_list() {
+        let id = (b >= 48 and b <= 57) or (b >= 65 and b <= 90) or (b >= 97 and b <= 122) or b == 45
+        run = if id { run + 1 } else { 0 }
+        if run > 250 {
+            return true
+        }
+    }
+    return false
+}
+
+/// The expressions to use for this text: the ones given, or node-semver's
+/// exact bounded ones when the text has a long run.
+fn for_text(r: NsRegexes, text: str) -> NsRegexes {
+    return if long_run(text) { build_regexes(true) } else { r }
+}
+
+fn build_regexes(exact: bool) -> NsRegexes {
+    let num = "0|[1-9]\\d*"
+    let num_loose = "\\d+"
+    let non_num = "\\d*[a-zA-Z-][a-zA-Z0-9-]*"
+    let main = "(" + num + ")\\.(" + num + ")\\.(" + num + ")"
+    let main_loose = "(" + num_loose + ")\\.(" + num_loose + ")\\.(" + num_loose + ")"
+    let pre_id = "(?:" + non_num + "|" + num + ")"
+    let pre_id_loose = "(?:" + non_num + "|" + num_loose + ")"
+    let pre = "(?:-(" + pre_id + "(?:\\." + pre_id + ")*))"
+    let pre_loose = "(?:-?(" + pre_id_loose + "(?:\\." + pre_id_loose + ")*))"
+    let build_id = "[a-zA-Z0-9-]+"
+    let build = "(?:\\+(" + build_id + "(?:\\." + build_id + ")*))"
+    let full_plain = "v?" + main + pre + "?" + build + "?"
+    let loose_plain = "[v=\\s]*" + main_loose + pre_loose + "?" + build + "?"
+    let gtlt = "((?:<|>)?=?)"
+    let xid_loose = num_loose + "|x|X|\\*"
+    let xid = num + "|x|X|\\*"
+    let xplain = "[v=\\s]*(" + xid + ")(?:\\.(" + xid + ")(?:\\.(" + xid + ")(?:" + pre + ")?" + build + "?)?)?"
+    let xplain_loose = "[v=\\s]*(" + xid_loose + ")(?:\\.(" + xid_loose + ")(?:\\.(" + xid_loose + ")(?:" + pre_loose + ")?" + build + "?)?)?"
+    return NsRegexes{ full: rx("^" + full_plain + "$", exact), loose: rx("^" + loose_plain + "$", exact),
+        comparator: rx("^" + gtlt + "\\s*(" + full_plain + ")$|^$", exact), comparator_loose: rx("^" + gtlt + "\\s*(" + loose_plain + ")$|^$", exact),
+        hyphen: rx("^\\s*(" + xplain + ")\\s+-\\s+(" + xplain + ")\\s*$", exact), hyphen_loose: rx("^\\s*(" + xplain_loose + ")\\s+-\\s+(" + xplain_loose + ")\\s*$", exact),
+        comparator_trim: rx("(\\s*)" + gtlt + "\\s*(" + loose_plain + "|" + xplain + ")", exact), tilde_trim: rx("(\\s*)(?:~>?)\\s+", exact),
+        caret_trim: rx("(\\s*)(?:\\^)\\s+", exact), tilde: rx("^(?:~>?)" + xplain + "$", exact), tilde_loose: rx("^(?:~>?)" + xplain_loose + "$", exact),
+        caret: rx("^(?:\\^)" + xplain + "$", exact), caret_loose: rx("^(?:\\^)" + xplain_loose + "$", exact), xrange: rx("^" + gtlt + "\\s*" + xplain + "$", exact),
+        xrange_loose: rx("^" + gtlt + "\\s*" + xplain_loose + "$", exact), star: rx("(<|>)?=?\\s*\\*", exact), gte0: rx("^\\s*>=\\s*0\\.0\\.0\\s*$", exact),
+        gte0pre: rx("^\\s*>=\\s*0\\.0\\.0-0\\s*$", exact), build: rx(build, exact), numeric: rx("^[0-9]+$", exact) }
+}
+
+let MAX_SAFE = 9007199254740991
+
+fn group(m: RegexMatch, i: i64) -> str {
+    return if i < m.groups.len() { m.groups[i] } else { "" }
+}
+
+/// `+s` for the digit strings node-semver converts; None past
+/// MAX_SAFE_INTEGER (where every comparator built from it fails).
+fn number(s: str) -> Option[i64] {
+    var n = 0
+    for b in s.to_bytes().to_list() {
+        if b < 48 or b > 57 {
+            return None
+        }
+        n = n * 10 + b - 48
+        if n > MAX_SAFE {
+            return None
+        }
+    }
+    return Some(n)
+}
+
+fn is_js_space(b: i64) -> bool {
+    return b == 32 or (b >= 9 and b <= 13)
+}
+
+fn trim(s: str) -> str {
+    let b = s.to_bytes().to_list()
+    var a = 0
+    var z = b.len()
+    while a < z and is_js_space(b[a]) {
+        a = a + 1
+    }
+    while z > a and is_js_space(b[z - 1]) {
+        z = z - 1
+    }
+    return bytes_of(b.slice(a, z)).to_str()
+}
+
+fn ident_text(i: NsIdent) -> str {
+    return if i.is_num { "{i.num}" } else { i.text }
+}
+
+/// `new SemVer(version, { loose })`, or None where it throws.
+pub fn parse(r: NsRegexes, version: str, loose: bool) -> Option[NsVersion] {
+    return match parse_version(r, version, loose) {
+        Ok(v) -> Some(v)
+        Err(_e) -> None
+    }
+}
+
+fn parse_version(r0: NsRegexes, version: str, loose: bool) -> NsVersion ! str {
+    if version.len() > 256 {
+        fail("longer than 256")
+    }
+    let r = for_text(r0, version)
+    let m = regex.find(if loose { r.loose } else { r.full }, trim(version)) ?? fail("invalid")
+    let major = number(group(m, 1)) ?? fail("invalid")
+    let minor = number(group(m, 2)) ?? fail("invalid")
+    let patch = number(group(m, 3)) ?? fail("invalid")
+    var pre: [NsIdent] = []
+    let p = group(m, 4)
+    if p.len() > 0 {
+        for id in p.split(".") {
+            let n = if regex.matches(r.numeric, id) { number(id) } else { None }
+            pre.push(match n {
+                Some(v) -> if v < MAX_SAFE { NsIdent{ is_num: true, num: v, text: id } } else { NsIdent{ is_num: false, num: 0, text: id } }
+                None -> NsIdent{ is_num: false, num: 0, text: id }
+            })
+        }
+    }
+    let b = group(m, 5)
+    var v = NsVersion{ major: major, minor: minor, patch: patch, prerelease: pre, build: if b.len() > 0 { b.split(".") } else { [] }, version: "" }
+    v.version = "{major}.{minor}.{patch}" + if pre.len() > 0 { "-" + pre.map(|i| ident_text(i)).join(".") } else { "" }
+    return v
+}
+
+/// `semver.valid`: the normalised version, or None.
+pub fn valid(r: NsRegexes, version: str, loose: bool) -> Option[str] {
+    return match parse(r, version, loose) {
+        Some(v) -> Some(v.version)
+        None -> None
+    }
+}
+
+/// `semver.clean`: leading `=` and `v` dropped, then valid.
+pub fn clean(r: NsRegexes, version: str, loose: bool) -> Option[str] {
+    var s = trim(version)
+    while s.starts_with("=") or s.starts_with("v") {
+        s = s.substr(1, s.len() - 1)
+    }
+    return valid(r, s, loose)
+}
+
+fn digits_only(s: str) -> bool {
+    if s.len() == 0 {
+        return false
+    }
+    for b in s.to_bytes().to_list() {
+        if b < 48 or b > 57 {
+            return false
+        }
+    }
+    return true
+}
+
+fn utf16_less(a: str, b: str) -> bool {
+    let x = a.codes()
+    let y = b.codes()
+    var i = 0
+    while i < x.len() and i < y.len() {
+        if x[i] != y[i] {
+            // Astral code points compare as their high surrogates.
+            let p = if x[i] >= 65536 { 55296 + (x[i] - 65536).ushr(10) } else { x[i] }
+            let q = if y[i] >= 65536 { 55296 + (y[i] - 65536).ushr(10) } else { y[i] }
+            return if p != q { p < q } else { x[i] < y[i] }
+        }
+        i = i + 1
+    }
+    return x.len() < y.len()
+}
+
+/// compareIdentifiers.
+fn compare_ids(a: NsIdent, b: NsIdent) -> i64 {
+    if a.is_num and b.is_num {
+        return if a.num == b.num { 0 } else if a.num < b.num { 0 - 1 } else { 1 }
+    }
+    let anum = a.is_num or digits_only(a.text)
+    let bnum = b.is_num or digits_only(b.text)
+    if anum and bnum {
+        let x = if a.is_num { a.num } else { number(a.text) ?? MAX_SAFE }
+        let y = if b.is_num { b.num } else { number(b.text) ?? MAX_SAFE }
+        return if x == y { 0 } else if x < y { 0 - 1 } else { 1 }
+    }
+    if not a.is_num and not b.is_num and a.text == b.text {
+        return 0
+    }
+    if anum and not bnum {
+        return 0 - 1
+    }
+    if bnum and not anum {
+        return 1
+    }
+    return if utf16_less(a.text, b.text) { 0 - 1 } else { 1 }
+}
+
+fn same_ident(a: NsIdent, b: NsIdent) -> bool {
+    return a.is_num == b.is_num and (if a.is_num { a.num == b.num } else { a.text == b.text })
+}
+
+/// `semver.compare`: -1, 0 or 1 (builds ignored).
+pub fn compare(a: NsVersion, b: NsVersion) -> i64 {
+    if a.version == b.version {
+        return 0
+    }
+    for (x, y) in [(a.major, b.major), (a.minor, b.minor), (a.patch, b.patch)] {
+        if x != y {
+            return if x < y { 0 - 1 } else { 1 }
+        }
+    }
+    let ap = a.prerelease
+    let bp = b.prerelease
+    if ap.len() > 0 and bp.len() == 0 {
+        return 0 - 1
+    }
+    if ap.len() == 0 and bp.len() > 0 {
+        return 1
+    }
+    var i = 0
+    while true {
+        if i >= ap.len() and i >= bp.len() {
+            return 0
+        }
+        if i >= bp.len() {
+            return 1
+        }
+        if i >= ap.len() {
+            return 0 - 1
+        }
+        if not same_ident(ap[i], bp[i]) {
+            return compare_ids(ap[i], bp[i])
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+fn cmp_op(a: NsVersion, op: str, b: NsVersion) -> bool {
+    let c = compare(a, b)
+    return if op == "" or op == "=" { c == 0 } else if op == ">" { c > 0 } else if op == ">=" { c >= 0 } else if op == "<" { c < 0 } else { c <= 0 }
+}
+
+fn is_x(id: str) -> bool {
+    return id.len() == 0 or id.to_lower() == "x" or id == "*"
+}
+
+/// `+id + 1` as text; past MAX_SAFE_INTEGER a number no comparator
+/// accepts, as in JavaScript.
+fn inc(id: str) -> str {
+    return match number(id) {
+        Some(n) -> "{n + 1}"
+        None -> "99999999999999999999"
+    }
+}
+
+/// `s.split(/\s+/)`, JavaScript's way: a leading run gives an empty first
+/// part.
+fn split_ws(s: str) -> [str] {
+    var out: [str] = []
+    var cur: [i64] = []
+    var in_ws = false
+    var any = false
+    for b in s.to_bytes().to_list() {
+        if is_js_space(b) {
+            if not in_ws {
+                out.push(bytes_of(cur).to_str())
+                cur = []
+            }
+            in_ws = true
+        } else {
+            cur.push(b)
+            in_ws = false
+        }
+        any = true
+    }
+    out.push(bytes_of(cur).to_str())
+    return if any { out } else { [""] }
+}
+
+fn replace_first(r: Regex, s: str, by: str) -> str {
+    return match regex.find(r, s) {
+        Some(m) -> s.substr(0, m.start) + by + s.substr(m.end, s.len() - m.end)
+        None -> s
+    }
+}
+
+fn tilde_one(r: NsRegexes, comp: str, loose: bool) -> str {
+    let m = match regex.find(if loose { r.tilde_loose } else { r.tilde }, comp) {
+        Some(x) -> x
+        None -> return comp
+    }
+    let (mj, mn, pt, pr) = (group(m, 1), group(m, 2), group(m, 3), group(m, 4))
+    if is_x(mj) {
+        return ""
+    }
+    if is_x(mn) {
+        return ">=" + mj + ".0.0 <" + inc(mj) + ".0.0-0"
+    }
+    if is_x(pt) {
+        return ">=" + mj + "." + mn + ".0 <" + mj + "." + inc(mn) + ".0-0"
+    }
+    return ">=" + mj + "." + mn + "." + pt + (if pr.len() > 0 { "-" + pr } else { "" }) + " <" + mj + "." + inc(mn) + ".0-0"
+}
+
+fn caret_one(r: NsRegexes, comp: str, loose: bool, include_pre: bool) -> str {
+    let m = match regex.find(if loose { r.caret_loose } else { r.caret }, comp) {
+        Some(x) -> x
+        None -> return comp
+    }
+    let (mj, mn, pt, pr) = (group(m, 1), group(m, 2), group(m, 3), group(m, 4))
+    let z = if include_pre { "-0" } else { "" }
+    if is_x(mj) {
+        return ""
+    }
+    if is_x(mn) {
+        return ">=" + mj + ".0.0" + z + " <" + inc(mj) + ".0.0-0"
+    }
+    if is_x(pt) {
+        return if mj == "0" { ">=" + mj + "." + mn + ".0" + z + " <" + mj + "." + inc(mn) + ".0-0" }
+        else { ">=" + mj + "." + mn + ".0" + z + " <" + inc(mj) + ".0.0-0" }
+    }
+    let low = ">=" + mj + "." + mn + "." + pt + (if pr.len() > 0 { "-" + pr } else { z })
+    if mj == "0" {
+        return low + if mn == "0" { " <" + mj + "." + mn + "." + inc(pt) + "-0" } else { " <" + mj + "." + inc(mn) + ".0-0" }
+    }
+    return ">=" + mj + "." + mn + "." + pt + (if pr.len() > 0 { "-" + pr } else { "" }) + " <" + inc(mj) + ".0.0-0"
+}
+
+fn xrange_one(r: NsRegexes, comp0: str, loose: bool, include_pre: bool) -> str {
+    let comp = trim(comp0)
+    let m = match regex.find(if loose { r.xrange_loose } else { r.xrange }, comp) {
+        Some(x) -> x
+        None -> return comp
+    }
+    var gtlt = group(m, 1)
+    var mj = group(m, 2)
+    var mn = group(m, 3)
+    var pt = group(m, 4)
+    let xmj = is_x(mj)
+    let xmn = xmj or is_x(mn)
+    let xpt = xmn or is_x(pt)
+    if gtlt == "=" and xpt {
+        gtlt = ""
+    }
+    var pr = if include_pre { "-0" } else { "" }
+    if xmj {
+        return if gtlt == ">" or gtlt == "<" { "<0.0.0-0" } else { "*" }
+    }
+    if gtlt.len() > 0 and xpt {
+        if xmn {
+            mn = "0"
+        }
+        pt = "0"
+        if gtlt == ">" {
+            gtlt = ">="
+            if xmn {
+                mj = inc(mj)
+                mn = "0"
+            } else {
+                mn = inc(mn)
+            }
+        } else if gtlt == "<=" {
+            gtlt = "<"
+            if xmn {
+                mj = inc(mj)
+            } else {
+                mn = inc(mn)
+            }
+        }
+        if gtlt == "<" {
+            pr = "-0"
+        }
+        return gtlt + mj + "." + mn + "." + pt + pr
+    }
+    if xmn {
+        return ">=" + mj + ".0.0" + pr + " <" + inc(mj) + ".0.0-0"
+    }
+    if xpt {
+        return ">=" + mj + "." + mn + ".0" + pr + " <" + mj + "." + inc(mn) + ".0-0"
+    }
+    return m.groups[0]
+}
+
+fn hyphen(r: NsRegexes, range: str, loose: bool, include_pre: bool) -> str {
+    let m = match regex.find(if loose { r.hyphen_loose } else { r.hyphen }, range) {
+        Some(x) -> x
+        None -> return range
+    }
+    let g = |i| group(m, i)
+    var from = g(1)
+    if is_x(g(2)) {
+        from = ""
+    } else if is_x(g(3)) {
+        from = ">=" + g(2) + ".0.0" + if include_pre { "-0" } else { "" }
+    } else if is_x(g(4)) {
+        from = ">=" + g(2) + "." + g(3) + ".0" + if include_pre { "-0" } else { "" }
+    } else if g(5).len() > 0 {
+        from = ">=" + from
+    } else {
+        from = ">=" + from + if include_pre { "-0" } else { "" }
+    }
+    var to = g(7)
+    if is_x(g(8)) {
+        to = ""
+    } else if is_x(g(9)) {
+        to = "<" + inc(g(8)) + ".0.0-0"
+    } else if is_x(g(10)) {
+        to = "<" + g(8) + "." + inc(g(9)) + ".0-0"
+    } else if g(11).len() > 0 {
+        to = "<=" + g(8) + "." + g(9) + "." + g(10) + "-" + g(11)
+    } else if include_pre {
+        to = "<" + g(8) + "." + g(9) + "." + inc(g(10)) + "-0"
+    } else {
+        to = "<=" + to
+    }
+    return trim(from + " " + to)
+}
+
+fn map_ws(s: str, f: fn(str) -> str) -> str {
+    return split_ws(s).map(|c| f(c)).join(" ")
+}
+
+fn parse_comparator_text(r: NsRegexes, comp0: str, loose: bool, include_pre: bool) -> str {
+    var comp = replace_first(r.build, comp0, "")
+    comp = map_ws(trim(comp), |c| caret_one(r, c, loose, include_pre))
+    comp = map_ws(trim(comp), |c| tilde_one(r, c, loose))
+    comp = map_ws(comp, |c| xrange_one(r, c, loose, include_pre))
+    return replace_first(r.star, trim(comp), "")
+}
+
+/// `new Comparator(comp, { loose })`; None where it throws.
+fn comparator(r: NsRegexes, comp: str, loose: bool) -> Option[NsComparator] {
+    let c = split_ws(trim(comp)).join(" ")
+    let m = match regex.find(if loose { r.comparator_loose } else { r.comparator }, c) {
+        Some(x) -> x
+        None -> return None
+    }
+    var op = group(m, 1)
+    if op == "=" {
+        op = ""
+    }
+    let v = group(m, 2)
+    if v.len() == 0 {
+        return Some(NsComparator{ operator: op, semver: None, value: "" })
+    }
+    let sv = match parse(r, v, loose) {
+        Some(x) -> x
+        None -> return None
+    }
+    return Some(NsComparator{ operator: op, semver: Some(sv), value: op + sv.version })
+}
+
+fn parse_set(r: NsRegexes, range0: str, loose: bool, include_pre: bool) -> Option[[NsComparator]] {
+    var range = hyphen(r, range0, loose, include_pre)
+    range = regex.replace_all(r.comparator_trim, range, "$1$2$3")
+    range = regex.replace_all(r.tilde_trim, range, "$1~")
+    range = regex.replace_all(r.caret_trim, range, "$1^")
+    let joined = range.split(" ").map(|c| parse_comparator_text(r, c, loose, include_pre)).join(" ")
+    var list = split_ws(joined).map(|c| replace_first(if include_pre { r.gte0pre } else { r.gte0 }, trim(c), ""))
+    if loose {
+        list = list.filter(|c| regex.find(r.comparator_loose, c) != None)
+    }
+    // Every comparator is built before any is looked at: one that fails
+    // after a `<0.0.0-0` still makes the range invalid.
+    var all: [NsComparator] = []
+    for text in list {
+        all.push(match comparator(r, text, loose) {
+            Some(x) -> x
+            None -> return None
+        })
+    }
+    var out: [NsComparator] = []
+    for c in all {
+        if c.value == "<0.0.0-0" {
+            return Some([c])
+        }
+        if out.filter(|o| o.value == c.value).len() == 0 {
+            out.push(c)
+        }
+    }
+    if out.len() > 1 and out.filter(|o| o.value == "").len() > 0 {
+        out = out.filter(|o| o.value != "")
+    }
+    return Some(out)
+}
+
+/// `new Range(range, { loose, includePrerelease })`; None where it throws.
+pub fn parse_range(r0: NsRegexes, range: str, loose: bool, include_pre: bool) -> Option[NsRange] {
+    let r = for_text(r0, range)
+    let raw = split_ws(trim(range)).join(" ")
+    var set: [[NsComparator]] = []
+    for part in raw.split("||") {
+        let s = match parse_set(r, trim(part), loose, include_pre) {
+            Some(x) -> x
+            None -> return None
+        }
+        if s.len() > 0 {
+            set.push(s)
+        }
+    }
+    if set.len() == 0 {
+        return None
+    }
+    if set.len() > 1 {
+        let first = set[0]
+        set = set.filter(|c| c[0].value != "<0.0.0-0")
+        if set.len() == 0 {
+            set = [first]
+        } else if set.len() > 1 {
+            for c in set {
+                if c.len() == 1 and c[0].value == "" {
+                    set = [c]
+                    break
+                }
+            }
+        }
+    }
+    let text = set.map(|cs| cs.map(|c| trim(c.value)).join(" ")).join("||")
+    return Some(NsRange{ set: set, range: text })
+}
+
+/// `semver.validRange`: the normalised range (`*` when it is empty), or
+/// None.
+pub fn valid_range(r: NsRegexes, range: str, loose: bool, include_pre: bool) -> Option[str] {
+    return match parse_range(r, range, loose, include_pre) {
+        Some(x) -> Some(if x.range.len() == 0 { "*" } else { x.range })
+        None -> None
+    }
+}
+
+fn test_set(set: [NsComparator], v: NsVersion, include_pre: bool) -> bool {
+    for c in set {
+        match c.semver {
+            Some(sv) -> {
+                if not cmp_op(v, c.operator, sv) {
+                    return false
+                }
+            }
+            None -> {}
+        }
+    }
+    if v.prerelease.len() > 0 and not include_pre {
+        for c in set {
+            match c.semver {
+                Some(sv) -> {
+                    if sv.prerelease.len() > 0 and sv.major == v.major and sv.minor == v.minor and sv.patch == v.patch {
+                        return true
+                    }
+                }
+                None -> {}
+            }
+        }
+        return false
+    }
+    return true
+}
+
+/// Range.test over a parsed range.
+pub fn range_test(r: NsRegexes, range: NsRange, version: str, loose: bool, include_pre: bool) -> bool {
+    let v = match parse(r, version, loose) {
+        Some(x) -> x
+        None -> return false
+    }
+    for set in range.set {
+        if test_set(set, v, include_pre) {
+            return true
+        }
+    }
+    return false
+}
+
+/// `semver.satisfies`.
+pub fn satisfies(r: NsRegexes, version: str, range: str, loose: bool, include_pre: bool) -> bool {
+    return match parse_range(r, range, loose, include_pre) {
+        Some(x) -> range_test(r, x, version, loose, include_pre)
+        None -> false
+    }
+}
+
+/// `semver.maxSatisfying` (`max` true) or `minSatisfying`: the version as
+/// given, or None.
+pub fn best_satisfying(r: NsRegexes, versions: [str], range: str, loose: bool, include_pre: bool, max: bool) -> Option[str] {
+    let rg = match parse_range(r, range, loose, include_pre) {
+        Some(x) -> x
+        None -> return None
+    }
+    var best: Option[str] = None
+    var best_v = NsVersion{ major: 0, minor: 0, patch: 0, prerelease: [], build: [], version: "" }
+    for v in versions {
+        if range_test(r, rg, v, loose, include_pre) {
+            let sv = parse(r, v, loose) ?? best_v
+            if best == None or compare(best_v, sv) == (if max { 0 - 1 } else { 1 }) {
+                best = Some(v)
+                best_v = sv
+            }
+        }
+    }
+    return best
+}

@@ -1,0 +1,8 @@
+[package]
+name = "nodesemver"
+version = "1.0.0"
+capabilities = []
+
+[dependencies.regex]
+path = "../regex"
+version = "^1.0.0"

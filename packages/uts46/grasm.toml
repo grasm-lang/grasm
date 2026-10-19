@@ -1,0 +1,12 @@
+[package]
+name = "uts46"
+version = "1.0.0"
+capabilities = []
+
+[dependencies.punycode]
+path = "../punycode"
+version = "^1.0.0"
+
+[dependencies.unicodenorm]
+path = "../unicodenorm"
+version = "^1.0.0"

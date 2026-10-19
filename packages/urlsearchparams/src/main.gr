@@ -1,0 +1,186 @@
+// application/x-www-form-urlencoded, and URLSearchParams.
+//
+// The format every HTML form submits and every query string is read as:
+// pairs joined by `&`, name and value split at the first `=`, `+` for a
+// space, everything else percent-encoded as bytes of UTF-8. Reading is
+// forgiving -- empty pairs are skipped, a pair with no `=` has an empty
+// value, a stray `%` stays, invalid UTF-8 becomes U+FFFD -- and writing
+// is not: everything but ASCII letters, digits and `*-._` is escaped.
+//
+// `parse` and `serialize` are the URL Standard's parser and serialiser;
+// the rest are URLSearchParams' methods over a list of pairs, with its
+// `sort`: stable, by the names' UTF-16 code units, so a name with an
+// astral character sorts before one with U+FFFD, as in every browser.
+import whatwgurl
+
+type FormPair = { name: str, value: str }
+
+fn decode_part(s: str) -> str {
+    var b: [i64] = []
+    for x in s.to_bytes().to_list() {
+        b.push(if x == 43 { 32 } else { x })
+    }
+    return utf8_text(whatwgurl.utf8_decode(whatwgurl.percent_decode(bytes_of(b))))
+}
+
+fn utf8_text(cs: [i64]) -> str {
+    var out: [i64] = []
+    for c in cs {
+        if c < 128 {
+            out.push(c)
+        } else if c < 2048 {
+            out.push(192 + c.ushr(6))
+            out.push(128 + c.bit_and(63))
+        } else if c < 65536 {
+            out.push(224 + c.ushr(12))
+            out.push(128 + c.ushr(6).bit_and(63))
+            out.push(128 + c.bit_and(63))
+        } else {
+            out.push(240 + c.ushr(18))
+            out.push(128 + c.ushr(12).bit_and(63))
+            out.push(128 + c.ushr(6).bit_and(63))
+            out.push(128 + c.bit_and(63))
+        }
+    }
+    return bytes_of(out).to_str()
+}
+
+/// The application/x-www-form-urlencoded parser.
+pub fn parse(input: str) -> [FormPair] {
+    var out: [FormPair] = []
+    for part in input.split("&") {
+        if part.len() == 0 {
+            continue
+        }
+        let at = part.index_of("=") ?? 0 - 1
+        let name = if at < 0 { part } else { part.substr(0, at) }
+        let value = if at < 0 { "" } else { part.substr(at + 1, part.len() - at - 1) }
+        out.push(FormPair{ name: decode_part(name), value: decode_part(value) })
+    }
+    return out
+}
+
+fn encode_part(s: str) -> str {
+    var parts: [str] = []
+    for c in s.codes() {
+        parts.push(if c == 32 { "+" } else { whatwgurl.encode_code(c, 7) })
+    }
+    return parts.join("")
+}
+
+/// The application/x-www-form-urlencoded serialiser.
+pub fn serialize(pairs: [FormPair]) -> str {
+    return pairs.map(|p| encode_part(p.name) + "=" + encode_part(p.value)).join("&")
+}
+
+/// `new URLSearchParams(init)`: a leading `?` is dropped.
+pub fn from_string(init: str) -> [FormPair] {
+    return parse(if init.starts_with("?") { init.substr(1, init.len() - 1) } else { init })
+}
+
+pub fn append(ps: [FormPair], name: str, value: str) -> [FormPair] {
+    return ps + [FormPair{ name: name, value: value }]
+}
+
+/// `delete(name)`, or `delete(name, value)` when `value` is Some.
+pub fn remove(ps: [FormPair], name: str, value: Option[str]) -> [FormPair] {
+    return ps.filter(|p| not (p.name == name and (value == None or Some(p.value) == value)))
+}
+
+pub fn get(ps: [FormPair], name: str) -> Option[str] {
+    for p in ps {
+        if p.name == name {
+            return Some(p.value)
+        }
+    }
+    return None
+}
+
+pub fn get_all(ps: [FormPair], name: str) -> [str] {
+    return ps.filter(|p| p.name == name).map(|p| p.value)
+}
+
+pub fn has(ps: [FormPair], name: str, value: Option[str]) -> bool {
+    for p in ps {
+        if p.name == name and (value == None or Some(p.value) == value) {
+            return true
+        }
+    }
+    return false
+}
+
+/// `set`: the first pair with the name takes the value, the others go;
+/// with none, the pair is appended.
+pub fn set(ps: [FormPair], name: str, value: str) -> [FormPair] {
+    var out: [FormPair] = []
+    var done = false
+    for p in ps {
+        if p.name == name {
+            if not done {
+                out.push(FormPair{ name: name, value: value })
+                done = true
+            }
+        } else {
+            out.push(p)
+        }
+    }
+    if not done {
+        out.push(FormPair{ name: name, value: value })
+    }
+    return out
+}
+
+fn utf16_key(s: str) -> [i64] {
+    var out: [i64] = []
+    for c in s.codes() {
+        if c >= 65536 {
+            let v = c - 65536
+            out.push(55296 + v.ushr(10))
+            out.push(56320 + v.bit_and(1023))
+        } else {
+            out.push(c)
+        }
+    }
+    return out
+}
+
+fn less(a: [i64], b: [i64]) -> bool {
+    var i = 0
+    while i < a.len() and i < b.len() {
+        if a[i] != b[i] {
+            return a[i] < b[i]
+        }
+        i = i + 1
+    }
+    return a.len() < b.len()
+}
+
+/// `sort`: stable, by UTF-16 code units of the names.
+pub fn sort(ps: [FormPair]) -> [FormPair] {
+    var out: [FormPair] = []
+    var keys: [[i64]] = []
+    for p in ps {
+        let k = utf16_key(p.name)
+        var at = out.len()
+        while at > 0 and less(k, keys[at - 1]) {
+            at = at - 1
+        }
+        var next: [FormPair] = []
+        var next_keys: [[i64]] = []
+        for i in 0..out.len() {
+            if i == at {
+                next.push(p)
+                next_keys.push(k)
+            }
+            next.push(out[i])
+            next_keys.push(keys[i])
+        }
+        if at == out.len() {
+            next.push(p)
+            next_keys.push(k)
+        }
+        out = next
+        keys = next_keys
+    }
+    return out
+}

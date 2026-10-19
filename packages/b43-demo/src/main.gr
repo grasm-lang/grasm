@@ -1,0 +1,53 @@
+// Ten pieces of the web platform and of package management, each
+// exercised once. scripts/b43_diff.sh holds them to Node, npm and pip.
+import uts46
+import whatwgurl
+import urlsearchparams
+import whatwgmime
+import dataurl
+import hostedgit
+import nodesemver
+import npmspec
+import negotiator
+import pytags
+
+fn web() {
+    let u = whatwgurl.parse("HTTP://EXAMPLE.com:80/a/./b/../c?x=1 2#frag", None) ?? panic("url")
+    assert_eq(whatwgurl.href(u), "http://example.com/a/c?x=1%202#frag")
+    assert_eq(whatwgurl.origin(u), "http://example.com")
+    let rel = whatwgurl.parse_with("../d?y", "https://h.org/p/q/r") ?? panic("relative")
+    assert_eq(whatwgurl.href(rel), "https://h.org/p/d?y")
+    assert_eq(whatwgurl.hostname(whatwgurl.parse("http://0x7f.1/", None) ?? panic("ipv4")), "127.0.0.1")
+    assert_eq(whatwgurl.href(whatwgurl.set_port(u, "8080")), "http://example.com:8080/a/c?x=1%202#frag")
+    assert_eq(uts46.to_ascii(uts46.tables(), "München.DE") ?? "", "xn--mnchen-3ya.de")
+    assert_eq(uts46.to_unicode("xn--mnchen-3ya.de"), "münchen.de")
+    let qs = urlsearchparams.from_string("?b=2&a=1&a=0+x")
+    assert_eq(urlsearchparams.serialize(urlsearchparams.sort(qs)), "a=1&a=0+x&b=2")
+    let m = whatwgmime.parse(" Text/HTML ; Charset=\"utf-8\" ; x") ?? panic("mime")
+    assert_eq(whatwgmime.serialize(m), "text/html;charset=utf-8")
+    let d = dataurl.process_text("data:;base64,aGk=") ?? panic("data")
+    assert_eq((whatwgmime.serialize(d.mime), d.body), ("text/plain;charset=US-ASCII", "hi".to_bytes()))
+}
+
+fn packages() {
+    let h = hostedgit.from_url("git@github.com:npm/cli.git#v10") ?? panic("hosted")
+    let plain = GitRender{ path: "", fragment: None, no_git_plus: false, no_committish: false }
+    assert_eq(hostedgit.render(h, "tarball", plain) ?? "", "https://codeload.github.com/npm/cli/tar.gz/v10")
+    let r = nodesemver.regexes()
+    assert_eq(nodesemver.valid_range(r, "^1.2.x || ~0.3", false, false) ?? "", ">=1.2.0 <2.0.0-0||>=0.3.0 <0.4.0-0")
+    assert(not nodesemver.satisfies(r, "1.3.0-beta", "^1.2.0", false, false))
+    assert_eq(nodesemver.best_satisfying(r, ["1.2.3", "1.9.0", "2.0.0"], "^1", false, false, true), Some("1.9.0"))
+    let spec = npmspec.parse_with(r, "alias@npm:react@^18", "/w", "/home/u") ?? panic("npa")
+    assert_eq((spec.kind, spec.sub_spec), ("alias", Some("react@^18")))
+    assert_eq(negotiator.media_types(Some("text/*;q=0.5, application/json"), Some(["text/html", "application/json"])), ["application/json", "text/html"])
+    assert_eq(negotiator.encodings(Some("gzip;q=0"), Some(["gzip", "identity"]), None), ["identity"])
+    let supported = pytags.cpython_tags([3, 12], ["cp312"], ["macosx_11_0_arm64"]) + pytags.compatible_tags([3, 12], None, ["macosx_11_0_arm64"])
+    // 13 CPython tags, 14 pure-Python ones for the platform, then py312-none-any.
+    assert_eq(pytags.rank(supported, pytags.parse_tag("py3-none-any") ?? []), Some(28))
+}
+
+fn main() / {io} {
+    web()
+    packages()
+    print("ten formats exercised")
+}

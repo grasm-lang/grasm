@@ -1,0 +1,4 @@
+[package]
+name = "negotiator"
+version = "1.0.0"
+capabilities = []

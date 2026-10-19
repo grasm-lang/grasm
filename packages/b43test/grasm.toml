@@ -1,0 +1,44 @@
+[package]
+name = "b43test"
+version = "1.0.0"
+capabilities = ["io"]
+
+[dependencies.uts46]
+path = "../uts46"
+version = "^1.0.0"
+
+[dependencies.whatwgurl]
+path = "../whatwgurl"
+version = "^1.0.0"
+
+[dependencies.urlsearchparams]
+path = "../urlsearchparams"
+version = "^1.0.0"
+
+[dependencies.whatwgmime]
+path = "../whatwgmime"
+version = "^1.0.0"
+
+[dependencies.dataurl]
+path = "../dataurl"
+version = "^1.0.0"
+
+[dependencies.hostedgit]
+path = "../hostedgit"
+version = "^1.0.0"
+
+[dependencies.nodesemver]
+path = "../nodesemver"
+version = "^1.0.0"
+
+[dependencies.npmspec]
+path = "../npmspec"
+version = "^1.0.0"
+
+[dependencies.negotiator]
+path = "../negotiator"
+version = "^1.0.0"
+
+[dependencies.pytags]
+path = "../pytags"
+version = "^1.0.0"

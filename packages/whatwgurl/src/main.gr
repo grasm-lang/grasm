@@ -1,0 +1,1299 @@
+// URLs as the URL Standard parses them: what a browser, Node, Deno and
+// every fetch implementation mean by `new URL(input, base)`.
+//
+// RFC 3986 describes URLs that are already well formed. The web is made
+// of the other kind -- backslashes for slashes, tabs and newlines in the
+// middle, `http:example.com`, `HTTP://EXAMPLE.COM:80/a/./b/../c`, hosts in
+// any script, IPv4 addresses written `0x7f.1` -- and the URL Standard
+// says exactly what each becomes, by one state machine. That machine is
+// here, state for state: special schemes (http, https, ws, wss, ftp,
+// file) and their default ports, the percent-encode sets for userinfo,
+// path, query and fragment, dot segments in their encoded spellings,
+// Windows drive letters in file URLs, opaque paths (`mailto:`, `data:`),
+// and the host parser -- IPv6 with its compressed form, IPv4 in every
+// radix the standard accepts, opaque hosts for other schemes, and domains
+// through UTS #46 (`packages/uts46`).
+//
+// `parse` resolves an input against an optional base; `href` and the
+// other getters serialise as the standard's API does; the `set_*`
+// functions are the API's setters, run as the standard runs them, by
+// re-entering the state machine part-way. `origin` follows blob URLs to
+// the URL inside them.
+import uts46
+
+type WhatwgUrl = {
+    scheme: str,
+    username: str,
+    password: str,
+    /// The serialised host; None for no host, Some("") for an empty one.
+    host: Option[str],
+    port: Option[i64],
+    path: [str],
+    /// Some when the URL has an opaque path (`mailto:x`), which `path`
+    /// then does not hold.
+    opaque: Option[str],
+    query: Option[str],
+    fragment: Option[str],
+}
+
+type UrlError =
+    | UrlInvalid(why: str)
+
+let EOF = 0 - 1
+
+pub fn is_special(scheme: str) -> bool {
+    return scheme == "http" or scheme == "https" or scheme == "ws" or scheme == "wss" or scheme == "ftp" or scheme == "file"
+}
+
+/// The default port of a special scheme, or None.
+pub fn default_port(scheme: str) -> Option[i64] {
+    return if scheme == "http" or scheme == "ws" { Some(80) } else if scheme == "https" or scheme == "wss" { Some(443) } else if scheme == "ftp" { Some(21) }
+    else { None }
+}
+
+fn is_alpha(c: i64) -> bool {
+    return (c >= 65 and c <= 90) or (c >= 97 and c <= 122)
+}
+
+fn is_digit(c: i64) -> bool {
+    return c >= 48 and c <= 57
+}
+
+fn is_hex(c: i64) -> bool {
+    return is_digit(c) or (c >= 65 and c <= 70) or (c >= 97 and c <= 102)
+}
+
+fn hex_val(c: i64) -> i64 {
+    return if is_digit(c) { c - 48 } else if c >= 97 { c - 87 } else { c - 55 }
+}
+
+fn utf8(c: i64) -> [i64] {
+    if c < 128 {
+        return [c]
+    }
+    if c < 2048 {
+        return [192 + c.ushr(6), 128 + c.bit_and(63)]
+    }
+    if c < 65536 {
+        return [224 + c.ushr(12), 128 + c.ushr(6).bit_and(63), 128 + c.bit_and(63)]
+    }
+    return [240 + c.ushr(18), 128 + c.ushr(12).bit_and(63), 128 + c.ushr(6).bit_and(63), 128 + c.bit_and(63)]
+}
+
+fn from_codes(cs: [i64]) -> str {
+    var out: [i64] = []
+    for c in cs {
+        for b in utf8(c) {
+            out.push(b)
+        }
+    }
+    return bytes_of(out).to_str()
+}
+
+// Percent-encode sets: 0 C0 control, 1 fragment, 2 query, 3 special-query,
+// 4 path, 5 userinfo, 6 component, 7 application/x-www-form-urlencoded.
+fn in_set(c: i64, set: i64) -> bool {
+    if c < 32 or c > 126 {
+        return true
+    }
+    if set == 0 {
+        return false
+    }
+    if set == 1 {
+        return c == 32 or c == 34 or c == 60 or c == 62 or c == 96
+    }
+    let query = c == 32 or c == 34 or c == 35 or c == 60 or c == 62
+    if set == 2 {
+        return query
+    }
+    if set == 3 {
+        return query or c == 39
+    }
+    let path = query or c == 63 or c == 94 or c == 96 or c == 123 or c == 125
+    if set == 4 {
+        return path
+    }
+    let userinfo = path or c == 47 or c == 58 or c == 59 or c == 61 or c == 64 or (c >= 91 and c <= 93) or c == 124
+    if set == 5 {
+        return userinfo
+    }
+    let component = userinfo or c == 36 or c == 37 or c == 38 or c == 43 or c == 44
+    if set == 6 {
+        return component
+    }
+    return component or c == 33 or (c >= 39 and c <= 41) or c == 126
+}
+
+/// UTF-8 percent-encode of one code point with a set.
+pub fn encode_code(c: i64, set: i64) -> str {
+    if not in_set(c, set) {
+        return bytes_of([c]).to_str()
+    }
+    let digits = "0123456789ABCDEF"
+    var s = ""
+    for b in utf8(c) {
+        s = s + "%" + digits.substr(b.ushr(4), 1) + digits.substr(b.bit_and(15), 1)
+    }
+    return s
+}
+
+/// Percent-encodes a whole string with a set (`set` as `encode_code`).
+pub fn encode(s: str, set: i64) -> str {
+    var parts: [str] = []
+    for c in s.codes() {
+        parts.push(encode_code(c, set))
+    }
+    return parts.join("")
+}
+
+/// Percent-decodes bytes: `%` and two hex digits become that byte;
+/// anything else stays.
+pub fn percent_decode(b: bytes) -> bytes {
+    var out: [i64] = []
+    var i = 0
+    while i < b.len() {
+        let c = b.at(i)
+        if c == 37 and i + 2 < b.len() + 0 and is_hex(b.at(i + 1)) and is_hex(b.at(i + 2)) {
+            out.push(hex_val(b.at(i + 1)) * 16 + hex_val(b.at(i + 2)))
+            i = i + 3
+        } else {
+            out.push(c)
+            i = i + 1
+        }
+    }
+    return bytes_of(out)
+}
+
+/// The Encoding Standard's UTF-8 decode: one U+FFFD for each maximal
+/// invalid subsequence, and a BOM left where it is.
+pub fn utf8_decode(b: bytes) -> [i64] {
+    var out: [i64] = []
+    var i = 0
+    while i < b.len() {
+        let x = b.at(i)
+        i = i + 1
+        if x < 128 {
+            out.push(x)
+            continue
+        }
+        let need = if x >= 194 and x <= 223 { 1 } else if x >= 224 and x <= 239 { 2 } else if x >= 240 and x <= 244 { 3 } else { 0 }
+        if need == 0 {
+            out.push(65533)
+            continue
+        }
+        var cp = x.bit_and(if need == 1 { 31 } else if need == 2 { 15 } else { 7 })
+        var lo = if x == 224 { 160 } else if x == 240 { 144 } else { 128 }
+        var hi = if x == 237 { 159 } else if x == 244 { 143 } else { 191 }
+        var got = 0
+        while got < need and i < b.len() and b.at(i) >= lo and b.at(i) <= hi {
+            cp = cp.shl(6).bit_or(b.at(i).bit_and(63))
+            i = i + 1
+            got = got + 1
+            lo = 128
+            hi = 191
+        }
+        out.push(if got == need { cp } else { 65533 })
+    }
+    return out
+}
+
+// --- hosts -----------------------------------------------------------------
+
+fn ipv4_number(s: str) -> Option[i64] {
+    if s.len() == 0 {
+        return None
+    }
+    var t = s
+    var radix = 10
+    if t.len() >= 2 and (t.starts_with("0x") or t.starts_with("0X")) {
+        radix = 16
+        t = t.substr(2, t.len() - 2)
+    } else if t.len() >= 2 and t.starts_with("0") {
+        radix = 8
+        t = t.substr(1, t.len() - 1)
+    }
+    var n = 0
+    for c in t.codes() {
+        let d = if is_digit(c) { c - 48 } else if is_hex(c) { hex_val(c) } else { 99 }
+        if d >= radix {
+            return None
+        }
+        // Anything past 2^32 fails later; stop it growing without bound.
+        n = if n > 4294967296 { n } else { n * radix + d }
+    }
+    return Some(n)
+}
+
+fn ends_in_number(s: str) -> bool {
+    var parts = s.split(".")
+    if parts[parts.len() - 1].len() == 0 {
+        if parts.len() == 1 {
+            return false
+        }
+        parts = parts.slice(0, parts.len() - 1)
+    }
+    let last = parts[parts.len() - 1]
+    if last.len() > 0 {
+        var digits = true
+        for c in last.codes() {
+            digits = digits and is_digit(c)
+        }
+        if digits {
+            return true
+        }
+    }
+    return ipv4_number(last) != None and (last.starts_with("0x") or last.starts_with("0X"))
+}
+
+fn ipv4(s: str) -> str ! UrlError {
+    var parts = s.split(".")
+    if parts[parts.len() - 1].len() == 0 and parts.len() > 1 {
+        parts = parts.slice(0, parts.len() - 1)
+    }
+    if parts.len() > 4 {
+        fail(UrlInvalid("an IPv4 address of more than four parts"))
+    }
+    var nums: [i64] = []
+    for p in parts {
+        nums.push(ipv4_number(p) ?? fail(UrlInvalid("an IPv4 part that is not a number")))
+    }
+    for i in 0..(nums.len() - 1) {
+        if nums[i] > 255 {
+            fail(UrlInvalid("an IPv4 part past 255"))
+        }
+    }
+    var limit = 1
+    for _k in 0..(5 - nums.len()) {
+        limit = limit * 256
+    }
+    if nums[nums.len() - 1] >= limit {
+        fail(UrlInvalid("an IPv4 address past 32 bits"))
+    }
+    var v = nums[nums.len() - 1]
+    var scale = 16777216
+    for i in 0..(nums.len() - 1) {
+        v = v + nums[i] * scale
+        scale = scale / 256
+    }
+    return "{v.ushr(24).bit_and(255)}.{v.ushr(16).bit_and(255)}.{v.ushr(8).bit_and(255)}.{v.bit_and(255)}"
+}
+
+fn cp_at(cs: [i64], i: i64) -> i64 {
+    return if i >= 0 and i < cs.len() { cs[i] } else { EOF }
+}
+
+/// The IPv4 address that ends an IPv6 one, written into `addr` from
+/// `piece`; the piece after it.
+fn embedded_ipv4(cs: [i64], p0: i64, inout addr: [i64], piece0: i64) -> i64 ! UrlError {
+    var p = p0
+    var piece = piece0
+    var seen = 0
+    while cp_at(cs, p) != EOF {
+        var v = 0 - 1
+        if seen > 0 {
+            if cp_at(cs, p) == 46 and seen < 4 {
+                p = p + 1
+            } else {
+                fail(UrlInvalid("a bad embedded IPv4 address"))
+            }
+        }
+        if not is_digit(cp_at(cs, p)) {
+            fail(UrlInvalid("a bad embedded IPv4 address"))
+        }
+        while is_digit(cp_at(cs, p)) {
+            let n = cp_at(cs, p) - 48
+            if v == 0 - 1 {
+                v = n
+            } else if v == 0 {
+                fail(UrlInvalid("a leading zero in an embedded IPv4 part"))
+            } else {
+                v = v * 10 + n
+            }
+            if v > 255 {
+                fail(UrlInvalid("an embedded IPv4 part past 255"))
+            }
+            p = p + 1
+        }
+        addr[piece] = addr[piece] * 256 + v
+        seen = seen + 1
+        if seen == 2 or seen == 4 {
+            piece = piece + 1
+        }
+    }
+    if seen != 4 {
+        fail(UrlInvalid("an embedded IPv4 address too short"))
+    }
+    return piece
+}
+
+fn ipv6_parse(cs: [i64]) -> [i64] ! UrlError {
+    var addr = [0, 0, 0, 0, 0, 0, 0, 0]
+    var piece = 0
+    var compress = 0 - 1
+    var p = 0
+    if cp_at(cs, p) == 58 {
+        if cp_at(cs, p + 1) != 58 {
+            fail(UrlInvalid("an IPv6 address starting with one colon"))
+        }
+        p = p + 2
+        piece = 1
+        compress = 1
+    }
+    while cp_at(cs, p) != EOF {
+        if piece == 8 {
+            fail(UrlInvalid("too many IPv6 pieces"))
+        }
+        if cp_at(cs, p) == 58 {
+            if compress != 0 - 1 {
+                fail(UrlInvalid("two :: in an IPv6 address"))
+            }
+            p = p + 1
+            piece = piece + 1
+            compress = piece
+            continue
+        }
+        var value = 0
+        var length = 0
+        while length < 4 and is_hex(cp_at(cs, p)) {
+            value = value * 16 + hex_val(cp_at(cs, p))
+            p = p + 1
+            length = length + 1
+        }
+        if cp_at(cs, p) == 46 {
+            if length == 0 {
+                fail(UrlInvalid("an IPv4 part with no number"))
+            }
+            if piece > 6 {
+                fail(UrlInvalid("an embedded IPv4 address too late"))
+            }
+            piece = try embedded_ipv4(cs, p - length, addr, piece)
+            break
+        } else if cp_at(cs, p) == 58 {
+            p = p + 1
+            if cp_at(cs, p) == EOF {
+                fail(UrlInvalid("an IPv6 address ending in one colon"))
+            }
+        } else if cp_at(cs, p) != EOF {
+            fail(UrlInvalid("a bad character in an IPv6 address"))
+        }
+        addr[piece] = value
+        piece = piece + 1
+    }
+    if compress != 0 - 1 {
+        var swaps = piece - compress
+        piece = 7
+        while piece != 0 and swaps > 0 {
+            let tmp = addr[piece]
+            addr[piece] = addr[compress + swaps - 1]
+            addr[compress + swaps - 1] = tmp
+            piece = piece - 1
+            swaps = swaps - 1
+        }
+    } else if piece != 8 {
+        fail(UrlInvalid("too few IPv6 pieces"))
+    }
+    return addr
+}
+
+fn ipv6_text(addr: [i64]) -> str {
+    // The first longest run of two or more zero pieces is compressed.
+    var best = 0 - 1
+    var best_len = 1
+    var i = 0
+    while i < 8 {
+        if addr[i] == 0 {
+            var j = i
+            while j < 8 and addr[j] == 0 {
+                j = j + 1
+            }
+            if j - i > best_len {
+                best = i
+                best_len = j - i
+            }
+            i = j
+        } else {
+            i = i + 1
+        }
+    }
+    let digits = "0123456789abcdef"
+    var out = ""
+    var ignore0 = false
+    for k in 0..8 {
+        if ignore0 and addr[k] == 0 {
+            continue
+        }
+        ignore0 = false
+        if best == k {
+            out = out + (if k == 0 { "::" } else { ":" })
+            ignore0 = true
+            continue
+        }
+        var h = ""
+        var v = addr[k]
+        if v == 0 {
+            h = "0"
+        }
+        while v > 0 {
+            h = digits.substr(v.bit_and(15), 1) + h
+            v = v.ushr(4)
+        }
+        out = out + h + (if k != 7 { ":" } else { "" })
+    }
+    return out
+}
+
+fn forbidden_host(c: i64) -> bool {
+    return c == 0 or c == 9 or c == 10 or c == 13 or c == 32 or c == 35 or c == 47 or c == 58 or c == 60 or c == 62 or c == 63 or c == 64 or c == 91 or
+    c == 92 or c == 93 or c == 94 or c == 124
+}
+
+fn forbidden_domain(c: i64) -> bool {
+    return forbidden_host(c) or c <= 31 or c == 37 or c == 127
+}
+
+/// The URL Standard's domain to ASCII, then the host checks: the
+/// serialised host, or an error.
+pub fn domain_to_ascii(domain: str) -> str ! UrlError {
+    let ascii = if uts46.needs_tables(domain) { uts46.to_ascii(uts46.tables(), domain) ?? fail(UrlInvalid("a domain UTS #46 rejects")) }
+    else { if domain.len() == 0 { fail(UrlInvalid("an empty domain")) } else { domain.to_lower() } }
+    for c in ascii.codes() {
+        if forbidden_domain(c) {
+            fail(UrlInvalid("a forbidden code point in a domain"))
+        }
+    }
+    return if ends_in_number(ascii) { try ipv4(ascii) } else { ascii }
+}
+
+/// The host parser: `[...]` for IPv6, an opaque host for non-special
+/// schemes, a domain or IPv4 address otherwise.
+pub fn parse_host(input: str, opaque: bool) -> str ! UrlError {
+    if input.starts_with("[") {
+        if not input.ends_with("]") {
+            fail(UrlInvalid("an IPv6 address without its ]"))
+        }
+        return "[" + ipv6_text(try ipv6_parse(input.substr(1, input.len() - 2).codes())) + "]"
+    }
+    if opaque {
+        for c in input.codes() {
+            if forbidden_host(c) {
+                fail(UrlInvalid("a forbidden code point in an opaque host"))
+            }
+        }
+        return encode(input, 0)
+    }
+    let bytes = percent_decode(input.to_bytes())
+    return try domain_to_ascii(from_codes(utf8_decode(bytes)))
+}
+
+// --- the state machine ------------------------------------------------------
+
+// States: 1 scheme start, 2 scheme, 3 no scheme, 4 special relative or
+// authority, 5 path or authority, 6 relative, 7 relative slash, 8 special
+// authority slashes, 9 special authority ignore slashes, 10 authority,
+// 11 host, 12 hostname, 13 port, 14 file, 15 file slash, 16 file host,
+// 17 path start, 18 path, 19 opaque path, 20 query, 21 fragment.
+
+type UrlMachine = {
+    cs: [i64],
+    p: i64,
+    state: i64,
+    over: i64,
+    buffer: [i64],
+    at_seen: bool,
+    brackets: bool,
+    pw_seen: bool,
+    url: WhatwgUrl,
+    base: Option[WhatwgUrl],
+    done: bool,
+}
+
+fn empty_url() -> WhatwgUrl {
+    return WhatwgUrl{ scheme: "", username: "", password: "", host: None, port: None, path: [], opaque: None, query: None, fragment: None }
+}
+
+fn code_at(m: UrlMachine, i: i64) -> i64 {
+    return if i >= 0 and i < m.cs.len() { m.cs[i] } else { EOF }
+}
+
+fn remaining_starts(m: UrlMachine, c: i64) -> bool {
+    return code_at(m, m.p + 1) == c
+}
+
+fn buf(m: UrlMachine) -> str {
+    return from_codes(m.buffer)
+}
+
+fn special(m: UrlMachine) -> bool {
+    return is_special(m.url.scheme)
+}
+
+fn credentials(u: WhatwgUrl) -> bool {
+    return u.username.len() > 0 or u.password.len() > 0
+}
+
+/// A Windows drive letter: a letter then `:` or `|` (normalised: `:`).
+fn drive_letter(cs: [i64], normalised: bool) -> bool {
+    return cs.len() == 2 and is_alpha(cs[0]) and (cs[1] == 58 or (not normalised and cs[1] == 124))
+}
+
+fn starts_with_drive(m: UrlMachine) -> bool {
+    let rest = m.cs.slice(if m.p < 0 { 0 } else if m.p > m.cs.len() { m.cs.len() } else { m.p }, m.cs.len())
+    if rest.len() < 2 or not drive_letter(rest.slice(0, 2), false) {
+        return false
+    }
+    return rest.len() == 2 or rest[2] == 47 or rest[2] == 92 or rest[2] == 63 or rest[2] == 35
+}
+
+fn shorten(inout u: WhatwgUrl) {
+    if u.scheme == "file" and u.path.len() == 1 and drive_letter(u.path[0].codes(), true) {
+        return
+    }
+    if u.path.len() > 0 {
+        u.path = u.path.slice(0, u.path.len() - 1)
+    }
+}
+
+fn st_scheme_start(inout m: UrlMachine, c: i64) -> () ! UrlError {
+    if is_alpha(c) {
+        m.buffer.push(c.bit_or(32))
+        m.state = 2
+    } else if m.over == 0 {
+        m.state = 3
+        m.p = m.p - 1
+    } else {
+        fail(UrlInvalid("a scheme that does not start with a letter"))
+    }
+}
+
+fn st_scheme(inout m: UrlMachine, c: i64) -> () ! UrlError {
+    if is_alpha(c) or is_digit(c) or c == 43 or c == 45 or c == 46 {
+        m.buffer.push(if c >= 65 and c <= 90 { c + 32 } else { c })
+        return
+    }
+    if c != 58 {
+        if m.over != 0 {
+            fail(UrlInvalid("a scheme with a character schemes may not hold"))
+        }
+        m.buffer = []
+        m.state = 3
+        m.p = 0 - 1
+        return
+    }
+    let b = buf(m)
+    if m.over != 0 {
+        if is_special(m.url.scheme) != is_special(b) or ((credentials(m.url) or m.url.port != None) and b == "file") or
+        (m.url.scheme == "file" and m.url.host == Some("")) {
+            m.done = true
+            return
+        }
+    }
+    m.url.scheme = b
+    if m.over != 0 {
+        if m.url.port != None and m.url.port == default_port(b) {
+            m.url.port = None
+        }
+        m.done = true
+        return
+    }
+    m.buffer = []
+    if b == "file" {
+        m.state = 14
+    } else if special(m) and m.base != None and (m.base ?? empty_url()).scheme == b {
+        m.state = 4
+    } else if special(m) {
+        m.state = 8
+    } else if remaining_starts(m, 47) {
+        m.state = 5
+        m.p = m.p + 1
+    } else {
+        m.url.opaque = Some("")
+        m.state = 19
+    }
+}
+
+fn st_no_scheme(inout m: UrlMachine, c: i64) -> () ! UrlError {
+    let base = m.base ?? fail(UrlInvalid("a relative URL with no base"))
+    if base.opaque != None {
+        if c != 35 {
+            fail(UrlInvalid("a relative URL against a base with an opaque path"))
+        }
+        m.url.scheme = base.scheme
+        m.url.opaque = base.opaque
+        m.url.query = base.query
+        m.url.fragment = Some("")
+        m.state = 21
+        return
+    }
+    m.state = if base.scheme != "file" { 6 } else { 14 }
+    m.p = m.p - 1
+}
+
+fn st_relative(inout m: UrlMachine, c: i64) -> () ! UrlError {
+    let base = m.base ?? fail(UrlInvalid("no base"))
+    m.url.scheme = base.scheme
+    if c == 47 or (special(m) and c == 92) {
+        m.state = 7
+        return
+    }
+    m.url.username = base.username
+    m.url.password = base.password
+    m.url.host = base.host
+    m.url.port = base.port
+    m.url.path = base.path
+    m.url.query = base.query
+    if c == 63 {
+        m.url.query = Some("")
+        m.state = 20
+    } else if c == 35 {
+        m.url.fragment = Some("")
+        m.state = 21
+    } else if c != EOF {
+        m.url.query = None
+        shorten(m.url)
+        m.state = 18
+        m.p = m.p - 1
+    }
+}
+
+fn st_relative_slash(inout m: UrlMachine, c: i64) -> () ! UrlError {
+    if special(m) and (c == 47 or c == 92) {
+        m.state = 9
+    } else if c == 47 {
+        m.state = 10
+    } else {
+        let base = m.base ?? fail(UrlInvalid("no base"))
+        m.url.username = base.username
+        m.url.password = base.password
+        m.url.host = base.host
+        m.url.port = base.port
+        m.state = 18
+        m.p = m.p - 1
+    }
+}
+
+fn st_authority(inout m: UrlMachine, c: i64) -> () ! UrlError {
+    if c == 64 {
+        if m.at_seen {
+            m.buffer = [37, 52, 48] + m.buffer
+        }
+        m.at_seen = true
+        for x in m.buffer {
+            if x == 58 and not m.pw_seen {
+                m.pw_seen = true
+                continue
+            }
+            if m.pw_seen {
+                m.url.password = m.url.password + encode_code(x, 5)
+            } else {
+                m.url.username = m.url.username + encode_code(x, 5)
+            }
+        }
+        m.buffer = []
+    } else if c == EOF or c == 47 or c == 63 or c == 35 or (special(m) and c == 92) {
+        if m.at_seen and m.buffer.len() == 0 {
+            fail(UrlInvalid("credentials with no host"))
+        }
+        m.p = m.p - m.buffer.len() - 1
+        m.buffer = []
+        m.state = 11
+    } else {
+        m.buffer.push(c)
+    }
+}
+
+fn st_host(inout m: UrlMachine, c: i64) -> () ! UrlError {
+    if m.over != 0 and m.url.scheme == "file" {
+        m.p = m.p - 1
+        m.state = 16
+        return
+    }
+    if c == 58 and not m.brackets {
+        if m.buffer.len() == 0 {
+            fail(UrlInvalid("a port with no host"))
+        }
+        if m.over == 12 {
+            fail(UrlInvalid("a port given to the hostname setter"))
+        }
+        m.url.host = Some(try parse_host(buf(m), not special(m)))
+        m.buffer = []
+        m.state = 13
+        return
+    }
+    if c == EOF or c == 47 or c == 63 or c == 35 or (special(m) and c == 92) {
+        m.p = m.p - 1
+        if special(m) and m.buffer.len() == 0 {
+            fail(UrlInvalid("a special URL with no host"))
+        }
+        if m.over != 0 and m.buffer.len() == 0 and (credentials(m.url) or m.url.port != None) {
+            m.done = true
+            return
+        }
+        m.url.host = Some(try parse_host(buf(m), not special(m)))
+        m.buffer = []
+        m.state = 17
+        if m.over != 0 {
+            m.done = true
+        }
+        return
+    }
+    if c == 91 {
+        m.brackets = true
+    }
+    if c == 93 {
+        m.brackets = false
+    }
+    m.buffer.push(c)
+}
+
+fn st_port(inout m: UrlMachine, c: i64) -> () ! UrlError {
+    if is_digit(c) {
+        m.buffer.push(c)
+        return
+    }
+    if c == EOF or c == 47 or c == 63 or c == 35 or (special(m) and c == 92) or m.over != 0 {
+        if m.buffer.len() > 0 {
+            var n = 0
+            for d in m.buffer {
+                n = if n > 65535 { n } else { n * 10 + d - 48 }
+            }
+            if n > 65535 {
+                fail(UrlInvalid("a port past 65535"))
+            }
+            m.url.port = if Some(n) == default_port(m.url.scheme) { None } else { Some(n) }
+            m.buffer = []
+            if m.over != 0 {
+                m.done = true
+                return
+            }
+        }
+        if m.over != 0 {
+            m.done = true
+            return
+        }
+        m.state = 17
+        m.p = m.p - 1
+        return
+    }
+    fail(UrlInvalid("a port that is not a number"))
+}
+
+fn st_file(inout m: UrlMachine, c: i64) -> () ! UrlError {
+    m.url.scheme = "file"
+    m.url.host = Some("")
+    if c == 47 or c == 92 {
+        m.state = 15
+        return
+    }
+    let base = m.base ?? empty_url()
+    if m.base != None and base.scheme == "file" {
+        m.url.host = base.host
+        m.url.path = base.path
+        m.url.query = base.query
+        if c == 63 {
+            m.url.query = Some("")
+            m.state = 20
+        } else if c == 35 {
+            m.url.fragment = Some("")
+            m.state = 21
+        } else if c != EOF {
+            m.url.query = None
+            if not starts_with_drive(m) {
+                shorten(m.url)
+            } else {
+                m.url.path = []
+            }
+            m.state = 18
+            m.p = m.p - 1
+        }
+        return
+    }
+    m.state = 18
+    m.p = m.p - 1
+}
+
+fn st_file_slash(inout m: UrlMachine, c: i64) -> () ! UrlError {
+    if c == 47 or c == 92 {
+        m.state = 16
+        return
+    }
+    let base = m.base ?? empty_url()
+    if m.base != None and base.scheme == "file" {
+        m.url.host = base.host
+        if not starts_with_drive(m) and base.path.len() > 0 and drive_letter(base.path[0].codes(), true) {
+            m.url.path.push(base.path[0])
+        }
+    }
+    m.state = 18
+    m.p = m.p - 1
+}
+
+fn st_file_host(inout m: UrlMachine, c: i64) -> () ! UrlError {
+    if not (c == EOF or c == 47 or c == 92 or c == 63 or c == 35) {
+        m.buffer.push(c)
+        return
+    }
+    m.p = m.p - 1
+    if m.over == 0 and drive_letter(m.buffer, false) {
+        // The drive letter stays in the buffer for the path state.
+        m.state = 18
+        return
+    }
+    if m.buffer.len() == 0 {
+        m.url.host = Some("")
+        if m.over != 0 {
+            m.done = true
+            return
+        }
+        m.state = 17
+        return
+    }
+    var host = try parse_host(buf(m), not special(m))
+    if host == "localhost" {
+        host = ""
+    }
+    m.url.host = Some(host)
+    if m.over != 0 {
+        m.done = true
+        return
+    }
+    m.buffer = []
+    m.state = 17
+}
+
+fn st_path_start(inout m: UrlMachine, c: i64) {
+    if special(m) {
+        m.state = 18
+        if c != 47 and c != 92 {
+            m.p = m.p - 1
+        }
+    } else if m.over == 0 and c == 63 {
+        m.url.query = Some("")
+        m.state = 20
+    } else if m.over == 0 and c == 35 {
+        m.url.fragment = Some("")
+        m.state = 21
+    } else if c != EOF {
+        m.state = 18
+        if c != 47 {
+            m.p = m.p - 1
+        }
+    } else if m.over != 0 and m.url.host == None {
+        m.url.path.push("")
+    }
+}
+
+fn dot_kind(s: str) -> i64 {
+    let l = s.to_lower()
+    if l == "." or l == "%2e" {
+        return 1
+    }
+    if l == ".." or l == ".%2e" or l == "%2e." or l == "%2e%2e" {
+        return 2
+    }
+    return 0
+}
+
+fn st_path(inout m: UrlMachine, c: i64) {
+    let slash = c == 47 or (special(m) and c == 92)
+    if not (c == EOF or slash or (m.over == 0 and (c == 63 or c == 35))) {
+        m.buffer = m.buffer + encode_code(c, 4).codes()
+        return
+    }
+    let b = buf(m)
+    let kind = dot_kind(b)
+    if kind == 2 {
+        shorten(m.url)
+        if not slash {
+            m.url.path.push("")
+        }
+    } else if kind == 1 and not slash {
+        m.url.path.push("")
+    } else if kind == 0 {
+        var seg = b
+        if m.url.scheme == "file" and m.url.path.len() == 0 and drive_letter(m.buffer, false) {
+            seg = seg.substr(0, 1) + ":"
+        }
+        m.url.path.push(seg)
+    }
+    m.buffer = []
+    if c == 63 {
+        m.url.query = Some("")
+        m.state = 20
+    }
+    if c == 35 {
+        m.url.fragment = Some("")
+        m.state = 21
+    }
+}
+
+fn st_opaque(inout m: UrlMachine, c: i64) {
+    if c == 63 {
+        m.url.query = Some("")
+        m.state = 20
+    } else if c == 35 {
+        m.url.fragment = Some("")
+        m.state = 21
+    } else if c == 32 {
+        let next = code_at(m, m.p + 1)
+        m.url.opaque = Some((m.url.opaque ?? "") + if next == 63 or next == 35 { "%20" } else { " " })
+    } else if c != EOF {
+        m.url.opaque = Some((m.url.opaque ?? "") + encode_code(c, 0))
+    }
+}
+
+fn st_query(inout m: UrlMachine, c: i64) {
+    if (m.over == 0 and c == 35) or c == EOF {
+        let set = if special(m) { 3 } else { 2 }
+        var q = m.url.query ?? ""
+        for x in m.buffer {
+            q = q + encode_code(x, set)
+        }
+        m.url.query = Some(q)
+        m.buffer = []
+        if c == 35 {
+            m.url.fragment = Some("")
+            m.state = 21
+        }
+    } else if c != EOF {
+        m.buffer.push(c)
+    }
+}
+
+fn step(inout m: UrlMachine, c: i64) -> () ! UrlError {
+    let s = m.state
+    if s == 1 {
+        try st_scheme_start(m, c)
+    } else if s == 2 {
+        try st_scheme(m, c)
+    } else if s == 3 {
+        try st_no_scheme(m, c)
+    } else if s == 4 {
+        m.state = if c == 47 and remaining_starts(m, 47) { 9 } else { 6 }
+        m.p = if m.state == 9 { m.p + 1 } else { m.p - 1 }
+    } else if s == 5 {
+        m.state = if c == 47 { 10 } else { 18 }
+        if c != 47 {
+            m.p = m.p - 1
+        }
+    } else if s == 6 {
+        try st_relative(m, c)
+    } else if s == 7 {
+        try st_relative_slash(m, c)
+    } else if s == 8 {
+        m.state = 9
+        m.p = if c == 47 and remaining_starts(m, 47) { m.p + 1 } else { m.p - 1 }
+    } else if s == 9 {
+        if c != 47 and c != 92 {
+            m.state = 10
+            m.p = m.p - 1
+        }
+    } else if s == 10 {
+        try st_authority(m, c)
+    } else if s == 11 or s == 12 {
+        try st_host(m, c)
+    } else if s == 13 {
+        try st_port(m, c)
+    } else {
+        try step_rest(m, c)
+    }
+}
+
+fn step_rest(inout m: UrlMachine, c: i64) -> () ! UrlError {
+    let s = m.state
+    if s == 14 {
+        try st_file(m, c)
+    } else if s == 15 {
+        try st_file_slash(m, c)
+    } else if s == 16 {
+        try st_file_host(m, c)
+    } else if s == 17 {
+        st_path_start(m, c)
+    } else if s == 18 {
+        st_path(m, c)
+    } else if s == 19 {
+        st_opaque(m, c)
+    } else if s == 20 {
+        st_query(m, c)
+    } else if c != EOF {
+        m.url.fragment = Some((m.url.fragment ?? "") + encode_code(c, 1))
+    }
+}
+
+fn is_c0_or_space(c: i64) -> bool {
+    return c >= 0 and c <= 32
+}
+
+/// The basic URL parser, given a URL to change and a state to start in
+/// when a setter calls it (`over` 0 otherwise).
+fn run_machine(input: str, base: Option[WhatwgUrl], url: WhatwgUrl, over: i64) -> WhatwgUrl ! UrlError {
+    return try run_machine_as(input, base, url, over, over != 0)
+}
+
+/// The machine; `keep` returns the URL as changed so far when it fails
+/// (what a setter does) instead of failing.
+fn run_machine_as(input: str, base: Option[WhatwgUrl], url: WhatwgUrl, over: i64, keep: bool) -> WhatwgUrl ! UrlError {
+    var cs = input.codes()
+    if over == 0 {
+        var a = 0
+        var b = cs.len()
+        while a < b and is_c0_or_space(cs[a]) {
+            a = a + 1
+        }
+        while b > a and is_c0_or_space(cs[b - 1]) {
+            b = b - 1
+        }
+        cs = cs.slice(a, b)
+    }
+    cs = cs.filter(|c| c != 9 and c != 10 and c != 13)
+    var m = UrlMachine{ cs: cs, p: 0, state: if over == 0 { 1 } else { over }, over: over, buffer: [], at_seen: false, brackets: false, pw_seen: false,
+        url: url, base: base, done: false }
+    while true {
+        match step(m, code_at(m, m.p)) {
+            Ok(_u) -> {}
+            Err(e) -> {
+                // A setter keeps what the parser changed before it failed.
+                if keep {
+                    return m.url
+                }
+                fail(e)
+            }
+        }
+        if m.done or m.p >= m.cs.len() {
+            break
+        }
+        m.p = m.p + 1
+    }
+    return m.url
+}
+
+/// Parses `input`, against `base` when given.
+pub fn parse(input: str, base: Option[WhatwgUrl]) -> WhatwgUrl ! UrlError {
+    return try run_machine(input, base, empty_url(), 0)
+}
+
+/// `new URL(input, base)`, both as text.
+pub fn parse_with(input: str, base: str) -> WhatwgUrl ! UrlError {
+    let b = try parse(base, None)
+    return try parse(input, Some(b))
+}
+
+// --- serialising and the API ---------------------------------------------------
+
+/// The path as the API's `pathname` shows it.
+pub fn pathname(u: WhatwgUrl) -> str {
+    return match u.opaque {
+        Some(o) -> o
+        None -> u.path.map(|s| "/" + s).join("")
+    }
+}
+
+/// The URL serialiser, with or without the fragment.
+pub fn serialize(u: WhatwgUrl, with_fragment: bool) -> str {
+    var out = u.scheme + ":"
+    match u.host {
+        Some(h) -> {
+            out = out + "//"
+            if credentials(u) {
+                out = out + u.username + (if u.password.len() > 0 { ":" + u.password } else { "" }) + "@"
+            }
+            out = out + h
+            match u.port {
+                Some(p) -> out = out + ":{p}"
+                None -> {}
+            }
+        }
+        None -> {
+            if u.opaque == None and u.path.len() > 1 and u.path[0].len() == 0 {
+                out = out + "/."
+            }
+        }
+    }
+    out = out + pathname(u)
+    match u.query {
+        Some(q) -> out = out + "?" + q
+        None -> {}
+    }
+    if with_fragment {
+        match u.fragment {
+            Some(f) -> out = out + "#" + f
+            None -> {}
+        }
+    }
+    return out
+}
+
+pub fn href(u: WhatwgUrl) -> str {
+    return serialize(u, true)
+}
+
+pub fn protocol(u: WhatwgUrl) -> str {
+    return u.scheme + ":"
+}
+
+pub fn hostname(u: WhatwgUrl) -> str {
+    return u.host ?? ""
+}
+
+pub fn port_text(u: WhatwgUrl) -> str {
+    return match u.port {
+        Some(p) -> "{p}"
+        None -> ""
+    }
+}
+
+pub fn host(u: WhatwgUrl) -> str {
+    return match u.port {
+        Some(p) -> hostname(u) + ":{p}"
+        None -> hostname(u)
+    }
+}
+
+pub fn search(u: WhatwgUrl) -> str {
+    let q = u.query ?? ""
+    return if q.len() == 0 { "" } else { "?" + q }
+}
+
+pub fn hash(u: WhatwgUrl) -> str {
+    let f = u.fragment ?? ""
+    return if f.len() == 0 { "" } else { "#" + f }
+}
+
+/// The serialised origin: scheme, host and port for special schemes other
+/// than file, the origin of the URL inside a blob URL whose scheme is
+/// http or https, and "null" for everything else.
+pub fn origin(u: WhatwgUrl) -> str {
+    if u.scheme == "blob" {
+        return match parse(pathname(u), None) {
+            Ok(inner) -> if inner.scheme == "http" or inner.scheme == "https" { origin(inner) } else { "null" }
+            Err(_e) -> "null"
+        }
+    }
+    if is_special(u.scheme) and u.scheme != "file" {
+        return u.scheme + "://" + host(u)
+    }
+    return "null"
+}
+
+fn cannot_have_credentials(u: WhatwgUrl) -> bool {
+    return u.host == None or u.host == Some("") or u.scheme == "file"
+}
+
+/// The `href` setter: the URL replaced, or unchanged if the text does not
+/// parse.
+pub fn set_href(u: WhatwgUrl, value: str) -> WhatwgUrl {
+    return parse(value, None) ?? u
+}
+
+fn rerun(u: WhatwgUrl, value: str, state: i64) -> WhatwgUrl {
+    return run_machine(value, None, u, state) ?? u
+}
+
+pub fn set_protocol(u: WhatwgUrl, value: str) -> WhatwgUrl {
+    return rerun(u, value + ":", 1)
+}
+
+pub fn set_username(u: WhatwgUrl, value: str) -> WhatwgUrl {
+    if cannot_have_credentials(u) {
+        return u
+    }
+    var v = u
+    v.username = encode(value, 5)
+    return v
+}
+
+pub fn set_password(u: WhatwgUrl, value: str) -> WhatwgUrl {
+    if cannot_have_credentials(u) {
+        return u
+    }
+    var v = u
+    v.password = encode(value, 5)
+    return v
+}
+
+pub fn set_host(u: WhatwgUrl, value: str) -> WhatwgUrl {
+    return if u.opaque != None { u } else { rerun(u, value, 11) }
+}
+
+pub fn set_hostname(u: WhatwgUrl, value: str) -> WhatwgUrl {
+    return if u.opaque != None { u } else { rerun(u, value, 12) }
+}
+
+pub fn set_port(u: WhatwgUrl, value: str) -> WhatwgUrl {
+    if cannot_have_credentials(u) {
+        return u
+    }
+    if value.len() == 0 {
+        var v = u
+        v.port = None
+        return v
+    }
+    return rerun(u, value, 13)
+}
+
+pub fn set_pathname(u: WhatwgUrl, value: str) -> WhatwgUrl {
+    if u.opaque != None {
+        return u
+    }
+    var v = u
+    v.path = []
+    return rerun(v, value, 17)
+}
+
+/// Trailing spaces of an opaque path go once nothing follows them.
+fn strip_opaque(u: WhatwgUrl) -> WhatwgUrl {
+    var v = u
+    match u.opaque {
+        Some(o) -> {
+            if u.fragment == None and u.query == None {
+                var t = o
+                while t.ends_with(" ") {
+                    t = t.substr(0, t.len() - 1)
+                }
+                v.opaque = Some(t)
+            }
+        }
+        None -> {}
+    }
+    return v
+}
+
+pub fn set_search(u: WhatwgUrl, value: str) -> WhatwgUrl {
+    var v = u
+    if value.len() == 0 {
+        v.query = None
+        return strip_opaque(v)
+    }
+    let input = if value.starts_with("?") { value.substr(1, value.len() - 1) } else { value }
+    v.query = Some("")
+    return rerun(v, input, 20)
+}
+
+pub fn set_hash(u: WhatwgUrl, value: str) -> WhatwgUrl {
+    var v = u
+    if value.len() == 0 {
+        v.fragment = None
+        return strip_opaque(v)
+    }
+    let input = if value.starts_with("#") { value.substr(1, value.len() - 1) } else { value }
+    v.fragment = Some("")
+    return rerun(v, input, 21)
+}
+
+/// Node's url.domainToASCII: the text given to the hostname setter of
+/// `ws://x` -- so an IPv6 address in brackets is a host, anything from a
+/// `/`, `?` or `#` on is ignored, and a port is an error -- and the
+/// hostname that results; "" when the setter fails.
+pub fn domain_to_ascii_node(domain: str) -> str {
+    let u = parse("ws://x", None) ?? empty_url()
+    return match run_machine_as(domain, None, u, 12, false) {
+        Ok(v) -> hostname(v)
+        Err(_e) -> ""
+    }
+}
+
+/// Node's url.domainToUnicode: domainToASCII, then its `xn--` labels
+/// decoded; "" when it fails.
+pub fn domain_to_unicode_node(domain: str) -> str {
+    let a = domain_to_ascii_node(domain)
+    return if a.len() == 0 { "" } else { uts46.to_unicode(a) }
+}

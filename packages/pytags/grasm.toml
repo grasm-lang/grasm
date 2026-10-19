@@ -1,0 +1,4 @@
+[package]
+name = "pytags"
+version = "1.0.0"
+capabilities = []

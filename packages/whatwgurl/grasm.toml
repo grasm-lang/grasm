@@ -1,0 +1,8 @@
+[package]
+name = "whatwgurl"
+version = "1.0.0"
+capabilities = []
+
+[dependencies.uts46]
+path = "../uts46"
+version = "^1.0.0"

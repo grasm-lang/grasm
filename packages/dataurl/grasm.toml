@@ -1,0 +1,12 @@
+[package]
+name = "dataurl"
+version = "1.0.0"
+capabilities = []
+
+[dependencies.whatwgurl]
+path = "../whatwgurl"
+version = "^1.0.0"
+
+[dependencies.whatwgmime]
+path = "../whatwgmime"
+version = "^1.0.0"

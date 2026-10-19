@@ -1,0 +1,127 @@
+// data: URLs, read as fetch reads them.
+//
+// `data:[<type>][;base64],<body>` looks simple and is full of small
+// decisions: the URL is parsed first (so tabs and newlines vanish and a
+// fragment is cut off), the type is whatever comes before the first
+// comma with its spaces trimmed, `;base64` is recognised case-blind with
+// spaces before it, the body is percent-decoded as bytes and then, if
+// base64, decoded forgivingly (ASCII whitespace ignored, padding
+// optional but not wrong), a type that starts with `;` means text/plain,
+// and a type that does not parse means `text/plain;charset=US-ASCII`.
+//
+// `process` returns the MIME type and the body, or None where fetch
+// fails (no comma, bad base64, not a data: URL); `forgiving_base64` is
+// the Infra Standard's decoder on its own.
+import whatwgurl
+import whatwgmime
+
+type DataUrl = { mime: MimeType, body: bytes }
+
+fn b64_value(c: i64) -> i64 {
+    return if c >= 65 and c <= 90 { c - 65 } else if c >= 97 and c <= 122 { c - 71 } else if c >= 48 and c <= 57 { c + 4 } else if c == 43 { 62 }
+    else if c == 47 { 63 } else { 0 - 1 }
+}
+
+/// The Infra Standard's forgiving-base64 decode; None on failure.
+pub fn forgiving_base64(s: str) -> Option[bytes] {
+    var cs = s.to_bytes().to_list().filter(|c| not (c == 9 or c == 10 or c == 12 or c == 13 or c == 32))
+    if cs.len() % 4 == 0 and cs.len() > 0 {
+        if cs[cs.len() - 1] == 61 {
+            cs = cs.slice(0, cs.len() - 1)
+            if cs[cs.len() - 1] == 61 {
+                cs = cs.slice(0, cs.len() - 1)
+            }
+        }
+    }
+    if cs.len() % 4 == 1 {
+        return None
+    }
+    var out: [i64] = []
+    var buffer = 0
+    var bits = 0
+    for c in cs {
+        let v = b64_value(c)
+        if v < 0 {
+            return None
+        }
+        buffer = buffer.shl(6).bit_or(v)
+        bits = bits + 6
+        if bits >= 8 {
+            bits = bits - 8
+            out.push(buffer.ushr(bits).bit_and(255))
+        }
+    }
+    return Some(bytes_of(out))
+}
+
+fn latin1(b: bytes) -> str {
+    var cs: [i64] = []
+    for x in b.to_list() {
+        if x < 128 {
+            cs.push(x)
+        } else {
+            cs.push(192 + x.ushr(6))
+            cs.push(128 + x.bit_and(63))
+        }
+    }
+    return bytes_of(cs).to_str()
+}
+
+fn ascii_space(c: i64) -> bool {
+    return c == 9 or c == 10 or c == 12 or c == 13 or c == 32
+}
+
+fn trim_ascii(s: str) -> str {
+    let cs = s.to_bytes().to_list()
+    var a = 0
+    var b = cs.len()
+    while a < b and ascii_space(cs[a]) {
+        a = a + 1
+    }
+    while b > a and ascii_space(cs[b - 1]) {
+        b = b - 1
+    }
+    return bytes_of(cs.slice(a, b)).to_str()
+}
+
+/// The data: URL processor over a parsed URL.
+pub fn process(u: WhatwgUrl) -> Option[DataUrl] {
+    if u.scheme != "data" {
+        return None
+    }
+    let input = whatwgurl.serialize(u, false)
+    let rest = input.substr(5, input.len() - 5)
+    let comma = rest.index_of(",") ?? 0 - 1
+    if comma < 0 {
+        return None
+    }
+    var mime = trim_ascii(rest.substr(0, comma))
+    var body = whatwgurl.percent_decode(rest.substr(comma + 1, rest.len() - comma - 1).to_bytes())
+    // `;base64`, case-blind, with spaces allowed between the two.
+    if mime.to_lower().ends_with("base64") {
+        var m = mime.substr(0, mime.len() - 6)
+        while m.ends_with(" ") {
+            m = m.substr(0, m.len() - 1)
+        }
+        if m.ends_with(";") {
+            match forgiving_base64(latin1(body)) {
+                Some(b) -> body = b
+                None -> return None
+            }
+            mime = m.substr(0, m.len() - 1)
+        }
+    }
+    if mime.starts_with(";") {
+        mime = "text/plain" + mime
+    }
+    let fallback = MimeType{ kind: "text", subtype: "plain", params: [("charset", "US-ASCII")] }
+    return Some(DataUrl{ mime: whatwgmime.parse(mime) ?? fallback, body: body })
+}
+
+/// `fetch("data:...")`: the URL parsed, then processed.
+pub fn process_text(url: str) -> Option[DataUrl] {
+    return match whatwgurl.parse(url, None) {
+        Ok(u) -> process(u)
+        Err(_e) -> None
+    }
+}

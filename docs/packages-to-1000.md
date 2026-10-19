@@ -260,6 +260,32 @@ becomes buildable the day its reference is installed.
 
 ## Landed
 
+- [x] **B43: the web's URLs and the package managers' specifiers** —
+  `uts46` `whatwgurl` `urlsearchparams` `whatwgmime` `dataurl` (B20's
+  data URLs), `hostedgit` `nodesemver` `npmspec` `negotiator` `pytags`,
+  and the harness `b43test`; the new gate `b43diff` runs 110 cases of
+  about a hundred inputs each, in 11 families: URLs parsed with every
+  getter and changed by every setter, domains to ASCII and back, form
+  data and URLSearchParams, MIME types and data: URLs against Node 25
+  (ada 3.3, util.MIMEType, fetch); hosted-git-info, node-semver (loose
+  and prerelease modes), npm-package-arg and negotiator against the
+  copies inside npm; wheel tags and a wheel's rank against pip's
+  packaging 24.1. The URL parser also passes 888 of WPT's 896 URL tests
+  and 276 of its 278 setter tests; the rest follow a 2025 change (an
+  invalid `xn--` label left alone) that Node 25 does not have either.
+  Node's own bugs are left out of the gate and counted, not copied: a
+  `#` anywhere accepted against an opaque base, a file path's first
+  segment kept when it merely starts like a drive letter, two setter
+  cases where WPT agrees with the code here, and util.MIMEType's
+  untrimmed input. UTS #46 follows ada where the standard leaves room:
+  the bidi rule and ContextJ as ada applies them, its tables for marks,
+  viramas, joining types and bidi classes. node-semver is ported with
+  its own regular expressions run by `packages/regex`, whose priorities
+  are JavaScript's; the bounded `safeRe` forms are used only where a run
+  passes 250 characters, which is 36 times faster and gives the same
+  answers. One break per package turned the gate red. The count reaches
+  971.
+
 - [x] **B42: object files, debug lines, SQLite's side files, machine
   code and Go source** — B26's `symtab` `machofat` `x86len` `sqlitewal`
   `sqlitejournal`, its `codesign` as `codesig` and `gosyntax` begun as
@@ -843,7 +869,7 @@ becomes buildable the day its reference is installed.
 | | |
 |---|---|
 | At the start | 669 |
-| Now | 960 |
+| Now | 971 |
 | Candidates above | 316 packages in 28 batches, plus `ecc`, `rfc6979` and `goprintf` |
 | Harnesses, one a batch | 28 |
 | If every candidate lands | 1016 |

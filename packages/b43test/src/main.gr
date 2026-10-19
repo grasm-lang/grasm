@@ -1,0 +1,227 @@
+// The harness scripts/b43_diff.py drives. Each case file holds one input
+// per line; the answer is one line, the inputs' answers joined by `;`,
+// every text hex-encoded so nothing in it can be mistaken for structure.
+import whatwgurl
+import urlsearchparams
+import whatwgmime
+import dataurl
+import hostedgit
+import nodesemver
+import npmspec
+import negotiator
+import pytags
+
+fn hexs(s: str) -> str {
+    let digits = "0123456789abcdef"
+    var parts: [str] = []
+    for x in s.to_bytes().to_list() {
+        parts.push(digits.substr(x.ushr(4), 1) + digits.substr(x.bit_and(15), 1))
+    }
+    return parts.join("")
+}
+
+fn bhex(b: bytes) -> str {
+    let digits = "0123456789abcdef"
+    var parts: [str] = []
+    for x in b.to_list() {
+        parts.push(digits.substr(x.ushr(4), 1) + digits.substr(x.bit_and(15), 1))
+    }
+    return parts.join("")
+}
+
+/// Hex back to text; "-" and "_" stand for the empty string.
+fn unhex(h: str) -> str {
+    if h == "-" or h == "_" {
+        return ""
+    }
+    var out: [i64] = []
+    let b = h.to_bytes()
+    var i = 0
+    while i + 1 < b.len() {
+        let hi = b.at(i)
+        let lo = b.at(i + 1)
+        out.push((if hi >= 97 { hi - 87 } else { hi - 48 }) * 16 + (if lo >= 97 { lo - 87 } else { lo - 48 }))
+        i = i + 2
+    }
+    return bytes_of(out).to_str()
+}
+
+fn o(x: Option[str]) -> str {
+    return match x {
+        Some(s) -> hexs(s)
+        None -> "-"
+    }
+}
+
+fn url_fields(u: WhatwgUrl) -> str {
+    return [whatwgurl.href(u), whatwgurl.origin(u), whatwgurl.protocol(u), u.username, u.password, whatwgurl.host(u), whatwgurl.hostname(u),
+        whatwgurl.port_text(u), whatwgurl.pathname(u), whatwgurl.search(u), whatwgurl.hash(u)].map(|x| hexs(x)).join(",")
+}
+
+fn url_line(f: [str]) -> str {
+    let base = if f[1] == "-" { None } else {
+        match whatwgurl.parse(unhex(f[1]), None) {
+            Ok(b) -> Some(b)
+            Err(_e) -> return "BADBASE"
+        }
+    }
+    return match whatwgurl.parse(unhex(f[0]), base) {
+        Ok(u) -> url_fields(u)
+        Err(_e) -> "FAIL"
+    }
+}
+
+fn set_line(f: [str]) -> str {
+    let u = match whatwgurl.parse(unhex(f[0]), None) {
+        Ok(x) -> x
+        Err(_e) -> return "BADURL"
+    }
+    let s = unhex(f[1])
+    let v = unhex(f[2])
+    let r = if s == "href" { whatwgurl.set_href(u, v) } else if s == "protocol" { whatwgurl.set_protocol(u, v) } else if s == "username" { whatwgurl.set_username(u, v) }
+    else if s == "password" { whatwgurl.set_password(u, v) } else if s == "host" { whatwgurl.set_host(u, v) } else if s == "hostname" { whatwgurl.set_hostname(u, v) }
+    else if s == "port" { whatwgurl.set_port(u, v) } else if s == "pathname" { whatwgurl.set_pathname(u, v) } else if s == "search" { whatwgurl.set_search(u, v) }
+    else { whatwgurl.set_hash(u, v) }
+    return hexs(whatwgurl.href(r))
+}
+
+fn web_line(op: str, f: [str]) -> str {
+    let v = unhex(f[0])
+    if op == "domain" {
+        let a = whatwgurl.domain_to_ascii_node(v)
+        return (if a.len() == 0 { "-" } else { hexs(a) }) + "," + hexs(whatwgurl.domain_to_unicode_node(v))
+    }
+    if op == "qs" {
+        let ps = urlsearchparams.from_string(v)
+        return hexs(urlsearchparams.serialize(ps)) + "," + hexs(urlsearchparams.serialize(urlsearchparams.sort(ps))) + "," +
+        hexs(ps.map(|p| p.name + "=" + p.value).join("&"))
+    }
+    if op == "mime" {
+        return match whatwgmime.parse(v) {
+            Some(m) -> hexs(whatwgmime.serialize(m)) + "," + hexs(whatwgmime.essence(m))
+            None -> "FAIL"
+        }
+    }
+    return match dataurl.process_text(v) {
+        Some(d) -> hexs(whatwgmime.serialize(d.mime)) + "," + bhex(d.body)
+        None -> "FAIL"
+    }
+}
+
+fn hosted_line(f: [str]) -> str {
+    let plain = GitRender{ path: "", fragment: None, no_git_plus: false, no_committish: false }
+    let h = match hostedgit.from_url(unhex(f[0])) {
+        Some(x) -> x
+        None -> return "NONE"
+    }
+    var parts = [hexs(h.kind), o(h.user), o(h.auth), hexs(h.project), o(h.committish), hexs(h.default)]
+    for w in ["ssh", "sshurl", "docs", "bugs", "https", "git", "shortcut", "path", "tarball", "browse"] {
+        parts.push(o(hostedgit.render(h, w, plain)))
+    }
+    parts.push(o(hostedgit.render(h, "browse", GitRender{ path: "/a/b", fragment: None, no_git_plus: false, no_committish: false })))
+    parts.push(o(hostedgit.render(h, "browse", GitRender{ path: "a/b", fragment: Some("Some Frag!"), no_git_plus: false, no_committish: false })))
+    parts.push(o(hostedgit.render(h, "browsefile", GitRender{ path: "x.js", fragment: None, no_git_plus: false, no_committish: false })))
+    parts.push(o(hostedgit.render(h, "file", GitRender{ path: "p/q.txt", fragment: None, no_git_plus: false, no_committish: false })))
+    parts.push(o(hostedgit.render(h, "edit", GitRender{ path: "e.md", fragment: None, no_git_plus: false, no_committish: false })))
+    parts.push(o(hostedgit.render(h, "https", GitRender{ path: "", fragment: None, no_git_plus: true, no_committish: true })))
+    parts.push(o(hostedgit.to_string(h, plain)))
+    return parts.join(",")
+}
+
+fn semver_line(r: NsRegexes, f: [str]) -> str {
+    let v = unhex(f[0])
+    let rg = unhex(f[1])
+    let versions = f[2].split(",").map(|h| unhex(h))
+    var out: [str] = []
+    for loose in [false, true] {
+        out.push(o(nodesemver.valid(r, v, loose)))
+        out.push(o(nodesemver.clean(r, v, loose)))
+        for pre in [false, true] {
+            out.push(o(nodesemver.valid_range(r, rg, loose, pre)))
+            out.push(if nodesemver.satisfies(r, v, rg, loose, pre) { "T" } else { "F" })
+            out.push(o(nodesemver.best_satisfying(r, versions, rg, loose, pre, true)))
+            out.push(o(nodesemver.best_satisfying(r, versions, rg, loose, pre, false)))
+        }
+    }
+    return out.join(",")
+}
+
+fn npa_line(r: NsRegexes, f: [str]) -> str {
+    return match npmspec.parse_with(r, unhex(f[0]), "/w/proj", "/home/u") {
+        Ok(s) -> [hexs(s.kind), o(s.name), o(s.escaped_name), o(s.scope), hexs(s.raw_spec), o(s.save_spec), o(s.fetch_spec), o(s.git_range),
+            o(s.git_committish), o(s.git_subdir), if s.registry { "T" } else { "-" }, o(s.sub_spec), hexs(npmspec.to_string(s))].join(",")
+        Err(_e) -> "ERR"
+    }
+}
+
+fn neg_line(f: [str]) -> str {
+    let accept = if f[1] == "-" { None } else { Some(unhex(f[1])) }
+    let offers = if f[2] == "-" { None } else { Some(if f[2] == "_" { [] } else { f[2].split(",").map(|h| unhex(h)) }) }
+    let pref = if f.len() > 3 and f[3] != "-" { Some(f[3].split(",").map(|h| unhex(h))) } else { None }
+    let out = if f[0] == "m" { negotiator.media_types(accept, offers) } else if f[0] == "c" { negotiator.charsets(accept, offers) }
+    else if f[0] == "e" { negotiator.encodings(accept, offers, pref) } else { negotiator.languages(accept, offers) }
+    return out.map(|s| hexs(s)).join(",") + "."
+}
+
+fn ints(s: str) -> [i64] {
+    return s.split(".").map(|x| x.parse_int() ?? 0)
+}
+
+fn names(s: str) -> [str] {
+    return if s == "_" { [] } else { s.split(",") }
+}
+
+fn ts(xs: [PyTag]) -> str {
+    return xs.map(|t| pytags.tag_text(t)).join(" ")
+}
+
+fn tags_line(f: [str]) -> str {
+    if f[0] == "cp" {
+        return hexs(ts(pytags.cpython_tags(ints(f[1]), names(f[2]), names(f[3]))))
+    }
+    if f[0] == "gen" {
+        return hexs(ts(pytags.generic_tags(f[1], names(f[2]), names(f[3]))))
+    }
+    if f[0] == "compat" {
+        return hexs(ts(pytags.compatible_tags(ints(f[1]), if f[2] == "_" { None } else { Some(f[2]) }, names(f[3]))))
+    }
+    if f[0] == "mac" {
+        let v = ints(f[1])
+        return hexs(pytags.mac_platforms((v[0], v[1]), f[2]).join(" "))
+    }
+    if f[0] == "rank" {
+        let supported = pytags.cpython_tags(ints(f[1]), names(f[2]), names(f[3])) + pytags.compatible_tags(ints(f[1]), None, names(f[3]))
+        var wheel: [PyTag] = []
+        for t in names(f[4]) {
+            wheel = wheel + (pytags.parse_tag(unhex(t)) ?? [])
+        }
+        return match pytags.rank(supported, wheel) {
+            Some(i) -> "{i}"
+            None -> "-"
+        }
+    }
+    return match pytags.parse_tag(unhex(f[1])) {
+        Some(t) -> hexs(ts(t))
+        None -> "ERR"
+    }
+}
+
+fn line(op: str, r: NsRegexes, l: str) -> str {
+    let f = l.split(" ")
+    return if op == "url" { url_line(f) } else if op == "set" { set_line(f) } else if op == "hosted" { hosted_line(f) } else if op == "semver" { semver_line(r, f) }
+    else if op == "npa" { npa_line(r, f) } else if op == "neg" { neg_line(f) } else if op == "tags" { tags_line(f) } else { web_line(op, f) }
+}
+
+fn main() / {io} {
+    let argv = args()
+    let r = nodesemver.regexes()
+    var i = 0
+    while i + 1 < argv.len() {
+        let out = match read_bytes(argv[i + 1]) {
+            Ok(data) -> data.to_str().split("\n").filter(|l| l.len() > 0).map(|l| line(argv[i], r, l)).join(";")
+            Err(_) -> "NOFILE"
+        }
+        print(out)
+        i = i + 2
+    }
+}

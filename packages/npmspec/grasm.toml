@@ -1,0 +1,20 @@
+[package]
+name = "npmspec"
+version = "1.0.0"
+capabilities = []
+
+[dependencies.hostedgit]
+path = "../hostedgit"
+version = "^1.0.0"
+
+[dependencies.nodesemver]
+path = "../nodesemver"
+version = "^1.0.0"
+
+[dependencies.npmname]
+path = "../npmname"
+version = "^1.0.0"
+
+[dependencies.whatwgurl]
+path = "../whatwgurl"
+version = "^1.0.0"

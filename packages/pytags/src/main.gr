@@ -1,0 +1,257 @@
+// Python wheel compatibility tags, as pip chooses wheels (packaging 24.1).
+//
+// A wheel says what it runs on in three parts -- interpreter, ABI,
+// platform: `cp312-cp312-macosx_11_0_arm64`, `py3-none-any`, or a
+// compressed set like `cp39.cp310-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64`.
+// An installer lists, best first, every tag the running interpreter
+// accepts, and installs the wheel whose best tag comes earliest. That
+// list has a precise order: the interpreter's own ABIs on each platform,
+// then abi3 and `none`, then abi3 for each older CPython minor; then
+// pure-Python tags for this version and every older one, platform first
+// and `any` last. On macOS the platforms run from the running release
+// down, each with its binary formats (`arm64`, `universal2`; for Intel
+// `x86_64`, `intel`, `fat64`, `fat32`, `universal`), then the 10.x
+// releases a newer system still accepts.
+//
+// `parse_tag` expands a tag set; `cpython_tags`, `generic_tags`,
+// `compatible_tags` and `mac_platforms` are packaging's functions with
+// every input given (nothing is read from the running system); `rank`
+// is where a wheel's tags first appear in a supported list.
+
+type PyTag = { interpreter: str, abi: str, platform: str }
+
+pub fn tag(i: str, a: str, p: str) -> PyTag {
+    return PyTag{ interpreter: i.to_lower(), abi: a.to_lower(), platform: p.to_lower() }
+}
+
+pub fn tag_text(t: PyTag) -> str {
+    return t.interpreter + "-" + t.abi + "-" + t.platform
+}
+
+/// The tags a (possibly compressed) tag stands for, sorted; None unless
+/// it has exactly three parts.
+pub fn parse_tag(text: str) -> Option[[PyTag]] {
+    let parts = text.split("-")
+    if parts.len() != 3 {
+        return None
+    }
+    var out: [PyTag] = []
+    for i in parts[0].split(".") {
+        for a in parts[1].split(".") {
+            for p in parts[2].split(".") {
+                let t = tag(i, a, p)
+                if out.filter(|x| tag_text(x) == tag_text(t)).len() == 0 {
+                    out.push(t)
+                }
+            }
+        }
+    }
+    out.sort_by(|t| tag_text(t))
+    return Some(out)
+}
+
+fn nodot(v: [i64]) -> str {
+    return v.map(|x| "{x}").join("")
+}
+
+fn at_least(v: [i64], major: i64, minor: i64) -> bool {
+    if v[0] != major {
+        return v[0] > major
+    }
+    return v.len() > 1 and v[1] >= minor
+}
+
+fn remove_first(xs: [str], x: str) -> [str] {
+    var out: [str] = []
+    var gone = false
+    for y in xs {
+        if y == x and not gone {
+            gone = true
+        } else {
+            out.push(y)
+        }
+    }
+    return out
+}
+
+fn threaded(abis: [str]) -> bool {
+    if abis.len() == 0 or not abis[0].starts_with("cp") {
+        return false
+    }
+    let b = abis[0].to_bytes()
+    var k = 2
+    while k < b.len() and b.at(k) >= 48 and b.at(k) <= 57 {
+        k = k + 1
+    }
+    if k == 2 {
+        return false
+    }
+    return abis[0].substr(k, abis[0].len() - k).contains("t")
+}
+
+/// cpython_tags(python_version, abis, platforms).
+pub fn cpython_tags(version: [i64], abis0: [str], platforms: [str]) -> [PyTag] {
+    let interp = "cp" + nodot(version.slice(0, if version.len() > 2 { 2 } else { version.len() }))
+    let abis = remove_first(remove_first(abis0, "abi3"), "none")
+    var out: [PyTag] = []
+    for a in abis {
+        for p in platforms {
+            out.push(tag(interp, a, p))
+        }
+    }
+    let abi3 = version.len() > 1 and at_least(version, 3, 2) and not threaded(abis)
+    if abi3 {
+        for p in platforms {
+            out.push(tag(interp, "abi3", p))
+        }
+    }
+    for p in platforms {
+        out.push(tag(interp, "none", p))
+    }
+    if abi3 {
+        var minor = version[1] - 1
+        while minor > 1 {
+            for p in platforms {
+                out.push(tag("cp" + nodot([version[0], minor]), "abi3", p))
+            }
+            minor = minor - 1
+        }
+    }
+    return out
+}
+
+/// generic_tags(interpreter, abis, platforms): `none` added when absent.
+pub fn generic_tags(interpreter: str, abis0: [str], platforms: [str]) -> [PyTag] {
+    let abis = if abis0.contains("none") { abis0 } else { abis0 + ["none"] }
+    var out: [PyTag] = []
+    for a in abis {
+        for p in platforms {
+            out.push(tag(interpreter, a, p))
+        }
+    }
+    return out
+}
+
+fn py_range(version: [i64]) -> [str] {
+    var out: [str] = []
+    if version.len() > 1 {
+        out.push("py" + nodot(version.slice(0, 2)))
+    }
+    out.push("py{version[0]}")
+    if version.len() > 1 {
+        var minor = version[1] - 1
+        while minor >= 0 {
+            out.push("py" + nodot([version[0], minor]))
+            minor = minor - 1
+        }
+    }
+    return out
+}
+
+/// compatible_tags(python_version, interpreter, platforms).
+pub fn compatible_tags(version: [i64], interpreter: Option[str], platforms: [str]) -> [PyTag] {
+    var out: [PyTag] = []
+    for v in py_range(version) {
+        for p in platforms {
+            out.push(tag(v, "none", p))
+        }
+    }
+    match interpreter {
+        Some(i) -> {
+            if i.len() > 0 {
+                out.push(tag(i, "none", "any"))
+            }
+        }
+        None -> {}
+    }
+    for v in py_range(version) {
+        out.push(tag(v, "none", "any"))
+    }
+    return out
+}
+
+fn before(a: (i64, i64), b: (i64, i64)) -> bool {
+    return a.0 < b.0 or (a.0 == b.0 and a.1 < b.1)
+}
+
+/// _mac_binary_formats(version, arch).
+pub fn mac_binary_formats(version: (i64, i64), arch: str) -> [str] {
+    var formats = [arch]
+    if arch == "x86_64" {
+        if before(version, (10, 4)) {
+            return []
+        }
+        formats = formats + ["intel", "fat64", "fat32"]
+    } else if arch == "i386" {
+        if before(version, (10, 4)) {
+            return []
+        }
+        formats = formats + ["intel", "fat32", "fat"]
+    } else if arch == "ppc64" {
+        if before((10, 5), version) or before(version, (10, 4)) {
+            return []
+        }
+        formats.push("fat64")
+    } else if arch == "ppc" {
+        if before((10, 6), version) {
+            return []
+        }
+        formats = formats + ["fat32", "fat"]
+    }
+    if arch == "arm64" or arch == "x86_64" {
+        formats.push("universal2")
+    }
+    if ["x86_64", "i386", "ppc64", "ppc", "intel"].contains(arch) {
+        formats.push("universal")
+    }
+    return formats
+}
+
+/// mac_platforms(version, arch).
+pub fn mac_platforms(version: (i64, i64), arch: str) -> [str] {
+    var out: [str] = []
+    if not before(version, (10, 0)) and before(version, (11, 0)) {
+        var minor = version.1
+        while minor >= 0 {
+            for f in mac_binary_formats((10, minor), arch) {
+                out.push("macosx_10_{minor}_" + f)
+            }
+            minor = minor - 1
+        }
+    }
+    if not before(version, (11, 0)) {
+        var major = version.0
+        while major > 10 {
+            for f in mac_binary_formats((major, 0), arch) {
+                out.push("macosx_{major}_0_" + f)
+            }
+            major = major - 1
+        }
+        var minor = 16
+        while minor > 3 {
+            if arch == "x86_64" {
+                for f in mac_binary_formats((10, minor), arch) {
+                    out.push("macosx_10_{minor}_" + f)
+                }
+            } else {
+                out.push("macosx_10_{minor}_universal2")
+            }
+            minor = minor - 1
+        }
+    }
+    return out
+}
+
+/// Where a wheel's best tag stands in a supported list (lower is
+/// better), or None if no tag of the wheel is supported.
+pub fn rank(supported: [PyTag], wheel: [PyTag]) -> Option[i64] {
+    for i in 0..supported.len() {
+        let t = tag_text(supported[i])
+        for w in wheel {
+            if tag_text(w) == t {
+                return Some(i)
+            }
+        }
+    }
+    return None
+}

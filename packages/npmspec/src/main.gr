@@ -1,0 +1,515 @@
+// Package specifiers as npm reads them (npm-package-arg 13).
+//
+// Everything after `npm install` is a specifier: `lodash`, `lodash@^4`,
+// `@scope/pkg@next`, `alias@npm:react@18`, `github:user/repo#semver:^2`,
+// `git+ssh://git@host:repo.git#path:packages/a`, `https://x/y.tgz`,
+// `./local/dir`, `file:../x.tgz`, `~/code/pkg`. Each becomes a typed
+// result -- version, range, tag, alias, git, remote, file or directory --
+// with the name, the spec to save in package.json and the spec to fetch.
+// The rules are npm's, not tidier ones: a name is validated by npm's name
+// rules, versions and ranges by node-semver in loose mode, hosted
+// repositories by hosted-git-info, a tag may hold only what
+// encodeURIComponent leaves alone, and file paths become file: URLs
+// resolved against the directory npm runs in and the home directory.
+//
+// `parse(arg, where, home)` returns the result, or an error where npm
+// throws. Paths are POSIX.
+import hostedgit
+import nodesemver
+import npmname
+import whatwgurl
+
+type NpmSpec = {
+    kind: str,
+    raw: str,
+    name: Option[str],
+    escaped_name: Option[str],
+    scope: Option[str],
+    raw_spec: str,
+    save_spec: Option[str],
+    fetch_spec: Option[str],
+    git_range: Option[str],
+    git_committish: Option[str],
+    git_subdir: Option[str],
+    registry: bool,
+    sub_spec: Option[str],
+}
+
+type NpmSpecError =
+    | NpmInvalidName(name: str)
+    | NpmInvalidTag(tag: str)
+    | NpmUnsupportedUrl(protocol: str)
+    | NpmInvalid(why: str)
+
+fn starts_ci(s: str, prefix: str) -> bool {
+    return s.to_lower().starts_with(prefix)
+}
+
+fn byte_index(s: str, c: i64, from: i64) -> i64 {
+    let b = s.to_bytes()
+    var i = from
+    while i < b.len() {
+        if b.at(i) == c {
+            return i
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+fn cut(s: str, a: i64, z: i64) -> str {
+    let b = s.to_bytes()
+    let lo = if a < 0 { 0 } else if a > b.len() { b.len() } else { a }
+    let hi = if z < lo { lo } else if z > b.len() { b.len() } else { z }
+    return bytes_of(b.slice(lo, hi).to_list()).to_str()
+}
+
+fn rest(s: str, a: i64) -> str {
+    return cut(s, a, s.to_bytes().len())
+}
+
+/// /^(?:git[+])?[a-z]+:/i
+fn is_url(s: str) -> bool {
+    var t = s.to_lower()
+    if t.starts_with("git+") {
+        t = rest(t, 4)
+    }
+    let b = t.to_bytes()
+    var i = 0
+    while i < b.len() and b.at(i) >= 97 and b.at(i) <= 122 {
+        i = i + 1
+    }
+    return i > 0 and i < b.len() and b.at(i) == 58
+}
+
+/// /^[^@]+@[^:.]+\.[^:]+:.+$/i
+fn is_git(s: str) -> bool {
+    let at = byte_index(s, 64, 0)
+    if at <= 0 {
+        return false
+    }
+    let after = rest(s, at + 1)
+    let colon = byte_index(after, 58, 0)
+    if colon < 0 or colon + 1 >= after.to_bytes().len() {
+        return false
+    }
+    let host = cut(after, 0, colon)
+    let dot = byte_index(host, 46, 0)
+    // [^:.]+ then \. then [^:]+ : the host has a dot with text either side.
+    return dot > 0 and dot + 1 < host.to_bytes().len()
+}
+
+fn has_slash(s: str) -> bool {
+    return byte_index(s, 47, 0) >= 0
+}
+
+fn is_file_type(s: str) -> bool {
+    let l = s.to_lower()
+    return l.ends_with(".tgz") or l.ends_with(".tar.gz") or l.ends_with(".tar")
+}
+
+/// /^(?:[.]|~[/]|[/]|[a-zA-Z]:)/
+fn is_posix_file(s: str) -> bool {
+    let b = s.to_bytes()
+    if b.len() == 0 {
+        return false
+    }
+    let c = b.at(0)
+    if c == 46 or c == 47 {
+        return true
+    }
+    if c == 126 and b.len() > 1 and b.at(1) == 47 {
+        return true
+    }
+    return b.len() > 1 and ((c >= 65 and c <= 90) or (c >= 97 and c <= 122)) and b.at(1) == 58
+}
+
+fn empty_spec(raw: str, name: Option[str], spec: str) -> NpmSpec ! NpmSpecError {
+    var r = NpmSpec{ kind: "", raw: raw, name: None, escaped_name: None, scope: None, raw_spec: spec, save_spec: None, fetch_spec: None, git_range: None,
+        git_committish: None, git_subdir: None, registry: false, sub_spec: None }
+    match name {
+        Some(n) -> {
+            if n.len() > 0 {
+                if not npmname.validate(n).valid_for_old {
+                    fail(NpmInvalidName(n))
+                }
+                r.name = Some(n)
+                let slash = byte_index(n, 47, 0)
+                r.scope = if n.starts_with("@") { Some(cut(n, 0, if slash < 0 { n.to_bytes().len() - 1 } else { slash })) } else { None }
+                r.escaped_name = Some(if slash < 0 { n } else { cut(n, 0, slash) + "%2f" + rest(n, slash + 1) })
+            }
+        }
+        None -> {}
+    }
+    return r
+}
+
+fn set_git_attrs(r: NpmSpec, committish: Option[str]) -> NpmSpec ! NpmSpecError {
+    var res = r
+    let c = committish ?? ""
+    if c.len() == 0 {
+        res.git_committish = None
+        return res
+    }
+    for part in c.split("::") {
+        if not part.contains(":") {
+            if res.git_range != None {
+                fail(NpmInvalid("cannot override existing semver range with a committish"))
+            }
+            if res.git_committish != None {
+                fail(NpmInvalid("cannot override existing committish with a second committish"))
+            }
+            res.git_committish = Some(part)
+            continue
+        }
+        let kv = part.split(":")
+        let value = kv[1]
+        if kv[0] == "semver" {
+            if res.git_committish != None or res.git_range != None {
+                fail(NpmInvalid("a second semver range or a committish"))
+            }
+            res.git_range = Some(hostedgit.decode_uri_component(value) ?? fail(NpmInvalid("URI malformed")))
+        } else if kv[0] == "path" {
+            if res.git_subdir != None {
+                fail(NpmInvalid("cannot override existing path with a second path"))
+            }
+            res.git_subdir = Some("/" + value)
+        }
+    }
+    return res
+}
+
+fn from_hosted(r: NpmSpec, h: GitHost) -> NpmSpec ! NpmSpecError {
+    var res = r
+    res.kind = "git"
+    res.save_spec = hostedgit.to_string(h, GitRender{ path: "", fragment: None, no_git_plus: false, no_committish: false })
+    res.fetch_spec = if h.default == "shortcut" { None } else { hostedgit.to_string(h, GitRender{ path: "", fragment: None, no_git_plus: true, no_committish: true }) }
+    return try set_git_attrs(res, h.committish)
+}
+
+/// /^git\+ssh:\/\/([^:#]+:[^#]+(?:\.git)?)(?:#(.*))?$/i, and the port
+/// check after it: (location, committish), or None.
+fn scp_inside_ssh(raw: str) -> Option[(str, Option[str])] {
+    if not starts_ci(raw, "git+ssh://") {
+        return None
+    }
+    let body = rest(raw, 10)
+    let hash = byte_index(body, 35, 0)
+    let loc = if hash < 0 { body } else { cut(body, 0, hash) }
+    let colon = byte_index(loc, 58, 0)
+    if colon <= 0 or colon + 1 >= loc.to_bytes().len() {
+        return None
+    }
+    // :[0-9]+(\/|$) anywhere in the location means a port, not scp.
+    let b = loc.to_bytes()
+    var i = 0
+    while i < b.len() {
+        if b.at(i) == 58 {
+            var k = i + 1
+            while k < b.len() and b.at(k) >= 48 and b.at(k) <= 57 {
+                k = k + 1
+            }
+            if k > i + 1 and (k == b.len() or b.at(k) == 47) {
+                return None
+            }
+        }
+        i = i + 1
+    }
+    return Some((loc, if hash < 0 { None } else { Some(rest(body, hash + 1)) }))
+}
+
+fn from_url(r: NpmSpec) -> NpmSpec ! NpmSpecError {
+    var res = r
+    var raw = r.raw_spec
+    res.save_spec = Some(raw)
+    if raw.starts_with("git+ssh:") {
+        match scp_inside_ssh(raw) {
+            Some((loc, committish)) -> {
+                res.kind = "git"
+                res = try set_git_attrs(res, committish)
+                res.fetch_spec = Some(loc)
+                return res
+            }
+            None -> {}
+        }
+    } else if raw.starts_with("git+file://") {
+        raw = raw.split("\\").join("/")
+    }
+    let u = whatwgurl.parse(raw, None) ?? fail(NpmInvalid("Invalid URL"))
+    let proto = u.scheme + ":"
+    if ["git:", "git+http:", "git+https:", "git+rsync:", "git+ftp:", "git+file:", "git+ssh:"].contains(proto) {
+        res.kind = "git"
+        res = try set_git_attrs(res, Some(rest(whatwgurl.hash(u), 1)))
+        let drive = starts_ci(raw, "git+file://") and raw.to_bytes().len() > 12 and is_alpha(raw.to_bytes().at(11)) and raw.to_bytes().at(12) == 58
+        var f = if proto == "git+file:" and drive { "git+file://" + whatwgurl.host(u).to_lower() + ":" + whatwgurl.pathname(u) }
+        else { whatwgurl.href(whatwgurl.set_hash(u, "")) }
+        if f.starts_with("git+") {
+            f = rest(f, 4)
+        }
+        res.fetch_spec = Some(f)
+        return res
+    }
+    if proto == "http:" or proto == "https:" {
+        res.kind = "remote"
+        res.fetch_spec = res.save_spec
+        return res
+    }
+    fail(NpmUnsupportedUrl(proto))
+}
+
+fn is_alpha(c: i64) -> bool {
+    return (c >= 65 and c <= 90) or (c >= 97 and c <= 122)
+}
+
+fn encode_uri_component_same(s: str) -> bool {
+    return hostedgit.encode_uri_component(s) == s
+}
+
+fn from_registry(rx: NsRegexes, r: NpmSpec) -> NpmSpec ! NpmSpecError {
+    var res = r
+    res.registry = true
+    let spec = js_trim(r.raw_spec)
+    res.save_spec = None
+    res.fetch_spec = Some(spec)
+    if nodesemver.valid(rx, spec, true) != None {
+        res.kind = "version"
+    } else if nodesemver.valid_range(rx, spec, true, false) != None {
+        res.kind = "range"
+    } else {
+        if not encode_uri_component_same(spec) {
+            fail(NpmInvalidTag(spec))
+        }
+        res.kind = "tag"
+    }
+    return res
+}
+
+fn js_trim(s: str) -> str {
+    let b = s.to_bytes().to_list()
+    var a = 0
+    var z = b.len()
+    while a < z and (b[a] == 32 or (b[a] >= 9 and b[a] <= 13)) {
+        a = a + 1
+    }
+    while z > a and (b[z - 1] == 32 or (b[z - 1] >= 9 and b[z - 1] <= 13)) {
+        z = z - 1
+    }
+    return bytes_of(b.slice(a, z)).to_str()
+}
+
+// --- POSIX paths ---------------------------------------------------------------
+
+/// path.posix.normalize of an absolute path, as resolve leaves it.
+fn normalize_abs(p: str) -> str {
+    var out: [str] = []
+    for seg in p.split("/") {
+        if seg.len() == 0 or seg == "." {
+            continue
+        }
+        if seg == ".." {
+            if out.len() > 0 {
+                out = out.slice(0, out.len() - 1)
+            }
+            continue
+        }
+        out.push(seg)
+    }
+    return "/" + out.join("/")
+}
+
+/// path.posix.resolve: right to left until a path is absolute.
+pub fn resolve(parts: [str]) -> str {
+    var acc = ""
+    var i = parts.len() - 1
+    while i >= 0 {
+        let p = parts[i]
+        if p.len() > 0 {
+            acc = if acc.len() == 0 { p } else { p + "/" + acc }
+            if p.starts_with("/") {
+                break
+            }
+        }
+        i = i - 1
+    }
+    return normalize_abs(acc)
+}
+
+/// path.posix.relative between two absolute paths.
+pub fn relative(from: str, to: str) -> str {
+    let a = normalize_abs(from).split("/").filter(|s| s.len() > 0)
+    let b = normalize_abs(to).split("/").filter(|s| s.len() > 0)
+    var k = 0
+    while k < a.len() and k < b.len() and a[k] == b[k] {
+        k = k + 1
+    }
+    var out: [str] = []
+    for _i in k..a.len() {
+        out.push("..")
+    }
+    for i in k..b.len() {
+        out.push(b[i])
+    }
+    return out.join("/")
+}
+
+/// npm-package-arg's pathToFileURL: a few characters escaped, `file:` in
+/// front unless already there.
+fn path_to_file_url(s: str) -> str {
+    var out = ""
+    for c in s.codes() {
+        out = out + if c == 0 { "%00" } else if c == 9 { "%09" } else if c == 10 { "%0A" } else if c == 13 { "%0D" } else if c == 32 { "%20" }
+        else if c == 34 { "%22" } else if c == 35 { "%23" } else if c == 37 { "%25" } else if c == 63 { "%3F" } else if c == 91 { "%5B" }
+        else if c == 92 { "%5C" } else if c == 93 { "%5D" } else if c == 94 { "%5E" } else if c == 124 { "%7C" } else if c == 126 { "%7E" }
+        else { whatwgurl_char(c) }
+    }
+    return if out.starts_with("file:") { out } else { "file:" + out }
+}
+
+fn whatwgurl_char(c: i64) -> str {
+    var b: [i64] = []
+    if c < 128 {
+        b = [c]
+    } else if c < 2048 {
+        b = [192 + c.ushr(6), 128 + c.bit_and(63)]
+    } else if c < 65536 {
+        b = [224 + c.ushr(12), 128 + c.ushr(6).bit_and(63), 128 + c.bit_and(63)]
+    } else {
+        b = [240 + c.ushr(18), 128 + c.ushr(12).bit_and(63), 128 + c.ushr(6).bit_and(63), 128 + c.bit_and(63)]
+    }
+    return bytes_of(b).to_str()
+}
+
+fn from_file(r: NpmSpec, where: str, home: str) -> NpmSpec ! NpmSpecError {
+    var res = r
+    res.kind = if is_file_type(r.raw_spec) { "file" } else { "directory" }
+    var raw = path_to_file_url(r.raw_spec)
+    if raw.starts_with("file:/") {
+        let b = raw.to_bytes()
+        if raw.starts_with("file://") and b.len() > 7 and b.at(7) != 47 {
+            raw = "file:/" + rest(raw, 5)
+        }
+        // /^\/{1,3}\.\.?(\/|$)/ on what follows `file:`
+        let after = rest(raw, 5)
+        var k = 0
+        let ab = after.to_bytes()
+        while k < ab.len() and k < 3 and ab.at(k) == 47 {
+            k = k + 1
+        }
+        if k >= 1 and k < ab.len() and ab.at(k) == 46 {
+            var e = k + 1
+            if e < ab.len() and ab.at(e) == 46 {
+                e = e + 1
+            }
+            if e == ab.len() or ab.at(e) == 47 {
+                raw = "file:" + rest(after, k)
+            }
+        }
+    }
+    let base = whatwgurl.parse(path_to_file_url(resolve([where])) + "/", None) ?? fail(NpmInvalid("Invalid file: URL"))
+    let resolved = whatwgurl.parse(raw, Some(base)) ?? fail(NpmInvalid("Invalid file: URL, must comply with RFC 8089"))
+    let spec_url = whatwgurl.parse(raw, None) ?? fail(NpmInvalid("Invalid file: URL, must comply with RFC 8089"))
+    let spec_path = hostedgit.decode_uri_component(whatwgurl.pathname(spec_url)) ?? fail(NpmInvalid("URI malformed"))
+    var resolved_path = hostedgit.decode_uri_component(whatwgurl.pathname(resolved)) ?? fail(NpmInvalid("URI malformed"))
+    var save = ""
+    if spec_path == "/~" or spec_path.starts_with("/~/") {
+        save = "file:" + rest(spec_path, 1)
+        resolved_path = resolve([home, rest(spec_path, 3)])
+    } else if not rest(raw, 5).starts_with("/") {
+        save = "file:" + relative(where, resolved_path)
+    } else {
+        save = "file:" + resolve([resolved_path])
+    }
+    res.fetch_spec = Some(resolve([where, resolved_path]))
+    save = save.split("\\").join("/")
+    if save.starts_with("file://") {
+        save = "file:/" + rest(save, 7)
+    }
+    res.save_spec = Some(save)
+    return res
+}
+
+fn from_alias(rx: NsRegexes, r: NpmSpec, where: str, home: str) -> NpmSpec ! NpmSpecError {
+    var res = r
+    let sub = try parse_with(rx, rest(r.raw_spec, 4), where, home)
+    if sub.kind == "alias" {
+        fail(NpmInvalid("nested aliases not supported"))
+    }
+    if not sub.registry {
+        fail(NpmInvalid("aliases only work for registry deps"))
+    }
+    if sub.name == None {
+        fail(NpmInvalid("aliases must have a name"))
+    }
+    res.sub_spec = Some(to_string(sub))
+    res.registry = true
+    res.kind = "alias"
+    res.save_spec = None
+    res.fetch_spec = None
+    return res
+}
+
+fn resolve_spec(rx: NsRegexes, name: Option[str], spec: str, where: str, arg: str, home: str) -> NpmSpec ! NpmSpecError {
+    let res = try empty_spec(arg, name, spec)
+    if starts_ci(spec, "file:") or is_posix_file(spec) {
+        return try from_file(res, where, home)
+    }
+    if starts_ci(spec, "npm:") {
+        return try from_alias(rx, res, where, home)
+    }
+    match hostedgit.from_url(spec) {
+        Some(h) -> return try from_hosted(res, h)
+        None -> {}
+    }
+    if spec.len() > 0 and is_url(spec) {
+        return try from_url(res)
+    }
+    if spec.len() > 0 and (has_slash(spec) or is_file_type(spec)) {
+        return try from_file(res, where, home)
+    }
+    return try from_registry(rx, res)
+}
+
+/// npa(arg, where), with `home` as the home directory and node-semver's
+/// expressions from `nodesemver.regexes()`.
+pub fn parse_with(rx: NsRegexes, arg: str, where: str, home: str) -> NpmSpec ! NpmSpecError {
+    let at = byte_index(arg, 64, 1)
+    let name_part = if at > 0 { cut(arg, 0, at) } else { arg }
+    if is_url(arg) {
+        return try resolve_spec(rx, None, arg, where, arg, home)
+    }
+    if is_git(arg) {
+        return try resolve_spec(rx, None, "git+ssh://" + arg, where, arg, home)
+    }
+    if not name_part.starts_with("@") and (has_slash(name_part) or is_file_type(name_part)) {
+        return try resolve_spec(rx, None, arg, where, arg, home)
+    }
+    if at > 0 {
+        let spec = rest(arg, at + 1)
+        return try resolve_spec(rx, Some(name_part), if spec.len() == 0 { "*" } else { spec }, where, arg, home)
+    }
+    if npmname.validate(arg).valid_for_old {
+        return try resolve_spec(rx, Some(arg), "*", where, arg, home)
+    }
+    return try resolve_spec(rx, None, arg, where, arg, home)
+}
+
+/// Result.toString: name and the spec to save (or fetch, or as given).
+pub fn to_string(r: NpmSpec) -> str {
+    var full: [str] = []
+    match r.name {
+        Some(n) -> {
+            if n.len() > 0 {
+                full.push(n)
+            }
+        }
+        None -> {}
+    }
+    // saveSpec || fetchSpec || rawSpec
+    let save = r.save_spec ?? ""
+    let fetch = r.fetch_spec ?? ""
+    let spec = if save.len() > 0 { save } else if fetch.len() > 0 { fetch } else { r.raw_spec }
+    if spec.len() > 0 {
+        full.push(spec)
+    }
+    return if full.len() > 0 { full.join("@") } else { r.raw }
+}

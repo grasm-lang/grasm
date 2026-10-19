@@ -1,0 +1,563 @@
+// Git repositories on GitHub, GitLab, Bitbucket, Gist and SourceHut, as
+// npm reads and writes them (hosted-git-info 9).
+//
+// `"repository": "npm/cli"`, `github:npm/cli#v10`, `git@github.com:npm/cli.git`,
+// `git+https://user:token@github.com/npm/cli.git#semver:^10` and
+// `https://gitlab.com/group/sub/project/-/tree/main` all name a hosted
+// repository; npm needs the host, user, project and committish out of
+// any of them, and then the URL for each purpose: ssh, https, the git
+// protocol, a tarball, a file's raw content, a page to browse or edit,
+// the issues. This does what hosted-git-info does, byte for byte, quirks
+// included -- an `scp`-style address becomes `git+ssh://`, `user/repo`
+// alone is GitHub, auth is kept only for the protocols that may carry
+// it, a missing user prints as "null", and a GitHub `tree` URL with no
+// branch has the committish "undefined".
+//
+// `from_url` parses, `render` produces one representation (`ssh`,
+// `sshurl`, `https`, `git`, `shortcut`, `path`, `tarball`, `file`,
+// `edit`, `browse`, `browsefile`, `docs`, `bugs`), and `to_string` the
+// default one.
+import whatwgurl
+
+type GitHost = {
+    kind: str,
+    user: Option[str],
+    auth: Option[str],
+    project: str,
+    committish: Option[str],
+    default: str,
+}
+
+type GitRender = { path: str, fragment: Option[str], no_git_plus: bool, no_committish: bool }
+
+fn index_of(s: str, needle: str, from: i64) -> i64 {
+    let b = s.to_bytes()
+    let n = needle.to_bytes()
+    var i = if from < 0 { 0 } else { from }
+    while i + n.len() <= b.len() {
+        if b.slice(i, i + n.len()) == n {
+            return i
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+/// JavaScript's lastIndexOf(char, position): the last match starting at
+/// or before `position`.
+fn last_index_of(s: str, c: i64, position: i64) -> i64 {
+    let b = s.to_bytes()
+    var i = if position >= b.len() { b.len() - 1 } else { position }
+    while i >= 0 {
+        if b.at(i) == c {
+            return i
+        }
+        i = i - 1
+    }
+    return 0 - 1
+}
+
+fn cut(s: str, a: i64, z: i64) -> str {
+    let b = s.to_bytes()
+    let lo = if a < 0 { 0 } else if a > b.len() { b.len() } else { a }
+    let hi = if z < lo { lo } else if z > b.len() { b.len() } else { z }
+    return bytes_of(b.slice(lo, hi).to_list()).to_str()
+}
+
+fn from(s: str, a: i64) -> str {
+    return cut(s, a, s.to_bytes().len())
+}
+
+/// encodeURIComponent: all but letters, digits and `-_.!~*'()`.
+pub fn encode_uri_component(s: str) -> str {
+    let digits = "0123456789ABCDEF"
+    var out = ""
+    for x in s.to_bytes().to_list() {
+        let keep = (x >= 48 and x <= 57) or (x >= 65 and x <= 90) or (x >= 97 and x <= 122) or "-_.!~*'()".to_bytes().to_list().contains(x)
+        out = out + if keep { bytes_of([x]).to_str() } else { "%" + digits.substr(x.ushr(4), 1) + digits.substr(x.bit_and(15), 1) }
+    }
+    return out
+}
+
+fn hexv(c: i64) -> i64 {
+    return if c >= 48 and c <= 57 { c - 48 } else if c >= 97 and c <= 102 { c - 87 } else if c >= 65 and c <= 70 { c - 55 } else { 0 - 1 }
+}
+
+/// decodeURIComponent: None where JavaScript throws a URIError (a `%`
+/// without two hex digits after it, or escapes that are not UTF-8).
+pub fn decode_uri_component(s: str) -> Option[str] {
+    let b = s.to_bytes()
+    var out: [i64] = []
+    var i = 0
+    while i < b.len() {
+        if b.at(i) != 37 {
+            out.push(b.at(i))
+            i = i + 1
+            continue
+        }
+        if i + 2 >= b.len() {
+            return None
+        }
+        let v = if hexv(b.at(i + 1)) < 0 or hexv(b.at(i + 2)) < 0 { 0 - 1 } else { hexv(b.at(i + 1)) * 16 + hexv(b.at(i + 2)) }
+        if v < 0 {
+            return None
+        }
+        out.push(v)
+        i = i + 3
+    }
+    let text = bytes_of(out)
+    // Escapes must decode as UTF-8 exactly.
+    let back = text.to_str().to_bytes()
+    if back != text {
+        return None
+    }
+    return Some(text.to_str())
+}
+
+fn is_word(c: i64) -> bool {
+    return (c >= 48 and c <= 57) or (c >= 65 and c <= 90) or (c >= 97 and c <= 122) or c == 95
+}
+
+/// hosted-git-info's formatHashFragment, over ASCII.
+fn hash_fragment(f: str) -> str {
+    var cs = f.to_lower().to_bytes().to_list()
+    var a = 0
+    while a < cs.len() and not is_word(cs[a]) {
+        a = a + 1
+    }
+    cs = cs.slice(a, cs.len())
+    var z = cs.len()
+    while z > 0 and not is_word(cs[z - 1]) {
+        z = z - 1
+    }
+    cs = cs.slice(0, z).filter(|c| c != 47)
+    var out: [i64] = []
+    var run = false
+    for c in cs {
+        if is_word(c) {
+            out.push(c)
+            run = false
+        } else if not run {
+            out.push(45)
+            run = true
+        }
+    }
+    return bytes_of(out).to_str()
+}
+
+fn domain(kind: str) -> str {
+    return if kind == "github" { "github.com" } else if kind == "bitbucket" { "bitbucket.org" } else if kind == "gitlab" { "gitlab.com" }
+    else if kind == "gist" { "gist.github.com" } else { "git.sr.ht" }
+}
+
+fn host_protocols(kind: str) -> [str] {
+    return if kind == "github" { ["git:", "http:", "git+ssh:", "git+https:", "ssh:", "https:"] } else if kind == "gist" { ["git:", "git+ssh:", "git+https:", "ssh:", "https:"] }
+    else if kind == "sourcehut" { ["git+ssh:", "https:"] } else { ["git+ssh:", "git+https:", "ssh:", "https:"] }
+}
+
+fn kind_of_shortcut(proto: str) -> Option[str] {
+    for k in ["github", "bitbucket", "gitlab", "gist", "sourcehut"] {
+        if proto == k + ":" {
+            return Some(k)
+        }
+    }
+    return None
+}
+
+fn kind_of_domain(host: str) -> Option[str] {
+    let h = if host.starts_with("www.") { from(host, 4) } else { host }
+    for k in ["github", "bitbucket", "gitlab", "gist", "sourcehut"] {
+        if h == domain(k) {
+            return Some(k)
+        }
+    }
+    return None
+}
+
+/// The protocols npm knows: (protocol, representation name, carries auth).
+fn known_protocol(p: str) -> Option[(str, bool)] {
+    let table = [("git+ssh:", "sshurl", false), ("ssh:", "sshurl", false), ("git+https:", "https", true), ("git:", "", true), ("http:", "", true),
+        ("https:", "", true), ("git+http:", "", true), ("github:", "github", false), ("bitbucket:", "bitbucket", false), ("gitlab:", "gitlab", false),
+        ("gist:", "gist", false), ("sourcehut:", "sourcehut", false)]
+    for (k, name, auth) in table {
+        if k == p {
+            return Some((name, auth))
+        }
+    }
+    return None
+}
+
+fn js_space(c: i64) -> bool {
+    return (c >= 9 and c <= 13) or c == 32 or c == 160 or c == 5760 or (c >= 8192 and c <= 8202) or c == 8232 or c == 8233 or c == 8239 or c == 8287 or
+    c == 12288 or c == 65279
+}
+
+/// `user/repo`: a slash, no protocol, no second slash, no `@`, no space
+/// (all before any `#`), not a path.
+fn github_shorthand(arg: str) -> bool {
+    let hash = index_of(arg, "#", 0)
+    let slash = index_of(arg, "/", 0)
+    let slash2 = index_of(arg, "/", slash + 1)
+    let colon = index_of(arg, ":", 0)
+    let at = index_of(arg, "@", 0)
+    var space = 0 - 1
+    let b = arg.to_bytes()
+    var k = 0
+    for c in arg.codes() {
+        if js_space(c) and space < 0 {
+            space = k
+        }
+        k = k + whatwgurl_utf8_len(c)
+    }
+    let after = |i| i == 0 - 1 or (hash > 0 - 1 and i > hash)
+    let ends_ok = if hash > 0 - 1 { hash == 0 or b.at(hash - 1) != 47 } else { not arg.ends_with("/") }
+    return after(space) and slash > 0 and ends_ok and not arg.starts_with(".") and after(at) and after(colon) and after(slash2)
+}
+
+fn whatwgurl_utf8_len(c: i64) -> i64 {
+    return if c < 128 { 1 } else if c < 2048 { 2 } else if c < 65536 { 3 } else { 4 }
+}
+
+fn correct_protocol(arg: str) -> str {
+    let colon = index_of(arg, ":", 0)
+    let proto = cut(arg, 0, colon + 1)
+    if known_protocol(proto) != None {
+        return arg
+    }
+    if colon >= 0 and cut(arg, colon, colon + 3) == "://" {
+        return arg
+    }
+    let at = index_of(arg, "@", 0)
+    if at > 0 - 1 {
+        return if at > colon { "git+ssh://" + arg } else { arg }
+    }
+    return cut(arg, 0, colon + 1) + "//" + from(arg, colon + 1)
+}
+
+fn last_before(s: str, c: i64, before: str) -> i64 {
+    let p = index_of(s, before, 0)
+    return last_index_of(s, c, if p > 0 - 1 { p } else { s.to_bytes().len() })
+}
+
+fn correct_url(u: str) -> str {
+    var g = u
+    let at = last_before(g, 64, "#")
+    let colon = last_before(g, 58, "#")
+    if colon > at {
+        g = cut(g, 0, colon) + "/" + from(g, colon + 1)
+    }
+    if last_before(g, 58, "#") == 0 - 1 and index_of(g, "//", 0) == 0 - 1 {
+        g = "git+ssh://" + g
+    }
+    return g
+}
+
+fn parse_url(giturl: str) -> Option[WhatwgUrl] {
+    let p = correct_protocol(giturl)
+    return match whatwgurl.parse(p, None) {
+        Ok(u) -> Some(u)
+        Err(_e) -> match whatwgurl.parse(correct_url(p), None) {
+            Ok(u) -> Some(u)
+            Err(_e2) -> None
+        }
+    }
+}
+
+fn split_limit(s: str, sep: str, limit: i64) -> [str] {
+    let all = s.split(sep)
+    return if all.len() > limit { all.slice(0, limit) } else { all }
+}
+
+fn part(xs: [str], i: i64) -> Option[str] {
+    return if i < xs.len() { Some(xs[i]) } else { None }
+}
+
+fn truthy(o: Option[str]) -> bool {
+    return match o {
+        Some(s) -> s.len() > 0
+        None -> false
+    }
+}
+
+fn strip_git(p: str) -> str {
+    return if p.ends_with(".git") { cut(p, 0, p.to_bytes().len() - 4) } else { p }
+}
+
+/// A host's extract: (user, project, committish), raw.
+fn extract(kind: str, u: WhatwgUrl) -> Option[(Option[str], str, Option[str])] {
+    let path = whatwgurl.pathname(u)
+    let hash = from(whatwgurl.hash(u), 1)
+    if kind == "github" {
+        let xs = split_limit(path, "/", 5)
+        let kind_part = part(xs, 3)
+        if truthy(kind_part) and kind_part != Some("tree") {
+            return None
+        }
+        let committish = if truthy(kind_part) { part(xs, 4) } else { Some(hash) }
+        let project = strip_git(part(xs, 2) ?? "")
+        if not truthy(part(xs, 1)) or project.len() == 0 {
+            return None
+        }
+        return Some((part(xs, 1), project, committish))
+    }
+    if kind == "gitlab" {
+        let p = from(path, 1)
+        if p.contains("/-/") or p.contains("/archive.tar.gz") {
+            return None
+        }
+        let segs = p.split("/")
+        let project = strip_git(segs[segs.len() - 1])
+        let user = segs.slice(0, segs.len() - 1).join("/")
+        if user.len() == 0 or project.len() == 0 {
+            return None
+        }
+        return Some((Some(user), project, Some(hash)))
+    }
+    let xs = split_limit(path, "/", 4)
+    let aux = part(xs, 3) ?? ""
+    if (kind == "bitbucket" and aux == "get") or (kind == "sourcehut" and aux == "archive") or (kind == "gist" and aux == "raw") {
+        return None
+    }
+    if kind == "gist" {
+        if not truthy(part(xs, 2)) {
+            if not truthy(part(xs, 1)) {
+                return None
+            }
+            return Some((None, strip_git(part(xs, 1) ?? ""), Some(hash)))
+        }
+        return Some((part(xs, 1), strip_git(part(xs, 2) ?? ""), Some(hash)))
+    }
+    let project = strip_git(part(xs, 2) ?? "")
+    if not truthy(part(xs, 1)) or project.len() == 0 {
+        return None
+    }
+    return Some((part(xs, 1), project, Some(hash)))
+}
+
+fn decode_opt(o: Option[str]) -> Option[Option[str]] {
+    return match o {
+        Some(s) -> match decode_uri_component(s) {
+            Some(d) -> Some(Some(d))
+            None -> None
+        }
+        None -> Some(None)
+    }
+}
+
+fn shortcut_parts(u: WhatwgUrl) -> (Option[str], str, Option[str]) ! str {
+    var path = whatwgurl.pathname(u)
+    if path.starts_with("/") {
+        path = from(path, 1)
+    }
+    let at = index_of(path, "@", 0)
+    if at > 0 - 1 {
+        path = from(path, at + 1)
+    }
+    let slash = last_index_of(path, 47, path.to_bytes().len())
+    var user: Option[str] = None
+    var project = ""
+    if slash > 0 - 1 {
+        let us = decode_uri_component(cut(path, 0, slash)) ?? fail("a malformed escape")
+        user = if us.len() > 0 { Some(us) } else { None }
+        project = decode_uri_component(from(path, slash + 1)) ?? fail("a malformed escape")
+    } else {
+        project = decode_uri_component(path) ?? fail("a malformed escape")
+    }
+    let hash = whatwgurl.hash(u)
+    let committish = if hash.len() > 0 { Some(decode_uri_component(from(hash, 1)) ?? fail("a malformed escape")) } else { None }
+    return (user, strip_git(project), committish)
+}
+
+/// hosted-git-info's fromUrl: the repository a string names, if it is on
+/// a known host.
+pub fn from_url(giturl: str) -> Option[GitHost] {
+    return match parse_host(giturl) {
+        Ok(h) -> h
+        Err(_e) -> None
+    }
+}
+
+fn parse_host(giturl: str) -> Option[GitHost] ! str {
+    if giturl.len() == 0 {
+        return None
+    }
+    let corrected = if github_shorthand(giturl) { "github:" + giturl } else { giturl }
+    let u = parse_url(corrected) ?? fail("none")
+    let shortcut = kind_of_shortcut(u.scheme + ":")
+    let kind = match shortcut {
+        Some(k) -> k
+        None -> kind_of_domain(whatwgurl.hostname(u)) ?? fail("none")
+    }
+    let proto = u.scheme + ":"
+    var auth: Option[str] = None
+    match known_protocol(proto) {
+        Some((_n, carries)) -> {
+            if carries and (u.username.len() > 0 or u.password.len() > 0) {
+                auth = Some(u.username + if u.password.len() > 0 { ":" + u.password } else { "" })
+            }
+        }
+        None -> {}
+    }
+    if shortcut != None {
+        return match shortcut_parts(u) {
+            Ok((user, project, committish)) -> Some(GitHost{ kind: kind, user: user, auth: auth, project: project, committish: committish, default: "shortcut" })
+            Err(_e) -> None
+        }
+    }
+    if not host_protocols(kind).contains(proto) {
+        return None
+    }
+    let (user0, project0, committish0) = extract(kind, u) ?? fail("none")
+    let user = if truthy(user0) { decode_opt(user0) ?? fail("none") } else { user0 }
+    let project = decode_uri_component(project0) ?? fail("none")
+    // decodeURIComponent(undefined) is the string "undefined".
+    let committish = decode_uri_component(committish0 ?? "undefined") ?? fail("none")
+    let rep = match known_protocol(proto) {
+        Some((name, _a)) -> if name.len() > 0 { name } else { u.scheme }
+        None -> u.scheme
+    }
+    return Some(GitHost{ kind: kind, user: user, auth: auth, project: project, committish: Some(committish), default: rep })
+}
+
+/// maybeJoin: every part present and non-empty, or nothing.
+fn mj(parts: [Option[str]]) -> str {
+    var out = ""
+    for p in parts {
+        match p {
+            Some(s) -> {
+                if s.len() == 0 {
+                    return ""
+                }
+                out = out + s
+            }
+            None -> return ""
+        }
+    }
+    return out
+}
+
+/// maybeEncode.
+fn me(o: Option[str]) -> Option[str] {
+    return match o {
+        Some(s) -> if s.len() > 0 { Some(encode_uri_component(s)) } else { None }
+        None -> None
+    }
+}
+
+fn or_head(o: Option[str]) -> Option[str] {
+    return if truthy(o) { o } else { Some("HEAD") }
+}
+
+fn text(o: Option[str]) -> str {
+    return o ?? "null"
+}
+
+fn sub_path(kind: str, which: str) -> Option[str] {
+    if which == "tree" {
+        return if kind == "github" or kind == "gitlab" or kind == "sourcehut" { Some("tree") } else if kind == "bitbucket" { Some("src") } else { None }
+    }
+    if which == "blob" {
+        return if kind == "github" { Some("blob") } else if kind == "bitbucket" { Some("src") } else if kind == "gist" { None } else { Some("tree") }
+    }
+    return if kind == "github" or kind == "gist" { Some("edit") } else if kind == "bitbucket" { Some("?mode=edit") } else if kind == "gitlab" { Some("-/edit") }
+    else { None }
+}
+
+fn hashformat(kind: str, f: str) -> str {
+    if kind == "gist" {
+        return if f.len() > 0 { "file-" + hash_fragment(f) } else { "" }
+    }
+    return hash_fragment(f)
+}
+
+/// One representation; None where the host has no template for it.
+pub fn render(h: GitHost, what: str, opts: GitRender) -> Option[str] {
+    let c = if opts.no_committish and what != "tarball" { None } else { h.committish }
+    var path = opts.path
+    if path.starts_with("/") {
+        path = from(path, 1)
+    }
+    let d = domain(h.kind)
+    let base = "https://" + d + "/" + text(h.user) + "/" + h.project
+    let gist = h.kind == "gist"
+    let hc = mj([Some("#"), c])
+    var r: Option[str] = None
+    if what == "ssh" {
+        r = Some("git@" + d + ":" + (if gist { "" } else { text(h.user) + "/" }) + h.project + ".git" + hc)
+    } else if what == "sshurl" {
+        r = Some("git+ssh://git@" + d + "/" + (if gist { "" } else { text(h.user) + "/" }) + h.project + ".git" + hc)
+    } else if what == "edit" {
+        r = Some(if gist { base + mj([Some("/"), me(c)]) + "/" + (sub_path(h.kind, "edit") ?? "") }
+            else if h.kind == "bitbucket" { base + mj([Some("/"), sub_path(h.kind, "tree"), Some("/"), me(or_head(c)), Some("/"), Some(path), sub_path(h.kind, "edit")]) }
+            else { base + mj([Some("/"), sub_path(h.kind, "edit"), Some("/"), me(or_head(c)), Some("/"), Some(path)]) })
+    } else if what == "browse" or what == "browsefile" {
+        r = Some(browse(h, what, c, path, opts.fragment))
+    } else if what == "docs" {
+        r = Some(if gist { "https://" + d + "/" + h.project + mj([Some("/"), me(c)]) } else { base + mj([Some("/"), sub_path(h.kind, "tree"), Some("/"), me(c)]) + "#readme" })
+    } else if what == "https" {
+        r = Some(if gist { "git+https://" + d + "/" + h.project + ".git" + hc } else if h.kind == "sourcehut" { base + ".git" + hc }
+            else { "git+https://" + mj([h.auth, Some("@")]) + d + "/" + text(h.user) + "/" + h.project + ".git" + hc })
+    } else {
+        r = render_more(h, what, c, path)
+    }
+    return match r {
+        Some(s) -> Some(if opts.no_git_plus and s.starts_with("git+") { from(s, 4) } else { s })
+        None -> None
+    }
+}
+
+fn browse(h: GitHost, what: str, c: Option[str], path: str, fragment: Option[str]) -> str {
+    let d = domain(h.kind)
+    if h.kind == "gist" {
+        let tail = if what == "browse" and path.len() == 0 and fragment == None { "" } else { mj([Some("#"), Some(hashformat(h.kind, path))]) }
+        return "https://" + d + "/" + h.project + mj([Some("/"), me(c)]) + tail
+    }
+    let base = "https://" + d + "/" + text(h.user) + "/" + h.project
+    if what == "browse" and path.len() == 0 and fragment == None {
+        return base + mj([Some("/"), sub_path(h.kind, "tree"), Some("/"), me(c)])
+    }
+    let sub = if what == "browse" { sub_path(h.kind, "tree") } else { sub_path(h.kind, "blob") }
+    return base + "/" + (sub ?? "undefined") + "/" + (me(or_head(c)) ?? "") + "/" + path + mj([Some("#"), Some(hashformat(h.kind, fragment ?? ""))])
+}
+
+fn render_more(h: GitHost, what: str, c: Option[str], path: str) -> Option[str] {
+    let d = domain(h.kind)
+    let gist = h.kind == "gist"
+    let user = text(h.user)
+    let hc = mj([Some("#"), c])
+    if what == "file" {
+        return Some(if h.kind == "github" { "https://" + mj([h.auth, Some("@")]) + "raw.githubusercontent.com/" + user + "/" + h.project + "/" + (me(or_head(c)) ?? "") + "/" + path }
+            else if gist { "https://gist.githubusercontent.com/" + user + "/" + h.project + "/raw" + mj([Some("/"), me(c)]) + "/" + path }
+            else if h.kind == "sourcehut" { "https://" + d + "/" + user + "/" + h.project + "/blob/" + (me(c) ?? "HEAD") + "/" + path }
+            else { "https://" + d + "/" + user + "/" + h.project + "/raw/" + (me(or_head(c)) ?? "") + "/" + path })
+    }
+    if what == "shortcut" {
+        return Some(h.kind + ":" + (if gist { "" } else { user + "/" }) + h.project + hc)
+    }
+    if what == "path" {
+        return Some((if gist { "" } else { user + "/" }) + h.project + hc)
+    }
+    if what == "bugs" {
+        return if h.kind == "sourcehut" { None } else if gist { Some("https://" + d + "/" + h.project) } else { Some("https://" + d + "/" + user + "/" + h.project + "/issues") }
+    }
+    if what == "git" {
+        return if h.kind == "github" { Some("git://" + mj([h.auth, Some("@")]) + d + "/" + user + "/" + h.project + ".git" + hc) }
+        else if gist { Some("git://" + d + "/" + h.project + ".git" + hc) } else { None }
+    }
+    if what == "tarball" {
+        let tag = me(or_head(c)) ?? ""
+        return Some(if h.kind == "github" { "https://codeload." + d + "/" + user + "/" + h.project + "/tar.gz/" + tag }
+            else if h.kind == "bitbucket" { "https://" + d + "/" + user + "/" + h.project + "/get/" + tag + ".tar.gz" }
+            else if h.kind == "gitlab" { "https://" + d + "/" + user + "/" + h.project + "/repository/archive.tar.gz?ref=" + tag }
+            else if gist { "https://codeload.github.com/gist/" + h.project + "/tar.gz/" + tag }
+            else { "https://" + d + "/" + user + "/" + h.project + "/archive/" + (me(c) ?? "HEAD") + ".tar.gz" })
+    }
+    return None
+}
+
+/// toString: the default representation, or sshurl when the default has
+/// no method of its own.
+pub fn to_string(h: GitHost, opts: GitRender) -> Option[str] {
+    let methods = ["ssh", "sshurl", "browse", "docs", "bugs", "https", "git", "shortcut", "path", "tarball"]
+    return render(h, if methods.contains(h.default) { h.default } else { "sshurl" }, opts)
+}
