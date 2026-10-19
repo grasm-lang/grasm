@@ -1,0 +1,607 @@
+// The Grasm side of scripts/b40_diff.py: pairs of `<op[:param]> <path>`.
+// Each answer is one line of text, or ERR.
+import jsonlines
+import jarmanifest
+import pycfile
+import taptest
+import v8serial
+import perlstorable
+import javaserial
+import classfile
+import yaml
+import yamlemit
+import json
+
+fn hex(raw: bytes) -> str {
+    let digits = "0123456789abcdef"
+    var parts: [str] = []
+    for i in 0..raw.len() {
+        parts.push(digits.substr(raw.at(i) / 16, 1) + digits.substr(raw.at(i) % 16, 1))
+    }
+    parts.join("")
+}
+
+fn hs(s: str) -> str {
+    hex(s.to_bytes())
+}
+
+fn ints(v: [i64]) -> str {
+    v.map(|x| "{x}").join(",")
+}
+
+fn mf_attrs(a: [(str, str)]) -> str {
+    a.map(|kv| hs(kv.0) + "=" + hs(kv.1)).join(",")
+}
+
+fn text_formats(op: str, d: bytes) -> str ! str {
+    if op == "jsonl" {
+        return match jsonlines.parse(d.to_str()) {
+            Ok(vs) -> vs.map(|v| hs(json.render(v))).join(";")
+            Err(JlBadLine(line, _w)) -> "BAD:{line}"
+        }
+    }
+    if op == "jsonseq" {
+        return jsonlines.parse_seq(d).map(|r| match r.value {
+            Some(v) -> "ok:" + hs(json.render(v))
+            None -> "bad:" + hs(r.text)
+        }).join(";")
+    }
+    if op == "mf" {
+        let m = jarmanifest.parse(d) ?? fail("x")
+        let again = match jarmanifest.encode(m) {
+            Ok(b) -> hex(b)
+            Err(_e) -> "-"
+        }
+        return mf_attrs(m.main) + "|" + m.sections.map(|s| hs(s.name) + ":" + mf_attrs(s.attributes)).join(";") + "|" + again
+    }
+    if op == "tap" {
+        let r = taptest.parse(d.to_str())
+        let toks = r.tokens.map(|t| match t {
+            TapVersion(v) -> "V{v}"
+            TapPlan(n, dir, ex, todo) -> "P{n}," + dir + "," + hs(ex) + "," + ints(todo)
+            TapTest(ok, n, desc, dir, ex) -> "T{ok},{n}," + hs(desc) + "," + dir + "," + hs(ex)
+            TapComment(c) -> "C" + hs(c)
+            TapBailout(b) -> "B" + hs(b)
+            TapYaml(raw) -> "Y" + hs(raw)
+            TapPragma(ps) -> "G" + ps.join(",")
+            TapUnknown(raw) -> "U" + hs(raw)
+        }).join(";")
+        let skip_all = match r.skip_all {
+            Some(s) -> hs(s)
+            None -> "-"
+        }
+        let bail = match r.bailout {
+            Some(s) -> hs(s)
+            None -> "-"
+        }
+        return toks + "|{r.version},{r.planned},{r.tests_run}," + ints(r.passed) + "/" + ints(r.failed) + "/" + ints(r.actual_passed) + "/" +
+        ints(r.actual_failed) + "/" + ints(r.todo) + "/" + ints(r.todo_passed) + "/" + ints(r.skipped) + "|" + skip_all + "|" + bail + "|{r.good_plan}|" +
+        r.errors.map(|e| hs(e)).join(",")
+    }
+    return try binary_formats(op, d)
+}
+
+fn pyc_code(c: PycCode) -> str {
+    "(" + hs(c.name) + "," + hs(c.qualname) + "," + hs(c.filename) + ",{c.first_line},{c.argcount},{c.posonly},{c.kwonly},{c.flags},{c.stack_size}," +
+    c.names.map(|n| hs(n)).join("+") + "," + c.locals.map(|n| hs(n)).join("+") + "," + c.nested.map(|n| pyc_code(n)).join("") + ")"
+}
+
+fn binary_formats(op: str, d: bytes) -> str ! str {
+    if op == "pyc" {
+        let h = pycfile.header(d) ?? fail("x")
+        return "{h.magic},{h.flags},{h.mtime},{h.source_size}," + hex(h.source_hash) + "|" + pyc_code(pycfile.code(d) ?? fail("x"))
+    }
+    if op.starts_with("pychash") {
+        let magic = op.split("=")[1].parse_int() ?? 0
+        return hex(pycfile.source_hash(magic, d))
+    }
+    if op == "v8" {
+        let doc = v8serial.decode(d) ?? fail("x")
+        return v8_dump(doc) + "|" + hex(v8serial.encode(doc))
+    }
+    if op == "storable" {
+        let doc = perlstorable.decode(d) ?? fail("x")
+        let file = d.len() >= 4 and d.slice(0, 4).to_str() == "pst0"
+        return storable_dump(doc) + "|" + hex(perlstorable.encode(doc, file))
+    }
+    if op == "jser" {
+        let s = javaserial.decode(d) ?? fail("x")
+        return jser_dump(s) + "|" + hex(javaserial.encode(s))
+    }
+    if op == "class" {
+        return try class_dump(d)
+    }
+    return try yaml_ops(op, d)
+}
+
+fn units_hex(u: [i64]) -> str {
+    let digits = "0123456789abcdef"
+    u.map(|x| digits.substr(x.ushr(12).bit_and(15), 1) + digits.substr(x.ushr(8).bit_and(15), 1) + digits.substr(x.ushr(4).bit_and(15), 1) +
+        digits.substr(x.bit_and(15), 1)).join("")
+}
+
+/// A canonical text of a V8 value graph; objects are numbered as first
+/// met, and met again as ^n.
+fn v8_node(doc: V8Doc, at: i64, inout seen: [i64]) -> str {
+    let n = doc.nodes[at]
+    let is_obj = match n {
+        V8Undefined -> false
+        V8Null -> false
+        V8Hole -> false
+        V8Bool(_b) -> false
+        V8Number(_f) -> false
+        V8BigInt(_s, _m) -> false
+        V8String(_u) -> false
+        _ -> true
+    }
+    if is_obj {
+        for k in 0..seen.len() {
+            if seen[k] == at {
+                return "^{k}"
+            }
+        }
+        seen.push(at)
+    }
+    let me = seen.len() - 1
+    return match n {
+        V8Undefined -> "u"
+        V8Null -> "n"
+        V8Hole -> "h"
+        V8Bool(b) -> if b { "t" } else { "f" }
+        V8Number(f) -> "d{f.to_bits()}"
+        V8BigInt(neg, mag) -> "b" + (if neg { "-" } else { "+" }) + big_hex(mag)
+        V8String(u) -> "s" + units_hex(u)
+        V8Object(keys, values) -> "o{me}(" + v8_props(doc, keys, values, seen) + ")"
+        V8Array(dense, length, elements, keys, values) -> v8_array(doc, me, dense, length, elements, keys, values, seen)
+        V8Date(ms) -> "D{ms.to_bits()}"
+        V8RegExp(src, flags) -> "R" + units_hex(src) + "/{flags}"
+        V8Map(entries) -> {
+            var parts: [str] = []
+            for e in entries {
+                let k = v8_node(doc, e.0, seen)
+                parts.push(k + "=>" + v8_node(doc, e.1, seen))
+            }
+            "M{me}(" + parts.join(",") + ")"
+        }
+        V8Set(items) -> {
+            var parts: [str] = []
+            for x in items {
+                parts.push(v8_node(doc, x, seen))
+            }
+            "S{me}(" + parts.join(",") + ")"
+        }
+        V8ArrayBuffer(data) -> "B{me}:" + hex(data)
+        V8TypedArray(kind, data) -> "T{me}:{kind}:" + hex(data)
+        V8Boxed(inner) -> "X{me}:" + v8_node(doc, inner, seen)
+        V8Error(kind, message, stack, cause) -> "E{me}:" + kind + "," + (match message {
+            Some(m) -> units_hex(m)
+            None -> "-"
+        }) + "," + (match stack {
+            Some(s) -> units_hex(s)
+            None -> "-"
+        }) + "," + (match cause {
+            Some(c) -> v8_node(doc, c, seen)
+            None -> "-"
+        })
+    }
+}
+
+fn big_hex(mag: bytes) -> str {
+    let digits = "0123456789abcdef"
+    var parts: [str] = []
+    var k = mag.len() - 1
+    while k >= 0 {
+        parts.push(digits.substr(mag.at(k) / 16, 1) + digits.substr(mag.at(k) % 16, 1))
+        k = k - 1
+    }
+    var s = parts.join("")
+    while s.starts_with("0") and s.len() > 1 {
+        s = s.substr(1, s.len() - 1)
+    }
+    return if s.len() == 0 { "0" } else { s }
+}
+
+fn v8_key(k: V8Key) -> str {
+    return match k {
+        V8IntKey(i) -> "i{i}"
+        V8StrKey(u) -> "s" + units_hex(u)
+    }
+}
+
+fn v8_props(doc: V8Doc, keys: [V8Key], values: [i64], inout seen: [i64]) -> str {
+    var parts: [str] = []
+    for i in 0..keys.len() {
+        parts.push(v8_key(keys[i]) + ":" + v8_node(doc, values[i], seen))
+    }
+    return parts.join(",")
+}
+
+/// An array as its length, each index (h for a hole) and its other
+/// properties, however it was written.
+fn v8_array(doc: V8Doc, me: i64, dense: bool, length: i64, elements: [i64], keys: [V8Key], values: [i64], inout seen: [i64]) -> str {
+    var slots: [i64] = []
+    for _i in 0..length {
+        slots.push(0 - 1)
+    }
+    if dense {
+        for i in 0..elements.len() {
+            let is_hole = match doc.nodes[elements[i]] {
+                V8Hole -> true
+                _ -> false
+            }
+            if not is_hole and i < length {
+                slots[i] = elements[i]
+            }
+        }
+    }
+    var other_k: [V8Key] = []
+    var other_v: [i64] = []
+    for i in 0..keys.len() {
+        match keys[i] {
+            V8IntKey(x) -> {
+                if x >= 0 and x < length {
+                    slots[x] = values[i]
+                } else {
+                    other_k.push(keys[i])
+                    other_v.push(values[i])
+                }
+            }
+            _ -> {
+                other_k.push(keys[i])
+                other_v.push(values[i])
+            }
+        }
+    }
+    var parts: [str] = []
+    for s in slots {
+        parts.push(if s < 0 { "h" } else { v8_node(doc, s, seen) })
+    }
+    return "A{me}[{length}](" + parts.join(",") + ")\{" + v8_props(doc, other_k, other_v, seen) + "\}"
+}
+
+fn v8_dump(doc: V8Doc) -> str {
+    var seen: [i64] = []
+    return v8_node(doc, doc.root, seen)
+}
+
+fn hex_int(v: i64) -> str {
+    let digits = "0123456789abcdef"
+    if v == 0 {
+        return "0"
+    }
+    var parts: [str] = []
+    var x = v
+    while x > 0 {
+        parts.push(digits.substr(x % 16, 1))
+        x = x / 16
+    }
+    var out: [str] = []
+    var k = parts.len() - 1
+    while k >= 0 {
+        out.push(parts[k])
+        k = k - 1
+    }
+    out.join("")
+}
+
+fn cps(codes: [i64]) -> str {
+    codes.map(|c| hex_int(c)).join(".")
+}
+
+fn pl_val(doc: PerlDoc, at: i64, inout seen: [i64]) -> str {
+    return match doc.nodes[at] {
+        PlUndef -> "u"
+        PlSvUndef -> "u"
+        PlYes -> "s" + cps("1".codes())
+        PlNo -> "s"
+        PlInt(i) -> "s" + cps("{i}".codes())
+        PlDouble(f) -> "s" + cps(perlstorable.perl_number(f).codes())
+        PlBytes(b) -> "s" + cps(b.to_list())
+        PlUtf8(t) -> "s" + cps(t.codes())
+        PlRef(target, _w, _o) -> "r" + pl_ref(doc, target, seen)
+        _ -> "?"
+    }
+}
+
+fn key_text(k: (bytes, bool)) -> str {
+    return if k.1 { k.0.to_str() } else { k.0.to_list().map(|c| c.to_char()).join("") }
+}
+
+/// What a reference points at, numbered as first met.
+fn pl_ref(doc: PerlDoc, at: i64, inout seen: [i64]) -> str {
+    var target = at
+    var prefix = ""
+    match doc.nodes[at] {
+        PlBlessed(class, t) -> {
+            prefix = "B" + hs(class) + ":"
+            target = t
+        }
+        _ -> {}
+    }
+    for k in 0..seen.len() {
+        if seen[k] == target {
+            return "^{k}"
+        }
+    }
+    seen.push(target)
+    let me = seen.len() - 1
+    return prefix + match doc.nodes[target] {
+        PlArray(items) -> {
+            var parts: [str] = []
+            for x in items {
+                parts.push(pl_val(doc, x, seen))
+            }
+            "A{me}(" + parts.join(",") + ")"
+        }
+        PlHash(keys, values) -> {
+            var order: [i64] = []
+            for i in 0..keys.len() {
+                order.push(i)
+            }
+            order.sort_by(|i| key_text(keys[i]))
+            var parts: [str] = []
+            for i in order {
+                parts.push(cps(key_text(keys[i]).codes()) + "=" + pl_val(doc, values[i], seen))
+            }
+            "H{me}(" + parts.join(",") + ")"
+        }
+        _ -> "S{me}:" + pl_val(doc, target, seen)
+    }
+}
+
+fn storable_dump(doc: PerlDoc) -> str {
+    var seen: [i64] = []
+    return pl_ref(doc, doc.root, seen)
+}
+
+fn js_prim(code: str, bits: i64) -> str {
+    if code == "B" or code == "S" or code == "I" {
+        let n = if code == "B" { 1 } else if code == "S" { 2 } else { 4 }
+        let top = 1.shl(8 * n - 1)
+        return "{if bits >= top { bits - 2 * top } else { bits }}"
+    }
+    if code == "J" {
+        return "{bits}"
+    }
+    return "{bits}"
+}
+
+fn desc_name(s: JavaStream, desc: i64) -> str {
+    return match s.items[desc] {
+        JiDesc(name, _u, _f, _fs, _a, _s) -> name
+        _ -> "$Proxy"
+    }
+}
+
+fn js_item(s: JavaStream, at: i64, inout seen: [i64]) -> str {
+    let it = s.items[at]
+    match it {
+        JiNull -> return "N"
+        JiString(raw, _l) -> return "S" + hs(javaserial.string_text(raw))
+        JiEnum(desc, name) -> return "E" + desc_name(s, desc) + "." + match s.items[name] {
+            JiString(raw, _l) -> hs(javaserial.string_text(raw))
+            _ -> "?"
+        }
+        JiClass(desc) -> return "C" + desc_name(s, desc)
+        _ -> {}
+    }
+    for k in 0..seen.len() {
+        if seen[k] == at {
+            return "^{k}"
+        }
+    }
+    seen.push(at)
+    let me = seen.len() - 1
+    return match it {
+        JiObject(desc, data) -> {
+            var parts: [str] = []
+            let chain = javaserial.class_chain(s.items, desc)
+            for k in 0..chain.len() {
+                match s.items[chain[k]] {
+                    JiDesc(_n, _u, flags, fields, _a, _sup) -> {
+                        if flags.bit_and(2) != 0 and k < data.len() {
+                            for j in 0..fields.len() {
+                                if j < data[k].values.len() {
+                                    parts.push(fields[j].name + "=" + js_value(s, data[k].values[j], seen))
+                                }
+                            }
+                        }
+                    }
+                    _ -> {}
+                }
+            }
+            "O{me}" + desc_name(s, desc) + "(" + parts.join(",") + ")"
+        }
+        JiArray(desc, values) -> {
+            var parts: [str] = []
+            for v in values {
+                parts.push(js_value(s, v, seen))
+            }
+            "A{me}" + desc_name(s, desc) + "[" + parts.join(",") + "]"
+        }
+        _ -> "?"
+    }
+}
+
+fn js_value(s: JavaStream, v: JavaValue, inout seen: [i64]) -> str {
+    return match v {
+        JvPrim(code, bits) -> js_prim(code, bits)
+        JvRef(item) -> js_item(s, item, seen)
+    }
+}
+
+fn jser_dump(s: JavaStream) -> str {
+    var seen: [i64] = []
+    var parts: [str] = []
+    for c in s.contents {
+        match s.items[c] {
+            JiBlock(_d, _l) -> {}
+            JiReset -> {}
+            _ -> parts.push(js_item(s, c, seen))
+        }
+    }
+    return parts.join(";")
+}
+
+fn cp_kind(e: CpEntry) -> str {
+    return match e {
+        CpEmpty -> ""
+        CpUtf8(s) -> "Utf8:" + hs(s)
+        CpInt(v) -> "Integer:{v}"
+        CpFloat(_b) -> "Float"
+        CpLong(v) -> "Long:{v}"
+        CpDouble(_b) -> "Double"
+        CpClass(n) -> "Class:#{n}"
+        CpString(n) -> "String:#{n}"
+        CpMember(kind, c, nt) -> (if kind == 9 { "Fieldref" } else if kind == 10 { "Methodref" } else { "InterfaceMethodref" }) + ":#{c}.#{nt}"
+        CpNameType(n, d) -> "NameAndType:#{n}:#{d}"
+        CpMethodHandle(k, r) -> "MethodHandle:{k}:#{r}"
+        CpMethodType(d) -> "MethodType:#{d}"
+        CpDynamic(kind, b, nt) -> (if kind == 17 { "Dynamic" } else { "InvokeDynamic" }) + ":#{b}:#{nt}"
+        CpModule(n) -> "Module:#{n}"
+        CpPackage(n) -> "Package:#{n}"
+    }
+}
+
+fn member_dump(c: ClassFile, m: ClassMember, kind: str) -> str ! str {
+    var out = kind + ":" + hs(m.name) + ":" + hs(m.descriptor) + ":{m.access}"
+    for a in m.attributes {
+        if a.name == "Code" {
+            let code = classfile.code(c.pool, a) ?? fail("x")
+            let ins = classfile.instructions(code.code) ?? fail("x")
+            out = out + "|C:{code.max_stack}:{code.max_locals}|" + ins.map(|i| "{i.offset}:" + i.mnemonic + ":" + ints(i.operands)).join(";") +
+            "|" + code.exceptions.map(|e| "{e.0}:{e.1}:{e.2}:{e.3}").join(";")
+        }
+    }
+    return out
+}
+
+fn class_dump(d: bytes) -> str ! str {
+    let c = classfile.parse(d) ?? fail("x")
+    var parts = ["{c.major}.{c.minor}:{c.access}:" + hs(c.this_class) + ":" + hs(c.super_class) + ":" + c.interfaces.map(|i| hs(i)).join(",")]
+    for i in 1..c.pool.len() {
+        let k = cp_kind(c.pool[i])
+        if k.len() > 0 {
+            parts.push("#{i}=" + k)
+        }
+    }
+    for f in c.fields {
+        parts.push(try member_dump(c, f, "F"))
+    }
+    for m in c.methods {
+        parts.push(try member_dump(c, m, "M"))
+    }
+    return hs(parts.join("\n"))
+}
+
+fn esc(s: str) -> str {
+    return s.replace("\\", "\\\\").replace("\n", "\\n").replace("\t", "\\t").replace("\r", "\\r").replace("\u{8}", "\\b")
+}
+
+fn props(anchor: str, tag: str) -> str {
+    return (if anchor.len() > 0 { " &" + anchor } else { "" }) + (if tag.len() > 0 { " <" + tag + ">" } else { "" })
+}
+
+fn event_line(e: YamlEvent) -> str {
+    return match e {
+        YeStreamStart -> "+STR"
+        YeStreamEnd -> "-STR"
+        YeDocStart(_v, _t, implicit) -> if implicit { "+DOC" } else { "+DOC ---" }
+        YeDocEnd(implicit) -> if implicit { "-DOC" } else { "-DOC ..." }
+        YeAlias(a) -> "=ALI *" + a
+        YeScalar(a, t, v, _p, _q, style) -> "=VAL" + props(a, t) + " " + (if style == "" { ":" } else { style }) + esc(v)
+        YeSeqStart(a, t, _i, flow) -> "+SEQ" + (if flow { " []" } else { "" }) + props(a, t)
+        YeSeqEnd -> "-SEQ"
+        YeMapStart(a, t, _i, flow) -> "+MAP" + (if flow { " \{\}" } else { "" }) + props(a, t)
+        YeMapEnd -> "-MAP"
+    }
+}
+
+/// A resolved document as canonical text: nodes met again as ^n.
+fn y_node(doc: YamlDoc, at: i64, inout seen: [i64]) -> str ! str {
+    for k in 0..seen.len() {
+        if seen[k] == at {
+            return "^{k}"
+        }
+    }
+    match doc.nodes[at] {
+        YnScalar(tag, value, _s, plain) -> return match yaml.resolve(tag, value, plain) ?? fail("x") {
+            YsNull -> "~"
+            YsBool(b) -> if b { "T" } else { "F" }
+            YsInt(i) -> "i{i}"
+            YsBigInt(dd) -> "i" + dd
+            YsFloat(f) -> if f != f { "fnan" } else { "f{f.to_bits()}" }
+            YsTimestamp(_t) -> "t"
+            YsBinary(b) -> "x" + hex(b)
+            YsMerge -> "s" + hs("<<")
+            YsString(x) -> "s" + hs(x)
+        }
+        _ -> {}
+    }
+    seen.push(at)
+    let me = seen.len() - 1
+    match doc.nodes[at] {
+        YnSeq(_t, items, _f) -> {
+            var parts: [str] = []
+            for x in items {
+                parts.push(try y_node(doc, x, seen))
+            }
+            return "[{me}:" + parts.join(",") + "]"
+        }
+        _ -> {}
+    }
+    // A mapping: its pairs after merging, the first of a repeated key kept,
+    // in key order so the dump does not depend on how they were written.
+    var keys: [str] = []
+    var parts: [str] = []
+    for (k, v) in yaml.pairs(doc, at) ?? fail("x") {
+        var kseen: [i64] = []
+        let kt = try y_node(doc, k, kseen)
+        if keys.any(|x| x == kt) {
+            continue
+        }
+        keys.push(kt)
+        parts.push(kt + "=" + (try y_node(doc, v, seen)))
+    }
+    parts.sort()
+    return "\{{me}:" + parts.join(",") + "\}"
+}
+
+fn yaml_ops(op: str, d: bytes) -> str ! str {
+    let text = d.to_str()
+    if op == "yev" {
+        return match yaml.events(text) {
+            Ok(evs) -> hs(evs.map(|e| event_line(e)).join("\n"))
+            Err(_e) -> "ERR"
+        }
+    }
+    let docs = yaml.load(text) ?? fail("x")
+    if op == "yload" {
+        var parts: [str] = []
+        for doc in docs {
+            var seen: [i64] = []
+            parts.push(try y_node(doc, doc.root, seen))
+        }
+        return hs(parts.join("\n"))
+    }
+    if op == "yemit" {
+        return hs(yamlemit.emit_all(docs))
+    }
+    fail("unknown op")
+}
+
+fn main() / {io} {
+    let argv = args()
+    var i = 0
+    while i + 1 < argv.len() {
+        let out = match read_bytes(argv[i + 1]) {
+            Ok(data) -> match text_formats(argv[i], data) {
+                Ok(s) -> s
+                Err(_) -> "ERR"
+            }
+            Err(_) -> "NOFILE"
+        }
+        print(out)
+        i = i + 2
+    }
+}

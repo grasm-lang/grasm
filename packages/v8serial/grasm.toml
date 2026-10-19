@@ -1,0 +1,4 @@
+[package]
+name = "v8serial"
+version = "1.0.0"
+capabilities = []

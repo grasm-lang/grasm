@@ -1,0 +1,12 @@
+[package]
+name = "yamlemit"
+version = "1.0.0"
+capabilities = []
+
+[dependencies.yaml]
+path = "../yaml"
+version = "^1.0.0"
+
+[dependencies.shortestfloat]
+path = "../shortestfloat"
+version = "^1.0.0"

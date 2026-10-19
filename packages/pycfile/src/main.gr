@@ -1,0 +1,327 @@
+// Python's compiled files (.pyc), and the code objects inside them.
+//
+// A .pyc is a 16-byte header (PEP 552) and a marshalled code object. The
+// header is the interpreter's magic number (two bytes of version, then
+// "\r\n"), a 32-bit flags word, and then either the source file's
+// modification time and size (flags 0: the default, checked against the
+// source's stat), or an 8-byte hash of the source (flags bit 0, with bit 1
+// set when the import system should check it): SipHash keyed by the
+// magic number (1-3 from Python 3.11, 2-4 before), as
+// `importlib.util.source_hash` computes it. Reproducible
+// builds, Debian and Bazel use hash-based files; a tool that decides
+// whether a .pyc is stale, or which Python wrote it, reads this header.
+//
+// The code object is read for what it describes, not to run it: name,
+// qualified name, file, first line, argument counts, flags, stack size,
+// the global names and local variable names it uses, and the code objects
+// nested in its constants (functions, classes, comprehensions). Python
+// 3.11 and later lay a code object out one way and 3.8 to 3.10 another;
+// the magic number says which.
+//
+// Checked against `py_compile` and `marshal` in Pythons 3.9, 3.13 and
+// 3.14.
+import siphash
+
+type PycHeader = { magic: i64, flags: i64, mtime: i64, source_size: i64, source_hash: bytes }
+
+type PycCode = {
+    name: str,
+    qualname: str,
+    filename: str,
+    first_line: i64,
+    argcount: i64,
+    posonly: i64,
+    kwonly: i64,
+    flags: i64,
+    stack_size: i64,
+    names: [str],
+    locals: [str],
+    nested: [PycCode],
+}
+
+type PycError =
+    | PycMalformed(at: i64, why: str)
+    | PycUnknownType(at: i64, code: i64)
+
+fn u32(d: bytes, at: i64) -> i64 {
+    return d.at(at).bit_or(d.at(at + 1).shl(8)).bit_or(d.at(at + 2).shl(16)).bit_or(d.at(at + 3).shl(24))
+}
+
+pub fn header(d: bytes) -> PycHeader ! PycError {
+    if d.len() < 16 or d.at(2) != 13 or d.at(3) != 10 {
+        fail(PycMalformed(0, "not a .pyc header"))
+    }
+    let flags = u32(d, 4)
+    if flags > 3 {
+        fail(PycMalformed(4, "unknown flags"))
+    }
+    let magic = d.at(0).bit_or(d.at(1).shl(8))
+    if flags.bit_and(1) != 0 {
+        return PycHeader{ magic: magic, flags: flags, mtime: 0, source_size: 0, source_hash: d.slice(8, 16) }
+    }
+    return PycHeader{ magic: magic, flags: flags, mtime: u32(d, 8), source_size: u32(d, 12), source_hash: bytes_of([]) }
+}
+
+/// The 8 bytes `importlib.util.source_hash` gives a source for the
+/// interpreter with this magic number: SipHash keyed by the magic, -1-3
+/// from Python 3.11 (magic 3495) on and -2-4 before, as each interpreter's
+/// keyed hash was.
+pub fn source_hash(magic: i64, source: bytes) -> bytes {
+    // The key is the magic as a little-endian 32-bit number, "\r\n" and all.
+    let key = magic.bit_or(2573.shl(16))
+    let h = if magic >= 3495 { siphash.hash_1_3(siphash.key_of(key, 0), source) } else { siphash.hash(siphash.key_of(key, 0), source) }
+    var out: [i64] = []
+    for k in 0..8 {
+        out.push(h.ushr(8 * k).bit_and(255))
+    }
+    return bytes_of(out)
+}
+
+/// Whether a .pyc still matches its source: by hash for a hash-based file
+/// (an unchecked one always matches, as the import system treats it), by
+/// modification time and size (modulo 2^32) otherwise.
+pub fn matches_source(h: PycHeader, source: bytes, mtime: i64) -> bool {
+    if h.flags.bit_and(1) != 0 {
+        return h.flags.bit_and(2) == 0 or source_hash(h.magic, source) == h.source_hash
+    }
+    return h.mtime == mtime.bit_and(4294967295) and h.source_size == source.len().bit_and(4294967295)
+}
+
+/// A .pyc header for a source: hash-based (checked or not) or by
+/// modification time.
+pub fn make_header(magic: i64, source: bytes, mtime: i64, hashed: bool, checked: bool) -> bytes {
+    var out = [magic.bit_and(255), magic.ushr(8).bit_and(255), 13, 10]
+    let flags = if hashed { 1 + (if checked { 2 } else { 0 }) } else { 0 }
+    for k in 0..4 {
+        out.push(flags.ushr(8 * k).bit_and(255))
+    }
+    let tail = if hashed { source_hash(magic, source).to_list() } else {
+        var t: [i64] = []
+        for v in [mtime.bit_and(4294967295), source.len().bit_and(4294967295)] {
+            for k in 0..4 {
+                t.push(v.ushr(8 * k).bit_and(255))
+            }
+        }
+        t
+    }
+    for x in tail {
+        out.push(x)
+    }
+    return bytes_of(out)
+}
+
+/// What the walker keeps of a marshalled value.
+type PycValue =
+    | PvStr(s: str)
+    | PvBytes(b: bytes)
+    | PvTuple(items: [PycValue])
+    | PvCode(c: PycCode)
+    | PvOther
+
+type PycReader = { d: bytes, at: i64, refs: [PycValue], modern: bool }
+
+fn byte(inout r: PycReader) -> i64 ! PycError {
+    if r.at >= r.d.len() {
+        fail(PycMalformed(r.at, "data ends inside a value"))
+    }
+    r.at = r.at + 1
+    return r.d.at(r.at - 1)
+}
+
+fn long(inout r: PycReader) -> i64 ! PycError {
+    if r.at + 4 > r.d.len() {
+        fail(PycMalformed(r.at, "data ends inside a value"))
+    }
+    let v = u32(r.d, r.at)
+    r.at = r.at + 4
+    return if v >= 2147483648 { v - 4294967296 } else { v }
+}
+
+fn take(inout r: PycReader, n: i64) -> bytes ! PycError {
+    if n < 0 or r.at + n > r.d.len() {
+        fail(PycMalformed(r.at, "data ends inside a value"))
+    }
+    r.at = r.at + n
+    return r.d.slice(r.at - n, r.at)
+}
+
+fn as_str(v: PycValue) -> str {
+    return match v {
+        PvStr(s) -> s
+        _ -> ""
+    }
+}
+
+fn strs(v: PycValue) -> [str] {
+    return match v {
+        PvTuple(items) -> items.map(|x| as_str(x))
+        _ -> []
+    }
+}
+
+/// One marshalled value. A flagged value takes the next reference slot
+/// before its contents are read, as `marshal` numbers them.
+fn value(inout r: PycReader) -> PycValue ! PycError {
+    let start = r.at
+    let code = try byte(r)
+    let t = code.bit_and(127)
+    var slot = 0 - 1
+    if code.bit_and(128) != 0 {
+        slot = r.refs.len()
+        r.refs.push(PvOther)
+    }
+    let v = try body(r, t, start)
+    if slot >= 0 {
+        r.refs[slot] = v
+    }
+    return v
+}
+
+fn body(inout r: PycReader, t: i64, start: i64) -> PycValue ! PycError {
+    // N F T . S 0: no payload
+    if t == 78 or t == 70 or t == 84 or t == 46 or t == 83 or t == 48 {
+        return PvOther
+    }
+    if t == 105 {
+        let _v = try long(r)
+        return PvOther
+    }
+    if t == 108 {
+        let n = try long(r)
+        let _d = try take(r, 2 * n.abs())
+        return PvOther
+    }
+    if t == 103 {
+        let _f = try take(r, 8)
+        return PvOther
+    }
+    if t == 121 {
+        let _c = try take(r, 16)
+        return PvOther
+    }
+    if t == 102 {
+        let n = try byte(r)
+        let _f = try take(r, n)
+        return PvOther
+    }
+    if t == 120 {
+        for _k in 0..2 {
+            let n = try byte(r)
+            let _f = try take(r, n)
+        }
+        return PvOther
+    }
+    if t == 115 {
+        let n = try long(r)
+        return PvBytes(try take(r, n))
+    }
+    if t == 116 or t == 117 or t == 97 or t == 65 {
+        let n = try long(r)
+        return PvStr((try take(r, n)).to_str())
+    }
+    if t == 122 or t == 90 {
+        let n = try byte(r)
+        return PvStr((try take(r, n)).to_str())
+    }
+    if t == 114 {
+        let k = try long(r)
+        if k < 0 or k >= r.refs.len() {
+            fail(PycMalformed(start, "a reference to an object not yet read"))
+        }
+        return r.refs[k]
+    }
+    return try containers(r, t, start)
+}
+
+fn containers(inout r: PycReader, t: i64, start: i64) -> PycValue ! PycError {
+    if t == 40 or t == 41 or t == 91 or t == 60 or t == 62 {
+        let n = if t == 41 { try byte(r) } else { try long(r) }
+        if n < 0 {
+            fail(PycMalformed(start, "a negative length"))
+        }
+        var items: [PycValue] = []
+        for _k in 0..n {
+            items.push(try value(r))
+        }
+        return if t == 40 or t == 41 { PvTuple(items) } else { PvOther }
+    }
+    if t == 123 {
+        while true {
+            if r.at < r.d.len() and r.d.at(r.at) == 48 {
+                r.at = r.at + 1
+                return PvOther
+            }
+            let _k = try value(r)
+            let _v = try value(r)
+        }
+    }
+    if t == 58 {
+        for _k in 0..3 {
+            let _s = try value(r)
+        }
+        return PvOther
+    }
+    if t == 99 {
+        return PvCode(try code_object(r))
+    }
+    fail(PycUnknownType(start, t))
+}
+
+fn code_object(inout r: PycReader) -> PycCode ! PycError {
+    var c = PycCode{ name: "", qualname: "", filename: "", first_line: 0, argcount: try long(r), posonly: try long(r), kwonly: try long(r),
+        flags: 0, stack_size: 0, names: [], locals: [], nested: [] }
+    if not r.modern {
+        let _nlocals = try long(r)
+    }
+    c.stack_size = try long(r)
+    c.flags = try long(r)
+    let _code = try value(r)
+    for v in match try value(r) {
+        PvTuple(items) -> items
+        _ -> []
+    } {
+        match v {
+            PvCode(n) -> c.nested.push(n)
+            _ -> {}
+        }
+    }
+    c.names = strs(try value(r))
+    if r.modern {
+        // Locals, cells and free variables share one list; a kind byte each
+        // says which (0x20 marks a local).
+        let names = strs(try value(r))
+        let kinds = match try value(r) {
+            PvBytes(b) -> b
+            _ -> bytes_of([])
+        }
+        for i in 0..names.len() {
+            if i < kinds.len() and kinds.at(i).bit_and(32) != 0 {
+                c.locals.push(names[i])
+            }
+        }
+    } else {
+        c.locals = strs(try value(r))
+        let _free = try value(r)
+        let _cell = try value(r)
+    }
+    c.filename = as_str(try value(r))
+    c.name = as_str(try value(r))
+    c.qualname = if r.modern { as_str(try value(r)) } else { c.name }
+    c.first_line = try long(r)
+    let _lines = try value(r)
+    if r.modern {
+        let _exceptions = try value(r)
+    }
+    return c
+}
+
+/// The code object of a .pyc: magic numbers from 3495 (Python 3.11) on use
+/// the newer layout.
+pub fn code(d: bytes) -> PycCode ! PycError {
+    let h = try header(d)
+    var r = PycReader{ d: d, at: 16, refs: [], modern: h.magic >= 3495 }
+    return match try value(r) {
+        PvCode(c) -> c
+        _ -> fail(PycMalformed(16, "the body is not a code object"))
+    }
+}

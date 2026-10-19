@@ -1,0 +1,447 @@
+// JVM class files, and the bytecode in them.
+//
+// A class file is 0xCAFEBABE, a version (52 is Java 8, 61 Java 17, 65
+// Java 21), a constant pool of UTF-8 strings, numbers, class and member
+// references, method handles and types, dynamic constants, modules and
+// packages (8- and 16-bit indices, longs and doubles taking two slots),
+// access flags, this class, its superclass and interfaces, fields and
+// methods with their descriptors, and attributes: Code (the bytecode,
+// stack and locals sizes, exception table), line numbers, local
+// variables, signatures, inner classes, bootstrap methods, records,
+// nest members, permitted subclasses and the rest. Build tools, static
+// analysers, dependency scanners and obfuscators read these; Gradle and
+// Bazel hash their API; a vulnerability scanner finds a class in a jar.
+//
+// `parse` reads the whole structure, keeping attributes it does not know
+// as raw bytes. `instructions` disassembles a Code attribute: every
+// opcode of the JVM specification with its operands, the wide forms,
+// and tableswitch and lookupswitch with their padding. `descriptor_types`
+// splits a method descriptor into parameter and return types.
+//
+// Checked against `javap -v -c -p` (Java 17) on the classes of the JDK's
+// own modules: every constant, member, flag and instruction.
+
+type CpEntry =
+    | CpEmpty
+    | CpUtf8(s: str)
+    | CpInt(v: i64)
+    | CpFloat(bits: i64)
+    | CpLong(v: i64)
+    | CpDouble(bits: i64)
+    | CpClass(name: i64)
+    | CpString(s: i64)
+    | CpMember(kind: i64, class: i64, name_type: i64)
+    | CpNameType(name: i64, descriptor: i64)
+    | CpMethodHandle(kind: i64, reference: i64)
+    | CpMethodType(descriptor: i64)
+    | CpDynamic(kind: i64, bootstrap: i64, name_type: i64)
+    | CpModule(name: i64)
+    | CpPackage(name: i64)
+
+type ClassAttribute = { name: str, data: bytes }
+
+type ClassMember = { access: i64, name: str, descriptor: str, attributes: [ClassAttribute] }
+
+type ClassFile = {
+    minor: i64,
+    major: i64,
+    pool: [CpEntry],
+    access: i64,
+    this_class: str,
+    super_class: str,
+    interfaces: [str],
+    fields: [ClassMember],
+    methods: [ClassMember],
+    attributes: [ClassAttribute],
+}
+
+type ClassCode = { max_stack: i64, max_locals: i64, code: bytes, exceptions: [(i64, i64, i64, i64)], attributes: [ClassAttribute] }
+
+type ClassInstruction = { offset: i64, opcode: i64, mnemonic: str, operands: [i64] }
+
+type ClassFileError =
+    | CfMalformed(at: i64, why: str)
+
+type CfReader = { d: bytes, at: i64 }
+
+fn u(inout r: CfReader, n: i64) -> i64 ! ClassFileError {
+    if r.at + n > r.d.len() {
+        fail(CfMalformed(r.at, "the class file ends inside a structure"))
+    }
+    var v = 0
+    for k in 0..n {
+        v = v.shl(8).bit_or(r.d.at(r.at + k))
+    }
+    r.at = r.at + n
+    return v
+}
+
+fn take(inout r: CfReader, n: i64) -> bytes ! ClassFileError {
+    if n < 0 or r.at + n > r.d.len() {
+        fail(CfMalformed(r.at, "the class file ends inside a structure"))
+    }
+    r.at = r.at + n
+    return r.d.slice(r.at - n, r.at)
+}
+
+/// Java's modified UTF-8, as a constant pool's strings are written.
+pub fn modified_utf8(b: bytes) -> str {
+    var units: [i64] = []
+    var i = 0
+    while i < b.len() {
+        let c = b.at(i)
+        if c < 128 {
+            units.push(c)
+            i = i + 1
+        } else if c.ushr(5) == 6 and i + 1 < b.len() {
+            units.push(c.bit_and(31).shl(6).bit_or(b.at(i + 1).bit_and(63)))
+            i = i + 2
+        } else if i + 2 < b.len() {
+            units.push(c.bit_and(15).shl(12).bit_or(b.at(i + 1).bit_and(63).shl(6)).bit_or(b.at(i + 2).bit_and(63)))
+            i = i + 3
+        } else {
+            units.push(65533)
+            i = i + 1
+        }
+    }
+    var out: [str] = []
+    var k = 0
+    while k < units.len() {
+        let x = units[k]
+        if x >= 55296 and x < 56320 and k + 1 < units.len() and units[k + 1] >= 56320 and units[k + 1] < 57344 {
+            out.push((65536 + (x - 55296).shl(10) + (units[k + 1] - 56320)).to_char())
+            k = k + 2
+        } else {
+            out.push((if x >= 55296 and x < 57344 { 65533 } else { x }).to_char())
+            k = k + 1
+        }
+    }
+    return out.join("")
+}
+
+fn pool(inout r: CfReader) -> [CpEntry] ! ClassFileError {
+    let n = try u(r, 2)
+    var out: [CpEntry] = [CpEmpty]
+    while out.len() < n {
+        let at = r.at
+        let tag = try u(r, 1)
+        if tag == 1 {
+            let len = try u(r, 2)
+            out.push(CpUtf8(modified_utf8(try take(r, len))))
+        } else if tag == 3 {
+            let v = try u(r, 4)
+            out.push(CpInt(if v >= 2147483648 { v - 4294967296 } else { v }))
+        } else if tag == 4 {
+            out.push(CpFloat(try u(r, 4)))
+        } else if tag == 5 or tag == 6 {
+            let v = try u(r, 8)
+            out.push(if tag == 5 { CpLong(v) } else { CpDouble(v) })
+            out.push(CpEmpty)
+        } else if tag == 7 {
+            out.push(CpClass(try u(r, 2)))
+        } else if tag == 8 {
+            out.push(CpString(try u(r, 2)))
+        } else if tag == 9 or tag == 10 or tag == 11 {
+            let c = try u(r, 2)
+            out.push(CpMember(tag, c, try u(r, 2)))
+        } else if tag == 12 {
+            let a = try u(r, 2)
+            out.push(CpNameType(a, try u(r, 2)))
+        } else if tag == 15 {
+            let k = try u(r, 1)
+            out.push(CpMethodHandle(k, try u(r, 2)))
+        } else if tag == 16 {
+            out.push(CpMethodType(try u(r, 2)))
+        } else if tag == 17 or tag == 18 {
+            let b = try u(r, 2)
+            out.push(CpDynamic(tag, b, try u(r, 2)))
+        } else if tag == 19 {
+            out.push(CpModule(try u(r, 2)))
+        } else if tag == 20 {
+            out.push(CpPackage(try u(r, 2)))
+        } else {
+            fail(CfMalformed(at, "an unknown constant pool tag {tag}"))
+        }
+    }
+    return out
+}
+
+/// The text of a UTF-8 constant.
+pub fn utf8(p: [CpEntry], i: i64) -> str {
+    if i <= 0 or i >= p.len() {
+        return ""
+    }
+    return match p[i] {
+        CpUtf8(s) -> s
+        _ -> ""
+    }
+}
+
+/// The name a Class constant refers to.
+pub fn class_name(p: [CpEntry], i: i64) -> str {
+    if i <= 0 or i >= p.len() {
+        return ""
+    }
+    return match p[i] {
+        CpClass(n) -> utf8(p, n)
+        _ -> ""
+    }
+}
+
+fn attributes(inout r: CfReader, p: [CpEntry]) -> [ClassAttribute] ! ClassFileError {
+    let n = try u(r, 2)
+    var out: [ClassAttribute] = []
+    for _k in 0..n {
+        let name = utf8(p, try u(r, 2))
+        let len = try u(r, 4)
+        out.push(ClassAttribute{ name: name, data: try take(r, len) })
+    }
+    return out
+}
+
+fn members(inout r: CfReader, p: [CpEntry]) -> [ClassMember] ! ClassFileError {
+    let n = try u(r, 2)
+    var out: [ClassMember] = []
+    for _k in 0..n {
+        let access = try u(r, 2)
+        let name = utf8(p, try u(r, 2))
+        let desc = utf8(p, try u(r, 2))
+        out.push(ClassMember{ access: access, name: name, descriptor: desc, attributes: try attributes(r, p) })
+    }
+    return out
+}
+
+pub fn parse(d: bytes) -> ClassFile ! ClassFileError {
+    var r = CfReader{ d: d, at: 0 }
+    if (try u(r, 4)) != 3405691582 {
+        fail(CfMalformed(0, "no 0xCAFEBABE"))
+    }
+    let minor = try u(r, 2)
+    let major = try u(r, 2)
+    let p = try pool(r)
+    let access = try u(r, 2)
+    let this_class = class_name(p, try u(r, 2))
+    let super_class = class_name(p, try u(r, 2))
+    let ni = try u(r, 2)
+    var interfaces: [str] = []
+    for _k in 0..ni {
+        interfaces.push(class_name(p, try u(r, 2)))
+    }
+    let fields = try members(r, p)
+    let methods = try members(r, p)
+    let attrs = try attributes(r, p)
+    if r.at != d.len() {
+        fail(CfMalformed(r.at, "bytes after the class"))
+    }
+    return ClassFile{ minor: minor, major: major, pool: p, access: access, this_class: this_class, super_class: super_class,
+        interfaces: interfaces, fields: fields, methods: methods, attributes: attrs }
+}
+
+/// A Code attribute's parts.
+pub fn code(p: [CpEntry], a: ClassAttribute) -> ClassCode ! ClassFileError {
+    var r = CfReader{ d: a.data, at: 0 }
+    let max_stack = try u(r, 2)
+    let max_locals = try u(r, 2)
+    let len = try u(r, 4)
+    let body = try take(r, len)
+    let ne = try u(r, 2)
+    var ex: [(i64, i64, i64, i64)] = []
+    for _k in 0..ne {
+        let a1 = try u(r, 2)
+        let a2 = try u(r, 2)
+        let a3 = try u(r, 2)
+        ex.push((a1, a2, a3, try u(r, 2)))
+    }
+    return ClassCode{ max_stack: max_stack, max_locals: max_locals, code: body, exceptions: ex, attributes: try attributes(r, p) }
+}
+
+fn mnemonics() -> [str] {
+    let s = "nop aconst_null iconst_m1 iconst_0 iconst_1 iconst_2 iconst_3 iconst_4 iconst_5 lconst_0 lconst_1 fconst_0 fconst_1 fconst_2 " +
+    "dconst_0 dconst_1 bipush sipush ldc ldc_w ldc2_w iload lload fload dload aload iload_0 iload_1 iload_2 iload_3 lload_0 lload_1 " +
+    "lload_2 lload_3 fload_0 fload_1 fload_2 fload_3 dload_0 dload_1 dload_2 dload_3 aload_0 aload_1 aload_2 aload_3 iaload laload " +
+    "faload daload aaload baload caload saload istore lstore fstore dstore astore istore_0 istore_1 istore_2 istore_3 lstore_0 " +
+    "lstore_1 lstore_2 lstore_3 fstore_0 fstore_1 fstore_2 fstore_3 dstore_0 dstore_1 dstore_2 dstore_3 astore_0 astore_1 astore_2 " +
+    "astore_3 iastore lastore fastore dastore aastore bastore castore sastore pop pop2 dup dup_x1 dup_x2 dup2 dup2_x1 dup2_x2 swap " +
+    "iadd ladd fadd dadd isub lsub fsub dsub imul lmul fmul dmul idiv ldiv fdiv ddiv irem lrem frem drem ineg lneg fneg dneg ishl " +
+    "lshl ishr lshr iushr lushr iand land ior lor ixor lxor iinc i2l i2f i2d l2i l2f l2d f2i f2l f2d d2i d2l d2f i2b i2c i2s lcmp " +
+    "fcmpl fcmpg dcmpl dcmpg ifeq ifne iflt ifge ifgt ifle if_icmpeq if_icmpne if_icmplt if_icmpge if_icmpgt if_icmple if_acmpeq " +
+    "if_acmpne goto jsr ret tableswitch lookupswitch ireturn lreturn freturn dreturn areturn return getstatic putstatic getfield " +
+    "putfield invokevirtual invokespecial invokestatic invokeinterface invokedynamic new newarray anewarray arraylength athrow " +
+    "checkcast instanceof monitorenter monitorexit wide multianewarray ifnull ifnonnull goto_w jsr_w"
+    return s.split(" ")
+}
+
+/// How an opcode's operands are laid out: "" none, "b" a signed byte,
+/// "s" a signed short, "c1" and "c2" constant pool indices, "l" a local,
+/// "i" iinc, "j" and "J" branch offsets of 2 and 4 bytes, and the rest
+/// by name.
+fn layout(op: i64) -> str {
+    if op == 16 {
+        return "b"
+    }
+    if op == 188 {
+        return "c1"
+    }
+    if op == 17 {
+        return "s"
+    }
+    if op == 18 {
+        return "c1"
+    }
+    if op == 19 or op == 20 or op >= 178 and op <= 184 or op == 187 or op == 189 or op == 192 or op == 193 {
+        return "c2"
+    }
+    if op >= 21 and op <= 25 or op >= 54 and op <= 58 or op == 169 {
+        return "l"
+    }
+    if op == 132 {
+        return "i"
+    }
+    if op >= 153 and op <= 168 or op == 198 or op == 199 {
+        return "j"
+    }
+    if op == 200 or op == 201 {
+        return "J"
+    }
+    return if op == 185 { "ii" } else if op == 186 { "id" } else if op == 197 { "m" } else if op == 170 { "ts" } else if op == 171 { "ls" }
+    else if op == 196 { "w" } else { "" }
+}
+
+fn s_of(v: i64, n: i64) -> i64 {
+    let top = 1.shl(8 * n - 1)
+    return if v >= top { v - 2 * top } else { v }
+}
+
+/// The instructions of a method's bytecode. Branch operands are absolute
+/// offsets; newarray's is its type code; a wide instruction is its
+/// opcode's mnemonic with "_w"; tableswitch gives the default, low, high
+/// and each target, lookupswitch the default, the pair count and each
+/// match and target.
+pub fn instructions(code: bytes) -> [ClassInstruction] ! ClassFileError {
+    let names = mnemonics()
+    var out: [ClassInstruction] = []
+    var r = CfReader{ d: code, at: 0 }
+    while r.at < code.len() {
+        let pc = r.at
+        let op = try u(r, 1)
+        if op > 201 {
+            fail(CfMalformed(pc, "an unknown opcode {op}"))
+        }
+        var name = names[op]
+        var ops: [i64] = []
+        let l = layout(op)
+        if l == "b" {
+            ops.push(s_of(try u(r, 1), 1))
+        } else if l == "s" {
+            ops.push(s_of(try u(r, 2), 2))
+        } else if l == "c1" or l == "l" {
+            ops.push(try u(r, 1))
+        } else if l == "c2" {
+            ops.push(try u(r, 2))
+        } else if l == "i" {
+            ops.push(try u(r, 1))
+            ops.push(s_of(try u(r, 1), 1))
+        } else if l == "j" {
+            ops.push(pc + s_of(try u(r, 2), 2))
+        } else if l == "J" {
+            ops.push(pc + s_of(try u(r, 4), 4))
+        } else if l == "ii" or l == "id" or l == "m" {
+            ops.push(try u(r, 2))
+            ops.push(try u(r, 1))
+            if l != "m" {
+                ops.push(try u(r, 1))
+            }
+        } else if l == "ts" or l == "ls" {
+            while r.at % 4 != 0 {
+                let _pad = try u(r, 1)
+            }
+            ops.push(pc + s_of(try u(r, 4), 4))
+            if l == "ts" {
+                let low = s_of(try u(r, 4), 4)
+                let high = s_of(try u(r, 4), 4)
+                if high < low or high - low > 65536 {
+                    fail(CfMalformed(pc, "a tableswitch whose range is impossible"))
+                }
+                ops.push(low)
+                ops.push(high)
+                for _k in 0..(high - low + 1) {
+                    ops.push(pc + s_of(try u(r, 4), 4))
+                }
+            } else {
+                let n = s_of(try u(r, 4), 4)
+                if n < 0 or n > 65536 {
+                    fail(CfMalformed(pc, "a lookupswitch with an impossible pair count"))
+                }
+                ops.push(n)
+                for _k in 0..n {
+                    ops.push(s_of(try u(r, 4), 4))
+                    ops.push(pc + s_of(try u(r, 4), 4))
+                }
+            }
+        } else if l == "w" {
+            let inner = try u(r, 1)
+            if inner > 201 or layout(inner) != "l" and inner != 132 {
+                fail(CfMalformed(pc, "wide before an opcode it cannot widen"))
+            }
+            name = names[inner] + "_w"
+            ops.push(try u(r, 2))
+            if inner == 132 {
+                ops.push(s_of(try u(r, 2), 2))
+            }
+        }
+        out.push(ClassInstruction{ offset: pc, opcode: op, mnemonic: name, operands: ops })
+    }
+    return out
+}
+
+/// A field descriptor's type from `at`: its text and where it ends.
+fn one_type(d: str, at: i64) -> (str, i64) ! ClassFileError {
+    var i = at
+    let cs = d.chars()
+    while i < cs.len() and cs[i] == "[" {
+        i = i + 1
+    }
+    if i >= cs.len() {
+        fail(CfMalformed(at, "a descriptor cut short"))
+    }
+    if cs[i] == "L" {
+        var j = i
+        while j < cs.len() and cs[j] != ";" {
+            j = j + 1
+        }
+        if j >= cs.len() {
+            fail(CfMalformed(at, "a class type without its \";\""))
+        }
+        return (cs.slice(at, j + 1).join(""), j + 1)
+    }
+    if not "BCDFIJSZ".contains(cs[i]) {
+        fail(CfMalformed(i, "an unknown type " + cs[i]))
+    }
+    return (cs.slice(at, i + 1).join(""), i + 1)
+}
+
+/// A method descriptor's parameter types and return type ("V" for void).
+pub fn descriptor_types(d: str) -> ([str], str) ! ClassFileError {
+    let cs = d.chars()
+    if cs.len() < 3 or cs[0] != "(" {
+        fail(CfMalformed(0, "not a method descriptor"))
+    }
+    var params: [str] = []
+    var i = 1
+    while i < cs.len() and cs[i] != ")" {
+        let (t, next) = try one_type(d, i)
+        params.push(t)
+        i = next
+    }
+    if i >= cs.len() {
+        fail(CfMalformed(i, "a descriptor without \")\""))
+    }
+    if i + 1 < cs.len() and cs[i + 1] == "V" and i + 2 == cs.len() {
+        return (params, "V")
+    }
+    let (ret, end) = try one_type(d, i + 1)
+    if end != cs.len() {
+        fail(CfMalformed(end, "text after the return type"))
+    }
+    return (params, ret)
+}

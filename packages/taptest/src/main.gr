@@ -1,0 +1,485 @@
+// The Test Anything Protocol: reading a test run's TAP, and writing it.
+//
+// TAP is the line-oriented output of Perl's test suites, and of node-tap,
+// Node's built-in test runner, pytest-tap, Bats, libtap and many CI
+// systems: an optional "TAP version 13", a plan "1..N" (at the start or
+// the end), one "ok" or "not ok" line per test with an optional number,
+// description and "# SKIP" or "# TODO" directive, comments starting with
+// "#", "Bail out!" to stop the run, and (version 13) an indented YAML
+// block "---" ... "..." of diagnostics after a test.
+//
+// `parse` reads a run as Perl's TAP::Parser does, line for line: which
+// token each line is (the same regular expressions, tried in the same
+// order), test numbers filled in from the count, a plan's TODO list
+// applied, and the run's result -- passed, failed, todo, unexpectedly
+// passing todo, skipped and actually passing tests, whether the plan was
+// good, a skip-all reason, a bail-out -- with TAP::Parser's parse errors
+// in its words, so a harness built on this reports what `prove` reports.
+//
+// Checked against TAP::Parser 3.43 (Perl 5.34).
+
+type TapToken =
+    | TapVersion(version: i64)
+    | TapPlan(planned: i64, directive: str, explanation: str, todo: [i64])
+    | TapTest(ok: bool, number: i64, description: str, directive: str, explanation: str)
+    | TapComment(text: str)
+    | TapBailout(reason: str)
+    | TapYaml(raw: str)
+    | TapPragma(pragmas: [str])
+    | TapUnknown(raw: str)
+
+type TapRun = {
+    tokens: [TapToken],
+    version: i64,
+    planned: i64,
+    tests_run: i64,
+    passed: [i64],
+    failed: [i64],
+    actual_passed: [i64],
+    actual_failed: [i64],
+    todo: [i64],
+    todo_passed: [i64],
+    skipped: [i64],
+    skip_all: Option[str],
+    bailout: Option[str],
+    good_plan: bool,
+    errors: [str],
+}
+
+fn is_space(c: str) -> bool {
+    return c == " " or c == "\t" or c == "\r" or c == "\n" or c == "\u{c}" or c == "\u{b}"
+}
+
+/// Perl's `s/^\s+//; s/\s+$//`.
+fn trim(s: str) -> str {
+    let cs = s.chars()
+    var a = 0
+    var b = cs.len()
+    while a < b and is_space(cs[a]) {
+        a = a + 1
+    }
+    while b > a and is_space(cs[b - 1]) {
+        b = b - 1
+    }
+    return cs.slice(a, b).join("")
+}
+
+fn digits_at(cs: [str], at: i64) -> i64 {
+    var n = 0
+    while at + n < cs.len() and cs[at + n] >= "0" and cs[at + n] <= "9" {
+        n = n + 1
+    }
+    return n
+}
+
+fn skip_spaces(cs: [str], at: i64) -> i64 {
+    var i = at
+    while i < cs.len() and is_space(cs[i]) {
+        i = i + 1
+    }
+    return i
+}
+
+fn word_char(c: str) -> bool {
+    return c >= "a" and c <= "z" or c >= "A" and c <= "Z" or c >= "0" and c <= "9" or c == "_"
+}
+
+fn upper_is(cs: [str], at: i64, word: str) -> bool {
+    let w = word.chars()
+    if at + w.len() > cs.len() {
+        return false
+    }
+    for k in 0..w.len() {
+        if cs[at + k].to_upper() != w[k] {
+            return false
+        }
+    }
+    return true
+}
+
+/// `ok` / `not ok`, a number, and the rest split at an unescaped "#" that
+/// starts a SKIP or TODO directive.
+fn test_line(cs: [str]) -> Option[TapToken] {
+    let negated = cs.len() >= 4 and cs.slice(0, 4).join("") == "not "
+    let at = if negated { 4 } else { 0 }
+    if at + 2 > cs.len() or cs[at] != "o" or cs[at + 1] != "k" or at + 2 < cs.len() and word_char(cs[at + 2]) {
+        return None
+    }
+    var i = skip_spaces(cs, at + 2)
+    let n = digits_at(cs, i)
+    var number = 0 - 1
+    if n > 0 {
+        number = cs.slice(i, i + n).join("").parse_int() ?? -1
+        i = skip_spaces(cs, i + n)
+    }
+    let rest = cs.slice(i, cs.len())
+    // The directive: the first "#" not escaped by a backslash, then SKIP or
+    // TODO as a whole word, in any case.
+    var k = 0
+    while k < rest.len() {
+        if rest[k] == "\\" {
+            k = k + 2
+            continue
+        }
+        if rest[k] == "#" {
+            let d = skip_spaces(rest, k + 1)
+            for word in ["SKIP", "TODO"] {
+                if upper_is(rest, d, word) and (d + 4 >= rest.len() or not word_char(rest[d + 4])) {
+                    return Some(TapTest(not negated, number, trim(rest.slice(0, k).join("")), word, trim(rest.slice(d + 4, rest.len()).join(""))))
+                }
+            }
+            break
+        }
+        k = k + 1
+    }
+    return Some(TapTest(not negated, number, trim(rest.join("")), "", ""))
+}
+
+fn plan_line(cs: [str], version: i64) -> Option[TapToken] {
+    if cs.len() < 4 or cs.slice(0, 3).join("") != "1.." {
+        return None
+    }
+    let n = digits_at(cs, 3)
+    if n == 0 {
+        return None
+    }
+    let planned = cs.slice(3, 3 + n).join("").parse_int() ?? 0
+    let tail_at = skip_spaces(cs, 3 + n)
+    let tail = cs.slice(tail_at, cs.len())
+    if version >= 13 {
+        if tail.len() == 0 {
+            return Some(TapPlan(planned, if planned == 0 { "SKIP" } else { "" }, "", []))
+        }
+        // "#", spaces, SKIP as a word, then the explanation.
+        if tail[0] != "#" {
+            return None
+        }
+        let d = skip_spaces(tail, 1)
+        if not upper_is(tail, d, "SKIP") or d + 4 < tail.len() and word_char(tail[d + 4]) {
+            return None
+        }
+        return Some(TapPlan(planned, "SKIP", trim(tail.slice(d + 4, tail.len()).join("")), []))
+    }
+    let t = tail.join("")
+    if t.starts_with("todo") {
+        // "todo", then one or more runs of spaces and digits; anything after
+        // the last run is ignored, as TAP::Parser's pattern ignores it.
+        var todo: [i64] = []
+        var p = 4
+        while p < tail.len() and is_space(tail[p]) {
+            let q = skip_spaces(tail, p)
+            let run = digits_at(tail, q)
+            if run == 0 {
+                break
+            }
+            todo.push(tail.slice(q, q + run).join("").parse_int() ?? 0)
+            p = q + run
+        }
+        if todo.len() > 0 {
+            return Some(TapPlan(planned, "TODO", "", todo))
+        }
+    }
+    if planned == 0 {
+        // "# SKIP..." then at least one space before the reason.
+        var explanation = ""
+        if tail.len() > 0 and tail[0] == "#" {
+            let d = skip_spaces(tail, 1)
+            if upper_is(tail, d, "SKIP") {
+                var e = d + 4
+                while e < tail.len() and not is_space(tail[e]) {
+                    e = e + 1
+                }
+                if e < tail.len() {
+                    explanation = trim(tail.slice(skip_spaces(tail, e), tail.len()).join(""))
+                }
+            }
+        }
+        return Some(TapPlan(0, "SKIP", explanation, []))
+    }
+    if trim(t).len() > 0 {
+        return Some(TapUnknown(cs.join("")))
+    }
+    return Some(TapPlan(planned, "", "", []))
+}
+
+/// Which token one line is, for the TAP version in force.
+pub fn token(line: str, version: i64) -> TapToken {
+    let cs = line.chars()
+    match test_line(cs) {
+        Some(t) -> return t
+        None -> {}
+    }
+    if cs.len() > 0 and cs[0] == "#" {
+        return TapComment(trim(cs.slice(1, cs.len()).join("")))
+    }
+    match plan_line(cs, version) {
+        Some(t) -> return t
+        None -> {}
+    }
+    // TAP, spaces, version, spaces, digits, then nothing but spaces.
+    if upper_is(cs, 0, "TAP") and 3 < cs.len() and is_space(cs[3]) {
+        let v = skip_spaces(cs, 3)
+        if upper_is(cs, v, "VERSION") and v + 7 < cs.len() and is_space(cs[v + 7]) {
+            let d = skip_spaces(cs, v + 7)
+            let n = digits_at(cs, d)
+            if n > 0 and skip_spaces(cs, d + n) == cs.len() {
+                return TapVersion(cs.slice(d, d + n).join("").parse_int() ?? 0)
+            }
+        }
+    }
+    let b = skip_spaces(cs, 0)
+    if cs.slice(b, cs.len()).join("").starts_with("Bail out!") {
+        return TapBailout(trim(cs.slice(b + 9, cs.len()).join("")))
+    }
+    if version >= 13 and line.starts_with("pragma ") {
+        let ps = line.substr(7, line.len() - 7).split(",").map(|p| trim(p))
+        if ps.len() > 0 and ps.all(|p| p.len() > 1 and (p.starts_with("+") or p.starts_with("-")) and p.substr(1, p.len() - 1).chars().all(|c| word_char(c))) {
+            return TapPragma(ps)
+        }
+    }
+    return TapUnknown(line)
+}
+
+/// What the parser has seen, and where in TAP::Parser's state table it is.
+type TapState = { run: TapRun, state: str, plan_text: str, todo_plan: [i64], strict: bool, has_plan: bool, last_directive: str }
+
+fn add_test(inout st: TapState, ok: bool, number: i64, directive_in: str) {
+    st.run.tests_run = st.run.tests_run + 1
+    let run_n = st.run.tests_run
+    var directive = directive_in
+    if number >= 0 {
+        var k = 0 - 1
+        for i in 0..st.todo_plan.len() {
+            if st.todo_plan[i] == number and k < 0 {
+                k = i
+            }
+        }
+        if k >= 0 {
+            directive = "TODO"
+            var rest: [i64] = []
+            for i in 0..st.todo_plan.len() {
+                if st.todo_plan[i] != number {
+                    rest.push(st.todo_plan[i])
+                }
+            }
+            st.todo_plan = rest
+        }
+    }
+    let unplanned = st.run.planned >= 0 and run_n > st.run.planned
+    var n = number
+    if number >= 0 {
+        if number != run_n {
+            st.run.errors.push("Tests out of sequence.  Found ({number}) but expected ({run_n})")
+        }
+    } else {
+        n = run_n
+    }
+    st.last_directive = directive
+    let todo = directive == "TODO"
+    if todo {
+        st.run.todo.push(n)
+        if ok {
+            st.run.todo_passed.push(n)
+        }
+    }
+    if directive == "SKIP" {
+        st.run.skipped.push(n)
+    }
+    if not unplanned and (todo or ok) {
+        st.run.passed.push(n)
+    } else {
+        st.run.failed.push(n)
+    }
+    if ok {
+        st.run.actual_passed.push(n)
+    } else {
+        st.run.actual_failed.push(n)
+    }
+}
+
+fn add_plan(inout st: TapState, planned: i64, directive: str, explanation: str, todo: [i64]) {
+    st.run.planned = planned
+    st.has_plan = true
+    st.plan_text = "1..{planned}"
+    if directive == "SKIP" {
+        st.run.skip_all = Some(if explanation.len() > 0 { explanation } else { "(no reason given)" })
+    }
+    for x in todo {
+        st.todo_plan.push(x)
+    }
+}
+
+/// One token through the state table: (state, kind) to what happens.
+fn step(inout st: TapState, t: TapToken) {
+    let s = st.state
+    match t {
+        TapTest(ok, number, _d, directive, _e) -> {
+            if s == "GOT_PLAN" {
+                st.run.errors.push("Plan (" + st.plan_text + ") must be at the beginning or end of the TAP output")
+                st.run.good_plan = false
+            }
+            add_test(st, ok, number, directive)
+            st.state = if s == "INIT" or s == "PLAN" or s == "UNPLANNED" or s == "UNPLANNED_AFTER_TEST" { "UNPLANNED_AFTER_TEST" } else { "PLANNED_AFTER_TEST" }
+        }
+        TapPlan(planned, directive, explanation, todo) -> {
+            if s == "PLANNED" or s == "PLANNED_AFTER_TEST" or s == "GOT_PLAN" {
+                st.run.errors.push("More than one plan found in TAP output")
+                st.state = "PLANNED"
+            } else {
+                add_plan(st, planned, directive, explanation, todo)
+                st.state = if s == "INIT" or s == "PLAN" { "PLANNED" } else { "GOT_PLAN" }
+            }
+        }
+        TapVersion(v) -> {
+            if s == "INIT" {
+                var ver = v
+                if ver <= 12 {
+                    st.run.errors.push("Explicit TAP version must be at least 13. Got version {ver}")
+                    ver = 12
+                }
+                if ver > 13 {
+                    st.run.errors.push("TAP specified version {ver} but we don't know about versions later than 13")
+                    ver = 13
+                }
+                st.run.version = ver
+                st.state = "PLAN"
+            } else {
+                st.run.errors.push("If TAP version is present it must be the first line of output")
+            }
+        }
+        TapYaml(_r) -> {
+            if s == "PLANNED_AFTER_TEST" {
+                st.state = "PLANNED"
+            } else if s == "UNPLANNED_AFTER_TEST" {
+                st.state = "UNPLANNED"
+            }
+        }
+        TapBailout(reason) -> {
+            if st.run.bailout.is_none() {
+                st.run.bailout = Some(reason)
+            }
+        }
+        TapPragma(ps) -> {
+            for p in ps {
+                if p.substr(1, p.len() - 1) == "strict" {
+                    st.strict = p.starts_with("+")
+                }
+            }
+        }
+        TapUnknown(raw) -> {
+            if st.strict {
+                st.run.errors.push("Unknown TAP token: \"" + raw + "\"")
+            }
+        }
+        TapComment(_c) -> {}
+    }
+}
+
+/// A test run's TAP, read as TAP::Parser reads it.
+pub fn parse(text: str) -> TapRun {
+    // Perl's split /\n/: empty lines at the end are not lines.
+    var lines = text.split("\n")
+    while lines.len() > 0 and lines[lines.len() - 1].len() == 0 {
+        let _l = lines.pop()
+    }
+    var st = TapState{ run: TapRun{ tokens: [], version: 12, planned: 0 - 1, tests_run: 0, passed: [], failed: [], actual_passed: [],
+        actual_failed: [], todo: [], todo_passed: [], skipped: [], skip_all: None, bailout: None, good_plan: true, errors: [] },
+        state: "INIT", plan_text: "", todo_plan: [], strict: false, has_plan: false, last_directive: "" }
+    var i = 0
+    while i < lines.len() {
+        var t = token(lines[i], st.run.version)
+        if st.run.version >= 13 {
+            match yaml_block(lines, i) {
+                Some((raw, next, closed)) -> {
+                    if not closed {
+                        st.run.errors.push("Missing '...' at end of YAMLish")
+                    }
+                    t = TapYaml(raw)
+                    i = next - 1
+                }
+                None -> {}
+            }
+        }
+        step(st, t)
+        // A test without a number gets the count, in the token too.
+        match t {
+            TapTest(ok, number, d, _dir, ex) -> {
+                // TAP::Parser writes into the token the number it gave a
+                // test and a TODO the plan's list gave it.
+                t = TapTest(ok, if number < 0 { st.run.tests_run } else { number }, d, st.last_directive, ex)
+            }
+            _ -> {}
+        }
+        st.run.tokens.push(t)
+        i = i + 1
+    }
+    finish(st)
+    return st.run
+}
+
+/// A version 13 YAML block starting at line `at`: its raw lines, the line
+/// after it, and whether it was closed by "...".
+fn yaml_block(lines: [str], at: i64) -> Option[(str, i64, bool)] {
+    let cs = lines[at].chars()
+    let pad = skip_spaces(cs, 0)
+    if pad == 0 or not cs.slice(pad, cs.len()).join("").starts_with("---") {
+        return None
+    }
+    var raw = [lines[at]]
+    var i = at + 1
+    while i < lines.len() {
+        let l = lines[i].chars()
+        var k = 0
+        while k < pad and k < l.len() and is_space(l[k]) {
+            k = k + 1
+        }
+        if k < pad {
+            // TAP::Parser's reader takes this line too, and it is lost.
+            return Some((raw.join("\n"), i + 1, false))
+        }
+        raw.push(lines[i])
+        let body = l.slice(pad, l.len()).join("")
+        if body.starts_with("...") and trim(body.substr(3, body.len() - 3)).len() == 0 {
+            // TAP::Parser's raw text ends with the line ending.
+            return Some((raw.join("\n") + "\n", i + 1, true))
+        }
+        i = i + 1
+    }
+    return Some((raw.join("\n"), i, false))
+}
+
+fn finish(inout st: TapState) {
+    if not st.has_plan {
+        st.run.errors.push("No plan found in TAP output")
+        st.run.good_plan = false
+    }
+    let planned = if st.run.planned >= 0 { st.run.planned } else { 0 }
+    if st.run.tests_run != planned {
+        st.run.good_plan = false
+        if st.run.planned >= 0 {
+            st.run.errors.push("Bad plan.  You planned {st.run.planned} tests but ran {st.run.tests_run}.")
+        }
+    }
+}
+
+/// A plan line.
+pub fn plan(n: i64) -> str {
+    return "1..{n}"
+}
+
+/// A test line as Test::More writes it: "#" in the description escaped,
+/// the directive and its explanation after " # ". A newline cannot be in
+/// a line and is refused.
+pub fn result_line(ok: bool, number: i64, description: str, directive: str, explanation: str) -> Option[str] {
+    if description.contains("\n") or explanation.contains("\n") {
+        return None
+    }
+    var out = (if ok { "ok" } else { "not ok" }) + " {number}"
+    if description.len() > 0 {
+        out = out + " - " + description.replace("#", "\\#")
+    }
+    if directive.len() > 0 {
+        out = out + " # " + directive + (if explanation.len() > 0 { " " + explanation } else { "" })
+    }
+    return Some(out)
+}

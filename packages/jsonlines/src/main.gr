@@ -1,0 +1,115 @@
+// JSON Lines (NDJSON) and JSON text sequences (RFC 7464): many JSON values
+// in one file.
+//
+// JSON Lines is one value per line, each line ended by "\n" (a "\r" before
+// it is JSON whitespace and is allowed); the last line may or may not end
+// with one. Log pipelines, BigQuery and Elasticsearch bulk loads, OpenAI's
+// batch files and every `jq -c` output are JSON Lines, because a file can
+// be appended to, split and streamed a line at a time. A blank line is not
+// a value, and is an error here as it is to Python's `json.loads` of each
+// line: a reader that skipped it would hide a truncated write.
+//
+// A JSON text sequence starts each value with the record separator (0x1E)
+// and ends it with "\n". A text that does not parse is reported and the
+// reader goes on at the next separator, as RFC 7464 asks of a reader of a
+// sequence that may have been cut short.
+//
+// Checked against Python's `json` module, line by line and record by
+// record.
+import json
+
+type JsonLinesError =
+    | JlBadLine(line: i64, why: str)
+
+/// The values of a JSON Lines text, in order.
+pub fn parse(text: str) -> [ref Json] ! JsonLinesError {
+    var out: [ref Json] = []
+    let lines = text.split("\n")
+    for i in 0..lines.len() {
+        if i == lines.len() - 1 and lines[i].len() == 0 {
+            break
+        }
+        let v = json.parse(lines[i]) ?? {
+            for x in out {
+                json.free(x)
+            }
+            fail(JlBadLine(i + 1, if lines[i].trim().len() == 0 { "a blank line" } else { "not one JSON value" }))
+        }
+        out.push(v)
+    }
+    return out
+}
+
+/// Each value on its own line, every line ended with "\n".
+pub fn render(values: [ref Json]) -> str {
+    var parts: [str] = []
+    for v in values {
+        parts.push(json.render(v) + "\n")
+    }
+    return parts.join("")
+}
+
+/// The line at `at` (a byte offset into `text`) and where the next one
+/// starts, for reading a large file a line at a time; None past the end.
+pub fn next_line(text: str, at: i64) -> Option[(str, i64)] {
+    let b = text.to_bytes()
+    if at >= b.len() {
+        return None
+    }
+    var end = at
+    while end < b.len() and b.at(end) != 10 {
+        end = end + 1
+    }
+    return Some((b.slice(at, end).to_str(), if end < b.len() { end + 1 } else { end }))
+}
+
+/// One record of a JSON text sequence: its value, or None when it did not
+/// parse (cut short, or not JSON).
+type JsonSeqRecord = { value: Option[ref Json], text: str }
+
+/// The records of a JSON text sequence. Anything before the first record
+/// separator is not a record and is dropped; a record whose text is empty
+/// (two separators in a row) is skipped, as RFC 7464 allows.
+pub fn parse_seq(data: bytes) -> [JsonSeqRecord] {
+    var out: [JsonSeqRecord] = []
+    var i = 0
+    while i < data.len() and data.at(i) != 30 {
+        i = i + 1
+    }
+    while i < data.len() {
+        var end = i + 1
+        while end < data.len() and data.at(end) != 30 {
+            end = end + 1
+        }
+        let text = data.slice(i + 1, end).to_str()
+        if text.trim().len() > 0 {
+            // A text that does not end in "\n" was cut short, even when what
+            // there is happens to parse (a number cut after a digit would).
+            let whole = text.ends_with("\n")
+            var v: Option[ref Json] = None
+            if whole {
+                match json.parse(text) {
+                    Ok(j) -> {
+                        v = Some(j)
+                    }
+                    Err(_) -> {}
+                }
+            }
+            out.push(JsonSeqRecord{ value: v, text: text })
+        }
+        i = end
+    }
+    return out
+}
+
+/// Each value as a record: the separator, the value, "\n".
+pub fn render_seq(values: [ref Json]) -> bytes {
+    var out: [i64] = []
+    for v in values {
+        out.push(30)
+        for x in (json.render(v) + "\n").to_bytes().to_list() {
+            out.push(x)
+        }
+    }
+    return bytes_of(out)
+}

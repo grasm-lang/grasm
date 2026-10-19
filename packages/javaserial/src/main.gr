@@ -1,0 +1,569 @@
+// Java object serialization streams: what ObjectOutputStream writes.
+//
+// RMI, JMX, old session stores, Java caches (Ehcache, Hazelcast's legacy
+// mode), Apache Commons and countless message queues pass objects this
+// way, and a security scanner must read it to see what a payload would
+// instantiate. A stream is 0xACED, version 5, then contents: objects
+// (a class description and each class's field values, from the topmost
+// serializable superclass down, with the data a class's own writeObject
+// adds as an annotation of block data and further objects), class
+// descriptions (name, serialVersionUID, flags, typed fields, annotation,
+// superclass), strings (modified UTF-8, with a long form), arrays, enum
+// constants, classes, proxy class descriptions, block data, resets and
+// exceptions. Every description, object, string, array, enum and class
+// gets a handle in order, and anything met again is written as a
+// reference to its handle.
+//
+// A stream is held as an arena of `JavaItem`s with handles resolved to
+// item numbers, so shared and cyclic graphs survive; `encode` writes it
+// back as it was read, byte for byte. Nothing is instantiated: reading a
+// stream here runs no code, which is the point of reading it here.
+//
+// Checked against Java 17's ObjectOutputStream and ObjectInputStream:
+// streams of custom classes, records, enums, arrays, boxed numbers,
+// collections and cycles read here and written back unchanged, and every
+// object's serializable fields equal to what Java reads.
+
+type JavaField = { code: str, name: str, class_name: i64 }
+
+type JavaValue =
+    | JvPrim(code: str, bits: i64)
+    | JvRef(item: i64)
+
+type JavaClassData = { values: [JavaValue], annotation: [i64] }
+
+type JavaItem =
+    | JiNull
+    | JiDesc(name: str, uid: i64, flags: i64, fields: [JavaField], annotation: [i64], super_desc: i64)
+    | JiProxy(interfaces: [str], annotation: [i64], super_desc: i64)
+    | JiObject(desc: i64, data: [JavaClassData])
+    | JiString(raw: bytes, long: bool)
+    | JiArray(desc: i64, values: [JavaValue])
+    | JiEnum(desc: i64, name: i64)
+    | JiClass(desc: i64)
+    | JiBlock(data: bytes, long: bool)
+    | JiReset
+    | JiException(thrown: i64)
+
+type JavaStream = { items: [JavaItem], contents: [i64] }
+
+type JavaSerialError =
+    | JsMalformed(at: i64, why: str)
+
+type JsReader = { d: bytes, at: i64, items: [JavaItem], handles: [i64] }
+
+fn u8(inout r: JsReader) -> i64 ! JavaSerialError {
+    if r.at >= r.d.len() {
+        fail(JsMalformed(r.at, "the stream ends inside an item"))
+    }
+    r.at = r.at + 1
+    return r.d.at(r.at - 1)
+}
+
+fn be(inout r: JsReader, n: i64) -> i64 ! JavaSerialError {
+    if r.at + n > r.d.len() {
+        fail(JsMalformed(r.at, "the stream ends inside an item"))
+    }
+    var v = 0
+    for k in 0..n {
+        v = v.shl(8).bit_or(r.d.at(r.at + k))
+    }
+    r.at = r.at + n
+    return v
+}
+
+fn signed(v: i64, n: i64) -> i64 {
+    if n >= 8 {
+        return v
+    }
+    let top = 1.shl(8 * n - 1)
+    return if v >= top { v - 2 * top } else { v }
+}
+
+/// Java's modified UTF-8: NUL as two bytes, characters beyond the BMP as
+/// two three-byte surrogates.
+pub fn modified_utf8_decode(b: bytes) -> str ! JavaSerialError {
+    var units: [i64] = []
+    var i = 0
+    while i < b.len() {
+        let c = b.at(i)
+        if c < 128 {
+            units.push(c)
+            i = i + 1
+        } else if c.ushr(5) == 6 and i + 1 < b.len() {
+            units.push(c.bit_and(31).shl(6).bit_or(b.at(i + 1).bit_and(63)))
+            i = i + 2
+        } else if c.ushr(4) == 14 and i + 2 < b.len() {
+            units.push(c.bit_and(15).shl(12).bit_or(b.at(i + 1).bit_and(63).shl(6)).bit_or(b.at(i + 2).bit_and(63)))
+            i = i + 3
+        } else {
+            fail(JsMalformed(i, "malformed modified UTF-8"))
+        }
+    }
+    var cps: [i64] = []
+    var k = 0
+    while k < units.len() {
+        let u = units[k]
+        if u >= 55296 and u < 56320 and k + 1 < units.len() and units[k + 1] >= 56320 and units[k + 1] < 57344 {
+            cps.push(65536 + (u - 55296).shl(10) + (units[k + 1] - 56320))
+            k = k + 2
+        } else {
+            cps.push(if u >= 55296 and u < 57344 { 65533 } else { u })
+            k = k + 1
+        }
+    }
+    return cps.map(|c| c.to_char()).join("")
+}
+
+pub fn modified_utf8_encode(s: str) -> bytes {
+    var out: [i64] = []
+    for c in s.codes() {
+        var units = [c]
+        if c >= 65536 {
+            units = [55296 + (c - 65536).ushr(10), 56320 + (c - 65536).bit_and(1023)]
+        }
+        for u in units {
+            if u >= 1 and u < 128 {
+                out.push(u)
+            } else if u < 2048 {
+                out.push(192 + u.ushr(6))
+                out.push(128 + u.bit_and(63))
+            } else {
+                out.push(224 + u.ushr(12))
+                out.push(128 + u.ushr(6).bit_and(63))
+                out.push(128 + u.bit_and(63))
+            }
+        }
+    }
+    return bytes_of(out)
+}
+
+fn utf(inout r: JsReader) -> str ! JavaSerialError {
+    let n = try be(r, 2)
+    if r.at + n > r.d.len() {
+        fail(JsMalformed(r.at, "a string longer than the stream"))
+    }
+    r.at = r.at + n
+    return try modified_utf8_decode(r.d.slice(r.at - n, r.at))
+}
+
+fn new_item(inout r: JsReader, handle: bool) -> i64 {
+    r.items.push(JiNull)
+    let at = r.items.len() - 1
+    if handle {
+        r.handles.push(at)
+    }
+    return at
+}
+
+fn put_item(inout r: JsReader, it: JavaItem) -> i64 {
+    r.items.push(it)
+    return r.items.len() - 1
+}
+
+fn read_string_item(inout r: JsReader, long: bool) -> i64 ! JavaSerialError {
+    let me = new_item(r, true)
+    let n = if long { try be(r, 8) } else { try be(r, 2) }
+    if n < 0 or r.at + n > r.d.len() {
+        fail(JsMalformed(r.at, "a string longer than the stream"))
+    }
+    r.at = r.at + n
+    r.items[me] = JiString(r.d.slice(r.at - n, r.at), long)
+    return me
+}
+
+/// Contents up to TC_ENDBLOCKDATA, which is consumed.
+fn annotation(inout r: JsReader) -> [i64] ! JavaSerialError {
+    var out: [i64] = []
+    while true {
+        if r.at >= r.d.len() {
+            fail(JsMalformed(r.at, "an annotation without its end"))
+        }
+        if r.d.at(r.at) == 120 {
+            r.at = r.at + 1
+            return out
+        }
+        out.push(try content(r))
+    }
+    return out
+}
+
+fn class_desc(inout r: JsReader, tag: i64) -> i64 ! JavaSerialError {
+    if tag == 125 {
+        let me = new_item(r, true)
+        let n = try be(r, 4)
+        var names: [str] = []
+        for _k in 0..n {
+            names.push(try utf(r))
+        }
+        let ann = try annotation(r)
+        r.items[me] = JiProxy(names, ann, try content(r))
+        return me
+    }
+    let name = try utf(r)
+    let uid = try be(r, 8)
+    let me = new_item(r, true)
+    let flags = try u8(r)
+    let count = try be(r, 2)
+    var fields: [JavaField] = []
+    for _k in 0..count {
+        let code = (try u8(r)).to_char()
+        let fname = try utf(r)
+        let cls = if code == "L" or code == "[" { try content(r) } else { 0 - 1 }
+        fields.push(JavaField{ code: code, name: fname, class_name: cls })
+    }
+    let ann = try annotation(r)
+    r.items[me] = JiDesc(name, uid, flags, fields, ann, try content(r))
+    return me
+}
+
+fn prim_size(code: str) -> i64 {
+    return if code == "B" or code == "Z" { 1 } else if code == "C" or code == "S" { 2 } else if code == "I" or code == "F" { 4 }
+    else if code == "D" or code == "J" { 8 } else { 0 }
+}
+
+fn field_value(inout r: JsReader, code: str) -> JavaValue ! JavaSerialError {
+    let n = prim_size(code)
+    if n == 0 {
+        return JvRef(try content(r))
+    }
+    return JvPrim(code, try be(r, n))
+}
+
+/// The descriptions of a class and its superclasses, topmost first.
+pub fn class_chain(items: [JavaItem], desc: i64) -> [i64] {
+    var chain: [i64] = []
+    var d = desc
+    while d >= 0 and d < items.len() {
+        match items[d] {
+            JiDesc(_n, _u, _f, _fs, _a, sup) -> {
+                chain.push(d)
+                d = sup
+            }
+            JiProxy(_n, _a, sup) -> {
+                chain.push(d)
+                d = sup
+            }
+            _ -> {
+                d = 0 - 1
+            }
+        }
+    }
+    var out: [i64] = []
+    var k = chain.len() - 1
+    while k >= 0 {
+        out.push(chain[k])
+        k = k - 1
+    }
+    return out
+}
+
+fn object(inout r: JsReader) -> i64 ! JavaSerialError {
+    let desc = try content(r)
+    let me = new_item(r, true)
+    var data: [JavaClassData] = []
+    for d in class_chain(r.items, desc) {
+        match r.items[d] {
+            JiDesc(name, _u, flags, fields, _a, _s) -> {
+                var values: [JavaValue] = []
+                var ann: [i64] = []
+                if flags.bit_and(2) != 0 {
+                    for f in fields {
+                        values.push(try field_value(r, f.code))
+                    }
+                    if flags.bit_and(1) != 0 {
+                        ann = try annotation(r)
+                    }
+                } else if flags.bit_and(4) != 0 {
+                    if flags.bit_and(8) == 0 {
+                        fail(JsMalformed(r.at, "externalizable data of protocol version 1 for " + name))
+                    }
+                    ann = try annotation(r)
+                }
+                data.push(JavaClassData{ values: values, annotation: ann })
+            }
+            _ -> data.push(JavaClassData{ values: [], annotation: [] })
+        }
+    }
+    r.items[me] = JiObject(desc, data)
+    return me
+}
+
+fn array(inout r: JsReader) -> i64 ! JavaSerialError {
+    let desc = try content(r)
+    let me = new_item(r, true)
+    let code = match r.items[desc] {
+        JiDesc(name, _u, _f, _fs, _a, _s) -> if name.len() >= 2 { name.substr(1, 1) } else { "L" }
+        _ -> "L"
+    }
+    let n = try be(r, 4)
+    if n < 0 or n > r.d.len() - r.at and prim_size(code) > 0 {
+        fail(JsMalformed(r.at, "an array longer than the stream"))
+    }
+    var values: [JavaValue] = []
+    for _k in 0..n {
+        values.push(try field_value(r, code))
+    }
+    r.items[me] = JiArray(desc, values)
+    return me
+}
+
+fn content(inout r: JsReader) -> i64 ! JavaSerialError {
+    let at = r.at
+    let t = try u8(r)
+    if t == 112 {
+        return put_item(r, JiNull)
+    }
+    if t == 113 {
+        let h = (try be(r, 4)) - 8257536
+        if h < 0 or h >= r.handles.len() {
+            fail(JsMalformed(at, "a reference to a handle not yet assigned"))
+        }
+        return r.handles[h]
+    }
+    if t == 114 or t == 125 {
+        return try class_desc(r, t)
+    }
+    if t == 115 {
+        return try object(r)
+    }
+    if t == 116 or t == 124 {
+        return try read_string_item(r, t == 124)
+    }
+    if t == 117 {
+        return try array(r)
+    }
+    if t == 118 {
+        let desc = try content(r)
+        let me = new_item(r, true)
+        r.items[me] = JiClass(desc)
+        return me
+    }
+    if t == 126 {
+        let desc = try content(r)
+        let me = new_item(r, true)
+        r.items[me] = JiEnum(desc, try content(r))
+        return me
+    }
+    if t == 119 or t == 122 {
+        let n = if t == 119 { try u8(r) } else { try be(r, 4) }
+        if n < 0 or r.at + n > r.d.len() {
+            fail(JsMalformed(at, "block data longer than the stream"))
+        }
+        r.at = r.at + n
+        return put_item(r, JiBlock(r.d.slice(r.at - n, r.at), t == 122))
+    }
+    if t == 121 {
+        r.handles = []
+        return put_item(r, JiReset)
+    }
+    if t == 123 {
+        r.handles = []
+        let thrown = try content(r)
+        r.handles = []
+        return put_item(r, JiException(thrown))
+    }
+    fail(JsMalformed(at, "an unknown tag {t}"))
+}
+
+/// A whole stream: the magic, the version, and its contents.
+pub fn decode(d: bytes) -> JavaStream ! JavaSerialError {
+    if d.len() < 4 or d.at(0) != 172 or d.at(1) != 237 or d.at(2) != 0 or d.at(3) != 5 {
+        fail(JsMalformed(0, "not a version 5 serialization stream"))
+    }
+    var r = JsReader{ d: d, at: 4, items: [], handles: [] }
+    var contents: [i64] = []
+    while r.at < d.len() {
+        contents.push(try content(r))
+    }
+    return JavaStream{ items: r.items, contents: contents }
+}
+
+/// A string item's text.
+pub fn string_text(raw: bytes) -> str {
+    return modified_utf8_decode(raw) ?? ""
+}
+
+type JsWriter = { s: JavaStream, out: [i64], handles: [i64] }
+
+fn put_be(inout w: JsWriter, v: i64, n: i64) {
+    var k = n - 1
+    while k >= 0 {
+        w.out.push(v.shr(8 * k).bit_and(255))
+        k = k - 1
+    }
+}
+
+fn put_utf(inout w: JsWriter, s: str) {
+    let b = modified_utf8_encode(s)
+    put_be(w, b.len(), 2)
+    for i in 0..b.len() {
+        w.out.push(b.at(i))
+    }
+}
+
+/// A reference when the item already has a live handle; true when one
+/// was written.
+fn put_reference(inout w: JsWriter, item: i64) -> bool {
+    for h in 0..w.handles.len() {
+        if w.handles[h] == item {
+            w.out.push(113)
+            put_be(w, 8257536 + h, 4)
+            return true
+        }
+    }
+    return false
+}
+
+fn put_value(inout w: JsWriter, v: JavaValue) {
+    match v {
+        JvPrim(code, bits) -> put_be(w, bits, prim_size(code))
+        JvRef(item) -> put_content(w, item)
+    }
+}
+
+fn put_annotation(inout w: JsWriter, items: [i64]) {
+    for x in items {
+        put_content(w, x)
+    }
+    w.out.push(120)
+}
+
+fn put_desc(inout w: JsWriter, it: JavaItem, me: i64) {
+    match it {
+        JiDesc(name, uid, flags, fields, ann, sup) -> {
+            w.out.push(114)
+            put_utf(w, name)
+            put_be(w, uid, 8)
+            w.handles.push(me)
+            w.out.push(flags)
+            put_be(w, fields.len(), 2)
+            for f in fields {
+                w.out.push(f.code.to_bytes().at(0))
+                put_utf(w, f.name)
+                if f.class_name >= 0 {
+                    put_content(w, f.class_name)
+                }
+            }
+            put_annotation(w, ann)
+            put_content(w, sup)
+        }
+        JiProxy(names, ann, sup) -> {
+            w.out.push(125)
+            w.handles.push(me)
+            put_be(w, names.len(), 4)
+            for n in names {
+                put_utf(w, n)
+            }
+            put_annotation(w, ann)
+            put_content(w, sup)
+        }
+        _ -> {}
+    }
+}
+
+fn put_content(inout w: JsWriter, item: i64) {
+    let it = w.s.items[item]
+    match it {
+        JiNull -> {
+            w.out.push(112)
+            return
+        }
+        JiBlock(data, long) -> {
+            if long {
+                w.out.push(122)
+                put_be(w, data.len(), 4)
+            } else {
+                w.out.push(119)
+                w.out.push(data.len())
+            }
+            for i in 0..data.len() {
+                w.out.push(data.at(i))
+            }
+            return
+        }
+        JiReset -> {
+            w.out.push(121)
+            w.handles = []
+            return
+        }
+        JiException(thrown) -> {
+            w.out.push(123)
+            w.handles = []
+            put_content(w, thrown)
+            w.handles = []
+            return
+        }
+        _ -> {}
+    }
+    if put_reference(w, item) {
+        return
+    }
+    put_new(w, it, item)
+}
+
+fn put_new(inout w: JsWriter, it: JavaItem, item: i64) {
+    match it {
+        JiString(raw, long) -> {
+            w.out.push(if long { 124 } else { 116 })
+            w.handles.push(item)
+            put_be(w, raw.len(), if long { 8 } else { 2 })
+            for i in 0..raw.len() {
+                w.out.push(raw.at(i))
+            }
+        }
+        JiObject(desc, data) -> {
+            w.out.push(115)
+            put_content(w, desc)
+            w.handles.push(item)
+            let chain = class_chain(w.s.items, desc)
+            for k in 0..data.len() {
+                for v in data[k].values {
+                    put_value(w, v)
+                }
+                if k < chain.len() and annotated(w.s.items[chain[k]]) {
+                    put_annotation(w, data[k].annotation)
+                }
+            }
+        }
+        JiArray(desc, values) -> {
+            w.out.push(117)
+            put_content(w, desc)
+            put_be(w, values.len(), 4)
+            w.handles.push(item)
+            for v in values {
+                put_value(w, v)
+            }
+        }
+        JiClass(desc) -> {
+            w.out.push(118)
+            put_content(w, desc)
+            w.handles.push(item)
+        }
+        JiEnum(desc, name) -> {
+            w.out.push(126)
+            put_content(w, desc)
+            w.handles.push(item)
+            put_content(w, name)
+        }
+        _ -> put_desc(w, it, item)
+    }
+}
+
+/// Whether a class's data ends with an annotation: its own writeObject,
+/// or an externalizable class's block data.
+fn annotated(it: JavaItem) -> bool {
+    return match it {
+        JiDesc(_n, _u, flags, _f, _a, _s) -> flags.bit_and(3) == 3 or flags.bit_and(12) == 12
+        _ -> false
+    }
+}
+
+/// The stream as it was read: the magic, version 5, and every content.
+pub fn encode(s: JavaStream) -> bytes {
+    var w = JsWriter{ s: s, out: [172, 237, 0, 5], handles: [] }
+    for c in s.contents {
+        put_content(w, c)
+    }
+    return bytes_of(w.out)
+}

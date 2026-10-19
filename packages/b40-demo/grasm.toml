@@ -1,0 +1,44 @@
+[package]
+name = "b40_demo"
+version = "1.0.0"
+capabilities = ["io"]
+
+[dependencies.jsonlines]
+path = "../jsonlines"
+version = "^1.0.0"
+
+[dependencies.jarmanifest]
+path = "../jarmanifest"
+version = "^1.0.0"
+
+[dependencies.pycfile]
+path = "../pycfile"
+version = "^1.0.0"
+
+[dependencies.taptest]
+path = "../taptest"
+version = "^1.0.0"
+
+[dependencies.v8serial]
+path = "../v8serial"
+version = "^1.0.0"
+
+[dependencies.perlstorable]
+path = "../perlstorable"
+version = "^1.0.0"
+
+[dependencies.javaserial]
+path = "../javaserial"
+version = "^1.0.0"
+
+[dependencies.classfile]
+path = "../classfile"
+version = "^1.0.0"
+
+[dependencies.yaml]
+path = "../yaml"
+version = "^1.0.0"
+
+[dependencies.yamlemit]
+path = "../yamlemit"
+version = "^1.0.0"

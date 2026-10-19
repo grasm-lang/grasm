@@ -1,0 +1,1891 @@
+// YAML 1.1, read as libyaml reads it: the configuration language of
+// Kubernetes, Ansible, GitHub Actions, Docker Compose, OpenAPI, Rails and
+// Home Assistant.
+//
+// Reading is three stages, as in libyaml (which Ruby's Psych, PyYAML's
+// fast path and many others wrap):
+//
+// - the scanner turns characters into tokens: indentation becomes
+//   block-sequence, block-mapping and block-end tokens, a "key: value"
+//   whose key was not marked with "?" is found by remembering where a
+//   simple key could have started, flow collections, anchors, aliases,
+//   tags (with %TAG handles), and scalars in their five styles -- plain
+//   (folded across lines), single-quoted, double-quoted (with every
+//   escape), literal and folded block scalars (with indentation and
+//   chomping indicators);
+// - the parser turns tokens into events by the grammar: streams,
+//   documents with their directives, sequences and mappings in block and
+//   flow form, empty values, implicit keys in flow sequences;
+// - the composer builds each document's node graph, an alias pointing at
+//   its anchor's node, and resolves untagged plain scalars to YAML 1.1's
+//   types: null (~, null, Null, NULL, empty), booleans (yes/no, true/false,
+//   on/off in their three cases), integers (decimal, 0x hex, 0 octal, 0b
+//   binary, underscores, base 60), floats (with a point, base 60, .inf,
+//   .nan), timestamps, merge keys (<<) and strings.
+//
+// A document is an arena of `YamlNode`s, so an alias shares its node and
+// a recursive document is representable. `y` and `n` are strings here,
+// as PyYAML and Psych read them, though YAML 1.1 lists them as booleans.
+//
+// Checked against Ruby's Psych 3.1 (libyaml 0.2.5): random documents in
+// every style, and every error, read the same.
+
+type YamlMark = { index: i64, line: i64, column: i64 }
+
+type YamlTok =
+    | YtStreamStart
+    | YtStreamEnd
+    | YtVersion(major: i64, minor: i64)
+    | YtTagDirective(handle: str, prefix: str)
+    | YtDocStart
+    | YtDocEnd
+    | YtBlockSeqStart
+    | YtBlockMapStart
+    | YtBlockEnd
+    | YtFlowSeqStart
+    | YtFlowSeqEnd
+    | YtFlowMapStart
+    | YtFlowMapEnd
+    | YtBlockEntry
+    | YtFlowEntry
+    | YtKey
+    | YtValue
+    | YtAlias(name: str)
+    | YtAnchor(name: str)
+    | YtTag(handle: str, suffix: str)
+    | YtScalar(value: str, style: str)
+
+type YamlToken = { tok: YamlTok, start: YamlMark }
+
+type YamlSyntaxError = { line: i64, column: i64, why: str }
+
+type YamlSimpleKey = { possible: bool, required: bool, token_number: i64, mark: YamlMark }
+
+type YamlScanner = {
+    cs: [str],
+    at: i64,
+    line: i64,
+    column: i64,
+    tokens: [YamlToken],
+    parsed: i64,
+    indent: i64,
+    indents: [i64],
+    flow_level: i64,
+    simple_key_allowed: bool,
+    keys: [YamlSimpleKey],
+    stream_end: bool,
+}
+
+fn ch(s: YamlScanner, k: i64) -> str {
+    let i = s.at + k
+    return if i < s.cs.len() { s.cs[i] } else { "" }
+}
+
+fn is_break(c: str) -> bool {
+    return c == "\n" or c == "\r" or c == "\u{85}" or c == "\u{2028}" or c == "\u{2029}"
+}
+
+fn is_blank(c: str) -> bool {
+    return c == " " or c == "\t"
+}
+
+fn is_blankz(c: str) -> bool {
+    return c == "" or is_blank(c) or is_break(c)
+}
+
+fn is_breakz(c: str) -> bool {
+    return c == "" or is_break(c)
+}
+
+fn is_alpha(c: str) -> bool {
+    return c >= "0" and c <= "9" or c >= "a" and c <= "z" or c >= "A" and c <= "Z" or c == "_" or c == "-"
+}
+
+fn mark(s: YamlScanner) -> YamlMark {
+    return YamlMark{ index: s.at, line: s.line, column: s.column }
+}
+
+fn skip(inout s: YamlScanner) {
+    s.at = s.at + 1
+    s.column = s.column + 1
+}
+
+fn skip_line(inout s: YamlScanner) {
+    if ch(s, 0) == "\r" and ch(s, 1) == "\n" {
+        s.at = s.at + 2
+    } else if is_break(ch(s, 0)) {
+        s.at = s.at + 1
+    }
+    s.line = s.line + 1
+    s.column = 0
+}
+
+/// A line break as it is folded into a scalar: CR, LF and CR LF are "\n";
+/// NEL is "\n" too; LS and PS stay themselves.
+fn read_line(inout s: YamlScanner) -> str {
+    let c = ch(s, 0)
+    let out = if c == "\u{2028}" or c == "\u{2029}" { c } else { "\n" }
+    skip_line(s)
+    return out
+}
+
+fn err(s: YamlScanner, why: str) -> YamlSyntaxError {
+    return YamlSyntaxError{ line: s.line, column: s.column, why: why }
+}
+
+fn push_token(inout s: YamlScanner, t: YamlTok, m: YamlMark) {
+    s.tokens.push(YamlToken{ tok: t, start: m })
+}
+
+fn stale_keys(inout s: YamlScanner) -> () ! YamlSyntaxError {
+    for i in 0..s.keys.len() {
+        let k = s.keys[i]
+        if k.possible and (k.mark.line < s.line or k.mark.index + 1024 < s.at) {
+            if k.required {
+                fail(YamlSyntaxError{ line: k.mark.line, column: k.mark.column, why: "could not find expected ':' while scanning a simple key" })
+            }
+            s.keys[i].possible = false
+        }
+    }
+}
+
+fn remove_key(inout s: YamlScanner) -> () ! YamlSyntaxError {
+    let top = s.keys.len() - 1
+    let k = s.keys[top]
+    if k.possible and k.required {
+        fail(YamlSyntaxError{ line: k.mark.line, column: k.mark.column, why: "could not find expected ':' while scanning a simple key" })
+    }
+    s.keys[top].possible = false
+}
+
+fn save_key(inout s: YamlScanner) -> () ! YamlSyntaxError {
+    let required = s.flow_level == 0 and s.indent == s.column
+    if s.simple_key_allowed {
+        try remove_key(s)
+        s.keys[s.keys.len() - 1] = YamlSimpleKey{ possible: true, required: required, token_number: s.parsed + s.tokens.len(), mark: mark(s) }
+    }
+}
+
+/// Puts a token at position `at` of the queue. Simple keys are always
+/// recent, so only a short tail moves.
+fn insert_token(inout s: YamlScanner, at: i64, tok: YamlToken) {
+    var tail: [YamlToken] = []
+    while s.tokens.len() > at {
+        tail.push(s.tokens[s.tokens.len() - 1])
+        let _t = s.tokens.pop()
+    }
+    s.tokens.push(tok)
+    var k = tail.len() - 1
+    while k >= 0 {
+        s.tokens.push(tail[k])
+        k = k - 1
+    }
+}
+
+/// Opens a block collection when the column is deeper than the current
+/// indentation; the token goes at `number`, or at the end when -1.
+fn roll_indent(inout s: YamlScanner, column: i64, number: i64, t: YamlTok, m: YamlMark) {
+    if s.flow_level > 0 {
+        return
+    }
+    if s.indent < column {
+        s.indents.push(s.indent)
+        s.indent = column
+        let tok = YamlToken{ tok: t, start: m }
+        if number == -1 {
+            s.tokens.push(tok)
+        } else {
+            insert_token(s, number - s.parsed, tok)
+        }
+    }
+}
+
+fn unroll_indent(inout s: YamlScanner, column: i64) {
+    if s.flow_level > 0 {
+        return
+    }
+    while s.indent > column {
+        push_token(s, YtBlockEnd, mark(s))
+        s.indent = s.indents[s.indents.len() - 1]
+        s.indents = s.indents.slice(0, s.indents.len() - 1)
+    }
+}
+
+fn scan_to_next_token(inout s: YamlScanner) {
+    while true {
+        if s.at == 0 and ch(s, 0) == "\u{feff}" {
+            s.at = 1
+        }
+        while ch(s, 0) == " " or (s.flow_level > 0 or not s.simple_key_allowed) and ch(s, 0) == "\t" {
+            skip(s)
+        }
+        if ch(s, 0) == "#" {
+            while not is_breakz(ch(s, 0)) {
+                skip(s)
+            }
+        }
+        if is_break(ch(s, 0)) {
+            skip_line(s)
+            if s.flow_level == 0 {
+                s.simple_key_allowed = true
+            }
+        } else {
+            return
+        }
+    }
+}
+
+fn next_token(inout s: YamlScanner) -> () ! YamlSyntaxError {
+    scan_to_next_token(s)
+    try stale_keys(s)
+    unroll_indent(s, s.column)
+    let c = ch(s, 0)
+    if c == "" {
+        return try stream_end(s)
+    }
+    let three = ch(s, 0) + ch(s, 1) + ch(s, 2)
+    if s.column == 0 and c == "%" {
+        return try directive(s)
+    }
+    if s.column == 0 and (three == "---" or three == "...") and is_blankz(ch(s, 3)) {
+        unroll_indent(s, -1)
+        try remove_key(s)
+        s.simple_key_allowed = false
+        let m = mark(s)
+        skip(s)
+        skip(s)
+        skip(s)
+        push_token(s, if three == "---" { YtDocStart } else { YtDocEnd }, m)
+        return
+    }
+    if c == "[" or c == "\{" {
+        try save_key(s)
+        s.flow_level = s.flow_level + 1
+        s.keys.push(YamlSimpleKey{ possible: false, required: false, token_number: 0, mark: mark(s) })
+        s.simple_key_allowed = true
+        let m = mark(s)
+        skip(s)
+        push_token(s, if c == "[" { YtFlowSeqStart } else { YtFlowMapStart }, m)
+        return
+    }
+    if c == "]" or c == "\}" {
+        try remove_key(s)
+        if s.flow_level > 0 {
+            s.flow_level = s.flow_level - 1
+            s.keys = s.keys.slice(0, s.keys.len() - 1)
+        }
+        s.simple_key_allowed = false
+        let m = mark(s)
+        skip(s)
+        push_token(s, if c == "]" { YtFlowSeqEnd } else { YtFlowMapEnd }, m)
+        return
+    }
+    if c == "," {
+        try remove_key(s)
+        s.simple_key_allowed = true
+        let m = mark(s)
+        skip(s)
+        push_token(s, YtFlowEntry, m)
+        return
+    }
+    return try indicators(s, c)
+}
+
+fn indicators(inout s: YamlScanner, c: str) -> () ! YamlSyntaxError {
+    if c == "-" and is_blankz(ch(s, 1)) {
+        if s.flow_level == 0 {
+            if not s.simple_key_allowed {
+                fail(err(s, "block sequence entries are not allowed in this context"))
+            }
+            roll_indent(s, s.column, -1, YtBlockSeqStart, mark(s))
+        }
+        try remove_key(s)
+        s.simple_key_allowed = true
+        let m = mark(s)
+        skip(s)
+        push_token(s, YtBlockEntry, m)
+        return
+    }
+    if c == "?" and (s.flow_level > 0 or is_blankz(ch(s, 1))) {
+        if s.flow_level == 0 {
+            if not s.simple_key_allowed {
+                fail(err(s, "mapping keys are not allowed in this context"))
+            }
+            roll_indent(s, s.column, -1, YtBlockMapStart, mark(s))
+        }
+        try remove_key(s)
+        s.simple_key_allowed = s.flow_level == 0
+        let m = mark(s)
+        skip(s)
+        push_token(s, YtKey, m)
+        return
+    }
+    if c == ":" and (s.flow_level > 0 or is_blankz(ch(s, 1))) {
+        return try value_indicator(s)
+    }
+    if c == "*" or c == "&" {
+        try save_key(s)
+        s.simple_key_allowed = false
+        return try anchor(s, c == "*")
+    }
+    if c == "!" {
+        try save_key(s)
+        s.simple_key_allowed = false
+        return try tag(s)
+    }
+    if (c == "|" or c == ">") and s.flow_level == 0 {
+        try remove_key(s)
+        s.simple_key_allowed = true
+        return try block_scalar(s, c == "|")
+    }
+    if c == "'" or c == "\"" {
+        try save_key(s)
+        s.simple_key_allowed = false
+        return try flow_scalar(s, c == "'")
+    }
+    let n = ch(s, 1)
+    let special = "-?:,[]\{\}#&*!|>'\"%@`".contains(c)
+    if not (is_blankz(c) or special) or c == "-" and not is_blank(n) or s.flow_level == 0 and (c == "?" or c == ":") and not is_blankz(n) {
+        try save_key(s)
+        s.simple_key_allowed = false
+        return try plain_scalar(s)
+    }
+    fail(err(s, "found character that cannot start any token while scanning for the next token"))
+}
+
+fn value_indicator(inout s: YamlScanner) -> () ! YamlSyntaxError {
+    let top = s.keys.len() - 1
+    let k = s.keys[top]
+    if k.possible {
+        insert_token(s, k.token_number - s.parsed, YamlToken{ tok: YtKey, start: k.mark })
+        roll_indent(s, k.mark.column, k.token_number, YtBlockMapStart, k.mark)
+        s.keys[top].possible = false
+        s.simple_key_allowed = false
+    } else {
+        if s.flow_level == 0 {
+            if not s.simple_key_allowed {
+                fail(err(s, "mapping values are not allowed in this context"))
+            }
+            roll_indent(s, s.column, -1, YtBlockMapStart, mark(s))
+        }
+        s.simple_key_allowed = s.flow_level == 0
+    }
+    let m = mark(s)
+    skip(s)
+    push_token(s, YtValue, m)
+}
+
+fn stream_end(inout s: YamlScanner) -> () ! YamlSyntaxError {
+    if s.column != 0 {
+        s.column = 0
+        s.line = s.line + 1
+    }
+    unroll_indent(s, -1)
+    try remove_key(s)
+    s.simple_key_allowed = false
+    push_token(s, YtStreamEnd, mark(s))
+    s.stream_end = true
+}
+
+fn line_end(inout s: YamlScanner) -> () ! YamlSyntaxError {
+    while is_blank(ch(s, 0)) {
+        skip(s)
+    }
+    if ch(s, 0) == "#" {
+        while not is_breakz(ch(s, 0)) {
+            skip(s)
+        }
+    }
+    if not is_breakz(ch(s, 0)) {
+        fail(err(s, "did not find expected comment or line break"))
+    }
+    if is_break(ch(s, 0)) {
+        skip_line(s)
+    }
+}
+
+fn number(inout s: YamlScanner) -> i64 ! YamlSyntaxError {
+    var v = 0
+    var n = 0
+    while ch(s, 0) >= "0" and ch(s, 0) <= "9" {
+        n = n + 1
+        if n > 9 {
+            fail(err(s, "found extremely long version number while scanning a %YAML directive"))
+        }
+        v = v * 10 + (ch(s, 0).parse_int() ?? 0)
+        skip(s)
+    }
+    if n == 0 {
+        fail(err(s, "did not find expected version number while scanning a %YAML directive"))
+    }
+    return v
+}
+
+fn directive(inout s: YamlScanner) -> () ! YamlSyntaxError {
+    unroll_indent(s, -1)
+    try remove_key(s)
+    s.simple_key_allowed = false
+    let m = mark(s)
+    skip(s)
+    var name = ""
+    while is_alpha(ch(s, 0)) {
+        name = name + ch(s, 0)
+        skip(s)
+    }
+    if name.len() == 0 {
+        fail(err(s, "could not find expected directive name while scanning a directive"))
+    }
+    if not is_blankz(ch(s, 0)) {
+        fail(err(s, "found unexpected non-alphabetical character while scanning a directive"))
+    }
+    if name == "YAML" {
+        while is_blank(ch(s, 0)) {
+            skip(s)
+        }
+        let major = try number(s)
+        if ch(s, 0) != "." {
+            fail(err(s, "did not find expected digit or '.' character while scanning a %YAML directive"))
+        }
+        skip(s)
+        push_token(s, YtVersion(major, try number(s)), m)
+    } else if name == "TAG" {
+        while is_blank(ch(s, 0)) {
+            skip(s)
+        }
+        let handle = try tag_handle(s, true)
+        if not is_blank(ch(s, 0)) {
+            fail(err(s, "did not find expected whitespace while scanning a %TAG directive"))
+        }
+        while is_blank(ch(s, 0)) {
+            skip(s)
+        }
+        let prefix = try tag_uri(s, true, "")
+        if not is_blankz(ch(s, 0)) {
+            fail(err(s, "did not find expected whitespace or line break while scanning a %TAG directive"))
+        }
+        push_token(s, YtTagDirective(handle, prefix), m)
+    } else {
+        fail(YamlSyntaxError{ line: m.line, column: m.column, why: "found unknown directive name while scanning a directive" })
+    }
+    try line_end(s)
+}
+
+fn anchor(inout s: YamlScanner, alias: bool) -> () ! YamlSyntaxError {
+    let m = mark(s)
+    skip(s)
+    var name = ""
+    while is_alpha(ch(s, 0)) {
+        name = name + ch(s, 0)
+        skip(s)
+    }
+    let c = ch(s, 0)
+    if name.len() == 0 or not (is_blankz(c) or c == "?" or c == ":" or c == "," or c == "]" or c == "\}" or c == "%" or c == "@" or c == "`") {
+        fail(err(s, "did not find expected alphabetic or numeric character while scanning an anchor"))
+    }
+    push_token(s, if alias { YtAlias(name) } else { YtAnchor(name) }, m)
+}
+
+fn tag_handle(inout s: YamlScanner, in_directive: bool) -> str ! YamlSyntaxError {
+    if ch(s, 0) != "!" {
+        fail(err(s, "did not find expected '!' while scanning a tag"))
+    }
+    var h = "!"
+    skip(s)
+    while is_alpha(ch(s, 0)) {
+        h = h + ch(s, 0)
+        skip(s)
+    }
+    if ch(s, 0) == "!" {
+        h = h + "!"
+        skip(s)
+    } else if in_directive and h != "!" {
+        fail(err(s, "did not find expected '!' while parsing a tag directive"))
+    }
+    return h
+}
+
+fn hex_value(c: str) -> i64 {
+    return if c >= "0" and c <= "9" { c.parse_int() ?? 0 } else if c >= "a" and c <= "f" { c.to_bytes().at(0) - 87 }
+    else if c >= "A" and c <= "F" { c.to_bytes().at(0) - 55 } else { 0 - 1 }
+}
+
+/// A tag's URI part, %-escapes decoded; `head` is text already read (a
+/// handle that turned out to be part of the suffix).
+fn tag_uri(inout s: YamlScanner, in_directive: bool, head: str) -> str ! YamlSyntaxError {
+    var out: [i64] = head.to_bytes().to_list()
+    let extra = ";/?:@&=+$.%!~*'()"
+    while true {
+        let c = ch(s, 0)
+        // libyaml 0.2.5 takes "," "[" and "]" as URI characters everywhere,
+        // so "[!!str, 1]" tags the 1 with "tag:yaml.org,2002:str,".
+        let ok = is_alpha(c) or c.len() > 0 and extra.contains(c) or c == "," or c == "[" or c == "]"
+        let _d = in_directive
+        if not ok {
+            break
+        }
+        if c == "%" {
+            let a = hex_value(ch(s, 1))
+            let b = hex_value(ch(s, 2))
+            if a < 0 or b < 0 {
+                fail(err(s, "did not find URI escaped octet while parsing a tag"))
+            }
+            out.push(a * 16 + b)
+            skip(s)
+            skip(s)
+            skip(s)
+        } else {
+            for x in c.to_bytes().to_list() {
+                out.push(x)
+            }
+            skip(s)
+        }
+    }
+    if out.len() == 0 {
+        fail(err(s, "did not find expected tag URI while parsing a tag"))
+    }
+    return bytes_of(out).to_str()
+}
+
+fn tag(inout s: YamlScanner) -> () ! YamlSyntaxError {
+    let m = mark(s)
+    var handle = ""
+    var suffix = ""
+    if ch(s, 1) == "<" {
+        skip(s)
+        skip(s)
+        suffix = try tag_uri(s, false, "")
+        if ch(s, 0) != ">" {
+            fail(err(s, "did not find the expected '>' while scanning a tag"))
+        }
+        skip(s)
+    } else {
+        let h = try tag_handle(s, false)
+        if h.len() > 1 and h.ends_with("!") {
+            handle = h
+            suffix = try tag_uri(s, false, "")
+        } else {
+            // "!foo": the handle is "!", "foo" the suffix; a lone "!" is the
+            // non-specific tag.
+            let rest = h.substr(1, h.len() - 1)
+            let tail = if is_blankz(ch(s, 0)) and rest.len() == 0 { "" } else { try tag_uri_or_empty(s, rest) }
+            if tail.len() == 0 {
+                handle = ""
+                suffix = "!"
+            } else {
+                handle = "!"
+                suffix = tail
+            }
+        }
+    }
+    if not is_blankz(ch(s, 0)) and not (s.flow_level > 0 and ch(s, 0) == ",") {
+        fail(err(s, "did not find expected whitespace or line break while scanning a tag"))
+    }
+    push_token(s, YtTag(handle, suffix), m)
+}
+
+fn tag_uri_or_empty(inout s: YamlScanner, head: str) -> str ! YamlSyntaxError {
+    let c = ch(s, 0)
+    let extra = ";/?:@&=+$.%!~*'()"
+    if head.len() == 0 and not (is_alpha(c) or c.len() > 0 and extra.contains(c)) {
+        return ""
+    }
+    return try tag_uri(s, false, head)
+}
+
+fn block_breaks(inout s: YamlScanner, inout indent: i64, inout breaks: str) -> () ! YamlSyntaxError {
+    var max_indent = 0
+    while true {
+        while (indent == 0 or s.column < indent) and ch(s, 0) == " " {
+            skip(s)
+        }
+        if s.column > max_indent {
+            max_indent = s.column
+        }
+        if (indent == 0 or s.column < indent) and ch(s, 0) == "\t" {
+            fail(err(s, "found a tab character where an indentation space is expected while scanning a block scalar"))
+        }
+        if not is_break(ch(s, 0)) {
+            break
+        }
+        breaks = breaks + read_line(s)
+    }
+    if indent == 0 {
+        indent = max_indent
+        if indent < s.indent + 1 {
+            indent = s.indent + 1
+        }
+        if indent < 1 {
+            indent = 1
+        }
+    }
+}
+
+fn block_scalar(inout s: YamlScanner, literal: bool) -> () ! YamlSyntaxError {
+    let m = mark(s)
+    skip(s)
+    var chomping = 0
+    var increment = 0
+    let c = ch(s, 0)
+    if c == "+" or c == "-" {
+        chomping = if c == "+" { 1 } else { 0 - 1 }
+        skip(s)
+        if ch(s, 0) >= "0" and ch(s, 0) <= "9" {
+            if ch(s, 0) == "0" {
+                fail(err(s, "found an indentation indicator equal to 0 while scanning a block scalar"))
+            }
+            increment = ch(s, 0).parse_int() ?? 0
+            skip(s)
+        }
+    } else if c >= "0" and c <= "9" {
+        if c == "0" {
+            fail(err(s, "found an indentation indicator equal to 0 while scanning a block scalar"))
+        }
+        increment = c.parse_int() ?? 0
+        skip(s)
+        if ch(s, 0) == "+" or ch(s, 0) == "-" {
+            chomping = if ch(s, 0) == "+" { 1 } else { 0 - 1 }
+            skip(s)
+        }
+    }
+    try line_end(s)
+    var indent = 0
+    if increment > 0 {
+        indent = if s.indent >= 0 { s.indent + increment } else { increment }
+    }
+    var text = ""
+    var leading_break = ""
+    var trailing = ""
+    var leading_blank = false
+    try block_breaks(s, indent, trailing)
+    while s.column == indent and ch(s, 0) != "" {
+        let trailing_blank = is_blank(ch(s, 0))
+        if not literal and leading_break.starts_with("\n") and not leading_blank and not trailing_blank {
+            if trailing.len() == 0 {
+                text = text + " "
+            }
+        } else {
+            text = text + leading_break
+        }
+        leading_break = ""
+        text = text + trailing
+        trailing = ""
+        leading_blank = is_blank(ch(s, 0))
+        var parts: [str] = []
+        while not is_breakz(ch(s, 0)) {
+            parts.push(ch(s, 0))
+            skip(s)
+        }
+        text = text + parts.join("")
+        if ch(s, 0) == "" {
+            break
+        }
+        leading_break = read_line(s)
+        try block_breaks(s, indent, trailing)
+    }
+    if chomping != -1 {
+        text = text + leading_break
+    }
+    if chomping == 1 {
+        text = text + trailing
+    }
+    push_token(s, YtScalar(text, if literal { "|" } else { ">" }), m)
+}
+
+fn escape(inout s: YamlScanner) -> str ! YamlSyntaxError {
+    let c = ch(s, 1)
+    let simple = [("0", "\u{0}"), ("a", "\u{7}"), ("b", "\u{8}"), ("t", "\t"), ("\t", "\t"), ("n", "\n"), ("v", "\u{b}"), ("f", "\u{c}"),
+        ("r", "\r"), ("e", "\u{1b}"), (" ", " "), ("\"", "\""), ("/", "/"), ("\\", "\\"), ("N", "\u{85}"), ("_", "\u{a0}"),
+        ("L", "\u{2028}"), ("P", "\u{2029}")]
+    for (k, v) in simple {
+        if c == k {
+            skip(s)
+            skip(s)
+            return v
+        }
+    }
+    let n = if c == "x" { 2 } else if c == "u" { 4 } else if c == "U" { 8 } else { 0 }
+    if n == 0 {
+        fail(err(s, "found unknown escape character while parsing a quoted scalar"))
+    }
+    skip(s)
+    skip(s)
+    var v = 0
+    for _k in 0..n {
+        let h = hex_value(ch(s, 0))
+        if h < 0 {
+            fail(err(s, "did not find expected hexdecimal number while parsing a quoted scalar"))
+        }
+        v = v * 16 + h
+        skip(s)
+    }
+    if v >= 55296 and v <= 57343 or v > 1114111 {
+        fail(err(s, "found invalid Unicode character escape code while parsing a quoted scalar"))
+    }
+    return v.to_char()
+}
+
+fn flow_scalar(inout s: YamlScanner, single: bool) -> () ! YamlSyntaxError {
+    let m = mark(s)
+    skip(s)
+    var text: [str] = []
+    var leading_break = ""
+    var trailing = ""
+    var spaces = ""
+    let quote = if single { "'" } else { "\"" }
+    while true {
+        let three = ch(s, 0) + ch(s, 1) + ch(s, 2)
+        if s.column == 0 and (three == "---" or three == "...") and is_blankz(ch(s, 3)) {
+            fail(err(s, "found unexpected document indicator while scanning a quoted scalar"))
+        }
+        if ch(s, 0) == "" {
+            fail(err(s, "found unexpected end of stream while scanning a quoted scalar"))
+        }
+        var leading_blanks = false
+        while not is_blankz(ch(s, 0)) {
+            let c = ch(s, 0)
+            if single and c == "'" and ch(s, 1) == "'" {
+                text.push("'")
+                skip(s)
+                skip(s)
+            } else if c == quote {
+                break
+            } else if not single and c == "\\" and is_break(ch(s, 1)) {
+                skip(s)
+                skip_line(s)
+                leading_blanks = true
+                break
+            } else if not single and c == "\\" {
+                text.push(try escape(s))
+            } else {
+                text.push(c)
+                skip(s)
+            }
+        }
+        if ch(s, 0) == quote {
+            break
+        }
+        while is_blank(ch(s, 0)) or is_break(ch(s, 0)) {
+            if is_blank(ch(s, 0)) {
+                if not leading_blanks {
+                    spaces = spaces + ch(s, 0)
+                }
+                skip(s)
+            } else if not leading_blanks {
+                spaces = ""
+                leading_break = read_line(s)
+                leading_blanks = true
+            } else {
+                trailing = trailing + read_line(s)
+            }
+        }
+        if leading_blanks {
+            if leading_break.starts_with("\n") {
+                text.push(if trailing.len() == 0 { " " } else { trailing })
+            } else {
+                text.push(leading_break + trailing)
+            }
+            leading_break = ""
+            trailing = ""
+        } else {
+            text.push(spaces)
+            spaces = ""
+        }
+    }
+    skip(s)
+    push_token(s, YtScalar(text.join(""), quote), m)
+}
+
+fn plain_scalar(inout s: YamlScanner) -> () ! YamlSyntaxError {
+    let m = mark(s)
+    var text: [str] = []
+    var leading_break = ""
+    var trailing = ""
+    var spaces = ""
+    var leading_blanks = false
+    let indent = s.indent + 1
+    while true {
+        let three = ch(s, 0) + ch(s, 1) + ch(s, 2)
+        if s.column == 0 and (three == "---" or three == "...") and is_blankz(ch(s, 3)) {
+            break
+        }
+        if ch(s, 0) == "#" {
+            break
+        }
+        while not is_blankz(ch(s, 0)) {
+            let c = ch(s, 0)
+            if s.flow_level > 0 and c == ":" and not is_blankz(ch(s, 1)) {
+                fail(YamlSyntaxError{ line: m.line, column: m.column, why: "found unexpected ':' while scanning a plain scalar" })
+            }
+            if c == ":" and is_blankz(ch(s, 1)) or s.flow_level > 0 and (c == "," or c == "[" or c == "]" or c == "\{" or c == "\}") {
+                break
+            }
+            if leading_blanks or spaces.len() > 0 {
+                if leading_blanks {
+                    if leading_break.starts_with("\n") {
+                        text.push(if trailing.len() == 0 { " " } else { trailing })
+                    } else {
+                        text.push(leading_break + trailing)
+                    }
+                    leading_break = ""
+                    trailing = ""
+                    leading_blanks = false
+                } else {
+                    text.push(spaces)
+                    spaces = ""
+                }
+            }
+            text.push(c)
+            skip(s)
+        }
+        if not (is_blank(ch(s, 0)) or is_break(ch(s, 0))) {
+            break
+        }
+        while is_blank(ch(s, 0)) or is_break(ch(s, 0)) {
+            if is_blank(ch(s, 0)) {
+                if leading_blanks and s.column < indent and ch(s, 0) == "\t" {
+                    fail(err(s, "found a tab character that violates indentation while scanning a plain scalar"))
+                }
+                if not leading_blanks {
+                    spaces = spaces + ch(s, 0)
+                }
+                skip(s)
+            } else if not leading_blanks {
+                spaces = ""
+                leading_break = read_line(s)
+                leading_blanks = true
+            } else {
+                trailing = trailing + read_line(s)
+            }
+        }
+        if s.flow_level == 0 and s.column < indent {
+            break
+        }
+    }
+    push_token(s, YtScalar(text.join(""), ""), m)
+    if leading_blanks {
+        s.simple_key_allowed = true
+    }
+}
+
+/// Every token of a text, as libyaml's scanner produces them.
+pub fn tokens(text: str) -> [YamlToken] ! YamlSyntaxError {
+    var s = YamlScanner{ cs: text.chars(), at: 0, line: 0, column: 0, tokens: [], parsed: 0, indent: 0 - 1, indents: [], flow_level: 0,
+        simple_key_allowed: true, keys: [YamlSimpleKey{ possible: false, required: false, token_number: 0, mark: YamlMark{ index: 0, line: 0, column: 0 } }],
+        stream_end: false }
+    push_token(s, YtStreamStart, mark(s))
+    while not s.stream_end {
+        try next_token(s)
+    }
+    return s.tokens
+}
+
+type YamlEvent =
+    | YeStreamStart
+    | YeStreamEnd
+    | YeDocStart(version: str, tags: [(str, str)], implicit: bool)
+    | YeDocEnd(implicit: bool)
+    | YeAlias(anchor: str)
+    | YeScalar(anchor: str, tag: str, value: str, plain_implicit: bool, quoted_implicit: bool, style: str)
+    | YeSeqStart(anchor: str, tag: str, implicit: bool, flow: bool)
+    | YeSeqEnd
+    | YeMapStart(anchor: str, tag: str, implicit: bool, flow: bool)
+    | YeMapEnd
+
+type YamlParser = { toks: [YamlToken], at: i64, states: [str], state: str, events: [YamlEvent], tags: [(str, str)] }
+
+fn tk(p: YamlParser) -> YamlTok {
+    return p.toks[if p.at < p.toks.len() { p.at } else { p.toks.len() - 1 }].tok
+}
+
+fn kind(t: YamlTok) -> str {
+    return match t {
+        YtStreamStart -> "stream-start"
+        YtStreamEnd -> "stream-end"
+        YtVersion(_a, _b) -> "version"
+        YtTagDirective(_h, _p) -> "tag-directive"
+        YtDocStart -> "doc-start"
+        YtDocEnd -> "doc-end"
+        YtBlockSeqStart -> "block-seq"
+        YtBlockMapStart -> "block-map"
+        YtBlockEnd -> "block-end"
+        YtFlowSeqStart -> "["
+        YtFlowSeqEnd -> "]"
+        YtFlowMapStart -> "\{"
+        YtFlowMapEnd -> "\}"
+        YtBlockEntry -> "-"
+        YtFlowEntry -> ","
+        YtKey -> "?"
+        YtValue -> ":"
+        YtAlias(_n) -> "alias"
+        YtAnchor(_n) -> "anchor"
+        YtTag(_h, _s) -> "tag"
+        YtScalar(_v, _s) -> "scalar"
+    }
+}
+
+fn pk(p: YamlParser) -> str {
+    return kind(tk(p))
+}
+
+fn perr(p: YamlParser, why: str) -> YamlSyntaxError {
+    let m = p.toks[if p.at < p.toks.len() { p.at } else { p.toks.len() - 1 }].start
+    return YamlSyntaxError{ line: m.line, column: m.column, why: why }
+}
+
+fn pop_state(inout p: YamlParser) {
+    p.state = p.states[p.states.len() - 1]
+    let _s = p.states.pop()
+}
+
+fn empty_scalar(inout p: YamlParser) {
+    p.events.push(YeScalar("", "", "", true, false, ""))
+}
+
+fn directives(inout p: YamlParser) -> str ! YamlSyntaxError {
+    var version = ""
+    p.tags = []
+    while pk(p) == "version" or pk(p) == "tag-directive" {
+        match tk(p) {
+            YtVersion(major, minor) -> {
+                if version.len() > 0 {
+                    fail(perr(p, "found duplicate %YAML directive"))
+                }
+                if major != 1 or minor != 1 and minor != 2 {
+                    fail(perr(p, "found incompatible YAML document"))
+                }
+                version = "{major}.{minor}"
+            }
+            YtTagDirective(h, prefix) -> {
+                for (h2, _x) in p.tags {
+                    if h2 == h {
+                        fail(perr(p, "found duplicate %TAG directive"))
+                    }
+                }
+                p.tags.push((h, prefix))
+            }
+            _ -> {}
+        }
+        p.at = p.at + 1
+    }
+    return version
+}
+
+fn with_defaults(t: [(str, str)]) -> [(str, str)] {
+    var out = t
+    for (h, prefix) in [("!", "!"), ("!!", "tag:yaml.org,2002:")] {
+        if not out.any(|x| x.0 == h) {
+            out.push((h, prefix))
+        }
+    }
+    return out
+}
+
+fn document_start(inout p: YamlParser, implicit: bool) -> () ! YamlSyntaxError {
+    if not implicit {
+        while pk(p) == "doc-end" {
+            p.at = p.at + 1
+        }
+    }
+    let k = pk(p)
+    if implicit and k != "version" and k != "tag-directive" and k != "doc-start" and k != "stream-end" {
+        p.tags = []
+        p.states.push("document-end")
+        p.state = "block-node"
+        p.events.push(YeDocStart("", [], true))
+        return
+    }
+    if k != "stream-end" {
+        let version = try directives(p)
+        if pk(p) != "doc-start" {
+            fail(perr(p, "did not find expected <document start>"))
+        }
+        p.states.push("document-end")
+        p.state = "document-content"
+        p.events.push(YeDocStart(version, p.tags, false))
+        p.at = p.at + 1
+        return
+    }
+    p.events.push(YeStreamEnd)
+    p.state = "end"
+}
+
+fn document_end(inout p: YamlParser) {
+    var implicit = true
+    if pk(p) == "doc-end" {
+        p.at = p.at + 1
+        implicit = false
+    }
+    p.tags = []
+    p.state = "document-start"
+    p.events.push(YeDocEnd(implicit))
+}
+
+fn resolve_tag(p: YamlParser, handle: str, suffix: str) -> str ! YamlSyntaxError {
+    if handle.len() == 0 {
+        return suffix
+    }
+    for (h, prefix) in with_defaults(p.tags) {
+        if h == handle {
+            return prefix + suffix
+        }
+    }
+    fail(perr(p, "found undefined tag handle while parsing a node"))
+}
+
+fn node(inout p: YamlParser, block: bool, indentless: bool) -> () ! YamlSyntaxError {
+    match tk(p) {
+        YtAlias(name) -> {
+            pop_state(p)
+            p.events.push(YeAlias(name))
+            p.at = p.at + 1
+            return
+        }
+        _ -> {}
+    }
+    var anchor = ""
+    var tag = ""
+    var tagged = false
+    for _k in 0..2 {
+        match tk(p) {
+            YtAnchor(n) -> {
+                if anchor.len() == 0 {
+                    anchor = n
+                    p.at = p.at + 1
+                }
+            }
+            YtTag(h, s) -> {
+                if not tagged {
+                    tag = try resolve_tag(p, h, s)
+                    tagged = true
+                    p.at = p.at + 1
+                }
+            }
+            _ -> {}
+        }
+    }
+    let implicit = tag.len() == 0
+    let k = pk(p)
+    if indentless and k == "-" {
+        p.state = "indentless-entry"
+        p.events.push(YeSeqStart(anchor, tag, implicit, false))
+        return
+    }
+    match tk(p) {
+        YtScalar(value, style) -> {
+            let plain_implicit = style == "" and tag.len() == 0 or tag == "!"
+            let quoted_implicit = not plain_implicit and tag.len() == 0
+            pop_state(p)
+            p.events.push(YeScalar(anchor, tag, value, plain_implicit, quoted_implicit, style))
+            p.at = p.at + 1
+            return
+        }
+        _ -> {}
+    }
+    if k == "[" or k == "\{" {
+        p.state = if k == "[" { "flow-seq-first" } else { "flow-map-first" }
+        p.events.push(if k == "[" { YeSeqStart(anchor, tag, implicit, true) } else { YeMapStart(anchor, tag, implicit, true) })
+        return
+    }
+    if block and (k == "block-seq" or k == "block-map") {
+        p.state = if k == "block-seq" { "block-seq-first" } else { "block-map-first" }
+        p.events.push(if k == "block-seq" { YeSeqStart(anchor, tag, implicit, false) } else { YeMapStart(anchor, tag, implicit, false) })
+        return
+    }
+    if anchor.len() > 0 or tagged {
+        pop_state(p)
+        p.events.push(YeScalar(anchor, tag, "", implicit, false, ""))
+        return
+    }
+    fail(perr(p, if block { "did not find expected node content while parsing a block node" } else { "did not find expected node content while parsing a flow node" }))
+}
+
+fn block_states(inout p: YamlParser) -> () ! YamlSyntaxError {
+    let st = p.state
+    let k = pk(p)
+    if st == "block-seq-first" or st == "block-seq" {
+        if st == "block-seq-first" {
+            p.at = p.at + 1
+        }
+        let k2 = pk(p)
+        if k2 == "-" {
+            p.at = p.at + 1
+            if pk(p) != "-" and pk(p) != "block-end" {
+                p.states.push("block-seq")
+                return try node(p, true, false)
+            }
+            p.state = "block-seq"
+            empty_scalar(p)
+            return
+        }
+        if k2 == "block-end" {
+            pop_state(p)
+            p.events.push(YeSeqEnd)
+            p.at = p.at + 1
+            return
+        }
+        fail(perr(p, "did not find expected '-' indicator while parsing a block collection"))
+    }
+    if st == "indentless-entry" {
+        if k == "-" {
+            p.at = p.at + 1
+            let n = pk(p)
+            if n != "-" and n != "?" and n != ":" and n != "block-end" {
+                p.states.push("indentless-entry")
+                return try node(p, true, false)
+            }
+            empty_scalar(p)
+            return
+        }
+        pop_state(p)
+        p.events.push(YeSeqEnd)
+        return
+    }
+    if st == "block-map-first" or st == "block-map-key" {
+        if st == "block-map-first" {
+            p.at = p.at + 1
+        }
+        let k2 = pk(p)
+        if k2 == "?" {
+            p.at = p.at + 1
+            let n = pk(p)
+            if n != "?" and n != ":" and n != "block-end" {
+                p.states.push("block-map-value")
+                return try node(p, true, true)
+            }
+            p.state = "block-map-value"
+            empty_scalar(p)
+            return
+        }
+        if k2 == "block-end" {
+            pop_state(p)
+            p.events.push(YeMapEnd)
+            p.at = p.at + 1
+            return
+        }
+        fail(perr(p, "did not find expected key while parsing a block mapping"))
+    }
+    // block-map-value
+    if k == ":" {
+        p.at = p.at + 1
+        let n = pk(p)
+        if n != "?" and n != ":" and n != "block-end" {
+            p.states.push("block-map-key")
+            return try node(p, true, true)
+        }
+    }
+    p.state = "block-map-key"
+    empty_scalar(p)
+}
+
+fn flow_states(inout p: YamlParser) -> () ! YamlSyntaxError {
+    let st = p.state
+    if st == "flow-seq-first" or st == "flow-seq" {
+        if st == "flow-seq-first" {
+            p.at = p.at + 1
+        }
+        if pk(p) != "]" {
+            if st == "flow-seq" {
+                if pk(p) == "," {
+                    p.at = p.at + 1
+                } else {
+                    fail(perr(p, "did not find expected ',' or ']' while parsing a flow sequence"))
+                }
+            }
+            if pk(p) == "?" {
+                p.state = "flow-seq-map-key"
+                p.events.push(YeMapStart("", "", true, true))
+                p.at = p.at + 1
+                return
+            }
+            if pk(p) != "]" {
+                p.states.push("flow-seq")
+                return try node(p, false, false)
+            }
+        }
+        pop_state(p)
+        p.events.push(YeSeqEnd)
+        p.at = p.at + 1
+        return
+    }
+    if st == "flow-seq-map-key" {
+        let k = pk(p)
+        if k != ":" and k != "," and k != "]" {
+            p.states.push("flow-seq-map-value")
+            return try node(p, false, false)
+        }
+        p.state = "flow-seq-map-value"
+        empty_scalar(p)
+        return
+    }
+    if st == "flow-seq-map-value" {
+        if pk(p) == ":" {
+            p.at = p.at + 1
+            if pk(p) != "," and pk(p) != "]" {
+                p.states.push("flow-seq-map-end")
+                return try node(p, false, false)
+            }
+        }
+        p.state = "flow-seq-map-end"
+        empty_scalar(p)
+        return
+    }
+    if st == "flow-seq-map-end" {
+        p.state = "flow-seq"
+        p.events.push(YeMapEnd)
+        return
+    }
+    return try flow_map_states(p)
+}
+
+fn flow_map_states(inout p: YamlParser) -> () ! YamlSyntaxError {
+    let st = p.state
+    if st == "flow-map-first" or st == "flow-map-key" {
+        if st == "flow-map-first" {
+            p.at = p.at + 1
+        }
+        if pk(p) != "\}" {
+            if st == "flow-map-key" {
+                if pk(p) == "," {
+                    p.at = p.at + 1
+                } else {
+                    fail(perr(p, "did not find expected ',' or '}' while parsing a flow mapping"))
+                }
+            }
+            if pk(p) == "?" {
+                p.at = p.at + 1
+                let k = pk(p)
+                if k != ":" and k != "," and k != "\}" {
+                    p.states.push("flow-map-value")
+                    return try node(p, false, false)
+                }
+                p.state = "flow-map-value"
+                empty_scalar(p)
+                return
+            }
+            if pk(p) != "\}" {
+                p.states.push("flow-map-empty-value")
+                return try node(p, false, false)
+            }
+        }
+        pop_state(p)
+        p.events.push(YeMapEnd)
+        p.at = p.at + 1
+        return
+    }
+    if st == "flow-map-empty-value" {
+        p.state = "flow-map-key"
+        empty_scalar(p)
+        return
+    }
+    // flow-map-value
+    if pk(p) == ":" {
+        p.at = p.at + 1
+        if pk(p) != "," and pk(p) != "\}" {
+            p.states.push("flow-map-key")
+            return try node(p, false, false)
+        }
+    }
+    p.state = "flow-map-key"
+    empty_scalar(p)
+}
+
+/// The events of a stream, as libyaml's parser produces them.
+pub fn events(text: str) -> [YamlEvent] ! YamlSyntaxError {
+    var p = YamlParser{ toks: try tokens(text), at: 0, states: [], state: "stream-start", events: [], tags: [] }
+    while p.state != "end" {
+        let st = p.state
+        if st == "stream-start" {
+            p.at = p.at + 1
+            p.events.push(YeStreamStart)
+            p.state = "implicit-document-start"
+        } else if st == "implicit-document-start" or st == "document-start" {
+            try document_start(p, st == "implicit-document-start")
+        } else if st == "document-content" {
+            let k = pk(p)
+            if k == "version" or k == "tag-directive" or k == "doc-start" or k == "doc-end" or k == "stream-end" {
+                pop_state(p)
+                empty_scalar(p)
+            } else {
+                try node(p, true, false)
+            }
+        } else if st == "document-end" {
+            document_end(p)
+        } else if st == "block-node" {
+            try node(p, true, false)
+        } else if st.starts_with("block") or st == "indentless-entry" {
+            try block_states(p)
+        } else {
+            try flow_states(p)
+        }
+    }
+    return p.events
+}
+
+type YamlNode =
+    | YnScalar(tag: str, value: str, style: str, plain: bool)
+    | YnSeq(tag: str, items: [i64], flow: bool)
+    | YnMap(tag: str, keys: [i64], values: [i64], flow: bool)
+
+type YamlDoc = { nodes: [YamlNode], root: i64, version: str, explicit_start: bool, explicit_end: bool }
+
+type YamlComposer = { ev: [YamlEvent], at: i64, nodes: [YamlNode], anchors: [(str, i64)] }
+
+fn remember(inout c: YamlComposer, anchor: str, at: i64) {
+    if anchor.len() > 0 {
+        c.anchors.push((anchor, at))
+    }
+}
+
+fn compose_node(inout c: YamlComposer) -> i64 ! YamlSyntaxError {
+    let e = c.ev[c.at]
+    c.at = c.at + 1
+    match e {
+        YeAlias(name) -> {
+            var k = c.anchors.len() - 1
+            while k >= 0 {
+                if c.anchors[k].0 == name {
+                    return c.anchors[k].1
+                }
+                k = k - 1
+            }
+            fail(YamlSyntaxError{ line: 0, column: 0, why: "found undefined alias " + name })
+        }
+        YeScalar(anchor, tag, value, plain, _q, style) -> {
+            c.nodes.push(YnScalar(tag, value, style, plain))
+            let me = c.nodes.len() - 1
+            remember(c, anchor, me)
+            return me
+        }
+        YeSeqStart(anchor, tag, _i, flow) -> {
+            c.nodes.push(YnSeq(tag, [], flow))
+            let me = c.nodes.len() - 1
+            remember(c, anchor, me)
+            var items: [i64] = []
+            while true {
+                match c.ev[c.at] {
+                    YeSeqEnd -> {
+                        c.at = c.at + 1
+                        break
+                    }
+                    _ -> items.push(try compose_node(c))
+                }
+            }
+            c.nodes[me] = YnSeq(tag, items, flow)
+            return me
+        }
+        YeMapStart(anchor, tag, _i, flow) -> {
+            c.nodes.push(YnMap(tag, [], [], flow))
+            let me = c.nodes.len() - 1
+            remember(c, anchor, me)
+            var keys: [i64] = []
+            var values: [i64] = []
+            while true {
+                match c.ev[c.at] {
+                    YeMapEnd -> {
+                        c.at = c.at + 1
+                        break
+                    }
+                    _ -> {
+                        keys.push(try compose_node(c))
+                        values.push(try compose_node(c))
+                    }
+                }
+            }
+            c.nodes[me] = YnMap(tag, keys, values, flow)
+            return me
+        }
+        _ -> fail(YamlSyntaxError{ line: 0, column: 0, why: "an event out of place" })
+    }
+}
+
+/// Every document of a stream, each its own graph of nodes.
+pub fn load(text: str) -> [YamlDoc] ! YamlSyntaxError {
+    let ev = try events(text)
+    var c = YamlComposer{ ev: ev, at: 1, nodes: [], anchors: [] }
+    var docs: [YamlDoc] = []
+    while true {
+        match c.ev[c.at] {
+            YeDocStart(version, _tags, implicit) -> {
+                c.at = c.at + 1
+                c.nodes = []
+                c.anchors = []
+                let root = try compose_node(c)
+                let end_implicit = match c.ev[c.at] {
+                    YeDocEnd(i) -> i
+                    _ -> true
+                }
+                c.at = c.at + 1
+                docs.push(YamlDoc{ nodes: c.nodes, root: root, version: version, explicit_start: not implicit, explicit_end: not end_implicit })
+            }
+            _ -> break
+        }
+    }
+    return docs
+}
+
+type YamlScalar =
+    | YsNull
+    | YsBool(b: bool)
+    | YsInt(i: i64)
+    | YsBigInt(decimal: str)
+    | YsFloat(f: f64)
+    | YsTimestamp(text: str)
+    | YsBinary(data: bytes)
+    | YsMerge
+    | YsString(s: str)
+
+fn all_in(s: str, allowed: str) -> bool {
+    return s.chars().all(|c| allowed.contains(c))
+}
+
+/// A base-10 digit string (no sign) with underscores, as an integer, or
+/// None when it overflows.
+fn digits_value(s: str, base: i64) -> Option[i64] {
+    var v = 0
+    for c in s.chars() {
+        if c == "_" {
+            continue
+        }
+        let d = hex_value(c)
+        if d < 0 or d >= base {
+            return None
+        }
+        if v > (9223372036854775807 - d) / base {
+            return None
+        }
+        v = v * base + d
+    }
+    return Some(v)
+}
+
+fn int_of(sign: i64, body: str, base: i64) -> YamlScalar {
+    return match digits_value(body, base) {
+        Some(v) -> YsInt(sign * v)
+        None -> YsBigInt((if sign < 0 { "-" } else { "" }) + big_decimal(body, base))
+    }
+}
+
+/// A number too big for 64 bits, in decimal.
+fn big_decimal(body: str, base: i64) -> str {
+    var digits: [i64] = [0]
+    for c in body.chars() {
+        if c == "_" {
+            continue
+        }
+        var carry = hex_value(c)
+        var i = 0
+        while i < digits.len() {
+            let v = digits[i] * base + carry
+            digits[i] = v % 10
+            carry = v / 10
+            i = i + 1
+        }
+        while carry > 0 {
+            digits.push(carry % 10)
+            carry = carry / 10
+        }
+    }
+    var out: [str] = []
+    var k = digits.len() - 1
+    while k > 0 and digits[k] == 0 {
+        k = k - 1
+    }
+    while k >= 0 {
+        out.push("{digits[k]}")
+        k = k - 1
+    }
+    return out.join("")
+}
+
+fn split_sign(v: str) -> (i64, str) {
+    if v.starts_with("-") {
+        return (0 - 1, v.substr(1, v.len() - 1))
+    }
+    if v.starts_with("+") {
+        return (1, v.substr(1, v.len() - 1))
+    }
+    return (1, v)
+}
+
+/// YAML 1.1's integer forms, or None.
+fn implicit_int(v: str) -> Option[YamlScalar] {
+    let (sign, b) = split_sign(v)
+    if b.len() == 0 {
+        return None
+    }
+    if b.starts_with("0b") and b.len() > 2 and all_in(b.substr(2, b.len() - 2), "01_") {
+        return Some(int_of(sign, b.substr(2, b.len() - 2), 2))
+    }
+    if b.starts_with("0x") and b.len() > 2 and all_in(b.substr(2, b.len() - 2), "0123456789abcdefABCDEF_") {
+        return Some(int_of(sign, b.substr(2, b.len() - 2), 16))
+    }
+    if b == "0" {
+        return Some(YsInt(0))
+    }
+    if b.starts_with("0") and b.len() > 1 and all_in(b.substr(1, b.len() - 1), "01234567_") {
+        return Some(int_of(sign, b.substr(1, b.len() - 1), 8))
+    }
+    let first = b.substr(0, 1)
+    if first >= "1" and first <= "9" and all_in(b, "0123456789_") {
+        return Some(int_of(sign, b, 10))
+    }
+    // Base 60: 190:20:30.
+    let parts = b.split(":")
+    if parts.len() > 1 and first >= "1" and first <= "9" and all_in(parts[0], "0123456789_") {
+        var total = 0
+        for i in 0..parts.len() {
+            let p = parts[i]
+            if i > 0 and (p.len() == 0 or p.len() > 2 or not all_in(p, "0123456789") or (p.parse_int() ?? 99) > 59) {
+                return None
+            }
+            let x = digits_value(p, 10) ?? 0
+            total = total * 60 + x
+        }
+        return Some(YsInt(sign * total))
+    }
+    return None
+}
+
+/// YAML 1.1's float forms, or None. A second point makes a string.
+fn implicit_float(v: str) -> Option[YamlScalar] {
+    let (sign, b) = split_sign(v)
+    if b == ".inf" or b == ".Inf" or b == ".INF" {
+        return Some(YsFloat(sign.as_f64() / 0.0))
+    }
+    if (b == ".nan" or b == ".NaN" or b == ".NAN") and v == b {
+        return Some(YsFloat(0.0 / 0.0))
+    }
+    // A mantissa with one point, then an exponent with a sign.
+    var mant = b
+    var exp = ""
+    let e = b.index_of("e") ?? (b.index_of("E") ?? -1)
+    if e >= 0 {
+        mant = b.substr(0, e)
+        exp = b.substr(e + 1, b.len() - e - 1)
+        if exp.len() < 2 or not (exp.starts_with("+") or exp.starts_with("-")) or not all_in(exp.substr(1, exp.len() - 1), "0123456789") {
+            return None
+        }
+    }
+    let dot = mant.index_of(".") ?? -1
+    if dot < 0 {
+        return None
+    }
+    let whole = mant.substr(0, dot)
+    let frac = mant.substr(dot + 1, mant.len() - dot - 1)
+    if not all_in(frac, "0123456789") {
+        // Base 60 with a fraction: 190:20:30.15.
+        if e >= 0 or not all_in(frac, "0123456789_") {
+            return None
+        }
+    }
+    if whole.contains(":") {
+        if e >= 0 {
+            return None
+        }
+        let parts = whole.split(":")
+        if parts[0].len() == 0 or not all_in(parts[0], "0123456789_") {
+            return None
+        }
+        var total = (digits_value(parts[0], 10) ?? 0).as_f64()
+        for i in 1..parts.len() {
+            let p = parts[i]
+            if p.len() == 0 or p.len() > 2 or not all_in(p, "0123456789") or (p.parse_int() ?? 99) > 59 {
+                return None
+            }
+            total = total * 60.0 + (p.parse_int() ?? 0).as_f64()
+        }
+        let f = ("0." + frac.replace("_", "")).parse_float() ?? 0.0
+        return Some(YsFloat(sign.as_f64() * (total + f)))
+    }
+    if whole.len() > 0 and (not all_in(whole, "0123456789_") or whole.starts_with("_")) {
+        return None
+    }
+    let text = (if whole.len() == 0 { "0" } else { whole.replace("_", "") }) + "." + (if frac.len() == 0 { "0" } else { frac }) +
+    (if exp.len() > 0 { "e" + exp } else { "" })
+    let f = text.parse_float() ?? 0.0
+    return Some(YsFloat(sign.as_f64() * f))
+}
+
+fn is_digits(s: str, lo: i64, hi: i64) -> bool {
+    return s.len() >= lo and s.len() <= hi and all_in(s, "0123456789")
+}
+
+/// YAML 1.1's timestamp: a date, or a date and time with an optional
+/// fraction and zone.
+fn is_timestamp(v: str) -> bool {
+    let cs = v.chars()
+    if cs.len() < 8 {
+        return false
+    }
+    let date_end = (v.index_of("T") ?? (v.index_of("t") ?? (v.index_of(" ") ?? (v.index_of("\t") ?? v.len()))))
+    let date = v.substr(0, date_end).split("-")
+    if date.len() != 3 or not is_digits(date[0], 4, 4) {
+        return false
+    }
+    if date_end == v.len() {
+        return is_digits(date[1], 2, 2) and is_digits(date[2], 2, 2)
+    }
+    if not is_digits(date[1], 1, 2) or not is_digits(date[2], 1, 2) {
+        return false
+    }
+    var rest = v.substr(date_end + 1, v.len() - date_end - 1)
+    while rest.starts_with(" ") or rest.starts_with("\t") {
+        rest = rest.substr(1, rest.len() - 1)
+    }
+    // hh:mm:ss, a fraction, then spaces and Z or a numeric offset.
+    let t = rest.chars()
+    var i = 0
+    var n = 0
+    while i < t.len() and t[i] >= "0" and t[i] <= "9" {
+        i = i + 1
+        n = n + 1
+    }
+    if n < 1 or n > 2 or i + 6 > t.len() or t[i] != ":" or not is_digits(t.slice(i + 1, i + 3).join(""), 2, 2) or t[i + 3] != ":" or
+    not is_digits(t.slice(i + 4, i + 6).join(""), 2, 2) {
+        return false
+    }
+    i = i + 6
+    if i < t.len() and t[i] == "." {
+        i = i + 1
+        while i < t.len() and t[i] >= "0" and t[i] <= "9" {
+            i = i + 1
+        }
+    }
+    while i < t.len() and (t[i] == " " or t[i] == "\t") {
+        i = i + 1
+    }
+    if i == t.len() {
+        return true
+    }
+    let zone = t.slice(i, t.len()).join("")
+    if zone == "Z" {
+        return true
+    }
+    if not (zone.starts_with("+") or zone.starts_with("-")) {
+        return false
+    }
+    let z = zone.substr(1, zone.len() - 1).split(":")
+    return z.len() == 1 and is_digits(z[0], 1, 2) or z.len() == 2 and is_digits(z[0], 1, 2) and is_digits(z[1], 2, 2)
+}
+
+fn implicit(v: str) -> YamlScalar {
+    if v.len() == 0 or v == "~" or v == "null" or v == "Null" or v == "NULL" {
+        return YsNull
+    }
+    for w in ["yes", "Yes", "YES", "true", "True", "TRUE", "on", "On", "ON"] {
+        if v == w {
+            return YsBool(true)
+        }
+    }
+    for w in ["no", "No", "NO", "false", "False", "FALSE", "off", "Off", "OFF"] {
+        if v == w {
+            return YsBool(false)
+        }
+    }
+    if v == "<<" {
+        return YsMerge
+    }
+    match implicit_int(v) {
+        Some(x) -> return x
+        None -> {}
+    }
+    match implicit_float(v) {
+        Some(x) -> return x
+        None -> {}
+    }
+    if is_timestamp(v) {
+        return YsTimestamp(v)
+    }
+    return YsString(v)
+}
+
+fn base64_value(c: str) -> i64 {
+    let table = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+    return table.index_of(c) ?? -1
+}
+
+fn binary(v: str) -> Option[bytes] {
+    var bits = 0
+    var n = 0
+    var out: [i64] = []
+    for c in v.chars() {
+        if c == " " or c == "\n" or c == "\r" or c == "\t" or c == "=" {
+            continue
+        }
+        let x = base64_value(c)
+        if x < 0 {
+            return None
+        }
+        bits = bits.shl(6).bit_or(x)
+        n = n + 6
+        if n >= 8 {
+            n = n - 8
+            out.push(bits.ushr(n).bit_and(255))
+        }
+    }
+    return Some(bytes_of(out))
+}
+
+/// A scalar's value under its tag: untagged plain scalars by YAML 1.1's
+/// implicit types, quoted ones and "!" as strings, the core tags as
+/// their types (a value its tag cannot read is an error), any other tag
+/// as a string.
+pub fn resolve(tag: str, value: str, plain: bool) -> YamlScalar ! YamlSyntaxError {
+    let core = "tag:yaml.org,2002:"
+    if tag.len() == 0 {
+        return if plain { implicit(value) } else { YsString(value) }
+    }
+    if not tag.starts_with(core) {
+        return YsString(value)
+    }
+    let t = tag.substr(core.len(), tag.len() - core.len())
+    let wrong = YamlSyntaxError{ line: 0, column: 0, why: "a value that is not of its tag " + tag }
+    if t == "str" {
+        return YsString(value)
+    }
+    if t == "binary" {
+        return YsBinary(binary(value) ?? fail(wrong))
+    }
+    let x = implicit(value)
+    let ok = match x {
+        YsNull -> t == "null"
+        YsBool(_b) -> t == "bool"
+        YsInt(_i) -> t == "int"
+        YsBigInt(_d) -> t == "int"
+        YsFloat(_f) -> t == "float"
+        YsTimestamp(_s) -> t == "timestamp"
+        YsMerge -> t == "merge"
+        _ -> false
+    }
+    if ok {
+        return x
+    }
+    if t == "float" {
+        match x {
+            YsInt(i) -> return YsFloat(i.as_f64())
+            _ -> {}
+        }
+    }
+    if t == "null" or t == "bool" or t == "int" or t == "float" or t == "timestamp" or t == "merge" {
+        fail(wrong)
+    }
+    return YsString(value)
+}
+
+/// Whether two key nodes are the same key: the same node, or scalars of
+/// equal value.
+fn same_key(doc: YamlDoc, a: i64, b: i64) -> bool {
+    if a == b {
+        return true
+    }
+    match doc.nodes[a] {
+        YnScalar(t1, v1, _s1, p1) -> match doc.nodes[b] {
+            YnScalar(t2, v2, _s2, p2) -> {
+                let x = resolve(t1, v1, p1) ?? YsString(v1)
+                let y = resolve(t2, v2, p2) ?? YsString(v2)
+                return match x {
+                    YsNull -> match y {
+                        YsNull -> true
+                        _ -> false
+                    }
+                    YsBool(i) -> match y {
+                        YsBool(j) -> i == j
+                        _ -> false
+                    }
+                    YsInt(i) -> match y {
+                        YsInt(j) -> i == j
+                        _ -> false
+                    }
+                    YsBigInt(i) -> match y {
+                        YsBigInt(j) -> i == j
+                        _ -> false
+                    }
+                    YsFloat(i) -> match y {
+                        YsFloat(j) -> i == j
+                        _ -> false
+                    }
+                    YsString(i) -> match y {
+                        YsString(j) -> i == j
+                        _ -> false
+                    }
+                    YsTimestamp(i) -> match y {
+                        YsTimestamp(j) -> i == j
+                        _ -> false
+                    }
+                    YsBinary(i) -> match y {
+                        YsBinary(j) -> i == j
+                        _ -> false
+                    }
+                    YsMerge -> false
+                }
+            }
+            _ -> false
+        }
+        _ -> false
+    }
+}
+
+fn has_key(doc: YamlDoc, ps: [(i64, i64)], k: i64) -> i64 {
+    for i in 0..ps.len() {
+        if same_key(doc, ps[i].0, k) {
+            return i
+        }
+    }
+    return 0 - 1
+}
+
+/// A mapping's pairs, each key once, with YAML 1.1 merge keys applied: a
+/// key written twice keeps its last value (as PyYAML, Psych and
+/// SnakeYAML read it), and the mappings a "<<" names (one, or a sequence
+/// of them, earlier ones winning) supply only keys the mapping does not
+/// have itself.
+pub fn pairs(doc: YamlDoc, node: i64) -> [(i64, i64)] ! YamlSyntaxError {
+    var direct: [(i64, i64)] = []
+    var merged: [(i64, i64)] = []
+    match doc.nodes[node] {
+        YnMap(_t, keys, values, _f) -> {
+            for i in 0..keys.len() {
+                let is_merge = match doc.nodes[keys[i]] {
+                    YnScalar(tag, value, _s, plain) -> match try resolve(tag, value, plain) {
+                        YsMerge -> true
+                        _ -> false
+                    }
+                    _ -> false
+                }
+                if not is_merge {
+                    let at = has_key(doc, direct, keys[i])
+                    if at >= 0 {
+                        direct[at] = (direct[at].0, values[i])
+                    } else {
+                        direct.push((keys[i], values[i]))
+                    }
+                    continue
+                }
+                let sources = match doc.nodes[values[i]] {
+                    YnSeq(_t2, items, _f2) -> items
+                    _ -> [values[i]]
+                }
+                for src in sources {
+                    match doc.nodes[src] {
+                        YnMap(_a, _b, _c, _d) -> {
+                            for pr in try pairs(doc, src) {
+                                if has_key(doc, merged, pr.0) < 0 {
+                                    merged.push(pr)
+                                }
+                            }
+                        }
+                        _ -> fail(YamlSyntaxError{ line: 0, column: 0, why: "a merge key whose value is not a mapping" })
+                    }
+                }
+            }
+        }
+        _ -> {}
+    }
+    var out = direct
+    for pr in merged {
+        if has_key(doc, direct, pr.0) < 0 {
+            out.push(pr)
+        }
+    }
+    return out
+}

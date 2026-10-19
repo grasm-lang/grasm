@@ -1,0 +1,662 @@
+// V8's value serialization: what Node's `v8.serialize` writes, what
+// `structuredClone`, `postMessage` and worker messages carry, and what
+// IndexedDB stores in Chrome.
+//
+// A header (0xFF and a version, 15 for current V8), then one value as a
+// tag byte and its contents: undefined, null, booleans, 32-bit integers
+// (zigzag varints), doubles, BigInts (a sign and 64-bit digits), strings
+// (Latin-1 or UTF-16), objects (keys and values, then a count), dense and
+// sparse arrays, Dates, RegExps (source and flags), Maps, Sets,
+// ArrayBuffers, boxed primitives, Errors, and Node's typed arrays and
+// Buffers (written as host objects: a type number, a length, the bytes).
+// An object met again is written as a back-reference to the number it got
+// when first written, so shared and cyclic structures survive.
+//
+// A value is a graph, held here in an arena: `V8Doc.nodes`, with
+// containers pointing at node numbers, so sharing and cycles are kept.
+// Strings are UTF-16 code units, as JavaScript's are: a lone surrogate is
+// a legal string. Writing makes the choices V8 makes: Latin-1 when every
+// unit fits, a 32-bit integer when a number is one (and not -0), dense or
+// sparse arrays as the value says, and a padding byte where a UTF-16
+// string's data would start at an odd offset.
+//
+// Checked against Node 25's `v8.serialize` and `v8.deserialize`: every
+// value read here as Node reads it, and written back byte for byte.
+
+type V8Key =
+    | V8IntKey(i: i64)
+    | V8StrKey(units: [i64])
+
+type V8Node =
+    | V8Undefined
+    | V8Null
+    | V8Hole
+    | V8Bool(b: bool)
+    | V8Number(n: f64)
+    | V8BigInt(negative: bool, magnitude: bytes)
+    | V8String(units: [i64])
+    | V8Object(keys: [V8Key], values: [i64])
+    | V8Array(dense: bool, length: i64, elements: [i64], keys: [V8Key], values: [i64])
+    | V8Date(ms: f64)
+    | V8RegExp(source: [i64], flags: i64)
+    | V8Map(entries: [(i64, i64)])
+    | V8Set(items: [i64])
+    | V8ArrayBuffer(data: bytes)
+    | V8TypedArray(kind: i64, data: bytes)
+    | V8Boxed(value: i64)
+    | V8Error(kind: str, message: Option[[i64]], stack: Option[[i64]], cause: Option[i64])
+
+type V8Doc = { nodes: [V8Node], root: i64 }
+
+type V8Error =
+    | V8Malformed(at: i64, why: str)
+    | V8UnknownTag(at: i64, tag: i64)
+
+type V8Reader = { d: bytes, at: i64, nodes: [V8Node], ids: [i64] }
+
+fn byte(inout r: V8Reader) -> i64 ! V8Error {
+    if r.at >= r.d.len() {
+        fail(V8Malformed(r.at, "data ends inside a value"))
+    }
+    r.at = r.at + 1
+    return r.d.at(r.at - 1)
+}
+
+fn varint(inout r: V8Reader) -> i64 ! V8Error {
+    var v = 0
+    var shift = 0
+    while true {
+        let b = try byte(r)
+        if shift > 63 {
+            fail(V8Malformed(r.at, "a varint too long"))
+        }
+        v = v.bit_or(b.bit_and(127).shl(shift))
+        shift = shift + 7
+        if b < 128 {
+            return v
+        }
+    }
+    return v
+}
+
+fn raw(inout r: V8Reader, n: i64) -> bytes ! V8Error {
+    if n < 0 or r.at + n > r.d.len() {
+        fail(V8Malformed(r.at, "data ends inside a value"))
+    }
+    r.at = r.at + n
+    return r.d.slice(r.at - n, r.at)
+}
+
+fn double(inout r: V8Reader) -> f64 ! V8Error {
+    let b = try raw(r, 8)
+    var bits = 0
+    for k in 0..8 {
+        bits = bits.bit_or(b.at(k).shl(8 * k))
+    }
+    return bits.from_bits()
+}
+
+fn add(inout r: V8Reader, n: V8Node) -> i64 {
+    r.nodes.push(n)
+    return r.nodes.len() - 1
+}
+
+/// A node that gets an object number: put in place first, so a reference
+/// to it from inside finds it.
+fn reserve(inout r: V8Reader) -> i64 {
+    r.nodes.push(V8Undefined)
+    r.ids.push(r.nodes.len() - 1)
+    return r.nodes.len() - 1
+}
+
+fn string_units(inout r: V8Reader, tag: i64) -> [i64] ! V8Error {
+    let n = try varint(r)
+    let b = try raw(r, n)
+    if tag == 34 {
+        return b.to_list()
+    }
+    if tag == 99 {
+        if n % 2 != 0 {
+            fail(V8Malformed(r.at, "a two-byte string of odd length"))
+        }
+        var out: [i64] = []
+        var k = 0
+        while k < n {
+            out.push(b.at(k).bit_or(b.at(k + 1).shl(8)))
+            k = k + 2
+        }
+        return out
+    }
+    // A UTF-8 string, as old versions wrote: as UTF-16 code units.
+    var out: [i64] = []
+    for c in b.to_str().codes() {
+        if c >= 65536 {
+            out.push(55296 + (c - 65536).ushr(10))
+            out.push(56320 + (c - 65536).bit_and(1023))
+        } else {
+            out.push(c)
+        }
+    }
+    return out
+}
+
+/// The next tag, past any padding.
+fn tag(inout r: V8Reader) -> i64 ! V8Error {
+    var t = try byte(r)
+    while t == 0 {
+        t = try byte(r)
+    }
+    return t
+}
+
+fn read_string(inout r: V8Reader) -> [i64] ! V8Error {
+    let t = try tag(r)
+    if t != 34 and t != 99 and t != 83 {
+        fail(V8Malformed(r.at - 1, "a string expected"))
+    }
+    return try string_units(r, t)
+}
+
+fn bigint(inout r: V8Reader) -> V8Node ! V8Error {
+    let bits = try varint(r)
+    return V8BigInt(bits.bit_and(1) == 1, try raw(r, bits.ushr(1)))
+}
+
+fn key(inout r: V8Reader) -> V8Key ! V8Error {
+    let t = try tag(r)
+    if t == 34 or t == 99 or t == 83 {
+        return V8StrKey(try string_units(r, t))
+    }
+    if t == 73 {
+        let z = try varint(r)
+        return V8IntKey(z.ushr(1).bit_xor(0 - z.bit_and(1)))
+    }
+    if t == 85 {
+        return V8IntKey(try varint(r))
+    }
+    if t == 78 {
+        return V8IntKey((try double(r)).as_i64())
+    }
+    fail(V8Malformed(r.at - 1, "an object key that is not a string or a number"))
+}
+
+/// Keys and values up to the end tag; returns the count the end tag gives.
+fn properties(inout r: V8Reader, end: i64, inout keys: [V8Key], inout values: [i64]) -> i64 ! V8Error {
+    while true {
+        if r.at < r.d.len() and r.d.at(r.at) == end {
+            r.at = r.at + 1
+            return try varint(r)
+        }
+        keys.push(try key(r))
+        values.push(try value(r))
+    }
+    return 0
+}
+
+fn value(inout r: V8Reader) -> i64 ! V8Error {
+    let at = r.at
+    let t = try tag(r)
+    if t == 95 {
+        return add(r, V8Undefined)
+    }
+    if t == 48 {
+        return add(r, V8Null)
+    }
+    if t == 45 {
+        return add(r, V8Hole)
+    }
+    if t == 84 or t == 70 {
+        return add(r, V8Bool(t == 84))
+    }
+    if t == 73 {
+        let z = try varint(r)
+        return add(r, V8Number(z.ushr(1).bit_xor(0 - z.bit_and(1)).as_f64()))
+    }
+    if t == 85 {
+        return add(r, V8Number((try varint(r)).as_f64()))
+    }
+    if t == 78 {
+        return add(r, V8Number(try double(r)))
+    }
+    if t == 90 {
+        return add(r, try bigint(r))
+    }
+    if t == 34 or t == 99 or t == 83 {
+        return add(r, V8String(try string_units(r, t)))
+    }
+    if t == 94 {
+        let id = try varint(r)
+        if id >= r.ids.len() {
+            fail(V8Malformed(at, "a reference to an object not yet read"))
+        }
+        return r.ids[id]
+    }
+    return try compound(r, t, at)
+}
+
+fn compound(inout r: V8Reader, t: i64, at: i64) -> i64 ! V8Error {
+    if t == 111 {
+        let me = reserve(r)
+        var keys: [V8Key] = []
+        var values: [i64] = []
+        let n = try properties(r, 123, keys, values)
+        if n != keys.len() {
+            fail(V8Malformed(at, "an object whose count does not match"))
+        }
+        r.nodes[me] = V8Object(keys, values)
+        return me
+    }
+    if t == 65 or t == 97 {
+        let length = try varint(r)
+        let me = reserve(r)
+        var elements: [i64] = []
+        if t == 65 {
+            for _i in 0..length {
+                elements.push(try value(r))
+            }
+        }
+        var keys: [V8Key] = []
+        var values: [i64] = []
+        let n = try properties(r, if t == 65 { 36 } else { 64 }, keys, values)
+        let len2 = try varint(r)
+        if n != keys.len() or len2 != length {
+            fail(V8Malformed(at, "an array whose counts do not match"))
+        }
+        r.nodes[me] = V8Array(t == 65, length, elements, keys, values)
+        return me
+    }
+    if t == 68 {
+        let me = reserve(r)
+        r.nodes[me] = V8Date(try double(r))
+        return me
+    }
+    if t == 82 {
+        let me = reserve(r)
+        let source = try read_string(r)
+        r.nodes[me] = V8RegExp(source, try varint(r))
+        return me
+    }
+    return try collections(r, t, at)
+}
+
+fn collections(inout r: V8Reader, t: i64, at: i64) -> i64 ! V8Error {
+    if t == 59 {
+        let me = reserve(r)
+        var entries: [(i64, i64)] = []
+        while r.at < r.d.len() and r.d.at(r.at) != 58 {
+            let k = try value(r)
+            entries.push((k, try value(r)))
+        }
+        let _end = try byte(r)
+        if (try varint(r)) != 2 * entries.len() {
+            fail(V8Malformed(at, "a map whose count does not match"))
+        }
+        r.nodes[me] = V8Map(entries)
+        return me
+    }
+    if t == 39 {
+        let me = reserve(r)
+        var items: [i64] = []
+        while r.at < r.d.len() and r.d.at(r.at) != 44 {
+            items.push(try value(r))
+        }
+        let _end = try byte(r)
+        if (try varint(r)) != items.len() {
+            fail(V8Malformed(at, "a set whose count does not match"))
+        }
+        r.nodes[me] = V8Set(items)
+        return me
+    }
+    if t == 66 {
+        let me = reserve(r)
+        let n = try varint(r)
+        r.nodes[me] = V8ArrayBuffer(try raw(r, n))
+        return me
+    }
+    if t == 92 {
+        let me = reserve(r)
+        let kind = try varint(r)
+        let n = try varint(r)
+        r.nodes[me] = V8TypedArray(kind, try raw(r, n))
+        return me
+    }
+    return try boxed(r, t, at)
+}
+
+fn boxed(inout r: V8Reader, t: i64, at: i64) -> i64 ! V8Error {
+    if t == 121 or t == 120 or t == 110 or t == 122 or t == 115 {
+        let me = reserve(r)
+        let inner = if t == 121 or t == 120 { add(r, V8Bool(t == 121)) } else if t == 110 { add(r, V8Number(try double(r))) }
+        else if t == 122 { add(r, try bigint(r)) } else { add(r, V8String(try read_string(r))) }
+        r.nodes[me] = V8Boxed(inner)
+        return me
+    }
+    if t == 114 {
+        let me = reserve(r)
+        var kind = "Error"
+        var message: Option[[i64]] = None
+        var stack: Option[[i64]] = None
+        var cause: Option[i64] = None
+        while true {
+            let s = try byte(r)
+            if s == 46 {
+                r.nodes[me] = V8Error(kind, message, stack, cause)
+                return me
+            }
+            let names = [(69, "EvalError"), (82, "RangeError"), (70, "ReferenceError"), (83, "SyntaxError"), (84, "TypeError"), (85, "URIError")]
+            var known = false
+            for (c, n) in names {
+                if c == s {
+                    kind = n
+                    known = true
+                }
+            }
+            if s == 109 {
+                message = Some(try read_string(r))
+            } else if s == 115 {
+                stack = Some(try read_string(r))
+            } else if s == 99 {
+                cause = Some(try value(r))
+            } else if not known {
+                fail(V8Malformed(r.at - 1, "an unknown error field"))
+            }
+        }
+    }
+    fail(V8UnknownTag(at, t))
+}
+
+/// A serialized value, read whole.
+pub fn decode(d: bytes) -> V8Doc ! V8Error {
+    if d.len() < 2 or d.at(0) != 255 {
+        fail(V8Malformed(0, "no version header"))
+    }
+    var r = V8Reader{ d: d, at: 1, nodes: [], ids: [] }
+    let version = try varint(r)
+    if version < 13 {
+        fail(V8Malformed(1, "a version before 13"))
+    }
+    let root = try value(r)
+    return V8Doc{ nodes: r.nodes, root: root }
+}
+
+type V8Writer = { doc: V8Doc, out: [i64], ids: [i64] }
+
+fn put_varint(inout w: V8Writer, v: i64) {
+    var x = v
+    while x >= 128 {
+        w.out.push(x.bit_and(127) + 128)
+        x = x.ushr(7)
+    }
+    w.out.push(x)
+}
+
+fn put_double(inout w: V8Writer, f: f64) {
+    let bits = f.to_bits()
+    for k in 0..8 {
+        w.out.push(bits.ushr(8 * k).bit_and(255))
+    }
+}
+
+fn varint_len(v: i64) -> i64 {
+    var n = 1
+    var x = v
+    while x >= 128 {
+        x = x.ushr(7)
+        n = n + 1
+    }
+    return n
+}
+
+/// Latin-1 when every unit fits, UTF-16 otherwise, as V8 chooses; a UTF-16
+/// string's data starts at an even offset, a padding byte before its tag
+/// when it would not.
+fn put_string(inout w: V8Writer, units: [i64]) {
+    if units.all(|u| u < 256) {
+        w.out.push(34)
+        put_varint(w, units.len())
+        for u in units {
+            w.out.push(u)
+        }
+    } else {
+        if (w.out.len() + 1 + varint_len(2 * units.len())) % 2 == 1 {
+            w.out.push(0)
+        }
+        w.out.push(99)
+        put_varint(w, 2 * units.len())
+        for u in units {
+            w.out.push(u.bit_and(255))
+            w.out.push(u.ushr(8))
+        }
+    }
+}
+
+/// A number as a 32-bit integer when it is one (and not -0), else a double.
+fn put_number(inout w: V8Writer, n: f64) {
+    let i = n.as_i64()
+    if i.as_f64() == n and i >= -2147483648 and i <= 2147483647 and not (i == 0 and n.to_bits() != 0) {
+        w.out.push(73)
+        put_varint(w, i.shl(1).bit_xor(i.shr(63)).bit_and(4294967295))
+    } else {
+        w.out.push(78)
+        put_double(w, n)
+    }
+}
+
+fn put_key(inout w: V8Writer, k: V8Key) {
+    match k {
+        V8IntKey(i) -> put_number(w, i.as_f64())
+        V8StrKey(units) -> put_string(w, units)
+    }
+}
+
+fn put_props(inout w: V8Writer, keys: [V8Key], values: [i64]) {
+    for i in 0..keys.len() {
+        put_key(w, keys[i])
+        put_value(w, values[i])
+    }
+}
+
+fn put_bigint(inout w: V8Writer, negative: bool, magnitude: bytes) {
+    put_varint(w, magnitude.len().shl(1) + (if negative { 1 } else { 0 }))
+    for i in 0..magnitude.len() {
+        w.out.push(magnitude.at(i))
+    }
+}
+
+/// Whether a node is one V8 numbers and refers back to.
+fn is_object(n: V8Node) -> bool {
+    return match n {
+        V8Undefined -> false
+        V8Null -> false
+        V8Hole -> false
+        V8Bool(_b) -> false
+        V8Number(_n) -> false
+        V8BigInt(_s, _m) -> false
+        V8String(_u) -> false
+        _ -> true
+    }
+}
+
+fn put_value(inout w: V8Writer, at: i64) {
+    let n = w.doc.nodes[at]
+    if is_object(n) {
+        for id in 0..w.ids.len() {
+            if w.ids[id] == at {
+                w.out.push(94)
+                put_varint(w, id)
+                return
+            }
+        }
+        w.ids.push(at)
+    }
+    match n {
+        V8Undefined -> w.out.push(95)
+        V8Null -> w.out.push(48)
+        V8Hole -> w.out.push(45)
+        V8Bool(b) -> w.out.push(if b { 84 } else { 70 })
+        V8Number(f) -> put_number(w, f)
+        V8BigInt(s, m) -> {
+            w.out.push(90)
+            put_bigint(w, s, m)
+        }
+        V8String(units) -> put_string(w, units)
+        _ -> put_compound(w, n)
+    }
+}
+
+fn put_compound(inout w: V8Writer, n: V8Node) {
+    match n {
+        V8Object(keys, values) -> {
+            w.out.push(111)
+            put_props(w, keys, values)
+            w.out.push(123)
+            put_varint(w, keys.len())
+        }
+        V8Array(dense, length, elements, keys, values) -> {
+            w.out.push(if dense { 65 } else { 97 })
+            put_varint(w, length)
+            for e in elements {
+                put_value(w, e)
+            }
+            put_props(w, keys, values)
+            w.out.push(if dense { 36 } else { 64 })
+            put_varint(w, keys.len())
+            put_varint(w, length)
+        }
+        V8Date(ms) -> {
+            w.out.push(68)
+            put_double(w, ms)
+        }
+        V8RegExp(source, flags) -> {
+            w.out.push(82)
+            put_string(w, source)
+            put_varint(w, flags)
+        }
+        V8Map(entries) -> {
+            w.out.push(59)
+            for (k, v) in entries {
+                put_value(w, k)
+                put_value(w, v)
+            }
+            w.out.push(58)
+            put_varint(w, 2 * entries.len())
+        }
+        V8Set(items) -> {
+            w.out.push(39)
+            for x in items {
+                put_value(w, x)
+            }
+            w.out.push(44)
+            put_varint(w, items.len())
+        }
+        _ -> put_other(w, n)
+    }
+}
+
+fn put_other(inout w: V8Writer, n: V8Node) {
+    match n {
+        V8ArrayBuffer(data) -> {
+            w.out.push(66)
+            put_varint(w, data.len())
+            for i in 0..data.len() {
+                w.out.push(data.at(i))
+            }
+        }
+        V8TypedArray(kind, data) -> {
+            w.out.push(92)
+            put_varint(w, kind)
+            put_varint(w, data.len())
+            for i in 0..data.len() {
+                w.out.push(data.at(i))
+            }
+        }
+        V8Boxed(inner) -> {
+            match w.doc.nodes[inner] {
+                V8Bool(b) -> w.out.push(if b { 121 } else { 120 })
+                V8Number(f) -> {
+                    w.out.push(110)
+                    put_double(w, f)
+                }
+                V8BigInt(s, m) -> {
+                    w.out.push(122)
+                    put_bigint(w, s, m)
+                }
+                V8String(units) -> {
+                    w.out.push(115)
+                    put_string(w, units)
+                }
+                _ -> w.out.push(95)
+            }
+        }
+        V8Error(kind, message, stack, cause) -> {
+            w.out.push(114)
+            let tags = [("EvalError", 69), ("RangeError", 82), ("ReferenceError", 70), ("SyntaxError", 83), ("TypeError", 84), ("URIError", 85)]
+            for (name, t) in tags {
+                if name == kind {
+                    w.out.push(t)
+                }
+            }
+            match message {
+                Some(m) -> {
+                    w.out.push(109)
+                    put_string(w, m)
+                }
+                None -> {}
+            }
+            match stack {
+                Some(s) -> {
+                    w.out.push(115)
+                    put_string(w, s)
+                }
+                None -> {}
+            }
+            match cause {
+                Some(c) -> {
+                    w.out.push(99)
+                    put_value(w, c)
+                }
+                None -> {}
+            }
+            w.out.push(46)
+        }
+        _ -> w.out.push(95)
+    }
+}
+
+/// The value as V8 version 15 writes it.
+pub fn encode(doc: V8Doc) -> bytes {
+    var w = V8Writer{ doc: doc, out: [255, 15], ids: [] }
+    put_value(w, doc.root)
+    return bytes_of(w.out)
+}
+
+/// A string node's text; a lone surrogate becomes U+FFFD.
+pub fn text(units: [i64]) -> str {
+    var cps: [i64] = []
+    var i = 0
+    while i < units.len() {
+        let u = units[i]
+        if u >= 55296 and u < 56320 and i + 1 < units.len() and units[i + 1] >= 56320 and units[i + 1] < 57344 {
+            cps.push(65536 + (u - 55296).shl(10) + (units[i + 1] - 56320))
+            i = i + 2
+        } else {
+            cps.push(if u >= 55296 and u < 57344 { 65533 } else { u })
+            i = i + 1
+        }
+    }
+    return cps.map(|c| c.to_char()).join("")
+}
+
+/// A text as UTF-16 code units.
+pub fn units(s: str) -> [i64] {
+    var out: [i64] = []
+    for c in s.codes() {
+        if c >= 65536 {
+            out.push(55296 + (c - 65536).ushr(10))
+            out.push(56320 + (c - 65536).bit_and(1023))
+        } else {
+            out.push(c)
+        }
+    }
+    return out
+}

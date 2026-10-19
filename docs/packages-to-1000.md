@@ -253,9 +253,43 @@ projection library), `flexlayout` (no layout engine outside a browser),
 `ndarray` (no NumPy), `quic` `http3` (no peer), `osmpbf` `mvt` (no
 `paulmach/protoscan` in the module cache), `cuesheet` (FFmpeg has no cue
 sheet reader), `sdp` (FFmpeg reads SDP only to open the RTP session it
-describes). Each becomes buildable the day its reference is installed.
+describes), `cargolock` (no cargo), `pyproject` (no PEP 621 build
+backend), `cyclonedx` `osvrecord` (no schema validator), `ocimanifest`
+(the module cache has image-spec's go.mod and not its code). Each
+becomes buildable the day its reference is installed.
 
 ## Landed
+
+- [x] **B40: other languages' files** — B4's `yaml` `yamlemit`
+  `jsonlines` `javaserial` `perlstorable` `classfile` `jarmanifest`
+  `pycfile` `taptest` `v8serial` (`javaprops` is `properties` already),
+  and the harness `b40test`; the new gate `b40diff` runs about 970 cases,
+  each format against the language that writes it: JSON Lines and JSON
+  text sequences against Python's `json`; JAR manifests read and written
+  against java.util.jar.Manifest; .pyc files from Pythons 3.9, 3.13 and
+  3.14 in all three invalidation modes against each one's `marshal`, and
+  `source_hash` against importlib; TAP against Perl's TAP::Parser, tokens,
+  results and parse errors; V8 values against Node's `v8.serialize`, and
+  Storable against `nfreeze`, `freeze`, `nstore` and `store`, each read to
+  the same graph and written back byte for byte; Java object streams of
+  custom classes, records, enums, externalizables, collections and cycles
+  against ObjectInputStream, written back byte for byte; class files of
+  the JDK's own modules against `javap -v -c -p`, every constant, member
+  and instruction; and YAML against Ruby's Psych (libyaml 0.2.5): parse
+  events for random documents, a corpus of awkward ones and damaged ones
+  (every error agreed on), resolved values, and YAML written here read
+  back by Psych to the same values. The references' habits were followed
+  where they decide what the bytes mean: V8 pads a UTF-16 string to an
+  even offset; Storable's back-references are big-endian even in a
+  native-order stream; Java reads a manifest 512 bytes at a time, a CR
+  taking its LF only when both fit, and loses an unfinished last line
+  with the header it would have continued; Python's source hash is
+  SipHash-1-3 from 3.11 and SipHash-2-4 before; TAP::Parser writes a
+  test's assigned number and its plan-given TODO into the token. Where
+  Psych is not YAML 1.1 the package follows the specification and the
+  gate leaves those inputs out: Psych reads an unknown or "!" tag as
+  untagged, `1:30` as 5400, `1,000` as a number and `nULL` as null. The
+  count reaches 938.
 
 - [x] **B39: audio and video formats** — B11's `isobmff` `matroska`
   `oggpage` `vorbiscomment` `opushead` `flacdec` `adts` `mp3frame` `aiff`
@@ -746,7 +780,7 @@ describes). Each becomes buildable the day its reference is installed.
 | | |
 |---|---|
 | At the start | 669 |
-| Now | 927 |
+| Now | 938 |
 | Candidates above | 316 packages in 28 batches, plus `ecc`, `rfc6979` and `goprintf` |
 | Harnesses, one a batch | 28 |
 | If every candidate lands | 1016 |

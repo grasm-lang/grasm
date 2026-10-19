@@ -1,0 +1,465 @@
+// Perl's Storable: the binary format of `store`, `nstore`, `freeze` and
+// `nfreeze`.
+//
+// Storable is how Perl programs persist and pass data structures: CPAN's
+// cache, session stores, job queues (Gearman, TheSchwartz), memcached
+// clients, and many a nightly dump. A stream is an optional "pst0" file
+// magic, a major version byte with the network-order flag in its low
+// bit, a minor version, and (native order only) the byte order string and
+// the sizes of int, long, pointer and NV; then one value as a tag byte
+// and its contents: undef, small integers in a byte, 32-bit integers,
+// native integers and doubles (native order) or decimal strings (network
+// order), byte strings and UTF-8 strings, references (weak and
+// overloaded too), arrays, hashes (with per-key UTF-8 flags when needed),
+// blessed objects with their class names (a class seen before is named
+// by index), and back-references: every value stored gets a number in
+// order, and a value met again is written as its number, so shared and
+// cyclic structures survive.
+//
+// A value is a graph, held in an arena: `PerlDoc.nodes`, references and
+// containers pointing at node numbers. Writing follows `nfreeze` (or
+// `freeze`) with `$Storable::canonical` set: hash keys sorted, integers in
+// the smallest form, network-order numbers as Perl prints them ("%.15g").
+//
+// Hooks (STORABLE_freeze), tied variables and code references are
+// refused, as they need the Perl that wrote them.
+//
+// Checked against Storable 3.23 (Perl 5.34), reading `freeze`, `nfreeze`,
+// `store` and `nstore` output and writing what `thaw` reads back and
+// `nfreeze` writes byte for byte.
+import cformat
+
+type PerlNode =
+    | PlUndef
+    | PlSvUndef
+    | PlYes
+    | PlNo
+    | PlInt(i: i64)
+    | PlDouble(f: f64)
+    | PlBytes(b: bytes)
+    | PlUtf8(s: str)
+    | PlRef(target: i64, weak: bool, overload: bool)
+    | PlArray(items: [i64])
+    | PlHash(keys: [(bytes, bool)], values: [i64])
+    | PlBlessed(class: str, target: i64)
+
+type PerlDoc = { nodes: [PerlNode], root: i64, network: bool }
+
+type StorableError =
+    | StMalformed(at: i64, why: str)
+    | StUnsupported(at: i64, what: str)
+
+type StReader = { d: bytes, at: i64, net: bool, int_size: i64, nodes: [PerlNode], seen: [i64], classes: [str] }
+
+fn byte(inout r: StReader) -> i64 ! StorableError {
+    if r.at >= r.d.len() {
+        fail(StMalformed(r.at, "data ends inside a value"))
+    }
+    r.at = r.at + 1
+    return r.d.at(r.at - 1)
+}
+
+fn take(inout r: StReader, n: i64) -> bytes ! StorableError {
+    if n < 0 or r.at + n > r.d.len() {
+        fail(StMalformed(r.at, "data ends inside a value"))
+    }
+    r.at = r.at + n
+    return r.d.slice(r.at - n, r.at)
+}
+
+/// A 32-bit length or number: big-endian in network order, little-endian
+/// (this machine's order) otherwise.
+fn i32(inout r: StReader) -> i64 ! StorableError {
+    let b = try take(r, 4)
+    let v = if r.net { b.at(0).shl(24).bit_or(b.at(1).shl(16)).bit_or(b.at(2).shl(8)).bit_or(b.at(3)) }
+    else { b.at(0).bit_or(b.at(1).shl(8)).bit_or(b.at(2).shl(16)).bit_or(b.at(3).shl(24)) }
+    return if v >= 2147483648 { v - 4294967296 } else { v }
+}
+
+fn le64(b: bytes) -> i64 {
+    var v = 0
+    for k in 0..8 {
+        v = v.bit_or(b.at(k).shl(8 * k))
+    }
+    return v
+}
+
+fn add(inout r: StReader, n: PerlNode) -> i64 {
+    r.nodes.push(n)
+    return r.nodes.len() - 1
+}
+
+/// A node that gets the next stored-value number, put in place before its
+/// contents are read.
+fn seen(inout r: StReader, n: PerlNode) -> i64 {
+    let at = add(r, n)
+    r.seen.push(at)
+    return at
+}
+
+fn value(inout r: StReader) -> i64 ! StorableError {
+    let at = r.at
+    let t = try byte(r)
+    if t == 0 {
+        // Back-reference numbers are big-endian in either order.
+        let b = try take(r, 4)
+        let k = b.at(0).shl(24).bit_or(b.at(1).shl(16)).bit_or(b.at(2).shl(8)).bit_or(b.at(3))
+        if k < 0 or k >= r.seen.len() {
+            fail(StMalformed(at, "a reference to a value not yet read"))
+        }
+        return r.seen[k]
+    }
+    if t == 5 {
+        return seen(r, PlUndef)
+    }
+    if t == 14 or t == 31 {
+        return seen(r, PlSvUndef)
+    }
+    if t == 15 {
+        return seen(r, PlYes)
+    }
+    if t == 16 {
+        return seen(r, PlNo)
+    }
+    if t == 8 {
+        return seen(r, PlInt((try byte(r)) - 128))
+    }
+    if t == 9 {
+        // Always big-endian, whatever the stream's order.
+        let b = try take(r, 4)
+        let v = b.at(0).shl(24).bit_or(b.at(1).shl(16)).bit_or(b.at(2).shl(8)).bit_or(b.at(3))
+        return seen(r, PlInt(if v >= 2147483648 { v - 4294967296 } else { v }))
+    }
+    if t == 6 {
+        return seen(r, PlInt(le64(try take(r, 8))))
+    }
+    if t == 7 {
+        let bits = le64(try take(r, 8))
+        return seen(r, PlDouble(bits.from_bits()))
+    }
+    if t == 10 or t == 1 {
+        let n = if t == 10 { try byte(r) } else { try i32(r) }
+        return seen(r, PlBytes(try take(r, n)))
+    }
+    if t == 23 or t == 24 {
+        let n = if t == 23 { try byte(r) } else { try i32(r) }
+        return seen(r, PlUtf8((try take(r, n)).to_str()))
+    }
+    return try containers(r, t, at)
+}
+
+fn containers(inout r: StReader, t: i64, at: i64) -> i64 ! StorableError {
+    if t == 4 or t == 20 or t == 27 or t == 28 {
+        let me = seen(r, PlUndef)
+        let target = try value(r)
+        r.nodes[me] = PlRef(target, t == 27 or t == 28, t == 20 or t == 28)
+        return me
+    }
+    if t == 2 {
+        let n = try i32(r)
+        let me = seen(r, PlUndef)
+        var items: [i64] = []
+        for _k in 0..n {
+            items.push(try value(r))
+        }
+        r.nodes[me] = PlArray(items)
+        return me
+    }
+    if t == 3 or t == 25 {
+        if t == 25 {
+            let _flags = try byte(r)
+        }
+        let n = try i32(r)
+        let me = seen(r, PlUndef)
+        var keys: [(bytes, bool)] = []
+        var values: [i64] = []
+        for _k in 0..n {
+            values.push(try value(r))
+            var utf8 = false
+            if t == 25 {
+                let kf = try byte(r)
+                if kf.bit_and(8) != 0 {
+                    fail(StUnsupported(at, "a hash key stored as a value"))
+                }
+                utf8 = kf.bit_and(1) != 0
+            }
+            let len = try i32(r)
+            keys.push((try take(r, len), utf8))
+        }
+        r.nodes[me] = PlHash(keys, values)
+        return me
+    }
+    if t == 17 or t == 18 {
+        var class = ""
+        if t == 17 {
+            var n = try byte(r)
+            if n.bit_and(128) != 0 {
+                n = try i32(r)
+            }
+            class = (try take(r, n)).to_str()
+            r.classes.push(class)
+        } else {
+            var k = try byte(r)
+            if k.bit_and(128) != 0 {
+                k = try i32(r)
+            }
+            if k >= r.classes.len() {
+                fail(StMalformed(at, "a class index not yet seen"))
+            }
+            class = r.classes[k]
+        }
+        let target = try value(r)
+        let me = add(r, PlBlessed(class, target))
+        // A later back-reference to the object means the blessed object.
+        for k in 0..r.seen.len() {
+            if r.seen[k] == target {
+                r.seen[k] = me
+            }
+        }
+        return me
+    }
+    let names = [(11, "a tied array"), (12, "a tied hash"), (13, "a tied scalar"), (19, "a STORABLE_freeze hook"), (21, "a tied hash element"),
+        (22, "a tied array element"), (26, "a code reference"), (29, "a version string"), (30, "a version string"), (32, "a regular expression"),
+        (33, "a large object")]
+    for (code, what) in names {
+        if code == t {
+            fail(StUnsupported(at, what))
+        }
+    }
+    fail(StMalformed(at, "an unknown tag {t}"))
+}
+
+/// A Storable stream (with or without the "pst0" of a file).
+pub fn decode(d: bytes) -> PerlDoc ! StorableError {
+    var at = if d.len() >= 4 and d.slice(0, 4).to_str() == "pst0" { 4 } else { 0 }
+    if at + 2 > d.len() {
+        fail(StMalformed(at, "no header"))
+    }
+    let major = d.at(at)
+    if major.ushr(1) != 2 {
+        fail(StMalformed(at, "a major version other than 2"))
+    }
+    let net = major.bit_and(1) == 1
+    at = at + 2
+    var int_size = 4
+    if not net {
+        let n = d.at(at)
+        let order = d.slice(at + 1, at + 1 + n).to_str()
+        if order != "12345678" and order != "1234" {
+            fail(StUnsupported(at, "a byte order other than little-endian"))
+        }
+        int_size = d.at(at + 1 + n)
+        at = at + 1 + n + 4
+    }
+    var r = StReader{ d: d, at: at, net: net, int_size: int_size, nodes: [], seen: [], classes: [] }
+    let root = try value(r)
+    return PerlDoc{ nodes: r.nodes, root: root, network: net }
+}
+
+type StWriter = { doc: PerlDoc, out: [i64], stored: [i64], classes: [str] }
+
+fn put32(inout w: StWriter, v: i64) {
+    let x = v.bit_and(4294967295)
+    if w.doc.network {
+        for k in [24, 16, 8, 0] {
+            w.out.push(x.ushr(k).bit_and(255))
+        }
+    } else {
+        for k in [0, 8, 16, 24] {
+            w.out.push(x.ushr(k).bit_and(255))
+        }
+    }
+}
+
+fn put_bytes(inout w: StWriter, b: bytes) {
+    for i in 0..b.len() {
+        w.out.push(b.at(i))
+    }
+}
+
+/// A string: a one-byte length up to 255 bytes, a 32-bit one beyond.
+fn put_string(inout w: StWriter, b: bytes, utf8: bool) {
+    if b.len() <= 255 {
+        w.out.push(if utf8 { 23 } else { 10 })
+        w.out.push(b.len())
+    } else {
+        w.out.push(if utf8 { 24 } else { 1 })
+        put32(w, b.len())
+    }
+    put_bytes(w, b)
+}
+
+fn put_int(inout w: StWriter, i: i64) {
+    if i >= -128 and i <= 127 {
+        w.out.push(8)
+        w.out.push(i + 128)
+    } else if w.doc.network {
+        if i >= -2147483648 and i <= 2147483647 {
+            w.out.push(9)
+            for k in [24, 16, 8, 0] {
+                w.out.push(i.shr(k).bit_and(255))
+            }
+        } else {
+            put_string(w, "{i}".to_bytes(), false)
+        }
+    } else {
+        w.out.push(6)
+        for k in 0..8 {
+            w.out.push(i.shr(8 * k).bit_and(255))
+        }
+    }
+}
+
+/// A number as Perl prints it: "%.15g", with Perl's names for infinities
+/// and NaN.
+pub fn perl_number(f: f64) -> str {
+    if f != f {
+        return "NaN"
+    }
+    if f > 1.7976931348623157e308 {
+        return "Inf"
+    }
+    if f < -1.7976931348623157e308 {
+        return "-Inf"
+    }
+    return cformat.format("%.15g", [Float(f)]) ?? "0"
+}
+
+fn put_double(inout w: StWriter, f: f64) {
+    let i = f.as_i64()
+    // An integer in disguise is stored as one, as Storable does -- when
+    // Perl holds it as a precise integer: whole, and smaller than 2^53.
+    if f == f and f > -9007199254740992.0 and f < 9007199254740992.0 and i.as_f64() == f {
+        put_int(w, i)
+    } else if w.doc.network {
+        put_string(w, perl_number(f).to_bytes(), false)
+    } else {
+        w.out.push(7)
+        let bits = f.to_bits()
+        for k in 0..8 {
+            w.out.push(bits.ushr(8 * k).bit_and(255))
+        }
+    }
+}
+
+/// A key as text, for Perl's string order: by code point, a byte key's
+/// bytes being Latin-1 characters. UTF-8's byte order is code point order.
+fn key_text(k: (bytes, bool)) -> str {
+    return if k.1 { k.0.to_str() } else { k.0.to_list().map(|c| c.to_char()).join("") }
+}
+
+fn put_hash(inout w: StWriter, keys: [(bytes, bool)], values: [i64]) {
+    var order: [i64] = []
+    for i in 0..keys.len() {
+        order.push(i)
+    }
+    order.sort_by(|i| key_text(keys[i]))
+    let flagged = keys.any(|k| k.1)
+    if flagged {
+        w.out.push(25)
+        w.out.push(0)
+    } else {
+        w.out.push(3)
+    }
+    put32(w, keys.len())
+    for i in order {
+        put_value(w, values[i])
+        if flagged {
+            w.out.push(if keys[i].1 { 1 } else { 0 })
+        }
+        put32(w, keys[i].0.len())
+        put_bytes(w, keys[i].0)
+    }
+}
+
+fn put_value(inout w: StWriter, at: i64) {
+    for k in 0..w.stored.len() {
+        if w.stored[k] == at {
+            w.out.push(0)
+            for sh in [24, 16, 8, 0] {
+                w.out.push(k.ushr(sh).bit_and(255))
+            }
+            return
+        }
+    }
+    let n = w.doc.nodes[at]
+    match n {
+        PlBlessed(class, target) -> {
+            put_bless(w, class)
+            put_value(w, target)
+            return
+        }
+        _ -> {}
+    }
+    w.stored.push(at)
+    match n {
+        PlUndef -> w.out.push(5)
+        PlSvUndef -> w.out.push(14)
+        PlYes -> w.out.push(15)
+        PlNo -> w.out.push(16)
+        PlInt(i) -> put_int(w, i)
+        PlDouble(f) -> put_double(w, f)
+        PlBytes(b) -> put_string(w, b, false)
+        PlUtf8(s) -> put_string(w, s.to_bytes(), true)
+        PlRef(target, weak, overload) -> {
+            w.out.push(if weak and overload { 28 } else if weak { 27 } else if overload { 20 } else { 4 })
+            put_value(w, target)
+        }
+        PlArray(items) -> {
+            w.out.push(2)
+            put32(w, items.len())
+            for x in items {
+                put_value(w, x)
+            }
+        }
+        PlHash(keys, values) -> put_hash(w, keys, values)
+        PlBlessed(_c, _t) -> {}
+    }
+}
+
+fn put_bless(inout w: StWriter, class: str) {
+    for k in 0..w.classes.len() {
+        if w.classes[k] == class {
+            w.out.push(18)
+            if k <= 127 {
+                w.out.push(k)
+            } else {
+                w.out.push(128)
+                put32(w, k)
+            }
+            return
+        }
+    }
+    w.classes.push(class)
+    let b = class.to_bytes()
+    w.out.push(17)
+    if b.len() <= 127 {
+        w.out.push(b.len())
+    } else {
+        w.out.push(128)
+        put32(w, b.len())
+    }
+    put_bytes(w, b)
+}
+
+/// The value as `nfreeze` (network order) or `freeze` writes it with
+/// `$Storable::canonical` set; `file` adds the "pst0" of `nstore` and
+/// `store`.
+pub fn encode(doc: PerlDoc, file: bool) -> bytes {
+    var w = StWriter{ doc: doc, out: [], stored: [], classes: [] }
+    if file {
+        for c in "pst0".to_bytes().to_list() {
+            w.out.push(c)
+        }
+    }
+    if doc.network {
+        w.out.push(5)
+        w.out.push(11)
+    } else {
+        for x in [4, 11, 8] + "12345678".to_bytes().to_list() + [4, 8, 8, 8] {
+            w.out.push(x)
+        }
+    }
+    put_value(w, doc.root)
+    return bytes_of(w.out)
+}

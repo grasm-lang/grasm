@@ -1,0 +1,70 @@
+// Ten other languages' file formats, each read and written once.
+// scripts/b40_diff.sh holds them to the languages that write them.
+import jsonlines
+import jarmanifest
+import pycfile
+import taptest
+import v8serial
+import perlstorable
+import javaserial
+import classfile
+import yaml
+import yamlemit
+
+fn config() {
+    let docs = yaml.load("defaults: &d\n  retries: 3\n  verbose: no\nprod:\n  <<: *d\n  hosts: [a.example, b.example]\n  started: 2001-12-14\n") ?? panic("yaml")
+    let doc = docs[0]
+    var prod = 0 - 1
+    for (k, v) in yaml.pairs(doc, doc.root) ?? panic("pairs") {
+        match doc.nodes[k] {
+            YnScalar(_t, name, _s, _p) -> {
+                if name == "prod" {
+                    prod = v
+                }
+            }
+            _ -> {}
+        }
+    }
+    // The merge key brings in "retries" and "verbose".
+    assert_eq((yaml.pairs(doc, prod) ?? []).len(), 4)
+    let again = yaml.load(yamlemit.emit(doc)) ?? panic("again")
+    assert_eq(again.len(), 1)
+    let lines = jsonlines.parse("\{\"a\":1\}\n[true,null]\n") ?? panic("jsonl")
+    assert_eq(jsonlines.render(lines), "\{\"a\":1\}\n[true,null]\n")
+}
+
+fn jvm() {
+    let mf = jarmanifest.parse("Manifest-Version: 1.0\r\nMain-Class: com.example.Main\r\n\r\nName: a/B.class\r\nSHA-256-Digest: x\r\n".to_bytes()) ?? panic("mf")
+    assert_eq(jarmanifest.get(mf.main, "main-class") ?? "", "com.example.Main")
+    assert_eq(mf.sections[0].name, "a/B.class")
+    // A class with no members: CAFEBABE, Java 17, a pool of two classes.
+    let cls = bytes_of([202, 254, 186, 190, 0, 0, 0, 61, 0, 5, 1, 0, 1, 65, 7, 0, 1, 1, 0, 16] + "java/lang/Object".to_bytes().to_list() +
+        [7, 0, 3, 0, 33, 0, 2, 0, 4, 0, 0, 0, 0, 0, 0, 0, 0])
+    let c = classfile.parse(cls) ?? panic("class")
+    assert_eq((c.this_class, c.super_class, c.major), ("A", "java/lang/Object", 61))
+    assert_eq(classfile.descriptor_types("(I[Ljava/lang/String;J)V") ?? ([], ""), (["I", "[Ljava/lang/String;", "J"], "V"))
+    let ins = classfile.instructions(bytes_of([42, 183, 0, 1, 177])) ?? []
+    assert_eq(ins.map(|i| i.mnemonic), ["aload_0", "invokespecial", "return"])
+    // A Java string written by ObjectOutputStream: "hi".
+    let s = javaserial.decode(bytes_of([172, 237, 0, 5, 116, 0, 2, 104, 105])) ?? panic("ser")
+    assert_eq(javaserial.encode(s), bytes_of([172, 237, 0, 5, 116, 0, 2, 104, 105]))
+}
+
+fn scripting() {
+    let run = taptest.parse("TAP version 13\n1..3\nok 1 - adds\nnot ok 2 - subtracts # TODO later\nok - skipped # SKIP no db\n")
+    assert_eq((run.passed, run.failed, run.todo, run.skipped, run.good_plan), ([1, 2, 3], [], [2], [3], true))
+    let v8 = v8serial.decode(bytes_of([255, 15, 111, 34, 1, 97, 73, 2, 123, 1])) ?? panic("v8")
+    assert_eq(v8serial.encode(v8), bytes_of([255, 15, 111, 34, 1, 97, 73, 2, 123, 1]))
+    let st = perlstorable.decode(bytes_of([5, 11, 2, 0, 0, 0, 2, 8, 129, 10, 3, 97, 98, 99])) ?? panic("storable")
+    assert_eq(perlstorable.encode(st, false), bytes_of([5, 11, 2, 0, 0, 0, 2, 8, 129, 10, 3, 97, 98, 99]))
+    let header = pycfile.make_header(3627, "print(1)\n".to_bytes(), 0, true, true)
+    let h = pycfile.header(bytes_of(header.to_list() + [0])) ?? panic("pyc")
+    assert(pycfile.matches_source(h, "print(1)\n".to_bytes(), 0))
+}
+
+fn main() / {io} {
+    config()
+    jvm()
+    scripting()
+    print("ten formats read and written")
+}

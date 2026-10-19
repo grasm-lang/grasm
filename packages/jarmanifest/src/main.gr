@@ -1,0 +1,237 @@
+// JAR manifests: META-INF/MANIFEST.MF, and the .SF signature files that
+// share its format.
+//
+// A main section of "Name: value" headers, then individual sections, each
+// starting with a "Name:" header naming the entry it describes, sections
+// separated by blank lines. A header name is 1 to 70 of A-Z a-z 0-9 _ -,
+// compared without regard to case; ": " separates it from the value; a
+// line is at most 72 bytes, and a longer value continues on lines that
+// begin with a single space. Lines end in CR LF, LF or CR. Every jar,
+// war and OSGi bundle carries one: Main-Class, Class-Path, Automatic-
+// Module-Name, Bundle-SymbolicName, Multi-Release, and the digests a
+// signed jar is checked against.
+//
+// Reading follows `java.util.jar.Manifest` where the specification leaves
+// room: lines are cut as Java's reader cuts them (512 bytes at most, an
+// ending included); a last line with no line ending is dropped, with the
+// header it would have continued (Java drops both); a
+// repeated header keeps its first spelling and its last value; sections
+// naming the same entry merge.
+// Writing is Java's to the byte: the version header first, lines of at
+// most 72 bytes split without regard to UTF-8 characters (the bytes are
+// joined before decoding), CR LF line endings.
+//
+// Checked against java.util.jar.Manifest in Java 17, reading and writing.
+
+type ManifestSection = { name: str, attributes: [(str, str)] }
+
+type JarManifest = { main: [(str, str)], sections: [ManifestSection] }
+
+type ManifestError =
+    | MfBadHeader(line: i64, why: str)
+    | MfLineTooLong(line: i64)
+    | MfNoVersion
+
+/// A header name as java.util.jar.Attributes.Name allows it.
+pub fn valid_name(n: str) -> bool {
+    let b = n.to_bytes()
+    if b.len() < 1 or b.len() > 70 {
+        return false
+    }
+    for i in 0..b.len() {
+        let c = b.at(i)
+        let ok = c >= 48 and c <= 57 or c >= 65 and c <= 90 or c >= 97 and c <= 122 or c == 45 or c == 95
+        if not ok {
+            return false
+        }
+    }
+    return true
+}
+
+/// The lines of the text, each without its ending, read as Java's
+/// manifest reader reads them: at most 512 bytes a line, its ending
+/// included; a CR takes the LF after it only when both fit, so a 511-byte
+/// line ended by CR LF is followed by an empty line; 512 bytes with no
+/// ending is an error; and a last line with no ending is lost, with the
+/// header it would have continued (Java was still holding it).
+fn lines(d: bytes) -> [bytes] ! ManifestError {
+    var out: [bytes] = []
+    var pos = 0
+    while pos < d.len() {
+        let limit = if d.len() - pos < 512 { d.len() } else { pos + 512 }
+        var k = pos
+        while k < limit and d.at(k) != 10 and d.at(k) != 13 {
+            k = k + 1
+        }
+        if k == limit {
+            if limit - pos >= 512 {
+                fail(MfLineTooLong(out.len() + 1))
+            }
+            if d.at(pos) == 32 and out.len() > 0 and out[out.len() - 1].len() > 0 {
+                while out.len() > 0 and out[out.len() - 1].len() > 0 and out[out.len() - 1].at(0) == 32 {
+                    let _c = out.pop()
+                }
+                if out.len() > 0 and out[out.len() - 1].len() > 0 {
+                    let _h = out.pop()
+                }
+            }
+            return out
+        }
+        out.push(d.slice(pos, k))
+        pos = if d.at(k) == 13 and k + 1 < limit and d.at(k + 1) == 10 { k + 2 } else { k + 1 }
+    }
+    return out
+}
+
+fn put(inout attrs: [(str, str)], name: str, value: str) {
+    let low = name.to_lower()
+    for k in 0..attrs.len() {
+        if attrs[k].0.to_lower() == low {
+            attrs[k] = (attrs[k].0, value)
+            return
+        }
+    }
+    attrs.push((name, value))
+}
+
+/// The header lines of one section from `at`, joined with their
+/// continuations; returns where the section's blank line (or the end) is.
+fn headers(ls: [bytes], at: i64) -> ([(str, bytes, i64)], i64) {
+    var out: [(str, bytes, i64)] = []
+    var i = at
+    while i < ls.len() and ls[i].len() > 0 {
+        let l = ls[i]
+        if l.at(0) == 32 and out.len() > 0 {
+            let last = out.len() - 1
+            out[last] = (out[last].0, bytes_of(out[last].1.to_list() + l.slice(1, l.len()).to_list()), out[last].2)
+        } else {
+            out.push(("", l, i + 1))
+        }
+        i = i + 1
+    }
+    return (out, i)
+}
+
+fn split_header(h: bytes, line: i64) -> (str, str) ! ManifestError {
+    var c = 0
+    while c < h.len() and h.at(c) != 58 {
+        c = c + 1
+    }
+    if c >= h.len() or c + 1 >= h.len() or h.at(c + 1) != 32 {
+        fail(MfBadHeader(line, "no \": \" after the header name"))
+    }
+    let name = h.slice(0, c).to_str()
+    if not valid_name(name) {
+        fail(MfBadHeader(line, "an invalid header name"))
+    }
+    return (name, h.slice(c + 2, h.len()).to_str())
+}
+
+pub fn parse(d: bytes) -> JarManifest ! ManifestError {
+    let ls = try lines(d)
+    var m = JarManifest{ main: [], sections: [] }
+    let (main, end) = headers(ls, 0)
+    for (_e, h, line) in main {
+        let (n, v) = try split_header(h, line)
+        put(m.main, n, v)
+    }
+    var i = end
+    while i < ls.len() {
+        if ls[i].len() == 0 {
+            i = i + 1
+            continue
+        }
+        let (hs, next) = headers(ls, i)
+        let (first, value) = try split_header(hs[0].1, hs[0].2)
+        if first.to_lower() != "name" {
+            fail(MfBadHeader(hs[0].2, "a section that does not start with Name"))
+        }
+        var slot = 0 - 1
+        for k in 0..m.sections.len() {
+            if m.sections[k].name == value {
+                slot = k
+            }
+        }
+        if slot < 0 {
+            m.sections.push(ManifestSection{ name: value, attributes: [] })
+            slot = m.sections.len() - 1
+        }
+        var attrs = m.sections[slot].attributes
+        for k in 1..hs.len() {
+            let (n, v) = try split_header(hs[k].1, hs[k].2)
+            put(attrs, n, v)
+        }
+        m.sections[slot].attributes = attrs
+        i = next
+    }
+    return m
+}
+
+/// A header value, case-insensitively by name.
+pub fn get(attrs: [(str, str)], name: str) -> Option[str] {
+    let low = name.to_lower()
+    for (n, v) in attrs {
+        if n.to_lower() == low {
+            return Some(v)
+        }
+    }
+    return None
+}
+
+/// "name: value" as lines of at most 72 bytes, CR LF after each.
+fn line72(inout out: [i64], text: str) {
+    let b = text.to_bytes()
+    out.push(b.at(0))
+    var pos = 1
+    while b.len() - pos > 71 {
+        for k in pos..(pos + 71) {
+            out.push(b.at(k))
+        }
+        pos = pos + 71
+        for x in [13, 10, 32] {
+            out.push(x)
+        }
+    }
+    for k in pos..b.len() {
+        out.push(b.at(k))
+    }
+    out.push(13)
+    out.push(10)
+}
+
+fn write_attrs(inout out: [i64], attrs: [(str, str)], skip: str) -> () ! ManifestError {
+    for (n, v) in attrs {
+        if not valid_name(n) {
+            fail(MfBadHeader(0, "an invalid header name"))
+        }
+        if n.to_lower() != skip.to_lower() {
+            line72(out, n + ": " + v)
+        }
+    }
+}
+
+/// The manifest as Java writes it: Manifest-Version (or, for a signature
+/// file, Signature-Version) first, the other main headers, a blank line,
+/// then each section. Java writes nothing of a main section without a
+/// version, so that is refused here rather than lost.
+pub fn encode(m: JarManifest) -> bytes ! ManifestError {
+    var version = "Manifest-Version"
+    var value = get(m.main, version)
+    if value.is_none() {
+        version = "Signature-Version"
+        value = get(m.main, version)
+    }
+    let v = value ?? fail(MfNoVersion)
+    var out: [i64] = []
+    line72(out, version + ": " + v)
+    try write_attrs(out, m.main, version)
+    out.push(13)
+    out.push(10)
+    for s in m.sections {
+        line72(out, "Name: " + s.name)
+        try write_attrs(out, s.attributes, "")
+        out.push(13)
+        out.push(10)
+    }
+    return bytes_of(out)
+}

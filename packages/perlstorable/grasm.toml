@@ -1,0 +1,8 @@
+[package]
+name = "perlstorable"
+version = "1.0.0"
+capabilities = []
+
+[dependencies.cformat]
+path = "../cformat"
+version = "^1.0.0"

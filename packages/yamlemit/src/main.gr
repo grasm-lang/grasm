@@ -1,0 +1,395 @@
+// Writing YAML: a document graph from `yaml` as block-style YAML 1.1
+// that any YAML reader reads back to the same values.
+//
+// Mappings and sequences are written in block style (empty ones as {}
+// and []), two spaces deep; a key that is not a short single-line scalar
+// is written with "? ". Scalars are written by what they mean, not how
+// they were spelled: null, booleans, integers and floats in canonical
+// form (floats always with a point, .inf and .nan), timestamps as given,
+// binary as base64 under !!binary, and strings in the plainest style
+// that reads back as the same string -- plain when nothing in it could
+// be read as another type or as YAML syntax, single-quoted when it is
+// printable on one line, a literal block (with its chomping and, for a
+// leading space, indentation indicator) for text of several lines, and
+// double-quoted with escapes otherwise. Plain is refused conservatively:
+// anything another YAML 1.1 reader might take for a number, a boolean or
+// null (yes, Off, 1_000, 1:30, 2001-12-14, y, NULL in any case) is
+// quoted. A node met more than once gets an anchor (&a1) and later an
+// alias (*a1), so shared and recursive documents survive.
+//
+// Checked against Ruby's Psych: what is written here loads in Psych to
+// the values the document holds, for random documents of every kind.
+import yaml
+import shortestfloat
+
+type YamlWriter = { doc: YamlDoc, uses: [i64], names: [i64], out: [str] }
+
+fn count_uses(doc: YamlDoc, at: i64, inout uses: [i64]) {
+    uses[at] = uses[at] + 1
+    if uses[at] > 1 {
+        return
+    }
+    match doc.nodes[at] {
+        YnSeq(_t, items, _f) -> {
+            for x in items {
+                count_uses(doc, x, uses)
+            }
+        }
+        YnMap(_t, keys, values, _f) -> {
+            for i in 0..keys.len() {
+                count_uses(doc, keys[i], uses)
+                count_uses(doc, values[i], uses)
+            }
+        }
+        _ -> {}
+    }
+}
+
+fn printable(c: i64) -> bool {
+    return c >= 32 and c < 127 or c == 9 or c >= 160 and c != 8232 and c != 8233 and c != 65279 and c < 1114112 or c == 10
+}
+
+fn lower(s: str) -> str {
+    return s.to_lower()
+}
+
+/// Whether a string could be read as something other than itself by some
+/// YAML 1.1 reader, or as YAML syntax.
+fn needs_quotes(s: str) -> bool {
+    if s.len() == 0 {
+        return true
+    }
+    let l = lower(s)
+    for w in ["y", "n", "yes", "no", "true", "false", "on", "off", "null", "~", "<<", "="] {
+        if l == w {
+            return true
+        }
+    }
+    let first = s.substr(0, 1)
+    if "-?:,[]\{\}#&*!|>'\"%@` \t".contains(first) {
+        return true
+    }
+    let last = s.substr(s.len() - 1, 1)
+    if last == " " or last == "\t" or last == ":" {
+        return true
+    }
+    if s.contains(": ") or s.contains(" #") or s.contains(":\t") or s.contains("\t#") or s.contains("\t") {
+        return true
+    }
+    // Anything number-like or date-like.
+    let c0 = s.codes()[0]
+    if c0 >= 48 and c0 <= 57 or first == "." or first == "+" {
+        return true
+    }
+    for c in s.codes() {
+        if not printable(c) or c == 10 or c == 133 {
+            return true
+        }
+    }
+    match yaml.resolve("", s, true) {
+        Ok(YsString(_x)) -> return false
+        _ -> return true
+    }
+}
+
+fn escape_double(s: str) -> str {
+    var parts: [str] = []
+    for c in s.codes() {
+        if c == 92 {
+            parts.push("\\\\")
+        } else if c == 34 {
+            parts.push("\\\"")
+        } else if c == 10 {
+            parts.push("\\n")
+        } else if c == 9 {
+            parts.push("\\t")
+        } else if c == 13 {
+            parts.push("\\r")
+        } else if c == 0 {
+            parts.push("\\0")
+        } else if c == 133 {
+            parts.push("\\N")
+        } else if c == 8232 {
+            parts.push("\\L")
+        } else if c == 8233 {
+            parts.push("\\P")
+        } else if c < 32 or c == 127 or c >= 128 and c < 160 {
+            let h = "0123456789ABCDEF"
+            parts.push("\\x" + h.substr(c / 16, 1) + h.substr(c % 16, 1))
+        } else if c == 65279 {
+            parts.push("\\uFEFF")
+        } else {
+            parts.push(c.to_char())
+        }
+    }
+    return "\"" + parts.join("") + "\""
+}
+
+/// A string as a literal block, at `indent` spaces, when it can be one.
+fn literal(s: str, indent: i64) -> Option[str] {
+    for c in s.codes() {
+        if not printable(c) or c == 13 {
+            return None
+        }
+    }
+    let pad = " ".repeat(indent)
+    var body = s
+    var chomp = ""
+    if not s.ends_with("\n") {
+        chomp = "-"
+    } else if s.ends_with("\n\n") or s == "\n" {
+        chomp = "+"
+    }
+    if chomp != "-" {
+        body = s.substr(0, s.len() - 1)
+    }
+    let lines = body.split("\n")
+    // A first line that starts with a space, or blank first lines, need the
+    // indentation said outright.
+    let ind = if lines.len() > 0 and (lines[0].starts_with(" ") or lines[0].len() == 0 and lines.any(|l| l.starts_with(" "))) { "2" } else { "" }
+    var out = "|" + ind + chomp
+    for l in lines {
+        out = out + "\n" + (if l.len() > 0 { pad + l } else { "" })
+    }
+    return Some(out)
+}
+
+fn string_scalar(s: str, indent: i64, as_key: bool) -> str {
+    if not needs_quotes(s) and not s.contains("\n") {
+        return s
+    }
+    if not s.contains("\n") and s.codes().all(|c| printable(c) and c != 9 and c != 133) {
+        return "'" + s.replace("'", "''") + "'"
+    }
+    if not as_key and s.contains("\n") {
+        match literal(s, indent) {
+            Some(t) -> return t
+            None -> {}
+        }
+    }
+    return escape_double(s)
+}
+
+/// A float in YAML 1.1's form: a point always, an exponent with a sign.
+pub fn float_text(f: f64) -> str {
+    if f != f {
+        return ".nan"
+    }
+    if f > 1.7976931348623157e308 {
+        return ".inf"
+    }
+    if f < -1.7976931348623157e308 {
+        return "-.inf"
+    }
+    let p = shortestfloat.parts(f)
+    let sign = if p.negative { "-" } else { "" }
+    let d = if p.digits.len() == 0 { "0" } else { p.digits }
+    let e = p.point - 1
+    if e >= -4 and e < 16 {
+        if p.point <= 0 {
+            return sign + "0." + "0".repeat(0 - p.point) + d
+        }
+        if p.point >= d.len() {
+            return sign + d + "0".repeat(p.point - d.len()) + ".0"
+        }
+        return sign + d.substr(0, p.point) + "." + d.substr(p.point, d.len() - p.point)
+    }
+    let mant = d.substr(0, 1) + "." + (if d.len() > 1 { d.substr(1, d.len() - 1) } else { "0" })
+    return sign + mant + "e" + (if e < 0 { "-" } else { "+" }) + "{e.abs()}"
+}
+
+fn base64(b: bytes) -> str {
+    let t = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+    var out: [str] = []
+    var i = 0
+    while i < b.len() {
+        let n = b.len() - i
+        let x = b.at(i).shl(16).bit_or(if n > 1 { b.at(i + 1).shl(8) } else { 0 }).bit_or(if n > 2 { b.at(i + 2) } else { 0 })
+        out.push(t.substr(x.ushr(18), 1) + t.substr(x.ushr(12).bit_and(63), 1) + (if n > 1 { t.substr(x.ushr(6).bit_and(63), 1) } else { "=" }) +
+            (if n > 2 { t.substr(x.bit_and(63), 1) } else { "=" }))
+        i = i + 3
+    }
+    return out.join("")
+}
+
+/// "&a1 " the first time a shared node is written, "" otherwise; and the
+/// alias when it has been written already.
+fn anchor_for(inout w: YamlWriter, at: i64) -> (str, bool) {
+    if w.uses[at] < 2 {
+        return ("", false)
+    }
+    for k in 0..w.names.len() {
+        if w.names[k] == at {
+            return ("*a{k + 1}", true)
+        }
+    }
+    w.names.push(at)
+    return ("&a{w.names.len()} ", false)
+}
+
+fn scalar_text(w: YamlWriter, at: i64, indent: i64, as_key: bool) -> str {
+    return match w.doc.nodes[at] {
+        YnScalar(tag, value, _style, plain) -> match yaml.resolve(tag, value, plain) {
+            Ok(YsNull) -> "null"
+            Ok(YsBool(b)) -> if b { "true" } else { "false" }
+            Ok(YsInt(i)) -> "{i}"
+            Ok(YsBigInt(d)) -> d
+            Ok(YsFloat(f)) -> float_text(f)
+            Ok(YsTimestamp(t)) -> t
+            Ok(YsMerge) -> "<<"
+            Ok(YsBinary(b)) -> "!!binary " + string_scalar(base64(b), indent, as_key)
+            Ok(YsString(s)) -> string_scalar(s, indent, as_key)
+            Err(_e) -> string_scalar(value, indent, as_key)
+        }
+        _ -> ""
+    }
+}
+
+fn is_scalar(w: YamlWriter, at: i64) -> bool {
+    return match w.doc.nodes[at] {
+        YnScalar(_t, _v, _s, _p) -> true
+        _ -> false
+    }
+}
+
+fn is_empty_collection(w: YamlWriter, at: i64) -> bool {
+    return match w.doc.nodes[at] {
+        YnSeq(_t, items, _f) -> items.len() == 0
+        YnMap(_t, keys, _v, _f) -> keys.len() == 0
+        _ -> false
+    }
+}
+
+/// A node written after "- ", "key: " or "--- " on the current line (which
+/// is open), its following lines at `indent`.
+fn inline(inout w: YamlWriter, at: i64, indent: i64) {
+    let (a, is_alias) = anchor_for(w, at)
+    if is_alias {
+        w.out.push(a)
+        return
+    }
+    let prefix = a
+    match w.doc.nodes[at] {
+        YnScalar(_t, _v, _s, _p) -> w.out.push(prefix + scalar_text(w, at, indent, false))
+        YnSeq(_t, items, _f) -> {
+            if items.len() == 0 {
+                w.out.push(prefix + "[]")
+                return
+            }
+            if prefix.len() > 0 {
+                w.out.push(prefix.trim())
+            }
+            block_seq(w, items, indent, prefix.len() == 0)
+        }
+        YnMap(_t, keys, values, _f) -> {
+            if keys.len() == 0 {
+                w.out.push(prefix + "\{\}")
+                return
+            }
+            if prefix.len() > 0 {
+                w.out.push(prefix.trim())
+            }
+            block_map(w, keys, values, indent, prefix.len() == 0)
+        }
+    }
+}
+
+fn newline(inout w: YamlWriter, indent: i64) {
+    w.out.push("\n" + " ".repeat(indent))
+}
+
+/// Items: the first on the open line when `same_line`, the rest each on a
+/// line of its own.
+fn block_seq(inout w: YamlWriter, items: [i64], indent: i64, same_line: bool) {
+    for i in 0..items.len() {
+        if i > 0 or not same_line {
+            newline(w, indent)
+        }
+        w.out.push("- ")
+        inline(w, items[i], indent + 2)
+    }
+}
+
+fn simple_key(w: YamlWriter, at: i64) -> bool {
+    if not is_scalar(w, at) {
+        return false
+    }
+    let t = scalar_text(w, at, 0, true)
+    return not t.contains("\n") and t.len() < 1000 and not t.starts_with("!!")
+}
+
+fn block_map(inout w: YamlWriter, keys: [i64], values: [i64], indent: i64, same_line: bool) {
+    for i in 0..keys.len() {
+        if i > 0 or not same_line {
+            newline(w, indent)
+        }
+        let k = keys[i]
+        let v = values[i]
+        if simple_key(w, k) and w.uses[k] < 2 {
+            w.out.push(scalar_text(w, k, indent, true) + ":")
+        } else {
+            w.out.push("? ")
+            inline(w, k, indent + 2)
+            newline(w, indent)
+            w.out.push(":")
+        }
+        // A collection value starts on its own line, sequences at the
+        // mapping's own depth plus two.
+        if is_scalar(w, v) or is_empty_collection(w, v) or w.uses[v] > 1 and seen(w, v) {
+            w.out.push(" ")
+            inline(w, v, indent + 2)
+        } else {
+            let (a, _x) = anchor_for(w, v)
+            if a.len() > 0 {
+                w.out.push(" " + a.trim())
+            }
+            match w.doc.nodes[v] {
+                YnSeq(_t, items, _f) -> block_seq(w, items, indent + 2, false)
+                YnMap(_t, ks, vs, _f) -> block_map(w, ks, vs, indent + 2, false)
+                _ -> {}
+            }
+        }
+    }
+}
+
+fn seen(w: YamlWriter, at: i64) -> bool {
+    return w.names.any(|n| n == at)
+}
+
+/// A document as block YAML: "---", the root, and a final newline.
+pub fn emit(doc: YamlDoc) -> str {
+    var uses: [i64] = []
+    for _i in 0..doc.nodes.len() {
+        uses.push(0)
+    }
+    count_uses(doc, doc.root, uses)
+    var w = YamlWriter{ doc: doc, uses: uses, names: [], out: ["---"] }
+    match doc.nodes[doc.root] {
+        YnScalar(_t, _v, _s, _p) -> {
+            w.out.push(" ")
+            inline(w, doc.root, 2)
+        }
+        _ -> {
+            if is_empty_collection(w, doc.root) {
+                w.out.push(" ")
+                inline(w, doc.root, 0)
+            } else {
+                let (a, _x) = anchor_for(w, doc.root)
+                if a.len() > 0 {
+                    w.out.push(" " + a.trim())
+                }
+                match doc.nodes[doc.root] {
+                    YnSeq(_t, items, _f) -> block_seq(w, items, 0, false)
+                    YnMap(_t, ks, vs, _f) -> block_map(w, ks, vs, 0, false)
+                    _ -> {}
+                }
+            }
+        }
+    }
+    return w.out.join("") + "\n"
+}
+
+/// Several documents, one after another.
+pub fn emit_all(docs: [YamlDoc]) -> str {
+    return docs.map(|d| emit(d)).join("")
+}

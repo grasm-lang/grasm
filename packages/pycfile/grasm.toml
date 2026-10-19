@@ -1,0 +1,8 @@
+[package]
+name = "pycfile"
+version = "1.0.0"
+capabilities = []
+
+[dependencies.siphash]
+path = "../siphash"
+version = "^1.0.0"
