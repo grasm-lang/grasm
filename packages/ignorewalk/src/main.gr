@@ -1,0 +1,100 @@
+// Which files in a tree git ignores, from all the ignore files at once.
+//
+// `gitignore` matches a path against one file's patterns. A tree has
+// many: a .gitignore in any directory, whose patterns are relative to
+// that directory and apply only below it; the repository's
+// .git/info/exclude; and the user's global excludes file. Git consults
+// them all, the global file first and the deepest .gitignore last, and
+// the last pattern that matches decides -- so a .gitignore deeper in the
+// tree can re-include what a shallower one ignored. And git never looks
+// inside a directory it ignores, so neither a deeper .gitignore nor a
+// "!" pattern can bring back a file below one.
+//
+// `ignored` decides one path; `walk` classifies a whole listing. Formatters,
+// file watchers, build tools and `npm pack` need exactly this answer.
+//
+// Checked against git 2.48's `git ls-files --others --ignored
+// --exclude-standard` and `git ls-files --others --exclude-standard`, on
+// random trees with random ignore files at every level.
+import gitignore
+
+type IgnoreSource = { base: str, rules: [IgnoreRule] }
+
+/// The sources in git's order of precedence, lowest first: the global
+/// excludes file, info/exclude, then each .gitignore by its directory's
+/// depth (a file's directory is "" at the top).
+pub fn sources(global: str, info_exclude: str, gitignores: [(str, str)]) -> [IgnoreSource] {
+    var out = [IgnoreSource{ base: "", rules: gitignore.parse(global) }, IgnoreSource{ base: "", rules: gitignore.parse(info_exclude) }]
+    var files = gitignores
+    files.sort_by(|f| "{depth(f.0) + 1000}" + f.0)
+    for (dir, text) in files {
+        out.push(IgnoreSource{ base: dir, rules: gitignore.parse(text) })
+    }
+    return out
+}
+
+fn depth(dir: str) -> i64 {
+    return if dir.len() == 0 { 0 } else { dir.split("/").len() }
+}
+
+/// The path relative to a source's directory, when the source applies.
+fn relative(base: str, path: str) -> Option[str] {
+    if base.len() == 0 {
+        return Some(path)
+    }
+    if path.starts_with(base + "/") {
+        return Some(path.substr(base.len() + 1, path.len() - base.len() - 1))
+    }
+    return None
+}
+
+fn decide(srcs: [IgnoreSource], path: str, is_dir: bool) -> bool {
+    var ignored = false
+    for s in srcs {
+        match relative(s.base, path) {
+            Some(rel) -> {
+                for r in s.rules {
+                    if gitignore.rule_matches(r, rel, is_dir) {
+                        ignored = not r.negated
+                    }
+                }
+            }
+            None -> {}
+        }
+    }
+    return ignored
+}
+
+/// Whether git ignores a path: some directory above it is ignored, or the
+/// last matching pattern of every source that applies says so.
+pub fn ignored(srcs: [IgnoreSource], path: str, is_dir: bool) -> bool {
+    let parts = path.split("/")
+    var prefix = ""
+    for i in 0..(parts.len() - 1) {
+        prefix = if i == 0 { parts[0] } else { prefix + "/" + parts[i] }
+        if decide(srcs, prefix, true) {
+            return true
+        }
+    }
+    return decide(srcs, path, is_dir)
+}
+
+/// Each path of a listing with whether git ignores it. The .gitignore files
+/// are found in the listing itself (given as (path, contents)); a
+/// .gitignore inside an ignored directory is not read, as git does not
+/// read it.
+pub fn walk(paths: [(str, bool)], gitignores: [(str, str)], info_exclude: str, global: str) -> [(str, bool)] {
+    var files: [(str, str)] = []
+    for (p, text) in gitignores {
+        files.push((if p.contains("/") { p.substr(0, p.len() - "/.gitignore".len()) } else { "" }, text))
+    }
+    files.sort_by(|f| "{depth(f.0) + 1000}" + f.0)
+    var read: [(str, str)] = []
+    for (dir, text) in files {
+        if dir.len() == 0 or not ignored(sources(global, info_exclude, read), dir, true) {
+            read.push((dir, text))
+        }
+    }
+    let srcs = sources(global, info_exclude, read)
+    return paths.map(|x| (x.0, ignored(srcs, x.0, x.1)))
+}

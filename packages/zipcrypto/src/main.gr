@@ -1,0 +1,213 @@
+// ZIP's traditional PKWARE encryption ("ZipCrypto"), in archives.
+//
+// Three 32-bit keys, started from fixed values and stirred with every
+// plaintext byte through CRC-32 and a linear congruence; each byte of the
+// stream is XORed with a byte the third key yields. Before the data comes
+// a 12-byte header, itself encrypted: eleven random bytes and a check
+// byte (the CRC's high byte, or the time's when a data descriptor follows)
+// that lets a reader reject a wrong password without decompressing. It is
+// weak -- a known-plaintext attack recovers the keys -- but `zip -P`,
+// Windows Explorer's "compressed folder" passwords and many old archives
+// use it, and a reader of archives must open them.
+//
+// `entries` reads an archive's central directory, `open` decrypts,
+// inflates and checks one entry, and `encrypt_archive` writes an archive
+// whose entries are deflated and encrypted (the random header bytes come
+// from the caller).
+//
+// Checked against Info-ZIP's `zip -P`/`unzip -P` and Python's zipfile.
+import crc32
+import zlib
+import deflate
+
+type ZcKeys = { k0: i64, k1: i64, k2: i64, table: [i64] }
+
+type ZcEntry = {
+    name: str,
+    flags: i64,
+    method: i64,
+    dos_time: i64,
+    dos_date: i64,
+    crc: i64,
+    compressed_size: i64,
+    size: i64,
+    data: bytes,
+}
+
+type ZipCryptoError =
+    | ZcMalformed(at: i64, why: str)
+    | ZcWrongPassword(name: str)
+    | ZcNotFound(name: str)
+    | ZcBadCrc(name: str)
+    | ZcUnsupported(name: str, method: i64)
+
+fn crc_byte(t: [i64], c: i64, b: i64) -> i64 {
+    return t[c.bit_xor(b).bit_and(255)].bit_xor(c.ushr(8))
+}
+
+fn update(inout k: ZcKeys, b: i64) {
+    k.k0 = crc_byte(k.table, k.k0, b)
+    k.k1 = (k.k1 + k.k0.bit_and(255)).bit_and(4294967295)
+    k.k1 = (k.k1 * 134775813 + 1).bit_and(4294967295)
+    k.k2 = crc_byte(k.table, k.k2, k.k1.ushr(24))
+}
+
+fn stream_byte(k: ZcKeys) -> i64 {
+    let t = k.k2.bit_or(2).bit_and(65535)
+    return (t * t.bit_xor(1)).ushr(8).bit_and(255)
+}
+
+/// The keys after the password.
+pub fn keys(password: bytes) -> ZcKeys {
+    var k = ZcKeys{ k0: 305419896, k1: 591751049, k2: 878082192, table: crc32.table() }
+    for i in 0..password.len() {
+        update(k, password.at(i))
+    }
+    return k
+}
+
+/// The 12-byte header and the data after it, decrypted; the header's last
+/// byte must be `check`.
+pub fn decrypt(password: bytes, data: bytes, check: i64) -> bytes ! ZipCryptoError {
+    if data.len() < 12 {
+        fail(ZcMalformed(0, "data shorter than the encryption header"))
+    }
+    var k = keys(password)
+    var out: [i64] = []
+    for i in 0..data.len() {
+        let p = data.at(i).bit_xor(stream_byte(k))
+        update(k, p)
+        if i >= 12 {
+            out.push(p)
+        } else if i == 11 and p != check {
+            fail(ZcWrongPassword(""))
+        }
+    }
+    return bytes_of(out)
+}
+
+/// The header (eleven caller-chosen bytes and the check byte) and the
+/// data, encrypted.
+pub fn encrypt(password: bytes, plain: bytes, check: i64, random: bytes) -> bytes {
+    var k = keys(password)
+    var header: [i64] = []
+    for i in 0..11 {
+        header.push(if random.len() > 0 { random.at(i % random.len()) } else { 0 })
+    }
+    header.push(check)
+    var out: [i64] = []
+    for p in header + plain.to_list() {
+        out.push(p.bit_xor(stream_byte(k)))
+        update(k, p)
+    }
+    return bytes_of(out)
+}
+
+fn u16(d: bytes, at: i64) -> i64 {
+    return d.at(at).bit_or(d.at(at + 1).shl(8))
+}
+
+fn u32(d: bytes, at: i64) -> i64 {
+    return u16(d, at).bit_or(u16(d, at + 2).shl(16))
+}
+
+/// The entries of an archive, from its central directory; each entry's
+/// `data` is what is stored (header included when encrypted).
+pub fn entries(d: bytes) -> [ZcEntry] ! ZipCryptoError {
+    var e = d.len() - 22
+    while e >= 0 and u32(d, e) != 101010256 {
+        e = e - 1
+    }
+    if e < 0 {
+        fail(ZcMalformed(0, "no end of central directory"))
+    }
+    let count = u16(d, e + 10)
+    var at = u32(d, e + 16)
+    var out: [ZcEntry] = []
+    for _k in 0..count {
+        if at + 46 > d.len() or u32(d, at) != 33639248 {
+            fail(ZcMalformed(at, "a bad central directory entry"))
+        }
+        let n = u16(d, at + 28)
+        let local = u32(d, at + 42)
+        if local + 30 > d.len() or u32(d, local) != 67324752 {
+            fail(ZcMalformed(local, "a bad local header"))
+        }
+        let start = local + 30 + u16(d, local + 26) + u16(d, local + 28)
+        let csize = u32(d, at + 20)
+        if start + csize > d.len() {
+            fail(ZcMalformed(local, "data longer than the archive"))
+        }
+        out.push(ZcEntry{ name: d.slice(at + 46, at + 46 + n).to_str(), flags: u16(d, at + 8), method: u16(d, at + 10), dos_time: u16(d, at + 12),
+            dos_date: u16(d, at + 14), crc: u32(d, at + 16), compressed_size: csize, size: u32(d, at + 24), data: d.slice(start, start + csize) })
+        at = at + 46 + n + u16(d, at + 30) + u16(d, at + 32)
+    }
+    return out
+}
+
+/// One entry's contents: decrypted when it is encrypted, inflated, and
+/// its CRC checked.
+pub fn open(d: bytes, name: str, password: bytes) -> bytes ! ZipCryptoError {
+    for e in try entries(d) {
+        if e.name != name {
+            continue
+        }
+        var data = e.data
+        if e.flags.bit_and(1) != 0 {
+            let check = if e.flags.bit_and(8) != 0 { e.dos_time.ushr(8) } else { e.crc.ushr(24) }
+            data = decrypt(password, data, check) ?? fail(ZcWrongPassword(name))
+        }
+        let plain = if e.method == 0 { data } else if e.method == 8 { zlib.inflate(data, e.size) ?? fail(ZcMalformed(0, "bad deflate data in " + name)) }
+        else { fail(ZcUnsupported(name, e.method)) }
+        if crc32.of(plain) != e.crc {
+            fail(ZcBadCrc(name))
+        }
+        return plain
+    }
+    fail(ZcNotFound(name))
+}
+
+fn le(v: i64, n: i64) -> [i64] {
+    var out: [i64] = []
+    for k in 0..n {
+        out.push(v.ushr(8 * k).bit_and(255))
+    }
+    return out
+}
+
+/// An archive of deflated, encrypted entries. `random` supplies the
+/// header bytes (eleven an entry, taken in turn); the check byte is the
+/// CRC's high byte, as written without a data descriptor.
+pub fn encrypt_archive(files: [(str, bytes)], password: bytes, random: bytes, dos_date: i64, dos_time: i64) -> bytes {
+    var out: [i64] = []
+    var central: [i64] = []
+    var r = 0
+    for (name, data) in files {
+        let crc = crc32.of(data)
+        let packed = deflate.compress(data)
+        var salt: [i64] = []
+        for k in 0..11 {
+            salt.push(if random.len() > 0 { random.at((r + k) % random.len()) } else { 0 })
+        }
+        r = r + 11
+        let body = encrypt(password, packed, crc.ushr(24), bytes_of(salt))
+        let nb = name.to_bytes().to_list()
+        let offset = out.len()
+        let common = le(20, 2) + le(1, 2) + le(8, 2) + le(dos_time, 2) + le(dos_date, 2) + le(crc, 4) + le(body.len(), 4) + le(data.len(), 4) +
+        le(nb.len(), 2) + le(0, 2)
+        for x in le(67324752, 4) + common + nb + body.to_list() {
+            out.push(x)
+        }
+        for x in le(33639248, 4) + le(20, 2) + common + le(0, 2) + le(0, 2) + le(0, 2) + le(0, 4) + le(offset, 4) + nb {
+            central.push(x)
+        }
+    }
+    let cd = out.len()
+    for x in central {
+        out.push(x)
+    }
+    for x in le(101010256, 4) + le(0, 2) + le(0, 2) + le(files.len(), 2) + le(files.len(), 2) + le(central.len(), 4) + le(cd, 4) + le(0, 2) {
+        out.push(x)
+    }
+    return bytes_of(out)
+}

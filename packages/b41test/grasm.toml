@@ -1,0 +1,60 @@
+[package]
+name = "b41test"
+version = "0.1.0"
+capabilities = ["io"]
+
+[dependencies.zipcrypto]
+path = "../zipcrypto"
+version = "^1.0.0"
+
+[dependencies.shar]
+path = "../shar"
+version = "^1.0.0"
+
+[dependencies.debfile]
+path = "../debfile"
+version = "^1.0.0"
+
+[dependencies.xar]
+path = "../xar"
+version = "^1.0.0"
+
+[dependencies.pkgbom]
+path = "../pkgbom"
+version = "^1.0.0"
+
+[dependencies.reftable]
+path = "../reftable"
+version = "^1.0.0"
+
+[dependencies.ewah]
+path = "../ewah"
+version = "^1.0.0"
+
+[dependencies.gitnotes]
+path = "../gitnotes"
+version = "^1.0.0"
+
+[dependencies.ignorewalk]
+path = "../ignorewalk"
+version = "^1.0.0"
+
+[dependencies.gitstatus]
+path = "../gitstatus"
+version = "^1.0.0"
+
+[dependencies.gitindex]
+path = "../gitindex"
+version = "^1.0.0"
+
+[dependencies.zlib]
+path = "../zlib"
+version = "^1.0.0"
+
+[dependencies.md5]
+path = "../md5"
+version = "^1.0.0"
+
+[dependencies.bytes_codec]
+path = "../bytes"
+version = "^1.0.0"

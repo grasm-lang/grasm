@@ -1,0 +1,72 @@
+// Ten archive and git formats, each exercised once.
+// scripts/b41_diff.sh holds them to zip, sh, ar, tar, xar, lsbom and git.
+import zipcrypto
+import shar
+import debfile
+import xar
+import pkgbom
+import reftable
+import ewah
+import gitnotes
+import ignorewalk
+import gitstatus
+
+fn archives() {
+    let zip = zipcrypto.encrypt_archive([("hello.txt", "hello, world\n".to_bytes())], "secret".to_bytes(), "salt".to_bytes(), 23119, 39612)
+    assert_eq(zipcrypto.open(zip, "hello.txt", "secret".to_bytes()) ?? bytes_of([]), "hello, world\n".to_bytes())
+    let wrong = match zipcrypto.open(zip, "hello.txt", "guess".to_bytes()) {
+        Ok(_b) -> false
+        Err(_e) -> true
+    }
+    assert(wrong)
+    let s = shar.write([SharDir("docs"), SharFile("docs/a b.txt", "two\nlines\n".to_bytes()), SharFile("bin", bytes_of([0, 255, 10]))])
+    assert_eq((shar.parse(s) ?? []).len(), 3)
+    let deb = debfile.build([("Package", "hello"), ("Version", "1.0-1"), ("Depends", "libc6 (>= 2.34) | musl")], [("usr/bin/hello", "#!/bin/sh\n".to_bytes())], 0)
+    let pkg = debfile.parse(deb) ?? panic("deb")
+    assert_eq(debfile.field(pkg, "package") ?? "", "hello")
+    assert_eq(debfile.check_md5sums(pkg), [])
+    let deps = debfile.depends(debfile.field(pkg, "Depends") ?? "") ?? []
+    assert_eq((deps[0][0].relation, deps[0][0].version, deps[0][1].name), (">=", "2.34", "musl"))
+    let x = xar.parse(xar.build([XiDir("d", 493), XiFile("d/f", "data".to_bytes(), 420), XiLink("l", "d/f")])) ?? panic("xar")
+    assert(xar.toc_checksum_holds(x))
+    assert_eq(x.entries.map(|e| e.path), ["d", "d/f", "l"])
+    assert_eq(xar.contents(x, x.entries[1]) ?? bytes_of([]), "data".to_bytes())
+    let not_bom = match pkgbom.parse("not a bom".to_bytes()) {
+        Ok(_e) -> false
+        Err(_e) -> true
+    }
+    assert(not_bom)
+}
+
+fn git() {
+    // EWAH: three runs of bits, written and read back.
+    let bits = [0, 1, 2, 64, 65, 200]
+    let (back, _end) = ewah.decode(ewah.encode(bits, 256), 0) ?? ([], 0)
+    assert_eq(back, bits)
+    let n = [NoteEntry{ object: "1".repeat(40), blob: "a".repeat(40) }, NoteEntry{ object: "2".repeat(40), blob: "b".repeat(40) }]
+    let (root, trees) = gitnotes.write(n)
+    assert_eq((root.len(), trees.len()), (40, 1))
+    assert_eq(gitnotes.combine_cat_sort_uniq("b\na\n", "a\nc\n"), "a\nb\nc\n")
+    let srcs = ignorewalk.sources("", "", [("", "*.log\n!keep.log\nbuild/\n"), ("build", "!x\n")])
+    assert(ignorewalk.ignored(srcs, "debug.log", false))
+    assert(not ignorewalk.ignored(srcs, "keep.log", false))
+    assert(ignorewalk.ignored(srcs, "build/x", false))
+    let head = [GsEntry{ path: "a", mode: 33188, id: "1".repeat(40) }]
+    let index = [GsIndexEntry{ path: "a", mode: 33188, id: "2".repeat(40), stage: 0 }]
+    let work = [GsEntry{ path: "a", mode: 33188, id: "2".repeat(40) }, GsEntry{ path: "new", mode: 33188, id: "3".repeat(40) }]
+    let lines = gitstatus.porcelain_v2(gitstatus.status(head, index, work, [], "", ""))
+    assert_eq(lines.len(), 2)
+    assert(lines[0].starts_with("1 M. N... 100644 100644 100644"))
+    assert_eq(lines[1], "? new")
+    let bad = match reftable.read_table("REFT".to_bytes()) {
+        Ok(_t) -> false
+        Err(_e) -> true
+    }
+    assert(bad)
+}
+
+fn main() / {io} {
+    archives()
+    git()
+    print("ten formats exercised")
+}

@@ -1,0 +1,8 @@
+[package]
+name = "gitstatus"
+version = "1.0.0"
+capabilities = []
+
+[dependencies.ignorewalk]
+path = "../ignorewalk"
+version = "^1.0.0"

@@ -260,6 +260,33 @@ becomes buildable the day its reference is installed.
 
 ## Landed
 
+- [x] **B41: archives, and git further down** — B19's `zipcrypto`
+  `shar` `debfile` `xar` `pkgbom` and B17's `reftable` `ewah` `gitnotes`
+  `gitstatus` `ignorewalk`, with the harness `b41test`; the new gate
+  `b41diff` runs about 320 cases: archives `zip -P` writes opened here and
+  archives written here opened by Python's zipfile and `unzip -P`; shell
+  archives from macOS `shar` read as `sh` unpacks them, and written here
+  for `sh` to unpack (and read back here as `sh` unpacked them); .deb packages put together with `ar` and Python's
+  tarfile (gzip, xz, bzip2, zstd, plain), and packages written here taken
+  apart by `ar` and `tar`; xar archives listed and extracted as `xar` does,
+  and written here for `xar`; BOM files against `lsbom`; and random git
+  repositories against git 2.48 -- reftable stacks against `for-each-ref`
+  and `reflog`, reachability bitmaps against `rev-list --objects` (and
+  every EWAH written back word for word), notes trees against `notes
+  list` and `notes merge`, the notes fanout against the tree `notes copy
+  --stdin` writes (the same tree id at up to 1,500 notes), ignore rules
+  across nested .gitignore files against `ls-files -o -i` (with a family
+  whose rules flip at every depth, so precedence decides each path), and status
+  against `status --porcelain=v2`. On the way: macOS `shar` writes a
+  file without a final newline so that `sh` swallows the rest of the
+  archive into it, which `shar` here reads as `sh` does and avoids when
+  writing; BSD `ar` shows GNU's "/" after a member name, so .deb members
+  are named as dpkg-deb names them; reftable log blocks are type 'g' and
+  zlib-wrapped, and a table of logs alone starts them at offset 0; git
+  shows a symbolic ref's own reflog, or its target's when it has none;
+  and an empty EWAH still has one marker word. One break per package
+  turned the gate red. The count reaches 949.
+
 - [x] **B40: other languages' files** — B4's `yaml` `yamlemit`
   `jsonlines` `javaserial` `perlstorable` `classfile` `jarmanifest`
   `pycfile` `taptest` `v8serial` (`javaprops` is `properties` already),
@@ -780,7 +807,7 @@ becomes buildable the day its reference is installed.
 | | |
 |---|---|
 | At the start | 669 |
-| Now | 938 |
+| Now | 949 |
 | Candidates above | 316 packages in 28 batches, plus `ecc`, `rfc6979` and `goprintf` |
 | Harnesses, one a batch | 28 |
 | If every candidate lands | 1016 |

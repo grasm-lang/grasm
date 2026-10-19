@@ -1,0 +1,12 @@
+[package]
+name = "reftable"
+version = "1.0.0"
+capabilities = []
+
+[dependencies.zlib]
+path = "../zlib"
+version = "^1.0.0"
+
+[dependencies.crc32]
+path = "../crc32"
+version = "^1.0.0"

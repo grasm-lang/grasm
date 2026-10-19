@@ -1,0 +1,8 @@
+[package]
+name = "gitnotes"
+version = "1.0.0"
+capabilities = []
+
+[dependencies.sha1]
+path = "../sha1"
+version = "^1.0.0"

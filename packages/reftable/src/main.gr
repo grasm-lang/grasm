@@ -1,0 +1,282 @@
+// Git's reftable: the binary store for refs and reflogs that replaces
+// loose ref files and packed-refs (`git init --ref-format=reftable`, and
+// JGit and Gerrit's for years).
+//
+// A repository's refs are a stack of tables (.git/reftable/tables.list,
+// oldest first). A table is a header ("REFT", version 1 or 2, block
+// size, the range of update indices it covers, and in version 2 the hash
+// it uses), blocks, and a footer repeating the header with the positions
+// of its sections and a CRC-32. Ref blocks ('r') hold records sorted by name,
+// each sharing a prefix with the one before ("prefix compression", with
+// restart points where it does not), whose value is a deletion, an
+// object id, an object id and its peeled target (an annotated tag), or a
+// symbolic ref's target. Log blocks ('g') are zlib-compressed and hold reflog
+// entries keyed by ref name and reversed update index: old and new ids,
+// committer name and email, time, zone, message. Numbers are git's
+// "offset" varints.
+//
+// `read_table` reads one table's refs and logs; `merge` combines a stack
+// as git does -- the newest record for a name wins, and a deletion hides
+// the name; log entries likewise by name and update index.
+//
+// Checked against git 2.48: repositories with branches, annotated tags,
+// symbolic refs, deletions and reflogs, against `git for-each-ref`,
+// `git symbolic-ref` and `git reflog`.
+import zlib
+import crc32
+
+type RtRef = { name: str, update_index: i64, kind: i64, value: str, peeled: str, target: str }
+
+type RtLog = { name: str, update_index: i64, kind: i64, old_id: str, new_id: str, who: str, email: str, time: i64, tz: i64, message: str }
+
+type RtTable = { version: i64, block_size: i64, min_index: i64, max_index: i64, hash_size: i64, refs: [RtRef], logs: [RtLog] }
+
+type ReftableError =
+    | RtMalformed(at: i64, why: str)
+
+type RtReader = { d: bytes, at: i64 }
+
+fn be(d: bytes, at: i64, n: i64) -> i64 ! ReftableError {
+    if at < 0 or at + n > d.len() {
+        fail(RtMalformed(at, "a read past the end"))
+    }
+    var v = 0
+    for k in 0..n {
+        v = v.shl(8).bit_or(d.at(at + k))
+    }
+    return v
+}
+
+/// Git's offset varint: each continuation adds one before shifting.
+fn varint(inout r: RtReader) -> i64 ! ReftableError {
+    if r.at >= r.d.len() {
+        fail(RtMalformed(r.at, "a varint past the end"))
+    }
+    var b = r.d.at(r.at)
+    r.at = r.at + 1
+    var v = b.bit_and(127)
+    while b.bit_and(128) != 0 {
+        if r.at >= r.d.len() {
+            fail(RtMalformed(r.at, "a varint past the end"))
+        }
+        b = r.d.at(r.at)
+        r.at = r.at + 1
+        v = (v + 1).shl(7).bit_or(b.bit_and(127))
+    }
+    return v
+}
+
+fn hex(b: bytes) -> str {
+    let digits = "0123456789abcdef"
+    var parts: [str] = []
+    for i in 0..b.len() {
+        parts.push(digits.substr(b.at(i) / 16, 1) + digits.substr(b.at(i) % 16, 1))
+    }
+    return parts.join("")
+}
+
+fn take(inout r: RtReader, n: i64) -> bytes ! ReftableError {
+    if n < 0 or r.at + n > r.d.len() {
+        fail(RtMalformed(r.at, "a field past the end"))
+    }
+    r.at = r.at + n
+    return r.d.slice(r.at - n, r.at)
+}
+
+/// The records of one block (data in `d` from `from` to the restart
+/// table); keys rebuilt from their prefixes.
+fn ref_records(d: bytes, from: i64, end: i64, min_index: i64, hash: i64, inout out: [RtRef]) -> () ! ReftableError {
+    var r = RtReader{ d: d, at: from }
+    var last: [i64] = []
+    while r.at < end {
+        let prefix = try varint(r)
+        let sv = try varint(r)
+        let suffix = try take(r, sv.ushr(3))
+        let kind = sv.bit_and(7)
+        if prefix > last.len() {
+            fail(RtMalformed(r.at, "a prefix longer than the previous key"))
+        }
+        var key = last.slice(0, prefix)
+        for x in suffix.to_list() {
+            key.push(x)
+        }
+        last = key
+        let ui = min_index + (try varint(r))
+        var rec = RtRef{ name: bytes_of(key).to_str(), update_index: ui, kind: kind, value: "", peeled: "", target: "" }
+        if kind == 1 or kind == 2 {
+            rec.value = hex(try take(r, hash))
+            if kind == 2 {
+                rec.peeled = hex(try take(r, hash))
+            }
+        } else if kind == 3 {
+            let n = try varint(r)
+            rec.target = (try take(r, n)).to_str()
+        } else if kind != 0 {
+            fail(RtMalformed(r.at, "an unknown ref value type"))
+        }
+        out.push(rec)
+    }
+}
+
+fn log_records(d: bytes, hash: i64, inout out: [RtLog]) -> () ! ReftableError {
+    var r = RtReader{ d: d, at: 4 }
+    let restarts = try be(d, d.len() - 2, 2)
+    let end = d.len() - 2 - 3 * restarts
+    var last: [i64] = []
+    while r.at < end {
+        let prefix = try varint(r)
+        let sv = try varint(r)
+        let suffix = try take(r, sv.ushr(3))
+        let kind = sv.bit_and(7)
+        var key = last.slice(0, prefix)
+        for x in suffix.to_list() {
+            key.push(x)
+        }
+        last = key
+        let kb = bytes_of(key)
+        let nul = kb.len() - 9
+        if nul < 0 or kb.at(nul) != 0 {
+            fail(RtMalformed(r.at, "a log key without its update index"))
+        }
+        var rev = 0
+        for k in 0..8 {
+            rev = rev.shl(8).bit_or(kb.at(nul + 1 + k))
+        }
+        var rec = RtLog{ name: kb.slice(0, nul).to_str(), update_index: rev.bit_not(), kind: kind, old_id: "", new_id: "", who: "", email: "", time: 0,
+            tz: 0, message: "" }
+        if kind == 1 {
+            rec.old_id = hex(try take(r, hash))
+            rec.new_id = hex(try take(r, hash))
+            let n1 = try varint(r)
+            rec.who = (try take(r, n1)).to_str()
+            let n2 = try varint(r)
+            rec.email = (try take(r, n2)).to_str()
+            rec.time = try varint(r)
+            let tz = try be(d, r.at, 2)
+            r.at = r.at + 2
+            rec.tz = if tz >= 32768 { tz - 65536 } else { tz }
+            let n3 = try varint(r)
+            rec.message = (try take(r, n3)).to_str()
+        } else if kind != 0 {
+            fail(RtMalformed(r.at, "an unknown log type"))
+        }
+        out.push(rec)
+    }
+}
+
+/// The log blocks: where the footer says, or at the very start when the
+/// table holds nothing else (its first block then carries the header).
+fn read_logs(d: bytes, head: i64, log_pos: i64, f: i64, hash: i64, inout logs: [RtLog]) -> () ! ReftableError {
+    var lp = if log_pos > 0 { log_pos } else if d.at(head) == 103 { 0 } else { 0 - 1 }
+    while lp >= 0 and lp < f {
+        let at = if lp == 0 { head } else { lp }
+        if d.at(at) != 103 {
+            break
+        }
+        let len = try be(d, at + 1, 3)
+        let want = len - (at - lp) - 4
+        let (body, used) = zlib.decompress_prefix(d.slice(at + 4, f), want) ?? fail(RtMalformed(at, "a log block that does not inflate"))
+        if body.len() != want {
+            fail(RtMalformed(at, "a log block of the wrong size"))
+        }
+        try log_records(bytes_of(d.slice(at, at + 4).to_list() + body.to_list()), hash, logs)
+        lp = at + 4 + used
+    }
+}
+
+/// One table: its refs (every record, deletions included) and logs.
+pub fn read_table(d: bytes) -> RtTable ! ReftableError {
+    if d.len() < 24 or d.slice(0, 4).to_str() != "REFT" {
+        fail(RtMalformed(0, "not a reftable"))
+    }
+    let version = d.at(4)
+    if version != 1 and version != 2 {
+        fail(RtMalformed(4, "an unknown version"))
+    }
+    let head = if version == 1 { 24 } else { 28 }
+    let foot = if version == 1 { 68 } else { 72 }
+    var hash = 20
+    if version == 2 {
+        let id = d.slice(24, 28).to_str()
+        hash = if id == "s256" { 32 } else if id == "sha1" { 20 } else { fail(RtMalformed(24, "an unknown hash id")) }
+    }
+    if d.len() < head + foot - head {
+        fail(RtMalformed(0, "a table too short for its footer"))
+    }
+    let f = d.len() - foot
+    if d.slice(f, f + head) != d.slice(0, head) {
+        fail(RtMalformed(f, "a footer that does not repeat the header"))
+    }
+    if crc32.of(d.slice(f, d.len() - 4)) != (try be(d, d.len() - 4, 4)) {
+        fail(RtMalformed(f, "a footer whose CRC does not hold"))
+    }
+    let ref_index = try be(d, f + head, 8)
+    let obj = (try be(d, f + head + 8, 8)).ushr(5)
+    let obj_index = try be(d, f + head + 16, 8)
+    let log_pos = try be(d, f + head + 24, 8)
+    let min_index = try be(d, 8, 8)
+    var t = RtTable{ version: version, block_size: try be(d, 5, 3), min_index: min_index, max_index: try be(d, 16, 8), hash_size: hash, refs: [], logs: [] }
+    // Ref blocks run from the start to the first other section.
+    var limit = f
+    for p in [ref_index, obj, obj_index, log_pos] {
+        if p > 0 and p < limit {
+            limit = p
+        }
+    }
+    var pos = 0
+    while pos < limit {
+        let block_start = pos
+        let at = if pos == 0 { head } else { pos }
+        if d.at(at) != 114 {
+            break
+        }
+        let len = try be(d, at + 1, 3)
+        let end_block = block_start + len
+        let restarts = try be(d, end_block - 2, 2)
+        try ref_records(d, at + 4, end_block - 2 - 3 * restarts, min_index, hash, t.refs)
+        pos = end_block
+        while pos < limit and d.at(pos) == 0 {
+            pos = pos + 1
+        }
+    }
+    try read_logs(d, head, log_pos, f, hash, t.logs)
+    return t
+}
+
+fn zero_pad(s: str, n: i64) -> str {
+    return "0".repeat(if s.len() < n { n - s.len() } else { 0 }) + s
+}
+
+/// A stack of tables, oldest first, as git sees it: for each name the
+/// newest record, names whose newest record is a deletion left out; log
+/// entries the same by name and update index, newest first per name.
+pub fn merge(tables: [RtTable]) -> ([RtRef], [RtLog]) {
+    var refs: Map[str, RtRef] = {}
+    var logs: Map[str, RtLog] = {}
+    for t in tables {
+        for r in t.refs {
+            refs.set(r.name, r)
+        }
+        for l in t.logs {
+            logs.set(l.name + "\u{0}{l.update_index}", l)
+        }
+    }
+    var out_refs: [RtRef] = []
+    for k in refs.keys() {
+        let r = refs.get(k) ?? RtRef{ name: "", update_index: 0, kind: 0, value: "", peeled: "", target: "" }
+        if r.kind != 0 {
+            out_refs.push(r)
+        }
+    }
+    out_refs.sort_by(|r| r.name)
+    var out_logs: [RtLog] = []
+    for k in logs.keys() {
+        let l = logs.get(k) ?? RtLog{ name: "", update_index: 0, kind: 0, old_id: "", new_id: "", who: "", email: "", time: 0, tz: 0, message: "" }
+        if l.kind != 0 {
+            out_logs.push(l)
+        }
+    }
+    // By name, then newest first: a key that sorts that way.
+    out_logs.sort_by(|l| l.name + "\u{0}" + zero_pad("{9223372036854775807 - l.update_index}", 20))
+    return (out_refs, out_logs)
+}

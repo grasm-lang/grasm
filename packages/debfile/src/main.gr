@@ -1,0 +1,260 @@
+// Debian packages (.deb): reading and writing them.
+//
+// A .deb is an `ar` archive of three members, in order: `debian-binary`
+// ("2.0\n"), `control.tar` and `data.tar`, each tar compressed with gzip,
+// xz, zstd or bzip2 (or not at all). The control tarball holds
+// `./control` -- a paragraph of "Field: value" lines, a value continued
+// on lines that start with a space and a blank line within a value
+// written as " ." -- and the maintainer scripts and md5sums; the data
+// tarball holds the files to install. Debian, Ubuntu and their
+// derivatives install every package from this format, and scanners read
+// it to find what a container image contains.
+//
+// `parse` reads all three layers and the control fields; `depends` splits
+// a relationship field (Depends, Pre-Depends, Recommends...) into its
+// alternatives with their versions and architectures; `check_md5sums`
+// holds the data files to the md5sums file; `build` writes a package
+// (gzip-compressed tarballs, member names as dpkg-deb writes them) from
+// fields and files.
+//
+// Checked against `ar` and `tar` for the layers, and a reference reading
+// of the control paragraph and relationship fields.
+import arfile
+import tar
+import gzip
+import xzfile
+import zstd
+import bzip2
+import md5
+
+type DebPackage = { format: str, fields: [(str, str)], control_files: [TarEntry], data_files: [TarEntry] }
+
+type DebRelation = { name: str, arch_qualifier: str, relation: str, version: str, architectures: [str] }
+
+type DebPackageError =
+    | DebMalformed(why: str)
+    | DebBadMember(name: str)
+
+fn unpack(name: str, data: bytes) -> [TarEntry] ! DebPackageError {
+    let limit = 1073741824
+    let raw = if name.ends_with(".gz") { gzip.decode_all(data, limit) ?? fail(DebBadMember(name)) }
+    else if name.ends_with(".xz") { xzfile.decode(data, limit) ?? fail(DebBadMember(name)) }
+    else if name.ends_with(".zst") { zstd.decode(data) ?? fail(DebBadMember(name)) }
+    else if name.ends_with(".bz2") { bzip2.decode(data) ?? fail(DebBadMember(name)) }
+    else if name.ends_with(".tar") { data } else { fail(DebBadMember(name)) }
+    return tar.decode(raw) ?? fail(DebBadMember(name))
+}
+
+/// A control paragraph: fields in order; a continued value keeps its
+/// line breaks, each continuation line without its first space and " ."
+/// as an empty line.
+pub fn parse_control(text: str) -> [(str, str)] ! DebPackageError {
+    var out: [(str, str)] = []
+    for raw in text.split("\n") {
+        let line = if raw.ends_with("\r") { raw.substr(0, raw.len() - 1) } else { raw }
+        if line.len() == 0 {
+            if out.len() > 0 {
+                break
+            }
+            continue
+        }
+        if line.starts_with("#") {
+            continue
+        }
+        if line.starts_with(" ") or line.starts_with("\t") {
+            if out.len() == 0 {
+                fail(DebMalformed("a continuation line before any field"))
+            }
+            let rest = line.substr(1, line.len() - 1)
+            let last = out.len() - 1
+            out[last] = (out[last].0, out[last].1 + "\n" + (if rest == "." { "" } else { rest }))
+            continue
+        }
+        let colon = line.index_of(":") ?? fail(DebMalformed("a line that is not a field"))
+        out.push((line.substr(0, colon), line.substr(colon + 1, line.len() - colon - 1).trim()))
+    }
+    return out
+}
+
+/// A field's value, its name compared without regard to case.
+pub fn field(p: DebPackage, name: str) -> Option[str] {
+    for (k, v) in p.fields {
+        if k.to_lower() == name.to_lower() {
+            return Some(v)
+        }
+    }
+    return None
+}
+
+pub fn parse(deb: bytes) -> DebPackage ! DebPackageError {
+    let members = arfile.decode(deb) ?? fail(DebMalformed("not an ar archive"))
+    if members.len() < 3 or members[0].name != "debian-binary" {
+        fail(DebMalformed("no debian-binary first"))
+    }
+    let format = members[0].data.to_str()
+    if not format.starts_with("2.") {
+        fail(DebMalformed("a format other than 2.x"))
+    }
+    var control: [TarEntry] = []
+    var data: [TarEntry] = []
+    var seen_control = false
+    for m in members.slice(1, members.len()) {
+        if m.name.starts_with("control.tar") {
+            control = try unpack(m.name, m.data)
+            seen_control = true
+        } else if m.name.starts_with("data.tar") {
+            if not seen_control {
+                fail(DebMalformed("data before control"))
+            }
+            data = try unpack(m.name, m.data)
+        }
+    }
+    var fields: [(str, str)] = []
+    for e in control {
+        if e.name == "./control" or e.name == "control" {
+            fields = try parse_control(e.data.to_str())
+        }
+    }
+    if fields.len() == 0 {
+        fail(DebMalformed("no control file"))
+    }
+    return DebPackage{ format: format.trim(), fields: fields, control_files: control, data_files: data }
+}
+
+/// A relationship field: groups separated by commas, alternatives by
+/// "|", each a name with an optional ":arch", "(op version)" and
+/// "[arch ...]".
+pub fn depends(value: str) -> [[DebRelation]] ! DebPackageError {
+    var out: [[DebRelation]] = []
+    for group in value.replace("\n", " ").split(",") {
+        if group.trim().len() == 0 {
+            continue
+        }
+        var alts: [DebRelation] = []
+        for alt in group.split("|") {
+            var s = alt.trim()
+            var r = DebRelation{ name: "", arch_qualifier: "", relation: "", version: "", architectures: [] }
+            var n = 0
+            while n < s.len() and not " ([".contains(s.substr(n, 1)) {
+                n = n + 1
+            }
+            let full = s.substr(0, n)
+            let colon = full.index_of(":") ?? -1
+            r.name = if colon >= 0 { full.substr(0, colon) } else { full }
+            r.arch_qualifier = if colon >= 0 { full.substr(colon + 1, full.len() - colon - 1) } else { "" }
+            s = s.substr(n, s.len() - n).trim()
+            if s.starts_with("(") {
+                let close = s.index_of(")") ?? fail(DebMalformed("an unclosed version in " + alt))
+                var inner = s.substr(1, close - 1).trim()
+                for op in [">>", "<<", ">=", "<=", "=", ">", "<"] {
+                    if r.relation.len() == 0 and inner.starts_with(op) {
+                        r.relation = op
+                        inner = inner.substr(op.len(), inner.len() - op.len()).trim()
+                    }
+                }
+                if r.relation.len() == 0 or inner.len() == 0 {
+                    fail(DebMalformed("a bad version relation in " + alt))
+                }
+                r.version = inner
+                s = s.substr(close + 1, s.len() - close - 1).trim()
+            }
+            if s.starts_with("[") {
+                let close = s.index_of("]") ?? fail(DebMalformed("an unclosed architecture list in " + alt))
+                r.architectures = s.substr(1, close - 1).split(" ").filter(|a| a.len() > 0)
+                s = s.substr(close + 1, s.len() - close - 1).trim()
+            }
+            if r.name.len() == 0 or s.len() > 0 and not s.starts_with("<") {
+                fail(DebMalformed("a bad relationship " + alt))
+            }
+            alts.push(r)
+        }
+        out.push(alts)
+    }
+    return out
+}
+
+/// The data files whose md5sums entry does not match; an empty list
+/// means every listed file holds.
+pub fn check_md5sums(p: DebPackage) -> [str] {
+    var bad: [str] = []
+    for e in p.control_files {
+        if e.name != "./md5sums" and e.name != "md5sums" {
+            continue
+        }
+        for line in e.data.to_str().split("\n") {
+            if line.len() < 34 {
+                continue
+            }
+            let sum = line.substr(0, 32)
+            let path = line.substr(34, line.len() - 34)
+            var found = false
+            for f in p.data_files {
+                let n = if f.name.starts_with("./") { f.name.substr(2, f.name.len() - 2) } else { f.name }
+                if n == path {
+                    found = true
+                    if md5.hex(f.data) != sum {
+                        bad.push(path)
+                    }
+                }
+            }
+            if not found {
+                bad.push(path)
+            }
+        }
+    }
+    return bad
+}
+
+fn padded(text: str, width: i64) -> [i64] {
+    var b = text.to_bytes().to_list()
+    while b.len() < width {
+        b.push(32)
+    }
+    return b
+}
+
+/// The `ar` archive as dpkg-deb writes it: names space-padded with no
+/// GNU "/" after them (BSD `ar` would show one as part of the name), mode
+/// 100644, owner 0, an odd member padded with a newline.
+fn ar_deb(members: [(str, bytes)], modified: i64) -> bytes {
+    var out = "!<arch>\n".to_bytes().to_list()
+    for (name, data) in members {
+        for x in padded(name, 16) + padded("{modified}", 12) + padded("0", 6) + padded("0", 6) + padded("100644", 8) + padded("{data.len()}", 10) + [96, 10] {
+            out.push(x)
+        }
+        for x in data.to_list() {
+            out.push(x)
+        }
+        if data.len() % 2 == 1 {
+            out.push(10)
+        }
+    }
+    return bytes_of(out)
+}
+
+fn control_text(fields: [(str, str)]) -> str {
+    var lines: [str] = []
+    for (k, v) in fields {
+        let parts = v.split("\n")
+        lines.push(k + ": " + parts[0])
+        for p in parts.slice(1, parts.len()) {
+            lines.push(" " + (if p.len() == 0 { "." } else { p }))
+        }
+    }
+    return lines.join("\n") + "\n"
+}
+
+/// A package from its control fields and files (paths without "./");
+/// md5sums is written for the files.
+pub fn build(fields: [(str, str)], files: [(str, bytes)], modified: i64) -> bytes {
+    var sums: [str] = []
+    var data: [TarEntry] = []
+    for (path, content) in files {
+        data.push(tar.with_modified(tar.entry("./" + path, content), modified))
+        sums.push(md5.hex(content) + "  " + path)
+    }
+    let control = [tar.with_modified(tar.entry("./control", control_text(fields).to_bytes()), modified),
+        tar.with_modified(tar.entry("./md5sums", (sums.join("\n") + (if sums.len() > 0 { "\n" } else { "" })).to_bytes()), modified)]
+    return ar_deb([("debian-binary", "2.0\n".to_bytes()), ("control.tar.gz", gzip.encode(tar.encode(control), "", modified)),
+        ("data.tar.gz", gzip.encode(tar.encode(data), "", modified))], modified)
+}

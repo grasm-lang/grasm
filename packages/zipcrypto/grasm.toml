@@ -1,0 +1,16 @@
+[package]
+name = "zipcrypto"
+version = "1.0.0"
+capabilities = []
+
+[dependencies.crc32]
+path = "../crc32"
+version = "^1.0.0"
+
+[dependencies.zlib]
+path = "../zlib"
+version = "^1.0.0"
+
+[dependencies.deflate]
+path = "../deflate"
+version = "^1.0.0"

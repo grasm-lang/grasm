@@ -1,0 +1,8 @@
+[package]
+name = "ignorewalk"
+version = "1.0.0"
+capabilities = []
+
+[dependencies.gitignore]
+path = "../gitignore"
+version = "^1.0.0"

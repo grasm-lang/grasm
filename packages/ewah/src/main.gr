@@ -1,0 +1,221 @@
+// EWAH compressed bitmaps, and git's reachability bitmaps (.bitmap) built
+// from them.
+//
+// EWAH ("enhanced word-aligned hybrid") stores a bitmap as 64-bit words:
+// a marker word says how many words of all ones or all zeros come next
+// and how many literal words follow it, so long runs cost one word. Git
+// stores a bitmap per selected commit -- one bit per object in the pack,
+// in pack order, set for every object the commit reaches -- which is what
+// makes `git clone` and `git fetch` from big repositories fast; Lucene and
+// Apache Kylin use EWAH too.
+//
+// A git .bitmap file is "BITM", version 1, flags (full DAG, name-hash
+// cache, lookup table), an entry count, the pack's checksum, four EWAH
+// bitmaps of commits, trees, blobs and tags, then for each entry the
+// commit's position in the pack index, an XOR offset (the stored bitmap
+// is XORed with the bitmap of the entry that many places before), flags
+// and the EWAH; then, as the flags say, a 32-bit name hash per object and
+// a lookup table.
+//
+// `decode` and `encode` are the EWAH codec on sorted bit positions;
+// `bitmap_file` reads a .bitmap file with every entry's XOR chain
+// resolved.
+//
+// Checked against git 2.48: `git repack -adb` bitmaps against `git
+// rev-list --objects` and `git cat-file`, and EWAH written here equal to
+// git's word for word.
+
+type EwahError =
+    | EwahMalformed(at: i64, why: str)
+
+type BitmapEntry = { position: i64, xor: i64, flags: i64, bits: [i64] }
+
+type BitmapFile = {
+    version: i64,
+    flags: i64,
+    checksum: bytes,
+    commits: [i64],
+    trees: [i64],
+    blobs: [i64],
+    tags: [i64],
+    entries: [BitmapEntry],
+    name_hashes: [i64],
+}
+
+fn be(d: bytes, at: i64, n: i64) -> i64 ! EwahError {
+    if at < 0 or at + n > d.len() {
+        fail(EwahMalformed(at, "a read past the end"))
+    }
+    var v = 0
+    for k in 0..n {
+        v = v.shl(8).bit_or(d.at(at + k))
+    }
+    return v
+}
+
+/// A serialized EWAH bitmap at `at`: the set bit positions, ascending, and
+/// where it ends.
+pub fn decode(d: bytes, at: i64) -> ([i64], i64) ! EwahError {
+    let bit_size = try be(d, at, 4)
+    let n = try be(d, at + 4, 4)
+    if at + 12 + 8 * n > d.len() {
+        fail(EwahMalformed(at, "words past the end"))
+    }
+    var out: [i64] = []
+    var pos = 0
+    var i = 0
+    while i < n {
+        let w = try be(d, at + 8 + 8 * i, 8)
+        let run_bit = w.bit_and(1)
+        let run_len = w.ushr(1).bit_and(4294967295)
+        let lits = w.ushr(33)
+        if run_bit == 1 {
+            for b in pos..(pos + 64 * run_len) {
+                if b < bit_size {
+                    out.push(b)
+                }
+            }
+        }
+        pos = pos + 64 * run_len
+        if i + lits > n - 1 {
+            fail(EwahMalformed(at, "literal words past the buffer"))
+        }
+        for k in 1..(lits + 1) {
+            let lw = try be(d, at + 8 + 8 * (i + k), 8)
+            for b in 0..64 {
+                if lw.ushr(b).bit_and(1) == 1 and pos + b < bit_size {
+                    out.push(pos + b)
+                }
+            }
+            pos = pos + 64
+        }
+        i = i + 1 + lits
+    }
+    return (out, at + 12 + 8 * n)
+}
+
+fn put(inout out: [i64], v: i64, n: i64) {
+    var k = n - 1
+    while k >= 0 {
+        out.push(v.ushr(8 * k).bit_and(255))
+        k = k - 1
+    }
+}
+
+/// A bitmap of `bit_size` bits with the given positions set (ascending),
+/// as git writes it: runs of empty or full words gathered into marker
+/// words, each marker followed by its literal words.
+pub fn encode(positions: [i64], bit_size: i64) -> bytes {
+    let nwords = (bit_size + 63) / 64
+    var words: [i64] = []
+    for _k in 0..nwords {
+        words.push(0)
+    }
+    for p in positions {
+        if p < bit_size {
+            words[p / 64] = words[p / 64].bit_or(1.shl(p % 64))
+        }
+    }
+    var buf: [i64] = []
+    var rlw = 0
+    var i = 0
+    // A marker: running bit, run length (32 bits), literal count (31 bits).
+    while i < nwords {
+        var run_bit = 0
+        var run = 0
+        if words[i] == 0 or words[i] == -1 {
+            run_bit = if words[i] == -1 { 1 } else { 0 }
+            let v = words[i]
+            while i < nwords and words[i] == v and run < 4294967295 {
+                run = run + 1
+                i = i + 1
+            }
+        }
+        var lits: [i64] = []
+        while i < nwords and words[i] != 0 and words[i] != -1 and lits.len() < 2147483647 {
+            lits.push(words[i])
+            i = i + 1
+        }
+        rlw = buf.len()
+        buf.push(run_bit.bit_or(run.shl(1)).bit_or(lits.len().shl(33)))
+        for l in lits {
+            buf.push(l)
+        }
+    }
+    // An empty bitmap still has its one marker word, as git's does.
+    if buf.len() == 0 {
+        buf.push(0)
+    }
+    var out: [i64] = []
+    put(out, bit_size, 4)
+    put(out, buf.len(), 4)
+    for w in buf {
+        put(out, w, 8)
+    }
+    put(out, rlw, 4)
+    return bytes_of(out)
+}
+
+fn xor_sets(a: [i64], b: [i64]) -> [i64] {
+    var out: [i64] = []
+    var i = 0
+    var j = 0
+    while i < a.len() or j < b.len() {
+        if j >= b.len() or i < a.len() and a[i] < b[j] {
+            out.push(a[i])
+            i = i + 1
+        } else if i >= a.len() or b[j] < a[i] {
+            out.push(b[j])
+            j = j + 1
+        } else {
+            i = i + 1
+            j = j + 1
+        }
+    }
+    return out
+}
+
+/// A .bitmap file, each entry's bits with its XOR chain applied; `objects`
+/// is how many objects the pack holds (for the name-hash cache).
+pub fn bitmap_file(d: bytes, objects: i64) -> BitmapFile ! EwahError {
+    if d.len() < 32 or d.slice(0, 4).to_str() != "BITM" {
+        fail(EwahMalformed(0, "not a bitmap file"))
+    }
+    let version = try be(d, 4, 2)
+    if version != 1 {
+        fail(EwahMalformed(4, "a version other than 1"))
+    }
+    let flags = try be(d, 6, 2)
+    let count = try be(d, 8, 4)
+    var f = BitmapFile{ version: version, flags: flags, checksum: d.slice(12, 32), commits: [], trees: [], blobs: [], tags: [], entries: [],
+        name_hashes: [] }
+    var at = 32
+    var types: [[i64]] = []
+    for _t in 0..4 {
+        let (bits, next) = try decode(d, at)
+        types.push(bits)
+        at = next
+    }
+    f.commits = types[0]
+    f.trees = types[1]
+    f.blobs = types[2]
+    f.tags = types[3]
+    for k in 0..count {
+        let pos = try be(d, at, 4)
+        let xo = try be(d, at + 4, 1)
+        let fl = try be(d, at + 5, 1)
+        let (stored, next) = try decode(d, at + 6)
+        at = next
+        if xo > k {
+            fail(EwahMalformed(at, "an XOR offset before the first entry"))
+        }
+        let bits = if xo == 0 { stored } else { xor_sets(stored, f.entries[k - xo].bits) }
+        f.entries.push(BitmapEntry{ position: pos, xor: xo, flags: fl, bits: bits })
+    }
+    if flags.bit_and(4) != 0 {
+        for k in 0..objects {
+            f.name_hashes.push(try be(d, at + 4 * k, 4))
+        }
+    }
+    return f
+}

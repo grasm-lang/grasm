@@ -1,0 +1,220 @@
+// Bill of Materials files (.bom): the inventory macOS installer packages
+// carry (Archive.bom), and the receipts in /var/db/receipts that
+// `pkgutil --files` and `lsbom` read to say what a package installed.
+//
+// "BOMStore", a version, then a table of blocks (offset and length each)
+// and a list of named variables pointing at blocks: "Paths" is a B-tree
+// whose leaves hold, for each path, a record of its type (file,
+// directory, link, device), mode, owner, modification time, size,
+// CRC-32 checksum and link target, and a name with the id of its parent
+// directory; "BomInfo", "HLIndex", "VIndex" and "Size64" hold summaries,
+// hard links and 64-bit sizes. Leaves are chained left to right, so a
+// reader walks to the leftmost leaf and follows the chain.
+//
+// `parse` reads every path with its full name (built from the parent
+// chain, "." at the root) and its record; `lsbom_line` renders an entry
+// as `lsbom` prints it by default.
+//
+// Checked against macOS `mkbom` and `lsbom`.
+
+type BomEntry = {
+    path: str,
+    kind: i64,
+    mode: i64,
+    uid: i64,
+    gid: i64,
+    mtime: i64,
+    size: i64,
+    checksum: i64,
+    link: str,
+    architecture: i64,
+}
+
+type BomError =
+    | BomMalformed(why: str)
+
+fn be(d: bytes, at: i64, n: i64) -> i64 ! BomError {
+    if at < 0 or at + n > d.len() {
+        fail(BomMalformed("a read past the end of the file"))
+    }
+    var v = 0
+    for k in 0..n {
+        v = v.shl(8).bit_or(d.at(at + k))
+    }
+    return v
+}
+
+type BomStore = { d: bytes, blocks: [(i64, i64)], vars: [(str, i64)] }
+
+fn block(s: BomStore, index: i64) -> (i64, i64) ! BomError {
+    if index <= 0 or index >= s.blocks.len() {
+        fail(BomMalformed("a block index out of range"))
+    }
+    let b = s.blocks[index]
+    if b.0 + b.1 > s.d.len() {
+        fail(BomMalformed("a block past the end of the file"))
+    }
+    return b
+}
+
+fn store(d: bytes) -> BomStore ! BomError {
+    if d.len() < 32 or d.slice(0, 8).to_str() != "BOMStore" {
+        fail(BomMalformed("not a BOMStore"))
+    }
+    let index_at = try be(d, 16, 4)
+    let vars_at = try be(d, 24, 4)
+    let count = try be(d, index_at, 4)
+    var blocks: [(i64, i64)] = []
+    for k in 0..count {
+        let a = try be(d, index_at + 4 + 8 * k, 4)
+        blocks.push((a, try be(d, index_at + 8 + 8 * k, 4)))
+    }
+    let nvars = try be(d, vars_at, 4)
+    var vars: [(str, i64)] = []
+    var p = vars_at + 4
+    for _k in 0..nvars {
+        let idx = try be(d, p, 4)
+        let len = try be(d, p + 4, 1)
+        if p + 5 + len > d.len() {
+            fail(BomMalformed("a variable name past the end"))
+        }
+        vars.push((d.slice(p + 5, p + 5 + len).to_str(), idx))
+        p = p + 5 + len
+    }
+    return BomStore{ d: d, blocks: blocks, vars: vars }
+}
+
+/// The names of the variables the file holds.
+pub fn variables(d: bytes) -> [str] ! BomError {
+    return (try store(d)).vars.map(|v| v.0)
+}
+
+fn cstring(d: bytes, from: i64, to: i64) -> str {
+    var e = from
+    while e < to and d.at(e) != 0 {
+        e = e + 1
+    }
+    return d.slice(from, e).to_str()
+}
+
+pub fn parse(d: bytes) -> [BomEntry] ! BomError {
+    let s = try store(d)
+    var tree = 0 - 1
+    for (name, idx) in s.vars {
+        if name == "Paths" {
+            tree = idx
+        }
+    }
+    if tree < 0 {
+        fail(BomMalformed("no Paths tree"))
+    }
+    let (t, _tl) = try block(s, tree)
+    if d.slice(t, t + 4).to_str() != "tree" {
+        fail(BomMalformed("Paths is not a tree"))
+    }
+    var node = try be(d, t + 8, 4)
+    // Down the leftmost branch to the first leaf.
+    var guard = 0
+    while true {
+        let (n, _l) = try block(s, node)
+        if (try be(d, n, 2)) != 0 {
+            break
+        }
+        node = try be(d, n + 12, 4)
+        guard = guard + 1
+        if guard > 64 {
+            fail(BomMalformed("a tree too deep"))
+        }
+    }
+    var ids: [(i64, i64, str)] = []
+    var recs: [(i64, i64)] = []
+    var visited = 0
+    while node != 0 {
+        let (n, _l) = try block(s, node)
+        let count = try be(d, n + 2, 2)
+        for k in 0..count {
+            let info1 = try be(d, n + 12 + 8 * k, 4)
+            let file = try be(d, n + 16 + 8 * k, 4)
+            let (i1, _a) = try block(s, info1)
+            let id = try be(d, i1, 4)
+            let info2 = try be(d, i1 + 4, 4)
+            let (f, fl) = try block(s, file)
+            ids.push((id, try be(d, f, 4), cstring(d, f + 4, f + fl)))
+            recs.push((info2, id))
+        }
+        node = try be(d, n + 4, 4)
+        visited = visited + 1
+        if visited > s.blocks.len() {
+            fail(BomMalformed("a leaf chain that loops"))
+        }
+    }
+    var by_id: Map[i64, i64] = {}
+    for k in 0..ids.len() {
+        by_id.set(ids[k].0, k)
+    }
+    var out: [BomEntry] = []
+    for k in 0..ids.len() {
+        let (b, bl) = try block(s, recs[k].0)
+        let link_len = if bl >= 31 { try be(d, b + 27, 4) } else { 0 }
+        out.push(BomEntry{ path: full_path(ids, by_id, k), kind: try be(d, b, 1), architecture: try be(d, b + 2, 2), mode: try be(d, b + 4, 2),
+            uid: try be(d, b + 6, 4), gid: try be(d, b + 10, 4), mtime: try be(d, b + 14, 4), size: try be(d, b + 18, 4), checksum: try be(d, b + 23, 4),
+            link: if link_len > 0 and b + 31 + link_len <= d.len() { cstring(d, b + 31, b + 31 + link_len) } else { "" } })
+    }
+    return out
+}
+
+fn full_path(ids: [(i64, i64, str)], by_id: Map[i64, i64], k: i64) -> str {
+    var parts: [str] = [ids[k].2]
+    var parent = ids[k].1
+    var guard = 0
+    while parent != 0 and guard < 4096 {
+        match by_id.get(parent) {
+            Some(at) -> {
+                parts.push(ids[at].2)
+                parent = ids[at].1
+            }
+            None -> break
+        }
+        guard = guard + 1
+    }
+    var out: [str] = []
+    var i = parts.len() - 1
+    while i >= 0 {
+        out.push(parts[i])
+        i = i - 1
+    }
+    return out.join("/")
+}
+
+fn octal(v: i64) -> str {
+    if v == 0 {
+        return "0"
+    }
+    var parts: [str] = []
+    var x = v
+    while x > 0 {
+        parts.push("{x % 8}")
+        x = x / 8
+    }
+    var out: [str] = []
+    var k = parts.len() - 1
+    while k >= 0 {
+        out.push(parts[k])
+        k = k - 1
+    }
+    return out.join("")
+}
+
+/// An entry as `lsbom` prints it: path, octal mode, uid/gid, and for files
+/// and links the size and checksum, and for links the target.
+pub fn lsbom_line(e: BomEntry) -> str {
+    var cols = [e.path, octal(e.mode), "{e.uid}/{e.gid}"]
+    if e.kind == 1 or e.kind == 3 {
+        cols.push("{e.size}")
+        cols.push("{e.checksum}")
+    }
+    if e.kind == 3 {
+        cols.push(e.link)
+    }
+    return cols.join("\t")
+}

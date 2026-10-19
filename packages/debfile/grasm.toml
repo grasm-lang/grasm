@@ -1,0 +1,32 @@
+[package]
+name = "debfile"
+version = "1.0.0"
+capabilities = []
+
+[dependencies.arfile]
+path = "../arfile"
+version = "^1.0.0"
+
+[dependencies.tar]
+path = "../tar"
+version = "^1.0.0"
+
+[dependencies.gzip]
+path = "../gzip"
+version = "^1.0.0"
+
+[dependencies.xzfile]
+path = "../xzfile"
+version = "^1.0.0"
+
+[dependencies.zstd]
+path = "../zstd"
+version = "^1.0.0"
+
+[dependencies.bzip2]
+path = "../bzip2"
+version = "^1.0.0"
+
+[dependencies.md5]
+path = "../md5"
+version = "^1.0.0"

@@ -1,0 +1,301 @@
+// xar archives: macOS installer packages (.pkg), Safari extensions, and
+// the archives of `xar` and `pkgutil`.
+//
+// A 28-byte header ("xar!", its own size, version 1, the compressed and
+// uncompressed sizes of the table of contents, a checksum algorithm),
+// the table of contents as zlib-compressed XML, then the heap. The TOC
+// is a tree of <file> elements -- name, type (file, directory, symlink,
+// hardlink...), mode, owner, times, link target -- each with a <data>
+// element (offset into the heap, stored length, size, encoding:
+// zlib-deflated, bzip2 or none, and archived and extracted checksums)
+// and extended attributes stored the same way. The TOC's own checksum
+// sits at the heap offset the TOC names.
+//
+// `parse` reads the tree into a flat list of entries with full paths,
+// `contents` extracts an entry's data checking both checksums, and
+// `toc_checksum_holds` checks the TOC. `build` writes an archive of
+// files, directories and symbolic links, deflated with SHA-1 checksums.
+//
+// Checked against macOS `xar`: archives it writes listed and extracted
+// here as `xar -tv` and `xar -x` do, and archives written here read by it.
+import xml
+import zlib
+import deflate
+import sha1
+import md5
+import bzip2
+
+type XarData = { offset: i64, length: i64, size: i64, encoding: str, archived: str, archived_style: str, extracted: str, extracted_style: str }
+
+type XarEntry = {
+    id: str,
+    path: str,
+    kind: str,
+    mode: i64,
+    uid: i64,
+    gid: i64,
+    user: str,
+    group: str,
+    mtime: str,
+    link: str,
+    data: Option[XarData],
+    attributes: [(str, XarData)],
+}
+
+type XarArchive = { toc: str, toc_compressed: bytes, checksum_style: str, checksum_offset: i64, checksum_size: i64, heap: bytes, entries: [XarEntry] }
+
+type XarError =
+    | XarMalformed(why: str)
+    | XarBadChecksum(path: str)
+    | XarUnsupported(what: str)
+
+fn be(d: bytes, at: i64, n: i64) -> i64 {
+    var v = 0
+    for k in 0..n {
+        v = v.shl(8).bit_or(d.at(at + k))
+    }
+    return v
+}
+
+fn child_text(n: ref Node, name: str) -> str {
+    return match xml.first_element(n, name) {
+        Some(c) -> xml.text_of(c)
+        None -> ""
+    }
+}
+
+fn data_of(n: ref Node) -> XarData {
+    var d = XarData{ offset: child_text(n, "offset").parse_int() ?? 0, length: child_text(n, "length").parse_int() ?? 0,
+        size: child_text(n, "size").parse_int() ?? 0, encoding: "", archived: child_text(n, "archived-checksum"), archived_style: "",
+        extracted: child_text(n, "extracted-checksum"), extracted_style: "" }
+    match xml.first_element(n, "encoding") {
+        Some(e) -> d.encoding = xml.attribute(e, "style") ?? ""
+        None -> {}
+    }
+    match xml.first_element(n, "archived-checksum") {
+        Some(e) -> d.archived_style = xml.attribute(e, "style") ?? ""
+        None -> {}
+    }
+    match xml.first_element(n, "extracted-checksum") {
+        Some(e) -> d.extracted_style = xml.attribute(e, "style") ?? ""
+        None -> {}
+    }
+    return d
+}
+
+fn walk(n: ref Node, prefix: str, inout out: [XarEntry]) {
+    for f in xml.elements(n, "file") {
+        let name = child_text(f, "name")
+        let path = if prefix.len() == 0 { name } else { prefix + "/" + name }
+        var attrs: [(str, XarData)] = []
+        for ea in xml.elements(f, "ea") {
+            attrs.push((child_text(ea, "name"), data_of(ea)))
+        }
+        let data = match xml.first_element(f, "data") {
+            Some(dn) -> Some(data_of(dn))
+            None -> None
+        }
+        out.push(XarEntry{ id: xml.attribute(f, "id") ?? "", path: path, kind: child_text(f, "type"),
+            mode: child_text(f, "mode").parse_int_base(8) ?? 0, uid: child_text(f, "uid").parse_int() ?? 0, gid: child_text(f, "gid").parse_int() ?? 0,
+            user: child_text(f, "user"), group: child_text(f, "group"), mtime: child_text(f, "mtime"), link: child_text(f, "link"), data: data,
+            attributes: attrs })
+        walk(f, path, out)
+    }
+}
+
+pub fn parse(d: bytes) -> XarArchive ! XarError {
+    if d.len() < 28 or d.slice(0, 4).to_str() != "xar!" {
+        fail(XarMalformed("not a xar archive"))
+    }
+    let header = be(d, 4, 2)
+    let clen = be(d, 8, 8)
+    let ulen = be(d, 16, 8)
+    let alg = be(d, 24, 4)
+    if header < 28 or header + clen > d.len() {
+        fail(XarMalformed("a table of contents longer than the archive"))
+    }
+    let packed = d.slice(header, header + clen)
+    let toc = (zlib.decompress(packed, ulen + 1) ?? fail(XarMalformed("a table of contents that does not inflate"))).to_str()
+    let root = xml.parse(toc) ?? fail(XarMalformed("a table of contents that is not XML"))
+    let t = (xml.path(root, "toc") ?? fail(XarMalformed("no <toc>")))
+    var style = if alg == 0 { "none" } else if alg == 1 { "sha1" } else if alg == 2 { "md5" } else { "other" }
+    var off = 0
+    var size = 0
+    match xml.first_element(t, "checksum") {
+        Some(c) -> {
+            style = xml.attribute(c, "style") ?? style
+            off = child_text(c, "offset").parse_int() ?? 0
+            size = child_text(c, "size").parse_int() ?? 0
+        }
+        None -> {}
+    }
+    var entries: [XarEntry] = []
+    walk(t, "", entries)
+    return XarArchive{ toc: toc, toc_compressed: packed, checksum_style: style, checksum_offset: off, checksum_size: size,
+        heap: d.slice(header + clen, d.len()), entries: entries }
+}
+
+fn digest(style: str, b: bytes) -> str ! XarError {
+    if style == "sha1" {
+        return sha1.hex(b)
+    }
+    if style == "md5" {
+        return md5.hex(b)
+    }
+    fail(XarUnsupported("checksum " + style))
+}
+
+fn hex(b: bytes) -> str {
+    let digits = "0123456789abcdef"
+    var parts: [str] = []
+    for i in 0..b.len() {
+        parts.push(digits.substr(b.at(i) / 16, 1) + digits.substr(b.at(i) % 16, 1))
+    }
+    return parts.join("")
+}
+
+/// Whether the checksum the TOC names matches the compressed TOC.
+pub fn toc_checksum_holds(a: XarArchive) -> bool {
+    if a.checksum_style == "none" or a.checksum_size == 0 {
+        return true
+    }
+    if a.checksum_offset + a.checksum_size > a.heap.len() {
+        return false
+    }
+    let want = hex(a.heap.slice(a.checksum_offset, a.checksum_offset + a.checksum_size))
+    return match digest(a.checksum_style, a.toc_compressed) {
+        Ok(h) -> h == want
+        Err(_e) -> false
+    }
+}
+
+/// Stored bytes decoded, both checksums held.
+pub fn extract(a: XarArchive, d: XarData, path: str) -> bytes ! XarError {
+    if d.offset + d.length > a.heap.len() {
+        fail(XarMalformed("data beyond the heap for " + path))
+    }
+    let stored = a.heap.slice(d.offset, d.offset + d.length)
+    if d.archived.len() > 0 and (try digest(d.archived_style, stored)) != d.archived.to_lower() {
+        fail(XarBadChecksum(path))
+    }
+    let plain = if d.encoding == "application/x-gzip" { zlib.decompress(stored, d.size + 1) ?? fail(XarMalformed("data that does not inflate for " + path)) }
+    else if d.encoding == "application/x-bzip2" { bzip2.decode(stored) ?? fail(XarMalformed("bad bzip2 data for " + path)) }
+    else if d.encoding == "application/octet-stream" or d.encoding.len() == 0 { stored } else { fail(XarUnsupported("encoding " + d.encoding)) }
+    if d.extracted.len() > 0 and (try digest(d.extracted_style, plain)) != d.extracted.to_lower() {
+        fail(XarBadChecksum(path))
+    }
+    return plain
+}
+
+/// An entry's contents; an entry without data is empty.
+pub fn contents(a: XarArchive, e: XarEntry) -> bytes ! XarError {
+    return match e.data {
+        Some(d) -> try extract(a, d, e.path)
+        None -> bytes_of([])
+    }
+}
+
+type XarItem =
+    | XiFile(path: str, data: bytes, mode: i64)
+    | XiDir(path: str, mode: i64)
+    | XiLink(path: str, target: str)
+
+fn item_path(it: XarItem) -> str {
+    return match it {
+        XiFile(p, _d, _m) -> p
+        XiDir(p, _m) -> p
+        XiLink(p, _t) -> p
+    }
+}
+
+fn parent_of(p: str) -> str {
+    var k = p.len() - 1
+    while k >= 0 and p.substr(k, 1) != "/" {
+        k = k - 1
+    }
+    return if k < 0 { "" } else { p.substr(0, k) }
+}
+
+fn base_of(p: str) -> str {
+    let parent = parent_of(p)
+    return if parent.len() == 0 { p } else { p.substr(parent.len() + 1, p.len() - parent.len() - 1) }
+}
+
+fn data_xml(offset: i64, stored: bytes, plain: bytes, pad: str) -> str {
+    return pad + "<data>\n" + pad + " <length>{stored.len()}</length>\n" + pad + " <offset>{offset}</offset>\n" + pad + " <size>{plain.len()}</size>\n" +
+    pad + " <encoding style=\"application/x-gzip\"/>\n" + pad + " <extracted-checksum style=\"sha1\">" + sha1.hex(plain) + "</extracted-checksum>\n" +
+    pad + " <archived-checksum style=\"sha1\">" + sha1.hex(stored) + "</archived-checksum>\n" + pad + "</data>\n"
+}
+
+fn octal(m: i64) -> str {
+    return "0" + "{m.ushr(6).bit_and(7)}{m.ushr(3).bit_and(7)}{m.bit_and(7)}"
+}
+
+/// The <file> elements under `parent`, depth-first, their data appended
+/// to the heap.
+fn files_xml(items: [XarItem], parent: str, depth: i64, inout next_id: i64, inout heap: [i64]) -> str {
+    let pad = " ".repeat(depth)
+    var out: [str] = []
+    for it in items {
+        let p = item_path(it)
+        if parent_of(p) != parent {
+            continue
+        }
+        let id = next_id
+        next_id = next_id + 1
+        var body = ""
+        match it {
+            XiFile(_p, data, mode) -> {
+                let stored = deflate.compress_zlib(data, zlib.adler32(data))
+                body = data_xml(heap.len(), stored, data, pad + " ") + pad + " <mode>" + octal(mode) + "</mode>\n" + pad + " <type>file</type>\n"
+                for x in stored.to_list() {
+                    heap.push(x)
+                }
+            }
+            XiDir(_p, mode) -> {
+                body = pad + " <mode>" + octal(mode) + "</mode>\n" + pad + " <type>directory</type>\n"
+            }
+            XiLink(_p, target) -> {
+                body = pad + " <link type=\"file\">" + xml.escape_text(target) + "</link>\n" + pad + " <type>symlink</type>\n"
+            }
+        }
+        let inner = match it {
+            XiDir(dp, _m) -> files_xml(items, dp, depth + 1, next_id, heap)
+            _ -> ""
+        }
+        out.push(pad + "<file id=\"{id}\">\n" + body + pad + " <name>" + xml.escape_text(base_of(p)) + "</name>\n" + inner + pad + "</file>\n")
+    }
+    return out.join("")
+}
+
+/// An archive of the items. A directory's contents are the items whose
+/// paths it is the parent of; an item whose parent is not listed is not
+/// written.
+pub fn build(items: [XarItem]) -> bytes {
+    var heap: [i64] = []
+    for _k in 0..20 {
+        heap.push(0)
+    }
+    var next_id = 1
+    let files = files_xml(items, "", 2, next_id, heap)
+    let toc = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<xar>\n <toc>\n  <checksum style=\"sha1\">\n   <offset>0</offset>\n   <size>20</size>\n  </checksum>\n" +
+    files + " </toc>\n</xar>\n"
+    let plain = toc.to_bytes()
+    let packed = deflate.compress_zlib(plain, zlib.adler32(plain))
+    let sum = sha1.hash(packed)
+    for k in 0..20 {
+        heap[k] = sum.at(k)
+    }
+    var out = "xar!".to_bytes().to_list()
+    for v in [(28, 2), (1, 2), (packed.len(), 8), (plain.len(), 8), (1, 4)] {
+        var k = v.1 - 1
+        while k >= 0 {
+            out.push(v.0.ushr(8 * k).bit_and(255))
+            k = k - 1
+        }
+    }
+    for x in packed.to_list() + heap {
+        out.push(x)
+    }
+    return bytes_of(out)
+}
