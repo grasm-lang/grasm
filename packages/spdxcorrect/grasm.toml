@@ -1,0 +1,8 @@
+[package]
+name = "spdxcorrect"
+version = "1.0.0"
+capabilities = []
+
+[dependencies.jsnumber]
+path = "../jsnumber"
+version = "^1.0.0"

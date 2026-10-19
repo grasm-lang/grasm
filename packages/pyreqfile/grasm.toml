@@ -1,0 +1,8 @@
+[package]
+name = "pyreqfile"
+version = "1.0.0"
+capabilities = []
+
+[dependencies.shlex]
+path = "../shlex"
+version = "^1.0.0"

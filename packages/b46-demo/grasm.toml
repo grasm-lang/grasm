@@ -1,0 +1,36 @@
+[package]
+name = "b46_demo"
+version = "1.0.0"
+capabilities = ["io"]
+
+[dependencies.braceexpansion]
+path = "../braceexpansion"
+version = "^1.0.0"
+
+[dependencies.npmini]
+path = "../npmini"
+version = "^1.0.0"
+
+[dependencies.spdxcorrect]
+path = "../spdxcorrect"
+version = "^1.0.0"
+
+[dependencies.npminstallchecks]
+path = "../npminstallchecks"
+version = "^1.0.0"
+
+[dependencies.pickmanifest]
+path = "../pickmanifest"
+version = "^1.0.0"
+
+[dependencies.pyreqfile]
+path = "../pyreqfile"
+version = "^1.0.0"
+
+[dependencies.pyentrypoints]
+path = "../pyentrypoints"
+version = "^1.0.0"
+
+[dependencies.nodesemver]
+path = "../nodesemver"
+version = "^1.0.0"

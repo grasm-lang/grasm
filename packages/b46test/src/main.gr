@@ -1,0 +1,280 @@
+// The harness scripts/b46_diff.py drives: each (op, path) pair names a
+// case file of inputs, one per line, hex-encoded; the answer is one line,
+// each input's answer hex-encoded and joined by `;`. A requirements-file
+// case is a whole set of files and gives one answer.
+import braceexpansion
+import npmini
+import spdxcorrect
+import npminstallchecks
+import pickmanifest
+import pyreqfile
+import pyentrypoints
+import nodesemver
+
+fn hexs(s: str) -> str {
+    let digits = "0123456789abcdef"
+    var parts: [str] = []
+    for x in s.to_bytes().to_list() {
+        parts.push(digits.substr(x.ushr(4), 1) + digits.substr(x.bit_and(15), 1))
+    }
+    return parts.join("")
+}
+
+fn unhex(h: str) -> str {
+    if h == "-" {
+        return ""
+    }
+    var out: [i64] = []
+    let b = h.to_bytes()
+    var i = 0
+    while i + 1 < b.len() {
+        let hi = b.at(i)
+        let lo = b.at(i + 1)
+        out.push((if hi >= 97 { hi - 87 } else { hi - 48 }) * 16 + (if lo >= 97 { lo - 87 } else { lo - 48 }))
+        i = i + 2
+    }
+    return bytes_of(out).to_str()
+}
+
+fn opt(h: str) -> Option[str] {
+    return if h == "_" { None } else { Some(unhex(h)) }
+}
+
+/// JSON's quoting, as json.dumps (ensure_ascii off) and JSON.stringify write it.
+fn q(s: str) -> str {
+    var out = "\""
+    for c in s.codes() {
+        out = out + if c == 34 { "\\\"" } else if c == 92 { "\\\\" } else if c == 10 { "\\n" } else if c == 13 { "\\r" } else if c == 9 { "\\t" } else if c == 8 { "\\b" }
+        else if c == 12 { "\\f" } else if c < 32 { "\\u00" + "0123456789abcdef".substr(c.ushr(4), 1) + "0123456789abcdef".substr(c.bit_and(15), 1) } else { c.to_char() }
+    }
+    return out + "\""
+}
+
+fn ql(xs: [str]) -> str {
+    return "[" + xs.map(|x| q(x)).join(", ") + "]"
+}
+
+fn brace(f: [str]) -> str {
+    return braceexpansion.expand(unhex(f[0])).map(|x| hexs(x)).join(",")
+}
+
+fn ini(f: [str]) -> str {
+    let t = unhex(f[1])
+    if f[0] == "dec" or f[0] == "decd" {
+        return match npmini.decode(t, f[0] == "dec") {
+            Ok(j) -> j
+            Err(_e) -> "ERR"
+        }
+    }
+    if f[0] == "safe" {
+        return npmini.safe(t)
+    }
+    if f[0] == "unsafe" {
+        return npmini.read_value(t)
+    }
+    let o = f[2].split(",")
+    let opts = IniOptions{ section: if o[0] == "-" { "" } else { unhex(o[0]) }, align: o[1] == "1", newline: o[2] == "1", sort: o[3] == "1", whitespace: o[4] == "1",
+        windows: o[5] == "1", bracketed_array: o[6] == "1" }
+    return match npmini.encode(t, opts) {
+        Ok(s) -> s
+        Err(_e) -> "ERR"
+    }
+}
+
+fn spdx(t: SpdxTables, f: [str]) -> str {
+    let s = unhex(f[1])
+    if f[0] == "valid" {
+        return if spdxcorrect.valid(t, s) { "T" } else { "F" }
+    }
+    return match spdxcorrect.correct(t, s, f[0] == "fix") {
+        Ok(Some(v)) -> v
+        Ok(None) -> "NULL"
+        Err(_e) -> "ERR"
+    }
+}
+
+fn check_error(e: InstallCheckError) -> str {
+    return match e {
+        BadEngine() -> "EBADENGINE"
+        BadPlatform() -> "EBADPLATFORM"
+        CheckThrown(m) -> "THROW:" + m
+        CheckJsonError(m) -> "JSON:" + m
+    }
+}
+
+fn install(r: NsRegexes, f: [str]) -> str {
+    let v = match npminstallchecks.parse_json(unhex(f[1])) {
+        Ok(x) -> x
+        Err(_e) -> return "BADJSON"
+    }
+    if f[0] == "engine" {
+        return match npminstallchecks.check_engine(r, v, opt(f[2]), opt(f[3]), f[4] == "1") {
+            Ok(_u) -> "OK"
+            Err(e) -> check_error(e)
+        }
+    }
+    if f[0] == "platform" {
+        return match npminstallchecks.check_platform(v, f[2] == "1", unhex(f[3]), unhex(f[4]), opt(f[5])) {
+            Ok(_u) -> "OK"
+            Err(e) -> check_error(e)
+        }
+    }
+    let cur = npminstallchecks.parse_json(unhex(f[2])) ?? NicNull
+    return match npminstallchecks.check_dev_engines(r, v, cur, f[3] == "1", f[4] == "1") {
+        Ok(fs) -> "[" + fs.map(|x| x.engine + "|" + (if x.is_warn { "w" } else { "-" }) + (if x.is_error { "e" } else { "-" }) + "|" + x.messages.join(";")).join("#") + "]"
+        Err(e) -> check_error(e)
+    }
+}
+
+fn field(v: NicValue, k: str) -> Option[NicValue] {
+    return match v {
+        NicObj(keys, vals) -> {
+            var out: Option[NicValue] = None
+            for i in 0..keys.len() {
+                if keys[i] == k {
+                    out = Some(vals[i])
+                }
+            }
+            out
+        }
+        _ -> None
+    }
+}
+
+fn bin_json(v: Option[NicValue]) -> str {
+    return match v {
+        Some(NicObj(keys, vals)) -> {
+            var parts: [str] = []
+            for i in 0..keys.len() {
+                parts.push(q(keys[i]) + ":" + match vals[i] {
+                    NicStr(s) -> q(s)
+                    _ -> "?"
+                })
+            }
+            "\{" + parts.join(",") + "\}"
+        }
+        _ -> "null"
+    }
+}
+
+fn pick(r: NsRegexes, f: [str]) -> str {
+    let pk = npminstallchecks.parse_json(unhex(f[1])) ?? NicNull
+    let o = PickOptions{ default_tag: opt(f[3]) ?? "latest", before: opt(f[4]), node_version: unhex(f[5]), npm_version: opt(f[6]), include_staged: f[7] == "1",
+        avoid: opt(f[8]), avoid_strict: f[9] == "1" }
+    return match pickmanifest.pick(r, pk, opt(f[2]), o) {
+        Ok(p) -> {
+            let v = match field(p.manifest, "version") {
+                Some(NicStr(s)) -> s
+                _ -> "-"
+            }
+            v + "|" + (if p.should_avoid { "A" } else { "-" }) + (if p.outside_range == Some(true) { "O" } else { "-" }) +
+            (if p.semver_major == Some(true) { "M" } else if p.semver_major == Some(false) { "m" } else { "-" }) + "|" + bin_json(field(p.manifest, "bin"))
+        }
+        Err(e) -> match e {
+            PickNoMatch() -> "THROW:ETARGET"
+            PickForbidden() -> "THROW:E403"
+            PickNoVersions() -> "THROW:ENOVERSIONS"
+            PickNoAvoidable() -> "THROW:ETARGET:avoid"
+            PickUnsupported() -> "THROW:unsupported"
+            PickInvalidTag(_t) -> "THROW:EINVALIDTAGNAME"
+            PickThrown(_w) -> "THROW:ERR_INVALID_ARG_TYPE"
+        }
+    }
+}
+
+fn entry(w: PyWord, f: [str]) -> str {
+    return match pyentrypoints.parse(unhex(f[0])) {
+        Ok(eps) -> eps.map(|e| hexs(e.group) + "," + hexs(e.name) + "," + hexs(e.value) + "," + match pyentrypoints.parts(w, e.value) {
+            Some(p) -> hexs(p.module) + "," + (match p.attr {
+                Some(a) -> hexs(a)
+                None -> "N"
+            }) + "," + p.extras.map(|x| hexs(x)).join(".")
+            None -> "ASSERT"
+        }).join(";")
+        Err(_e) -> "TYPEERROR"
+    }
+}
+
+fn bool_text(b: bool) -> str {
+    return if b { "true" } else { "false" }
+}
+
+fn opts_json(o: ReqOptions) -> str {
+    let hashes = match o.hashes {
+        Some(hs) -> "\{" + hs.map(|h| q(h.algo) + ": " + ql(h.digests)).join(", ") + "\}"
+        None -> "null"
+    }
+    let cs = match o.config_settings {
+        Some(xs) -> "\{" + xs.map(|x| q(x.key) + ": " + (if x.values.len() == 1 { q(x.values[0]) } else { ql(x.values) })).join(", ") + "\}"
+        None -> "null"
+    }
+    let go = match o.global_options {
+        Some(xs) -> ql(xs)
+        None -> "null"
+    }
+    var nb = o.no_binary
+    nb.sort()
+    var ob = o.only_binary
+    ob.sort()
+    let idx = match o.index_url {
+        Some(s) -> q(s)
+        None -> "null"
+    }
+    return "\{" + ["\"config_settings\": " + cs, "\"constraints\": " + ql(o.constraints), "\"editables\": " + ql(o.editables), "\"extra_index_urls\": " + ql(o.extra_index_urls),
+        "\"features_enabled\": " + ql(o.features_enabled), "\"find_links\": " + ql(o.find_links), "\"global_options\": " + go, "\"hashes\": " + hashes, "\"index_url\": " + idx,
+        "\"no_binary\": " + ql(nb), "\"no_index\": " + bool_text(o.no_index), "\"only_binary\": " + ql(ob), "\"pre\": " + bool_text(o.pre), "\"prefer_binary\": " +
+        bool_text(o.prefer_binary), "\"require_hashes\": " + bool_text(o.require_hashes), "\"requirements\": " + ql(o.requirements), "\"trusted_hosts\": " +
+        ql(o.trusted_hosts)].join(", ") + "\}"
+}
+
+/// A case file: the root's path, then `F\tpath\thex` and `E\tname\thex` lines.
+fn reqfile(text: str) -> str {
+    let lines = text.split("\n").filter(|l| l.len() > 0)
+    var files: [(str, str)] = []
+    var env: [(str, str)] = []
+    for l in lines.slice(1, lines.len()) {
+        let f = l.split("\t")
+        if f[0] == "F" {
+            files.push((f[1], unhex(f[2])))
+        } else {
+            env.push((f[1], unhex(f[2])))
+        }
+    }
+    return match pyreqfile.parse(files, lines[0], false, env) {
+        Ok(ls) -> ls.map(|x| "LINE\t" + q(x.filename) + "\t{x.lineno}\t" + (if x.is_requirement { "R" } else { "-" }) + (if x.is_editable { "E" } else { "-" }) +
+            (if x.constraint { "C" } else { "-" }) + "\t" + q(x.requirement) + "\t" + opts_json(x.opts)).join("\n")
+        Err(e) -> match e {
+            ReqParseError(m) -> "ERR RequirementsFileParseError " + q(m)
+            ReqInstallationError(m) -> "ERR InstallationError " + q(m)
+            ReqCommandError(m) -> "ERR CommandError " + q(m)
+            ReqUnsupportedUrl(u) -> "ERR Url " + q(u)
+        }
+    }
+}
+
+fn main() / {io} {
+    let argv = args()
+    let r = nodesemver.regexes()
+    let t = spdxcorrect.tables()
+    let w = pyentrypoints.word_table()
+    var i = 0
+    while i + 1 < argv.len() {
+        let op = argv[i]
+        let text = match read_bytes(argv[i + 1]) {
+            Ok(d) -> d.to_str()
+            Err(_e) -> ""
+        }
+        if op == "reqfile" {
+            print(hexs(reqfile(text)))
+        } else {
+            var out: [str] = []
+            for l in text.split("\n").filter(|l| l.len() > 0) {
+                let f = l.split(" ")
+                out.push(hexs(if op == "brace" { brace(f) } else if op == "ini" { ini(f) } else if op == "spdx" { spdx(t, f) } else if op == "install" { install(r, f) }
+                    else if op == "pick" { pick(r, f) } else { entry(w, f) }))
+            }
+            print(out.join(";"))
+        }
+        i = i + 2
+    }
+}

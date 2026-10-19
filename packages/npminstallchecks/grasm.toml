@@ -1,0 +1,12 @@
+[package]
+name = "npminstallchecks"
+version = "1.0.0"
+capabilities = []
+
+[dependencies.nodesemver]
+path = "../nodesemver"
+version = "^1.0.0"
+
+[dependencies.jsnumber]
+path = "../jsnumber"
+version = "^1.0.0"

@@ -1,0 +1,1019 @@
+// npm's INI: `.npmrc`, and every config file read with the `ini` package.
+//
+// npm's reading of INI is its own. `key[]=v` lines build arrays; `[a.b]`
+// sections nest (a backslash keeps a period: `[a\.b]` is one name); a
+// value in double quotes is JSON (so `"1"` is a string but `'1'` is the
+// number 1, the single quotes stripped and the rest handed to
+// `JSON.parse`); `true`, `false` and `null` are what they say; a key with
+// no `=` is `true`; `;` and `#` end a value unless escaped; `__proto__` is
+// refused. And because the result is a JavaScript object, JavaScript's
+// rules come with it: keys that are integers sort first, a section named
+// like an existing array or string writes into it (or into nothing), and a
+// handful of shapes throw a TypeError or a RangeError. Writing back has its
+// own choices: arrays as `key[]` lines, values quoted only when they would
+// not read back, sections nested by their dotted names, alignment on `=`
+// counted in UTF-16 units, keys sorted by UTF-16 code units.
+//
+// This follows ini 5.0.0 (npm 11) step for step, on a model of the
+// JavaScript objects it builds. `decode` gives the result as the JSON
+// `JSON.stringify` writes for it; `encode` writes a JSON document out as
+// INI text; `safe` and `read_value` (ini's `unsafe`) are the quoting rules
+// on their own.
+//
+// Two things are approximated: a lone surrogate in a quoted value's JSON
+// (`"\ud800"`), which a JavaScript string can hold and text here cannot,
+// becomes U+FFFD; and a `__proto__` key written into an object that came
+// from `JSON.parse`, which there replaces the object's prototype, is
+// dropped here (both leave the same JSON).
+import jsnumber
+
+type JsValue =
+    | JsUndef
+    | JsNull
+    | JsBool(b: bool)
+    | JsNum(n: f64)
+    | JsStr(s: str)
+    | JsRef(id: i64)
+
+/// An object or an array. `plain` objects have Object.prototype (JSON.parse
+/// made them); the others have no prototype at all.
+type JsCell = { array: bool, plain: bool, keys: [str], vals: [JsValue], items: [JsValue], holes: [bool] }
+
+type JsHeap = { cells: [JsCell] }
+
+type IniError =
+    | IniTypeError(why: str)
+    | IniRangeError(why: str)
+    | IniSyntaxError(why: str)
+
+type IniOptions = { section: str, align: bool, newline: bool, sort: bool, whitespace: bool, windows: bool, bracketed_array: bool }
+
+// --- the object model ------------------------------------------------------
+
+fn new_object(inout h: JsHeap, plain: bool) -> JsValue {
+    h.cells.push(JsCell{ array: false, plain: plain, keys: [], vals: [], items: [], holes: [] })
+    return JsRef(h.cells.len() - 1)
+}
+
+fn new_array(inout h: JsHeap, items: [JsValue]) -> JsValue {
+    h.cells.push(JsCell{ array: true, plain: true, keys: [], vals: [], items: items, holes: items.map(|_x| false) })
+    return JsRef(h.cells.len() - 1)
+}
+
+/// A canonical array index: "0", or digits without a leading zero, below
+/// 2^32 - 1.
+fn index_of_key(key: str) -> i64 {
+    if key.len() == 0 or key.len() > 10 or key.len() > 1 and key.starts_with("0") {
+        return 0 - 1
+    }
+    var v = 0
+    for c in key.codes() {
+        if c < 48 or c > 57 {
+            return 0 - 1
+        }
+        v = v * 10 + c - 48
+    }
+    return if v < 4294967295 { v } else { 0 - 1 }
+}
+
+fn utf16_len(s: str) -> i64 {
+    var n = 0
+    for c in s.codes() {
+        n = n + if c > 65535 { 2 } else { 1 }
+    }
+    return n
+}
+
+fn units(s: str) -> [i64] {
+    var out: [i64] = []
+    for c in s.codes() {
+        if c > 65535 {
+            out.push(55296 + (c - 65536).ushr(10))
+            out.push(56320 + (c - 65536).bit_and(1023))
+        } else {
+            out.push(c)
+        }
+    }
+    return out
+}
+
+/// `a < b` comparing UTF-16 code units, as JavaScript's default sort does.
+fn units_less(a: str, b: str) -> bool {
+    let x = units(a)
+    let y = units(b)
+    var i = 0
+    while i < x.len() and i < y.len() {
+        if x[i] != y[i] {
+            return x[i] < y[i]
+        }
+        i = i + 1
+    }
+    return x.len() < y.len()
+}
+
+fn number_text(n: f64) -> str {
+    return if n == 0.0 { "0" } else { jsnumber.to_string(n) }
+}
+
+/// ToString, as a property key or `${...}` makes it.
+fn to_str(h: JsHeap, v: JsValue, depth: i64) -> str {
+    return match v {
+        JsUndef -> "undefined"
+        JsNull -> "null"
+        JsBool(b) -> if b { "true" } else { "false" }
+        JsNum(n) -> number_text(n)
+        JsStr(s) -> s
+        JsRef(id) -> if h.cells[id].array {
+            if depth > 64 { "" } else {
+                var parts: [str] = []
+                for i in 0..h.cells[id].items.len() {
+                    let x = h.cells[id].items[i]
+                    parts.push(match x {
+                        JsUndef -> ""
+                        JsNull -> ""
+                        _ -> to_str(h, x, depth + 1)
+                    })
+                }
+                parts.join(",")
+            }
+        } else { "[object Object]" }
+    }
+}
+
+/// An object's own enumerable keys, in JavaScript's order: integer indices
+/// ascending, then the rest as they were made.
+fn own_keys(h: JsHeap, id: i64) -> [str] {
+    let c = h.cells[id]
+    var ints: [i64] = []
+    var rest: [str] = []
+    if c.array {
+        for i in 0..c.items.len() {
+            if not c.holes[i] {
+                ints.push(i)
+            }
+        }
+    }
+    for k in c.keys {
+        let i = index_of_key(k)
+        if i >= 0 and not c.array {
+            ints.push(i)
+        } else if i < 0 {
+            rest.push(k)
+        }
+    }
+    ints.sort()
+    return ints.map(|i| "{i}") + rest
+}
+
+fn find_key(c: JsCell, key: str) -> i64 {
+    for i in 0..c.keys.len() {
+        if c.keys[i] == key {
+            return i
+        }
+    }
+    return 0 - 1
+}
+
+fn get(h: JsHeap, v: JsValue, key: str) -> JsValue {
+    return match v {
+        JsRef(id) -> {
+            let c = h.cells[id]
+            let i = index_of_key(key)
+            if c.array and i >= 0 {
+                if i < c.items.len() and not c.holes[i] { c.items[i] } else { JsUndef }
+            } else if c.array and key == "length" {
+                JsNum(c.items.len().as_f64())
+            } else {
+                let k = find_key(c, key)
+                if k >= 0 { c.vals[k] } else { JsUndef }
+            }
+        }
+        JsStr(s) -> {
+            let i = index_of_key(key)
+            let u = units(s)
+            // Half of a surrogate pair is not text here; the read only ever
+            // feeds Array.isArray, so U+FFFD stands in for it.
+            let unit = if i >= 0 and i < u.len() { u[i] } else { 0 }
+            if key == "length" { JsNum(u.len().as_f64()) } else if i >= 0 and i < u.len() { JsStr(if unit >= 55296 and unit <= 57343 { (65533).to_char() } else { unit.to_char() }) }
+            else { JsUndef }
+        }
+        _ -> JsUndef
+    }
+}
+
+fn has_own(h: JsHeap, v: JsValue, key: str) -> bool ! IniError {
+    return match v {
+        JsUndef -> fail(IniTypeError("Cannot convert undefined or null to object"))
+        JsNull -> fail(IniTypeError("Cannot convert undefined or null to object"))
+        JsRef(id) -> {
+            let c = h.cells[id]
+            let i = index_of_key(key)
+            if c.array and i >= 0 { i < c.items.len() and not c.holes[i] } else if c.array and key == "length" { true } else { find_key(c, key) >= 0 }
+        }
+        JsStr(s) -> {
+            let i = index_of_key(key)
+            key == "length" or i >= 0 and i < utf16_len(s)
+        }
+        _ -> false
+    }
+}
+
+fn is_array(h: JsHeap, v: JsValue) -> bool {
+    return match v {
+        JsRef(id) -> h.cells[id].array
+        _ -> false
+    }
+}
+
+/// `typeof v === 'object'`: null, and every object and array.
+fn is_objectish(v: JsValue) -> bool {
+    return match v {
+        JsNull -> true
+        JsRef(_id) -> true
+        _ -> false
+    }
+}
+
+fn truthy(v: JsValue) -> bool {
+    return match v {
+        JsUndef -> false
+        JsNull -> false
+        JsBool(b) -> b
+        JsNum(n) -> n != 0.0 and n == n
+        JsStr(s) -> s.len() > 0
+        JsRef(_id) -> true
+    }
+}
+
+fn same(a: JsValue, b: JsValue) -> bool {
+    return match (a, b) {
+        (JsRef(x), JsRef(y)) -> x == y
+        _ -> false
+    }
+}
+
+/// ToNumber, for an array's new length.
+fn to_number(h: JsHeap, v: JsValue) -> f64 {
+    let nan = 0.0 / 0.0
+    return match v {
+        JsUndef -> nan
+        JsNull -> 0.0
+        JsBool(b) -> if b { 1.0 } else { 0.0 }
+        JsNum(n) -> n
+        JsStr(s) -> jsnumber.number(s)
+        JsRef(_id) -> jsnumber.number(to_str(h, v, 0))
+    }
+}
+
+/// `target[key] = value`. Writing to a primitive does nothing (the module
+/// is not in strict mode); to null or undefined, throws.
+fn set(inout h: JsHeap, target: JsValue, key: str, value: JsValue) -> () ! IniError {
+    let id = match target {
+        JsRef(x) -> x
+        JsUndef -> fail(IniTypeError("Cannot set properties of undefined"))
+        JsNull -> fail(IniTypeError("Cannot set properties of null"))
+        _ -> return ()
+    }
+    var c = h.cells[id]
+    if c.plain and not c.array and key == "__proto__" {
+        return ()
+    }
+    let i = index_of_key(key)
+    if c.array and i >= 0 {
+        while c.items.len() <= i {
+            c.items.push(JsUndef)
+            c.holes.push(true)
+        }
+        c.items[i] = value
+        c.holes[i] = false
+    } else if c.array and key == "length" {
+        let n = to_number(h, value)
+        let whole = n.round()
+        if n != whole or n < 0.0 or n >= 4294967296.0 {
+            fail(IniRangeError("Invalid array length"))
+        }
+        let len = whole.as_i64()
+        while c.items.len() < len {
+            c.items.push(JsUndef)
+            c.holes.push(true)
+        }
+        c.items = c.items.slice(0, len)
+        c.holes = c.holes.slice(0, len)
+    } else {
+        let k = find_key(c, key)
+        if k >= 0 {
+            c.vals[k] = value
+        } else {
+            c.keys.push(key)
+            c.vals.push(value)
+        }
+    }
+    h.cells[id] = c
+    return ()
+}
+
+fn delete_key(inout h: JsHeap, id: i64, key: str) {
+    var c = h.cells[id]
+    let k = find_key(c, key)
+    if k >= 0 {
+        c.keys = c.keys.slice(0, k) + c.keys.slice(k + 1, c.keys.len())
+        c.vals = c.vals.slice(0, k) + c.vals.slice(k + 1, c.vals.len())
+        h.cells[id] = c
+    }
+}
+
+fn push(inout h: JsHeap, id: i64, value: JsValue) {
+    var c = h.cells[id]
+    c.items.push(value)
+    c.holes.push(false)
+    h.cells[id] = c
+}
+
+// --- JSON, as JSON.parse and JSON.stringify do it --------------------------
+
+type JsonCursor = { c: [i64], at: i64 }
+
+fn json_ws(inout p: JsonCursor) {
+    while p.at < p.c.len() and (p.c[p.at] == 32 or p.c[p.at] == 9 or p.c[p.at] == 10 or p.c[p.at] == 13) {
+        p.at = p.at + 1
+    }
+}
+
+fn hex_digit(c: i64) -> i64 {
+    return if c >= 48 and c <= 57 { c - 48 } else if c >= 97 and c <= 102 { c - 87 } else if c >= 65 and c <= 70 { c - 55 } else { 0 - 1 }
+}
+
+fn json_string(inout p: JsonCursor) -> str ! IniError {
+    p.at = p.at + 1
+    var out: [i64] = []
+    var pending = 0 - 1
+    while true {
+        if p.at >= p.c.len() {
+            fail(IniSyntaxError("Unterminated string in JSON"))
+        }
+        let c = p.c[p.at]
+        p.at = p.at + 1
+        var unit = 0 - 1
+        if c == 34 {
+            break
+        } else if c < 32 {
+            fail(IniSyntaxError("Bad control character in string literal in JSON"))
+        } else if c == 92 {
+            if p.at >= p.c.len() {
+                fail(IniSyntaxError("Unterminated string in JSON"))
+            }
+            let e = p.c[p.at]
+            p.at = p.at + 1
+            if e == 117 {
+                var v = 0
+                for _k in 0..4 {
+                    let d = if p.at < p.c.len() { hex_digit(p.c[p.at]) } else { 0 - 1 }
+                    if d < 0 {
+                        fail(IniSyntaxError("Bad Unicode escape in JSON"))
+                    }
+                    v = v * 16 + d
+                    p.at = p.at + 1
+                }
+                unit = v
+            } else {
+                let plain = [(34, 34), (92, 92), (47, 47), (98, 8), (102, 12), (110, 10), (114, 13), (116, 9)].filter(|x| x.0 == e)
+                if plain.len() == 0 {
+                    fail(IniSyntaxError("Bad escaped character in JSON"))
+                }
+                unit = plain[0].1
+            }
+        } else {
+            if pending >= 0 {
+                out.push(65533)
+                pending = 0 - 1
+            }
+            out.push(c)
+            continue
+        }
+        // A \u escape: pair surrogates; a lone one becomes U+FFFD.
+        if unit >= 55296 and unit <= 56319 {
+            if pending >= 0 {
+                out.push(65533)
+            }
+            pending = unit
+        } else if unit >= 56320 and unit <= 57343 {
+            if pending >= 0 {
+                out.push(65536 + (pending - 55296).shl(10) + unit - 56320)
+                pending = 0 - 1
+            } else {
+                out.push(65533)
+            }
+        } else {
+            if pending >= 0 {
+                out.push(65533)
+                pending = 0 - 1
+            }
+            out.push(unit)
+        }
+    }
+    if pending >= 0 {
+        out.push(65533)
+    }
+    return out.map(|x| x.to_char()).join("")
+}
+
+fn json_number(inout p: JsonCursor) -> f64 ! IniError {
+    let start = p.at
+    if p.at < p.c.len() and p.c[p.at] == 45 {
+        p.at = p.at + 1
+    }
+    let int_start = p.at
+    while p.at < p.c.len() and p.c[p.at] >= 48 and p.c[p.at] <= 57 {
+        p.at = p.at + 1
+    }
+    if p.at == int_start or p.at - int_start > 1 and p.c[int_start] == 48 {
+        fail(IniSyntaxError("No number after minus sign in JSON"))
+    }
+    if p.at < p.c.len() and p.c[p.at] == 46 {
+        p.at = p.at + 1
+        let f = p.at
+        while p.at < p.c.len() and p.c[p.at] >= 48 and p.c[p.at] <= 57 {
+            p.at = p.at + 1
+        }
+        if p.at == f {
+            fail(IniSyntaxError("Unterminated fractional number in JSON"))
+        }
+    }
+    if p.at < p.c.len() and (p.c[p.at] == 101 or p.c[p.at] == 69) {
+        p.at = p.at + 1
+        if p.at < p.c.len() and (p.c[p.at] == 43 or p.c[p.at] == 45) {
+            p.at = p.at + 1
+        }
+        let e = p.at
+        while p.at < p.c.len() and p.c[p.at] >= 48 and p.c[p.at] <= 57 {
+            p.at = p.at + 1
+        }
+        if p.at == e {
+            fail(IniSyntaxError("Exponent part is missing a number in JSON"))
+        }
+    }
+    return jsnumber.number(p.c.slice(start, p.at).map(|x| x.to_char()).join(""))
+}
+
+fn json_value(inout h: JsHeap, inout p: JsonCursor, depth: i64) -> JsValue ! IniError {
+    json_ws(p)
+    if p.at >= p.c.len() or depth > 512 {
+        fail(IniSyntaxError("Unexpected end of JSON input"))
+    }
+    let c = p.c[p.at]
+    if c == 123 {
+        p.at = p.at + 1
+        let obj = new_object(h, true)
+        json_ws(p)
+        if p.at < p.c.len() and p.c[p.at] == 125 {
+            p.at = p.at + 1
+            return obj
+        }
+        while true {
+            json_ws(p)
+            if p.at >= p.c.len() or p.c[p.at] != 34 {
+                fail(IniSyntaxError("Expected property name in JSON"))
+            }
+            let key = try json_string(p)
+            json_ws(p)
+            if p.at >= p.c.len() or p.c[p.at] != 58 {
+                fail(IniSyntaxError("Expected ':' after property name in JSON"))
+            }
+            p.at = p.at + 1
+            let v = try json_value(h, p, depth + 1)
+            define(h, ref_id(obj), key, v)
+            json_ws(p)
+            if p.at < p.c.len() and p.c[p.at] == 44 {
+                p.at = p.at + 1
+            } else if p.at < p.c.len() and p.c[p.at] == 125 {
+                p.at = p.at + 1
+                return obj
+            } else {
+                fail(IniSyntaxError("Expected ',' or '}' after property value in JSON"))
+            }
+        }
+    }
+    if c == 91 {
+        p.at = p.at + 1
+        var items: [JsValue] = []
+        json_ws(p)
+        if p.at < p.c.len() and p.c[p.at] == 93 {
+            p.at = p.at + 1
+            return new_array(h, items)
+        }
+        while true {
+            items.push(try json_value(h, p, depth + 1))
+            json_ws(p)
+            if p.at < p.c.len() and p.c[p.at] == 44 {
+                p.at = p.at + 1
+            } else if p.at < p.c.len() and p.c[p.at] == 93 {
+                p.at = p.at + 1
+                return new_array(h, items)
+            } else {
+                fail(IniSyntaxError("Expected ',' or ']' after array element in JSON"))
+            }
+        }
+    }
+    if c == 34 {
+        return JsStr(try json_string(p))
+    }
+    if c == 45 or c >= 48 and c <= 57 {
+        return JsNum(try json_number(p))
+    }
+    for (word, v) in [("true", JsBool(true)), ("false", JsBool(false)), ("null", JsNull)] {
+        let w = word.codes()
+        if p.at + w.len() <= p.c.len() and p.c.slice(p.at, p.at + w.len()) == w {
+            p.at = p.at + w.len()
+            return v
+        }
+    }
+    fail(IniSyntaxError("Unexpected token in JSON"))
+}
+
+/// Defines a key outright, as JSON.parse does (`__proto__` included).
+fn define(inout h: JsHeap, id: i64, key: str, v: JsValue) {
+    var cell = h.cells[id]
+    let k = find_key(cell, key)
+    if k >= 0 {
+        cell.vals[k] = v
+    } else {
+        cell.keys.push(key)
+        cell.vals.push(v)
+    }
+    h.cells[id] = cell
+}
+
+/// JSON.parse.
+fn json_parse(inout h: JsHeap, text: str) -> JsValue ! IniError {
+    var p = JsonCursor{ c: text.codes(), at: 0 }
+    let v = try json_value(h, p, 0)
+    json_ws(p)
+    if p.at < p.c.len() {
+        fail(IniSyntaxError("Unexpected non-whitespace character after JSON"))
+    }
+    return v
+}
+
+fn quote(s: str) -> str {
+    var out = "\""
+    for c in s.codes() {
+        out = out + if c == 34 { "\\\"" } else if c == 92 { "\\\\" } else if c == 8 { "\\b" } else if c == 12 { "\\f" } else if c == 10 { "\\n" }
+        else if c == 13 { "\\r" } else if c == 9 { "\\t" } else if c < 32 { "\\u00" + "0123456789abcdef".substr(c.ushr(4), 1) + "0123456789abcdef".substr(c.bit_and(15), 1) }
+        else { c.to_char() }
+    }
+    return out + "\""
+}
+
+/// JSON.stringify; None where it gives undefined.
+fn stringify(h: JsHeap, v: JsValue, inout stack: [i64]) -> Option[str] ! IniError {
+    return match v {
+        JsUndef -> None
+        JsNull -> Some("null")
+        JsBool(b) -> Some(if b { "true" } else { "false" })
+        JsNum(n) -> Some(if n != n or n - n != 0.0 { "null" } else { number_text(n) })
+        JsStr(s) -> Some(quote(s))
+        JsRef(id) -> {
+            if stack.contains(id) {
+                fail(IniTypeError("Converting circular structure to JSON"))
+            }
+            stack.push(id)
+            let c = h.cells[id]
+            var parts: [str] = []
+            if c.array {
+                for i in 0..c.items.len() {
+                    parts.push(if c.holes[i] { "null" } else { (try stringify(h, c.items[i], stack)) ?? "null" })
+                }
+            } else {
+                for k in own_keys(h, id) {
+                    match try stringify(h, get(h, v, k), stack) {
+                        Some(t) -> parts.push(quote(k) + ":" + t)
+                        None -> ()
+                    }
+                }
+            }
+            stack = stack.slice(0, stack.len() - 1)
+            Some(if c.array { "[" + parts.join(",") + "]" } else { "\{" + parts.join(",") + "\}" })
+        }
+    }
+}
+
+fn json_text(h: JsHeap, v: JsValue) -> str ! IniError {
+    var stack: [i64] = []
+    return (try stringify(h, v, stack)) ?? "undefined"
+}
+
+// --- ini itself -------------------------------------------------------------
+
+fn js_trim(s: str) -> str {
+    let c = s.codes()
+    var a = 0
+    var b = c.len()
+    while a < b and jsnumber.is_js_space(c[a]) {
+        a = a + 1
+    }
+    while b > a and jsnumber.is_js_space(c[b - 1]) {
+        b = b - 1
+    }
+    return s.substr(a, b - a)
+}
+
+fn is_quoted(s: str) -> bool {
+    return s.starts_with("\"") and s.ends_with("\"") or s.starts_with("'") and s.ends_with("'")
+}
+
+fn unsafe_value(inout h: JsHeap, raw: str) -> JsValue {
+    var val = js_trim(raw)
+    if is_quoted(val) {
+        if val.starts_with("'") {
+            val = if val.len() >= 2 { val.substr(1, val.len() - 2) } else { "" }
+        }
+        return match json_parse(h, val) {
+            Ok(v) -> v
+            Err(_e) -> JsStr(val)
+        }
+    }
+    // Up to the first `;` or `#` not escaped; `\;`, `\#` and `\\` unescape,
+    // any other backslash stays.
+    var out = ""
+    var esc = false
+    for c in val.chars() {
+        if esc {
+            out = out + if c == "\\" or c == ";" or c == "#" { c } else { "\\" + c }
+            esc = false
+        } else if c == ";" or c == "#" {
+            break
+        } else if c == "\\" {
+            esc = true
+        } else {
+            out = out + c
+        }
+    }
+    if esc {
+        out = out + "\\"
+    }
+    return JsStr(js_trim(out))
+}
+
+fn safe_value(h: JsHeap, v: JsValue) -> str ! IniError {
+    return match v {
+        JsStr(s) -> if s.contains("=") or s.contains("\r") or s.contains("\n") or s.starts_with("[") or s.len() > 1 and is_quoted(s) or s != js_trim(s) { quote(s) }
+        else { s.split(";").join("\\;").split("#").join("\\#") }
+        _ -> try json_text(h, v)
+    }
+}
+
+/// A value as ini writes it: quoted (as JSON) when it would not read back
+/// as itself, else with `;` and `#` escaped.
+pub fn safe(s: str) -> str {
+    let h = JsHeap{ cells: [] }
+    return safe_value(h, JsStr(s)) ?? quote(s)
+}
+
+/// A value as ini reads it, as JSON: quoted values parsed as JSON (single
+/// quotes stripped first), others cut at a comment and unescaped.
+pub fn read_value(s: str) -> str {
+    var h = JsHeap{ cells: [] }
+    let v = unsafe_value(h, s)
+    return json_text(h, v) ?? ""
+}
+
+fn split_sections(s: str, sep: str) -> [str] {
+    var out: [str] = []
+    let parts = s.split(sep)
+    var cur = parts[0]
+    for i in 1..parts.len() {
+        if cur.ends_with("\\") {
+            cur = cur + sep + parts[i]
+        } else {
+            out.push(cur)
+            cur = parts[i]
+        }
+    }
+    out.push(cur)
+    return out
+}
+
+fn is_line_end(c: i64) -> bool {
+    return c == 10 or c == 13 or c == 8232 or c == 8233
+}
+
+/// `str.split(/[\r\n]+/)`
+fn split_lines(s: str) -> [str] {
+    var out: [str] = []
+    var cur = ""
+    var in_run = false
+    for c in s.chars() {
+        if c == "\r" or c == "\n" {
+            if not in_run {
+                out.push(cur)
+                cur = ""
+            }
+            in_run = true
+        } else {
+            in_run = false
+            cur = cur + c
+        }
+    }
+    out.push(cur)
+    return out
+}
+
+let PROTO_NAMES = ["constructor", "__defineGetter__", "__defineSetter__", "hasOwnProperty", "__lookupGetter__", "__lookupSetter__", "isPrototypeOf",
+    "propertyIsEnumerable", "toString", "valueOf", "__proto__", "toLocaleString"]
+
+/// What `/^\[([^\]]*)\]\s*$|^([^=]+)(=(.*))?$/` makes of a line: a
+/// section's text, or a key's and maybe a value's, or nothing.
+type IniLine =
+    | IniSectionLine(text: str)
+    | IniKeyLine(key: str, value: Option[str])
+    | IniNoMatch()
+
+fn classify(line: str) -> IniLine {
+    if line.starts_with("[") {
+        match line.substr(1, line.len()).index_of("]") {
+            Some(i) -> {
+                if line.substr(i + 2, line.len()).codes().filter(|c| not jsnumber.is_js_space(c)).len() == 0 {
+                    return IniSectionLine(line.substr(1, i))
+                }
+            }
+            None -> ()
+        }
+    }
+    return match line.index_of("=") {
+        None -> IniKeyLine(line, None)
+        Some(0) -> IniNoMatch()
+        Some(i) -> {
+            let rest = line.substr(i + 1, line.len())
+            if rest.codes().filter(|c| is_line_end(c)).len() > 0 { IniNoMatch() } else { IniKeyLine(line.substr(0, i), Some(rest)) }
+        }
+    }
+}
+
+fn skip_line(line: str) -> bool {
+    let t = line.codes().filter(|c| not jsnumber.is_js_space(c))
+    if line.len() == 0 or t.len() == 0 {
+        return true
+    }
+    let first = line.codes().filter(|c| not jsnumber.is_js_space(c))[0]
+    // `^\s*[;#]`: the first character that is not white space.
+    var i = 0
+    let c = line.codes()
+    while i < c.len() and jsnumber.is_js_space(c[i]) {
+        i = i + 1
+    }
+    return c[i] == 59 or c[i] == 35 or first < 0
+}
+
+fn ref_id(v: JsValue) -> i64 {
+    return match v {
+        JsRef(id) -> id
+        _ -> 0 - 1
+    }
+}
+
+fn key_line(inout h: JsHeap, p: JsValue, key_text: str, value_text: Option[str], bracketed: bool, inout counts: [(str, i64)]) -> () ! IniError {
+    let raw = unsafe_value(h, key_text)
+    var arr = false
+    if bracketed {
+        arr = match raw {
+            JsStr(s) -> utf16_len(s) > 2 and s.ends_with("[]")
+            JsNull -> fail(IniTypeError("Cannot read properties of null (reading 'length')"))
+            _ -> false
+        }
+    } else {
+        let name = to_str(h, raw, 0)
+        if not PROTO_NAMES.contains(name) {
+            var n = 1
+            var found = false
+            for i in 0..counts.len() {
+                if counts[i].0 == name {
+                    n = counts[i].1 + 1
+                    counts[i] = (name, n)
+                    found = true
+                }
+            }
+            if not found {
+                counts.push((name, 1))
+            }
+            arr = n > 1
+        }
+    }
+    var key = raw
+    if arr {
+        key = match raw {
+            JsStr(s) -> JsStr(if s.ends_with("[]") { s.substr(0, s.len() - 2) } else { s })
+            JsNull -> fail(IniTypeError("Cannot read properties of null (reading 'endsWith')"))
+            _ -> fail(IniTypeError("keyRaw.endsWith is not a function"))
+        }
+    }
+    match key {
+        JsStr(s) -> if s == "__proto__" {
+            return ()
+        }
+        _ -> ()
+    }
+    let value_raw = match value_text {
+        Some(t) -> unsafe_value(h, t)
+        None -> JsBool(true)
+    }
+    let value = match value_raw {
+        JsStr(s) -> if s == "true" { JsBool(true) } else if s == "false" { JsBool(false) } else if s == "null" { JsNull } else { value_raw }
+        _ -> value_raw
+    }
+    let pk = to_str(h, key, 0)
+    if arr {
+        if not (try has_own(h, p, pk)) {
+            let fresh = new_array(h, [])
+            try set(h, p, pk, fresh)
+        } else if not is_array(h, get(h, p, pk)) {
+            let wrapped = new_array(h, [get(h, p, pk)])
+            try set(h, p, pk, wrapped)
+        }
+    }
+    let now = get(h, p, pk)
+    if is_array(h, now) {
+        push(h, ref_id(now), value)
+    } else {
+        try set(h, p, pk, value)
+    }
+    return ()
+}
+
+/// `{a:{y:1},"a.b":{x:2}}` to `{a:{y:1,b:{x:2}}}`: each dotted section
+/// moved under its parent.
+fn nest(inout h: JsHeap, out: JsValue) -> () ! IniError {
+    var remove: [str] = []
+    for k in own_keys(h, ref_id(out)) {
+        let v = get(h, out, k)
+        if not (try has_own(h, out, k)) or not is_objectish(v) or is_array(h, v) {
+            continue
+        }
+        var parts = split_sections(k, ".")
+        var p = out
+        let l = parts[parts.len() - 1]
+        parts = parts.slice(0, parts.len() - 1)
+        let nl = l.split("\\.").join(".")
+        for part in parts {
+            if part == "__proto__" {
+                continue
+            }
+            if not (try has_own(h, p, part)) or not is_objectish(get(h, p, part)) {
+                let fresh = new_object(h, false)
+                try set(h, p, part, fresh)
+            }
+            p = get(h, p, part)
+        }
+        if same(p, out) and nl == l {
+            continue
+        }
+        try set(h, p, nl, get(h, out, k))
+        remove.push(k)
+    }
+    for k in remove {
+        delete_key(h, ref_id(out), k)
+    }
+    return ()
+}
+
+/// An INI text read as `ini.decode` reads it, as the JSON `JSON.stringify`
+/// writes for the result. `bracketed_array` false makes a repeated key an
+/// array instead of a `key[]` one.
+pub fn decode(text: str, bracketed_array: bool) -> str ! IniError {
+    var h = JsHeap{ cells: [] }
+    let out = new_object(h, false)
+    var p = out
+    var counts: [(str, i64)] = []
+    for line in split_lines(text) {
+        if skip_line(line) {
+            continue
+        }
+        match classify(line) {
+            IniNoMatch() -> ()
+            IniSectionLine(t) -> {
+                let section = unsafe_value(h, t)
+                let detached = match section {
+                    JsStr(s) -> s == "__proto__"
+                    _ -> false
+                }
+                if detached {
+                    p = new_object(h, false)
+                } else {
+                    let key = to_str(h, section, 0)
+                    let cur = get(h, out, key)
+                    let v = if truthy(cur) { cur } else { new_object(h, false) }
+                    try set(h, out, key, v)
+                    p = v
+                }
+            }
+            IniKeyLine(k, v) -> try key_line(h, p, k, v, bracketed_array, counts)
+        }
+    }
+    try nest(h, out)
+    return try json_text(h, out)
+}
+
+fn pad_end(s: str, n: i64) -> str {
+    let len = utf16_len(s)
+    return if len >= n { s } else { s + " ".repeat(n - len) }
+}
+
+fn object_keys(h: JsHeap, v: JsValue) -> [str] ! IniError {
+    return match v {
+        JsRef(id) -> own_keys(h, id)
+        JsStr(s) -> {
+            var out: [str] = []
+            for i in 0..utf16_len(s) {
+                out.push("{i}")
+            }
+            out
+        }
+        JsUndef -> fail(IniTypeError("Cannot convert undefined or null to object"))
+        JsNull -> fail(IniTypeError("Cannot convert undefined or null to object"))
+        _ -> []
+    }
+}
+
+fn sorted_units(keys: [str]) -> [str] {
+    var out: [str] = []
+    for k in keys {
+        var at = out.len()
+        while at > 0 and units_less(k, out[at - 1]) {
+            at = at - 1
+        }
+        out = out.slice(0, at) + [k] + out.slice(at, out.len())
+    }
+    return out
+}
+
+fn encode_value(h: JsHeap, obj: JsValue, o: IniOptions) -> str ! IniError {
+    let whitespace = o.whitespace or o.align
+    let eol = if o.windows { "\r\n" } else { "\n" }
+    let separator = if whitespace { " = " } else { "=" }
+    let all = try object_keys(h, obj)
+    let keys = if o.sort { sorted_units(all) } else { all }
+    var pad = 0
+    if o.align {
+        var best = ""
+        var cands: [str] = []
+        for k in keys {
+            let v = get(h, obj, k)
+            match v {
+                JsNull -> cands.push(k)
+                JsRef(_id) -> if is_array(h, v) {
+                    cands.push(k + "[]")
+                }
+                _ -> cands.push(k)
+            }
+        }
+        cands.push("")
+        best = cands[0]
+        for i in 1..cands.len() {
+            if utf16_len(try safe_value(h, JsStr(best))) < utf16_len(try safe_value(h, JsStr(cands[i]))) {
+                best = cands[i]
+            }
+        }
+        pad = utf16_len(try safe_value(h, JsStr(best)))
+    }
+    var out = ""
+    let suffix = if o.bracketed_array { "[]" } else { "" }
+    var children: [str] = []
+    for k in keys {
+        let val = get(h, obj, k)
+        if truthy(val) and is_array(h, val) {
+            let c = h.cells[ref_id(val)]
+            for i in 0..c.items.len() {
+                let item = if c.holes[i] { JsUndef } else { c.items[i] }
+                let text = match item {
+                    JsUndef -> "undefined"
+                    _ -> try safe_value(h, item)
+                }
+                out = out + pad_end(try safe_value(h, JsStr(k + suffix)), pad) + separator + text + eol
+            }
+        } else if truthy(val) and is_objectish(val) {
+            children.push(k)
+        } else {
+            out = out + pad_end(try safe_value(h, JsStr(k)), pad) + separator + (try safe_value(h, val)) + eol
+        }
+    }
+    if o.section.len() > 0 and out.len() > 0 {
+        out = "[" + (try safe_value(h, JsStr(o.section))) + "]" + (if o.newline { eol + eol } else { eol }) + out
+    }
+    for k in children {
+        let nk = split_sections(k, ".").join("\\.")
+        let section = (if o.section.len() > 0 { o.section + "." } else { "" }) + nk
+        let child = try encode_value(h, get(h, obj, k), IniOptions{ section: section, align: o.align, newline: o.newline, sort: o.sort, whitespace: o.whitespace,
+            windows: o.windows, bracketed_array: o.bracketed_array })
+        if out.len() > 0 and child.len() > 0 {
+            out = out + eol
+        }
+        out = out + child
+    }
+    return out
+}
+
+/// A JSON document written out as `ini.encode` writes the object.
+pub fn encode(json: str, o: IniOptions) -> str ! IniError {
+    var h = JsHeap{ cells: [] }
+    let v = try json_parse(h, json)
+    return try encode_value(h, v, o)
+}

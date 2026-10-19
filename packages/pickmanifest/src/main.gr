@@ -1,0 +1,722 @@
+// Which version npm installs: npm-pick-manifest.
+//
+// Given a packument (every version a registry has of a package, with its
+// dist-tags and publish times) and what was asked for, npm picks one
+// manifest. A tag (`latest`, `next`) means that version exactly; a version
+// means that version; a range means the best version in it, which is not
+// simply the highest: the default tag's version wins when it satisfies the
+// range and is fit to install, and otherwise versions are ranked -- not
+// avoided, not restricted by policy, not staged, not deprecated and
+// supported by this Node and npm, supported, not deprecated, then highest.
+// `before` ignores anything published after a date (and a tag published
+// after it falls back to the best version at or below the tag's);
+// `avoid` marks versions to step around, and `avoid_strict` steps
+// around them even outside the range asked for (to the best `^` of the
+// pick, then to anything), saying so. The manifest picked has its `bin`
+// normalised as npm-normalize-package-bin does: names are base names, paths
+// are relative, `\` is `/`, and a string `bin` is named after the package.
+//
+// This follows npm-pick-manifest 11.0.1 with npm-package-arg 13.0.1's
+// typing of the request, node-semver 7.7.3, npm-install-checks 7.1.2 and
+// npm-normalize-package-bin 4.0.0, and reads dates as `Date.parse` does
+// for ISO 8601 (a time without an offset taken as UTC).
+import npminstallchecks
+import nodesemver
+import hostedgit
+import jsnumber
+
+type PickOptions = {
+    default_tag: str,
+    before: Option[str],
+    node_version: str,
+    npm_version: Option[str],
+    include_staged: bool,
+    avoid: Option[str],
+    avoid_strict: bool,
+}
+
+/// The manifest picked (with its bin normalised), and what npm marks on it.
+type Picked = { manifest: NicValue, should_avoid: bool, outside_range: Option[bool], semver_major: Option[bool] }
+
+type PickError =
+    | PickNoMatch()
+    | PickForbidden()
+    | PickNoVersions()
+    | PickNoAvoidable()
+    | PickUnsupported()
+    | PickInvalidTag(tag: str)
+    | PickThrown(why: str)
+
+// --- values ------------------------------------------------------------------
+
+fn get(v: Option[NicValue], key: str) -> Option[NicValue] {
+    return match v {
+        Some(NicObj(keys, vals)) -> {
+            var out: Option[NicValue] = None
+            for i in 0..keys.len() {
+                if keys[i] == key {
+                    out = Some(vals[i])
+                }
+            }
+            out
+        }
+        _ -> None
+    }
+}
+
+fn truthy(v: Option[NicValue]) -> bool {
+    return match v {
+        None -> false
+        Some(NicNull) -> false
+        Some(NicBool(b)) -> b
+        Some(NicNum(n)) -> n != 0.0 and n == n
+        Some(NicStr(s)) -> s.len() > 0
+        Some(_x) -> true
+    }
+}
+
+/// A value as a property key.
+fn key_of(v: Option[NicValue]) -> str {
+    return match v {
+        None -> "undefined"
+        Some(NicNull) -> "null"
+        Some(NicBool(b)) -> if b { "true" } else { "false" }
+        Some(NicNum(n)) -> if n == 0.0 { "0" } else { jsnumber.to_string(n) }
+        Some(NicStr(s)) -> s
+        Some(NicArr(_x)) -> "[array]"
+        Some(NicObj(_k, _v)) -> "[object Object]"
+    }
+}
+
+fn text(v: Option[NicValue]) -> Option[str] {
+    return match v {
+        Some(NicStr(s)) -> Some(s)
+        _ -> None
+    }
+}
+
+fn entries(v: Option[NicValue]) -> [(str, NicValue)] {
+    return match v {
+        Some(NicObj(keys, vals)) -> {
+            var out: [(str, NicValue)] = []
+            for i in 0..keys.len() {
+                out.push((keys[i], vals[i]))
+            }
+            out
+        }
+        _ -> []
+    }
+}
+
+fn with_key(v: NicValue, key: str, value: Option[NicValue]) -> NicValue {
+    var keys: [str] = []
+    var vals: [NicValue] = []
+    var done = false
+    for (k, x) in entries(Some(v)) {
+        if k == key {
+            match value {
+                Some(y) -> {
+                    keys.push(k)
+                    vals.push(y)
+                }
+                None -> ()
+            }
+            done = true
+        } else {
+            keys.push(k)
+            vals.push(x)
+        }
+    }
+    if not done {
+        match value {
+            Some(y) -> {
+                keys.push(key)
+                vals.push(y)
+            }
+            None -> ()
+        }
+    }
+    return NicObj(keys, vals)
+}
+
+// --- Date.parse, for ISO 8601 ---------------------------------------------------
+
+fn digits_at(c: [i64], at: i64, n: i64) -> i64 {
+    if at + n > c.len() {
+        return 0 - 1
+    }
+    var v = 0
+    for i in 0..n {
+        let d = c[at + i]
+        if d < 48 or d > 57 {
+            return 0 - 1
+        }
+        v = v * 10 + d - 48
+    }
+    return v
+}
+
+fn days_from_civil(y0: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y0 - 1 } else { y0 }
+    let era = (if y >= 0 { y } else { y - 399 }) / 400
+    let yoe = y - era * 400
+    let mp = (m + 9) % 12
+    let doy = (153 * mp + 2) / 5 + d - 1
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy
+    return era * 146097 + doe - 719468
+}
+
+/// `THH:mm[:ss[.sss]]` from `at` (the `T`): milliseconds into the day and
+/// where it ends.
+fn clock(c: [i64], at0: i64) -> Option[(i64, i64)] {
+    let hh = digits_at(c, at0 + 1, 2)
+    let mm = if at0 + 3 < c.len() and c[at0 + 3] == 58 { digits_at(c, at0 + 4, 2) } else { 0 - 1 }
+    var at = at0 + 6
+    var ss = 0
+    var frac = 0
+    if at < c.len() and c[at] == 58 {
+        ss = digits_at(c, at + 1, 2)
+        at = at + 3
+        if at < c.len() and c[at] == 46 {
+            // Any number of digits; the first three count.
+            var n = 0
+            at = at + 1
+            while at < c.len() and c[at] >= 48 and c[at] <= 57 {
+                if n < 3 {
+                    frac = frac * 10 + c[at] - 48
+                }
+                n = n + 1
+                at = at + 1
+            }
+            if n == 0 {
+                return None
+            }
+            while n < 3 {
+                frac = frac * 10
+                n = n + 1
+            }
+        }
+    }
+    if hh < 0 or mm < 0 or ss < 0 or frac < 0 or hh > 24 or mm > 59 or ss > 59 or hh == 24 and (mm > 0 or ss > 0 or frac > 0) {
+        return None
+    }
+    return Some((((hh * 60 + mm) * 60 + ss) * 1000 + frac, at))
+}
+
+/// `Date.parse` of the ECMAScript date-time format, in milliseconds; None
+/// (NaN) for anything else.
+pub fn parse_date(s: str) -> Option[f64] {
+    let c = s.codes()
+    var at = 0
+    var year = 0
+    if c.len() > 0 and (c[0] == 43 or c[0] == 45) {
+        year = digits_at(c, 1, 6)
+        if year < 0 or c[0] == 45 and year == 0 {
+            return None
+        }
+        year = if c[0] == 45 { 0 - year } else { year }
+        at = 7
+    } else {
+        year = digits_at(c, 0, 4)
+        if year < 0 {
+            return None
+        }
+        at = 4
+    }
+    var month = 1
+    var day = 1
+    if at < c.len() and c[at] == 45 {
+        month = digits_at(c, at + 1, 2)
+        at = at + 3
+        if at < c.len() and c[at] == 45 {
+            day = digits_at(c, at + 1, 2)
+            at = at + 3
+        }
+    }
+    // V8 takes any day up to 31 and lets it run into the next month.
+    if month < 1 or month > 12 or day < 1 or day > 31 {
+        return None
+    }
+    var ms = days_from_civil(year, month, day) * 86400000
+    if at == c.len() {
+        return Some(ms.as_f64())
+    }
+    if c[at] != 84 and c[at] != 116 {
+        return None
+    }
+    let (in_day, after) = match clock(c, at) {
+        Some(x) -> x
+        None -> return None
+    }
+    at = after
+    ms = ms + in_day
+    if at == c.len() or at + 1 == c.len() and (c[at] == 90 or c[at] == 122) {
+        return Some(ms.as_f64())
+    }
+    if at + 6 == c.len() and (c[at] == 43 or c[at] == 45) and c[at + 3] == 58 {
+        let oh = digits_at(c, at + 1, 2)
+        let om = digits_at(c, at + 4, 2)
+        if oh < 0 or om < 0 or oh > 23 or om > 59 {
+            return None
+        }
+        let off = (oh * 60 + om) * 60000
+        return Some((if c[at] == 43 { ms - off } else { ms + off }).as_f64())
+    }
+    return None
+}
+
+// --- Node's posix path, for bins --------------------------------------------------
+
+fn normalize_string(path: [i64], above_root: bool) -> [i64] {
+    var res: [i64] = []
+    var last_seg = 0
+    var last_slash = 0 - 1
+    var dots = 0
+    var code = 0
+    var i = 0
+    while i <= path.len() {
+        if i < path.len() {
+            code = path[i]
+        } else if code == 47 {
+            break
+        } else {
+            code = 47
+        }
+        if code == 47 {
+            if last_slash == i - 1 or dots == 1 {
+                // nothing
+            } else if dots == 2 {
+                var handled = false
+                if res.len() < 2 or last_seg != 2 or res[res.len() - 1] != 46 or res[res.len() - 2] != 46 {
+                    if res.len() > 2 {
+                        let cut = res.len() - last_seg - 1
+                        if cut < 0 {
+                            res = []
+                            last_seg = 0
+                        } else {
+                            res = res.slice(0, cut)
+                            var k = res.len() - 1
+                            while k >= 0 and res[k] != 47 {
+                                k = k - 1
+                            }
+                            last_seg = res.len() - 1 - k
+                        }
+                        handled = true
+                    } else if res.len() != 0 {
+                        res = []
+                        last_seg = 0
+                        handled = true
+                    }
+                }
+                if not handled and above_root {
+                    res = res + (if res.len() > 0 { [47, 46, 46] } else { [46, 46] })
+                    last_seg = 2
+                }
+            } else {
+                if res.len() > 0 {
+                    res.push(47)
+                }
+                res = res + path.slice(last_slash + 1, i)
+                last_seg = i - last_slash - 1
+            }
+            last_slash = i
+            dots = 0
+        } else if code == 46 and dots != 0 - 1 {
+            dots = dots + 1
+        } else {
+            dots = 0 - 1
+        }
+        i = i + 1
+    }
+    return res
+}
+
+fn codes_text(c: [i64]) -> str {
+    return c.map(|x| x.to_char()).join("")
+}
+
+/// `path.posix.join('/', p).slice(1)`
+fn rooted(p: str) -> str {
+    let c = p.codes()
+    let joined = if c.len() > 0 { [47, 47] + c } else { [47] }
+    let trailing = joined[joined.len() - 1] == 47
+    let body = normalize_string(joined, false)
+    if body.len() == 0 {
+        return ""
+    }
+    return codes_text(body) + if trailing { "/" } else { "" }
+}
+
+/// `path.posix.basename`
+fn basename(p: str) -> str {
+    let c = p.codes()
+    var start = 0
+    var end = 0 - 1
+    var matched_slash = true
+    var i = c.len() - 1
+    while i >= 0 {
+        if c[i] == 47 {
+            if not matched_slash {
+                start = i + 1
+                break
+            }
+        } else if end == 0 - 1 {
+            matched_slash = false
+            end = i + 1
+        }
+        i = i - 1
+    }
+    return if end == 0 - 1 { "" } else { codes_text(c.slice(start, end)) }
+}
+
+// --- what was asked for -------------------------------------------------------------
+
+fn is_letter(c: i64) -> bool {
+    return c >= 65 and c <= 90 or c >= 97 and c <= 122
+}
+
+/// `/^(?:git[+])?[a-z]+:/i`
+fn is_url(s: str) -> bool {
+    let c = s.codes()
+    var i = if s.to_lower().starts_with("git+") { 4 } else { 0 }
+    let start = i
+    while i < c.len() and is_letter(c[i]) {
+        i = i + 1
+    }
+    return i > start and i < c.len() and c[i] == 58
+}
+
+/// `/^(?:[.]|~[/]|[/]|[a-zA-Z]:)/`
+fn is_posix_file(s: str) -> bool {
+    let c = s.codes()
+    return c.len() > 0 and (c[0] == 46 or c[0] == 47 or s.starts_with("~/") or c.len() > 1 and is_letter(c[0]) and c[1] == 58)
+}
+
+fn is_file_type(s: str) -> bool {
+    let l = s.to_lower()
+    return l.ends_with(".tgz") or l.ends_with(".tar.gz") or l.ends_with(".tar")
+}
+
+/// encodeURIComponent leaves these alone.
+fn uri_safe(s: str) -> bool {
+    for c in s.codes() {
+        let ok = is_letter(c) or c >= 48 and c <= 57 or [45, 95, 46, 33, 126, 42, 39, 40, 41].contains(c)
+        if not ok {
+            return false
+        }
+    }
+    return true
+}
+
+/// npa.resolve's type for a spec: "tag", "version" or "range" (else the
+/// error pick-manifest throws).
+fn spec_type(r: NsRegexes, spec: str) -> str ! PickError {
+    let l = spec.to_lower()
+    if spec.len() > 0 and (l.starts_with("file:") or is_posix_file(spec)) or l.starts_with("npm:") {
+        fail(PickUnsupported())
+    }
+    if hostedgit.from_url(spec) != None or spec.len() > 0 and is_url(spec) or spec.contains("/") or is_file_type(spec) {
+        fail(PickUnsupported())
+    }
+    let t = spec.trim()
+    if nodesemver.valid(r, t, true) != None {
+        return "version"
+    }
+    if nodesemver.valid_range(r, t, true, false) != None {
+        return "range"
+    }
+    if not uri_safe(t) {
+        fail(PickInvalidTag(t))
+    }
+    return "tag"
+}
+
+// --- picking ----------------------------------------------------------------------------
+
+type PickState = { packument: NicValue, times: Option[NicValue], time: Option[f64], versions: Option[NicValue], staged: Option[NicValue], restricted: Option[NicValue] }
+
+/// Published at or before the cut-off (or no record of when).
+fn is_before(st: PickState, ver: str) -> bool {
+    let t = get(st.times, ver)
+    if not truthy(st.times) or not truthy(t) {
+        return true
+    }
+    let at = match text(t) {
+        Some(s) -> parse_date(s)
+        None -> None
+    }
+    // A cut-off that is not a date is NaN, before which nothing was published.
+    return match (at, st.time) {
+        (Some(a), Some(cut)) -> a <= cut
+        _ -> false
+    }
+}
+
+fn should_avoid(r: NsRegexes, ver: Option[str], avoid: Option[str]) -> bool {
+    return match (ver, avoid) {
+        (Some(v), Some(a)) -> a.len() > 0 and nodesemver.satisfies(r, v, a, true, true)
+        _ -> false
+    }
+}
+
+fn engine_ok(r: NsRegexes, mani: NicValue, o: PickOptions) -> bool {
+    return match npminstallchecks.check_engine(r, mani, o.npm_version, Some(o.node_version), false) {
+        Ok(_u) -> true
+        Err(_e) -> false
+    }
+}
+
+fn decorate(r: NsRegexes, mani: Option[NicValue], avoid: Option[str]) -> Option[Picked] {
+    return match mani {
+        Some(m) -> if truthy(mani) { Some(Picked{ manifest: m, should_avoid: should_avoid(r, text(get(mani, "version")), avoid), outside_range: None, semver_major: None }) } else { None }
+        None -> None
+    }
+}
+
+fn first_of(st: PickState, ver: str) -> Option[NicValue] {
+    for src in [st.versions, st.staged, st.restricted] {
+        if truthy(get(src, ver)) {
+            return get(src, ver)
+        }
+    }
+    return None
+}
+
+fn rank_flags(r: NsRegexes, st: PickState, o: PickOptions, e: (str, NicValue)) -> [bool] {
+    let deprecated = truthy(get(Some(e.1), "deprecated"))
+    let engine = engine_ok(r, e.1, o)
+    return [not should_avoid(r, Some(e.0), o.avoid), not truthy(get(st.restricted, e.0)), not truthy(get(st.staged, e.0)), not deprecated and engine, engine,
+        not deprecated]
+}
+
+/// `b` before `a` in pick-manifest's ranking.
+fn ranks_before(r: NsRegexes, st: PickState, o: PickOptions, a: (str, NicValue), b: (str, NicValue)) -> bool {
+    let fa = rank_flags(r, st, o, a)
+    let fb = rank_flags(r, st, o, b)
+    for i in 0..fa.len() {
+        if fa[i] != fb[i] {
+            return fb[i]
+        }
+    }
+    let va = nodesemver.parse(r, a.0, true)
+    let vb = nodesemver.parse(r, b.0, true)
+    return match (va, vb) {
+        (Some(x), Some(y)) -> nodesemver.compare(y, x) > 0
+        _ -> false
+    }
+}
+
+fn pick_loose(r: NsRegexes, st: PickState, wanted: Option[str], o: PickOptions) -> Option[Picked] ! PickError {
+    let w = wanted ?? ""
+    let asked = if w.len() > 0 { w } else { o.default_tag }
+    let kind = try spec_type(r, asked)
+    let dist_tags = get(Some(st.packument), "dist-tags")
+    if w.len() > 0 and kind == "tag" {
+        let ver = get(dist_tags, w)
+        let vk = key_of(ver)
+        if is_before(st, vk) {
+            return decorate(r, first_of(st, vk), o.avoid)
+        }
+        return try pick_loose(r, st, Some("<=" + vk), o)
+    }
+    if w.len() > 0 and kind == "version" {
+        let ver = nodesemver.clean(r, w, true)
+        let vk = ver ?? "null"
+        return if is_before(st, vk) { decorate(r, first_of(st, vk), o.avoid) } else { None }
+    }
+    let range = if kind == "range" { w } else { "*" }
+    let default_ver = text(get(dist_tags, o.default_tag))
+    match default_ver {
+        Some(dv) -> {
+            if dv.len() > 0 and (range == "*" or nodesemver.satisfies(r, dv, range, true, false)) and not truthy(get(st.restricted, dv)) and not should_avoid(r, Some(dv), o.avoid) {
+                let mani = get(st.versions, dv)
+                let ok = truthy(mani) and is_before(st, dv) and engine_ok(r, mani ?? NicNull, o) and not truthy(get(mani, "deprecated")) and not truthy(get(st.staged, dv))
+                if ok {
+                    return Some(Picked{ manifest: mani ?? NicNull, should_avoid: false, outside_range: None, semver_major: None })
+                }
+            }
+        }
+        None -> ()
+    }
+    var all: [(str, NicValue)] = []
+    for e in entries(st.versions) + entries(st.staged) + entries(st.restricted) {
+        if is_before(st, e.0) {
+            all.push(e)
+        }
+    }
+    if all.len() == 0 {
+        fail(PickNoVersions())
+    }
+    // A stable insertion sort, as V8's sort is stable.
+    var sorted: [(str, NicValue)] = []
+    for e in all {
+        if not nodesemver.satisfies(r, e.0, range, true, false) {
+            continue
+        }
+        var at = sorted.len()
+        while at > 0 and ranks_before(r, st, o, sorted[at - 1], e) {
+            at = at - 1
+        }
+        sorted = sorted.slice(0, at) + [e] + sorted.slice(at, sorted.len())
+    }
+    return if sorted.len() > 0 { decorate(r, Some(sorted[0].1), o.avoid) } else { None }
+}
+
+fn pick_inner(r: NsRegexes, st: PickState, wanted: Option[str], o: PickOptions) -> Option[Picked] ! PickError {
+    if not o.avoid_strict {
+        return try pick_loose(r, st, wanted, o)
+    }
+    let result = try pick_loose(r, st, wanted, o)
+    let res = match result {
+        Some(p) -> if p.should_avoid { p } else { return result }
+        None -> return None
+    }
+    let version = key_of(get(Some(res.manifest), "version"))
+    for (asked, major) in [("^" + version, false), ("*", true)] {
+        match try pick_loose(r, st, Some(asked), o) {
+            Some(p) -> if not p.should_avoid {
+                return Some(Picked{ manifest: p.manifest, should_avoid: false, outside_range: Some(true), semver_major: Some(major) })
+            }
+            None -> return Some(Picked{ manifest: NicObj([], []), should_avoid: false, outside_range: Some(true), semver_major: Some(major) })
+        }
+    }
+    fail(PickNoAvoidable())
+}
+
+/// npm-normalize-package-bin.
+fn normalize_bin(pkg: NicValue) -> NicValue ! PickError {
+    let bin = get(Some(pkg), "bin")
+    if not truthy(bin) {
+        return with_key(pkg, "bin", None)
+    }
+    var orig: [(str, NicValue)] = []
+    match bin {
+        Some(NicStr(s)) -> {
+            let name = get(Some(pkg), "name")
+            if not truthy(name) {
+                return with_key(pkg, "bin", None)
+            }
+            orig = [(key_of(name), NicStr(s))]
+        }
+        Some(NicArr(items)) -> {
+            var keys: [str] = []
+            var vals: [NicValue] = []
+            for it in items {
+                let k = match it {
+                    NicStr(s) -> s
+                    _ -> fail(PickThrown("The \"path\" argument must be of type string"))
+                }
+                let b = basename(k)
+                var found = false
+                for i in 0..keys.len() {
+                    if keys[i] == b {
+                        vals[i] = it
+                        found = true
+                    }
+                }
+                if not found {
+                    keys.push(b)
+                    vals.push(it)
+                }
+            }
+            orig = ordered(keys, vals)
+        }
+        Some(NicObj(_k, _v)) -> orig = entries(bin)
+        _ -> return with_key(pkg, "bin", None)
+    }
+    var keys: [str] = []
+    var vals: [NicValue] = []
+    for (bin_key, target) in orig {
+        let base = rooted(basename(bin_key.replace("\\", "/").replace(":", "/")))
+        let t = match target {
+            NicStr(x) -> x
+            _ -> ""
+        }
+        let is_text = match target {
+            NicStr(_x) -> true
+            _ -> false
+        }
+        if not is_text or base.len() == 0 {
+            continue
+        }
+        let bin_target = rooted(t.replace("\\", "/"))
+        if bin_target.len() == 0 {
+            continue
+        }
+        var found = false
+        for i in 0..keys.len() {
+            if keys[i] == base {
+                vals[i] = NicStr(bin_target)
+                found = true
+            }
+        }
+        if not found {
+            keys.push(base)
+            vals.push(NicStr(bin_target))
+        }
+    }
+    if keys.len() == 0 {
+        return with_key(pkg, "bin", None)
+    }
+    let clean = ordered(keys, vals)
+    return with_key(pkg, "bin", Some(NicObj(clean.map(|e| e.0), clean.map(|e| e.1))))
+}
+
+fn index_key(k: str) -> i64 {
+    if k.len() == 0 or k.len() > 10 or k.len() > 1 and k.starts_with("0") {
+        return 0 - 1
+    }
+    var v = 0
+    for c in k.codes() {
+        if c < 48 or c > 57 {
+            return 0 - 1
+        }
+        v = v * 10 + c - 48
+    }
+    return if v < 4294967295 { v } else { 0 - 1 }
+}
+
+/// Integer keys first, ascending, as a JavaScript object keeps them.
+fn ordered(keys: [str], vals: [NicValue]) -> [(str, NicValue)] {
+    var ints: [(i64, i64)] = []
+    var rest: [(str, NicValue)] = []
+    for i in 0..keys.len() {
+        let n = index_key(keys[i])
+        if n >= 0 {
+            ints.push((n, i))
+        } else {
+            rest.push((keys[i], vals[i]))
+        }
+    }
+    ints.sort()
+    var out: [(str, NicValue)] = []
+    for (_n, i) in ints {
+        out.push((keys[i], vals[i]))
+    }
+    for e in rest {
+        out.push(e)
+    }
+    return out
+}
+
+/// What npm-pick-manifest gives for a packument and a request.
+pub fn pick(r: NsRegexes, packument: NicValue, wanted: Option[str], o: PickOptions) -> Picked ! PickError {
+    let times = get(Some(packument), "time")
+    let staged = if o.include_staged { get(get(Some(packument), "stagedVersions"), "versions") } else { None }
+    let restricted = get(get(Some(packument), "policyRestrictions"), "versions")
+    let versions = if truthy(get(Some(packument), "versions")) { get(Some(packument), "versions") } else { Some(NicObj([], [])) }
+    let before = o.before ?? ""
+    let time = if before.len() > 0 and truthy(times) { parse_date(before) } else { Some(1.0 / 0.0) }
+    let st = PickState{ packument: packument, times: times, time: time, versions: versions, staged: if truthy(staged) { staged } else { None },
+        restricted: if truthy(restricted) { restricted } else { None } }
+    let picked = try pick_inner(r, st, wanted, o)
+    let p = match picked {
+        Some(x) -> x
+        None -> fail(PickNoMatch())
+    }
+    let manifest = try normalize_bin(p.manifest)
+    if truthy(get(st.restricted, key_of(get(Some(manifest), "version")))) {
+        fail(PickForbidden())
+    }
+    return Picked{ manifest: manifest, should_avoid: p.should_avoid, outside_range: p.outside_range, semver_major: p.semver_major }
+}

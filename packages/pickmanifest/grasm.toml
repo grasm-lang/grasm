@@ -1,0 +1,20 @@
+[package]
+name = "pickmanifest"
+version = "1.0.0"
+capabilities = []
+
+[dependencies.npminstallchecks]
+path = "../npminstallchecks"
+version = "^1.0.0"
+
+[dependencies.nodesemver]
+path = "../nodesemver"
+version = "^1.0.0"
+
+[dependencies.hostedgit]
+path = "../hostedgit"
+version = "^1.0.0"
+
+[dependencies.jsnumber]
+path = "../jsnumber"
+version = "^1.0.0"

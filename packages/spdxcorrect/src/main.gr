@@ -1,0 +1,560 @@
+// Fixing the `license` field people actually write: `MIT License`,
+// `Apache 2`, `GPLv3`, `BSD 3 clause`, `New BSD`, `Attribution-NonCommercial`.
+//
+// npm runs every `license` through spdx-correct before it warns, and so do
+// the tools that read package.json after it. It tries, in order: the text
+// as it stands; without a trailing `+`; 27 small rewrites (upper case, no
+// periods, no spaces, `v` for `-`, `-2.0` from a bare `2`, `-only` or
+// `-or-later` for a GPL, `-Clause` for a BSD, `CC-` in front...), keeping
+// the first that parses; the same after each of 35 common misspellings
+// (`GLP`, `APGL` for `AGPL`, `GNU Lesser General Public License`),
+// longest first; a substring guess (`APACHE` anywhere is Apache-2.0, any
+// licence with a single version is that version); and the guess after a
+// misspelling. A GPL family name without `-only` or `-or-later` is
+// upgraded to the one it meant.
+//
+// What counts as parsing is spdx-expression-parse 3.0.1 (the copy
+// spdx-correct carries), quirks included: its scanner looks for the next
+// identifier anywhere ahead rather than at the cursor, so `#MIT` reads as
+// `MIT` and then fails on the `T` it skipped back over; `+` after a space
+// is refused; `()` and a dangling operator throw from inside the parser.
+// The license and exception lists are spdx-license-ids 3.0.22 (deprecated
+// identifiers included) and spdx-exceptions 2.5.0; the rewrite tables and
+// their order (sorted by length, then by `localeCompare` of the upper
+// case) are spdx-correct 3.2.0's, as Node sorts them.
+//
+// `correct` gives the corrected expression, None where nothing fits, or
+// the TypeError spdx-correct throws (it does, for `+`: a rewrite reaches
+// for the first character of an empty string).
+import jsnumber
+
+type SpdxTables = { licenses: [str], exceptions: [str], transpositions: [(str, str)], last_resorts: [(str, str)] }
+
+type SpdxToken = { kind: str, text: str }
+
+/// spdx-expression-parse threw.
+type SpdxParseError =
+    | SpdxParseFailed()
+
+type SpdxCorrectError =
+    | SpdxInvalidArgument()
+    | SpdxTypeError(why: str)
+
+let LICENSE_IDS = ["0BSD", "3D-Slicer-1.0", "AAL", "ADSL", "AFL-1.1", "AFL-1.2", "AFL-2.0", "AFL-2.1", "AFL-3.0", "AGPL-1.0-only", "AGPL-1.0-or-later", "AGPL-3.0-only", "AGPL-3.0-or-later", "AMD-newlib", "AMDPLPA", "AML", "AML-glslang", "AMPAS", "ANTLR-PD", "ANTLR-PD-fallback", "APAFML", "APL-1.0", "APSL-1.0", "APSL-1.1", "APSL-1.2", "APSL-2.0", "ASWF-Digital-Assets-1.0", "ASWF-Digital-Assets-1.1", "Abstyles", "AdaCore-doc", "Adobe-2006", "Adobe-Display-PostScript", "Adobe-Glyph", "Adobe-Utopia", "Afmparse", "Aladdin", "Apache-1.0", "Apache-1.1", "Apache-2.0", "App-s2p", "Arphic-1999", "Artistic-1.0", "Artistic-1.0-Perl", "Artistic-1.0-cl8", "Artistic-2.0", "Artistic-dist", "Aspell-RU", "BSD-1-Clause", "BSD-2-Clause", "BSD-2-Clause-Darwin", "BSD-2-Clause-Patent", "BSD-2-Clause-Views", "BSD-2-Clause-first-lines", "BSD-2-Clause-pkgconf-disclaimer", "BSD-3-Clause", "BSD-3-Clause-Attribution", "BSD-3-Clause-Clear", "BSD-3-Clause-HP", "BSD-3-Clause-LBNL", "BSD-3-Clause-Modification", "BSD-3-Clause-No-Military-License", "BSD-3-Clause-No-Nuclear-License", "BSD-3-Clause-No-Nuclear-License-2014", "BSD-3-Clause-No-Nuclear-Warranty", "BSD-3-Clause-Open-MPI", "BSD-3-Clause-Sun", "BSD-3-Clause-acpica", "BSD-3-Clause-flex", "BSD-4-Clause", "BSD-4-Clause-Shortened", "BSD-4-Clause-UC", "BSD-4.3RENO", "BSD-4.3TAHOE", "BSD-Advertising-Acknowledgement", "BSD-Attribution-HPND-disclaimer", "BSD-Inferno-Nettverk", "BSD-Protection", "BSD-Source-Code", "BSD-Source-beginning-file", "BSD-Systemics", "BSD-Systemics-W3Works", "BSL-1.0", "BUSL-1.1", "Baekmuk", "Bahyph", "Barr", "Beerware", "BitTorrent-1.0", "BitTorrent-1.1", "Bitstream-Charter", "Bitstream-Vera", "BlueOak-1.0.0", "Boehm-GC", "Boehm-GC-without-fee", "Borceux", "Brian-Gladman-2-Clause", "Brian-Gladman-3-Clause", "C-UDA-1.0", "CAL-1.0", "CAL-1.0-Combined-Work-Exception", "CATOSL-1.1", "CC-BY-1.0", "CC-BY-2.0", "CC-BY-2.5", "CC-BY-2.5-AU", "CC-BY-3.0", "CC-BY-3.0-AT", "CC-BY-3.0-AU", "CC-BY-3.0-DE", "CC-BY-3.0-IGO", "CC-BY-3.0-NL", "CC-BY-3.0-US", "CC-BY-4.0", "CC-BY-NC-1.0", "CC-BY-NC-2.0", "CC-BY-NC-2.5", "CC-BY-NC-3.0", "CC-BY-NC-3.0-DE", "CC-BY-NC-4.0", "CC-BY-NC-ND-1.0", "CC-BY-NC-ND-2.0", "CC-BY-NC-ND-2.5", "CC-BY-NC-ND-3.0", "CC-BY-NC-ND-3.0-DE", "CC-BY-NC-ND-3.0-IGO", "CC-BY-NC-ND-4.0", "CC-BY-NC-SA-1.0", "CC-BY-NC-SA-2.0", "CC-BY-NC-SA-2.0-DE", "CC-BY-NC-SA-2.0-FR", "CC-BY-NC-SA-2.0-UK", "CC-BY-NC-SA-2.5", "CC-BY-NC-SA-3.0", "CC-BY-NC-SA-3.0-DE", "CC-BY-NC-SA-3.0-IGO", "CC-BY-NC-SA-4.0", "CC-BY-ND-1.0", "CC-BY-ND-2.0", "CC-BY-ND-2.5", "CC-BY-ND-3.0", "CC-BY-ND-3.0-DE", "CC-BY-ND-4.0", "CC-BY-SA-1.0", "CC-BY-SA-2.0", "CC-BY-SA-2.0-UK", "CC-BY-SA-2.1-JP", "CC-BY-SA-2.5", "CC-BY-SA-3.0", "CC-BY-SA-3.0-AT", "CC-BY-SA-3.0-DE", "CC-BY-SA-3.0-IGO", "CC-BY-SA-4.0", "CC-PDDC", "CC-PDM-1.0", "CC-SA-1.0", "CC0-1.0", "CDDL-1.0", "CDDL-1.1", "CDL-1.0", "CDLA-Permissive-1.0", "CDLA-Permissive-2.0", "CDLA-Sharing-1.0", "CECILL-1.0", "CECILL-1.1", "CECILL-2.0", "CECILL-2.1", "CECILL-B", "CECILL-C", "CERN-OHL-1.1", "CERN-OHL-1.2", "CERN-OHL-P-2.0", "CERN-OHL-S-2.0", "CERN-OHL-W-2.0", "CFITSIO", "CMU-Mach", "CMU-Mach-nodoc", "CNRI-Jython", "CNRI-Python", "CNRI-Python-GPL-Compatible", "COIL-1.0", "CPAL-1.0", "CPL-1.0", "CPOL-1.02", "CUA-OPL-1.0", "Caldera", "Caldera-no-preamble", "Catharon", "ClArtistic", "Clips", "Community-Spec-1.0", "Condor-1.1", "Cornell-Lossless-JPEG", "Cronyx", "Crossword", "CryptoSwift", "CrystalStacker", "Cube", "D-FSL-1.0", "DEC-3-Clause", "DL-DE-BY-2.0", "DL-DE-ZERO-2.0", "DOC", "DRL-1.0", "DRL-1.1", "DSDP", "DocBook-DTD", "DocBook-Schema", "DocBook-Stylesheet", "DocBook-XML", "Dotseqn", "ECL-1.0", "ECL-2.0", "EFL-1.0", "EFL-2.0", "EPICS", "EPL-1.0", "EPL-2.0", "EUDatagrid", "EUPL-1.0", "EUPL-1.1", "EUPL-1.2", "Elastic-2.0", "Entessa", "ErlPL-1.1", "Eurosym", "FBM", "FDK-AAC", "FSFAP", "FSFAP-no-warranty-disclaimer", "FSFUL", "FSFULLR", "FSFULLRSD", "FSFULLRWD", "FSL-1.1-ALv2", "FSL-1.1-MIT", "FTL", "Fair", "Ferguson-Twofish", "Frameworx-1.0", "FreeBSD-DOC", "FreeImage", "Furuseth", "GCR-docs", "GD", "GFDL-1.1-invariants-only", "GFDL-1.1-invariants-or-later", "GFDL-1.1-no-invariants-only", "GFDL-1.1-no-invariants-or-later", "GFDL-1.1-only", "GFDL-1.1-or-later", "GFDL-1.2-invariants-only", "GFDL-1.2-invariants-or-later", "GFDL-1.2-no-invariants-only", "GFDL-1.2-no-invariants-or-later", "GFDL-1.2-only", "GFDL-1.2-or-later", "GFDL-1.3-invariants-only", "GFDL-1.3-invariants-or-later", "GFDL-1.3-no-invariants-only", "GFDL-1.3-no-invariants-or-later", "GFDL-1.3-only", "GFDL-1.3-or-later", "GL2PS", "GLWTPL", "GPL-1.0-only", "GPL-1.0-or-later", "GPL-2.0-only", "GPL-2.0-or-later", "GPL-3.0-only", "GPL-3.0-or-later", "Game-Programming-Gems", "Giftware", "Glide", "Glulxe", "Graphics-Gems", "Gutmann", "HDF5", "HIDAPI", "HP-1986", "HP-1989", "HPND", "HPND-DEC", "HPND-Fenneberg-Livingston", "HPND-INRIA-IMAG", "HPND-Intel", "HPND-Kevlin-Henney", "HPND-MIT-disclaimer", "HPND-Markus-Kuhn", "HPND-Netrek", "HPND-Pbmplus", "HPND-UC", "HPND-UC-export-US", "HPND-doc", "HPND-doc-sell", "HPND-export-US", "HPND-export-US-acknowledgement", "HPND-export-US-modify", "HPND-export2-US", "HPND-merchantability-variant", "HPND-sell-MIT-disclaimer-xserver", "HPND-sell-regexpr", "HPND-sell-variant", "HPND-sell-variant-MIT-disclaimer", "HPND-sell-variant-MIT-disclaimer-rev", "HTMLTIDY", "HaskellReport", "Hippocratic-2.1", "IBM-pibs", "ICU", "IEC-Code-Components-EULA", "IJG", "IJG-short", "IPA", "IPL-1.0", "ISC", "ISC-Veillard", "ImageMagick", "Imlib2", "Info-ZIP", "Inner-Net-2.0", "InnoSetup", "Intel", "Intel-ACPI", "Interbase-1.0", "JPL-image", "JPNIC", "JSON", "Jam", "JasPer-2.0", "Kastrup", "Kazlib", "Knuth-CTAN", "LAL-1.2", "LAL-1.3", "LGPL-2.0-only", "LGPL-2.0-or-later", "LGPL-2.1-only", "LGPL-2.1-or-later", "LGPL-3.0-only", "LGPL-3.0-or-later", "LGPLLR", "LOOP", "LPD-document", "LPL-1.0", "LPL-1.02", "LPPL-1.0", "LPPL-1.1", "LPPL-1.2", "LPPL-1.3a", "LPPL-1.3c", "LZMA-SDK-9.11-to-9.20", "LZMA-SDK-9.22", "Latex2e", "Latex2e-translated-notice", "Leptonica", "LiLiQ-P-1.1", "LiLiQ-R-1.1", "LiLiQ-Rplus-1.1", "Libpng", "Linux-OpenIB", "Linux-man-pages-1-para", "Linux-man-pages-copyleft", "Linux-man-pages-copyleft-2-para", "Linux-man-pages-copyleft-var", "Lucida-Bitmap-Fonts", "MIPS", "MIT", "MIT-0", "MIT-CMU", "MIT-Click", "MIT-Festival", "MIT-Khronos-old", "MIT-Modern-Variant", "MIT-Wu", "MIT-advertising", "MIT-enna", "MIT-feh", "MIT-open-group", "MIT-testregex", "MITNFA", "MMIXware", "MPEG-SSG", "MPL-1.0", "MPL-1.1", "MPL-2.0", "MPL-2.0-no-copyleft-exception", "MS-LPL", "MS-PL", "MS-RL", "MTLL", "Mackerras-3-Clause", "Mackerras-3-Clause-acknowledgment", "MakeIndex", "Martin-Birgmeier", "McPhee-slideshow", "Minpack", "MirOS", "Motosoto", "MulanPSL-1.0", "MulanPSL-2.0", "Multics", "Mup", "NAIST-2003", "NASA-1.3", "NBPL-1.0", "NCBI-PD", "NCGL-UK-2.0", "NCL", "NCSA", "NGPL", "NICTA-1.0", "NIST-PD", "NIST-PD-fallback", "NIST-Software", "NLOD-1.0", "NLOD-2.0", "NLPL", "NOSL", "NPL-1.0", "NPL-1.1", "NPOSL-3.0", "NRL", "NTIA-PD", "NTP", "NTP-0", "Naumen", "NetCDF", "Newsletr", "Nokia", "Noweb", "O-UDA-1.0", "OAR", "OCCT-PL", "OCLC-2.0", "ODC-By-1.0", "ODbL-1.0", "OFFIS", "OFL-1.0", "OFL-1.0-RFN", "OFL-1.0-no-RFN", "OFL-1.1", "OFL-1.1-RFN", "OFL-1.1-no-RFN", "OGC-1.0", "OGDL-Taiwan-1.0", "OGL-Canada-2.0", "OGL-UK-1.0", "OGL-UK-2.0", "OGL-UK-3.0", "OGTSL", "OLDAP-1.1", "OLDAP-1.2", "OLDAP-1.3", "OLDAP-1.4", "OLDAP-2.0", "OLDAP-2.0.1", "OLDAP-2.1", "OLDAP-2.2", "OLDAP-2.2.1", "OLDAP-2.2.2", "OLDAP-2.3", "OLDAP-2.4", "OLDAP-2.5", "OLDAP-2.6", "OLDAP-2.7", "OLDAP-2.8", "OLFL-1.3", "OML", "OPL-1.0", "OPL-UK-3.0", "OPUBL-1.0", "OSET-PL-2.1", "OSL-1.0", "OSL-1.1", "OSL-2.0", "OSL-2.1", "OSL-3.0", "OpenPBS-2.3", "OpenSSL", "OpenSSL-standalone", "OpenVision", "PADL", "PDDL-1.0", "PHP-3.0", "PHP-3.01", "PPL", "PSF-2.0", "Parity-6.0.0", "Parity-7.0.0", "Pixar", "Plexus", "PolyForm-Noncommercial-1.0.0", "PolyForm-Small-Business-1.0.0", "PostgreSQL", "Python-2.0", "Python-2.0.1", "QPL-1.0", "QPL-1.0-INRIA-2004", "Qhull", "RHeCos-1.1", "RPL-1.1", "RPL-1.5", "RPSL-1.0", "RSA-MD", "RSCPL", "Rdisc", "Ruby", "Ruby-pty", "SAX-PD", "SAX-PD-2.0", "SCEA", "SGI-B-1.0", "SGI-B-1.1", "SGI-B-2.0", "SGI-OpenGL", "SGP4", "SHL-0.5", "SHL-0.51", "SISSL", "SISSL-1.2", "SL", "SMAIL-GPL", "SMLNJ", "SMPPL", "SNIA", "SOFA", "SPL-1.0", "SSH-OpenSSH", "SSH-short", "SSLeay-standalone", "SSPL-1.0", "SUL-1.0", "SWL", "Saxpath", "SchemeReport", "Sendmail", "Sendmail-8.23", "Sendmail-Open-Source-1.1", "SimPL-2.0", "Sleepycat", "Soundex", "Spencer-86", "Spencer-94", "Spencer-99", "SugarCRM-1.1.3", "Sun-PPP", "Sun-PPP-2000", "SunPro", "Symlinks", "TAPR-OHL-1.0", "TCL", "TCP-wrappers", "TGPPL-1.0", "TMate", "TORQUE-1.1", "TOSL", "TPDL", "TPL-1.0", "TTWL", "TTYP0", "TU-Berlin-1.0", "TU-Berlin-2.0", "TermReadKey", "ThirdEye", "TrustedQSL", "UCAR", "UCL-1.0", "UMich-Merit", "UPL-1.0", "URT-RLE", "Ubuntu-font-1.0", "Unicode-3.0", "Unicode-DFS-2015", "Unicode-DFS-2016", "Unicode-TOU", "UnixCrypt", "Unlicense", "Unlicense-libtelnet", "Unlicense-libwhirlpool", "VOSTROM", "VSL-1.0", "Vim", "W3C", "W3C-19980720", "W3C-20150513", "WTFPL", "Watcom-1.0", "Widget-Workshop", "Wsuipa", "X11", "X11-distribute-modifications-variant", "X11-swapped", "XFree86-1.1", "XSkat", "Xdebug-1.03", "Xerox", "Xfig", "Xnet", "YPL-1.0", "YPL-1.1", "ZPL-1.1", "ZPL-2.0", "ZPL-2.1", "Zed", "Zeeff", "Zend-2.0", "Zimbra-1.3", "Zimbra-1.4", "Zlib", "any-OSI", "any-OSI-perl-modules", "bcrypt-Solar-Designer", "blessing", "bzip2-1.0.6", "check-cvs", "checkmk", "copyleft-next-0.3.0", "copyleft-next-0.3.1", "curl", "cve-tou", "diffmark", "dtoa", "dvipdfm", "eGenix", "etalab-2.0", "fwlw", "gSOAP-1.3b", "generic-xts", "gnuplot", "gtkbook", "hdparm", "iMatix", "jove", "libpng-1.6.35", "libpng-2.0", "libselinux-1.0", "libtiff", "libutil-David-Nugent", "lsof", "magaz", "mailprio", "man2html", "metamail", "mpi-permissive", "mpich2", "mplus", "ngrep", "pkgconf", "pnmstitch", "psfrag", "psutils", "python-ldap", "radvd", "snprintf", "softSurfer", "ssh-keyscan", "swrule", "threeparttable", "ulem", "w3m", "wwl", "xinetd", "xkeyboard-config-Zinoviev", "xlock", "xpp", "xzoom", "zlib-acknowledgement", "AGPL-1.0", "AGPL-3.0", "BSD-2-Clause-FreeBSD", "BSD-2-Clause-NetBSD", "GFDL-1.1", "GFDL-1.2", "GFDL-1.3", "GPL-1.0", "GPL-2.0", "GPL-2.0-with-GCC-exception", "GPL-2.0-with-autoconf-exception", "GPL-2.0-with-bison-exception", "GPL-2.0-with-classpath-exception", "GPL-2.0-with-font-exception", "GPL-3.0", "GPL-3.0-with-GCC-exception", "GPL-3.0-with-autoconf-exception", "LGPL-2.0", "LGPL-2.1", "LGPL-3.0", "Net-SNMP", "Nunit", "StandardML-NJ", "bzip2-1.0.5", "eCos-2.0", "wxWindows"]
+let EXCEPTION_IDS = ["389-exception", "Asterisk-exception", "Autoconf-exception-2.0", "Autoconf-exception-3.0", "Autoconf-exception-generic", "Autoconf-exception-generic-3.0", "Autoconf-exception-macro", "Bison-exception-1.24", "Bison-exception-2.2", "Bootloader-exception", "Classpath-exception-2.0", "CLISP-exception-2.0", "cryptsetup-OpenSSL-exception", "DigiRule-FOSS-exception", "eCos-exception-2.0", "Fawkes-Runtime-exception", "FLTK-exception", "fmt-exception", "Font-exception-2.0", "freertos-exception-2.0", "GCC-exception-2.0", "GCC-exception-2.0-note", "GCC-exception-3.1", "Gmsh-exception", "GNAT-exception", "GNOME-examples-exception", "GNU-compiler-exception", "gnu-javamail-exception", "GPL-3.0-interface-exception", "GPL-3.0-linking-exception", "GPL-3.0-linking-source-exception", "GPL-CC-1.0", "GStreamer-exception-2005", "GStreamer-exception-2008", "i2p-gpl-java-exception", "KiCad-libraries-exception", "LGPL-3.0-linking-exception", "libpri-OpenH323-exception", "Libtool-exception", "Linux-syscall-note", "LLGPL", "LLVM-exception", "LZMA-exception", "mif-exception", "OCaml-LGPL-linking-exception", "OCCT-exception-1.0", "OpenJDK-assembly-exception-1.0", "openvpn-openssl-exception", "PS-or-PDF-font-exception-20170817", "QPL-1.0-INRIA-2004-exception", "Qt-GPL-exception-1.0", "Qt-LGPL-exception-1.1", "Qwt-exception-1.0", "SANE-exception", "SHL-2.0", "SHL-2.1", "stunnel-exception", "SWI-exception", "Swift-exception", "Texinfo-exception", "u-boot-exception-2.0", "UBDL-exception", "Universal-FOSS-exception-1.0", "vsftpd-openssl-exception", "WxWindows-exception-3.1", "x11vnc-openssl-exception"]
+let TRANSPOSITIONS = [("GNU LESSER GENERAL PUBLIC LICENSE", "LGPL"), ("GNU Lesser General Public License", "LGPL"), ("GNU LESSER GENERAL PUBLIC LICENSE", "LGPL-2.1"), ("GNU Lesser General Public License", "LGPL-2.1"), ("LESSER GENERAL PUBLIC LICENSE", "LGPL"), ("Lesser General Public License", "LGPL"), ("LESSER GENERAL PUBLIC LICENSE", "LGPL-2.1"), ("Lesser General Public License", "LGPL-2.1"), ("Universal Permissive License", "UPL"), ("GNU General Public License", "GPL"), ("GNU GENERAL PUBLIC LICENSE", "GPL"), ("Mozilla Public License", "MPL"), ("Gnu public license", "GPL"), ("GNU Public License", "GPL"), (" International", ""), (" or later", "+"), ("-License", ""), ("GNU LGPL", "LGPL"), ("GNU GLP", "GPL"), ("GNU GPL", "GPL"), ("GNU/GPL", "GPL"), ("Cla\u{75}de", "Clause"), ("WTFGPL", "WTFPL"), ("APGL", "AGPL"), ("APL", "Apache"), ("GLP", "GPL"), ("GLP", "GPL"), ("GNU", "GPL"), ("Gpl", "GPL"), ("GUN", "GPL"), ("ISD", "ISC"), ("IST", "ISC"), ("MTI", "MIT"), ("WTH", "WTF"), ("+", "")]
+let LAST_RESORTS = [("MIT +NO-FALSE-ATTRIBS", "MITNFA"), ("Sendmail-Open-Source", "Sendmail-Open-Source-1.1"), ("LZMA-SDK-9.11-to", "LZMA-SDK-9.11-to-9.20"), ("Community-Spec", "Community-Spec-1.0"), ("CDLA-Sharing", "CDLA-Sharing-1.0"), ("Hippocratic", "Hippocratic-2.1"), ("LiLiQ-Rplus", "LiLiQ-Rplus-1.1"), ("OGDL-Taiwan", "OGDL-Taiwan-1.0"), ("Ubuntu-font", "Ubuntu-font-1.0"), ("CERN-OHL-P", "CERN-OHL-P-2.0"), ("CERN-OHL-S", "CERN-OHL-S-2.0"), ("CERN-OHL-W", "CERN-OHL-W-2.0"), ("DL-DE-ZERO", "DL-DE-ZERO-2.0"), ("libselinux", "libselinux-1.0"), ("OGL-Canada", "OGL-Canada-2.0"), ("3D-Slicer", "3D-Slicer-1.0"), ("Frameworx", "Frameworx-1.0"), ("Inner-Net", "Inner-Net-2.0"), ("Interbase", "Interbase-1.0"), ("2 CLAUSE", "BSD-2-Clause"), ("2-CLAUSE", "BSD-2-Clause"), ("3 CLAUSE", "BSD-3-Clause"), ("3-CLAUSE", "BSD-3-Clause"), ("ARTISTIC", "Artistic-2.0"), ("DL-DE-BY", "DL-DE-BY-2.0"), ("LZMA-SDK", "LZMA-SDK-9.22"), ("Sendmail", "Sendmail-8.23"), ("TAPR-OHL", "TAPR-OHL-1.0"), ("CUA-OPL", "CUA-OPL-1.0"), ("ECLIPSE", "EPL-1.0"), ("Elastic", "Elastic-2.0"), ("LiLiQ-P", "LiLiQ-P-1.1"), ("LiLiQ-R", "LiLiQ-R-1.1"), ("NCGL-UK", "NCGL-UK-2.0"), ("OpenPBS", "OpenPBS-2.3"), ("OSET-PL", "OSET-PL-2.1"), ("Unicode", "Unicode-3.0"), ("XFree86", "XFree86-1.1"), ("AFFERO", "AGPL-3.0-or-later"), ("Affero", "AGPL-3.0-or-later"), ("APACHE", "Apache-2.0"), ("CATOSL", "CATOSL-1.1"), ("CC-PDM", "CC-PDM-1.0"), ("Condor", "Condor-1.1"), ("etalab", "etalab-2.0"), ("JasPer", "JasPer-2.0"), ("libpng", "libpng-2.0"), ("ODC-By", "ODC-By-1.0"), ("OPL-UK", "OPL-UK-3.0"), ("Python", "Python-2.0"), ("RHeCos", "RHeCos-1.1"), ("SAX-PD", "SAX-PD-2.0"), ("TORQUE", "TORQUE-1.1"), ("Watcom", "Watcom-1.0"), ("Xdebug", "Xdebug-1.03"), ("BOOST", "BSL-1.0"), ("C-UDA", "C-UDA-1.0"), ("CC-SA", "CC-SA-1.0"), ("D-FSL", "D-FSL-1.0"), ("ErlPL", "ErlPL-1.1"), ("GPL-1", "GPL-1.0-only"), ("GPL-2", "GPL-2.0-only"), ("GPLV1", "GPL-1.0-only"), ("GPLV2", "GPL-2.0-only"), ("NICTA", "NICTA-1.0"), ("NPOSL", "NPOSL-3.0"), ("O-UDA", "O-UDA-1.0"), ("OPUBL", "OPUBL-1.0"), ("SimPL", "SimPL-2.0"), ("SISSL", "SISSL-1.2"), ("TGPPL", "TGPPL-1.0"), ("AGPL", "AGPL-3.0-or-later"), ("BEER", "Beerware"), ("BUSL", "BUSL-1.1"), ("CDDL", "CDDL-1.1"), ("COIL", "COIL-1.0"), ("CPAL", "CPAL-1.0"), ("CPOL", "CPOL-1.02"), ("FUCK", "WTFPL"), ("LGPL", "LGPL-3.0-or-later"), ("NASA", "NASA-1.3"), ("NBPL", "NBPL-1.0"), ("OCLC", "OCLC-2.0"), ("ODbL", "ODbL-1.0"), ("OLFL", "OLFL-1.3"), ("PDDL", "PDDL-1.0"), ("RPSL", "RPSL-1.0"), ("SSPL", "SSPL-1.0"), ("UNLI", "Unlicense"), ("Zend", "Zend-2.0"), ("ZLIB", "Zlib"), ("BSD", "BSD-2-Clause"), ("BSL", "BSL-1.0"), ("CAL", "CAL-1.0"), ("CC0", "CC0-1.0"), ("CDL", "CDL-1.0"), ("CPL", "CPL-1.0"), ("GNU", "GPL-3.0-or-later"), ("GPL", "GPL-3.0-or-later"), ("IPL", "IPL-1.0"), ("MIT", "MIT"), ("MPL", "MPL-2.0"), ("OGC", "OGC-1.0"), ("OPL", "OPL-1.0"), ("PSF", "PSF-2.0"), ("QPL", "QPL-1.0"), ("SPL", "SPL-1.0"), ("SUL", "SUL-1.0"), ("TPL", "TPL-1.0"), ("UCL", "UCL-1.0"), ("UPL", "UPL-1.0"), ("VSL", "VSL-1.0"), ("WTF", "WTFPL"), ("X11", "X11")]
+
+/// The lists, built once and passed down (a top-level list is rebuilt on
+/// every read).
+pub fn tables() -> SpdxTables {
+    return SpdxTables{ licenses: LICENSE_IDS, exceptions: EXCEPTION_IDS, transpositions: TRANSPOSITIONS, last_resorts: LAST_RESORTS }
+}
+
+// --- spdx-expression-parse 3.0.1 --------------------------------------------
+
+fn is_id_char(c: i64) -> bool {
+    return c >= 65 and c <= 90 or c >= 97 and c <= 122 or c >= 48 and c <= 57 or c == 45 or c == 46
+}
+
+type SpdxScanner = { c: [i64], at: i64 }
+
+fn starts_at(c: [i64], at: i64, s: str) -> bool {
+    let w = s.codes()
+    return at + w.len() <= c.len() and c.slice(at, at + w.len()) == w
+}
+
+/// `/[A-Za-z0-9-.]+/` matched against the rest of the text -- not
+/// anchored: the first run anywhere ahead, while the cursor moves on by
+/// the run's length from where it was.
+fn idstring(inout s: SpdxScanner) -> Option[str] {
+    var i = s.at
+    while i < s.c.len() and not is_id_char(s.c[i]) {
+        i = i + 1
+    }
+    if i >= s.c.len() {
+        return None
+    }
+    var e = i
+    while e < s.c.len() and is_id_char(s.c[e]) {
+        e = e + 1
+    }
+    s.at = s.at + (e - i)
+    return Some(s.c.slice(i, e).map(|x| x.to_char()).join(""))
+}
+
+fn next_token(t: SpdxTables, inout s: SpdxScanner) -> Option[SpdxToken] ! SpdxParseError {
+    for op in ["WITH", "AND", "OR", "(", ")", ":", "+"] {
+        if starts_at(s.c, s.at, op) {
+            s.at = s.at + op.len()
+            if op == "+" and s.at > 1 and s.c[s.at - 2] == 32 {
+                fail(SpdxParseFailed())
+            }
+            return Some(SpdxToken{ kind: "OPERATOR", text: op })
+        }
+    }
+    for (prefix, kind) in [("DocumentRef-", "DOCUMENTREF"), ("LicenseRef-", "LICENSEREF")] {
+        if starts_at(s.c, s.at, prefix) {
+            s.at = s.at + prefix.len()
+            let id = idstring(s) ?? fail(SpdxParseFailed())
+            return Some(SpdxToken{ kind: kind, text: id })
+        }
+    }
+    let begin = s.at
+    let id = match idstring(s) {
+        Some(x) -> x
+        None -> ""
+    }
+    if t.licenses.contains(id) {
+        return Some(SpdxToken{ kind: "LICENSE", text: id })
+    }
+    if t.exceptions.contains(id) {
+        return Some(SpdxToken{ kind: "EXCEPTION", text: id })
+    }
+    s.at = begin
+    return None
+}
+
+fn scan(t: SpdxTables, text: str) -> [SpdxToken] ! SpdxParseError {
+    var s = SpdxScanner{ c: text.codes(), at: 0 }
+    var out: [SpdxToken] = []
+    while s.at < s.c.len() {
+        while s.at < s.c.len() and s.c[s.at] == 32 {
+            s.at = s.at + 1
+        }
+        if s.at >= s.c.len() {
+            break
+        }
+        match try next_token(t, s) {
+            Some(tok) -> out.push(tok)
+            None -> fail(SpdxParseFailed())
+        }
+    }
+    return out
+}
+
+type SpdxParser = { toks: [SpdxToken], at: i64 }
+
+fn operator_is(inout p: SpdxParser, op: str) -> bool {
+    if p.at < p.toks.len() and p.toks[p.at].kind == "OPERATOR" and p.toks[p.at].text == op {
+        p.at = p.at + 1
+        return true
+    }
+    return false
+}
+
+/// Each parser returns whether it found something; a throw is `fail`.
+fn parse_license_ref(inout p: SpdxParser) -> bool ! SpdxParseError {
+    let begin = p.at
+    // `token().type` on no token is a TypeError.
+    if p.at >= p.toks.len() {
+        fail(SpdxParseFailed())
+    }
+    if p.toks[p.at].kind == "DOCUMENTREF" {
+        p.at = p.at + 1
+        if not operator_is(p, ":") {
+            fail(SpdxParseFailed())
+        }
+    }
+    if p.at >= p.toks.len() {
+        fail(SpdxParseFailed())
+    }
+    if p.toks[p.at].kind == "LICENSEREF" {
+        p.at = p.at + 1
+        return true
+    }
+    p.at = begin
+    return false
+}
+
+fn parse_license(inout p: SpdxParser) -> bool ! SpdxParseError {
+    if p.at < p.toks.len() and p.toks[p.at].kind == "LICENSE" {
+        p.at = p.at + 1
+        operator_is(p, "+")
+        if operator_is(p, "WITH") {
+            if p.at < p.toks.len() and p.toks[p.at].kind == "EXCEPTION" {
+                p.at = p.at + 1
+            } else {
+                fail(SpdxParseFailed())
+            }
+        }
+        return true
+    }
+    return false
+}
+
+/// `(expr)`; true only when the expression inside was something, though
+/// the parentheses are consumed either way.
+fn parse_paren(inout p: SpdxParser) -> bool ! SpdxParseError {
+    if not operator_is(p, "(") {
+        return false
+    }
+    let inner = try parse_binary(p, "OR")
+    if not operator_is(p, ")") {
+        fail(SpdxParseFailed())
+    }
+    return inner
+}
+
+fn parse_atom(inout p: SpdxParser) -> bool ! SpdxParseError {
+    if try parse_paren(p) {
+        return true
+    }
+    if try parse_license_ref(p) {
+        return true
+    }
+    return try parse_license(p)
+}
+
+fn parse_binary(inout p: SpdxParser, op: str) -> bool ! SpdxParseError {
+    let left = if op == "OR" { try parse_binary(p, "AND") } else { try parse_atom(p) }
+    if not left {
+        return false
+    }
+    if not operator_is(p, op) {
+        return true
+    }
+    if not (try parse_binary(p, op)) {
+        fail(SpdxParseFailed())
+    }
+    return true
+}
+
+/// Whether spdx-expression-parse accepts the text.
+pub fn valid(t: SpdxTables, text: str) -> bool {
+    let toks = match scan(t, text) {
+        Ok(x) -> x
+        Err(_e) -> return false
+    }
+    var p = SpdxParser{ toks: toks, at: 0 }
+    return match parse_binary(p, "OR") {
+        Ok(found) -> found and p.at >= p.toks.len()
+        Err(_e) -> false
+    }
+}
+
+// --- spdx-correct 3.2.0 -------------------------------------------------------
+
+fn text_of(c: [i64]) -> str {
+    return c.map(|x| x.to_char()).join("")
+}
+
+fn js_trim(s: str) -> str {
+    let c = s.codes()
+    var a = 0
+    var b = c.len()
+    while a < b and jsnumber.is_js_space(c[a]) {
+        a = a + 1
+    }
+    while b > a and jsnumber.is_js_space(c[b - 1]) {
+        b = b - 1
+    }
+    return text_of(c.slice(a, b))
+}
+
+fn is_digit(c: i64) -> bool {
+    return c >= 48 and c <= 57
+}
+
+fn is_word(c: i64) -> bool {
+    return c >= 65 and c <= 90 or c >= 97 and c <= 122 or is_digit(c) or c == 95
+}
+
+/// `s.replace(from, to)` with a string pattern: the first occurrence only.
+fn replace_first(s: str, from: str, to: str) -> str {
+    return match s.index_of(from) {
+        Some(i) -> s.substr(0, i) + to + s.substr(i + from.len(), s.len())
+        None -> s
+    }
+}
+
+/// Replaces the span [a, b) of `c`.
+fn splice(c: [i64], a: i64, b: i64, rep: str) -> str {
+    return text_of(c.slice(0, a)) + rep + text_of(c.slice(b, c.len()))
+}
+
+fn skip_ws(c: [i64], at: i64) -> i64 {
+    var i = at
+    while i < c.len() and jsnumber.is_js_space(c[i]) {
+        i = i + 1
+    }
+    return i
+}
+
+/// `/,?\s*(\d)/` -> the digit, given a template around it.
+fn comma_digit(s: str, before: str, after: str) -> str {
+    let c = s.codes()
+    for p in 0..c.len() {
+        let q = skip_ws(c, if c[p] == 44 { p + 1 } else { p })
+        if q < c.len() and is_digit(c[q]) {
+            return splice(c, p, q + 1, before + c[q].to_char() + after)
+        }
+    }
+    return s
+}
+
+/// `/,?\s*(V\.|v\.|V|v|Version|version)\s*(\d)/`
+fn version_digit(s: str, after: str) -> str {
+    let c = s.codes()
+    for p in 0..c.len() {
+        let q = skip_ws(c, if c[p] == 44 { p + 1 } else { p })
+        for alt in ["V.", "v.", "V", "v", "Version", "version"] {
+            if starts_at(c, q, alt) {
+                let r = skip_ws(c, q + alt.len())
+                if r < c.len() and is_digit(c[r]) {
+                    return splice(c, p, r + 1, "-" + c[r].to_char() + after)
+                }
+            }
+        }
+    }
+    return s
+}
+
+/// `/\s*V\s*(\d)/`
+fn big_v_digit(s: str) -> str {
+    let c = s.codes()
+    for p in 0..c.len() {
+        let q = skip_ws(c, p)
+        if q < c.len() and c[q] == 86 {
+            let r = skip_ws(c, q + 1)
+            if r < c.len() and is_digit(c[r]) {
+                return splice(c, p, r + 1, "-" + c[r].to_char())
+            }
+        }
+    }
+    return s
+}
+
+/// `/(\d)$/`
+fn last_digit(s: str, before: str, after: str) -> str {
+    let c = s.codes()
+    if c.len() > 0 and is_digit(c[c.len() - 1]) {
+        return splice(c, c.len() - 1, c.len(), before + c[c.len() - 1].to_char() + after)
+    }
+    return s
+}
+
+/// `/(-| )?(\d)$/` -> `-$2-Clause`
+fn clause_last(s: str) -> str {
+    let c = s.codes()
+    let n = c.len()
+    if n >= 2 and (c[n - 2] == 45 or c[n - 2] == 32) and is_digit(c[n - 1]) {
+        return splice(c, n - 2, n, "-" + c[n - 1].to_char() + "-Clause")
+    }
+    if n >= 1 and is_digit(c[n - 1]) {
+        return splice(c, n - 1, n, "-" + c[n - 1].to_char() + "-Clause")
+    }
+    return s
+}
+
+/// `/(-| )clause(-| )(\d)/` -> `-$3-Clause`
+fn clause_word(s: str) -> str {
+    let c = s.codes()
+    for p in 0..c.len() {
+        if (c[p] == 45 or c[p] == 32) and starts_at(c, p + 1, "clause") and p + 8 < c.len() and (c[p + 7] == 45 or c[p + 7] == 32) and is_digit(c[p + 8]) {
+            return splice(c, p, p + 9, "-" + c[p + 8].to_char() + "-Clause")
+        }
+    }
+    return s
+}
+
+fn lower(c: i64) -> i64 {
+    return if c >= 65 and c <= 90 { c + 32 } else { c }
+}
+
+/// An ASCII word, matched case-insensitively (`/i` without `u`).
+fn ci_at(c: [i64], at: i64, w: str) -> bool {
+    let x = w.codes()
+    if at + x.len() > c.len() {
+        return false
+    }
+    for i in 0..x.len() {
+        if lower(c[at + i]) != lower(x[i]) {
+            return false
+        }
+    }
+    return true
+}
+
+/// `/\b(A|B)(-| )?BSD((-| )License)?/i` -> template, `$1` the word as written.
+fn bsd(s: str, words: [str], template: str) -> str {
+    let c = s.codes()
+    for p in 0..c.len() {
+        if p > 0 and is_word(c[p - 1]) {
+            continue
+        }
+        for w in words {
+            if not ci_at(c, p, w) {
+                continue
+            }
+            let q = p + w.len()
+            let tries = if q < c.len() and (c[q] == 45 or c[q] == 32) { [q + 1, q] } else { [q] }
+            for q2 in tries {
+                if ci_at(c, q2, "BSD") {
+                    var r = q2 + 3
+                    if r < c.len() and (c[r] == 45 or c[r] == 32) and ci_at(c, r + 1, "License") {
+                        r = r + 8
+                    }
+                    return splice(c, p, r, template.replace("$1", text_of(c.slice(p, q))))
+                }
+            }
+        }
+    }
+    return s
+}
+
+/// `/ ?International/` -> ''
+fn drop_international(s: str) -> str {
+    let c = s.codes()
+    for p in 0..c.len() {
+        if c[p] == 32 and starts_at(c, p + 1, "International") {
+            return splice(c, p, p + 14, "")
+        }
+        if starts_at(c, p, "International") {
+            return splice(c, p, p + 13, "")
+        }
+    }
+    return s
+}
+
+/// `/ (\d)/` -> `-$1`
+fn space_digit(s: str) -> str {
+    let c = s.codes()
+    for p in 0..c.len() {
+        if c[p] == 32 and p + 1 < c.len() and is_digit(c[p + 1]) {
+            return splice(c, p, p + 2, "-" + c[p + 1].to_char())
+        }
+    }
+    return s
+}
+
+fn attribution(s: str) -> str {
+    return drop_international(space_digit(replace_first(replace_first(replace_first(s, "Attribution", "BY"), "NonCommercial", "NC"), "NoDerivatives", "ND")))
+}
+
+fn strip_dots(s: str) -> str {
+    return s.split(".").join("")
+}
+
+fn collapse_ws(s: str, rep: str) -> str {
+    let c = s.codes()
+    var out = ""
+    var i = 0
+    while i < c.len() {
+        if jsnumber.is_js_space(c[i]) {
+            i = skip_ws(c, i)
+            out = out + rep
+        } else {
+            out = out + c[i].to_char()
+            i = i + 1
+        }
+    }
+    return out
+}
+
+/// The first character upper-cased, as `s[0].toUpperCase()` does: one
+/// UTF-16 unit, so a character outside the BMP stays as it is.
+fn capitalize(s: str) -> Option[str] {
+    if s.len() == 0 {
+        return None
+    }
+    let first = s.substr(0, 1)
+    return Some((if first.code_at(0) > 65535 { first } else { first.to_upper() }) + s.substr(1, s.len()))
+}
+
+/// The k-th of the 27 rewrites; None where it throws.
+fn transform(k: i64, a: str) -> Option[str] {
+    let out = if k == 0 { a.to_upper() } else if k == 1 { js_trim(a) } else if k == 2 { strip_dots(a) } else if k == 3 { collapse_ws(a, "") }
+    else if k == 4 { collapse_ws(a, "-") } else if k == 5 { replace_first(a, "v", "-") } else if k == 6 { comma_digit(a, "-", "") }
+    else if k == 7 { comma_digit(a, "-", ".0") } else if k == 8 { version_digit(a, "") } else if k == 9 { version_digit(a, ".0") }
+    else if k == 10 { return capitalize(a) } else if k == 11 { replace_first(a, "/", "-") } else if k == 12 { last_digit(big_v_digit(a), "", ".0") }
+    else if k == 13 { a + if a.contains("3.0") { "-or-later" } else { "-only" } } else if k == 14 { a + "only" } else if k == 15 { last_digit(a, "-", ".0") }
+    else if k == 16 { clause_last(a) } else if k == 17 { clause_word(a) } else if k == 18 { bsd(a, ["Modified", "New", "Revised"], "BSD-3-Clause") }
+    else if k == 19 { bsd(a, ["Simplified"], "BSD-2-Clause") } else if k == 20 { bsd(a, ["Free", "Net"], "BSD-2-Clause-$1BSD") }
+    else if k == 21 { bsd(a, ["Clear"], "BSD-3-Clause-Clear") } else if k == 22 { bsd(a, ["Old", "Original"], "BSD-4-Clause") } else if k == 23 { "CC-" + a }
+    else if k == 24 { "CC-" + a + "-4.0" } else if k == 25 { attribution(a) } else { "CC-" + attribution(a) + "-4.0" }
+    return Some(out)
+}
+
+fn valid_transformation(t: SpdxTables, id: str) -> Option[str] ! SpdxCorrectError {
+    for k in 0..27 {
+        let raw = transform(k, id) ?? fail(SpdxTypeError("Cannot read properties of undefined (reading 'toUpperCase')"))
+        let out = js_trim(raw)
+        if out != id and valid(t, out) {
+            return Some(out)
+        }
+    }
+    return None
+}
+
+fn valid_last_resort(t: SpdxTables, id: str) -> Option[str] {
+    let up = id.to_upper()
+    for (sub, ident) in t.last_resorts {
+        if up.contains(sub) {
+            return Some(ident)
+        }
+    }
+    return None
+}
+
+/// Each misspelling found in the text, fixed once, then `check`ed: 0 is
+/// "valid, or a valid rewrite", 1 is "a substring guess".
+fn any_correction(t: SpdxTables, id: str, check: i64) -> Option[str] ! SpdxCorrectError {
+    for (wrong, right) in t.transpositions {
+        if id.contains(wrong) {
+            let fixed = replace_first(id, wrong, right)
+            let got = if check == 1 { valid_last_resort(t, fixed) } else if valid(t, fixed) { Some(fixed) } else { try valid_transformation(t, fixed) }
+            if got != None {
+                return got
+            }
+        }
+    }
+    return None
+}
+
+fn upgrade_gpls(v: str) -> str {
+    if ["GPL-1.0", "LGPL-1.0", "AGPL-1.0", "GPL-2.0", "LGPL-2.0", "AGPL-2.0", "LGPL-2.1"].contains(v) {
+        return v + "-only"
+    }
+    if ["GPL-1.0+", "GPL-2.0+", "GPL-3.0+", "LGPL-2.0+", "LGPL-2.1+", "LGPL-3.0+", "AGPL-1.0+", "AGPL-3.0+"].contains(v) {
+        return v.substr(0, v.len() - 1) + "-or-later"
+    }
+    if ["GPL-3.0", "LGPL-3.0", "AGPL-3.0"].contains(v) {
+        return v + "-or-later"
+    }
+    return v
+}
+
+fn finish(v: str, upgrade: bool) -> str {
+    return if upgrade { upgrade_gpls(v) } else { v }
+}
+
+/// What spdx-correct makes of a license text: an expression that parses,
+/// None when nothing fits, or the error it throws.
+pub fn correct(t: SpdxTables, identifier: str, upgrade: bool) -> Option[str] ! SpdxCorrectError {
+    let id = js_trim(identifier)
+    if id.len() == 0 {
+        fail(SpdxInvalidArgument())
+    }
+    if valid(t, id) {
+        return Some(finish(id, upgrade))
+    }
+    let no_plus = js_trim(if id.ends_with("+") { id.substr(0, id.len() - 1) } else { id })
+    if valid(t, no_plus) {
+        return Some(finish(no_plus, upgrade))
+    }
+    var found = try valid_transformation(t, id)
+    if found == None {
+        found = try any_correction(t, id, 0)
+    }
+    if found == None {
+        found = valid_last_resort(t, id)
+    }
+    if found == None {
+        found = try any_correction(t, id, 1)
+    }
+    return match found {
+        Some(v) -> Some(finish(v, upgrade))
+        None -> None
+    }
+}

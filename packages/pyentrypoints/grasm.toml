@@ -1,0 +1,4 @@
+[package]
+name = "pyentrypoints"
+version = "1.0.0"
+capabilities = []

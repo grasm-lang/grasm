@@ -260,6 +260,43 @@ becomes buildable the day its reference is installed.
 
 ## Landed
 
+- [x] **B46: what packages say about themselves, as npm and pip read it**
+  — `braceexpansion` `npmini` (npm's INI, `.npmrc`) `spdxcorrect`
+  `npminstallchecks` (engines, platforms, devEngines) `pickmanifest`
+  (npm-pick-manifest) `pyreqfile` (pip's requirements files)
+  `pyentrypoints` (`entry_points.txt`), and the harness `b46test`; the
+  new gate `b46diff` runs 112 cases (about 8,600 inputs) in 12 families
+  against npm's own copies of brace-expansion 2.0.2, ini 5.0.0,
+  spdx-correct 3.2.0 (with the spdx-expression-parse it carries),
+  npm-install-checks 7.1.2 and npm-pick-manifest 11.0.1, and against
+  pip 24.3's requirements-file parser and Python 3.13's
+  importlib.metadata. These are read as JavaScript and Python read them,
+  not as the formats' prose says: npm's INI hands quoted values to
+  `JSON.parse`, sorts integer keys first, writes into an array or a
+  string when a section is named like one, and throws where JavaScript
+  throws; spdx-expression-parse looks for the next identifier anywhere
+  ahead of its cursor; pick-manifest reads dates as V8 does (Feb 30 is
+  Mar 1); pip abbreviates long options as optparse does, names itself
+  `pip` in its errors, and shares one `--use-feature` list among every
+  line it parses (so a feature named once stays named), which is kept
+  because pip acts on it. The gate also checks that the tables the
+  packages carry (SPDX license and exception identifiers, spdx-correct's
+  rewrite lists in the order Node's `localeCompare` sorts them, Python's
+  `\w`) still match their sources. Left out, not copied: the brace
+  expansion minimatch 10.0 loads (@isaacs/brace-expansion 5.0.0) turns
+  a backslash before any character into a period, so `{a,b}\*` matches
+  `a.`; `braceexpansion` follows brace-expansion 2.0.2. One break per
+  package turned the gate red (spdx-correct's needed mutated real license
+  identifiers before its `v` rewrite was tested at all). Found on the
+  way, and fixed in the compiler: an incremental native build reused a
+  library's object compiled while one of its structs was boxed after an
+  edit to `main` made it a value struct, and the binary segfaulted until
+  `.grasm-cache` was deleted (the layout decisions are now part of the
+  cache key); and a pattern that binds a name and then fails on a later
+  part -- `(Some(x), Some(y))` against `(Some(s), None)`, or `P(x, R())`
+  against `P(s, Q())` -- leaked what it bound on every try. The count
+  reaches 1000.
+
 - [x] **B45: the files a toolchain leaves behind** — `dyldinfo` (rebase
   and bind opcodes, before chained fixups) `machobuild` (LC_BUILD_VERSION
   and LC_VERSION_MIN) `csreq` (code-signing requirements, compiled and
@@ -926,7 +963,7 @@ becomes buildable the day its reference is installed.
 | | |
 |---|---|
 | At the start | 669 |
-| Now | 992 |
+| Now | 1000 |
 | Candidates above | 316 packages in 28 batches, plus `ecc`, `rfc6979` and `goprintf` |
 | Harnesses, one a batch | 28 |
 | If every candidate lands | 1016 |

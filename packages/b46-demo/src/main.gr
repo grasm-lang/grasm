@@ -1,0 +1,75 @@
+// Seven readers of what packages say about themselves, each run once.
+// scripts/b46_diff.sh holds them to npm's own modules, pip and Python.
+import braceexpansion
+import npmini
+import spdxcorrect
+import npminstallchecks
+import pickmanifest
+import pyreqfile
+import pyentrypoints
+import nodesemver
+
+fn npm_side(r: NsRegexes) {
+    let globbed = braceexpansion.expand("src/\{a,b\}/file\{1..3\}.\{js,ts\}")
+    assert_eq(globbed.len(), 12)
+    assert_eq(globbed.slice(0, 4), ["src/a/file1.js", "src/a/file1.ts", "src/a/file2.js", "src/a/file2.ts"])
+    let npmrc = "; npmrc\nregistry = https://registry.example/\n[@scope]\nalways-auth = true\nca[] = one\nca[] = two\n"
+    assert_eq(npmini.decode(npmrc, true) ?? "", "\{\"registry\":\"https://registry.example/\",\"@scope\":\{\"always-auth\":true,\"ca\":[\"one\",\"two\"]\}\}")
+    let opts = IniOptions{ section: "", align: false, newline: false, sort: false, whitespace: true, windows: false, bracketed_array: true }
+    let written = npmini.encode("\{\"registry\":\"https://r/\",\"@scope\":\{\"token\":\"a;b\",\"list\":[\"x\",\"y\"]\}\}", opts) ?? ""
+    assert_eq(written, "registry = https://r/\n\n[@scope]\ntoken = a\\;b\nlist[] = x\nlist[] = y\n")
+    let t = spdxcorrect.tables()
+    assert_eq(["Apache 2", "GPLv3", "BSD 3 clause", "MIT License"].map(|x| (spdxcorrect.correct(t, x, true) ?? None) ?? "?"), ["Apache-2.0", "GPL-3.0-or-later", "BSD-3-Clause", "MIT"])
+    let needs18 = npminstallchecks.parse_json("\{\"engines\":\{\"node\":\">=18\"\}\}") ?? NicNull
+    let refused = match npminstallchecks.check_engine(r, needs18, None, Some("16.0.0"), false) {
+        Ok(_u) -> false
+        Err(_e) -> true
+    }
+    assert_eq(refused, true)
+    let packument = npminstallchecks.parse_json("\{\"name\":\"pkg\",\"versions\":\{\"1.0.0\":\{\"version\":\"1.0.0\"\},\"1.1.0\":\{\"version\":\"1.1.0\",\"bin\":\"cli.js\"," +
+        "\"name\":\"pkg\"\},\"2.0.0-beta.1\":\{\"version\":\"2.0.0-beta.1\"\}\},\"dist-tags\":\{\"latest\":\"1.1.0\",\"next\":\"2.0.0-beta.1\"\}\}") ?? NicNull
+    let o = PickOptions{ default_tag: "latest", before: None, node_version: "22.0.0", npm_version: None, include_staged: false, avoid: None, avoid_strict: false }
+    let picked = pickmanifest.pick(r, packument, Some("^1.0.0"), o) ?? panic("pick")
+    assert_eq(version_of(picked.manifest), "1.1.0")
+    assert_eq(version_of((pickmanifest.pick(r, packument, Some("next"), o) ?? panic("pick")).manifest), "2.0.0-beta.1")
+}
+
+fn version_of(m: NicValue) -> str {
+    return match m {
+        NicObj(keys, vals) -> {
+            var v = "?"
+            for i in 0..keys.len() {
+                if keys[i] == "version" {
+                    v = match vals[i] {
+                        NicStr(s) -> s
+                        _ -> "?"
+                    }
+                }
+            }
+            v
+        }
+        _ -> "?"
+    }
+}
+
+fn python_side() {
+    let files = [("/proj/requirements.txt", "requests>=2.31  # pinned below\n-r dev.txt\n--index-url https://pypi.example/simple\n"),
+        ("/proj/dev.txt", "pytest --hash=sha256:abc \\\n    --hash=sha256:def\n")]
+    let lines = pyreqfile.parse(files, "/proj/requirements.txt", false, []) ?? panic("requirements")
+    assert_eq(lines.map(|l| l.requirement), ["requests>=2.31", "pytest", ""])
+    assert_eq(lines[1].filename, "/proj/dev.txt")
+    assert_eq((lines[1].opts.hashes ?? [])[0].digests, ["abc", "def"])
+    assert_eq(lines[2].opts.index_url, Some("https://pypi.example/simple"))
+    let eps = pyentrypoints.parse("[console_scripts]\nblack = black:patched_main [d]\n\n[pytest11]\ncov = pytest_cov.plugin\n") ?? []
+    assert_eq(eps.map(|e| e.group + "/" + e.name), ["console_scripts/black", "pytest11/cov"])
+    let w = pyentrypoints.word_table()
+    let p = pyentrypoints.parts(w, eps[0].value) ?? panic("parts")
+    assert_eq((p.module, p.attr, p.extras), ("black", Some("patched_main"), ["d"]))
+    assert_eq(pyentrypoints.select(eps, Some("pytest11"), None).len(), 1)
+}
+
+fn main() / {io} {
+    npm_side(nodesemver.regexes())
+    python_side()
+    print("seven package readers exercised")
+}

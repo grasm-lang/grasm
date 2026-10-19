@@ -1,0 +1,290 @@
+// Brace expansion, as Bash does it and as npm's `brace-expansion` (and so
+// minimatch, glob and every tool built on them) copies it.
+//
+// `a{b,c}d` is `abd acd`; `{1..10..3}` is `1 4 7 10`; `{a..e}` counts
+// letters; `{01..10}` keeps the width the widest end has; nested sets
+// multiply out, left to right. The rules that are not obvious are the ones
+// that make it Bash's: a `{` with no comma and no `..` inside stays a
+// literal (`{a}` is `{a}`), unless a comma further on would close an outer
+// set (`{a},b}` is `{a} b`); `${...}` is a shell variable and is left
+// alone; a leading `{}` is two literal characters; a backslash keeps a
+// brace, a comma, a period or itself from counting; and at the top level an
+// expansion that came out empty is dropped, except from a sequence.
+//
+// This follows brace-expansion 2.0.2 and balanced-match 1.0.2 step for
+// step, the pairing of braces included: the innermost-first scan that pairs
+// `{` with `}` decides what `{a{b}c}d}` means. (@isaacs/brace-expansion
+// 5.0.0, the copy minimatch 10.0 loads, turns a backslash before any other
+// character into a period -- `{a,b}\*` gives `a.` and `b.` -- which is a
+// bug, and is not followed here.)
+//
+// A step of zero (`{1..5..0}`) would loop for ever there; here it counts
+// by one, as Bash does.
+
+fn sentinel(name: str) -> str {
+    // Characters no pattern holds by accident: a NUL, a name and a
+    // noncharacter, then a NUL.
+    return (0).to_char() + name + (1114110).to_char() + (0).to_char()
+}
+
+/// `s.indexOf(t, from)`: the first `t` at or after `from`, or -1.
+fn index_from(s: str, t: str, from: i64) -> i64 {
+    let start = if from < 0 { 0 } else { from }
+    if start > s.len() {
+        return 0 - 1
+    }
+    return match s.substr(start, s.len()).index_of(t) {
+        Some(i) -> i + start
+        None -> 0 - 1
+    }
+}
+
+fn index_of(s: str, t: str) -> i64 {
+    return index_from(s, t, 0)
+}
+
+/// balanced-match's `range`: where the first balanced `{...}` starts and
+/// ends, scanning so that a run of opens pairs innermost first.
+fn range(s: str) -> Option[(i64, i64)] {
+    var ai = index_of(s, "\{")
+    var bi = index_from(s, "\}", ai + 1)
+    var i = ai
+    if ai < 0 or bi <= 0 {
+        return None
+    }
+    var begs: [i64] = []
+    var left = s.len()
+    var right = 0 - 1
+    while i >= 0 {
+        if i == ai {
+            begs.push(i)
+            ai = index_from(s, "\{", i + 1)
+        } else if begs.len() == 1 {
+            return Some((begs[0], bi))
+        } else {
+            let beg = begs[begs.len() - 1]
+            begs = begs.slice(0, begs.len() - 1)
+            if beg < left {
+                left = beg
+                right = bi
+            }
+            bi = index_from(s, "\}", i + 1)
+        }
+        i = if ai < bi and ai >= 0 { ai } else { bi }
+    }
+    if begs.len() > 0 and right >= 0 {
+        return Some((left, right))
+    }
+    return None
+}
+
+type Balanced = { pre: str, body: str, post: str }
+
+fn balanced(s: str) -> Option[Balanced] {
+    let (a, b) = match range(s) {
+        Some(r) -> r
+        None -> return None
+    }
+    return Some(Balanced{ pre: s.substr(0, a), body: s.substr(a + 1, b - a - 1), post: s.substr(b + 1, s.len()) })
+}
+
+fn escape_braces(s: str, marks: [str]) -> str {
+    return s.split("\\\\").join(marks[0]).split("\\\{").join(marks[1]).split("\\\}").join(marks[2]).split("\\,").join(marks[3]).split("\\.").join(marks[4])
+}
+
+fn unescape_braces(s: str, marks: [str]) -> str {
+    return s.split(marks[0]).join("\\").split(marks[1]).join("\{").split(marks[2]).join("\}").split(marks[3]).join(",").split(marks[4]).join(".")
+}
+
+/// `{a,{b,c},d}`'s members: a split on commas that keeps nested sets whole.
+fn comma_parts(s: str) -> [str] {
+    if s.len() == 0 {
+        return [""]
+    }
+    let m = match balanced(s) {
+        Some(x) -> x
+        None -> return s.split(",")
+    }
+    var p = m.pre.split(",")
+    p[p.len() - 1] = p[p.len() - 1] + "\{" + m.body + "\}"
+    let post = comma_parts(m.post)
+    if m.post.len() > 0 {
+        p[p.len() - 1] = p[p.len() - 1] + post[0]
+        p = p + post.slice(1, post.len())
+    }
+    return p
+}
+
+fn is_digits(s: str) -> bool {
+    if s.len() == 0 {
+        return false
+    }
+    for c in s.codes() {
+        if c < 48 or c > 57 {
+            return false
+        }
+    }
+    return true
+}
+
+/// `-?\d+`
+fn is_int(s: str) -> bool {
+    return is_digits(if s.starts_with("-") { s.substr(1, s.len()) } else { s })
+}
+
+fn is_letter(s: str) -> bool {
+    if s.len() != 1 {
+        return false
+    }
+    let c = s.code_at(0)
+    return c >= 65 and c <= 90 or c >= 97 and c <= 122
+}
+
+/// `/^-?\d+\.\.-?\d+(?:\.\.-?\d+)?$/` and its letter twin.
+fn sequence_kind(body: str) -> i64 {
+    let parts = body.split("..")
+    if parts.len() != 2 and parts.len() != 3 {
+        return 0
+    }
+    if parts.len() == 3 and not is_int(parts[2]) {
+        return 0
+    }
+    if is_int(parts[0]) and is_int(parts[1]) {
+        return 1
+    }
+    if is_letter(parts[0]) and is_letter(parts[1]) {
+        return 2
+    }
+    return 0
+}
+
+/// `parseInt(s, 10)`, which the sequence's own pattern keeps exact here.
+fn int_of(s: str) -> i64 {
+    let neg = s.starts_with("-")
+    var v = 0
+    for c in (if neg { s.substr(1, s.len()) } else { s }).codes() {
+        v = v * 10 + c - 48
+    }
+    return if neg { 0 - v } else { v }
+}
+
+/// `/^-?0\d/`
+fn is_padded(s: str) -> bool {
+    let t = if s.starts_with("-") { s.substr(1, s.len()) } else { s }
+    return t.len() >= 2 and t.code_at(0) == 48 and t.code_at(1) >= 48 and t.code_at(1) <= 57
+}
+
+fn sequence(n: [str], alpha: bool) -> [str] {
+    let x = if alpha { n[0].code_at(0) } else { int_of(n[0]) }
+    let y = if alpha { n[1].code_at(0) } else { int_of(n[1]) }
+    let width = if n[0].len() > n[1].len() { n[0].len() } else { n[1].len() }
+    var incr = if n.len() == 3 { int_of(n[2]) } else { 1 }
+    if incr < 0 {
+        incr = 0 - incr
+    }
+    if incr == 0 {
+        incr = 1
+    }
+    let reverse = y < x
+    let pad = is_padded(n[0]) or is_padded(n[1]) or n.len() == 3 and is_padded(n[2])
+    var out: [str] = []
+    var i = x
+    while if reverse { i >= y } else { i <= y } {
+        if alpha {
+            out.push(if i == 92 { "" } else { i.to_char() })
+        } else {
+            var c = "{i}"
+            let need = width - c.len()
+            if pad and need > 0 {
+                c = if i < 0 { "-" + "0".repeat(need) + c.substr(1, c.len()) } else { "0".repeat(need) + c }
+            }
+            out.push(c)
+        }
+        i = if reverse { i - incr } else { i + incr }
+    }
+    return out
+}
+
+fn is_line_end(c: i64) -> bool {
+    return c == 10 or c == 13 or c == 8232 or c == 8233
+}
+
+/// `/,.*\}/`: a comma, and after it on the same line a closing brace.
+fn comma_then_close(s: str) -> bool {
+    var seen = false
+    for c in s.codes() {
+        if is_line_end(c) {
+            seen = false
+        } else if c == 44 {
+            seen = true
+        } else if c == 125 and seen {
+            return true
+        }
+    }
+    return false
+}
+
+fn expand_(s: str, top: bool, marks: [str]) -> [str] {
+    let m = match balanced(s) {
+        Some(x) -> x
+        None -> return [s]
+    }
+    let post = if m.post.len() > 0 { expand_(m.post, false, marks) } else { [""] }
+    var out: [str] = []
+    if m.pre.ends_with("$") {
+        for p in post {
+            out.push(m.pre + "\{" + m.body + "\}" + p)
+        }
+        return out
+    }
+    let kind = sequence_kind(m.body)
+    let options = m.body.contains(",")
+    if kind == 0 and not options {
+        if comma_then_close(m.post) {
+            return expand_(m.pre + "\{" + m.body + marks[2] + m.post, false, marks)
+        }
+        return [s]
+    }
+    var items: [str] = []
+    if kind != 0 {
+        items = sequence(m.body.split(".."), kind == 2)
+    } else {
+        let n = comma_parts(m.body)
+        if n.len() == 1 {
+            let inner = expand_(n[0], false, marks).map(|x| "\{" + x + "\}")
+            if inner.len() == 1 {
+                return post.map(|p| m.pre + inner[0] + p)
+            }
+            for x in inner {
+                for y in expand_(x, false, marks) {
+                    items.push(y)
+                }
+            }
+        } else {
+            for x in n {
+                for y in expand_(x, false, marks) {
+                    items.push(y)
+                }
+            }
+        }
+    }
+    for it in items {
+        for p in post {
+            let e = m.pre + it + p
+            if not top or kind != 0 or e.len() > 0 {
+                out.push(e)
+            }
+        }
+    }
+    return out
+}
+
+/// Every word a pattern expands to, in Bash's order.
+pub fn expand(pattern: str) -> [str] {
+    if pattern.len() == 0 {
+        return []
+    }
+    let marks = ["SLASH", "OPEN", "CLOSE", "COMMA", "PERIOD"].map(|n| sentinel(n))
+    let s = if pattern.starts_with("\{\}") { "\\\{\\\}" + pattern.substr(2, pattern.len()) } else { pattern }
+    return expand_(escape_braces(s, marks), true, marks).map(|x| unescape_braces(x, marks))
+}

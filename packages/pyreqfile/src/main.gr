@@ -1,0 +1,651 @@
+// pip's requirements files: `requirements.txt` and `constraints.txt`.
+//
+// Each line is a requirement (`requests>=2.31 ; python_version >= "3.8"`,
+// a URL, a path), an editable one (`-e ./src`), or options -- an index
+// (`-i`, `--extra-index-url`, `--no-index`), `-f` links, binary policy
+// (`--no-binary`, `--only-binary`, `--prefer-binary`), `--pre`,
+// `--require-hashes`, `--trusted-host`, `--use-feature`, another file to
+// read in its place (`-r`, or `-c` for constraints). A requirement may
+// carry `--hash`, `--global-option` and `--config-settings`. Before that,
+// pip reads the file its own way: lines split as Python's `splitlines`
+// does, a backslash at the end joins the next line (not after a comment),
+// `#` after white space starts a comment, `${NAME}` (upper case, digits,
+// underscore) is replaced from the environment when set and not empty,
+// and the line is cut at the first word that starts with `-` -- the words
+// before it are the requirement, untouched, and the rest is split as a
+// shell would and parsed as pip's command line parses it, abbreviations
+// (`--ext` for `--extra-index-url`) and all.
+//
+// This follows pip 24.3's req_file.py with Python 3.13's optparse and
+// shlex. Files are given as text (decoding them is the caller's), by
+// absolute path; a nested file is found by joining its name to the
+// directory of the file naming it, and one that names itself, however
+// indirectly, is refused. Error messages are pip's, as `pip` prints them
+// (optparse names the program after argv[0], here `pip`). One quirk is
+// kept because pip acts on it: `--use-feature` appends to a list every
+// line shares, so a feature named once stays named on each line after.
+import shlex
+
+type ReqHashes = { algo: str, digests: [str] }
+
+type ReqSetting = { key: str, values: [str] }
+
+/// The options a line set, with pip's defaults where it set none.
+type ReqOptions = {
+    index_url: Option[str],
+    extra_index_urls: [str],
+    no_index: bool,
+    constraints: [str],
+    requirements: [str],
+    editables: [str],
+    find_links: [str],
+    no_binary: [str],
+    only_binary: [str],
+    prefer_binary: bool,
+    require_hashes: bool,
+    pre: bool,
+    trusted_hosts: [str],
+    features_enabled: [str],
+    global_options: Option[[str]],
+    hashes: Option[[ReqHashes]],
+    config_settings: Option[[ReqSetting]],
+}
+
+type ReqLine = { filename: str, lineno: i64, constraint: bool, is_requirement: bool, is_editable: bool, requirement: str, opts: ReqOptions }
+
+type ReqFileError =
+    | ReqParseError(msg: str)
+    | ReqInstallationError(msg: str)
+    | ReqCommandError(msg: str)
+    | ReqUnsupportedUrl(url: str)
+
+/// What an option line or the parser threw.
+type ReqOptError =
+    | OptParse(msg: str)
+    | OptCommand(msg: str)
+
+// --- Python's text rules ------------------------------------------------------
+
+/// `str.isspace()`, which is also `\s` in a `str` pattern.
+fn py_space(c: i64) -> bool {
+    return c >= 9 and c <= 13 or c >= 28 and c <= 32 or c == 133 or c == 160 or c == 5760 or c >= 8192 and c <= 8202 or c == 8232 or c == 8233 or c == 8239 or
+    c == 8287 or c == 12288
+}
+
+fn text_of(c: [i64]) -> str {
+    return c.map(|x| x.to_char()).join("")
+}
+
+fn py_strip(s: str) -> str {
+    let c = s.codes()
+    var a = 0
+    var b = c.len()
+    while a < b and py_space(c[a]) {
+        a = a + 1
+    }
+    while b > a and py_space(c[b - 1]) {
+        b = b - 1
+    }
+    return text_of(c.slice(a, b))
+}
+
+/// `str.splitlines()`
+fn split_lines(s: str) -> [str] {
+    let c = s.codes()
+    var out: [str] = []
+    var start = 0
+    var i = 0
+    while i < c.len() {
+        let x = c[i]
+        if x == 10 or x == 11 or x == 12 or x == 13 or x == 28 or x == 29 or x == 30 or x == 133 or x == 8232 or x == 8233 {
+            out.push(text_of(c.slice(start, i)))
+            if x == 13 and i + 1 < c.len() and c[i + 1] == 10 {
+                i = i + 1
+            }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    if start < c.len() {
+        out.push(text_of(c.slice(start, c.len())))
+    }
+    return out
+}
+
+/// Where `(^|\s+)#.*$` matches, if it does.
+fn comment_at(s: str) -> Option[i64] {
+    let c = s.codes()
+    for q in 0..c.len() {
+        if c[q] != 35 {
+            continue
+        }
+        if q == 0 {
+            return Some(0)
+        }
+        if py_space(c[q - 1]) {
+            var p = q - 1
+            while p > 0 and py_space(c[p - 1]) {
+                p = p - 1
+            }
+            return Some(p)
+        }
+    }
+    return None
+}
+
+/// `repr()` of a string, for the messages that quote one.
+fn py_repr(s: str) -> str {
+    let quote = if s.contains("'") and not s.contains("\"") { "\"" } else { "'" }
+    var out = quote
+    for c in s.codes() {
+        out = out + if c == 92 { "\\\\" } else if c == 10 { "\\n" } else if c == 13 { "\\r" } else if c == 9 { "\\t" } else if c.to_char() == quote { "\\" + quote }
+        else if c < 32 or c >= 127 and c <= 160 { "\\x" + "0123456789abcdef".substr(c.ushr(4), 1) + "0123456789abcdef".substr(c.bit_and(15), 1) } else { c.to_char() }
+    }
+    return out + quote
+}
+
+// --- reading a file into lines -------------------------------------------------------
+
+/// Lines with their numbers, joined, stripped of comments, and with the
+/// environment's `${NAME}` substituted.
+fn preprocess(content: str, env: [(str, str)]) -> [(i64, str)] {
+    var joined: [(i64, str)] = []
+    var primary = 0
+    var parts: [str] = []
+    let lines = split_lines(content)
+    for n in 0..lines.len() {
+        var line = lines[n]
+        let commented = comment_at(line) == Some(0) or match comment_at(line) {
+            Some(p) -> line.substr(0, p).codes().filter(|c| not py_space(c)).len() == 0
+            None -> false
+        }
+        if not line.ends_with("\\") or commented {
+            if commented {
+                line = " " + line
+            }
+            if parts.len() > 0 {
+                parts.push(line)
+                joined.push((primary, parts.join("")))
+                parts = []
+            } else {
+                joined.push((n + 1, line))
+            }
+        } else {
+            if parts.len() == 0 {
+                primary = n + 1
+            }
+            parts.push(strip_backslashes(line))
+        }
+    }
+    if parts.len() > 0 {
+        joined.push((primary, parts.join("")))
+    }
+    var out: [(i64, str)] = []
+    for (n, raw) in joined {
+        let cut = match comment_at(raw) {
+            Some(p) -> raw.substr(0, p)
+            None -> raw
+        }
+        let line = py_strip(cut)
+        if line.len() > 0 {
+            out.push((n, expand_env(line, env)))
+        }
+    }
+    return out
+}
+
+fn strip_backslashes(s: str) -> str {
+    let c = s.codes()
+    var a = 0
+    var b = c.len()
+    while a < b and c[a] == 92 {
+        a = a + 1
+    }
+    while b > a and c[b - 1] == 92 {
+        b = b - 1
+    }
+    return text_of(c.slice(a, b))
+}
+
+/// Every `${NAME}` in the line (found before any is replaced), each
+/// replaced everywhere when the environment has it and it is not empty.
+fn expand_env(line: str, env: [(str, str)]) -> str {
+    let c = line.codes()
+    var found: [str] = []
+    var i = 0
+    while i + 3 < c.len() + 1 {
+        if c[i] == 36 and i + 1 < c.len() and c[i + 1] == 123 {
+            var j = i + 2
+            while j < c.len() and (c[j] >= 65 and c[j] <= 90 or c[j] >= 48 and c[j] <= 57 or c[j] == 95) {
+                j = j + 1
+            }
+            if j > i + 2 and j < c.len() and c[j] == 125 {
+                found.push(text_of(c.slice(i + 2, j)))
+                i = j + 1
+                continue
+            }
+        }
+        i = i + 1
+    }
+    var out = line
+    for name in found {
+        for (k, v) in env {
+            if k == name and v.len() > 0 {
+                out = out.split("$\{" + name + "\}").join(v)
+            }
+        }
+    }
+    return out
+}
+
+/// The words before the first that starts with `-`, and the rest.
+fn break_args_options(line: str) -> (str, str) {
+    let tokens = line.split(" ")
+    var args: [str] = []
+    var i = 0
+    while i < tokens.len() and not tokens[i].starts_with("-") {
+        args.push(tokens[i])
+        i = i + 1
+    }
+    return (args.join(" "), tokens.slice(i, tokens.len()).join(" "))
+}
+
+// --- optparse, with pip's options ---------------------------------------------------------
+
+/// One option: its names, where it stores, and how.
+type PipOption = { short: str, longs: [str], dest: str, action: str }
+
+fn pip_options() -> [PipOption] {
+    return [
+        PipOption{ short: "-i", longs: ["--index-url", "--pypi-url"], dest: "index_url", action: "store" },
+        PipOption{ short: "", longs: ["--extra-index-url"], dest: "extra_index_urls", action: "append" },
+        PipOption{ short: "", longs: ["--no-index"], dest: "no_index", action: "store_true" },
+        PipOption{ short: "-c", longs: ["--constraint"], dest: "constraints", action: "append" },
+        PipOption{ short: "-r", longs: ["--requirement"], dest: "requirements", action: "append" },
+        PipOption{ short: "-e", longs: ["--editable"], dest: "editables", action: "append" },
+        PipOption{ short: "-f", longs: ["--find-links"], dest: "find_links", action: "append" },
+        PipOption{ short: "", longs: ["--no-binary"], dest: "no_binary", action: "callback" },
+        PipOption{ short: "", longs: ["--only-binary"], dest: "only_binary", action: "callback" },
+        PipOption{ short: "", longs: ["--prefer-binary"], dest: "prefer_binary", action: "store_true" },
+        PipOption{ short: "", longs: ["--require-hashes"], dest: "require_hashes", action: "store_true" },
+        PipOption{ short: "", longs: ["--pre"], dest: "pre", action: "store_true" },
+        PipOption{ short: "", longs: ["--trusted-host"], dest: "trusted_hosts", action: "append" },
+        PipOption{ short: "", longs: ["--use-feature"], dest: "features_enabled", action: "append" },
+        PipOption{ short: "", longs: ["--global-option"], dest: "global_options", action: "append" },
+        PipOption{ short: "", longs: ["--hash"], dest: "hashes", action: "callback" },
+        PipOption{ short: "-C", longs: ["--config-settings"], dest: "config_settings", action: "callback" },
+    ]
+}
+
+/// pip's `--use-feature` keeps its default list in the option factory, so
+/// every parser shares it: `features` is what earlier lines appended.
+fn fresh_options(features: [str]) -> ReqOptions {
+    return ReqOptions{ index_url: None, extra_index_urls: [], no_index: false, constraints: [], requirements: [], editables: [], find_links: [], no_binary: [],
+        only_binary: [], prefer_binary: false, require_hashes: false, pre: false, trusted_hosts: [], features_enabled: features, global_options: None, hashes: None,
+        config_settings: None }
+}
+
+fn opt_error(msg: str) -> ReqOptError {
+    return OptParse("pip: error: " + msg + "\n")
+}
+
+/// packaging's canonicalize_name: runs of `-_.` to one `-`, lower case.
+fn canonical(name: str) -> str {
+    var out = ""
+    var run = false
+    for c in name.chars() {
+        if c == "-" or c == "_" or c == "." {
+            if not run {
+                out = out + "-"
+            }
+            run = true
+        } else {
+            out = out + c
+            run = false
+        }
+    }
+    return out.to_lower()
+}
+
+fn add_name(xs: [str], name: str) -> [str] {
+    return if xs.contains(name) { xs } else { xs + [name] }
+}
+
+/// FormatControl.handle_mutual_excludes: `target` gains, `other` loses.
+fn mutual_excludes(value: str, target0: [str], other0: [str]) -> ([str], [str]) ! ReqOptError {
+    if value.starts_with("-") {
+        fail(OptCommand("--no-binary / --only-binary option requires 1 argument."))
+    }
+    var target = target0
+    var other = other0
+    var names = value.split(",")
+    while names.contains(":all:") {
+        other = []
+        target = [":all:"]
+        var k = 0
+        while names[k] != ":all:" {
+            k = k + 1
+        }
+        names = names.slice(k + 1, names.len())
+        if not names.contains(":none:") {
+            return (target, other)
+        }
+    }
+    for name in names {
+        if name == ":none:" {
+            target = []
+            continue
+        }
+        let n = canonical(name)
+        other = other.filter(|x| x != n)
+        target = add_name(target, n)
+    }
+    return (target, other)
+}
+
+fn take_action(inout v: ReqOptions, o: PipOption, opt: str, value: str) -> () ! ReqOptError {
+    let d = o.dest
+    if d == "index_url" {
+        v.index_url = Some(value)
+    } else if d == "extra_index_urls" {
+        v.extra_index_urls.push(value)
+    } else if d == "constraints" {
+        v.constraints.push(value)
+    } else if d == "requirements" {
+        v.requirements.push(value)
+    } else if d == "editables" {
+        v.editables.push(value)
+    } else if d == "find_links" {
+        v.find_links.push(value)
+    } else if d == "trusted_hosts" {
+        v.trusted_hosts.push(value)
+    } else if d == "features_enabled" {
+        let choices = ["fast-deps", "truststore", "no-binary-enable-wheel-cache"]
+        if not choices.contains(value) {
+            fail(opt_error("option " + opt + ": invalid choice: " + py_repr(value) + " (choose from " + choices.map(|c| py_repr(c)).join(", ") + ")"))
+        }
+        v.features_enabled.push(value)
+    } else if d == "global_options" {
+        v.global_options = Some((v.global_options ?? []) + [value])
+    } else if d == "no_binary" {
+        let (t, o2) = try mutual_excludes(value, v.no_binary, v.only_binary)
+        v.no_binary = t
+        v.only_binary = o2
+    } else if d == "only_binary" {
+        let (t, o2) = try mutual_excludes(value, v.only_binary, v.no_binary)
+        v.only_binary = t
+        v.no_binary = o2
+    } else if d == "hashes" {
+        try merge_hash(v, opt, value)
+    } else if d == "config_settings" {
+        try config_setting(v, opt, value)
+    }
+    return ()
+}
+
+fn merge_hash(inout v: ReqOptions, opt: str, value: str) -> () ! ReqOptError {
+    var hs = v.hashes ?? []
+    v.hashes = Some(hs)
+    let i = match value.index_of(":") {
+        Some(x) -> x
+        None -> fail(opt_error("Arguments to " + opt + " must be a hash name followed by a value, like --hash=sha256:abcde..."))
+    }
+    let algo = value.substr(0, i)
+    let digest = value.substr(i + 1, value.len())
+    if not ["sha256", "sha384", "sha512"].contains(algo) {
+        fail(opt_error("Allowed hash algorithms for " + opt + " are sha256, sha384, sha512."))
+    }
+    var found = false
+    for k in 0..hs.len() {
+        if hs[k].algo == algo {
+            hs[k].digests.push(digest)
+            found = true
+        }
+    }
+    if not found {
+        hs.push(ReqHashes{ algo: algo, digests: [digest] })
+    }
+    v.hashes = Some(hs)
+    return ()
+}
+
+fn config_setting(inout v: ReqOptions, opt: str, value: str) -> () ! ReqOptError {
+    let i = match value.index_of("=") {
+        Some(x) -> x
+        None -> fail(opt_error("Arguments to " + opt + " must be of the form KEY=VAL"))
+    }
+    let key = value.substr(0, i)
+    let val = value.substr(i + 1, value.len())
+    var cs = v.config_settings ?? []
+    var found = false
+    for k in 0..cs.len() {
+        if cs[k].key == key {
+            cs[k].values.push(val)
+            found = true
+        }
+    }
+    if not found {
+        cs.push(ReqSetting{ key: key, values: [val] })
+    }
+    v.config_settings = Some(cs)
+    return ()
+}
+
+/// `_match_abbrev`: an exact long option, or the one it is a prefix of.
+fn match_long(opts: [PipOption], s: str) -> (PipOption, str) ! ReqOptError {
+    var names: [(str, PipOption)] = []
+    for o in opts {
+        for l in o.longs {
+            names.push((l, o))
+        }
+    }
+    for (n, o) in names {
+        if n == s {
+            return (o, n)
+        }
+    }
+    let hits = names.filter(|x| x.0.starts_with(s))
+    if hits.len() == 1 {
+        return (hits[0].1, hits[0].0)
+    }
+    if hits.len() == 0 {
+        fail(opt_error("no such option: " + s))
+    }
+    var words = hits.map(|x| x.0)
+    words.sort()
+    fail(opt_error("ambiguous option: " + s + " (" + words.join(", ") + "?)"))
+}
+
+fn takes_value(o: PipOption) -> bool {
+    return o.action != "store_true"
+}
+
+/// optparse's parse_args over pip's options; positional words are dropped,
+/// as pip drops them.
+fn parse_options(args0: [str], features: [str]) -> ReqOptions ! ReqOptError {
+    let opts = pip_options()
+    var v = fresh_options(features)
+    var rargs = args0
+    while rargs.len() > 0 {
+        let arg = rargs[0]
+        rargs = rargs.slice(1, rargs.len())
+        if arg == "--" {
+            break
+        }
+        if arg.starts_with("--") {
+            var name = arg
+            var explicit = false
+            match arg.index_of("=") {
+                Some(i) -> {
+                    name = arg.substr(0, i)
+                    rargs = [arg.substr(i + 1, arg.len())] + rargs
+                    explicit = true
+                }
+                None -> ()
+            }
+            let (o, full) = try match_long(opts, name)
+            if takes_value(o) {
+                if rargs.len() < 1 {
+                    fail(opt_error(full + " option requires 1 argument"))
+                }
+                let value = rargs[0]
+                rargs = rargs.slice(1, rargs.len())
+                try take_action(v, o, full, value)
+            } else if explicit {
+                fail(opt_error(full + " option does not take a value"))
+            } else {
+                try store_true(v, o.dest)
+            }
+        } else if arg.starts_with("-") and arg.len() > 1 {
+            let ch = arg.substr(1, 1)
+            let hits = opts.filter(|x| x.short == "-" + ch)
+            if hits.len() == 0 {
+                fail(opt_error("no such option: -" + ch))
+            }
+            // Every short option pip has takes a value: the rest of the word,
+            // or the next word.
+            if arg.len() > 2 {
+                rargs = [arg.substr(2, arg.len())] + rargs
+            }
+            if rargs.len() < 1 {
+                fail(opt_error("-" + ch + " option requires 1 argument"))
+            }
+            let value = rargs[0]
+            rargs = rargs.slice(1, rargs.len())
+            try take_action(v, hits[0], "-" + ch, value)
+        }
+    }
+    return v
+}
+
+fn store_true(inout v: ReqOptions, dest: str) -> () ! ReqOptError {
+    if dest == "no_index" {
+        v.no_index = true
+    } else if dest == "prefer_binary" {
+        v.prefer_binary = true
+    } else if dest == "require_hashes" {
+        v.require_hashes = true
+    } else if dest == "pre" {
+        v.pre = true
+    }
+    return ()
+}
+
+// --- files -----------------------------------------------------------------------------------
+
+/// `^(http|https|file):`, any case.
+fn has_scheme(s: str) -> bool {
+    let l = s.to_lower()
+    return l.starts_with("http:") or l.starts_with("https:") or l.starts_with("file:")
+}
+
+/// posixpath.normpath
+fn normpath(p: str) -> str {
+    if p.len() == 0 {
+        return "."
+    }
+    let initial = if p.starts_with("//") and not p.starts_with("///") { 2 } else if p.starts_with("/") { 1 } else { 0 }
+    var out: [str] = []
+    for comp in p.split("/") {
+        if comp.len() == 0 or comp == "." {
+            continue
+        }
+        if comp != ".." or initial == 0 and out.len() == 0 or out.len() > 0 and out[out.len() - 1] == ".." {
+            out.push(comp)
+        } else if out.len() > 0 {
+            out = out.slice(0, out.len() - 1)
+        }
+    }
+    let body = out.join("/")
+    let joined = "/".repeat(initial) + body
+    return if joined.len() == 0 { "." } else { joined }
+}
+
+fn dirname(p: str) -> str {
+    let c = p.codes()
+    var i = c.len()
+    while i > 0 and c[i - 1] != 47 {
+        i = i - 1
+    }
+    var head = text_of(c.slice(0, i))
+    if head.len() > 0 and head.codes().filter(|x| x != 47).len() > 0 {
+        while head.ends_with("/") {
+            head = head.substr(0, head.len() - 1)
+        }
+    }
+    return head
+}
+
+/// os.path.abspath(os.path.join(os.path.dirname(filename), name)), the
+/// file names absolute already.
+fn nested_path(filename: str, name: str) -> str {
+    let dir = dirname(filename)
+    let joined = if name.starts_with("/") { name } else if dir.len() == 0 or dir.ends_with("/") { dir + name } else { dir + "/" + name }
+    return normpath(if joined.starts_with("/") { joined } else { "/" + joined })
+}
+
+fn content_of(files: [(str, str)], path: str) -> str ! ReqFileError {
+    for (p, t) in files {
+        if p == path {
+            return t
+        }
+    }
+    fail(ReqInstallationError("Could not open requirements file: [Errno 2] No such file or directory: " + py_repr(path)))
+}
+
+/// One parsed line of a file, as pip's line parser gives it.
+fn parse_line(n: i64, line: str, filename: str, constraint: bool, features: [str]) -> ReqLine ! ReqFileError {
+    let (args, options) = break_args_options(line)
+    let words = match shlex.split(options, false) {
+        Ok(w) -> w
+        Err(_e) -> fail(ReqParseError("Invalid requirement: " + line + "\nCould not split options: " + options))
+    }
+    let opts = match parse_options(words, features) {
+        Ok(o) -> o
+        Err(OptParse(m)) -> fail(ReqParseError("Invalid requirement: " + line + "\n" + m))
+        Err(OptCommand(m)) -> fail(ReqCommandError(m))
+    }
+    let req = args.len() > 0
+    let editable = not req and opts.editables.len() > 0
+    return ReqLine{ filename: filename, lineno: n, constraint: constraint, is_requirement: req or editable, is_editable: editable,
+        requirement: if req { args } else if editable { opts.editables[0] } else { "" }, opts: opts }
+}
+
+/// pip's _parse_and_recurse: a line that names another file is replaced
+/// by that file's lines. `seen` maps each file on this path to the one
+/// that named it ("" for the first).
+fn parse_and_recurse(files: [(str, str)], env: [(str, str)], filename: str, constraint: bool, seen: [(str, str)], inout features: [str], inout out: [ReqLine]) -> () ! ReqFileError {
+    let content = try content_of(files, normpath(filename))
+    for (n, text) in preprocess(content, env) {
+        let line = try parse_line(n, text, filename, constraint, features)
+        features = line.opts.features_enabled
+        if line.is_requirement or line.opts.requirements.len() == 0 and line.opts.constraints.len() == 0 {
+            out.push(line)
+            continue
+        }
+        let nested_constraint = line.opts.requirements.len() == 0
+        let name = if nested_constraint { line.opts.constraints[0] } else { line.opts.requirements[0] }
+        if has_scheme(filename) or has_scheme(name) {
+            fail(ReqUnsupportedUrl(name))
+        }
+        let path = nested_path(filename, name)
+        for (p, from) in seen {
+            if p == path {
+                let tail = if from.len() > 0 { " and again in " + from } else { "" }
+                fail(ReqParseError(path + " recursively references itself in " + filename + tail))
+            }
+        }
+        try parse_and_recurse(files, env, path, nested_constraint, seen + [(path, filename)], features, out)
+    }
+    return ()
+}
+
+/// Every requirement and option line of a requirements file (and of the
+/// files it names), in order. `files` maps absolute paths to their text;
+/// `env` is the environment `${NAME}` reads.
+pub fn parse(files: [(str, str)], root: str, constraint: bool, env: [(str, str)]) -> [ReqLine] ! ReqFileError {
+    var out: [ReqLine] = []
+    var features: [str] = []
+    try parse_and_recurse(files, env, root, constraint, [(normpath(root), "")], features, out)
+    return out
+}
