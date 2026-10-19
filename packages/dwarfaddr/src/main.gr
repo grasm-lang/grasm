@@ -1,0 +1,142 @@
+// DWARF 5's indirection tables: `.debug_addr` and `.debug_str_offsets`.
+//
+// DWARF 5 lets a debugging entry name an address or a string by index
+// (DW_FORM_addrx, DW_FORM_strx) so most of `.debug_info` needs no
+// relocations: the addresses live once in `.debug_addr` and the string
+// offsets once in `.debug_str_offsets`, each table a header -- unit
+// length (32- or 64-bit DWARF), version, and for addresses the address
+// and segment selector sizes -- then the entries. A unit's
+// DW_AT_addr_base and DW_AT_str_offsets_base point just past its header.
+//
+// `addr_tables` and `str_offset_tables` read every contribution;
+// `describe_addr` and `describe_str_offsets` print them as `dwarfdump
+// --debug-addr` and `--debug-str-offsets` do.
+import dwarfline
+
+type AddrTable = { length: i64, dwarf64: bool, version: i64, addr_size: i64, seg_size: i64, addrs: [i64] }
+
+type StrOffsetTable = { at: i64, length: i64, dwarf64: bool, version: i64, offsets: [(i64, i64)] }
+
+type DwarfAddrError =
+    | DwarfAddrMalformed(why: str)
+
+fn le(d: bytes, at: i64, n: i64) -> i64 ! DwarfAddrError {
+    if at < 0 or at + n > d.len() {
+        fail(DwarfAddrMalformed("a read past the end at {at}"))
+    }
+    var v = 0
+    for k in 0..n {
+        v = v.bit_or(d.at(at + k).shl(8 * k))
+    }
+    return v
+}
+
+fn unit_length(d: bytes, at: i64) -> (i64, bool, i64) ! DwarfAddrError {
+    let l = try le(d, at, 4)
+    if l == 4294967295 {
+        return (try le(d, at + 4, 8), true, at + 12)
+    }
+    return (l, false, at + 4)
+}
+
+/// Every `.debug_addr` contribution.
+pub fn addr_tables(d: bytes) -> [AddrTable] ! DwarfAddrError {
+    var out: [AddrTable] = []
+    var at = 0
+    while at < d.len() {
+        let (len, wide, body) = try unit_length(d, at)
+        let end = body + len
+        let size = try le(d, body + 2, 1)
+        if size != 4 and size != 8 {
+            fail(DwarfAddrMalformed("an address size of {size}"))
+        }
+        var addrs: [i64] = []
+        var p = body + 4
+        while p + size <= end {
+            addrs.push(try le(d, p, size))
+            p = p + size
+        }
+        out.push(AddrTable{ length: len, dwarf64: wide, version: try le(d, body, 2), addr_size: size, seg_size: try le(d, body + 3, 1), addrs: addrs })
+        at = end
+    }
+    return out
+}
+
+/// Every `.debug_str_offsets` contribution, with the string each offset
+/// names in `.debug_str`.
+pub fn str_offset_tables(d: bytes) -> [StrOffsetTable] ! DwarfAddrError {
+    var out: [StrOffsetTable] = []
+    var at = 0
+    while at < d.len() {
+        let (len, wide, body) = try unit_length(d, at)
+        let end = body + len
+        let w = if wide { 8 } else { 4 }
+        var offs: [(i64, i64)] = []
+        var p = body + 4
+        while p + w <= end {
+            offs.push((p, try le(d, p, w)))
+            p = p + w
+        }
+        out.push(StrOffsetTable{ at: at, length: len, dwarf64: wide, version: try le(d, body, 2), offsets: offs })
+        at = end
+    }
+    return out
+}
+
+fn hexw(v: i64, w: i64) -> str {
+    let digits = "0123456789abcdef"
+    var s = ""
+    for k in 0..w {
+        s = digits.substr(v.ushr(4 * k).bit_and(15), 1) + s
+    }
+    return s
+}
+
+pub fn describe_addr(ts: [AddrTable]) -> [str] {
+    var out: [str] = []
+    for t in ts {
+        out.push("Address table header: length = 0x" + hexw(t.length, if t.dwarf64 { 16 } else { 8 }) + ", format = " + (if t.dwarf64 { "DWARF64" } else { "DWARF32" }) +
+            ", version = 0x" + hexw(t.version, 4) + ", addr_size = 0x" + hexw(t.addr_size, 2) + ", seg_size = 0x" + hexw(t.seg_size, 2))
+        out.push("Addrs: [")
+        for a in t.addrs {
+            out.push("0x" + hexw(a, 2 * t.addr_size))
+        }
+        out.push("]")
+    }
+    return out
+}
+
+fn quoted(s: str) -> str {
+    var out = "\""
+    for c in s.codes() {
+        out = out + if c == 34 { "\\\"" } else if c == 92 { "\\\\" } else if c == 10 { "\\n" } else if c == 9 { "\\t" } else { bytes_of([c]).to_str() }
+    }
+    return out + "\""
+}
+
+fn cstr(d: bytes, at: i64) -> str {
+    var e = at
+    while e < d.len() and d.at(e) != 0 {
+        e = e + 1
+    }
+    return d.slice(at, e).to_str()
+}
+
+pub fn describe_str_offsets(ts: [StrOffsetTable], strs: bytes) -> [str] {
+    var out: [str] = []
+    for t in ts {
+        out.push("0x" + hexw(t.at, 8) + ": Contribution size = {t.length}, Format = " + (if t.dwarf64 { "DWARF64" } else { "DWARF32" }) + ", Version = {t.version}")
+        for (at, off) in t.offsets {
+            out.push("0x" + hexw(at, 8) + ": " + hexw(off, if t.dwarf64 { 16 } else { 8 }) + " " + (if off < strs.len() { quoted(cstr(strs, off)) } else { "<invalid offset>" }))
+        }
+    }
+    return out
+}
+
+/// The tables of a Mach-O object or .dSYM, as dwarfdump prints them.
+pub fn describe_image(image: bytes) -> [str] ! DwarfAddrError {
+    let addr = dwarfline.section(image, "__DWARF", "__debug_addr") ?? fail(DwarfAddrMalformed("sections"))
+    let offs = dwarfline.section(image, "__DWARF", "__debug_str_offs") ?? fail(DwarfAddrMalformed("sections"))
+    let strs = dwarfline.section(image, "__DWARF", "__debug_str") ?? fail(DwarfAddrMalformed("sections"))
+    return describe_addr(try addr_tables(addr)) + describe_str_offsets(try str_offset_tables(offs), strs)
+}

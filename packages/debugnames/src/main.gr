@@ -1,0 +1,340 @@
+// DWARF 5's name index: `.debug_names`, how a debugger finds `main`
+// without reading every unit.
+//
+// A hash table over every name a unit defines (functions, variables,
+// types, namespaces): a header (unit, type unit and foreign type unit
+// counts, bucket and name counts, an augmentation string -- `LLVM0700`
+// from clang), the units' offsets, a bucket array holding each bucket's
+// first name index, the names' hashes (DJB, case-sensitive), their
+// offsets in `.debug_str`, offsets into an entry pool, and an
+// abbreviation table that says, for each kind of entry, its tag and
+// which indexed attributes follow in which forms: the DIE's offset, its
+// unit, its parent's entry (or a flag that the parent is not indexed).
+// A bucket's names run on while their hashes still land in it.
+//
+// `indexes` reads the section; `describe` prints it as `dwarfdump
+// --debug-names` does (abbreviations in table order: dwarfdump's own
+// order is a hash set's, which a comparison has to ignore).
+import dwarfline
+
+type NamesAbbrev = { code: i64, tag: i64, attrs: [(i64, i64)] }
+
+type NamesEntry = { at: i64, abbrev: i64, values: [(i64, i64, i64)] }
+
+type NamesName = { index: i64, hash: i64, str_offset: i64, entries: [NamesEntry] }
+
+type NameIndex = {
+    at: i64,
+    length: i64,
+    version: i64,
+    cus: [i64],
+    local_tus: [i64],
+    foreign_tus: [i64],
+    bucket_count: i64,
+    name_count: i64,
+    abbrev_size: i64,
+    augmentation: str,
+    abbrevs: [NamesAbbrev],
+    buckets: [[NamesName]],
+    /// Where the entry pool starts, for parent references.
+    pool: i64,
+}
+
+type DebugNamesError =
+    | DebugNamesMalformed(why: str)
+
+type NamesCursor = { d: bytes, at: i64 }
+
+fn le(inout c: NamesCursor, n: i64) -> i64 ! DebugNamesError {
+    if c.at + n > c.d.len() {
+        fail(DebugNamesMalformed("a read past the end at {c.at}"))
+    }
+    var v = 0
+    for k in 0..n {
+        v = v.bit_or(c.d.at(c.at + k).shl(8 * k))
+    }
+    c.at = c.at + n
+    return v
+}
+
+fn uleb(inout c: NamesCursor) -> i64 ! DebugNamesError {
+    var v = 0
+    var shift = 0
+    while true {
+        let b = try le(c, 1)
+        if shift < 64 {
+            v = v.bit_or(b.bit_and(127).shl(shift))
+        }
+        shift = shift + 7
+        if b < 128 {
+            break
+        }
+    }
+    return v
+}
+
+fn form_size(form: i64) -> i64 {
+    return if form == 11 or form == 17 { 1 } else if form == 5 or form == 18 { 2 } else if form == 6 or form == 19 { 4 } else if form == 7 or form == 20 or form == 32 { 8 }
+    else if form == 25 { 0 } else { 0 - 1 }
+}
+
+fn read_value(inout c: NamesCursor, form: i64) -> i64 ! DebugNamesError {
+    let n = form_size(form)
+    if n >= 0 {
+        return if n == 0 { 1 } else { try le(c, n) }
+    }
+    if form == 15 or form == 21 {
+        return try uleb(c)
+    }
+    fail(DebugNamesMalformed("an index form {form}"))
+}
+
+fn abbrevs_at(d: bytes, at: i64, size: i64) -> [NamesAbbrev] ! DebugNamesError {
+    var c = NamesCursor{ d: d, at: at }
+    var out: [NamesAbbrev] = []
+    while c.at < at + size {
+        let code = try uleb(c)
+        if code == 0 {
+            break
+        }
+        let tag = try uleb(c)
+        var attrs: [(i64, i64)] = []
+        while true {
+            let idx = try uleb(c)
+            let form = try uleb(c)
+            if idx == 0 and form == 0 {
+                break
+            }
+            attrs.push((idx, form))
+        }
+        out.push(NamesAbbrev{ code: code, tag: tag, attrs: attrs })
+    }
+    return out
+}
+
+fn entries_at(d: bytes, at: i64, abbrevs: [NamesAbbrev]) -> [NamesEntry] ! DebugNamesError {
+    var c = NamesCursor{ d: d, at: at }
+    var out: [NamesEntry] = []
+    while true {
+        let start = c.at
+        let code = try uleb(c)
+        if code == 0 {
+            break
+        }
+        let ab = abbrevs.filter(|a| a.code == code)
+        if ab.len() == 0 {
+            fail(DebugNamesMalformed("an entry with abbreviation {code} that is not there"))
+        }
+        var values: [(i64, i64, i64)] = []
+        for (idx, form) in ab[0].attrs {
+            values.push((idx, form, try read_value(c, form)))
+        }
+        out.push(NamesEntry{ at: start, abbrev: code, values: values })
+    }
+    return out
+}
+
+fn index_at(d: bytes, at: i64) -> (NameIndex, i64) ! DebugNamesError {
+    var c = NamesCursor{ d: d, at: at }
+    let length = try le(c, 4)
+    let end = at + 4 + length
+    let version = try le(c, 2)
+    try le(c, 2)
+    let ncu = try le(c, 4)
+    let nltu = try le(c, 4)
+    let nftu = try le(c, 4)
+    let nbuckets = try le(c, 4)
+    let nnames = try le(c, 4)
+    let asize = try le(c, 4)
+    let augsize = try le(c, 4)
+    let aug = d.slice(c.at, c.at + augsize).to_str()
+    c.at = c.at + (augsize + 3) / 4 * 4
+    var cus: [i64] = []
+    for _k in 0..ncu {
+        cus.push(try le(c, 4))
+    }
+    var ltus: [i64] = []
+    for _k in 0..nltu {
+        ltus.push(try le(c, 4))
+    }
+    var ftus: [i64] = []
+    for _k in 0..nftu {
+        ftus.push(try le(c, 8))
+    }
+    let buckets_at = c.at
+    let hashes_at = buckets_at + 4 * nbuckets
+    let strs_at = hashes_at + 4 * nnames
+    let offs_at = strs_at + 4 * nnames
+    let abbrev_at = offs_at + 4 * nnames
+    let pool = abbrev_at + asize
+    let abbrevs = try abbrevs_at(d, abbrev_at, asize)
+    var buckets: [[NamesName]] = []
+    for b in 0..nbuckets {
+        var h = NamesCursor{ d: d, at: buckets_at + 4 * b }
+        var first = try le(h, 4)
+        var names: [NamesName] = []
+        while first >= 1 and first <= nnames {
+            var hc = NamesCursor{ d: d, at: hashes_at + 4 * (first - 1) }
+            let hash = try le(hc, 4)
+            if hash % nbuckets != b {
+                break
+            }
+            var sc = NamesCursor{ d: d, at: strs_at + 4 * (first - 1) }
+            var oc = NamesCursor{ d: d, at: offs_at + 4 * (first - 1) }
+            let so = try le(sc, 4)
+            let eo = try le(oc, 4)
+            names.push(NamesName{ index: first, hash: hash, str_offset: so, entries: try entries_at(d, pool + eo, abbrevs) })
+            first = first + 1
+        }
+        buckets.push(names)
+    }
+    return (NameIndex{ at: at, length: length, version: version, cus: cus, local_tus: ltus, foreign_tus: ftus, bucket_count: nbuckets, name_count: nnames,
+        abbrev_size: asize, augmentation: aug, abbrevs: abbrevs, buckets: buckets, pool: pool }, end)
+}
+
+/// Every name index in a `.debug_names` section.
+pub fn indexes(d: bytes) -> [NameIndex] ! DebugNamesError {
+    var out: [NameIndex] = []
+    var at = 0
+    while at < d.len() {
+        let (ix, next) = try index_at(d, at)
+        out.push(ix)
+        at = next
+    }
+    return out
+}
+
+
+fn hex_up(v: i64) -> str {
+    let digits = "0123456789ABCDEF"
+    if v == 0 {
+        return "0"
+    }
+    var s = ""
+    var x = v
+    while x > 0 {
+        s = digits.substr(x.bit_and(15), 1) + s
+        x = x.ushr(4)
+    }
+    return s
+}
+
+fn hexw(v: i64, w: i64) -> str {
+    let digits = "0123456789abcdef"
+    var s = ""
+    var n = 0
+    while n < w or v.ushr(4 * n) != 0 {
+        s = digits.substr(v.ushr(4 * n).bit_and(15), 1) + s
+        n = n + 1
+        if n >= 16 {
+            break
+        }
+    }
+    return s
+}
+
+pub fn tag_name(t: i64) -> str {
+    let names = [(1, "array_type"), (2, "class_type"), (4, "enumeration_type"), (5, "formal_parameter"), (8, "imported_declaration"), (10, "label"),
+        (11, "lexical_block"), (13, "member"), (15, "pointer_type"), (16, "reference_type"), (17, "compile_unit"), (19, "structure_type"),
+        (21, "subroutine_type"), (22, "typedef"), (23, "union_type"), (24, "unspecified_parameters"), (28, "inheritance"), (29, "inlined_subroutine"),
+        (30, "module"), (31, "ptr_to_member_type"), (33, "subrange_type"), (36, "base_type"), (38, "const_type"), (40, "enumerator"), (46, "subprogram"),
+        (47, "template_type_parameter"), (48, "template_value_parameter"), (52, "variable"), (53, "volatile_type"), (55, "restrict_type"),
+        (57, "namespace"), (58, "imported_module"), (59, "unspecified_type"), (65, "type_unit"), (66, "rvalue_reference_type"), (67, "template_alias"),
+        (71, "atomic_type"), (72, "call_site"), (73, "call_site_parameter")]
+    for (k, n) in names {
+        if k == t {
+            return "DW_TAG_" + n
+        }
+    }
+    return "DW_TAG_unknown_" + hexw(t, 1)
+}
+
+fn idx_name(i: i64) -> str {
+    return if i == 1 { "DW_IDX_compile_unit" } else if i == 2 { "DW_IDX_type_unit" } else if i == 3 { "DW_IDX_die_offset" } else if i == 4 { "DW_IDX_parent" }
+    else if i == 5 { "DW_IDX_type_hash" } else if i == 8192 { "DW_IDX_GNU_internal" } else if i == 8193 { "DW_IDX_GNU_external" } else { "DW_IDX_unknown_" + hexw(i, 1) }
+}
+
+fn form_name(f: i64) -> str {
+    let names = [(5, "data2"), (6, "data4"), (7, "data8"), (11, "data1"), (15, "udata"), (17, "ref1"), (18, "ref2"), (19, "ref4"), (20, "ref8"),
+        (21, "ref_udata"), (25, "flag_present"), (32, "ref_sig8")]
+    for (k, n) in names {
+        if k == f {
+            return "DW_FORM_" + n
+        }
+    }
+    return "DW_FORM_unknown_" + hexw(f, 1)
+}
+
+fn value_text(idx: i64, form: i64, v: i64, pool: i64) -> str {
+    if idx == 4 {
+        return if form == 25 { "<parent not indexed>" } else { "Entry @ 0x" + hexw(pool + v, 1) }
+    }
+    let n = form_size(form)
+    return if n > 0 { "0x" + hexw(v, 2 * n) } else { "{v}" }
+}
+
+fn cstr(d: bytes, at: i64) -> str {
+    var e = at
+    while e < d.len() and d.at(e) != 0 {
+        e = e + 1
+    }
+    return if at < d.len() { d.slice(at, e).to_str() } else { "" }
+}
+
+/// The section as `dwarfdump --debug-names` prints it.
+pub fn describe(ixs: [NameIndex], strs: bytes) -> [str] {
+    var out: [str] = []
+    for ix in ixs {
+        out.push("Name Index @ 0x" + hexw(ix.at, 1) + " \{")
+        out = out + ["  Header \{", "    Length: 0x" + hex_up(ix.length), "    Format: DWARF32", "    Version: {ix.version}", "    CU count: {ix.cus.len()}",
+            "    Local TU count: {ix.local_tus.len()}", "    Foreign TU count: {ix.foreign_tus.len()}", "    Bucket count: {ix.bucket_count}",
+            "    Name count: {ix.name_count}", "    Abbreviations table size: 0x" + hex_up(ix.abbrev_size), "    Augmentation: '" + ix.augmentation + "'", "  \}"]
+        out.push("  Compilation Unit offsets [")
+        for i in 0..ix.cus.len() {
+            out.push("    CU[{i}]: 0x" + hexw(ix.cus[i], 8))
+        }
+        out.push("  ]")
+        out.push("  Abbreviations [")
+        for a in ix.abbrevs {
+            out.push("    Abbreviation 0x" + hexw(a.code, 1) + " \{")
+            out.push("      Tag: " + tag_name(a.tag))
+            for (i, f) in a.attrs {
+                out.push("      " + idx_name(i) + ": " + form_name(f))
+            }
+            out.push("    \}")
+        }
+        out.push("  ]")
+        for b in 0..ix.buckets.len() {
+            out.push("  Bucket {b} [")
+            if ix.buckets[b].len() == 0 {
+                out.push("    EMPTY")
+            }
+            for n in ix.buckets[b] {
+                out.push("    Name {n.index} \{")
+                out.push("      Hash: 0x" + hex_up(n.hash))
+                out.push("      String: 0x" + hexw(n.str_offset, 8) + " \"" + cstr(strs, n.str_offset) + "\"")
+                for e in n.entries {
+                    out.push("      Entry @ 0x" + hexw(e.at, 1) + " \{")
+                    out.push("        Abbrev: 0x" + hexw(e.abbrev, 1))
+                    let ab = ix.abbrevs.filter(|a| a.code == e.abbrev)
+                    out.push("        Tag: " + tag_name(if ab.len() > 0 { ab[0].tag } else { 0 }))
+                    for (i, f, v) in e.values {
+                        out.push("        " + idx_name(i) + ": " + value_text(i, f, v, ix.pool))
+                    }
+                    out.push("      \}")
+                }
+                out.push("    \}")
+            }
+            out.push("  ]")
+        }
+        out.push("\}")
+    }
+    return out
+}
+
+/// The name indexes of a Mach-O object or .dSYM, as dwarfdump prints them.
+pub fn describe_image(image: bytes) -> [str] ! DebugNamesError {
+    let names = dwarfline.section(image, "__DWARF", "__debug_names") ?? fail(DebugNamesMalformed("sections"))
+    let strs = dwarfline.section(image, "__DWARF", "__debug_str") ?? fail(DebugNamesMalformed("sections"))
+    return describe(try indexes(names), strs)
+}

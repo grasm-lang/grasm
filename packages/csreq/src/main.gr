@@ -1,0 +1,763 @@
+// Code signing requirements: the little language `codesign -r` and
+// `csreq` speak, and the binary form a signature carries.
+//
+// `identifier "com.example.app" and anchor apple generic and
+// certificate leaf[subject.OU] = ABCDE12345` is what a designated
+// requirement looks like -- the test a program must pass to count as
+// the same program after an update. Signed, it is a blob (magic
+// fade0c00) holding an expression in prefix form: 32-bit opcodes (and,
+// or, not, identifier, anchor apple, anchor apple generic, certificate
+// fields by name or OID, Info.plist keys, entitlements, cdhashes,
+// platform, notarized...), certificate slots (leaf 0, root -1, others
+// by number), match operations (exists, absent, =, ~, <, >, <=, >=,
+// prefix and suffix wildcards), and data as a 32-bit length then the
+// bytes, padded to four. A signature's set of them (magic fade0c01) is
+// indexed by type: host, guest, designated, library, plugin.
+//
+// `decompile` writes a requirement as Security.framework's Dumper does
+// (and so `csreq -t` and `codesign -d -r-`): quotes only where a bare
+// word would not read back, `/* exists */` for an existence test, OIDs
+// in dotted form. `compile` parses the language into the bytes `csreq
+// -b` writes.
+
+type CsreqError =
+    | CsreqMalformed(why: str)
+    | CsreqSyntax(at: i64, why: str)
+
+type ReqReader = { d: bytes, pc: i64 }
+
+fn get32(inout r: ReqReader) -> i64 ! CsreqError {
+    if r.pc + 4 > r.d.len() {
+        fail(CsreqMalformed("a read past the end"))
+    }
+    var v = 0
+    for k in 0..4 {
+        v = v.shl(8).bit_or(r.d.at(r.pc + k))
+    }
+    r.pc = r.pc + 4
+    return v
+}
+
+fn sget32(inout r: ReqReader) -> i64 ! CsreqError {
+    let v = try get32(r)
+    return if v >= 2147483648 { v - 4294967296 } else { v }
+}
+
+fn get_data(inout r: ReqReader) -> bytes ! CsreqError {
+    let n = try get32(r)
+    if r.pc + n > r.d.len() {
+        fail(CsreqMalformed("data past the end"))
+    }
+    let out = r.d.slice(r.pc, r.pc + n)
+    r.pc = r.pc + (n + 3) / 4 * 4
+    return out
+}
+
+fn keywords() -> [str] {
+    return ["guest", "host", "designated", "library", "plugin", "or", "and", "always", "true", "never", "false", "identifier", "cdhash", "platform",
+        "notarized", "legacy", "anchor", "apple", "generic", "certificate", "cert", "trusted", "info", "entitlement", "exists", "absent", "leaf", "root",
+        "timestamp", ""]
+}
+
+fn is_alnum(c: i64) -> bool {
+    return (c >= 48 and c <= 57) or (c >= 65 and c <= 90) or (c >= 97 and c <= 122)
+}
+
+fn hex_bytes(b: bytes) -> str {
+    let digits = "0123456789abcdef"
+    var parts: [str] = []
+    for x in b.to_list() {
+        parts.push(digits.substr(x.ushr(4), 1) + digits.substr(x.bit_and(15), 1))
+    }
+    return parts.join("")
+}
+
+/// Dumper::data: bare, quoted, or 0x-hex, whichever reads back.
+fn data_text(b: bytes, dot_ok: bool) -> str {
+    var mode = 0
+    for n in 0..b.len() {
+        let c = b.at(n)
+        if is_alnum(c) or (c == 46 and dot_ok) {
+            if n == 0 and c >= 48 and c <= 57 {
+                mode = if mode < 1 { 1 } else { mode }
+            }
+        } else if (c >= 33 and c <= 126) or c == 32 or (c >= 9 and c <= 13) {
+            mode = if mode < 1 { 1 } else { mode }
+        } else {
+            mode = 2
+            break
+        }
+    }
+    if mode == 0 and keywords().contains(b.to_str()) {
+        mode = 1
+    }
+    if mode == 0 {
+        return b.to_str()
+    }
+    if mode == 1 {
+        var out: [i64] = [34]
+        for x in b.to_list() {
+            if x == 92 or x == 34 {
+                out.push(92)
+            }
+            out.push(x)
+        }
+        out.push(34)
+        return bytes_of(out).to_str()
+    }
+    return "0x" + hex_bytes(b)
+}
+
+/// A DER OID body in dotted form.
+fn oid_text(b: bytes) -> str {
+    if b.len() == 0 {
+        return ""
+    }
+    var parts: [str] = []
+    let first = b.at(0)
+    parts.push("{first / 40}")
+    parts.push("{first % 40}")
+    var v = 0
+    for i in 1..b.len() {
+        v = v.shl(7).bit_or(b.at(i).bit_and(127))
+        if b.at(i) < 128 {
+            parts.push("{v}")
+            v = 0
+        }
+    }
+    return parts.join(".")
+}
+
+fn slot_text(inout r: ReqReader) -> str ! CsreqError {
+    let s = try sget32(r)
+    return if s == 0 - 1 { " root" } else if s == 0 { " leaf" } else { " {s}" }
+}
+
+fn match_text(inout r: ReqReader) -> str ! CsreqError {
+    let op = try get32(r)
+    if op == 0 {
+        return " /* exists */"
+    }
+    if op == 14 {
+        return " absent "
+    }
+    if op >= 9 and op <= 13 {
+        fail(CsreqMalformed("a timestamp match"))
+    }
+    let v = data_text(try get_data(r), false)
+    let pre = [" = ", " = ", " ~ ", " = ", " = *", " < ", " > ", " <= ", " >= "]
+    if op > 8 {
+        fail(CsreqMalformed("a match operation {op}"))
+    }
+    return pre[op] + v + if op == 3 { "*" } else { "" }
+}
+
+/// Dumper::expr at a syntax level: 0 primary, 1 and, 2 or, 3 top.
+fn expr(inout r: ReqReader, level: i64) -> str ! CsreqError {
+    let raw = try get32(r)
+    let op = raw.bit_and(16777215)
+    if op == 0 {
+        return "never"
+    }
+    if op == 1 {
+        return "always"
+    }
+    if op == 2 {
+        return "identifier " + data_text(try get_data(r), false)
+    }
+    if op == 3 {
+        return "anchor apple"
+    }
+    if op == 15 {
+        return "anchor apple generic"
+    }
+    if op == 4 {
+        return "certificate" + (try slot_text(r)) + " = H\"" + hex_bytes(try get_data(r)) + "\""
+    }
+    if op == 5 {
+        return "info[" + data_text(try get_data(r), true) + "] = " + data_text(try get_data(r), false)
+    }
+    if op == 6 or op == 7 {
+        let mine = if op == 6 { 1 } else { 2 }
+        let a = try expr(r, mine)
+        let b = try expr(r, mine)
+        let s = a + (if op == 6 { " and " } else { " or " }) + b
+        return if level < mine { "(" + s + ")" } else { s }
+    }
+    if op == 9 {
+        return "! " + (try expr(r, 0))
+    }
+    if op == 8 {
+        return "cdhash H\"" + hex_bytes(try get_data(r)) + "\""
+    }
+    return try expr_more(r, op)
+}
+
+fn expr_more(inout r: ReqReader, op: i64) -> str ! CsreqError {
+    if op == 10 or op == 16 {
+        return (if op == 10 { "info[" } else { "entitlement[" }) + data_text(try get_data(r), true) + "]" + (try match_text(r))
+    }
+    if op == 11 {
+        let slot = try slot_text(r)
+        return "certificate" + slot + "[" + data_text(try get_data(r), true) + "]" + (try match_text(r))
+    }
+    if op == 14 or op == 17 or op == 22 {
+        let slot = try slot_text(r)
+        let kind = if op == 14 { "field." } else if op == 17 { "policy." } else { "timestamp." }
+        return "certificate" + slot + "[" + kind + oid_text(try get_data(r)) + "]" + (try match_text(r))
+    }
+    if op == 12 {
+        return "certificate" + (try slot_text(r)) + "trusted"
+    }
+    if op == 13 {
+        return "anchor trusted"
+    }
+    if op == 18 {
+        return "anchor apple " + data_text(try get_data(r), false)
+    }
+    if op == 19 {
+        return "(" + data_text(try get_data(r), false) + ")"
+    }
+    if op == 20 {
+        return "platform = {try sget32(r)}"
+    }
+    if op == 21 {
+        return "notarized"
+    }
+    if op == 23 {
+        return "legacy"
+    }
+    fail(CsreqMalformed("an opcode {op}"))
+}
+
+/// One requirement blob (fade0c00) as text.
+pub fn decompile(d: bytes) -> str ! CsreqError {
+    var r = ReqReader{ d: d, pc: 0 }
+    if (try get32(r)) != 4208856064 {
+        fail(CsreqMalformed("not a requirement"))
+    }
+    try get32(r)
+    if (try get32(r)) != 1 {
+        fail(CsreqMalformed("not an expression requirement"))
+    }
+    return try expr(r, 3)
+}
+
+/// A requirement set (fade0c01) as `codesign -d -r-` lists it.
+pub fn decompile_set(d: bytes) -> [str] ! CsreqError {
+    var r = ReqReader{ d: d, pc: 0 }
+    if (try get32(r)) != 4208856065 {
+        fail(CsreqMalformed("not a requirement set"))
+    }
+    try get32(r)
+    let n = try get32(r)
+    let names = ["", "host", "guest", "designated", "library", "plugin"]
+    var out: [str] = []
+    for i in 0..n {
+        var h = ReqReader{ d: d, pc: 12 + 8 * i }
+        let kind = try get32(h)
+        let off = try get32(h)
+        let len = (d.at(off + 4) * 16777216) + d.at(off + 5) * 65536 + d.at(off + 6) * 256 + d.at(off + 7)
+        let prefix = if kind >= 1 and kind <= 5 { names[kind] + " => " } else { "/*unknown type*/ {kind} => " }
+        out.push(prefix + (try decompile(d.slice(off, off + len))))
+    }
+    return out
+}
+
+// --- compiling ------------------------------------------------------------------
+
+/// A token: its kind ("kw", "dotkey", "string", "hash", "hex", "int",
+/// "path", or the punctuation itself) and its text.
+type ReqToken = { kind: str, text: str, at: i64 }
+
+fn ident_char(c: i64, first: bool) -> bool {
+    return (c >= 65 and c <= 90) or (c >= 97 and c <= 122) or (not first and c >= 48 and c <= 57)
+}
+
+fn hex_digit(c: i64) -> bool {
+    return (c >= 48 and c <= 57) or (c >= 97 and c <= 102) or (c >= 65 and c <= 70)
+}
+
+fn lex_ident_run(b: [i64], p0: i64) -> i64 {
+    var p = p0
+    while p < b.len() and ident_char(b[p], p == p0) {
+        p = p + 1
+    }
+    return p
+}
+
+fn lex_word(b: [i64], p0: i64) -> (ReqToken, i64) {
+    // DOTKEY: IDENT ( "." ( IDENT | INTEGER ) )*
+    var p = lex_ident_run(b, p0)
+    while p + 1 < b.len() and b[p] == 46 and (ident_char(b[p + 1], true) or (b[p + 1] >= 48 and b[p + 1] <= 57)) {
+        if ident_char(b[p + 1], true) {
+            p = lex_ident_run(b, p + 1)
+        } else {
+            p = p + 1
+            while p < b.len() and b[p] >= 48 and b[p] <= 57 {
+                p = p + 1
+            }
+        }
+    }
+    let text = bytes_of(b.slice(p0, p)).to_str()
+    return (ReqToken{ kind: if keywords().contains(text) { "kw" } else { "dotkey" }, text: text, at: p0 }, p)
+}
+
+fn lex_string(b: [i64], p0: i64) -> (ReqToken, i64) ! CsreqError {
+    var p = p0 + 1
+    var out: [i64] = []
+    while true {
+        if p >= b.len() {
+            fail(CsreqSyntax(p0, "an unterminated string"))
+        }
+        let c = b[p]
+        if c == 34 {
+            break
+        }
+        if c == 92 {
+            if p + 1 < b.len() and b[p + 1] == 34 {
+                out.push(34)
+                p = p + 2
+                continue
+            }
+            fail(CsreqSyntax(p, "a backslash not before a quote"))
+        }
+        out.push(c)
+        p = p + 1
+    }
+    return (ReqToken{ kind: "string", text: bytes_of(out).to_str(), at: p0 }, p + 1)
+}
+
+fn lex_hexrun(b: [i64], p0: i64) -> i64 {
+    var p = p0
+    while p < b.len() and hex_digit(b[p]) {
+        p = p + 1
+    }
+    return p
+}
+
+fn skip_space(b: [i64], p0: i64) -> i64 {
+    var p = p0
+    while p < b.len() {
+        let c = b[p]
+        if c == 32 or c == 10 or c == 9 {
+            p = p + 1
+        } else if c == 35 or (c == 47 and p + 1 < b.len() and b[p + 1] == 47) {
+            while p < b.len() and b[p] != 10 {
+                p = p + 1
+            }
+        } else if c == 47 and p + 1 < b.len() and b[p + 1] == 42 {
+            p = p + 2
+            while p + 1 < b.len() and not (b[p] == 42 and b[p + 1] == 47) {
+                p = p + 1
+            }
+            p = p + 2
+        } else {
+            break
+        }
+    }
+    return p
+}
+
+fn lex(text: str) -> [ReqToken] ! CsreqError {
+    let b = text.to_bytes().to_list()
+    var out: [ReqToken] = []
+    var p = skip_space(b, 0)
+    while p < b.len() {
+        let c = b[p]
+        let n = if p + 1 < b.len() { b[p + 1] } else { 0 - 1 }
+        if c == 72 and n == 34 {
+            let e = lex_hexrun(b, p + 2)
+            if e == p + 2 or e >= b.len() or b[e] != 34 {
+                fail(CsreqSyntax(p, "a bad hash constant"))
+            }
+            out.push(ReqToken{ kind: "hash", text: bytes_of(b.slice(p + 2, e)).to_str(), at: p })
+            p = e + 1
+        } else if ident_char(c, true) {
+            let (t, e) = lex_word(b, p)
+            out.push(t)
+            p = e
+        } else if c == 48 and n == 120 {
+            let e = lex_hexrun(b, p + 2)
+            if e == p + 2 {
+                fail(CsreqSyntax(p, "a bad hex constant"))
+            }
+            out.push(ReqToken{ kind: "hex", text: bytes_of(b.slice(p + 2, e)).to_str(), at: p })
+            p = e
+        } else if c >= 48 and c <= 57 {
+            var e = p
+            while e < b.len() and b[e] >= 48 and b[e] <= 57 {
+                e = e + 1
+            }
+            out.push(ReqToken{ kind: "int", text: bytes_of(b.slice(p, e)).to_str(), at: p })
+            p = e
+        } else if c == 34 {
+            let (t, e) = try lex_string(b, p)
+            out.push(t)
+            p = e
+        } else if c == 47 {
+            var e = p
+            var parts = 0
+            while e < b.len() and b[e] == 47 and e + 1 < b.len() and ident_char(b[e + 1], true) {
+                e = lex_ident_run(b, e + 1)
+                parts = parts + 1
+            }
+            if parts < 2 {
+                fail(CsreqSyntax(p, "a path of one component"))
+            }
+            out.push(ReqToken{ kind: "path", text: bytes_of(b.slice(p, e)).to_str(), at: p })
+            p = e
+        } else {
+            let two = if n >= 0 { bytes_of([c, n]).to_str() } else { "" }
+            if two == "<=" or two == ">=" or two == "==" or two == "=>" {
+                out.push(ReqToken{ kind: two, text: two, at: p })
+                p = p + 2
+            } else if "()[]<>,=~-!*;".to_bytes().to_list().contains(c) {
+                out.push(ReqToken{ kind: bytes_of([c]).to_str(), text: bytes_of([c]).to_str(), at: p })
+                p = p + 1
+            } else {
+                fail(CsreqSyntax(p, "an unexpected character"))
+            }
+        }
+        p = skip_space(b, p)
+    }
+    return out
+}
+
+type ReqParser = { toks: [ReqToken], i: i64, out: [i64] }
+
+fn peek(ps: ReqParser, k: i64) -> ReqToken {
+    return if ps.i + k < ps.toks.len() { ps.toks[ps.i + k] } else { ReqToken{ kind: "eof", text: "", at: 0 - 1 } }
+}
+
+fn is_kw(t: ReqToken, w: str) -> bool {
+    return t.kind == "kw" and t.text == w
+}
+
+fn put32(inout ps: ReqParser, v: i64) {
+    let u = if v < 0 { v + 4294967296 } else { v }
+    for k in 0..4 {
+        ps.out.push(u.ushr(8 * (3 - k)).bit_and(255))
+    }
+}
+
+fn put_data(inout ps: ReqParser, data: [i64]) {
+    put32(ps, data.len())
+    for x in data {
+        ps.out.push(x)
+    }
+    while ps.out.len() % 4 != 0 {
+        ps.out.push(0)
+    }
+}
+
+fn expect(inout ps: ReqParser, kind: str) -> ReqToken ! CsreqError {
+    let t = peek(ps, 0)
+    if t.kind != kind {
+        fail(CsreqSyntax(t.at, "expected " + kind + ", found " + t.kind + " " + t.text))
+    }
+    ps.i = ps.i + 1
+    return t
+}
+
+/// The optional `=` or `==` before a value.
+fn eql(inout ps: ReqParser) {
+    let k = peek(ps, 0).kind
+    if k == "=" or k == "==" {
+        ps.i = ps.i + 1
+    }
+}
+
+fn hex_to_bytes(h: str) -> [i64] {
+    let b = h.to_bytes().to_list()
+    var out: [i64] = []
+    var i = 0
+    while i + 1 < b.len() {
+        let v = |c| if c >= 97 { c - 87 } else if c >= 65 { c - 55 } else { c - 48 }
+        out.push(v(b[i]) * 16 + v(b[i + 1]))
+        i = i + 2
+    }
+    return out
+}
+
+fn string_value(inout ps: ReqParser) -> [i64] ! CsreqError {
+    let t = peek(ps, 0)
+    if t.kind != "dotkey" and t.kind != "string" {
+        fail(CsreqSyntax(t.at, "expected a string, found " + t.kind + " " + t.text))
+    }
+    ps.i = ps.i + 1
+    return t.text.to_bytes().to_list()
+}
+
+fn data_value(inout ps: ReqParser) -> [i64] ! CsreqError {
+    let t = peek(ps, 0)
+    if t.kind == "hex" {
+        ps.i = ps.i + 1
+        return hex_to_bytes(t.text)
+    }
+    return try string_value(ps)
+}
+
+/// A dotted OID as DER content bytes.
+fn oid_bytes(text: str) -> [i64] ! CsreqError {
+    let parts = text.split(".").map(|p| p.parse_int() ?? (0 - 1))
+    if parts.len() < 2 or parts.filter(|v| v < 0).len() > 0 {
+        fail(CsreqSyntax(0, "a bad OID " + text))
+    }
+    var out = [parts[0] * 40 + parts[1]]
+    for k in 2..parts.len() {
+        var v = parts[k]
+        var group: [i64] = [v.bit_and(127)]
+        v = v.ushr(7)
+        while v > 0 {
+            group.push(v.bit_and(127).bit_or(128))
+            v = v.ushr(7)
+        }
+        var j = group.len() - 1
+        while j >= 0 {
+            out.push(group[j])
+            j = j - 1
+        }
+    }
+    return out
+}
+
+fn match_suffix(inout ps: ReqParser) -> () ! CsreqError {
+    let t = peek(ps, 0)
+    if is_kw(t, "exists") {
+        ps.i = ps.i + 1
+        put32(ps, 0)
+        return
+    }
+    if is_kw(t, "absent") {
+        ps.i = ps.i + 1
+        put32(ps, 14)
+        return
+    }
+    let ops = [("~", 2), ("<", 5), (">", 6), ("<=", 7), (">=", 8)]
+    for (k, op) in ops {
+        if t.kind == k {
+            ps.i = ps.i + 1
+            put32(ps, op)
+            put_data(ps, try data_value(ps))
+            return
+        }
+    }
+    if t.kind == "=" or t.kind == "==" {
+        ps.i = ps.i + 1
+        var op = 1
+        if peek(ps, 0).kind == "*" {
+            ps.i = ps.i + 1
+            op = 4
+        }
+        if is_kw(peek(ps, 0), "timestamp") {
+            fail(CsreqSyntax(peek(ps, 0).at, "timestamps are not supported"))
+        }
+        let v = try data_value(ps)
+        if peek(ps, 0).kind == "*" {
+            ps.i = ps.i + 1
+            op = if op == 4 { 2 } else { 3 }
+        }
+        put32(ps, op)
+        put_data(ps, v)
+        return
+    }
+    // An empty suffix tests existence.
+    put32(ps, 0)
+}
+
+fn bracket_key(inout ps: ReqParser) -> str ! CsreqError {
+    try expect(ps, "[")
+    let k = bytes_of(try string_value(ps)).to_str()
+    try expect(ps, "]")
+    return k
+}
+
+fn cert_slot(inout ps: ReqParser) -> i64 ! CsreqError {
+    let t = peek(ps, 0)
+    if is_kw(t, "leaf") or is_kw(t, "root") {
+        ps.i = ps.i + 1
+        return if t.text == "leaf" { 0 } else { 0 - 1 }
+    }
+    var neg = false
+    if t.kind == "-" {
+        neg = true
+        ps.i = ps.i + 1
+    }
+    let n = (try expect(ps, "int")).text.parse_int() ?? 0
+    return if neg { 0 - n } else { n }
+}
+
+fn slot_spec(inout ps: ReqParser, slot: i64) -> () ! CsreqError {
+    if peek(ps, 0).kind == "[" {
+        let key = try bracket_key(ps)
+        let prefixes = [("timestamp.", 22), ("subject.", 11), ("field.", 14), ("extension.", 14), ("policy.", 17)]
+        var done = false
+        for (pre, op) in prefixes {
+            if not done and key.starts_with(pre) {
+                put32(ps, op)
+                put32(ps, slot)
+                if op == 11 {
+                    put_data(ps, key.to_bytes().to_list())
+                } else {
+                    put_data(ps, try oid_bytes(key.substr(pre.len(), key.len() - pre.len())))
+                }
+                done = true
+            }
+        }
+        if not done {
+            fail(CsreqSyntax(peek(ps, 0).at, key + ": unrecognized certificate field"))
+        }
+        try match_suffix(ps)
+        return
+    }
+    eql(ps)
+    let h = try expect(ps, "hash")
+    let digest = hex_to_bytes(h.text)
+    if digest.len() != 20 {
+        fail(CsreqSyntax(h.at, "a certificate hash that is not 20 bytes"))
+    }
+    put32(ps, 4)
+    put32(ps, slot)
+    put_data(ps, digest)
+}
+
+fn cert_spec(inout ps: ReqParser) -> () ! CsreqError {
+    let t = peek(ps, 0)
+    let t1 = peek(ps, 1)
+    if is_kw(t, "anchor") and is_kw(t1, "apple") {
+        ps.i = ps.i + 2
+        let n = peek(ps, 0)
+        if is_kw(n, "generic") {
+            ps.i = ps.i + 1
+            put32(ps, 15)
+        } else if n.kind == "dotkey" or n.kind == "string" {
+            ps.i = ps.i + 1
+            put32(ps, 18)
+            put_data(ps, n.text.to_bytes().to_list())
+        } else {
+            put32(ps, 3)
+        }
+        return
+    }
+    if is_kw(t, "anchor") and is_kw(t1, "generic") and is_kw(peek(ps, 2), "apple") {
+        ps.i = ps.i + 3
+        put32(ps, 15)
+        return
+    }
+    if is_kw(t1, "trusted") {
+        ps.i = ps.i + 2
+        put32(ps, 13)
+        return
+    }
+    ps.i = ps.i + 1
+    if is_kw(t, "anchor") {
+        try slot_spec(ps, 0 - 1)
+        return
+    }
+    let slot = try cert_slot(ps)
+    if is_kw(peek(ps, 0), "trusted") {
+        ps.i = ps.i + 1
+        put32(ps, 12)
+        put32(ps, slot)
+        return
+    }
+    try slot_spec(ps, slot)
+}
+
+fn primary(inout ps: ReqParser) -> () ! CsreqError {
+    let t = peek(ps, 0)
+    let t1 = peek(ps, 1)
+    if t.kind == "(" and (t1.kind == "dotkey" or t1.kind == "string") {
+        ps.i = ps.i + 2
+        try expect(ps, ")")
+        put32(ps, 19)
+        put_data(ps, t1.text.to_bytes().to_list())
+        return
+    }
+    if t.kind == "(" {
+        ps.i = ps.i + 1
+        try parse_or(ps)
+        try expect(ps, ")")
+        return
+    }
+    if t.kind == "!" {
+        ps.i = ps.i + 1
+        put32(ps, 9)
+        try primary(ps)
+        return
+    }
+    if t.kind != "kw" {
+        fail(CsreqSyntax(t.at, "unexpected " + t.kind + " " + t.text))
+    }
+    let w = t.text
+    if w == "always" or w == "true" or w == "never" or w == "false" or w == "notarized" or w == "legacy" {
+        ps.i = ps.i + 1
+        put32(ps, if w == "always" or w == "true" { 1 } else if w == "never" or w == "false" { 0 } else if w == "notarized" { 21 } else { 23 })
+    } else if w == "anchor" or w == "certificate" or w == "cert" {
+        try cert_spec(ps)
+    } else if w == "info" or w == "entitlement" {
+        ps.i = ps.i + 1
+        put32(ps, if w == "info" { 10 } else { 16 })
+        put_data(ps, (try bracket_key(ps)).to_bytes().to_list())
+        try match_suffix(ps)
+    } else if w == "identifier" {
+        ps.i = ps.i + 1
+        eql(ps)
+        put32(ps, 2)
+        put_data(ps, try string_value(ps))
+    } else if w == "cdhash" {
+        ps.i = ps.i + 1
+        eql(ps)
+        let h = try expect(ps, "hash")
+        put32(ps, 8)
+        put_data(ps, hex_to_bytes(h.text))
+    } else if w == "platform" {
+        ps.i = ps.i + 1
+        eql(ps)
+        put32(ps, 20)
+        put32(ps, (try expect(ps, "int")).text.parse_int() ?? 0)
+    } else {
+        fail(CsreqSyntax(t.at, "unexpected " + w))
+    }
+}
+
+/// `a and b and c`, left to right: each `and` goes in front of the
+/// operands so far.
+fn term(inout ps: ReqParser) -> () ! CsreqError {
+    let label = ps.out.len()
+    try primary(ps)
+    while is_kw(peek(ps, 0), "and") {
+        ps.i = ps.i + 1
+        ps.out = ps.out.slice(0, label) + [0, 0, 0, 6] + ps.out.slice(label, ps.out.len())
+        try primary(ps)
+    }
+}
+
+fn parse_or(inout ps: ReqParser) -> () ! CsreqError {
+    let label = ps.out.len()
+    try term(ps)
+    while is_kw(peek(ps, 0), "or") {
+        ps.i = ps.i + 1
+        ps.out = ps.out.slice(0, label) + [0, 0, 0, 7] + ps.out.slice(label, ps.out.len())
+        try term(ps)
+    }
+}
+
+/// A requirement's text to the blob `csreq -b` writes.
+pub fn compile(text: str) -> bytes ! CsreqError {
+    var ps = ReqParser{ toks: try lex(text), i: 0, out: [] }
+    try parse_or(ps)
+    while peek(ps, 0).kind == ";" {
+        ps.i = ps.i + 1
+    }
+    let rest = peek(ps, 0)
+    if rest.kind != "eof" {
+        fail(CsreqSyntax(rest.at, "unexpected " + rest.kind + " " + rest.text + " after the requirement"))
+    }
+    var head = ReqParser{ toks: [], i: 0, out: [] }
+    put32(head, 4208856064)
+    put32(head, 12 + ps.out.len())
+    put32(head, 1)
+    return bytes_of(head.out + ps.out)
+}

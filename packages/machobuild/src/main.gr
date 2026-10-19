@@ -1,0 +1,116 @@
+// What platform a Mach-O image was built for, and with what.
+//
+// Since 2018 a binary says it in LC_BUILD_VERSION: the platform (macOS,
+// iOS, Mac Catalyst, a simulator, visionOS, DriverKit...), the oldest OS
+// it runs on, the SDK it was built against, and the tools that built it
+// (clang, swift, ld) with their versions. (vtool calls visionOS by its
+// internal name, XROS.) Older binaries say only the
+// minimum OS and SDK, in one of four LC_VERSION_MIN commands -- one per
+// platform. Versions are packed xxxx.yy.zz in 32 bits; the source
+// version (LC_SOURCE_VERSION) is packed a.b.c.d.e in 64.
+//
+// `build_info` reads every such command; `describe` prints them as
+// `vtool -show-build` does.
+import machoread
+
+type BuildTool = { tool: i64, version: i64 }
+
+type BuildCommand = { index: i64, kind: i64, size: i64, platform: i64, minos: i64, sdk: i64, tools: [BuildTool] }
+
+type MachoBuildError =
+    | MachoBuildMalformed(why: str)
+
+fn word(d: bytes, at: i64, big: bool) -> i64 ! MachoBuildError {
+    if at < 0 or at + 4 > d.len() {
+        fail(MachoBuildMalformed("a read past the end"))
+    }
+    var v = 0
+    for k in 0..4 {
+        v = v.shl(8).bit_or(d.at(if big { at + k } else { at + 3 - k }))
+    }
+    return v
+}
+
+/// The platform for each LC_VERSION_MIN command.
+fn min_platform(kind: i64) -> i64 {
+    return if kind == 36 { 1 } else if kind == 37 { 2 } else if kind == 47 { 3 } else { 4 }
+}
+
+/// LC_BUILD_VERSION and LC_VERSION_MIN_* commands, with their load
+/// command indexes.
+pub fn build_info(image: bytes, at: i64) -> [BuildCommand] ! MachoBuildError {
+    let h = machoread.header(image, at) ?? fail(MachoBuildMalformed("not a Mach-O image"))
+    let cmds = machoread.commands(image, at) ?? fail(MachoBuildMalformed("bad load commands"))
+    var out: [BuildCommand] = []
+    for i in 0..cmds.len() {
+        let c = cmds[i]
+        if c.kind == 50 {
+            let n = try word(image, c.at + 20, h.big_endian)
+            var tools: [BuildTool] = []
+            for k in 0..n {
+                tools.push(BuildTool{ tool: try word(image, c.at + 24 + 8 * k, h.big_endian), version: try word(image, c.at + 28 + 8 * k, h.big_endian) })
+            }
+            out.push(BuildCommand{ index: i, kind: c.kind, size: c.size, platform: try word(image, c.at + 8, h.big_endian), minos: try word(image, c.at + 12, h.big_endian),
+                sdk: try word(image, c.at + 16, h.big_endian), tools: tools })
+        } else if c.kind == 36 or c.kind == 37 or c.kind == 47 or c.kind == 48 {
+            out.push(BuildCommand{ index: i, kind: c.kind, size: c.size, platform: min_platform(c.kind), minos: try word(image, c.at + 8, h.big_endian),
+                sdk: try word(image, c.at + 12, h.big_endian), tools: [] })
+        }
+    }
+    return out
+}
+
+/// xxxx.yy.zz, the patch only when it is not zero.
+pub fn version_text(v: i64) -> str {
+    let patch = v.bit_and(255)
+    return "{v.ushr(16)}.{v.ushr(8).bit_and(255)}" + if patch != 0 { ".{patch}" } else { "" }
+}
+
+pub fn platform_name(p: i64) -> str {
+    let names = ["", "MACOS", "IOS", "TVOS", "WATCHOS", "BRIDGEOS", "MACCATALYST", "IOSSIMULATOR", "TVOSSIMULATOR", "WATCHOSSIMULATOR", "DRIVERKIT", "XROS",
+        "XROSSIMULATOR", "FIRMWARE", "SEPOS", "MACOS_EXCLAVECORE", "MACOS_EXCLAVEKIT", "IOS_EXCLAVECORE", "IOS_EXCLAVEKIT", "TVOS_EXCLAVECORE",
+        "TVOS_EXCLAVEKIT", "WATCHOS_EXCLAVECORE", "WATCHOS_EXCLAVEKIT", "XROS_EXCLAVECORE", "XROS_EXCLAVEKIT", "MACOS_KERNELKIT", "IOS_KERNELKIT",
+        "TVOS_KERNELKIT", "WATCHOS_KERNELKIT", "XROS_KERNELKIT", "BRIDGEOS_KERNELKIT"]
+    return if p >= 1 and p < names.len() { names[p] } else { "{p}" }
+}
+
+/// A tool's name as vtool gives it: the three it knows by name, and any
+/// other (lld, Metal's tools) by number.
+pub fn tool_name(t: i64) -> str {
+    return if t == 1 { "CLANG" } else if t == 2 { "SWIFT" } else if t == 3 { "LD" } else { "{t}" }
+}
+
+fn right(s: str, n: i64) -> str {
+    return if s.len() >= n { s } else { " ".repeat(n - s.len()) + s }
+}
+
+fn command_name(kind: i64) -> str {
+    return if kind == 50 { "LC_BUILD_VERSION" } else if kind == 36 { "LC_VERSION_MIN_MACOSX" } else if kind == 37 { "LC_VERSION_MIN_IPHONEOS" }
+    else if kind == 47 { "LC_VERSION_MIN_TVOS" } else { "LC_VERSION_MIN_WATCHOS" }
+}
+
+/// The commands as `vtool -show-build` prints them (after its first line,
+/// the file's name).
+pub fn describe(cmds: [BuildCommand]) -> [str] {
+    var out: [str] = []
+    for c in cmds {
+        out.push("Load command {c.index}")
+        out.push(right("cmd", 9) + " " + command_name(c.kind))
+        out.push(right("cmdsize", 9) + " {c.size}")
+        let sdk = if c.sdk == 0 { "n/a" } else { version_text(c.sdk) }
+        if c.kind == 50 {
+            out.push(right("platform", 9) + " " + platform_name(c.platform))
+            out.push(right("minos", 9) + " " + version_text(c.minos))
+            out.push(right("sdk", 9) + " " + sdk)
+            out.push(right("ntools", 9) + " {c.tools.len()}")
+            for t in c.tools {
+                out.push(right("tool", 9) + " " + tool_name(t.tool))
+                out.push(right("version", 9) + " " + version_text(t.version))
+            }
+        } else {
+            out.push(right("version", 9) + " " + version_text(c.minos))
+            out.push(right("sdk", 9) + " " + sdk)
+        }
+    }
+    return out
+}

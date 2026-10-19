@@ -260,6 +260,44 @@ becomes buildable the day its reference is installed.
 
 ## Landed
 
+- [x] **B45: the files a toolchain leaves behind** — `dyldinfo` (rebase
+  and bind opcodes, before chained fixups) `machobuild` (LC_BUILD_VERSION
+  and LC_VERSION_MIN) `csreq` (code-signing requirements, compiled and
+  decompiled) `ranlibindex` (`__.SYMDEF SORTED`) `lzmaalone` (`.lzma`)
+  `packbits` `dwarfaddr` (`.debug_addr`, `.debug_str_offsets`)
+  `dwarflists` (`.debug_rnglists`) `debugnames` (`.debug_names`)
+  `unwindinfo` (`__unwind_info`), and the harness `b45test`; the new gate
+  `b45diff` runs about 210 cases in 15 families: opcode fixups against
+  objdump's bind, lazy-bind and rebase tables and against `dyld_info
+  -fixups`, weak-bind tables against objdump, build versions against
+  `vtool -show-build` on objects for every platform clang targets and on
+  commands vtool writes, 300 random requirements compiled byte for byte
+  as `csreq -b` compiles them and printed back as `csreq -t` prints them,
+  requirement sets in real signatures as `codesign -d -r-` lists them,
+  archive indexes against `nm --print-armap` and rebuilt byte for byte as
+  libtool writes them, `.lzma` files (sizes known and unknown, truncated,
+  bit-flipped) against liblzma, PackBits rows encoded byte for byte as
+  libtiff encodes them, DWARF 5's side tables in objects and .dSYMs
+  against `dwarfdump`, and unwind info against `objdump --unwind-info`
+  in images built here (two with more encodings than a compressed page
+  can index, so ld writes regular pages) and in the system's own, fat
+  ones included. Two oracles' bugs are counted and left out, not
+  copied: `dyld_info` pairs symbols with the wrong addresses after a bind
+  that steps backwards (`BIND_OPCODE_DO_BIND_ADD_ADDR_ULEB` with a
+  negative step) and then reads past the stream, sometimes crashing; and
+  objdump's weak-bind iterator, after a strong definition, re-applies
+  the previous step, so every later entry is misplaced by a pointer. In
+  both cases the regular bind table agrees with the code here. Found on
+  the way, in `xzfile`'s LZMA decoder: it accepted a range coder whose
+  first byte was not zero, an end marker decoded from zeros past the
+  input, a coder not finished at the end, a match reaching past the
+  dictionary, and a stream with a known size that went on after it
+  without an end marker. All five are now refused as liblzma refuses
+  them; 3,600 fuzzed files agree. One break per package turned the gate
+  red. The count reaches 992. **Every count from B29 to B44 was one too
+  high**: from B29 on, the count included `packages/README.md`, which is
+  a file. B29 reached 833, not 834, and B44 981, not 982.
+
 - [x] **B44: the font tables still unread** — B13's `cff`, `gpos` and
   `gvar`, with `gdef` `varstore` (item variation stores, HVAR, VVAR and
   MVAR) `traktable` `feattable` `metatable` (meta and ltag) `vertmetrics`
@@ -888,7 +926,7 @@ becomes buildable the day its reference is installed.
 | | |
 |---|---|
 | At the start | 669 |
-| Now | 982 |
+| Now | 992 |
 | Candidates above | 316 packages in 28 batches, plus `ecc`, `rfc6979` and `goprintf` |
 | Harnesses, one a batch | 28 |
 | If every candidate lands | 1016 |

@@ -1,0 +1,138 @@
+// The symbol index of a macOS static library: `__.SYMDEF SORTED`.
+//
+// A linker looking for a symbol in a `.a` does not open every member: it
+// reads the index ranlib (or libtool) put first -- a byte count, then
+// (string offset, member header offset) pairs sorted by symbol name, then
+// the names. Every externally defined symbol of every Mach-O member is
+// listed, private externs included; undefined and common symbols are not.
+// The names are laid out member by member, each in its own symbol-table
+// order, and the table is padded with zeros to a multiple of eight.
+//
+// `index` reads an archive's index as (symbol, member offset) pairs and
+// `member_name` names the member at an offset (BSD `#1/` long names
+// included), so the pair reads as `nm --print-armap` prints it;
+// `defined` lists what a member contributes; `payload` builds the
+// index's bytes for members at given offsets, as libtool does.
+import symtab
+
+type RanlibEntry = { symbol: str, offset: i64 }
+
+type RanlibError =
+    | RanlibMalformed(why: str)
+
+fn le32(d: bytes, at: i64) -> i64 ! RanlibError {
+    if at < 0 or at + 4 > d.len() {
+        fail(RanlibMalformed("a read past the end"))
+    }
+    return d.at(at) + d.at(at + 1) * 256 + d.at(at + 2) * 65536 + d.at(at + 3) * 16777216
+}
+
+/// A member's header at `at`: (name, where its data starts, data size).
+pub fn member_at(d: bytes, at: i64) -> (str, i64, i64) ! RanlibError {
+    if at + 60 > d.len() {
+        fail(RanlibMalformed("a member header past the end"))
+    }
+    let raw = d.slice(at, at + 16).to_str().trim()
+    let size = d.slice(at + 48, at + 58).to_str().trim().parse_int() ?? fail(RanlibMalformed("a member size"))
+    if raw.starts_with("#1/") {
+        let n = raw.substr(3, raw.len() - 3).parse_int() ?? 0
+        var e = at + 60
+        while e < at + 60 + n and d.at(e) != 0 {
+            e = e + 1
+        }
+        return (d.slice(at + 60, e).to_str(), at + 60 + n, size - n)
+    }
+    return (raw, at + 60, size)
+}
+
+pub fn member_name(d: bytes, at: i64) -> str ! RanlibError {
+    return (try member_at(d, at)).0
+}
+
+/// The archive's index, in index order.
+pub fn index(d: bytes) -> [RanlibEntry] ! RanlibError {
+    let (name, data, _size) = try member_at(d, 8)
+    if not name.starts_with("__.SYMDEF") {
+        fail(RanlibMalformed("no symbol index"))
+    }
+    let n = try le32(d, data)
+    let strings = data + 8 + n
+    var out: [RanlibEntry] = []
+    for i in 0..(n / 8) {
+        let strx = try le32(d, data + 4 + 8 * i)
+        var e = strings + strx
+        while e < d.len() and d.at(e) != 0 {
+            e = e + 1
+        }
+        out.push(RanlibEntry{ symbol: d.slice(strings + strx, e).to_str(), offset: try le32(d, data + 8 + 8 * i) })
+    }
+    return out
+}
+
+/// What an object contributes to the index: externally defined symbols
+/// (private externs too), in its symbol table's order.
+pub fn defined(object: bytes) -> [str] ! RanlibError {
+    var out: [str] = []
+    for s in symtab.symbols(object, 0) ?? fail(RanlibMalformed("a member that is not an object")) {
+        let kind = s.kind.bit_and(14)
+        if not symtab.is_stab(s) and symtab.is_external(s) and (kind == 14 or kind == 2) {
+            out.push(s.name)
+        }
+    }
+    return out
+}
+
+fn put32(inout out: [i64], v: i64) {
+    for k in 0..4 {
+        out.push(v.ushr(8 * k).bit_and(255))
+    }
+}
+
+fn less(a: str, b: str) -> bool {
+    let x = a.to_bytes()
+    let y = b.to_bytes()
+    var i = 0
+    while i < x.len() and i < y.len() {
+        if x.at(i) != y.at(i) {
+            return x.at(i) < y.at(i)
+        }
+        i = i + 1
+    }
+    return x.len() < y.len()
+}
+
+/// The `__.SYMDEF SORTED` contents for (member header offset, object)
+/// pairs, in archive order.
+pub fn payload(members: [(i64, bytes)]) -> bytes ! RanlibError {
+    var strtab: [i64] = []
+    var entries: [(str, i64, i64)] = []
+    for (offset, object) in members {
+        for name in try defined(object) {
+            entries.push((name, strtab.len(), offset))
+            for b in name.to_bytes().to_list() {
+                strtab.push(b)
+            }
+            strtab.push(0)
+        }
+    }
+    while strtab.len() % 8 != 0 {
+        strtab.push(0)
+    }
+    // A stable sort by name.
+    var sorted: [(str, i64, i64)] = []
+    for e in entries {
+        var at = sorted.len()
+        while at > 0 and less(e.0, sorted[at - 1].0) {
+            at = at - 1
+        }
+        sorted = sorted.slice(0, at) + [e] + sorted.slice(at, sorted.len())
+    }
+    var out: [i64] = []
+    put32(out, 8 * sorted.len())
+    for (_n, strx, off) in sorted {
+        put32(out, strx)
+        put32(out, off)
+    }
+    put32(out, strtab.len())
+    return bytes_of(out + strtab)
+}

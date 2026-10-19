@@ -1,0 +1,48 @@
+// `.lzma` files: LZMA alone, the format before `.xz`.
+//
+// Thirteen bytes of header -- the literal context, literal position and
+// position bits packed in one byte as (pb * 5 + lp) * 9 + lc, the
+// dictionary size, and the decoded size (all ones when unknown, and then
+// the stream ends with an end marker) -- then one raw LZMA stream. Old
+// source tarballs, firmware images, SWF files and lzma-utils' output all
+// use it. The LZMA decoder is `packages/xzfile`'s.
+//
+// `header` reads the header; `decode` the whole file.
+import xzfile
+
+type LzmaHeader = { lc: i64, lp: i64, pb: i64, dict_size: i64, size: Option[i64] }
+
+type LzmaAloneError =
+    | LzmaAloneMalformed(why: str)
+
+/// The 13-byte header.
+pub fn header(d: bytes) -> LzmaHeader ! LzmaAloneError {
+    if d.len() < 13 {
+        fail(LzmaAloneMalformed("shorter than the header"))
+    }
+    let props = d.at(0)
+    if props >= 225 {
+        fail(LzmaAloneMalformed("properties byte {props}"))
+    }
+    var dict = 0
+    for k in 0..4 {
+        dict = dict + d.at(1 + k).shl(8 * k)
+    }
+    var unknown = true
+    var size = 0
+    for k in 0..8 {
+        let b = d.at(5 + k)
+        unknown = unknown and b == 255
+        size = size + b.shl(8 * k)
+    }
+    if not unknown and size < 0 {
+        fail(LzmaAloneMalformed("a decoded size past 2^63"))
+    }
+    return LzmaHeader{ lc: props % 9, lp: props / 9 % 5, pb: props / 45, dict_size: dict, size: if unknown { None } else { Some(size) } }
+}
+
+/// The decoded contents, at most `limit` bytes.
+pub fn decode(d: bytes, limit: i64) -> bytes ! LzmaAloneError {
+    let h = try header(d)
+    return xzfile.lzma_decode(d.slice(13, d.len()), h.lc, h.lp, h.pb, h.dict_size, h.size, limit) ?? fail(LzmaAloneMalformed("a corrupt LZMA stream"))
+}

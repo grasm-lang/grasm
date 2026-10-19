@@ -1,0 +1,208 @@
+// Compact unwind information: `__TEXT,__unwind_info` in a linked Mach-O
+// image, how a debugger, a profiler or the C++ runtime walks the stack.
+//
+// Most functions unwind by one of a few recipes (frame pointer, frameless
+// with a fixed stack size, registers saved in a known order), so instead
+// of DWARF call-frame programs the linker writes a 32-bit encoding per
+// function and packs them in two levels: a header with the encodings used
+// most (shared by every page), the personality routines (the C++ or Swift
+// runtime's, 1-based), a top-level index of (first function, page,
+// LSDA range) ending in a sentinel, an array of (function, LSDA) pairs for
+// the functions that catch exceptions, and second-level pages. A regular
+// page lists (function offset, encoding) pairs; a compressed page packs
+// each entry in 32 bits -- the function's offset from the page's first in
+// 24, an encoding index in 8, counting the shared encodings first and the
+// page's own after them.
+//
+// `parse` reads the section; `describe` prints it as `objdump
+// --unwind-info` does, and `describe_image` does so for each slice of a
+// fat file in turn.
+import dwarfline
+import machofat
+
+type UnwindIndex = { function: i64, page: i64, lsda: i64 }
+
+type UnwindPage = { index: i64, kind: i64, own_encodings: [i64], entries: [(i64, i64, i64)] }
+
+type UnwindInfo = {
+    version: i64,
+    header: [i64],
+    common: [i64],
+    personalities: [i64],
+    indexes: [UnwindIndex],
+    lsdas: [(i64, i64)],
+    pages: [UnwindPage],
+}
+
+type UnwindError =
+    | UnwindMalformed(why: str)
+
+fn u32(d: bytes, at: i64) -> i64 ! UnwindError {
+    if at < 0 or at + 4 > d.len() {
+        fail(UnwindMalformed("a read past the end at {at}"))
+    }
+    return d.at(at) + d.at(at + 1) * 256 + d.at(at + 2) * 65536 + d.at(at + 3) * 16777216
+}
+
+fn u16(d: bytes, at: i64) -> i64 ! UnwindError {
+    if at < 0 or at + 2 > d.len() {
+        fail(UnwindMalformed("a read past the end at {at}"))
+    }
+    return d.at(at) + d.at(at + 1) * 256
+}
+
+fn page_at(d: bytes, i: i64, at: i64, base: i64, common: [i64]) -> UnwindPage ! UnwindError {
+    let kind = try u32(d, at)
+    var page_enc: [i64] = []
+    var entries: [(i64, i64, i64)] = []
+    if kind == 2 {
+        let start = try u16(d, at + 4)
+        let n = try u16(d, at + 6)
+        for k in 0..n {
+            entries.push((try u32(d, at + start + 8 * k), 0 - 1, try u32(d, at + start + 8 * k + 4)))
+        }
+    } else if kind == 3 {
+        let start = try u16(d, at + 4)
+        let n = try u16(d, at + 6)
+        let enc_start = try u16(d, at + 8)
+        let nenc = try u16(d, at + 10)
+        for k in 0..nenc {
+            page_enc.push(try u32(d, at + enc_start + 4 * k))
+        }
+        for k in 0..n {
+            let e = try u32(d, at + start + 4 * k)
+            let idx = e.ushr(24)
+            let enc = if idx < common.len() { common[idx] } else if idx - common.len() < page_enc.len() { page_enc[idx - common.len()] } else { 0 }
+            entries.push((base + e.bit_and(16777215), idx, enc))
+        }
+    }
+    return UnwindPage{ index: i, kind: kind, own_encodings: page_enc, entries: entries }
+}
+
+/// Reads a `__unwind_info` section.
+pub fn parse(d: bytes) -> UnwindInfo ! UnwindError {
+    let version = try u32(d, 0)
+    var header: [i64] = []
+    for k in 1..7 {
+        header.push(try u32(d, 4 * k))
+    }
+    var common: [i64] = []
+    for k in 0..header[1] {
+        common.push(try u32(d, header[0] + 4 * k))
+    }
+    var pers: [i64] = []
+    for k in 0..header[3] {
+        pers.push(try u32(d, header[2] + 4 * k))
+    }
+    var idx: [UnwindIndex] = []
+    for k in 0..header[5] {
+        let p = header[4] + 12 * k
+        idx.push(UnwindIndex{ function: try u32(d, p), page: try u32(d, p + 4), lsda: try u32(d, p + 8) })
+    }
+    var lsdas: [(i64, i64)] = []
+    if idx.len() > 0 {
+        let n = (idx[idx.len() - 1].lsda - idx[0].lsda) / 8
+        for k in 0..n {
+            lsdas.push((try u32(d, idx[0].lsda + 8 * k), try u32(d, idx[0].lsda + 8 * k + 4)))
+        }
+    }
+    var pages: [UnwindPage] = []
+    for i in 0..(idx.len() - 1) {
+        if idx[i].page == 0 {
+            break
+        }
+        pages.push(try page_at(d, i, idx[i].page, idx[i].function, common))
+    }
+    return UnwindInfo{ version: version, header: header, common: common, personalities: pers, indexes: idx, lsdas: lsdas, pages: pages }
+}
+
+fn h(v: i64) -> str {
+    let digits = "0123456789abcdef"
+    if v == 0 {
+        return "0"
+    }
+    var s = ""
+    var x = v
+    while x > 0 {
+        s = digits.substr(x.bit_and(15), 1) + s
+        x = x.ushr(4)
+    }
+    return s
+}
+
+fn h8(v: i64) -> str {
+    var s = h(v)
+    while s.len() < 8 {
+        s = "0" + s
+    }
+    return s
+}
+
+/// The section as `objdump --unwind-info` prints it (after its heading).
+pub fn describe(u: UnwindInfo) -> [str] {
+    let labels = ["Common encodings array section offset:     ", "Number of common encodings in array:       ", "Personality function array section offset: ",
+        "Number of personality functions in array:  ", "Index array section offset:                ", "Number of indices in array:                "]
+    var out = ["  Version:                                   0x" + h(u.version)]
+    for k in 0..6 {
+        out.push("  " + labels[k] + "0x" + h(u.header[k]))
+    }
+    out.push("  Common encodings: (count = {u.common.len()})")
+    for k in 0..u.common.len() {
+        out.push("    encoding[{k}]: 0x" + h8(u.common[k]))
+    }
+    out.push("  Personality functions: (count = {u.personalities.len()})")
+    for k in 0..u.personalities.len() {
+        out.push("    personality[{k + 1}]: 0x" + h8(u.personalities[k]))
+    }
+    out.push("  Top level indices: (count = {u.indexes.len()})")
+    for k in 0..u.indexes.len() {
+        let x = u.indexes[k]
+        out.push("    [{k}]: function offset=0x" + h8(x.function) + ", 2nd level page offset=0x" + h8(x.page) + ", LSDA offset=0x" + h8(x.lsda))
+    }
+    out.push("  LSDA descriptors:")
+    for k in 0..u.lsdas.len() {
+        out.push("    [{k}]: function offset=0x" + h8(u.lsdas[k].0) + ", LSDA offset=0x" + h8(u.lsdas[k].1))
+    }
+    out.push("  Second level indices:")
+    for p in u.pages {
+        let x = u.indexes[p.index]
+        out.push("    Second level index[{p.index}]: offset in section=0x" + h8(x.page) + ", base function offset=0x" + h8(x.function))
+        if p.kind != 2 and p.kind != 3 {
+            out.push("    Skipping 2nd level page with unknown kind {p.kind}")
+            continue
+        }
+        if p.own_encodings.len() > 0 {
+            out.push("      Page encodings: (count = {p.own_encodings.len()})")
+            for k in 0..p.own_encodings.len() {
+                out.push("        encoding[{k + u.common.len()}]: 0x" + h8(p.own_encodings[k]))
+            }
+        }
+        for k in 0..p.entries.len() {
+            let (f, idx, enc) = p.entries[k]
+            out.push("      [{k}]: function offset=0x" + h8(f) + ", " + (if p.kind == 2 { "encoding=0x" } else { "encoding[{idx}]=0x" }) + h8(enc))
+        }
+    }
+    return out
+}
+
+fn one_image(image: bytes) -> [str] ! UnwindError {
+    let d = dwarfline.section(image, "__TEXT", "__unwind_info") ?? fail(UnwindMalformed("sections"))
+    if d.len() == 0 {
+        return []
+    }
+    return ["Contents of __unwind_info section:"] + describe(try parse(d))
+}
+
+/// A linked image's unwind info, as objdump prints it from the section's
+/// heading on: each slice of a fat file in header order, any slice
+/// without the section left out.
+pub fn describe_image(image: bytes) -> [str] ! UnwindError {
+    if not machofat.is_fat(image) {
+        return try one_image(image)
+    }
+    var out: [str] = []
+    for s in machofat.slices(image) ?? fail(UnwindMalformed("fat header")) {
+        out = out + try one_image(machofat.bytes_of_slice(image, s))
+    }
+    return out
+}

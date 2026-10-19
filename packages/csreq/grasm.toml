@@ -1,0 +1,4 @@
+[package]
+name = "csreq"
+version = "1.0.0"
+capabilities = []

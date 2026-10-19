@@ -1,0 +1,9 @@
+[package]
+name = "ranlibindex"
+version = "1.0.0"
+capabilities = []
+
+[dependencies.symtab]
+path = "../symtab"
+version = "^1.0.0"
+

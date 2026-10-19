@@ -1,0 +1,8 @@
+[package]
+name = "debugnames"
+version = "1.0.0"
+capabilities = []
+
+[dependencies.dwarfline]
+path = "../dwarfline"
+version = "^1.0.0"

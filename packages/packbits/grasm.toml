@@ -1,0 +1,4 @@
+[package]
+name = "packbits"
+version = "1.0.0"
+capabilities = []

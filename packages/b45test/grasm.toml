@@ -1,0 +1,44 @@
+[package]
+name = "b45test"
+version = "1.0.0"
+capabilities = ["io"]
+
+[dependencies.dyldinfo]
+path = "../dyldinfo"
+version = "^1.0.0"
+
+[dependencies.machobuild]
+path = "../machobuild"
+version = "^1.0.0"
+
+[dependencies.csreq]
+path = "../csreq"
+version = "^1.0.0"
+
+[dependencies.ranlibindex]
+path = "../ranlibindex"
+version = "^1.0.0"
+
+[dependencies.lzmaalone]
+path = "../lzmaalone"
+version = "^1.0.0"
+
+[dependencies.packbits]
+path = "../packbits"
+version = "^1.0.0"
+
+[dependencies.dwarfaddr]
+path = "../dwarfaddr"
+version = "^1.0.0"
+
+[dependencies.dwarflists]
+path = "../dwarflists"
+version = "^1.0.0"
+
+[dependencies.debugnames]
+path = "../debugnames"
+version = "^1.0.0"
+
+[dependencies.unwindinfo]
+path = "../unwindinfo"
+version = "^1.0.0"

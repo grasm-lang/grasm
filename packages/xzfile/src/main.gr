@@ -69,12 +69,13 @@ fn next_byte(inout r: XzRange) -> i64 {
 }
 
 fn range_start(data: bytes, at: i64) -> XzRange {
+    // The first byte is always zero; anything else is a corrupt stream.
     var r = XzRange{
         data: data,
         at: at + 1,
         range: 4294967295,
         code: 0,
-        failed: false,
+        failed: at >= data.len() or data.at(at) != 0,
     }
     var i = 0
     while i < 4 {
@@ -745,4 +746,53 @@ pub fn check_kind(data: bytes) -> i64 {
         return -1
     }
     return data.at(7).bit_and(15)
+}
+
+/// A raw LZMA (not LZMA2) stream: what `.lzma` files, 7z's LZMA coder and
+/// ZIP method 14 hold. A match may reach back at most `dict_size` bytes
+/// (taken as liblzma takes it: at least 4096, rounded up to a multiple of
+/// 16). `size` is the decoded length when known: the stream may then end
+/// there, or carry one end marker after it, and nothing else. None reads
+/// to the end marker. Either way the range coder must finish with its
+/// code at zero, as liblzma requires.
+pub fn lzma_decode(data: bytes, lc: i64, lp: i64, pb: i64, dict_size: i64, size: Option[i64], limit: i64) -> bytes ! XzError {
+    if lc > 8 or lp > 4 or pb > 4 {
+        fail(XzCorrupt(0))
+    }
+    let window = (if dict_size < 4096 { 4096 } else { dict_size } + 15) / 16 * 16
+    var d = new_lzma(lc, lp, pb, 0)
+    var r = range_start(data, 0)
+    let target = size ?? limit
+    if target > limit {
+        fail(XzTooLarge(limit))
+    }
+    while d.out.len() < target {
+        if r.failed {
+            fail(XzCorrupt(0))
+        }
+        d.dict_at = if d.out.len() > window { d.out.len() - window } else { 0 }
+        if not decode_symbol(r, d, limit) {
+            // An end marker ends the stream only if it was read from the
+            // input (not from zeros past it) and leaves the coder finished.
+            if d.reps[0] == 4294967295 and size == None and not r.failed and r.code == 0 {
+                return bytes_of(d.out)
+            }
+            fail(XzCorrupt(0))
+        }
+    }
+    if size == None {
+        fail(XzTooLarge(limit))
+    }
+    // A match running past the size, input that ran out, or a coder not
+    // finished and not followed by exactly an end marker: all corrupt.
+    if d.out.len() > target or r.failed {
+        fail(XzCorrupt(0))
+    }
+    if r.code != 0 {
+        d.dict_at = if d.out.len() > window { d.out.len() - window } else { 0 }
+        if decode_symbol(r, d, limit) or d.reps[0] != 4294967295 or r.failed or r.code != 0 {
+            fail(XzCorrupt(0))
+        }
+    }
+    return bytes_of(d.out)
 }

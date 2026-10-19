@@ -1,0 +1,159 @@
+// The harness scripts/b45_diff.py drives: one operation per (op, path)
+// pair, one answer line each. Text answers are hex, so any byte survives;
+// byte answers go to `<path>.out` and the line says "ok".
+import dyldinfo
+import machobuild
+import csreq
+import ranlibindex
+import lzmaalone
+import packbits
+import dwarfaddr
+import dwarflists
+import debugnames
+import unwindinfo
+
+fn hex(b: bytes) -> str {
+    let digits = "0123456789abcdef"
+    var parts: [str] = []
+    for x in b.to_list() {
+        parts.push(digits.substr(x.ushr(4), 1) + digits.substr(x.bit_and(15), 1))
+    }
+    return parts.join("")
+}
+
+fn lines_hex(ls: [str]) -> str {
+    return hex(ls.join("\n").to_bytes())
+}
+
+fn unhex(h: str) -> bytes {
+    var out: [i64] = []
+    let b = h.to_bytes()
+    var i = 0
+    while i + 1 < b.len() {
+        let hi = b.at(i)
+        let lo = b.at(i + 1)
+        out.push((if hi >= 97 { hi - 87 } else { hi - 48 }) * 16 + (if lo >= 97 { lo - 87 } else { lo - 48 }))
+        i = i + 2
+    }
+    return bytes_of(out)
+}
+
+/// Each line of the file compiled and its bytes decompiled again:
+/// `bytes|text` in hex, or ERR where the text does not compile.
+fn requirements(d: bytes) -> str {
+    var out: [str] = []
+    for line in d.to_str().split("\n").filter(|l| l.len() > 0) {
+        out.push(match csreq.compile(line) {
+            Ok(b) -> hex(b) + "|" + match csreq.decompile(b) {
+                Ok(t) -> hex(t.to_bytes())
+                Err(_e) -> "ERR"
+            }
+            Err(_e) -> "ERR"
+        })
+    }
+    return out.join(";")
+}
+
+/// Each line a requirement blob in hex, decompiled.
+fn blobs(d: bytes) -> str {
+    var out: [str] = []
+    for line in d.to_str().split("\n").filter(|l| l.len() > 0) {
+        out.push(match csreq.decompile(unhex(line)) {
+            Ok(t) -> hex(t.to_bytes())
+            Err(_e) -> "ERR"
+        })
+    }
+    return out.join(";")
+}
+
+fn armap(d: bytes) -> str ! str {
+    var out = ["Archive map"]
+    for e in ranlibindex.index(d) ?? fail("index") {
+        out.push(e.symbol + " in " + (ranlibindex.member_name(d, e.offset) ?? fail("member")))
+    }
+    return lines_hex(out)
+}
+
+/// The index rebuilt from the members as they lie, against the one there.
+fn reindex(d: bytes) -> str ! str {
+    let (_n, data0, size0) = ranlibindex.member_at(d, 8) ?? fail("first member")
+    var members: [(i64, bytes)] = []
+    var at = data0 + size0
+    at = at + at % 2
+    while at + 60 <= d.len() {
+        let (_name, data, size) = ranlibindex.member_at(d, at) ?? fail("member")
+        members.push((at, d.slice(data, data + size)))
+        let end = data + size
+        at = end + end % 2
+    }
+    let mine = ranlibindex.payload(members) ?? fail("payload")
+    return if mine == d.slice(data0, data0 + size0) { "same" } else { "differs at {mine.len()} bytes against {size0}" }
+}
+
+fn to_file(path: str, b: bytes) -> str ! str / {io} {
+    write_bytes(path + ".out", b) ?? fail("write")
+    return "ok"
+}
+
+fn answer(op: [str], path: str) -> str ! str / {io} {
+    let d = read_bytes(path) ?? fail("cannot read " + path)
+    let o = op[0]
+    if o == "fixups" {
+        return lines_hex(dyldinfo.describe(d, 0) ?? fail("fixups"))
+    }
+    if o == "weak" {
+        return lines_hex(dyldinfo.describe_weak(d, 0) ?? fail("weak"))
+    }
+    if o == "build" {
+        return lines_hex(machobuild.describe(machobuild.build_info(d, 0) ?? fail("build")))
+    }
+    if o == "req" {
+        return requirements(d)
+    }
+    if o == "reqblob" {
+        return blobs(d)
+    }
+    if o == "reqset" {
+        return lines_hex(csreq.decompile_set(d) ?? fail("set"))
+    }
+    if o == "armap" {
+        return try armap(d)
+    }
+    if o == "ranlib" {
+        return try reindex(d)
+    }
+    if o == "lzma" {
+        return try to_file(path, lzmaalone.decode(d, 1073741824) ?? fail("lzma"))
+    }
+    if o == "pbenc" {
+        return try to_file(path, packbits.encode(d, op[1].parse_int() ?? 1))
+    }
+    if o == "pbdec" {
+        return try to_file(path, packbits.decode(d, 1073741824) ?? fail("packbits"))
+    }
+    if o == "addr" {
+        return lines_hex(dwarfaddr.describe_image(d) ?? fail("addr"))
+    }
+    if o == "rng" {
+        return lines_hex(dwarflists.describe_image(d) ?? fail("rnglists"))
+    }
+    if o == "names" {
+        return lines_hex(debugnames.describe_image(d) ?? fail("names"))
+    }
+    if o == "unwind" {
+        return lines_hex(unwindinfo.describe_image(d) ?? fail("unwind"))
+    }
+    fail("unknown op " + o)
+}
+
+fn main() / {io} {
+    let argv = args()
+    var i = 0
+    while i + 1 < argv.len() {
+        print(match answer(argv[i].split(":"), argv[i + 1]) {
+            Ok(s) -> s
+            Err(_e) -> "ERR"
+        })
+        i = i + 2
+    }
+}

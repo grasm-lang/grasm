@@ -1,0 +1,115 @@
+// Ten readers of the files a toolchain leaves behind, each run once on
+// bytes built here. scripts/b45_diff.sh holds them to dyld_info, objdump,
+// vtool, csreq, codesign, nm, liblzma, libtiff and dwarfdump.
+import dyldinfo
+import machobuild
+import csreq
+import ranlibindex
+import lzmaalone
+import packbits
+import dwarfaddr
+import dwarflists
+import debugnames
+import unwindinfo
+
+fn le(v: i64, n: i64) -> [i64] {
+    var out: [i64] = []
+    for k in 0..n {
+        out.push(v.ushr(8 * k).bit_and(255))
+    }
+    return out
+}
+
+fn unhex(h: str) -> bytes {
+    var out: [i64] = []
+    let b = h.to_bytes()
+    var i = 0
+    while i + 1 < b.len() {
+        let hi = b.at(i)
+        let lo = b.at(i + 1)
+        out.push((if hi >= 97 { hi - 87 } else { hi - 48 }) * 16 + (if lo >= 97 { lo - 87 } else { lo - 48 }))
+        i = i + 2
+    }
+    return bytes_of(out)
+}
+
+fn compression() {
+    // Apple's PackBits example (TN1023), which libtiff packs the same way.
+    let row = unhex("aaaaaa80002aaaaaaaaa80002a22aaaaaaaaaaaaaaaaaaaa")
+    let packed = packbits.encode_row(row)
+    assert_eq(packed, unhex("feaa0280002afdaa0380002a22f7aa"))
+    assert_eq(packbits.decode(packed, 100) ?? bytes_of([]), row)
+    // A .lzma file as Python's lzma writes it: size unknown, end marker.
+    let lz = bytes_of([93, 0, 16, 0, 0, 255, 255, 255, 255, 255, 255, 255, 255, 0, 51, 156, 136, 70, 253, 103, 31, 113, 171, 174, 229, 25, 25, 200, 16, 44, 231,
+        143, 197, 90, 222, 99, 127, 0, 253, 92, 97, 106, 87, 185, 128, 217, 231, 255, 255, 176, 96, 0, 0])
+    let h = lzmaalone.header(lz) ?? panic("header")
+    assert_eq((h.lc, h.lp, h.pb, h.dict_size), (3, 0, 2, 4096))
+    assert_eq((lzmaalone.decode(lz, 1000) ?? panic("decode")).to_str(), "grasm reads .lzma files, grasm reads .lzma files\n")
+}
+
+fn signing() {
+    // The requirement as `csreq -b` compiles it, and back.
+    let text = "identifier \"com.example.app\" and anchor apple generic"
+    let blob = unhex("fade0c000000002c0000000100000006000000020000000f636f6d2e6578616d706c652e617070000000000f")
+    assert_eq(csreq.compile(text) ?? panic("compile"), blob)
+    assert_eq(csreq.decompile(blob) ?? panic("decompile"), text)
+    // LC_BUILD_VERSION for macOS 14.4.1 with the 15.2 SDK and ld 1115.7.3.
+    let cmd = le(50, 4) + le(32, 4) + le(1, 4) + le(918529, 4) + le(983552, 4) + le(1, 4) + le(3, 4) + le(73074435, 4)
+    let image = bytes_of(le(4277009103, 4) + le(16777228, 4) + le(0, 4) + le(1, 4) + le(1, 4) + le(cmd.len(), 4) + le(0, 4) + le(0, 4) + cmd)
+    let lines = machobuild.describe(machobuild.build_info(image, 0) ?? panic("build"))
+    assert_eq(lines, ["Load command 0", "      cmd LC_BUILD_VERSION", "  cmdsize 32", " platform MACOS", "    minos 14.4.1", "      sdk 15.2", "   ntools 1",
+        "     tool LD", "  version 1115.7.3"])
+    // An image with no LC_DYLD_INFO has no opcodes to read.
+    let refused = match dyldinfo.fixups(image, 0) {
+        Ok(_f) -> false
+        Err(_e) -> true
+    }
+    assert_eq(refused, true)
+}
+
+fn archives() {
+    // One member with a BSD long name, `#1/8`: the name rides in front of
+    // the data, padded with NULs.
+    let header = "#1/8            0           0     0     644     12        `\n"
+    let ar = bytes_of("!<arch>\n".to_bytes().to_list() + header.to_bytes().to_list() + "ab.o".to_bytes().to_list() + [0, 0, 0, 0, 1, 2, 3, 4])
+    assert_eq(ranlibindex.member_name(ar, 8) ?? "", "ab.o")
+    let (_name, data, size) = ranlibindex.member_at(ar, 8) ?? panic("member")
+    assert_eq(ar.slice(data, data + size), bytes_of([1, 2, 3, 4]))
+}
+
+fn debug_tables() {
+    // .debug_addr: one DWARF 5 table, one eight-byte address.
+    let addr = bytes_of(le(12, 4) + le(5, 2) + [8, 0] + le(4294983552, 8))
+    assert_eq(dwarfaddr.describe_addr(dwarfaddr.addr_tables(addr) ?? []), ["Address table header: length = 0x0000000c, format = DWARF32, " +
+        "version = 0x0005, addr_size = 0x08, seg_size = 0x00", "Addrs: [", "0x0000000100003f80", "]"])
+    // .debug_rnglists: a base address, two offset pairs, the end.
+    let lists = le(5, 2) + [8, 0] + le(0, 4) + [5] + le(4096, 8) + [4, 0, 16, 4, 44, 224, 1] + [0]
+    let rl = bytes_of(le(lists.len(), 4) + lists)
+    assert_eq(dwarflists.describe(dwarflists.tables(rl) ?? [], None), ["range list header: length = 0x00000019, format = DWARF32, version = 0x0005, " +
+        "addr_size = 0x08, seg_size = 0x00, offset_entry_count = 0x00000000", "ranges:", "[0x0000000000001000, 0x0000000000001010)",
+        "[0x000000000000102c, 0x00000000000010e0)", "<End of list>"])
+    assert_eq(debugnames.tag_name(46), "DW_TAG_subprogram")
+    assert_eq(debugnames.indexes(bytes_of([])) ?? [], [])
+}
+
+fn unwind() {
+    // A header, one common encoding (frame-based, arm64), no personalities,
+    // two top-level entries (the second the sentinel) and one compressed
+    // page holding two functions.
+    let head = le(1, 4) + le(28, 4) + le(1, 4) + le(32, 4) + le(0, 4) + le(32, 4) + le(2, 4) + le(67108864, 4)
+    let index = le(16384, 4) + le(56, 4) + le(56, 4) + le(16512, 4) + le(0, 4) + le(56, 4)
+    let page = le(3, 4) + le(12, 2) + le(2, 2) + le(20, 2) + le(0, 2) + le(0, 4) + le(64, 4)
+    let u = unwindinfo.parse(bytes_of(head + index + page)) ?? panic("unwind")
+    let lines = unwindinfo.describe(u)
+    assert_eq(lines[lines.len() - 3], "    Second level index[0]: offset in section=0x00000038, base function offset=0x00004000")
+    assert_eq(lines[lines.len() - 1], "      [1]: function offset=0x00004040, encoding[0]=0x04000000")
+}
+
+fn main() / {io} {
+    compression()
+    signing()
+    archives()
+    debug_tables()
+    unwind()
+    print("ten toolchain readers exercised")
+}

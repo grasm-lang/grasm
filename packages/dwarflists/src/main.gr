@@ -1,0 +1,163 @@
+// DWARF 5 range lists: `.debug_rnglists`.
+//
+// A function split by the optimiser, an inlined call spread across a
+// loop, a scope that is two pieces of code: each is described by a list
+// of address ranges. DWARF 5 packs those lists into `.debug_rnglists`,
+// one table per unit -- a header (length, version, address and selector
+// sizes, and an optional array of offsets so entries can be named by
+// index) and then lists of entries, each kind saying how its range is
+// written: a base address (literal, or an index into `.debug_addr`), a
+// pair of offsets from that base, start and end, start and length, the
+// start by index, and an end-of-list marker.
+//
+// `tables` reads the section; `describe` prints it as `dwarfdump
+// --debug-rnglists` does: headers, offset arrays, and every list resolved
+// to [start, end) ranges. An address given by index is resolved through
+// the address table passed in; dumping the section on its own, dwarfdump
+// has none and uses the index itself, which `describe_image` copies.
+import dwarfline
+
+type RangeEntry = { kind: i64, a: i64, b: i64 }
+
+type RangeTable = { length: i64, dwarf64: bool, version: i64, addr_size: i64, seg_size: i64, offsets: [i64], lists: [[RangeEntry]] }
+
+type DwarfListError =
+    | DwarfListMalformed(why: str)
+
+type ListCursor = { d: bytes, at: i64 }
+
+fn le(inout c: ListCursor, n: i64) -> i64 ! DwarfListError {
+    if c.at + n > c.d.len() {
+        fail(DwarfListMalformed("a read past the end"))
+    }
+    var v = 0
+    for k in 0..n {
+        v = v.bit_or(c.d.at(c.at + k).shl(8 * k))
+    }
+    c.at = c.at + n
+    return v
+}
+
+fn uleb(inout c: ListCursor) -> i64 ! DwarfListError {
+    var v = 0
+    var shift = 0
+    while true {
+        let b = try le(c, 1)
+        if shift < 64 {
+            v = v.bit_or(b.bit_and(127).shl(shift))
+        }
+        shift = shift + 7
+        if b < 128 {
+            break
+        }
+    }
+    return v
+}
+
+/// Every table in a `.debug_rnglists` section.
+pub fn tables(d: bytes) -> [RangeTable] ! DwarfListError {
+    var out: [RangeTable] = []
+    var c = ListCursor{ d: d, at: 0 }
+    while c.at < d.len() {
+        var len = try le(c, 4)
+        var wide = false
+        if len == 4294967295 {
+            len = try le(c, 8)
+            wide = true
+        }
+        let end = c.at + len
+        let version = try le(c, 2)
+        let asize = try le(c, 1)
+        let ssize = try le(c, 1)
+        let count = try le(c, 4)
+        var offs: [i64] = []
+        for _k in 0..count {
+            offs.push(try le(c, if wide { 8 } else { 4 }))
+        }
+        var lists: [[RangeEntry]] = []
+        var cur: [RangeEntry] = []
+        while c.at < end {
+            let kind = try le(c, 1)
+            var e = RangeEntry{ kind: kind, a: 0, b: 0 }
+            if kind == 1 or kind == 2 or kind == 3 or kind == 4 {
+                e.a = try uleb(c)
+                if kind != 1 {
+                    e.b = try uleb(c)
+                }
+            } else if kind == 5 {
+                e.a = try le(c, asize)
+            } else if kind == 6 or kind == 7 {
+                e.a = try le(c, asize)
+                e.b = if kind == 6 { try le(c, asize) } else { try uleb(c) }
+            } else if kind != 0 {
+                fail(DwarfListMalformed("a range list entry kind {kind}"))
+            }
+            cur.push(e)
+            if kind == 0 {
+                lists.push(cur)
+                cur = []
+            }
+        }
+        c.at = end
+        out.push(RangeTable{ length: len, dwarf64: wide, version: version, addr_size: asize, seg_size: ssize, offsets: offs, lists: lists })
+    }
+    return out
+}
+
+fn hexw(v: i64, w: i64) -> str {
+    let digits = "0123456789abcdef"
+    var s = ""
+    for k in 0..w {
+        s = digits.substr(v.ushr(4 * k).bit_and(15), 1) + s
+    }
+    return s
+}
+
+fn lookup(addrs: Option[[i64]], i: i64) -> i64 {
+    return match addrs {
+        Some(a) -> if i < a.len() { a[i] } else { i }
+        None -> i
+    }
+}
+
+/// The section as `dwarfdump --debug-rnglists` prints it.
+pub fn describe(ts: [RangeTable], addrs: Option[[i64]]) -> [str] {
+    var out: [str] = []
+    for t in ts {
+        out.push("range list header: length = 0x" + hexw(t.length, if t.dwarf64 { 16 } else { 8 }) + ", format = " + (if t.dwarf64 { "DWARF64" } else { "DWARF32" }) +
+            ", version = 0x" + hexw(t.version, 4) + ", addr_size = 0x" + hexw(t.addr_size, 2) + ", seg_size = 0x" + hexw(t.seg_size, 2) + ", offset_entry_count = 0x" +
+            hexw(t.offsets.len(), 8))
+        if t.offsets.len() > 0 {
+            out.push("offsets: [")
+            for o in t.offsets {
+                out.push("0x" + hexw(o, if t.dwarf64 { 16 } else { 8 }))
+            }
+            out.push("]")
+        }
+        out.push("ranges:")
+        let w = 2 * t.addr_size
+        for l in t.lists {
+            var base = 0
+            for e in l {
+                if e.kind == 0 {
+                    out.push("<End of list>")
+                } else if e.kind == 1 {
+                    base = lookup(addrs, e.a)
+                } else if e.kind == 5 {
+                    base = e.a
+                } else {
+                    let start = if e.kind == 4 { base + e.a } else if e.kind == 2 or e.kind == 3 { lookup(addrs, e.a) } else { e.a }
+                    let end = if e.kind == 4 { base + e.b } else if e.kind == 2 { lookup(addrs, e.b) } else if e.kind == 6 { e.b } else { start + e.b }
+                    out.push("[0x" + hexw(start, w) + ", 0x" + hexw(end, w) + ")")
+                }
+            }
+        }
+    }
+    return out
+}
+
+/// The range lists of a Mach-O object or .dSYM, as dwarfdump prints them.
+pub fn describe_image(image: bytes) -> [str] ! DwarfListError {
+    let rl = dwarfline.section(image, "__DWARF", "__debug_rnglists") ?? fail(DwarfListMalformed("sections"))
+    return describe(try tables(rl), None)
+}

@@ -1,0 +1,12 @@
+[package]
+name = "unwindinfo"
+version = "1.0.0"
+capabilities = []
+
+[dependencies.dwarfline]
+path = "../dwarfline"
+version = "^1.0.0"
+
+[dependencies.machofat]
+path = "../machofat"
+version = "^1.0.0"

@@ -1,0 +1,12 @@
+[package]
+name = "dyldinfo"
+version = "1.0.0"
+capabilities = []
+
+[dependencies.machoread]
+path = "../machoread"
+version = "^1.0.0"
+
+[dependencies.chainedfixups]
+path = "../chainedfixups"
+version = "^1.0.0"

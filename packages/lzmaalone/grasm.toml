@@ -1,0 +1,8 @@
+[package]
+name = "lzmaalone"
+version = "1.0.0"
+capabilities = []
+
+[dependencies.xzfile]
+path = "../xzfile"
+version = "^1.0.0"
