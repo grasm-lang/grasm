@@ -1,0 +1,155 @@
+// Vorbis comments: the tags of Ogg Vorbis, Opus, FLAC, Speex and Theora.
+//
+// A vendor string, then a count of user comments, each "NAME=value" --
+// every length a 32-bit little-endian count of UTF-8 bytes. Names are
+// ASCII from 0x20 to 0x7D except '=', compared without regard to case;
+// a name may repeat (two ARTISTs). Vorbis wraps it in a header packet
+// ("\x03vorbis", the comments, a framing bit); Opus prefixes "OpusTags";
+// FLAC stores it bare in a VORBIS_COMMENT block. Every Ogg file, every
+// tagged FLAC album and every Opus voice note in a messaging app carries
+// these.
+//
+// Checked against FFmpeg's Ogg muxer and demuxer: the comments FFmpeg
+// writes parse to the tags given it, and comments written here, packed
+// into a stream with `oggpage`, read back in FFmpeg as the same tags.
+
+type VorbisComments = { vendor: str, comments: [(str, str)] }
+
+type VorbisCommentError =
+    | VcMalformed(why: str)
+    | VcBadName(name: str)
+
+fn u32(d: bytes, at: i64) -> i64 {
+    return d.at(at).bit_or(d.at(at + 1).shl(8)).bit_or(d.at(at + 2).shl(16)).bit_or(d.at(at + 3).shl(24))
+}
+
+/// A field name as the specification allows it.
+pub fn valid_name(name: str) -> bool {
+    let b = name.to_bytes()
+    if b.len() == 0 {
+        return false
+    }
+    for i in 0..b.len() {
+        let c = b.at(i)
+        if c < 32 or c > 125 or c == 61 {
+            return false
+        }
+    }
+    return true
+}
+
+/// The bare structure starting at `at`, and where it ends.
+pub fn parse_at(d: bytes, at: i64) -> (VorbisComments, i64) ! VorbisCommentError {
+    if at + 4 > d.len() {
+        fail(VcMalformed("no vendor length"))
+    }
+    let vlen = u32(d, at)
+    if at + 4 + vlen + 4 > d.len() {
+        fail(VcMalformed("a vendor string longer than the data"))
+    }
+    let vendor = d.slice(at + 4, at + 4 + vlen).to_str()
+    var p = at + 4 + vlen
+    let count = u32(d, p)
+    p = p + 4
+    var comments: [(str, str)] = []
+    for _i in 0..count {
+        if p + 4 > d.len() {
+            fail(VcMalformed("fewer comments than the count"))
+        }
+        let n = u32(d, p)
+        if p + 4 + n > d.len() {
+            fail(VcMalformed("a comment longer than the data"))
+        }
+        let c = d.slice(p + 4, p + 4 + n)
+        var eq = 0 - 1
+        var k = 0
+        while k < c.len() and eq < 0 {
+            if c.at(k) == 61 {
+                eq = k
+            }
+            k = k + 1
+        }
+        if eq < 0 {
+            fail(VcMalformed("a comment without '='"))
+        }
+        let name = c.slice(0, eq).to_str()
+        if not valid_name(name) {
+            fail(VcBadName(name))
+        }
+        comments.push((name, c.slice(eq + 1, c.len()).to_str()))
+        p = p + 4 + n
+    }
+    return (VorbisComments{ vendor: vendor, comments: comments }, p)
+}
+
+pub fn parse(d: bytes) -> VorbisComments ! VorbisCommentError {
+    let (c, _end) = try parse_at(d, 0)
+    return c
+}
+
+/// A Vorbis comment header packet: type 3, "vorbis", the comments and a
+/// set framing bit.
+pub fn parse_vorbis_packet(d: bytes) -> VorbisComments ! VorbisCommentError {
+    if d.len() < 7 or d.at(0) != 3 or d.slice(1, 7).to_str() != "vorbis" {
+        fail(VcMalformed("not a Vorbis comment header"))
+    }
+    let (c, end) = try parse_at(d, 7)
+    if end >= d.len() or d.at(end).bit_and(1) == 0 {
+        fail(VcMalformed("no framing bit"))
+    }
+    return c
+}
+
+/// An Opus comment header: "OpusTags" then the comments; anything after
+/// them is padding or binary data the specification lets encoders keep.
+pub fn parse_opus_tags(d: bytes) -> VorbisComments ! VorbisCommentError {
+    if d.len() < 8 or d.slice(0, 8).to_str() != "OpusTags" {
+        fail(VcMalformed("not an OpusTags header"))
+    }
+    let (c, _end) = try parse_at(d, 8)
+    return c
+}
+
+/// Every value of a field, its name compared without regard to case.
+pub fn values(c: VorbisComments, name: str) -> [str] {
+    let want = name.to_upper()
+    var out: [str] = []
+    for (n, v) in c.comments {
+        if n.to_upper() == want {
+            out.push(v)
+        }
+    }
+    return out
+}
+
+fn le32(v: i64) -> [i64] {
+    return [v.bit_and(255), v.shr(8).bit_and(255), v.shr(16).bit_and(255), v.shr(24).bit_and(255)]
+}
+
+pub fn encode(c: VorbisComments) -> bytes ! VorbisCommentError {
+    let vendor = c.vendor.to_bytes()
+    var out = le32(vendor.len())
+    for x in vendor.to_list() + le32(c.comments.len()) {
+        out.push(x)
+    }
+    for (n, v) in c.comments {
+        if not valid_name(n) {
+            fail(VcBadName(n))
+        }
+        let b = (n + "=" + v).to_bytes()
+        for x in le32(b.len()) + b.to_list() {
+            out.push(x)
+        }
+    }
+    return bytes_of(out)
+}
+
+pub fn encode_vorbis_packet(c: VorbisComments) -> bytes ! VorbisCommentError {
+    let body = try encode(c)
+    return bytes_of([3] + "vorbis".to_bytes().to_list() + body.to_list() + [1])
+}
+
+pub fn encode_opus_tags(c: VorbisComments) -> bytes ! VorbisCommentError {
+    let body = try encode(c)
+    return bytes_of("OpusTags".to_bytes().to_list() + body.to_list())
+}

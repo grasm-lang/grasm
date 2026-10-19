@@ -1,0 +1,4 @@
+[package]
+name = "mp3frame"
+version = "1.0.0"
+capabilities = []

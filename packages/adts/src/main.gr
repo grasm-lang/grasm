@@ -1,0 +1,137 @@
+// ADTS: the framing of raw AAC streams (.aac files, MPEG-TS and HLS
+// audio, Shoutcast and Icecast AAC radio, DAB+ and phone recorders).
+//
+// Each frame starts with a 7-byte header (9 with a CRC): a 12-bit sync
+// word, the MPEG version (0 for MPEG-4, 1 for MPEG-2), the layer (always
+// 0), whether a CRC is absent, the audio object type minus one, a
+// sampling frequency index, a channel configuration, the frame's length
+// including the header, the decoder buffer fullness (0x7FF for variable
+// bit rate), and the number of raw data blocks less one. Each raw data
+// block is 1024 samples.
+//
+// `audio_specific_config` turns a header into the two-byte MPEG-4
+// AudioSpecificConfig that MP4 and Matroska files carry instead.
+//
+// Checked against FFmpeg's ADTS demuxer and AAC parser: frame positions,
+// sizes and durations, the stream's rate and channels, and the
+// AudioSpecificConfig FFmpeg writes when it copies ADTS audio into MP4.
+
+type AdtsHeader = {
+    mpeg2: bool,
+    crc_absent: bool,
+    object_type: i64,
+    rate_index: i64,
+    channel_config: i64,
+    frame_length: i64,
+    fullness: i64,
+    blocks: i64,
+}
+
+type AdtsFrame = { offset: i64, header: AdtsHeader }
+
+type AdtsError =
+    | AdtsMalformed(at: i64, why: str)
+
+pub fn rates() -> [i64] {
+    return [96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350]
+}
+
+/// The sampling frequency index for a rate, or -1 when it has none.
+pub fn rate_index(rate: i64) -> i64 {
+    let r = rates()
+    for i in 0..r.len() {
+        if r[i] == rate {
+            return i
+        }
+    }
+    return 0 - 1
+}
+
+/// Channels for a channel configuration (1 to 7; 7 is 7.1).
+pub fn channel_count(config: i64) -> i64 {
+    return if config == 7 { 8 } else { config }
+}
+
+pub fn parse_header(d: bytes, at: i64) -> AdtsHeader ! AdtsError {
+    if at + 7 > d.len() {
+        fail(AdtsMalformed(at, "a header cut short"))
+    }
+    if d.at(at) != 255 or d.at(at + 1).bit_and(246) != 240 {
+        fail(AdtsMalformed(at, "no sync word"))
+    }
+    let b1 = d.at(at + 1)
+    let b2 = d.at(at + 2)
+    let b3 = d.at(at + 3)
+    let rate_i = b2.ushr(2).bit_and(15)
+    if rate_i > 12 {
+        fail(AdtsMalformed(at, "a reserved sampling frequency index"))
+    }
+    let length = b3.bit_and(3).shl(11).bit_or(d.at(at + 4).shl(3)).bit_or(d.at(at + 5).ushr(5))
+    let h = AdtsHeader{ mpeg2: b1.bit_and(8) != 0, crc_absent: b1.bit_and(1) != 0, object_type: b2.ushr(6) + 1, rate_index: rate_i,
+        channel_config: b2.bit_and(1).shl(2).bit_or(b3.ushr(6)), frame_length: length,
+        fullness: d.at(at + 5).bit_and(31).shl(6).bit_or(d.at(at + 6).ushr(2)), blocks: d.at(at + 6).bit_and(3) + 1 }
+    if length < (if h.crc_absent { 7 } else { 9 }) {
+        fail(AdtsMalformed(at, "a frame shorter than its header"))
+    }
+    return h
+}
+
+/// Where the frames end: before an ID3v1 tag and an APEv2 tag, if any.
+fn frames_end(d: bytes) -> i64 {
+    var end = d.len()
+    if end >= 128 and d.slice(end - 128, end - 125).to_str() == "TAG" {
+        end = end - 128
+    }
+    if end >= 32 and d.slice(end - 32, end - 24).to_str() == "APETAGEX" {
+        let size = d.at(end - 20).bit_or(d.at(end - 19).shl(8)).bit_or(d.at(end - 18).shl(16)).bit_or(d.at(end - 17).shl(24))
+        let header = if d.at(end - 9).bit_and(128) != 0 { 32 } else { 0 }
+        end = end - size - header
+    }
+    return end
+}
+
+/// Every frame; an ID3v2 tag at the start, and ID3v1 and APEv2 tags at
+/// the end, are skipped. A frame cut short is an error, as is anything
+/// between frames.
+pub fn frames(d: bytes) -> [AdtsFrame] ! AdtsError {
+    var at = 0
+    if d.len() >= 10 and d.slice(0, 3).to_str() == "ID3" {
+        let size = d.at(6).shl(21).bit_or(d.at(7).shl(14)).bit_or(d.at(8).shl(7)).bit_or(d.at(9))
+        at = 10 + size + (if d.at(5).bit_and(16) != 0 { 10 } else { 0 })
+    }
+    let end = frames_end(d)
+    var out: [AdtsFrame] = []
+    while at < end {
+        let h = try parse_header(d, at)
+        if at + h.frame_length > end {
+            fail(AdtsMalformed(at, "a frame cut short"))
+        }
+        out.push(AdtsFrame{ offset: at, header: h })
+        at = at + h.frame_length
+    }
+    return out
+}
+
+/// A CRC-less header for a frame of `payload` bytes of raw AAC.
+pub fn header(object_type: i64, rate_i: i64, channel_config: i64, payload: i64, fullness: i64) -> bytes ! AdtsError {
+    let length = payload + 7
+    if object_type < 1 or object_type > 4 or rate_i < 0 or rate_i > 12 or channel_config < 0 or channel_config > 7 or length > 8191 {
+        fail(AdtsMalformed(0, "header fields out of range"))
+    }
+    return bytes_of([255, 241, (object_type - 1).shl(6).bit_or(rate_i.shl(2)).bit_or(channel_config.ushr(2)),
+        channel_config.bit_and(3).shl(6).bit_or(length.ushr(11)), length.ushr(3).bit_and(255),
+        length.bit_and(7).shl(5).bit_or(fullness.ushr(6).bit_and(31)), fullness.bit_and(63).shl(2)])
+}
+
+/// The raw AAC of a frame, header (and CRC) removed.
+pub fn payload(d: bytes, f: AdtsFrame) -> bytes {
+    let skip = if f.header.crc_absent { 7 } else { 9 }
+    return d.slice(f.offset + skip, f.offset + f.header.frame_length)
+}
+
+/// The MPEG-4 AudioSpecificConfig: object type, frequency index, channel
+/// configuration, then three zero bits (1024-sample frames, no core coder,
+/// no extension).
+pub fn audio_specific_config(h: AdtsHeader) -> bytes {
+    return bytes_of([h.object_type.shl(3).bit_or(h.rate_index.ushr(1)), h.rate_index.bit_and(1).shl(7).bit_or(h.channel_config.shl(3))])
+}

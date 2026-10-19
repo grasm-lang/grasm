@@ -1,0 +1,266 @@
+// IMA ADPCM (DVI ADPCM), 4-bit adaptive audio, in Microsoft's WAV block
+// layout and Apple's QuickTime ("ima4") packet layout.
+//
+// Each 4-bit code is a sign and a magnitude in units of a step size that
+// adapts: large codes grow the step through an index into an 89-entry
+// table, small codes shrink it. It packs 16-bit audio into a quarter of
+// the space with nothing but shifts and adds, which is why game audio,
+// voice recorders, Bluetooth and DECT phones, and old QuickTime and WAV
+// files use it.
+//
+// - WAV (format 0x11): blocks that each start, per channel, with the
+//   first sample and the step index, then the codes in groups of eight
+//   per channel, the low nibble first.
+// - QuickTime: 34-byte packets per channel, a 2-byte header (the top nine
+//   bits of the predictor, a 7-bit step index) and 64 codes.
+//
+// Decoding follows the IMA reference: the difference is built from the
+// step and its halves and quarter, not multiplied out, which rounds
+// differently. Encoding chooses each code the same way, so the encoder and
+// any reference decoder agree on every sample.
+//
+// Checked against FFmpeg's adpcm_ima_wav and adpcm_ima_qt.
+
+type ImaState = { predictor: i64, index: i64 }
+
+type ImaError =
+    | ImaMalformed(why: str)
+
+fn steps() -> [i64] {
+    return [7, 8, 9, 10, 11, 12, 13, 14, 16, 17, 19, 21, 23, 25, 28, 31, 34, 37, 41, 45, 50, 55, 60, 66, 73, 80, 88, 97, 107, 118, 130, 143,
+        157, 173, 190, 209, 230, 253, 279, 307, 337, 371, 408, 449, 494, 544, 598, 658, 724, 796, 876, 963, 1060, 1166, 1282, 1411, 1552,
+        1707, 1878, 2066, 2272, 2499, 2749, 3024, 3327, 3660, 4026, 4428, 4871, 5358, 5894, 6484, 7132, 7845, 8630, 9493, 10442, 11487,
+        12635, 13899, 15289, 16818, 18500, 20350, 22385, 24623, 27086, 29794, 32767]
+}
+
+fn index_change(code: i64) -> i64 {
+    let m = code.bit_and(7)
+    return if m < 4 { 0 - 1 } else { 2 * (m - 3) }
+}
+
+fn clamp(v: i64, lo: i64, hi: i64) -> i64 {
+    return if v < lo { lo } else if v > hi { hi } else { v }
+}
+
+/// One code applied to the state: the new sample.
+pub fn expand(s: [i64], inout st: ImaState, code: i64) -> i64 {
+    let step = s[st.index]
+    var diff = step.shr(3)
+    if code.bit_and(4) != 0 {
+        diff = diff + step
+    }
+    if code.bit_and(2) != 0 {
+        diff = diff + step.shr(1)
+    }
+    if code.bit_and(1) != 0 {
+        diff = diff + step.shr(2)
+    }
+    st.predictor = clamp(if code.bit_and(8) != 0 { st.predictor - diff } else { st.predictor + diff }, -32768, 32767)
+    st.index = clamp(st.index + index_change(code), 0, 88)
+    return st.predictor
+}
+
+/// The code for one sample, and the state moved past it.
+pub fn compress(s: [i64], inout st: ImaState, sample: i64) -> i64 {
+    var delta = sample - st.predictor
+    var code = 0
+    if delta < 0 {
+        code = 8
+        delta = 0 - delta
+    }
+    var step = s[st.index]
+    if delta >= step {
+        code = code.bit_or(4)
+        delta = delta - step
+    }
+    step = step.shr(1)
+    if delta >= step {
+        code = code.bit_or(2)
+        delta = delta - step
+    }
+    step = step.shr(1)
+    if delta >= step {
+        code = code.bit_or(1)
+    }
+    let _same = expand(s, st, code)
+    return code
+}
+
+fn s16(b: bytes, at: i64) -> i64 {
+    let v = b.at(at) + 256 * b.at(at + 1)
+    return if v >= 32768 { v - 65536 } else { v }
+}
+
+/// WAV IMA ADPCM: whole blocks of `block_align` bytes, samples interleaved.
+pub fn decode_wav(data: bytes, block_align: i64, channels: i64) -> [i64] ! ImaError {
+    if channels < 1 or block_align < 4 * channels or (block_align - 4 * channels) % (4 * channels) != 0 {
+        fail(ImaMalformed("a block size that does not fit the channels"))
+    }
+    let s = steps()
+    var out: [i64] = []
+    var at = 0
+    while at + block_align <= data.len() {
+        var st: [ImaState] = []
+        for c in 0..channels {
+            let h = at + 4 * c
+            let idx = data.at(h + 2)
+            if idx > 88 {
+                fail(ImaMalformed("a step index above 88"))
+            }
+            st.push(ImaState{ predictor: s16(data, h), index: idx })
+        }
+        let groups = (block_align - 4 * channels) / (4 * channels)
+        let per = 1 + 8 * groups
+        var block: [i64] = []
+        for _i in 0..(per * channels) {
+            block.push(0)
+        }
+        for c in 0..channels {
+            block[c] = st[c].predictor
+        }
+        for g in 0..groups {
+            for c in 0..channels {
+                let base = at + 4 * channels + (g * channels + c) * 4
+                for k in 0..4 {
+                    let byte = data.at(base + k)
+                    let n = 1 + g * 8 + 2 * k
+                    block[n * channels + c] = expand(s, st[c], byte.bit_and(15))
+                    block[(n + 1) * channels + c] = expand(s, st[c], byte.ushr(4))
+                }
+            }
+        }
+        for v in block {
+            out.push(v)
+        }
+        at = at + block_align
+    }
+    return out
+}
+
+/// QuickTime IMA4: 34-byte packets, one per channel in turn, 64 samples
+/// each. A packet's header holds only the top nine bits of the predictor,
+/// so a decoder keeps the full predictor it ended the last packet with
+/// when the header agrees with it -- the same step index and a predictor
+/// within the bits the header drops -- as Apple's decoder and FFmpeg do.
+/// The state before the first packet is a zero predictor at index 0.
+pub fn decode_qt(data: bytes, channels: i64) -> [i64] ! ImaError {
+    if channels < 1 {
+        fail(ImaMalformed("no channels"))
+    }
+    let s = steps()
+    var out: [i64] = []
+    var st: [ImaState] = []
+    for _c in 0..channels {
+        st.push(ImaState{ predictor: 0, index: 0 })
+    }
+    var at = 0
+    while at + 34 * channels <= data.len() {
+        var frame: [i64] = []
+        for _i in 0..(64 * channels) {
+            frame.push(0)
+        }
+        for c in 0..channels {
+            let p = at + 34 * c
+            let head = data.at(p) * 256 + data.at(p + 1)
+            var pred = head.bit_and(65408)
+            if pred >= 32768 {
+                pred = pred - 65536
+            }
+            let index = clamp(head.bit_and(127), 0, 88)
+            let gap = st[c].predictor - pred
+            if index != st[c].index or gap > 127 or gap < -127 {
+                st[c] = ImaState{ predictor: pred, index: index }
+            }
+            for k in 0..32 {
+                let byte = data.at(p + 2 + k)
+                frame[(2 * k) * channels + c] = expand(s, st[c], byte.bit_and(15))
+                frame[(2 * k + 1) * channels + c] = expand(s, st[c], byte.ushr(4))
+            }
+        }
+        for v in frame {
+            out.push(v)
+        }
+        at = at + 34 * channels
+    }
+    return out
+}
+
+/// WAV IMA ADPCM blocks of `block_align` bytes from interleaved samples; a
+/// short last block is padded with its last sample. The step index carries
+/// from block to block, as encoders do.
+pub fn encode_wav(samples: [i64], channels: i64, block_align: i64) -> bytes ! ImaError {
+    if channels < 1 or block_align < 4 * channels or (block_align - 4 * channels) % (4 * channels) != 0 {
+        fail(ImaMalformed("a block size that does not fit the channels"))
+    }
+    let s = steps()
+    let groups = (block_align - 4 * channels) / (4 * channels)
+    let per = 1 + 8 * groups
+    let frames = samples.len() / channels
+    var st: [ImaState] = []
+    for _c in 0..channels {
+        st.push(ImaState{ predictor: 0, index: 0 })
+    }
+    var out: [i64] = []
+    var f = 0
+    while f < frames {
+        let at = |n, c| {
+            let k = if f + n < frames { f + n } else { frames - 1 }
+            clamp(samples[k * channels + c], -32768, 32767)
+        }
+        for c in 0..channels {
+            st[c].predictor = at(0, c)
+            let v = st[c].predictor
+            for b in [v.bit_and(255), v.shr(8).bit_and(255), st[c].index, 0] {
+                out.push(b)
+            }
+        }
+        for g in 0..groups {
+            for c in 0..channels {
+                for k in 0..4 {
+                    let n = 1 + g * 8 + 2 * k
+                    let lo = compress(s, st[c], at(n, c))
+                    let hi = compress(s, st[c], at(n + 1, c))
+                    out.push(lo.bit_or(hi.shl(4)))
+                }
+            }
+        }
+        f = f + per
+    }
+    return bytes_of(out)
+}
+
+/// QuickTime IMA4 packets from interleaved samples, 64 frames each; a short
+/// last packet is padded with its last sample. Each header carries the
+/// state's top bits, and the state runs on unrounded, as `decode_qt` (and
+/// every QuickTime decoder) continues it.
+pub fn encode_qt(samples: [i64], channels: i64) -> bytes ! ImaError {
+    if channels < 1 {
+        fail(ImaMalformed("no channels"))
+    }
+    let s = steps()
+    let frames = samples.len() / channels
+    var st: [ImaState] = []
+    for _c in 0..channels {
+        st.push(ImaState{ predictor: 0, index: 0 })
+    }
+    var out: [i64] = []
+    var f = 0
+    while f < frames {
+        for c in 0..channels {
+            let head = st[c].predictor.bit_and(65408).bit_and(65535).bit_or(st[c].index)
+            out.push(head.ushr(8))
+            out.push(head.bit_and(255))
+            for k in 0..32 {
+                let a = f + 2 * k
+                let b = f + 2 * k + 1
+                let sa = clamp(samples[(if a < frames { a } else { frames - 1 }) * channels + c], -32768, 32767)
+                let sb = clamp(samples[(if b < frames { b } else { frames - 1 }) * channels + c], -32768, 32767)
+                let lo = compress(s, st[c], sa)
+                let hi = compress(s, st[c], sb)
+                out.push(lo.bit_or(hi.shl(4)))
+            }
+        }
+        f = f + 64
+    }
+    return bytes_of(out)
+}

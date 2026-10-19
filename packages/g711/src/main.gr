@@ -1,0 +1,98 @@
+// G.711 μ-law and A-law, ITU-T's 8-bit telephone audio.
+//
+// Each 8-bit code is a sign, a 3-bit segment and a 4-bit step within it:
+// a logarithmic scale that gives 13 or 14 bits of dynamic range in 8.
+// μ-law is North America's and Japan's, A-law everyone else's. Every
+// phone call through the PSTN, every VoIP call that falls back to PCMU or
+// PCMA (the codecs every SIP stack must have), .au files, WAV files of
+// format 6 and 7, and voicemail systems carry this.
+//
+// Decoding is the standard expansion to 16-bit linear. Encoding rounds to
+// the nearest code: a 16-bit sample is quantised to 14 bits and mapped
+// through decision levels halfway between neighbouring decoded values,
+// built once per call from the decoder, exactly as FFmpeg encodes.
+//
+// Checked against FFmpeg's pcm_mulaw and pcm_alaw on every 16-bit input.
+
+pub fn ulaw_decode(code: i64) -> i64 {
+    let u = code.bit_not().bit_and(255)
+    var t = u.bit_and(15).shl(3) + 132
+    t = t.shl(u.bit_and(112).ushr(4))
+    return if u.bit_and(128) != 0 { 132 - t } else { t - 132 }
+}
+
+pub fn alaw_decode(code: i64) -> i64 {
+    let a = code.bit_xor(85)
+    var t = a.bit_and(15)
+    let seg = a.bit_and(112).ushr(4)
+    t = if seg > 0 { (t + t + 1 + 32).shl(seg + 2) } else { (t + t + 1).shl(3) }
+    return if a.bit_and(128) != 0 { t } else { 0 - t }
+}
+
+/// The 16384-entry encoding table for 14-bit samples (offset by 8192):
+/// each code covers the samples nearer it than its neighbours.
+fn table(ulaw: bool) -> [i64] {
+    let mask = if ulaw { 255 } else { 213 }
+    var tab: [i64] = []
+    for _i in 0..16384 {
+        tab.push(0)
+    }
+    tab[8192] = mask
+    var j = 1
+    for i in 0..127 {
+        let v1 = if ulaw { ulaw_decode(i.bit_xor(mask)) } else { alaw_decode(i.bit_xor(mask)) }
+        let v2 = if ulaw { ulaw_decode((i + 1).bit_xor(mask)) } else { alaw_decode((i + 1).bit_xor(mask)) }
+        let v = (v1 + v2 + 4).shr(3)
+        while j < v {
+            tab[8192 - j] = i.bit_xor(mask.bit_xor(128))
+            tab[8192 + j] = i.bit_xor(mask)
+            j = j + 1
+        }
+    }
+    while j < 8192 {
+        tab[8192 - j] = 127.bit_xor(mask.bit_xor(128))
+        tab[8192 + j] = 127.bit_xor(mask)
+        j = j + 1
+    }
+    tab[0] = tab[1]
+    return tab
+}
+
+fn clamp16(s: i64) -> i64 {
+    return if s < -32768 { -32768 } else if s > 32767 { 32767 } else { s }
+}
+
+/// 16-bit samples to μ-law codes.
+pub fn ulaw_encode(samples: [i64]) -> bytes {
+    let tab = table(true)
+    var out: [i64] = []
+    for s in samples {
+        out.push(tab[(clamp16(s) + 32768).shr(2)])
+    }
+    return bytes_of(out)
+}
+
+pub fn alaw_encode(samples: [i64]) -> bytes {
+    let tab = table(false)
+    var out: [i64] = []
+    for s in samples {
+        out.push(tab[(clamp16(s) + 32768).shr(2)])
+    }
+    return bytes_of(out)
+}
+
+pub fn ulaw_samples(codes: bytes) -> [i64] {
+    var out: [i64] = []
+    for i in 0..codes.len() {
+        out.push(ulaw_decode(codes.at(i)))
+    }
+    return out
+}
+
+pub fn alaw_samples(codes: bytes) -> [i64] {
+    var out: [i64] = []
+    for i in 0..codes.len() {
+        out.push(alaw_decode(codes.at(i)))
+    }
+    return out
+}

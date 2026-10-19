@@ -1,0 +1,252 @@
+// The Ogg container (RFC 3533): pages, and the packets they carry.
+//
+// A page is "OggS", a version (0), header flags (continued packet, first
+// page of a stream, last page), a 64-bit granule position, the stream's
+// serial number, a page sequence number, a CRC-32 of the whole page, and a
+// segment table: up to 255 lacing values, each up to 255 bytes, where a
+// value below 255 ends a packet. A packet can span pages; a granule of -1
+// means no packet ends on the page. Several logical streams may be
+// multiplexed by serial number. Vorbis, Opus, FLAC-in-Ogg, Theora and
+// Speex files are Ogg, and so is the audio of every WebRTC recorder,
+// Wikipedia's media and many games.
+//
+// The CRC is CRC-32 with polynomial 0x04C11DB7, not reflected, zero
+// initial value, no final XOR -- not zlib's.
+//
+// Checked against FFmpeg's Ogg demuxer: the packets this reassembles hash
+// to FFmpeg's, and pages this writes are read back by FFmpeg unchanged.
+
+type OggPage = { flags: i64, granule: i64, serial: i64, sequence: i64, lacing: [i64], body: bytes }
+
+type OggPacket = { serial: i64, data: bytes, granule: i64, first_page: i64, last_page: i64 }
+
+type OggError =
+    | OggMalformed(at: i64, why: str)
+    | OggBadCrc(at: i64)
+
+pub fn crc_table() -> [i64] {
+    var t: [i64] = []
+    for i in 0..256 {
+        var r = i.shl(24)
+        for _k in 0..8 {
+            r = if r.bit_and(2147483648) != 0 { r.shl(1).bit_xor(79764919) } else { r.shl(1) }
+            r = r.bit_and(4294967295)
+        }
+        t.push(r)
+    }
+    return t
+}
+
+pub fn crc(t: [i64], d: bytes) -> i64 {
+    var c = 0
+    for i in 0..d.len() {
+        c = c.shl(8).bit_and(4294967295).bit_xor(t[c.ushr(24).bit_xor(d.at(i))])
+    }
+    return c
+}
+
+fn le(d: bytes, at: i64, n: i64) -> i64 {
+    var v = 0
+    var k = n - 1
+    while k >= 0 {
+        v = v.shl(8).bit_or(d.at(at + k))
+        k = k - 1
+    }
+    return v
+}
+
+/// Every page, each CRC checked.
+pub fn pages(d: bytes) -> [OggPage] ! OggError {
+    let t = crc_table()
+    var out: [OggPage] = []
+    var at = 0
+    while at < d.len() {
+        if at + 27 > d.len() or d.slice(at, at + 4).to_str() != "OggS" {
+            fail(OggMalformed(at, "no capture pattern"))
+        }
+        if d.at(at + 4) != 0 {
+            fail(OggMalformed(at, "a stream structure version other than 0"))
+        }
+        let nseg = d.at(at + 26)
+        if at + 27 + nseg > d.len() {
+            fail(OggMalformed(at, "a segment table cut short"))
+        }
+        var lacing: [i64] = []
+        var size = 0
+        for i in 0..nseg {
+            lacing.push(d.at(at + 27 + i))
+            size = size + d.at(at + 27 + i)
+        }
+        let end = at + 27 + nseg + size
+        if end > d.len() {
+            fail(OggMalformed(at, "a page body cut short"))
+        }
+        var page = d.slice(at, end).to_list()
+        for k in 22..26 {
+            page[k] = 0
+        }
+        if crc(t, bytes_of(page)) != le(d, at + 22, 4) {
+            fail(OggBadCrc(at))
+        }
+        out.push(OggPage{ flags: d.at(at + 5), granule: le(d, at + 6, 8), serial: le(d, at + 14, 4), sequence: le(d, at + 18, 4),
+            lacing: lacing, body: d.slice(at + 27 + nseg, end) })
+        at = end
+    }
+    return out
+}
+
+/// The packets of every stream, in the order they complete. A packet
+/// carries the granule of the page it ends on when it is that page's last.
+/// Data that cannot make a whole packet is discarded, as libogg and FFmpeg
+/// discard it: the tail of a packet whose start was never seen (a page
+/// marked as continuing when nothing is open, as when a capture joins a
+/// stream midway), and an unfinished packet that the next page does not
+/// continue.
+pub fn packets(ps: [OggPage]) -> [OggPacket] ! OggError {
+    var out: [OggPacket] = []
+    var open_serial: [i64] = []
+    var open_data: [[i64]] = []
+    var open_first: [i64] = []
+    var open_skip: [bool] = []
+    for n in 0..ps.len() {
+        let p = ps[n]
+        let continued = p.flags.bit_and(1) != 0
+        var slot = 0 - 1
+        for i in 0..open_serial.len() {
+            if open_serial[i] == p.serial {
+                slot = i
+            }
+        }
+        if slot < 0 {
+            open_serial.push(p.serial)
+            open_data.push([])
+            open_first.push(n)
+            open_skip.push(false)
+            slot = open_serial.len() - 1
+        }
+        if not continued {
+            open_data[slot] = []
+        }
+        open_skip[slot] = continued and open_data[slot].len() == 0
+        var last_end = 0 - 1
+        for i in 0..p.lacing.len() {
+            if p.lacing[i] < 255 {
+                last_end = i
+            }
+        }
+        var off = 0
+        var buf = open_data[slot]
+        if buf.len() == 0 {
+            open_first[slot] = n
+        }
+        for i in 0..p.lacing.len() {
+            let l = p.lacing[i]
+            for k in 0..l {
+                buf.push(p.body.at(off + k))
+            }
+            off = off + l
+            if l < 255 {
+                if not open_skip[slot] {
+                    out.push(OggPacket{ serial: p.serial, data: bytes_of(buf), granule: if i == last_end { p.granule } else { 0 - 1 },
+                        first_page: open_first[slot], last_page: n })
+                }
+                open_skip[slot] = false
+                buf = []
+                open_first[slot] = n
+            }
+        }
+        open_data[slot] = buf
+    }
+    return out
+}
+
+fn le_bytes(v: i64, n: i64) -> [i64] {
+    var out: [i64] = []
+    for k in 0..n {
+        out.push(v.shr(8 * k).bit_and(255))
+    }
+    return out
+}
+
+/// One page's bytes, CRC filled in.
+pub fn write_page(t: [i64], p: OggPage) -> bytes {
+    var out = "OggS".to_bytes().to_list()
+    out.push(0)
+    out.push(p.flags)
+    for x in le_bytes(p.granule, 8) + le_bytes(p.serial, 4) + le_bytes(p.sequence, 4) + [0, 0, 0, 0] {
+        out.push(x)
+    }
+    out.push(p.lacing.len())
+    for l in p.lacing {
+        out.push(l)
+    }
+    for i in 0..p.body.len() {
+        out.push(p.body.at(i))
+    }
+    let c = crc(t, bytes_of(out))
+    for k in 0..4 {
+        out[22 + k] = c.shr(8 * k).bit_and(255)
+    }
+    return bytes_of(out)
+}
+
+type OggWriter = { t: [i64], serial: i64, seq: i64, lacing: [i64], body: [i64], granule: i64, continued: bool, pages: [OggPage] }
+
+fn flush(inout w: OggWriter) {
+    let flags = (if w.continued { 1 } else { 0 }) + (if w.seq == 0 { 2 } else { 0 })
+    w.pages.push(OggPage{ flags: flags, granule: w.granule, serial: w.serial, sequence: w.seq, lacing: w.lacing, body: bytes_of(w.body) })
+    w.seq = w.seq + 1
+    w.lacing = []
+    w.body = []
+    w.granule = 0 - 1
+}
+
+/// One logical stream from packets and their granules: the first `alone`
+/// packets (the codec headers) get a page each, the first page flagged as
+/// the start of the stream; the rest share pages of up to `max_segments`
+/// lacing values, spanning pages when they must. The last page is flagged
+/// as the end.
+pub fn write_stream(serial: i64, data: [bytes], granules: [i64], alone: i64, max_segments: i64) -> bytes {
+    let limit = if max_segments < 1 { 1 } else if max_segments > 255 { 255 } else { max_segments }
+    var w = OggWriter{ t: crc_table(), serial: serial, seq: 0, lacing: [], body: [], granule: 0 - 1, continued: false, pages: [] }
+    for n in 0..data.len() {
+        let d = data[n]
+        var off = 0
+        var done = false
+        while not done {
+            let take = if d.len() - off >= 255 { 255 } else { d.len() - off }
+            w.lacing.push(take)
+            for k in off..(off + take) {
+                w.body.push(d.at(k))
+            }
+            off = off + take
+            if take < 255 {
+                done = true
+                w.granule = granules[n]
+            }
+            if w.lacing.len() == limit {
+                flush(w)
+                w.continued = not done
+            }
+        }
+        if n < alone and w.lacing.len() > 0 {
+            flush(w)
+            w.continued = false
+        }
+    }
+    if w.lacing.len() > 0 {
+        flush(w)
+    }
+    var out: [i64] = []
+    for i in 0..w.pages.len() {
+        var p = w.pages[i]
+        if i == w.pages.len() - 1 {
+            p.flags = p.flags.bit_or(4)
+        }
+        let b = write_page(w.t, p)
+        for k in 0..b.len() {
+            out.push(b.at(k))
+        }
+    }
+    return bytes_of(out)
+}

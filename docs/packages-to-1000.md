@@ -251,10 +251,53 @@ reference on this machine. `langtag` and `ssdp` were looked at and are
 `ply` `obj` `gltf` (no mesh library), `proj4` `s2cell` `h3cell` (no
 projection library), `flexlayout` (no layout engine outside a browser),
 `ndarray` (no NumPy), `quic` `http3` (no peer), `osmpbf` `mvt` (no
-`paulmach/protoscan` in the module cache). Each becomes buildable the
-day its reference is installed.
+`paulmach/protoscan` in the module cache), `cuesheet` (FFmpeg has no cue
+sheet reader), `sdp` (FFmpeg reads SDP only to open the RTP session it
+describes). Each becomes buildable the day its reference is installed.
 
 ## Landed
+
+- [x] **B39: audio and video formats** — B11's `isobmff` `matroska`
+  `oggpage` `vorbiscomment` `opushead` `flacdec` `adts` `mp3frame` `aiff`
+  `aufile` `caffile` `y4m` `assfile` `g711` `imaadpcm` (`webvtt` is
+  `subtitles` already; `cuesheet` and `sdp` are deferred), and the harness
+  `b39test`; the new gate `b39diff` runs 575 cases against FFmpeg 8.1
+  and, where macOS has it, Apple's `afconvert`, on media made fresh each
+  run from random signals and settings: G.711 over every 16-bit sample and
+  every code; IMA ADPCM WAV blocks and QuickTime packets from both
+  encoders, and streams encoded here decoded by FFmpeg and afconvert to
+  exactly the samples predicted, no further from the input than FFmpeg's
+  own encoder; .au, AIFF/AIFF-C and CAF in every encoding either tool
+  writes, and files written here read back by both; YUV4MPEG2 in nineteen
+  pixel formats with odd sizes; ASS events against FFmpeg's demuxer
+  packets; FLAC across compression levels, LPC types, stereo modes,
+  partition orders, block sizes, depths and up to eight channels, against
+  the encoder's own input; Ogg pages and packets of Opus, Vorbis, FLAC and
+  two-stream files, OpusHead, packet durations and comments, and Opus files
+  re-tagged here; ADTS frames and the AudioSpecificConfig FFmpeg writes
+  into MP4, and streams re-framed here decoding to the same audio; MP3 and
+  MP2 frames with Xing and LAME tags; every sample of MP4, MOV,
+  faststart, fragmented and Smooth Streaming files; and Matroska and WebM
+  frames from FFmpeg, and files written here with every lacing. FFmpeg's
+  own habits are modelled where they are habits, not the format: it
+  regroups PCM samples into 1,024-sample packets, moves DTS back (sample
+  tables) or PTS forward (fragments) around negative composition offsets,
+  fills unknown durations and lace times, marks intra-only frames key, and
+  renames and merges Vorbis comments. Where FFmpeg is wrong the package
+  follows the format: its FLAC encoder now and then writes a frame header
+  with a wrong CRC-8, which its decoder either rejects or silently decodes
+  nothing from (the gate walks every frame's CRCs and skips such files);
+  its decoder returned nothing from a valid eight-channel file that this
+  one read exactly (FLAC is lossless, so the encoder's input is the
+  oracle); its stream duration for MP3 can be a size estimate and its decoder keeps
+  LAME padding longer than a frame, and its Ogg muxer can flag a page as
+  continuing a finished packet (read as libogg and FFmpeg read it). It
+  found two bugs here: IMA4 packets must carry the full predictor across
+  packets when the header agrees with it, as Apple's and FFmpeg's decoders
+  do, and a single EBML-laced frame must not code its size. One break per
+  package turned it red, once the YUV4MPEG2 sources were made with a flat
+  colour: FFmpeg's `testsrc2` rounds its size to even, so no odd size had
+  been tested, and the gate now counts them. The count reaches 927.
 
 - [x] **B38: OpenType tables** — B13's `kern`, with `otfname` `os2table`
   `posttable` `ttcfile` `fvar` `avar` `stat` `colrcpal` `gsub` (B13 named
@@ -703,7 +746,7 @@ day its reference is installed.
 | | |
 |---|---|
 | At the start | 669 |
-| Now | 911 |
+| Now | 927 |
 | Candidates above | 316 packages in 28 batches, plus `ecc`, `rfc6979` and `goprintf` |
 | Harnesses, one a batch | 28 |
 | If every candidate lands | 1016 |

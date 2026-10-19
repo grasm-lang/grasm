@@ -1,0 +1,169 @@
+// Apple Core Audio Format files (.caf).
+//
+// "caff", version 1, then chunks with 64-bit sizes: `desc` describes the
+// audio (sample rate as a 64-bit float, format ID, format flags, bytes and
+// frames per packet, channels, bits per channel), `data` holds an edit
+// count and the packets (its size may be -1, meaning to the end of the
+// file), and optional `pakt`, `kuki`, `chan` and `info` chunks describe
+// variable-sized packets, codec cookies, layouts and strings. macOS and
+// iOS record into CAF, and Logic and GarageBand keep loops in it; the
+// 64-bit sizes are why it holds hours of audio that WAV cannot.
+//
+// `decode` handles linear PCM (integer or float, big- or little-endian),
+// μ-law, A-law and IMA4 (through `imaadpcm`). `encode` writes integer PCM.
+//
+// Checked against FFmpeg's caf demuxer and muxer.
+import g711
+import bfloat16
+import imaadpcm
+
+type CafAudio = { rate: f64, format: str, flags: i64, channels: i64, bits: i64, info: [(str, str)], samples: [i64], floats: [f64] }
+
+type CafError =
+    | CafMalformed(why: str)
+    | CafUnsupported(format: str)
+
+fn u32(b: bytes, at: i64) -> i64 {
+    return b.at(at).shl(24).bit_or(b.at(at + 1).shl(16)).bit_or(b.at(at + 2).shl(8)).bit_or(b.at(at + 3))
+}
+
+fn u64(b: bytes, at: i64) -> i64 {
+    return u32(b, at).shl(32).bit_or(u32(b, at + 4))
+}
+
+fn signed(v: i64, n: i64) -> i64 {
+    let top = 1.shl(8 * n - 1)
+    return if v >= top { v - 2 * top } else { v }
+}
+
+fn info_strings(d: bytes, at: i64, n: i64) -> [(str, str)] {
+    var out: [(str, str)] = []
+    if n < 4 {
+        return out
+    }
+    let count = u32(d, at)
+    var p = at + 4
+    let end = at + n
+    var parts: [str] = []
+    var start = p
+    while p < end and parts.len() < 2 * count {
+        if d.at(p) == 0 {
+            parts.push(d.slice(start, p).to_str())
+            start = p + 1
+        }
+        p = p + 1
+    }
+    var i = 0
+    while i + 1 < parts.len() {
+        out.push((parts[i], parts[i + 1]))
+        i = i + 2
+    }
+    return out
+}
+
+pub fn decode(data: bytes) -> CafAudio ! CafError {
+    if data.len() < 8 or data.slice(0, 4).to_str() != "caff" {
+        fail(CafMalformed("not a CAF file"))
+    }
+    var at = 8
+    var desc = 0 - 1
+    var audio = 0 - 1
+    var audio_len = 0
+    var info: [(str, str)] = []
+    while at + 12 <= data.len() {
+        let id = data.slice(at, at + 4).to_str()
+        var n = u64(data, at + 4)
+        if n < 0 or at + 12 + n > data.len() {
+            n = data.len() - at - 12
+        }
+        if id == "desc" {
+            desc = at + 12
+        } else if id == "data" {
+            audio = at + 12 + 4
+            audio_len = n - 4
+        } else if id == "info" {
+            info = info_strings(data, at + 12, n)
+        }
+        at = at + 12 + n
+    }
+    if desc < 0 or desc + 32 > data.len() {
+        fail(CafMalformed("no desc chunk"))
+    }
+    let rate: f64 = u64(data, desc).from_bits()
+    let format = data.slice(desc + 8, desc + 12).to_str()
+    let flags = u32(data, desc + 12)
+    let channels = u32(data, desc + 24)
+    let bits = u32(data, desc + 28)
+    var samples: [i64] = []
+    var floats: [f64] = []
+    if audio < 0 or channels < 1 {
+        return CafAudio{ rate: rate, format: format, flags: flags, channels: channels, bits: bits, info: info, samples: [], floats: [] }
+    }
+    let body = data.slice(audio, audio + (if audio_len < 0 { 0 } else { audio_len }))
+    if format == "ima4" {
+        samples = imaadpcm.decode_qt(body, channels) ?? fail(CafMalformed("IMA4 packets"))
+    } else if format == "lpcm" or format == "ulaw" or format == "alaw" {
+        let width = if format == "lpcm" { bits / 8 } else { 1 }
+        if width < 1 or width > 8 {
+            fail(CafUnsupported(format))
+        }
+        let little = flags.bit_and(2) != 0
+        let float = flags.bit_and(1) != 0
+        let n = body.len() / (width * channels) * channels
+        for i in 0..n {
+            var v = 0
+            for k in 0..width {
+                v = v.shl(8).bit_or(body.at(i * width + (if little { width - 1 - k } else { k })))
+            }
+            if format == "ulaw" {
+                samples.push(g711.ulaw_decode(v))
+            } else if format == "alaw" {
+                samples.push(g711.alaw_decode(v))
+            } else if float {
+                floats.push(if width == 4 { bfloat16.f32_from_bits(v) } else { v.from_bits() })
+            } else {
+                samples.push(signed(v, width))
+            }
+        }
+    } else {
+        fail(CafUnsupported(format))
+    }
+    return CafAudio{ rate: rate, format: format, flags: flags, channels: channels, bits: bits, info: info, samples: samples, floats: floats }
+}
+
+fn be(v: i64, n: i64) -> [i64] {
+    var out: [i64] = []
+    var i = n - 1
+    while i >= 0 {
+        out.push(v.shr(8 * i).bit_and(255))
+        i = i - 1
+    }
+    return out
+}
+
+/// Integer linear PCM (8, 16, 24 or 32 bits), big- or little-endian.
+pub fn encode(rate: f64, channels: i64, bits: i64, little_endian: bool, samples: [i64]) -> bytes ! CafError {
+    if channels < 1 or samples.len() % channels != 0 or (bits != 8 and bits != 16 and bits != 24 and bits != 32) {
+        fail(CafMalformed("samples, channels and sample size that do not fit"))
+    }
+    let width = bits / 8
+    var out = "caff".to_bytes().to_list() + [0, 1, 0, 0]
+    let desc = be(rate.to_bits(), 8) + "lpcm".to_bytes().to_list() + be(if little_endian { 2 } else { 0 }, 4) + be(width * channels, 4) + be(1, 4) +
+    be(channels, 4) + be(bits, 4)
+    for x in "desc".to_bytes().to_list() + be(32, 8) + desc {
+        out.push(x)
+    }
+    var audio = [0, 0, 0, 0]
+    for s in samples {
+        let b = be(s, width)
+        var k = 0
+        while k < width {
+            audio.push(if little_endian { b[width - 1 - k] } else { b[k] })
+            k = k + 1
+        }
+    }
+    for x in "data".to_bytes().to_list() + be(audio.len(), 8) + audio {
+        out.push(x)
+    }
+    return bytes_of(out)
+}

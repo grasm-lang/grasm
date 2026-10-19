@@ -1,0 +1,8 @@
+[package]
+name = "opushead"
+version = "1.0.0"
+capabilities = []
+
+[dependencies.vorbiscomment]
+path = "../vorbiscomment"
+version = "^1.0.0"

@@ -1,0 +1,134 @@
+// Sun/NeXT audio files (.au, .snd).
+//
+// A 24-byte big-endian header -- ".snd", the data offset, the data size
+// (or all ones when unknown, as when streaming), the encoding, the sample
+// rate and the channel count -- an annotation filling the rest of the
+// header, then interleaved samples. The encodings in use are 8-bit μ-law
+// (1, the original), signed 8-, 16-, 24- and 32-bit linear (2 to 5),
+// 32- and 64-bit floating point (6 and 7) and 8-bit A-law (27). Unix
+// workstations, Java's AudioSystem, and early web audio used it, and SIP
+// and telephony tools still exchange μ-law .au files.
+//
+// `decode` returns integer samples: μ-law and A-law expanded to 16 bits,
+// linear ones as stored; floating-point files are returned as floats.
+//
+// Checked against FFmpeg's au demuxer and muxer.
+import g711
+import bfloat16
+
+type AuAudio = { encoding: i64, rate: i64, channels: i64, annotation: bytes, samples: [i64], floats: [f64] }
+
+type AuError =
+    | AuMalformed(why: str)
+    | AuUnsupported(encoding: i64)
+
+fn u32(b: bytes, at: i64) -> i64 {
+    return b.at(at).shl(24).bit_or(b.at(at + 1).shl(16)).bit_or(b.at(at + 2).shl(8)).bit_or(b.at(at + 3))
+}
+
+fn width(encoding: i64) -> i64 {
+    if encoding == 1 or encoding == 2 or encoding == 27 {
+        return 1
+    }
+    if encoding >= 3 and encoding <= 5 {
+        return encoding - 1
+    }
+    if encoding == 6 {
+        return 4
+    }
+    if encoding == 7 {
+        return 8
+    }
+    return 0
+}
+
+fn signed(v: i64, bytes_n: i64) -> i64 {
+    let top = 1.shl(8 * bytes_n - 1)
+    return if v >= top { v - 2 * top } else { v }
+}
+
+pub fn decode(data: bytes) -> AuAudio ! AuError {
+    if data.len() < 24 or data.slice(0, 4).to_str() != ".snd" {
+        fail(AuMalformed("not an au file"))
+    }
+    let offset = u32(data, 4)
+    let size = u32(data, 8)
+    let encoding = u32(data, 12)
+    let rate = u32(data, 16)
+    let channels = u32(data, 20)
+    let w = width(encoding)
+    if w == 0 {
+        fail(AuUnsupported(encoding))
+    }
+    if offset < 24 or offset > data.len() or channels < 1 {
+        fail(AuMalformed("a header that does not fit"))
+    }
+    let avail = data.len() - offset
+    let len = if size == 4294967295 or size > avail { avail } else { size }
+    let n = len / w / channels * channels
+    var samples: [i64] = []
+    var floats: [f64] = []
+    for i in 0..n {
+        let p = offset + i * w
+        var v = 0
+        for k in 0..w {
+            v = v.shl(8).bit_or(data.at(p + k))
+        }
+        if encoding == 1 {
+            samples.push(g711.ulaw_decode(v))
+        } else if encoding == 27 {
+            samples.push(g711.alaw_decode(v))
+        } else if encoding == 6 {
+            floats.push(bfloat16.f32_from_bits(v))
+        } else if encoding == 7 {
+            floats.push(v.from_bits())
+        } else {
+            samples.push(signed(v, w))
+        }
+    }
+    return AuAudio{ encoding: encoding, rate: rate, channels: channels, annotation: data.slice(24, offset), samples: samples, floats: floats }
+}
+
+fn be(v: i64, n: i64) -> [i64] {
+    var out: [i64] = []
+    var i = n - 1
+    while i >= 0 {
+        out.push(v.shr(8 * i).bit_and(255))
+        i = i - 1
+    }
+    return out
+}
+
+/// An .au file of integer samples in one of the integer encodings (1, 2,
+/// 3, 4, 5 or 27); μ-law and A-law take 16-bit samples. The annotation is
+/// padded with zeros to a multiple of 8 bytes, at least 8.
+pub fn encode(encoding: i64, rate: i64, channels: i64, annotation: bytes, samples: [i64]) -> bytes ! AuError {
+    let w = width(encoding)
+    if w == 0 or encoding == 6 or encoding == 7 {
+        fail(AuUnsupported(encoding))
+    }
+    if channels < 1 or samples.len() % channels != 0 {
+        fail(AuMalformed("samples that do not fill the channels"))
+    }
+    var note = annotation.to_list()
+    while note.len() < 8 or note.len() % 8 != 0 {
+        note.push(0)
+    }
+    let body = if encoding == 1 { g711.ulaw_encode(samples).to_list() } else if encoding == 27 { g711.alaw_encode(samples).to_list() } else {
+        var b: [i64] = []
+        for s in samples {
+            for x in be(s, w) {
+                b.push(x)
+            }
+        }
+        b
+    }
+    var out = ".snd".to_bytes().to_list()
+    for x in be(24 + note.len(), 4) + be(body.len(), 4) + be(encoding, 4) + be(rate, 4) + be(channels, 4) {
+        out.push(x)
+    }
+    for x in note + body {
+        out.push(x)
+    }
+    return bytes_of(out)
+}

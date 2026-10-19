@@ -1,0 +1,168 @@
+// YUV4MPEG2 (.y4m): raw video frames with a one-line header.
+//
+//     YUV4MPEG2 W640 H480 F30000:1001 Ip A1:1 C420jpeg
+//     FRAME
+//     ...planes...
+//
+// The header gives width, height, frame rate, interlacing, pixel aspect
+// ratio and colour space (chroma subsampling and bit depth), then each
+// frame is "FRAME", optional parameters and a newline, and its planes:
+// luma, then the two chroma planes subsampled as the colour space says
+// (and alpha for 444alpha). It is the lingua franca of video tools:
+// x264, x265, rav1e, SVT-AV1, libaom and VMAF read it, and ffmpeg and
+// mpv write it, because it needs no codec at all.
+//
+// Colour spaces 420jpeg, 420mpeg2, 420paldv, 420, 411, 422, 444,
+// 444alpha and mono are 8-bit; their deeper forms (420p10, 444p16,
+// mono12 and the like, 9 to 16 bits) use two little-endian bytes a
+// sample.
+//
+// Checked against FFmpeg's yuv4mpegpipe muxer and demuxer.
+
+type Y4m = {
+    width: i64,
+    height: i64,
+    fps: (i64, i64),
+    interlace: str,
+    aspect: (i64, i64),
+    colorspace: str,
+    extensions: [str],
+    frames: [bytes],
+}
+
+type Y4mError =
+    | Y4mMalformed(why: str)
+    | Y4mUnsupported(colorspace: str)
+
+/// Chroma width and height divisors, plane count and bytes a sample.
+/// Depths above 8 bits ("420p10", "mono12") take two bytes a sample.
+fn layout(cs: str) -> (i64, i64, i64, i64) ! Y4mError {
+    var base = cs
+    var size = 1
+    let digits = "0123456789"
+    var cut = cs.len()
+    while cut > 0 and digits.contains(cs.substr(cut - 1, 1)) {
+        cut = cut - 1
+    }
+    if cut < cs.len() and cut > 0 and (cs.substr(cut - 1, 1) == "p" or cs.substr(0, cut) == "mono") {
+        let depth = cs.substr(cut, cs.len() - cut).parse_int() ?? 0
+        if depth < 9 or depth > 16 {
+            fail(Y4mUnsupported(cs))
+        }
+        base = if cs.substr(cut - 1, 1) == "p" { cs.substr(0, cut - 1) } else { "mono" }
+        size = 2
+    }
+    if base == "mono" {
+        return (1, 1, 1, size)
+    }
+    if base == "420jpeg" or base == "420mpeg2" or base == "420paldv" or base == "420" {
+        return (2, 2, 3, size)
+    }
+    if base == "411" {
+        return (4, 1, 3, size)
+    }
+    if base == "422" {
+        return (2, 1, 3, size)
+    }
+    if base == "444" {
+        return (1, 1, 3, size)
+    }
+    if cs == "444alpha" {
+        return (1, 1, 4, 1)
+    }
+    fail(Y4mUnsupported(cs))
+}
+
+/// The bytes one frame takes.
+pub fn frame_size(cs: str, w: i64, h: i64) -> i64 ! Y4mError {
+    let (dx, dy, planes, size) = try layout(cs)
+    let chroma = ((w + dx - 1) / dx) * ((h + dy - 1) / dy)
+    return size * (w * h + (if planes >= 3 { 2 * chroma } else { 0 }) + (if planes == 4 { w * h } else { 0 }))
+}
+
+fn ratio(s: str) -> (i64, i64) ! Y4mError {
+    let p = s.split(":")
+    if p.len() != 2 {
+        fail(Y4mMalformed("a ratio without a colon"))
+    }
+    return (p[0].parse_int() ?? fail(Y4mMalformed("a ratio")), p[1].parse_int() ?? fail(Y4mMalformed("a ratio")))
+}
+
+fn line_end(d: bytes, from: i64) -> i64 ! Y4mError {
+    var i = from
+    while i < d.len() and d.at(i) != 10 {
+        i = i + 1
+    }
+    if i >= d.len() {
+        fail(Y4mMalformed("a line without its newline"))
+    }
+    return i
+}
+
+pub fn decode(d: bytes) -> Y4m ! Y4mError {
+    if d.len() < 10 or d.slice(0, 10).to_str() != "YUV4MPEG2 " {
+        fail(Y4mMalformed("not YUV4MPEG2"))
+    }
+    let end = try line_end(d, 0)
+    var y = Y4m{ width: 0, height: 0, fps: (0, 0), interlace: "?", aspect: (0, 0), colorspace: "420jpeg", extensions: [], frames: [] }
+    for t in d.slice(10, end).to_str().split(" ") {
+        if t.len() == 0 {
+            continue
+        }
+        let k = t.substr(0, 1)
+        let v = t.substr(1, t.len() - 1)
+        if k == "W" {
+            y.width = v.parse_int() ?? 0
+        } else if k == "H" {
+            y.height = v.parse_int() ?? 0
+        } else if k == "F" {
+            y.fps = try ratio(v)
+        } else if k == "I" {
+            y.interlace = v
+        } else if k == "A" {
+            y.aspect = try ratio(v)
+        } else if k == "C" {
+            y.colorspace = v
+        } else if k == "X" {
+            y.extensions.push(v)
+        }
+    }
+    if y.width < 1 or y.height < 1 {
+        fail(Y4mMalformed("no width and height"))
+    }
+    let size = try frame_size(y.colorspace, y.width, y.height)
+    var at = end + 1
+    while at < d.len() {
+        if at + 5 > d.len() or d.slice(at, at + 5).to_str() != "FRAME" {
+            fail(Y4mMalformed("a frame without its FRAME line"))
+        }
+        let e = try line_end(d, at)
+        if e + 1 + size > d.len() {
+            fail(Y4mMalformed("a frame cut short"))
+        }
+        y.frames.push(d.slice(e + 1, e + 1 + size))
+        at = e + 1 + size
+    }
+    return y
+}
+
+pub fn encode(y: Y4m) -> bytes ! Y4mError {
+    let size = try frame_size(y.colorspace, y.width, y.height)
+    var head = "YUV4MPEG2 W{y.width} H{y.height} F{y.fps.0}:{y.fps.1} I" + y.interlace + " A{y.aspect.0}:{y.aspect.1} C" + y.colorspace
+    for x in y.extensions {
+        head = head + " X" + x
+    }
+    var out = (head + "\n").to_bytes().to_list()
+    for f in y.frames {
+        if f.len() != size {
+            fail(Y4mMalformed("a frame of the wrong size"))
+        }
+        for b in "FRAME\n".to_bytes().to_list() {
+            out.push(b)
+        }
+        for i in 0..f.len() {
+            out.push(f.at(i))
+        }
+    }
+    return bytes_of(out)
+}

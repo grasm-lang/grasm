@@ -1,0 +1,4 @@
+[package]
+name = "g711"
+version = "1.0.0"
+capabilities = []

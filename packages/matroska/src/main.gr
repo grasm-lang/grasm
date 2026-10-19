@@ -1,0 +1,592 @@
+// Matroska and WebM files (.mkv, .mka, .webm), built on EBML.
+//
+// EBML is binary XML: each element is an ID and a size, both written as
+// variable-length integers whose leading zero bits give their length,
+// then a body that is an integer, a float, a string, binary data or more
+// elements. A size of all ones means unknown -- the element runs until
+// something that cannot be inside it begins, which is how live streams
+// are written. A Matroska file is an EBML header naming the DocType
+// ("matroska" or "webm"), then a Segment holding Info (the timestamp
+// scale, duration, the muxing and writing apps), Tracks (number, type,
+// codec ID and private data, default duration, video dimensions, audio
+// rate and channels), and Clusters: a timestamp, then SimpleBlocks and
+// BlockGroups, each a track number, a 16-bit timestamp relative to the
+// cluster, flags, and one frame or several laced together (Xiph, EBML or
+// fixed-size lacing). YouTube serves WebM; anime releases, Blu-ray rips,
+// OBS recordings and browsers' MediaRecorder write Matroska.
+//
+// `frames` unlaces every block. A lace after the first is dated by the
+// block's duration (its BlockDuration, or the track's DefaultDuration
+// times the lace count) shared out by integer division; without one its
+// time is unknown (-1). Timestamps are as stored: a reader that honours
+// a track's CodecDelay shifts them back by it. `encode` writes a file
+// with chosen lacing.
+//
+// Checked against FFmpeg's Matroska demuxer: every packet's timestamp,
+// size, key flag and contents, for files FFmpeg writes and for files
+// written here with each kind of lacing.
+import bfloat16
+
+type MkvElement = { id: i64, offset: i64, header: i64, size: i64, unknown: bool }
+
+type MkvTrack = {
+    number: i64,
+    uid: i64,
+    kind: i64,
+    codec: str,
+    private: bytes,
+    default_duration: i64,
+    codec_delay: i64,
+    language: str,
+    name: str,
+    width: i64,
+    height: i64,
+    rate: f64,
+    channels: i64,
+    bit_depth: i64,
+}
+
+type MkvInfo = { doc_type: str, timestamp_scale: i64, duration: f64, muxing_app: str, writing_app: str, title: str }
+
+type MkvFrame = { track: i64, timestamp: i64, keyframe: bool, data: bytes }
+
+type MkvBlockOut = { track: i64, timestamp: i64, keyframe: bool, lacing: i64, frames: [bytes] }
+
+type MkvError =
+    | MkvMalformed(at: i64, why: str)
+
+/// A variable-length integer at `at`: (value, length, all ones).
+pub fn vint(d: bytes, at: i64, keep_marker: bool) -> (i64, i64, bool) ! MkvError {
+    if at >= d.len() {
+        fail(MkvMalformed(at, "data ends inside a variable-length integer"))
+    }
+    let first = d.at(at)
+    if first == 0 {
+        fail(MkvMalformed(at, "a variable-length integer longer than eight bytes"))
+    }
+    var len = 1
+    while first.bit_and(128.ushr(len - 1)) == 0 {
+        len = len + 1
+    }
+    if at + len > d.len() {
+        fail(MkvMalformed(at, "data ends inside a variable-length integer"))
+    }
+    var v = if keep_marker { first } else { first.bit_and(128.ushr(len - 1) - 1) }
+    var ones = v == 128.ushr(len - 1) - 1
+    for k in 1..len {
+        v = v.shl(8).bit_or(d.at(at + k))
+        ones = ones and d.at(at + k) == 255
+    }
+    return (v, len, ones and not keep_marker)
+}
+
+fn element(d: bytes, at: i64, end: i64) -> MkvElement ! MkvError {
+    let (id, il, _a) = try vint(d, at, true)
+    let (size, sl, unknown) = try vint(d, at + il, false)
+    let header = il + sl
+    let real = if unknown { end - at - header } else { size }
+    if not unknown and at + header + size > end {
+        fail(MkvMalformed(at, "an element of size {size} that does not fit"))
+    }
+    return MkvElement{ id: id, offset: at, header: header, size: real, unknown: unknown }
+}
+
+/// IDs that may appear inside a Cluster: an element of unknown size ends
+/// at the first ID that may not.
+fn in_cluster(id: i64) -> bool {
+    return id == 231 or id == 163 or id == 160 or id == 236 or id == 191 or id == 167 or id == 171 or id == 22612 or id == 175
+}
+
+/// The elements between `from` and `to`. An element of unknown size ends
+/// where the next element that it cannot contain begins.
+pub fn elements(d: bytes, from: i64, to: i64) -> [MkvElement] ! MkvError {
+    var out: [MkvElement] = []
+    var at = from
+    while at < to {
+        var e = try element(d, at, to)
+        if e.unknown and e.id == 524531317 {
+            var p = at + e.header
+            while p < to {
+                let c = try element(d, p, to)
+                if not in_cluster(c.id) {
+                    break
+                }
+                p = p + c.header + c.size
+            }
+            e.size = p - at - e.header
+        }
+        out.push(e)
+        at = at + e.header + e.size
+    }
+    return out
+}
+
+fn body(e: MkvElement) -> i64 {
+    return e.offset + e.header
+}
+
+pub fn children(d: bytes, e: MkvElement) -> [MkvElement] ! MkvError {
+    return try elements(d, body(e), body(e) + e.size)
+}
+
+pub fn uint(d: bytes, e: MkvElement) -> i64 {
+    var v = 0
+    for k in 0..e.size {
+        v = v.shl(8).bit_or(d.at(body(e) + k))
+    }
+    return v
+}
+
+pub fn float(d: bytes, e: MkvElement) -> f64 {
+    let v = uint(d, e)
+    return if e.size == 4 { bfloat16.f32_from_bits(v) } else if e.size == 8 { v.from_bits() } else { 0.0 }
+}
+
+/// A string element, any NUL padding at the end removed.
+pub fn string(d: bytes, e: MkvElement) -> str {
+    var end = body(e) + e.size
+    while end > body(e) and d.at(end - 1) == 0 {
+        end = end - 1
+    }
+    return d.slice(body(e), end).to_str()
+}
+
+/// The EBML header's DocType and the Segment.
+fn segment(d: bytes) -> (str, MkvElement) ! MkvError {
+    let top = try elements(d, 0, d.len())
+    if top.len() < 2 or top[0].id != 440786851 {
+        fail(MkvMalformed(0, "no EBML header"))
+    }
+    var doc = "matroska"
+    for c in try children(d, top[0]) {
+        if c.id == 17026 {
+            doc = string(d, c)
+        }
+    }
+    for e in top {
+        if e.id == 408125543 {
+            return (doc, e)
+        }
+    }
+    fail(MkvMalformed(0, "no Segment"))
+}
+
+pub fn info(d: bytes) -> MkvInfo ! MkvError {
+    let (doc, seg) = try segment(d)
+    var i = MkvInfo{ doc_type: doc, timestamp_scale: 1000000, duration: 0.0, muxing_app: "", writing_app: "", title: "" }
+    for e in try children(d, seg) {
+        if e.id == 357149030 {
+            for c in try children(d, e) {
+                if c.id == 2807729 {
+                    i.timestamp_scale = uint(d, c)
+                } else if c.id == 17545 {
+                    i.duration = float(d, c)
+                } else if c.id == 19840 {
+                    i.muxing_app = string(d, c)
+                } else if c.id == 22337 {
+                    i.writing_app = string(d, c)
+                } else if c.id == 31657 {
+                    i.title = string(d, c)
+                }
+            }
+        }
+    }
+    return i
+}
+
+fn track_entry(d: bytes, e: MkvElement) -> MkvTrack ! MkvError {
+    var t = MkvTrack{ number: 0, uid: 0, kind: 0, codec: "", private: bytes_of([]), default_duration: 0, codec_delay: 0, language: "eng", name: "", width: 0,
+        height: 0, rate: 8000.0, channels: 1, bit_depth: 0 }
+    for c in try children(d, e) {
+        let id = c.id
+        if id == 215 {
+            t.number = uint(d, c)
+        } else if id == 29637 {
+            t.uid = uint(d, c)
+        } else if id == 131 {
+            t.kind = uint(d, c)
+        } else if id == 134 {
+            t.codec = string(d, c)
+        } else if id == 25506 {
+            t.private = d.slice(body(c), body(c) + c.size)
+        } else if id == 2352003 {
+            t.default_duration = uint(d, c)
+        } else if id == 22186 {
+            t.codec_delay = uint(d, c)
+        } else if id == 2274716 {
+            t.language = string(d, c)
+        } else if id == 21358 {
+            t.name = string(d, c)
+        } else if id == 224 or id == 225 {
+            for v in try children(d, c) {
+                if v.id == 176 {
+                    t.width = uint(d, v)
+                } else if v.id == 186 {
+                    t.height = uint(d, v)
+                } else if v.id == 181 {
+                    t.rate = float(d, v)
+                } else if v.id == 159 {
+                    t.channels = uint(d, v)
+                } else if v.id == 25188 {
+                    t.bit_depth = uint(d, v)
+                }
+            }
+        }
+    }
+    return t
+}
+
+pub fn tracks(d: bytes) -> [MkvTrack] ! MkvError {
+    let (_doc, seg) = try segment(d)
+    var out: [MkvTrack] = []
+    for e in try children(d, seg) {
+        if e.id == 374648427 {
+            for c in try children(d, e) {
+                if c.id == 174 {
+                    out.push(try track_entry(d, c))
+                }
+            }
+        }
+    }
+    return out
+}
+
+/// A block's frames, unlaced: (track, relative timestamp, flags, frames).
+pub fn unlace(d: bytes, from: i64, to: i64) -> (i64, i64, i64, [bytes]) ! MkvError {
+    let (track, tl, _u) = try vint(d, from, false)
+    var p = from + tl
+    if p + 3 > to {
+        fail(MkvMalformed(from, "a block header cut short"))
+    }
+    var rel = d.at(p).shl(8).bit_or(d.at(p + 1))
+    if rel >= 32768 {
+        rel = rel - 65536
+    }
+    let flags = d.at(p + 2)
+    p = p + 3
+    let lacing = flags.ushr(1).bit_and(3)
+    if lacing == 0 {
+        return (track, rel, flags, [d.slice(p, to)])
+    }
+    if p >= to {
+        fail(MkvMalformed(from, "a laced block without its lace count"))
+    }
+    let count = d.at(p) + 1
+    p = p + 1
+    var sizes: [i64] = []
+    if lacing == 1 {
+        for _i in 0..(count - 1) {
+            var n = 0
+            var more = true
+            while more {
+                if p >= to {
+                    fail(MkvMalformed(from, "Xiph lace sizes cut short"))
+                }
+                n = n + d.at(p)
+                more = d.at(p) == 255
+                p = p + 1
+            }
+            sizes.push(n)
+        }
+    } else if lacing == 3 and count > 1 {
+        let (first, fl, _f) = try vint(d, p, false)
+        p = p + fl
+        sizes.push(first)
+        var prev = first
+        for _i in 0..(count - 2) {
+            let (raw, rl, _r) = try vint(d, p, false)
+            p = p + rl
+            prev = prev + raw - (1.shl(7 * rl - 1) - 1)
+            sizes.push(prev)
+        }
+    } else if lacing == 2 {
+        if (to - p) % count != 0 {
+            fail(MkvMalformed(from, "fixed-size laces that do not divide the block"))
+        }
+        for _i in 0..(count - 1) {
+            sizes.push((to - p) / count)
+        }
+    }
+    var frames: [bytes] = []
+    for n in sizes {
+        if n < 0 or p + n > to {
+            fail(MkvMalformed(from, "lace sizes larger than the block"))
+        }
+        frames.push(d.slice(p, p + n))
+        p = p + n
+    }
+    if p > to {
+        fail(MkvMalformed(from, "lace sizes larger than the block"))
+    }
+    frames.push(d.slice(p, to))
+    return (track, rel, flags, frames)
+}
+
+/// One block's frames dated: lace n starts n/laces of the way through the
+/// block's duration, floored.
+fn add_block(track: i64, ts: i64, key: bool, duration: i64, frames: [bytes], inout out: [MkvFrame]) {
+    let n = frames.len()
+    for i in 0..n {
+        let t = if i == 0 { ts } else if duration > 0 { ts + duration * i / n } else { 0 - 1 }
+        out.push(MkvFrame{ track: track, timestamp: t, keyframe: key, data: frames[i] })
+    }
+}
+
+/// A block's duration from its track's DefaultDuration: the lace count
+/// times it, in timestamp-scale units.
+fn block_duration_of(ts: [MkvTrack], track: i64, laces: i64, scale: i64) -> i64 {
+    for t in ts {
+        if t.number == track {
+            return t.default_duration * laces / scale
+        }
+    }
+    return 0
+}
+
+fn cluster_frames(d: bytes, cluster: MkvElement, ts: [MkvTrack], scale: i64, inout out: [MkvFrame]) -> () ! MkvError {
+    var base = 0
+    for e in try children(d, cluster) {
+        if e.id == 231 {
+            base = uint(d, e)
+        } else if e.id == 163 {
+            let (track, rel, flags, frames) = try unlace(d, body(e), body(e) + e.size)
+            add_block(track, base + rel, flags.bit_and(128) != 0, block_duration_of(ts, track, frames.len(), scale), frames, out)
+        } else if e.id == 160 {
+            var block = e
+            var found = false
+            var duration = 0 - 1
+            var key = true
+            for c in try children(d, e) {
+                if c.id == 161 {
+                    block = c
+                    found = true
+                } else if c.id == 155 {
+                    duration = uint(d, c)
+                } else if c.id == 251 {
+                    key = false
+                }
+            }
+            if not found {
+                fail(MkvMalformed(e.offset, "a BlockGroup without a Block"))
+            }
+            let (track, rel, _flags, frames) = try unlace(d, body(block), body(block) + block.size)
+            let dur = if duration >= 0 { duration } else { block_duration_of(ts, track, frames.len(), scale) }
+            add_block(track, base + rel, key, dur, frames, out)
+        }
+    }
+}
+
+/// Every frame of every cluster in file order; timestamps are in the
+/// segment's timestamp scale.
+pub fn frames(d: bytes) -> [MkvFrame] ! MkvError {
+    let (_doc, seg) = try segment(d)
+    let ts = try tracks(d)
+    let scale = (try info(d)).timestamp_scale
+    var out: [MkvFrame] = []
+    for e in try children(d, seg) {
+        if e.id == 524531317 {
+            try cluster_frames(d, e, ts, scale, out)
+        }
+    }
+    return out
+}
+
+/// A size as the shortest variable-length integer that can hold it (all
+/// ones is reserved for unknown).
+pub fn size_vint(n: i64) -> [i64] {
+    var len = 1
+    while n >= 1.shl(7 * len) - 1 {
+        len = len + 1
+    }
+    var out: [i64] = []
+    var k = len - 1
+    while k >= 0 {
+        out.push(n.shr(8 * k).bit_and(255))
+        k = k - 1
+    }
+    out[0] = out[0].bit_or(128.ushr(len - 1))
+    return out
+}
+
+fn id_bytes(id: i64) -> [i64] {
+    var out: [i64] = []
+    var k = 3
+    while k >= 0 {
+        let b = id.shr(8 * k).bit_and(255)
+        if b != 0 or out.len() > 0 {
+            out.push(b)
+        }
+        k = k - 1
+    }
+    return out
+}
+
+fn el(id: i64, content: [i64]) -> [i64] {
+    var out = id_bytes(id)
+    for x in size_vint(content.len()) + content {
+        out.push(x)
+    }
+    return out
+}
+
+fn el_uint(id: i64, v: i64) -> [i64] {
+    var b: [i64] = []
+    var k = 7
+    while k >= 0 {
+        let x = v.shr(8 * k).bit_and(255)
+        if x != 0 or b.len() > 0 or k == 0 {
+            b.push(x)
+        }
+        k = k - 1
+    }
+    return el(id, b)
+}
+
+fn el_float(id: i64, v: f64) -> [i64] {
+    let bits = v.to_bits()
+    var b: [i64] = []
+    var k = 7
+    while k >= 0 {
+        b.push(bits.shr(8 * k).bit_and(255))
+        k = k - 1
+    }
+    return el(id, b)
+}
+
+fn el_str(id: i64, s: str) -> [i64] {
+    return el(id, s.to_bytes().to_list())
+}
+
+fn track_bytes(t: MkvTrack) -> [i64] {
+    var c = el_uint(215, t.number) + el_uint(29637, t.uid) + el_uint(131, t.kind) + el_str(134, t.codec) + el_str(2274716, t.language)
+    if t.private.len() > 0 {
+        c = c + el(25506, t.private.to_list())
+    }
+    if t.default_duration > 0 {
+        c = c + el_uint(2352003, t.default_duration)
+    }
+    if t.codec_delay > 0 {
+        c = c + el_uint(22186, t.codec_delay)
+    }
+    if t.name.len() > 0 {
+        c = c + el_str(21358, t.name)
+    }
+    if t.kind == 1 {
+        c = c + el(224, el_uint(176, t.width) + el_uint(186, t.height))
+    } else if t.kind == 2 {
+        var a = el_float(181, t.rate) + el_uint(159, t.channels)
+        if t.bit_depth > 0 {
+            a = a + el_uint(25188, t.bit_depth)
+        }
+        c = c + el(225, a)
+    }
+    return el(174, c)
+}
+
+/// A SimpleBlock's bytes, laced as asked: 0 none (one frame), 1 Xiph,
+/// 2 fixed-size (equal frames), 3 EBML. A single frame is written unlaced
+/// whatever the lacing: the specification codes no sizes for one EBML
+/// lace, but FFmpeg reads one, and an unlaced block means the same.
+pub fn block_bytes(b: MkvBlockOut, rel: i64) -> [i64] ! MkvError {
+    let n = b.frames.len()
+    if n == 0 or n > 256 or b.lacing == 0 and n != 1 {
+        fail(MkvMalformed(0, "a block of {n} frames that its lacing cannot hold"))
+    }
+    let lacing = if n == 1 { 0 } else { b.lacing }
+    var out = size_vint(b.track)
+    let r = if rel < 0 { rel + 65536 } else { rel }
+    for x in [r.ushr(8), r.bit_and(255), (if b.keyframe { 128 } else { 0 }) + lacing.shl(1)] {
+        out.push(x)
+    }
+    if lacing != 0 {
+        out.push(n - 1)
+        if lacing == 1 {
+            for i in 0..(n - 1) {
+                var s = b.frames[i].len()
+                while s >= 255 {
+                    out.push(255)
+                    s = s - 255
+                }
+                out.push(s)
+            }
+        } else if lacing == 2 {
+            for f in b.frames {
+                if f.len() != b.frames[0].len() {
+                    fail(MkvMalformed(0, "fixed-size lacing of frames that differ in size"))
+                }
+            }
+        } else {
+            for x in size_vint(b.frames[0].len()) {
+                out.push(x)
+            }
+            for i in 1..(n - 1) {
+                for x in signed_vint(b.frames[i].len() - b.frames[i - 1].len()) {
+                    out.push(x)
+                }
+            }
+        }
+    }
+    for f in b.frames {
+        for i in 0..f.len() {
+            out.push(f.at(i))
+        }
+    }
+    return out
+}
+
+/// A signed lace-size difference: the shortest length whose bias holds it.
+fn signed_vint(v: i64) -> [i64] {
+    var len = 1
+    while v < 0 - (1.shl(7 * len - 1) - 1) or v > 1.shl(7 * len - 1) - 1 {
+        len = len + 1
+    }
+    let raw = v + 1.shl(7 * len - 1) - 1
+    var out: [i64] = []
+    var k = len - 1
+    while k >= 0 {
+        out.push(raw.shr(8 * k).bit_and(255))
+        k = k - 1
+    }
+    out[0] = out[0].bit_or(128.ushr(len - 1))
+    return out
+}
+
+/// A whole file: the EBML header, Info at a millisecond timestamp scale,
+/// Tracks, then Clusters of SimpleBlocks. A new Cluster starts when a
+/// block's timestamp would not fit 16 bits relative to the current one, or
+/// every `per_cluster` blocks.
+pub fn encode(doc_type: str, app: str, ts: [MkvTrack], blocks: [MkvBlockOut], per_cluster: i64) -> bytes ! MkvError {
+    let header = el(440786851, el_uint(17030, 1) + el_uint(17143, 1) + el_uint(17138, 4) + el_uint(17139, 8) + el_str(17026, doc_type) +
+        el_uint(17031, 4) + el_uint(17029, 2))
+    let info_el = el(357149030, el_uint(2807729, 1000000) + el_str(19840, app) + el_str(22337, app))
+    var tracks_c: [i64] = []
+    for t in ts {
+        for x in track_bytes(t) {
+            tracks_c.push(x)
+        }
+    }
+    var seg = info_el + el(374648427, tracks_c)
+    var i = 0
+    while i < blocks.len() {
+        let base = blocks[i].timestamp
+        if base < 0 {
+            fail(MkvMalformed(0, "a block before time zero"))
+        }
+        var c = el_uint(231, base)
+        var n = 0
+        while i < blocks.len() and n < per_cluster and blocks[i].timestamp - base >= -32768 and blocks[i].timestamp - base <= 32767 {
+            for x in el(163, try block_bytes(blocks[i], blocks[i].timestamp - base)) {
+                c.push(x)
+            }
+            i = i + 1
+            n = n + 1
+        }
+        if n == 0 {
+            fail(MkvMalformed(0, "a block that no cluster can hold"))
+        }
+        for x in el(524531317, c) {
+            seg.push(x)
+        }
+    }
+    return bytes_of(header + el(408125543, seg))
+}

@@ -1,0 +1,146 @@
+// Advanced SubStation Alpha subtitles (.ass, and .ssa's V4 styles).
+//
+// An INI-like script: `[Script Info]` key-value pairs (play resolution,
+// wrap style), `[V4+ Styles]` with a Format line naming the columns and a
+// Style line per style (font, size, colours, outline, alignment, margins),
+// and `[Events]` with a Format line and Dialogue (and Comment) lines whose
+// last column, the text, may itself contain commas and `{\override}` tags.
+// Times are H:MM:SS.CC, in centiseconds. Anime fansubs, Aegisub, mpv and
+// libass, and every player that shows styled subtitles use it.
+//
+// `parse` keeps every section: key-value pairs for Script Info, columns
+// as their Format line orders them for styles and events (each as
+// written, spaces kept, for the reader to trim as it sees fit), and other
+// sections ([Fonts], [Graphics], [Aegisub Project]) as raw lines.
+//
+// Checked against FFmpeg's ass demuxer, event by event.
+
+type AssEvent = { kind: str, start: i64, end: i64, fields: [str] }
+
+type AssScript = {
+    info: [(str, str)],
+    style_format: [str],
+    styles: [[str]],
+    event_format: [str],
+    events: [AssEvent],
+    other: [(str, [str])],
+}
+
+type AssError =
+    | AssMalformed(why: str)
+
+/// H:MM:SS.CC as centiseconds; hours may have any number of digits. The
+/// fraction is read as a whole number of centiseconds, however many digits
+/// it has, as libass and FFmpeg read it: "0:00:01.5" is 1.05 seconds.
+pub fn parse_time(t: str) -> i64 ! AssError {
+    let p = t.trim().split(":")
+    if p.len() != 3 {
+        fail(AssMalformed("a time without hours, minutes and seconds"))
+    }
+    let s = p[2].split(".")
+    let h = p[0].parse_int() ?? fail(AssMalformed("hours"))
+    let m = p[1].parse_int() ?? fail(AssMalformed("minutes"))
+    let sec = s[0].parse_int() ?? fail(AssMalformed("seconds"))
+    let cs = if s.len() > 1 and s[1].len() > 0 { s[1].parse_int() ?? fail(AssMalformed("centiseconds")) } else { 0 }
+    return ((h * 60 + m) * 60 + sec) * 100 + cs
+}
+
+pub fn render_time(cs: i64) -> str {
+    let two = |v| if v < 10 { "0{v}" } else { "{v}" }
+    return "{cs / 360000}:" + two(cs / 6000 % 60) + ":" + two(cs / 100 % 60) + "." + two(cs % 100)
+}
+
+/// A line's columns as written: the first n - 1 split at commas, the last
+/// the rest, commas and all.
+fn columns(rest: str, n: i64) -> [str] {
+    var out: [str] = []
+    var r = rest
+    while out.len() < n - 1 {
+        match r.index_of(",") {
+            Some(i) -> {
+                out.push(r.substr(0, i))
+                r = r.substr(i + 1, r.len() - i - 1)
+            }
+            None -> {
+                out.push(r)
+                r = ""
+            }
+        }
+    }
+    out.push(r)
+    return out
+}
+
+pub fn parse(text: str) -> AssScript ! AssError {
+    var s = AssScript{ info: [], style_format: [], styles: [], event_format: [], events: [], other: [] }
+    var section = ""
+    // The section being read, if it is one kept as raw lines.
+    var raw_name = ""
+    var raw_lines: [str] = []
+    let body = if text.starts_with("\u{feff}") { text.substr(1, text.len() - 1) } else { text }
+    for raw in body.split("\n") {
+        let line = if raw.ends_with("\r") { raw.substr(0, raw.len() - 1) } else { raw }
+        let t = line.trim()
+        if t.len() == 0 {
+            continue
+        }
+        if t.starts_with("[") and t.ends_with("]") {
+            if raw_name.len() > 0 {
+                s.other.push((raw_name, raw_lines))
+            }
+            section = t.to_lower()
+            let known = section == "[script info]" or section == "[v4+ styles]" or section == "[v4 styles]" or section == "[events]"
+            raw_name = if known { "" } else { t }
+            raw_lines = []
+            continue
+        }
+        // Trailing spaces belong to the last column (an event's text).
+        let lt = line.trim_start()
+        let colon = lt.index_of(":") ?? -1
+        let key = if colon > 0 { lt.substr(0, colon).trim() } else { "" }
+        let value = if colon > 0 { lt.substr(colon + 1, lt.len() - colon - 1).trim_start() } else { lt }
+        if section == "[script info]" {
+            if not t.starts_with(";") and colon > 0 {
+                s.info.push((key, value.trim()))
+            }
+        } else if section == "[v4+ styles]" or section == "[v4 styles]" {
+            if key == "Format" {
+                s.style_format = value.split(",").map(|x| x.trim())
+            } else if key == "Style" {
+                s.styles.push(columns(value, s.style_format.len()))
+            }
+        } else if section == "[events]" {
+            if key == "Format" {
+                s.event_format = value.split(",").map(|x| x.trim())
+            } else if (key == "Dialogue" or key == "Comment") and s.event_format.len() > 0 {
+                let f = columns(value, s.event_format.len())
+                var start = 0
+                var end = 0
+                for i in 0..s.event_format.len() {
+                    if s.event_format[i] == "Start" {
+                        start = try parse_time(f[i])
+                    } else if s.event_format[i] == "End" {
+                        end = try parse_time(f[i])
+                    }
+                }
+                s.events.push(AssEvent{ kind: key, start: start, end: end, fields: f })
+            }
+        } else if raw_name.len() > 0 {
+            raw_lines.push(line)
+        }
+    }
+    if raw_name.len() > 0 {
+        s.other.push((raw_name, raw_lines))
+    }
+    return s
+}
+
+/// An event's column by its Format name.
+pub fn field(s: AssScript, e: AssEvent, name: str) -> str {
+    for i in 0..s.event_format.len() {
+        if s.event_format[i] == name and i < e.fields.len() {
+            return e.fields[i]
+        }
+    }
+    return ""
+}

@@ -1,0 +1,12 @@
+[package]
+name = "aiff"
+version = "1.0.0"
+capabilities = []
+
+[dependencies.g711]
+path = "../g711"
+version = "^1.0.0"
+
+[dependencies.bfloat16]
+path = "../bfloat16"
+version = "^1.0.0"

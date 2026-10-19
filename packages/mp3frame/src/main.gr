@@ -1,0 +1,209 @@
+// MPEG audio frames: the headers of MP3, MP2 and MP1 streams, and the
+// Xing/Info and LAME tags that give an MP3 its length and its gapless
+// trim.
+//
+// Each frame starts with an 11-bit sync, the MPEG version (1, 2 or 2.5),
+// the layer (I, II or III), a CRC flag, a bit rate index, a sample rate
+// index, a padding bit, the channel mode, and copyright and emphasis
+// bits. The frame's length follows from these: 144 * bitrate / rate
+// bytes for Layer III at MPEG-1 (72 at 2 and 2.5), 144 for Layer II,
+// 4 * (12 * bitrate / rate) for Layer I, plus the padding slot. An MP3
+// encoder writes a first frame of silence holding a Xing ("Xing" for VBR,
+// "Info" for CBR) tag -- frame and byte counts, a seek table -- and LAME
+// adds its encoder delay and padding, which a player trims for gapless
+// playback. Every podcast, audiobook, and music collection from the last
+// thirty years is these frames.
+//
+// Checked against FFmpeg's MP3 demuxer: frame positions and sizes, the
+// stream's rate, channels and bit rate, and its start time and duration
+// from the Xing and LAME tags.
+
+type MpaHeader = {
+    version: str,
+    layer: i64,
+    crc: bool,
+    bitrate: i64,
+    rate: i64,
+    padding: bool,
+    mode: i64,
+    mode_extension: i64,
+    copyright: bool,
+    original: bool,
+    emphasis: i64,
+    length: i64,
+    samples: i64,
+}
+
+type MpaFrame = { offset: i64, header: MpaHeader }
+
+type XingTag = { vbr: bool, frames: i64, bytes_n: i64, toc: [i64], quality: i64, delay: i64, padding: i64, encoder: str }
+
+type MpaError =
+    | MpaMalformed(at: i64, why: str)
+
+fn bitrates(version: str, layer: i64) -> [i64] {
+    if version == "1" {
+        if layer == 1 {
+            return [0, 32, 64, 96, 128, 160, 192, 224, 256, 288, 320, 352, 384, 416, 448]
+        }
+        if layer == 2 {
+            return [0, 32, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 384]
+        }
+        return [0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320]
+    }
+    if layer == 1 {
+        return [0, 32, 48, 56, 64, 80, 96, 112, 128, 144, 160, 176, 192, 224, 256]
+    }
+    return [0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160]
+}
+
+pub fn parse_header(d: bytes, at: i64) -> MpaHeader ! MpaError {
+    if at + 4 > d.len() {
+        fail(MpaMalformed(at, "a header cut short"))
+    }
+    let h = d.at(at).shl(24).bit_or(d.at(at + 1).shl(16)).bit_or(d.at(at + 2).shl(8)).bit_or(d.at(at + 3))
+    if h.ushr(21) != 2047 {
+        fail(MpaMalformed(at, "no frame sync"))
+    }
+    let v = h.ushr(19).bit_and(3)
+    let l = h.ushr(17).bit_and(3)
+    let bi = h.ushr(12).bit_and(15)
+    let ri = h.ushr(10).bit_and(3)
+    if v == 1 or l == 0 or bi == 15 or ri == 3 {
+        fail(MpaMalformed(at, "a reserved version, layer, bit rate or sample rate"))
+    }
+    if bi == 0 {
+        fail(MpaMalformed(at, "a free-format frame"))
+    }
+    let version = if v == 3 { "1" } else if v == 2 { "2" } else { "2.5" }
+    let layer = 4 - l
+    let base = [44100, 48000, 32000][ri]
+    let rate = if v == 3 { base } else if v == 2 { base / 2 } else { base / 4 }
+    let bitrate = bitrates(version, layer)[bi] * 1000
+    let pad = h.ushr(9).bit_and(1)
+    let length = if layer == 1 { (12 * bitrate / rate + pad) * 4 } else if layer == 3 and v != 3 { 72 * bitrate / rate + pad }
+    else { 144 * bitrate / rate + pad }
+    let samples = if layer == 1 { 384 } else if layer == 3 and v != 3 { 576 } else { 1152 }
+    return MpaHeader{ version: version, layer: layer, crc: h.ushr(16).bit_and(1) == 0, bitrate: bitrate, rate: rate, padding: pad == 1,
+        mode: h.ushr(6).bit_and(3), mode_extension: h.ushr(4).bit_and(3), copyright: h.ushr(3).bit_and(1) == 1,
+        original: h.ushr(2).bit_and(1) == 1, emphasis: h.bit_and(3), length: length, samples: samples }
+}
+
+pub fn channels(h: MpaHeader) -> i64 {
+    return if h.mode == 3 { 1 } else { 2 }
+}
+
+/// Where the audio starts: past an ID3v2 tag (and its footer), if any.
+pub fn audio_start(d: bytes) -> i64 {
+    if d.len() >= 10 and d.slice(0, 3).to_str() == "ID3" {
+        let size = d.at(6).shl(21).bit_or(d.at(7).shl(14)).bit_or(d.at(8).shl(7)).bit_or(d.at(9))
+        return 10 + size + (if d.at(5).bit_and(16) != 0 { 10 } else { 0 })
+    }
+    return 0
+}
+
+/// Where the audio ends: before an ID3v1 tag and an APEv2 footer, if any.
+pub fn audio_end(d: bytes) -> i64 {
+    var end = d.len()
+    if end >= 128 and d.slice(end - 128, end - 125).to_str() == "TAG" {
+        end = end - 128
+    }
+    if end >= 32 and d.slice(end - 32, end - 24).to_str() == "APETAGEX" {
+        let size = d.at(end - 20).bit_or(d.at(end - 19).shl(8)).bit_or(d.at(end - 18).shl(16)).bit_or(d.at(end - 17).shl(24))
+        let header = if d.at(end - 9).bit_and(128) != 0 { 32 } else { 0 }
+        end = end - size - header
+    }
+    return end
+}
+
+/// Every frame between the tags, in order. A frame cut short at the end is
+/// dropped, as players do; anything else between frames is an error.
+pub fn frames(d: bytes) -> [MpaFrame] ! MpaError {
+    let end = audio_end(d)
+    var at = audio_start(d)
+    var out: [MpaFrame] = []
+    while at + 4 <= end {
+        let h = try parse_header(d, at)
+        if at + h.length > end {
+            return out
+        }
+        out.push(MpaFrame{ offset: at, header: h })
+        at = at + h.length
+    }
+    return out
+}
+
+/// Where a Layer III frame's side information ends: the Xing tag goes
+/// right after it.
+fn side_info_end(h: MpaHeader) -> i64 {
+    let side = if h.version == "1" { if h.mode == 3 { 17 } else { 32 } } else { if h.mode == 3 { 9 } else { 17 } }
+    return 4 + (if h.crc { 2 } else { 0 }) + side
+}
+
+fn be32(d: bytes, at: i64) -> i64 {
+    return d.at(at).shl(24).bit_or(d.at(at + 1).shl(16)).bit_or(d.at(at + 2).shl(8)).bit_or(d.at(at + 3))
+}
+
+/// The Xing or Info tag in a frame, with LAME's delay and padding when the
+/// LAME extension follows it.
+pub fn xing(d: bytes, f: MpaFrame) -> Option[XingTag] {
+    let at = f.offset + side_info_end(f.header)
+    if at + 8 > d.len() {
+        return None
+    }
+    let id = d.slice(at, at + 4).to_str()
+    if id != "Xing" and id != "Info" {
+        return None
+    }
+    let flags = be32(d, at + 4)
+    var p = at + 8
+    var t = XingTag{ vbr: id == "Xing", frames: 0 - 1, bytes_n: 0 - 1, toc: [], quality: 0 - 1, delay: 0, padding: 0, encoder: "" }
+    if flags.bit_and(1) != 0 {
+        t.frames = be32(d, p)
+        p = p + 4
+    }
+    if flags.bit_and(2) != 0 {
+        t.bytes_n = be32(d, p)
+        p = p + 4
+    }
+    if flags.bit_and(4) != 0 {
+        for k in 0..100 {
+            t.toc.push(d.at(p + k))
+        }
+        p = p + 100
+    }
+    if flags.bit_and(8) != 0 {
+        t.quality = be32(d, p)
+        p = p + 4
+    }
+    if p + 24 <= f.offset + f.header.length {
+        let enc = d.slice(p, p + 9)
+        var printable = true
+        for i in 0..9 {
+            if enc.at(i) < 32 or enc.at(i) > 126 {
+                printable = false
+            }
+        }
+        if printable and (enc.slice(0, 4).to_str() == "LAME" or enc.slice(0, 4).to_str() == "Lavc" or enc.slice(0, 4).to_str() == "Lavf") {
+            t.encoder = enc.to_str()
+            t.delay = d.at(p + 21).shl(4).bit_or(d.at(p + 22).ushr(4))
+            t.padding = d.at(p + 22).bit_and(15).shl(8).bit_or(d.at(p + 23))
+        }
+    }
+    return Some(t)
+}
+
+/// The samples a decoder discards at the start: the encoder delay plus the
+/// 529-sample delay of the reference decoder, when LAME recorded it.
+pub fn start_samples(t: XingTag) -> i64 {
+    return if t.encoder.len() > 0 { t.delay + 529 } else { 0 }
+}
+
+/// The audio's length in samples, the delay and padding trimmed, when
+/// the tag counts its frames (the tag's own frame not among them).
+pub fn duration_samples(t: XingTag, samples_per_frame: i64) -> i64 {
+    if t.frames < 0 {
+        return 0 - 1
+    }
+    return t.frames * samples_per_frame - t.delay - t.padding
+}

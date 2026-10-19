@@ -1,0 +1,103 @@
+// One short tone through fifteen audio and video formats and back.
+// scripts/b39_diff.sh holds them to FFmpeg and afconvert.
+import g711
+import imaadpcm
+import aufile
+import aiff
+import caffile
+import y4m
+import assfile
+import flacdec
+import oggpage
+import vorbiscomment
+import opushead
+import adts
+import mp3frame
+import isobmff
+import matroska
+import bytes_codec
+
+fn tone() -> [i64] {
+    // A 1 kHz tone at 8 kHz: eight samples a cycle.
+    let cycle = [0, 2896, 4095, 2896, 0, -2896, -4095, -2896]
+    var out: [i64] = []
+    for i in 0..64 {
+        out.push(cycle[i % 8] * 4)
+    }
+    out
+}
+
+fn telephone(s: [i64]) {
+    let u = g711.ulaw_samples(g711.ulaw_encode(s))
+    let a = g711.alaw_samples(g711.alaw_encode(s))
+    for i in 0..s.len() {
+        assert((u[i] - s[i]).abs() <= 1024 and (a[i] - s[i]).abs() <= 1024)
+    }
+    // A 36-byte block holds the first sample and 64 codes: 65 samples.
+    let wav = imaadpcm.encode_wav(s, 1, 36) ?? panic("ima wav")
+    assert_eq((imaadpcm.decode_wav(wav, 36, 1) ?? panic("ima")).len(), 65)
+    let qt = imaadpcm.encode_qt(s, 1) ?? panic("ima4")
+    assert_eq(qt.len(), 34)
+    assert_eq((imaadpcm.decode_qt(qt, 1) ?? panic("ima4")).len(), 64)
+}
+
+fn files(s: [i64]) {
+    let au = aufile.encode(3, 8000, 1, "tone".to_bytes(), s) ?? panic("au")
+    assert_eq((aufile.decode(au) ?? panic("au")).samples, s)
+    let aif = aiff.encode(1, 8000.0, 16, false, s) ?? panic("aiff")
+    let back = aiff.decode(aif) ?? panic("aiff")
+    assert_eq(back.samples, s)
+    assert_eq(back.rate, 8000.0)
+    let caf = caffile.encode(8000.0, 1, 16, true, s) ?? panic("caf")
+    assert_eq((caffile.decode(caf) ?? panic("caf")).samples, s)
+    // FFmpeg's FLAC encoder, given the tone at a quarter of the level.
+    let flac = bytes_codec.decode_hex("664c6143800000220240024000004900004901f400f0000000202280ca11b229714802ef845c85e7e6d5fff86408001fbe4e00000b500fff0b500000f4b0f001f4b0e6223faa6c6ac39608429f5ee0a6bef48108f3409a4591b6753189a3cd02691646d9d4c6268f3409a4591b67531898a265") ?? panic("hex")
+    let f = flacdec.decode(flac) ?? panic("flac")
+    assert_eq(f.samples, s.slice(0, 32).map(|x| x / 4))
+}
+
+fn containers(s: [i64]) {
+    let tags = VorbisComments{ vendor: "grasm", comments: [("TITLE", "Tone"), ("ARTIST", "A"), ("artist", "B")] }
+    assert_eq(vorbiscomment.values(vorbiscomment.parse_opus_tags(vorbiscomment.encode_opus_tags(tags) ?? panic("tags")) ?? panic("tags"), "Artist"),
+        ["A", "B"])
+    let head = OpusHead{ version: 1, channels: 2, pre_skip: 312, input_rate: 48000, output_gain: 0, family: 0, streams: 1, coupled: 1, mapping: [0, 1] }
+    // A 20 ms CELT packet (configuration 31), then three 10 ms frames in one.
+    let packets = [opushead.encode(head), vorbiscomment.encode_opus_tags(tags) ?? panic("tags"), bytes_of([248, 0]), bytes_of([243, 3, 0])]
+    let ogg = oggpage.write_stream(7, packets, [0, 0, 960, 2400], 2, 255)
+    let back = oggpage.packets(oggpage.pages(ogg) ?? panic("ogg")) ?? panic("ogg")
+    assert_eq(back.len(), 4)
+    assert_eq((opushead.parse(back[0].data) ?? panic("head")).pre_skip, 312)
+    assert_eq(opushead.packet_samples(back[3].data) ?? 0, 1440)
+
+    let mkv = matroska.encode("webm", "demo", [MkvTrack{ number: 1, uid: 1, kind: 2, codec: "A_PCM/INT/LIT", private: bytes_of([]),
+        default_duration: 4000000, codec_delay: 0, language: "und", name: "", width: 0, height: 0, rate: 8000.0, channels: 1, bit_depth: 16 }],
+        [MkvBlockOut{ track: 1, timestamp: 0, keyframe: true, lacing: 1, frames: [bytes_of([1, 2]), bytes_of([3]), bytes_of([4, 5, 6])] }], 8) ?? panic("mkv")
+    let fs = matroska.frames(mkv) ?? panic("mkv")
+    assert_eq(fs.map(|f| f.timestamp), [0, 4, 8])
+
+    let pcm = s.map(|x| x.bit_and(255))
+    let y = Y4m{ width: 4, height: 2, fps: (30000, 1001), interlace: "p", aspect: (1, 1), colorspace: "420jpeg", extensions: [], frames: [bytes_of(pcm.slice(0, 12))] }
+    assert_eq((y4m.decode(y4m.encode(y) ?? panic("y4m")) ?? panic("y4m")).frames.len(), 1)
+}
+
+fn streams() {
+    let h = adts.parse_header(adts.header(2, 4, 2, 100, 2047) ?? panic("adts"), 0) ?? panic("adts")
+    assert_eq(h.frame_length, 107)
+    assert_eq(adts.audio_specific_config(h), bytes_of([18, 16]))
+    // 128 kbit/s MPEG-1 Layer III at 44.1 kHz: 417 bytes a frame.
+    let m = mp3frame.parse_header(bytes_of([255, 251, 144, 100]), 0) ?? panic("mp3")
+    assert_eq((m.bitrate, m.rate, m.length), (128000, 44100, 417))
+    let ftyp = bytes_of([0, 0, 0, 16] + "ftypisom".to_bytes().to_list() + [0, 0, 2, 0] + [0, 0, 0, 8] + "free".to_bytes().to_list())
+    assert_eq(isobmff.brands(ftyp) ?? [], ["isom"])
+    let ass = assfile.parse("[Events]\nFormat: Layer, Start, End, Style, Text\nDialogue: 0,0:00:01.50,0:00:02.00,Default,Hi, there\n") ?? panic("ass")
+    assert_eq((ass.events[0].start, assfile.field(ass, ass.events[0], "Text")), (150, "Hi, there"))
+}
+
+fn main() / {io} {
+    let s = tone()
+    telephone(s)
+    files(s)
+    containers(s)
+    streams()
+    print("fifteen formats round-trip")
+}

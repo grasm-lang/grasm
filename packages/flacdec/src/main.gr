@@ -1,0 +1,330 @@
+// FLAC audio decoding: the frames, subframes and residuals of the Free
+// Lossless Audio Codec (RFC 9639).
+//
+// A FLAC stream is "fLaC", metadata blocks (STREAMINFO first; `flacmeta`
+// reads them), then frames. Each frame header gives the block size, sample
+// rate, channel arrangement and sample size, a UTF-8-style frame or sample
+// number and a CRC-8; each channel is a subframe -- a constant, verbatim
+// samples, a fixed polynomial predictor of order 0 to 4, or an LPC
+// predictor of order 1 to 32 with quantised coefficients -- whose
+// prediction error is Rice-coded in partitions; stereo is stored as left
+// and side, side and right, or mid and side; and the frame ends with a
+// CRC-16 over all of it. Every lossless music library, Bandcamp and Qobuz
+// downloads, archive.org's audio, and lossless streaming deliver FLAC.
+//
+// `decode` returns the interleaved samples at the stream's own bit depth,
+// checking both CRCs, the sync code and every reserved value.
+//
+// Checked against FFmpeg's FLAC decoder on streams FFmpeg's encoder makes
+// at every compression level, with fixed, LPC and constant subframes,
+// escaped partitions and every stereo decorrelation.
+
+type FlacAudio = { rate: i64, channels: i64, bits: i64, frames: i64, samples: [i64] }
+
+type FlacDecodeError =
+    | FlacNotFlac
+    | FlacBadFrame(at: i64, why: str)
+    | FlacBadCrc(at: i64)
+
+type FlacBits = { data: bytes, pos: i64 }
+
+fn read(inout r: FlacBits, n: i64) -> i64 ! FlacDecodeError {
+    var v = 0
+    var left = n
+    while left > 0 {
+        let byte = r.pos / 8
+        if byte >= r.data.len() {
+            fail(FlacBadFrame(byte, "data ends inside a frame"))
+        }
+        let off = r.pos % 8
+        let avail = 8 - off
+        let take = if left < avail { left } else { avail }
+        let bits = r.data.at(byte).ushr(avail - take).bit_and(1.shl(take) - 1)
+        v = v.shl(take).bit_or(bits)
+        r.pos = r.pos + take
+        left = left - take
+    }
+    return v
+}
+
+fn read_signed(inout r: FlacBits, n: i64) -> i64 ! FlacDecodeError {
+    if n == 0 {
+        return 0
+    }
+    let v = try read(r, n)
+    return if v >= 1.shl(n - 1) { v - 1.shl(n) } else { v }
+}
+
+/// Zero bits before the next one, and the one.
+fn unary(inout r: FlacBits) -> i64 ! FlacDecodeError {
+    var n = 0
+    while true {
+        let byte = r.pos / 8
+        if byte >= r.data.len() {
+            fail(FlacBadFrame(byte, "data ends inside a residual"))
+        }
+        let off = r.pos % 8
+        let rest = r.data.at(byte).bit_and(255.ushr(off))
+        if rest == 0 {
+            n = n + 8 - off
+            r.pos = r.pos + 8 - off
+        } else {
+            var k = off
+            while r.data.at(byte).ushr(7 - k).bit_and(1) == 0 {
+                k = k + 1
+            }
+            n = n + k - off
+            r.pos = byte * 8 + k + 1
+            return n
+        }
+    }
+    return n
+}
+
+fn crc8(d: bytes, from: i64, to: i64) -> i64 {
+    var c = 0
+    for i in from..to {
+        c = c.bit_xor(d.at(i))
+        for _k in 0..8 {
+            c = if c.bit_and(128) != 0 { c.shl(1).bit_xor(7).bit_and(255) } else { c.shl(1).bit_and(255) }
+        }
+    }
+    return c
+}
+
+fn crc16(d: bytes, from: i64, to: i64) -> i64 {
+    var c = 0
+    for i in from..to {
+        c = c.bit_xor(d.at(i).shl(8))
+        for _k in 0..8 {
+            c = if c.bit_and(32768) != 0 { c.shl(1).bit_xor(32773).bit_and(65535) } else { c.shl(1).bit_and(65535) }
+        }
+    }
+    return c
+}
+
+fn residual(inout r: FlacBits, block: i64, order: i64, inout out: [i64]) -> () ! FlacDecodeError {
+    let method = try read(r, 2)
+    if method > 1 {
+        fail(FlacBadFrame(r.pos / 8, "a reserved residual coding method"))
+    }
+    let pbits = if method == 0 { 4 } else { 5 }
+    let escape = 1.shl(pbits) - 1
+    let porder = try read(r, 4)
+    let parts = 1.shl(porder)
+    if block % parts != 0 or block.shr(porder) < order {
+        fail(FlacBadFrame(r.pos / 8, "a partition order that does not fit the block"))
+    }
+    for p in 0..parts {
+        let n = block.shr(porder) - (if p == 0 { order } else { 0 })
+        let param = try read(r, pbits)
+        if param == escape {
+            let raw = try read(r, 5)
+            for _i in 0..n {
+                out.push(try read_signed(r, raw))
+            }
+        } else {
+            for _i in 0..n {
+                let q = try unary(r)
+                let u = q.shl(param).bit_or(try read(r, param))
+                out.push(u.ushr(1).bit_xor(0 - u.bit_and(1)))
+            }
+        }
+    }
+}
+
+fn subframe(inout r: FlacBits, block: i64, bps: i64) -> [i64] ! FlacDecodeError {
+    if (try read(r, 1)) != 0 {
+        fail(FlacBadFrame(r.pos / 8, "a subframe's padding bit is set"))
+    }
+    let kind = try read(r, 6)
+    var wasted = 0
+    if (try read(r, 1)) == 1 {
+        wasted = 1 + (try unary(r))
+    }
+    let b = bps - wasted
+    var s: [i64] = []
+    if kind == 0 {
+        let v = try read_signed(r, b)
+        for _i in 0..block {
+            s.push(v)
+        }
+    } else if kind == 1 {
+        for _i in 0..block {
+            s.push(try read_signed(r, b))
+        }
+    } else if kind >= 8 and kind <= 12 {
+        let order = kind - 8
+        for _i in 0..order {
+            s.push(try read_signed(r, b))
+        }
+        try residual(r, block, order, s)
+        let c = [[], [1], [2, -1], [3, -3, 1], [4, -6, 4, -1]]
+        for i in order..block {
+            var p = 0
+            for j in 0..order {
+                p = p + c[order][j] * s[i - 1 - j]
+            }
+            s[i] = s[i] + p
+        }
+    } else if kind >= 32 {
+        let order = kind - 31
+        for _i in 0..order {
+            s.push(try read_signed(r, b))
+        }
+        let precision = (try read(r, 4)) + 1
+        if precision == 16 {
+            fail(FlacBadFrame(r.pos / 8, "an invalid coefficient precision"))
+        }
+        let shift = try read_signed(r, 5)
+        if shift < 0 {
+            fail(FlacBadFrame(r.pos / 8, "a negative LPC shift"))
+        }
+        var coeffs: [i64] = []
+        for _i in 0..order {
+            coeffs.push(try read_signed(r, precision))
+        }
+        try residual(r, block, order, s)
+        for i in order..block {
+            var p = 0
+            for j in 0..order {
+                p = p + coeffs[j] * s[i - 1 - j]
+            }
+            s[i] = s[i] + p.shr(shift)
+        }
+    } else {
+        fail(FlacBadFrame(r.pos / 8, "a reserved subframe type"))
+    }
+    if wasted > 0 {
+        for i in 0..block {
+            s[i] = s[i].shl(wasted)
+        }
+    }
+    return s
+}
+
+fn utf8_number(inout r: FlacBits) -> i64 ! FlacDecodeError {
+    let first = try read(r, 8)
+    if first < 128 {
+        return first
+    }
+    var extra = 0
+    var mask = 64
+    while first.bit_and(mask) != 0 {
+        extra = extra + 1
+        mask = mask.ushr(1)
+    }
+    if extra == 0 or extra > 6 {
+        fail(FlacBadFrame(r.pos / 8, "a malformed frame number"))
+    }
+    var v = first.bit_and(mask - 1)
+    for _i in 0..extra {
+        let c = try read(r, 8)
+        if c.ushr(6) != 2 {
+            fail(FlacBadFrame(r.pos / 8, "a malformed frame number"))
+        }
+        v = v.shl(6).bit_or(c.bit_and(63))
+    }
+    return v
+}
+
+fn u24(d: bytes, at: i64) -> i64 {
+    return d.at(at).shl(16).bit_or(d.at(at + 1).shl(8)).bit_or(d.at(at + 2))
+}
+
+fn frame(inout r: FlacBits, info_rate: i64, info_bits: i64, inout out: [i64]) -> (i64, i64, i64) ! FlacDecodeError {
+    let start = r.pos / 8
+    if (try read(r, 14)) != 16382 or (try read(r, 1)) != 0 {
+        fail(FlacBadFrame(start, "no frame sync code"))
+    }
+    let _blocking = try read(r, 1)
+    let bs_code = try read(r, 4)
+    let sr_code = try read(r, 4)
+    let ch_code = try read(r, 4)
+    let ss_code = try read(r, 3)
+    if (try read(r, 1)) != 0 or bs_code == 0 or sr_code == 15 or ch_code > 10 or ss_code == 3 {
+        fail(FlacBadFrame(start, "a reserved value in the frame header"))
+    }
+    let _number = try utf8_number(r)
+    let block = if bs_code == 1 { 192 } else if bs_code <= 5 { 576 * 1.shl(bs_code - 2) } else if bs_code == 6 { (try read(r, 8)) + 1 }
+    else if bs_code == 7 { (try read(r, 16)) + 1 } else { 256 * 1.shl(bs_code - 8) }
+    let rates = [0, 88200, 176400, 192000, 8000, 16000, 22050, 24000, 32000, 44100, 48000, 96000]
+    let rate = if sr_code == 0 { info_rate } else if sr_code <= 11 { rates[sr_code] } else if sr_code == 12 { (try read(r, 8)) * 1000 }
+    else if sr_code == 13 { try read(r, 16) } else { (try read(r, 16)) * 10 }
+    let sizes = [0, 8, 12, 0, 16, 20, 24, 32]
+    let bps = if ss_code == 0 { info_bits } else { sizes[ss_code] }
+    let header_end = r.pos / 8
+    if (try read(r, 8)) != crc8(r.data, start, header_end) {
+        fail(FlacBadCrc(start))
+    }
+    let channels = if ch_code <= 7 { ch_code + 1 } else { 2 }
+    var subs: [[i64]] = []
+    for c in 0..channels {
+        let side = ch_code == 8 and c == 1 or ch_code == 9 and c == 0 or ch_code == 10 and c == 1
+        subs.push(try subframe(r, block, bps + (if side { 1 } else { 0 })))
+    }
+    // Byte alignment, then the CRC-16 over the whole frame.
+    if r.pos % 8 != 0 {
+        r.pos = r.pos + 8 - r.pos % 8
+    }
+    let end = r.pos / 8
+    if (try read(r, 16)) != crc16(r.data, start, end) {
+        fail(FlacBadCrc(start))
+    }
+    for i in 0..block {
+        if ch_code == 8 {
+            out.push(subs[0][i])
+            out.push(subs[0][i] - subs[1][i])
+        } else if ch_code == 9 {
+            out.push(subs[0][i] + subs[1][i])
+            out.push(subs[1][i])
+        } else if ch_code == 10 {
+            let side = subs[1][i]
+            let mid = subs[0][i].shl(1).bit_or(side.bit_and(1))
+            out.push((mid + side).shr(1))
+            out.push((mid - side).shr(1))
+        } else {
+            for c in 0..channels {
+                out.push(subs[c][i])
+            }
+        }
+    }
+    return (rate, channels, bps)
+}
+
+pub fn decode(data: bytes) -> FlacAudio ! FlacDecodeError {
+    if data.len() < 8 or data.slice(0, 4).to_str() != "fLaC" {
+        fail(FlacNotFlac)
+    }
+    var at = 4
+    var rate = 0
+    var channels = 0
+    var bits = 0
+    var last = false
+    while not last {
+        if at + 4 > data.len() {
+            fail(FlacNotFlac)
+        }
+        last = data.at(at) >= 128
+        let kind = data.at(at).bit_and(127)
+        let len = u24(data, at + 1)
+        if kind == 0 and len >= 18 {
+            let p = at + 4
+            rate = data.at(p + 10).shl(12).bit_or(data.at(p + 11).shl(4)).bit_or(data.at(p + 12).ushr(4))
+            channels = data.at(p + 12).ushr(1).bit_and(7) + 1
+            bits = data.at(p + 12).bit_and(1).shl(4).bit_or(data.at(p + 13).ushr(4)) + 1
+        }
+        at = at + 4 + len
+    }
+    var r = FlacBits{ data: data, pos: 8 * at }
+    var out: [i64] = []
+    var frames = 0
+    while r.pos / 8 + 2 <= data.len() {
+        let (fr, fc, fb) = try frame(r, rate, bits, out)
+        rate = fr
+        channels = fc
+        bits = fb
+        frames = frames + 1
+    }
+    return FlacAudio{ rate: rate, channels: channels, bits: bits, frames: frames, samples: out }
+}

@@ -1,0 +1,68 @@
+[package]
+name = "b39_demo"
+version = "1.0.0"
+capabilities = ["io"]
+
+[dependencies.g711]
+path = "../g711"
+version = "^1.0.0"
+
+[dependencies.imaadpcm]
+path = "../imaadpcm"
+version = "^1.0.0"
+
+[dependencies.aufile]
+path = "../aufile"
+version = "^1.0.0"
+
+[dependencies.aiff]
+path = "../aiff"
+version = "^1.0.0"
+
+[dependencies.caffile]
+path = "../caffile"
+version = "^1.0.0"
+
+[dependencies.y4m]
+path = "../y4m"
+version = "^1.0.0"
+
+[dependencies.assfile]
+path = "../assfile"
+version = "^1.0.0"
+
+[dependencies.flacdec]
+path = "../flacdec"
+version = "^1.0.0"
+
+[dependencies.oggpage]
+path = "../oggpage"
+version = "^1.0.0"
+
+[dependencies.vorbiscomment]
+path = "../vorbiscomment"
+version = "^1.0.0"
+
+[dependencies.opushead]
+path = "../opushead"
+version = "^1.0.0"
+
+[dependencies.adts]
+path = "../adts"
+version = "^1.0.0"
+
+[dependencies.mp3frame]
+path = "../mp3frame"
+version = "^1.0.0"
+
+[dependencies.isobmff]
+path = "../isobmff"
+version = "^1.0.0"
+
+[dependencies.matroska]
+path = "../matroska"
+version = "^1.0.0"
+
+[dependencies.bytes_codec]
+path = "../bytes"
+version = "^1.0.0"

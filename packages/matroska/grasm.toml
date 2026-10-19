@@ -1,0 +1,8 @@
+[package]
+name = "matroska"
+version = "1.0.0"
+capabilities = []
+
+[dependencies.bfloat16]
+path = "../bfloat16"
+version = "^1.0.0"

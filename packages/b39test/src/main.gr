@@ -1,0 +1,322 @@
+// The Grasm side of scripts/b39_diff.py: pairs of `<op[:param...]> <path>`.
+// Each answer is one line of text, or ERR.
+import g711
+import imaadpcm
+import aufile
+import aiff
+import caffile
+import y4m
+import assfile
+import flacdec
+import oggpage
+import vorbiscomment
+import opushead
+import adts
+import mp3frame
+import isobmff
+import matroska
+import md5
+import bytes_codec
+
+fn hex(raw: bytes) -> str {
+    let digits = "0123456789abcdef"
+    var parts: [str] = []
+    for i in 0..raw.len() {
+        parts.push(digits.substr(raw.at(i) / 16, 1) + digits.substr(raw.at(i) % 16, 1))
+    }
+    parts.join("")
+}
+
+fn ints(v: [i64]) -> str {
+    v.map(|x| "{x}").join(",")
+}
+
+fn float_bits(v: [f64]) -> str {
+    v.map(|x| "{x.to_bits()}").join(",")
+}
+
+fn num(s: str) -> i64 {
+    s.parse_int() ?? 0
+}
+
+/// Little-endian 32-bit samples, as the oracle's PCM is laid out.
+fn s32le(d: bytes) -> [i64] {
+    var out: [i64] = []
+    var i = 0
+    while i + 4 <= d.len() {
+        let v = d.at(i).bit_or(d.at(i + 1).shl(8)).bit_or(d.at(i + 2).shl(16)).bit_or(d.at(i + 3).shl(24))
+        out.push(if v >= 2147483648 { v - 4294967296 } else { v })
+        i = i + 4
+    }
+    out
+}
+
+fn s16le(d: bytes) -> [i64] {
+    var out: [i64] = []
+    var i = 0
+    while i + 2 <= d.len() {
+        let v = d.at(i).bit_or(d.at(i + 1).shl(8))
+        out.push(if v >= 32768 { v - 65536 } else { v })
+        i = i + 2
+    }
+    out
+}
+
+/// Samples as little-endian 32-bit integers, hashed.
+fn samples_md5(v: [i64]) -> str {
+    var out: [i64] = []
+    for x in v {
+        for k in 0..4 {
+            out.push(x.shr(8 * k).bit_and(255))
+        }
+    }
+    md5.hex(bytes_of(out))
+}
+
+fn audio(p: [str], d: bytes) -> str ! str {
+    let op = p[0]
+    if op == "g711" {
+        var all: [i64] = []
+        for s in -32768..32768 {
+            all.push(s)
+        }
+        let ulaw = p[1] == "ulaw"
+        let enc = if ulaw { g711.ulaw_encode(all) } else { g711.alaw_encode(all) }
+        var codes: [i64] = []
+        for c in 0..256 {
+            codes.push(c)
+        }
+        let dec = if ulaw { g711.ulaw_samples(bytes_of(codes)) } else { g711.alaw_samples(bytes_of(codes)) }
+        return md5.hex(enc) + "|" + ints(dec)
+    }
+    if op == "imawav" {
+        return ints(imaadpcm.decode_wav(d, num(p[1]), num(p[2])) ?? fail("x"))
+    }
+    if op == "imaqt" {
+        return ints(imaadpcm.decode_qt(d, num(p[1])) ?? fail("x"))
+    }
+    if op == "imaencwav" {
+        let e = imaadpcm.encode_wav(s16le(d), num(p[1]), num(p[2])) ?? fail("x")
+        return hex(e) + "|" + ints(imaadpcm.decode_wav(e, num(p[2]), num(p[1])) ?? fail("x"))
+    }
+    if op == "imaencqt" {
+        let e = imaadpcm.encode_qt(s16le(d), num(p[1])) ?? fail("x")
+        return hex(e) + "|" + ints(imaadpcm.decode_qt(e, num(p[1])) ?? fail("x"))
+    }
+    if op == "au" {
+        let a = aufile.decode(d) ?? fail("x")
+        return "{a.encoding},{a.rate},{a.channels}|" + hex(a.annotation) + "|" + ints(a.samples) + "|" + float_bits(a.floats)
+    }
+    if op == "auenc" {
+        let note = bytes_codec.decode_hex(p[4]) ?? fail("x")
+        return hex(aufile.encode(num(p[1]), num(p[2]), num(p[3]), note, s32le(d)) ?? fail("x"))
+    }
+    if op == "aiff" {
+        let a = aiff.decode(d) ?? fail("x")
+        return "{a.channels},{a.frames},{a.bits},{a.rate.to_bits()}," + a.compression + "|" + ints(a.samples) + "|" + float_bits(a.floats)
+    }
+    if op == "aiffenc" {
+        let rate: f64 = num(p[2]).from_bits()
+        return hex(aiff.encode(num(p[1]), rate, num(p[3]), p[4] == "1", s32le(d)) ?? fail("x"))
+    }
+    if op == "caf" {
+        let c = caffile.decode(d) ?? fail("x")
+        let info = c.info.map(|kv| hex(kv.0.to_bytes()) + "=" + hex(kv.1.to_bytes())).join(";")
+        return "{c.rate.to_bits()}," + c.format + ",{c.flags},{c.channels},{c.bits}|" + info + "|" + ints(c.samples) + "|" + float_bits(c.floats)
+    }
+    if op == "cafenc" {
+        let rate: f64 = num(p[1]).from_bits()
+        return hex(caffile.encode(rate, num(p[2]), num(p[3]), p[4] == "1", s32le(d)) ?? fail("x"))
+    }
+    if op == "flac" {
+        let f = flacdec.decode(d) ?? fail("x")
+        return "{f.rate},{f.channels},{f.bits},{f.frames},{f.samples.len()}|" + samples_md5(f.samples)
+    }
+    return try containers(p, d)
+}
+
+fn containers(p: [str], d: bytes) -> str ! str {
+    let op = p[0]
+    if op == "y4m" {
+        let y = y4m.decode(d) ?? fail("x")
+        var all: [i64] = []
+        for f in y.frames {
+            for i in 0..f.len() {
+                all.push(f.at(i))
+            }
+        }
+        let again = y4m.encode(y) ?? fail("x")
+        return "{y.width},{y.height},{y.fps.0}:{y.fps.1}," + y.interlace + ",{y.aspect.0}:{y.aspect.1}," + y.colorspace + "," +
+        y.extensions.join("+") + "|{y.frames.len()}|" + md5.hex(bytes_of(all)) + "|" + (if again == d { "same" } else { "differs" })
+    }
+    if op == "ass" {
+        let s = assfile.parse(d.to_str()) ?? fail("x")
+        var parts: [str] = []
+        for e in s.events {
+            parts.push(e.kind + ",{e.start},{e.end}," + hex(s.event_format.join(",").to_bytes()) + "," + hex(e.fields.join("\u{1}").to_bytes()))
+        }
+        return "{s.info.len()},{s.styles.len()}|" + parts.join(";")
+    }
+    if op == "ogg" {
+        let ps = oggpage.pages(d) ?? fail("x")
+        let ks = oggpage.packets(ps) ?? fail("x")
+        return ps.map(|g| "{g.flags},{g.granule},{g.serial},{g.sequence},{g.lacing.len()}").join(";") + "|" +
+        ks.map(|k| "{k.serial},{k.data.len()},{k.granule}," + md5.hex(k.data)).join(";")
+    }
+    if op == "opus" {
+        let ks = oggpage.packets(oggpage.pages(d) ?? fail("x")) ?? fail("x")
+        let h = opushead.parse(ks[0].data) ?? fail("x")
+        let t = opushead.tags(ks[1].data) ?? fail("x")
+        var durs: [i64] = []
+        for i in 2..ks.len() {
+            durs.push(opushead.packet_samples(ks[i].data) ?? fail("x"))
+        }
+        return "{h.version},{h.channels},{h.pre_skip},{h.input_rate},{h.output_gain},{h.family},{h.streams},{h.coupled}," + ints(h.mapping) +
+        "|" + (if opushead.encode(h) == ks[0].data { "same" } else { "differs" }) + "|" + tag_summary(t) + "|" + ints(durs)
+    }
+    if op == "vorbistags" {
+        let ks = oggpage.packets(oggpage.pages(d) ?? fail("x")) ?? fail("x")
+        let t = vorbiscomment.parse_vorbis_packet(ks[1].data) ?? fail("x")
+        let again = vorbiscomment.encode_vorbis_packet(t) ?? fail("x")
+        return tag_summary(t) + "|" + (if again == ks[1].data { "same" } else { "differs" })
+    }
+    if op == "opusretag" {
+        return hex(try retag(p[1], d))
+    }
+    return try streams(p, d)
+}
+
+fn tag_summary(t: VorbisComments) -> str {
+    hex(t.vendor.to_bytes()) + "|" + t.comments.map(|kv| hex(kv.0.to_bytes()) + "=" + hex(kv.1.to_bytes())).join(";")
+}
+
+/// An Ogg Opus file with its comment header replaced: `spec` is hex of
+/// the vendor and then NAME=value lines.
+fn retag(spec: str, d: bytes) -> bytes ! str {
+    let lines = (bytes_codec.decode_hex(spec) ?? fail("x")).to_str().split("\n")
+    var comments: [(str, str)] = []
+    for i in 1..lines.len() {
+        let eq = lines[i].index_of("=") ?? fail("x")
+        comments.push((lines[i].substr(0, eq), lines[i].substr(eq + 1, lines[i].len() - eq - 1)))
+    }
+    let tags = vorbiscomment.encode_opus_tags(VorbisComments{ vendor: lines[0], comments: comments }) ?? fail("x")
+    let ks = oggpage.packets(oggpage.pages(d) ?? fail("x")) ?? fail("x")
+    var data: [bytes] = []
+    var granules: [i64] = []
+    for i in 0..ks.len() {
+        data.push(if i == 1 { tags } else { ks[i].data })
+        granules.push(if i < 2 { 0 } else { ks[i].granule })
+    }
+    // Pages of the rewritten stream end on packet boundaries the old ones
+    // did not, so date every packet: the running total of durations.
+    var total = 0
+    for i in 2..data.len() {
+        total = total + (opushead.packet_samples(data[i]) ?? fail("x"))
+        granules[i] = total
+    }
+    let last = ks[ks.len() - 1].granule
+    if last >= 0 {
+        granules[granules.len() - 1] = last
+    }
+    return oggpage.write_stream(ks[0].serial, data, granules, 2, 17)
+}
+
+fn streams(p: [str], d: bytes) -> str ! str {
+    let op = p[0]
+    if op == "adts" {
+        let fs = adts.frames(d) ?? fail("x")
+        let asc = if fs.len() > 0 { hex(adts.audio_specific_config(fs[0].header)) } else { "" }
+        return fs.map(|f| {
+            let h = f.header
+            "{f.offset},{h.frame_length},{h.mpeg2},{h.crc_absent},{h.object_type},{h.rate_index},{h.channel_config},{h.fullness},{h.blocks}"
+        }).join(";") + "|" + asc
+    }
+    if op == "adtsrewrap" {
+        var out: [i64] = []
+        for f in adts.frames(d) ?? fail("x") {
+            let h = f.header
+            let pay = adts.payload(d, f)
+            for x in (adts.header(h.object_type, h.rate_index, h.channel_config, pay.len(), 2047) ?? fail("x")).to_list() + pay.to_list() {
+                out.push(x)
+            }
+        }
+        return hex(bytes_of(out))
+    }
+    if op == "mp3" {
+        let fs = mp3frame.frames(d) ?? fail("x")
+        let x = if fs.len() > 0 { mp3frame.xing(d, fs[0]) } else { None }
+        let tag = match x {
+            Some(t) -> "{t.vbr},{t.frames},{t.bytes_n},{t.quality},{t.delay},{t.padding}," + t.encoder.trim() +
+            ",{mp3frame.start_samples(t)},{mp3frame.duration_samples(t, fs[0].header.samples)}"
+            None -> "none"
+        }
+        return fs.map(|f| {
+            let h = f.header
+            "{f.offset},{h.length}," + h.version + ",{h.layer},{h.bitrate},{h.rate},{h.mode},{h.padding},{h.samples}"
+        }).join(";") + "|" + tag
+    }
+    if op == "mp4" {
+        let ts = isobmff.tracks(d) ?? fail("x")
+        return ts.map(|t| "{t.id}," + t.handler + ",{t.timescale},{t.duration}," + t.language + "," + hex(t.codec.to_bytes()) +
+            ",{t.width},{t.height},{t.channels},{t.sample_rate.to_bits()},{t.table_samples}:" +
+            t.samples.map(|s| "{s.offset},{s.size},{s.dts},{s.pts},{s.duration},{s.sync},{s.chunk}").join(";")).join("/")
+    }
+    if op == "mkv" {
+        return try mkv_summary(d)
+    }
+    if op == "mkvenc" {
+        let file = try mkv_from_spec(p[1], d.to_str())
+        return hex(file) + "#" + (try mkv_summary(file))
+    }
+    fail("unknown op")
+}
+
+fn mkv_summary(d: bytes) -> str ! str {
+    let i = matroska.info(d) ?? fail("x")
+    let ts = matroska.tracks(d) ?? fail("x")
+    let fs = matroska.frames(d) ?? fail("x")
+    return i.doc_type + ",{i.timestamp_scale}," + hex(i.muxing_app.to_bytes()) + "|" +
+    ts.map(|t| "{t.number},{t.kind}," + t.codec + ",{t.default_duration},{t.codec_delay},{t.width},{t.height},{t.rate.to_bits()},{t.channels},{t.bit_depth}," +
+        md5.hex(t.private)).join(";") + "|" + fs.map(|f| "{f.track},{f.timestamp},{f.keyframe},{f.data.len()}," + md5.hex(f.data)).join(";")
+}
+
+/// `T number kind codec private-hex default-duration width height
+/// rate-bits channels bit-depth` (a private of `-` is none) and `B track
+/// timestamp key lacing hex,hex,...` lines.
+fn mkv_from_spec(doc: str, spec: str) -> bytes ! str {
+    var ts: [MkvTrack] = []
+    var bs: [MkvBlockOut] = []
+    for line in spec.split("\n") {
+        let f = line.split(" ")
+        if f[0] == "T" {
+            let rate: f64 = num(f[8]).from_bits()
+            ts.push(MkvTrack{ number: num(f[1]), uid: num(f[1]) + 1000, kind: num(f[2]), codec: f[3], private: if f[4] == "-" { bytes_of([]) } else { bytes_codec.decode_hex(f[4]) ?? fail("x") },
+                default_duration: num(f[5]), codec_delay: 0, language: "und", name: "", width: num(f[6]), height: num(f[7]), rate: rate, channels: num(f[9]),
+                bit_depth: num(f[10]) })
+        } else if f[0] == "B" {
+            var frames: [bytes] = []
+            for h in f[5].split(",") {
+                frames.push(bytes_codec.decode_hex(h) ?? fail("x"))
+            }
+            bs.push(MkvBlockOut{ track: num(f[1]), timestamp: num(f[2]), keyframe: f[3] == "1", lacing: num(f[4]), frames: frames })
+        }
+    }
+    return matroska.encode(doc, "grasm", ts, bs, 7) ?? fail("x")
+}
+
+fn main() / {io} {
+    let argv = args()
+    var i = 0
+    while i + 1 < argv.len() {
+        let p = argv[i].split(":")
+        let out = match read_bytes(argv[i + 1]) {
+            Ok(data) -> match audio(p, data) {
+                Ok(s) -> s
+                Err(_) -> "ERR"
+            }
+            Err(_) -> "NOFILE"
+        }
+        print(out)
+        i = i + 2
+    }
+}

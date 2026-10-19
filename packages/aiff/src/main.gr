@@ -1,0 +1,207 @@
+// AIFF and AIFF-C audio files (Apple, 1988 and 1991).
+//
+// An IFF "FORM" of type AIFF or AIFC holding chunks: COMM gives the
+// channel count, the frame count, the sample size and the sample rate as
+// an 80-bit IEEE extended float (and, in AIFF-C, a compression type and
+// name); SSND holds the interleaved samples after an offset and block
+// size. Samples are big-endian and signed, left-justified in whole bytes;
+// AIFF-C adds `sowt` (little-endian), 32- and 64-bit floats and G.711.
+// Logic, Pro Tools, sample libraries and Macs' system sounds use AIFF.
+//
+// `decode` returns integer samples as stored (μ-law and A-law expanded to
+// 16 bits) or floats. `encode` writes AIFF or, for little-endian or
+// floating data, AIFF-C.
+//
+// Checked against FFmpeg's aiff demuxer and muxer.
+import g711
+import bfloat16
+
+type AiffAudio = { channels: i64, frames: i64, bits: i64, rate: f64, compression: str, samples: [i64], floats: [f64] }
+
+type AiffError =
+    | AiffMalformed(why: str)
+    | AiffUnsupported(what: str)
+
+fn u32(b: bytes, at: i64) -> i64 {
+    return b.at(at).shl(24).bit_or(b.at(at + 1).shl(16)).bit_or(b.at(at + 2).shl(8)).bit_or(b.at(at + 3))
+}
+
+fn u16(b: bytes, at: i64) -> i64 {
+    return b.at(at) * 256 + b.at(at + 1)
+}
+
+/// An 80-bit extended float (sign, 15-bit exponent, 64-bit mantissa with
+/// an explicit integer bit) as an f64, exactly when it fits.
+pub fn extended_to_f64(b: bytes, at: i64) -> f64 {
+    let se = u16(b, at)
+    let negative = se >= 32768
+    let e = se.bit_and(32767)
+    let hi = u32(b, at + 2)
+    let lo = u32(b, at + 6)
+    if e == 0 and hi == 0 and lo == 0 {
+        return 0.0
+    }
+    // Normalise so the integer bit is set, then drop it into the f64.
+    var mh = hi
+    var ml = lo
+    var exp = e - 16383
+    while mh < 2147483648 and (mh != 0 or ml != 0) {
+        mh = mh.shl(1).bit_or(ml.ushr(31)).bit_and(4294967295)
+        ml = ml.shl(1).bit_and(4294967295)
+        exp = exp - 1
+    }
+    let frac = (mh - 2147483648).shl(21).bit_or(ml.ushr(11))
+    let bits = (exp + 1023).shl(52).bit_or(frac)
+    let v: f64 = bits.from_bits()
+    return if negative { 0.0 - v } else { v }
+}
+
+/// An f64 as the 80-bit extended float.
+pub fn f64_to_extended(v: f64) -> [i64] {
+    let bits = v.to_bits()
+    if bits.bit_and(9223372036854775807) == 0 {
+        return [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    }
+    let sign = if bits < 0 { 32768 } else { 0 }
+    let e = bits.ushr(52).bit_and(2047) - 1023 + 16383
+    let m = bits.bit_and(4503599627370495)
+    let hi = 2147483648 + m.ushr(21)
+    let lo = m.bit_and(2097151).shl(11)
+    let se = sign + e
+    return [se.ushr(8), se.bit_and(255), hi.ushr(24), hi.ushr(16).bit_and(255), hi.ushr(8).bit_and(255), hi.bit_and(255),
+        lo.ushr(24), lo.ushr(16).bit_and(255), lo.ushr(8).bit_and(255), lo.bit_and(255)]
+}
+
+fn signed(v: i64, n: i64) -> i64 {
+    let top = 1.shl(8 * n - 1)
+    return if v >= top { v - 2 * top } else { v }
+}
+
+pub fn decode(data: bytes) -> AiffAudio ! AiffError {
+    if data.len() < 12 or data.slice(0, 4).to_str() != "FORM" {
+        fail(AiffMalformed("not an IFF FORM"))
+    }
+    let kind = data.slice(8, 12).to_str()
+    if kind != "AIFF" and kind != "AIFC" {
+        fail(AiffMalformed("a FORM of type " + kind))
+    }
+    var at = 12
+    var comm = 0 - 1
+    var ssnd = 0 - 1
+    var ssnd_len = 0
+    while at + 8 <= data.len() {
+        let id = data.slice(at, at + 4).to_str()
+        let n = u32(data, at + 4)
+        if id == "COMM" {
+            comm = at + 8
+        } else if id == "SSND" {
+            ssnd = at + 8
+            ssnd_len = if at + 8 + n > data.len() { data.len() - at - 8 } else { n }
+        }
+        at = at + 8 + n + n % 2
+    }
+    if comm < 0 or comm + 18 > data.len() {
+        fail(AiffMalformed("no COMM chunk"))
+    }
+    let channels = u16(data, comm)
+    let frames = u32(data, comm + 2)
+    let bits = u16(data, comm + 6)
+    let rate = extended_to_f64(data, comm + 8)
+    var compression = "NONE"
+    if kind == "AIFC" {
+        if comm + 22 > data.len() {
+            fail(AiffMalformed("an AIFC COMM without its compression type"))
+        }
+        compression = data.slice(comm + 18, comm + 22).to_str()
+    }
+    var samples: [i64] = []
+    var floats: [f64] = []
+    if ssnd < 0 or frames == 0 or channels == 0 {
+        return AiffAudio{ channels: channels, frames: frames, bits: bits, rate: rate, compression: compression, samples: [], floats: [] }
+    }
+    let offset = u32(data, ssnd)
+    let start = ssnd + 8 + offset
+    let c = compression.to_lower()
+    let width = if c == "fl32" { 4 } else if c == "fl64" { 8 } else if c == "ulaw" or c == "alaw" { 1 } else { (bits + 7) / 8 }
+    if c != "none" and c != "twos" and c != "sowt" and c != "fl32" and c != "fl64" and c != "ulaw" and c != "alaw" {
+        fail(AiffUnsupported("compression " + compression))
+    }
+    let avail = (ssnd + ssnd_len - start) / (width * channels)
+    let n = (if frames < avail { frames } else { avail }) * channels
+    for i in 0..n {
+        let p = start + i * width
+        var v = 0
+        for k in 0..width {
+            v = v.shl(8).bit_or(data.at(p + (if c == "sowt" { width - 1 - k } else { k })))
+        }
+        if c == "ulaw" {
+            samples.push(g711.ulaw_decode(v))
+        } else if c == "alaw" {
+            samples.push(g711.alaw_decode(v))
+        } else if c == "fl32" {
+            floats.push(bfloat16.f32_from_bits(v))
+        } else if c == "fl64" {
+            floats.push(v.from_bits())
+        } else {
+            samples.push(signed(v, width))
+        }
+    }
+    return AiffAudio{ channels: channels, frames: frames, bits: bits, rate: rate, compression: compression, samples: samples, floats: floats }
+}
+
+fn be(v: i64, n: i64) -> [i64] {
+    var out: [i64] = []
+    var i = n - 1
+    while i >= 0 {
+        out.push(v.shr(8 * i).bit_and(255))
+        i = i - 1
+    }
+    return out
+}
+
+/// Integer samples as AIFF (big-endian) or, when `little_endian`, AIFF-C
+/// with `sowt`; `bits` is 8, 16, 24 or 32. `sowt` is QuickTime's 16-bit
+/// little-endian type, and only 16-bit samples are written with it:
+/// FFmpeg reads any `sowt` file as 16-bit, whatever its sample size says.
+pub fn encode(channels: i64, rate: f64, bits: i64, little_endian: bool, samples: [i64]) -> bytes ! AiffError {
+    if channels < 1 or samples.len() % channels != 0 or (bits != 8 and bits != 16 and bits != 24 and bits != 32) {
+        fail(AiffMalformed("samples, channels and sample size that do not fit"))
+    }
+    if little_endian and bits != 16 {
+        fail(AiffUnsupported("sowt samples other than 16-bit"))
+    }
+    let width = bits / 8
+    let frames = samples.len() / channels
+    var comm = be(channels, 2) + be(frames, 4) + be(bits, 2) + f64_to_extended(rate)
+    if little_endian {
+        comm = comm + "sowt".to_bytes().to_list() + [0, 0]
+    }
+    var sound = be(0, 4) + be(0, 4)
+    for s in samples {
+        let b = be(s, width)
+        if little_endian {
+            var k = width - 1
+            while k >= 0 {
+                sound.push(b[k])
+                k = k - 1
+            }
+        } else {
+            for x in b {
+                sound.push(x)
+            }
+        }
+    }
+    var body = (if little_endian { "AIFC" } else { "AIFF" }).to_bytes().to_list()
+    if little_endian {
+        for x in "FVER".to_bytes().to_list() + be(4, 4) + be(2726318400, 4) {
+            body.push(x)
+        }
+    }
+    for x in "COMM".to_bytes().to_list() + be(comm.len(), 4) + comm + "SSND".to_bytes().to_list() + be(sound.len(), 4) + sound {
+        body.push(x)
+    }
+    if sound.len() % 2 == 1 {
+        body.push(0)
+    }
+    return bytes_of("FORM".to_bytes().to_list() + be(body.len(), 4) + body)
+}

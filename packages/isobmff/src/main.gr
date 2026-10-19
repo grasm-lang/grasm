@@ -1,0 +1,512 @@
+// ISO base media files: MP4, M4A, MOV, 3GP, HEIF's container, and the
+// fragmented MP4 of DASH, HLS and CMAF streaming (ISO/IEC 14496-12).
+//
+// A file is a tree of boxes: a 32-bit size (1 means a 64-bit size
+// follows, 0 means to the end of the file) and a four-character type.
+// `moov` describes the presentation: `mvhd` its timescale and duration,
+// and a `trak` per track whose `mdia` holds `mdhd` (the track's
+// timescale, duration and language), `hdlr` (video, sound, text...) and
+// the sample table `stbl`: `stsd` (the codec and its parameters), `stts`
+// (sample durations), `ctts` (composition offsets), `stss` (sync samples),
+// `stsz` or `stz2` (sizes), `stsc` (samples per chunk) and `stco` or
+// `co64` (chunk offsets). A fragmented file adds `moof` boxes after it,
+// each with a `traf` per track: `tfhd` defaults, `tfdt` the decode time,
+// and `trun` runs of samples. Every phone video, every streaming service's
+// segments and every podcast with chapters is this format.
+//
+// `tracks` resolves every sample of every track -- its file offset,
+// size, decode and presentation time, duration and whether it is a sync
+// sample -- through both the sample table and any fragments.
+//
+// Checked against FFmpeg's mov demuxer (with edit lists ignored, so
+// times are the file's own): every packet's position, size, timestamps,
+// duration and key flag, and each stream's codec tag, timescale and
+// dimensions or rate and channels, for MP4, MOV, faststart and
+// fragmented files.
+
+type BmffBox = { kind: str, offset: i64, header: i64, size: i64 }
+
+/// A sample: where it is, its times in the track's timescale, whether it
+/// is a sync sample, and the chunk (in the sample table) or track run (in
+/// a fragment) it belongs to, numbered from 0 through the whole track.
+type BmffSample = { offset: i64, size: i64, dts: i64, pts: i64, duration: i64, sync: bool, chunk: i64 }
+
+type BmffTrack = {
+    id: i64,
+    handler: str,
+    timescale: i64,
+    duration: i64,
+    language: str,
+    codec: str,
+    width: i64,
+    height: i64,
+    channels: i64,
+    sample_rate: f64,
+    samples: [BmffSample],
+    /// How many of the samples the sample table holds; fragments add the rest.
+    table_samples: i64,
+}
+
+type BmffError =
+    | BmffMalformed(at: i64, why: str)
+
+fn u32(d: bytes, at: i64) -> i64 {
+    return d.at(at).shl(24).bit_or(d.at(at + 1).shl(16)).bit_or(d.at(at + 2).shl(8)).bit_or(d.at(at + 3))
+}
+
+fn u16(d: bytes, at: i64) -> i64 {
+    return d.at(at).shl(8).bit_or(d.at(at + 1))
+}
+
+fn u64(d: bytes, at: i64) -> i64 {
+    return u32(d, at).shl(32).bit_or(u32(d, at + 4))
+}
+
+fn s32(v: i64) -> i64 {
+    return if v >= 2147483648 { v - 4294967296 } else { v }
+}
+
+/// The boxes laid end to end between `from` and `to`.
+pub fn boxes(d: bytes, from: i64, to: i64) -> [BmffBox] ! BmffError {
+    var out: [BmffBox] = []
+    var at = from
+    while at + 8 <= to {
+        var size = u32(d, at)
+        var header = 8
+        if size == 1 {
+            if at + 16 > to {
+                fail(BmffMalformed(at, "a 64-bit size cut short"))
+            }
+            size = u64(d, at + 8)
+            header = 16
+        } else if size == 0 {
+            size = to - at
+        }
+        let kind = d.slice(at + 4, at + 8).to_str()
+        if kind == "uuid" {
+            header = header + 16
+        }
+        if size < header or at + size > to {
+            fail(BmffMalformed(at, "a box of size {size} that does not fit"))
+        }
+        out.push(BmffBox{ kind: kind, offset: at, header: header, size: size })
+        at = at + size
+    }
+    return out
+}
+
+pub fn children(d: bytes, b: BmffBox) -> [BmffBox] ! BmffError {
+    return try boxes(d, b.offset + b.header, b.offset + b.size)
+}
+
+/// The first child of a kind, if any.
+pub fn child(d: bytes, b: BmffBox, kind: str) -> Option[BmffBox] ! BmffError {
+    for c in try children(d, b) {
+        if c.kind == kind {
+            return Some(c)
+        }
+    }
+    return None
+}
+
+fn need(d: bytes, b: BmffBox, kind: str) -> BmffBox ! BmffError {
+    return (try child(d, b, kind)) ?? fail(BmffMalformed(b.offset, "no " + kind + " in " + b.kind))
+}
+
+/// The body of a box, past its header.
+fn body(b: BmffBox) -> i64 {
+    return b.offset + b.header
+}
+
+/// The brand and compatible brands of the `ftyp` box.
+pub fn brands(d: bytes) -> [str] ! BmffError {
+    for b in try boxes(d, 0, d.len()) {
+        if b.kind == "ftyp" {
+            var out = [d.slice(body(b), body(b) + 4).to_str()]
+            var p = body(b) + 8
+            while p + 4 <= b.offset + b.size {
+                out.push(d.slice(p, p + 4).to_str())
+                p = p + 4
+            }
+            return out
+        }
+    }
+    return []
+}
+
+/// The movie timescale and duration from `mvhd`.
+pub fn movie_time(d: bytes) -> (i64, i64) ! BmffError {
+    let moov = try top(d, "moov")
+    let mvhd = try need(d, moov, "mvhd")
+    let p = body(mvhd)
+    return if d.at(p) == 1 { (u32(d, p + 20), u64(d, p + 24)) } else { (u32(d, p + 12), u32(d, p + 16)) }
+}
+
+fn top(d: bytes, kind: str) -> BmffBox ! BmffError {
+    for b in try boxes(d, 0, d.len()) {
+        if b.kind == kind {
+            return b
+        }
+    }
+    fail(BmffMalformed(0, "no " + kind + " box"))
+}
+
+fn language(code: i64) -> str {
+    if code == 0 or code == 32767 {
+        return "und"
+    }
+    return bytes_of([code.ushr(10).bit_and(31) + 96, code.ushr(5).bit_and(31) + 96, code.bit_and(31) + 96]).to_str()
+}
+
+/// A track's header fields and its sample description.
+fn describe(d: bytes, trak: BmffBox) -> BmffTrack ! BmffError {
+    let tkhd = try need(d, trak, "tkhd")
+    let mdia = try need(d, trak, "mdia")
+    let mdhd = try need(d, mdia, "mdhd")
+    let hdlr = try need(d, mdia, "hdlr")
+    let tp = body(tkhd)
+    let mp = body(mdhd)
+    let v1 = d.at(mp) == 1
+    var t = BmffTrack{ id: u32(d, tp + (if d.at(tp) == 1 { 20 } else { 12 })), handler: d.slice(body(hdlr) + 8, body(hdlr) + 12).to_str(),
+        timescale: u32(d, mp + (if v1 { 20 } else { 12 })), duration: if v1 { u64(d, mp + 24) } else { u32(d, mp + 16) },
+        language: language(u16(d, mp + (if v1 { 32 } else { 20 }))), codec: "", width: 0, height: 0, channels: 0, sample_rate: 0.0, samples: [],
+        table_samples: 0 }
+    let stsd = try need(d, try need(d, try need(d, mdia, "minf"), "stbl"), "stsd")
+    let entries = try boxes(d, body(stsd) + 8, stsd.offset + stsd.size)
+    if entries.len() > 0 {
+        let e = entries[0]
+        let p = body(e)
+        t.codec = e.kind
+        if t.handler == "vide" and p + 28 <= e.offset + e.size {
+            t.width = u16(d, p + 24)
+            t.height = u16(d, p + 26)
+        } else if t.handler == "soun" and p + 28 <= e.offset + e.size {
+            let version = u16(d, p + 8)
+            if version == 2 and p + 44 <= e.offset + e.size {
+                t.sample_rate = u64(d, p + 32).from_bits()
+                t.channels = u32(d, p + 40)
+            } else {
+                t.channels = u16(d, p + 16)
+                t.sample_rate = u32(d, p + 24).as_f64() / 65536.0
+            }
+        }
+    }
+    return t
+}
+
+/// The sample table's samples.
+fn table_samples(d: bytes, stbl: BmffBox) -> [BmffSample] ! BmffError {
+    let sizes = try sample_sizes(d, stbl)
+    let n = sizes.len()
+    var offsets: [i64] = []
+    var owner: [i64] = []
+    let chunks = try chunk_offsets(d, stbl)
+    let stsc = try need(d, stbl, "stsc")
+    let ec = u32(d, body(stsc) + 4)
+    var s = 0
+    for i in 0..ec {
+        let p = body(stsc) + 8 + 12 * i
+        let first = u32(d, p) - 1
+        let per = u32(d, p + 4)
+        let last = if i + 1 < ec { u32(d, p + 12) - 1 } else { chunks.len() }
+        for c in first..last {
+            if c >= chunks.len() {
+                fail(BmffMalformed(stsc.offset, "a chunk that does not exist"))
+            }
+            var off = chunks[c]
+            for _k in 0..per {
+                if s < n {
+                    offsets.push(off)
+                    owner.push(c)
+                    off = off + sizes[s]
+                    s = s + 1
+                }
+            }
+        }
+    }
+    if offsets.len() != n {
+        fail(BmffMalformed(stsc.offset, "chunks that do not hold every sample"))
+    }
+    let durations = try runs(d, try need(d, stbl, "stts"), n, false)
+    var cts: [i64] = []
+    match try child(d, stbl, "ctts") {
+        Some(c) -> {
+            cts = try runs(d, c, n, true)
+        }
+        None -> {}
+    }
+    let sync = try sync_samples(d, stbl, n)
+    var out: [BmffSample] = []
+    var dts = 0
+    for i in 0..n {
+        let off = if cts.len() > 0 { cts[i] } else { 0 }
+        out.push(BmffSample{ offset: offsets[i], size: sizes[i], dts: dts, pts: dts + off, duration: durations[i], sync: sync[i], chunk: owner[i] })
+        dts = dts + durations[i]
+    }
+    return out
+}
+
+fn sample_sizes(d: bytes, stbl: BmffBox) -> [i64] ! BmffError {
+    var out: [i64] = []
+    match try child(d, stbl, "stsz") {
+        Some(b) -> {
+            let fixed = u32(d, body(b) + 4)
+            let n = u32(d, body(b) + 8)
+            for i in 0..n {
+                out.push(if fixed != 0 { fixed } else { u32(d, body(b) + 12 + 4 * i) })
+            }
+        }
+        None -> {
+            let b = try need(d, stbl, "stz2")
+            let field = d.at(body(b) + 7)
+            let n = u32(d, body(b) + 8)
+            let p = body(b) + 12
+            for i in 0..n {
+                out.push(if field == 4 { d.at(p + i / 2).ushr(if i % 2 == 0 { 4 } else { 0 }).bit_and(15) } else if field == 8 { d.at(p + i) }
+                    else { u16(d, p + 2 * i) })
+            }
+        }
+    }
+    return out
+}
+
+fn chunk_offsets(d: bytes, stbl: BmffBox) -> [i64] ! BmffError {
+    var out: [i64] = []
+    match try child(d, stbl, "stco") {
+        Some(b) -> {
+            for i in 0..u32(d, body(b) + 4) {
+                out.push(u32(d, body(b) + 8 + 4 * i))
+            }
+        }
+        None -> {
+            let b = try need(d, stbl, "co64")
+            for i in 0..u32(d, body(b) + 4) {
+                out.push(u64(d, body(b) + 8 + 8 * i))
+            }
+        }
+    }
+    return out
+}
+
+/// `stts` or `ctts` run-length entries expanded to one value a sample;
+/// a `ctts` of version 1 has signed offsets.
+fn runs(d: bytes, b: BmffBox, n: i64, signed: bool) -> [i64] ! BmffError {
+    let v1 = d.at(body(b)) == 1
+    var out: [i64] = []
+    let ec = u32(d, body(b) + 4)
+    for i in 0..ec {
+        let p = body(b) + 8 + 8 * i
+        if p + 8 > b.offset + b.size {
+            fail(BmffMalformed(b.offset, "a table cut short"))
+        }
+        let v = u32(d, p + 4)
+        for _k in 0..u32(d, p) {
+            out.push(if signed and v1 { s32(v) } else { v })
+        }
+    }
+    while out.len() < n {
+        out.push(0)
+    }
+    return out
+}
+
+fn sync_samples(d: bytes, stbl: BmffBox, n: i64) -> [bool] ! BmffError {
+    var out: [bool] = []
+    let stss = try child(d, stbl, "stss")
+    for _i in 0..n {
+        out.push(stss.is_none())
+    }
+    match stss {
+        Some(b) -> {
+            for i in 0..u32(d, body(b) + 4) {
+                let k = u32(d, body(b) + 8 + 4 * i) - 1
+                if k >= 0 and k < n {
+                    out[k] = true
+                }
+            }
+        }
+        None -> {}
+    }
+    return out
+}
+
+/// Per-track fragment defaults from `trex`: (track, duration, size, flags).
+fn trex_defaults(d: bytes, moov: BmffBox) -> [(i64, i64, i64, i64)] ! BmffError {
+    var out: [(i64, i64, i64, i64)] = []
+    match try child(d, moov, "mvex") {
+        Some(mvex) -> {
+            for b in try children(d, mvex) {
+                if b.kind == "trex" {
+                    let p = body(b)
+                    out.push((u32(d, p + 4), u32(d, p + 12), u32(d, p + 16), u32(d, p + 20)))
+                }
+            }
+        }
+        None -> {}
+    }
+    return out
+}
+
+/// What a `traf` carries forward: the track, its defaults and where the
+/// next run's data starts when the run does not say.
+type BmffTraf = { track: i64, base: i64, duration: i64, size: i64, flags: i64 }
+
+fn traf_header(d: bytes, traf: BmffBox, moof: BmffBox, implicit: i64, defaults: [(i64, i64, i64, i64)]) -> BmffTraf ! BmffError {
+    let tfhd = try need(d, traf, "tfhd")
+    var p = body(tfhd)
+    let flags = u32(d, p).bit_and(16777215)
+    var h = BmffTraf{ track: u32(d, p + 4), base: implicit, duration: 0, size: 0, flags: 0 }
+    for (t, dur, size, fl) in defaults {
+        if t == h.track {
+            h.duration = dur
+            h.size = size
+            h.flags = fl
+        }
+    }
+    p = p + 8
+    if flags.bit_and(1) != 0 {
+        h.base = u64(d, p)
+        p = p + 8
+    } else if flags.bit_and(131072) != 0 {
+        h.base = moof.offset
+    }
+    if flags.bit_and(2) != 0 {
+        p = p + 4
+    }
+    if flags.bit_and(8) != 0 {
+        h.duration = u32(d, p)
+        p = p + 4
+    }
+    if flags.bit_and(16) != 0 {
+        h.size = u32(d, p)
+        p = p + 4
+    }
+    if flags.bit_and(32) != 0 {
+        h.flags = u32(d, p)
+    }
+    return h
+}
+
+/// A sample is sync unless its flags mark it non-sync or dependent on
+/// other samples.
+fn sync_flag(flags: i64) -> bool {
+    return flags.bit_and(65536) == 0 and flags.ushr(24).bit_and(3) != 1
+}
+
+/// One `trun`'s samples from decode time `dts`, numbered as chunk
+/// `chunk`; returns where its data ends.
+fn run(d: bytes, b: BmffBox, h: BmffTraf, start: i64, dts: i64, chunk: i64, inout out: [BmffSample]) -> i64 ! BmffError {
+    var p = body(b)
+    let v1 = d.at(p) == 1
+    let flags = u32(d, p).bit_and(16777215)
+    let n = u32(d, p + 4)
+    p = p + 8
+    var offset = start
+    if flags.bit_and(1) != 0 {
+        offset = h.base + s32(u32(d, p))
+        p = p + 4
+    }
+    var first_flags = 0 - 1
+    if flags.bit_and(4) != 0 {
+        first_flags = u32(d, p)
+        p = p + 4
+    }
+    var t = dts
+    for i in 0..n {
+        var dur = h.duration
+        var size = h.size
+        var sf = if i == 0 and first_flags >= 0 { first_flags } else { h.flags }
+        var cts = 0
+        if flags.bit_and(256) != 0 {
+            dur = u32(d, p)
+            p = p + 4
+        }
+        if flags.bit_and(512) != 0 {
+            size = u32(d, p)
+            p = p + 4
+        }
+        if flags.bit_and(1024) != 0 {
+            let f = u32(d, p)
+            sf = if i == 0 and first_flags >= 0 { first_flags } else { f }
+            p = p + 4
+        }
+        if flags.bit_and(2048) != 0 {
+            cts = if v1 { s32(u32(d, p)) } else { u32(d, p) }
+            p = p + 4
+        }
+        if p > b.offset + b.size {
+            fail(BmffMalformed(b.offset, "a trun cut short"))
+        }
+        out.push(BmffSample{ offset: offset, size: size, dts: t, pts: t + cts, duration: dur, sync: sync_flag(sf), chunk: chunk })
+        offset = offset + size
+        t = t + dur
+    }
+    return offset
+}
+
+/// Adds every fragment's samples to its track.
+fn fragments(d: bytes, moov: BmffBox, inout tracks: [BmffTrack]) -> () ! BmffError {
+    let defaults = try trex_defaults(d, moov)
+    for moof in try boxes(d, 0, d.len()) {
+        if moof.kind != "moof" {
+            continue
+        }
+        var implicit = moof.offset
+        for traf in try children(d, moof) {
+            if traf.kind != "traf" {
+                continue
+            }
+            let h = try traf_header(d, traf, moof, implicit, defaults)
+            var slot = 0 - 1
+            for i in 0..tracks.len() {
+                if tracks[i].id == h.track {
+                    slot = i
+                }
+            }
+            if slot < 0 {
+                fail(BmffMalformed(traf.offset, "a fragment of track {h.track}, which moov does not describe"))
+            }
+            var samples = tracks[slot].samples
+            let last = samples.len() - 1
+            var dts = if last >= 0 { samples[last].dts + samples[last].duration } else { 0 }
+            match try child(d, traf, "tfdt") {
+                Some(b) -> {
+                    dts = if d.at(body(b)) == 1 { u64(d, body(b) + 4) } else { u32(d, body(b) + 4) }
+                }
+                None -> {}
+            }
+            var next = h.base
+            for b in try children(d, traf) {
+                if b.kind == "trun" {
+                    let before = samples.len()
+                    let chunk = if before > 0 { samples[before - 1].chunk + 1 } else { 0 }
+                    next = try run(d, b, h, next, dts, chunk, samples)
+                    if samples.len() > before {
+                        let s = samples[samples.len() - 1]
+                        dts = s.dts + s.duration
+                    }
+                }
+            }
+            implicit = next
+            tracks[slot].samples = samples
+        }
+    }
+}
+
+/// Every track, with every sample from the sample table and fragments.
+pub fn tracks(d: bytes) -> [BmffTrack] ! BmffError {
+    let moov = try top(d, "moov")
+    var out: [BmffTrack] = []
+    for trak in try children(d, moov) {
+        if trak.kind != "trak" {
+            continue
+        }
+        var t = try describe(d, trak)
+        let stbl = try need(d, try need(d, try need(d, trak, "mdia"), "minf"), "stbl")
+        t.samples = try table_samples(d, stbl)
+        t.table_samples = t.samples.len()
+        out.push(t)
+    }
+    try fragments(d, moov, out)
+    return out
+}

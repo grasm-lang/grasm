@@ -1,0 +1,166 @@
+// Opus in Ogg (RFC 7845): the identification header, and the duration of
+// every Opus packet from its table-of-contents byte (RFC 6716).
+//
+// OpusHead gives the version, the channel count, the pre-skip (samples at
+// 48 kHz the decoder discards at the start), the input sample rate (for
+// information only), an output gain in Q7.8 dB, and a channel mapping
+// family: 0 is mono or stereo in one stream, 1 is Vorbis channel order
+// for up to eight channels, 255 is undefined order; families other than
+// 0 add the stream count, how many of those are coupled stereo pairs and
+// a mapping from output channel to decoded channel.
+//
+// A packet's TOC byte gives its configuration (mode, bandwidth and frame
+// size: 2.5 to 60 ms) and how many frames it holds: one, two, or a count
+// in the next byte. Its duration bounds how much audio a packet is,
+// which is how a player seeks and how a container computes timestamps.
+// Every WebRTC call, Discord voice, WhatsApp voice notes and YouTube's
+// audio streams are Opus.
+//
+// Checked against FFmpeg's Ogg demuxer: the header matches the stream's
+// extradata, channels and initial padding, and durations match the
+// demuxer's packet durations.
+import vorbiscomment
+
+type OpusHead = {
+    version: i64,
+    channels: i64,
+    pre_skip: i64,
+    input_rate: i64,
+    output_gain: i64,
+    family: i64,
+    streams: i64,
+    coupled: i64,
+    mapping: [i64],
+}
+
+type OpusHeadError =
+    | OpusMalformed(why: str)
+
+fn le(d: bytes, at: i64, n: i64) -> i64 {
+    var v = 0
+    var k = n - 1
+    while k >= 0 {
+        v = v.shl(8).bit_or(d.at(at + k))
+        k = k - 1
+    }
+    return v
+}
+
+pub fn parse(d: bytes) -> OpusHead ! OpusHeadError {
+    if d.len() < 19 or d.slice(0, 8).to_str() != "OpusHead" {
+        fail(OpusMalformed("not an OpusHead"))
+    }
+    let version = d.at(8)
+    if version.ushr(4) != 0 {
+        fail(OpusMalformed("an incompatible major version"))
+    }
+    let channels = d.at(9)
+    if channels == 0 {
+        fail(OpusMalformed("no channels"))
+    }
+    var gain = le(d, 16, 2)
+    if gain >= 32768 {
+        gain = gain - 65536
+    }
+    let family = d.at(18)
+    var h = OpusHead{ version: version, channels: channels, pre_skip: le(d, 10, 2), input_rate: le(d, 12, 4), output_gain: gain,
+        family: family, streams: 1, coupled: if channels == 2 { 1 } else { 0 }, mapping: [] }
+    if family == 0 {
+        if channels > 2 {
+            fail(OpusMalformed("more than two channels in mapping family 0"))
+        }
+        h.mapping = if channels == 1 { [0] } else { [0, 1] }
+        return h
+    }
+    if d.len() < 21 + channels {
+        fail(OpusMalformed("a channel mapping table cut short"))
+    }
+    h.streams = d.at(19)
+    h.coupled = d.at(20)
+    if h.streams == 0 or h.coupled > h.streams or h.streams + h.coupled > 255 {
+        fail(OpusMalformed("stream counts that do not fit"))
+    }
+    if family == 1 and channels > 8 {
+        fail(OpusMalformed("more than eight channels in mapping family 1"))
+    }
+    for i in 0..channels {
+        let m = d.at(21 + i)
+        if m != 255 and m >= h.streams + h.coupled {
+            fail(OpusMalformed("a channel mapped to a stream that does not exist"))
+        }
+        h.mapping.push(m)
+    }
+    return h
+}
+
+pub fn encode(h: OpusHead) -> bytes {
+    var out = "OpusHead".to_bytes().to_list()
+    let g = if h.output_gain < 0 { h.output_gain + 65536 } else { h.output_gain }
+    for x in [h.version, h.channels, h.pre_skip.bit_and(255), h.pre_skip.shr(8).bit_and(255), h.input_rate.bit_and(255),
+        h.input_rate.shr(8).bit_and(255), h.input_rate.shr(16).bit_and(255), h.input_rate.shr(24).bit_and(255), g.bit_and(255),
+        g.shr(8).bit_and(255), h.family] {
+        out.push(x)
+    }
+    if h.family != 0 {
+        out.push(h.streams)
+        out.push(h.coupled)
+        for m in h.mapping {
+            out.push(m)
+        }
+    }
+    return bytes_of(out)
+}
+
+/// The output gain in decibels.
+pub fn gain_db(h: OpusHead) -> f64 {
+    return h.output_gain.as_f64() / 256.0
+}
+
+/// One frame's length in 48 kHz samples, from a TOC configuration (0-31).
+pub fn frame_samples(config: i64) -> i64 {
+    if config < 12 {
+        return [480, 960, 1920, 2880][config % 4]
+    }
+    if config < 16 {
+        return [480, 960][config % 2]
+    }
+    return [120, 240, 480, 960][config % 4]
+}
+
+/// How many frames a packet holds, from its TOC byte and, for code 3,
+/// the frame-count byte after it.
+pub fn frame_count(packet: bytes) -> i64 ! OpusHeadError {
+    if packet.len() < 1 {
+        fail(OpusMalformed("an empty packet"))
+    }
+    let code = packet.at(0).bit_and(3)
+    if code == 0 {
+        return 1
+    }
+    if code == 1 or code == 2 {
+        return 2
+    }
+    if packet.len() < 2 {
+        fail(OpusMalformed("a code 3 packet without its frame count"))
+    }
+    let n = packet.at(1).bit_and(63)
+    if n == 0 {
+        fail(OpusMalformed("a code 3 packet of no frames"))
+    }
+    return n
+}
+
+/// A packet's duration in 48 kHz samples; no more than 120 ms is valid.
+pub fn packet_samples(packet: bytes) -> i64 ! OpusHeadError {
+    let n = try frame_count(packet)
+    let total = n * frame_samples(packet.at(0).ushr(3))
+    if total > 5760 {
+        fail(OpusMalformed("a packet longer than 120 ms"))
+    }
+    return total
+}
+
+/// The comment header, through `vorbiscomment`.
+pub fn tags(d: bytes) -> VorbisComments ! OpusHeadError {
+    return vorbiscomment.parse_opus_tags(d) ?? fail(OpusMalformed("an OpusTags header"))
+}
