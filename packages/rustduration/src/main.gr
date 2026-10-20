@@ -1,0 +1,386 @@
+// Rust's `std::time::Duration`, as Rust 1.99 has it: `{:?}` (with
+// width, fill, alignment, `+` and precision), `try_from_secs_f64` and the
+// `from_secs_f64` behind `mul_f64` and `div_f64`, `as_secs_f64`,
+// `div_duration_f64`, and the checked and saturating arithmetic.
+//
+// Rust services log timings with `{:?}` and read timeouts as float
+// seconds, and a tool that parses those logs or agrees on those timeouts
+// needs the same text and the same nanoseconds:
+//
+//   - **`{:?}`** picks the unit -- `s` from one second, else `ms`, `µs`,
+//     `ns` -- and writes the fraction with trailing zeros dropped
+//     (`1.5s`, `1.000000001s`, `100ms`, `1µs`). A precision rounds half
+//     to even (`{:.0?}` of 1.5µs is `2µs`, of 2.5µs `2µs`), and a carry
+//     past `u64::MAX` seconds prints `18446744073709551616`. Width pads
+//     on the right by default and counts `µ` as one character; the `0`
+//     flag does nothing.
+//   - **`try_from_secs_f64`** rounds to the nearest nanosecond, ties to
+//     even, from the exact binary value (`0.999e-9` is 1ns, anything below
+//     2^-31 s is zero); negative values (but not `-0.0`) are "value is
+//     negative", and NaN, infinity and 2^64 s or more are "value is either
+//     too big or NaN". `mul_f64` and `div_f64` panic with those messages.
+//   - **Arithmetic**: `checked_add`, `checked_sub`, `checked_mul` and
+//     `checked_div` by a `u32`, the saturating versions, and `abs_diff`.
+//
+// Seconds are a `u64`, held in an i64's 64 bits.
+//
+// Checked against `rustc` 1.99 on generated programs calling the methods.
+
+import bigint
+
+/// A duration: whole seconds (a u64 in an i64's bits) and nanoseconds
+/// below one second.
+type RustDuration = { secs: i64, nanos: i64 }
+
+/// The error, or the panic, with Rust's message.
+type RustDurationError = | RdNegative | RdOverflowOrNan | RdNewOverflow | RdBadSpec(why: str)
+
+pub fn error_text(e: RustDurationError) -> str {
+    return match e {
+        RdNegative -> "cannot convert float seconds to Duration: value is negative"
+        RdOverflowOrNan -> "cannot convert float seconds to Duration: value is either too big or NaN"
+        RdNewOverflow -> "overflow in Duration::new"
+        RdBadSpec(why) -> why
+    }
+}
+
+fn nanos_per_sec() -> i64 {
+    return 1000000000
+}
+
+fn min_i64() -> i64 {
+    return 0 - 9223372036854775807 - 1
+}
+
+fn ult(a: i64, b: i64) -> bool {
+    return a.bit_xor(min_i64()) < b.bit_xor(min_i64())
+}
+
+/// u64 addition, None on overflow.
+fn uadd(a: i64, b: i64) -> Option[i64] {
+    let s = a + b
+    return if ult(s, a) { None } else { Some(s) }
+}
+
+fn udec(v: i64) -> str {
+    if v >= 0 {
+        return v.to_str()
+    }
+    let q = v.ushr(1) / 5
+    return q.to_str() + (v - q * 10).to_str()
+}
+
+fn u_to_f(u: i64) -> f64 {
+    if u >= 0 {
+        return u.as_f64()
+    }
+    return u.ushr(1).bit_or(u.bit_and(1)).as_f64() * 2.0
+}
+
+fn ubig(u: i64) -> BigInt {
+    if u >= 0 {
+        return bigint.from_i64(u)
+    }
+    return bigint.add(bigint.from_i64(u.bit_and(9223372036854775807)), bigint.pow(bigint.from_i64(2), 63))
+}
+
+fn big_to_u(b: BigInt) -> i64 {
+    // b < 2^64.
+    let two63 = bigint.pow(bigint.from_i64(2), 63)
+    if bigint.compare(b, two63) < 0 {
+        return bigint.to_i64(b) ?? 0
+    }
+    return (bigint.to_i64(bigint.sub(b, two63)) ?? 0).bit_or(min_i64())
+}
+
+/// `Duration::new(secs, nanos)`.
+pub fn new(secs: i64, nanos: i64) -> RustDuration ! RustDurationError {
+    if nanos < nanos_per_sec() {
+        return RustDuration{ secs: secs, nanos: nanos }
+    }
+    let s = match uadd(secs, nanos / nanos_per_sec()) {
+        Some(v) -> v
+        None -> fail(RdNewOverflow)
+    }
+    return RustDuration{ secs: s, nanos: nanos % nanos_per_sec() }
+}
+
+// --- {:?} ---------------------------------------------------------------------------------------------
+
+/// A parsed `{:spec?}`: fill, alignment (or ""), `+`, width, precision.
+type RdSpec = { fill: str, align: str, plus: bool, width: i64, precision: Option[i64] }
+
+fn is_align(c: str) -> bool {
+    return c == "<" or c == "^" or c == ">"
+}
+
+fn digits_from(cs: [str], at: i64) -> (Option[i64], i64) {
+    var i = at
+    while i < cs.len() and cs[i] >= "0" and cs[i] <= "9" and cs[i].len() == 1 {
+        i = i + 1
+    }
+    if i == at {
+        return (None, at)
+    }
+    return (cs.slice(at, i).join("").parse_int(), i)
+}
+
+fn parse_spec(spec: str) -> RdSpec ! RustDurationError {
+    let cs = spec.chars()
+    var s = RdSpec{ fill: " ", align: "", plus: false, width: 0, precision: None }
+    var i = 0
+    if cs.len() >= 2 and is_align(cs[1]) {
+        s.fill = cs[0]
+        s.align = cs[1]
+        i = 2
+    } else if cs.len() >= 1 and is_align(cs[0]) {
+        s.align = cs[0]
+        i = 1
+    }
+    if i < cs.len() and (cs[i] == "+" or cs[i] == "-") {
+        s.plus = cs[i] == "+"
+        i = i + 1
+    }
+    if i < cs.len() and cs[i] == "#" {
+        i = i + 1
+    }
+    if i < cs.len() and cs[i] == "0" {
+        i = i + 1
+    }
+    let w = digits_from(cs, i)
+    s.width = w.0 ?? 0
+    i = w.1
+    if i < cs.len() and cs[i] == "." {
+        let p = digits_from(cs, i + 1)
+        if p.0.is_none() {
+            fail(RdBadSpec("a precision with no digits"))
+        }
+        s.precision = p.0
+        i = p.1
+    }
+    if i != cs.len() {
+        fail(RdBadSpec("an unsupported spec " + spec))
+    }
+    return s
+}
+
+/// fmt_decimal from core::time.
+fn fmt_decimal(s: RdSpec, integer0: i64, frac0: i64, divisor0: i64, prefix: str, postfix: str) -> str {
+    var buf = ["0", "0", "0", "0", "0", "0", "0", "0", "0"]
+    var pos = 0
+    var frac = frac0
+    var divisor = divisor0
+    let cap = s.precision ?? 9
+    while frac > 0 and pos < cap {
+        buf[pos] = (frac / divisor).to_str()
+        frac = frac % divisor
+        divisor = divisor / 10
+        pos = pos + 1
+    }
+    var integer = Some(integer0)
+    if frac > 0 and frac >= divisor * 5 {
+        let tie = frac == divisor * 5
+        let odd = if pos > 0 { (buf[pos - 1].parse_int() ?? 0) % 2 == 1 } else { integer0.bit_and(1) == 1 }
+        if not (tie and not odd) {
+            var k = pos
+            var carry = true
+            while carry and k > 0 {
+                k = k - 1
+                if buf[k] != "9" {
+                    buf[k] = ((buf[k].parse_int() ?? 0) + 1).to_str()
+                    carry = false
+                } else {
+                    buf[k] = "0"
+                }
+            }
+            if carry {
+                integer = uadd(integer0, 1)
+            }
+        }
+    }
+    let end = match s.precision {
+        Some(p) -> p.min(9)
+        None -> pos
+    }
+    var body = prefix + match integer {
+        Some(v) -> udec(v)
+        None -> "18446744073709551616"
+    }
+    if end > 0 {
+        let w = s.precision ?? pos
+        body = body + "." + buf.slice(0, end).join("").pad_end(w, "0")
+    }
+    body = body + postfix
+    let actual = body.len()
+    if s.width <= actual {
+        return body
+    }
+    let n = s.width - actual
+    let align = if s.align == "" { "<" } else { s.align }
+    let left = if align == "<" { 0 } else if align == ">" { n } else { n / 2 }
+    return s.fill.repeat(left) + body + s.fill.repeat(n - left)
+}
+
+/// `format!("{:spec?}", d)`, `spec` being what comes before the `?`.
+pub fn debug(d: RustDuration, spec: str) -> str ! RustDurationError {
+    let s = try parse_spec(spec)
+    let prefix = if s.plus { "+" } else { "" }
+    if d.secs != 0 {
+        return fmt_decimal(s, d.secs, d.nanos, 100000000, prefix, "s")
+    }
+    if d.nanos >= 1000000 {
+        return fmt_decimal(s, d.nanos / 1000000, d.nanos % 1000000, 100000, prefix, "ms")
+    }
+    if d.nanos >= 1000 {
+        return fmt_decimal(s, d.nanos / 1000, d.nanos % 1000, 100, prefix, "µs")
+    }
+    return fmt_decimal(s, d.nanos, 0, 1, prefix, "ns")
+}
+
+// --- floats -----------------------------------------------------------------------------------------
+
+/// The nanoseconds of `nanos_tmp >> offset`, rounded half to even by the
+/// bits shifted out.
+fn round_shifted(tmp: BigInt, offset: i64) -> i64 {
+    let unit = bigint.pow(bigint.from_i64(2), offset)
+    let qr = bigint.divmod(tmp, unit) ?? (bigint.zero(), bigint.zero())
+    var nanos = bigint.to_i64(qr.0) ?? 0
+    let half = bigint.pow(bigint.from_i64(2), offset - 1)
+    let c = bigint.compare(qr.1, half)
+    if c > 0 or c == 0 and nanos.bit_and(1) == 1 {
+        nanos = nanos + 1
+    }
+    return nanos
+}
+
+/// `Duration::try_from_secs_f64(x)`.
+pub fn try_from_secs_f64(x: f64) -> RustDuration ! RustDurationError {
+    if x < 0.0 {
+        fail(RdNegative)
+    }
+    let bits = x.to_bits()
+    let mant = bits.bit_and(4503599627370495).bit_or(4503599627370496)
+    let exp = bits.ushr(52).bit_and(2047) - 1023
+    if exp < 0 - 31 {
+        return RustDuration{ secs: 0, nanos: 0 }
+    }
+    if exp < 0 {
+        let t = bigint.mul(bigint.from_i64(mant), bigint.pow(bigint.from_i64(2), 44 + exp))
+        let nanos = round_shifted(bigint.mul(bigint.from_i64(nanos_per_sec()), t), 96)
+        return if nanos != nanos_per_sec() { RustDuration{ secs: 0, nanos: nanos } } else { RustDuration{ secs: 1, nanos: 0 } }
+    }
+    if exp < 52 {
+        let secs = mant.ushr(52 - exp)
+        let t = mant.shl(exp).bit_and(4503599627370495)
+        let nanos = round_shifted(bigint.mul(bigint.from_i64(nanos_per_sec()), bigint.from_i64(t)), 52)
+        return if nanos != nanos_per_sec() { RustDuration{ secs: secs, nanos: nanos } } else { RustDuration{ secs: secs + 1, nanos: 0 } }
+    }
+    if exp < 64 {
+        return RustDuration{ secs: big_to_u(bigint.mul(bigint.from_i64(mant), bigint.pow(bigint.from_i64(2), exp - 52))), nanos: 0 }
+    }
+    fail(RdOverflowOrNan)
+}
+
+/// `d.as_secs_f64()`.
+pub fn as_secs_f64(d: RustDuration) -> f64 {
+    return u_to_f(d.secs) + d.nanos.as_f64() / 1000000000.0
+}
+
+/// `d.mul_f64(rhs)`; the error is the panic.
+pub fn mul_f64(d: RustDuration, rhs: f64) -> RustDuration ! RustDurationError {
+    return try try_from_secs_f64(rhs * as_secs_f64(d))
+}
+
+/// `d.div_f64(rhs)`; the error is the panic.
+pub fn div_f64(d: RustDuration, rhs: f64) -> RustDuration ! RustDurationError {
+    return try try_from_secs_f64(as_secs_f64(d) / rhs)
+}
+
+/// `a.div_duration_f64(b)`.
+pub fn div_duration_f64(a: RustDuration, b: RustDuration) -> f64 {
+    let x = u_to_f(a.secs) * 1000000000.0 + a.nanos.as_f64()
+    let y = u_to_f(b.secs) * 1000000000.0 + b.nanos.as_f64()
+    return x / y
+}
+
+// --- arithmetic -------------------------------------------------------------------------------------
+
+pub fn checked_add(a: RustDuration, b: RustDuration) -> Option[RustDuration] {
+    var secs = match uadd(a.secs, b.secs) {
+        Some(v) -> v
+        None -> return None
+    }
+    var nanos = a.nanos + b.nanos
+    if nanos >= nanos_per_sec() {
+        nanos = nanos - nanos_per_sec()
+        secs = match uadd(secs, 1) {
+            Some(v) -> v
+            None -> return None
+        }
+    }
+    return Some(RustDuration{ secs: secs, nanos: nanos })
+}
+
+pub fn checked_sub(a: RustDuration, b: RustDuration) -> Option[RustDuration] {
+    if ult(a.secs, b.secs) {
+        return None
+    }
+    var secs = a.secs - b.secs
+    var nanos = 0
+    if a.nanos >= b.nanos {
+        nanos = a.nanos - b.nanos
+    } else if secs != 0 {
+        secs = secs - 1
+        nanos = a.nanos + nanos_per_sec() - b.nanos
+    } else {
+        return None
+    }
+    return Some(RustDuration{ secs: secs, nanos: nanos })
+}
+
+fn max_duration() -> RustDuration {
+    return RustDuration{ secs: 0 - 1, nanos: 999999999 }
+}
+
+pub fn saturating_add(a: RustDuration, b: RustDuration) -> RustDuration {
+    return checked_add(a, b) ?? max_duration()
+}
+
+pub fn saturating_sub(a: RustDuration, b: RustDuration) -> RustDuration {
+    return checked_sub(a, b) ?? RustDuration{ secs: 0, nanos: 0 }
+}
+
+pub fn abs_diff(a: RustDuration, b: RustDuration) -> RustDuration {
+    return checked_sub(a, b) ?? (checked_sub(b, a) ?? RustDuration{ secs: 0, nanos: 0 })
+}
+
+/// `checked_mul` by a u32 (0..2^32).
+pub fn checked_mul(a: RustDuration, rhs: i64) -> Option[RustDuration] {
+    let total = a.nanos * rhs
+    let extra = total / nanos_per_sec()
+    let nanos = total % nanos_per_sec()
+    let product = bigint.mul(ubig(a.secs), bigint.from_i64(rhs))
+    let secs = bigint.add(product, bigint.from_i64(extra))
+    if bigint.compare(secs, bigint.pow(bigint.from_i64(2), 64)) >= 0 {
+        return None
+    }
+    return Some(RustDuration{ secs: big_to_u(secs), nanos: nanos })
+}
+
+pub fn saturating_mul(a: RustDuration, rhs: i64) -> RustDuration {
+    return checked_mul(a, rhs) ?? max_duration()
+}
+
+/// `checked_div` by a u32.
+pub fn checked_div(a: RustDuration, rhs: i64) -> Option[RustDuration] {
+    if rhs == 0 {
+        return None
+    }
+    let qr = bigint.divmod(ubig(a.secs), bigint.from_i64(rhs)) ?? (bigint.zero(), bigint.zero())
+    let secs = big_to_u(qr.0)
+    let extra_secs = bigint.to_i64(qr.1) ?? 0
+    var nanos = a.nanos / rhs
+    let extra_nanos = a.nanos % rhs
+    nanos = nanos + (extra_secs * nanos_per_sec() + extra_nanos) / rhs
+    return Some(RustDuration{ secs: secs, nanos: nanos })
+}

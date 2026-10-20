@@ -1,0 +1,16 @@
+[package]
+name = "pyreprlib"
+version = "1.0.0"
+capabilities = []
+
+[dependencies.bigint]
+path = "../bigint"
+version = "^1.0.0"
+
+[dependencies.pycharclass]
+path = "../pycharclass"
+version = "^1.0.0"
+
+[dependencies.pyliteral]
+path = "../pyliteral"
+version = "^1.0.0"

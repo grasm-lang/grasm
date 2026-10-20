@@ -1,0 +1,885 @@
+// Java's `DateTimeFormatter.ofPattern(pattern, Locale.US)`, as Java 17
+// compiles a pattern and formats a `LocalDate`, `LocalTime` or
+// `LocalDateTime` with it, exceptions included.
+//
+// Java services log, name files and answer in JSON with dates written by
+// these patterns, and a program that must produce or predict the same text
+// -- or refuse the same patterns -- needs Java's rules, several of which
+// differ from `SimpleDateFormat` and from LDML:
+//
+//   - Letters: `G` era, `u` year, `y` year-of-era, `Y` week-based year,
+//     `Q`/`q` quarter, `M`/`L` month, `w` week of week-based year, `W`
+//     week of month, `e`/`c` localized day of week, `E` day name, `d`, `D`,
+//     `F` (aligned day of week in month, as Java 17 maps it), `g` modified
+//     Julian day, `a` AM/PM, `B` day period (`noon`, `in the evening`),
+//     `h`, `K`, `k`, `H`, `m`, `s`, `S` fraction, `A` milli of day, `n`
+//     nano of second, `N` nano of day. Weeks are Locale.US weeks: Sunday
+//     first, one day enough for a first week.
+//   - Counts: one letter is the shortest number, two pad to two (`yy` and
+//     `YY` keep the last two digits), four or more of `y`, `u` and `Y` pad
+//     and add `+` when the value outgrows the padding; three to five letters
+//     of a text field are short, full and narrow text (`E` with one or two
+//     is short too).
+//   - `'...'` quotes (`''` is a quote), `[...]` is optional -- dropped
+//     whole when a field in it is missing -- and `pN` pads the next field to
+//     N with spaces on the left, refusing output that does not fit.
+//   - Refusals at compile time are Java's `IllegalArgumentException`
+//     messages (`Too many pattern letters: d`, `Unknown pattern letter: b`,
+//     `Pattern includes reserved character: '#'` ...), and the
+//     `ClassCastException` Java throws when a padded number is followed
+//     directly by another number (`ppHmm`).
+//   - At format time a field the value lacks is `Unsupported field: X`,
+//     and zone and offset letters always fail for these local values
+//     (`Unable to extract ZoneId from temporal ...`) unless optional.
+//     Eleven to eighteen `y`, `u` or `Y` compile, but formatting a
+//     non-negative year with them throws Java's
+//     `ArrayIndexOutOfBoundsException` (its threshold table stops at 10^10).
+//
+// Dates are proleptic ISO with years -999999999 to 999999999. The values
+// are taken as given; checking that a date exists is `javalocaldate`'s
+// job.
+//
+// Not here: parsing, locales other than Locale.US, other chronologies,
+// and zoned or offset values (whose zone letters would print).
+
+type JavaDtfError =
+    | JavaDtfIllegalArgument(message: str)
+    | JavaDtfClassCast(message: str)
+    | JavaDtfDateTime(message: str)
+    | JavaDtfUnsupported(message: str)
+    | JavaDtfIndexOutOfBounds(message: str)
+
+/// The exception's message.
+pub fn error_text(e: JavaDtfError) -> str {
+    return match e {
+        JavaDtfIllegalArgument(m) -> m
+        JavaDtfClassCast(m) -> m
+        JavaDtfDateTime(m) -> m
+        JavaDtfUnsupported(m) -> m
+        JavaDtfIndexOutOfBounds(m) -> m
+    }
+}
+
+/// The exception's class.
+pub fn error_class(e: JavaDtfError) -> str {
+    return match e {
+        JavaDtfIllegalArgument(_m) -> "java.lang.IllegalArgumentException"
+        JavaDtfClassCast(_m) -> "java.lang.ClassCastException"
+        JavaDtfDateTime(_m) -> "java.time.DateTimeException"
+        JavaDtfUnsupported(_m) -> "java.time.temporal.UnsupportedTemporalTypeException"
+        JavaDtfIndexOutOfBounds(_m) -> "java.lang.ArrayIndexOutOfBoundsException"
+    }
+}
+
+/// A compiled pattern element. Signs: 0 normal, 1 not negative, 2 a `+`
+/// when the value exceeds the padding.
+type JavaDtfPart =
+    | JdtfLiteral(text: str)
+    | JdtfNumber(field: str, min: i64, max: i64, sign: i64)
+    | JdtfReduced(field: str)
+    | JdtfText(field: str, style: i64)
+    | JdtfFraction(width: i64)
+    | JdtfWeek(letter: str, min: i64, max: i64, sign: i64)
+    | JdtfDayPeriod(style: i64)
+    | JdtfOffset
+    | JdtfZone
+    | JdtfPad(width: i64, part: JavaDtfPart)
+    | JdtfOptional(parts: [JavaDtfPart])
+
+type JavaDateTimeFormatter = { parts: [JavaDtfPart] }
+
+/// A `LocalDate`, `LocalTime` or `LocalDateTime`.
+type JavaTemporal = { has_date: bool, has_time: bool, year: i64, month: i64, day: i64, hour: i64, minute: i64, second: i64, nano: i64 }
+
+pub fn local_date(year: i64, month: i64, day: i64) -> JavaTemporal {
+    return JavaTemporal{ has_date: true, has_time: false, year: year, month: month, day: day, hour: 0, minute: 0, second: 0, nano: 0 }
+}
+
+pub fn local_time(hour: i64, minute: i64, second: i64, nano: i64) -> JavaTemporal {
+    return JavaTemporal{ has_date: false, has_time: true, year: 0, month: 0, day: 0, hour: hour, minute: minute, second: second, nano: nano }
+}
+
+pub fn local_date_time(year: i64, month: i64, day: i64, hour: i64, minute: i64, second: i64, nano: i64) -> JavaTemporal {
+    return JavaTemporal{ has_date: true, has_time: true, year: year, month: month, day: day, hour: hour, minute: minute, second: second, nano: nano }
+}
+
+// ---- compiling a pattern, as DateTimeFormatterBuilder.appendPattern does
+
+/// One composite being built: its parts, the index of the value parser
+/// adjacent parsing would extend (-1 for none), and a pending pad width.
+type JavaDtfLevel = { parts: [JavaDtfPart], vindex: i64, pad: i64 }
+
+type JavaDtfBuilder = { levels: [JavaDtfLevel] }
+
+fn is_padded(p: JavaDtfPart) -> bool {
+    return match p {
+        JdtfPad(_w, _q) -> true
+        JdtfLiteral(_t) -> false
+        JdtfNumber(_f, _a, _b, _c) -> false
+        JdtfReduced(_f) -> false
+        JdtfText(_f, _s) -> false
+        JdtfFraction(_w) -> false
+        JdtfWeek(_l, _a, _b, _c) -> false
+        JdtfDayPeriod(_s) -> false
+        JdtfOffset -> false
+        JdtfZone -> false
+        JdtfOptional(_ps) -> false
+    }
+}
+
+fn append_internal(inout b: JavaDtfBuilder, part: JavaDtfPart) -> i64 {
+    let k = b.levels.len() - 1
+    var lv = b.levels[k]
+    let p = if lv.pad > 0 { JdtfPad(lv.pad, part) } else { part }
+    lv.pad = 0
+    lv.parts.push(p)
+    lv.vindex = 0 - 1
+    b.levels[k] = lv
+    return lv.parts.len() - 1
+}
+
+fn set_vindex(inout b: JavaDtfBuilder, v: i64) {
+    let k = b.levels.len() - 1
+    var lv = b.levels[k]
+    lv.vindex = v
+    b.levels[k] = lv
+}
+
+fn cast_failure() -> JavaDtfError {
+    let pad = "java.time.format.DateTimeFormatterBuilder$PadPrinterParserDecorator"
+    let num = "java.time.format.DateTimeFormatterBuilder$NumberPrinterParser"
+    return JavaDtfClassCast("class " + pad + " cannot be cast to class " + num + " (" + pad + " and " + num + " are in module java.base of loader 'bootstrap')")
+}
+
+/// `appendValue(NumberPrinterParser)`: adjacent value parsing casts the
+/// previous value parser, which fails when it was padded.
+fn append_value(inout b: JavaDtfBuilder, part: JavaDtfPart, fixed: bool) -> () ! JavaDtfError {
+    let lv = b.levels[b.levels.len() - 1]
+    let prev = lv.vindex
+    if prev >= 0 {
+        if is_padded(lv.parts[prev]) {
+            fail(cast_failure())
+        }
+        if fixed {
+            append_internal(b, part)
+            set_vindex(b, prev)
+            return
+        }
+    }
+    let at = append_internal(b, part)
+    set_vindex(b, at)
+}
+
+fn illegal(m: str) -> JavaDtfError {
+    return JavaDtfIllegalArgument(m)
+}
+
+/// `appendValue(field, min, max, sign)` with its checks.
+fn append_number(inout b: JavaDtfBuilder, field: str, min: i64, max: i64, sign: i64) -> () ! JavaDtfError {
+    if min == max and sign == 1 {
+        if min < 1 or min > 19 {
+            fail(illegal("The width must be from 1 to 19 inclusive but was " + min.to_str()))
+        }
+        return try append_value(b, JdtfNumber(field, min, max, 1), true)
+    }
+    if min < 1 or min > 19 {
+        fail(illegal("The minimum width must be from 1 to 19 inclusive but was " + min.to_str()))
+    }
+    if max < 1 or max > 19 {
+        fail(illegal("The maximum width must be from 1 to 19 inclusive but was " + max.to_str()))
+    }
+    if max < min {
+        fail(illegal("The maximum width must exceed or equal the minimum width but " + max.to_str() + " < " + min.to_str()))
+    }
+    return try append_value(b, JdtfNumber(field, min, max, sign), false)
+}
+
+fn append_week(inout b: JavaDtfBuilder, letter: str, min: i64, max: i64, sign: i64) -> () ! JavaDtfError {
+    return try append_value(b, JdtfWeek(letter, min, max, sign), min == max)
+}
+
+fn too_many(cur: str) -> JavaDtfError {
+    return illegal("Too many pattern letters: " + cur)
+}
+
+fn field_of(cur: str) -> str {
+    let names = [("G", "Era"), ("y", "YearOfEra"), ("u", "Year"), ("Q", "QuarterOfYear"), ("q", "QuarterOfYear"), ("M", "MonthOfYear"),
+        ("L", "MonthOfYear"), ("D", "DayOfYear"), ("d", "DayOfMonth"), ("F", "AlignedDayOfWeekInMonth"), ("E", "DayOfWeek"), ("c", "DayOfWeek"),
+        ("e", "DayOfWeek"), ("a", "AmPmOfDay"), ("H", "HourOfDay"), ("k", "ClockHourOfDay"), ("K", "HourOfAmPm"), ("h", "ClockHourOfAmPm"),
+        ("m", "MinuteOfHour"), ("s", "SecondOfMinute"), ("S", "NanoOfSecond"), ("A", "MilliOfDay"), ("n", "NanoOfSecond"), ("N", "NanoOfDay"),
+        ("g", "ModifiedJulianDay")]
+    for (k, v) in names {
+        if k == cur {
+            return v
+        }
+    }
+    return ""
+}
+
+/// The text field forms: 3, 4 and 5 letters (short, full, narrow).
+fn text_by_count(inout b: JavaDtfBuilder, cur: str, count: i64, field: str) -> () ! JavaDtfError {
+    if count > 5 {
+        fail(too_many(cur))
+    }
+    append_internal(b, JdtfText(field, count - 3))
+}
+
+fn parse_text_field(inout b: JavaDtfBuilder, cur: str, count: i64, field: str) -> () ! JavaDtfError {
+    if cur == "c" {
+        if count == 1 {
+            return try append_week(b, "c", 1, 1, 1)
+        }
+        if count == 2 {
+            fail(illegal("Invalid pattern \"cc\""))
+        }
+    }
+    if count <= 2 {
+        if cur == "e" {
+            return try append_week(b, "e", count, count, 1)
+        }
+        if cur == "E" {
+            append_internal(b, JdtfText(field, 0))
+            return
+        }
+        if count == 1 {
+            return try append_number(b, field, 1, 19, 0)
+        }
+        return try append_number(b, field, 2, 2, 1)
+    }
+    return try text_by_count(b, cur, count, field)
+}
+
+fn parse_numeric_field(inout b: JavaDtfBuilder, cur: str, count: i64, field: str) -> () ! JavaDtfError {
+    if cur == "F" {
+        if count != 1 {
+            fail(too_many(cur))
+        }
+        return try append_number(b, field, 1, 19, 0)
+    }
+    if cur == "D" {
+        if count == 1 {
+            return try append_number(b, field, 1, 19, 0)
+        }
+        if count > 3 {
+            fail(too_many(cur))
+        }
+        return try append_number(b, field, count, 3, 1)
+    }
+    if cur == "g" {
+        return try append_number(b, field, count, 19, 0)
+    }
+    if cur == "A" or cur == "n" or cur == "N" {
+        return try append_number(b, field, count, 19, 1)
+    }
+    if count > 2 {
+        fail(too_many(cur))
+    }
+    if count == 1 {
+        return try append_number(b, field, 1, 19, 0)
+    }
+    return try append_number(b, field, 2, 2, 1)
+}
+
+/// `parseField` for a letter Java maps to a field.
+fn parse_field(inout b: JavaDtfBuilder, cur: str, count: i64, field: str) -> () ! JavaDtfError {
+    if cur == "u" or cur == "y" {
+        if count == 2 {
+            return try append_value(b, JdtfReduced(field), true)
+        }
+        return try append_number(b, field, count, 19, if count < 4 { 0 } else { 2 })
+    }
+    if "cLqMQEe".contains(cur) {
+        return try parse_text_field(b, cur, count, field)
+    }
+    if cur == "a" {
+        if count != 1 {
+            fail(too_many(cur))
+        }
+        append_internal(b, JdtfText(field, 0))
+        return
+    }
+    if cur == "G" {
+        if count > 5 {
+            fail(too_many(cur))
+        }
+        append_internal(b, JdtfText(field, if count <= 3 { 0 } else { count - 3 }))
+        return
+    }
+    if cur == "S" {
+        if count > 9 {
+            fail(illegal("Minimum width must be from 0 to 9 inclusive but was " + count.to_str()))
+        }
+        return try append_value(b, JdtfFraction(count), true)
+    }
+    return try parse_numeric_field(b, cur, count, field)
+}
+
+fn parse_zone_letter(inout b: JavaDtfBuilder, cur: str, count: i64) -> () ! JavaDtfError {
+    if cur == "z" {
+        if count > 4 {
+            fail(too_many(cur))
+        }
+        append_internal(b, JdtfZone)
+    } else if cur == "V" {
+        if count != 2 {
+            fail(illegal("Pattern letter count must be 2: V"))
+        }
+        append_internal(b, JdtfZone)
+    } else if cur == "v" {
+        if count != 1 and count != 4 {
+            fail(illegal("Wrong number of pattern letters: v"))
+        }
+        append_internal(b, JdtfZone)
+    } else if cur == "O" {
+        if count != 1 and count != 4 {
+            fail(illegal("Pattern letter count must be 1 or 4: O"))
+        }
+        append_internal(b, JdtfOffset)
+    } else {
+        if count > 5 {
+            fail(too_many(cur))
+        }
+        append_internal(b, JdtfOffset)
+    }
+}
+
+fn parse_other_letter(inout b: JavaDtfBuilder, cur: str, count: i64) -> () ! JavaDtfError {
+    if "zVvZOXx".contains(cur) {
+        return try parse_zone_letter(b, cur, count)
+    }
+    if cur == "W" {
+        if count > 1 {
+            fail(too_many(cur))
+        }
+        return try append_week(b, "W", 1, 1, 1)
+    }
+    if cur == "w" {
+        if count > 2 {
+            fail(too_many(cur))
+        }
+        return try append_week(b, "w", count, 2, 1)
+    }
+    if cur == "Y" {
+        if count == 2 {
+            return try append_week(b, "Y", 2, 2, 1)
+        }
+        return try append_week(b, "Y", count, 19, if count < 4 { 0 } else { 2 })
+    }
+    if cur == "B" {
+        if count != 1 and count != 4 and count != 5 {
+            fail(illegal("Wrong number of pattern letters: B"))
+        }
+        append_internal(b, JdtfDayPeriod(if count == 1 { 0 } else { count - 3 }))
+        return
+    }
+    fail(illegal("Unknown pattern letter: " + cur))
+}
+
+fn is_letter(c: str) -> bool {
+    let x = c.code_at(0)
+    return (x >= 65 and x <= 90) or (x >= 97 and x <= 122)
+}
+
+fn run_length(chars: [str], at: i64) -> i64 {
+    var end = at + 1
+    while end < chars.len() and chars[end] == chars[at] {
+        end = end + 1
+    }
+    return end - at
+}
+
+fn set_pad(inout b: JavaDtfBuilder, width: i64) {
+    let k = b.levels.len() - 1
+    var lv = b.levels[k]
+    lv.pad = width
+    lv.vindex = 0 - 1
+    b.levels[k] = lv
+}
+
+/// A run of pattern letters at `at` (after any `p` padding): the position
+/// after it.
+fn letters(inout b: JavaDtfBuilder, chars: [str], pattern: str, at: i64) -> i64 ! JavaDtfError {
+    var pos = at
+    var count = run_length(chars, pos)
+    var cur = chars[pos]
+    pos = pos + count
+    if cur == "p" {
+        if pos >= chars.len() or not is_letter(chars[pos]) {
+            fail(illegal("Pad letter 'p' must be followed by valid pad pattern: " + pattern))
+        }
+        set_pad(b, count)
+        cur = chars[pos]
+        count = run_length(chars, pos)
+        pos = pos + count
+    }
+    let field = field_of(cur)
+    if field.len() > 0 {
+        try parse_field(b, cur, count, field)
+    } else {
+        try parse_other_letter(b, cur, count)
+    }
+    return pos
+}
+
+/// A quoted literal starting at `at`: the position of its closing quote.
+fn quoted(inout b: JavaDtfBuilder, chars: [str], pattern: str, at: i64) -> i64 ! JavaDtfError {
+    var pos = at + 1
+    while pos < chars.len() {
+        if chars[pos] == "'" {
+            if pos + 1 < chars.len() and chars[pos + 1] == "'" {
+                pos = pos + 1
+            } else {
+                break
+            }
+        }
+        pos = pos + 1
+    }
+    if pos >= chars.len() {
+        fail(illegal("Pattern ends with an incomplete string literal: " + pattern))
+    }
+    let body = chars.slice(at + 1, pos).join("")
+    append_internal(b, JdtfLiteral(if body.len() == 0 { "'" } else { body.replace("''", "'") }))
+    return pos
+}
+
+fn optional_start(inout b: JavaDtfBuilder) {
+    set_vindex(b, 0 - 1)
+    b.levels.push(JavaDtfLevel{ parts: [], vindex: 0 - 1, pad: 0 })
+}
+
+fn optional_end(inout b: JavaDtfBuilder) {
+    let inner = b.levels.pop() ?? JavaDtfLevel{ parts: [], vindex: 0 - 1, pad: 0 }
+    if inner.parts.len() > 0 {
+        append_internal(b, JdtfOptional(inner.parts))
+    }
+}
+
+/// `DateTimeFormatter.ofPattern(pattern, Locale.US)`.
+pub fn of_pattern(pattern: str) -> JavaDateTimeFormatter ! JavaDtfError {
+    let chars = pattern.chars()
+    var b = JavaDtfBuilder{ levels: [JavaDtfLevel{ parts: [], vindex: 0 - 1, pad: 0 }] }
+    var pos = 0
+    while pos < chars.len() {
+        let cur = chars[pos]
+        if is_letter(cur) {
+            pos = try letters(b, chars, pattern, pos)
+            continue
+        }
+        if cur == "'" {
+            pos = try quoted(b, chars, pattern, pos)
+        } else if cur == "[" {
+            optional_start(b)
+        } else if cur == "]" {
+            if b.levels.len() == 1 {
+                fail(illegal("Pattern invalid as it contains ] without previous ["))
+            }
+            optional_end(b)
+        } else if cur == "\{" or cur == "}" or cur == "#" {
+            fail(illegal("Pattern includes reserved character: '" + cur + "'"))
+        } else {
+            append_internal(b, JdtfLiteral(cur))
+        }
+        pos = pos + 1
+    }
+    while b.levels.len() > 1 {
+        optional_end(b)
+    }
+    return JavaDateTimeFormatter{ parts: b.levels[0].parts }
+}
+
+// ---- the ISO calendar
+
+fn floor_div(a: i64, b: i64) -> i64 {
+    let q = a / b
+    return if (a % b != 0) and ((a < 0) != (b < 0)) { q - 1 } else { q }
+}
+
+fn floor_mod(a: i64, b: i64) -> i64 {
+    return a - floor_div(a, b) * b
+}
+
+fn is_leap(y: i64) -> bool {
+    return y.bit_and(3) == 0 and (y % 100 != 0 or y % 400 == 0)
+}
+
+/// `LocalDate.toEpochDay`.
+fn epoch_day(y: i64, m: i64, d: i64) -> i64 {
+    var total = 365 * y
+    if y >= 0 {
+        total = total + (y + 3) / 4 - (y + 99) / 100 + (y + 399) / 400
+    } else {
+        total = total - (y / (0 - 4) - y / (0 - 100) + y / (0 - 400))
+    }
+    total = total + (367 * m - 362) / 12 + d - 1
+    if m > 2 {
+        total = total - 1
+        if not is_leap(y) {
+            total = total - 1
+        }
+    }
+    return total - 719528
+}
+
+fn day_of_year(y: i64, m: i64, d: i64) -> i64 {
+    return epoch_day(y, m, d) - epoch_day(y, 1, 1) + 1
+}
+
+/// ISO day of week, Monday 1.
+fn iso_dow(y: i64, m: i64, d: i64) -> i64 {
+    return floor_mod(epoch_day(y, m, d) + 3, 7) + 1
+}
+
+/// Day of week counted from Sunday as 1, Locale.US's week.
+fn us_dow(y: i64, m: i64, d: i64) -> i64 {
+    return floor_mod(iso_dow(y, m, d) - 7, 7) + 1
+}
+
+fn start_of_week_offset(day: i64, dow: i64) -> i64 {
+    let week_start = floor_mod(day - dow, 7)
+    return if week_start + 1 > 1 { 7 - week_start } else { 0 - week_start }
+}
+
+fn compute_week(offset: i64, day: i64) -> i64 {
+    return (7 + offset + (day - 1)) / 7
+}
+
+fn year_len(y: i64) -> i64 {
+    return if is_leap(y) { 366 } else { 365 }
+}
+
+fn week_based_year(y: i64, m: i64, d: i64) -> i64 {
+    let doy = day_of_year(y, m, d)
+    let offset = start_of_week_offset(doy, us_dow(y, m, d))
+    let week = compute_week(offset, doy)
+    if week == 0 {
+        return y - 1
+    }
+    return if week >= compute_week(offset, year_len(y) + 1) { y + 1 } else { y }
+}
+
+fn week_of_week_based_year(y: i64, m: i64, d: i64) -> i64 ! JavaDtfError {
+    let doy = day_of_year(y, m, d)
+    let offset = start_of_week_offset(doy, us_dow(y, m, d))
+    let week = compute_week(offset, doy)
+    if week == 0 {
+        if y == 0 - 999999999 {
+            fail(JavaDtfDateTime("Invalid value for EpochDay (valid values -365243219162 - 365241780471): -365243219163"))
+        }
+        return try week_of_week_based_year(y - 1, 12, 31)
+    }
+    if week > 50 {
+        let new_year_week = compute_week(offset, year_len(y) + 1)
+        if week >= new_year_week {
+            return week - new_year_week + 1
+        }
+    }
+    return week
+}
+
+fn week_of_month(y: i64, m: i64, d: i64) -> i64 {
+    return compute_week(start_of_week_offset(d, us_dow(y, m, d)), d)
+}
+
+// ---- fields
+
+fn is_time_field(field: str) -> bool {
+    return ["AmPmOfDay", "HourOfDay", "ClockHourOfDay", "HourOfAmPm", "ClockHourOfAmPm", "MinuteOfHour", "SecondOfMinute", "NanoOfSecond", "MilliOfDay",
+        "NanoOfDay"].contains(field)
+}
+
+fn supported(t: JavaTemporal, field: str) -> bool {
+    return if is_time_field(field) { t.has_time } else { t.has_date }
+}
+
+fn unsupported(field: str) -> JavaDtfError {
+    let name = if field == "ModifiedJulianDay" { "EpochDay" } else { field }
+    return JavaDtfUnsupported("Unsupported field: " + name)
+}
+
+fn date_value(t: JavaTemporal, field: str) -> i64 {
+    if field == "Era" {
+        return if t.year >= 1 { 1 } else { 0 }
+    }
+    if field == "YearOfEra" {
+        return if t.year >= 1 { t.year } else { 1 - t.year }
+    }
+    if field == "Year" {
+        return t.year
+    }
+    if field == "QuarterOfYear" {
+        return (t.month - 1) / 3 + 1
+    }
+    if field == "MonthOfYear" {
+        return t.month
+    }
+    if field == "DayOfYear" {
+        return day_of_year(t.year, t.month, t.day)
+    }
+    if field == "DayOfMonth" {
+        return t.day
+    }
+    if field == "AlignedDayOfWeekInMonth" {
+        return (t.day - 1) % 7 + 1
+    }
+    if field == "DayOfWeek" {
+        return iso_dow(t.year, t.month, t.day)
+    }
+    return epoch_day(t.year, t.month, t.day) + 40587
+}
+
+fn time_value(t: JavaTemporal, field: str) -> i64 {
+    let h = t.hour
+    if field == "AmPmOfDay" {
+        return h / 12
+    }
+    if field == "HourOfDay" {
+        return h
+    }
+    if field == "ClockHourOfDay" {
+        return if h == 0 { 24 } else { h }
+    }
+    if field == "HourOfAmPm" {
+        return h % 12
+    }
+    if field == "ClockHourOfAmPm" {
+        return if h % 12 == 0 { 12 } else { h % 12 }
+    }
+    if field == "MinuteOfHour" {
+        return t.minute
+    }
+    if field == "SecondOfMinute" {
+        return t.second
+    }
+    if field == "NanoOfSecond" {
+        return t.nano
+    }
+    let nod = ((h * 60 + t.minute) * 60 + t.second) * 1000000000 + t.nano
+    return if field == "MilliOfDay" { nod / 1000000 } else { nod }
+}
+
+/// `DateTimePrintContext.getValue(field)`: `None` for a field the value
+/// lacks inside an optional section, an exception outside one.
+fn value_of(t: JavaTemporal, field: str, optional: i64) -> Option[i64] ! JavaDtfError {
+    if not supported(t, field) {
+        if optional > 0 {
+            return None
+        }
+        fail(unsupported(field))
+    }
+    return Some(if is_time_field(field) { time_value(t, field) } else { date_value(t, field) })
+}
+
+fn week_value(t: JavaTemporal, letter: str, optional: i64) -> Option[i64] ! JavaDtfError {
+    if not t.has_date {
+        if optional > 0 {
+            return None
+        }
+        fail(JavaDtfUnsupported("Unsupported field: DayOfWeek"))
+    }
+    if letter == "Y" {
+        return Some(week_based_year(t.year, t.month, t.day))
+    }
+    if letter == "w" {
+        return Some(try week_of_week_based_year(t.year, t.month, t.day))
+    }
+    if letter == "W" {
+        return Some(week_of_month(t.year, t.month, t.day))
+    }
+    return Some(us_dow(t.year, t.month, t.day))
+}
+
+// ---- printing
+
+fn pow10(n: i64) -> i64 {
+    var v = 1
+    for _k in 0..n {
+        v = v * 10
+    }
+    return v
+}
+
+fn week_field_name(letter: str) -> str {
+    let kind = if letter == "Y" { "WeekBasedYear" } else if letter == "w" { "WeekOfWeekBasedYear" } else if letter == "W" { "WeekOfMonth" } else { "DayOfWeek" }
+    return kind + "[WeekFields[SUNDAY,1]]"
+}
+
+/// `NumberPrinterParser.format` of `value`.
+fn number_text(name: str, value: i64, min: i64, max: i64, sign: i64) -> str ! JavaDtfError {
+    let digits = if value == 0 - 9223372036854775807 - 1 { "9223372036854775808" } else { value.abs().to_str() }
+    if digits.len() > max {
+        fail(JavaDtfDateTime("Field " + name + " cannot be printed as the value " + value.to_str() + " exceeds the maximum print width of " + max.to_str()))
+    }
+    var out = ""
+    if value >= 0 {
+        if sign == 2 and min < 19 and min > 10 {
+            // Java's table of thresholds stops at 10^10.
+            fail(JavaDtfIndexOutOfBounds("Index " + min.to_str() + " out of bounds for length 11"))
+        }
+        if sign == 2 and min < 19 and value >= pow10(min) {
+            out = "+"
+        }
+    } else {
+        if sign == 1 {
+            fail(JavaDtfDateTime("Field " + name + " cannot be printed as the value " + value.to_str() + " cannot be negative according to the SignStyle"))
+        }
+        out = "-"
+    }
+    return out + "0".repeat((min - digits.len()).max(0)) + digits
+}
+
+fn text_of(field: str, value: i64, style: i64) -> str {
+    if field == "Era" {
+        let names = [["BC", "AD"], ["Before Christ", "Anno Domini"], ["B", "A"]]
+        return names[style][value]
+    }
+    if field == "AmPmOfDay" {
+        return ["AM", "PM"][value]
+    }
+    if field == "QuarterOfYear" {
+        return [["Q1", "Q2", "Q3", "Q4"], ["1st quarter", "2nd quarter", "3rd quarter", "4th quarter"], ["1", "2", "3", "4"]][style][value - 1]
+    }
+    if field == "MonthOfYear" {
+        let full = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"]
+        let name = full[value - 1]
+        return if style == 1 { name } else if style == 0 { name.substr(0, 3) } else { name.substr(0, 1) }
+    }
+    let days = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+    let day = days[value - 1]
+    return if style == 1 { day } else if style == 0 { day.substr(0, 3) } else { day.substr(0, 1) }
+}
+
+/// The day period for a minute of the day, as CLDR's English rules give it.
+fn day_period(minute: i64, style: i64) -> str {
+    if minute == 0 {
+        return if style == 2 { "mi" } else { "midnight" }
+    }
+    if minute == 720 {
+        return if style == 2 { "n" } else { "noon" }
+    }
+    if minute < 360 or minute >= 1260 {
+        return "at night"
+    }
+    if minute < 720 {
+        return "in the morning"
+    }
+    return if minute < 1080 { "in the afternoon" } else { "in the evening" }
+}
+
+fn fraction_text(nano: i64, width: i64) -> str {
+    return (nano + 1000000000).to_str().substr(1, width)
+}
+
+fn two_digit(year: i64) -> str {
+    let v = year.abs() % 100
+    return (if v < 10 { "0" } else { "" }) + v.to_str()
+}
+
+fn pad2(n: i64) -> str {
+    return (if n < 10 { "0" } else { "" }) + n.to_str()
+}
+
+/// `LocalDate.toString`, `LocalTime.toString` and `LocalDateTime.toString`.
+pub fn temporal_text(t: JavaTemporal) -> str {
+    var out = ""
+    if t.has_date {
+        let y = t.year
+        if y.abs() < 1000 {
+            out = (if y < 0 { "-" } else { "" }) + (y.abs() + 10000).to_str().substr(1, 4)
+        } else {
+            out = (if y > 9999 { "+" } else { "" }) + y.to_str()
+        }
+        out = out + "-" + pad2(t.month) + "-" + pad2(t.day)
+    }
+    if t.has_time {
+        if t.has_date {
+            out = out + "T"
+        }
+        out = out + pad2(t.hour) + ":" + pad2(t.minute)
+        if t.second > 0 or t.nano > 0 {
+            out = out + ":" + pad2(t.second)
+            if t.nano > 0 {
+                let n = t.nano
+                let frac = if n % 1000000 == 0 { (n / 1000000 + 1000).to_str() } else if n % 1000 == 0 { (n / 1000 + 1000000).to_str() } else { (n + 1000000000).to_str() }
+                out = out + "." + frac.substr(1, frac.len() - 1)
+            }
+        }
+    }
+    return out
+}
+
+fn format_number(t: JavaTemporal, field: str, min: i64, max: i64, sign: i64, optional: i64) -> Option[str] ! JavaDtfError {
+    return match try value_of(t, field, optional) {
+        None -> None
+        Some(v) -> Some(try number_text(field, v, min, max, sign))
+    }
+}
+
+fn format_week(t: JavaTemporal, letter: str, min: i64, max: i64, sign: i64, optional: i64) -> Option[str] ! JavaDtfError {
+    let v = match try week_value(t, letter, optional) {
+        None -> return None
+        Some(x) -> x
+    }
+    if letter == "Y" and min == 2 and max == 2 {
+        return Some(two_digit(v))
+    }
+    let lo = if letter == "Y" { min } else if min == 2 { 2 } else { 1 }
+    let hi = if letter == "Y" { max } else { 2 }
+    return Some(try number_text(week_field_name(letter), v, lo, hi, if letter == "Y" { sign } else { 1 }))
+}
+
+fn format_simple(t: JavaTemporal, part: JavaDtfPart, optional: i64) -> Option[str] ! JavaDtfError {
+    return match part {
+        JdtfLiteral(s) -> Some(s)
+        JdtfNumber(f, lo, hi, sign) -> try format_number(t, f, lo, hi, sign, optional)
+        JdtfReduced(f) -> match try value_of(t, f, optional) {
+            None -> None
+            Some(v) -> Some(two_digit(v))
+        }
+        JdtfText(f, style) -> match try value_of(t, f, optional) {
+            None -> None
+            Some(v) -> Some(text_of(f, v, style))
+        }
+        JdtfFraction(w) -> match try value_of(t, "NanoOfSecond", optional) {
+            None -> None
+            Some(v) -> Some(fraction_text(v, w))
+        }
+        JdtfWeek(l, lo, hi, sign) -> try format_week(t, l, lo, hi, sign, optional)
+        JdtfDayPeriod(style) -> match try value_of(t, "HourOfDay", optional) {
+            None -> None
+            Some(h) -> Some(day_period(h * 60 + t.minute, style))
+        }
+        JdtfOffset -> if optional > 0 { None } else { fail(JavaDtfUnsupported("Unsupported field: OffsetSeconds")) }
+        JdtfZone -> if optional > 0 { None } else { fail(JavaDtfDateTime("Unable to extract ZoneId from temporal " + temporal_text(t))) }
+        JdtfPad(w, inner) -> try format_padded(t, w, inner, optional)
+        JdtfOptional(ps) -> Some(try format_parts(t, ps, optional + 1))
+    }
+}
+
+fn format_padded(t: JavaTemporal, width: i64, inner: JavaDtfPart, optional: i64) -> Option[str] ! JavaDtfError {
+    let s = match try format_simple(t, inner, optional) {
+        None -> return None
+        Some(x) -> x
+    }
+    if s.len() > width {
+        fail(JavaDtfDateTime("Cannot print as output of " + s.len().to_str() + " characters exceeds pad width of " + width.to_str()))
+    }
+    return Some(" ".repeat(width - s.len()) + s)
+}
+
+/// A composite: inside an optional section, a missing field drops the
+/// whole section.
+fn format_parts(t: JavaTemporal, parts: [JavaDtfPart], optional: i64) -> str ! JavaDtfError {
+    var out = ""
+    for p in parts {
+        match try format_simple(t, p, optional) {
+            None -> return ""
+            Some(s) -> out = out + s
+        }
+    }
+    return out
+}
+
+/// `formatter.format(temporal)`.
+pub fn format(f: JavaDateTimeFormatter, t: JavaTemporal) -> str ! JavaDtfError {
+    return try format_parts(t, f.parts, 0)
+}

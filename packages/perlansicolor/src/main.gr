@@ -1,0 +1,376 @@
+// Perl's Term::ANSIColor (version 5.01, as in Perl 5.34): `color`,
+// `colored` (both calling forms, and with `$EACHLINE`), `uncolor`,
+// `colorstrip` and `colorvalid` -- the terminal escape sequences Perl
+// scripts color their output with, and the names that go with them.
+//
+// A tool that has to produce the same colored output as a Perl script,
+// or read the attribute names back out of its logs, needs the module's
+// table and its parsing rules:
+//
+//   - **Names** are case-insensitive and may come several to a string
+//     (`'bold red on_blue'`): the 16 colors and their `on_` and `bright_`
+//     forms, `bold`, `dark`/`faint`, `italic`, `underline`/`underscore`,
+//     `blink`, `reverse`, `concealed`, `clear`/`reset`, the 256-color
+//     names `ansi0`..`ansi255`, `rgbRGB` (each 0..5) and `grey0`..`grey23`
+//     (all with `on_`), and 24-bit `rNNNgNNNbNNN` up to 255. Anything else
+//     is `Invalid attribute name ...`, lowercased.
+//   - **`uncolor`** strips one `ESC [` and one `m`, reads the numbers
+//     (leading zeros dropped, `38;5;N` and `38;2;R;G;B` kept whole), and
+//     answers the names -- `clear` for 0, `dark` for 2, `underline` for 4,
+//     `rgb500` for `38;5;196` -- or `No name for escape sequence ...`.
+//   - **`colored`** puts the reset `ESC [0m` after the text, or with
+//     `$EACHLINE` around each piece between delimiters, leaving the
+//     delimiters and empty pieces alone; `color()` with no names is undef.
+//
+// Not covered: the constant functions (`BOLD`, `PUSHCOLOR`, ...),
+// `coloralias` and `ANSI_COLORS_ALIASES` (process state), and the
+// `ANSI_COLORS_DISABLED`/`NO_COLOR` switches -- color is always on here.
+// Attribute names are ASCII: the module lowercases and matches digits
+// the Unicode way, which this does not.
+//
+// Checked against `perl` 5.34's Term::ANSIColor.
+
+/// The module's croak, with its message.
+type AnsiColorError = | AnsiColorCroak(message: str)
+
+pub fn error_text(e: AnsiColorError) -> str {
+    return match e {
+        AnsiColorCroak(m) -> m
+    }
+}
+
+fn croak(m: str) -> AnsiColorError {
+    return AnsiColorCroak(m)
+}
+
+fn basic_names() -> [(str, str)] {
+    var out = [("clear", "0"), ("reset", "0"), ("bold", "1"), ("dark", "2"), ("faint", "2"), ("italic", "3"), ("underline", "4"), ("underscore", "4"),
+        ("blink", "5"), ("reverse", "7"), ("concealed", "8")]
+    let colors = ["black", "red", "green", "yellow", "blue", "magenta", "cyan", "white"]
+    for i in 0..8 {
+        out.push((colors[i], (30 + i).to_str()))
+        out.push(("on_" + colors[i], (40 + i).to_str()))
+        out.push(("bright_" + colors[i], (90 + i).to_str()))
+        out.push(("on_bright_" + colors[i], (100 + i).to_str()))
+    }
+    return out
+}
+
+fn all_digits(s: str) -> bool {
+    if s == "" {
+        return false
+    }
+    for c in s.codes() {
+        if c < 48 or c > 57 {
+            return false
+        }
+    }
+    return true
+}
+
+/// The escape code of a named attribute (not 24-bit), or None.
+pub fn attribute_code(name: str) -> Option[str] {
+    for (n, code) in basic_names() {
+        if n == name {
+            return Some(code)
+        }
+    }
+    let on = name.starts_with("on_")
+    let rest = if on { name.substr(3, name.len() - 3) } else { name }
+    let lead = if on { "48;5;" } else { "38;5;" }
+    if rest.starts_with("ansi") {
+        let n = rest.substr(4, rest.len() - 4)
+        if all_digits(n) and (n == "0" or not n.starts_with("0")) {
+            let v = n.parse_int() ?? 999
+            if v <= 255 {
+                return Some(lead + n)
+            }
+        }
+        return None
+    }
+    if rest.starts_with("grey") {
+        let n = rest.substr(4, rest.len() - 4)
+        if all_digits(n) and (n == "0" or not n.starts_with("0")) {
+            let v = n.parse_int() ?? 999
+            if v <= 23 {
+                return Some(lead + (v + 232).to_str())
+            }
+        }
+        return None
+    }
+    if rest.starts_with("rgb") and rest.len() == 6 and all_digits(rest.substr(3, 3)) {
+        let cs = rest.substr(3, 3).codes().map(|c| c - 48)
+        if cs[0] <= 5 and cs[1] <= 5 and cs[2] <= 5 {
+            return Some(lead + (16 + 36 * cs[0] + 6 * cs[1] + cs[2]).to_str())
+        }
+    }
+    return None
+}
+
+/// `on_?rNgNbN`: the prefix and the three numbers' digits, or None.
+fn truecolor_parts(code: str) -> Option[(bool, [str])] {
+    let on = code.starts_with("on_")
+    let rest = if on { code.substr(3, code.len() - 3) } else { code }
+    if not rest.starts_with("r") {
+        return None
+    }
+    let g = rest.index_of("g")
+    let b = rest.index_of("b")
+    match g {
+        Some(gi) -> match b {
+            Some(bi) -> if bi > gi {
+                let r = rest.substr(1, gi - 1)
+                let gs = rest.substr(gi + 1, bi - gi - 1)
+                let bs = rest.substr(bi + 1, rest.len() - bi - 1)
+                if all_digits(r) and all_digits(gs) and all_digits(bs) {
+                    return Some((on, [r, gs, bs]))
+                }
+            }
+            None -> {}
+        }
+        None -> {}
+    }
+    return None
+}
+
+/// The value of a digit string, capped (Perl compares it as a number).
+fn digits_value(d: str) -> i64 {
+    var v = 0
+    for c in d.codes() {
+        v = v * 10 + c - 48
+        if v > 100000 {
+            return 100000
+        }
+    }
+    return v
+}
+
+/// Perl's `lc` on ASCII text.
+fn ascii_lower(s: str) -> str {
+    return s.codes().map(|c| if c >= 65 and c <= 90 { (c + 32).to_char() } else { c.to_char() }).join("")
+}
+
+fn words(codes: [str]) -> [str] {
+    var out: [str] = []
+    for c in codes {
+        for w in c.replace("\t", " ").replace("\n", " ").replace("\r", " ").replace("\u{c}", " ").replace("\u{b}", " ").split(" ") {
+            if w != "" {
+                out.push(w)
+            }
+        }
+    }
+    return out
+}
+
+/// `color(@codes)`; None where Perl answers undef (no names at all).
+pub fn color(codes: [str]) -> Option[str] ! AnsiColorError {
+    var parts: [str] = []
+    for word in words(codes) {
+        let code = ascii_lower(word)
+        match attribute_code(code) {
+            Some(v) -> parts.push(v)
+            None -> match truecolor_parts(code) {
+                Some((on, rgb)) -> {
+                    let vs = rgb.map(|d| digits_value(d))
+                    if vs[0] > 255 or vs[1] > 255 or vs[2] > 255 {
+                        fail(croak("Invalid attribute name " + code))
+                    }
+                    parts.push((if on { "48" } else { "38" }) + ";2;" + vs.map(|v| v.to_str()).join(";"))
+                }
+                None -> fail(croak("Invalid attribute name " + code))
+            }
+        }
+    }
+    if parts.len() == 0 {
+        return None
+    }
+    return Some("\u{1b}[" + parts.join(";") + "m")
+}
+
+fn split_keep(s: str, delim: str) -> [str] {
+    var out: [str] = []
+    var rest = s
+    while true {
+        match rest.index_of(delim) {
+            Some(k) -> {
+                out.push(rest.substr(0, k))
+                out.push(delim)
+                rest = rest.substr(k + delim.len(), rest.len() - k - delim.len())
+            }
+            None -> {
+                out.push(rest)
+                break
+            }
+        }
+    }
+    return out
+}
+
+/// `colored($string, @codes)`, with `$EACHLINE` given or None.
+pub fn colored(text: str, codes: [str], eachline: Option[str]) -> str ! AnsiColorError {
+    let attr = (try color(codes)) ?? ""
+    return match eachline {
+        Some(delim) -> if delim == "" { text.chars().map(|c| attr + c + "\u{1b}[0m").join("") } else {
+            split_keep(text, delim).filter(|p| p.len() > 0).map(|p| if p == delim { p } else { attr + p + "\u{1b}[0m" }).join("")
+        }
+        None -> attr + text + "\u{1b}[0m"
+    }
+}
+
+/// `colored(\@codes, @strings)`.
+pub fn colored_list(codes: [str], texts: [str], eachline: Option[str]) -> str ! AnsiColorError {
+    return try colored(texts.join(""), codes, eachline)
+}
+
+fn strip_zeros(num: str) -> str {
+    return num.split(";").map(|p| {
+        var q = p
+        while q.len() > 1 and q.starts_with("0") {
+            q = q.substr(1, q.len() - 1)
+        }
+        q
+    }).join(";")
+}
+
+fn name_of(num: str) -> str ! AnsiColorError {
+    let plain = strip_zeros(num)
+    // The module's reverse table keeps the alphabetically first name.
+    let named = first_name(plain)
+    if named != "" {
+        return named
+    }
+    for lead in ["38;5;", "48;5;"] {
+        if plain.starts_with(lead) {
+            let v = plain.substr(5, plain.len() - 5).parse_int() ?? 999
+            let on = if lead == "48;5;" { "on_" } else { "" }
+            if v < 16 {
+                return on + "ansi" + v.to_str()
+            }
+            if v < 232 {
+                let w = v - 16
+                return on + "rgb" + (w / 36).to_str() + (w / 6 % 6).to_str() + (w % 6).to_str()
+            }
+            if v < 256 {
+                return on + "grey" + (v - 232).to_str()
+            }
+        }
+    }
+    fail(croak("No name for escape sequence " + plain))
+}
+
+fn first_name(code: str) -> str {
+    var best = ""
+    for (n, c) in basic_names() {
+        if c == code and (best == "" or n < best) {
+            best = n
+        }
+    }
+    return best
+}
+
+fn uncolor_numbers(attrs: str) -> [str] {
+    let parts = attrs.split(";")
+    var out: [str] = []
+    var i = 0
+    while i < parts.len() {
+        let p = parts[i]
+        if p == "" {
+            i = i + 1
+            continue
+        }
+        let lead = strip_zeros(p)
+        let kind = if i + 1 < parts.len() { strip_zeros(parts[i + 1]) } else { "" }
+        let rest = parts.len() - i
+        let rgb = (lead == "38" or lead == "48") and kind == "2" and rest >= 5 and all_digits(parts[i + 2]) and all_digits(parts[i + 3]) and
+        all_digits(parts[i + 4])
+        let indexed = (lead == "38" or lead == "48") and kind == "5" and rest >= 3 and all_digits(parts[i + 2])
+        let take = if rgb { 5 } else if indexed { 3 } else { 1 }
+        out.push(parts.slice(i, i + take).join(";"))
+        i = i + take
+    }
+    return out
+}
+
+/// `uncolor(@escapes)`.
+pub fn uncolor(escapes: [str]) -> [str] ! AnsiColorError {
+    var nums: [str] = []
+    for e0 in escapes {
+        var e = e0
+        if e.starts_with("\u{1b}[") {
+            e = e.substr(2, e.len() - 2)
+        }
+        if e.ends_with("m") {
+            e = e.substr(0, e.len() - 1)
+        }
+        var ok = true
+        let ps = e.split(";")
+        for k in 0..ps.len() {
+            let last = k == ps.len() - 1
+            if not (all_digits(ps[k]) or last and ps[k] == "") {
+                ok = false
+            }
+        }
+        if not ok {
+            fail(croak("Bad escape sequence " + e))
+        }
+        nums = nums + uncolor_numbers(e)
+    }
+    var out: [str] = []
+    for num in nums {
+        let ps = num.split(";")
+        if ps.len() == 5 {
+            let vs = ps.slice(2, 5).map(|d| digits_value(d))
+            if vs[0] > 255 or vs[1] > 255 or vs[2] > 255 {
+                fail(croak("No name for escape sequence " + num))
+            }
+            let on = if strip_zeros(ps[0]) == "48" { "on_" } else { "" }
+            out.push(on + "r" + vs[0].to_str() + "g" + vs[1].to_str() + "b" + vs[2].to_str())
+        } else {
+            out.push(try name_of(num))
+        }
+    }
+    return out
+}
+
+/// `colorstrip(@strings)`: each without its `ESC [ ... m` sequences.
+pub fn colorstrip(texts: [str]) -> [str] {
+    return texts.map(|t| strip_one(t))
+}
+
+fn strip_one(t: str) -> str {
+    let cs = t.chars()
+    var out = ""
+    var i = 0
+    while i < cs.len() {
+        if cs[i] == "\u{1b}" and i + 1 < cs.len() and cs[i + 1] == "[" {
+            var j = i + 2
+            while j < cs.len() and (cs[j] == ";" or cs[j] >= "0" and cs[j] <= "9" and cs[j].len() == 1) {
+                j = j + 1
+            }
+            if j < cs.len() and cs[j] == "m" {
+                i = j + 1
+                continue
+            }
+        }
+        out = out + cs[i]
+        i = i + 1
+    }
+    return out
+}
+
+/// `colorvalid(@codes)`.
+pub fn colorvalid(codes: [str]) -> bool {
+    for code in words(codes.map(|c| ascii_lower(c))) {
+        if attribute_code(code).is_some() {
+            continue
+        }
+        match truecolor_parts(code) {
+            Some((_on, rgb)) -> if rgb.map(|d| digits_value(d)).all(|v| v <= 255) {
+                continue
+            }
+            None -> {}
+        }
+        return false
+    }
+    return true
+}

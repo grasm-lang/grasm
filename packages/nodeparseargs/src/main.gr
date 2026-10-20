@@ -1,0 +1,507 @@
+// Node's `util.parseArgs`, as Node 25 parses a command line: the tokens,
+// the values and positionals it returns, and the errors it throws.
+//
+// Node CLIs written without a dependency read their options with this,
+// and a shell completion, a wrapper or a port must split the same command
+// line the same way:
+//
+//   - `-a` and `--all` are options; `-abc` is a group of short options,
+//     ending at the first one that takes a string, which takes the rest
+//     (`-ofile`); `--name=value` and `--name value` give a string option
+//     its value, and the next argument is taken even if it starts with a
+//     dash -- which strict mode then rejects as ambiguous.
+//   - `--` ends the options; a `multiple` option collects a list;
+//     defaults fill what was not given; `allowNegative` reads `--no-x`.
+//   - Strict mode (the default) throws for an unknown option, a string
+//     option without a value, a boolean given one, and a positional
+//     argument when they are not allowed, with Node's messages.
+//   - Strings are JavaScript's UTF-16, so a short option group splits a
+//     character outside the BMP into its two surrogates, as `charAt`
+//     does; names and values come back as UTF-16 code units.
+//   - The values object keeps JavaScript's key order: names that are
+//     array indexes first, in numeric order, then the rest as stored.
+
+/// An option's configuration. `short` must be one UTF-16 code unit.
+type ParseArgsOption = { name: str, is_string: bool, short: Option[str], multiple: bool, default: Option[ParseArgsValue] }
+
+/// A value: a string (UTF-16 units), a boolean, or a list of them.
+type ParseArgsValue = | PaString(units: [i64]) | PaBool(value: bool) | PaList(items: [ParseArgsValue])
+
+type ParseArgsConfig = { args: [str], options: [ParseArgsOption], strict: bool, allow_positionals: Option[bool], allow_negative: bool }
+
+/// A token, as `tokens: true` returns them; `inline` is None where Node
+/// leaves inlineValue undefined.
+type ParseArgsToken = {
+    kind: str,
+    index: i64,
+    name: Option[[i64]],
+    raw_name: Option[[i64]],
+    value: Option[[i64]],
+    inline: Option[bool],
+}
+
+type ParseArgsResult = { values: [([i64], ParseArgsValue)], positionals: [[i64]], tokens: [ParseArgsToken] }
+
+/// The TypeError parseArgs throws: its code and its message as UTF-16
+/// units (a message can quote half of a surrogate pair).
+type ParseArgsError = | ParseArgsError(code: str, msg: [i64])
+
+pub fn error_code(e: ParseArgsError) -> str {
+    return match e {
+        ParseArgsError(c, _m) -> c
+    }
+}
+
+/// The message as UTF-16 units, exactly.
+pub fn error_units(e: ParseArgsError) -> [i64] {
+    return match e {
+        ParseArgsError(_c, m) -> m
+    }
+}
+
+/// The message as text; an unpaired surrogate becomes U+FFFD.
+pub fn error_text(e: ParseArgsError) -> str {
+    return text(error_units(e))
+}
+
+// ---- UTF-16
+
+/// A string's UTF-16 code units.
+pub fn units(s: str) -> [i64] {
+    var out: [i64] = []
+    for c in s.codes() {
+        if c >= 65536 {
+            out.push(55296 + (c - 65536).shr(10))
+            out.push(56320 + (c - 65536).bit_and(1023))
+        } else {
+            out.push(c)
+        }
+    }
+    return out
+}
+
+fn u(s: str) -> [i64] {
+    return units(s)
+}
+
+fn cat(a: [i64], b: [i64]) -> [i64] {
+    var out = a
+    for x in b {
+        out.push(x)
+    }
+    return out
+}
+
+fn starts(xs: [i64], prefix: str) -> bool {
+    let p = u(prefix)
+    return xs.len() >= p.len() and xs.slice(0, p.len()) == p
+}
+
+fn index_of(xs: [i64], c: i64, from: i64) -> i64 {
+    var i = from
+    while i < xs.len() {
+        if xs[i] == c {
+            return i
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+// ---- options
+
+/// The options in JavaScript's key order: array-index names first, by
+/// value, then the others in the order given.
+fn ordered(options: [ParseArgsOption]) -> [ParseArgsOption] {
+    let idx = options.filter(|o| array_index(u(o.name)) >= 0)
+    var sorted = idx
+    var i = 1
+    while i < sorted.len() {
+        var j = i
+        while j > 0 and array_index(u(sorted[j - 1].name)) > array_index(u(sorted[j].name)) {
+            let t = sorted[j - 1]
+            sorted[j - 1] = sorted[j]
+            sorted[j] = t
+            j = j - 1
+        }
+        i = i + 1
+    }
+    for o in options {
+        if array_index(u(o.name)) < 0 {
+            sorted.push(o)
+        }
+    }
+    return sorted
+}
+
+/// The number a key is as an array index, or -1.
+fn array_index(k: [i64]) -> i64 {
+    if k.len() == 0 or k.len() > 10 or (k.len() > 1 and k[0] == 48) {
+        return 0 - 1
+    }
+    var v = 0
+    for c in k {
+        if c < 48 or c > 57 {
+            return 0 - 1
+        }
+        v = v * 10 + c - 48
+    }
+    return if v <= 4294967294 { v } else { 0 - 1 }
+}
+
+fn option_named(options: [ParseArgsOption], name: [i64]) -> Option[ParseArgsOption] {
+    for o in options {
+        if u(o.name) == name {
+            return Some(o)
+        }
+    }
+    return None
+}
+
+fn is_string_option(options: [ParseArgsOption], name: [i64]) -> bool {
+    return match option_named(options, name) {
+        Some(o) -> o.is_string
+        None -> false
+    }
+}
+
+/// findLongOptionForShort.
+fn long_for_short(short: [i64], options: [ParseArgsOption]) -> [i64] {
+    for o in ordered(options) {
+        match o.short {
+            Some(s) -> if u(s) == short {
+                return u(o.name)
+            }
+            None -> {}
+        }
+    }
+    return short
+}
+
+// ---- argsToTokens
+
+fn option_token(index: i64, name: [i64], raw: [i64], value: Option[[i64]], inline: Option[bool]) -> ParseArgsToken {
+    return ParseArgsToken{ kind: "option", index: index, name: Some(name), raw_name: Some(raw), value: value, inline: inline }
+}
+
+fn positional_token(index: i64, value: [i64]) -> ParseArgsToken {
+    return ParseArgsToken{ kind: "positional", index: index, name: None, raw_name: None, value: Some(value), inline: None }
+}
+
+fn tokens_of(args: [[i64]], options: [ParseArgsOption]) -> [ParseArgsToken] {
+    var tokens: [ParseArgsToken] = []
+    var index = 0 - 1
+    var group = 0
+    var rest = args
+    while rest.len() > 0 {
+        let arg = rest[0]
+        rest = rest.slice(1, rest.len())
+        let next = if rest.len() > 0 { Some(rest[0]) } else { None }
+        if group > 0 {
+            group = group - 1
+        } else {
+            index = index + 1
+        }
+        if arg == u("--") {
+            tokens.push(ParseArgsToken{ kind: "option-terminator", index: index, name: None, raw_name: None, value: None, inline: None })
+            for a in rest {
+                index = index + 1
+                tokens.push(positional_token(index, a))
+            }
+            break
+        }
+        let n = arg.len()
+        let dash = n > 0 and arg[0] == 45
+        let second_dash = n > 1 and arg[1] == 45
+        if n == 2 and dash and not second_dash {
+            // A lone short option.
+            let long = long_for_short(arg.slice(1, 2), options)
+            if is_string_option(options, long) and next.is_some() {
+                rest = rest.slice(1, rest.len())
+                tokens.push(option_token(index, long, arg, next, Some(false)))
+                index = index + 1
+            } else {
+                tokens.push(option_token(index, long, arg, None, None))
+            }
+            continue
+        }
+        if n > 2 and dash and not second_dash {
+            let long = long_for_short(arg.slice(1, 2), options)
+            if not is_string_option(options, long) {
+                // A group: expand it in front of what is left.
+                var expanded: [[i64]] = []
+                for k in 1..n {
+                    let one = arg.slice(k, k + 1)
+                    if not is_string_option(options, long_for_short(one, options)) or k == n - 1 {
+                        expanded.push(cat([45], one))
+                    } else {
+                        expanded.push(cat([45], arg.slice(k, n)))
+                        break
+                    }
+                }
+                group = expanded.len()
+                rest = cat_lists(expanded, rest)
+                continue
+            }
+            tokens.push(option_token(index, long, [45, arg[1]], Some(arg.slice(2, n)), Some(true)))
+            continue
+        }
+        if n > 2 and starts(arg, "--") {
+            let eq = index_of(arg, 61, 3)
+            if eq < 0 {
+                let long = arg.slice(2, n)
+                if is_string_option(options, long) and next.is_some() {
+                    rest = rest.slice(1, rest.len())
+                    tokens.push(option_token(index, long, arg, next, Some(false)))
+                    index = index + 1
+                } else {
+                    tokens.push(option_token(index, long, arg, None, None))
+                }
+            } else {
+                let first_eq = index_of(arg, 61, 0)
+                let long = arg.slice(2, first_eq)
+                tokens.push(option_token(index, long, cat(u("--"), long), Some(arg.slice(first_eq + 1, n)), Some(true)))
+            }
+            continue
+        }
+        tokens.push(positional_token(index, arg))
+    }
+    return tokens
+}
+
+fn cat_lists(a: [[i64]], b: [[i64]]) -> [[i64]] {
+    var out = a
+    for x in b {
+        out.push(x)
+    }
+    return out
+}
+
+// ---- checks and errors
+
+/// JSON.stringify of a string, as UTF-16 units.
+fn json_units(s: [i64]) -> [i64] {
+    let d = "0123456789abcdef".codes()
+    var out = [34]
+    var i = 0
+    while i < s.len() {
+        let c = s[i]
+        let high = c >= 55296 and c <= 56319
+        let low = c >= 56320 and c <= 57343
+        let paired = high and i + 1 < s.len() and s[i + 1] >= 56320 and s[i + 1] <= 57343
+        if paired {
+            out.push(c)
+            out.push(s[i + 1])
+            i = i + 2
+            continue
+        }
+        if c == 34 or c == 92 {
+            out = cat(out, [92, c])
+        } else if c == 8 {
+            out = cat(out, u("\\b"))
+        } else if c == 12 {
+            out = cat(out, u("\\f"))
+        } else if c == 10 {
+            out = cat(out, u("\\n"))
+        } else if c == 13 {
+            out = cat(out, u("\\r"))
+        } else if c == 9 {
+            out = cat(out, u("\\t"))
+        } else if c < 32 or high or low {
+            out = cat(out, [92, 117, d[c.shr(12).bit_and(15)], d[c.shr(8).bit_and(15)], d[c.shr(4).bit_and(15)], d[c.bit_and(15)]])
+        } else {
+            out.push(c)
+        }
+        i = i + 1
+    }
+    out.push(34)
+    return out
+}
+
+fn text(us: [i64]) -> str {
+    var out = ""
+    var i = 0
+    while i < us.len() {
+        let c = us[i]
+        if c >= 55296 and c <= 56319 and i + 1 < us.len() and us[i + 1] >= 56320 and us[i + 1] <= 57343 {
+            out = out + (65536 + (c - 55296).shl(10) + us[i + 1] - 56320).to_char()
+            i = i + 2
+        } else {
+            out = out + (if c >= 55296 and c <= 57343 { 65533 } else { c }).to_char()
+            i = i + 1
+        }
+    }
+    return out
+}
+
+fn unknown(raw: [i64], allow_positionals: bool) -> ParseArgsError {
+    let hint = if allow_positionals {
+        cat(u(". To specify a positional argument starting with a '-', place it at the end of the command after '--', as in '-- "), json_units(raw))
+    } else { [] }
+    return ParseArgsError("ERR_PARSE_ARGS_UNKNOWN_OPTION", (cat(cat(cat(u("Unknown option '"), raw), u("'")), hint)))
+}
+
+fn check_usage(options: [ParseArgsOption], allow_negative: bool, allow_positionals: bool, t: ParseArgsToken) -> () ! ParseArgsError {
+    var name = t.name ?? []
+    let raw = t.raw_name ?? []
+    if option_named(options, name).is_none() {
+        if allow_negative and starts(name, "no-") {
+            name = name.slice(3, name.len())
+            let ok = match option_named(options, name) {
+                Some(o) -> not o.is_string
+                None -> false
+            }
+            if not ok {
+                fail(unknown(raw, allow_positionals))
+            }
+        } else {
+            fail(unknown(raw, allow_positionals))
+        }
+    }
+    let o = option_named(options, name) ?? ParseArgsOption{ name: "", is_string: false, short: None, multiple: false, default: None }
+    let short_part = match o.short {
+        Some(s) -> if s.len() > 0 { cat(cat(u("-"), u(s)), u(", ")) } else { [] }
+        None -> []
+    }
+    let both = cat(cat(short_part, u("--")), name)
+    if o.is_string and t.value.is_none() {
+        fail(ParseArgsError("ERR_PARSE_ARGS_INVALID_OPTION_VALUE", (cat(cat(u("Option '"), both), u(" <value>' argument missing")))))
+    }
+    if not o.is_string and t.value.is_some() {
+        fail(ParseArgsError("ERR_PARSE_ARGS_INVALID_OPTION_VALUE", (cat(cat(u("Option '"), both), u("' does not take an argument")))))
+    }
+    return ()
+}
+
+fn check_option_like(t: ParseArgsToken) -> () ! ParseArgsError {
+    let v = t.value ?? []
+    if (t.inline ?? false) or not (v.len() > 1 and v[0] == 45) {
+        return ()
+    }
+    let raw = t.raw_name ?? []
+    let name = t.name ?? []
+    let example = if starts(raw, "--") { cat(cat(u("'"), raw), u("=-XYZ'")) } else {
+        cat(cat(cat(cat(u("'--"), name), u("=-XYZ' or '")), raw), u("-XYZ'"))
+    }
+    let msg = cat(cat(cat(cat(cat(cat(u("Option '"), raw), u("' argument is ambiguous.\nDid you forget to specify the option argument for '")), raw),
+        u("'?\nTo specify an option argument starting with a dash use ")), example), u("."))
+    fail(ParseArgsError("ERR_PARSE_ARGS_INVALID_OPTION_VALUE", (msg)))
+    return ()
+}
+
+// ---- values
+
+fn set_value(inout values: [([i64], ParseArgsValue)], key: [i64], v: ParseArgsValue) {
+    for i in 0..values.len() {
+        if values[i].0 == key {
+            values[i] = (key, v)
+            return
+        }
+    }
+    values.push((key, v))
+}
+
+fn get_value(values: [([i64], ParseArgsValue)], key: [i64]) -> Option[ParseArgsValue] {
+    for kv in values {
+        if kv.0 == key {
+            return Some(kv.1)
+        }
+    }
+    return None
+}
+
+fn store(inout t: ParseArgsToken, options: [ParseArgsOption], inout values: [([i64], ParseArgsValue)], allow_negative: bool) {
+    var name = t.name ?? []
+    if name == u("__proto__") {
+        return
+    }
+    var v = match t.value {
+        Some(s) -> PaString(s)
+        None -> PaBool(true)
+    }
+    if allow_negative and starts(name, "no-") and t.value.is_none() {
+        name = name.slice(3, name.len())
+        t.name = Some(name)
+        v = PaBool(false)
+    }
+    let multiple = match option_named(options, name) {
+        Some(o) -> o.multiple
+        None -> false
+    }
+    if multiple {
+        match get_value(values, name) {
+            Some(PaList(items)) -> {
+                var more = items
+                more.push(v)
+                set_value(values, name, PaList(more))
+            }
+            _ -> set_value(values, name, PaList([v]))
+        }
+    } else {
+        set_value(values, name, v)
+    }
+}
+
+/// The values in JavaScript's key order.
+fn key_order(values: [([i64], ParseArgsValue)]) -> [([i64], ParseArgsValue)] {
+    var idx = values.filter(|kv| array_index(kv.0) >= 0)
+    var i = 1
+    while i < idx.len() {
+        var j = i
+        while j > 0 and array_index(idx[j - 1].0) > array_index(idx[j].0) {
+            let t = idx[j - 1]
+            idx[j - 1] = idx[j]
+            idx[j] = t
+            j = j - 1
+        }
+        i = i + 1
+    }
+    for kv in values {
+        if array_index(kv.0) < 0 {
+            idx.push(kv)
+        }
+    }
+    return idx
+}
+
+/// `util.parseArgs(config)` with `tokens: true`.
+pub fn parse_args(config: ParseArgsConfig) -> ParseArgsResult ! ParseArgsError {
+    for o in ordered(config.options) {
+        match o.short {
+            Some(s) -> if u(s).len() != 1 {
+                fail(ParseArgsError("ERR_INVALID_ARG_VALUE", u("The property 'options." + o.name + ".short' must be a single character. Received '" + s + "'")))
+            }
+            None -> {}
+        }
+    }
+    let allow_positionals = config.allow_positionals ?? not config.strict
+    var tokens = tokens_of(config.args.map(|a| u(a)), config.options)
+    var values: [([i64], ParseArgsValue)] = []
+    var positionals: [[i64]] = []
+    for i in 0..tokens.len() {
+        var t = tokens[i]
+        if t.kind == "option" {
+            if config.strict {
+                try check_usage(config.options, config.allow_negative, allow_positionals, t)
+                try check_option_like(t)
+            }
+            store(t, config.options, values, config.allow_negative)
+            tokens[i] = t
+        } else if t.kind == "positional" {
+            if not allow_positionals {
+                fail(ParseArgsError("ERR_PARSE_ARGS_UNEXPECTED_POSITIONAL", (cat(cat(u("Unexpected argument '"), t.value ?? []),
+                    u("'. This command does not take positional arguments")))))
+            }
+            positionals.push(t.value ?? [])
+        }
+    }
+    for o in ordered(config.options) {
+        match o.default {
+            Some(d) -> if get_value(values, u(o.name)).is_none() and o.name != "__proto__" {
+                set_value(values, u(o.name), d)
+            }
+            None -> {}
+        }
+    }
+    return ParseArgsResult{ values: key_order(values), positionals: positionals, tokens: tokens }
+}

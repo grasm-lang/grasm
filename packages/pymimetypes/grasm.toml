@@ -1,0 +1,8 @@
+[package]
+name = "pymimetypes"
+version = "1.0.0"
+capabilities = []
+
+[dependencies.pyurlparse]
+path = "../pyurlparse"
+version = "^1.0.0"

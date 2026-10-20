@@ -1,0 +1,397 @@
+// Perl's version objects, as Perl 5.34's `version` (0.9928) reads and
+// writes them: `version->parse`, `version->declare`, and `stringify`,
+// `numify`, `normal`, `is_alpha`, `is_qv` and `<=>`, from strings.
+//
+// CPAN, every `use Module 1.23`, META files and Perl toolchains compare
+// versions this way, and the decimal and dotted forms do not mean what
+// they look like:
+//
+//   - A decimal version's fraction is read three digits a part: `1.2`
+//     is 1.200.0, `1.02_03` (an alpha) is 1.20.300, `1.002003` is v1.2.3.
+//   - A version with two or more dots, or a leading `v`, is dotted:
+//     `1.2.3`; `declare` reads even `1.2` as dotted (v1.2.0).
+//   - Leading space is skipped; reading stops at `;`, `{`, `}` or the
+//     end, and other trailing data is an error -- or, after `;`, `{` or
+//     `}`, ignored as Perl ignores it (with a warning).
+//   - Errors are Perl's: "Invalid version format (fractional part
+//     required)", "(non-numeric data)", "(trailing decimal)", and so on;
+//     the string `undef` is version 0.
+//   - Parts above 2^31 - 1 make the version `v.Inf`.
+//   - `<=>` compares part by part, missing parts being zero.
+//
+// Only string input is covered: Perl turns a bare number into its own
+// text first, by rules that belong to Perl's numbers.
+
+/// A version object: its parts and the keys Perl keeps.
+type PerlVersion = { parts: [i64], original: str, qv: bool, alpha: bool }
+
+/// The croak, with Perl's message.
+type PerlVersionError = | PerlVersionError(msg: str)
+
+pub fn error_text(e: PerlVersionError) -> str {
+    return match e {
+        PerlVersionError(m) -> m
+    }
+}
+
+fn at(s: [i64], i: i64) -> i64 {
+    return if i >= 0 and i < s.len() { s[i] } else { 0 }
+}
+
+fn digit(c: i64) -> bool {
+    return c >= 48 and c <= 57
+}
+
+fn space(c: i64) -> bool {
+    return c == 32 or (c >= 9 and c <= 13)
+}
+
+fn alpha_char(c: i64) -> bool {
+    return (c >= 65 and c <= 90) or (c >= 97 and c <= 122)
+}
+
+fn ends(c: i64) -> bool {
+    return c == 0 or c == 59 or c == 123 or c == 125
+}
+
+fn bad(why: str) -> PerlVersionError {
+    return PerlVersionError("Invalid version format (" + why + ")")
+}
+
+type Prescan = { end: i64, qv: bool, saw_decimal: i64, width: i64, alpha: bool }
+
+/// prescan_version (lax): where the version ends and what it is, or the
+/// error.
+fn prescan(s: [i64], from: i64, qv0: bool) -> Prescan ! PerlVersionError {
+    var d = from
+    if qv0 and digit(at(s, d)) {
+        return try dotted(s, d, Prescan{ end: d, qv: true, saw_decimal: 0, width: 3, alpha: false })
+    }
+    if at(s, d) == 118 {
+        d = d + 1
+        if not digit(at(s, d)) {
+            fail(bad("dotted-decimal versions require at least three parts"))
+        }
+        return try dotted(s, d, Prescan{ end: d, qv: true, saw_decimal: 0, width: 3, alpha: false })
+    }
+    // A decimal version.
+    var saw = 0
+    var width = 3
+    var alpha = false
+    if at(s, d) == 45 {
+        fail(bad("negative version number"))
+    }
+    while digit(at(s, d)) {
+        d = d + 1
+    }
+    if at(s, d) == 46 {
+        saw = saw + 1
+        d = d + 1
+    } else if ends(at(s, d)) or space(at(s, d)) {
+        if d == from {
+            fail(bad("version required"))
+        }
+        return try finish(s, d, Prescan{ end: d, qv: qv0, saw_decimal: saw, width: width, alpha: alpha })
+    } else if d == from {
+        fail(bad("non-numeric data"))
+    } else if at(s, d) == 95 {
+        fail(bad(if digit(at(s, d + 1)) { "alpha without decimal" } else { "misplaced underscore" }))
+    } else {
+        fail(bad("non-numeric data"))
+    }
+    if not digit(at(s, d)) and not (ends(at(s, d)) or space(at(s, d))) {
+        fail(bad("fractional part required"))
+    }
+    var j = 0
+    while digit(at(s, d)) {
+        d = d + 1
+        j = j + 1
+        if at(s, d) == 46 and digit(at(s, d - 1)) {
+            if alpha {
+                fail(bad("underscores before decimal"))
+            }
+            // Dotted after all: start over from the beginning, keeping the
+            // count of decimal points, as the C does.
+            return try dotted(s, from, Prescan{ end: from, qv: true, saw_decimal: saw, width: width, alpha: alpha })
+        }
+        if at(s, d) == 95 {
+            if alpha {
+                fail(bad("multiple underscores"))
+            }
+            if not digit(at(s, d + 1)) {
+                fail(bad("misplaced underscore"))
+            }
+            width = j
+            d = d + 1
+            alpha = true
+        }
+    }
+    return try finish(s, d, Prescan{ end: d, qv: qv0, saw_decimal: saw, width: width, alpha: alpha })
+}
+
+/// The dotted-decimal part of prescan_version, from `d0`.
+fn dotted(s: [i64], d0: i64, p: Prescan) -> Prescan ! PerlVersionError {
+    var d = d0
+    var saw = p.saw_decimal
+    var alpha = p.alpha
+    while digit(at(s, d)) {
+        d = d + 1
+    }
+    if at(s, d) != 46 {
+        return try finish(s, d, Prescan{ end: d, qv: true, saw_decimal: saw, width: p.width, alpha: alpha })
+    }
+    saw = saw + 1
+    d = d + 1
+    while digit(at(s, d)) {
+        while digit(at(s, d)) {
+            d = d + 1
+        }
+        if at(s, d) == 95 {
+            if alpha {
+                fail(bad("multiple underscores"))
+            }
+            d = d + 1
+            alpha = true
+        } else if at(s, d) == 46 {
+            if alpha {
+                fail(bad("underscores before decimal"))
+            }
+            saw = saw + 1
+            d = d + 1
+        } else {
+            break
+        }
+    }
+    return try finish(s, d, Prescan{ end: d, qv: true, saw_decimal: saw, width: p.width, alpha: alpha })
+}
+
+/// version_prescan_finish.
+fn finish(s: [i64], d0: i64, p: Prescan) -> Prescan ! PerlVersionError {
+    var d = d0
+    while space(at(s, d)) {
+        d = d + 1
+    }
+    if not digit(at(s, d)) and not ends(at(s, d)) {
+        fail(bad("non-numeric data"))
+    }
+    if p.saw_decimal > 1 and at(s, d - 1) == 46 {
+        fail(bad("trailing decimal"))
+    }
+    return Prescan{ end: d, qv: p.qv, saw_decimal: p.saw_decimal, width: p.width, alpha: p.alpha }
+}
+
+fn version_max() -> i64 {
+    return 2147483647
+}
+
+/// One part's value from `s` to `end`, as scan_version reads it: the
+/// fraction of a decimal version three digits at a time, anything else
+/// as an integer; and whether it overflowed.
+fn part_value(text: [i64], s0: i64, end: i64, fraction: bool) -> (i64, bool) {
+    var rev = 0
+    if fraction {
+        var mult = 100
+        var s = s0
+        while s < end {
+            rev = rev + (text[s] - 48) * mult
+            mult = mult / 10
+            s = s + 1
+            if at(text, s) == 95 {
+                s = s + 1
+            }
+        }
+        return (rev, false)
+    }
+    var mult = 1
+    var e = end - 1
+    while e >= s0 {
+        if text[e] != 95 {
+            let i = text[e] - 48
+            if mult == version_max() or i > version_max() / mult or i * mult > version_max() - rev {
+                return (version_max(), true)
+            }
+            rev = rev + i * mult
+            mult = if mult > version_max() / 10 { version_max() } else { mult * 10 }
+        }
+        e = e - 1
+    }
+    return (rev, false)
+}
+
+/// scan_version: the version object and where reading stopped.
+fn scan(text: [i64], qv0: bool) -> (PerlVersion, i64) ! PerlVersionError {
+    var s = 0
+    while space(at(text, s)) {
+        s = s + 1
+    }
+    let undef = text.slice(s, text.len()) == "undef".codes()
+    var p = Prescan{ end: s, qv: qv0, saw_decimal: 0, width: 3, alpha: false }
+    match prescan(text, s, qv0) {
+        Ok(found) -> p = found
+        Err(e) -> if not undef {
+            fail(e)
+        }
+    }
+    let qv = p.qv
+    let start = s
+    if at(text, s) == 118 {
+        s = s + 1
+    }
+    var pos = s
+    var parts: [i64] = []
+    var vinf = false
+    while digit(at(text, pos)) or at(text, pos) == 95 {
+        pos = pos + 1
+    }
+    if not alpha_char(at(text, pos)) {
+        while true {
+            let (rev, over) = part_value(text, s, pos, not qv and s > start and p.saw_decimal == 1)
+            parts.push(rev)
+            if over {
+                vinf = true
+                s = p.end
+                break
+            }
+            let c = at(text, pos)
+            if c == 46 {
+                pos = pos + 1
+                if qv {
+                    while at(text, pos) == 48 {
+                        pos = pos + 1
+                    }
+                }
+                s = pos
+            } else if (c == 95 or c == 44) and digit(at(text, pos + 1)) {
+                pos = pos + 1
+                s = pos
+            } else if digit(c) {
+                s = pos
+            } else {
+                s = pos
+                break
+            }
+            if qv {
+                while digit(at(text, pos)) or at(text, pos) == 95 {
+                    pos = pos + 1
+                }
+            } else {
+                var digits = 0
+                while (digit(at(text, pos)) or at(text, pos) == 95) and digits < 3 {
+                    if at(text, pos) != 95 {
+                        digits = digits + 1
+                    }
+                    pos = pos + 1
+                }
+            }
+        }
+    }
+    if qv {
+        while parts.len() < 3 {
+            parts.push(0)
+        }
+    }
+    var original = "0"
+    if vinf {
+        original = "v.Inf"
+    } else if s > start {
+        original = bytes_of(text.slice(start, s)).to_str()
+        if qv and p.saw_decimal == 1 and at(text, start) != 118 {
+            original = "v" + original
+        }
+    } else {
+        parts.push(0)
+    }
+    if undef {
+        s = s + 5
+    }
+    return (PerlVersion{ parts: parts, original: original, qv: qv, alpha: p.alpha }, s)
+}
+
+/// `version->parse(text)` (and `version->new`). Text after `;`, `{` or `}`
+/// that Perl ignores with a warning is ignored here too.
+pub fn parse(text: str) -> PerlVersion ! PerlVersionError {
+    let (v, _end) = try scan(text.to_bytes().to_list(), false)
+    return v
+}
+
+/// `version->declare(text)` (and `qv`): the text read as dotted.
+pub fn declare(text: str) -> PerlVersion ! PerlVersionError {
+    let (v, _end) = try scan(text.to_bytes().to_list(), true)
+    return v
+}
+
+/// `$v->stringify`, which is also what `"$v"` prints.
+pub fn stringify(v: PerlVersion) -> str {
+    return v.original
+}
+
+fn pad3(n: i64) -> str {
+    let t = n.to_str()
+    return if t.len() >= 3 { t } else if t.len() == 2 { "0" + t } else { "00" + t }
+}
+
+/// `$v->numify`.
+pub fn numify(v: PerlVersion) -> str {
+    if v.parts.len() == 0 {
+        return "0"
+    }
+    var out = (if v.parts[0] < 0 { 0 - v.parts[0] } else { v.parts[0] }).to_str() + "."
+    for k in 1..v.parts.len() {
+        out = out + pad3(v.parts[k])
+    }
+    if v.parts.len() == 1 {
+        out = out + "000"
+    }
+    return out
+}
+
+/// `$v->normal`.
+pub fn normal(v: PerlVersion) -> str {
+    if v.parts.len() == 0 {
+        return ""
+    }
+    var out = "v" + v.parts[0].to_str()
+    for k in 1..v.parts.len() {
+        out = out + "." + v.parts[k].to_str()
+    }
+    var n = v.parts.len()
+    while n < 3 {
+        out = out + ".0"
+        n = n + 1
+    }
+    return out
+}
+
+pub fn is_alpha(v: PerlVersion) -> bool {
+    return v.alpha
+}
+
+pub fn is_qv(v: PerlVersion) -> bool {
+    return v.qv
+}
+
+/// `$a <=> $b`: -1, 0 or 1.
+pub fn compare(a: PerlVersion, b: PerlVersion) -> i64 {
+    let l = a.parts.len()
+    let r = b.parts.len()
+    let m = if l < r { l } else { r }
+    for i in 0..m {
+        if a.parts[i] < b.parts[i] {
+            return 0 - 1
+        }
+        if a.parts[i] > b.parts[i] {
+            return 1
+        }
+    }
+    for i in m..r {
+        if b.parts[i] != 0 {
+            return 0 - 1
+        }
+    }
+    for i in m..l {
+        if a.parts[i] != 0 {
+            return 1
+        }
+    }
+    return 0
+}

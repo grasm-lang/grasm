@@ -1,0 +1,513 @@
+// Lua's `string.pack`, `string.unpack` and `string.packsize`, as Lua
+// 5.5 does them on a 64-bit little-endian machine.
+//
+// Lua programs read and write binary formats -- network messages, game
+// saves, file headers -- with these three, and a program on the other
+// side of the bytes has to use the same layout:
+//
+//   - Options: `b B h H l L j J T i[n] I[n]` integers (n from 1 to 16; a
+//     size past 8 sign-extends on packing and must hold no more than an
+//     i64 on unpacking), `f d n` floats, `s[n]` length-prefixed and `z`
+//     zero-terminated strings, `c n` fixed-size strings, `x` a padding
+//     byte, `X op` alignment to `op`, `< > =` byte order, `!n` the
+//     largest alignment (alignment is off until `!` turns it on).
+//   - Values are coerced as Lua coerces them: a string that reads as a
+//     number packs as one, a float with an integral value packs as an
+//     integer, a number packs into a string option as its `tostring`.
+//   - Errors are Lua's text, `bad argument #2 to 'string.pack'
+//     (integer overflow)` and the rest; a missing argument reads as nil,
+//     because pack keeps a nil after its arguments.
+import luaformat
+
+/// A Lua value, as far as these functions care.
+type LuaValue =
+    | LuaNil
+    | LuaBool(b: bool)
+    | LuaInt(i: i64)
+    | LuaFloat(f: f64)
+    | LuaStr(s: bytes)
+    | LuaTable
+
+/// The error Lua raises, with its message.
+type LuaPackError = | LuaPackError(msg: str)
+
+pub fn error_text(e: LuaPackError) -> str {
+    return match e {
+        LuaPackError(m) -> m
+    }
+}
+
+/// The kinds of option.
+type PackKind = | KInt | KUint | KFloat | KNumber | KDouble | KChar | KString | KZstr | KPadding | KPaddalign | KNop
+
+/// Reading the format: where, the byte order, the largest alignment.
+type PackHeader = { fmt: [i64], at: i64, little: bool, maxalign: i64, func: str }
+
+fn arg_error(h: PackHeader, arg: i64, msg: str) -> LuaPackError {
+    return LuaPackError("bad argument #" + arg.to_str() + " to '" + h.func + "' (" + msg + ")")
+}
+
+fn peek(h: PackHeader) -> i64 {
+    return if h.at < h.fmt.len() { h.fmt[h.at] } else { 0 }
+}
+
+fn digit(c: i64) -> bool {
+    return c >= 48 and c <= 57
+}
+
+/// getnum: a numeral, or `df` where there is none.
+fn getnum(inout h: PackHeader, df: i64) -> i64 {
+    if not digit(peek(h)) {
+        return df
+    }
+    var a = 0
+    while true {
+        a = a * 10 + peek(h) - 48
+        h.at = h.at + 1
+        if not (digit(peek(h)) and a <= (9223372036854775807 - 9) / 10) {
+            break
+        }
+    }
+    return a
+}
+
+fn getnumlimit(inout h: PackHeader, df: i64) -> i64 ! LuaPackError {
+    let sz = getnum(h, df)
+    if sz < 1 or sz > 16 {
+        let low = sz.bit_and(4294967295)
+        fail(LuaPackError("integral size (" + (if low >= 2147483648 { low - 4294967296 } else { low }).to_str() + ") out of limits [1,16]"))
+    }
+    return sz
+}
+
+/// getoption: the next option and its size.
+fn getoption(inout h: PackHeader) -> (PackKind, i64) ! LuaPackError {
+    let opt = peek(h)
+    h.at = h.at + 1
+    let fixed = [(98, KInt, 1), (66, KUint, 1), (104, KInt, 2), (72, KUint, 2), (108, KInt, 8), (76, KUint, 8), (106, KInt, 8), (74, KUint, 8), (84, KUint, 8),
+        (102, KFloat, 4), (110, KNumber, 8), (100, KDouble, 8)]
+    for (c, kind, size) in fixed {
+        if opt == c {
+            return (kind, size)
+        }
+    }
+    if opt == 105 or opt == 73 {
+        return (if opt == 105 { KInt } else { KUint }, try getnumlimit(h, 4))
+    }
+    if opt == 115 {
+        return (KString, try getnumlimit(h, 8))
+    }
+    if opt == 99 {
+        let size = getnum(h, 0 - 1)
+        if size == 0 - 1 {
+            fail(LuaPackError("missing size for format option 'c'"))
+        }
+        return (KChar, size)
+    }
+    if opt == 122 {
+        return (KZstr, 0)
+    }
+    if opt == 120 {
+        return (KPadding, 1)
+    }
+    if opt == 88 {
+        return (KPaddalign, 0)
+    }
+    if opt == 32 {
+        return (KNop, 0)
+    }
+    if opt == 60 or opt == 62 or opt == 61 {
+        h.little = opt != 62
+        return (KNop, 0)
+    }
+    if opt == 33 {
+        h.maxalign = try getnumlimit(h, 8)
+        return (KNop, 0)
+    }
+    fail(LuaPackError("invalid format option '" + bytes_of([opt]).to_str() + "'"))
+}
+
+fn is_kind(k: PackKind, want: PackKind) -> bool {
+    return match (k, want) {
+        (KChar, KChar) -> true
+        (KString, KString) -> true
+        (KZstr, KZstr) -> true
+        (KPaddalign, KPaddalign) -> true
+        _ -> false
+    }
+}
+
+/// getdetails: the option, its size, and the padding before it.
+fn getdetails(inout h: PackHeader, total: i64) -> (PackKind, i64, i64) ! LuaPackError {
+    let (opt, size) = try getoption(h)
+    var align = size
+    if is_kind(opt, KPaddalign) {
+        if peek(h) == 0 {
+            fail(arg_error(h, 1, "invalid next option for option 'X'"))
+        }
+        let (next, nsize) = try getoption(h)
+        if is_kind(next, KChar) or nsize == 0 {
+            fail(arg_error(h, 1, "invalid next option for option 'X'"))
+        }
+        align = nsize
+    }
+    if align <= 1 or is_kind(opt, KChar) {
+        return (opt, size, 0)
+    }
+    if align > h.maxalign {
+        align = h.maxalign
+    }
+    if align.bit_and(align - 1) != 0 {
+        fail(arg_error(h, 1, "format asks for alignment not power of 2"))
+    }
+    return (opt, size, (align - total.bit_and(align - 1)).bit_and(align - 1))
+}
+
+// ---- Lua's coercions
+
+fn type_name(v: LuaValue) -> str {
+    return match v {
+        LuaNil -> "nil"
+        LuaBool(_b) -> "boolean"
+        LuaInt(_i) -> "number"
+        LuaFloat(_f) -> "number"
+        LuaStr(_s) -> "string"
+        LuaTable -> "table"
+    }
+}
+
+fn arg_at(args: [LuaValue], arg: i64) -> LuaValue {
+    return if arg - 2 < args.len() { args[arg - 2] } else { LuaNil }
+}
+
+/// A float with an integral value in the i64 range, as an integer.
+fn float_integer(f: f64) -> Option[i64] {
+    if f >= -9223372036854775808.0 and f < 9223372036854775808.0 and f == f.floor() {
+        return Some(f.as_i64())
+    }
+    return None
+}
+
+/// luaL_checkinteger.
+fn check_integer(h: PackHeader, args: [LuaValue], arg: i64) -> i64 ! LuaPackError {
+    let v = arg_at(args, arg)
+    let no_rep = arg_error(h, arg, "number has no integer representation")
+    match v {
+        LuaInt(i) -> return i
+        LuaFloat(f) -> return float_integer(f) ?? fail(no_rep)
+        LuaStr(s) -> match luaformat.tonumber(s.to_str()) {
+            Some(n) -> return if n.is_integer { n.integer } else { float_integer(n.float) ?? fail(no_rep) }
+            None -> {}
+        }
+        _ -> {}
+    }
+    fail(arg_error(h, arg, "number expected, got " + type_name(v)))
+}
+
+/// luaL_checknumber.
+fn check_number(h: PackHeader, args: [LuaValue], arg: i64) -> f64 ! LuaPackError {
+    let v = arg_at(args, arg)
+    match v {
+        LuaInt(i) -> return i.as_f64()
+        LuaFloat(f) -> return f
+        LuaStr(s) -> match luaformat.tonumber(s.to_str()) {
+            Some(n) -> return if n.is_integer { n.integer.as_f64() } else { n.float }
+            None -> {}
+        }
+        _ -> {}
+    }
+    fail(arg_error(h, arg, "number expected, got " + type_name(v)))
+}
+
+/// luaL_checklstring: a number becomes its `tostring`.
+fn check_string(h: PackHeader, args: [LuaValue], arg: i64) -> [i64] ! LuaPackError {
+    let v = arg_at(args, arg)
+    return match v {
+        LuaStr(s) -> s.to_list()
+        LuaInt(i) -> i.to_str().to_bytes().to_list()
+        LuaFloat(f) -> luaformat.tostring_float(f).to_bytes().to_list()
+        _ -> fail(arg_error(h, arg, "string expected, got " + type_name(v)))
+    }
+}
+
+// ---- C's float
+
+/// The bits of `(float)x`: rounded to nearest, ties to even.
+fn f32_bits(x: f64) -> i64 {
+    let bits = x.to_bits()
+    let sign = bits.ushr(63).shl(31)
+    let exp = bits.shr(52).bit_and(2047)
+    let mant = bits.bit_and(4503599627370495)
+    if exp == 2047 {
+        return if mant == 0 { sign.bit_or(2139095040) } else { sign.bit_or(2143289344).bit_or(mant.ushr(29)) }
+    }
+    if exp == 0 {
+        return sign
+    }
+    let m = mant.bit_or(4503599627370496)
+    var e = exp - 1023 + 127
+    if e >= 255 {
+        return sign.bit_or(2139095040)
+    }
+    let shift = if e >= 1 { 29 } else { 29 + 1 - e }
+    if shift > 60 {
+        return sign
+    }
+    var q = m.ushr(shift)
+    let rem = m - q.shl(shift)
+    let half = 1.shl(shift - 1)
+    if rem > half or (rem == half and q % 2 == 1) {
+        q = q + 1
+    }
+    if e >= 1 {
+        if q == 16777216 {
+            q = q / 2
+            e = e + 1
+            if e >= 255 {
+                return sign.bit_or(2139095040)
+            }
+        }
+        return sign.bit_or(e.shl(23)).bit_or(q.bit_and(8388607))
+    }
+    return sign.bit_or(q)
+}
+
+/// 2^e, for e in the normal range of a double.
+fn pow2(e: i64) -> f64 {
+    return (e + 1023).shl(52).from_bits()
+}
+
+/// `(double)f` for the float with these bits.
+fn f32_value(b: i64) -> f64 {
+    let negative = b.shr(31).bit_and(1) == 1
+    let e = b.shr(23).bit_and(255)
+    let m = b.bit_and(8388607)
+    if e == 255 {
+        let s = if negative { 1.shl(63) } else { 0 }
+        return if m == 0 { if negative { -1.0 / 0.0 } else { 1.0 / 0.0 } } else { s.bit_or(9221120237041090560).bit_or(m.shl(29)).from_bits() }
+    }
+    let v = if e == 0 { m.as_f64() * pow2(0 - 149) } else { (m + 8388608).as_f64() * pow2(e - 150) }
+    return if negative { v * -1.0 } else { v }
+}
+
+// ---- pack, unpack, packsize
+
+fn header(fmt: bytes, func: str) -> PackHeader {
+    return PackHeader{ fmt: fmt.to_list(), at: 0, little: true, maxalign: 1, func: func }
+}
+
+/// `size` bytes of `n`, in the header's order; a negative `n` packed into
+/// more than 8 bytes is sign-extended.
+fn packint(n: i64, size: i64, little: bool, negative: bool) -> [i64] {
+    var le: [i64] = []
+    for i in 0..size {
+        le.push(if i < 8 { n.ushr(8 * i).bit_and(255) } else if negative { 255 } else { 0 })
+    }
+    if little {
+        return le
+    }
+    var be: [i64] = []
+    var k = size - 1
+    while k >= 0 {
+        be.push(le[k])
+        k = k - 1
+    }
+    return be
+}
+
+fn pack_integer(h: PackHeader, args: [LuaValue], arg: i64, opt: PackKind, size: i64) -> [i64] ! LuaPackError {
+    let n = try check_integer(h, args, arg)
+    let signed = match opt {
+        KInt -> true
+        _ -> false
+    }
+    if size < 8 {
+        let lim = 1.shl(size * 8 - 1)
+        if signed and not (0 - lim <= n and n < lim) {
+            fail(arg_error(h, arg, "integer overflow"))
+        }
+        if not signed and (n < 0 or n >= 2 * lim) {
+            fail(arg_error(h, arg, "unsigned overflow"))
+        }
+    }
+    return packint(n, size, h.little, signed and n < 0)
+}
+
+/// One option's bytes; `extra` is what it adds to the total beyond its
+/// size (a string's length).
+fn pack_one(h: PackHeader, args: [LuaValue], arg: i64, opt: PackKind, size: i64) -> ([i64], i64) ! LuaPackError {
+    match opt {
+        KInt -> return (try pack_integer(h, args, arg, opt, size), 0)
+        KUint -> return (try pack_integer(h, args, arg, opt, size), 0)
+        KFloat -> return (packint(f32_bits(try check_number(h, args, arg)), 4, h.little, false), 0)
+        KNumber -> return (packint((try check_number(h, args, arg)).to_bits(), 8, h.little, false), 0)
+        KDouble -> return (packint((try check_number(h, args, arg)).to_bits(), 8, h.little, false), 0)
+        KChar -> {
+            let s = try check_string(h, args, arg)
+            if s.len() > size {
+                fail(arg_error(h, arg, "string longer than given size"))
+            }
+            var out = s
+            for _k in 0..(size - s.len()) {
+                out.push(0)
+            }
+            return (out, 0)
+        }
+        KString -> {
+            let s = try check_string(h, args, arg)
+            if size < 8 and s.len() >= 1.shl(size * 8) {
+                fail(arg_error(h, arg, "string length does not fit in given size"))
+            }
+            return (packint(s.len(), size, h.little, false) + s, s.len())
+        }
+        KZstr -> {
+            let s = try check_string(h, args, arg)
+            if s.contains(0) {
+                fail(arg_error(h, arg, "string contains zeros"))
+            }
+            return (s + [0], s.len() + 1)
+        }
+        _ -> return ([], 0)
+    }
+}
+
+fn takes_argument(opt: PackKind) -> bool {
+    return match opt {
+        KPadding -> false
+        KPaddalign -> false
+        KNop -> false
+        _ -> true
+    }
+}
+
+/// `string.pack(fmt, ...)`.
+pub fn pack(fmt: bytes, args: [LuaValue]) -> bytes ! LuaPackError {
+    var h = header(fmt, "string.pack")
+    var arg = 1
+    var total = 0
+    var out: [i64] = []
+    while peek(h) != 0 {
+        let (opt, size, ntoalign) = try getdetails(h, total)
+        if size + ntoalign > 9223372036854775807 - total {
+            fail(arg_error(h, arg, "result too long"))
+        }
+        total = total + ntoalign + size
+        for _k in 0..ntoalign {
+            out.push(0)
+        }
+        if is_padding(opt) {
+            out.push(0)
+        }
+        if takes_argument(opt) {
+            arg = arg + 1
+            let (bs, extra) = try pack_one(h, args, arg, opt, size)
+            out = out + bs
+            total = total + extra
+        }
+    }
+    return bytes_of(out)
+}
+
+fn is_padding(opt: PackKind) -> bool {
+    return match opt {
+        KPadding -> true
+        _ -> false
+    }
+}
+
+/// `string.packsize(fmt)`.
+pub fn packsize(fmt: bytes) -> i64 ! LuaPackError {
+    var h = header(fmt, "string.packsize")
+    var total = 0
+    while peek(h) != 0 {
+        let (opt, size0, ntoalign) = try getdetails(h, total)
+        if is_kind(opt, KString) or is_kind(opt, KZstr) {
+            fail(arg_error(h, 1, "variable-length format"))
+        }
+        let size = size0 + ntoalign
+        if total > 9223372036854775807 - size {
+            fail(arg_error(h, 1, "format result too large"))
+        }
+        total = total + size
+    }
+    return total
+}
+
+/// unpackint: `size` bytes at `pos` as an integer.
+fn unpackint(d: [i64], pos: i64, little: bool, size: i64, signed: bool) -> i64 ! LuaPackError {
+    let limit = if size <= 8 { size } else { 8 }
+    var res = 0
+    var i = limit - 1
+    while i >= 0 {
+        res = res.shl(8).bit_or(d[pos + (if little { i } else { size - 1 - i })])
+        i = i - 1
+    }
+    if size < 8 {
+        if signed {
+            let mask = 1.shl(size * 8 - 1)
+            res = res.bit_xor(mask) - mask
+        }
+    } else if size > 8 {
+        let mask = if not signed or res >= 0 { 0 } else { 255 }
+        for k in limit..size {
+            if d[pos + (if little { k } else { size - 1 - k })] != mask {
+                fail(LuaPackError(size.to_str() + "-byte integer does not fit into Lua Integer"))
+            }
+        }
+    }
+    return res
+}
+
+/// posrelatI.
+fn posrelat(pos: i64, len: i64) -> i64 {
+    return if pos > 0 { pos } else if pos == 0 { 1 } else if pos < 0 - len { 1 } else { len + pos + 1 }
+}
+
+/// `string.unpack(fmt, data, init)`: the values and the next position.
+pub fn unpack(fmt: bytes, data: bytes, init: i64) -> ([LuaValue], i64) ! LuaPackError {
+    var h = header(fmt, "string.unpack")
+    let d = data.to_list()
+    let ld = d.len()
+    var pos = posrelat(init, ld) - 1
+    if pos > ld {
+        fail(arg_error(h, 3, "initial position out of string"))
+    }
+    var out: [LuaValue] = []
+    while peek(h) != 0 {
+        let (opt, size, ntoalign) = try getdetails(h, pos)
+        if size > ld - pos or ntoalign > ld - pos - size {
+            fail(arg_error(h, 2, "data string too short"))
+        }
+        pos = pos + ntoalign
+        match opt {
+            KInt -> out.push(LuaInt(try unpackint(d, pos, h.little, size, true)))
+            KUint -> out.push(LuaInt(try unpackint(d, pos, h.little, size, false)))
+            KFloat -> out.push(LuaFloat(f32_value(try unpackint(d, pos, h.little, 4, false))))
+            KNumber -> out.push(LuaFloat((try unpackint(d, pos, h.little, 8, false)).from_bits()))
+            KDouble -> out.push(LuaFloat((try unpackint(d, pos, h.little, 8, false)).from_bits()))
+            KChar -> out.push(LuaStr(bytes_of(d.slice(pos, pos + size))))
+            KString -> {
+                let len = try unpackint(d, pos, h.little, size, false)
+                if len < 0 or len > ld - pos - size {
+                    fail(arg_error(h, 2, "data string too short"))
+                }
+                out.push(LuaStr(bytes_of(d.slice(pos + size, pos + size + len))))
+                pos = pos + len
+            }
+            KZstr -> {
+                var len = 0
+                while pos + len < ld and d[pos + len] != 0 {
+                    len = len + 1
+                }
+                if pos + len >= ld {
+                    fail(arg_error(h, 2, "unfinished string for format 'z'"))
+                }
+                out.push(LuaStr(bytes_of(d.slice(pos, pos + len))))
+                pos = pos + len + 1
+            }
+            _ -> {}
+        }
+        pos = pos + size
+    }
+    return (out, pos + 1)
+}

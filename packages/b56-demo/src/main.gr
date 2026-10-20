@@ -1,0 +1,196 @@
+// Eight libraries, each run once on an input whose answer came from the
+// tool it is held to -- SBCL 2.6, Rust 1.99 (twice), Perl 5.34 (twice),
+// Ruby 2.6 and CPython 3.13 (twice). scripts/b56_diff.sh holds them to
+// those tools on thousands more.
+import bigint
+import lispnumbers
+import perlparsewords
+import perltextwrap
+import pyipaddress
+import pystr
+import rubyfloat
+import rustescape
+import rustpath
+
+fn lisp_text(r: str ! LispFormatError) -> str {
+    return match r {
+        Ok(t) -> t
+        Err(e) -> "E:" + lispnumbers.error_text(e)
+    }
+}
+
+fn lisp() {
+    assert_eq(lisp_text(lispnumbers.cardinal(bigint.from_i64(1234))), "one thousand two hundred thirty-four")
+    assert_eq(lisp_text(lispnumbers.ordinal(bigint.from_i64(22))), "twenty-second")
+    assert_eq(lisp_text(lispnumbers.roman(bigint.from_i64(1999))), "MCMXCIX")
+    assert_eq(lisp_text(lispnumbers.old_roman(bigint.from_i64(4))), "IIII")
+    assert_eq(lisp_text(lispnumbers.roman(bigint.from_i64(4000))), "E:Number too large to print in Roman numerals: 4,000")
+    assert_eq(lispnumbers.radix(bigint.from_i64(1234567), 10, 0, " ", ",", 3, true, false), "1,234,567")
+    assert_eq(lispnumbers.radix(bigint.from_i64(0 - 255), 16, 8, "0", ",", 3, false, true), "00000-FF")
+    print("~R, ~:R, ~@R, ~:@R and radix: SBCL's")
+}
+
+fn rust_paths() {
+    assert(rustpath.extension("/a/b.tar.gz") == Some("gz"))
+    assert(rustpath.file_stem("/a/b.tar.gz") == Some("b.tar"))
+    assert(rustpath.file_prefix("/a/b.tar.gz") == Some("b"))
+    assert(rustpath.parent("/a/b.tar.gz") == Some("/a"))
+    assert(rustpath.parent("/") == None)
+    assert_eq(rustpath.join("/a", "/b"), "/b")
+    assert_eq(rustpath.components("a//b/./c/").join("|"), "a|b|c")
+    assert_eq(rustpath.with_extension("a/b.c", "d") ?? "", "a/b.d")
+    assert(rustpath.strip_prefix("/a/b/c", "/a") == Some("b/c"))
+    print("std::path::Path: Rust's")
+}
+
+fn words(r: [Option[str]] ! ParseWordsError) -> str {
+    return match r {
+        Ok(ws) -> ws.map(|w| w ?? "<undef>").join("|")
+        Err(e) -> "E:" + perlparsewords.error_text(e)
+    }
+}
+
+fn perl_words() {
+    assert_eq(perlparsewords.shellwords(["foo \"bar baz\" 'q x'"]).map(|w| w ?? "<undef>").join("|"), "foo|bar baz|q x")
+    assert_eq(words(perlparsewords.parse_line(",", KeepNothing, "a,\"b,c\",d")), "a|b,c|d")
+    assert_eq(words(perlparsewords.parse_line(",", KeepQuotes, "a,\"b,c\",d")), "a|\"b,c\"|d")
+    assert_eq(words(perlparsewords.parse_line("\\s+", KeepNothing, "a \"b")), "")
+    print("Text::ParseWords: Perl's")
+}
+
+fn rf(r: RubyNumber ! FloatDomainError) -> str {
+    return match r {
+        Ok(RubyInt(i)) -> "i" + bigint.to_str(i)
+        Ok(RubyFloat(f)) -> "f" + f.to_str()
+        Err(e) -> "E:" + rubyfloat.error_text(e)
+    }
+}
+
+fn ruby() {
+    assert_eq(rubyfloat.to_s(1.0e16), "1.0e+16")
+    assert_eq(rubyfloat.to_s(100.0), "100.0")
+    assert_eq(rubyfloat.to_s(0.00001), "1.0e-05")
+    assert_eq(rf(rubyfloat.round(2.5, 0, HalfUp)), "i3")
+    assert_eq(rf(rubyfloat.round(2.5, 0, HalfEven)), "i2")
+    assert_eq(rf(rubyfloat.round(12345.0, 0 - 2, HalfUp)), "i12300")
+    assert_eq(rf(rubyfloat.floor(0.0 - 1.5, 0)), "i-2")
+    assert(match rubyfloat.round(1.15, 1, HalfUp) {
+        Ok(RubyFloat(f)) -> f == 1.2
+        _ -> false
+    })
+    assert_eq(rf(rubyfloat.round(1.0 / 0.0, 0, HalfUp)), "E:Infinity")
+    print("Float#to_s, round, floor, ceil and truncate: Ruby's")
+}
+
+fn rust_escapes() {
+    assert_eq(rustescape.escape_debug("a\u{301}"), "a\u{301}")
+    assert_eq(rustescape.escape_debug("\u{301}a"), "\\u\{301}a")
+    assert_eq(rustescape.debug_str("it's \"x\"\n"), "\"it's \\\"x\\\"\\n\"")
+    assert_eq(rustescape.debug_char("'"), "'\\''")
+    assert_eq(rustescape.escape_unicode_char("é"), "\\u\{e9}")
+    assert_eq(rustescape.escape_default("é\t"), "\\u\{e9}\\t")
+    assert_eq(rustescape.escape_debug_char("\u{200b}"), "\\u\{200b}")
+    print("escape_debug, escape_default, escape_unicode and \{:?}: Rust's")
+}
+
+fn wrapped(r: str ! WrapError) -> str {
+    return match r {
+        Ok(t) -> t
+        Err(e) -> "E:" + perltextwrap.error_text(e)
+    }
+}
+
+fn perl_wrap() {
+    var o = perltextwrap.default_options()
+    o.columns = 10
+    assert_eq(wrapped(perltextwrap.wrap("", "", ["the quick brown fox jumps"], o)), "the quick\nbrown fox\njumps")
+    o.columns = 6
+    o.huge = HugeDie
+    assert_eq(wrapped(perltextwrap.wrap("", "", ["supercalifragilistic"], o)), "E:couldn't wrap 'supercalifragilistic'")
+    o.huge = HugeOverflow
+    assert_eq(wrapped(perltextwrap.wrap("* ", "  ", ["supercalifragilistic word"], o)), "* supercalifragilistic\n  word")
+    assert_eq(perltextwrap.unexpand("a       b", 8), "a\tb")
+    assert_eq(perltextwrap.expand("a\tb", 4), "a   b")
+    print("Text::Wrap and Text::Tabs: Perl's")
+}
+
+fn ip_error(r: PyIpAddress ! PyIpError) -> str {
+    return match r {
+        Ok(a) -> pyipaddress.address_str(a)
+        Err(e) -> pyipaddress.error_class(e) + ": " + pyipaddress.error_text(e)
+    }
+}
+
+fn nets(r: [PyIpNetwork] ! PyIpError) -> str {
+    return match r {
+        Ok(ns) -> ns.map(|n| pyipaddress.network_str(n)).join(" ")
+        Err(e) -> pyipaddress.error_class(e) + ": " + pyipaddress.error_text(e)
+    }
+}
+
+fn net(text: str) -> PyIpNetwork {
+    return pyipaddress.ip_network(text, true) ?? panic("network")
+}
+
+fn python_ipaddress() {
+    assert_eq(ip_error(pyipaddress.ipv4_address("1.2.3.04")), "AddressValueError: Leading zeros are not permitted in '04' in '1.2.3.04'")
+    assert_eq(ip_error(pyipaddress.ip_address("1.2.3.04")), "ValueError: '1.2.3.04' does not appear to be an IPv4 or IPv6 address")
+    assert_eq(ip_error(pyipaddress.ip_address("2001:0db8:0:0:0:0:0:1")), "2001:db8::1")
+    let mapped = pyipaddress.ip_address("::ffff:1.2.3.4") ?? panic("mapped")
+    assert_eq(pyipaddress.address_exploded(mapped) ?? "", "0000:0000:0000:0000:0000:ffff:1.2.3.4")
+    let scoped = pyipaddress.ip_address("fe80::1%eth0") ?? panic("scoped")
+    assert_eq(match pyipaddress.address_exploded(scoped) {
+        Ok(t) -> t
+        Err(e) -> pyipaddress.error_text(e)
+    }, "Only hex digits permitted in '1%eth0' in 'fe80::1%eth0'")
+    assert(match pyipaddress.ip_network("1.2.3.4/24", true) {
+        Ok(_n) -> false
+        Err(e) -> pyipaddress.error_text(e) == "1.2.3.4/24 has host bits set"
+    })
+    assert_eq(pyipaddress.network_str(pyipaddress.ipv4_network("10.0.0.0/0.255.255.255", true) ?? panic("hostmask")), "10.0.0.0/8")
+    assert_eq(nets(pyipaddress.collapse_addresses([PyIpNetworkItem(net("192.0.2.0/25")), PyIpNetworkItem(net("192.0.2.128/25"))])), "192.0.2.0/24")
+    let first = pyipaddress.ip_address("1.0.0.0") ?? panic("first")
+    assert_eq(nets(pyipaddress.summarize_address_range(first, pyipaddress.ip_address("1.0.0.5") ?? first)), "1.0.0.0/30 1.0.0.4/31")
+    assert_eq(nets(pyipaddress.address_exclude(net("10.0.0.0/30"), net("10.0.0.1/32"))), "10.0.0.2/31 10.0.0.0/32")
+    assert(not pyipaddress.interface_is_unspecified(pyipaddress.ip_interface("0.0.0.0/32") ?? panic("iface")))
+    assert(pyipaddress.is_private(pyipaddress.ip_address("::ffff:10.0.0.1") ?? first))
+    let shared = pyipaddress.ip_address("100.64.0.1") ?? first
+    assert(not pyipaddress.is_global(shared) and not pyipaddress.is_private(shared))
+    assert_eq(pyipaddress.network_reverse_pointer(net("2001:db8::/32")) ?? "", "2.3./.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.8.b.d.0.1.0.0.2.ip6.arpa")
+    assert_eq(pyipaddress.format_address(pyipaddress.ip_address("192.0.2.1") ?? first, "#_x") ?? "", "0xc000_0201")
+    print("ipaddress: Python's")
+}
+
+fn python_str() {
+    assert_eq((pystr.split("a,b,,c", Some(","), 0 - 1) ?? []).join("|"), "a|b||c")
+    assert_eq((pystr.split("  a  b ", None, 0 - 1) ?? []).join("|"), "a|b")
+    assert_eq((pystr.split(" a b c ", None, 1) ?? []).join("|"), "a|b c ")
+    assert_eq((pystr.split("x\u{1680}y", None, 0 - 1) ?? []).join("|"), "x|y")
+    assert_eq(pystr.splitlines("x\r\ny\u{2028}z", false).join("|"), "x|y|z")
+    assert_eq(pystr.lower("ΟΔΟΣ ΣΑ"), "οδος σα")
+    assert_eq(pystr.lower("ΣΑ'Σ'"), "σα'ς'")
+    assert_eq(pystr.lower("İ"), "i\u{307}")
+    assert_eq(pystr.title("they're bill's"), "They'Re Bill'S")
+    assert_eq(pystr.title("ǆemal"), "ǅemal")
+    assert_eq(pystr.upper("ß"), "SS")
+    assert_eq(pystr.capitalize("ﬁx"), "Fix")
+    assert_eq(pystr.center("ab", 5, "*") ?? "", "**ab*")
+    assert_eq(pystr.zfill("-42", 6), "-00042")
+    assert_eq(pystr.expandtabs("a\tbc\td", 4), "a   bc  d")
+    assert_eq(pystr.find("abc", "", Some(3), None), 3)
+    assert_eq(pystr.find("abc", "", Some(4), None), 0 - 1)
+    assert_eq(pystr.count("aaa", "aa", None, None), 1)
+    assert_eq(pystr.replace("abc", "", "-", 0 - 1), "-a-b-c-")
+    print("str methods: Python's")
+}
+
+fn main() / {io} {
+    lisp()
+    rust_paths()
+    perl_words()
+    ruby()
+    rust_escapes()
+    perl_wrap()
+    python_ipaddress()
+    python_str()
+}

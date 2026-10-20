@@ -1,0 +1,659 @@
+// Ruby's `CGI` helpers and `ERB::Util`, as Ruby 2.6 runs them (its
+// `cgi/escape` C extension included): `CGI.escape`, `unescape`,
+// `escapeHTML`, `unescapeHTML`, `escapeElement`, `unescapeElement`,
+// `rfc1123_date`, `pretty`, `CGI.parse`, `CGI::Cookie.parse` and
+// `Cookie#to_s`, and `ERB::Util.url_encode` and `html_escape`.
+//
+// Rails-era and Rack code escapes and parses through these, and their
+// rules are their own:
+//
+//   - `escape` keeps `A-Za-z0-9-._~`, writes a space as `+` and every
+//     other byte as `%XX`; `url_encode` is the same but writes a space as
+//     `%20`. `unescape` reads `+` as a space and `%XX` as a byte, leaves
+//     a broken escape as it is, stops at a `%` in the last two places
+//     (so `%+` keeps its `+`), and returns bytes that need not be UTF-8.
+//   - `escapeHTML` (and `html_escape`) escapes `' & " < >` as `&#39;
+//     &amp; &quot; &lt; &gt;`.
+//   - `unescapeHTML` is the C scanner: `&apos; &amp; &quot; &gt; &lt;`,
+//     `&#NN;` and `&#xHH;` below U+10FFFF (so `&#1114111;` stays, a
+//     surrogate becomes its three bytes, `&#0;` a NUL). A failed attempt
+//     skips one more character, so `&a&amp;` and `&#12&amp;` are left
+//     whole.
+//   - `escapeElement` and `unescapeElement` escape (or unescape) whole
+//     tags of the named elements, case-insensitively, from `<` (or
+//     `&lt;`, in any case) to the first `>` (or `&gt;`).
+//   - `pretty` puts every tag on its own line and indents element
+//     contents by `shift`, by Ruby's regular expressions; a closing tag
+//     with no opening line before it is ArgumentError "bad value for
+//     range".
+//   - `CGI.parse` splits on `&` and `;`, keeps keys in first-seen order
+//     with every value (a key without `=` gets no value), and drops
+//     empty fields; `Cookie.parse` splits on `;` and one optional white
+//     space, needs `=`, splits values on `&`, and joins a repeated name's
+//     values. `Cookie#to_s` escapes the values and writes `; path=`
+//     even when the path is empty.
+//   - `rfc1123_date` is `Sun, 06 Nov 1994 08:49:37 GMT`, year padded to
+//     four digits (`-0001` before year 0).
+//
+// Strings are bytes, as Ruby's are. Limits: `escapeElement`,
+// `unescapeElement` and `pretty` treat every byte above 127 as a word
+// character, which is Ruby's view of letters but not of other non-ASCII
+// characters, and compare names in ASCII case only.
+
+/// Ruby's ArgumentError, with its message.
+type RbCgiError = | RbCgiArgumentError(msg: str)
+
+pub fn error_text(e: RbCgiError) -> str {
+    return match e {
+        RbCgiArgumentError(m) -> m
+    }
+}
+
+fn hex2(c: i64) -> [i64] {
+    let d = "0123456789ABCDEF".codes()
+    return [37, d[c / 16], d[c % 16]]
+}
+
+fn extend(inout out: [i64], xs: [i64]) {
+    for x in xs {
+        out.push(x)
+    }
+}
+
+fn is_alnum(c: i64) -> bool {
+    return c >= 48 and c <= 57 or c >= 65 and c <= 90 or c >= 97 and c <= 122
+}
+
+fn is_hex(c: i64) -> bool {
+    return c >= 48 and c <= 57 or c >= 65 and c <= 70 or c >= 97 and c <= 102
+}
+
+fn hex_value(c: i64) -> i64 {
+    return if c >= 97 { c - 87 } else if c >= 65 { c - 55 } else { c - 48 }
+}
+
+fn text_of(t: str) -> [i64] {
+    return t.to_bytes().to_list()
+}
+
+// ---- URL escaping
+
+fn url_escape(b: bytes, space: [i64]) -> bytes {
+    var out: [i64] = []
+    for c in b.to_list() {
+        if is_alnum(c) or c == 45 or c == 46 or c == 95 or c == 126 {
+            out.push(c)
+        } else if c == 32 {
+            extend(out, space)
+        } else {
+            extend(out, hex2(c))
+        }
+    }
+    return bytes_of(out)
+}
+
+/// `CGI.escape`.
+pub fn escape(b: bytes) -> bytes {
+    return url_escape(b, [43])
+}
+
+/// `ERB::Util.url_encode`.
+pub fn url_encode(b: bytes) -> bytes {
+    return url_escape(b, [37, 50, 48])
+}
+
+/// `CGI.unescape`.
+pub fn unescape(b: bytes) -> bytes {
+    let s = b.to_list()
+    var out: [i64] = []
+    var i = 0
+    while i < s.len() {
+        let c = s[i]
+        if c == 37 and i + 3 > s.len() {
+            // A `%` in the last two places ends the scan: the rest, a `+`
+            // included, is kept as it is.
+            for x in s.slice(i, s.len()) {
+                out.push(x)
+            }
+            break
+        }
+        if c == 43 {
+            out.push(32)
+        } else if c == 37 and is_hex(s[i + 1]) and is_hex(s[i + 2]) {
+            out.push(hex_value(s[i + 1]) * 16 + hex_value(s[i + 2]))
+            i = i + 2
+        } else {
+            out.push(c)
+        }
+        i = i + 1
+    }
+    return bytes_of(out)
+}
+
+// ---- HTML escaping
+
+/// `CGI.escapeHTML`, and `ERB::Util.html_escape`.
+pub fn escape_html(b: bytes) -> bytes {
+    var out: [i64] = []
+    for c in b.to_list() {
+        if c == 39 {
+            extend(out, text_of("&#39;"))
+        } else if c == 38 {
+            extend(out, text_of("&amp;"))
+        } else if c == 34 {
+            extend(out, text_of("&quot;"))
+        } else if c == 60 {
+            extend(out, text_of("&lt;"))
+        } else if c == 62 {
+            extend(out, text_of("&gt;"))
+        } else {
+            out.push(c)
+        }
+    }
+    return bytes_of(out)
+}
+
+fn matches_at(s: [i64], i: i64, word: str) -> bool {
+    let w = text_of(word)
+    return s.len() - i >= w.len() and s.slice(i, i + w.len()) == w
+}
+
+/// UTF-8 bytes of a code point, surrogates included (`rb_enc_mbcput`).
+fn utf8_of(cc: i64) -> [i64] {
+    if cc < 128 {
+        return [cc]
+    }
+    if cc < 2048 {
+        return [cc.shr(6).bit_or(192), cc.bit_and(63).bit_or(128)]
+    }
+    if cc < 65536 {
+        return [cc.shr(12).bit_or(224), cc.shr(6).bit_and(63).bit_or(128), cc.bit_and(63).bit_or(128)]
+    }
+    return [cc.shr(18).bit_or(240), cc.shr(12).bit_and(63).bit_or(128), cc.shr(6).bit_and(63).bit_or(128), cc.bit_and(63).bit_or(128)]
+}
+
+/// A numeric reference after `&#`, the scanner at `i`: (code point, the
+/// index of the `;`) when it decodes, else the index the scanner stopped
+/// at (it then skips that character).
+fn numeric_ref(s: [i64], i0: i64) -> (i64, i64) {
+    var i = i0
+    var base = 0
+    if s.len() - i >= 2 and s[i] >= 48 and s[i] <= 57 {
+        base = 10
+    } else if i < s.len() and (s[i] == 120 or s[i] == 88) {
+        i = i + 1
+        if s.len() - i >= 2 and is_hex(s[i]) {
+            base = 16
+        } else {
+            return (0 - 1, i)
+        }
+    } else {
+        return (0 - 1, i)
+    }
+    var cc = 0
+    var overflow = false
+    while i < s.len() and (if base == 10 { s[i] >= 48 and s[i] <= 57 } else { is_hex(s[i]) }) {
+        if cc > 1000000000000 {
+            overflow = true
+        } else {
+            cc = cc * base + hex_value(s[i])
+        }
+        i = i + 1
+    }
+    if overflow or cc >= 1114111 or i >= s.len() or s[i] != 59 {
+        return (0 - 1, i)
+    }
+    return (cc, i)
+}
+
+/// `CGI.unescapeHTML`, the C extension's scanner for UTF-8 text.
+pub fn unescape_html(b: bytes) -> bytes {
+    let s = b.to_list()
+    var out: [i64] = []
+    var beg = 0
+    var i = 0
+    while i < s.len() {
+        if s[i] != 38 {
+            i = i + 1
+            continue
+        }
+        let amp = i
+        i = i + 1
+        if i >= s.len() {
+            break
+        }
+        let c = s[i]
+        var got: [i64] = []
+        if c == 97 or c == 113 or c == 103 or c == 108 {
+            i = i + 1
+            let named = if c == 97 { [("pos;", 39), ("mp;", 38)] } else if c == 113 { [("uot;", 34)] } else { [("t;", if c == 103 { 62 } else { 60 })] }
+            match named.find(|n| matches_at(s, i, n.0)) {
+                Some(n) -> {
+                    i = i + n.0.len() - 1
+                    got = [n.1]
+                }
+                None -> {
+                    i = i + 1
+                    continue
+                }
+            }
+        } else if c == 35 {
+            let (cc, at) = numeric_ref(s, i + 1)
+            i = at
+            if cc < 0 {
+                i = i + 1
+                continue
+            }
+            got = utf8_of(cc)
+        } else {
+            continue
+        }
+        extend(out, s.slice(beg, amp))
+        extend(out, got)
+        beg = i + 1
+        i = i + 1
+    }
+    extend(out, s.slice(beg, s.len()))
+    return bytes_of(out)
+}
+
+// ---- elements
+
+fn lower(c: i64) -> i64 {
+    return if c >= 65 and c <= 90 { c + 32 } else { c }
+}
+
+fn is_word(c: i64) -> bool {
+    return is_alnum(c) or c == 95 or c >= 128
+}
+
+/// `<\/?(?:names)(?!\w)(?:.|\n)*?>` (with `open` and `close` the
+/// delimiters) at `i`: where the match ends, or -1.
+fn same_ci(s: [i64], i: i64, w: [i64]) -> bool {
+    return s.len() - i >= w.len() and s.slice(i, i + w.len()).map(|c| lower(c)) == w.map(|c| lower(c))
+}
+
+fn element_at(s: [i64], i: i64, names: [str], open: [i64], close: [i64]) -> i64 {
+    if not same_ci(s, i, open) {
+        return 0 - 1
+    }
+    var j = i + open.len()
+    var starts = [j]
+    if j < s.len() and s[j] == 47 {
+        starts = [j + 1, j]
+    }
+    // `\/?` is greedy: with the slash first, then without.
+    for st in starts {
+        for name in names {
+            let n = text_of(name)
+            if s.len() - st >= n.len() and s.slice(st, st + n.len()).map(|c| lower(c)) == n.map(|c| lower(c)) {
+                let after = st + n.len()
+                if after >= s.len() or not is_word(s[after]) {
+                    var k = after
+                    while k + close.len() <= s.len() {
+                        if same_ci(s, k, close) {
+                            return k + close.len()
+                        }
+                        k = k + 1
+                    }
+                }
+            }
+        }
+    }
+    return 0 - 1
+}
+
+fn element_replace(b: bytes, names: [str], open: str, close: str, escaping: bool) -> bytes {
+    if names.len() == 0 {
+        return b
+    }
+    let s = b.to_list()
+    var out: [i64] = []
+    var i = 0
+    while i < s.len() {
+        let e = element_at(s, i, names, text_of(open), text_of(close))
+        if e < 0 {
+            out.push(s[i])
+            i = i + 1
+        } else {
+            let piece = bytes_of(s.slice(i, e))
+            extend(out, (if escaping { escape_html(piece) } else { unescape_html(piece) }).to_list())
+            i = e
+        }
+    }
+    return bytes_of(out)
+}
+
+/// `CGI.escapeElement(string, *elements)`.
+pub fn escape_element(b: bytes, names: [str]) -> bytes {
+    return element_replace(b, names, "<", ">", true)
+}
+
+/// `CGI.unescapeElement(string, *elements)`.
+pub fn unescape_element(b: bytes, names: [str]) -> bytes {
+    return element_replace(b, names, "&lt;", "&gt;", false)
+}
+
+// ---- pretty
+
+/// `<.*?>` from `i` with `/m`: the index after the first `>`, or -1.
+fn tag_end(s: [i64], i: i64) -> i64 {
+    if s[i] != 60 {
+        return 0 - 1
+    }
+    var k = i + 1
+    while k < s.len() {
+        if s[k] == 62 {
+            return k + 1
+        }
+        k = k + 1
+    }
+    return 0 - 1
+}
+
+/// The first two substitutions of `pretty`: a newline before every tag
+/// but one at the very start, then after every tag (the lazy `.*?`
+/// running on past a `>` that a newline follows).
+fn split_tags(s0: [i64]) -> [i64] {
+    var s1: [i64] = []
+    var i = 0
+    while i < s0.len() {
+        let e = if i > 0 { tag_end(s0, i) } else { 0 - 1 }
+        if e < 0 {
+            s1.push(s0[i])
+            i = i + 1
+        } else {
+            s1.push(10)
+            extend(s1, s0.slice(i, e))
+            i = e
+        }
+    }
+    var s2: [i64] = []
+    i = 0
+    while i < s1.len() {
+        var e = 0 - 1
+        if s1[i] == 60 {
+            var k = i + 1
+            while k < s1.len() {
+                if s1[k] == 62 and (k + 1 >= s1.len() or s1[k + 1] != 10) {
+                    e = k + 1
+                    break
+                }
+                k = k + 1
+            }
+        }
+        if e < 0 {
+            s2.push(s1[i])
+            i = i + 1
+        } else {
+            extend(s2, s1.slice(i, e))
+            s2.push(10)
+            i = e
+        }
+    }
+    return s2
+}
+
+fn line_start(s: [i64], i: i64) -> bool {
+    return i == 0 or s[i - 1] == 10
+}
+
+fn is_space(c: i64) -> bool {
+    return c == 32 or c == 9 or c == 10 or c == 11 or c == 12 or c == 13
+}
+
+/// `index(/^<\/(\w+)/, from)`: (start, element name) or None.
+fn closing_tag(s: [i64], from: i64) -> Option[(i64, [i64])] {
+    var i = from
+    while i + 2 < s.len() {
+        if line_start(s, i) and s[i] == 60 and s[i + 1] == 47 and is_word(s[i + 2]) {
+            var k = i + 2
+            while k < s.len() and is_word(s[k]) {
+                k = k + 1
+            }
+            return Some((i, s.slice(i + 2, k)))
+        }
+        i = i + 1
+    }
+    return None
+}
+
+/// `rindex(/^\s*<element/i, pos)`.
+fn opening_line(s: [i64], name: [i64], pos: i64) -> i64 {
+    var st = pos.min(s.len())
+    while st >= 0 {
+        if line_start(s, st) {
+            var k = st
+            while k < s.len() and is_space(s[k]) {
+                k = k + 1
+            }
+            if k < s.len() and s[k] == 60 and s.len() - k - 1 >= name.len() and s.slice(k + 1, k + 1 + name.len()).map(|c| lower(c)) == name.map(|c| lower(c)) {
+                return st
+            }
+        }
+        st = st - 1
+    }
+    return 0 - 1
+}
+
+/// `CGI.pretty(string, shift)`.
+pub fn pretty(b: bytes, shift: str) -> bytes ! RbCgiError {
+    var lines = split_tags(b.to_list())
+    let sh = text_of(shift)
+    var end_pos = 0
+    while true {
+        let (at, name) = match closing_tag(lines, end_pos) {
+            Some(x) -> x
+            None -> break
+        }
+        end_pos = at
+        let start = opening_line(lines, name, end_pos)
+        if start < 0 {
+            fail(RbCgiArgumentError("bad value for range"))
+        }
+        var mid: [i64] = []
+        var k = start
+        while k < end_pos {
+            mid.push(lines[k])
+            if lines[k] == 10 and k + 1 < end_pos {
+                extend(mid, sh)
+            }
+            k = k + 1
+        }
+        lines = lines.slice(0, start) + [95, 95] + mid + [95, 95] + lines.slice(end_pos, lines.len())
+    }
+    return bytes_of(drop_markers(lines, sh))
+}
+
+/// `gsub(/^((?:shift)*)__(?=<\/?\w)/, '\1')`.
+fn drop_markers(s: [i64], sh: [i64]) -> [i64] {
+    var out: [i64] = []
+    var i = 0
+    while i < s.len() {
+        if line_start(s, i) {
+            var k = i
+            while sh.len() > 0 and k + sh.len() <= s.len() and s.slice(k, k + sh.len()) == sh {
+                k = k + sh.len()
+            }
+            let tag = k + 2 < s.len() and s[k] == 95 and s[k + 1] == 95 and s[k + 2] == 60 and (k + 3 < s.len() and is_word(s[k + 3]) or k + 4 < s.len() and s[k + 3] ==
+                47 and is_word(s[k + 4]))
+            if tag {
+                extend(out, s.slice(i, k))
+                i = k + 2
+                continue
+            }
+        }
+        out.push(s[i])
+        i = i + 1
+    }
+    return out
+}
+
+// ---- parse and cookies
+
+/// Ruby's `split` on a set of separator bytes: empty fields kept except
+/// at the end, and none at all for an empty string.
+fn split_on(s: [i64], seps: [i64]) -> [[i64]] {
+    var out: [[i64]] = []
+    var cur: [i64] = []
+    for c in s {
+        if seps.contains(c) {
+            out.push(cur)
+            cur = []
+        } else {
+            cur.push(c)
+        }
+    }
+    out.push(cur)
+    while out.len() > 0 and out[out.len() - 1].len() == 0 {
+        let _x = out.pop()
+    }
+    return out
+}
+
+fn first_eq(s: [i64]) -> i64 {
+    var i = 0
+    while i < s.len() {
+        if s[i] == 61 {
+            return i
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+fn add_values(inout keys: [bytes], inout values: [[bytes]], k: bytes, vs: [bytes]) {
+    var i = 0
+    while i < keys.len() {
+        if keys[i] == k {
+            for v in vs {
+                values[i].push(v)
+            }
+            return
+        }
+        i = i + 1
+    }
+    keys.push(k)
+    values.push(vs)
+}
+
+/// `CGI.parse(query)`: keys in first-seen order, each with its values.
+pub fn parse(query: bytes) -> [(bytes, [bytes])] {
+    var keys: [bytes] = []
+    var values: [[bytes]] = []
+    for field in split_on(query.to_list(), [38, 59]) {
+        if field.len() == 0 {
+            continue
+        }
+        let eq = first_eq(field)
+        if eq < 0 {
+            add_values(keys, values, unescape(bytes_of(field)), [])
+        } else {
+            add_values(keys, values, unescape(bytes_of(field.slice(0, eq))), [unescape(bytes_of(field.slice(eq + 1, field.len())))])
+        }
+    }
+    return keys.zip(values)
+}
+
+/// `CGI::Cookie.parse(raw)`: name, then its values, in first-seen order.
+pub fn cookie_parse(raw: bytes) -> [(bytes, [bytes])] {
+    let s = raw.to_list()
+    // split(/;\s?/): a `;` and at most one white space after it.
+    var pieces: [[i64]] = []
+    var cur: [i64] = []
+    var i = 0
+    while i < s.len() {
+        if s[i] == 59 {
+            pieces.push(cur)
+            cur = []
+            if i + 1 < s.len() and is_space(s[i + 1]) {
+                i = i + 1
+            }
+        } else {
+            cur.push(s[i])
+        }
+        i = i + 1
+    }
+    pieces.push(cur)
+    while pieces.len() > 0 and pieces[pieces.len() - 1].len() == 0 {
+        let _x = pieces.pop()
+    }
+    var keys: [bytes] = []
+    var values: [[bytes]] = []
+    for p in pieces {
+        let eq = first_eq(p)
+        if eq < 0 {
+            continue
+        }
+        let vs = split_on(p.slice(eq + 1, p.len()), [38]).map(|v| unescape(bytes_of(v)))
+        add_values(keys, values, bytes_of(p.slice(0, eq)), vs)
+    }
+    return keys.zip(values)
+}
+
+/// `CGI::Cookie#to_s` for a cookie with these fields; `expires` is
+/// seconds since the epoch.
+pub fn cookie_to_s(name: bytes, values: [bytes], domain: Option[bytes], path: bytes, expires: Option[i64], secure: bool, httponly: bool) -> bytes {
+    var out = name.to_list()
+    out.push(61)
+    var first = true
+    for v in values {
+        if not first {
+            out.push(38)
+        }
+        extend(out, escape(v).to_list())
+        first = false
+    }
+    match domain {
+        Some(d) -> {
+            extend(out, text_of("; domain="))
+            extend(out, d.to_list())
+        }
+        None -> ()
+    }
+    // A cookie always has a path, empty when none was given.
+    extend(out, text_of("; path="))
+    extend(out, path.to_list())
+    match expires {
+        Some(t) -> extend(out, text_of("; expires=" + rfc1123_date(t)))
+        None -> ()
+    }
+    if secure {
+        extend(out, text_of("; secure"))
+    }
+    if httponly {
+        extend(out, text_of("; HttpOnly"))
+    }
+    return bytes_of(out)
+}
+
+// ---- dates
+
+fn floor_div(a: i64, b: i64) -> i64 {
+    let q = a / b
+    return if a % b != 0 and (a < 0) != (b < 0) { q - 1 } else { q }
+}
+
+fn pad(n: i64, w: i64) -> str {
+    return if n < 0 { "-" + (0 - n).to_str().pad_start(w, "0") } else { n.to_str().pad_start(w, "0") }
+}
+
+/// `CGI.rfc1123_date(Time.at(sec))`.
+pub fn rfc1123_date(sec: i64) -> str {
+    let days = floor_div(sec, 86400)
+    let rest = sec - days * 86400
+    let z = days + 719468
+    let era = floor_div(z, 146097)
+    let doe = z - era * 146097
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100)
+    let mp = (5 * doy + 2) / 153
+    let d = doy - (153 * mp + 2) / 5 + 1
+    let m = if mp < 10 { mp + 3 } else { mp - 9 }
+    let y = yoe + era * 400 + (if m <= 2 { 1 } else { 0 })
+    let wd = days + 4 - floor_div(days + 4, 7) * 7
+    let day_names = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
+    let months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+    return day_names[wd] + ", " + pad(d, 2) + " " + months[m - 1] + " " + pad(y, 4) + " " + pad(rest / 3600, 2) + ":" + pad(rest / 60 % 60, 2) + ":" + pad(rest % 60, 2) +
+    " GMT"
+}

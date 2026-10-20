@@ -1,0 +1,8 @@
+[package]
+name = "pystr"
+version = "1.0.0"
+capabilities = []
+
+[dependencies.pycharclass]
+path = "../pycharclass"
+version = "^1.0.0"

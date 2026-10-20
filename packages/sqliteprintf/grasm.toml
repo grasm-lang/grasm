@@ -1,0 +1,16 @@
+[package]
+name = "sqliteprintf"
+version = "1.0.0"
+capabilities = []
+
+[dependencies.bigint]
+path = "../bigint"
+version = "^1.0.0"
+
+[dependencies.pymath]
+path = "../pymath"
+version = "^1.0.0"
+
+[dependencies.sqlitefile]
+path = "../sqlitefile"
+version = "^1.0.0"

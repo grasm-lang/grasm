@@ -1,0 +1,98 @@
+// Ruby's `Abbrev.abbrev`, as Ruby 2.6's `abbrev.rb` computes it: every
+// unambiguous abbreviation of a list of words, mapped to the word it
+// abbreviates, in the order Ruby's Hash holds them.
+//
+// Command-line tools and REPLs built on Ruby let a user type `con` for
+// `config`, and the table `Abbrev.abbrev` builds is what decides which
+// prefixes count. Its rules:
+//
+//   - Every prefix of every word, longest first, is a candidate; one seen
+//     for exactly one word maps to it, and one seen a second time is taken
+//     out of the table (a third sighting changes nothing).
+//   - Each word then maps to itself, even when it is a prefix of another
+//     word (`car` stays when `cart` is also listed), and a word listed
+//     twice still maps to itself.
+//   - An empty word has no prefixes but still maps to itself.
+//   - With a pattern, only prefixes and words that start with the pattern
+//     are kept; Ruby turns a String pattern into `/\A<pattern>/`, so it is
+//     a literal prefix, and the empty pattern keeps everything.
+//   - The result is in Ruby's Hash order: a key keeps the place it was
+//     first inserted at, and a key deleted and inserted again goes to the
+//     end. Prefixes are counted in characters, not bytes.
+//
+// Limits: a Regexp pattern (as opposed to a String) is not supported;
+// words are taken as valid UTF-8 text.
+
+/// An insertion-ordered table with deletion, as a Ruby Hash keeps one.
+type RbAbbrevTable = { keys: [str], values: [str], live: [bool], slot: Map[str, i64] }
+
+fn table_set(inout t: RbAbbrevTable, k: str, v: str) {
+    match t.slot.get(k) {
+        Some(i) -> {
+            t.values[i] = v
+        }
+        None -> {
+            t.slot.set(k, t.keys.len())
+            t.keys.push(k)
+            t.values.push(v)
+            t.live.push(true)
+        }
+    }
+}
+
+fn table_delete(inout t: RbAbbrevTable, k: str) {
+    match t.slot.get(k) {
+        Some(i) -> {
+            t.live[i] = false
+            let _gone = t.slot.delete(k)
+        }
+        None -> ()
+    }
+}
+
+fn keeps(pattern: Option[str], s: str) -> bool {
+    return match pattern {
+        Some(p) -> s.starts_with(p)
+        None -> true
+    }
+}
+
+/// `Abbrev.abbrev(words, pattern)`: (abbreviation, word) pairs in the
+/// order Ruby's Hash yields them. `pattern` is a String prefix or `None`.
+pub fn abbrev(words: [str], pattern: Option[str]) -> [(str, str)] {
+    var t = RbAbbrevTable{ keys: [], values: [], live: [], slot: map() }
+    var seen: Map[str, i64] = map()
+    for word in words {
+        var n = word.len()
+        while n >= 1 {
+            let ab = word.substr(0, n)
+            n = n - 1
+            if not keeps(pattern, ab) {
+                continue
+            }
+            let count = (seen.get(ab) ?? 0) + 1
+            seen.set(ab, count)
+            if count == 1 {
+                table_set(t, ab, word)
+            } else if count == 2 {
+                table_delete(t, ab)
+            } else {
+                break
+            }
+        }
+    }
+    for word in words {
+        if keeps(pattern, word) {
+            table_set(t, word, word)
+        }
+    }
+    var out: [(str, str)] = []
+    var i = 0
+    while i < t.keys.len() {
+        if t.live[i] {
+            out.push((t.keys[i], t.values[i]))
+        }
+        i = i + 1
+    }
+    return out
+}

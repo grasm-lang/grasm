@@ -1,0 +1,274 @@
+// Python's `urllib.robotparser.RobotFileParser`, as CPython 3.13 parses a
+// robots.txt and answers from it: `can_fetch`, `crawl_delay`,
+// `request_rate`, `site_maps` and `str()`.
+//
+// Python crawlers and archivers decide what they may fetch with this, and
+// it is not Google's robots.txt: `packages/robots` takes the longest
+// matching rule, while Python takes the first. What a port has to keep:
+//
+//   - Lines are `name: value`, the name compared after `strip().lower()`,
+//     the value stripped and percent-decoded; `#` starts a comment, and a
+//     line that was empty to begin with ends a group. A rule before any
+//     `User-agent` is ignored; `Sitemap` is collected wherever it is.
+//   - A group naming `*` becomes the default entry -- only the first such
+//     group; a later one is dropped -- and a group is chosen by the first
+//     of its agent names, lowercased, found inside the crawler's name
+//     (the part before its first `/`, lowercased).
+//   - The first rule whose path is a prefix of the URL's path decides; an
+//     empty `Disallow` allows everything; paths on both sides are put
+//     through `urlparse`/`urlunparse` and `quote`, so `%7E` and `~`
+//     compare equal and the URL's scheme and host are dropped.
+//   - `Crawl-delay` and `Request-rate` keep a value only when it is all
+//     digits (`str.isdigit`, so `²` passes the test and then makes `int()`
+//     raise "invalid literal for int() with base 10: '²'", as Python
+//     does), and a group with nothing usable still counts as a group.
+//
+// Limits: values longer than 4300 digits are converted here, where Python
+// refuses them (its integer-string limit). `read()` (fetching the file)
+// is not here: hand the text to `parse_text`, which splits it as
+// `str.splitlines` does.
+
+import bigint
+import pycharclass
+import pystr
+import pyurlparse
+
+type PyRobotRule = { path: str, allowance: bool }
+
+type PyRobotEntry = { useragents: [str], rulelines: [PyRobotRule], delay: Option[BigInt], req_rate: Option[(BigInt, BigInt)] }
+
+/// A parsed robots.txt.
+type PyRobotParser = { entries: [PyRobotEntry], default_entry: Option[PyRobotEntry], sitemaps: [str] }
+
+/// The ValueError Python raises from `int()` or `urlparse`.
+type PyRobotError = | PyRobotValueError(msg: str)
+
+pub fn error_text(e: PyRobotError) -> str {
+    return match e {
+        PyRobotValueError(m) -> m
+    }
+}
+
+fn url_error(e: PyUrlError) -> PyRobotError {
+    return match e {
+        PyValueError(m) -> PyRobotValueError(m)
+    }
+}
+
+fn empty_entry() -> PyRobotEntry {
+    return PyRobotEntry{ useragents: [], rulelines: [], delay: None, req_rate: None }
+}
+
+/// `int(text)` for a text whose stripped form `isdigit()`.
+fn digits_value(text: str) -> BigInt ! PyRobotError {
+    let t = pystr.strip(text, None)
+    var v = bigint.zero()
+    let ten = bigint.from_i64(10)
+    for c in t.codes() {
+        let d = pycharclass.decimal_value(c)
+        if d < 0 {
+            fail(PyRobotValueError("invalid literal for int() with base 10: " + pyurlparse.py_repr(text)))
+        }
+        v = bigint.add(bigint.mul(v, ten), bigint.from_i64(d))
+    }
+    return v
+}
+
+fn is_digits(text: str) -> bool {
+    return pycharclass.isdigit(pystr.strip(text, None))
+}
+
+/// A rule's path as `RuleLine` stores it.
+fn rule_path(path: str) -> str ! PyRobotError {
+    let p = match pyurlparse.urlparse(path, "", true) {
+        Ok(p) -> p
+        Err(e) -> fail(url_error(e))
+    }
+    return pyurlparse.quote(pyurlparse.urlunparse(p), "/")
+}
+
+fn add_entry(inout p: PyRobotParser, e: PyRobotEntry) {
+    if e.useragents.contains("*") {
+        match p.default_entry {
+            None -> p.default_entry = Some(e)
+            Some(_d) -> {}
+        }
+    } else {
+        p.entries.push(e)
+    }
+}
+
+/// One `name: value` line; answers the new state.
+fn directive(inout p: PyRobotParser, inout entry: PyRobotEntry, state: i64, name: str, value: str) -> i64 ! PyRobotError {
+    if name == "user-agent" {
+        if state == 2 {
+            add_entry(p, entry)
+            entry = empty_entry()
+        }
+        entry.useragents.push(value)
+        return 1
+    }
+    if name == "sitemap" {
+        p.sitemaps.push(value)
+        return state
+    }
+    if state == 0 or (name != "disallow" and name != "allow" and name != "crawl-delay" and name != "request-rate") {
+        return state
+    }
+    if name == "disallow" or name == "allow" {
+        let allow = name == "allow" or value.len() == 0
+        entry.rulelines.push(PyRobotRule{ path: try rule_path(value), allowance: allow })
+    } else if name == "crawl-delay" {
+        if is_digits(value) {
+            entry.delay = Some(try digits_value(value))
+        }
+    } else {
+        let numbers = if value.len() == 0 { [""] } else { value.split("/") }
+        if numbers.len() == 2 and is_digits(numbers[0]) and is_digits(numbers[1]) {
+            let a = try digits_value(numbers[0])
+            entry.req_rate = Some((a, try digits_value(numbers[1])))
+        }
+    }
+    return 2
+}
+
+/// The name of a directive as compared: `strip().lower()`.
+fn directive_name(raw: str) -> str {
+    return pystr.lower(pystr.strip(raw, None))
+}
+
+/// `RobotFileParser.parse(lines)` on a fresh parser.
+pub fn parse(lines: [str]) -> PyRobotParser ! PyRobotError {
+    var p = PyRobotParser{ entries: [], default_entry: None, sitemaps: [] }
+    var state = 0
+    var entry = empty_entry()
+    for raw in lines {
+        if raw.len() == 0 {
+            if state == 1 {
+                entry = empty_entry()
+                state = 0
+            } else if state == 2 {
+                add_entry(p, entry)
+                entry = empty_entry()
+                state = 0
+            }
+        }
+        let line = pystr.strip(match raw.index_of("#") {
+            Some(i) -> raw.substr(0, i)
+            None -> raw
+        }, None)
+        match line.index_of(":") {
+            Some(i) -> {
+                let name = directive_name(line.substr(0, i))
+                let value = pyurlparse.unquote(pystr.strip(line.substr(i + 1, line.len() - i - 1), None))
+                state = try directive(p, entry, state, name, value)
+            }
+            None -> {}
+        }
+    }
+    if state == 2 {
+        add_entry(p, entry)
+    }
+    return p
+}
+
+/// `parse(text.splitlines())`, which is what `read()` does with the file.
+pub fn parse_text(text: str) -> PyRobotParser ! PyRobotError {
+    return try parse(pystr.splitlines(text, false))
+}
+
+fn applies_to(e: PyRobotEntry, useragent: str) -> bool {
+    let ua = pystr.lower(if useragent.len() == 0 { "" } else { useragent.split("/")[0] })
+    for agent in e.useragents {
+        if agent == "*" {
+            return true
+        }
+        if ua.contains(pystr.lower(agent)) {
+            return true
+        }
+    }
+    return false
+}
+
+fn allowance(e: PyRobotEntry, path: str) -> bool {
+    for r in e.rulelines {
+        if r.path == "*" or path.starts_with(r.path) {
+            return r.allowance
+        }
+    }
+    return true
+}
+
+/// The entry that answers for `useragent`, if any.
+fn entry_for(p: PyRobotParser, useragent: str) -> Option[PyRobotEntry] {
+    for e in p.entries {
+        if applies_to(e, useragent) {
+            return Some(e)
+        }
+    }
+    return p.default_entry
+}
+
+/// `can_fetch(useragent, url)`.
+pub fn can_fetch(p: PyRobotParser, useragent: str, url: str) -> bool ! PyRobotError {
+    let parsed = match pyurlparse.urlparse(pyurlparse.unquote(url), "", true) {
+        Ok(x) -> x
+        Err(e) -> fail(url_error(e))
+    }
+    let bare = PyParse{ scheme: "", netloc: "", path: parsed.path, params: parsed.params, query: parsed.query, fragment: parsed.fragment }
+    var path = pyurlparse.quote(pyurlparse.urlunparse(bare), "/")
+    if path.len() == 0 {
+        path = "/"
+    }
+    return match entry_for(p, useragent) {
+        Some(e) -> allowance(e, path)
+        None -> true
+    }
+}
+
+/// `crawl_delay(useragent)`.
+pub fn crawl_delay(p: PyRobotParser, useragent: str) -> Option[BigInt] {
+    return match entry_for(p, useragent) {
+        Some(e) -> e.delay
+        None -> None
+    }
+}
+
+/// `request_rate(useragent)`: requests and seconds.
+pub fn request_rate(p: PyRobotParser, useragent: str) -> Option[(BigInt, BigInt)] {
+    return match entry_for(p, useragent) {
+        Some(e) -> e.req_rate
+        None -> None
+    }
+}
+
+/// `site_maps()`: None when there are none.
+pub fn site_maps(p: PyRobotParser) -> Option[[str]] {
+    return if p.sitemaps.len() == 0 { None } else { Some(p.sitemaps) }
+}
+
+fn entry_text(e: PyRobotEntry) -> str {
+    var out: [str] = e.useragents.map(|a| "User-agent: " + a)
+    match e.delay {
+        Some(d) -> out.push("Crawl-delay: " + bigint.to_str(d))
+        None -> {}
+    }
+    match e.req_rate {
+        Some(r) -> out.push("Request-rate: " + bigint.to_str(r.0) + "/" + bigint.to_str(r.1))
+        None -> {}
+    }
+    for r in e.rulelines {
+        out.push((if r.allowance { "Allow: " } else { "Disallow: " }) + r.path)
+    }
+    return out.join("\n")
+}
+
+/// `str(parser)`.
+pub fn to_str(p: PyRobotParser) -> str {
+    var all = p.entries
+    match p.default_entry {
+        Some(e) -> all.push(e)
+        None -> {}
+    }
+    return all.map(|e| entry_text(e)).join("\n\n")
+}

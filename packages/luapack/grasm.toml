@@ -1,0 +1,8 @@
+[package]
+name = "luapack"
+version = "1.0.0"
+capabilities = []
+
+[dependencies.luaformat]
+path = "../luaformat"
+version = "^1.0.0"

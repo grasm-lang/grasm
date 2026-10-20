@@ -1,0 +1,461 @@
+// Go's HTTP cookies, as Go 1.25's `net/http` reads and writes them:
+// `ParseCookie` (a `Cookie` request header), `ParseSetCookie` (a
+// `Set-Cookie` response header), `Cookie.String` and `Cookie.Valid`,
+// error texts included.
+//
+// Every Go web server and client goes through these, and a proxy, a test
+// or another service that must agree with one needs Go's rules:
+//
+//   - A cookie name is an RFC 7230 token; a value is printable ASCII
+//     without `"`, `;` or `\`, and may be wrapped in double quotes, which
+//     are removed and remembered (`quoted`).
+//   - `ParseCookie` refuses the whole header for one bad pair (`http:
+//     '=' not found in cookie`, `http: invalid cookie name`, `http: invalid
+//     cookie value`), refuses a blank header, and refuses more than 3000
+//     pairs, Go's default limit.
+//   - `ParseSetCookie` trims ASCII space around each attribute, matches
+//     attribute names case-insensitively (skipping any with a byte outside
+//     printable ASCII), and keeps what it does not understand in
+//     `unparsed`: an unknown attribute, a value with a bad byte, a `Max-Age`
+//     that is not a number or has a leading zero, an `Expires` that is not
+//     RFC 1123 (or its `02-Jan-2006` variant). `Max-Age` of zero or less is
+//     -1; `SameSite` other than Lax, Strict or None is the default mode.
+//   - `cookie_string` drops bytes that are not allowed from the value and
+//     path, quotes a value holding a space or comma (or one that was
+//     quoted), drops a domain that is neither a host name nor an IPv4
+//     address (and a leading dot from one that is), writes `Expires` only
+//     from 1601 on, and `Max-Age=0` for a negative `max_age`.
+//   - `cookie_valid` reports the first problem as Go does, a bad byte
+//     quoted as a Go rune literal.
+//
+// `Expires` parses as Go does on a machine whose local zone is UTC (see
+// `packages/gotimefmt`); a zone abbreviation other than UTC and GMT+N
+// therefore reads as offset zero. The raw header and the unparsed
+// attributes are bytes, since a header need not be UTF-8.
+//
+// Not here: the request and response helpers (`Request.Cookies`,
+// `SetCookie`), and the `httpcookiemaxnum` GODEBUG setting -- the limit is
+// Go's default of 3000.
+
+import gonetip
+import goquote
+import gotimefmt
+
+/// `same_site`: 0 not set, 1 default mode, 2 Lax, 3 Strict, 4 None.
+/// `expires`: Unix seconds and nanoseconds, `None` for Go's zero time.
+type GoHttpCookie = {
+    name: str,
+    value: str,
+    quoted: bool,
+    path: str,
+    domain: str,
+    expires: Option[(i64, i64)],
+    raw_expires: str,
+    max_age: i64,
+    secure: bool,
+    http_only: bool,
+    same_site: i64,
+    partitioned: bool,
+    raw: bytes,
+    unparsed: [bytes],
+}
+
+type GoHttpCookieError = | GoHttpCookieFailed(text: str)
+
+/// The error's text, as Go's `Error()` gives it.
+pub fn error_text(e: GoHttpCookieError) -> str {
+    return match e {
+        GoHttpCookieFailed(t) -> t
+    }
+}
+
+fn failed(t: str) -> GoHttpCookieError {
+    return GoHttpCookieFailed(t)
+}
+
+/// A cookie with only a name and a value set.
+pub fn new_cookie(name: str, value: str) -> GoHttpCookie {
+    return GoHttpCookie{ name: name, value: value, quoted: false, path: "", domain: "", expires: None, raw_expires: "", max_age: 0, secure: false,
+        http_only: false, same_site: 0, partitioned: false, raw: bytes_of([]), unparsed: [] }
+}
+
+fn text(b: [i64]) -> str {
+    return bytes_of(b).to_str()
+}
+
+fn is_space(c: i64) -> bool {
+    return c == 32 or c == 9 or c == 10 or c == 13
+}
+
+/// `textproto.TrimString`.
+fn trim(b: [i64]) -> [i64] {
+    var lo = 0
+    var hi = b.len()
+    while lo < hi and is_space(b[lo]) {
+        lo = lo + 1
+    }
+    while hi > lo and is_space(b[hi - 1]) {
+        hi = hi - 1
+    }
+    return b.slice(lo, hi)
+}
+
+fn split_on(b: [i64], sep: i64) -> [[i64]] {
+    var parts: [[i64]] = []
+    var start = 0
+    for i in 0..b.len() {
+        if b[i] == sep {
+            parts.push(b.slice(start, i))
+            start = i + 1
+        }
+    }
+    parts.push(b.slice(start, b.len()))
+    return parts
+}
+
+fn index_of(b: [i64], c: i64) -> i64 {
+    for i in 0..b.len() {
+        if b[i] == c {
+            return i
+        }
+    }
+    return 0 - 1
+}
+
+fn is_token_byte(c: i64) -> bool {
+    return (c >= 48 and c <= 57) or (c >= 65 and c <= 90) or (c >= 97 and c <= 122) or "!#$%&'*+-.^_`|~".to_bytes().to_list().contains(c)
+}
+
+fn is_token(b: [i64]) -> bool {
+    return b.len() > 0 and b.all(|c| is_token_byte(c))
+}
+
+fn valid_value_byte(c: i64) -> bool {
+    return c >= 32 and c < 127 and c != 34 and c != 59 and c != 92
+}
+
+fn valid_path_byte(c: i64) -> bool {
+    return c >= 32 and c < 127 and c != 59
+}
+
+/// `parseCookieValue`: the value, whether it was quoted, and whether it
+/// is allowed.
+fn parse_value(raw0: [i64], allow_quote: bool) -> ([i64], bool, bool) {
+    var raw = raw0
+    var quoted = false
+    if allow_quote and raw.len() > 1 and raw[0] == 34 and raw[raw.len() - 1] == 34 {
+        raw = raw.slice(1, raw.len() - 1)
+        quoted = true
+    }
+    if not raw.all(|c| valid_value_byte(c)) {
+        return ([], quoted, false)
+    }
+    return (raw, quoted, true)
+}
+
+/// `http.ParseCookie`: the pairs of a `Cookie` header.
+pub fn parse_cookie(line: bytes) -> [GoHttpCookie] ! GoHttpCookieError {
+    let b = line.to_list()
+    if b.filter(|c| c == 59).len() + 1 > 3000 {
+        fail(failed("http: number of cookies exceeded limit"))
+    }
+    let parts = split_on(trim(b), 59)
+    if parts.len() == 1 and parts[0].len() == 0 {
+        fail(failed("http: blank cookie"))
+    }
+    var cookies: [GoHttpCookie] = []
+    for p in parts {
+        let s = trim(p)
+        let eq = index_of(s, 61)
+        if eq < 0 {
+            fail(failed("http: '=' not found in cookie"))
+        }
+        if not is_token(s.slice(0, eq)) {
+            fail(failed("http: invalid cookie name"))
+        }
+        let (value, quoted, ok) = parse_value(s.slice(eq + 1, s.len()), true)
+        if not ok {
+            fail(failed("http: invalid cookie value"))
+        }
+        var c = new_cookie(text(s.slice(0, eq)), text(value))
+        c.quoted = quoted
+        cookies.push(c)
+    }
+    return cookies
+}
+
+fn printable(b: [i64]) -> bool {
+    return b.all(|c| c >= 32 and c <= 126)
+}
+
+fn lower_ascii(b: [i64]) -> str {
+    return text(b.map(|c| if c >= 65 and c <= 90 { c + 32 } else { c }))
+}
+
+/// `strconv.Atoi`.
+fn atoi(s: [i64]) -> Option[i64] {
+    if s.len() == 0 {
+        return None
+    }
+    let neg = s[0] == 45
+    let digits = if s[0] == 45 or s[0] == 43 { s.slice(1, s.len()) } else { s }
+    if digits.len() == 0 {
+        return None
+    }
+    if not digits.all(|c| c >= 48 and c <= 57) {
+        return None
+    }
+    if neg and bytes_of(digits).to_str() == "9223372036854775808" {
+        return Some(0 - 9223372036854775807 - 1)
+    }
+    var v = 0
+    for c in digits {
+        let d = c - 48
+        if v > (9223372036854775807 - d) / 10 {
+            return None
+        }
+        v = v * 10 + d
+    }
+    return Some(if neg { 0 - v } else { v })
+}
+
+fn parse_expires(val: str) -> Option[(i64, i64)] {
+    for layout in ["Mon, 02 Jan 2006 15:04:05 MST", "Mon, 02-Jan-2006 15:04:05 MST"] {
+        match gotimefmt.parse(layout, val) {
+            Ok(t) -> return Some((t.unix, t.nanos))
+            Err(_e) -> {}
+        }
+    }
+    return None
+}
+
+/// One attribute of a `Set-Cookie` line; false when it belongs in
+/// `unparsed`.
+fn set_attribute(inout c: GoHttpCookie, lower: str, val: [i64]) -> bool {
+    if lower == "samesite" {
+        if not printable(val) {
+            c.same_site = 1
+            return true
+        }
+        let v = lower_ascii(val)
+        c.same_site = if v == "lax" { 2 } else if v == "strict" { 3 } else if v == "none" { 4 } else { 1 }
+        return true
+    }
+    if lower == "secure" or lower == "httponly" or lower == "partitioned" {
+        c.secure = c.secure or lower == "secure"
+        c.http_only = c.http_only or lower == "httponly"
+        c.partitioned = c.partitioned or lower == "partitioned"
+        return true
+    }
+    if lower == "domain" or lower == "path" {
+        if lower == "domain" {
+            c.domain = text(val)
+        } else {
+            c.path = text(val)
+        }
+        return true
+    }
+    if lower == "max-age" {
+        let secs = atoi(val) ?? (0 - 1)
+        if atoi(val).is_none() or (secs != 0 and val[0] == 48) {
+            return false
+        }
+        c.max_age = if secs <= 0 { 0 - 1 } else { secs }
+        return true
+    }
+    if lower == "expires" {
+        c.raw_expires = text(val)
+        c.expires = parse_expires(text(val))
+        return c.expires.is_some()
+    }
+    return false
+}
+
+/// `http.ParseSetCookie`: one `Set-Cookie` header.
+pub fn parse_set_cookie(line: bytes) -> GoHttpCookie ! GoHttpCookieError {
+    let parts = split_on(trim(line.to_list()), 59)
+    if parts.len() == 1 and parts[0].len() == 0 {
+        fail(failed("http: blank cookie"))
+    }
+    let first = trim(parts[0])
+    let eq = index_of(first, 61)
+    if eq < 0 {
+        fail(failed("http: '=' not found in cookie"))
+    }
+    let name = trim(first.slice(0, eq))
+    if not is_token(name) {
+        fail(failed("http: invalid cookie name"))
+    }
+    let (value, quoted, ok) = parse_value(first.slice(eq + 1, first.len()), true)
+    if not ok {
+        fail(failed("http: invalid cookie value"))
+    }
+    var c = new_cookie(text(name), text(value))
+    c.quoted = quoted
+    c.raw = line
+    for k in 1..parts.len() {
+        let part = trim(parts[k])
+        if part.len() == 0 {
+            continue
+        }
+        let at = index_of(part, 61)
+        let attr = if at < 0 { part } else { part.slice(0, at) }
+        let raw_val = if at < 0 { [] } else { part.slice(at + 1, part.len()) }
+        if not printable(attr) {
+            continue
+        }
+        let (val, _q, good) = parse_value(raw_val, false)
+        if not good or not set_attribute(c, lower_ascii(attr), val) {
+            c.unparsed.push(bytes_of(part))
+        }
+    }
+    return c
+}
+
+// ---- writing
+
+fn sanitize(b: [i64], path: bool) -> [i64] {
+    return b.filter(|c| if path { valid_path_byte(c) } else { valid_value_byte(c) })
+}
+
+fn is_domain_name(s0: [i64]) -> bool {
+    if s0.len() == 0 or s0.len() > 255 {
+        return false
+    }
+    let s = if s0[0] == 46 { s0.slice(1, s0.len()) } else { s0 }
+    var last = 46
+    var ok = false
+    var partlen = 0
+    for c in s {
+        if (c >= 97 and c <= 122) or (c >= 65 and c <= 90) {
+            ok = true
+            partlen = partlen + 1
+        } else if c >= 48 and c <= 57 {
+            partlen = partlen + 1
+        } else if c == 45 {
+            if last == 46 {
+                return false
+            }
+            partlen = partlen + 1
+        } else if c == 46 {
+            if last == 46 or last == 45 or partlen > 63 or partlen == 0 {
+                return false
+            }
+            partlen = 0
+        } else {
+            return false
+        }
+        last = c
+    }
+    return ok and last != 45 and partlen <= 63
+}
+
+/// `validCookieDomain`: a host name, or an IP address without a colon.
+fn valid_domain(d: str) -> bool {
+    if is_domain_name(d.to_bytes().to_list()) {
+        return true
+    }
+    let ip = match gonetip.parse_addr(d) {
+        Ok(a) -> gonetip.zone(a).len() == 0
+        Err(_e) -> false
+    }
+    return ip and not d.contains(":")
+}
+
+fn floor_div(a: i64, b: i64) -> i64 {
+    let q = a / b
+    return if (a % b != 0) and ((a < 0) != (b < 0)) { q - 1 } else { q }
+}
+
+/// The UTC year of a moment.
+fn year_of(unix: i64) -> i64 {
+    let z = floor_div(unix, 86400) + 719468
+    let era = floor_div(z, 146097)
+    let doe = z - era * 146097
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100)
+    let mp = (5 * doy + 2) / 153
+    let m = if mp < 10 { mp + 3 } else { mp - 9 }
+    return yoe + era * 400 + (if m <= 2 { 1 } else { 0 })
+}
+
+fn is_zero_time(e: (i64, i64)) -> bool {
+    return e.0 == 0 - 62135596800 and e.1 == 0
+}
+
+/// `Cookie.String`: the `Set-Cookie` value Go writes; "" for a cookie
+/// whose name is not a token.
+pub fn cookie_string(c: GoHttpCookie) -> str {
+    if not is_token(c.name.to_bytes().to_list()) {
+        return ""
+    }
+    var out = c.name + "="
+    let v = sanitize(c.value.to_bytes().to_list(), false)
+    if v.len() > 0 {
+        out = out + (if v.contains(32) or v.contains(44) or c.quoted { "\"" + text(v) + "\"" } else { text(v) })
+    }
+    if c.path.len() > 0 {
+        out = out + "; Path=" + text(sanitize(c.path.to_bytes().to_list(), true))
+    }
+    if c.domain.len() > 0 and valid_domain(c.domain) {
+        out = out + "; Domain=" + (if c.domain.starts_with(".") { c.domain.substr(1, c.domain.len() - 1) } else { c.domain })
+    }
+    match c.expires {
+        Some(e) -> if year_of(e.0) >= 1601 {
+            out = out + "; Expires=" + gotimefmt.format(gotimefmt.new_time(e.0, e.1, 0, "UTC"), "Mon, 02 Jan 2006 15:04:05 GMT")
+        }
+        None -> {}
+    }
+    if c.max_age > 0 {
+        out = out + "; Max-Age=" + c.max_age.to_str()
+    } else if c.max_age < 0 {
+        out = out + "; Max-Age=0"
+    }
+    if c.http_only {
+        out = out + "; HttpOnly"
+    }
+    if c.secure {
+        out = out + "; Secure"
+    }
+    out = out + (if c.same_site == 4 { "; SameSite=None" } else if c.same_site == 2 { "; SameSite=Lax" } else if c.same_site == 3 { "; SameSite=Strict" } else { "" })
+    if c.partitioned {
+        out = out + "; Partitioned"
+    }
+    return out
+}
+
+fn first_bad(b: [i64], path: bool) -> i64 {
+    for c in b {
+        if not (if path { valid_path_byte(c) } else { valid_value_byte(c) }) {
+            return c
+        }
+    }
+    return 0 - 1
+}
+
+/// `Cookie.Valid`: the first problem Go finds, or nothing.
+pub fn cookie_valid(c: GoHttpCookie) -> () ! GoHttpCookieError {
+    if not is_token(c.name.to_bytes().to_list()) {
+        fail(failed("http: invalid Cookie.Name"))
+    }
+    match c.expires {
+        Some(e) -> if not is_zero_time(e) and year_of(e.0) < 1601 {
+            fail(failed("http: invalid Cookie.Expires"))
+        }
+        None -> {}
+    }
+    let bv = first_bad(c.value.to_bytes().to_list(), false)
+    if bv >= 0 {
+        fail(failed("http: invalid byte " + goquote.quote_rune(bv) + " in Cookie.Value"))
+    }
+    let bp = first_bad(c.path.to_bytes().to_list(), true)
+    if bp >= 0 {
+        fail(failed("http: invalid byte " + goquote.quote_rune(bp) + " in Cookie.Path"))
+    }
+    if c.domain.len() > 0 and not valid_domain(c.domain) {
+        fail(failed("http: invalid Cookie.Domain"))
+    }
+    if c.partitioned and not c.secure {
+        fail(failed("http: partitioned cookies must be set with Secure"))
+    }
+}

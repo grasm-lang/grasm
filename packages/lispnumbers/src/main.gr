@@ -1,0 +1,247 @@
+// Common Lisp's `~R` family, as SBCL 2.6 prints integers with `format`:
+// English cardinals (`~R`), ordinals (`~:R`), Roman numerals (`~@R`) and
+// old Roman numerals (`~:@R`), and `~nR`, `~D`, `~B`, `~O`, `~X` with
+// their column, padding, sign and comma parameters.
+//
+// Lisp programs print cheques, ranks, chapter numbers and reports with
+// these; a program producing the same documents has to spell numbers the
+// same way:
+//
+//   - Cardinals have no "and" and hyphenate tens ("one hundred
+//     twenty-three"), name periods up to vigintillion, and refuse
+//     10^66 and past with `Number too large to print in English:
+//     1,000,...` (the number with commas).
+//   - Ordinals end in "th" after a round hundred ("one hundredth") and
+//     know "twelfth"; zero is "zeroth"; a negative number says "negative".
+//     The error for one too large names the number less its last two
+//     digits, as SBCL computes it.
+//   - Roman numerals run 1 to 3999 (subtractive) and old ones 1 to 4999
+//     ("IIII"); outside, SBCL says the number is "too large" -- zero and
+//     negatives included.
+//   - Radix printing uses capital letters past 9, pads on the left to
+//     `mincol`, and groups digits from the right with the comma character.
+import bigint
+
+/// SBCL's format error, with its message.
+type LispFormatError = | LispFormatError(msg: str)
+
+pub fn error_text(e: LispFormatError) -> str {
+    return match e {
+        LispFormatError(m) -> m
+    }
+}
+
+fn big(n: i64) -> BigInt {
+    return bigint.from_i64(n)
+}
+
+fn small(n: BigInt) -> i64 {
+    return bigint.to_i64(n) ?? 0
+}
+
+/// `~:D`: the decimal with commas every three digits.
+fn with_commas(n: BigInt) -> str {
+    let negative = bigint.sign(n) < 0
+    let digits = bigint.to_str(if negative { bigint.negate(n) } else { n })
+    return (if negative { "-" } else { "" }) + add_commas(digits, ",", 3)
+}
+
+/// format-add-commas: groups of `interval` from the right.
+fn add_commas(text: str, comma: str, interval: i64) -> str {
+    let cs = text.codes()
+    var out = ""
+    for i in 0..cs.len() {
+        if i > 0 and (cs.len() - i) % interval == 0 {
+            out = out + comma
+        }
+        out = out + cs[i].to_char()
+    }
+    return out
+}
+
+fn ones() -> [str] {
+    return ["", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine"]
+}
+
+fn tens() -> [str] {
+    return ["", "", "twenty", "thirty", "forty", "fifty", "sixty", "seventy", "eighty", "ninety"]
+}
+
+fn teens() -> [str] {
+    return ["ten", "eleven", "twelve", "thirteen", "fourteen", "fifteen", "sixteen", "seventeen", "eighteen", "nineteen"]
+}
+
+/// format-print-small-cardinal: 1..999.
+fn small_cardinal(n: i64) -> str {
+    let hundreds = n / 100
+    let rem = n % 100
+    var out = ""
+    if hundreds > 0 {
+        out = ones()[hundreds] + " hundred" + (if rem > 0 { " " } else { "" })
+    }
+    if rem > 0 {
+        let t = rem / 10
+        let o = rem % 10
+        if t > 1 {
+            out = out + tens()[t] + (if o > 0 { "-" + ones()[o] } else { "" })
+        } else if t == 1 {
+            out = out + teens()[o]
+        } else {
+            out = out + ones()[o]
+        }
+    }
+    return out
+}
+
+fn periods() -> [str] {
+    return ["", " thousand", " million", " billion", " trillion", " quadrillion", " quintillion", " sextillion", " septillion", " octillion", " nonillion",
+        " decillion", " undecillion", " duodecillion", " tredecillion", " quattuordecillion", " quindecillion", " sexdecillion", " septendecillion",
+        " octodecillion", " novemdecillion", " vigintillion"]
+}
+
+/// format-print-cardinal-aux: `n` > 0, from period `period`; `err` is the
+/// number the error names.
+fn cardinal_aux(n: BigInt, period: i64, err: BigInt) -> str ! LispFormatError {
+    let (beyond, here) = bigint.divmod(n, big(1000)) ?? (bigint.zero(), bigint.zero())
+    if period > 21 {
+        fail(LispFormatError("Number too large to print in English: " + with_commas(err)))
+    }
+    var out = ""
+    if not bigint.is_zero(beyond) {
+        out = try cardinal_aux(beyond, period + 1, err)
+    }
+    if not bigint.is_zero(here) {
+        if not bigint.is_zero(beyond) {
+            out = out + " "
+        }
+        out = out + small_cardinal(small(here)) + periods()[period]
+    }
+    return out
+}
+
+/// `~R`: the number in English.
+pub fn cardinal(n: BigInt) -> str ! LispFormatError {
+    if bigint.sign(n) < 0 {
+        return "negative " + (try cardinal_aux(bigint.negate(n), 0, n))
+    }
+    if bigint.is_zero(n) {
+        return "zero"
+    }
+    return try cardinal_aux(n, 0, n)
+}
+
+/// `~:R`: the ordinal in English.
+pub fn ordinal(n: BigInt) -> str ! LispFormatError {
+    let ordinal_ones = ["", "first", "second", "third", "fourth", "fifth", "sixth", "seventh", "eighth", "ninth"]
+    let ordinal_tens = ["", "tenth", "twentieth", "thirtieth", "fortieth", "fiftieth", "sixtieth", "seventieth", "eightieth", "ninetieth"]
+    var out = if bigint.sign(n) < 0 { "negative " } else { "" }
+    let number = if bigint.sign(n) < 0 { bigint.negate(n) } else { n }
+    let (top, botb) = bigint.divmod(number, big(100)) ?? (bigint.zero(), bigint.zero())
+    let bot = small(botb)
+    if not bigint.is_zero(top) {
+        out = out + (try cardinal(bigint.sub(number, botb)))
+    }
+    if not bigint.is_zero(top) and bot > 0 {
+        out = out + " "
+    }
+    let t = bot / 10
+    let o = bot % 10
+    if bot == 12 {
+        return out + "twelfth"
+    }
+    if t == 1 {
+        return out + teens()[o] + "th"
+    }
+    if t == 0 and o > 0 {
+        return out + ordinal_ones[o]
+    }
+    if o == 0 and t > 0 {
+        return out + ordinal_tens[t]
+    }
+    if bot > 0 {
+        return out + tens()[t] + "-" + ordinal_ones[o]
+    }
+    return out + (if bigint.sign(number) > 0 { "th" } else { "zeroth" })
+}
+
+fn roman_letters() -> [(str, i64)] {
+    return [("M", 1000), ("D", 500), ("C", 100), ("L", 50), ("X", 10), ("V", 5), ("I", 1)]
+}
+
+/// `~:@R`: old Roman numerals (no subtraction), 1 to 4999.
+pub fn old_roman(n: BigInt) -> str ! LispFormatError {
+    if bigint.sign(n) <= 0 or bigint.compare(n, big(5000)) >= 0 {
+        fail(LispFormatError("Number too large to print in old Roman numerals: " + with_commas(n)))
+    }
+    var v = small(n)
+    var out = ""
+    for (letter, value) in roman_letters() {
+        while v >= value {
+            out = out + letter
+            v = v - value
+        }
+    }
+    return out
+}
+
+/// `~@R`: Roman numerals, 1 to 3999.
+pub fn roman(n: BigInt) -> str ! LispFormatError {
+    if bigint.sign(n) <= 0 or bigint.compare(n, big(4000)) >= 0 {
+        fail(LispFormatError("Number too large to print in Roman numerals: " + with_commas(n)))
+    }
+    let subs = [("C", 100), ("C", 100), ("X", 10), ("X", 10), ("I", 1), ("I", 1), ("", 0)]
+    var v = small(n)
+    var out = ""
+    let letters = roman_letters()
+    for k in 0..letters.len() {
+        let (letter, value) = letters[k]
+        while v >= value {
+            out = out + letter
+            v = v - value
+        }
+        let (sub, sub_value) = subs[k]
+        if sub_value > 0 and v >= value - sub_value {
+            out = out + sub + letter
+            v = v - (value - sub_value)
+        }
+    }
+    return out
+}
+
+/// A non-negative number's digits in `base`, capitals past 9.
+fn digits_in(n: BigInt, base: i64) -> str {
+    if bigint.is_zero(n) {
+        return "0"
+    }
+    let alphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    var rev: [str] = []
+    var v = n
+    while not bigint.is_zero(v) {
+        let (q, r) = bigint.divmod(v, big(base)) ?? (bigint.zero(), bigint.zero())
+        rev.push(alphabet.substr(small(r), 1))
+        v = q
+    }
+    var out = ""
+    var k = rev.len() - 1
+    while k >= 0 {
+        out = out + rev[k]
+        k = k - 1
+    }
+    return out
+}
+
+/// `~mincol,padchar,commachar,commaintervalR` with radix `base` (and
+/// `~D ~B ~O ~X`): `commas` is the `:` modifier, `sign` the `@`.
+pub fn radix(n: BigInt, base: i64, mincol: i64, padchar: str, commachar: str, interval: i64, commas: bool, sign: bool) -> str {
+    let negative = bigint.sign(n) < 0
+    let digits = digits_in(if negative { bigint.negate(n) } else { n }, base)
+    let commaed = if commas { add_commas(digits, commachar, interval) } else { digits }
+    let signed = (if negative { "-" } else if sign { "+" } else { "" }) + commaed
+    var pad = ""
+    var len = signed.codes().len()
+    while len < mincol {
+        pad = pad + padchar
+        len = len + 1
+    }
+    return pad + signed
+}

@@ -1,0 +1,341 @@
+// Java's `java.text.SimpleDateFormat(pattern, Locale.US)` with its time
+// zone set to GMT, as Java 17 compiles a pattern and formats an instant.
+//
+// Older Java code -- servlet containers, log4j 1 layouts, JDBC drivers,
+// most Java written before `java.time` -- writes dates with this class,
+// and something reading those logs or matching that output needs its
+// rules, which are not `DateTimeFormatter`'s:
+//
+//   - Letters are `G y M d k H m s S E D F w W a h K z Z Y u X L`. A count
+//     pads a number with zeros to that many digits (to at most 309, where
+//     Java's number formatter stops), except `yy` and `YY`, which keep the
+//     last two digits. `M` and `L` with three letters are short names and
+//     with four or more full; `E` with fewer than four is short. `k` writes
+//     midnight as 24 and `h` as 12; `S` is milliseconds, padded, never a
+//     fraction.
+//   - Weeks are Locale.US weeks (Sunday first, one day enough): `w` week of
+//     year, `W` week of month, `Y` the year those weeks belong to, `F` the
+//     day-of-week-in-month count, `u` the ISO day number (Monday 1).
+//   - The zone is GMT, so `z` is `GMT` (`zzzz` `Greenwich Mean Time`), `Z`
+//     is `+0000` and `X` is `Z`.
+//   - Any other ASCII letter is `Illegal pattern character 'b'`; text in
+//     single quotes is literal, `''` is a quote inside or outside them, and
+//     a quote left open is `Unterminated quote`; four or more `X` are
+//     `invalid ISO 8601 format: length=4`, reported when the run ends, so an
+//     illegal letter right after one is reported first.
+//
+// Instants are milliseconds since 1970 in GMT. Java's `GregorianCalendar`
+// switches to the Julian calendar before 1582-10-15, which shifts dates,
+// day-of-year and week numbers around that cutover; this package formats
+// instants from 1584-01-01T00:00:00Z on (Gregorian years whose weeks the
+// cutover does not touch) and refuses earlier ones.
+//
+// Not here: parsing, locales other than Locale.US, time zones other
+// than GMT, and a two-digit-year start (it only matters to parsing).
+
+type JavaSdfError =
+    | JavaSdfIllegalArgument(message: str)
+    | JavaSdfOutOfRange(millis: i64)
+
+/// The exception's message (or, for an instant before 1584, why it is
+/// refused).
+pub fn error_text(e: JavaSdfError) -> str {
+    return match e {
+        JavaSdfIllegalArgument(m) -> m
+        JavaSdfOutOfRange(ms) -> "instant " + ms.to_str() + " is before 1584-01-01T00:00:00Z"
+    }
+}
+
+/// A compiled element: a literal, or a pattern letter and its count.
+type JavaSdfPart = | JsdfLiteral(text: str) | JsdfField(letter: str, count: i64)
+
+type JavaSimpleDateFormat = { parts: [JavaSdfPart] }
+
+fn letter_code(c: str) -> bool {
+    let x = c.code_at(0)
+    return (x >= 97 and x <= 122) or (x >= 65 and x <= 90)
+}
+
+/// `encode`: a finished run of letters.
+fn flush(inout parts: [JavaSdfPart], tag: str, count: i64) -> () ! JavaSdfError {
+    if count == 0 {
+        return
+    }
+    if tag == "X" and count >= 4 {
+        fail(JavaSdfIllegalArgument("invalid ISO 8601 format: length=" + count.to_str()))
+    }
+    parts.push(JsdfField(tag, count))
+}
+
+/// The quoted text that starts after the quote at `at`: the text and the
+/// position of the closing quote.
+fn quoted(chars: [str], at: i64) -> (str, i64) {
+    var buf = ""
+    var i = at + 1
+    while i < chars.len() {
+        if chars[i] == "'" {
+            if i + 1 < chars.len() and chars[i + 1] == "'" {
+                buf = buf + "'"
+                i = i + 2
+                continue
+            }
+            return (buf, i)
+        }
+        buf = buf + chars[i]
+        i = i + 1
+    }
+    return (buf, 0 - 1)
+}
+
+/// `new SimpleDateFormat(pattern, Locale.US)`.
+pub fn compile(pattern: str) -> JavaSimpleDateFormat ! JavaSdfError {
+    let chars = pattern.chars()
+    var parts: [JavaSdfPart] = []
+    var tag = ""
+    var count = 0
+    var i = 0
+    while i < chars.len() {
+        let c = chars[i]
+        if c == "'" {
+            try flush(parts, tag, count)
+            tag = ""
+            count = 0
+            if i + 1 < chars.len() and chars[i + 1] == "'" {
+                parts.push(JsdfLiteral("'"))
+                i = i + 2
+                continue
+            }
+            let (text, end) = quoted(chars, i)
+            if end < 0 {
+                fail(JavaSdfIllegalArgument("Unterminated quote"))
+            }
+            parts.push(JsdfLiteral(text))
+            i = end + 1
+            continue
+        }
+        if not letter_code(c) {
+            try flush(parts, tag, count)
+            tag = ""
+            count = 0
+            parts.push(JsdfLiteral(c))
+            i = i + 1
+            continue
+        }
+        if not "GyMdkHmsSEDFwWahKzZYuXL".contains(c) {
+            fail(JavaSdfIllegalArgument("Illegal pattern character '" + c + "'"))
+        }
+        if tag == "" or tag == c {
+            tag = c
+            count = count + 1
+        } else {
+            try flush(parts, tag, count)
+            tag = c
+            count = 1
+        }
+        i = i + 1
+    }
+    try flush(parts, tag, count)
+    return JavaSimpleDateFormat{ parts: parts }
+}
+
+// ---- the calendar, in Rata Die days (day 1 is 0001-01-01, a Monday)
+
+fn floor_div(a: i64, b: i64) -> i64 {
+    let q = a / b
+    return if (a % b != 0) and ((a < 0) != (b < 0)) { q - 1 } else { q }
+}
+
+fn floor_mod(a: i64, b: i64) -> i64 {
+    return a - floor_div(a, b) * b
+}
+
+fn is_leap(y: i64) -> bool {
+    return y % 4 == 0 and (y % 100 != 0 or y % 400 == 0)
+}
+
+/// The Rata Die day of a Gregorian date.
+fn fixed_date(y: i64, m: i64, d: i64) -> i64 {
+    let p = y - 1
+    var days = 365 * p + floor_div(p, 4) - floor_div(p, 100) + floor_div(p, 400) + (367 * m - 362) / 12 + d
+    if m > 2 {
+        days = days - (if is_leap(y) { 1 } else { 2 })
+    }
+    return days
+}
+
+/// The Gregorian date of a Rata Die day.
+fn civil(fixed: i64) -> (i64, i64, i64) {
+    let z = fixed - 1 - 719162 + 719468
+    let era = floor_div(z, 146097)
+    let doe = z - era * 146097
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100)
+    let mp = (5 * doy + 2) / 153
+    let d = doy - (153 * mp + 2) / 5 + 1
+    let m = if mp < 10 { mp + 3 } else { mp - 9 }
+    return (yoe + era * 400 + (if m <= 2 { 1 } else { 0 }), m, d)
+}
+
+/// Day of week of a Rata Die day, Sunday 1.
+fn day_of_week(fixed: i64) -> i64 {
+    return floor_mod(fixed, 7) + 1
+}
+
+/// `getDayOfWeekDateOnOrBefore(fixed, Sunday)`.
+fn sunday_on_or_before(fixed: i64) -> i64 {
+    return fixed - floor_mod(fixed, 7)
+}
+
+/// `getWeekNumber`: weeks start on Sunday and one day makes a first week.
+fn week_number(day1: i64, fixed: i64) -> i64 {
+    var first = sunday_on_or_before(day1 + 6)
+    if first - day1 >= 1 {
+        first = first - 7
+    }
+    return floor_div(fixed - first, 7) + 1
+}
+
+/// The calendar fields Java computes for one instant.
+type JavaSdfFields = {
+    year: i64,
+    month: i64,
+    day: i64,
+    dow: i64,
+    doy: i64,
+    week_of_year: i64,
+    week_of_month: i64,
+    week_year: i64,
+    hour: i64,
+    minute: i64,
+    second: i64,
+    milli: i64,
+}
+
+fn week_of_year(y: i64, jan1: i64, fixed: i64) -> i64 {
+    let w = week_number(jan1, fixed)
+    if w == 0 {
+        let prev = jan1 - (if is_leap(y - 1) { 366 } else { 365 })
+        return week_number(prev, jan1 - 1)
+    }
+    if w >= 52 {
+        let next = jan1 + (if is_leap(y) { 366 } else { 365 })
+        let next_first = sunday_on_or_before(next + 6)
+        if next_first - next >= 1 and fixed >= next_first - 7 {
+            return 1
+        }
+    }
+    return w
+}
+
+fn fields_of(ms: i64) -> JavaSdfFields {
+    let days = floor_div(ms, 86400000)
+    let tod = ms - days * 86400000
+    let fixed = days + 719163
+    let (y, m, d) = civil(fixed)
+    let jan1 = fixed_date(y, 1, 1)
+    let woy = week_of_year(y, jan1, fixed)
+    let wy = if m == 1 and woy >= 52 { y - 1 } else if m != 1 and woy == 1 { y + 1 } else { y }
+    return JavaSdfFields{ year: y, month: m, day: d, dow: day_of_week(fixed), doy: fixed - jan1 + 1, week_of_year: woy,
+        week_of_month: week_number(fixed - d + 1, fixed), week_year: wy, hour: tod / 3600000, minute: tod / 60000 % 60, second: tod / 1000 % 60,
+        milli: tod % 1000 }
+}
+
+// ---- printing
+
+/// `zeroPaddingNumber(value, count, max)`; Java's number format pads to
+/// at most 309 digits.
+fn padded(value: i64, count: i64) -> str {
+    let digits = value.to_str()
+    return "0".repeat((count.min(309) - digits.len()).max(0)) + digits
+}
+
+fn month_name(m: i64, count: i64) -> str {
+    let names = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"]
+    return if count >= 4 { names[m - 1] } else { names[m - 1].substr(0, 3) }
+}
+
+fn field_text(f: JavaSdfFields, letter: str, count: i64) -> str {
+    if letter == "G" {
+        return "AD"
+    }
+    if letter == "y" or letter == "Y" {
+        let v = if letter == "y" { f.year } else { f.week_year }
+        return if count == 2 { padded(v % 100, 2) } else { padded(v, count) }
+    }
+    if letter == "M" or letter == "L" {
+        return if count >= 3 { month_name(f.month, count) } else { padded(f.month, count) }
+    }
+    if letter == "E" {
+        let days = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]
+        return if count >= 4 { days[f.dow - 1] } else { days[f.dow - 1].substr(0, 3) }
+    }
+    if letter == "a" {
+        return if f.hour < 12 { "AM" } else { "PM" }
+    }
+    if letter == "z" {
+        return if count >= 4 { "Greenwich Mean Time" } else { "GMT" }
+    }
+    if letter == "Z" {
+        return "+0000"
+    }
+    if letter == "X" {
+        return "Z"
+    }
+    return padded(number_of(f, letter), count)
+}
+
+fn number_of(f: JavaSdfFields, letter: str) -> i64 {
+    if letter == "d" {
+        return f.day
+    }
+    if letter == "k" {
+        return if f.hour == 0 { 24 } else { f.hour }
+    }
+    if letter == "H" {
+        return f.hour
+    }
+    if letter == "m" {
+        return f.minute
+    }
+    if letter == "s" {
+        return f.second
+    }
+    if letter == "S" {
+        return f.milli
+    }
+    if letter == "D" {
+        return f.doy
+    }
+    if letter == "F" {
+        return (f.day - 1) / 7 + 1
+    }
+    if letter == "w" {
+        return f.week_of_year
+    }
+    if letter == "W" {
+        return f.week_of_month
+    }
+    if letter == "h" {
+        return if f.hour % 12 == 0 { 12 } else { f.hour % 12 }
+    }
+    if letter == "K" {
+        return f.hour % 12
+    }
+    return if f.dow == 1 { 7 } else { f.dow - 1 }
+}
+
+/// `format(new Date(millis))` in GMT, for instants from 1584 on.
+pub fn format(f: JavaSimpleDateFormat, millis: i64) -> str ! JavaSdfError {
+    if millis < 0 - 12181017600000 {
+        fail(JavaSdfOutOfRange(millis))
+    }
+    let fields = fields_of(millis)
+    var out = ""
+    for p in f.parts {
+        out = out + match p {
+            JsdfLiteral(t) -> t
+            JsdfField(l, n) -> field_text(fields, l, n)
+        }
+    }
+    return out
+}

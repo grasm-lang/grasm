@@ -1,0 +1,373 @@
+// The harness scripts/b55_diff.sh drives: each argument pair is an
+// operation and a file of cases, one per line; each answer is one line.
+import nodepathwin32
+import javaintegers
+import jqformat
+import luapack
+import luautf8
+import rubyinspect
+import rubynumparse
+import bigint
+import sqlitelike
+
+fn unhex_list(h: str) -> [i64] {
+    if h == "-" {
+        return []
+    }
+    var out: [i64] = []
+    let b = h.to_bytes()
+    var i = 0
+    while i + 1 < b.len() {
+        let hi = b.at(i)
+        let lo = b.at(i + 1)
+        out.push((if hi >= 97 { hi - 87 } else { hi - 48 }) * 16 + (if lo >= 97 { lo - 87 } else { lo - 48 }))
+        i = i + 2
+    }
+    return out
+}
+
+fn unhex(h: str) -> str {
+    return bytes_of(unhex_list(h)).to_str()
+}
+
+fn hex_bytes(b: bytes) -> str {
+    let digits = "0123456789abcdef"
+    let h = b.to_list().map(|x| digits.substr(x.ushr(4), 1) + digits.substr(x.bit_and(15), 1)).join("")
+    return if h.len() == 0 { "-" } else { h }
+}
+
+fn hex_u64(h: str) -> i64 {
+    var v = 0
+    for c in h.codes() {
+        let d = if c >= 97 { c - 87 } else if c >= 65 { c - 55 } else { c - 48 }
+        v = v.shl(4).bit_or(d)
+    }
+    return v
+}
+
+/// A value: `z` NULL, `i<decimal>`, `n<hex of a double>`, `t<hex>` TEXT,
+/// `b<hex>` BLOB.
+fn sql_value(v: str) -> SqlValue {
+    let body = v.substr(1, v.len() - 1)
+    if v == "z" {
+        return SqlNull
+    }
+    if v.starts_with("n") {
+        return SqlFloat(hex_u64(body).from_bits())
+    }
+    if v.starts_with("i") {
+        return SqlInteger(body.parse_int() ?? 0)
+    }
+    if v.starts_with("b") {
+        return SqlBlob(bytes_of(unhex_list(body)))
+    }
+    return SqlText(unhex(body))
+}
+
+/// `l pattern text [escape]` or `g pattern text`.
+fn like_or_glob(f: [str]) -> Option[bool] ! LikeError {
+    if f[0] == "g" {
+        return try sqlitelike.glob(sql_value(f[2]), sql_value(f[1]))
+    }
+    return try sqlitelike.like(sql_value(f[2]), sql_value(f[1]), if f.len() > 3 { Some(sql_value(f[3])) } else { None })
+}
+
+fn sqlitelike_line(f: [str]) -> str {
+    return match like_or_glob(f) {
+        Ok(Some(true)) -> "1"
+        Ok(Some(false)) -> "0"
+        Ok(None) -> "null"
+        Err(e) -> "E:" + sqlitelike.error_text(e)
+    }
+}
+
+fn hex_text(t: str) -> str {
+    return hex_bytes(t.to_bytes())
+}
+
+fn nodepathwin32_line(f: [str]) -> str {
+    let a = f.slice(1, f.len()).map(|h| unhex(h))
+    let op = f[0]
+    if op == "norm" {
+        return hex_text(nodepathwin32.normalize(a[0]))
+    }
+    if op == "abs" {
+        return if nodepathwin32.is_absolute(a[0]) { "true" } else { "false" }
+    }
+    if op == "join" {
+        return hex_text(nodepathwin32.join(a))
+    }
+    if op == "res" {
+        return hex_text(nodepathwin32.resolve(a.slice(1, a.len()), a[0]))
+    }
+    if op == "rel" {
+        return hex_text(nodepathwin32.relative(a[1], a[2], a[0]))
+    }
+    if op == "ns" {
+        return hex_text(nodepathwin32.to_namespaced_path(a[1], a[0]))
+    }
+    if op == "dir" {
+        return hex_text(nodepathwin32.dirname(a[0]))
+    }
+    if op == "base" {
+        return hex_text(nodepathwin32.basename(a[0], if a.len() > 1 { Some(a[1]) } else { None }))
+    }
+    if op == "ext" {
+        return hex_text(nodepathwin32.extname(a[0]))
+    }
+    if op == "parse" {
+        let p = nodepathwin32.parse(a[0])
+        return [p.root, p.dir, p.base, p.ext, p.name].map(|x| hex_text(x)).join(".")
+    }
+    return hex_text(nodepathwin32.format(Win32Path{ root: a[0], dir: a[1], base: a[2], ext: a[3], name: a[4] }))
+}
+
+fn rubyinspect_line(f: [str]) -> str {
+    let data = bytes_of(unhex_list(f[1]))
+    if f[0] == "i" {
+        return hex_text(rubyinspect.inspect(data, f[2] == "1"))
+    }
+    if f[0] == "d" {
+        return hex_text(rubyinspect.dump(data, f[2] == "1"))
+    }
+    return match rubyinspect.undump(data.to_str()) {
+        Ok(u) -> hex_bytes(u.data) + "|" + u.encoding
+        Err(e) -> "E:" + rubyinspect.error_text(e)
+    }
+}
+
+fn bits_hex(f: f64) -> str {
+    let digits = "0123456789abcdef"
+    let b = f.to_bits()
+    var out = ""
+    for k in 0..16 {
+        out = out + digits.substr(b.ushr(60 - 4 * k).bit_and(15), 1)
+    }
+    return out
+}
+
+fn int_op(f: [str], s: bytes) -> BigInt ! RubyNumError {
+    if f[0] == "ti" {
+        return try rubynumparse.to_i(s, f[2].parse_int() ?? 0)
+    }
+    return try rubynumparse.integer(s, if f[2] == "-" { None } else { Some(f[2].parse_int() ?? 0) })
+}
+
+fn rubynumparse_line(f: [str]) -> str {
+    let s = bytes_of(unhex_list(f[1]))
+    if f[0] == "tf" {
+        return bits_hex(rubynumparse.to_f(s))
+    }
+    if f[0] == "ff" {
+        return match rubynumparse.float(s) {
+            Ok(v) -> bits_hex(v)
+            Err(e) -> "E:" + rubynumparse.error_text(e)
+        }
+    }
+    return match int_op(f, s) {
+        Ok(v) -> bigint.to_str(v)
+        Err(e) -> "E:" + rubynumparse.error_text(e)
+    }
+}
+
+fn lua_value(v: str) -> LuaValue {
+    let k = v.substr(0, 1)
+    let body = v.substr(1, v.len() - 1)
+    if k == "n" {
+        return LuaNil
+    }
+    if k == "t" or k == "f" {
+        return LuaBool(k == "t")
+    }
+    if k == "T" {
+        return LuaTable
+    }
+    if k == "i" {
+        return LuaInt(body.parse_int() ?? 0)
+    }
+    if k == "d" {
+        return LuaFloat(hex_u64(body).from_bits())
+    }
+    return LuaStr(bytes_of(unhex_list(body)))
+}
+
+fn lua_show(v: LuaValue) -> str {
+    return match v {
+        LuaInt(i) -> "i:" + i.to_str()
+        LuaFloat(f) -> "f:" + bits_hex(f)
+        LuaStr(s) -> "s:" + hex_bytes(s)
+        _ -> "?"
+    }
+}
+
+fn luapack_line(f: [str]) -> str {
+    let fmt = bytes_of(unhex_list(f[1]))
+    if f[0] == "p" {
+        return match luapack.pack(fmt, f.slice(2, f.len()).map(|v| lua_value(v))) {
+            Ok(b) -> "s:" + hex_bytes(b)
+            Err(e) -> "E:" + luapack.error_text(e)
+        }
+    }
+    if f[0] == "z" {
+        return match luapack.packsize(fmt) {
+            Ok(n) -> "i:" + n.to_str()
+            Err(e) -> "E:" + luapack.error_text(e)
+        }
+    }
+    return match luapack.unpack(fmt, bytes_of(unhex_list(f[2])), f[3].parse_int() ?? 1) {
+        Ok((vs, next)) -> vs.map(|v| lua_show(v)).join(",") + ";" + next.to_str()
+        Err(e) -> "E:" + luapack.error_text(e)
+    }
+}
+
+fn b64(t: str) -> str {
+    return jqformat.format("base64", JqString(t)) ?? ""
+}
+
+fn jqformat_line(f: [str]) -> str {
+    let v = match jqformat.parse(unhex(f[1])) {
+        Ok(v) -> v
+        Err(_e) -> return "bad input"
+    }
+    return match jqformat.format(f[0], v) {
+        Ok(t) -> b64(t)
+        Err(e) -> "E:" + b64(jqformat.error_text(e))
+    }
+}
+
+fn opt_int(v: str) -> Option[i64] {
+    return if v == "_" { None } else { Some(v.parse_int() ?? 0) }
+}
+
+fn luautf8_ints(r: [i64] ! LuaUtf8Error) -> str {
+    return match r {
+        Ok(cs) -> cs.map(|c| c.to_str()).join(",")
+        Err(e) -> "E:" + luautf8.error_text(e)
+    }
+}
+
+fn luautf8_line(f: [str]) -> str {
+    let op = f[0]
+    if op == "char" {
+        return match luautf8.char(f.slice(1, f.len()).map(|v| v.parse_int() ?? 0)) {
+            Ok(b) -> "s:" + hex_bytes(b)
+            Err(e) -> "E:" + luautf8.error_text(e)
+        }
+    }
+    let s = bytes_of(unhex_list(f[1]))
+    if op == "codes" {
+        return match luautf8.codes(s, f[2] == "T") {
+            Ok(ps) -> "c:" + ps.map(|p| p.0.to_str() + ":" + p.1.to_str()).join(" ")
+            Err(e) -> "E:" + luautf8.error_text(e)
+        }
+    }
+    if op == "codepoint" {
+        return luautf8_ints(luautf8.codepoint(s, f[2].parse_int() ?? 1, opt_int(f[3]), f[4] == "T"))
+    }
+    if op == "len" {
+        return match luautf8.len(s, f[2].parse_int() ?? 1, f[3].parse_int() ?? 0 - 1, f[4] == "T") {
+            Ok(Utf8Count(n)) -> n.to_str()
+            Ok(Utf8BadAt(p)) -> "fail," + p.to_str()
+            Err(e) -> "E:" + luautf8.error_text(e)
+        }
+    }
+    return match luautf8.offset(s, f[2].parse_int() ?? 0, opt_int(f[3])) {
+        Ok(Some((a, b))) -> a.to_str() + "," + b.to_str()
+        Ok(None) -> "fail"
+        Err(e) -> "E:" + luautf8.error_text(e)
+    }
+}
+
+fn javaint_parse(op: str, s: str, radix: i64) -> i64 ! JavaNumberError {
+    if op == "pi" {
+        return try javaintegers.parse_int(s, radix)
+    }
+    if op == "pl" {
+        return try javaintegers.parse_long(s, radix)
+    }
+    if op == "pui" {
+        return try javaintegers.parse_unsigned_int(s, radix)
+    }
+    if op == "pul" {
+        return try javaintegers.parse_unsigned_long(s, radix)
+    }
+    if op == "di" {
+        return try javaintegers.decode_int(s)
+    }
+    return try javaintegers.decode_long(s)
+}
+
+fn javaintegers_line(f: [str]) -> str {
+    let op = f[0]
+    if op == "pi" or op == "pl" or op == "pui" or op == "pul" or op == "di" or op == "dl" {
+        let radix = if f.len() > 2 { f[2].parse_int() ?? 10 } else { 10 }
+        return match javaint_parse(op, unhex(f[1]), radix) {
+            Ok(v) -> v.to_str()
+            Err(e) -> "E:" + javaintegers.error_text(e)
+        }
+    }
+    let v = f[1].parse_int() ?? 0
+    let radix = f[2].parse_int() ?? 10
+    let bits = f[3].parse_int() ?? 64
+    let w = if bits == 32 { wrap_int(v) } else { v }
+    if op == "ts" {
+        return javaintegers.to_string(w, radix)
+    }
+    if op == "tus" {
+        return javaintegers.to_unsigned_string(w, radix, bits)
+    }
+    if op == "th" {
+        return javaintegers.to_hex_string(w, bits)
+    }
+    if op == "to" {
+        return javaintegers.to_octal_string(w, bits)
+    }
+    return javaintegers.to_binary_string(w, bits)
+}
+
+fn wrap_int(v: i64) -> i64 {
+    let low = v.bit_and(4294967295)
+    return if low >= 2147483648 { low - 4294967296 } else { low }
+}
+
+fn main() / {io} {
+    let argv = args()
+    var i = 0
+    while i + 1 < argv.len() {
+        let op = argv[i]
+        let text = match read_bytes(argv[i + 1]) {
+            Ok(d) -> d.to_str()
+            Err(_e) -> ""
+        }
+        for l in text.split("\n").filter(|l| l.len() > 0) {
+            if op == "nodepathwin32" {
+                print(nodepathwin32_line(l.split(" ")))
+            }
+            if op == "rubyinspect" {
+                print(rubyinspect_line(l.split(" ")))
+            }
+            if op == "rubynumparse" {
+                print(rubynumparse_line(l.split(" ")))
+            }
+            if op == "luapack" {
+                print(luapack_line(l.split(" ")))
+            }
+            if op == "jqformat" {
+                let parts = l.split(" ")
+                print(jqformat_line(parts.slice(1, parts.len())))
+            }
+            if op == "luautf8" {
+                let parts = l.split(" ")
+                print(luautf8_line(parts.slice(1, parts.len())))
+            }
+            if op == "javaintegers" {
+                let parts = l.split(" ")
+                print(javaintegers_line(parts.slice(1, parts.len())))
+            }
+            if op == "sqlitelike" {
+                print(sqlitelike_line(l.split(" ")))
+            }
+        }
+        i = i + 2
+    }
+}

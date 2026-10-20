@@ -1,0 +1,8 @@
+[package]
+name = "nodematchesglob"
+version = "1.0.0"
+capabilities = []
+
+[dependencies.braceexpansion]
+path = "../braceexpansion"
+version = "^1.0.0"

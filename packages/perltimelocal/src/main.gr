@@ -1,0 +1,210 @@
+// Perl's Time::Local (version 1.30, as in Perl 5.34): `timegm`,
+// `timegm_nocheck`, `timegm_modern` and `timegm_posix` -- broken-down UTC
+// time to epoch seconds, with the module's year rules, range checks and
+// die messages.
+//
+// Perl programs turn parsed dates into epoch seconds with these (log
+// processors, cron replacements, report generators), and a program that
+// has to agree with them on a timestamp -- or on which dates they refuse --
+// needs the same rules:
+//
+//   - **Years**: `timegm` reads 1000 and up as a full year, 100..999 as
+//     years since 1900, and 0..99 by a rolling century: within 50 years of
+//     "now" (`70` is 2070 when now is 2026, `77` is 1977). Here "now" is a
+//     parameter, so the answer does not depend on the clock. `_modern`
+//     takes years as they are, `_posix` as years since 1900.
+//   - **Checks** (all but `_nocheck`): month 0..11, day within the month
+//     (29 February only in leap years), hour 0..23, minute 0..59, second
+//     [0, 60), and fewer than 365 * 2^31 days from the epoch -- each with
+//     Time::Local's croak text, `Day '29' out of range 1..28`, and
+//     `Day too big - ... > 783831531520` followed by `Cannot handle date
+//     (...)`.
+//   - **Arithmetic** is Perl's: integers stay integers (a double holding
+//     an integer counts as one), a fractional second (or minute, hour,
+//     day) makes the result a double, Perl prints it with `%.15g`, and
+//     the day count uses Perl's truncating `int` and
+//     floor-sign `%` -- so `_nocheck` dates far before year 0 and months
+//     outside 0..11 come out as the module computes them.
+//
+// Only the GM functions are here (the local-time ones depend on the
+// machine's zone). Months and years are integers; years beyond ±10^11 are
+// refused, so the seconds always fit the 64-bit integer Perl uses.
+//
+// Checked against `perl` 5.34's Time::Local, reloaded for each call with
+// `localtime` reporting the chosen year.
+
+import perlsprintf
+
+/// A Perl number: an integer (IV) or a double (NV).
+type TlNum = | TlInt(v: i64) | TlFloat(x: f64)
+
+/// The croak, with its message.
+type TimeLocalError = | TimeLocalDied(message: str) | TimeLocalRefused(why: str)
+
+fn as_float(n: TlNum) -> f64 {
+    return match n {
+        TlInt(v) -> v.as_f64()
+        TlFloat(x) -> x
+    }
+}
+
+/// The integer Perl's `+` and `*` use for an operand: an IV, or a double
+/// holding an integer below 2^53 (SvIV_please makes those IVs).
+fn iv_able(n: TlNum) -> Option[i64] {
+    return match n {
+        TlInt(v) -> Some(v)
+        TlFloat(x) -> if x == x.floor() and x.abs() < 9007199254740992.0 { Some(x.as_i64()) } else { None }
+    }
+}
+
+/// Perl's `+`: integer arithmetic when both operands are integers (and
+/// it does not overflow), else doubles.
+fn add(a: TlNum, b: TlNum) -> TlNum {
+    match iv_able(a) {
+        Some(x) -> match iv_able(b) {
+            Some(y) -> {
+                let s = x + y
+                if not (x >= 0 and y >= 0 and s < 0 or x < 0 and y < 0 and s >= 0) {
+                    return TlInt(s)
+                }
+            }
+            None -> {}
+        }
+        None -> {}
+    }
+    return TlFloat(as_float(a) + as_float(b))
+}
+
+fn mul_int(k: i64, b: TlNum) -> TlNum {
+    return match iv_able(b) {
+        Some(y) -> TlInt(k * y)
+        None -> TlFloat(k.as_f64() * as_float(b))
+    }
+}
+
+/// How Perl prints the number.
+pub fn num_text(n: TlNum) -> str {
+    return match n {
+        TlInt(v) -> v.to_str()
+        TlFloat(x) -> if x == 0.0 { "0" } else {
+            match perlsprintf.sprintf("%.15g", [PerlNum(x)]) {
+                Ok(r) -> r.text
+                Err(_e) -> "?"
+            }
+        }
+    }
+}
+
+fn less(a: TlNum, b: i64) -> bool {
+    return match a {
+        TlInt(v) -> v < b
+        TlFloat(x) -> x < b.as_f64()
+    }
+}
+
+fn greater(a: TlNum, b: i64) -> bool {
+    return match a {
+        TlInt(v) -> v > b
+        TlFloat(x) -> x > b.as_f64()
+    }
+}
+
+fn floor_mod(a: i64, b: i64) -> i64 {
+    let r = a % b
+    return if r != 0 and (r < 0) != (b < 0) { r + b } else { r }
+}
+
+fn is_leap(y: i64) -> bool {
+    if y % 4 != 0 {
+        return false
+    }
+    if y % 100 != 0 {
+        return true
+    }
+    return y % 400 == 0
+}
+
+/// The integer part of `_daygm`: days from year 0 by the module's
+/// formula, with Perl's truncating `int`.
+fn day_formula(month0: i64, year0: i64) -> i64 {
+    let month = floor_mod(month0 + 10, 12)
+    let year = year0 + 1900 - month / 10
+    return 365 * year + year / 4 - year / 100 + year / 400 + (month * 306 + 5) / 10
+}
+
+/// `_daygm`: days since 1970-01-01 for a day of a month of a year (years
+/// since 1900).
+fn daygm(mday: TlNum, month: i64, year: i64) -> TlNum {
+    let epoc = 1 + day_formula(0, 70)
+    return add(mday, TlInt(day_formula(month, year) - epoc))
+}
+
+fn month_days(month: i64, year: i64) -> i64 {
+    let days = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    return days[month] + (if month == 1 and is_leap(year + 1900) { 1 } else { 0 })
+}
+
+fn died(m: str) -> TimeLocalError {
+    return TimeLocalDied(m)
+}
+
+fn range_checks(sec: TlNum, min: TlNum, hour: TlNum, mday: TlNum, month: i64, year: i64) -> () ! TimeLocalError {
+    if month > 11 or month < 0 {
+        fail(died("Month '" + month.to_str() + "' out of range 0..11"))
+    }
+    let md = month_days(month, year)
+    if greater(mday, md) or less(mday, 1) {
+        fail(died("Day '" + num_text(mday) + "' out of range 1.." + md.to_str()))
+    }
+    if greater(hour, 23) or less(hour, 0) {
+        fail(died("Hour '" + num_text(hour) + "' out of range 0..23"))
+    }
+    if greater(min, 59) or less(min, 0) {
+        fail(died("Minute '" + num_text(min) + "' out of range 0..59"))
+    }
+    if not less(sec, 60) or less(sec, 0) {
+        fail(died("Second '" + num_text(sec) + "' out of range 0..59"))
+    }
+    return ()
+}
+
+/// `variant(sec, min, hour, mday, month, year)` for `timegm`,
+/// `timegm_nocheck`, `timegm_modern` or `timegm_posix`, with the current
+/// year (in full, e.g. 2026) given for the two-digit-year window.
+pub fn timegm(variant: str, this_year: i64, sec: TlNum, min: TlNum, hour: TlNum, mday: TlNum, month: i64, year0: i64) -> TlNum ! TimeLocalError {
+    if not (variant == "timegm" or variant == "timegm_nocheck" or variant == "timegm_modern" or variant == "timegm_posix") {
+        fail(TimeLocalRefused("unknown function " + variant))
+    }
+    if year0 > 100000000000 or year0 < 0 - 100000000000 {
+        fail(TimeLocalRefused("a year beyond ±10^11"))
+    }
+    let now = this_year - 1900
+    let breakpoint = floor_mod(now + 50, 100)
+    var next_century = now - floor_mod(now, 100)
+    if breakpoint < 50 {
+        next_century = next_century + 100
+    }
+    let century = next_century - 100
+    var year = year0
+    if variant == "timegm_modern" {
+        year = year - 1900
+    } else if variant != "timegm_posix" {
+        if year >= 1000 {
+            year = year - 1900
+        } else if year < 100 and year >= 0 {
+            year = year + (if year > breakpoint { century } else { next_century })
+        }
+    }
+    let check = variant != "timegm_nocheck"
+    if check {
+        try range_checks(sec, min, hour, mday, month, year)
+    }
+    let days = daygm(mday, month, year)
+    let max_day = 783831531520
+    if check and not (as_float(days).abs() < max_day.as_f64()) {
+        let big = if greater(days, max_day) { "Day too big - " + num_text(days) + " > " + max_day.to_str() + "\n" } else { "" }
+        fail(died(big + "Cannot handle date (" + [num_text(sec), num_text(min), num_text(hour), num_text(mday), month.to_str(), (year + 1900).to_str()].join(", ") + ")"))
+    }
+    let total = add(add(add(add(sec, TlInt(0)), mul_int(60, min)), mul_int(3600, hour)), mul_int(86400, days))
+    return total
+}

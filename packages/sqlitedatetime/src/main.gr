@@ -1,0 +1,953 @@
+// SQLite's date and time functions, as SQLite 3.51.1 computes them:
+// `date`, `time`, `datetime`, `julianday`, `unixepoch`, `strftime` and
+// `timediff`, with every modifier that does not ask the operating system.
+//
+// A great deal of data is stamped and queried through SQLite -- mobile
+// apps, browsers, embedded logs -- and a program reading that data has to
+// get the same answers out of the same text:
+//
+//   - A time value is `YYYY-MM-DD`, optionally with `HH:MM[:SS[.FFF]]`
+//     after a space or `T` and a `Z` or `+HH:MM` zone; or `HH:MM...` alone
+//     (on 2000-01-01); or a number, which is a Julian day if it can be
+//     one. Out of range, or malformed, and the answer is NULL (None here).
+//   - Values are sqlitefile's `SqlValue`, so a column read from a database
+//     file goes straight in: INTEGER and REAL are numbers, TEXT and BLOB
+//     are read as text up to the first NUL, and NULL gives NULL.
+//   - Modifiers: `+NNN days` (and seconds, minutes, hours, months, years,
+//     fractions allowed), `+YYYY-MM-DD HH:MM:SS`, `+HH:MM:SS`, `start of
+//     day|month|year`, `weekday N`, `unixepoch`, `julianday`, `auto`,
+//     `floor`, `ceiling`, `subsec`. Adding months keeps the day, so the
+//     31st of a short month rolls into the next unless `floor` follows.
+//   - `strftime` knows `%d %e %f %F %G %g %H %I %j %J %k %l %m %M %p %P %R
+//     %s %S %T %u %U %V %w %W %Y %%`; any other `%` gives NULL.
+//   - The arithmetic is SQLite's own, down to the bit: numbers are read
+//     by its double-double parser, the fused multiply-adds the arm64
+//     build performs are performed here, and `%J`, `%f` and subsecond
+//     `%s` are printed by its own printf (both from packages/sqliteprintf).
+//
+// What reads the clock or the time zone is left out: `now` (and calling
+// with no time value), `subsec` as a time value, and the `localtime` and
+// `utc` modifiers all give None.
+
+import pymath
+import sqlitefile
+import sqliteprintf
+
+/// What `unixepoch` returns: an integer, or a real with `subsec`.
+type UnixEpoch = | EpochInt(value: i64) | EpochReal(value: f64)
+
+type DateTime = {
+    jd: i64,
+    y: i64,
+    mo: i64,
+    d: i64,
+    h: i64,
+    mi: i64,
+    tz: i64,
+    s: f64,
+    valid_jd: bool,
+    valid_ymd: bool,
+    valid_hms: bool,
+    nfloor: i64,
+    raw_s: bool,
+    is_error: bool,
+    use_subsec: bool,
+}
+
+fn blank() -> DateTime {
+    return DateTime{ jd: 0, y: 0, mo: 0, d: 0, h: 0, mi: 0, tz: 0, s: 0.0, valid_jd: false, valid_ymd: false, valid_hms: false, nfloor: 0, raw_s: false,
+        is_error: false, use_subsec: false }
+}
+
+fn fma(x: f64, y: f64, z: f64) -> f64 {
+    return pymath.fma(x, y, z) ?? (x * y + z)
+}
+
+// ---- bytes, as the C code reads them
+
+fn at(z: [i64], i: i64) -> i64 {
+    return if i >= 0 and i < z.len() { z[i] } else { 0 }
+}
+
+fn is_space(c: i64) -> bool {
+    return c == 32 or (c >= 9 and c <= 13)
+}
+
+fn is_digit(c: i64) -> bool {
+    return c >= 48 and c <= 57
+}
+
+fn lower(c: i64) -> i64 {
+    return if c >= 65 and c <= 90 { c + 32 } else { c }
+}
+
+/// sqlite3_stricmp of the bytes from `from` against `word`.
+fn iequals(z: [i64], from: i64, word: str) -> bool {
+    let w = word.codes()
+    if z.len() - from != w.len() {
+        return false
+    }
+    for i in 0..w.len() {
+        if lower(z[from + i]) != lower(w[i]) {
+            return false
+        }
+    }
+    return true
+}
+
+/// sqlite3_strnicmp: the first `n` bytes agree, ignoring case.
+fn istarts(z: [i64], word: str, n: i64) -> bool {
+    let w = word.codes()
+    for i in 0..n {
+        if lower(at(z, i)) != lower(at(w, i)) {
+            return false
+        }
+        if at(w, i) == 0 {
+            return true
+        }
+    }
+    return true
+}
+
+// ---- reading a time value
+
+/// getDigits: fields of `N` digits between `min` and `max`, each followed
+/// by its separator, as "40f-21a-21d" spells them. The values read before
+/// the first failure.
+fn get_digits(z: [i64], from: i64, fmt: str) -> [i64] {
+    let f = fmt.codes()
+    let maxes = [12, 14, 24, 31, 59, 14712]
+    var out: [i64] = []
+    var pos = from
+    var k = 0
+    while k < f.len() {
+        let n = f[k] - 48
+        let min = f[k + 1] - 48
+        let max = maxes[f[k + 2] - 97]
+        let next = at(f, k + 3)
+        var val = 0
+        for _i in 0..n {
+            if not is_digit(at(z, pos)) {
+                return out
+            }
+            val = val * 10 + at(z, pos) - 48
+            pos = pos + 1
+        }
+        if val < min or val > max or (next != 0 and next != at(z, pos)) {
+            return out
+        }
+        out.push(val)
+        pos = pos + 1
+        if next == 0 {
+            return out
+        }
+        k = k + 4
+    }
+    return out
+}
+
+/// parseTimezone: true where the text after the time is not a zone.
+fn parse_timezone(z: [i64], from: i64, inout p: DateTime) -> bool {
+    var i = from
+    while is_space(at(z, i)) {
+        i = i + 1
+    }
+    p.tz = 0
+    let c = at(z, i)
+    var sgn = 0
+    if c == 45 {
+        sgn = 0 - 1
+    } else if c == 43 {
+        sgn = 1
+    } else if c == 90 or c == 122 {
+        i = i + 1
+        while is_space(at(z, i)) {
+            i = i + 1
+        }
+        return at(z, i) != 0
+    } else {
+        return c != 0
+    }
+    i = i + 1
+    let hm = get_digits(z, i, "20b:20e")
+    if hm.len() != 2 {
+        return true
+    }
+    i = i + 5
+    p.tz = sgn * (hm[1] + hm[0] * 60)
+    while is_space(at(z, i)) {
+        i = i + 1
+    }
+    return at(z, i) != 0
+}
+
+/// parseHhMmSs: true where `HH:MM[:SS[.FFF]][zone]` does not start at
+/// `from`.
+fn parse_hms(z: [i64], from: i64, inout p: DateTime) -> bool {
+    let hm = get_digits(z, from, "20c:20e")
+    if hm.len() != 2 {
+        return true
+    }
+    var i = from + 5
+    var s = 0
+    var ms = 0.0
+    if at(z, i) == 58 {
+        i = i + 1
+        let ss = get_digits(z, i, "20e")
+        if ss.len() != 1 {
+            return true
+        }
+        s = ss[0]
+        i = i + 2
+        if at(z, i) == 46 and is_digit(at(z, i + 1)) {
+            var scale = 1.0
+            i = i + 1
+            while is_digit(at(z, i)) {
+                ms = fma(ms, 10.0, at(z, i).as_f64()) - 48.0
+                scale = scale * 10.0
+                i = i + 1
+            }
+            ms = ms / scale
+            if ms > 0.999 {
+                ms = 0.999
+            }
+        }
+    }
+    p.valid_jd = false
+    p.raw_s = false
+    p.valid_hms = true
+    p.h = hm[0]
+    p.mi = hm[1]
+    p.s = s.as_f64() + ms
+    return parse_timezone(z, i, p)
+}
+
+fn compute_floor(inout p: DateTime) {
+    if p.d <= 28 {
+        p.nfloor = 0
+    } else if 1.shl(p.mo).bit_and(5546) != 0 {
+        p.nfloor = 0
+    } else if p.mo != 2 {
+        p.nfloor = if p.d == 31 { 1 } else { 0 }
+    } else if p.y % 4 != 0 or (p.y % 100 == 0 and p.y % 400 != 0) {
+        p.nfloor = p.d - 28
+    } else {
+        p.nfloor = p.d - 29
+    }
+}
+
+fn date_error(inout p: DateTime) {
+    p = blank()
+    p.is_error = true
+}
+
+fn compute_jd(inout p: DateTime) {
+    if p.valid_jd {
+        return
+    }
+    var y = 2000
+    var m = 1
+    var d = 1
+    if p.valid_ymd {
+        y = p.y
+        m = p.mo
+        d = p.d
+    }
+    if y < 0 - 4713 or y > 9999 or p.raw_s {
+        date_error(p)
+        return
+    }
+    if m <= 2 {
+        y = y - 1
+        m = m + 12
+    }
+    let a = (y + 4800) / 100
+    let b = 38 - a + a / 4
+    let x1 = 36525 * (y + 4716) / 100
+    let x2 = 306001 * (m + 1) / 10000
+    p.jd = (((x1 + x2 + d + b).as_f64() - 1524.5) * 86400000.0).as_i64()
+    p.valid_jd = true
+    if p.valid_hms {
+        p.jd = p.jd + p.h * 3600000 + p.mi * 60000 + fma(p.s, 1000.0, 0.5).as_i64()
+        if p.tz != 0 {
+            p.jd = p.jd - p.tz * 60000
+            p.valid_ymd = false
+            p.valid_hms = false
+            p.tz = 0
+        }
+    }
+}
+
+/// parseYyyyMmDd: true where the text is not a date.
+fn parse_ymd(z: [i64], inout p: DateTime) -> bool {
+    var i = 0
+    var neg = false
+    if at(z, 0) == 45 {
+        i = 1
+        neg = true
+    }
+    let ymd = get_digits(z, i, "40f-21a-21d")
+    if ymd.len() != 3 {
+        return true
+    }
+    i = i + 10
+    while is_space(at(z, i)) or at(z, i) == 84 {
+        i = i + 1
+    }
+    if not parse_hms(z, i, p) {
+        // the time is read
+    } else if at(z, i) == 0 {
+        p.valid_hms = false
+    } else {
+        return true
+    }
+    p.valid_jd = false
+    p.valid_ymd = true
+    p.y = if neg { 0 - ymd[0] } else { ymd[0] }
+    p.mo = ymd[1]
+    p.d = ymd[2]
+    compute_floor(p)
+    if p.tz != 0 {
+        compute_jd(p)
+    }
+    return false
+}
+
+fn set_raw_number(inout p: DateTime, r: f64) {
+    p.s = r
+    p.raw_s = true
+    if r >= 0.0 and r < 5373484.5 {
+        p.jd = fma(r, 86400000.0, 0.5).as_i64()
+        p.valid_jd = true
+    }
+}
+
+fn valid_julian_day(jd: i64) -> bool {
+    return jd >= 0 and jd <= 464269060799999
+}
+
+fn compute_ymd(inout p: DateTime) {
+    if p.valid_ymd {
+        return
+    }
+    if not p.valid_jd {
+        p.y = 2000
+        p.mo = 1
+        p.d = 1
+    } else if not valid_julian_day(p.jd) {
+        date_error(p)
+        return
+    } else {
+        let z = (p.jd + 43200000) / 86400000
+        let alpha = ((z.as_f64() + 32044.75) / 36524.25).as_i64() - 52
+        let a = z + 1 + alpha - (alpha + 100) / 4 + 25
+        let b = a + 1524
+        let c = ((b.as_f64() - 122.1) / 365.25).as_i64()
+        let d = 36525 * c.bit_and(32767) / 100
+        let e = ((b - d).as_f64() / 30.6001).as_i64()
+        let x1 = (30.6001 * e.as_f64()).as_i64()
+        p.d = b - d - x1
+        p.mo = if e < 14 { e - 1 } else { e - 13 }
+        p.y = if p.mo > 2 { c - 4716 } else { c - 4715 }
+    }
+    p.valid_ymd = true
+}
+
+fn compute_hms(inout p: DateTime) {
+    if p.valid_hms {
+        return
+    }
+    compute_jd(p)
+    let day_ms = (p.jd + 43200000) % 86400000
+    p.s = (day_ms % 60000).as_f64() / 1000.0
+    let day_min = day_ms / 60000
+    p.mi = day_min % 60
+    p.h = day_min / 60
+    p.raw_s = false
+    p.valid_hms = true
+}
+
+fn compute_ymd_hms(inout p: DateTime) {
+    compute_ymd(p)
+    compute_hms(p)
+}
+
+fn clear_ymd_hms_tz(inout p: DateTime) {
+    p.valid_ymd = false
+    p.valid_hms = false
+    p.tz = 0
+}
+
+/// parseDateOrTime: true where the text is not a time value. `now` and
+/// `subsec` read the clock, and are refused.
+fn parse_date_or_time(z: [i64], inout p: DateTime) -> bool {
+    if not parse_ymd(z, p) {
+        return false
+    }
+    if not parse_hms(z, 0, p) {
+        return false
+    }
+    if iequals(z, 0, "now") {
+        return true
+    }
+    let (r, code) = sqliteprintf.atof(z, z.len())
+    if code > 0 {
+        set_raw_number(p, r)
+        return false
+    }
+    return true
+}
+
+fn auto_adjust(inout p: DateTime) {
+    if not p.raw_s or p.valid_jd {
+        p.raw_s = false
+    } else if p.s >= -210866760000.0 and p.s <= 253402300799.0 {
+        let r = fma(p.s, 1000.0, 210866760000000.0)
+        clear_ymd_hms_tz(p)
+        p.jd = (r + 0.5).as_i64()
+        p.valid_jd = true
+        p.raw_s = false
+    }
+}
+
+// ---- modifiers
+
+/// The `+NNN units` forms: name, the float32 limit SQLite stores, and
+/// milliseconds per unit over 1000.
+fn units() -> [(str, f64, f64)] {
+    return [("second", 464269992787968.0, 1.0), ("minute", 7737900007424.0, 60.0), ("hour", 128969998336.0, 3600.0), ("day", 5373485.0, 86400.0),
+        ("month", 176546.0, 2592000.0), ("year", 14713.0, 31536000.0)]
+}
+
+/// The `+NNN units`, `±HH:MM:SS` and `±YYYY-MM-DD HH:MM:SS` forms. False
+/// where the modifier is not one.
+fn shift(z: [i64], inout p: DateTime) -> bool {
+    var n = 1
+    while at(z, n) != 0 {
+        if at(z, n) == 58 or is_space(at(z, n)) {
+            break
+        }
+        if at(z, n) == 45 {
+            if n == 5 and get_digits(z, 1, "40f").len() == 1 {
+                break
+            }
+            if n == 6 and get_digits(z, 1, "50f").len() == 1 {
+                break
+            }
+        }
+        n = n + 1
+    }
+    let (r, code) = sqliteprintf.atof(z, n)
+    if code <= 0 {
+        return false
+    }
+    if at(z, n) == 45 {
+        return shift_ymd(z, n, p)
+    }
+    if at(z, n) == 58 {
+        return shift_hms(z, 0, at(z, 0), p)
+    }
+    return shift_units(z, n, r, p)
+}
+
+/// (+|-)YYYY-MM-DD[ HH:MM[:SS]], with MM 0..11 and DD 0..30.
+fn shift_ymd(z0: [i64], n: i64, inout p: DateTime) -> bool {
+    let sign = at(z0, 0)
+    if sign != 43 and sign != 45 {
+        return false
+    }
+    let ymd = if n == 5 { get_digits(z0, 1, "40f-20a-20d") } else { get_digits(z0, 1, "50f-20a-20d") }
+    if ymd.len() != 3 {
+        return false
+    }
+    let z = if n == 6 { z0.slice(1, z0.len()) } else { z0 }
+    var d = ymd[2]
+    if ymd[1] >= 12 or d >= 31 {
+        return false
+    }
+    compute_ymd_hms(p)
+    p.valid_jd = false
+    if sign == 45 {
+        p.y = p.y - ymd[0]
+        p.mo = p.mo - ymd[1]
+        d = 0 - d
+    } else {
+        p.y = p.y + ymd[0]
+        p.mo = p.mo + ymd[1]
+    }
+    let x = if p.mo > 0 { (p.mo - 1) / 12 } else { (p.mo - 12) / 12 }
+    p.y = p.y + x
+    p.mo = p.mo - x * 12
+    compute_floor(p)
+    compute_jd(p)
+    p.valid_hms = false
+    p.valid_ymd = false
+    p.jd = p.jd + d * 86400000
+    if at(z, 11) == 0 {
+        return true
+    }
+    if is_space(at(z, 11)) and get_digits(z, 12, "20c:20e").len() == 2 {
+        return shift_hms(z, 12, sign, p)
+    }
+    return false
+}
+
+/// (+|-)HH:MM[:SS[.FFF]] starting at `from`, the sign being `sign`.
+fn shift_hms(z: [i64], from: i64, sign: i64, inout p: DateTime) -> bool {
+    var start = from
+    if not is_digit(at(z, start)) {
+        start = start + 1
+    }
+    var tx = blank()
+    if parse_hms(z, start, tx) {
+        return false
+    }
+    compute_jd(tx)
+    tx.jd = tx.jd - 43200000
+    let day = tx.jd / 86400000
+    tx.jd = tx.jd - day * 86400000
+    if sign == 45 {
+        tx.jd = 0 - tx.jd
+    }
+    compute_jd(p)
+    clear_ymd_hms_tz(p)
+    p.jd = p.jd + tx.jd
+    return true
+}
+
+/// +NNN units: `r` of them, the unit after byte `n`.
+fn shift_units(z: [i64], n: i64, r0: f64, inout p: DateTime) -> bool {
+    var r = r0
+    var i = n
+    while is_space(at(z, i)) {
+        i = i + 1
+    }
+    let rest = z.slice(i, z.len())
+    var len = rest.len()
+    if len < 3 or len > 10 {
+        return false
+    }
+    if lower(rest[len - 1]) == 115 {
+        len = len - 1
+    }
+    compute_jd(p)
+    let rounder = if r < 0.0 { -0.5 } else { 0.5 }
+    p.nfloor = 0
+    var ok = false
+    for k in 0..6 {
+        let (name, limit, xform) = units()[k]
+        if name.codes().len() == len and istarts(rest, name, len) and r > 0.0 - limit and r < limit {
+            if k == 4 or k == 5 {
+                compute_ymd_hms(p)
+                if k == 4 {
+                    p.mo = p.mo + r.as_i64()
+                    let x = if p.mo > 0 { (p.mo - 1) / 12 } else { (p.mo - 12) / 12 }
+                    p.y = p.y + x
+                    p.mo = p.mo - x * 12
+                } else {
+                    p.y = p.y + r.as_i64()
+                }
+                compute_floor(p)
+                p.valid_jd = false
+                r = r - r.as_i64().as_f64()
+            }
+            compute_jd(p)
+            p.jd = p.jd + fma(r * 1000.0, xform, rounder).as_i64()
+            ok = true
+            break
+        }
+    }
+    clear_ymd_hms_tz(p)
+    return ok
+}
+
+/// parseModifier: false where the modifier is not one (or reads the OS's
+/// time zone). `index` is the argument's position, from 1.
+fn modifier(z: [i64], inout p: DateTime, index: i64) -> bool {
+    let c = lower(at(z, 0))
+    if c == 97 or c == 106 or c == 117 {
+        return raw_modifier(z, p, index)
+    }
+    if c == 99 and iequals(z, 0, "ceiling") {
+        compute_jd(p)
+        clear_ymd_hms_tz(p)
+        p.nfloor = 0
+        return true
+    }
+    if c == 102 and iequals(z, 0, "floor") {
+        compute_jd(p)
+        p.jd = p.jd - p.nfloor * 86400000
+        clear_ymd_hms_tz(p)
+        return true
+    }
+    if c == 119 {
+        return weekday(z, p)
+    }
+    if c == 115 {
+        return start_of(z, p)
+    }
+    if c == 43 or c == 45 or is_digit(c) {
+        return shift(z, p)
+    }
+    return false
+}
+
+/// `auto`, `julianday` and `unixepoch`, which say how to read a number and
+/// must come first.
+fn raw_modifier(z: [i64], inout p: DateTime, index: i64) -> bool {
+    if iequals(z, 0, "auto") {
+        if index > 1 {
+            return false
+        }
+        auto_adjust(p)
+        return true
+    }
+    if iequals(z, 0, "julianday") {
+        if index > 1 or not (p.valid_jd and p.raw_s) {
+            return false
+        }
+        p.raw_s = false
+        return true
+    }
+    if not (iequals(z, 0, "unixepoch") and p.raw_s) or index > 1 {
+        return false
+    }
+    let r = fma(p.s, 1000.0, 210866760000000.0)
+    if r >= 0.0 and r < 464269060800000.0 {
+        clear_ymd_hms_tz(p)
+        p.jd = (r + 0.5).as_i64()
+        p.valid_jd = true
+        p.raw_s = false
+        return true
+    }
+    return false
+}
+
+/// `weekday N`.
+fn weekday(z: [i64], inout p: DateTime) -> bool {
+    if not istarts(z, "weekday ", 8) {
+        return false
+    }
+    let (r, code) = sqliteprintf.atof(z.slice(8, z.len()), z.len() - 8)
+    if code <= 0 or r < 0.0 or r >= 7.0 or r.as_i64().as_f64() != r {
+        return false
+    }
+    let n = r.as_i64()
+    compute_ymd_hms(p)
+    p.tz = 0
+    p.valid_jd = false
+    compute_jd(p)
+    var wd = (p.jd + 129600000) / 86400000 % 7
+    if wd > n {
+        wd = wd - 7
+    }
+    p.jd = p.jd + (n - wd) * 86400000
+    clear_ymd_hms_tz(p)
+    return true
+}
+
+/// `start of day|month|year`, and `subsec`.
+fn start_of(z: [i64], inout p: DateTime) -> bool {
+    if not istarts(z, "start of ", 9) {
+        if iequals(z, 0, "subsec") or iequals(z, 0, "subsecond") {
+            p.use_subsec = true
+            return true
+        }
+        return false
+    }
+    if not p.valid_jd and not p.valid_ymd and not p.valid_hms {
+        return false
+    }
+    compute_ymd(p)
+    p.valid_hms = true
+    p.h = 0
+    p.mi = 0
+    p.s = 0.0
+    p.raw_s = false
+    p.tz = 0
+    p.valid_jd = false
+    if iequals(z, 9, "month") {
+        p.d = 1
+        return true
+    }
+    if iequals(z, 9, "year") {
+        p.mo = 1
+        p.d = 1
+        return true
+    }
+    return iequals(z, 9, "day")
+}
+
+// ---- isDate
+
+/// TEXT or a BLOB as `sqlite3_value_text` hands it to the parser: a C
+/// string, so it ends at the first NUL.
+fn c_string(b: [i64]) -> [i64] {
+    var out: [i64] = []
+    for c in b {
+        if c == 0 {
+            break
+        }
+        out.push(c)
+    }
+    return out
+}
+
+fn is_date(value: SqlValue, modifiers: [str]) -> Option[DateTime] {
+    var p = blank()
+    match value {
+        SqlNull -> return None
+        SqlInteger(n) -> set_raw_number(p, n.as_f64())
+        SqlFloat(v) -> set_raw_number(p, v)
+        SqlText(t) -> if parse_date_or_time(c_string(t.to_bytes().to_list()), p) {
+            return None
+        }
+        SqlBlob(b) -> if parse_date_or_time(c_string(b.to_list()), p) {
+            return None
+        }
+    }
+    for i in 0..modifiers.len() {
+        if not modifier(modifiers[i].to_bytes().to_list(), p, i + 1) {
+            return None
+        }
+    }
+    compute_jd(p)
+    if p.is_error or not valid_julian_day(p.jd) {
+        return None
+    }
+    if modifiers.len() == 0 and p.valid_ymd and p.d > 28 {
+        p.valid_ymd = false
+    }
+    return Some(p)
+}
+
+// ---- printing numbers, through sqliteprintf's decimal conversion
+
+/// SQLite's printf for `%0W.Pf` ("f") and `%.Pg` ("g"), as date.c calls it.
+fn sqlite_float(v: f64, width: i64, precision: i64, kind: str) -> str {
+    let spec = "%" + (if width > 0 { "0" + width.to_str() } else { "" }) + "." + precision.to_str() + kind
+    return (sqliteprintf.format(spec, [SqlFloat(v)]) ?? "".to_bytes()).to_str()
+}
+
+/// C's `%0Nd` and `%Nd`.
+fn pad_int(v: i64, width: i64, zero: bool) -> str {
+    let digits = (if v < 0 { 0 - v } else { v }).to_str()
+    let sign = if v < 0 { "-" } else { "" }
+    let len = digits.len() + sign.len()
+    if len >= width {
+        return sign + digits
+    }
+    let fill = (0..(width - len)).to_list().map(|_x| if zero { "0" } else { " " }).join("")
+    return if zero { sign + fill + digits } else { fill + sign + digits }
+}
+
+// ---- the functions
+
+/// `julianday(value, modifiers...)`.
+pub fn julianday(value: SqlValue, modifiers: [str]) -> Option[f64] {
+    return match is_date(value, modifiers) {
+        Some(p) -> Some(p.jd.as_f64() / 86400000.0)
+        None -> None
+    }
+}
+
+/// `unixepoch(value, modifiers...)`.
+pub fn unixepoch(value: SqlValue, modifiers: [str]) -> Option[UnixEpoch] {
+    return match is_date(value, modifiers) {
+        Some(p) -> Some(if p.use_subsec { EpochReal((p.jd - 210866760000000).as_f64() / 1000.0) } else { EpochInt(p.jd / 1000 - 210866760000) })
+        None -> None
+    }
+}
+
+fn two(n: i64) -> str {
+    return (n / 10 % 10).to_str() + (n % 10).to_str()
+}
+
+fn year_text(y: i64) -> str {
+    let a = if y < 0 { 0 - y } else { y }
+    return (if y < 0 { "-" } else { "" }) + (a / 1000 % 10).to_str() + (a / 100 % 10).to_str() + (a / 10 % 10).to_str() + (a % 10).to_str()
+}
+
+fn seconds_text(p: DateTime) -> str {
+    if p.use_subsec {
+        let s = fma(1000.0, p.s, 0.5).as_i64()
+        return (s / 10000 % 10).to_str() + (s / 1000 % 10).to_str() + "." + (s / 100 % 10).to_str() + (s / 10 % 10).to_str() + (s % 10).to_str()
+    }
+    return two(p.s.as_i64())
+}
+
+/// `date(value, modifiers...)`.
+pub fn date(value: SqlValue, modifiers: [str]) -> Option[str] {
+    var p = match is_date(value, modifiers) {
+        Some(v) -> v
+        None -> return None
+    }
+    compute_ymd(p)
+    return Some(year_text(p.y) + "-" + two(p.mo) + "-" + two(p.d))
+}
+
+/// `time(value, modifiers...)`.
+pub fn time(value: SqlValue, modifiers: [str]) -> Option[str] {
+    var p = match is_date(value, modifiers) {
+        Some(v) -> v
+        None -> return None
+    }
+    compute_hms(p)
+    return Some(two(p.h) + ":" + two(p.mi) + ":" + seconds_text(p))
+}
+
+/// `datetime(value, modifiers...)`.
+pub fn datetime(value: SqlValue, modifiers: [str]) -> Option[str] {
+    var p = match is_date(value, modifiers) {
+        Some(v) -> v
+        None -> return None
+    }
+    compute_ymd_hms(p)
+    return Some(year_text(p.y) + "-" + two(p.mo) + "-" + two(p.d) + " " + two(p.h) + ":" + two(p.mi) + ":" + seconds_text(p))
+}
+
+fn days_after_jan01(p: DateTime) -> i64 {
+    var jan = p
+    jan.valid_jd = false
+    jan.mo = 1
+    jan.d = 1
+    compute_jd(jan)
+    return (p.jd - jan.jd + 43200000) / 86400000
+}
+
+fn days_after_monday(p: DateTime) -> i64 {
+    return (p.jd + 43200000) / 86400000 % 7
+}
+
+fn days_after_sunday(p: DateTime) -> i64 {
+    return (p.jd + 129600000) / 86400000 % 7
+}
+
+/// The Thursday of the ISO week `p` is in.
+fn iso_thursday(p: DateTime) -> DateTime {
+    var y = p
+    y.jd = y.jd + (3 - days_after_monday(p)) * 86400000
+    y.valid_ymd = false
+    compute_ymd(y)
+    return y
+}
+
+/// One `%` conversion, or None for one strftime does not know.
+fn conversion(c: i64, p: DateTime) -> Option[str] {
+    let h12 = if p.h > 12 { p.h - 12 } else if p.h == 0 { 12 } else { p.h }
+    return if c == 100 { Some(pad_int(p.d, 2, true)) } else if c == 101 { Some(pad_int(p.d, 2, false)) } else if c == 102 {
+        Some(sqlite_float(if p.s > 59.999 { 59.999 } else { p.s }, 6, 3, "f"))
+    } else if c == 70 { Some(pad_int(p.y, 4, true) + "-" + pad_int(p.mo, 2, true) + "-" + pad_int(p.d, 2, true)) } else if c == 71 {
+        Some(pad_int(iso_thursday(p).y, 4, true))
+    } else if c == 103 { Some(pad_int(iso_thursday(p).y % 100, 2, true)) } else if c == 72 { Some(pad_int(p.h, 2, true)) } else if c == 107 {
+        Some(pad_int(p.h, 2, false))
+    } else if c == 73 { Some(pad_int(h12, 2, true)) } else if c == 108 { Some(pad_int(h12, 2, false)) } else if c == 106 {
+        Some(pad_int(days_after_jan01(p) + 1, 3, true))
+    } else if c == 74 { Some(sqlite_float(p.jd.as_f64() / 86400000.0, 0, 16, "g")) } else if c == 109 { Some(pad_int(p.mo, 2, true)) } else if c == 77 {
+        Some(pad_int(p.mi, 2, true))
+    } else if c == 112 { Some(if p.h >= 12 { "PM" } else { "AM" }) } else if c == 80 { Some(if p.h >= 12 { "pm" } else { "am" }) } else if c == 82 {
+        Some(pad_int(p.h, 2, true) + ":" + pad_int(p.mi, 2, true))
+    } else if c == 115 {
+        Some(if p.use_subsec { sqlite_float((p.jd - 210866760000000).as_f64() / 1000.0, 0, 3, "f") } else { (p.jd / 1000 - 210866760000).to_str() })
+    } else if c == 83 { Some(pad_int(p.s.as_i64(), 2, true)) } else if c == 84 {
+        Some(pad_int(p.h, 2, true) + ":" + pad_int(p.mi, 2, true) + ":" + pad_int(p.s.as_i64(), 2, true))
+    } else if c == 117 or c == 119 {
+        let w = days_after_sunday(p)
+        Some(if w == 0 and c == 117 { "7" } else { w.to_str() })
+    } else if c == 85 { Some(pad_int((days_after_jan01(p) - days_after_sunday(p) + 7) / 7, 2, true)) } else if c == 86 {
+        Some(pad_int(days_after_jan01(iso_thursday(p)) / 7 + 1, 2, true))
+    } else if c == 87 { Some(pad_int((days_after_jan01(p) - days_after_monday(p) + 7) / 7, 2, true)) } else if c == 89 {
+        Some(pad_int(p.y, 4, true))
+    } else if c == 37 { Some("%") } else { None }
+}
+
+/// `strftime(format, value, modifiers...)`.
+pub fn strftime(format: str, value: SqlValue, modifiers: [str]) -> Option[str] {
+    var p = match is_date(value, modifiers) {
+        Some(v) -> v
+        None -> return None
+    }
+    compute_jd(p)
+    compute_ymd_hms(p)
+    let f = format.to_bytes().to_list()
+    var out: [i64] = []
+    var i = 0
+    while i < f.len() {
+        if f[i] != 37 {
+            out.push(f[i])
+            i = i + 1
+            continue
+        }
+        let piece = match conversion(at(f, i + 1), p) {
+            Some(v) -> v
+            None -> return None
+        }
+        for b in piece.to_bytes().to_list() {
+            out.push(b)
+        }
+        i = i + 2
+    }
+    return Some(bytes_of(out).to_str())
+}
+
+/// `timediff(a, b)`: how much later `a` is than `b`, as
+/// `±YYYY-MM-DD HH:MM:SS.SSS`.
+pub fn timediff(a: SqlValue, b: SqlValue) -> Option[str] {
+    var d1 = match is_date(a, []) {
+        Some(v) -> v
+        None -> return None
+    }
+    var d2 = match is_date(b, []) {
+        Some(v) -> v
+        None -> return None
+    }
+    compute_ymd_hms(d1)
+    compute_ymd_hms(d2)
+    let later = d1.jd >= d2.jd
+    let (y, m) = whole_months(d1, d2, later)
+    d1.jd = (if later { d1.jd - d2.jd } else { d2.jd - d1.jd }) + 148699540800000
+    clear_ymd_hms_tz(d1)
+    compute_ymd_hms(d1)
+    return Some((if later { "+" } else { "-" }) + pad_int(y, 4, true) + "-" + pad_int(m, 2, true) + "-" + pad_int(d1.d - 1, 2, true) + " " +
+        pad_int(d1.h, 2, true) + ":" + pad_int(d1.mi, 2, true) + ":" + sqlite_float(d1.s, 6, 3, "f"))
+}
+
+/// The whole years and months between `d1` and `d2`, moving `d2` by them
+/// towards `d1` as timediff does.
+fn whole_months(d1: DateTime, inout d2: DateTime, later: bool) -> (i64, i64) {
+    var y = if later { d1.y - d2.y } else { d2.y - d1.y }
+    if y != 0 {
+        d2.y = d1.y
+        d2.valid_jd = false
+        compute_jd(d2)
+    }
+    var m = if later { d1.mo - d2.mo } else { d2.mo - d1.mo }
+    if m < 0 {
+        y = y - 1
+        m = m + 12
+    }
+    if m != 0 {
+        d2.mo = d1.mo
+        d2.valid_jd = false
+        compute_jd(d2)
+    }
+    while (later and d1.jd < d2.jd) or (not later and d1.jd > d2.jd) {
+        m = m - 1
+        if m < 0 {
+            m = 11
+            y = y - 1
+        }
+        d2.mo = d2.mo + (if later { 0 - 1 } else { 1 })
+        if d2.mo < 1 {
+            d2.mo = 12
+            d2.y = d2.y - 1
+        }
+        if d2.mo > 12 {
+            d2.mo = 1
+            d2.y = d2.y + 1
+        }
+        d2.valid_jd = false
+        compute_jd(d2)
+    }
+    return (y, m)
+}

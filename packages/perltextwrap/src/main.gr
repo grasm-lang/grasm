@@ -1,0 +1,430 @@
+// Perl's Text::Wrap (2013.0523) and Text::Tabs: `wrap`, `fill`, `expand`
+// and `unexpand`, as Perl 5.34 runs them on character strings.
+//
+// Perl tools wrap help text, mail bodies and reports with these, and a
+// program producing the same output has to cut each line where Perl does:
+//
+//   - Widths count grapheme clusters (`\X`), not characters, and a line
+//     holds at most `columns - 1` of them after the lead.
+//   - A line ends at the last `$break` (by default a whitespace-led
+//     cluster) that fits, or at a newline; the break itself is dropped,
+//     and one that ends the text is kept at the very end.
+//   - A word longer than the line is cut (`huge` = wrap), left whole
+//     (overflow), or refused (die); a subsequent-line indent too wide for
+//     `columns` widens it for the call.
+//   - Tabs in the text are expanded first, and each line is unexpanded
+//     again (runs of spaces ending a tab stop become a tab) unless
+//     `unexpand` is off; `separator2` replaces the separator only where
+//     the break was not a newline.
+//   - `fill` reflows paragraphs (split at a newline followed by
+//     whitespace), joining them with a blank line when both indents are
+//     the same.
+//
+// Clusters come from packages/graphemes (Unicode 17); Perl 5.34 segments
+// by Unicode 13, so text using characters or rules added since (Indic
+// conjuncts, newer emoji) can count differently. A custom `break` is
+// matched with packages/regex (no lookaround or backreferences, `\s` as
+// Perl means it); one that can match empty text is refused.
+import graphemes
+import regex
+
+/// What `$huge` says to do with a word longer than the line.
+type WrapHuge = | HugeWrap | HugeOverflow | HugeDie
+
+/// Text::Wrap's package variables.
+type WrapOptions = {
+    columns: i64,
+    huge: WrapHuge,
+    unexpand: bool,
+    tabstop: i64,
+    separator: str,
+    separator2: Option[str],
+    /// `$break` when it is not the default `(?=\s)\X`.
+    brk: Option[str],
+}
+
+/// Perl's `die`: a word that would not fit under `huge` = die (the text
+/// being wrapped), or a `break` this package cannot use.
+type WrapError = | WrapDied(text: str) | WrapBadBreak(msg: str)
+
+pub fn error_text(e: WrapError) -> str {
+    return match e {
+        WrapDied(t) -> "couldn't wrap '" + t + "'"
+        WrapBadBreak(m) -> m
+    }
+}
+
+/// Text::Wrap's defaults: 76 columns, wrap, unexpand, tabstop 8, "\n".
+pub fn default_options() -> WrapOptions {
+    return WrapOptions{ columns: 76, huge: HugeWrap, unexpand: true, tabstop: 8, separator: "\n", separator2: None, brk: None }
+}
+
+// ---- characters and clusters
+
+/// Perl's `\s` on a character string: Unicode White_Space.
+fn ws_chars() -> str {
+    let codes = [9, 10, 11, 12, 13, 32, 133, 160, 5760, 8192, 8193, 8194, 8195, 8196, 8197, 8198, 8199, 8200, 8201, 8202, 8232, 8233, 8239, 8287, 12288]
+    return codes.map(|c| c.to_char()).join("")
+}
+
+fn is_ws(c: str) -> bool {
+    return ws_chars().contains(c)
+}
+
+/// How many characters the `\X` starting at `p` takes.
+fn cluster_len(cs: [str], p: i64) -> i64 {
+    var state = graphemes.advance(graphemes.start_state(), cs[p].code_at(0))
+    var q = p + 1
+    while q < cs.len() and not graphemes.breaks_between(state, cs[q - 1].code_at(0), cs[q].code_at(0)) {
+        state = graphemes.advance(state, cs[q].code_at(0))
+        q = q + 1
+    }
+    return q - p
+}
+
+/// `_xlen`: how many `\X` a string holds.
+fn xlen(text: str) -> i64 {
+    return graphemes.count(text)
+}
+
+fn slice_text(cs: [str], a: i64, b: i64) -> str {
+    return cs.slice(a, b).join("")
+}
+
+// ---- Text::Tabs
+
+/// One line's tabs (the line keeps its newline): each pads to the next
+/// stop, counting clusters of the original line before it.
+fn expand_line(line: [str], tabstop: i64) -> str {
+    var out = ""
+    var offs = 0
+    var i = 0
+    while i < line.len() {
+        if line[i] == "\t" {
+            let pad = tabstop - (xlen(slice_text(line, 0, i)) + offs) % tabstop
+            offs = offs + pad - 1
+            out = out + " ".repeat(pad)
+        } else {
+            out = out + line[i]
+        }
+        i = i + 1
+    }
+    return out
+}
+
+/// `expand($text)` with `$tabstop`.
+pub fn expand(text: str, tabstop: i64) -> str {
+    let cs = text.chars()
+    var out = ""
+    var start = 0
+    var i = 0
+    while i < cs.len() {
+        if cs[i] == "\n" {
+            out = out + expand_line(cs.slice(start, i + 1), tabstop)
+            start = i + 1
+        }
+        i = i + 1
+    }
+    return out + expand_line(cs.slice(start, cs.len()), tabstop)
+}
+
+/// `s/  +$/\t/`.
+fn tab_tail(chunk: str) -> str {
+    let cs = chunk.chars()
+    var i = cs.len()
+    while i > 0 and cs[i - 1] == " " {
+        i = i - 1
+    }
+    if cs.len() - i >= 2 {
+        return slice_text(cs, 0, i) + "\t"
+    }
+    return chunk
+}
+
+fn unexpand_line(text: str, tabstop: i64) -> str {
+    let cs = expand(text, tabstop).chars()
+    var chunks: [str] = []
+    var p = 0
+    while true {
+        var q = p
+        var k = 0
+        while k < tabstop and q < cs.len() {
+            q = q + cluster_len(cs, q)
+            k = k + 1
+        }
+        if k < tabstop {
+            break
+        }
+        chunks.push(tab_tail(slice_text(cs, p, q)))
+        p = q
+    }
+    var last = slice_text(cs, p, cs.len())
+    if last == " ".repeat(tabstop) {
+        last = "\t"
+    }
+    return chunks.join("") + last
+}
+
+/// `unexpand($text)` with `$tabstop`.
+pub fn unexpand(text: str, tabstop: i64) -> str {
+    return text.split("\n").map(|l| unexpand_line(l, tabstop)).join("\n")
+}
+
+// ---- breaks
+
+type Breaker = | DefaultBreak | RegexBreak(r: Regex)
+
+/// `\s` and `\S` written out as Perl means them.
+fn perl_classes(pattern: str) -> str {
+    let cs = pattern.chars()
+    var out = ""
+    var in_class = false
+    var i = 0
+    while i < cs.len() {
+        let c = cs[i]
+        if c == "\\" and i + 1 < cs.len() {
+            let e = cs[i + 1]
+            if e == "s" {
+                out = out + (if in_class { ws_chars() } else { "[" + ws_chars() + "]" })
+            } else if e == "S" and not in_class {
+                out = out + "[^" + ws_chars() + "]"
+            } else {
+                out = out + c + e
+            }
+            i = i + 2
+            continue
+        }
+        if c == "[" and not in_class {
+            in_class = true
+        } else if c == "]" and in_class {
+            in_class = false
+        }
+        out = out + c
+        i = i + 1
+    }
+    return out
+}
+
+fn breaker(o: WrapOptions) -> Breaker ! WrapError {
+    let pattern = match o.brk {
+        Some(p) -> p
+        None -> return DefaultBreak
+    }
+    let r = match regex.compile("^(?:" + perl_classes(pattern) + ")") {
+        Ok(r) -> r
+        Err(e) -> fail(WrapBadBreak("bad break: " + e.why))
+    }
+    if regex.matches(r, "") {
+        fail(WrapBadBreak("a break that matches empty text"))
+    }
+    return RegexBreak(r)
+}
+
+/// How many characters `$break` takes at `p`, or -1.
+fn break_at(b: Breaker, cs: [str], p: i64) -> i64 {
+    return match b {
+        DefaultBreak -> if p < cs.len() and is_ws(cs[p]) { cluster_len(cs, p) } else { 0 - 1 }
+        RegexBreak(r) -> match regex.find(r, slice_text(cs, p, cs.len())) {
+            Some(m) -> m.text.chars().len()
+            None -> 0 - 1
+        }
+    }
+}
+
+/// `($break|\n+|\z)` at `p`: the characters it takes, or -1.
+fn terminator_at(b: Breaker, cs: [str], p: i64) -> i64 {
+    let k = break_at(b, cs, p)
+    if k >= 0 {
+        return k
+    }
+    var q = p
+    while q < cs.len() and cs[q] == "\n" {
+        q = q + 1
+    }
+    if q > p {
+        return q - p
+    }
+    return if p == cs.len() { 0 } else { 0 - 1 }
+}
+
+/// `\G(?:$break)*\Z`: where the match ends, or -1.
+fn only_breaks_left(b: Breaker, cs: [str], p: i64) -> i64 {
+    var ends = [p]
+    var q = p
+    while true {
+        let k = break_at(b, cs, q)
+        if k <= 0 {
+            break
+        }
+        q = q + k
+        ends.push(q)
+    }
+    var i = ends.len() - 1
+    while i >= 0 {
+        let e = ends[i]
+        if e == cs.len() or (e == cs.len() - 1 and cs[e] == "\n") {
+            return e
+        }
+        i = i - 1
+    }
+    return 0 - 1
+}
+
+/// Where each of up to `limit` clusters (none starting with a newline)
+/// from `p` ends, `p` itself first.
+fn cluster_ends(cs: [str], p: i64, limit: i64) -> [i64] {
+    var ends = [p]
+    var q = p
+    while ends.len() - 1 < limit and q < cs.len() and cs[q] != "\n" {
+        q = q + cluster_len(cs, q)
+        ends.push(q)
+    }
+    return ends
+}
+
+/// One line: (where its text ends, where the match ends, remainder), or
+/// None where `huge` = die refuses.
+fn next_line(b: Breaker, cs: [str], p: i64, ll: i64, o: WrapOptions) -> Option[(i64, i64, str)] {
+    let ends = cluster_ends(cs, p, ll)
+    var k = ends.len() - 1
+    while k >= 0 {
+        let t = terminator_at(b, cs, ends[k])
+        if t >= 0 {
+            return Some((ends[k], ends[k] + t, slice_text(cs, ends[k], ends[k] + t)))
+        }
+        k = k - 1
+    }
+    match o.huge {
+        HugeWrap -> {
+            if ends.len() - 1 == ll {
+                let e = ends[ll]
+                return Some((e, e, o.separator2 ?? o.separator))
+            }
+            return None
+        }
+        HugeOverflow -> {
+            let all = cluster_ends(cs, p, cs.len())
+            var j = 0
+            while j < all.len() {
+                let t = terminator_at(b, cs, all[j])
+                if t >= 0 {
+                    return Some((all[j], all[j] + t, slice_text(cs, all[j], all[j] + t)))
+                }
+                j = j + 1
+            }
+            return None
+        }
+        HugeDie -> return None
+    }
+}
+
+/// `wrap($initial_tab, $subsequent_tab, @text)`.
+pub fn wrap(ip: str, xp: str, texts: [str], o: WrapOptions) -> str ! WrapError {
+    let b = try breaker(o)
+    var joined = ""
+    var i = 0
+    while i < texts.len() {
+        let piece = texts[i]
+        let pcs = piece.chars()
+        let spaced = i + 1 == texts.len() or (pcs.len() > 0 and is_ws(pcs[pcs.len() - 1]))
+        joined = joined + piece + (if spaced { "" } else { " " })
+        i = i + 1
+    }
+    let text = expand(joined, o.tabstop)
+    let cs = text.chars()
+    var columns = o.columns
+    let xp_len = xlen(expand(xp, o.tabstop))
+    var nll = columns - xp_len - 1
+    if nll <= 0 and xp.len() > 0 {
+        columns = xp_len + 2
+        nll = 1
+    }
+    var ll = columns - xlen(expand(ip, o.tabstop)) - 1
+    if ll < 0 {
+        ll = 0
+    }
+    var r = ""
+    var lead = ip
+    var nl = ""
+    var remainder = ""
+    var pos = 0
+    while true {
+        let fin = only_breaks_left(b, cs, pos)
+        if fin >= 0 {
+            pos = fin
+            break
+        }
+        let (text_end, match_end, rem) = match next_line(b, cs, pos, ll, o) {
+            Some(x) -> x
+            None -> fail(WrapDied(text))
+        }
+        let line = nl + lead + slice_text(cs, pos, text_end)
+        r = r + (if o.unexpand { unexpand(line, o.tabstop) } else { line })
+        remainder = rem
+        pos = match_end
+        lead = xp
+        ll = nll
+        nl = match o.separator2 {
+            Some(s2) -> if remainder == "\n" { "\n" } else { s2 }
+            None -> o.separator
+        }
+    }
+    r = r + remainder
+    if pos != cs.len() {
+        r = r + lead + slice_text(cs, pos, cs.len())
+    }
+    return r
+}
+
+/// `split(/\n\s+/, $text)`, trailing empty fields dropped.
+fn paragraphs(text: str) -> [str] {
+    let cs = text.chars()
+    var out: [str] = []
+    var start = 0
+    var i = 0
+    while i < cs.len() {
+        if cs[i] == "\n" and i + 1 < cs.len() and is_ws(cs[i + 1]) {
+            var j = i + 1
+            while j < cs.len() and is_ws(cs[j]) {
+                j = j + 1
+            }
+            out.push(slice_text(cs, start, i))
+            start = j
+            i = j
+        } else {
+            i = i + 1
+        }
+    }
+    out.push(slice_text(cs, start, cs.len()))
+    while out.len() > 0 and out[out.len() - 1].len() == 0 {
+        out.pop()
+    }
+    return out
+}
+
+/// `s/\s+/ /g`.
+fn squeeze(text: str) -> str {
+    var out = ""
+    var in_ws = false
+    for c in text.chars() {
+        if is_ws(c) {
+            if not in_ws {
+                out = out + " "
+            }
+            in_ws = true
+        } else {
+            out = out + c
+            in_ws = false
+        }
+    }
+    return out
+}
+
+/// `fill($initial_tab, $subsequent_tab, @raw)`.
+pub fn fill(ip: str, xp: str, raw: [str], o: WrapOptions) -> str ! WrapError {
+    var paras: [str] = []
+    for pp in paragraphs(raw.join("\n")) {
+        paras.push(try wrap(ip, xp, [squeeze(pp)], o))
+    }
+    return paras.join(if ip == xp { "\n\n" } else { "\n" })
+}

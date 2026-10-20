@@ -1,0 +1,244 @@
+// Perl's File::Spec::Unix (PathTools 3.80, as in Perl 5.34): the path
+// arithmetic Perl programs do on Unix -- `canonpath`, `catdir`, `catfile`,
+// `splitdir`, `splitpath`, `catpath`, `abs2rel`, `rel2abs`,
+// `file_name_is_absolute` and `no_upwards`.
+//
+// Build tools (ExtUtils::MakeMaker, Module::Build), installers, test
+// harnesses and many a deployment script build and compare paths with
+// these, and a tool that has to land files where they put them, or read
+// their manifests, has to compute the same strings:
+//
+//   - **`canonpath`** is the C version Perl actually runs (Cwd.xs): runs
+//     of slashes squeeze, `.` segments disappear (a lone `.` stays, and
+//     `./` alone becomes `.`), leading `..` after the root disappears
+//     (`/../a` is `/a`), and a trailing slash goes unless it is all there
+//     is. Inner `..` is kept: `a/b/..` is not `a`.
+//   - **`catdir`** and **`catfile`** join with `/` and canonicalise (an
+//     empty first part makes the path absolute); `splitdir` keeps empty
+//     fields; `splitpath` keeps a trailing `.` or `..` with the directory.
+//   - **`abs2rel`** and **`rel2abs`** take the current directory as an
+//     argument instead of asking the process for it, so they answer the
+//     same everywhere; `abs2rel` walks back through `..` in the base the
+//     way the module does.
+//
+// Checked against `perl` 5.34's File::Spec::Unix with `Cwd::getcwd`
+// replaced by the directory given.
+
+fn at(cs: [str], i: i64) -> str {
+    return if i >= 0 and i < cs.len() { cs[i] } else { "\u{0}" }
+}
+
+/// File::Spec::Unix->canonpath, as Cwd.xs computes it.
+pub fn canonpath(path: str) -> str {
+    let cs = path.chars()
+    let pe = cs.len()
+    if pe == 0 {
+        return ""
+    }
+    var out: [str] = []
+    var p = 0
+    if cs[0] == "/" {
+        out.push("/")
+        while true {
+            p = p + 1
+            while at(cs, p) == "/" {
+                p = p + 1
+            }
+            if at(cs, p) == "." and at(cs, p + 1) == "." and (p + 2 == pe or at(cs, p + 2) == "/") {
+                p = p + 1
+            } else if not (at(cs, p) == "." and (p + 1 == pe or at(cs, p + 1) == "/")) {
+                break
+            }
+        }
+    } else if cs[0] == "." and at(cs, 1) == "/" {
+        var going = true
+        while going {
+            p = p + 1
+            p = p + 1
+            while at(cs, p) == "/" {
+                p = p + 1
+            }
+            going = at(cs, p) == "." and at(cs, p + 1) == "/"
+        }
+        if p == pe {
+            out.push(".")
+        }
+    }
+    if p >= pe {
+        return out.join("")
+    }
+    return out.join("") + segments(cs, p)
+}
+
+/// The main loop of unix_canonpath from `p0`: each segment copied, then
+/// slashes and `.` segments skipped.
+fn segments(cs: [str], p0: i64) -> str {
+    let pe = cs.len()
+    var out: [str] = []
+    var p = p0
+    while true {
+        while p < pe and cs[p] != "/" {
+            out.push(cs[p])
+            p = p + 1
+        }
+        if p == pe {
+            return out.join("")
+        }
+        while true {
+            p = p + 1
+            while at(cs, p) == "/" {
+                p = p + 1
+            }
+            if p == pe {
+                return out.join("")
+            }
+            if cs[p] != "." {
+                break
+            }
+            if p + 1 == pe {
+                return out.join("")
+            }
+            if cs[p + 1] != "/" {
+                break
+            }
+            p = p + 1
+        }
+        out.push("/")
+    }
+    return out.join("")
+}
+
+/// `catdir(dirs...)`.
+pub fn catdir(dirs: [str]) -> str {
+    return canonpath((dirs + [""]).join("/"))
+}
+
+/// `catfile(parts...)`; None for no parts (Perl answers undef).
+pub fn catfile(parts: [str]) -> Option[str] {
+    if parts.len() == 0 {
+        return None
+    }
+    let file = canonpath(parts[parts.len() - 1])
+    if parts.len() == 1 {
+        return Some(file)
+    }
+    var dir = catdir(parts.slice(0, parts.len() - 1))
+    if dir == "" or not dir.ends_with("/") {
+        dir = dir + "/"
+    }
+    return Some(dir + file)
+}
+
+/// `splitdir(path)`: every field between slashes, empty ones included;
+/// nothing at all for the empty string.
+pub fn splitdir(path: str) -> [str] {
+    if path == "" {
+        return []
+    }
+    return path.split("/")
+}
+
+/// `splitpath(path, no_file)`: volume (always empty), directory, file.
+pub fn splitpath(path: str, no_file: bool) -> (str, str, str) {
+    if no_file {
+        return ("", path, "")
+    }
+    let cs = path.chars()
+    var last = 0 - 1
+    var i = 0
+    while i < cs.len() {
+        if cs[i] == "/" {
+            last = i
+        }
+        i = i + 1
+    }
+    if last < 0 {
+        return ("", "", path)
+    }
+    let rest = cs.slice(last + 1, cs.len()).join("")
+    if rest == "." or rest == ".." {
+        return ("", path, "")
+    }
+    return ("", cs.slice(0, last + 1).join(""), rest)
+}
+
+/// `catpath(volume, directory, file)`; the volume is ignored on Unix.
+pub fn catpath(_volume: str, directory: str, file: str) -> str {
+    if directory != "" and file != "" and not directory.ends_with("/") and not file.starts_with("/") {
+        return directory + "/" + file
+    }
+    return directory + file
+}
+
+pub fn file_name_is_absolute(path: str) -> bool {
+    return path.starts_with("/")
+}
+
+/// `no_upwards(names...)`: without `.` and `..`.
+pub fn no_upwards(names: [str]) -> [str] {
+    return names.filter(|n| n != "." and n != "..")
+}
+
+/// `rel2abs(path, base)` with `cwd` standing for `Cwd::getcwd()`; an
+/// empty base means the current directory.
+pub fn rel2abs(path: str, base: str, cwd: str) -> str {
+    if file_name_is_absolute(path) {
+        return canonpath(path)
+    }
+    var b = base
+    if b == "" {
+        b = cwd
+    } else if not file_name_is_absolute(b) {
+        b = rel2abs(b, "", cwd)
+    } else {
+        b = canonpath(b)
+    }
+    return canonpath(catdir([b, path]))
+}
+
+/// `abs2rel(path, base)` with `cwd` standing for `Cwd::getcwd()`; an
+/// empty base means the current directory.
+pub fn abs2rel(path0: str, base0: str, cwd: str) -> str {
+    let path = canonpath(path0)
+    let base = canonpath(if base0 == "" { cwd } else { base0 })
+    var path_dirs = ""
+    var base_dirs = ""
+    if file_name_is_absolute(path) or file_name_is_absolute(base) {
+        path_dirs = rel2abs(path, "", cwd)
+        base_dirs = rel2abs(base, "", cwd)
+    } else {
+        path_dirs = catdir([cwd, path])
+        base_dirs = catdir([cwd, base])
+    }
+    var pathchunks = splitdir(path_dirs)
+    var basechunks = splitdir(base_dirs)
+    if base_dirs == "/" {
+        if path_dirs == "/" {
+            return "."
+        }
+        return canonpath(catpath("", catdir(pathchunks.slice(1, pathchunks.len())), ""))
+    }
+    var common: [str] = []
+    while pathchunks.len() > 0 and basechunks.len() > 0 and pathchunks[0] == basechunks[0] {
+        common.push(pathchunks.remove(0))
+        let _b = basechunks.remove(0)
+    }
+    if pathchunks.len() == 0 and basechunks.len() == 0 {
+        return "."
+    }
+    var reverse_base: [str] = []
+    for dir in basechunks {
+        if dir != ".." {
+            reverse_base = [".."] + reverse_base
+            common.push(dir)
+        } else if common.len() > 0 {
+            if reverse_base.len() > 0 and reverse_base[0] == ".." {
+                let _r = reverse_base.remove(0)
+                let _c = common.pop()
+            } else {
+                reverse_base = [common.pop() ?? ""] + reverse_base
+            }
+        }
+    }
+    return canonpath(catpath("", catdir(reverse_base + pathchunks), ""))
+}

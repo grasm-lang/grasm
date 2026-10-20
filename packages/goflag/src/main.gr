@@ -1,0 +1,266 @@
+// Go's `flag` package, as Go 1.25 parses a command line and prints its
+// usage: `FlagSet.Parse` with `ContinueOnError`, the values the flags
+// hold afterwards, `Args`, and `PrintDefaults`.
+//
+// Every Go command-line tool reads its options this way, and a wrapper,
+// a completion script or a re-implementation has to read them the same:
+//
+//   - `-name` and `--name` are the same; `-name=value` or `-name value`
+//     for everything but a bool, which takes only `-name` or
+//     `-name=value`. Flags stop at the first argument that is not one,
+//     or after `--`; a lone `-` is an argument.
+//   - Values are read by `strconv` (ints in any base Go literals use,
+//     `_` included) and durations by `time.ParseDuration`; a bad one is
+//     `invalid value "x" for flag -n: parse error` (or `value out of
+//     range`), with Go's quoting.
+//   - An unknown flag is `flag provided but not defined: -x`, except
+//     `-help` and `-h`, which ask for help.
+//   - `PrintDefaults` sorts the flags, names a value by a `back-quoted`
+//     word in the usage or by its type, puts a one-letter bool's usage on
+//     its own line, and shows a default that is not the zero value.
+
+import goduration
+import goquote
+import gostrconv
+
+type GoFlagKind = | FlagBool | FlagInt | FlagInt64 | FlagUint | FlagUint64 | FlagString | FlagFloat64 | FlagDuration
+
+/// A defined flag: its name, kind, usage, and the text of its default as
+/// the flag's `String` writes it.
+type GoFlag = { name: str, kind: GoFlagKind, usage: str, default_text: str }
+
+/// After `Parse`: every flag's value as its `String` writes it and the
+/// flags that were set, both by name, and the arguments left over.
+type GoFlagParse = { values: [(str, str)], set: [str], args: [str] }
+
+/// The error `Parse` returns, with Go's message.
+type GoFlagError = | GoFlagError(msg: str)
+
+pub fn error_text(e: GoFlagError) -> str {
+    return match e {
+        GoFlagError(m) -> m
+    }
+}
+
+fn num_problem(e: GoNumError) -> str {
+    return if e.err == "value out of range" { "value out of range" } else { "parse error" }
+}
+
+/// `Value.Set(text)`: the value as its `String` writes it, or the error
+/// `Set` returns.
+fn set_value(kind: GoFlagKind, text: str) -> str ! str {
+    return match kind {
+        FlagBool -> {
+            let (b, err) = gostrconv.parse_bool(text)
+            if err.is_some() {
+                fail("parse error")
+            }
+            if b { "true" } else { "false" }
+        }
+        FlagInt -> int_value(text)
+        FlagInt64 -> int_value(text)
+        FlagUint -> uint_value(text)
+        FlagUint64 -> uint_value(text)
+        FlagString -> text
+        FlagFloat64 -> {
+            let (f, err) = gostrconv.parse_float(text, 64)
+            match err {
+                Some(e) -> fail(num_problem(e))
+                None -> gostrconv.format_float(f, "g", 0 - 1, 64)
+            }
+        }
+        FlagDuration -> match goduration.parse_duration(text) {
+            Ok(d) -> goduration.duration_string(d)
+            Err(_e) -> fail("parse error")
+        }
+    }
+}
+
+fn int_value(text: str) -> str ! str {
+    let (v, err) = gostrconv.parse_int(text, 0, 64)
+    return match err {
+        Some(e) -> fail(num_problem(e))
+        None -> v.to_str()
+    }
+}
+
+fn uint_value(text: str) -> str ! str {
+    let (v, err) = gostrconv.parse_uint(text, 0, 64)
+    return match err {
+        Some(e) -> fail(num_problem(e))
+        None -> gostrconv.format_uint(v, 10)
+    }
+}
+
+fn zero_text(kind: GoFlagKind) -> str {
+    return match kind {
+        FlagBool -> "false"
+        FlagString -> ""
+        FlagDuration -> "0s"
+        _ -> "0"
+    }
+}
+
+/// A flag of `kind` named `name`, its default given as text a `Set`
+/// accepts (None for the zero value).
+pub fn define(name: str, kind: GoFlagKind, default: Option[str], usage: str) -> GoFlag ! GoFlagError {
+    let text = match default {
+        Some(t) -> match set_value(kind, t) {
+            Ok(v) -> v
+            Err(e) -> fail(GoFlagError("bad default for -" + name + ": " + e))
+        }
+        None -> zero_text(kind)
+    }
+    return GoFlag{ name: name, kind: kind, usage: usage, default_text: text }
+}
+
+fn quoted(s: str) -> str {
+    return goquote.quote(s.to_bytes())
+}
+
+fn sorted_names(flags: [GoFlag]) -> [str] {
+    var names = flags.map(|f| f.name)
+    var i = 1
+    while i < names.len() {
+        var j = i
+        while j > 0 and names[j - 1] > names[j] {
+            let t = names[j - 1]
+            names[j - 1] = names[j]
+            names[j] = t
+            j = j - 1
+        }
+        i = i + 1
+    }
+    return names
+}
+
+fn find_flag(flags: [GoFlag], name: str) -> Option[GoFlag] {
+    for f in flags {
+        if f.name == name {
+            return Some(f)
+        }
+    }
+    return None
+}
+
+/// `fs.Parse(args)` for a FlagSet holding `flags`.
+pub fn parse(flags: [GoFlag], arguments: [str]) -> GoFlagParse ! GoFlagError {
+    var values = flags.map(|f| (f.name, f.default_text))
+    var set: [str] = []
+    var args = arguments
+    while args.len() > 0 {
+        let s = args[0]
+        let sb = s.to_bytes().to_list()
+        if sb.len() < 2 or sb[0] != 45 {
+            break
+        }
+        var minuses = 1
+        if sb[1] == 45 {
+            minuses = 2
+            if sb.len() == 2 {
+                args = args.slice(1, args.len())
+                break
+            }
+        }
+        var name = bytes_of(sb.slice(minuses, sb.len()))
+        let nb = name.to_list()
+        if nb.len() == 0 or nb[0] == 45 or nb[0] == 61 {
+            fail(GoFlagError("bad flag syntax: " + s))
+        }
+        args = args.slice(1, args.len())
+        var has_value = false
+        var value = ""
+        for i in 1..nb.len() {
+            if nb[i] == 61 {
+                value = bytes_of(nb.slice(i + 1, nb.len())).to_str()
+                has_value = true
+                name = bytes_of(nb.slice(0, i))
+                break
+            }
+        }
+        let n = name.to_str()
+        let flag = match find_flag(flags, n) {
+            Some(f) -> f
+            None -> if n == "help" or n == "h" { fail(GoFlagError("flag: help requested")) } else {
+                fail(GoFlagError("flag provided but not defined: -" + n))
+            }
+        }
+        let is_bool = match flag.kind {
+            FlagBool -> true
+            _ -> false
+        }
+        if is_bool {
+            if not has_value {
+                value = "true"
+            }
+        } else if not has_value {
+            if args.len() == 0 {
+                fail(GoFlagError("flag needs an argument: -" + n))
+            }
+            value = args[0]
+            args = args.slice(1, args.len())
+        }
+        let v = match set_value(flag.kind, value) {
+            Ok(t) -> t
+            Err(e) -> fail(GoFlagError(if is_bool { "invalid boolean value " + quoted(value) + " for -" + n + ": " + e } else {
+                "invalid value " + quoted(value) + " for flag -" + n + ": " + e
+            }))
+        }
+        values = values.map(|kv| if kv.0 == n { (n, v) } else { kv })
+        if not set.contains(n) {
+            set.push(n)
+        }
+    }
+    let order = sorted_names(flags)
+    return GoFlagParse{ values: order.map(|k| (k, values.filter(|kv| kv.0 == k)[0].1)), set: order.filter(|k| set.contains(k)), args: args }
+}
+
+/// `UnquoteUsage`: the value's name and the usage with its back quotes
+/// removed.
+fn unquote_usage(f: GoFlag) -> (str, str) {
+    let u = f.usage.to_bytes().to_list()
+    for i in 0..u.len() {
+        if u[i] == 96 {
+            for j in (i + 1)..u.len() {
+                if u[j] == 96 {
+                    let name = bytes_of(u.slice(i + 1, j)).to_str()
+                    return (name, bytes_of(u.slice(0, i)).to_str() + name + bytes_of(u.slice(j + 1, u.len())).to_str())
+                }
+            }
+            break
+        }
+    }
+    let name = match f.kind {
+        FlagBool -> ""
+        FlagDuration -> "duration"
+        FlagFloat64 -> "float"
+        FlagInt -> "int"
+        FlagInt64 -> "int"
+        FlagString -> "string"
+        FlagUint -> "uint"
+        FlagUint64 -> "uint"
+    }
+    return (name, f.usage)
+}
+
+/// `fs.PrintDefaults()`'s output.
+pub fn print_defaults(flags: [GoFlag]) -> str {
+    var out = ""
+    for n in sorted_names(flags) {
+        let f = find_flag(flags, n) ?? flags[0]
+        var line = "  -" + n
+        let (vname, usage) = unquote_usage(f)
+        if vname.len() > 0 {
+            line = line + " " + vname
+        }
+        line = line + (if line.to_bytes().len() <= 4 { "\t" } else { "\n    \t" }) + usage.replace("\n", "\n    \t")
+        if f.default_text != zero_text(f.kind) {
+            line = line + match f.kind {
+                FlagString -> " (default " + quoted(f.default_text) + ")"
+                _ -> " (default " + f.default_text + ")"
+            }
+        }
+        out = out + line + "\n"
+    }
+    return out
+}

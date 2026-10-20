@@ -1,0 +1,16 @@
+[package]
+name = "rustnum"
+version = "1.0.0"
+capabilities = []
+
+[dependencies.shortestfloat]
+path = "../shortestfloat"
+version = "^1.0.0"
+
+[dependencies.gostrconv]
+path = "../gostrconv"
+version = "^1.0.0"
+
+[dependencies.bigint]
+path = "../bigint"
+version = "^1.0.0"

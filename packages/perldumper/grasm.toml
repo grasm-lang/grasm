@@ -1,0 +1,8 @@
+[package]
+name = "perldumper"
+version = "1.0.0"
+capabilities = []
+
+[dependencies.perlstorable]
+path = "../perlstorable"
+version = "^1.0.0"

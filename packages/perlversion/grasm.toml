@@ -1,0 +1,4 @@
+[package]
+name = "perlversion"
+version = "1.0.0"
+capabilities = []

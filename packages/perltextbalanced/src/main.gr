@@ -1,0 +1,406 @@
+// Perl's Text::Balanced (version 2.04, Perl 5.34): `extract_delimited`
+// and `extract_bracketed`, called in list context, and the error each
+// leaves in `$@`.
+//
+// Parse::RecDescent, Perl::Critic's helpers, templating modules and many
+// a configuration reader pull quoted strings and bracketed blocks off the
+// front of their input with these two, and anything reading the same input
+// has to cut it in the same places:
+//
+//   - **`extract_delimited(text, delims, prefix, escapes)`** skips what the
+//     prefix pattern matches (white space by default), then takes a string
+//     opened and closed by one of the delimiters (`'`, `"` and backquote by
+//     default), where the escape character (backslash by default, one per
+//     delimiter, the last repeated) protects the next character -- not a
+//     line break -- and an escape equal to its delimiter means the
+//     delimiter doubled. Delimiters with no visible character match the
+//     empty string. The prefix backtracks to let a delimiter match.
+//   - **`extract_bracketed(text, delims, prefix)`** takes a balanced run of
+//     the bracket kinds named (`{([<` by default; a closing bracket names
+//     its opener), skipping backslash-escaped characters and strings in
+//     the quote characters listed among the delimiters, and fails on a
+//     wrong or missing closer.
+//   - Both answer the extracted text, the remainder and the prefix; on
+//     failure the text is the remainder, the other two are absent, and
+//     the failure carries Text::Balanced's message and position (in
+//     characters).
+//
+// The prefix is a regular expression in Perl; this takes the subset made
+// of literal characters, `.`, `\s`, `\S`, escaped punctuation and simple
+// classes, each with `*`, `+` or `?`, and refuses any other pattern.
+// `extract_bracketed`'s `q` (quote-like operators inside the brackets) is
+// refused too, and `extract_quotelike`, `extract_codeblock`,
+// `extract_variable`, `extract_tagged` and `extract_multiple` are not
+// here.
+//
+// Checked against `perl` 5.34's Text::Balanced on generated texts,
+// delimiter sets and prefixes.
+
+/// What an extraction answers: the extracted text and the prefix (both
+/// absent on failure), the remainder, and the failure left in `$@`.
+type TextBalancedResult = { extracted: Option[str], remainder: str, prefix: Option[str], failure: Option[TextBalancedFailure] }
+
+/// `$@->{error}` and `$@->{pos}`.
+type TextBalancedFailure = { message: str, pos: i64 }
+
+/// A pattern or option this does not reproduce.
+type TextBalancedError = | TextBalancedUnsupported(why: str)
+
+/// One atom of a prefix pattern: what it matches and how often.
+type TbAtom = { kind: i64, code: i64, ranges: [(i64, i64)], space: bool, negate: bool, min: i64, max: i64 }
+
+fn perl_space(c: i64) -> bool {
+    return c >= 9 and c <= 13 or c == 32 or c == 133 or c == 160 or c == 5760 or c >= 8192 and c <= 8202 or c == 8232 or c == 8233 or c == 8239 or c == 8287 or c == 12288
+}
+
+fn atom_matches(a: TbAtom, c: i64) -> bool {
+    if a.kind == 0 {
+        return c == a.code
+    }
+    if a.kind == 1 {
+        return c != 10
+    }
+    if a.kind == 3 {
+        return perl_space(c) != a.negate
+    }
+    let inside = a.ranges.any(|r| c >= r.0 and c <= r.1) or a.space and perl_space(c)
+    return inside != a.negate
+}
+
+fn unsupported(why: str) -> TextBalancedError {
+    return TextBalancedUnsupported(why)
+}
+
+fn escaped_code(c: i64) -> i64 {
+    return if c == 116 { 9 } else if c == 110 { 10 } else if c == 114 { 13 } else if c == 102 { 12 } else { c }
+}
+
+fn is_alnum(c: i64) -> bool {
+    return c >= 48 and c <= 57 or c >= 65 and c <= 90 or c >= 97 and c <= 122 or c == 95
+}
+
+/// `[...]` from just after the `[`: the atom and where the class ends.
+fn parse_class(p: [i64], from: i64) -> (TbAtom, i64) ! TextBalancedError {
+    var i = from
+    var a = TbAtom{ kind: 2, code: 0, ranges: [], space: false, negate: false, min: 1, max: 1 }
+    if i < p.len() and p[i] == 94 {
+        a.negate = true
+        i = i + 1
+    }
+    var first = true
+    while i < p.len() and (p[i] != 93 or first) {
+        first = false
+        var c = p[i]
+        if c == 92 {
+            if i + 1 >= p.len() {
+                fail(unsupported("a class ending in a backslash"))
+            }
+            let e = p[i + 1]
+            if e == 115 {
+                a.space = true
+                i = i + 2
+                continue
+            }
+            if is_alnum(e) and escaped_code(e) == e {
+                fail(unsupported("\\" + e.to_char() + " in a class"))
+            }
+            c = escaped_code(e)
+            i = i + 1
+        }
+        if c == 91 and i + 1 < p.len() and (p[i + 1] == 58 or p[i + 1] == 61 or p[i + 1] == 46) {
+            fail(unsupported("POSIX classes"))
+        }
+        if i + 2 < p.len() and p[i + 1] == 45 and p[i + 2] != 93 and p[i + 2] != 92 {
+            a.ranges.push((c, p[i + 2]))
+            i = i + 3
+        } else {
+            a.ranges.push((c, c))
+            i = i + 1
+        }
+    }
+    if i >= p.len() {
+        fail(unsupported("an unterminated class"))
+    }
+    return (a, i + 1)
+}
+
+/// The prefix pattern as atoms, or a refusal for what it cannot hold.
+fn parse_prefix(pattern: str) -> [TbAtom] ! TextBalancedError {
+    let p = pattern.codes()
+    var atoms: [TbAtom] = []
+    var i = 0
+    while i < p.len() {
+        let c = p[i]
+        var a = TbAtom{ kind: 0, code: c, ranges: [], space: false, negate: false, min: 1, max: 1 }
+        if c == 92 {
+            if i + 1 >= p.len() {
+                fail(unsupported("a pattern ending in a backslash"))
+            }
+            let e = p[i + 1]
+            if e == 115 or e == 83 {
+                a.kind = 3
+                a.negate = e == 83
+            } else if is_alnum(e) and escaped_code(e) == e {
+                fail(unsupported("\\" + e.to_char()))
+            } else {
+                a.code = escaped_code(e)
+            }
+            i = i + 2
+        } else if c == 91 {
+            let parsed = try parse_class(p, i + 1)
+            a = parsed.0
+            i = parsed.1
+        } else if c == 46 {
+            a.kind = 1
+            i = i + 1
+        } else if c == 40 or c == 41 or c == 124 or c == 94 or c == 36 or c == 123 or c == 125 or c == 42 or c == 43 or c == 63 {
+            fail(unsupported("the pattern syntax " + c.to_char()))
+        } else {
+            i = i + 1
+        }
+        if i < p.len() and (p[i] == 42 or p[i] == 43 or p[i] == 63) {
+            a.min = if p[i] == 43 { 1 } else { 0 }
+            a.max = if p[i] == 63 { 1 } else { 1000000000 }
+            i = i + 1
+            if i < p.len() and (p[i] == 42 or p[i] == 43 or p[i] == 63 or p[i] == 123) {
+                fail(unsupported("non-greedy or stacked quantifiers"))
+            }
+        }
+        atoms.push(a)
+    }
+    return atoms
+}
+
+/// Where the prefix can end when it starts at `pos`, in the order Perl's
+/// backtracking tries them.
+fn prefix_ends(atoms: [TbAtom], i: i64, text: [i64], pos: i64) -> [i64] {
+    if i == atoms.len() {
+        return [pos]
+    }
+    let a = atoms[i]
+    var reps = 0
+    while reps < a.max and pos + reps < text.len() and atom_matches(a, text[pos + reps]) {
+        reps = reps + 1
+    }
+    var out: [i64] = []
+    var k = reps
+    while k >= a.min {
+        for e in prefix_ends(atoms, i + 1, text, pos + k) {
+            out.push(e)
+        }
+        k = k - 1
+    }
+    return out
+}
+
+fn piece(text: [i64], from: i64, to: i64) -> str {
+    return text.slice(from, to).map(|c| c.to_char()).join("")
+}
+
+fn success(text: [i64], start: i64, end: i64, pre_from: i64) -> TextBalancedResult {
+    return TextBalancedResult{ extracted: Some(piece(text, start, end)), remainder: piece(text, end, text.len()), prefix: Some(piece(text, pre_from, start)), failure: None }
+}
+
+fn failure(text: [i64], message: str, pos: i64) -> TextBalancedResult {
+    return TextBalancedResult{ extracted: None, remainder: piece(text, 0, text.len()), prefix: None, failure: Some(TextBalancedFailure{ message: message, pos: pos }) }
+}
+
+// --- extract_delimited -----------------------------------------------------------------------------------
+
+/// One delimiter's string at `p`: where it ends, if it is there.
+fn delimited_at(text: [i64], p: i64, d: i64, e: i64) -> Option[i64] {
+    if p >= text.len() or text[p] != d {
+        return None
+    }
+    var j = p + 1
+    if d == e {
+        // d [^d]* (dd [^d]*)* d, trying the most doubled pairs first.
+        var stops: [i64] = []
+        while j < text.len() and text[j] != d {
+            j = j + 1
+        }
+        stops.push(j)
+        while j + 1 < text.len() and text[j] == d and text[j + 1] == d {
+            j = j + 2
+            while j < text.len() and text[j] != d {
+                j = j + 1
+            }
+            stops.push(j)
+        }
+        var k = stops.len() - 1
+        while k >= 0 {
+            if stops[k] < text.len() and text[stops[k]] == d {
+                return Some(stops[k] + 1)
+            }
+            k = k - 1
+        }
+        return None
+    }
+    var going = true
+    while going {
+        while j < text.len() and text[j] != d and text[j] != e {
+            j = j + 1
+        }
+        if j + 1 < text.len() and text[j] == e and text[j + 1] != 10 {
+            j = j + 2
+        } else {
+            going = false
+        }
+    }
+    return if j < text.len() and text[j] == d { Some(j + 1) } else { None }
+}
+
+/// `extract_delimited(text, delims, prefix, escapes)`; an absent argument
+/// is Perl's default.
+pub fn extract_delimited(text0: str, delims: Option[str], prefix: Option[str], escapes: Option[str]) -> TextBalancedResult ! TextBalancedError {
+    let text = text0.codes()
+    let dels = (delims ?? "'\"`").codes()
+    let atoms = try parse_prefix(prefix ?? "\\s*")
+    var escs = (escapes ?? "\\").codes()
+    if escs.len() == 0 or escapes == Some("0") {
+        escs = [92]
+    }
+    while escs.len() < dels.len() {
+        escs.push(escs[escs.len() - 1])
+    }
+    let visible = dels.any(|c| not perl_space(c))
+    for p in prefix_ends(atoms, 0, text, 0) {
+        if not visible {
+            return success(text, p, p, 0)
+        }
+        var i = 0
+        while i < dels.len() {
+            match delimited_at(text, p, dels[i], escs[i]) {
+                Some(end) -> return success(text, p, end, 0)
+                None -> {}
+            }
+            i = i + 1
+        }
+    }
+    return failure(text, "Not a delimited pattern", 0)
+}
+
+// --- extract_bracketed -----------------------------------------------------------------------------------
+
+fn opener_of(c: i64) -> i64 {
+    return if c == 93 { 91 } else if c == 41 { 40 } else if c == 125 { 123 } else if c == 62 { 60 } else { c }
+}
+
+fn closer_of(c: i64) -> i64 {
+    return if c == 91 { 93 } else if c == 40 { 41 } else if c == 123 { 125 } else if c == 60 { 62 } else { c }
+}
+
+fn is_bracket(c: i64) -> bool {
+    return c == 91 or c == 40 or c == 123 or c == 60
+}
+
+/// The delimiter argument as Perl rewrites it: the quote characters
+/// taken out (in the order ' " `), every bracket made an opener,
+/// everything else up to U+00FF dropped, and repeats squeezed.
+fn bracket_sets(spec: [i64]) -> ([i64], [i64]) ! TextBalancedError {
+    var quotes: [i64] = []
+    for q in [39, 34, 96] {
+        if spec.contains(q) {
+            quotes.push(q)
+        }
+    }
+    if spec.contains(113) {
+        fail(unsupported("the q delimiter (quote-like operators)"))
+    }
+    var ldel: [i64] = []
+    var last_mapped = 0 - 1
+    for c in spec.filter(|c| c != 39 and c != 34 and c != 96) {
+        if c > 255 {
+            ldel.push(c)
+            last_mapped = 0 - 1
+        } else if is_bracket(c) or c == 93 or c == 41 or c == 125 or c == 62 {
+            let o = opener_of(c)
+            if o != last_mapped {
+                ldel.push(o)
+            }
+            last_mapped = o
+        }
+    }
+    return (ldel, quotes)
+}
+
+fn shown(c: i64) -> str {
+    return c.to_char()
+}
+
+/// `extract_bracketed(text, delims, prefix)`.
+pub fn extract_bracketed(text0: str, delims: Option[str], prefix: Option[str]) -> TextBalancedResult ! TextBalancedError {
+    let text = text0.codes()
+    let spec = delims ?? "\{([<"
+    let sets = try bracket_sets(spec.codes())
+    let ldel = sets.0
+    if not ldel.any(|c| is_bracket(c)) {
+        return failure(text, "Did not find a suitable bracket in delimiter: \"" + spec + "\"", 0)
+    }
+    let pattern = prefix ?? "\\s*"
+    let atoms = try parse_prefix(pattern)
+    let ends = prefix_ends(atoms, 0, text, 0)
+    if ends.len() == 0 {
+        return failure(text, "Did not find prefix: /" + pattern + "/", 0)
+    }
+    let start = ends[0]
+    if start >= text.len() or not ldel.contains(text[start]) {
+        return failure(text, "Did not find opening bracket after prefix: \"" + pattern + "\"", start)
+    }
+    return bracket_body(text, ldel, sets.1, start)
+}
+
+fn bracket_body(text: [i64], ldel: [i64], quotes: [i64], start: i64) -> TextBalancedResult {
+    let rdel = ldel.map(|c| closer_of(c))
+    var nesting = [text[start]]
+    var p = start + 1
+    while p < text.len() {
+        let c = text[p]
+        if c == 92 and p + 1 < text.len() {
+            p = p + 2
+        } else if ldel.contains(c) {
+            nesting.push(c)
+            p = p + 1
+        } else if rdel.contains(c) {
+            p = p + 1
+            let expected = closer_of(nesting.pop() ?? 0)
+            if expected != c {
+                return failure(text, "Mismatched closing bracket: expected \"" + shown(expected) + "\" but found \"" + shown(c) + "\"", p)
+            }
+            if nesting.len() == 0 {
+                return success(text, start, p, 0)
+            }
+        } else if quotes.contains(c) {
+            p = p + 1
+            match quoted_end(text, p, c) {
+                Some(e) -> p = e
+                None -> return failure(text, "Unmatched embedded quote (" + shown(c) + ")", p)
+            }
+        } else if is_alnum(c) and c != 95 {
+            while p < text.len() and is_alnum(text[p]) and text[p] != 95 {
+                p = p + 1
+            }
+        } else {
+            p = p + 1
+        }
+    }
+    return failure(text, "Unmatched opening bracket(s): " + nesting.map(|c| shown(c)).join("..") + "..", p)
+}
+
+/// The end of a quoted string whose quote opened just before `from`:
+/// `[^\\q]*(?:\\.[^\\q]*)*q`.
+fn quoted_end(text: [i64], from: i64, q: i64) -> Option[i64] {
+    var j = from
+    var going = true
+    while going {
+        while j < text.len() and text[j] != 92 and text[j] != q {
+            j = j + 1
+        }
+        if j + 1 < text.len() and text[j] == 92 {
+            j = j + 2
+        } else {
+            going = false
+        }
+    }
+    return if j < text.len() and text[j] == q { Some(j + 1) } else { None }
+}

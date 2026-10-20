@@ -1,0 +1,1980 @@
+// Node's `path.matchesGlob(path, pattern)`, as Node 25 runs it: the copy
+// of minimatch 10 it carries, with the options Node passes -- backslashes
+// in the pattern are separators (`windowsPathsNoEscape`), a leading `!`
+// or `#` is a literal (`nonegate`, `nocomment`), `optimizationLevel: 2`,
+// `nocaseMagicOnly`, and `nocase` on macOS and Windows hosts only.
+// `path.posix.matchesGlob` and `path.win32.matchesGlob` differ in how
+// paths split and in drive letters and UNC roots.
+//
+// What a reader of the documentation would not guess:
+//
+//   - With `nocase`, only segments with magic in them ignore case. `a/*`
+//     does not match `A/b` on a Mac, while `a/b*` matches `a/B`.
+//   - Braces expand first (`{a,b}`, `{1..3}`, `{a..c}`), and the expanded
+//     patterns are simplified before matching: `a/../b` is `b`, empty and
+//     `.` segments go, `**/..` splits in two, and a pattern another one
+//     covers is dropped -- so `{a,*}` is just `*`. The path is simplified
+//     the same way, so `a/../b` matches `b`.
+//   - `*`, `?` and `[...]` never match a leading `.`; `**` never crosses a
+//     segment that starts with one.
+//   - Extended globs `@(a|b)`, `*(...)`, `+(...)`, `?(...)` and `!(...)`
+//     become regular expressions. A `!(...)` carries the rest of the
+//     segment into its test, and one whose last alternative ends empty --
+//     `!(x|)`, or `!(x@(y))` -- matches any non-empty name. An extglob
+//     with nothing inside is a literal when it is alone (`@()`), and makes
+//     `*()` inside another a SyntaxError: "Nothing to repeat".
+//   - POSIX classes (`[[:alpha:]]`) switch the segment's expression to
+//     Unicode mode, where `\-`, `\,`, `\#` and an escaped space are invalid
+//     escapes: `[[:alpha:]]-x` throws a SyntaxError. `[:print:]` is `\p{C}`,
+//     the control characters, as minimatch writes it.
+//   - A few shapes are tested without the expression (`*`, `*.ext`, `???`,
+//     `*.*`, `.*`), so their case rule is `toLowerCase`, not the
+//     expression's.
+//
+// Case-insensitive matching follows JavaScript's: `toUpperCase` per UTF-16
+// unit without the u flag, simple case folding with it. The tables for
+// that and for the general categories come from Node 25 (Unicode 17).
+//
+// Errors are Node's: a SyntaxError with V8's message, or the TypeError
+// "pattern is too long" past 65,536 UTF-16 units.
+//
+// Limits: case-insensitive `toLowerCase` uses Grasm's case mapping, which
+// may be an older Unicode version than Node 25's for the newest letters.
+import braceexpansion
+
+type MgError = | MgSyntaxError(message: str) | MgTypeError(message: str)
+
+/// The JavaScript error's name.
+pub fn error_name(e: MgError) -> str {
+    return match e {
+        MgSyntaxError(_m) -> "SyntaxError"
+        MgTypeError(_m) -> "TypeError"
+    }
+}
+
+/// The JavaScript error's message.
+pub fn error_message(e: MgError) -> str {
+    return match e {
+        MgSyntaxError(m) -> m
+        MgTypeError(m) -> m
+    }
+}
+
+// ---- UTF-16 text
+
+fn units_of(s: str) -> [i64] {
+    var out: [i64] = []
+    for c in s.codes() {
+        if c >= 65536 {
+            out.push(55296 + (c - 65536) / 1024)
+            out.push(56320 + (c - 65536) % 1024)
+        } else {
+            out.push(c)
+        }
+    }
+    return out
+}
+
+/// Text of UTF-16 units; a lone surrogate becomes U+FFFD, as it does when
+/// Node writes the string out.
+fn text_of(u: [i64]) -> str {
+    var out: [str] = []
+    var i = 0
+    while i < u.len() {
+        let c = u[i]
+        if c >= 55296 and c <= 56319 and i + 1 < u.len() and u[i + 1] >= 56320 and u[i + 1] <= 57343 {
+            out.push(((c - 55296) * 1024 + u[i + 1] - 56320 + 65536).to_char())
+            i = i + 2
+        } else {
+            out.push((if c >= 55296 and c <= 57343 { 65533 } else { c }).to_char())
+            i = i + 1
+        }
+    }
+    return out.join("")
+}
+
+fn extend(inout out: [i64], xs: [i64]) {
+    for x in xs {
+        out.push(x)
+    }
+}
+
+fn starts_at(s: [i64], at: i64, w: [i64]) -> bool {
+    return at >= 0 and s.len() - at >= w.len() and s.slice(at, at + w.len()) == w
+}
+
+fn ends_with(s: [i64], w: [i64]) -> bool {
+    return s.len() >= w.len() and s.slice(s.len() - w.len(), s.len()) == w
+}
+
+fn lower_units(u: [i64]) -> [i64] {
+    return units_of(text_of(u).to_lower())
+}
+
+/// A line terminator, which a regular expression's `.` does not match.
+fn is_lt(c: i64) -> bool {
+    return c == 10 or c == 13 or c == 8232 or c == 8233
+}
+
+/// `\s` in a JavaScript regular expression.
+fn is_space(c: i64) -> bool {
+    return c >= 9 and c <= 13 or c == 32 or c == 160 or c == 5760 or c >= 8192 and c <= 8202 or c == 8232 or c == 8233 or c == 8239 or c == 8287 or c == 12288 or
+    c == 65279
+}
+
+fn is_hex(c: i64) -> bool {
+    return c >= 48 and c <= 57 or c >= 65 and c <= 70 or c >= 97 and c <= 102
+}
+
+fn hex_value(c: i64) -> i64 {
+    return if c >= 97 { c - 87 } else if c >= 65 { c - 55 } else { c - 48 }
+}
+
+// ---- the regular expressions minimatch builds, and a matcher for them
+
+type MgItem = | MgRange(lo: i64, hi: i64) | MgProp(ranges: [i64])
+
+type MgRx =
+    | MgCh(c: i64)
+    | MgSet(items: [MgItem], negated: bool)
+    | MgDot
+    | MgBol
+    | MgEol
+    | MgSeq(items: [ref MgRx])
+    | MgAlt(alts: [ref MgRx])
+    | MgNot(inner: ref MgRx)
+    | MgRep(item: ref MgRx, least: i64, most: i64)
+
+/// A compiled expression; `wide` when anything in it is outside ASCII.
+type MgRe = { root: ref MgRx, icase: bool, unicode: bool, wide: bool }
+
+type MgReader = { cs: [i64], i: i64, u: bool, wide: bool }
+
+type MgAtom = { set: bool, c: i64, items: [MgItem] }
+
+fn rx_peek(r: MgReader, k: i64) -> i64 {
+    return if r.i + k < r.cs.len() { r.cs[r.i + k] } else { 0 - 1 }
+}
+
+fn is_quant(c: i64) -> bool {
+    return c == 42 or c == 43 or c == 63
+}
+
+fn is_syntax_char(c: i64) -> bool {
+    return c == 94 or c == 36 or c == 92 or c == 46 or c == 42 or c == 43 or c == 63 or c == 40 or c == 41 or c == 91 or c == 93 or c == 123 or c == 125 or c == 124
+}
+
+fn control_escape(e: i64) -> i64 {
+    return if e == 116 { 9 } else if e == 110 { 10 } else if e == 118 { 11 } else if e == 102 { 12 } else if e == 114 { 13 } else { 0 - 1 }
+}
+
+fn rx_disj(inout r: MgReader) -> ref MgRx ! MgError {
+    var alts: [ref MgRx] = []
+    alts.push(try rx_alt(r))
+    while rx_peek(r, 0) == 124 {
+        r.i = r.i + 1
+        alts.push(try rx_alt(r))
+    }
+    if alts.len() == 1 {
+        return alts[0]
+    }
+    return ref(MgAlt(alts))
+}
+
+fn rx_alt(inout r: MgReader) -> ref MgRx ! MgError {
+    var items: [ref MgRx] = []
+    while r.i < r.cs.len() and r.cs[r.i] != 124 and r.cs[r.i] != 41 {
+        items.push(try rx_term(r))
+    }
+    return ref(MgSeq(items))
+}
+
+fn rx_term(inout r: MgReader) -> ref MgRx ! MgError {
+    let c = r.cs[r.i]
+    if is_quant(c) {
+        fail(MgSyntaxError("Nothing to repeat"))
+    }
+    if c == 94 or c == 36 {
+        r.i = r.i + 1
+        if is_quant(rx_peek(r, 0)) {
+            fail(MgSyntaxError("Nothing to repeat"))
+        }
+        return if c == 94 { ref(MgBol) } else { ref(MgEol) }
+    }
+    let atom = try rx_atom(r)
+    let q = rx_peek(r, 0)
+    if not is_quant(q) {
+        return atom
+    }
+    r.i = r.i + 1
+    if rx_peek(r, 0) == 63 {
+        r.i = r.i + 1
+    }
+    return ref(MgRep(atom, if q == 43 { 1 } else { 0 }, if q == 63 { 1 } else { 0 - 1 }))
+}
+
+fn rx_atom(inout r: MgReader) -> ref MgRx ! MgError {
+    let c = r.cs[r.i]
+    if c == 40 {
+        return try rx_group(r)
+    }
+    r.i = r.i + 1
+    if c == 91 {
+        return try rx_class(r)
+    }
+    if c == 46 {
+        return ref(MgDot)
+    }
+    if c == 92 {
+        let a = try rx_escape(r, false)
+        return if a.set { ref(MgSet(a.items, false)) } else { ref(MgCh(a.c)) }
+    }
+    if r.u and (c == 123 or c == 125 or c == 93) {
+        fail(MgSyntaxError("Lone quantifier brackets"))
+    }
+    if c >= 128 {
+        r.wide = true
+    }
+    return ref(MgCh(c))
+}
+
+fn rx_group(inout r: MgReader) -> ref MgRx ! MgError {
+    let negative = rx_peek(r, 1) == 63 and rx_peek(r, 2) == 33
+    if rx_peek(r, 1) == 63 and (rx_peek(r, 2) == 33 or rx_peek(r, 2) == 58) {
+        r.i = r.i + 3
+    } else if rx_peek(r, 1) == 63 {
+        fail(MgSyntaxError("Invalid group"))
+    } else {
+        r.i = r.i + 1
+    }
+    let inner = try rx_disj(r)
+    if rx_peek(r, 0) != 41 {
+        fail(MgSyntaxError("Unterminated group"))
+    }
+    r.i = r.i + 1
+    return if negative { ref(MgNot(inner)) } else { inner }
+}
+
+/// An escape after its backslash, in a class or out of one.
+fn rx_escape(inout r: MgReader, in_class: bool) -> MgAtom ! MgError {
+    if r.i >= r.cs.len() {
+        fail(MgSyntaxError("\\ at end of pattern"))
+    }
+    let e = r.cs[r.i]
+    r.i = r.i + 1
+    let simple = control_escape(e)
+    if simple >= 0 {
+        return MgAtom{ set: false, c: simple, items: [] }
+    }
+    if e == 120 and is_hex(rx_peek(r, 0)) and is_hex(rx_peek(r, 1)) {
+        let v = hex_value(rx_peek(r, 0)) * 16 + hex_value(rx_peek(r, 1))
+        r.i = r.i + 2
+        if v >= 128 {
+            r.wide = true
+        }
+        return MgAtom{ set: false, c: v, items: [] }
+    }
+    if e == 112 and r.u and rx_peek(r, 0) == 123 {
+        return try rx_property(r)
+    }
+    if is_syntax_char(e) or e == 47 or in_class and e == 45 {
+        return MgAtom{ set: false, c: e, items: [] }
+    }
+    if r.u {
+        fail(MgSyntaxError(if in_class { "Invalid class escape" } else { "Invalid escape" }))
+    }
+    if e >= 128 {
+        r.wide = true
+    }
+    return MgAtom{ set: false, c: e, items: [] }
+}
+
+/// `\p{Name}` after its `p`.
+fn rx_property(inout r: MgReader) -> MgAtom ! MgError {
+    var name: [i64] = []
+    var k = r.i + 1
+    while k < r.cs.len() and r.cs[k] != 125 {
+        name.push(r.cs[k])
+        k = k + 1
+    }
+    let ranges = category_ranges(text_of(name))
+    if k >= r.cs.len() or ranges.len() == 0 {
+        fail(MgSyntaxError("Invalid property name"))
+    }
+    r.i = k + 1
+    r.wide = true
+    return MgAtom{ set: true, c: 0, items: [MgProp(ranges)] }
+}
+
+fn rx_class_atom(inout r: MgReader) -> MgAtom ! MgError {
+    let c = r.cs[r.i]
+    r.i = r.i + 1
+    if c == 92 {
+        return try rx_escape(r, true)
+    }
+    return MgAtom{ set: false, c: c, items: [] }
+}
+
+fn rx_class(inout r: MgReader) -> ref MgRx ! MgError {
+    var negated = false
+    if rx_peek(r, 0) == 94 {
+        negated = true
+        r.i = r.i + 1
+    }
+    var items: [MgItem] = []
+    while r.i < r.cs.len() and r.cs[r.i] != 93 {
+        let a = try rx_class_atom(r)
+        if not a.set and rx_peek(r, 0) == 45 and rx_peek(r, 1) >= 0 and rx_peek(r, 1) != 93 {
+            r.i = r.i + 1
+            let b = try rx_class_atom(r)
+            if b.set {
+                fail(MgSyntaxError("Invalid character class"))
+            }
+            if a.c > b.c {
+                fail(MgSyntaxError("Range out of order in character class"))
+            }
+            items.push(MgRange(a.c, b.c))
+        } else if a.set {
+            for it in a.items {
+                items.push(it)
+            }
+        } else {
+            items.push(MgRange(a.c, a.c))
+        }
+    }
+    if r.i >= r.cs.len() {
+        fail(MgSyntaxError("Unterminated character class"))
+    }
+    r.i = r.i + 1
+    for it in items {
+        match it {
+            MgRange(_lo, hi) -> {
+                if hi >= 128 {
+                    r.wide = true
+                }
+            }
+            MgProp(_x) -> ()
+        }
+    }
+    return ref(MgSet(items, negated))
+}
+
+/// Surrogate pairs as code points, as the u flag reads a pattern.
+fn code_points(u: [i64]) -> [i64] {
+    var out: [i64] = []
+    var i = 0
+    while i < u.len() {
+        let c = u[i]
+        if c >= 55296 and c <= 56319 and i + 1 < u.len() and u[i + 1] >= 56320 and u[i + 1] <= 57343 {
+            out.push((c - 55296) * 1024 + u[i + 1] - 56320 + 65536)
+            i = i + 2
+        } else {
+            out.push(c)
+            i = i + 1
+        }
+    }
+    return out
+}
+
+fn rx_parse_all(inout r: MgReader) -> ref MgRx ! MgError {
+    let root = try rx_disj(r)
+    if r.i < r.cs.len() {
+        fail(MgSyntaxError("Unmatched ')'"))
+    }
+    return root
+}
+
+/// `new RegExp("^" + src + "$", flags)`.
+fn rx_compile(src: [i64], icase: bool, unicode: bool) -> MgRe ! MgError {
+    var full = [94]
+    extend(full, src)
+    full.push(36)
+    var r = MgReader{ cs: if unicode { code_points(full) } else { full }, i: 0, u: unicode, wide: false }
+    let root = match rx_parse_all(r) {
+        Ok(x) -> x
+        Err(e) -> {
+            let flags = (if icase { "i" } else { "" }) + (if unicode { "u" } else { "" })
+            fail(MgSyntaxError("Invalid regular expression: /" + text_of(full) + "/" + flags + ": " + error_message(e)))
+        }
+    }
+    return MgRe{ root: root, icase: icase, unicode: unicode, wide: r.wide }
+}
+
+// ---- matching
+
+/// Case folding for one test: `keys` map to `vals`; `inv` is every
+/// `val * 2^21 + key`, sorted. Empty tables fold ASCII letters only.
+type MgFold = { on: bool, unicode: bool, keys: [i64], vals: [i64], inv: [i64] }
+
+fn base36(t: str) -> i64 {
+    var v = 0
+    var neg = false
+    for c in t.codes() {
+        if c == 45 {
+            neg = true
+        } else {
+            v = v * 36 + (if c >= 97 { c - 87 } else { c - 48 })
+        }
+    }
+    return if neg { 0 - v } else { v }
+}
+
+/// A category's ranges, low and high in turn.
+fn category_ranges(name: str) -> [i64] {
+    let text = category_table(name)
+    if text.len() == 0 {
+        return []
+    }
+    let xs = text.split(".")
+    var out: [i64] = []
+    var prev = 0
+    var i = 0
+    while i + 1 < xs.len() {
+        let a = prev + base36(xs[i])
+        let b = a + base36(xs[i + 1]) - 1
+        out.push(a)
+        out.push(b)
+        prev = b + 1
+        i = i + 2
+    }
+    return out
+}
+
+fn fold_tables(unicode: bool) -> MgFold {
+    let xs = (if unicode { fold_table() } else { canon_table() }).split(".")
+    var keys: [i64] = []
+    var vals: [i64] = []
+    var inv: [i64] = []
+    var prev = 0
+    var i = 0
+    while i + 1 < xs.len() {
+        let x = prev + base36(xs[i])
+        let y = x + base36(xs[i + 1])
+        keys.push(x)
+        vals.push(y)
+        inv.push(y * 2097152 + x)
+        prev = x
+        i = i + 2
+    }
+    inv.sort()
+    return MgFold{ on: true, unicode: unicode, keys: keys, vals: vals, inv: inv }
+}
+
+fn bsearch(xs: [i64], x: i64) -> i64 {
+    var lo = 0
+    var hi = xs.len() - 1
+    while lo <= hi {
+        let mid = (lo + hi) / 2
+        if xs[mid] == x {
+            return mid
+        }
+        if xs[mid] < x {
+            lo = mid + 1
+        } else {
+            hi = mid - 1
+        }
+    }
+    return 0 - 1
+}
+
+fn lower_bound(xs: [i64], x: i64) -> i64 {
+    var lo = 0
+    var hi = xs.len()
+    while lo < hi {
+        let mid = (lo + hi) / 2
+        if xs[mid] < x {
+            lo = mid + 1
+        } else {
+            hi = mid
+        }
+    }
+    return lo
+}
+
+fn canon(x: i64, f: MgFold) -> i64 {
+    if f.keys.len() == 0 {
+        return if x >= 65 and x <= 90 { x + 32 } else { x }
+    }
+    let at = bsearch(f.keys, x)
+    return if at >= 0 { f.vals[at] } else { x }
+}
+
+/// Every character that folds as `x` does.
+fn fold_class(x: i64, f: MgFold) -> [i64] {
+    if f.keys.len() == 0 {
+        if x >= 65 and x <= 90 {
+            return [x, x + 32]
+        }
+        return if x >= 97 and x <= 122 { [x, x - 32] } else { [x] }
+    }
+    let k = canon(x, f)
+    var out: [i64] = []
+    if canon(k, f) == k {
+        out.push(k)
+    }
+    var i = lower_bound(f.inv, k * 2097152)
+    while i < f.inv.len() and f.inv[i] / 2097152 == k {
+        let key = f.inv[i] % 2097152
+        if key != k {
+            out.push(key)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn in_ranges(flat: [i64], c: i64) -> bool {
+    var lo = 0
+    var hi = flat.len() / 2 - 1
+    while lo <= hi {
+        let mid = (lo + hi) / 2
+        if c < flat[mid * 2] {
+            hi = mid - 1
+        } else if c > flat[mid * 2 + 1] {
+            lo = mid + 1
+        } else {
+            return true
+        }
+    }
+    return false
+}
+
+fn in_items(items: [MgItem], c: i64) -> bool {
+    for it in items {
+        let hit = match it {
+            MgRange(lo, hi) -> c >= lo and c <= hi
+            MgProp(flat) -> in_ranges(flat, c)
+        }
+        if hit {
+            return true
+        }
+    }
+    return false
+}
+
+fn set_has(items: [MgItem], negated: bool, c: i64, f: MgFold) -> bool {
+    var found = false
+    if f.on {
+        found = fold_class(c, f).any(|a| in_items(items, a))
+    } else {
+        found = in_items(items, c)
+    }
+    return found != negated
+}
+
+/// The character at `p`, and how many units it takes.
+fn char_at(s: [i64], p: i64, u: bool) -> (i64, i64) {
+    let c = s[p]
+    if u and c >= 55296 and c <= 56319 and p + 1 < s.len() and s[p + 1] >= 56320 and s[p + 1] <= 57343 {
+        return ((c - 55296) * 1024 + s[p + 1] - 56320 + 65536, 2)
+    }
+    return (c, 1)
+}
+
+fn merge(a: [i64], b: [i64]) -> [i64] {
+    var out: [i64] = []
+    var i = 0
+    var j = 0
+    while i < a.len() or j < b.len() {
+        if j >= b.len() or i < a.len() and a[i] < b[j] {
+            out.push(a[i])
+            i = i + 1
+        } else if i >= a.len() or b[j] < a[i] {
+            out.push(b[j])
+            j = j + 1
+        } else {
+            out.push(a[i])
+            i = i + 1
+            j = j + 1
+        }
+    }
+    return out
+}
+
+/// One character, `c` or a class: the positions after it.
+fn rx_step(rx: ref MgRx, s: [i64], starts: [i64], f: MgFold) -> [i64] {
+    var out: [i64] = []
+    for p in starts {
+        if p < s.len() {
+            let (ch, w) = char_at(s, p, f.unicode)
+            let hit = match rx {
+                MgCh(c) -> ch == c or f.on and canon(ch, f) == canon(c, f)
+                MgSet(items, negated) -> set_has(items, negated, ch, f)
+                _ -> not is_lt(ch)
+            }
+            if hit {
+                out.push(p + w)
+            }
+        }
+    }
+    return out
+}
+
+/// The positions in `a` that are not in `b`; both sorted.
+fn minus(a: [i64], b: [i64]) -> [i64] {
+    var out: [i64] = []
+    var j = 0
+    for x in a {
+        while j < b.len() and b[j] < x {
+            j = j + 1
+        }
+        if j >= b.len() or b[j] != x {
+            out.push(x)
+        }
+    }
+    return out
+}
+
+fn rx_repeat(item: ref MgRx, least: i64, most: i64, s: [i64], starts: [i64], f: MgFold) -> [i64] {
+    var cur = starts
+    var k = 0
+    while k < least {
+        cur = rx_run(item, s, cur, f)
+        k = k + 1
+    }
+    if most == 1 {
+        return merge(cur, rx_run(item, s, cur, f))
+    }
+    var all = cur
+    var frontier = cur
+    while frontier.len() > 0 {
+        let fresh = minus(rx_run(item, s, frontier, f), all)
+        all = merge(all, fresh)
+        frontier = fresh
+    }
+    return all
+}
+
+/// Every position a match of `rx` can end at, from any of `starts`.
+fn rx_run(rx: ref MgRx, s: [i64], starts: [i64], f: MgFold) -> [i64] {
+    return match rx {
+        MgBol -> starts.filter(|p| p == 0)
+        MgEol -> starts.filter(|p| p == s.len())
+        MgSeq(items) -> {
+            var cur = starts
+            for it in items {
+                if cur.len() > 0 {
+                    cur = rx_run(it, s, cur, f)
+                }
+            }
+            cur
+        }
+        MgAlt(alts) -> {
+            var out: [i64] = []
+            for a in alts {
+                out = merge(out, rx_run(a, s, starts, f))
+            }
+            out
+        }
+        MgNot(inner) -> starts.filter(|p| rx_run(inner, s, [p], f).len() == 0)
+        MgRep(item, least, most) -> rx_repeat(item, least, most, s, starts, f)
+        _ -> rx_step(rx, s, starts, f)
+    }
+}
+
+/// `re.test(s)`; the expression is anchored at both ends.
+fn rx_test(re: MgRe, s: [i64]) -> bool {
+    var f = MgFold{ on: re.icase, unicode: re.unicode, keys: [], vals: [], inv: [] }
+    if re.icase and (re.wide or s.any(|c| c >= 128)) {
+        f = fold_tables(re.unicode)
+    }
+    return rx_run(re.root, s, [0], f).len() > 0
+}
+
+// ---- minimatch's AST: a segment to the source of its expression
+
+type MgPart = | MgText(s: [i64]) | MgSub(id: i64)
+
+/// One node; `kind` is 0 for a plain run, else the extglob's character.
+/// `magic` is -1 while minimatch's field is still undefined.
+type MgNode = {
+    kind: i64,
+    parent: i64,
+    index: i64,
+    parts: [MgPart],
+    magic: i64,
+    uflag: bool,
+    empty_ext: bool,
+    cached: bool,
+    text: [i64],
+}
+
+/// The nodes, the root first, and the `!(...)` nodes to fill.
+type MgTree = { nodes: [MgNode], negs: [i64], filled: bool }
+
+/// What `toRegExpSource` returns: the source, the unescaped body, whether
+/// there is magic, and whether the u flag is needed.
+type MgSrc = { re: [i64], body: [i64], magic: bool, uflag: bool }
+
+fn is_ext_char(c: i64) -> bool {
+    return c == 33 or c == 63 or c == 43 or c == 42 or c == 64
+}
+
+fn mg_new(inout t: MgTree, kind: i64, parent: i64) -> i64 {
+    let index = if parent >= 0 { t.nodes[parent].parts.len() } else { 0 }
+    t.nodes.push(MgNode{ kind: kind, parent: parent, index: index, parts: [], magic: if kind != 0 { 1 } else { 0 - 1 }, uflag: false, empty_ext: false, cached: false,
+        text: [] })
+    let id = t.nodes.len() - 1
+    if kind == 33 and not t.filled {
+        t.negs.push(id)
+    }
+    return id
+}
+
+fn mg_push(inout t: MgTree, id: i64, p: MgPart) {
+    let empty = match p {
+        MgText(s) -> s.len() == 0
+        MgSub(_x) -> false
+    }
+    if not empty {
+        var n = t.nodes[id]
+        n.parts.push(p)
+        t.nodes[id] = n
+    }
+}
+
+/// `#parseAST`'s tracking of `[...]`, which hides `|`, `)` and extglobs.
+type MgScan = { inside: bool, start: i64, neg: bool }
+
+fn mg_bracket(inout b: MgScan, c: i64, i: i64) -> bool {
+    if b.inside {
+        if i == b.start + 1 {
+            if c == 94 or c == 33 {
+                b.neg = true
+            }
+        } else if c == 93 and not (i == b.start + 2 and b.neg) {
+            b.inside = false
+        }
+        return true
+    }
+    if c == 91 {
+        b.inside = true
+        b.start = i
+        b.neg = false
+        return true
+    }
+    return false
+}
+
+// No backslash reaches the parser: `windowsPathsNoEscape` made them all
+// separators, so minimatch's escape handling never runs here.
+fn mg_parse_root(inout t: MgTree, s: [i64]) {
+    var i = 0
+    var acc: [i64] = []
+    var b = MgScan{ inside: false, start: 0 - 1, neg: false }
+    while i < s.len() {
+        let c = s[i]
+        i = i + 1
+        if mg_bracket(b, c, i) {
+            acc.push(c)
+        } else if is_ext_char(c) and i < s.len() and s[i] == 40 {
+            mg_push(t, 0, MgText(acc))
+            acc = []
+            let e = mg_new(t, c, 0)
+            i = mg_parse_ext(t, s, e, i)
+            mg_push(t, 0, MgSub(e))
+        } else {
+            acc.push(c)
+        }
+    }
+    mg_push(t, 0, MgText(acc))
+}
+
+/// An extglob whose `(` is at `pos`; the index after its `)`.
+fn mg_parse_ext(inout t: MgTree, s: [i64], ast: i64, pos: i64) -> i64 {
+    var i = pos + 1
+    var part = mg_new(t, 0, ast)
+    var alts: [i64] = []
+    var acc: [i64] = []
+    var b = MgScan{ inside: false, start: 0 - 1, neg: false }
+    while i < s.len() {
+        let c = s[i]
+        i = i + 1
+        if mg_bracket(b, c, i) {
+            acc.push(c)
+        } else if is_ext_char(c) and i < s.len() and s[i] == 40 {
+            mg_push(t, part, MgText(acc))
+            acc = []
+            let e = mg_new(t, c, part)
+            mg_push(t, part, MgSub(e))
+            i = mg_parse_ext(t, s, e, i)
+        } else if c == 124 {
+            mg_push(t, part, MgText(acc))
+            acc = []
+            alts.push(part)
+            // Every alternative is made while `ast` has no parts, so all of
+            // them have index 0.
+            part = mg_new(t, 0, ast)
+        } else if c == 41 {
+            if acc.len() == 0 and t.nodes[ast].parts.len() == 0 {
+                var n = t.nodes[ast]
+                n.empty_ext = true
+                t.nodes[ast] = n
+            }
+            mg_push(t, part, MgText(acc))
+            for a in alts {
+                mg_push(t, ast, MgSub(a))
+            }
+            mg_push(t, ast, MgSub(part))
+            return i
+        } else {
+            acc.push(c)
+        }
+    }
+    // Unterminated: the rest of the text, from the extglob's character.
+    var n = t.nodes[ast]
+    n.kind = 0
+    n.magic = 0 - 1
+    n.parts = [MgText(s.slice(pos - 1, s.len()))]
+    t.nodes[ast] = n
+    return i
+}
+
+/// `toString`, cached the first time as minimatch caches it.
+fn mg_text(inout t: MgTree, id: i64) -> [i64] {
+    if t.nodes[id].cached {
+        return t.nodes[id].text
+    }
+    let n = t.nodes[id]
+    var out: [i64] = []
+    if n.kind != 0 {
+        out.push(n.kind)
+        out.push(40)
+    }
+    var first = true
+    for p in n.parts {
+        if n.kind != 0 and not first {
+            out.push(124)
+        }
+        first = false
+        let piece = match p {
+            MgText(s) -> s
+            MgSub(c) -> mg_text(t, c)
+        }
+        extend(out, piece)
+    }
+    if n.kind != 0 {
+        out.push(41)
+    }
+    var m = t.nodes[id]
+    m.cached = true
+    m.text = out
+    t.nodes[id] = m
+    return out
+}
+
+fn mg_clone(inout t: MgTree, src: i64, parent: i64) -> i64 {
+    let c = mg_new(t, t.nodes[src].kind, parent)
+    for p in t.nodes[src].parts {
+        mg_copy_in(t, c, p)
+    }
+    return c
+}
+
+fn mg_copy_in(inout t: MgTree, into: i64, part: MgPart) {
+    match part {
+        MgText(s) -> mg_push(t, into, MgText(s))
+        MgSub(src) -> {
+            let c = mg_clone(t, src, into)
+            mg_push(t, into, MgSub(c))
+        }
+    }
+}
+
+/// `#fillNegs`: each `!(...)` alternative gets a copy of everything after
+/// the extglob, up through the plain runs that hold it.
+fn mg_fill_negs(inout t: MgTree) {
+    if t.filled {
+        return
+    }
+    let _whole = mg_text(t, 0)
+    t.filled = true
+    while t.negs.len() > 0 {
+        let n = t.negs[t.negs.len() - 1]
+        t.negs = t.negs.slice(0, t.negs.len() - 1)
+        if t.nodes[n].kind == 33 {
+            var p = n
+            var pp = t.nodes[n].parent
+            while pp >= 0 {
+                var i = t.nodes[p].index + 1
+                while t.nodes[pp].kind == 0 and i < t.nodes[pp].parts.len() {
+                    let sibling = t.nodes[pp].parts[i]
+                    for alt in t.nodes[n].parts {
+                        match alt {
+                            MgSub(a) -> mg_copy_in(t, a, sibling)
+                            MgText(_s) -> ()
+                        }
+                    }
+                    i = i + 1
+                }
+                p = pp
+                pp = t.nodes[pp].parent
+            }
+        }
+    }
+}
+
+fn mg_is_start(t: MgTree, id: i64) -> bool {
+    if id == 0 {
+        return true
+    }
+    let par = t.nodes[id].parent
+    if not mg_is_start(t, par) {
+        return false
+    }
+    let idx = t.nodes[id].index
+    var i = 0
+    while i < idx {
+        if i >= t.nodes[par].parts.len() {
+            return false
+        }
+        let neg = match t.nodes[par].parts[i] {
+            MgSub(x) -> t.nodes[x].kind == 33
+            MgText(_s) -> false
+        }
+        if not neg {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn mg_is_end(t: MgTree, id: i64) -> bool {
+    if id == 0 {
+        return true
+    }
+    let par = t.nodes[id].parent
+    if t.nodes[par].kind == 33 {
+        return true
+    }
+    if not mg_is_end(t, par) {
+        return false
+    }
+    if t.nodes[id].kind == 0 {
+        return true
+    }
+    return t.nodes[id].index == t.nodes[par].parts.len() - 1
+}
+
+fn mg_source(inout t: MgTree, id: i64, allow: i64) -> MgSrc {
+    if id == 0 {
+        mg_fill_negs(t)
+    }
+    if t.nodes[id].kind == 0 {
+        return mg_plain_source(t, id, allow)
+    }
+    return mg_ext_source(t, id, allow)
+}
+
+/// `[` and `.`: the starts that could open a dot or traversal segment.
+fn opens_dot(src: [i64], k: i64) -> bool {
+    return k < src.len() and (src[k] == 91 or src[k] == 46)
+}
+
+/// The guard before a plain run that starts its segment.
+fn mg_start_guard(t: MgTree, id: i64, src: [i64], allow: i64) -> [i64] {
+    let parts = t.nodes[id].parts
+    if not mg_is_start(t, id) or parts.len() == 0 {
+        return []
+    }
+    let first = match parts[0] {
+        MgText(s0) -> s0
+        MgSub(_c) -> return []
+    }
+    if parts.len() == 1 and (first == [46] or first == [46, 46]) {
+        return []
+    }
+    let dot = allow == 1
+    let no_trav = dot and opens_dot(src, 0) or starts_at(src, 0, [92, 46]) and opens_dot(src, 2) or starts_at(src, 0, [92, 46, 92, 46]) and opens_dot(src, 4)
+    if no_trav {
+        return units_of("(?!(?:^|/)\\.\\.?(?:$|/))")
+    }
+    return if not dot and allow != 1 and opens_dot(src, 0) { units_of("(?!\\.)") } else { [] }
+}
+
+fn mg_plain_source(inout t: MgTree, id: i64, allow: i64) -> MgSrc {
+    let no_empty = mg_is_start(t, id) and mg_is_end(t, id)
+    var src: [i64] = []
+    for p in t.nodes[id].parts {
+        let r = match p {
+            MgText(s) -> mg_parse_glob(s, t.nodes[id].magic == 1, no_empty)
+            MgSub(c) -> mg_source(t, c, allow)
+        }
+        var n = t.nodes[id]
+        n.magic = if n.magic == 1 or r.magic { 1 } else { 0 }
+        n.uflag = n.uflag or r.uflag
+        t.nodes[id] = n
+        extend(src, r.re)
+    }
+    var re = mg_start_guard(t, id, src, allow)
+    extend(re, src)
+    let par = t.nodes[id].parent
+    if mg_is_end(t, id) and t.filled and par >= 0 and t.nodes[par].kind == 33 {
+        extend(re, units_of("(?:$|\\/)"))
+    }
+    var n = t.nodes[id]
+    n.magic = if n.magic == 1 { 1 } else { 0 }
+    t.nodes[id] = n
+    return MgSrc{ re: re, body: if id == 0 { mg_unescape(src) } else { [] }, magic: n.magic == 1, uflag: n.uflag }
+}
+
+/// `#partsToRegExp`: the alternatives' sources joined with `|`.
+fn mg_parts_source(inout t: MgTree, id: i64, dot: bool) -> [i64] {
+    var res: [[i64]] = []
+    for p in t.nodes[id].parts {
+        match p {
+            MgSub(c) -> {
+                let r = mg_source(t, c, if dot { 1 } else { 0 })
+                var n = t.nodes[id]
+                n.uflag = n.uflag or r.uflag
+                t.nodes[id] = n
+                res.push(r.re)
+            }
+            MgText(_s) -> ()
+        }
+    }
+    let whole = mg_is_start(t, id) and mg_is_end(t, id)
+    var out: [i64] = []
+    var first = true
+    for r in res {
+        if not whole or r.len() > 0 {
+            if not first {
+                out.push(124)
+            }
+            extend(out, r)
+            first = false
+        }
+    }
+    return out
+}
+
+fn mg_ext_close(t: MgTree, id: i64, dot: bool, allow: i64, dotted: bool) -> [i64] {
+    let kind = t.nodes[id].kind
+    if kind == 33 {
+        var close = [41, 41]
+        if mg_is_start(t, id) and not dot and allow != 1 {
+            extend(close, units_of("(?!\\.)"))
+        }
+        extend(close, units_of("[^/]*?)"))
+        return close
+    }
+    if kind == 64 or kind == 43 and dotted {
+        return [41]
+    }
+    if kind == 63 or kind == 42 and dotted {
+        return [41, 63]
+    }
+    return [41, kind]
+}
+
+fn mg_ext_source(inout t: MgTree, id: i64, allow: i64) -> MgSrc {
+    let dot = allow == 1
+    let kind = t.nodes[id].kind
+    var body = mg_parts_source(t, id, dot)
+    if mg_is_start(t, id) and mg_is_end(t, id) and body.len() == 0 and kind != 33 {
+        // Nothing inside: the extglob's own text, unescaped, as a literal.
+        let s = mg_text(t, id)
+        var n = t.nodes[id]
+        n.parts = [MgText(s)]
+        n.kind = 0
+        n.magic = 0 - 1
+        t.nodes[id] = n
+        return MgSrc{ re: s, body: [], magic: false, uflag: false }
+    }
+    var dotted: [i64] = []
+    if (kind == 42 or kind == 43) and allow != 1 and not dot {
+        dotted = mg_parts_source(t, id, true)
+    }
+    if dotted == body {
+        dotted = []
+    }
+    if dotted.len() > 0 {
+        var b = units_of("(?:")
+        extend(b, body)
+        extend(b, units_of(")(?:"))
+        extend(b, dotted)
+        extend(b, units_of(")*?"))
+        body = b
+    }
+    var re: [i64] = []
+    if kind == 33 and t.nodes[id].empty_ext {
+        if mg_is_start(t, id) and not dot {
+            re = units_of("(?!\\.)")
+        }
+        extend(re, units_of("[^/]+?"))
+    } else {
+        re = units_of(if kind == 33 { "(?:(?!(?:" } else { "(?:" })
+        extend(re, body)
+        extend(re, mg_ext_close(t, id, dot, allow, dotted.len() > 0))
+    }
+    return MgSrc{ re: re, body: [], magic: true, uflag: t.nodes[id].uflag }
+}
+
+fn regexp_escape(c: i64) -> [i64] {
+    let special = c == 45 or c == 91 or c == 93 or c == 123 or c == 125 or c == 40 or c == 41 or c == 42 or c == 43 or c == 63 or c == 46 or c == 44 or c == 92 or c ==
+    94 or c == 36 or c == 124 or c == 35 or is_space(c)
+    return if special { [92, c] } else { [c] }
+}
+
+fn brace_escape(cs: [i64]) -> [i64] {
+    var out: [i64] = []
+    for c in cs {
+        if c == 91 or c == 93 or c == 92 or c == 45 {
+            out.push(92)
+        }
+        out.push(c)
+    }
+    return out
+}
+
+/// `#parseGlob` for a plain piece of a segment.
+fn mg_parse_glob(glob: [i64], has_magic: bool, no_empty: bool) -> MgSrc {
+    var re: [i64] = []
+    var uflag = false
+    var magic = has_magic
+    var i = 0
+    while i < glob.len() {
+        let c = glob[i]
+        var done = false
+        if c == 91 {
+            let k = mg_parse_class(glob, i)
+            if k.consumed > 0 {
+                extend(re, k.src)
+                uflag = uflag or k.uflag
+                i = i + k.consumed
+                magic = magic or k.magic
+                done = true
+            }
+        }
+        if not done {
+            if c == 42 {
+                extend(re, units_of(if no_empty and glob == [42] { "[^/]+?" } else { "[^/]*?" }))
+                magic = true
+            } else if c == 63 {
+                extend(re, units_of("[^/]"))
+                magic = true
+            } else {
+                extend(re, regexp_escape(c))
+            }
+            i = i + 1
+        }
+    }
+    return MgSrc{ re: re, body: [], magic: magic, uflag: uflag }
+}
+
+type MgClass = { src: [i64], uflag: bool, consumed: i64, magic: bool }
+
+/// minimatch's POSIX classes: name, the class body, Unicode, negated.
+fn posix_classes() -> [(str, str, bool, bool)] {
+    return [
+        ("[:alnum:]", "\\p\{L\}\\p\{Nl\}\\p\{Nd\}", true, false),
+        ("[:alpha:]", "\\p\{L\}\\p\{Nl\}", true, false),
+        ("[:ascii:]", "\\x00-\\x7f", false, false),
+        ("[:blank:]", "\\p\{Zs\}\\t", true, false),
+        ("[:cntrl:]", "\\p\{Cc\}", true, false),
+        ("[:digit:]", "\\p\{Nd\}", true, false),
+        ("[:graph:]", "\\p\{Z\}\\p\{C\}", true, true),
+        ("[:lower:]", "\\p\{Ll\}", true, false),
+        ("[:print:]", "\\p\{C\}", true, false),
+        ("[:punct:]", "\\p\{P\}", true, false),
+        ("[:space:]", "\\p\{Z\}\\t\\r\\n\\v\\f", true, false),
+        ("[:upper:]", "\\p\{Lu\}", true, false),
+        ("[:word:]", "\\p\{L\}\\p\{Nl\}\\p\{Nd\}\\p\{Pc\}", true, false),
+        ("[:xdigit:]", "A-Fa-f0-9", false, false),
+    ]
+}
+
+fn class_never(glob: [i64], pos: i64) -> MgClass {
+    return MgClass{ src: [36, 46], uflag: false, consumed: glob.len() - pos, magic: true }
+}
+
+/// `parseClass`: a bracket expression at `pos`, or nothing consumed.
+fn mg_parse_class(glob: [i64], pos: i64) -> MgClass {
+    var ranges: [[i64]] = []
+    var negs: [[i64]] = []
+    var i = pos + 1
+    var saw_start = false
+    var uflag = false
+    var negate = false
+    var end_pos = pos
+    var range_start = 0 - 1
+    let classes = posix_classes()
+    while i < glob.len() {
+        let c = glob[i]
+        var next = false
+        if (c == 33 or c == 94) and i == pos + 1 {
+            negate = true
+            i = i + 1
+            next = true
+        } else if c == 93 and saw_start {
+            end_pos = i + 1
+            break
+        }
+        if not next {
+            saw_start = true
+            if c == 91 {
+                for pc in classes {
+                    if not next and starts_at(glob, i, units_of(pc.0)) {
+                        if range_start >= 0 {
+                            return class_never(glob, pos)
+                        }
+                        i = i + units_of(pc.0).len()
+                        if pc.3 {
+                            negs.push(units_of(pc.1))
+                        } else {
+                            ranges.push(units_of(pc.1))
+                        }
+                        uflag = uflag or pc.2
+                        next = true
+                    }
+                }
+            }
+        }
+        if not next {
+            if range_start >= 0 {
+                if c > range_start {
+                    var r = brace_escape([range_start])
+                    r.push(45)
+                    extend(r, brace_escape([c]))
+                    ranges.push(r)
+                } else if c == range_start {
+                    ranges.push(brace_escape([c]))
+                }
+                range_start = 0 - 1
+                i = i + 1
+            } else if starts_at(glob, i + 1, [45, 93]) {
+                ranges.push(brace_escape([c, 45]))
+                i = i + 2
+            } else if starts_at(glob, i + 1, [45]) {
+                range_start = c
+                i = i + 2
+            } else {
+                ranges.push(brace_escape([c]))
+                i = i + 1
+            }
+        }
+    }
+    return mg_class_result(ranges, negs, negate, uflag, end_pos, i, glob, pos)
+}
+
+fn mg_class_result(ranges: [[i64]], negs: [[i64]], negate: bool, uflag: bool, end_pos: i64, i: i64, glob: [i64], pos: i64) -> MgClass {
+    if end_pos < i {
+        return MgClass{ src: [], uflag: false, consumed: 0, magic: false }
+    }
+    if ranges.len() == 0 and negs.len() == 0 {
+        return class_never(glob, pos)
+    }
+    if negs.len() == 0 and ranges.len() == 1 and not negate {
+        let r = ranges[0]
+        // `/^\\?.$/`: one character, escaped or not, that is not a line end.
+        let one = r.len() == 1 and not is_lt(r[0]) or r.len() == 2 and r[0] == 92 and not is_lt(r[1])
+        if one {
+            return MgClass{ src: regexp_escape(r[r.len() - 1]), uflag: false, consumed: end_pos - pos, magic: false }
+        }
+    }
+    var sranges = [91]
+    if negate {
+        sranges.push(94)
+    }
+    for r in ranges {
+        extend(sranges, r)
+    }
+    sranges.push(93)
+    var snegs = [91]
+    if not negate {
+        snegs.push(94)
+    }
+    for r in negs {
+        extend(snegs, r)
+    }
+    snegs.push(93)
+    var comb: [i64] = []
+    if ranges.len() > 0 and negs.len() > 0 {
+        comb.push(40)
+        extend(comb, sranges)
+        comb.push(124)
+        extend(comb, snegs)
+        comb.push(41)
+    } else {
+        comb = if ranges.len() > 0 { sranges } else { snegs }
+    }
+    return MgClass{ src: comb, uflag: uflag, consumed: end_pos - pos, magic: true }
+}
+
+/// minimatch's `unescape` without `windowsPathsNoEscape`: `[x]` to `x`,
+/// then `\x` to `x`.
+fn mg_unescape(s: [i64]) -> [i64] {
+    var a: [i64] = []
+    var i = 0
+    while i < s.len() {
+        let one = s[i] != 92 and not is_lt(s[i]) and i + 3 < s.len() and s[i + 1] == 91 and s[i + 2] != 47 and s[i + 2] != 92 and s[i + 3] == 93
+        let at_start = i == 0 and i + 2 < s.len() and s[0] == 91 and s[1] != 47 and s[1] != 92 and s[2] == 93
+        if one {
+            a.push(s[i])
+            a.push(s[i + 2])
+            i = i + 4
+        } else if at_start {
+            a.push(s[1])
+            i = 3
+        } else {
+            a.push(s[i])
+            i = i + 1
+        }
+    }
+    var out: [i64] = []
+    i = 0
+    while i < a.len() {
+        if a[i] == 92 and i + 1 < a.len() and a[i + 1] != 47 {
+            out.push(a[i + 1])
+            i = i + 2
+        } else {
+            out.push(a[i])
+            i = i + 1
+        }
+    }
+    return out
+}
+
+// ---- one segment of a pattern
+
+/// The shapes minimatch tests without its expression.
+type MgFast = | FastNone | FastStar | FastStarExt(ext: [i64]) | FastQmarks(len: i64, ext: [i64]) | FastStarDotStar | FastDotStar
+
+/// A parsed segment: `**`, a literal, or an expression.
+type MgPat = | MgGlobstar | MgLit(s: [i64]) | MgMatch(re: MgRe, fast: MgFast)
+
+fn plain_ext(xs: [i64]) -> bool {
+    return not xs.any(|c| c == 43 or c == 64 or c == 33 or c == 63 or c == 42 or c == 91 or c == 40)
+}
+
+fn run_of(s: [i64], c: i64, from: i64) -> i64 {
+    var k = from
+    while k < s.len() and s[k] == c {
+        k = k + 1
+    }
+    return k
+}
+
+fn fast_kind(seg: [i64]) -> MgFast {
+    let k = run_of(seg, 42, 0)
+    if k > 0 and k == seg.len() {
+        return FastStar
+    }
+    if k > 0 and plain_ext(seg.slice(k, seg.len())) {
+        return FastStarExt(seg.slice(k, seg.len()))
+    }
+    let q = run_of(seg, 63, 0)
+    if q > 0 and plain_ext(seg.slice(q, seg.len())) {
+        return FastQmarks(seg.len(), seg.slice(q, seg.len()))
+    }
+    if k > 0 and k < seg.len() and seg[k] == 46 and k + 1 < seg.len() and run_of(seg, 42, k + 1) == seg.len() {
+        return FastStarDotStar
+    }
+    if seg.len() > 1 and seg[0] == 46 and run_of(seg, 42, 1) == seg.len() {
+        return FastDotStar
+    }
+    return FastNone
+}
+
+fn fast_test(fast: MgFast, f: [i64], nocase: bool) -> bool {
+    let dotted = f.len() > 0 and f[0] == 46
+    return match fast {
+        FastStar -> f.len() != 0 and not dotted
+        FastStarExt(ext) -> not dotted and (if nocase { ends_with(lower_units(f), lower_units(ext)) } else { ends_with(f, ext) })
+        FastQmarks(len, ext) -> {
+            let base = f.len() == len and not dotted
+            if ext.len() == 0 {
+                base
+            } else {
+                base and (if nocase { ends_with(lower_units(f), lower_units(ext)) } else { ends_with(f, ext) })
+            }
+        }
+        FastStarDotStar -> not dotted and f.contains(46)
+        FastDotStar -> f != [46] and f != [46, 46] and dotted
+        FastNone -> false
+    }
+}
+
+/// `Minimatch#parse` for one segment.
+fn parse_segment(seg: [i64], nocase: bool) -> MgPat ! MgError {
+    if seg == [42, 42] {
+        return MgGlobstar
+    }
+    if seg.len() == 0 {
+        return MgLit([])
+    }
+    let fast = fast_kind(seg)
+    var t = MgTree{ nodes: [], negs: [], filled: false }
+    let _root = mg_new(t, 0, 0 - 1)
+    mg_parse_root(t, seg)
+    let _glob = mg_text(t, 0)
+    let src = mg_source(t, 0, 0 - 1)
+    if not src.magic {
+        return MgLit(src.body)
+    }
+    let re = try rx_compile(src.re, nocase, src.uflag)
+    return MgMatch(re, fast)
+}
+
+fn part_matches(p: MgPat, f: [i64], nocase: bool) -> bool {
+    return match p {
+        MgGlobstar -> false
+        MgLit(s) -> f == s
+        MgMatch(re, fast) -> {
+            match fast {
+                FastNone -> rx_test(re, f)
+                _ -> fast_test(fast, f, nocase)
+            }
+        }
+    }
+}
+
+// ---- the whole pattern
+
+type MgOpts = { windows: bool, nocase: bool }
+
+/// `/\{(?:(?!\{).)*\}/`: a `{` and, later on its line with no `{` in
+/// between, a `}`.
+fn has_brace_set(p: [i64]) -> bool {
+    var open = false
+    for c in p {
+        if c == 123 {
+            open = true
+        } else if is_lt(c) {
+            open = false
+        } else if c == 125 and open {
+            return true
+        }
+    }
+    return false
+}
+
+fn brace_set(p: [i64]) -> [[i64]] {
+    let words = if has_brace_set(p) { braceexpansion.expand(text_of(p)).map(|w| units_of(w)) } else { [p] }
+    var out: [[i64]] = []
+    for w in words {
+        if not out.contains(w) {
+            out.push(w)
+        }
+    }
+    return out
+}
+
+/// `split(/\/+/)`, with a leading `//name` kept as an empty first part on
+/// Windows.
+fn slash_split(p: [i64], windows: bool) -> [[i64]] {
+    var out: [[i64]] = []
+    if windows and p.len() > 2 and p[0] == 47 and p[1] == 47 and p[2] != 47 {
+        out.push([])
+    }
+    var cur: [i64] = []
+    var i = 0
+    while i < p.len() {
+        if p[i] == 47 {
+            out.push(cur)
+            cur = []
+            i = run_of(p, 47, i)
+        } else {
+            cur.push(p[i])
+            i = i + 1
+        }
+    }
+    out.push(cur)
+    return out
+}
+
+fn index_from(parts: [[i64]], w: [i64], from: i64) -> i64 {
+    var i = if from < 0 { 0 } else { from }
+    while i < parts.len() {
+        if parts[i] == w {
+            return i
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+fn part_at(parts: [[i64]], i: i64) -> Option[[i64]] {
+    return if i >= 0 and i < parts.len() { Some(parts[i]) } else { None }
+}
+
+fn is_dot_or_dots(p: Option[[i64]]) -> bool {
+    return match p {
+        Some(x) -> x == [46] or x == [46, 46]
+        None -> false
+    }
+}
+
+fn is_real(p: Option[[i64]]) -> bool {
+    return match p {
+        Some(x) -> x.len() > 0 and x != [46] and x != [46, 46] and x != [42, 42]
+        None -> false
+    }
+}
+
+fn splice(parts: [[i64]], at: i64, count: i64, put: [[i64]]) -> [[i64]] {
+    var out = parts.slice(0, at)
+    for w in put {
+        out.push(w)
+    }
+    for w in parts.slice(at + count, parts.len()) {
+        out.push(w)
+    }
+    return out
+}
+
+/// Empty and `.` parts dropped from the middle, and a `./` or `./.` cut to
+/// `.`; true when anything changed.
+fn drop_empties(inout parts: [[i64]]) -> bool {
+    var did = false
+    var i = 1
+    while i < parts.len() - 1 {
+        let p = parts[i]
+        if not (i == 1 and p.len() == 0 and parts[0].len() == 0) and (p == [46] or p.len() == 0) {
+            did = true
+            parts = splice(parts, i, 1, [])
+            i = i - 1
+        }
+        i = i + 1
+    }
+    if parts.len() == 2 and parts[0] == [46] and (parts[1] == [46] or parts[1].len() == 0) {
+        did = true
+        parts = parts.slice(0, 1)
+    }
+    return did
+}
+
+/// `<p>/..` removed; with `first_phase`, a `./` kept before a `**`.
+fn drop_dot_dots(inout parts: [[i64]], first_phase: bool) -> bool {
+    var did = false
+    var dd = 0
+    while true {
+        dd = index_from(parts, [46, 46], dd + 1)
+        if dd < 0 {
+            break
+        }
+        if is_real(part_at(parts, dd - 1)) {
+            did = true
+            let keep_dot = first_phase and dd == 1 and part_at(parts, dd + 1) == Some([42, 42])
+            parts = splice(parts, dd - 1, 2, if keep_dot { [[46]] } else { [] })
+            if first_phase and parts.len() == 0 {
+                parts.push([])
+            }
+            dd = dd - 2
+        }
+    }
+    return did
+}
+
+fn usable_part(x: Option[[i64]]) -> bool {
+    return match x {
+        Some(v) -> v.len() > 0 and v != [46] and v != [46, 46]
+        None -> false
+    }
+}
+
+/// `**/../<p>/<p>` becomes `../<p>/<p>` here and `**/<p>/<p>` in a new
+/// pattern; runs of `**` collapse.
+fn split_globstar_dots(inout parts: [[i64]], inout all: [[[i64]]]) -> bool {
+    var did = false
+    var gs = 0 - 1
+    while true {
+        gs = index_from(parts, [42, 42], gs + 1)
+        if gs < 0 {
+            break
+        }
+        var gss = gs
+        while part_at(parts, gss + 1) == Some([42, 42]) {
+            gss = gss + 1
+        }
+        if gss > gs {
+            parts = splice(parts, gs + 1, gss - gs, [])
+        }
+        let next = part_at(parts, gs + 1)
+        let p = part_at(parts, gs + 2)
+        let p2 = part_at(parts, gs + 3)
+        if next == Some([46, 46]) and usable_part(p) and usable_part(p2) {
+            did = true
+            parts = splice(parts, gs, 1, [])
+            var other = parts
+            other[gs] = [42, 42]
+            all.push(other)
+            gs = gs - 1
+        }
+    }
+    return did
+}
+
+fn first_phase(parts0: [[[i64]]]) -> [[[i64]]] {
+    var all = parts0
+    var did = true
+    while did {
+        did = false
+        var k = 0
+        while k < all.len() {
+            var parts = all[k]
+            if split_globstar_dots(parts, all) {
+                did = true
+            }
+            if drop_empties(parts) {
+                did = true
+            }
+            if drop_dot_dots(parts, true) {
+                did = true
+            }
+            all[k] = parts
+            k = k + 1
+        }
+    }
+    return all
+}
+
+/// `partsMatch`: one pattern that covers both, or None.
+fn parts_match(a: [[i64]], b: [[i64]]) -> Option[[[i64]]] {
+    var ai = 0
+    var bi = 0
+    var result: [[i64]] = []
+    var which = 0
+    let star = [42]
+    let gstar = [42, 42]
+    while ai < a.len() and bi < b.len() {
+        if a[ai] == b[bi] {
+            result.push(a[ai])
+            ai = ai + 1
+            bi = bi + 1
+        } else if a[ai] == gstar and part_at(a, ai + 1) == Some(b[bi]) {
+            result.push(a[ai])
+            ai = ai + 1
+        } else if b[bi] == gstar and part_at(b, bi + 1) == Some(a[ai]) {
+            result.push(b[bi])
+            bi = bi + 1
+        } else if a[ai] == star and b[bi].len() > 0 and b[bi][0] != 46 and b[bi] != gstar {
+            if which == 2 {
+                return None
+            }
+            which = 1
+            result.push(a[ai])
+            ai = ai + 1
+            bi = bi + 1
+        } else if b[bi] == star and a[ai].len() > 0 and a[ai][0] != 46 and a[ai] != gstar {
+            if which == 1 {
+                return None
+            }
+            which = 2
+            result.push(b[bi])
+            ai = ai + 1
+            bi = bi + 1
+        } else {
+            return None
+        }
+    }
+    return if a.len() == b.len() { Some(result) } else { None }
+}
+
+fn second_phase(parts0: [[[i64]]]) -> [[[i64]]] {
+    var all = parts0
+    var i = 0
+    while i < all.len() - 1 {
+        var j = i + 1
+        while j < all.len() {
+            match parts_match(all[i], all[j]) {
+                Some(m) -> {
+                    all[i] = []
+                    all[j] = m
+                    j = all.len()
+                }
+                None -> {
+                    j = j + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return all.filter(|p| p.len() > 0)
+}
+
+/// `/[?*]|[+@!]\(.*?\)|\[|\]/`
+fn glob_magic(s: [i64]) -> bool {
+    var i = 0
+    while i < s.len() {
+        let c = s[i]
+        if c == 63 or c == 42 or c == 91 or c == 93 {
+            return true
+        }
+        if (c == 43 or c == 64 or c == 33) and i + 1 < s.len() and s[i + 1] == 40 {
+            var k = i + 2
+            while k < s.len() and not is_lt(s[k]) {
+                if s[k] == 41 {
+                    return true
+                }
+                k = k + 1
+            }
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn magic_at(s: [[i64]], i: i64) -> bool {
+    return i < s.len() and glob_magic(s[i])
+}
+
+/// `/^[a-z]:/i`, or with `whole`, `/^[a-z]:$/i`.
+fn is_drive(s: [i64], whole: bool) -> bool {
+    let ok = s.len() >= 2 and (s[0] >= 65 and s[0] <= 90 or s[0] >= 97 and s[0] <= 122) and s[1] == 58
+    return ok and (not whole or s.len() == 2)
+}
+
+fn parse_parts(s: [[i64]], o: MgOpts) -> [MgPat] ! MgError {
+    var raw = 0
+    if o.windows and o.nocase {
+        // `windowsNoMagicRoot`: a UNC or drive root is kept as written.
+        let unc = s.len() > 1 and s[0].len() == 0 and s[1].len() == 0 and (s.len() > 2 and s[2] == [63] or not magic_at(s, 2)) and not magic_at(s, 3)
+        if unc {
+            raw = 4
+        } else if is_drive(s[0], false) {
+            raw = 1
+        }
+    }
+    var out: [MgPat] = []
+    var i = 0
+    while i < s.len() {
+        if i < raw {
+            out.push(MgLit(s[i]))
+        } else {
+            out.push(try parse_segment(s[i], o.nocase))
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn lit_of(p: MgPat) -> Option[[i64]] {
+    return match p {
+        MgLit(s) -> Some(s)
+        _ -> None
+    }
+}
+
+fn is_lit(p: MgPat, w: [i64]) -> bool {
+    return lit_of(p) == Some(w)
+}
+
+fn lit_drive(ps: [MgPat], i: i64) -> bool {
+    if i >= ps.len() {
+        return false
+    }
+    return match lit_of(ps[i]) {
+        Some(s) -> is_drive(s, true)
+        None -> false
+    }
+}
+
+/// `levelTwoFileOptimize`, the path's own simplification.
+fn level_two(parts0: [[i64]]) -> [[i64]] {
+    var parts = parts0
+    var did = true
+    while did {
+        did = drop_empties(parts)
+        if drop_dot_dots(parts, false) {
+            did = true
+        }
+    }
+    return parts
+}
+
+/// Where a drive letter sits: 0 for `c:`, 3 for `//?/c:`, or -1.
+fn file_drive_at(file: [[i64]]) -> i64 {
+    if file.len() > 0 and is_drive(file[0], true) {
+        return 0
+    }
+    let unc = file.len() > 3 and file[0].len() == 0 and file[1].len() == 0 and file[2] == [63] and is_drive(file[3], true)
+    return if unc { 3 } else { 0 - 1 }
+}
+
+fn pattern_drive_at(ps: [MgPat]) -> i64 {
+    if lit_drive(ps, 0) {
+        return 0
+    }
+    let unc = ps.len() > 3 and is_lit(ps[0], []) and is_lit(ps[1], []) and is_lit(ps[2], [63]) and lit_drive(ps, 3)
+    return if unc { 3 } else { 0 - 1 }
+}
+
+fn ascii_lower(s: [i64]) -> [i64] {
+    return s.map(|c| if c >= 65 and c <= 90 { c + 32 } else { c })
+}
+
+/// `matchOne`; when the path is not cut short for a drive, `file` is
+/// simplified in place, as minimatch's array is.
+fn match_one(inout file: [[i64]], pattern0: [MgPat], o: MgOpts) -> bool {
+    var pattern = pattern0
+    var f = file
+    var sliced = false
+    if o.windows {
+        let fdi = file_drive_at(f)
+        let pdi = pattern_drive_at(pattern)
+        if fdi >= 0 and pdi >= 0 {
+            let fd = f[fdi]
+            let pd = lit_of(pattern[pdi]) ?? []
+            if ascii_lower(fd) == ascii_lower(pd) {
+                pattern[pdi] = MgLit(fd)
+                if pdi > fdi {
+                    pattern = pattern.slice(pdi, pattern.len())
+                } else if fdi > pdi {
+                    f = f.slice(fdi, f.len())
+                    sliced = true
+                }
+            }
+        }
+    }
+    let opt = level_two(f)
+    if not sliced {
+        file = opt
+    }
+    return match_parts(if opt.len() == 0 { [[]] } else { opt }, pattern, o)
+}
+
+fn dot_name(f: [i64]) -> bool {
+    return f.len() > 0 and f[0] == 46
+}
+
+fn match_parts(file: [[i64]], pattern: [MgPat], o: MgOpts) -> bool {
+    var fi = 0
+    var pi = 0
+    let fl = file.len()
+    let pl = pattern.len()
+    while fi < fl and pi < pl {
+        match pattern[pi] {
+            MgGlobstar -> return match_globstar(file, fi, pattern, pi + 1, o)
+            _ -> {
+                if not part_matches(pattern[pi], file[fi], o.nocase) {
+                    return false
+                }
+            }
+        }
+        fi = fi + 1
+        pi = pi + 1
+    }
+    if fi == fl and pi == pl {
+        return true
+    }
+    if fi == fl {
+        return false
+    }
+    return pi == pl and fi == fl - 1 and file[fi].len() == 0
+}
+
+/// A `**` at `pr - 1`: it takes no dot segment, and as few as it needs.
+fn match_globstar(file: [[i64]], fi: i64, pattern: [MgPat], pr: i64, o: MgOpts) -> bool {
+    let fl = file.len()
+    if pr == pattern.len() {
+        return not file.slice(fi, fl).any(|x| dot_name(x))
+    }
+    var fr = fi
+    while fr < fl {
+        var rest = file.slice(fr, fl)
+        if match_one(rest, pattern.slice(pr, pattern.len()), o) {
+            return true
+        }
+        if dot_name(file[fr]) {
+            return false
+        }
+        fr = fr + 1
+    }
+    return false
+}
+
+/// `path.matchesGlob(path, pattern)`: `windows` for `path.win32`, and
+/// `nocase` as Node sets it on macOS and Windows hosts (false on Linux).
+pub fn matches_glob(path: str, pattern: str, windows: bool, nocase: bool) -> bool ! MgError {
+    let o = MgOpts{ windows: windows, nocase: nocase }
+    let pat = units_of(pattern).map(|c| if c == 92 { 47 } else { c })
+    if pat.len() > 65536 {
+        fail(MgTypeError("pattern is too long"))
+    }
+    let f0 = units_of(path)
+    if pat.len() == 0 {
+        return f0.len() == 0
+    }
+    let globs = brace_set(pat)
+    let parts = second_phase(first_phase(globs.map(|g| slash_split(g, windows))))
+    var set: [[MgPat]] = []
+    for s in parts {
+        var ps = try parse_parts(s, o)
+        // `//?/c:` keeps its `?` as a literal.
+        if windows and ps.len() > 3 and is_lit(ps[0], []) and is_lit(ps[1], []) and s[2] == [63] and lit_drive(ps, 3) {
+            ps[2] = MgLit([63])
+        }
+        set.push(ps)
+    }
+    var ff = slash_split(if windows { f0.map(|c| if c == 92 { 47 } else { c }) } else { f0 }, windows)
+    for ps in set {
+        if match_one(ff, ps, o) {
+            return true
+        }
+    }
+    return false
+}
+
+/// `path.posix.matchesGlob` on a Linux host.
+pub fn posix_matches_glob(path: str, pattern: str) -> bool ! MgError {
+    return try matches_glob(path, pattern, false, false)
+}
+
+/// `path.win32.matchesGlob` on a Windows host.
+pub fn win32_matches_glob(path: str, pattern: str) -> bool ! MgError {
+    return try matches_glob(path, pattern, true, true)
+}
+
+// Generated by b62lib/nodematchesglob/gen_tables.js from Node v25.2.1 (Unicode 17.0).
+// Do not edit by hand.
+
+/// Ranges of a general category, as base-36 gaps and lengths.
+fn category_table(name: str) -> str {
+    if name == "L" {
+        return "1t.q.6.q.1b.1.a.1.4.1.5.n.1.v.1.cq.4.c.e.5.7.1.1.1.3l.5.1.2.2.4.1.1.6.1.1.3.1.1.1.k.1.2b.1.3v.8.4m.1.12.2.1.6.15.1z.r.4.4.19.17.z.2.1.2r.1.1.f.2.7.2.a.3.2.1.g.1.1.u.t.2h.b.1.o.x.9.2.4.1.5.m.4.1.9.1.3.1.n.p.7.b.5.o.1.7.g.16.1m.1i.3.1.i.1.7.a.f.g.4.8.2.2.2.m.1.7.1.1.3.4.3.1.g.1.d.2.1.3.e.2.a.1.8.6.4.2.2.m.1.7.1.2.1.2.1.2.v.4.1.1.j.3.g.9.1.3.1.m.1.7.1.2.1.5.3.1.i.1.f.2.n.1.b.8.2.2.2.m.1.7.1.2.1.5.3.1.u.2.1.3.f.1.h.1.1.6.3.3.1.4.3.2.1.1.1.2.3.2.3.3.3.c.m.1.1g.8.1.3.1.n.1.g.3.1.q.3.1.2.2.2.u.1.4.8.1.3.1.n.1.a.1.5.3.1.u.3.1.2.f.2.h.9.1.3.1.15.2.1.g.1.5.3.8.3.o.6.5.i.3.o.1.9.1.1.2.7.1m.1c.1.2.c.7.1m.2.1.1.1.5.1.o.1.1.1.a.1.2.9.1.2.5.1.1.l.4.w.1.1r.8.1.10.r.5.37.17.k.1.g.6.4.4.3.1.3.2.7.3.4.d.c.1.h.12.1.1.5.1.2.17.1.99.1.4.2.7.1.1.1.4.2.15.1.4.2.x.1.4.2.7.1.1.1.4.2.f.1.1l.1.4.2.1v.11.g.g.2e.2.6.3.h8.2.h.1.q.5.23.6.8.7.i.d.j.e.i.e.d.1.3.f.1g.z.1.4.1.1v.2h.7.5.2.y.1.1.5.1y.a.v.1d.u.2.5.b.18.4.q.1i.n.9.1h.2a.1.2l.1b.h.8.1i.u.d.2.a.18.q.10.15.3.a.10.2.b.5.17.2.3.15.4.1.6.1.2.3.1.5.5c.1s.7q.2.6.2.12.2.6.2.8.1.1.1.1.1.1.1.v.2.1h.1.7.1.1.3.3.1.7.3.4.2.6.4.d.5.3.1.7.38.1.d.1.g.d.2t.1.4.1.2.a.1.1.3.5.6.1.1.1.1.1.1.4.1.b.2.4.5.5.4.1.1g.2.22j.6d.6.4.3.2.c.12.1.1.5.1.2.1k.7.1.g.n.9.7.1.7.1.7.1.7.1.7.1.7.1.7.1.7.28.1.d1.2.16.5.5.2.4.2e.6.3.1.2i.1.4.5.17.1.2m.h.w.1c.g.e8.534.1s.h3h.1v.1a.2.7h.3.g.a.2.k.1b.g.v.2.1y.1d.9.2.2v.2.2a.k.h.1.3.1.4.1.n.t.1g.e.1e.1q.6.3.1.1.2.b.s.a.n.p.t.7.1b.s.1.g.5.1.a.a.5.1.15.n.3.1.8.k.n.3.1.3.1e.1.1.3.2.2.5.2.1.1.1.o.3.2.b.7.3.c.6.2.6.2.6.9.7.1.7.1.17.1.e.6.37.t.8mc.c.n.4.1d.6is.a6.2.2y.12.7.c.5.5.1.1.a.1.d.1.5.1.1.1.2.1.2.1.30.x.a3.i.1s.2.1i.14.c.38.5.1.3r.10.q.6.q.b.2h.3.6.2.6.2.6.2.3.z.c.1.q.1.j.1.2.1.f.2.e.y.3f.at.t.3.1d.1b.w.d.k.1.8.6.12.a.u.2.10.4.8.1c.4e.i.10.4.10.4.14.8.1g.c.b.1.f.1.7.1.2.1.b.1.f.1.7.1.2.3.1g.c.8n.9.m.a.8.o.6.1.16.1.9.1x.6.2.1.1.18.1.2.3.1.2.n.a.n.9.v.1t.j.1.2.a.m.a.q.6.q.12.1k.6.2.1s.1.f.4.1.3.1.t.16.t.3.t.z.8.1.s.r.1i.a.m.a.j.d.i.32.21.1j.1f.d.1f.d.10.12.s.9.n.6y.16.6.2.g.6.1k.t.a.1.8.m.16.i.1a.l.r.n.c.1h.1l.2.2.1.d.19.w.p.q.10.t.1.2.1.8.z.3.1.c.1c.e.4.l.1.1.1.z.i.1.p.j.2.1r.7.1.1.1.4.1.f.1.a.7.1b.12.8.2.2.2.m.1.7.1.2.1.5.3.1.i.1.c.5.u.a.1.1.2.1.1.12.1.1.p.1.1.1.18.1h.i.4.k.3.u.1c.k.2.1.1.54.1b.15.4.10.1c.k.1.1n.17.d.1.1z.r.11.7.55.18.38.1s.v.8.2.1.2.8.1.2.1.o.f.1.1.1.2m.8.2.13.g.1.1.1.s.1.a.14.7.1.l.1.b.1a.j.1.i.21.5j.x.v.9.1.11.h.1.1d.u.34.7.1.2.1.12.l.1.p.6.1.2.1.w.e.1.n.18.78.j.f.1.1.d.1.y.3g.1.27.pm.6e.5g.218.2p.f.ts.h.6.p.32z.5.g7.5a1.u.1cy.ft.7.v.h.27.h.u.i.1c.g.4.v.l.5.j.c0.19.5v.1s.w.p.2.p.18.23.5.1.1u.d.1s.2.1.1.e.2.c.5p2.15.w.2p.37.6pp.4.1.7.1.2.1.83.f.1.t.3.2.1.e.4.8.b0.1s4.2z.5.d.3.9.7.a.4me.2d.1.1z.1.2.2.1.2.2.2.4.1.c.1.1.1.7.1.1t.1.4.2.8.1.7.1.s.1.4.1.5.1.1.3.7.1.9g.2.p.1.p.1.v.1.p.1.v.1.p.1.v.1.p.1.v.1.p.1.8.1f8.v.6.6.79.1q.42.19.a.7.g.1.8x.u.i.18.dg.s.6c.u.2.1.5r.v.1.3.1.2.1.7.2.5.9.2.68.7.1.4.1.2.1.f.1.5h.1n.1w.7.1.xg.4.1.r.1.2.1.1.2.1.1.a.1.4.1.1.1.1.6.1.4.1.1.1.1.1.1.3.1.2.1.1.2.1.1.1.1.1.1.1.1.1.1.2.1.1.2.4.1.7.1.4.1.4.1.1.1.a.1.h.5.3.1.5.1.h.3es.wyo.w.3dq.2.4ge.2.5rl.f.ha.1wi.f2.15u.3t7.5.6ju"
+    }
+    if name == "Nl" {
+        return "4j2.3.227.z.2.4.2v2.1.p.9.e.3.nfv.a.hu8.1h.cs.1.8.1.3q.5.6cq.33.ex1.3"
+    }
+    if name == "Nd" {
+        return "1c.a.17q.a.3q.a.5i.a.bg.a.3a.a.3a.a.3a.a.3a.a.3a.a.3a.a.3a.a.3a.a.3a.a.2o.a.3a.a.1y.a.7q.a.1y.a.1fq.a.12.a.8c.a.3k.a.4m.a.6.a.52.a.2e.a.3q.a.6.a.r7q.a.iu.a.12.a.5i.a.m.a.2e.a.ba.a.geu.a.13a.a.1om.a.6.a.m4.a.3k.a.1o.a.40.a.7q.a.9i.a.3a.a.ae.a.2u.a.6.k.24.a.bq.a.2u.a.ie.a.2e.a.6u.a.1y.a.1i.a.9y.a.d06.a.1t2.a.2e.a.3q.a.eu.a.iuu.a.250.1e.1ts.a.bq.a.dy.a.6v.a.np.a.3o6.a"
+    }
+    if name == "Zs" {
+        return "w.1.3j.1.4bj.1.1vj.b.10.1.1b.1.334.1"
+    }
+    if name == "Cc" {
+        return "0.w.2n.x"
+    }
+    if name == "Z" {
+        return "w.1.3j.1.4bj.1.1vj.b.t.2.5.1.1b.1.334.1"
+    }
+    if name == "C" {
+        return "0.w.2n.x.d.1.ju.2.6.4.7.1.1.1.k.1.b1.1.12.2.1e.2.3.1.1j.8.r.4.6.h.m.1.5c.1.1c.2.1n.2.2t.e.1n.2.1d.2.f.1.s.2.1.1.b.5.w.7.23.1.4h.1.8.2.2.2.m.1.7.1.1.3.4.2.9.2.2.2.4.8.1.4.2.1.5.2.p.2.3.1.6.4.2.2.m.1.7.1.2.1.2.1.2.2.1.1.5.4.2.2.3.3.1.7.4.1.1.7.h.a.3.1.9.1.3.1.m.1.7.1.2.1.5.2.a.1.3.1.3.2.1.f.4.2.c.7.7.1.3.1.8.2.2.2.m.1.7.1.2.1.5.2.9.2.2.2.3.7.3.4.2.1.5.2.i.a.2.1.6.3.3.1.4.3.2.1.1.1.2.3.2.3.3.3.c.4.5.3.3.1.4.2.1.6.1.e.l.5.d.1.3.1.n.1.g.2.9.1.3.1.4.7.2.1.3.1.2.2.4.2.a.7.m.1.3.1.n.1.a.1.5.2.9.1.3.1.4.7.2.5.3.1.4.2.a.1.3.c.d.1.3.1.1f.1.3.1.6.4.g.2.q.1.3.1.i.3.o.1.9.1.1.2.7.3.1.4.6.1.1.1.8.6.a.2.3.c.1m.4.t.11.2.1.1.1.5.1.o.1.1.1.n.2.5.1.1.1.7.1.a.2.4.w.20.1.10.4.13.1.10.1.f.1.d.11.5i.1.1.5.1.2.ah.1.4.2.7.1.1.1.4.2.15.1.4.2.x.1.4.2.7.1.1.1.4.2.f.1.1l.1.4.2.1v.2.w.3.q.6.2e.2.6.2.il.3.2h.7.m.9.o.9.k.c.d.1.3.1.2.c.2m.2.a.6.a.6.e.1.b.6.2h.7.17.5.1y.a.v.1.c.4.c.4.1.3.16.2.5.b.18.4.q.6.b.3.1q.2.1t.1.t.2.b.6.a.6.e.2.1a.2.c.k.25.1.4m.8.1o.3.f.3.1q.5.17.2.b.8.17.5.eu.2.6.2.12.2.6.2.8.1.1.1.1.1.1.1.v.2.1h.1.f.1.e.2.6.1.j.2.3.1.9.1.b.5.q.5.1d.g.2.2.r.1.d.3.y.e.x.f.3w.4.ii.m.b.l.1ec.2.am.5.19.1.1.5.1.2.1k.7.2.e.o.9.7.1.7.1.7.1.7.1.7.1.7.1.7.1.7.1.3i.y.q.1.2h.c.5y.q.28.1.2e.2.2v.5.17.1.2m.1.2e.9.1c.1.mlp.3.1j.9.9o.k.54.8.65.k.1o.3.a.6.1k.8.1y.8.c.6.38.b.u.3.26.1.b.4.x.1.1j.9.e.2.a.2.2v.o.s.a.6.2.6.2.6.9.7.1.7.1.1o.4.3i.2.a.6.8mc.c.n.4.1d.6is.a6.2.2y.12.7.c.5.5.q.1.5.1.1.1.2.1.2.1.i2.w.16.6.1f.1.j.1.4.4.5.1.3r.4.5a.3.6.2.6.2.6.2.3.3.7.1.7.d.2.2.c.1.q.1.j.1.2.1.f.2.e.y.3f.5.3.4.19.3.2g.1.d.3.1.1b.1a.3m.t.3.1d.f.s.4.10.9.u.5.17.5.u.1.11.4.e.16.4e.2.a.6.10.4.10.4.14.8.1g.b.c.1.f.1.7.1.2.1.b.1.f.1.7.1.2.3.1g.c.8n.9.m.a.8.o.6.1.16.1.9.1x.6.2.1.1.18.1.2.3.1.2.n.1.20.8.9.1c.j.1.2.5.x.3.r.5.r.12.1k.4.k.2.1e.1.2.5.8.1.3.1.t.2.3.4.a.7.9.7.1s.w.13.4.c.9.1i.3.t.2.r.5.q.7.4.c.7.28.21.1j.1f.d.1f.7.1a.8.a.6.12.3.t.8.2.5s.v.1.16.1.3.2.2.g.6.8.9.x.1a.8.16.m.q.12.s.k.n.9.26.4.10.9.1q.1.5.d.p.7.a.6.1h.1.i.8.13.9.2o.1.k.b.i.1.1b.1q.7.1.1.1.4.1.f.1.b.6.1n.5.a.6.4.1.8.2.2.2.m.1.7.1.2.1.5.1.a.2.2.2.3.2.1.6.1.5.7.2.7.3.5.b.a.1.1.2.1.1.12.1.a.1.1.2.1.1.4.1.a.1.2.8.2.t.2k.1.5.u.20.8.a.4m.1i.2.12.y.1x.b.a.6.d.j.1m.6.a.6.k.s.r.2.f.4.n.55.1o.2s.2b.c.8.2.1.2.8.1.2.1.u.1.2.2.c.9.a.1y.8.2.1a.2.b.r.20.8.2b.d.21.7.a.2e.8.2g.y.e.a.6.9.1.19.1.e.a.t.3.w.2.m.1.e.21.7.1.2.1.18.3.1.1.2.1.9.8.a.6.6.1.2.1.11.1.2.1.6.7.a.6.18.4.a.6u.p.7.h.1.15.3.t.2d.1.f.1e.d.pn.2u.33.1.5.b.5g.218.2r.d.ts.g.m.a.32z.5.g7.5a1.1m.1c6.ft.7.v.1.a.4.29.1.a.6.u.2.6.a.1y.a.a.1.7.1.l.5.j.c0.1m.5i.2j.5.p.2.p.18.23.4.1l.7.h.1s.5.b.7.9.5p2.15.w.2p.37.6pp.4.1.7.1.2.1.83.f.1.t.3.2.1.e.4.8.b0.1s4.2z.5.d.3.9.7.a.2.4.31c.71.3.c4.6.n.f.h.f.1a.2.n.9.38.1o.6u.a.13.2.22.8.34.l.1y.3e.k.c.k.c.2f.9.p.3r.2d.1.1z.1.2.2.1.2.2.2.4.1.c.1.1.1.7.1.1t.1.4.2.8.1.7.1.s.1.4.1.5.1.1.3.7.1.9g.2.84.2.ji.f.5.1.f.uo.v.6.6.5x.7.1.h.2.7.1.2.1.5.5.1q.x.1.34.19.3.e.2.a.4.2.8w.v.h.1m.5.1.cw.16.5y.17.4.1.5c.v.1.m.8.2.68.7.1.4.1.2.1.f.1.5h.2.g.15.24.4.a.4.2.lt.1w.24.1p.5e.4.1.r.1.2.1.1.2.1.1.a.1.4.1.1.1.1.6.1.4.1.1.1.1.1.1.3.1.2.1.1.2.1.1.1.1.1.1.1.1.1.1.2.1.1.2.4.1.7.1.4.1.4.1.1.1.a.1.h.5.3.1.5.1.h.1g.2.7i.18.4.2s.c.f.2.f.1.f.1.11.a.4u.1k.t.d.18.4.9.7.2.e.6.4a.rd.3.h.3.d.3.62.6.c.4.1.f.c.4.1k.8.a.6.14.8.u.2.c.4.2.e.9.13.9k.8.e.2.d.3.b.3.1l.1.1.4.g.2.c.4.a.7.43.1.2v.sl.wyo.w.3dq.2.4ge.2.5rl.f.ha.1wi.f2.15u.3t7.5.6ju.f62u.6o.47bk"
+    }
+    if name == "Ll" {
+        return "2p.q.1m.1.15.o.1.8.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.2.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.2.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.2.1.1.1.1.3.2.1.1.1.2.1.3.2.4.1.2.1.3.3.2.1.2.1.1.1.1.1.2.1.1.2.1.1.2.1.3.1.1.1.2.2.2.3.6.1.2.1.2.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.2.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.2.2.1.1.1.3.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.7.2.1.2.2.1.1.4.1.1.1.1.1.1.1.1.1x.2.q.5d.1.1.1.3.1.3.3.i.1.r.z.1.2.3.3.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.5.1.1.2.1.2.2.1f.1c.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.9.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.2.1.1.1.1.1.1.1.1.1.1.1.1.2.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1c.15.287.17.2.3.l4.6.1oi.9.1.1.39.18.1r.d.1.y.2u.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.9.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.9.8.6.a.8.8.8.8.6.a.8.8.8.8.e.2.8.8.8.8.8.8.5.1.2.6.1.3.3.1.2.8.4.2.2.8.8.a.3.1.2.7m.1.3.2.3.1.r.1.4.1.4.1.2.2.8.4.4.1.1h.1.23v.1c.1.1.3.2.1.1.1.1.1.1.4.1.1.2.1.6.5.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.2.7.1.1.1.4.1.c.12.1.1.5.1.nwz.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.j.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.3r.1.1.1.1.1.1.1.1.1.1.1.1.3.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.8.1.1.1.1.2.1.1.1.1.1.1.1.1.1.4.1.1.1.2.1.1.3.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.5.1.5.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.4.1.1.1.2.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.q.1.3.1.mt.17.5.9.7.28.fnk.7.c.5.tl.q.y5.14.3s.10.4b.b.1.f.1.7.1.2.1dv.1f.3h.m.27u.w.gw0.w.1n.p.k06.q.q.7.1.i.q.q.q.4.1.1.1.7.1.b.q.q.q.q.q.q.q.q.q.q.q.q.q.q.q.q.q.s.s.p.1.6.q.p.1.6.q.p.1.6.q.p.1.6.q.p.1.6.1.1.1f8.a.1.k.6.6.1yv.y"
+    }
+    if name == "P" {
+        return "x.3.1.6.1.4.a.2.3.2.q.3.1.1.r.1.1.1.z.1.5.1.3.1.a.2.3.1.3.1.ji.1.8.1.cy.6.15.2.1f.1.1.1.2.1.2.1.18.2.k.2.1.2.d.1.1.3.22.4.2u.1.17.e.6h.3.1i.f.v.1.79.2.a.1.3w.1.3c.1.3d.1.au.1.c.1.a7.1.2i.1.a.2.4o.f.1.1.11.4.1z.1.22.5.4.2.33.6.4r.1.h0.9.47.1.h9.1.18.2.26.3.1z.2.4d.3.1.3.11.b.8p.2.60.2.3k.7.1.6.4g.2.a.7.s.3.3g.4.1n.5.1q.2.1s.8.b.1.n0.o.8.k.1.d.1.c.u.2.e.2.hl.4.t.2.u5.e.27.2.v.a.b7.m.1r.4.w.2.l7.4.1.2.34.1.3z.1b.1.w.2.c.bn.3.4.a.2.c.g.1.c.1.2q.1.2i.1.mwy.2.7h.3.2r.1.a.1.37.6.ak.4.2e.2.14.3.1.1.1d.2.1b.1.2p.d.g.2.3g.4.3i.2.g.2.6x.1.g2a.2.5s.a.m.z.1.e.1.1.4.1.1.2.45.3.1.6.1.4.a.2.3.2.q.3.1.1.r.1.1.1.1.7.be.3.ik.1.1c.1.bi.1.kn.1.5j.1.v.1.7k.9.12.1.34.7.1u.7.2h.4.cx.1.8u.1.y.1.3o.5.18.4.59.7.31.2.1.4.3i.4.1c.2.27.4.4.1.d.1.1.3.2g.6.2z.1.8a.2.1.2.36.5.a.2.1.1.2w.1.6y.n.2x.3.s.d.24.1.3m.3.70.1.7c.3.4b.1.2k.8.2b.3.1.5.2l.a.5z.1.2n.5.16.2.hx.2.22.d.4v.1.vk.5.29o.2.bjv.2.3p.1.1t.5.8.1.fc.3.87.4.93.1.f5o.1.5wn.5.29f.1.ny.2"
+    }
+    if name == "Lu" {
+        return "1t.q.2t.n.1.7.x.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.2.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.2.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.2.1.1.1.1.3.2.1.1.1.2.1.3.2.4.1.2.1.3.3.2.1.2.1.1.1.1.1.2.1.1.2.1.1.2.1.3.1.1.1.2.3.1.7.1.2.1.2.1.2.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.2.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.2.1.2.1.1.3.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.7.2.1.2.2.1.1.4.1.1.1.1.1.1.1.1.81.1.1.1.3.1.8.1.6.1.1.3.1.1.1.2.1.h.1.9.z.1.2.3.3.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.5.1.2.1.1.2.2.1f.1c.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.9.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.2.1.1.1.1.1.1.1.1.1.1.1.1.2.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.2.12.289.12.1.1.5.1.k2.2e.1oz.1.6.17.2.3.8w.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.9.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.9.8.8.6.a.8.8.8.8.6.b.1.1.1.1.1.1.1.8.8.20.4.c.4.c.4.c.5.b.4.7a.1.4.1.3.3.2.3.2.1.3.5.6.1.1.1.1.1.1.4.2.4.a.2.5.1.1p.1.22k.1c.1c.1.1.3.2.1.1.1.1.1.1.4.1.1.2.1.8.3.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.8.1.1.1.4.1.nyl.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.j.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.3r.1.1.1.1.1.1.1.1.1.1.1.1.1.3.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.a.1.1.1.1.2.1.1.1.1.1.1.1.1.4.1.1.1.2.1.1.1.3.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.5.1.5.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.4.1.1.1.2.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.o.1.h7v.q.xx.14.3s.10.4c.b.1.f.1.7.1.2.1d6.1f.4d.m.27u.w.gw0.w.1s.p.k07.q.q.q.q.q.q.1.1.2.2.1.2.2.2.4.1.8.q.q.q.2.1.4.2.8.1.7.r.2.1.4.1.5.1.1.3.7.r.q.q.q.q.q.q.q.q.q.q.q.u.p.x.p.x.p.x.p.x.p.x.1.3ed.y"
+    }
+    if name == "Pc" {
+        return "2n.1.6an.2.j.1.17tq.2.o.3.6n.1"
+    }
+    return ""
+}
+
+/// Code units whose case-insensitive form without the u flag differs:
+/// base-36 steps from the previous unit, then the signed distance to it.
+fn canon_table() -> str {
+    return "2p.-w.1.-w.1.-w.1.-w.1.-w.1.-w.1.-w.1.-w.1.-w.1.-w.1.-w.1.-w.1.-w.1.-w.1.-w.1.-w.1.-w.1.-w.1.-w.1.-w.1.-w.1.-w.1.-w.1.-w.1.-w.1.-w.1n.kn.17.-w.1.-w.1.-w.1.-w.1.-w.1.-w.1.-w.1.-w.1.-w.1.-w.1.-w.1.-w.1.-w.1.-w.1.-w.1.-w.1.-w.1.-w.1.-w.1.-w.1.-w.1.-w.1.-w.2.-w.1.-w.1.-w.1.-w.1.-w.1.-w.1.-w.1.3d.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.4.-1.2.-1.2.-1.3.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.3.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.3.-1.2.-1.2.-1.2.5f.3.-1.2.-1.3.-1.4.-1.6.-1.3.2p.4.-1.1.4j.1.wu9.3.3m.3.-1.2.-1.2.-1.3.-1.5.-1.3.-1.4.-1.2.-1.3.-1.4.-1.2.1k.6.-1.1.-2.2.-1.1.-2.2.-1.1.-2.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.1.-27.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.3.-1.1.-2.2.-1.4.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.4.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.9.-1.3.8cf.1.8cf.2.-1.5.-1.2.-1.2.-1.2.-1.2.-1.1.8bj.1.8bg.1.8bi.1.-5u.1.-5q.2.-5p.1.-5p.2.-5m.2.-5n.1.wnj.4.-5p.1.wnf.2.-5r.1.wo7.1.wmg.1.wn8.2.-5t.1.-5v.1.wn8.1.8af.1.wn5.3.-5v.2.8al.1.-5x.3.-5y.8.89z.3.-62.2.wn7.1.-62.4.wmi.1.-62.1.-1x.1.-61.1.-61.1.-1z.6.-63.b.wlx.1.wlu.4n.2c.18.-1.2.-1.4.-1.4.3m.1.3m.1.3m.1b.-12.1.-11.1.-11.1.-11.2.-w.1.-w.1.-w.1.-w.1.-w.1.-w.1.-w.1.-w.1.-w.1.-w.1.-w.1.-w.1.-w.1.-w.1.-w.1.-w.1.-w.1.-v.1.-w.1.-w.1.-w.1.-w.1.-w.1.-w.1.-w.1.-w.1.-w.1.-1s.1.-1r.1.-1r.2.-1q.1.-1l.4.-1b.1.-1i.1.-8.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.1.-2e.1.-28.1.7.1.-38.2.-2o.3.-1.3.-1.1h.-w.1.-w.1.-w.1.-w.1.-w.1.-w.1.-w.1.-w.1.-w.1.-w.1.-w.1.-w.1.-w.1.-w.1.-w.1.-w.1.-w.1.-w.1.-w.1.-w.1.-w.1.-w.1.-w.1.-w.1.-w.1.-w.1.-w.1.-w.1.-w.1.-w.1.-w.1.-w.1.-28.1.-28.1.-28.1.-28.1.-28.1.-28.1.-28.1.-28.1.-28.1.-28.1.-28.1.-28.1.-28.1.-28.1.-28.1.-28.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.a.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.3.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.1.-f.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.1e.-1c.1.-1c.1.-1c.1.-1c.1.-1c.1.-1c.1.-1c.1.-1c.1.-1c.1.-1c.1.-1c.1.-1c.1.-1c.1.-1c.1.-1c.1.-1c.1.-1c.1.-1c.1.-1c.1.-1c.1.-1c.1.-1c.1.-1c.1.-1c.1.-1c.1.-1c.1.-1c.1.-1c.1.-1c.1.-1c.1.-1c.1.-1c.1.-1c.1.-1c.1.-1c.1.-1c.1.-1c.1.-1c.28a.2bk.1.2bk.1.2bk.1.2bk.1.2bk.1.2bk.1.2bk.1.2bk.1.2bk.1.2bk.1.2bk.1.2bk.1.2bk.1.2bk.1.2bk.1.2bk.1.2bk.1.2bk.1.2bk.1.2bk.1.2bk.1.2bk.1.2bk.1.2bk.1.2bk.1.2bk.1.2bk.1.2bk.1.2bk.1.2bk.1.2bk.1.2bk.1.2bk.1.2bk.1.2bk.1.2bk.1.2bk.1.2bk.1.2bk.1.2bk.1.2bk.1.2bk.1.2bk.3.2bk.1.2bk.1.2bk.l5.-8.1.-8.1.-8.1.-8.1.-8.1.-8.1oj.-4tq.1.-4tp.1.-4tg.1.-4te.1.-4te.1.-4tf.1.-4t8.1.-4rp.1.r7m.2.-1.6n.r9g.4.2xy.h.raw.37.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.6.-1n.6.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.1.8.1.8.1.8.1.8.1.8.1.8.1.8.1.8.9.8.1.8.1.8.1.8.1.8.1.8.b.8.1.8.1.8.1.8.1.8.1.8.1.8.1.8.9.8.1.8.1.8.1.8.1.8.1.8.1.8.1.8.9.8.1.8.1.8.1.8.1.8.1.8.c.8.2.8.2.8.2.8.9.8.1.8.1.8.1.8.1.8.1.8.1.8.1.8.9.22.1.22.1.2e.1.2e.1.2e.1.2e.1.2s.1.2s.1.3k.1.3k.1.34.1.34.1.3i.1.3i.1f.8.1.8.d.-5k5.i.8.1.8.f.8.1.8.4.7.a1.-s.y.-g.1.-g.1.-g.1.-g.1.-g.1.-g.1.-g.1.-g.1.-g.1.-g.1.-g.1.-g.1.-g.1.-g.1.-g.1.-g.5.-1.ng.-q.1.-q.1.-q.1.-q.1.-q.1.-q.1.-q.1.-q.1.-q.1.-q.1.-q.1.-q.1.-q.1.-q.1.-q.1.-q.1.-q.1.-q.1.-q.1.-q.1.-q.1.-q.1.-q.1.-q.1.-q.1.-q.1fr.-1c.1.-1c.1.-1c.1.-1c.1.-1c.1.-1c.1.-1c.1.-1c.1.-1c.1.-1c.1.-1c.1.-1c.1.-1c.1.-1c.1.-1c.1.-1c.1.-1c.1.-1c.1.-1c.1.-1c.1.-1c.1.-1c.1.-1c.1.-1c.1.-1c.1.-1c.1.-1c.1.-1c.1.-1c.1.-1c.1.-1c.1.-1c.1.-1c.1.-1c.1.-1c.1.-1c.1.-1c.1.-1c.1.-1c.1.-1c.1.-1c.1.-1c.1.-1c.1.-1c.1.-1c.1.-1c.1.-1c.1.-1c.2.-1.4.-8bv.1.-8bs.2.-1.2.-1.2.-1.7.-1.3.-1.b.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.9.-1.2.-1.5.-1.d.-5ls.1.-5ls.1.-5ls.1.-5ls.1.-5ls.1.-5ls.1.-5ls.1.-5ls.1.-5ls.1.-5ls.1.-5ls.1.-5ls.1.-5ls.1.-5ls.1.-5ls.1.-5ls.1.-5ls.1.-5ls.1.-5ls.1.-5ls.1.-5ls.1.-5ls.1.-5ls.1.-5ls.1.-5ls.1.-5ls.1.-5ls.1.-5ls.1.-5ls.1.-5ls.1.-5ls.1.-5ls.1.-5ls.1.-5ls.1.-5ls.1.-5ls.1.-5ls.1.-5ls.2.-5ls.6.-5ls.nx0.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.k.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.3s.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.4.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.b.-1.2.-1.3.-1.2.-1.2.-1.2.-1.2.-1.5.-1.5.-1.2.-1.1.1c.3.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.c.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.5.-1.2.-1.3.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.2.-1.r.-1.nx.-ps.t.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.ghu.-w.1.-w.1.-w.1.-w.1.-w.1.-w.1.-w.1.-w.1.-w.1.-w.1.-w.1.-w.1.-w.1.-w.1.-w.1.-w.1.-w.1.-w.1.-w.1.-w.1.-w.1.-w.1.-w.1.-w.1.-w.1.-w"
+}
+
+/// Simple case folding (CaseFolding.txt statuses C and S), the same way.
+fn fold_table() -> str {
+    return "1t.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.2j.lj.b.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.2.w.1.w.1.w.1.w.1.w.1.w.1.w.y.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.4.1.2.1.2.1.3.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.3.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.-3d.1.1.2.1.2.1.2.-7g.2.5u.1.1.2.1.2.5q.1.1.2.5p.1.5p.1.1.3.27.1.5m.1.5n.1.1.2.5p.1.5r.2.5v.1.5t.1.1.4.5v.1.5x.2.5y.1.1.2.1.2.1.2.62.1.1.2.62.3.1.2.62.1.1.2.61.1.61.1.1.2.1.2.63.1.1.4.1.8.2.1.1.2.2.1.1.2.2.1.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.3.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.3.2.1.1.2.1.2.-2p.1.-1k.1.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.-3m.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.8.8bv.1.1.2.-4j.1.8bs.3.1.2.-5f.1.1x.1.1z.1.1.2.1.2.1.2.1.2.1.6v.38.17.1.2.1.4.1.9.38.7.12.2.11.1.11.1.11.2.1s.2.1r.1.1r.2.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.2.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.n.1.d.8.1.-u.1.-p.4.-f.1.-m.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.-1i.1.-1c.3.-1o.1.-1s.2.1.2.-7.1.1.3.-3m.1.-3m.1.-3m.1.28.1.28.1.28.1.28.1.28.1.28.1.28.1.28.1.28.1.28.1.28.1.28.1.28.1.28.1.28.1.28.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1d.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.a.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.f.1.1.2.1.2.1.2.1.2.1.2.1.2.1.3.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.3.1c.1.1c.1.1c.1.1c.1.1c.1.1c.1.1c.1.1c.1.1c.1.1c.1.1c.1.1c.1.1c.1.1c.1.1c.1.1c.1.1c.1.1c.1.1c.1.1c.1.1c.1.1c.1.1c.1.1c.1.1c.1.1c.1.1c.1.1c.1.1c.1.1c.1.1c.1.1c.1.1c.1.1c.1.1c.1.1c.1.1c.1.1c.28a.5ls.1.5ls.1.5ls.1.5ls.1.5ls.1.5ls.1.5ls.1.5ls.1.5ls.1.5ls.1.5ls.1.5ls.1.5ls.1.5ls.1.5ls.1.5ls.1.5ls.1.5ls.1.5ls.1.5ls.1.5ls.1.5ls.1.5ls.1.5ls.1.5ls.1.5ls.1.5ls.1.5ls.1.5ls.1.5ls.1.5ls.1.5ls.1.5ls.1.5ls.1.5ls.1.5ls.1.5ls.1.5ls.2.5ls.6.5ls.mj.-8.1.-8.1.-8.1.-8.1.-8.1.-8.1oj.-4su.1.-4st.1.-4sk.1.-4si.1.-4si.1.-4sj.1.-4sc.1.-4ro.1.r7n.1.1.7.-2bk.1.-2bk.1.-2bk.1.-2bk.1.-2bk.1.-2bk.1.-2bk.1.-2bk.1.-2bk.1.-2bk.1.-2bk.1.-2bk.1.-2bk.1.-2bk.1.-2bk.1.-2bk.1.-2bk.1.-2bk.1.-2bk.1.-2bk.1.-2bk.1.-2bk.1.-2bk.1.-2bk.1.-2bk.1.-2bk.1.-2bk.1.-2bk.1.-2bk.1.-2bk.1.-2bk.1.-2bk.1.-2bk.1.-2bk.1.-2bk.1.-2bk.1.-2bk.1.-2bk.1.-2bk.1.-2bk.1.-2bk.1.-2bk.1.-2bk.3.-2bk.1.-2bk.1.-2bk.8x.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.7.-1m.3.-5vj.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.a.-8.1.-8.1.-8.1.-8.1.-8.1.-8.1.-8.1.-8.9.-8.1.-8.1.-8.1.-8.1.-8.1.-8.b.-8.1.-8.1.-8.1.-8.1.-8.1.-8.1.-8.1.-8.9.-8.1.-8.1.-8.1.-8.1.-8.1.-8.1.-8.1.-8.9.-8.1.-8.1.-8.1.-8.1.-8.1.-8.c.-8.2.-8.2.-8.2.-8.9.-8.1.-8.1.-8.1.-8.1.-8.1.-8.1.-8.1.-8.p.-8.1.-8.1.-8.1.-8.1.-8.1.-8.1.-8.1.-8.9.-8.1.-8.1.-8.1.-8.1.-8.1.-8.1.-8.1.-8.9.-8.1.-8.1.-8.1.-8.1.-8.1.-8.1.-8.1.-8.9.-8.1.-8.1.-22.1.-22.1.-9.2.-5j9.a.-2e.1.-2e.1.-2e.1.-2e.1.-9.7.-5kz.5.-8.1.-8.1.-2s.1.-2s.8.-5kj.5.-8.1.-8.1.-34.1.-34.1.-7.c.-3k.1.-3k.1.-3i.1.-3i.1.-9.8a.-5st.4.-6gv.1.-6di.7.s.1a.g.1.g.1.g.1.g.1.g.1.g.1.g.1.g.1.g.1.g.1.g.1.g.1.g.1.g.1.g.1.g.k.1.mr.q.1.q.1.q.1.q.1.q.1.q.1.q.1.q.1.q.1.q.1.q.1.q.1.q.1.q.1.q.1.q.1.q.1.q.1.q.1.q.1.q.1.q.1.q.1.q.1.q.1.q.1f5.1c.1.1c.1.1c.1.1c.1.1c.1.1c.1.1c.1.1c.1.1c.1.1c.1.1c.1.1c.1.1c.1.1c.1.1c.1.1c.1.1c.1.1c.1.1c.1.1c.1.1c.1.1c.1.1c.1.1c.1.1c.1.1c.1.1c.1.1c.1.1c.1.1c.1.1c.1.1c.1.1c.1.1c.1.1c.1.1c.1.1c.1.1c.1.1c.1.1c.1.1c.1.1c.1.1c.1.1c.1.1c.1.1c.1.1c.1.1c.1d.1.2.-8af.1.-2xy.1.-89z.3.1.2.1.2.1.2.-8bg.1.-8al.1.-8bj.1.-8bi.2.1.3.1.9.-8cf.1.-8cf.1.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.9.1.2.1.5.1.nym.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.k.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.3s.1.2.1.2.1.2.1.2.1.2.1.2.1.4.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.b.1.2.1.2.-r9g.1.1.2.1.2.1.2.1.2.1.5.1.2.-wmg.3.1.2.1.4.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.-wn8.1.-wnj.1.-wnf.1.-wn5.1.-wn8.2.-wlu.1.-wmi.1.-wlx.1.ps.1.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.-1c.1.-wn7.1.-raw.1.1.2.1.2.-wo7.1.1.2.1.2.1.2.1.2.1.2.1.2.1.2.1.2.-wu9.p.1.or.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.1.-tzk.fnq.1.t8.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.xy.14.1.14.1.14.1.14.1.14.1.14.1.14.1.14.1.14.1.14.1.14.1.14.1.14.1.14.1.14.1.14.1.14.1.14.1.14.1.14.1.14.1.14.1.14.1.14.1.14.1.14.1.14.1.14.1.14.1.14.1.14.1.14.1.14.1.14.1.14.1.14.1.14.1.14.1.14.1.14.3t.14.1.14.1.14.1.14.1.14.1.14.1.14.1.14.1.14.1.14.1.14.1.14.1.14.1.14.1.14.1.14.1.14.1.14.1.14.1.14.1.14.1.14.1.14.1.14.1.14.1.14.1.14.1.14.1.14.1.14.1.14.1.14.1.14.1.14.1.14.1.14.4d.13.1.13.1.13.1.13.1.13.1.13.1.13.1.13.1.13.1.13.1.13.2.13.1.13.1.13.1.13.1.13.1.13.1.13.1.13.1.13.1.13.1.13.1.13.1.13.1.13.1.13.2.13.1.13.1.13.1.13.1.13.1.13.1.13.2.13.1.13.1d7.1s.1.1s.1.1s.1.1s.1.1s.1.1s.1.1s.1.1s.1.1s.1.1s.1.1s.1.1s.1.1s.1.1s.1.1s.1.1s.1.1s.1.1s.1.1s.1.1s.1.1s.1.1s.1.1s.1.1s.1.1s.1.1s.1.1s.1.1s.1.1s.1.1s.1.1s.1.1s.1.1s.1.1s.1.1s.1.1s.1.1s.1.1s.1.1s.1.1s.1.1s.1.1s.1.1s.1.1s.1.1s.1.1s.1.1s.1.1s.1.1s.1.1s.1.1s.4e.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.27v.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.gw1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1.w.1t.r.1.r.1.r.1.r.1.r.1.r.1.r.1.r.1.r.1.r.1.r.1.r.1.r.1.r.1.r.1.r.1.r.1.r.1.r.1.r.1.r.1.r.1.r.1.r.1.r.o5k.y.1.y.1.y.1.y.1.y.1.y.1.y.1.y.1.y.1.y.1.y.1.y.1.y.1.y.1.y.1.y.1.y.1.y.1.y.1.y.1.y.1.y.1.y.1.y.1.y.1.y.1.y.1.y.1.y.1.y.1.y.1.y.1.y.1.y"
+}

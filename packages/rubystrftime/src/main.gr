@@ -1,0 +1,521 @@
+// Ruby's `Time#strftime` on UTC times, as Ruby 2.6's `strftime.c` formats
+// them: `Time.at(sec, nsec, :nsec).utc.strftime(format)`.
+//
+// Ruby programs write log stamps, file names and HTTP dates through
+// `strftime`, and its rules differ from C's and from other languages' in
+// the corners:
+//
+//   - Every conversion: `%Y %C %y %m %B %b %h %d %e %j %H %k %I %l %P %p
+//     %M %S %L %N %z %:z %::z %:::z %Z %A %a %u %w %G %g %V %U %W %s %n
+//     %t %%`, and the composites `%c %D %F %v %x %X %r %R %T`. Anything
+//     else (`%Q`, `%+`, `%E` before a letter it does not modify) is copied
+//     through as written.
+//   - Flags `-` (no padding), `_` (spaces), `0` (zeros), `^` (upper case)
+//     and `#` (change case: upper for names, lower for `%p` and `%Z`, and
+//     `%#P` stays `PM`), and a width. A flag after a width ends the
+//     directive, which is then copied (`%10-d` is `%10-d`). `-` makes a
+//     number's width 1 whatever width follows (`%-10d` is `14`).
+//   - A width pads text with spaces (or zeros under `0`), numbers with
+//     their default; a negative number keeps its sign before the zeros
+//     (`-0003` for year -3, whose default width is 5). `%C` floors and
+//     `%y` takes the floored remainder, so year -3 is century `-1`, year
+//     `97`.
+//   - `%L` and `%N` print 3 and 9 digits, or as many as the width asks,
+//     truncating and then padding with zeros (`%12N`).
+//   - `%z` is `+0000` in UTC; its width counts the whole field, `_` moves
+//     the sign right (`%_z` is ` +000`), and `%:::z` is `+00`.
+//   - A directive cut off by the end of the format (`abc%`, `%-`, `%5`)
+//     is ArgumentError "invalid format: <format>".
+//   - Dates are proleptic Gregorian at every year, negative ones
+//     included; weeks follow `%U` (Sunday first), `%W` (Monday first) and
+//     ISO 8601 (`%V`, with its year in `%G` and `%g`).
+//
+// Limits: UTC only (no other offset or zone name); `sec` and `nsec` are
+// i64 with `nsec` in 0..999999999; widths of a megabyte or more, which
+// Ruby refuses as Errno::ERANGE, are not modelled.
+
+/// ArgumentError, with Ruby's message.
+type RbStrftimeError = | RbStrftimeInvalid(msg: str)
+
+pub fn error_text(e: RbStrftimeError) -> str {
+    return match e {
+        RbStrftimeInvalid(m) -> m
+    }
+}
+
+/// The broken-down UTC time strftime reads.
+type RbStrftimeTm = {
+    year: i64,
+    mon: i64,
+    mday: i64,
+    hour: i64,
+    min: i64,
+    sec: i64,
+    wday: i64,
+    yday: i64,
+    epoch: i64,
+    nsec: i64,
+}
+
+fn floor_div(a: i64, b: i64) -> i64 {
+    let q = a / b
+    return if a % b != 0 and (a < 0) != (b < 0) { q - 1 } else { q }
+}
+
+fn floor_mod(a: i64, b: i64) -> i64 {
+    return a - floor_div(a, b) * b
+}
+
+fn is_leap(y: i64) -> bool {
+    return floor_mod(y, 4) == 0 and floor_mod(y, 100) != 0 or floor_mod(y, 400) == 0
+}
+
+fn days_before_month(y: i64, m: i64) -> i64 {
+    let table = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334]
+    return table[m - 1] + (if m > 2 and is_leap(y) { 1 } else { 0 })
+}
+
+/// The UTC calendar fields of `sec` seconds after the epoch.
+fn breakdown(sec: i64, nsec: i64) -> RbStrftimeTm {
+    let days = floor_div(sec, 86400)
+    let rest = sec - days * 86400
+    let z = days + 719468
+    let era = floor_div(z, 146097)
+    let doe = z - era * 146097
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100)
+    let mp = (5 * doy + 2) / 153
+    let d = doy - (153 * mp + 2) / 5 + 1
+    let m = if mp < 10 { mp + 3 } else { mp - 9 }
+    let y = yoe + era * 400 + (if m <= 2 { 1 } else { 0 })
+    return RbStrftimeTm{
+        year: y,
+        mon: m,
+        mday: d,
+        hour: rest / 3600,
+        min: rest / 60 % 60,
+        sec: rest % 60,
+        wday: floor_mod(days + 4, 7),
+        yday: days_before_month(y, m) + d,
+        epoch: sec,
+        nsec: nsec,
+    }
+}
+
+// ---- weeks
+
+/// `weeknumber`: weeks into the year, the first starting on `first`
+/// (0 Sunday, 1 Monday); days before it are week 0.
+fn week_number(yday0: i64, wday0: i64, first: i64) -> i64 {
+    var wday = wday0
+    if first == 1 {
+        wday = if wday == 0 { 6 } else { wday - 1 }
+    }
+    return ((yday0 + 7 - wday) / 7).max(0)
+}
+
+/// `iso8601wknum` on (year, month, day of month, weekday, 0-based day of
+/// year), as strftime.c works it out.
+fn iso_week(year: i64, mon: i64, mday: i64, wday: i64, yday0: i64) -> i64 {
+    var weeknum = week_number(yday0, wday, 1)
+    var jan1 = wday - yday0 % 7
+    if jan1 < 0 {
+        jan1 = jan1 + 7
+    }
+    if jan1 >= 2 and jan1 <= 4 {
+        weeknum = weeknum + 1
+    } else if jan1 != 1 and weeknum == 0 {
+        let last_year = year - 1
+        weeknum = iso_week(last_year, 12, 31, if jan1 == 0 { 6 } else { jan1 - 1 }, 364 + (if is_leap(last_year) { 1 } else { 0 }))
+    }
+    if mon == 12 {
+        if wday == 1 and mday >= 29 or wday == 2 and mday >= 30 or wday == 3 and mday == 31 {
+            weeknum = 1
+        }
+    }
+    return weeknum
+}
+
+fn tm_iso_week(t: RbStrftimeTm) -> i64 {
+    return iso_week(t.year, t.mon, t.mday, t.wday, t.yday - 1)
+}
+
+/// The year the ISO week belongs to.
+fn iso_year(t: RbStrftimeTm) -> i64 {
+    let w = tm_iso_week(t)
+    if t.mon == 12 and w == 1 {
+        return t.year + 1
+    }
+    if t.mon == 1 and w >= 52 {
+        return t.year - 1
+    }
+    return t.year
+}
+
+// ---- printf pieces
+
+/// `%0*ld` (zeros) or `%*ld` (spaces) of `v` at `width`.
+fn printf_int(v: i64, width: i64, zeros: bool) -> str {
+    let digits = if v < 0 { (0 - v).to_str() } else { v.to_str() }
+    let sign = if v < 0 { "-" } else { "" }
+    if zeros {
+        return sign + digits.pad_start(width - sign.len(), "0")
+    }
+    return (sign + digits).pad_start(width, " ")
+}
+
+fn ascii_case(t: str, upper: bool, lower: bool) -> str {
+    if upper == lower {
+        return t
+    }
+    return t.codes().map(|c| if upper and c >= 97 and c <= 122 { (c - 32).to_char() } else if lower and c >= 65 and c <= 90 {
+        (c + 32).to_char()
+    } else { c.to_char() }).join("")
+}
+
+fn day_name(w: i64) -> str {
+    return ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"][w]
+}
+
+fn month_name(m: i64) -> str {
+    return ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"][m - 1]
+}
+
+/// The flags and width read so far in one directive.
+type RbStrftimeSpec = { precision: i64, left: bool, chcase: bool, lower: bool, upper: bool, padding: str, colons: i64 }
+
+/// A number, as the FMT macro prints it: `def_pad` and `def_prec` are the
+/// directive's own padding and width.
+fn fmt_num(sp: RbStrftimeSpec, def_pad: str, def_prec: i64, v: i64) -> str {
+    let width = if sp.left { 1 } else if sp.precision <= 0 { def_prec } else { sp.precision }
+    return printf_int(v, width, sp.padding == "0" or sp.padding == "" and def_pad == "0")
+}
+
+/// Text, as the common tail pads it and changes its case.
+fn fmt_text(sp: RbStrftimeSpec, t: str) -> str {
+    let body = ascii_case(t, sp.upper, sp.lower)
+    if not sp.left and sp.precision > t.len() {
+        return (if sp.padding == "" { " " } else { sp.padding }).repeat(sp.precision - t.len()) + body
+    }
+    return body
+}
+
+/// A composite (`%c` and the like): the inner format's text, case
+/// changed and then padded.
+fn fmt_composite(sp: RbStrftimeSpec, inner: str, t: RbStrftimeTm) -> str {
+    let body = ascii_case(format_tm(inner.codes(), t) ?? "", sp.upper, sp.lower)
+    if sp.precision > body.len() {
+        return (if sp.padding == "" { " " } else { sp.padding }).repeat(sp.precision - body.len()) + body
+    }
+    return body
+}
+
+/// `%L` and `%N`: `w` digits by default, truncated or zero-filled.
+fn fmt_subsec(sp: RbStrftimeSpec, w: i64, nsec: i64) -> str {
+    let p = if sp.precision <= 0 { w } else { sp.precision }
+    if p > 9 {
+        return nsec.to_str().pad_start(9, "0") + "0".repeat(p - 9)
+    }
+    var v = nsec
+    for _i in 0..(9 - p) {
+        v = v / 10
+    }
+    return v.to_str().pad_start(p, "0")
+}
+
+/// `%z` and its colon forms, for an offset of zero.
+fn fmt_zone_offset(sp: RbStrftimeSpec) -> str {
+    let pr = sp.precision
+    let p = if sp.colons == 0 { if pr <= 5 { 2 } else { pr - 3 } } else if sp.colons == 1 { if pr <= 6 { 2 } else { pr - 4 } } else if sp.colons == 2 {
+        if pr <= 9 { 2 } else { pr - 7 }
+    } else { if pr <= 3 { 2 } else { pr - 1 } }
+    let hours = if sp.padding == " " { "+0".pad_start(p + 1, " ") } else { "+" + "0".pad_start(p, "0") }
+    if sp.colons == 3 {
+        return hours
+    }
+    return hours + (if sp.colons >= 1 { ":00" } else { "00" }) + (if sp.colons >= 2 { ":00" } else { "" })
+}
+
+fn hour12(h: i64) -> i64 {
+    return if h == 0 { 12 } else if h > 12 { h - 12 } else { h }
+}
+
+/// A numeric conversion's text, or `None` when `c` is not one.
+fn numeric(c: str, sp: RbStrftimeSpec, t: RbStrftimeTm) -> Option[str] {
+    if c == "d" {
+        return Some(fmt_num(sp, "0", 2, t.mday))
+    }
+    if c == "e" {
+        return Some(fmt_num(sp, " ", 2, t.mday))
+    }
+    if c == "H" {
+        return Some(fmt_num(sp, "0", 2, t.hour))
+    }
+    if c == "k" {
+        return Some(fmt_num(sp, " ", 2, t.hour))
+    }
+    if c == "I" {
+        return Some(fmt_num(sp, "0", 2, hour12(t.hour)))
+    }
+    if c == "l" {
+        return Some(fmt_num(sp, " ", 2, hour12(t.hour)))
+    }
+    if c == "j" {
+        return Some(fmt_num(sp, "0", 3, t.yday))
+    }
+    if c == "m" {
+        return Some(fmt_num(sp, "0", 2, t.mon))
+    }
+    if c == "M" {
+        return Some(fmt_num(sp, "0", 2, t.min))
+    }
+    if c == "S" {
+        return Some(fmt_num(sp, "0", 2, t.sec))
+    }
+    if c == "s" {
+        return Some(fmt_num(sp, "0", 1, t.epoch))
+    }
+    if c == "U" {
+        return Some(fmt_num(sp, "0", 2, week_number(t.yday - 1, t.wday, 0)))
+    }
+    if c == "W" {
+        return Some(fmt_num(sp, "0", 2, week_number(t.yday - 1, t.wday, 1)))
+    }
+    if c == "V" {
+        return Some(fmt_num(sp, "0", 2, tm_iso_week(t)))
+    }
+    if c == "w" {
+        return Some(fmt_num(sp, "0", 1, t.wday))
+    }
+    if c == "u" {
+        return Some(fmt_num(sp, "0", 1, if t.wday == 0 { 7 } else { t.wday }))
+    }
+    if c == "y" {
+        return Some(fmt_num(sp, "0", 2, floor_mod(t.year, 100)))
+    }
+    if c == "C" {
+        return Some(fmt_num(sp, "0", 2, floor_div(t.year, 100)))
+    }
+    if c == "Y" {
+        return Some(fmt_num(sp, "0", if t.year >= 0 { 4 } else { 5 }, t.year))
+    }
+    if c == "G" {
+        let y = iso_year(t)
+        return Some(fmt_num(sp, "0", if y >= 0 { 4 } else { 5 }, y))
+    }
+    if c == "g" {
+        return Some(fmt_num(sp, "0", 2, floor_mod(iso_year(t), 100)))
+    }
+    return None
+}
+
+/// A name, with the case rule its directive applies; `None` otherwise.
+fn named(c: str, sp0: RbStrftimeSpec, t: RbStrftimeTm) -> Option[str] {
+    var sp = sp0
+    if c == "a" or c == "A" or c == "b" or c == "B" or c == "h" {
+        if sp.chcase {
+            sp.lower = false
+            sp.chcase = false
+            sp.upper = true
+        }
+        let name = if c == "a" or c == "A" { day_name(t.wday) } else { month_name(t.mon) }
+        return Some(fmt_text(sp, if c == "A" or c == "B" { name } else { name.substr(0, 3) }))
+    }
+    if c == "p" or c == "P" {
+        if c == "p" and sp.chcase or c == "P" and not sp.chcase and not sp.upper {
+            sp.upper = false
+            sp.chcase = false
+            sp.lower = true
+        }
+        return Some(fmt_text(sp, if t.hour < 12 { "AM" } else { "PM" }))
+    }
+    if c == "Z" {
+        if sp.chcase {
+            sp.upper = false
+            sp.chcase = false
+            sp.lower = true
+        }
+        return Some(fmt_text(sp, "UTC"))
+    }
+    return None
+}
+
+fn composite_format(c: str) -> Option[str] {
+    if c == "c" {
+        return Some("%a %b %e %H:%M:%S %Y")
+    }
+    if c == "x" or c == "D" {
+        return Some("%m/%d/%y")
+    }
+    if c == "X" or c == "T" {
+        return Some("%H:%M:%S")
+    }
+    if c == "r" {
+        return Some("%I:%M:%S %p")
+    }
+    if c == "R" {
+        return Some("%H:%M")
+    }
+    if c == "v" {
+        return Some("%e-%^b-%4Y")
+    }
+    if c == "F" {
+        return Some("%Y-%m-%d")
+    }
+    return None
+}
+
+fn chars_of(f: [i64], from: i64, to: i64) -> str {
+    return f.slice(from, to).map(|c| c.to_char()).join("")
+}
+
+fn is_digit(c: i64) -> bool {
+    return c >= 48 and c <= 57
+}
+
+/// The colons of `%:z`, `%::z` and `%:::z` from the first one at `at`:
+/// how many before the `z`, 4 when three colons are followed by a fourth
+/// (strftime.c then reads on), or 0 when the run is not one of those.
+fn colon_run(f: [i64], at: i64) -> i64 {
+    var colons = 1
+    while colons <= 3 {
+        if at + colons >= f.len() {
+            return 0
+        }
+        if f[at + colons] == 122 {
+            return colons
+        }
+        if f[at + colons] != 58 {
+            return 0
+        }
+        colons = colons + 1
+    }
+    return colons
+}
+
+/// One directive starting at the `%` at `start`: its text and the index
+/// of its last character, or `None` when the format ends inside it.
+fn directive(f: [i64], start: i64, t: RbStrftimeTm) -> Option[(str, i64)] {
+    var sp = RbStrftimeSpec{ precision: 0 - 1, left: false, chcase: false, lower: false, upper: false, padding: "", colons: 0 }
+    var at = start
+    while true {
+        at = at + 1
+        if at >= f.len() {
+            return None
+        }
+        let code = f[at]
+        let c = code.to_char()
+        let flag = c == "-" or c == "^" or c == "#" or c == "_"
+        if flag and sp.precision > 0 {
+            break
+        }
+        if c == "-" {
+            sp.left = true
+            sp.padding = ""
+            sp.precision = 0
+            continue
+        }
+        if c == "^" {
+            sp.upper = true
+            continue
+        }
+        if c == "#" {
+            sp.chcase = true
+            continue
+        }
+        if c == "_" {
+            sp.padding = " "
+            continue
+        }
+        if is_digit(code) {
+            if c == "0" {
+                sp.padding = "0"
+            }
+            var end = at
+            var v = 0
+            while end < f.len() and is_digit(f[end]) and v <= 2147483647 {
+                v = v * 10 + (f[end] - 48)
+                end = end + 1
+            }
+            if v > 2147483647 {
+                break
+            }
+            sp.precision = v
+            at = end - 1
+            continue
+        }
+        if c == ":" {
+            let colons = colon_run(f, at)
+            if colons == 0 {
+                break
+            }
+            sp.colons = colons
+            at = at + colons - 1
+            continue
+        }
+        if c == "E" or c == "O" {
+            let allowed = if c == "E" { "cCxXyY" } else { "deHkIlmMSuUVwWy" }
+            if at + 1 >= f.len() or not allowed.contains(f[at + 1].to_char()) {
+                break
+            }
+            continue
+        }
+        return Some((conversion(c, sp, t) ?? chars_of(f, start, at + 1), at))
+    }
+    // Unknown: the directive so far, as written.
+    return Some((chars_of(f, start, at + 1), at))
+}
+
+/// The text of conversion `c` under `sp`, or `None` for an unknown one.
+fn conversion(c: str, sp: RbStrftimeSpec, t: RbStrftimeTm) -> Option[str] {
+    if c == "z" {
+        return if sp.colons > 3 { None } else { Some(fmt_zone_offset(sp)) }
+    }
+    if c == "%" or c == "n" or c == "t" {
+        let ch = if c == "%" { "%" } else if c == "n" { "\n" } else { "\t" }
+        return Some(fmt_text(RbStrftimeSpec{ precision: sp.precision, left: sp.left, chcase: false, lower: false, upper: false, padding: sp.padding, colons: 0 }, ch))
+    }
+    if c == "L" {
+        return Some(fmt_subsec(sp, 3, t.nsec))
+    }
+    if c == "N" {
+        return Some(fmt_subsec(sp, 9, t.nsec))
+    }
+    match composite_format(c) {
+        Some(inner) -> return Some(fmt_composite(sp, inner, t))
+        None -> ()
+    }
+    match numeric(c, sp, t) {
+        Some(text) -> return Some(text)
+        None -> ()
+    }
+    return named(c, sp, t)
+}
+
+fn format_tm(f: [i64], t: RbStrftimeTm) -> Option[str] {
+    var out: [str] = []
+    var i = 0
+    while i < f.len() {
+        if f[i] != 37 {
+            out.push(f[i].to_char())
+            i = i + 1
+            continue
+        }
+        match directive(f, i, t) {
+            Some(d) -> {
+                out.push(d.0)
+                i = d.1 + 1
+            }
+            None -> return None
+        }
+    }
+    return Some(out.join(""))
+}
+
+/// `Time.at(sec, nsec, :nsec).utc.strftime(format)`.
+pub fn strftime(sec: i64, nsec: i64, format: str) -> str ! RbStrftimeError {
+    return match format_tm(format.codes(), breakdown(sec, nsec)) {
+        Some(text) -> text
+        None -> fail(RbStrftimeInvalid("invalid format: " + format))
+    }
+}

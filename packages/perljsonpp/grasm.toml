@@ -1,0 +1,16 @@
+[package]
+name = "perljsonpp"
+version = "1.0.0"
+capabilities = []
+
+[dependencies.bigint]
+path = "../bigint"
+version = "^1.0.0"
+
+[dependencies.perlsprintf]
+path = "../perlsprintf"
+version = "^1.0.0"
+
+[dependencies.shortestfloat]
+path = "../shortestfloat"
+version = "^1.0.0"

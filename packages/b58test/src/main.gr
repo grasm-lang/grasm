@@ -1,0 +1,329 @@
+// The harness scripts/b58_diff.sh drives: each argument pair is an
+// operation and a file of cases, one per line; each answer is one line.
+import gobuildconstraint
+import goversion
+import gostrings
+import gonetmail
+import javaurlencoder
+import javadatetimeformatter
+import gohtml
+import gohttpcookie
+import javasimpledateformat
+
+fn unhex_list(h: str) -> [i64] {
+    if h == "-" {
+        return []
+    }
+    var out: [i64] = []
+    let b = h.to_bytes()
+    var i = 0
+    while i + 1 < b.len() {
+        let hi = b.at(i)
+        let lo = b.at(i + 1)
+        out.push((if hi >= 97 { hi - 87 } else { hi - 48 }) * 16 + (if lo >= 97 { lo - 87 } else { lo - 48 }))
+        i = i + 2
+    }
+    return out
+}
+
+fn unhex_bytes(h: str) -> bytes {
+    return bytes_of(unhex_list(h))
+}
+
+fn unhex(h: str) -> str {
+    return unhex_bytes(h).to_str()
+}
+
+fn hex_bytes(b: bytes) -> str {
+    let digits = "0123456789abcdef"
+    let h = b.to_list().map(|x| digits.substr(x.ushr(4), 1) + digits.substr(x.bit_and(15), 1)).join("")
+    return if h.len() == 0 { "-" } else { h }
+}
+
+fn hex_text(t: str) -> str {
+    return hex_bytes(t.to_bytes())
+}
+
+fn hex_list(xs: [str]) -> str {
+    return if xs.len() == 0 { "~" } else { xs.map(|x| hex_text(x)).join(",") }
+}
+
+fn list(h: str) -> [str] {
+    return if h == "~" { [] } else { h.split(",").map(|x| unhex(x)) }
+}
+
+fn flag(v: bool) -> str {
+    return if v { "1" } else { "0" }
+}
+
+fn gobuildconstraint_line(f: [str]) -> str {
+    let line = unhex_bytes(f[1])
+    let kinds = flag(gobuildconstraint.is_go_build_bytes(line)) + flag(gobuildconstraint.is_plus_build_bytes(line))
+    return match gobuildconstraint.parse_bytes(line) {
+        Err(e) -> "E " + kinds + " " + gobuildconstraint.error_offset(e).to_str() + " " + hex_text(gobuildconstraint.error_text(e))
+        Ok(x) -> {
+            let (v, asked) = gobuildconstraint.eval_trace(x, list(f[2]))
+            let pbl = match gobuildconstraint.plus_build_lines(x) {
+                Ok(ls) -> hex_list(ls)
+                Err(e) -> "E:" + hex_text(gobuildconstraint.error_text(e))
+            }
+            "OK " + kinds + " " + hex_text(gobuildconstraint.to_str(x)) + " " + flag(v) + " " + hex_list(asked) + " " + hex_text(gobuildconstraint.go_version(x)) + " " + pbl
+        }
+    }
+}
+
+fn goversion_line(f: [str]) -> str {
+    let x = unhex(f[0])
+    let y = unhex(f[1])
+    return goversion.compare(x, y).to_str() + " " + flag(goversion.is_valid(x)) + " " + hex_text(goversion.lang(x))
+}
+
+fn hex_blist(xs: [bytes]) -> str {
+    return if xs.len() == 0 { "~" } else { xs.map(|x| hex_bytes(x)).join(",") }
+}
+
+fn gostrings_split(f: [str]) -> str {
+    let s = unhex_bytes(f[1])
+    let sep = unhex_bytes(f[2])
+    let n = f[3].parse_int() ?? 0
+    return hex_blist(gostrings.split_n(s, sep, n)) + " " + hex_blist(gostrings.split_after_n(s, sep, n)) + " " + hex_blist(gostrings.split(s, sep)) + " " +
+    hex_blist(gostrings.split_after(s, sep))
+}
+
+fn gostrings_cut(f: [str]) -> str {
+    let s = unhex_bytes(f[1])
+    let sep = unhex_bytes(f[2])
+    let (x, y, ok) = gostrings.cut(s, sep)
+    let (p, okp) = gostrings.cut_prefix(s, sep)
+    let (q, oks) = gostrings.cut_suffix(s, sep)
+    return [hex_bytes(x), hex_bytes(y), flag(ok), hex_bytes(p), flag(okp), hex_bytes(q), flag(oks), gostrings.count(s, sep).to_str(), gostrings.index(s, sep).to_str(),
+        gostrings.last_index(s, sep).to_str()].join(" ")
+}
+
+fn gostrings_trim(f: [str]) -> str {
+    let s = unhex_bytes(f[1])
+    let c = unhex_bytes(f[2])
+    return [gostrings.trim(s, c), gostrings.trim_left(s, c), gostrings.trim_right(s, c), gostrings.trim_prefix(s, c), gostrings.trim_suffix(s, c), gostrings.trim_space(s)].map(|x|
+        hex_bytes(x)).join(" ")
+}
+
+fn gostrings_replacer(f: [str]) -> str {
+    var pairs: [(bytes, bytes)] = []
+    var i = 2
+    while i + 1 < f.len() {
+        pairs.push((unhex_bytes(f[i]), unhex_bytes(f[i + 1])))
+        i = i + 2
+    }
+    return hex_bytes(gostrings.replacer_replace(gostrings.new_replacer(pairs), unhex_bytes(f[1])))
+}
+
+fn gostrings_line(f: [str]) -> str {
+    let op = f[0]
+    if op == "K" {
+        let r = f[1].parse_int() ?? 0
+        return [gostrings.unicode_to_upper(r), gostrings.unicode_to_lower(r), gostrings.unicode_to_title(r), gostrings.unicode_simple_fold(r)].map(|x| x.to_str()).join(" ")
+    }
+    let s = unhex_bytes(f[1])
+    if op == "F" {
+        return hex_blist(gostrings.fields(s))
+    }
+    if op == "E" {
+        return flag(gostrings.equal_fold(s, unhex_bytes(f[2])))
+    }
+    if op == "U" {
+        return [gostrings.to_upper(s), gostrings.to_lower(s), gostrings.to_title(s), gostrings.title(s)].map(|x| hex_bytes(x)).join(" ")
+    }
+    if op == "V" {
+        return hex_bytes(gostrings.to_valid_utf8(s, unhex_bytes(f[2])))
+    }
+    if op == "S" {
+        return gostrings_split(f)
+    }
+    if op == "C" {
+        return gostrings_cut(f)
+    }
+    if op == "A" {
+        let chars = unhex_bytes(f[2])
+        return gostrings.index_any(s, chars).to_str() + " " + gostrings.last_index_any(s, chars).to_str() + " " + flag(gostrings.contains_any(s, chars))
+    }
+    if op == "I" {
+        let r = f[2].parse_int() ?? 0
+        return gostrings.index_rune(s, r).to_str() + " " + flag(gostrings.contains_rune(s, r))
+    }
+    if op == "R" {
+        let old = unhex_bytes(f[2])
+        let new = unhex_bytes(f[3])
+        return hex_bytes(gostrings.replace(s, old, new, f[4].parse_int() ?? 0)) + " " + hex_bytes(gostrings.replace_all(s, old, new))
+    }
+    if op == "P" {
+        return gostrings_replacer(f)
+    }
+    return gostrings_trim(f)
+}
+
+fn mail_address(a: GoMailAddress) -> str {
+    return hex_bytes(a.name) + ":" + hex_bytes(a.address) + ":" + hex_bytes(gonetmail.address_string(a))
+}
+
+fn gonetmail_line(f: [str]) -> str {
+    let op = f[0]
+    let s = unhex_bytes(f[1])
+    if op == "a" {
+        return match gonetmail.parse_address_bytes(s) {
+            Ok(a) -> "OK " + mail_address(a)
+            Err(e) -> "E " + hex_text(gonetmail.error_text(e))
+        }
+    }
+    if op == "l" {
+        return match gonetmail.parse_address_list(s) {
+            Ok(xs) -> "OK " + xs.len().to_str() + " " + (if xs.len() == 0 { "~" } else { xs.map(|a| mail_address(a)).join(",") })
+            Err(e) -> "E " + hex_text(gonetmail.error_text(e))
+        }
+    }
+    if op == "d" {
+        return match gonetmail.parse_date(s) {
+            Ok(t) -> "OK " + t.unix.to_str() + " " + t.nanos.to_str() + " " + hex_text(t.zone) + " " + t.offset.to_str()
+            Err(e) -> "E " + hex_text(gonetmail.error_text(e))
+        }
+    }
+    return hex_bytes(gonetmail.address_string(GoMailAddress{ name: s, address: unhex_bytes(f[2]) }))
+}
+
+fn javaurlencoder_line(f: [str]) -> str {
+    let s = unhex(f[1])
+    if f[0] == "e" {
+        return hex_text(javaurlencoder.encode(s))
+    }
+    return match javaurlencoder.decode(s) {
+        Ok(t) -> "OK " + hex_text(t)
+        Err(e) -> "E " + hex_text(javaurlencoder.error_text(e))
+    }
+}
+
+fn dtf_error(e: JavaDtfError) -> str {
+    return "E " + javadatetimeformatter.error_class(e) + " " + hex_text(javadatetimeformatter.error_text(e))
+}
+
+fn javadatetimeformatter_line(f: [str]) -> str {
+    let n = f.slice(2, 9).map(|x| x.parse_int() ?? 0)
+    let t = if f[1] == "D" { javadatetimeformatter.local_date(n[0], n[1], n[2]) } else if f[1] == "T" { javadatetimeformatter.local_time(n[3], n[4], n[5], n[6]) } else {
+        javadatetimeformatter.local_date_time(n[0], n[1], n[2], n[3], n[4], n[5], n[6])
+    }
+    return match javadatetimeformatter.of_pattern(unhex(f[0])) {
+        Err(e) -> dtf_error(e)
+        Ok(fmt) -> match javadatetimeformatter.format(fmt, t) {
+            Ok(s) -> "OK " + hex_text(s)
+            Err(e) -> dtf_error(e)
+        }
+    }
+}
+
+fn cookie_valid_text(c: GoHttpCookie) -> str {
+    return match gohttpcookie.cookie_valid(c) {
+        Ok(_u) -> "ok"
+        Err(e) -> hex_text(gohttpcookie.error_text(e))
+    }
+}
+
+fn cookie_expires(c: GoHttpCookie) -> str {
+    return match c.expires {
+        Some(e) -> if e.0 == 0 - 62135596800 and e.1 == 0 { "-" } else { e.0.to_str() + "." + e.1.to_str() }
+        None -> "-"
+    }
+}
+
+fn set_cookie_text(c: GoHttpCookie) -> str {
+    let flags = [c.max_age.to_str(), flag(c.secure), flag(c.http_only), c.same_site.to_str(), flag(c.partitioned)].join(" ")
+    let fields = [hex_text(c.name), hex_text(c.value), flag(c.quoted), hex_text(c.path), hex_text(c.domain), cookie_expires(c), hex_text(c.raw_expires), flags,
+        hex_bytes(c.raw), hex_blist(c.unparsed), hex_text(gohttpcookie.cookie_string(c)), cookie_valid_text(c)]
+    return "OK " + fields.join(" ")
+}
+
+fn written_cookie(f: [str]) -> GoHttpCookie {
+    var c = gohttpcookie.new_cookie(unhex(f[1]), unhex(f[2]))
+    c.quoted = f[3] == "1"
+    c.path = unhex(f[4])
+    c.domain = unhex(f[5])
+    if f[6] != "-" {
+        let p = f[6].split(".")
+        c.expires = Some((p[0].parse_int() ?? 0, p[1].parse_int() ?? 0))
+    }
+    c.max_age = f[7].parse_int() ?? 0
+    c.secure = f[8] == "1"
+    c.http_only = f[9] == "1"
+    c.same_site = f[10].parse_int() ?? 0
+    c.partitioned = f[11] == "1"
+    return c
+}
+
+fn gohttpcookie_line(f: [str]) -> str {
+    if f[0] == "c" {
+        return match gohttpcookie.parse_cookie(unhex_bytes(f[1])) {
+            Ok(cs) -> "OK " + cs.len().to_str() + " " + cs.map(|c| hex_text(c.name) + ":" + hex_text(c.value) + ":" + flag(c.quoted) + ":" +
+                hex_text(gohttpcookie.cookie_string(c)) + ":" + cookie_valid_text(c)).join(",")
+            Err(e) -> "E " + hex_text(gohttpcookie.error_text(e))
+        }
+    }
+    if f[0] == "s" {
+        return match gohttpcookie.parse_set_cookie(unhex_bytes(f[1])) {
+            Ok(c) -> set_cookie_text(c)
+            Err(e) -> "E " + hex_text(gohttpcookie.error_text(e))
+        }
+    }
+    let c = written_cookie(f)
+    return hex_text(gohttpcookie.cookie_string(c)) + " " + cookie_valid_text(c)
+}
+
+fn javasimpledateformat_line(f: [str]) -> str {
+    return match javasimpledateformat.compile(unhex(f[0])) {
+        Err(e) -> "E java.lang.IllegalArgumentException " + hex_text(javasimpledateformat.error_text(e))
+        Ok(fmt) -> match javasimpledateformat.format(fmt, f[1].parse_int() ?? 0) {
+            Ok(s) -> "OK " + hex_text(s)
+            Err(e) -> "E range " + hex_text(javasimpledateformat.error_text(e))
+        }
+    }
+}
+
+fn main() / {io} {
+    let html_table = gohtml.entity_table()
+    let argv = args()
+    var i = 0
+    while i + 1 < argv.len() {
+        let op = argv[i]
+        let text = match read_bytes(argv[i + 1]) {
+            Ok(d) -> d.to_str()
+            Err(_e) -> ""
+        }
+        for l in text.split("\n").filter(|l| l.len() > 0) {
+            if op == "javasimpledateformat" {
+                print(javasimpledateformat_line(l.split(" ")))
+            }
+            if op == "gohttpcookie" {
+                print(gohttpcookie_line(l.split(" ")))
+            }
+            if op == "gohtml" {
+                let f = l.split(" ")
+                print(if f[0] == "e" { hex_text(gohtml.escape_string(unhex(f[1]))) } else { hex_bytes(gohtml.unescape_with(html_table, unhex_bytes(f[1]))) })
+            }
+            if op == "javadatetimeformatter" {
+                print(javadatetimeformatter_line(l.split(" ")))
+            }
+            if op == "javaurlencoder" {
+                print(javaurlencoder_line(l.split(" ")))
+            }
+            if op == "gonetmail" {
+                print(gonetmail_line(l.split(" ")))
+            }
+            if op == "gostrings" {
+                print(gostrings_line(l.split(" ")))
+            }
+            if op == "goversion" {
+                print(goversion_line(l.split(" ")))
+            }
+            if op == "gobuildconstraint" {
+                print(gobuildconstraint_line(l.split(" ")))
+            }
+        }
+        i = i + 2
+    }
+}

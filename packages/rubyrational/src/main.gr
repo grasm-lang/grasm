@@ -1,0 +1,581 @@
+// Ruby 2.6's Rational: `Rational(string)` and `String#to_r`, `Rational(a,
+// b)`, arithmetic, `<=>`, `**`, `to_s` and `inspect`, `floor`, `ceil`,
+// `truncate` and `round` with digits and `half:`, and `rationalize`.
+//
+// Ruby reads a rational the way its C code does, and that code has corners:
+//
+//   - Digits may be split by single underscores (`1_000`), but `1__0`,
+//     `_1` and `1_` are not numbers; leading zeros are skipped first, so
+//     `0_1` is 1 while `0__1` is 0 followed by junk.
+//   - `1.` and `.` are numbers (1 and 0), `1.e5` is not, `1e+` is 1, and a
+//     denominator may have a fraction and an exponent: `0.75/0.25` is 3.
+//   - `1/0`, `1/0.0` and `1/.` are ZeroDivisionError -- even for `to_r`,
+//     which otherwise never fails: it reads what it can and ignores the
+//     rest, and reads nothing as 0.
+//   - An exponent past what an Integer holds overflows to Infinity, which
+//     is FloatDomainError "Infinity", or underflows to 0.0, which
+//     `Rational()` turns back into 0 but `to_r` returns as the Float 0.0
+//     or -0.0.
+//   - A string that is not a rational is ArgumentError, "invalid value for
+//     convert(): " and the string as `inspect` writes it.
+//
+// Rounding follows Rational's own: `round`, `floor`, `ceil` and `truncate`
+// with no digits give an Integer, with digits of 1 or more a Rational,
+// and with 0 or fewer an Integer again. `half:` is `up` (the default),
+// `even` or `down`, in any case; anything else is ArgumentError "invalid
+// rounding mode: ...". `rationalize(eps)` is the simplest rational within
+// `eps`, by Ruby's continued-fraction walk.
+//
+// Limits: an exponent that Ruby would carry out as a power of ten bigger
+// than 10^10000 is refused here with a RangeError (Ruby computes it, or
+// past about 10^8388608 warns and returns a Float); `**` takes an Integer
+// exponent below 10,000.
+import bigint
+
+type RbRational = { num: BigInt, den: BigInt }
+
+type RbRatError =
+    | RbRatArgumentError(message: str)
+    | RbRatZeroDivisionError(message: str)
+    | RbRatFloatDomainError(message: str)
+    | RbRatRangeError(message: str)
+
+/// What `String#to_r` returns: a Rational, or the Float zero an underflow
+/// leaves.
+type RbToR = | RbRat(value: RbRational) | RbFloatZero(negative: bool)
+
+/// A rounding result: an Integer or a Rational.
+type RbRounded = | RbWhole(value: BigInt) | RbFraction(value: RbRational)
+
+/// The Ruby exception's class name.
+pub fn error_name(e: RbRatError) -> str {
+    return match e {
+        RbRatArgumentError(_m) -> "ArgumentError"
+        RbRatZeroDivisionError(_m) -> "ZeroDivisionError"
+        RbRatFloatDomainError(_m) -> "FloatDomainError"
+        RbRatRangeError(_m) -> "RangeError"
+    }
+}
+
+/// The Ruby exception's message.
+pub fn error_message(e: RbRatError) -> str {
+    return match e {
+        RbRatArgumentError(m) -> m
+        RbRatZeroDivisionError(m) -> m
+        RbRatFloatDomainError(m) -> m
+        RbRatRangeError(m) -> m
+    }
+}
+
+fn big(v: i64) -> BigInt {
+    return bigint.from_i64(v)
+}
+
+fn is_zero(n: BigInt) -> bool {
+    return bigint.is_zero(n)
+}
+
+fn zero_div() -> RbRatError {
+    return RbRatZeroDivisionError("divided by 0")
+}
+
+/// Floor division, as Ruby's Integer#div.
+fn idiv(a: BigInt, b: BigInt) -> BigInt {
+    let pair = bigint.divmod(a, b) ?? (bigint.zero(), bigint.zero())
+    if not is_zero(pair.1) and bigint.sign(pair.1) != bigint.sign(b) {
+        return bigint.sub(pair.0, big(1))
+    }
+    return pair.0
+}
+
+fn babs(n: BigInt) -> BigInt {
+    return if bigint.sign(n) < 0 { bigint.negate(n) } else { n }
+}
+
+fn gcd(a: BigInt, b: BigInt) -> BigInt {
+    var x = babs(a)
+    var y = babs(b)
+    while not is_zero(y) {
+        let r = bigint.rem(x, y) ?? bigint.zero()
+        x = y
+        y = r
+    }
+    return x
+}
+
+/// A reduced rational with a positive denominator.
+fn make(num: BigInt, den: BigInt) -> RbRational ! RbRatError {
+    if is_zero(den) {
+        fail(zero_div())
+    }
+    var n = num
+    var d = den
+    if bigint.sign(d) < 0 {
+        n = bigint.negate(n)
+        d = bigint.negate(d)
+    }
+    let g = gcd(n, d)
+    if is_zero(g) {
+        return RbRational{ num: bigint.zero(), den: big(1) }
+    }
+    return RbRational{ num: bigint.div(n, g) ?? n, den: bigint.div(d, g) ?? d }
+}
+
+fn whole(n: BigInt) -> RbRational {
+    return RbRational{ num: n, den: big(1) }
+}
+
+/// `Rational(num, den)` for two Integers.
+pub fn rational(num: BigInt, den: BigInt) -> RbRational ! RbRatError {
+    return try make(num, den)
+}
+
+/// `Integer#to_r`.
+pub fn integer(n: BigInt) -> RbRational {
+    return whole(n)
+}
+
+pub fn numerator(r: RbRational) -> BigInt {
+    return r.num
+}
+
+pub fn denominator(r: RbRational) -> BigInt {
+    return r.den
+}
+
+// ---- reading
+
+fn is_space(c: i64) -> bool {
+    return c == 32 or c >= 9 and c <= 13
+}
+
+fn is_digit(c: i64) -> bool {
+    return c >= 48 and c <= 57
+}
+
+fn at(b: [i64], i: i64) -> i64 {
+    return if i < b.len() { b[i] } else { 0 }
+}
+
+/// What `rb_int_parse_cstr` (base 10, underscores, no sign) leaves:
+/// whether it read a number, its value, where it stopped, and how many
+/// digits it counted.
+type RbInt = { ok: bool, value: BigInt, end: i64, count: i64 }
+
+fn parse_int(b: [i64], start: i64) -> RbInt {
+    if start >= b.len() {
+        return RbInt{ ok: false, value: bigint.zero(), end: start, count: 0 }
+    }
+    var i = start
+    var count = 0
+    if b[i] == 48 and b.len() - i != 1 {
+        // Leading zeros, and single underscores among them, are skipped;
+        // at the end of the text or before white space it steps back so
+        // a digit is left.
+        count = 1
+        var us = 0
+        var c = 0
+        while true {
+            i = i + 1
+            c = at(b, i)
+            if c == 95 {
+                us = us + 1
+                if us >= 2 {
+                    break
+                }
+            } else if c == 48 {
+                count = count + 1
+                us = 0
+            } else {
+                break
+            }
+        }
+        if c == 0 or is_space(c) {
+            i = i - 1
+        }
+    }
+    if not is_digit(at(b, i)) {
+        return RbInt{ ok: count > 0, value: bigint.zero(), end: i, count: count }
+    }
+    var digits = ""
+    var last = i
+    var under = false
+    var k = i
+    while k < b.len() {
+        let c = b[k]
+        if c == 95 {
+            if under {
+                break
+            }
+            under = true
+        } else if is_digit(c) {
+            digits = digits + c.to_char()
+            under = false
+            last = k + 1
+        } else {
+            break
+        }
+        k = k + 1
+    }
+    return RbInt{ ok: true, value: bigint.parse(digits) ?? bigint.zero(), end: last, count: count + digits.len() }
+}
+
+/// `read_num`: whether a number was read, where it stopped, its digits as
+/// an Integer, and the power of ten that divides them.
+type RbNum = { ok: bool, end: i64, num: BigInt, nexp: BigInt }
+
+fn pow10(n: i64) -> BigInt {
+    return bigint.pow(big(10), n)
+}
+
+fn read_num(b: [i64], start: i64) -> RbNum {
+    var s = start
+    var num = bigint.zero()
+    var nexp = bigint.zero()
+    var ok = false
+    var frac_digits = 0
+    if s < b.len() and b[s] != 46 {
+        let n = parse_int(b, s)
+        if not n.ok {
+            return RbNum{ ok: false, end: s, num: num, nexp: nexp }
+        }
+        s = n.end
+        num = n.value
+        ok = true
+    }
+    if s < b.len() and b[s] == 46 {
+        s = s + 1
+        let f = parse_int(b, s)
+        if not f.ok {
+            return RbNum{ ok: true, end: s, num: num, nexp: nexp }
+        }
+        s = f.end
+        nexp = big(f.count)
+        num = bigint.add(bigint.mul(num, pow10(f.count)), f.value)
+        frac_digits = f.count
+        ok = true
+    }
+    if ok and s + 1 < b.len() and (b[s] == 101 or b[s] == 69) {
+        s = s + 1
+        var minus = false
+        if b[s] == 43 or b[s] == 45 {
+            minus = b[s] == 45
+            s = s + 1
+        }
+        let e = parse_int(b, s)
+        if not e.ok {
+            return RbNum{ ok: true, end: s, num: num, nexp: nexp }
+        }
+        s = e.end
+        if not is_zero(e.value) {
+            nexp = if minus { bigint.add(e.value, big(frac_digits)) } else { bigint.negate(bigint.sub(e.value, big(frac_digits))) }
+        }
+    }
+    return RbNum{ ok: ok, end: s, num: num, nexp: nexp }
+}
+
+fn skip_ws(b: [i64], start: i64) -> i64 {
+    var s = start
+    while s < b.len() and is_space(b[s]) {
+        s = s + 1
+    }
+    return s
+}
+
+/// A fixnum on a 64-bit Ruby: -2^62 up to 2^62 - 1.
+fn fixnum(n: BigInt) -> bool {
+    let limit = big(4611686018427387904)
+    return bigint.compare(n, limit) < 0 and bigint.compare(n, bigint.negate(limit)) >= 0
+}
+
+/// What `parse_rat` gives back: a rational, a Float zero, or nothing (a
+/// strict parse that failed).
+type RbParsed = | RbParsedRat(value: RbRational) | RbParsedZero(negative: bool) | RbParsedNothing
+
+fn parse_rat(text: str, strict: bool) -> RbParsed ! RbRatError {
+    let b = text.to_bytes().to_list()
+    var s = skip_ws(b, 0)
+    var negative = false
+    if s < b.len() and (b[s] == 43 or b[s] == 45) {
+        negative = b[s] == 45
+        s = s + 1
+    }
+    let n = read_num(b, s)
+    if not n.ok {
+        return if strict { RbParsedNothing } else { RbParsedRat(whole(bigint.zero())) }
+    }
+    s = n.end
+    var num = n.num
+    var den = big(1)
+    var nexp = n.nexp
+    if s < b.len() and b[s] == 47 {
+        let d = read_num(b, s + 1)
+        if not d.ok {
+            if strict {
+                return RbParsedNothing
+            }
+        } else if is_zero(d.num) {
+            fail(zero_div())
+        } else if strict and skip_ws(b, d.end) != b.len() {
+            return RbParsedNothing
+        } else {
+            den = d.num
+            nexp = bigint.sub(nexp, d.nexp)
+        }
+    } else if strict and skip_ws(b, s) != b.len() {
+        return RbParsedNothing
+    }
+    if not is_zero(nexp) {
+        if not fixnum(nexp) {
+            if bigint.sign(nexp) < 0 {
+                fail(RbRatFloatDomainError("Infinity"))
+            }
+            return RbParsedZero(negative)
+        }
+        let e = bigint.to_i64(babs(nexp)) ?? 0
+        if e > 10000 {
+            fail(RbRatRangeError("an exponent past 10000 is beyond this package"))
+        }
+        if bigint.sign(nexp) < 0 {
+            num = bigint.mul(num, pow10(e))
+        } else {
+            den = bigint.mul(den, pow10(e))
+        }
+    }
+    if negative {
+        num = bigint.negate(num)
+    }
+    return RbParsedRat(try make(num, den))
+}
+
+/// `String#inspect`, as the ArgumentError message quotes the text.
+fn ruby_inspect(text: str) -> str {
+    var out = "\""
+    let cs = text.codes()
+    var i = 0
+    while i < cs.len() {
+        let c = cs[i]
+        let next = if i + 1 < cs.len() { cs[i + 1] } else { 0 - 1 }
+        let named = if c == 10 { "n" } else if c == 9 { "t" } else if c == 13 { "r" } else if c == 12 { "f" } else if c == 11 { "v" } else if c == 8 { "b" } else if c ==
+        7 { "a" } else if c == 27 { "e" } else { "" }
+        if c == 34 or c == 92 {
+            out = out + "\\" + c.to_char()
+        } else if c == 35 and (next == 123 or next == 36 or next == 64) {
+            out = out + "\\#"
+        } else if named.len() > 0 {
+            out = out + "\\" + named
+        } else if c < 32 or c == 127 {
+            let h = "0123456789ABCDEF"
+            out = out + "\\u00" + h.substr(c / 16, 1) + h.substr(c % 16, 1)
+        } else {
+            out = out + c.to_char()
+        }
+        i = i + 1
+    }
+    return out + "\""
+}
+
+/// `Rational(string)`.
+pub fn parse(text: str) -> RbRational ! RbRatError {
+    return match try parse_rat(text, true) {
+        RbParsedRat(r) -> r
+        RbParsedZero(_neg) -> whole(bigint.zero())
+        RbParsedNothing -> fail(RbRatArgumentError("invalid value for convert(): " + ruby_inspect(text)))
+    }
+}
+
+/// `String#to_r`.
+pub fn to_r(text: str) -> RbToR ! RbRatError {
+    return match try parse_rat(text, false) {
+        RbParsedRat(r) -> RbRat(r)
+        RbParsedZero(neg) -> RbFloatZero(neg)
+        RbParsedNothing -> RbRat(whole(bigint.zero()))
+    }
+}
+
+// ---- arithmetic
+
+pub fn add(a: RbRational, b: RbRational) -> RbRational {
+    return make(bigint.add(bigint.mul(a.num, b.den), bigint.mul(b.num, a.den)), bigint.mul(a.den, b.den)) ?? a
+}
+
+pub fn sub(a: RbRational, b: RbRational) -> RbRational {
+    return add(a, RbRational{ num: bigint.negate(b.num), den: b.den })
+}
+
+pub fn mul(a: RbRational, b: RbRational) -> RbRational {
+    return make(bigint.mul(a.num, b.num), bigint.mul(a.den, b.den)) ?? a
+}
+
+/// `a / b`: ZeroDivisionError when `b` is zero.
+pub fn div(a: RbRational, b: RbRational) -> RbRational ! RbRatError {
+    return try make(bigint.mul(a.num, b.den), bigint.mul(a.den, b.num))
+}
+
+/// `a <=> b`: -1, 0 or 1.
+pub fn compare(a: RbRational, b: RbRational) -> i64 {
+    return bigint.compare(bigint.mul(a.num, b.den), bigint.mul(b.num, a.den))
+}
+
+fn is_one(n: BigInt) -> bool {
+    return bigint.compare(n, big(1)) == 0
+}
+
+/// `a ** n` for an Integer `n`.
+pub fn pow(a: RbRational, n: i64) -> RbRational ! RbRatError {
+    if n == 0 {
+        return whole(big(1))
+    }
+    if is_one(a.den) {
+        if is_one(a.num) {
+            return whole(big(1))
+        }
+        if bigint.compare(a.num, big(0 - 1)) == 0 {
+            return whole(big(if n % 2 != 0 { 0 - 1 } else { 1 }))
+        }
+        if is_zero(a.num) {
+            if n < 0 {
+                fail(zero_div())
+            }
+            return whole(bigint.zero())
+        }
+    }
+    if n >= 10000 or n <= 0 - 10000 {
+        fail(RbRatRangeError("an exponent past 10000 is beyond this package"))
+    }
+    if n > 0 {
+        return try make(bigint.pow(a.num, n), bigint.pow(a.den, n))
+    }
+    return try make(bigint.pow(a.den, 0 - n), bigint.pow(a.num, 0 - n))
+}
+
+/// `to_s`: "n/d".
+pub fn to_s(r: RbRational) -> str {
+    return bigint.to_str(r.num) + "/" + bigint.to_str(r.den)
+}
+
+/// `inspect`: "(n/d)".
+pub fn inspect(r: RbRational) -> str {
+    return "(" + to_s(r) + ")"
+}
+
+// ---- rounding
+
+fn floor_of(r: RbRational) -> BigInt {
+    return idiv(r.num, r.den)
+}
+
+fn ceil_of(r: RbRational) -> BigInt {
+    return bigint.negate(idiv(bigint.negate(r.num), r.den))
+}
+
+fn truncate_of(r: RbRational) -> BigInt {
+    return if bigint.sign(r.num) < 0 { ceil_of(r) } else { floor_of(r) }
+}
+
+/// Half up, down or even: on the magnitude, with the sign put back.
+fn round_of(r: RbRational, mode: i64) -> BigInt {
+    let neg = bigint.sign(r.num) < 0
+    var num = bigint.add(bigint.mul(babs(r.num), big(2)), r.den)
+    if mode == 2 {
+        num = bigint.sub(num, big(1))
+    }
+    let den = bigint.mul(r.den, big(2))
+    var q = idiv(num, den)
+    if mode == 1 {
+        let rem = bigint.sub(num, bigint.mul(q, den))
+        if is_zero(rem) and not is_zero(bigint.rem(q, big(2)) ?? bigint.zero()) {
+            q = bigint.sub(q, big(1))
+        }
+    }
+    return if neg { bigint.negate(q) } else { q }
+}
+
+fn apply(r: RbRational, kind: str, mode: i64) -> BigInt {
+    if kind == "floor" {
+        return floor_of(r)
+    }
+    if kind == "ceil" {
+        return ceil_of(r)
+    }
+    if kind == "truncate" {
+        return truncate_of(r)
+    }
+    return round_of(r, mode)
+}
+
+/// `half:` as Ruby reads it: 0 up, 1 even, 2 down.
+fn rounding_mode(half: Option[str]) -> i64 ! RbRatError {
+    let h = match half {
+        Some(x) -> x
+        None -> return 0
+    }
+    let lower = h.to_lower()
+    if h.len() == 2 and lower == "up" {
+        return 0
+    }
+    if h.len() == 4 and lower == "even" {
+        return 1
+    }
+    if h.len() == 4 and lower == "down" {
+        return 2
+    }
+    fail(RbRatArgumentError("invalid rounding mode: " + h))
+}
+
+/// `floor`, `ceil`, `truncate` or `round` (`kind`), with `digits` and, for
+/// `round`, `half:`.
+pub fn round_with(r: RbRational, kind: str, digits: Option[i64], half: Option[str]) -> RbRounded ! RbRatError {
+    let mode = try rounding_mode(half)
+    let n = match digits {
+        Some(d) -> d
+        None -> return RbWhole(apply(r, kind, mode))
+    }
+    if n > 10000 or n < 0 - 10000 {
+        fail(RbRatRangeError("digits past 10000 are beyond this package"))
+    }
+    let b = if n >= 0 { whole(pow10(n)) } else { RbRational{ num: big(1), den: pow10(0 - n) } }
+    let s = apply(mul(r, b), kind, mode)
+    let back = try div(whole(s), b)
+    if n < 1 {
+        return RbWhole(truncate_of(back))
+    }
+    return RbFraction(back)
+}
+
+/// `rationalize(eps)`: the simplest rational within `eps`.
+pub fn rationalize(r: RbRational, eps: RbRational) -> RbRational {
+    if bigint.sign(r.num) < 0 {
+        let pos = rationalize(RbRational{ num: bigint.negate(r.num), den: r.den }, eps)
+        return RbRational{ num: bigint.negate(pos.num), den: pos.den }
+    }
+    let e = RbRational{ num: babs(eps.num), den: eps.den }
+    var a = sub(r, e)
+    var b = add(r, e)
+    if compare(a, b) == 0 {
+        return r
+    }
+    var p0 = bigint.zero()
+    var p1 = big(1)
+    var q0 = big(1)
+    var q1 = bigint.zero()
+    var c = ceil_of(a)
+    while compare(whole(c), b) >= 0 {
+        let k = bigint.sub(c, big(1))
+        let p2 = bigint.add(bigint.mul(k, p1), p0)
+        let q2 = bigint.add(bigint.mul(k, q1), q0)
+        let t = reciprocal(sub(b, whole(k)))
+        b = reciprocal(sub(a, whole(k)))
+        a = t
+        p0 = p1
+        q0 = q1
+        p1 = p2
+        q1 = q2
+        c = ceil_of(a)
+    }
+    return make(bigint.add(bigint.mul(c, p1), p0), bigint.add(bigint.mul(c, q1), q0)) ?? r
+}
+
+fn reciprocal(r: RbRational) -> RbRational {
+    return make(r.den, r.num) ?? r
+}

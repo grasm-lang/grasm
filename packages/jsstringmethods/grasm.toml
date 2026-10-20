@@ -1,0 +1,16 @@
+[package]
+name = "jsstringmethods"
+version = "1.0.0"
+capabilities = []
+
+[dependencies.jsnumber]
+path = "../jsnumber"
+version = "^1.0.0"
+
+[dependencies.bigint]
+path = "../bigint"
+version = "^1.0.0"
+
+[dependencies.shortestfloat]
+path = "../shortestfloat"
+version = "^1.0.0"

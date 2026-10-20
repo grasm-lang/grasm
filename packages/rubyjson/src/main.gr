@@ -1,0 +1,810 @@
+// Ruby's `JSON.generate`, `JSON.pretty_generate` and `JSON.parse`, as
+// Ruby 2.6's bundled json 2.1.0 C extension runs them: the same bytes
+// out, the same values in, and the same exceptions with the same
+// messages.
+//
+// A service that has to accept exactly what a Ruby service accepts, or
+// produce byte-identical JSON for a signature or a cache key, needs the
+// extension's own rules, several of which are not the JSON standard's:
+//
+//   - `generate` writes no spaces; `pretty_generate` indents by two
+//     spaces, puts `": "` between key and value, and writes an empty
+//     array as `[\n\n]` and an empty object as `{\n}` (indented to their
+//     depth).
+//   - Strings escape `"`, `\` and the control characters (`\b \f \n \r
+//     \t`, the rest as lower-case `\u00XX`); `/`, DEL and U+2028 stay as
+//     they are. Bytes that are not UTF-8 raise GeneratorError ("partial
+//     character in source, but hit end", "source sequence is
+//     illegal/malformed utf-8").
+//   - Floats print as Ruby's `Float#to_s` (`1.0e+15`, `1.0e-05`,
+//     `0.0001`, `-0.0`, `123456789012345.0`; shortest digits, and an
+//     exponent once a whole number reaches 16 digits); NaN and the infinities raise GeneratorError
+//     "865: NaN not allowed in JSON" / "862: Infinity not allowed in
+//     JSON".
+//   - More than 100 levels of arrays and objects raise NestingError
+//     ("nesting of 100 is too deep" from `generate`, "nesting of 101 is
+//     too deep" from `parse`).
+//   - `parse` takes any value at the top, `/* */` and `//` comments
+//     wherever white space may go, and any character after a backslash
+//     (`"\x"` is `"x"`); integers of any size; floats only with digits on
+//     both sides of the point, rounded to the nearest double (`1e400` is
+//     Infinity). A repeated key keeps its first place and its last value.
+//   - `\u` escapes are decoded as the extension decodes them: a high
+//     surrogate takes the low ten bits of whatever `\u` follows it, a high
+//     surrogate followed by anything else is `?` and swallows the next
+//     character, a lone low surrogate becomes its three-byte encoding,
+//     and fewer than six characters left after a high surrogate is
+//     "incomplete surrogate pair". Bytes that are not UTF-8 pass through.
+//   - Errors are ParserError "<line>: unexpected token at '<rest>'", with
+//     the extension's line number (767 for the document, 416 inside an
+//     array, 224 for NaN, 231 for Infinity, 247 for -Infinity) and the
+//     rest of the text from where its state machine stopped: the start
+//     of an object that failed anywhere inside, the element where an
+//     array failed, the character after the value at the top.
+//
+// Limits: no options (`allow_nan`, `symbolize_names`, `max_nesting`,
+// `create_additions`, ...); Hash keys are strings; the text is bytes and
+// so is every string in it. `Infinity` as the very first thing in the
+// text is not reproduced: the extension then reads the byte before the
+// text for its message.
+
+import bigint
+import shortestfloat
+
+/// A JSON value as Ruby holds it. Strings are bytes, as Ruby's are.
+type RbJsonValue =
+    | RbJsonNull
+    | RbJsonBool(b: bool)
+    | RbJsonInt(n: BigInt)
+    | RbJsonFloat(x: f64)
+    | RbJsonString(s: bytes)
+    | RbJsonArray(items: [RbJsonValue])
+    | RbJsonObject(keys: [bytes], values: [RbJsonValue])
+
+/// The exception class (`JSON::ParserError`, `JSON::NestingError`,
+/// `JSON::GeneratorError`) and its message, as bytes.
+type RbJsonError = | RbJsonError(class_name: str, message: bytes)
+
+pub fn error_class(e: RbJsonError) -> str {
+    return match e {
+        RbJsonError(c, _m) -> c
+    }
+}
+
+pub fn error_message(e: RbJsonError) -> bytes {
+    return match e {
+        RbJsonError(_c, m) -> m
+    }
+}
+
+fn text_bytes(t: str) -> [i64] {
+    return t.to_bytes().to_list()
+}
+
+fn extend(inout out: [i64], xs: [i64]) {
+    for x in xs {
+        out.push(x)
+    }
+}
+
+// ---- generating
+
+/// The pieces that differ between `generate` and `pretty_generate`.
+type RbJsonStyle = { indent: [i64], colon: [i64], object_nl: [i64], array_nl: [i64] }
+
+fn compact_style() -> RbJsonStyle {
+    return RbJsonStyle{ indent: [], colon: [58], object_nl: [], array_nl: [] }
+}
+
+fn pretty_style() -> RbJsonStyle {
+    return RbJsonStyle{ indent: [32, 32], colon: [58, 32], object_nl: [10], array_nl: [10] }
+}
+
+fn generator_error(m: str) -> RbJsonError {
+    return RbJsonError("JSON::GeneratorError", m.to_bytes())
+}
+
+fn trailing_bytes(c: i64) -> i64 {
+    return if c < 192 { 0 } else if c < 224 { 1 } else if c < 240 { 2 } else if c < 248 { 3 } else if c < 252 { 4 } else { 5 }
+}
+
+/// `isLegalUTF8` from the extension's copy of ConvertUTF.c.
+fn legal_utf8(s: [i64], at: i64, len: i64) -> bool {
+    if len > 4 {
+        return false
+    }
+    let lead = s[at]
+    if len >= 4 and (s[at + 3] < 128 or s[at + 3] > 191) {
+        return false
+    }
+    if len >= 3 and (s[at + 2] < 128 or s[at + 2] > 191) {
+        return false
+    }
+    if len >= 2 {
+        let a = s[at + 1]
+        if a > 191 {
+            return false
+        }
+        let bad = if lead == 224 { a < 160 } else if lead == 237 { a > 159 } else if lead == 240 { a < 144 } else if lead == 244 { a > 143 } else { a < 128 }
+        if bad {
+            return false
+        }
+    }
+    if lead >= 128 and lead < 194 {
+        return false
+    }
+    return lead <= 244
+}
+
+fn escape_control(c: i64) -> [i64] {
+    if c == 10 {
+        return [92, 110]
+    }
+    if c == 13 {
+        return [92, 114]
+    }
+    if c == 9 {
+        return [92, 116]
+    }
+    if c == 12 {
+        return [92, 102]
+    }
+    if c == 8 {
+        return [92, 98]
+    }
+    let d = "0123456789abcdef"
+    return text_bytes("\\u00" + d.substr(c / 16, 1) + d.substr(c % 16, 1))
+}
+
+/// `convert_UTF8_to_JSON` between quotes.
+fn gen_string(inout out: [i64], s: [i64]) -> () ! RbJsonError {
+    out.push(34)
+    var i = 0
+    while i < s.len() {
+        let c = s[i]
+        if c < 32 {
+            extend(out, escape_control(c))
+            i = i + 1
+        } else if c == 92 or c == 34 {
+            out.push(92)
+            out.push(c)
+            i = i + 1
+        } else {
+            let len = trailing_bytes(c) + 1
+            if i + len > s.len() {
+                fail(generator_error("partial character in source, but hit end"))
+            }
+            if not legal_utf8(s, i, len) {
+                fail(generator_error("source sequence is illegal/malformed utf-8"))
+            }
+            extend(out, s.slice(i, i + len))
+            i = i + len
+        }
+    }
+    out.push(34)
+    return ()
+}
+
+/// Ruby's `Float#to_s` for a finite double.
+pub fn float_to_s(x: f64) -> str {
+    let p = shortestfloat.parts(x)
+    let sign = if p.negative { "-" } else { "" }
+    let d = p.digits
+    let e = p.point
+    if d == "0" {
+        return sign + "0.0"
+    }
+    if e > 0 and e < d.len() {
+        return sign + d.substr(0, e) + "." + d.substr(e, d.len())
+    }
+    if e > 0 and e <= 15 {
+        return sign + d + "0".repeat(e - d.len()) + ".0"
+    }
+    if e <= 0 and e > 0 - 4 {
+        return sign + "0." + "0".repeat(0 - e) + d
+    }
+    let x1 = e - 1
+    let exp = (if x1 < 0 { "-" } else { "+" }) + (if x1 < 0 { 0 - x1 } else { x1 }).to_str().pad_start(2, "0")
+    return sign + d.substr(0, 1) + "." + (if d.len() > 1 { d.substr(1, d.len()) } else { "0" }) + "e" + exp
+}
+
+fn gen_float(inout out: [i64], x: f64) -> () ! RbJsonError {
+    if x != x {
+        fail(generator_error("865: NaN not allowed in JSON"))
+    }
+    if x - x != 0.0 {
+        fail(generator_error("862: " + (if x < 0.0 { "-Infinity" } else { "Infinity" }) + " not allowed in JSON"))
+    }
+    extend(out, text_bytes(float_to_s(x)))
+    return ()
+}
+
+fn indent_to(inout out: [i64], st: RbJsonStyle, depth: i64) {
+    for _i in 0..depth {
+        extend(out, st.indent)
+    }
+}
+
+fn gen_value(inout out: [i64], v: RbJsonValue, st: RbJsonStyle, depth: i64) -> () ! RbJsonError {
+    match v {
+        RbJsonNull -> extend(out, text_bytes("null"))
+        RbJsonBool(b) -> extend(out, text_bytes(if b { "true" } else { "false" }))
+        RbJsonInt(n) -> extend(out, text_bytes(bigint.to_str(n)))
+        RbJsonFloat(x) -> try gen_float(out, x)
+        RbJsonString(s) -> try gen_string(out, s.to_list())
+        RbJsonArray(items) -> try gen_array(out, items, st, depth + 1)
+        RbJsonObject(keys, values) -> try gen_object(out, keys, values, st, depth + 1)
+    }
+    return ()
+}
+
+fn gen_array(inout out: [i64], items: [RbJsonValue], st: RbJsonStyle, depth: i64) -> () ! RbJsonError {
+    if depth > 100 {
+        fail(RbJsonError("JSON::NestingError", ("nesting of " + (depth - 1).to_str() + " is too deep").to_bytes()))
+    }
+    out.push(91)
+    extend(out, st.array_nl)
+    var i = 0
+    while i < items.len() {
+        if i > 0 {
+            out.push(44)
+            extend(out, st.array_nl)
+        }
+        indent_to(out, st, depth)
+        try gen_value(out, items[i], st, depth)
+        i = i + 1
+    }
+    extend(out, st.array_nl)
+    if st.array_nl.len() > 0 {
+        indent_to(out, st, depth - 1)
+    }
+    out.push(93)
+    return ()
+}
+
+fn gen_object(inout out: [i64], keys: [bytes], values: [RbJsonValue], st: RbJsonStyle, depth: i64) -> () ! RbJsonError {
+    if depth > 100 {
+        fail(RbJsonError("JSON::NestingError", ("nesting of " + (depth - 1).to_str() + " is too deep").to_bytes()))
+    }
+    out.push(123)
+    var i = 0
+    while i < keys.len() {
+        if i > 0 {
+            out.push(44)
+        }
+        extend(out, st.object_nl)
+        indent_to(out, st, depth)
+        try gen_string(out, keys[i].to_list())
+        extend(out, st.colon)
+        try gen_value(out, values[i], st, depth)
+        i = i + 1
+    }
+    extend(out, st.object_nl)
+    if st.object_nl.len() > 0 {
+        indent_to(out, st, depth - 1)
+    }
+    out.push(125)
+    return ()
+}
+
+/// `JSON.generate(value)`.
+pub fn generate(v: RbJsonValue) -> bytes ! RbJsonError {
+    var out: [i64] = []
+    try gen_value(out, v, compact_style(), 0)
+    return bytes_of(out)
+}
+
+/// `JSON.pretty_generate(value)`.
+pub fn pretty_generate(v: RbJsonValue) -> bytes ! RbJsonError {
+    var out: [i64] = []
+    try gen_value(out, v, pretty_style(), 0)
+    return bytes_of(out)
+}
+
+// ---- parsing
+
+/// What one value parse came to: a value and the index after it; a
+/// failure the extension reports as stopping at the value's start
+/// (`fhold` with a final state); or an outright mismatch (NULL).
+type RbJsonStep =
+    | RbJsonGot(value: RbJsonValue, next: i64)
+    | RbJsonSoft
+    | RbJsonMismatch
+
+/// ParserError "<line>: unexpected token at '<rest>'", the rest running to
+/// the first NUL as C's `%s` does.
+fn token_error(src: [i64], line: i64, at: i64) -> RbJsonError {
+    var msg = text_bytes(line.to_str() + ": unexpected token at '")
+    var i = at.max(0)
+    while i < src.len() and src[i] != 0 {
+        msg.push(src[i])
+        i = i + 1
+    }
+    msg.push(39)
+    return RbJsonError("JSON::ParserError", bytes_of(msg))
+}
+
+fn is_ws(c: i64) -> bool {
+    return c == 32 or c == 9 or c == 10 or c == 13
+}
+
+fn begins_value(c: i64) -> bool {
+    return c == 34 or c == 45 or c == 91 or c == 123 or c == 110 or c == 116 or c == 102 or c == 78 or c == 73 or c >= 48 and c <= 57
+}
+
+/// White space and comments from `p`: where they end, and whether the
+/// machine is still in a good state there (false: it stopped on a bad
+/// character after `/`, or ran out inside a comment).
+fn skip_ignore(src: [i64], p0: i64) -> (i64, bool) {
+    var p = p0
+    while p < src.len() {
+        let c = src[p]
+        if is_ws(c) {
+            p = p + 1
+        } else if c == 47 {
+            if p + 1 >= src.len() {
+                return (src.len(), false)
+            }
+            let k = src[p + 1]
+            if k == 42 {
+                var q = p + 2
+                while q + 1 < src.len() and not (src[q] == 42 and src[q + 1] == 47) {
+                    q = q + 1
+                }
+                if q + 1 >= src.len() {
+                    return (src.len(), false)
+                }
+                p = q + 2
+            } else if k == 47 {
+                var q = p + 2
+                while q < src.len() and src[q] != 10 {
+                    q = q + 1
+                }
+                if q >= src.len() {
+                    return (src.len(), false)
+                }
+                p = q + 1
+            } else {
+                return (p + 1, false)
+            }
+        } else {
+            return (p, true)
+        }
+    }
+    return (p, true)
+}
+
+fn matches(src: [i64], p: i64, word: str) -> bool {
+    let w = text_bytes(word)
+    if p + w.len() > src.len() {
+        return false
+    }
+    var i = 0
+    while i < w.len() {
+        if src[p + i] != w[i] {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn is_digit(c: i64) -> bool {
+    return c >= 48 and c <= 57
+}
+
+fn digits_from(src: [i64], p: i64) -> i64 {
+    var q = p
+    while q < src.len() and is_digit(src[q]) {
+        q = q + 1
+    }
+    return q
+}
+
+/// The integer machine: the index after the integer, or -1.
+fn integer_end(src: [i64], p: i64) -> i64 {
+    var q = p
+    if q < src.len() and src[q] == 45 {
+        q = q + 1
+    }
+    if q >= src.len() {
+        return 0 - 1
+    }
+    if src[q] == 48 {
+        q = q + 1
+        return if q < src.len() and is_digit(src[q]) { 0 - 1 } else { q }
+    }
+    if is_digit(src[q]) {
+        return digits_from(src, q)
+    }
+    return 0 - 1
+}
+
+/// The float machine: the index after the float, or -1.
+fn float_end(src: [i64], p: i64) -> i64 {
+    var q = p
+    if q < src.len() and src[q] == 45 {
+        q = q + 1
+    }
+    if q >= src.len() or not is_digit(src[q]) {
+        return 0 - 1
+    }
+    q = if src[q] == 48 { q + 1 } else { digits_from(src, q) }
+    if q >= src.len() {
+        return 0 - 1
+    }
+    var c = src[q]
+    if c == 46 {
+        q = q + 1
+        if q >= src.len() or not is_digit(src[q]) {
+            return 0 - 1
+        }
+        q = digits_from(src, q)
+        if q >= src.len() {
+            return q
+        }
+        c = src[q]
+        if c == 45 or c == 46 {
+            return 0 - 1
+        }
+        if c != 69 and c != 101 {
+            return q
+        }
+    } else if c != 69 and c != 101 {
+        return 0 - 1
+    }
+    return exponent_end(src, q + 1)
+}
+
+fn exponent_end(src: [i64], p: i64) -> i64 {
+    var q = p
+    if q < src.len() and (src[q] == 43 or src[q] == 45) {
+        q = q + 1
+    }
+    if q >= src.len() or not is_digit(src[q]) {
+        return 0 - 1
+    }
+    q = digits_from(src, q)
+    if q < src.len() and (src[q] == 69 or src[q] == 101 or src[q] == 45 or src[q] == 46) {
+        return 0 - 1
+    }
+    return q
+}
+
+fn ascii_text(src: [i64], from: i64, to: i64) -> str {
+    return src.slice(from, to).map(|c| c.to_char()).join("")
+}
+
+fn parse_number(src: [i64], p: i64) -> RbJsonStep ! RbJsonError {
+    if src.len() - p >= 9 and matches(src, p, "-Infinity") {
+        fail(token_error(src, 247, p))
+    }
+    let fe = float_end(src, p)
+    if fe >= 0 {
+        return RbJsonGot(RbJsonFloat(ascii_text(src, p, fe).parse_float() ?? 0.0), fe)
+    }
+    let ie = integer_end(src, p)
+    if ie >= 0 {
+        return RbJsonGot(RbJsonInt(bigint.parse(ascii_text(src, p, ie)) ?? bigint.zero()), ie)
+    }
+    return RbJsonSoft
+}
+
+fn hex_value(c: i64) -> i64 {
+    return if c >= 97 { c - 87 } else if c >= 65 { c - 55 } else { c - 48 }
+}
+
+fn is_hex(c: i64) -> bool {
+    return is_digit(c) or c >= 65 and c <= 70 or c >= 97 and c <= 102
+}
+
+fn hex4(src: [i64], at: i64) -> i64 {
+    return hex_value(src[at]) * 4096 + hex_value(src[at + 1]) * 256 + hex_value(src[at + 2]) * 16 + hex_value(src[at + 3])
+}
+
+/// The string machine: the index of the closing quote, or -1.
+fn string_close(src: [i64], p: i64) -> i64 {
+    var q = p + 1
+    while q < src.len() {
+        let c = src[q]
+        if c == 34 {
+            return q
+        }
+        if c < 32 {
+            return 0 - 1
+        }
+        if c == 92 {
+            q = q + 1
+            if q >= src.len() or src[q] < 32 {
+                return 0 - 1
+            }
+            if src[q] == 117 {
+                var k = 1
+                while k <= 4 {
+                    if q + k >= src.len() or not is_hex(src[q + k]) {
+                        return 0 - 1
+                    }
+                    k = k + 1
+                }
+                q = q + 4
+            }
+        }
+        q = q + 1
+    }
+    return 0 - 1
+}
+
+/// `convert_UTF32_to_UTF8`.
+fn utf8_of(ch: i64) -> [i64] {
+    if ch <= 127 {
+        return [ch]
+    }
+    if ch <= 2047 {
+        return [ch.shr(6).bit_or(192), ch.bit_and(63).bit_or(128)]
+    }
+    if ch <= 65535 {
+        return [ch.shr(12).bit_or(224), ch.shr(6).bit_and(63).bit_or(128), ch.bit_and(63).bit_or(128)]
+    }
+    if ch <= 2097151 {
+        return [ch.shr(18).bit_or(240), ch.shr(12).bit_and(63).bit_or(128), ch.shr(6).bit_and(63).bit_or(128), ch.bit_and(63).bit_or(128)]
+    }
+    return [63]
+}
+
+fn simple_escape(c: i64) -> i64 {
+    return if c == 110 { 10 } else if c == 114 { 13 } else if c == 116 { 9 } else if c == 34 { 34 } else if c == 92 { 92 } else if c == 98 { 8 } else if c == 102 {
+        12
+    } else { 0 - 1 }
+}
+
+/// `json_string_unescape` over `src[start..end)`.
+fn unescape(src: [i64], start: i64, end: i64) -> [i64] ! RbJsonError {
+    var out: [i64] = []
+    var p = start
+    var pe = start
+    while pe < end {
+        if src[pe] != 92 {
+            pe = pe + 1
+            continue
+        }
+        extend(out, src.slice(p, pe))
+        pe = pe + 1
+        let c = src[pe]
+        let simple = simple_escape(c)
+        if simple >= 0 {
+            out.push(simple)
+        } else if c == 117 {
+            var ch = hex4(src, pe + 1)
+            pe = pe + 4
+            if ch.bit_and(64512) == 55296 {
+                pe = pe + 1
+                if pe > end - 6 {
+                    var msg = text_bytes("468: incomplete surrogate pair at '")
+                    var i = p
+                    while i < src.len() and src[i] != 0 {
+                        msg.push(src[i])
+                        i = i + 1
+                    }
+                    msg.push(39)
+                    fail(RbJsonError("JSON::ParserError", bytes_of(msg)))
+                }
+                if src[pe] == 92 and src[pe + 1] == 117 {
+                    let sur = hex4(src, pe + 2)
+                    ch = ch.bit_and(63).shl(10).bit_or((ch.shr(6).bit_and(15) + 1).shl(16)).bit_or(sur.bit_and(1023))
+                    pe = pe + 5
+                    extend(out, utf8_of(ch))
+                } else {
+                    out.push(63)
+                }
+            } else {
+                extend(out, utf8_of(ch))
+            }
+        } else {
+            // Any other character: the backslash goes and it stays.
+            p = pe
+            continue
+        }
+        pe = pe + 1
+        p = pe
+    }
+    extend(out, src.slice(p, pe))
+    return out
+}
+
+fn parse_string(src: [i64], p: i64) -> RbJsonStep ! RbJsonError {
+    let close = string_close(src, p)
+    if close < 0 {
+        return RbJsonSoft
+    }
+    let s = try unescape(src, p + 1, close)
+    return RbJsonGot(RbJsonString(bytes_of(s)), close + 1)
+}
+
+fn literal(src: [i64], p: i64, word: str, v: RbJsonValue) -> RbJsonStep {
+    return if matches(src, p, word) { RbJsonGot(v, p + word.len()) } else { RbJsonMismatch }
+}
+
+fn parse_value(src: [i64], p: i64, nesting: i64) -> RbJsonStep ! RbJsonError {
+    let c = src[p]
+    if c == 34 {
+        return try parse_string(src, p)
+    }
+    if c == 45 or is_digit(c) {
+        return try parse_number(src, p)
+    }
+    if c == 91 {
+        let (v, next) = try parse_array(src, p, nesting + 1)
+        return RbJsonGot(v, next)
+    }
+    if c == 123 {
+        return try parse_object(src, p, nesting + 1)
+    }
+    if c == 110 {
+        return literal(src, p, "null", RbJsonNull)
+    }
+    if c == 116 {
+        return literal(src, p, "true", RbJsonBool(true))
+    }
+    if c == 102 {
+        return literal(src, p, "false", RbJsonBool(false))
+    }
+    if c == 78 and matches(src, p, "NaN") {
+        fail(token_error(src, 224, p))
+    }
+    if c == 73 and matches(src, p, "Infinity") {
+        fail(token_error(src, 231, p - 1))
+    }
+    return RbJsonMismatch
+}
+
+fn nesting_error(n: i64) -> RbJsonError {
+    return RbJsonError("JSON::NestingError", ("nesting of " + n.to_str() + " is too deep").to_bytes())
+}
+
+/// `JSON_parse_array`: raises at the place its machine stopped.
+fn parse_array(src: [i64], p: i64, nesting: i64) -> (RbJsonValue, i64) ! RbJsonError {
+    if nesting > 100 {
+        fail(nesting_error(nesting))
+    }
+    var items: [RbJsonValue] = []
+    var q = p + 1
+    // 0: after `[`, 1: after a value, 2: after `,`.
+    var state = 0
+    while true {
+        let (r, ok) = skip_ignore(src, q)
+        q = r
+        if not ok or q >= src.len() {
+            fail(token_error(src, 416, q))
+        }
+        let c = src[q]
+        if c == 93 and state != 2 {
+            return (RbJsonArray(items), q + 1)
+        }
+        if state == 1 {
+            if c != 44 {
+                fail(token_error(src, 416, q))
+            }
+            q = q + 1
+            state = 2
+            continue
+        }
+        if not begins_value(c) {
+            fail(token_error(src, 416, q))
+        }
+        match try parse_value(src, q, nesting) {
+            RbJsonGot(v, next) -> {
+                items.push(v)
+                q = next
+                state = 1
+            }
+            _ -> fail(token_error(src, 416, q))
+        }
+    }
+    return (RbJsonArray(items), q)
+}
+
+/// `JSON_parse_object`: a failure anywhere is NULL, reported by the
+/// caller at the `{`.
+fn parse_object(src: [i64], p: i64, nesting: i64) -> RbJsonStep ! RbJsonError {
+    if nesting > 100 {
+        fail(nesting_error(nesting))
+    }
+    var keys: [bytes] = []
+    var values: [RbJsonValue] = []
+    var q = p + 1
+    var first = true
+    while true {
+        let (r, ok) = skip_ignore(src, q)
+        q = r
+        if not ok or q >= src.len() {
+            return RbJsonSoft
+        }
+        // At the top of the loop the machine is just past `{` or a pair,
+        // and both may close.
+        if src[q] == 125 {
+            return RbJsonGot(RbJsonObject(keys, values), q + 1)
+        }
+        if not first {
+            if src[q] != 44 {
+                return RbJsonSoft
+            }
+            let (r2, ok2) = skip_ignore(src, q + 1)
+            q = r2
+            if not ok2 or q >= src.len() {
+                return RbJsonSoft
+            }
+        }
+        first = false
+        match try pair(src, q, nesting) {
+            Some(kv) -> {
+                let (k, v, next) = kv
+                set_key(keys, values, k, v)
+                q = next
+            }
+            None -> return RbJsonSoft
+        }
+    }
+    return RbJsonSoft
+}
+
+/// One `"name": value` from `q`: the key, value and the index after.
+fn pair(src: [i64], q0: i64, nesting: i64) -> Option[(bytes, RbJsonValue, i64)] ! RbJsonError {
+    if src[q0] != 34 {
+        return None
+    }
+    let key = match try parse_string(src, q0) {
+        RbJsonGot(v, next) -> (v, next)
+        _ -> return None
+    }
+    let (kv, after) = key
+    let k = match kv {
+        RbJsonString(s) -> s
+        _ -> bytes_of([])
+    }
+    let (r, ok) = skip_ignore(src, after)
+    if not ok or r >= src.len() or src[r] != 58 {
+        return None
+    }
+    let (q, ok2) = skip_ignore(src, r + 1)
+    if not ok2 or q >= src.len() or not begins_value(src[q]) {
+        return None
+    }
+    return match try parse_value(src, q, nesting) {
+        RbJsonGot(v, next) -> Some((k, v, next))
+        _ -> None
+    }
+}
+
+fn set_key(inout keys: [bytes], inout values: [RbJsonValue], k: bytes, v: RbJsonValue) {
+    var i = 0
+    while i < keys.len() {
+        if keys[i] == k {
+            values[i] = v
+            return
+        }
+        i = i + 1
+    }
+    keys.push(k)
+    values.push(v)
+}
+
+/// `JSON.parse(text)`.
+pub fn parse(text: bytes) -> RbJsonValue ! RbJsonError {
+    let src = text.to_list()
+    let (p, ok) = skip_ignore(src, 0)
+    if not ok or p >= src.len() or not begins_value(src[p]) {
+        fail(token_error(src, 767, p))
+    }
+    return match try parse_value(src, p, 0) {
+        RbJsonGot(v, next) -> try finish(src, v, next)
+        _ -> fail(token_error(src, 767, p))
+    }
+}
+
+fn finish(src: [i64], v: RbJsonValue, next: i64) -> RbJsonValue ! RbJsonError {
+    let (q, ok) = skip_ignore(src, next)
+    if not ok or q != src.len() {
+        fail(token_error(src, 767, q))
+    }
+    return v
+}

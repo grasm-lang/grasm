@@ -1,0 +1,1053 @@
+// SQLite's `printf()` (and `format()`), as SQLite 3.51.1 writes it, with
+// the conversions between SQL values it makes on the way.
+//
+// `printf` is how SQL formats -- report columns, generated SQL text with
+// `%q` and `%Q`, padded keys -- and a program producing the same text
+// outside the database, or checking a query's output, has to agree with
+// it byte for byte:
+//
+//   - Arguments are SQL values, converted as `sqlite3_value_int64`,
+//     `_double` and `_text` convert them: TEXT read as a number takes the
+//     longest numeric prefix ("  12abc" is 12, past 19 digits it clamps),
+//     a REAL becomes an integer by truncation and saturates, a REAL
+//     becomes text as `%!.15g`, NULL is 0, 0.0 or no text. A missing
+//     argument reads as NULL.
+//   - Conversions: `d i u x X o p r` (`r` is an ordinal, "1st"), `f e E g
+//     G` through SQLite's own decimal conversion (16 significant digits,
+//     26 with `!`), `s z`, `c` (one UTF-8 character, repeated by the
+//     precision), `q Q w` (SQL quoting; `%#q` and `%#Q` add unistr()
+//     escapes for control characters), `n` (nothing), `%`; flags `- + #
+//     ! 0 ,` with `,` grouping thousands; `*` widths and precisions from
+//     the arguments, a negative width meaning left-justified.
+//   - Text is bytes: a TEXT or BLOB argument is used up to its first NUL,
+//     a precision can cut a UTF-8 character in half, and `!` counts
+//     characters instead of bytes.
+//   - An unknown conversion, or a format ending inside one, stops the
+//     output there; if nothing was written at all the result is NULL
+//     (None), as it is for an empty format.
+//
+// The numeric reading and SQLite's decimal conversion (`sqlite3AtoF`,
+// `sqlite3Atoi64`, `sqlite3FpDecode`) are public: packages/sqlitedatetime
+// formats its times with them.
+//
+// A width or precision past SQLite's length limit (a billion bytes) is
+// an error in SQLite ("string or blob too big"); here it is only slow.
+
+import bigint
+import pymath
+import sqlitefile
+
+fn fma(x: f64, y: f64, z: f64) -> f64 {
+    return pymath.fma(x, y, z) ?? (x * y + z)
+}
+
+fn is_space(c: i64) -> bool {
+    return c == 32 or (c >= 9 and c <= 13)
+}
+
+fn is_digit(c: i64) -> bool {
+    return c >= 48 and c <= 57
+}
+
+fn ascii(s: str) -> [i64] {
+    return s.to_bytes().to_list()
+}
+
+/// Text as C reads it: up to the first NUL.
+fn c_string(b: [i64]) -> [i64] {
+    var out: [i64] = []
+    for c in b {
+        if c == 0 {
+            break
+        }
+        out.push(c)
+    }
+    return out
+}
+
+// ---- sqlite3AtoF
+
+/// dekkerMul2: (x0, x1) *= (y, yy) in double-double, with the fused
+/// multiply-adds clang emits for it on arm64.
+fn dekker(x: (f64, f64), y: f64, yy: f64) -> (f64, f64) {
+    let (x0, x1) = x
+    let hx = x0.to_bits().bit_and(0 - 67108864).from_bits()
+    let tx = x0 - hx
+    let hy = y.to_bits().bit_and(0 - 67108864).from_bits()
+    let ty = y - hy
+    let p = hy * hx
+    let q = fma(hx, ty, tx * hy)
+    let c = p + q
+    var cc = fma(tx, ty, p - c + q)
+    cc = cc + fma(x0, yy, x1 * y)
+    let n0 = c + cc
+    var n1 = c - n0
+    n1 = n1 + cc
+    return (n0, n1)
+}
+
+fn big(n: i64) -> BigInt {
+    return bigint.from_i64(n)
+}
+
+/// The double nearest a non-negative integer, ties to even.
+fn big_to_double(n: BigInt) -> f64 {
+    let bits = bigint.bit_length(n)
+    if bits <= 53 {
+        return (bigint.to_i64(n) ?? 0).as_f64()
+    }
+    let shift = bits - 53
+    let two = bigint.pow(big(2), shift)
+    let (q, r) = bigint.divmod(n, two) ?? (bigint.zero(), bigint.zero())
+    var m = bigint.to_i64(q) ?? 0
+    let half = bigint.compare(bigint.add(r, r), two)
+    var e = shift
+    if half > 0 or (half == 0 and m % 2 == 1) {
+        m = m + 1
+        if m == 9007199254740992 {
+            m = m / 2
+            e = e + 1
+        }
+    }
+    var v = m.as_f64()
+    for _k in 0..e {
+        v = v * 2.0
+    }
+    return v
+}
+
+/// `sqlite3AtoF(z, &r, n)`: the value, and 1 for an integer, 2 or more
+/// for a real, 0 for not a number, -1 for a number with junk after it.
+pub fn atof(z0: [i64], n: i64) -> (f64, i64) {
+    let z = z0.slice(0, if n < z0.len() { n } else { z0.len() })
+    let end = z.len()
+    var i = 0
+    while i < end and is_space(z[i]) {
+        i = i + 1
+    }
+    if i >= end {
+        return (0.0, 0)
+    }
+    var sign = 1
+    if z[i] == 45 {
+        sign = 0 - 1
+        i = i + 1
+    } else if z[i] == 43 {
+        i = i + 1
+    }
+    let limit = bigint.parse("1844674407370955161") ?? bigint.zero()
+    var s = bigint.zero()
+    var d = 0
+    var ndigit = 0
+    var etype = 1
+    while i < end and is_digit(z[i]) {
+        s = bigint.add(bigint.mul(s, big(10)), big(z[i] - 48))
+        i = i + 1
+        ndigit = ndigit + 1
+        if bigint.compare(s, limit) >= 0 {
+            while i < end and is_digit(z[i]) {
+                i = i + 1
+                d = d + 1
+            }
+        }
+    }
+    if i < end and z[i] == 46 {
+        i = i + 1
+        etype = etype + 1
+        while i < end and is_digit(z[i]) {
+            if bigint.compare(s, limit) < 0 {
+                s = bigint.add(bigint.mul(s, big(10)), big(z[i] - 48))
+                d = d - 1
+                ndigit = ndigit + 1
+            }
+            i = i + 1
+        }
+    }
+    let (after, e, e_valid, has_e) = atof_exponent(z, i)
+    i = after
+    if has_e {
+        etype = etype + 1
+    }
+    while i < end and is_space(z[i]) {
+        i = i + 1
+    }
+    let code = if i == end and ndigit > 0 and e_valid and etype > 0 { etype } else if etype >= 2 and (etype == 3 or e_valid) and ndigit > 0 { 0 - 1 } else { 0 }
+    if bigint.is_zero(s) {
+        return (if sign < 0 { -0.0 } else { 0.0 }, code)
+    }
+    return (atof_value(s, e + d, sign), code)
+}
+
+/// An `e` exponent at `i`: where it ends, its value with its sign, whether
+/// it is well formed, and whether there was an `e` at all.
+fn atof_exponent(z: [i64], from: i64) -> (i64, i64, bool, bool) {
+    var i = from
+    let end = z.len()
+    if not (i < end and (z[i] == 101 or z[i] == 69)) {
+        return (i, 0, true, false)
+    }
+    i = i + 1
+    var valid = false
+    var esign = 1
+    var e = 0
+    if i < end {
+        if z[i] == 45 {
+            esign = 0 - 1
+            i = i + 1
+        } else if z[i] == 43 {
+            i = i + 1
+        }
+        while i < end and is_digit(z[i]) {
+            e = if e < 10000 { e * 10 + z[i] - 48 } else { 10000 }
+            i = i + 1
+            valid = true
+        }
+    }
+    return (i, e * esign, valid, true)
+}
+
+fn atof_value(s0: BigInt, e0: i64, sign: i64) -> f64 {
+    var s = s0
+    var e = e0
+    // (LARGEST_UINT64 - 0x7ff) / 10
+    let grow_limit = bigint.div(bigint.sub(bigint.parse("18446744073709551615") ?? bigint.zero(), big(2047)), big(10)) ?? bigint.zero()
+    while e > 0 and bigint.compare(s, grow_limit) < 0 {
+        s = bigint.mul(s, big(10))
+        e = e - 1
+    }
+    while e < 0 {
+        let (q, r) = bigint.divmod(s, big(10)) ?? (bigint.zero(), bigint.zero())
+        if not bigint.is_zero(r) {
+            break
+        }
+        s = q
+        e = e + 1
+    }
+    let r0 = big_to_double(s)
+    var r1 = 0.0
+    if r0 <= 18446744073709549568.0 {
+        let s2 = bigint.parse(exact_integer(r0)) ?? bigint.zero()
+        let diff = bigint.sub(s, s2)
+        r1 = if bigint.sign(diff) >= 0 { big_to_double(diff) } else { 0.0 - big_to_double(bigint.negate(diff)) }
+    }
+    var rr = (r0, r1)
+    if e > 0 {
+        while e >= 100 {
+            e = e - 100
+            rr = dekker(rr, 1.0e100, -1.5902891109759918046e83)
+        }
+        while e >= 10 {
+            e = e - 10
+            rr = dekker(rr, 1.0e10, 0.0)
+        }
+        while e >= 1 {
+            e = e - 1
+            rr = dekker(rr, 10.0, 0.0)
+        }
+    } else {
+        while e <= -100 {
+            e = e + 100
+            rr = dekker(rr, 1.0e-100, -1.99918998026028836196e-117)
+        }
+        while e <= -10 {
+            e = e + 10
+            rr = dekker(rr, 1.0e-10, -3.6432197315497741579e-27)
+        }
+        while e <= -1 {
+            e = e + 1
+            rr = dekker(rr, 0.1, -5.5511151231257827021e-18)
+        }
+    }
+    var v = rr.0 + rr.1
+    if v != v {
+        v = 1.0 / 0.0
+    }
+    return if sign < 0 { v * -1.0 } else { v }
+}
+
+/// An integral double's digits.
+fn exact_integer(x: f64) -> str {
+    if x < 9007199254740992.0 {
+        return x.as_i64().to_str()
+    }
+    let bits = x.to_bits()
+    let exp = bits.shr(52).bit_and(2047) - 1075
+    let mant = bits.bit_and(4503599627370495) + 4503599627370496
+    return bigint.to_str(bigint.mul(big(mant), bigint.pow(big(2), exp)))
+}
+
+// ---- SQLite's own decimal conversion (sqlite3FpDecode and printf)
+
+/// `r` (positive) scaled into 1e17..1e19 in double-double, as an integer,
+/// and the power of ten it was scaled by.
+fn fp_scale(r: f64) -> (i64, i64) {
+    var rr = (r, 0.0)
+    var exp = 0
+    if rr.0 > 9223372036854774784.0 {
+        while rr.0 > 9.223372036854774784e118 {
+            exp = exp + 100
+            rr = dekker(rr, 1.0e-100, -1.99918998026028836196e-117)
+        }
+        while rr.0 > 9.223372036854774784e28 {
+            exp = exp + 10
+            rr = dekker(rr, 1.0e-10, -3.6432197315497741579e-27)
+        }
+        while rr.0 > 9223372036854774784.0 {
+            exp = exp + 1
+            rr = dekker(rr, 0.1, -5.5511151231257827021e-18)
+        }
+    } else {
+        while rr.0 < 9.223372036854774784e-83 {
+            exp = exp - 100
+            rr = dekker(rr, 1.0e100, -1.5902891109759918046e83)
+        }
+        while rr.0 < 92233720.36854774784 {
+            exp = exp - 10
+            rr = dekker(rr, 1.0e10, 0.0)
+        }
+        while rr.0 < 922337203685477478.0 {
+            exp = exp - 1
+            rr = dekker(rr, 10.0, 0.0)
+        }
+    }
+    let v = if rr.1 < 0.0 { rr.0.as_i64() - (0.0 - rr.1).as_i64() } else { rr.0.as_i64() + rr.1.as_i64() }
+    return (v, exp)
+}
+
+fn prepend(d: i64, z: [i64]) -> [i64] {
+    var out = [d]
+    for x in z {
+        out.push(x)
+    }
+    return out
+}
+
+/// The significant digits and the position of the decimal point, rounded
+/// as sqlite3FpDecode rounds: `round` > 0 is significant digits, <= 0 is
+/// digits after the point.
+pub fn fp_decode(r0: f64, round0: i64, max_round: i64) -> ([i64], i64) {
+    if r0 == 0.0 {
+        return ([0], 1)
+    }
+    let (v, exp) = fp_scale(if r0 < 0.0 { 0.0 - r0 } else { r0 })
+    var z = v.to_str().codes().map(|c| c - 48)
+    var dp = z.len() + exp
+    var round = round0
+    if round <= 0 {
+        round = dp - round
+        if round == 0 and z[0] >= 5 {
+            round = 1
+            z = prepend(0, z)
+            dp = dp + 1
+        }
+    }
+    if round > 0 and (round < z.len() or z.len() > max_round) {
+        if round > max_round {
+            round = max_round
+        }
+        let up = round < z.len() and z[round] >= 5
+        z = z.slice(0, round)
+        var j = round - 1
+        while up {
+            z[j] = z[j] + 1
+            if z[j] <= 9 {
+                break
+            }
+            z[j] = 0
+            if j == 0 {
+                z = prepend(1, z)
+                dp = dp + 1
+                break
+            }
+            j = j - 1
+        }
+    }
+    while z.len() > 1 and z[z.len() - 1] == 0 {
+        z = z.slice(0, z.len() - 1)
+    }
+    return (z, dp)
+}
+
+// ---- sqlite3Atoi64 and the value conversions
+
+/// `sqlite3Atoi64`: the integer at the front of `z` (after spaces and a
+/// sign), clamped to the i64 range, and the return code: 0 for an exact
+/// integer, 1 for one with text after it, 2 for an overflow, 3 for
+/// 9223372036854775808, -1 for no digits.
+pub fn atoi64(z: [i64]) -> (i64, i64) {
+    var i = 0
+    while i < z.len() and is_space(z[i]) {
+        i = i + 1
+    }
+    var neg = false
+    if i < z.len() and z[i] == 45 {
+        neg = true
+        i = i + 1
+    } else if i < z.len() and z[i] == 43 {
+        i = i + 1
+    }
+    let start = i
+    while i < z.len() and z[i] == 48 {
+        i = i + 1
+    }
+    let first = i
+    while i < z.len() and is_digit(z[i]) {
+        i = i + 1
+    }
+    let ndigits = i - first
+    var rc = 0
+    if ndigits == 0 and start == first {
+        rc = 0 - 1
+    } else {
+        var k = i
+        while k < z.len() {
+            if not is_space(z[k]) {
+                rc = 1
+                break
+            }
+            k = k + 1
+        }
+    }
+    let digits = z.slice(first, i).map(|d| (d - 48).to_str()).join("")
+    let cmp = if ndigits < 19 { 0 - 1 } else if ndigits > 19 { 1 } else { cmp_text(digits, "9223372036854775808") }
+    if cmp < 0 {
+        let v = if ndigits == 0 { 0 } else { digits.parse_int() ?? 0 }
+        return (if neg { 0 - v } else { v }, rc)
+    }
+    let clamped = if neg { 0 - 9223372036854775807 - 1 } else { 9223372036854775807 }
+    if cmp > 0 {
+        return (clamped, 2)
+    }
+    return (clamped, if neg { rc } else { 3 })
+}
+
+fn cmp_text(a: str, b: str) -> i64 {
+    return if a < b { 0 - 1 } else if a > b { 1 } else { 0 }
+}
+
+/// `sqlite3RealToI64`: truncation, saturating at the ends of the range.
+fn real_to_i64(r: f64) -> i64 {
+    if r < -9223372036854774784.0 {
+        return 0 - 9223372036854775807 - 1
+    }
+    if r > 9223372036854774784.0 {
+        return 9223372036854775807
+    }
+    return if r != r { 0 } else { r.as_i64() }
+}
+
+/// `sqlite3_value_int64`.
+pub fn value_int(v: SqlValue) -> i64 {
+    return match v {
+        SqlNull -> 0
+        SqlInteger(n) -> n
+        SqlFloat(f) -> real_to_i64(f)
+        SqlText(t) -> atoi64(t.to_bytes().to_list()).0
+        SqlBlob(b) -> atoi64(b.to_list()).0
+    }
+}
+
+/// `sqlite3_value_double`.
+pub fn value_real(v: SqlValue) -> f64 {
+    return match v {
+        SqlNull -> 0.0
+        SqlInteger(n) -> n.as_f64()
+        SqlFloat(f) -> f
+        SqlText(t) -> atof(t.to_bytes().to_list(), t.to_bytes().len()).0
+        SqlBlob(b) -> atof(b.to_list(), b.len()).0
+    }
+}
+
+/// `sqlite3_value_text`, as C sees it (up to the first NUL); None for NULL.
+pub fn value_text(v: SqlValue) -> Option[bytes] {
+    return match v {
+        SqlNull -> None
+        SqlInteger(n) -> Some(n.to_str().to_bytes())
+        SqlFloat(f) -> Some(real_text(f).to_bytes())
+        SqlText(t) -> Some(bytes_of(c_string(t.to_bytes().to_list())))
+        SqlBlob(b) -> Some(bytes_of(c_string(b.to_list())))
+    }
+}
+
+/// A REAL as SQLite writes it as text: `%!.15g`.
+pub fn real_text(r: f64) -> str {
+    return (printf(SqlText("%!.15g"), [SqlFloat(r)]) ?? "".to_bytes()).to_str()
+}
+
+// ---- the arguments
+
+/// The arguments of one call, taken left to right.
+type PrintfArgs = { args: [SqlValue], used: i64 }
+
+fn next_arg(inout a: PrintfArgs) -> SqlValue {
+    if a.used >= a.args.len() {
+        return SqlNull
+    }
+    a.used = a.used + 1
+    return a.args[a.used - 1]
+}
+
+fn get_int(inout a: PrintfArgs) -> i64 {
+    return value_int(next_arg(a))
+}
+
+fn get_double(inout a: PrintfArgs) -> f64 {
+    return value_real(next_arg(a))
+}
+
+fn get_text(inout a: PrintfArgs) -> Option[[i64]] {
+    return match value_text(next_arg(a)) {
+        Some(b) -> Some(b.to_list())
+        None -> None
+    }
+}
+
+// ---- the format
+
+/// One conversion's flags, width, precision and letter (0 when the format
+/// ended inside it).
+type PrintfSpec = { left: bool, prefix: i64, alt: bool, alt2: bool, zero: bool, thousand: bool, width: i64, precision: i64, conv: i64 }
+
+fn at(f: [i64], i: i64) -> i64 {
+    return if i >= 0 and i < f.len() { f[i] } else { 0 }
+}
+
+/// `(int)` of a 64-bit value: its low 32 bits, signed.
+fn int32(v: i64) -> i64 {
+    let low = v.bit_and(4294967295)
+    return if low >= 2147483648 { low - 4294967296 } else { low }
+}
+
+fn star_width(inout s: PrintfSpec, inout a: PrintfArgs) {
+    var w = int32(get_int(a))
+    if w < 0 {
+        s.left = true
+        w = if w >= 0 - 2147483647 { 0 - w } else { 0 }
+    }
+    s.width = w
+}
+
+/// The digits of a width or precision, as an unsigned int accumulates
+/// them; where they end.
+fn digits_at(f: [i64], from: i64) -> (i64, i64) {
+    var i = from
+    var v = 0
+    while is_digit(at(f, i)) {
+        v = (v * 10 + at(f, i) - 48).bit_and(4294967295)
+        i = i + 1
+    }
+    return (v.bit_and(2147483647), i)
+}
+
+/// A `.` and what follows it; where the precision ends.
+fn precision_at(f: [i64], dot: i64, inout s: PrintfSpec, inout a: PrintfArgs) -> i64 {
+    var i = dot + 1
+    if at(f, i) == 42 {
+        var p = int32(get_int(a))
+        if p < 0 {
+            p = if p >= 0 - 2147483647 { 0 - p } else { 0 - 1 }
+        }
+        s.precision = p
+        return i + 1
+    }
+    let (p, end) = digits_at(f, i)
+    s.precision = p
+    i = end
+    return i
+}
+
+/// The flags, width and precision after a `%`, as sqlite3_str_vappendf
+/// reads them; `i` ends at the conversion letter.
+fn parse_spec(f: [i64], from: i64, inout a: PrintfArgs) -> (PrintfSpec, i64) {
+    var s = PrintfSpec{ left: false, prefix: 0, alt: false, alt2: false, zero: false, thousand: false, width: 0, precision: 0 - 1, conv: 0 }
+    var i = from
+    while true {
+        let c = at(f, i)
+        if c == 45 {
+            s.left = true
+        } else if c == 43 or c == 32 {
+            s.prefix = c
+        } else if c == 35 {
+            s.alt = true
+        } else if c == 33 {
+            s.alt2 = true
+        } else if c == 48 {
+            s.zero = true
+        } else if c == 44 {
+            s.thousand = true
+        } else if c == 108 {
+            i = i + 1
+            if at(f, i) == 108 {
+                i = i + 1
+            }
+            break
+        } else if c >= 49 and c <= 57 {
+            let (w, end) = digits_at(f, i)
+            s.width = w
+            i = end
+            if at(f, i) != 46 and at(f, i) != 108 {
+                break
+            }
+            i = i - 1
+        } else if c == 42 {
+            star_width(s, a)
+            if at(f, i + 1) != 46 and at(f, i + 1) != 108 {
+                i = i + 1
+                break
+            }
+        } else if c == 46 {
+            i = precision_at(f, i, s, a)
+            if at(f, i) != 108 {
+                break
+            }
+            i = i - 1
+        } else {
+            break
+        }
+        i = i + 1
+        if at(f, i) == 0 {
+            break
+        }
+    }
+    s.conv = at(f, i)
+    return (s, i)
+}
+
+// ---- integers
+
+/// Unsigned 64-bit division of the bits in `u` by a small base.
+fn udivmod(u: i64, b: i64) -> (i64, i64) {
+    if u >= 0 {
+        return (u / b, u % b)
+    }
+    var q = (u.ushr(1) / b).shl(1)
+    var r = u - q * b
+    while r >= b {
+        q = q + 1
+        r = r - b
+    }
+    return (q, r)
+}
+
+/// "1,234,567": commas between groups of three, counted from the right.
+fn grouped(body: [i64]) -> [i64] {
+    var out: [i64] = []
+    for i in 0..body.len() {
+        if i > 0 and (body.len() - i) % 3 == 0 {
+            out.push(44)
+        }
+        out.push(body[i])
+    }
+    return out
+}
+
+/// `d i u x X o p r`.
+fn render_integer(s: PrintfSpec, inout a: PrintfArgs) -> [i64] {
+    let c = s.conv
+    let signed = c == 100 or c == 105 or c == 114
+    let v = get_int(a)
+    var prefix = 0
+    var mag = v
+    if signed {
+        if v < 0 {
+            mag = 0 - v
+            prefix = 45
+        } else {
+            prefix = s.prefix
+        }
+    }
+    let alt = s.alt and mag != 0
+    var precision = s.precision
+    let signed_width = s.width - (if prefix != 0 { 1 } else { 0 })
+    if s.zero and precision < signed_width {
+        precision = signed_width
+    }
+    let base = if c == 120 or c == 88 or c == 112 { 16 } else if c == 111 { 8 } else { 10 }
+    let digits = if c == 120 { "0123456789abcdef" } else { "0123456789ABCDEF" }
+    var rev: [i64] = []
+    var m = mag
+    while true {
+        let (q, r) = udivmod(m, base)
+        rev.push(digits.code_at(r))
+        m = q
+        if m == 0 {
+            break
+        }
+    }
+    var body: [i64] = []
+    var k = rev.len() - 1
+    while k >= 0 {
+        body.push(rev[k])
+        k = k - 1
+    }
+    if c == 114 {
+        body = body + ordinal_suffix(mag)
+    }
+    while precision > body.len() {
+        body = [48] + body
+    }
+    let thousand = s.thousand and (c == 100 or c == 105 or c == 117)
+    if thousand {
+        body = grouped(body)
+    }
+    if prefix != 0 {
+        body = [prefix] + body
+    }
+    if alt {
+        body = (if c == 111 { [48] } else if c == 88 { [48, 88] } else if c == 120 or c == 112 { [48, 120] } else { [] }) + body
+    }
+    return body
+}
+
+/// "st", "nd", "rd" or "th".
+fn ordinal_suffix(mag: i64) -> [i64] {
+    let (tens, x0) = udivmod(mag, 10)
+    let (_h, x1) = udivmod(tens, 10)
+    let x = if x0 >= 4 or x1 == 1 { 0 } else { x0 }
+    return [ascii("thstndrd")[x * 2], ascii("thstndrd")[x * 2 + 1]]
+}
+
+// ---- reals
+
+/// The text for an infinity or NaN, or None for a value to print with
+/// digits (an infinity under the `0` flag is printed as 9e999).
+fn special_real(r: f64, s: PrintfSpec) -> Option[[i64]] {
+    if r != r {
+        return Some(ascii(if s.zero { "null" } else { "NaN" }))
+    }
+    if (r > 1.7976931348623157e308 or r < -1.7976931348623157e308) and not s.zero {
+        return Some(ascii(if r < 0.0 { "-Inf" } else if s.prefix != 0 { s.prefix.to_char() + "Inf" } else { "Inf" }))
+    }
+    return None
+}
+
+/// `f e E g G`.
+fn render_real(s: PrintfSpec, inout a: PrintfArgs) -> [i64] {
+    let r = get_double(a)
+    let c = s.conv
+    match special_real(r, s) {
+        Some(t) -> return t
+        None -> {}
+    }
+    var precision = if s.precision < 0 { 6 } else if s.precision > 100000000 { 100000000 } else { s.precision }
+    let generic = c == 103 or c == 71
+    var as_exp = c == 101 or c == 69
+    if generic and precision == 0 {
+        precision = 1
+    }
+    let round = if c == 102 { 0 - precision } else if generic { precision } else { precision + 1 }
+    let infinite = r > 1.7976931348623157e308 or r < -1.7976931348623157e308
+    let (z, dp) = if infinite { ([9], 1000) } else { fp_decode(if r < 0.0 { 0.0 - r } else { r }, round, if s.alt2 { 26 } else { 16 }) }
+    var prefix = s.prefix
+    if r < 0.0 {
+        prefix = if s.alt and s.prefix == 0 and c == 102 and dp <= round { 0 } else { 45 }
+    }
+    var rtz = s.alt2
+    if generic {
+        precision = precision - 1
+        rtz = not s.alt
+        if dp - 1 < 0 - 4 or dp - 1 > precision {
+            as_exp = true
+        } else {
+            precision = precision - (dp - 1)
+        }
+    }
+    var out: [i64] = if prefix != 0 { [prefix] } else { [] }
+    out = out + real_digits(z, if as_exp { 0 } else { dp - 1 }, precision, s)
+    if rtz and (precision > 0 or s.alt or s.alt2) {
+        while out[out.len() - 1] == 48 {
+            out.pop()
+        }
+        if out[out.len() - 1] == 46 {
+            if s.alt2 {
+                out.push(48)
+            } else {
+                out.pop()
+            }
+        }
+    }
+    if as_exp {
+        out = out + exponent(dp - 1, c == 69 or c == 71)
+    }
+    if s.zero and not s.left and out.len() < s.width {
+        let at = if prefix != 0 { 1 } else { 0 }
+        var padded = out.slice(0, at)
+        for _k in 0..(s.width - out.len()) {
+            padded.push(48)
+        }
+        out = padded + out.slice(at, out.len())
+    }
+    return out
+}
+
+/// The digits before and after the point; `e2` is the power of ten of the
+/// first one written.
+fn real_digits(z: [i64], e20: i64, precision0: i64, s: PrintfSpec) -> [i64] {
+    var out: [i64] = []
+    var e2 = e20
+    var precision = precision0
+    var j = 0
+    if e2 < 0 {
+        out.push(48)
+    } else {
+        while e2 >= 0 {
+            out.push(48 + (if j < z.len() { z[j] } else { 0 }))
+            j = j + 1
+            if s.thousand and e2 % 3 == 0 and e2 > 1 {
+                out.push(44)
+            }
+            e2 = e2 - 1
+        }
+    }
+    if precision > 0 or s.alt or s.alt2 {
+        out.push(46)
+    }
+    e2 = e2 + 1
+    while e2 < 0 and precision > 0 {
+        out.push(48)
+        precision = precision - 1
+        e2 = e2 + 1
+    }
+    while precision > 0 {
+        out.push(48 + (if j < z.len() { z[j] } else { 0 }))
+        j = j + 1
+        precision = precision - 1
+    }
+    return out
+}
+
+fn exponent(e: i64, upper: bool) -> [i64] {
+    var out = [if upper { 69 } else { 101 }, if e < 0 { 45 } else { 43 }]
+    var x = if e < 0 { 0 - e } else { e }
+    if x >= 100 {
+        out.push(48 + x / 100)
+        x = x % 100
+    }
+    out.push(48 + x / 10)
+    out.push(48 + x % 10)
+    return out
+}
+
+// ---- text
+
+/// Under `!` a width counts characters: each UTF-8 continuation byte in
+/// the text widens the field by one.
+fn utf8_width(width: i64, text: [i64], alt2: bool) -> i64 {
+    var w = width
+    if alt2 and width > 0 {
+        for b in text {
+            if b.bit_and(192) == 128 {
+                w = w + 1
+            }
+        }
+    }
+    return w
+}
+
+/// `s z`: the text, cut to the precision (bytes, or characters under `!`).
+fn render_string(s: PrintfSpec, inout a: PrintfArgs) -> [i64] {
+    let t = get_text(a) ?? []
+    if s.precision < 0 {
+        return t
+    }
+    if not s.alt2 {
+        return t.slice(0, if s.precision < t.len() { s.precision } else { t.len() })
+    }
+    var k = 0
+    var left = s.precision
+    while left > 0 and k < t.len() {
+        let lead = t[k]
+        k = k + 1
+        if lead >= 192 {
+            while k < t.len() and t[k].bit_and(192) == 128 {
+                k = k + 1
+            }
+        }
+        left = left - 1
+    }
+    return t.slice(0, k)
+}
+
+/// `q Q w`: quote characters doubled, `'...'` around for `%Q`, and under
+/// `#` backslashes doubled and control characters as `\u00XX` (in
+/// `unistr('...')` for `%Q`).
+fn render_quoted(s: PrintfSpec, inout a: PrintfArgs) -> [i64] {
+    let c = s.conv
+    let arg = get_text(a)
+    let q = if c == 119 { 34 } else { 39 }
+    var need_quote = if arg.is_some() and c == 81 { 1 } else { 0 }
+    let esc = arg ?? ascii(if c == 81 { "NULL" } else { "(NULL)" })
+    var k = s.precision
+    var i = 0
+    while k != 0 and i < esc.len() {
+        if s.alt2 and esc[i].bit_and(192) == 192 {
+            while i + 1 < esc.len() and esc[i + 1].bit_and(192) == 128 {
+                i = i + 1
+            }
+        }
+        i = i + 1
+        k = k - 1
+    }
+    var alt = s.alt and c != 119
+    if alt {
+        let ctrl = esc.slice(0, i).filter(|b| b <= 31).len()
+        if ctrl > 0 or c == 113 {
+            if c == 81 {
+                need_quote = 2
+            }
+        } else {
+            alt = false
+        }
+    }
+    var out: [i64] = if need_quote == 2 { ascii("unistr('") } else if need_quote == 1 { [39] } else { [] }
+    for j in 0..i {
+        let ch = esc[j]
+        if alt and ch != q and ch != 92 and ch <= 31 {
+            out = out + ascii("\\u00") + [if ch >= 16 { 49 } else { 48 }, "0123456789abcdef".code_at(ch.bit_and(15))]
+        } else {
+            out.push(ch)
+            if ch == q or (alt and ch == 92) {
+                out.push(ch)
+            }
+        }
+    }
+    if need_quote > 0 {
+        out.push(39)
+        if need_quote == 2 {
+            out.push(41)
+        }
+    }
+    return out
+}
+
+/// `%c`'s character: the first UTF-8 character of the argument's text (a
+/// NUL byte for empty text or NULL).
+fn first_char(a: Option[[i64]]) -> [i64] {
+    let t = a ?? []
+    let first = if t.len() > 0 { t[0] } else { 0 }
+    var out = [first]
+    if first.bit_and(192) == 192 {
+        var k = 1
+        while out.len() < 4 and k < t.len() and t[k].bit_and(192) == 128 {
+            out.push(t[k])
+            k = k + 1
+        }
+    }
+    return out
+}
+
+fn spaces(inout out: [i64], n: i64) {
+    for _k in 0..n {
+        out.push(32)
+    }
+}
+
+/// `%c`: the character, the precision's count of times. The copies but
+/// the last go out here, with the field's leading spaces; the width left
+/// for the last copy is returned.
+fn emit_char(s: PrintfSpec, ch: [i64], inout out: [i64]) -> i64 {
+    var width = s.width
+    if s.precision > 1 {
+        width = width - (s.precision - 1)
+        if width > 1 and not s.left {
+            spaces(out, width - 1)
+            width = 0
+        }
+        for _k in 0..(s.precision - 1) {
+            out = out + ch
+        }
+    }
+    return utf8_width(width, ch, true)
+}
+
+/// The text of one conversion in its field.
+fn emit_field(inout out: [i64], text: [i64], width0: i64, left: bool) {
+    let width = width0 - text.len()
+    if width > 0 and not left {
+        spaces(out, width)
+    }
+    out = out + text
+    if width > 0 and left {
+        spaces(out, width)
+    }
+}
+
+fn is_integer_conv(c: i64) -> bool {
+    return c == 100 or c == 105 or c == 117 or c == 120 or c == 88 or c == 111 or c == 112 or c == 114
+}
+
+fn is_real_conv(c: i64) -> bool {
+    return c == 102 or c == 101 or c == 69 or c == 103 or c == 71
+}
+
+/// One conversion: its text and the width it is set in, or None where
+/// SQLite stops (an unknown letter, `%T`, `%S`, or the end of the format).
+fn conversion(s: PrintfSpec, inout a: PrintfArgs, inout out: [i64]) -> Option[([i64], i64)] {
+    let c = s.conv
+    if is_integer_conv(c) {
+        return Some((render_integer(s, a), s.width))
+    }
+    if is_real_conv(c) {
+        return Some((render_real(s, a), s.width))
+    }
+    if c == 115 or c == 122 {
+        let t = render_string(s, a)
+        return Some((t, utf8_width(s.width, t, s.alt2)))
+    }
+    if c == 113 or c == 81 or c == 119 {
+        let t = render_quoted(s, a)
+        return Some((t, utf8_width(s.width, t, s.alt2)))
+    }
+    if c == 99 {
+        let ch = first_char(get_text(a))
+        return Some((ch, emit_char(s, ch, out)))
+    }
+    if c == 37 {
+        return Some(([37], s.width))
+    }
+    if c == 110 {
+        return Some(([], 0))
+    }
+    return None
+}
+
+/// SQL's `printf(format, args...)`: the text, or None (SQL NULL) for a NULL
+/// format or when nothing was written.
+pub fn printf(format: SqlValue, args: [SqlValue]) -> Option[bytes] {
+    let f = (value_text(format) ?? "".to_bytes()).to_list()
+    if value_text(format).is_none() {
+        return None
+    }
+    var a = PrintfArgs{ args: args, used: 0 }
+    var out: [i64] = []
+    var written = false
+    var i = 0
+    while i < f.len() {
+        if f[i] != 37 {
+            out.push(f[i])
+            written = true
+            i = i + 1
+            continue
+        }
+        i = i + 1
+        if i >= f.len() {
+            out.push(37)
+            written = true
+            break
+        }
+        let (s, end) = parse_spec(f, i, a)
+        i = end
+        match conversion(s, a, out) {
+            Some((text, width)) -> emit_field(out, text, width, s.left)
+            None -> return if written { Some(bytes_of(out)) } else { None }
+        }
+        written = true
+        i = i + 1
+    }
+    return if written { Some(bytes_of(out)) } else { None }
+}
+
+/// `printf` with a text format.
+pub fn format(format: str, args: [SqlValue]) -> Option[bytes] {
+    return printf(SqlText(format), args)
+}

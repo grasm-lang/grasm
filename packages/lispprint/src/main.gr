@@ -1,0 +1,268 @@
+// How Common Lisp prints numbers, strings and characters, as SBCL 2.6.8's
+// PRIN1 and PRINC write them, under `*print-base*`, `*print-radix*` and
+// `*read-default-float-format*`.
+//
+// Lisp data files, logs and generated source are PRIN1 output, and a
+// program that writes data Lisp will read back -- or reads what Lisp
+// wrote -- has to agree on the spelling:
+//
+//   - **Integers** print in `*print-base*` with capital digits; with
+//     `*print-radix*` a decimal integer gets a trailing point (`10.`) and
+//     other bases a prefix (`#xA`, `#b101`, `#o17`, `#3r101`) with the sign
+//     after it (`#x-FF`).
+//   - **Ratios** are reduced, print in the base, and with the radix take a
+//     prefix even in base 10 (`#10r1/2`).
+//   - **Floats** print in SBCL's shortest form, plain from 10^-3 to 10^7
+//     (`123456.7`, `1.0e7`, `1.0e-4`), with the exponent marker of their
+//     format when it is not `*read-default-float-format*`: a double is
+//     `1.5d0` by default and `1.5` when doubles are the default, which
+//     makes a single `1.5f0`. Infinities print as `#.DOUBLE-FLOAT-...`
+//     (`#.|DOUBLE-FLOAT-...|` in base 35 or 36, where the name would read
+//     as a number) and NaNs as `#<SINGLE-FLOAT quiet NaN>`.
+//   - **Strings**: PRIN1 quotes them and escapes `"` and `\`; PRINC does
+//     not.
+//   - **Characters**: PRIN1 writes `#\a`, `#\ ` for a space, SBCL's names
+//     for the controls (`#\Nul`, `#\Bel`, `#\Backspace`, `#\Tab`,
+//     `#\Newline`, `#\Rubout`, ...) and for U+0080 to U+009F
+//     (`#\Next-Line`, `#\U80`); PRINC writes the character.
+//
+// The float digits are lispformat's (SBCL's free-format printer); this
+// adds the markers. Not covered: PRIN1 of a character from U+00A0 up,
+// which SBCL spells with its Unicode name (`#\LATIN_SMALL_LETTER_E_...`),
+// is refused; so are bases outside 2 to 36.
+//
+// Checked against `sbcl` 2.6.8's PRIN1-TO-STRING and PRINC-TO-STRING.
+
+import bigint
+import lispformat
+
+/// What can be printed.
+type LispPrintable =
+    | LoInteger(n: BigInt)
+    /// A ratio; it is reduced before printing.
+    | LoRatio(num: BigInt, den: BigInt)
+    /// A single-float, by its 32 bits.
+    | LoSingle(bits: i64)
+    | LoDouble(x: f64)
+    | LoString(s: str)
+    /// A character, by its code point.
+    | LoChar(code: i64)
+
+/// The printer variables: `*print-base*`, `*print-radix*`, and whether
+/// `*read-default-float-format*` is double-float (else single-float).
+type LispPrintVars = { base: i64, radix: bool, double_default: bool }
+
+type LispPrintError = | LispPrintRefused(why: str)
+
+pub fn error_text(e: LispPrintError) -> str {
+    return match e {
+        LispPrintRefused(w) -> w
+    }
+}
+
+/// SBCL's defaults: base 10, no radix, single-float.
+pub fn print_vars() -> LispPrintVars {
+    return LispPrintVars{ base: 10, radix: false, double_default: false }
+}
+
+fn refused(why: str) -> LispPrintError {
+    return LispPrintRefused(why)
+}
+
+// ---- rationals
+
+fn digits(n: BigInt, base: i64) -> str {
+    let d = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    var m = n
+    if bigint.sign(m) < 0 {
+        m = bigint.negate(m)
+    }
+    if bigint.sign(m) == 0 {
+        return "0"
+    }
+    var out: [str] = []
+    let b = bigint.from_i64(base)
+    while bigint.sign(m) > 0 {
+        let (q, r) = bigint.divmod(m, b) ?? (bigint.zero(), bigint.zero())
+        out = [d.substr(bigint.to_i64(r) ?? 0, 1)] + out
+        m = q
+    }
+    return out.join("")
+}
+
+fn radix_prefix(base: i64) -> str {
+    if base == 2 {
+        return "#b"
+    }
+    if base == 8 {
+        return "#o"
+    }
+    if base == 16 {
+        return "#x"
+    }
+    return "#" + base.to_str() + "r"
+}
+
+fn sign_of(n: BigInt) -> str {
+    return if bigint.sign(n) < 0 { "-" } else { "" }
+}
+
+fn integer_text(n: BigInt, v: LispPrintVars) -> str {
+    let body = sign_of(n) + digits(n, v.base)
+    if not v.radix {
+        return body
+    }
+    if v.base == 10 {
+        return body + "."
+    }
+    return radix_prefix(v.base) + body
+}
+
+fn gcd(a: BigInt, b: BigInt) -> BigInt {
+    var x = if bigint.sign(a) < 0 { bigint.negate(a) } else { a }
+    var y = if bigint.sign(b) < 0 { bigint.negate(b) } else { b }
+    while bigint.sign(y) != 0 {
+        let (_q, r) = bigint.divmod(x, y) ?? (bigint.zero(), bigint.zero())
+        x = y
+        y = r
+    }
+    return x
+}
+
+fn ratio_text(num0: BigInt, den0: BigInt, v: LispPrintVars) -> str ! LispPrintError {
+    if bigint.sign(den0) == 0 {
+        fail(refused("a ratio with a zero denominator"))
+    }
+    var num = num0
+    var den = den0
+    if bigint.sign(den) < 0 {
+        num = bigint.negate(num)
+        den = bigint.negate(den)
+    }
+    let g = gcd(num, den)
+    if bigint.sign(g) != 0 {
+        num = (bigint.divmod(num, g) ?? (num, bigint.zero())).0
+        den = (bigint.divmod(den, g) ?? (den, bigint.zero())).0
+    }
+    if bigint.compare(den, bigint.from_i64(1)) == 0 {
+        return integer_text(num, v)
+    }
+    let body = sign_of(num) + digits(num, v.base) + "/" + digits(den, v.base)
+    return if v.radix { radix_prefix(v.base) + body } else { body }
+}
+
+// ---- floats
+
+fn free_format(arg: LispArg) -> str ! LispPrintError {
+    return match lispformat.format("~D", [arg]) {
+        Ok(t) -> t
+        Err(_e) -> fail(refused("lispformat could not print the float"))
+    }
+}
+
+/// The float in the default single-float format, with its marker moved
+/// when doubles are the default.
+fn float_text(arg: LispArg, single: bool, v: LispPrintVars) -> str ! LispPrintError {
+    let t = try free_format(arg)
+    if t.starts_with("#.") {
+        // The infinity's symbol could be read as a number from base 35 up.
+        return if v.base >= 35 { "#.|" + t.substr(2, t.len() - 2) + "|" } else { t }
+    }
+    if not v.double_default or t.starts_with("#") {
+        return t
+    }
+    if single {
+        return if t.contains("e") { t.replace("e", "f") } else { t + "f0" }
+    }
+    return match t.index_of("d") {
+        Some(k) -> {
+            let exp = t.substr(k + 1, t.len() - k - 1)
+            if exp == "0" { t.substr(0, k) } else { t.substr(0, k) + "e" + exp }
+        }
+        None -> t
+    }
+}
+
+// ---- characters and strings
+
+fn control_names() -> [str] {
+    return ["Nul", "Soh", "Stx", "Etx", "Eot", "Enq", "Ack", "Bel", "Backspace", "Tab", "Newline", "Vt", "Page", "Return", "So", "Si", "Dle", "Dc1",
+        "Dc2", "Dc3", "Dc4", "Nak", "Syn", "Etb", "Can", "Em", "Sub", "Esc", "Fs", "Gs", "Rs", "Us"]
+}
+
+fn c1_names() -> [str] {
+    return ["U80", "U81", "Break-Permitted", "No-Break-Permitted", "U84", "Next-Line", "Start-Selected-Area", "End-Selected-Area",
+        "Character-Tabulation-Set", "Character-Tabulation-With-Justification", "Line-Tabulation-Set", "Partial-Line-Forward",
+        "Partial-Line-Backward", "Reverse-Linefeed", "Single-Shift-Two", "Single-Shift-Three", "Device-Control-String", "Private-Use-One",
+        "Private-Use-Two", "Set-Transmit-State", "Cancel-Character", "Message-Waiting", "Start-Guarded-Area", "End-Guarded-Area",
+        "Start-String", "U99", "Single-Character-Introducer", "Control-Sequence-Introducer", "String-Terminator",
+        "Operating-System-Command", "Privacy-Message", "Application-Program-Command"]
+}
+
+fn char_of(code: i64) -> str ! LispPrintError {
+    if code < 0 or code > 1114111 or code >= 55296 and code <= 57343 {
+        fail(refused("not a character code this can hold: " + code.to_str()))
+    }
+    return code.to_char()
+}
+
+fn char_prin1(code: i64) -> str ! LispPrintError {
+    let c = try char_of(code)
+    if code < 32 {
+        return "#\\" + control_names()[code]
+    }
+    if code == 127 {
+        return "#\\Rubout"
+    }
+    if code >= 128 and code < 160 {
+        return "#\\" + c1_names()[code - 128]
+    }
+    if code >= 160 {
+        fail(refused("SBCL names this character by its Unicode name"))
+    }
+    return "#\\" + c
+}
+
+fn string_prin1(s: str) -> str {
+    var out = "\""
+    for ch in s.chars() {
+        if ch == "\"" or ch == "\\" {
+            out = out + "\\"
+        }
+        out = out + ch
+    }
+    return out + "\""
+}
+
+// ---- the printers
+
+fn number_text(o: LispPrintable, v: LispPrintVars) -> str ! LispPrintError {
+    if v.base < 2 or v.base > 36 {
+        fail(refused("*print-base* " + v.base.to_str()))
+    }
+    return match o {
+        LoInteger(n) -> integer_text(n, v)
+        LoRatio(num, den) -> try ratio_text(num, den, v)
+        LoSingle(bits) -> try float_text(LispSingle(bits), true, v)
+        LoDouble(x) -> try float_text(LispDouble(x), false, v)
+        _ -> ""
+    }
+}
+
+/// `(prin1-to-string object)`.
+pub fn prin1(o: LispPrintable, v: LispPrintVars) -> str ! LispPrintError {
+    return match o {
+        LoString(s) -> string_prin1(s)
+        LoChar(code) -> try char_prin1(code)
+        _ -> try number_text(o, v)
+    }
+}
+
+/// `(princ-to-string object)`.
+pub fn princ(o: LispPrintable, v: LispPrintVars) -> str ! LispPrintError {
+    return match o {
+        LoString(s) -> s
+        LoChar(code) -> try char_of(code)
+        _ -> try number_text(o, v)
+    }
+}

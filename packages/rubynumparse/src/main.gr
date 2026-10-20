@@ -1,0 +1,776 @@
+// Ruby's reading of numbers from strings, as Ruby 2.6 does it:
+// `String#to_i(base)`, `String#to_f`, `Kernel#Integer(str[, base])` and
+// `Kernel#Float(str)`.
+//
+// Configuration, CSV columns, form fields and command-line arguments in
+// Ruby programs become numbers through these four, and a peer reading
+// the same text has to get the same numbers and refuse the same input:
+//
+//   - `to_i` takes the longest number at the front and never fails:
+//     spaces and a sign first, single underscores between digits, a
+//     `0x`/`0b`/`0o`/`0d` prefix matching the base (base 0 picks the base
+//     from the prefix, a bare leading 0 meaning octal). Any length: the
+//     result is a BigInt.
+//   - `Integer()` takes the same syntax but all of the string (spaces may
+//     follow), base 0 by default, and raises `invalid value for
+//     Integer(): "12abc"`, the string shown as `inspect` shows it.
+//   - `to_f` reads a decimal number and never fails; `Float()` reads all
+//     of the string and raises, and alone accepts hexadecimal (`0x1.8p1`).
+//     Float's message shows the string as bytes (`"\xC3\xA9"`).
+//   - Ruby's own conversion is kept where it is not the textbook one: a
+//     fraction counts only its first digits (60 significant in all), a
+//     hexadecimal mantissa is summed in floating point, and when anything
+//     follows the number (an underscore, a space, junk) the text is
+//     rewritten into a 70-byte buffer first -- so a number of more than 60
+//     characters followed by anything loses its later digits
+//     (`("1" + "0" * 69 + "x").to_f` is 1.0e+59). A NUL after a number too
+//     long for 64 bits is taken as its end by `Integer()`, which refuses
+//     one after a short number.
+//
+// Strings are taken to be UTF-8 for the messages.
+import bigint
+import gostrconv
+import rubyinspect
+
+/// ArgumentError, with Ruby's message.
+type RubyNumError = | RubyNumError(msg: str)
+
+pub fn error_text(e: RubyNumError) -> str {
+    return match e {
+        RubyNumError(m) -> m
+    }
+}
+
+fn at(b: [i64], i: i64) -> i64 {
+    return if i >= 0 and i < b.len() { b[i] } else { 0 }
+}
+
+fn is_space(c: i64) -> bool {
+    return c == 32 or (c >= 9 and c <= 13)
+}
+
+fn is_digit(c: i64) -> bool {
+    return c >= 48 and c <= 57
+}
+
+/// ruby_digit36_to_number_table: the digit's value, or -1.
+fn digit_value(c: i64) -> i64 {
+    if c >= 48 and c <= 57 {
+        return c - 48
+    }
+    if c >= 97 and c <= 122 {
+        return c - 87
+    }
+    if c >= 65 and c <= 90 {
+        return c - 55
+    }
+    return 0 - 1
+}
+
+/// Where integer parsing is: the position, the bytes left (`len`), the
+/// sign, and whether the string has run out (`bad`).
+type IntScan = { i: i64, len: i64, negative: bool, bad: bool }
+
+/// ADV(n): step over `n` bytes, unless that would use up the string.
+fn adv(inout s: IntScan, n: i64) {
+    if s.len > 0 and s.len <= n {
+        s.bad = true
+        return
+    }
+    s.i = s.i + n
+    s.len = s.len - n
+}
+
+/// Spaces and a sign.
+fn scan_sign(b: [i64], inout s: IntScan) {
+    if s.len == 0 {
+        return
+    }
+    while not s.bad and is_space(at(b, s.i)) {
+        adv(s, 1)
+    }
+    if s.bad {
+        return
+    }
+    if at(b, s.i) == 43 {
+        adv(s, 1)
+    } else if at(b, s.i) == 45 {
+        adv(s, 1)
+        s.negative = true
+    }
+}
+
+fn prefix_letter(base: i64) -> i64 {
+    return if base == 2 { 98 } else if base == 8 { 111 } else if base == 10 { 100 } else if base == 16 { 120 } else { 0 }
+}
+
+/// The base, after a prefix that names or matches it.
+fn scan_base(b: [i64], inout s: IntScan, base0: i64) -> i64 {
+    let c0 = at(b, s.i)
+    let c1 = at(b, s.i + 1).bit_or(32)
+    if base0 <= 0 {
+        if c0 == 48 and s.len > 1 {
+            for (letter, base) in [(120, 16), (98, 2), (111, 8), (100, 10)] {
+                if c1 == letter {
+                    adv(s, 2)
+                    return base
+                }
+            }
+            return 8
+        }
+        return if base0 < 0 - 1 { 0 - base0 } else { 10 }
+    }
+    if s.len != 1 and c0 == 48 and prefix_letter(base0) != 0 and c1 == prefix_letter(base0) {
+        adv(s, 2)
+    }
+    return base0
+}
+
+/// After leading zeros (single underscores among them allowed): where the
+/// digits proper start, how much is left, and whether any zero was seen.
+fn squeeze_zeros(b: [i64], inout s: IntScan) -> bool {
+    if not (at(b, s.i) == 48 and s.len != 1) {
+        return false
+    }
+    let end = s.i + s.len
+    var us = 0
+    var c = 0
+    while true {
+        s.i = s.i + 1
+        c = at(b, s.i)
+        if c != 48 and c != 95 {
+            break
+        }
+        if c == 95 {
+            us = us + 1
+            if us >= 2 {
+                break
+            }
+        } else {
+            us = 0
+        }
+        if s.i == end {
+            break
+        }
+    }
+    if c == 0 or is_space(c) {
+        s.i = s.i - 1
+    }
+    s.len = end - s.i
+    return true
+}
+
+fn big_from(digits: [i64], base: i64) -> BigInt {
+    var v = bigint.zero()
+    let b = bigint.from_i64(base)
+    for d in digits {
+        v = bigint.add(bigint.mul(v, b), bigint.from_i64(d))
+    }
+    return v
+}
+
+/// The digits from `i` (no underscores) while they fit the base and the
+/// length: their values.
+fn plain_digits(b: [i64], i: i64, len: i64, base: i64) -> [i64] {
+    var out: [i64] = []
+    var k = i
+    while k < i + len {
+        let d = digit_value(at(b, k))
+        if d < 0 or d >= base {
+            break
+        }
+        out.push(d)
+        k = k + 1
+    }
+    return out
+}
+
+/// str2big_scan_digits: digits with single underscores between them; the
+/// digit values, or None where `badcheck` refuses the rest.
+fn underscore_digits(b: [i64], i: i64, len0: i64, base: i64, badcheck: bool) -> Option[[i64]] {
+    var out: [i64] = []
+    var len = len0
+    if len == 0 {
+        return Some(out)
+    }
+    if badcheck and at(b, i) == 95 {
+        return None
+    }
+    var nondigit = false
+    var p = i
+    while true {
+        let c = at(b, p)
+        p = p + 1
+        if c == 0 {
+            break
+        }
+        if c == 95 {
+            if nondigit {
+                if badcheck {
+                    return None
+                }
+                break
+            }
+            nondigit = true
+        } else if digit_value(c) < 0 or digit_value(c) >= base {
+            break
+        } else {
+            nondigit = false
+            out.push(digit_value(c))
+        }
+        len = len - 1
+        if len == 0 {
+            break
+        }
+    }
+    if badcheck and nondigit {
+        return None
+    }
+    if badcheck and len > 0 {
+        p = p - 1
+        while at(b, p) != 0 and is_space(at(b, p)) {
+            p = p + 1
+            len = len - 1
+            if len == 0 {
+                break
+            }
+        }
+        if len > 0 and at(b, p) != 0 {
+            return None
+        }
+    }
+    return Some(out)
+}
+
+/// rb_int_parse_cstr with every flag: the integer, None where it is not
+/// one (`badcheck` checking that nothing but spaces follows), or the
+/// invalid-radix error.
+fn parse_int(b: [i64], base0: i64, badcheck: bool) -> Option[BigInt] ! RubyNumError {
+    var s = IntScan{ i: 0, len: b.len(), negative: false, bad: false }
+    scan_sign(b, s)
+    if s.bad {
+        return None
+    }
+    let base = scan_base(b, s, base0)
+    if s.bad {
+        return None
+    }
+    if base < 2 or base > 36 {
+        fail(RubyNumError("invalid radix " + base.to_str()))
+    }
+    if s.len == 0 {
+        return None
+    }
+    let _zeros = squeeze_zeros(b, s)
+    let first = digit_value(at(b, s.i))
+    if first < 0 or first >= base {
+        return None
+    }
+    let digits = plain_digits(b, s.i, s.len, base)
+    let value = big_from(digits, base)
+    let end = s.i + digits.len()
+    let overflow = bigint.compare(value, bigint.parse("18446744073709551615") ?? bigint.zero()) > 0
+    if not overflow and not (digits.len() > 0 and at(b, end) == 95) {
+        if badcheck {
+            if digits.len() == 0 {
+                return None
+            }
+            var k = end
+            while k < s.i + s.len {
+                if not is_space(at(b, k)) {
+                    return None
+                }
+                k = k + 1
+            }
+        }
+        return Some(if s.negative { bigint.negate(value) } else { value })
+    }
+    return match underscore_digits(b, s.i, s.len, base, badcheck) {
+        Some(ds) -> Some(if s.negative { bigint.negate(big_from(ds, base)) } else { big_from(ds, base) })
+        None -> None
+    }
+}
+
+/// `str.to_i(base)`.
+pub fn to_i(s: bytes, base: i64) -> BigInt ! RubyNumError {
+    if base < 0 {
+        fail(RubyNumError("invalid radix " + base.to_str()))
+    }
+    return (try parse_int(s.to_list(), base, false)) ?? bigint.zero()
+}
+
+/// `Integer(str)`, or `Integer(str, base)`.
+pub fn integer(s: bytes, base: Option[i64]) -> BigInt ! RubyNumError {
+    return match try parse_int(s.to_list(), base ?? 0, true) {
+        Some(v) -> v
+        None -> fail(RubyNumError("invalid value for Integer(): " + rubyinspect.inspect(s, false)))
+    }
+}
+
+// ---- ruby_strtod
+
+/// 2^e as a double, for e within the normal range.
+fn pow2(e: i64) -> f64 {
+    return (e + 1023).shl(52).from_bits()
+}
+
+/// ldexp(x, n) for finite non-negative x, rounded once, as C's is.
+fn ldexp(x: f64, n: i64) -> f64 {
+    if x == 0.0 {
+        return x
+    }
+    let bits = x.to_bits()
+    let biased = bits.shr(52).bit_and(2047)
+    var m = bits.bit_and(4503599627370495)
+    var e = 0
+    if biased == 0 {
+        e = 0 - 1074
+    } else {
+        m = m + 4503599627370496
+        e = biased - 1075
+    }
+    e = e + n
+    var top = e
+    var t = m
+    while t > 1 {
+        t = t.shr(1)
+        top = top + 1
+    }
+    if top > 1023 {
+        return 1.0 / 0.0
+    }
+    if e >= 0 - 1074 {
+        var v = m.as_f64()
+        var k = e
+        while k > 1000 {
+            v = v * pow2(1000)
+            k = k - 1000
+        }
+        while k < 0 - 1000 {
+            v = v * pow2(0 - 1000)
+            k = k + 1000
+        }
+        if k >= 0 - 1022 {
+            return v * pow2(k)
+        }
+        return v * pow2(k + 1000) * pow2(0 - 1000)
+    }
+    // Below the smallest subnormal step: round m * 2^e to a multiple of
+    // 2^-1074, ties to even.
+    let shift = 0 - 1074 - e
+    if shift > 60 {
+        return 0.0
+    }
+    let q = m.shr(shift)
+    let rem = m - q.shl(shift)
+    let half = 1.shl(shift - 1)
+    let up = rem > half or (rem == half and q % 2 == 1)
+    return (q + (if up { 1 } else { 0 })).as_f64() * 5e-324
+}
+
+fn hex_value(c: i64) -> i64 {
+    if c >= 48 and c <= 57 {
+        return c - 48
+    }
+    if c >= 97 and c <= 102 {
+        return c - 87
+    }
+    if c >= 65 and c <= 70 {
+        return c - 55
+    }
+    return 0 - 1
+}
+
+/// The hexadecimal form after `0x` (at `x`): value and end, or None
+/// where ruby_strtod gives up (it then converts nothing).
+fn strtod_hex(b: [i64], x: i64) -> Option[(f64, i64)] {
+    var s = x + 1
+    var adj = 0.0
+    var aadj = 1.0
+    var nd0 = 0 - 4
+    if at(b, s) == 0 or hex_value(at(b, s)) < 0 {
+        return None
+    }
+    if at(b, s) == 48 {
+        while at(b, s) == 48 {
+            s = s + 1
+        }
+        if at(b, s) == 0 {
+            return Some((0.0, s))
+        }
+    }
+    while hex_value(at(b, s)) >= 0 {
+        adj = adj + aadj * hex_value(at(b, s)).as_f64()
+        nd0 = nd0 + 4
+        aadj = aadj / 16.0
+        s = s + 1
+    }
+    var dot = false
+    if at(b, s) == 46 {
+        dot = true
+        s = s + 1
+        if at(b, s) == 0 or hex_value(at(b, s)) < 0 {
+            return None
+        }
+        if nd0 < 0 {
+            while at(b, s) == 48 {
+                s = s + 1
+                nd0 = nd0 - 4
+            }
+        }
+        while hex_value(at(b, s)) >= 0 {
+            adj = adj + aadj * hex_value(at(b, s)).as_f64()
+            aadj = aadj / 16.0
+            s = s + 1
+            if aadj == 0.0 {
+                while hex_value(at(b, s)) >= 0 {
+                    s = s + 1
+                }
+                break
+            }
+        }
+    }
+    if at(b, s) == 112 or at(b, s) == 80 {
+        s = s + 1
+        var dsign = 44 - at(b, s)
+        if dsign == 1 or dsign == 0 - 1 {
+            s = s + 1
+        } else {
+            dsign = 1
+        }
+        if not is_digit(at(b, s)) {
+            return None
+        }
+        var nd = 0
+        while is_digit(at(b, s)) {
+            nd = nd * 10 + at(b, s) - 48
+            s = s + 1
+            if nd + dsign * nd0 > 2095 {
+                while is_digit(at(b, s)) {
+                    s = s + 1
+                }
+                break
+            }
+        }
+        nd0 = nd0 + nd * dsign
+    } else if dot {
+        return None
+    }
+    return Some((ldexp(adj, nd0), s))
+}
+
+/// The decimal digits ruby_strtod uses and the power of ten after them,
+/// with where the number ends; None where it converts nothing.
+type DecimalRead = { digits: [i64], exp: i64, end: i64 }
+
+/// The fraction after `.` at `s`: its digits until 60 significant ones
+/// are reached (later ones are dropped), and where it ends.
+fn read_fraction(b: [i64], s0: i64, inout d: DecimalRead, inout nz: i64) -> i64 {
+    var s = s0
+    var c = at(b, s)
+    if d.digits.len() == 0 {
+        while c == 48 {
+            nz = nz + 1
+            s = s + 1
+            c = at(b, s)
+        }
+        if c < 49 or c > 57 {
+            return s
+        }
+        d.exp = d.exp - nz
+        nz = 0
+    }
+    while is_digit(c) {
+        nz = nz + 1
+        if d.digits.len() <= 60 and c != 48 {
+            d.exp = d.exp - nz
+            for _k in 1..nz {
+                d.digits.push(0)
+            }
+            d.digits.push(c - 48)
+            nz = 0
+        }
+        s = s + 1
+        c = at(b, s)
+    }
+    return s
+}
+
+/// An `e` exponent at `s`: its value (capped at 19999) and where it ends,
+/// or (0, s) when what follows the `e` is not one.
+fn read_exponent(b: [i64], s0: i64) -> (i64, i64) {
+    var s = s0 + 1
+    var negative = false
+    if at(b, s) == 45 {
+        negative = true
+        s = s + 1
+    } else if at(b, s) == 43 {
+        s = s + 1
+    }
+    if not is_digit(at(b, s)) {
+        return (0, s0)
+    }
+    var v = 0
+    while is_digit(at(b, s)) {
+        v = if v > 19999 { v } else { v * 10 + at(b, s) - 48 }
+        s = s + 1
+    }
+    let e = if v > 19999 { 19999 } else { v }
+    return (if negative { 0 - e } else { e }, s)
+}
+
+/// The decimal form from `s` (after the sign): None for no number.
+fn strtod_decimal(b: [i64], s0: i64) -> Option[DecimalRead] {
+    var s = s0
+    var nz0 = false
+    if at(b, s) == 48 {
+        nz0 = true
+        while at(b, s) == 48 {
+            s = s + 1
+        }
+        if at(b, s) == 0 {
+            return Some(DecimalRead{ digits: [], exp: 0, end: s })
+        }
+    }
+    var d = DecimalRead{ digits: [], exp: 0, end: s }
+    while is_digit(at(b, s)) {
+        d.digits.push(at(b, s) - 48)
+        s = s + 1
+    }
+    var nz = 0
+    if at(b, s) == 46 and is_digit(at(b, s + 1)) {
+        s = read_fraction(b, s + 1, d, nz)
+    }
+    let c = at(b, s)
+    if c == 101 or c == 69 {
+        if d.digits.len() == 0 and nz == 0 and not nz0 {
+            return None
+        }
+        let (e, after) = read_exponent(b, s)
+        d.exp = d.exp + e
+        s = after
+    }
+    if d.digits.len() == 0 and nz == 0 and not nz0 {
+        return None
+    }
+    d.end = s
+    return Some(d)
+}
+
+/// ruby_strtod: the value and where it ends (`from` when nothing was
+/// converted).
+fn strtod(b: [i64], from: i64) -> (f64, i64) {
+    var s = from
+    var negative = false
+    while true {
+        let c = at(b, s)
+        if c == 45 or c == 43 {
+            negative = c == 45
+            s = s + 1
+            if at(b, s) == 0 {
+                return (0.0, from)
+            }
+            break
+        }
+        if c == 0 {
+            return (0.0, from)
+        }
+        if not is_space(c) {
+            break
+        }
+        s = s + 1
+    }
+    if at(b, s) == 48 and (at(b, s + 1) == 120 or at(b, s + 1) == 88) {
+        return match strtod_hex(b, s + 1) {
+            Some((v, end)) -> (if negative { v * -1.0 } else { v }, end)
+            None -> (0.0, from)
+        }
+    }
+    return match strtod_decimal(b, s) {
+        Some(d) -> (signed(decimal_value(d), negative), d.end)
+        None -> (0.0, from)
+    }
+}
+
+fn signed(v: f64, negative: bool) -> f64 {
+    return if negative { v * -1.0 } else { v }
+}
+
+/// The digits times ten to the exponent, correctly rounded.
+fn decimal_value(d: DecimalRead) -> f64 {
+    if d.digits.len() == 0 {
+        return 0.0
+    }
+    let text = d.digits.map(|x| x.to_str()).join("") + "e" + d.exp.to_str()
+    let (v, _err) = gostrconv.parse_float(text, 64)
+    return v
+}
+
+// ---- rb_cstr_to_dbl
+
+/// The 70-byte buffer the number is rewritten into: its bytes, the limit
+/// (60, or 69 once an exponent is reached), the last byte taken, whether
+/// a `.` has been taken, and whether the rest was refused.
+type FloatBuf = { buf: [i64], limit: i64, prev: i64, dot: bool, bad: bool }
+
+fn put(inout f: FloatBuf, c: i64) {
+    f.prev = c
+    f.buf.push(c)
+}
+
+/// One more byte of what follows the number, at `p`: where reading goes
+/// on, or -1 where it stops (`bad` set when the byte is refused).
+fn buffer_step(b: [i64], p0: i64, inout f: FloatBuf) -> i64 {
+    var p = p0
+    if at(b, p) == 95 {
+        if f.buf.len() == 0 or not is_digit(f.prev) {
+            f.bad = true
+            return 0 - 1
+        }
+        p = p + 1
+        if not is_digit(at(b, p)) {
+            f.bad = true
+            return 0 - 1
+        }
+    }
+    let c = at(b, p)
+    f.prev = c
+    p = p + 1
+    if f.limit == 60 and (c == 101 or c == 69 or c == 112 or c == 80) {
+        f.limit = 69
+        f.buf.push(c)
+        if at(b, p) == 43 or at(b, p) == 45 {
+            put(f, at(b, p))
+            p = p + 1
+        }
+        if at(b, p) == 48 {
+            put(f, 48)
+            while at(b, p) == 48 {
+                p = p + 1
+            }
+        }
+        return p
+    }
+    if is_space(c) {
+        while is_space(at(b, p)) {
+            p = p + 1
+        }
+        if at(b, p) != 0 {
+            f.bad = true
+            return 0 - 1
+        }
+    } else if c == 46 {
+        if f.dot {
+            f.bad = true
+            return 0 - 1
+        }
+        f.dot = true
+    } else if not is_digit(c) {
+        f.bad = true
+        return 0 - 1
+    }
+    if f.buf.len() < f.limit {
+        f.buf.push(c)
+    }
+    return p
+}
+
+/// The number at `p` (ending where ruby_strtod said, at `end`) and what
+/// follows it, rewritten as rb_cstr_to_dbl does.
+fn rewrite(b: [i64], p0: i64, end: i64) -> FloatBuf {
+    var f = FloatBuf{ buf: [], limit: 60, prev: 0, dot: false, bad: false }
+    var p = p0
+    if at(b, p) == 43 or at(b, p) == 45 {
+        put(f, at(b, p))
+        p = p + 1
+    }
+    if at(b, p) == 48 {
+        put(f, 48)
+        p = p + 1
+        while at(b, p) == 48 {
+            p = p + 1
+        }
+    }
+    while p < end and f.buf.len() < f.limit {
+        put(f, at(b, p))
+        p = p + 1
+    }
+    while at(b, p) != 0 {
+        p = buffer_step(b, p, f)
+        if p < 0 {
+            break
+        }
+    }
+    return f
+}
+
+fn hex_start(b: [i64], p: i64) -> bool {
+    return at(b, p) == 48 and (at(b, p + 1) == 120 or at(b, p + 1) == 88)
+}
+
+/// rb_cstr_to_dbl: the value, or None where `badcheck` refuses the text.
+fn cstr_to_dbl(b: [i64], badcheck: bool) -> Option[f64] {
+    var p = 0
+    while is_space(at(b, p)) {
+        p = p + 1
+    }
+    if not badcheck and hex_start(b, p) {
+        return Some(0.0)
+    }
+    let (d, end) = strtod(b, p)
+    if p == end {
+        return if badcheck { None } else { Some(d) }
+    }
+    if at(b, end) == 0 {
+        return Some(d)
+    }
+    let f = rewrite(b, p, end)
+    if f.bad and badcheck {
+        return None
+    }
+    if not badcheck and hex_start(f.buf, 0) {
+        return Some(0.0)
+    }
+    let (d2, end2) = strtod(f.buf, 0)
+    if badcheck {
+        if end2 == 0 {
+            return None
+        }
+        var k = end2
+        while is_space(at(f.buf, k)) {
+            k = k + 1
+        }
+        if at(f.buf, k) != 0 {
+            return None
+        }
+    }
+    return Some(d2)
+}
+
+fn before_nul(b: [i64]) -> [i64] {
+    var out: [i64] = []
+    for c in b {
+        if c == 0 {
+            break
+        }
+        out.push(c)
+    }
+    return out
+}
+
+/// `str.to_f`.
+pub fn to_f(s: bytes) -> f64 {
+    return cstr_to_dbl(before_nul(s.to_list()), false) ?? 0.0
+}
+
+/// `Float(str)`.
+pub fn float(s: bytes) -> f64 ! RubyNumError {
+    let b = s.to_list()
+    if b.contains(0) {
+        fail(RubyNumError("string for Float contains null byte"))
+    }
+    return match cstr_to_dbl(b, true) {
+        Some(v) -> v
+        None -> fail(RubyNumError("invalid value for Float(): " + rubyinspect.inspect(s, true)))
+    }
+}

@@ -1,0 +1,338 @@
+// Rust's format specifications, as Rust 1.99's `std::fmt` applies them:
+// `{:spec}` for `i64`, `u64`, `f64` and `str`, with fill, alignment,
+// sign, `#`, `0`, width and precision -- written out or taken from an
+// argument -- and the `?`, `x?`, `X?`, `x`, `X`, `o`, `b`, `e` and `E`
+// types.
+//
+// Rust services, CLIs and logs lay out their numbers and columns with
+// these specs, and anything that reproduces that output -- a report
+// generator, a log parser's test fixtures, a port of a Rust tool -- has
+// to pad, sign and round exactly as `format!` does:
+//
+//   - **Integers** (`pad_integral`): `+` signs non-negative values, `#`
+//     adds `0x`, `0o` or `0b`, `0` pads with zeros between the sign and
+//     prefix and the digits (whatever the fill and alignment), and other
+//     padding goes right by default. Hex, octal and binary print a
+//     negative `i64` as its two's complement; precision is ignored, except
+//     by `{:e}`, which writes `1.234e3`, drops trailing zeros, rounds half
+//     to even (`{:.0e}` of 25 is `2e1`) and pads with zeros after the
+//     digits when asked for more.
+//   - **Floats** (`pad_formatted_parts`): shortest digits or exactly
+//     `precision` places, `{:?}` switching to an exponent outside
+//     [1e-4, 1e16), `{:e}`; `-0.0` keeps its sign, NaN never takes one,
+//     and the `0` flag pads infinities and NaN with zeros too (`00inf`).
+//     The digits come from `rustnum`, which is held to the same Rust.
+//   - **Strings** (`pad`): precision cuts to that many characters, width
+//     counts characters, default alignment is left, and the sign, `#`
+//     and `0` flags are ignored.
+//   - Widths and precisions given as `N$` read `counts[N - 1]` (argument 0
+//     being the value), and a `.*` precision reads `counts[0]`.
+//
+// Not covered: `{:?}` of a string (its escaping is `rustescape`'s), other
+// types, named arguments, and the compile-time errors `format!` gives for
+// a bad spec -- here a spec that does not parse, or a type the value does
+// not have, is an error.
+//
+// Checked against `rustc` 1.99 on generated `format!` calls over
+// boundary integers, all kinds of doubles and Unicode strings.
+
+import bigint
+import rustnum
+
+/// The value being formatted. A `u64` is held by its 64 bits.
+type RustFmtArg = | RustI64(v: i64) | RustU64(bits: i64) | RustF64(x: f64) | RustStr(s: str)
+
+/// A spec that does not parse, or names a type the value does not have.
+type RustFmtError = | RustFmtBadSpec(why: str) | RustFmtBadType(why: str)
+
+/// A parsed spec. `align` is 0 for none, else `<`, `^` or `>`.
+type RustSpec = { fill: str, align: str, plus: bool, alternate: bool, zero: bool, width: i64, precision: Option[i64], kind: str }
+
+fn bad(why: str) -> RustFmtError {
+    return RustFmtBadSpec(why)
+}
+
+fn is_digit(c: str) -> bool {
+    return c.len() == 1 and c >= "0" and c <= "9"
+}
+
+/// A count: digits, or digits and `$` naming an argument.
+fn count_at(cs: [str], at: i64, counts: [i64]) -> (Option[i64], i64) ! RustFmtError {
+    var i = at
+    while i < cs.len() and is_digit(cs[i]) {
+        i = i + 1
+    }
+    if i == at {
+        return (None, at)
+    }
+    let n = cs.slice(at, i).join("").parse_int() ?? 0
+    if i < cs.len() and cs[i] == "$" {
+        return (Some(try arg_count(n, counts)), i + 1)
+    }
+    return (Some(n), i)
+}
+
+fn arg_count(n: i64, counts: [i64]) -> i64 ! RustFmtError {
+    if n < 1 or n > counts.len() {
+        fail(bad("a count names an argument that is not there"))
+    }
+    return counts[n - 1]
+}
+
+fn is_align(c: str) -> bool {
+    return c == "<" or c == "^" or c == ">"
+}
+
+fn parse_spec(spec: str, counts: [i64]) -> RustSpec ! RustFmtError {
+    let cs = spec.chars()
+    var s = RustSpec{ fill: " ", align: "", plus: false, alternate: false, zero: false, width: 0, precision: None, kind: "" }
+    var i = 0
+    if cs.len() >= 2 and is_align(cs[1]) {
+        s.fill = cs[0]
+        s.align = cs[1]
+        i = 2
+    } else if cs.len() >= 1 and is_align(cs[0]) {
+        s.align = cs[0]
+        i = 1
+    }
+    if i < cs.len() and (cs[i] == "+" or cs[i] == "-") {
+        s.plus = cs[i] == "+"
+        i = i + 1
+    }
+    if i < cs.len() and cs[i] == "#" {
+        s.alternate = true
+        i = i + 1
+    }
+    var have_width = false
+    if i < cs.len() and cs[i] == "0" {
+        if i + 1 < cs.len() and cs[i + 1] == "$" {
+            s.width = try arg_count(0, counts)
+            have_width = true
+            i = i + 2
+        } else {
+            s.zero = true
+            i = i + 1
+        }
+    }
+    if not have_width {
+        let w = try count_at(cs, i, counts)
+        s.width = w.0 ?? 0
+        i = w.1
+    }
+    if i < cs.len() and cs[i] == "." {
+        i = i + 1
+        if i < cs.len() and cs[i] == "*" {
+            if counts.len() == 0 {
+                fail(bad("a .* precision with no count"))
+            }
+            s.precision = Some(counts[0])
+            i = i + 1
+        } else {
+            let p = try count_at(cs, i, counts)
+            if p.0.is_none() {
+                fail(bad("a precision with no digits"))
+            }
+            s.precision = p.0
+            i = p.1
+        }
+    }
+    s.kind = cs.slice(i, cs.len()).join("")
+    if not ["", "?", "x?", "X?", "x", "X", "o", "b", "e", "E"].contains(s.kind) {
+        fail(bad("an unknown type " + s.kind))
+    }
+    return s
+}
+
+/// Fill before and after, for `padding` characters with the default
+/// alignment `default`.
+fn padding(s: RustSpec, n: i64, default: str) -> (str, str) {
+    let align = if s.align == "" { default } else { s.align }
+    let left = if align == "<" { 0 } else if align == ">" { n } else { n / 2 }
+    return (s.fill.repeat(left), s.fill.repeat(n - left))
+}
+
+/// Formatter::pad_integral.
+fn pad_integral(s: RustSpec, nonnegative: bool, prefix: str, digits: str) -> str {
+    var width = digits.len()
+    var sign = ""
+    if not nonnegative {
+        sign = "-"
+    } else if s.plus {
+        sign = "+"
+    }
+    width = width + sign.len()
+    let pre = if s.alternate { prefix } else { "" }
+    width = width + pre.len()
+    if width >= s.width {
+        return sign + pre + digits
+    }
+    if s.zero {
+        return sign + pre + "0".repeat(s.width - width) + digits
+    }
+    let pads = padding(s, s.width - width, ">")
+    return pads.0 + sign + pre + digits + pads.1
+}
+
+/// Formatter::pad_formatted_parts, for a sign and the rest.
+fn pad_parts(s: RustSpec, sign: str, body: str) -> str {
+    if s.width == 0 {
+        return sign + body
+    }
+    if s.zero {
+        let width = (s.width - sign.len()).max(0)
+        if width <= body.len() {
+            return sign + body
+        }
+        return sign + "0".repeat(width - body.len()) + body
+    }
+    let len = sign.len() + body.len()
+    if s.width <= len {
+        return sign + body
+    }
+    let pads = padding(s, s.width - len, ">")
+    return pads.0 + sign + body + pads.1
+}
+
+/// Formatter::pad, for strings.
+fn pad_str(s: RustSpec, text: str) -> str {
+    var t = text
+    match s.precision {
+        Some(p) -> if t.len() > p {
+            t = t.substr(0, p)
+        }
+        None -> {}
+    }
+    if t.len() >= s.width {
+        return t
+    }
+    let pads = padding(s, s.width - t.len(), "<")
+    return pads.0 + t + pads.1
+}
+
+fn ubig(bits: i64) -> BigInt {
+    if bits >= 0 {
+        return bigint.from_i64(bits)
+    }
+    return bigint.add(bigint.from_i64(bits.bit_and(9223372036854775807)), bigint.pow(bigint.from_i64(2), 63))
+}
+
+fn radix_digits(bits: i64, shift: i64, upper: bool) -> str {
+    let set = if upper { "0123456789ABCDEF" } else { "0123456789abcdef" }
+    var out: [str] = []
+    var v = bits
+    let mask = 1.shl(shift) - 1
+    while true {
+        out.push(set.substr(v.bit_and(mask), 1))
+        v = v.ushr(shift)
+        if v == 0 {
+            break
+        }
+    }
+    return out.rev().join("")
+}
+
+/// `{:e}` of an integer: the coefficient, rounded half to even when the
+/// precision drops digits, and the extra zeros the precision asks for.
+fn integer_exp(s: RustSpec, nonnegative: bool, magnitude: BigInt, upper: bool) -> str {
+    let digits = bigint.to_str(magnitude)
+    var exp = digits.len() - 1
+    var coef = digits
+    var more = 0
+    match s.precision {
+        None -> {
+            while coef.len() > 1 and coef.ends_with("0") {
+                coef = coef.substr(0, coef.len() - 1)
+            }
+        }
+        Some(p) -> if p >= coef.len() - 1 {
+            more = p - (coef.len() - 1)
+        } else {
+            coef = round_digits(coef, p + 1)
+            if coef.len() > p + 1 {
+                coef = coef.substr(0, p + 1)
+                exp = exp + 1
+            }
+        }
+    }
+    var text = coef.substr(0, 1)
+    if coef.len() > 1 or more > 0 {
+        text = text + "." + coef.substr(1, coef.len() - 1)
+    }
+    let e = (if upper { "E" } else { "e" }) + exp.to_str()
+    if more == 0 {
+        return pad_integral(s, nonnegative, "", text + e)
+    }
+    let sign = if not nonnegative { "-" } else if s.plus { "+" } else { "" }
+    return pad_parts(s, sign, text + "0".repeat(more) + e)
+}
+
+/// The first `keep` digits of `d`, rounded half to even (one longer when
+/// the rounding carries into a new digit).
+fn round_digits(d: str, keep: i64) -> str {
+    let head = d.substr(0, keep)
+    let rest = d.substr(keep, d.len() - keep)
+    let first = rest.substr(0, 1)
+    let tail_zero = rest.substr(1, rest.len() - 1).chars().all(|c| c == "0")
+    let last_odd = (head.substr(head.len() - 1, 1).parse_int() ?? 0) % 2 == 1
+    let up = first > "5" or first == "5" and (not tail_zero or last_odd)
+    if not up {
+        return head
+    }
+    return bigint.to_str(bigint.add(bigint.parse(head) ?? bigint.zero(), bigint.from_i64(1)))
+}
+
+fn integer(s: RustSpec, bits: i64, signed: bool) -> str {
+    let nonnegative = not signed or bits >= 0
+    let magnitude = if signed and bits < 0 { ubig(0 - bits) } else { ubig(bits) }
+    let k = s.kind
+    if k == "x" or k == "x?" {
+        return pad_integral(s, true, "0x", radix_digits(bits, 4, false))
+    }
+    if k == "X" or k == "X?" {
+        return pad_integral(s, true, "0x", radix_digits(bits, 4, true))
+    }
+    if k == "o" {
+        return pad_integral(s, true, "0o", radix_digits(bits, 3, false))
+    }
+    if k == "b" {
+        return pad_integral(s, true, "0b", radix_digits(bits, 1, false))
+    }
+    if k == "e" or k == "E" {
+        return integer_exp(s, nonnegative, magnitude, k == "E")
+    }
+    return pad_integral(s, nonnegative, "", bigint.to_str(magnitude))
+}
+
+fn float(s: RustSpec, x: f64) -> str ! RustFmtError {
+    let k = s.kind
+    var text = ""
+    if k == "e" or k == "E" {
+        text = match s.precision {
+            Some(p) -> rustnum.exp_fixed(x, p, k == "E")
+            None -> rustnum.exp(x, k == "E")
+        }
+    } else if k == "" or k == "?" {
+        text = match s.precision {
+            Some(p) -> rustnum.fixed(x, p)
+            None -> if k == "?" { rustnum.debug(x) } else { rustnum.display(x) }
+        }
+    } else {
+        fail(RustFmtBadType("f64 has no \{:" + k + "}"))
+    }
+    if text.starts_with("-") {
+        return pad_parts(s, "-", text.substr(1, text.len() - 1))
+    }
+    return pad_parts(s, if s.plus and x == x { "+" } else { "" }, text)
+}
+
+/// `format!("{:spec}", arg)`, with `counts` the arguments `N$` and `.*`
+/// read.
+pub fn format_value(spec: str, arg: RustFmtArg, counts: [i64]) -> str ! RustFmtError {
+    let s = try parse_spec(spec, counts)
+    return match arg {
+        RustI64(v) -> integer(s, v, true)
+        RustU64(b) -> integer(s, b, false)
+        RustF64(x) -> try float(s, x)
+        RustStr(t) -> if s.kind == "" { pad_str(s, t) } else { fail(RustFmtBadType("str has no \{:" + s.kind + "}")) }
+    }
+}

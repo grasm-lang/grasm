@@ -1,0 +1,48 @@
+// Perl's Text::Abbrev: `abbrev`, the table of every unambiguous
+// truncation of a list of words, as Text::Abbrev 1.02 (Perl 5.34) builds
+// it.
+//
+// Command loops, REPLs and option parsers written in Perl accept `del` for
+// `delete` through this table, and a tool that has to take the same input
+// has to build the same table:
+//
+//   - every truncation of a word, from one character short of the word
+//     down to its first character, maps to the word -- unless another
+//     word (or the same word given twice) shares it, and then it is not
+//     in the table at all;
+//   - every word maps to itself, even when it is a truncation of another
+//     word (`ab` and `abc` give `ab => ab`) or appears twice;
+//   - lengths are in characters, so `é` is one, and the empty word maps to
+//     itself;
+//   - the counting is Perl's, including skipping the rest of a word once a
+//     truncation has been seen three times.
+//
+// Checked against `perl` 5.34 calling `abbrev` on generated word lists.
+
+/// The table `abbrev(words)` returns.
+pub fn abbrev(words: [str]) -> Map[str, str] {
+    var table: Map[str, str] = map()
+    var seen: Map[str, i64] = map()
+    for word in words {
+        var len = word.len() - 1
+        while len > 0 {
+            let short = word.substr(0, len)
+            let count = (seen.get(short) ?? 0) + 1
+            seen.set(short, count)
+            if count == 1 {
+                table.set(short, word)
+            } else if count == 2 {
+                let _gone = table.delete(short)
+            } else {
+                // A third word with this truncation: Perl moves on to the
+                // next word.
+                break
+            }
+            len = len - 1
+        }
+    }
+    for word in words {
+        table.set(word, word)
+    }
+    return table
+}

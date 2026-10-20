@@ -1,0 +1,768 @@
+// The harness scripts/b56_diff.sh drives: each argument pair is an
+// operation and a file of cases, one per line; each answer is one line.
+import bigint
+import lispnumbers
+import perlparsewords
+import rubyfloat
+import rustescape
+import perltextwrap
+import pyipaddress
+import pystr
+import rustpath
+
+fn unhex_list(h: str) -> [i64] {
+    if h == "-" {
+        return []
+    }
+    var out: [i64] = []
+    let b = h.to_bytes()
+    var i = 0
+    while i + 1 < b.len() {
+        let hi = b.at(i)
+        let lo = b.at(i + 1)
+        out.push((if hi >= 97 { hi - 87 } else { hi - 48 }) * 16 + (if lo >= 97 { lo - 87 } else { lo - 48 }))
+        i = i + 2
+    }
+    return out
+}
+
+fn unhex(h: str) -> str {
+    return bytes_of(unhex_list(h)).to_str()
+}
+
+fn hex_bytes(b: bytes) -> str {
+    let digits = "0123456789abcdef"
+    let h = b.to_list().map(|x| digits.substr(x.ushr(4), 1) + digits.substr(x.bit_and(15), 1)).join("")
+    return if h.len() == 0 { "-" } else { h }
+}
+
+fn hex_u64(h: str) -> i64 {
+    var v = 0
+    for c in h.codes() {
+        let d = if c >= 97 { c - 87 } else if c >= 65 { c - 55 } else { c - 48 }
+        v = v.shl(4).bit_or(d)
+    }
+    return v
+}
+
+
+fn hex_text(t: str) -> str {
+    return hex_bytes(t.to_bytes())
+}
+
+fn lisp_result(r: str ! LispFormatError) -> str {
+    return match r {
+        Ok(t) -> t
+        Err(e) -> "E:" + lispnumbers.error_text(e)
+    }
+}
+
+fn lispnumbers_line(f: [str]) -> str {
+    let n = bigint.parse(f[1]) ?? bigint.zero()
+    let op = f[0]
+    if op == "c" {
+        return lisp_result(lispnumbers.cardinal(n))
+    }
+    if op == "o" {
+        return lisp_result(lispnumbers.ordinal(n))
+    }
+    if op == "r" {
+        return lisp_result(lispnumbers.roman(n))
+    }
+    if op == "or" {
+        return lisp_result(lispnumbers.old_roman(n))
+    }
+    return lispnumbers.radix(n, f[2].parse_int() ?? 10, f[3].parse_int() ?? 0, unhex(f[4]), unhex(f[5]), f[6].parse_int() ?? 3, f[7] == "1", f[8] == "1")
+}
+
+fn rp_opt(o: Option[str]) -> str {
+    return match o {
+        Some(t) -> "s:" + hex_text(t)
+        None -> "none"
+    }
+}
+
+fn rustpath_line(f: [str]) -> str {
+    let a = unhex(f[1])
+    let op = f[0]
+    let b = if f.len() > 2 { unhex(f[2]) } else { "" }
+    if op == "comp" {
+        return rustpath.components(a).map(|c| "s:" + hex_text(c)).join(",")
+    }
+    if op == "parent" {
+        return rp_opt(rustpath.parent(a))
+    }
+    if op == "name" {
+        return rp_opt(rustpath.file_name(a))
+    }
+    if op == "stem" {
+        return rp_opt(rustpath.file_stem(a))
+    }
+    if op == "prefix" {
+        return rp_opt(rustpath.file_prefix(a))
+    }
+    if op == "ext" {
+        return rp_opt(rustpath.extension(a))
+    }
+    if op == "abs" {
+        return if rustpath.is_absolute(a) { "true" } else { "false" }
+    }
+    if op == "join" {
+        return "s:" + hex_text(rustpath.join(a, b))
+    }
+    if op == "wfn" {
+        return "s:" + hex_text(rustpath.with_file_name(a, b))
+    }
+    if op == "wext" {
+        return match rustpath.with_extension(a, b) {
+            Ok(t) -> "s:" + hex_text(t)
+            Err(e) -> "P:" + rustpath.error_text(e)
+        }
+    }
+    if op == "strip" {
+        return rp_opt(rustpath.strip_prefix(a, b))
+    }
+    let r = if op == "starts" { rustpath.starts_with(a, b) } else { rustpath.ends_with(a, b) }
+    return if r { "true" } else { "false" }
+}
+
+fn pw_word(w: Option[str]) -> str {
+    return match w {
+        Some(t) -> "s" + hex_text(t)
+        None -> "u"
+    }
+}
+
+fn pw_keep(k: str) -> ParseWordsKeep {
+    return if k == "d" { KeepDelimiters } else if k == "0" { KeepNothing } else { KeepQuotes }
+}
+
+fn pw_words(r: [Option[str]] ! ParseWordsError) -> str {
+    return match r {
+        Ok(ws) -> ws.map(|w| pw_word(w)).join(",")
+        Err(e) -> "E:" + perlparsewords.error_text(e)
+    }
+}
+
+fn perlparsewords_line(f: [str]) -> str {
+    let op = f[0]
+    let rest = f.slice(1, f.len())
+    if op == "pl" {
+        return pw_words(perlparsewords.parse_line(unhex(rest[0]), pw_keep(rest[1]), unhex(rest[2])))
+    }
+    if op == "qw" {
+        return pw_words(perlparsewords.quotewords(unhex(rest[0]), pw_keep(rest[1]), rest.slice(2, rest.len()).map(|h| unhex(h))))
+    }
+    if op == "nq" {
+        return match perlparsewords.nested_quotewords(unhex(rest[0]), pw_keep(rest[1]), rest.slice(2, rest.len()).map(|h| unhex(h))) {
+            Ok(ls) -> ls.map(|ws| ws.map(|w| pw_word(w)).join(",")).join(";")
+            Err(e) -> "E:" + perlparsewords.error_text(e)
+        }
+    }
+    if op == "sw" {
+        return perlparsewords.shellwords(rest.map(|h| unhex(h))).map(|w| pw_word(w)).join(",")
+    }
+    return match perlparsewords.old_shellwords(rest.map(|h| unhex(h))) {
+        Some(ws) -> ws.map(|w| "s" + hex_text(w)).join(",")
+        None -> "W"
+    }
+}
+
+fn rf_bits(x: f64) -> str {
+    let digits = "0123456789abcdef"
+    let b = x.to_bits()
+    var out = ""
+    for k in 0..16 {
+        out = out + digits.substr(b.ushr(60 - 4 * k).bit_and(15), 1)
+    }
+    return out
+}
+
+fn rf_number(r: RubyNumber ! FloatDomainError) -> str {
+    return match r {
+        Ok(RubyInt(i)) -> "i" + bigint.to_str(i)
+        Ok(RubyFloat(f)) -> if f != f { "fnan" } else { "f" + rf_bits(f) }
+        Err(e) -> "E:" + rubyfloat.error_text(e)
+    }
+}
+
+fn rubyfloat_line(f: [str]) -> str {
+    let op = f[0]
+    let x = hex_u64(f[1]).from_bits()
+    let n = if f.len() > 2 { f[2].parse_int() ?? 0 } else { 0 }
+    if op == "ts" {
+        return rubyfloat.to_s(x)
+    }
+    if op == "rd" {
+        let mode = if f[3] == "even" { HalfEven } else if f[3] == "down" { HalfDown } else { HalfUp }
+        return rf_number(rubyfloat.round(x, n, mode))
+    }
+    if op == "r0" {
+        return rf_number(rubyfloat.round(x, 0, HalfUp))
+    }
+    if op == "fl" {
+        return rf_number(rubyfloat.floor(x, n))
+    }
+    if op == "ce" {
+        return rf_number(rubyfloat.ceil(x, n))
+    }
+    return rf_number(rubyfloat.truncate(x, n))
+}
+
+fn rustescape_line(f: [str]) -> str {
+    let op = f[0]
+    let s = unhex(f[1])
+    let c = if s.len() > 0 { s.chars()[0] } else { 0.to_char() }
+    let r = if op == "cd" {
+        rustescape.escape_debug_char(c)
+    } else if op == "cf" {
+        rustescape.escape_default_char(c)
+    } else if op == "cu" {
+        rustescape.escape_unicode_char(c)
+    } else if op == "sd" {
+        rustescape.escape_debug(s)
+    } else if op == "sf" {
+        rustescape.escape_default(s)
+    } else if op == "su" {
+        rustescape.escape_unicode(s)
+    } else if op == "ds" {
+        rustescape.debug_str(s)
+    } else {
+        rustescape.debug_char(c)
+    }
+    return hex_text(r)
+}
+
+fn tw_opt(h: str) -> Option[str] {
+    return if h == "u" { None } else { Some(unhex(h)) }
+}
+
+fn tw_run(wrapping: bool, ip: str, xp: str, texts: [str], o: WrapOptions) -> str ! WrapError {
+    if wrapping {
+        return try perltextwrap.wrap(ip, xp, texts, o)
+    }
+    return try perltextwrap.fill(ip, xp, texts, o)
+}
+
+fn perltextwrap_line(f: [str]) -> str {
+    let op = f[0]
+    if op == "e" {
+        return hex_text(perltextwrap.expand(unhex(f[2]), f[1].parse_int() ?? 8))
+    }
+    if op == "x" {
+        return hex_text(perltextwrap.unexpand(unhex(f[2]), f[1].parse_int() ?? 8))
+    }
+    let huge = if f[2] == "die" { HugeDie } else if f[2] == "overflow" { HugeOverflow } else { HugeWrap }
+    let o = WrapOptions{ columns: f[1].parse_int() ?? 76, huge: huge, unexpand: f[3] == "1", tabstop: f[4].parse_int() ?? 8, separator: unhex(f[5]), separator2: tw_opt(f[6]), brk: tw_opt(f[7]) }
+    let texts = f.slice(10, f.len()).map(|h| unhex(h))
+    return match tw_run(op == "w", unhex(f[8]), unhex(f[9]), texts, o) {
+        Ok(t) -> hex_text(t)
+        Err(_e) -> "D"
+    }
+}
+
+fn pi_err(e: PyIpError) -> str {
+    return "E:" + pyipaddress.error_class(e) + ":" + pyipaddress.error_text(e)
+}
+
+fn pi_b(v: bool) -> str {
+    return if v { "T" } else { "F" }
+}
+
+fn pi_try(r: str ! PyIpError) -> str {
+    return match r {
+        Ok(t) -> t
+        Err(e) -> pi_err(e)
+    }
+}
+
+fn pi_bool(r: bool ! PyIpError) -> str {
+    return match r {
+        Ok(v) -> pi_b(v)
+        Err(e) -> pi_err(e)
+    }
+}
+
+fn pi_flags(a: PyIpAddress, unspecified: bool, loopback: bool) -> str {
+    var fs = [pyipaddress.is_multicast(a), pyipaddress.is_private(a), pyipaddress.is_global(a), unspecified, pyipaddress.is_reserved(a), loopback,
+        pyipaddress.is_link_local(a)]
+    if a.version == 6 {
+        fs.push(pyipaddress.is_site_local(a))
+    }
+    return fs.map(|v| pi_b(v)).join("")
+}
+
+fn pi_opt(a: Option[PyIpAddress]) -> str {
+    return match a {
+        Some(x) -> pyipaddress.address_str(x)
+        None -> "-"
+    }
+}
+
+fn pi_extras(a: PyIpAddress, v4_mapped: str ! PyIpError) -> [str] {
+    if a.version == 4 {
+        return [pi_try(v4_mapped)]
+    }
+    let t = match pyipaddress.teredo(a) {
+        Some(p) -> pyipaddress.address_str(p.0) + "," + pyipaddress.address_str(p.1)
+        None -> "-"
+    }
+    let s = match a.scope {
+        Some(x) -> "s" + x
+        None -> "N"
+    }
+    return [pi_opt(pyipaddress.ipv4_mapped(a)), t, pi_opt(pyipaddress.sixtofour(a)), s]
+}
+
+fn pi_v4_mapped(a: PyIpAddress) -> str ! PyIpError {
+    return pyipaddress.address_str(try pyipaddress.ipv6_mapped(a))
+}
+
+fn pi_addr_desc(a: PyIpAddress) -> str {
+    let s = pyipaddress.address_str(a)
+    let head = [pyipaddress.address_repr(a), s, pi_try(pyipaddress.address_exploded(a)), s, pi_try(pyipaddress.address_reverse_pointer(a)),
+        hex_bytes(pyipaddress.packed(a)), bigint.to_str(pyipaddress.to_int(a)), a.version.to_str(), pyipaddress.max_prefixlen(a.version).to_str(),
+        pi_flags(a, pyipaddress.is_unspecified(a), pyipaddress.is_loopback(a))]
+    return (head + pi_extras(a, pi_v4_mapped(a))).join("|")
+}
+
+fn pi_iface_mapped(i: PyIpInterface) -> str ! PyIpError {
+    return pyipaddress.address_str(try pyipaddress.interface_ipv6_mapped(i))
+}
+
+fn pi_iface_desc(i: PyIpInterface) -> str {
+    let a = i.address
+    let s = pyipaddress.interface_str(i)
+    let head = [pyipaddress.interface_repr(i), s, pyipaddress.interface_exploded(i), s, pyipaddress.interface_reverse_pointer(i),
+        hex_bytes(pyipaddress.packed(a)), bigint.to_str(pyipaddress.to_int(a)), pyipaddress.address_repr(pyipaddress.interface_ip(i)),
+        pyipaddress.network_repr(i.network), pyipaddress.address_str(pyipaddress.netmask(i.network)),
+        pyipaddress.address_str(pyipaddress.hostmask(i.network)), pyipaddress.interface_with_prefixlen(i), pyipaddress.interface_with_netmask(i),
+        pyipaddress.interface_with_hostmask(i), pi_flags(a, pyipaddress.interface_is_unspecified(i), pyipaddress.interface_is_loopback(i))]
+    return (head + pi_extras(a, pi_iface_mapped(i))).join("|")
+}
+
+fn pi_net_flags(n: PyIpNetwork) -> str {
+    var fs = [pyipaddress.network_is_multicast(n), pyipaddress.network_is_private(n), pyipaddress.network_is_global(n),
+        pyipaddress.network_is_unspecified(n), pyipaddress.network_is_reserved(n), pyipaddress.network_is_loopback(n),
+        pyipaddress.network_is_link_local(n)]
+    if pyipaddress.version_of(n) == 6 {
+        fs.push(pyipaddress.network_is_site_local(n))
+    }
+    return fs.map(|v| pi_b(v)).join("")
+}
+
+fn pi_index(n: PyIpNetwork, i: i64) -> str {
+    return match pyipaddress.network_index(n, bigint.from_i64(i)) {
+        Ok(a) -> pyipaddress.address_repr(a)
+        Err(e) -> pi_err(e)
+    }
+}
+
+fn pi_net_desc(n: PyIpNetwork) -> str {
+    let s = pyipaddress.network_str(n)
+    let hs = pyipaddress.hosts(n, 4)
+    let shown = hs.slice(0, if hs.len() > 3 { 3 } else { hs.len() }).map(|a| pyipaddress.address_repr(a)).join(",") + (if hs.len() > 3 { "+" } else { "" })
+    return [pyipaddress.network_repr(n), s, pi_try(pyipaddress.network_exploded(n)), s, pi_try(pyipaddress.network_reverse_pointer(n)),
+        pyipaddress.address_repr(n.network_address), pyipaddress.address_str(pyipaddress.broadcast_address(n)),
+        pyipaddress.address_str(pyipaddress.netmask(n)), pyipaddress.address_str(pyipaddress.hostmask(n)), n.prefixlen.to_str(), s,
+        pyipaddress.with_netmask(n), pyipaddress.with_hostmask(n), bigint.to_str(pyipaddress.num_addresses(n)), pi_net_flags(n), shown, pi_index(n, 0),
+        pi_index(n, 0 - 1)].join("|")
+}
+
+fn pi_addr(ctor: str, text: str) -> PyIpAddress ! PyIpError {
+    if ctor == "v4" {
+        return try pyipaddress.ipv4_address(text)
+    }
+    if ctor == "v6" {
+        return try pyipaddress.ipv6_address(text)
+    }
+    return try pyipaddress.ip_address(text)
+}
+
+fn pi_iface(ctor: str, text: str) -> PyIpInterface ! PyIpError {
+    if ctor == "v4" {
+        return try pyipaddress.ipv4_interface(text)
+    }
+    if ctor == "v6" {
+        return try pyipaddress.ipv6_interface(text)
+    }
+    return try pyipaddress.ip_interface(text)
+}
+
+fn pi_net(ctor: str, text: str) -> PyIpNetwork ! PyIpError {
+    let strict = ctor.ends_with("s")
+    if ctor.starts_with("v4") {
+        return try pyipaddress.ipv4_network(text, strict)
+    }
+    if ctor.starts_with("v6") {
+        return try pyipaddress.ipv6_network(text, strict)
+    }
+    return try pyipaddress.ip_network(text, strict)
+}
+
+/// The `kind:ctor:hex` argument's constructor and text.
+fn pi_spec(s: str) -> [str] {
+    let p = s.split(":")
+    return [p[0], p[1], unhex(p[2])]
+}
+
+fn pi_arg_addr(s: str) -> PyIpAddress ! PyIpError {
+    let p = pi_spec(s)
+    return try pi_addr(p[1], p[2])
+}
+
+fn pi_arg_net(s: str) -> PyIpNetwork ! PyIpError {
+    let p = pi_spec(s)
+    return try pi_net(p[1], p[2])
+}
+
+fn pi_arg_iface(s: str) -> PyIpInterface ! PyIpError {
+    let p = pi_spec(s)
+    return try pi_iface(p[1], p[2])
+}
+
+fn pi_cmp6(eq: bool, lt: bool ! PyIpError, le: bool ! PyIpError, gt: bool ! PyIpError, ge: bool ! PyIpError) -> str {
+    return [pi_b(eq), pi_b(not eq), pi_bool(lt), pi_bool(le), pi_bool(gt), pi_bool(ge)].map(|t| t + ";").join("")
+}
+
+fn pi_cmp(f: [str]) -> str ! PyIpError {
+    let kind = f[1].substr(0, 1)
+    if kind == "A" {
+        let x = try pi_arg_addr(f[1])
+        let y = try pi_arg_addr(f[2])
+        return pi_cmp6(pyipaddress.address_eq(x, y), pyipaddress.address_lt(x, y), pyipaddress.address_le(x, y), pyipaddress.address_gt(x, y),
+            pyipaddress.address_ge(x, y))
+    }
+    if kind == "N" {
+        let x = try pi_arg_net(f[1])
+        let y = try pi_arg_net(f[2])
+        return pi_cmp6(pyipaddress.network_eq(x, y), pyipaddress.network_lt(x, y), pyipaddress.network_le(x, y), pyipaddress.network_gt(x, y),
+            pyipaddress.network_ge(x, y))
+    }
+    let x = try pi_arg_iface(f[1])
+    let y = try pi_arg_iface(f[2])
+    return pi_cmp6(pyipaddress.interface_eq(x, y), pyipaddress.interface_lt(x, y), pyipaddress.interface_le(x, y), pyipaddress.interface_gt(x, y),
+        pyipaddress.interface_ge(x, y))
+}
+
+fn pi_nets(ns: [PyIpNetwork]) -> str {
+    return ns.map(|n| pyipaddress.network_repr(n)).join(",")
+}
+
+fn pi_first(ns: [PyIpNetwork], k: i64) -> str {
+    let shown = ns.slice(0, if ns.len() > k { k } else { ns.len() })
+    return pi_nets(shown) + (if ns.len() > k { "+" } else { "" })
+}
+
+fn pi_opt_int(s: str) -> Option[i64] {
+    return if s == "-" { None } else { s.parse_int() }
+}
+
+fn pi_compare(r: i64 ! PyIpError) -> str {
+    return match r {
+        Ok(v) -> v.to_str()
+        Err(e) -> pi_err(e)
+    }
+}
+
+fn pi_nn(f: [str]) -> str ! PyIpError {
+    let x = try pi_arg_net(f[1])
+    let y = try pi_arg_net(f[2])
+    return [pi_b(pyipaddress.overlaps(x, y)), pi_bool(pyipaddress.subnet_of(x, y)), pi_bool(pyipaddress.supernet_of(x, y)),
+        pi_compare(pyipaddress.compare_networks(x, y))].join(";")
+}
+
+fn pi_arith(f: [str]) -> str ! PyIpError {
+    var d = bigint.parse(f[2]) ?? bigint.zero()
+    if f[0] == "SUB" {
+        d = bigint.negate(d)
+    }
+    if f[1].starts_with("I") {
+        return pyipaddress.interface_repr(try pyipaddress.interface_add(try pi_arg_iface(f[1]), d))
+    }
+    return pyipaddress.address_repr(try pyipaddress.address_add(try pi_arg_addr(f[1]), d))
+}
+
+fn pi_item(s: str) -> PyIpItem ! PyIpError {
+    if s.starts_with("N") {
+        return PyIpNetworkItem(try pi_arg_net(s))
+    }
+    return PyIpAddressItem(try pi_arg_addr(s))
+}
+
+fn pi_collapse(f: [str]) -> str ! PyIpError {
+    var items: [PyIpItem] = []
+    for s in f.slice(1, f.len()) {
+        items.push(try pi_item(s))
+    }
+    return pi_nets(try pyipaddress.collapse_addresses(items))
+}
+
+fn pi_format(f: [str]) -> str ! PyIpError {
+    if f[1].starts_with("I") {
+        return try pyipaddress.format_interface(try pi_arg_iface(f[1]), unhex(f[2]))
+    }
+    return try pyipaddress.format_address(try pi_arg_addr(f[1]), unhex(f[2]))
+}
+
+fn pi_from(f: [str]) -> str ! PyIpError {
+    let v = if f[1] == "4" { 4 } else { 6 }
+    if f[0] == "AI" {
+        return pi_addr_desc(try pyipaddress.from_int(v, bigint.parse(f[2]) ?? bigint.zero()))
+    }
+    return pi_addr_desc(try pyipaddress.from_packed(v, bytes_of(unhex_list(f[2]))))
+}
+
+fn pi_answer(f: [str]) -> str ! PyIpError {
+    let op = f[0]
+    if op == "A" {
+        return pi_addr_desc(try pi_addr(f[1], unhex(f[2])))
+    }
+    if op == "I" {
+        return pi_iface_desc(try pi_iface(f[1], unhex(f[2])))
+    }
+    if op == "N" {
+        return pi_net_desc(try pi_net(f[1], unhex(f[2])))
+    }
+    if op == "AI" or op == "AP" {
+        return try pi_from(f)
+    }
+    if op == "ADD" or op == "SUB" {
+        return try pi_arith(f)
+    }
+    if op == "CMP" {
+        return try pi_cmp(f)
+    }
+    if op == "GI" {
+        return pyipaddress.address_repr(try pyipaddress.network_index(try pi_arg_net(f[1]), bigint.parse(f[2]) ?? bigint.zero()))
+    }
+    if op == "SUBN" {
+        return pi_first(try pyipaddress.subnets(try pi_arg_net(f[1]), f[2].parse_int() ?? 1, pi_opt_int(f[3]), 5), 4)
+    }
+    if op == "SUPN" {
+        return pyipaddress.network_repr(try pyipaddress.supernet(try pi_arg_net(f[1]), f[2].parse_int() ?? 1, pi_opt_int(f[3])))
+    }
+    if op == "EXC" {
+        return pi_nets(try pyipaddress.address_exclude(try pi_arg_net(f[1]), try pi_arg_net(f[2])))
+    }
+    if op == "NN" {
+        return try pi_nn(f)
+    }
+    if op == "IN" {
+        let n = try pi_arg_net(f[1])
+        return pi_b(pyipaddress.contains(n, try pi_arg_addr(f[2])))
+    }
+    if op == "SAR" {
+        let a = try pi_arg_addr(f[1])
+        return pi_nets(try pyipaddress.summarize_address_range(a, try pi_arg_addr(f[2])))
+    }
+    if op == "COL" {
+        return try pi_collapse(f)
+    }
+    return try pi_format(f)
+}
+
+fn pyipaddress_line(f: [str]) -> str {
+    return hex_text(pi_try(pi_answer(f)))
+}
+
+fn ps_list(xs: [str]) -> str {
+    return "L" + xs.map(|x| hex_text(x)).join(",")
+}
+
+fn ps_err(e: PyStrError) -> str {
+    return "E:" + pystr.error_class(e) + ":" + pystr.error_text(e)
+}
+
+fn ps_opt_text(h: str) -> Option[str] {
+    return if h == "N" { None } else { Some(unhex(h)) }
+}
+
+fn ps_opt_int(h: str) -> Option[i64] {
+    return if h == "N" { None } else { h.parse_int() }
+}
+
+fn ps_lists(r: [str] ! PyStrError) -> str {
+    return match r {
+        Ok(xs) -> ps_list(xs)
+        Err(e) -> ps_err(e)
+    }
+}
+
+fn ps_text(r: str ! PyStrError) -> str {
+    return match r {
+        Ok(t) -> "S" + hex_text(t)
+        Err(e) -> ps_err(e)
+    }
+}
+
+fn ps_triple(r: (str, str, str) ! PyStrError) -> str {
+    return match r {
+        Ok(t) -> ps_list([t.0, t.1, t.2])
+        Err(e) -> ps_err(e)
+    }
+}
+
+fn ps_cps(cs: [i64]) -> str {
+    return cs.map(|c| c.to_base(16)).join(".")
+}
+
+fn ps_table(lo: i64, hi: i64) -> str {
+    var out: [str] = []
+    for cp in lo..hi {
+        if cp >= 55296 and cp <= 57343 {
+            continue
+        }
+        let lw = pystr.case_mapping(cp, 0)
+        let up = pystr.case_mapping(cp, 1)
+        let ti = pystr.case_mapping(cp, 2)
+        let flags = (if pystr.is_cased(cp) { 1 } else { 0 }) + (if pystr.is_case_ignorable(cp) { 2 } else { 0 })
+        let same = [cp]
+        if lw != same or up != same or ti != same or flags != 0 {
+            out.push(cp.to_base(16) + ":" + ps_cps(lw) + "/" + ps_cps(up) + "/" + ps_cps(ti) + "/{flags}")
+        }
+    }
+    return out.join(",")
+}
+
+fn ps_indexed(forward: bool, s: str, sub: str, a: Option[i64], b: Option[i64]) -> i64 ! PyStrError {
+    if forward {
+        return try pystr.index(s, sub, a, b)
+    }
+    return try pystr.rindex(s, sub, a, b)
+}
+
+fn ps_search(op: str, s: str, sub: str, a: Option[i64], b: Option[i64]) -> str {
+    if op == "find" {
+        return pystr.find(s, sub, a, b).to_str()
+    }
+    if op == "rfind" {
+        return pystr.rfind(s, sub, a, b).to_str()
+    }
+    if op == "count" {
+        return pystr.count(s, sub, a, b).to_str()
+    }
+    if op == "startswith" {
+        return if pystr.startswith(s, sub, a, b) { "T" } else { "F" }
+    }
+    if op == "endswith" {
+        return if pystr.endswith(s, sub, a, b) { "T" } else { "F" }
+    }
+    return match ps_indexed(op == "index", s, sub, a, b) {
+        Ok(i) -> i.to_str()
+        Err(e) -> ps_err(e)
+    }
+}
+
+fn ps_case(op: str, s: str) -> str {
+    let t = if op == "upper" {
+        pystr.upper(s)
+    } else if op == "lower" {
+        pystr.lower(s)
+    } else if op == "title" {
+        pystr.title(s)
+    } else if op == "capitalize" {
+        pystr.capitalize(s)
+    } else {
+        pystr.swapcase(s)
+    }
+    return "S" + hex_text(t)
+}
+
+fn ps_pad(op: str, s: str, width: i64, fill: str) -> str {
+    if op == "center" {
+        return ps_text(pystr.center(s, width, fill))
+    }
+    if op == "ljust" {
+        return ps_text(pystr.ljust(s, width, fill))
+    }
+    return ps_text(pystr.rjust(s, width, fill))
+}
+
+fn ps_strip(op: str, s: str, chars: Option[str]) -> str {
+    let t = if op == "strip" { pystr.strip(s, chars) } else if op == "lstrip" { pystr.lstrip(s, chars) } else { pystr.rstrip(s, chars) }
+    return "S" + hex_text(t)
+}
+
+fn pystr_line(f: [str]) -> str {
+    let op = f[0]
+    if op == "rg" {
+        return ps_table(f[1].parse_int_base(16) ?? 0, f[2].parse_int_base(16) ?? 0)
+    }
+    let s = unhex(f[1])
+    if op == "sp" {
+        return ps_lists(pystr.split(s, ps_opt_text(f[2]), f[3].parse_int() ?? 0 - 1))
+    }
+    if op == "rsp" {
+        return ps_lists(pystr.rsplit(s, ps_opt_text(f[2]), f[3].parse_int() ?? 0 - 1))
+    }
+    if op == "sl" {
+        return ps_list(pystr.splitlines(s, f[2] == "1"))
+    }
+    if op == "strip" or op == "lstrip" or op == "rstrip" {
+        return ps_strip(op, s, ps_opt_text(f[2]))
+    }
+    if op == "exp" {
+        return "S" + hex_text(pystr.expandtabs(s, f[2].parse_int() ?? 8))
+    }
+    if op == "part" {
+        return ps_triple(pystr.partition(s, unhex(f[2])))
+    }
+    if op == "rpart" {
+        return ps_triple(pystr.rpartition(s, unhex(f[2])))
+    }
+    if op == "center" or op == "ljust" or op == "rjust" {
+        return ps_pad(op, s, f[2].parse_int() ?? 0, unhex(f[3]))
+    }
+    if op == "zfill" {
+        return "S" + hex_text(pystr.zfill(s, f[2].parse_int() ?? 0))
+    }
+    if op == "replace" {
+        return "S" + hex_text(pystr.replace(s, unhex(f[2]), unhex(f[3]), f[4].parse_int() ?? 0 - 1))
+    }
+    if f.len() == 5 {
+        return ps_search(op, s, unhex(f[2]), ps_opt_int(f[3]), ps_opt_int(f[4]))
+    }
+    return ps_case(op, s)
+}
+
+fn main() / {io} {
+    let argv = args()
+    var i = 0
+    while i + 1 < argv.len() {
+        let op = argv[i]
+        let text = match read_bytes(argv[i + 1]) {
+            Ok(d) -> d.to_str()
+            Err(_e) -> ""
+        }
+        for l in text.split("\n").filter(|l| l.len() > 0) {
+            let parts = l.split(" ")
+            let rest = parts.slice(1, parts.len())
+            if op == "rustpath" {
+                print(rustpath_line(rest))
+            }
+            if op == "perlparsewords" {
+                print(perlparsewords_line(rest))
+            }
+            if op == "rubyfloat" {
+                print(rubyfloat_line(rest))
+            }
+            if op == "rustescape" {
+                print(rustescape_line(rest))
+            }
+            if op == "perltextwrap" {
+                print(perltextwrap_line(rest))
+            }
+            if op == "pyipaddress" {
+                print(pyipaddress_line(rest))
+            }
+            if op == "pystr" {
+                print(pystr_line(rest))
+            }
+            if op == "lispnumbers" {
+                print(lispnumbers_line(rest))
+            }
+        }
+        i = i + 2
+    }
+}

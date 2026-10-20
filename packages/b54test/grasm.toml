@@ -1,0 +1,64 @@
+[package]
+name = "b54test"
+version = "1.0.0"
+capabilities = ["io"]
+
+[dependencies.sqlitedatetime]
+path = "../sqlitedatetime"
+version = "^1.0.0"
+
+[dependencies.bigint]
+path = "../bigint"
+version = "^1.0.0"
+
+[dependencies.pymath]
+path = "../pymath"
+version = "^1.0.0"
+
+[dependencies.luapattern]
+path = "../luapattern"
+version = "^1.0.0"
+
+[dependencies.goflag]
+path = "../goflag"
+version = "^1.0.0"
+
+[dependencies.gostrconv]
+path = "../gostrconv"
+version = "^1.0.0"
+
+[dependencies.goduration]
+path = "../goduration"
+version = "^1.0.0"
+
+[dependencies.goquote]
+path = "../goquote"
+version = "^1.0.0"
+
+[dependencies.nodeparseargs]
+path = "../nodeparseargs"
+version = "^1.0.0"
+
+[dependencies.perlversion]
+path = "../perlversion"
+version = "^1.0.0"
+
+[dependencies.rustnum]
+path = "../rustnum"
+version = "^1.0.0"
+
+[dependencies.shortestfloat]
+path = "../shortestfloat"
+version = "^1.0.0"
+
+[dependencies.javalocaldate]
+path = "../javalocaldate"
+version = "^1.0.0"
+
+[dependencies.perldumper]
+path = "../perldumper"
+version = "^1.0.0"
+
+[dependencies.sqliteprintf]
+path = "../sqliteprintf"
+version = "^1.0.0"

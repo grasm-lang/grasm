@@ -1,0 +1,4 @@
+[package]
+name = "perlmimebase64"
+version = "1.0.0"
+capabilities = []

@@ -1,0 +1,292 @@
+// Java's `application/x-www-form-urlencoded` codec, as Java 17's
+// `java.net.URLEncoder.encode(s, UTF_8)` and `URLDecoder.decode(s,
+// UTF_8)` compute it, exception messages included.
+//
+// Servlet containers, Spring and most Java HTTP clients encode form fields
+// and query strings with these two, and something talking to a Java
+// service -- or replacing one -- has to produce and accept the same text:
+//
+//   - `encode` keeps ASCII letters, digits and `-_.*`, writes a space as
+//     `+`, and every other character as its UTF-8 bytes in upper-case
+//     `%XX`, so `~` and `'` are escaped where JavaScript would not.
+//   - `decode` turns `+` into a space and each run of `%XY` escapes into
+//     bytes, which are decoded as UTF-8 the way `new String(bytes, UTF_8)`
+//     does: a malformed sequence becomes U+FFFD, a truncated one at the end
+//     of a run becomes one U+FFFD, and an encoded surrogate becomes one
+//     U+FFFD for all three bytes.
+//   - The two characters after `%` are read by `Integer.parseInt(s, i, i +
+//     2, 16)`: a leading `+` is accepted (`%+F` is byte 15), `-` gives
+//     "negative value" (but `%-0` is byte 0), and any Unicode decimal digit
+//     or full-width `Ａ`-`Ｆ` counts as a hex digit, as `Character.digit`
+//     says. Anything else is `URLDecoder: Illegal hex characters in escape
+//     (%) pattern - Error at index N in: "XY"`, counted in UTF-16 units, a
+//     split surrogate pair printed as `?` as Java's UTF-8 output writes it.
+//   - A `%` with fewer than two characters after it is `URLDecoder:
+//     Incomplete trailing escape (%) pattern`.
+//
+// Text is Grasm text, so a Java string holding an unpaired surrogate (which
+// `encode` writes as `%3F`) cannot be passed in; that is the one input
+// Java accepts that this does not.
+
+type JavaUrlError = | JavaUrlIllegal(message: str)
+
+/// The exception's message.
+pub fn error_text(e: JavaUrlError) -> str {
+    return match e {
+        JavaUrlIllegal(m) -> m
+    }
+}
+
+fn safe(c: i64) -> bool {
+    return (c >= 97 and c <= 122) or (c >= 65 and c <= 90) or (c >= 48 and c <= 57) or c == 45 or c == 95 or c == 46 or c == 42
+}
+
+/// `URLEncoder.encode(s, StandardCharsets.UTF_8)`.
+pub fn encode(s: str) -> str {
+    let digits = "0123456789ABCDEF"
+    var out = ""
+    for c in s.codes() {
+        if c == 32 {
+            out = out + "+"
+        } else if safe(c) {
+            out = out + c.to_char()
+        } else {
+            for b in c.to_char().to_bytes().to_list() {
+                out = out + "%" + digits.substr(b.shr(4), 1) + digits.substr(b.bit_and(15), 1)
+            }
+        }
+    }
+    return out
+}
+
+/// The text as Java holds it: UTF-16 code units.
+fn utf16(s: str) -> [i64] {
+    var u: [i64] = []
+    for c in s.codes() {
+        if c >= 65536 {
+            u.push(55296 + (c - 65536).shr(10))
+            u.push(56320 + (c - 65536).bit_and(1023))
+        } else {
+            u.push(c)
+        }
+    }
+    return u
+}
+
+/// UTF-16 units back to text, an unpaired surrogate written as `?`, as
+/// `getBytes(UTF_8)` writes it.
+fn text16(u: [i64]) -> str {
+    var out = ""
+    var i = 0
+    while i < u.len() {
+        let c = u[i]
+        if c >= 55296 and c <= 56319 and i + 1 < u.len() and u[i + 1] >= 56320 and u[i + 1] <= 57343 {
+            out = out + (65536 + (c - 55296).shl(10) + (u[i + 1] - 56320)).to_char()
+            i = i + 2
+        } else {
+            out = out + (if c >= 55296 and c <= 57343 { "?" } else { c.to_char() })
+            i = i + 1
+        }
+    }
+    return out
+}
+
+/// `Character.digit(c, 16)`.
+fn digit16(t: [i64], c: i64) -> i64 {
+    var k = 0
+    while k < t.len() {
+        if c >= t[k] and c <= t[k + 1] {
+            return t[k + 2] + (c - t[k])
+        }
+        k = k + 3
+    }
+    return 0 - 1
+}
+
+fn illegal(u: [i64], begin: i64, at: i64) -> JavaUrlError {
+    return JavaUrlIllegal("URLDecoder: Illegal hex characters in escape (%) pattern - Error at index " + (at - begin).to_str() + " in: \"" +
+        text16(u.slice(begin, begin + 2)) + "\"")
+}
+
+/// `Integer.parseInt(s, begin, begin + 2, 16)`.
+fn parse_hex2(t: [i64], u: [i64], begin: i64) -> i64 ! JavaUrlError {
+    let end = begin + 2
+    var i = begin
+    var negative = false
+    let first = u[i]
+    if first < 48 {
+        if first == 45 {
+            negative = true
+        } else if first != 43 {
+            fail(illegal(u, begin, i))
+        }
+        i = i + 1
+        if i == end {
+            fail(illegal(u, begin, i))
+        }
+    }
+    var result = 0
+    while i < end {
+        let d = digit16(t, u[i])
+        if d < 0 {
+            fail(illegal(u, begin, i))
+        }
+        result = result * 16 - d
+        i = i + 1
+    }
+    return if negative { result } else { 0 - result }
+}
+
+fn cont(b: i64) -> bool {
+    return b.bit_and(192) == 128
+}
+
+fn malformed3(src: [i64], sp: i64) -> i64 {
+    let b1 = src[sp]
+    let b2 = src[sp + 1]
+    return if (b1 == 224 and b2.bit_and(224) == 128) or not cont(b2) { 1 } else { 2 }
+}
+
+fn malformed4(src: [i64], sp: i64) -> i64 {
+    let b1 = src[sp]
+    let b2 = src[sp + 1]
+    if b1 > 244 or (b1 == 240 and (b2 < 144 or b2 > 191)) or (b1 == 244 and b2.bit_and(240) != 128) or not cont(b2) {
+        return 1
+    }
+    return if not cont(src[sp + 2]) { 2 } else { 3 }
+}
+
+/// The three-byte case of Java's decoder: the code points it writes and
+/// where it goes on, -1 to stop.
+fn decode3(src: [i64], at: i64) -> ([i64], i64) {
+    let b1 = src[at]
+    let sl = src.len()
+    var sp = at + 1
+    if sp + 1 < sl {
+        let b2 = src[sp]
+        let b3 = src[sp + 1]
+        if (b1 == 224 and b2.bit_and(224) == 128) or not cont(b2) or not cont(b3) {
+            return ([65533], at + malformed3(src, at))
+        }
+        let c = b1.bit_and(15).shl(12).bit_or(b2.bit_and(63).shl(6)).bit_or(b3.bit_and(63))
+        return ([if c >= 55296 and c <= 57343 { 65533 } else { c }], sp + 2)
+    }
+    if sp < sl and ((b1 == 224 and src[sp].bit_and(224) == 128) or not cont(src[sp])) {
+        return ([65533], sp)
+    }
+    return ([65533], 0 - 1)
+}
+
+/// The four-byte case of Java's decoder.
+fn decode4(src: [i64], at: i64) -> ([i64], i64) {
+    let b1 = src[at]
+    let sl = src.len()
+    var sp = at + 1
+    if sp + 2 < sl {
+        let b2 = src[sp]
+        let b3 = src[sp + 1]
+        let b4 = src[sp + 2]
+        let uc = b1.bit_and(7).shl(18).bit_or(b2.bit_and(63).shl(12)).bit_or(b3.bit_and(63).shl(6)).bit_or(b4.bit_and(63))
+        if not cont(b2) or not cont(b3) or not cont(b4) or uc < 65536 or uc > 1114111 {
+            return ([65533], at + malformed4(src, at))
+        }
+        return ([uc], sp + 3)
+    }
+    if b1 > 244 or (sp < sl and ((b1 == 240 and (src[sp] < 144 or src[sp] > 191)) or (b1 == 244 and src[sp].bit_and(240) != 128) or not cont(src[sp]))) {
+        return ([65533], sp)
+    }
+    sp = sp + 1
+    if sp < sl and not cont(src[sp]) {
+        return ([65533], sp)
+    }
+    return ([65533], 0 - 1)
+}
+
+/// `new String(bytes, UTF_8)`, as code points.
+fn java_utf8(src: [i64]) -> [i64] {
+    var out: [i64] = []
+    var sp = 0
+    while sp >= 0 and sp < src.len() {
+        let b1 = src[sp]
+        if b1 < 128 {
+            out.push(b1)
+            sp = sp + 1
+        } else if b1 >= 194 and b1 <= 223 {
+            if sp + 1 < src.len() {
+                let b2 = src[sp + 1]
+                if not cont(b2) {
+                    out.push(65533)
+                    sp = sp + 1
+                } else {
+                    out.push(b1.bit_and(31).shl(6).bit_or(b2.bit_and(63)))
+                    sp = sp + 2
+                }
+            } else {
+                out.push(65533)
+                sp = 0 - 1
+            }
+        } else if b1 >= 224 and b1 <= 247 {
+            let (cs, next) = if b1 <= 239 { decode3(src, sp) } else { decode4(src, sp) }
+            for c in cs {
+                out.push(c)
+            }
+            sp = next
+        } else {
+            out.push(65533)
+            sp = sp + 1
+        }
+    }
+    return out
+}
+
+/// `URLDecoder.decode(s, StandardCharsets.UTF_8)`.
+pub fn decode(s: str) -> str ! JavaUrlError {
+    let t = digit_ranges()
+    let u = utf16(s)
+    let n = u.len()
+    var out: [i64] = []
+    var i = 0
+    while i < n {
+        var c = u[i]
+        if c == 43 {
+            out.push(32)
+            i = i + 1
+        } else if c == 37 {
+            var raw: [i64] = []
+            while i + 2 < n and c == 37 {
+                let v = try parse_hex2(t, u, i + 1)
+                if v < 0 {
+                    fail(JavaUrlIllegal("URLDecoder: Illegal hex characters in escape (%) pattern - negative value"))
+                }
+                raw.push(v)
+                i = i + 3
+                if i < n {
+                    c = u[i]
+                }
+            }
+            if i < n and c == 37 {
+                fail(JavaUrlIllegal("URLDecoder: Incomplete trailing escape (%) pattern"))
+            }
+            for cp in java_utf8(raw) {
+                for unit in utf16(cp.to_char()) {
+                    out.push(unit)
+                }
+            }
+        } else {
+            out.push(c)
+            i = i + 1
+        }
+    }
+    return text16(out)
+}
+
+/// `Character.digit(c, 16)` for each UTF-16 unit: lo, hi, value at lo.
+fn digit_ranges() -> [i64] {
+    return [
+        48, 57, 0, 65, 70, 10, 97, 102, 10, 1632, 1641, 0, 1776, 1785, 0, 1984, 1993, 0, 2406, 2415, 0, 2534, 2543, 0, 2662, 2671,
+        0, 2790, 2799, 0, 2918, 2927, 0, 3046, 3055, 0, 3174, 3183, 0, 3302, 3311, 0, 3430, 3439, 0, 3558, 3567, 0, 3664, 3673, 0,
+        3792, 3801, 0, 3872, 3881, 0, 4160, 4169, 0, 4240, 4249, 0, 6112, 6121, 0, 6160, 6169, 0, 6470, 6479, 0, 6608, 6617, 0,
+        6784, 6793, 0, 6800, 6809, 0, 6992, 7001, 0, 7088, 7097, 0, 7232, 7241, 0, 7248, 7257, 0, 42528, 42537, 0, 43216, 43225,
+        0, 43264, 43273, 0, 43472, 43481, 0, 43504, 43513, 0, 43600, 43609, 0, 44016, 44025, 0, 65296, 65305, 0, 65313, 65318, 10,
+        65345, 65350, 10]
+}

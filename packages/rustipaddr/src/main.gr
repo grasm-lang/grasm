@@ -1,0 +1,589 @@
+// Rust's `std::net` addresses, as Rust 1.99 has them: `FromStr` for
+// `IpAddr`, `Ipv4Addr`, `Ipv6Addr`, `SocketAddr`, `SocketAddrV4` and
+// `SocketAddrV6` with their error messages, `Display` (with width, fill,
+// alignment and precision), and the stable classification methods.
+//
+// Rust services print and parse addresses with these, so a tool that reads
+// their configuration or logs, or writes addresses a Rust program will
+// read, has to accept exactly the same strings and print the same text:
+//
+//   - **Parsing** takes dotted quads with one to three digits and no
+//     leading zero (`01.2.3.4` is refused), hex groups of one to four
+//     digits in either case, one `::`, and a dotted quad only as the last
+//     two groups (`::ffff:1.2.3.4`, `::1.2.3.4`). A socket address is
+//     `a.b.c.d:port` or `[v6%scope]:port`; ports and scopes may have
+//     leading zeros. The errors are Rust's: "invalid IPv4 address syntax",
+//     "invalid IPv6 socket address syntax", and so on.
+//   - **Display** compresses the longest run of two or more zero groups
+//     (the first, on a tie) into `::`, writes lowercase hex, and prints an
+//     IPv4-mapped address as `::ffff:1.2.3.4`; an IPv4-compatible one
+//     (`::1.2.3.4`) prints in hex (`::102:304`). A socket address shows
+//     its scope as `%n` when it is not zero. Width pads (on the right by
+//     default), and a precision cuts the text: `{:.3}` of 127.0.0.1 is
+//     `127`.
+//   - **Classification**: `is_unspecified`, `is_loopback`, `is_private`,
+//     `is_link_local`, `is_multicast`, `is_broadcast`,
+//     `is_documentation`, `to_ipv6_compatible`, `to_ipv6_mapped` for IPv4;
+//     `is_unspecified`, `is_loopback`, `is_unique_local`,
+//     `is_unicast_link_local`, `is_multicast`, `to_ipv4_mapped`,
+//     `to_ipv4` and `to_canonical` for IPv6. The unstable ones
+//     (`is_global`, `is_shared`, ...) are not here.
+//
+// Checked against `rustc` 1.99 on generated programs calling the methods.
+
+/// An IPv4 address: its 32 bits.
+type RustIpv4Addr = { bits: i64 }
+
+/// An IPv6 address: its eight 16-bit groups.
+type RustIpv6Addr = { segments: [i64] }
+
+type RustIpAddr = | RustIpV4(a: RustIpv4Addr) | RustIpV6(a: RustIpv6Addr)
+
+type RustSocketAddrV4 = { ip: RustIpv4Addr, port: i64 }
+
+type RustSocketAddrV6 = { ip: RustIpv6Addr, port: i64, flowinfo: i64, scope_id: i64 }
+
+type RustSocketAddr = | RustSockV4(a: RustSocketAddrV4) | RustSockV6(a: RustSocketAddrV6)
+
+/// Which parse failed; `parse_error_text` gives Rust's message.
+type RustAddrParseError = | RustAddrBadIp | RustAddrBadIpv4 | RustAddrBadIpv6 | RustAddrBadSocket | RustAddrBadSocketV4 | RustAddrBadSocketV6
+
+pub fn parse_error_text(e: RustAddrParseError) -> str {
+    return match e {
+        RustAddrBadIp -> "invalid IP address syntax"
+        RustAddrBadIpv4 -> "invalid IPv4 address syntax"
+        RustAddrBadIpv6 -> "invalid IPv6 address syntax"
+        RustAddrBadSocket -> "invalid socket address syntax"
+        RustAddrBadSocketV4 -> "invalid IPv4 socket address syntax"
+        RustAddrBadSocketV6 -> "invalid IPv6 socket address syntax"
+    }
+}
+
+// --- parsing ------------------------------------------------------------------------------------------
+
+fn at(cs: [str], i: i64) -> str {
+    return if i < cs.len() { cs[i] } else { "" }
+}
+
+fn digit(c: str, radix: i64) -> Option[i64] {
+    if c.len() != 1 {
+        return None
+    }
+    let d = "0123456789".index_of(c)
+    if d.is_some() or radix != 16 {
+        return d
+    }
+    return match "abcdef".index_of(c) {
+        Some(l) -> Some(10 + l)
+        None -> match "ABCDEF".index_of(c) {
+            Some(u) -> Some(10 + u)
+            None -> None
+        }
+    }
+}
+
+/// read_radix_max_digits: a number of up to `max_digits` digits, no more
+/// than `max_value`; a leading zero only if allowed.
+fn read_radix(cs: [str], p0: i64, radix: i64, max_digits: i64, zero_prefix: bool, max_value: i64) -> Option[(i64, i64)] {
+    let first = match digit(at(cs, p0), radix) {
+        Some(d) -> d
+        None -> return None
+    }
+    var result = first
+    var count = 1
+    var p = p0 + 1
+    while digit(at(cs, p), radix).is_some() {
+        if count >= max_digits {
+            return None
+        }
+        result = result * radix + (digit(at(cs, p), radix) ?? 0)
+        count = count + 1
+        p = p + 1
+    }
+    if not zero_prefix and first == 0 and count > 1 or result > max_value {
+        return None
+    }
+    return Some((result, p))
+}
+
+/// read_decimal: any number of digits, no more than `max_value`.
+fn read_decimal(cs: [str], p0: i64, max_value: i64) -> Option[(i64, i64)] {
+    var result = match digit(at(cs, p0), 10) {
+        Some(d) -> d
+        None -> return None
+    }
+    var p = p0 + 1
+    while digit(at(cs, p), 10).is_some() {
+        result = result * 10 + (digit(at(cs, p), 10) ?? 0)
+        if result > max_value {
+            return None
+        }
+        p = p + 1
+    }
+    return Some((result, p))
+}
+
+fn read_ipv4(cs: [str], p0: i64) -> Option[(i64, i64)] {
+    var bits = 0
+    var p = p0
+    var i = 0
+    while i < 4 {
+        if i > 0 {
+            if at(cs, p) != "." {
+                return None
+            }
+            p = p + 1
+        }
+        match read_radix(cs, p, 10, 3, false, 255) {
+            Some(r) -> {
+                bits = bits * 256 + r.0
+                p = r.1
+            }
+            None -> return None
+        }
+        i = i + 1
+    }
+    return Some((bits, p))
+}
+
+/// The groups read before (or after) the `::`: their values, where the
+/// reading stopped, and whether it ended with a dotted quad.
+type RustIpGroups = { groups: [i64], end: i64, ipv4: bool }
+
+fn read_groups(cs: [str], p0: i64, limit: i64) -> RustIpGroups {
+    var groups: [i64] = []
+    var p = p0
+    var i = 0
+    while i < limit {
+        let sep_ok = i == 0 or at(cs, p) == ":"
+        let start = if i == 0 { p } else { p + 1 }
+        if sep_ok and i < limit - 1 {
+            match read_ipv4(cs, start) {
+                Some(r) -> {
+                    groups.push(r.0.shr(16))
+                    groups.push(r.0.bit_and(65535))
+                    return RustIpGroups{ groups: groups, end: r.1, ipv4: true }
+                }
+                None -> {}
+            }
+        }
+        if not sep_ok {
+            return RustIpGroups{ groups: groups, end: p, ipv4: false }
+        }
+        match read_radix(cs, start, 16, 4, true, 65535) {
+            Some(r) -> {
+                groups.push(r.0)
+                p = r.1
+            }
+            None -> return RustIpGroups{ groups: groups, end: p, ipv4: false }
+        }
+        i = i + 1
+    }
+    return RustIpGroups{ groups: groups, end: p, ipv4: false }
+}
+
+fn read_ipv6(cs: [str], p0: i64) -> Option[(RustIpv6Addr, i64)] {
+    let head = read_groups(cs, p0, 8)
+    if head.groups.len() == 8 {
+        return Some((RustIpv6Addr{ segments: head.groups }, head.end))
+    }
+    if head.ipv4 or at(cs, head.end) != ":" or at(cs, head.end + 1) != ":" {
+        return None
+    }
+    let tail = read_groups(cs, head.end + 2, 8 - (head.groups.len() + 1))
+    var segs = head.groups
+    while segs.len() + tail.groups.len() < 8 {
+        segs.push(0)
+    }
+    return Some((RustIpv6Addr{ segments: segs + tail.groups }, tail.end))
+}
+
+fn read_port(cs: [str], p: i64) -> Option[(i64, i64)] {
+    if at(cs, p) != ":" {
+        return None
+    }
+    return read_decimal(cs, p + 1, 65535)
+}
+
+fn read_socket_v4(cs: [str], p0: i64) -> Option[(RustSocketAddrV4, i64)] {
+    let ip = match read_ipv4(cs, p0) {
+        Some(r) -> r
+        None -> return None
+    }
+    return match read_port(cs, ip.1) {
+        Some(port) -> Some((RustSocketAddrV4{ ip: RustIpv4Addr{ bits: ip.0 }, port: port.0 }, port.1))
+        None -> None
+    }
+}
+
+fn read_socket_v6(cs: [str], p0: i64) -> Option[(RustSocketAddrV6, i64)] {
+    if at(cs, p0) != "[" {
+        return None
+    }
+    let ip = match read_ipv6(cs, p0 + 1) {
+        Some(r) -> r
+        None -> return None
+    }
+    var p = ip.1
+    var scope = 0
+    if at(cs, p) == "%" {
+        match read_decimal(cs, p + 1, 4294967295) {
+            Some(r) -> {
+                scope = r.0
+                p = r.1
+            }
+            None -> {}
+        }
+    }
+    if at(cs, p) != "]" {
+        return None
+    }
+    return match read_port(cs, p + 1) {
+        Some(port) -> Some((RustSocketAddrV6{ ip: ip.0, port: port.0, flowinfo: 0, scope_id: scope }, port.1))
+        None -> None
+    }
+}
+
+/// `s.parse::<Ipv4Addr>()`.
+pub fn parse_ipv4(s: str) -> RustIpv4Addr ! RustAddrParseError {
+    let cs = s.chars()
+    if s.byte_len() > 15 {
+        fail(RustAddrBadIpv4)
+    }
+    return match read_ipv4(cs, 0) {
+        Some(r) -> if r.1 == cs.len() { RustIpv4Addr{ bits: r.0 } } else { fail(RustAddrBadIpv4) }
+        None -> fail(RustAddrBadIpv4)
+    }
+}
+
+/// `s.parse::<Ipv6Addr>()`.
+pub fn parse_ipv6(s: str) -> RustIpv6Addr ! RustAddrParseError {
+    let cs = s.chars()
+    return match read_ipv6(cs, 0) {
+        Some(r) -> if r.1 == cs.len() { r.0 } else { fail(RustAddrBadIpv6) }
+        None -> fail(RustAddrBadIpv6)
+    }
+}
+
+/// `s.parse::<IpAddr>()`: IPv4 if a dotted quad starts it, else IPv6.
+pub fn parse_ip(s: str) -> RustIpAddr ! RustAddrParseError {
+    let cs = s.chars()
+    match read_ipv4(cs, 0) {
+        Some(r) -> return if r.1 == cs.len() { RustIpV4(RustIpv4Addr{ bits: r.0 }) } else { fail(RustAddrBadIp) }
+        None -> {}
+    }
+    return match read_ipv6(cs, 0) {
+        Some(r) -> if r.1 == cs.len() { RustIpV6(r.0) } else { fail(RustAddrBadIp) }
+        None -> fail(RustAddrBadIp)
+    }
+}
+
+/// `s.parse::<SocketAddrV4>()`.
+pub fn parse_socket_v4(s: str) -> RustSocketAddrV4 ! RustAddrParseError {
+    let cs = s.chars()
+    return match read_socket_v4(cs, 0) {
+        Some(r) -> if r.1 == cs.len() { r.0 } else { fail(RustAddrBadSocketV4) }
+        None -> fail(RustAddrBadSocketV4)
+    }
+}
+
+/// `s.parse::<SocketAddrV6>()`.
+pub fn parse_socket_v6(s: str) -> RustSocketAddrV6 ! RustAddrParseError {
+    let cs = s.chars()
+    return match read_socket_v6(cs, 0) {
+        Some(r) -> if r.1 == cs.len() { r.0 } else { fail(RustAddrBadSocketV6) }
+        None -> fail(RustAddrBadSocketV6)
+    }
+}
+
+/// `s.parse::<SocketAddr>()`.
+pub fn parse_socket(s: str) -> RustSocketAddr ! RustAddrParseError {
+    let cs = s.chars()
+    match read_socket_v4(cs, 0) {
+        Some(r) -> return if r.1 == cs.len() { RustSockV4(r.0) } else { fail(RustAddrBadSocket) }
+        None -> {}
+    }
+    return match read_socket_v6(cs, 0) {
+        Some(r) -> if r.1 == cs.len() { RustSockV6(r.0) } else { fail(RustAddrBadSocket) }
+        None -> fail(RustAddrBadSocket)
+    }
+}
+
+// --- display -------------------------------------------------------------------------------------------
+
+/// The parts of a `{:spec}` that Display of an address uses.
+type RustAddrSpec = { fill: str, align: str, width: Option[i64], precision: Option[i64] }
+
+fn is_align(c: str) -> bool {
+    return c == "<" or c == "^" or c == ">"
+}
+
+fn number_at(cs: [str], at0: i64) -> (Option[i64], i64) {
+    var i = at0
+    while i < cs.len() and digit(cs[i], 10).is_some() {
+        i = i + 1
+    }
+    if i == at0 {
+        return (None, at0)
+    }
+    return (cs.slice(at0, i).join("").parse_int(), i)
+}
+
+/// A format spec, the text between `{:` and `}`: fill and alignment, sign,
+/// `#`, `0`, width and precision. None for anything else.
+pub fn parse_spec(spec: str) -> Option[RustAddrSpec] {
+    let cs = spec.chars()
+    var s = RustAddrSpec{ fill: " ", align: "", width: None, precision: None }
+    var i = 0
+    if cs.len() >= 2 and is_align(cs[1]) {
+        s.fill = cs[0]
+        s.align = cs[1]
+        i = 2
+    } else if cs.len() >= 1 and is_align(cs[0]) {
+        s.align = cs[0]
+        i = 1
+    }
+    if i < cs.len() and (cs[i] == "+" or cs[i] == "-") {
+        i = i + 1
+    }
+    if i < cs.len() and cs[i] == "#" {
+        i = i + 1
+    }
+    if i < cs.len() and cs[i] == "0" {
+        i = i + 1
+    }
+    let w = number_at(cs, i)
+    s.width = w.0
+    i = w.1
+    if i < cs.len() and cs[i] == "." {
+        let p = number_at(cs, i + 1)
+        if p.0.is_none() {
+            return None
+        }
+        s.precision = p.0
+        i = p.1
+    }
+    return if i == cs.len() { Some(s) } else { None }
+}
+
+/// Formatter::pad: cut to the precision, then pad to the width.
+fn pad(text: str, s: RustAddrSpec) -> str {
+    var t = text
+    match s.precision {
+        Some(p) -> if t.len() > p {
+            t = t.substr(0, p)
+        }
+        None -> {}
+    }
+    let w = s.width ?? 0
+    if t.len() >= w {
+        return t
+    }
+    let n = w - t.len()
+    let align = if s.align == "" { "<" } else { s.align }
+    let left = if align == "<" { 0 } else if align == ">" { n } else { n / 2 }
+    return s.fill.repeat(left) + t + s.fill.repeat(n - left)
+}
+
+pub fn ipv4_octets(a: RustIpv4Addr) -> [i64] {
+    return [a.bits.shr(24).bit_and(255), a.bits.shr(16).bit_and(255), a.bits.shr(8).bit_and(255), a.bits.bit_and(255)]
+}
+
+/// `a.to_string()`.
+pub fn ipv4_text(a: RustIpv4Addr) -> str {
+    return ipv4_octets(a).map(|o| o.to_str()).join(".")
+}
+
+fn hex_group(v: i64) -> str {
+    let digits = "0123456789abcdef"
+    var out = ""
+    var x = v
+    while true {
+        out = digits.substr(x.bit_and(15), 1) + out
+        x = x.shr(4)
+        if x == 0 {
+            break
+        }
+    }
+    return out
+}
+
+/// `a.to_string()`.
+pub fn ipv6_text(a: RustIpv6Addr) -> str {
+    match to_ipv4_mapped(a) {
+        Some(v4) -> return "::ffff:" + ipv4_text(v4)
+        None -> {}
+    }
+    var best_start = 0
+    var best_len = 0
+    var cur_start = 0
+    var cur_len = 0
+    var i = 0
+    while i < 8 {
+        if a.segments[i] == 0 {
+            if cur_len == 0 {
+                cur_start = i
+            }
+            cur_len = cur_len + 1
+            if cur_len > best_len {
+                best_start = cur_start
+                best_len = cur_len
+            }
+        } else {
+            cur_len = 0
+        }
+        i = i + 1
+    }
+    let hex = a.segments.map(|g| hex_group(g))
+    if best_len > 1 {
+        return hex.slice(0, best_start).join(":") + "::" + hex.slice(best_start + best_len, 8).join(":")
+    }
+    return hex.join(":")
+}
+
+pub fn ip_text(a: RustIpAddr) -> str {
+    return match a {
+        RustIpV4(v) -> ipv4_text(v)
+        RustIpV6(v) -> ipv6_text(v)
+    }
+}
+
+pub fn socket_v4_text(a: RustSocketAddrV4) -> str {
+    return ipv4_text(a.ip) + ":" + a.port.to_str()
+}
+
+pub fn socket_v6_text(a: RustSocketAddrV6) -> str {
+    let scope = if a.scope_id == 0 { "" } else { "%" + a.scope_id.to_str() }
+    return "[" + ipv6_text(a.ip) + scope + "]:" + a.port.to_str()
+}
+
+pub fn socket_text(a: RustSocketAddr) -> str {
+    return match a {
+        RustSockV4(v) -> socket_v4_text(v)
+        RustSockV6(v) -> socket_v6_text(v)
+    }
+}
+
+/// `format!("{:spec}", text)` for an address's Display text; None for a
+/// spec this does not take.
+pub fn format_with(text: str, spec: str) -> Option[str] {
+    return match parse_spec(spec) {
+        Some(s) -> Some(if s.width.is_none() and s.precision.is_none() { text } else { pad(text, s) })
+        None -> None
+    }
+}
+
+// --- classification --------------------------------------------------------------------------------
+
+pub fn ipv4_is_unspecified(a: RustIpv4Addr) -> bool {
+    return a.bits == 0
+}
+
+pub fn ipv4_is_loopback(a: RustIpv4Addr) -> bool {
+    return ipv4_octets(a)[0] == 127
+}
+
+pub fn ipv4_is_private(a: RustIpv4Addr) -> bool {
+    let o = ipv4_octets(a)
+    return o[0] == 10 or o[0] == 172 and o[1] >= 16 and o[1] <= 31 or o[0] == 192 and o[1] == 168
+}
+
+pub fn ipv4_is_link_local(a: RustIpv4Addr) -> bool {
+    let o = ipv4_octets(a)
+    return o[0] == 169 and o[1] == 254
+}
+
+pub fn ipv4_is_multicast(a: RustIpv4Addr) -> bool {
+    let o = ipv4_octets(a)
+    return o[0] >= 224 and o[0] <= 239
+}
+
+pub fn ipv4_is_broadcast(a: RustIpv4Addr) -> bool {
+    return a.bits == 4294967295
+}
+
+pub fn ipv4_is_documentation(a: RustIpv4Addr) -> bool {
+    let o = ipv4_octets(a)
+    return o[0] == 192 and o[1] == 0 and o[2] == 2 or o[0] == 198 and o[1] == 51 and o[2] == 100 or o[0] == 203 and o[1] == 0 and o[2] == 113
+}
+
+pub fn to_ipv6_compatible(a: RustIpv4Addr) -> RustIpv6Addr {
+    return RustIpv6Addr{ segments: [0, 0, 0, 0, 0, 0, a.bits.shr(16), a.bits.bit_and(65535)] }
+}
+
+pub fn to_ipv6_mapped(a: RustIpv4Addr) -> RustIpv6Addr {
+    return RustIpv6Addr{ segments: [0, 0, 0, 0, 0, 65535, a.bits.shr(16), a.bits.bit_and(65535)] }
+}
+
+fn zeros_before(a: RustIpv6Addr, n: i64) -> bool {
+    var i = 0
+    while i < n {
+        if a.segments[i] != 0 {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+pub fn ipv6_is_unspecified(a: RustIpv6Addr) -> bool {
+    return zeros_before(a, 8)
+}
+
+pub fn ipv6_is_loopback(a: RustIpv6Addr) -> bool {
+    return zeros_before(a, 7) and a.segments[7] == 1
+}
+
+pub fn ipv6_is_unique_local(a: RustIpv6Addr) -> bool {
+    return a.segments[0].bit_and(65024) == 64512
+}
+
+pub fn ipv6_is_unicast_link_local(a: RustIpv6Addr) -> bool {
+    return a.segments[0].bit_and(65472) == 65152
+}
+
+pub fn ipv6_is_multicast(a: RustIpv6Addr) -> bool {
+    return a.segments[0].bit_and(65280) == 65280
+}
+
+fn low_v4(a: RustIpv6Addr) -> RustIpv4Addr {
+    return RustIpv4Addr{ bits: a.segments[6] * 65536 + a.segments[7] }
+}
+
+/// `to_ipv4_mapped`: only `::ffff:a.b.c.d`.
+pub fn to_ipv4_mapped(a: RustIpv6Addr) -> Option[RustIpv4Addr] {
+    return if zeros_before(a, 5) and a.segments[5] == 65535 { Some(low_v4(a)) } else { None }
+}
+
+/// `to_ipv4`: `::ffff:a.b.c.d` and `::a.b.c.d` (so `::` and `::1` too).
+pub fn to_ipv4(a: RustIpv6Addr) -> Option[RustIpv4Addr] {
+    return if zeros_before(a, 5) and (a.segments[5] == 0 or a.segments[5] == 65535) { Some(low_v4(a)) } else { None }
+}
+
+pub fn to_canonical(a: RustIpv6Addr) -> RustIpAddr {
+    return match to_ipv4_mapped(a) {
+        Some(v4) -> RustIpV4(v4)
+        None -> RustIpV6(a)
+    }
+}
+
+pub fn ip_is_unspecified(a: RustIpAddr) -> bool {
+    return match a {
+        RustIpV4(v) -> ipv4_is_unspecified(v)
+        RustIpV6(v) -> ipv6_is_unspecified(v)
+    }
+}
+
+pub fn ip_is_loopback(a: RustIpAddr) -> bool {
+    return match a {
+        RustIpV4(v) -> ipv4_is_loopback(v)
+        RustIpV6(v) -> ipv6_is_loopback(v)
+    }
+}
+
+pub fn ip_is_multicast(a: RustIpAddr) -> bool {
+    return match a {
+        RustIpV4(v) -> ipv4_is_multicast(v)
+        RustIpV6(v) -> ipv6_is_multicast(v)
+    }
+}

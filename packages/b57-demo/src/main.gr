@@ -1,0 +1,128 @@
+// Six libraries, each run once on an input whose answer came from
+// CPython 3.13's own module: colorsys, mimetypes, urllib.robotparser,
+// reprlib, the urllib.request/http.cookiejar header helpers and strptime.
+// scripts/b57_diff.sh holds them to Python on thousands more.
+import bigint
+import pycolorsys
+import pyhttpheaders
+import pyliteral
+import pymimetypes
+import pyreprlib
+import pyrobotparser
+import pystrptime
+
+fn triple(t: (f64, f64, f64)) -> [f64] {
+    return [t.0, t.1, t.2]
+}
+
+fn colors() {
+    assert(triple(pycolorsys.rgb_to_hsv(0.2, 0.4, 0.4) ?? (0.0, 0.0, 0.0)) == [0.5, 0.5, 0.4])
+    assert(triple(pycolorsys.hls_to_rgb(0.0, 0.5, 1.0)) == [1.0, 0.0, 0.0])
+    assert(triple(pycolorsys.rgb_to_hls(1.0, 0.5, 0.0) ?? (0.0, 0.0, 0.0)) == [0.08333333333333333, 0.5, 1.0])
+    assert(triple(pycolorsys.hsv_to_rgb(0.5, 1.0, 1.0) ?? (1.0, 1.0, 1.0)) == [0.0, 1.0, 1.0])
+    assert_eq(match pycolorsys.rgb_to_hls(0.0 - 1.0, 1.0, 0.0) {
+        Ok(_t) -> ""
+        Err(e) -> pycolorsys.error_class(e) + ": " + pycolorsys.error_text(e)
+    }, "ZeroDivisionError: float division by zero")
+    print("colorsys: Python's")
+}
+
+fn guess(url: str, strict: bool) -> str {
+    return match pymimetypes.guess_type(url, strict) {
+        Ok(p) -> (p.0 ?? "None") + " " + (p.1 ?? "None")
+        Err(e) -> pymimetypes.error_text(e)
+    }
+}
+
+fn mimes() {
+    assert_eq(guess("archive.tar.gz", true), "application/x-tar gzip")
+    assert_eq(guess("x.TGZ", true), "application/x-tar gzip")
+    assert_eq(guess("http://a/b.png?x=1.txt", true), "image/png None")
+    assert_eq(guess("data:text/html;charset=utf-8,<p>", true), "text/html None")
+    assert_eq(guess(".bashrc", true), "None None")
+    assert(pymimetypes.guess_extension("text/plain", true) == Some(".txt"))
+    print("mimetypes: Python's")
+}
+
+fn robots() {
+    let text = "User-agent: *\nDisallow: /private\nAllow: /private/ok\nCrawl-delay: 5\n\nUser-agent: FigTree\nDisallow: /\nSitemap: http://example.com/s.xml"
+    let p = pyrobotparser.parse_text(text) ?? panic("robots.txt")
+    assert(not (pyrobotparser.can_fetch(p, "Googlebot", "/private/ok") ?? true))
+    assert(pyrobotparser.can_fetch(p, "Googlebot", "/public") ?? false)
+    assert(not (pyrobotparser.can_fetch(p, "FigTree/1.0", "/x") ?? true))
+    assert_eq(bigint.to_str(pyrobotparser.crawl_delay(p, "x") ?? bigint.zero()), "5")
+    assert((pyrobotparser.site_maps(p) ?? []) == ["http://example.com/s.xml"])
+    assert_eq(pyrobotparser.to_str(p), "User-agent: FigTree\nDisallow: /\n\nUser-agent: *\nCrawl-delay: 5\nDisallow: /private\nAllow: /private/ok")
+    print("urllib.robotparser: Python's")
+}
+
+fn short(o: PyReprOptions, literal: str) -> str {
+    let v = pyliteral.literal_eval(literal) ?? panic("literal")
+    return pyreprlib.repr(o, v) ?? ""
+}
+
+fn reprs() {
+    let d = pyreprlib.default_options()
+    var hundred: [str] = []
+    for k in 0..100 {
+        hundred.push(k.to_str())
+    }
+    assert_eq(short(d, "[" + hundred.join(", ") + "]"), "[0, 1, 2, 3, 4, 5, ...]")
+    assert_eq(short(d, "'" + "x".repeat(100) + "'"), "'xxxxxxxxxxxx...xxxxxxxxxxxxx'")
+    assert_eq(short(d, "\{'b': 1, 'a': [1, 2, 3, 4, 5, 6, 7]}"), "\{'a': [1, 2, 3, 4, 5, 6, ...], 'b': 1}")
+    var o = d
+    o.indent = PyReprIndentSpaces(2)
+    o.maxlevel = 2
+    assert_eq(short(o, "[1, [2, [3]]]"), "[\n  1,\n  [\n    2,\n    [...],\n  ],\n]")
+    print("reprlib: Python's")
+}
+
+fn when(r: PyHeaderValue ! PyHeaderError) -> str {
+    return match r {
+        Ok(PyHeaderInt(n)) -> n.to_str()
+        Ok(PyHeaderFloat(n)) -> n.to_str() + ".0"
+        Ok(_v) -> "None"
+        Err(e) -> pyhttpheaders.error_text(e)
+    }
+}
+
+fn headers() {
+    assert(pyhttpheaders.parse_http_list("a, \"b,c\", d") == ["a", "\"b,c\"", "d"])
+    let words = pyhttpheaders.split_header_words(["foo=\"bar\"; port=\"80,81\"; discard, bar=baz"])
+    assert_eq(words.len(), 2)
+    assert(words[0][1].1 == Some("80,81"))
+    assert(words[0][2].1 == None)
+    assert_eq(pyhttpheaders.join_header_words([[("a", Some("b c")), ("d", None)]]), "a=\"b c\"; d")
+    assert_eq(when(pyhttpheaders.http2time("Wed, 09 Feb 1994 22:23:32 GMT", 2026)), "760832612.0")
+    assert_eq(when(pyhttpheaders.http2time("09-Feb-94 22:23:32 GMT", 2026)), "760832612")
+    assert_eq(when(pyhttpheaders.iso2time("1994-02-03 14:15:29 -0100", 2026)), "760288529")
+    print("urllib.request and http.cookiejar header helpers: Python's")
+}
+
+fn parsed(data: str, format: str) -> str {
+    return match pystrptime.strptime_time(data, format) {
+        Ok(t) -> [t.year, t.month, t.day, t.hour, t.minute, t.second, t.weekday, t.yday].map(|x| x.to_str()).join(",")
+        Err(e) -> pystrptime.error_class(e) + ": " + pystrptime.error_text(e)
+    }
+}
+
+fn dates() {
+    assert_eq(parsed("2020123", "%Y%m%d"), "2020,12,3,0,0,0,3,338")
+    assert_eq(parsed("2021-02-29", "%Y-%m-%d"), "ValueError: day is out of range for month")
+    assert_eq(parsed("2020 53 1", "%G %V %u"), "2020,12,28,0,0,0,0,363")
+    assert_eq(parsed("x", "%q"), "ValueError: 'q' is a bad directive in format '%q'")
+    assert_eq(parsed("12:30 PM", "%I:%M %p"), "1900,1,1,12,30,0,0,1")
+    let d = pystrptime.strptime_datetime("2020-01-02T03:04:05.5+05:30", "%Y-%m-%dT%H:%M:%S.%f%z") ?? panic("datetime")
+    assert_eq(d.microsecond, 500000)
+    assert(d.offset == Some(19800000000))
+    print("time.strptime and datetime.strptime: Python's")
+}
+
+fn main() / {io} {
+    colors()
+    mimes()
+    robots()
+    reprs()
+    headers()
+    dates()
+}

@@ -1,0 +1,8 @@
+[package]
+name = "jqpath"
+version = "1.0.0"
+capabilities = []
+
+[dependencies.jqformat]
+path = "../jqformat"
+version = "^1.0.0"

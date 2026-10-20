@@ -1,0 +1,955 @@
+// Node's legacy URL API, `url.parse`, `url.format` and `url.resolve`, as
+// Node 25's `lib/url.js` runs them (not the WHATWG `URL` class).
+//
+// A great deal of server code still calls `url.parse`, and its answers are
+// its own: a peer that routes, signs or logs the same requests has to cut
+// the same strings the same way:
+//
+//   - The input is trimmed of code units below 33, U+00A0 and U+FEFF;
+//     backslashes before the first `?` or `#` become `/`.
+//   - A path with no `@` or `#` that matches `^(//?(?!/)[^?\s]*)(\?\S*)?$`
+//     takes the fast path: no host, no escaping.
+//   - The protocol is `^[a-z0-9.+-]+:`, lower-cased; `//` then marks a host
+//     for http, https, ftp, gopher, file, ws and wss, for any protocol when
+//     the slashes are there, and always with `slashesDenoteHost`. The test
+//     for "a protocol that needs no slashes to have a host" uses the
+//     protocol as written, so `HTTP:foo/bar` has host `foo`.
+//   - The host ends at the first `/`, `?` or `#`; characters RFC 2396
+//     forbids end it too unless an `@` follows; the last `@` before the
+//     end splits off the auth, which is percent-decoded (a bad escape is
+//     URIError "URI malformed"). Tabs and line breaks in it are dropped.
+//   - `:digits` at the end is the port; any other `:` in the host name is
+//     TypeError "The argument 'url' <url>. Received 'Invalid port in
+//     url'". A host name longer than 255 becomes empty, and is lower-cased;
+//     `[...]` is IPv6 and keeps its `:`; NUL, `[` or `]` elsewhere is
+//     TypeError "Invalid URL".
+//   - Outside `javascript:`, the rest has `\t \n \r space " ' < > \ ^ `
+//     { | }` percent-escaped; then `#` starts the hash and the first `?`
+//     the search; `parseQueryString` reads the query as Node's
+//     `querystring` does.
+//   - `format` escapes the auth (keeping `A-Za-z0-9 ! ' ( ) * - . _ ~ :`),
+//     brackets a host name holding `:`, writes `//` for the slashed
+//     protocols (just `//` for a hostless `file:`), escapes `#` and `?` in
+//     the path and `#` in the search; a lone surrogate in the auth is
+//     URIError "URI malformed".
+//   - `resolve` follows `Url.prototype.resolveObject` line by line,
+//     including its handling of hostless protocols (`mailto:`), `..` past
+//     the root and trailing slashes.
+//
+// Strings are UTF-16 code units, as JavaScript's are; `units` converts.
+// Limits: host names must be ASCII and have no `xn--` label (Node runs
+// those through IDNA's toASCII, which is not here; they are refused with
+// an "Unsupported" error); with `parseQueryString` the query is decoded by
+// the `querystring` package as text, so a lone surrogate in it becomes
+// U+FFFD. JavaScript lists a query object's integer-like keys first; the
+// pairs here are in the order they appeared.
+
+import jsuri
+import querystring
+
+/// What `url.parse` puts in `query`: nothing, the text after `?`, or the
+/// parsed pairs.
+type NodeUrlQuery =
+    | NodeUrlNoQuery
+    | NodeUrlQueryText(units: [i64])
+    | NodeUrlQueryPairs(pairs: [QueryPair])
+
+/// A `Url` object. `None` is null (or absent, which `format` treats the
+/// same way).
+type NodeUrl = {
+    protocol: Option[[i64]],
+    slashes: Option[bool],
+    auth: Option[[i64]],
+    host: Option[[i64]],
+    port: Option[[i64]],
+    hostname: Option[[i64]],
+    hash: Option[[i64]],
+    search: Option[[i64]],
+    query: NodeUrlQuery,
+    pathname: Option[[i64]],
+    path: Option[[i64]],
+    href: [i64],
+}
+
+/// The error thrown: its class (`TypeError`, `URIError`, or `Unsupported`
+/// for what this package does not do), Node's code, and the message.
+type NodeUrlError = | NodeUrlError(class_name: str, code: str, message: [i64])
+
+pub fn error_class(e: NodeUrlError) -> str {
+    return match e {
+        NodeUrlError(c, _k, _m) -> c
+    }
+}
+
+pub fn error_code(e: NodeUrlError) -> str {
+    return match e {
+        NodeUrlError(_c, k, _m) -> k
+    }
+}
+
+pub fn error_message(e: NodeUrlError) -> [i64] {
+    return match e {
+        NodeUrlError(_c, _k, m) -> m
+    }
+}
+
+/// Text as UTF-16 code units.
+pub fn units(s: str) -> [i64] {
+    return jsuri.units(s)
+}
+
+fn u(s: str) -> [i64] {
+    return s.codes()
+}
+
+fn empty_url() -> NodeUrl {
+    return NodeUrl{
+        protocol: None,
+        slashes: None,
+        auth: None,
+        host: None,
+        port: None,
+        hostname: None,
+        hash: None,
+        search: None,
+        query: NodeUrlNoQuery,
+        pathname: None,
+        path: None,
+        href: [],
+    }
+}
+
+fn invalid_url() -> NodeUrlError {
+    return NodeUrlError("TypeError", "ERR_INVALID_URL", u("Invalid URL"))
+}
+
+/// URIError from `encodeStr` (with Node's code) or from
+/// `decodeURIComponent` (which has none: "undefined").
+fn uri_malformed(code: str) -> NodeUrlError {
+    return NodeUrlError("URIError", code, u("URI malformed"))
+}
+
+fn truthy(x: Option[[i64]]) -> bool {
+    return match x {
+        Some(v) -> v.len() > 0
+        None -> false
+    }
+}
+
+fn or_empty(x: Option[[i64]]) -> [i64] {
+    return x ?? []
+}
+
+fn is_ascii_text(xs: [i64], text: str) -> bool {
+    return xs == u(text)
+}
+
+fn index_of(xs: [i64], c: i64) -> i64 {
+    var i = 0
+    while i < xs.len() {
+        if xs[i] == c {
+            return i
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+fn slashed(p: [i64]) -> bool {
+    for name in ["http", "http:", "https", "https:", "ftp", "ftp:", "gopher", "gopher:", "file", "file:", "ws", "ws:", "wss", "wss:"] {
+        if is_ascii_text(p, name) {
+            return true
+        }
+    }
+    return false
+}
+
+fn javascript(p: Option[[i64]]) -> bool {
+    return match p {
+        Some(v) -> is_ascii_text(v, "javascript") or is_ascii_text(v, "javascript:")
+        None -> false
+    }
+}
+
+fn is_js_space(c: i64) -> bool {
+    return c == 9 or c == 10 or c == 11 or c == 12 or c == 13 or c == 32 or c == 160 or c == 5760 or c >= 8192 and c <= 8202 or c == 8232 or c == 8233 or c == 8239 or
+    c == 8287 or c == 12288 or c == 65279
+}
+
+// ---- parse: trimming and the fast path
+
+/// The trimmed input with backslashes before the first `?` or `#` made
+/// `/`, and whether it holds a `#` and an `@` (before that split).
+fn trim_input(url: [i64]) -> ([i64], bool, bool) {
+    var has_hash = false
+    var has_at = false
+    var start = 0 - 1
+    var end = 0 - 1
+    var in_ws = false
+    var split = false
+    var out: [i64] = []
+    var i = 0
+    while i < url.len() {
+        let c = url[i]
+        let ws = c < 33 or c == 160 or c == 65279
+        if start < 0 {
+            if ws {
+                i = i + 1
+                continue
+            }
+            start = i
+        } else if in_ws {
+            if not ws {
+                end = 0 - 1
+                in_ws = false
+            }
+        } else if ws {
+            end = i
+            in_ws = true
+        }
+        if not split {
+            if c == 64 {
+                has_at = true
+            } else if c == 35 {
+                has_hash = true
+                split = true
+            } else if c == 63 {
+                split = true
+            }
+        } else if not has_hash and c == 35 {
+            has_hash = true
+        }
+        out.push(if not split and c == 92 { 47 } else { c })
+        i = i + 1
+    }
+    // `out` holds url[start..]; cut the trailing white space.
+    let kept = if start < 0 { [] } else if end < 0 { out } else { out.slice(0, end - start) }
+    return (kept, has_hash, has_at)
+}
+
+/// `simplePathPattern`: (pathname, search) when it matches.
+fn simple_path(rest: [i64]) -> Option[([i64], Option[[i64]])] {
+    if rest.len() == 0 or rest[0] != 47 {
+        return None
+    }
+    var i = 1
+    if i < rest.len() and rest[i] == 47 {
+        i = i + 1
+    }
+    if i < rest.len() and rest[i] == 47 {
+        return None
+    }
+    while i < rest.len() and rest[i] != 63 {
+        if is_js_space(rest[i]) {
+            return None
+        }
+        i = i + 1
+    }
+    let path = rest.slice(0, i)
+    if i == rest.len() {
+        return Some((path, None))
+    }
+    var j = i
+    while j < rest.len() {
+        if is_js_space(rest[j]) {
+            return None
+        }
+        j = j + 1
+    }
+    return Some((path, Some(rest.slice(i, rest.len()))))
+}
+
+fn query_of(text: [i64], parse_query: bool) -> NodeUrlQuery {
+    if parse_query {
+        return NodeUrlQueryPairs(querystring.parse(jsuri.text(text)))
+    }
+    return NodeUrlQueryText(text)
+}
+
+// ---- parse: protocol and host
+
+/// `protocolPattern`: the length of `scheme:` at the start, or 0.
+fn protocol_length(rest: [i64]) -> i64 {
+    var i = 0
+    while i < rest.len() {
+        let c = rest[i]
+        if c == 58 {
+            return i
+        }
+        let ok = c >= 97 and c <= 122 or c >= 65 and c <= 90 or c >= 48 and c <= 57 or c == 46 or c == 43 or c == 45
+        if not ok {
+            return 0
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+fn ascii_lower(xs: [i64]) -> [i64] {
+    return xs.map(|c| if c >= 65 and c <= 90 { c + 32 } else { c })
+}
+
+/// `hostPattern`: `//`, something without `@` or `/`, `@`, and more.
+fn host_pattern(rest: [i64]) -> bool {
+    if rest.len() < 4 or rest[0] != 47 or rest[1] != 47 {
+        return false
+    }
+    var i = 2
+    while i < rest.len() and rest[i] != 64 and rest[i] != 47 {
+        i = i + 1
+    }
+    return i > 2 and i < rest.len() and rest[i] == 64 and i + 1 < rest.len() and rest[i + 1] != 64 and rest[i + 1] != 47
+}
+
+fn never_in_host(c: i64) -> bool {
+    return c == 32 or c == 34 or c == 37 or c == 39 or c == 59 or c == 60 or c == 62 or c == 92 or c == 94 or c == 96 or c == 123 or c == 124 or c == 125
+}
+
+/// The host scan: tabs and line breaks dropped; where the host ends
+/// (`nonHost`, -1 for the end) and the last `@` before that.
+fn host_scan(inout rest: [i64]) -> (i64, i64) {
+    var host_end = 0 - 1
+    var at_sign = 0 - 1
+    var non_host = 0 - 1
+    var i = 0
+    while i < rest.len() {
+        let c = rest[i]
+        if c == 9 or c == 10 or c == 13 {
+            rest = rest.slice(0, i) + rest.slice(i + 1, rest.len())
+            continue
+        }
+        if never_in_host(c) {
+            if non_host < 0 {
+                non_host = i
+            }
+        } else if c == 35 or c == 47 or c == 63 {
+            if non_host < 0 {
+                non_host = i
+            }
+            host_end = i
+        } else if c == 64 {
+            at_sign = i
+            non_host = 0 - 1
+        }
+        if host_end >= 0 {
+            break
+        }
+        i = i + 1
+    }
+    return (non_host, at_sign)
+}
+
+/// `parseHost`: the port off the end of `host`, and the host name.
+fn parse_host(inout url: NodeUrl) {
+    let host = or_empty(url.host)
+    var i = host.len()
+    while i > 0 and host[i - 1] >= 48 and host[i - 1] <= 57 {
+        i = i - 1
+    }
+    var name = host
+    if i > 0 and host[i - 1] == 58 {
+        if i < host.len() {
+            url.port = Some(host.slice(i, host.len()))
+        }
+        name = host.slice(0, i - 1)
+    }
+    if name.len() > 0 {
+        url.hostname = Some(name)
+    }
+}
+
+fn forbidden_host(xs: [i64], ipv6: bool) -> bool {
+    for c in xs {
+        let common = c == 0 or c == 9 or c == 10 or c == 13 or c == 32 or c == 35 or c == 37 or c == 47 or c == 60 or c == 62 or c == 63 or c == 64 or c == 92 or c == 94 or c == 124
+        if common or not ipv6 and (c == 58 or c == 91 or c == 93) {
+            return true
+        }
+    }
+    return false
+}
+
+/// `toASCII` for the host names this package takes: ASCII without an
+/// `xn--` label is already ASCII.
+fn to_ascii(name: [i64]) -> [i64] ! NodeUrlError {
+    if name.any(|c| c > 127) {
+        fail(NodeUrlError("Unsupported", "IDNA", u("non-ASCII host name")))
+    }
+    var label_start = true
+    var i = 0
+    while i < name.len() {
+        if label_start and i + 3 < name.len() and name[i] == 120 and name[i + 1] == 110 and name[i + 2] == 45 and name[i + 3] == 45 {
+            fail(NodeUrlError("Unsupported", "IDNA", u("xn-- label")))
+        }
+        label_start = name[i] == 46
+        i = i + 1
+    }
+    return name
+}
+
+/// The host part of `parse`, once `rest` starts at the host; returns
+/// what is left after it.
+fn parse_authority(inout url: NodeUrl, rest0: [i64], input: [i64]) -> [i64] ! NodeUrlError {
+    var rest = rest0
+    let (non_host, at_sign) = host_scan(rest)
+    var start = 0
+    if at_sign >= 0 {
+        url.auth = match jsuri.decode_uri_component(rest.slice(0, at_sign)) {
+            Ok(a) -> Some(a)
+            Err(_e) -> fail(uri_malformed("undefined"))
+        }
+        start = at_sign + 1
+    }
+    if non_host < 0 {
+        url.host = Some(rest.slice(start, rest.len()))
+        rest = []
+    } else {
+        url.host = Some(rest.slice(start, non_host))
+        rest = rest.slice(non_host, rest.len())
+    }
+    parse_host(url)
+    let hostname = url.hostname ?? []
+    let ipv6 = hostname.len() > 0 and hostname[0] == 91 and hostname[hostname.len() - 1] == 93
+    if not ipv6 {
+        rest = try check_hostname(url, rest, hostname, input)
+    }
+    var name = url.hostname ?? []
+    name = if name.len() > 255 { [] } else { ascii_lower(name) }
+    if name.len() > 0 {
+        if ipv6 {
+            if forbidden_host(name, true) {
+                fail(invalid_url())
+            }
+        } else {
+            name = try to_ascii(name)
+            if name.len() == 0 or forbidden_host(name, false) {
+                fail(invalid_url())
+            }
+        }
+    }
+    url.hostname = Some(name)
+    let port = url.port ?? []
+    url.host = Some(name + (if port.len() > 0 { [58] + port } else { [] }))
+    if ipv6 {
+        url.hostname = Some(name.slice(1, name.len() - 1))
+        if rest.len() == 0 or rest[0] != 47 {
+            rest = [47] + rest
+        }
+    }
+    return rest
+}
+
+/// `getHostname`: a host name with `/ \ # ? :` in it is cut there and
+/// the remainder joins the path; `:` is an invalid port.
+fn check_hostname(inout url: NodeUrl, rest: [i64], hostname: [i64], input: [i64]) -> [i64] ! NodeUrlError {
+    var i = 0
+    while i < hostname.len() {
+        let c = hostname[i]
+        if c == 58 {
+            fail(NodeUrlError("TypeError", "ERR_INVALID_ARG_VALUE", u("The argument 'url' ") + input + u(". Received 'Invalid port in url'")))
+        }
+        if c == 47 or c == 92 or c == 35 or c == 63 {
+            url.hostname = Some(hostname.slice(0, i))
+            return [47] + hostname.slice(i, hostname.len()) + rest
+        }
+        i = i + 1
+    }
+    return rest
+}
+
+// ---- parse: the rest
+
+fn auto_escape(rest: [i64]) -> [i64] {
+    var out: [i64] = []
+    for c in rest {
+        let code = if c == 9 { "%09" } else if c == 10 { "%0A" } else if c == 13 { "%0D" } else if c == 32 { "%20" } else if c == 34 { "%22" } else if c == 39 {
+            "%27"
+        } else if c == 60 { "%3C" } else if c == 62 { "%3E" } else if c == 92 { "%5C" } else if c == 94 { "%5E" } else if c == 96 { "%60" } else if c == 123 {
+            "%7B"
+        } else if c == 124 { "%7C" } else if c == 125 { "%7D" } else { "" }
+        if code == "" {
+            out.push(c)
+        } else {
+            for x in u(code) {
+                out.push(x)
+            }
+        }
+    }
+    return out
+}
+
+fn split_rest(inout url: NodeUrl, rest: [i64], parse_query: bool) {
+    var question = 0 - 1
+    var hash = 0 - 1
+    var i = 0
+    while i < rest.len() {
+        if rest[i] == 35 {
+            url.hash = Some(rest.slice(i, rest.len()))
+            hash = i
+            break
+        }
+        if rest[i] == 63 and question < 0 {
+            question = i
+        }
+        i = i + 1
+    }
+    if question >= 0 {
+        let stop = if hash < 0 { rest.len() } else { hash }
+        url.search = Some(rest.slice(question, stop))
+        url.query = query_of(rest.slice(question + 1, stop), parse_query)
+    } else if parse_query {
+        url.search = None
+        url.query = NodeUrlQueryPairs([])
+    }
+    let first = if question >= 0 and (hash < 0 or question < hash) { question } else { hash }
+    if first < 0 {
+        if rest.len() > 0 {
+            url.pathname = Some(rest)
+        }
+    } else if first > 0 {
+        url.pathname = Some(rest.slice(0, first))
+    }
+}
+
+/// `url.parse(url, parseQueryString, slashesDenoteHost)`.
+pub fn parse(input: [i64], parse_query: bool, slashes_denote_host: bool) -> NodeUrl ! NodeUrlError {
+    var url = empty_url()
+    let (trimmed, has_hash, has_at) = trim_input(input)
+    var rest = trimmed
+    if not slashes_denote_host and not has_hash and not has_at {
+        match simple_path(rest) {
+            Some(sp) -> {
+                let (pathname, search) = sp
+                url.path = Some(rest)
+                url.href = rest
+                url.pathname = Some(pathname)
+                match search {
+                    Some(s) -> {
+                        url.search = Some(s)
+                        url.query = query_of(s.slice(1, s.len()), parse_query)
+                    }
+                    None -> {
+                        if parse_query {
+                            url.query = NodeUrlQueryPairs([])
+                        }
+                    }
+                }
+                return url
+            }
+            None -> ()
+        }
+    }
+    let plen = protocol_length(rest)
+    let proto = rest.slice(0, plen + 1)
+    let lower = ascii_lower(proto)
+    if plen > 0 {
+        url.protocol = Some(lower)
+        rest = rest.slice(plen + 1, rest.len())
+    }
+    let hostless = plen > 0 and javascript(Some(lower))
+    var slashes = false
+    if slashes_denote_host or plen > 0 or host_pattern(rest) {
+        slashes = rest.len() >= 2 and rest[0] == 47 and rest[1] == 47
+        if slashes and not hostless {
+            rest = rest.slice(2, rest.len())
+            url.slashes = Some(true)
+        }
+    }
+    if not hostless and (slashes or plen > 0 and not slashed(proto)) {
+        rest = try parse_authority(url, rest, input)
+    }
+    if not javascript(url.protocol) {
+        rest = auto_escape(rest)
+    }
+    split_rest(url, rest, parse_query)
+    if plen > 0 and slashed(lower) and truthy(url.hostname) and not truthy(url.pathname) {
+        url.pathname = Some([47])
+    }
+    if truthy(url.pathname) or truthy(url.search) {
+        url.path = Some(or_empty(url.pathname) + or_empty(url.search))
+    }
+    url.href = try format(url)
+    return url
+}
+
+// ---- format
+
+fn hex2(b: i64) -> [i64] {
+    let d = "0123456789ABCDEF"
+    return u("%" + d.substr(b / 16, 1) + d.substr(b % 16, 1))
+}
+
+fn auth_keeps(c: i64) -> bool {
+    return c >= 97 and c <= 122 or c >= 65 and c <= 90 or c >= 48 and c <= 57 or c == 33 or c == 39 or c == 40 or c == 41 or c == 42 or c == 45 or c == 46 or c == 95 or
+    c == 126 or c == 58
+}
+
+/// `encodeStr` with the auth's table: UTF-8 percent escapes; a surrogate
+/// takes the next unit as its pair whatever it is, and one at the end is
+/// URIError.
+fn encode_auth(s: [i64]) -> [i64] ! NodeUrlError {
+    var out: [i64] = []
+    var i = 0
+    while i < s.len() {
+        var c = s[i]
+        if c < 128 {
+            if auth_keeps(c) {
+                out.push(c)
+            } else {
+                out = out + hex2(c)
+            }
+        } else if c < 2048 {
+            out = out + hex2(c.shr(6).bit_or(192)) + hex2(c.bit_and(63).bit_or(128))
+        } else if c < 55296 or c >= 57344 {
+            out = out + hex2(c.shr(12).bit_or(224)) + hex2(c.shr(6).bit_and(63).bit_or(128)) + hex2(c.bit_and(63).bit_or(128))
+        } else {
+            i = i + 1
+            if i >= s.len() {
+                fail(uri_malformed("ERR_INVALID_URI"))
+            }
+            c = 65536 + c.bit_and(1023).shl(10).bit_or(s[i].bit_and(1023))
+            out = out + hex2(c.shr(18).bit_or(240)) + hex2(c.shr(12).bit_and(63).bit_or(128)) + hex2(c.shr(6).bit_and(63).bit_or(128)) + hex2(c.bit_and(63).bit_or(128))
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn escape_marks(xs: [i64], also_question: bool) -> [i64] {
+    var out: [i64] = []
+    for c in xs {
+        if c == 35 {
+            out = out + u("%23")
+        } else if c == 63 and also_question {
+            out = out + u("%3F")
+        } else {
+            out.push(c)
+        }
+    }
+    return out
+}
+
+/// `Url.prototype.format` on a `Url` object.
+pub fn format(url: NodeUrl) -> [i64] ! NodeUrlError {
+    var auth = or_empty(url.auth)
+    if auth.len() > 0 {
+        auth = (try encode_auth(auth)) + [64]
+    }
+    var protocol = or_empty(url.protocol)
+    if protocol.len() > 0 and protocol[protocol.len() - 1] != 58 {
+        protocol.push(58)
+    }
+    var pathname = escape_marks(or_empty(url.pathname), true)
+    var hash = or_empty(url.hash)
+    var host: [i64] = []
+    if truthy(url.host) {
+        host = auth + or_empty(url.host)
+    } else if truthy(url.hostname) {
+        let name = or_empty(url.hostname)
+        let bracket = index_of(name, 58) >= 0 and not (name[0] == 91 and name[name.len() - 1] == 93)
+        host = auth + (if bracket { [91] + name + [93] } else { name })
+        if truthy(url.port) {
+            host = host + [58] + or_empty(url.port)
+        }
+    }
+    let query = match url.query {
+        NodeUrlQueryPairs(pairs) -> units(querystring.stringify(pairs))
+        _ -> []
+    }
+    var search = if truthy(url.search) { or_empty(url.search) } else if query.len() > 0 { [63] + query } else { [] }
+    if (url.slashes ?? false) or slashed(protocol) {
+        if (url.slashes ?? false) or host.len() > 0 {
+            if pathname.len() > 0 and pathname[0] != 47 {
+                pathname = [47] + pathname
+            }
+            host = u("//") + host
+        } else if protocol.len() >= 4 and protocol.slice(0, 4) == u("file") {
+            host = u("//")
+        }
+    }
+    search = escape_marks(search, false)
+    if hash.len() > 0 and hash[0] != 35 {
+        hash = [35] + hash
+    }
+    if search.len() > 0 and search[0] != 63 {
+        search = [63] + search
+    }
+    return protocol + host + pathname + search + hash
+}
+
+// ---- resolve
+
+fn split_slash(xs: [i64]) -> [[i64]] {
+    var out: [[i64]] = []
+    var cur: [i64] = []
+    for c in xs {
+        if c == 47 {
+            out.push(cur)
+            cur = []
+        } else {
+            cur.push(c)
+        }
+    }
+    out.push(cur)
+    return out
+}
+
+fn join_slash(parts: [[i64]]) -> [i64] {
+    var out: [i64] = []
+    var i = 0
+    while i < parts.len() {
+        if i > 0 {
+            out.push(47)
+        }
+        out = out + parts[i]
+        i = i + 1
+    }
+    return out
+}
+
+fn starts_slash(x: Option[[i64]]) -> bool {
+    return match x {
+        Some(v) -> v.len() > 0 and v[0] == 47
+        None -> false
+    }
+}
+
+fn is_file_protocol(p: [i64]) -> bool {
+    return p == u("file") or p == u("file:")
+}
+
+/// `user@host` held in a host: (auth, host) split at the first `@`, or
+/// None when there is no `@` past the first character.
+fn auth_in_host(host: Option[[i64]]) -> Option[([i64], [i64])] {
+    let h = host ?? []
+    let at = index_of(h, 64)
+    if at <= 0 {
+        return None
+    }
+    let rest = h.slice(at + 1, h.len())
+    let second = index_of(rest, 64)
+    return Some((h.slice(0, at), if second < 0 { rest } else { rest.slice(0, second) }))
+}
+
+/// `url.resolve(from, to)`.
+pub fn resolve(from: [i64], to: [i64]) -> [i64] ! NodeUrlError {
+    let source = try parse(from, false, true)
+    let relative = try parse(to, false, true)
+    return try format(try resolve_object(source, relative))
+}
+
+/// `Url.prototype.resolveObject`, for what `format` reads.
+pub fn resolve_object(source: NodeUrl, rel0: NodeUrl) -> NodeUrl ! NodeUrlError {
+    var result = source
+    var relative = rel0
+    result.hash = relative.hash
+    if relative.href.len() == 0 {
+        return result
+    }
+    if (relative.slashes ?? false) and not truthy(relative.protocol) {
+        let protocol = result.protocol
+        result = relative
+        result.protocol = protocol
+        if slashed(or_empty(result.protocol)) and truthy(result.hostname) and not truthy(result.pathname) {
+            result.pathname = Some([47])
+        }
+        return result
+    }
+    if truthy(relative.protocol) and relative.protocol != result.protocol {
+        return try new_protocol(result, relative)
+    }
+    return try same_protocol(result, relative)
+}
+
+/// The branch where the relative URL brings its own protocol.
+fn new_protocol(result0: NodeUrl, rel0: NodeUrl) -> NodeUrl ! NodeUrlError {
+    var result = result0
+    var relative = rel0
+    let rp = or_empty(relative.protocol)
+    if not slashed(rp) {
+        return relative
+    }
+    result.protocol = relative.protocol
+    if not truthy(relative.host) and not is_file_protocol(rp) and not javascript(relative.protocol) {
+        var rel_path = split_slash(or_empty(relative.pathname))
+        var host: Option[[i64]] = None
+        while rel_path.len() > 0 {
+            host = Some(rel_path.remove(0))
+            if truthy(host) {
+                break
+            }
+        }
+        relative.host = if truthy(host) { host } else { Some([]) }
+        if not truthy(relative.hostname) {
+            relative.hostname = Some([])
+        }
+        if rel_path.len() == 0 or rel_path[0].len() > 0 {
+            rel_path = [[]] + rel_path
+        }
+        if rel_path.len() < 2 {
+            rel_path = [[]] + rel_path
+        }
+        result.pathname = Some(join_slash(rel_path))
+    } else {
+        result.pathname = relative.pathname
+    }
+    result.search = relative.search
+    result.query = relative.query
+    result.host = if truthy(relative.host) { relative.host } else { Some([]) }
+    result.auth = relative.auth
+    result.hostname = if truthy(relative.hostname) { relative.hostname } else { relative.host }
+    result.port = relative.port
+    if not (result.slashes ?? false) {
+        result.slashes = relative.slashes
+    }
+    return result
+}
+
+/// The paths of the general branch and the flags it carries.
+type NodeUrlPaths = { src: [[i64]], rel: [[i64]], must_end_abs: bool, remove_all_dots: bool, no_leading_slashes: bool }
+
+fn same_protocol(result0: NodeUrl, rel0: NodeUrl) -> NodeUrl ! NodeUrlError {
+    var result = result0
+    var relative = rel0
+    let is_rel_abs = truthy(relative.host) or starts_slash(relative.pathname)
+    let must = is_rel_abs or starts_slash(result.pathname) or truthy(result.host) and truthy(relative.pathname)
+    var ps = NodeUrlPaths{
+        src: if truthy(result.pathname) { split_slash(or_empty(result.pathname)) } else { [] },
+        rel: if truthy(relative.pathname) { split_slash(or_empty(relative.pathname)) } else { [] },
+        must_end_abs: must,
+        remove_all_dots: must,
+        no_leading_slashes: truthy(result.protocol) and not slashed(or_empty(result.protocol)),
+    }
+    if ps.no_leading_slashes {
+        result.hostname = Some([])
+        result.port = None
+        if truthy(result.host) {
+            if ps.src.len() > 0 and ps.src[0].len() == 0 {
+                ps.src[0] = or_empty(result.host)
+            } else {
+                ps.src = [or_empty(result.host)] + ps.src
+            }
+        }
+        result.host = Some([])
+        if truthy(relative.protocol) {
+            relative.hostname = None
+            relative.port = None
+            result.auth = None
+            if truthy(relative.host) {
+                if ps.rel.len() > 0 and ps.rel[0].len() == 0 {
+                    ps.rel[0] = or_empty(relative.host)
+                } else {
+                    ps.rel = [or_empty(relative.host)] + ps.rel
+                }
+            }
+            relative.host = None
+        }
+        ps.must_end_abs = ps.must_end_abs and (ps.rel.len() > 0 and ps.rel[0].len() == 0 or ps.src.len() > 0 and ps.src[0].len() == 0)
+    }
+    if is_rel_abs {
+        if relative.host.is_some() {
+            if result.host != relative.host {
+                result.auth = None
+            }
+            result.host = relative.host
+            result.port = relative.port
+        }
+        if relative.hostname.is_some() {
+            if result.hostname != relative.hostname {
+                result.auth = None
+            }
+            result.hostname = relative.hostname
+        }
+        result.search = relative.search
+        result.query = relative.query
+        ps.src = ps.rel
+    } else if ps.rel.len() > 0 {
+        let _dropped = ps.src.pop()
+        ps.src = ps.src + ps.rel
+        result.search = relative.search
+        result.query = relative.query
+    } else if relative.search.is_some() {
+        if ps.no_leading_slashes {
+            result.host = if ps.src.len() > 0 { Some(ps.src.remove(0)) } else { None }
+            result.hostname = result.host
+            match auth_in_host(result.host) {
+                Some(ah) -> {
+                    result.auth = Some(ah.0)
+                    result.host = Some(ah.1)
+                    result.hostname = Some(ah.1)
+                }
+                None -> ()
+            }
+        }
+        result.search = relative.search
+        result.query = relative.query
+        return result
+    }
+    return finish_paths(result, relative, ps)
+}
+
+/// Dot segments, the trailing slash, the host of a hostless protocol.
+fn finish_paths(result0: NodeUrl, relative: NodeUrl, ps0: NodeUrlPaths) -> NodeUrl {
+    var result = result0
+    var ps = ps0
+    if ps.src.len() == 0 {
+        result.pathname = None
+        return result
+    }
+    let last = ps.src[ps.src.len() - 1]
+    let dot = last == u(".") or last == u("..")
+    let trailing = (truthy(result.host) or truthy(relative.host) or ps.src.len() > 1) and dot or last.len() == 0
+    var up = 0
+    var i = ps.src.len() - 1
+    while i >= 0 {
+        let seg = ps.src[i]
+        if seg == u(".") {
+            let _a = ps.src.remove(i)
+        } else if seg == u("..") {
+            let _b = ps.src.remove(i)
+            up = up + 1
+        } else if up > 0 {
+            let _c = ps.src.remove(i)
+            up = up - 1
+        }
+        i = i - 1
+    }
+    if not ps.must_end_abs and not ps.remove_all_dots {
+        while up > 0 {
+            ps.src = [u("..")] + ps.src
+            up = up - 1
+        }
+    }
+    let first_is = |want| ps.src.len() > 0 and ps.src[0] == want
+    if ps.must_end_abs and not first_is([]) and not (ps.src.len() > 0 and ps.src[0].len() > 0 and ps.src[0][0] == 47) {
+        ps.src = [[]] + ps.src
+    }
+    let joined = join_slash(ps.src)
+    if trailing and (joined.len() == 0 or joined[joined.len() - 1] != 47) {
+        ps.src.push([])
+    }
+    let absolute = ps.src.len() > 0 and (ps.src[0].len() == 0 or ps.src[0][0] == 47)
+    if ps.no_leading_slashes {
+        result.host = Some(if absolute { [] } else if ps.src.len() > 0 { ps.src.remove(0) } else { [] })
+        result.hostname = result.host
+        match auth_in_host(result.host) {
+            Some(ah) -> {
+                result.auth = Some(ah.0)
+                result.host = Some(ah.1)
+                result.hostname = Some(ah.1)
+            }
+            None -> ()
+        }
+    }
+    let must = ps.must_end_abs or truthy(result.host) and ps.src.len() > 0
+    if must and not absolute {
+        ps.src = [[]] + ps.src
+    }
+    result.pathname = if ps.src.len() == 0 { None } else { Some(join_slash(ps.src)) }
+    if truthy(relative.auth) {
+        result.auth = relative.auth
+    }
+    if not (result.slashes ?? false) {
+        result.slashes = relative.slashes
+    }
+    return result
+}

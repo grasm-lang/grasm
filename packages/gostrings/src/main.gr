@@ -1,0 +1,969 @@
+// Go's `strings` package where its byte-level and Unicode rules decide the
+// answer, as Go 1.25 computes it: `Fields`, `EqualFold`, `ToUpper`,
+// `ToLower`, `ToTitle`, `Title`, `ToValidUTF8`, `Split`, `SplitN`,
+// `SplitAfter`, `SplitAfterN`, `Cut`, `CutPrefix`, `CutSuffix`, `Count`,
+// `Index`, `LastIndex`, `IndexRune`, `IndexAny`, `LastIndexAny`,
+// `ContainsRune`, `ContainsAny`, `Replace`, `ReplaceAll`, `Trim`,
+// `TrimLeft`, `TrimRight`, `TrimSpace`, `TrimPrefix`, `TrimSuffix` and
+// `NewReplacer` with `Replacer.Replace`; and the rune mappings under them,
+// `unicode.ToUpper`, `ToLower`, `ToTitle` and `SimpleFold`.
+//
+// A Go string is bytes, so these take and return `bytes`, and a program
+// that must give the answers a Go program gives needs Go's exact rules:
+//
+//   - A byte that does not start a valid UTF-8 sequence reads as U+FFFD,
+//     one byte at a time; the case mappings and `Title` write it back as
+//     U+FFFD's three bytes, while `Split` with an empty separator keeps it
+//     as the byte it was. `EqualFold` treats any two such bytes as equal.
+//   - Case mapping is Unicode 15.0's simple mapping (`ß` stays `ß`, `ǆ`
+//     titles as `ǅ`), and `EqualFold` follows `SimpleFold` orbits, so `K`
+//     (U+212A) equals `k` and `ſ` equals `S`.
+//   - `Count(s, "")` is the number of runes plus one, and `Replace` with an
+//     empty `old` inserts at rune boundaries; but a `Replacer` with an empty
+//     old string inserts between every byte, even inside a character, and at
+//     each position takes the first old string, in argument order, that
+//     matches there -- not the longest.
+//   - `Fields` and `TrimSpace` split on Unicode white space (U+0085,
+//     U+00A0, U+3000 and the rest); `Title` capitalizes after anything but
+//     a letter, a digit or `_`, as Go's deprecated `Title` does.
+//   - `SplitN` with `n == 0` gives no pieces, and with `n < 0` all of them;
+//     `IndexAny` and `LastIndexAny` look for U+FFFD where a set holds a
+//     single non-ASCII byte; `IndexRune` of an invalid rune is -1.
+//
+// Not here: the functions that take a function (`Map`, `FieldsFunc`,
+// `TrimFunc`, `IndexFunc` and the rest), the iterator forms (`Lines`,
+// `SplitSeq` ...), `Builder` and `Reader`.
+
+type GoReplacer = { olds: [[i64]], news: [[i64]] }
+
+type GoUnicodeTables = { letters: [i64], digits: [i64], cases: [i64], orbit: [i64] }
+
+fn tables() -> GoUnicodeTables {
+    return GoUnicodeTables{ letters: letter_ranges(), digits: digit_ranges(), cases: case_ranges(), orbit: fold_orbit() }
+}
+
+// ---- UTF-8 as Go decodes and encodes it
+
+/// `utf8.DecodeRune` of `b` from `i`: the rune and its width, U+FFFD and
+/// 1 for a byte that does not start a valid sequence.
+fn decode(b: [i64], i: i64) -> (i64, i64) {
+    let c0 = b[i]
+    if c0 < 128 {
+        return (c0, 1)
+    }
+    let n = b.len() - i
+    let bad = (65533, 1)
+    if c0 < 194 or c0 > 244 {
+        return bad
+    }
+    if c0 < 224 {
+        if n < 2 or b[i + 1] < 128 or b[i + 1] > 191 {
+            return bad
+        }
+        return (c0.bit_and(31).shl(6).bit_or(b[i + 1].bit_and(63)), 2)
+    }
+    let lo = if c0 == 224 { 160 } else if c0 == 240 { 144 } else { 128 }
+    let hi = if c0 == 237 { 159 } else if c0 == 244 { 143 } else { 191 }
+    if n < 2 or b[i + 1] < lo or b[i + 1] > hi {
+        return bad
+    }
+    if n < 3 or b[i + 2] < 128 or b[i + 2] > 191 {
+        return bad
+    }
+    if c0 < 240 {
+        return (c0.bit_and(15).shl(12).bit_or(b[i + 1].bit_and(63).shl(6)).bit_or(b[i + 2].bit_and(63)), 3)
+    }
+    if n < 4 or b[i + 3] < 128 or b[i + 3] > 191 {
+        return bad
+    }
+    return (c0.bit_and(7).shl(18).bit_or(b[i + 1].bit_and(63).shl(12)).bit_or(b[i + 2].bit_and(63).shl(6)).bit_or(b[i + 3].bit_and(63)), 4)
+}
+
+/// `utf8.DecodeLastRune` of `b[..end]`.
+fn decode_last(b: [i64], end: i64) -> (i64, i64) {
+    var start = end - 1
+    if b[start] < 128 {
+        return (b[start], 1)
+    }
+    let lim = (end - 4).max(0)
+    start = start - 1
+    while start >= lim {
+        if b[start] < 128 or b[start] >= 192 {
+            break
+        }
+        start = start - 1
+    }
+    start = start.max(0)
+    let (r, size) = decode(b.slice(start, end), 0)
+    if start + size != end {
+        return (65533, 1)
+    }
+    return (r, size)
+}
+
+fn valid_rune(r: i64) -> bool {
+    return r >= 0 and r <= 1114111 and (r < 55296 or r > 57343)
+}
+
+/// The UTF-8 encoding of `r`, U+FFFD's for a value that is not a rune.
+fn encode(r: i64) -> [i64] {
+    if r >= 0 and r < 128 {
+        return [r]
+    }
+    if r >= 0 and r < 2048 {
+        return [192 + r.shr(6), 128 + r.bit_and(63)]
+    }
+    if not valid_rune(r) {
+        return [239, 191, 189]
+    }
+    if r < 65536 {
+        return [224 + r.shr(12), 128 + r.shr(6).bit_and(63), 128 + r.bit_and(63)]
+    }
+    return [240 + r.shr(18), 128 + r.shr(12).bit_and(63), 128 + r.shr(6).bit_and(63), 128 + r.bit_and(63)]
+}
+
+fn rune_count(b: [i64]) -> i64 {
+    var n = 0
+    var i = 0
+    while i < b.len() {
+        i = i + decode(b, i).1
+        n = n + 1
+    }
+    return n
+}
+
+fn out(b: [i64]) -> bytes {
+    return bytes_of(b)
+}
+
+// ---- Unicode tables
+
+fn in_ranges(t: [i64], r: i64) -> bool {
+    var lo = 0
+    var hi = t.len() / 2 - 1
+    while lo <= hi {
+        let mid = (lo + hi) / 2
+        if r < t[2 * mid] {
+            hi = mid - 1
+        } else if r > t[2 * mid + 1] {
+            lo = mid + 1
+        } else {
+            return true
+        }
+    }
+    return false
+}
+
+/// `unicode.IsSpace`.
+fn is_space(r: i64) -> bool {
+    if r < 256 {
+        return (r >= 9 and r <= 13) or r == 32 or r == 133 or r == 160
+    }
+    return r == 5760 or (r >= 8192 and r <= 8202) or r == 8232 or r == 8233 or r == 8239 or r == 8287 or r == 12288
+}
+
+/// `unicode.To(c, r)` for c = 0 (upper), 1 (lower), 2 (title), from Go's
+/// `CaseRanges`.
+fn to_case(t: GoUnicodeTables, c: i64, r: i64) -> i64 {
+    if r < 128 {
+        if c == 1 {
+            return if r >= 65 and r <= 90 { r + 32 } else { r }
+        }
+        return if r >= 97 and r <= 122 { r - 32 } else { r }
+    }
+    let cr = t.cases
+    var lo = 0
+    var hi = cr.len() / 5
+    while lo < hi {
+        let m = (lo + hi) / 2
+        let first = cr[5 * m]
+        if first <= r and r <= cr[5 * m + 1] {
+            let delta = cr[5 * m + 2 + c]
+            if delta > 1114111 {
+                return first + (r - first).bit_and(0 - 2).bit_or(c.bit_and(1))
+            }
+            return r + delta
+        }
+        if r < first {
+            hi = m
+        } else {
+            lo = m + 1
+        }
+    }
+    return r
+}
+
+fn fold(t: GoUnicodeTables, r: i64) -> i64 {
+    if r < 0 or r > 1114111 {
+        return r
+    }
+    let o = t.orbit
+    var lo = 0
+    var hi = o.len() / 2 - 1
+    while lo <= hi {
+        let mid = (lo + hi) / 2
+        if r < o[2 * mid] {
+            hi = mid - 1
+        } else if r > o[2 * mid] {
+            lo = mid + 1
+        } else {
+            return o[2 * mid + 1]
+        }
+    }
+    let l = to_case(t, 1, r)
+    return if l != r { l } else { to_case(t, 0, r) }
+}
+
+/// `unicode.ToUpper`.
+pub fn unicode_to_upper(r: i64) -> i64 {
+    return to_case(tables(), 0, r)
+}
+
+/// `unicode.ToLower`.
+pub fn unicode_to_lower(r: i64) -> i64 {
+    return to_case(tables(), 1, r)
+}
+
+/// `unicode.ToTitle`.
+pub fn unicode_to_title(r: i64) -> i64 {
+    return to_case(tables(), 2, r)
+}
+
+/// `unicode.SimpleFold`: the next rune, upwards and round again, that
+/// folds to the same thing as `r`.
+pub fn unicode_simple_fold(r: i64) -> i64 {
+    return fold(tables(), r)
+}
+
+// ---- searching
+
+fn find(s: [i64], sep: [i64], from: i64) -> i64 {
+    let n = sep.len()
+    var i = from
+    while i + n <= s.len() {
+        var k = 0
+        while k < n and s[i + k] == sep[k] {
+            k = k + 1
+        }
+        if k == n {
+            return i
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+fn count_list(s: [i64], sep: [i64]) -> i64 {
+    if sep.len() == 0 {
+        return rune_count(s) + 1
+    }
+    var n = 0
+    var i = find(s, sep, 0)
+    while i >= 0 {
+        n = n + 1
+        i = find(s, sep, i + sep.len())
+    }
+    return n
+}
+
+/// `strings.Count`: non-overlapping instances of `sep`; runes plus one when
+/// `sep` is empty.
+pub fn count(s: bytes, sep: bytes) -> i64 {
+    return count_list(s.to_list(), sep.to_list())
+}
+
+/// `strings.Index`.
+pub fn index(s: bytes, sep: bytes) -> i64 {
+    return find(s.to_list(), sep.to_list(), 0)
+}
+
+/// `strings.LastIndex`.
+pub fn last_index(s: bytes, sep: bytes) -> i64 {
+    let a = s.to_list()
+    let b = sep.to_list()
+    var i = a.len() - b.len()
+    while i >= 0 {
+        if a.slice(i, i + b.len()) == b {
+            return i
+        }
+        i = i - 1
+    }
+    return 0 - 1
+}
+
+fn index_rune_list(s: [i64], r: i64) -> i64 {
+    if r >= 0 and r < 128 {
+        return find(s, [r], 0)
+    }
+    if r == 65533 {
+        var i = 0
+        while i < s.len() {
+            let (c, w) = decode(s, i)
+            if c == 65533 {
+                return i
+            }
+            i = i + w
+        }
+        return 0 - 1
+    }
+    if not valid_rune(r) {
+        return 0 - 1
+    }
+    return find(s, encode(r), 0)
+}
+
+/// `strings.IndexRune`: where `r` first appears; U+FFFD also finds a byte
+/// that is not UTF-8; an invalid rune is never found.
+pub fn index_rune(s: bytes, r: i64) -> i64 {
+    return index_rune_list(s.to_list(), r)
+}
+
+/// `strings.ContainsRune`.
+pub fn contains_rune(s: bytes, r: i64) -> bool {
+    return index_rune(s, r) >= 0
+}
+
+/// `strings.IndexAny`.
+pub fn index_any(s: bytes, chars: bytes) -> i64 {
+    let a = s.to_list()
+    let set = chars.to_list()
+    if set.len() == 0 {
+        return 0 - 1
+    }
+    if set.len() == 1 {
+        return index_rune_list(a, if set[0] >= 128 { 65533 } else { set[0] })
+    }
+    var i = 0
+    while i < a.len() {
+        let (c, w) = decode(a, i)
+        if index_rune_list(set, c) >= 0 {
+            return i
+        }
+        i = i + w
+    }
+    return 0 - 1
+}
+
+/// `strings.ContainsAny`.
+pub fn contains_any(s: bytes, chars: bytes) -> bool {
+    return index_any(s, chars) >= 0
+}
+
+/// `strings.LastIndexAny`.
+pub fn last_index_any(s: bytes, chars: bytes) -> i64 {
+    let a = s.to_list()
+    let set = chars.to_list()
+    if set.len() == 0 {
+        return 0 - 1
+    }
+    var i = a.len()
+    while i > 0 {
+        let (r, size) = decode_last(a, i)
+        i = i - size
+        if index_rune_list(set, r) >= 0 {
+            return i
+        }
+    }
+    return 0 - 1
+}
+
+// ---- splitting
+
+fn explode(s: [i64], n0: i64) -> [bytes] {
+    let l = rune_count(s)
+    let n = if n0 < 0 or n0 > l { l } else { n0 }
+    var parts: [bytes] = []
+    var at = 0
+    for _k in 0..(n - 1).max(0) {
+        let w = decode(s, at).1
+        parts.push(out(s.slice(at, at + w)))
+        at = at + w
+    }
+    if n > 0 {
+        parts.push(out(s.slice(at, s.len())))
+    }
+    return parts
+}
+
+fn gen_split(s: [i64], sep: [i64], save: i64, n0: i64) -> [bytes] {
+    if n0 == 0 {
+        return []
+    }
+    if sep.len() == 0 {
+        return explode(s, n0)
+    }
+    var n = if n0 < 0 { count_list(s, sep) + 1 } else { n0 }
+    n = n.min(s.len() + 1) - 1
+    var parts: [bytes] = []
+    var at = 0
+    while parts.len() < n {
+        let m = find(s, sep, at)
+        if m < 0 {
+            break
+        }
+        parts.push(out(s.slice(at, m + save)))
+        at = m + sep.len()
+    }
+    parts.push(out(s.slice(at, s.len())))
+    return parts
+}
+
+/// `strings.SplitN`: at most `n` pieces (all when `n < 0`, none when 0);
+/// an empty `sep` splits after each rune.
+pub fn split_n(s: bytes, sep: bytes, n: i64) -> [bytes] {
+    return gen_split(s.to_list(), sep.to_list(), 0, n)
+}
+
+/// `strings.SplitAfterN`: as `SplitN`, each piece keeping its separator.
+pub fn split_after_n(s: bytes, sep: bytes, n: i64) -> [bytes] {
+    return gen_split(s.to_list(), sep.to_list(), sep.len(), n)
+}
+
+/// `strings.Split`.
+pub fn split(s: bytes, sep: bytes) -> [bytes] {
+    return split_n(s, sep, 0 - 1)
+}
+
+/// `strings.SplitAfter`.
+pub fn split_after(s: bytes, sep: bytes) -> [bytes] {
+    return split_after_n(s, sep, 0 - 1)
+}
+
+/// `strings.Fields`: the runs between Unicode white space.
+pub fn fields(s: bytes) -> [bytes] {
+    let a = s.to_list()
+    var parts: [bytes] = []
+    var start = 0 - 1
+    var i = 0
+    while i < a.len() {
+        let (r, w) = decode(a, i)
+        if is_space(r) {
+            if start >= 0 {
+                parts.push(out(a.slice(start, i)))
+                start = 0 - 1
+            }
+        } else if start < 0 {
+            start = i
+        }
+        i = i + w
+    }
+    if start >= 0 {
+        parts.push(out(a.slice(start, a.len())))
+    }
+    return parts
+}
+
+/// `strings.Cut`: before and after the first `sep`, and whether it was there.
+pub fn cut(s: bytes, sep: bytes) -> (bytes, bytes, bool) {
+    let i = index(s, sep)
+    if i < 0 {
+        return (s, out([]), false)
+    }
+    return (s.slice(0, i), s.slice(i + sep.len(), s.len()), true)
+}
+
+fn has_prefix(s: bytes, p: bytes) -> bool {
+    return s.len() >= p.len() and s.slice(0, p.len()) == p
+}
+
+fn has_suffix(s: bytes, p: bytes) -> bool {
+    return s.len() >= p.len() and s.slice(s.len() - p.len(), s.len()) == p
+}
+
+/// `strings.CutPrefix`.
+pub fn cut_prefix(s: bytes, prefix: bytes) -> (bytes, bool) {
+    return if has_prefix(s, prefix) { (s.slice(prefix.len(), s.len()), true) } else { (s, false) }
+}
+
+/// `strings.CutSuffix`.
+pub fn cut_suffix(s: bytes, suffix: bytes) -> (bytes, bool) {
+    return if has_suffix(s, suffix) { (s.slice(0, s.len() - suffix.len()), true) } else { (s, false) }
+}
+
+/// `strings.TrimPrefix`.
+pub fn trim_prefix(s: bytes, prefix: bytes) -> bytes {
+    return cut_prefix(s, prefix).0
+}
+
+/// `strings.TrimSuffix`.
+pub fn trim_suffix(s: bytes, suffix: bytes) -> bytes {
+    return cut_suffix(s, suffix).0
+}
+
+// ---- case
+
+fn map_case(s: bytes, c: i64) -> bytes {
+    let t = tables()
+    let a = s.to_list()
+    var o: [i64] = []
+    var i = 0
+    while i < a.len() {
+        let (r, w) = decode(a, i)
+        for x in encode(to_case(t, c, r)) {
+            o.push(x)
+        }
+        i = i + w
+    }
+    return out(o)
+}
+
+/// `strings.ToUpper`.
+pub fn to_upper(s: bytes) -> bytes {
+    return map_case(s, 0)
+}
+
+/// `strings.ToLower`.
+pub fn to_lower(s: bytes) -> bytes {
+    return map_case(s, 1)
+}
+
+/// `strings.ToTitle`.
+pub fn to_title(s: bytes) -> bytes {
+    return map_case(s, 2)
+}
+
+fn is_separator(t: GoUnicodeTables, r: i64) -> bool {
+    if r < 128 {
+        return not ((r >= 48 and r <= 57) or (r >= 97 and r <= 122) or (r >= 65 and r <= 90) or r == 95)
+    }
+    if in_ranges(t.letters, r) or in_ranges(t.digits, r) {
+        return false
+    }
+    return is_space(r)
+}
+
+/// `strings.Title`: each rune after a separator in title case.
+pub fn title(s: bytes) -> bytes {
+    let t = tables()
+    let a = s.to_list()
+    var o: [i64] = []
+    var prev = 32
+    var i = 0
+    while i < a.len() {
+        let (r, w) = decode(a, i)
+        let m = if is_separator(t, prev) { to_case(t, 2, r) } else { r }
+        prev = r
+        for x in encode(m) {
+            o.push(x)
+        }
+        i = i + w
+    }
+    return out(o)
+}
+
+/// `strings.EqualFold`: equal under simple Unicode case folding.
+pub fn equal_fold(s: bytes, u: bytes) -> bool {
+    let t = tables()
+    let a = s.to_list()
+    let b = u.to_list()
+    var i = 0
+    var j = 0
+    while i < a.len() {
+        if j >= b.len() {
+            return false
+        }
+        let (r1, w1) = decode(a, i)
+        let (r2, w2) = decode(b, j)
+        i = i + w1
+        j = j + w2
+        if r1 != r2 {
+            let sr = r1.min(r2)
+            let tr = r1.max(r2)
+            if tr < 128 {
+                if not (sr >= 65 and sr <= 90 and tr == sr + 32) {
+                    return false
+                }
+            } else {
+                var r = fold(t, sr)
+                while r != sr and r < tr {
+                    r = fold(t, r)
+                }
+                if r != tr {
+                    return false
+                }
+            }
+        }
+    }
+    return j == b.len()
+}
+
+/// `strings.ToValidUTF8`: each run of bytes that are not UTF-8 replaced by
+/// `replacement`, once.
+pub fn to_valid_utf8(s: bytes, replacement: bytes) -> bytes {
+    let a = s.to_list()
+    var o: [i64] = []
+    var invalid = false
+    var i = 0
+    while i < a.len() {
+        let w = decode(a, i).1
+        if a[i] >= 128 and w == 1 {
+            if not invalid {
+                invalid = true
+                for x in replacement.to_list() {
+                    o.push(x)
+                }
+            }
+            i = i + 1
+        } else {
+            invalid = false
+            for k in 0..w {
+                o.push(a[i + k])
+            }
+            i = i + w
+        }
+    }
+    return out(o)
+}
+
+// ---- trimming
+
+fn trim_left_list(a: [i64], set: [i64]) -> [i64] {
+    var i = 0
+    while i < a.len() {
+        let (r, n) = decode(a, i)
+        if index_rune_list(set, r) < 0 {
+            break
+        }
+        i = i + n
+    }
+    return a.slice(i, a.len())
+}
+
+fn trim_right_list(a: [i64], set: [i64]) -> [i64] {
+    var end = a.len()
+    while end > 0 {
+        let (r, n) = decode_last(a, end)
+        if index_rune_list(set, r) < 0 {
+            break
+        }
+        end = end - n
+    }
+    return a.slice(0, end)
+}
+
+/// `strings.Trim`: runes in `cutset` removed from both ends.
+pub fn trim(s: bytes, cutset: bytes) -> bytes {
+    if s.len() == 0 or cutset.len() == 0 {
+        return s
+    }
+    let set = cutset.to_list()
+    return out(trim_left_list(trim_right_list(s.to_list(), set), set))
+}
+
+/// `strings.TrimLeft`.
+pub fn trim_left(s: bytes, cutset: bytes) -> bytes {
+    if s.len() == 0 or cutset.len() == 0 {
+        return s
+    }
+    return out(trim_left_list(s.to_list(), cutset.to_list()))
+}
+
+/// `strings.TrimRight`.
+pub fn trim_right(s: bytes, cutset: bytes) -> bytes {
+    if s.len() == 0 or cutset.len() == 0 {
+        return s
+    }
+    return out(trim_right_list(s.to_list(), cutset.to_list()))
+}
+
+/// `strings.TrimSpace`: Unicode white space removed from both ends.
+pub fn trim_space(s: bytes) -> bytes {
+    let a = s.to_list()
+    var i = 0
+    while i < a.len() {
+        let (r, n) = decode(a, i)
+        if not is_space(r) {
+            break
+        }
+        i = i + n
+    }
+    var end = a.len()
+    while end > i {
+        let (r, n) = decode_last(a, end)
+        if not is_space(r) {
+            break
+        }
+        end = end - n
+    }
+    return out(a.slice(i, end))
+}
+
+// ---- replacing
+
+/// `strings.Replace`: the first `n` non-overlapping `old` replaced (all when
+/// `n < 0`); an empty `old` matches at the start and after each rune.
+pub fn replace(s: bytes, old: bytes, new: bytes, n: i64) -> bytes {
+    let a = s.to_list()
+    let o = old.to_list()
+    if o == new.to_list() or n == 0 {
+        return s
+    }
+    let m = count_list(a, o)
+    if m == 0 {
+        return s
+    }
+    let times = if n < 0 or m < n { m } else { n }
+    var res: [i64] = []
+    var start = 0
+    for k in 0..times {
+        var j = start
+        if o.len() == 0 {
+            if k > 0 and start < a.len() {
+                j = j + decode(a, start).1
+            }
+        } else {
+            j = find(a, o, start)
+        }
+        for x in a.slice(start, j) {
+            res.push(x)
+        }
+        for x in new.to_list() {
+            res.push(x)
+        }
+        start = j + o.len()
+    }
+    for x in a.slice(start, a.len()) {
+        res.push(x)
+    }
+    return out(res)
+}
+
+/// `strings.ReplaceAll`.
+pub fn replace_all(s: bytes, old: bytes, new: bytes) -> bytes {
+    return replace(s, old, new, 0 - 1)
+}
+
+/// `strings.NewReplacer(old1, new1, old2, new2, ...)`, from the pairs.
+pub fn new_replacer(pairs: [(bytes, bytes)]) -> GoReplacer {
+    return GoReplacer{ olds: pairs.map(|p| p.0.to_list()), news: pairs.map(|p| p.1.to_list()) }
+}
+
+fn starts_at(s: [i64], at: i64, p: [i64]) -> bool {
+    if at + p.len() > s.len() {
+        return false
+    }
+    for k in 0..p.len() {
+        if s[at + k] != p[k] {
+            return false
+        }
+    }
+    return true
+}
+
+/// `Replacer.Replace`: left to right, a byte at a time; at each position
+/// the first pair (in argument order) whose old string starts there, and
+/// an empty old string at most once per position.
+pub fn replacer_replace(r: GoReplacer, s: bytes) -> bytes {
+    let a = s.to_list()
+    var res: [i64] = []
+    var last = 0
+    var prev_empty = false
+    var i = 0
+    while i <= a.len() {
+        var hit = 0 - 1
+        for k in 0..r.olds.len() {
+            if hit < 0 and not (prev_empty and r.olds[k].len() == 0) and starts_at(a, i, r.olds[k]) {
+                hit = k
+            }
+        }
+        prev_empty = hit >= 0 and r.olds[hit].len() == 0
+        if hit >= 0 {
+            for x in a.slice(last, i) {
+                res.push(x)
+            }
+            for x in r.news[hit] {
+                res.push(x)
+            }
+            i = i + r.olds[hit].len()
+            last = i
+        } else {
+            i = i + 1
+        }
+    }
+    for x in a.slice(last, a.len()) {
+        res.push(x)
+    }
+    return out(res)
+}
+
+// ---- Go's unicode tables (Unicode 15.0), generated from Go 1.25
+
+/// `unicode.IsLetter` as ranges.
+fn letter_ranges() -> [i64] {
+    return [
+        65, 90, 97, 122, 170, 170, 181, 181, 186, 186, 192, 214, 216, 246, 248, 705, 710, 721, 736, 740, 748, 748, 750, 750, 880,
+        884, 886, 887, 890, 893, 895, 895, 902, 902, 904, 906, 908, 908, 910, 929, 931, 1013, 1015, 1153, 1162, 1327, 1329, 1366,
+        1369, 1369, 1376, 1416, 1488, 1514, 1519, 1522, 1568, 1610, 1646, 1647, 1649, 1747, 1749, 1749, 1765, 1766, 1774, 1775,
+        1786, 1788, 1791, 1791, 1808, 1808, 1810, 1839, 1869, 1957, 1969, 1969, 1994, 2026, 2036, 2037, 2042, 2042, 2048, 2069,
+        2074, 2074, 2084, 2084, 2088, 2088, 2112, 2136, 2144, 2154, 2160, 2183, 2185, 2190, 2208, 2249, 2308, 2361, 2365, 2365,
+        2384, 2384, 2392, 2401, 2417, 2432, 2437, 2444, 2447, 2448, 2451, 2472, 2474, 2480, 2482, 2482, 2486, 2489, 2493, 2493,
+        2510, 2510, 2524, 2525, 2527, 2529, 2544, 2545, 2556, 2556, 2565, 2570, 2575, 2576, 2579, 2600, 2602, 2608, 2610, 2611,
+        2613, 2614, 2616, 2617, 2649, 2652, 2654, 2654, 2674, 2676, 2693, 2701, 2703, 2705, 2707, 2728, 2730, 2736, 2738, 2739,
+        2741, 2745, 2749, 2749, 2768, 2768, 2784, 2785, 2809, 2809, 2821, 2828, 2831, 2832, 2835, 2856, 2858, 2864, 2866, 2867,
+        2869, 2873, 2877, 2877, 2908, 2909, 2911, 2913, 2929, 2929, 2947, 2947, 2949, 2954, 2958, 2960, 2962, 2965, 2969, 2970,
+        2972, 2972, 2974, 2975, 2979, 2980, 2984, 2986, 2990, 3001, 3024, 3024, 3077, 3084, 3086, 3088, 3090, 3112, 3114, 3129,
+        3133, 3133, 3160, 3162, 3165, 3165, 3168, 3169, 3200, 3200, 3205, 3212, 3214, 3216, 3218, 3240, 3242, 3251, 3253, 3257,
+        3261, 3261, 3293, 3294, 3296, 3297, 3313, 3314, 3332, 3340, 3342, 3344, 3346, 3386, 3389, 3389, 3406, 3406, 3412, 3414,
+        3423, 3425, 3450, 3455, 3461, 3478, 3482, 3505, 3507, 3515, 3517, 3517, 3520, 3526, 3585, 3632, 3634, 3635, 3648, 3654,
+        3713, 3714, 3716, 3716, 3718, 3722, 3724, 3747, 3749, 3749, 3751, 3760, 3762, 3763, 3773, 3773, 3776, 3780, 3782, 3782,
+        3804, 3807, 3840, 3840, 3904, 3911, 3913, 3948, 3976, 3980, 4096, 4138, 4159, 4159, 4176, 4181, 4186, 4189, 4193, 4193,
+        4197, 4198, 4206, 4208, 4213, 4225, 4238, 4238, 4256, 4293, 4295, 4295, 4301, 4301, 4304, 4346, 4348, 4680, 4682, 4685,
+        4688, 4694, 4696, 4696, 4698, 4701, 4704, 4744, 4746, 4749, 4752, 4784, 4786, 4789, 4792, 4798, 4800, 4800, 4802, 4805,
+        4808, 4822, 4824, 4880, 4882, 4885, 4888, 4954, 4992, 5007, 5024, 5109, 5112, 5117, 5121, 5740, 5743, 5759, 5761, 5786,
+        5792, 5866, 5873, 5880, 5888, 5905, 5919, 5937, 5952, 5969, 5984, 5996, 5998, 6000, 6016, 6067, 6103, 6103, 6108, 6108,
+        6176, 6264, 6272, 6276, 6279, 6312, 6314, 6314, 6320, 6389, 6400, 6430, 6480, 6509, 6512, 6516, 6528, 6571, 6576, 6601,
+        6656, 6678, 6688, 6740, 6823, 6823, 6917, 6963, 6981, 6988, 7043, 7072, 7086, 7087, 7098, 7141, 7168, 7203, 7245, 7247,
+        7258, 7293, 7296, 7304, 7312, 7354, 7357, 7359, 7401, 7404, 7406, 7411, 7413, 7414, 7418, 7418, 7424, 7615, 7680, 7957,
+        7960, 7965, 7968, 8005, 8008, 8013, 8016, 8023, 8025, 8025, 8027, 8027, 8029, 8029, 8031, 8061, 8064, 8116, 8118, 8124,
+        8126, 8126, 8130, 8132, 8134, 8140, 8144, 8147, 8150, 8155, 8160, 8172, 8178, 8180, 8182, 8188, 8305, 8305, 8319, 8319,
+        8336, 8348, 8450, 8450, 8455, 8455, 8458, 8467, 8469, 8469, 8473, 8477, 8484, 8484, 8486, 8486, 8488, 8488, 8490, 8493,
+        8495, 8505, 8508, 8511, 8517, 8521, 8526, 8526, 8579, 8580, 11264, 11492, 11499, 11502, 11506, 11507, 11520, 11557, 11559,
+        11559, 11565, 11565, 11568, 11623, 11631, 11631, 11648, 11670, 11680, 11686, 11688, 11694, 11696, 11702, 11704, 11710,
+        11712, 11718, 11720, 11726, 11728, 11734, 11736, 11742, 11823, 11823, 12293, 12294, 12337, 12341, 12347, 12348, 12353,
+        12438, 12445, 12447, 12449, 12538, 12540, 12543, 12549, 12591, 12593, 12686, 12704, 12735, 12784, 12799, 13312, 19903,
+        19968, 42124, 42192, 42237, 42240, 42508, 42512, 42527, 42538, 42539, 42560, 42606, 42623, 42653, 42656, 42725, 42775,
+        42783, 42786, 42888, 42891, 42954, 42960, 42961, 42963, 42963, 42965, 42969, 42994, 43009, 43011, 43013, 43015, 43018,
+        43020, 43042, 43072, 43123, 43138, 43187, 43250, 43255, 43259, 43259, 43261, 43262, 43274, 43301, 43312, 43334, 43360,
+        43388, 43396, 43442, 43471, 43471, 43488, 43492, 43494, 43503, 43514, 43518, 43520, 43560, 43584, 43586, 43588, 43595,
+        43616, 43638, 43642, 43642, 43646, 43695, 43697, 43697, 43701, 43702, 43705, 43709, 43712, 43712, 43714, 43714, 43739,
+        43741, 43744, 43754, 43762, 43764, 43777, 43782, 43785, 43790, 43793, 43798, 43808, 43814, 43816, 43822, 43824, 43866,
+        43868, 43881, 43888, 44002, 44032, 55203, 55216, 55238, 55243, 55291, 63744, 64109, 64112, 64217, 64256, 64262, 64275,
+        64279, 64285, 64285, 64287, 64296, 64298, 64310, 64312, 64316, 64318, 64318, 64320, 64321, 64323, 64324, 64326, 64433,
+        64467, 64829, 64848, 64911, 64914, 64967, 65008, 65019, 65136, 65140, 65142, 65276, 65313, 65338, 65345, 65370, 65382,
+        65470, 65474, 65479, 65482, 65487, 65490, 65495, 65498, 65500, 65536, 65547, 65549, 65574, 65576, 65594, 65596, 65597,
+        65599, 65613, 65616, 65629, 65664, 65786, 66176, 66204, 66208, 66256, 66304, 66335, 66349, 66368, 66370, 66377, 66384,
+        66421, 66432, 66461, 66464, 66499, 66504, 66511, 66560, 66717, 66736, 66771, 66776, 66811, 66816, 66855, 66864, 66915,
+        66928, 66938, 66940, 66954, 66956, 66962, 66964, 66965, 66967, 66977, 66979, 66993, 66995, 67001, 67003, 67004, 67072,
+        67382, 67392, 67413, 67424, 67431, 67456, 67461, 67463, 67504, 67506, 67514, 67584, 67589, 67592, 67592, 67594, 67637,
+        67639, 67640, 67644, 67644, 67647, 67669, 67680, 67702, 67712, 67742, 67808, 67826, 67828, 67829, 67840, 67861, 67872,
+        67897, 67968, 68023, 68030, 68031, 68096, 68096, 68112, 68115, 68117, 68119, 68121, 68149, 68192, 68220, 68224, 68252,
+        68288, 68295, 68297, 68324, 68352, 68405, 68416, 68437, 68448, 68466, 68480, 68497, 68608, 68680, 68736, 68786, 68800,
+        68850, 68864, 68899, 69248, 69289, 69296, 69297, 69376, 69404, 69415, 69415, 69424, 69445, 69488, 69505, 69552, 69572,
+        69600, 69622, 69635, 69687, 69745, 69746, 69749, 69749, 69763, 69807, 69840, 69864, 69891, 69926, 69956, 69956, 69959,
+        69959, 69968, 70002, 70006, 70006, 70019, 70066, 70081, 70084, 70106, 70106, 70108, 70108, 70144, 70161, 70163, 70187,
+        70207, 70208, 70272, 70278, 70280, 70280, 70282, 70285, 70287, 70301, 70303, 70312, 70320, 70366, 70405, 70412, 70415,
+        70416, 70419, 70440, 70442, 70448, 70450, 70451, 70453, 70457, 70461, 70461, 70480, 70480, 70493, 70497, 70656, 70708,
+        70727, 70730, 70751, 70753, 70784, 70831, 70852, 70853, 70855, 70855, 71040, 71086, 71128, 71131, 71168, 71215, 71236,
+        71236, 71296, 71338, 71352, 71352, 71424, 71450, 71488, 71494, 71680, 71723, 71840, 71903, 71935, 71942, 71945, 71945,
+        71948, 71955, 71957, 71958, 71960, 71983, 71999, 71999, 72001, 72001, 72096, 72103, 72106, 72144, 72161, 72161, 72163,
+        72163, 72192, 72192, 72203, 72242, 72250, 72250, 72272, 72272, 72284, 72329, 72349, 72349, 72368, 72440, 72704, 72712,
+        72714, 72750, 72768, 72768, 72818, 72847, 72960, 72966, 72968, 72969, 72971, 73008, 73030, 73030, 73056, 73061, 73063,
+        73064, 73066, 73097, 73112, 73112, 73440, 73458, 73474, 73474, 73476, 73488, 73490, 73523, 73648, 73648, 73728, 74649,
+        74880, 75075, 77712, 77808, 77824, 78895, 78913, 78918, 82944, 83526, 92160, 92728, 92736, 92766, 92784, 92862, 92880,
+        92909, 92928, 92975, 92992, 92995, 93027, 93047, 93053, 93071, 93760, 93823, 93952, 94026, 94032, 94032, 94099, 94111,
+        94176, 94177, 94179, 94179, 94208, 100343, 100352, 101589, 101632, 101640, 110576, 110579, 110581, 110587, 110589, 110590,
+        110592, 110882, 110898, 110898, 110928, 110930, 110933, 110933, 110948, 110951, 110960, 111355, 113664, 113770, 113776,
+        113788, 113792, 113800, 113808, 113817, 119808, 119892, 119894, 119964, 119966, 119967, 119970, 119970, 119973, 119974,
+        119977, 119980, 119982, 119993, 119995, 119995, 119997, 120003, 120005, 120069, 120071, 120074, 120077, 120084, 120086,
+        120092, 120094, 120121, 120123, 120126, 120128, 120132, 120134, 120134, 120138, 120144, 120146, 120485, 120488, 120512,
+        120514, 120538, 120540, 120570, 120572, 120596, 120598, 120628, 120630, 120654, 120656, 120686, 120688, 120712, 120714,
+        120744, 120746, 120770, 120772, 120779, 122624, 122654, 122661, 122666, 122928, 122989, 123136, 123180, 123191, 123197,
+        123214, 123214, 123536, 123565, 123584, 123627, 124112, 124139, 124896, 124902, 124904, 124907, 124909, 124910, 124912,
+        124926, 124928, 125124, 125184, 125251, 125259, 125259, 126464, 126467, 126469, 126495, 126497, 126498, 126500, 126500,
+        126503, 126503, 126505, 126514, 126516, 126519, 126521, 126521, 126523, 126523, 126530, 126530, 126535, 126535, 126537,
+        126537, 126539, 126539, 126541, 126543, 126545, 126546, 126548, 126548, 126551, 126551, 126553, 126553, 126555, 126555,
+        126557, 126557, 126559, 126559, 126561, 126562, 126564, 126564, 126567, 126570, 126572, 126578, 126580, 126583, 126585,
+        126588, 126590, 126590, 126592, 126601, 126603, 126619, 126625, 126627, 126629, 126633, 126635, 126651, 131072, 173791,
+        173824, 177977, 177984, 178205, 178208, 183969, 183984, 191456, 194560, 195101, 196608, 201546, 201552, 205743]
+}
+
+/// `unicode.IsDigit` as ranges.
+fn digit_ranges() -> [i64] {
+    return [
+        48, 57, 1632, 1641, 1776, 1785, 1984, 1993, 2406, 2415, 2534, 2543, 2662, 2671, 2790, 2799, 2918, 2927, 3046, 3055, 3174,
+        3183, 3302, 3311, 3430, 3439, 3558, 3567, 3664, 3673, 3792, 3801, 3872, 3881, 4160, 4169, 4240, 4249, 6112, 6121, 6160,
+        6169, 6470, 6479, 6608, 6617, 6784, 6793, 6800, 6809, 6992, 7001, 7088, 7097, 7232, 7241, 7248, 7257, 42528, 42537, 43216,
+        43225, 43264, 43273, 43472, 43481, 43504, 43513, 43600, 43609, 44016, 44025, 65296, 65305, 66720, 66729, 68912, 68921,
+        69734, 69743, 69872, 69881, 69942, 69951, 70096, 70105, 70384, 70393, 70736, 70745, 70864, 70873, 71248, 71257, 71360,
+        71369, 71472, 71481, 71904, 71913, 72016, 72025, 72784, 72793, 73040, 73049, 73120, 73129, 73552, 73561, 92768, 92777,
+        92864, 92873, 93008, 93017, 120782, 120831, 123200, 123209, 123632, 123641, 124144, 124153, 125264, 125273, 130032,
+        130041]
+}
+
+/// `unicode.CaseRanges`: lo, hi and the upper, lower and title deltas,
+/// 1114112 marking an upper-lower alternation.
+fn case_ranges() -> [i64] {
+    return [
+        65, 90, 0, 32, 0, 97, 122, -32, 0, -32, 181, 181, 743, 0, 743, 192, 214, 0, 32, 0, 216, 222, 0, 32, 0, 224, 246, -32, 0,
+        -32, 248, 254, -32, 0, -32, 255, 255, 121, 0, 121, 256, 303, 1114112, 1114112, 1114112, 304, 304, 0, -199, 0, 305, 305,
+        -232, 0, -232, 306, 311, 1114112, 1114112, 1114112, 313, 328, 1114112, 1114112, 1114112, 330, 375, 1114112, 1114112,
+        1114112, 376, 376, 0, -121, 0, 377, 382, 1114112, 1114112, 1114112, 383, 383, -300, 0, -300, 384, 384, 195, 0, 195, 385,
+        385, 0, 210, 0, 386, 389, 1114112, 1114112, 1114112, 390, 390, 0, 206, 0, 391, 392, 1114112, 1114112, 1114112, 393, 394,
+        0, 205, 0, 395, 396, 1114112, 1114112, 1114112, 398, 398, 0, 79, 0, 399, 399, 0, 202, 0, 400, 400, 0, 203, 0, 401, 402,
+        1114112, 1114112, 1114112, 403, 403, 0, 205, 0, 404, 404, 0, 207, 0, 405, 405, 97, 0, 97, 406, 406, 0, 211, 0, 407, 407,
+        0, 209, 0, 408, 409, 1114112, 1114112, 1114112, 410, 410, 163, 0, 163, 412, 412, 0, 211, 0, 413, 413, 0, 213, 0, 414, 414,
+        130, 0, 130, 415, 415, 0, 214, 0, 416, 421, 1114112, 1114112, 1114112, 422, 422, 0, 218, 0, 423, 424, 1114112, 1114112,
+        1114112, 425, 425, 0, 218, 0, 428, 429, 1114112, 1114112, 1114112, 430, 430, 0, 218, 0, 431, 432, 1114112, 1114112,
+        1114112, 433, 434, 0, 217, 0, 435, 438, 1114112, 1114112, 1114112, 439, 439, 0, 219, 0, 440, 441, 1114112, 1114112,
+        1114112, 444, 445, 1114112, 1114112, 1114112, 447, 447, 56, 0, 56, 452, 452, 0, 2, 1, 453, 453, -1, 1, 0, 454, 454, -2, 0,
+        -1, 455, 455, 0, 2, 1, 456, 456, -1, 1, 0, 457, 457, -2, 0, -1, 458, 458, 0, 2, 1, 459, 459, -1, 1, 0, 460, 460, -2, 0,
+        -1, 461, 476, 1114112, 1114112, 1114112, 477, 477, -79, 0, -79, 478, 495, 1114112, 1114112, 1114112, 497, 497, 0, 2, 1,
+        498, 498, -1, 1, 0, 499, 499, -2, 0, -1, 500, 501, 1114112, 1114112, 1114112, 502, 502, 0, -97, 0, 503, 503, 0, -56, 0,
+        504, 543, 1114112, 1114112, 1114112, 544, 544, 0, -130, 0, 546, 563, 1114112, 1114112, 1114112, 570, 570, 0, 10795, 0,
+        571, 572, 1114112, 1114112, 1114112, 573, 573, 0, -163, 0, 574, 574, 0, 10792, 0, 575, 576, 10815, 0, 10815, 577, 578,
+        1114112, 1114112, 1114112, 579, 579, 0, -195, 0, 580, 580, 0, 69, 0, 581, 581, 0, 71, 0, 582, 591, 1114112, 1114112,
+        1114112, 592, 592, 10783, 0, 10783, 593, 593, 10780, 0, 10780, 594, 594, 10782, 0, 10782, 595, 595, -210, 0, -210, 596,
+        596, -206, 0, -206, 598, 599, -205, 0, -205, 601, 601, -202, 0, -202, 603, 603, -203, 0, -203, 604, 604, 42319, 0, 42319,
+        608, 608, -205, 0, -205, 609, 609, 42315, 0, 42315, 611, 611, -207, 0, -207, 613, 613, 42280, 0, 42280, 614, 614, 42308,
+        0, 42308, 616, 616, -209, 0, -209, 617, 617, -211, 0, -211, 618, 618, 42308, 0, 42308, 619, 619, 10743, 0, 10743, 620,
+        620, 42305, 0, 42305, 623, 623, -211, 0, -211, 625, 625, 10749, 0, 10749, 626, 626, -213, 0, -213, 629, 629, -214, 0,
+        -214, 637, 637, 10727, 0, 10727, 640, 640, -218, 0, -218, 642, 642, 42307, 0, 42307, 643, 643, -218, 0, -218, 647, 647,
+        42282, 0, 42282, 648, 648, -218, 0, -218, 649, 649, -69, 0, -69, 650, 651, -217, 0, -217, 652, 652, -71, 0, -71, 658, 658,
+        -219, 0, -219, 669, 669, 42261, 0, 42261, 670, 670, 42258, 0, 42258, 837, 837, 84, 0, 84, 880, 883, 1114112, 1114112,
+        1114112, 886, 887, 1114112, 1114112, 1114112, 891, 893, 130, 0, 130, 895, 895, 0, 116, 0, 902, 902, 0, 38, 0, 904, 906, 0,
+        37, 0, 908, 908, 0, 64, 0, 910, 911, 0, 63, 0, 913, 929, 0, 32, 0, 931, 939, 0, 32, 0, 940, 940, -38, 0, -38, 941, 943,
+        -37, 0, -37, 945, 961, -32, 0, -32, 962, 962, -31, 0, -31, 963, 971, -32, 0, -32, 972, 972, -64, 0, -64, 973, 974, -63, 0,
+        -63, 975, 975, 0, 8, 0, 976, 976, -62, 0, -62, 977, 977, -57, 0, -57, 981, 981, -47, 0, -47, 982, 982, -54, 0, -54, 983,
+        983, -8, 0, -8, 984, 1007, 1114112, 1114112, 1114112, 1008, 1008, -86, 0, -86, 1009, 1009, -80, 0, -80, 1010, 1010, 7, 0,
+        7, 1011, 1011, -116, 0, -116, 1012, 1012, 0, -60, 0, 1013, 1013, -96, 0, -96, 1015, 1016, 1114112, 1114112, 1114112, 1017,
+        1017, 0, -7, 0, 1018, 1019, 1114112, 1114112, 1114112, 1021, 1023, 0, -130, 0, 1024, 1039, 0, 80, 0, 1040, 1071, 0, 32, 0,
+        1072, 1103, -32, 0, -32, 1104, 1119, -80, 0, -80, 1120, 1153, 1114112, 1114112, 1114112, 1162, 1215, 1114112, 1114112,
+        1114112, 1216, 1216, 0, 15, 0, 1217, 1230, 1114112, 1114112, 1114112, 1231, 1231, -15, 0, -15, 1232, 1327, 1114112,
+        1114112, 1114112, 1329, 1366, 0, 48, 0, 1377, 1414, -48, 0, -48, 4256, 4293, 0, 7264, 0, 4295, 4295, 0, 7264, 0, 4301,
+        4301, 0, 7264, 0, 4304, 4346, 3008, 0, 0, 4349, 4351, 3008, 0, 0, 5024, 5103, 0, 38864, 0, 5104, 5109, 0, 8, 0, 5112,
+        5117, -8, 0, -8, 7296, 7296, -6254, 0, -6254, 7297, 7297, -6253, 0, -6253, 7298, 7298, -6244, 0, -6244, 7299, 7300, -6242,
+        0, -6242, 7301, 7301, -6243, 0, -6243, 7302, 7302, -6236, 0, -6236, 7303, 7303, -6181, 0, -6181, 7304, 7304, 35266, 0,
+        35266, 7312, 7354, 0, -3008, 0, 7357, 7359, 0, -3008, 0, 7545, 7545, 35332, 0, 35332, 7549, 7549, 3814, 0, 3814, 7566,
+        7566, 35384, 0, 35384, 7680, 7829, 1114112, 1114112, 1114112, 7835, 7835, -59, 0, -59, 7838, 7838, 0, -7615, 0, 7840,
+        7935, 1114112, 1114112, 1114112, 7936, 7943, 8, 0, 8, 7944, 7951, 0, -8, 0, 7952, 7957, 8, 0, 8, 7960, 7965, 0, -8, 0,
+        7968, 7975, 8, 0, 8, 7976, 7983, 0, -8, 0, 7984, 7991, 8, 0, 8, 7992, 7999, 0, -8, 0, 8000, 8005, 8, 0, 8, 8008, 8013, 0,
+        -8, 0, 8017, 8017, 8, 0, 8, 8019, 8019, 8, 0, 8, 8021, 8021, 8, 0, 8, 8023, 8023, 8, 0, 8, 8025, 8025, 0, -8, 0, 8027,
+        8027, 0, -8, 0, 8029, 8029, 0, -8, 0, 8031, 8031, 0, -8, 0, 8032, 8039, 8, 0, 8, 8040, 8047, 0, -8, 0, 8048, 8049, 74, 0,
+        74, 8050, 8053, 86, 0, 86, 8054, 8055, 100, 0, 100, 8056, 8057, 128, 0, 128, 8058, 8059, 112, 0, 112, 8060, 8061, 126, 0,
+        126, 8064, 8071, 8, 0, 8, 8072, 8079, 0, -8, 0, 8080, 8087, 8, 0, 8, 8088, 8095, 0, -8, 0, 8096, 8103, 8, 0, 8, 8104,
+        8111, 0, -8, 0, 8112, 8113, 8, 0, 8, 8115, 8115, 9, 0, 9, 8120, 8121, 0, -8, 0, 8122, 8123, 0, -74, 0, 8124, 8124, 0, -9,
+        0, 8126, 8126, -7205, 0, -7205, 8131, 8131, 9, 0, 9, 8136, 8139, 0, -86, 0, 8140, 8140, 0, -9, 0, 8144, 8145, 8, 0, 8,
+        8152, 8153, 0, -8, 0, 8154, 8155, 0, -100, 0, 8160, 8161, 8, 0, 8, 8165, 8165, 7, 0, 7, 8168, 8169, 0, -8, 0, 8170, 8171,
+        0, -112, 0, 8172, 8172, 0, -7, 0, 8179, 8179, 9, 0, 9, 8184, 8185, 0, -128, 0, 8186, 8187, 0, -126, 0, 8188, 8188, 0, -9,
+        0, 8486, 8486, 0, -7517, 0, 8490, 8490, 0, -8383, 0, 8491, 8491, 0, -8262, 0, 8498, 8498, 0, 28, 0, 8526, 8526, -28, 0,
+        -28, 8544, 8559, 0, 16, 0, 8560, 8575, -16, 0, -16, 8579, 8580, 1114112, 1114112, 1114112, 9398, 9423, 0, 26, 0, 9424,
+        9449, -26, 0, -26, 11264, 11311, 0, 48, 0, 11312, 11359, -48, 0, -48, 11360, 11361, 1114112, 1114112, 1114112, 11362,
+        11362, 0, -10743, 0, 11363, 11363, 0, -3814, 0, 11364, 11364, 0, -10727, 0, 11365, 11365, -10795, 0, -10795, 11366, 11366,
+        -10792, 0, -10792, 11367, 11372, 1114112, 1114112, 1114112, 11373, 11373, 0, -10780, 0, 11374, 11374, 0, -10749, 0, 11375,
+        11375, 0, -10783, 0, 11376, 11376, 0, -10782, 0, 11378, 11379, 1114112, 1114112, 1114112, 11381, 11382, 1114112, 1114112,
+        1114112, 11390, 11391, 0, -10815, 0, 11392, 11491, 1114112, 1114112, 1114112, 11499, 11502, 1114112, 1114112, 1114112,
+        11506, 11507, 1114112, 1114112, 1114112, 11520, 11557, -7264, 0, -7264, 11559, 11559, -7264, 0, -7264, 11565, 11565,
+        -7264, 0, -7264, 42560, 42605, 1114112, 1114112, 1114112, 42624, 42651, 1114112, 1114112, 1114112, 42786, 42799, 1114112,
+        1114112, 1114112, 42802, 42863, 1114112, 1114112, 1114112, 42873, 42876, 1114112, 1114112, 1114112, 42877, 42877, 0,
+        -35332, 0, 42878, 42887, 1114112, 1114112, 1114112, 42891, 42892, 1114112, 1114112, 1114112, 42893, 42893, 0, -42280, 0,
+        42896, 42899, 1114112, 1114112, 1114112, 42900, 42900, 48, 0, 48, 42902, 42921, 1114112, 1114112, 1114112, 42922, 42922,
+        0, -42308, 0, 42923, 42923, 0, -42319, 0, 42924, 42924, 0, -42315, 0, 42925, 42925, 0, -42305, 0, 42926, 42926, 0, -42308,
+        0, 42928, 42928, 0, -42258, 0, 42929, 42929, 0, -42282, 0, 42930, 42930, 0, -42261, 0, 42931, 42931, 0, 928, 0, 42932,
+        42947, 1114112, 1114112, 1114112, 42948, 42948, 0, -48, 0, 42949, 42949, 0, -42307, 0, 42950, 42950, 0, -35384, 0, 42951,
+        42954, 1114112, 1114112, 1114112, 42960, 42961, 1114112, 1114112, 1114112, 42966, 42969, 1114112, 1114112, 1114112, 42997,
+        42998, 1114112, 1114112, 1114112, 43859, 43859, -928, 0, -928, 43888, 43967, -38864, 0, -38864, 65313, 65338, 0, 32, 0,
+        65345, 65370, -32, 0, -32, 66560, 66599, 0, 40, 0, 66600, 66639, -40, 0, -40, 66736, 66771, 0, 40, 0, 66776, 66811, -40,
+        0, -40, 66928, 66938, 0, 39, 0, 66940, 66954, 0, 39, 0, 66956, 66962, 0, 39, 0, 66964, 66965, 0, 39, 0, 66967, 66977, -39,
+        0, -39, 66979, 66993, -39, 0, -39, 66995, 67001, -39, 0, -39, 67003, 67004, -39, 0, -39, 68736, 68786, 0, 64, 0, 68800,
+        68850, -64, 0, -64, 71840, 71871, 0, 32, 0, 71872, 71903, -32, 0, -32, 93760, 93791, 0, 32, 0, 93792, 93823, -32, 0, -32,
+        125184, 125217, 0, 34, 0, 125218, 125251, -34, 0, -34]
+}
+
+/// The `SimpleFold` steps the case ranges do not give: from, to.
+fn fold_orbit() -> [i64] {
+    return [
+        107, 8490, 115, 383, 223, 7838, 229, 8491, 304, 304, 305, 305, 452, 453, 455, 456, 458, 459, 497, 498, 931, 962, 946, 976,
+        949, 1013, 952, 977, 953, 8126, 954, 1008, 956, 181, 960, 982, 961, 1009, 962, 963, 966, 981, 969, 8486, 977, 1012, 1012,
+        920, 1074, 7296, 1076, 7297, 1086, 7298, 1089, 7299, 1090, 7300, 1098, 7302, 1123, 7303, 7300, 7301, 7777, 7835, 8126,
+        837, 8486, 937, 8490, 75, 8491, 197, 42571, 7304]
+}

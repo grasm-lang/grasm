@@ -1,0 +1,4 @@
+[package]
+name = "nodepathwin32"
+version = "1.0.0"
+capabilities = []

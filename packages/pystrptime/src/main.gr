@@ -1,0 +1,1144 @@
+// Python's `time.strptime` and `datetime.strptime`, as CPython 3.13 parses
+// dates in the C locale with the time zone set to UTC: `_strptime`'s
+// format-to-regex translation, its matching, and its date arithmetic,
+// errors included.
+//
+// Python services parse timestamps from logs, forms and APIs with these,
+// and what they accept is particular:
+//
+//   - The format becomes a case-insensitive regular expression: a run of
+//     whitespace matches any run of Unicode whitespace, `'` also matches
+//     `ʼ`, other characters match themselves under `re`'s case folding
+//     (so `k` matches the Kelvin sign), and each directive is a fixed
+//     alternation tried in order (`%d` is `3[01]|[12]\d|0[1-9]|[1-9]| [1-9]`),
+//     with backtracking between them -- `%Y%m%d` reads `2020123` as
+//     2020-12-03. `\d` is any Unicode decimal digit, `%f` only ASCII.
+//   - Names (`%a %A %b %B %p`) are the C locale's English ones; `%Z`
+//     accepts `utc` and `gmt` (the zone is UTC); `%z` takes `Z` or
+//     `+HH[:]MM[[:]SS[.ffffff]]`, refusing mixed colons.
+//   - Errors: "time data '...' does not match format '...'" (both as
+//     `repr` writes them), "unconverted data remains: ...", "'q' is a bad
+//     directive in format '%q'" (a `%` before an escaped character reports
+//     `%`), the `%G`/`%V`/`%j` combination rules, and the date errors
+//     ("day is out of range for month", "Invalid week: 53", ...).
+//   - `%j`, `%U`/`%W` with a weekday, and `%G %V` with a weekday decide
+//     the date; a day-of-year past the year's end moves into the next year
+//     and week 0 can move into the previous one; with no year, 1900 is
+//     used (1904 while computing February 29).
+//   - `datetime.strptime` then builds a `datetime`, which checks seconds
+//     (`%S` takes 61 for `time.strptime`, not for `datetime`) and the UTC
+//     offset (less than 24 hours either way).
+//
+// `%c`, `%x` and `%X` use the C locale's formats as CPython 3.13 computes
+// them on macOS (`%a %b %d %H:%M:%S %Y`, `%m/%d/%y`, `%H:%M:%S`). A format
+// naming one group twice raises re's PatternError with its message, as
+// Python does. The case tables at the end are generated from CPython
+// 3.13's `re` by gen_tables.py.
+
+import pycharclass
+
+/// Python's exception: class and message.
+type PyStrptimeError = | PyStrptimeError(cls: str, msg: str)
+
+pub fn error_class(e: PyStrptimeError) -> str {
+    return match e {
+        PyStrptimeError(c, _m) -> c
+    }
+}
+
+pub fn error_text(e: PyStrptimeError) -> str {
+    return match e {
+        PyStrptimeError(_c, m) -> m
+    }
+}
+
+fn value_error(msg: str) -> PyStrptimeError {
+    return PyStrptimeError("ValueError", msg)
+}
+
+/// `time.strptime`'s struct_time.
+type PyStructTime = {
+    year: i64,
+    month: i64,
+    day: i64,
+    hour: i64,
+    minute: i64,
+    second: i64,
+    weekday: i64,
+    yday: i64,
+    isdst: i64,
+    zone: Option[str],
+    gmtoff: Option[i64],
+}
+
+/// `datetime.strptime`'s datetime: its fields, and its UTC offset in
+/// microseconds and its zone's `tzname()` when it has a timezone.
+type PyStrptimeDateTime = {
+    year: i64,
+    month: i64,
+    day: i64,
+    hour: i64,
+    minute: i64,
+    second: i64,
+    microsecond: i64,
+    offset: Option[i64],
+    tzname: Option[str],
+}
+
+fn from_codes(cs: [i64]) -> str {
+    return cs.map(|c| c.to_char()).join("")
+}
+
+fn hex_digits(v: i64, width: i64) -> str {
+    return v.to_base(16).pad_start(width, "0")
+}
+
+/// Python 3.13's `repr` of a str (printable characters by pycharclass).
+fn py_repr(s: str) -> str {
+    let cs = s.codes()
+    let quote = if cs.contains(39) and not cs.contains(34) { 34 } else { 39 }
+    var out: [str] = [quote.to_char()]
+    for c in cs {
+        if c == quote or c == 92 {
+            out.push("\\" + c.to_char())
+        } else if c == 9 {
+            out.push("\\t")
+        } else if c == 10 {
+            out.push("\\n")
+        } else if c == 13 {
+            out.push("\\r")
+        } else if c < 32 or c == 127 {
+            out.push("\\x" + hex_digits(c, 2))
+        } else if c < 127 or pycharclass.is_printable(c) {
+            out.push(c.to_char())
+        } else if c < 256 {
+            out.push("\\x" + hex_digits(c, 2))
+        } else if c < 65536 {
+            out.push("\\u" + hex_digits(c, 4))
+        } else {
+            out.push("\\U" + hex_digits(c, 8))
+        }
+    }
+    out.push(quote.to_char())
+    return out.join("")
+}
+
+// ---- re's case-insensitive comparison
+
+fn re_lower(cp: i64) -> i64 {
+    let runs = PYSTRPTIME_LOWER_RUNS
+    var lo = 0
+    var hi = runs.len() / 4 - 1
+    if cp < runs[0] {
+        return cp
+    }
+    while lo < hi {
+        let mid = (lo + hi + 1) / 2
+        if runs[mid * 4] <= cp {
+            lo = mid
+        } else {
+            hi = mid - 1
+        }
+    }
+    let at = lo * 4
+    if cp > runs[at + 1] or (cp - runs[at]) % runs[at + 2] != 0 {
+        return cp
+    }
+    return cp + runs[at + 3]
+}
+
+fn re_cased(cp: i64) -> bool {
+    let starts = PYSTRPTIME_CASED_STARTS
+    var lo = 0
+    var hi = starts.len() - 1
+    while lo < hi {
+        let mid = (lo + hi + 1) / 2
+        if starts[mid] <= cp {
+            lo = mid
+        } else {
+            hi = mid - 1
+        }
+    }
+    return lo % 2 == 1
+}
+
+/// Whether data character `d` matches pattern character `c` under
+/// `re.IGNORECASE`.
+fn same_ignoring_case(c: i64, d: i64) -> bool {
+    if not re_cased(c) {
+        return c == d
+    }
+    let lo = re_lower(c)
+    let ld = re_lower(d)
+    if ld == lo {
+        return true
+    }
+    let extra = PYSTRPTIME_EXTRA_CASES
+    var k = 0
+    while k + 3 < extra.len() {
+        if extra[k] == lo {
+            return (extra[k + 1] > 0 and extra[k + 2] == ld) or (extra[k + 1] > 1 and extra[k + 3] == ld)
+        }
+        k = k + 4
+    }
+    return false
+}
+
+// ---- the format
+
+/// One piece of the compiled format: a character, a run of whitespace,
+/// an apostrophe, or a directive.
+type PtToken = | PtChar(c: i64) | PtSpace | PtApos | PtDirective(key: str)
+
+/// One unit of the regex source the format turns into, before directives
+/// are substituted: its source characters and what it matches.
+type PtUnit = { text: [i64], token: PtToken }
+
+fn is_special(c: i64) -> bool {
+    return "\\.^$*+?()\{}[]|".codes().contains(c)
+}
+
+fn units_of(format: str) -> [PtUnit] {
+    let cs = format.codes()
+    var out: [PtUnit] = []
+    var i = 0
+    while i < cs.len() {
+        let c = cs[i]
+        if pycharclass.re_space(c) {
+            while i < cs.len() and pycharclass.re_space(cs[i]) {
+                i = i + 1
+            }
+            out.push(PtUnit{ text: [92, 115, 43], token: PtSpace })
+            continue
+        }
+        if c == 39 {
+            out.push(PtUnit{ text: [91, 39, 700, 93], token: PtApos })
+        } else if is_special(c) {
+            out.push(PtUnit{ text: [92, c], token: PtChar(c) })
+        } else {
+            out.push(PtUnit{ text: [c], token: PtChar(c) })
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn directive_keys() -> [str] {
+    return ["d", "f", "H", "I", "G", "j", "m", "M", "S", "U", "w", "u", "V", "y", "Y", "z", "A", "a", "B", "b", "p", "Z", "%", "Od", "Om", "Oy", "OH", "OI",
+        "OM", "OS", "Ow", "W", "c", "x", "X"]
+}
+
+/// `pattern(format)` as tokens: the `%(O?.)` substitution over the escaped
+/// source, raising Python's error for an unknown directive.
+fn tokens_of(format: str) -> [PtToken] ! PyStrptimeError {
+    let units = units_of(format)
+    // The source characters, each with the unit it came from.
+    var src: [i64] = []
+    var owner: [i64] = []
+    for u in 0..units.len() {
+        for c in units[u].text {
+            src.push(c)
+            owner.push(u)
+        }
+    }
+    var out: [PtToken] = []
+    var i = 0
+    var last_unit = 0 - 1
+    while i < src.len() {
+        if src[i] == 37 and i + 1 < src.len() {
+            let two = src[i + 1] == 79 and i + 2 < src.len()
+            let key = from_codes(src.slice(i + 1, if two { i + 3 } else { i + 2 }))
+            if not directive_keys().contains(key) {
+                fail(value_error("'" + (if key == "\\" { "%" } else { key }) + "' is a bad directive in format '" + format + "'"))
+            }
+            out.push(PtDirective(key))
+            i = i + (if two { 3 } else { 2 })
+            last_unit = owner[i - 1]
+            continue
+        }
+        if owner[i] != last_unit {
+            out.push(units[owner[i]].token)
+            last_unit = owner[i]
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn locale_format(key: str) -> str {
+    return if key == "c" { "%a %b %d %H:%M:%S %Y" } else if key == "x" { "%m/%d/%y" } else { "%H:%M:%S" }
+}
+
+/// The tokens with %c, %x and %X expanded.
+fn expanded(format: str) -> [PtToken] ! PyStrptimeError {
+    var out: [PtToken] = []
+    for t in try tokens_of(format) {
+        match t {
+            PtDirective(k) -> if k == "c" or k == "x" or k == "X" {
+                for inner in try tokens_of(locale_format(k)) {
+                    out.push(inner)
+                }
+            } else {
+                out.push(t)
+            }
+            _ -> out.push(t)
+        }
+    }
+    return out
+}
+
+// ---- the regex text, for re's duplicate-group error
+
+fn names_regex(names: [str], key: str) -> str {
+    return "(?P<" + key + ">" + names.join("|") + ")"
+}
+
+/// The regex text Python substitutes for a directive.
+fn directive_regex(key: str) -> str {
+    if key == "d" {
+        return "(?P<d>3[0-1]|[1-2]\\d|0[1-9]|[1-9]| [1-9])"
+    }
+    if key == "f" {
+        return "(?P<f>[0-9]\{1,6})"
+    }
+    if key == "H" {
+        return "(?P<H>2[0-3]|[0-1]\\d|\\d)"
+    }
+    if key == "I" {
+        return "(?P<I>1[0-2]|0[1-9]|[1-9]| [1-9])"
+    }
+    if key == "G" or key == "Y" {
+        return "(?P<" + key + ">\\d\\d\\d\\d)"
+    }
+    if key == "j" {
+        return "(?P<j>36[0-6]|3[0-5]\\d|[1-2]\\d\\d|0[1-9]\\d|00[1-9]|[1-9]\\d|0[1-9]|[1-9])"
+    }
+    if key == "m" {
+        return "(?P<m>1[0-2]|0[1-9]|[1-9])"
+    }
+    if key == "M" {
+        return "(?P<M>[0-5]\\d|\\d)"
+    }
+    if key == "S" {
+        return "(?P<S>6[0-1]|[0-5]\\d|\\d)"
+    }
+    if key == "U" or key == "W" {
+        return "(?P<" + key + ">5[0-3]|[0-4]\\d|\\d)"
+    }
+    if key == "w" {
+        return "(?P<w>[0-6])"
+    }
+    if key == "u" {
+        return "(?P<u>[1-7])"
+    }
+    if key == "V" {
+        return "(?P<V>5[0-3]|0[1-9]|[1-4]\\d|\\d)"
+    }
+    if key == "y" {
+        return "(?P<y>\\d\\d)"
+    }
+    if key == "z" {
+        return "(?P<z>[+-]\\d\\d:?[0-5]\\d(:?[0-5]\\d(\\.\\d\{1,6})?)?|(?-i:Z))"
+    }
+    if key == "%" {
+        return "%"
+    }
+    if key == "Ow" {
+        return "(?P<w>\\d)"
+    }
+    if key.len() == 2 {
+        return "(?P<" + key.substr(1, 1) + ">\\d\\d|\\d| \\d)"
+    }
+    return names_regex(names_for(key), key)
+}
+
+fn group_name(key: str) -> Option[str] {
+    if key == "%" {
+        return None
+    }
+    return Some(if key.len() == 2 { key.substr(1, 1) } else { key })
+}
+
+/// re's "redefinition of group name" error, with its group numbers and
+/// the position of the second name in the regex text.
+fn check_groups(format: str) -> bool ! PyStrptimeError {
+    var text: [i64] = []
+    var names: [str] = []
+    var numbers: [i64] = []
+    var groups = 0
+    for t in try expanded_with_text(format) {
+        match t.0 {
+            Some(key) -> {
+                let name = group_name(key)
+                match name {
+                    Some(n) -> {
+                        groups = groups + 1
+                        for k in 0..names.len() {
+                            if names[k] == n {
+                                fail(PyStrptimeError("PatternError", "redefinition of group name " + py_repr(n) + " as group {groups}; was group {numbers[k]} at position {text.len() + 4}"))
+                            }
+                        }
+                        names.push(n)
+                        numbers.push(groups)
+                        if key == "z" {
+                            groups = groups + 2
+                        }
+                    }
+                    None -> {}
+                }
+            }
+            None -> {}
+        }
+        for c in t.1.codes() {
+            text.push(c)
+        }
+    }
+    return true
+}
+
+/// The expanded tokens, each with the regex text it stands for.
+fn expanded_with_text(format: str) -> [(Option[str], str)] ! PyStrptimeError {
+    var out: [(Option[str], str)] = []
+    for t in try tokens_of(format) {
+        match t {
+            PtDirective(k) -> if k == "c" or k == "x" or k == "X" {
+                for inner in try tokens_of(locale_format(k)) {
+                    out.push(token_text(inner))
+                }
+            } else {
+                out.push(token_text(t))
+            }
+            _ -> out.push(token_text(t))
+        }
+    }
+    return out
+}
+
+fn token_text(t: PtToken) -> (Option[str], str) {
+    return match t {
+        PtChar(c) -> (None, if is_special(c) { "\\" + c.to_char() } else { c.to_char() })
+        PtSpace -> (None, "\\s+")
+        PtApos -> (None, "['ʼ]")
+        PtDirective(k) -> (Some(k), directive_regex(k))
+    }
+}
+
+// ---- matching
+
+fn names_for(key: str) -> [str] {
+    if key == "a" {
+        return ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+    }
+    if key == "A" {
+        return ["wednesday", "thursday", "saturday", "tuesday", "monday", "friday", "sunday"]
+    }
+    if key == "b" {
+        return ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"]
+    }
+    if key == "B" {
+        return ["september", "february", "november", "december", "january", "october", "august", "march", "april", "june", "july", "may"]
+    }
+    if key == "p" {
+        return ["am", "pm"]
+    }
+    return ["utc", "gmt"]
+}
+
+fn is_digit_at(cs: [i64], i: i64) -> bool {
+    return i < cs.len() and pycharclass.re_digit(cs[i])
+}
+
+fn in_range_at(cs: [i64], i: i64, lo: i64, hi: i64) -> bool {
+    return i < cs.len() and cs[i] >= lo and cs[i] <= hi
+}
+
+/// One alternative of a directive, as a list of steps: `D` any decimal
+/// digit, `rXY` an ASCII digit from X to Y, or a literal character.
+fn steps_match(cs: [i64], at: i64, steps: [str]) -> bool {
+    var i = at
+    for s in steps {
+        let ok = if s == "D" {
+            is_digit_at(cs, i)
+        } else if s.len() == 3 and s.starts_with("r") {
+            in_range_at(cs, i, s.code_at(1), s.code_at(2))
+        } else {
+            i < cs.len() and cs[i] == s.code_at(0)
+        }
+        if not ok {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn alternatives(key: str) -> [[str]] {
+    if key == "d" {
+        return [["3", "r01"], ["r12", "D"], ["0", "r19"], ["r19"], [" ", "r19"]]
+    }
+    if key == "H" {
+        return [["2", "r03"], ["r01", "D"], ["D"]]
+    }
+    if key == "I" {
+        return [["1", "r02"], ["0", "r19"], ["r19"], [" ", "r19"]]
+    }
+    if key == "G" or key == "Y" {
+        return [["D", "D", "D", "D"]]
+    }
+    if key == "j" {
+        return [["3", "6", "r06"], ["3", "r05", "D"], ["r12", "D", "D"], ["0", "r19", "D"], ["0", "0", "r19"], ["r19", "D"], ["0", "r19"], ["r19"]]
+    }
+    if key == "m" {
+        return [["1", "r02"], ["0", "r19"], ["r19"]]
+    }
+    if key == "M" {
+        return [["r05", "D"], ["D"]]
+    }
+    if key == "S" {
+        return [["6", "r01"], ["r05", "D"], ["D"]]
+    }
+    if key == "U" or key == "W" {
+        return [["5", "r03"], ["r04", "D"], ["D"]]
+    }
+    if key == "w" {
+        return [["r06"]]
+    }
+    if key == "u" {
+        return [["r17"]]
+    }
+    if key == "V" {
+        return [["5", "r03"], ["0", "r19"], ["r14", "D"], ["D"]]
+    }
+    if key == "y" {
+        return [["D", "D"]]
+    }
+    if key == "Ow" {
+        return [["D"]]
+    }
+    return [["D", "D"], ["D"], [" ", "D"]]
+}
+
+/// `[+-]\d\d:?[0-5]\d(:?[0-5]\d(\.\d{1,6})?)?|Z`: the lengths it can match,
+/// in re's order of preference.
+fn zone_lengths(cs: [i64], at: i64) -> [i64] {
+    var out: [i64] = []
+    if at < cs.len() and (cs[at] == 43 or cs[at] == 45) and is_digit_at(cs, at + 1) and is_digit_at(cs, at + 2) {
+        for colon in [1, 0] {
+            let m = at + 3 + colon
+            if colon == 1 and not (m - 1 < cs.len() and cs[m - 1] == 58) {
+                continue
+            }
+            if in_range_at(cs, m, 48, 53) and is_digit_at(cs, m + 1) {
+                for t in seconds_lengths(cs, m + 2) {
+                    out.push(m + 2 + t - at)
+                }
+                out.push(m + 2 - at)
+            }
+        }
+    }
+    if at < cs.len() and cs[at] == 90 {
+        out.push(1)
+    }
+    return out
+}
+
+/// `:?[0-5]\d(\.\d{1,6})?` after the minutes.
+fn seconds_lengths(cs: [i64], at: i64) -> [i64] {
+    var out: [i64] = []
+    for colon in [1, 0] {
+        let s = at + colon
+        if colon == 1 and not (at < cs.len() and cs[at] == 58) {
+            continue
+        }
+        if in_range_at(cs, s, 48, 53) and is_digit_at(cs, s + 1) {
+            let f = s + 2
+            if f < cs.len() and cs[f] == 46 {
+                var n = 0
+                while n < 6 and is_digit_at(cs, f + 1 + n) {
+                    n = n + 1
+                }
+                var k = n
+                while k >= 1 {
+                    out.push(f + 1 + k - at)
+                    k = k - 1
+                }
+            }
+            out.push(f - at)
+        }
+    }
+    return out
+}
+
+fn names_lengths(cs: [i64], at: i64, names: [str]) -> [i64] {
+    var out: [i64] = []
+    for name in names {
+        let nc = name.codes()
+        var ok = at + nc.len() <= cs.len()
+        var k = 0
+        while ok and k < nc.len() {
+            ok = same_ignoring_case(nc[k], cs[at + k])
+            k = k + 1
+        }
+        if ok {
+            out.push(nc.len())
+        }
+    }
+    return out
+}
+
+/// The lengths a token can match at `at`, in re's order of preference.
+fn token_lengths(cs: [i64], at: i64, t: PtToken) -> [i64] {
+    return match t {
+        PtChar(c) -> if at < cs.len() and same_ignoring_case(c, cs[at]) { [1] } else { [] }
+        PtApos -> if at < cs.len() and (cs[at] == 39 or cs[at] == 700) { [1] } else { [] }
+        PtSpace -> {
+            var n = 0
+            while at + n < cs.len() and pycharclass.re_space(cs[at + n]) {
+                n = n + 1
+            }
+            var out: [i64] = []
+            while n >= 1 {
+                out.push(n)
+                n = n - 1
+            }
+            out
+        }
+        PtDirective(key) -> directive_lengths(cs, at, key)
+    }
+}
+
+fn directive_lengths(cs: [i64], at: i64, key: str) -> [i64] {
+    if key == "%" {
+        return if at < cs.len() and cs[at] == 37 { [1] } else { [] }
+    }
+    if key == "z" {
+        return zone_lengths(cs, at)
+    }
+    if key == "f" {
+        var n = 0
+        while n < 6 and in_range_at(cs, at + n, 48, 57) {
+            n = n + 1
+        }
+        var out: [i64] = []
+        while n >= 1 {
+            out.push(n)
+            n = n - 1
+        }
+        return out
+    }
+    if key == "a" or key == "A" or key == "b" or key == "B" or key == "p" or key == "Z" {
+        return names_lengths(cs, at, names_for(key))
+    }
+    var out: [i64] = []
+    for alt in alternatives(key) {
+        if steps_match(cs, at, alt) {
+            out.push(alt.len())
+        }
+    }
+    return out
+}
+
+/// The first way every token matches from `at`: the ends of the tokens.
+fn search(cs: [i64], tokens: [PtToken], k: i64, at: i64) -> Option[[i64]] {
+    if k == tokens.len() {
+        return Some([])
+    }
+    for n in token_lengths(cs, at, tokens[k]) {
+        match search(cs, tokens, k + 1, at + n) {
+            Some(rest) -> return Some([at + n] + rest)
+            None -> {}
+        }
+    }
+    return None
+}
+
+// ---- the calendar
+
+fn is_leap(y: i64) -> bool {
+    return y % 4 == 0 and (y % 100 != 0 or y % 400 == 0)
+}
+
+fn days_in_month(y: i64, m: i64) -> i64 {
+    if m == 2 {
+        return if is_leap(y) { 29 } else { 28 }
+    }
+    return if m == 4 or m == 6 or m == 9 or m == 11 { 30 } else { 31 }
+}
+
+fn days_before_year(y: i64) -> i64 {
+    let p = y - 1
+    return p * 365 + p / 4 - p / 100 + p / 400
+}
+
+fn days_before_month(y: i64, m: i64) -> i64 {
+    var n = 0
+    for k in 1..m {
+        n = n + days_in_month(y, k)
+    }
+    return n
+}
+
+/// `date(y, m, d)`'s checks, then its ordinal.
+fn ordinal(y: i64, m: i64, d: i64) -> i64 ! PyStrptimeError {
+    if y < 1 or y > 9999 {
+        fail(value_error("year {y} is out of range"))
+    }
+    if m < 1 or m > 12 {
+        fail(value_error("month must be in 1..12"))
+    }
+    if d < 1 or d > days_in_month(y, m) {
+        fail(value_error("day is out of range for month"))
+    }
+    return days_before_year(y) + days_before_month(y, m) + d
+}
+
+/// `date.fromordinal(n)`: year, month, day.
+fn from_ordinal(n: i64) -> (i64, i64, i64) ! PyStrptimeError {
+    if n < 1 {
+        fail(value_error("ordinal must be >= 1"))
+    }
+    var y = (n - 1) / 366 + 1
+    while days_before_year(y + 1) < n {
+        y = y + 1
+    }
+    if y > 9999 {
+        fail(value_error("year {y} is out of range"))
+    }
+    var left = n - days_before_year(y)
+    var m = 1
+    while left > days_in_month(y, m) {
+        left = left - days_in_month(y, m)
+        m = m + 1
+    }
+    return (y, m, left)
+}
+
+fn weekday_of(ord: i64) -> i64 {
+    return (ord + 6) % 7
+}
+
+/// `date.fromisocalendar(year, week, day)`.
+fn from_iso(year: i64, week: i64, day: i64) -> (i64, i64, i64) ! PyStrptimeError {
+    if year < 1 or year > 9999 {
+        fail(value_error("Year is out of range: {year}"))
+    }
+    if week <= 0 or week >= 53 {
+        let first = weekday_of(days_before_year(year) + 1)
+        if not (week == 53 and (first == 3 or (first == 2 and is_leap(year)))) {
+            fail(value_error("Invalid week: {week}"))
+        }
+    }
+    if day <= 0 or day >= 8 {
+        fail(value_error("Invalid weekday: {day} (range is [1, 7])"))
+    }
+    let jan4 = days_before_year(year) + 4
+    let week1_monday = jan4 - weekday_of(jan4)
+    return try from_ordinal(week1_monday + (week - 1) * 7 + day - 1)
+}
+
+// ---- reading the groups
+
+/// `int(text)` of decimal digits (any script), a leading space allowed.
+fn digits_value(text: str) -> i64 {
+    var v = 0
+    for c in text.codes() {
+        if c != 32 {
+            v = v * 10 + pycharclass.decimal_value(c)
+        }
+    }
+    return v
+}
+
+/// Python's `lower()` of a matched name. re matched it against an ASCII
+/// name, so it holds ASCII letters and the characters re folds onto them:
+/// the Kelvin sign (lower `k`), dotted capital I (lower `i` and U+0307),
+/// dotless i and long s (each its own lower case).
+fn lower_name(found: str) -> str {
+    var out: [i64] = []
+    for c in found.codes() {
+        if c >= 65 and c <= 90 {
+            out.push(c + 32)
+        } else if c == 8490 {
+            out.push(107)
+        } else if c == 304 {
+            out.push(105)
+            out.push(775)
+        } else {
+            out.push(c)
+        }
+    }
+    return from_codes(out)
+}
+
+/// `names.index(found.lower())`.
+fn name_index(names: [str], found: str) -> i64 ! PyStrptimeError {
+    let low = lower_name(found)
+    for k in 0..names.len() {
+        if names[k] == low {
+            return k
+        }
+    }
+    fail(value_error(py_repr(low) + " is not in list"))
+}
+
+/// The parsed fields, before the date is worked out.
+type PtFields = {
+    year: Option[i64],
+    iso_year: Option[i64],
+    month: i64,
+    day: i64,
+    hour: i64,
+    minute: i64,
+    second: i64,
+    fraction: i64,
+    tz: i64,
+    gmtoff: Option[i64],
+    gmtoff_fraction: i64,
+    iso_week: Option[i64],
+    week_of_year: Option[i64],
+    week_starts_monday: bool,
+    weekday: Option[i64],
+    julian: Option[i64],
+    zone: Option[str],
+}
+
+fn hour12(found: [(str, str)], hour: i64) -> i64 {
+    var ampm = ""
+    for g in found {
+        if g.0 == "p" {
+            ampm = ascii_lower(g.1)
+        }
+    }
+    if ampm == "" or ampm == "am" {
+        return if hour == 12 { 0 } else { hour }
+    }
+    if ampm == "pm" {
+        return if hour != 12 { hour + 12 } else { hour }
+    }
+    return hour
+}
+
+fn ascii_lower(s: str) -> str {
+    return lower_name(s)
+}
+
+/// `%z`: seconds and microseconds east of UTC.
+fn zone_offset(text: str) -> (i64, i64) ! PyStrptimeError {
+    if text == "Z" {
+        return (0, 0)
+    }
+    var z = text.codes()
+    if z[3] == 58 {
+        z = z.slice(0, 3) + z.slice(4, z.len())
+        if z.len() > 5 {
+            if z[5] != 58 {
+                fail(value_error("Inconsistent use of : in " + text))
+            }
+            z = z.slice(0, 5) + z.slice(6, z.len())
+        }
+    }
+    let hours = digits_value(from_codes(z.slice(1, 3)))
+    let minutes = digits_value(from_codes(z.slice(3, 5)))
+    let sec_text = z.slice(5, if z.len() < 7 { z.len() } else { 7 })
+    if sec_text.len() > 0 and not sec_text.all(|c| pycharclass.re_digit(c)) {
+        fail(value_error("invalid literal for int() with base 10: " + py_repr(from_codes(sec_text))))
+    }
+    let seconds = digits_value(from_codes(sec_text))
+    let rest = if z.len() > 8 { z.slice(8, z.len()) } else { [] }
+    var frac = from_codes(rest)
+    while frac.len() < 6 {
+        frac = frac + "0"
+    }
+    let sign = if z[0] == 45 { 0 - 1 } else { 1 }
+    return (sign * (hours * 3600 + minutes * 60 + seconds), sign * digits_value(frac))
+}
+
+fn read_group(inout f: PtFields, found: [(str, str)], key: str, text: str) -> bool ! PyStrptimeError {
+    if key == "y" {
+        let y = digits_value(text)
+        f.year = Some(if y <= 68 { y + 2000 } else { y + 1900 })
+    } else if key == "Y" {
+        f.year = Some(digits_value(text))
+    } else if key == "G" {
+        f.iso_year = Some(digits_value(text))
+    } else if key == "m" {
+        f.month = digits_value(text)
+    } else if key == "B" {
+        f.month = try name_index(["", "january", "february", "march", "april", "may", "june", "july", "august", "september", "october", "november",
+            "december"], text)
+    } else if key == "b" {
+        f.month = try name_index(["", "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"], text)
+    } else if key == "d" {
+        f.day = digits_value(text)
+    } else if key == "H" {
+        f.hour = digits_value(text)
+    } else if key == "I" {
+        f.hour = hour12(found, digits_value(text))
+    } else if key == "M" {
+        f.minute = digits_value(text)
+    } else if key == "S" {
+        f.second = digits_value(text)
+    } else if key == "f" {
+        var s = text
+        while s.len() < 6 {
+            s = s + "0"
+        }
+        f.fraction = digits_value(s)
+    } else {
+        return try read_more(f, key, text)
+    }
+    return true
+}
+
+fn read_more(inout f: PtFields, key: str, text: str) -> bool ! PyStrptimeError {
+    if key == "A" {
+        f.weekday = Some(try name_index(["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"], text))
+    } else if key == "a" {
+        f.weekday = Some(try name_index(["mon", "tue", "wed", "thu", "fri", "sat", "sun"], text))
+    } else if key == "w" {
+        let w = digits_value(text)
+        f.weekday = Some(if w == 0 { 6 } else { w - 1 })
+    } else if key == "u" {
+        f.weekday = Some(digits_value(text) - 1)
+    } else if key == "j" {
+        f.julian = Some(digits_value(text))
+    } else if key == "U" or key == "W" {
+        f.week_of_year = Some(digits_value(text))
+        f.week_starts_monday = key == "W"
+    } else if key == "V" {
+        f.iso_week = Some(digits_value(text))
+    } else if key == "z" {
+        let off = try zone_offset(text)
+        f.gmtoff = Some(off.0)
+        f.gmtoff_fraction = off.1
+    } else if key == "Z" {
+        f.tz = 0
+        f.zone = Some(text)
+    }
+    return true
+}
+
+/// The groups found, in the order of the format, as (group, text).
+fn parse_groups(data: str, format: str) -> [(str, str)] ! PyStrptimeError {
+    let _ok = try check_groups(format)
+    let tokens = try expanded(format)
+    let cs = data.codes()
+    let ends = match search(cs, tokens, 0, 0) {
+        Some(e) -> e
+        None -> fail(value_error("time data " + py_repr(data) + " does not match format " + py_repr(format)))
+    }
+    let end = if ends.len() > 0 { ends[ends.len() - 1] } else { 0 }
+    if end != cs.len() {
+        fail(value_error("unconverted data remains: " + from_codes(cs.slice(end, cs.len()))))
+    }
+    var found: [(str, str)] = []
+    var at = 0
+    for k in 0..tokens.len() {
+        match tokens[k] {
+            PtDirective(key) -> match group_name(key) {
+                Some(n) -> found.push((n, from_codes(cs.slice(at, ends[k]))))
+                None -> {}
+            }
+            _ -> {}
+        }
+        at = ends[k]
+    }
+    return found
+}
+
+fn empty_fields() -> PtFields {
+    return PtFields{ year: None, iso_year: None, month: 1, day: 1, hour: 0, minute: 0, second: 0, fraction: 0, tz: 0 - 1, gmtoff: None, gmtoff_fraction: 0,
+        iso_week: None, week_of_year: None, week_starts_monday: false, weekday: None, julian: None, zone: None }
+}
+
+fn check_iso(f: PtFields) -> bool ! PyStrptimeError {
+    if f.iso_year != None {
+        if f.julian != None {
+            fail(value_error("Day of the year directive '%j' is not compatible with ISO year directive '%G'. Use '%Y' instead."))
+        }
+        if f.iso_week == None or f.weekday == None {
+            fail(value_error("ISO year directive '%G' must be used with the ISO week directive '%V' and a weekday directive ('%A', '%a', '%w', or '%u')."))
+        }
+    } else if f.iso_week != None {
+        if f.year == None or f.weekday == None {
+            fail(value_error("ISO week directive '%V' must be used with the ISO year directive '%G' and a weekday directive ('%A', '%a', '%w', or '%u')."))
+        }
+        fail(value_error("ISO week directive '%V' is incompatible with the year directive '%Y'. Use the ISO year '%G' instead."))
+    }
+    return true
+}
+
+/// `_calc_julian_from_U_or_W`.
+fn julian_from_week(year: i64, week: i64, day: i64, monday: bool) -> i64 ! PyStrptimeError {
+    var first = weekday_of(try ordinal(year, 1, 1))
+    var dow = day
+    if not monday {
+        first = (first + 1) % 7
+        dow = (dow + 1) % 7
+    }
+    let week0 = (7 - first) % 7
+    if week == 0 {
+        return 1 + dow - first
+    }
+    return 1 + week0 + 7 * (week - 1) + dow
+}
+
+/// `_strptime`: the struct_time fields, the fraction and the offset's
+/// microseconds.
+fn strptime_fields(data: str, format: str) -> (PyStructTime, i64, i64) ! PyStrptimeError {
+    let found = try parse_groups(data, format)
+    var f = empty_fields()
+    for g in found {
+        let _read = try read_group(f, found, g.0, g.1)
+    }
+    let _iso = try check_iso(f)
+    var leap_fix = false
+    var year = match f.year {
+        Some(y) -> y
+        None -> if f.month == 2 and f.day == 29 { 1904 } else { 1900 }
+    }
+    leap_fix = f.year == None and f.month == 2 and f.day == 29
+    var month = f.month
+    var day = f.day
+    var julian = f.julian
+    if julian == None and f.weekday != None {
+        let wd = f.weekday ?? 0
+        match f.week_of_year {
+            Some(w) -> julian = Some(try julian_from_week(year, w, wd, f.week_starts_monday))
+            None -> match f.iso_year {
+                Some(iy) -> {
+                    let r = try from_iso(iy, f.iso_week ?? 0, wd + 1)
+                    year = r.0
+                    month = r.1
+                    day = r.2
+                }
+                None -> {}
+            }
+        }
+        match julian {
+            Some(j) -> if j <= 0 {
+                year = year - 1
+                julian = Some(j + (if is_leap(year) { 366 } else { 365 }))
+            }
+            None -> {}
+        }
+    }
+    var yday = 0
+    match julian {
+        None -> yday = (try ordinal(year, month, day)) - (try ordinal(year, 1, 1)) + 1
+        Some(j) -> {
+            let r = try from_ordinal(j - 1 + (try ordinal(year, 1, 1)))
+            year = r.0
+            month = r.1
+            day = r.2
+            yday = j
+        }
+    }
+    let weekday = match f.weekday {
+        Some(w) -> w
+        None -> weekday_of(try ordinal(year, month, day))
+    }
+    let st = PyStructTime{ year: if leap_fix { 1900 } else { year }, month: month, day: day, hour: f.hour, minute: f.minute, second: f.second,
+        weekday: weekday, yday: yday, isdst: f.tz, zone: f.zone, gmtoff: f.gmtoff }
+    return (st, f.fraction, f.gmtoff_fraction)
+}
+
+/// `time.strptime(data, format)`.
+pub fn strptime_time(data: str, format: str) -> PyStructTime ! PyStrptimeError {
+    return (try strptime_fields(data, format)).0
+}
+
+/// `repr(timedelta(microseconds=us))`.
+fn timedelta_repr(us: i64) -> str {
+    let day_us = 86400000000
+    var days = us / day_us
+    var rest = us - days * day_us
+    if rest < 0 {
+        days = days - 1
+        rest = rest + day_us
+    }
+    let seconds = rest / 1000000
+    let micro = rest % 1000000
+    var parts: [str] = []
+    if days != 0 {
+        parts.push("days={days}")
+    }
+    if seconds != 0 {
+        parts.push("seconds={seconds}")
+    }
+    if micro != 0 {
+        parts.push("microseconds={micro}")
+    }
+    return "datetime.timedelta(" + (if parts.len() == 0 { "0" } else { parts.join(", ") }) + ")"
+}
+
+/// `datetime.strptime(data, format)`.
+pub fn strptime_datetime(data: str, format: str) -> PyStrptimeDateTime ! PyStrptimeError {
+    let r = try strptime_fields(data, format)
+    let st = r.0
+    var offset: Option[i64] = None
+    match st.gmtoff {
+        Some(g) -> {
+            let us = g * 1000000 + r.2
+            if us <= 0 - 86400000000 or us >= 86400000000 {
+                fail(value_error("offset must be a timedelta strictly between -timedelta(hours=24) and timedelta(hours=24), not " + timedelta_repr(us) + "."))
+            }
+            offset = Some(us)
+        }
+        None -> {}
+    }
+    let _date = try ordinal(st.year, st.month, st.day)
+    if st.hour > 23 {
+        fail(value_error("hour must be in 0..23"))
+    }
+    if st.minute > 59 {
+        fail(value_error("minute must be in 0..59"))
+    }
+    if st.second > 59 {
+        fail(value_error("second must be in 0..59"))
+    }
+    let name = match offset {
+        Some(us) -> Some(st.zone ?? offset_name(us))
+        None -> None
+    }
+    return PyStrptimeDateTime{ year: st.year, month: st.month, day: st.day, hour: st.hour, minute: st.minute, second: st.second, microsecond: r.1,
+        offset: offset, tzname: name }
+}
+
+fn two(n: i64) -> str {
+    return n.to_str().pad_start(2, "0")
+}
+
+/// The name of a timezone made without one: `UTC`, `UTC+05:30`,
+/// `UTC-01:02:03.000004`.
+fn offset_name(us: i64) -> str {
+    if us == 0 {
+        return "UTC"
+    }
+    let sign = if us < 0 { "-" } else { "+" }
+    let a = if us < 0 { 0 - us } else { us }
+    let hours = a / 3600000000
+    let minutes = a / 60000000 % 60
+    let seconds = a / 1000000 % 60
+    let micro = a % 1000000
+    let head = "UTC" + sign + two(hours) + ":" + two(minutes)
+    if micro != 0 {
+        return head + ":" + two(seconds) + "." + micro.to_str().pad_start(6, "0")
+    }
+    if seconds != 0 {
+        return head + ":" + two(seconds)
+    }
+    return head
+}
+
+// Generated by gen_tables.py from CPython 3.13's re module (_sre.unicode_tolower,
+// _sre.unicode_iscased, re._casefix). Do not edit: regenerate.
+
+/// re's simple lowercase: first, last, step and delta.
+pub let PYSTRPTIME_LOWER_RUNS: [i64] = [65, 90, 1, 32, 192, 214, 1, 32, 216, 222, 1, 32, 256, 302, 2, 1, 304, 304, 1, -199, 306, 310, 2, 1, 313, 327, 2, 1, 330, 374, 2, 1, 376, 376, 1, -121, 377, 381, 2, 1, 385, 385, 1, 210, 386, 388, 2, 1, 390, 390, 1, 206, 391, 391, 1, 1, 393, 394, 1, 205, 395, 395, 1, 1, 398, 398, 1, 79, 399, 399, 1, 202, 400, 400, 1, 203, 401, 401, 1, 1, 403, 403, 1, 205, 404, 404, 1, 207, 406, 406, 1, 211, 407, 407, 1, 209, 408, 408, 1, 1, 412, 412, 1, 211, 413, 413, 1, 213, 415, 415, 1, 214, 416, 420, 2, 1, 422, 422, 1, 218, 423, 423, 1, 1, 425, 425, 1, 218, 428, 428, 1, 1, 430, 430, 1, 218, 431, 431, 1, 1, 433, 434, 1, 217, 435, 437, 2, 1, 439, 439, 1, 219, 440, 440, 1, 1, 444, 444, 1, 1, 452, 452, 1, 2, 453, 453, 1, 1, 455, 455, 1, 2, 456, 456, 1, 1, 458, 458, 1, 2, 459, 475, 2, 1, 478, 494, 2, 1, 497, 497, 1, 2, 498, 500, 2, 1, 502, 502, 1, -97, 503, 503, 1, -56, 504, 542, 2, 1, 544, 544, 1, -130, 546, 562, 2, 1, 570, 570, 1, 10795, 571, 571, 1, 1, 573, 573, 1, -163, 574, 574, 1, 10792, 577, 577, 1, 1, 579, 579, 1, -195, 580, 580, 1, 69, 581, 581, 1, 71, 582, 590, 2, 1, 880, 882, 2, 1, 886, 886, 1, 1, 895, 895, 1, 116, 902, 902, 1, 38, 904, 906, 1, 37, 908, 908, 1, 64, 910, 911, 1, 63, 913, 929, 1, 32, 931, 939, 1, 32, 975, 975, 1, 8, 984, 1006, 2, 1, 1012, 1012, 1, -60, 1015, 1015, 1, 1, 1017, 1017, 1, -7, 1018, 1018, 1, 1, 1021, 1023, 1, -130, 1024, 1039, 1, 80, 1040, 1071, 1, 32, 1120, 1152, 2, 1, 1162, 1214, 2, 1, 1216, 1216, 1, 15, 1217, 1229, 2, 1, 1232, 1326, 2, 1, 1329, 1366, 1, 48, 4256, 4293, 1, 7264, 4295, 4295, 1, 7264, 4301, 4301, 1, 7264, 5024, 5103, 1, 38864, 5104, 5109, 1, 8, 7312, 7354, 1, -3008, 7357, 7359, 1, -3008, 7680, 7828, 2, 1, 7838, 7838, 1, -7615, 7840, 7934, 2, 1, 7944, 7951, 1, -8, 7960, 7965, 1, -8, 7976, 7983, 1, -8, 7992, 7999, 1, -8, 8008, 8013, 1, -8, 8025, 8031, 2, -8, 8040, 8047, 1, -8, 8072, 8079, 1, -8, 8088, 8095, 1, -8, 8104, 8111, 1, -8, 8120, 8121, 1, -8, 8122, 8123, 1, -74, 8124, 8124, 1, -9, 8136, 8139, 1, -86, 8140, 8140, 1, -9, 8152, 8153, 1, -8, 8154, 8155, 1, -100, 8168, 8169, 1, -8, 8170, 8171, 1, -112, 8172, 8172, 1, -7, 8184, 8185, 1, -128, 8186, 8187, 1, -126, 8188, 8188, 1, -9, 8486, 8486, 1, -7517, 8490, 8490, 1, -8383, 8491, 8491, 1, -8262, 8498, 8498, 1, 28, 8544, 8559, 1, 16, 8579, 8579, 1, 1, 9398, 9423, 1, 26, 11264, 11311, 1, 48, 11360, 11360, 1, 1, 11362, 11362, 1, -10743, 11363, 11363, 1, -3814, 11364, 11364, 1, -10727, 11367, 11371, 2, 1, 11373, 11373, 1, -10780, 11374, 11374, 1, -10749, 11375, 11375, 1, -10783, 11376, 11376, 1, -10782, 11378, 11378, 1, 1, 11381, 11381, 1, 1, 11390, 11391, 1, -10815, 11392, 11490, 2, 1, 11499, 11501, 2, 1, 11506, 11506, 1, 1, 42560, 42604, 2, 1, 42624, 42650, 2, 1, 42786, 42798, 2, 1, 42802, 42862, 2, 1, 42873, 42875, 2, 1, 42877, 42877, 1, -35332, 42878, 42886, 2, 1, 42891, 42891, 1, 1, 42893, 42893, 1, -42280, 42896, 42898, 2, 1, 42902, 42920, 2, 1, 42922, 42922, 1, -42308, 42923, 42923, 1, -42319, 42924, 42924, 1, -42315, 42925, 42925, 1, -42305, 42926, 42926, 1, -42308, 42928, 42928, 1, -42258, 42929, 42929, 1, -42282, 42930, 42930, 1, -42261, 42931, 42931, 1, 928, 42932, 42946, 2, 1, 42948, 42948, 1, -48, 42949, 42949, 1, -42307, 42950, 42950, 1, -35384, 42951, 42953, 2, 1, 42960, 42960, 1, 1, 42966, 42968, 2, 1, 42997, 42997, 1, 1, 65313, 65338, 1, 32, 66560, 66599, 1, 40, 66736, 66771, 1, 40, 66928, 66938, 1, 39, 66940, 66954, 1, 39, 66956, 66962, 1, 39, 66964, 66965, 1, 39, 68736, 68786, 1, 64, 71840, 71871, 1, 32, 93760, 93791, 1, 32, 125184, 125217, 1, 34]
+
+/// Where re's cased flag changes, starting with not cased at 0.
+pub let PYSTRPTIME_CASED_STARTS: [i64] = [0, 65, 91, 97, 123, 181, 182, 192, 215, 216, 247, 248, 312, 313, 397, 398, 411, 412, 426, 428, 442, 444, 446, 447, 448, 452, 545, 546, 564, 570, 597, 598, 600, 601, 602, 603, 605, 608, 610, 611, 612, 613, 615, 616, 621, 623, 624, 625, 627, 629, 630, 637, 638, 640, 641, 642, 644, 647, 653, 658, 659, 669, 671, 837, 838, 880, 884, 886, 888, 891, 894, 895, 896, 902, 903, 904, 907, 908, 909, 910, 930, 931, 978, 981, 1014, 1015, 1020, 1021, 1154, 1162, 1328, 1329, 1367, 1377, 1416, 4256, 4294, 4295, 4296, 4301, 4302, 4304, 4347, 4349, 4352, 5024, 5110, 5112, 5118, 7296, 7305, 7312, 7355, 7357, 7360, 7545, 7546, 7549, 7550, 7566, 7567, 7680, 7836, 7838, 7839, 7840, 7958, 7960, 7966, 7968, 8006, 8008, 8014, 8016, 8024, 8025, 8026, 8027, 8028, 8029, 8030, 8031, 8062, 8064, 8117, 8118, 8125, 8126, 8127, 8130, 8133, 8134, 8141, 8144, 8148, 8150, 8156, 8160, 8173, 8178, 8181, 8182, 8189, 8486, 8487, 8490, 8492, 8498, 8499, 8526, 8527, 8544, 8576, 8579, 8581, 9398, 9450, 11264, 11377, 11378, 11380, 11381, 11383, 11390, 11492, 11499, 11503, 11506, 11508, 11520, 11558, 11559, 11560, 11565, 11566, 42560, 42606, 42624, 42652, 42786, 42800, 42802, 42864, 42873, 42888, 42891, 42894, 42896, 42901, 42902, 42927, 42928, 42955, 42960, 42962, 42966, 42970, 42997, 42999, 43859, 43860, 43888, 43968, 64256, 64263, 64275, 64280, 65313, 65339, 65345, 65371, 66560, 66640, 66736, 66772, 66776, 66812, 66928, 66939, 66940, 66955, 66956, 66963, 66964, 66966, 66967, 66978, 66979, 66994, 66995, 67002, 67003, 67005, 68736, 68787, 68800, 68851, 71840, 71904, 93760, 93824, 125184, 125252]
+
+/// re._casefix: a lowercase code point, how many extra equivalents, and up to two.
+pub let PYSTRPTIME_EXTRA_CASES: [i64] = [105, 1, 305, 0, 115, 1, 383, 0, 181, 1, 956, 0, 305, 1, 105, 0, 383, 1, 115, 0, 837, 2, 953, 8126, 912, 1, 8147, 0, 944, 1, 8163, 0, 946, 1, 976, 0, 949, 1, 1013, 0, 952, 1, 977, 0, 953, 2, 837, 8126, 954, 1, 1008, 0, 956, 1, 181, 0, 960, 1, 982, 0, 961, 1, 1009, 0, 962, 1, 963, 0, 963, 1, 962, 0, 966, 1, 981, 0, 976, 1, 946, 0, 977, 1, 952, 0, 981, 1, 966, 0, 982, 1, 960, 0, 1008, 1, 954, 0, 1009, 1, 961, 0, 1013, 1, 949, 0, 1074, 1, 7296, 0, 1076, 1, 7297, 0, 1086, 1, 7298, 0, 1089, 1, 7299, 0, 1090, 2, 7300, 7301, 1098, 1, 7302, 0, 1123, 1, 7303, 0, 7296, 1, 1074, 0, 7297, 1, 1076, 0, 7298, 1, 1086, 0, 7299, 1, 1089, 0, 7300, 2, 1090, 7301, 7301, 2, 1090, 7300, 7302, 1, 1098, 0, 7303, 1, 1123, 0, 7304, 1, 42571, 0, 7777, 1, 7835, 0, 7835, 1, 7777, 0, 8126, 2, 837, 953, 8147, 1, 912, 0, 8163, 1, 944, 0, 42571, 1, 7304, 0, 64261, 1, 64262, 0, 64262, 1, 64261, 0]

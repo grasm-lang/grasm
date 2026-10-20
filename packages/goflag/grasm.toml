@@ -1,0 +1,20 @@
+[package]
+name = "goflag"
+version = "1.0.0"
+capabilities = []
+
+[dependencies.gostrconv]
+path = "../gostrconv"
+version = "^1.0.0"
+
+[dependencies.goduration]
+path = "../goduration"
+version = "^1.0.0"
+
+[dependencies.goquote]
+path = "../goquote"
+version = "^1.0.0"
+
+[dependencies.bigint]
+path = "../bigint"
+version = "^1.0.0"

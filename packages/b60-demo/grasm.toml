@@ -1,0 +1,64 @@
+[package]
+name = "b60_demo"
+version = "1.0.0"
+capabilities = ["io"]
+
+[dependencies.perlsprintf]
+path = "../perlsprintf"
+version = "^1.0.0"
+
+[dependencies.shortestfloat]
+path = "../shortestfloat"
+version = "^1.0.0"
+
+[dependencies.bigint]
+path = "../bigint"
+version = "^1.0.0"
+
+[dependencies.perltextabbrev]
+path = "../perltextabbrev"
+version = "^1.0.0"
+
+[dependencies.perlmimebase64]
+path = "../perlmimebase64"
+version = "^1.0.0"
+
+[dependencies.perlgetoptlong]
+path = "../perlgetoptlong"
+version = "^1.0.0"
+
+[dependencies.perltextbalanced]
+path = "../perltextbalanced"
+version = "^1.0.0"
+
+[dependencies.lispformat]
+path = "../lispformat"
+version = "^1.0.0"
+
+[dependencies.lispreadnumber]
+path = "../lispreadnumber"
+version = "^1.0.0"
+
+[dependencies.rustfmt]
+path = "../rustfmt"
+version = "^1.0.0"
+
+[dependencies.rustnum]
+path = "../rustnum"
+version = "^1.0.0"
+
+[dependencies.gostrconv]
+path = "../gostrconv"
+version = "^1.0.0"
+
+[dependencies.luanumber]
+path = "../luanumber"
+version = "^1.0.0"
+
+[dependencies.luaformat]
+path = "../luaformat"
+version = "^1.0.0"
+
+[dependencies.floatmath]
+path = "../floatmath"
+version = "^1.0.0"

@@ -1,0 +1,1365 @@
+// Ruby's `Kernel#format` (`sprintf`, `String#%`), as Ruby 2.6's
+// `sprintf.c` and its BSD `vfprintf` print: every conversion, flag and
+// argument reference, with Ruby's exceptions and messages.
+//
+// Ruby code builds its reports, file names and protocol lines with
+// `format`, and a peer that has to produce the same bytes needs Ruby's
+// rules, which are not C's in several places:
+//
+//   - Conversions `%d %i %u %b %B %o %x %X %f %e %E %g %G %a %A %c %s %p
+//     %%`; flags `-`, `+`, space, `0`, `#`; a width and a precision,
+//     each a number or `*` (from the next argument, or `*N$`); `%N$`
+//     takes argument N; `%<name>` takes a value from the one Hash
+//     argument and `%{name}` prints it as a string.
+//   - `%x`, `%o`, `%b` of a negative number print its two's complement
+//     after `..` (`..f01` for -255, `..1` for -1), padding with `f`, `7`
+//     or `1`, unless `+` or space asks for a sign (`-ff`). `#` adds
+//     `0x`/`0X`/`0b`/`0B`/`0` (none for zero, and `%#.0x` of 0 is
+//     empty).
+//   - `%f` of an Integer is exact at any size (`format("%f", 2**70)`),
+//     and ignores `#` (and prints -2**62 with two minus signs, as 2.6
+//     does).
+//   - Floats round as Ruby 2.6's `dtoa` rounds them: the exact binary
+//     value, ties to even (`%.0f` of 2.5 is `2`), except that when its
+//     floating-point fast path finds the rest within its error bound of
+//     a half, the last digit goes to even whatever the exact value says
+//     (`%.1f` of 99999.95 is `100000.0` and of 99999.85 is `99999.8`).
+//     That fast path is reproduced operation for operation. Digits past
+//     the 1026th decimal place are zeros, as BSD's `cvt` stops there.
+//   - `%e`/`%g` follow BSD's rules (`%g` strips trailing zeros; `#`
+//     keeps them and the point). `%a` always leads with `1` (`0x1p-1074`
+//     for the smallest subnormal) and rounds the hex digits half to even;
+//     `%.13a` drops the lowest bit, as BSD's `hdtoa` does.
+//   - NaN and infinity print as `NaN` and `Inf`, padded with spaces even
+//     under `0`.
+//   - Floats given to integer conversions truncate; NaN and infinity
+//     raise FloatDomainError. Integers given to `%e %g %a` convert to the
+//     nearest double (an Integer too large is `Inf`).
+//   - The error messages are Ruby's: "too few arguments", "malformed
+//     format string - %y", "incomplete format specifier; use %% (double
+//     %) instead", "flag after width", "width given twice", "precision
+//     given twice", "unnumbered(1) mixed with numbered", "numbered(2)
+//     after unnumbered(1)", "named<a> after numbered", "one hash
+//     required", "key<a> not found" (KeyError), "invalid format
+//     character - %", "%c requires a character", "invalid character",
+//     "width too big", "can't convert nil into Integer" (TypeError),
+//     "integer 2147483648 too big to convert to `int'" (RangeError), and
+//     the rest.
+//
+// Limits: arguments are Integers, Floats, Strings, nil, true, false and a
+// Hash with Symbol keys (printed by `%s`/`%p` only when its keys are plain
+// lower-case names). A String given to a numeric conversion, a Float
+// given to `%s`/`%p`, a non-ASCII String given to `%p`, and
+// `%c` of a surrogate or of -1/-2 (which Ruby turns into bytes that are
+// not UTF-8) are refused with an "unsupported" error instead of being
+// converted. "too many arguments" is not reported (Ruby reports it only
+// under -d).
+
+import bigint
+
+/// An argument to `format`.
+type RbFmtArg =
+    | RbFmtInt(n: BigInt)
+    | RbFmtFloat(x: f64)
+    | RbFmtStr(s: str)
+    | RbFmtNil
+    | RbFmtTrue
+    | RbFmtFalse
+    | RbFmtHash(keys: [str], values: [RbFmtArg])
+
+/// Ruby's exception: its class name and message. Class "Unsupported" is
+/// an argument this package does not convert (see the limits above).
+type RbFmtError = | RbFmtError(class_name: str, message: str)
+
+pub fn error_class(e: RbFmtError) -> str {
+    return match e {
+        RbFmtError(c, _m) -> c
+    }
+}
+
+pub fn error_message(e: RbFmtError) -> str {
+    return match e {
+        RbFmtError(_c, m) -> m
+    }
+}
+
+fn arg_error(m: str) -> RbFmtError {
+    return RbFmtError("ArgumentError", m)
+}
+
+fn unsupported(m: str) -> RbFmtError {
+    return RbFmtError("Unsupported", m)
+}
+
+// Flag bits, as sprintf.c numbers them.
+fn f_sharp() -> i64 {
+    return 1
+}
+
+fn f_minus() -> i64 {
+    return 2
+}
+
+fn f_plus() -> i64 {
+    return 4
+}
+
+fn f_zero() -> i64 {
+    return 8
+}
+
+fn f_space() -> i64 {
+    return 16
+}
+
+fn f_width() -> i64 {
+    return 32
+}
+
+fn f_prec() -> i64 {
+    return 64
+}
+
+fn f_prec0() -> i64 {
+    return 128
+}
+
+fn has(flags: i64, bit: i64) -> bool {
+    return flags.bit_and(bit) != 0
+}
+
+fn int_max() -> i64 {
+    return 2147483647
+}
+
+// ---- small helpers
+
+fn big(n: i64) -> BigInt {
+    return bigint.from_i64(n)
+}
+
+fn is_neg(n: BigInt) -> bool {
+    return bigint.sign(n) < 0
+}
+
+fn babs(n: BigInt) -> BigInt {
+    return if is_neg(n) { bigint.negate(n) } else { n }
+}
+
+fn chars(f: [i64], from: i64, to: i64) -> str {
+    return f.slice(from, to).map(|c| c.to_char()).join("")
+}
+
+fn spaces(n: i64) -> str {
+    return if n > 0 { " ".repeat(n) } else { "" }
+}
+
+fn zeros(n: i64) -> str {
+    return if n > 0 { "0".repeat(n) } else { "" }
+}
+
+fn nan_f() -> f64 {
+    return (9221120237041090560).from_bits()
+}
+
+fn is_nan(x: f64) -> bool {
+    return x != x
+}
+
+fn is_inf(x: f64) -> bool {
+    return not is_nan(x) and x - x != 0.0
+}
+
+// ---- exact numbers
+
+/// The exact integer part of a finite double.
+fn trunc_big(x: f64) -> BigInt {
+    if x < 9223372036854775807.0 and x > -9223372036854775807.0 {
+        return big(x.as_i64())
+    }
+    let bits = x.to_bits()
+    let e = bits.ushr(52).bit_and(2047) - 1075
+    let m = bits.bit_and(4503599627370495).bit_or(4503599627370496)
+    let v = bigint.mul(big(m), bigint.pow(big(2), e))
+    return if x < 0.0 { bigint.negate(v) } else { v }
+}
+
+/// The double nearest an Integer, ties to even; `Inf` past the range.
+fn big_to_f64(n: BigInt) -> f64 {
+    let a = babs(n)
+    let bl = bit_len(a)
+    var v = 0.0
+    if bl <= 53 {
+        v = (bigint.to_i64(a) ?? 0).as_f64()
+    } else {
+        var shift = bl - 53
+        let p = bigint.pow(big(2), shift)
+        let (q0, r) = bigint.divmod(a, p) ?? (bigint.zero(), bigint.zero())
+        var q = bigint.to_i64(q0) ?? 0
+        let half = bigint.div(p, big(2)) ?? bigint.zero()
+        let c = bigint.compare(r, half)
+        if c > 0 or c == 0 and q % 2 == 1 {
+            q = q + 1
+        }
+        if q == 9007199254740992 {
+            q = q / 2
+            shift = shift + 1
+        }
+        let e = 1075 + shift
+        v = if e >= 2047 { (9218868437227405312).from_bits() } else { e.shl(52).bit_or(q - 4503599627370496).from_bits() }
+    }
+    return if is_neg(n) { v * -1.0 } else { v }
+}
+
+/// Bits in the magnitude.
+fn bit_len(a: BigInt) -> i64 {
+    return bigint.bit_length(a)
+}
+
+/// `a` (not negative) in `base`, at least `width` digits.
+fn digits_in_base(a: BigInt, base: i64, width: i64) -> str {
+    let alphabet = "0123456789abcdef"
+    var out: [str] = []
+    var left = a
+    let b = big(base)
+    while not bigint.is_zero(left) {
+        let (q, r) = bigint.divmod(left, b) ?? (bigint.zero(), bigint.zero())
+        out.push(alphabet.substr(bigint.to_i64(r) ?? 0, 1))
+        left = q
+    }
+    while out.len() < width {
+        out.push("0")
+    }
+    return out.rev().join("")
+}
+
+// ---- argument conversions
+
+fn type_name(v: RbFmtArg) -> str {
+    return match v {
+        RbFmtNil -> "nil"
+        RbFmtTrue -> "true"
+        RbFmtFalse -> "false"
+        RbFmtHash(_k, _v) -> "Hash"
+        RbFmtStr(_s) -> "String"
+        RbFmtInt(_n) -> "Integer"
+        RbFmtFloat(_x) -> "Float"
+    }
+}
+
+/// What `%d` and its kin make of an argument.
+fn to_integer(v: RbFmtArg) -> BigInt ! RbFmtError {
+    return match v {
+        RbFmtInt(n) -> n
+        RbFmtFloat(x) -> try float_to_integer(x)
+        RbFmtStr(_s) -> fail(unsupported("String given to an integer conversion"))
+        _ -> fail(RbFmtError("TypeError", "can't convert " + type_name(v) + " into Integer"))
+    }
+}
+
+fn float_to_integer(x: f64) -> BigInt ! RbFmtError {
+    if is_nan(x) {
+        fail(RbFmtError("FloatDomainError", "NaN"))
+    }
+    if is_inf(x) {
+        fail(RbFmtError("FloatDomainError", if x < 0.0 { "-Infinity" } else { "Infinity" }))
+    }
+    return trunc_big(x)
+}
+
+/// `Float(arg)` for the float conversions.
+fn to_float(v: RbFmtArg) -> f64 ! RbFmtError {
+    return match v {
+        RbFmtFloat(x) -> x
+        RbFmtInt(n) -> big_to_f64(n)
+        RbFmtStr(_s) -> fail(unsupported("String given to a float conversion"))
+        _ -> fail(RbFmtError("TypeError", "can't convert " + type_name(v) + " into Float"))
+    }
+}
+
+fn int_range(n: BigInt) -> i64 ! RbFmtError {
+    if bigint.to_i64(n).is_none() {
+        fail(RbFmtError("RangeError", "bignum too big to convert into `long'"))
+    }
+    if bigint.compare(n, big(int_max())) > 0 {
+        fail(RbFmtError("RangeError", "integer " + bigint.to_str(n) + " too big to convert to `int'"))
+    }
+    if bigint.compare(n, big(0 - 2147483648)) < 0 {
+        fail(RbFmtError("RangeError", "integer " + bigint.to_str(n) + " too small to convert to `int'"))
+    }
+    return bigint.to_i64(n) ?? 0
+}
+
+/// NUM2INT, for `*` and `%c`.
+fn num2int(v: RbFmtArg) -> i64 ! RbFmtError {
+    return match v {
+        RbFmtInt(n) -> try int_range(n)
+        RbFmtFloat(x) -> try float_num2int(x)
+        RbFmtNil -> fail(RbFmtError("TypeError", "no implicit conversion from nil to integer"))
+        _ -> fail(RbFmtError("TypeError", "no implicit conversion of " + type_name(v) + " into Integer"))
+    }
+}
+
+fn float_num2int(x: f64) -> i64 ! RbFmtError {
+    if not (x < 9223372036854775808.0 and x >= -9223372036854775808.0) {
+        let shown = if is_nan(x) { "NaN" } else if is_inf(x) { if x < 0.0 { "-Inf" } else { "Inf" } } else { bsd_float("g", f_minus(), 0 - 1, 10, x) }
+        fail(RbFmtError("RangeError", "float " + shown + " out of range of integer"))
+    }
+    return try int_range(big(x.as_i64()))
+}
+
+// ---- %s and %p
+
+fn inspect_ascii(s: str) -> str ! RbFmtError {
+    let cs = s.codes()
+    var out = "\""
+    var i = 0
+    while i < cs.len() {
+        let c = cs[i]
+        let next = if i + 1 < cs.len() { cs[i + 1] } else { 0 - 1 }
+        out = out + (try inspect_char(c, next))
+        i = i + 1
+    }
+    return out + "\""
+}
+
+fn inspect_char(c: i64, next: i64) -> str ! RbFmtError {
+    if c > 127 {
+        fail(unsupported("non-ASCII String given to %p"))
+    }
+    if c == 34 or c == 92 {
+        return "\\" + c.to_char()
+    }
+    if c == 35 and (next == 36 or next == 64 or next == 123) {
+        return "\\#"
+    }
+    let named = [(10, "n"), (13, "r"), (9, "t"), (12, "f"), (11, "v"), (8, "b"), (7, "a"), (27, "e")].find(|p| p.0 == c)
+    match named {
+        Some(p) -> return "\\" + p.1
+        None -> ()
+    }
+    if c >= 32 and c < 127 {
+        return c.to_char()
+    }
+    let d = "0123456789ABCDEF"
+    return "\\u00" + d.substr(c / 16, 1) + d.substr(c % 16, 1)
+}
+
+fn to_s(v: RbFmtArg) -> str ! RbFmtError {
+    return match v {
+        RbFmtInt(n) -> bigint.to_str(n)
+        RbFmtStr(s) -> s
+        RbFmtNil -> ""
+        RbFmtTrue -> "true"
+        RbFmtFalse -> "false"
+        RbFmtHash(keys, values) -> try inspect_hash(keys, values)
+        _ -> fail(unsupported(type_name(v) + " given to %s"))
+    }
+}
+
+fn inspect(v: RbFmtArg) -> str ! RbFmtError {
+    return match v {
+        RbFmtInt(n) -> bigint.to_str(n)
+        RbFmtStr(s) -> try inspect_ascii(s)
+        RbFmtNil -> "nil"
+        RbFmtTrue -> "true"
+        RbFmtFalse -> "false"
+        RbFmtHash(keys, values) -> try inspect_hash(keys, values)
+        _ -> fail(unsupported(type_name(v) + " given to %p"))
+    }
+}
+
+/// `Hash#inspect` (also its `to_s`) for Symbol keys that are plain
+/// lower-case identifiers: `{:a=>1, :b=>"x"}`.
+fn inspect_hash(keys: [str], values: [RbFmtArg]) -> str ! RbFmtError {
+    var parts: [str] = []
+    var i = 0
+    while i < keys.len() {
+        let k = keys[i]
+        let plain = k.len() > 0 and k.codes().all(|c| c >= 97 and c <= 122 or c == 95)
+        if not plain {
+            fail(unsupported("Hash key that is not a plain identifier"))
+        }
+        parts.push(":" + k + "=>" + (try inspect(values[i])))
+        i = i + 1
+    }
+    return "\{" + parts.join(", ") + "}"
+}
+
+fn conv_s(flags: i64, width: i64, prec: i64, v: RbFmtArg, p: bool) -> str ! RbFmtError {
+    var text = if p { try inspect(v) } else { try to_s(v) }
+    if not has(flags, f_prec() + f_width()) {
+        return text
+    }
+    var slen = text.len()
+    if has(flags, f_prec()) and prec < slen {
+        text = text.substr(0, prec)
+        slen = prec
+    }
+    if has(flags, f_width()) and width > slen {
+        return if has(flags, f_minus()) { text + spaces(width - slen) } else { spaces(width - slen) + text }
+    }
+    return text
+}
+
+// ---- %c
+
+fn conv_c(flags: i64, width: i64, v: RbFmtArg) -> str ! RbFmtError {
+    let ch = try char_of(v)
+    if not has(flags, f_width()) {
+        return ch
+    }
+    return if has(flags, f_minus()) { ch + spaces(width - 1) } else { spaces(width - 1) + ch }
+}
+
+fn char_of(v: RbFmtArg) -> str ! RbFmtError {
+    match v {
+        RbFmtStr(s) -> {
+            if s.len() != 1 {
+                fail(arg_error("%c requires a character"))
+            }
+            return s
+        }
+        _ -> ()
+    }
+    let c = try num2int(v)
+    if c >= 55296 and c <= 57343 or c == 0 - 1 or c == 0 - 2 {
+        fail(unsupported("%c of a code that is not a character in UTF-8"))
+    }
+    if c < 0 or c > 1114111 {
+        fail(arg_error("invalid character"))
+    }
+    return c.to_char()
+}
+
+// ---- integer conversions
+
+/// `sign_bits`: the digit a negative two's complement number repeats.
+fn sign_digit(base: i64, conv: str) -> str {
+    return if base == 16 { if conv == "X" { "F" } else { "f" } } else if base == 8 { "7" } else { "1" }
+}
+
+/// The digits of `n` for a conversion in `base`: (digits, sign char,
+/// valsign, dots).
+fn int_digits(n: BigInt, base: i64, signed: bool, flags: i64) -> (str, str, i64, bool) {
+    let neg = is_neg(n)
+    let sc = if neg { "-" } else if has(flags, f_plus()) { "+" } else if has(flags, f_space()) { " " } else { "" }
+    let valsign = if neg { 0 - 1 } else if bigint.is_zero(n) { 0 } else { 1 }
+    if base == 10 {
+        return (bigint.to_str(babs(n)), sc, if neg { 0 - 1 } else { 1 }, false)
+    }
+    let numbits = if base == 16 { 4 } else if base == 8 { 3 } else { 1 }
+    let a = babs(n)
+    let bl = bit_len(a)
+    var numdigits = (bl + numbits - 1) / numbits
+    if signed {
+        return (digits_in_base(a, base, numdigits.max(1)), sc, valsign, false)
+    }
+    let nlz = numdigits * numbits - bl
+    let single = bigint.compare(a, bigint.pow(big(2), bl - 1)) == 0
+    if numdigits == 0 or (nlz != numbits - 1 or not single) and neg {
+        numdigits = numdigits + 1
+    }
+    let v = if neg { bigint.add(bigint.pow(big(base), numdigits), n) } else { n }
+    return (digits_in_base(v, base, numdigits), "", valsign, neg)
+}
+
+fn conv_int(conv: str, flags: i64, width0: i64, prec0: i64, v: RbFmtArg) -> str ! RbFmtError {
+    let n = try to_integer(v)
+    let base = if conv == "o" { 8 } else if conv == "x" or conv == "X" { 16 } else if conv == "b" or conv == "B" { 2 } else { 10 }
+    let signed = base == 10 or has(flags, f_plus() + f_space())
+    var prefix = if not has(flags, f_sharp()) { "" } else if conv == "o" { "0" } else if conv == "x" { "0x" } else if conv == "X" { "0X" } else if conv == "b" {
+        "0b"
+    } else if conv == "B" { "0B" } else { "" }
+    let (s0, sc, valsign, dots) = int_digits(n, base, signed, flags)
+    var s = if conv == "X" { s0.to_upper() } else { s0 }
+    var width = width0 - (if sc == "" { 0 } else { 1 })
+    var prec = prec0
+    var len = s.len()
+    if dots {
+        prec = prec - 2
+        width = width - 2
+    }
+    if prefix == "0" {
+        if dots {
+            prefix = ""
+        } else if len == 1 and s == "0" {
+            len = 0
+            if has(flags, f_prec()) {
+                prec = prec - 1
+            }
+        } else if has(flags, f_prec()) and prec > len {
+            prefix = ""
+        }
+    } else if len == 1 and s == "0" {
+        prefix = ""
+    }
+    width = width - prefix.len()
+    if flags.bit_and(f_zero() + f_minus() + f_prec()) == f_zero() {
+        prec = width
+        width = 0
+    } else {
+        if prec < len {
+            if prefix == "" and prec == 0 and len == 1 and s == "0" {
+                len = 0
+            }
+            prec = len
+        }
+        width = width - prec
+    }
+    return int_layout(flags, width, prec, len, s, sc, prefix, dots, if not signed and valsign < 0 { sign_digit(base, conv) } else { "" })
+}
+
+/// The tail of the integer case: padding, sign, prefix, dots, precision
+/// fill and digits. `fill` is the two's complement digit, or empty.
+fn int_layout(flags: i64, width: i64, prec: i64, len: i64, s: str, sc: str, prefix: str, dots: bool, fill: str) -> str {
+    var out = ""
+    var w = width
+    if not has(flags, f_minus()) {
+        out = spaces(w)
+        w = 0
+    }
+    out = out + sc + prefix + (if dots { ".." } else { "" })
+    if prec > len {
+        if fill != "" {
+            out = out + fill.repeat(prec - len)
+        } else if flags.bit_and(f_minus() + f_prec()) != f_minus() {
+            out = out + zeros(prec - len)
+        }
+    }
+    return out + s.substr(0, len) + spaces(w)
+}
+
+// ---- %f of an Integer
+
+fn conv_f_exact(flags: i64, width: i64, prec0: i64, n: BigInt) -> str {
+    let prec = if has(flags, f_prec()) { prec0 } else { 6 }
+    let sign = if is_neg(n) { 0 - 1 } else if has(flags, f_plus()) { 1 } else { 0 }
+    // sprintf.c negates a Fixnum in place; -2**62 does not fit and stays
+    // negative, so its digits keep their own minus sign.
+    let fixnum_min = bigint.compare(n, bigint.negate(bigint.pow(big(2), 62))) == 0
+    let val = if fixnum_min { bigint.to_str(n) } else { bigint.to_str(babs(n)) }
+    let zero = if prec >= 0 { prec } else { 0 }
+    var len = val.len() + zero
+    if prec >= len {
+        len = prec + 1
+    }
+    if sign != 0 or has(flags, f_space()) {
+        len = len + 1
+    }
+    if prec > 0 {
+        len = len + 1
+    }
+    let fill = if width > len { width - len } else { 0 }
+    var out = ""
+    if fill > 0 and not has(flags, f_minus() + f_zero()) {
+        out = spaces(fill)
+    }
+    if sign != 0 or has(flags, f_space()) {
+        out = out + (if sign > 0 { "+" } else if sign < 0 { "-" } else { " " })
+    }
+    if fill > 0 and flags.bit_and(f_minus() + f_zero()) == f_zero() {
+        out = out + zeros(fill)
+    }
+    out = out + val + (if prec > 0 { "." } else { "" }) + zeros(zero)
+    if fill > 0 and has(flags, f_minus()) {
+        out = out + spaces(fill)
+    }
+    return out
+}
+
+// ---- floats: exact digits
+
+/// The exact decimal digits of |x| (finite, not zero), trailing zeros
+/// removed, and the position of the point: |x| = 0.D * 10^decpt.
+fn exact_digits(x: f64) -> (str, i64) {
+    let bits = x.to_bits().bit_and(9223372036854775807)
+    let exp_bits = bits.ushr(52)
+    let frac = bits.bit_and(4503599627370495)
+    let m = if exp_bits == 0 { frac } else { frac.bit_or(4503599627370496) }
+    let e = if exp_bits == 0 { 0 - 1074 } else { exp_bits - 1075 }
+    var d = ""
+    var decpt = 0
+    if e >= 0 {
+        d = bigint.to_str(bigint.mul(big(m), bigint.pow(big(2), e)))
+        decpt = d.len()
+    } else {
+        d = bigint.to_str(bigint.mul(big(m), bigint.pow(big(5), 0 - e)))
+        decpt = d.len() + e
+    }
+    return (strip_zeros(d), decpt)
+}
+
+fn strip_zeros(d: str) -> str {
+    var n = d.len()
+    while n > 1 and d.substr(n - 1, 1) == "0" {
+        n = n - 1
+    }
+    return d.substr(0, n)
+}
+
+fn tens(k: i64) -> f64 {
+    return [1.0, 10.0, 100.0, 1000.0, 10000.0, 100000.0, 1000000.0, 10000000.0, 100000000.0, 1000000000.0, 10000000000.0, 100000000000.0, 1000000000000.0,
+        10000000000000.0, 100000000000000.0, 1000000000000000.0, 10000000000000000.0, 100000000000000000.0, 1000000000000000000.0, 10000000000000000000.0,
+        100000000000000000000.0, 1000000000000000000000.0, 10000000000000000000000.0][k]
+}
+
+fn bigtens(i: i64) -> f64 {
+    return [1e16, 1e32, 1e64, 1e128, 1e256][i]
+}
+
+/// dtoa's estimate of floor(log10 x) and whether it still needs checking.
+fn estimate_k(x: f64) -> (i64, bool) {
+    let bits = x.to_bits()
+    let biased = bits.ushr(52).bit_and(2047)
+    let frac = bits.bit_and(4503599627370495)
+    var d2 = 0.0
+    var i = 0
+    if biased != 0 {
+        d2 = (1023).shl(52).bit_or(frac).from_bits()
+        i = biased - 1023
+    } else {
+        var nb = 0
+        while nb < 52 and frac.ushr(nb) != 0 {
+            nb = nb + 1
+        }
+        let top = if nb > 32 { frac.ushr(nb - 32) } else { frac.shl(32 - nb) }
+        d2 = top.bit_and(4294967295).as_f64() / 2147483648.0
+        i = nb - 1075
+    }
+    let ds = (d2 - 1.5) * 0.289529654602168 + 0.1760912590558 + i.as_f64() * 0.301029995663981
+    var k = ds.as_i64()
+    if ds < 0.0 and ds != k.as_f64() {
+        k = k - 1
+    }
+    if k >= 0 and k <= 22 {
+        return (if x < tens(k) { k - 1 } else { k }, false)
+    }
+    return (k, true)
+}
+
+/// Whether a finite x is an integer (d2b's `be >= 0`).
+fn is_integral(x: f64) -> bool {
+    let bits = x.to_bits()
+    let biased = bits.ushr(52).bit_and(2047)
+    if biased == 0 {
+        return false
+    }
+    var m = bits.bit_and(4503599627370495).bit_or(4503599627370496)
+    var e = biased - 1075
+    while m % 2 == 0 {
+        m = m / 2
+        e = e + 1
+    }
+    return e >= 0
+}
+
+/// `bump_up`: the digits plus one in the last place, trailing nines
+/// dropped; all nines become `1` a place higher.
+fn bump_up(ds: [i64], k: i64) -> (str, i64) {
+    var n = ds.len()
+    while n > 0 and ds[n - 1] == 9 {
+        n = n - 1
+    }
+    if n == 0 {
+        return ("1", k + 2)
+    }
+    var out = ds.slice(0, n)
+    out[n - 1] = out[n - 1] + 1
+    return (out.map(|d| d.to_str()).join(""), k + 1)
+}
+
+/// What the floating-point quick path of Ruby's dtoa decided.
+type RbFmtQuick =
+    | RbQuickDigits(digits: str, decpt: i64)
+    | RbQuickFailed(half: bool)
+
+/// The quick path: scale by powers of ten in doubles, make the digits,
+/// and accept them when the error bound allows. Ruby 2.6 also rounds up
+/// when the remainder is only within the bound of a half and the last
+/// digit is odd.
+fn quick_path(x: f64, k0: i64, k_check: bool, ilim0: i64, ilim1: i64, ndigits: i64) -> RbFmtQuick {
+    var d = x
+    var k = k0
+    var ilim = ilim0
+    var ieps = 2
+    var i = 0
+    if k > 0 {
+        var ds = tens(k.bit_and(15))
+        var j = k.shr(4)
+        if j.bit_and(16) != 0 {
+            j = j.bit_and(15)
+            d = d / bigtens(4)
+            ieps = ieps + 1
+        }
+        while j != 0 {
+            if j.bit_and(1) != 0 {
+                ieps = ieps + 1
+                ds = ds * bigtens(i)
+            }
+            j = j.shr(1)
+            i = i + 1
+        }
+        d = d / ds
+    } else if k < 0 {
+        d = d * tens((0 - k).bit_and(15))
+        var j = (0 - k).shr(4)
+        while j != 0 {
+            if j.bit_and(1) != 0 {
+                ieps = ieps + 1
+                d = d * bigtens(i)
+            }
+            j = j.shr(1)
+            i = i + 1
+        }
+    }
+    if k_check and d < 1.0 and ilim > 0 {
+        if ilim1 <= 0 {
+            return RbQuickFailed(false)
+        }
+        ilim = ilim1
+        k = k - 1
+        d = d * 10.0
+        ieps = ieps + 1
+    }
+    var eps = (ieps.as_f64() * d + 7.0) / 4503599627370496.0
+    if ilim == 0 {
+        d = d - 5.0
+        return if d > eps { RbQuickDigits("1", k + 2) } else if d < 0.0 - eps { RbQuickDigits("", 0 - ndigits) } else { RbQuickFailed(false) }
+    }
+    eps = eps * tens(ilim - 1)
+    return quick_digits(d, eps, k, ilim)
+}
+
+fn quick_digits(d0: f64, eps: f64, k: i64, ilim0: i64) -> RbFmtQuick {
+    var d = d0
+    var ilim = ilim0
+    var ds: [i64] = []
+    var i = 1
+    while true {
+        let l = d.as_i64()
+        d = d - l.as_f64()
+        if d == 0.0 {
+            ilim = i
+        }
+        ds.push(l)
+        if i == ilim {
+            if d > 0.5 + eps {
+                let (t, p) = bump_up(ds, k)
+                return RbQuickDigits(t, p)
+            }
+            if d < 0.5 - eps {
+                return RbQuickDigits(strip_zeros(ds.map(|v| v.to_str()).join("")), k + 1)
+            }
+            if l % 2 == 1 {
+                let (t, p) = bump_up(ds, k)
+                return RbQuickDigits(t, p)
+            }
+            return RbQuickFailed(true)
+        }
+        i = i + 1
+        d = d * 10.0
+    }
+    return RbQuickFailed(false)
+}
+
+/// The exact path: the digits of the exact value, rounded half to even,
+/// except that after an undecided quick path (`half`) a round-up only
+/// happens on an odd digit (the trailing nines still go).
+fn exact_round(x: f64, mode: i64, ndigits: i64, half: bool) -> (str, i64) {
+    let (d, decpt) = exact_digits(x)
+    let ilim = if mode == 2 { ndigits.max(1) } else { ndigits + decpt }
+    if mode == 3 and ilim <= 0 {
+        let above_half = ilim == 0 and (d.code_at(0) > 53 or d.code_at(0) == 53 and d.len() > 1)
+        return if above_half { ("1", decpt + 1) } else { ("", 0 - ndigits) }
+    }
+    if d.len() <= ilim {
+        return (d, decpt)
+    }
+    let digit = d.code_at(ilim - 1) - 48
+    let next = d.code_at(ilim)
+    let j = if next > 53 or next == 53 and d.len() > ilim + 1 { 1 } else if next == 53 { 0 } else { 0 - 1 }
+    if j < 0 or j == 0 and digit % 2 == 0 {
+        return (strip_zeros(d.substr(0, ilim)), decpt)
+    }
+    var p = ilim - 1
+    while p >= 0 and d.code_at(p) == 57 {
+        p = p - 1
+    }
+    if p < 0 {
+        return ("1", decpt + 1)
+    }
+    let at = d.code_at(p) - 48
+    if half and at % 2 == 0 {
+        return (d.substr(0, p + 1), decpt)
+    }
+    return (d.substr(0, p) + (at + 1).to_str(), decpt)
+}
+
+/// Ruby's `BSD__dtoa` in mode 2 (`n` significant digits) or 3 (`n`
+/// places after the point) for a finite, non-negative x: (digits,
+/// decpt), with its rounding quirks.
+fn dtoa(x: f64, mode: i64, n: i64) -> (str, i64) {
+    if x == 0.0 {
+        return ("0", 1)
+    }
+    let (k, k_check) = estimate_k(x)
+    let ilim = if mode == 2 { n.max(1) } else { n + k + 1 }
+    let ilim1 = if mode == 2 { ilim } else { ilim - 1 }
+    var half = false
+    if ilim >= 0 and ilim <= 14 {
+        match quick_path(x, k, k_check, ilim, ilim1, n) {
+            RbQuickDigits(t, p) -> return (t, p)
+            RbQuickFailed(h) -> half = h
+        }
+    }
+    // A small integer is redone exactly in doubles, without the quirk.
+    if is_integral(x) and k <= 14 {
+        return exact_round(x, mode, n, false)
+    }
+    return exact_round(x, mode, n, half)
+}
+
+/// BSD `__hdtoa`: hex digits of |x| (leading `1`), and the binary
+/// exponent plus one. `n` digits, or as many as needed when negative.
+fn hdtoa(x: f64, n0: i64, upper: bool) -> (str, i64) {
+    if x == 0.0 {
+        return ("0", 1)
+    }
+    let bits = x.to_bits().bit_and(9223372036854775807)
+    let exp_bits = bits.ushr(52)
+    var frac = bits.bit_and(4503599627370495)
+    var decpt = exp_bits - 1022
+    if exp_bits == 0 {
+        // Subnormal: shift the leading one out of the fraction.
+        var b = 51
+        while frac.ushr(b).bit_and(1) == 0 {
+            b = b - 1
+        }
+        frac = (frac - 1.shl(b)).shl(52 - b)
+        decpt = b - 1073
+    }
+    let n = if n0 == 0 { 1 } else { n0 }
+    if n > 0 and n < 15 {
+        // The add-and-subtract trick keeps 4(n-1) fraction bits, but only
+        // 51 at n = 14, so `%.13a` rounds away the lowest bit.
+        let shift = 52 - (4 * (n - 1)).min(51)
+        var q = frac.bit_or(4503599627370496).ushr(shift)
+        let rem = frac.bit_and(1.shl(shift) - 1)
+        let half = 1.shl(shift - 1)
+        if rem > half or rem == half and q % 2 == 1 {
+            q = q + 1
+        }
+        if q == 1.shl(53 - shift) {
+            q = q / 2
+            decpt = decpt + 1
+        }
+        frac = (q - 1.shl(52 - shift)).shl(shift)
+    }
+    let xd = if upper { "0123456789ABCDEF" } else { "0123456789abcdef" }
+    var out = "1"
+    let size = if n > 0 { n } else { 15 }
+    var k = 1
+    while k < size {
+        let digit = if k <= 13 { frac.ushr(52 - 4 * k).bit_and(15) } else { 0 }
+        out = out + xd.substr(digit, 1)
+        k = k + 1
+    }
+    if n < 0 {
+        out = strip_zeros(out)
+    }
+    return (out, decpt)
+}
+
+// ---- floats: BSD vfprintf
+
+/// The exponent suffix: `e+05`, `p-3`.
+fn exponent_text(e: i64, letter: str) -> str {
+    let sign = if e < 0 { "-" } else { "+" }
+    let a = if e < 0 { 0 - e } else { e }
+    if a > 9 {
+        return letter + sign + a.to_str()
+    }
+    return letter + sign + (if letter == "p" or letter == "P" { "" } else { "0" }) + a.to_str()
+}
+
+/// The pieces BSD prints for one float: the sign, `0x` or nothing, the
+/// body, and the size it counted for padding.
+type RbFmtFloatParts = { sign: str, prefix: str, body: str, size: i64 }
+
+/// `cvt`: digits and point for conversion `ch`, padded under `#`.
+fn cvt(x: f64, ndigits: i64, alt: bool, ch: str) -> (str, i64) {
+    let a = if x < 0.0 { 0.0 - x } else { x }
+    let (d0, decpt0) = if ch == "a" or ch == "A" { hdtoa(a, ndigits, ch == "A") } else { dtoa(a, if ch == "f" { 3 } else { 2 }, ndigits) }
+    var d = d0
+    var decpt = decpt0
+    if alt {
+        var bp = ndigits
+        if ch == "f" {
+            if d.substr(0, 1) == "0" and a != 0.0 {
+                decpt = 1 - ndigits
+            }
+            bp = bp + decpt
+        }
+        d = d + zeros(bp - d.len())
+    }
+    return (d, decpt)
+}
+
+/// BSD `vfprintf` for one of `e E f g G a A` on a finite double. `width`
+/// and `prec` are -1 when absent.
+fn bsd_float(conv: str, flags: i64, width: i64, prec0: i64, x: f64) -> str {
+    let parts = float_parts(conv, flags, prec0, x)
+    let realsz = parts.size + parts.sign.len() + parts.prefix.len()
+    let w = width.max(0)
+    let ladjust = has(flags, f_minus())
+    let zeropad = has(flags, f_zero()) and not ladjust
+    let left = if not ladjust and not zeropad { spaces(w - realsz) } else { "" }
+    let mid = if zeropad { zeros(w - realsz) } else { "" }
+    let right = if ladjust { spaces(w - realsz) } else { "" }
+    return left + parts.sign + parts.prefix + mid + parts.body + right
+}
+
+fn float_parts(conv: str, flags: i64, prec0: i64, x: f64) -> RbFmtFloatParts {
+    var alt = has(flags, f_sharp())
+    var prec = prec0
+    var fprec = 0
+    if conv == "a" or conv == "A" {
+        if prec > 0 {
+            alt = true
+            prec = prec + 1
+            fprec = prec
+        }
+    } else if conv == "e" or conv == "E" {
+        if prec != 0 {
+            alt = true
+        }
+        if prec == 0 - 1 {
+            prec = 7
+        } else {
+            prec = prec + 1
+            fprec = prec
+        }
+    } else {
+        if conv == "f" and prec != 0 {
+            alt = true
+        }
+        if prec == 0 - 1 {
+            prec = 6
+        } else {
+            fprec = prec
+        }
+    }
+    let (digits, expt0) = cvt(x, prec.min(1026), alt, conv)
+    let negative = x < 0.0 or x == 0.0 and x.to_bits() < 0
+    let sign = if negative { "-" } else if has(flags, f_plus()) { "+" } else if has(flags, f_space()) { " " } else { "" }
+    var ch = conv
+    if conv == "g" or conv == "G" {
+        ch = if expt0 <= 0 - 4 or expt0 > prec and expt0 > 1 { if conv == "g" { "e" } else { "E" } } else { "g" }
+    }
+    if ch == "a" or ch == "A" {
+        return hex_parts(ch, sign, digits, expt0, alt, fprec)
+    }
+    if ch == "e" or ch == "E" {
+        return exp_parts(ch, sign, digits, expt0, alt, fprec, x)
+    }
+    return fixed_parts(ch, sign, digits, expt0, alt, fprec, prec, x)
+}
+
+fn hex_parts(ch: str, sign: str, digits: str, expt: i64, alt: bool, fprec: i64) -> RbFmtFloatParts {
+    let ndig = digits.len()
+    let exp = exponent_text(expt - 1, if ch == "a" { "p" } else { "P" })
+    let point = ndig > 1 or alt
+    let body = digits.substr(0, 1) + (if point { "." + digits.substr(1, ndig) } else { "" }) + zeros(fprec - ndig) + exp
+    return RbFmtFloatParts{ sign: sign, prefix: if ch == "a" { "0x" } else { "0X" }, body: body, size: exp.len() + ndig + (if point { 1 } else { 0 }) }
+}
+
+fn exp_parts(ch: str, sign: str, digits: str, expt: i64, alt: bool, fprec0: i64, x: f64) -> RbFmtFloatParts {
+    let ndig = digits.len()
+    let exp = exponent_text(expt - 1, ch)
+    var fprec = fprec0
+    var size = exp.len() + ndig
+    var body = ""
+    if ndig > 1 or alt {
+        fprec = fprec + 1
+        size = size + 1
+        body = digits.substr(0, 1) + "." + (if x != 0.0 { digits.substr(1, ndig) } else { zeros(ndig - 1) }) + (if alt { zeros(fprec - ndig - 1) } else { "" })
+    } else {
+        body = digits.substr(0, 1)
+    }
+    return RbFmtFloatParts{ sign: sign, prefix: "", body: body + exp, size: size }
+}
+
+fn fixed_parts(ch: str, sign: str, digits: str, expt: i64, alt: bool, fprec: i64, prec: i64, x: f64) -> RbFmtFloatParts {
+    let ndig = digits.len()
+    var size = 0
+    if ch == "f" {
+        size = if expt > 0 { expt + (if prec > 0 or alt { prec + 1 } else { 0 }) } else if prec == 0 { 1 + (if alt { 1 } else { 0 }) } else { prec + 2 }
+    } else if expt >= ndig {
+        size = expt + (if alt { 1 } else { 0 })
+    } else {
+        size = ndig + (if expt > 0 { 1 } else { 2 - expt })
+    }
+    let fadj = if ch == "f" { expt } else { 0 }
+    var body = ""
+    if x == 0.0 {
+        body = if ndig <= 1 and not alt { "0" } else { "0." + zeros(if ndig >= fprec { ndig - 1 } else { fprec - (if ch != "f" { 1 } else { 0 }) }) }
+    } else if expt == 0 and ndig == 0 and not alt {
+        body = "0"
+    } else if expt <= 0 {
+        body = "0." + zeros(0 - expt) + digits + (if alt { zeros(fprec - ndig + fadj) } else { "" })
+    } else if expt >= ndig {
+        body = digits + zeros(expt - ndig) + (if alt { "." } else { "" })
+    } else {
+        body = digits.substr(0, expt) + "." + digits.substr(expt, ndig) + (if alt { zeros(fprec - ndig + fadj) } else { "" })
+    }
+    return RbFmtFloatParts{ sign: sign, prefix: "", body: body, size: size }
+}
+
+/// Ruby's own text for NaN and infinity: spaces, never zeros.
+fn non_finite(flags: i64, width: i64, x: f64) -> str {
+    let expr = if is_nan(x) { "NaN" } else { "Inf" }
+    let sign = if not is_nan(x) and x < 0.0 { "-" } else if has(flags, f_plus()) { "+" } else if has(flags, f_space()) { " " } else { "" }
+    let text = sign + expr
+    let need = if has(flags, f_width()) and text.len() < width { width } else { text.len() }
+    return if has(flags, f_minus()) { text + spaces(need - text.len()) } else { spaces(need - text.len()) + text }
+}
+
+fn conv_float(conv: str, flags: i64, width: i64, prec: i64, v: RbFmtArg) -> str ! RbFmtError {
+    let x = try to_float(v)
+    if is_nan(x) or is_inf(x) {
+        return non_finite(flags, width, x)
+    }
+    return bsd_float(conv, flags, if has(flags, f_width()) { width } else { 0 - 1 }, if has(flags, f_prec()) { prec } else { 0 - 1 }, x)
+}
+
+// ---- the directive scanner
+
+/// Which arguments have been taken: the next unnumbered one, how the
+/// last was taken (n > 0 unnumbered, -1 numbered, -2 named), and the
+/// Hash once looked up.
+type RbFmtCursor = { nextarg: i64, posarg: i64, hash: Option[RbFmtArg] }
+
+/// One directive being read.
+type RbFmtSpec = { flags: i64, width: i64, prec: i64, value: Option[RbFmtArg], sym: Option[str], p: i64 }
+
+fn nth_arg(args: [RbFmtArg], n: i64) -> RbFmtArg ! RbFmtError {
+    if n > args.len() {
+        fail(arg_error("too few arguments"))
+    }
+    return args[n - 1]
+}
+
+fn next_arg(inout cur: RbFmtCursor, args: [RbFmtArg]) -> RbFmtArg ! RbFmtError {
+    if cur.posarg == 0 - 1 {
+        fail(arg_error("unnumbered(" + cur.nextarg.to_str() + ") mixed with numbered"))
+    }
+    if cur.posarg == 0 - 2 {
+        fail(arg_error("unnumbered(" + cur.nextarg.to_str() + ") mixed with named"))
+    }
+    cur.posarg = cur.nextarg
+    cur.nextarg = cur.nextarg + 1
+    return try nth_arg(args, cur.posarg)
+}
+
+fn pos_arg(inout cur: RbFmtCursor, args: [RbFmtArg], n: i64) -> RbFmtArg ! RbFmtError {
+    if cur.posarg > 0 {
+        fail(arg_error("numbered(" + n.to_str() + ") after unnumbered(" + cur.posarg.to_str() + ")"))
+    }
+    if cur.posarg == 0 - 2 {
+        fail(arg_error("numbered(" + n.to_str() + ") after named"))
+    }
+    if n < 1 {
+        fail(arg_error("invalid index - " + n.to_str() + "$"))
+    }
+    cur.posarg = 0 - 1
+    return try nth_arg(args, n)
+}
+
+fn get_arg(inout cur: RbFmtCursor, args: [RbFmtArg], sp: RbFmtSpec) -> RbFmtArg ! RbFmtError {
+    return match sp.value {
+        Some(v) -> v
+        None -> try next_arg(cur, args)
+    }
+}
+
+fn is_digit(c: i64) -> bool {
+    return c >= 48 and c <= 57
+}
+
+fn at(f: [i64], p: i64) -> i64 {
+    return if p < f.len() { f[p] } else { 0 }
+}
+
+/// `get_num`: digits from `p` onto `start`; `None` when past INT_MAX.
+fn get_num(f: [i64], p: i64, start: i64) -> Option[(i64, i64)] ! RbFmtError {
+    var n = start
+    var q = p
+    while q < f.len() and is_digit(f[q]) {
+        if n > int_max() / 10 {
+            return None
+        }
+        n = n * 10
+        let d = f[q] - 48
+        if int_max() - d < n {
+            return None
+        }
+        n = n + d
+        q = q + 1
+    }
+    if q >= f.len() {
+        fail(arg_error("malformed format string - %*[0-9]"))
+    }
+    return Some((n, q))
+}
+
+/// `GETASTER`: the value of a `*` at `sp.p`; leaves `sp.p` on its last
+/// character.
+fn aster(f: [i64], inout sp: RbFmtSpec, inout cur: RbFmtCursor, args: [RbFmtArg], what: str) -> i64 ! RbFmtError {
+    let t = sp.p
+    let (n, q) = (try get_num(f, t + 1, 0)) ?? fail(arg_error(what + " too big"))
+    var v = RbFmtNil
+    if at(f, q) == 36 {
+        v = try pos_arg(cur, args, n)
+        sp.p = q
+    } else {
+        v = try next_arg(cur, args)
+        sp.p = t
+    }
+    return try num2int(v)
+}
+
+fn check_for_flags(flags: i64) -> () ! RbFmtError {
+    if has(flags, f_width()) {
+        fail(arg_error("flag after width"))
+    }
+    if has(flags, f_prec0()) {
+        fail(arg_error("flag after precision"))
+    }
+    return ()
+}
+
+fn check_for_width(flags: i64) -> () ! RbFmtError {
+    if has(flags, f_width()) {
+        fail(arg_error("width given twice"))
+    }
+    if has(flags, f_prec0()) {
+        fail(arg_error("width after precision"))
+    }
+    return ()
+}
+
+fn flag_bit(c: i64) -> i64 {
+    return if c == 32 { f_space() } else if c == 35 { f_sharp() } else if c == 43 { f_plus() } else if c == 45 { f_minus() } else if c == 48 { f_zero() } else {
+        0
+    }
+}
+
+/// A width, or `N$` choosing the argument.
+fn width_or_position(f: [i64], inout sp: RbFmtSpec, inout cur: RbFmtCursor, args: [RbFmtArg]) -> () ! RbFmtError {
+    let (n, q) = (try get_num(f, sp.p, 0)) ?? fail(arg_error("width too big"))
+    sp.p = q
+    if f[q] == 36 {
+        if sp.value.is_some() {
+            fail(arg_error("value given twice - " + n.to_str() + "$"))
+        }
+        sp.value = Some(try pos_arg(cur, args, n))
+        sp.p = q + 1
+        return ()
+    }
+    try check_for_width(sp.flags)
+    sp.width = n
+    sp.flags = sp.flags.bit_or(f_width())
+    return ()
+}
+
+fn star_width(f: [i64], inout sp: RbFmtSpec, inout cur: RbFmtCursor, args: [RbFmtArg]) -> () ! RbFmtError {
+    try check_for_width(sp.flags)
+    sp.flags = sp.flags.bit_or(f_width())
+    var w = try aster(f, sp, cur, args, "width")
+    if w < 0 {
+        sp.flags = sp.flags.bit_or(f_minus())
+        w = 0 - w
+        if w > int_max() {
+            fail(arg_error("width too big"))
+        }
+    }
+    sp.width = w
+    sp.p = sp.p + 1
+    return ()
+}
+
+fn precision(f: [i64], inout sp: RbFmtSpec, inout cur: RbFmtCursor, args: [RbFmtArg]) -> () ! RbFmtError {
+    if has(sp.flags, f_prec0()) {
+        fail(arg_error("precision given twice"))
+    }
+    sp.flags = sp.flags.bit_or(f_prec() + f_prec0())
+    sp.prec = 0
+    sp.p = sp.p + 1
+    if at(f, sp.p) == 42 {
+        sp.prec = try aster(f, sp, cur, args, "prec")
+        if sp.prec < 0 {
+            sp.flags = sp.flags - f_prec()
+        }
+        sp.p = sp.p + 1
+        return ()
+    }
+    let (n, q) = (try get_num(f, sp.p, 0)) ?? fail(arg_error("precision too big"))
+    sp.prec = n
+    sp.p = q
+    return ()
+}
+
+fn get_hash(inout cur: RbFmtCursor, args: [RbFmtArg]) -> RbFmtArg ! RbFmtError {
+    match cur.hash {
+        Some(h) -> return h
+        None -> ()
+    }
+    if args.len() != 1 {
+        fail(arg_error("one hash required"))
+    }
+    match args[0] {
+        RbFmtHash(_k, _v) -> {
+            cur.hash = Some(args[0])
+            return args[0]
+        }
+        _ -> fail(arg_error("one hash required"))
+    }
+}
+
+/// `%<name>` or `%{name}` at `sp.p`: looks the name up and leaves
+/// `sp.p` on the closing bracket.
+fn named(f: [i64], inout sp: RbFmtSpec, inout cur: RbFmtCursor, args: [RbFmtArg]) -> () ! RbFmtError {
+    let start = sp.p
+    let term = if f[start] == 60 { 62 } else { 125 }
+    var p = start
+    while p < f.len() and f[p] != term {
+        p = p + 1
+    }
+    if p >= f.len() {
+        fail(arg_error("malformed name - unmatched parenthesis"))
+    }
+    let shown = chars(f, start, p + 1)
+    match sp.sym {
+        Some(prev) -> fail(arg_error("named" + shown + " after <" + prev + ">"))
+        None -> ()
+    }
+    if cur.posarg > 0 {
+        fail(arg_error("named" + shown + " after unnumbered(" + cur.posarg.to_str() + ")"))
+    }
+    if cur.posarg == 0 - 1 {
+        fail(arg_error("named" + shown + " after numbered"))
+    }
+    cur.posarg = 0 - 2
+    let h = try get_hash(cur, args)
+    let key = chars(f, start + 1, p)
+    sp.sym = Some(key)
+    sp.value = Some(try lookup(h, key, shown))
+    sp.p = p
+    return ()
+}
+
+fn lookup(h: RbFmtArg, key: str, shown: str) -> RbFmtArg ! RbFmtError {
+    match h {
+        RbFmtHash(keys, values) -> {
+            var i = 0
+            while i < keys.len() {
+                if keys[i] == key {
+                    return values[i]
+                }
+                i = i + 1
+            }
+        }
+        _ -> ()
+    }
+    fail(RbFmtError("KeyError", "key" + shown + " not found"))
+}
+
+/// The text of the conversion at `sp.p`, whose character is `c`.
+fn convert(c: i64, inout sp: RbFmtSpec, inout cur: RbFmtCursor, args: [RbFmtArg]) -> str ! RbFmtError {
+    let conv = c.to_char()
+    if c == 99 {
+        return try conv_c(sp.flags, sp.width, try get_arg(cur, args, sp))
+    }
+    if c == 115 or c == 112 {
+        return try conv_s(sp.flags, sp.width, sp.prec, try get_arg(cur, args, sp), c == 112)
+    }
+    if "diuoxXbB".contains(conv) {
+        return try conv_int(conv, sp.flags, sp.width, sp.prec, try get_arg(cur, args, sp))
+    }
+    if c == 102 {
+        let v = try get_arg(cur, args, sp)
+        return match v {
+            RbFmtInt(n) -> conv_f_exact(sp.flags, sp.width, sp.prec, n)
+            _ -> try conv_float(conv, sp.flags, sp.width, sp.prec, v)
+        }
+    }
+    if "gGeEaA".contains(conv) {
+        return try conv_float(conv, sp.flags, sp.width, sp.prec, try get_arg(cur, args, sp))
+    }
+    if c >= 33 and c < 127 {
+        fail(arg_error("malformed format string - %" + conv))
+    }
+    fail(arg_error("malformed format string"))
+}
+
+/// One directive whose first character after `%` is at `p0`: appends
+/// its text and returns the index of its last character.
+fn directive(f: [i64], p0: i64, args: [RbFmtArg], inout cur: RbFmtCursor, inout out: [str]) -> i64 ! RbFmtError {
+    var sp = RbFmtSpec{ flags: 0, width: 0 - 1, prec: 0 - 1, value: None, sym: None, p: p0 }
+    while true {
+        let c = at(f, sp.p)
+        let bit = flag_bit(c)
+        if bit != 0 {
+            try check_for_flags(sp.flags)
+            sp.flags = sp.flags.bit_or(bit)
+            sp.p = sp.p + 1
+        } else if c >= 49 and c <= 57 {
+            try width_or_position(f, sp, cur, args)
+        } else if c == 60 or c == 123 {
+            try named(f, sp, cur, args)
+            if c == 123 {
+                out.push(try conv_s(sp.flags, sp.width, sp.prec, try get_arg(cur, args, sp), false))
+                return sp.p
+            }
+            sp.p = sp.p + 1
+        } else if c == 42 {
+            try star_width(f, sp, cur, args)
+        } else if c == 46 {
+            try precision(f, sp, cur, args)
+        } else if c == 10 or c == 0 or c == 37 {
+            if sp.flags != 0 {
+                fail(arg_error("invalid format character - %"))
+            }
+            out.push("%")
+            return if c == 37 { sp.p } else { sp.p - 1 }
+        } else {
+            out.push(try convert(c, sp, cur, args))
+            return sp.p
+        }
+    }
+    return sp.p
+}
+
+/// `format(fmt, *args)`.
+pub fn format(fmt: str, args: [RbFmtArg]) -> str ! RbFmtError {
+    let f = fmt.codes()
+    var cur = RbFmtCursor{ nextarg: 1, posarg: 0, hash: None }
+    var out: [str] = []
+    var p = 0
+    while p < f.len() {
+        var t = p
+        while t < f.len() and f[t] != 37 {
+            t = t + 1
+        }
+        if t + 1 == f.len() {
+            fail(arg_error("incomplete format specifier; use %% (double %) instead"))
+        }
+        out.push(chars(f, p, t))
+        if t >= f.len() {
+            break
+        }
+        p = (try directive(f, t + 1, args, cur, out)) + 1
+    }
+    return out.join("")
+}

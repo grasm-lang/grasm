@@ -1,0 +1,44 @@
+[package]
+name = "b58_demo"
+version = "1.0.0"
+capabilities = ["io"]
+
+[dependencies.gobuildconstraint]
+path = "../gobuildconstraint"
+version = "^1.0.0"
+
+[dependencies.goversion]
+path = "../goversion"
+version = "^1.0.0"
+
+[dependencies.gostrings]
+path = "../gostrings"
+version = "^1.0.0"
+
+[dependencies.gonetmail]
+path = "../gonetmail"
+version = "^1.0.0"
+
+[dependencies.gotimefmt]
+path = "../gotimefmt"
+version = "^1.0.0"
+
+[dependencies.javaurlencoder]
+path = "../javaurlencoder"
+version = "^1.0.0"
+
+[dependencies.javadatetimeformatter]
+path = "../javadatetimeformatter"
+version = "^1.0.0"
+
+[dependencies.gohtml]
+path = "../gohtml"
+version = "^1.0.0"
+
+[dependencies.gohttpcookie]
+path = "../gohttpcookie"
+version = "^1.0.0"
+
+[dependencies.javasimpledateformat]
+path = "../javasimpledateformat"
+version = "^1.0.0"

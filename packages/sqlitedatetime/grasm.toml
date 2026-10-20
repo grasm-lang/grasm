@@ -1,0 +1,16 @@
+[package]
+name = "sqlitedatetime"
+version = "1.0.0"
+capabilities = []
+
+[dependencies.pymath]
+path = "../pymath"
+version = "^1.0.0"
+
+[dependencies.sqlitefile]
+path = "../sqlitefile"
+version = "^1.0.0"
+
+[dependencies.sqliteprintf]
+path = "../sqliteprintf"
+version = "^1.0.0"

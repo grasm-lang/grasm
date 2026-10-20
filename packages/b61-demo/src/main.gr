@@ -1,0 +1,154 @@
+// Each library run on inputs whose answers came from the tool it is held
+// to; scripts/b61_diff.py holds them to those tools on thousands more.
+import perlfilespec
+import perltimelocal
+import rustduration
+import rustipaddr
+import jqformat
+import jqpath
+import perljsonpp
+import lispprint
+import perlansicolor
+import bigint
+
+fn file_spec() {
+    assert_eq(perlfilespec.canonpath("/../a//./b/"), "/a/b")
+    assert_eq(perlfilespec.catfile(["a", "b", "c.txt"]) ?? "", "a/b/c.txt")
+    assert_eq(perlfilespec.abs2rel("/a/b/c", "/a/x", "/home/u"), "../b/c")
+    assert_eq(perlfilespec.rel2abs("../x", "src", "/home/u"), "/home/u/src/../x")
+    assert_eq(perlfilespec.splitdir("/a//b/"), ["", "a", "", "b", ""])
+    assert_eq(perlfilespec.canonpath("a/b/.."), "a/b/..")
+    print("perlfilespec: Perl's File::Spec::Unix")
+}
+
+fn time_local() {
+    let z = TlInt(0)
+    assert_eq(perltimelocal.timegm("timegm", 2026, z, z, z, TlInt(1), 0, 70) ?? z, TlInt(3155760000))
+    assert_eq(perltimelocal.timegm("timegm", 2026, z, z, z, TlInt(1), 0, 77) ?? z, TlInt(220924800))
+    assert_eq(perltimelocal.timegm("timegm", 2026, TlFloat(59.5), z, z, TlInt(1), 0, 2000) ?? z, TlFloat(946684859.5))
+    let refused = match perltimelocal.timegm("timegm", 2026, z, z, z, TlInt(29), 1, 2100) {
+        Ok(_v) -> ""
+        Err(e) -> match e {
+            TimeLocalDied(m) -> m
+            TimeLocalRefused(w) -> w
+        }
+    }
+    assert_eq(refused, "Day '29' out of range 1..28")
+    print("perltimelocal: Perl's Time::Local")
+}
+
+fn rd_text(secs: i64, nanos: i64, spec: str) -> str {
+    return rustduration.debug(RustDuration{ secs: secs, nanos: nanos }, spec) ?? "error"
+}
+
+fn duration() {
+    assert_eq(rd_text(1, 500000000, ""), "1.5s")
+    assert_eq(rd_text(1, 1, ""), "1.000000001s")
+    assert_eq(rd_text(0, 100000000, ""), "100ms")
+    assert_eq(rd_text(0, 1500, ".0"), "2µs")
+    assert_eq(rd_text(1, 0, "*^12"), "*****1s*****")
+    let blank = RustDuration{ secs: 0, nanos: 0 }
+    assert_eq(rustduration.try_from_secs_f64(0.999e-9) ?? blank, RustDuration{ secs: 0, nanos: 1 })
+    let neg = match rustduration.try_from_secs_f64(0.0 - 1.0) {
+        Ok(_d) -> ""
+        Err(e) -> rustduration.error_text(e)
+    }
+    assert_eq(neg, "cannot convert float seconds to Duration: value is negative")
+    print("rustduration: Rust's Duration")
+}
+
+fn ip_addresses() {
+    let mapped = rustipaddr.parse_ipv6("::FFFF:1.2.3.4") ?? RustIpv6Addr{ segments: [] }
+    assert_eq(rustipaddr.ipv6_text(mapped), "::ffff:1.2.3.4")
+    let compatible = rustipaddr.parse_ipv6("::1.2.3.4") ?? RustIpv6Addr{ segments: [] }
+    assert_eq(rustipaddr.ipv6_text(compatible), "::102:304")
+    let runs = rustipaddr.parse_ipv6("1:0:0:2:0:0:3:4") ?? RustIpv6Addr{ segments: [] }
+    assert_eq(rustipaddr.ipv6_text(runs), "1::2:0:0:3:4")
+    let refused = match rustipaddr.parse_ipv4("01.2.3.4") {
+        Ok(_a) -> ""
+        Err(e) -> rustipaddr.parse_error_text(e)
+    }
+    assert_eq(refused, "invalid IPv4 address syntax")
+    let sock = rustipaddr.parse_socket("[fe80::1%0003]:0080") ?? RustSockV4(RustSocketAddrV4{ ip: RustIpv4Addr{ bits: 0 }, port: 0 })
+    assert_eq(rustipaddr.socket_text(sock), "[fe80::1%3]:80")
+    assert_eq(rustipaddr.format_with("127.0.0.1", "*^13.3") ?? "", "*****127*****")
+    assert(rustipaddr.ipv4_is_private(RustIpv4Addr{ bits: 2886729729 }))
+    print("rustipaddr: Rust's std::net addresses")
+}
+
+fn jq(text: str) -> JqValue {
+    return jqformat.parse(text) ?? JqNull
+}
+
+fn jq_paths() {
+    let doc = jq("\{\"a\":\{\"b\":[1,2,3]},\"c\":1.000}")
+    assert_eq(jqformat.tojson(jqpath.getpath(doc, jq("[\"a\",\"b\",-1]")) ?? JqNull), "3")
+    let grown = jqpath.setpath(doc, jq("[\"a\",\"b\",5]"), jq("1e2")) ?? JqNull
+    assert_eq(jqformat.tojson(grown), "\{\"a\":\{\"b\":[1,2,3,null,null,1E+2]},\"c\":1.000}")
+    let cut = jqpath.delpaths(doc, jq("[[\"a\",\"b\",0],[\"a\",\"b\",-1]]")) ?? JqNull
+    assert_eq(jqformat.tojson(cut), "\{\"a\":\{\"b\":[2]},\"c\":1.000}")
+    let numbers = jqpath.paths_where(doc, "numbers") ?? []
+    assert_eq(jqformat.tojson(JqArray(numbers)), "[[\"a\",\"b\",0],[\"a\",\"b\",1],[\"a\",\"b\",2],[\"c\"]]")
+    let picked = jqpath.pick(doc, [jq("[\"a\",\"b\",1]")]) ?? JqNull
+    assert_eq(jqformat.tojson(picked), "\{\"a\":\{\"b\":[null,2]}}")
+    let entries = jqpath.from_entries(jq("[\{\"name\":\"x\",\"value\":false},\{\"key\":null,\"Key\":\"y\"}]")) ?? JqNull
+    assert_eq(jqformat.tojson(entries), "\{\"x\":false,\"y\":null}")
+    print("jqpath: jq's path builtins")
+}
+
+fn json_pp() {
+    var o = perljsonpp.options()
+    o.canonical = true
+    let doc = JppHash([("b", JppArray([JppInt(bigint.from_i64(1)), JppStr("2"), JppUndef])), ("a", JppNum(0.5)), ("c", JppStr("é\n"))])
+    assert_eq(perljsonpp.encode(doc, o) ?? "", "\{\"a\":0.5,\"b\":[1,\"2\",null],\"c\":\"é\\n\"}")
+    var ascii = perljsonpp.options()
+    ascii.ascii = true
+    assert_eq(perljsonpp.encode(JppArray([JppStr("😀")]), ascii) ?? "", "[\"\\ud83d\\ude00\"]")
+    let bad = match perljsonpp.decode("[1,x]", perljsonpp.options()) {
+        Ok(_v) -> ""
+        Err(e) -> perljsonpp.error_text(e)
+    }
+    assert_eq(bad, "malformed JSON string, neither array, object, number, string or atom, at character offset 3 (before \"x]\")")
+    let nums = perljsonpp.decode("[1e2,1.0,12345678901234567890123]", perljsonpp.options()) ?? JppUndef
+    assert_eq(nums, JppArray([JppInt(bigint.from_i64(100)), JppNum(1.0), JppStr("12345678901234567890123")]))
+    print("perljsonpp: Perl's JSON::PP")
+}
+
+fn lp(o: LispPrintable, base: i64, radix: bool, double_default: bool) -> str {
+    return lispprint.prin1(o, LispPrintVars{ base: base, radix: radix, double_default: double_default }) ?? "error"
+}
+
+fn lisp_printer() {
+    assert_eq(lp(LoDouble(1.5), 10, false, false), "1.5d0")
+    assert_eq(lp(LoDouble(1.5), 10, false, true), "1.5")
+    assert_eq(lp(LoDouble(10000000.0), 10, false, true), "1.0e7")
+    assert_eq(lp(LoInteger(bigint.from_i64(0 - 255)), 16, true, false), "#x-FF")
+    assert_eq(lp(LoInteger(bigint.from_i64(10)), 10, true, false), "10.")
+    assert_eq(lp(LoRatio(bigint.from_i64(2), bigint.from_i64(4)), 10, true, false), "#10r1/2")
+    assert_eq(lp(LoString("a\"b"), 10, false, false), "\"a\\\"b\"")
+    assert_eq(lp(LoChar(32), 10, false, false), "#\\ ")
+    assert_eq(lp(LoChar(133), 10, false, false), "#\\Next-Line")
+    print("lispprint: SBCL's PRIN1 and PRINC")
+}
+
+fn ansi_color() {
+    assert_eq((perlansicolor.color(["bold", "Red on_blue"]) ?? None) ?? "", "\u{1b}[1;31;44m")
+    assert_eq(perlansicolor.colored("hi", ["green"], None) ?? "", "\u{1b}[32mhi\u{1b}[0m")
+    assert_eq(perlansicolor.colored("a\n\nb", ["green"], Some("\n")) ?? "", "\u{1b}[32ma\u{1b}[0m\n\n\u{1b}[32mb\u{1b}[0m")
+    assert_eq(perlansicolor.uncolor(["\u{1b}[1;38;5;196m", "04;007"]) ?? [], ["bold", "rgb500", "underline", "reverse"])
+    assert_eq(perlansicolor.colorstrip(["\u{1b}[1mX\u{1b}[0m"]), ["X"])
+    assert(perlansicolor.colorvalid(["bold r1g2b3"]))
+    assert(not perlansicolor.colorvalid(["r256g0b0"]))
+    print("perlansicolor: Perl's Term::ANSIColor")
+}
+
+fn main() {
+    file_spec()
+    time_local()
+    duration()
+    ip_addresses()
+    jq_paths()
+    json_pp()
+    lisp_printer()
+    ansi_color()
+}

@@ -1,0 +1,153 @@
+// Nine libraries, each run on inputs whose answers came from the tool it
+// is held to -- Perl 5.34 for five, SBCL 2.6.8 for two, Rust 1.99 and
+// Lua 5.5 for one each. scripts/b60_diff.py holds them to those tools on
+// thousands more.
+import bigint
+import perlsprintf
+import perltextabbrev
+import perlmimebase64
+import perlgetoptlong
+import perltextbalanced
+import lispformat
+import lispreadnumber
+import rustfmt
+import luanumber
+
+fn perl_text(f: str, args: [PerlArg]) -> (str, [str]) {
+    return match perlsprintf.sprintf(f, args) {
+        Ok(r) -> (r.text, r.warnings)
+        Err(e) -> ("error: " + perlsprintf.error_text(e), [])
+    }
+}
+
+fn perl() {
+    assert_eq(perl_text("%vd", [PerlStr("1.22.333")]).0, "49.46.50.50.46.51.51.51")
+    assert_eq(perl_text("%-6s|%05.1f|%#x|%+d", [PerlStr("ab"), PerlNum(2.25), PerlInt(255), PerlStr("12abc")]), ("ab    |002.2|0xff|+12", ["Argument \"12abc\" isn't numeric in sprintf"]))
+    assert_eq(perl_text("%2$s %1$s", [PerlStr("a"), PerlStr("b")]).0, "b a")
+    assert_eq(perl_text("%d|%u", [PerlNum(1.0e20), PerlStr("-3.5")]).0, "-1|18446744073709551613")
+    assert_eq(perl_text("%1$d %1$d", [PerlStr(" inf")]).0, "0 Inf")
+    assert_eq(perl_text("%y%s", [PerlStr("x"), PerlStr("y")]), ("%yx", ["Invalid conversion in sprintf: \"%y\""]))
+    assert_eq(perl_text("%z%s", [PerlStr("x")]), ("%s", ["Redundant argument in sprintf"]))
+    assert_eq(perl_text("%.3a", [PerlNum(1.0 / 3.0)]).0, "0x1.555p-2")
+    assert_eq(perl_text("%c", [PerlInt(0 - 1)]).0, "error: Use of code point 0xFFFFFFFFFFFFFFFF is not allowed; the permissible max is 0x7FFFFFFFFFFFFFFF")
+    print("perlsprintf: Perl's sprintf")
+}
+
+fn abbrev() {
+    let t = perltextabbrev.abbrev(["list", "load", "lis"])
+    assert_eq(t.get("lo") ?? "", "load")
+    assert_eq(t.get("lis") ?? "", "lis")
+    assert_eq(t.get("lisx") ?? "none", "none")
+    assert(not t.has("l"))
+    assert_eq(t.len(), 5)
+    print("perltextabbrev: Perl's Text::Abbrev")
+}
+
+fn mime() {
+    let nl = "\n".to_bytes()
+    assert_eq(perlmimebase64.encode_base64("Aladdin:open sesame".to_bytes(), nl).to_str(), "QWxhZGRpbjpvcGVuIHNlc2FtZQ==\n")
+    assert_eq(perlmimebase64.decode_base64("QWxh*ZGRp\nbg".to_bytes()).to_str(), "Aladdin")
+    assert_eq(perlmimebase64.encode_qp(bytes_of([99, 97, 102, 233, 32, 10]), nl, false).to_str(), "caf=E9=20\n")
+    assert_eq(perlmimebase64.decode_qp("a=3Db =\r\nc  \n".to_bytes()).to_str(), "a=b c\n")
+    print("perlmimebase64: Perl's MIME::Base64 and MIME::QuotedPrint")
+}
+
+fn getopt() {
+    let r = perlgetoptlong.get_options(["-vvx3", "--name=Al", "--lib", "a", "--lib", "b", "--define", "k=v", "rest", "--", "-q"], ["v+", "x=i", "name=s", "lib=s@", "define=s%", "q"], ["bundling"]) ?? GolResult{ ok: false, values: [], rest: [], warnings: [] }
+    assert(r.ok)
+    assert_eq(r.rest, ["rest", "-q"])
+    assert_eq(r.values.len(), 5)
+    assert_eq(r.values[0].0, "define")
+    assert_eq(r.values[4], ("x", GolScalar("3")))
+    assert_eq(r.values[3], ("v", GolScalar("2")))
+    let amb = perlgetoptlong.get_options(["--verb", "--fo"], ["verbose", "foo=s", "fox"], []) ?? GolResult{ ok: true, values: [], rest: [], warnings: [] }
+    assert(not amb.ok)
+    assert_eq(amb.warnings, ["Option fo is ambiguous (foo, fox)"])
+    print("perlgetoptlong: Perl's Getopt::Long")
+}
+
+fn balanced() {
+    let blank = TextBalancedResult{ extracted: None, remainder: "", prefix: None, failure: None }
+    let d = perltextbalanced.extract_delimited("  \"a\\\"b\" rest", None, None, None) ?? blank
+    assert_eq(d.extracted ?? "", "\"a\\\"b\"")
+    assert_eq(d.remainder, " rest")
+    assert_eq(d.prefix ?? "", "  ")
+    let b = perltextbalanced.extract_bracketed(" (a [b] \"c)\" d) rest", Some("(\""), None) ?? blank
+    assert_eq(b.extracted ?? "", "(a [b] \"c)\" d)")
+    let bad = perltextbalanced.extract_bracketed(" (a [b) rest", None, None) ?? blank
+    assert(bad.extracted.is_none())
+    assert_eq(bad.failure ?? TextBalancedFailure{ message: "", pos: 0 }, TextBalancedFailure{ message: "Mismatched closing bracket: expected \"]\" but found \")\"", pos: 7 })
+    print("perltextbalanced: Perl's Text::Balanced")
+}
+
+fn lisp_text(control: str, args: [LispArg]) -> str {
+    return lispformat.format(control, args) ?? "error"
+}
+
+fn lisp_format() {
+    // 0.125 is a single-float with bits 0x3e000000.
+    assert_eq(lisp_text("~,2F", [LispSingle(1040187392)]), "0.13")
+    assert_eq(lisp_text("~8,3E", [LispDouble(31.4)]), "3.140d+1")
+    assert_eq(lisp_text("~:D", [LispInteger(bigint.from_i64(1234567))]), "1,234,567")
+    assert_eq(lisp_text("~,,'.,4:X", [LispInteger(bigint.from_i64(1234567))]), "12.D687")
+    assert_eq(lisp_text("~,0F", [LispDouble(2.5)]), "3.")
+    assert_eq(lisp_text("~F", []), "error")
+    print("lispformat: SBCL's FORMAT for numbers")
+}
+
+fn lisp_read() {
+    let ratio = lispreadnumber.read_token("1.5r0", 10, "single-float") ?? LrSymbol("")
+    assert_eq(ratio, LrRatio(bigint.from_i64(3), bigint.from_i64(2)))
+    assert_eq(lispreadnumber.read_token("1e5", 16, "single-float") ?? LrSymbol(""), LrInteger(bigint.from_i64(485)))
+    assert_eq(lispreadnumber.read_token("1e+5", 16, "single-float") ?? LrSymbol(""), LrSingle(1203982336))
+    assert_eq(lispreadnumber.read_token("17.", 16, "single-float") ?? LrSymbol(""), LrInteger(bigint.from_i64(17)))
+    assert_eq(lispreadnumber.read_token("1e5x", 10, "single-float") ?? LrSymbol(""), LrSymbol("1E5X"))
+    assert_eq(lispreadnumber.read_token("1.5d0", 10, "single-float") ?? LrSymbol(""), LrDouble(1.5))
+    print("lispreadnumber: SBCL's reader on numbers")
+}
+
+fn rust_text(spec: str, arg: RustFmtArg) -> str {
+    return rustfmt.format_value(spec, arg, []) ?? "error"
+}
+
+fn rust_fmt() {
+    assert_eq(rust_text(">8.2", RustF64(0.0 - 1.5)), "   -1.50")
+    assert_eq(rust_text("+#010x", RustI64(255)), "+0x00000ff")
+    assert_eq(rust_text("^9", RustStr("héllo")), "  héllo  ")
+    assert_eq(rust_text(".2e", RustU64(1235)), "1.24e3")
+    assert_eq(rust_text("05", RustF64(1.0 / 0.0)), "00inf")
+    assert_eq(rust_text("x", RustI64(0 - 1)), "ffffffffffffffff")
+    assert_eq(rustfmt.format_value("1$", RustI64(7), [4]) ?? "error", "   7")
+    print("rustfmt: Rust's format specs")
+}
+
+fn lua_arith(op: str, a: LuaNumValue, b: LuaNumValue) -> LuaNumValue {
+    return luanumber.arith(op, a, b) ?? LnStr("error")
+}
+
+fn lua() {
+    assert_eq(lua_arith("//", LnInt(0 - 7), LnInt(2)), LnInt(0 - 4))
+    assert_eq(lua_arith("%", LnInt(0 - 7), LnInt(3)), LnInt(2))
+    assert_eq(lua_arith("%", LnFloat(7.5), LnInt(0 - 2)), LnFloat(0.0 - 0.5))
+    assert_eq(lua_arith("<<", LnInt(1), LnInt(64)), LnInt(0))
+    assert_eq(lua_arith(">>", LnInt(0 - 1), LnInt(1)), LnInt(9223372036854775807))
+    assert_eq(lua_arith("+", LnStr("10"), LnInt(1)), LnInt(11))
+    assert_eq(luanumber.arith("//", LnInt(7), LnInt(0)) ?? LnNil, LnNil)
+    assert(not (luanumber.compare("==", LnInt(9007199254740993), LnFloat(9007199254740992.0)) ?? true))
+    assert(luanumber.compare(">", LnInt(9007199254740993), LnFloat(9007199254740992.0)) ?? false)
+    assert_eq(luanumber.math("max", [LnInt(1), LnFloat(1.0)]) ?? LnNil, LnInt(1))
+    assert_eq(luanumber.tonumber_base(" -zz ", 36) ?? None, Some(0 - 1295))
+    print("luanumber: Lua's arithmetic")
+}
+
+fn main() {
+    perl()
+    abbrev()
+    mime()
+    getopt()
+    balanced()
+    lisp_format()
+    lisp_read()
+    rust_fmt()
+    lua()
+}

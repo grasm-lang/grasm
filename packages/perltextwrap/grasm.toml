@@ -1,0 +1,12 @@
+[package]
+name = "perltextwrap"
+version = "1.0.0"
+capabilities = []
+
+[dependencies.graphemes]
+path = "../graphemes"
+version = "^1.0.0"
+
+[dependencies.regex]
+path = "../regex"
+version = "^1.0.0"

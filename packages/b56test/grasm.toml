@@ -1,0 +1,40 @@
+[package]
+name = "b56test"
+version = "1.0.0"
+capabilities = ["io"]
+
+[dependencies.lispnumbers]
+path = "../lispnumbers"
+version = "^1.0.0"
+
+[dependencies.bigint]
+path = "../bigint"
+version = "^1.0.0"
+
+[dependencies.rustpath]
+path = "../rustpath"
+version = "^1.0.0"
+
+[dependencies.perlparsewords]
+path = "../perlparsewords"
+version = "^1.0.0"
+
+[dependencies.rubyfloat]
+path = "../rubyfloat"
+version = "^1.0.0"
+
+[dependencies.rustescape]
+path = "../rustescape"
+version = "^1.0.0"
+
+[dependencies.perltextwrap]
+path = "../perltextwrap"
+version = "^1.0.0"
+
+[dependencies.pyipaddress]
+path = "../pyipaddress"
+version = "^1.0.0"
+
+[dependencies.pystr]
+path = "../pystr"
+version = "^1.0.0"

@@ -1,0 +1,487 @@
+// JavaScript's `String.prototype` methods whose edge cases decide the
+// answer, as V8 runs them in Node 25: on UTF-16 code units, with
+// ECMAScript's argument conversions.
+//
+// Code ported from JavaScript, or a server that must cut, pad and search
+// text exactly as a browser did, gets these answers wrong in the corners
+// unless it follows the specification's steps:
+//
+//   - Every index and length is in UTF-16 code units, so a character
+//     beyond the BMP counts twice and can be cut in half; `at`,
+//     `codePointAt`, padding, `split("")` and `replaceAll("", ...)` all
+//     see the halves.
+//   - Numeric arguments go through ToIntegerOrInfinity: NaN is 0,
+//     fractions truncate toward zero, infinities stay. `undefined` is
+//     NaN, except where a method gives it a meaning: `split`'s limit is
+//     then 2**32 - 1, `substring`/`slice`'s end the length, `substr`'s
+//     length the rest, `lastIndexOf`'s position +Infinity, `padStart`'s
+//     fill a space.
+//   - `split` takes its limit through ToUint32 (`-1` is 4294967295,
+//     2**32 + 1 is 1); an empty separator splits into code units, and an
+//     empty string split by a non-empty one is `[""]`.
+//   - `substring` clamps and swaps; `slice` and `substr` count a negative
+//     index from the end; `lastIndexOf` searches back from its position.
+//   - `trim` removes JavaScript's white space and line terminators (tab,
+//     VT, FF, space, NBSP, U+1680, U+2000-U+200A, U+202F, U+205F,
+//     U+3000, U+FEFF, LF, CR, U+2028, U+2029).
+//   - `toWellFormed` replaces each lone surrogate with U+FFFD.
+//   - `repeat` throws "Invalid count value: X" for a negative or
+//     infinite count, X as JavaScript prints the number; it and the pads
+//     throw "Invalid string length" past V8's 536870888 units.
+//   - `replace` and `replaceAll` with a string pattern expand `$$`, `$&`,
+//     `` $` `` and `$'` in the replacement and leave `$1`, `$<x>` and any
+//     other `$` as written.
+//
+// Limits: arguments are numbers, strings or `undefined`; the conversions
+// of other values (objects, symbols, RegExp separators) are not here, nor
+// replacement functions. Results longer than 536870888 units are reported
+// as V8 reports them, but a result exactly at that length is not built
+// in the tests.
+
+import jsnumber
+
+/// A RangeError, with V8's message.
+type JsStrError = | JsStrRangeError(msg: str)
+
+pub fn error_text(e: JsStrError) -> str {
+    return match e {
+        JsStrRangeError(m) -> m
+    }
+}
+
+fn max_string_length() -> i64 {
+    return 536870888
+}
+
+/// Text as UTF-16 code units.
+pub fn units(s: str) -> [i64] {
+    var out: [i64] = []
+    for c in s.codes() {
+        if c >= 65536 {
+            out.push(55296 + (c - 65536).shr(10))
+            out.push(56320 + (c - 65536).bit_and(1023))
+        } else {
+            out.push(c)
+        }
+    }
+    return out
+}
+
+fn is_high(u: i64) -> bool {
+    return u >= 55296 and u <= 56319
+}
+
+fn is_low(u: i64) -> bool {
+    return u >= 56320 and u <= 57343
+}
+
+/// Code units as text, a lone surrogate as U+FFFD.
+pub fn text(us: [i64]) -> str {
+    var out: [str] = []
+    var i = 0
+    while i < us.len() {
+        let u = us[i]
+        if is_high(u) and i + 1 < us.len() and is_low(us[i + 1]) {
+            out.push((65536 + (u - 55296).shl(10) + (us[i + 1] - 56320)).to_char())
+            i = i + 2
+        } else {
+            out.push(if is_high(u) or is_low(u) { "\u{FFFD}" } else { u.to_char() })
+            i = i + 1
+        }
+    }
+    return out.join("")
+}
+
+// ---- argument conversion
+
+fn nan() -> f64 {
+    return (9221120237041090560).from_bits()
+}
+
+fn infinity() -> f64 {
+    return (9218868437227405312).from_bits()
+}
+
+/// ToIntegerOrInfinity: NaN is 0, toward zero, infinities kept.
+fn to_integer(x: f64) -> f64 {
+    if x != x {
+        return 0.0
+    }
+    if x - x != 0.0 {
+        return x
+    }
+    let t = if x < 0.0 { (0.0 - x).floor() * -1.0 } else { x.floor() }
+    return if t == 0.0 { 0.0 } else { t }
+}
+
+/// An argument that may be `undefined`, as a number: `undefined` is NaN.
+fn number(a: Option[f64]) -> f64 {
+    return a ?? nan()
+}
+
+/// `x` held to `0..=len`, as an index.
+fn clamp(x: f64, len: i64) -> i64 {
+    if x <= 0.0 {
+        return 0
+    }
+    if x >= len.as_f64() {
+        return len
+    }
+    return x.as_i64()
+}
+
+/// A relative index (negative counts from the end) held to `0..=len`.
+fn relative(x: f64, len: i64) -> i64 {
+    if x < 0.0 {
+        return clamp(len.as_f64() + x, len)
+    }
+    return clamp(x, len)
+}
+
+/// ToUint32.
+fn to_uint32(x: f64) -> i64 {
+    if x != x or x - x != 0.0 {
+        return 0
+    }
+    let t = to_integer(x)
+    let m = t - (t / 4294967296.0).floor() * 4294967296.0
+    return m.as_i64()
+}
+
+fn cut(s: [i64], from: i64, to: i64) -> [i64] {
+    return s.slice(from, to)
+}
+
+fn extend(inout out: [i64], xs: [i64]) {
+    for x in xs {
+        out.push(x)
+    }
+}
+
+// ---- searching
+
+/// StringIndexOf: the first match at or after `from`, or -1.
+fn find_from(s: [i64], search: [i64], from: i64) -> i64 {
+    let n = search.len()
+    var k = from
+    while k + n <= s.len() {
+        if matches_at(s, search, k) {
+            return k
+        }
+        k = k + 1
+    }
+    return 0 - 1
+}
+
+fn matches_at(s: [i64], search: [i64], k: i64) -> bool {
+    var j = 0
+    while j < search.len() {
+        if s[k + j] != search[j] {
+            return false
+        }
+        j = j + 1
+    }
+    return true
+}
+
+/// `s.indexOf(search, position)`.
+pub fn index_of(s: [i64], search: [i64], position: Option[f64]) -> i64 {
+    return find_from(s, search, clamp(to_integer(number(position)), s.len()))
+}
+
+/// `s.lastIndexOf(search, position)`.
+pub fn last_index_of(s: [i64], search: [i64], position: Option[f64]) -> i64 {
+    let p = number(position)
+    let pos = if p != p { infinity() } else { to_integer(p) }
+    let start = clamp(pos, s.len())
+    var k = start.min(s.len() - search.len())
+    while k >= 0 {
+        if matches_at(s, search, k) {
+            return k
+        }
+        k = k - 1
+    }
+    return 0 - 1
+}
+
+/// `s.includes(search, position)`.
+pub fn includes(s: [i64], search: [i64], position: Option[f64]) -> bool {
+    return index_of(s, search, position) >= 0
+}
+
+/// `s.startsWith(search, position)`.
+pub fn starts_with(s: [i64], search: [i64], position: Option[f64]) -> bool {
+    let start = clamp(to_integer(number(position)), s.len())
+    return start + search.len() <= s.len() and matches_at(s, search, start)
+}
+
+/// `s.endsWith(search, endPosition)`.
+pub fn ends_with(s: [i64], search: [i64], end_position: Option[f64]) -> bool {
+    let end = match end_position {
+        Some(e) -> clamp(to_integer(e), s.len())
+        None -> s.len()
+    }
+    let start = end - search.len()
+    return start >= 0 and matches_at(s, search, start)
+}
+
+// ---- cutting
+
+/// `s.at(index)`: the code unit, or `None` for undefined.
+pub fn at(s: [i64], index: Option[f64]) -> Option[i64] {
+    let rel = to_integer(number(index))
+    let k = if rel >= 0.0 { rel } else { s.len().as_f64() + rel }
+    if k < 0.0 or k >= s.len().as_f64() {
+        return None
+    }
+    return Some(s[k.as_i64()])
+}
+
+/// `s.codePointAt(pos)`: a pair's code point, a lone surrogate as itself.
+pub fn code_point_at(s: [i64], pos: Option[f64]) -> Option[i64] {
+    let p = to_integer(number(pos))
+    if p < 0.0 or p >= s.len().as_f64() {
+        return None
+    }
+    let k = p.as_i64()
+    let u = s[k]
+    if is_high(u) and k + 1 < s.len() and is_low(s[k + 1]) {
+        return Some(65536 + (u - 55296).shl(10) + (s[k + 1] - 56320))
+    }
+    return Some(u)
+}
+
+/// `s.substring(start, end)`.
+pub fn substring(s: [i64], start: Option[f64], end: Option[f64]) -> [i64] {
+    let a = clamp(to_integer(number(start)), s.len())
+    let b = match end {
+        Some(e) -> clamp(to_integer(e), s.len())
+        None -> s.len()
+    }
+    return cut(s, a.min(b), a.max(b))
+}
+
+/// `s.substr(start, length)`.
+pub fn substr(s: [i64], start: Option[f64], length: Option[f64]) -> [i64] {
+    let size = s.len()
+    let a = relative(to_integer(number(start)), size)
+    let n = match length {
+        Some(l) -> clamp(to_integer(l), size)
+        None -> size
+    }
+    return cut(s, a, (a + n).min(size))
+}
+
+/// `s.slice(start, end)`.
+pub fn slice(s: [i64], start: Option[f64], end: Option[f64]) -> [i64] {
+    let a = relative(to_integer(number(start)), s.len())
+    let b = match end {
+        Some(e) -> relative(to_integer(e), s.len())
+        None -> s.len()
+    }
+    return if a >= b { [] } else { cut(s, a, b) }
+}
+
+/// `s.split(separator, limit)` with a string separator or `undefined`.
+pub fn split(s: [i64], separator: Option[[i64]], limit: Option[f64]) -> [[i64]] {
+    let lim = match limit {
+        Some(l) -> to_uint32(l)
+        None -> 4294967295
+    }
+    if lim == 0 {
+        return []
+    }
+    let sep = match separator {
+        Some(t) -> t
+        None -> return [s]
+    }
+    if sep.len() == 0 {
+        return cut(s, 0, lim.min(s.len())).map(|u| [u])
+    }
+    if s.len() == 0 {
+        return [s]
+    }
+    var out: [[i64]] = []
+    var i = 0
+    var j = find_from(s, sep, 0)
+    while j >= 0 {
+        out.push(cut(s, i, j))
+        if out.len() == lim {
+            return out
+        }
+        i = j + sep.len()
+        j = find_from(s, sep, i)
+    }
+    out.push(cut(s, i, s.len()))
+    return out
+}
+
+// ---- padding, trimming, repeating
+
+fn pad(s: [i64], max_length: Option[f64], fill: Option[[i64]], at_start: bool) -> [i64] ! JsStrError {
+    let target = to_integer(number(max_length))
+    if target <= s.len().as_f64() {
+        return s
+    }
+    let filler = fill ?? [32]
+    if filler.len() == 0 {
+        return s
+    }
+    if target > max_string_length().as_f64() {
+        fail(JsStrRangeError("Invalid string length"))
+    }
+    let fill_len = target.as_i64() - s.len()
+    var padding: [i64] = []
+    while padding.len() < fill_len {
+        padding.push(filler[padding.len() % filler.len()])
+    }
+    return if at_start { padding + s } else { s + padding }
+}
+
+/// `s.padStart(maxLength, fillString)`.
+pub fn pad_start(s: [i64], max_length: Option[f64], fill: Option[[i64]]) -> [i64] ! JsStrError {
+    return try pad(s, max_length, fill, true)
+}
+
+/// `s.padEnd(maxLength, fillString)`.
+pub fn pad_end(s: [i64], max_length: Option[f64], fill: Option[[i64]]) -> [i64] ! JsStrError {
+    return try pad(s, max_length, fill, false)
+}
+
+fn is_space(u: i64) -> bool {
+    return jsnumber.is_js_space(u)
+}
+
+/// `s.trimStart()`.
+pub fn trim_start(s: [i64]) -> [i64] {
+    var i = 0
+    while i < s.len() and is_space(s[i]) {
+        i = i + 1
+    }
+    return cut(s, i, s.len())
+}
+
+/// `s.trimEnd()`.
+pub fn trim_end(s: [i64]) -> [i64] {
+    var j = s.len()
+    while j > 0 and is_space(s[j - 1]) {
+        j = j - 1
+    }
+    return cut(s, 0, j)
+}
+
+/// `s.trim()`.
+pub fn trim(s: [i64]) -> [i64] {
+    return trim_end(trim_start(s))
+}
+
+/// `s.repeat(count)`.
+pub fn repeat(s: [i64], count: Option[f64]) -> [i64] ! JsStrError {
+    let c = number(count)
+    let n = to_integer(c)
+    if n < 0.0 or n == infinity() {
+        fail(JsStrRangeError("Invalid count value: " + jsnumber.to_string(c)))
+    }
+    if n == 0.0 or s.len() == 0 {
+        return []
+    }
+    if n * s.len().as_f64() > max_string_length().as_f64() {
+        fail(JsStrRangeError("Invalid string length"))
+    }
+    var out: [i64] = []
+    for _i in 0..n.as_i64() {
+        extend(out, s)
+    }
+    return out
+}
+
+/// `s.isWellFormed()`: no lone surrogate.
+pub fn is_well_formed(s: [i64]) -> bool {
+    return to_well_formed(s) == s
+}
+
+/// `s.toWellFormed()`: each lone surrogate as U+FFFD.
+pub fn to_well_formed(s: [i64]) -> [i64] {
+    var out: [i64] = []
+    var i = 0
+    while i < s.len() {
+        let u = s[i]
+        if is_high(u) and i + 1 < s.len() and is_low(s[i + 1]) {
+            out.push(u)
+            out.push(s[i + 1])
+            i = i + 2
+        } else {
+            out.push(if is_high(u) or is_low(u) { 65533 } else { u })
+            i = i + 1
+        }
+    }
+    return out
+}
+
+// ---- replacing
+
+/// GetSubstitution with no captures: `$$`, `$&`, `` $` `` and `$'`.
+fn substitution(matched: [i64], s: [i64], position: i64, template: [i64]) -> [i64] {
+    var out: [i64] = []
+    var i = 0
+    while i < template.len() {
+        let c = template[i]
+        if c == 36 and i + 1 < template.len() {
+            let d = template[i + 1]
+            if d == 36 {
+                out.push(36)
+                i = i + 2
+                continue
+            }
+            if d == 38 {
+                extend(out, matched)
+                i = i + 2
+                continue
+            }
+            if d == 96 {
+                extend(out, cut(s, 0, position))
+                i = i + 2
+                continue
+            }
+            if d == 39 {
+                extend(out, cut(s, (position + matched.len()).min(s.len()), s.len()))
+                i = i + 2
+                continue
+            }
+        }
+        out.push(c)
+        i = i + 1
+    }
+    return out
+}
+
+/// `s.replace(search, replacement)` with a string pattern: the first match.
+pub fn replace(s: [i64], search: [i64], replacement: [i64]) -> [i64] {
+    let pos = find_from(s, search, 0)
+    if pos < 0 {
+        return s
+    }
+    return cut(s, 0, pos) + substitution(search, s, pos, replacement) + cut(s, pos + search.len(), s.len())
+}
+
+/// `s.replaceAll(search, replacement)` with a string pattern.
+pub fn replace_all(s: [i64], search: [i64], replacement: [i64]) -> [i64] {
+    let advance = search.len().max(1)
+    var positions: [i64] = []
+    var p = find_from(s, search, 0)
+    while p >= 0 {
+        positions.push(p)
+        p = find_from(s, search, p + advance)
+    }
+    var out: [i64] = []
+    var end_of_last = 0
+    for q in positions {
+        extend(out, cut(s, end_of_last, q))
+        extend(out, substitution(search, s, q, replacement))
+        end_of_last = q + search.len()
+    }
+    if end_of_last < s.len() {
+        extend(out, cut(s, end_of_last, s.len()))
+    }
+    return out
+}

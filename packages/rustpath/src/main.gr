@@ -1,0 +1,407 @@
+// Rust's `std::path::Path` on Unix, as Rust 1.99 takes a path apart:
+// `components`, `parent`, `file_name`, `file_stem`, `file_prefix`,
+// `extension`, `join`, `with_file_name`, `with_extension`,
+// `strip_prefix`, `starts_with`, `ends_with` and `is_absolute`.
+//
+// Rust tools -- build systems, packagers, linters -- decide what a file is
+// called and where it goes with these, and a program that has to agree
+// (a config generator, a test of a Rust tool's output) needs the same
+// answers:
+//
+//   - Components drop empty parts and `.` (except a leading `./`, kept as
+//     the current directory), keep `..`, and ignore a trailing slash.
+//   - `parent` and `strip_prefix` answer a piece of the original text
+//     rather than a rebuilt path: the parent of `./a/./b/.` is `./a`.
+//   - `extension` is after the last dot of the file name, unless that dot
+//     starts the name (`.bashrc` has none); `file_prefix` stops at the
+//     first dot.
+//   - `join` replaces the path with an absolute argument and otherwise
+//     adds a `/` if the path does not end in one.
+//   - `with_extension` keeps everything up to the file stem, so a trailing
+//     slash goes, and refuses an extension holding a `/` (Rust panics).
+
+/// Rust's panic message, for an extension holding a separator.
+type RustPathError = | RustPathError(msg: str)
+
+pub fn error_text(e: RustPathError) -> str {
+    return match e {
+        RustPathError(m) -> m
+    }
+}
+
+/// A component: 0 the root, 1 `.`, 2 `..`, 3 a name.
+type PathPart = { kind: i64, text: [i64] }
+
+/// Components: the bytes, the part still to read, where each end is
+/// (1 StartDir, 2 Body, 3 Done), and whether the path has a root.
+type Comps = { b: [i64], start: i64, end: i64, front: i64, back: i64, root: bool }
+
+fn bytes_of_str(s: str) -> [i64] {
+    return s.to_bytes().to_list()
+}
+
+fn text(b: [i64]) -> str {
+    return bytes_of(b).to_str()
+}
+
+fn comps(s: str) -> Comps {
+    let b = bytes_of_str(s)
+    return Comps{ b: b, start: 0, end: b.len(), front: 1, back: 2, root: b.len() > 0 and b[0] == 47 }
+}
+
+fn include_cur_dir(c: Comps) -> bool {
+    if c.root {
+        return false
+    }
+    let n = c.end - c.start
+    return (n == 1 and c.b[c.start] == 46) or (n >= 2 and c.b[c.start] == 46 and c.b[c.start + 1] == 47)
+}
+
+fn len_before_body(c: Comps) -> i64 {
+    let root = if c.front <= 1 and c.root { 1 } else { 0 }
+    let cur = if c.front <= 1 and include_cur_dir(c) { 1 } else { 0 }
+    return root + cur
+}
+
+fn finished(c: Comps) -> bool {
+    return c.front == 3 or c.back == 3 or c.front > c.back
+}
+
+fn single(comp: [i64]) -> Option[PathPart] {
+    if comp == [46] or comp.len() == 0 {
+        return None
+    }
+    if comp == [46, 46] {
+        return Some(PathPart{ kind: 2, text: comp })
+    }
+    return Some(PathPart{ kind: 3, text: comp })
+}
+
+/// parse_next_component: (bytes used, component).
+fn parse_next(c: Comps) -> (i64, Option[PathPart]) {
+    var i = c.start
+    while i < c.end and c.b[i] != 47 {
+        i = i + 1
+    }
+    let comp = c.b.slice(c.start, i)
+    return (comp.len() + (if i < c.end { 1 } else { 0 }), single(comp))
+}
+
+/// parse_next_component_back: (bytes used, component).
+fn parse_back(c: Comps) -> (i64, Option[PathPart]) {
+    let from = c.start + len_before_body(c)
+    var i = c.end - 1
+    while i >= from and c.b[i] != 47 {
+        i = i - 1
+    }
+    let comp = c.b.slice(if i >= from { i + 1 } else { from }, c.end)
+    return (comp.len() + (if i >= from { 1 } else { 0 }), single(comp))
+}
+
+fn next(inout c: Comps) -> Option[PathPart] {
+    while not finished(c) {
+        if c.front == 2 {
+            if c.start >= c.end {
+                c.front = 3
+                continue
+            }
+            let (size, comp) = parse_next(c)
+            c.start = c.start + size
+            if comp.is_some() {
+                return comp
+            }
+        } else {
+            let cur = include_cur_dir(c)
+            c.front = 2
+            if c.root {
+                c.start = c.start + 1
+                return Some(PathPart{ kind: 0, text: [47] })
+            }
+            if cur {
+                c.start = c.start + 1
+                return Some(PathPart{ kind: 1, text: [46] })
+            }
+        }
+    }
+    return None
+}
+
+fn next_back(inout c: Comps) -> Option[PathPart] {
+    while not finished(c) {
+        if c.back == 2 {
+            if c.end - c.start <= len_before_body(c) {
+                c.back = 1
+                continue
+            }
+            let (size, comp) = parse_back(c)
+            c.end = c.end - size
+            if comp.is_some() {
+                return comp
+            }
+        } else {
+            c.back = 3
+            if c.root {
+                c.end = c.end - 1
+                return Some(PathPart{ kind: 0, text: [47] })
+            }
+            if include_cur_dir(c) {
+                c.end = c.end - 1
+                return Some(PathPart{ kind: 1, text: [46] })
+            }
+        }
+    }
+    return None
+}
+
+/// Components::as_path: what is left, trimmed of empty and `.` parts.
+fn as_path(c0: Comps) -> [i64] {
+    var c = c0
+    if c.front == 2 {
+        while c.start < c.end {
+            let (size, comp) = parse_next(c)
+            if comp.is_some() {
+                break
+            }
+            c.start = c.start + size
+        }
+    }
+    if c.back == 2 {
+        while c.end - c.start > len_before_body(c) {
+            let (size, comp) = parse_back(c)
+            if comp.is_some() {
+                break
+            }
+            c.end = c.end - size
+        }
+    }
+    return c.b.slice(c.start, c.end)
+}
+
+fn all_parts(s: str) -> [PathPart] {
+    var c = comps(s)
+    var out: [PathPart] = []
+    while true {
+        match next(c) {
+            Some(p) -> out.push(p)
+            None -> break
+        }
+    }
+    return out
+}
+
+/// `path.components()`, each as `as_os_str` shows it.
+pub fn components(s: str) -> [str] {
+    return all_parts(s).map(|p| text(p.text))
+}
+
+/// `path.parent()`.
+pub fn parent(s: str) -> Option[str] {
+    var c = comps(s)
+    return match next_back(c) {
+        Some(p) -> if p.kind == 0 { None } else { Some(text(as_path(c))) }
+        None -> None
+    }
+}
+
+fn file_name_bytes(s: str) -> Option[[i64]] {
+    var c = comps(s)
+    return match next_back(c) {
+        Some(p) -> if p.kind == 3 { Some(p.text) } else { None }
+        None -> None
+    }
+}
+
+/// `path.file_name()`.
+pub fn file_name(s: str) -> Option[str] {
+    return match file_name_bytes(s) {
+        Some(b) -> Some(text(b))
+        None -> None
+    }
+}
+
+/// rsplit_file_at_dot: (before, after) of the last dot.
+fn rsplit_dot(f: [i64]) -> (Option[[i64]], Option[[i64]]) {
+    if f == [46, 46] {
+        return (Some(f), None)
+    }
+    var i = f.len() - 1
+    while i >= 0 and f[i] != 46 {
+        i = i - 1
+    }
+    if i < 0 {
+        return (None, Some(f))
+    }
+    if i == 0 {
+        return (Some(f), None)
+    }
+    return (Some(f.slice(0, i)), Some(f.slice(i + 1, f.len())))
+}
+
+/// `path.file_stem()`.
+pub fn file_stem(s: str) -> Option[str] {
+    return match file_name_bytes(s) {
+        Some(f) -> match rsplit_dot(f) {
+            (Some(before), _a) -> Some(text(before))
+            (None, Some(after)) -> Some(text(after))
+            _ -> None
+        }
+        None -> None
+    }
+}
+
+/// `path.extension()`.
+pub fn extension(s: str) -> Option[str] {
+    return match file_name_bytes(s) {
+        Some(f) -> match rsplit_dot(f) {
+            (Some(_b), Some(after)) -> Some(text(after))
+            _ -> None
+        }
+        None -> None
+    }
+}
+
+/// `path.file_prefix()`: up to the first dot after the first byte.
+pub fn file_prefix(s: str) -> Option[str] {
+    return match file_name_bytes(s) {
+        Some(f) -> {
+            if f == [46, 46] {
+                return Some(text(f))
+            }
+            var i = 1
+            while i < f.len() and f[i] != 46 {
+                i = i + 1
+            }
+            Some(text(f.slice(0, i)))
+        }
+        None -> None
+    }
+}
+
+/// `path.is_absolute()` (and `has_root`, the same on Unix).
+pub fn is_absolute(s: str) -> bool {
+    return s.starts_with("/")
+}
+
+/// `path.join(other)`.
+pub fn join(base: str, other: str) -> str {
+    if is_absolute(other) {
+        return other
+    }
+    let b = bytes_of_str(base)
+    let need_sep = b.len() > 0 and b[b.len() - 1] != 47
+    return base + (if need_sep { "/" } else { "" }) + other
+}
+
+/// PathBuf::pop: the path truncated to its parent, or None.
+fn popped(s: str) -> Option[str] {
+    return parent(s)
+}
+
+/// `path.with_file_name(name)`.
+pub fn with_file_name(s: str, name: str) -> str {
+    let base = if file_name_bytes(s).is_some() { popped(s) ?? s } else { s }
+    return join(base, name)
+}
+
+fn check_extension(ext: str) ! RustPathError {
+    if ext.contains("/") {
+        fail(RustPathError("extension cannot contain path separators: " + debug_os_str(ext)))
+    }
+}
+
+/// `{:?}` of an OsStr holding UTF-8, as Rust escapes a str.
+fn debug_os_str(s: str) -> str {
+    var out = "\""
+    for c in s.codes() {
+        out = out + (if c == 34 { "\\\"" } else if c == 92 { "\\\\" } else if c == 10 { "\\n" } else if c == 9 { "\\t" } else if c == 13 { "\\r" } else if c == 0 {
+            "\\0"
+        } else { c.to_char() })
+    }
+    return out + "\""
+}
+
+/// Where the file name begins in the path, as `next_back` finds it.
+fn file_name_start(s: str) -> Option[i64] {
+    var c = comps(s)
+    while not finished(c) {
+        if c.back != 2 or c.end - c.start <= len_before_body(c) {
+            return None
+        }
+        let (size, comp) = parse_back(c)
+        c.end = c.end - size
+        match comp {
+            Some(p) -> return if p.kind == 3 { Some(c.end + size - p.text.len()) } else { None }
+            None -> {}
+        }
+    }
+    return None
+}
+
+/// PathBuf::set_extension: kept up to the end of the file stem, then the
+/// new extension; None where there is no file stem.
+fn set_extension(s: str, ext: str) -> Option[str] {
+    let start = file_name_start(s) ?? (0 - 1)
+    let name = file_name_bytes(s) ?? []
+    if start < 0 {
+        return None
+    }
+    let stem_len = match rsplit_dot(name) {
+        (Some(before), _a) -> before.len()
+        (None, Some(after)) -> after.len()
+        _ -> 0
+    }
+    let b = bytes_of_str(s)
+    return Some(text(b.slice(0, start + stem_len)) + (if ext.len() > 0 { "." + ext } else { "" }))
+}
+
+/// `path.with_extension(ext)`.
+pub fn with_extension(s: str, ext: str) -> str ! RustPathError {
+    try check_extension(ext)
+    let b = bytes_of_str(s)
+    let copied = match extension(s) {
+        Some(prev) -> text(b.slice(0, b.len() - bytes_of_str(prev).len()))
+        None -> s
+    }
+    return set_extension(copied, ext) ?? copied
+}
+
+/// iter_after: what is left of `a` after `prefix`, or None.
+fn iter_after(a: Comps, prefix: Comps, backwards: bool) -> Option[Comps] {
+    var it = a
+    var p = prefix
+    while true {
+        var probe = it
+        let x = if backwards { next_back(probe) } else { next(probe) }
+        let y = if backwards { next_back(p) } else { next(p) }
+        match (x, y) {
+            (Some(u), Some(v)) -> {
+                if u.kind != v.kind or u.text != v.text {
+                    return None
+                }
+            }
+            (Some(_u), None) -> return Some(it)
+            (None, None) -> return Some(it)
+            _ -> return None
+        }
+        it = probe
+    }
+    return None
+}
+
+/// `path.strip_prefix(base)`.
+pub fn strip_prefix(s: str, base: str) -> Option[str] {
+    return match iter_after(comps(s), comps(base), false) {
+        Some(rest) -> Some(text(as_path(rest)))
+        None -> None
+    }
+}
+
+/// `path.starts_with(base)`.
+pub fn starts_with(s: str, base: str) -> bool {
+    return iter_after(comps(s), comps(base), false).is_some()
+}
+
+/// `path.ends_with(child)`.
+pub fn ends_with(s: str, child: str) -> bool {
+    return iter_after(comps(s), comps(child), true).is_some()
+}

@@ -1,0 +1,273 @@
+// Rust's numbers as text, as Rust 1.99 writes and reads them: `f64`'s
+// `Display`, `Debug`, `{:.N}`, `{:e}`, `{:E}` and `{:.Ne}`, and
+// `str::parse` for `f64` and for the integer types, errors included.
+//
+// Rust services log, serialize and print numbers with these, and a reader
+// has to agree with them to the digit:
+//
+//   - `Display` writes the shortest digits that read back, and never an
+//     exponent: `1e21` is `1000000000000000000000`, `1e-7` is `0.0000001`.
+//   - `Debug` writes `1.0` for a whole number, and switches to `1e16` and
+//     `1.5e-5` at 1e16 and below 1e-4.
+//   - `{:.N}` and `{:.Ne}` round the double's exact value half to even
+//     (`{:.1}` of 0.25 is `0.2`); `-0.0` keeps its sign everywhere.
+//   - `parse::<f64>` takes an optional sign, decimal digits with an
+//     optional fraction and exponent, or `inf`, `infinity` or `nan` in any
+//     case; nothing else -- no spaces, no `_`, no hex. It rounds
+//     correctly and overflows to infinity.
+//   - `parse` for an integer takes `+`, `-` for a signed type, and
+//     decimal digits, and fails at the first problem it meets reading
+//     left to right: an empty string, an invalid digit, or a value too
+//     large or too small for the type.
+
+import bigint
+import gostrconv
+import shortestfloat
+
+/// ParseIntError or ParseFloatError: the kind and Rust's message.
+type RustParseError = | RustParseError(kind: str, msg: str)
+
+pub fn error_kind(e: RustParseError) -> str {
+    return match e {
+        RustParseError(k, _m) -> k
+    }
+}
+
+pub fn error_text(e: RustParseError) -> str {
+    return match e {
+        RustParseError(_k, m) -> m
+    }
+}
+
+fn zeros(n: i64) -> str {
+    var out = ""
+    for _i in 0..n {
+        out = out + "0"
+    }
+    return out
+}
+
+fn special(x: f64) -> Option[str] {
+    if x != x {
+        return Some("NaN")
+    }
+    if x == 1.0 / 0.0 {
+        return Some("inf")
+    }
+    if x == -1.0 / 0.0 {
+        return Some("-inf")
+    }
+    return None
+}
+
+fn negative(x: f64) -> bool {
+    return x.to_bits().ushr(63) == 1
+}
+
+/// Twice the exact magnitude of `x` as num / 2^den2 (num an integer).
+fn exact_twice(x: f64) -> (BigInt, i64) {
+    let bits = x.to_bits()
+    let raw = bits.ushr(52).bit_and(2047)
+    let frac = bits.bit_and(4503599627370495)
+    let m = if raw == 0 { frac } else { frac + 4503599627370496 }
+    let e = if raw == 0 { 0 - 1074 } else { raw - 1075 }
+    // 2 * m * 2^e
+    return if e + 1 >= 0 { (bigint.mul(bigint.from_i64(m), bigint.pow(bigint.from_i64(2), e + 1)), 0) } else { (bigint.from_i64(m), 0 - (e + 1)) }
+}
+
+/// The shortest digits Rust writes: the shortest that read back, and of
+/// two equally close, the larger -- Rust's shortest search rounds a tie
+/// up where Python's and Ryu's pick the even one.
+fn shortest(x: f64) -> (str, i64) {
+    let p = shortestfloat.parts(x)
+    let d = p.digits
+    let n = d.len()
+    // Is |x| exactly (d + 1/2) x 10^(point - n)? Compare 2|x| with
+    // (2d + 1) x 10^(point - n).
+    let (num, den2) = exact_twice(x)
+    let k = p.point - n
+    let odd = bigint.add(bigint.mul(bigint.parse(d) ?? bigint.zero(), bigint.from_i64(2)), bigint.from_i64(1))
+    let ten = bigint.from_i64(10)
+    let left = bigint.mul(num, if k < 0 { bigint.pow(ten, 0 - k) } else { bigint.from_i64(1) })
+    let right = bigint.mul(bigint.mul(odd, if k > 0 { bigint.pow(ten, k) } else { bigint.from_i64(1) }), bigint.pow(bigint.from_i64(2), den2))
+    if bigint.compare(left, right) != 0 {
+        return (d, p.point)
+    }
+    let up = bigint.to_str(bigint.add(bigint.parse(d) ?? bigint.zero(), bigint.from_i64(1)))
+    return if up.len() > n { (up.substr(0, n), p.point + 1) } else { (up, p.point) }
+}
+
+/// The shortest digits laid out without an exponent.
+fn plain(x: f64) -> str {
+    let sign = if negative(x) { "-" } else { "" }
+    if x == 0.0 {
+        return sign + "0"
+    }
+    let (d, point) = shortest(x)
+    let n = d.len()
+    if point <= 0 {
+        return sign + "0." + zeros(0 - point) + d
+    }
+    if point >= n {
+        return sign + d + zeros(point - n)
+    }
+    return sign + d.substr(0, point) + "." + d.substr(point, n - point)
+}
+
+/// `format!("{}", x)`.
+pub fn display(x: f64) -> str {
+    return special(x) ?? plain(x)
+}
+
+/// `format!("{:?}", x)`.
+pub fn debug(x: f64) -> str {
+    match special(x) {
+        Some(t) -> return t
+        None -> {}
+    }
+    let a = if negative(x) { x * -1.0 } else { x }
+    if (a != 0.0 and a < 0.0001) or a >= 10000000000000000.0 {
+        return exp(x, false)
+    }
+    let t = plain(x)
+    return if t.contains(".") { t } else { t + ".0" }
+}
+
+/// `format!("{:.N}", x)`.
+pub fn fixed(x: f64, places: i64) -> str {
+    return special(x) ?? shortestfloat.fixed(x, places)
+}
+
+fn exp_layout(neg: bool, d: str, point: i64, upper: bool) -> str {
+    let mantissa = if d.len() > 1 { d.substr(0, 1) + "." + d.substr(1, d.len() - 1) } else { d }
+    return (if neg { "-" } else { "" }) + mantissa + (if upper { "E" } else { "e" }) + (point - 1).to_str()
+}
+
+/// `format!("{:e}", x)`, or `{:E}` when `upper`.
+pub fn exp(x: f64, upper: bool) -> str {
+    match special(x) {
+        Some(t) -> return t
+        None -> {}
+    }
+    if x == 0.0 {
+        return (if negative(x) { "-" } else { "" }) + "0" + (if upper { "E0" } else { "e0" })
+    }
+    let (d, point) = shortest(x)
+    return exp_layout(negative(x), d, point, upper)
+}
+
+/// `format!("{:.Ne}", x)`, or `{:.NE}` when `upper`.
+pub fn exp_fixed(x: f64, places: i64, upper: bool) -> str {
+    match special(x) {
+        Some(t) -> return t
+        None -> {}
+    }
+    let p = shortestfloat.significant(x, places + 1)
+    return exp_layout(negative(x), p.digits, if x == 0.0 { 1 } else { p.point }, upper)
+}
+
+// ---- parsing
+
+fn is_digit(c: i64) -> bool {
+    return c >= 48 and c <= 57
+}
+
+fn lower_ascii(s: str) -> str {
+    return s.codes().map(|c| if c >= 65 and c <= 90 { (c + 32).to_char() } else { c.to_char() }).join("")
+}
+
+/// `text.parse::<f64>()`.
+pub fn parse_f64(text: str) -> f64 ! RustParseError {
+    let invalid = RustParseError("Invalid", "invalid float literal")
+    let cs = text.to_bytes().to_list()
+    if cs.len() == 0 {
+        fail(RustParseError("Empty", "cannot parse float from empty string"))
+    }
+    var i = 0
+    var neg = false
+    if cs[0] == 43 or cs[0] == 45 {
+        neg = cs[0] == 45
+        i = 1
+    }
+    let rest = lower_ascii(bytes_of(cs.slice(i, cs.len())).to_str())
+    if rest == "inf" or rest == "infinity" {
+        return if neg { -1.0 / 0.0 } else { 1.0 / 0.0 }
+    }
+    if rest == "nan" {
+        return 0.0 / 0.0
+    }
+    var digits = 0
+    while i < cs.len() and is_digit(cs[i]) {
+        i = i + 1
+        digits = digits + 1
+    }
+    if i < cs.len() and cs[i] == 46 {
+        i = i + 1
+        while i < cs.len() and is_digit(cs[i]) {
+            i = i + 1
+            digits = digits + 1
+        }
+    }
+    if digits == 0 {
+        fail(invalid)
+    }
+    if i < cs.len() and (cs[i] == 101 or cs[i] == 69) {
+        i = i + 1
+        if i < cs.len() and (cs[i] == 43 or cs[i] == 45) {
+            i = i + 1
+        }
+        var exp_digits = 0
+        while i < cs.len() and is_digit(cs[i]) {
+            i = i + 1
+            exp_digits = exp_digits + 1
+        }
+        if exp_digits == 0 {
+            fail(invalid)
+        }
+    }
+    if i != cs.len() {
+        fail(invalid)
+    }
+    let (v, _err) = gostrconv.parse_float(text, 64)
+    return v
+}
+
+/// `text.parse::<T>()` for an integer type of `bits` bits, signed or not.
+pub fn parse_int(text: str, bits: i64, signed: bool) -> BigInt ! RustParseError {
+    let cs = text.to_bytes().to_list()
+    if cs.len() == 0 {
+        fail(RustParseError("Empty", "cannot parse integer from empty string"))
+    }
+    let invalid = RustParseError("InvalidDigit", "invalid digit found in string")
+    if cs.len() == 1 and (cs[0] == 43 or cs[0] == 45) {
+        fail(invalid)
+    }
+    var i = 0
+    var positive = true
+    if cs[0] == 43 {
+        i = 1
+    } else if cs[0] == 45 and signed {
+        positive = false
+        i = 1
+    }
+    let two = bigint.from_i64(2)
+    let max = if signed { bigint.sub(bigint.pow(two, bits - 1), bigint.from_i64(1)) } else { bigint.sub(bigint.pow(two, bits), bigint.from_i64(1)) }
+    let min = if signed { bigint.negate(bigint.pow(two, bits - 1)) } else { bigint.zero() }
+    var v = bigint.zero()
+    while i < cs.len() {
+        if not is_digit(cs[i]) {
+            fail(invalid)
+        }
+        let d = bigint.from_i64(cs[i] - 48)
+        v = bigint.mul(v, bigint.from_i64(10))
+        v = if positive { bigint.add(v, d) } else { bigint.sub(v, d) }
+        if positive and bigint.compare(v, max) > 0 {
+            fail(RustParseError("PosOverflow", "number too large to fit in target type"))
+        }
+        if not positive and bigint.compare(v, min) < 0 {
+            fail(RustParseError("NegOverflow", "number too small to fit in target type"))
+        }
+        i = i + 1
+    }
+    return v
+}

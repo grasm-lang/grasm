@@ -1,0 +1,20 @@
+[package]
+name = "pyrobotparser"
+version = "1.0.0"
+capabilities = []
+
+[dependencies.bigint]
+path = "../bigint"
+version = "^1.0.0"
+
+[dependencies.pycharclass]
+path = "../pycharclass"
+version = "^1.0.0"
+
+[dependencies.pystr]
+path = "../pystr"
+version = "^1.0.0"
+
+[dependencies.pyurlparse]
+path = "../pyurlparse"
+version = "^1.0.0"

@@ -1,0 +1,133 @@
+// Eight libraries, each run once on an input whose answer came from the
+// tool it is held to -- SQLite 3.51, Node 25, Ruby 2.6 (twice), Lua 5.5
+// (twice), jq 1.7.1 and Java 17. scripts/b55_diff.sh holds them to those
+// tools on thousands more.
+import bigint
+import javaintegers
+import jqformat
+import luapack
+import luautf8
+import nodepathwin32
+import rubyinspect
+import rubynumparse
+import sqlitelike
+
+fn sqlite() {
+    assert(not ((sqlitelike.like(SqlText("café"), SqlText("%É%"), None) ?? None) ?? true))
+    assert((sqlitelike.like(SqlText("ABC"), SqlText("a_c"), None) ?? None) ?? false)
+    assert((sqlitelike.like(SqlText("a%b"), SqlText("a\\%b"), Some(SqlText("\\"))) ?? None) ?? false)
+    assert((sqlitelike.glob(SqlText("abc"), SqlText("a[a-c]?")) ?? None) ?? false)
+    assert(not ((sqlitelike.glob(SqlText("abc"), SqlText("A*")) ?? None) ?? true))
+    let bad = match sqlitelike.like(SqlText("a"), SqlText("a"), Some(SqlText("ab"))) {
+        Ok(_r) -> ""
+        Err(e) -> sqlitelike.error_text(e)
+    }
+    assert_eq(bad, "ESCAPE expression must be a single character")
+    print("LIKE and GLOB: SQLite's")
+}
+
+fn node() {
+    assert_eq(nodepathwin32.normalize("C:/a//b\\..\\c"), "C:\\a\\c")
+    assert_eq(nodepathwin32.join(["\\\\server", "share", "x"]), "\\\\server\\share\\x")
+    assert_eq(nodepathwin32.relative("C:\\a\\b", "C:\\a\\c\\d", "C:\\work"), "..\\c\\d")
+    assert_eq(nodepathwin32.normalize("CON:x"), ".\\CON:x")
+    let p = nodepathwin32.parse("C:\\dir\\f.txt")
+    assert_eq([p.root, p.dir, p.base, p.ext, p.name].join("|"), "C:\\|C:\\dir|f.txt|.txt|f")
+    assert_eq(nodepathwin32.resolve(["x", "..\\y"], "C:\\work"), "C:\\work\\y")
+    assert_eq(nodepathwin32.to_namespaced_path("C:\\a", "C:\\work"), "\\\\?\\C:\\a")
+    print("path.win32: Node's")
+}
+
+fn ruby_strings() {
+    let s = "a\né#\{x}\u{200b}\u{1}".to_bytes()
+    assert_eq(rubyinspect.inspect(s, false), "\"a\\né\\#\{x}\u{200b}\\u0001\"")
+    assert_eq(rubyinspect.dump(s, false), "\"a\\n\\u00E9\\#\{x}\\u200B\\x01\"")
+    let mixed = match rubyinspect.undump("\"\\u00E9\\x41\"") {
+        Ok(_u) -> ""
+        Err(e) -> rubyinspect.error_text(e)
+    }
+    assert_eq(mixed, "hex escape and Unicode escape are mixed")
+    let u = rubyinspect.undump("\"caf\\u00E9\"") ?? panic("undump")
+    assert_eq(u.data.to_str(), "café")
+    print("inspect, dump and undump: Ruby's")
+}
+
+fn ruby_numbers() {
+    assert_eq(bigint.to_str(rubynumparse.to_i("12abc".to_bytes(), 10) ?? bigint.zero()), "12")
+    assert_eq(bigint.to_str(rubynumparse.integer("0x1A".to_bytes(), None) ?? bigint.zero()), "26")
+    assert_eq(rubynumparse.float("1_000.5".to_bytes()) ?? 0.0, 1000.5)
+    var long = "1"
+    for _k in 0..69 {
+        long = long + "0"
+    }
+    assert_eq(rubynumparse.to_f((long + "x").to_bytes()), 1.0e59)
+    let bad = match rubynumparse.integer("12abc".to_bytes(), None) {
+        Ok(_n) -> ""
+        Err(e) -> rubynumparse.error_text(e)
+    }
+    assert_eq(bad, "invalid value for Integer(): \"12abc\"")
+    print("to_i, to_f, Integer() and Float(): Ruby's")
+}
+
+fn lua() {
+    let p = luapack.pack("<i2 s1".to_bytes(), [LuaInt(258), LuaStr("hi".to_bytes())]) ?? "".to_bytes()
+    assert(p.to_list() == [2, 1, 2, 104, 105])
+    let (vs, next) = luapack.unpack("<i2 s1".to_bytes(), p, 1) ?? ([], 0)
+    assert_eq(vs.len(), 2)
+    assert_eq(next, 6)
+    assert_eq(luapack.packsize("!8 i1 i8".to_bytes()) ?? 0, 16)
+    let over = match luapack.pack("i1".to_bytes(), [LuaInt(200)]) {
+        Ok(_b) -> ""
+        Err(e) -> luapack.error_text(e)
+    }
+    assert_eq(over, "bad argument #2 to 'string.pack' (integer overflow)")
+    assert(match luautf8.len("aé€".to_bytes(), 1, 0 - 1, false) {
+        Ok(Utf8Count(n)) -> n == 3
+        _ -> false
+    })
+    assert((luautf8.offset("aé".to_bytes(), 2, None) ?? None) == Some((2, 3)))
+    assert(luautf8.codepoint("é".to_bytes(), 1, None, false) ?? [] == [233])
+    assert(match luautf8.len(bytes_of([97, 255, 98]), 1, 0 - 1, false) {
+        Ok(Utf8BadAt(at)) -> at == 2
+        _ -> false
+    })
+    assert_eq((luautf8.char([72, 228]) ?? "".to_bytes()).to_str(), "Hä")
+    print("string.pack and utf8: Lua's")
+}
+
+fn jq() {
+    let row = jqformat.parse("[1e2, \"x\\\"y\", null]") ?? JqNull
+    assert_eq(jqformat.format("csv", row) ?? "", "1E+2,\"x\"\"y\",")
+    assert_eq(jqformat.format("sh", JqString("it's")) ?? "", "'it'\\''s'")
+    assert_eq(jqformat.format("base64d", JqString("YWJj")) ?? "", "abc")
+    let bad = match jqformat.format("csv", jqformat.parse("\{\"a\":1}") ?? JqNull) {
+        Ok(_t) -> ""
+        Err(e) -> jqformat.error_text(e)
+    }
+    assert_eq(bad, "object (\{\"a\":1}) cannot be csv-formatted, only array")
+    print("@-formats: jq's")
+}
+
+fn java() {
+    assert_eq(javaintegers.parse_int("١٢٣", 10) ?? 0, 123)
+    let bad = match javaintegers.parse_int("12x", 16) {
+        Ok(_n) -> ""
+        Err(e) -> javaintegers.error_text(e)
+    }
+    assert_eq(bad, "For input string: \"12x\" under radix 16")
+    assert_eq(javaintegers.parse_unsigned_int("4294967295", 10) ?? 0, 0 - 1)
+    assert_eq(javaintegers.decode_int("-0x80000000") ?? 0, 0 - 2147483648)
+    assert_eq(javaintegers.to_unsigned_string(0 - 1, 16, 32), "ffffffff")
+    assert_eq(javaintegers.to_string(0 - 255, 16), "-ff")
+    print("Integer and Long: Java's")
+}
+
+fn main() / {io} {
+    sqlite()
+    node()
+    ruby_strings()
+    ruby_numbers()
+    lua()
+    jq()
+    java()
+}

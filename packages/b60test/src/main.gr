@@ -1,0 +1,372 @@
+// The harness scripts/b60_diff.py drives: each argument pair is an
+// operation and a file of cases, one per line; each answer is one line.
+// Perl 5.34 (sprintf, Text::Abbrev, MIME::Base64, Getopt::Long,
+// Text::Balanced), SBCL 2.6.8 (FORMAT, the reader), Rust 1.99 (format
+// specs) and Lua 5.5 (arithmetic).
+import perlsprintf
+import perltextabbrev
+import perlmimebase64
+import perlgetoptlong
+import perltextbalanced
+import lispformat
+import lispreadnumber
+import rustfmt
+import luanumber
+import bigint
+
+fn unhex_list(h: str) -> [i64] {
+    if h == "-" {
+        return []
+    }
+    var out: [i64] = []
+    let b = h.to_bytes()
+    var i = 0
+    while i + 1 < b.len() {
+        let hi = b.at(i)
+        let lo = b.at(i + 1)
+        out.push((if hi >= 97 { hi - 87 } else { hi - 48 }) * 16 + (if lo >= 97 { lo - 87 } else { lo - 48 }))
+        i = i + 2
+    }
+    return out
+}
+
+fn unhex(h: str) -> str {
+    return bytes_of(unhex_list(h)).to_str()
+}
+
+fn hex_bytes(b: bytes) -> str {
+    let digits = "0123456789abcdef"
+    let h = b.to_list().map(|x| digits.substr(x.ushr(4), 1) + digits.substr(x.bit_and(15), 1)).join("")
+    return if h.len() == 0 { "-" } else { h }
+}
+
+fn hex_text(t: str) -> str {
+    return hex_bytes(t.to_bytes())
+}
+
+fn hex_u64(h: str) -> i64 {
+    var v = 0
+    for c in h.codes() {
+        let d = if c >= 97 { c - 87 } else if c >= 65 { c - 55 } else { c - 48 }
+        v = v.shl(4).bit_or(d)
+    }
+    return v
+}
+
+fn hex_list(ws: [str]) -> str {
+    return if ws.len() == 0 { "-" } else { ws.map(|w| hex_text(w)).join(",") }
+}
+
+fn perl_arg(a: str) -> PerlArg {
+    let k = a.substr(0, 1)
+    let v = a.substr(1, a.len() - 1)
+    if k == "s" {
+        return PerlStr(unhex(v))
+    }
+    if k == "i" {
+        return PerlInt(v.parse_int() ?? 0)
+    }
+    return PerlNum(hex_u64(v).from_bits())
+}
+
+fn perlsprintf_line(f: [str]) -> str {
+    let args = f.slice(1, f.len()).map(|a| perl_arg(a))
+    return match perlsprintf.sprintf(unhex(f[0]), args) {
+        Ok(r) -> "T:" + hex_text(r.text) + " " + hex_list(r.warnings)
+        Err(e) -> match e {
+            PerlSprintfDied(m, ws) -> "D:" + hex_text(m) + " " + hex_list(ws)
+            PerlSprintfNotText(ws) -> "U:- " + hex_list(ws)
+            PerlSprintfRefused(why) -> "R:" + hex_text(why)
+        }
+    }
+}
+
+fn perltextabbrev_line(l: str) -> str {
+    let words = if l == "~" { [] } else { l.split(" ").map(|w| unhex(w)) }
+    var pairs = perltextabbrev.abbrev(words).entries().map(|kv| hex_text(kv.0) + "=" + hex_text(kv.1))
+    pairs.sort()
+    return if pairs.len() == 0 { "-" } else { pairs.join(",") }
+}
+
+fn ub(h: str) -> bytes {
+    return bytes_of(unhex_list(h))
+}
+
+fn eol_of(h: str) -> bytes {
+    return if h == "~" { "\n".to_bytes() } else { ub(h) }
+}
+
+fn perlmimebase64_line(f: [str]) -> str {
+    let op = f[0]
+    if op == "e64" {
+        return hex_bytes(perlmimebase64.encode_base64(ub(f[1]), eol_of(f[2])))
+    }
+    if op == "d64" {
+        return hex_bytes(perlmimebase64.decode_base64(ub(f[1])))
+    }
+    if op == "l64" {
+        return perlmimebase64.encoded_base64_length(ub(f[1]), eol_of(f[2])).to_str()
+    }
+    if op == "dl64" {
+        return perlmimebase64.decoded_base64_length(ub(f[1])).to_str()
+    }
+    if op == "eu" {
+        return hex_bytes(perlmimebase64.encode_base64url(ub(f[1])))
+    }
+    if op == "du" {
+        return hex_bytes(perlmimebase64.decode_base64url(ub(f[1])))
+    }
+    if op == "eqp" {
+        let binary = f[3] != "~" and f[3] != "0"
+        return hex_bytes(perlmimebase64.encode_qp(ub(f[1]), eol_of(f[2]), binary))
+    }
+    return hex_bytes(perlmimebase64.decode_qp(ub(f[1])))
+}
+
+fn hex_strs(l: str) -> [str] {
+    return if l == "~" { [] } else { l.split(",").map(|x| unhex(x)) }
+}
+
+fn strs_hex(xs: [str]) -> str {
+    return if xs.len() == 0 { "~" } else { xs.map(|x| hex_text(x)).join(",") }
+}
+
+fn gol_entry(kv: (str, GolValue)) -> str {
+    return kv.0 + "\t" + match kv.1 {
+        GolScalar(t) -> "S\t" + t
+        GolList(xs) -> (["A"] + xs).join("\t")
+        GolHash(ps) -> (["H"] + ps.map(|p| p.0 + "\t" + p.1)).join("\t")
+    }
+}
+
+fn perlgetoptlong_line(f: [str]) -> str {
+    return match perlgetoptlong.get_options(hex_strs(f[2]), hex_strs(f[1]), hex_strs(f[0])) {
+        Ok(r) -> (if r.ok { "1" } else { "0" }) + " " + hex_text(r.values.map(|kv| gol_entry(kv)).join("\n")) + " " + strs_hex(r.rest) + " " + strs_hex(r.warnings)
+        Err(e) -> match e {
+            GolDied(m) -> "D:" + hex_text(m)
+            GolRefused(why) -> "R:" + hex_text(why)
+        }
+    }
+}
+
+fn opt_text(h: str) -> Option[str] {
+    return if h == "~" { None } else { Some(unhex(h)) }
+}
+
+fn opt_hex(t: Option[str]) -> str {
+    return match t {
+        Some(x) -> hex_text(x)
+        None -> "~"
+    }
+}
+
+fn balanced_call(f: [str]) -> TextBalancedResult ! TextBalancedError {
+    if f[0] == "d" {
+        return try perltextbalanced.extract_delimited(unhex(f[1]), opt_text(f[2]), opt_text(f[3]), opt_text(f[4]))
+    }
+    return try perltextbalanced.extract_bracketed(unhex(f[1]), opt_text(f[2]), opt_text(f[3]))
+}
+
+fn perltextbalanced_line(f: [str]) -> str {
+    return match balanced_call(f) {
+        Ok(v) -> opt_hex(v.extracted) + " " + hex_text(v.remainder) + " " + opt_hex(v.prefix) + " " + match v.failure {
+            Some(e) -> hex_text(e.message) + ":" + e.pos.to_str()
+            None -> "~"
+        }
+        Err(e) -> match e {
+            TextBalancedUnsupported(why) -> "R:" + hex_text(why)
+        }
+    }
+}
+
+fn lisp_arg(a: str) -> LispArg {
+    let k = a.substr(0, 1)
+    let v = a.substr(1, a.len() - 1)
+    if k == "i" {
+        return LispInteger(bigint.parse(v) ?? bigint.zero())
+    }
+    if k == "r" {
+        let parts = v.split("/")
+        return LispRatio(bigint.parse(parts[0]) ?? bigint.zero(), bigint.parse(parts[1]) ?? bigint.from_i64(1))
+    }
+    if k == "s" {
+        return LispSingle(hex_u64(v))
+    }
+    if k == "d" {
+        return LispDouble(hex_u64(v).from_bits())
+    }
+    if k == "c" {
+        return LispChar((v.parse_int() ?? 32).to_char())
+    }
+    return LispNil
+}
+
+fn lispformat_line(f: [str]) -> str {
+    return match lispformat.format(unhex(f[0]), f.slice(1, f.len()).map(|a| lisp_arg(a))) {
+        Ok(t) -> hex_text(t)
+        Err(e) -> match e {
+            SbclFormatFailed -> "E"
+            SbclFormatRefused(why) -> "R:" + hex_text(why)
+        }
+    }
+}
+
+fn lispreadnumber_line(f: [str]) -> str {
+    return match lispreadnumber.read_token(unhex(f[2]), f[0].parse_int() ?? 10, f[1]) {
+        Ok(v) -> match v {
+            LrInteger(n) -> "I:" + bigint.to_str(n)
+            LrRatio(n, d) -> "R:" + bigint.to_str(n) + "/" + bigint.to_str(d)
+            LrSingle(b) -> "F:" + b.to_base(16).pad_start(8, "0")
+            LrDouble(x) -> "D:" + hex_bits(x)
+            LrSymbol(name) -> "S:" + hex_text(name)
+        }
+        Err(e) -> match e {
+            LispReadFailed(k) -> "E:" + k
+            LispReadRefused(why) -> "R!" + hex_text(why)
+        }
+    }
+}
+
+fn hex_bits(x: f64) -> str {
+    let b = x.to_bits()
+    let digits = "0123456789abcdef"
+    var out = ""
+    var k = 60
+    while k >= 0 {
+        out = out + digits.substr(b.ushr(k).bit_and(15), 1)
+        k = k - 4
+    }
+    return out
+}
+
+fn rust_arg(a: str) -> RustFmtArg {
+    let k = a.substr(0, 1)
+    let v = a.substr(1, a.len() - 1)
+    if k == "i" {
+        return RustI64(v.parse_int() ?? 0)
+    }
+    if k == "u" {
+        return RustU64(bigint.to_i64(bigint.sub(bigint.parse(v) ?? bigint.zero(), if v.len() >= 19 and (bigint.compare(bigint.parse(v) ?? bigint.zero(), bigint.parse("9223372036854775807") ?? bigint.zero()) > 0) { bigint.pow(bigint.from_i64(2), 64) } else { bigint.zero() })) ?? 0)
+    }
+    if k == "f" {
+        return RustF64(hex_u64(v).from_bits())
+    }
+    return RustStr(unhex(v))
+}
+
+fn rustfmt_line(f: [str]) -> str {
+    let counts = f.slice(2, f.len()).map(|c| c.parse_int() ?? 0)
+    return match rustfmt.format_value(unhex(f[0]), rust_arg(f[1]), counts) {
+        Ok(t) -> hex_text(t)
+        Err(e) -> match e {
+            RustFmtBadSpec(why) -> "R:" + hex_text(why)
+            RustFmtBadType(why) -> "T:" + hex_text(why)
+        }
+    }
+}
+
+fn lua_value(a: str) -> LuaNumValue {
+    let k = a.substr(0, 1)
+    let v = a.substr(1, a.len() - 1)
+    if k == "i" {
+        return LnInt(v.parse_int() ?? 0)
+    }
+    if k == "f" {
+        return LnFloat(hex_u64(v).from_bits())
+    }
+    return LnStr(unhex(v))
+}
+
+fn lua_shown(v: LuaNumValue) -> str {
+    return match v {
+        LnInt(i) -> "i:" + i.to_str()
+        LnFloat(x) -> if x != x { "f:nan" } else { "f:" + hex_bits(x) }
+        LnStr(t) -> "s:" + hex_text(t)
+        LnBool(b) -> "b:" + (if b { "true" } else { "false" })
+        LnNil -> "n"
+    }
+}
+
+fn lua_call(f: [str]) -> LuaNumValue ! LuaNumError {
+    let op = f[0]
+    let args = f.slice(1, f.len()).map(|a| lua_value(a))
+    if op.starts_with("m:") {
+        return try luanumber.math(op.substr(2, op.len() - 2), args)
+    }
+    if op == "neg" {
+        return try luanumber.unary("-", args[0])
+    }
+    if op == "bnot" {
+        return try luanumber.unary("~", args[0])
+    }
+    if op == "tonumber" {
+        let text = match args[0] {
+            LnStr(t) -> t
+            _ -> ""
+        }
+        let base = match args[1] {
+            LnInt(b) -> b
+            _ -> 10
+        }
+        return match try luanumber.tonumber_base(text, base) {
+            Some(n) -> LnInt(n)
+            None -> LnNil
+        }
+    }
+    if op == "<" or op == "<=" or op == ">" or op == ">=" or op == "==" or op == "~=" {
+        return LnBool(try luanumber.compare(op, args[0], args[1]))
+    }
+    return try luanumber.arith(op, args[0], args[1])
+}
+
+fn luanumber_line(f: [str]) -> str {
+    return match lua_call(f) {
+        Ok(v) -> lua_shown(v)
+        Err(e) -> match e {
+            LuaRaised(k) -> "e:" + k
+            LuaNumRefused(why) -> "R:" + hex_text(why)
+        }
+    }
+}
+
+fn main() / {io} {
+    let argv = args()
+    var i = 0
+    while i + 1 < argv.len() {
+        let op = argv[i]
+        let text = match read_bytes(argv[i + 1]) {
+            Ok(d) -> d.to_str()
+            Err(_e) -> ""
+        }
+        for l in text.split("\n").filter(|l| l.len() > 0) {
+            if op == "luanumber" {
+                print(luanumber_line(l.split(" ")))
+            }
+            if op == "rustfmt" {
+                print(rustfmt_line(l.split(" ")))
+            }
+            if op == "lispreadnumber" {
+                print(lispreadnumber_line(l.split(" ")))
+            }
+            if op == "lispformat" {
+                print(lispformat_line(l.split(" ")))
+            }
+            if op == "perltextbalanced" {
+                print(perltextbalanced_line(l.split(" ")))
+            }
+            if op == "perlgetoptlong" {
+                print(perlgetoptlong_line(l.split(" ")))
+            }
+            if op == "perlmimebase64" {
+                print(perlmimebase64_line(l.split(" ")))
+            }
+            if op == "perltextabbrev" {
+                print(perltextabbrev_line(l))
+            }
+            if op == "perlsprintf" {
+                print(perlsprintf_line(l.split(" ")))
+            }
+        }
+        i = i + 2
+    }
+}

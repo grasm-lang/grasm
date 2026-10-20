@@ -1,0 +1,727 @@
+// Python's `str` methods, as CPython 3.13 runs them on Unicode text:
+// splitting, stripping, padding, searching, replacing and changing case.
+//
+// Code that has to produce the same strings as a Python program -- a
+// port, a formatter, a tool that reads what a Python script wrote -- needs
+// Python's rules, and they are not the obvious ones:
+//
+//   - `split()` with no separator splits on runs of Unicode whitespace
+//     (`isspace`, which includes U+001C..U+001F and U+0085) and drops
+//     empty pieces; with a separator it keeps them, and `maxsplit` leaves
+//     the rest whole (`rsplit` counts from the right). `splitlines` breaks
+//     at `\n`, `\r`, `\r\n`, `\v`, `\f`, U+001C..U+001E, U+0085, U+2028
+//     and U+2029.
+//   - `strip()` removes Unicode whitespace; `strip(chars)` any of the
+//     characters given. `expandtabs` counts columns in code points and
+//     restarts only after `\n` and `\r`.
+//   - `center` puts the odd space on the left when the width is odd
+//     (`marg // 2 + (marg & width & 1)`); `zfill` keeps a leading `+` or
+//     `-` in front.
+//   - `find`, `rfind`, `index`, `rindex`, `count`, `startswith` and
+//     `endswith` take `start` and `end` as slice bounds, negative ones
+//     counted from the end, and an empty substring is found where the
+//     slice allows (`"abc".find("", 3)` is 3, `.find("", 4)` is -1).
+//     `replace` with an empty `old` inserts between characters.
+//   - `upper`, `lower`, `title`, `capitalize` and `swapcase` use full case
+//     mappings (`ß` uppercases to `SS`, `ﬁ` titlecases to `Fi`, `İ`
+//     lowercases to `i̇`), and a capital sigma lowercases to `ς` at the
+//     end of a word, read through case-ignorable characters, as CPython
+//     reads it. `title` starts a word after any character that is not
+//     cased, so `"they're"` becomes `"They'Re"`; `capitalize` titlecases
+//     the first character (since 3.8) and lowercases the rest.
+//
+// The predicates (`isalpha`, `isdigit`, `isspace`, `isidentifier`, ...)
+// are `pycharclass`'s, which this uses for whitespace.
+//
+// The case tables at the end are generated from CPython 3.13's own str
+// methods (Unicode 15.1) by gen_tables.py. Python strings may hold lone
+// surrogates; Grasm text cannot, so they are outside this.
+
+import pycharclass
+
+/// Python's exception: ValueError or TypeError, with its message.
+type PyStrError = | PyStrValueError(msg: str) | PyStrTypeError(msg: str)
+
+pub fn error_class(e: PyStrError) -> str {
+    return match e {
+        PyStrValueError(_m) -> "ValueError"
+        PyStrTypeError(_m) -> "TypeError"
+    }
+}
+
+pub fn error_text(e: PyStrError) -> str {
+    return match e {
+        PyStrValueError(m) -> m
+        PyStrTypeError(m) -> m
+    }
+}
+
+fn from_codes(cs: [i64]) -> str {
+    return cs.map(|c| c.to_char()).join("")
+}
+
+fn sub_codes(cs: [i64], a: i64, b: i64) -> str {
+    return from_codes(cs.slice(a, b))
+}
+
+fn is_space(c: i64) -> bool {
+    return pycharclass.is_space(c)
+}
+
+/// `Py_UNICODE_ISLINEBREAK`.
+pub fn is_line_break(c: i64) -> bool {
+    return (c >= 10 and c <= 13) or (c >= 28 and c <= 30) or c == 133 or c == 8232 or c == 8233
+}
+
+// ---- splitting
+
+fn empty_separator() -> PyStrError {
+    return PyStrValueError("empty separator")
+}
+
+/// Whether the code points of `sep` start at `cs[i]`.
+fn match_at(cs: [i64], i: i64, sep: [i64]) -> bool {
+    if i < 0 or i + sep.len() > cs.len() {
+        return false
+    }
+    for k in 0..sep.len() {
+        if cs[i + k] != sep[k] {
+            return false
+        }
+    }
+    return true
+}
+
+/// The first match of `sep` in `cs[lo..hi]` at or after `lo`, or -1.
+fn find_in(cs: [i64], sep: [i64], lo: i64, hi: i64) -> i64 {
+    var i = lo
+    while i + sep.len() <= hi {
+        if match_at(cs, i, sep) {
+            return i
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+/// The last match of `sep` lying wholly in `cs[lo..hi]`, or -1.
+fn rfind_in(cs: [i64], sep: [i64], lo: i64, hi: i64) -> i64 {
+    var i = hi - sep.len()
+    while i >= lo {
+        if match_at(cs, i, sep) {
+            return i
+        }
+        i = i - 1
+    }
+    return 0 - 1
+}
+
+fn split_whitespace(cs: [i64], maxsplit: i64) -> [str] {
+    var out: [str] = []
+    var left = if maxsplit < 0 { cs.len() + 1 } else { maxsplit }
+    var i = 0
+    let n = cs.len()
+    while left > 0 {
+        left = left - 1
+        while i < n and is_space(cs[i]) {
+            i = i + 1
+        }
+        if i == n {
+            break
+        }
+        let j = i
+        i = i + 1
+        while i < n and not is_space(cs[i]) {
+            i = i + 1
+        }
+        out.push(sub_codes(cs, j, i))
+    }
+    if i < n {
+        while i < n and is_space(cs[i]) {
+            i = i + 1
+        }
+        if i != n {
+            out.push(sub_codes(cs, i, n))
+        }
+    }
+    return out
+}
+
+/// `s.split(sep, maxsplit)`; None splits on whitespace.
+pub fn split(s: str, sep: Option[str], maxsplit: i64) -> [str] ! PyStrError {
+    let cs = s.codes()
+    let sp = match sep {
+        None -> return split_whitespace(cs, maxsplit)
+        Some(t) -> t.codes()
+    }
+    if sp.len() == 0 {
+        fail(empty_separator())
+    }
+    var out: [str] = []
+    var left = if maxsplit < 0 { cs.len() + 1 } else { maxsplit }
+    var i = 0
+    while left > 0 {
+        left = left - 1
+        let pos = find_in(cs, sp, i, cs.len())
+        if pos < 0 {
+            break
+        }
+        out.push(sub_codes(cs, i, pos))
+        i = pos + sp.len()
+    }
+    out.push(sub_codes(cs, i, cs.len()))
+    return out
+}
+
+fn rsplit_whitespace(cs: [i64], maxsplit: i64) -> [str] {
+    var out: [str] = []
+    var left = if maxsplit < 0 { cs.len() + 1 } else { maxsplit }
+    var i = cs.len() - 1
+    while left > 0 {
+        left = left - 1
+        while i >= 0 and is_space(cs[i]) {
+            i = i - 1
+        }
+        if i < 0 {
+            break
+        }
+        let j = i
+        i = i - 1
+        while i >= 0 and not is_space(cs[i]) {
+            i = i - 1
+        }
+        out.push(sub_codes(cs, i + 1, j + 1))
+    }
+    if i >= 0 {
+        while i >= 0 and is_space(cs[i]) {
+            i = i - 1
+        }
+        if i >= 0 {
+            out.push(sub_codes(cs, 0, i + 1))
+        }
+    }
+    return out.rev()
+}
+
+/// `s.rsplit(sep, maxsplit)`.
+pub fn rsplit(s: str, sep: Option[str], maxsplit: i64) -> [str] ! PyStrError {
+    let cs = s.codes()
+    let sp = match sep {
+        None -> return rsplit_whitespace(cs, maxsplit)
+        Some(t) -> t.codes()
+    }
+    if sp.len() == 0 {
+        fail(empty_separator())
+    }
+    var out: [str] = []
+    var left = if maxsplit < 0 { cs.len() + 1 } else { maxsplit }
+    var j = cs.len()
+    while left > 0 {
+        left = left - 1
+        let pos = rfind_in(cs, sp, 0, j)
+        if pos < 0 {
+            break
+        }
+        out.push(sub_codes(cs, pos + sp.len(), j))
+        j = pos
+    }
+    out.push(sub_codes(cs, 0, j))
+    return out.rev()
+}
+
+/// `s.splitlines(keepends)`.
+pub fn splitlines(s: str, keepends: bool) -> [str] {
+    let cs = s.codes()
+    let n = cs.len()
+    var out: [str] = []
+    var i = 0
+    var j = 0
+    while i < n {
+        while i < n and not is_line_break(cs[i]) {
+            i = i + 1
+        }
+        var eol = i
+        if i < n {
+            if cs[i] == 13 and i + 1 < n and cs[i + 1] == 10 {
+                i = i + 2
+            } else {
+                i = i + 1
+            }
+            if keepends {
+                eol = i
+            }
+        }
+        out.push(sub_codes(cs, j, eol))
+        j = i
+    }
+    return out
+}
+
+/// `s.partition(sep)`.
+pub fn partition(s: str, sep: str) -> (str, str, str) ! PyStrError {
+    let cs = s.codes()
+    let sp = sep.codes()
+    if sp.len() == 0 {
+        fail(empty_separator())
+    }
+    let pos = find_in(cs, sp, 0, cs.len())
+    if pos < 0 {
+        return (s, "", "")
+    }
+    return (sub_codes(cs, 0, pos), sep, sub_codes(cs, pos + sp.len(), cs.len()))
+}
+
+/// `s.rpartition(sep)`.
+pub fn rpartition(s: str, sep: str) -> (str, str, str) ! PyStrError {
+    let cs = s.codes()
+    let sp = sep.codes()
+    if sp.len() == 0 {
+        fail(empty_separator())
+    }
+    let pos = rfind_in(cs, sp, 0, cs.len())
+    if pos < 0 {
+        return ("", "", s)
+    }
+    return (sub_codes(cs, 0, pos), sep, sub_codes(cs, pos + sp.len(), cs.len()))
+}
+
+// ---- stripping and padding
+
+fn strippable(c: i64, chars: Option[[i64]]) -> bool {
+    return match chars {
+        None -> is_space(c)
+        Some(set) -> set.contains(c)
+    }
+}
+
+fn strip_codes(s: str, chars: Option[str], left: bool, right: bool) -> str {
+    let cs = s.codes()
+    let set = match chars {
+        Some(t) -> Some(t.codes())
+        None -> None
+    }
+    var a = 0
+    var b = cs.len()
+    if left {
+        while a < b and strippable(cs[a], set) {
+            a = a + 1
+        }
+    }
+    if right {
+        while b > a and strippable(cs[b - 1], set) {
+            b = b - 1
+        }
+    }
+    return sub_codes(cs, a, b)
+}
+
+/// `s.strip(chars)`; None strips whitespace.
+pub fn strip(s: str, chars: Option[str]) -> str {
+    return strip_codes(s, chars, true, true)
+}
+
+pub fn lstrip(s: str, chars: Option[str]) -> str {
+    return strip_codes(s, chars, true, false)
+}
+
+pub fn rstrip(s: str, chars: Option[str]) -> str {
+    return strip_codes(s, chars, false, true)
+}
+
+/// `s.expandtabs(tabsize)`.
+pub fn expandtabs(s: str, tabsize: i64) -> str {
+    var out: [str] = []
+    var col = 0
+    for c in s.codes() {
+        if c == 9 {
+            if tabsize > 0 {
+                let incr = tabsize - col % tabsize
+                col = col + incr
+                out.push(" ".repeat(incr))
+            }
+        } else {
+            col = col + 1
+            out.push(c.to_char())
+            if c == 10 or c == 13 {
+                col = 0
+            }
+        }
+    }
+    return out.join("")
+}
+
+fn fill_char(fill: str) -> str ! PyStrError {
+    if fill.len() != 1 {
+        fail(PyStrTypeError("The fill character must be exactly one character long"))
+    }
+    return fill
+}
+
+/// `s.center(width, fillchar)`.
+pub fn center(s: str, width: i64, fillchar: str) -> str ! PyStrError {
+    let f = try fill_char(fillchar)
+    let n = s.len()
+    if n >= width {
+        return s
+    }
+    let marg = width - n
+    let left = marg / 2 + marg.bit_and(width).bit_and(1)
+    return f.repeat(left) + s + f.repeat(marg - left)
+}
+
+/// `s.ljust(width, fillchar)`.
+pub fn ljust(s: str, width: i64, fillchar: str) -> str ! PyStrError {
+    let f = try fill_char(fillchar)
+    if s.len() >= width {
+        return s
+    }
+    return s + f.repeat(width - s.len())
+}
+
+/// `s.rjust(width, fillchar)`.
+pub fn rjust(s: str, width: i64, fillchar: str) -> str ! PyStrError {
+    let f = try fill_char(fillchar)
+    if s.len() >= width {
+        return s
+    }
+    return f.repeat(width - s.len()) + s
+}
+
+/// `s.zfill(width)`.
+pub fn zfill(s: str, width: i64) -> str {
+    let n = s.len()
+    if n >= width {
+        return s
+    }
+    let pad = "0".repeat(width - n)
+    if n > 0 and (s.code_at(0) == 43 or s.code_at(0) == 45) {
+        return s.substr(0, 1) + pad + s.substr(1, n - 1)
+    }
+    return pad + s
+}
+
+// ---- searching
+
+/// `ADJUST_INDICES`: slice bounds as Python clamps them.
+fn adjust(start: Option[i64], end: Option[i64], n: i64) -> (i64, i64) {
+    var a = start ?? 0
+    var b = end ?? n
+    if b > n {
+        b = n
+    } else if b < 0 {
+        b = b + n
+        if b < 0 {
+            b = 0
+        }
+    }
+    if a < 0 {
+        a = a + n
+        if a < 0 {
+            a = 0
+        }
+    }
+    return (a, b)
+}
+
+/// `s.find(sub, start, end)`: -1 when absent.
+pub fn find(s: str, sub: str, start: Option[i64], end: Option[i64]) -> i64 {
+    let cs = s.codes()
+    let sp = sub.codes()
+    let r = adjust(start, end, cs.len())
+    if r.1 - r.0 < sp.len() {
+        return 0 - 1
+    }
+    return find_in(cs, sp, r.0, r.1)
+}
+
+/// `s.rfind(sub, start, end)`.
+pub fn rfind(s: str, sub: str, start: Option[i64], end: Option[i64]) -> i64 {
+    let cs = s.codes()
+    let sp = sub.codes()
+    let r = adjust(start, end, cs.len())
+    if r.1 - r.0 < sp.len() {
+        return 0 - 1
+    }
+    return rfind_in(cs, sp, r.0, r.1)
+}
+
+/// `s.index(sub, start, end)`.
+pub fn index(s: str, sub: str, start: Option[i64], end: Option[i64]) -> i64 ! PyStrError {
+    let i = find(s, sub, start, end)
+    if i < 0 {
+        fail(PyStrValueError("substring not found"))
+    }
+    return i
+}
+
+/// `s.rindex(sub, start, end)`.
+pub fn rindex(s: str, sub: str, start: Option[i64], end: Option[i64]) -> i64 ! PyStrError {
+    let i = rfind(s, sub, start, end)
+    if i < 0 {
+        fail(PyStrValueError("substring not found"))
+    }
+    return i
+}
+
+/// `s.count(sub, start, end)`: matches that do not overlap.
+pub fn count(s: str, sub: str, start: Option[i64], end: Option[i64]) -> i64 {
+    let cs = s.codes()
+    let sp = sub.codes()
+    let r = adjust(start, end, cs.len())
+    if r.1 - r.0 < sp.len() {
+        return 0
+    }
+    if sp.len() == 0 {
+        return r.1 - r.0 + 1
+    }
+    var n = 0
+    var i = r.0
+    while i + sp.len() <= r.1 {
+        if match_at(cs, i, sp) {
+            n = n + 1
+            i = i + sp.len()
+        } else {
+            i = i + 1
+        }
+    }
+    return n
+}
+
+fn tail_match(s: str, sub: str, start: Option[i64], end: Option[i64], at_end: bool) -> bool {
+    let cs = s.codes()
+    let sp = sub.codes()
+    let r = adjust(start, end, cs.len())
+    let last = r.1 - sp.len()
+    if last < r.0 {
+        return false
+    }
+    return match_at(cs, if at_end { last } else { r.0 }, sp)
+}
+
+/// `s.startswith(prefix, start, end)`.
+pub fn startswith(s: str, prefix: str, start: Option[i64], end: Option[i64]) -> bool {
+    return tail_match(s, prefix, start, end, false)
+}
+
+/// `s.endswith(suffix, start, end)`.
+pub fn endswith(s: str, suffix: str, start: Option[i64], end: Option[i64]) -> bool {
+    return tail_match(s, suffix, start, end, true)
+}
+
+/// `s.replace(old, new, count)`; a negative count replaces every match.
+pub fn replace(s: str, old: str, new: str, count: i64) -> str {
+    let cs = s.codes()
+    let op = old.codes()
+    var left = if count < 0 { cs.len() + 1 } else { count }
+    var out: [str] = []
+    var i = 0
+    if op.len() == 0 {
+        while i <= cs.len() {
+            if left > 0 {
+                out.push(new)
+                left = left - 1
+            }
+            if i < cs.len() {
+                out.push(cs[i].to_char())
+            }
+            i = i + 1
+        }
+        return out.join("")
+    }
+    while i < cs.len() {
+        if left > 0 and match_at(cs, i, op) {
+            out.push(new)
+            left = left - 1
+            i = i + op.len()
+        } else {
+            out.push(cs[i].to_char())
+            i = i + 1
+        }
+    }
+    return out.join("")
+}
+
+// ---- case
+
+/// The run in a table of four-number runs that holds `cp`: its delta, or 0.
+fn run_delta(runs: [i64], cp: i64) -> i64 {
+    var lo = 0
+    var hi = runs.len() / 4 - 1
+    if hi < 0 or cp < runs[0] {
+        return 0
+    }
+    while lo < hi {
+        let mid = (lo + hi + 1) / 2
+        if runs[mid * 4] <= cp {
+            lo = mid
+        } else {
+            hi = mid - 1
+        }
+    }
+    let at = lo * 4
+    if cp > runs[at + 1] or (cp - runs[at]) % runs[at + 2] != 0 {
+        return 0
+    }
+    return runs[at + 3]
+}
+
+/// A mapping longer than one character, or an empty list.
+fn special(cp: i64, kind: i64) -> [i64] {
+    let t = PYSTR_SPECIAL
+    let key = cp * 4 + kind
+    var lo = 0
+    var hi = t.len() / 5 - 1
+    while lo <= hi {
+        let mid = (lo + hi) / 2
+        let k = t[mid * 5]
+        if k == key {
+            return t.slice(mid * 5 + 2, mid * 5 + 2 + t[mid * 5 + 1])
+        }
+        if k < key {
+            lo = mid + 1
+        } else {
+            hi = mid - 1
+        }
+    }
+    return []
+}
+
+fn props(cp: i64) -> i64 {
+    let starts = PYSTR_PROP_STARTS
+    var lo = 0
+    var hi = starts.len() - 1
+    while lo < hi {
+        let mid = (lo + hi + 1) / 2
+        if starts[mid] <= cp {
+            lo = mid
+        } else {
+            hi = mid - 1
+        }
+    }
+    return PYSTR_PROP_VALUES[lo]
+}
+
+/// Unicode's Cased property, as CPython's `_PyUnicode_IsCased`.
+pub fn is_cased(cp: i64) -> bool {
+    return props(cp).bit_and(1) != 0
+}
+
+/// Unicode's Case_Ignorable property.
+pub fn is_case_ignorable(cp: i64) -> bool {
+    return props(cp).bit_and(2) != 0
+}
+
+/// The full mapping of one code point: kind 0 lower, 1 upper, 2 title.
+pub fn case_mapping(cp: i64, kind: i64) -> [i64] {
+    let s = special(cp, kind)
+    if s.len() > 0 {
+        return s
+    }
+    let runs = if kind == 0 { PYSTR_LOWER_RUNS } else if kind == 1 { PYSTR_UPPER_RUNS } else { PYSTR_TITLE_RUNS }
+    return [cp + run_delta(runs, cp)]
+}
+
+/// `handle_capital_sigma`: ς at the end of a word, σ elsewhere.
+fn sigma(cs: [i64], i: i64) -> i64 {
+    var j = i - 1
+    while j >= 0 and is_case_ignorable(cs[j]) {
+        j = j - 1
+    }
+    var final_sigma = j >= 0 and is_cased(cs[j])
+    if final_sigma and i < cs.len() - 1 {
+        j = i + 1
+        while j < cs.len() and is_case_ignorable(cs[j]) {
+            j = j + 1
+        }
+        final_sigma = j == cs.len() or not is_cased(cs[j])
+    }
+    return if final_sigma { 962 } else { 963 }
+}
+
+/// `lower_ucs4`: the lower-case mapping of `cs[i]` in its context.
+fn lower_at(cs: [i64], i: i64) -> [i64] {
+    if cs[i] == 931 {
+        return [sigma(cs, i)]
+    }
+    return case_mapping(cs[i], 0)
+}
+
+fn emit(inout out: [str], m: [i64]) {
+    for c in m {
+        out.push(c.to_char())
+    }
+}
+
+/// `s.lower()`.
+pub fn lower(s: str) -> str {
+    let cs = s.codes()
+    var out: [str] = []
+    for i in 0..cs.len() {
+        emit(out, lower_at(cs, i))
+    }
+    return out.join("")
+}
+
+/// `s.upper()`.
+pub fn upper(s: str) -> str {
+    var out: [str] = []
+    for c in s.codes() {
+        emit(out, case_mapping(c, 1))
+    }
+    return out.join("")
+}
+
+/// `s.title()`.
+pub fn title(s: str) -> str {
+    let cs = s.codes()
+    var out: [str] = []
+    var previous_is_cased = false
+    for i in 0..cs.len() {
+        emit(out, if previous_is_cased { lower_at(cs, i) } else { case_mapping(cs[i], 2) })
+        previous_is_cased = is_cased(cs[i])
+    }
+    return out.join("")
+}
+
+/// `s.capitalize()`.
+pub fn capitalize(s: str) -> str {
+    let cs = s.codes()
+    var out: [str] = []
+    for i in 0..cs.len() {
+        emit(out, if i == 0 { case_mapping(cs[0], 2) } else { lower_at(cs, i) })
+    }
+    return out.join("")
+}
+
+/// `s.swapcase()`.
+pub fn swapcase(s: str) -> str {
+    let cs = s.codes()
+    var out: [str] = []
+    for i in 0..cs.len() {
+        let c = cs[i]
+        let m = if pycharclass.is_upper(c) { lower_at(cs, i) } else if pycharclass.is_lower(c) { case_mapping(c, 1) } else { [c] }
+        emit(out, m)
+    }
+    return out.join("")
+}
+
+// Generated by gen_tables.py from CPython 3.13's str methods (Unicode 15.1.0).
+// Do not edit: regenerate.
+
+/// Single-character lower mappings: first, last, step and delta.
+pub let PYSTR_LOWER_RUNS: [i64] = [65, 90, 1, 32, 192, 214, 1, 32, 216, 222, 1, 32, 256, 302, 2, 1, 306, 310, 2, 1, 313, 327, 2, 1, 330, 374, 2, 1, 376, 376, 1, -121, 377, 381, 2, 1, 385, 385, 1, 210, 386, 388, 2, 1, 390, 390, 1, 206, 391, 391, 1, 1, 393, 394, 1, 205, 395, 395, 1, 1, 398, 398, 1, 79, 399, 399, 1, 202, 400, 400, 1, 203, 401, 401, 1, 1, 403, 403, 1, 205, 404, 404, 1, 207, 406, 406, 1, 211, 407, 407, 1, 209, 408, 408, 1, 1, 412, 412, 1, 211, 413, 413, 1, 213, 415, 415, 1, 214, 416, 420, 2, 1, 422, 422, 1, 218, 423, 423, 1, 1, 425, 425, 1, 218, 428, 428, 1, 1, 430, 430, 1, 218, 431, 431, 1, 1, 433, 434, 1, 217, 435, 437, 2, 1, 439, 439, 1, 219, 440, 440, 1, 1, 444, 444, 1, 1, 452, 452, 1, 2, 453, 453, 1, 1, 455, 455, 1, 2, 456, 456, 1, 1, 458, 458, 1, 2, 459, 475, 2, 1, 478, 494, 2, 1, 497, 497, 1, 2, 498, 500, 2, 1, 502, 502, 1, -97, 503, 503, 1, -56, 504, 542, 2, 1, 544, 544, 1, -130, 546, 562, 2, 1, 570, 570, 1, 10795, 571, 571, 1, 1, 573, 573, 1, -163, 574, 574, 1, 10792, 577, 577, 1, 1, 579, 579, 1, -195, 580, 580, 1, 69, 581, 581, 1, 71, 582, 590, 2, 1, 880, 882, 2, 1, 886, 886, 1, 1, 895, 895, 1, 116, 902, 902, 1, 38, 904, 906, 1, 37, 908, 908, 1, 64, 910, 911, 1, 63, 913, 929, 1, 32, 931, 939, 1, 32, 975, 975, 1, 8, 984, 1006, 2, 1, 1012, 1012, 1, -60, 1015, 1015, 1, 1, 1017, 1017, 1, -7, 1018, 1018, 1, 1, 1021, 1023, 1, -130, 1024, 1039, 1, 80, 1040, 1071, 1, 32, 1120, 1152, 2, 1, 1162, 1214, 2, 1, 1216, 1216, 1, 15, 1217, 1229, 2, 1, 1232, 1326, 2, 1, 1329, 1366, 1, 48, 4256, 4293, 1, 7264, 4295, 4295, 1, 7264, 4301, 4301, 1, 7264, 5024, 5103, 1, 38864, 5104, 5109, 1, 8, 7312, 7354, 1, -3008, 7357, 7359, 1, -3008, 7680, 7828, 2, 1, 7838, 7838, 1, -7615, 7840, 7934, 2, 1, 7944, 7951, 1, -8, 7960, 7965, 1, -8, 7976, 7983, 1, -8, 7992, 7999, 1, -8, 8008, 8013, 1, -8, 8025, 8031, 2, -8, 8040, 8047, 1, -8, 8072, 8079, 1, -8, 8088, 8095, 1, -8, 8104, 8111, 1, -8, 8120, 8121, 1, -8, 8122, 8123, 1, -74, 8124, 8124, 1, -9, 8136, 8139, 1, -86, 8140, 8140, 1, -9, 8152, 8153, 1, -8, 8154, 8155, 1, -100, 8168, 8169, 1, -8, 8170, 8171, 1, -112, 8172, 8172, 1, -7, 8184, 8185, 1, -128, 8186, 8187, 1, -126, 8188, 8188, 1, -9, 8486, 8486, 1, -7517, 8490, 8490, 1, -8383, 8491, 8491, 1, -8262, 8498, 8498, 1, 28, 8544, 8559, 1, 16, 8579, 8579, 1, 1, 9398, 9423, 1, 26, 11264, 11311, 1, 48, 11360, 11360, 1, 1, 11362, 11362, 1, -10743, 11363, 11363, 1, -3814, 11364, 11364, 1, -10727, 11367, 11371, 2, 1, 11373, 11373, 1, -10780, 11374, 11374, 1, -10749, 11375, 11375, 1, -10783, 11376, 11376, 1, -10782, 11378, 11378, 1, 1, 11381, 11381, 1, 1, 11390, 11391, 1, -10815, 11392, 11490, 2, 1, 11499, 11501, 2, 1, 11506, 11506, 1, 1, 42560, 42604, 2, 1, 42624, 42650, 2, 1, 42786, 42798, 2, 1, 42802, 42862, 2, 1, 42873, 42875, 2, 1, 42877, 42877, 1, -35332, 42878, 42886, 2, 1, 42891, 42891, 1, 1, 42893, 42893, 1, -42280, 42896, 42898, 2, 1, 42902, 42920, 2, 1, 42922, 42922, 1, -42308, 42923, 42923, 1, -42319, 42924, 42924, 1, -42315, 42925, 42925, 1, -42305, 42926, 42926, 1, -42308, 42928, 42928, 1, -42258, 42929, 42929, 1, -42282, 42930, 42930, 1, -42261, 42931, 42931, 1, 928, 42932, 42946, 2, 1, 42948, 42948, 1, -48, 42949, 42949, 1, -42307, 42950, 42950, 1, -35384, 42951, 42953, 2, 1, 42960, 42960, 1, 1, 42966, 42968, 2, 1, 42997, 42997, 1, 1, 65313, 65338, 1, 32, 66560, 66599, 1, 40, 66736, 66771, 1, 40, 66928, 66938, 1, 39, 66940, 66954, 1, 39, 66956, 66962, 1, 39, 66964, 66965, 1, 39, 68736, 68786, 1, 64, 71840, 71871, 1, 32, 93760, 93791, 1, 32, 125184, 125217, 1, 34]
+
+/// Single-character upper mappings: first, last, step and delta.
+pub let PYSTR_UPPER_RUNS: [i64] = [97, 122, 1, -32, 181, 181, 1, 743, 224, 246, 1, -32, 248, 254, 1, -32, 255, 255, 1, 121, 257, 303, 2, -1, 305, 305, 1, -232, 307, 311, 2, -1, 314, 328, 2, -1, 331, 375, 2, -1, 378, 382, 2, -1, 383, 383, 1, -300, 384, 384, 1, 195, 387, 389, 2, -1, 392, 392, 1, -1, 396, 396, 1, -1, 402, 402, 1, -1, 405, 405, 1, 97, 409, 409, 1, -1, 410, 410, 1, 163, 414, 414, 1, 130, 417, 421, 2, -1, 424, 424, 1, -1, 429, 429, 1, -1, 432, 432, 1, -1, 436, 438, 2, -1, 441, 441, 1, -1, 445, 445, 1, -1, 447, 447, 1, 56, 453, 453, 1, -1, 454, 454, 1, -2, 456, 456, 1, -1, 457, 457, 1, -2, 459, 459, 1, -1, 460, 460, 1, -2, 462, 476, 2, -1, 477, 477, 1, -79, 479, 495, 2, -1, 498, 498, 1, -1, 499, 499, 1, -2, 501, 501, 1, -1, 505, 543, 2, -1, 547, 563, 2, -1, 572, 572, 1, -1, 575, 576, 1, 10815, 578, 578, 1, -1, 583, 591, 2, -1, 592, 592, 1, 10783, 593, 593, 1, 10780, 594, 594, 1, 10782, 595, 595, 1, -210, 596, 596, 1, -206, 598, 599, 1, -205, 601, 601, 1, -202, 603, 603, 1, -203, 604, 604, 1, 42319, 608, 608, 1, -205, 609, 609, 1, 42315, 611, 611, 1, -207, 613, 613, 1, 42280, 614, 614, 1, 42308, 616, 616, 1, -209, 617, 617, 1, -211, 618, 618, 1, 42308, 619, 619, 1, 10743, 620, 620, 1, 42305, 623, 623, 1, -211, 625, 625, 1, 10749, 626, 626, 1, -213, 629, 629, 1, -214, 637, 637, 1, 10727, 640, 640, 1, -218, 642, 642, 1, 42307, 643, 643, 1, -218, 647, 647, 1, 42282, 648, 648, 1, -218, 649, 649, 1, -69, 650, 651, 1, -217, 652, 652, 1, -71, 658, 658, 1, -219, 669, 669, 1, 42261, 670, 670, 1, 42258, 837, 837, 1, 84, 881, 883, 2, -1, 887, 887, 1, -1, 891, 893, 1, 130, 940, 940, 1, -38, 941, 943, 1, -37, 945, 961, 1, -32, 962, 962, 1, -31, 963, 971, 1, -32, 972, 972, 1, -64, 973, 974, 1, -63, 976, 976, 1, -62, 977, 977, 1, -57, 981, 981, 1, -47, 982, 982, 1, -54, 983, 983, 1, -8, 985, 1007, 2, -1, 1008, 1008, 1, -86, 1009, 1009, 1, -80, 1010, 1010, 1, 7, 1011, 1011, 1, -116, 1013, 1013, 1, -96, 1016, 1016, 1, -1, 1019, 1019, 1, -1, 1072, 1103, 1, -32, 1104, 1119, 1, -80, 1121, 1153, 2, -1, 1163, 1215, 2, -1, 1218, 1230, 2, -1, 1231, 1231, 1, -15, 1233, 1327, 2, -1, 1377, 1414, 1, -48, 4304, 4346, 1, 3008, 4349, 4351, 1, 3008, 5112, 5117, 1, -8, 7296, 7296, 1, -6254, 7297, 7297, 1, -6253, 7298, 7298, 1, -6244, 7299, 7300, 1, -6242, 7301, 7301, 1, -6243, 7302, 7302, 1, -6236, 7303, 7303, 1, -6181, 7304, 7304, 1, 35266, 7545, 7545, 1, 35332, 7549, 7549, 1, 3814, 7566, 7566, 1, 35384, 7681, 7829, 2, -1, 7835, 7835, 1, -59, 7841, 7935, 2, -1, 7936, 7943, 1, 8, 7952, 7957, 1, 8, 7968, 7975, 1, 8, 7984, 7991, 1, 8, 8000, 8005, 1, 8, 8017, 8023, 2, 8, 8032, 8039, 1, 8, 8048, 8049, 1, 74, 8050, 8053, 1, 86, 8054, 8055, 1, 100, 8056, 8057, 1, 128, 8058, 8059, 1, 112, 8060, 8061, 1, 126, 8112, 8113, 1, 8, 8126, 8126, 1, -7205, 8144, 8145, 1, 8, 8160, 8161, 1, 8, 8165, 8165, 1, 7, 8526, 8526, 1, -28, 8560, 8575, 1, -16, 8580, 8580, 1, -1, 9424, 9449, 1, -26, 11312, 11359, 1, -48, 11361, 11361, 1, -1, 11365, 11365, 1, -10795, 11366, 11366, 1, -10792, 11368, 11372, 2, -1, 11379, 11379, 1, -1, 11382, 11382, 1, -1, 11393, 11491, 2, -1, 11500, 11502, 2, -1, 11507, 11507, 1, -1, 11520, 11557, 1, -7264, 11559, 11559, 1, -7264, 11565, 11565, 1, -7264, 42561, 42605, 2, -1, 42625, 42651, 2, -1, 42787, 42799, 2, -1, 42803, 42863, 2, -1, 42874, 42876, 2, -1, 42879, 42887, 2, -1, 42892, 42892, 1, -1, 42897, 42899, 2, -1, 42900, 42900, 1, 48, 42903, 42921, 2, -1, 42933, 42947, 2, -1, 42952, 42954, 2, -1, 42961, 42961, 1, -1, 42967, 42969, 2, -1, 42998, 42998, 1, -1, 43859, 43859, 1, -928, 43888, 43967, 1, -38864, 65345, 65370, 1, -32, 66600, 66639, 1, -40, 66776, 66811, 1, -40, 66967, 66977, 1, -39, 66979, 66993, 1, -39, 66995, 67001, 1, -39, 67003, 67004, 1, -39, 68800, 68850, 1, -64, 71872, 71903, 1, -32, 93792, 93823, 1, -32, 125218, 125251, 1, -34]
+
+/// Single-character title mappings: first, last, step and delta.
+pub let PYSTR_TITLE_RUNS: [i64] = [97, 122, 1, -32, 181, 181, 1, 743, 224, 246, 1, -32, 248, 254, 1, -32, 255, 255, 1, 121, 257, 303, 2, -1, 305, 305, 1, -232, 307, 311, 2, -1, 314, 328, 2, -1, 331, 375, 2, -1, 378, 382, 2, -1, 383, 383, 1, -300, 384, 384, 1, 195, 387, 389, 2, -1, 392, 392, 1, -1, 396, 396, 1, -1, 402, 402, 1, -1, 405, 405, 1, 97, 409, 409, 1, -1, 410, 410, 1, 163, 414, 414, 1, 130, 417, 421, 2, -1, 424, 424, 1, -1, 429, 429, 1, -1, 432, 432, 1, -1, 436, 438, 2, -1, 441, 441, 1, -1, 445, 445, 1, -1, 447, 447, 1, 56, 452, 452, 1, 1, 454, 454, 1, -1, 455, 455, 1, 1, 457, 457, 1, -1, 458, 458, 1, 1, 460, 476, 2, -1, 477, 477, 1, -79, 479, 495, 2, -1, 497, 497, 1, 1, 499, 501, 2, -1, 505, 543, 2, -1, 547, 563, 2, -1, 572, 572, 1, -1, 575, 576, 1, 10815, 578, 578, 1, -1, 583, 591, 2, -1, 592, 592, 1, 10783, 593, 593, 1, 10780, 594, 594, 1, 10782, 595, 595, 1, -210, 596, 596, 1, -206, 598, 599, 1, -205, 601, 601, 1, -202, 603, 603, 1, -203, 604, 604, 1, 42319, 608, 608, 1, -205, 609, 609, 1, 42315, 611, 611, 1, -207, 613, 613, 1, 42280, 614, 614, 1, 42308, 616, 616, 1, -209, 617, 617, 1, -211, 618, 618, 1, 42308, 619, 619, 1, 10743, 620, 620, 1, 42305, 623, 623, 1, -211, 625, 625, 1, 10749, 626, 626, 1, -213, 629, 629, 1, -214, 637, 637, 1, 10727, 640, 640, 1, -218, 642, 642, 1, 42307, 643, 643, 1, -218, 647, 647, 1, 42282, 648, 648, 1, -218, 649, 649, 1, -69, 650, 651, 1, -217, 652, 652, 1, -71, 658, 658, 1, -219, 669, 669, 1, 42261, 670, 670, 1, 42258, 837, 837, 1, 84, 881, 883, 2, -1, 887, 887, 1, -1, 891, 893, 1, 130, 940, 940, 1, -38, 941, 943, 1, -37, 945, 961, 1, -32, 962, 962, 1, -31, 963, 971, 1, -32, 972, 972, 1, -64, 973, 974, 1, -63, 976, 976, 1, -62, 977, 977, 1, -57, 981, 981, 1, -47, 982, 982, 1, -54, 983, 983, 1, -8, 985, 1007, 2, -1, 1008, 1008, 1, -86, 1009, 1009, 1, -80, 1010, 1010, 1, 7, 1011, 1011, 1, -116, 1013, 1013, 1, -96, 1016, 1016, 1, -1, 1019, 1019, 1, -1, 1072, 1103, 1, -32, 1104, 1119, 1, -80, 1121, 1153, 2, -1, 1163, 1215, 2, -1, 1218, 1230, 2, -1, 1231, 1231, 1, -15, 1233, 1327, 2, -1, 1377, 1414, 1, -48, 5112, 5117, 1, -8, 7296, 7296, 1, -6254, 7297, 7297, 1, -6253, 7298, 7298, 1, -6244, 7299, 7300, 1, -6242, 7301, 7301, 1, -6243, 7302, 7302, 1, -6236, 7303, 7303, 1, -6181, 7304, 7304, 1, 35266, 7545, 7545, 1, 35332, 7549, 7549, 1, 3814, 7566, 7566, 1, 35384, 7681, 7829, 2, -1, 7835, 7835, 1, -59, 7841, 7935, 2, -1, 7936, 7943, 1, 8, 7952, 7957, 1, 8, 7968, 7975, 1, 8, 7984, 7991, 1, 8, 8000, 8005, 1, 8, 8017, 8023, 2, 8, 8032, 8039, 1, 8, 8048, 8049, 1, 74, 8050, 8053, 1, 86, 8054, 8055, 1, 100, 8056, 8057, 1, 128, 8058, 8059, 1, 112, 8060, 8061, 1, 126, 8064, 8071, 1, 8, 8080, 8087, 1, 8, 8096, 8103, 1, 8, 8112, 8113, 1, 8, 8115, 8115, 1, 9, 8126, 8126, 1, -7205, 8131, 8131, 1, 9, 8144, 8145, 1, 8, 8160, 8161, 1, 8, 8165, 8165, 1, 7, 8179, 8179, 1, 9, 8526, 8526, 1, -28, 8560, 8575, 1, -16, 8580, 8580, 1, -1, 9424, 9449, 1, -26, 11312, 11359, 1, -48, 11361, 11361, 1, -1, 11365, 11365, 1, -10795, 11366, 11366, 1, -10792, 11368, 11372, 2, -1, 11379, 11379, 1, -1, 11382, 11382, 1, -1, 11393, 11491, 2, -1, 11500, 11502, 2, -1, 11507, 11507, 1, -1, 11520, 11557, 1, -7264, 11559, 11559, 1, -7264, 11565, 11565, 1, -7264, 42561, 42605, 2, -1, 42625, 42651, 2, -1, 42787, 42799, 2, -1, 42803, 42863, 2, -1, 42874, 42876, 2, -1, 42879, 42887, 2, -1, 42892, 42892, 1, -1, 42897, 42899, 2, -1, 42900, 42900, 1, 48, 42903, 42921, 2, -1, 42933, 42947, 2, -1, 42952, 42954, 2, -1, 42961, 42961, 1, -1, 42967, 42969, 2, -1, 42998, 42998, 1, -1, 43859, 43859, 1, -928, 43888, 43967, 1, -38864, 65345, 65370, 1, -32, 66600, 66639, 1, -40, 66776, 66811, 1, -40, 66967, 66977, 1, -39, 66979, 66993, 1, -39, 66995, 67001, 1, -39, 67003, 67004, 1, -39, 68800, 68850, 1, -64, 71872, 71903, 1, -32, 93792, 93823, 1, -32, 125218, 125251, 1, -34]
+
+/// Longer mappings, five numbers each: code point * 4 + kind (0 lower, 1
+/// upper, 2 title), length, and up to three code points.
+pub let PYSTR_SPECIAL: [i64] = [893, 2, 83, 83, 0, 894, 2, 83, 115, 0, 1216, 2, 105, 775, 0, 1317, 2, 700, 78, 0, 1318, 2, 700, 78, 0, 1985, 2, 74, 780, 0, 1986, 2, 74, 780, 0, 3649, 3, 921, 776, 769, 3650, 3, 921, 776, 769, 3777, 3, 933, 776, 769, 3778, 3, 933, 776, 769, 5661, 2, 1333, 1362, 0, 5662, 2, 1333, 1410, 0, 31321, 2, 72, 817, 0, 31322, 2, 72, 817, 0, 31325, 2, 84, 776, 0, 31326, 2, 84, 776, 0, 31329, 2, 87, 778, 0, 31330, 2, 87, 778, 0, 31333, 2, 89, 778, 0, 31334, 2, 89, 778, 0, 31337, 2, 65, 702, 0, 31338, 2, 65, 702, 0, 32065, 2, 933, 787, 0, 32066, 2, 933, 787, 0, 32073, 3, 933, 787, 768, 32074, 3, 933, 787, 768, 32081, 3, 933, 787, 769, 32082, 3, 933, 787, 769, 32089, 3, 933, 787, 834, 32090, 3, 933, 787, 834, 32257, 2, 7944, 921, 0, 32261, 2, 7945, 921, 0, 32265, 2, 7946, 921, 0, 32269, 2, 7947, 921, 0, 32273, 2, 7948, 921, 0, 32277, 2, 7949, 921, 0, 32281, 2, 7950, 921, 0, 32285, 2, 7951, 921, 0, 32289, 2, 7944, 921, 0, 32293, 2, 7945, 921, 0, 32297, 2, 7946, 921, 0, 32301, 2, 7947, 921, 0, 32305, 2, 7948, 921, 0, 32309, 2, 7949, 921, 0, 32313, 2, 7950, 921, 0, 32317, 2, 7951, 921, 0, 32321, 2, 7976, 921, 0, 32325, 2, 7977, 921, 0, 32329, 2, 7978, 921, 0, 32333, 2, 7979, 921, 0, 32337, 2, 7980, 921, 0, 32341, 2, 7981, 921, 0, 32345, 2, 7982, 921, 0, 32349, 2, 7983, 921, 0, 32353, 2, 7976, 921, 0, 32357, 2, 7977, 921, 0, 32361, 2, 7978, 921, 0, 32365, 2, 7979, 921, 0, 32369, 2, 7980, 921, 0, 32373, 2, 7981, 921, 0, 32377, 2, 7982, 921, 0, 32381, 2, 7983, 921, 0, 32385, 2, 8040, 921, 0, 32389, 2, 8041, 921, 0, 32393, 2, 8042, 921, 0, 32397, 2, 8043, 921, 0, 32401, 2, 8044, 921, 0, 32405, 2, 8045, 921, 0, 32409, 2, 8046, 921, 0, 32413, 2, 8047, 921, 0, 32417, 2, 8040, 921, 0, 32421, 2, 8041, 921, 0, 32425, 2, 8042, 921, 0, 32429, 2, 8043, 921, 0, 32433, 2, 8044, 921, 0, 32437, 2, 8045, 921, 0, 32441, 2, 8046, 921, 0, 32445, 2, 8047, 921, 0, 32457, 2, 8122, 921, 0, 32458, 2, 8122, 837, 0, 32461, 2, 913, 921, 0, 32465, 2, 902, 921, 0, 32466, 2, 902, 837, 0, 32473, 2, 913, 834, 0, 32474, 2, 913, 834, 0, 32477, 3, 913, 834, 921, 32478, 3, 913, 834, 837, 32497, 2, 913, 921, 0, 32521, 2, 8138, 921, 0, 32522, 2, 8138, 837, 0, 32525, 2, 919, 921, 0, 32529, 2, 905, 921, 0, 32530, 2, 905, 837, 0, 32537, 2, 919, 834, 0, 32538, 2, 919, 834, 0, 32541, 3, 919, 834, 921, 32542, 3, 919, 834, 837, 32561, 2, 919, 921, 0, 32585, 3, 921, 776, 768, 32586, 3, 921, 776, 768, 32589, 3, 921, 776, 769, 32590, 3, 921, 776, 769, 32601, 2, 921, 834, 0, 32602, 2, 921, 834, 0, 32605, 3, 921, 776, 834, 32606, 3, 921, 776, 834, 32649, 3, 933, 776, 768, 32650, 3, 933, 776, 768, 32653, 3, 933, 776, 769, 32654, 3, 933, 776, 769, 32657, 2, 929, 787, 0, 32658, 2, 929, 787, 0, 32665, 2, 933, 834, 0, 32666, 2, 933, 834, 0, 32669, 3, 933, 776, 834, 32670, 3, 933, 776, 834, 32713, 2, 8186, 921, 0, 32714, 2, 8186, 837, 0, 32717, 2, 937, 921, 0, 32721, 2, 911, 921, 0, 32722, 2, 911, 837, 0, 32729, 2, 937, 834, 0, 32730, 2, 937, 834, 0, 32733, 3, 937, 834, 921, 32734, 3, 937, 834, 837, 32753, 2, 937, 921, 0, 257025, 2, 70, 70, 0, 257026, 2, 70, 102, 0, 257029, 2, 70, 73, 0, 257030, 2, 70, 105, 0, 257033, 2, 70, 76, 0, 257034, 2, 70, 108, 0, 257037, 3, 70, 70, 73, 257038, 3, 70, 102, 105, 257041, 3, 70, 70, 76, 257042, 3, 70, 102, 108, 257045, 2, 83, 84, 0, 257046, 2, 83, 116, 0, 257049, 2, 83, 84, 0, 257050, 2, 83, 116, 0, 257101, 2, 1348, 1350, 0, 257102, 2, 1348, 1398, 0, 257105, 2, 1348, 1333, 0, 257106, 2, 1348, 1381, 0, 257109, 2, 1348, 1339, 0, 257110, 2, 1348, 1387, 0, 257113, 2, 1358, 1350, 0, 257114, 2, 1358, 1398, 0, 257117, 2, 1348, 1341, 0, 257118, 2, 1348, 1389, 0]
+
+/// Where each run of code points with the same case properties begins,
+/// and its value: 1 cased, 2 case-ignorable.
+pub let PYSTR_PROP_STARTS: [i64] = [0, 39, 40, 46, 47, 58, 59, 65, 91, 94, 95, 96, 97, 123, 168, 169, 170, 171, 173, 174, 175, 176, 180, 181, 182, 183, 185, 186, 187, 192, 215, 216, 247, 248, 443, 444, 448, 452, 660, 661, 688, 697, 704, 706, 736, 741, 837, 838, 880, 884, 886, 888, 890, 891, 894, 895, 896, 900, 902, 903, 904, 907, 908, 909, 910, 930, 931, 1014, 1015, 1154, 1155, 1162, 1328, 1329, 1367, 1369, 1370, 1375, 1376, 1417, 1425, 1470, 1471, 1472, 1473, 1475, 1476, 1478, 1479, 1480, 1524, 1525, 1536, 1542, 1552, 1563, 1564, 1565, 1600, 1601, 1611, 1632, 1648, 1649, 1750, 1758, 1759, 1769, 1770, 1774, 1807, 1808, 1809, 1810, 1840, 1867, 1958, 1969, 2027, 2038, 2042, 2043, 2045, 2046, 2070, 2094, 2137, 2140, 2184, 2185, 2192, 2194, 2200, 2208, 2249, 2307, 2362, 2363, 2364, 2365, 2369, 2377, 2381, 2382, 2385, 2392, 2402, 2404, 2417, 2418, 2433, 2434, 2492, 2493, 2497, 2501, 2509, 2510, 2530, 2532, 2558, 2559, 2561, 2563, 2620, 2621, 2625, 2627, 2631, 2633, 2635, 2638, 2641, 2642, 2672, 2674, 2677, 2678, 2689, 2691, 2748, 2749, 2753, 2758, 2759, 2761, 2765, 2766, 2786, 2788, 2810, 2816, 2817, 2818, 2876, 2877, 2879, 2880, 2881, 2885, 2893, 2894, 2901, 2903, 2914, 2916, 2946, 2947, 3008, 3009, 3021, 3022, 3072, 3073, 3076, 3077, 3132, 3133, 3134, 3137, 3142, 3145, 3146, 3150, 3157, 3159, 3170, 3172, 3201, 3202, 3260, 3261, 3263, 3264, 3270, 3271, 3276, 3278, 3298, 3300, 3328, 3330, 3387, 3389, 3393, 3397, 3405, 3406, 3426, 3428, 3457, 3458, 3530, 3531, 3538, 3541, 3542, 3543, 3633, 3634, 3636, 3643, 3654, 3663, 3761, 3762, 3764, 3773, 3782, 3783, 3784, 3791, 3864, 3866, 3893, 3894, 3895, 3896, 3897, 3898, 3953, 3967, 3968, 3973, 3974, 3976, 3981, 3992, 3993, 4029, 4038, 4039, 4141, 4145, 4146, 4152, 4153, 4155, 4157, 4159, 4184, 4186, 4190, 4193, 4209, 4213, 4226, 4227, 4229, 4231, 4237, 4238, 4253, 4254, 4256, 4294, 4295, 4296, 4301, 4302, 4304, 4347, 4348, 4349, 4352, 4957, 4960, 5024, 5110, 5112, 5118, 5906, 5909, 5938, 5940, 5970, 5972, 6002, 6004, 6068, 6070, 6071, 6078, 6086, 6087, 6089, 6100, 6103, 6104, 6109, 6110, 6155, 6160, 6211, 6212, 6277, 6279, 6313, 6314, 6432, 6435, 6439, 6441, 6450, 6451, 6457, 6460, 6679, 6681, 6683, 6684, 6742, 6743, 6744, 6751, 6752, 6753, 6754, 6755, 6757, 6765, 6771, 6781, 6783, 6784, 6823, 6824, 6832, 6863, 6912, 6916, 6964, 6965, 6966, 6971, 6972, 6973, 6978, 6979, 7019, 7028, 7040, 7042, 7074, 7078, 7080, 7082, 7083, 7086, 7142, 7143, 7144, 7146, 7149, 7150, 7151, 7154, 7212, 7220, 7222, 7224, 7288, 7294, 7296, 7305, 7312, 7355, 7357, 7360, 7376, 7379, 7380, 7393, 7394, 7401, 7405, 7406, 7412, 7413, 7416, 7418, 7424, 7468, 7531, 7544, 7545, 7579, 7616, 7680, 7958, 7960, 7966, 7968, 8006, 8008, 8014, 8016, 8024, 8025, 8026, 8027, 8028, 8029, 8030, 8031, 8062, 8064, 8117, 8118, 8125, 8126, 8127, 8130, 8133, 8134, 8141, 8144, 8148, 8150, 8156, 8157, 8160, 8173, 8176, 8178, 8181, 8182, 8189, 8191, 8203, 8208, 8216, 8218, 8228, 8229, 8231, 8232, 8234, 8239, 8288, 8293, 8294, 8304, 8305, 8306, 8319, 8320, 8336, 8349, 8400, 8433, 8450, 8451, 8455, 8456, 8458, 8468, 8469, 8470, 8473, 8478, 8484, 8485, 8486, 8487, 8488, 8489, 8490, 8494, 8495, 8501, 8505, 8506, 8508, 8512, 8517, 8522, 8526, 8527, 8544, 8576, 8579, 8581, 9398, 9450, 11264, 11388, 11390, 11493, 11499, 11503, 11506, 11508, 11520, 11558, 11559, 11560, 11565, 11566, 11631, 11632, 11647, 11648, 11744, 11776, 11823, 11824, 12293, 12294, 12330, 12334, 12337, 12342, 12347, 12348, 12441, 12447, 12540, 12543, 40981, 40982, 42232, 42238, 42508, 42509, 42560, 42606, 42607, 42611, 42612, 42622, 42623, 42624, 42652, 42654, 42656, 42736, 42738, 42752, 42786, 42864, 42865, 42888, 42891, 42895, 42896, 42955, 42960, 42962, 42963, 42964, 42965, 42970, 42994, 42997, 42999, 43000, 43002, 43003, 43010, 43011, 43014, 43015, 43019, 43020, 43045, 43047, 43052, 43053, 43204, 43206, 43232, 43250, 43263, 43264, 43302, 43310, 43335, 43346, 43392, 43395, 43443, 43444, 43446, 43450, 43452, 43454, 43471, 43472, 43493, 43495, 43561, 43567, 43569, 43571, 43573, 43575, 43587, 43588, 43596, 43597, 43632, 43633, 43644, 43645, 43696, 43697, 43698, 43701, 43703, 43705, 43710, 43712, 43713, 43714, 43741, 43742, 43756, 43758, 43763, 43765, 43766, 43767, 43824, 43867, 43868, 43872, 43881, 43882, 43884, 43888, 43968, 44005, 44006, 44008, 44009, 44013, 44014, 64256, 64263, 64275, 64280, 64286, 64287, 64434, 64451, 65024, 65040, 65043, 65044, 65056, 65072, 65106, 65107, 65109, 65110, 65279, 65280, 65287, 65288, 65294, 65295, 65306, 65307, 65313, 65339, 65342, 65343, 65344, 65345, 65371, 65392, 65393, 65438, 65440, 65507, 65508, 65529, 65532, 66045, 66046, 66272, 66273, 66422, 66427, 66560, 66640, 66736, 66772, 66776, 66812, 66928, 66939, 66940, 66955, 66956, 66963, 66964, 66966, 66967, 66978, 66979, 66994, 66995, 67002, 67003, 67005, 67456, 67457, 67459, 67462, 67463, 67505, 67506, 67515, 68097, 68100, 68101, 68103, 68108, 68112, 68152, 68155, 68159, 68160, 68325, 68327, 68736, 68787, 68800, 68851, 68900, 68904, 69291, 69293, 69373, 69376, 69446, 69457, 69506, 69510, 69633, 69634, 69688, 69703, 69744, 69745, 69747, 69749, 69759, 69762, 69811, 69815, 69817, 69819, 69821, 69822, 69826, 69827, 69837, 69838, 69888, 69891, 69927, 69932, 69933, 69941, 70003, 70004, 70016, 70018, 70070, 70079, 70089, 70093, 70095, 70096, 70191, 70194, 70196, 70197, 70198, 70200, 70206, 70207, 70209, 70210, 70367, 70368, 70371, 70379, 70400, 70402, 70459, 70461, 70464, 70465, 70502, 70509, 70512, 70517, 70712, 70720, 70722, 70725, 70726, 70727, 70750, 70751, 70835, 70841, 70842, 70843, 70847, 70849, 70850, 70852, 71090, 71094, 71100, 71102, 71103, 71105, 71132, 71134, 71219, 71227, 71229, 71230, 71231, 71233, 71339, 71340, 71341, 71342, 71344, 71350, 71351, 71352, 71453, 71456, 71458, 71462, 71463, 71468, 71727, 71736, 71737, 71739, 71840, 71904, 71995, 71997, 71998, 71999, 72003, 72004, 72148, 72152, 72154, 72156, 72160, 72161, 72193, 72203, 72243, 72249, 72251, 72255, 72263, 72264, 72273, 72279, 72281, 72284, 72330, 72343, 72344, 72346, 72752, 72759, 72760, 72766, 72767, 72768, 72850, 72872, 72874, 72881, 72882, 72884, 72885, 72887, 73009, 73015, 73018, 73019, 73020, 73022, 73023, 73030, 73031, 73032, 73104, 73106, 73109, 73110, 73111, 73112, 73459, 73461, 73472, 73474, 73526, 73531, 73536, 73537, 73538, 73539, 78896, 78913, 78919, 78934, 92912, 92917, 92976, 92983, 92992, 92996, 93760, 93824, 94031, 94032, 94095, 94112, 94176, 94178, 94179, 94181, 110576, 110580, 110581, 110588, 110589, 110591, 113821, 113823, 113824, 113828, 118528, 118574, 118576, 118599, 119143, 119146, 119155, 119171, 119173, 119180, 119210, 119214, 119362, 119365, 119808, 119893, 119894, 119965, 119966, 119968, 119970, 119971, 119973, 119975, 119977, 119981, 119982, 119994, 119995, 119996, 119997, 120004, 120005, 120070, 120071, 120075, 120077, 120085, 120086, 120093, 120094, 120122, 120123, 120127, 120128, 120133, 120134, 120135, 120138, 120145, 120146, 120486, 120488, 120513, 120514, 120539, 120540, 120571, 120572, 120597, 120598, 120629, 120630, 120655, 120656, 120687, 120688, 120713, 120714, 120745, 120746, 120771, 120772, 120780, 121344, 121399, 121403, 121453, 121461, 121462, 121476, 121477, 121499, 121504, 121505, 121520, 122624, 122634, 122635, 122655, 122661, 122667, 122880, 122887, 122888, 122905, 122907, 122914, 122915, 122917, 122918, 122923, 122928, 122990, 123023, 123024, 123184, 123198, 123566, 123567, 123628, 123632, 124139, 124144, 125136, 125143, 125184, 125252, 125260, 127280, 127306, 127312, 127338, 127344, 127370, 127995, 128000, 917505, 917506, 917536, 917632, 917760, 918000]
+pub let PYSTR_PROP_VALUES: [i64] = [0, 2, 0, 2, 0, 2, 0, 1, 0, 2, 0, 2, 1, 0, 2, 0, 1, 0, 2, 0, 2, 0, 2, 1, 0, 2, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 3, 2, 3, 2, 3, 2, 3, 2, 1, 2, 1, 0, 3, 1, 0, 1, 0, 2, 1, 2, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 2, 1, 0, 1, 0, 2, 0, 2, 1, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 1, 0, 1, 0, 1, 0, 1, 0, 3, 1, 0, 2, 0, 1, 0, 1, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 1, 0, 1, 0, 1, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 1, 3, 1, 3, 1, 3, 2, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 2, 1, 2, 1, 0, 1, 2, 1, 0, 1, 0, 2, 1, 2, 0, 1, 0, 1, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 3, 0, 3, 0, 3, 0, 2, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 3, 1, 0, 1, 2, 1, 0, 1, 0, 1, 0, 1, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 1, 0, 2, 0, 2, 0, 2, 1, 3, 2, 0, 2, 0, 2, 1, 3, 1, 2, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 3, 1, 0, 3, 1, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 1, 2, 3, 1, 3, 2, 0, 1, 0, 2, 0, 2, 0, 2, 0, 1, 0, 1, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 1, 0, 2, 0, 2, 1, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 3, 2, 3, 0, 3, 0, 3, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 1, 0, 1, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 1, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 1, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 1, 0, 1, 0, 1, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 3, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 1, 2, 0, 1, 0, 1, 0, 1, 0, 2, 0, 2, 0, 2, 0, 2, 0]

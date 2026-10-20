@@ -1,0 +1,4 @@
+[package]
+name = "rubycgi"
+version = "1.0.0"
+capabilities = []

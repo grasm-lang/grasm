@@ -1,0 +1,332 @@
+// The harness scripts/b57_diff.sh drives: each argument pair is an
+// operation and a file of cases, one per line; each answer is one line.
+import bigint
+import pycolorsys
+import pyhttpheaders
+import pymimetypes
+import pyliteral
+import pyreprlib
+import pyrobotparser
+import pystrptime
+import shortestfloat
+
+fn unhex_list(h: str) -> [i64] {
+    if h == "-" {
+        return []
+    }
+    var out: [i64] = []
+    let b = h.to_bytes()
+    var i = 0
+    while i + 1 < b.len() {
+        let hi = b.at(i)
+        let lo = b.at(i + 1)
+        out.push((if hi >= 97 { hi - 87 } else { hi - 48 }) * 16 + (if lo >= 97 { lo - 87 } else { lo - 48 }))
+        i = i + 2
+    }
+    return out
+}
+
+fn unhex(h: str) -> str {
+    return bytes_of(unhex_list(h)).to_str()
+}
+
+fn hex_bytes(b: bytes) -> str {
+    let digits = "0123456789abcdef"
+    let h = b.to_list().map(|x| digits.substr(x.ushr(4), 1) + digits.substr(x.bit_and(15), 1)).join("")
+    return if h.len() == 0 { "-" } else { h }
+}
+
+fn hex_text(t: str) -> str {
+    return hex_bytes(t.to_bytes())
+}
+
+fn hex_u64(h: str) -> i64 {
+    var v = 0
+    for c in h.codes() {
+        let d = if c >= 97 { c - 87 } else if c >= 65 { c - 55 } else { c - 48 }
+        v = v.shl(4).bit_or(d)
+    }
+    return v
+}
+
+fn bits_f64(h: str) -> f64 {
+    return hex_u64(h).from_bits()
+}
+
+fn cs_triple(t: (f64, f64, f64)) -> str {
+    return [shortestfloat.repr(t.0), shortestfloat.repr(t.1), shortestfloat.repr(t.2)].join(",")
+}
+
+fn cs_result(r: (f64, f64, f64) ! ColorsysError) -> str {
+    return match r {
+        Ok(t) -> cs_triple(t)
+        Err(e) -> "E:" + pycolorsys.error_class(e) + ":" + pycolorsys.error_text(e)
+    }
+}
+
+fn pycolorsys_line(f: [str]) -> str {
+    let a = bits_f64(f[1])
+    let b = bits_f64(f[2])
+    let c = bits_f64(f[3])
+    let op = f[0]
+    if op == "rgb_to_yiq" {
+        return cs_triple(pycolorsys.rgb_to_yiq(a, b, c))
+    }
+    if op == "yiq_to_rgb" {
+        return cs_triple(pycolorsys.yiq_to_rgb(a, b, c))
+    }
+    if op == "rgb_to_hls" {
+        return cs_result(pycolorsys.rgb_to_hls(a, b, c))
+    }
+    if op == "hls_to_rgb" {
+        return cs_triple(pycolorsys.hls_to_rgb(a, b, c))
+    }
+    if op == "rgb_to_hsv" {
+        return cs_result(pycolorsys.rgb_to_hsv(a, b, c))
+    }
+    return cs_result(pycolorsys.hsv_to_rgb(a, b, c))
+}
+
+fn mt_opt(v: Option[str]) -> str {
+    return match v {
+        Some(t) -> "s" + t
+        None -> "-"
+    }
+}
+
+fn mt_pair(p: (Option[str], Option[str])) -> str {
+    return mt_opt(p.0) + "|" + mt_opt(p.1)
+}
+
+fn pymimetypes_line(f: [str]) -> str {
+    let strict = f[1] == "1"
+    let arg = unhex(f[2])
+    let out = if f[0] == "T" {
+        match pymimetypes.guess_type(arg, strict) {
+            Ok(p) -> mt_pair(p)
+            Err(e) -> "E:ValueError:" + pymimetypes.error_text(e)
+        }
+    } else if f[0] == "F" {
+        mt_pair(pymimetypes.guess_file_type(arg, strict))
+    } else if f[0] == "A" {
+        "L" + pymimetypes.guess_all_extensions(arg, strict).join(",")
+    } else {
+        mt_opt(pymimetypes.guess_extension(arg, strict))
+    }
+    return hex_text(out)
+}
+
+fn rp_err(e: PyRobotError) -> str {
+    return "E:ValueError:" + pyrobotparser.error_text(e)
+}
+
+fn rp_fetch(p: PyRobotParser, ua: str, url: str) -> str {
+    return match pyrobotparser.can_fetch(p, ua, url) {
+        Ok(b) -> if b { "T" } else { "F" }
+        Err(e) -> rp_err(e)
+    }
+}
+
+fn pyrobotparser_line(f: [str]) -> str {
+    let p = match pyrobotparser.parse_text(unhex(f[0])) {
+        Ok(p) -> p
+        Err(e) -> return hex_text(rp_err(e))
+    }
+    var out = [pyrobotparser.to_str(p), match pyrobotparser.site_maps(p) {
+        Some(sm) -> "L" + sm.join("\n")
+        None -> "N"
+    }]
+    var k = 1
+    while k + 1 < f.len() {
+        let ua = unhex(f[k])
+        out.push(rp_fetch(p, ua, unhex(f[k + 1])))
+        out.push(match pyrobotparser.crawl_delay(p, ua) {
+            Some(d) -> bigint.to_str(d)
+            None -> "None"
+        })
+        out.push(match pyrobotparser.request_rate(p, ua) {
+            Some(r) -> bigint.to_str(r.0) + "/" + bigint.to_str(r.1)
+            None -> "N"
+        })
+        k = k + 2
+    }
+    return out.map(|x| hex_text(x)).join(",")
+}
+
+fn rl_indent(t: str) -> PyReprIndent {
+    if t == "N" {
+        return PyReprNoIndent
+    }
+    if t.starts_with("i") {
+        return PyReprIndentSpaces(t.substr(1, t.len() - 1).parse_int() ?? 0)
+    }
+    return PyReprIndentText(unhex(t.substr(1, t.len() - 1)))
+}
+
+fn pyreprlib_line(f: [str]) -> str {
+    let value = match pyliteral.literal_eval(unhex(f[0])) {
+        Ok(v) -> v
+        Err(_e) -> return hex_text("E:literal")
+    }
+    let n = f.slice(1, 9).map(|x| x.parse_int() ?? 0)
+    let o = PyReprOptions{ maxlevel: n[0], maxtuple: n[1], maxlist: n[2], maxdict: n[3], maxset: n[4], maxstring: n[5], maxlong: n[6], maxother: n[7],
+        fillvalue: unhex(f[9]), indent: rl_indent(f[10]) }
+    return hex_text(match pyreprlib.repr(o, value) {
+        Ok(t) -> t
+        Err(e) -> "E:ValueError:" + pyreprlib.error_text(e)
+    })
+}
+
+fn hh_err(e: PyHeaderError) -> str {
+    return "E:" + pyhttpheaders.error_class(e) + ":" + pyhttpheaders.error_text(e)
+}
+
+fn hh_val(v: PyHeaderValue) -> str {
+    return match v {
+        PyHeaderNone -> "N"
+        PyHeaderText(t) -> "s" + hex_text(t)
+        PyHeaderInt(n) -> "i" + n.to_str()
+        PyHeaderFloat(n) -> "f" + n.to_str()
+    }
+}
+
+fn hh_opt(v: Option[str]) -> PyHeaderValue {
+    return match v {
+        Some(t) -> PyHeaderText(t)
+        None -> PyHeaderNone
+    }
+}
+
+fn hh_words(lists: [[(str, PyHeaderValue)]]) -> str {
+    return lists.map(|pairs| pairs.map(|p| hex_text(p.0) + ":" + hh_val(p.1)).join(",")).join(";")
+}
+
+fn hh_pairs_arg(a: str) -> [[(str, Option[str])]] {
+    var lists: [[(str, Option[str])]] = []
+    if a == "-" {
+        return lists
+    }
+    for group in a.split("/") {
+        var pairs: [(str, Option[str])] = []
+        if group != "~" {
+            for p in group.split(",") {
+                let kv = p.split(":")
+                pairs.push((unhex(kv[0]), if kv[1] == "N" { None } else { Some(unhex(kv[1].substr(1, kv[1].len() - 1))) }))
+            }
+        }
+        lists.push(pairs)
+    }
+    return lists
+}
+
+fn hh_parse_date(op: str, year: i64, text: str) -> PyHeaderValue ! PyHeaderError {
+    if op == "H" {
+        return try pyhttpheaders.http2time(text, year)
+    }
+    return try pyhttpheaders.iso2time(text, year)
+}
+
+fn hh_date(op: str, year: i64, text: str) -> str {
+    return match hh_parse_date(op, year, text) {
+        Ok(v) -> hh_val(v)
+        Err(e) -> hh_err(e)
+    }
+}
+
+fn pyhttpheaders_line(f: [str]) -> str {
+    let op = f[0]
+    let rest = f.slice(1, f.len())
+    if op == "L" {
+        return pyhttpheaders.parse_http_list(unhex(rest[0])).map(|x| hex_text(x)).join(",")
+    }
+    if op == "K" {
+        return match pyhttpheaders.parse_keqv_list(rest.map(|x| unhex(x))) {
+            Ok(items) -> items.map(|kv| hex_text(kv.0) + ":" + hex_text(kv.1)).join(",")
+            Err(e) -> hh_err(e)
+        }
+    }
+    if op == "S" {
+        return hh_words(pyhttpheaders.split_header_words(rest.map(|x| unhex(x))).map(|pairs| pairs.map(|p| (p.0, hh_opt(p.1)))))
+    }
+    if op == "J" {
+        return hex_text(pyhttpheaders.join_header_words(hh_pairs_arg(rest[0])))
+    }
+    let year = rest[0].parse_int() ?? 2026
+    if op == "N" {
+        return match pyhttpheaders.parse_ns_headers(rest.slice(1, rest.len()).map(|x| unhex(x)), year) {
+            Ok(lists) -> hh_words(lists)
+            Err(e) -> hh_err(e)
+        }
+    }
+    return hh_date(op, year, unhex(rest[1]))
+}
+
+fn sp_opt_text(v: Option[str]) -> str {
+    return match v {
+        Some(t) -> "s" + t
+        None -> "N"
+    }
+}
+
+fn sp_opt_int(v: Option[i64]) -> str {
+    return match v {
+        Some(n) -> n.to_str()
+        None -> "N"
+    }
+}
+
+fn sp_err(e: PyStrptimeError) -> str {
+    return "E:" + pystrptime.error_class(e) + ":" + pystrptime.error_text(e)
+}
+
+fn pystrptime_line(f: [str]) -> str {
+    let data = unhex(f[1])
+    let format = unhex(f[2])
+    if f[0] == "T" {
+        return hex_text(match pystrptime.strptime_time(data, format) {
+            Ok(t) -> [t.year, t.month, t.day, t.hour, t.minute, t.second, t.weekday, t.yday, t.isdst].map(|x| x.to_str()).join(",") + "|" + sp_opt_text(t.zone) +
+            "|" + sp_opt_int(t.gmtoff)
+            Err(e) -> sp_err(e)
+        })
+    }
+    return hex_text(match pystrptime.strptime_datetime(data, format) {
+        Ok(d) -> [d.year, d.month, d.day, d.hour, d.minute, d.second, d.microsecond].map(|x| x.to_str()).join(",") + "|" + sp_opt_int(d.offset) + "|" +
+        sp_opt_text(d.tzname)
+        Err(e) -> sp_err(e)
+    })
+}
+
+fn main() / {io} {
+    let argv = args()
+    var i = 0
+    while i + 1 < argv.len() {
+        let op = argv[i]
+        let text = match read_bytes(argv[i + 1]) {
+            Ok(d) -> d.to_str()
+            Err(_e) -> ""
+        }
+        for l in text.split("\n").filter(|l| l.len() > 0) {
+            let parts = l.split(" ")
+            let rest = parts.slice(1, parts.len())
+            if op == "pymimetypes" {
+                print(pymimetypes_line(rest))
+            }
+            if op == "pyrobotparser" {
+                print(pyrobotparser_line(rest))
+            }
+            if op == "pyreprlib" {
+                print(pyreprlib_line(rest))
+            }
+            if op == "pyhttpheaders" {
+                print(pyhttpheaders_line(rest))
+            }
+            if op == "pystrptime" {
+                print(pystrptime_line(rest))
+            }
+            if op == "pycolorsys" {
+                print(pycolorsys_line(rest))
+            }
+        }
+        i = i + 2
+    }
+}

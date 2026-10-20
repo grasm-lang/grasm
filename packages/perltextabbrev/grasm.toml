@@ -1,0 +1,4 @@
+[package]
+name = "perltextabbrev"
+version = "1.0.0"
+capabilities = []

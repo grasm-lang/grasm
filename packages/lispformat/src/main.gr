@@ -1,0 +1,944 @@
+// Common Lisp's FORMAT for numbers, as SBCL 2.6.8 writes them: the
+// floating-point directives `~F`, `~E`, `~G` and `~$`, and the integer
+// directives `~D`, `~B`, `~O` and `~X`.
+//
+// Lisp programs write their reports, tables and logs with FORMAT, and the
+// numbers come out in SBCL's own way, not C's:
+//
+//   - **`~w,d,k,ovf,padF`** prints the shortest digits that read back when
+//     no `d` or `w` is given, rounds to `d` places by widening the
+//     rounding interval of Burger and Dybvig's algorithm (so a tie goes
+//     up: `~,2F` of 0.125 is `0.13`, and `~,0F` of 2.5 is `3.`), fits a
+//     width by trading fraction digits, drops the leading zero when that
+//     makes it fit, scales by `10^k`, and fills with `ovf` when it cannot.
+//   - **`~w,d,e,k,ovf,pad,markE`** puts `k` digits before the point and an
+//     exponent with the float's own marker (`e` for a single-float, `d`
+//     for a double-float, or `mark`), padded to `e` digits.
+//   - **`~G`** chooses between them as the standard says, with SBCL's
+//     defaults; **`~d,n,w,pad$`** writes money, `:` putting the sign
+//     before the padding.
+//   - Rationals given to the float directives are first made
+//     single-floats (correctly rounded; too large is an error), and
+//     infinities and NaNs print as SBCL prints them
+//     (`#.DOUBLE-FLOAT-POSITIVE-INFINITY`, `#<SINGLE-FLOAT quiet NaN>`).
+//   - **`~mincol,padchar,commachar,intervalD`** (and `B`, `O`, `X`): an
+//     integer goes to `lispnumbers`' `radix`, which groups, signs and pads
+//     as SBCL does; a non-integer argument is printed as by PRINC,
+//     unpadded -- ratios in the directive's base, floats in SBCL's free
+//     format (`1.0d7`, `1.5e-7`), infinities as `#.DOUBLE-FLOAT-...`.
+//   - Parameters may be integers, `'c` characters, `V` (from the
+//     arguments; NIL means the default) or `#` (the arguments left).
+//     Text, `~%` and `~~` are copied; a missing argument, a wrong
+//     modifier, too many parameters or a float that does not fit is an
+//     error, as in SBCL.
+//
+// Not covered: the other directives (`~A`, `~S`, `~R`, conditionals,
+// iteration, justification...) are refused, as are parameters of the
+// wrong type (a character where a number is needed): SBCL fails on those
+// at a point that depends on the path taken. Errors are reported without
+// SBCL's message text.
+//
+// Checked against `sbcl` 2.6.8 calling FORMAT with generated control
+// strings over integers, ratios, single-floats and double-floats.
+
+import bigint
+import lispnumbers
+
+/// A FORMAT argument.
+type LispArg =
+    | LispInteger(n: BigInt)
+    | LispRatio(num: BigInt, den: BigInt)
+    /// A single-float, by its 32 bits.
+    | LispSingle(bits: i64)
+    | LispDouble(x: f64)
+    | LispChar(c: str)
+    | LispNil
+
+/// FORMAT signalled an error, or was given what this does not do.
+type SbclFormatError = | SbclFormatFailed | SbclFormatRefused(why: str)
+
+/// A float taken apart: kind, sign, and `f × 2^e` with `p` digits.
+type LispFloat = { single: bool, negative: bool, f: i64, e: i64, inf: bool, nan: bool, trapping: bool }
+
+/// A parameter: absent, an integer, or a character.
+type LispParam = | LpNone | LpInt(v: i64) | LpChar(c: str)
+
+/// A parsed directive: its parameters (with `v` and `#` not yet read),
+/// modifiers and character.
+type LispDirective = { params: [str], colon: bool, atsign: bool, ch: str, end: i64 }
+
+// --- floats ------------------------------------------------------------------------------------------
+
+fn decode_double(x: f64) -> LispFloat {
+    let bits = x.to_bits()
+    let raw = bits.ushr(52).bit_and(2047)
+    let frac = bits.bit_and(4503599627370495)
+    var f = frac
+    var e = 0 - 1074
+    if raw != 0 {
+        f = frac + 4503599627370496
+        e = raw - 1075
+    }
+    return LispFloat{ single: false, negative: bits < 0, f: f, e: e, inf: raw == 2047 and frac == 0, nan: raw == 2047 and frac != 0, trapping: frac.bit_and(2251799813685248) == 0 }
+}
+
+fn decode_single(bits: i64) -> LispFloat {
+    let raw = bits.ushr(23).bit_and(255)
+    let frac = bits.bit_and(8388607)
+    var f = frac
+    var e = 0 - 149
+    if raw != 0 {
+        f = frac + 8388608
+        e = raw - 150
+    }
+    return LispFloat{ single: true, negative: bits.bit_and(2147483648) != 0, f: f, e: e, inf: raw == 255 and frac == 0, nan: raw == 255 and frac != 0, trapping: frac.bit_and(4194304) == 0 }
+}
+
+fn digits_of(x: LispFloat) -> i64 {
+    return if x.single { 24 } else { 53 }
+}
+
+fn is_zero(x: LispFloat) -> bool {
+    return x.f == 0 and not x.inf and not x.nan
+}
+
+fn big(v: i64) -> BigInt {
+    return bigint.from_i64(v)
+}
+
+fn pow_of(base: i64, n: i64) -> BigInt {
+    return bigint.pow(big(base), n)
+}
+
+fn badd(a: BigInt, b: BigInt) -> BigInt {
+    return bigint.add(a, b)
+}
+
+fn bmul(a: BigInt, b: BigInt) -> BigInt {
+    return bigint.mul(a, b)
+}
+
+fn bcmp(a: BigInt, b: BigInt) -> i64 {
+    return bigint.compare(a, b)
+}
+
+fn int_len(v: i64) -> i64 {
+    var n = 0
+    while v.ushr(n) != 0 {
+        n = n + 1
+    }
+    return n
+}
+
+/// The state of Burger and Dybvig's digit generation.
+type LispDragon = { r: BigInt, s: BigInt, mp: BigInt, mm: BigInt, high_ok: bool, low_ok: bool }
+
+fn dragon_start(x: LispFloat) -> (LispDragon, i64, i64) {
+    let p = digits_of(x)
+    var f = x.f
+    var e = x.e
+    if int_len(f) < p {
+        let shift = p - int_len(f)
+        f = f.shl(shift)
+        e = e - shift
+    }
+    let even = f.bit_and(1) == 0
+    let min_e = if x.single { 0 - 148 } else { 0 - 1073 }
+    let top = 1.shl(p - 1)
+    var d = LispDragon{ r: big(0), s: big(0), mp: big(0), mm: big(0), high_ok: even, low_ok: even }
+    if e >= 0 {
+        let be = pow_of(2, e)
+        d.mm = be
+        if f != top {
+            d.r = bmul(big(f), pow_of(2, e + 1))
+            d.s = big(2)
+            d.mp = be
+        } else {
+            d.mp = pow_of(2, e + 1)
+            d.r = bmul(big(f), pow_of(2, e + 2))
+            d.s = big(4)
+        }
+    } else if e == min_e or f != top {
+        d.r = big(f * 2)
+        d.s = pow_of(2, 1 - e)
+        d.mp = big(1)
+        d.mm = big(1)
+    } else {
+        d.r = big(f * 4)
+        d.s = pow_of(2, 2 - e)
+        d.mp = big(2)
+        d.mm = big(1)
+    }
+    return (d, e, p)
+}
+
+/// The digits from the state (the `generate` of the algorithm).
+fn generate(d0: LispDragon) -> str {
+    var d = d0
+    var out = ""
+    let ten = big(10)
+    while true {
+        let qr = bigint.divmod(bmul(d.r, ten), d.s) ?? (big(0), big(0))
+        let digit = bigint.to_i64(qr.0) ?? 0
+        d.r = qr.1
+        d.mp = bmul(d.mp, ten)
+        d.mm = bmul(d.mm, ten)
+        let low = bcmp(d.r, d.mm)
+        let tc1 = low < 0 or d.low_ok and low == 0
+        let high = bcmp(badd(d.r, d.mp), d.s)
+        let tc2 = high > 0 or d.high_ok and high == 0
+        if tc1 or tc2 {
+            var last = digit
+            if not tc1 and tc2 {
+                last = digit + 1
+            } else if tc1 and not tc2 {
+                last = digit
+            } else if bcmp(bmul(d.r, big(2)), d.s) < 0 {
+                last = digit
+            } else {
+                last = digit + 1
+            }
+            return out + last.to_str()
+        }
+        out = out + digit.to_str()
+    }
+    return out
+}
+
+/// The free-format exponent estimate, as SBCL computes it in doubles.
+fn estimate(e: i64, p: i64) -> i64 {
+    let x = (e + p - 1).as_f64() * 0.3010299956639812 - 0.00000000010000000133514320
+    let c = x.ceil()
+    return c.as_i64()
+}
+
+/// FLONUM-TO-DIGITS: the decimal exponent `k` (the value is
+/// `0.digits × 10^k`) and the digits; to the shortest that reads back,
+/// or down to `10^position` (relative to the first digit when
+/// `relative`).
+fn flonum_to_digits(x: LispFloat, position: Option[i64], relative: bool) -> (i64, str) {
+    if is_zero(x) {
+        return (0, "0")
+    }
+    let start = dragon_start(x)
+    var d = start.0
+    return match position {
+        Some(pos) -> scale_fixed(d, pos, relative)
+        None -> scale_free(d, start.1, start.2)
+    }
+}
+
+fn scale_free(d0: LispDragon, e: i64, p: i64) -> (i64, str) {
+    var d = d0
+    var k = estimate(e, p)
+    if k >= 0 {
+        d.s = bmul(d.s, pow_of(10, k))
+    } else {
+        let sc = pow_of(10, 0 - k)
+        d.r = bmul(d.r, sc)
+        d.mp = bmul(d.mp, sc)
+        d.mm = bmul(d.mm, sc)
+    }
+    let c = bcmp(badd(d.r, d.mp), d.s)
+    if c > 0 or d.high_ok and c == 0 {
+        k = k + 1
+        d.s = bmul(d.s, big(10))
+    }
+    return (k, generate(d))
+}
+
+/// The position version (`scale-p`): the rounding interval widened to half
+/// a unit at `10^position`, all in integers (everything is scaled by
+/// `2 × 10^-position` when the position is negative).
+fn scale_fixed(d0: LispDragon, position0: i64, relative: bool) -> (i64, str) {
+    var d = d0
+    var position = position0
+    if relative {
+        var k = 0
+        var l = big(1)
+        while bcmp(bmul(d.s, l), badd(d.r, d.mp)) < 0 {
+            k = k + 1
+            l = bmul(l, big(10))
+        }
+        let t = k - position
+        let below = if t >= 0 {
+            bcmp(badd(bmul(d.r, big(2)), bmul(d.s, pow_of(10, t))), bmul(bmul(d.s, l), big(2))) < 0
+        } else {
+            let u = pow_of(10, 0 - t)
+            bcmp(badd(bmul(bmul(d.r, big(2)), u), d.s), bmul(bmul(bmul(d.s, l), big(2)), u)) < 0
+        }
+        position = if below { k - position } else { k - position - 1 }
+    }
+    let factor = bmul(big(2), pow_of(10, if position < 0 { 0 - position } else { 0 }))
+    let x = bmul(d.s, pow_of(10, if position > 0 { position } else { 0 }))
+    d.r = bmul(d.r, factor)
+    d.s = bmul(d.s, factor)
+    d.mp = bmul(d.mp, factor)
+    d.mm = bmul(d.mm, factor)
+    if bcmp(d.mm, x) < 0 {
+        d.mm = x
+    }
+    if bcmp(d.mp, x) < 0 {
+        d.mp = x
+    }
+    d.low_ok = true
+    d.high_ok = true
+    var k = 0
+    let rmp = badd(d.r, d.mp)
+    while bcmp(rmp, d.s) >= 0 {
+        k = k + 1
+        d.s = bmul(d.s, big(10))
+    }
+    while bcmp(d.r, d.mm) > 0 and bcmp(bmul(badd(d.r, d.mp), big(10)), d.s) < 0 {
+        k = k - 1
+        d.r = bmul(d.r, big(10))
+        d.mp = bmul(d.mp, big(10))
+        d.mm = bmul(d.mm, big(10))
+    }
+    return (k, generate(d))
+}
+
+fn flonum_exponent(x: LispFloat) -> i64 {
+    if is_zero(x) {
+        return 1
+    }
+    return flonum_to_digits(x, None, false).0
+}
+
+/// FLONUM-TO-STRING's answer: the text, whether it starts or ends with
+/// the point, and where the point is.
+type LispFlonum = { text: str, lpoint: bool, tpoint: bool, point: i64 }
+
+fn opt_or(v: Option[i64], d: i64) -> i64 {
+    return v ?? d
+}
+
+fn flonum_to_string(x: LispFloat, width: Option[i64], fdigits: Option[i64], scale: Option[i64], fmin: Option[i64], ezero: Option[i64]) -> LispFlonum {
+    let sc = opt_or(scale, 0)
+    var found = (0, "")
+    match fdigits {
+        Some(fd) -> found = flonum_to_digits(x, Some((0 - (fd + sc)).min(0 - opt_or(fmin, 0)) + opt_or(ezero, 0)), false)
+        None -> {
+            let w = opt_or(width, 0)
+            if width.is_some() and w > 1 {
+                let a = flonum_to_digits(x, Some((w - 1 + (if sc < 0 { sc } else { 0 })).max(1)), true)
+                let b = flonum_to_digits(x, Some(0 - (opt_or(fmin, 0) + sc)), false)
+                found = if a.1.len() >= b.1.len() { a } else { b }
+            } else {
+                found = flonum_to_digits(x, None, false)
+            }
+        }
+    }
+    var e = found.0
+    let digits = found.1
+    if ezero.is_some() {
+        e = if is_zero(x) { 0 } else { e - opt_or(ezero, 0) }
+    }
+    if not is_zero(x) {
+        e = e + sc
+    }
+    let n = digits.len()
+    var out = ""
+    if e == 0 and ezero.is_some() or e > 0 {
+        let cut = n.min(e)
+        out = digits.substr(0, cut) + "0".repeat((e - n).max(0)) + "." + digits.substr(cut, n - cut)
+        match fdigits {
+            Some(fd) -> out = out + "0".repeat((fd - (n - cut)).max(0))
+            None -> {}
+        }
+    } else {
+        let end = match fdigits {
+            Some(fd) -> n.min(opt_or(fmin, 0).max(fd + e))
+            None -> n
+        }
+        out = "." + "0".repeat((0 - e).max(0)) + digits.substr(0, end)
+        match fdigits {
+            Some(fd) -> out = out + "0".repeat((fd + e - n).max(0))
+            None -> {}
+        }
+    }
+    return LispFlonum{ text: out, lpoint: out.starts_with("."), tpoint: out.ends_with("."), point: out.index_of(".") ?? 0 }
+}
+
+// --- rationals made single-floats ---------------------------------------------------------------
+
+fn bit_length(n: BigInt) -> i64 {
+    return bigint.bit_length(n)
+}
+
+/// `(coerce q 'single-float)` for `num/den` (den > 0), correctly rounded;
+/// None when it overflows.
+fn rational_to_single(num0: BigInt, den: BigInt) -> Option[i64] {
+    let negative = bigint.sign(num0) < 0
+    let num = if negative { bigint.negate(num0) } else { num0 }
+    if bigint.is_zero(num) {
+        return Some(0)
+    }
+    // 2^e2 <= num/den < 2^(e2+1).
+    var e2 = bit_length(num) - bit_length(den)
+    let lhs = if e2 >= 0 { num } else { bmul(num, pow_of(2, 0 - e2)) }
+    let rhs = if e2 >= 0 { bmul(den, pow_of(2, e2)) } else { den }
+    if bcmp(lhs, rhs) < 0 {
+        e2 = e2 - 1
+    }
+    let s = (e2 - 23).max(0 - 149)
+    let top = if s < 0 { bmul(num, pow_of(2, 0 - s)) } else { num }
+    let bottom = if s > 0 { bmul(den, pow_of(2, s)) } else { den }
+    let qr = bigint.divmod(top, bottom) ?? (big(0), big(0))
+    var m = bigint.to_i64(qr.0) ?? 0
+    let twice = bcmp(bmul(qr.1, big(2)), bottom)
+    if twice > 0 or twice == 0 and m.bit_and(1) == 1 {
+        m = m + 1
+    }
+    var exp = s
+    if m >= 16777216 {
+        m = m.shr(1)
+        exp = exp + 1
+    }
+    let sign = if negative { 2147483648 } else { 0 }
+    if m < 8388608 {
+        return Some(sign + m)
+    }
+    let raw = exp + 150
+    if raw >= 255 {
+        return None
+    }
+    return Some(sign + raw.shl(23) + m - 8388608)
+}
+
+/// The float a float directive prints for an argument: None for a
+/// non-number (printed as by PRINC instead).
+fn as_float(a: LispArg) -> Option[LispFloat] ! SbclFormatError {
+    let bits = match a {
+        LispSingle(b) -> return Some(decode_single(b))
+        LispDouble(x) -> return Some(decode_double(x))
+        LispInteger(n) -> rational_to_single(n, big(1))
+        LispRatio(n, d) -> rational_to_single(n, d)
+        _ -> return None
+    }
+    return match bits {
+        Some(b) -> Some(decode_single(b))
+        None -> fail(SbclFormatFailed)
+    }
+}
+
+fn negate_float(x: LispFloat) -> LispFloat {
+    var y = x
+    y.negative = false
+    return y
+}
+
+// --- printing as PRIN1 and PRINC do ---------------------------------------------------------
+
+fn infnan_text(x: LispFloat) -> str {
+    let kind = if x.single { "SINGLE-FLOAT" } else { "DOUBLE-FLOAT" }
+    if x.nan {
+        return "#<" + kind + (if x.trapping { " trapping" } else { " quiet" }) + " NaN>"
+    }
+    return "#." + kind + (if x.negative { "-NEGATIVE-INFINITY" } else { "-POSITIVE-INFINITY" })
+}
+
+fn exponent_text(x: LispFloat, exp: i64) -> str {
+    if x.single {
+        return if exp != 0 { "e" + exp.to_str() } else { "" }
+    }
+    return "d" + exp.to_str()
+}
+
+/// A float as PRINC writes it (SBCL's free format).
+fn print_float(x: LispFloat) -> str {
+    if x.inf or x.nan {
+        return infnan_text(x)
+    }
+    let sign = if x.negative { "-" } else { "" }
+    if is_zero(x) {
+        return sign + "0.0" + exponent_text(x, 0)
+    }
+    let found = flonum_to_digits(negate_float(x), None, false)
+    let k = found.0
+    let digits = found.1
+    var out = sign
+    var dot = 0
+    if not (0 - 3 < k and k < 8) {
+        dot = 1
+    } else if k > 0 {
+        dot = k
+    } else {
+        dot = 0 - 1
+        out = out + "0." + "0".repeat(0 - k)
+    }
+    var i = 0
+    for d in digits.chars() {
+        if i == dot {
+            out = out + "."
+        }
+        out = out + d
+        i = i + 1
+    }
+    if i <= dot {
+        out = out + "0".repeat(dot - i) + ".0"
+    }
+    return out + exponent_text(x, if 0 - 3 < k and k < 8 { 0 } else { k - 1 })
+}
+
+/// An integer in `base` as PRINC writes it: lispnumbers' `radix` with no
+/// padding or grouping.
+fn integer_text(n: BigInt, base: i64) -> str {
+    return lispnumbers.radix(n, base, 0, " ", ",", 3, false, false)
+}
+
+/// PRINC of an argument with `*print-base*` bound to `base`.
+fn princ(a: LispArg, base: i64) -> str {
+    return match a {
+        LispInteger(n) -> integer_text(n, base)
+        LispRatio(n, d) -> integer_text(n, base) + "/" + integer_text(d, base)
+        LispSingle(b) -> print_float(decode_single(b))
+        LispDouble(x) -> print_float(decode_double(x))
+        LispChar(c) -> c
+        LispNil -> "NIL"
+    }
+}
+
+/// FORMAT-WRITE-FIELD with colinc 1 and minpad 0.
+fn write_field(text: str, mincol: i64, pad: str, padleft: bool) -> str ! SbclFormatError {
+    if mincol < 0 {
+        fail(SbclFormatFailed)
+    }
+    let fill = pad.repeat((mincol - text.len()).max(0))
+    return if padleft { fill + text } else { text + fill }
+}
+
+// --- the float directives ---------------------------------------------------------------------
+
+fn sign_text(x: LispFloat, atsign: bool) -> str {
+    return if x.negative { "-" } else if atsign { "+" } else { "" }
+}
+
+/// FORMAT-FIXED-AUX: the text, and whether it overflowed.
+fn fixed_aux(x: LispFloat, w: Option[i64], d: Option[i64], k: Option[i64], ovf: Option[str], pad: str, atsign: bool) -> (str, bool) {
+    if x.inf or x.nan {
+        return (infnan_text(x), false)
+    }
+    var space = w
+    if w.is_some() and (atsign or x.negative) {
+        space = Some(opt_or(w, 0) - 1)
+    }
+    let fl = flonum_to_string(negate_float(x), space, d, k, None, None)
+    var lpoint = fl.lpoint
+    var tpoint = fl.tpoint
+    if d == Some(0) {
+        tpoint = false
+    }
+    var left = opt_or(space, 0) - fl.text.len()
+    if w.is_some() {
+        if lpoint {
+            if left > 0 or tpoint {
+                left = left - 1
+            } else {
+                lpoint = false
+            }
+        }
+        if tpoint {
+            if left > 0 {
+                left = left - 1
+            } else {
+                tpoint = false
+            }
+        }
+    }
+    match ovf {
+        Some(o) -> if w.is_some() and left < 0 {
+            return (o.repeat(opt_or(w, 0).max(0)), true)
+        }
+        None -> {}
+    }
+    let lead = if w.is_some() { pad.repeat(left.max(0)) } else { "" }
+    return (lead + sign_text(x, atsign) + (if lpoint { "0" } else { "" }) + fl.text + (if tpoint { "0" } else { "" }), false)
+}
+
+fn exponent_marker(x: LispFloat, mark: Option[str]) -> str {
+    return mark ?? (if x.single { "e" } else { "d" })
+}
+
+/// FORMAT-EXP-AUX.
+fn exp_aux(x: LispFloat, w: Option[i64], d: Option[i64], e: Option[i64], k: i64, ovf: Option[str], pad: str, mark: Option[str], atsign: bool) -> str {
+    if x.inf or x.nan {
+        return infnan_text(x)
+    }
+    let num = negate_float(x)
+    let num_expt = flonum_exponent(num)
+    let expt = num_expt - k
+    let estr = expt.abs().to_str()
+    let elen = match e {
+        Some(v) -> estr.len().max(v)
+        None -> estr.len()
+    }
+    var space: Option[i64] = None
+    if w.is_some() {
+        space = Some(opt_or(w, 0) - 2 - elen - (if atsign or x.negative { 1 } else { 0 }))
+    }
+    if w.is_some() and ovf.is_some() and e.is_some() and elen > opt_or(e, 0) {
+        return (ovf ?? " ").repeat(opt_or(w, 0).max(0))
+    }
+    let fdig = match d {
+        Some(v) -> Some(if k > 0 { v - k + 1 } else { v })
+        None -> None
+    }
+    let fmin = if k < 0 { Some(1) } else { fdig }
+    let fl = flonum_to_string(num, space, fdig, Some(k), fmin, Some(num_expt))
+    var lpoint = fl.lpoint
+    var tpoint = fl.tpoint
+    if fdig == Some(0) {
+        tpoint = false
+    }
+    var left = opt_or(space, 0) - fl.text.len()
+    if w.is_some() {
+        if lpoint {
+            if left > 0 or tpoint {
+                left = left - 1
+            } else {
+                lpoint = false
+            }
+        }
+        if tpoint {
+            if left <= 0 {
+                tpoint = false
+            } else {
+                left = left - 1
+            }
+        }
+    }
+    if w.is_some() and left < 0 and ovf.is_some() {
+        return (ovf ?? " ").repeat(opt_or(w, 0).max(0))
+    }
+    let lead = if w.is_some() { pad.repeat(left.max(0)) } else { "" }
+    let zeros = match e {
+        Some(v) -> "0".repeat((v - estr.len()).max(0))
+        None -> ""
+    }
+    return lead + sign_text(x, atsign) + (if lpoint { "0" } else { "" }) + fl.text + (if tpoint { "0" } else { "" }) + exponent_marker(x, mark) + (if expt < 0 { "-" } else { "+" }) + zeros + estr
+}
+
+/// FORMAT-GENERAL-AUX.
+fn general_aux(x: LispFloat, w: Option[i64], d0: Option[i64], e: Option[i64], k: Option[i64], ovf: Option[str], pad: str, mark: Option[str], atsign: bool) -> str {
+    if x.inf or x.nan {
+        return infnan_text(x)
+    }
+    let a = negate_float(x)
+    let n = flonum_exponent(a)
+    var d = 0
+    match d0 {
+        Some(v) -> d = v
+        None -> {
+            let len = flonum_to_string(a, None, None, None, None, None).text.len()
+            let q = if len == 1 { 1 } else { len - 1 }
+            d = q.max(n.min(7))
+        }
+    }
+    let ee = match e {
+        Some(v) -> v + 2
+        None -> 4
+    }
+    let ww = match w {
+        Some(v) -> Some(v - ee)
+        None -> None
+    }
+    let dd = d - n
+    if 0 <= dd and dd <= d {
+        let r = fixed_aux(x, ww, Some(dd), None, ovf, pad, atsign)
+        let fill = if r.1 { ovf ?? " " } else { " " }
+        return r.0 + fill.repeat(ee.max(0))
+    }
+    return exp_aux(x, w, Some(d), e, k ?? 1, ovf, pad, mark, atsign)
+}
+
+/// FORMAT-DOLLARS.
+fn dollars(a: LispArg, d: i64, n: i64, w: i64, pad: str, colon: bool, atsign: bool) -> str ! SbclFormatError {
+    let x = match try as_float(a) {
+        Some(f) -> f
+        None -> return try write_field(princ(a, 10), w, " ", true)
+    }
+    if x.inf or x.nan {
+        fail(SbclFormatFailed)
+    }
+    let sign = sign_text(x, atsign)
+    let fl = flonum_to_string(negate_float(x), None, Some(d), None, None, None)
+    let fill = pad.repeat((w - sign.len() - n.max(fl.point) - 1 - d).max(0))
+    let body = "0".repeat((n - fl.point).max(0)) + fl.text
+    return if colon { sign + fill + body } else { fill + sign + body }
+}
+
+// --- control strings -------------------------------------------------------------------------------
+
+fn is_digit_char(c: str) -> bool {
+    return c >= "0" and c <= "9" and c.len() == 1
+}
+
+/// PARSE-INTEGER with junk allowed, from `at`: the value (if there were
+/// digits) and where it stopped.
+fn parse_int_at(cs: [str], at: i64) -> (Option[str], i64) {
+    var i = at
+    if i < cs.len() and (cs[i] == "+" or cs[i] == "-") {
+        i = i + 1
+    }
+    let d = i
+    while i < cs.len() and is_digit_char(cs[i]) {
+        i = i + 1
+    }
+    if i == d {
+        return (None, at + 1)
+    }
+    return (Some(cs.slice(at, i).join("")), i)
+}
+
+fn at_char(cs: [str], i: i64) -> str ! SbclFormatError {
+    if i >= cs.len() {
+        fail(SbclFormatFailed)
+    }
+    return cs[i]
+}
+
+/// PARSE-DIRECTIVE from the `~` at `start`. A parameter is kept as
+/// written: `` (absent), an integer, `v`, `#`, or `'` and a character.
+fn parse_directive(cs: [str], start: i64) -> LispDirective ! SbclFormatError {
+    var posn = start + 1
+    var params: [str] = []
+    var colon = false
+    var atsign = false
+    while true {
+        let c = try at_char(cs, posn)
+        let param_start = is_digit_char(c) or c == "+" or c == "-" or c == "v" or c == "V" or c == "#" or c == "'" or c == ","
+        if param_start and (colon or atsign) {
+            fail(SbclFormatFailed)
+        }
+        if is_digit_char(c) or c == "+" or c == "-" or c == "v" or c == "V" or c == "#" {
+            var token = c.to_lower()
+            if c != "v" and c != "V" and c != "#" {
+                let p = parse_int_at(cs, posn)
+                token = p.0 ?? ""
+                posn = p.1
+            } else {
+                posn = posn + 1
+            }
+            params.push(token)
+            let next = try at_char(cs, posn)
+            if next == ":" or next == "@" {
+                posn = posn - 1
+            } else if next != "," {
+                break
+            }
+        } else if c == "'" {
+            posn = posn + 1
+            params.push("'" + (try at_char(cs, posn)))
+            posn = posn + 1
+            if (try at_char(cs, posn)) != "," {
+                posn = posn - 1
+            }
+        } else if c == "," {
+            params.push("")
+        } else if c == ":" {
+            if colon {
+                fail(SbclFormatFailed)
+            }
+            colon = true
+        } else if c == "@" {
+            if atsign {
+                fail(SbclFormatFailed)
+            }
+            atsign = true
+        } else {
+            if cs[posn - 1] == "," and (posn < 2 or cs[posn - 2] != "'") {
+                if colon or atsign {
+                    fail(SbclFormatFailed)
+                }
+                params.push("")
+            }
+            break
+        }
+        posn = posn + 1
+    }
+    let ch = try at_char(cs, posn)
+    return LispDirective{ params: params, colon: colon, atsign: atsign, ch: ch.to_upper(), end: posn + 1 }
+}
+
+/// Binding the parameters: each one read (from the arguments for `V`),
+/// absent ones left absent for their defaults.
+fn bind_params(d: LispDirective, count: i64, inout args: [LispArg]) -> [LispParam] ! SbclFormatError {
+    if d.params.len() > count {
+        // SBCL binds the ones it knows first; V parameters among them read
+        // their arguments, then it complains.
+        let _x = try read_params(d.params.slice(0, count), args)
+        fail(SbclFormatFailed)
+    }
+    var out = try read_params(d.params, args)
+    while out.len() < count {
+        out.push(LpNone)
+    }
+    return out
+}
+
+fn read_params(ps: [str], inout args: [LispArg]) -> [LispParam] ! SbclFormatError {
+    var out: [LispParam] = []
+    for p in ps {
+        if p == "" {
+            out.push(LpNone)
+        } else if p == "#" {
+            out.push(LpInt(args.len()))
+        } else if p == "v" {
+            if args.len() == 0 {
+                fail(SbclFormatFailed)
+            }
+            let a = args.remove(0)
+            out.push(match a {
+                LispInteger(n) -> match bigint.to_i64(n) {
+                    Some(v) -> LpInt(v)
+                    None -> fail(SbclFormatRefused("a parameter too large"))
+                }
+                LispChar(c) -> LpChar(c)
+                LispNil -> LpNone
+                _ -> fail(SbclFormatRefused("a parameter that is not an integer or a character"))
+            })
+        } else if p.starts_with("'") {
+            out.push(LpChar(p.substr(1, p.len() - 1)))
+        } else {
+            out.push(match p.parse_int() {
+                Some(v) -> LpInt(v)
+                None -> fail(SbclFormatRefused("a parameter too large"))
+            })
+        }
+    }
+    return out
+}
+
+fn int_param(p: LispParam) -> Option[i64] ! SbclFormatError {
+    return match p {
+        LpNone -> None
+        LpInt(v) -> Some(v)
+        LpChar(_c) -> fail(SbclFormatRefused("a character where a number is needed"))
+    }
+}
+
+fn int_or(p: LispParam, d: i64) -> i64 ! SbclFormatError {
+    return (try int_param(p)) ?? d
+}
+
+fn char_param(p: LispParam) -> Option[str] ! SbclFormatError {
+    return match p {
+        LpNone -> None
+        LpChar(c) -> Some(c)
+        LpInt(_v) -> fail(SbclFormatRefused("a number where a character is needed"))
+    }
+}
+
+fn next_arg(inout args: [LispArg]) -> LispArg ! SbclFormatError {
+    if args.len() == 0 {
+        fail(SbclFormatFailed)
+    }
+    return args.remove(0)
+}
+
+fn fixed_directive(d: LispDirective, inout args: [LispArg]) -> str ! SbclFormatError {
+    if d.colon {
+        fail(SbclFormatFailed)
+    }
+    let ps = try bind_params(d, 5, args)
+    let w = try int_param(ps[0])
+    let a = try next_arg(args)
+    let pad = (try char_param(ps[4])) ?? " "
+    return match try as_float(a) {
+        Some(x) -> fixed_aux(x, w, try int_param(ps[1]), try int_param(ps[2]), try char_param(ps[3]), pad, d.atsign).0
+        None -> try write_field(princ(a, 10), w ?? 0, pad, false)
+    }
+}
+
+fn exp_directive(d: LispDirective, inout args: [LispArg]) -> str ! SbclFormatError {
+    if d.colon {
+        fail(SbclFormatFailed)
+    }
+    let ps = try bind_params(d, 7, args)
+    let w = try int_param(ps[0])
+    let a = try next_arg(args)
+    let pad = (try char_param(ps[5])) ?? " "
+    let general = d.ch == "G"
+    return match try as_float(a) {
+        Some(x) -> if general {
+            general_aux(x, w, try int_param(ps[1]), try int_param(ps[2]), try int_param(ps[3]), try char_param(ps[4]), pad, try char_param(ps[6]), d.atsign)
+        } else {
+            exp_aux(x, w, try int_param(ps[1]), try int_param(ps[2]), try int_or(ps[3], 1), try char_param(ps[4]), pad, try char_param(ps[6]), d.atsign)
+        }
+        None -> try write_field(princ(a, 10), w ?? 0, pad, false)
+    }
+}
+
+fn dollar_directive(d: LispDirective, inout args: [LispArg]) -> str ! SbclFormatError {
+    let ps = try bind_params(d, 4, args)
+    let a = try next_arg(args)
+    return try dollars(a, try int_or(ps[0], 2), try int_or(ps[1], 1), try int_or(ps[2], 0), (try char_param(ps[3])) ?? " ", d.colon, d.atsign)
+}
+
+fn integer_directive(d: LispDirective, inout args: [LispArg]) -> str ! SbclFormatError {
+    let base = if d.ch == "D" { 10 } else if d.ch == "B" { 2 } else if d.ch == "O" { 8 } else { 16 }
+    if not (d.colon or d.atsign or d.params.len() > 0) {
+        return princ(try next_arg(args), base)
+    }
+    let ps = try bind_params(d, 4, args)
+    let a = try next_arg(args)
+    let n = match a {
+        LispInteger(v) -> v
+        _ -> return princ(a, base)
+    }
+    let mincol = try int_or(ps[0], 0)
+    let pad = (try char_param(ps[1])) ?? " "
+    let comma = (try char_param(ps[2])) ?? ","
+    let interval = try int_or(ps[3], 3)
+    if d.colon and interval <= 0 {
+        fail(SbclFormatRefused("a comma interval below 1"))
+    }
+    if mincol < 0 {
+        // FORMAT-WRITE-FIELD refuses a negative mincol.
+        fail(SbclFormatFailed)
+    }
+    return lispnumbers.radix(n, base, mincol, pad, comma, interval, d.colon, d.atsign)
+}
+
+fn repeat_directive(d: LispDirective, text: str, inout args: [LispArg]) -> str ! SbclFormatError {
+    if d.colon or d.atsign {
+        fail(SbclFormatFailed)
+    }
+    let ps = try bind_params(d, 1, args)
+    return text.repeat((try int_or(ps[0], 1)).max(0))
+}
+
+/// `(format nil control args...)` for the directives above.
+pub fn format(control: str, args0: [LispArg]) -> str ! SbclFormatError {
+    let cs = control.chars()
+    var args = args0
+    var out = ""
+    var i = 0
+    while i < cs.len() {
+        if cs[i] != "~" {
+            out = out + cs[i]
+            i = i + 1
+            continue
+        }
+        let d = try parse_directive(cs, i)
+        let c = d.ch
+        if c == "F" {
+            out = out + (try fixed_directive(d, args))
+        } else if c == "E" or c == "G" {
+            out = out + (try exp_directive(d, args))
+        } else if c == "$" {
+            out = out + (try dollar_directive(d, args))
+        } else if c == "D" or c == "B" or c == "O" or c == "X" {
+            out = out + (try integer_directive(d, args))
+        } else if c == "%" {
+            out = out + (try repeat_directive(d, "\n", args))
+        } else if c == "~" {
+            out = out + (try repeat_directive(d, "~", args))
+        } else {
+            fail(SbclFormatRefused("the directive ~" + c + " is not supported"))
+        }
+        i = d.end
+    }
+    return out
+}

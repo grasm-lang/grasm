@@ -1,0 +1,631 @@
+// The harness scripts/b59_diff.sh drives: each argument pair is an
+// operation and a file of cases, one per line; each answer is one line.
+import bigint
+import gostrconv
+import jsuri
+import jsdate
+import nodelegacyurl
+import querystring
+import jsstringmethods
+import rubyabbrev
+import rubyformat
+import rubyinteger
+import rubyjson
+import rubystrftime
+import rubyuri
+
+fn unhex_list(h: str) -> [i64] {
+    if h == "-" {
+        return []
+    }
+    var out: [i64] = []
+    let b = h.to_bytes()
+    var i = 0
+    while i + 1 < b.len() {
+        let hi = b.at(i)
+        let lo = b.at(i + 1)
+        out.push((if hi >= 97 { hi - 87 } else { hi - 48 }) * 16 + (if lo >= 97 { lo - 87 } else { lo - 48 }))
+        i = i + 2
+    }
+    return out
+}
+
+fn unhex(h: str) -> str {
+    return bytes_of(unhex_list(h)).to_str()
+}
+
+fn hex_bytes(b: bytes) -> str {
+    let digits = "0123456789abcdef"
+    let h = b.to_list().map(|x| digits.substr(x.ushr(4), 1) + digits.substr(x.bit_and(15), 1)).join("")
+    return if h.len() == 0 { "-" } else { h }
+}
+
+fn hex_text(t: str) -> str {
+    return hex_bytes(t.to_bytes())
+}
+
+fn rubyabbrev_line(f: [str]) -> str {
+    let pattern = if f[0] == "~" { None } else { Some(unhex(f[0])) }
+    let t = rubyabbrev.abbrev(f.slice(1, f.len()).map(|w| unhex(w)), pattern)
+    return if t.len() == 0 { "~" } else { t.map(|kv| hex_text(kv.0) + "=" + hex_text(kv.1)).join(",") }
+}
+
+fn rb_big(t: str) -> BigInt {
+    return bigint.parse(t) ?? bigint.zero()
+}
+
+fn ri_err(e: RbIntegerError) -> str {
+    return "E:" + rubyinteger.error_class(e) + ":" + hex_text(rubyinteger.error_message(e))
+}
+
+fn ri_num(r: BigInt ! RbIntegerError) -> str {
+    return match r {
+        Ok(n) -> bigint.to_str(n)
+        Err(e) -> ri_err(e)
+    }
+}
+
+fn ri_divmod(a: BigInt, b: BigInt) -> str ! RbIntegerError {
+    let (q, r) = try rubyinteger.divmod(a, b)
+    let m = try rubyinteger.remainder(a, b)
+    return bigint.to_str(q) + " " + bigint.to_str(r) + " " + bigint.to_str(m)
+}
+
+fn ri_digits(a: BigInt, base: str) -> str {
+    return match rubyinteger.digits(a, if base == "~" { bigint.from_i64(10) } else { rb_big(base) }) {
+        Ok(ds) -> ds.map(|d| bigint.to_str(d)).join(",")
+        Err(e) -> ri_err(e)
+    }
+}
+
+fn rubyinteger_line(f: [str]) -> str {
+    let op = f[0]
+    let a = rb_big(f[1])
+    if op == "ts" {
+        return match rubyinteger.to_s(a, f[2].parse_int() ?? 0) {
+            Ok(t) -> t
+            Err(e) -> ri_err(e)
+        }
+    }
+    if op == "dg" {
+        return ri_digits(a, f[2])
+    }
+    if op == "sq" {
+        return ri_num(rubyinteger.isqrt(a))
+    }
+    if op == "pm" {
+        return ri_num(rubyinteger.pow_mod(a, rb_big(f[2]), rb_big(f[3])))
+    }
+    if op == "bl" {
+        return rubyinteger.bit_length(a).to_str()
+    }
+    if op == "gl" {
+        let b = rb_big(f[2])
+        return bigint.to_str(rubyinteger.gcd(a, b)) + " " + bigint.to_str(rubyinteger.lcm(a, b))
+    }
+    let nd = f[2].parse_int() ?? 0
+    if op == "rd" {
+        return ri_num(rubyinteger.round(a, nd, if f[3] == "~" { None } else { Some(unhex(f[3])) }))
+    }
+    if op == "fl" {
+        return ri_num(rubyinteger.floor(a, nd))
+    }
+    if op == "ce" {
+        return ri_num(rubyinteger.ceil(a, nd))
+    }
+    if op == "tr" {
+        return ri_num(rubyinteger.truncate(a, nd))
+    }
+    if op == "ba" {
+        return rubyinteger.bit_at(a, rb_big(f[2])).to_str()
+    }
+    return match ri_divmod(a, rb_big(f[2])) {
+        Ok(t) -> t
+        Err(e) -> ri_err(e)
+    }
+}
+
+fn hex_digit(c: i64) -> i64 {
+    return if c >= 97 { c - 87 } else if c >= 65 { c - 55 } else { c - 48 }
+}
+
+/// Four hex digits per UTF-16 unit, '-' for none.
+fn js_units(h: str) -> [i64] {
+    if h == "-" {
+        return []
+    }
+    let cs = h.codes()
+    var out: [i64] = []
+    var i = 0
+    while i + 3 < cs.len() {
+        out.push(hex_digit(cs[i]) * 4096 + hex_digit(cs[i + 1]) * 256 + hex_digit(cs[i + 2]) * 16 + hex_digit(cs[i + 3]))
+        i = i + 4
+    }
+    return out
+}
+
+fn js_opt_units(h: str) -> Option[[i64]] {
+    return if h == "u" { None } else { Some(js_units(h)) }
+}
+
+fn js_hex(us: [i64]) -> str {
+    if us.len() == 0 {
+        return "-"
+    }
+    let d = "0123456789abcdef"
+    return us.map(|u| d.substr(u.shr(12).bit_and(15), 1) + d.substr(u.shr(8).bit_and(15), 1) + d.substr(u.shr(4).bit_and(15), 1) + d.substr(u.bit_and(15), 1)).join(
+        "")
+}
+
+fn js_num(t: str) -> Option[f64] {
+    if t == "u" {
+        return None
+    }
+    if t == "nan" {
+        return Some((9221120237041090560).from_bits())
+    }
+    if t == "inf" {
+        return Some((9218868437227405312).from_bits())
+    }
+    if t == "-inf" {
+        return Some((0 - 4503599627370496).from_bits())
+    }
+    return t.parse_float()
+}
+
+fn js_res(r: [i64] ! JsStrError) -> str {
+    return match r {
+        Ok(us) -> js_hex(us)
+        Err(e) -> "E:RangeError:" + hex_text(jsstringmethods.error_text(e))
+    }
+}
+
+fn js_search(op: str, s: [i64], f: [str]) -> str {
+    let t = js_units(f[2])
+    let p = js_num(f[3])
+    if op == "io" {
+        return jsstringmethods.index_of(s, t, p).to_str()
+    }
+    if op == "li" {
+        return jsstringmethods.last_index_of(s, t, p).to_str()
+    }
+    let b = if op == "ic" { jsstringmethods.includes(s, t, p) } else if op == "sw" { jsstringmethods.starts_with(s, t, p) } else {
+        jsstringmethods.ends_with(s, t, p)
+    }
+    return if b { "true" } else { "false" }
+}
+
+fn jsstringmethods_line(f: [str]) -> str {
+    let op = f[0]
+    let s = js_units(f[1])
+    if op == "sp" {
+        let parts = jsstringmethods.split(s, js_opt_units(f[2]), js_num(f[3]))
+        return if parts.len() == 0 { "~" } else { parts.map(|p| js_hex(p)).join(",") }
+    }
+    if op == "ps" {
+        return js_res(jsstringmethods.pad_start(s, js_num(f[2]), js_opt_units(f[3])))
+    }
+    if op == "pe" {
+        return js_res(jsstringmethods.pad_end(s, js_num(f[2]), js_opt_units(f[3])))
+    }
+    if op == "at" {
+        return match jsstringmethods.at(s, js_num(f[2])) {
+            Some(u) -> js_hex([u])
+            None -> "u"
+        }
+    }
+    if op == "cp" {
+        return match jsstringmethods.code_point_at(s, js_num(f[2])) {
+            Some(c) -> c.to_str()
+            None -> "u"
+        }
+    }
+    if op == "wf" {
+        return (if jsstringmethods.is_well_formed(s) { "true" } else { "false" }) + "|" + js_hex(jsstringmethods.to_well_formed(s))
+    }
+    if op == "tm" {
+        return js_hex(jsstringmethods.trim(s)) + "," + js_hex(jsstringmethods.trim_start(s)) + "," + js_hex(jsstringmethods.trim_end(s))
+    }
+    if op == "sb" {
+        return js_hex(jsstringmethods.substring(s, js_num(f[2]), js_num(f[3])))
+    }
+    if op == "sr" {
+        return js_hex(jsstringmethods.substr(s, js_num(f[2]), js_num(f[3])))
+    }
+    if op == "sl" {
+        return js_hex(jsstringmethods.slice(s, js_num(f[2]), js_num(f[3])))
+    }
+    if op == "rp" {
+        return js_res(jsstringmethods.repeat(s, js_num(f[2])))
+    }
+    if op == "re" {
+        return js_hex(jsstringmethods.replace(s, js_units(f[2]), js_units(f[3])))
+    }
+    if op == "ra" {
+        return js_hex(jsstringmethods.replace_all(s, js_units(f[2]), js_units(f[3])))
+    }
+    return js_search(op, s, f)
+}
+
+fn rubystrftime_line(f: [str]) -> str {
+    return match rubystrftime.strftime(f[0].parse_int() ?? 0, f[1].parse_int() ?? 0, unhex(f[2])) {
+        Ok(t) -> hex_text(t)
+        Err(e) -> "E:ArgumentError:" + hex_text(rubystrftime.error_text(e))
+    }
+}
+
+fn hex_u64(h: str) -> i64 {
+    var v = 0
+    for c in h.codes() {
+        v = v.shl(4).bit_or(hex_digit(c))
+    }
+    return v
+}
+
+fn rf_arg(t: str) -> RbFmtArg {
+    let kind = t.substr(0, 1)
+    let body = t.substr(2, t.len())
+    if kind == "i" {
+        return RbFmtInt(rb_big(body))
+    }
+    if kind == "f" {
+        return RbFmtFloat(hex_u64(body).from_bits())
+    }
+    if kind == "s" {
+        return RbFmtStr(unhex(body))
+    }
+    if kind == "n" {
+        return RbFmtNil
+    }
+    if kind == "t" {
+        return RbFmtTrue
+    }
+    if kind == "F" {
+        return RbFmtFalse
+    }
+    var keys: [str] = []
+    var values: [RbFmtArg] = []
+    if body != "" {
+        for kv in body.split(",") {
+            let at = kv.index_of("=") ?? 0
+            keys.push(unhex(kv.substr(0, at)))
+            values.push(rf_arg(kv.substr(at + 1, kv.len())))
+        }
+    }
+    return RbFmtHash(keys, values)
+}
+
+fn rubyformat_line(f: [str]) -> str {
+    return match rubyformat.format(unhex(f[0]), f.slice(1, f.len()).map(|t| rf_arg(t))) {
+        Ok(t) -> hex_text(t)
+        Err(e) -> "E:" + rubyformat.error_class(e) + ":" + hex_text(rubyformat.error_message(e))
+    }
+}
+
+/// Reads one tree (n t f i<dec>; d<hex16> s<hex>; a<n>: o<n>:) at `at`.
+fn rj_read(t: str, at: i64) -> (RbJsonValue, i64) {
+    let c = t.substr(at, 1)
+    if c == "n" {
+        return (RbJsonNull, at + 1)
+    }
+    if c == "t" or c == "f" {
+        return (RbJsonBool(c == "t"), at + 1)
+    }
+    if c == "d" {
+        return (RbJsonFloat(hex_u64(t.substr(at + 1, 16)).from_bits()), at + 17)
+    }
+    let rest = t.substr(at + 1, t.len())
+    if c == "i" or c == "s" {
+        let end = rest.index_of(";") ?? 0
+        let body = rest.substr(0, end)
+        let v = if c == "i" { RbJsonInt(rb_big(body)) } else { RbJsonString(bytes_of(unhex_list(if body == "" { "-" } else { body }))) }
+        return (v, at + end + 2)
+    }
+    let colon = rest.index_of(":") ?? 0
+    let n = rest.substr(0, colon).parse_int() ?? 0
+    var i = at + colon + 2
+    var items: [RbJsonValue] = []
+    var keys: [bytes] = []
+    for _k in 0..n {
+        if c == "o" {
+            let (kv, after) = rj_read(t, i)
+            keys.push(match kv {
+                RbJsonString(b) -> b
+                _ -> bytes_of([])
+            })
+            i = after
+        }
+        let (v, next) = rj_read(t, i)
+        items.push(v)
+        i = next
+    }
+    if c == "a" {
+        return (RbJsonArray(items), i)
+    }
+    // A Ruby Hash built by assignment: a repeated key keeps its first
+    // place and takes the last value.
+    var ks: [bytes] = []
+    var vs: [RbJsonValue] = []
+    for (k, v) in keys.zip(items) {
+        match ks.enumerate().find(|e| e.1 == k) {
+            Some(e) -> vs[e.0] = v
+            None -> {
+                ks.push(k)
+                vs.push(v)
+            }
+        }
+    }
+    return (RbJsonObject(ks, vs), i)
+}
+
+fn rj_write(v: RbJsonValue) -> str {
+    return match v {
+        RbJsonNull -> "n"
+        RbJsonBool(b) -> if b { "t" } else { "f" }
+        RbJsonInt(n) -> "i" + bigint.to_str(n) + ";"
+        RbJsonFloat(x) -> "d" + gostrconv.format_uint(x.to_bits(), 16).pad_start(16, "0")
+        RbJsonString(b) -> "s" + (if b.len() == 0 { "" } else { hex_bytes(b) }) + ";"
+        RbJsonArray(items) -> "a" + items.len().to_str() + ":" + items.map(|x| rj_write(x)).join("")
+        RbJsonObject(keys, values) -> "o" + keys.len().to_str() + ":" + keys.zip(values).map(|kv| rj_write(RbJsonString(kv.0)) + rj_write(kv.1)).join("")
+    }
+}
+
+fn rj_err(e: RbJsonError) -> str {
+    return "E:" + rubyjson.error_class(e) + ":" + hex_bytes(rubyjson.error_message(e))
+}
+
+fn rj_gen(compact: bool, v: RbJsonValue) -> bytes ! RbJsonError {
+    if compact {
+        return try rubyjson.generate(v)
+    }
+    return try rubyjson.pretty_generate(v)
+}
+
+fn rubyjson_line(f: [str]) -> str {
+    if f[0] == "parse" {
+        return match rubyjson.parse(bytes_of(unhex_list(f[1]))) {
+            Ok(v) -> rj_write(v)
+            Err(e) -> rj_err(e)
+        }
+    }
+    let (v, _end) = rj_read(f[1], 0)
+    return match rj_gen(f[0] == "gen", v) {
+        Ok(b) -> hex_bytes(b)
+        Err(e) -> rj_err(e)
+    }
+}
+
+fn jd_show(x: f64) -> str {
+    return if x != x { "NaN" } else { x.as_i64().to_str() }
+}
+
+fn jd_num(t: str) -> f64 {
+    return js_num(t) ?? 0.0
+}
+
+fn jsdate_line(f: [str]) -> str {
+    if f[0] == "pa" {
+        return jd_show(jsdate.parse(js_units(f[1])))
+    }
+    if f[0] == "ut" {
+        return jd_show(jsdate.utc(f.slice(1, f.len()).map(|t| jd_num(t))))
+    }
+    let t = jsdate.time_clip(jd_num(f[1]))
+    let iso = match jsdate.to_iso_string(t) {
+        Ok(s) -> s
+        Err(e) -> "E:RangeError:" + jsdate.error_text(e)
+    }
+    let getters = ["FullYear", "Month", "Date", "Day", "Hours", "Minutes", "Seconds", "Milliseconds"].map(|g| jd_show(jsdate.get_utc(t, g))).join(",")
+    return [jd_show(t), iso, jsdate.to_utc_string(t), jsdate.to_string(t), jsdate.to_date_string(t), jsdate.to_time_string(t), getters].join("|")
+}
+
+fn nu_opt(o: Option[[i64]]) -> str {
+    return match o {
+        Some(v) -> js_hex(v)
+        None -> "n"
+    }
+}
+
+/// JavaScript's own-key order: array indices ascending, then the rest in
+/// the order they were added.
+fn nu_is_index(k: str) -> bool {
+    let cs = k.codes()
+    if cs.len() == 0 or cs.len() > 10 or not cs.all(|c| c >= 48 and c <= 57) or cs.len() > 1 and cs[0] == 48 {
+        return false
+    }
+    return (k.parse_int() ?? 0) < 4294967295
+}
+
+fn nu_query(q: NodeUrlQuery) -> str {
+    return match q {
+        NodeUrlNoQuery -> "n"
+        NodeUrlQueryText(t) -> js_hex(t)
+        NodeUrlQueryPairs(pairs) -> "o:" + nu_js_order(pairs).map(|p| js_hex(nodelegacyurl.units(p.key)) + "=" + (if p.values.len() == 1 {
+            "s" + js_hex(nodelegacyurl.units(p.values[0]))
+        } else { "a" + p.values.map(|v| js_hex(nodelegacyurl.units(v))).join(".") })).join(",")
+    }
+}
+
+fn nu_js_order(pairs: [QueryPair]) -> [QueryPair] {
+    var idx = pairs.filter(|p| nu_is_index(p.key))
+    idx.sort_by(|p| p.key.parse_int() ?? 0)
+    return idx + pairs.filter(|p| not nu_is_index(p.key))
+}
+
+fn nu_err(e: NodeUrlError) -> str {
+    return "E:" + nodelegacyurl.error_class(e) + ":" + nodelegacyurl.error_code(e) + ":" + js_hex(nodelegacyurl.error_message(e))
+}
+
+fn nu_field(t: str) -> Option[[i64]] {
+    return if t == "u" or t == "n" { None } else { Some(js_units(t)) }
+}
+
+fn nu_format_query(t: str) -> NodeUrlQuery {
+    if t == "u" or t == "n" {
+        return NodeUrlNoQuery
+    }
+    if not t.starts_with("o:") {
+        return NodeUrlQueryText(js_units(t))
+    }
+    var pairs: [QueryPair] = []
+    for kv in t.substr(2, t.len()).split(",").filter(|x| x.len() > 0) {
+        let at = kv.index_of("=") ?? 0
+        let k = jsuri.text(js_units(kv.substr(0, at)))
+        let v = jsuri.text(js_units(kv.substr(at + 1, kv.len())))
+        match pairs.enumerate().find(|e| e.1.key == k) {
+            Some(e) -> pairs[e.0] = querystring.pair(k, v)
+            None -> pairs.push(querystring.pair(k, v))
+        }
+    }
+    return NodeUrlQueryPairs(pairs)
+}
+
+fn nodelegacyurl_line(f: [str]) -> str {
+    if f[0] == "pa" {
+        return match nodelegacyurl.parse(js_units(f[1]), f[2] == "1", f[3] == "1") {
+            Ok(x) -> [nu_opt(x.protocol), if x.slashes ?? false { "t" } else { "n" }, nu_opt(x.auth), nu_opt(x.host), nu_opt(x.port), nu_opt(x.hostname), nu_opt(x.hash), nu_opt(
+                x.search), nu_query(x.query), nu_opt(x.pathname), nu_opt(x.path), js_hex(x.href)].join("|")
+            Err(e) -> nu_err(e)
+        }
+    }
+    if f[0] == "rs" {
+        return match nodelegacyurl.resolve(js_units(f[1]), js_units(f[2])) {
+            Ok(x) -> js_hex(x)
+            Err(e) -> nu_err(e)
+        }
+    }
+    let obj = NodeUrl{
+        protocol: nu_field(f[1]),
+        slashes: if f[2] == "t" { Some(true) } else if f[2] == "f" { Some(false) } else { None },
+        auth: nu_field(f[3]),
+        host: nu_field(f[4]),
+        port: nu_field(f[5]),
+        hostname: nu_field(f[6]),
+        hash: nu_field(f[7]),
+        search: nu_field(f[8]),
+        query: nu_format_query(f[9]),
+        pathname: nu_field(f[10]),
+        path: None,
+        href: [],
+    }
+    return match nodelegacyurl.format(obj) {
+        Ok(x) -> js_hex(x)
+        Err(e) -> nu_err(e)
+    }
+}
+
+fn ru_hex(o: Option[str]) -> str {
+    return match o {
+        Some(t) -> hex_text(t)
+        None -> "n"
+    }
+}
+
+fn ru_show(u: RbUri) -> str {
+    var extras: [str] = []
+    if u.kind == "FTP" {
+        extras = [ru_hex(u.typecode)]
+    } else if u.kind == "LDAP" or u.kind == "LDAPS" {
+        extras = [u.dn, u.attributes, u.scope, u.filter, u.extensions].map(|x| ru_hex(x))
+    } else if u.kind == "MailTo" {
+        extras = [ru_hex(u.to)] + u.headers.map(|h| "h" + h.map(|x| hex_text(x)).join("."))
+    }
+    return [u.kind, ru_hex(u.scheme), ru_hex(rubyuri.userinfo(u)), ru_hex(u.host), ru_hex(u.port), ru_hex(rubyuri.path(u)), ru_hex(u.query), ru_hex(u.fragment), ru_hex(
+        u.opaque), extras.join(","), hex_text(rubyuri.to_s(u))].join("|")
+}
+
+fn ru_err(e: RbUriError) -> str {
+    return "E:" + rubyuri.error_class(e) + ":" + hex_text(rubyuri.error_message(e))
+}
+
+fn ru_value(t: str) -> RbWwwValue {
+    let k = t.substr(0, 1)
+    if k == "n" {
+        return RbWwwNil
+    }
+    if k == "s" {
+        return RbWwwOne(unhex(t.substr(1, t.len())))
+    }
+    let body = t.substr(1, t.len())
+    return RbWwwMany(if body == "" { [] } else { body.split(".").map(|x| if x == "n" { None } else { Some(unhex(x)) }) })
+}
+
+fn ru_parse_or_join(op: str, f: [str]) -> RbUri ! RbUriError {
+    if op == "pa" {
+        return try rubyuri.parse(unhex(f[1]))
+    }
+    return try rubyuri.join(unhex(f[1]), f.slice(2, f.len()).map(|x| unhex(x)))
+}
+
+fn rubyuri_line(f: [str]) -> str {
+    let op = f[0]
+    if op == "pa" or op == "jo" {
+        return match ru_parse_or_join(op, f) {
+            Ok(u) -> ru_show(u)
+            Err(e) -> ru_err(e)
+        }
+    }
+    if op == "ec" {
+        return hex_text(rubyuri.encode_www_form_component(bytes_of(unhex_list(f[1]))))
+    }
+    if op == "dc" {
+        return match rubyuri.decode_www_form_component(unhex(f[1])) {
+            Ok(b) -> hex_bytes(b)
+            Err(e) -> ru_err(e)
+        }
+    }
+    if op == "ew" {
+        let pairs = f.slice(1, f.len()).map(|kv| {
+            let at = kv.index_of("=") ?? 0
+            (unhex(kv.substr(0, at)), ru_value(kv.substr(at + 1, kv.len())))
+        })
+        return hex_text(rubyuri.encode_www_form(pairs))
+    }
+    return match rubyuri.decode_www_form(unhex(f[1])) {
+        Ok(ps) -> if ps.len() == 0 { "~" } else { ps.map(|kv| hex_text(kv.0) + "=" + hex_text(kv.1)).join(",") }
+        Err(e) -> ru_err(e)
+    }
+}
+
+fn main() / {io} {
+    let argv = args()
+    var i = 0
+    while i + 1 < argv.len() {
+        let op = argv[i]
+        let text = match read_bytes(argv[i + 1]) {
+            Ok(d) -> d.to_str()
+            Err(_e) -> ""
+        }
+        for l in text.split("\n").filter(|l| l.len() > 0) {
+            let f = l.split(" ")
+            if op == "jsstringmethods" {
+                print(jsstringmethods_line(f))
+            }
+            if op == "rubystrftime" {
+                print(rubystrftime_line(f))
+            }
+            if op == "rubyformat" {
+                print(rubyformat_line(f))
+            }
+            if op == "rubyjson" {
+                print(rubyjson_line(f))
+            }
+            if op == "jsdate" {
+                print(jsdate_line(f))
+            }
+            if op == "nodelegacyurl" {
+                print(nodelegacyurl_line(f))
+            }
+            if op == "rubyuri" {
+                print(rubyuri_line(f))
+            }
+            if op == "rubyinteger" {
+                print(rubyinteger_line(f))
+            }
+            if op == "rubyabbrev" {
+                print(rubyabbrev_line(f))
+            }
+        }
+        i = i + 2
+    }
+}

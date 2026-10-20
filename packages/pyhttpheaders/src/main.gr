@@ -1,0 +1,790 @@
+// HTTP header helpers from Python's standard library, as CPython 3.13 runs
+// them: `urllib.request.parse_http_list` and `parse_keqv_list`, and
+// `http.cookiejar`'s `split_header_words`, `join_header_words`,
+// `parse_ns_headers`, `http2time` and `iso2time`.
+//
+// Python's HTTP clients read `WWW-Authenticate`, `Set-Cookie` and other
+// list-valued headers through these, so a tool that must parse a header
+// the way a Python client will -- or predict what cookie a Python crawler
+// keeps -- needs their exact (and lenient) rules:
+//
+//   - `parse_http_list` splits at commas outside double quotes, honours
+//     backslash escapes inside quotes, keeps the quotes, and strips each
+//     element; a trailing empty element is dropped, earlier ones are kept.
+//   - `split_header_words` reads `token`, `token=value` and
+//     `token="quoted \"value\""` pairs, separated by `;` or by whitespace,
+//     with `,` starting a new header; junk (`=`, `;`, spaces) is skipped.
+//     `join_header_words` quotes a value unless it is all word characters
+//     (Python's `^\w+$`, which also accepts one trailing newline).
+//   - `parse_ns_headers` reads Netscape `Set-Cookie` values: `;`-separated,
+//     known attribute names lowercased, `expires` turned into seconds by
+//     `http2time` (None when unreadable), quotes stripped from `version`,
+//     and `('version', '0')` added when there was none.
+//   - `http2time` takes the strict RFC 1123 form (giving a float) and a
+//     loose family of forms (`09-Feb-94`, `9 Feb 1994 22:23 +0130 (PST)`,
+//     numeric or underscore-separated months, as `int()` reads them);
+//     `iso2time` takes ISO 8601 forms. Two-digit years are placed in the
+//     century window around the current year, which here is a parameter.
+//     A strict-form month that is not a month name raises Python's
+//     ValueError ("'jxx' is not in list"), and an ISO time with
+//     fractional seconds raises one from `int()`.
+//
+// The date patterns are matched with a small backtracking matcher that
+// follows Python's `re` priorities (greedy, leftmost alternative first).
+
+import pycharclass
+
+/// A parse_ns_headers value: None, a string, or an expiry in seconds
+/// (`http2time` gives a float for the strict form).
+type PyHeaderValue = | PyHeaderNone | PyHeaderText(text: str) | PyHeaderInt(n: i64) | PyHeaderFloat(n: i64)
+
+/// Python's exception: class and message.
+type PyHeaderError = | PyHeaderError(cls: str, msg: str)
+
+pub fn error_class(e: PyHeaderError) -> str {
+    return match e {
+        PyHeaderError(c, _m) -> c
+    }
+}
+
+pub fn error_text(e: PyHeaderError) -> str {
+    return match e {
+        PyHeaderError(_c, m) -> m
+    }
+}
+
+fn is_space(c: i64) -> bool {
+    return pycharclass.is_space(c)
+}
+
+fn from_codes(cs: [i64]) -> str {
+    return cs.map(|c| c.to_char()).join("")
+}
+
+fn strip_codes(cs: [i64]) -> [i64] {
+    var a = 0
+    var b = cs.len()
+    while a < b and is_space(cs[a]) {
+        a = a + 1
+    }
+    while b > a and is_space(cs[b - 1]) {
+        b = b - 1
+    }
+    return cs.slice(a, b)
+}
+
+fn strip(s: str) -> str {
+    return from_codes(strip_codes(s.codes()))
+}
+
+// ---- urllib.request
+
+/// `parse_http_list(s)`.
+pub fn parse_http_list(s: str) -> [str] {
+    var res: [str] = []
+    var part: [i64] = []
+    var escape = false
+    var quote = false
+    for c in s.codes() {
+        if escape {
+            part.push(c)
+            escape = false
+        } else if quote {
+            if c == 92 {
+                escape = true
+            } else {
+                if c == 34 {
+                    quote = false
+                }
+                part.push(c)
+            }
+        } else if c == 44 {
+            res.push(from_codes(part))
+            part = []
+        } else {
+            if c == 34 {
+                quote = true
+            }
+            part.push(c)
+        }
+    }
+    if part.len() > 0 {
+        res.push(from_codes(part))
+    }
+    return res.map(|p| strip(p))
+}
+
+/// `parse_keqv_list(l)`: a dict, as its items in insertion order.
+pub fn parse_keqv_list(l: [str]) -> [(str, str)] ! PyHeaderError {
+    var keys: [str] = []
+    var values: [str] = []
+    for elt in l {
+        let i = match elt.index_of("=") {
+            Some(i) -> i
+            None -> fail(PyHeaderError("ValueError", "not enough values to unpack (expected 2, got 1)"))
+        }
+        let k = elt.substr(0, i)
+        var v = elt.substr(i + 1, elt.len() - i - 1)
+        if v.len() == 0 {
+            fail(PyHeaderError("IndexError", "string index out of range"))
+        }
+        if v.starts_with("\"") and v.ends_with("\"") {
+            v = if v.len() == 1 { "" } else { v.substr(1, v.len() - 2) }
+        }
+        var at = 0 - 1
+        for j in 0..keys.len() {
+            if keys[j] == k {
+                at = j
+            }
+        }
+        if at < 0 {
+            keys.push(k)
+            values.push(v)
+        } else {
+            values[at] = v
+        }
+    }
+    var out: [(str, str)] = []
+    for j in 0..keys.len() {
+        out.push((keys[j], values[j]))
+    }
+    return out
+}
+
+// ---- http.cookiejar: header words
+
+fn skip_spaces(cs: [i64], i: i64) -> i64 {
+    var k = i
+    while k < cs.len() and pycharclass.re_space(cs[k]) {
+        k = k + 1
+    }
+    return k
+}
+
+/// HEADER_TOKEN_RE at `i`: the end of the token, or -1.
+fn token_end(cs: [i64], i: i64) -> i64 {
+    var k = skip_spaces(cs, i)
+    let start = k
+    while k < cs.len() and cs[k] != 61 and cs[k] != 59 and cs[k] != 44 and not pycharclass.re_space(cs[k]) {
+        k = k + 1
+    }
+    return if k > start { k } else { 0 - 1 }
+}
+
+/// `\s*=\s*` at `i`: where the value starts, or -1.
+fn after_equals(cs: [i64], i: i64) -> i64 {
+    let k = skip_spaces(cs, i)
+    if k >= cs.len() or cs[k] != 61 {
+        return 0 - 1
+    }
+    return skip_spaces(cs, k + 1)
+}
+
+/// HEADER_QUOTED_VALUE_RE at `i`: the unescaped value and where it ends.
+fn quoted_value(cs: [i64], i: i64) -> Option[(str, i64)] {
+    let v = after_equals(cs, i)
+    if v < 0 or v >= cs.len() or cs[v] != 34 {
+        return None
+    }
+    var k = v + 1
+    var out: [i64] = []
+    while k < cs.len() {
+        let c = cs[k]
+        if c == 34 {
+            return Some((from_codes(out), k + 1))
+        }
+        if c == 92 {
+            if k + 1 >= cs.len() or cs[k + 1] == 10 {
+                return None
+            }
+            out.push(cs[k + 1])
+            k = k + 2
+        } else {
+            out.push(c)
+            k = k + 1
+        }
+    }
+    return None
+}
+
+/// HEADER_VALUE_RE at `i`: the value and where it ends.
+fn plain_value(cs: [i64], i: i64) -> Option[(str, i64)] {
+    let v = after_equals(cs, i)
+    if v < 0 {
+        return None
+    }
+    var k = v
+    while k < cs.len() and cs[k] != 59 and cs[k] != 44 and not pycharclass.re_space(cs[k]) {
+        k = k + 1
+    }
+    return Some((strip(from_codes(cs.slice(v, k))), k))
+}
+
+fn junk_end(cs: [i64], i: i64) -> i64 {
+    var k = i
+    while k < cs.len() and (cs[k] == 61 or cs[k] == 59 or pycharclass.re_space(cs[k])) {
+        k = k + 1
+    }
+    return k
+}
+
+/// `split_header_words(header_values)`.
+pub fn split_header_words(header_values: [str]) -> [[(str, Option[str])]] {
+    var result: [[(str, Option[str])]] = []
+    for text in header_values {
+        let cs = text.codes()
+        var i = 0
+        var pairs: [(str, Option[str])] = []
+        while i < cs.len() {
+            let t = token_end(cs, i)
+            if t >= 0 {
+                let name = from_codes(cs.slice(skip_spaces(cs, i), t))
+                i = t
+                var value: Option[str] = None
+                match quoted_value(cs, i) {
+                    Some(q) -> {
+                        value = Some(q.0)
+                        i = q.1
+                    }
+                    None -> match plain_value(cs, i) {
+                        Some(p) -> {
+                            value = Some(p.0)
+                            i = p.1
+                        }
+                        None -> {}
+                    }
+                }
+                pairs.push((name, value))
+            } else {
+                let k = skip_spaces(cs, i)
+                if k < cs.len() and cs[k] == 44 {
+                    i = k + 1
+                    if pairs.len() > 0 {
+                        result.push(pairs)
+                    }
+                    pairs = []
+                } else {
+                    i = junk_end(cs, i)
+                }
+            }
+        }
+        if pairs.len() > 0 {
+            result.push(pairs)
+        }
+    }
+    return result
+}
+
+/// Python's `re.search(r"^\w+$", v)`: word characters, and `$` also
+/// matches before a final newline.
+fn all_word(v: str) -> bool {
+    var cs = v.codes()
+    if cs.len() > 0 and cs[cs.len() - 1] == 10 {
+        cs = cs.slice(0, cs.len() - 1)
+    }
+    return cs.len() > 0 and cs.all(|c| pycharclass.re_word(c))
+}
+
+/// `join_header_words(lists)`.
+pub fn join_header_words(lists: [[(str, Option[str])]]) -> str {
+    var headers: [str] = []
+    for pairs in lists {
+        var attr: [str] = []
+        for p in pairs {
+            match p.1 {
+                Some(v) -> {
+                    let shown = if all_word(v) { v } else { "\"" + v.replace("\\", "\\\\").replace("\"", "\\\"") + "\"" }
+                    attr.push(p.0 + "=" + shown)
+                }
+                None -> attr.push(p.0)
+            }
+        }
+        if attr.len() > 0 {
+            headers.push(attr.join("; "))
+        }
+    }
+    return headers.join(", ")
+}
+
+fn strip_quotes(text: str) -> str {
+    var t = text
+    if t.starts_with("\"") {
+        t = t.substr(1, t.len() - 1)
+    }
+    if t.ends_with("\"") {
+        t = t.substr(0, t.len() - 1)
+    }
+    return t
+}
+
+/// `key.lower()` when it names a known attribute; only ASCII (and the
+/// Kelvin sign, which lowercases to `k`) can, and none of them has a `k`.
+fn known_attr(key: str) -> Option[str] {
+    var out: [i64] = []
+    for c in key.codes() {
+        if c >= 128 {
+            return None
+        }
+        out.push(if c >= 65 and c <= 90 { c + 32 } else { c })
+    }
+    let lc = from_codes(out)
+    let known = ["expires", "domain", "path", "secure", "version", "port", "max-age"]
+    return if known.contains(lc) { Some(lc) } else { None }
+}
+
+fn ns_value(key: str, val: Option[str], current_year: i64) -> PyHeaderValue ! PyHeaderError {
+    let v = match val {
+        Some(v) -> v
+        None -> return PyHeaderNone
+    }
+    if key == "version" {
+        return PyHeaderText(strip_quotes(v))
+    }
+    if key == "expires" {
+        return try http2time(strip_quotes(v), current_year)
+    }
+    return PyHeaderText(v)
+}
+
+/// `parse_ns_headers(ns_headers)`.
+pub fn parse_ns_headers(ns_headers: [str], current_year: i64) -> [[(str, PyHeaderValue)]] ! PyHeaderError {
+    var result: [[(str, PyHeaderValue)]] = []
+    for header in ns_headers {
+        var pairs: [(str, PyHeaderValue)] = []
+        var version_set = false
+        let params = if header.len() == 0 { [""] } else { header.split(";") }
+        for ii in 0..params.len() {
+            let param = strip(params[ii])
+            let eq = param.index_of("=")
+            var key = strip(match eq {
+                Some(i) -> param.substr(0, i)
+                None -> param
+            })
+            if key.len() == 0 {
+                if ii == 0 {
+                    break
+                }
+                continue
+            }
+            let val: Option[str] = match eq {
+                Some(i) -> Some(strip(param.substr(i + 1, param.len() - i - 1)))
+                None -> None
+            }
+            if ii == 0 {
+                pairs.push((key, match val {
+                    Some(v) -> PyHeaderText(v)
+                    None -> PyHeaderNone
+                }))
+                continue
+            }
+            key = known_attr(key) ?? key
+            if key == "version" {
+                version_set = true
+            }
+            pairs.push((key, try ns_value(key, val, current_year)))
+        }
+        if pairs.len() > 0 {
+            if not version_set {
+                pairs.push(("version", PyHeaderText("0")))
+            }
+            result.push(pairs)
+        }
+    }
+    return result
+}
+
+// ---- a backtracking matcher for the date patterns
+
+type RxNode =
+    | RxClass(ranges: [i64])
+    | RxSeq(items: [ref RxNode])
+    | RxAlt(items: [ref RxNode])
+    | RxRepeat(item: ref RxNode, least: i64, most: i64)
+    | RxGroup(index: i64, item: ref RxNode)
+    | RxNotAhead(item: ref RxNode)
+    | RxEnd
+    | RxWordBoundary
+
+type RxState = { pos: i64, caps: [i64] }
+
+fn in_ranges(r: [i64], c: i64) -> bool {
+    var k = 0
+    while k + 1 < r.len() {
+        if c >= r[k] and c <= r[k + 1] {
+            return true
+        }
+        k = k + 2
+    }
+    return false
+}
+
+fn is_word_ascii(c: i64) -> bool {
+    return in_ranges([48, 57, 65, 90, 95, 95, 97, 122], c)
+}
+
+fn with_caps(st: RxState, at: i64, start: i64, end: i64) -> RxState {
+    var caps: [i64] = []
+    for k in 0..st.caps.len() {
+        caps.push(if k == 2 * at { start } else if k == 2 * at + 1 { end } else { st.caps[k] })
+    }
+    return RxState{ pos: st.pos, caps: caps }
+}
+
+/// Every way `node` matches at `st.pos`, in Python's order of preference.
+fn rx_all(node: ref RxNode, cs: [i64], st: RxState) -> [RxState] {
+    return match node {
+        RxClass(r) -> if st.pos < cs.len() and in_ranges(r, cs[st.pos]) { [RxState{ pos: st.pos + 1, caps: st.caps }] } else { [] }
+        RxSeq(items) -> rx_seq(items, 0, cs, st)
+        RxAlt(items) -> rx_alt(items, cs, st)
+        RxRepeat(item, least, most) -> rx_repeat(item, least, most, 0, cs, st)
+        RxGroup(index, item) -> rx_all(item, cs, st).map(|r| with_caps(RxState{ pos: r.pos, caps: r.caps }, index, st.pos, r.pos))
+        RxNotAhead(item) -> if rx_all(item, cs, st).len() == 0 { [st] } else { [] }
+        RxEnd -> if st.pos == cs.len() or (st.pos == cs.len() - 1 and cs[st.pos] == 10) { [st] } else { [] }
+        RxWordBoundary -> if (st.pos > 0 and is_word_ascii(cs[st.pos - 1])) != (st.pos < cs.len() and is_word_ascii(cs[st.pos])) { [st] } else { [] }
+    }
+}
+
+fn rx_seq(items: [ref RxNode], k: i64, cs: [i64], st: RxState) -> [RxState] {
+    if k == items.len() {
+        return [st]
+    }
+    var out: [RxState] = []
+    for r in rx_all(items[k], cs, st) {
+        for t in rx_seq(items, k + 1, cs, r) {
+            out.push(t)
+        }
+    }
+    return out
+}
+
+fn rx_alt(items: [ref RxNode], cs: [i64], st: RxState) -> [RxState] {
+    var out: [RxState] = []
+    for item in items {
+        for r in rx_all(item, cs, st) {
+            out.push(r)
+        }
+    }
+    return out
+}
+
+fn rx_repeat(item: ref RxNode, least: i64, most: i64, count: i64, cs: [i64], st: RxState) -> [RxState] {
+    var out: [RxState] = []
+    if most < 0 or count < most {
+        for r in rx_all(item, cs, st) {
+            if r.pos == st.pos {
+                continue
+            }
+            for t in rx_repeat(item, least, most, count + 1, cs, r) {
+                out.push(t)
+            }
+        }
+    }
+    if count >= least {
+        out.push(st)
+    }
+    return out
+}
+
+/// The first match at the start of `text`, as its end and its groups'
+/// (start, end) pairs, -1 for a group that took no part.
+fn rx_match(node: ref RxNode, groups: i64, cs: [i64]) -> Option[RxState] {
+    var caps: [i64] = []
+    for _k in 0..(2 * groups + 2) {
+        caps.push(0 - 1)
+    }
+    let all = rx_all(node, cs, RxState{ pos: 0, caps: caps })
+    return if all.len() > 0 { Some(all[0]) } else { None }
+}
+
+fn group_text(cs: [i64], st: RxState, k: i64) -> Option[str] {
+    let a = st.caps[2 * k]
+    return if a < 0 { None } else { Some(from_codes(cs.slice(a, st.caps[2 * k + 1]))) }
+}
+
+fn chars_of(set: str) -> [i64] {
+    var out: [i64] = []
+    for c in set.codes() {
+        out.push(c)
+        out.push(c)
+    }
+    return out
+}
+
+fn one_of(set: str) -> ref RxNode {
+    return ref(RxClass(chars_of(set)))
+}
+
+fn lit(text: str) -> ref RxNode {
+    return ref(RxSeq(text.codes().map(|c| ref(RxClass([c, c])))))
+}
+
+/// A literal matched case-insensitively (ASCII).
+fn ilit(text: str) -> ref RxNode {
+    return ref(RxSeq(text.codes().map(|c| ref(RxClass([c, c, c.bit_xor(32), c.bit_xor(32)])))))
+}
+
+fn digit() -> ref RxNode {
+    return ref(RxClass([48, 57]))
+}
+
+fn space() -> ref RxNode {
+    return ref(RxClass([9, 13, 32, 32]))
+}
+
+fn word() -> ref RxNode {
+    return ref(RxClass([48, 57, 65, 90, 95, 95, 97, 122]))
+}
+
+fn letter() -> ref RxNode {
+    return ref(RxClass([65, 90, 97, 122]))
+}
+
+fn seq(items: [ref RxNode]) -> ref RxNode {
+    return ref(RxSeq(items))
+}
+
+fn alt(items: [ref RxNode]) -> ref RxNode {
+    return ref(RxAlt(items))
+}
+
+fn rep(item: ref RxNode, least: i64, most: i64) -> ref RxNode {
+    return ref(RxRepeat(item, least, most))
+}
+
+fn opt(item: ref RxNode) -> ref RxNode {
+    return rep(item, 0, 1)
+}
+
+fn grp(index: i64, item: ref RxNode) -> ref RxNode {
+    return ref(RxGroup(index, item))
+}
+
+/// `(?:\s+|[-\/])`.
+fn date_sep() -> ref RxNode {
+    return alt([rep(space(), 1, 0 - 1), one_of("-/")])
+}
+
+fn strict_date_re() -> ref RxNode {
+    let lower = ref(RxClass([97, 122]))
+    return seq([one_of("SMTWF"), lower, lower, lit(", "), grp(1, rep(digit(), 2, 2)), lit(" "), grp(2, seq([one_of("JFMASOND"), lower, lower])), lit(" "),
+        grp(3, rep(digit(), 4, 4)), lit(" "), grp(4, rep(digit(), 2, 2)), lit(":"), grp(5, rep(digit(), 2, 2)), lit(":"), grp(6, rep(digit(), 2, 2)),
+        lit(" GMT"), ref(RxEnd)])
+}
+
+fn weekday_re() -> ref RxNode {
+    let days = alt(["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"].map(|d| ilit(d)))
+    return seq([days, rep(letter(), 0, 0 - 1), opt(lit(",")), rep(space(), 0, 0 - 1)])
+}
+
+fn loose_date_re() -> ref RxNode {
+    let clock = seq([alt([rep(space(), 1, 0 - 1), lit(":")]), grp(4, rep(digit(), 1, 2)), lit(":"), grp(5, rep(digit(), 2, 2)),
+        opt(seq([lit(":"), grp(6, rep(digit(), 2, 2))]))])
+    let not_ampm = ref(RxNotAhead(seq([one_of("APap"), one_of("Mm"), ref(RxWordBoundary)])))
+    let zone = alt([seq([opt(one_of("-+")), rep(digit(), 2, 4)]), seq([not_ampm, rep(letter(), 1, 0 - 1)])])
+    return seq([grp(1, rep(digit(), 1, 2)), date_sep(), grp(2, rep(word(), 1, 0 - 1)), date_sep(), grp(3, rep(digit(), 1, 0 - 1)), opt(clock),
+        rep(space(), 0, 0 - 1), opt(seq([grp(7, zone), rep(space(), 0, 0 - 1)])), opt(seq([lit("("), rep(word(), 1, 0 - 1), lit(")"), rep(space(), 0, 0 - 1)])),
+        ref(RxEnd)])
+}
+
+fn iso_date_re() -> ref RxNode {
+    let seconds = seq([opt(lit(":")), grp(6, seq([rep(digit(), 2, 2), opt(seq([lit("."), rep(digit(), 0, 0 - 1)]))]))])
+    let clock = seq([alt([rep(space(), 1, 0 - 1), one_of("-:Tt")]), grp(4, rep(digit(), 1, 2)), opt(lit(":")), grp(5, rep(digit(), 2, 2)), opt(seconds)])
+    let zone = alt([seq([opt(one_of("-+")), rep(digit(), 1, 2), opt(lit(":")), opt(grp(8, seq([opt(lit(":")), rep(digit(), 2, 2)])))]), one_of("Zz")])
+    return seq([grp(1, rep(digit(), 4, 4)), opt(one_of("-/")), grp(2, rep(digit(), 1, 2)), opt(one_of("-/")), grp(3, rep(digit(), 1, 2)), opt(clock),
+        rep(space(), 0, 0 - 1), opt(seq([grp(7, zone), rep(space(), 0, 0 - 1)])), ref(RxEnd)])
+}
+
+fn timezone_re() -> ref RxNode {
+    return seq([opt(grp(1, one_of("-+"))), grp(2, rep(digit(), 1, 2)), opt(lit(":")), opt(grp(3, rep(digit(), 2, 2))), ref(RxEnd)])
+}
+
+// ---- http.cookiejar: dates
+
+fn month_names() -> [str] {
+    return ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"]
+}
+
+fn ascii_lower(s: str) -> str {
+    return from_codes(s.codes().map(|c| if c >= 65 and c <= 90 { c + 32 } else { c }))
+}
+
+fn ascii_upper(s: str) -> str {
+    return from_codes(s.codes().map(|c| if c >= 97 and c <= 122 { c - 32 } else { c }))
+}
+
+/// `int(text)` for ASCII digits with single underscores between them, as
+/// Python reads it; None for anything else. Values past 10**12 are capped.
+fn py_int(text: str) -> Option[i64] {
+    let cs = text.codes()
+    if cs.len() == 0 or cs[0] == 95 or cs[cs.len() - 1] == 95 {
+        return None
+    }
+    var v = 0
+    for k in 0..cs.len() {
+        let c = cs[k]
+        if c == 95 {
+            if cs[k - 1] == 95 {
+                return None
+            }
+        } else if c >= 48 and c <= 57 {
+            v = if v > 1000000000000 { v } else { v * 10 + c - 48 }
+        } else {
+            return None
+        }
+    }
+    return Some(v)
+}
+
+/// Days from 1970-01-01 to the given date (proleptic Gregorian).
+fn days_from_civil(y0: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y0 - 1 } else { y0 }
+    let era = (if y >= 0 { y } else { y - 399 }) / 400
+    let yoe = y - era * 400
+    let mp = (m + 9) % 12
+    let doy = (153 * mp + 2) / 5 + d - 1
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy
+    return era * 146097 + doe - 719468
+}
+
+/// `_timegm`: seconds since the epoch, or None outside its checks.
+fn timegm(year: i64, month: i64, day: i64, hour: i64, minute: i64, second: i64) -> Option[i64] {
+    if year < 1970 or month < 1 or month > 12 or day < 1 or day > 31 or hour < 0 or hour > 24 or minute < 0 or minute > 59 or second < 0 or second > 61 {
+        return None
+    }
+    return Some(((days_from_civil(year, month, 1) + day - 1) * 24 + hour) * 3600 + minute * 60 + second)
+}
+
+/// `offset_from_tz_string(tz)`.
+fn tz_offset(tz: str) -> Option[i64] {
+    if tz == "GMT" or tz == "UTC" or tz == "UT" or tz == "Z" {
+        return Some(0)
+    }
+    let cs = tz.codes()
+    return match rx_match(timezone_re(), 3, cs) {
+        Some(st) -> {
+            var off = 3600 * (py_int(group_text(cs, st, 2) ?? "0") ?? 0)
+            match group_text(cs, st, 3) {
+                Some(m) -> off = off + 60 * (py_int(m) ?? 0)
+                None -> {}
+            }
+            Some(if group_text(cs, st, 1) == Some("-") { 0 - off } else { off })
+        }
+        None -> None
+    }
+}
+
+fn int_part(text: Option[str]) -> i64 ! PyHeaderError {
+    return match text {
+        None -> 0
+        Some(t) -> match py_int(t) {
+            Some(v) -> v
+            None -> fail(PyHeaderError("ValueError", "invalid literal for int() with base 10: '" + t + "'"))
+        }
+    }
+}
+
+/// `_str2time`, with the current year given.
+fn str2time(parts: [Option[str]], current_year: i64) -> PyHeaderValue ! PyHeaderError {
+    let ytext = parts[2] ?? ""
+    var digits = ytext
+    while digits.len() > 1 and digits.starts_with("0") {
+        digits = digits.substr(1, digits.len() - 1)
+    }
+    if digits.len() > 4 {
+        return PyHeaderNone
+    }
+    var yr = py_int(digits) ?? 0
+    let mtext = parts[1] ?? ""
+    var mon = 0
+    let names = month_names()
+    for k in 0..12 {
+        if ascii_lower(mtext) == names[k] {
+            mon = k + 1
+        }
+    }
+    if mon == 0 {
+        mon = match py_int(mtext) {
+            Some(m) -> if m >= 1 and m <= 12 { m } else { return PyHeaderNone }
+            None -> return PyHeaderNone
+        }
+    }
+    let day = try int_part(parts[0])
+    let hr = try int_part(parts[3])
+    let mi = try int_part(parts[4])
+    let sec = try int_part(parts[5])
+    if yr < 1000 {
+        let m0 = current_year % 100
+        let tmp = yr
+        yr = yr + current_year - m0
+        let m = m0 - tmp
+        if m > 50 {
+            yr = yr + 100
+        } else if m < 0 - 50 {
+            yr = yr - 100
+        }
+    }
+    let t = match timegm(yr, mon, day, hr, mi, sec) {
+        Some(t) -> t
+        None -> return PyHeaderNone
+    }
+    let off = match tz_offset(ascii_upper(parts[6] ?? "UTC")) {
+        Some(o) -> o
+        None -> return PyHeaderNone
+    }
+    return PyHeaderInt(t - off)
+}
+
+/// `http2time(text)`: seconds since the epoch, or None.
+pub fn http2time(text: str, current_year: i64) -> PyHeaderValue ! PyHeaderError {
+    let raw = text.codes()
+    match rx_match(strict_date_re(), 6, raw) {
+        Some(st) -> {
+            let g = [1, 2, 3, 4, 5, 6].map(|k| group_text(raw, st, k) ?? "")
+            let names = month_names()
+            var mon = 0
+            for k in 0..12 {
+                if ascii_lower(g[1]) == names[k] {
+                    mon = k + 1
+                }
+            }
+            if mon == 0 {
+                fail(PyHeaderError("ValueError", "'" + ascii_lower(g[1]) + "' is not in list"))
+            }
+            let n = g.map(|x| py_int(x) ?? 0)
+            return match timegm(n[2], mon, n[0], n[3], n[4], n[5]) {
+                Some(t) -> PyHeaderFloat(t)
+                None -> PyHeaderNone
+            }
+        }
+        None -> {}
+    }
+    var cs = strip_left(raw)
+    match rx_match(weekday_re(), 0, cs) {
+        Some(st) -> cs = cs.slice(st.pos, cs.len())
+        None -> {}
+    }
+    return match rx_match(loose_date_re(), 7, cs) {
+        Some(st) -> try str2time([1, 2, 3, 4, 5, 6, 7].map(|k| group_text(cs, st, k)), current_year)
+        None -> PyHeaderNone
+    }
+}
+
+fn strip_left(cs: [i64]) -> [i64] {
+    var a = 0
+    while a < cs.len() and is_space(cs[a]) {
+        a = a + 1
+    }
+    return cs.slice(a, cs.len())
+}
+
+/// `iso2time(text)`: seconds since the epoch, or None.
+pub fn iso2time(text: str, current_year: i64) -> PyHeaderValue ! PyHeaderError {
+    let cs = strip_left(text.codes())
+    return match rx_match(iso_date_re(), 8, cs) {
+        Some(st) -> {
+            let g = [1, 2, 3, 4, 5, 6, 7].map(|k| group_text(cs, st, k))
+            try str2time([g[2], g[1], g[0], g[3], g[4], g[5], g[6]], current_year)
+        }
+        None -> PyHeaderNone
+    }
+}

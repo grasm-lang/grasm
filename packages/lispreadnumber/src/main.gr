@@ -1,0 +1,851 @@
+// What the Common Lisp reader makes of a token, as SBCL 2.6.8's
+// `read-from-string` reads it: an integer, a ratio, a float of the right
+// format, or a symbol -- under any `*read-base*` from 2 to 36 and any
+// `*read-default-float-format*`.
+//
+// Lisp data files, configuration written as s-expressions, and every tool
+// that reads Lisp source have to agree with the reader on where a number
+// ends and a symbol begins, and the rules are subtle:
+//
+//   - **Integers** are digits of `*read-base*` with an optional sign; a
+//     trailing dot (`17.`) means decimal whatever the base.
+//   - **Ratios** are `n/d` in `*read-base*`, reduced (`4/2` is 2); `1/0`
+//     is a reader error.
+//   - **Floats** need a decimal point with digits after it, or an
+//     exponent: `1.5`, `.5`, `1.e5`, `1e5`. The exponent marker picks the
+//     format -- `e` the default format, `s` and `f` single-float, `d` and
+//     `l` double-float, and SBCL's `r` an exact rational (`1.5r0` is
+//     3/2). Values are correctly rounded from the exact decimal, too small
+//     ones become zero, and too large ones are an error.
+//   - **The base interferes**: in base 16 `1e5` is the integer 485 but
+//     `1e+5` is a float, `a.` is a symbol, and `1.5` is still decimal.
+//   - **Everything else is a symbol**: `1/`, `+.`, `1e`, `1e5x`, `1.5.5`,
+//     with letters upcased unless escaped with `\` or `|...|`. A lone
+//     `.` and runs of dots are errors.
+//
+// Only the token is read: leading white space is skipped and reading
+// stops at white space or a terminating macro character. Tokens are
+// ASCII (SBCL also reads other Unicode decimal digits as digits, which
+// this does not); a package marker (`:`) and tokens that start with a
+// macro character are refused.
+//
+// Checked against `sbcl` 2.6.8's `read-from-string` under generated
+// tokens, bases and default float formats.
+
+import bigint
+
+/// What a token reads as.
+type LispReadValue =
+    | LrInteger(n: BigInt)
+    | LrRatio(num: BigInt, den: BigInt)
+    /// A single-float, by its 32 bits.
+    | LrSingle(bits: i64)
+    | LrDouble(x: f64)
+    | LrSymbol(name: str)
+
+/// The reader's error: `impossible` (a number that cannot be built),
+/// `reader` (a malformed token) or `eof` (input ended inside an escape),
+/// or a refusal.
+type LispReadError = | LispReadFailed(kind: str) | LispReadRefused(why: str)
+
+// Character attributes, numbered as SBCL numbers them.
+fn a_constituent() -> i64 {
+    return 4
+}
+
+fn a_dot() -> i64 {
+    return 5
+}
+
+fn a_expt() -> i64 {
+    return 6
+}
+
+fn a_slash() -> i64 {
+    return 7
+}
+
+fn a_digit() -> i64 {
+    return 8
+}
+
+fn a_sign() -> i64 {
+    return 9
+}
+
+fn a_decimal() -> i64 {
+    return 10
+}
+
+fn a_digit_or_expt() -> i64 {
+    return 11
+}
+
+fn a_package() -> i64 {
+    return 12
+}
+
+fn a_invalid() -> i64 {
+    return 13
+}
+
+fn a_delimiter() -> i64 {
+    return 14
+}
+
+fn a_single() -> i64 {
+    return 2
+}
+
+fn a_multiple() -> i64 {
+    return 3
+}
+
+fn digit_value(c: i64, radix: i64) -> Option[i64] {
+    let v = if c >= 48 and c <= 57 { c - 48 } else if c >= 65 and c <= 90 { c - 55 } else if c >= 97 and c <= 122 { c - 87 } else { 99 }
+    return if v < radix { Some(v) } else { None }
+}
+
+/// The syntax of a character: delimiter, an escape, or constituent.
+fn syntax(c: i64) -> i64 {
+    if c == 32 or c == 9 or c == 10 or c == 13 or c == 12 {
+        return a_delimiter()
+    }
+    if c == 34 or c == 39 or c == 40 or c == 41 or c == 44 or c == 59 or c == 96 {
+        return a_delimiter()
+    }
+    if c == 92 {
+        return a_single()
+    }
+    if c == 124 {
+        return a_multiple()
+    }
+    return a_constituent()
+}
+
+/// The constituent trait of a character.
+fn trait_of(c: i64) -> i64 {
+    if c == 58 {
+        return a_package()
+    }
+    if c == 46 {
+        return a_dot()
+    }
+    if c == 43 or c == 45 {
+        return a_sign()
+    }
+    if c == 47 {
+        return a_slash()
+    }
+    if c >= 48 and c <= 57 {
+        return a_digit()
+    }
+    if c == 101 or c == 102 or c == 100 or c == 115 or c == 108 or c == 114 or c == 69 or c == 70 or c == 68 or c == 83 or c == 76 or c == 82 {
+        return a_expt()
+    }
+    if c == 8 or c == 127 {
+        return a_invalid()
+    }
+    return a_constituent()
+}
+
+fn reader_error() -> LispReadError {
+    return LispReadFailed("reader")
+}
+
+/// CHAR-CLASS.
+fn class1(c: i64) -> i64 ! LispReadError {
+    let s = syntax(c)
+    if s != a_constituent() {
+        return s
+    }
+    let t = trait_of(c)
+    if t == a_invalid() {
+        fail(reader_error())
+    }
+    return t
+}
+
+/// CHAR-CLASS2: a digit only when it is one in the base.
+fn class2(c: i64, base: i64) -> i64 ! LispReadError {
+    let s = syntax(c)
+    if s != a_constituent() {
+        return s
+    }
+    let t = trait_of(c)
+    if digit_value(c, base).is_some() {
+        return a_digit()
+    }
+    if t == a_digit() {
+        return a_constituent()
+    }
+    if t == a_invalid() {
+        fail(reader_error())
+    }
+    return t
+}
+
+/// The reader's state while it reads a token.
+type LispTok = { cs: [i64], pos: i64, base: i64, buf: [i64], escaped: [bool], rational: bool, float: bool }
+
+/// CHAR-CLASS3, which also narrows whether the token can still be a
+/// rational or a float.
+fn class3(inout t: LispTok, c: i64) -> i64 ! LispReadError {
+    let s = syntax(c)
+    if s != a_constituent() {
+        return s
+    }
+    let att = trait_of(c)
+    if t.rational {
+        t.rational = digit_value(c, t.base).is_some() or att == a_slash()
+    }
+    if t.float {
+        t.float = digit_value(c, 10).is_some() or att == a_dot()
+    }
+    if digit_value(c, t.base.max(10)).is_some() {
+        if digit_value(c, t.base).is_some() {
+            return if att == a_expt() { a_digit_or_expt() } else { a_digit() }
+        }
+        return a_decimal()
+    }
+    if att == a_invalid() {
+        fail(reader_error())
+    }
+    return att
+}
+
+fn push(inout t: LispTok, c: i64) {
+    t.buf.push(c)
+    t.escaped.push(false)
+}
+
+/// The next character, or -1 at the end of the string.
+fn next(inout t: LispTok) -> i64 {
+    if t.pos >= t.cs.len() {
+        return 0 - 1
+    }
+    let c = t.cs[t.pos]
+    t.pos = t.pos + 1
+    return c
+}
+
+// The states of READ-TOKEN. Each answers the value the token reads as.
+
+/// What a state does with the classes every state treats alike: a
+/// delimiter or the end, escapes, and a package marker.
+fn common(inout t: LispTok, cls: i64, at_end: bool) -> LispReadValue ! LispReadError {
+    if at_end or cls == a_delimiter() {
+        return symbol_of(t)
+    }
+    if cls == a_single() {
+        return try single_escape(t)
+    }
+    if cls == a_multiple() {
+        return try multiple_escape(t)
+    }
+    if cls == a_package() {
+        fail(LispReadRefused("package markers are not supported"))
+    }
+    return try symbol_state(t, 0)
+}
+
+pub fn read_token(text: str, base: i64, float_format: str) -> LispReadValue ! LispReadError {
+    if base < 2 or base > 36 {
+        fail(LispReadRefused("a base outside 2..36"))
+    }
+    if not (float_format == "single-float" or float_format == "double-float" or float_format == "short-float" or float_format == "long-float") {
+        fail(LispReadRefused("an unknown float format"))
+    }
+    let cs = text.codes()
+    if cs.any(|c| c > 127) {
+        fail(LispReadRefused("non-ASCII characters"))
+    }
+    var t = LispTok{ cs: cs, pos: 0, base: base, buf: [], escaped: [], rational: true, float: true }
+    var c = next(t)
+    while c >= 0 and (c == 32 or c == 9 or c == 10 or c == 13 or c == 12) {
+        c = next(t)
+    }
+    if c < 0 {
+        fail(LispReadFailed("eof"))
+    }
+    if syntax(c) == a_delimiter() or c == 35 {
+        fail(LispReadRefused("a token that starts with a macro character"))
+    }
+    return try first_state(t, c, float_format)
+}
+
+fn first_state(inout t: LispTok, c: i64, ff: str) -> LispReadValue ! LispReadError {
+    let cls = try class3(t, c)
+    if cls == a_sign() {
+        return try sign_state(t, c, ff)
+    }
+    if cls == a_digit() {
+        return try leftdigit(t, c, false, ff)
+    }
+    if cls == a_digit_or_expt() {
+        return try leftdigit(t, c, true, ff)
+    }
+    if cls == a_decimal() {
+        return try leftdecimal(t, c, ff)
+    }
+    if cls == a_dot() {
+        return try frontdot(t, c, ff)
+    }
+    if cls == a_single() {
+        return try single_escape(t)
+    }
+    if cls == a_multiple() {
+        return try multiple_escape(t)
+    }
+    if cls == a_package() {
+        fail(LispReadRefused("package markers are not supported"))
+    }
+    return try symbol_state(t, c)
+}
+
+fn sign_state(inout t: LispTok, c0: i64, ff: str) -> LispReadValue ! LispReadError {
+    push(t, c0)
+    let c = next(t)
+    if c < 0 {
+        return symbol_of(t)
+    }
+    t.rational = true
+    t.float = true
+    let cls = try class3(t, c)
+    if cls == a_digit() {
+        return try leftdigit(t, c, false, ff)
+    }
+    if cls == a_digit_or_expt() {
+        return try leftdigit(t, c, true, ff)
+    }
+    if cls == a_decimal() {
+        return try leftdecimal(t, c, ff)
+    }
+    if cls == a_dot() {
+        return try signdot(t, c, ff)
+    }
+    return try common_or_symbol(t, cls, c)
+}
+
+/// The tail every state shares once nothing number-like matched: the
+/// common classes, otherwise the symbol state with this character.
+fn common_or_symbol(inout t: LispTok, cls: i64, c: i64) -> LispReadValue ! LispReadError {
+    if cls == a_delimiter() or cls == a_single() or cls == a_multiple() or cls == a_package() {
+        return try common(t, cls, false)
+    }
+    return try symbol_state(t, c)
+}
+
+/// LEFTDIGIT: "[sign] {digit}+". `seen` is SEEN-DIGIT-OR-EXPT.
+fn leftdigit(inout t: LispTok, c0: i64, seen0: bool, ff: str) -> LispReadValue ! LispReadError {
+    var seen = seen0
+    var c = c0
+    while true {
+        push(t, c)
+        c = next(t)
+        if c < 0 {
+            return try make_integer(t, t.base)
+        }
+        let was_float = t.float
+        let cls = try class3(t, c)
+        if cls == a_digit() {
+            continue
+        }
+        if cls == a_decimal() {
+            return if t.float { try leftdecimal(t, c, ff) } else { try symbol_state(t, c) }
+        }
+        if cls == a_dot() {
+            return if t.float { try middledot(t, c, ff) } else { try symbol_state(t, c) }
+        }
+        if cls == a_digit_or_expt() {
+            if seen or not was_float {
+                seen = true
+                continue
+            }
+            return try leftdigit_or_expt(t, c, ff)
+        }
+        if cls == a_expt() {
+            return if was_float { try exponent_state(t, c, ff) } else { try symbol_state(t, c) }
+        }
+        if cls == a_slash() {
+            return if t.rational { try ratio_state(t, c) } else { try symbol_state(t, c) }
+        }
+        if cls == a_delimiter() {
+            return try make_integer(t, t.base)
+        }
+        return try common_or_symbol(t, cls, c)
+    }
+    return try make_integer(t, t.base)
+}
+
+fn leftdigit_or_expt(inout t: LispTok, c0: i64, ff: str) -> LispReadValue ! LispReadError {
+    push(t, c0)
+    let c = next(t)
+    if c < 0 {
+        return try make_integer(t, t.base)
+    }
+    let cls = try class3(t, c)
+    if cls == a_digit() or cls == a_digit_or_expt() {
+        return try leftdigit(t, c, true, ff)
+    }
+    if cls == a_dot() or cls == a_expt() {
+        return try symbol_state(t, c)
+    }
+    if cls == a_sign() {
+        return try exptsign(t, c, ff)
+    }
+    if cls == a_slash() {
+        return if t.rational { try ratio_state(t, c) } else { try symbol_state(t, c) }
+    }
+    if cls == a_delimiter() {
+        return try make_integer(t, t.base)
+    }
+    return try common_or_symbol(t, cls, c)
+}
+
+/// LEFTDECIMALDIGIT: decimal digits that are not digits in the base.
+fn leftdecimal(inout t: LispTok, c0: i64, ff: str) -> LispReadValue ! LispReadError {
+    var c = c0
+    while true {
+        push(t, c)
+        c = next(t)
+        if c < 0 {
+            return symbol_of(t)
+        }
+        let cls = try class1(c)
+        if cls == a_digit() {
+            continue
+        }
+        if cls == a_dot() {
+            return try middledot(t, c, ff)
+        }
+        if cls == a_expt() {
+            return try exponent_state(t, c, ff)
+        }
+        return try common_or_symbol(t, cls, c)
+    }
+    return symbol_of(t)
+}
+
+fn middledot(inout t: LispTok, c0: i64, ff: str) -> LispReadValue ! LispReadError {
+    push(t, c0)
+    let c = next(t)
+    if c < 0 {
+        return try make_integer(t, 10)
+    }
+    let cls = try class1(c)
+    if cls == a_digit() {
+        return try rightdigit(t, c, ff)
+    }
+    if cls == a_expt() {
+        return try exponent_state(t, c, ff)
+    }
+    if cls == a_delimiter() {
+        return try make_integer(t, 10)
+    }
+    return try common_or_symbol(t, cls, c)
+}
+
+fn rightdigit(inout t: LispTok, c0: i64, ff: str) -> LispReadValue ! LispReadError {
+    var c = c0
+    while true {
+        push(t, c)
+        c = next(t)
+        if c < 0 {
+            return try make_float(t, ff)
+        }
+        let cls = try class1(c)
+        if cls == a_digit() {
+            continue
+        }
+        if cls == a_expt() {
+            return try exponent_state(t, c, ff)
+        }
+        if cls == a_delimiter() {
+            return try make_float(t, ff)
+        }
+        return try common_or_symbol(t, cls, c)
+    }
+    return try make_float(t, ff)
+}
+
+fn signdot(inout t: LispTok, c0: i64, ff: str) -> LispReadValue ! LispReadError {
+    push(t, c0)
+    let c = next(t)
+    if c < 0 {
+        return symbol_of(t)
+    }
+    let cls = try class1(c)
+    if cls == a_digit() {
+        return try rightdigit(t, c, ff)
+    }
+    if cls == a_delimiter() or cls == a_single() or cls == a_multiple() {
+        return try common(t, cls, false)
+    }
+    return try symbol_state(t, c)
+}
+
+fn frontdot(inout t: LispTok, c0: i64, ff: str) -> LispReadValue ! LispReadError {
+    push(t, c0)
+    let c = next(t)
+    if c < 0 {
+        fail(reader_error())
+    }
+    let cls = try class1(c)
+    if cls == a_digit() {
+        return try rightdigit(t, c, ff)
+    }
+    if cls == a_dot() {
+        return try dots(t, c)
+    }
+    if cls == a_delimiter() {
+        fail(reader_error())
+    }
+    return try common_or_symbol(t, cls, c)
+}
+
+fn exponent_state(inout t: LispTok, c0: i64, ff: str) -> LispReadValue ! LispReadError {
+    push(t, c0)
+    let c = next(t)
+    if c < 0 {
+        return symbol_of(t)
+    }
+    t.float = true
+    let cls = try class1(c)
+    if cls == a_sign() {
+        return try exptsign(t, c, ff)
+    }
+    if cls == a_digit() {
+        return try exptdigit(t, c, ff)
+    }
+    return try common_or_symbol(t, cls, c)
+}
+
+fn exptsign(inout t: LispTok, c0: i64, ff: str) -> LispReadValue ! LispReadError {
+    push(t, c0)
+    let c = next(t)
+    if c < 0 {
+        return symbol_of(t)
+    }
+    let cls = try class1(c)
+    if cls == a_digit() {
+        return try exptdigit(t, c, ff)
+    }
+    return try common_or_symbol(t, cls, c)
+}
+
+fn exptdigit(inout t: LispTok, c0: i64, ff: str) -> LispReadValue ! LispReadError {
+    var c = c0
+    while true {
+        push(t, c)
+        c = next(t)
+        if c < 0 {
+            return try make_float(t, ff)
+        }
+        let cls = try class1(c)
+        if cls == a_digit() {
+            continue
+        }
+        if cls == a_delimiter() {
+            return try make_float(t, ff)
+        }
+        return try common_or_symbol(t, cls, c)
+    }
+    return try make_float(t, ff)
+}
+
+fn ratio_state(inout t: LispTok, c0: i64) -> LispReadValue ! LispReadError {
+    push(t, c0)
+    var c = next(t)
+    if c < 0 {
+        return symbol_of(t)
+    }
+    var cls = try class2(c, t.base)
+    if cls != a_digit() {
+        return try common_or_symbol(t, cls, c)
+    }
+    while true {
+        push(t, c)
+        c = next(t)
+        if c < 0 {
+            return try make_ratio(t)
+        }
+        cls = try class2(c, t.base)
+        if cls == a_digit() {
+            continue
+        }
+        if cls == a_delimiter() {
+            return try make_ratio(t)
+        }
+        return try common_or_symbol(t, cls, c)
+    }
+    return try make_ratio(t)
+}
+
+fn dots(inout t: LispTok, c0: i64) -> LispReadValue ! LispReadError {
+    var c = c0
+    while true {
+        push(t, c)
+        c = next(t)
+        if c < 0 {
+            fail(reader_error())
+        }
+        let cls = try class1(c)
+        if cls == a_dot() {
+            continue
+        }
+        if cls == a_delimiter() {
+            fail(reader_error())
+        }
+        return try common_or_symbol(t, cls, c)
+    }
+    fail(reader_error())
+}
+
+/// SYMBOL: everything up to a delimiter, with escapes.
+fn symbol_state(inout t: LispTok, c0: i64) -> LispReadValue ! LispReadError {
+    var c = c0
+    while true {
+        if c > 0 or c == 0 {
+            push(t, c)
+        }
+        c = next(t)
+        if c < 0 {
+            return symbol_of(t)
+        }
+        let cls = try class1(c)
+        if cls == a_single() or cls == a_multiple() or cls == a_delimiter() or cls == a_package() {
+            return try common(t, cls, false)
+        }
+    }
+    return symbol_of(t)
+}
+
+fn single_escape(inout t: LispTok) -> LispReadValue ! LispReadError {
+    let n = next(t)
+    if n < 0 {
+        fail(LispReadFailed("eof"))
+    }
+    t.buf.push(n)
+    t.escaped.push(true)
+    return try after_escape(t)
+}
+
+fn multiple_escape(inout t: LispTok) -> LispReadValue ! LispReadError {
+    while true {
+        var c = next(t)
+        if c < 0 {
+            fail(LispReadFailed("eof"))
+        }
+        if c == 124 {
+            break
+        }
+        if c == 92 {
+            c = next(t)
+            if c < 0 {
+                fail(LispReadFailed("eof"))
+            }
+        }
+        t.buf.push(c)
+        t.escaped.push(true)
+    }
+    return try after_escape(t)
+}
+
+fn after_escape(inout t: LispTok) -> LispReadValue ! LispReadError {
+    let c = next(t)
+    if c < 0 {
+        return symbol_of(t)
+    }
+    let cls = try class1(c)
+    return try common_or_symbol(t, cls, c)
+}
+
+fn symbol_of(t: LispTok) -> LispReadValue {
+    var name = ""
+    var i = 0
+    while i < t.buf.len() {
+        let c = t.buf[i]
+        let up = if not t.escaped[i] and c >= 97 and c <= 122 { c - 32 } else { c }
+        name = name + up.to_char()
+        i = i + 1
+    }
+    return LrSymbol(name)
+}
+
+// --- building the numbers -----------------------------------------------------------------------
+
+fn big(v: i64) -> BigInt {
+    return bigint.from_i64(v)
+}
+
+/// The digits from `at` in `base`, and where they stopped.
+fn digits_from(buf: [i64], at: i64, base: i64) -> (BigInt, i64) {
+    var n = big(0)
+    var i = at
+    while i < buf.len() {
+        match digit_value(buf[i], base) {
+            Some(d) -> n = bigint.add(bigint.mul(n, big(base)), big(d))
+            None -> return (n, i)
+        }
+        i = i + 1
+    }
+    return (n, i)
+}
+
+fn sign_skip(buf: [i64]) -> (bool, i64) {
+    if buf.len() > 0 and buf[0] == 45 {
+        return (true, 1)
+    }
+    return (false, if buf.len() > 0 and buf[0] == 43 { 1 } else { 0 })
+}
+
+fn make_integer(t: LispTok, base: i64) -> LispReadValue ! LispReadError {
+    let s = sign_skip(t.buf)
+    let n = digits_from(t.buf, s.1, base).0
+    return LrInteger(if s.0 { bigint.negate(n) } else { n })
+}
+
+fn gcd(a0: BigInt, b0: BigInt) -> BigInt {
+    var a = a0
+    var b = b0
+    while not bigint.is_zero(b) {
+        let r = bigint.rem(a, b) ?? big(0)
+        a = b
+        b = r
+    }
+    return a
+}
+
+/// A rational in lowest terms: an integer when the denominator is 1.
+fn rational(num: BigInt, den: BigInt) -> LispReadValue {
+    let g = gcd(if bigint.sign(num) < 0 { bigint.negate(num) } else { num }, den)
+    let n = bigint.div(num, g) ?? num
+    let d = bigint.div(den, g) ?? den
+    if bigint.compare(d, big(1)) == 0 {
+        return LrInteger(n)
+    }
+    return LrRatio(n, d)
+}
+
+fn make_ratio(t: LispTok) -> LispReadValue ! LispReadError {
+    let s = sign_skip(t.buf)
+    let num = digits_from(t.buf, s.1, t.base)
+    let den = digits_from(t.buf, num.1 + 1, t.base).0
+    if bigint.is_zero(den) {
+        fail(LispReadFailed("impossible"))
+    }
+    let n = if s.0 { bigint.negate(num.0) } else { num.0 }
+    return rational(n, den)
+}
+
+fn integer_length(n: BigInt) -> i64 {
+    return bigint.bit_length(n)
+}
+
+/// TRUNCATE-EXPONENT: the exponent held to what a double could need.
+fn truncate_exponent(exponent: i64, number: BigInt, divisor: BigInt) -> i64 {
+    let magnitude = integer_length(number) - (integer_length(divisor) - 1)
+    if exponent < 0 {
+        let v = 0 - (1075 + magnitude)
+        let ceil3 = if v >= 0 { (v + 2) / 3 } else { 0 - ((0 - v) / 3) }
+        return exponent.max(ceil3)
+    }
+    let w = 1075 - magnitude
+    let floor3 = if w >= 0 { w / 3 } else { 0 - ((0 - w + 2) / 3) }
+    return exponent.min(floor3)
+}
+
+fn make_float(t: LispTok, ff: str) -> LispReadValue ! LispReadError {
+    let s = sign_skip(t.buf)
+    let whole = digits_from(t.buf, s.1, 10)
+    var number = whole.0
+    var at = whole.1
+    var divisor = big(1)
+    if at < t.buf.len() and t.buf[at] == 46 {
+        at = at + 1
+        while at < t.buf.len() and t.buf[at] >= 48 and t.buf[at] <= 57 {
+            divisor = bigint.mul(divisor, big(10))
+            number = bigint.add(bigint.mul(number, big(10)), big(t.buf[at] - 48))
+            at = at + 1
+        }
+    }
+    var format = ff
+    var exponent = 0
+    if at < t.buf.len() {
+        let marker = t.buf[at]
+        at = at + 1
+        var negative_exp = false
+        if at < t.buf.len() and (t.buf[at] == 45 or t.buf[at] == 43) {
+            negative_exp = t.buf[at] == 45
+            at = at + 1
+        }
+        let e = digits_from(t.buf, at, 10).0
+        let ev = bigint.to_i64(e) ?? 1000000000
+        exponent = if negative_exp { 0 - ev } else { ev }
+        let up = if marker >= 97 { marker - 32 } else { marker }
+        format = if up == 83 or up == 70 { "single-float" } else if up == 68 or up == 76 { "double-float" } else if up == 82 { "rational" } else { ff }
+        exponent = truncate_exponent(exponent, number, divisor)
+    }
+    var top = number
+    var bottom = divisor
+    if exponent >= 0 {
+        top = bigint.mul(top, bigint.pow(big(10), exponent))
+    } else {
+        bottom = bigint.mul(bottom, bigint.pow(big(10), 0 - exponent))
+    }
+    return try float_value(top, bottom, format, s.0)
+}
+
+fn float_value(top: BigInt, bottom: BigInt, format: str, negative: bool) -> LispReadValue ! LispReadError {
+    if format == "rational" {
+        return rational(if negative { bigint.negate(top) } else { top }, bottom)
+    }
+    let single = format == "single-float" or format == "short-float"
+    let bits = match to_float(top, bottom, if single { 24 } else { 53 }, if single { 0 - 149 } else { 0 - 1074 }, if single { 128 } else { 1024 }) {
+        Some(b) -> b
+        None -> fail(LispReadFailed("impossible"))
+    }
+    if single {
+        return LrSingle(if negative { bits.bit_or(2147483648) } else { bits })
+    }
+    let x = bits.from_bits()
+    return LrDouble(if negative { x * (0.0 - 1.0) } else { x })
+}
+
+/// `top / bottom` (non-negative) correctly rounded to a float with `p`
+/// significant bits, smallest exponent `min_e` and values below
+/// `2^max_e`: its bits, or None when it overflows.
+fn to_float(top: BigInt, bottom: BigInt, p: i64, min_e: i64, max_e: i64) -> Option[i64] {
+    if bigint.is_zero(top) {
+        return Some(0)
+    }
+    var e2 = integer_length(top) - integer_length(bottom)
+    let lhs = if e2 >= 0 { top } else { bigint.mul(top, bigint.pow(big(2), 0 - e2)) }
+    let rhs = if e2 >= 0 { bigint.mul(bottom, bigint.pow(big(2), e2)) } else { bottom }
+    if bigint.compare(lhs, rhs) < 0 {
+        e2 = e2 - 1
+    }
+    let s = (e2 - (p - 1)).max(min_e)
+    let num = if s < 0 { bigint.mul(top, bigint.pow(big(2), 0 - s)) } else { top }
+    let den = if s > 0 { bigint.mul(bottom, bigint.pow(big(2), s)) } else { bottom }
+    let qr = bigint.divmod(num, den) ?? (big(0), big(0))
+    var m = bigint.to_i64(qr.0) ?? 0
+    let twice = bigint.compare(bigint.mul(qr.1, big(2)), den)
+    if twice > 0 or twice == 0 and m.bit_and(1) == 1 {
+        m = m + 1
+    }
+    var exp = s
+    if m >= 1.shl(p) {
+        m = m.shr(1)
+        exp = exp + 1
+    }
+    if m < 1.shl(p - 1) {
+        return Some(m)
+    }
+    let biased = exp + (p - 1) - min_e - (p - 2)
+    if exp + p > max_e {
+        return None
+    }
+    return Some(biased.shl(p - 1) + m - 1.shl(p - 1))
+}

@@ -1,0 +1,942 @@
+// Perl's JSON::PP (version 4.06, as in Perl 5.34): `encode` and `decode`
+// with the options that change the text -- `ascii`, `latin1`, `utf8`,
+// `indent` (and `indent_length`), `space_before`, `space_after`,
+// `pretty`, `canonical`, `escape_slash`, `allow_nonref`, `max_depth`,
+// and for decoding `relaxed`, `loose`, `allow_singlequote` and
+// `allow_barekey` -- with the module's error messages.
+//
+// JSON::PP is the JSON module every Perl has, and a program exchanging
+// JSON with Perl tools, or checking what they wrote, meets its habits:
+//
+//   - **Numbers and strings**: a Perl string is always quoted (`"10"`), a
+//     number never is, and a double prints as Perl prints it (`1e+20`,
+//     `0.5`, `Inf`, `NaN`, `-0.0` as `0`). An integral double from 2^53
+//     up to 2^62 (or down to -2^62) comes out quoted, `"1e+17"`, as it
+//     does in a Perl that has already encoded any non-integral number --
+//     the very first such number in a fresh process comes out unquoted.
+//   - **Strings** escape `"`, `\`, `\n`, `\r`, `\t`, `\f`, `\b` by name and
+//     the other control characters as `\u00XX`, but not DEL; `ascii` and
+//     `latin1` write characters beyond 127 or 255 as `\uXXXX` (pairs past
+//     U+FFFF), and `escape_slash` writes `\/`.
+//   - **Layout**: `indent` puts each element on its own line, three
+//     spaces a level (`indent_length`), and ends the text with a newline;
+//     `space_before` and `space_after` space the colon only. `canonical`
+//     sorts keys; without it this keeps the order given (Perl's own order
+//     is its hash order, which no other program can reproduce).
+//   - **Decoding** reads numbers as Perl does (`1e2` is the integer 100,
+//     `1.0` a double but `1.0e17` an integer, an integer longer than 20
+//     characters a string), keeps
+//     the last of repeated keys, and reports errors as JSON::PP does:
+//     `, or ] expected while parsing array, at character offset 6 (before
+//     "x]")` -- the offset counts UTF-8 bytes, and the context shows the
+//     bytes that follow, escaped, cut after 20 characters. `relaxed`
+//     allows trailing commas, `#`, `//` and `/* */` comments, and tabs
+//     in strings; `loose` allows control characters and unknown escapes;
+//     `allow_singlequote` and `allow_barekey` allow `'strings'` and bare
+//     keys. `true` and `false` pass `allow_nonref(0)`, as in JSON::PP.
+//
+// Not covered: blessed objects, tags and filters; `allow_bignum`; input
+// in UTF-16 or UTF-32 (which JSON::PP converts first) is refused, as are
+// integers beyond 64 bits. Decoded numbers are correctly rounded doubles.
+//
+// Checked against `perl` 5.34's JSON::PP.
+
+import bigint
+import perlsprintf
+
+/// A Perl value as JSON::PP sees it.
+type PerlJsonValue =
+    | JppUndef
+    | JppTrue
+    | JppFalse
+    /// A Perl integer (IV or UV).
+    | JppInt(n: BigInt)
+    /// A Perl double (NV).
+    | JppNum(x: f64)
+    | JppStr(s: str)
+    | JppArray(items: [PerlJsonValue])
+    | JppHash(entries: [(str, PerlJsonValue)])
+
+type PerlJsonOptions = {
+    ascii: bool,
+    latin1: bool,
+    utf8: bool,
+    indent: bool,
+    indent_length: i64,
+    space_before: bool,
+    space_after: bool,
+    canonical: bool,
+    allow_nonref: bool,
+    escape_slash: bool,
+    relaxed: bool,
+    loose: bool,
+    allow_singlequote: bool,
+    allow_barekey: bool,
+    max_depth: i64,
+}
+
+/// JSON::PP's croak, or something this does not do.
+type PerlJsonError = | PerlJsonCroak(message: str) | PerlJsonRefused(why: str)
+
+pub fn error_text(e: PerlJsonError) -> str {
+    return match e {
+        PerlJsonCroak(m) -> m
+        PerlJsonRefused(w) -> w
+    }
+}
+
+/// `JSON::PP->new`: allow_nonref on, indent_length 3, max_depth 512.
+pub fn options() -> PerlJsonOptions {
+    return PerlJsonOptions{
+        ascii: false,
+        latin1: false,
+        utf8: false,
+        indent: false,
+        indent_length: 3,
+        space_before: false,
+        space_after: false,
+        canonical: false,
+        allow_nonref: true,
+        escape_slash: false,
+        relaxed: false,
+        loose: false,
+        allow_singlequote: false,
+        allow_barekey: false,
+        max_depth: 512,
+    }
+}
+
+/// `->pretty`: indent, space_before and space_after.
+pub fn pretty(o: PerlJsonOptions) -> PerlJsonOptions {
+    var p = o
+    p.indent = true
+    p.space_before = true
+    p.space_after = true
+    return p
+}
+
+fn croak(m: str) -> PerlJsonError {
+    return PerlJsonCroak(m)
+}
+
+// ---- numbers
+
+/// How Perl prints a double: `%.15g`, with 0 for either zero.
+pub fn nv_text(x: f64) -> str {
+    if x != x {
+        return "NaN"
+    }
+    if x == 1.0 / 0.0 {
+        return "Inf"
+    }
+    if x == 0.0 - 1.0 / 0.0 {
+        return "-Inf"
+    }
+    if x == 0.0 {
+        return "0"
+    }
+    return match perlsprintf.sprintf("%.15g", [PerlNum(x)]) {
+        Ok(r) -> r.text
+        Err(_e) -> "?"
+    }
+}
+
+fn two_pow(n: i64) -> f64 {
+    var x = 1.0
+    for _k in 0..n {
+        x = x * 2.0
+    }
+    return x
+}
+
+/// A double as JSON::PP writes it: unquoted, except an integral one from
+/// 2^53 up to 2^62 or from -2^62 down to -2^53.
+fn nv_json(x: f64) -> str {
+    let t = nv_text(x)
+    let integral = x == x and x.abs() != 1.0 / 0.0 and x == x.floor()
+    if integral and x.abs() >= two_pow(53) and x >= 0.0 - two_pow(62) and x < two_pow(62) {
+        return "\"" + t + "\""
+    }
+    return t
+}
+
+// ---- encoding
+
+fn hex_digits(v: i64, width: i64) -> str {
+    let d = "0123456789abcdef"
+    var out = ""
+    var x = v
+    while x > 0 or out.len() < width {
+        out = d.substr(x.bit_and(15), 1) + out
+        x = x.shr(4)
+    }
+    return out
+}
+
+fn wide_escape(c: i64) -> str {
+    if c <= 65535 {
+        return "\\u" + hex_digits(c, 4)
+    }
+    let u = c - 65536
+    return "\\u" + hex_digits(55296 + u / 1024, 1) + "\\u" + hex_digits(56320 + u % 1024, 1)
+}
+
+/// string_to_json.
+fn string_json(s: str, o: PerlJsonOptions) -> str {
+    var out = "\""
+    for ch in s.chars() {
+        let c = ch.code_at(0)
+        if ch == "\"" {
+            out = out + "\\\""
+        } else if ch == "\\" {
+            out = out + "\\\\"
+        } else if c == 10 {
+            out = out + "\\n"
+        } else if c == 13 {
+            out = out + "\\r"
+        } else if c == 9 {
+            out = out + "\\t"
+        } else if c == 12 {
+            out = out + "\\f"
+        } else if c == 8 {
+            out = out + "\\b"
+        } else if ch == "/" and o.escape_slash {
+            out = out + "\\/"
+        } else if c < 32 {
+            out = out + "\\u00" + hex_digits(c, 2)
+        } else if o.ascii and c > 127 or o.latin1 and c > 255 {
+            out = out + wide_escape(c)
+        } else {
+            out = out + ch
+        }
+    }
+    return out + "\""
+}
+
+fn in_64_bits(n: BigInt) -> bool {
+    let low = bigint.negate(bigint.pow(bigint.from_i64(2), 63))
+    let high = bigint.pow(bigint.from_i64(2), 64)
+    return bigint.compare(n, low) >= 0 and bigint.compare(n, high) < 0
+}
+
+/// A hash's entries with repeated keys merged (the last value, the first
+/// place), sorted when canonical.
+fn hash_entries(entries: [(str, PerlJsonValue)], canonical: bool) -> [(str, PerlJsonValue)] {
+    var out: [(str, PerlJsonValue)] = []
+    for (k, v) in entries {
+        var found = false
+        for i in 0..out.len() {
+            if out[i].0 == k {
+                out[i] = (k, v)
+                found = true
+            }
+        }
+        if not found {
+            out.push((k, v))
+        }
+    }
+    if not canonical {
+        return out
+    }
+    var i = 1
+    while i < out.len() {
+        var j = i
+        while j > 0 and out[j - 1].0 > out[j].0 {
+            let t = out[j]
+            out[j] = out[j - 1]
+            out[j - 1] = t
+            j = j - 1
+        }
+        i = i + 1
+    }
+    return out
+}
+
+type JppWriter = { o: PerlJsonOptions, depth: i64, level: i64 }
+
+fn deeper(inout w: JppWriter) -> () ! PerlJsonError {
+    w.depth = w.depth + 1
+    if w.depth > w.o.max_depth {
+        fail(croak("json text or perl structure exceeds maximum nesting level (max_depth set too low?)"))
+    }
+    return ()
+}
+
+fn container_json(open: str, close: str, parts_of: [PerlJsonValue], keys: [str], inout w: JppWriter) -> str ! PerlJsonError {
+    try deeper(w)
+    var pre = ""
+    var post = ""
+    if w.o.indent {
+        let space = " ".repeat(w.o.indent_length)
+        post = "\n" + space.repeat(w.level)
+        w.level = w.level + 1
+        pre = "\n" + space.repeat(w.level)
+    }
+    let del = (if w.o.space_before { " " } else { "" }) + ":" + (if w.o.space_after { " " } else { "" })
+    var res: [str] = []
+    for i in 0..parts_of.len() {
+        let body = try value_json(parts_of[i], w)
+        res.push(if keys.len() > 0 { string_json(keys[i], w.o) + del + body } else { body })
+    }
+    w.depth = w.depth - 1
+    if w.o.indent {
+        w.level = w.level - 1
+    }
+    if res.len() == 0 {
+        return open + close
+    }
+    return open + pre + res.join("," + pre) + post + close
+}
+
+fn value_json(v: PerlJsonValue, inout w: JppWriter) -> str ! PerlJsonError {
+    return match v {
+        JppUndef -> "null"
+        JppTrue -> "true"
+        JppFalse -> "false"
+        JppInt(n) -> if in_64_bits(n) { bigint.to_str(n) } else { fail(PerlJsonRefused("an integer beyond 64 bits")) }
+        JppNum(x) -> nv_json(x)
+        JppStr(s) -> string_json(s, w.o)
+        JppArray(items) -> try container_json("[", "]", items, [], w)
+        JppHash(entries) -> {
+            let es = hash_entries(entries, w.o.canonical)
+            let values = es.map(|e| e.1)
+            let keys = es.map(|e| e.0)
+            try container_json("\{", "}", values, keys, w)
+        }
+    }
+}
+
+/// `$json->encode($value)`: the text as characters (with `utf8` its
+/// UTF-8 bytes are the bytes JSON::PP returns).
+pub fn encode(v: PerlJsonValue, o: PerlJsonOptions) -> str ! PerlJsonError {
+    let is_ref = match v {
+        JppArray(_i) -> true
+        JppHash(_e) -> true
+        JppTrue -> true
+        JppFalse -> true
+        _ -> false
+    }
+    if not is_ref and not o.allow_nonref {
+        fail(croak("hash- or arrayref expected (not a simple scalar, use allow_nonref to allow this)"))
+    }
+    var w = JppWriter{ o: o, depth: 0, level: 0 }
+    let text = try value_json(v, w)
+    return if o.indent { text + "\n" } else { text }
+}
+
+// ---- decoding
+
+/// The parser's state, as JSON::PP keeps it: the text as bytes, the
+/// offset past the current character, and the current character (-1 when
+/// past the end, -2 before the first).
+type JppReader = { text: [i64], at: i64, ch: i64, depth: i64, o: PerlJsonOptions }
+
+fn next_chr(inout r: JppReader) {
+    if r.at >= r.text.len() {
+        r.ch = 0 - 1
+        return
+    }
+    r.ch = r.text[r.at]
+    r.at = r.at + 1
+}
+
+fn mess_of(r: JppReader) -> str {
+    var mess = ""
+    var i = r.at
+    while i < r.text.len() {
+        let c = r.text[i]
+        mess = mess + (if c == 7 {
+            "\\a"
+        } else if c == 9 {
+            "\\t"
+        } else if c == 10 {
+            "\\n"
+        } else if c == 13 {
+            "\\r"
+        } else if c == 12 {
+            "\\f"
+        } else if c < 32 or c >= 128 {
+            "\\x\{" + hex_digits(c, 1) + "}"
+        } else if c == 92 {
+            "\\\\"
+        } else {
+            bytes_of([c]).to_str()
+        })
+        if mess.len() >= 20 {
+            mess = mess + "..."
+            break
+        }
+        i = i + 1
+    }
+    return if mess == "" { "(end of string)" } else { mess }
+}
+
+/// decode_error: the message, the offset and what follows.
+fn decode_error(r: JppReader, error: str) -> PerlJsonError {
+    return croak(error + ", at character offset " + r.at.to_str() + " (before \"" + mess_of(r) + "\")")
+}
+
+fn is_digit(c: i64) -> bool {
+    return c >= 48 and c <= 57
+}
+
+fn white(inout r: JppReader) -> () ! PerlJsonError {
+    while r.ch != 0 - 1 {
+        let c = r.ch
+        if c == 0 - 2 or c == 32 or c == 9 or c == 13 or c == 10 {
+            next_chr(r)
+        } else if r.o.relaxed and c == 47 {
+            next_chr(r)
+            if r.ch == 47 {
+                next_chr(r)
+                while r.ch != 0 - 1 and r.ch != 10 and r.ch != 13 {
+                    next_chr(r)
+                }
+            } else if r.ch == 42 {
+                next_chr(r)
+                try block_comment(r)
+            } else {
+                r.at = r.at - 1
+                fail(decode_error(r, "malformed JSON string, neither array, object, number, string or atom"))
+            }
+        } else if r.o.relaxed and c == 35 {
+            var p = r.at
+            while p < r.text.len() and r.text[p] != 10 {
+                p = p + 1
+            }
+            if p < r.text.len() {
+                p = p + 1
+            }
+            r.at = p
+            next_chr(r)
+        } else {
+            break
+        }
+    }
+    return ()
+}
+
+fn block_comment(inout r: JppReader) -> () ! PerlJsonError {
+    while true {
+        if r.ch == 0 - 1 {
+            fail(decode_error(r, "Unterminated comment"))
+        }
+        if r.ch == 42 {
+            next_chr(r)
+            if r.ch == 47 {
+                next_chr(r)
+                return ()
+            }
+        } else {
+            next_chr(r)
+        }
+    }
+    return ()
+}
+
+fn hex_value(c: i64) -> Option[i64] {
+    if c >= 48 and c <= 57 {
+        return Some(c - 48)
+    }
+    if c >= 97 and c <= 102 {
+        return Some(c - 87)
+    }
+    if c >= 65 and c <= 70 {
+        return Some(c - 55)
+    }
+    return None
+}
+
+fn utf8_of(cp: i64) -> [i64] {
+    return cp.to_char().to_bytes().to_list()
+}
+
+/// Whether bytes are well-formed UTF-8.
+fn utf8_valid(b: [i64]) -> bool {
+    var i = 0
+    while i < b.len() {
+        let first = b[i]
+        if first < 128 {
+            i = i + 1
+            continue
+        }
+        let n = if first >= 194 and first <= 223 { 2 } else if first >= 224 and first <= 239 { 3 } else if first >= 240 and first <= 244 { 4 } else { 0 }
+        if n == 0 or i + n > b.len() {
+            return false
+        }
+        let low = if first == 224 { 160 } else if first == 240 { 144 } else { 128 }
+        let high = if first == 237 { 159 } else if first == 244 { 143 } else { 191 }
+        if b[i + 1] < low or b[i + 1] > high {
+            return false
+        }
+        for k in 2..n {
+            if b[i + k] < 128 or b[i + k] > 191 {
+                return false
+            }
+        }
+        i = i + n
+    }
+    return true
+}
+
+/// is_valid_utf8: the length of the sequence at `at - 1`, or 0.
+fn valid_sequence(r: JppReader) -> i64 {
+    let first = r.text[r.at - 1]
+    let n = if first >= 194 and first <= 223 { 2 } else if first >= 224 and first <= 239 { 3 } else if first >= 240 and first <= 244 { 4 } else { 0 }
+    if n == 0 or r.at - 1 + n > r.text.len() {
+        return 0
+    }
+    let b1 = r.text[r.at]
+    let low = if first == 224 { 160 } else if first == 240 { 144 } else { 128 }
+    let high = if first == 237 { 159 } else if first == 244 { 143 } else { 191 }
+    if b1 < low or b1 > high {
+        return 0
+    }
+    for k in 2..n {
+        let b = r.text[r.at - 1 + k]
+        if b < 128 or b > 191 {
+            return 0
+        }
+    }
+    return n
+}
+
+/// Bytes as a Perl string: UTF-8 decoded when `utf8` and valid, else one
+/// character a byte.
+fn perl_string(b: [i64], utf8: bool) -> str {
+    if utf8 and utf8_valid(b) {
+        return bytes_of(b).to_str()
+    }
+    return b.map(|x| x.to_char()).join("")
+}
+
+/// A `\uXXXX` escape, the `u` just read: a character, or half of a
+/// surrogate pair.
+fn unicode_escape(inout r: JppReader, inout s: [i64], inout is_utf8: bool, inout utf16: i64) -> () ! PerlJsonError {
+    var u = 0
+    for _k in 0..4 {
+        next_chr(r)
+        match hex_value(r.ch) {
+            Some(d) -> u = u * 16 + d
+            None -> fail(decode_error(r, "unexpected end of string while parsing JSON string"))
+        }
+    }
+    if u >= 55296 and u <= 56319 {
+        utf16 = u
+    } else if u >= 56320 and u <= 57343 {
+        if utf16 < 0 {
+            fail(decode_error(r, "missing high surrogate character in surrogate pair"))
+        }
+        is_utf8 = true
+        s = s + utf8_of(65536 + (utf16 - 55296) * 1024 + (u - 56320))
+        utf16 = 0 - 1
+    } else {
+        if utf16 >= 0 {
+            fail(decode_error(r, "surrogate pair expected"))
+        }
+        if u > 127 {
+            is_utf8 = true
+            s = s + utf8_of(u)
+        } else {
+            s.push(u)
+        }
+    }
+    return ()
+}
+
+fn string_value(inout r: JppReader) -> str ! PerlJsonError {
+    var s: [i64] = []
+    var is_utf8 = false
+    var utf16 = 0 - 1
+    if not (r.ch == 34 or r.o.allow_singlequote and r.ch == 39) {
+        fail(decode_error(r, "unexpected end of string while parsing JSON string"))
+    }
+    let bound = r.ch
+    while true {
+        next_chr(r)
+        if r.ch == 0 - 1 {
+            break
+        }
+        if r.ch == bound {
+            next_chr(r)
+            if utf16 >= 0 {
+                fail(decode_error(r, "missing low surrogate character in surrogate pair"))
+            }
+            return perl_string(s, is_utf8)
+        }
+        if r.ch == 92 {
+            next_chr(r)
+            let c = r.ch
+            let named = [(98, 8), (116, 9), (110, 10), (102, 12), (114, 13), (92, 92), (34, 34), (47, 47)]
+            var done = false
+            for (k, v) in named {
+                if c == k {
+                    s.push(v)
+                    done = true
+                }
+            }
+            if done {
+                continue
+            }
+            if c == 117 {
+                try unicode_escape(r, s, is_utf8, utf16)
+                continue
+            }
+            if not r.o.loose {
+                r.at = r.at - 2
+                fail(decode_error(r, "illegal backslash escape sequence in string"))
+            }
+            if c >= 0 {
+                s.push(c)
+            }
+            continue
+        }
+        var piece = [r.ch]
+        if r.ch > 127 {
+            let n = valid_sequence(r)
+            if n == 0 {
+                r.at = r.at - 1
+                fail(decode_error(r, "malformed UTF-8 character in JSON string"))
+            }
+            piece = r.text.slice(r.at - 1, r.at - 1 + n)
+            r.at = r.at + n - 1
+            is_utf8 = true
+        }
+        if not r.o.loose and piece.len() == 1 and (piece[0] < 32 or piece[0] == 34 or piece[0] == 92) {
+            if not r.o.relaxed or piece[0] != 9 {
+                r.at = r.at - 1
+                fail(decode_error(r, "invalid character encountered while parsing JSON string"))
+            }
+        }
+        s = s + piece
+    }
+    fail(decode_error(r, "unexpected end of string while parsing JSON string"))
+}
+
+fn bare_key(inout r: JppReader) -> str {
+    var key: [i64] = []
+    while true {
+        let c = r.ch
+        let ok = c == 36 or is_digit(c) or c >= 65 and c <= 90 or c == 95 or c >= 97 and c <= 122 or c >= 128
+        if not ok {
+            break
+        }
+        key.push(c)
+        next_chr(r)
+    }
+    return perl_string(key, false)
+}
+
+fn word(inout r: JppReader) -> PerlJsonValue ! PerlJsonError {
+    let start = r.at - 1
+    let w = r.text.slice(start, (start + 4).min(r.text.len()))
+    let text = if utf8_valid(w) { bytes_of(w).to_str() } else { "" }
+    if text == "true" {
+        r.at = r.at + 3
+        next_chr(r)
+        return JppTrue
+    }
+    if text == "null" {
+        r.at = r.at + 3
+        next_chr(r)
+        return JppUndef
+    }
+    if text == "fals" {
+        r.at = r.at + 3
+        if r.at < r.text.len() and r.text[r.at] == 101 {
+            r.at = r.at + 1
+            next_chr(r)
+            return JppFalse
+        }
+    }
+    r.at = r.at - 1
+    let first = if w.len() > 0 { w[0] } else { 0 - 1 }
+    if first == 110 {
+        fail(decode_error(r, "'null' expected"))
+    }
+    if first == 116 {
+        fail(decode_error(r, "'true' expected"))
+    }
+    if first == 102 {
+        fail(decode_error(r, "'false' expected"))
+    }
+    fail(decode_error(r, "malformed JSON string, neither array, object, number, string or atom"))
+}
+
+fn digits_while(inout r: JppReader, inout n: str) {
+    next_chr(r)
+    while r.ch != 0 - 1 and is_digit(r.ch) {
+        n = n + r.ch.to_char()
+        next_chr(r)
+    }
+}
+
+fn number(inout r: JppReader) -> PerlJsonValue ! PerlJsonError {
+    var n = ""
+    var is_dec = false
+    var is_exp = false
+    if r.ch == 45 {
+        n = "-"
+        next_chr(r)
+        if r.ch == 0 - 1 or not is_digit(r.ch) {
+            fail(decode_error(r, "malformed number (no digits after initial minus)"))
+        }
+    }
+    if r.ch == 48 {
+        let peek = if r.at < r.text.len() { r.text[r.at] } else { 0 - 1 }
+        let bad = is_digit(peek) or peek >= 97 and peek <= 100 or peek == 102 or peek >= 65 and peek <= 68 or peek == 70
+        if bad {
+            fail(decode_error(r, "malformed number (leading zero must not be followed by another digit)"))
+        }
+        n = n + "0"
+        next_chr(r)
+    }
+    while r.ch != 0 - 1 and is_digit(r.ch) {
+        n = n + r.ch.to_char()
+        next_chr(r)
+    }
+    if r.ch == 46 {
+        n = n + "."
+        is_dec = true
+        next_chr(r)
+        if r.ch == 0 - 1 or not is_digit(r.ch) {
+            fail(decode_error(r, "malformed number (no digits after decimal point)"))
+        }
+        n = n + r.ch.to_char()
+        digits_while(r, n)
+    }
+    if r.ch == 101 or r.ch == 69 {
+        n = n + r.ch.to_char()
+        is_exp = true
+        next_chr(r)
+        if r.ch == 43 or r.ch == 45 {
+            n = n + r.ch.to_char()
+            next_chr(r)
+            if r.ch == 0 - 1 or not is_digit(r.ch) {
+                fail(decode_error(r, "malformed number (no digits after exp sign)"))
+            }
+            n = n + r.ch.to_char()
+        } else if r.ch != 0 - 1 and is_digit(r.ch) {
+            n = n + r.ch.to_char()
+        } else {
+            fail(decode_error(r, "malformed number (no digits after exp sign)"))
+        }
+        digits_while(r, n)
+    }
+    return number_value(n, is_dec, is_exp)
+}
+
+/// What `$v/1.0` or `0+$v` makes of the number's text.
+fn number_value(n: str, is_dec: bool, is_exp: bool) -> PerlJsonValue {
+    let x = n.parse_float() ?? 0.0
+    let integral = x == x and x.abs() != 1.0 / 0.0 and x == x.floor() and x >= 0.0 - two_pow(63) and x < two_pow(64)
+    if is_dec {
+        // `$v/1.0`: Perl divides as integers only past 2^53.
+        return if integral and x.abs() > two_pow(53) { JppInt(bigint.parse(perlsprintf_integer(x)) ?? bigint.zero()) } else { JppNum(x) }
+    }
+    if is_exp {
+        return if integral { JppInt(bigint.parse(perlsprintf_integer(x)) ?? bigint.zero()) } else { JppNum(x) }
+    }
+    if n.len() > 20 {
+        return JppStr(n)
+    }
+    let v = bigint.parse(n) ?? bigint.zero()
+    if in_64_bits(v) {
+        return JppInt(v)
+    }
+    if n.starts_with("-") and bigint.compare(bigint.negate(v), bigint.pow(bigint.from_i64(2), 64)) < 0 {
+        // -(NV)value: the magnitude, a 64-bit integer, made a double.
+        return JppNum(0.0 - (n.substr(1, n.len() - 1).parse_float() ?? 0.0))
+    }
+    return JppNum(x)
+}
+
+/// An integral double's digits.
+fn perlsprintf_integer(x: f64) -> str {
+    return match perlsprintf.sprintf("%.0f", [PerlNum(x)]) {
+        Ok(r) -> r.text
+        Err(_e) -> "0"
+    }
+}
+
+fn deeper_read(inout r: JppReader) -> () ! PerlJsonError {
+    r.depth = r.depth + 1
+    if r.depth > r.o.max_depth {
+        fail(decode_error(r, "json text or perl structure exceeds maximum nesting level (max_depth set too low?)"))
+    }
+    return ()
+}
+
+fn array(inout r: JppReader) -> PerlJsonValue ! PerlJsonError {
+    try deeper_read(r)
+    var items: [PerlJsonValue] = []
+    next_chr(r)
+    try white(r)
+    if r.ch == 93 {
+        r.depth = r.depth - 1
+        next_chr(r)
+        return JppArray(items)
+    }
+    while r.ch != 0 - 1 {
+        match try value(r) {
+            Some(v) -> items.push(v)
+            None -> {}
+        }
+        try white(r)
+        if r.ch == 0 - 1 {
+            break
+        }
+        if r.ch == 93 {
+            r.depth = r.depth - 1
+            next_chr(r)
+            return JppArray(items)
+        }
+        if r.ch != 44 {
+            break
+        }
+        next_chr(r)
+        try white(r)
+        if r.o.relaxed and r.ch == 93 {
+            r.depth = r.depth - 1
+            next_chr(r)
+            return JppArray(items)
+        }
+    }
+    if r.ch >= 0 {
+        r.at = r.at - 1
+    }
+    fail(decode_error(r, ", or ] expected while parsing array"))
+}
+
+fn put(entries: [(str, PerlJsonValue)], k: str, v: PerlJsonValue) -> [(str, PerlJsonValue)] {
+    var out = entries
+    for i in 0..out.len() {
+        if out[i].0 == k {
+            out[i] = (k, v)
+            return out
+        }
+    }
+    out.push((k, v))
+    return out
+}
+
+fn object(inout r: JppReader) -> PerlJsonValue ! PerlJsonError {
+    try deeper_read(r)
+    var entries: [(str, PerlJsonValue)] = []
+    next_chr(r)
+    try white(r)
+    if r.ch == 125 {
+        r.depth = r.depth - 1
+        next_chr(r)
+        return JppHash(entries)
+    }
+    while r.ch != 0 - 1 {
+        let k = if r.o.allow_barekey and r.ch != 34 and r.ch != 39 { bare_key(r) } else { try string_value(r) }
+        try white(r)
+        if r.ch != 58 {
+            r.at = r.at - 1
+            fail(decode_error(r, "':' expected"))
+        }
+        next_chr(r)
+        entries = put(entries, k, (try value(r)) ?? JppUndef)
+        try white(r)
+        if r.ch == 0 - 1 {
+            break
+        }
+        if r.ch == 125 {
+            r.depth = r.depth - 1
+            next_chr(r)
+            return JppHash(entries)
+        }
+        if r.ch != 44 {
+            break
+        }
+        next_chr(r)
+        try white(r)
+        if r.o.relaxed and r.ch == 125 {
+            r.depth = r.depth - 1
+            next_chr(r)
+            return JppHash(entries)
+        }
+    }
+    if r.ch >= 0 {
+        r.at = r.at - 1
+    }
+    fail(decode_error(r, ", or } expected while parsing object/hash"))
+}
+
+fn value(inout r: JppReader) -> Option[PerlJsonValue] ! PerlJsonError {
+    try white(r)
+    let c = r.ch
+    if c == 0 - 1 {
+        return None
+    }
+    if c == 123 {
+        return Some(try object(r))
+    }
+    if c == 91 {
+        return Some(try array(r))
+    }
+    if c == 40 {
+        fail(decode_error(r, "malformed JSON string, neither array, object, number, string or atom"))
+    }
+    if c == 34 or r.o.allow_singlequote and c == 39 {
+        return Some(JppStr(try string_value(r)))
+    }
+    if is_digit(c) or c == 45 {
+        return Some(try number(r))
+    }
+    return Some(try word(r))
+}
+
+/// `$json->decode($text)` for a text of characters. With `utf8` the
+/// characters are the bytes, and one beyond U+00FF is an error.
+pub fn decode(text: str, o: PerlJsonOptions) -> PerlJsonValue ! PerlJsonError {
+    if not o.utf8 {
+        return try decode_from(text.to_bytes().to_list(), o)
+    }
+    var b: [i64] = []
+    for ch in text.chars() {
+        let c = ch.code_at(0)
+        if c > 255 {
+            fail(croak("Wide character in subroutine entry"))
+        }
+        b.push(c)
+    }
+    return try decode_from(b, o)
+}
+
+/// `$json->decode($bytes)` for a byte string.
+pub fn decode_bytes(b: bytes, o: PerlJsonOptions) -> PerlJsonValue ! PerlJsonError {
+    if o.utf8 {
+        return try decode_from(b.to_list(), o)
+    }
+    return try decode_from(perl_string(b.to_list(), false).to_bytes().to_list(), o)
+}
+
+fn decode_from(text: [i64], o: PerlJsonOptions) -> PerlJsonValue ! PerlJsonError {
+    if o.utf8 and text.len() >= 4 and (text[0] == 0 or text[1] == 0) {
+        fail(PerlJsonRefused("a text in UTF-16 or UTF-32"))
+    }
+    var r = JppReader{ text: text, at: 0, ch: 0 - 2, depth: 0, o: o }
+    try white(r)
+    if r.ch == 0 - 1 {
+        fail(decode_error(r, "malformed JSON string, neither array, object, number, string or atom"))
+    }
+    let result = (try value(r)) ?? JppUndef
+    let is_ref = match result {
+        JppArray(_i) -> true
+        JppHash(_e) -> true
+        JppTrue -> true
+        JppFalse -> true
+        _ -> false
+    }
+    if not o.allow_nonref and not is_ref {
+        fail(croak("JSON text must be an object or array (but found number, string, true, false or null, use allow_nonref to allow this)"))
+    }
+    try white(r)
+    if r.ch != 0 - 1 {
+        fail(decode_error(r, "garbage after JSON object"))
+    }
+    return result
+}

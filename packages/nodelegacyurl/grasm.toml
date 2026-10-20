@@ -1,0 +1,12 @@
+[package]
+name = "nodelegacyurl"
+version = "1.0.0"
+capabilities = []
+
+[dependencies.jsuri]
+path = "../jsuri"
+version = "^1.0.0"
+
+[dependencies.querystring]
+path = "../querystring"
+version = "^1.0.0"

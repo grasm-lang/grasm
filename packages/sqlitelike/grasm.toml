@@ -1,0 +1,12 @@
+[package]
+name = "sqlitelike"
+version = "1.0.0"
+capabilities = []
+
+[dependencies.sqlitefile]
+path = "../sqlitefile"
+version = "^1.0.0"
+
+[dependencies.sqliteprintf]
+path = "../sqliteprintf"
+version = "^1.0.0"

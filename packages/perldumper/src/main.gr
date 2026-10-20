@@ -1,0 +1,730 @@
+// Perl's Data::Dumper, as its XS implementation (2.179, Perl 5.34) writes
+// a value with `$Data::Dumper::Sortkeys` set.
+//
+// `Dumper` output is how Perl programs log, debug, snapshot and diff their
+// data, and it is Perl source: a test fixture, a cache file or a config
+// written with it is read back with `eval`. Writing the same text means a
+// non-Perl tool can produce fixtures a Perl test compares byte for byte,
+// or show a Storable file exactly as `perl -MData::Dumper` would.
+//
+// A value is a graph of Perl SVs, as perlstorable's `PerlDoc` holds one:
+// every scalar, array and hash is a node, and a reference names its
+// target node, so a structure shared or cyclic, a reference to an array
+// element, and a blessed object are all as Perl has them. A container
+// node given as a value to dump stands for a reference to it, which is
+// what `thaw` hands back.
+//
+// What Dumper decides from the SV:
+//
+//   - An integer (IOK) prints bare, quoted past ten characters; one whose
+//     string form differs (`!!0`, whose string is "") goes the string way.
+//   - A double prints as its string, "%.15g", quoted; under Useqq a short
+//     decimal integer is bare.
+//   - A byte string is single-quoted with `'` and `\` escaped and every
+//     other byte raw. A character string (UTF-8 flag) with anything past
+//     ASCII is double-quoted with `\x{...}` escapes. Useqq double-quotes
+//     everything with C escapes and octal.
+//   - Hash keys sort as Perl's `sv_cmp` sorts them; Quotekeys 0 leaves a
+//     key bare when it is an identifier or a short decimal integer.
+//   - A reference met a second time prints the path where it was first
+//     dumped (`$VAR1->{'a'}[0]`); under Purity a placeholder, and the
+//     assignment after the statement. Deepcopy dumps repeats in full and
+//     keeps names only for cycles.
+//   - Indent 0, 1, 2 and 3; Pad, Varname, Terse, Pair, Trailingcomma,
+//     Maxrecurse (an error past it, as Perl croaks), the Bless keyword, and
+//     names given to `Dump`, `*name` included.
+//
+// The output is bytes: a byte string's high bytes go out raw. Pad, Pair,
+// Varname and names are taken to be ASCII; Perl upgrades the whole output
+// when one is not, and that is not followed. Maxdepth (which prints an
+// address) and code references are not handled.
+//
+// One place Perl's own output is not defined: the path to an array, built
+// for a later reference to print, is copied with strlcpy, so a NUL byte in
+// a hash key on that path ends the copy and the rest of the name is
+// whatever the buffer held. Here the path is the key as written.
+import perlstorable
+
+/// The settings of a `Data::Dumper` object, as its methods set them.
+type DumperOptions = {
+    indent: i64,
+    pad: str,
+    varname: str,
+    terse: bool,
+    useqq: bool,
+    quotekeys: bool,
+    pair: str,
+    trailingcomma: bool,
+    purity: bool,
+    deepcopy: bool,
+    maxrecurse: i64,
+    bless: str,
+    names: [str]
+}
+
+/// `Recursion limit of N exceeded`, which Dumper croaks.
+type DumperError = | DumperRecursion(limit: i64)
+
+pub fn error_text(e: DumperError) -> str {
+    return match e {
+        DumperRecursion(n) -> "Recursion limit of " + n.to_str() + " exceeded"
+    }
+}
+
+/// Data::Dumper's defaults: Indent 2, Quotekeys 1, Pair " => ", Varname
+/// "VAR", Maxrecurse 1000, "bless".
+pub fn default_options() -> DumperOptions {
+    return DumperOptions{
+        indent: 2,
+        pad: "",
+        varname: "VAR",
+        terse: false,
+        useqq: false,
+        quotekeys: true,
+        pair: " => ",
+        trailingcomma: false,
+        purity: false,
+        deepcopy: false,
+        maxrecurse: 1000,
+        bless: "bless",
+        names: []
+    }
+}
+
+type DumpState = {
+    doc: PerlDoc,
+    o: DumperOptions,
+    out: [i64],
+    xpad: [i64],
+    sep: [i64],
+    // The seen table: an SV's identity to its entry, the name it was
+    // dumped under, and whether its dump has finished.
+    seen: Map[i64, i64],
+    names: [[i64]],
+    marks: [bool],
+    post: [[i64]],
+    recursed: bool,
+    classes: Map[i64, str]
+}
+
+fn ascii(s: str) -> [i64] {
+    return s.to_bytes().to_list()
+}
+
+fn put(inout st: DumpState, s: str) {
+    for b in s.to_bytes().to_list() {
+        st.out.push(b)
+    }
+}
+
+fn put_all(inout st: DumpState, bs: [i64]) {
+    for b in bs {
+        st.out.push(b)
+    }
+}
+
+fn repeat(bs: [i64], n: i64) -> [i64] {
+    var out: [i64] = []
+    for _i in 0..n {
+        out = out + bs
+    }
+    return out
+}
+
+fn spaces(n: i64) -> [i64] {
+    return repeat([32], n)
+}
+
+/// The SV a node is: a blessed node is the object it blesses.
+fn canon(doc: PerlDoc, id: i64) -> i64 {
+    var at = id
+    var steps = 0
+    while steps <= doc.nodes.len() {
+        match doc.nodes[at] {
+            PlBlessed(_c, t) -> at = t
+            _ -> return at
+        }
+        steps = steps + 1
+    }
+    return at
+}
+
+// ---- strings
+
+fn is_print(c: i64) -> bool {
+    return c >= 32 and c <= 126
+}
+
+/// safe_decimal_number: /^(?:0|-?[1-9]\d{0,8})\z/.
+fn safe_decimal(p: [i64]) -> bool {
+    if p.len() == 1 and p[0] == 48 {
+        return true
+    }
+    var i = if p.len() > 0 and p[0] == 45 { 1 } else { 0 }
+    if i >= p.len() or p[i] < 49 or p[i] > 57 {
+        return false
+    }
+    if p.len() - i - 1 > 8 {
+        return false
+    }
+    i = i + 1
+    while i < p.len() {
+        if p[i] < 48 or p[i] > 57 {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn is_word(c: i64) -> bool {
+    return (c >= 48 and c <= 57) or (c >= 65 and c <= 90) or (c >= 97 and c <= 122) or c == 95
+}
+
+fn key_needs_quote(k: [i64]) -> bool {
+    if safe_decimal(k) {
+        return false
+    }
+    if k.len() == 0 or not (is_word(k[0]) and not (k[0] >= 48 and k[0] <= 57)) {
+        return true
+    }
+    for c in k {
+        if not is_word(c) {
+            return true
+        }
+    }
+    return false
+}
+
+/// esc_q inside single quotes.
+fn single_quoted(s: [i64]) -> [i64] {
+    var out = [39]
+    for c in s {
+        if c == 39 or c == 92 {
+            out.push(92)
+        }
+        out.push(c)
+    }
+    out.push(39)
+    return out
+}
+
+fn hex_lower(v: i64) -> [i64] {
+    let digits = "0123456789abcdef"
+    var rev: [i64] = []
+    var x = v
+    while true {
+        rev.push(digits.code_at(x % 16))
+        x = x / 16
+        if x == 0 {
+            break
+        }
+    }
+    var out: [i64] = []
+    var i = rev.len() - 1
+    while i >= 0 {
+        out.push(rev[i])
+        i = i - 1
+    }
+    return out
+}
+
+/// Code points of UTF-8 bytes (the input is well formed).
+fn decode_utf8(s: [i64]) -> [i64] {
+    var out: [i64] = []
+    var i = 0
+    while i < s.len() {
+        let b = s[i]
+        let n = if b < 128 { 1 } else if b < 224 { 2 } else if b < 240 { 3 } else { 4 }
+        var c = if n == 1 { b } else if n == 2 { b.bit_and(31) } else if n == 3 { b.bit_and(15) } else { b.bit_and(7) }
+        for k in 1..n {
+            c = c.shl(6) + (if i + k < s.len() { s[i + k].bit_and(63) } else { 0 })
+        }
+        out.push(c)
+        i = i + n
+    }
+    return out
+}
+
+fn qq_control(k: i64, next_is_digit: bool) -> [i64] {
+    let named = [(7, 97), (8, 98), (9, 116), (10, 110), (12, 102), (13, 114), (27, 101)]
+    for (c, letter) in named {
+        if c == k {
+            return [92, letter]
+        }
+    }
+    if k <= 7 and not next_is_digit {
+        return [92, 48 + k]
+    }
+    if k <= 63 and not next_is_digit {
+        return [92, 48 + k.shr(3), 48 + k.bit_and(7)]
+    }
+    return [92, 48 + k.shr(6), 48 + k.bit_and(63).shr(3), 48 + k.bit_and(7)]
+}
+
+/// esc_q_utf8: a character string, or any string under Useqq.
+fn qq_quoted(s: [i64], utf8: bool, useqq: bool) -> [i64] {
+    let chars = if utf8 { decode_utf8(s) } else { s }
+    var wide = false
+    for c in chars {
+        if utf8 and c >= 128 {
+            wide = true
+        }
+    }
+    if not wide and not useqq {
+        return single_quoted(s)
+    }
+    var out = [34]
+    for i in 0..chars.len() {
+        let k = chars[i]
+        if utf8 and k >= 128 {
+            out = out + [92, 120, 123] + hex_lower(k) + [125]
+        } else if is_print(k) {
+            if k == 34 or k == 92 or k == 36 or k == 64 {
+                out.push(92)
+            }
+            out.push(k)
+        } else if not useqq {
+            out.push(k)
+        } else {
+            let next_is_digit = i + 1 < chars.len() and chars[i + 1] >= 48 and chars[i + 1] <= 57
+            out = out + qq_control(k, next_is_digit)
+        }
+    }
+    out.push(34)
+    return out
+}
+
+/// A string scalar's text: bare under Useqq when a short decimal integer,
+/// else quoted.
+fn string_value(st: DumpState, c: [i64], utf8: bool) -> [i64] {
+    if st.o.useqq and safe_decimal(c) {
+        return c
+    }
+    if utf8 or st.o.useqq {
+        return qq_quoted(c, utf8, st.o.useqq)
+    }
+    return single_quoted(c)
+}
+
+/// A double as Perl stringifies it.
+fn nv_text(f: f64) -> str {
+    return if f == 0.0 { "0" } else { perlstorable.perl_number(f) }
+}
+
+// ---- hash keys
+
+/// A key as `sv_cmp` compares it: UTF-8, a byte string upgraded.
+fn key_order_bytes(k: (bytes, bool)) -> [i64] {
+    let (b, utf8) = k
+    if utf8 {
+        return b.to_list()
+    }
+    var out: [i64] = []
+    for c in b.to_list() {
+        if c < 128 {
+            out.push(c)
+        } else {
+            out.push(192 + c.shr(6))
+            out.push(128 + c.bit_and(63))
+        }
+    }
+    return out
+}
+
+fn bytes_less(a: [i64], b: [i64]) -> bool {
+    let n = if a.len() < b.len() { a.len() } else { b.len() }
+    for i in 0..n {
+        if a[i] != b[i] {
+            return a[i] < b[i]
+        }
+    }
+    return a.len() < b.len()
+}
+
+/// The positions of the keys in sorted order (a stable merge sort).
+fn sorted_positions(keys: [(bytes, bool)]) -> [i64] {
+    let order = keys.map(|k| key_order_bytes(k))
+    var idx: [i64] = []
+    for i in 0..keys.len() {
+        idx.push(i)
+    }
+    var width = 1
+    while width < idx.len() {
+        var merged: [i64] = []
+        var lo = 0
+        while lo < idx.len() {
+            let mid = if lo + width < idx.len() { lo + width } else { idx.len() }
+            let hi = if lo + 2 * width < idx.len() { lo + 2 * width } else { idx.len() }
+            var i = lo
+            var j = mid
+            while i < mid or j < hi {
+                if j >= hi or (i < mid and not bytes_less(order[idx[j]], order[idx[i]])) {
+                    merged.push(idx[i])
+                    i = i + 1
+                } else {
+                    merged.push(idx[j])
+                    j = j + 1
+                }
+            }
+            lo = hi
+        }
+        idx = merged
+        width = width * 2
+    }
+    return idx
+}
+
+// ---- the walk
+
+/// An SV's identity for the seen table: its node, and one identity for
+/// every PL_sv_undef, which is a single SV in Perl.
+fn ident_of(doc: PerlDoc, id: i64) -> i64 {
+    let c = canon(doc, id)
+    return match doc.nodes[c] {
+        PlSvUndef -> 0 - 1
+        _ -> c
+    }
+}
+
+/// 0 for a scalar, 1 for an array, 2 for a hash.
+fn kind_of(doc: PerlDoc, id: i64) -> i64 {
+    return match doc.nodes[canon(doc, id)] {
+        PlArray(_i) -> 1
+        PlHash(_k, _v) -> 2
+        _ -> 0
+    }
+}
+
+fn seen_add(inout st: DumpState, id: i64, name: [i64]) -> i64 {
+    st.names.push(name)
+    st.marks.push(false)
+    let e = st.names.len() - 1
+    st.seen.set(id, e)
+    return e
+}
+
+fn seen_finish(inout st: DumpState, id: i64, entry: i64) {
+    if st.o.deepcopy {
+        let _gone = st.seen.delete(id)
+    } else if entry >= 0 {
+        st.marks[entry] = true
+    }
+}
+
+/// Whether a path into this name takes `->`: after a plain variable, and
+/// after `${...}`, but not between two subscripts.
+fn needs_arrow(name: [i64]) -> bool {
+    let n = name.len()
+    return (n > 0 and name[n - 1] != 93 and name[n - 1] != 125) or (n > 4 and (name[1] == 123 or (name[0] == 92 and name[2] == 123)))
+}
+
+fn tail(bs: [i64]) -> [i64] {
+    var out: [i64] = []
+    for i in 1..bs.len() {
+        out.push(bs[i])
+    }
+    return out
+}
+
+/// One SV, under the name a later reference to it would print.
+fn dd(inout st: DumpState, node: i64, fresh: i64, name: [i64], level: i64, apad: [i64]) {
+    if st.recursed {
+        return
+    }
+    let c = canon(st.doc, node)
+    match st.doc.nodes[c] {
+        PlArray(_i) -> dump_ref(st, node, name, level, apad)
+        PlHash(_k, _v) -> dump_ref(st, node, name, level, apad)
+        PlRef(t, _w, _o) -> dump_ref(st, t, name, level, apad)
+        _ -> dump_scalar(st, c, if fresh != 0 { fresh } else { ident_of(st.doc, c) }, name)
+    }
+}
+
+/// A reference met before: its first name, or Purity's placeholder.
+fn dump_seen(inout st: DumpState, other: [i64], kind: i64, name: [i64], level: i64) {
+    if st.o.purity and level > 0 {
+        put(st, if kind == 2 { "\{}" } else if kind == 1 { "[]" } else { "do\{my $o}" })
+        st.post.push(name + ascii(" = ") + other)
+    } else if name[0] == 64 or name[0] == 37 {
+        if other.len() > 1 and other[0] == 92 and other[1] == name[0] {
+            put_all(st, tail(other))
+        } else {
+            st.out.push(name[0])
+            put(st, "\{")
+            put_all(st, other)
+            put(st, "}")
+        }
+    } else {
+        put_all(st, other)
+    }
+}
+
+fn dump_ref(inout st: DumpState, target: i64, name: [i64], level: i64, apad: [i64]) {
+    let ival = canon(st.doc, target)
+    let id = ident_of(st.doc, ival)
+    let kind = kind_of(st.doc, ival)
+    match st.seen.get(id) {
+        Some(e) -> {
+            dump_seen(st, st.names[e], kind, name, level)
+            return
+        }
+        None -> {}
+    }
+    let entry = seen_add(st, id, if name[0] == 64 or name[0] == 37 { [92] + name } else { name })
+    if st.o.maxrecurse > 0 and level >= st.o.maxrecurse {
+        st.recursed = true
+    }
+    let class = st.classes.get(ival)
+    var inner_apad = apad
+    if class.is_some() {
+        put(st, st.o.bless)
+        put(st, "( ")
+        if st.o.indent >= 2 {
+            inner_apad = apad + spaces(st.o.bless.to_bytes().len() + 2)
+        }
+    }
+    let ipad = repeat(st.xpad, level + 1)
+    match st.doc.nodes[ival] {
+        PlArray(items) -> dump_array(st, items, name, level, inner_apad, ipad)
+        PlHash(keys, values) -> dump_hash(st, keys, values, name, level, inner_apad, ipad)
+        _ -> {
+            let namesv = ascii("$\{") + name + ascii("}")
+            if class.is_some() {
+                put(st, "do\{\\(my $o = ")
+                dd(st, ival, 0, namesv, level + 1, inner_apad)
+                put(st, ")}")
+            } else {
+                put(st, "\\")
+                dd(st, ival, 0, namesv, level + 1, inner_apad)
+            }
+        }
+    }
+    match class {
+        Some(c) -> {
+            put(st, ", ")
+            put_all(st, single_quoted(ascii(c)))
+            put(st, " )")
+        }
+        None -> {}
+    }
+    seen_finish(st, id, entry)
+}
+
+fn dump_array(inout st: DumpState, items: [i64], name: [i64], level: i64, apad: [i64], ipad: [i64]) {
+    var iname = name
+    if name[0] == 64 {
+        put(st, "(")
+        iname = [36] + tail(name)
+    } else {
+        put(st, "[")
+        if needs_arrow(name) {
+            iname = iname + [45, 62]
+        }
+    }
+    iname = iname + [91]
+    let totpad = st.sep + ascii(st.o.pad) + apad
+    for ix in 0..items.len() {
+        if st.o.indent >= 3 {
+            put_all(st, totpad)
+            put_all(st, ipad)
+            put(st, "#" + ix.to_str())
+        }
+        put_all(st, totpad)
+        put_all(st, ipad)
+        dd(st, items[ix], 0, iname + ascii(ix.to_str()) + [93], level + 1, apad)
+        if ix < items.len() - 1 or (st.o.trailingcomma and st.o.indent >= 1) {
+            put(st, ",")
+        }
+    }
+    if items.len() > 0 {
+        put_all(st, totpad)
+        put_all(st, repeat(st.xpad, level))
+    }
+    put(st, if name[0] == 64 { ")" } else { "]" })
+}
+
+fn hash_key(st: DumpState, k: [i64], utf8: bool) -> [i64] {
+    if st.o.quotekeys or key_needs_quote(k) {
+        return if utf8 or st.o.useqq { qq_quoted(k, utf8, st.o.useqq) } else { single_quoted(k) }
+    }
+    return k
+}
+
+fn dump_hash(inout st: DumpState, keys: [(bytes, bool)], values: [i64], name: [i64], level: i64, apad: [i64], ipad: [i64]) {
+    var iname = name
+    if name[0] == 37 {
+        put(st, "(")
+        iname = [36] + tail(name)
+    } else {
+        put(st, "\{")
+        if needs_arrow(name) {
+            iname = iname + [45, 62]
+        }
+    }
+    iname = iname + [123]
+    let totpad = st.sep + ascii(st.o.pad) + apad
+    let order = sorted_positions(keys)
+    for i in 0..order.len() {
+        let (kb, utf8) = keys[order[i]]
+        if i > 0 {
+            put(st, ",")
+        }
+        put_all(st, totpad)
+        put_all(st, ipad)
+        let nkey = hash_key(st, kb.to_list(), utf8)
+        put_all(st, nkey)
+        put(st, st.o.pair)
+        let newapad = if st.o.indent >= 2 { apad + spaces(nkey.len() + 4) } else { apad }
+        dd(st, values[order[i]], 0, iname + nkey + [125], level + 1, newapad)
+    }
+    if order.len() > 0 {
+        if st.o.trailingcomma and st.o.indent >= 1 {
+            put(st, ",")
+        }
+        put_all(st, totpad)
+        put_all(st, repeat(st.xpad, level))
+    }
+    put(st, if name[0] == 37 { ")" } else { "}" })
+}
+
+/// An integer: bare, or quoted past ten characters (for a 32-bit reader).
+fn int_text(text: str) -> [i64] {
+    let t = ascii(text)
+    return if t.len() > 10 { [39] + t + [39] } else { t }
+}
+
+fn dump_scalar(inout st: DumpState, node: i64, id: i64, name: [i64]) {
+    var entry = 0 - 1
+    match st.seen.get(id) {
+        Some(e) -> {
+            if st.marks[e] {
+                put(st, "$\{")
+                put_all(st, st.names[e])
+                put(st, "}")
+                return
+            }
+            entry = e
+        }
+        None -> {
+            if id != 0 - 1 {
+                entry = seen_add(st, id, [92] + name)
+            }
+        }
+    }
+    let text = match st.doc.nodes[node] {
+        PlInt(i) -> int_text(i.to_str())
+        PlYes -> [49]
+        PlNo -> string_value(st, [], false)
+        PlDouble(f) -> string_value(st, ascii(nv_text(f)), false)
+        PlBytes(b) -> string_value(st, b.to_list(), false)
+        PlUtf8(s) -> string_value(st, ascii(s), true)
+        _ -> ascii("undef")
+    }
+    put_all(st, text)
+    seen_finish(st, id, entry)
+}
+
+/// The name a value is dumped under: `$VAR1`, or the name given, a
+/// leading `*` taking the sigil of what the value refers to.
+fn value_name(o: DumperOptions, i: i64, is_ref: bool, kind: i64) -> [i64] {
+    if i >= o.names.len() {
+        return ascii("$" + o.varname + (i + 1).to_str())
+    }
+    let nm = ascii(o.names[i])
+    if nm.len() > 0 and nm[0] == 42 {
+        let sigil = if not is_ref { 36 } else if kind == 1 { 64 } else if kind == 2 { 37 } else { 36 }
+        return [sigil] + tail(nm)
+    }
+    if nm.len() == 0 or nm[0] != 36 {
+        return [36] + nm
+    }
+    return nm
+}
+
+fn new_state(doc: PerlDoc, o: DumperOptions) -> DumpState {
+    var classes: Map[i64, str] = map()
+    for n in doc.nodes {
+        match n {
+            PlBlessed(c, t) -> classes.set(canon(doc, t), c)
+            _ -> {}
+        }
+    }
+    return DumpState{
+        doc: doc,
+        o: o,
+        out: [],
+        xpad: if o.indent > 0 { [32, 32] } else { [] },
+        sep: if o.indent > 0 { [10] } else { [] },
+        seen: map(),
+        names: [],
+        marks: [],
+        post: [],
+        recursed: false,
+        classes: classes
+    }
+}
+
+/// One value's statement, `$VAR1 = ...;`, and any Purity fix-ups.
+fn dump_value(inout st: DumpState, v: i64, i: i64) -> [i64] {
+    st.post = []
+    let as_ref = match st.doc.nodes[v] {
+        PlBlessed(_c, _t) -> true
+        PlArray(_i) -> true
+        PlHash(_k, _v) -> true
+        _ -> false
+    }
+    let target = match st.doc.nodes[v] {
+        PlRef(t, _w, _o) -> t
+        _ -> v
+    }
+    let is_ref = as_ref or target != v
+    let name = value_name(st.o, i, is_ref, kind_of(st.doc, target))
+    let newapad = if st.o.indent >= 2 and not st.o.terse { spaces(name.len() + 3) } else { [] }
+    let saved = st.out
+    st.out = []
+    if as_ref {
+        dump_ref(st, v, name, 0, newapad)
+    } else {
+        dd(st, v, 0 - 2 - i, name, 0, newapad)
+    }
+    var valstr = st.out
+    st.out = saved
+    if st.post.len() > 0 or not st.o.terse {
+        valstr = name + ascii(" = ") + valstr + [59]
+    }
+    let pad = ascii(st.o.pad)
+    var out = pad + valstr + st.sep
+    if st.post.len() > 0 {
+        out = out + pad
+        for j in 0..st.post.len() {
+            out = out + st.post[j]
+            if j < st.post.len() - 1 {
+                out = out + [59] + st.sep + pad
+            }
+        }
+        out = out + [59] + st.sep
+    }
+    return out
+}
+
+/// `Data::Dumper->new(values, names)->Dump` with these settings and
+/// Sortkeys on. Each value is a node of the document: a scalar is dumped
+/// as a copy, as `new` copies it; an array, hash or blessed node as a
+/// reference to it.
+pub fn dump(doc: PerlDoc, values: [i64], o: DumperOptions) -> bytes ! DumperError {
+    var st = new_state(doc, o)
+    var out: [i64] = []
+    for i in 0..values.len() {
+        out = out + dump_value(st, values[i], i)
+    }
+    if st.recursed {
+        fail(DumperRecursion(o.maxrecurse))
+    }
+    return bytes_of(out)
+}
+
+/// `Dumper(values)` with the defaults (and Sortkeys).
+pub fn dumper(doc: PerlDoc, values: [i64]) -> bytes ! DumperError {
+    return try dump(doc, values, default_options())
+}

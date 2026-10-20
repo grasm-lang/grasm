@@ -1,0 +1,337 @@
+// Ruby's `Float#to_s`, `round`, `floor`, `ceil` and `truncate`, digits
+// and `half:` modes included, as Ruby 2.6 computes them.
+//
+// Ruby code prices, rates and measurements with these, and reports print
+// what `to_s` gives; a program reproducing the numbers has to round them
+// the same way, including where Ruby's way is not exact arithmetic:
+//
+//   - `to_s` prints the shortest digits that read back, plainly from
+//     0.0001 up to 1e16 (`1.0e+16` beyond, `1.0e-05` below), with ".0"
+//     on whole numbers and "-0.0" for negative zero.
+//   - `round(n)` for n > 0 scales by 10**n in floating point and rounds
+//     there, correcting by comparing back; `half: :up` (the default),
+//     `:even` and `:down` decide ties. Past the digits a double holds it
+//     returns the number itself; well below it, 0.0. With n huge enough
+//     that 10**n overflows the scaled value is NaN, as Ruby's is.
+//   - A NaN or infinity that would have to become an Integer is a
+//     FloatDomainError named after the value Ruby reached --
+//     `Float::INFINITY.round(half: :even)` reaches NaN on the way.
+//   - `round(n)` for n <= 0, and `floor`, `ceil` and `truncate` with n <=
+//     0, answer Integers -- for n < 0 Ruby first truncates the float to
+//     an Integer and rounds that (`15.5.round(-1)` is 20, from 15). Its
+//     `ceil` of a Bignum already on the multiple adds one more step
+//     (`1e20.ceil(-2)` is 100000000000000000100), and so does this.
+import bigint
+import shortestfloat
+
+/// How `round` breaks a tie.
+type RubyHalf = | HalfUp | HalfEven | HalfDown
+
+/// What these return: an Integer or a Float.
+type RubyNumber = | RubyInt(i: BigInt) | RubyFloat(f: f64)
+
+/// Ruby's FloatDomainError: a NaN or infinity that had to become an
+/// Integer. The message is the value's `to_s`.
+type FloatDomainError = | FloatDomainError(msg: str)
+
+pub fn error_text(e: FloatDomainError) -> str {
+    return match e {
+        FloatDomainError(m) -> m
+    }
+}
+
+/// dbl2ival: an integral double as an Integer.
+fn dbl2ival(x: f64) -> BigInt ! FloatDomainError {
+    if x != x or x.abs() > 1.7976931348623157e308 {
+        fail(FloatDomainError(to_s(x)))
+    }
+    return integer_of(x)
+}
+
+/// `float.to_s`.
+pub fn to_s(value: f64) -> str {
+    if value != value {
+        return "NaN"
+    }
+    if value > 1.7976931348623157e308 {
+        return "Infinity"
+    }
+    if value < -1.7976931348623157e308 {
+        return "-Infinity"
+    }
+    let sign = if value.to_bits() < 0 { "-" } else { "" }
+    if value == 0.0 {
+        return sign + "0.0"
+    }
+    let p = shortestfloat.parts(value)
+    let digits = p.digits
+    let digs = digits.len()
+    let decpt = p.point
+    if decpt > 0 {
+        if decpt < digs {
+            return sign + digits.substr(0, decpt) + "." + digits.substr(decpt, digs - decpt)
+        }
+        if decpt <= 15 {
+            return sign + digits + zeros(decpt - digs) + ".0"
+        }
+    } else if decpt > 0 - 4 {
+        return sign + "0." + zeros(0 - decpt) + digits
+    }
+    let mantissa = digits.substr(0, 1) + "." + (if digs > 1 { digits.substr(1, digs - 1) } else { "0" })
+    let e = decpt - 1
+    let a = if e < 0 { 0 - e } else { e }
+    return sign + mantissa + "e" + (if e < 0 { "-" } else { "+" }) + (if a < 10 { "0" } else { "" }) + a.to_str()
+}
+
+fn zeros(n: i64) -> str {
+    var out = ""
+    for _k in 0..n {
+        out = out + "0"
+    }
+    return out
+}
+
+// ---- C's rounding helpers
+
+/// C's round(): halves away from zero.
+fn c_round(x: f64) -> f64 {
+    if x > 0.0 {
+        let f = x.floor()
+        return f + (if x - f >= 0.5 { 1.0 } else { 0.0 })
+    }
+    if x < 0.0 {
+        let f = x.ceil()
+        return f - (if f - x >= 0.5 { 1.0 } else { 0.0 })
+    }
+    return x
+}
+
+fn trunc(x: f64) -> f64 {
+    return if x >= 0.0 { x.floor() } else { x.ceil() }
+}
+
+/// fmod(f, 2.0) for an integral f: 0.0 or 1.0 (with f's sign).
+fn fmod2(f: f64) -> f64 {
+    let half = f / 2.0
+    return f - trunc(half) * 2.0
+}
+
+fn round_half_up(x: f64, s: f64) -> f64 {
+    let xs = x * s
+    var f = c_round(xs)
+    if s == 1.0 {
+        return f
+    }
+    if x > 0.0 {
+        if (f + 0.5) / s <= x {
+            f = f + 1.0
+        }
+    } else if (f - 0.5) / s >= x {
+        f = f - 1.0
+    }
+    return f
+}
+
+fn round_half_down(x: f64, s: f64) -> f64 {
+    let xs = x * s
+    var f = c_round(xs)
+    if x > 0.0 {
+        if (f - 0.5) / s >= x {
+            f = f - 1.0
+        }
+    } else if (f + 0.5) / s <= x {
+        f = f + 1.0
+    }
+    return f
+}
+
+fn round_half_even(x: f64, s: f64) -> f64 {
+    let xs = x * s
+    if x > 0.0 {
+        let f = xs.floor()
+        var d = xs - f
+        if d > 0.5 {
+            d = 1.0
+        } else if d == 0.5 or (f + 0.5) / s <= x {
+            d = fmod2(f)
+        } else {
+            d = 0.0
+        }
+        return f + d
+    }
+    if x < 0.0 {
+        let f = xs.ceil()
+        var d = f - xs
+        if d > 0.5 {
+            d = 1.0
+        } else if d == 0.5 or (f - 0.5) / s >= x {
+            d = fmod2(0.0 - f)
+        } else {
+            d = 0.0
+        }
+        return f - d
+    }
+    return x
+}
+
+fn round_call(mode: RubyHalf, x: f64, s: f64) -> f64 {
+    return match mode {
+        HalfUp -> round_half_up(x, s)
+        HalfEven -> round_half_even(x, s)
+        HalfDown -> round_half_down(x, s)
+    }
+}
+
+/// frexp's exponent: |x| = m * 2^e with 0.5 <= m < 1.
+fn frexp_exponent(x: f64) -> i64 {
+    let bits = x.to_bits().bit_and(9223372036854775807)
+    let biased = bits.shr(52)
+    if biased > 0 {
+        return biased - 1022
+    }
+    // A subnormal is m * 2^-1074: the exponent is m's bit length - 1074.
+    var m = bits
+    var e = 0 - 1021
+    while m < 4503599627370496 {
+        m = m * 2
+        e = e - 1
+    }
+    return e
+}
+
+fn round_overflow(ndigits: i64, binexp: i64) -> bool {
+    return ndigits >= 17 - (if binexp > 0 { binexp / 4 } else { binexp / 3 - 1 })
+}
+
+fn round_underflow(ndigits: i64, binexp: i64) -> bool {
+    return ndigits < 0 - (if binexp > 0 { binexp / 3 + 1 } else { binexp / 4 })
+}
+
+/// pow(10, n), correctly rounded (and infinite past the range).
+fn pow10(n: i64) -> f64 {
+    return ("1e" + n.to_str()).parse_float() ?? 0.0
+}
+
+/// The exact integer value of an integral double.
+fn integer_of(x: f64) -> BigInt {
+    if x.abs() < 9007199254740992.0 {
+        return bigint.from_i64(x.as_i64())
+    }
+    let bits = x.to_bits()
+    let exp = bits.shr(52).bit_and(2047) - 1075
+    let mant = bits.bit_and(4503599627370495) + 4503599627370496
+    let v = bigint.mul(bigint.from_i64(mant), bigint.pow(bigint.from_i64(2), exp))
+    return if x < 0.0 { bigint.negate(v) } else { v }
+}
+
+/// What a negative-digits operation does to an Integer: 0 when 10**-n is
+/// beyond it (int_round_zero_p's estimate), else the operation.
+fn int_zero(num: BigInt, ndigits: i64) -> bool {
+    let a = if bigint.sign(num) < 0 { bigint.negate(num) } else { num }
+    let fits = bigint.compare(a, bigint.from_i64(4611686018427387903)) <= 0
+    // A Fixnum counts as 8 bytes; a Bignum as the bytes it needs (BIGSIZE).
+    let bytes = if fits { 8 } else { (bigint.bit_length(a) + 7) / 8 }
+    return -0.415241 * ndigits.as_f64() - 0.125 > bytes.as_f64()
+}
+
+fn big_mod(a: BigInt, f: BigInt) -> BigInt {
+    let (_q, r) = bigint.divmod(a, f) ?? (bigint.zero(), bigint.zero())
+    return if bigint.sign(r) < 0 { bigint.add(r, f) } else { r }
+}
+
+/// Integer#round(n) for n < 0.
+fn int_round(num: BigInt, ndigits: i64, mode: RubyHalf) -> BigInt {
+    if int_zero(num, ndigits) {
+        return bigint.zero()
+    }
+    let f = bigint.pow(bigint.from_i64(10), 0 - ndigits)
+    let r = big_mod(num, f)
+    let n = bigint.sub(num, r)
+    let c = bigint.compare(bigint.add(r, r), f)
+    if c > 0 {
+        return bigint.add(n, f)
+    }
+    if c < 0 {
+        return n
+    }
+    let up = match mode {
+        HalfUp -> bigint.sign(num) > 0
+        HalfDown -> bigint.sign(num) < 0
+        HalfEven -> {
+            let (q, _r) = bigint.divmod(n, f) ?? (bigint.zero(), bigint.zero())
+            not bigint.is_zero(big_mod(q, bigint.from_i64(2)))
+        }
+    }
+    return if up { bigint.add(n, f) } else { n }
+}
+
+/// `float.round(ndigits, half: mode)`.
+pub fn round(number: f64, ndigits: i64, mode: RubyHalf) -> RubyNumber ! FloatDomainError {
+    if number == 0.0 {
+        return if ndigits > 0 { RubyFloat(number) } else { RubyInt(bigint.zero()) }
+    }
+    if ndigits < 0 {
+        return RubyInt(int_round(try dbl2ival(trunc(number)), ndigits, mode))
+    }
+    if ndigits == 0 {
+        return RubyInt(try dbl2ival(round_call(mode, number, 1.0)))
+    }
+    if number != number or number.abs() > 1.7976931348623157e308 {
+        return RubyFloat(number)
+    }
+    let binexp = frexp_exponent(number)
+    if round_overflow(ndigits, binexp) {
+        return RubyFloat(number)
+    }
+    if round_underflow(ndigits, binexp) {
+        return RubyFloat(0.0)
+    }
+    let f = pow10(ndigits)
+    return RubyFloat(round_call(mode, number, f) / f)
+}
+
+fn floor_or_ceil(number: f64, ndigits: i64, up: bool) -> RubyNumber ! FloatDomainError {
+    if number == 0.0 {
+        return if ndigits > 0 { RubyFloat(number) } else { RubyInt(bigint.zero()) }
+    }
+    if ndigits > 0 {
+        let binexp = frexp_exponent(number)
+        if round_overflow(ndigits, binexp) {
+            return RubyFloat(number)
+        }
+        if (if up { number < 0.0 } else { number > 0.0 }) and round_underflow(ndigits, binexp) {
+            return RubyFloat(0.0)
+        }
+        let f = pow10(ndigits)
+        return RubyFloat((if up { (number * f).ceil() } else { (number * f).floor() }) / f)
+    }
+    let whole = try dbl2ival(if up { number.ceil() } else { number.floor() })
+    if ndigits == 0 or int_zero(whole, ndigits) {
+        return RubyInt(if ndigits == 0 { whole } else { bigint.zero() })
+    }
+    let f = bigint.pow(bigint.from_i64(10), 0 - ndigits)
+    let r = big_mod(whole, f)
+    if up {
+        // rb_int_ceil: exact on fixnums; on a bignum (or a power of ten past
+        // a fixnum) it adds the step even to an exact multiple.
+        let small = bigint.compare(bigint.from_i64(0 - 4611686018427387904), whole) <= 0 and bigint.compare(whole, bigint.from_i64(4611686018427387903)) <= 0
+        let exact = bigint.is_zero(r) and small and ndigits >= 0 - 18
+        return RubyInt(if exact { whole } else { bigint.add(whole, bigint.sub(f, r)) })
+    }
+    return RubyInt(bigint.sub(whole, r))
+}
+
+/// `float.floor(ndigits)`.
+pub fn floor(number: f64, ndigits: i64) -> RubyNumber ! FloatDomainError {
+    return try floor_or_ceil(number, ndigits, false)
+}
+
+/// `float.ceil(ndigits)`.
+pub fn ceil(number: f64, ndigits: i64) -> RubyNumber ! FloatDomainError {
+    return try floor_or_ceil(number, ndigits, true)
+}
+
+/// `float.truncate(ndigits)`: floor or ceil by the sign bit.
+pub fn truncate(number: f64, ndigits: i64) -> RubyNumber ! FloatDomainError {
+    return try floor_or_ceil(number, ndigits, number.to_bits() < 0)
+}

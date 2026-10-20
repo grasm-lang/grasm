@@ -1,0 +1,76 @@
+[package]
+name = "b59test"
+version = "1.0.0"
+capabilities = ["io"]
+
+[dependencies.rubyabbrev]
+path = "../rubyabbrev"
+version = "^1.0.0"
+
+[dependencies.rubyinteger]
+path = "../rubyinteger"
+version = "^1.0.0"
+
+[dependencies.bigint]
+path = "../bigint"
+version = "^1.0.0"
+
+[dependencies.javabiginteger]
+path = "../javabiginteger"
+version = "^1.0.0"
+
+[dependencies.pycharclass]
+path = "../pycharclass"
+version = "^1.0.0"
+
+[dependencies.jsstringmethods]
+path = "../jsstringmethods"
+version = "^1.0.0"
+
+[dependencies.jsnumber]
+path = "../jsnumber"
+version = "^1.0.0"
+
+[dependencies.shortestfloat]
+path = "../shortestfloat"
+version = "^1.0.0"
+
+[dependencies.rubystrftime]
+path = "../rubystrftime"
+version = "^1.0.0"
+
+[dependencies.rubyformat]
+path = "../rubyformat"
+version = "^1.0.0"
+
+[dependencies.rubyjson]
+path = "../rubyjson"
+version = "^1.0.0"
+
+[dependencies.gostrconv]
+path = "../gostrconv"
+version = "^1.0.0"
+
+[dependencies.goquote]
+path = "../goquote"
+version = "^1.0.0"
+
+[dependencies.jsdate]
+path = "../jsdate"
+version = "^1.0.0"
+
+[dependencies.nodelegacyurl]
+path = "../nodelegacyurl"
+version = "^1.0.0"
+
+[dependencies.jsuri]
+path = "../jsuri"
+version = "^1.0.0"
+
+[dependencies.querystring]
+path = "../querystring"
+version = "^1.0.0"
+
+[dependencies.rubyuri]
+path = "../rubyuri"
+version = "^1.0.0"

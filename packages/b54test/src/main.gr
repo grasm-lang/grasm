@@ -1,0 +1,528 @@
+// The harness scripts/b54_diff.sh drives: each argument pair is an
+// operation and a file of cases, one per line; each answer is one line.
+import goflag
+import perldumper
+import javalocaldate
+import luapattern
+import nodeparseargs
+import perlversion
+import rustnum
+import bigint
+import sqlitedatetime
+import sqliteprintf
+
+fn unhex_list(h: str) -> [i64] {
+    if h == "-" {
+        return []
+    }
+    var out: [i64] = []
+    let b = h.to_bytes()
+    var i = 0
+    while i + 1 < b.len() {
+        let hi = b.at(i)
+        let lo = b.at(i + 1)
+        out.push((if hi >= 97 { hi - 87 } else { hi - 48 }) * 16 + (if lo >= 97 { lo - 87 } else { lo - 48 }))
+        i = i + 2
+    }
+    return out
+}
+
+fn unhex(h: str) -> str {
+    return bytes_of(unhex_list(h)).to_str()
+}
+
+fn hex_bytes(b: bytes) -> str {
+    let digits = "0123456789abcdef"
+    let h = b.to_list().map(|x| digits.substr(x.ushr(4), 1) + digits.substr(x.bit_and(15), 1)).join("")
+    return if h.len() == 0 { "-" } else { h }
+}
+
+fn hex_text(t: str) -> str {
+    return hex_bytes(t.to_bytes())
+}
+
+fn hex_u64(h: str) -> i64 {
+    var v = 0
+    for c in h.codes() {
+        let d = if c >= 97 { c - 87 } else if c >= 65 { c - 55 } else { c - 48 }
+        v = v.shl(4).bit_or(d)
+    }
+    return v
+}
+
+fn bits_hex(x: f64) -> str {
+    let digits = "0123456789abcdef"
+    let b = x.to_bits()
+    var out = ""
+    for k in 0..16 {
+        out = out + digits.substr(b.ushr(60 - 4 * k).bit_and(15), 1)
+    }
+    return out
+}
+
+fn sql_value(v: str) -> SqlValue {
+    let body = v.substr(1, v.len() - 1)
+    if v == "z" {
+        return SqlNull
+    }
+    if v.starts_with("n") {
+        return SqlFloat(hex_u64(body).from_bits())
+    }
+    if v.starts_with("i") {
+        return SqlInteger(body.parse_int() ?? 0)
+    }
+    if v.starts_with("b") {
+        return SqlBlob(bytes_of(unhex_list(body)))
+    }
+    return SqlText(unhex(body))
+}
+
+fn shown_text(r: Option[str]) -> str {
+    return match r {
+        Some(t) -> "s:" + hex_text(t)
+        None -> "null"
+    }
+}
+
+fn sqlitedatetime_line(f: [str]) -> str {
+    let op = f[0]
+    if op == "sf" {
+        let fmt = sql_value(f[1])
+        let text = match fmt {
+            SqlText(t) -> t
+            _ -> ""
+        }
+        return shown_text(sqlitedatetime.strftime(text, sql_value(f[2]), f.slice(3, f.len()).map(|m| unhex(m.substr(1, m.len() - 1)))))
+    }
+    if op == "td" {
+        return shown_text(sqlitedatetime.timediff(sql_value(f[1]), sql_value(f[2])))
+    }
+    let v = sql_value(f[1])
+    let mods = f.slice(2, f.len()).map(|m| unhex(m.substr(1, m.len() - 1)))
+    if op == "jd" {
+        return match sqlitedatetime.julianday(v, mods) {
+            Some(x) -> "r:" + bits_hex(x)
+            None -> "null"
+        }
+    }
+    if op == "ue" {
+        return match sqlitedatetime.unixepoch(v, mods) {
+            Some(EpochInt(n)) -> "i:" + n.to_str()
+            Some(EpochReal(x)) -> "r:" + bits_hex(x)
+            None -> "null"
+        }
+    }
+    if op == "date" {
+        return shown_text(sqlitedatetime.date(v, mods))
+    }
+    if op == "time" {
+        return shown_text(sqlitedatetime.time(v, mods))
+    }
+    return shown_text(sqlitedatetime.datetime(v, mods))
+}
+
+fn lua_caps(cs: [LuaCapture]) -> str {
+    if cs.len() == 0 {
+        return "~"
+    }
+    return cs.map(|c| match c {
+        LuaText(t) -> "s" + hex_bytes(t)
+        LuaPosition(n) -> "p" + n.to_str()
+    }).join(",")
+}
+
+fn lua_bytes(h: str) -> bytes {
+    return bytes_of(unhex_list(h))
+}
+
+fn lua_err(e: LuaPatternError) -> str {
+    return "E:" + hex_text(luapattern.error_text(e))
+}
+
+fn lua_table(h: str) -> [(bytes, bytes)] {
+    if h == "-" {
+        return []
+    }
+    return h.split(",").map(|kv| (lua_bytes(kv.split("=")[0]), lua_bytes(kv.split("=")[1])))
+}
+
+fn luapattern_line(f: [str]) -> str {
+    let op = f[0]
+    let s = lua_bytes(f[1])
+    let p = lua_bytes(f[2])
+    if op == "f" {
+        return match luapattern.find(s, p, f[3].parse_int() ?? 1, f[4] == "1") {
+            Ok(Some((a, e, cs))) -> a.to_str() + " " + e.to_str() + " " + lua_caps(cs)
+            Ok(None) -> "nil"
+            Err(e) -> lua_err(e)
+        }
+    }
+    if op == "m" {
+        return match luapattern.match_text(s, p, f[3].parse_int() ?? 1) {
+            Ok(Some(cs)) -> lua_caps(cs)
+            Ok(None) -> "nil"
+            Err(e) -> lua_err(e)
+        }
+    }
+    if op == "g" {
+        return match luapattern.gmatch(s, p, f[3].parse_int() ?? 1) {
+            Ok(rs) -> if rs.len() == 0 { "none" } else { rs.map(|r| lua_caps(r)).join(";") }
+            Err(e) -> lua_err(e)
+        }
+    }
+    let repl = if op == "r" { LuaWith(lua_bytes(f[3])) } else { LuaTable(lua_table(f[3])) }
+    let max = if f[4] == "~" { None } else { Some(f[4].parse_int() ?? 0) }
+    return match luapattern.gsub(s, p, repl, max) {
+        Ok((t, n)) -> hex_bytes(t) + " " + n.to_str()
+        Err(e) -> lua_err(e)
+    }
+}
+
+fn flag_kind(k: str) -> GoFlagKind {
+    return if k == "b" { FlagBool } else if k == "i" { FlagInt } else if k == "I" { FlagInt64 } else if k == "u" { FlagUint } else if k == "U" { FlagUint64 } else if k == "s" {
+        FlagString
+    } else if k == "f" { FlagFloat64 } else { FlagDuration }
+}
+
+fn flag_defs(h: str) -> [GoFlag] ! GoFlagError {
+    var out: [GoFlag] = []
+    if h == "~" {
+        return out
+    }
+    for spec in h.split(",") {
+        let p = spec.split(":")
+        out.push(try goflag.define(unhex(p[1]), flag_kind(p[0]), if p[2] == "~" { None } else { Some(unhex(p[2])) }, unhex(p[3])))
+    }
+    return out
+}
+
+fn tilde(xs: [str]) -> str {
+    return if xs.len() == 0 { "~" } else { xs.join(",") }
+}
+
+fn goflag_line(f: [str]) -> str {
+    let defs = match flag_defs(f[1]) {
+        Ok(d) -> d
+        Err(_e) -> return "BADDEF"
+    }
+    if f[0] == "d" {
+        return hex_text(goflag.print_defaults(defs))
+    }
+    let args = if f[2] == "~" { [] } else { f[2].split(",").map(|a| unhex(a)) }
+    return match goflag.parse(defs, args) {
+        Ok(r) -> tilde(r.values.map(|kv| hex_text(kv.0) + "=" + hex_text(kv.1))) + " " + tilde(r.set.map(|n| hex_text(n))) + " " + tilde(r.args.map(|a| hex_text(a)))
+        Err(e) -> "E:" + hex_text(goflag.error_text(e))
+    }
+}
+
+fn unit_hex(us: [i64]) -> str {
+    if us.len() == 0 {
+        return "-"
+    }
+    let d = "0123456789abcdef"
+    return us.map(|x| d.substr(x.shr(12).bit_and(15), 1) + d.substr(x.shr(8).bit_and(15), 1) + d.substr(x.shr(4).bit_and(15), 1) + d.substr(x.bit_and(15), 1)).join(
+        "")
+}
+
+fn pa_value(v: ParseArgsValue) -> str {
+    return match v {
+        PaString(us) -> "s" + unit_hex(us)
+        PaBool(b) -> if b { "b1" } else { "b0" }
+        PaList(items) -> "l[" + items.map(|x| pa_value(x)).join(";") + "]"
+    }
+}
+
+fn pa_one(is_string: bool, x: str) -> ParseArgsValue {
+    return if is_string { PaString(nodeparseargs.units(unhex(x))) } else { PaBool(x == "1") }
+}
+
+fn pa_option(spec: str) -> ParseArgsOption {
+    let p = spec.split(":")
+    let is_string = p[1] == "s"
+    let multiple = p[3] == "1"
+    let default = if p[4] == "~" { None } else if multiple { Some(PaList(p[4].split("+").filter(|x| x.len() > 0).map(|x| pa_one(is_string, x)))) } else {
+        Some(pa_one(is_string, p[4]))
+    }
+    return ParseArgsOption{ name: unhex(p[0]), is_string: is_string, short: if p[2] == "~" { None } else { Some(unhex(p[2])) }, multiple: multiple, default: default }
+}
+
+fn opt_units(x: Option[[i64]]) -> str {
+    return match x {
+        Some(us) -> unit_hex(us)
+        None -> "~"
+    }
+}
+
+fn nodeparseargs_line(f: [str]) -> str {
+    let config = ParseArgsConfig{ args: if f[0] == "~" { [] } else { f[0].split(",").map(|a| unhex(a)) }, options: if f[1] == "~" { [] } else {
+        f[1].split(",").map(|o| pa_option(o))
+    }, strict: f[2] == "1", allow_positionals: if f[3] == "~" { None } else { Some(f[3] == "1") }, allow_negative: f[4] == "1" }
+    return match nodeparseargs.parse_args(config) {
+        Ok(r) -> {
+            let values = r.values.map(|kv| unit_hex(kv.0) + "=" + pa_value(kv.1)).join(",")
+            let pos = r.positionals.map(|x| unit_hex(x)).join(",")
+            let toks = r.tokens.map(|t| [t.kind, t.index.to_str(), opt_units(t.name), opt_units(t.raw_name), opt_units(t.value), match t.inline {
+                Some(b) -> if b { "1" } else { "0" }
+                None -> "~"
+            }].join("|")).join(",")
+            (if values == "" { "~" } else { values }) + " " + (if pos == "" { "~" } else { pos }) + " " + (if toks == "" { "~" } else { toks })
+        }
+        Err(e) -> "E:" + nodeparseargs.error_code(e) + ":" + unit_hex(nodeparseargs.error_units(e))
+    }
+}
+
+fn pv_make(mode: str, h: str) -> PerlVersion ! PerlVersionError {
+    return if mode == "d" { try perlversion.declare(unhex(h)) } else { try perlversion.parse(unhex(h)) }
+}
+
+fn pv_compare(f: [str]) -> str ! PerlVersionError {
+    let a = try pv_make(f[2], f[1])
+    let b = try pv_make(f[4], f[3])
+    return perlversion.compare(a, b).to_str()
+}
+
+fn perlversion_line(f: [str]) -> str {
+    if f[0] == "c" {
+        return match pv_compare(f) {
+            Ok(t) -> t
+            Err(e) -> "E:" + hex_text(perlversion.error_text(e))
+        }
+    }
+    return match pv_make(f[0], f[1]) {
+        Ok(v) -> [hex_text(perlversion.stringify(v)), hex_text(perlversion.numify(v)), hex_text(perlversion.normal(v)), if perlversion.is_alpha(v) { "1" } else { "0" },
+            if perlversion.is_qv(v) { "1" } else { "0" }].join("|")
+        Err(e) -> "E:" + hex_text(perlversion.error_text(e))
+    }
+}
+
+fn rust_int(f: [str]) -> str {
+    let t = f[2]
+    let signed = t.starts_with("i")
+    let bits = t.substr(1, t.len() - 1).parse_int() ?? 64
+    return match rustnum.parse_int(unhex(f[1]), bits, signed) {
+        Ok(v) -> bigint.to_str(v)
+        Err(e) -> "E:" + rustnum.error_kind(e) + ":" + hex_text(rustnum.error_text(e))
+    }
+}
+
+fn rustnum_line(f: [str]) -> str {
+    let op = f[0]
+    if op == "i" {
+        return rust_int(f)
+    }
+    if op == "p" {
+        return match rustnum.parse_f64(unhex(f[1])) {
+            Ok(v) -> if v != v { "7ff8000000000000" } else { bits_hex(v) }
+            Err(e) -> "E:" + hex_text(rustnum.error_text(e))
+        }
+    }
+    let x = hex_u64(f[1]).from_bits()
+    if op == "d" {
+        return hex_text(rustnum.display(x))
+    }
+    if op == "g" {
+        return hex_text(rustnum.debug(x))
+    }
+    if op == "f" {
+        return hex_text(rustnum.fixed(x, f[2].parse_int() ?? 0))
+    }
+    if op == "e" {
+        return hex_text(rustnum.exp(x, f[2] == "1"))
+    }
+    return hex_text(rustnum.exp_fixed(x, f[2].parse_int() ?? 0, f[3] == "1"))
+}
+
+fn jd_err(e: LocalDateError) -> str {
+    return "E:" + javalocaldate.error_kind(e) + ":" + hex_text(javalocaldate.error_text(e))
+}
+
+fn jd_show(r: JavaDate ! LocalDateError) -> str {
+    return match r {
+        Ok(d) -> d.year.to_str() + "," + d.month.to_str() + "," + d.day.to_str() + "|" + hex_text(javalocaldate.to_string(d))
+        Err(e) -> jd_err(e)
+    }
+}
+
+fn jd_date(s: str) -> JavaDate ! LocalDateError {
+    let p = s.split(",")
+    return try javalocaldate.of(p[0].parse_int() ?? 0, p[1].parse_int() ?? 0, p[2].parse_int() ?? 0)
+}
+
+fn jd_plus(f: [str]) -> JavaDate ! LocalDateError {
+    let d = try jd_date(f[1])
+    let n = f[3].parse_int() ?? 0
+    return if f[2] == "d" { try javalocaldate.plus_days(d, n) } else if f[2] == "w" { try javalocaldate.plus_weeks(d, n) } else if f[2] == "m" {
+        try javalocaldate.plus_months(d, n)
+    } else { try javalocaldate.plus_years(d, n) }
+}
+
+fn jd_with(f: [str]) -> JavaDate ! LocalDateError {
+    let d = try jd_date(f[1])
+    let n = f[3].parse_int() ?? 0
+    return if f[2] == "y" { try javalocaldate.with_year(d, n) } else if f[2] == "m" { try javalocaldate.with_month(d, n) } else {
+        try javalocaldate.with_day_of_month(d, n)
+    }
+}
+
+fn jd_info(s: str) -> str ! LocalDateError {
+    let d = try jd_date(s)
+    return [javalocaldate.to_epoch_day(d).to_str(), javalocaldate.day_of_week_name(d), javalocaldate.day_of_year(d).to_str(), javalocaldate.length_of_month(d).to_str(),
+        javalocaldate.length_of_year(d).to_str(), if javalocaldate.is_leap(d.year) { "true" } else { "false" }].join("|")
+}
+
+fn jd_until(f: [str]) -> str ! LocalDateError {
+    let a = try jd_date(f[1])
+    let b = try jd_date(f[2])
+    return javalocaldate.until(a, b, f[3]).to_str()
+}
+
+fn javalocaldate_line(f: [str]) -> str {
+    let op = f[0]
+    if op == "parse" {
+        return jd_show(javalocaldate.parse(unhex(f[1])))
+    }
+    if op == "of" {
+        return jd_show(javalocaldate.of(f[1].parse_int() ?? 0, f[2].parse_int() ?? 0, f[3].parse_int() ?? 0))
+    }
+    if op == "epoch" {
+        return jd_show(javalocaldate.of_epoch_day(f[1].parse_int() ?? 0))
+    }
+    if op == "plus" {
+        return jd_show(jd_plus(f))
+    }
+    if op == "with" {
+        return jd_show(jd_with(f))
+    }
+    let r: str ! LocalDateError = if op == "info" { jd_info(f[1]) } else { jd_until(f) }
+    return match r {
+        Ok(t) -> t
+        Err(e) -> jd_err(e)
+    }
+}
+
+fn pd_node(spec: str) -> PerlNode {
+    let k = spec.substr(0, 1)
+    let a = if spec.len() > 2 { spec.substr(2, spec.len() - 2) } else { "" }
+    if k == "u" {
+        return PlUndef
+    }
+    if k == "U" {
+        return PlSvUndef
+    }
+    if k == "y" {
+        return PlYes
+    }
+    if k == "n" {
+        return PlNo
+    }
+    if k == "i" {
+        return PlInt(hex_u64(a))
+    }
+    if k == "d" {
+        return PlDouble(hex_u64(a).from_bits())
+    }
+    if k == "b" {
+        return PlBytes(bytes_of(unhex_list(a)))
+    }
+    if k == "s" {
+        return PlUtf8(unhex(a))
+    }
+    if k == "r" {
+        return PlRef(a.parse_int() ?? 0, false, false)
+    }
+    if k == "a" {
+        return PlArray(if a == "-" { [] } else { a.split(".").map(|x| x.parse_int() ?? 0) })
+    }
+    if k == "B" {
+        let p = a.split("/")
+        return PlBlessed(unhex(p[0]), p[1].parse_int() ?? 0)
+    }
+    var keys: [(bytes, bool)] = []
+    var values: [i64] = []
+    if a != "-" {
+        for e in a.split(".") {
+            let p = e.split("/")
+            keys.push((bytes_of(unhex_list(p[0])), p[1] == "1"))
+            values.push(p[2].parse_int() ?? 0)
+        }
+    }
+    return PlHash(keys, values)
+}
+
+fn pd_options(spec: str) -> DumperOptions {
+    let f = spec.split(",")
+    var o = perldumper.default_options()
+    o.indent = f[0].parse_int() ?? 0
+    o.pad = unhex(f[1])
+    o.varname = unhex(f[2])
+    o.terse = f[3] == "1"
+    o.useqq = f[4] == "1"
+    o.quotekeys = f[5] == "1"
+    o.pair = unhex(f[6])
+    o.trailingcomma = f[7] == "1"
+    o.purity = f[8] == "1"
+    o.deepcopy = f[9] == "1"
+    o.maxrecurse = f[10].parse_int() ?? 0
+    o.bless = unhex(f[11])
+    o.names = if f[12] == "-" { [] } else { f[12].split(".").map(|x| unhex(x)) }
+    return o
+}
+
+fn perldumper_line(f: [str]) -> str {
+    let doc = PerlDoc{ nodes: f[2].split(";").map(|x| pd_node(x)), root: 0, network: false }
+    let roots = f[3].split(".").map(|x| x.parse_int() ?? 0)
+    return match perldumper.dump(doc, roots, pd_options(f[1])) {
+        Ok(b) -> hex_bytes(b)
+        Err(e) -> "E:" + hex_text(perldumper.error_text(e))
+    }
+}
+
+fn sqliteprintf_line(f: [str]) -> str {
+    let args = f.slice(2, f.len()).map(|v| sql_value(v))
+    return match sqliteprintf.printf(sql_value(f[1]), args) {
+        Some(b) -> "s:" + hex_bytes(b)
+        None -> "null"
+    }
+}
+
+fn main() / {io} {
+    let argv = args()
+    var i = 0
+    while i + 1 < argv.len() {
+        let op = argv[i]
+        let text = match read_bytes(argv[i + 1]) {
+            Ok(d) -> d.to_str()
+            Err(_e) -> ""
+        }
+        for l in text.split("\n").filter(|l| l.len() > 0) {
+            if op == "goflag" {
+                print(goflag_line(l.split(" ")))
+            }
+            if op == "nodeparseargs" {
+                print(nodeparseargs_line(l.split(" ")))
+            }
+            if op == "perlversion" {
+                print(perlversion_line(l.split(" ")))
+            }
+            if op == "rustnum" {
+                print(rustnum_line(l.split(" ")))
+            }
+            if op == "javalocaldate" {
+                print(javalocaldate_line(l.split(" ")))
+            }
+            if op == "perldumper" {
+                print(perldumper_line(l.split(" ")))
+            }
+            if op == "sqliteprintf" {
+                print(sqliteprintf_line(l.split(" ")))
+            }
+            if op == "luapattern" {
+                print(luapattern_line(l.split(" ")))
+            }
+            if op == "sqlitedatetime" {
+                print(sqlitedatetime_line(l.split(" ")))
+            }
+        }
+        i = i + 2
+    }
+}

@@ -1,0 +1,1129 @@
+// Ruby 2.6's `Array#pack`, `String#unpack` and `String#unpack1`: binary
+// layouts from a template, as Ruby's pack.c reads it on a 64-bit
+// little-endian machine (x86-64 and arm64 alike).
+//
+// Directives: `C c` (8 bits), `S s` (16), `L l` and `I i` (32), `Q q`
+// and `J j` (64), with `_` or `!` for the native size (`L_` is 64 bits,
+// as a C long is) and `<` or `>` for the byte order; `n N` and `v V`
+// (big- and little-endian 16 and 32); `U` (UTF-8, up to the old six-byte
+// form of 0x7fffffff); `w` (BER); `a A Z` (strings padded with NUL or
+// space, or NUL-terminated); `B b H h` (bit and hex strings); `u` (uuencode),
+// `m` (base64, `m0` strict) and `M` (quoted-printable); and `x X @`
+// (NUL, back up, absolute position). A count follows, or `*`. White space
+// and `#` comments are skipped; an unknown directive is skipped too (Ruby
+// only warns).
+//
+// Ruby's own corners, kept here:
+//
+//   - Integers are cut to their low bits: `[2**64 + 5].pack("Q")` is 5.
+//   - Unpacking more integers than the data holds pads the result with
+//     nil (`"\x01".unpack("C3")` is `[1, nil, nil]`); with `*` it does not.
+//   - `b` and `B` with a count beyond the string pad with
+//     `(count - length + 1) / 2` NUL bytes, not with whole bytes of bits.
+//   - `@*` in `pack` goes back to position 0, emptying the result; in
+//     `unpack`, `*` after `@`, `X` or `x` means "the bytes that are left".
+//   - `M` writes an Integer by its decimal digits; `m` and `u` lines hold
+//     45 bytes unless the count says otherwise (`u` at most 63).
+//   - `unpack1` stops at the first value, so a later error never happens.
+//   - A bare `@` in `unpack` counts 0, but 1 when it ends the template.
+//
+// Errors are Ruby's: ArgumentError ("too few arguments", "X outside of
+// string", "invalid base64", "malformed UTF-8 character", "'_' allowed
+// only after types sSiIlLqQjJ", ...), RangeError ("pack(U): value out of
+// range", "bignum too big to convert into `long'", "Can't use both '<'
+// and '>'") and TypeError ("no implicit conversion of String into
+// Integer").
+//
+// Limits: the float directives (`D d F f E e G g`) and the pointer ones
+// (`P p`) are refused with an ArgumentError naming them, and a count past
+// 100,000,000 is RangeError "pack length too big" (Ruby's limit is the
+// machine word).
+import bigint
+
+type RbPackItem = | RbPackInt(value: BigInt) | RbPackStr(value: bytes) | RbPackNil
+
+type RbUnpacked = | RbUnpackedInt(value: BigInt) | RbUnpackedStr(value: bytes) | RbUnpackedNil
+
+type RbPackError =
+    | RbPackArgumentError(message: str)
+    | RbPackRangeError(message: str)
+    | RbPackTypeError(message: str)
+
+pub fn error_name(e: RbPackError) -> str {
+    return match e {
+        RbPackArgumentError(_m) -> "ArgumentError"
+        RbPackRangeError(_m) -> "RangeError"
+        RbPackTypeError(_m) -> "TypeError"
+    }
+}
+
+pub fn error_message(e: RbPackError) -> str {
+    return match e {
+        RbPackArgumentError(m) -> m
+        RbPackRangeError(m) -> m
+        RbPackTypeError(m) -> m
+    }
+}
+
+fn big(v: i64) -> BigInt {
+    return bigint.from_i64(v)
+}
+
+fn extend(inout out: [i64], xs: [i64]) {
+    for x in xs {
+        out.push(x)
+    }
+}
+
+fn zeros(n: i64, c: i64) -> [i64] {
+    var out: [i64] = []
+    var i = 0
+    while i < n {
+        out.push(c)
+        i = i + 1
+    }
+    return out
+}
+
+fn is_space(c: i64) -> bool {
+    return c == 32 or c >= 9 and c <= 13
+}
+
+fn is_digit(c: i64) -> bool {
+    return c >= 48 and c <= 57
+}
+
+fn has(set: str, c: i64) -> bool {
+    return set.to_bytes().to_list().contains(c)
+}
+
+// ---- the template
+
+/// One directive: its letter, native size, explicit order (0, `<` or
+/// `>`), its count, whether the count was `*`, whether there was a count,
+/// and where the template goes on.
+type RbDirective = { kind: i64, natint: bool, endian: i64, len: i64, star: bool, counted: bool, at_end: bool, last: i64, next: i64 }
+
+/// The directive at `i`, after any white space or comment; kind 0 at the
+/// end.
+fn read_directive(t: [i64], i0: i64) -> RbDirective ! RbPackError {
+    var i = i0
+    while i < t.len() and (is_space(t[i]) or t[i] == 35) {
+        if t[i] == 35 {
+            while i < t.len() and t[i] != 10 {
+                i = i + 1
+            }
+        } else {
+            i = i + 1
+        }
+    }
+    if i >= t.len() {
+        return RbDirective{ kind: 0, natint: false, endian: 0, len: 0, star: false, counted: false, at_end: true, last: 0, next: i }
+    }
+    let kind = t[i]
+    i = i + 1
+    var natint = false
+    var endian = 0
+    while i < t.len() and (t[i] == 95 or t[i] == 33 or t[i] == 60 or t[i] == 62) {
+        let m = t[i]
+        if m == 95 or m == 33 {
+            if not has("sSiIlLqQjJ", kind) {
+                fail(RbPackArgumentError("'" + m.to_char() + "' allowed only after types sSiIlLqQjJ"))
+            }
+            natint = true
+        } else {
+            if not has("sSiIlLqQjJ", kind) {
+                fail(RbPackArgumentError("'" + m.to_char() + "' allowed only after types sSiIlLqQjJ"))
+            }
+            if endian != 0 {
+                fail(RbPackRangeError("Can't use both '<' and '>'"))
+            }
+            endian = m
+        }
+        i = i + 1
+    }
+    let at_end = i >= t.len()
+    var len = 1
+    var star = false
+    var counted = false
+    if i < t.len() and t[i] == 42 {
+        star = true
+        counted = true
+        i = i + 1
+    } else if i < t.len() and is_digit(t[i]) {
+        len = 0
+        counted = true
+        while i < t.len() and is_digit(t[i]) {
+            if len > 100000000 {
+                fail(RbPackRangeError("pack length too big"))
+            }
+            len = len * 10 + t[i] - 48
+            i = i + 1
+        }
+    }
+    return RbDirective{ kind: kind, natint: natint, endian: endian, len: len, star: star, counted: counted, at_end: at_end, last: t[i - 1], next: i }
+}
+
+/// An integer directive's size in bytes and byte order, or 0.
+fn integer_layout(d: RbDirective) -> (i64, bool) {
+    let k = d.kind
+    var size = 0
+    var big_endian = false
+    if k == 99 or k == 67 {
+        size = 1
+    } else if k == 115 or k == 83 {
+        size = 2
+    } else if k == 105 or k == 73 {
+        size = 4
+    } else if k == 108 or k == 76 {
+        size = if d.natint { 8 } else { 4 }
+    } else if k == 113 or k == 81 or k == 106 or k == 74 {
+        size = 8
+    } else if k == 110 or k == 78 {
+        size = if k == 110 { 2 } else { 4 }
+        big_endian = true
+    } else if k == 118 or k == 86 {
+        size = if k == 118 { 2 } else { 4 }
+    }
+    if d.endian != 0 {
+        big_endian = d.endian == 62
+    }
+    return (size, big_endian)
+}
+
+fn refused(kind: i64) -> bool {
+    return has("DdFfEeGgPp", kind)
+}
+
+fn refuse(kind: i64) -> RbPackError {
+    return RbPackArgumentError("'" + kind.to_char() + "' (floats and pointers) is not supported by this package")
+}
+
+// ---- integers
+
+fn pow2(bits: i64) -> BigInt {
+    return bigint.pow(big(2), bits)
+}
+
+/// The value's low `size` bytes, two's complement, least significant
+/// first.
+fn low_bytes(v: BigInt, size: i64) -> [i64] {
+    let m = pow2(8 * size)
+    var r = bigint.rem(v, m) ?? bigint.zero()
+    if bigint.sign(r) < 0 {
+        r = bigint.add(r, m)
+    }
+    var out: [i64] = []
+    var i = 0
+    while i < size {
+        let pair = bigint.divmod(r, big(256)) ?? (bigint.zero(), bigint.zero())
+        out.push(bigint.to_i64(pair.1) ?? 0)
+        r = pair.0
+        i = i + 1
+    }
+    return out
+}
+
+fn reversed(xs: [i64]) -> [i64] {
+    var out: [i64] = []
+    var i = xs.len() - 1
+    while i >= 0 {
+        out.push(xs[i])
+        i = i - 1
+    }
+    return out
+}
+
+fn bytes_value(bs: [i64], big_endian: bool, signed: bool) -> BigInt {
+    var v = bigint.zero()
+    var i = 0
+    while i < bs.len() {
+        let b = if big_endian { bs[i] } else { bs[bs.len() - 1 - i] }
+        v = bigint.add(bigint.mul(v, big(256)), big(b))
+        i = i + 1
+    }
+    if signed and bs.len() > 0 and (if big_endian { bs[0] } else { bs[bs.len() - 1] }) >= 128 {
+        v = bigint.sub(v, pow2(8 * bs.len()))
+    }
+    return v
+}
+
+fn take_int(item: RbPackItem) -> BigInt ! RbPackError {
+    return match item {
+        RbPackInt(v) -> v
+        RbPackStr(_s) -> fail(RbPackTypeError("no implicit conversion of String into Integer"))
+        RbPackNil -> fail(RbPackTypeError("no implicit conversion of nil into Integer"))
+    }
+}
+
+fn take_str(item: RbPackItem) -> [i64] ! RbPackError {
+    return match item {
+        RbPackStr(s) -> s.to_list()
+        RbPackInt(_v) -> fail(RbPackTypeError("no implicit conversion of Integer into String"))
+        RbPackNil -> fail(RbPackTypeError("no implicit conversion of nil into String"))
+    }
+}
+
+/// `rb_uv_to_utf8`, six-byte forms included.
+fn utf8_of(v: i64) -> [i64] ! RbPackError {
+    if v < 0 or v > 2147483647 {
+        fail(RbPackRangeError("pack(U): value out of range"))
+    }
+    if v <= 127 {
+        return [v]
+    }
+    let n = if v <= 2047 { 2 } else if v <= 65535 { 3 } else if v <= 2097151 { 4 } else if v <= 67108863 { 5 } else { 6 }
+    let lead = [0, 0, 192, 224, 240, 248, 252]
+    var out: [i64] = []
+    var k = n - 1
+    out.push(v.shr(6 * k).bit_or(lead[n]).bit_and(255))
+    while k > 0 {
+        k = k - 1
+        out.push(v.shr(6 * k).bit_and(63).bit_or(128))
+    }
+    return out
+}
+
+/// BER: base 128, high bit on every byte but the last.
+fn ber_of(v: BigInt) -> [i64] ! RbPackError {
+    if bigint.sign(v) < 0 {
+        fail(RbPackArgumentError("can't compress negative numbers"))
+    }
+    var digits: [i64] = []
+    var r = v
+    while true {
+        let pair = bigint.divmod(r, big(128)) ?? (bigint.zero(), bigint.zero())
+        digits.push(bigint.to_i64(pair.1) ?? 0)
+        r = pair.0
+        if bigint.is_zero(r) {
+            break
+        }
+    }
+    var out: [i64] = []
+    var i = digits.len() - 1
+    while i >= 0 {
+        out.push(if i > 0 { digits[i] + 128 } else { digits[i] })
+        i = i - 1
+    }
+    return out
+}
+
+// ---- pack
+
+fn pad_string(out: [i64], src: [i64], d: RbDirective, len0: i64) -> [i64] {
+    var res = out
+    let len = len0
+    if src.len() >= len {
+        extend(res, src.slice(0, len))
+        if d.star and d.kind == 90 {
+            res.push(0)
+        }
+    } else {
+        extend(res, src)
+        extend(res, zeros(len - src.len(), if d.kind == 65 { 32 } else { 0 }))
+    }
+    return res
+}
+
+/// `b` and `B`: one bit from each character's low bit.
+fn pack_bits(src: [i64], len0: i64, ascending: bool) -> [i64] {
+    var len = len0
+    var pad = 0
+    if len > src.len() {
+        pad = (len - src.len() + 1) / 2
+        len = src.len()
+    }
+    var out: [i64] = []
+    var byte = 0
+    var i = 0
+    while i < len {
+        let bit = src[i].bit_and(1)
+        if ascending {
+            if bit == 1 {
+                byte = byte.bit_or(128)
+            }
+        } else {
+            byte = byte.bit_or(bit)
+        }
+        i = i + 1
+        if i % 8 != 0 {
+            byte = if ascending { byte.shr(1) } else { byte.shl(1) }
+        } else {
+            out.push(byte.bit_and(255))
+            byte = 0
+        }
+    }
+    if len % 8 != 0 {
+        byte = if ascending { byte.shr(7 - len % 8) } else { byte.shl(7 - len % 8) }
+        out.push(byte.bit_and(255))
+    }
+    extend(out, zeros(pad, 0))
+    return out
+}
+
+fn is_alpha(c: i64) -> bool {
+    return c >= 65 and c <= 90 or c >= 97 and c <= 122
+}
+
+/// `h` and `H`: a nibble from each character.
+fn pack_hex(src: [i64], len0: i64, low_first: bool) -> [i64] {
+    var len = len0
+    var pad = 0
+    if len > src.len() {
+        pad = (len + 1) / 2 - (src.len() + 1) / 2
+        len = src.len()
+    }
+    var out: [i64] = []
+    var byte = 0
+    var i = 0
+    while i < len {
+        let c = src[i]
+        let nib = if is_alpha(c) { (c.bit_and(15) + 9).bit_and(15) } else { c.bit_and(15) }
+        byte = byte.bit_or(if low_first { nib.shl(4) } else { nib })
+        i = i + 1
+        if i % 2 != 0 {
+            byte = if low_first { byte.shr(4) } else { byte.shl(4) }
+        } else {
+            out.push(byte.bit_and(255))
+            byte = 0
+        }
+    }
+    if len % 2 != 0 {
+        out.push(byte.bit_and(255))
+    }
+    extend(out, zeros(pad, 0))
+    return out
+}
+
+/// `encodes`: uuencode or base64 of up to a line's bytes.
+fn encodes(s: [i64], uu: bool, tail_lf: bool) -> [i64] {
+    let table = (if uu { "`!\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_" } else {
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+    }).to_bytes().to_list()
+    let padding = if uu { 96 } else { 61 }
+    var out: [i64] = []
+    if uu {
+        out.push(s.len() + 32)
+    }
+    var i = 0
+    while s.len() - i >= 3 {
+        out.push(table[s[i].shr(2)])
+        out.push(table[s[i].shl(4).bit_and(48).bit_or(s[i + 1].shr(4))])
+        out.push(table[s[i + 1].shl(2).bit_and(60).bit_or(s[i + 2].shr(6))])
+        out.push(table[s[i + 2].bit_and(63)])
+        i = i + 3
+    }
+    if s.len() - i == 2 {
+        out.push(table[s[i].shr(2)])
+        out.push(table[s[i].shl(4).bit_and(48).bit_or(s[i + 1].shr(4))])
+        out.push(table[s[i + 1].shl(2).bit_and(60)])
+        out.push(padding)
+    } else if s.len() - i == 1 {
+        out.push(table[s[i].shr(2)])
+        out.push(table[s[i].shl(4).bit_and(48)])
+        out.push(padding)
+        out.push(padding)
+    }
+    if tail_lf {
+        out.push(10)
+    }
+    return out
+}
+
+fn pack_lines(src: [i64], len0: i64, uu: bool) -> [i64] {
+    if len0 == 0 and not uu {
+        return encodes(src, false, false)
+    }
+    let len = if len0 <= 2 { 45 } else if len0 > 63 and uu { 63 } else { len0 / 3 * 3 }
+    var out: [i64] = []
+    var i = 0
+    while i < src.len() {
+        let todo = if src.len() - i > len { len } else { src.len() - i }
+        extend(out, encodes(src.slice(i, i + todo), uu, true))
+        i = i + todo
+    }
+    return out
+}
+
+/// `qpencode`, lines at most `len` characters before a soft break.
+fn qp_encode(s: [i64], len: i64) -> [i64] {
+    let hex = "0123456789ABCDEF".to_bytes().to_list()
+    var out: [i64] = []
+    var n = 0
+    var prev = 0 - 1
+    for c in s {
+        if c > 126 or c < 32 and c != 10 and c != 9 or c == 61 {
+            out.push(61)
+            out.push(hex[c.shr(4)])
+            out.push(hex[c.bit_and(15)])
+            n = n + 3
+            prev = 0 - 1
+        } else if c == 10 {
+            if prev == 32 or prev == 9 {
+                out.push(61)
+                out.push(c)
+            }
+            out.push(c)
+            n = 0
+            prev = c
+        } else {
+            out.push(c)
+            n = n + 1
+            prev = c
+        }
+        if n > len {
+            out.push(61)
+            out.push(10)
+            n = 0
+            prev = 10
+        }
+    }
+    if n > 0 {
+        out.push(61)
+        out.push(10)
+    }
+    return out
+}
+
+fn item_text(item: RbPackItem) -> [i64] {
+    return match item {
+        RbPackStr(s) -> s.to_list()
+        RbPackInt(v) -> bigint.to_str(v).to_bytes().to_list()
+        RbPackNil -> []
+    }
+}
+
+/// The state `pack` carries: the output so far and the next item.
+type RbPacker = { out: [i64], idx: i64 }
+
+fn next_item(inout p: RbPacker, items: [RbPackItem]) -> RbPackItem ! RbPackError {
+    if p.idx >= items.len() {
+        fail(RbPackArgumentError("too few arguments"))
+    }
+    p.idx = p.idx + 1
+    return items[p.idx - 1]
+}
+
+fn pack_string_directive(inout p: RbPacker, items: [RbPackItem], d: RbDirective) ! RbPackError {
+    let item = try next_item(p, items)
+    let src = match item {
+        RbPackNil -> []
+        _ -> try take_str(item)
+    }
+    let len = if d.last == 42 { src.len() } else { d.len }
+    let k = d.kind
+    if k == 97 or k == 65 or k == 90 {
+        p.out = pad_string(p.out, src, d, len)
+    } else if k == 98 or k == 66 {
+        extend(p.out, pack_bits(src, len, k == 98))
+    } else {
+        extend(p.out, pack_hex(src, len, k == 104))
+    }
+}
+
+fn pack_position(inout p: RbPacker, d: RbDirective, len: i64) ! RbPackError {
+    if d.kind == 120 {
+        extend(p.out, zeros(len, 0))
+        return
+    }
+    var back = len
+    if d.kind == 64 {
+        let to = len - p.out.len()
+        if to > 0 {
+            extend(p.out, zeros(to, 0))
+            return
+        }
+        back = 0 - to
+    }
+    if p.out.len() < back {
+        fail(RbPackArgumentError("X outside of string"))
+    }
+    p.out = p.out.slice(0, p.out.len() - back)
+}
+
+fn pack_directive(inout p: RbPacker, items: [RbPackItem], d: RbDirective) ! RbPackError {
+    let k = d.kind
+    var len = d.len
+    if d.star {
+        len = if has("@Xxu", k) { 0 } else if has("PMm", k) { 1 } else { items.len() - p.idx }
+    }
+    if refused(k) {
+        fail(refuse(k))
+    }
+    if has("aAZBbHh", k) {
+        try pack_string_directive(p, items, d)
+        return
+    }
+    let (size, big_endian) = integer_layout(d)
+    if size > 0 {
+        var n = 0
+        while n < len {
+            let v = try take_int(try next_item(p, items))
+            let bs = low_bytes(v, size)
+            extend(p.out, if big_endian { reversed(bs) } else { bs })
+            n = n + 1
+        }
+        return
+    }
+    if k == 120 or k == 88 or k == 64 {
+        try pack_position(p, d, len)
+        return
+    }
+    if k == 37 {
+        fail(RbPackArgumentError("% is not supported"))
+    }
+    try pack_text_directive(p, items, d, len)
+}
+
+fn pack_text_directive(inout p: RbPacker, items: [RbPackItem], d: RbDirective, len: i64) ! RbPackError {
+    let k = d.kind
+    if k == 85 {
+        var n = 0
+        while n < len {
+            let v = try take_int(try next_item(p, items))
+            let small = match bigint.to_i64(v) {
+                Some(x) -> x
+                None -> fail(RbPackRangeError("bignum too big to convert into `long'"))
+            }
+            extend(p.out, try utf8_of(small))
+            n = n + 1
+        }
+    } else if k == 117 or k == 109 {
+        let src = try take_str(try next_item(p, items))
+        extend(p.out, pack_lines(src, len, k == 117))
+    } else if k == 77 {
+        let src = item_text(try next_item(p, items))
+        extend(p.out, qp_encode(src, if len <= 1 { 72 } else { len }))
+    } else if k == 119 {
+        var n = 0
+        while n < len {
+            let v = try take_int(try next_item(p, items))
+            extend(p.out, try ber_of(v))
+            n = n + 1
+        }
+    }
+}
+
+/// `items.pack(template)`.
+pub fn pack(items: [RbPackItem], template: str) -> bytes ! RbPackError {
+    let t = template.to_bytes().to_list()
+    var p = RbPacker{ out: [], idx: 0 }
+    var i = 0
+    while true {
+        let d = try read_directive(t, i)
+        if d.kind == 0 {
+            break
+        }
+        i = d.next
+        try pack_directive(p, items, d)
+    }
+    return bytes_of(p.out)
+}
+
+// ---- unpack
+
+/// The state `unpack` carries: the data, where it is, the results, and
+/// whether one value is all that is wanted.
+type RbUnpacker = { s: [i64], pos: i64, out: [RbUnpacked], one: bool }
+
+fn push(inout u: RbUnpacker, v: RbUnpacked) {
+    u.out.push(v)
+}
+
+fn done(u: RbUnpacker) -> bool {
+    return u.one and u.out.len() > 0
+}
+
+fn left(u: RbUnpacker) -> i64 {
+    return u.s.len() - u.pos
+}
+
+fn unpack_strings(inout u: RbUnpacker, d: RbDirective, len0: i64) {
+    var len = len0
+    let k = d.kind
+    if k == 65 or k == 97 {
+        if len > left(u) {
+            len = left(u)
+        }
+        var keep = len
+        if k == 65 {
+            while keep > 0 and (u.s[u.pos + keep - 1] == 32 or u.s[u.pos + keep - 1] == 0) {
+                keep = keep - 1
+            }
+        }
+        push(u, RbUnpackedStr(bytes_of(u.s.slice(u.pos, u.pos + keep))))
+        u.pos = u.pos + len
+        return
+    }
+    if len > left(u) {
+        len = left(u)
+    }
+    var t = u.pos
+    while t < u.pos + len and u.s[t] != 0 {
+        t = t + 1
+    }
+    push(u, RbUnpackedStr(bytes_of(u.s.slice(u.pos, t))))
+    if t < u.s.len() {
+        t = t + 1
+    }
+    u.pos = if d.star { t } else { u.pos + len }
+}
+
+fn unpack_bits(inout u: RbUnpacker, d: RbDirective, len0: i64) {
+    let k = d.kind
+    let per = if k == 98 or k == 66 { 8 } else { 2 }
+    var len = len0
+    if d.last == 42 or len > left(u) * per {
+        len = left(u) * per
+    }
+    let hex = "0123456789abcdef".to_bytes().to_list()
+    var out: [i64] = []
+    var bits = 0
+    var i = 0
+    while i < len {
+        if i % per != 0 {
+            bits = if k == 98 { bits.shr(1) } else if k == 66 { bits.shl(1) } else if k == 104 { bits.shr(4) } else { bits.shl(4) }
+        } else {
+            bits = u.s[u.pos]
+            u.pos = u.pos + 1
+        }
+        if k == 98 {
+            out.push(if bits.bit_and(1) == 1 { 49 } else { 48 })
+        } else if k == 66 {
+            out.push(if bits.bit_and(128) != 0 { 49 } else { 48 })
+        } else if k == 104 {
+            out.push(hex[bits.bit_and(15)])
+        } else {
+            out.push(hex[bits.shr(4).bit_and(15)])
+        }
+        i = i + 1
+    }
+    push(u, RbUnpackedStr(bytes_of(out)))
+}
+
+fn unpack_integers(inout u: RbUnpacker, d: RbDirective, len0: i64, size: i64, big_endian: bool) {
+    var len = len0
+    var missing = 0
+    if len > left(u) / size {
+        if not d.star {
+            missing = len - left(u) / size
+        }
+        len = left(u) / size
+    }
+    let signed = d.kind == 99 or d.kind == 115 or d.kind == 105 or d.kind == 108 or d.kind == 113 or d.kind == 106
+    var n = 0
+    while n < len and not done(u) {
+        push(u, RbUnpackedInt(bytes_value(u.s.slice(u.pos, u.pos + size), big_endian, signed)))
+        u.pos = u.pos + size
+        n = n + 1
+    }
+    if not u.one {
+        var m = 0
+        while m < missing {
+            push(u, RbUnpackedNil)
+            m = m + 1
+        }
+    }
+}
+
+/// `utf8_to_uv`: the character at `pos` and its length.
+fn utf8_at(s: [i64], pos: i64) -> (i64, i64) ! RbPackError {
+    let c = s[pos]
+    if c < 128 {
+        return (c, 1)
+    }
+    if c.bit_and(64) == 0 {
+        fail(RbPackArgumentError("malformed UTF-8 character"))
+    }
+    var n = 0
+    var v = 0
+    if c.bit_and(32) == 0 {
+        n = 2
+        v = c.bit_and(31)
+    } else if c.bit_and(16) == 0 {
+        n = 3
+        v = c.bit_and(15)
+    } else if c.bit_and(8) == 0 {
+        n = 4
+        v = c.bit_and(7)
+    } else if c.bit_and(4) == 0 {
+        n = 5
+        v = c.bit_and(3)
+    } else if c.bit_and(2) == 0 {
+        n = 6
+        v = c.bit_and(1)
+    } else {
+        fail(RbPackArgumentError("malformed UTF-8 character"))
+    }
+    let avail = s.len() - pos
+    if n > avail {
+        fail(RbPackArgumentError("malformed UTF-8 character (expected " + n.to_str() + " bytes, given " + avail.to_str() + " bytes)"))
+    }
+    var k = 1
+    while k < n {
+        let b = s[pos + k]
+        if b.bit_and(192) != 128 {
+            fail(RbPackArgumentError("malformed UTF-8 character"))
+        }
+        v = v.shl(6).bit_or(b.bit_and(63))
+        k = k + 1
+    }
+    let limits = [0, 128, 2048, 65536, 2097152, 67108864]
+    if v < limits[n - 1] {
+        fail(RbPackArgumentError("redundant UTF-8 sequence"))
+    }
+    return (v, n)
+}
+
+fn uu_value(s: [i64], pos: i64) -> bool {
+    return pos < s.len() and s[pos] >= 32 and s[pos] < 97
+}
+
+fn unpack_uu(s: [i64], start: i64) -> ([i64], i64) {
+    let cap = (s.len() - start) * 3 / 4
+    var out: [i64] = []
+    var total = 0
+    var i = start
+    while i < s.len() and s[i] > 32 and s[i] < 97 {
+        var len = (s[i] - 32).bit_and(63)
+        i = i + 1
+        total = total + len
+        if total > cap {
+            len = len - (total - cap)
+            total = cap
+        }
+        while len > 0 {
+            let mlen = if len > 3 { 3 } else { len }
+            var q: [i64] = []
+            var k = 0
+            while k < 4 {
+                if uu_value(s, i) {
+                    q.push((s[i] - 32).bit_and(63))
+                    i = i + 1
+                } else {
+                    q.push(0)
+                }
+                k = k + 1
+            }
+            let hunk = [q[0].shl(2).bit_or(q[1].shr(4)).bit_and(255), q[1].shl(4).bit_or(q[2].shr(2)).bit_and(255), q[2].shl(6).bit_or(q[3]).bit_and(255)]
+            extend(out, hunk.slice(0, mlen))
+            len = len - mlen
+        }
+        if i < s.len() and s[i] != 13 and s[i] != 10 {
+            i = i + 1
+        }
+        if i < s.len() and s[i] == 13 {
+            i = i + 1
+        }
+        if i < s.len() and s[i] == 10 {
+            i = i + 1
+        }
+    }
+    return (out.slice(0, total), i)
+}
+
+fn b64_value(c: i64) -> i64 {
+    if c >= 65 and c <= 90 {
+        return c - 65
+    }
+    if c >= 97 and c <= 122 {
+        return c - 71
+    }
+    if c >= 48 and c <= 57 {
+        return c + 4
+    }
+    if c == 43 {
+        return 62
+    }
+    return if c == 47 { 63 } else { 0 - 1 }
+}
+
+/// The byte at `i`, or the NUL past the end that the C code reads.
+fn at(s: [i64], i: i64) -> i64 {
+    return if i < s.len() { s[i] } else { 0 }
+}
+
+/// `m0`: RFC 4648, where anything out of place is "invalid base64".
+fn unpack_b64_strict(s: [i64], start: i64) -> ([i64], i64) ! RbPackError {
+    var out: [i64] = []
+    var i = start
+    var a = 0 - 1
+    var b = 0 - 1
+    var c = 0
+    var d = 0
+    let bad = RbPackArgumentError("invalid base64")
+    while i < s.len() {
+        a = b64_value(s[i])
+        i = i + 1
+        if i >= s.len() or a == 0 - 1 {
+            fail(bad)
+        }
+        b = b64_value(s[i])
+        i = i + 1
+        if i >= s.len() or b == 0 - 1 {
+            fail(bad)
+        }
+        c = 0 - 1
+        d = 0 - 1
+        if s[i] == 61 {
+            if i + 2 == s.len() and s[i + 1] == 61 {
+                break
+            }
+            fail(bad)
+        }
+        c = b64_value(s[i])
+        i = i + 1
+        if i >= s.len() or c == 0 - 1 {
+            fail(bad)
+        }
+        if i + 1 == s.len() and s[i] == 61 {
+            break
+        }
+        d = b64_value(s[i])
+        i = i + 1
+        if d == 0 - 1 {
+            fail(bad)
+        }
+        extend(out, [a.shl(2).bit_or(b.shr(4)).bit_and(255), b.shl(4).bit_or(c.shr(2)).bit_and(255), c.shl(6).bit_or(d).bit_and(255)])
+    }
+    if c == 0 - 1 {
+        out.push(a.shl(2).bit_or(b.shr(4)).bit_and(255))
+        if b.bit_and(15) != 0 {
+            fail(bad)
+        }
+    } else if d == 0 - 1 {
+        out.push(a.shl(2).bit_or(b.shr(4)).bit_and(255))
+        out.push(b.shl(4).bit_or(c.shr(2)).bit_and(255))
+        if c.bit_and(3) != 0 {
+            fail(bad)
+        }
+    }
+    return (out, i)
+}
+
+/// `m`: RFC 2045, skipping what is not base64 and stopping at `=`.
+fn unpack_b64(s: [i64], start: i64) -> ([i64], i64) {
+    var out: [i64] = []
+    var i = start
+    var a = 0 - 1
+    var b = 0 - 1
+    var c = 0 - 1
+    while i < s.len() {
+        a = 0 - 1
+        b = 0 - 1
+        c = 0 - 1
+        while i < s.len() and b64_value(s[i]) == 0 - 1 {
+            i = i + 1
+        }
+        if i >= s.len() {
+            break
+        }
+        a = b64_value(s[i])
+        i = i + 1
+        while i < s.len() and b64_value(s[i]) == 0 - 1 {
+            i = i + 1
+        }
+        if i >= s.len() {
+            break
+        }
+        b = b64_value(s[i])
+        i = i + 1
+        while i < s.len() and b64_value(s[i]) == 0 - 1 and s[i] != 61 {
+            i = i + 1
+        }
+        if at(s, i) == 61 or i >= s.len() {
+            break
+        }
+        c = b64_value(s[i])
+        i = i + 1
+        var d = 0 - 1
+        while i < s.len() and b64_value(s[i]) == 0 - 1 and s[i] != 61 {
+            i = i + 1
+        }
+        if at(s, i) == 61 or i >= s.len() {
+            break
+        }
+        d = b64_value(s[i])
+        i = i + 1
+        extend(out, [a.shl(2).bit_or(b.shr(4)).bit_and(255), b.shl(4).bit_or(c.shr(2)).bit_and(255), c.shl(6).bit_or(d).bit_and(255)])
+        a = 0 - 1
+    }
+    if a != 0 - 1 and b != 0 - 1 {
+        out.push(a.shl(2).bit_or(b.shr(4)).bit_and(255))
+        if c != 0 - 1 {
+            out.push(b.shl(4).bit_or(c.shr(2)).bit_and(255))
+        }
+    }
+    return (out, i)
+}
+
+fn hex_digit(c: i64) -> i64 {
+    if c >= 48 and c <= 57 {
+        return c - 48
+    }
+    if c >= 97 and c <= 102 {
+        return c - 87
+    }
+    return if c >= 65 and c <= 70 { c - 55 } else { 0 - 1 }
+}
+
+/// `M`: quoted-printable; at the first bad escape the rest is kept as it
+/// is, and reading goes on from that escape.
+fn unpack_qp(s: [i64], start: i64) -> ([i64], i64) {
+    var out: [i64] = []
+    var i = start
+    var ss = start
+    while i < s.len() {
+        if s[i] == 61 {
+            i = i + 1
+            if i == s.len() {
+                break
+            }
+            if i + 1 < s.len() and s[i] == 13 and s[i + 1] == 10 {
+                i = i + 1
+            }
+            if s[i] != 10 {
+                let c1 = hex_digit(s[i])
+                if c1 == 0 - 1 {
+                    break
+                }
+                i = i + 1
+                if i == s.len() {
+                    break
+                }
+                let c2 = hex_digit(s[i])
+                if c2 == 0 - 1 {
+                    break
+                }
+                out.push(c1 * 16 + c2)
+            }
+        } else {
+            out.push(s[i])
+        }
+        i = i + 1
+        ss = i
+    }
+    extend(out, s.slice(ss, s.len()))
+    return (out, i)
+}
+
+fn unpack_position(inout u: RbUnpacker, d: RbDirective, len: i64) ! RbPackError {
+    if d.kind == 64 {
+        if len > u.s.len() {
+            fail(RbPackArgumentError("@ outside of string"))
+        }
+        u.pos = len
+    } else if d.kind == 88 {
+        if len > u.pos {
+            fail(RbPackArgumentError("X outside of string"))
+        }
+        u.pos = u.pos - len
+    } else {
+        if len > left(u) {
+            fail(RbPackArgumentError("x outside of string"))
+        }
+        u.pos = u.pos + len
+    }
+}
+
+fn unpack_text(inout u: RbUnpacker, d: RbDirective, len0: i64) ! RbPackError {
+    let k = d.kind
+    if k == 85 {
+        var len = if len0 > left(u) { left(u) } else { len0 }
+        while len > 0 and u.pos < u.s.len() and not done(u) {
+            let (v, n) = try utf8_at(u.s, u.pos)
+            u.pos = u.pos + n
+            len = len - 1
+            push(u, RbUnpackedInt(bigint.from_i64(v)))
+        }
+    } else if k == 117 {
+        let (bs, end) = unpack_uu(u.s, u.pos)
+        u.pos = end
+        push(u, RbUnpackedStr(bytes_of(bs)))
+    } else if k == 109 {
+        let (bs, end) = if len0 == 0 { try unpack_b64_strict(u.s, u.pos) } else { unpack_b64(u.s, u.pos) }
+        u.pos = end
+        push(u, RbUnpackedStr(bytes_of(bs)))
+    } else if k == 77 {
+        let (bs, end) = unpack_qp(u.s, u.pos)
+        u.pos = end
+        push(u, RbUnpackedStr(bytes_of(bs)))
+    } else if k == 119 {
+        var len = len0
+        var s0 = u.pos
+        while len > 0 and u.pos < u.s.len() and not done(u) {
+            u.pos = u.pos + 1
+            if u.s[u.pos - 1].bit_and(128) == 0 {
+                var v = bigint.zero()
+                for b in u.s.slice(s0, u.pos) {
+                    v = bigint.add(bigint.mul(v, big(128)), big(b.bit_and(127)))
+                }
+                push(u, RbUnpackedInt(v))
+                len = len - 1
+                s0 = u.pos
+            }
+        }
+    }
+}
+
+fn unpack_directive(inout u: RbUnpacker, d: RbDirective) ! RbPackError {
+    let k = d.kind
+    var len = d.len
+    if d.star {
+        len = left(u)
+    } else if not d.counted {
+        // With nothing after it in the template the count is 1, even for
+        // `@`; otherwise a bare `@` is 0.
+        len = if k == 64 and not d.at_end { 0 } else { 1 }
+    }
+    if refused(k) {
+        fail(refuse(k))
+    }
+    if k == 37 {
+        fail(RbPackArgumentError("% is not supported"))
+    }
+    if k == 65 or k == 97 or k == 90 {
+        unpack_strings(u, d, len)
+        return
+    }
+    if k == 98 or k == 66 or k == 104 or k == 72 {
+        unpack_bits(u, d, len)
+        return
+    }
+    let (size, big_endian) = integer_layout(d)
+    if size > 0 {
+        unpack_integers(u, d, len, size, big_endian)
+        return
+    }
+    if k == 64 or k == 88 or k == 120 {
+        try unpack_position(u, d, len)
+        return
+    }
+    try unpack_text(u, d, len)
+}
+
+fn run_unpack(data: bytes, template: str, one: bool) -> [RbUnpacked] ! RbPackError {
+    let t = template.to_bytes().to_list()
+    var u = RbUnpacker{ s: data.to_list(), pos: 0, out: [], one: one }
+    var i = 0
+    while not done(u) {
+        let d = try read_directive(t, i)
+        if d.kind == 0 {
+            break
+        }
+        i = d.next
+        try unpack_directive(u, d)
+    }
+    return u.out
+}
+
+/// `data.unpack(template)`.
+pub fn unpack(data: bytes, template: str) -> [RbUnpacked] ! RbPackError {
+    return try run_unpack(data, template, false)
+}
+
+/// `data.unpack1(template)`: the first value, or nil.
+pub fn unpack1(data: bytes, template: str) -> RbUnpacked ! RbPackError {
+    let out = try run_unpack(data, template, true)
+    return if out.len() > 0 { out[0] } else { RbUnpackedNil }
+}

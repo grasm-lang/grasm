@@ -1,0 +1,24 @@
+[package]
+name = "gonetmail"
+version = "1.0.0"
+capabilities = []
+
+[dependencies.goencoding]
+path = "../goencoding"
+version = "^1.0.0"
+
+[dependencies.gonetip]
+path = "../gonetip"
+version = "^1.0.0"
+
+[dependencies.goquote]
+path = "../goquote"
+version = "^1.0.0"
+
+[dependencies.gostrings]
+path = "../gostrings"
+version = "^1.0.0"
+
+[dependencies.gotimefmt]
+path = "../gotimefmt"
+version = "^1.0.0"

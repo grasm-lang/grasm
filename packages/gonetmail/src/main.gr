@@ -1,0 +1,923 @@
+// Go's `net/mail` addresses and dates, as Go 1.25 parses and prints them:
+// `ParseAddress`, `ParseAddressList`, `Address.String` and `ParseDate`,
+// error texts included.
+//
+// Go mail servers, list managers and notification services read `From`,
+// `To` and `Date` through this package, and a tool on the other side --
+// a test of what a Go service accepts, a proxy that must refuse what it
+// would refuse -- needs its exact reading:
+//
+//   - An address is tried first as a bare `local@domain`, then as a
+//     display name (atoms, quoted strings, RFC 2047 encoded words) before
+//     `<local@domain>`; a comment after a bare address becomes its name.
+//     Groups (`Team: a@x, b@y;`) give their members; `ParseAddress` refuses
+//     a group of other than one.
+//   - Local parts are dot-atoms or quoted strings, domains dot-atoms or
+//     bracketed IP addresses as `net.ParseIP` reads them (no zone).
+//     Non-ASCII text is allowed (RFC 6532); bytes that are not UTF-8 are
+//     refused with Go's `%q` of the rest of the input.
+//   - Encoded words decode in `utf-8`, `iso-8859-1` and `us-ascii`
+//     (matched as `strings.EqualFold` does, so `uſ-ascii` counts); any
+//     other charset is `charset not supported: "<lowercased>"`, and a word
+//     that does not decode is kept as text. Adjacent encoded words in a
+//     name join without the space between them.
+//   - `address_string` quotes a local part that is not a dot-atom, writes
+//     an all-ASCII name as a quoted string, and any other name as a UTF-8
+//     encoded word -- `B` if it holds one of ``"#$%&'(),.:;<>@[]^`{|}~``,
+//     `Q` otherwise -- split at 75 bytes without cutting a character.
+//   - `ParseDate` reads RFC 5322 dates with or without the day name and
+//     seconds, two- or four-digit years and a numeric, named or `UT` zone,
+//     joins folded lines, refuses a bare CR, and ignores anything after a
+//     numeric zone that is not a malformed comment. It answers as Go does
+//     on a machine whose local zone is UTC (see `packages/gotimefmt`).
+//
+// A Go string is bytes, and a decoded name can hold bytes that are not
+// UTF-8 (`=?utf-8?q?=FF?=`), so names, addresses and dates are `bytes`.
+//
+// Not here: `ReadMessage` and `Header`, and an `AddressParser` with a
+// caller's own `WordDecoder` -- this is the default decoder only.
+
+import goencoding
+import gonetip
+import goquote
+import gostrings
+import gotimefmt
+
+type GoMailAddress = { name: bytes, address: bytes }
+
+type GoMailError = | GoMailFailed(text: str)
+
+/// The error's text, as Go's `Error()` gives it.
+pub fn error_text(e: GoMailError) -> str {
+    return match e {
+        GoMailFailed(t) -> t
+    }
+}
+
+fn failed(t: str) -> GoMailError {
+    return GoMailFailed(t)
+}
+
+fn misformatted() -> GoMailError {
+    return GoMailFailed("mail: misformatted parenthetical comment")
+}
+
+fn quoted(b: [i64]) -> str {
+    return goquote.quote(bytes_of(b))
+}
+
+// ---- runes
+
+/// `utf8.DecodeRune` of `b` from `i`; (65533, 1) for a bad byte and
+/// (65533, 0) at the end.
+fn decode(b: [i64], i: i64) -> (i64, i64) {
+    if i >= b.len() {
+        return (65533, 0)
+    }
+    let c0 = b[i]
+    if c0 < 128 {
+        return (c0, 1)
+    }
+    let n = b.len() - i
+    let bad = (65533, 1)
+    if c0 < 194 or c0 > 244 {
+        return bad
+    }
+    if c0 < 224 {
+        if n < 2 or b[i + 1] < 128 or b[i + 1] > 191 {
+            return bad
+        }
+        return (c0.bit_and(31).shl(6).bit_or(b[i + 1].bit_and(63)), 2)
+    }
+    let lo = if c0 == 224 { 160 } else if c0 == 240 { 144 } else { 128 }
+    let hi = if c0 == 237 { 159 } else if c0 == 244 { 143 } else { 191 }
+    if n < 2 or b[i + 1] < lo or b[i + 1] > hi {
+        return bad
+    }
+    if n < 3 or b[i + 2] < 128 or b[i + 2] > 191 {
+        return bad
+    }
+    if c0 < 240 {
+        return (c0.bit_and(15).shl(12).bit_or(b[i + 1].bit_and(63).shl(6)).bit_or(b[i + 2].bit_and(63)), 3)
+    }
+    if n < 4 or b[i + 3] < 128 or b[i + 3] > 191 {
+        return bad
+    }
+    return (c0.bit_and(7).shl(18).bit_or(b[i + 1].bit_and(63).shl(12)).bit_or(b[i + 2].bit_and(63).shl(6)).bit_or(b[i + 3].bit_and(63)), 4)
+}
+
+fn encode(r: i64) -> [i64] {
+    return r.to_char().to_bytes().to_list()
+}
+
+fn is_vchar(r: i64) -> bool {
+    return (r >= 33 and r <= 126) or r >= 128
+}
+
+fn is_wsp(r: i64) -> bool {
+    return r == 32 or r == 9
+}
+
+/// RFC 5322 atext, with `.` when `dot`.
+fn is_atext(r: i64, dot: bool) -> bool {
+    if r == 46 {
+        return dot
+    }
+    if r == 40 or r == 41 or r == 60 or r == 62 or r == 91 or r == 93 or r == 58 or r == 59 or r == 64 or r == 92 or r == 44 or r == 34 {
+        return false
+    }
+    return is_vchar(r)
+}
+
+fn is_qtext(r: i64) -> bool {
+    return r != 92 and r != 34 and is_vchar(r)
+}
+
+fn is_dtext(r: i64) -> bool {
+    return r != 91 and r != 93 and r != 92 and is_vchar(r)
+}
+
+fn push_all(inout o: [i64], xs: [i64]) {
+    for x in xs {
+        o.push(x)
+    }
+}
+
+// ---- the parser state: the input and how much of it is consumed
+
+type GoMailParser = { s: [i64], at: i64 }
+
+fn rest(p: GoMailParser) -> [i64] {
+    return p.s.slice(p.at, p.s.len())
+}
+
+fn empty(p: GoMailParser) -> bool {
+    return p.at >= p.s.len()
+}
+
+fn peek(p: GoMailParser) -> i64 {
+    return p.s[p.at]
+}
+
+fn consume(inout p: GoMailParser, c: i64) -> bool {
+    if empty(p) or peek(p) != c {
+        return false
+    }
+    p.at = p.at + 1
+    return true
+}
+
+fn skip_space(inout p: GoMailParser) {
+    while not empty(p) and (peek(p) == 32 or peek(p) == 9) {
+        p.at = p.at + 1
+    }
+}
+
+/// A comment after its `(`: its text and whether it closed.
+fn consume_comment(inout p: GoMailParser) -> ([i64], bool) {
+    var depth = 1
+    var comment: [i64] = []
+    while not empty(p) and depth != 0 {
+        if peek(p) == 92 and p.s.len() - p.at > 1 {
+            p.at = p.at + 1
+        } else if peek(p) == 40 {
+            depth = depth + 1
+        } else if peek(p) == 41 {
+            depth = depth - 1
+        }
+        if depth > 0 {
+            comment.push(peek(p))
+        }
+        p.at = p.at + 1
+    }
+    return (comment, depth == 0)
+}
+
+fn skip_cfws(inout p: GoMailParser) -> bool {
+    skip_space(p)
+    while consume(p, 40) {
+        let (_c, ok) = consume_comment(p)
+        if not ok {
+            return false
+        }
+        skip_space(p)
+    }
+    return true
+}
+
+fn consume_quoted_string(inout p: GoMailParser) -> [i64] ! GoMailError {
+    var i = p.at + 1
+    var qsb: [i64] = []
+    var escaped = false
+    while true {
+        let (r, size) = decode(p.s, i)
+        if size == 0 {
+            fail(failed("mail: unclosed quoted-string"))
+        }
+        if size == 1 and r == 65533 {
+            fail(failed("mail: invalid utf-8 in quoted-string: " + quoted(rest(p))))
+        }
+        if escaped {
+            if not is_vchar(r) and not is_wsp(r) {
+                fail(failed("mail: bad character in quoted-string: " + goquote.quote_rune(r)))
+            }
+            push_all(qsb, encode(r))
+            escaped = false
+        } else if is_qtext(r) or is_wsp(r) {
+            push_all(qsb, encode(r))
+        } else if r == 34 {
+            break
+        } else if r == 92 {
+            escaped = true
+        } else {
+            fail(failed("mail: bad character in quoted-string: " + goquote.quote_rune(r)))
+        }
+        i = i + size
+    }
+    p.at = i + 1
+    return qsb
+}
+
+fn consume_atom(inout p: GoMailParser, dot: bool, permissive: bool) -> [i64] ! GoMailError {
+    var i = p.at
+    while true {
+        let (r, size) = decode(p.s, i)
+        if size == 1 and r == 65533 {
+            fail(failed("mail: invalid utf-8 in address: " + quoted(rest(p))))
+        }
+        if size == 0 or not is_atext(r, dot) {
+            break
+        }
+        i = i + size
+    }
+    if i == p.at {
+        fail(failed("mail: invalid string"))
+    }
+    let atom = p.s.slice(p.at, i)
+    p.at = i
+    if not permissive {
+        if atom[0] == 46 {
+            fail(failed("mail: leading dot in atom"))
+        }
+        for k in 1..atom.len() {
+            if atom[k] == 46 and atom[k - 1] == 46 {
+                fail(failed("mail: double dot in atom"))
+            }
+        }
+        if atom[atom.len() - 1] == 46 {
+            fail(failed("mail: trailing dot in atom"))
+        }
+    }
+    return atom
+}
+
+fn consume_domain_literal(inout p: GoMailParser) -> [i64] ! GoMailError {
+    if not consume(p, 91) {
+        fail(failed("mail: missing \"[\" in domain-literal"))
+    }
+    let start = p.at
+    while true {
+        if empty(p) {
+            fail(failed("mail: unclosed domain-literal"))
+        }
+        if peek(p) == 93 {
+            break
+        }
+        let (r, size) = decode(p.s, p.at)
+        if size == 1 and r == 65533 {
+            fail(failed("mail: invalid utf-8 in domain-literal: " + quoted(rest(p))))
+        }
+        if not is_dtext(r) {
+            fail(failed("mail: bad character in domain-literal: " + goquote.quote_rune(r)))
+        }
+        p.at = p.at + size
+    }
+    let dtext = p.s.slice(start, p.at)
+    p.at = p.at + 1
+    let ip_ok = match gonetip.parse_addr(bytes_of(dtext).to_str()) {
+        Ok(a) -> gonetip.zone(a).len() == 0
+        Err(_e) -> false
+    }
+    if not ip_ok {
+        fail(failed("mail: invalid IP address in domain-literal: " + quoted(dtext)))
+    }
+    return [91] + dtext + [93]
+}
+
+fn addr_spec_body(inout p: GoMailParser) -> [i64] ! GoMailError {
+    skip_space(p)
+    if empty(p) {
+        fail(failed("mail: no addr-spec"))
+    }
+    var local: [i64] = []
+    if peek(p) == 34 {
+        local = match consume_quoted_string(p) {
+            Ok(q) -> q
+            Err(_e) -> []
+        }
+        if local.len() == 0 {
+            fail(failed("mail: empty quoted string in addr-spec"))
+        }
+    } else {
+        local = try consume_atom(p, true, false)
+    }
+    if not consume(p, 64) {
+        fail(failed("mail: missing @ in addr-spec"))
+    }
+    skip_space(p)
+    if empty(p) {
+        fail(failed("mail: no domain in addr-spec"))
+    }
+    var domain: [i64] = []
+    if peek(p) == 91 {
+        domain = try consume_domain_literal(p)
+    } else {
+        domain = try consume_atom(p, true, false)
+    }
+    return local + [64] + domain
+}
+
+/// `consumeAddrSpec`: on failure the input is left where it was.
+fn consume_addr_spec(inout p: GoMailParser) -> [i64] ! GoMailError {
+    let orig = p.at
+    return match addr_spec_body(p) {
+        Ok(spec) -> spec
+        Err(e) -> {
+            p.at = orig
+            fail(e)
+        }
+    }
+}
+
+// ---- RFC 2047 words
+
+/// `strings.EqualFold(charset, name)` for an ASCII `name`.
+fn charset_is(charset: [i64], name: str) -> bool {
+    return gostrings.equal_fold(bytes_of(charset), name.to_bytes())
+}
+
+/// `fromHex`: upper- or lower-case hex digit, -1 otherwise.
+fn hex_digit(c: i64) -> i64 {
+    if c >= 48 and c <= 57 {
+        return c - 48
+    }
+    if c >= 65 and c <= 70 {
+        return c - 55
+    }
+    if c >= 97 and c <= 102 {
+        return c - 87
+    }
+    return 0 - 1
+}
+
+fn q_decode(text: [i64]) -> Option[[i64]] {
+    var o: [i64] = []
+    var i = 0
+    while i < text.len() {
+        let c = text[i]
+        if c == 95 {
+            o.push(32)
+        } else if c == 61 {
+            if i + 2 >= text.len() {
+                return None
+            }
+            let hi = hex_digit(text[i + 1])
+            let lo = hex_digit(text[i + 2])
+            if hi < 0 or lo < 0 {
+                return None
+            }
+            o.push(hi * 16 + lo)
+            i = i + 2
+        } else if (c <= 126 and c >= 32) or c == 10 or c == 13 or c == 9 {
+            o.push(c)
+        } else {
+            return None
+        }
+        i = i + 1
+    }
+    return Some(o)
+}
+
+fn count_of(s: [i64], c: i64) -> i64 {
+    return s.filter(|x| x == c).len()
+}
+
+fn index_of(s: [i64], c: i64) -> i64 {
+    for i in 0..s.len() {
+        if s[i] == c {
+            return i
+        }
+    }
+    return 0 - 1
+}
+
+/// `mime.WordDecoder.Decode` with net/mail's charset reader: the decoded
+/// text, `None` for a word that does not decode, or the charset error.
+fn decode_word(word: [i64]) -> Option[[i64]] ! GoMailError {
+    let n = word.len()
+    if n < 8 or word[0] != 61 or word[1] != 63 or word[n - 2] != 63 or word[n - 1] != 61 or count_of(word, 63) != 4 {
+        return None
+    }
+    let inner = word.slice(2, n - 2)
+    let q1 = index_of(inner, 63)
+    let charset = inner.slice(0, q1)
+    let after = inner.slice(q1 + 1, inner.len())
+    let q2 = index_of(after, 63)
+    if charset.len() == 0 or q2 != 1 {
+        return None
+    }
+    let text = after.slice(2, after.len())
+    let kind = after[0]
+    var content: [i64] = []
+    if kind == 66 or kind == 98 {
+        let (b, err) = goencoding.base64_decode(goencoding.std_encoding(), bytes_of(text))
+        if err.is_some() {
+            return None
+        }
+        content = b.to_list()
+    } else if kind == 81 or kind == 113 {
+        content = match q_decode(text) {
+            Some(d) -> d
+            None -> return None
+        }
+    } else {
+        return None
+    }
+    if charset_is(charset, "utf-8") {
+        return Some(content)
+    }
+    var o: [i64] = []
+    if charset_is(charset, "iso-8859-1") {
+        for c in content {
+            push_all(o, encode(c))
+        }
+        return Some(o)
+    }
+    if charset_is(charset, "us-ascii") {
+        for c in content {
+            push_all(o, if c >= 128 { [239, 191, 189] } else { [c] })
+        }
+        return Some(o)
+    }
+    fail(failed("charset not supported: " + goquote.quote(gostrings.to_lower(bytes_of(charset)))))
+}
+
+// ---- names
+
+fn consume_phrase(inout p: GoMailParser) -> [i64] ! GoMailError {
+    var words: [[i64]] = []
+    var prev_encoded = false
+    var err: Option[GoMailError] = None
+    while true {
+        if words.len() > 0 and not skip_cfws(p) {
+            fail(misformatted())
+        }
+        skip_space(p)
+        if empty(p) {
+            break
+        }
+        var word: [i64] = []
+        var encoded = false
+        if peek(p) == 34 {
+            match consume_quoted_string(p) {
+                Ok(w) -> word = w
+                Err(e) -> err = Some(e)
+            }
+        } else {
+            match consume_atom(p, true, true) {
+                Ok(w) -> {
+                    match decode_word(w) {
+                        Ok(d) -> match d {
+                            Some(t) -> {
+                                word = t
+                                encoded = true
+                            }
+                            None -> word = w
+                        }
+                        Err(e) -> err = Some(e)
+                    }
+                }
+                Err(e) -> err = Some(e)
+            }
+        }
+        if err.is_some() {
+            break
+        }
+        if prev_encoded and encoded {
+            words[words.len() - 1] = words[words.len() - 1] + word
+        } else {
+            words.push(word)
+        }
+        prev_encoded = encoded
+    }
+    match err {
+        Some(e) -> if words.len() == 0 {
+            fail(failed("mail: missing word in phrase: " + error_text(e)))
+        }
+        None -> {}
+    }
+    return join_words(words)
+}
+
+fn join_words(words: [[i64]]) -> [i64] {
+    var o: [i64] = []
+    for k in 0..words.len() {
+        if k > 0 {
+            o.push(32)
+        }
+        push_all(o, words[k])
+    }
+    return o
+}
+
+fn consume_display_name_comment(inout p: GoMailParser) -> [i64] ! GoMailError {
+    if not consume(p, 40) {
+        fail(failed("mail: comment does not start with ("))
+    }
+    let (comment, ok) = consume_comment(p)
+    if not ok {
+        fail(misformatted())
+    }
+    var words: [[i64]] = []
+    var cur: [i64] = []
+    for c in comment + [32] {
+        if c == 32 or c == 9 {
+            if cur.len() > 0 {
+                let d = try decode_word(cur)
+                words.push(d ?? cur)
+            }
+            cur = []
+        } else {
+            cur.push(c)
+        }
+    }
+    return join_words(words)
+}
+
+// ---- addresses
+
+fn all_atext(name: [i64]) -> bool {
+    var i = 0
+    while i < name.len() {
+        let (r, w) = decode(name, i)
+        if not is_atext(r, true) {
+            return false
+        }
+        i = i + w
+    }
+    return true
+}
+
+fn parse_address(inout p: GoMailParser, group: bool) -> [GoMailAddress] ! GoMailError {
+    skip_space(p)
+    if empty(p) {
+        fail(failed("mail: no address"))
+    }
+    match consume_addr_spec(p) {
+        Ok(spec) -> {
+            skip_space(p)
+            var comment: [i64] = []
+            if not empty(p) and peek(p) == 40 {
+                comment = try consume_display_name_comment(p)
+            }
+            return [GoMailAddress{ name: bytes_of(comment), address: bytes_of(spec) }]
+        }
+        Err(_e) -> {}
+    }
+    var name: [i64] = []
+    if peek(p) != 60 {
+        name = try consume_phrase(p)
+    }
+    skip_space(p)
+    if group and consume(p, 58) {
+        return try consume_group_list(p)
+    }
+    if not consume(p, 60) {
+        if all_atext(name) {
+            fail(failed("mail: missing '@' or angle-addr"))
+        }
+        fail(failed("mail: no angle-addr"))
+    }
+    let spec = try consume_addr_spec(p)
+    if not consume(p, 62) {
+        fail(failed("mail: unclosed angle-addr"))
+    }
+    return [GoMailAddress{ name: bytes_of(name), address: bytes_of(spec) }]
+}
+
+fn consume_group_list(inout p: GoMailParser) -> [GoMailAddress] ! GoMailError {
+    var members: [GoMailAddress] = []
+    skip_space(p)
+    if consume(p, 59) {
+        if not skip_cfws(p) {
+            fail(misformatted())
+        }
+        return members
+    }
+    while true {
+        skip_space(p)
+        for a in try parse_address(p, false) {
+            members.push(a)
+        }
+        if not skip_cfws(p) {
+            fail(misformatted())
+        }
+        if consume(p, 59) {
+            if not skip_cfws(p) {
+                fail(misformatted())
+            }
+            break
+        }
+        if not consume(p, 44) {
+            fail(failed("mail: expected comma"))
+        }
+    }
+    return members
+}
+
+/// `mail.ParseAddress`: exactly one address.
+pub fn parse_address_bytes(address: bytes) -> GoMailAddress ! GoMailError {
+    var p = GoMailParser{ s: address.to_list(), at: 0 }
+    let addrs = try parse_address(p, true)
+    if not skip_cfws(p) {
+        fail(misformatted())
+    }
+    if not empty(p) {
+        fail(failed("mail: expected single address, got " + quoted(rest(p))))
+    }
+    if addrs.len() == 0 {
+        fail(failed("mail: empty group"))
+    }
+    if addrs.len() > 1 {
+        fail(failed("mail: group with multiple addresses"))
+    }
+    return addrs[0]
+}
+
+/// `mail.ParseAddress` of text.
+pub fn parse_address_text(address: str) -> GoMailAddress ! GoMailError {
+    return try parse_address_bytes(address.to_bytes())
+}
+
+/// `mail.ParseAddressList`: a comma-separated list, groups expanded.
+pub fn parse_address_list(list: bytes) -> [GoMailAddress] ! GoMailError {
+    var p = GoMailParser{ s: list.to_list(), at: 0 }
+    var found: [GoMailAddress] = []
+    while true {
+        skip_space(p)
+        if consume(p, 44) {
+            continue
+        }
+        for a in try parse_address(p, true) {
+            found.push(a)
+        }
+        if not skip_cfws(p) {
+            fail(misformatted())
+        }
+        if empty(p) {
+            break
+        }
+        if peek(p) != 44 {
+            fail(failed("mail: expected comma"))
+        }
+        while consume(p, 44) {
+            skip_space(p)
+        }
+        if empty(p) {
+            break
+        }
+    }
+    return found
+}
+
+// ---- printing
+
+fn quote_string(s: [i64]) -> [i64] {
+    var o: [i64] = [34]
+    var i = 0
+    while i < s.len() {
+        let (r, w) = decode(s, i)
+        if is_qtext(r) or is_wsp(r) {
+            push_all(o, encode(r))
+        } else if is_vchar(r) {
+            o.push(92)
+            push_all(o, encode(r))
+        }
+        i = i + w
+    }
+    o.push(34)
+    return o
+}
+
+fn base64_text(b: [i64]) -> [i64] {
+    return goencoding.base64_encode(goencoding.std_encoding(), bytes_of(b)).to_bytes().to_list()
+}
+
+fn upper_hex(c: i64) -> [i64] {
+    let digits = "0123456789ABCDEF".to_bytes().to_list()
+    return [61, digits[c.shr(4)], digits[c.bit_and(15)]]
+}
+
+fn q_piece(b: [i64]) -> [i64] {
+    var o: [i64] = []
+    for c in b {
+        if c == 32 {
+            o.push(95)
+        } else if c >= 33 and c <= 126 and c != 61 and c != 63 and c != 95 {
+            o.push(c)
+        } else {
+            push_all(o, upper_hex(c))
+        }
+    }
+    return o
+}
+
+fn open_word(kind: i64) -> [i64] {
+    return "=?utf-8?".to_bytes().to_list() + [kind, 63]
+}
+
+/// `mime.BEncoding.Encode("utf-8", s)` of a name that needs encoding.
+fn b_encode(s: [i64]) -> [i64] {
+    var o = open_word(98)
+    if (s.len() + 2) / 3 * 4 <= 63 {
+        return o + base64_text(s) + [63, 61]
+    }
+    var current = 0
+    var last = 0
+    var i = 0
+    while i < s.len() {
+        let w = decode(s, i).1
+        if current + w <= 45 {
+            current = current + w
+        } else {
+            push_all(o, base64_text(s.slice(last, i)) + [63, 61, 32] + open_word(98))
+            last = i
+            current = w
+        }
+        i = i + w
+    }
+    return o + base64_text(s.slice(last, s.len())) + [63, 61]
+}
+
+/// `mime.QEncoding.Encode("utf-8", s)` of a name that needs encoding.
+fn q_encode(s: [i64]) -> [i64] {
+    var o = open_word(113)
+    var current = 0
+    var i = 0
+    while i < s.len() {
+        let b = s[i]
+        let plain = b >= 32 and b <= 126 and b != 61 and b != 63 and b != 95
+        let w = if plain { 1 } else { decode(s, i).1 }
+        let enc = if plain { 1 } else { 3 * w }
+        if current + enc > 63 {
+            push_all(o, [63, 61, 32] + open_word(113))
+            current = 0
+        }
+        push_all(o, q_piece(s.slice(i, i + w)))
+        current = current + enc
+        i = i + w
+    }
+    return o + [63, 61]
+}
+
+fn local_needs_quotes(local: [i64]) -> bool {
+    var i = 0
+    while i < local.len() {
+        let (r, w) = decode(local, i)
+        if not is_atext(r, false) {
+            if not (r == 46 and i > 0 and local[i - 1] != 46 and i < local.len() - 1) {
+                return true
+            }
+        }
+        i = i + w
+    }
+    return false
+}
+
+/// `Address.String`: `<local@domain>`, after the name when there is one.
+pub fn address_string(a: GoMailAddress) -> bytes {
+    let addr = a.address.to_list()
+    var at = 0 - 1
+    for i in 0..addr.len() {
+        if addr[i] == 64 {
+            at = i
+        }
+    }
+    let local0 = if at < 0 { addr } else { addr.slice(0, at) }
+    let domain = if at < 0 { [] } else { addr.slice(at + 1, addr.len()) }
+    let local = if local_needs_quotes(local0) { quote_string(local0) } else { local0 }
+    let s = [60] + local + [64] + domain + [62]
+    let name = a.name.to_list()
+    if name.len() == 0 {
+        return bytes_of(s)
+    }
+    var printable = true
+    var i = 0
+    while i < name.len() {
+        let (r, w) = decode(name, i)
+        if (not is_vchar(r) and not is_wsp(r)) or r >= 128 {
+            printable = false
+        }
+        i = i + w
+    }
+    if printable {
+        return bytes_of(quote_string(name) + [32] + s)
+    }
+    let specials = "\"#$%&'(),.:;<>@[]^`\{|\}~".to_bytes().to_list()
+    let encoded = if name.any(|c| specials.contains(c)) { b_encode(name) } else { q_encode(name) }
+    return bytes_of(encoded + [32] + s)
+}
+
+// ---- dates
+
+fn date_layouts() -> [str] {
+    var out: [str] = []
+    for dow in ["", "Mon, "] {
+        for day in ["2", "02"] {
+            for year in ["2006", "06"] {
+                for second in [":05", ""] {
+                    for zone in ["-0700", "MST", "UT"] {
+                        out.push(dow + day + " Jan " + year + " 15:04" + second + " " + zone)
+                    }
+                }
+            }
+        }
+    }
+    return out
+}
+
+fn without_crlf(s: [i64]) -> [i64] {
+    var o: [i64] = []
+    var i = 0
+    while i < s.len() {
+        if s[i] == 13 and i + 1 < s.len() and s[i + 1] == 10 {
+            i = i + 2
+        } else {
+            o.push(s[i])
+            i = i + 1
+        }
+    }
+    return o
+}
+
+fn valid_utf8(s: [i64]) -> bool {
+    var i = 0
+    while i < s.len() {
+        let (r, w) = decode(s, i)
+        if r == 65533 and w == 1 {
+            return false
+        }
+        i = i + w
+    }
+    return true
+}
+
+/// Where the date ends: after a numeric zone's four digits, after the
+/// first `T` that is not the first byte, or nowhere (-1).
+fn date_end(s: [i64]) -> i64 {
+    for i in 0..s.len() {
+        if s[i] == 43 or s[i] == 45 {
+            if s.len() >= i + 5 {
+                return i + 5
+            }
+            break
+        }
+    }
+    var t = index_of(s, 84)
+    if t == 0 {
+        let u = index_of(s.slice(1, s.len()), 84)
+        t = if u < 0 { u } else { u + 1 }
+    }
+    return if t >= 0 and s.len() >= t + 5 { t + 1 } else { 0 - 1 }
+}
+
+/// `mail.ParseDate`: an RFC 5322 date, read as Go reads it on a machine
+/// whose local zone is UTC.
+pub fn parse_date(date: bytes) -> GoTime ! GoMailError {
+    let whole = without_crlf(date.to_list())
+    if whole.contains(13) {
+        fail(failed("mail: header has a CR without LF"))
+    }
+    var p = GoMailParser{ s: whole, at: 0 }
+    skip_space(p)
+    let r = rest(p)
+    let end = date_end(r)
+    var text = whole
+    if end >= 0 {
+        text = r.slice(0, end)
+        p.at = p.at + end
+    }
+    if not skip_cfws(p) {
+        fail(misformatted())
+    }
+    if valid_utf8(text) {
+        let value = bytes_of(text).to_str()
+        for layout in date_layouts() {
+            match gotimefmt.parse(layout, value) {
+                Ok(t) -> return t
+                Err(_e) -> {}
+            }
+        }
+    }
+    fail(failed("mail: header could not be parsed"))
+}

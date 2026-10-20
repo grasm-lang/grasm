@@ -1,0 +1,60 @@
+[package]
+name = "b61test"
+version = "1.0.0"
+capabilities = ["io"]
+
+[dependencies.perlfilespec]
+path = "../perlfilespec"
+version = "^1.0.0"
+
+[dependencies.perltimelocal]
+path = "../perltimelocal"
+version = "^1.0.0"
+
+[dependencies.perlsprintf]
+path = "../perlsprintf"
+version = "^1.0.0"
+
+[dependencies.shortestfloat]
+path = "../shortestfloat"
+version = "^1.0.0"
+
+[dependencies.bigint]
+path = "../bigint"
+version = "^1.0.0"
+
+[dependencies.rustduration]
+path = "../rustduration"
+version = "^1.0.0"
+
+[dependencies.rustipaddr]
+path = "../rustipaddr"
+version = "^1.0.0"
+
+[dependencies.jqpath]
+path = "../jqpath"
+version = "^1.0.0"
+
+[dependencies.jqformat]
+path = "../jqformat"
+version = "^1.0.0"
+
+[dependencies.perljsonpp]
+path = "../perljsonpp"
+version = "^1.0.0"
+
+[dependencies.lispprint]
+path = "../lispprint"
+version = "^1.0.0"
+
+[dependencies.lispformat]
+path = "../lispformat"
+version = "^1.0.0"
+
+[dependencies.lispnumbers]
+path = "../lispnumbers"
+version = "^1.0.0"
+
+[dependencies.perlansicolor]
+path = "../perlansicolor"
+version = "^1.0.0"

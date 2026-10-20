@@ -1,0 +1,1608 @@
+// Python's `ipaddress`, as CPython 3.13.1 runs it: addresses, networks and
+// interfaces of both versions, their properties, and the module functions
+// `summarize_address_range` and `collapse_addresses`, with the exception
+// classes and messages Python raises.
+//
+// Python services validate configuration, allow-lists and API input with
+// this module, so its answers are what such a program accepted, printed and
+// matched. What a port has to get right:
+//
+//   - Parsing is strict and says why: `1.2.3.04` is "Leading zeros are not
+//     permitted in '04' in '1.2.3.04'", an IPv6 group is at most four hex
+//     digits, `::` may appear once, an embedded IPv4 tail is checked as an
+//     IPv4 address, and `%scope` is kept on an IPv6 address.
+//   - `ip_address`, `ip_network` and `ip_interface` try IPv4 then IPv6 and
+//     fail with "... does not appear to be an IPv4 or IPv6 address", except
+//     that a network with host bits set raises "1.2.3.4/24 has host bits
+//     set" straight through.
+//   - An IPv4 netmask may be a prefix length, a dotted netmask or a dotted
+//     hostmask (`/0.0.0.255`); IPv6 takes only a prefix length.
+//   - `str` compresses IPv6 as RFC 5952 does and prints an IPv4-mapped
+//     address with dots (`::ffff:1.2.3.4`); `exploded` and
+//     `reverse_pointer` re-read `str(self)`, so on an address with a scope
+//     they raise, and a mapped interface's exploded form loses its
+//     `/prefix`.
+//   - The is_private/is_global tables are 3.13's, and an IPv4-mapped
+//     address answers as its IPv4 address. `IPv4Interface.is_unspecified`
+//     is always False (it compares itself with an address that has no
+//     network).
+//   - Equality includes the scope; ordering compares integers, so two
+//     addresses differing only in scope are each greater than the other.
+//   - `subnets` returns the network itself at the longest prefix before
+//     looking at its arguments, `supernet` the same at prefix 0, and
+//     `address_exclude`, `summarize_address_range` and `collapse_addresses`
+//     follow Python's loops, errors included.
+//   - `format` takes `b`, `x`, `X` and `n` with `#` and `_`, and string
+//     specs ending in `s`.
+//
+// Messages quote text as Python 3.13's `repr` does, with its Unicode 15.1
+// idea of what is printable (pycharclass).
+//
+// Limits: values are made from text, integers and packed bytes, not from
+// tuples. String specs for `format` go through formatspec; one it refuses
+// raises ValueError("Invalid format specifier '...' for object of type
+// 'str'"), which is not always Python's wording, and malformed specs are
+// not among the cases checked. `collapse_addresses` given
+// addresses of one version and networks of the other raises a TypeError
+// naming the first of each, where Python names whichever pair its sort
+// compares first; and with scoped addresses that are equal as integers
+// Python's order depends on hashing, where here it is input order.
+
+import bigint
+import formatspec
+import pycharclass
+import pyliteral
+
+/// An address: version 4 or 6, its bytes most significant first (4 or 16
+/// of them), and an IPv6 scope id.
+type PyIpAddress = { version: i64, ip: [i64], scope: Option[str] }
+
+/// A network: its network address (which keeps a scope it was written
+/// with), the netmask's bytes and the prefix length.
+type PyIpNetwork = { network_address: PyIpAddress, netmask: [i64], prefixlen: i64 }
+
+/// An interface: an address and the network it sits in.
+type PyIpInterface = { address: PyIpAddress, network: PyIpNetwork }
+
+/// What `collapse_addresses` takes.
+type PyIpItem = | PyIpAddressItem(a: PyIpAddress) | PyIpNetworkItem(n: PyIpNetwork)
+
+/// Python's exception, by class.
+type PyIpError =
+    | PyIpAddressValueError(msg: str)
+    | PyIpNetmaskValueError(msg: str)
+    | PyIpValueError(msg: str)
+    | PyIpTypeError(msg: str)
+    | PyIpIndexError(msg: str)
+    | PyIpAssertionError(msg: str)
+
+pub fn error_class(e: PyIpError) -> str {
+    return match e {
+        PyIpAddressValueError(_m) -> "AddressValueError"
+        PyIpNetmaskValueError(_m) -> "NetmaskValueError"
+        PyIpValueError(_m) -> "ValueError"
+        PyIpTypeError(_m) -> "TypeError"
+        PyIpIndexError(_m) -> "IndexError"
+        PyIpAssertionError(_m) -> "AssertionError"
+    }
+}
+
+pub fn error_text(e: PyIpError) -> str {
+    return match e {
+        PyIpAddressValueError(m) -> m
+        PyIpNetmaskValueError(m) -> m
+        PyIpValueError(m) -> m
+        PyIpTypeError(m) -> m
+        PyIpIndexError(m) -> m
+        PyIpAssertionError(m) -> m
+    }
+}
+
+fn hex_digits(v: i64, width: i64) -> str {
+    return v.to_base(16).pad_start(width, "0")
+}
+
+/// Python 3.13's `repr` of a str: printable characters as they are, by
+/// CPython 3.13's own table (pycharclass), the rest escaped.
+fn rp(s: str) -> str {
+    let cs = s.codes()
+    let quote = if cs.contains(39) and not cs.contains(34) { 34 } else { 39 }
+    var out: [str] = [quote.to_char()]
+    for c in cs {
+        if c == quote or c == 92 {
+            out.push("\\" + c.to_char())
+        } else if c == 9 {
+            out.push("\\t")
+        } else if c == 10 {
+            out.push("\\n")
+        } else if c == 13 {
+            out.push("\\r")
+        } else if c < 32 or c == 127 {
+            out.push("\\x" + hex_digits(c, 2))
+        } else if c < 127 or pycharclass.is_printable(c) {
+            out.push(c.to_char())
+        } else if c < 256 {
+            out.push("\\x" + hex_digits(c, 2))
+        } else if c < 65536 {
+            out.push("\\u" + hex_digits(c, 4))
+        } else {
+            out.push("\\U" + hex_digits(c, 8))
+        }
+    }
+    out.push(quote.to_char())
+    return out.join("")
+}
+
+fn ave(m: str) -> PyIpError {
+    return PyIpAddressValueError(m)
+}
+
+// ---- bytes as unsigned integers
+
+fn width(version: i64) -> i64 {
+    return if version == 4 { 4 } else { 16 }
+}
+
+pub fn max_prefixlen(version: i64) -> i64 {
+    return width(version) * 8
+}
+
+fn filled(n: i64, v: i64) -> [i64] {
+    var out: [i64] = []
+    for _i in 0..n {
+        out.push(v)
+    }
+    return out
+}
+
+fn mask_of(version: i64, prefixlen: i64) -> [i64] {
+    var out: [i64] = []
+    for i in 0..width(version) {
+        let bits = prefixlen - 8 * i
+        out.push(if bits >= 8 { 255 } else if bits <= 0 { 0 } else { 255.shl(8 - bits).bit_and(255) })
+    }
+    return out
+}
+
+fn bytes_and(a: [i64], b: [i64]) -> [i64] {
+    var out: [i64] = []
+    for i in 0..a.len() {
+        out.push(a[i].bit_and(b[i]))
+    }
+    return out
+}
+
+fn bytes_or(a: [i64], b: [i64]) -> [i64] {
+    var out: [i64] = []
+    for i in 0..a.len() {
+        out.push(a[i].bit_or(b[i]))
+    }
+    return out
+}
+
+fn bytes_not(a: [i64]) -> [i64] {
+    return a.map(|x| 255 - x)
+}
+
+fn bytes_cmp(a: [i64], b: [i64]) -> i64 {
+    for i in 0..a.len() {
+        if a[i] != b[i] {
+            return if a[i] < b[i] { 0 - 1 } else { 1 }
+        }
+    }
+    return 0
+}
+
+/// a + b, and whether it carried out of the top byte.
+fn bytes_add(a: [i64], b: [i64]) -> ([i64], bool) {
+    var out = filled(a.len(), 0)
+    var carry = 0
+    var i = a.len() - 1
+    while i >= 0 {
+        let s = a[i] + b[i] + carry
+        out[i] = s.bit_and(255)
+        carry = s.ushr(8)
+        i = i - 1
+    }
+    return (out, carry > 0)
+}
+
+/// a - b, for a >= b.
+fn bytes_sub(a: [i64], b: [i64]) -> [i64] {
+    var out = filled(a.len(), 0)
+    var borrow = 0
+    var i = a.len() - 1
+    while i >= 0 {
+        var s = a[i] - b[i] - borrow
+        borrow = 0
+        if s < 0 {
+            s = s + 256
+            borrow = 1
+        }
+        out[i] = s
+        i = i - 1
+    }
+    return out
+}
+
+/// 1 << k in n bytes, for k < 8n.
+fn one_shl(n: i64, k: i64) -> [i64] {
+    var out = filled(n, 0)
+    out[n - 1 - k / 8] = 1.shl(k % 8)
+    return out
+}
+
+fn trailing_zeros(a: [i64]) -> i64 {
+    var count = 0
+    var i = a.len() - 1
+    while i >= 0 {
+        if a[i] != 0 {
+            var v = a[i]
+            while v.bit_and(1) == 0 {
+                v = v.ushr(1)
+                count = count + 1
+            }
+            return count
+        }
+        count = count + 8
+        i = i - 1
+    }
+    return count
+}
+
+fn bit_length(a: [i64]) -> i64 {
+    for i in 0..a.len() {
+        if a[i] != 0 {
+            var v = a[i]
+            var bits = 0
+            while v > 0 {
+                v = v.ushr(1)
+                bits = bits + 1
+            }
+            return (a.len() - 1 - i) * 8 + bits
+        }
+    }
+    return 0
+}
+
+fn is_zero(a: [i64]) -> bool {
+    return a.all(|x| x == 0)
+}
+
+fn to_big(ip: [i64]) -> BigInt {
+    return bigint.from_bytes(bytes_of(ip))
+}
+
+fn plain(version: i64, ip: [i64]) -> PyIpAddress {
+    return PyIpAddress{ version: version, ip: ip, scope: None }
+}
+
+/// `IPv4Address(n)` / `IPv6Address(n)`.
+pub fn from_int(version: i64, n: BigInt) -> PyIpAddress ! PyIpError {
+    let bits = max_prefixlen(version)
+    if bigint.sign(n) < 0 {
+        fail(ave(bigint.to_str(n) + " (< 0) is not permitted as an IPv{version} address"))
+    }
+    if bigint.bit_length(n) > bits {
+        fail(ave(bigint.to_str(n) + " (>= 2**{bits}) is not permitted as an IPv{version} address"))
+    }
+    let data = bigint.to_bytes(n, width(version)) ?? bytes_of([])
+    return plain(version, data.to_list())
+}
+
+/// `IPv4Address(b)` / `IPv6Address(b)` of packed bytes.
+pub fn from_packed(version: i64, data: bytes) -> PyIpAddress ! PyIpError {
+    let w = width(version)
+    if data.len() != w {
+        fail(ave(pyliteral.repr_bytes(data) + " (len {data.len()} != {w}) is not permitted as an IPv{version} address"))
+    }
+    return plain(version, data.to_list())
+}
+
+pub fn to_int(a: PyIpAddress) -> BigInt {
+    return to_big(a.ip)
+}
+
+pub fn packed(a: PyIpAddress) -> bytes {
+    return bytes_of(a.ip)
+}
+
+// ---- parsing
+
+/// Python's `str.split(sep)`, which gives `['']` for an empty string.
+fn psplit(s: str, sep: str) -> [str] {
+    if s.len() == 0 {
+        return [""]
+    }
+    return s.split(sep)
+}
+
+fn ascii_digits(s: str) -> bool {
+    return s.len() > 0 and s.codes().all(|c| c >= 48 and c <= 57)
+}
+
+fn parse_octet(s: str) -> i64 ! PyIpError {
+    if s.len() == 0 {
+        fail(PyIpValueError("Empty octet not permitted"))
+    }
+    if not ascii_digits(s) {
+        fail(PyIpValueError("Only decimal digits permitted in " + rp(s)))
+    }
+    if s.len() > 3 {
+        fail(PyIpValueError("At most 3 characters permitted in " + rp(s)))
+    }
+    if s != "0" and s.code_at(0) == 48 {
+        fail(PyIpValueError("Leading zeros are not permitted in " + rp(s)))
+    }
+    let v = s.parse_int() ?? 0
+    if v > 255 {
+        fail(PyIpValueError("Octet {v} (> 255) not permitted"))
+    }
+    return v
+}
+
+fn v4_from_string(s: str) -> [i64] ! PyIpError {
+    if s.len() == 0 {
+        fail(ave("Address cannot be empty"))
+    }
+    let octets = psplit(s, ".")
+    if octets.len() != 4 {
+        fail(ave("Expected 4 octets in " + rp(s)))
+    }
+    var out: [i64] = []
+    for o in octets {
+        match parse_octet(o) {
+            Ok(v) -> out.push(v)
+            Err(e) -> fail(ave(error_text(e) + " in " + rp(s)))
+        }
+    }
+    return out
+}
+
+fn is_hex(c: i64) -> bool {
+    return (c >= 48 and c <= 57) or (c >= 97 and c <= 102) or (c >= 65 and c <= 70)
+}
+
+fn parse_hextet(h: str) -> i64 ! PyIpError {
+    if not h.codes().all(|c| is_hex(c)) {
+        fail(PyIpValueError("Only hex digits permitted in " + rp(h)))
+    }
+    if h.len() > 4 {
+        fail(PyIpValueError("At most 4 characters permitted in " + rp(h)))
+    }
+    if h.len() == 0 {
+        fail(PyIpValueError("invalid literal for int() with base 16: ''"))
+    }
+    return h.parse_int_base(16) ?? 0
+}
+
+/// The parts of an IPv6 address with an IPv4 tail replaced by two groups.
+fn v6_parts(s: str) -> [str] ! PyIpError {
+    var parts = psplit(s, ":")
+    if parts.len() < 3 {
+        fail(ave("At least 3 parts expected in " + rp(s)))
+    }
+    let tail = parts[parts.len() - 1]
+    if tail.contains(".") {
+        parts = parts.slice(0, parts.len() - 1)
+        match ipv4_address(tail) {
+            Ok(a) -> {
+                parts.push((a.ip[0] * 256 + a.ip[1]).to_base(16))
+                parts.push((a.ip[2] * 256 + a.ip[3]).to_base(16))
+            }
+            Err(e) -> fail(ave(error_text(e) + " in " + rp(s)))
+        }
+    }
+    if parts.len() > 9 {
+        fail(ave("At most 8 colons permitted in " + rp(s)))
+    }
+    return parts
+}
+
+/// How many groups come before the `::`, how many after, and how many it
+/// stands for.
+fn v6_layout(s: str, parts: [str]) -> (i64, i64, i64) ! PyIpError {
+    let n = parts.len()
+    var skip = 0 - 1
+    for i in 1..(n - 1) {
+        if parts[i].len() == 0 {
+            if skip >= 0 {
+                fail(ave("At most one '::' permitted in " + rp(s)))
+            }
+            skip = i
+        }
+    }
+    if skip < 0 {
+        if n != 8 {
+            fail(ave("Exactly 8 parts expected without '::' in " + rp(s)))
+        }
+        if parts[0].len() == 0 {
+            fail(ave("Leading ':' only permitted as part of '::' in " + rp(s)))
+        }
+        if parts[n - 1].len() == 0 {
+            fail(ave("Trailing ':' only permitted as part of '::' in " + rp(s)))
+        }
+        return (n, 0, 0)
+    }
+    var hi = skip
+    var lo = n - skip - 1
+    if parts[0].len() == 0 {
+        hi = hi - 1
+        if hi != 0 {
+            fail(ave("Leading ':' only permitted as part of '::' in " + rp(s)))
+        }
+    }
+    if parts[n - 1].len() == 0 {
+        lo = lo - 1
+        if lo != 0 {
+            fail(ave("Trailing ':' only permitted as part of '::' in " + rp(s)))
+        }
+    }
+    let skipped = 8 - (hi + lo)
+    if skipped < 1 {
+        fail(ave("Expected at most 7 other parts with '::' in " + rp(s)))
+    }
+    return (hi, lo, skipped)
+}
+
+fn push_hextet(s: str, h: str, inout out: [i64]) -> bool ! PyIpError {
+    match parse_hextet(h) {
+        Ok(v) -> {
+            out.push(v.ushr(8))
+            out.push(v.bit_and(255))
+        }
+        Err(e) -> fail(ave(error_text(e) + " in " + rp(s)))
+    }
+    return true
+}
+
+fn v6_from_string(s: str) -> [i64] ! PyIpError {
+    if s.len() == 0 {
+        fail(ave("Address cannot be empty"))
+    }
+    let parts = try v6_parts(s)
+    let layout = try v6_layout(s, parts)
+    var out: [i64] = []
+    for i in 0..layout.0 {
+        try push_hextet(s, parts[i], out)
+    }
+    for _k in 0..(layout.2 * 2) {
+        out.push(0)
+    }
+    for i in (parts.len() - layout.1)..parts.len() {
+        try push_hextet(s, parts[i], out)
+    }
+    return out
+}
+
+fn split_scope(s: str) -> (str, Option[str]) ! PyIpError {
+    match s.index_of("%") {
+        None -> return (s, None)
+        Some(i) -> {
+            let scope = s.substr(i + 1, s.len() - i - 1)
+            if scope.len() == 0 or scope.contains("%") {
+                fail(ave("Invalid IPv6 address: \"" + rp(s) + "\""))
+            }
+            return (s.substr(0, i), Some(scope))
+        }
+    }
+}
+
+/// `IPv4Address(text)`.
+pub fn ipv4_address(text: str) -> PyIpAddress ! PyIpError {
+    if text.contains("/") {
+        fail(ave("Unexpected '/' in " + rp(text)))
+    }
+    return plain(4, try v4_from_string(text))
+}
+
+/// `IPv6Address(text)`.
+pub fn ipv6_address(text: str) -> PyIpAddress ! PyIpError {
+    if text.contains("/") {
+        fail(ave("Unexpected '/' in " + rp(text)))
+    }
+    let parts = try split_scope(text)
+    let ip = try v6_from_string(parts.0)
+    return PyIpAddress{ version: 6, ip: ip, scope: parts.1 }
+}
+
+fn make_address(version: i64, text: str) -> PyIpAddress ! PyIpError {
+    if version == 4 {
+        return try ipv4_address(text)
+    }
+    return try ipv6_address(text)
+}
+
+/// Whether `ip_address` and friends move on to the next version.
+fn caught(e: PyIpError) -> bool {
+    return match e {
+        PyIpAddressValueError(_m) -> true
+        PyIpNetmaskValueError(_m) -> true
+        _ -> false
+    }
+}
+
+/// `ip_address(text)`.
+pub fn ip_address(text: str) -> PyIpAddress ! PyIpError {
+    for v in [4, 6] {
+        match make_address(v, text) {
+            Ok(a) -> return a
+            Err(e) -> if not caught(e) {
+                fail(e)
+            }
+        }
+    }
+    fail(PyIpValueError(rp(text) + " does not appear to be an IPv4 or IPv6 address"))
+}
+
+// ---- addresses as text
+
+fn v4_text(ip: [i64]) -> str {
+    return ip.map(|x| x.to_str()).join(".")
+}
+
+fn compress(h: [str]) -> [str] {
+    var best_start = 0 - 1
+    var best_len = 0
+    var start = 0 - 1
+    var run = 0
+    for i in 0..h.len() {
+        if h[i] == "0" {
+            run = run + 1
+            if start == 0 - 1 {
+                start = i
+            }
+            if run > best_len {
+                best_len = run
+                best_start = start
+            }
+        } else {
+            run = 0
+            start = 0 - 1
+        }
+    }
+    if best_len <= 1 {
+        return h
+    }
+    let end = best_start + best_len
+    var out: [str] = if best_start == 0 { [""] } else { [] }
+    for i in 0..best_start {
+        out.push(h[i])
+    }
+    out.push("")
+    for i in end..h.len() {
+        out.push(h[i])
+    }
+    if end == h.len() {
+        out.push("")
+    }
+    return out
+}
+
+fn group(ip: [i64], k: i64) -> i64 {
+    return ip[2 * k] * 256 + ip[2 * k + 1]
+}
+
+/// `_string_from_ip_int`: compressed hex groups, never dotted.
+fn v6_text(ip: [i64]) -> str {
+    var h: [str] = []
+    for k in 0..8 {
+        h.push(group(ip, k).to_base(16))
+    }
+    return compress(h).join(":")
+}
+
+fn hex_pad(v: i64, n: i64) -> str {
+    return v.to_base(16).pad_start(n, "0")
+}
+
+fn exploded_hex(ip: [i64]) -> str {
+    var h: [str] = []
+    for k in 0..8 {
+        h.push(hex_pad(group(ip, k), 4))
+    }
+    return h.join(":")
+}
+
+/// `ipv4_mapped`: the IPv4 address in `::ffff:a.b.c.d`, or None.
+pub fn ipv4_mapped(a: PyIpAddress) -> Option[PyIpAddress] {
+    if a.version != 6 or not is_zero(a.ip.slice(0, 10)) or a.ip[10] != 255 or a.ip[11] != 255 {
+        return None
+    }
+    return Some(plain(4, a.ip.slice(12, 16)))
+}
+
+/// `teredo`: the server and client of a 2001::/32 address.
+pub fn teredo(a: PyIpAddress) -> Option[(PyIpAddress, PyIpAddress)] {
+    if a.version != 6 or a.ip.slice(0, 4) != [32, 1, 0, 0] {
+        return None
+    }
+    return Some((plain(4, a.ip.slice(4, 8)), plain(4, bytes_not(a.ip.slice(12, 16)))))
+}
+
+/// `sixtofour`: the IPv4 address in a 2002::/16 address.
+pub fn sixtofour(a: PyIpAddress) -> Option[PyIpAddress] {
+    if a.version != 6 or a.ip[0] != 32 or a.ip[1] != 2 {
+        return None
+    }
+    return Some(plain(4, a.ip.slice(2, 6)))
+}
+
+/// `str(address)`.
+pub fn address_str(a: PyIpAddress) -> str {
+    if a.version == 4 {
+        return v4_text(a.ip)
+    }
+    let base = match ipv4_mapped(a) {
+        None -> v6_text(a.ip)
+        Some(m) -> v6_text([0, 0, 0, 0] + a.ip.slice(0, 12)) + ":" + v4_text(m.ip)
+    }
+    return match a.scope {
+        Some(s) -> base + "%" + s
+        None -> base
+    }
+}
+
+fn class_name(version: i64, kind: str) -> str {
+    return "IPv{version}" + kind
+}
+
+pub fn address_repr(a: PyIpAddress) -> str {
+    return class_name(a.version, "Address") + "(" + rp(address_str(a)) + ")"
+}
+
+/// `_BaseV6._explode_shorthand_ip_string` on a text: read it back, then
+/// print every group in full.
+fn explode_text(s: str) -> str ! PyIpError {
+    return exploded_hex(try v6_from_string(s))
+}
+
+/// `exploded`.
+pub fn address_exploded(a: PyIpAddress) -> str ! PyIpError {
+    if a.version == 4 {
+        return address_str(a)
+    }
+    let raw = try explode_text(address_str(a))
+    return match ipv4_mapped(a) {
+        None -> raw
+        Some(m) -> raw.substr(0, 30) + v4_text(m.ip)
+    }
+}
+
+fn reverse_dots(s: str) -> str {
+    return s.chars().rev().filter(|c| c != ":").join(".")
+}
+
+fn v4_reverse(text: str) -> str {
+    return psplit(text, ".").rev().join(".") + ".in-addr.arpa"
+}
+
+fn hex8(ip: [i64]) -> str {
+    return ip.map(|x| hex_pad(x, 2)).join("")
+}
+
+/// `reverse_pointer`.
+pub fn address_reverse_pointer(a: PyIpAddress) -> str ! PyIpError {
+    if a.version == 4 {
+        return v4_reverse(address_str(a))
+    }
+    return match ipv4_mapped(a) {
+        None -> reverse_dots(try address_exploded(a)) + ".ip6.arpa"
+        Some(m) -> reverse_dots((try explode_text(address_str(a))).substr(0, 30) + hex8(m.ip)) + ".ip6.arpa"
+    }
+}
+
+// ---- the special ranges
+
+fn net4(a: i64, b: i64, c: i64, d: i64, p: i64) -> ([i64], i64) {
+    return ([a, b, c, d], p)
+}
+
+fn net6(h: str, p: i64) -> ([i64], i64) {
+    let full = h + "0".repeat(32 - h.len())
+    var out: [i64] = []
+    for i in 0..16 {
+        out.push(full.substr(2 * i, 2).parse_int_base(16) ?? 0)
+    }
+    return (out, p)
+}
+
+fn within(ip: [i64], net: ([i64], i64)) -> bool {
+    return bytes_and(ip, mask_of(if ip.len() == 4 { 4 } else { 6 }, net.1)) == net.0
+}
+
+fn v4_private() -> [([i64], i64)] {
+    return [net4(0, 0, 0, 0, 8), net4(10, 0, 0, 0, 8), net4(127, 0, 0, 0, 8), net4(169, 254, 0, 0, 16), net4(172, 16, 0, 0, 12), net4(192, 0, 0, 0, 24),
+        net4(192, 0, 0, 170, 31), net4(192, 0, 2, 0, 24), net4(192, 168, 0, 0, 16), net4(198, 18, 0, 0, 15), net4(198, 51, 100, 0, 24),
+        net4(203, 0, 113, 0, 24), net4(240, 0, 0, 0, 4), net4(255, 255, 255, 255, 32)]
+}
+
+fn v6_private() -> [([i64], i64)] {
+    return [net6("00000000000000000000000000000001", 128), net6("", 128), net6("00000000000000000000ffff", 96), net6("0064ff9b0001", 48),
+        net6("0100", 64), net6("2001", 23), net6("20010db8", 32), net6("2002", 16), net6("3fff", 20), net6("fc00", 7), net6("fe80", 10)]
+}
+
+fn private_list(version: i64) -> [([i64], i64)] {
+    return if version == 4 { v4_private() } else { v6_private() }
+}
+
+fn exception_list(version: i64) -> [([i64], i64)] {
+    if version == 4 {
+        return [net4(192, 0, 0, 9, 32), net4(192, 0, 0, 10, 32)]
+    }
+    return [net6("20010001000000000000000000000001", 128), net6("20010001000000000000000000000002", 128), net6("20010003", 32),
+        net6("200100040112", 48), net6("20010020", 28), net6("20010030", 28)]
+}
+
+fn v6_reserved() -> [([i64], i64)] {
+    return [net6("", 8), net6("01", 8), net6("02", 7), net6("04", 6), net6("08", 5), net6("1", 4), net6("4", 3), net6("6", 3), net6("8", 3), net6("a", 3),
+        net6("c", 3), net6("e", 4), net6("f0", 5), net6("f8", 6), net6("fe", 9)]
+}
+
+fn multicast_net(version: i64) -> ([i64], i64) {
+    return if version == 4 { net4(224, 0, 0, 0, 4) } else { net6("ff", 8) }
+}
+
+fn link_local_net(version: i64) -> ([i64], i64) {
+    return if version == 4 { net4(169, 254, 0, 0, 16) } else { net6("fe8", 10) }
+}
+
+fn public_v4() -> ([i64], i64) {
+    return net4(100, 64, 0, 0, 10)
+}
+
+fn site_local_v6() -> ([i64], i64) {
+    return net6("fec", 10)
+}
+
+// ---- address properties
+
+pub fn is_multicast(a: PyIpAddress) -> bool {
+    return match ipv4_mapped(a) {
+        Some(m) -> is_multicast(m)
+        None -> within(a.ip, multicast_net(a.version))
+    }
+}
+
+pub fn is_private(a: PyIpAddress) -> bool {
+    return match ipv4_mapped(a) {
+        Some(m) -> is_private(m)
+        None -> private_list(a.version).any(|n| within(a.ip, n)) and not exception_list(a.version).any(|n| within(a.ip, n))
+    }
+}
+
+pub fn is_global(a: PyIpAddress) -> bool {
+    return match ipv4_mapped(a) {
+        Some(m) -> is_global(m)
+        None -> (a.version == 6 or not within(a.ip, public_v4())) and not is_private(a)
+    }
+}
+
+pub fn is_unspecified(a: PyIpAddress) -> bool {
+    return match ipv4_mapped(a) {
+        Some(m) -> is_unspecified(m)
+        None -> is_zero(a.ip)
+    }
+}
+
+pub fn is_reserved(a: PyIpAddress) -> bool {
+    return match ipv4_mapped(a) {
+        Some(m) -> is_reserved(m)
+        None -> if a.version == 4 { within(a.ip, net4(240, 0, 0, 0, 4)) } else { v6_reserved().any(|n| within(a.ip, n)) }
+    }
+}
+
+pub fn is_loopback(a: PyIpAddress) -> bool {
+    return match ipv4_mapped(a) {
+        Some(m) -> is_loopback(m)
+        None -> if a.version == 4 { within(a.ip, net4(127, 0, 0, 0, 8)) } else { a.ip == mask_of(6, 0).slice(0, 15) + [1] }
+    }
+}
+
+pub fn is_link_local(a: PyIpAddress) -> bool {
+    return match ipv4_mapped(a) {
+        Some(m) -> is_link_local(m)
+        None -> within(a.ip, link_local_net(a.version))
+    }
+}
+
+/// IPv6 only; a mapped address is not looked through here.
+pub fn is_site_local(a: PyIpAddress) -> bool {
+    return a.version == 6 and within(a.ip, site_local_v6())
+}
+
+/// `IPv4Address.ipv6_mapped`.
+pub fn ipv6_mapped(a: PyIpAddress) -> PyIpAddress ! PyIpError {
+    return try ipv6_address("::ffff:" + address_str(a))
+}
+
+// ---- address arithmetic and order
+
+/// `address + n`; the scope is lost, as in Python.
+pub fn address_add(a: PyIpAddress, n: BigInt) -> PyIpAddress ! PyIpError {
+    return try from_int(a.version, bigint.add(to_big(a.ip), n))
+}
+
+pub fn address_eq(a: PyIpAddress, b: PyIpAddress) -> bool {
+    return a.version == b.version and a.ip == b.ip and a.scope == b.scope
+}
+
+fn version_error(x: str, y: str) -> PyIpError {
+    return PyIpTypeError(x + " and " + y + " are not of the same version")
+}
+
+pub fn address_lt(a: PyIpAddress, b: PyIpAddress) -> bool ! PyIpError {
+    if a.version != b.version {
+        fail(version_error(address_str(a), address_str(b)))
+    }
+    return bytes_cmp(a.ip, b.ip) < 0
+}
+
+/// `<=`, `>` and `>=` as `functools.total_ordering` derives them from `<`
+/// and `==`.
+pub fn address_le(a: PyIpAddress, b: PyIpAddress) -> bool ! PyIpError {
+    return (try address_lt(a, b)) or address_eq(a, b)
+}
+
+pub fn address_gt(a: PyIpAddress, b: PyIpAddress) -> bool ! PyIpError {
+    return not (try address_lt(a, b)) and not address_eq(a, b)
+}
+
+pub fn address_ge(a: PyIpAddress, b: PyIpAddress) -> bool ! PyIpError {
+    return not (try address_lt(a, b))
+}
+
+/// `format(address, spec)`, also for an interface (whose text and class
+/// name are passed).
+pub fn format_value(version: i64, ip: [i64], text: str, cls: str, spec: str) -> str ! PyIpError {
+    if spec.len() == 0 or spec.ends_with("s") {
+        return match formatspec.format_str(text, spec) {
+            Ok(t) -> t
+            Err(_e) -> fail(PyIpValueError("Invalid format specifier " + rp(spec) + " for object of type 'str'"))
+        }
+    }
+    let unsupported = PyIpTypeError("unsupported format string passed to " + cls + ".__format__")
+    var rest = spec
+    let alternate = rest.starts_with("#")
+    if alternate {
+        rest = rest.substr(1, rest.len() - 1)
+    }
+    let grouping = rest.starts_with("_")
+    if grouping {
+        rest = rest.substr(1, rest.len() - 1)
+    }
+    if rest != "b" and rest != "x" and rest != "X" and rest != "n" {
+        fail(unsupported)
+    }
+    let kind = if rest == "n" { if version == 4 { "b" } else { "x" } } else { rest }
+    var digits = if kind == "b" { ip.map(|x| x.to_base(2).pad_start(8, "0")).join("") } else { hex8(ip) }
+    if kind == "X" {
+        digits = digits.to_upper()
+    }
+    if grouping {
+        var groups: [str] = []
+        for k in 0..(digits.len() / 4) {
+            groups.push(digits.substr(4 * k, 4))
+        }
+        digits = groups.join("_")
+    }
+    return (if alternate { "0" + kind } else { "" }) + digits
+}
+
+pub fn format_address(a: PyIpAddress, spec: str) -> str ! PyIpError {
+    return try format_value(a.version, a.ip, address_str(a), class_name(a.version, "Address"), spec)
+}
+
+// ---- networks
+
+fn prefix_invalid(s: str) -> PyIpError {
+    return PyIpNetmaskValueError(rp(s) + " is not a valid netmask")
+}
+
+fn prefix_from_prefix_string(version: i64, s: str) -> i64 ! PyIpError {
+    if not ascii_digits(s) {
+        fail(prefix_invalid(s))
+    }
+    var digits = s
+    while digits.len() > 1 and digits.starts_with("0") {
+        digits = digits.substr(1, digits.len() - 1)
+    }
+    let v = if digits.len() > 4 { 1000 } else { digits.parse_int() ?? 1000 }
+    if v > max_prefixlen(version) {
+        fail(prefix_invalid(s))
+    }
+    return v
+}
+
+/// The prefix length of a contiguous netmask.
+fn prefix_of_mask(version: i64, ip: [i64]) -> Option[i64] {
+    let p = max_prefixlen(version) - trailing_zeros(ip)
+    return if ip == mask_of(version, p) { Some(p) } else { None }
+}
+
+fn prefix_from_ip_string(s: str) -> i64 ! PyIpError {
+    let ip = match v4_from_string(s) {
+        Ok(ip) -> ip
+        Err(_e) -> fail(prefix_invalid(s))
+    }
+    match prefix_of_mask(4, ip) {
+        Some(p) -> return p
+        None -> {}
+    }
+    return match prefix_of_mask(4, bytes_not(ip)) {
+        Some(p) -> p
+        None -> fail(prefix_invalid(s))
+    }
+}
+
+/// `_make_netmask` of the text after the `/`.
+fn make_netmask(version: i64, s: str) -> i64 ! PyIpError {
+    match prefix_from_prefix_string(version, s) {
+        Ok(p) -> return p
+        Err(e) -> if version == 6 {
+            fail(e)
+        }
+    }
+    return try prefix_from_ip_string(s)
+}
+
+fn split_prefix(text: str) -> [str] ! PyIpError {
+    let parts = psplit(text, "/")
+    if parts.len() > 2 {
+        fail(ave("Only one '/' permitted in " + rp(text)))
+    }
+    return parts
+}
+
+fn prefix_or_max(version: i64, parts: [str]) -> i64 ! PyIpError {
+    if parts.len() < 2 {
+        return max_prefixlen(version)
+    }
+    return try make_netmask(version, parts[1])
+}
+
+fn network_of(version: i64, ip: [i64], prefixlen: i64) -> PyIpNetwork {
+    return PyIpNetwork{ network_address: plain(version, ip), netmask: mask_of(version, prefixlen), prefixlen: prefixlen }
+}
+
+/// `str(network)`.
+pub fn network_str(n: PyIpNetwork) -> str {
+    return address_str(n.network_address) + "/{n.prefixlen}"
+}
+
+pub fn network_repr(n: PyIpNetwork) -> str {
+    return class_name(n.network_address.version, "Network") + "(" + rp(network_str(n)) + ")"
+}
+
+/// The network from an address and a prefix length, masked when `strict`
+/// is off.
+fn masked_network(addr: PyIpAddress, prefixlen: i64, strict: bool) -> PyIpNetwork ! PyIpError {
+    let n = PyIpNetwork{ network_address: addr, netmask: mask_of(addr.version, prefixlen), prefixlen: prefixlen }
+    let m = bytes_and(addr.ip, n.netmask)
+    if m == addr.ip {
+        return n
+    }
+    if strict {
+        fail(PyIpValueError(network_str(n) + " has host bits set"))
+    }
+    return network_of(addr.version, m, prefixlen)
+}
+
+fn make_network(version: i64, text: str, strict: bool) -> PyIpNetwork ! PyIpError {
+    let parts = try split_prefix(text)
+    let addr = try make_address(version, parts[0])
+    let prefixlen = try prefix_or_max(version, parts)
+    return try masked_network(addr, prefixlen, strict)
+}
+
+pub fn ipv4_network(text: str, strict: bool) -> PyIpNetwork ! PyIpError {
+    return try make_network(4, text, strict)
+}
+
+pub fn ipv6_network(text: str, strict: bool) -> PyIpNetwork ! PyIpError {
+    return try make_network(6, text, strict)
+}
+
+/// `ip_network(text, strict)`.
+pub fn ip_network(text: str, strict: bool) -> PyIpNetwork ! PyIpError {
+    for v in [4, 6] {
+        match make_network(v, text, strict) {
+            Ok(n) -> return n
+            Err(e) -> if not caught(e) {
+                fail(e)
+            }
+        }
+    }
+    fail(PyIpValueError(rp(text) + " does not appear to be an IPv4 or IPv6 network"))
+}
+
+pub fn version_of(n: PyIpNetwork) -> i64 {
+    return n.network_address.version
+}
+
+pub fn hostmask(n: PyIpNetwork) -> PyIpAddress {
+    return plain(version_of(n), bytes_not(n.netmask))
+}
+
+pub fn netmask(n: PyIpNetwork) -> PyIpAddress {
+    return plain(version_of(n), n.netmask)
+}
+
+pub fn broadcast_address(n: PyIpNetwork) -> PyIpAddress {
+    return plain(version_of(n), bytes_or(n.network_address.ip, bytes_not(n.netmask)))
+}
+
+pub fn with_netmask(n: PyIpNetwork) -> str {
+    return address_str(n.network_address) + "/" + address_str(netmask(n))
+}
+
+pub fn with_hostmask(n: PyIpNetwork) -> str {
+    return address_str(n.network_address) + "/" + address_str(hostmask(n))
+}
+
+pub fn num_addresses(n: PyIpNetwork) -> BigInt {
+    return bigint.pow(bigint.from_i64(2), max_prefixlen(version_of(n)) - n.prefixlen)
+}
+
+pub fn network_exploded(n: PyIpNetwork) -> str ! PyIpError {
+    if version_of(n) == 4 {
+        return network_str(n)
+    }
+    return (try explode_text(address_str(n.network_address))) + "/{n.prefixlen}"
+}
+
+pub fn network_reverse_pointer(n: PyIpNetwork) -> str ! PyIpError {
+    if version_of(n) == 4 {
+        return v4_reverse(network_str(n))
+    }
+    return reverse_dots(try network_exploded(n)) + ".ip6.arpa"
+}
+
+/// `address in network`: False across versions.
+pub fn contains(n: PyIpNetwork, a: PyIpAddress) -> bool {
+    return a.version == version_of(n) and bytes_and(a.ip, n.netmask) == n.network_address.ip
+}
+
+fn within_net(ip: [i64], n: ([i64], i64)) -> bool {
+    return within(ip, n)
+}
+
+pub fn network_is_multicast(n: PyIpNetwork) -> bool {
+    return is_multicast(n.network_address) and is_multicast(broadcast_address(n))
+}
+
+pub fn network_is_private(n: PyIpNetwork) -> bool {
+    let lo = n.network_address.ip
+    let hi = broadcast_address(n).ip
+    let v = version_of(n)
+    return private_list(v).any(|p| within_net(lo, p) and within_net(hi, p)) and exception_list(v).all(|e| not within_net(lo, e) and not within_net(hi, e))
+}
+
+pub fn network_is_global(n: PyIpNetwork) -> bool {
+    if version_of(n) == 6 {
+        return not network_is_private(n)
+    }
+    let shared = within(n.network_address.ip, public_v4()) and within(broadcast_address(n).ip, public_v4())
+    return not shared and not network_is_private(n)
+}
+
+pub fn network_is_unspecified(n: PyIpNetwork) -> bool {
+    return is_unspecified(n.network_address) and is_unspecified(broadcast_address(n))
+}
+
+pub fn network_is_reserved(n: PyIpNetwork) -> bool {
+    return is_reserved(n.network_address) and is_reserved(broadcast_address(n))
+}
+
+pub fn network_is_loopback(n: PyIpNetwork) -> bool {
+    return is_loopback(n.network_address) and is_loopback(broadcast_address(n))
+}
+
+pub fn network_is_link_local(n: PyIpNetwork) -> bool {
+    return is_link_local(n.network_address) and is_link_local(broadcast_address(n))
+}
+
+pub fn network_is_site_local(n: PyIpNetwork) -> bool {
+    return is_site_local(n.network_address) and is_site_local(broadcast_address(n))
+}
+
+/// The first `limit` of `hosts()`: all addresses but the network and (for
+/// IPv4) broadcast ones, except that a /31 (/127) gives both and a /32
+/// (/128) its one address.
+pub fn hosts(n: PyIpNetwork, limit: i64) -> [PyIpAddress] {
+    let v = version_of(n)
+    let max = max_prefixlen(v)
+    if n.prefixlen == max {
+        return [n.network_address].slice(0, if limit < 1 { 0 } else { 1 })
+    }
+    let last = broadcast_address(n).ip
+    let one = one_shl(width(v), 0)
+    var cur = n.network_address.ip
+    var stop = last
+    if n.prefixlen < max - 1 {
+        cur = bytes_add(cur, one).0
+        if v == 4 {
+            stop = bytes_sub(last, one)
+        }
+    }
+    var out: [PyIpAddress] = []
+    while out.len() < limit and bytes_cmp(cur, stop) <= 0 {
+        out.push(plain(v, cur))
+        let next = bytes_add(cur, one)
+        if next.1 {
+            break
+        }
+        cur = next.0
+    }
+    return out
+}
+
+/// `network[i]`.
+pub fn network_index(n: PyIpNetwork, i: BigInt) -> PyIpAddress ! PyIpError {
+    let lo = to_big(n.network_address.ip)
+    let hi = to_big(broadcast_address(n).ip)
+    let out_of_range = PyIpIndexError("address out of range")
+    if bigint.sign(i) >= 0 {
+        let at = bigint.add(lo, i)
+        if bigint.compare(at, hi) > 0 {
+            fail(out_of_range)
+        }
+        return try from_int(version_of(n), at)
+    }
+    let at = bigint.add(hi, bigint.add(i, bigint.from_i64(1)))
+    if bigint.compare(at, lo) < 0 {
+        fail(out_of_range)
+    }
+    return try from_int(version_of(n), at)
+}
+
+pub fn network_eq(a: PyIpNetwork, b: PyIpNetwork) -> bool {
+    return version_of(a) == version_of(b) and address_eq(a.network_address, b.network_address) and a.netmask == b.netmask
+}
+
+pub fn network_lt(a: PyIpNetwork, b: PyIpNetwork) -> bool ! PyIpError {
+    if version_of(a) != version_of(b) {
+        fail(version_error(network_str(a), network_str(b)))
+    }
+    if not address_eq(a.network_address, b.network_address) {
+        return try address_lt(a.network_address, b.network_address)
+    }
+    return bytes_cmp(a.netmask, b.netmask) < 0
+}
+
+pub fn network_le(a: PyIpNetwork, b: PyIpNetwork) -> bool ! PyIpError {
+    return (try network_lt(a, b)) or network_eq(a, b)
+}
+
+pub fn network_gt(a: PyIpNetwork, b: PyIpNetwork) -> bool ! PyIpError {
+    return not (try network_lt(a, b)) and not network_eq(a, b)
+}
+
+pub fn network_ge(a: PyIpNetwork, b: PyIpNetwork) -> bool ! PyIpError {
+    return not (try network_lt(a, b))
+}
+
+pub fn overlaps(a: PyIpNetwork, b: PyIpNetwork) -> bool {
+    return contains(b, a.network_address) or contains(b, broadcast_address(a)) or contains(a, b.network_address) or contains(a, broadcast_address(b))
+}
+
+/// `a.subnet_of(b)`.
+pub fn subnet_of(a: PyIpNetwork, b: PyIpNetwork) -> bool ! PyIpError {
+    if version_of(a) != version_of(b) {
+        fail(version_error(network_str(a), network_str(b)))
+    }
+    return (try address_le(b.network_address, a.network_address)) and (try address_ge(broadcast_address(b), broadcast_address(a)))
+}
+
+/// `a.supernet_of(b)`.
+pub fn supernet_of(a: PyIpNetwork, b: PyIpNetwork) -> bool ! PyIpError {
+    return try subnet_of(b, a)
+}
+
+/// `a.compare_networks(b)`: -1, 0 or 1.
+pub fn compare_networks(a: PyIpNetwork, b: PyIpNetwork) -> i64 ! PyIpError {
+    if version_of(a) != version_of(b) {
+        fail(PyIpTypeError(network_str(a) + " and " + network_str(b) + " are not of the same type"))
+    }
+    if try address_lt(a.network_address, b.network_address) {
+        return 0 - 1
+    }
+    if try address_gt(a.network_address, b.network_address) {
+        return 1
+    }
+    return bytes_cmp(a.netmask, b.netmask)
+}
+
+/// The first `limit` of `subnets(prefixlen_diff, new_prefix)`.
+pub fn subnets(n: PyIpNetwork, prefixlen_diff: i64, new_prefix: Option[i64], limit: i64) -> [PyIpNetwork] ! PyIpError {
+    let v = version_of(n)
+    let max = max_prefixlen(v)
+    if n.prefixlen == max {
+        return [n].slice(0, if limit < 1 { 0 } else { 1 })
+    }
+    var diff = prefixlen_diff
+    match new_prefix {
+        Some(p) -> {
+            if p < n.prefixlen {
+                fail(PyIpValueError("new prefix must be longer"))
+            }
+            if prefixlen_diff != 1 {
+                fail(PyIpValueError("cannot set prefixlen_diff and new_prefix"))
+            }
+            diff = p - n.prefixlen
+        }
+        None -> {}
+    }
+    if diff < 0 {
+        fail(PyIpValueError("prefix length diff must be > 0"))
+    }
+    let p = n.prefixlen + diff
+    if p > max {
+        fail(PyIpValueError("prefix length diff {p} is invalid for netblock " + network_str(n)))
+    }
+    if p == 0 {
+        return [network_of(v, n.network_address.ip, 0)].slice(0, if limit < 1 { 0 } else { 1 })
+    }
+    let step = one_shl(width(v), max - p)
+    let last = broadcast_address(n).ip
+    var cur = n.network_address.ip
+    var out: [PyIpNetwork] = []
+    while out.len() < limit and bytes_cmp(cur, last) <= 0 {
+        out.push(network_of(v, cur, p))
+        let next = bytes_add(cur, step)
+        if next.1 {
+            break
+        }
+        cur = next.0
+    }
+    return out
+}
+
+/// `supernet(prefixlen_diff, new_prefix)`.
+pub fn supernet(n: PyIpNetwork, prefixlen_diff: i64, new_prefix: Option[i64]) -> PyIpNetwork ! PyIpError {
+    if n.prefixlen == 0 {
+        return n
+    }
+    var diff = prefixlen_diff
+    match new_prefix {
+        Some(p) -> {
+            if p > n.prefixlen {
+                fail(PyIpValueError("new prefix must be shorter"))
+            }
+            if prefixlen_diff != 1 {
+                fail(PyIpValueError("cannot set prefixlen_diff and new_prefix"))
+            }
+            diff = n.prefixlen - p
+        }
+        None -> {}
+    }
+    let p = n.prefixlen - diff
+    if p < 0 {
+        fail(PyIpValueError("current prefixlen is {n.prefixlen}, cannot have a prefixlen_diff of {diff}"))
+    }
+    if diff < 0 {
+        fail(PyIpValueError("negative shift count"))
+    }
+    let v = version_of(n)
+    return network_of(v, bytes_and(n.network_address.ip, mask_of(v, p)), p)
+}
+
+fn halves(n: PyIpNetwork) -> (PyIpNetwork, PyIpNetwork) {
+    let two = subnets(n, 1, None, 2) ?? []
+    return (two[0], two[1])
+}
+
+fn exclusion_error(s1: PyIpNetwork, s2: PyIpNetwork, other: PyIpNetwork) -> PyIpError {
+    return PyIpAssertionError("Error performing exclusion: s1: " + network_str(s1) + " s2: " + network_str(s2) + " other: " + network_str(other))
+}
+
+/// `a.address_exclude(b)`, as a list.
+pub fn address_exclude(a: PyIpNetwork, b: PyIpNetwork) -> [PyIpNetwork] ! PyIpError {
+    if version_of(a) != version_of(b) {
+        fail(version_error(network_str(a), network_str(b)))
+    }
+    if not (try subnet_of(b, a)) {
+        fail(PyIpValueError(network_str(b) + " not contained in " + network_str(a)))
+    }
+    if network_eq(b, a) {
+        return []
+    }
+    let other = try make_network(version_of(b), address_str(b.network_address) + "/{b.prefixlen}", true)
+    var out: [PyIpNetwork] = []
+    var pair = halves(a)
+    while not network_eq(pair.0, other) and not network_eq(pair.1, other) {
+        if try subnet_of(other, pair.0) {
+            out.push(pair.1)
+            pair = halves(pair.0)
+        } else if try subnet_of(other, pair.1) {
+            out.push(pair.0)
+            pair = halves(pair.1)
+        } else {
+            fail(exclusion_error(pair.0, pair.1, other))
+        }
+    }
+    if network_eq(pair.0, other) {
+        out.push(pair.1)
+    } else {
+        out.push(pair.0)
+    }
+    return out
+}
+
+// ---- interfaces
+
+fn make_interface(version: i64, text: str) -> PyIpInterface ! PyIpError {
+    let parts = try split_prefix(text)
+    let addr = try make_address(version, parts[0])
+    let prefixlen = try prefix_or_max(version, parts)
+    let network = try masked_network(addr, prefixlen, false)
+    return PyIpInterface{ address: addr, network: network }
+}
+
+pub fn ipv4_interface(text: str) -> PyIpInterface ! PyIpError {
+    return try make_interface(4, text)
+}
+
+pub fn ipv6_interface(text: str) -> PyIpInterface ! PyIpError {
+    return try make_interface(6, text)
+}
+
+/// `ip_interface(text)`.
+pub fn ip_interface(text: str) -> PyIpInterface ! PyIpError {
+    for v in [4, 6] {
+        match make_interface(v, text) {
+            Ok(i) -> return i
+            Err(e) -> if not caught(e) {
+                fail(e)
+            }
+        }
+    }
+    fail(PyIpValueError(rp(text) + " does not appear to be an IPv4 or IPv6 interface"))
+}
+
+/// `IPv4Interface(n)` / `IPv6Interface(n)`: a /32 or /128.
+pub fn interface_from_int(version: i64, n: BigInt) -> PyIpInterface ! PyIpError {
+    let a = try from_int(version, n)
+    return PyIpInterface{ address: a, network: network_of(version, a.ip, max_prefixlen(version)) }
+}
+
+/// `interface + n`: a /32 or /128, as in Python.
+pub fn interface_add(i: PyIpInterface, n: BigInt) -> PyIpInterface ! PyIpError {
+    return try interface_from_int(i.address.version, bigint.add(to_big(i.address.ip), n))
+}
+
+fn text_from_ip(a: PyIpAddress) -> str {
+    return if a.version == 4 { v4_text(a.ip) } else { v6_text(a.ip) }
+}
+
+/// `str(interface)`.
+pub fn interface_str(i: PyIpInterface) -> str {
+    return address_str(i.address) + "/{i.network.prefixlen}"
+}
+
+pub fn interface_repr(i: PyIpInterface) -> str {
+    return class_name(i.address.version, "Interface") + "(" + rp(interface_str(i)) + ")"
+}
+
+/// `interface.ip`: the address without its scope.
+pub fn interface_ip(i: PyIpInterface) -> PyIpAddress {
+    return plain(i.address.version, i.address.ip)
+}
+
+pub fn interface_with_prefixlen(i: PyIpInterface) -> str {
+    return text_from_ip(i.address) + "/{i.network.prefixlen}"
+}
+
+pub fn interface_with_netmask(i: PyIpInterface) -> str {
+    return text_from_ip(i.address) + "/" + address_str(netmask(i.network))
+}
+
+pub fn interface_with_hostmask(i: PyIpInterface) -> str {
+    return text_from_ip(i.address) + "/" + address_str(hostmask(i.network))
+}
+
+pub fn interface_exploded(i: PyIpInterface) -> str {
+    if i.address.version == 4 {
+        return interface_str(i)
+    }
+    let raw = exploded_hex(i.address.ip) + "/{i.network.prefixlen}"
+    return match ipv4_mapped(i.address) {
+        None -> raw
+        Some(m) -> raw.substr(0, 30) + v4_text(m.ip)
+    }
+}
+
+pub fn interface_reverse_pointer(i: PyIpInterface) -> str {
+    if i.address.version == 4 {
+        return v4_reverse(interface_str(i))
+    }
+    return match ipv4_mapped(i.address) {
+        None -> reverse_dots(interface_exploded(i)) + ".ip6.arpa"
+        Some(m) -> reverse_dots(exploded_hex(i.address.ip).substr(0, 30) + hex8(m.ip)) + ".ip6.arpa"
+    }
+}
+
+/// Always False for IPv4 (Python compares the interface with an address,
+/// which has no network); for IPv6, a zero address in an unspecified
+/// network.
+pub fn interface_is_unspecified(i: PyIpInterface) -> bool {
+    return i.address.version == 6 and is_zero(i.address.ip) and network_is_unspecified(i.network)
+}
+
+pub fn interface_is_loopback(i: PyIpInterface) -> bool {
+    if i.address.version == 4 {
+        return is_loopback(i.address)
+    }
+    return is_loopback(i.address) and network_is_loopback(i.network)
+}
+
+/// `IPv4Interface.ipv6_mapped`, which formats the interface with its
+/// prefix and so always raises.
+pub fn interface_ipv6_mapped(i: PyIpInterface) -> PyIpAddress ! PyIpError {
+    return try ipv6_address("::ffff:" + interface_str(i))
+}
+
+pub fn format_interface(i: PyIpInterface, spec: str) -> str ! PyIpError {
+    return try format_value(i.address.version, i.address.ip, interface_str(i), class_name(i.address.version, "Interface"), spec)
+}
+
+pub fn interface_eq(a: PyIpInterface, b: PyIpInterface) -> bool {
+    return address_eq(a.address, b.address) and network_eq(a.network, b.network)
+}
+
+pub fn interface_lt(a: PyIpInterface, b: PyIpInterface) -> bool ! PyIpError {
+    if a.address.version != b.address.version {
+        fail(version_error(interface_str(a), interface_str(b)))
+    }
+    let less = bytes_cmp(a.address.ip, b.address.ip) < 0
+    return (try network_lt(a.network, b.network)) or (network_eq(a.network, b.network) and less)
+}
+
+pub fn interface_le(a: PyIpInterface, b: PyIpInterface) -> bool ! PyIpError {
+    return (try interface_lt(a, b)) or interface_eq(a, b)
+}
+
+pub fn interface_gt(a: PyIpInterface, b: PyIpInterface) -> bool ! PyIpError {
+    return not (try interface_lt(a, b)) and not interface_eq(a, b)
+}
+
+pub fn interface_ge(a: PyIpInterface, b: PyIpInterface) -> bool ! PyIpError {
+    return not (try interface_lt(a, b))
+}
+
+// ---- module functions
+
+/// `summarize_address_range(first, last)`, as a list.
+pub fn summarize_address_range(first: PyIpAddress, last: PyIpAddress) -> [PyIpNetwork] ! PyIpError {
+    if first.version != last.version {
+        fail(version_error(address_str(first), address_str(last)))
+    }
+    if try address_gt(first, last) {
+        fail(PyIpValueError("last IP address must be greater than first"))
+    }
+    let v = first.version
+    let bits = max_prefixlen(v)
+    let one = one_shl(width(v), 0)
+    var cur = first.ip
+    var out: [PyIpNetwork] = []
+    while bytes_cmp(cur, last.ip) <= 0 {
+        let span = bytes_add(bytes_sub(last.ip, cur), one)
+        let room = if span.1 { bits } else { bit_length(span.0) - 1 }
+        let tz = trailing_zeros(cur)
+        let nbits = if tz < room { tz } else { room }
+        out.push(network_of(v, cur, bits - nbits))
+        if nbits == bits {
+            break
+        }
+        let next = bytes_add(cur, one_shl(width(v), nbits))
+        if next.1 {
+            break
+        }
+        cur = next.0
+    }
+    return out
+}
+
+/// The networks covering runs of consecutive addresses, after sorting and
+/// removing duplicates.
+fn address_runs(ips: [PyIpAddress]) -> [PyIpNetwork] ! PyIpError {
+    var uniq: [PyIpAddress] = []
+    for a in ips {
+        if not uniq.any(|u| address_eq(u, a)) {
+            uniq.push(a)
+        }
+    }
+    uniq.sort_by(|a| hex8(a.ip))
+    var out: [PyIpNetwork] = []
+    var k = 0
+    while k < uniq.len() {
+        var j = k
+        while j + 1 < uniq.len() and bytes_add(uniq[j].ip, one_shl(uniq[j].ip.len(), 0)).0 == uniq[j + 1].ip and not is_zero(uniq[j + 1].ip) {
+            j = j + 1
+        }
+        for n in try summarize_address_range(uniq[k], uniq[j]) {
+            out.push(n)
+        }
+        k = j + 1
+    }
+    return out
+}
+
+fn net_key(n: PyIpNetwork) -> str {
+    return hex8(n.network_address.ip) + hex8(n.netmask)
+}
+
+/// `_collapse_addresses_internal`.
+fn collapse_networks(nets: [PyIpNetwork]) -> [PyIpNetwork] {
+    var to_merge = nets
+    var keys: [PyIpNetwork] = []
+    var vals: [PyIpNetwork] = []
+    while to_merge.len() > 0 {
+        let net = to_merge[to_merge.len() - 1]
+        to_merge = to_merge.slice(0, to_merge.len() - 1)
+        let sup = supernet(net, 1, None) ?? net
+        var at = 0 - 1
+        for k in 0..keys.len() {
+            if network_eq(keys[k], sup) {
+                at = k
+            }
+        }
+        if at < 0 {
+            keys.push(sup)
+            vals.push(net)
+        } else if not network_eq(vals[at], net) {
+            keys = keys.slice(0, at) + keys.slice(at + 1, keys.len())
+            vals = vals.slice(0, at) + vals.slice(at + 1, vals.len())
+            to_merge.push(sup)
+        }
+    }
+    vals.sort_by(|n| net_key(n))
+    var out: [PyIpNetwork] = []
+    for n in vals {
+        if out.len() > 0 and bytes_cmp(broadcast_address(out[out.len() - 1]).ip, broadcast_address(n).ip) >= 0 {
+            continue
+        }
+        out.push(n)
+    }
+    return out
+}
+
+/// `collapse_addresses(items)`, as a list.
+pub fn collapse_addresses(items: [PyIpItem]) -> [PyIpNetwork] ! PyIpError {
+    var ips: [PyIpAddress] = []
+    var nets: [PyIpNetwork] = []
+    for it in items {
+        match it {
+            PyIpAddressItem(a) -> {
+                if ips.len() > 0 and ips[ips.len() - 1].version != a.version {
+                    fail(version_error(address_str(a), address_str(ips[ips.len() - 1])))
+                }
+                ips.push(a)
+            }
+            PyIpNetworkItem(n) -> {
+                let _added = try add_network_item(n, ips, nets)
+            }
+        }
+    }
+    if ips.len() > 0 and nets.len() > 0 and ips[0].version != version_of(nets[0]) {
+        fail(version_error(network_str(nets[0]), address_str(ips[0]) + "/{max_prefixlen(ips[0].version)}"))
+    }
+    let runs = try address_runs(ips)
+    return collapse_networks(runs + nets)
+}
+
+/// A network goes with the addresses when it is a single address.
+fn add_network_item(n: PyIpNetwork, inout ips: [PyIpAddress], inout nets: [PyIpNetwork]) -> bool ! PyIpError {
+    if n.prefixlen == max_prefixlen(version_of(n)) {
+        if ips.len() > 0 and ips[ips.len() - 1].version != version_of(n) {
+            fail(version_error(network_str(n), address_str(ips[ips.len() - 1])))
+        }
+        ips.push(n.network_address)
+        return true
+    }
+    if nets.len() > 0 and version_of(nets[nets.len() - 1]) != version_of(n) {
+        fail(version_error(network_str(n), network_str(nets[nets.len() - 1])))
+    }
+    nets.push(n)
+    return true
+}

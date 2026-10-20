@@ -260,6 +260,114 @@ becomes buildable the day its reference is installed.
 
 ## Landed
 
+- [x] **B62: Ruby's text and number formats, and Node's glob** —
+  `rubycgi` (`CGI` escaping, `CGI.parse`, cookies, `ERB::Util`)
+  `nodematchesglob` (`path.matchesGlob`, posix and win32) `rubycsvline`
+  (csv 3.0.9's `parse_line` and `generate_line`) `rubyrational`
+  `rubydate` (`Date` under its calendar reform) `rubypack` (`pack` and
+  `unpack` without the float and pointer directives), and the harness
+  `b62test`; the new gate `b62diff` runs 72,000 lines against Ruby 2.6
+  and Node 25. Found on the way: csv 3.0.9's string-split fast path and
+  its scanner disagree (`a|||b` with `col_sep "||"`), and `strip: true`
+  without a quote character splits on a literal `" \t\r\n\f"`.
+
+- [x] **B61: paths, times, JSON and printing in four runtimes** —
+  `perlfilespec` (File::Spec::Unix) `perltimelocal` (Time::Local's GM
+  functions) `perljsonpp` (JSON::PP 4.06) `perlansicolor`
+  (Term::ANSIColor) `rustduration` `rustipaddr` (`std::net` parsing and
+  display) `jqpath` (jq's path builtins) `lispprint` (SBCL's PRIN1 and
+  PRINC of numbers, strings and characters), and the harness `b61test`;
+  the new gate `b61diff` runs 80,000 lines against Perl 5.34, rustc
+  1.99, jq 1.7.1 and SBCL 2.6.8. Found on the way: jq 1.7.1 frees a
+  slice key twice when its bounds are not numbers and dies a few calls
+  later, so its oracle runs those deletions alone; JSON::PP quotes an
+  integral double between 2^53 and 2^62 only after the process has
+  encoded its first non-integral number.
+
+- [x] **B60: Perl's formats, Lisp's numbers, Rust's specs, Lua's
+  arithmetic** — `perlsprintf` `perltextabbrev` `perlmimebase64`
+  (MIME::Base64 and MIME::QuotedPrint) `perlgetoptlong` (Getopt::Long
+  2.52) `perltextbalanced` (`extract_delimited`, `extract_bracketed`)
+  `lispformat` (FORMAT's `~F ~E ~G ~$` and integer directives)
+  `lispreadnumber` (the reader's number syntax) `rustfmt` (`{:spec}` for
+  integers, floats and strings) `luanumber` (Lua 5.5 number semantics),
+  and the harness `b60test`; the new gate `b60diff` runs 90,000 lines
+  against Perl 5.34, SBCL 2.6.8, rustc 1.99 and Lua 5.5. Found on the
+  way: `%n` still works in Perl 5.34's sprintf (refused here), and a
+  width between 1e6 and 2^62 makes Perl allocate gigabytes.
+
+- [x] **B59: Ruby's and V8's dates, formats and URLs** — `rubyabbrev`
+  `rubyinteger` `rubystrftime` `rubyformat` (`Kernel#format` with its
+  own dtoa) `rubyjson` (json 2.1) `rubyuri` (`URI.parse`, `join`, the
+  www-form functions) `jsdate` (V8's `Date.parse` and printing, in UTC)
+  `jsstringmethods` `nodelegacyurl` (`url.parse`, `format`, `resolve`),
+  and the harness `b59test`; the new gate `b59diff` runs 104,000 lines
+  against Ruby 2.6 and Node 25. Ruby 2.6's bugs are kept where a program
+  would see them: `Integer.sqrt` below 2**53 truncates a double, the
+  RFC 3986 relative-reference regexp has misplaced brackets, and `%.1f`
+  of 99999.95 is `100000.0`.
+
+- [x] **B58: Go's strings, mail and cookies; Java's date formats** —
+  `gobuildconstraint` (`//go:build` and `// +build`) `goversion`
+  `gostrings` `gonetmail` `gohtml` `gohttpcookie` `javaurlencoder`
+  `javadatetimeformatter` (formatting only) `javasimpledateformat`
+  (formatting, GMT, from 1584), and the harness `b58test`; the new gate
+  `b58diff` runs 124,000 lines against Go 1.25 and Java 17. One seed's
+  first run reported 110 differing lines that neither a rerun nor
+  replaying that run's own inputs, harness and oracles reproduced; the
+  machine's load was between 30 and 100. It is recorded as unexplained.
+
+- [x] **B57: six of Python's smaller modules** — `pycolorsys`
+  `pymimetypes` (a `MimeTypes()` instance) `pyrobotparser` (first match,
+  where `robots` follows Google's longest match) `pyreprlib`
+  `pyhttpheaders` (urllib.request's and http.cookiejar's header helpers)
+  `pystrptime`, and the harness `b57test`; the new gate `b57diff` runs
+  60,000 lines against CPython 3.13. A seventh, `pygettextplural`
+  (`gettext.c2py`), passed its diff and controls and was not landed:
+  `gettextmo` already evaluates catalogue plural rules against
+  `GNUTranslations`, which calls c2py. Found on the way: `pyliteral`'s
+  printable table came from Python 3.14's Unicode 16, so packages that
+  must match 3.13's `repr` build theirs on `pycharclass`.
+
+- [x] **B56: words, wraps and numbers in five runtimes** —
+  `lispnumbers` (FORMAT's `~R`) `rustpath` (`std::path::Path` on Unix)
+  `perlparsewords` (Text::ParseWords) `perltextwrap` (Text::Wrap and
+  Text::Tabs) `rubyfloat` (`Float#to_s`, `round`, `floor`, `ceil`)
+  `rustescape` (`escape_debug` and `{:?}` of str and char)
+  `pyipaddress` (CPython 3.13.1's `ipaddress`) `pystr` (str methods),
+  and the harness `b56test`; the new gate `b56diff` runs 84,637 lines
+  against SBCL 2.6.8, rustc 1.99, Perl 5.34, Ruby 2.6 and CPython 3.13.
+  `perltextwrap` counts clusters with `graphemes` (Unicode 17) where Perl
+  5.34 uses Unicode 13, and says so; `rustescape`'s two character sets
+  were read off Rust's own `escape_debug`. Found on the way: Ruby 2.6's
+  Bignum `ceil` adds a step to an exact multiple (`1e20.ceil(-2)`).
+
+- [x] **B55: SQLite's LIKE, Node's win32 paths, Ruby's inspect** —
+  `sqlitelike` (`LIKE` and `GLOB`) `nodepathwin32` `rubyinspect`
+  (`inspect`, `dump`, `undump`) `rubynumparse` (`to_i`, `Integer()`,
+  `to_f`, `Float()`) `luapack` (`string.pack`) `jqformat` (jq's
+  @-formats) `luautf8` `javaintegers` (`Integer` and `Long` parsing and
+  printing), and the harness `b55test`; the new gate `b55diff` runs
+  84,000 lines against SQLite 3.51.1, Node 25, Ruby 2.6, Lua 5.5, jq
+  1.7.1 and Java 17.
+
+- [x] **B54: SQLite's dates and printf, and five command lines** —
+  `sqlitedatetime` (`date`, `time`, `datetime`, `julianday`, `unixepoch`,
+  `strftime`, `timediff`) `sqliteprintf` `luapattern` (Lua 5.5's
+  patterns) `goflag` (Go's `flag`) `nodeparseargs` (`util.parseArgs`)
+  `perlversion` (`version.pm`) `perldumper` (Data::Dumper) `rustnum`
+  (Rust's number parsing and printing) `javalocaldate`, and the harness
+  `b54test`; the new gate `b54diff` runs 78,000 lines against SQLite
+  3.51.1, Lua 5.5, Go 1.25, Node 25, Perl 5.34, rustc 1.99 and Java 17.
+  Found on the way: Data::Dumper copies a hash key with `strlcpy`, so a
+  key holding NUL is cut there; the generator keeps NUL out of keys.
+
+B54, B55 and the first six of B56 were rebuilt after a reboot emptied
+`/private/tmp`, where they had been built: the commands that wrote them
+were replayed from the session record with the repository write-locked,
+and each batch then agreed in full on a fresh seed (78,000, 84,000 and
+64,501 lines) before the remaining work went on.
+
 - [x] **B53: strings as five runtimes handle them** — `pyglob`
   (`glob.translate`, `escape`, `has_magic`) `goencoding` (Go's base64,
   base32, hex and ascii85) `javabiginteger` `pyquopri` `pyemailutils`
@@ -1047,7 +1155,7 @@ the repository already had them under other names: `ssri` (`sri`),
 | | |
 |---|---|
 | At the start | 669 package directories, test harnesses included |
-| Now | 1059 package directories besides the demos: **943 libraries** (a package exporting a `pub fn`) and 116 test harnesses |
+| Now | 1140 package directories besides the demos: **1015 libraries** (a package exporting a `pub fn`) and 125 test harnesses |
 | Candidates above | 316 packages in 28 batches, plus `ecc`, `rfc6979` and `goprintf` |
 | Harnesses, one a batch | 28 |
 | If every candidate lands | 1016 |
@@ -1057,10 +1165,12 @@ The "1000" these batches reached counted every package directory but the
 `-demo` ones, and so counted the harnesses (`b47test`, `uritdiff`,
 `gostdtest`, ...) that drive the diffs: programs with a `main` and no API,
 which nobody would depend on. Counted as libraries the set was 891, with
-109 more needed for the target; B47-B53 bring it to 943, and 57 are still
-needed. `scripts/site.py` counts the same way now.
+109 more needed for the target; B47-B53 brought it to 943 and B54-B62 to
+1015. `scripts/site.py` counts the same way.
 
-The margin over 1000 is 16. It is there because some
-candidate will turn out to exist already under a name the grep missed, or to
-disagree with its oracle in a way that says the oracle is the better
-package, and the plan should not need rewriting when that happens.
+Each of those 124 libraries is held by its batch's gate to the runtime it
+ports, on generated inputs and with mutation controls run when it was
+built: a library that agreed with its oracle but whose test could not tell
+a broken copy from a working one did not land. "Held to" means agreement on
+what the generators reach, and each package's header lists what it refuses
+or leaves out; it does not mean the whole of a runtime's API.

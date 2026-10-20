@@ -1,0 +1,897 @@
+// JavaScript's `Date`, as V8 14.1 runs it in Node 25 with the time zone
+// set to UTC: `Date.parse`, `Date.UTC`, the time value a `Date` holds,
+// `toISOString`, `toUTCString`, `toString`, `toDateString`,
+// `toTimeString` and the UTC getters.
+//
+// Every browser and Node service reads dates through `Date.parse`, and a
+// peer that must accept and reject the same strings, and land on the same
+// millisecond, needs V8's parser rather than the specification's, which
+// only defines the ISO format:
+//
+//   - ISO strings: `YYYY`, `YYYY-MM`, `YYYY-MM-DD`, `±YYYYYY` years
+//     (`-000000` is not one), then `THH:mm`, `:ss`, `.sss` with any
+//     number of digits, and `Z` or `±hh:mm` (or `±hhmm`). `24:00` is the
+//     next midnight. A date alone is UTC; a date and time without an
+//     offset is local time, which here is UTC.
+//   - V8's legacy parser for everything else, as its source has it:
+//     words before the first number are ignored, `(...)` is skipped,
+//     month names count by their first three letters (`Mayday` is May),
+//     `UT`, `UTC`, `GMT`, `Z` and the US zones `EST` to `PDT` are
+//     offsets, `AM`/`PM` adjust the hour, `n:` and `n.` start a time,
+//     other numbers are day, month and year in V8's order (`1/2/3` is
+//     2003-01-02; a missing year is 2001 by way of V8's padding, so "Jan
+//     15" is 2001-01-15; 0-49 and 50-99 are 2000s and 1900s), and a sign after a time or `UTC` is
+//     an offset (`GMT-8`, `+0530`, `+5:` takes any hour, its seconds
+//     wrapping at 2**32 as V8's unsigned arithmetic does).
+//   - Only the first nine significant digits of a number count; a NUL
+//     ends the string; white space is JavaScript's (U+FEFF included,
+//     U+2028 and U+180E not).
+//   - `Date.UTC` maps 0-99 to 1900-1999, truncates fractions, rolls
+//     months over, and works the day number out with V8's integer
+//     arithmetic; every result goes through TimeClip: beyond 8.64e15 ms
+//     either way is NaN.
+//   - `toISOString` throws RangeError "Invalid time value" for NaN and
+//     writes `+YYYYYY`/`-YYYYYY` outside 0000-9999; the other formats
+//     write "Invalid Date", a negative year as `-0001`, and the zone as
+//     `GMT+0000 (Coordinated Universal Time)`.
+//
+// Strings are UTF-16 code units, as JavaScript's are; `units` converts.
+// Limits: the time zone is UTC only (other zones need a zone database);
+// arguments are numbers already, so `ToNumber` of strings and objects is
+// the caller's.
+
+/// A RangeError, with V8's message.
+type JsDateError = | JsDateRangeError(msg: str)
+
+pub fn error_text(e: JsDateError) -> str {
+    return match e {
+        JsDateRangeError(m) -> m
+    }
+}
+
+/// Text as UTF-16 code units.
+pub fn units(s: str) -> [i64] {
+    var out: [i64] = []
+    for c in s.codes() {
+        if c >= 65536 {
+            out.push(55296 + (c - 65536).shr(10))
+            out.push(56320 + (c - 65536).bit_and(1023))
+        } else {
+            out.push(c)
+        }
+    }
+    return out
+}
+
+fn nan() -> f64 {
+    return (9221120237041090560).from_bits()
+}
+
+fn is_finite(x: f64) -> bool {
+    return x - x == 0.0
+}
+
+fn k_none() -> i64 {
+    return 2147483647
+}
+
+/// ToIntegerOrInfinity on a double, as V8's DoubleToInteger.
+fn to_integer(x: f64) -> f64 {
+    if x != x or x == 0.0 {
+        return 0.0
+    }
+    if not is_finite(x) {
+        return x
+    }
+    return (if x > 0.0 { x.floor() } else { x.ceil() }) + 0.0
+}
+
+// ---- time values
+
+/// V8's MakeDay, integer arithmetic and all.
+pub fn make_day(year: f64, month: f64, date: f64) -> f64 {
+    if not (year >= -1000000.0 and year <= 1000000.0 and month >= -10000000.0 and month <= 10000000.0 and is_finite(date)) {
+        return nan()
+    }
+    var y = year.as_i64()
+    var m = month.as_i64()
+    y = y + m / 12
+    m = m % 12
+    if m < 0 {
+        m = m + 12
+        y = y - 1
+    }
+    let delta = 399999
+    let base_day = 365 * (1970 + delta) + (1970 + delta) / 4 - (1970 + delta) / 100 + (1970 + delta) / 400
+    var day = 365 * (y + delta) + (y + delta) / 4 - (y + delta) / 100 + (y + delta) / 400 - base_day
+    let leap = not (y % 4 != 0 or y % 100 == 0 and y % 400 != 0)
+    let table = if leap { [0, 31, 60, 91, 121, 152, 182, 213, 244, 274, 305, 335] } else { [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334] }
+    day = day + table[m]
+    return (day - 1).as_f64() + to_integer(date)
+}
+
+/// MakeTime: hours, minutes, seconds and ms, each truncated, combined in
+/// doubles left to right.
+pub fn make_time(h: f64, m: f64, s: f64, ms: f64) -> f64 {
+    if not (is_finite(h) and is_finite(m) and is_finite(s) and is_finite(ms)) {
+        return nan()
+    }
+    return to_integer(h) * 3600000.0 + to_integer(m) * 60000.0 + to_integer(s) * 1000.0 + to_integer(ms)
+}
+
+/// MakeDate.
+pub fn make_date(day: f64, time: f64) -> f64 {
+    if not (is_finite(day) and is_finite(time)) {
+        return nan()
+    }
+    return time + day * 86400000.0
+}
+
+/// TimeClip: the time value a `Date` holds, NaN beyond 8.64e15 ms.
+pub fn time_clip(t: f64) -> f64 {
+    if t >= -8640000000000000.0 and t <= 8640000000000000.0 {
+        return (if t > 0.0 { t.floor() } else { t.ceil() }) + 0.0
+    }
+    return nan()
+}
+
+/// `Date.UTC(...args)` with the arguments already numbers; missing ones
+/// take their defaults (a missing year is NaN).
+pub fn utc(args: [f64]) -> f64 {
+    let arg = |i, d| args.get(i) ?? d
+    var year = args.get(0) ?? nan()
+    if year == year {
+        let y = to_integer(year)
+        if y >= 0.0 and y <= 99.0 {
+            year = 1900.0 + y
+        }
+    }
+    let day = make_day(year, arg(1, 0.0), arg(2, 1.0))
+    let time = make_time(arg(3, 0.0), arg(4, 0.0), arg(5, 0.0), arg(6, 0.0))
+    return time_clip(make_date(day, time))
+}
+
+// ---- breaking a time value down
+
+/// The UTC fields of a valid time value: year, month (0-11), day of the
+/// month, weekday (0 Sunday), hours, minutes, seconds, milliseconds.
+type JsDateFields = { year: i64, month: i64, day: i64, weekday: i64, hour: i64, minute: i64, second: i64, ms: i64 }
+
+fn floor_div(a: i64, b: i64) -> i64 {
+    let q = a / b
+    return if a % b != 0 and (a < 0) != (b < 0) { q - 1 } else { q }
+}
+
+/// The fields of time value `t` (not NaN).
+pub fn fields(t: f64) -> JsDateFields {
+    let ms = t.as_i64()
+    let days = floor_div(ms, 86400000)
+    let in_day = ms - days * 86400000
+    let z = days + 719468
+    let era = floor_div(z, 146097)
+    let doe = z - era * 146097
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100)
+    let mp = (5 * doy + 2) / 153
+    let d = doy - (153 * mp + 2) / 5 + 1
+    let m = if mp < 10 { mp + 3 } else { mp - 9 }
+    let y = yoe + era * 400 + (if m <= 2 { 1 } else { 0 })
+    let wd = (days + 4) % 7
+    return JsDateFields{
+        year: y,
+        month: m - 1,
+        day: d,
+        weekday: if wd < 0 { wd + 7 } else { wd },
+        hour: in_day / 3600000,
+        minute: in_day / 60000 % 60,
+        second: in_day / 1000 % 60,
+        ms: in_day % 1000,
+    }
+}
+
+/// A UTC getter (`getUTCFullYear`, ...) by name: NaN for an invalid date.
+pub fn get_utc(t: f64, field: str) -> f64 {
+    if t != t {
+        return nan()
+    }
+    let f = fields(t)
+    let v = if field == "FullYear" { f.year } else if field == "Month" { f.month } else if field == "Date" { f.day } else if field == "Day" { f.weekday } else if field == "Hours" {
+        f.hour
+    } else if field == "Minutes" { f.minute } else if field == "Seconds" { f.second } else { f.ms }
+    return v.as_f64()
+}
+
+// ---- formatting
+
+fn pad(n: i64, width: i64) -> str {
+    return if n < 0 { "-" + (0 - n).to_str().pad_start(width - 1, "0") } else { n.to_str().pad_start(width, "0") }
+}
+
+fn week_day_name(w: i64) -> str {
+    return ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"][w]
+}
+
+fn month_name(m: i64) -> str {
+    return ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"][m]
+}
+
+fn year_text(y: i64) -> str {
+    return if y < 0 { pad(y, 5) } else { pad(y, 4) }
+}
+
+fn clock(f: JsDateFields) -> str {
+    return pad(f.hour, 2) + ":" + pad(f.minute, 2) + ":" + pad(f.second, 2)
+}
+
+/// `toISOString()`.
+pub fn to_iso_string(t: f64) -> str ! JsDateError {
+    if t != t {
+        fail(JsDateRangeError("Invalid time value"))
+    }
+    let f = fields(t)
+    let y = if f.year >= 0 and f.year <= 9999 { pad(f.year, 4) } else if f.year < 0 { "-" + pad(0 - f.year, 6) } else { "+" + pad(f.year, 6) }
+    return y + "-" + pad(f.month + 1, 2) + "-" + pad(f.day, 2) + "T" + clock(f) + "." + pad(f.ms, 3) + "Z"
+}
+
+/// `toUTCString()`.
+pub fn to_utc_string(t: f64) -> str {
+    if t != t {
+        return "Invalid Date"
+    }
+    let f = fields(t)
+    return week_day_name(f.weekday) + ", " + pad(f.day, 2) + " " + month_name(f.month) + " " + year_text(f.year) + " " + clock(f) + " GMT"
+}
+
+/// `toDateString()` in UTC.
+pub fn to_date_string(t: f64) -> str {
+    if t != t {
+        return "Invalid Date"
+    }
+    let f = fields(t)
+    return week_day_name(f.weekday) + " " + month_name(f.month) + " " + pad(f.day, 2) + " " + year_text(f.year)
+}
+
+/// `toTimeString()` in UTC.
+pub fn to_time_string(t: f64) -> str {
+    if t != t {
+        return "Invalid Date"
+    }
+    return clock(fields(t)) + " GMT+0000 (Coordinated Universal Time)"
+}
+
+/// `toString()` in UTC.
+pub fn to_string(t: f64) -> str {
+    if t != t {
+        return "Invalid Date"
+    }
+    return to_date_string(t) + " " + to_time_string(t)
+}
+
+// ---- the parser's input and tokens
+
+/// V8's `DateToken`: a tag (negative for the plain kinds, a keyword type
+/// otherwise), the length in units and a value.
+type JsDateToken = { tag: i64, length: i64, value: i64 }
+
+fn tag_invalid() -> i64 {
+    return 0 - 6
+}
+
+fn tag_unknown() -> i64 {
+    return 0 - 5
+}
+
+fn tag_space() -> i64 {
+    return 0 - 4
+}
+
+fn tag_number() -> i64 {
+    return 0 - 3
+}
+
+fn tag_symbol() -> i64 {
+    return 0 - 2
+}
+
+fn tag_end() -> i64 {
+    return 0 - 1
+}
+
+// Keyword types.
+fn kw_invalid() -> i64 {
+    return 0
+}
+
+fn kw_month() -> i64 {
+    return 1
+}
+
+fn kw_zone() -> i64 {
+    return 2
+}
+
+fn kw_time_separator() -> i64 {
+    return 3
+}
+
+fn kw_am_pm() -> i64 {
+    return 4
+}
+
+fn tok(tag: i64, length: i64, value: i64) -> JsDateToken {
+    return JsDateToken{ tag: tag, length: length, value: value }
+}
+
+fn is_number(t: JsDateToken) -> bool {
+    return t.tag == tag_number()
+}
+
+fn is_symbol(t: JsDateToken, c: i64) -> bool {
+    return t.tag == tag_symbol() and t.value == c
+}
+
+fn is_sign(t: JsDateToken) -> bool {
+    return t.tag == tag_symbol() and (t.value == 45 or t.value == 43)
+}
+
+fn is_keyword(t: JsDateToken) -> bool {
+    return t.tag >= 0
+}
+
+fn is_fixed_number(t: JsDateToken, len: i64) -> bool {
+    return is_number(t) and t.length == len
+}
+
+fn is_keyword_z(t: JsDateToken) -> bool {
+    return t.tag == kw_zone() and t.length == 1 and t.value == 0
+}
+
+fn between(x: i64, lo: i64, hi: i64) -> bool {
+    return x >= lo and x <= hi
+}
+
+/// V8's WhiteSpace (not the line terminators).
+fn is_white_space(c: i64) -> bool {
+    return c == 9 or c == 11 or c == 12 or c == 32 or c == 160 or c == 5760 or c >= 8192 and c <= 8202 or c == 8239 or c == 8287 or c == 12288 or c == 65279
+}
+
+fn is_space_or_terminator(c: i64) -> bool {
+    return is_white_space(c) or c == 10 or c == 13 or c == 8232 or c == 8233
+}
+
+/// The InputReader and the tokenizer over it: the current character, the
+/// index past it, and the token after the one last taken.
+type JsDateScanner = { s: [i64], index: i64, ch: i64, next: JsDateToken }
+
+fn advance(inout sc: JsDateScanner) {
+    sc.ch = if sc.index < sc.s.len() { sc.s[sc.index] } else { 0 }
+    sc.index = sc.index + 1
+}
+
+fn is_digit(c: i64) -> bool {
+    return c >= 48 and c <= 57
+}
+
+/// ReadUnsignedNumeral: leading zeros skipped, nine significant digits
+/// kept, the rest read and dropped.
+fn read_numeral(inout sc: JsDateScanner) -> i64 {
+    var n = 0
+    var i = 0
+    while sc.ch == 48 {
+        advance(sc)
+    }
+    while is_digit(sc.ch) {
+        if i < 9 {
+            n = n * 10 + sc.ch - 48
+        }
+        i = i + 1
+        advance(sc)
+    }
+    return n
+}
+
+/// The keyword table: (three-letter prefix, type, value).
+fn keyword_table() -> [(str, i64, i64)] {
+    return [("jan", 1, 1), ("feb", 1, 2), ("mar", 1, 3), ("apr", 1, 4), ("may", 1, 5), ("jun", 1, 6), ("jul", 1, 7), ("aug", 1, 8), ("sep", 1, 9),
+        ("oct", 1, 10), ("nov", 1, 11), ("dec", 1, 12), ("am", 4, 0), ("pm", 4, 12), ("ut", 2, 0), ("utc", 2, 0), ("z", 2, 0), ("gmt", 2, 0), ("cdt", 2, 0 - 5),
+        ("cst", 2, 0 - 6), ("edt", 2, 0 - 4), ("est", 2, 0 - 5), ("mdt", 2, 0 - 6), ("mst", 2, 0 - 7), ("pdt", 2, 0 - 7), ("pst", 2, 0 - 8), ("t", 3, 0)]
+}
+
+/// A word: characters from 'A' up that are not white space. Looked up by
+/// its first three characters, each OR 0x20, and its length.
+fn read_word(inout sc: JsDateScanner) -> JsDateToken {
+    var prefix = [0, 0, 0]
+    var len = 0
+    while sc.ch >= 65 and not is_white_space(sc.ch) {
+        if len < 3 {
+            prefix[len] = sc.ch.bit_or(32)
+        }
+        len = len + 1
+        advance(sc)
+    }
+    for entry in keyword_table() {
+        let (word, kind, value) = entry
+        let w = word.codes()
+        var same = true
+        for j in 0..3 {
+            if prefix[j] != (w.get(j) ?? 0) {
+                same = false
+            }
+        }
+        if same and (len <= 3 or kind == kw_month()) {
+            return tok(kind, len, value)
+        }
+    }
+    return tok(kw_invalid(), len, 0)
+}
+
+/// DateStringTokenizer::Scan.
+fn scan(inout sc: JsDateScanner) -> JsDateToken {
+    let pre = sc.index
+    let c = sc.ch
+    if c == 0 {
+        return tok(tag_end(), 0, 0 - 1)
+    }
+    if is_digit(c) {
+        let n = read_numeral(sc)
+        return tok(tag_number(), sc.index - pre, n)
+    }
+    if c == 58 or c == 45 or c == 43 or c == 46 or c == 41 {
+        advance(sc)
+        return tok(tag_symbol(), 1, c)
+    }
+    if c >= 65 and not is_white_space(c) {
+        return read_word(sc)
+    }
+    if is_space_or_terminator(c) {
+        advance(sc)
+        return tok(tag_space(), sc.index - pre, 0 - 1)
+    }
+    if c == 40 {
+        var balance = 0
+        while true {
+            if sc.ch == 41 {
+                balance = balance - 1
+            } else if sc.ch == 40 {
+                balance = balance + 1
+            }
+            advance(sc)
+            if not (balance > 0 and sc.ch != 0) {
+                break
+            }
+        }
+        return tok(tag_unknown(), 1, 0 - 1)
+    }
+    advance(sc)
+    return tok(tag_unknown(), 1, 0 - 1)
+}
+
+/// The tokenizer's Next: the token in hand, and the one after scanned.
+fn next_token(inout sc: JsDateScanner) -> JsDateToken {
+    let t = sc.next
+    sc.next = scan(sc)
+    return t
+}
+
+fn skip_symbol(inout sc: JsDateScanner, c: i64) -> bool {
+    if is_symbol(sc.next, c) {
+        sc.next = scan(sc)
+        return true
+    }
+    return false
+}
+
+// ---- the composers
+
+/// DayComposer, TimeComposer and TimeZoneComposer in one record.
+type JsDateParts = {
+    day: [i64],
+    named_month: i64,
+    iso_date: bool,
+    time: [i64],
+    hour_offset: i64,
+    tz_sign: i64,
+    tz_hour: i64,
+    tz_minute: i64,
+}
+
+fn time_add(inout p: JsDateParts, n: i64) -> bool {
+    if p.time.len() < 4 {
+        p.time.push(n)
+        return true
+    }
+    return false
+}
+
+fn time_add_final(inout p: JsDateParts, n: i64) -> bool {
+    if not time_add(p, n) {
+        return false
+    }
+    while p.time.len() < 4 {
+        p.time.push(0)
+    }
+    return true
+}
+
+fn time_expecting(p: JsDateParts, n: i64) -> bool {
+    let i = p.time.len()
+    return i == 1 and between(n, 0, 59) or i == 2 and between(n, 0, 59) or i == 3 and between(n, 0, 999)
+}
+
+fn day_add(inout p: JsDateParts, n: i64) -> bool {
+    if p.day.len() < 3 {
+        p.day.push(n)
+        return true
+    }
+    return false
+}
+
+fn tz_set(inout p: JsDateParts, hours: i64) {
+    p.tz_sign = if hours < 0 { 0 - 1 } else { 1 }
+    p.tz_hour = hours * p.tz_sign
+    p.tz_minute = 0
+}
+
+fn tz_expecting(p: JsDateParts, n: i64) -> bool {
+    return p.tz_hour != k_none() and p.tz_minute == k_none() and between(n, 0, 59)
+}
+
+fn tz_is_utc(p: JsDateParts) -> bool {
+    return p.tz_hour == 0 and p.tz_minute == 0
+}
+
+/// ReadMilliseconds: the first three significant digits of the numeral.
+fn read_ms(t: JsDateToken) -> i64 {
+    var number = t.value
+    var length = t.length
+    if length < 3 {
+        if length == 1 {
+            number = number * 100
+        } else if length == 2 {
+            number = number * 10
+        }
+    } else if length > 3 {
+        if length > 9 {
+            length = 9
+        }
+        var factor = 1
+        while length > 3 {
+            factor = factor * 10
+            length = length - 1
+        }
+        number = number / factor
+    }
+    return number
+}
+
+/// DayComposer::Write: (year, month 0-11, day) or None.
+fn write_day(p: JsDateParts) -> Option[(i64, i64, i64)] {
+    if p.day.len() < 1 {
+        return None
+    }
+    var comp = p.day
+    while comp.len() < 3 {
+        comp.push(1)
+    }
+    var year = 0
+    var month = k_none()
+    var day = k_none()
+    if p.named_month == k_none() {
+        if p.iso_date or not between(comp[0], 1, 31) {
+            year = comp[0]
+            month = comp[1]
+            day = comp[2]
+        } else {
+            month = comp[0]
+            day = comp[1]
+            year = comp[2]
+        }
+    } else {
+        // V8 tests for one component after padding to three, so never
+        // finds one: "Jan 15" takes its year from the padding, 2001.
+        month = p.named_month
+        if not between(comp[0], 1, 31) {
+            year = comp[0]
+            day = comp[1]
+        } else {
+            day = comp[0]
+            year = comp[1]
+        }
+    }
+    if not p.iso_date {
+        if between(year, 0, 49) {
+            year = year + 2000
+        } else if between(year, 50, 99) {
+            year = year + 1900
+        }
+    }
+    if not between(month, 1, 12) or not between(day, 1, 31) {
+        return None
+    }
+    return Some((year, month - 1, day))
+}
+
+/// TimeComposer::Write: (hour, minute, second, ms) or None.
+fn write_time(p: JsDateParts) -> Option[(i64, i64, i64, i64)] {
+    var c = p.time
+    while c.len() < 4 {
+        c.push(0)
+    }
+    var hour = c[0]
+    if p.hour_offset != k_none() {
+        if not between(hour, 0, 12) {
+            return None
+        }
+        hour = hour % 12 + p.hour_offset
+    }
+    if not (between(hour, 0, 23) and between(c[1], 0, 59) and between(c[2], 0, 59) and between(c[3], 0, 999)) {
+        if hour != 24 or c[1] != 0 or c[2] != 0 or c[3] != 0 {
+            return None
+        }
+    }
+    return Some((hour, c[1], c[2], c[3]))
+}
+
+/// TimeZoneComposer::Write: the offset in seconds, NaN when none was
+/// given, or None when it overflows a Smi (in V8's unsigned 32-bit sum).
+fn write_tz(p: JsDateParts) -> Option[f64] {
+    if p.tz_sign == k_none() {
+        return Some(nan())
+    }
+    let h = if p.tz_hour == k_none() { 0 } else { p.tz_hour }
+    let m = if p.tz_minute == k_none() { 0 } else { p.tz_minute }
+    let total = (h * 3600 + m * 60).bit_and(4294967295)
+    if total > 2147483647 {
+        return None
+    }
+    return Some((if p.tz_sign < 0 { 0 - total } else { total }).as_f64())
+}
+
+// ---- the ES5 (ISO) part
+
+/// What ParseES5DateTime hands back: the next token for the legacy
+/// parser, the end of input (done), or a terminal failure.
+fn es5_date(inout sc: JsDateScanner, inout p: JsDateParts) -> JsDateToken {
+    if is_sign(sc.next) {
+        let sign_token = next_token(sc)
+        if not is_fixed_number(sc.next, 6) {
+            return sign_token
+        }
+        let sign = 44 - sign_token.value
+        let year = next_token(sc).value
+        if sign < 0 and year == 0 {
+            return sign_token
+        }
+        let _a = day_add(p, sign * year)
+    } else if is_fixed_number(sc.next, 4) {
+        let _b = day_add(p, next_token(sc).value)
+    } else {
+        return next_token(sc)
+    }
+    if skip_symbol(sc, 45) {
+        if not is_fixed_number(sc.next, 2) or not between(sc.next.value, 1, 12) {
+            return next_token(sc)
+        }
+        let _c = day_add(p, next_token(sc).value)
+        if skip_symbol(sc, 45) {
+            if not is_fixed_number(sc.next, 2) or not between(sc.next.value, 1, 31) {
+                return next_token(sc)
+            }
+            let _d = day_add(p, next_token(sc).value)
+        }
+    }
+    if sc.next.tag != kw_time_separator() {
+        if sc.next.tag != tag_end() {
+            return next_token(sc)
+        }
+    } else {
+        let _t = next_token(sc)
+        if not es5_time(sc, p) {
+            return tok(tag_invalid(), 0, 0 - 1)
+        }
+    }
+    if p.tz_hour == k_none() and p.time.len() == 0 {
+        tz_set(p, 0)
+    }
+    p.iso_date = true
+    return tok(tag_end(), 0, 0 - 1)
+}
+
+/// The `THH:mm[:ss[.sss]][Z|±hh:mm]` part, after the `T`.
+fn es5_time(inout sc: JsDateScanner, inout p: JsDateParts) -> bool {
+    if not is_fixed_number(sc.next, 2) or not between(sc.next.value, 0, 24) {
+        return false
+    }
+    let hour_is_24 = sc.next.value == 24
+    let _h = time_add(p, next_token(sc).value)
+    if not skip_symbol(sc, 58) {
+        return false
+    }
+    if not is_fixed_number(sc.next, 2) or not between(sc.next.value, 0, 59) or hour_is_24 and sc.next.value > 0 {
+        return false
+    }
+    let _m = time_add(p, next_token(sc).value)
+    if skip_symbol(sc, 58) {
+        if not is_fixed_number(sc.next, 2) or not between(sc.next.value, 0, 59) or hour_is_24 and sc.next.value > 0 {
+            return false
+        }
+        let _s = time_add(p, next_token(sc).value)
+        if skip_symbol(sc, 46) {
+            if not is_number(sc.next) or hour_is_24 and sc.next.value > 0 {
+                return false
+            }
+            let _ms = time_add(p, read_ms(next_token(sc)))
+        }
+    }
+    if is_keyword_z(sc.next) {
+        let _z = next_token(sc)
+        tz_set(p, 0)
+    } else if is_sign(sc.next) {
+        if not es5_offset(sc, p) {
+            return false
+        }
+    }
+    return sc.next.tag == tag_end()
+}
+
+fn es5_offset(inout sc: JsDateScanner, inout p: JsDateParts) -> bool {
+    p.tz_sign = if next_token(sc).value == 43 { 1 } else { 0 - 1 }
+    if is_fixed_number(sc.next, 4) {
+        let hm = next_token(sc).value
+        if not between(hm / 100, 0, 23) or not between(hm % 100, 0, 59) {
+            return false
+        }
+        p.tz_hour = hm / 100
+        p.tz_minute = hm % 100
+        return true
+    }
+    if not is_fixed_number(sc.next, 2) or not between(sc.next.value, 0, 23) {
+        return false
+    }
+    p.tz_hour = next_token(sc).value
+    if not skip_symbol(sc, 58) {
+        return false
+    }
+    if not is_fixed_number(sc.next, 2) or not between(sc.next.value, 0, 59) {
+        return false
+    }
+    p.tz_minute = next_token(sc).value
+    return true
+}
+
+// ---- the legacy part
+
+/// What the legacy loop made of one token: keep going, or give up.
+fn legacy_number(inout sc: JsDateScanner, inout p: JsDateParts, n: i64) -> bool {
+    if skip_symbol(sc, 58) {
+        if skip_symbol(sc, 58) {
+            if p.time.len() != 0 {
+                return false
+            }
+            let _a = time_add(p, n)
+            let _b = time_add(p, 0)
+        } else {
+            if not time_add(p, n) {
+                return false
+            }
+            if is_symbol(sc.next, 46) {
+                let _c = next_token(sc)
+            }
+        }
+        return true
+    }
+    if skip_symbol(sc, 46) and time_expecting(p, n) {
+        let _d = time_add(p, n)
+        if not is_number(sc.next) {
+            return false
+        }
+        let ms = read_ms(next_token(sc))
+        if ms < 0 {
+            return false
+        }
+        // V8 ignores whether this fits.
+        let _g = time_add_final(p, ms)
+        return true
+    }
+    if tz_expecting(p, n) {
+        p.tz_minute = n
+        return true
+    }
+    if time_expecting(p, n) {
+        let _e = time_add_final(p, n)
+        let peek = sc.next
+        return peek.tag == tag_end() or peek.tag == tag_space() or is_keyword_z(peek) or is_sign(peek)
+    }
+    if not day_add(p, n) {
+        return false
+    }
+    let _f = skip_symbol(sc, 45)
+    return true
+}
+
+fn legacy_sign(inout sc: JsDateScanner, inout p: JsDateParts, t: JsDateToken) -> bool {
+    p.tz_sign = if 44 - t.value < 0 { 0 - 1 } else { 1 }
+    var n = 0
+    var length = 0
+    if is_number(sc.next) {
+        let num = next_token(sc)
+        length = num.length
+        n = num.value
+    }
+    if is_symbol(sc.next, 58) {
+        p.tz_hour = n
+        p.tz_minute = k_none()
+    } else if length == 1 or length == 2 {
+        p.tz_hour = n
+        p.tz_minute = 0
+    } else if length == 3 or length == 4 {
+        p.tz_hour = n / 100
+        p.tz_minute = n % 100
+    } else {
+        return false
+    }
+    return true
+}
+
+/// DateParser::Parse: the eight outputs (year, month, day, hour, minute,
+/// second, ms, UTC offset in seconds or NaN), or None.
+fn parse_fields(s: [i64]) -> Option[[f64]] {
+    var sc = JsDateScanner{ s: s, index: 0, ch: 0, next: tok(tag_end(), 0, 0 - 1) }
+    advance(sc)
+    sc.next = scan(sc)
+    var p = JsDateParts{ day: [], named_month: k_none(), iso_date: false, time: [], hour_offset: k_none(), tz_sign: k_none(), tz_hour: k_none(), tz_minute: k_none() }
+    var token = es5_date(sc, p)
+    if token.tag == tag_invalid() {
+        return None
+    }
+    var has_read_number = p.day.len() > 0
+    while token.tag != tag_end() {
+        if is_number(token) {
+            has_read_number = true
+            if not legacy_number(sc, p, token.value) {
+                return None
+            }
+        } else if is_keyword(token) {
+            if token.tag == kw_am_pm() and p.time.len() > 0 {
+                p.hour_offset = token.value
+            } else if token.tag == kw_month() {
+                p.named_month = token.value
+                let _s = skip_symbol(sc, 45)
+            } else if token.tag == kw_zone() and has_read_number {
+                tz_set(p, token.value)
+            } else if has_read_number or is_number(sc.next) {
+                return None
+            }
+        } else if is_sign(token) and (tz_is_utc(p) or p.time.len() > 0) {
+            has_read_number = true
+            if not legacy_sign(sc, p, token) {
+                return None
+            }
+        } else if (is_sign(token) or is_symbol(token, 41)) and has_read_number {
+            return None
+        }
+        token = next_token(sc)
+    }
+    return match (write_day(p), write_time(p), write_tz(p)) {
+        (Some(d), Some(t), Some(offset)) -> Some([d.0.as_f64(), d.1.as_f64(), d.2.as_f64(), t.0.as_f64(), t.1.as_f64(), t.2.as_f64(), t.3.as_f64(), offset])
+        _ -> None
+    }
+}
+
+/// `Date.parse(s)`: the time value, NaN when V8 rejects the string.
+pub fn parse(s: [i64]) -> f64 {
+    let out = match parse_fields(s) {
+        Some(o) -> o
+        None -> return nan()
+    }
+    var date = make_date(make_day(out[0], out[1], out[2]), make_time(out[3], out[4], out[5], out[6]))
+    if out[7] != out[7] {
+        // Local time, here UTC; V8 first checks it is near the range.
+        if not (date >= -8640002592000000.0 and date <= 8640002592000000.0) {
+            return nan()
+        }
+    } else {
+        date = date - out[7] * 1000.0
+    }
+    return time_clip(date)
+}

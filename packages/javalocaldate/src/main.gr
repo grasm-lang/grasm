@@ -1,0 +1,437 @@
+// Java's `java.time.LocalDate`, as Java 17 parses, prints and computes
+// it: `LocalDate.parse` (ISO, strict), `of`, `ofEpochDay`, `toString`,
+// `plusDays`, `plusWeeks`, `plusMonths`, `plusYears`, `withYear`,
+// `withMonth`, `withDayOfMonth`, `until`, and the calendar queries.
+//
+// Java services store and exchange dates in ISO text through `LocalDate`,
+// and a peer has to accept, refuse and compute what Java does:
+//
+//   - Parsing is `yyyy-MM-dd`, strictly: the year takes four to ten digits
+//     and a `+` exactly when it has more than four; month and day are two
+//     digits; a sign anywhere else, `-0000`, or trailing text is an error
+//     "Text '...' could not be parsed at index N" (or ", unparsed text
+//     found at index N"); a field out of range or a day the month lacks
+//     is "Text '...' could not be parsed: Invalid date 'APRIL 31'" and the
+//     like. Text past 64 characters is shortened in the message.
+//   - Years run from -999999999 to 999999999 and print with a sign past
+//     four digits (`+10000-01-01`, `-0001-01-01`).
+//   - Adding months or years keeps the day if the month has it and takes
+//     the month's last day if not; `until` counts whole units, months by
+//     the day of the month.
+
+/// A date: year, month (1-12), day.
+type JavaDate = { year: i64, month: i64, day: i64 }
+
+/// DateTimeParseException, DateTimeException or ArithmeticException: the
+/// class's simple name and the message.
+type LocalDateError = | LocalDateError(kind: str, msg: str)
+
+pub fn error_kind(e: LocalDateError) -> str {
+    return match e {
+        LocalDateError(k, _m) -> k
+    }
+}
+
+pub fn error_text(e: LocalDateError) -> str {
+    return match e {
+        LocalDateError(_k, m) -> m
+    }
+}
+
+fn dte(msg: str) -> LocalDateError {
+    return LocalDateError("DateTimeException", msg)
+}
+
+fn year_min() -> i64 {
+    return 0 - 999999999
+}
+
+fn year_max() -> i64 {
+    return 999999999
+}
+
+fn check_year(y: i64) -> i64 ! LocalDateError {
+    if y < year_min() or y > year_max() {
+        fail(dte("Invalid value for Year (valid values -999999999 - 999999999): " + y.to_str()))
+    }
+    return y
+}
+
+fn check_month(m: i64) -> i64 ! LocalDateError {
+    if m < 1 or m > 12 {
+        fail(dte("Invalid value for MonthOfYear (valid values 1 - 12): " + m.to_str()))
+    }
+    return m
+}
+
+fn check_day(d: i64) -> i64 ! LocalDateError {
+    if d < 1 or d > 31 {
+        fail(dte("Invalid value for DayOfMonth (valid values 1 - 28/31): " + d.to_str()))
+    }
+    return d
+}
+
+pub fn is_leap(year: i64) -> bool {
+    return year % 4 == 0 and (year % 100 != 0 or year % 400 == 0)
+}
+
+fn month_length(year: i64, month: i64) -> i64 {
+    return if month == 2 { if is_leap(year) { 29 } else { 28 } } else if month == 4 or month == 6 or month == 9 or month == 11 { 30 } else { 31 }
+}
+
+fn month_name(m: i64) -> str {
+    return ["JANUARY", "FEBRUARY", "MARCH", "APRIL", "MAY", "JUNE", "JULY", "AUGUST", "SEPTEMBER", "OCTOBER", "NOVEMBER", "DECEMBER"][m - 1]
+}
+
+/// `LocalDate.of(year, month, day)`.
+pub fn of(year: i64, month: i64, day: i64) -> JavaDate ! LocalDateError {
+    try check_year(year)
+    try check_month(month)
+    try check_day(day)
+    if day > month_length(year, month) {
+        if day == 29 {
+            fail(dte("Invalid date 'February 29' as '" + year.to_str() + "' is not a leap year"))
+        }
+        fail(dte("Invalid date '" + month_name(month) + " " + day.to_str() + "'"))
+    }
+    return JavaDate{ year: year, month: month, day: day }
+}
+
+fn previous_valid(year: i64, month: i64, day: i64) -> JavaDate {
+    let len = month_length(year, month)
+    return JavaDate{ year: year, month: month, day: if day > len { len } else { day } }
+}
+
+/// `date.toString()`.
+pub fn to_string(d: JavaDate) -> str {
+    let a = if d.year < 0 { 0 - d.year } else { d.year }
+    var y = ""
+    if a < 1000 {
+        let padded = (a + 10000).to_str()
+        y = (if d.year < 0 { "-" } else { "" }) + padded.substr(1, 4)
+    } else {
+        y = (if d.year > 9999 { "+" } else { "" }) + d.year.to_str()
+    }
+    return y + (if d.month < 10 { "-0" } else { "-" }) + d.month.to_str() + (if d.day < 10 { "-0" } else { "-" }) + d.day.to_str()
+}
+
+fn floor_div(a: i64, b: i64) -> i64 {
+    let q = a / b
+    return if (a % b != 0) and ((a < 0) != (b < 0)) { q - 1 } else { q }
+}
+
+fn floor_mod(a: i64, b: i64) -> i64 {
+    return a - floor_div(a, b) * b
+}
+
+fn days_0000_to_1970() -> i64 {
+    return 719528
+}
+
+/// `date.toEpochDay()`.
+pub fn to_epoch_day(d: JavaDate) -> i64 {
+    let y = d.year
+    let m = d.month
+    var total = 365 * y
+    if y >= 0 {
+        total = total + (y + 3) / 4 - (y + 99) / 100 + (y + 399) / 400
+    } else {
+        total = total - (y / (0 - 4) - y / (0 - 100) + y / (0 - 400))
+    }
+    total = total + (367 * m - 362) / 12
+    total = total + d.day - 1
+    if m > 2 {
+        total = total - 1
+        if not is_leap(y) {
+            total = total - 1
+        }
+    }
+    return total - days_0000_to_1970()
+}
+
+/// `LocalDate.ofEpochDay(n)`.
+pub fn of_epoch_day(epoch_day: i64) -> JavaDate ! LocalDateError {
+    if epoch_day < 0 - 365243219162 or epoch_day > 365241780471 {
+        fail(dte("Invalid value for EpochDay (valid values -365243219162 - 365241780471): " + epoch_day.to_str()))
+    }
+    var zero_day = epoch_day + days_0000_to_1970() - 60
+    var adjust = 0
+    if zero_day < 0 {
+        let cycles = (zero_day + 1) / 146097 - 1
+        adjust = cycles * 400
+        zero_day = zero_day + (0 - cycles) * 146097
+    }
+    var year_est = (400 * zero_day + 591) / 146097
+    var doy_est = zero_day - (365 * year_est + year_est / 4 - year_est / 100 + year_est / 400)
+    if doy_est < 0 {
+        year_est = year_est - 1
+        doy_est = zero_day - (365 * year_est + year_est / 4 - year_est / 100 + year_est / 400)
+    }
+    year_est = year_est + adjust
+    let march_doy0 = doy_est
+    let march_month0 = (march_doy0 * 5 + 2) / 153
+    let month = (march_month0 + 2) % 12 + 1
+    let dom = march_doy0 - (march_month0 * 306 + 5) / 10 + 1
+    year_est = year_est + march_month0 / 10
+    return JavaDate{ year: try check_year(year_est), month: month, day: dom }
+}
+
+fn long_overflow() -> LocalDateError {
+    return LocalDateError("ArithmeticException", "long overflow")
+}
+
+/// Math.addExact for longs.
+fn add_exact(a: i64, b: i64) -> i64 ! LocalDateError {
+    if (b > 0 and a > 9223372036854775807 - b) or (b < 0 and a < (0 - 9223372036854775807 - 1) - b) {
+        fail(long_overflow())
+    }
+    return a + b
+}
+
+/// `date.plusDays(n)`.
+pub fn plus_days(d: JavaDate, n: i64) -> JavaDate ! LocalDateError {
+    if n == 0 {
+        return d
+    }
+    // dom = day + n can only overflow when n is near the top of a long.
+    if n <= 9223372036854775807 - 31 {
+        let dom = d.day + n
+        if dom > 0 and dom <= 28 {
+            return JavaDate{ year: d.year, month: d.month, day: dom }
+        }
+        if dom > 28 and dom <= 59 {
+            let len = month_length(d.year, d.month)
+            if dom <= len {
+                return JavaDate{ year: d.year, month: d.month, day: dom }
+            }
+            if d.month < 12 {
+                return JavaDate{ year: d.year, month: d.month + 1, day: dom - len }
+            }
+            try check_year(d.year + 1)
+            return JavaDate{ year: d.year + 1, month: 1, day: dom - len }
+        }
+    }
+    return try of_epoch_day(try add_exact(to_epoch_day(d), n))
+}
+
+/// `date.plusWeeks(n)`.
+pub fn plus_weeks(d: JavaDate, n: i64) -> JavaDate ! LocalDateError {
+    if n > 1317624576693539401 or n < 0 - 1317624576693539401 {
+        fail(long_overflow())
+    }
+    return try plus_days(d, n * 7)
+}
+
+/// `date.plusMonths(n)`.
+pub fn plus_months(d: JavaDate, n: i64) -> JavaDate ! LocalDateError {
+    if n == 0 {
+        return d
+    }
+    let count = d.year * 12 + (d.month - 1)
+    if (n > 0 and count > 9223372036854775807 - n) or (n < 0 and count < (0 - 9223372036854775807 - 1) - n) {
+        // Java's "safe overflow" wraps here, and the year it checks is then
+        // far out of range; it fails the same way.
+        fail(dte("Invalid value for Year (valid values -999999999 - 999999999): " + floor_div(count + n, 12).to_str()))
+    }
+    let calc = count + n
+    let year = try check_year(floor_div(calc, 12))
+    return previous_valid(year, floor_mod(calc, 12) + 1, d.day)
+}
+
+/// `date.plusYears(n)`.
+pub fn plus_years(d: JavaDate, n: i64) -> JavaDate ! LocalDateError {
+    if n == 0 {
+        return d
+    }
+    let year = try check_year(d.year + n)
+    return previous_valid(year, d.month, d.day)
+}
+
+/// `date.withYear(y)`.
+pub fn with_year(d: JavaDate, y: i64) -> JavaDate ! LocalDateError {
+    if y == d.year {
+        return d
+    }
+    try check_year(y)
+    return previous_valid(y, d.month, d.day)
+}
+
+/// `date.withMonth(m)`.
+pub fn with_month(d: JavaDate, m: i64) -> JavaDate ! LocalDateError {
+    if m == d.month {
+        return d
+    }
+    try check_month(m)
+    return previous_valid(d.year, m, d.day)
+}
+
+/// `date.withDayOfMonth(day)`.
+pub fn with_day_of_month(d: JavaDate, day: i64) -> JavaDate ! LocalDateError {
+    if day == d.day {
+        return d
+    }
+    return try of(d.year, d.month, day)
+}
+
+/// `date.getDayOfWeek()`: 1 (MONDAY) to 7 (SUNDAY).
+pub fn day_of_week(d: JavaDate) -> i64 {
+    return floor_mod(to_epoch_day(d) + 3, 7) + 1
+}
+
+pub fn day_of_week_name(d: JavaDate) -> str {
+    return ["MONDAY", "TUESDAY", "WEDNESDAY", "THURSDAY", "FRIDAY", "SATURDAY", "SUNDAY"][day_of_week(d) - 1]
+}
+
+/// `date.getDayOfYear()`.
+pub fn day_of_year(d: JavaDate) -> i64 {
+    let firsts = [1, 32, 60, 91, 121, 152, 182, 213, 244, 274, 305, 335]
+    let leap = if is_leap(d.year) and d.month > 2 { 1 } else { 0 }
+    return firsts[d.month - 1] + leap + d.day - 1
+}
+
+pub fn length_of_month(d: JavaDate) -> i64 {
+    return month_length(d.year, d.month)
+}
+
+pub fn length_of_year(d: JavaDate) -> i64 {
+    return if is_leap(d.year) { 366 } else { 365 }
+}
+
+/// `start.until(end, unit)` for DAYS, WEEKS, MONTHS, YEARS, DECADES,
+/// CENTURIES and MILLENNIA.
+pub fn until(start: JavaDate, end: JavaDate, unit: str) -> i64 {
+    if unit == "DAYS" or unit == "WEEKS" {
+        let days = to_epoch_day(end) - to_epoch_day(start)
+        return if unit == "DAYS" { days } else { days / 7 }
+    }
+    let p1 = (start.year * 12 + start.month - 1) * 32 + start.day
+    let p2 = (end.year * 12 + end.month - 1) * 32 + end.day
+    let months = (p2 - p1) / 32
+    return if unit == "MONTHS" { months } else if unit == "YEARS" { months / 12 } else if unit == "DECADES" { months / 120 } else if unit == "CENTURIES" {
+        months / 1200
+    } else { months / 12000 }
+}
+
+// ---- LocalDate.parse
+
+/// One number of ISO_LOCAL_DATE: from `pos`, `min` to `max` digits, the
+/// year's sign rules when `year`. The value and where it ended, or the
+/// error index (as the complement, like Java's parsers).
+fn number(t: [i64], pos0: i64, min: i64, max: i64, year: bool) -> (i64, i64) {
+    if pos0 == t.len() {
+        return (0, 0 - 1 - pos0)
+    }
+    var pos = pos0
+    var negative = false
+    var positive = false
+    let c = t[pos]
+    if c == 43 or c == 45 {
+        if not year {
+            return (0, 0 - 1 - pos)
+        }
+        positive = c == 43
+        negative = c == 45
+        pos = pos + 1
+    }
+    let start = pos
+    if start + min > t.len() {
+        return (0, 0 - 1 - start)
+    }
+    let stop = if start + max < t.len() { start + max } else { t.len() }
+    var total = 0
+    while pos < stop {
+        let digit = t[pos] - 48
+        if digit < 0 or digit > 9 {
+            break
+        }
+        total = total * 10 + digit
+        pos = pos + 1
+    }
+    if pos < start + min {
+        return (0, 0 - 1 - start)
+    }
+    if negative {
+        if total == 0 {
+            return (0, 0 - 1 - (start - 1))
+        }
+        total = 0 - total
+    } else if year {
+        let len = pos - start
+        if positive and len <= min {
+            return (0, 0 - 1 - (start - 1))
+        }
+        if not positive and len > min {
+            return (0, 0 - 1 - start)
+        }
+    }
+    return (total, pos)
+}
+
+/// The text as Java quotes it in the message: up to 64 UTF-16 units, then
+/// `...`.
+fn abbreviated(text: str, units: [i64]) -> str {
+    if units.len() <= 64 {
+        return text
+    }
+    var out = ""
+    var i = 0
+    while i < 64 {
+        let c = units[i]
+        if c >= 55296 and c <= 56319 and i + 1 < units.len() and i + 1 < 64 {
+            out = out + (65536 + (c - 55296).shl(10) + units[i + 1] - 56320).to_char()
+            i = i + 2
+        } else {
+            out = out + (if c >= 55296 and c <= 57343 { 65533 } else { c }).to_char()
+            i = i + 1
+        }
+    }
+    return out + "..."
+}
+
+fn utf16(s: str) -> [i64] {
+    var out: [i64] = []
+    for c in s.codes() {
+        if c >= 65536 {
+            out.push(55296 + (c - 65536).shr(10))
+            out.push(56320 + (c - 65536).bit_and(1023))
+        } else {
+            out.push(c)
+        }
+    }
+    return out
+}
+
+fn at_index(shown: str, i: i64) -> LocalDateError {
+    return LocalDateError("DateTimeParseException", shown + " at index " + i.to_str())
+}
+
+/// `LocalDate.parse(text)`.
+pub fn parse(text: str) -> JavaDate ! LocalDateError {
+    let t = utf16(text)
+    let shown = "Text '" + abbreviated(text, t) + "' could not be parsed"
+    let (y, p1) = number(t, 0, 4, 10, true)
+    if p1 < 0 {
+        fail(at_index(shown, 0 - 1 - p1))
+    }
+    if p1 >= t.len() or t[p1] != 45 {
+        fail(at_index(shown, p1))
+    }
+    let (m, p2) = number(t, p1 + 1, 2, 2, false)
+    if p2 < 0 {
+        fail(at_index(shown, 0 - 1 - p2))
+    }
+    if p2 >= t.len() or t[p2] != 45 {
+        fail(at_index(shown, p2))
+    }
+    let (d, p3) = number(t, p2 + 1, 2, 2, false)
+    if p3 < 0 {
+        fail(at_index(shown, 0 - 1 - p3))
+    }
+    if p3 < t.len() {
+        fail(LocalDateError("DateTimeParseException", shown + ", unparsed text found at index " + p3.to_str()))
+    }
+    return match of(y, m, d) {
+        Ok(date) -> date
+        Err(e) -> fail(LocalDateError("DateTimeParseException", shown + ": " + error_text(e)))
+    }
+}

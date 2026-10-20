@@ -1,0 +1,874 @@
+// Node's `path.win32`, as Node 25 computes it: `normalize`, `join`,
+// `resolve`, `relative`, `toNamespacedPath`, `dirname`, `basename`,
+// `extname`, `parse`, `format` and `isAbsolute`, on any operating system.
+//
+// Build tools, installers and CI scripts written in JavaScript compute
+// Windows paths with `path.win32` wherever they run, and a program that
+// has to agree with them -- reading a lockfile, checking a generated
+// manifest -- needs the same answers, quirks included:
+//
+//   - `\` and `/` both separate; `C:` alone is drive-relative; `\\server\
+//     share` is a UNC root, and `\\.\` and `\\?\` are device roots.
+//   - `normalize` and `join` keep a Windows device name (CON, PRN, AUX,
+//     NUL, COM1-9, LPT1-9, COM¹²³, LPT¹²³) from being read as a drive:
+//     `CON:x` becomes `.\CON:x`. Node looks at the text before the first
+//     colon, or, with no colon, at all of it but the last character, so
+//     `normalize("CONx")` is `.\CONx` too.
+//   - `relative` compares paths with JavaScript's `toLowerCase`, by
+//     UTF-16 index, and takes the answer's text from the original.
+//   - `resolve` starts from a working directory, given here, as Node's
+//     `process.cwd()` on a POSIX host: `/home/me` is read as `\home\me`,
+//     and a drive-relative `C:x` lands under it (`C:\home\me\x`), as no
+//     `=C:` variable says otherwise.
+//
+// Positions are UTF-16 code units, as in JavaScript; a result that would
+// split a surrogate pair has U+FFFD there, as Node's UTF-8 output does.
+
+/// What `parse` returns and `format` takes.
+type Win32Path = { root: str, dir: str, base: str, ext: str, name: str }
+
+pub fn sep() -> str {
+    return "\\"
+}
+
+pub fn delimiter() -> str {
+    return ";"
+}
+
+/// A string's UTF-16 code units.
+fn units(s: str) -> [i64] {
+    var out: [i64] = []
+    for c in s.codes() {
+        if c >= 65536 {
+            out.push(55296 + (c - 65536).shr(10))
+            out.push(56320 + (c - 65536).bit_and(1023))
+        } else {
+            out.push(c)
+        }
+    }
+    return out
+}
+
+/// Code units back to text; a lone surrogate becomes U+FFFD.
+fn text(u: [i64]) -> str {
+    var out: [i64] = []
+    var i = 0
+    while i < u.len() {
+        let c = u[i]
+        if c >= 55296 and c <= 56319 and i + 1 < u.len() and u[i + 1] >= 56320 and u[i + 1] <= 57343 {
+            out.push(65536 + (c - 55296).shl(10) + u[i + 1] - 56320)
+            i = i + 2
+        } else {
+            out.push(if c >= 55296 and c <= 57343 { 65533 } else { c })
+            i = i + 1
+        }
+    }
+    return out.map(|c| c.to_char()).join("")
+}
+
+/// `charCodeAt`: -1 past either end (NaN, which equals nothing).
+fn code(u: [i64], i: i64) -> i64 {
+    return if i >= 0 and i < u.len() { u[i] } else { 0 - 1 }
+}
+
+/// `slice(start, end)` with JavaScript's negative and out-of-range ends.
+fn slice(u: [i64], start0: i64, end0: i64) -> [i64] {
+    let n = u.len()
+    let start = if start0 < 0 { max(n + start0, 0) } else { min(start0, n) }
+    let end = if end0 < 0 { max(n + end0, 0) } else { min(end0, n) }
+    return if start >= end { [] } else { u.slice(start, end) }
+}
+
+fn max(a: i64, b: i64) -> i64 {
+    return if a > b { a } else { b }
+}
+
+fn min(a: i64, b: i64) -> i64 {
+    return if a < b { a } else { b }
+}
+
+fn index_of(u: [i64], c: i64, from: i64) -> i64 {
+    var i = max(from, 0)
+    while i < u.len() {
+        if u[i] == c {
+            return i
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+fn is_sep(c: i64) -> bool {
+    return c == 47 or c == 92
+}
+
+fn is_device_root(c: i64) -> bool {
+    return (c >= 65 and c <= 90) or (c >= 97 and c <= 122)
+}
+
+fn lower_units(u: [i64]) -> [i64] {
+    return units(text(u).to_lower())
+}
+
+/// isWindowsReservedName: the text before `colon` (a negative index
+/// counting from the end, as `slice` does), upper-cased, is a device name.
+fn is_reserved(u: [i64], colon: i64) -> bool {
+    let part = text(slice(u, 0, colon)).to_upper()
+    let names = ["CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6",
+        "LPT7", "LPT8", "LPT9", "COM¹", "COM²", "COM³", "LPT¹", "LPT²", "LPT³"]
+    return names.contains(part)
+}
+
+/// normalizeString: `.` and `..` resolved, separators made `\`.
+fn normalize_string(path: [i64], above_root: bool) -> [i64] {
+    var res: [i64] = []
+    var last_len = 0
+    var last_slash = 0 - 1
+    var dots = 0
+    var c = 0
+    for i in 0..(path.len() + 1) {
+        if i < path.len() {
+            c = path[i]
+        } else if is_sep(c) {
+            break
+        } else {
+            c = 47
+        }
+        if is_sep(c) {
+            if last_slash == i - 1 or dots == 1 {
+                // nothing between two separators, or a `.`
+            } else if dots == 2 {
+                let parent_is_dots = res.len() >= 2 and last_len == 2 and res[res.len() - 1] == 46 and res[res.len() - 2] == 46
+                if not parent_is_dots and res.len() > 2 {
+                    let cut = res.len() - last_len - 1
+                    if cut == 0 - 1 {
+                        res = []
+                        last_len = 0
+                    } else {
+                        res = res.slice(0, cut)
+                        last_len = res.len() - 1 - last_index(res, 92)
+                    }
+                    last_slash = i
+                    dots = 0
+                    continue
+                }
+                if not parent_is_dots and res.len() != 0 {
+                    res = []
+                    last_len = 0
+                    last_slash = i
+                    dots = 0
+                    continue
+                }
+                if above_root {
+                    res = res + (if res.len() > 0 { [92, 46, 46] } else { [46, 46] })
+                    last_len = 2
+                }
+            } else {
+                res = res + (if res.len() > 0 { [92] } else { [] }) + path.slice(last_slash + 1, i)
+                last_len = i - last_slash - 1
+            }
+            last_slash = i
+            dots = 0
+        } else if c == 46 and dots != 0 - 1 {
+            dots = dots + 1
+        } else {
+            dots = 0 - 1
+        }
+    }
+    return res
+}
+
+fn last_index(u: [i64], c: i64) -> i64 {
+    var i = u.len() - 1
+    while i >= 0 {
+        if u[i] == c {
+            return i
+        }
+        i = i - 1
+    }
+    return 0 - 1
+}
+
+/// After `\\`: the end of the server part, of the separators after it,
+/// and of the share part (each -1 where there is none).
+fn unc_parts(p: [i64]) -> (i64, i64, i64) {
+    var j = 2
+    while j < p.len() and not is_sep(p[j]) {
+        j = j + 1
+    }
+    if not (j < p.len() and j != 2) {
+        return (0 - 1, 0 - 1, 0 - 1)
+    }
+    let server_end = j
+    while j < p.len() and is_sep(p[j]) {
+        j = j + 1
+    }
+    if not (j < p.len() and j != server_end) {
+        return (server_end, 0 - 1, 0 - 1)
+    }
+    let share_start = j
+    while j < p.len() and not is_sep(p[j]) {
+        j = j + 1
+    }
+    return (server_end, share_start, j)
+}
+
+fn bs2() -> [i64] {
+    return [92, 92]
+}
+
+/// normalize's root: (root end, device, absolute), or the whole answer
+/// for a bare `\\server\share`.
+fn normalize_root(p: [i64]) -> (i64, Option[[i64]], bool, Option[[i64]]) {
+    let c0 = p[0]
+    if is_sep(c0) {
+        if not is_sep(p[1]) {
+            return (1, None, true, None)
+        }
+        let (server_end, share_start, j) = unc_parts(p)
+        if share_start < 0 {
+            return (0, None, true, None)
+        }
+        let first = slice(p, 2, server_end)
+        if first == [46] or first == [63] {
+            let colon = index_of(p, 58, 0)
+            let possible = slice(p, 4, colon + 1)
+            if is_reserved(possible, possible.len() - 1) {
+                return (4 + possible.len(), Some(bs2() + [63, 92] + possible), true, None)
+            }
+            return (4, Some(bs2() + first), true, None)
+        }
+        if j == p.len() {
+            return (0, None, true, Some(bs2() + first + [92] + slice(p, share_start, p.len()) + [92]))
+        }
+        return (j, Some(bs2() + first + [92] + slice(p, share_start, j)), true, None)
+    }
+    let colon = index_of(p, 58, 0)
+    if colon > 0 {
+        if is_device_root(c0) and colon == 1 {
+            let abs = p.len() > 2 and is_sep(p[2])
+            return (if abs { 3 } else { 2 }, Some(slice(p, 0, 2)), abs, None)
+        }
+        if is_reserved(p, colon) {
+            return (colon + 1, Some(slice(p, 0, colon + 1)), false, None)
+        }
+    }
+    return (0, None, false, None)
+}
+
+fn normalize_units(p: [i64]) -> [i64] {
+    let len = p.len()
+    if len == 0 {
+        return [46]
+    }
+    if len == 1 {
+        return if p[0] == 47 { [92] } else { p }
+    }
+    let (root_end, device, absolute, whole) = normalize_root(p)
+    match whole {
+        Some(w) -> return w
+        None -> {}
+    }
+    var tail = if root_end < len { normalize_string(slice(p, root_end, len), not absolute) } else { [] }
+    if tail.len() == 0 and not absolute {
+        tail = [46]
+    }
+    if tail.len() > 0 and is_sep(p[len - 1]) {
+        tail.push(92)
+    }
+    if not absolute and device.is_none() and index_of(p, 58, 0) >= 0 {
+        if tail.len() >= 2 and is_device_root(tail[0]) and tail[1] == 58 {
+            return [46, 92] + tail
+        }
+        var index = index_of(p, 58, 0)
+        while index != 0 - 1 {
+            if index == len - 1 or is_sep(code(p, index + 1)) {
+                return [46, 92] + tail
+            }
+            index = index_of(p, 58, index + 1)
+        }
+    }
+    if is_reserved(p, index_of(p, 58, 0)) {
+        return [46, 92] + (device ?? []) + tail
+    }
+    return match device {
+        None -> if absolute { [92] + tail } else { tail }
+        Some(d) -> if absolute { d + [92] + tail } else { d + tail }
+    }
+}
+
+/// `path.win32.normalize(path)`.
+pub fn normalize(path: str) -> str {
+    return text(normalize_units(units(path)))
+}
+
+/// `path.win32.isAbsolute(path)`.
+pub fn is_absolute(path: str) -> bool {
+    let p = units(path)
+    if p.len() == 0 {
+        return false
+    }
+    return is_sep(p[0]) or (p.len() > 2 and is_device_root(p[0]) and p[1] == 58 and is_sep(p[2]))
+}
+
+/// `path.win32.join(...paths)`.
+pub fn join(paths: [str]) -> str {
+    let parts = paths.filter(|s| s.len() > 0).map(|s| units(s))
+    if parts.len() == 0 {
+        return "."
+    }
+    let first = parts[0]
+    var joined: [i64] = []
+    for k in 0..parts.len() {
+        if k > 0 {
+            joined.push(92)
+        }
+        joined = joined + parts[k]
+    }
+    var needs_replace = true
+    var slashes = 0
+    if is_sep(code(first, 0)) {
+        slashes = 1
+        if first.len() > 1 and is_sep(first[1]) {
+            slashes = 2
+            if first.len() > 2 {
+                if is_sep(first[2]) {
+                    slashes = 3
+                } else {
+                    needs_replace = false
+                }
+            }
+        }
+    }
+    if needs_replace {
+        while slashes < joined.len() and is_sep(joined[slashes]) {
+            slashes = slashes + 1
+        }
+        if slashes >= 2 {
+            joined = [92] + slice(joined, slashes, joined.len())
+        }
+    }
+    if backslash_parts(joined).filter(|q| index_of(q, 58, 0) != 0 - 1 and is_reserved(q, index_of(q, 58, 0))).len() > 0 {
+        return text(joined.map(|c| if c == 47 { 92 } else { c }))
+    }
+    return text(normalize_units(joined))
+}
+
+/// The non-empty runs between backslashes (only backslashes).
+fn backslash_parts(u: [i64]) -> [[i64]] {
+    var out: [[i64]] = []
+    var part: [i64] = []
+    for c in u {
+        if c == 92 {
+            if part.len() > 0 {
+                out.push(part)
+            }
+            part = []
+        } else {
+            part.push(c)
+        }
+    }
+    if part.len() > 0 {
+        out.push(part)
+    }
+    return out
+}
+
+/// resolve's root of one path: (root end, device, absolute).
+fn resolve_root(path: [i64]) -> (i64, [i64], bool) {
+    let len = path.len()
+    let c = code(path, 0)
+    if len == 1 {
+        return if is_sep(c) { (1, [], true) } else { (0, [], false) }
+    }
+    if is_sep(c) {
+        if not is_sep(path[1]) {
+            return (1, [], true)
+        }
+        let (server_end, share_start, j) = unc_parts(path)
+        if share_start < 0 {
+            return (0, [], true)
+        }
+        let first = slice(path, 2, server_end)
+        if first != [46] and first != [63] {
+            return (j, bs2() + first + [92] + slice(path, share_start, j), true)
+        }
+        return (4, bs2() + first, true)
+    }
+    if is_device_root(c) and code(path, 1) == 58 {
+        let abs = len > 2 and is_sep(path[2])
+        return (if abs { 3 } else { 2 }, slice(path, 0, 2), abs)
+    }
+    return (0, [], false)
+}
+
+fn resolve_units(paths: [str], cwd: str) -> [i64] {
+    var device: [i64] = []
+    var tail: [i64] = []
+    var absolute = false
+    var i = paths.len() - 1
+    while i >= 0 - 1 {
+        var path: [i64] = []
+        if i >= 0 {
+            path = units(paths[i])
+            if path.len() == 0 {
+                i = i - 1
+                continue
+            }
+        } else {
+            path = units(cwd)
+            if device.len() == 0 {
+                if paths.len() == 0 or (paths.len() == 1 and (paths[0] == "" or paths[0] == ".") and is_sep(code(path, 0))) {
+                    return path.map(|c| if c == 47 { 92 } else { c })
+                }
+            } else if lower_units(slice(path, 0, 2)) != lower_units(device) and code(path, 2) == 92 {
+                // process.env["=C:"], the drive's own directory, is unset.
+                path = device + [92]
+            }
+        }
+        let (root_end, here, abs) = resolve_root(path)
+        if here.len() > 0 {
+            if device.len() > 0 {
+                if lower_units(here) != lower_units(device) {
+                    i = i - 1
+                    continue
+                }
+            } else {
+                device = here
+            }
+        }
+        if absolute {
+            if device.len() > 0 {
+                break
+            }
+        } else {
+            tail = slice(path, root_end, path.len()) + [92] + tail
+            absolute = abs
+            if abs and device.len() > 0 {
+                break
+            }
+        }
+        i = i - 1
+    }
+    tail = normalize_string(tail, not absolute)
+    if absolute {
+        return device + [92] + tail
+    }
+    let out = device + tail
+    return if out.len() == 0 { [46] } else { out }
+}
+
+/// `path.win32.resolve(...paths)` with `process.cwd()` answering `cwd`.
+pub fn resolve(paths: [str], cwd: str) -> str {
+    return text(resolve_units(paths, cwd))
+}
+
+fn trim_backslashes(u: [i64]) -> (i64, i64) {
+    var start = 0
+    while start < u.len() and u[start] == 92 {
+        start = start + 1
+    }
+    var end = u.len()
+    while end - 1 > start and u[end - 1] == 92 {
+        end = end - 1
+    }
+    return (start, end)
+}
+
+/// relative's path when lower-casing changed a length: by segments.
+fn relative_by_parts(from_orig: [i64], to_orig: [i64]) -> [i64] {
+    var fs = split_backslash(from_orig)
+    var ts = split_backslash(to_orig)
+    if fs[fs.len() - 1].len() == 0 {
+        fs.pop()
+    }
+    if ts[ts.len() - 1].len() == 0 {
+        ts.pop()
+    }
+    let length = min(fs.len(), ts.len())
+    var i = 0
+    while i < length and lower_units(fs[i]) == lower_units(ts[i]) {
+        i = i + 1
+    }
+    if i == 0 {
+        return to_orig
+    }
+    var out: [i64] = []
+    if i == length {
+        if ts.len() > length {
+            return join_backslash(ts.slice(i, ts.len()))
+        }
+        if fs.len() > length {
+            for _k in 0..(fs.len() - 1 - i) {
+                out = out + [46, 46, 92]
+            }
+            return out + [46, 46]
+        }
+        return []
+    }
+    for _k in 0..(fs.len() - i) {
+        out = out + [46, 46, 92]
+    }
+    return out + join_backslash(ts.slice(i, ts.len()))
+}
+
+fn split_backslash(u: [i64]) -> [[i64]] {
+    var out: [[i64]] = []
+    var part: [i64] = []
+    for c in u {
+        if c == 92 {
+            out.push(part)
+            part = []
+        } else {
+            part.push(c)
+        }
+    }
+    out.push(part)
+    return out
+}
+
+fn join_backslash(parts: [[i64]]) -> [i64] {
+    var out: [i64] = []
+    for k in 0..parts.len() {
+        if k > 0 {
+            out.push(92)
+        }
+        out = out + parts[k]
+    }
+    return out
+}
+
+/// `path.win32.relative(from, to)`, both resolved against `cwd`.
+pub fn relative(from: str, to: str, cwd: str) -> str {
+    if from == to {
+        return ""
+    }
+    let fo = resolve_units([from], cwd)
+    let tor = resolve_units([to], cwd)
+    if fo == tor {
+        return ""
+    }
+    let f = lower_units(fo)
+    let t = lower_units(tor)
+    if f == t {
+        return ""
+    }
+    if fo.len() != f.len() or tor.len() != t.len() {
+        return text(relative_by_parts(fo, tor))
+    }
+    return text(relative_units(f, t, tor))
+}
+
+fn relative_units(f: [i64], t: [i64], tor: [i64]) -> [i64] {
+    let (fstart, fend) = trim_backslashes(f)
+    let (tstart0, tend) = trim_backslashes(t)
+    var tstart = tstart0
+    let flen = fend - fstart
+    let tlen = tend - tstart
+    let length = min(flen, tlen)
+    var common = 0 - 1
+    var i = 0
+    while i < length {
+        let fc = code(f, fstart + i)
+        if fc != code(t, tstart + i) {
+            break
+        }
+        if fc == 92 {
+            common = i
+        }
+        i = i + 1
+    }
+    if i != length {
+        if common == 0 - 1 {
+            return tor
+        }
+    } else {
+        if tlen > length {
+            if code(t, tstart + i) == 92 {
+                return slice(tor, tstart + i + 1, tor.len())
+            }
+            if i == 2 {
+                return slice(tor, tstart + i, tor.len())
+            }
+        }
+        if flen > length {
+            if code(f, fstart + i) == 92 {
+                common = i
+            } else if i == 2 {
+                common = 3
+            }
+        }
+        if common == 0 - 1 {
+            common = 0
+        }
+    }
+    var out: [i64] = []
+    var k = fstart + common + 1
+    while k <= fend {
+        if k == fend or code(f, k) == 92 {
+            out = out + (if out.len() == 0 { [46, 46] } else { [92, 46, 46] })
+        }
+        k = k + 1
+    }
+    tstart = tstart + common
+    if out.len() > 0 {
+        return out + slice(tor, tstart, tend)
+    }
+    if code(tor, tstart) == 92 {
+        tstart = tstart + 1
+    }
+    return slice(tor, tstart, tend)
+}
+
+/// `path.win32.toNamespacedPath(path)`, resolved against `cwd`.
+pub fn to_namespaced_path(path: str, cwd: str) -> str {
+    if path.len() == 0 {
+        return path
+    }
+    let r = resolve_units([path], cwd)
+    if r.len() <= 2 {
+        return path
+    }
+    if r[0] == 92 {
+        if r[1] == 92 and r[2] != 63 and r[2] != 46 {
+            return text(units("\\\\?\\UNC\\") + slice(r, 2, r.len()))
+        }
+    } else if is_device_root(r[0]) and r[1] == 58 and r[2] == 92 {
+        return text(units("\\\\?\\") + r)
+    }
+    return text(r)
+}
+
+/// `path.win32.dirname(path)`.
+pub fn dirname(path0: str) -> str {
+    let p = units(path0)
+    let len = p.len()
+    if len == 0 {
+        return "."
+    }
+    if len == 1 {
+        return if is_sep(p[0]) { path0 } else { "." }
+    }
+    var root_end = 0 - 1
+    var offset = 0
+    if is_sep(p[0]) {
+        root_end = 1
+        offset = 1
+        if is_sep(p[1]) {
+            let (_server_end, share_start, j) = unc_parts(p)
+            if share_start >= 0 {
+                if j == len {
+                    return path0
+                }
+                root_end = j + 1
+                offset = j + 1
+            }
+        }
+    } else if is_device_root(p[0]) and p[1] == 58 {
+        root_end = if len > 2 and is_sep(p[2]) { 3 } else { 2 }
+        offset = root_end
+    }
+    var end = 0 - 1
+    var matched_slash = true
+    var i = len - 1
+    while i >= offset {
+        if is_sep(p[i]) {
+            if not matched_slash {
+                end = i
+                break
+            }
+        } else {
+            matched_slash = false
+        }
+        i = i - 1
+    }
+    if end == 0 - 1 {
+        if root_end == 0 - 1 {
+            return "."
+        }
+        end = root_end
+    }
+    return text(slice(p, 0, end))
+}
+
+fn drive_start(p: [i64]) -> i64 {
+    return if p.len() >= 2 and is_device_root(p[0]) and p[1] == 58 { 2 } else { 0 }
+}
+
+/// `path.win32.basename(path[, suffix])`.
+pub fn basename(path0: str, suffix: Option[str]) -> str {
+    let p = units(path0)
+    var start = drive_start(p)
+    var end = 0 - 1
+    var matched_slash = true
+    let sfx = units(suffix ?? "")
+    if suffix.is_some() and sfx.len() > 0 and sfx.len() <= p.len() {
+        if sfx == p {
+            return ""
+        }
+        var ext_idx = sfx.len() - 1
+        var first_non_slash_end = 0 - 1
+        var i = p.len() - 1
+        while i >= start {
+            let c = p[i]
+            if is_sep(c) {
+                if not matched_slash {
+                    start = i + 1
+                    break
+                }
+            } else {
+                if first_non_slash_end == 0 - 1 {
+                    matched_slash = false
+                    first_non_slash_end = i + 1
+                }
+                if ext_idx >= 0 {
+                    if c == sfx[ext_idx] {
+                        ext_idx = ext_idx - 1
+                        if ext_idx == 0 - 1 {
+                            end = i
+                        }
+                    } else {
+                        ext_idx = 0 - 1
+                        end = first_non_slash_end
+                    }
+                }
+            }
+            i = i - 1
+        }
+        if start == end {
+            end = first_non_slash_end
+        } else if end == 0 - 1 {
+            end = p.len()
+        }
+        return text(slice(p, start, end))
+    }
+    var i = p.len() - 1
+    while i >= start {
+        if is_sep(p[i]) {
+            if not matched_slash {
+                start = i + 1
+                break
+            }
+        } else if end == 0 - 1 {
+            matched_slash = false
+            end = i + 1
+        }
+        i = i - 1
+    }
+    return if end == 0 - 1 { "" } else { text(slice(p, start, end)) }
+}
+
+/// The last part's extent from `root_end`: (start of the part, its end,
+/// the dot that starts the extension or -1). Shared by `extname` and
+/// `parse`.
+fn last_part(p: [i64], root_end: i64) -> (i64, i64, i64) {
+    var start_dot = 0 - 1
+    var start_part = root_end
+    var end = 0 - 1
+    var matched_slash = true
+    var pre_dot = 0
+    var i = p.len() - 1
+    while i >= root_end {
+        let c = p[i]
+        if is_sep(c) {
+            if not matched_slash {
+                start_part = i + 1
+                break
+            }
+            i = i - 1
+            continue
+        }
+        if end == 0 - 1 {
+            matched_slash = false
+            end = i + 1
+        }
+        if c == 46 {
+            if start_dot == 0 - 1 {
+                start_dot = i
+            } else if pre_dot != 1 {
+                pre_dot = 1
+            }
+        } else if start_dot != 0 - 1 {
+            pre_dot = 0 - 1
+        }
+        i = i - 1
+    }
+    let no_ext = start_dot == 0 - 1 or end == 0 - 1 or pre_dot == 0 or (pre_dot == 1 and start_dot == end - 1 and start_dot == start_part + 1)
+    return (start_part, end, if no_ext { 0 - 1 } else { start_dot })
+}
+
+/// `path.win32.extname(path)`.
+pub fn extname(path0: str) -> str {
+    let p = units(path0)
+    let (_start, end, dot) = last_part(p, drive_start(p))
+    return if dot == 0 - 1 { "" } else { text(slice(p, dot, end)) }
+}
+
+fn parse_root_end(p: [i64]) -> i64 {
+    let len = p.len()
+    if is_sep(p[0]) {
+        if not is_sep(p[1]) {
+            return 1
+        }
+        let (_server_end, share_start, j) = unc_parts(p)
+        if share_start < 0 {
+            return 1
+        }
+        return if j == len { j } else { j + 1 }
+    }
+    if is_device_root(p[0]) and p[1] == 58 {
+        return if len > 2 and is_sep(p[2]) { 3 } else { 2 }
+    }
+    return 0
+}
+
+/// `path.win32.parse(path)`.
+pub fn parse(path0: str) -> Win32Path {
+    let p = units(path0)
+    var r = Win32Path{ root: "", dir: "", base: "", ext: "", name: "" }
+    if p.len() == 0 {
+        return r
+    }
+    if p.len() == 1 {
+        if is_sep(p[0]) {
+            r.root = path0
+            r.dir = path0
+        } else {
+            r.base = path0
+            r.name = path0
+        }
+        return r
+    }
+    if is_device_root(p[0]) and p[1] == 58 and (p.len() == 2 or (p.len() == 3 and is_sep(p[2]))) {
+        r.root = path0
+        r.dir = path0
+        return r
+    }
+    let root_end = parse_root_end(p)
+    if root_end > 0 {
+        r.root = text(slice(p, 0, root_end))
+    }
+    let (start_part, end, dot) = last_part(p, root_end)
+    if end != 0 - 1 {
+        r.base = text(slice(p, start_part, end))
+        if dot == 0 - 1 {
+            r.name = r.base
+        } else {
+            r.name = text(slice(p, start_part, dot))
+            r.ext = text(slice(p, dot, end))
+        }
+    }
+    r.dir = if start_part > 0 and start_part != root_end { text(slice(p, 0, start_part - 1)) } else { r.root }
+    return r
+}
+
+/// `path.win32.format(pathObject)`; an empty field is an absent one.
+pub fn format(o: Win32Path) -> str {
+    let dir = if o.dir.len() > 0 { o.dir } else { o.root }
+    let ext = if o.ext.len() == 0 { "" } else if o.ext.starts_with(".") { o.ext } else { "." + o.ext }
+    let base = if o.base.len() > 0 { o.base } else { o.name + ext }
+    if dir.len() == 0 {
+        return base
+    }
+    return if dir == o.root { dir + base } else { dir + "\\" + base }
+}

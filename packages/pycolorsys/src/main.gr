@@ -1,0 +1,231 @@
+// Python's `colorsys`, as CPython 3.13 has it: conversions between RGB and
+// YIQ, HLS and HSV, each way, on floats.
+//
+// colorsys is arithmetic on doubles in a fixed order, so a port that does
+// the same operations in the same order gives bit-identical results, and
+// that is what this does -- the same expressions, grouped the way Python
+// evaluates them, with Python's float rules where they differ from C's:
+//
+//   - `x % 1.0` is Python's modulo: `fmod`, then moved into [0, 1) by
+//     adding 1.0 when the remainder is negative (which can round up to 1.0
+//     for a tiny negative hue), and +0.0 for an exact multiple.
+//   - `max` and `min` keep the first of equal arguments and pass a NaN
+//     through only from the first position, as Python's do.
+//   - A division by zero raises ZeroDivisionError("float division by
+//     zero"); it happens for inputs outside [0, 1], such as `rgb_to_hls`
+//     of (-1, 1, 0).
+//   - `hsv_to_rgb` truncates `h*6.0` to an integer, as `int()` does, and
+//     takes it modulo 6 the Python way (never negative), for any finite
+//     float; infinity is OverflowError("cannot convert float infinity to
+//     integer") and NaN ValueError("cannot convert float NaN to integer").
+//   - `yiq_to_rgb` clamps each result to [0, 1]; nothing else clamps.
+
+/// Python's exception, by class and message.
+type ColorsysError = | ColorsysError(cls: str, msg: str)
+
+pub fn error_class(e: ColorsysError) -> str {
+    return match e {
+        ColorsysError(c, _m) -> c
+    }
+}
+
+pub fn error_text(e: ColorsysError) -> str {
+    return match e {
+        ColorsysError(_c, m) -> m
+    }
+}
+
+fn divide(a: f64, b: f64) -> f64 ! ColorsysError {
+    if b == 0.0 {
+        fail(ColorsysError("ZeroDivisionError", "float division by zero"))
+    }
+    return a / b
+}
+
+/// Python's `x % 1.0`.
+fn mod1(x: f64) -> f64 {
+    let m = x % 1.0
+    if m != 0.0 {
+        return if m < 0.0 { m + 1.0 } else { m }
+    }
+    if m != m {
+        return m
+    }
+    return 0.0
+}
+
+/// Python's `max(a, b, c)`: the first, replaced by a later one only when
+/// that one is greater.
+fn max3(a: f64, b: f64, c: f64) -> f64 {
+    var m = a
+    if b > m {
+        m = b
+    }
+    if c > m {
+        m = c
+    }
+    return m
+}
+
+fn min3(a: f64, b: f64, c: f64) -> f64 {
+    var m = a
+    if b < m {
+        m = b
+    }
+    if c < m {
+        m = c
+    }
+    return m
+}
+
+/// `rgb_to_yiq(r, g, b)`.
+pub fn rgb_to_yiq(r: f64, g: f64, b: f64) -> (f64, f64, f64) {
+    let y = 0.30 * r + 0.59 * g + 0.11 * b
+    let i = 0.74 * (r - y) - 0.27 * (b - y)
+    let q = 0.48 * (r - y) + 0.41 * (b - y)
+    return (y, i, q)
+}
+
+fn clamp01(x: f64) -> f64 {
+    var v = x
+    if v < 0.0 {
+        v = 0.0
+    }
+    if v > 1.0 {
+        v = 1.0
+    }
+    return v
+}
+
+/// `yiq_to_rgb(y, i, q)`, clamped to [0, 1].
+pub fn yiq_to_rgb(y: f64, i: f64, q: f64) -> (f64, f64, f64) {
+    let r = y + 0.9468822170900693 * i + 0.6235565819861433 * q
+    let g = y - 0.27478764629897834 * i - 0.6356910791873801 * q
+    let b = y - 1.1085450346420322 * i + 1.7090069284064666 * q
+    return (clamp01(r), clamp01(g), clamp01(b))
+}
+
+/// The hue both `rgb_to_hls` and `rgb_to_hsv` compute.
+fn hue(r: f64, g: f64, b: f64, maxc: f64, rangec: f64) -> f64 ! ColorsysError {
+    let rc = try divide(maxc - r, rangec)
+    let gc = try divide(maxc - g, rangec)
+    let bc = try divide(maxc - b, rangec)
+    let h = if r == maxc { bc - gc } else if g == maxc { 2.0 + rc - bc } else { 4.0 + gc - rc }
+    return mod1(h / 6.0)
+}
+
+/// `rgb_to_hls(r, g, b)`.
+pub fn rgb_to_hls(r: f64, g: f64, b: f64) -> (f64, f64, f64) ! ColorsysError {
+    let maxc = max3(r, g, b)
+    let minc = min3(r, g, b)
+    let sumc = maxc + minc
+    let rangec = maxc - minc
+    let l = sumc / 2.0
+    if minc == maxc {
+        return (0.0, l, 0.0)
+    }
+    let s = if l <= 0.5 { try divide(rangec, sumc) } else { try divide(rangec, 2.0 - maxc - minc) }
+    let h = try hue(r, g, b, maxc, rangec)
+    return (h, l, s)
+}
+
+fn one_third() -> f64 {
+    return 1.0 / 3.0
+}
+
+fn two_thirds() -> f64 {
+    return 2.0 / 3.0
+}
+
+fn component(m1: f64, m2: f64, hue_in: f64) -> f64 {
+    let h = mod1(hue_in)
+    if h < 1.0 / 6.0 {
+        return m1 + (m2 - m1) * h * 6.0
+    }
+    if h < 0.5 {
+        return m2
+    }
+    if h < two_thirds() {
+        return m1 + (m2 - m1) * (two_thirds() - h) * 6.0
+    }
+    return m1
+}
+
+/// `hls_to_rgb(h, l, s)`.
+pub fn hls_to_rgb(h: f64, l: f64, s: f64) -> (f64, f64, f64) {
+    if s == 0.0 {
+        return (l, l, l)
+    }
+    let m2 = if l <= 0.5 { l * (1.0 + s) } else { l + s - l * s }
+    let m1 = 2.0 * l - m2
+    return (component(m1, m2, h + one_third()), component(m1, m2, h), component(m1, m2, h - one_third()))
+}
+
+/// `rgb_to_hsv(r, g, b)`.
+pub fn rgb_to_hsv(r: f64, g: f64, b: f64) -> (f64, f64, f64) ! ColorsysError {
+    let maxc = max3(r, g, b)
+    let minc = min3(r, g, b)
+    let rangec = maxc - minc
+    if minc == maxc {
+        return (0.0, 0.0, maxc)
+    }
+    let s = try divide(rangec, maxc)
+    let h = try hue(r, g, b, maxc, rangec)
+    return (h, s, maxc)
+}
+
+/// `int(x) % 6` and `x - int(x)`, as Python computes them for a finite x.
+fn sector(x: f64) -> (i64, f64) {
+    if x < 4611686018427387904.0 and x > 0.0 - 4611686018427387904.0 {
+        let i = x.as_i64()
+        let m = i % 6
+        return (if m < 0 { m + 6 } else { m }, x - i.as_f64())
+    }
+    // Here x is an integer: its mantissa times 2 to a power.
+    let bits = x.to_bits()
+    let e = bits.ushr(52).bit_and(2047) - 1075
+    var m = bits.bit_and(4503599627370495).bit_or(4503599627370496) % 6
+    for _k in 0..e {
+        m = m * 2 % 6
+    }
+    if x < 0.0 {
+        m = (6 - m) % 6
+    }
+    return (m, x - x)
+}
+
+/// `hsv_to_rgb(h, s, v)`.
+pub fn hsv_to_rgb(h: f64, s: f64, v: f64) -> (f64, f64, f64) ! ColorsysError {
+    if s == 0.0 {
+        return (v, v, v)
+    }
+    let h6 = h * 6.0
+    if h6 != h6 {
+        fail(ColorsysError("ValueError", "cannot convert float NaN to integer"))
+    }
+    if h6 == 1.0 / 0.0 or h6 == 0.0 - 1.0 / 0.0 {
+        fail(ColorsysError("OverflowError", "cannot convert float infinity to integer"))
+    }
+    let sec = sector(h6)
+    let f = sec.1
+    let p = v * (1.0 - s)
+    let q = v * (1.0 - s * f)
+    let t = v * (1.0 - s * (1.0 - f))
+    let i = sec.0
+    if i == 0 {
+        return (v, t, p)
+    }
+    if i == 1 {
+        return (q, v, p)
+    }
+    if i == 2 {
+        return (p, v, t)
+    }
+    if i == 3 {
+        return (p, q, v)
+    }
+    if i == 4 {
+        return (t, p, v)
+    }
+    return (v, p, q)
+}

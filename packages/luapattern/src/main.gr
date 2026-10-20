@@ -1,0 +1,654 @@
+// Lua's patterns, as Lua 5.5 matches them: `string.find`, `string.match`,
+// `string.gmatch` and `string.gsub`, over bytes.
+//
+// Lua has no regular expressions; scripts in games, Neovim, Redis, nginx
+// (OpenResty), Wireshark and Roblox parse text with these, and their rules
+// are their own:
+//
+//   - Classes are `.`, `%a %c %d %g %l %p %s %u %w %x` (upper case negates)
+//     in the C locale, so bytes past 127 are in none of them; `%` before
+//     anything else is that byte; sets are `[...]` with ranges and `%`
+//     classes, `[^...]` negated, and a `]` first is a member.
+//   - Quantifiers apply to one class: `*` and `+` greedy, `-` lazy, `?`.
+//   - `%bxy` matches a balanced run from `x` to `y`; `%f[set]` matches
+//     the empty frontier where the byte before is not in the set and the
+//     byte after is (the subject's ends count as byte 0).
+//   - `(` `)` capture text, `()` captures a position, `%1`..`%9` match a
+//     capture again; at most 32 captures.
+//   - `^` anchors at the start, `$` at the end only as the last byte.
+//   - Matching recurses, and 200 levels deep it gives up with "pattern
+//     too complex"; malformed patterns and bad capture references are
+//     errors with Lua's messages.
+//   - `gsub` replaces with `%0`..`%9` and `%%`, or by looking the first
+//     capture up in a table; an empty match right after the last one is
+//     skipped, as in `gmatch`.
+
+/// A capture: text, or a position (from 1).
+type LuaCapture = | LuaText(text: bytes) | LuaPosition(at: i64)
+
+/// The error Lua raises, with its message.
+type LuaPatternError = | LuaPatternError(msg: str)
+
+pub fn error_text(e: LuaPatternError) -> str {
+    return match e {
+        LuaPatternError(m) -> m
+    }
+}
+
+type MatchState = { src: [i64], pat: [i64], depth: i64, level: i64, cap_init: [i64], cap_len: [i64] }
+
+fn state(src: [i64], pat: [i64]) -> MatchState {
+    return MatchState{ src: src, pat: pat, depth: 200, level: 0, cap_init: (0..32).to_list().map(|_x| 0), cap_len: (0..32).to_list().map(|_x| 0) }
+}
+
+/// A byte of the subject or the pattern; past the end is the NUL Lua's
+/// strings carry.
+fn byte_at(xs: [i64], i: i64) -> i64 {
+    return if i >= 0 and i < xs.len() { xs[i] } else { 0 }
+}
+
+fn bail(msg: str) -> LuaPatternError {
+    return LuaPatternError(msg)
+}
+
+// ---- classes, in the C locale
+
+fn is_lower(c: i64) -> bool {
+    return c >= 97 and c <= 122
+}
+
+fn is_upper(c: i64) -> bool {
+    return c >= 65 and c <= 90
+}
+
+fn is_digit(c: i64) -> bool {
+    return c >= 48 and c <= 57
+}
+
+fn is_alpha(c: i64) -> bool {
+    return is_lower(c) or is_upper(c)
+}
+
+fn is_space(c: i64) -> bool {
+    return c == 32 or (c >= 9 and c <= 13)
+}
+
+fn is_cntrl(c: i64) -> bool {
+    return c < 32 or c == 127
+}
+
+fn is_graph(c: i64) -> bool {
+    return c >= 33 and c <= 126
+}
+
+fn match_class(c: i64, cl: i64) -> bool {
+    let low = if is_upper(cl) { cl + 32 } else { cl }
+    var res = false
+    if low == 97 {
+        res = is_alpha(c)
+    } else if low == 99 {
+        res = is_cntrl(c)
+    } else if low == 100 {
+        res = is_digit(c)
+    } else if low == 103 {
+        res = is_graph(c)
+    } else if low == 108 {
+        res = is_lower(c)
+    } else if low == 112 {
+        res = is_graph(c) and not is_alpha(c) and not is_digit(c)
+    } else if low == 115 {
+        res = is_space(c)
+    } else if low == 117 {
+        res = is_upper(c)
+    } else if low == 119 {
+        res = is_alpha(c) or is_digit(c)
+    } else if low == 120 {
+        res = is_digit(c) or (low_x(c))
+    } else if low == 122 {
+        res = c == 0
+    } else {
+        return cl == c
+    }
+    return if is_lower(cl) { res } else { not res }
+}
+
+fn low_x(c: i64) -> bool {
+    return (c >= 97 and c <= 102) or (c >= 65 and c <= 70)
+}
+
+/// classEnd: where the class starting at `p` ends.
+fn class_end(ms: MatchState, p0: i64) -> i64 ! LuaPatternError {
+    var p = p0
+    let c = byte_at(ms.pat, p)
+    p = p + 1
+    if c == 37 {
+        if p == ms.pat.len() {
+            fail(bail("malformed pattern (ends with '%')"))
+        }
+        return p + 1
+    }
+    if c == 91 {
+        if byte_at(ms.pat, p) == 94 {
+            p = p + 1
+        }
+        while true {
+            if p == ms.pat.len() {
+                fail(bail("malformed pattern (missing ']')"))
+            }
+            let x = byte_at(ms.pat, p)
+            p = p + 1
+            if x == 37 and p < ms.pat.len() {
+                p = p + 1
+            }
+            if byte_at(ms.pat, p) == 93 {
+                break
+            }
+        }
+        return p + 1
+    }
+    return p
+}
+
+/// matchbracketclass: `p` at the `[`, `ec` at the closing `]`.
+fn bracket(ms: MatchState, c: i64, p0: i64, ec: i64) -> bool {
+    var p = p0
+    var sig = true
+    if byte_at(ms.pat, p + 1) == 94 {
+        sig = false
+        p = p + 1
+    }
+    p = p + 1
+    while p < ec {
+        let x = byte_at(ms.pat, p)
+        if x == 37 {
+            p = p + 1
+            if match_class(c, byte_at(ms.pat, p)) {
+                return sig
+            }
+        } else if byte_at(ms.pat, p + 1) == 45 and p + 2 < ec {
+            p = p + 2
+            if byte_at(ms.pat, p - 2) <= c and c <= byte_at(ms.pat, p) {
+                return sig
+            }
+        } else if x == c {
+            return sig
+        }
+        p = p + 1
+    }
+    return not sig
+}
+
+fn single_match(ms: MatchState, s: i64, p: i64, ep: i64) -> bool {
+    if s >= ms.src.len() {
+        return false
+    }
+    let c = ms.src[s]
+    let x = byte_at(ms.pat, p)
+    return if x == 46 { true } else if x == 37 { match_class(c, byte_at(ms.pat, p + 1)) } else if x == 91 { bracket(ms, c, p, ep - 1) } else { x == c }
+}
+
+// ---- the matcher
+
+fn match_balance(ms: MatchState, s0: i64, p: i64) -> i64 ! LuaPatternError {
+    if p >= ms.pat.len() - 1 {
+        fail(bail("malformed pattern (missing arguments to '%b')"))
+    }
+    if byte_at(ms.src, s0) != byte_at(ms.pat, p) {
+        return 0 - 1
+    }
+    let b = byte_at(ms.pat, p)
+    let e = byte_at(ms.pat, p + 1)
+    var cont = 1
+    var s = s0 + 1
+    while s < ms.src.len() {
+        let c = ms.src[s]
+        if c == e {
+            cont = cont - 1
+            if cont == 0 {
+                return s + 1
+            }
+        } else if c == b {
+            cont = cont + 1
+        }
+        s = s + 1
+    }
+    return 0 - 1
+}
+
+fn max_expand(inout ms: MatchState, s: i64, p: i64, ep: i64) -> i64 ! LuaPatternError {
+    var i = 0
+    while single_match(ms, s + i, p, ep) {
+        i = i + 1
+    }
+    while i >= 0 {
+        let res = try do_match(ms, s + i, ep + 1)
+        if res >= 0 {
+            return res
+        }
+        i = i - 1
+    }
+    return 0 - 1
+}
+
+fn min_expand(inout ms: MatchState, s0: i64, p: i64, ep: i64) -> i64 ! LuaPatternError {
+    var s = s0
+    while true {
+        let res = try do_match(ms, s, ep + 1)
+        if res >= 0 {
+            return res
+        }
+        if single_match(ms, s, p, ep) {
+            s = s + 1
+        } else {
+            return 0 - 1
+        }
+    }
+    return 0 - 1
+}
+
+fn start_capture(inout ms: MatchState, s: i64, p: i64, what: i64) -> i64 ! LuaPatternError {
+    let level = ms.level
+    if level >= 32 {
+        fail(bail("too many captures"))
+    }
+    ms.cap_init[level] = s
+    ms.cap_len[level] = what
+    ms.level = level + 1
+    let res = try do_match(ms, s, p)
+    if res < 0 {
+        ms.level = ms.level - 1
+    }
+    return res
+}
+
+fn end_capture(inout ms: MatchState, s: i64, p: i64) -> i64 ! LuaPatternError {
+    var l = ms.level - 1
+    while l >= 0 and ms.cap_len[l] != 0 - 1 {
+        l = l - 1
+    }
+    if l < 0 {
+        fail(bail("invalid pattern capture"))
+    }
+    ms.cap_len[l] = s - ms.cap_init[l]
+    let res = try do_match(ms, s, p)
+    if res < 0 {
+        ms.cap_len[l] = 0 - 1
+    }
+    return res
+}
+
+fn check_capture(ms: MatchState, l0: i64) -> i64 ! LuaPatternError {
+    let l = l0 - 49
+    if l < 0 or l >= ms.level or ms.cap_len[l] == 0 - 1 {
+        fail(bail("invalid capture index %" + (l + 1).to_str()))
+    }
+    return l
+}
+
+fn match_capture(ms: MatchState, s: i64, l0: i64) -> i64 ! LuaPatternError {
+    let l = try check_capture(ms, l0)
+    let len = ms.cap_len[l]
+    // A position capture's length is -2, which C reads as a huge size_t:
+    // it never matches.
+    if len >= 0 and ms.src.len() - s >= len {
+        for k in 0..len {
+            if ms.src[ms.cap_init[l] + k] != ms.src[s + k] {
+                return 0 - 1
+            }
+        }
+        return s + len
+    }
+    return 0 - 1
+}
+
+/// `match`: where the match of the pattern from `p` against the subject
+/// from `s` ends, or -1.
+fn do_match(inout ms: MatchState, s0: i64, p0: i64) -> i64 ! LuaPatternError {
+    if ms.depth == 0 {
+        fail(bail("pattern too complex"))
+    }
+    ms.depth = ms.depth - 1
+    let r = try match_body(ms, s0, p0)
+    ms.depth = ms.depth + 1
+    return r
+}
+
+/// `%b`, `%f` and `%1`..`%9` at `p`: 0 and where to go on, 1 for no
+/// match, 2 for an escape that is an ordinary class.
+fn escape_item(inout ms: MatchState, s: i64, p0: i64) -> (i64, i64, i64) ! LuaPatternError {
+    let d = byte_at(ms.pat, p0 + 1)
+    if d == 98 {
+        let e = try match_balance(ms, s, p0 + 2)
+        return if e < 0 { (1, s, p0) } else { (0, e, p0 + 4) }
+    }
+    if d == 102 {
+        let p = p0 + 2
+        if byte_at(ms.pat, p) != 91 {
+            fail(bail("missing '[' after '%f' in pattern"))
+        }
+        let ep = try class_end(ms, p)
+        let previous = if s == 0 { 0 } else { ms.src[s - 1] }
+        if not bracket(ms, previous, p, ep - 1) and bracket(ms, byte_at(ms.src, s), p, ep - 1) {
+            return (0, s, ep)
+        }
+        return (1, s, p0)
+    }
+    if is_digit(d) {
+        let e = try match_capture(ms, s, d)
+        return if e < 0 { (1, s, p0) } else { (0, e, p0 + 2) }
+    }
+    return (2, s, p0)
+}
+
+fn match_body(inout ms: MatchState, s0: i64, p0: i64) -> i64 ! LuaPatternError {
+    var s = s0
+    var p = p0
+    while true {
+        if p == ms.pat.len() {
+            return s
+        }
+        let c = ms.pat[p]
+        if c == 40 {
+            return if byte_at(ms.pat, p + 1) == 41 { try start_capture(ms, s, p + 2, 0 - 2) } else { try start_capture(ms, s, p + 1, 0 - 1) }
+        }
+        if c == 41 {
+            return try end_capture(ms, s, p + 1)
+        }
+        if c == 36 and p + 1 == ms.pat.len() {
+            return if s == ms.src.len() { s } else { 0 - 1 }
+        }
+        if c == 37 {
+            let (code, s2, p2) = try escape_item(ms, s, p)
+            if code == 1 {
+                return 0 - 1
+            }
+            if code == 0 {
+                s = s2
+                p = p2
+                continue
+            }
+        }
+        // A class and an optional suffix.
+        let ep = try class_end(ms, p)
+        let suffix = byte_at(ms.pat, ep)
+        if not single_match(ms, s, p, ep) {
+            if suffix == 42 or suffix == 63 or suffix == 45 {
+                p = ep + 1
+                continue
+            }
+            return 0 - 1
+        }
+        if suffix == 63 {
+            let res = try do_match(ms, s + 1, ep + 1)
+            if res >= 0 {
+                return res
+            }
+            p = ep + 1
+            continue
+        }
+        if suffix == 43 {
+            return try max_expand(ms, s + 1, p, ep)
+        }
+        if suffix == 42 {
+            return try max_expand(ms, s, p, ep)
+        }
+        if suffix == 45 {
+            return try min_expand(ms, s, p, ep)
+        }
+        s = s + 1
+        p = ep
+    }
+    return 0 - 1
+}
+
+// ---- find, match, gmatch, gsub
+
+/// posrelatI: a 1-based start position, negatives from the end.
+fn position(pos: i64, len: i64) -> i64 {
+    return if pos > 0 { pos } else if pos == 0 { 1 } else if pos < 0 - len { 1 } else { len + pos + 1 }
+}
+
+fn capture(ms: MatchState, i: i64, s: i64, e: i64) -> LuaCapture ! LuaPatternError {
+    if i >= ms.level {
+        if i != 0 {
+            fail(bail("invalid capture index %" + (i + 1).to_str()))
+        }
+        return LuaText(bytes_of(ms.src.slice(s, e)))
+    }
+    let len = ms.cap_len[i]
+    if len == 0 - 1 {
+        fail(bail("unfinished capture"))
+    }
+    if len == 0 - 2 {
+        return LuaPosition(ms.cap_init[i] + 1)
+    }
+    return LuaText(bytes_of(ms.src.slice(ms.cap_init[i], ms.cap_init[i] + len)))
+}
+
+/// push_captures: every capture, or the whole match when there are none
+/// and `whole` is set.
+fn captures(ms: MatchState, s: i64, e: i64, whole: bool) -> [LuaCapture] ! LuaPatternError {
+    let n = if ms.level == 0 and whole { 1 } else { ms.level }
+    var out: [LuaCapture] = []
+    for i in 0..n {
+        out.push(try capture(ms, i, s, e))
+    }
+    return out
+}
+
+fn special(c: i64) -> bool {
+    return c == 94 or c == 36 or c == 42 or c == 43 or c == 63 or c == 46 or c == 40 or c == 91 or c == 37 or c == 45
+}
+
+fn plain_find(s: [i64], from: i64, p: [i64]) -> i64 {
+    if p.len() == 0 {
+        return from
+    }
+    var i = from
+    while i + p.len() <= s.len() {
+        var ok = true
+        for k in 0..p.len() {
+            if s[i + k] != p[k] {
+                ok = false
+                break
+            }
+        }
+        if ok {
+            return i
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+/// The first match from `init`: where it starts and ends (from 0) and
+/// the state holding its captures.
+fn first_match(s: [i64], p0: [i64], init: i64) -> Option[(i64, i64, MatchState)] ! LuaPatternError {
+    let anchor = byte_at(p0, 0) == 94
+    let p = if anchor { p0.slice(1, p0.len()) } else { p0 }
+    var ms = state(s, p)
+    var s1 = init
+    while true {
+        ms.depth = 200
+        ms.level = 0
+        let res = try do_match(ms, s1, 0)
+        if res >= 0 {
+            return Some((s1, res, ms))
+        }
+        s1 = s1 + 1
+        if s1 > s.len() or anchor {
+            break
+        }
+    }
+    return None
+}
+
+/// `string.find(s, pattern, init, plain)`: the start and end (from 1) and
+/// the captures, or None.
+pub fn find(text: bytes, pattern: bytes, init: i64, plain: bool) -> Option[(i64, i64, [LuaCapture])] ! LuaPatternError {
+    let s = text.to_list()
+    let p = pattern.to_list()
+    let start = position(init, s.len()) - 1
+    if start > s.len() {
+        return None
+    }
+    if plain or not p.any(|c| special(c)) {
+        let at = plain_find(s, start, p)
+        return if at < 0 { None } else { Some((at + 1, at + p.len(), [])) }
+    }
+    return match try first_match(s, p, start) {
+        Some((a, e, ms)) -> Some((a + 1, e, try captures(ms, 0, 0, false)))
+        None -> None
+    }
+}
+
+/// `string.match(s, pattern, init)`: the captures, or the whole match.
+pub fn match_text(text: bytes, pattern: bytes, init: i64) -> Option[[LuaCapture]] ! LuaPatternError {
+    let s = text.to_list()
+    let start = position(init, s.len()) - 1
+    if start > s.len() {
+        return None
+    }
+    return match try first_match(s, pattern.to_list(), start) {
+        Some((a, e, ms)) -> Some(try captures(ms, a, e, true))
+        None -> None
+    }
+}
+
+/// Every result `string.gmatch(s, pattern, init)` yields.
+pub fn gmatch(text: bytes, pattern: bytes, init: i64) -> [[LuaCapture]] ! LuaPatternError {
+    let s = text.to_list()
+    var src = position(init, s.len()) - 1
+    if src > s.len() {
+        src = s.len() + 1
+    }
+    var ms = state(s, pattern.to_list())
+    var last = 0 - 1
+    var out: [[LuaCapture]] = []
+    while src <= s.len() {
+        var found = false
+        var at = src
+        while at <= s.len() {
+            ms.depth = 200
+            ms.level = 0
+            let e = try do_match(ms, at, 0)
+            if e >= 0 and e != last {
+                out.push(try captures(ms, at, e, true))
+                src = e
+                last = e
+                found = true
+                break
+            }
+            at = at + 1
+        }
+        if not found {
+            break
+        }
+    }
+    return out
+}
+
+/// How `gsub` replaces a match: a string with `%0`..`%9`, or a table looked
+/// up by the first capture (string keys; a missing key keeps the match).
+type LuaReplacement = | LuaWith(text: bytes) | LuaTable(entries: [(bytes, bytes)])
+
+fn add_string(ms: MatchState, inout out: [i64], repl: [i64], s: i64, e: i64) -> () ! LuaPatternError {
+    var i = 0
+    while i < repl.len() {
+        let c = repl[i]
+        if c != 37 {
+            out.push(c)
+            i = i + 1
+            continue
+        }
+        let d = byte_at(repl, i + 1)
+        if d == 37 {
+            out.push(37)
+        } else if d == 48 {
+            for x in ms.src.slice(s, e) {
+                out.push(x)
+            }
+        } else if is_digit(d) {
+            let piece = match try capture(ms, d - 49, s, e) {
+                LuaText(t) -> t.to_list()
+                LuaPosition(n) -> n.to_str().to_bytes().to_list()
+            }
+            for x in piece {
+                out.push(x)
+            }
+        } else {
+            fail(bail("invalid use of '%' in replacement string"))
+        }
+        i = i + 2
+    }
+    return ()
+}
+
+fn lookup(entries: [(bytes, bytes)], key: LuaCapture) -> Option[bytes] {
+    return match key {
+        LuaText(t) -> {
+            for (k, v) in entries {
+                if k.to_list() == t.to_list() {
+                    return Some(v)
+                }
+            }
+            None
+        }
+        LuaPosition(_n) -> None
+    }
+}
+
+/// `string.gsub(s, pattern, repl, n)`: the new text and the number of
+/// matches replaced. `max` None is no limit.
+pub fn gsub(text: bytes, pattern: bytes, repl: LuaReplacement, max: Option[i64]) -> (bytes, i64) ! LuaPatternError {
+    let s = text.to_list()
+    let p0 = pattern.to_list()
+    let anchor = byte_at(p0, 0) == 94
+    var ms = state(s, if anchor { p0.slice(1, p0.len()) } else { p0 })
+    let limit = max ?? (s.len() + 1)
+    var src = 0
+    var last = 0 - 1
+    var n = 0
+    var changed = false
+    var out: [i64] = []
+    while n < limit {
+        ms.depth = 200
+        ms.level = 0
+        let e = try do_match(ms, src, 0)
+        if e >= 0 and e != last {
+            n = n + 1
+            match repl {
+                LuaWith(t) -> {
+                    try add_string(ms, out, t.to_list(), src, e)
+                    changed = true
+                }
+                LuaTable(entries) -> {
+                    let found = lookup(entries, try capture(ms, 0, src, e))
+                    if found.is_some() {
+                        changed = true
+                    }
+                    for x in (found ?? bytes_of(s.slice(src, e))).to_list() {
+                        out.push(x)
+                    }
+                }
+            }
+            src = e
+            last = e
+        } else if src < s.len() {
+            out.push(s[src])
+            src = src + 1
+        } else {
+            break
+        }
+        if anchor {
+            break
+        }
+    }
+    if not changed {
+        return (text, n)
+    }
+    for x in s.slice(src, s.len()) {
+        out.push(x)
+    }
+    return (bytes_of(out), n)
+}

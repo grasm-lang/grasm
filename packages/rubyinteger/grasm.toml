@@ -1,0 +1,13 @@
+[package]
+name = "rubyinteger"
+version = "1.0.0"
+capabilities = []
+
+[dependencies.bigint]
+path = "../bigint"
+version = "^1.0.0"
+
+[dependencies.javabiginteger]
+path = "../javabiginteger"
+version = "^1.0.0"
+

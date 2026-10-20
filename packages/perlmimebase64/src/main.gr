@@ -1,0 +1,357 @@
+// Perl's MIME::Base64 and MIME::QuotedPrint (version 3.16, as in Perl
+// 5.34): base64 and quoted-printable the way Perl mail and web code
+// writes and reads them.
+//
+// Every Perl program that sends mail (MIME::Lite, Email::MIME,
+// MIME::Entity), signs a request or embeds an image goes through these
+// two modules, and their output has details a generic encoder does not
+// share:
+//
+//   - **`encode_base64(bytes, eol)`** breaks lines every 76 characters
+//     and ends the last line with `eol` too (Perl's default is "\n"; an
+//     empty `eol` gives one unbroken line); nothing at all for no input.
+//   - **`decode_base64`** is lenient: it skips every byte outside the
+//     alphabet, stops at the first `=` that can end a group, ignores a
+//     lone trailing character, and decodes a last group of two or three
+//     characters without padding.
+//   - `encoded_base64_length` and `decoded_base64_length` answer the
+//     lengths without building anything; `encode_base64url` and
+//     `decode_base64url` are the URL alphabet with the padding dropped and
+//     restored.
+//   - **`encode_qp(bytes, eol, binary)`** writes `=XX` for `=`, control
+//     bytes, bytes past 126 and a space or tab that ends a line, breaks
+//     lines at 76 with `=` and `eol` (none when `eol` is empty), turns a
+//     soft break that would leave one character on its own line back
+//     into that character, and in binary mode writes "\n" as `=0A`.
+//   - **`decode_qp`** drops the white space that ends a line, a CR before
+//     a LF, and soft breaks (with spaces before their line end), decodes
+//     `=XX` in either case, and leaves any other `=` as it is.
+//
+// Strings are bytes here, as the XS reads them; Perl croaks with "Wide
+// character" on text beyond Latin-1, which this cannot be given.
+//
+// Checked against `perl` 5.34's MIME::Base64 and MIME::QuotedPrint.
+
+fn b64_alphabet() -> str {
+    return "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+}
+
+/// The value of a base64 byte, 254 for `=`, 255 for anything else.
+fn b64_index(c: i64) -> i64 {
+    if c >= 65 and c <= 90 {
+        return c - 65
+    }
+    if c >= 97 and c <= 122 {
+        return c - 71
+    }
+    if c >= 48 and c <= 57 {
+        return c + 4
+    }
+    if c == 43 {
+        return 62
+    }
+    if c == 47 {
+        return 63
+    }
+    return if c == 61 { 254 } else { 255 }
+}
+
+/// `encode_base64(data, eol)`.
+pub fn encode_base64(data: bytes, eol: bytes) -> bytes {
+    let digits = b64_alphabet().to_bytes()
+    let d = data.to_list()
+    let e = eol.to_list()
+    var out: [i64] = []
+    var chunk = 0
+    var i = 0
+    while i < d.len() {
+        if chunk == 19 {
+            for c in e {
+                out.push(c)
+            }
+            chunk = 0
+        }
+        let left = d.len() - i
+        let c1 = d[i]
+        let c2 = if left > 1 { d[i + 1] } else { 0 }
+        out.push(digits.at(c1.shr(2)))
+        out.push(digits.at(c1.bit_and(3).shl(4).bit_or(c2.bit_and(240).shr(4))))
+        if left > 2 {
+            let c3 = d[i + 2]
+            out.push(digits.at(c2.bit_and(15).shl(2).bit_or(c3.bit_and(192).shr(6))))
+            out.push(digits.at(c3.bit_and(63)))
+        } else if left == 2 {
+            out.push(digits.at(c2.bit_and(15).shl(2)))
+            out.push(61)
+        } else {
+            out.push(61)
+            out.push(61)
+        }
+        i = i + 3
+        chunk = chunk + 1
+    }
+    if d.len() > 0 {
+        for c in e {
+            out.push(c)
+        }
+    }
+    return bytes_of(out)
+}
+
+/// `decode_base64(text)`.
+pub fn decode_base64(text: bytes) -> bytes {
+    let t = text.to_list()
+    var out: [i64] = []
+    var at = 0
+    while at < t.len() {
+        var c = [0, 0, 0, 0]
+        var i = 0
+        var short = false
+        while i < 4 {
+            let uc = b64_index(t[at])
+            at = at + 1
+            if uc != 255 {
+                c[i] = uc
+                i = i + 1
+            }
+            if at == t.len() {
+                if i < 4 {
+                    if i < 2 {
+                        short = true
+                    } else {
+                        if i == 2 {
+                            c[2] = 254
+                        }
+                        c[3] = 254
+                    }
+                }
+                break
+            }
+        }
+        if short or c[0] == 254 or c[1] == 254 {
+            return bytes_of(out)
+        }
+        out.push(c[0].shl(2).bit_or(c[1].bit_and(48).shr(4)))
+        if c[2] == 254 {
+            return bytes_of(out)
+        }
+        out.push(c[1].bit_and(15).shl(4).bit_or(c[2].bit_and(60).shr(2)))
+        if c[3] == 254 {
+            return bytes_of(out)
+        }
+        out.push(c[2].bit_and(3).shl(6).bit_or(c[3]))
+    }
+    return bytes_of(out)
+}
+
+/// `encoded_base64_length(data, eol)`: the length encode_base64 answers.
+pub fn encoded_base64_length(data: bytes, eol: bytes) -> i64 {
+    let n = (data.len() + 2) / 3 * 4
+    return if n == 0 { 0 } else { n + ((n - 1) / 76 + 1) * eol.len() }
+}
+
+/// `decoded_base64_length(text)`, counted the XS's way: it stops at the
+/// first `=` wherever that is.
+pub fn decoded_base64_length(text: bytes) -> i64 {
+    var n = 0
+    var i = 0
+    for c in text.to_list() {
+        let uc = b64_index(c)
+        if uc == 254 {
+            return n
+        }
+        if uc != 255 {
+            if i > 0 {
+                n = n + 1
+            }
+            i = i + 1
+            if i == 4 {
+                i = 0
+            }
+        }
+    }
+    return n
+}
+
+/// `encode_base64url(data)`: one line, `-` and `_`, no padding.
+pub fn encode_base64url(data: bytes) -> bytes {
+    var e = encode_base64(data, bytes_of([])).to_list()
+    while e.len() > 0 and e[e.len() - 1] == 61 {
+        let _x = e.pop()
+    }
+    return bytes_of(e.map(|c| if c == 43 { 45 } else if c == 47 { 95 } else { c }))
+}
+
+/// `decode_base64url(text)`: `-` and `_` back, padding restored.
+pub fn decode_base64url(text: bytes) -> bytes {
+    var t = text.to_list().map(|c| if c == 45 { 43 } else if c == 95 { 47 } else { c })
+    while t.len() % 4 != 0 {
+        t.push(61)
+    }
+    return decode_base64(bytes_of(t))
+}
+
+fn qp_plain(c: i64) -> bool {
+    return c == 9 or c >= 32 and c <= 126 and c != 61
+}
+
+fn push_all(inout out: [i64], b: [i64]) {
+    for c in b {
+        out.push(c)
+    }
+}
+
+fn hex_upper(c: i64) -> [i64] {
+    let digits = "0123456789ABCDEF".to_bytes()
+    return [61, digits.at(c.shr(4)), digits.at(c.bit_and(15))]
+}
+
+/// `encode_qp(data, eol, binary)`.
+pub fn encode_qp(data: bytes, eol: bytes, binary: bool) -> bytes {
+    let d = data.to_list()
+    let e = eol.to_list()
+    var out: [i64] = []
+    var linelen = 0
+    var p = 0
+    while true {
+        let p_beg = p
+        while p < d.len() and qp_plain(d[p]) {
+            p = p + 1
+        }
+        if p == d.len() or d[p] == 10 {
+            while p > p_beg and (d[p - 1] == 9 or d[p - 1] == 32) {
+                p = p - 1
+            }
+        }
+        linelen = qp_plain_run(out, d.slice(p_beg, p), e, linelen)
+        if p == d.len() {
+            break
+        }
+        if d[p] == 10 and e.len() > 0 and not binary {
+            qp_hard_break(out, e, linelen)
+            p = p + 1
+            linelen = 0
+        } else {
+            let lone_newline = linelen == 73 and p + 1 < d.len() and d[p + 1] == 10 and not binary
+            if e.len() > 0 and linelen > 72 and not lone_newline {
+                out.push(61)
+                push_all(out, e)
+                linelen = 0
+            }
+            push_all(out, hex_upper(d[p]))
+            p = p + 1
+            linelen = linelen + 3
+        }
+    }
+    if out.len() > 0 and e.len() > 0 and linelen > 0 {
+        out.push(61)
+        push_all(out, e)
+    }
+    return bytes_of(out)
+}
+
+/// Plain text, broken at 76 with soft line breaks; the new line length.
+fn qp_plain_run(inout out: [i64], run: [i64], e: [i64], linelen0: i64) -> i64 {
+    var linelen = linelen0
+    var at = 0
+    var left = run.len()
+    if left == 0 {
+        return linelen
+    }
+    if e.len() > 0 and linelen <= 75 {
+        while left > 75 - linelen {
+            let n = 75 - linelen
+            push_all(out, run.slice(at, at + n))
+            at = at + n
+            left = left - n
+            out.push(61)
+            push_all(out, e)
+            linelen = 0
+        }
+    }
+    if left > 0 {
+        push_all(out, run.slice(at, at + left))
+        linelen = linelen + left
+    }
+    return linelen
+}
+
+/// A line break in the data: `eol`, or -- when the line so far is one
+/// character after a soft break -- that character pulled back in place
+/// of the `=`.
+fn qp_hard_break(inout out: [i64], e: [i64], linelen: i64) {
+    let n = out.len()
+    let at = n - e.len() - 2
+    if linelen == 1 and n > e.len() + 1 and at >= 0 and out[at] == 61 {
+        out[at] = out[n - 1]
+        let _x = out.pop()
+    } else {
+        push_all(out, e)
+    }
+}
+
+fn is_xdigit(c: i64) -> bool {
+    return c >= 48 and c <= 57 or c >= 97 and c <= 102 or c >= 65 and c <= 70
+}
+
+fn xvalue(c: i64) -> i64 {
+    return if c <= 57 { c - 48 } else if c >= 97 { c - 87 } else { c - 55 }
+}
+
+/// `decode_qp(text)`.
+pub fn decode_qp(text: bytes) -> bytes {
+    let t = text.to_list()
+    var out: [i64] = []
+    var white = 0 - 1
+    var s = 0
+    while s < t.len() {
+        let c = t[s]
+        if c == 32 or c == 9 {
+            if white < 0 {
+                white = s
+            }
+            s = s + 1
+        } else if c == 13 and s + 1 < t.len() and t[s + 1] == 10 {
+            s = s + 1
+        } else if c == 10 {
+            white = 0 - 1
+            out.push(10)
+            s = s + 1
+        } else {
+            if white >= 0 {
+                push_all(out, t.slice(white, s))
+                white = 0 - 1
+            }
+            s = qp_decode_at(out, t, s)
+        }
+    }
+    if white >= 0 {
+        push_all(out, t.slice(white, s))
+    }
+    return bytes_of(out)
+}
+
+/// One byte that is not white space or a line end: an escape, a soft
+/// break, or itself. Answers where to go on.
+fn qp_decode_at(inout out: [i64], t: [i64], s: i64) -> i64 {
+    if t[s] != 61 {
+        out.push(t[s])
+        return s + 1
+    }
+    if s + 2 < t.len() and is_xdigit(t[s + 1]) and is_xdigit(t[s + 2]) {
+        out.push(xvalue(t[s + 1]) * 16 + xvalue(t[s + 2]))
+        return s + 3
+    }
+    var p = s + 1
+    while p < t.len() and (t[p] == 32 or t[p] == 9) {
+        p = p + 1
+    }
+    if p < t.len() and t[p] == 10 {
+        return p + 1
+    }
+    if p + 1 < t.len() and t[p] == 13 and t[p + 1] == 10 {
+        return p + 2
+    }
+    out.push(61)
+    return s + 1
+}

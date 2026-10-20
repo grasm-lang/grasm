@@ -1,0 +1,359 @@
+// Ruby's Integer arithmetic that has exact answers, as Ruby 2.6 computes
+// it on 64-bit platforms: `to_s(base)`, `digits(base)`, `Integer.sqrt`,
+// `pow(b, m)`, `bit_length`, `gcd`, `lcm`, `round`/`floor`/`ceil`/
+// `truncate` with negative digits and `half:` modes, `int[i]`, `divmod`
+// and `remainder`, with Ruby's exceptions and messages.
+//
+// Ruby code that rounds money to the hundred, splits a number into base-N
+// digits or reduces a power modulo something gets these answers, and a
+// peer that must agree with it needs the same, including where Ruby 2.6
+// is wrong:
+//
+//   - `round(n)` with `n < 0` rounds to a multiple of 10**-n, half away
+//     from zero by default; `half:` takes `up`, `even` or `down` (a
+//     String or Symbol, compared without case; `nil` is the default) and
+//     anything else is "invalid rounding mode: X", checked even when `n`
+//     is not negative.
+//   - Ruby 2.6 answers 0 from `round`, `floor`, `ceil` and `truncate`
+//     whenever 0.415241 * -n - 0.125 exceeds the number's size in bytes
+//     (8 for a Fixnum), before rounding: `-15.floor(-20)` is 0, not
+//     -10**20. Off the Fixnum path (the number or 10**-n outside
+//     -2**62...2**62), `ceil` of an exact multiple adds one more step
+//     (`(10**20).ceil(-1)` is 10**20 + 10, `0.ceil(-19)` is 10**19) and
+//     so does `truncate` of a negative one. All of that is reproduced.
+//   - `ndigits` and the `to_s` base go through NUM2INT: outside 32 bits
+//     is "integer N too big to convert to `int'" (or "too small"), a
+//     RangeError.
+//   - `pow(b, m)` refuses a negative `b` (RangeError) and a zero `m`
+//     (ZeroDivisionError); the answer takes the sign of `m`. A zero
+//     exponent answers 1 even when `m` is 1 (and 0 when `m` is -1), as
+//     2.6 does.
+//   - `Integer.sqrt` below 2**53 is the double square root truncated,
+//     as 2.6 computes it, so it is one too high just under a large
+//     square (`Integer.sqrt(6399999999999999)` is 80000000); from 2**53
+//     up it is exact.
+//   - `digits` refuses a negative receiver (Math::DomainError "out of
+//     domain") before looking at the base; a negative base is "negative
+//     radix", 0 or 1 "invalid radix N"; a base of any size works.
+//   - `int[i]` sees two's complement: a negative number has every bit
+//     set past its length, and a negative `i` reads 0.
+//   - `divmod` floors; `remainder` truncates; both refuse 0 with
+//     "divided by 0".
+//
+// Limits: `fdiv`, `**` and anything else that answers a Float or a
+// Rational is not here, nor `String#to_i`; bases and `ndigits` are taken
+// within i64.
+
+import bigint
+import javabiginteger
+
+/// Ruby's exception class and message.
+type RbIntegerError =
+    | RbIntArgumentError(msg: str)
+    | RbIntRangeError(msg: str)
+    | RbIntZeroDivisionError(msg: str)
+    | RbIntDomainError(msg: str)
+
+/// How `round` breaks a tie, from its `half:` option.
+type RbRoundHalf =
+    | RbHalfUp
+    | RbHalfEven
+    | RbHalfDown
+
+pub fn error_class(e: RbIntegerError) -> str {
+    return match e {
+        RbIntArgumentError(_m) -> "ArgumentError"
+        RbIntRangeError(_m) -> "RangeError"
+        RbIntZeroDivisionError(_m) -> "ZeroDivisionError"
+        RbIntDomainError(_m) -> "Math::DomainError"
+    }
+}
+
+pub fn error_message(e: RbIntegerError) -> str {
+    return match e {
+        RbIntArgumentError(m) -> m
+        RbIntRangeError(m) -> m
+        RbIntZeroDivisionError(m) -> m
+        RbIntDomainError(m) -> m
+    }
+}
+
+fn big(n: i64) -> BigInt {
+    return bigint.from_i64(n)
+}
+
+fn is_neg(n: BigInt) -> bool {
+    return bigint.sign(n) < 0
+}
+
+fn babs(n: BigInt) -> BigInt {
+    return if is_neg(n) { bigint.negate(n) } else { n }
+}
+
+/// Whether Ruby holds the value as a Fixnum: -2**62 ..= 2**62 - 1.
+fn is_fixnum(n: BigInt) -> bool {
+    let limit = bigint.pow(big(2), 62)
+    return bigint.compare(n, limit) < 0 and bigint.compare(n, bigint.negate(limit)) >= 0
+}
+
+/// `a % m` for a positive `m`: never negative.
+fn floor_mod(a: BigInt, m: BigInt) -> BigInt {
+    return javabiginteger.modulo(a, m) ?? bigint.zero()
+}
+
+fn pow10(k: i64) -> BigInt {
+    return bigint.pow(big(10), k)
+}
+
+/// NUM2INT: an `int`, or Ruby's RangeError.
+fn to_c_int(n: i64) -> i64 ! RbIntegerError {
+    if n > 2147483647 {
+        fail(RbIntRangeError("integer " + n.to_str() + " too big to convert to `int'"))
+    }
+    if n < 0 - 2147483648 {
+        fail(RbIntRangeError("integer " + n.to_str() + " too small to convert to `int'"))
+    }
+    return n
+}
+
+// ---- printing and digits
+
+/// `n.to_s(base)`.
+pub fn to_s(n: BigInt, base: i64) -> str ! RbIntegerError {
+    let b = try to_c_int(base)
+    if b < 2 or b > 36 {
+        fail(RbIntArgumentError("invalid radix " + b.to_str()))
+    }
+    return javabiginteger.to_string(n, b)
+}
+
+/// `n.digits(base)`, least significant first.
+pub fn digits(n: BigInt, base: BigInt) -> [BigInt] ! RbIntegerError {
+    if is_neg(n) {
+        fail(RbIntDomainError("out of domain"))
+    }
+    if is_neg(base) {
+        fail(RbIntArgumentError("negative radix"))
+    }
+    if bigint.compare(base, big(2)) < 0 {
+        fail(RbIntArgumentError("invalid radix " + bigint.to_str(base)))
+    }
+    if bigint.is_zero(n) {
+        return [bigint.zero()]
+    }
+    var out: [BigInt] = []
+    var left = n
+    while not bigint.is_zero(left) {
+        let (q, r) = bigint.divmod(left, base) ?? (bigint.zero(), bigint.zero())
+        out.push(r)
+        left = q
+    }
+    return out
+}
+
+// ---- roots, powers, bits
+
+/// `Integer.sqrt(n)`.
+pub fn isqrt(n: BigInt) -> BigInt ! RbIntegerError {
+    if is_neg(n) {
+        fail(RbIntDomainError("Numerical argument is out of domain - \"isqrt\""))
+    }
+    // Below 2**53 Ruby 2.6 truncates the double square root, which comes
+    // out one too high just under a large square.
+    if bigint.compare(n, bigint.pow(big(2), 53)) < 0 {
+        return big((bigint.to_i64(n) ?? 0).as_f64().sqrt().as_i64())
+    }
+    return javabiginteger.sqrt(n) ?? bigint.zero()
+}
+
+/// `a.pow(b, m)`.
+pub fn pow_mod(a: BigInt, b: BigInt, m: BigInt) -> BigInt ! RbIntegerError {
+    if is_neg(b) {
+        fail(RbIntRangeError("Integer#pow() 1st argument cannot be negative when 2nd argument specified"))
+    }
+    if bigint.is_zero(m) {
+        fail(RbIntZeroDivisionError("divided by 0"))
+    }
+    let mm = babs(m)
+    // Ruby 2.6 starts from 1 and reduces only inside the loop, so a zero
+    // exponent leaves 1 even modulo 1.
+    let r = if bigint.is_zero(b) { big(1) } else { javabiginteger.mod_pow(floor_mod(a, mm), b, mm) ?? bigint.zero() }
+    if is_neg(m) and not bigint.is_zero(r) {
+        return bigint.sub(r, mm)
+    }
+    return r
+}
+
+/// `n.bit_length`: bits of the two's complement form, sign excluded.
+pub fn bit_length(n: BigInt) -> i64 {
+    return javabiginteger.bit_length(n)
+}
+
+/// `a.gcd(b)`, never negative.
+pub fn gcd(a: BigInt, b: BigInt) -> BigInt {
+    return javabiginteger.gcd(a, b)
+}
+
+/// `a.lcm(b)`, never negative.
+pub fn lcm(a: BigInt, b: BigInt) -> BigInt {
+    if bigint.is_zero(a) or bigint.is_zero(b) {
+        return bigint.zero()
+    }
+    let g = gcd(a, b)
+    return babs(bigint.mul(bigint.div(a, g) ?? bigint.zero(), b))
+}
+
+/// `n[i]`: bit `i` of the two's complement form, 0 or 1.
+pub fn bit_at(n: BigInt, i: BigInt) -> i64 {
+    if is_neg(i) {
+        return 0
+    }
+    match bigint.to_i64(i) {
+        Some(k) -> {
+            if k <= bit_length(n) + 1 {
+                return if javabiginteger.test_bit(n, k) ?? false { 1 } else { 0 }
+            }
+        }
+        None -> ()
+    }
+    return if is_neg(n) { 1 } else { 0 }
+}
+
+// ---- division
+
+/// `a.divmod(b)`: the floored quotient and the modulus (sign of `b`).
+pub fn divmod(a: BigInt, b: BigInt) -> (BigInt, BigInt) ! RbIntegerError {
+    if bigint.is_zero(b) {
+        fail(RbIntZeroDivisionError("divided by 0"))
+    }
+    let (q, r) = bigint.divmod(a, b) ?? (bigint.zero(), bigint.zero())
+    if not bigint.is_zero(r) and is_neg(r) != is_neg(b) {
+        return (bigint.sub(q, big(1)), bigint.add(r, b))
+    }
+    return (q, r)
+}
+
+/// `a.remainder(b)`: truncated, the sign of `a`.
+pub fn remainder(a: BigInt, b: BigInt) -> BigInt ! RbIntegerError {
+    if bigint.is_zero(b) {
+        fail(RbIntZeroDivisionError("divided by 0"))
+    }
+    return bigint.rem(a, b) ?? bigint.zero()
+}
+
+// ---- rounding to a power of ten
+
+/// The `half:` option: `None` is nil; a name is matched without case.
+pub fn half_mode(name: Option[str]) -> RbRoundHalf ! RbIntegerError {
+    return match name {
+        None -> RbHalfUp
+        Some(t) -> {
+            let l = ascii_lower(t)
+            if l == "up" {
+                return RbHalfUp
+            }
+            if l == "even" {
+                return RbHalfEven
+            }
+            if l == "down" {
+                return RbHalfDown
+            }
+            fail(RbIntArgumentError("invalid rounding mode: " + t))
+        }
+    }
+}
+
+fn ascii_lower(t: str) -> str {
+    return t.codes().map(|c| if c >= 65 and c <= 90 { (c + 32).to_char() } else { c.to_char() }).join("")
+}
+
+/// Ruby 2.6's shortcut to 0: `-0.415241 * ndigits - 0.125 > bytes`, with
+/// 8 bytes for a Fixnum and the magnitude's byte count otherwise.
+fn rounds_to_zero(n: BigInt, ndigits: i64) -> bool {
+    let size = if is_fixnum(n) { 8 } else { (bigint.bit_length(babs(n)) + 7) / 8 }
+    return (0.0 - 0.415241) * ndigits.as_f64() - 0.125 > size.as_f64()
+}
+
+/// Whether both the number and 10**-ndigits are Fixnums, the path on
+/// which 2.6's `ceil` and `truncate` are right.
+fn fixnum_path(n: BigInt, ndigits: i64) -> bool {
+    return is_fixnum(n) and ndigits >= 0 - 18
+}
+
+/// `n.round(ndigits, half: mode)`.
+pub fn round(n: BigInt, ndigits: i64, half: Option[str]) -> BigInt ! RbIntegerError {
+    let nd = try to_c_int(ndigits)
+    let mode = try half_mode(half)
+    if nd >= 0 {
+        return n
+    }
+    if rounds_to_zero(n, nd) {
+        return bigint.zero()
+    }
+    let f = pow10(0 - nd)
+    let h = bigint.div(f, big(2)) ?? bigint.zero()
+    let r = floor_mod(n, f)
+    let down = bigint.sub(n, r)
+    let c = bigint.compare(r, h)
+    return if c > 0 or c == 0 and tie_goes_up(mode, n, down, f) { bigint.add(down, f) } else { down }
+}
+
+/// At exactly half a step: whether `round` moves up from `down`, the
+/// multiple of `f` below `n`.
+fn tie_goes_up(mode: RbRoundHalf, n: BigInt, down: BigInt, f: BigInt) -> bool {
+    return match mode {
+        RbHalfUp -> bigint.sign(n) > 0
+        RbHalfDown -> is_neg(n)
+        RbHalfEven -> not bigint.is_zero(floor_mod(bigint.div(down, f) ?? bigint.zero(), big(2)))
+    }
+}
+
+/// `n.floor(ndigits)`.
+pub fn floor(n: BigInt, ndigits: i64) -> BigInt ! RbIntegerError {
+    let nd = try to_c_int(ndigits)
+    if nd >= 0 {
+        return n
+    }
+    if rounds_to_zero(n, nd) {
+        return bigint.zero()
+    }
+    return bigint.sub(n, floor_mod(n, pow10(0 - nd)))
+}
+
+/// `n.ceil(ndigits)`.
+pub fn ceil(n: BigInt, ndigits: i64) -> BigInt ! RbIntegerError {
+    let nd = try to_c_int(ndigits)
+    if nd >= 0 {
+        return n
+    }
+    if rounds_to_zero(n, nd) {
+        return bigint.zero()
+    }
+    let f = pow10(0 - nd)
+    let m = floor_mod(n, f)
+    if fixnum_path(n, nd) and bigint.is_zero(m) {
+        return n
+    }
+    // Off the Fixnum path 2.6 adds `f - m` even when `m` is 0.
+    return bigint.add(n, bigint.sub(f, m))
+}
+
+/// `n.truncate(ndigits)`.
+pub fn truncate(n: BigInt, ndigits: i64) -> BigInt ! RbIntegerError {
+    let nd = try to_c_int(ndigits)
+    if nd >= 0 {
+        return n
+    }
+    if rounds_to_zero(n, nd) {
+        return bigint.zero()
+    }
+    let f = pow10(0 - nd)
+    let m = floor_mod(n, f)
+    if not is_neg(n) {
+        return bigint.sub(n, m)
+    }
+    if fixnum_path(n, nd) and bigint.is_zero(m) {
+        return n
+    }
+    return bigint.add(n, bigint.sub(f, m))
+}

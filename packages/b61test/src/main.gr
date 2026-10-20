@@ -1,0 +1,643 @@
+// The harness scripts/b61_diff.py drives: each argument pair is an
+// operation and a file of cases, one per line; each answer is one line.
+import perlfilespec
+import perltimelocal
+import rustduration
+import rustipaddr
+import jqformat
+import jqpath
+import perljsonpp
+import lispprint
+import perlansicolor
+import bigint
+
+fn unhex_list(h: str) -> [i64] {
+    if h == "-" {
+        return []
+    }
+    var out: [i64] = []
+    let b = h.to_bytes()
+    var i = 0
+    while i + 1 < b.len() {
+        let hi = b.at(i)
+        let lo = b.at(i + 1)
+        out.push((if hi >= 97 { hi - 87 } else { hi - 48 }) * 16 + (if lo >= 97 { lo - 87 } else { lo - 48 }))
+        i = i + 2
+    }
+    return out
+}
+
+fn unhex(h: str) -> str {
+    return bytes_of(unhex_list(h)).to_str()
+}
+
+fn hex_bytes(b: bytes) -> str {
+    let digits = "0123456789abcdef"
+    let h = b.to_list().map(|x| digits.substr(x.ushr(4), 1) + digits.substr(x.bit_and(15), 1)).join("")
+    return if h.len() == 0 { "-" } else { h }
+}
+
+fn hex_text(t: str) -> str {
+    return hex_bytes(t.to_bytes())
+}
+
+fn hex_u64(h: str) -> i64 {
+    var v = 0
+    for c in h.codes() {
+        let d = if c >= 97 { c - 87 } else if c >= 65 { c - 55 } else { c - 48 }
+        v = v.shl(4).bit_or(d)
+    }
+    return v
+}
+
+fn hex_strs(l: str) -> [str] {
+    return if l == "~" { [] } else { l.split(",").map(|x| unhex(x)) }
+}
+
+fn strs_hex(xs: [str]) -> str {
+    return if xs.len() == 0 { "~" } else { xs.map(|x| hex_text(x)).join(",") }
+}
+
+fn perlfilespec_line(f: [str]) -> str {
+    let op = f[0]
+    if op == "cp" {
+        return hex_text(perlfilespec.canonpath(unhex(f[1])))
+    }
+    if op == "cd" {
+        return hex_text(perlfilespec.catdir(hex_strs(f[1])))
+    }
+    if op == "cf" {
+        return match perlfilespec.catfile(hex_strs(f[1])) {
+            Some(t) -> hex_text(t)
+            None -> "~"
+        }
+    }
+    if op == "sd" {
+        return strs_hex(perlfilespec.splitdir(unhex(f[1])))
+    }
+    if op == "sp" {
+        let r = perlfilespec.splitpath(unhex(f[1]), f[2] == "1")
+        return hex_text(r.0) + " " + hex_text(r.1) + " " + hex_text(r.2)
+    }
+    if op == "ct" {
+        return hex_text(perlfilespec.catpath(unhex(f[1]), unhex(f[2]), unhex(f[3])))
+    }
+    if op == "ab" {
+        return if perlfilespec.file_name_is_absolute(unhex(f[1])) { "1" } else { "0" }
+    }
+    if op == "nu" {
+        return strs_hex(perlfilespec.no_upwards(hex_strs(f[1])))
+    }
+    if op == "ra" {
+        return hex_text(perlfilespec.rel2abs(unhex(f[1]), unhex(f[2]), unhex(f[3])))
+    }
+    return hex_text(perlfilespec.abs2rel(unhex(f[1]), unhex(f[2]), unhex(f[3])))
+}
+
+fn tl_num(t: str) -> TlNum {
+    if t.contains(".") {
+        return TlFloat(t.parse_float() ?? 0.0)
+    }
+    return TlInt(t.parse_int() ?? 0)
+}
+
+fn perltimelocal_line(f: [str]) -> str {
+    return match perltimelocal.timegm(f[0], f[1].parse_int() ?? 2026, tl_num(f[2]), tl_num(f[3]), tl_num(f[4]), tl_num(f[5]), f[6].parse_int() ?? 0, f[7].parse_int() ?? 0) {
+        Ok(n) -> perltimelocal.num_text(n)
+        Err(e) -> match e {
+            TimeLocalDied(m) -> "E:" + hex_text(m)
+            TimeLocalRefused(why) -> "R:" + hex_text(why)
+        }
+    }
+}
+
+fn u64_bits(t: str) -> i64 {
+    let n = bigint.parse(t) ?? bigint.zero()
+    let two63 = bigint.pow(bigint.from_i64(2), 63)
+    if bigint.compare(n, two63) < 0 {
+        return bigint.to_i64(n) ?? 0
+    }
+    return (bigint.to_i64(bigint.sub(n, two63)) ?? 0).bit_or(0 - 9223372036854775807 - 1)
+}
+
+fn udec(v: i64) -> str {
+    if v >= 0 {
+        return v.to_str()
+    }
+    let q = v.ushr(1) / 5
+    return q.to_str() + (v - q * 10).to_str()
+}
+
+fn hex_bits(x: f64) -> str {
+    let b = x.to_bits()
+    let digits = "0123456789abcdef"
+    var out = ""
+    var k = 60
+    while k >= 0 {
+        out = out + digits.substr(b.ushr(k).bit_and(15), 1)
+        k = k - 4
+    }
+    return out
+}
+
+fn dur(s: str, n: str) -> RustDuration {
+    return RustDuration{ secs: u64_bits(s), nanos: n.parse_int() ?? 0 }
+}
+
+fn dshow(d: RustDuration) -> str {
+    return "D:" + udec(d.secs) + ":" + d.nanos.to_str()
+}
+
+fn odshow(d: Option[RustDuration]) -> str {
+    return match d {
+        Some(v) -> dshow(v)
+        None -> "None"
+    }
+}
+
+fn dur_result(r: RustDuration ! RustDurationError, tag: str) -> str {
+    return match r {
+        Ok(v) -> dshow(v)
+        Err(e) -> tag + hex_text(rustduration.error_text(e))
+    }
+}
+
+fn rustduration_line(f: [str]) -> str {
+    let op = f[0]
+    if op == "dbg" {
+        return match rustduration.debug(dur(f[1], f[2]), unhex(f[3])) {
+            Ok(t) -> hex_text(t)
+            Err(e) -> "R:" + hex_text(rustduration.error_text(e))
+        }
+    }
+    if op == "tf" {
+        return dur_result(rustduration.try_from_secs_f64(hex_u64(f[1]).from_bits()), "E:")
+    }
+    if op == "f64" {
+        return "F:" + hex_bits(rustduration.as_secs_f64(dur(f[1], f[2])))
+    }
+    if op == "mulf" {
+        return dur_result(rustduration.mul_f64(dur(f[1], f[2]), hex_u64(f[3]).from_bits()), "P:")
+    }
+    if op == "divf" {
+        return dur_result(rustduration.div_f64(dur(f[1], f[2]), hex_u64(f[3]).from_bits()), "P:")
+    }
+    if op == "mul" or op == "div" or op == "smul" {
+        let a = dur(f[1], f[2])
+        let k = f[3].parse_int() ?? 0
+        if op == "mul" {
+            return odshow(rustduration.checked_mul(a, k))
+        }
+        if op == "div" {
+            return odshow(rustduration.checked_div(a, k))
+        }
+        return dshow(rustduration.saturating_mul(a, k))
+    }
+    let a = dur(f[1], f[2])
+    let b = dur(f[3], f[4])
+    if op == "add" {
+        return odshow(rustduration.checked_add(a, b))
+    }
+    if op == "sub" {
+        return odshow(rustduration.checked_sub(a, b))
+    }
+    if op == "sadd" {
+        return dshow(rustduration.saturating_add(a, b))
+    }
+    if op == "ssub" {
+        return dshow(rustduration.saturating_sub(a, b))
+    }
+    if op == "absdiff" {
+        return dshow(rustduration.abs_diff(a, b))
+    }
+    return "F:" + hex_bits(rustduration.div_duration_f64(a, b))
+}
+
+fn v6_of(h: str) -> RustIpv6Addr {
+    var segs: [i64] = []
+    var k = 0
+    while k < 8 {
+        segs.push(hex_u64(h.substr(4 * k, 4)))
+        k = k + 1
+    }
+    return RustIpv6Addr{ segments: segs }
+}
+
+fn addr_error(e: RustAddrParseError) -> str {
+    return "E:" + hex_text(rustipaddr.parse_error_text(e))
+}
+
+fn parsed_text(kind: str, t: str) -> str {
+    if kind == "ip" {
+        return match rustipaddr.parse_ip(t) {
+            Ok(a) -> hex_text(rustipaddr.ip_text(a))
+            Err(e) -> addr_error(e)
+        }
+    }
+    if kind == "v4" {
+        return match rustipaddr.parse_ipv4(t) {
+            Ok(a) -> hex_text(rustipaddr.ipv4_text(a))
+            Err(e) -> addr_error(e)
+        }
+    }
+    if kind == "v6" {
+        return match rustipaddr.parse_ipv6(t) {
+            Ok(a) -> hex_text(rustipaddr.ipv6_text(a))
+            Err(e) -> addr_error(e)
+        }
+    }
+    if kind == "sock" {
+        return match rustipaddr.parse_socket(t) {
+            Ok(a) -> hex_text(rustipaddr.socket_text(a))
+            Err(e) -> addr_error(e)
+        }
+    }
+    if kind == "sock4" {
+        return match rustipaddr.parse_socket_v4(t) {
+            Ok(a) -> hex_text(rustipaddr.socket_v4_text(a))
+            Err(e) -> addr_error(e)
+        }
+    }
+    return match rustipaddr.parse_socket_v6(t) {
+        Ok(a) -> hex_text(rustipaddr.socket_v6_text(a))
+        Err(e) -> addr_error(e)
+    }
+}
+
+fn spec_text(text: str, spec: str) -> str {
+    return match rustipaddr.format_with(text, spec) {
+        Some(t) -> hex_text(t)
+        None -> "R:" + hex_text(spec)
+    }
+}
+
+fn bit(b: bool) -> str {
+    return if b { "1" } else { "0" }
+}
+
+fn v4_opt(a: Option[RustIpv4Addr]) -> str {
+    return match a {
+        Some(v) -> rustipaddr.ipv4_text(v)
+        None -> "-"
+    }
+}
+
+fn rustipaddr_line(f: [str]) -> str {
+    let op = f[0]
+    if op == "p" {
+        return parsed_text(f[1], unhex(f[2]))
+    }
+    if op == "f4" {
+        return spec_text(rustipaddr.ipv4_text(RustIpv4Addr{ bits: f[1].parse_int() ?? 0 }), unhex(f[2]))
+    }
+    if op == "f6" {
+        return spec_text(rustipaddr.ipv6_text(v6_of(f[1])), unhex(f[2]))
+    }
+    if op == "fs4" {
+        let a = RustSocketAddrV4{ ip: RustIpv4Addr{ bits: f[1].parse_int() ?? 0 }, port: f[2].parse_int() ?? 0 }
+        return spec_text(rustipaddr.socket_v4_text(a), unhex(f[3]))
+    }
+    if op == "fs6" {
+        let a = RustSocketAddrV6{ ip: v6_of(f[1]), port: f[2].parse_int() ?? 0, flowinfo: 0, scope_id: f[3].parse_int() ?? 0 }
+        return spec_text(rustipaddr.socket_v6_text(a), unhex(f[4]))
+    }
+    if op == "c4" {
+        let a = RustIpv4Addr{ bits: f[1].parse_int() ?? 0 }
+        let flags = [rustipaddr.ipv4_is_unspecified(a), rustipaddr.ipv4_is_loopback(a), rustipaddr.ipv4_is_private(a), rustipaddr.ipv4_is_link_local(a),
+            rustipaddr.ipv4_is_multicast(a), rustipaddr.ipv4_is_broadcast(a), rustipaddr.ipv4_is_documentation(a)]
+        let text = flags.map(|b| bit(b)).join("") + " " + rustipaddr.ipv6_text(rustipaddr.to_ipv6_compatible(a)) + " " + rustipaddr.ipv6_text(rustipaddr.to_ipv6_mapped(a))
+        return hex_text(text)
+    }
+    let a = v6_of(f[1])
+    let i = RustIpV6(a)
+    let flags = [rustipaddr.ipv6_is_unspecified(a), rustipaddr.ipv6_is_loopback(a), rustipaddr.ipv6_is_unique_local(a), rustipaddr.ipv6_is_unicast_link_local(a),
+        rustipaddr.ipv6_is_multicast(a), rustipaddr.ip_is_unspecified(i), rustipaddr.ip_is_loopback(i), rustipaddr.ip_is_multicast(i)]
+    let segs = "[" + a.segments.map(|g| g.to_str()).join(", ") + "]"
+    let text = flags.map(|b| bit(b)).join("") + " " + v4_opt(rustipaddr.to_ipv4_mapped(a)) + " " + v4_opt(rustipaddr.to_ipv4(a)) + " " + rustipaddr.ip_text(rustipaddr.to_canonical(a)) + " " + segs
+    return hex_text(text)
+}
+
+fn jq_arg(f: [str], i: i64) -> JqValue {
+    return if i < f.len() { jqformat.parse(unhex(f[i])) ?? JqString("unparsed") } else { JqNull }
+}
+
+fn jq_items(v: JqValue) -> [JqValue] {
+    return match v {
+        JqArray(items) -> items
+        _ -> []
+    }
+}
+
+fn jq_answer(r: JqValue ! JqError) -> str {
+    return match r {
+        Ok(v) -> jqformat.tojson(JqArray([JqNumber("0"), v]))
+        Err(e) -> jqformat.tojson(JqArray([JqNumber("1"), JqString(jqformat.error_text(e))]))
+    }
+}
+
+fn jq_ok(v: JqValue) -> str {
+    return jqformat.tojson(JqArray([JqNumber("0"), v]))
+}
+
+fn jq_list(r: [JqValue] ! JqError) -> str {
+    return match r {
+        Ok(vs) -> jq_ok(JqArray(vs))
+        Err(e) -> jqformat.tojson(JqArray([JqNumber("1"), JqString(jqformat.error_text(e))]))
+    }
+}
+
+fn jqpath_line(f: [str]) -> str {
+    let op = f[0]
+    let a = jq_arg(f, 1)
+    let b = jq_arg(f, 2)
+    if op == "get" {
+        return jq_answer(jqpath.getpath(a, b))
+    }
+    if op == "set" {
+        return jq_answer(jqpath.setpath(a, b, jq_arg(f, 3)))
+    }
+    if op == "del" {
+        return jq_answer(jqpath.delpaths(a, b))
+    }
+    if op == "paths" {
+        return jq_ok(JqArray(jqpath.paths(a)))
+    }
+    if op == "pathsf" {
+        let name = match b {
+            JqString(t) -> t
+            _ -> ""
+        }
+        return jq_list(jqpath.paths_where(a, name))
+    }
+    if op == "te" {
+        return jq_answer(jqpath.to_entries(a))
+    }
+    if op == "fe" {
+        return jq_answer(jqpath.from_entries(a))
+    }
+    if op == "pick" {
+        return jq_answer(jqpath.pick(a, jq_items(b)))
+    }
+    if op == "ts" {
+        return jq_ok(JqArray(jqpath.tostream(a)))
+    }
+    if op == "fs" {
+        return jq_list(jqpath.fromstream(jq_items(a)))
+    }
+    return jq_list(jqpath.truncate_stream(b, jq_items(a)))
+}
+
+fn pj_options(spec: str) -> PerlJsonOptions {
+    var o = perljsonpp.options()
+    if spec == "-" {
+        return o
+    }
+    for name in spec.split(",") {
+        if name == "pretty" {
+            o = perljsonpp.pretty(o)
+        } else if name == "ascii" {
+            o.ascii = true
+        } else if name == "latin1" {
+            o.latin1 = true
+        } else if name == "utf8" {
+            o.utf8 = true
+        } else if name == "indent" {
+            o.indent = true
+        } else if name == "space_before" {
+            o.space_before = true
+        } else if name == "space_after" {
+            o.space_after = true
+        } else if name == "canonical" {
+            o.canonical = true
+        } else if name == "escape_slash" {
+            o.escape_slash = true
+        } else if name == "relaxed" {
+            o.relaxed = true
+        } else if name == "loose" {
+            o.loose = true
+        } else if name == "allow_singlequote" {
+            o.allow_singlequote = true
+        } else if name == "allow_barekey" {
+            o.allow_barekey = true
+        } else if name == "nonref=0" {
+            o.allow_nonref = false
+        } else if name.starts_with("indent_length=") {
+            o.indent_length = name.substr(14, name.len() - 14).parse_int() ?? 3
+        } else if name.starts_with("max_depth=") {
+            o.max_depth = name.substr(10, name.len() - 10).parse_int() ?? 512
+        }
+    }
+    return o
+}
+
+fn pj_build(toks: [str], inout at: i64) -> PerlJsonValue {
+    let t = toks[at]
+    at = at + 1
+    if t == "u" {
+        return JppUndef
+    }
+    if t == "t" {
+        return JppTrue
+    }
+    if t == "f" {
+        return JppFalse
+    }
+    if t.starts_with("i:") {
+        return JppInt(bigint.parse(t.substr(2, t.len() - 2)) ?? bigint.zero())
+    }
+    if t.starts_with("x:") {
+        return JppNum(hex_u64(t.substr(2, t.len() - 2)).from_bits())
+    }
+    if t.starts_with("s:") {
+        return JppStr(unhex(t.substr(2, t.len() - 2)))
+    }
+    if t == "[" {
+        var items: [PerlJsonValue] = []
+        while toks[at] != "]" {
+            items.push(pj_build(toks, at))
+        }
+        at = at + 1
+        return JppArray(items)
+    }
+    var entries: [(str, PerlJsonValue)] = []
+    while toks[at] != "}" {
+        let k = unhex(toks[at].substr(2, toks[at].len() - 2))
+        at = at + 1
+        entries.push((k, pj_build(toks, at)))
+    }
+    at = at + 1
+    return JppHash(entries)
+}
+
+fn pj_dump(v: PerlJsonValue) -> str {
+    return match v {
+        JppUndef -> "u"
+        JppTrue -> "t"
+        JppFalse -> "f"
+        JppInt(n) -> "i:" + bigint.to_str(n)
+        JppNum(x) -> "n:" + perljsonpp.nv_text(x)
+        JppStr(t) -> "s:" + hex_text(t)
+        JppArray(items) -> (["["] + items.map(|x| pj_dump(x)) + ["]"]).join(" ")
+        JppHash(entries) -> {
+            var keys = entries.map(|e| e.0)
+            keys.sort()
+            var parts = ["\{"]
+            for k in keys {
+                for (ek, ev) in entries {
+                    if ek == k {
+                        parts.push("k:" + hex_text(k))
+                        parts.push(pj_dump(ev))
+                    }
+                }
+            }
+            parts.push("}")
+            parts.join(" ")
+        }
+    }
+}
+
+fn pj_error(e: PerlJsonError) -> str {
+    return match e {
+        PerlJsonCroak(m) -> "E:" + hex_text(m)
+        PerlJsonRefused(w) -> "X:" + hex_text(w)
+    }
+}
+
+fn pj_decode(h: str, o: PerlJsonOptions) -> PerlJsonValue ! PerlJsonError {
+    if o.utf8 {
+        return try perljsonpp.decode_bytes(bytes_of(unhex_list(h)), o)
+    }
+    return try perljsonpp.decode(unhex(h), o)
+}
+
+fn perljsonpp_line(f: [str]) -> str {
+    let o = pj_options(f[1])
+    if f[0] == "enc" {
+        var at = 2
+        let v = pj_build(f, at)
+        return match perljsonpp.encode(v, o) {
+            Ok(t) -> "R:" + hex_text(t)
+            Err(e) -> pj_error(e)
+        }
+    }
+    return match pj_decode(f[2], o) {
+        Ok(v) -> "V:" + pj_dump(v)
+        Err(e) -> pj_error(e)
+    }
+}
+
+fn lispprint_line(f: [str]) -> str {
+    let v = LispPrintVars{ base: f[1].parse_int() ?? 10, radix: f[2] == "1", double_default: f[3] == "1" }
+    let kind = f[4]
+    var o = LoChar(f[5].parse_int() ?? 0)
+    if kind == "int" {
+        o = LoInteger(bigint.parse(f[5]) ?? bigint.zero())
+    } else if kind == "ratio" {
+        o = LoRatio(bigint.parse(f[5]) ?? bigint.zero(), bigint.parse(f[6]) ?? bigint.zero())
+    } else if kind == "single" {
+        o = LoSingle(hex_u64(f[5]))
+    } else if kind == "double" {
+        o = LoDouble(hex_u64(f[5]).from_bits())
+    } else if kind == "string" {
+        o = LoString(unhex(f[5]))
+    }
+    return match lp_print(f[0], o, v) {
+        Ok(t) -> hex_text(t)
+        Err(e) -> "R:" + hex_text(lispprint.error_text(e))
+    }
+}
+
+fn lp_print(fname: str, o: LispPrintable, v: LispPrintVars) -> str ! LispPrintError {
+    if fname == "prin1" {
+        return try lispprint.prin1(o, v)
+    }
+    return try lispprint.princ(o, v)
+}
+
+fn ac_list(l: str) -> [str] {
+    return if l == "~" { [] } else { l.split(",").map(|x| unhex(x)) }
+}
+
+fn ac_hexlist(xs: [str]) -> str {
+    return if xs.len() == 0 { "~" } else { xs.map(|x| hex_text(x)).join(",") }
+}
+
+fn ac_error(e: AnsiColorError) -> str {
+    return "E:" + hex_text(perlansicolor.error_text(e))
+}
+
+fn ac_colored(op: str, f: [str], each: Option[str]) -> str ! AnsiColorError {
+    if op == "colored" {
+        return try perlansicolor.colored(unhex(f[2]), ac_list(f[3]), each)
+    }
+    return try perlansicolor.colored_list(ac_list(f[2]), ac_list(f[3]), each)
+}
+
+fn perlansicolor_line(f: [str]) -> str {
+    let op = f[0]
+    if op == "color" {
+        return match perlansicolor.color(ac_list(f[1])) {
+            Ok(r) -> match r {
+                Some(t) -> hex_text(t)
+                None -> "U"
+            }
+            Err(e) -> ac_error(e)
+        }
+    }
+    if op == "colored" or op == "coloredl" {
+        let each = if f[1] == "~" { None } else { Some(unhex(f[1])) }
+        return match ac_colored(op, f, each) {
+            Ok(t) -> hex_text(t)
+            Err(e) -> ac_error(e)
+        }
+    }
+    if op == "uncolor" {
+        return match perlansicolor.uncolor(ac_list(f[1])) {
+            Ok(names) -> ac_hexlist(names)
+            Err(e) -> ac_error(e)
+        }
+    }
+    if op == "strip" {
+        return ac_hexlist(perlansicolor.colorstrip(ac_list(f[1])))
+    }
+    return if perlansicolor.colorvalid(ac_list(f[1])) { "1" } else { "0" }
+}
+
+fn main() / {io} {
+    let argv = args()
+    var i = 0
+    while i + 1 < argv.len() {
+        let op = argv[i]
+        let text = match read_bytes(argv[i + 1]) {
+            Ok(d) -> d.to_str()
+            Err(_e) -> ""
+        }
+        for l in text.split("\n").filter(|l| l.len() > 0) {
+            if op == "perlansicolor" {
+                print(perlansicolor_line(l.split(" ")))
+            }
+            if op == "lispprint" {
+                print(lispprint_line(l.split(" ")))
+            }
+            if op == "perljsonpp" {
+                print(perljsonpp_line(l.split(" ")))
+            }
+            if op == "jqpath" {
+                print(jqpath_line(l.split(" ")))
+            }
+            if op == "rustipaddr" {
+                print(rustipaddr_line(l.split(" ")))
+            }
+            if op == "rustduration" {
+                print(rustduration_line(l.split(" ")))
+            }
+            if op == "perltimelocal" {
+                print(perltimelocal_line(l.split(" ")))
+            }
+            if op == "perlfilespec" {
+                print(perlfilespec_line(l.split(" ")))
+            }
+        }
+        i = i + 2
+    }
+}

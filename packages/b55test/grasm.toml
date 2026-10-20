@@ -1,0 +1,40 @@
+[package]
+name = "b55test"
+version = "1.0.0"
+capabilities = ["io"]
+
+[dependencies.sqlitelike]
+path = "../sqlitelike"
+version = "^1.0.0"
+
+[dependencies.nodepathwin32]
+path = "../nodepathwin32"
+version = "^1.0.0"
+
+[dependencies.rubyinspect]
+path = "../rubyinspect"
+version = "^1.0.0"
+
+[dependencies.rubynumparse]
+path = "../rubynumparse"
+version = "^1.0.0"
+
+[dependencies.bigint]
+path = "../bigint"
+version = "^1.0.0"
+
+[dependencies.luapack]
+path = "../luapack"
+version = "^1.0.0"
+
+[dependencies.jqformat]
+path = "../jqformat"
+version = "^1.0.0"
+
+[dependencies.luautf8]
+path = "../luautf8"
+version = "^1.0.0"
+
+[dependencies.javaintegers]
+path = "../javaintegers"
+version = "^1.0.0"

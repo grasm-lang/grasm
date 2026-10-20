@@ -1,0 +1,292 @@
+// Python's `reprlib.Repr`, as CPython 3.13 abbreviates a value: the
+// `repr` that debuggers, log lines and error messages use when a value is
+// too big to print whole.
+//
+// Values are `pyliteral`'s (what `ast.literal_eval` reads). Every option of
+// `Repr` that applies to them is here: `maxlevel`, `maxtuple`, `maxlist`,
+// `maxdict`, `maxset`, `maxstring`, `maxlong`, `maxother`, `fillvalue` and
+// `indent` (3.12+). What Python does with them:
+//
+//   - A str longer than `maxstring` in its repr keeps `(maxstring-3)//2`
+//     characters of repr at the front and the rest of the budget at the
+//     back, re-quoting from the shortened string, so the quotes and escapes
+//     around the fill come from the abbreviated text; an int is cut the
+//     same way by `maxlong`, and anything else (float, bytes, None, ...)
+//     by `maxother`.
+//   - A container shows its first `max...` items and then the fill; below
+//     `maxlevel` a non-empty container is just its brackets around the
+//     fill. A one-item tuple keeps its comma only without `indent`.
+//   - Sets and dict keys are sorted when Python can sort them; otherwise a
+//     dict keeps its insertion order.
+//   - `indent` (spaces or a string) puts one item per line, indented by
+//     level; a negative indent is ValueError "Repr.indent cannot be
+//     negative int (was -1)", raised only when there is something to
+//     indent, and a negative item limit raises islice's ValueError.
+//   - An int of more than 4300 digits makes `repr` raise Python's
+//     ValueError about the integer string conversion limit.
+//
+// Limits: arrays and deques are not values here. A set whose members
+// Python cannot sort is written in the order given, where Python uses
+// its hash-table order; and for dict keys that Python can only partly
+// order, whether its sort gives up depends on which pairs timsort
+// compares -- this sorts when every pair is ordered and keeps insertion
+// order otherwise.
+
+import bigint
+import pycharclass
+import pyliteral
+
+type PyReprIndent = | PyReprNoIndent | PyReprIndentSpaces(n: i64) | PyReprIndentText(text: str)
+
+/// `Repr`'s attributes.
+type PyReprOptions = {
+    maxlevel: i64,
+    maxtuple: i64,
+    maxlist: i64,
+    maxdict: i64,
+    maxset: i64,
+    maxstring: i64,
+    maxlong: i64,
+    maxother: i64,
+    fillvalue: str,
+    indent: PyReprIndent,
+}
+
+type PyReprError = | PyReprValueError(msg: str)
+
+pub fn error_text(e: PyReprError) -> str {
+    return match e {
+        PyReprValueError(m) -> m
+    }
+}
+
+/// `Repr()`'s defaults.
+pub fn default_options() -> PyReprOptions {
+    return PyReprOptions{ maxlevel: 6, maxtuple: 6, maxlist: 6, maxdict: 4, maxset: 6, maxstring: 30, maxlong: 40, maxother: 30, fillvalue: "...",
+        indent: PyReprNoIndent }
+}
+
+fn hex_digits(v: i64, width: i64) -> str {
+    return v.to_base(16).pad_start(width, "0")
+}
+
+/// Python 3.13's `repr` of a str, by CPython 3.13's table of printable
+/// characters (pycharclass).
+pub fn repr_text(s: str) -> str {
+    let cs = s.codes()
+    let quote = if cs.contains(39) and not cs.contains(34) { 34 } else { 39 }
+    var out: [str] = [quote.to_char()]
+    for c in cs {
+        if c == quote or c == 92 {
+            out.push("\\" + c.to_char())
+        } else if c == 9 {
+            out.push("\\t")
+        } else if c == 10 {
+            out.push("\\n")
+        } else if c == 13 {
+            out.push("\\r")
+        } else if c < 32 or c == 127 {
+            out.push("\\x" + hex_digits(c, 2))
+        } else if c < 127 or pycharclass.is_printable(c) {
+            out.push(c.to_char())
+        } else if c < 256 {
+            out.push("\\x" + hex_digits(c, 2))
+        } else if c < 65536 {
+            out.push("\\u" + hex_digits(c, 4))
+        } else {
+            out.push("\\U" + hex_digits(c, 8))
+        }
+    }
+    out.push(quote.to_char())
+    return out.join("")
+}
+
+/// Python's `s[:k]` and `s[k:]` on a list of characters.
+fn clamp_index(k: i64, n: i64) -> i64 {
+    if k < 0 {
+        return if k + n < 0 { 0 } else { k + n }
+    }
+    return if k > n { n } else { k }
+}
+
+fn head(cs: [str], k: i64) -> [str] {
+    return cs.slice(0, clamp_index(k, cs.len()))
+}
+
+fn tail(cs: [str], k: i64) -> [str] {
+    return cs.slice(clamp_index(k, cs.len()), cs.len())
+}
+
+fn budget(limit: i64) -> (i64, i64) {
+    let i0 = (limit - 3) / 2
+    let i = if i0 < 0 { 0 } else { i0 }
+    let j0 = limit - 3 - i
+    return (i, if j0 < 0 { 0 } else { j0 })
+}
+
+/// `s[:i] + fill + s[len(s)-j:]` when `s` is longer than `limit`.
+fn shorten(s: str, limit: i64, fill: str) -> str {
+    let cs = s.chars()
+    if cs.len() <= limit {
+        return s
+    }
+    let b = budget(limit)
+    return head(cs, b.0).join("") + fill + tail(cs, cs.len() - b.1).join("")
+}
+
+fn repr_str(o: PyReprOptions, x: str) -> str {
+    let xs = x.chars()
+    let s = repr_text(head(xs, o.maxstring).join(""))
+    if s.len() <= o.maxstring {
+        return s
+    }
+    let b = budget(o.maxstring)
+    let shorter = repr_text(head(xs, b.0).join("") + tail(xs, xs.len() - b.1).join(""))
+    let sc = shorter.chars()
+    return head(sc, b.0).join("") + o.fillvalue + tail(sc, sc.len() - b.1).join("")
+}
+
+fn repr_int(o: PyReprOptions, x: BigInt) -> str ! PyReprError {
+    let s = bigint.to_str(x)
+    let digits = if bigint.sign(x) < 0 { s.len() - 1 } else { s.len() }
+    if digits > 4300 {
+        fail(PyReprValueError("Exceeds the limit (4300 digits) for integer string conversion; use sys.set_int_max_str_digits() to increase the limit"))
+    }
+    return shorten(s, o.maxlong, o.fillvalue)
+}
+
+fn indent_unit(o: PyReprOptions) -> str ! PyReprError {
+    return match o.indent {
+        PyReprIndentSpaces(n) -> if n < 0 {
+            fail(PyReprValueError("Repr.indent cannot be negative int (was {n})"))
+        } else {
+            " ".repeat(n)
+        }
+        PyReprIndentText(t) -> t
+        PyReprNoIndent -> ""
+    }
+}
+
+/// `_join`: the pieces on one line, or one per line, indented by level.
+fn join_pieces(o: PyReprOptions, pieces: [str], level: i64) -> str ! PyReprError {
+    match o.indent {
+        PyReprNoIndent -> return pieces.join(", ")
+        _ -> {}
+    }
+    if pieces.len() == 0 {
+        return ""
+    }
+    let unit = try indent_unit(o)
+    let depth = o.maxlevel - level + 1
+    let sep = ",\n" + (if depth > 0 { unit.repeat(depth) } else { "" })
+    var all = [""]
+    for p in pieces {
+        all.push(p)
+    }
+    all.push("")
+    let joined = all.join(sep).chars()
+    let end = if unit.len() == 0 { joined.len() } else { joined.len() - unit.len() }
+    return joined.slice(if joined.len() > 0 { 1 } else { 0 }, if end < 1 { 1 } else { end }).join("")
+}
+
+fn islice_error() -> PyReprError {
+    return PyReprValueError("Stop argument for islice() must be None or an integer: 0 <= x <= sys.maxsize.")
+}
+
+fn repr_items(o: PyReprOptions, xs: [ref PyValue], level: i64, brackets: (str, str), maxiter: i64, trail: str) -> str ! PyReprError {
+    let n = xs.len()
+    if level <= 0 and n > 0 {
+        return brackets.0 + o.fillvalue + brackets.1
+    }
+    if maxiter < 0 {
+        fail(islice_error())
+    }
+    var pieces: [str] = []
+    for k in 0..(if n < maxiter { n } else { maxiter }) {
+        pieces.push(try repr_level(o, xs[k], level - 1))
+    }
+    if n > maxiter {
+        pieces.push(o.fillvalue)
+    }
+    let s = try join_pieces(o, pieces, level)
+    let plain = match o.indent {
+        PyReprNoIndent -> true
+        _ -> false
+    }
+    let right = if n == 1 and trail.len() > 0 and plain { trail + brackets.1 } else { brackets.1 }
+    return brackets.0 + s + right
+}
+
+/// `_possibly_sorted`: sorted when every pair is ordered, else as given.
+fn possibly_sorted(xs: [ref PyValue]) -> [ref PyValue] {
+    for a in xs {
+        for b in xs {
+            if pyliteral.less(a, b) == None {
+                return xs
+            }
+        }
+    }
+    var out: [ref PyValue] = []
+    for x in xs {
+        var at = out.len()
+        while at > 0 and (pyliteral.less(x, out[at - 1]) ?? false) {
+            at = at - 1
+        }
+        var next: [ref PyValue] = out.slice(0, at)
+        next.push(x)
+        for y in out.slice(at, out.len()) {
+            next.push(y)
+        }
+        out = next
+    }
+    return out
+}
+
+fn repr_dict(o: PyReprOptions, keys: [ref PyValue], values: [ref PyValue], level: i64) -> str ! PyReprError {
+    let n = keys.len()
+    if n == 0 {
+        return "\{}"
+    }
+    if level <= 0 {
+        return "\{" + o.fillvalue + "}"
+    }
+    if o.maxdict < 0 {
+        fail(islice_error())
+    }
+    var pieces: [str] = []
+    for key in possibly_sorted(keys) {
+        if pieces.len() >= o.maxdict {
+            break
+        }
+        var value = key
+        for k in 0..n {
+            if pyliteral.equals(keys[k], key) {
+                value = values[k]
+            }
+        }
+        let kr = try repr_level(o, key, level - 1)
+        pieces.push(kr + ": " + (try repr_level(o, value, level - 1)))
+    }
+    if n > o.maxdict {
+        pieces.push(o.fillvalue)
+    }
+    return "\{" + (try join_pieces(o, pieces, level)) + "}"
+}
+
+/// `repr1(x, level)`.
+fn repr_level(o: PyReprOptions, x: ref PyValue, level: i64) -> str ! PyReprError {
+    return match x {
+        PyStr(s) -> repr_str(o, s)
+        PyInt(i) -> try repr_int(o, i)
+        PyTuple(items) -> try repr_items(o, items, level, ("(", ")"), o.maxtuple, ",")
+        PyList(items) -> try repr_items(o, items, level, ("[", "]"), o.maxlist, "")
+        PySet(items) -> if items.len() == 0 { "set()" } else { try repr_items(o, possibly_sorted(items), level, ("\{", "}"), o.maxset, "") }
+        PyDict(keys, values) -> try repr_dict(o, keys, values, level)
+        _ -> shorten(pyliteral.repr(x), o.maxother, o.fillvalue)
+    }
+}
+
+/// `Repr(...).repr(x)`.
+pub fn repr(o: PyReprOptions, x: ref PyValue) -> str ! PyReprError {
+    return try repr_level(o, x, o.maxlevel)
+}

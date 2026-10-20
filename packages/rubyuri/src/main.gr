@@ -1,0 +1,1191 @@
+// Ruby's `URI`, as Ruby 2.6 parses, prints and joins URIs: `URI.parse`
+// (its RFC 3986 parser and the scheme classes), `URI#to_s`, `URI.join`,
+// and `URI.encode_www_form`, `decode_www_form`,
+// `encode_www_form_component` and `decode_www_form_component`.
+//
+// Ruby services route and sign requests through these, and a peer has to
+// take apart and rebuild the same strings and refuse the same ones:
+//
+//   - `parse` follows Ruby 2.6's two regular expressions match for match:
+//     `scheme:` with `//authority`, an absolute path, a rootless path
+//     (which makes the URI opaque, its query kept inside the opaque part)
+//     or nothing; otherwise a relative reference. Userinfo, host and
+//     port are split as the regexp splits them: a host is a bracketed
+//     IPv6 or IPvFuture literal or a run of name characters (an empty one
+//     is no host), a port is digits only. Anything else is
+//     InvalidURIError "bad URI(is not URI?): <inspect>"; non-ASCII is
+//     "URI must be ascii only <dump>".
+//   - The relative-reference expression of 2.6 has misplaced brackets
+//     around its IP literal, so there `[` starts an IPv6 address with no
+//     closing bracket (`//[::1` has host `[::1`, `//[::1]/x` is refused)
+//     and an IPvFuture literal ends in `]` without opening one; that is
+//     reproduced, backtracking order included.
+//   - The query has tabs and line breaks removed and `"`, `'`, `<`, `>`,
+//     backquote, space and control characters percent-escaped; the scheme
+//     is lower-cased, the port read as a number and the default port
+//     filled in (http 80, https 443, ftp 21, ldap 389, ldaps 636).
+//   - The scheme classes: FTP moves a leading `/` of the path to `%2F`
+//     and splits off `;type=`; File makes `localhost` and a missing host
+//     empty and drops userinfo and port; LDAP refuses a fragment or an
+//     opaque form ("bad LDAP URL") and splits its query into attributes,
+//     scope, filter and extensions; MailTo checks its addresses ("missing
+//     opaque part for mailto URL", "unrecognised opaque part for
+//     mailtoURL: ...") and rebuilds itself from them and its headers.
+//   - `join` merges as `Generic#merge`: an absolute reference replaces
+//     the base, two relative ones are BadURIError "both URI are relative",
+//     paths merge by Ruby's own `merge_path`, a query on a `mailto:` base
+//     is "query conflicts with opaque", and an `ftp:` base that changes
+//     raises NoMethodError, as 2.6's `FTP#merge` calls `typecode` on the
+//     String it was given.
+//   - The www-form functions: `encode_www_form_component` keeps
+//     `*-.0-9A-Z_a-z`, writes a space as `+` and everything else as `%XX`
+//     of its UTF-8 bytes; decoding refuses a `%` without two hex digits
+//     (ArgumentError "invalid %-encoding (...)"); `decode_www_form` splits
+//     on `&`, keeps empty fields, takes the first `=`, and replaces bytes
+//     that are not UTF-8 with U+FFFD.
+//
+// Limits: the string forms only (no `build`, no component setters, no
+// `URI::RFC2396_Parser`); `encode_www_form` takes strings and nil, not
+// other objects.
+
+import bigint
+
+/// A parsed URI: its class, the fields Ruby keeps, and the scheme
+/// classes' own.
+type RbUri = {
+    kind: str,
+    scheme: Option[str],
+    user: Option[str],
+    password: Option[str],
+    host: Option[str],
+    port: Option[str],
+    path: Option[str],
+    query: Option[str],
+    fragment: Option[str],
+    opaque: Option[str],
+    typecode: Option[str],
+    dn: Option[str],
+    attributes: Option[str],
+    scope: Option[str],
+    filter: Option[str],
+    extensions: Option[str],
+    to: Option[str],
+    headers: [[str]],
+}
+
+/// Ruby's exception: class name and message.
+type RbUriError = | RbUriError(class_name: str, message: str)
+
+pub fn error_class(e: RbUriError) -> str {
+    return match e {
+        RbUriError(c, _m) -> c
+    }
+}
+
+pub fn error_message(e: RbUriError) -> str {
+    return match e {
+        RbUriError(_c, m) -> m
+    }
+}
+
+fn invalid_uri(m: str) -> RbUriError {
+    return RbUriError("URI::InvalidURIError", m)
+}
+
+fn invalid_component(m: str) -> RbUriError {
+    return RbUriError("URI::InvalidComponentError", m)
+}
+
+// ---- character classes
+
+fn is_hex(c: i64) -> bool {
+    return c >= 48 and c <= 57 or c >= 65 and c <= 70 or c >= 97 and c <= 102
+}
+
+fn is_digit(c: i64) -> bool {
+    return c >= 48 and c <= 57
+}
+
+fn is_alpha(c: i64) -> bool {
+    return c >= 65 and c <= 90 or c >= 97 and c <= 122
+}
+
+/// `[!$&-.0-;=A-Z_a-z~]`: userinfo (and IPvFuture) characters.
+fn userinfo_char(c: i64) -> bool {
+    return c == 33 or c == 36 or c >= 38 and c <= 46 or c >= 48 and c <= 59 or c == 61 or is_alpha(c) or c == 95 or c == 126
+}
+
+/// `[!$&-.0-9;=A-Z_a-z~]`: reg-name characters (no `:`).
+fn regname_char(c: i64) -> bool {
+    return userinfo_char(c) and c != 58
+}
+
+/// `[!$&-.0-;=@-Z_a-z~]`: path segment characters.
+fn segment_char(c: i64) -> bool {
+    return userinfo_char(c) or c == 64
+}
+
+/// `segment-nz-nc`: a segment character other than `:`.
+fn noscheme_char(c: i64) -> bool {
+    return segment_char(c) and c != 58
+}
+
+/// Which class a run is of.
+fn class_ok(class: i64, c: i64) -> bool {
+    return if class == 0 { userinfo_char(c) } else if class == 1 { regname_char(c) } else if class == 2 { segment_char(c) } else if class == 3 {
+        noscheme_char(c)
+    } else { segment_char(c) or c == 47 or c == 63 }
+}
+
+/// The end of the longest run of `%XX` and characters of `class` from `p`
+/// (0 userinfo, 1 reg-name, 2 segment, 3 segment-nz-nc, 4 fragment).
+fn run(s: [i64], p: i64, class: i64) -> i64 {
+    var q = p
+    while q < s.len() {
+        if s[q] == 37 and q + 2 < s.len() and is_hex(s[q + 1]) and is_hex(s[q + 2]) {
+            q = q + 3
+        } else if class_ok(class, s[q]) {
+            q = q + 1
+        } else {
+            return q
+        }
+    }
+    return q
+}
+
+fn text(s: [i64], from: i64, to: i64) -> str {
+    return s.slice(from, to).map(|c| c.to_char()).join("")
+}
+
+// ---- IPv6, by ordered backtracking
+
+/// The pieces of the IPv6 expression.
+type RbUriPat =
+    | RbUriHex(min: i64, max: i64, lazy: bool)
+    | RbUriLit(c: i64)
+    | RbUriSeq(items: [ref RbUriPat])
+    | RbUriAlt(items: [ref RbUriPat])
+    | RbUriRep(item: ref RbUriPat, min: i64, max: i64, lazy: bool)
+    | RbUriOctet
+
+fn hex_ends(s: [i64], p: i64, min: i64, max: i64, lazy: bool) -> [i64] {
+    var n = 0
+    while n < max and p + n < s.len() and is_hex(s[p + n]) {
+        n = n + 1
+    }
+    var out: [i64] = []
+    var k = if lazy { min } else { n }
+    while k >= min and k <= n {
+        out.push(p + k)
+        k = if lazy { k + 1 } else { k - 1 }
+    }
+    return out
+}
+
+/// dec-octet: `[1-9]\d|1\d{2}|2[0-4]\d|25[0-5]|\d`, in that order.
+fn octet_ends(s: [i64], p: i64) -> [i64] {
+    let d = |i| if p + i < s.len() and is_digit(s[p + i]) { s[p + i] - 48 } else { 0 - 1 }
+    var out: [i64] = []
+    if d(0) >= 1 and d(1) >= 0 {
+        out.push(p + 2)
+    }
+    if d(0) == 1 and d(1) >= 0 and d(2) >= 0 {
+        out.push(p + 3)
+    }
+    if d(0) == 2 and d(1) >= 0 and d(1) <= 4 and d(2) >= 0 {
+        out.push(p + 3)
+    }
+    if d(0) == 2 and d(1) == 5 and d(2) >= 0 and d(2) <= 5 {
+        out.push(p + 3)
+    }
+    if d(0) >= 0 {
+        out.push(p + 1)
+    }
+    return out
+}
+
+/// Every end position `pat` can reach from `p`, in the order a
+/// backtracking engine tries them.
+fn ends(pat: ref RbUriPat, s: [i64], p: i64) -> [i64] {
+    return match pat {
+        RbUriHex(mn, mx, lz) -> hex_ends(s, p, mn, mx, lz)
+        RbUriLit(c) -> if p < s.len() and s[p] == c { [p + 1] } else { [] }
+        RbUriOctet -> octet_ends(s, p)
+        RbUriSeq(items) -> seq_ends(items, 0, s, p)
+        RbUriAlt(items) -> {
+            var out: [i64] = []
+            for it in items {
+                for e in ends(it, s, p) {
+                    out.push(e)
+                }
+            }
+            out
+        }
+        RbUriRep(item, mn, mx, lz) -> rep_ends(item, mn, mx, lz, 0, s, p)
+    }
+}
+
+fn seq_ends(items: [ref RbUriPat], i: i64, s: [i64], p: i64) -> [i64] {
+    if i >= items.len() {
+        return [p]
+    }
+    var out: [i64] = []
+    for e in ends(items[i], s, p) {
+        for f in seq_ends(items, i + 1, s, e) {
+            out.push(f)
+        }
+    }
+    return out
+}
+
+fn rep_ends(item: ref RbUriPat, mn: i64, mx: i64, lz: bool, k: i64, s: [i64], p: i64) -> [i64] {
+    var out: [i64] = []
+    if k >= mn and lz {
+        out.push(p)
+    }
+    if k < mx {
+        for e in ends(item, s, p) {
+            if e > p {
+                for f in rep_ends(item, mn, mx, lz, k + 1, s, e) {
+                    out.push(f)
+                }
+            }
+        }
+    }
+    if k >= mn and not lz {
+        out.push(p)
+    }
+    return out
+}
+
+fn hx() -> ref RbUriPat {
+    return ref(RbUriHex(1, 4, false))
+}
+
+fn colon() -> ref RbUriPat {
+    return ref(RbUriLit(58))
+}
+
+fn h16c() -> ref RbUriPat {
+    return ref(RbUriSeq([hx(), colon()]))
+}
+
+fn dcolon() -> ref RbUriPat {
+    return ref(RbUriSeq([colon(), colon()]))
+}
+
+fn ls32() -> ref RbUriPat {
+    let dot = ref(RbUriLit(46))
+    let o = ref(RbUriOctet)
+    let ipv4 = ref(RbUriSeq([o, dot, o, dot, o, dot, o]))
+    return ref(RbUriAlt([ref(RbUriSeq([hx(), colon(), hx()])), ipv4]))
+}
+
+/// `(?:(?:\h{1,4}:){,n}\h{1,4})?`
+fn head(n: i64) -> ref RbUriPat {
+    return ref(RbUriRep(ref(RbUriSeq([ref(RbUriRep(h16c(), 0, n, false)), hx()])), 0, 1, false))
+}
+
+/// The nine alternatives of the IPv6address expression, in order.
+fn ipv6() -> ref RbUriPat {
+    let rep = |n| ref(RbUriRep(h16c(), n, n, false))
+    return ref(RbUriAlt([
+        ref(RbUriSeq([rep(6), ls32()])),
+        ref(RbUriSeq([dcolon(), rep(5), ls32()])),
+        ref(RbUriSeq([ref(RbUriHex(1, 4, true)), dcolon(), rep(4), ls32()])),
+        ref(RbUriSeq([head(1), dcolon(), rep(3), ls32()])),
+        ref(RbUriSeq([head(2), dcolon(), rep(2), ls32()])),
+        ref(RbUriSeq([head(3), dcolon(), h16c(), ls32()])),
+        ref(RbUriSeq([head(4), dcolon(), ls32()])),
+        ref(RbUriSeq([head(5), dcolon(), hx()])),
+        ref(RbUriSeq([head(6), dcolon()])),
+    ]))
+}
+
+/// IPvFuture `v\h+\.[!$&-.0-;=A-Z_a-z~]+` from `p`: where it ends, or -1.
+fn ipvfuture_end(s: [i64], p: i64) -> i64 {
+    if p >= s.len() or s[p] != 118 {
+        return 0 - 1
+    }
+    var q = p + 1
+    while q < s.len() and is_hex(s[q]) {
+        q = q + 1
+    }
+    if q == p + 1 or q >= s.len() or s[q] != 46 {
+        return 0 - 1
+    }
+    let r = q + 1
+    q = r
+    while q < s.len() and userinfo_char(s[q]) {
+        q = q + 1
+    }
+    return if q == r { 0 - 1 } else { q }
+}
+
+// ---- the two expressions
+
+/// What the expression captured.
+type RbUriParts = {
+    scheme: Option[str],
+    userinfo: Option[str],
+    host: Option[str],
+    port: Option[str],
+    path: Option[str],
+    opaque: Option[str],
+    query: Option[str],
+    fragment: Option[str],
+}
+
+fn no_parts() -> RbUriParts {
+    return RbUriParts{ scheme: None, userinfo: None, host: None, port: None, path: None, opaque: None, query: None, fragment: None }
+}
+
+/// `(?:\?query)?(?:\#fragment)?\z` from `p`.
+fn tail(s: [i64], p: i64) -> Option[(Option[str], Option[str])] {
+    if p == s.len() {
+        return Some((None, None))
+    }
+    var q = p
+    var query: Option[str] = None
+    if s[q] == 63 {
+        var e = q + 1
+        while e < s.len() and s[e] != 35 {
+            e = e + 1
+        }
+        query = Some(text(s, q + 1, e))
+        q = e
+        if q == s.len() {
+            return Some((query, None))
+        }
+    }
+    if s[q] != 35 {
+        return None
+    }
+    let e = run(s, q + 1, 4)
+    return if e == s.len() { Some((query, Some(text(s, q + 1, e)))) } else { None }
+}
+
+/// The host alternatives at `h`, as end positions in the order the
+/// expression tries them; `h` itself means no host.
+fn host_ends(s: [i64], h: i64, relative: bool) -> [i64] {
+    var out: [i64] = []
+    if h < s.len() and s[h] == 91 {
+        if relative {
+            for e in ends(ipv6(), s, h + 1) {
+                out.push(e)
+            }
+        } else {
+            var close = h + 1
+            while close < s.len() and s[close] != 93 {
+                close = close + 1
+            }
+            let full = close < s.len() and (ends(ipv6(), s, h + 1).contains(close) or ipvfuture_end(s, h + 1) == close)
+            if full {
+                out.push(close + 1)
+            }
+        }
+    }
+    if relative {
+        let f = ipvfuture_end(s, h)
+        if f >= 0 and f < s.len() and s[f] == 93 {
+            out.push(f + 1)
+        }
+    }
+    let r = run(s, h, 1)
+    if r > h {
+        out.push(r)
+    }
+    out.push(h)
+    return out
+}
+
+/// `//authority path-abempty` and the tail, from `p` (just past `//`).
+fn authority(s: [i64], p: i64, relative: bool) -> Option[RbUriParts] {
+    let u = run(s, p, 0)
+    var starts: [(Option[str], i64)] = []
+    if u < s.len() and s[u] == 64 {
+        starts.push((Some(text(s, p, u)), u + 1))
+    }
+    starts.push((None, p))
+    for st in starts {
+        let (userinfo, h) = st
+        for e in host_ends(s, h, relative) {
+            match after_host(s, e) {
+                Some(rest) -> {
+                    var parts = rest
+                    parts.userinfo = userinfo
+                    parts.host = if e > h { Some(text(s, h, e)) } else { None }
+                    return Some(parts)
+                }
+                None -> ()
+            }
+        }
+    }
+    return None
+}
+
+/// `(?::port)?`, the path and the tail after a host ending at `e`.
+fn after_host(s: [i64], e: i64) -> Option[RbUriParts] {
+    var options: [(Option[str], i64)] = []
+    if e < s.len() and s[e] == 58 {
+        var d = e + 1
+        while d < s.len() and is_digit(s[d]) {
+            d = d + 1
+        }
+        options.push((Some(text(s, e + 1, d)), d))
+    }
+    options.push((None, e))
+    for opt in options {
+        let (port, q) = opt
+        let pe = abempty_end(s, q)
+        match tail(s, pe) {
+            Some(t) -> {
+                var parts = no_parts()
+                parts.port = port
+                parts.path = Some(text(s, q, pe))
+                parts.query = t.0
+                parts.fragment = t.1
+                return Some(parts)
+            }
+            None -> ()
+        }
+    }
+    return None
+}
+
+/// `path-abempty`: `(/segment)*`, longest.
+fn abempty_end(s: [i64], p: i64) -> i64 {
+    var q = p
+    while q < s.len() and s[q] == 47 {
+        q = run(s, q + 1, 2)
+    }
+    return q
+}
+
+/// The path alternatives that are not `//authority`: absolute, rootless
+/// (or no-scheme for a relative reference), empty.
+fn plain_path(s: [i64], p: i64, relative: bool) -> Option[RbUriParts] {
+    if p < s.len() and s[p] == 47 {
+        let first = run(s, p + 1, 2)
+        let pe = if first > p + 1 { abempty_end(s, first) } else { p + 1 }
+        return with_path(s, p, pe, false)
+    }
+    let first = run(s, p, if relative { 3 } else { 2 })
+    if first > p {
+        return with_path(s, p, abempty_end(s, first), not relative)
+    }
+    return with_path(s, p, p, false)
+}
+
+fn with_path(s: [i64], p: i64, pe: i64, opaque: bool) -> Option[RbUriParts] {
+    let t = match tail(s, pe) {
+        Some(x) -> x
+        None -> return None
+    }
+    var parts = no_parts()
+    let path = text(s, p, pe)
+    if opaque {
+        parts.opaque = Some(match t.0 {
+            Some(q) -> path + "?" + q
+            None -> path
+        })
+    } else {
+        parts.path = Some(path)
+        parts.query = t.0
+    }
+    parts.fragment = t.1
+    return Some(parts)
+}
+
+fn hier(s: [i64], p: i64, relative: bool) -> Option[RbUriParts] {
+    if p + 1 < s.len() and s[p] == 47 and s[p + 1] == 47 {
+        match authority(s, p + 2, relative) {
+            Some(parts) -> return Some(parts)
+            None -> ()
+        }
+    }
+    return plain_path(s, p, relative)
+}
+
+/// RFC3986_Parser#split.
+fn split(s: [i64]) -> RbUriParts ! RbUriError {
+    if s.len() > 0 and is_alpha(s[0]) {
+        var i = 1
+        while i < s.len() and (is_alpha(s[i]) or is_digit(s[i]) or s[i] == 43 or s[i] == 45 or s[i] == 46) {
+            i = i + 1
+        }
+        if i < s.len() and s[i] == 58 {
+            match hier(s, i + 1, false) {
+                Some(parts) -> {
+                    var out = parts
+                    out.scheme = Some(text(s, 0, i))
+                    return out
+                }
+                None -> ()
+            }
+        }
+    }
+    return match hier(s, 0, true) {
+        Some(parts) -> parts
+        None -> fail(invalid_uri("bad URI(is not URI?): " + inspect(s)))
+    }
+}
+
+// ---- inspect and dump
+
+fn hex_upper(n: i64, width: i64) -> str {
+    let d = "0123456789ABCDEF"
+    var out = ""
+    var v = n
+    while v > 0 {
+        out = d.substr(v % 16, 1) + out
+        v = v / 16
+    }
+    return out.pad_start(width, "0")
+}
+
+fn common_escape(c: i64, next: i64) -> Option[str] {
+    if c == 34 or c == 92 {
+        return Some("\\" + c.to_char())
+    }
+    if c == 35 and (next == 123 or next == 36 or next == 64) {
+        return Some("\\#")
+    }
+    let named = [(10, "n"), (13, "r"), (9, "t"), (12, "f"), (11, "v"), (8, "b"), (7, "a"), (27, "e")].find(|q| q.0 == c)
+    return match named {
+        Some(q) -> Some("\\" + q.1)
+        None -> if c >= 32 and c < 127 { Some(c.to_char()) } else { None }
+    }
+}
+
+/// `String#inspect` of an ASCII string.
+fn inspect(s: [i64]) -> str {
+    var out = "\""
+    var i = 0
+    while i < s.len() {
+        let next = if i + 1 < s.len() { s[i + 1] } else { 0 - 1 }
+        out = out + (common_escape(s[i], next) ?? "\\u" + hex_upper(s[i], 4))
+        i = i + 1
+    }
+    return out + "\""
+}
+
+/// `String#dump` of UTF-8 text.
+fn dump(cs: [i64]) -> str {
+    var out = "\""
+    var i = 0
+    while i < cs.len() {
+        let c = cs[i]
+        let next = if i + 1 < cs.len() { cs[i + 1] } else { 0 - 1 }
+        let plain = if c < 128 { common_escape(c, next) } else { None }
+        out = out + (plain ?? (if c < 128 { "\\x" + hex_upper(c, 2) } else if c < 65536 { "\\u" + hex_upper(c, 4) } else { "\\u\{" + hex_upper(c, 1) + "}" }))
+        i = i + 1
+    }
+    return out + "\""
+}
+
+// ---- building the URI objects
+
+fn ascii_down(t: str) -> str {
+    return t.codes().map(|c| if c >= 65 and c <= 90 { (c + 32).to_char() } else { c.to_char() }).join("")
+}
+
+fn ascii_up(t: str) -> str {
+    return t.codes().map(|c| if c >= 97 and c <= 122 { (c - 32).to_char() } else { c.to_char() }).join("")
+}
+
+fn default_port(kind: str) -> Option[str] {
+    return if kind == "HTTP" { Some("80") } else if kind == "HTTPS" { Some("443") } else if kind == "FTP" { Some("21") } else if kind == "LDAP" {
+        Some("389")
+    } else if kind == "LDAPS" { Some("636") } else { None }
+}
+
+/// `Generic#query=`: tabs and line breaks dropped, the rest escaped.
+fn query_set(v: Option[str]) -> Option[str] {
+    return match v {
+        Some(q) -> Some(q.codes().filter(|c| c != 9 and c != 13 and c != 10).map(|c| if c == 33 or c >= 36 and c <= 38 or c >= 40 and c <= 59 or c == 61 or c >= 63 and c <= 95 or
+            c >= 97 and c <= 126 { c.to_char() } else { "%" + hex_upper(c, 2) }).join(""))
+        None -> None
+    }
+}
+
+/// `Generic#fragment=`.
+fn fragment_set(v: Option[str]) -> Option[str] {
+    return match v {
+        Some(f) -> Some(f.codes().filter(|c| c != 9 and c != 13 and c != 10).map(|c| if c >= 33 and c <= 126 { c.to_char() } else { "%" + hex_upper(c, 2) }).join(""))
+        None -> None
+    }
+}
+
+fn port_number(p: str) -> Option[str] {
+    if p.len() == 0 {
+        return None
+    }
+    return Some(bigint.to_str(bigint.parse(p) ?? bigint.zero()))
+}
+
+/// `set_userinfo`: user and password split at the first `:`; a password
+/// already there stays when the new userinfo has none.
+fn set_userinfo(inout u: RbUri, ui: Option[str]) {
+    if u.kind == "File" {
+        return
+    }
+    let t = ui ?? ""
+    if t.len() == 0 {
+        u.user = None
+        return
+    }
+    match t.index_of(":") {
+        Some(i) -> {
+            u.user = Some(t.substr(0, i))
+            u.password = Some(t.substr(i + 1, t.len()))
+        }
+        None -> u.user = Some(t)
+    }
+}
+
+fn set_host(inout u: RbUri, h: Option[str]) {
+    if u.kind == "File" {
+        let v = h ?? ""
+        u.host = Some(if v == "localhost" { "" } else { v })
+        return
+    }
+    u.host = h
+}
+
+fn set_port(inout u: RbUri, p: Option[str]) {
+    if u.kind != "File" {
+        u.port = p
+    }
+}
+
+/// `set_path`, with FTP's leading `/` made `%2F` under a new `/`.
+fn set_path(inout u: RbUri, p: Option[str]) {
+    if u.kind == "FTP" {
+        match p {
+            Some(v) -> u.path = Some("/" + (if v.starts_with("/") { "%2F" + v.substr(1, v.len()) } else { v }))
+            None -> u.path = None
+        }
+        return
+    }
+    u.path = p
+}
+
+fn blank(kind: str) -> RbUri {
+    return RbUri{
+        kind: kind,
+        scheme: None,
+        user: None,
+        password: None,
+        host: None,
+        port: None,
+        path: None,
+        query: None,
+        fragment: None,
+        opaque: None,
+        typecode: None,
+        dn: None,
+        attributes: None,
+        scope: None,
+        filter: None,
+        extensions: None,
+        to: None,
+        headers: [],
+    }
+}
+
+/// `Generic#initialize` with `arg_check` false.
+fn generic(kind: str, parts: RbUriParts) -> RbUri {
+    var u = blank(kind)
+    u.scheme = match parts.scheme {
+        Some(sc) -> Some(ascii_down(sc))
+        None -> None
+    }
+    set_userinfo(u, parts.userinfo)
+    set_host(u, parts.host)
+    set_port(u, match parts.port {
+        Some(p) -> port_number(p)
+        None -> None
+    })
+    set_path(u, parts.path)
+    u.query = query_set(parts.query)
+    u.opaque = parts.opaque
+    u.fragment = fragment_set(parts.fragment)
+    if u.path.is_none() and u.opaque.is_none() {
+        set_path(u, Some(""))
+    }
+    if u.port.is_none() {
+        set_port(u, default_port(kind))
+    }
+    return u
+}
+
+fn class_of(scheme: Option[str]) -> str {
+    let up = ascii_up(scheme ?? "")
+    return if up == "FTP" { "FTP" } else if up == "HTTP" { "HTTP" } else if up == "HTTPS" { "HTTPS" } else if up == "LDAP" { "LDAP" } else if up == "LDAPS" {
+        "LDAPS"
+    } else if up == "MAILTO" { "MailTo" } else if up == "FILE" { "File" } else { "Generic" }
+}
+
+fn build(parts0: RbUriParts) -> RbUri ! RbUriError {
+    let kind = class_of(parts0.scheme)
+    var parts = parts0
+    if kind == "FTP" {
+        let p = match parts.path {
+            Some(x) -> x
+            None -> fail(invalid_uri("URI::InvalidURIError"))
+        }
+        let q = if p.starts_with("/") { p.substr(1, p.len()) } else { p }
+        parts.path = Some(if q.starts_with("%2F") { "/" + q.substr(3, q.len()) } else { q })
+    }
+    var u = generic(kind, parts)
+    if kind == "FTP" {
+        let path = u.path ?? ""
+        match path.index_of(";type=") {
+            Some(i) -> {
+                u.typecode = Some(path.substr(i + 6, path.len()))
+                u.path = Some(path.substr(0, i))
+            }
+            None -> ()
+        }
+    }
+    if kind == "LDAP" or kind == "LDAPS" {
+        try ldap_fields(u)
+    }
+    if kind == "MailTo" {
+        try mailto_fields(u)
+    }
+    return u
+}
+
+/// Ruby's `String#split(sep)` with a one-character string: trailing
+/// empty fields dropped, and an empty string gives none.
+fn ruby_split(t: str, sep: str) -> [str] {
+    if t.len() == 0 {
+        return []
+    }
+    var parts = t.split(sep)
+    while parts.len() > 0 and parts[parts.len() - 1].len() == 0 {
+        let _x = parts.pop()
+    }
+    return parts
+}
+
+fn ldap_fields(inout u: RbUri) -> () ! RbUriError {
+    if u.fragment.is_some() {
+        fail(invalid_uri("bad LDAP URL"))
+    }
+    let path = match u.path {
+        Some(p) -> p
+        None -> fail(invalid_uri("bad LDAP URL"))
+    }
+    u.dn = if path.len() >= 1 { Some(path.substr(1, path.len())) } else { None }
+    match u.query {
+        Some(q) -> {
+            let f = ruby_split(q, "?")
+            let pick = |i| match f.get(i) {
+                Some(x) -> if x.len() > 0 { Some(x) } else { None }
+                None -> None
+            }
+            u.attributes = pick(0)
+            u.scope = pick(1)
+            u.filter = pick(2)
+            u.extensions = pick(3)
+        }
+        None -> ()
+    }
+    return ()
+}
+
+/// The `to` check: `\A(?:[^@,;]+@[^@,;]+(?:\z|[,;]))*\z`.
+fn mailto_to_ok(cs: [i64]) -> bool {
+    var i = 0
+    while i < cs.len() {
+        let a = i
+        while i < cs.len() and cs[i] != 64 and cs[i] != 44 and cs[i] != 59 {
+            i = i + 1
+        }
+        if i == a or i >= cs.len() or cs[i] != 64 {
+            return false
+        }
+        i = i + 1
+        let b = i
+        while i < cs.len() and cs[i] != 64 and cs[i] != 44 and cs[i] != 59 {
+            i = i + 1
+        }
+        if i == b {
+            return false
+        }
+        if i < cs.len() {
+            if cs[i] != 44 and cs[i] != 59 {
+                return false
+            }
+            i = i + 1
+        }
+    }
+    return true
+}
+
+fn mailto_fields(inout u: RbUri) -> () ! RbUriError {
+    if u.query.is_some() and u.opaque.is_none() {
+        u.opaque = Some("?" + (u.query ?? ""))
+    }
+    let opaque = match u.opaque {
+        Some(o) -> o
+        None -> fail(invalid_component("missing opaque part for mailto URL"))
+    }
+    let cut = opaque.index_of("?")
+    let to = match cut {
+        Some(i) -> opaque.substr(0, i)
+        None -> opaque
+    }
+    if not mailto_to_ok(to.codes()) {
+        fail(invalid_component("unrecognised opaque part for mailtoURL: " + opaque))
+    }
+    u.to = Some(to)
+    u.headers = match cut {
+        Some(i) -> ruby_split(opaque.substr(i + 1, opaque.len()), "&").map(|x| if x.len() == 0 { [] } else {
+            match x.index_of("=") {
+                Some(k) -> [x.substr(0, k), x.substr(k + 1, x.len())]
+                None -> [x]
+            }
+        })
+        None -> []
+    }
+    return ()
+}
+
+/// `URI.parse(s)`.
+pub fn parse(input: str) -> RbUri ! RbUriError {
+    let cs = input.codes()
+    if cs.any(|c| c > 127) {
+        fail(invalid_uri("URI must be ascii only " + dump(cs)))
+    }
+    return try build(try split(cs))
+}
+
+// ---- accessors and printing
+
+/// `#userinfo`.
+pub fn userinfo(u: RbUri) -> Option[str] {
+    return match u.user {
+        Some(user) -> Some(match u.password {
+            Some(p) -> user + ":" + p
+            None -> user
+        })
+        None -> None
+    }
+}
+
+/// `#path`: FTP's takes the leading `/` off again and turns `%2F` back.
+pub fn path(u: RbUri) -> Option[str] {
+    if u.kind != "FTP" {
+        return u.path
+    }
+    let p = u.path ?? ""
+    let q = if p.starts_with("/") { p.substr(1, p.len()) } else { p }
+    return Some(if q.starts_with("%2F") { "/" + q.substr(3, q.len()) } else { q })
+}
+
+/// `#to_s`.
+pub fn to_s(u: RbUri) -> str {
+    if u.kind == "MailTo" {
+        let head = if u.headers.len() > 0 { "?" + u.headers.map(|h| h.join("=")).join("&") } else { "" }
+        return (u.scheme ?? "") + ":" + (u.to ?? "") + head + (match u.fragment {
+            Some(f) -> "#" + f
+            None -> ""
+        })
+    }
+    var out = match u.scheme {
+        Some(sc) -> sc + ":"
+        None -> ""
+    }
+    match u.opaque {
+        Some(o) -> out = out + o
+        None -> {
+            if u.host.is_some() or u.scheme == Some("file") or u.scheme == Some("postgres") {
+                out = out + "//"
+            }
+            match userinfo(u) {
+                Some(ui) -> out = out + ui + "@"
+                None -> ()
+            }
+            out = out + (u.host ?? "")
+            match u.port {
+                Some(p) -> {
+                    if Some(p) != default_port(u.kind) {
+                        out = out + ":" + p
+                    }
+                }
+                None -> ()
+            }
+            out = out + (u.path ?? "") + (match u.typecode {
+                Some(t) -> ";type=" + t
+                None -> ""
+            }) + (match u.query {
+                Some(q) -> "?" + q
+                None -> ""
+            })
+        }
+    }
+    return out + (match u.fragment {
+        Some(f) -> "#" + f
+        None -> ""
+    })
+}
+
+// ---- join
+
+/// Ruby's `path.split("/", -1)`: every field kept, but none for "".
+fn split_path(p: str) -> [str] {
+    return if p.len() == 0 { [] } else { p.split("/") }
+}
+
+/// `Array#slice!(start, 2)` as `merge_path` uses it, a negative start
+/// counting from the end.
+fn slice2(xs: [str], start0: i64) -> [str] {
+    let start = if start0 < 0 { start0 + xs.len() } else { start0 }
+    if start < 0 or start > xs.len() {
+        return xs
+    }
+    return xs.slice(0, start) + xs.slice(start + 2, xs.len())
+}
+
+/// `Generic#merge_path`.
+fn merge_path(base: str, rel: str) -> str {
+    var base_path = split_path(base)
+    var rel_path = split_path(rel)
+    if base_path.len() > 0 and base_path[base_path.len() - 1] == ".." {
+        base_path.push("")
+    }
+    while true {
+        match base_path.enumerate().find(|e| e.1 == "..") {
+            Some(e) -> base_path = slice2(base_path, e.0 - 1)
+            None -> break
+        }
+    }
+    if rel_path.len() > 0 and rel_path[0].len() == 0 {
+        base_path = []
+        let _first = rel_path.remove(0)
+    }
+    if rel_path.len() > 0 and (rel_path[rel_path.len() - 1] == "." or rel_path[rel_path.len() - 1] == "..") {
+        rel_path.push("")
+    }
+    rel_path = rel_path.filter(|x| x != ".")
+    var tmp: [str] = []
+    for x in rel_path {
+        if x == ".." and not (tmp.len() == 0 or tmp[tmp.len() - 1] == "..") {
+            let _gone = tmp.pop()
+        } else {
+            tmp.push(x)
+        }
+    }
+    var trailer = tmp.len() > 0
+    if base_path.len() == 0 {
+        base_path = [""]
+    } else if trailer {
+        let _b = base_path.pop()
+    }
+    var i = 0
+    while i < tmp.len() {
+        let x = tmp[i]
+        i = i + 1
+        if x == ".." {
+            if base_path.len() > 1 {
+                let _c = base_path.pop()
+            }
+        } else {
+            base_path.push(x)
+            while i < tmp.len() {
+                base_path.push(tmp[i])
+                i = i + 1
+            }
+            trailer = false
+        }
+    }
+    if trailer {
+        base_path.push("")
+    }
+    return base_path.join("/")
+}
+
+/// The components `==` compares, after `normalize`.
+fn components(u: RbUri) -> [Option[str]] {
+    let host = match u.host {
+        Some(h) -> Some(ascii_down(h))
+        None -> None
+    }
+    let p = path(u)
+    let normal_path = if p == Some("") { Some("/") } else { p }
+    return [u.scheme, userinfo(u), host, u.port, normal_path, u.typecode, u.query, u.fragment, u.opaque]
+}
+
+/// `URI::FTP#==` on the components FTP lists.
+fn same_ftp(a: RbUri, b: RbUri) -> bool {
+    return a.kind == b.kind and components(a).slice(0, 6) == components(b).slice(0, 6)
+}
+
+/// `Generic#merge`, with the scheme classes' differences.
+fn merge(base: RbUri, oth: str) -> RbUri ! RbUriError {
+    let rel = try parse(oth)
+    let result = try merge_parsed(base, rel)
+    if base.kind == "FTP" and not same_ftp(base, result) {
+        fail(RbUriError("NoMethodError", "undefined method `typecode' for " + inspect(oth.codes()) + ":String"))
+    }
+    return result
+}
+
+fn merge_parsed(base: RbUri, rel: RbUri) -> RbUri ! RbUriError {
+    if rel.scheme.is_some() {
+        return rel
+    }
+    if base.scheme.is_none() {
+        fail(RbUriError("URI::BadURIError", "both URI are relative"))
+    }
+    var b = base
+    let authority = userinfo(rel).is_some() or rel.host.is_some() or rel.port.is_some()
+    let rel_path = rel.path ?? ""
+    if rel_path.len() == 0 and not authority and rel.query.is_none() {
+        if rel.fragment.is_some() {
+            b.fragment = rel.fragment
+        }
+        return b
+    }
+    b.query = None
+    b.fragment = None
+    if not authority {
+        if b.path.is_some() and rel.path.is_some() {
+            set_path(b, Some(merge_path(path(b) ?? "", rel_path)))
+        }
+    } else if rel.path.is_some() {
+        set_path(b, rel.path)
+    }
+    if userinfo(rel).is_some() {
+        set_userinfo(b, userinfo(rel))
+    }
+    if rel.host.is_some() {
+        set_host(b, rel.host)
+    }
+    if rel.port.is_some() {
+        set_port(b, rel.port)
+    }
+    if rel.query.is_some() {
+        if b.opaque.is_some() {
+            fail(invalid_uri("query conflicts with opaque"))
+        }
+        b.query = query_set(rel.query)
+    }
+    if rel.fragment.is_some() {
+        b.fragment = rel.fragment
+    }
+    return b
+}
+
+/// `URI.join(first, *rest)`.
+pub fn join(first: str, rest: [str]) -> RbUri ! RbUriError {
+    var u = try parse(first)
+    for r in rest {
+        u = try merge(u, r)
+    }
+    return u
+}
+
+// ---- www-form
+
+/// `URI.encode_www_form_component`: `*-.0-9A-Z_a-z` kept, space `+`,
+/// every other byte `%XX`.
+pub fn encode_www_form_component(b: bytes) -> str {
+    var out = ""
+    for c in b.to_list() {
+        if c == 42 or c == 45 or c == 46 or is_digit(c) or is_alpha(c) or c == 95 {
+            out = out + c.to_char()
+        } else if c == 32 {
+            out = out + "+"
+        } else {
+            out = out + "%" + hex_upper(c, 2)
+        }
+    }
+    return out
+}
+
+fn hex_val(c: i64) -> i64 {
+    return if c >= 97 { c - 87 } else if c >= 65 { c - 55 } else { c - 48 }
+}
+
+/// `+` and `%XX` decoded, as bytes.
+fn decode_bytes(cs: [i64]) -> [i64] {
+    var out: [i64] = []
+    var i = 0
+    while i < cs.len() {
+        let c = cs[i]
+        if c == 43 {
+            out.push(32)
+            i = i + 1
+        } else if c == 37 and i + 2 < cs.len() and is_hex(cs[i + 1]) and is_hex(cs[i + 2]) {
+            out.push(hex_val(cs[i + 1]) * 16 + hex_val(cs[i + 2]))
+            i = i + 3
+        } else {
+            out.push(c)
+            i = i + 1
+        }
+    }
+    return out
+}
+
+/// `URI.decode_www_form_component`: bytes, which need not be UTF-8.
+pub fn decode_www_form_component(s: str) -> bytes ! RbUriError {
+    let cs = s.to_bytes().to_list()
+    var i = 0
+    while i < cs.len() {
+        if cs[i] == 37 and not (i + 2 < cs.len() and is_hex(cs[i + 1]) and is_hex(cs[i + 2])) {
+            fail(RbUriError("ArgumentError", "invalid %-encoding (" + s + ")"))
+        }
+        i = i + 1
+    }
+    return bytes_of(decode_bytes(cs))
+}
+
+/// A value in `encode_www_form`: nil, a string, or an array of strings
+/// and nils (a nil in an array writes nothing, not the key).
+type RbWwwValue =
+    | RbWwwNil
+    | RbWwwOne(v: str)
+    | RbWwwMany(vs: [Option[str]])
+
+/// `URI.encode_www_form(pairs)`.
+pub fn encode_www_form(pairs: [(str, RbWwwValue)]) -> str {
+    let comp = |t| encode_www_form_component(t.to_bytes())
+    return pairs.map(|kv| match kv.1 {
+        RbWwwNil -> comp(kv.0)
+        RbWwwOne(v) -> comp(kv.0) + "=" + comp(v)
+        // A nil in the array maps to nil in Ruby's block, which joins as "".
+        RbWwwMany(vs) -> vs.map(|w| match w {
+            Some(x) -> comp(kv.0) + "=" + comp(x)
+            None -> ""
+        }).join("&")
+    }).join("&")
+}
+
+/// `URI.decode_www_form(s)`: fields on `&` (empty ones kept), the first
+/// `=` splitting, and bytes that are not UTF-8 replaced.
+pub fn decode_www_form(s: str) -> [(str, str)] ! RbUriError {
+    if s.codes().any(|c| c > 127) {
+        fail(RbUriError("ArgumentError", "the input of URI.decode_www_form must be ASCII only string"))
+    }
+    var out: [(str, str)] = []
+    if s.len() == 0 {
+        return out
+    }
+    var fields = s.split("&")
+    if fields[fields.len() - 1].len() == 0 {
+        let _last = fields.pop()
+    }
+    for f in fields {
+        let (k, v) = match f.index_of("=") {
+            Some(i) -> (f.substr(0, i), f.substr(i + 1, f.len()))
+            None -> (f, "")
+        }
+        out.push((bytes_of(decode_bytes(k.codes())).to_str(), bytes_of(decode_bytes(v.codes())).to_str()))
+    }
+    return out
+}

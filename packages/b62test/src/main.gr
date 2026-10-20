@@ -1,0 +1,408 @@
+// The harness scripts/b62_diff.sh drives: each argument pair is an
+// operation and a file of cases, one per line; each answer is one line.
+import rubycgi
+import nodematchesglob
+import rubycsvline
+import rubyrational
+import bigint
+import rubydate
+import rubypack
+
+fn unhex_list(h: str) -> [i64] {
+    if h == "-" {
+        return []
+    }
+    var out: [i64] = []
+    let b = h.to_bytes()
+    var i = 0
+    while i + 1 < b.len() {
+        let hi = b.at(i)
+        let lo = b.at(i + 1)
+        out.push((if hi >= 97 { hi - 87 } else { hi - 48 }) * 16 + (if lo >= 97 { lo - 87 } else { lo - 48 }))
+        i = i + 2
+    }
+    return out
+}
+
+fn unhex(h: str) -> str {
+    return bytes_of(unhex_list(h)).to_str()
+}
+
+fn unhex_bytes(h: str) -> bytes {
+    return bytes_of(unhex_list(h))
+}
+
+fn hex_bytes(b: bytes) -> str {
+    let digits = "0123456789abcdef"
+    let h = b.to_list().map(|x| digits.substr(x.ushr(4), 1) + digits.substr(x.bit_and(15), 1)).join("")
+    return if h.len() == 0 { "-" } else { h }
+}
+
+fn hex_text(t: str) -> str {
+    return hex_bytes(t.to_bytes())
+}
+
+fn cg_pairs(ps: [(bytes, [bytes])]) -> str {
+    return if ps.len() == 0 { "~" } else { ps.map(|kv| hex_bytes(kv.0) + "=" + kv.1.map(|v| hex_bytes(v)).join(".")).join(",") }
+}
+
+fn rubycgi_line(f: [str]) -> str {
+    let op = f[0]
+    if op == "rd" {
+        return hex_text(rubycgi.rfc1123_date(f[1].parse_int() ?? 0))
+    }
+    if op == "ct" {
+        let values = if f[2] == "~" { [] } else { f[2].split(".").map(|x| unhex_bytes(x)) }
+        let domain = if f[3] == "n" { None } else { Some(unhex_bytes(f[3])) }
+        let expires = if f[5] == "n" { None } else { f[5].parse_int() }
+        return hex_bytes(rubycgi.cookie_to_s(unhex_bytes(f[1]), values, domain, unhex_bytes(f[4]), expires, f[6] == "1", f[7] == "1"))
+    }
+    let b = unhex_bytes(f[1])
+    if op == "es" {
+        return hex_bytes(rubycgi.escape(b))
+    }
+    if op == "ue" {
+        return hex_bytes(rubycgi.url_encode(b))
+    }
+    if op == "un" {
+        return hex_bytes(rubycgi.unescape(b))
+    }
+    if op == "eh" or op == "hh" {
+        return hex_bytes(rubycgi.escape_html(b))
+    }
+    if op == "uh" {
+        return hex_bytes(rubycgi.unescape_html(b))
+    }
+    if op == "ee" or op == "ce" {
+        let names = f.slice(2, f.len()).map(|x| unhex(x))
+        return hex_bytes(if op == "ee" { rubycgi.escape_element(b, names) } else { rubycgi.unescape_element(b, names) })
+    }
+    if op == "pr" {
+        return match rubycgi.pretty(b, unhex(f[2])) {
+            Ok(x) -> hex_bytes(x)
+            Err(e) -> "E:ArgumentError:" + hex_text(rubycgi.error_text(e))
+        }
+    }
+    if op == "pa" {
+        return cg_pairs(rubycgi.parse(b))
+    }
+    return cg_pairs(rubycgi.cookie_parse(b))
+}
+
+fn nodematchesglob_line(f: [str]) -> str {
+    let windows = f[0].starts_with("w")
+    let nocase = f[0].ends_with("x")
+    return match nodematchesglob.matches_glob(unhex(f[1]), unhex(f[2]), windows, nocase) {
+        Ok(b) -> if b { "1" } else { "0" }
+        Err(e) -> "E:" + nodematchesglob.error_name(e) + ":" + hex_text(nodematchesglob.error_message(e))
+    }
+}
+
+fn opt_text(h: str) -> Option[str] {
+    return if h == "n" { None } else { Some(unhex(h)) }
+}
+
+fn cv_row(r: Option[[Option[str]]]) -> str {
+    return match r {
+        None -> "N"
+        Some(fields) -> if fields.len() == 0 { "[]" } else { fields.map(|x| match x {
+            Some(t) -> hex_text(t)
+            None -> "n"
+        }).join(",") }
+    }
+}
+
+fn cv_parse(f: [str]) -> str {
+    var o = rubycsvline.parse_options()
+    o.col_sep = unhex(f[2])
+    o.row_sep = if f[3] == "a" { None } else { Some(unhex(f[3])) }
+    o.quote_char = opt_text(f[4])
+    let lib = f[5].parse_int() ?? 0
+    o.liberal_parsing = lib > 0
+    o.double_quote_outside_quote = lib == 2 or lib == 4
+    o.backslash_quote = lib == 3 or lib == 4
+    o.strip = f[6] == "t"
+    o.strip_char = if f[6].starts_with("x") { Some(unhex(f[6].substr(1, f[6].len() - 1))) } else { None }
+    o.field_size_limit = if f[7] == "n" { None } else { f[7].parse_int() }
+    o.skip_blanks = f[8] == "1"
+    o.nil_value = opt_text(f[9])
+    o.empty_value = unhex(f[10])
+    return match rubycsvline.parse_line(unhex_bytes(f[1]), o) {
+        Ok(r) -> cv_row(r)
+        Err(e) -> "E:" + rubycsvline.error_name(e) + ":" + hex_text(rubycsvline.error_message(e))
+    }
+}
+
+fn cv_generate(f: [str]) -> str {
+    let row = if f[1] == "~" { [] } else { f[1].split(".").map(|x| opt_text(x)) }
+    var o = rubycsvline.write_options()
+    o.col_sep = unhex(f[2])
+    o.row_sep = unhex(f[3])
+    o.quote_char = unhex(f[4])
+    o.force_quotes = f[5] == "1"
+    o.quote_empty = f[6] == "1"
+    o.write_nil_value = opt_text(f[7])
+    o.write_empty_value = unhex(f[8])
+    return match rubycsvline.generate_line(row, o) {
+        Ok(t) -> hex_text(t)
+        Err(e) -> "E:" + rubycsvline.error_name(e) + ":" + hex_text(rubycsvline.error_message(e))
+    }
+}
+
+fn rr_big(t: str) -> BigInt {
+    return bigint.parse(t) ?? bigint.zero()
+}
+
+fn rr_rat(t: str) -> RbRational {
+    let parts = t.split("/")
+    return rubyrational.rational(rr_big(parts[0]), rr_big(if parts.len() > 1 { parts[1] } else { "1" })) ?? rubyrational.integer(bigint.zero())
+}
+
+fn rr_err(e: RbRatError) -> str {
+    return "E:" + rubyrational.error_name(e) + ":" + hex_text(rubyrational.error_message(e))
+}
+
+fn rr_result(r: RbRational ! RbRatError) -> str {
+    return match r {
+        Ok(v) -> rubyrational.inspect(v)
+        Err(e) -> rr_err(e)
+    }
+}
+
+fn rr_arith(f: [str]) -> str {
+    let a = rr_rat(f[2])
+    if f[1] == "pow" {
+        return rr_result(rubyrational.pow(a, f[3].parse_int() ?? 0))
+    }
+    let b = rr_rat(f[3])
+    if f[1] == "add" {
+        return rubyrational.inspect(rubyrational.add(a, b))
+    }
+    if f[1] == "sub" {
+        return rubyrational.inspect(rubyrational.sub(a, b))
+    }
+    if f[1] == "mul" {
+        return rubyrational.inspect(rubyrational.mul(a, b))
+    }
+    if f[1] == "div" {
+        return rr_result(rubyrational.div(a, b))
+    }
+    return rubyrational.compare(a, b).to_str()
+}
+
+fn rr_round(f: [str]) -> str {
+    let digits = if f[3] == "-" { None } else { f[3].parse_int() }
+    let half = if f[4] == "-" { None } else { Some(f[4]) }
+    return match rubyrational.round_with(rr_rat(f[2]), f[1], digits, half) {
+        Ok(v) -> match v {
+            RbWhole(n) -> bigint.to_str(n)
+            RbFraction(q) -> rubyrational.inspect(q)
+        }
+        Err(e) -> rr_err(e)
+    }
+}
+
+fn rubyrational_line(f: [str]) -> str {
+    let op = f[0]
+    if op == "ps" {
+        return rr_result(rubyrational.parse(unhex(f[1])))
+    }
+    if op == "tr" {
+        return match rubyrational.to_r(unhex(f[1])) {
+            Ok(v) -> match v {
+                RbRat(q) -> rubyrational.inspect(q)
+                RbFloatZero(neg) -> if neg { "-0.0" } else { "0.0" }
+            }
+            Err(e) -> rr_err(e)
+        }
+    }
+    if op == "mk" {
+        return rr_result(rubyrational.rational(rr_big(f[1]), rr_big(f[2])))
+    }
+    if op == "ts" {
+        return rubyrational.to_s(rr_rat(f[1]))
+    }
+    if op == "ar" {
+        return rr_arith(f)
+    }
+    if op == "rd" {
+        return rr_round(f)
+    }
+    let r = rr_rat(f[1])
+    return rubyrational.inspect(if f[2] == "-" { r } else { rubyrational.rationalize(r, rr_rat(f[2])) })
+}
+
+fn rd_sg(t: str) -> i64 {
+    if t == "I" {
+        return rubydate.italy()
+    }
+    if t == "E" {
+        return rubydate.england()
+    }
+    if t == "J" {
+        return rubydate.julian()
+    }
+    if t == "G" {
+        return rubydate.gregorian()
+    }
+    return t.parse_int() ?? 0
+}
+
+fn tf(b: bool) -> str {
+    return if b { "true" } else { "false" }
+}
+
+fn rd_int(t: str) -> i64 {
+    return t.parse_int() ?? 0
+}
+
+fn rd_show(d: RbDate) -> str {
+    let fields = [rubydate.inspect(d), rubydate.year(d).to_str(), rubydate.mon(d).to_str(), rubydate.mday(d).to_str(), rubydate.wday(d).to_str(), rubydate.yday(d).to_str(),
+        rubydate.cwyear(d).to_str(), rubydate.cweek(d).to_str(), rubydate.cwday(d).to_str(), rubydate.jd(d).to_str(), rubydate.mjd(d).to_str(), rubydate.ld(d).to_str(),
+        rubydate.ajd_inspect(d), rubydate.amjd_inspect(d), tf(rubydate.leap_p(d)), tf(rubydate.julian_p(d)), tf(rubydate.gregorian_p(d)),
+        rubydate.start_text(d)]
+    return fields.join("|")
+}
+
+fn rd_result(r: RbDate ! RbDateError) -> str {
+    return match r {
+        Ok(d) -> rd_show(d)
+        Err(e) -> "E:ArgumentError:" + hex_text(rubydate.error_message(e))
+    }
+}
+
+fn rd_civil(f: [str]) -> RbDate ! RbDateError {
+    return try rubydate.civil(rd_int(f[1]), rd_int(f[2]), rd_int(f[3]), rd_sg(f[4]))
+}
+
+fn rd_months(f: [str]) -> RbDate ! RbDateError {
+    let d = try rd_civil(f)
+    let n = rd_int(f[5])
+    return if f[0] == "sh" { try rubydate.add_months(d, n) } else { try rubydate.sub_months(d, n) }
+}
+
+fn rd_shifted(f: [str]) -> RbDate ! RbDateError {
+    let d = try rd_civil(f)
+    return if f[0] == "ad" { rubydate.add_days(d, rd_int(f[5])) } else { rubydate.new_start(d, rd_sg(f[5])) }
+}
+
+fn rd_diff(f: [str]) -> str {
+    let a = match rd_civil(f) {
+        Ok(d) -> d
+        Err(e) -> return "E:ArgumentError:" + hex_text(rubydate.error_message(e))
+    }
+    let b = match rd_civil(["", f[5], f[6], f[7], f[8]]) {
+        Ok(d) -> d
+        Err(e) -> return "E:ArgumentError:" + hex_text(rubydate.error_message(e))
+    }
+    return "(" + rubydate.days_between(a, b).to_str() + "/1)|" + rubydate.compare(a, b).to_str()
+}
+
+fn rubydate_line(f: [str]) -> str {
+    let op = f[0]
+    if op == "vc" {
+        return tf(rubydate.valid_civil_p(rd_int(f[1]), rd_int(f[2]), rd_int(f[3]), rd_sg(f[4])))
+    }
+    if op == "vo" {
+        return tf(rubydate.valid_ordinal_p(rd_int(f[1]), rd_int(f[2]), rd_sg(f[3])))
+    }
+    if op == "vm" {
+        return tf(rubydate.valid_commercial_p(rd_int(f[1]), rd_int(f[2]), rd_int(f[3]), rd_sg(f[4])))
+    }
+    if op == "cv" {
+        return rd_result(rd_civil(f))
+    }
+    if op == "jd" {
+        return rd_show(rubydate.from_jd(rd_int(f[1]), rd_sg(f[2])))
+    }
+    if op == "od" {
+        return rd_result(rubydate.ordinal(rd_int(f[1]), rd_int(f[2]), rd_sg(f[3])))
+    }
+    if op == "cm" {
+        return rd_result(rubydate.commercial(rd_int(f[1]), rd_int(f[2]), rd_int(f[3]), rd_sg(f[4])))
+    }
+    if op == "sh" or op == "ls" {
+        return rd_result(rd_months(f))
+    }
+    if op == "ad" or op == "ns" {
+        return rd_result(rd_shifted(f))
+    }
+    return rd_diff(f)
+}
+
+fn rp_item(t: str) -> RbPackItem {
+    if t == "n" {
+        return RbPackNil
+    }
+    let body = t.substr(1, t.len() - 1)
+    if t.starts_with("i") {
+        return RbPackInt(bigint.parse(body) ?? bigint.zero())
+    }
+    return RbPackStr(unhex_bytes(body))
+}
+
+fn rp_show(v: RbUnpacked) -> str {
+    return match v {
+        RbUnpackedInt(n) -> "i" + bigint.to_str(n)
+        RbUnpackedStr(b) -> "s" + hex_bytes(b)
+        RbUnpackedNil -> "n"
+    }
+}
+
+fn rp_err(e: RbPackError) -> str {
+    return "E:" + rubypack.error_name(e) + ":" + hex_text(rubypack.error_message(e))
+}
+
+fn rubypack_line(f: [str]) -> str {
+    if f[0] == "pk" {
+        let items = if f[2] == "~" { [] } else { f[2].split(".").map(|t| rp_item(t)) }
+        return match rubypack.pack(items, unhex(f[1])) {
+            Ok(b) -> hex_bytes(b)
+            Err(e) -> rp_err(e)
+        }
+    }
+    if f[0] == "up" {
+        return match rubypack.unpack(unhex_bytes(f[1]), unhex(f[2])) {
+            Ok(vs) -> if vs.len() == 0 { "~" } else { vs.map(|v| rp_show(v)).join(",") }
+            Err(e) -> rp_err(e)
+        }
+    }
+    return match rubypack.unpack1(unhex_bytes(f[1]), unhex(f[2])) {
+        Ok(v) -> rp_show(v)
+        Err(e) -> rp_err(e)
+    }
+}
+
+fn main() / {io} {
+    let argv = args()
+    var i = 0
+    while i + 1 < argv.len() {
+        let op = argv[i]
+        let text = match read_bytes(argv[i + 1]) {
+            Ok(d) -> d.to_str()
+            Err(_e) -> ""
+        }
+        for l in text.split("\n").filter(|l| l.len() > 0) {
+            let f = l.split(" ")
+            if op == "rubycgi" {
+                print(rubycgi_line(f))
+            }
+            if op == "nodematchesglob" {
+                print(nodematchesglob_line(f))
+            }
+            if op == "rubypack" {
+                print(rubypack_line(f))
+            }
+            if op == "rubydate" {
+                print(rubydate_line(f))
+            }
+            if op == "rubyrational" {
+                print(rubyrational_line(f))
+            }
+            if op == "rubycsvline" {
+                print(if f[0] == "p" { cv_parse(f) } else { cv_generate(f) })
+            }
+        }
+        i = i + 2
+    }
+}

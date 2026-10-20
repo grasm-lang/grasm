@@ -1,0 +1,8 @@
+[package]
+name = "perlsprintf"
+version = "1.0.0"
+capabilities = []
+
+[dependencies.shortestfloat]
+path = "../shortestfloat"
+version = "^1.0.0"

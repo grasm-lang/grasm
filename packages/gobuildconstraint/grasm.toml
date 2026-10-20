@@ -1,0 +1,4 @@
+[package]
+name = "gobuildconstraint"
+version = "1.0.0"
+capabilities = []

@@ -1,0 +1,32 @@
+[package]
+name = "b62test"
+version = "1.0.0"
+capabilities = ["io"]
+
+[dependencies.rubycgi]
+path = "../rubycgi"
+version = "^1.0.0"
+
+[dependencies.nodematchesglob]
+path = "../nodematchesglob"
+version = "^1.0.0"
+
+[dependencies.rubycsvline]
+path = "../rubycsvline"
+version = "^1.0.0"
+
+[dependencies.rubyrational]
+path = "../rubyrational"
+version = "^1.0.0"
+
+[dependencies.bigint]
+path = "../bigint"
+version = "^1.0.0"
+
+[dependencies.rubydate]
+path = "../rubydate"
+version = "^1.0.0"
+
+[dependencies.rubypack]
+path = "../rubypack"
+version = "^1.0.0"

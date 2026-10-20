@@ -1,0 +1,172 @@
+// B62's libraries, each run once on an input whose answer came from the
+// runtime it is held to (Ruby 2.6 and Node 25). scripts/b62_diff.sh holds
+// them to those runtimes on thousands more.
+import rubycgi
+import nodematchesglob
+import rubycsvline
+import rubyrational
+import bigint
+import rubydate
+import rubypack
+
+fn t(b: bytes) -> str {
+    return b.to_str()
+}
+
+fn cgi() {
+    assert_eq(t(rubycgi.escape("a b&é~".to_bytes())), "a+b%26%C3%A9~")
+    assert_eq(t(rubycgi.url_encode("a b".to_bytes())), "a%20b")
+    assert_eq(t(rubycgi.unescape_html("&a&amp;&#x41;&#1114111;".to_bytes())), "&a&amp;A&#1114111;")
+    let q = rubycgi.parse("a=1&b;a=2&c=".to_bytes())
+    assert_eq(q.map(|kv| t(kv.0) + ":" + kv.1.map(|v| t(v)).join("|")).join(" "), "a:1|2 b: c:")
+    assert_eq(t(rubycgi.pretty("<a><b>x</b></a>".to_bytes(), "  ") ?? bytes_of([])), "<a>\n  <b>\n    x\n  </b>\n</a>\n")
+    assert_eq(rubycgi.rfc1123_date(784111777), "Sun, 06 Nov 1994 08:49:37 GMT")
+    let c = rubycgi.cookie_parse("a=1&2; b=x".to_bytes())
+    assert_eq(t(rubycgi.cookie_to_s(c[0].0, c[0].1, None, bytes_of([]), None, false, false)), "a=1&2; path=")
+    print("rubycgi: Ruby's CGI and ERB::Util")
+}
+
+fn glob(path: str, pattern: str, windows: bool, nocase: bool) -> str {
+    return match nodematchesglob.matches_glob(path, pattern, windows, nocase) {
+        Ok(b) -> if b { "yes" } else { "no" }
+        Err(e) -> nodematchesglob.error_name(e) + ": " + nodematchesglob.error_message(e)
+    }
+}
+
+fn matches_glob() {
+    assert_eq(glob("a/../b", "b", false, false), "yes")
+    assert_eq(glob("A/b", "a/*", false, true), "no")
+    assert_eq(glob("a/B", "a/b*", false, true), "yes")
+    assert_eq(glob("xy", "!(x@(y))", false, false), "yes")
+    assert_eq(glob("a-x", "[[:alpha:]]-x", false, false), "SyntaxError: Invalid regular expression: /^(?!\\.)[\\p\{L\}\\p\{Nl\}]\\-x$/u: Invalid escape")
+    assert_eq(glob("C:\\x\\y.js", "c:/**/*.JS", true, true), "yes")
+    assert_eq(glob(".git/x", "**/x", false, false), "no")
+    assert_eq(glob("a/b.x", "\{a,*\}/*.x", false, false), "yes")
+    print("nodematchesglob: Node's path.matchesGlob")
+}
+
+fn csv_row(line: str, o: RbCsvParseOptions) -> str {
+    return match rubycsvline.parse_line(line.to_bytes(), o) {
+        Ok(r) -> match r {
+            Some(fields) -> fields.map(|f| f ?? "nil").join("|")
+            None -> "none"
+        }
+        Err(e) -> rubycsvline.error_name(e) + ": " + rubycsvline.error_message(e)
+    }
+}
+
+fn csv_line() {
+    let plain = rubycsvline.parse_options()
+    var long_sep = rubycsvline.parse_options()
+    long_sep.col_sep = "||"
+    assert_eq(csv_row("a|||b", long_sep), "a||b")
+    assert_eq(csv_row("a,\"b\nc\",d\ne", plain), "a|b\nc|d")
+    var lf = rubycsvline.parse_options()
+    lf.row_sep = Some("\n")
+    assert_eq(csv_row("a,b\r\nc", lf), "MalformedCSVError: Unquoted fields do not allow new line <\"\\r\"> in line 1.")
+    var liberal = rubycsvline.parse_options()
+    liberal.liberal_parsing = true
+    assert_eq(csv_row("\"a\"b\"", liberal), "\"a\"b\"")
+    var nils = rubycsvline.parse_options()
+    nils.nil_value = Some("N")
+    assert_eq(csv_row(",a,", nils), "N|a|N")
+    assert_eq(csv_row("", plain), "none")
+    let w = rubycsvline.write_options()
+    assert_eq(rubycsvline.generate_line([Some("a"), None, Some(""), Some("b,c"), Some("d\"e")], w) ?? "", "a,,\"\",\"b,c\",\"d\"\"e\"\n")
+    print("rubycsvline: Ruby's CSV.parse_line and CSV.generate_line")
+}
+
+fn rat(text: str) -> str {
+    return match rubyrational.parse(text) {
+        Ok(r) -> rubyrational.inspect(r)
+        Err(e) -> rubyrational.error_name(e) + ": " + rubyrational.error_message(e)
+    }
+}
+
+fn ratio(n: i64, d: i64) -> RbRational {
+    return rubyrational.rational(bigint.from_i64(n), bigint.from_i64(d)) ?? rubyrational.integer(bigint.zero())
+}
+
+fn rounded(r: RbRational, digits: Option[i64], half: Option[str]) -> str {
+    return match rubyrational.round_with(r, "round", digits, half) {
+        Ok(v) -> match v {
+            RbWhole(n) -> bigint.to_str(n)
+            RbFraction(q) -> rubyrational.inspect(q)
+        }
+        Err(e) -> rubyrational.error_message(e)
+    }
+}
+
+fn rational() {
+    assert_eq(rat("0.75/0.25"), "(3/1)")
+    assert_eq(rat("1_000"), "(1000/1)")
+    assert_eq(rat("1__0"), "ArgumentError: invalid value for convert(): \"1__0\"")
+    assert_eq(rat("1/."), "ZeroDivisionError: divided by 0")
+    let tiny = match rubyrational.to_r("1e-99999999999999999999") {
+        Ok(v) -> match v {
+            RbRat(q) -> rubyrational.inspect(q)
+            RbFloatZero(neg) -> if neg { "-0.0" } else { "0.0" }
+        }
+        Err(_e) -> "error"
+    }
+    assert_eq(tiny, "0.0")
+    assert_eq(rounded(ratio(7, 3), Some(1), None), "(23/10)")
+    assert_eq(rounded(ratio(5, 2), None, Some("even")), "2")
+    assert_eq(rubyrational.inspect(rubyrational.rationalize(ratio(333, 1000), ratio(1, 100))), "(1/3)")
+    print("rubyrational: Ruby's Rational")
+}
+
+fn date_text(r: RbDate ! RbDateError) -> str {
+    return match r {
+        Ok(d) -> rubydate.to_s(d)
+        Err(e) -> rubydate.error_message(e)
+    }
+}
+
+fn date() {
+    let italy = rubydate.italy()
+    assert_eq(date_text(rubydate.civil(1582, 10, 0 - 21, italy)), "1582-10-01")
+    assert_eq(date_text(rubydate.civil(1582, 10, 10, italy)), "invalid date")
+    let nov = rubydate.civil(1582, 11, 10, italy) ?? rubydate.from_jd(0, italy)
+    assert_eq(date_text(rubydate.sub_months(nov, 1)), "1582-10-04")
+    assert_eq(rubydate.valid_civil_p(1582, 10, 10, rubydate.england()), true)
+    let d = rubydate.civil(2001, 2, 3, italy) ?? nov
+    assert_eq(rubydate.inspect(d), "#<Date: 2001-02-03 ((2451944j,0s,0n),+0s,2299161j)>")
+    assert_eq(date_text(rubydate.civil(0 - 1, 1, 1, italy)), "-0001-01-01")
+    assert_eq(date_text(rubydate.commercial(2009, 53, 7, italy)), "2010-01-03")
+    print("rubydate: Ruby's Date and its calendar reform")
+}
+
+fn hexed(b: bytes) -> str {
+    return b.to_list().map(|x| x.to_str()).join(" ")
+}
+
+fn shown(v: RbUnpacked) -> str {
+    return match v {
+        RbUnpackedInt(n) -> bigint.to_str(n)
+        RbUnpackedStr(b) -> b.to_str()
+        RbUnpackedNil -> "nil"
+    }
+}
+
+fn pack() {
+    let one = bigint.from_i64(1)
+    assert_eq(hexed(rubypack.pack([RbPackInt(one), RbPackInt(one)], "CC@*") ?? bytes_of([9])), "")
+    let wide = bigint.add(bigint.pow(bigint.from_i64(2), 64), bigint.from_i64(5))
+    assert_eq(hexed(rubypack.pack([RbPackInt(wide)], "Q") ?? bytes_of([])), "5 0 0 0 0 0 0 0")
+    assert_eq((rubypack.unpack(bytes_of([1]), "C3") ?? []).map(|v| shown(v)).join(","), "1,nil,nil")
+    assert_eq(shown(rubypack.unpack1("a".to_bytes(), "C@5") ?? RbUnpackedNil), "97")
+    assert_eq(hexed(rubypack.pack([RbPackInt(bigint.from_i64(2147483647))], "U") ?? bytes_of([])), "253 191 191 191 191 191")
+    assert_eq((rubypack.unpack("QQ==".to_bytes(), "m0a*") ?? []).map(|v| shown(v)).join(","), "A,==")
+    assert_eq(hexed(rubypack.pack([RbPackStr("ab".to_bytes())], "b5") ?? bytes_of([])), "1 0 0")
+    print("rubypack: Ruby's Array#pack and String#unpack")
+}
+
+fn main() / {io} {
+    cgi()
+    matches_glob()
+    csv_line()
+    rational()
+    date()
+    pack()
+}

@@ -1,0 +1,210 @@
+// Nine libraries, each run once on an input whose answer came from the
+// tool it is held to -- SQLite 3.51 (twice), Lua 5.5, Go 1.25, Node 25,
+// Perl 5.34 (twice), Rust 1.99 and Java 17. scripts/b54_diff.sh holds them
+// to those tools on thousands more.
+import bigint
+import goflag
+import javalocaldate
+import luapattern
+import nodeparseargs
+import perldumper
+import perlversion
+import rustnum
+import sqlitedatetime
+import sqliteprintf
+
+fn sqlite() {
+    assert_eq(sqlitedatetime.date(SqlText("2024-01-31"), ["+1 month"]) ?? "", "2024-03-02")
+    assert_eq(sqlitedatetime.datetime(SqlFloat(2460000.5), []) ?? "", "2023-02-25 00:00:00")
+    assert_eq(sqlitedatetime.datetime(SqlInteger(1704067200), ["unixepoch"]) ?? "", "2024-01-01 00:00:00")
+    assert_eq(sqlitedatetime.date(SqlBlob("2024-02-29\u{0}junk".to_bytes()), []) ?? "", "2024-02-29")
+    assert(sqlitedatetime.date(SqlNull, []).is_none())
+    assert(sqlitedatetime.date(SqlText("2024-13-01"), []).is_none())
+    let f = sqlitedatetime.strftime("%Y-%j %H:%M:%f", SqlText("2024-03-10 12:34:56.789"), ["start of month", "+5 days"])
+    assert_eq(f ?? "", "2024-066 00:00:00.000")
+    assert_eq(sqlitedatetime.timediff(SqlText("2024-03-01"), SqlText("2023-02-28")) ?? "", "+0001-00-02 00:00:00.000")
+    let e = match sqlitedatetime.unixepoch(SqlText("2024-01-01 00:00:00"), []) {
+        Some(EpochInt(n)) -> n
+        _ -> 0
+    }
+    assert_eq(e, 1704067200)
+    print("date and time functions: SQLite's")
+}
+
+fn sqlite_printf() {
+    let p = sqliteprintf.format("%,d|%r|%-6.2f|%Q|%q|%#Q|%.3c|%010.3e", [SqlInteger(1234567), SqlText("22"), SqlFloat(3.14159), SqlText("it's"), SqlNull,
+        SqlText("a\u{1}b"), SqlText("é"), SqlFloat(0.0 - 1234.5)])
+    assert_eq((p ?? "".to_bytes()).to_str(), "1,234,567|22nd|3.14  |'it''s'|(NULL)|unistr('a\\u0001b')|ééé|-1.235e+03")
+    assert(sqliteprintf.format("%y", []).is_none())
+    print("printf: SQLite's")
+}
+
+fn lua() {
+    let (a, b, _caps) = (luapattern.find("hello world".to_bytes(), "o w".to_bytes(), 1, false) ?? None) ?? (0, 0, [])
+    assert_eq(a, 5)
+    assert_eq(b, 7)
+    let caps = (luapattern.match_text("key=value".to_bytes(), "(%w+)=(%w+)".to_bytes(), 1) ?? None) ?? []
+    let words = caps.map(|c| match c {
+        LuaText(t) -> t.to_str()
+        LuaPosition(_p) -> "?"
+    })
+    assert_eq(words.join(" "), "key value")
+    let (once, n) = luapattern.gsub("hello world".to_bytes(), "o".to_bytes(), LuaWith("0".to_bytes()), Some(1)) ?? ("".to_bytes(), 0)
+    assert_eq(once.to_str(), "hell0 world")
+    assert_eq(n, 1)
+    let table = LuaTable([("name".to_bytes(), "Ann".to_bytes()), ("age".to_bytes(), "7".to_bytes())])
+    let (filled, m) = luapattern.gsub("$name is $age".to_bytes(), "%$(%w+)".to_bytes(), table, None) ?? ("".to_bytes(), 0)
+    assert_eq(filled.to_str(), "Ann is 7")
+    assert_eq(m, 2)
+    let bad = match luapattern.find("x".to_bytes(), "%".to_bytes(), 1, false) {
+        Ok(_r) -> ""
+        Err(e) -> luapattern.error_text(e)
+    }
+    assert_eq(bad, "malformed pattern (ends with '%')")
+    print("string patterns: Lua's")
+}
+
+fn flag_value(p: GoFlagParse, name: str) -> str {
+    for (k, v) in p.values {
+        if k == name {
+            return v
+        }
+    }
+    return ""
+}
+
+fn go() {
+    let flags = [goflag.define("n", FlagInt, Some("3"), "number of `rounds`") ?? panic("n"), goflag.define("v", FlagBool, None, "verbose") ?? panic("v"),
+        goflag.define("wait", FlagDuration, Some("2s"), "how long") ?? panic("wait")]
+    let p = goflag.parse(flags, ["-n=5", "--v", "-wait", "1m30s", "file", "-x"]) ?? panic("parse")
+    assert_eq(flag_value(p, "n"), "5")
+    assert_eq(flag_value(p, "v"), "true")
+    assert_eq(flag_value(p, "wait"), "1m30s")
+    assert_eq(p.args.join(" "), "file -x")
+    assert_eq(goflag.print_defaults(flags), "  -n rounds\n    \tnumber of rounds (default 3)\n  -v\tverbose\n  -wait duration\n    \thow long (default 2s)\n")
+    let bad = match goflag.parse([goflag.define("n", FlagInt, None, "") ?? panic("n")], ["-n", "x"]) {
+        Ok(_p) -> ""
+        Err(e) -> goflag.error_text(e)
+    }
+    assert_eq(bad, "invalid value \"x\" for flag -n: parse error")
+    print("flag: Go's")
+}
+
+fn node() {
+    let verbose = ParseArgsOption{ name: "verbose", is_string: false, short: Some("v"), multiple: false, default: None }
+    let name = ParseArgsOption{ name: "name", is_string: true, short: None, multiple: false, default: None }
+    let config = ParseArgsConfig{ args: ["-v", "--name=ann", "a", "--", "-b"], options: [verbose, name], strict: true, allow_positionals: Some(true), allow_negative: false }
+    let r = nodeparseargs.parse_args(config) ?? panic("parseArgs")
+    assert_eq(r.values.len(), 2)
+    assert(r.values[0].0 == nodeparseargs.units("verbose"))
+    assert(r.values[1].0 == nodeparseargs.units("name"))
+    assert(match r.values[1].1 {
+        PaString(u) -> u == nodeparseargs.units("ann")
+        _ -> false
+    })
+    assert(r.positionals == [nodeparseargs.units("a"), nodeparseargs.units("-b")])
+    let strict = ParseArgsConfig{ args: ["--nope"], options: [], strict: true, allow_positionals: None, allow_negative: false }
+    let e = match nodeparseargs.parse_args(strict) {
+        Ok(_r) -> ""
+        Err(err) -> nodeparseargs.error_code(err) + " " + nodeparseargs.error_text(err)
+    }
+    assert_eq(e, "ERR_PARSE_ARGS_UNKNOWN_OPTION Unknown option '--nope'")
+    print("util.parseArgs: Node's")
+}
+
+fn perl_versions() {
+    let v = perlversion.parse("1.2.3") ?? panic("1.2.3")
+    assert_eq(perlversion.stringify(v), "1.2.3")
+    assert_eq(perlversion.numify(v), "1.002003")
+    assert_eq(perlversion.normal(v), "v1.2.3")
+    let w = perlversion.parse("1.02_03") ?? panic("1.02_03")
+    assert_eq(perlversion.numify(w), "1.020300")
+    assert(perlversion.is_alpha(w))
+    assert_eq(perlversion.compare(perlversion.parse("v1.2") ?? v, perlversion.parse("1.2") ?? v), 0 - 1)
+    let bad = match perlversion.parse("1.2a") {
+        Ok(_v) -> ""
+        Err(e) -> perlversion.error_text(e)
+    }
+    assert_eq(bad, "Invalid version format (non-numeric data)")
+    print("version: Perl's")
+}
+
+fn perl_dumper() {
+    let keys = ["again", "list", "n", "name", "self"].map(|k| (k.to_bytes(), false))
+    let nodes = [PlHash(keys, [1, 2, 3, 4, 5]), PlRef(6, false, false), PlRef(6, false, false), PlDouble(3.5), PlUtf8("café"), PlRef(0, false, false),
+        PlArray([7, 8]), PlInt(1), PlBytes("two".to_bytes())]
+    let doc = PerlDoc{ nodes: nodes, root: 0, network: false }
+    let out = perldumper.dumper(doc, [0]) ?? "".to_bytes()
+    assert_eq(out.to_str(), "$VAR1 = \{\n          'again' => [\n                       1,\n                       'two'\n                     ],\n" +
+        "          'list' => $VAR1->\{'again'},\n          'n' => '3.5',\n          'name' => \"caf\\x\{e9}\",\n          'self' => $VAR1\n        };\n")
+    let obj = PerlDoc{ nodes: [PlBlessed("My::Obj", 1), PlHash([("id".to_bytes(), false), ("tag".to_bytes(), false)], [2, 3]), PlInt(42), PlBytes("a\tb".to_bytes())],
+        root: 0, network: false }
+    var o = perldumper.default_options()
+    o.indent = 1
+    o.useqq = true
+    o.terse = true
+    let shown = perldumper.dump(obj, [0], o) ?? "".to_bytes()
+    assert_eq(shown.to_str(), "bless( \{\n  \"id\" => 42,\n  \"tag\" => \"a\\tb\"\n}, 'My::Obj' )\n")
+    print("Data::Dumper: Perl's")
+}
+
+fn rust() {
+    assert_eq(rustnum.display(0.1 + 0.2), "0.30000000000000004")
+    assert_eq(rustnum.debug(1.0), "1.0")
+    assert_eq(rustnum.fixed(2.0 / 3.0, 3), "0.667")
+    assert_eq(rustnum.exp(1234.5, false), "1.2345e3")
+    assert_eq(rustnum.exp(0.00012, true), "1.2E-4")
+    assert_eq(rustnum.parse_f64("1e400") ?? 0.0, 1.0 / 0.0)
+    let bad = match rustnum.parse_f64("+0x1") {
+        Ok(_x) -> ""
+        Err(e) -> rustnum.error_text(e)
+    }
+    assert_eq(bad, "invalid float literal")
+    let big = match rustnum.parse_int("256", 8, false) {
+        Ok(_n) -> ""
+        Err(e) -> rustnum.error_text(e)
+    }
+    assert_eq(big, "number too large to fit in target type")
+    assert_eq(bigint.to_str(rustnum.parse_int("-128", 8, true) ?? bigint.zero()), "-128")
+    let empty = match rustnum.parse_int("", 32, true) {
+        Ok(_n) -> ""
+        Err(e) -> rustnum.error_text(e)
+    }
+    assert_eq(empty, "cannot parse integer from empty string")
+    print("number formatting and parsing: Rust's")
+}
+
+fn java() {
+    let d = javalocaldate.parse("2024-01-31") ?? panic("parse")
+    assert_eq(javalocaldate.to_string(javalocaldate.plus_months(d, 1) ?? d), "2024-02-29")
+    assert_eq(javalocaldate.to_string(javalocaldate.plus_days(d, 366) ?? d), "2025-01-31")
+    assert_eq(javalocaldate.day_of_week_name(d), "WEDNESDAY")
+    assert_eq(javalocaldate.day_of_year(d), 31)
+    let a = javalocaldate.of(2024, 3, 1) ?? d
+    assert_eq(javalocaldate.until(a, javalocaldate.of(2025, 2, 28) ?? d, "MONTHS"), 11)
+    assert_eq(javalocaldate.to_string(javalocaldate.of_epoch_day(0 - 1) ?? d), "1969-12-31")
+    assert_eq(javalocaldate.to_string(javalocaldate.of(10000, 1, 1) ?? d), "+10000-01-01")
+    let leap = match javalocaldate.parse("2023-02-29") {
+        Ok(_d) -> ""
+        Err(e) -> javalocaldate.error_kind(e) + ": " + javalocaldate.error_text(e)
+    }
+    assert_eq(leap, "DateTimeParseException: Text '2023-02-29' could not be parsed: Invalid date 'February 29' as '2023' is not a leap year")
+    let short = match javalocaldate.parse("2024-1-01") {
+        Ok(_d) -> ""
+        Err(e) -> javalocaldate.error_text(e)
+    }
+    assert_eq(short, "Text '2024-1-01' could not be parsed at index 5")
+    print("LocalDate: Java's")
+}
+
+fn main() / {io} {
+    sqlite()
+    sqlite_printf()
+    lua()
+    go()
+    node()
+    perl_versions()
+    perl_dumper()
+    rust()
+    java()
+}

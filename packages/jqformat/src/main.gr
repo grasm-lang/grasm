@@ -1,0 +1,703 @@
+// jq's string formats, as jq 1.7.1 writes them: `@text`, `@json`,
+// `@html`, `@uri`, `@csv`, `@tsv`, `@sh`, `@base64` and `@base64d`, over
+// jq's values, with its error messages.
+//
+// Shell scripts and pipelines turn JSON into CSV rows, shell words, URL
+// parameters and HTML with these, and a program producing or checking
+// the same text has to write it as jq does:
+//
+//   - Numbers keep the literal they were read from, in decNumber's form:
+//     `1e2` prints as `1E+2`, `1.0e3` as `1.0E+3`, `0.10` stays `0.10`,
+//     `0.0000001` becomes `1E-7`; jq 1.7 does not reformat a number it
+//     has not computed.
+//   - `@csv` and `@tsv` take an array: null is empty, strings are quoted
+//     (CSV, with `""`) or escaped (TSV, `\t \r \n \\`), anything else in
+//     the row is an error; `@sh` quotes strings with `'\''` and takes a
+//     single value as a one-element array.
+//   - A NUL in a string comes out as `\0` from every escaping format.
+//   - `@base64d` stops at the first `=`, refuses a character outside the
+//     alphabet, and replaces bytes that are not UTF-8 with U+FFFD, as
+//     every jq string does.
+//   - Errors read `object ({"a":"bbbbb...) is not valid in a csv row`:
+//     the kind, the value's JSON cut to 11 bytes and `...` when longer
+//     than 14, and the complaint. jq 1.7.1 has no `@base32`.
+//
+// `parse` reads standard JSON into these values (numbers as literals,
+// a repeated key keeping its first place and its last value); its error
+// does not reproduce jq's parser messages.
+
+type JqValue =
+    | JqNull
+    | JqBool(b: bool)
+    | JqNumber(literal: str)
+    | JqString(s: str)
+    | JqArray(items: [JqValue])
+    | JqObject(entries: [(str, JqValue)])
+
+/// A jq error, with its message.
+type JqError = | JqError(msg: str)
+
+pub fn error_text(e: JqError) -> str {
+    return match e {
+        JqError(m) -> m
+    }
+}
+
+fn ascii(s: str) -> [i64] {
+    return s.to_bytes().to_list()
+}
+
+fn is_digit(c: i64) -> bool {
+    return c >= 48 and c <= 57
+}
+
+// ---- numbers
+
+/// decNumber's to-scientific-string of a coefficient (digits) and an
+/// exponent.
+fn sci_string(negative: bool, coefficient: [i64], exp: i64) -> str {
+    let c = coefficient.map(|d| d.to_char()).join("")
+    let n = coefficient.len()
+    let adjusted = exp + n - 1
+    var body = ""
+    if exp <= 0 and adjusted >= 0 - 6 {
+        if exp == 0 {
+            body = c
+        } else if n > 0 - exp {
+            body = c.substr(0, n + exp) + "." + c.substr(n + exp, 0 - exp)
+        } else {
+            body = "0." + (0..(0 - exp - n)).to_list().map(|_k| "0").join("") + c
+        }
+    } else {
+        body = c.substr(0, 1) + (if n > 1 { "." + c.substr(1, n - 1) } else { "" }) + "E" + (if adjusted >= 0 { "+" } else { "-" }) +
+        (if adjusted < 0 { 0 - adjusted } else { adjusted }).to_str()
+    }
+    return (if negative { "-" } else { "" }) + body
+}
+
+/// A JSON number literal as jq keeps it, or None where the text is not
+/// one.
+fn canonical_number(text: str) -> Option[str] {
+    let b = ascii(text)
+    var i = 0
+    let negative = i < b.len() and b[i] == 45
+    if negative {
+        i = i + 1
+    }
+    let int_start = i
+    while i < b.len() and is_digit(b[i]) {
+        i = i + 1
+    }
+    let int_digits = b.slice(int_start, i)
+    if int_digits.len() == 0 or (int_digits.len() > 1 and int_digits[0] == 48) {
+        return None
+    }
+    var frac: [i64] = []
+    if i < b.len() and b[i] == 46 {
+        i = i + 1
+        let fs = i
+        while i < b.len() and is_digit(b[i]) {
+            i = i + 1
+        }
+        frac = b.slice(fs, i)
+        if frac.len() == 0 {
+            return None
+        }
+    }
+    var exp = 0
+    if i < b.len() and (b[i] == 101 or b[i] == 69) {
+        i = i + 1
+        var esign = 1
+        if i < b.len() and (b[i] == 43 or b[i] == 45) {
+            esign = if b[i] == 45 { 0 - 1 } else { 1 }
+            i = i + 1
+        }
+        let es = i
+        while i < b.len() and is_digit(b[i]) {
+            if exp < 100000000000 {
+                exp = exp * 10 + b[i] - 48
+            }
+            i = i + 1
+        }
+        if i == es {
+            return None
+        }
+        exp = exp * esign
+    }
+    if i != b.len() {
+        return None
+    }
+    var digits = int_digits + frac
+    while digits.len() > 1 and digits[0] == 48 {
+        digits = digits.slice(1, digits.len())
+    }
+    return Some(sci_string(negative, digits, exp - frac.len()))
+}
+
+/// A number from its JSON literal.
+pub fn number(literal: str) -> JqValue ! JqError {
+    return match canonical_number(literal) {
+        Some(t) -> JqNumber(t)
+        None -> fail(JqError("invalid number literal"))
+    }
+}
+
+// ---- UTF-8, as jq reads it
+
+/// jvp_utf8_next: (code point or -1, length) of the sequence at `i`.
+fn utf8_next(b: [i64], i: i64) -> (i64, i64) {
+    let first = b[i]
+    if first < 128 {
+        return (first, 1)
+    }
+    let len = if first >= 194 and first <= 223 { 2 } else if first >= 224 and first <= 239 { 3 } else if first >= 240 and first <= 244 { 4 } else { 0 }
+    if len == 0 {
+        return (0 - 1, 1)
+    }
+    if i + len > b.len() {
+        return (0 - 1, b.len() - i)
+    }
+    var c = first.bit_and(if len == 2 { 31 } else if len == 3 { 15 } else { 7 })
+    for k in 1..len {
+        let ch = b[i + k]
+        if ch < 128 or ch > 191 {
+            return (0 - 1, k)
+        }
+        c = c.shl(6).bit_or(ch.bit_and(63))
+    }
+    let minimum = if len == 2 { 128 } else if len == 3 { 2048 } else { 65536 }
+    if c < minimum or (c >= 55296 and c <= 57343) or c > 1114111 {
+        return (0 - 1, len)
+    }
+    return (c, len)
+}
+
+/// Bytes as a jq string: each bad sequence becomes U+FFFD.
+fn jq_string(b: [i64]) -> str {
+    var out: [i64] = []
+    var i = 0
+    while i < b.len() {
+        let (c, n) = utf8_next(b, i)
+        if c < 0 {
+            out = out + [239, 191, 189]
+        } else {
+            out = out + b.slice(i, i + n)
+        }
+        i = i + n
+    }
+    return bytes_of(out).to_str()
+}
+
+// ---- tojson
+
+fn hex4(v: i64) -> [i64] {
+    let d = "0123456789abcdef"
+    return [d.code_at(v.shr(12).bit_and(15)), d.code_at(v.shr(8).bit_and(15)), d.code_at(v.shr(4).bit_and(15)), d.code_at(v.bit_and(15))]
+}
+
+/// jvp_dump_string.
+fn dump_string(s: str, inout out: [i64]) {
+    let b = ascii(s)
+    out.push(34)
+    var i = 0
+    while i < b.len() {
+        let (c, n) = utf8_next(b, i)
+        if c >= 32 and c <= 126 {
+            if c == 34 or c == 92 {
+                out.push(92)
+            }
+            out.push(c)
+        } else if c >= 0 and (c < 32 or c == 127) {
+            let named = [(8, 98), (9, 116), (13, 114), (10, 110), (12, 102)]
+            var done = false
+            for (k, letter) in named {
+                if k == c {
+                    out = out + [92, letter]
+                    done = true
+                }
+            }
+            if not done {
+                out = out + [92, 117] + hex4(c)
+            }
+        } else {
+            out = out + b.slice(i, i + n)
+        }
+        i = i + n
+    }
+    out.push(34)
+}
+
+fn dump(v: JqValue, inout out: [i64]) {
+    match v {
+        JqNull -> out = out + ascii("null")
+        JqBool(b) -> out = out + ascii(if b { "true" } else { "false" })
+        JqNumber(t) -> out = out + ascii(t)
+        JqString(s) -> dump_string(s, out)
+        JqArray(items) -> {
+            out.push(91)
+            for k in 0..items.len() {
+                if k > 0 {
+                    out.push(44)
+                }
+                dump(items[k], out)
+            }
+            out.push(93)
+        }
+        JqObject(entries) -> {
+            out.push(123)
+            for k in 0..entries.len() {
+                if k > 0 {
+                    out.push(44)
+                }
+                let (key, value) = entries[k]
+                dump_string(key, out)
+                out.push(58)
+                dump(value, out)
+            }
+            out.push(125)
+        }
+    }
+}
+
+/// `tojson`.
+pub fn tojson(v: JqValue) -> str {
+    var out: [i64] = []
+    dump(v, out)
+    return bytes_of(out).to_str()
+}
+
+fn tostring(v: JqValue) -> str {
+    return match v {
+        JqString(s) -> s
+        _ -> tojson(v)
+    }
+}
+
+fn kind_name(v: JqValue) -> str {
+    return match v {
+        JqNull -> "null"
+        JqBool(_b) -> "boolean"
+        JqNumber(_n) -> "number"
+        JqString(_s) -> "string"
+        JqArray(_i) -> "array"
+        JqObject(_e) -> "object"
+    }
+}
+
+/// type_error: the kind, the JSON cut to 11 bytes and "..." past 14.
+fn type_error(bad: JqValue, msg: str) -> JqError {
+    var shown = ascii(tojson(bad))
+    if shown.len() > 14 {
+        shown = shown.slice(0, 11) + [46, 46, 46]
+    }
+    return JqError(jq_string(ascii(kind_name(bad) + " (") + shown + ascii(") " + msg)))
+}
+
+// ---- the formats
+
+/// escape_string: the ASCII characters in the table replaced, and NUL as
+/// `\0`.
+fn escape(s: str, table: [(i64, str)]) -> [i64] {
+    let b = ascii(s)
+    var out: [i64] = []
+    var i = 0
+    while i < b.len() {
+        let (c, n) = utf8_next(b, i)
+        var hit = false
+        if c == 0 {
+            out = out + [92, 48]
+            hit = true
+        }
+        for (k, rep) in table {
+            if not hit and k == c {
+                out = out + ascii(rep)
+                hit = true
+            }
+        }
+        if not hit {
+            out = out + b.slice(i, i + n)
+        }
+        i = i + n
+    }
+    return out
+}
+
+fn row(v: JqValue, csv: bool) -> str ! JqError {
+    let items = match v {
+        JqArray(items) -> items
+        _ -> fail(type_error(v, if csv { "cannot be csv-formatted, only array" } else { "cannot be tsv-formatted, only array" }))
+    }
+    var out: [i64] = []
+    for k in 0..items.len() {
+        if k > 0 {
+            out.push(if csv { 44 } else { 9 })
+        }
+        let x = items[k]
+        match x {
+            JqNull -> {}
+            JqBool(_b) -> out = out + ascii(tojson(x))
+            JqNumber(_n) -> out = out + ascii(tojson(x))
+            JqString(s) -> {
+                if csv {
+                    out = out + [34] + escape(s, [(34, "\"\"")]) + [34]
+                } else {
+                    out = out + escape(s, [(9, "\\t"), (13, "\\r"), (10, "\\n"), (92, "\\\\")])
+                }
+            }
+            _ -> fail(type_error(x, "is not valid in a csv row"))
+        }
+    }
+    return bytes_of(out).to_str()
+}
+
+fn shell(v: JqValue) -> str ! JqError {
+    let items = match v {
+        JqArray(items) -> items
+        _ -> [v]
+    }
+    var out: [i64] = []
+    for k in 0..items.len() {
+        if k > 0 {
+            out.push(32)
+        }
+        let x = items[k]
+        match x {
+            JqString(s) -> out = out + [39] + escape(s, [(39, "'\\''")]) + [39]
+            JqArray(_i) -> fail(type_error(x, "can not be escaped for shell"))
+            JqObject(_e) -> fail(type_error(x, "can not be escaped for shell"))
+            _ -> out = out + ascii(tojson(x))
+        }
+    }
+    return bytes_of(out).to_str()
+}
+
+fn uri(v: JqValue) -> str {
+    let digits = "0123456789ABCDEF"
+    var out: [i64] = []
+    for c in ascii(tostring(v)) {
+        let keep = (c >= 48 and c <= 57) or (c >= 65 and c <= 90) or (c >= 97 and c <= 122) or c == 45 or c == 95 or c == 46 or c == 126
+        if keep {
+            out.push(c)
+        } else {
+            out = out + [37, digits.code_at(c.shr(4)), digits.code_at(c.bit_and(15))]
+        }
+    }
+    return bytes_of(out).to_str()
+}
+
+fn base64_alphabet() -> str {
+    return "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+}
+
+fn base64(v: JqValue) -> str {
+    let a = base64_alphabet()
+    let d = ascii(tostring(v))
+    var out: [i64] = []
+    var i = 0
+    while i < d.len() {
+        let n = if d.len() - i >= 3 { 3 } else { d.len() - i }
+        var code = 0
+        for j in 0..3 {
+            code = code.shl(8).bit_or(if j < n { d[i + j] } else { 0 })
+        }
+        for j in 0..4 {
+            out.push(a.code_at(code.shr(18 - j * 6).bit_and(63)))
+        }
+        if n < 3 {
+            out[out.len() - 1] = 61
+        }
+        if n < 2 {
+            out[out.len() - 2] = 61
+        }
+        i = i + 3
+    }
+    return bytes_of(out).to_str()
+}
+
+fn base64_value(c: i64) -> i64 {
+    if c >= 65 and c <= 90 {
+        return c - 65
+    }
+    if c >= 97 and c <= 122 {
+        return c - 71
+    }
+    if c >= 48 and c <= 57 {
+        return c + 4
+    }
+    return if c == 43 { 62 } else if c == 47 { 63 } else { 0 - 1 }
+}
+
+fn base64d(v: JqValue) -> str ! JqError {
+    let text = tostring(v)
+    let d = ascii(text)
+    var out: [i64] = []
+    var code = 0
+    var read = 0
+    var i = 0
+    while i < d.len() and d[i] != 61 {
+        let k = base64_value(d[i])
+        if k < 0 {
+            fail(type_error(JqString(text), "is not valid base64 data"))
+        }
+        code = code.shl(6).bit_or(k)
+        read = read + 1
+        if read == 4 {
+            out = out + [code.shr(16).bit_and(255), code.shr(8).bit_and(255), code.bit_and(255)]
+            read = 0
+            code = 0
+        }
+        i = i + 1
+    }
+    if read == 3 {
+        out = out + [code.shr(10).bit_and(255), code.shr(2).bit_and(255)]
+    } else if read == 2 {
+        out.push(code.shr(4).bit_and(255))
+    } else if read == 1 {
+        fail(type_error(JqString(text), "trailing base64 byte found"))
+    }
+    return jq_string(out)
+}
+
+/// `format(name)`, as `@name` applies it to the input.
+pub fn format(name: str, v: JqValue) -> str ! JqError {
+    if name == "json" {
+        return tojson(v)
+    }
+    if name == "text" {
+        return tostring(v)
+    }
+    if name == "csv" or name == "tsv" {
+        return try row(v, name == "csv")
+    }
+    if name == "html" {
+        return bytes_of(escape(tostring(v), [(38, "&amp;"), (60, "&lt;"), (62, "&gt;"), (39, "&apos;"), (34, "&quot;")])).to_str()
+    }
+    if name == "uri" {
+        return uri(v)
+    }
+    if name == "sh" {
+        return try shell(v)
+    }
+    if name == "base64" {
+        return base64(v)
+    }
+    if name == "base64d" {
+        return try base64d(v)
+    }
+    fail(JqError(name + " is not a valid format"))
+}
+
+// ---- reading JSON
+
+type JsonReader = { b: [i64], i: i64 }
+
+fn bad_json() -> JqError {
+    return JqError("invalid JSON")
+}
+
+fn skip_ws(inout r: JsonReader) {
+    while r.i < r.b.len() and (r.b[r.i] == 32 or r.b[r.i] == 9 or r.b[r.i] == 10 or r.b[r.i] == 13) {
+        r.i = r.i + 1
+    }
+}
+
+fn hex_digit(c: i64) -> i64 {
+    return if c >= 48 and c <= 57 { c - 48 } else if c >= 97 and c <= 102 { c - 87 } else if c >= 65 and c <= 70 { c - 55 } else { 0 - 1 }
+}
+
+fn read_u4(inout r: JsonReader) -> i64 ! JqError {
+    var v = 0
+    for _k in 0..4 {
+        let h = hex_digit(if r.i < r.b.len() { r.b[r.i] } else { 0 })
+        if h < 0 {
+            fail(bad_json())
+        }
+        v = v * 16 + h
+        r.i = r.i + 1
+    }
+    return v
+}
+
+fn utf8_of(c: i64) -> [i64] {
+    if c < 128 {
+        return [c]
+    }
+    if c < 2048 {
+        return [192 + c.shr(6), 128 + c.bit_and(63)]
+    }
+    if c < 65536 {
+        return [224 + c.shr(12), 128 + c.shr(6).bit_and(63), 128 + c.bit_and(63)]
+    }
+    return [240 + c.shr(18), 128 + c.shr(12).bit_and(63), 128 + c.shr(6).bit_and(63), 128 + c.bit_and(63)]
+}
+
+/// A `\u` escape (after the `u`), a surrogate pair joined; a lone half
+/// is refused, as jq refuses it.
+fn unicode_escape(inout r: JsonReader) -> i64 ! JqError {
+    let c = try read_u4(r)
+    if c >= 55296 and c <= 56319 and r.i + 1 < r.b.len() and r.b[r.i] == 92 and r.b[r.i + 1] == 117 {
+        let save = r.i
+        r.i = r.i + 2
+        let lo = try read_u4(r)
+        if lo >= 56320 and lo <= 57343 {
+            return 65536 + (c - 55296).shl(10) + lo - 56320
+        }
+        r.i = save
+    }
+    if c >= 55296 and c <= 57343 {
+        fail(bad_json())
+    }
+    return c
+}
+
+fn read_string(inout r: JsonReader) -> str ! JqError {
+    r.i = r.i + 1
+    var out: [i64] = []
+    while true {
+        if r.i >= r.b.len() {
+            fail(bad_json())
+        }
+        let c = r.b[r.i]
+        r.i = r.i + 1
+        if c == 34 {
+            break
+        }
+        if c < 32 {
+            fail(bad_json())
+        }
+        if c != 92 {
+            out.push(c)
+            continue
+        }
+        let e = if r.i < r.b.len() { r.b[r.i] } else { 0 }
+        r.i = r.i + 1
+        let simple = [(34, 34), (92, 92), (47, 47), (98, 8), (102, 12), (110, 10), (114, 13), (116, 9)]
+        var hit = false
+        for (k, v) in simple {
+            if k == e {
+                out.push(v)
+                hit = true
+            }
+        }
+        if not hit {
+            if e != 117 {
+                fail(bad_json())
+            }
+            out = out + utf8_of(try unicode_escape(r))
+        }
+    }
+    return jq_string(out)
+}
+
+fn read_value(inout r: JsonReader) -> JqValue ! JqError {
+    skip_ws(r)
+    if r.i >= r.b.len() {
+        fail(bad_json())
+    }
+    let c = r.b[r.i]
+    if c == 34 {
+        return JqString(try read_string(r))
+    }
+    if c == 91 {
+        return try read_array(r)
+    }
+    if c == 123 {
+        return try read_object(r)
+    }
+    for (word, v) in [("null", JqNull), ("true", JqBool(true)), ("false", JqBool(false))] {
+        let w = ascii(word)
+        if r.i + w.len() <= r.b.len() and r.b.slice(r.i, r.i + w.len()) == w {
+            r.i = r.i + w.len()
+            return v
+        }
+    }
+    let start = r.i
+    while r.i < r.b.len() and (is_digit(r.b[r.i]) or r.b[r.i] == 45 or r.b[r.i] == 43 or r.b[r.i] == 46 or r.b[r.i] == 101 or r.b[r.i] == 69) {
+        r.i = r.i + 1
+    }
+    return match canonical_number(bytes_of(r.b.slice(start, r.i)).to_str()) {
+        Some(t) -> JqNumber(t)
+        None -> fail(bad_json())
+    }
+}
+
+fn read_array(inout r: JsonReader) -> JqValue ! JqError {
+    r.i = r.i + 1
+    var items: [JqValue] = []
+    skip_ws(r)
+    if r.i < r.b.len() and r.b[r.i] == 93 {
+        r.i = r.i + 1
+        return JqArray(items)
+    }
+    while true {
+        items.push(try read_value(r))
+        skip_ws(r)
+        if r.i >= r.b.len() {
+            fail(bad_json())
+        }
+        r.i = r.i + 1
+        if r.b[r.i - 1] == 93 {
+            return JqArray(items)
+        }
+        if r.b[r.i - 1] != 44 {
+            fail(bad_json())
+        }
+    }
+    return JqArray(items)
+}
+
+fn read_object(inout r: JsonReader) -> JqValue ! JqError {
+    r.i = r.i + 1
+    var entries: [(str, JqValue)] = []
+    skip_ws(r)
+    if r.i < r.b.len() and r.b[r.i] == 125 {
+        r.i = r.i + 1
+        return JqObject(entries)
+    }
+    while true {
+        skip_ws(r)
+        if r.i >= r.b.len() or r.b[r.i] != 34 {
+            fail(bad_json())
+        }
+        let key = try read_string(r)
+        skip_ws(r)
+        if r.i >= r.b.len() or r.b[r.i] != 58 {
+            fail(bad_json())
+        }
+        r.i = r.i + 1
+        let v = try read_value(r)
+        var placed = false
+        for k in 0..entries.len() {
+            if entries[k].0 == key {
+                entries[k] = (key, v)
+                placed = true
+            }
+        }
+        if not placed {
+            entries.push((key, v))
+        }
+        skip_ws(r)
+        if r.i >= r.b.len() {
+            fail(bad_json())
+        }
+        r.i = r.i + 1
+        if r.b[r.i - 1] == 125 {
+            return JqObject(entries)
+        }
+        if r.b[r.i - 1] != 44 {
+            fail(bad_json())
+        }
+    }
+    return JqObject(entries)
+}
+
+/// One JSON value, as jq reads its input (see the note above on errors).
+pub fn parse(text: str) -> JqValue ! JqError {
+    var r = JsonReader{ b: ascii(text), i: 0 }
+    let v = try read_value(r)
+    skip_ws(r)
+    if r.i != r.b.len() {
+        fail(bad_json())
+    }
+    return v
+}

@@ -1,0 +1,160 @@
+// Go's toolchain version strings, as Go 1.25's `go/version` reads them:
+// `Compare`, `IsValid` and `Lang`.
+//
+// `go.mod` files, `GOTOOLCHAIN`, `go version -m` and release tooling all
+// carry versions like `go1.21rc2` and `go1.22.0`, and anything choosing a
+// toolchain or checking a minimum has to order them as Go does:
+//
+//   - A version is `go` then a major number, optionally `.minor`, then
+//     either `.patch` or a pre-release: lower-case letters and an optional
+//     number (`rc2`, `beta1`, `alpha`). Numbers have no leading zeros, and
+//     may be any length. A `-suffix` (as in `go1.21-bigcorp`) is ignored.
+//   - `go1` is `go1.0.0`, and so is `go1.N` for N below 21; from 1.21 on
+//     `go1.21` is the language version, which comes before `go1.21rc1`,
+//     which comes before `go1.21.0`.
+//   - Pre-release kinds compare as strings, so `alpha` < `beta` < `rc`,
+//     and any other lower-case word sorts among them by spelling.
+//   - Every invalid version compares equal to every other, and below every
+//     valid one; `Lang` of an invalid version is "".
+//   - `Lang` keeps major and minor (`go1.21.3` is `go1.21`), but `go1.0`
+//     and `go1` are `go1`, while `go2` is `go2.0`.
+
+/// A parsed version; every field is "" for an invalid one.
+type GoVersionParts = { major: str, minor: str, patch: str, kind: str, pre: str }
+
+fn invalid() -> GoVersionParts {
+    return GoVersionParts{ major: "", minor: "", patch: "", kind: "", pre: "" }
+}
+
+fn is_digit(c: i64) -> bool {
+    return c >= 48 and c <= 57
+}
+
+/// A decimal number at the start of `b`: the digits and the rest, or
+/// `None` when there are none or a needless leading zero.
+fn cut_int(b: [i64]) -> Option[([i64], [i64])] {
+    var i = 0
+    while i < b.len() and is_digit(b[i]) {
+        i = i + 1
+    }
+    if i == 0 or (b[0] == 48 and i != 1) {
+        return None
+    }
+    return Some((b.slice(0, i), b.slice(i, b.len())))
+}
+
+fn text(b: [i64]) -> str {
+    return bytes_of(b).to_str()
+}
+
+/// `gover.CmpInt`: decimal strings without leading zeros, by length and
+/// then by spelling.
+fn cmp_int(x: str, y: str) -> i64 {
+    if x == y {
+        return 0
+    }
+    if x.len() != y.len() {
+        return if x.len() < y.len() { 0 - 1 } else { 1 }
+    }
+    return if x < y { 0 - 1 } else { 1 }
+}
+
+fn parse_rest(v: GoVersionParts, x: [i64]) -> GoVersionParts {
+    if x[0] == 46 {
+        return match cut_int(x.slice(1, x.len())) {
+            Some((p, rest)) -> if rest.len() == 0 { GoVersionParts{ major: v.major, minor: v.minor, patch: text(p), kind: "", pre: "" } } else { invalid() }
+            None -> invalid()
+        }
+    }
+    var i = 0
+    while i < x.len() and not is_digit(x[i]) {
+        if x[i] < 97 or x[i] > 122 {
+            return invalid()
+        }
+        i = i + 1
+    }
+    if i == 0 {
+        return invalid()
+    }
+    let kind = text(x.slice(0, i))
+    if i == x.len() {
+        return GoVersionParts{ major: v.major, minor: v.minor, patch: "", kind: kind, pre: "" }
+    }
+    return match cut_int(x.slice(i, x.len())) {
+        Some((p, rest)) -> if rest.len() == 0 { GoVersionParts{ major: v.major, minor: v.minor, patch: "", kind: kind, pre: text(p) } } else { invalid() }
+        None -> invalid()
+    }
+}
+
+/// `gover.Parse` of a version without its `go` prefix.
+fn parse_parts(x: [i64]) -> GoVersionParts {
+    let (major, rest) = match cut_int(x) {
+        Some(c) -> c
+        None -> return invalid()
+    }
+    if rest.len() == 0 {
+        return GoVersionParts{ major: text(major), minor: "0", patch: "0", kind: "", pre: "" }
+    }
+    if rest[0] != 46 {
+        return invalid()
+    }
+    let (minor, rest2) = match cut_int(rest.slice(1, rest.len())) {
+        Some(c) -> c
+        None -> return invalid()
+    }
+    let v = GoVersionParts{ major: text(major), minor: text(minor), patch: "", kind: "", pre: "" }
+    if rest2.len() == 0 {
+        return if cmp_int(v.minor, "21") < 0 { GoVersionParts{ major: v.major, minor: v.minor, patch: "0", kind: "", pre: "" } } else { v }
+    }
+    return parse_rest(v, rest2)
+}
+
+/// The version without `go` and without anything from the first `-`;
+/// empty when it does not start with `go`.
+fn strip_go(x: str) -> [i64] {
+    let b = x.to_bytes().to_list()
+    var end = 0
+    while end < b.len() and b[end] != 45 {
+        end = end + 1
+    }
+    if end < 2 or b[0] != 103 or b[1] != 111 {
+        return []
+    }
+    return b.slice(2, end)
+}
+
+/// The parts of a version (`major`, `minor`, `patch`, `kind`, `pre`), all
+/// "" when it is not valid.
+pub fn parse(x: str) -> GoVersionParts {
+    return parse_parts(strip_go(x))
+}
+
+/// `version.IsValid`.
+pub fn is_valid(x: str) -> bool {
+    return parse(x).major != ""
+}
+
+/// `version.Compare`: -1, 0 or 1.
+pub fn compare(x: str, y: str) -> i64 {
+    let a = parse(x)
+    let b = parse(y)
+    for c in [cmp_int(a.major, b.major), cmp_int(a.minor, b.minor), cmp_int(a.patch, b.patch), a.kind.cmp(b.kind), cmp_int(a.pre, b.pre)] {
+        if c != 0 {
+            return c
+        }
+    }
+    return 0
+}
+
+/// `version.Lang`: the language version, `go1.21` for `go1.21.3`, or ""
+/// for an invalid version.
+pub fn lang(x: str) -> str {
+    let v = parse(x)
+    if v.major == "" {
+        return ""
+    }
+    if v.minor == "" or (v.major == "1" and v.minor == "0") {
+        return "go" + v.major
+    }
+    return "go" + v.major + "." + v.minor
+}

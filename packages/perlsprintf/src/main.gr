@@ -1,0 +1,1882 @@
+// Perl's `sprintf`, as Perl 5.34 formats: every conversion, every flag,
+// vectors, explicit argument indexes, and the warnings it prints.
+//
+// Perl programs format nearly all of their output with `sprintf` and
+// `printf` -- log lines, reports, fixed-width records, version strings,
+// hex dumps -- and the result is read by other programs. Reproducing it
+// means Perl's own rules, which are C's `printf` with a good deal added:
+//
+//   - **Conversions** `%c %s %d %i %u %o %x %X %b %B %e %E %f %F %g %G
+//     %a %A %%`, and the synonyms `%D %U %O`; flags `- + space 0 #`;
+//     widths and precisions written out or taken from an argument with
+//     `*` or `*N$` (a negative width means `-`, a negative precision
+//     none); sizes `h hh l ll q L V z t j`, where `h` and `hh` really do
+//     cut an integer to 16 or 8 bits and `h`, `hh`, `z`, `t` or `j` on a
+//     float conversion makes it invalid.
+//   - **Explicit indexes** `%2$s`, and the vector flag: `%vd` prints the
+//     code points of a string joined by `.`, `%*vX` takes the joiner from
+//     an argument, and `%-*3$vd` mixes them.
+//   - **Arguments are numified as Perl numifies.** A string is read the
+//     way Perl reads one -- leading space, `0 but true`, `Inf`, `nan`,
+//     `1.#INF`, integers exact up to 2^64, everything else through
+//     `strtod`, and "isn't numeric" warnings for what is left over -- and
+//     the result is kept, so the second use of an argument does not warn
+//     again and can even read differently from the first (`%1$d %1$d` of
+//     `" inf"` is `0 Inf`, as in Perl). `%d` of a huge double is `-1`,
+//     `%u` of `-3.5` is 18446744073709551613, `%d` of `"inf"` is `Inf`.
+//   - **Floats** are C's: correctly rounded, half to even on the exact
+//     binary value; `%a` is Perl's own, which rounds a tie by looking at
+//     one digit only.
+//   - **Invalid conversions** print themselves and warn
+//     `Invalid conversion in sprintf: "%z"`; a missing argument warns and
+//     counts as an empty string; a left-over one warns when no index was
+//     written; widths beyond 2^62 die with Perl's message, as do `%c` of
+//     a negative number and of an infinity.
+//
+// The text is characters, as Perl's is; a `%c` past 255 counts its width
+// and precision in UTF-8 bytes, which is Perl's behaviour too. A result
+// holding a surrogate, a code point past U+10FFFF or a character cut in
+// half by such a precision is not text here, and is answered with
+// `PerlSprintfNotText`.
+//
+// Not covered: `%n` (it writes into its argument) and `%p` (it prints an
+// address) are refused; widths and precisions above 1,000,000 are refused
+// rather than built; arguments are strings, integers or doubles (no
+// references, no undef, no version objects); the NaN spellings `snan` and
+// `qnan` -- which Perl treats as NaN but `strtod` does not, sending
+// `%d` into undefined behaviour in Perl itself -- are refused; and a hex
+// number reached through `strtod` (`"+ 0x1p3"`) is read exactly only with
+// up to 13 hex digits.
+//
+// Checked against `perl` 5.34's `sprintf` with warnings on.
+
+import shortestfloat
+
+/// An argument, as a Perl scalar: a string, an integer or a double.
+type PerlArg = | PerlStr(text: str) | PerlInt(value: i64) | PerlNum(value: f64)
+
+/// The text and the warnings Perl printed while making it.
+type PerlSprintfResult = { text: str, warnings: [str] }
+
+/// `sprintf` died (with Perl's message and the warnings before it), made
+/// something that is not text, or was asked for what this does not do.
+type PerlSprintfError =
+    | PerlSprintfDied(message: str, warnings: [str])
+    | PerlSprintfNotText(warnings: [str])
+    | PerlSprintfRefused(why: str)
+
+/// An argument as Perl holds it: the slots and flags numification fills,
+/// once. `kind` is 0 for a string, 1 an integer, 2 a double, 3 the empty
+/// value a missing argument reads as.
+type PerlSv = {
+    kind: i64,
+    text: str,
+    iokp: bool,
+    nokp: bool,
+    iok: bool,
+    is_uv: bool,
+    ivx: i64,
+    nvx: f64,
+    pv: str,
+    pok: bool,
+}
+
+type PerlSpf = { svs: [PerlSv], warnings: [str], out: [i64], has_utf8: bool, not_text: bool }
+
+type PerlSpfDie = | PerlSpfDie(msg: str) | PerlSpfRefuse(why: str)
+
+/// One conversion as parsed: its flags, sizes, the argument it reads and
+/// where it ends.
+type PerlSpec = {
+    alt: bool,
+    left: bool,
+    fill: bool,
+    plus: i64,
+    width: i64,
+    has_precis: bool,
+    precis: i64,
+    vectorize: bool,
+    dotstr: str,
+    dot_utf8: bool,
+    efix: i64,
+    intsize: i64,
+    c: i64,
+    q: i64,
+    missing: bool,
+    bad: bool,
+}
+
+// --- numbers as Perl's C sees them -----------------------------------------------------------------
+
+fn iv_min() -> i64 {
+    return 0 - 9223372036854775807 - 1
+}
+
+fn two63() -> f64 {
+    return 9223372036854775808.0
+}
+
+fn two64() -> f64 {
+    return 18446744073709551616.0
+}
+
+fn high_bits(f: f64) -> i64 {
+    return (f - two63()).as_i64().bit_or(iv_min())
+}
+
+/// Perl_cast_iv: a double to an IV, saturating as Perl does.
+fn cast_iv(f: f64) -> i64 {
+    if f < two63() {
+        return if f < 0.0 - two63() { iv_min() } else { f.as_i64() }
+    }
+    if f < two64() {
+        return high_bits(f)
+    }
+    return if f > 0.0 { 0 - 1 } else { 0 }
+}
+
+/// Perl_cast_uv: a double to a UV (held in an i64).
+fn cast_uv(f: f64) -> i64 {
+    if f < 0.0 {
+        return if f < 0.0 - two63() { iv_min() } else { f.as_i64() }
+    }
+    if f < two64() {
+        return if f < two63() { f.as_i64() } else { high_bits(f) }
+    }
+    return if f > 0.0 { 0 - 1 } else { 0 }
+}
+
+/// A UV (held in an i64) as the double nearest it.
+fn uv_to_nv(u: i64) -> f64 {
+    if u >= 0 {
+        return u.as_f64()
+    }
+    return u.ushr(1).bit_or(u.bit_and(1)).as_f64() * 2.0
+}
+
+fn ult(a: i64, b: i64) -> bool {
+    return a.bit_xor(iv_min()) < b.bit_xor(iv_min())
+}
+
+/// Whether U_V(fabs(nv)) is below 2^53, as Perl asks it.
+fn small_nv(nv: f64) -> bool {
+    return nv != nv or nv.abs() < 9007199254740992.0
+}
+
+fn is_infnan(nv: f64) -> bool {
+    return nv != nv or nv * 0.5 == nv and nv != 0.0
+}
+
+fn udigits(v: i64, base: i64, upper: bool) -> str {
+    let set = if upper { "0123456789ABCDEF" } else { "0123456789abcdef" }
+    var out: [str] = []
+    var n = v
+    var going = true
+    while going {
+        // Unsigned division by halving first, so the top bit is a digit.
+        let q = n.ushr(1) / base * 2
+        var r = n - q * base
+        var qq = q
+        if r >= base or r < 0 {
+            r = r - base
+            qq = qq + 1
+        }
+        out.push(set.substr(r, 1))
+        n = qq
+        going = n != 0
+    }
+    return out.rev().join("")
+}
+
+fn udec(v: i64) -> str {
+    return udigits(v, 10, false)
+}
+
+// --- bytes -------------------------------------------------------------------------------------------
+
+fn at(b: [i64], i: i64) -> i64 {
+    return if i >= 0 and i < b.len() { b[i] } else { 0 }
+}
+
+fn is_space(c: i64) -> bool {
+    return c == 32 or c >= 9 and c <= 13
+}
+
+fn is_digit(c: i64) -> bool {
+    return c >= 48 and c <= 57
+}
+
+fn is_xdigit(c: i64) -> bool {
+    return is_digit(c) or c >= 97 and c <= 102 or c >= 65 and c <= 70
+}
+
+fn xvalue(c: i64) -> i64 {
+    return if is_digit(c) { c - 48 } else if c >= 97 { c - 87 } else { c - 55 }
+}
+
+fn fold(c: i64) -> i64 {
+    return if c >= 65 and c <= 90 { c + 32 } else { c }
+}
+
+fn is_ascii_text(t: str) -> bool {
+    return t.codes().all(|c| c < 128)
+}
+
+fn bytes_of_text(t: str) -> [i64] {
+    return t.to_bytes().to_list()
+}
+
+// --- grok_infnan, grok_number, Atof -------------------------------------------------------------------
+
+// Flags, as perl.h numbers them.
+fn f_in_uv() -> i64 {
+    return 1
+}
+
+fn f_not_int() -> i64 {
+    return 4
+}
+
+fn f_neg() -> i64 {
+    return 8
+}
+
+fn f_inf() -> i64 {
+    return 16
+}
+
+fn f_nan() -> i64 {
+    return 32
+}
+
+fn f_trailing() -> i64 {
+    return 64
+}
+
+fn has(flags: i64, f: i64) -> bool {
+    return flags.bit_and(f) != 0
+}
+
+fn skip_spaces(b: [i64], s0: i64, send: i64) -> i64 {
+    var s = s0
+    while s < send and is_space(at(b, s)) {
+        s = s + 1
+    }
+    return s
+}
+
+/// grok_infnan from `from`: the flags and where it stopped, which stays
+/// `from` when Perl leaves the pointer alone.
+fn grok_infnan(b: [i64], from: i64, send: i64) -> (i64, i64) {
+    var s = from
+    var flags = 0
+    if at(b, s) == 43 or at(b, s) == 45 {
+        if at(b, s) == 45 {
+            flags = f_neg()
+        }
+        s = s + 1
+        if s == send {
+            return (0, from)
+        }
+    }
+    var odh = false
+    if at(b, s) == 49 {
+        s = s + 1
+        if s == send {
+            return (0, from)
+        }
+        if at(b, s) == 46 {
+            s = s + 1
+            if s == send {
+                return (0, from)
+            }
+        }
+        if at(b, s) != 35 {
+            return (0, from)
+        }
+        s = s + 1
+        if s == send {
+            return (0, from)
+        }
+        odh = true
+    }
+    if fold(at(b, s)) == 105 {
+        return grok_inf(b, s, send, flags, odh, from)
+    }
+    return grok_nan(b, s, send, flags, from)
+}
+
+/// `word` matched case-insensitively at `s`, each letter checked before
+/// the next as Perl does; the count matched.
+fn word_at(b: [i64], s: i64, send: i64, word: str) -> i64 {
+    var k = 0
+    for c in word.codes() {
+        if s + k == send or fold(at(b, s + k)) != c {
+            return k
+        }
+        k = k + 1
+    }
+    return k
+}
+
+fn infnan_tail(b: [i64], s0: i64, send: i64, flags: i64) -> (i64, i64) {
+    return (flags, skip_spaces(b, s0, send))
+}
+
+fn grok_inf(b: [i64], s0: i64, send: i64, flags0: i64, odh: bool, from: i64) -> (i64, i64) {
+    var s = s0 + 1
+    if s == send or fold(at(b, s)) != 110 {
+        return (0, from)
+    }
+    s = s + 1
+    if s == send {
+        return (0, from)
+    }
+    var flags = flags0
+    if fold(at(b, s)) == 102 {
+        s = s + 1
+        if s < send and fold(at(b, s)) == 105 {
+            if word_at(b, s, send, "inity") < 5 {
+                return (flags + f_inf() + f_not_int() + f_trailing(), from)
+            }
+            s = s + 5
+        } else if odh {
+            while s < send and at(b, s) == 48 {
+                s = s + 1
+            }
+        }
+        s = skip_spaces(b, s, send)
+        if s < send and at(b, s) != 0 {
+            flags = flags.bit_or(f_trailing())
+        }
+        return infnan_tail(b, s, send, flags.bit_or(f_inf() + f_not_int()))
+    }
+    if fold(at(b, s)) == 100 and odh {
+        s = s + 1
+        flags = flags.bit_or(f_nan() + f_not_int())
+        while s < send and at(b, s) == 48 {
+            s = s + 1
+        }
+        if s < send and at(b, s) != 0 {
+            flags = flags.bit_or(f_trailing())
+        }
+        return infnan_tail(b, s, send, flags)
+    }
+    return (0, from)
+}
+
+fn grok_nan(b: [i64], s0: i64, send: i64, flags0: i64, from: i64) -> (i64, i64) {
+    var s = s0
+    if fold(at(b, s)) == 115 or fold(at(b, s)) == 113 {
+        s = s + 1
+        if s == send {
+            return (0, from)
+        }
+    }
+    if fold(at(b, s)) != 110 or word_at(b, s, send, "nan") < 3 {
+        return (0, from)
+    }
+    s = s + 3
+    let flags = flags0.bit_or(f_nan() + f_not_int())
+    if s == send {
+        return (flags, from)
+    }
+    if fold(at(b, s)) == 113 or fold(at(b, s)) == 115 {
+        s = s + 1
+        if s == send {
+            return (flags, from)
+        }
+    }
+    if at(b, s) == 40 {
+        return nan_payload(b, s + 1, send, flags, from)
+    }
+    s = skip_spaces(b, s, send)
+    let more = if s < send and at(b, s) != 0 { f_trailing() } else { 0 }
+    return infnan_tail(b, send, send, flags.bit_or(more))
+}
+
+/// The C99 `nan(...)` payload after the parenthesis at `s0 - 1`.
+fn nan_payload(b: [i64], s0: i64, send: i64, flags: i64, from: i64) -> (i64, i64) {
+    if s0 == send {
+        return (flags.bit_or(f_trailing()), from)
+    }
+    var t = s0 + 1
+    while t < send and at(b, t) != 0 and at(b, t) != 41 {
+        t = t + 1
+    }
+    if t == send {
+        return (flags.bit_or(f_trailing()), from)
+    }
+    if at(b, t) != 41 {
+        return infnan_tail(b, send, send, flags.bit_or(f_trailing()))
+    }
+    let s = s0
+    let lead = at(b, s) == 48 and s + 2 < t
+    if lead and fold(at(b, s + 1)) == 120 and is_xdigit(at(b, s + 2)) {
+        return infnan_tail(b, send, send, payload_digits(b, s + 2, t, 16, flags))
+    }
+    if lead and fold(at(b, s + 1)) == 98 and (at(b, s + 2) == 48 or at(b, s + 2) == 49) {
+        return infnan_tail(b, send, send, payload_digits(b, s + 2, t, 2, flags))
+    }
+    let inner = grok_number_flags(b.slice(s, t), true)
+    var out = flags
+    if not (s..t).to_list().all(|u| is_digit(at(b, u))) {
+        out = out.bit_or(f_trailing())
+    }
+    if has(inner.0, f_not_int()) or inner.0 == 0 {
+        return (0, from)
+    }
+    return infnan_tail(b, send, send, out)
+}
+
+/// grok_hex or grok_bin over a payload: digits and underscores; anything
+/// else before the parenthesis is trailing.
+fn payload_digits(b: [i64], s0: i64, t: i64, base: i64, flags: i64) -> i64 {
+    var s = s0
+    while s < t {
+        let c = at(b, s)
+        let ok = if base == 16 { is_xdigit(c) } else { c == 48 or c == 49 }
+        if not ok {
+            if c == 95 and s + 1 < t {
+                let d = at(b, s + 1)
+                let next_ok = if base == 16 { is_xdigit(d) } else { d == 48 or d == 49 }
+                if next_ok {
+                    s = s + 1
+                    continue
+                }
+            }
+            return flags.bit_or(f_trailing())
+        }
+        s = s + 1
+    }
+    return flags
+}
+
+/// grok_number_flags: the kind of number `b` is and, when it fits, its
+/// value as a UV.
+fn grok_number_flags(b: [i64], trailing: bool) -> (i64, i64) {
+    let send = b.len()
+    var s = 0
+    if s < send and is_space(at(b, s)) {
+        s = skip_spaces(b, s, send)
+        if s == send {
+            return (0, 0)
+        }
+    }
+    var numtype = 0
+    if at(b, s) == 45 or at(b, s) == 43 {
+        if at(b, s) == 45 {
+            numtype = f_neg()
+        }
+        s = s + 1
+        if s == send {
+            return (0, 0)
+        }
+    }
+    let d = s
+    var value = 0
+    if is_digit(at(b, s)) {
+        let m = grok_mantissa(b, s, send)
+        numtype = numtype.bit_or(m.0)
+        value = m.1
+        s = m.2
+        if s < send and at(b, s) == 46 {
+            numtype = numtype.bit_or(f_not_int())
+            s = s + 1
+            while s < send and is_digit(at(b, s)) {
+                s = s + 1
+            }
+        }
+    } else if s < send and at(b, s) == 46 {
+        s = s + 1
+        if not (s < send and is_digit(at(b, s))) {
+            return (0, 0)
+        }
+        while s < send and is_digit(at(b, s)) {
+            s = s + 1
+        }
+        numtype = numtype.bit_or(f_not_int() + f_in_uv())
+    }
+    return grok_rest(b, s, d, send, numtype, value, trailing)
+}
+
+/// The integer digits: the flags they add, the value, where they end.
+fn grok_mantissa(b: [i64], s0: i64, send: i64) -> (i64, i64, i64) {
+    var s = s0
+    var value = 0
+    let limit = 1844674407370955161
+    while s < send and is_digit(at(b, s)) {
+        let digit = at(b, s) - 48
+        if ult(value, limit) or value == limit and digit <= 5 {
+            value = value * 10 + digit
+            s = s + 1
+        } else {
+            while s < send and is_digit(at(b, s)) {
+                s = s + 1
+            }
+            return (2, value, s)
+        }
+    }
+    return (f_in_uv(), value, s)
+}
+
+fn grok_rest(b: [i64], s0: i64, d: i64, send: i64, numtype0: i64, value: i64, trailing: bool) -> (i64, i64) {
+    var s = s0
+    var numtype = numtype0
+    if s > d and s < send and fold(at(b, s)) == 101 {
+        s = s + 1
+        if s < send and (at(b, s) == 45 or at(b, s) == 43) {
+            s = s + 1
+        }
+        if not (s < send and is_digit(at(b, s))) {
+            return if trailing { (numtype.bit_or(f_trailing()), value) } else { (0, 0) }
+        }
+        while s < send and is_digit(at(b, s)) {
+            s = s + 1
+        }
+        numtype = numtype.bit_and(f_neg()).bit_or(f_not_int())
+    }
+    s = skip_spaces(b, s, send)
+    if s == send {
+        return (numtype, value)
+    }
+    if bytes_of(b).to_str() == "0 but true" {
+        return (f_in_uv(), 0)
+    }
+    let c = fold(at(b, s))
+    if s + 2 < send and (c == 105 or c == 110 or c == 113 or c == 115 or c == 35) {
+        let inf = grok_infnan(b, d, send).0
+        if has(inf, f_inf()) {
+            return (numtype.bit_or(inf), value)
+        }
+        if has(inf, f_nan()) {
+            return (numtype.bit_or(inf).bit_and(f_neg().bit_not()), value)
+        }
+        return (0, 0)
+    }
+    return if trailing { (numtype.bit_or(f_trailing()), value) } else { (0, 0) }
+}
+
+fn grok_number(b: [i64]) -> (i64, i64) {
+    return grok_number_flags(b, false)
+}
+
+/// my_atof3 over the bytes before any NUL: sign and white space, Perl's
+/// own infinities and NaNs, `0x` and `0b` read as 0, then strtod.
+fn atof(b0: [i64]) -> f64 {
+    var send = 0
+    while send < b0.len() and b0[send] != 0 {
+        send = send + 1
+    }
+    let b = b0.slice(0, send)
+    var s = skip_spaces(b, 0, send)
+    var negative = false
+    if at(b, s) == 45 {
+        negative = true
+        s = s + 1
+    } else if at(b, s) == 43 {
+        s = s + 1
+    }
+    let p0 = if negative { s - 1 } else { s }
+    let inf = grok_infnan(b, p0, send)
+    if inf.0 != 0 and inf.1 != p0 {
+        if has(inf.0, f_inf()) {
+            return if has(inf.0, f_neg()) { 0.0 - 1.0 / 0.0 } else { 1.0 / 0.0 }
+        }
+        if has(inf.0, f_nan()) {
+            return 0.0 / 0.0
+        }
+    }
+    if at(b, s) == 48 and (fold(at(b, s + 1)) == 120 or fold(at(b, s + 1)) == 98) {
+        return 0.0
+    }
+    return match strtod(b, s) {
+        Some(r) -> if negative { r * (0.0 - 1.0) } else { r }
+        None -> 0.0
+    }
+}
+
+/// strtod in the C locale, as the macOS libc reads: white space, a sign,
+/// then `inf`, `infinity`, `nan`, a hex float or a decimal one.
+fn strtod(b: [i64], s0: i64) -> Option[f64] {
+    var s = skip_spaces(b, s0, b.len())
+    var neg = false
+    if at(b, s) == 45 or at(b, s) == 43 {
+        neg = at(b, s) == 45
+        s = s + 1
+    }
+    let r = if word_at(b, s, b.len(), "inf") == 3 {
+        Some(1.0 / 0.0)
+    } else if word_at(b, s, b.len(), "nan") == 3 {
+        Some(0.0 / 0.0)
+    } else if at(b, s) == 48 and fold(at(b, s + 1)) == 120 {
+        Some(hex_float(b, s + 2))
+    } else {
+        decimal_float(b, s)
+    }
+    return match r {
+        Some(v) -> Some(if neg { v * (0.0 - 1.0) } else { v })
+        None -> None
+    }
+}
+
+/// The digits after `0x`; no hex digits means the `0` alone was read.
+fn hex_float(b: [i64], s0: i64) -> f64 {
+    var s = s0
+    var m = 0.0
+    var shift = 0
+    var any = false
+    while is_xdigit(at(b, s)) {
+        m = m * 16.0 + xvalue(at(b, s)).as_f64()
+        any = true
+        s = s + 1
+    }
+    if at(b, s) == 46 {
+        s = s + 1
+        while is_xdigit(at(b, s)) {
+            m = m * 16.0 + xvalue(at(b, s)).as_f64()
+            shift = shift - 4
+            any = true
+            s = s + 1
+        }
+    }
+    if not any {
+        return 0.0
+    }
+    if fold(at(b, s)) == 112 {
+        let e = exponent_digits(b, s + 1)
+        if e.1 {
+            shift = shift + e.0
+        }
+    }
+    return scale2(m, shift)
+}
+
+/// An optional sign and digits at `s`: the value (capped) and whether
+/// there were digits.
+fn exponent_digits(b: [i64], s0: i64) -> (i64, bool) {
+    var s = s0
+    var neg = false
+    if at(b, s) == 45 or at(b, s) == 43 {
+        neg = at(b, s) == 45
+        s = s + 1
+    }
+    if not is_digit(at(b, s)) {
+        return (0, false)
+    }
+    var e = 0
+    while is_digit(at(b, s)) {
+        if e < 100000 {
+            e = e * 10 + at(b, s) - 48
+        }
+        s = s + 1
+    }
+    return (if neg { 0 - e } else { e }, true)
+}
+
+fn scale2(m: f64, shift: i64) -> f64 {
+    var v = m
+    var k = shift
+    while k > 0 and v * 0.5 != v {
+        v = v * 2.0
+        k = k - 1
+    }
+    while k < 0 and v != 0.0 {
+        v = v * 0.5
+        k = k + 1
+    }
+    return v
+}
+
+fn decimal_float(b: [i64], s0: i64) -> Option[f64] {
+    var s = s0
+    var digits = 0
+    while is_digit(at(b, s)) {
+        s = s + 1
+        digits = digits + 1
+    }
+    if at(b, s) == 46 {
+        s = s + 1
+        while is_digit(at(b, s)) {
+            s = s + 1
+            digits = digits + 1
+        }
+    }
+    if digits == 0 {
+        return None
+    }
+    if fold(at(b, s)) == 101 {
+        var e = s + 1
+        if at(b, e) == 45 or at(b, e) == 43 {
+            e = e + 1
+        }
+        if is_digit(at(b, e)) {
+            while is_digit(at(b, e)) {
+                e = e + 1
+            }
+            s = e
+        }
+    }
+    var text = bytes_of(b.slice(s0, s)).to_str()
+    if text.starts_with(".") {
+        text = "0" + text
+    }
+    return text.parse_float()
+}
+
+// --- the scalar, numified as sv_2nv and sv_2iv do ----------------------------------------------------
+
+fn new_sv(a: PerlArg) -> PerlSv {
+    return match a {
+        PerlStr(t) -> PerlSv{ kind: 0, text: t, iokp: false, nokp: false, iok: false, is_uv: false, ivx: 0, nvx: 0.0, pv: t, pok: true }
+        PerlInt(v) -> PerlSv{ kind: 1, text: "", iokp: true, nokp: false, iok: true, is_uv: false, ivx: v, nvx: 0.0, pv: v.to_str(), pok: true }
+        PerlNum(x) -> PerlSv{ kind: 2, text: "", iokp: false, nokp: true, iok: false, is_uv: false, ivx: 0, nvx: x, pv: "", pok: false }
+    }
+}
+
+/// PL_sv_no: what a missing argument reads as.
+fn sv_no() -> PerlSv {
+    return PerlSv{ kind: 3, text: "", iokp: true, nokp: true, iok: true, is_uv: false, ivx: 0, nvx: 0.0, pv: "", pok: true }
+}
+
+/// The text of "Argument ... isn't numeric": printable ASCII as it is,
+/// the rest escaped, cut short with "..." as Perl cuts it.
+fn display(t: str) -> str {
+    if not is_ascii_text(t) {
+        var out = ""
+        for c in t.codes() {
+            if out.len() >= 32 {
+                return out + "..."
+            }
+            out = out + (if c >= 32 and c < 127 { c.to_char() } else { "\\x\{" + c.to_base(16) + "}" })
+        }
+        return out
+    }
+    var out = ""
+    let cs = t.codes()
+    var i = 0
+    while i < cs.len() and out.len() < 56 {
+        out = out + ascii_shown(cs[i])
+        i = i + 1
+    }
+    return if i < cs.len() { out + "..." } else { out }
+}
+
+fn ascii_shown(c: i64) -> str {
+    if c == 10 {
+        return "\\n"
+    }
+    if c == 13 {
+        return "\\r"
+    }
+    if c == 12 {
+        return "\\f"
+    }
+    if c == 92 {
+        return "\\\\"
+    }
+    if c == 0 {
+        return "\\0"
+    }
+    if c >= 32 and c < 127 {
+        return c.to_char()
+    }
+    return "^" + c.bit_xor(64).to_char()
+}
+
+fn not_a_number(inout st: PerlSpf, sv: PerlSv) {
+    st.warnings.push("Argument \"" + display(sv.text) + "\" isn't numeric in sprintf")
+}
+
+fn get_sv(st: PerlSpf, ix: i64) -> PerlSv {
+    return if ix >= 0 { st.svs[ix] } else { sv_no() }
+}
+
+fn put_sv(inout st: PerlSpf, ix: i64, sv: PerlSv) {
+    if ix >= 0 {
+        st.svs[ix] = sv
+    }
+}
+
+/// SvNV.
+fn sv_nv(inout st: PerlSpf, ix: i64) -> f64 {
+    var sv = get_sv(st, ix)
+    if sv.nokp {
+        return sv.nvx
+    }
+    if sv.iokp {
+        sv.nvx = if sv.is_uv { uv_to_nv(sv.ivx) } else { sv.ivx.as_f64() }
+        sv.nokp = true
+        put_sv(st, ix, sv)
+        return sv.nvx
+    }
+    let b = bytes_of_text(sv.text)
+    let g = grok_number(b)
+    if g.0 == 0 {
+        not_a_number(st, sv)
+    }
+    sv.nvx = atof(b)
+    sv.nokp = true
+    let in_uv = has(g.0, f_in_uv())
+    let neg = has(g.0, f_neg())
+    if not small_nv(sv.nvx) and in_uv and not (neg and not ult(g.1, iv_min())) {
+        sv.iokp = true
+        sv.ivx = if neg { 0 - g.1 } else { g.1 }
+        sv.is_uv = not neg and g.1 < 0
+    }
+    put_sv(st, ix, sv)
+    return sv.nvx
+}
+
+/// SvIV, and SvUV: the same 64 bits, read signed or not.
+fn sv_iv(inout st: PerlSpf, ix: i64) -> i64 {
+    var sv = get_sv(st, ix)
+    if sv.iokp {
+        return sv.ivx
+    }
+    if sv.nokp {
+        sv = iv_from_nv(sv)
+    } else {
+        sv = iv_from_pv(st, sv)
+    }
+    put_sv(st, ix, sv)
+    return sv.ivx
+}
+
+/// S_sv_2iuv_common when the double is the value.
+fn iv_from_nv(sv0: PerlSv) -> PerlSv {
+    var sv = sv0
+    sv.iokp = true
+    if sv.nvx < two63() {
+        sv.ivx = cast_iv(sv.nvx)
+        if sv.nvx == sv.ivx.as_f64() and sv.ivx != iv_min() and sv.ivx.abs() < 9007199254740992 and sv.kind == 2 {
+            sv.iok = true
+        }
+    } else {
+        sv.ivx = cast_uv(sv.nvx)
+        sv.is_uv = true
+    }
+    return sv
+}
+
+/// S_sv_2iuv_common when the string is.
+fn iv_from_pv(inout st: PerlSpf, sv0: PerlSv) -> PerlSv {
+    var sv = sv0
+    let b = bytes_of_text(sv.text)
+    if b.len() == 1 and is_digit(b[0]) {
+        sv.iokp = true
+        sv.ivx = b[0] - 48
+        return sv
+    }
+    let g = grok_number(b)
+    let numtype = g.0
+    if has(numtype, f_inf() + f_nan()) {
+        if has(numtype, f_trailing()) {
+            not_a_number(st, sv)
+        }
+        sv.nvx = if has(numtype, f_nan()) { 0.0 / 0.0 } else if has(numtype, f_neg()) { 0.0 - 1.0 / 0.0 } else { 1.0 / 0.0 }
+        sv.nokp = true
+        sv.iokp = false
+        return sv
+    }
+    if has(numtype, f_in_uv()) {
+        sv = integer_slot(sv, numtype, g.1)
+    }
+    if numtype.bit_and(f_in_uv() + f_not_int()) == f_in_uv() {
+        return sv
+    }
+    sv.nvx = atof(b)
+    if numtype == 0 {
+        not_a_number(st, sv)
+    }
+    sv.nokp = true
+    if numtype.bit_and(f_in_uv() + f_not_int()) == f_in_uv() + f_not_int() {
+        return sv
+    }
+    return iv_not_preserved(sv)
+}
+
+fn integer_slot(sv0: PerlSv, numtype: i64, value: i64) -> PerlSv {
+    var sv = sv0
+    sv.iokp = true
+    if not has(numtype, f_neg()) {
+        sv.ivx = value
+        sv.is_uv = value < 0
+    } else if not ult(iv_min(), value) {
+        sv.ivx = 0 - value
+    } else {
+        sv.nokp = true
+        sv.nvx = 0.0 - uv_to_nv(value)
+        sv.ivx = iv_min()
+    }
+    return sv
+}
+
+/// The IV of a string that was not a plain integer, from its double.
+fn iv_not_preserved(sv0: PerlSv) -> PerlSv {
+    var sv = sv0
+    sv.iokp = true
+    let nv = sv.nvx
+    if small_nv(nv) {
+        sv.ivx = cast_iv(nv)
+    } else if nv < 0.0 - two63() {
+        sv.ivx = iv_min()
+    } else if nv > two64() {
+        sv.ivx = 0 - 1
+        sv.is_uv = true
+    } else if nv < two63() {
+        sv.ivx = cast_iv(nv)
+    } else {
+        sv.ivx = cast_uv(nv)
+        sv.is_uv = true
+    }
+    return sv
+}
+
+/// isinfnansv: a numified value, or the string's own spelling.
+fn sv_infnan(st: PerlSpf, ix: i64) -> bool {
+    let sv = get_sv(st, ix)
+    if sv.nokp {
+        return is_infnan(sv.nvx)
+    }
+    if sv.iokp {
+        return false
+    }
+    let b = bytes_of_text(sv.text)
+    return grok_infnan(b, 0, b.len()).0 != 0
+}
+
+/// SvPV: a string's own text, a number's as Perl writes it (kept once
+/// made, as Perl keeps it).
+fn sv_pv(inout st: PerlSpf, ix: i64) -> str {
+    var sv = get_sv(st, ix)
+    if sv.pok {
+        return sv.pv
+    }
+    if sv.iok {
+        sv.pv = if sv.is_uv { udec(sv.ivx) } else { sv.ivx.to_str() }
+    } else {
+        sv.pv = nv_text(sv.nvx)
+    }
+    sv.pok = true
+    put_sv(st, ix, sv)
+    return sv.pv
+}
+
+/// A double as Perl prints it: "%.15g", with 0 for either zero.
+fn nv_text(nv: f64) -> str {
+    if nv == 0.0 {
+        return "0"
+    }
+    if is_infnan(nv) {
+        return infnan_text(nv, 0)
+    }
+    return (if negative_bits(nv) { "-" } else { "" }) + g_style(magnitude(nv), 15, false, false)
+}
+
+fn infnan_text(nv: f64, plus: i64) -> str {
+    if nv != nv {
+        return "NaN"
+    }
+    if nv < 0.0 {
+        return "-Inf"
+    }
+    return if plus != 0 { "+Inf" } else { "Inf" }
+}
+
+fn is_utf8_sv(sv: PerlSv) -> bool {
+    return sv.kind == 0 and not is_ascii_text(sv.text)
+}
+
+// --- C's %e %f %g, and Perl's %a -------------------------------------------------------------------
+
+fn magnitude(x: f64) -> f64 {
+    return x.to_bits().bit_and(9223372036854775807).from_bits()
+}
+
+fn negative_bits(x: f64) -> bool {
+    return x.to_bits() < 0
+}
+
+fn exp_text(e: i64, upper: bool) -> str {
+    let mark = if upper { "E" } else { "e" }
+    let sign = if e < 0 { "-" } else { "+" }
+    let digits = e.abs().to_str()
+    return mark + sign + (if digits.len() < 2 { "0" + digits } else { digits })
+}
+
+fn e_style(a: f64, prec: i64, alt: bool, upper: bool) -> str {
+    let p = shortestfloat.significant(a, prec + 1)
+    let d = p.digits
+    let dot = if prec > 0 or alt { "." } else { "" }
+    return d.substr(0, 1) + dot + d.substr(1, prec) + exp_text(p.point - 1, upper)
+}
+
+fn f_style(a: f64, prec: i64, alt: bool) -> str {
+    let t = shortestfloat.fixed(a, prec)
+    return if prec == 0 and alt { t + "." } else { t }
+}
+
+fn strip_zeros(t: str) -> str {
+    if not t.contains(".") {
+        return t
+    }
+    var end = t.len()
+    while end > 0 and t.substr(end - 1, 1) == "0" {
+        end = end - 1
+    }
+    if end > 0 and t.substr(end - 1, 1) == "." {
+        end = end - 1
+    }
+    return t.substr(0, end)
+}
+
+/// %g: P significant digits, fixed when the exponent is in [-4, P), and
+/// trailing zeros dropped unless `#`.
+fn g_style(a: f64, prec0: i64, alt: bool, upper: bool) -> str {
+    let prec = if prec0 == 0 { 1 } else { prec0 }
+    let p = shortestfloat.significant(a, prec)
+    let x = p.point - 1
+    let d = p.digits
+    if x < prec and x >= 0 - 4 {
+        var body = ""
+        if x >= 0 {
+            body = d.substr(0, x + 1)
+            let frac = d.substr(x + 1, prec - 1 - x)
+            body = body + (if frac.len() > 0 or alt { "." } else { "" }) + frac
+        } else {
+            body = "0." + "0".repeat(0 - x - 1) + d
+        }
+        return if alt { body } else { strip_zeros(body) }
+    }
+    var mant = d.substr(0, 1) + (if prec > 1 or alt { "." } else { "" }) + d.substr(1, prec - 1)
+    if not alt {
+        mant = strip_zeros(mant)
+    }
+    return mant + exp_text(x, upper)
+}
+
+/// The sign, the zeros or spaces of the width, C's way.
+fn c_pad(x: f64, body: str, s: PerlSpec) -> str {
+    let sign = if negative_bits(x) { "-" } else if s.plus == 43 { "+" } else if s.plus == 32 { " " } else { "" }
+    let have = sign.len() + body.len()
+    if s.width <= have {
+        return sign + body
+    }
+    let gap = s.width - have
+    if s.left {
+        return sign + body + " ".repeat(gap)
+    }
+    if s.fill {
+        return sign + "0".repeat(gap) + body
+    }
+    return " ".repeat(gap) + sign + body
+}
+
+fn float_text(x: f64, s: PerlSpec) -> str {
+    let c = s.c
+    let a = magnitude(x)
+    let prec = if s.has_precis { s.precis } else { 6 }
+    if c == 97 or c == 65 {
+        return hex_float_text(x, s)
+    }
+    let body = if c == 101 or c == 69 {
+        e_style(a, prec, s.alt, c == 69)
+    } else if c == 102 {
+        f_style(a, prec, s.alt)
+    } else {
+        g_style(a, prec, s.alt, c == 71)
+    }
+    return c_pad(x, body, s)
+}
+
+/// The nybbles Perl's S_hextract takes from a double, and the exponent
+/// frexp gives it.
+fn hextract(x: f64) -> ([i64], i64, bool) {
+    let bits = x.to_bits()
+    let raw = bits.ushr(52).bit_and(2047)
+    let frac = bits.bit_and(4503599627370495)
+    let subnormal = raw == 0 and frac != 0
+    var v: [i64] = []
+    if not subnormal {
+        v.push(if raw == 0 { 0 } else { 1 })
+    }
+    var k = 12
+    while k >= 0 {
+        v.push(frac.ushr(k * 4).bit_and(15))
+        k = k - 1
+    }
+    var e = 0
+    if raw != 0 {
+        e = raw - 1022
+    } else if frac != 0 {
+        var len = 0
+        while frac.ushr(len) != 0 {
+            len = len + 1
+        }
+        e = len - 1074
+    }
+    return (v, e, subnormal)
+}
+
+fn first_nonzero(v: [i64]) -> i64 {
+    var i = 0
+    while i < v.len() {
+        if v[i] != 0 {
+            return i
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+fn last_nonzero(v: [i64]) -> i64 {
+    var i = v.len() - 1
+    while i >= 0 {
+        if v[i] != 0 {
+            return i
+        }
+        i = i - 1
+    }
+    return 0 - 1
+}
+
+/// Perl's %a, from S_format_hexfp.
+fn hex_float_text(x: f64, s: PerlSpec) -> str {
+    let h = hextract(x)
+    var v = h.0
+    v.push(0)
+    v.push(0)
+    var exponent = h.1
+    let subnormal = h.2
+    let lower = s.c == 97
+    let negative = negative_bits(x)
+    var head = if negative { "-" } else if s.plus != 0 { s.plus.to_char() } else { "" }
+    head = head + (if lower { "0x" } else { "0X" })
+    let vfnz = first_nonzero(v)
+    var digits = ""
+    var radix = false
+    var zerotail = 0
+    if vfnz < 0 {
+        digits = "0"
+        exponent = 0
+        zerotail = if s.has_precis { s.precis } else { 0 }
+    } else {
+        let laid = hex_digits(v, vfnz, exponent - 1, subnormal, s)
+        digits = laid.0
+        exponent = laid.1
+        radix = laid.2
+        zerotail = laid.3
+    }
+    if s.has_precis and s.precis > 0 or s.alt {
+        radix = true
+    }
+    var body = digits.substr(0, 1)
+    if radix {
+        body = body + "."
+    }
+    body = body + digits.substr(1, digits.len() - 1) + "0".repeat(zerotail)
+    let ex = (if lower { "p" } else { "P" }) + (if exponent >= 0 { "+" } else { "" }) + exponent.to_str()
+    return hex_pad(head, (if lower { body } else { body.to_upper() }) + ex, s)
+}
+
+/// The digits after rounding to the precision, the exponent, whether a
+/// radix point is due, and the zeros to add.
+fn hex_digits(v0: [i64], vfnz: i64, exponent0: i64, subnormal: bool, s: PerlSpec) -> (str, i64, bool, i64) {
+    var v = v0
+    var exponent = exponent0
+    var vlnz = last_nonzero(v)
+    var start = 0
+    if subnormal {
+        if v[vfnz] > 1 {
+            var n = 0
+            var i = v[vfnz]
+            while i > 1 {
+                i = i.shr(1)
+                n = n + 1
+            }
+            v[vlnz + 1] = 0
+            var k = vlnz
+            while k >= vfnz {
+                v[k + 1] = v[k + 1].bit_or(v[k].bit_and(15.shr(4 - n)).shl(4 - n))
+                v[k] = v[k].shr(n)
+                k = k - 1
+            }
+            if v[vlnz + 1] != 0 {
+                vlnz = vlnz + 1
+            }
+        }
+        start = vfnz
+    }
+    var zerotail = 0
+    if s.has_precis {
+        let ve = if subnormal { vlnz + 1 } else { 14 }
+        let vn = ve - start
+        if s.precis < vn - 1 {
+            let r = hex_round(v, start, s.precis)
+            v = r.0
+            exponent = exponent + r.1
+            vlnz = start + s.precis
+        } else {
+            zerotail = if subnormal { s.precis - vn + 1 } else { s.precis - vlnz }
+        }
+    }
+    var out = ""
+    var k = start
+    out = out + v[k].to_base(16)
+    k = k + 1
+    while k <= vlnz {
+        out = out + v[k].to_base(16)
+        k = k + 1
+    }
+    return (out, exponent, vfnz < vlnz, zerotail)
+}
+
+/// Rounding at `start + p`, looking only at the next nybble; a carry out
+/// of the first digit shifts everything along.
+fn hex_round(v0: [i64], start: i64, p: i64) -> ([i64], i64) {
+    var v = v0
+    let next = v[start + p + 1]
+    var overflow = false
+    if next > 8 or next == 8 and v[start + p].bit_and(1) == 1 {
+        v[start + p] = v[start + p] + 1
+        overflow = v[start + p] > 15
+        v[start + p] = v[start + p].bit_and(15)
+    }
+    var k = start + p - 1
+    while overflow and k >= start {
+        v[k] = v[k] + 1
+        overflow = v[k] > 15
+        v[k] = v[k].bit_and(15)
+        k = k - 1
+    }
+    if overflow {
+        var w = v.slice(0, start)
+        w.push(1)
+        w = w + v.slice(start, v.len() - 1)
+        return (w, 4)
+    }
+    return (v, 0)
+}
+
+fn hex_pad(head: str, body: str, s: PerlSpec) -> str {
+    let elen = head.len() + body.len()
+    if elen >= s.width {
+        return head + body
+    }
+    let gap = s.width - elen
+    if s.left {
+        return head + body + " ".repeat(gap)
+    }
+    if s.fill {
+        return head + "0".repeat(gap) + body
+    }
+    return " ".repeat(gap) + head + body
+}
+
+// --- the conversions ------------------------------------------------------------------------------
+
+fn die(msg: str) -> PerlSpfDie {
+    return PerlSpfDie(msg)
+}
+
+fn overflow() -> PerlSpfDie {
+    return die("Integer overflow in format string for sprintf")
+}
+
+fn expect_number(pat: [i64], q0: i64) -> (i64, i64) ! PerlSpfDie {
+    var q = q0
+    var v = at(pat, q) - 48
+    q = q + 1
+    while is_digit(at(pat, q)) {
+        if v > 461168601842738789 {
+            fail(overflow())
+        }
+        v = v * 10 + at(pat, q) - 48
+        q = q + 1
+    }
+    return (v, q)
+}
+
+/// S_sprintf_arg_num_val: a width or precision from an argument, and
+/// whether it was negative.
+fn arg_num_val(inout st: PerlSpf, ix: i64, present: bool) -> (i64, bool) ! PerlSpfDie {
+    if not present {
+        return (0, false)
+    }
+    var iv = 0
+    if get_sv(st, ix).is_uv {
+        iv = sv_iv(st, ix)
+        if iv < 0 {
+            fail(overflow())
+        }
+    } else {
+        iv = sv_iv(st, ix)
+    }
+    var neg = false
+    if iv < 0 {
+        if iv == iv_min() {
+            fail(overflow())
+        }
+        iv = 0 - iv
+        neg = true
+    }
+    if iv > 4611686018427387903 {
+        fail(overflow())
+    }
+    return (iv, neg)
+}
+
+fn blank_spec(q: i64) -> PerlSpec {
+    return PerlSpec{ alt: false, left: false, fill: false, plus: 0, width: 0, has_precis: false, precis: 0, vectorize: false, dotstr: ".", dot_utf8: false, efix: 0, intsize: 0, c: 0, q: q, missing: false, bad: false }
+}
+
+/// The argument an index (or the next one) names: its slot, or -1 and the
+/// missing mark.
+fn take_arg(inout st: PerlSpf, inout svix: i64, ix: i64, inout s: PerlSpec) -> i64 {
+    var k = ix
+    if k == 0 {
+        k = svix
+        svix = svix + 1
+    } else {
+        k = k - 1
+    }
+    if k < st.svs.len() {
+        return k
+    }
+    s.missing = true
+    return 0 - 1
+}
+
+/// `*` or `*N$`: the index written, or 0; a bad one marks the spec bad.
+fn star_index(pat: [i64], inout s: PerlSpec, inout no_redundant: bool) -> i64 ! PerlSpfDie {
+    if at(pat, s.q) < 49 or at(pat, s.q) > 57 {
+        return 0
+    }
+    let n = try expect_number(pat, s.q)
+    s.q = n.1 + 1
+    if at(pat, n.1) != 36 {
+        s.bad = true
+        return 0
+    }
+    no_redundant = true
+    return n.0
+}
+
+fn parse_flags(pat: [i64], inout s: PerlSpec) {
+    var going = true
+    while going {
+        let c = at(pat, s.q)
+        if c == 32 or c == 43 {
+            if not (s.plus == 43 and c == 32) {
+                s.plus = c
+            }
+        } else if c == 45 {
+            s.left = true
+        } else if c == 48 {
+            s.fill = true
+        } else if c == 35 {
+            s.alt = true
+        } else {
+            going = false
+        }
+        if going {
+            s.q = s.q + 1
+        }
+    }
+}
+
+/// Vector flags and the width, from `tryasterisk` in sv.c.
+fn parse_width(inout st: PerlSpf, pat: [i64], inout s: PerlSpec, inout svix: i64, inout no_redundant: bool) -> () ! PerlSpfDie {
+    while true {
+        if at(pat, s.q) == 42 {
+            s.q = s.q + 1
+            let ix = try star_index(pat, s, no_redundant)
+            if s.bad {
+                return ()
+            }
+            if at(pat, s.q) == 118 {
+                s.q = s.q + 1
+                if s.vectorize {
+                    s.bad = true
+                    return ()
+                }
+                let k = take_arg(st, svix, ix, s)
+                s.dotstr = sv_pv(st, k)
+                s.dot_utf8 = is_utf8_sv(get_sv(st, k)) or st.has_utf8
+                s.vectorize = true
+                continue
+            }
+            let k = take_arg(st, svix, ix, s)
+            let w = try arg_num_val(st, k, k >= 0)
+            s.width = w.0
+            if w.1 {
+                s.left = true
+            }
+            return ()
+        }
+        if at(pat, s.q) == 118 {
+            s.q = s.q + 1
+            if s.vectorize {
+                s.bad = true
+                return ()
+            }
+            s.vectorize = true
+            s.dotstr = "."
+            continue
+        }
+        if at(pat, s.q) == 48 {
+            s.fill = true
+            s.q = s.q + 1
+        }
+        if at(pat, s.q) >= 49 and at(pat, s.q) <= 57 {
+            let n = try expect_number(pat, s.q)
+            s.width = n.0
+            s.q = n.1
+        }
+        return ()
+    }
+    return ()
+}
+
+fn parse_precision(inout st: PerlSpf, pat: [i64], inout s: PerlSpec, inout svix: i64, inout no_redundant: bool) -> () ! PerlSpfDie {
+    if at(pat, s.q) != 46 {
+        return ()
+    }
+    s.q = s.q + 1
+    if at(pat, s.q) == 42 {
+        s.q = s.q + 1
+        let ix = try star_index(pat, s, no_redundant)
+        if s.bad {
+            return ()
+        }
+        let k = take_arg(st, svix, ix, s)
+        let p = try arg_num_val(st, k, k >= 0)
+        s.has_precis = not p.1
+        s.precis = if p.1 { 0 } else { p.0 }
+        return ()
+    }
+    while at(pat, s.q) == 48 {
+        s.q = s.q + 1
+    }
+    s.precis = 0
+    if at(pat, s.q) >= 49 and at(pat, s.q) <= 57 {
+        let n = try expect_number(pat, s.q)
+        s.precis = n.0
+        s.q = n.1
+    }
+    s.has_precis = true
+    return ()
+}
+
+fn parse_size(pat: [i64], inout s: PerlSpec) {
+    let c = at(pat, s.q)
+    if c == 76 or c == 113 {
+        s.intsize = 113
+        s.q = s.q + 1
+    } else if c == 108 {
+        s.q = s.q + 1
+        if at(pat, s.q) == 108 {
+            s.intsize = 113
+            s.q = s.q + 1
+        } else {
+            s.intsize = 108
+        }
+    } else if c == 104 {
+        s.q = s.q + 1
+        if at(pat, s.q) == 104 {
+            s.intsize = 99
+            s.q = s.q + 1
+        } else {
+            s.intsize = 104
+        }
+    } else if c == 86 or c == 122 or c == 116 or c == 106 {
+        s.intsize = c
+        s.q = s.q + 1
+    }
+}
+
+/// Everything between the `%` and the conversion letter.
+fn parse_spec(inout st: PerlSpf, pat: [i64], fmtstart: i64, inout svix: i64, inout no_redundant: bool) -> PerlSpec ! PerlSpfDie {
+    var s = blank_spec(fmtstart)
+    var explicit_width = false
+    if at(pat, s.q) >= 49 and at(pat, s.q) <= 57 {
+        let n = try expect_number(pat, s.q)
+        s.q = n.1
+        if at(pat, s.q) == 36 {
+            s.q = s.q + 1
+            s.efix = n.0
+            no_redundant = true
+        } else {
+            s.width = n.0
+            explicit_width = true
+        }
+    }
+    if not explicit_width {
+        parse_flags(pat, s)
+        try parse_width(st, pat, s, svix, no_redundant)
+        if s.bad {
+            return s
+        }
+    }
+    try parse_precision(st, pat, s, svix, no_redundant)
+    if s.bad {
+        return s
+    }
+    parse_size(pat, s)
+    s.c = at(pat, s.q)
+    s.q = s.q + 1
+    return s
+}
+
+fn letter_in(c: i64, set: str) -> bool {
+    return c != 0 and set.codes().contains(c)
+}
+
+fn utf8_len(uv: i64) -> i64 {
+    if ult(uv, 128) {
+        return 1
+    }
+    if ult(uv, 2048) {
+        return 2
+    }
+    if ult(uv, 65536) {
+        return 3
+    }
+    if ult(uv, 2097152) {
+        return 4
+    }
+    if ult(uv, 67108864) {
+        return 5
+    }
+    if ult(uv, 2147483648) {
+        return 6
+    }
+    return if ult(uv, 68719476736) { 7 } else { 13 }
+}
+
+/// One element ready to append: its text, the length Perl pads against,
+/// and whether it is UTF-8.
+type PerlElem = { text: str, elen: i64, utf8: bool, zeros: i64, sign: str }
+
+fn plain_elem(t: str) -> PerlElem {
+    return PerlElem{ text: t, elen: t.len(), utf8: false, zeros: 0, sign: "" }
+}
+
+/// The append at the end of sv_vcatpvfn's loop: sign, padding, zeros.
+fn append(inout st: PerlSpf, e: PerlElem, s: PerlSpec) {
+    let have = e.elen + e.zeros + e.sign.len()
+    let gap = if s.width > have { s.width - have } else { 0 }
+    var piece = ""
+    if s.left {
+        piece = e.sign + "0".repeat(e.zeros) + e.text + " ".repeat(gap)
+    } else if s.fill {
+        piece = e.sign + "0".repeat(gap) + e.text
+    } else {
+        piece = " ".repeat(gap) + e.sign + "0".repeat(e.zeros) + e.text
+    }
+    for b in piece.to_bytes().to_list() {
+        st.out.push(b)
+    }
+    if e.utf8 {
+        st.has_utf8 = true
+    }
+}
+
+fn emit(inout st: PerlSpf, t: str) {
+    for b in t.to_bytes().to_list() {
+        st.out.push(b)
+    }
+}
+
+/// An integer in its base, with `#`'s prefix and the precision's zeros.
+fn integer_elem(uv: i64, base: i64, c: i64, sign0: str, inout s: PerlSpec) -> PerlElem {
+    var digits = udigits(uv, base, c == 88)
+    var sign = sign0
+    if s.alt and digits != "0" {
+        if base == 16 or base == 2 {
+            sign = sign + "0" + c.to_char()
+        } else if base == 8 {
+            digits = "0" + digits
+        }
+    }
+    var zeros = 0
+    if s.has_precis {
+        if s.precis > digits.len() {
+            zeros = s.precis - digits.len()
+        } else if s.precis == 0 and digits == "0" and not (base == 8 and s.alt) {
+            digits = ""
+        }
+        s.fill = false
+    }
+    return PerlElem{ text: digits, elen: digits.len(), utf8: false, zeros: zeros, sign: sign }
+}
+
+fn base_of(c: i64) -> i64 {
+    if c == 100 or c == 105 or c == 68 {
+        return 0 - 10
+    }
+    if c == 117 or c == 85 {
+        return 10
+    }
+    if c == 98 or c == 66 {
+        return 2
+    }
+    return if c == 111 or c == 79 { 8 } else { 16 }
+}
+
+fn narrow_signed(v: i64, intsize: i64) -> i64 {
+    if intsize == 99 {
+        return v.bit_and(255).bit_xor(128) - 128
+    }
+    if intsize == 104 {
+        return v.bit_and(65535).bit_xor(32768) - 32768
+    }
+    return v
+}
+
+fn narrow_unsigned(v: i64, intsize: i64) -> i64 {
+    if intsize == 99 {
+        return v.bit_and(255)
+    }
+    return if intsize == 104 { v.bit_and(65535) } else { v }
+}
+
+/// %d and friends on one argument that is not a vector.
+fn integer_conversion(inout st: PerlSpf, ix: i64, inout s: PerlSpec) -> () ! PerlSpfDie {
+    if sv_infnan(st, ix) {
+        return try infnan_conversion(st, ix, s)
+    }
+    let base = base_of(s.c)
+    let intsize = if s.c == 68 or s.c == 85 or s.c == 79 { 113 } else { s.intsize }
+    if base < 0 {
+        let iv = narrow_signed(sv_iv(st, ix), intsize)
+        let sign = if iv < 0 { "-" } else if s.plus != 0 { s.plus.to_char() } else { "" }
+        let e = integer_elem(if iv < 0 { 0 - iv } else { iv }, 10, s.c, sign, s)
+        append(st, e, s)
+        return ()
+    }
+    let uv = narrow_unsigned(sv_iv(st, ix), intsize)
+    let e = integer_elem(uv, base, s.c, "", s)
+    append(st, e, s)
+    return ()
+}
+
+fn infnan_conversion(inout st: PerlSpf, ix: i64, s: PerlSpec) -> () ! PerlSpfDie {
+    let nv = sv_nv(st, ix)
+    if not is_infnan(nv) {
+        fail(PerlSpfRefuse("this NaN spelling is a NaN to Perl and a 0 to strtod; Perl itself goes undefined here"))
+    }
+    if s.c == 99 {
+        fail(die("Cannot printf " + infnan_text(nv, 0) + " with 'c'"))
+    }
+    append(st, plain_elem(infnan_text(nv, s.plus)), s)
+    return ()
+}
+
+/// %vd: each code point formatted, joined by the separator.
+fn vector_conversion(inout st: PerlSpf, ix: i64, inout s: PerlSpec) {
+    let base0 = base_of(s.c)
+    let base = base0.abs()
+    var sign = if base0 < 0 and s.plus != 0 { s.plus.to_char() } else { "" }
+    let codes = sv_pv(st, ix).codes()
+    var i = 0
+    while i < codes.len() {
+        var e = integer_elem(codes[i], base, s.c, sign, s)
+        e.utf8 = s.dot_utf8
+        append(st, e, s)
+        i = i + 1
+        if i < codes.len() {
+            emit(st, s.dotstr)
+            sign = ""
+        }
+    }
+}
+
+fn char_conversion(inout st: PerlSpf, ix: i64, s: PerlSpec) -> () ! PerlSpfDie {
+    if sv_infnan(st, ix) {
+        return try infnan_conversion(st, ix, s)
+    }
+    let uv = sv_iv(st, ix)
+    if uv < 0 {
+        fail(die("Use of code point 0x" + udigits(uv, 16, true) + " is not allowed; the permissible max is 0x7FFFFFFFFFFFFFFF"))
+    }
+    let wide = uv > 255 or uv > 127 and st.has_utf8
+    var elen = if wide { utf8_len(uv) } else { 1 }
+    let scalar = not (uv > 1114111 or uv >= 55296 and uv <= 57343)
+    var text = if scalar { uv.to_char() } else { "" }
+    if s.has_precis and s.precis < elen {
+        // Perl cuts the UTF-8 bytes: none left is empty, some is broken.
+        if s.precis > 0 {
+            st.not_text = true
+        }
+        text = ""
+        elen = s.precis
+    } else if not scalar {
+        st.not_text = true
+    }
+    append(st, PerlElem{ text: text, elen: elen, utf8: wide, zeros: 0, sign: "" }, s)
+    return ()
+}
+
+fn string_conversion(inout st: PerlSpf, ix: i64, s: PerlSpec) {
+    let t = sv_pv(st, ix)
+    let u = is_utf8_sv(get_sv(st, ix))
+    let cut = if s.has_precis and s.precis < t.len() { t.substr(0, s.precis) } else { t }
+    append(st, PerlElem{ text: cut, elen: cut.len(), utf8: u, zeros: 0, sign: "" }, s)
+}
+
+fn float_conversion(inout st: PerlSpf, ix: i64, s: PerlSpec) {
+    let nv = sv_nv(st, ix)
+    if is_infnan(nv) {
+        append(st, plain_elem(infnan_text(nv, s.plus)), s)
+        return
+    }
+    var spec = s
+    if spec.c == 70 {
+        spec.c = 102
+    }
+    emit(st, float_text(nv, spec))
+}
+
+fn too_large(s: PerlSpec) -> bool {
+    return s.width > 1000000 or s.precis > 1000000
+}
+
+/// The conversion letter's work, once its argument is known.
+fn convert(inout st: PerlSpf, ix: i64, inout s: PerlSpec) -> () ! PerlSpfDie {
+    let c = s.c
+    if too_large(s) {
+        fail(PerlSpfRefuse("a width or precision above 1000000"))
+    }
+    if c == 115 {
+        string_conversion(st, ix, s)
+    } else if c == 99 {
+        try char_conversion(st, ix, s)
+    } else if letter_in(c, "BbDdiOouUXx") {
+        if s.vectorize {
+            vector_conversion(st, ix, s)
+        } else {
+            try integer_conversion(st, ix, s)
+        }
+    } else {
+        float_conversion(st, ix, s)
+    }
+    return ()
+}
+
+fn invalid_text(pat: [i64], fmtstart: i64, q: i64) -> str {
+    let patend = pat.len()
+    if fmtstart >= patend {
+        return "Invalid conversion in sprintf: end of string"
+    }
+    let fmtend = if q < patend { q } else { patend }
+    var out = "Invalid conversion in sprintf: \"%"
+    var k = fmtstart
+    while k < fmtend {
+        let b = pat[k]
+        if b >= 32 and b < 127 {
+            out = out + b.to_char()
+        } else {
+            out = out + "\\" + b.to_base(8).pad_start(3, "0")
+        }
+        k = k + 1
+    }
+    return out + "\""
+}
+
+/// Whether the letter (with its size) is one Perl formats; `%n` and `%p`
+/// are refused before this is asked.
+fn valid_letter(s: PerlSpec) -> bool {
+    let c = s.c
+    if letter_in(c, "eEfFgGaA") {
+        return not (s.intsize == 104 or s.intsize == 99 or s.intsize == 122 or s.intsize == 116 or s.intsize == 106)
+    }
+    return letter_in(c, "csBbDdiOouUXx")
+}
+
+/// One `%...` from `fmtstart` (just after the `%`); answers where to go on.
+fn directive(inout st: PerlSpf, pat: [i64], fmtstart: i64, inout svix: i64, inout no_redundant: bool) -> i64 ! PerlSpfDie {
+    let osvix = svix
+    var s = try parse_spec(st, pat, fmtstart, svix, no_redundant)
+    var bad = s.bad
+    if not bad and s.c == 37 {
+        if s.vectorize {
+            bad = true
+        } else {
+            if too_large(s) {
+                fail(PerlSpfRefuse("a width or precision above 1000000"))
+            }
+            let cut = if s.has_precis and s.precis < 1 { "" } else { "%" }
+            append(st, plain_elem(cut), s)
+            if s.missing {
+                st.warnings.push("Missing argument in sprintf")
+            }
+            return s.q
+        }
+    }
+    if not bad and s.vectorize and not letter_in(s.c, "BbDdiOouUXx") {
+        bad = true
+    }
+    if not bad {
+        let ix = take_arg(st, svix, s.efix, s)
+        if s.c == 110 or s.c == 112 {
+            fail(PerlSpfRefuse("%" + s.c.to_char() + " is not supported"))
+        }
+        if valid_letter(s) {
+            try convert(st, ix, s)
+            if s.missing {
+                st.warnings.push("Missing argument in sprintf")
+            }
+            return s.q
+        }
+    }
+    st.warnings.push(invalid_text(pat, fmtstart, s.q))
+    st.out.push(37)
+    svix = osvix
+    no_redundant = true
+    return fmtstart
+}
+
+fn run(inout st: PerlSpf, pat: [i64]) -> () ! PerlSpfDie {
+    var svix = 0
+    var no_redundant = false
+    var q = 0
+    while q < pat.len() {
+        if pat[q] != 37 {
+            st.out.push(pat[q])
+            q = q + 1
+            continue
+        }
+        q = try directive(st, pat, q + 1, svix, no_redundant)
+    }
+    if not no_redundant and st.svs.len() >= svix + 1 {
+        st.warnings.push("Redundant argument in sprintf")
+    }
+    return ()
+}
+
+/// `sprintf(format, args...)` as Perl 5.34 runs it with warnings on.
+pub fn sprintf(format: str, args: [PerlArg]) -> PerlSprintfResult ! PerlSprintfError {
+    var st = PerlSpf{ svs: args.map(|a| new_sv(a)), warnings: [], out: [], has_utf8: not is_ascii_text(format), not_text: false }
+    match run(st, bytes_of_text(format)) {
+        Ok(_u) -> {}
+        Err(e) -> match e {
+            PerlSpfDie(m) -> fail(PerlSprintfDied(m, st.warnings))
+            PerlSpfRefuse(why) -> fail(PerlSprintfRefused(why))
+        }
+    }
+    if st.not_text {
+        fail(PerlSprintfNotText(st.warnings))
+    }
+    return PerlSprintfResult{ text: bytes_of(st.out).to_str(), warnings: st.warnings }
+}
+
+/// The message of an error, for printing.
+pub fn error_text(e: PerlSprintfError) -> str {
+    return match e {
+        PerlSprintfDied(m, _w) -> m
+        PerlSprintfNotText(_w) -> "the result is not Unicode text"
+        PerlSprintfRefused(why) -> why
+    }
+}

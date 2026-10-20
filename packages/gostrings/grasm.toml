@@ -1,0 +1,4 @@
+[package]
+name = "gostrings"
+version = "1.0.0"
+capabilities = []

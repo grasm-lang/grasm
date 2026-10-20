@@ -1,0 +1,542 @@
+// Ruby 2.6's Date: the calendar under a reform date. `Date.civil`,
+// `Date.jd`, `Date.ordinal` and `Date.commercial` and their `valid_*?`
+// checks, `>>` and `<<`, `+`, `-` and `<=>`, `new_start`, and the fields:
+// year, month, day, wday, yday, cwyear, cweek, cwday, jd, mjd, ld, ajd,
+// amjd, `leap?`, `julian?`, `gregorian?`, `start`, `to_s` and `inspect`.
+//
+// A Date is a Julian day number and a "start": the day the Gregorian
+// calendar begins. Before it, dates are Julian. The default is
+// Date::ITALY, 1582-10-15, so `Date.new(1582, 10, 10)` does not exist and
+// `Date.new(1000, 2, 29)` does; Date::ENGLAND is 1752-09-14, Date::JULIAN
+// never switches and Date::GREGORIAN always was. A start outside the
+// reform years (Julian day 2298874 to 2426355) is ignored for ITALY, as
+// Ruby does with a warning -- except by the `valid_*?` checks, which take
+// it as 0 (so a year before 1582 is still Julian there, and later ones
+// Gregorian).
+//
+// What follows from Ruby's own algorithms:
+//
+//   - A negative month counts from the end (-1 is December) and a
+//     negative day from the month's last day. In the reform month the
+//     count is in days that exist: `Date.new(1582, 10, -21)` is
+//     1582-10-01, since October 1582 has 21 days.
+//   - `>>` keeps the day of the month if it can and steps back to the
+//     last day that exists otherwise, so a month that the reform starts
+//     late (`Date.new(1582, 11, 10) << 1` is 1582-10-04); a month with no
+//     day that early is ArgumentError "invalid date".
+//   - `leap?` on a Julian date asks whether February 29 exists.
+//   - `to_s` pads the year to four digits, five with a minus sign
+//     ("-0001-01-01"); `inspect` is "#<Date: 2001-02-03
+//     ((2451944j,0s,0n),+0s,2299161j)>", the start written as Inf or -Inf
+//     for JULIAN and GREGORIAN.
+//
+// Limits: years and day numbers are i64 (Ruby's are unbounded), and a
+// start is a whole day number.
+
+/// Ruby's ArgumentError "invalid date".
+type RbDateError = | RbDateInvalid(message: str)
+
+pub fn error_message(e: RbDateError) -> str {
+    return match e {
+        RbDateInvalid(m) -> m
+    }
+}
+
+/// A date: its Julian day number and its start.
+type RbDate = { jd: i64, sg: i64 }
+
+/// Date::ITALY, 1582-10-15.
+pub fn italy() -> i64 {
+    return 2299161
+}
+
+/// Date::ENGLAND, 1752-09-14.
+pub fn england() -> i64 {
+    return 2361222
+}
+
+/// Date::JULIAN: never Gregorian (Ruby's positive infinity).
+pub fn julian() -> i64 {
+    return 9223372036854775807
+}
+
+/// Date::GREGORIAN: always Gregorian (Ruby's negative infinity).
+pub fn gregorian() -> i64 {
+    return 0 - 9223372036854775807 - 1
+}
+
+fn is_inf(sg: i64) -> bool {
+    return sg == julian() or sg == gregorian()
+}
+
+/// A start Ruby accepts, or ITALY in its place.
+fn valid_start(sg: i64) -> i64 {
+    if is_inf(sg) or sg >= 2298874 and sg <= 2426355 {
+        return sg
+    }
+    return italy()
+}
+
+/// The `valid_*?` methods ignore a bad start differently: as 0, a
+/// reform at the beginning of the Julian period.
+fn check_start(sg: i64) -> i64 {
+    if is_inf(sg) or sg >= 2298874 and sg <= 2426355 {
+        return sg
+    }
+    return 0
+}
+
+fn invalid() -> RbDateError {
+    return RbDateInvalid("invalid date")
+}
+
+fn fdiv(a: i64, b: i64) -> i64 {
+    let q = a / b
+    return if a % b != 0 and (a < 0) != (b < 0) { q - 1 } else { q }
+}
+
+fn fmod(a: i64, b: i64) -> i64 {
+    return a - fdiv(a, b) * b
+}
+
+// ---- the C functions, in exact integers
+
+/// `c_civil_to_jd`: the Julian day of a civil date, Gregorian unless that
+/// falls before `sg`.
+fn civil_to_jd(y0: i64, m0: i64, d: i64, sg: i64) -> i64 {
+    var y = y0
+    var m = m0
+    if m <= 2 {
+        y = y - 1
+        m = m + 12
+    }
+    let a = fdiv(y, 100)
+    let b = 2 - a + fdiv(a, 4)
+    let jd = fdiv(1461 * (y + 4716), 4) + fdiv(306001 * (m + 1), 10000) + d + b - 1524
+    return if jd < sg { jd - b } else { jd }
+}
+
+/// `c_jd_to_civil`.
+fn jd_to_civil(jd: i64, sg: i64) -> (i64, i64, i64) {
+    var a = jd
+    if jd >= sg {
+        let x = fdiv(4 * jd - 7468865, 146097)
+        a = jd + 1 + x - fdiv(x, 4)
+    }
+    let b = a + 1524
+    let c = fdiv(20 * b - 2442, 7305)
+    let d = fdiv(1461 * c, 4)
+    let e = fdiv(10000 * (b - d), 306001)
+    let dom = b - d - fdiv(306001 * e, 10000)
+    if e <= 13 {
+        return (c - 4716, e - 1, dom)
+    }
+    return (c - 4715, e - 13, dom)
+}
+
+/// `c_valid_civil_p`: the Julian day, or -1 standing for "no such date"
+/// (paired with false).
+fn c_valid_civil(y: i64, m0: i64, d0: i64, sg: i64) -> (bool, i64) {
+    var m = m0
+    var d = d0
+    if m < 0 {
+        m = m + 13
+    }
+    if d < 0 {
+        let (found, last) = find_ldom(y, m, sg)
+        if not found {
+            return (false, 0)
+        }
+        let (ry, rm, rd) = jd_to_civil(last + d + 1, sg)
+        if ry != y or rm != m {
+            return (false, 0)
+        }
+        d = rd
+    }
+    let jd = civil_to_jd(y, m, d, sg)
+    let (ry, rm, rd) = jd_to_civil(jd, sg)
+    return (ry == y and rm == m and rd == d, jd)
+}
+
+/// `c_find_ldom`: the month's last day that exists.
+fn find_ldom(y: i64, m: i64, sg: i64) -> (bool, i64) {
+    var i = 0
+    while i < 30 {
+        let (ok, jd) = c_valid_civil(y, m, 31 - i, sg)
+        if ok {
+            return (true, jd)
+        }
+        i = i + 1
+    }
+    return (false, 0)
+}
+
+/// `c_find_fdoy`: the year's first day that exists.
+fn find_fdoy(y: i64, sg: i64) -> i64 {
+    var d = 1
+    while d < 31 {
+        let (ok, jd) = c_valid_civil(y, 1, d, sg)
+        if ok {
+            return jd
+        }
+        d = d + 1
+    }
+    return 0
+}
+
+/// `c_find_ldoy`: the year's last day that exists.
+fn find_ldoy(y: i64, sg: i64) -> (bool, i64) {
+    var i = 0
+    while i < 30 {
+        let (ok, jd) = c_valid_civil(y, 12, 31 - i, sg)
+        if ok {
+            return (true, jd)
+        }
+        i = i + 1
+    }
+    return (false, 0)
+}
+
+fn jd_to_ordinal(jd: i64, sg: i64) -> (i64, i64) {
+    let (y, _m, _d) = jd_to_civil(jd, sg)
+    return (y, jd - find_fdoy(y, sg) + 1)
+}
+
+fn ordinal_to_jd(y: i64, d: i64, sg: i64) -> i64 {
+    return find_fdoy(y, sg) + d - 1
+}
+
+fn commercial_to_jd(y: i64, w: i64, d: i64, sg: i64) -> i64 {
+    let rjd2 = find_fdoy(y, sg) + 3
+    return rjd2 - fmod(rjd2, 7) + 7 * (w - 1) + d - 1
+}
+
+/// `c_jd_to_commercial`: cwyear, cweek and cwday.
+fn jd_to_commercial(jd: i64, sg: i64) -> (i64, i64, i64) {
+    let (a, _m, _d) = jd_to_civil(jd - 3, sg)
+    var y = a + 1
+    var start = commercial_to_jd(a + 1, 1, 1, sg)
+    if jd < start {
+        start = commercial_to_jd(a, 1, 1, sg)
+        y = a
+    }
+    let wd = fmod(jd + 1, 7)
+    return (y, 1 + fdiv(jd - start, 7), if wd == 0 { 7 } else { wd })
+}
+
+fn julian_leap(y: i64) -> bool {
+    return fmod(y, 4) == 0
+}
+
+fn gregorian_leap(y: i64) -> bool {
+    return fmod(y, 4) == 0 and y % 100 != 0 or fmod(y, 400) == 0
+}
+
+/// `guess_style`: for years well before or after the reform, the calendar
+/// is plain Julian or plain Gregorian; 0 means "use the start".
+fn guess_style(y: i64, sg: i64) -> i64 {
+    if is_inf(sg) {
+        return sg
+    }
+    if y < 1582 {
+        return julian()
+    }
+    if y > 1930 {
+        return gregorian()
+    }
+    return 0
+}
+
+/// `c_valid_gregorian_p` and `c_valid_julian_p`: month and day resolved.
+fn plain_valid(y: i64, m0: i64, d0: i64, gregorian_style: bool) -> (bool, i64, i64) {
+    var m = m0
+    if m < 0 {
+        m = m + 13
+    }
+    if m < 1 or m > 12 {
+        return (false, 0, 0)
+    }
+    let leap = if gregorian_style { gregorian_leap(y) } else { julian_leap(y) }
+    let days = [31, if leap { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    let last = days[m - 1]
+    var d = d0
+    if d < 0 {
+        d = last + d + 1
+    }
+    if d < 1 or d > last {
+        return (false, 0, 0)
+    }
+    return (true, m, d)
+}
+
+/// `valid_civil_p`: the Julian day of y-m-d under `sg`, if it exists.
+fn valid_civil(y: i64, m: i64, d: i64, sg: i64) -> Option[i64] {
+    let style = guess_style(y, sg)
+    if style == 0 {
+        let (ok, jd) = c_valid_civil(y, m, d, sg)
+        return if ok { Some(jd) } else { None }
+    }
+    let (ok, rm, rd) = plain_valid(y, m, d, style == gregorian())
+    return if ok { Some(civil_to_jd(y, rm, rd, style)) } else { None }
+}
+
+/// `c_valid_ordinal_p`.
+fn c_valid_ordinal(y: i64, d0: i64, sg: i64) -> Option[i64] {
+    var d = d0
+    if d < 0 {
+        let (found, last) = find_ldoy(y, sg)
+        if not found {
+            return None
+        }
+        let (ry, rd) = jd_to_ordinal(last + d + 1, sg)
+        if ry != y {
+            return None
+        }
+        d = rd
+    }
+    let jd = ordinal_to_jd(y, d, sg)
+    let (ry, rd) = jd_to_ordinal(jd, sg)
+    return if ry == y and rd == d { Some(jd) } else { None }
+}
+
+/// `c_valid_commercial_p`.
+fn c_valid_commercial(y: i64, w0: i64, d0: i64, sg: i64) -> Option[i64] {
+    var w = w0
+    var d = d0
+    if d < 0 {
+        d = d + 8
+    }
+    if w < 0 {
+        let next = commercial_to_jd(y + 1, 1, 1, sg)
+        let (ry, rw, _rd) = jd_to_commercial(next + w * 7, sg)
+        if ry != y {
+            return None
+        }
+        w = rw
+    }
+    let jd = commercial_to_jd(y, w, d, sg)
+    let (ry, rw, rd) = jd_to_commercial(jd, sg)
+    return if ry == y and rw == w and rd == d { Some(jd) } else { None }
+}
+
+fn style_or_start(y: i64, sg: i64) -> i64 {
+    let style = guess_style(y, sg)
+    return if style == 0 { sg } else { style }
+}
+
+// ---- the class methods
+
+/// `Date.valid_civil?(y, m, d, start)`.
+pub fn valid_civil_p(y: i64, m: i64, d: i64, start: i64) -> bool {
+    return match valid_civil(y, m, d, check_start(start)) {
+        Some(_jd) -> true
+        None -> false
+    }
+}
+
+/// `Date.valid_ordinal?(y, d, start)`.
+pub fn valid_ordinal_p(y: i64, d: i64, start: i64) -> bool {
+    let sg = check_start(start)
+    return match c_valid_ordinal(y, d, style_or_start(y, sg)) {
+        Some(_jd) -> true
+        None -> false
+    }
+}
+
+/// `Date.valid_commercial?(y, w, d, start)`.
+pub fn valid_commercial_p(y: i64, w: i64, d: i64, start: i64) -> bool {
+    let sg = check_start(start)
+    return match c_valid_commercial(y, w, d, style_or_start(y, sg)) {
+        Some(_jd) -> true
+        None -> false
+    }
+}
+
+/// `Date.civil(y, m, d, start)` (and `Date.new`).
+pub fn civil(y: i64, m: i64, d: i64, start: i64) -> RbDate ! RbDateError {
+    let sg = valid_start(start)
+    return match valid_civil(y, m, d, sg) {
+        Some(jd) -> RbDate{ jd: jd, sg: sg }
+        None -> fail(invalid())
+    }
+}
+
+/// `Date.jd(jd, start)`.
+pub fn from_jd(jd: i64, start: i64) -> RbDate {
+    return RbDate{ jd: jd, sg: valid_start(start) }
+}
+
+/// `Date.ordinal(y, d, start)`.
+pub fn ordinal(y: i64, d: i64, start: i64) -> RbDate ! RbDateError {
+    let sg = valid_start(start)
+    return match c_valid_ordinal(y, d, style_or_start(y, sg)) {
+        Some(jd) -> RbDate{ jd: jd, sg: sg }
+        None -> fail(invalid())
+    }
+}
+
+/// `Date.commercial(cwyear, cweek, cwday, start)`.
+pub fn commercial(y: i64, w: i64, d: i64, start: i64) -> RbDate ! RbDateError {
+    let sg = valid_start(start)
+    return match c_valid_commercial(y, w, d, style_or_start(y, sg)) {
+        Some(jd) -> RbDate{ jd: jd, sg: sg }
+        None -> fail(invalid())
+    }
+}
+
+// ---- a date's fields
+
+fn civil_of(x: RbDate) -> (i64, i64, i64) {
+    return jd_to_civil(x.jd, x.sg)
+}
+
+pub fn year(x: RbDate) -> i64 {
+    return civil_of(x).0
+}
+
+pub fn mon(x: RbDate) -> i64 {
+    return civil_of(x).1
+}
+
+pub fn mday(x: RbDate) -> i64 {
+    return civil_of(x).2
+}
+
+pub fn jd(x: RbDate) -> i64 {
+    return x.jd
+}
+
+/// `wday`: 0 for Sunday.
+pub fn wday(x: RbDate) -> i64 {
+    return fmod(x.jd + 1, 7)
+}
+
+pub fn yday(x: RbDate) -> i64 {
+    return jd_to_ordinal(x.jd, x.sg).1
+}
+
+pub fn cwyear(x: RbDate) -> i64 {
+    return jd_to_commercial(x.jd, x.sg).0
+}
+
+pub fn cweek(x: RbDate) -> i64 {
+    return jd_to_commercial(x.jd, x.sg).1
+}
+
+/// `cwday`: 1 for Monday to 7 for Sunday.
+pub fn cwday(x: RbDate) -> i64 {
+    let w = wday(x)
+    return if w == 0 { 7 } else { w }
+}
+
+/// The modified Julian day.
+pub fn mjd(x: RbDate) -> i64 {
+    return x.jd - 2400001
+}
+
+/// The Lilian day: days since the Gregorian reform.
+pub fn ld(x: RbDate) -> i64 {
+    return x.jd - 2299160
+}
+
+/// `ajd.inspect`: the astronomical Julian day, a half day earlier.
+pub fn ajd_inspect(x: RbDate) -> str {
+    return "(" + (2 * x.jd - 1).to_str() + "/2)"
+}
+
+/// `amjd.inspect`.
+pub fn amjd_inspect(x: RbDate) -> str {
+    return "(" + mjd(x).to_str() + "/1)"
+}
+
+pub fn julian_p(x: RbDate) -> bool {
+    return x.jd < x.sg
+}
+
+pub fn gregorian_p(x: RbDate) -> bool {
+    return not julian_p(x)
+}
+
+/// `leap?`: on a Julian date, whether February 29 exists that year.
+pub fn leap_p(x: RbDate) -> bool {
+    let y = year(x)
+    if gregorian_p(x) {
+        return gregorian_leap(y)
+    }
+    let (_y, _m, d) = jd_to_civil(civil_to_jd(y, 3, 1, x.sg) - 1, x.sg)
+    return d == 29
+}
+
+/// The start as Ruby's Float prints it.
+pub fn start_text(x: RbDate) -> str {
+    if x.sg == julian() {
+        return "Infinity"
+    }
+    if x.sg == gregorian() {
+        return "-Infinity"
+    }
+    return x.sg.to_str() + ".0"
+}
+
+fn pad(n: i64, w: i64) -> str {
+    return if n < 0 { "-" + (0 - n).to_str().pad_start(w - 1, "0") } else { n.to_str().pad_start(w, "0") }
+}
+
+/// `to_s`: "%Y-%m-%d".
+pub fn to_s(x: RbDate) -> str {
+    let (y, m, d) = civil_of(x)
+    return pad(y, if y < 0 { 5 } else { 4 }) + "-" + pad(m, 2) + "-" + pad(d, 2)
+}
+
+/// `inspect`.
+pub fn inspect(x: RbDate) -> str {
+    let sg = if x.sg == julian() { "Inf" } else if x.sg == gregorian() { "-Inf" } else { x.sg.to_str() }
+    return "#<Date: " + to_s(x) + " ((" + x.jd.to_str() + "j,0s,0n),+0s," + sg + "j)>"
+}
+
+// ---- arithmetic
+
+/// `d + n` days.
+pub fn add_days(x: RbDate, n: i64) -> RbDate {
+    return RbDate{ jd: x.jd + n, sg: x.sg }
+}
+
+/// `d >> n` months: the same day, or the last one before it that exists.
+pub fn add_months(x: RbDate, n: i64) -> RbDate ! RbDateError {
+    let (y0, m0, d0) = civil_of(x)
+    let t = y0 * 12 + m0 - 1 + n
+    let y = fdiv(t, 12)
+    let m = fmod(t, 12) + 1
+    var d = d0
+    while true {
+        match valid_civil(y, m, d, x.sg) {
+            Some(jd) -> return RbDate{ jd: jd, sg: x.sg }
+            None -> ()
+        }
+        d = d - 1
+        if d < 1 {
+            fail(invalid())
+        }
+    }
+    return x
+}
+
+/// `d << n` months.
+pub fn sub_months(x: RbDate, n: i64) -> RbDate ! RbDateError {
+    return try add_months(x, 0 - n)
+}
+
+/// `a - b` in days; Ruby gives it as the Rational `(n/1)`.
+pub fn days_between(a: RbDate, b: RbDate) -> i64 {
+    return a.jd - b.jd
+}
+
+/// `a <=> b`.
+pub fn compare(a: RbDate, b: RbDate) -> i64 {
+    return if a.jd < b.jd { 0 - 1 } else if a.jd > b.jd { 1 } else { 0 }
+}
+
+/// `new_start(start)`: the same day under another reform date.
+pub fn new_start(x: RbDate, start: i64) -> RbDate {
+    return RbDate{ jd: x.jd, sg: valid_start(start) }
+}

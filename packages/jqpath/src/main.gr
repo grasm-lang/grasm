@@ -1,0 +1,939 @@
+// jq's path builtins, as jq 1.7.1 has them: `getpath`, `setpath`,
+// `delpaths`, `paths` and `paths(f)` for jq's selectors, `pick`,
+// `to_entries`, `from_entries`, `tostream`, `fromstream` and
+// `truncate_stream`, over jqformat's values, with jq's error messages.
+//
+// Scripts reshape JSON with these (`del`, `pick`, `with_entries` and
+// every assignment reduce to them), and a program that has to give the
+// same document back -- or fail where jq fails -- needs their rules:
+//
+//   - **Indexing** truncates a number index toward zero, counts a
+//     negative one from the end (`getpath([-1])`), answers null for any
+//     index of null and for a missing key or element, and slices with
+//     `{"start": s, "end": e}` (start rounded down, end up). An array as
+//     a key finds where it occurs as a run (`[1,2,1,2] | getpath([[1,2]])`
+//     is `[0,2]`).
+//   - **`setpath`** pads arrays with nulls, makes null into an object or
+//     an array as the key asks, keeps a replaced key in its place and adds
+//     a new one at the end, splices an array into a slice, and refuses a
+//     negative index before the start ("Out of bounds negative array
+//     index").
+//   - **`delpaths`** sorts the paths in jq's order first, deletes the
+//     elements of an array all at once, and treats null as nothing to
+//     delete from.
+//   - **`paths(f)`** keeps a node when `f`'s output is true in jq's
+//     sense, so `paths(nulls)` finds nothing and `paths(booleans)` finds
+//     only `true`.
+//   - **`from_entries`** takes the key from `key`, `Key`, `name` or
+//     `Name` (the first that is neither null nor false) and the value from
+//     `value` if present, else `Value`; a repeated key keeps its first
+//     place and its last value.
+//   - Errors read as jq's: `Cannot index number with string "b"`,
+//     `Cannot use null (null) as object key`, `Cannot iterate over string
+//     ("abc")`, with a value's JSON cut to 11 bytes and `...` past 14.
+//
+// `with_entries(f)` and `paths(f)` for an arbitrary filter take a jq
+// filter and are not here (`paths` takes the nine selector names);
+// jq 1.7.1 has no `leaf_paths`. Numbers are compared as exact decimals,
+// as jq compares two literals. An array index above 100000 is refused
+// rather than filled with nulls.
+//
+// Checked against `jq` 1.7.1.
+
+import jqformat
+
+/// A jq error message.
+fn err(m: str) -> JqError {
+    return JqError(m)
+}
+
+// ---- UTF-8, as jq repairs it
+
+fn utf8_next(b: [i64], i: i64) -> (i64, i64) {
+    let first = b[i]
+    if first < 128 {
+        return (first, 1)
+    }
+    let len = if first >= 194 and first <= 223 { 2 } else if first >= 224 and first <= 239 { 3 } else if first >= 240 and first <= 244 { 4 } else { 0 }
+    if len == 0 {
+        return (0 - 1, 1)
+    }
+    if i + len > b.len() {
+        return (0 - 1, b.len() - i)
+    }
+    var c = first.bit_and(if len == 2 { 31 } else if len == 3 { 15 } else { 7 })
+    for k in 1..len {
+        let ch = b[i + k]
+        if ch < 128 or ch > 191 {
+            return (0 - 1, k)
+        }
+        c = c.shl(6).bit_or(ch.bit_and(63))
+    }
+    let minimum = if len == 2 { 128 } else if len == 3 { 2048 } else { 65536 }
+    if c < minimum or (c >= 55296 and c <= 57343) or c > 1114111 {
+        return (0 - 1, len)
+    }
+    return (c, len)
+}
+
+/// Bytes as a jq string: each bad sequence becomes U+FFFD.
+fn repaired(b: [i64]) -> str {
+    var out: [i64] = []
+    var i = 0
+    while i < b.len() {
+        let (c, n) = utf8_next(b, i)
+        if c < 0 {
+            out.push(239)
+            out.push(191)
+            out.push(189)
+        } else {
+            for k in i..(i + n) {
+                out.push(b[k])
+            }
+        }
+        i = i + n
+    }
+    return bytes_of(out).to_str()
+}
+
+/// jv_dump_string_trunc with a 15-byte buffer.
+fn shown(v: JqValue) -> [i64] {
+    let b = jqformat.tojson(v).to_bytes().to_list()
+    return if b.len() > 14 { b.slice(0, 11) + [46, 46, 46] } else { b }
+}
+
+pub fn kind_name(v: JqValue) -> str {
+    return match v {
+        JqNull -> "null"
+        JqBool(_b) -> "boolean"
+        JqNumber(_n) -> "number"
+        JqString(_s) -> "string"
+        JqArray(_i) -> "array"
+        JqObject(_e) -> "object"
+    }
+}
+
+fn ascii(s: str) -> [i64] {
+    return s.to_bytes().to_list()
+}
+
+/// type_error: "kind (json) msg".
+fn type_error(bad: JqValue, msg: str) -> JqError {
+    return err(repaired(ascii(kind_name(bad) + " (") + shown(bad) + ascii(") " + msg)))
+}
+
+fn type_error2(a: JqValue, b: JqValue, msg: str) -> JqError {
+    return err(repaired(ascii(kind_name(a) + " (") + shown(a) + ascii(") and " + kind_name(b) + " (") + shown(b) + ascii(") " + msg)))
+}
+
+// ---- numbers
+
+fn num(i: i64) -> JqValue {
+    return JqNumber(i.to_str())
+}
+
+fn value_of(literal: str) -> f64 {
+    return literal.parse_float() ?? 0.0
+}
+
+/// A literal as sign, digits without leading or trailing zeros, and the
+/// exponent of the last digit; zero has no digits.
+fn decimal_parts(literal: str) -> (bool, str, i64) {
+    let negative = literal.starts_with("-")
+    let body = if negative { literal.substr(1, literal.len() - 1) } else { literal }
+    var mantissa = body
+    var exp = 0
+    let e = body.index_of("E")
+    match e {
+        Some(k) -> {
+            mantissa = body.substr(0, k)
+            exp = body.substr(k + 1, body.len() - k - 1).replace("+", "").parse_int() ?? 0
+        }
+        None -> {}
+    }
+    var digits = mantissa
+    match mantissa.index_of(".") {
+        Some(k) -> {
+            digits = mantissa.substr(0, k) + mantissa.substr(k + 1, mantissa.len() - k - 1)
+            exp = exp - (mantissa.len() - k - 1)
+        }
+        None -> {}
+    }
+    var cs = digits.chars()
+    var start = 0
+    while start < cs.len() and cs[start] == "0" {
+        start = start + 1
+    }
+    var end = cs.len()
+    while end > start and cs[end - 1] == "0" {
+        end = end - 1
+        exp = exp + 1
+    }
+    return (negative, cs.slice(start, end).join(""), exp)
+}
+
+fn magnitude_cmp(a: str, ae: i64, b: str, be: i64) -> i64 {
+    // Compare a * 10^ae with b * 10^be, both nonzero.
+    let atop = a.len() + ae
+    let btop = b.len() + be
+    if atop != btop {
+        return if atop < btop { 0 - 1 } else { 1 }
+    }
+    let n = a.len().max(b.len())
+    let ap = a.pad_end(n, "0")
+    let bp = b.pad_end(n, "0")
+    return if ap < bp { 0 - 1 } else if ap > bp { 1 } else { 0 }
+}
+
+/// decNumberCompare of two literals.
+fn number_cmp(a: str, b: str) -> i64 {
+    let (an, ad, ae) = decimal_parts(a)
+    let (bn, bd, be) = decimal_parts(b)
+    let az = ad == ""
+    let bz = bd == ""
+    if az and bz {
+        return 0
+    }
+    let asign = if az { 0 } else if an { 0 - 1 } else { 1 }
+    let bsign = if bz { 0 } else if bn { 0 - 1 } else { 1 }
+    if asign != bsign {
+        return if asign < bsign { 0 - 1 } else { 1 }
+    }
+    let m = magnitude_cmp(ad, ae, bd, be)
+    return if asign < 0 { 0 - m } else { m }
+}
+
+// ---- order and equality
+
+fn kind_rank(v: JqValue) -> i64 {
+    return match v {
+        JqNull -> 1
+        JqBool(b) -> if b { 3 } else { 2 }
+        JqNumber(_n) -> 4
+        JqString(_s) -> 5
+        JqArray(_i) -> 6
+        JqObject(_e) -> 7
+    }
+}
+
+fn bytes_cmp(a: str, b: str) -> i64 {
+    let x = a.to_bytes().to_list()
+    let y = b.to_bytes().to_list()
+    let n = x.len().min(y.len())
+    for i in 0..n {
+        if x[i] != y[i] {
+            return x[i] - y[i]
+        }
+    }
+    return x.len() - y.len()
+}
+
+fn sorted_keys(entries: [(str, JqValue)]) -> [str] {
+    var keys = entries.map(|e| e.0)
+    // Insertion sort by bytes: objects here are small.
+    var i = 1
+    while i < keys.len() {
+        var j = i
+        while j > 0 and bytes_cmp(keys[j - 1], keys[j]) > 0 {
+            let t = keys[j]
+            keys[j] = keys[j - 1]
+            keys[j - 1] = t
+            j = j - 1
+        }
+        i = i + 1
+    }
+    return keys
+}
+
+fn entry(entries: [(str, JqValue)], key: str) -> Option[JqValue] {
+    for (k, v) in entries {
+        if k == key {
+            return Some(v)
+        }
+    }
+    return None
+}
+
+/// jv_cmp.
+pub fn compare(a: JqValue, b: JqValue) -> i64 {
+    let ra = kind_rank(a)
+    let rb = kind_rank(b)
+    if ra != rb {
+        return ra - rb
+    }
+    return match a {
+        JqNumber(x) -> match b {
+            JqNumber(y) -> number_cmp(x, y)
+            _ -> 0
+        }
+        JqString(x) -> match b {
+            JqString(y) -> bytes_cmp(x, y)
+            _ -> 0
+        }
+        JqArray(x) -> match b {
+            JqArray(y) -> array_cmp(x, y)
+            _ -> 0
+        }
+        JqObject(x) -> match b {
+            JqObject(y) -> object_cmp(x, y)
+            _ -> 0
+        }
+        _ -> 0
+    }
+}
+
+fn array_cmp(x: [JqValue], y: [JqValue]) -> i64 {
+    var i = 0
+    while true {
+        let a_done = i >= x.len()
+        let b_done = i >= y.len()
+        if a_done or b_done {
+            return (if b_done { 1 } else { 0 }) - (if a_done { 1 } else { 0 })
+        }
+        let r = compare(x[i], y[i])
+        if r != 0 {
+            return r
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+fn object_cmp(x: [(str, JqValue)], y: [(str, JqValue)]) -> i64 {
+    let kx = sorted_keys(x)
+    let ky = sorted_keys(y)
+    let r = array_cmp(kx.map(|k| JqString(k)), ky.map(|k| JqString(k)))
+    if r != 0 {
+        return r
+    }
+    for k in kx {
+        let c = compare(entry(x, k) ?? JqNull, entry(y, k) ?? JqNull)
+        if c != 0 {
+            return c
+        }
+    }
+    return 0
+}
+
+/// jv_equal.
+pub fn equal(a: JqValue, b: JqValue) -> bool {
+    return kind_rank(a) == kind_rank(b) and compare(a, b) == 0
+}
+
+/// jv_sort: stable.
+fn sort_values(xs: [JqValue]) -> [JqValue] {
+    if xs.len() <= 1 {
+        return xs
+    }
+    let mid = xs.len() / 2
+    let left = sort_values(xs.slice(0, mid))
+    let right = sort_values(xs.slice(mid, xs.len()))
+    var out: [JqValue] = []
+    var i = 0
+    var j = 0
+    while i < left.len() or j < right.len() {
+        if j >= right.len() or i < left.len() and compare(left[i], right[j]) <= 0 {
+            out.push(left[i])
+            i = i + 1
+        } else {
+            out.push(right[j])
+            j = j + 1
+        }
+    }
+    return out
+}
+
+// ---- jv_get and jv_set
+
+fn int_index(literal: str) -> i64 {
+    let d = value_of(literal)
+    if d != d {
+        return 0
+    }
+    let c = if d < 0.0 - 2147483648.0 { 0.0 - 2147483648.0 } else if d > 2147483647.0 { 2147483647.0 } else { d }
+    return c.as_i64()
+}
+
+fn slice_bound(entries: [(str, JqValue)], key: str) -> JqValue {
+    // A missing key is jq's "invalid", which is not null and not a number.
+    return entry(entries, key) ?? JqBool(false)
+}
+
+/// parse_slice: (start, end) for a sequence of length `len`.
+fn parse_slice(len: i64, slice: [(str, JqValue)]) -> (i64, i64) ! JqError {
+    var start_v = slice_bound(slice, "start")
+    if start_v == JqNull {
+        start_v = num(0)
+    }
+    var end_v = slice_bound(slice, "end")
+    if end_v == JqNull {
+        end_v = num(len)
+    }
+    let ds0 = match start_v {
+        JqNumber(t) -> value_of(t)
+        _ -> fail(err("Array/string slice indices must be integers"))
+    }
+    let de0 = match end_v {
+        JqNumber(t) -> value_of(t)
+        _ -> fail(err("Array/string slice indices must be integers"))
+    }
+    let n = len.as_f64()
+    var ds = ds0
+    if ds < 0.0 {
+        ds = ds + n
+    }
+    if ds < 0.0 {
+        ds = 0.0
+    }
+    if ds > n {
+        ds = n
+    }
+    let start = ds.as_i64()
+    var de = de0
+    if de < 0.0 {
+        de = de + n
+    }
+    if de < 0.0 {
+        de = start.as_f64()
+    }
+    var end = if de > 2147483647.0 { 2147483647 } else { de.as_i64() }
+    if end > len {
+        end = len
+    }
+    if end < len and end.as_f64() < de {
+        end = end + 1
+    }
+    if end < start {
+        end = start
+    }
+    return (start, end)
+}
+
+fn index_message(t: JqValue, k: JqValue) -> JqError {
+    match k {
+        JqString(s) -> if s.to_bytes().len() < 30 {
+            let cut = match s.index_of("\u{0}") {
+                Some(z) -> s.substr(0, z)
+                None -> s
+            }
+            return err("Cannot index " + kind_name(t) + " with string \"" + cut + "\"")
+        }
+        _ -> {}
+    }
+    return err("Cannot index " + kind_name(t) + " with " + kind_name(k))
+}
+
+/// jv_array_indexes.
+fn array_indexes(a: [JqValue], b: [JqValue]) -> JqValue {
+    var res: [JqValue] = []
+    for ai in 0..a.len() {
+        var idx = 0 - 1
+        for bi in 0..b.len() {
+            let here = ai + bi < a.len() and equal(a[ai + bi], b[bi])
+            if not here {
+                idx = 0 - 1
+            } else if bi == 0 and idx == 0 - 1 {
+                idx = ai
+            }
+        }
+        if idx > 0 - 1 {
+            res.push(num(idx))
+        }
+    }
+    return JqArray(res)
+}
+
+/// jv_get: `t[k]`.
+pub fn get(t: JqValue, k: JqValue) -> JqValue ! JqError {
+    match t {
+        JqObject(entries) -> match k {
+            JqString(s) -> return entry(entries, s) ?? JqNull
+            _ -> {}
+        }
+        JqArray(items) -> match k {
+            JqNumber(lit) -> {
+                var idx = int_index(lit)
+                if idx < 0 {
+                    idx = idx + items.len()
+                }
+                return if idx >= 0 and idx < items.len() { items[idx] } else { JqNull }
+            }
+            JqObject(slice) -> {
+                let (s, e) = try parse_slice(items.len(), slice)
+                return JqArray(items.slice(s, e))
+            }
+            JqArray(b) -> return array_indexes(items, b)
+            _ -> {}
+        }
+        JqString(text) -> match k {
+            JqObject(slice) -> {
+                let cs = text.chars()
+                let (s, e) = try parse_slice(cs.len(), slice)
+                return JqString(cs.slice(s, e).join(""))
+            }
+            _ -> {}
+        }
+        JqNull -> match k {
+            JqString(_s) -> return JqNull
+            JqNumber(_n) -> return JqNull
+            JqObject(_o) -> return JqNull
+            _ -> {}
+        }
+        _ -> {}
+    }
+    fail(index_message(t, k))
+}
+
+fn object_set(entries: [(str, JqValue)], key: str, v: JqValue) -> [(str, JqValue)] {
+    var out = entries
+    for i in 0..out.len() {
+        if out[i].0 == key {
+            out[i] = (key, v)
+            return out
+        }
+    }
+    out.push((key, v))
+    return out
+}
+
+fn array_set(items: [JqValue], idx0: i64, v: JqValue) -> JqValue ! JqError {
+    var idx = idx0
+    if idx < 0 {
+        idx = idx + items.len()
+    }
+    if idx < 0 {
+        fail(err("Out of bounds negative array index"))
+    }
+    if idx > 100000 {
+        fail(err("jqpath: an array index above 100000"))
+    }
+    var out = items
+    while out.len() <= idx {
+        out.push(JqNull)
+    }
+    out[idx] = v
+    return JqArray(out)
+}
+
+/// jv_set: `t[k] = v`.
+pub fn set(t: JqValue, k: JqValue, v: JqValue) -> JqValue ! JqError {
+    let isnull = t == JqNull
+    match k {
+        JqString(s) -> {
+            if isnull {
+                return JqObject([(s, v)])
+            }
+            match t {
+                JqObject(entries) -> return JqObject(object_set(entries, s, v))
+                _ -> {}
+            }
+        }
+        JqNumber(lit) -> {
+            if isnull {
+                return try array_set([], int_index(lit), v)
+            }
+            match t {
+                JqArray(items) -> return try array_set(items, int_index(lit), v)
+                _ -> {}
+            }
+        }
+        JqObject(slice) -> {
+            if isnull {
+                return try set_slice([], slice, v)
+            }
+            match t {
+                JqArray(items) -> return try set_slice(items, slice, v)
+                JqString(_s) -> fail(err("Cannot update string slices"))
+                _ -> {}
+            }
+        }
+        _ -> {}
+    }
+    fail(err("Cannot update field at " + kind_name(k) + " index of " + kind_name(t)))
+}
+
+fn set_slice(items: [JqValue], slice: [(str, JqValue)], v: JqValue) -> JqValue ! JqError {
+    let (s, e) = try parse_slice(items.len(), slice)
+    return match v {
+        JqArray(insert) -> JqArray(items.slice(0, s) + insert + items.slice(e, items.len()))
+        _ -> fail(err("A slice of an array can only be assigned another array"))
+    }
+}
+
+// ---- getpath, setpath, delpaths
+
+fn path_items(path: JqValue, message: str) -> [JqValue] ! JqError {
+    return match path {
+        JqArray(items) -> items
+        _ -> fail(err(message))
+    }
+}
+
+/// `getpath(path)`.
+pub fn getpath(root: JqValue, path: JqValue) -> JqValue ! JqError {
+    let items = try path_items(path, "Path must be specified as an array")
+    var v = root
+    for k in items {
+        v = try get(v, k)
+    }
+    return v
+}
+
+/// `setpath(path; value)`.
+pub fn setpath(root: JqValue, path: JqValue, value: JqValue) -> JqValue ! JqError {
+    let items = try path_items(path, "Path must be specified as an array")
+    return try setpath_from(root, items, 0, value)
+}
+
+fn setpath_from(root: JqValue, items: [JqValue], at: i64, value: JqValue) -> JqValue ! JqError {
+    if at == items.len() {
+        return value
+    }
+    let k = items[at]
+    let sub = try get(root, k)
+    match k {
+        JqObject(_s) -> return try set(root, k, try setpath_from(sub, items, at + 1, value))
+        _ -> {}
+    }
+    let cleared = try set(root, k, JqNull)
+    return try set(cleared, k, try setpath_from(sub, items, at + 1, value))
+}
+
+/// `delpaths(paths)`.
+pub fn delpaths(root: JqValue, paths: JqValue) -> JqValue ! JqError {
+    let list = sort_values(try path_items(paths, "Paths must be specified as an array"))
+    var arrays: [[JqValue]] = []
+    for p in list {
+        match p {
+            JqArray(items) -> arrays.push(items)
+            _ -> fail(err("Path must be specified as array, not " + kind_name(p)))
+        }
+    }
+    if arrays.len() == 0 {
+        return root
+    }
+    if arrays[0].len() == 0 {
+        return JqNull
+    }
+    return try delpaths_sorted(root, arrays, 0)
+}
+
+fn delpaths_sorted(object0: JqValue, paths: [[JqValue]], start: i64) -> JqValue ! JqError {
+    var object = object0
+    var delkeys: [JqValue] = []
+    var i = 0
+    while i < paths.len() {
+        var j = i
+        let delkey = paths[i].len() == start + 1
+        let key = paths[i][start]
+        while j < paths.len() and equal(key, paths[j][start]) {
+            j = j + 1
+        }
+        if delkey {
+            delkeys.push(key)
+        } else {
+            let sub = try get(object, key)
+            if sub != JqNull {
+                let newsub = try delpaths_sorted(sub, paths.slice(i, j), start + 1)
+                object = try set(object, key, newsub)
+            }
+        }
+        i = j
+    }
+    return try dels(object, delkeys)
+}
+
+/// jv_dels: delete sorted keys at one level.
+fn dels(t: JqValue, keys: [JqValue]) -> JqValue ! JqError {
+    if t == JqNull or keys.len() == 0 {
+        return t
+    }
+    return match t {
+        JqArray(items) -> try dels_array(items, keys)
+        JqObject(entries) -> try dels_object(entries, keys)
+        _ -> fail(err("Cannot delete fields from " + kind_name(t)))
+    }
+}
+
+fn dels_object(entries: [(str, JqValue)], keys: [JqValue]) -> JqValue ! JqError {
+    var out = entries
+    for k in keys {
+        match k {
+            JqString(s) -> out = out.filter(|e| e.0 != s)
+            _ -> fail(err("Cannot delete " + kind_name(k) + " field of object"))
+        }
+    }
+    return JqObject(out)
+}
+
+fn dels_array(items: [JqValue], keys: [JqValue]) -> JqValue ! JqError {
+    var neg: [i64] = []
+    var nonneg: [i64] = []
+    var starts: [i64] = []
+    var ends: [i64] = []
+    for k in keys {
+        match k {
+            JqNumber(lit) -> if value_of(lit) < 0.0 {
+                neg.push(int_index(lit))
+            } else {
+                nonneg.push(int_index(lit))
+            }
+            JqObject(slice) -> {
+                let (s, e) = try parse_slice(items.len(), slice)
+                starts.push(s)
+                ends.push(e)
+            }
+            _ -> fail(err("Cannot delete " + kind_name(k) + " element of array"))
+        }
+    }
+    let len = items.len()
+    var out: [JqValue] = []
+    var ni = 0
+    var pi = 0
+    for i in 0..len {
+        var del = false
+        while ni < neg.len() {
+            let d = len + neg[ni]
+            if i == d {
+                del = true
+            }
+            if i < d {
+                break
+            }
+            ni = ni + 1
+        }
+        while pi < nonneg.len() {
+            let d = nonneg[pi]
+            if i == d {
+                del = true
+            }
+            if i < d {
+                break
+            }
+            pi = pi + 1
+        }
+        for s in 0..starts.len() {
+            if starts[s] <= i and i < ends[s] {
+                del = true
+            }
+        }
+        if not del {
+            out.push(items[i])
+        }
+    }
+    return JqArray(out)
+}
+
+// ---- paths
+
+fn children(v: JqValue) -> [(JqValue, JqValue)] {
+    return match v {
+        JqArray(items) -> (0..items.len()).to_list().map(|i| (num(i), items[i]))
+        JqObject(entries) -> entries.map(|e| (JqString(e.0), e.1))
+        _ -> []
+    }
+}
+
+fn truthy(v: JqValue) -> bool {
+    return not (v == JqNull or v == JqBool(false))
+}
+
+/// Whether `paths(selector)` keeps a node: the selector's output is true.
+fn selected(selector: str, v: JqValue) -> bool {
+    let kind = kind_name(v)
+    let container = kind == "array" or kind == "object"
+    if selector == "values" or selector == "" {
+        return truthy(v)
+    }
+    if selector == "scalars" {
+        return not container and truthy(v)
+    }
+    if selector == "iterables" {
+        return container
+    }
+    if selector == "booleans" {
+        return v == JqBool(true)
+    }
+    if selector == "nulls" {
+        return false
+    }
+    return kind + "s" == selector
+}
+
+fn walk_paths(v: JqValue, prefix: [JqValue], selector: str, everything: bool, inout out: [JqValue]) {
+    if prefix.len() > 0 and (everything or selected(selector, v)) {
+        out.push(JqArray(prefix))
+    }
+    for (k, child) in children(v) {
+        walk_paths(child, prefix + [k], selector, everything, out)
+    }
+}
+
+/// `[paths]`.
+pub fn paths(v: JqValue) -> [JqValue] {
+    var out: [JqValue] = []
+    walk_paths(v, [], "", true, out)
+    return out
+}
+
+pub fn selector_names() -> [str] {
+    return ["values", "nulls", "booleans", "numbers", "strings", "arrays", "objects", "iterables", "scalars"]
+}
+
+/// `[paths(selector)]` for one of jq's selector builtins.
+pub fn paths_where(v: JqValue, selector: str) -> [JqValue] ! JqError {
+    if not selector_names().contains(selector) {
+        fail(err("jqpath: not a selector: " + selector))
+    }
+    var out: [JqValue] = []
+    walk_paths(v, [], selector, false, out)
+    return out
+}
+
+// ---- entries
+
+fn iterate(v: JqValue) -> [JqValue] ! JqError {
+    return match v {
+        JqArray(items) -> items
+        JqObject(entries) -> entries.map(|e| e.1)
+        _ -> fail(err(repaired(ascii("Cannot iterate over " + kind_name(v) + " (") + shown(v) + ascii(")"))))
+    }
+}
+
+/// `to_entries`.
+pub fn to_entries(v: JqValue) -> JqValue ! JqError {
+    return match v {
+        JqObject(entries) -> JqArray(entries.map(|e| JqObject([("key", JqString(e.0)), ("value", e.1)])))
+        JqArray(items) -> JqArray((0..items.len()).to_list().map(|i| JqObject([("key", num(i)), ("value", items[i])])))
+        _ -> fail(type_error(v, "has no keys"))
+    }
+}
+
+fn entry_key(e: JqValue) -> JqValue ! JqError {
+    for name in ["key", "Key", "name"] {
+        let k = try get(e, JqString(name))
+        if truthy(k) {
+            return k
+        }
+    }
+    return try get(e, JqString("Name"))
+}
+
+fn has_key(e: JqValue, key: str) -> bool ! JqError {
+    return match e {
+        JqNull -> false
+        JqObject(entries) -> entry(entries, key).is_some()
+        _ -> fail(err("Cannot check whether " + kind_name(e) + " has a string key"))
+    }
+}
+
+/// `from_entries`.
+pub fn from_entries(v: JqValue) -> JqValue ! JqError {
+    var out: [(str, JqValue)] = []
+    for e in try iterate(v) {
+        let k = try entry_key(e)
+        let value = if try has_key(e, "value") { try get(e, JqString("value")) } else { try get(e, JqString("Value")) }
+        match k {
+            JqString(s) -> out = object_set(out, s, value)
+            _ -> fail(err(repaired(ascii("Cannot use " + kind_name(k) + " (") + shown(k) + ascii(") as object key"))))
+        }
+    }
+    return JqObject(out)
+}
+
+/// `pick(getpath(p1), getpath(p2), ...)`: the paths given, kept.
+pub fn pick(v: JqValue, ps: [JqValue]) -> JqValue ! JqError {
+    var out = JqNull
+    for p in ps {
+        let got = try getpath(v, p)
+        out = try setpath(out, p, got)
+    }
+    return out
+}
+
+// ---- streams
+
+fn stream_events(v: JqValue, prefix: [JqValue], inout out: [JqValue]) {
+    let kids = children(v)
+    for (k, child) in kids {
+        stream_events(child, prefix + [k], out)
+    }
+    if kids.len() == 0 {
+        out.push(JqArray([JqArray(prefix), v]))
+    } else {
+        out.push(JqArray([JqArray(prefix + [kids[kids.len() - 1].0])]))
+    }
+}
+
+/// `[tostream]`.
+pub fn tostream(v: JqValue) -> [JqValue] {
+    var out: [JqValue] = []
+    stream_events(v, [], out)
+    return out
+}
+
+/// `length`, as a double.
+fn length_of(v: JqValue) -> f64 ! JqError {
+    return match v {
+        JqNull -> 0.0
+        JqBool(_b) -> fail(type_error(v, "has no length"))
+        JqNumber(t) -> value_of(t).abs()
+        JqString(s) -> s.chars().len().as_f64()
+        JqArray(items) -> items.len().as_f64()
+        JqObject(entries) -> entries.len().as_f64()
+    }
+}
+
+/// `$a + $b` where `$a` is an array.
+fn plus_array(a: [JqValue], b: JqValue) -> [JqValue] ! JqError {
+    return match b {
+        JqNull -> a
+        JqArray(items) -> a + items
+        _ -> fail(type_error2(JqArray(a), b, "cannot be added"))
+    }
+}
+
+/// `[fromstream(events[])]`.
+pub fn fromstream(events: [JqValue]) -> [JqValue] ! JqError {
+    var out: [JqValue] = []
+    var x = JqNull
+    var emit = false
+    for ev in events {
+        if emit {
+            x = JqNull
+            emit = false
+        }
+        let whole = try length_of(ev)
+        let first = try get(ev, num(0))
+        if whole == 2.0 {
+            emit = try length_of(first) == 0.0
+            let path = try plus_array([JqString("x")], first)
+            let value = try get(ev, num(1))
+            x = try setpath(x, JqArray(path.slice(1, path.len())), value)
+        } else {
+            emit = try length_of(first) == 1.0
+        }
+        if emit {
+            out.push(x)
+        }
+    }
+    return out
+}
+
+/// `[depth | truncate_stream(events[])]`.
+pub fn truncate_stream(depth: JqValue, events: [JqValue]) -> [JqValue] ! JqError {
+    var out: [JqValue] = []
+    for ev in events {
+        let first = try get(ev, num(0))
+        let n = try length_of(first)
+        let longer = match depth {
+            JqNumber(t) -> n > value_of(t)
+            _ -> kind_rank(depth) < 4
+        }
+        if longer {
+            let cut = try get(first, JqObject([("start", depth), ("end", JqNull)]))
+            out.push(try setpath(ev, JqArray([num(0)]), cut))
+        }
+    }
+    return out
+}

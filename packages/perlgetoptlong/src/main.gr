@@ -1,0 +1,1420 @@
+// Perl's Getopt::Long, as version 2.52 (Perl 5.34) parses a command line:
+// `GetOptionsFromArray(\@args, \%h, @specs)` after `Configure(...)`.
+//
+// Nearly every Perl command-line tool takes its options this way, and a
+// wrapper, a completion script or a port of such a tool has to accept
+// exactly what it accepts:
+//
+//   - **Specs**: `name|alias|alias`, then `!` (also `--noname` and
+//     `--no-name`), `+` (counts), `=s :s =i :i =o :o =f :f` (`n` is `i`),
+//     `@` or `%` to collect a list or `key=value` pairs, repeat counts
+//     `{2}`, `{1,}`, `{,3}`, and `:5` or `:+` for an optional number with a
+//     default or an increment. Errors in specs die with Getopt::Long's
+//     messages, all of them together.
+//   - **Matching**: `--name=value`, `--name value`, `-name`, `+name`;
+//     unique abbreviations; case folded unless told not to; `--` ends the
+//     options; with `bundling` single letters bundle (`-vvx3`) and stay
+//     case-sensitive, `bundling_override` lets long names win, and
+//     `bundling_values` takes a value glued to its letter.
+//   - **Values**: integers are numified as Perl numifies (`+5` is 5, a
+//     number past 2^64 is a double), `o` reads `0x`, `0b` and leading-0
+//     octal with Perl's `oct` (overflow and portability warnings
+//     included), floats are kept as written without underscores, and an
+//     optional value falls back to its default when the next word is not
+//     one. Some of Getopt::Long's own quirks are reproduced, such as a
+//     value glued to a bundled letter keeping its underscores.
+//   - **Configuration**: `default`, `posix_default`, `auto_abbrev`,
+//     `getopt_compat`, `gnu_getopt`, `gnu_compat`, `ignore_case`,
+//     `ignore_case_always`, `bundling`, `bundling_override`,
+//     `bundling_values`, `require_order`, `permute`, `pass_through`, each
+//     with `no_`.
+//   - **Results**: the hash as Perl leaves it (each value as Perl prints
+//     it), the arguments left over, whether it succeeded, and every
+//     warning in order.
+//
+// Not covered: linkage to variables or code (everything goes into the
+// hash, as with a hash reference), `<>` and the callback options,
+// `auto_help`, `auto_version`, `debug` and the `prefix` patterns (these are
+// refused), and the duplicate-spec warnings that appear only under `-w`.
+// Option names in specs are expected to be ASCII.
+//
+// Checked against `perl` 5.34 calling GetOptionsFromArray with a hash
+// reference, under generated configurations, specs and command lines.
+
+import perlsprintf
+
+/// A value as Perl holds it: a string, an IV, a UV (held in an i64) or a
+/// double.
+type GolNum = | GolS(text: str) | GolI(v: i64) | GolU(v: i64) | GolN(x: f64)
+
+/// What one option key holds in the hash.
+type GolValue = | GolScalar(text: str) | GolList(items: [str]) | GolHash(pairs: [(str, str)])
+
+/// The outcome: GetOptions's return, the hash, the arguments left in the
+/// array, and the warnings.
+type GolResult = { ok: bool, values: [(str, GolValue)], rest: [str], warnings: [str] }
+
+/// Getopt::Long died (with its message), or was asked for what this does
+/// not do.
+type GolError = | GolDied(message: str) | GolRefused(why: str)
+
+type GolCfg = {
+    prefix: [str],
+    prefix_class: bool,
+    autoabbrev: bool,
+    bundling: i64,
+    getopt_compat: bool,
+    order: i64,
+    ignorecase: i64,
+    passthrough: bool,
+    gnu_compat: bool,
+    bundling_values: bool,
+}
+
+/// An option's control entry: type (`` ! + i I o f s``), canonical name,
+/// default, destination (0 scalar, 1 list, 2 hash), min and max values.
+type GolCtl = { type_: str, cname: str, default_: Option[str], dest: i64, amin: i64, amax: i64 }
+
+type GolSlot = | GolNone | GolVal(n: GolNum) | GolArr(items: [GolNum]) | GolMap(pairs: Map[str, GolNum])
+
+type GolState = {
+    cfg: GolCfg,
+    opctl: Map[str, GolCtl],
+    hash: Map[str, GolSlot],
+    argv: [str],
+    warnings: [str],
+    errors: i64,
+}
+
+/// FindOption's answer: found, the option (or none, after an error), its
+/// control, the value and the key.
+type GolFound = { found: bool, opt: Option[str], ctl: GolCtl, arg: Option[GolNum], key: Option[str] }
+
+// --- configuration ------------------------------------------------------------------------------------
+
+fn default_cfg() -> GolCfg {
+    return GolCfg{ prefix: ["--", "-", "+"], prefix_class: false, autoabbrev: true, bundling: 0, getopt_compat: true, order: 1, ignorecase: 1, passthrough: false, gnu_compat: false, bundling_values: false }
+}
+
+fn posix_cfg(c0: GolCfg) -> GolCfg {
+    var c = c0
+    c.prefix = ["--", "-"]
+    c.autoabbrev = false
+    c.bundling = 0
+    c.getopt_compat = false
+    c.order = 0
+    c.ignorecase = 1
+    c.passthrough = false
+    c.gnu_compat = false
+    c.bundling_values = false
+    return c
+}
+
+fn configure_one(c0: GolCfg, opt: str) -> GolCfg ! GolError {
+    var c = c0
+    var t = opt.to_lower()
+    var action = true
+    if t.starts_with("no") {
+        action = false
+        t = t.substr(2, t.len() - 2)
+        if t.starts_with("_") {
+            t = t.substr(1, t.len() - 1)
+        }
+    }
+    if (t == "default" or t == "defaults") and action {
+        return default_cfg()
+    }
+    if t == "posix_default" or t == "posix_defaults" {
+        return if action { posix_cfg(c) } else { default_cfg() }
+    }
+    if t == "auto_abbrev" or t == "autoabbrev" {
+        c.autoabbrev = action
+    } else if t == "getopt_compat" {
+        c.getopt_compat = action
+        c.prefix = if action { ["--", "-", "+"] } else { ["--", "-"] }
+        c.prefix_class = false
+    } else if t == "gnu_getopt" {
+        if action {
+            c.gnu_compat = true
+            c.bundling = 1
+            c.getopt_compat = false
+            c.prefix = ["--", "-"]
+            c.prefix_class = false
+            c.order = 1
+            c.bundling_values = false
+        }
+    } else if t == "gnu_compat" {
+        c.gnu_compat = action
+        c.bundling = 0
+        c.bundling_values = true
+    } else {
+        return try configure_more(c, t, action, opt)
+    }
+    return c
+}
+
+fn configure_more(c0: GolCfg, t: str, action: bool, opt: str) -> GolCfg ! GolError {
+    var c = c0
+    if t == "ignorecase" or t == "ignore_case" {
+        c.ignorecase = if action { 1 } else { 0 }
+    } else if t == "ignorecase_always" or t == "ignore_case_always" {
+        c.ignorecase = if action { 2 } else { 0 }
+    } else if t == "bundling" {
+        c.bundling = if action { 1 } else { 0 }
+        if action {
+            c.bundling_values = false
+        }
+    } else if t == "bundling_override" {
+        c.bundling = if action { 2 } else { 0 }
+        if action {
+            c.bundling_values = false
+        }
+    } else if t == "bundling_values" {
+        c.bundling_values = action
+        if action {
+            c.bundling = 0
+        }
+    } else if t == "require_order" {
+        c.order = if action { 0 } else { 1 }
+    } else if t == "permute" {
+        c.order = if action { 1 } else { 0 }
+    } else if t == "pass_through" or t == "passthrough" {
+        c.passthrough = action
+    } else if t == "debug" or t.ends_with("version") or t.ends_with("help") or t.starts_with("prefix") or t.starts_with("long_prefix") {
+        fail(GolRefused("configuration " + opt + " is not supported"))
+    } else {
+        fail(GolDied("Getopt::Long: unknown or erroneous config parameter \"" + opt + "\"\n"))
+    }
+    return c
+}
+
+// --- characters and the prefix ----------------------------------------------------------------------
+
+fn is_word(c: str) -> bool {
+    let k = c.code_at(0)
+    return k >= 48 and k <= 57 or k >= 65 and k <= 90 or k >= 97 and k <= 122 or k == 95 or k > 127 and c.to_upper() != c.to_lower()
+}
+
+fn is_digit_c(c: str) -> bool {
+    let k = c.code_at(0)
+    return k >= 48 and k <= 57
+}
+
+/// The prefix token `s` starts with, if any: the first alternative that
+/// matches, or one character of the class.
+fn prefix_at(cfg: GolCfg, s: str) -> Option[str] {
+    if cfg.prefix_class {
+        if s.len() > 0 and cfg.prefix.contains(s.substr(0, 1)) {
+            return Some(s.substr(0, 1))
+        }
+        return None
+    }
+    for p in cfg.prefix {
+        if s.starts_with(p) {
+            return Some(p)
+        }
+    }
+    return None
+}
+
+/// `$arg =~ /^$prefix.+/`: a prefix and at least one more character on
+/// its line.
+fn looks_like_option(cfg: GolCfg, s: str) -> bool {
+    let alts = if cfg.prefix_class { if s.len() > 0 and cfg.prefix.contains(s.substr(0, 1)) { [s.substr(0, 1)] } else { [] } } else { cfg.prefix }
+    for p in alts {
+        if s.starts_with(p) and s.len() > p.len() and s.substr(p.len(), 1) != "\n" {
+            return true
+        }
+    }
+    return false
+}
+
+/// `$opt = $+ if $opt =~ /^$prefix+(.*)$/s`: every leading prefix token.
+fn strip_prefixes(cfg: GolCfg, s0: str) -> str {
+    var s = s0
+    var going = true
+    while going {
+        match prefix_at(cfg, s) {
+            Some(p) -> s = s.substr(p.len(), s.len() - p.len())
+            None -> going = false
+        }
+    }
+    return s
+}
+
+fn all_non_word(s: str) -> bool {
+    return s.len() > 0 and s.chars().all(|c| not is_word(c))
+}
+
+// --- option specs ------------------------------------------------------------------------------------
+
+fn special_char(c: str) -> bool {
+    return c == "|" or c == "!" or c == "+" or c == "=" or c == ":"
+}
+
+/// Where the alias list starting at `pos` may end, in the order Perl's
+/// regex engine tries them.
+fn alias_ends(cs: [str], pos: i64) -> [i64] {
+    var out: [i64] = []
+    if pos < cs.len() and cs[pos] == "|" {
+        if pos + 1 < cs.len() and cs[pos + 1] != "\n" {
+            var run = pos + 2
+            while run < cs.len() and not special_char(cs[run]) and cs[run] != "\n" {
+                run = run + 1
+            }
+            var e = run
+            while e >= pos + 2 {
+                for x in alias_ends(cs, e) {
+                    out.push(x)
+                }
+                e = e - 1
+            }
+        }
+        for x in alias_ends(cs, pos + 1) {
+            out.push(x)
+        }
+    }
+    out.push(pos)
+    return out
+}
+
+fn digits_run(cs: [str], from: i64) -> i64 {
+    var i = from
+    while i < cs.len() and is_digit_c(cs[i]) {
+        i = i + 1
+    }
+    return i
+}
+
+/// Whether `cs[from..]` is a whole value spec (the second group of
+/// ParseOptionSpec's pattern), allowing a final newline as `$` does.
+fn spec_tail_ok(cs: [str], from: i64) -> bool {
+    var n = cs.len()
+    if n > from and cs[n - 1] == "\n" {
+        n = n - 1
+    }
+    let t = cs.slice(from, n).join("")
+    if t == "" or t == "!" or t == "+" {
+        return true
+    }
+    if not (t.starts_with("=") or t.starts_with(":")) or t.contains("\n") {
+        return false
+    }
+    let u = t.chars()
+    if u.len() >= 2 and "ionfs".contains(u[1]) {
+        var i = 2
+        if i < u.len() and (u[i] == "@" or u[i] == "%") {
+            i = i + 1
+        }
+        if i == u.len() {
+            return true
+        }
+        if u[i] != "\{" or u[u.len() - 1] != "}" {
+            return false
+        }
+        let inner = t.substr(i + 1, u.len() - i - 2).chars()
+        let a = digits_run(inner, 0)
+        let b = if a < inner.len() and inner[a] == "," { a + 1 } else { a }
+        return digits_run(inner, b) == inner.len()
+    }
+    if t.starts_with(":") {
+        var i = 1
+        if i < u.len() and u[i] == "+" {
+            i = i + 1
+        } else {
+            if i < u.len() and u[i] == "-" {
+                i = i + 1
+            }
+            let d = digits_run(u, i)
+            if d == i {
+                return false
+            }
+            i = d
+        }
+        return i == u.len() or i + 1 == u.len() and (u[i] == "@" or u[i] == "%")
+    }
+    return false
+}
+
+/// The names part and the value spec, or none when the spec is in error.
+fn split_spec(opt: str) -> Option[(Option[str], str)] {
+    let cs = opt.chars()
+    var w = 0
+    while w < cs.len() and (is_word(cs[w]) or w > 0 and cs[w] == "-") {
+        w = w + 1
+    }
+    if w > 0 and is_word(cs[0]) {
+        for e in alias_ends(cs, w) {
+            if spec_tail_ok(cs, e) {
+                return Some((Some(cs.slice(0, e).join("")), spec_text(cs, e)))
+            }
+        }
+    }
+    if spec_tail_ok(cs, 0) {
+        return Some((None, spec_text(cs, 0)))
+    }
+    return None
+}
+
+fn spec_text(cs: [str], from: i64) -> str {
+    var n = cs.len()
+    if n > from and cs[n - 1] == "\n" {
+        n = n - 1
+    }
+    return cs.slice(from, n).join("")
+}
+
+fn split_bars(t: str) -> [str] {
+    var parts = t.split("|")
+    while parts.len() > 0 and parts[parts.len() - 1] == "" {
+        let _x = parts.pop()
+    }
+    return parts
+}
+
+fn digits_value(t: str) -> Option[i64] {
+    if t == "" {
+        return None
+    }
+    return Some(t.parse_int() ?? 1000000000)
+}
+
+/// The control entry a value spec makes, or Getopt::Long's error text.
+fn spec_entry(spec: str, orig: str, opt: str, bundling: i64) -> GolCtl ! str {
+    if spec == "" or spec == "+" or spec == "!" {
+        return GolCtl{ type_: spec, cname: orig, default_: None, dest: 0, amin: 0, amax: 0 }
+    }
+    let u = spec.chars()
+    if u[0] == ":" and not "ionfs".contains(u[1]) {
+        let last = u[u.len() - 1]
+        let dest = if last == "@" { 1 } else if last == "%" { 2 } else { 0 }
+        let def = spec.substr(1, spec.len() - 1 - (if dest > 0 { 1 } else { 0 }))
+        let type_ = if def == "+" { "I" } else { "i" }
+        return GolCtl{ type_: type_, cname: orig, default_: if def == "+" { None } else { Some(def) }, dest: dest, amin: 0, amax: 1 }
+    }
+    let mand = u[0] == "="
+    let type_ = if u[1] == "n" { "i" } else { u[1] }
+    var i = 2
+    var dest = 0
+    if i < u.len() and (u[i] == "@" or u[i] == "%") {
+        dest = if u[i] == "@" { 1 } else { 2 }
+        i = i + 1
+    }
+    var mi: Option[i64] = None
+    var ma: Option[i64] = None
+    var cm = false
+    if i < u.len() {
+        if bundling != 0 {
+            fail("Cannot repeat while bundling: \"" + opt + "\"\n")
+        }
+        let inner = spec.substr(i + 1, u.len() - i - 2)
+        let comma = inner.index_of(",")
+        cm = comma.is_some()
+        let at = comma ?? inner.len()
+        mi = digits_value(inner.substr(0, at))
+        ma = digits_value(if cm { inner.substr(at + 1, inner.len() - at - 1) } else { "" })
+        if (mi ?? 1) == 0 and ma.is_none() and not cm {
+            fail("\{0} is useless in option spec: \"" + opt + "\"\n")
+        }
+    }
+    let min = mi ?? (if mand { 1 } else { 0 })
+    if ma.is_none() and not cm {
+        ma = Some(if min > 0 { min } else { 1 })
+    }
+    if (ma ?? 1) == 0 {
+        fail("Max must be greater than zero in option spec: \"" + opt + "\"\n")
+    }
+    if (ma ?? min) < min {
+        fail("Max less than min in option spec: \"" + opt + "\"\n")
+    }
+    return GolCtl{ type_: type_, cname: orig, default_: None, dest: dest, amin: min, amax: ma ?? (0 - 1) }
+}
+
+fn lc_name(cfg: GolCfg, name: str) -> str {
+    let limit = if cfg.bundling != 0 and name.len() == 1 { 1 } else { 0 }
+    return if cfg.ignorecase > limit { name.to_lower() } else { name }
+}
+
+/// ParseOptionSpec: the entries for every name, or the error text.
+fn parse_option_spec(inout st: GolState, opt: str) -> str {
+    let parts = match split_spec(opt) {
+        Some(p) -> p
+        None -> return "Error in option spec: \"" + opt + "\"\n"
+    }
+    let names = match parts.0 {
+        Some(n) -> split_bars(n)
+        None -> [""]
+    }
+    let orig = if names.len() > 0 { names[0] } else { "" }
+    let entry = match spec_entry(parts.1, orig, opt, st.cfg.bundling) {
+        Ok(e) -> e
+        Err(m) -> return m
+    }
+    for n0 in (if names.len() > 0 { names } else { [""] }) {
+        let n = lc_name(st.cfg, n0)
+        if parts.1 == "!" {
+            st.opctl.set("no" + n, entry)
+            st.opctl.set("no-" + n, entry)
+            var plain = entry
+            plain.type_ = ""
+            st.opctl.set(n, plain)
+        } else {
+            st.opctl.set(n, entry)
+        }
+    }
+    return ""
+}
+
+// --- Perl's numbers -----------------------------------------------------------------------------------
+
+fn iv_max() -> i64 {
+    return 9223372036854775807
+}
+
+fn ult(a: i64, b: i64) -> bool {
+    return a.bit_xor(0 - iv_max() - 1) < b.bit_xor(0 - iv_max() - 1)
+}
+
+fn udec(v: i64) -> str {
+    if v >= 0 {
+        return v.to_str()
+    }
+    let q = v.ushr(1) / 5
+    let r = v - q * 10
+    return q.to_str() + r.to_str()
+}
+
+fn uv_to_nv(u: i64) -> f64 {
+    if u >= 0 {
+        return u.as_f64()
+    }
+    return u.ushr(1).bit_or(u.bit_and(1)).as_f64() * 2.0
+}
+
+/// A double as Perl prints it.
+fn nv_text(x: f64) -> str {
+    if x == 0.0 {
+        return "0"
+    }
+    return match perlsprintf.sprintf("%.15g", [PerlNum(x)]) {
+        Ok(r) -> r.text
+        Err(_e) -> "?"
+    }
+}
+
+fn num_text(n: GolNum) -> str {
+    return match n {
+        GolS(t) -> t
+        GolI(v) -> v.to_str()
+        GolU(v) -> udec(v)
+        GolN(x) -> nv_text(x)
+    }
+}
+
+/// What Perl shows of a string in "isn't numeric" (ASCII text).
+fn shown(t: str) -> str {
+    var out = ""
+    let cs = t.codes()
+    var i = 0
+    while i < cs.len() and out.len() < 56 {
+        let c = cs[i]
+        out = out + (if c == 10 { "\\n" } else if c == 13 { "\\r" } else if c == 12 { "\\f" } else if c == 92 { "\\\\" } else if c == 0 { "\\0" } else if c >= 32 and c < 127 { c.to_char() } else if c < 128 { "^" + c.bit_xor(64).to_char() } else { c.to_char() })
+        i = i + 1
+    }
+    return if i < cs.len() { out + "..." } else { out }
+}
+
+/// `0 + $text` for the integer-shaped strings Getopt::Long adds to zero:
+/// an IV, a UV, or a double (with a warning when the text is not a
+/// number).
+fn add0(inout st: GolState, t: str) -> GolNum {
+    let cs = t.chars()
+    var i = 0
+    let neg = cs.len() > 0 and cs[0] == "-"
+    if cs.len() > 0 and (cs[0] == "-" or cs[0] == "+") {
+        i = 1
+    }
+    let d0 = i
+    while i < cs.len() and is_digit_c(cs[i]) {
+        i = i + 1
+    }
+    var tail = i
+    while tail < cs.len() and (cs[tail] == " " or cs[tail] == "\n" or cs[tail] == "\t" or cs[tail] == "\r" or cs[tail] == "\u{b}" or cs[tail] == "\u{c}") {
+        tail = tail + 1
+    }
+    let digits = cs.slice(d0, i).join("")
+    if i > d0 and tail == cs.len() {
+        return integer_value(digits, neg)
+    }
+    st.warnings.push("Argument \"" + shown(t) + "\" isn't numeric in addition (+)")
+    if i == d0 {
+        return GolN(0.0)
+    }
+    let v = digits.parse_float() ?? 0.0
+    return GolN(if neg { 0.0 - v } else { v })
+}
+
+/// A run of decimal digits with its sign, as grok_number and Atof give it.
+fn integer_value(digits: str, neg: bool) -> GolNum {
+    var v = 0
+    var over = false
+    for c in digits.codes() {
+        let d = c - 48
+        if ult(v, 1844674407370955161) or v == 1844674407370955161 and d <= 5 {
+            v = v * 10 + d
+        } else {
+            over = true
+        }
+    }
+    if over {
+        let x = digits.parse_float() ?? 0.0
+        return GolN(if neg { 0.0 - x } else { x })
+    }
+    if not neg {
+        return if v < 0 { GolU(v) } else { GolI(v) }
+    }
+    if v >= 0 or v == 0 - iv_max() - 1 {
+        return GolI(0 - v)
+    }
+    return GolN(0.0 - uv_to_nv(v))
+}
+
+fn class_digit(c: str, shift: i64) -> Option[i64] {
+    let k = c.code_at(0)
+    let v = if k >= 48 and k <= 57 { k - 48 } else if k >= 97 and k <= 102 { k - 87 } else if k >= 65 and k <= 70 { k - 55 } else { 99 }
+    return if v < 1.shl(shift) { Some(v) } else { None }
+}
+
+fn base_name(shift: i64) -> str {
+    return if shift == 4 { "hexadecimal" } else if shift == 1 { "binary" } else { "octal" }
+}
+
+/// grok_hex, grok_oct and grok_bin, with underscores allowed: the value
+/// (or the double after an overflow) and the warnings Perl gives.
+fn grok_base(inout st: GolState, cs: [str], shift: i64) -> GolNum {
+    var value = 0
+    var value_nv = 0.0
+    var factor = 1.0
+    var overflowed = false
+    let max_div = (0 - 1).ushr(shift)
+    var i = 0
+    while i < cs.len() {
+        var d = class_digit(cs[i], shift)
+        if d.is_none() and cs[i] == "_" and i + 1 < cs.len() and class_digit(cs[i + 1], shift).is_some() {
+            i = i + 1
+            d = class_digit(cs[i], shift)
+        }
+        match d {
+            Some(v) -> {
+                if not ult(max_div, value) {
+                    value = value.shl(shift).bit_or(v)
+                    factor = factor * 1.shl(shift).as_f64()
+                } else {
+                    value_nv = value_nv * factor + uv_to_nv(value)
+                    value = v
+                    factor = 1.shl(shift).as_f64()
+                    if not overflowed {
+                        overflowed = true
+                        st.warnings.push("Integer overflow in " + base_name(shift) + " number")
+                    }
+                }
+            }
+            None -> {
+                if cs[i] != "\u{0}" and (shift != 3 or cs[i] == "8" or cs[i] == "9") {
+                    st.warnings.push("Illegal " + base_name(shift) + " digit '" + cs[i] + "' ignored")
+                }
+                i = cs.len()
+            }
+        }
+        i = i + 1
+    }
+    return grok_finish(st, value, value_nv, factor, overflowed, shift)
+}
+
+fn grok_finish(inout st: GolState, value: i64, value_nv: f64, factor: f64, overflowed: bool, shift: i64) -> GolNum {
+    let portable = if shift == 4 { "Hexadecimal number > 0xffffffff non-portable" } else if shift == 1 { "Binary number > 0b11111111111111111111111111111111 non-portable" } else { "Octal number > 037777777777 non-portable" }
+    if not overflowed {
+        if ult(4294967295, value) {
+            st.warnings.push(portable)
+        }
+        return if value < 0 { GolU(value) } else { GolI(value) }
+    }
+    st.warnings.push(portable)
+    return GolN(value_nv * factor + uv_to_nv(value))
+}
+
+/// Perl's `oct`.
+fn perl_oct(inout st: GolState, t: str) -> GolNum {
+    var cs = t.chars()
+    var i = 0
+    while i < cs.len() and (cs[i] == " " or cs[i] == "\n" or cs[i] == "\t" or cs[i] == "\r" or cs[i] == "\u{b}" or cs[i] == "\u{c}") {
+        i = i + 1
+    }
+    if i < cs.len() and cs[i] == "0" {
+        i = i + 1
+    }
+    let c = if i < cs.len() { cs[i].to_lower() } else { "" }
+    if c == "x" {
+        return grok_base(st, cs.slice(i + 1, cs.len()), 4)
+    }
+    if c == "b" {
+        return grok_base(st, cs.slice(i + 1, cs.len()), 1)
+    }
+    if c == "o" {
+        i = i + 1
+    }
+    return grok_base(st, cs.slice(i, cs.len()), 3)
+}
+
+/// The conversion Getopt::Long applies to an `i`, `I` or `o` value.
+fn convert_int(inout st: GolState, type_: str, t: str) -> GolNum {
+    if type_ == "o" and t.starts_with("0") {
+        return perl_oct(st, t)
+    }
+    return add0(st, t)
+}
+
+fn add_one(inout st: GolState, n: GolNum) -> GolNum {
+    return match n {
+        GolI(v) -> if v == iv_max() { GolU(v + 1) } else { GolI(v + 1) }
+        GolU(v) -> if v == 0 - 1 { GolN(18446744073709551616.0) } else { GolU(v + 1) }
+        GolN(x) -> GolN(x + 1.0)
+        GolS(t) -> add_one(st, add0(st, t))
+    }
+}
+
+// --- the value patterns ----------------------------------------------------------------------------
+
+fn run_of(cs: [str], from: i64, ok: str) -> i64 {
+    var i = from
+    while i < cs.len() and ok.contains(cs[i].to_lower()) {
+        i = i + 1
+    }
+    return i
+}
+
+/// PAT_INT at the start of `cs`: where its greedy match ends, or -1.
+fn pat_int(cs: [str]) -> i64 {
+    var i = 0
+    if i < cs.len() and (cs[i] == "-" or cs[i] == "+") {
+        i = i + 1
+    }
+    i = run_of(cs, i, "_")
+    if i < cs.len() and is_digit_c(cs[i]) {
+        return run_of(cs, i + 1, "0123456789_")
+    }
+    return 0 - 1
+}
+
+/// PAT_XINT, case-insensitive: the first alternative that matches.
+fn pat_xint(cs: [str], full: bool) -> i64 {
+    let n = pat_int(cs)
+    let first = if n > 0 { cs.slice(0, n).join("").replace("_", "").replace("+", "").replace("-", "") } else { "" }
+    if n > 0 and not first.starts_with("0") and ends_ok(cs, n, full) {
+        return n
+    }
+    let lead = cs.len() >= 2 and cs[0] == "0"
+    if lead and cs[1].to_lower() == "x" {
+        let u = run_of(cs, 2, "_")
+        if u < cs.len() and "0123456789abcdef".contains(cs[u].to_lower()) {
+            let e = run_of(cs, u + 1, "0123456789abcdef_")
+            if ends_ok(cs, e, full) {
+                return e
+            }
+        }
+    }
+    if lead and cs[1].to_lower() == "b" {
+        let u = run_of(cs, 2, "_")
+        if u < cs.len() and (cs[u] == "0" or cs[u] == "1") {
+            let e = run_of(cs, u + 1, "01_")
+            if ends_ok(cs, e, full) {
+                return e
+            }
+        }
+    }
+    if cs.len() >= 1 and cs[0] == "0" {
+        let e = run_of(cs, 1, "01234567_")
+        if ends_ok(cs, e, full) {
+            return e
+        }
+    }
+    return 0 - 1
+}
+
+fn ends_ok(cs: [str], e: i64, full: bool) -> bool {
+    return not full or e == cs.len() or e + 1 == cs.len() and cs[e] == "\n"
+}
+
+/// PAT_FLOAT. Getopt::Long writes its fraction as "(\\.[0-9_]+)?" inside
+/// double quotes, where `\\.` is a plain `.`: so the fraction is any one
+/// character (a newline only under /s) and then digits, and `0o17` or
+/// `1x5` are floats to it. The ends a match can have, in the order Perl's
+/// regex engine tries them.
+fn pat_float_ends(cs: [str], dot_all: bool) -> [i64] {
+    var out: [i64] = []
+    var starts: [i64] = []
+    if cs.len() > 0 and (cs[0] == "-" or cs[0] == "+") {
+        starts.push(1)
+    }
+    starts.push(0)
+    for s in starts {
+        if not (s < cs.len() and (is_digit_c(cs[s]) or cs[s] == ".")) {
+            continue
+        }
+        var d = run_of(cs, s, "0123456789_")
+        while d >= s {
+            for f in float_fraction_ends(cs, d, dot_all) {
+                for e in float_exponent_ends(cs, f) {
+                    out.push(e)
+                }
+            }
+            d = d - 1
+        }
+    }
+    return out
+}
+
+fn float_fraction_ends(cs: [str], at: i64, dot_all: bool) -> [i64] {
+    var out: [i64] = []
+    if at + 1 < cs.len() and (dot_all or cs[at] != "\n") and "0123456789_".contains(cs[at + 1]) {
+        var e = run_of(cs, at + 1, "0123456789_")
+        while e > at + 1 {
+            out.push(e)
+            e = e - 1
+        }
+    }
+    out.push(at)
+    return out
+}
+
+fn float_exponent_ends(cs: [str], at: i64) -> [i64] {
+    var out: [i64] = []
+    if at < cs.len() and (cs[at] == "e" or cs[at] == "E") {
+        var j = at + 1
+        if j < cs.len() and (cs[j] == "-" or cs[j] == "+") {
+            j = j + 1
+        }
+        if j < cs.len() and "0123456789_".contains(cs[j]) {
+            var e = run_of(cs, j, "0123456789_")
+            while e > j {
+                out.push(e)
+                e = e - 1
+            }
+        }
+    }
+    out.push(at)
+    return out
+}
+
+/// PAT_FLOAT followed by anything (`/s`): the first end tried.
+fn pat_float(cs: [str]) -> i64 {
+    let ends = pat_float_ends(cs, true)
+    return if ends.len() > 0 { ends[0] } else { 0 - 1 }
+}
+
+fn full_int(t: str) -> bool {
+    let cs = t.chars()
+    let e = pat_int(cs)
+    return e > 0 and ends_ok(cs, e, true)
+}
+
+fn full_xint(t: str) -> bool {
+    return pat_xint(t.chars(), true) > 0
+}
+
+fn full_float(t: str) -> bool {
+    let cs = t.chars()
+    return pat_float_ends(cs, false).any(|e| ends_ok(cs, e, true))
+}
+
+fn line_of(t: str) -> str {
+    return match t.index_of("\n") {
+        Some(k) -> t.substr(0, k)
+        None -> t
+    }
+}
+
+/// ValidValue: whether `arg` can be taken as a further value.
+fn valid_value(cfg: GolCfg, ctl: GolCtl, arg0: str, mand: bool) -> bool {
+    var arg = arg0
+    if ctl.dest == 2 {
+        let cs = arg.chars()
+        var p = 0
+        while p < cs.len() and cs[p] == "=" {
+            p = p + 1
+        }
+        let eq = cs.slice(p, cs.len()).join("").index_of("=")
+        if p >= cs.len() or eq.is_none() {
+            return false
+        }
+        let at = p + (eq ?? 0)
+        arg = line_of(cs.slice(at + 1, cs.len()).join(""))
+    }
+    let t = ctl.type_
+    if t == "s" {
+        if mand or arg == "-" {
+            return true
+        }
+        return not (arg == "--" or looks_like_option(cfg, arg))
+    }
+    if t == "i" or t == "I" {
+        return full_int(arg)
+    }
+    if t == "o" {
+        return full_xint(arg)
+    }
+    return full_float(arg)
+}
+
+// --- FindOption ------------------------------------------------------------------------------------------
+
+fn not_found(ctl: GolCtl) -> GolFound {
+    return GolFound{ found: false, opt: None, ctl: ctl, arg: None, key: None }
+}
+
+fn in_error(ctl: GolCtl) -> GolFound {
+    return GolFound{ found: true, opt: None, ctl: ctl, arg: None, key: None }
+}
+
+fn got(opt: str, ctl: GolCtl, arg: GolNum) -> GolFound {
+    return GolFound{ found: true, opt: Some(opt), ctl: ctl, arg: Some(arg), key: None }
+}
+
+fn blank_ctl() -> GolCtl {
+    return GolCtl{ type_: "", cname: "", default_: None, dest: 0, amin: 0, amax: 0 }
+}
+
+fn warn(inout st: GolState, m: str) {
+    st.warnings.push(m)
+    st.errors = st.errors + 1
+}
+
+fn unshift(inout st: GolState, a: str) {
+    st.argv = [a] + st.argv
+}
+
+fn shift(inout st: GolState) -> str {
+    return st.argv.remove(0)
+}
+
+/// What the name the user typed comes to: the key to look up (after
+/// unbundling, abbreviation and case folding), the rest of a bundle, and
+/// a value given with `=`. None when it is ambiguous (after warning).
+type GolLookup = { opt: str, tryopt: str, rest: Option[str], optarg: Option[str], ambiguous: bool }
+
+fn lookup_name(inout st: GolState, starter: str, opt0: str) -> GolLookup {
+    let cfg = st.cfg
+    var opt = opt0
+    var optarg: Option[str] = None
+    var rest: Option[str] = None
+    let eq = if opt.len() > 1 { opt.substr(1, opt.len() - 1).index_of("=") } else { None }
+    if (starter == "--" or cfg.getopt_compat and (cfg.bundling == 0 or cfg.bundling == 2)) and eq.is_some() {
+        let at = (eq ?? 0) + 1
+        optarg = Some(opt.substr(at + 1, opt.len() - at - 1))
+        opt = opt.substr(0, at)
+    }
+    var tryopt = opt
+    if (cfg.bundling != 0 or cfg.bundling_values) and starter == "-" {
+        tryopt = if cfg.ignorecase > 0 { opt.to_lower() } else { opt }
+        if not (cfg.bundling == 2 and tryopt.len() > 1 and st.opctl.has(tryopt)) {
+            let r = if opt.len() > 0 { opt.substr(1, opt.len() - 1) } else { "" }
+            tryopt = opt.substr(0, 1)
+            if cfg.ignorecase > 1 {
+                tryopt = tryopt.to_lower()
+            }
+            if cfg.bundling_values {
+                optarg = if r == "" { None } else { Some(r) }
+            } else if r != "" {
+                rest = Some(r)
+            }
+        }
+    } else if cfg.autoabbrev and opt != "" {
+        if cfg.ignorecase > 0 {
+            opt = opt.to_lower()
+        }
+        tryopt = opt
+        let hits = st.opctl.keys().filter(|k| k.starts_with(opt))
+        var one = hits
+        if not (hits.len() <= 1 or hits.filter(|h| h == opt).len() == 1) {
+            var seen: Map[str, bool] = map()
+            for h in hits {
+                let c = st.opctl.get(h) ?? blank_ctl()
+                seen.set(if c.type_ == "!" { "no" + c.cname } else { c.cname }, true)
+            }
+            if seen.len() != 1 {
+                if not cfg.passthrough {
+                    warn(st, "Option " + opt + " is ambiguous (" + hits.join(", ") + ")")
+                }
+                return GolLookup{ opt: opt, tryopt: tryopt, rest: rest, optarg: optarg, ambiguous: true }
+            }
+            one = seen.keys()
+        }
+        if one.len() == 1 and one[0] != opt {
+            tryopt = lc_name(cfg, one[0])
+        }
+    } else if cfg.ignorecase > 0 {
+        tryopt = opt.to_lower()
+    }
+    return GolLookup{ opt: opt, tryopt: tryopt, rest: rest, optarg: optarg, ambiguous: false }
+}
+
+fn push_rest(inout st: GolState, starter: str, rest: Option[str]) {
+    match rest {
+        Some(r) -> unshift(st, starter + r)
+        None -> {}
+    }
+}
+
+/// FindOption.
+fn find_option(inout st: GolState, word: str) -> GolFound {
+    let starter = match prefix_at(st.cfg, word) {
+        Some(p) -> p
+        None -> return not_found(blank_ctl())
+    }
+    if word == "-" and not st.opctl.has("") {
+        return not_found(blank_ctl())
+    }
+    let look = lookup_name(st, starter, word.substr(starter.len(), word.len() - starter.len()))
+    if look.ambiguous {
+        return if st.cfg.passthrough { not_found(blank_ctl()) } else { in_error(blank_ctl()) }
+    }
+    let ctl = match st.opctl.get(look.tryopt) {
+        Some(c) -> c
+        None -> return unknown_option(st, starter, look)
+    }
+    let opt = look.tryopt
+    let t = ctl.type_
+    if t == "" or t == "!" or t == "+" {
+        return flag_option(st, starter, opt, ctl, look)
+    }
+    return value_option(st, starter, opt, ctl, look)
+}
+
+fn unknown_option(inout st: GolState, starter: str, look: GolLookup) -> GolFound {
+    if st.cfg.passthrough {
+        return not_found(blank_ctl())
+    }
+    var opt = look.opt
+    if st.cfg.bundling == 1 and starter.len() == 1 {
+        opt = opt.substr(0, 1)
+        push_rest(st, starter, look.rest)
+    }
+    if opt == "" {
+        warn(st, "Missing option after " + starter)
+    } else {
+        warn(st, "Unknown option: " + opt)
+    }
+    return in_error(blank_ctl())
+}
+
+fn flag_option(inout st: GolState, starter: str, opt: str, ctl: GolCtl, look: GolLookup) -> GolFound {
+    var result = got(opt, ctl, GolI(1))
+    if look.optarg.is_some() {
+        if st.cfg.passthrough {
+            return not_found(ctl)
+        }
+        warn(st, "Option " + opt + " does not take an argument")
+        result = in_error(ctl)
+    } else if ctl.type_ == "!" {
+        var name = opt
+        let low = name.to_lower()
+        if low.starts_with("no-") {
+            name = name.substr(3, name.len() - 3)
+        } else if low.starts_with("no") {
+            name = name.substr(2, name.len() - 2)
+        }
+        result = got(name, ctl, GolI(0))
+    }
+    push_rest(st, starter, look.rest)
+    return result
+}
+
+fn default_value(ctl: GolCtl) -> GolNum {
+    return match ctl.default_ {
+        Some(d) -> GolS(d)
+        None -> if ctl.type_ == "s" { GolS("") } else { GolI(0) }
+    }
+}
+
+fn incremented(opt: str, ctl: GolCtl) -> GolFound {
+    var c = ctl
+    c.type_ = "+"
+    return got(opt, c, GolI(1))
+}
+
+fn value_option(inout st: GolState, starter: str, opt: str, ctl: GolCtl, look: GolLookup) -> GolFound {
+    let mand = ctl.amin > 0
+    if st.cfg.gnu_compat {
+        var kind = 0
+        match look.optarg {
+            Some(a) -> kind = if a == "" { 1 } else { 2 }
+            None -> if look.rest.is_some() or st.argv.len() > 0 {
+                kind = 3
+            }
+        }
+        if kind == 0 and not mand {
+            return if ctl.type_ == "I" { incremented(opt, ctl) } else { got(opt, ctl, default_value(ctl)) }
+        }
+        if kind == 1 {
+            return got(opt, ctl, if ctl.type_ == "s" { GolS("") } else { GolI(0) })
+        }
+    }
+    let empty = match look.optarg {
+        Some(a) -> a == ""
+        None -> not (look.rest.is_some() or st.argv.len() > 0)
+    }
+    if empty {
+        if mand or ctl.dest == 2 {
+            if st.cfg.passthrough {
+                return not_found(ctl)
+            }
+            warn(st, "Option " + opt + " requires an argument")
+            return in_error(ctl)
+        }
+        return if ctl.type_ == "I" { incremented(opt, ctl) } else { got(opt, ctl, default_value(ctl)) }
+    }
+    let arg = match look.rest {
+        Some(r) -> r
+        None -> match look.optarg {
+            Some(a) -> a
+            None -> shift(st)
+        }
+    }
+    return keyed_value(st, starter, opt, ctl, look, arg)
+}
+
+/// The `key=value` split of a hash option, then the type check.
+fn keyed_value(inout st: GolState, starter: str, opt: str, ctl: GolCtl, look: GolLookup, arg0: str) -> GolFound {
+    var arg = arg0
+    var key: Option[str] = None
+    if ctl.dest == 2 {
+        match arg.index_of("=") {
+            Some(k) -> {
+                key = Some(arg.substr(0, k))
+                arg = arg.substr(k + 1, arg.len() - k - 1)
+            }
+            None -> {
+                key = Some(arg)
+                let fallback = match ctl.default_ {
+                    Some(d) -> Some(d)
+                    None -> if ctl.amin > 0 { None } else { Some(if ctl.type_ == "s" { "" } else { "1" }) }
+                }
+                match fallback {
+                    Some(f) -> arg = f
+                    None -> {
+                        warn(st, "Option " + opt + ", key \"" + arg + "\", requires a value")
+                        push_rest(st, starter, look.rest)
+                        return in_error(ctl)
+                    }
+                }
+            }
+        }
+    }
+    var found = typed_value(st, starter, opt, ctl, look, arg)
+    if found.found and found.opt.is_some() and found.key.is_none() {
+        found.key = key
+    }
+    return found
+}
+
+fn typed_value(inout st: GolState, starter: str, opt: str, ctl: GolCtl, look: GolLookup, arg: str) -> GolFound {
+    let t = ctl.type_
+    if t == "s" {
+        if ctl.amin > 0 or ctl.dest == 2 or look.optarg.is_some() or look.rest.is_some() or arg == "-" {
+            return got(opt, ctl, GolS(arg))
+        }
+        if arg == "--" or looks_like_option(st.cfg, arg) {
+            unshift(st, arg)
+            return got(opt, ctl, GolS(""))
+        }
+        return got(opt, ctl, GolS(arg))
+    }
+    if t == "f" {
+        return float_value(st, starter, opt, ctl, look, arg)
+    }
+    return int_value(st, starter, opt, ctl, look, arg)
+}
+
+fn key_prefix(ctl: GolCtl, cs: [str]) -> i64 {
+    if ctl.dest != 2 {
+        return 0
+    }
+    var i = 0
+    while i < cs.len() and cs[i] != "=" {
+        i = i + 1
+    }
+    return if i > 0 and i < cs.len() { i + 1 } else { 0 - 1 }
+}
+
+fn int_value(inout st: GolState, starter: str, opt: str, ctl: GolCtl, look: GolLookup, arg: str) -> GolFound {
+    let t = ctl.type_
+    if st.cfg.bundling != 0 {
+        match look.rest {
+            Some(r) -> {
+                let cs = r.chars()
+                let k = key_prefix(ctl, cs)
+                let e = if k < 0 { 0 - 1 } else if t == "o" { pat_xint(cs.slice(k, cs.len()), false) } else { pat_int(cs.slice(k, cs.len())) }
+                if k >= 0 and e > 0 {
+                    let text = cs.slice(k, k + e).join("")
+                    let after = cs.slice(k + e, cs.len()).join("")
+                    var found = got(opt, ctl, convert_int(st, t, text))
+                    if k > 0 {
+                        found.key = Some(cs.slice(0, k - 1).join(""))
+                    }
+                    if after != "" {
+                        unshift(st, starter + after)
+                    }
+                    return found
+                }
+            }
+            None -> {}
+        }
+    }
+    let ok = if t == "o" { full_xint(arg) } else { full_int(arg) }
+    if ok {
+        return got(opt, ctl, convert_int(st, t, arg.replace("_", "")))
+    }
+    if look.optarg.is_some() or ctl.amin > 0 {
+        if st.cfg.passthrough {
+            if look.optarg.is_none() {
+                unshift(st, match look.rest {
+                    Some(r) -> starter + r
+                    None -> arg
+                })
+            }
+            return not_found(ctl)
+        }
+        warn(st, "Value \"" + arg + "\" invalid for option " + opt + " (" + (if t == "o" { "extended " } else { "" }) + "number expected)")
+        push_rest(st, starter, look.rest)
+        return in_error(ctl)
+    }
+    unshift(st, match look.rest {
+        Some(r) -> starter + r
+        None -> arg
+    })
+    if t == "I" {
+        return incremented(opt, ctl)
+    }
+    return got(opt, ctl, match ctl.default_ {
+        Some(d) -> GolS(d)
+        None -> GolI(0)
+    })
+}
+
+fn float_value(inout st: GolState, starter: str, opt: str, ctl: GolCtl, look: GolLookup, arg: str) -> GolFound {
+    if st.cfg.bundling != 0 {
+        match look.rest {
+            Some(r) -> {
+                let cs = r.chars()
+                let k = key_prefix(ctl, cs)
+                let e = if k < 0 { 0 - 1 } else { pat_float(cs.slice(k, cs.len())) }
+                if k >= 0 and e >= 0 {
+                    var found = got(opt, ctl, GolS(cs.slice(k, k + e).join("")))
+                    if k > 0 {
+                        found.key = Some(cs.slice(0, k - 1).join(""))
+                    }
+                    let after = cs.slice(k + e, cs.len()).join("")
+                    if after != "" {
+                        unshift(st, starter + after)
+                    }
+                    return found
+                }
+            }
+            None -> {}
+        }
+    }
+    if full_float(arg) {
+        return got(opt, ctl, GolS(arg.replace("_", "")))
+    }
+    if look.optarg.is_some() or ctl.amin > 0 {
+        if st.cfg.passthrough {
+            if look.optarg.is_none() {
+                unshift(st, match look.rest {
+                    Some(r) -> starter + r
+                    None -> arg
+                })
+            }
+            return not_found(ctl)
+        }
+        warn(st, "Value \"" + arg + "\" invalid for option " + opt + " (real number expected)")
+        push_rest(st, starter, look.rest)
+        return in_error(ctl)
+    }
+    unshift(st, match look.rest {
+        Some(r) -> starter + r
+        None -> arg
+    })
+    return got(opt, ctl, GolS("0"))
+}
+
+// --- GetOptionsFromArray ------------------------------------------------------------------------------
+
+fn store(inout st: GolState, ctl: GolCtl, arg: GolNum, key: Option[str]) -> () ! GolError {
+    let name = ctl.cname
+    let slot = st.hash.get(name) ?? GolNone
+    if ctl.dest == 1 {
+        let items = match slot {
+            GolArr(xs) -> xs
+            GolNone -> []
+            _ -> fail(GolRefused("two options share the name " + name + " with different destinations"))
+        }
+        var more = items
+        more.push(arg)
+        st.hash.set(name, GolArr(more))
+        return ()
+    }
+    if ctl.dest == 2 {
+        var pairs = match slot {
+            GolMap(m) -> m
+            GolNone -> map()
+            _ -> fail(GolRefused("two options share the name " + name + " with different destinations"))
+        }
+        if key.is_none() {
+            // A value with no key: Perl stores it under "" and says so.
+            st.warnings.push("Use of uninitialized value $key in " + (if pairs.len() == 0 and slot == GolNone { "anonymous hash (\{})" } else { "hash element" }))
+        }
+        pairs.set(key ?? "", arg)
+        st.hash.set(name, GolMap(pairs))
+        return ()
+    }
+    let old = match slot {
+        GolVal(n) -> Some(n)
+        GolNone -> None
+        _ -> fail(GolRefused("two options share the name " + name + " with different destinations"))
+    }
+    if ctl.type_ == "+" {
+        match old {
+            Some(n) -> st.hash.set(name, GolVal(add_one(st, n)))
+            None -> st.hash.set(name, GolVal(arg))
+        }
+        return ()
+    }
+    st.hash.set(name, GolVal(arg))
+    return ()
+}
+
+/// Another value for an option that takes several: converted, and split
+/// into key and value for a hash (where a value with no key ends it).
+fn next_value(inout st: GolState, ctl: GolCtl) -> (Option[GolNum], Option[str]) {
+    let raw = shift(st)
+    var arg = GolS(raw)
+    let t = ctl.type_
+    if t == "i" or t == "I" or t == "o" {
+        arg = convert_int(st, t, raw.replace("_", ""))
+    }
+    if ctl.dest != 2 {
+        return (Some(arg), None)
+    }
+    let text = num_text(arg)
+    let k = text.index_of("=") ?? 0
+    if k == 0 {
+        return (None, None)
+    }
+    return (Some(GolS(line_of(text.substr(k + 1, text.len() - k - 1)))), Some(text.substr(0, k)))
+}
+
+/// The values of one option found on the command line.
+fn take_values(inout st: GolState, f: GolFound) -> () ! GolError {
+    let ctl = f.ctl
+    var arg = f.arg
+    var key = f.key
+    var count = 0
+    while arg.is_some() {
+        try store(st, ctl, arg ?? GolI(0), key)
+        count = count + 1
+        if count >= ctl.amax and ctl.amax != 0 - 1 {
+            return ()
+        }
+        arg = None
+        if count < ctl.amin {
+            if st.argv.len() > 0 {
+                if valid_value(st.cfg, ctl, st.argv[0], true) {
+                    let v = next_value(st, ctl)
+                    arg = v.0
+                    key = v.1
+                    continue
+                }
+                warn(st, "Value \"" + st.argv[0] + "\" invalid for option " + ctl.cname)
+            } else {
+                warn(st, "Insufficient arguments for option " + ctl.cname)
+            }
+        }
+        if st.argv.len() > 0 and valid_value(st.cfg, ctl, st.argv[0], false) {
+            let v = next_value(st, ctl)
+            arg = v.0
+            key = v.1
+        }
+    }
+    return ()
+}
+
+fn read_specs(inout st: GolState, specs0: [str]) -> () ! GolError {
+    var specs = specs0
+    if specs.len() > 0 and all_non_word(specs[0]) {
+        st.cfg.prefix = specs[0].chars()
+        st.cfg.prefix_class = true
+        specs = specs.slice(1, specs.len())
+    }
+    var errors = ""
+    for spec in specs {
+        let opt = strip_prefixes(st.cfg, spec)
+        if opt == "<>" {
+            errors = errors + "Option spec <> requires a reference to a subroutine\n"
+        } else {
+            errors = errors + parse_option_spec(st, opt)
+        }
+    }
+    if errors != "" {
+        fail(GolDied(errors))
+    }
+    return ()
+}
+
+fn slot_value(s: GolSlot) -> GolValue {
+    return match s {
+        GolVal(n) -> GolScalar(num_text(n))
+        GolArr(xs) -> GolList(xs.map(|x| num_text(x)))
+        GolMap(m) -> GolHash(m.entries().map(|kv| (kv.0, num_text(kv.1))))
+        GolNone -> GolScalar("")
+    }
+}
+
+/// `Configure("default", config...)` and then
+/// `GetOptionsFromArray(\@args, \%h, specs...)`.
+pub fn get_options(args: [str], specs: [str], config: [str]) -> GolResult ! GolError {
+    var cfg = default_cfg()
+    for c in config {
+        cfg = try configure_one(cfg, c)
+    }
+    var st = GolState{ cfg: cfg, opctl: map(), hash: map(), argv: args, warnings: [], errors: 0 }
+    try read_specs(st, specs)
+    var ret: [str] = []
+    var stopped = false
+    while not stopped and st.argv.len() > 0 {
+        let word = shift(st)
+        if word == "--" {
+            if st.cfg.passthrough {
+                ret.push(word)
+            }
+            stopped = true
+        } else {
+            let f = find_option(st, word)
+            if f.found {
+                if f.opt.is_some() {
+                    try take_values(st, f)
+                }
+            } else if st.cfg.order == 1 {
+                ret.push(word)
+            } else {
+                unshift(st, word)
+                return finish(st, [])
+            }
+        }
+    }
+    return finish(st, if st.cfg.order == 1 or st.cfg.passthrough { ret } else { [] })
+}
+
+fn finish(st: GolState, ret: [str]) -> GolResult {
+    let values = st.hash.entries().map(|kv| (kv.0, slot_value(kv.1)))
+    return GolResult{ ok: st.errors == 0, values: values, rest: ret + st.argv, warnings: st.warnings }
+}

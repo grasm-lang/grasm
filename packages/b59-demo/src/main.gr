@@ -1,0 +1,192 @@
+// B59's libraries, each run once on an input whose answer came from the
+// runtime it is held to (Ruby 2.6 and Node 25). scripts/b59_diff.sh holds
+// them to those runtimes on thousands more.
+import bigint
+import jsdate
+import nodelegacyurl
+import jsstringmethods
+import rubyabbrev
+import rubyformat
+import rubyinteger
+import rubyjson
+import rubystrftime
+import rubyuri
+
+fn abbrev() {
+    let t = rubyabbrev.abbrev(["car", "cart", "cone"], None)
+    assert_eq(t.map(|kv| kv.0 + ">" + kv.1).join(" "), "cart>cart cone>cone con>cone co>cone car>car")
+    let p = rubyabbrev.abbrev(["ruby", "rules"], Some("rul"))
+    assert_eq(p.map(|kv| kv.0 + ">" + kv.1).join(" "), "rules>rules rule>rules rul>rules")
+    print("rubyabbrev: Ruby's Abbrev.abbrev")
+}
+
+fn int_ok(r: BigInt ! RbIntegerError) -> str {
+    return match r {
+        Ok(n) -> bigint.to_str(n)
+        Err(e) -> rubyinteger.error_message(e)
+    }
+}
+
+fn b(n: i64) -> BigInt {
+    return bigint.from_i64(n)
+}
+
+fn integer() {
+    assert_eq(int_ok(rubyinteger.round(b(25), 0 - 1, Some("even"))), "20")
+    let big = bigint.parse("100000000000000000000") ?? bigint.zero()
+    assert_eq(int_ok(rubyinteger.ceil(big, 0 - 1)), "100000000000000000010")
+    assert_eq(int_ok(rubyinteger.pow_mod(b(2), b(10), b(0 - 1000))), "-976")
+    assert_eq(int_ok(rubyinteger.isqrt(b(6399999999999999))), "80000000")
+    let ds = rubyinteger.digits(b(1234), b(100)) ?? []
+    assert_eq(ds.map(|d| bigint.to_str(d)).join(","), "34,12")
+    assert_eq(rubyinteger.bit_at(b(0 - 5), b(100)), 1)
+    assert_eq(rubyinteger.to_s(b(0 - 255), 16) ?? "", "-ff")
+    print("rubyinteger: Ruby's Integer")
+}
+
+fn u(t: str) -> [i64] {
+    return jsstringmethods.units(t)
+}
+
+fn js_strings() {
+    let parts = jsstringmethods.split(u("a,b,,c"), Some(u(",")), Some(0.0 - 1.0))
+    assert_eq(parts.map(|p| jsstringmethods.text(p)).join("|"), "a|b||c")
+    assert_eq(jsstringmethods.at(u("😀x"), Some(0.0)) ?? 0, 55357)
+    assert_eq(jsstringmethods.text(jsstringmethods.pad_start(u("abc"), Some(6.0), Some(u("12"))) ?? []), "121abc")
+    assert_eq(jsstringmethods.text(jsstringmethods.trim(u("  x\u{3000}"))), "x")
+    assert_eq(jsstringmethods.text(jsstringmethods.substr(u("abc"), Some(0.0 - 2.0), Some(1.0))), "b")
+    assert_eq(jsstringmethods.text(jsstringmethods.replace_all(u("aaa"), [], u("-"))), "-a-a-a-")
+    assert_eq(jsstringmethods.text(jsstringmethods.replace(u("abc"), u("b"), u("[$`$$]"))), "a[a$]c")
+    let msg = match jsstringmethods.repeat(u("ab"), Some(0.0 - 1.5)) {
+        Ok(_r) -> ""
+        Err(e) -> jsstringmethods.error_text(e)
+    }
+    assert_eq(msg, "Invalid count value: -1.5")
+    print("jsstringmethods: JavaScript's String.prototype")
+}
+
+fn strftime() {
+    let at = |f| rubystrftime.strftime(1700000000, 123456789, f) ?? "?"
+    assert_eq(at("%Y-%m-%dT%H:%M:%S.%3N%:z"), "2023-11-14T22:13:20.123+00:00")
+    assert_eq(at("%-d %^b %y, %l:%M %P"), "14 NOV 23, 10:13 pm")
+    assert_eq(at("%10-d"), "%10-d")
+    assert_eq(at("%G-W%V-%u"), "2023-W46-2")
+    assert_eq(rubystrftime.strftime(0 - 62198755197, 0, "%Y %C %y") ?? "?", "-0001 -1 99")
+    let msg = match rubystrftime.strftime(0, 0, "abc%") {
+        Ok(_t) -> ""
+        Err(e) -> rubystrftime.error_text(e)
+    }
+    assert_eq(msg, "invalid format: abc%")
+    print("rubystrftime: Ruby's Time#strftime")
+}
+
+fn fmt(f: str, args: [RbFmtArg]) -> str {
+    return match rubyformat.format(f, args) {
+        Ok(t) -> t
+        Err(e) -> rubyformat.error_message(e)
+    }
+}
+
+fn format() {
+    let pi = RbFmtFloat(3.14159)
+    assert_eq(fmt("%08.3f|%-6x|%+.2e|%#o", [pi, RbFmtInt(b(0 - 255)), RbFmtFloat(12345.678), RbFmtInt(b(8))]), "0003.142|..f01 |+1.23e+04|010")
+    assert_eq(fmt("%.1f", [RbFmtFloat(99999.95)]), "100000.0")
+    assert_eq(fmt("%<n>05d %\{s}", [RbFmtHash(["n", "s"], [RbFmtInt(b(42)), RbFmtStr("x")])]), "00042 x")
+    assert_eq(fmt("%a", [RbFmtFloat(0.1)]), "0x1.999999999999ap-4")
+    assert_eq(fmt("%d %d", [RbFmtInt(b(1))]), "too few arguments")
+    print("rubyformat: Ruby's Kernel#format")
+}
+
+fn js(t: str) -> RbJsonValue {
+    return RbJsonString(t.to_bytes())
+}
+
+fn json_text(r: bytes ! RbJsonError) -> str {
+    return match r {
+        Ok(b) -> b.to_str()
+        Err(e) -> rubyjson.error_message(e).to_str()
+    }
+}
+
+fn json() {
+    let v = RbJsonObject(["a".to_bytes()], [RbJsonArray([RbJsonInt(b(1)), RbJsonFloat(2.5), RbJsonNull, js("x\n")])])
+    assert_eq(json_text(rubyjson.generate(v)), "\{\"a\":[1,2.5,null,\"x\\n\"]}")
+    let empty = RbJsonObject(["a".to_bytes(), "b".to_bytes()], [RbJsonArray([]), RbJsonObject([], [])])
+    assert_eq(json_text(rubyjson.pretty_generate(empty)), "\{\n  \"a\": [\n\n  ],\n  \"b\": \{\n  }\n}")
+    let bad = match rubyjson.parse("\{\"a\":1,}".to_bytes()) {
+        Ok(_v) -> ""
+        Err(e) -> rubyjson.error_message(e).to_str()
+    }
+    assert_eq(bad, "767: unexpected token at '\{\"a\":1,}'")
+    let parsed = rubyjson.parse("[\"\\ud800xyz\\u0041\", 1e400]".to_bytes()) ?? RbJsonNull
+    assert_eq(json_text(rubyjson.generate(match parsed {
+        RbJsonArray(items) -> items[0]
+        _ -> RbJsonNull
+    })), "\"?yzA\"")
+    print("rubyjson: Ruby's JSON")
+}
+
+fn dates() {
+    let p = |t| jsdate.parse(jsdate.units(t))
+    assert_eq(p("Jan 15"), 979516800000.0)
+    assert_eq(p("Tue, 14 Nov 2023 22:13:20 GMT"), 1700000000000.0)
+    assert_eq(p("2023-11-14T22:13:20.5+05:30"), 1699980200500.0)
+    assert(p("2023-02-30T25:00") != p("2023-02-30T25:00"))
+    assert_eq(jsdate.utc([99.0, 11.0, 31.0]), 946598400000.0)
+    assert_eq(jsdate.to_utc_string(0.0 - 62198755200000.0), "Fri, 01 Jan -0001 00:00:00 GMT")
+    assert_eq(jsdate.to_iso_string(8640000000000000.0) ?? "", "+275760-09-13T00:00:00.000Z")
+    let bad = match jsdate.to_iso_string(jsdate.time_clip(8640000000000001.0)) {
+        Ok(_s) -> ""
+        Err(e) -> jsdate.error_text(e)
+    }
+    assert_eq(bad, "Invalid time value")
+    print("jsdate: JavaScript's Date")
+}
+
+fn nu(t: str) -> [i64] {
+    return nodelegacyurl.units(t)
+}
+
+fn legacy_url() {
+    let parsed = nodelegacyurl.parse(nu("HTTP://User@Ex.COM:8080/a b?x=1#h"), false, false) ?? nodelegacyurl.parse([], false, false) ?? panic("unreachable")
+    assert_eq(jsstringmethods.text(parsed.href), "http://User@ex.com:8080/a%20b?x=1#h")
+    assert_eq(jsstringmethods.text(parsed.hostname ?? []), "ex.com")
+    assert_eq(jsstringmethods.text(nodelegacyurl.resolve(nu("http://a/b/c/d;p?q"), nu("../g")) ?? []), "http://a/b/g")
+    assert_eq(jsstringmethods.text(nodelegacyurl.resolve(nu("mailto:local1@domain1"), nu("local2@domain2")) ?? []), "mailto:local2@domain2")
+    let quirk = nodelegacyurl.parse(nu("HTTP:foo/bar"), false, false) ?? parsed
+    assert_eq(jsstringmethods.text(quirk.host ?? []), "foo")
+    let msg = match nodelegacyurl.parse(nu("http://a:b:c/"), false, false) {
+        Ok(_u) -> ""
+        Err(e) -> jsstringmethods.text(nodelegacyurl.error_message(e))
+    }
+    assert_eq(msg, "The argument 'url' http://a:b:c/. Received 'Invalid port in url'")
+    print("nodelegacyurl: Node's url.parse, url.format and url.resolve")
+}
+
+fn uri() {
+    let u = rubyuri.parse("http://user:pw@Example.COM:80/a/b?x y#f") ?? rubyuri.parse("") ?? panic("unreachable")
+    assert_eq(rubyuri.to_s(u), "http://user:pw@Example.COM/a/b?x%20y#f")
+    assert_eq(u.port ?? "", "80")
+    assert_eq((rubyuri.parse("//[::1") ?? u).host ?? "", "[::1")
+    assert_eq(rubyuri.to_s(rubyuri.join("http://a/b/c/d;p?q", ["../g", "?y"]) ?? u), "http://a/b/g?y")
+    assert_eq(rubyuri.encode_www_form([("a b", RbWwwOne("é")), ("c", RbWwwNil)]), "a+b=%C3%A9&c")
+    assert_eq((rubyuri.decode_www_form("a=1&&b") ?? []).map(|kv| kv.0 + ":" + kv.1).join(","), "a:1,:,b:")
+    let bad = match rubyuri.parse("http://[::1:2:3:4:5:6]/") {
+        Ok(_u) -> ""
+        Err(e) -> rubyuri.error_message(e)
+    }
+    assert_eq(bad, "bad URI(is not URI?): \"http://[::1:2:3:4:5:6]/\"")
+    print("rubyuri: Ruby's URI")
+}
+
+fn main() / {io} {
+    abbrev()
+    integer()
+    js_strings()
+    strftime()
+    format()
+    json()
+    dates()
+    legacy_url()
+    uri()
+}
