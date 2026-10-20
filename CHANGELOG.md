@@ -17,6 +17,9 @@ migration note here; anything `experimental` may change in any release. See
   names. Both now follow a fixed order, and the new gate `reprotest` builds
   a quarter of the corpus twice and requires identical bytes. Releases up to
   and including 1.1.0 were built without this.
+- **`walkdir-demo` walked the whole checkout when given no argument**, so
+  the interpreter and the compiled program counted different trees whenever
+  a build ran beside them. It walks a fixed directory now.
 
 ### Added
 

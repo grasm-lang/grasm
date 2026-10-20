@@ -4,7 +4,11 @@ import walkdir
 
 fn main() -> () ! WalkError / {io} {
     let a = args()
-    let root = a.get(0) ?? "."
+    // Without an argument -- the way difftest runs every corpus program --
+    // a fixed tree, not the working directory: `.` was the whole checkout,
+    // 38,000 files that changed while a build ran beside the two engines,
+    // so the interpreter and the compiled program counted different trees.
+    let root = a.get(0) ?? "packages/walkdir"
     let limit = (a.get(1) ?? "16").parse_int() ?? 16
     let w = try walkdir.walk(root, limit)
     print("files {w.files.len()}")
