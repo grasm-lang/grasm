@@ -219,10 +219,13 @@ chmod +x grasm-aarch64-apple-darwin && mv grasm-aarch64-apple-darwin grasm
 ./grasm run hello.gr
 ```
 
-**One binary, eighteen subcommands, nothing to install beside it** — no runtime,
-no package manager to bootstrap. Intel Macs take `grasm-x86_64-apple-darwin`;
-checksums are in `SHA256SUMS` beside them.
-[All downloads →](https://github.com/grasm-lang/grasm/releases/latest)
+**One binary, seventeen subcommands.** On its own it checks, formats,
+lints, tests and runs programs. Compiling to a native executable
+(`grasm build --native`) also needs the runtime library `libgrasm_rt_abi.a`
+beside it and a C toolchain's `cc` to link with, and the v1.0.0 downloads do
+not carry the library: for native builds, build from source for now. Intel
+Macs take `grasm-x86_64-apple-darwin`; checksums are in `SHA256SUMS` beside
+them. [All downloads →](https://github.com/grasm-lang/grasm/releases/latest)
 
 Building from source needs a Rust toolchain to bootstrap the compiler, the way
 every language starts — [`docs/overview.md`](docs/overview.md) has it, and
