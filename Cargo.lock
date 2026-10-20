@@ -204,7 +204,7 @@ dependencies = [
 
 [[package]]
 name = "grasm"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "grasm_dap",
  "grasm_interp",
@@ -218,7 +218,7 @@ dependencies = [
 
 [[package]]
 name = "grasm_dap"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "grasm_interp",
  "grasm_journal",
@@ -228,14 +228,14 @@ dependencies = [
 
 [[package]]
 name = "grasm_fiber"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "grasm_sys",
 ]
 
 [[package]]
 name = "grasm_interp"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "grasm_fiber",
  "grasm_journal",
@@ -245,14 +245,14 @@ dependencies = [
 
 [[package]]
 name = "grasm_journal"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "grasm_sys",
 ]
 
 [[package]]
 name = "grasm_lsp"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "grasm_sema",
  "grasm_syntax",
@@ -260,7 +260,7 @@ dependencies = [
 
 [[package]]
 name = "grasm_native"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "cranelift-codegen",
  "cranelift-frontend",
@@ -274,7 +274,7 @@ dependencies = [
 
 [[package]]
 name = "grasm_pkg"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "grasm_interp",
  "grasm_sema",
@@ -283,7 +283,7 @@ dependencies = [
 
 [[package]]
 name = "grasm_rt"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "grasm_fiber",
  "grasm_journal",
@@ -293,7 +293,7 @@ dependencies = [
 
 [[package]]
 name = "grasm_rt_abi"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "grasm_rt",
  "grasm_sys",
@@ -301,14 +301,14 @@ dependencies = [
 
 [[package]]
 name = "grasm_sema"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "grasm_syntax",
 ]
 
 [[package]]
 name = "grasm_spec"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "grasm_interp",
  "grasm_sema",
@@ -317,11 +317,11 @@ dependencies = [
 
 [[package]]
 name = "grasm_syntax"
-version = "1.0.0"
+version = "1.1.0"
 
 [[package]]
 name = "grasm_sys"
-version = "1.0.0"
+version = "1.1.0"
 
 [[package]]
 name = "grasm_wasm"
