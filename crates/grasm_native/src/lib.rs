@@ -7099,7 +7099,11 @@ impl FnCx<'_, '_> {
     /// Call only on non-terminated paths.
     fn pop_scope_with_decs(&mut self) {
         let scope = self.vars.pop().unwrap();
-        for (_, (var, vt)) in scope {
+        // Released in declaration order rather than the map's hash order, so
+        // the same program compiles to the same bytes every time.
+        let mut scope: Vec<(Variable, VType)> = scope.into_values().collect();
+        scope.sort_by_key(|(v, _)| v.as_u32());
+        for (var, vt) in scope {
             if self.moved.remove(&var.as_u32()) {
                 continue;
             }
@@ -7139,12 +7143,13 @@ impl FnCx<'_, '_> {
     /// released here. The scopes are not popped — the code after this is
     /// unreachable, and the enclosing lowering still owns the bookkeeping.
     fn emit_decs_above(&mut self, depth: usize) {
-        let live: Vec<(Variable, VType)> = self
+        let mut live: Vec<(Variable, VType)> = self
             .vars
             .iter()
             .skip(depth)
             .flat_map(|sc| sc.values().cloned())
             .collect();
+        live.sort_by_key(|(v, _)| v.as_u32());
         for (var, vt) in live {
             if let VType::Val(s) = &vt {
                 if !self.borrowed_vars.contains(&var.as_u32()) {
@@ -7166,12 +7171,13 @@ impl FnCx<'_, '_> {
     /// releases only what the closure bound, because the loop around it still
     /// owns the list it is walking and the one it is building.
     fn emit_scope_decs_below(&mut self, depth: usize) {
-        let deeper: Vec<(Variable, VType)> = self
+        let mut deeper: Vec<(Variable, VType)> = self
             .vars
             .iter()
             .skip(depth)
             .flat_map(|s| s.values().cloned())
             .collect();
+        deeper.sort_by_key(|(v, _)| v.as_u32());
         let inout_vars: Vec<Variable> = self.inout_slots.iter().map(|(_, v, _)| *v).collect();
         for (var, vt) in deeper {
             if inout_vars.contains(&var) {
@@ -7242,8 +7248,12 @@ impl FnCx<'_, '_> {
             }
         }
         self.handler_arg_held = held;
-        let all: Vec<(Variable, VType)> =
+        // In declaration order, not the scope maps' hash order: the releases
+        // are emitted in this order, and the same program has to compile to
+        // the same bytes every time.
+        let mut all: Vec<(Variable, VType)> =
             self.vars.iter().flat_map(|s| s.values().cloned()).collect();
+        all.sort_by_key(|(v, _)| v.as_u32());
         let inout_vars: Vec<Variable> = self.inout_slots.iter().map(|(_, v, _)| *v).collect();
         for (var, vt) in all {
             if inout_vars.contains(&var) {
@@ -7952,8 +7962,12 @@ impl FnCx<'_, '_> {
     }
 
     fn close_loop_appends(&mut self) {
+        // Closed in a fixed order (by the variable each append writes to),
+        // not the map's hash order, so the code comes out the same every time.
         if let Some(open) = self.str_appends.pop() {
-            for state in open.values() {
+            let mut open: Vec<_> = open.into_values().collect();
+            open.sort_by_key(|state| state.str_var.as_u32());
+            for state in &open {
                 let held = self.b.use_var(state.str_var);
                 let written = self.b.use_var(state.len_var);
                 self.call_rt("grasm_str_pin_end", &[held, written]);
@@ -7962,7 +7976,9 @@ impl FnCx<'_, '_> {
         let Some(open) = self.appends.pop() else {
             return;
         };
-        for state in open.values() {
+        let mut open: Vec<_> = open.into_values().collect();
+        open.sort_by_key(|state| state.list_var.as_u32());
+        for state in &open {
             let held = self.b.use_var(state.list_var);
             let written = self.b.use_var(state.len_var);
             self.call_rt("grasm_list_append_end", &[held, written]);

@@ -778,70 +778,53 @@ fn collect_packages(
     out: &mut HashMap<String, std::path::PathBuf>,
     depth: usize,
 ) -> bool {
-    let mut expanded = std::collections::HashSet::new();
+    // A package's sub-tree is expanded once, the first time it is reached:
+    // a graph has exponentially many paths, and twenty ordinary packages with
+    // three dependencies each took over a minute when every path was walked.
+    // Its dependencies are then recorded under the prefix it was reached by,
+    // and the shortest prefix of a package becomes its name -- so it has to be
+    // reached first by that one. The walk used to go depth first over a
+    // `HashMap`, so in a diamond (`sqlparse` under `sqlitelike.sqlitefile`
+    // and under `sqlitelike.sqliteprintf.sqlitefile`) which path came first
+    // was the hash seed's choice, and the same program got different module
+    // names -- and different symbol names in its binary -- from one build to
+    // the next. Best first by (length, prefix) reaches every package by its
+    // shortest prefix first, and in the same order every time.
+    let mut expanded: HashSet<std::path::PathBuf> = HashSet::new();
     let mut truncated = false;
-    collect_packages_in(
-        prefix,
-        dir,
-        resolved,
-        out,
-        depth,
-        &mut expanded,
-        &mut truncated,
-    );
-    truncated
-}
-
-fn collect_packages_in(
-    prefix: &str,
-    dir: &std::path::Path,
-    resolved: &HashMap<String, std::path::PathBuf>,
-    out: &mut HashMap<String, std::path::PathBuf>,
-    depth: usize,
-    expanded: &mut std::collections::HashSet<std::path::PathBuf>,
-    truncated: &mut bool,
-) {
-    if depth > MAX_PACKAGE_DEPTH {
-        *truncated = true;
-        return;
-    }
-    if out.contains_key(prefix) {
-        return;
-    }
-    out.insert(prefix.to_string(), dir.to_path_buf());
-    // One key per *path* through the graph, and a graph has exponentially
-    // many of those: twenty ordinary packages with three dependencies each
-    // took over a minute, ×3.3 for every two added. A package reached a
-    // second time under a longer prefix has the same dependencies, and every
-    // prefix that walk would add loses to the shorter one already recorded —
-    // so the sub-tree is expanded once.
-    let key = real_dir(dir);
-    if !expanded.insert(key) {
-        return;
-    }
-    let src_dir = package_entry(dir)
-        .parent()
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| dir.to_path_buf());
-    let mut subs = package_dependencies(&src_dir);
-    // A registry dependency has no path in the manifest; the toolchain
-    // resolved the graph and passed the directories down.
-    for name in dependency_names(&src_dir) {
-        if let (false, Some(dir)) = (subs.contains_key(&name), resolved.get(&name)) {
-            subs.insert(name, dir.clone());
+    let mut queue: std::collections::BTreeSet<(usize, String, std::path::PathBuf, usize)> =
+        std::collections::BTreeSet::new();
+    queue.insert((prefix.len(), prefix.to_string(), dir.to_path_buf(), depth));
+    while let Some((_, prefix, dir, depth)) = queue.pop_first() {
+        if depth > MAX_PACKAGE_DEPTH {
+            truncated = true;
+            continue;
+        }
+        if out.contains_key(&prefix) {
+            continue;
+        }
+        out.insert(prefix.clone(), dir.clone());
+        if !expanded.insert(real_dir(&dir)) {
+            continue;
+        }
+        let src_dir = package_entry(&dir)
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| dir.clone());
+        let mut subs = package_dependencies(&src_dir);
+        // A registry dependency has no path in the manifest; the toolchain
+        // resolved the graph and passed the directories down.
+        for name in dependency_names(&src_dir) {
+            if let (false, Some(d)) = (subs.contains_key(&name), resolved.get(&name)) {
+                subs.insert(name, d.clone());
+            }
+        }
+        for (name, sub) in subs {
+            let child = format!("{prefix}.{name}");
+            queue.insert((child.len(), child, sub, depth + 1));
         }
     }
-    for (name, sub) in subs {
-        collect_packages_in(
-            &format!("{prefix}.{name}"),
-            &sub,
-            resolved,
-            out,
-            depth + 1,
-            expanded,
-            truncated,
-        );
-    }
+    truncated
 }
 
 /// A module path *inside* a package, following that package's own

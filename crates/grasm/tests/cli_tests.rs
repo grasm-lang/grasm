@@ -2189,6 +2189,58 @@ fn an_import_used_only_for_its_types_is_not_unused() {
     assert_eq!(code, 0, "the program must check as written:\n{out}");
 }
 
+/// A package reached by two paths gets the same module name every time.
+///
+/// `parse` is reachable as `lib.file.parse` and as `lib.printf.file.parse`.
+/// The loader expands each package's dependencies once, under the prefix it
+/// first reaches it by, and names it by its shortest prefix -- but it walked
+/// depth first over a `HashMap`, so which path came first was the hash seed's
+/// choice and the same program got different module names (and different
+/// symbol names in its binary) from one run to the next. Each run here is a
+/// new process with new hash keys.
+#[test]
+fn a_package_reached_two_ways_gets_one_name_every_time() {
+    let work = Work::new("diamond");
+    let manifest = |name: &str, deps: &[&str]| {
+        let mut m = format!("[package]\nname = \"{name}\"\nversion = \"1.0.0\"\ncapabilities = []\n");
+        for d in deps {
+            m.push_str(&format!("\n[dependencies.{d}]\npath = \"../{d}\"\n"));
+        }
+        m
+    };
+    work.package("parse", &manifest("parse", &[]), "pub fn p() -> i64 {\n    1\n}\n");
+    work.package(
+        "file",
+        &manifest("file", &["parse"]),
+        "import parse\n\npub fn f() -> i64 {\n    parse.p() + 1\n}\n",
+    );
+    work.package(
+        "printf",
+        &manifest("printf", &["file"]),
+        "import file\n\npub fn g() -> i64 {\n    file.f() + 1\n}\n",
+    );
+    work.package(
+        "lib",
+        &manifest("lib", &["file", "printf"]),
+        "import file\nimport printf\n\npub fn h() -> i64 {\n    file.f() + printf.g()\n}\n",
+    );
+    let app = work.package(
+        "app",
+        &manifest("app", &["lib"]).replace("capabilities = []", "capabilities = [\"io\"]"),
+        "import lib\n\nfn main() {\n    print(lib.h().to_str())\n}\n",
+    );
+    let src = app_entry(&app);
+    for _ in 0..12 {
+        let (code, out) = run(&["tir", &src]);
+        assert_eq!(code, 0, "tir failed:\n{out}");
+        assert!(
+            out.contains("(file \"lib.file.parse\"") && !out.contains("lib.printf.file.parse"),
+            "`parse` was not named by its shortest path:\n{}",
+            out.lines().filter(|l| l.starts_with("(file")).collect::<Vec<_>>().join("\n")
+        );
+    }
+}
+
 /// Writing into a `bytes` ([L-LIB-BYTES-WRITE]), and the value semantics that
 /// make it safe to.
 ///

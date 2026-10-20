@@ -5,6 +5,25 @@ before 2.0. Anything marked `provisional` may change in a minor release with a
 migration note here; anything `experimental` may change in any release. See
 `docs/stability.md`.
 
+## Unreleased — since 1.1.0
+
+### Fixed
+
+- **Native builds were not reproducible.** The same program compiled to a
+  different executable from one build to the next -- 120 of 156 sampled
+  corpus programs. The backend released a scope's variables in the scope
+  map's hash order, and the loader named a package reached by two paths
+  after whichever path a hash map walked first, which also changed symbol
+  names. Both now follow a fixed order, and the new gate `reprotest` builds
+  a quarter of the corpus twice and requires identical bytes. Releases up to
+  and including 1.1.0 were built without this.
+
+### Added
+
+- **TIR** (`docs/tir.md`): `grasm tir` prints a checked program with every
+  decision the checker made written down, the first stage of the
+  self-hosting plan. The `tirtest` gate holds the whole corpus to it.
+
 ## 1.1.0 — 2026-10-20
 
 ### Added
