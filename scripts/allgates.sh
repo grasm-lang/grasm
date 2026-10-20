@@ -46,6 +46,9 @@ matches() {
 
 LOGS=${LOGS:-$(mktemp -d)}
 mkdir -p "$LOGS"
+# What git did not track before the run, so the `litter` gate can tell what
+# the run itself left behind.
+git ls-files --others --exclude-standard | sort > "$LOGS/untracked-before.txt"
 failed=0
 ran=0
 skipped=0
@@ -288,6 +291,24 @@ with open("site/facts.json", "w") as f:
 print("   ".join(f"{k}: {v}" for k, v in sorted(out.items()) if k != "taken"))
 FACTS
 }
+
+# A gate that writes into the checkout. `pngwrite-demo` and `tiffwrite-demo`
+# wrote 31 images into the repository root whenever a gate ran them with no
+# arguments, and a commit that staged everything published them. A file
+# created by hand while the suite runs shows up here too; that is a false
+# alarm worth reading rather than a reason to look less.
+litter() {
+    git ls-files --others --exclude-standard | sort > "$LOGS/untracked-after.txt"
+    local new
+    new=$(comm -13 "$LOGS/untracked-before.txt" "$LOGS/untracked-after.txt")
+    if [ -n "$new" ]; then
+        echo "files that appeared in the checkout during this run:"
+        echo "$new" | sed 's/^/  /'
+        return 1
+    fi
+    echo "new untracked files: 0"
+}
+run_gate litter litter
 
 if [ "$failed" -eq 0 ]; then
     run_gate sitefacts site_facts

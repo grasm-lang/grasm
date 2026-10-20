@@ -98,7 +98,12 @@ fn write_one(path: str, w: i64, h: i64, kind: str) -> () ! PngError / {io} {
 
 fn main() -> () ! PngError / {io} {
     let a = args()
-    let dir = a.get(0) ?? "."
+    // With no argument the files go under `target/`, which git ignores. The
+    // default used to be `.`, and the gates that run every demo with no
+    // arguments run from the repository root -- so this wrote its images
+    // there, and a commit that staged everything swept them in.
+    let dir = a.get(0) ?? "target/demo-out/pngwrite"
+    make_dir(dir) ?? ()
     try write_one("{dir}/flat.png", 64, 64, "flat")
     try write_one("{dir}/gradient.png", 64, 48, "gradient")
     try write_one("{dir}/noise.png", 48, 48, "noise")

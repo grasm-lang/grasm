@@ -20,6 +20,13 @@ migration note here; anything `experimental` may change in any release. See
 - **`walkdir-demo` walked the whole checkout when given no argument**, so
   the interpreter and the compiled program counted different trees whenever
   a build ran beside them. It walks a fixed directory now.
+- **Two demos wrote 31 images into the repository root**, and a commit that
+  staged everything published them, together with an unreferenced
+  screenshot from the WebAssembly work. `pngwrite-demo` and `tiffwrite-demo`
+  defaulted their output directory to `.`, and the gates that run every demo
+  with no arguments run from the root. They write under `target/` now, the
+  files are deleted, and the new gate `litter` fails a run that leaves an
+  untracked file in the checkout.
 
 ### Added
 

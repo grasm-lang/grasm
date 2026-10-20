@@ -52,7 +52,12 @@ fn write_one(
 
 fn main() -> () ! TiffError / {io} {
     let a = args()
-    let dir = a.get(0) ?? "."
+    // With no argument the files go under `target/`, which git ignores. The
+    // default used to be `.`, and the gates that run every demo with no
+    // arguments run from the repository root -- so this wrote its images
+    // there, and a commit that staged everything swept them in.
+    let dir = a.get(0) ?? "target/demo-out/tiffwrite"
+    make_dir(dir) ?? ()
     for codec in [1, 8, 32773] {
         // PackBits codes runs of identical *bytes*. An RGB flat fill has
         // none -- 70,110,150 repeating never repeats a byte -- so the
