@@ -1,0 +1,313 @@
+// Python's `fnmatch`, as CPython 3.13 runs it: `translate`, which turns a
+// shell pattern into the regular expression text Python compiles, and
+// `fnmatchcase`, `fnmatch` and `filter`, which match by it.
+//
+// Python tools filter files with these -- pytest's `-k` paths, setuptools'
+// package data, countless build scripts -- and a pattern means what
+// Python's translation makes of it:
+//
+//   - `*` crosses `/` and matches a leading dot; `?` is one character,
+//     newlines included.
+//   - `[!...]` negates; `]` first in a class is a member; a range written
+//     backwards is dropped (`[z-a]` matches nothing, `[a-c-e]` keeps what
+//     survives); an empty class never matches and `[!]` matches anything.
+//   - A `[` with no closing `]` is a literal `[`.
+//   - `translate` gives Python's exact text: `(?s:.*\.py)\Z`, `(?>.*?...)`
+//     groups between stars, `re.escape` on literals.
+//
+// `fnmatch` does not fold case, as on POSIX, where `os.path.normcase`
+// leaves names alone.
+
+/// One element of a translated pattern: a literal character, any
+/// character, a class, or a star.
+type FnPart =
+    | FnStar
+    | FnLit(c: i64)
+    | FnAny
+    | FnDot
+    | FnNever
+    | FnClass(negate: bool, ranges: [(i64, i64)], text: str)
+
+fn special(c: i64) -> bool {
+    return "()[]\{}?*+-|^$\\.&~# \t\n\r".codes().contains(c) or c == 11 or c == 12
+}
+
+/// `re.escape` of one character.
+fn escape_char(c: i64) -> str {
+    return if special(c) { "\\" + c.to_char() } else { c.to_char() }
+}
+
+fn find(cs: [i64], c: i64, from: i64, to: i64) -> i64 {
+    var k = from
+    while k < to {
+        if cs[k] == c {
+            return k
+        }
+        k = k + 1
+    }
+    return 0 - 1
+}
+
+fn class_escape(chunk: [i64], dash: bool) -> [i64] {
+    var out: [i64] = []
+    for c in chunk {
+        if c == 92 or (dash and c == 45) {
+            out.push(92)
+        }
+        out.push(c)
+    }
+    return out
+}
+
+/// The text between `[` and `]` (exclusive), as `_translate` rewrites it.
+fn class_stuff(pat: [i64], i0: i64, j: i64) -> [i64] {
+    var stuff: [i64] = []
+    if find(pat, 45, i0, j) < 0 {
+        stuff = class_escape(pat.slice(i0, j), false)
+    } else {
+        var chunks: [[i64]] = []
+        var i = i0
+        var k = if pat[i] == 33 { i + 2 } else { i + 1 }
+        while true {
+            k = if k < j { find(pat, 45, k, j) } else { 0 - 1 }
+            if k < 0 {
+                break
+            }
+            chunks.push(pat.slice(i, k))
+            i = k + 1
+            k = k + 3
+        }
+        let last = pat.slice(i, j)
+        if last.len() > 0 {
+            chunks.push(last)
+        } else {
+            chunks[chunks.len() - 1] = chunks[chunks.len() - 1] + [45]
+        }
+        var n = chunks.len() - 1
+        while n > 0 {
+            let prev = chunks[n - 1]
+            if prev[prev.len() - 1] > chunks[n][0] {
+                chunks[n - 1] = prev.slice(0, prev.len() - 1) + chunks[n].slice(1, chunks[n].len())
+                chunks.remove(n)
+            }
+            n = n - 1
+        }
+        for m in 0..chunks.len() {
+            if m > 0 {
+                stuff.push(45)
+            }
+            for c in class_escape(chunks[m], true) {
+                stuff.push(c)
+            }
+        }
+    }
+    var out: [i64] = []
+    for c in stuff {
+        if c == 38 or c == 126 or c == 124 {
+            out.push(92)
+        }
+        out.push(c)
+    }
+    return out
+}
+
+/// The set a class's rewritten text describes, as Python's `re` reads it:
+/// `\x` is a literal, an unescaped `-` between two members a range.
+fn class_ranges(stuff: [i64]) -> [(i64, i64)] {
+    var atoms: [(i64, bool)] = []
+    var k = 0
+    while k < stuff.len() {
+        if stuff[k] == 92 and k + 1 < stuff.len() {
+            atoms.push((stuff[k + 1], true))
+            k = k + 2
+        } else {
+            atoms.push((stuff[k], false))
+            k = k + 1
+        }
+    }
+    var out: [(i64, i64)] = []
+    var a = 0
+    while a < atoms.len() {
+        let (c, _e) = atoms[a]
+        if a + 2 < atoms.len() and atoms[a + 1] == (45, false) {
+            let (hi, _f) = atoms[a + 2]
+            out.push((c, hi))
+            a = a + 3
+        } else {
+            out.push((c, c))
+            a = a + 1
+        }
+    }
+    return out
+}
+
+/// `_translate`: the parts between and including stars.
+fn parts(pat: [i64]) -> [FnPart] {
+    var res: [FnPart] = []
+    var i = 0
+    let n = pat.len()
+    while i < n {
+        let c = pat[i]
+        i = i + 1
+        if c == 42 {
+            let starred = res.len() > 0 and match res[res.len() - 1] {
+                FnStar -> true
+                _ -> false
+            }
+            if not starred {
+                res.push(FnStar)
+            }
+        } else if c == 63 {
+            res.push(FnAny)
+        } else if c == 91 {
+            var j = i
+            if j < n and pat[j] == 33 {
+                j = j + 1
+            }
+            if j < n and pat[j] == 93 {
+                j = j + 1
+            }
+            while j < n and pat[j] != 93 {
+                j = j + 1
+            }
+            if j >= n {
+                res.push(FnLit(91))
+            } else {
+                res.push(class_part(class_stuff(pat, i, j)))
+                i = j + 1
+            }
+        } else {
+            res.push(FnLit(c))
+        }
+    }
+    return res
+}
+
+fn class_part(stuff: [i64]) -> FnPart {
+    if stuff.len() == 0 {
+        return FnNever
+    }
+    if stuff == [33] {
+        return FnDot
+    }
+    let negate = stuff[0] == 33
+    let body = if negate { stuff.slice(1, stuff.len()) } else { stuff }
+    let shown = if negate { [94] + body } else if stuff[0] == 94 or stuff[0] == 91 { [92] + stuff } else { stuff }
+    // Python reads `]` first in a class as a member, which is how it got
+    // there.
+    return FnClass(negate, class_ranges(body), "[" + shown.map(|x| x.to_char()).join("") + "]")
+}
+
+fn part_text(p: FnPart) -> str {
+    return match p {
+        FnStar -> ""
+        FnLit(c) -> if c == 91 { "\\[" } else { escape_char(c) }
+        FnAny -> "."
+        FnDot -> "."
+        FnNever -> "(?!)"
+        FnClass(_n, _r, t) -> t
+    }
+}
+
+fn is_star(p: FnPart) -> bool {
+    return match p {
+        FnStar -> true
+        _ -> false
+    }
+}
+
+/// `fnmatch.translate(pat)`.
+pub fn translate(pat: str) -> str {
+    let ps = parts(pat.codes())
+    var out = ""
+    var i = 0
+    let n = ps.len()
+    while i < n and not is_star(ps[i]) {
+        out = out + part_text(ps[i])
+        i = i + 1
+    }
+    while i < n {
+        i = i + 1
+        if i == n {
+            out = out + ".*"
+            break
+        }
+        var fixed = ""
+        while i < n and not is_star(ps[i]) {
+            fixed = fixed + part_text(ps[i])
+            i = i + 1
+        }
+        out = out + if i == n { ".*" + fixed } else { "(?>.*?" + fixed + ")" }
+    }
+    return "(?s:" + out + ")\\Z"
+}
+
+fn one(p: FnPart, c: i64) -> bool {
+    return match p {
+        FnLit(x) -> x == c
+        FnAny -> true
+        FnDot -> true
+        FnNever -> false
+        FnClass(negate, ranges, _t) -> ranges.any(|r| r.0 <= c and c <= r.1) != negate
+        FnStar -> false
+    }
+}
+
+fn matches(ps: [FnPart], name: [i64]) -> bool {
+    var p = 0
+    var s = 0
+    var star = 0 - 1
+    var mark = 0
+    while s < name.len() {
+        if p < ps.len() and is_star(ps[p]) {
+            star = p
+            p = p + 1
+            mark = s
+        } else if p < ps.len() and one(ps[p], name[s]) {
+            p = p + 1
+            s = s + 1
+        } else if star >= 0 {
+            p = star + 1
+            mark = mark + 1
+            s = mark
+        } else {
+            return false
+        }
+    }
+    while p < ps.len() and is_star(ps[p]) {
+        p = p + 1
+    }
+    return p == ps.len()
+}
+
+/// `fnmatch.fnmatchcase(name, pat)`.
+pub fn fnmatchcase(name: str, pat: str) -> bool {
+    return matches(parts(pat.codes()), name.codes())
+}
+
+/// `fnmatch.fnmatch(name, pat)` on POSIX: the same as `fnmatchcase`.
+pub fn fnmatch(name: str, pat: str) -> bool {
+    return fnmatchcase(name, pat)
+}
+
+/// `fnmatch.filter(names, pat)`.
+pub fn filter(names: [str], pat: str) -> [str] {
+    let ps = parts(pat.codes())
+    return names.filter(|n| matches(ps, n.codes()))
+}
+
+/// `re.escape(s)`.
+pub fn re_escape(s: str) -> str {
+    return s.codes().map(|c| escape_char(c)).join("")
+}
+
+/// `fnmatch._translate(pat, STAR, QUESTION_MARK)` joined: the regular
+/// expression text for one pattern, a star (runs of them collapsed) and a
+/// `?` written as given. `glob.translate` builds on this.
+pub fn translate_parts(pat: str, star: str, question: str) -> str {
+    return parts(pat.codes()).map(|p| match p {
+        FnStar -> star
+        FnAny -> question
+        _ -> part_text(p)
+    }).join("")
+}

@@ -1,0 +1,480 @@
+// Go's `encoding/base64`, `encoding/base32`, `encoding/hex` and
+// `encoding/ascii85`, as Go 1.25 encodes and decodes them, errors and
+// partial results included.
+//
+// Go services sign, store and compare encoded bytes everywhere, and a
+// peer has to accept and reject exactly what Go does and report the same
+// byte. These differ from the stricter readings in packages/base32,
+// packages/hexdump and packages/ascii85 on purpose:
+//
+// base64 (standard and URL alphabets, raw, other padding, `Strict`):
+//   - `\r` and `\n` are skipped anywhere; anything else outside the
+//     alphabet is "illegal base64 data at input byte N", counting from
+//     the start of the input.
+//   - Padding must complete its quantum and end the data (newlines aside);
+//     a padded encoding needs it, a raw one refuses it. `Strict` also
+//     refuses non-zero bits left over in the last character.
+//   - Decoding returns what it decoded before the error, with the error.
+// base32 (standard and hex alphabets): newlines are stripped first, so
+//   its byte offsets count the input without them.
+// hex: either case is read; the first bad character is "invalid byte:
+//   U+0067 'g'" (the quoted character only when Go thinks it printable --
+//   not U+00A0, not U+00AD), and an odd length is "odd length hex string"
+//   unless its last character is itself bad. `Dump` is the `hexdump -C`
+//   layout without the closing offset line.
+// ascii85 (btoa and PostScript, no `<~ ~>` framing):
+//   - Every byte up to and including space is skipped; `z` stands for
+//     four zero bytes, but only between groups.
+//   - A group's value is computed modulo 2^32 without complaint, so
+//     `uuuuu` decodes rather than failing.
+//   - Without `flush`, a trailing partial group is left unread (the count
+//     of bytes consumed says where); with it, a group of two to four
+//     characters is completed with `u`s and a single character is an
+//     error at the end of the input. On an error nothing is returned.
+
+/// Go's error values: base64's and base32's CorruptInputError, hex's
+/// InvalidByteError and ErrLength, ascii85's CorruptInputError.
+type GoEncodingError =
+    | GoBase64Corrupt(at: i64)
+    | GoBase32Corrupt(at: i64)
+    | GoHexInvalidByte(b: i64)
+    | GoHexOddLength
+    | GoAscii85Corrupt(at: i64)
+
+/// The error's text, as Go's `Error()` writes it.
+pub fn error_text(e: GoEncodingError) -> str {
+    return match e {
+        GoBase64Corrupt(n) -> "illegal base64 data at input byte " + n.to_str()
+        GoBase32Corrupt(n) -> "illegal base32 data at input byte " + n.to_str()
+        GoHexOddLength -> "encoding/hex: odd length hex string"
+        GoHexInvalidByte(b) -> "encoding/hex: invalid byte: U+" + hex4(b) + if go_printable(b) { " '" + b.to_char() + "'" } else { "" }
+        GoAscii85Corrupt(n) -> "illegal ascii85 data at input byte " + n.to_str()
+    }
+}
+
+// ---- base64 and base32
+
+/// A base64 encoding: the alphabet, the padding character (-1 for none)
+/// and whether it is strict.
+type GoB64 = { alphabet: [i64], pad: i64, strict: bool }
+
+/// A base32 encoding: the alphabet and the padding character (-1 none).
+type GoB32 = { alphabet: [i64], pad: i64 }
+
+pub fn std_encoding() -> GoB64 {
+    return GoB64{ alphabet: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/".codes(), pad: 61, strict: false }
+}
+
+pub fn url_encoding() -> GoB64 {
+    return GoB64{ alphabet: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_".codes(), pad: 61, strict: false }
+}
+
+/// `enc.WithPadding(pad)`; -1 is NoPadding.
+pub fn with_padding(e: GoB64, pad: i64) -> GoB64 {
+    return GoB64{ alphabet: e.alphabet, pad: pad, strict: e.strict }
+}
+
+/// `enc.Strict()`.
+pub fn strict(e: GoB64) -> GoB64 {
+    return GoB64{ alphabet: e.alphabet, pad: e.pad, strict: true }
+}
+
+pub fn std_encoding32() -> GoB32 {
+    return GoB32{ alphabet: "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567".codes(), pad: 61 }
+}
+
+pub fn hex_encoding32() -> GoB32 {
+    return GoB32{ alphabet: "0123456789ABCDEFGHIJKLMNOPQRSTUV".codes(), pad: 61 }
+}
+
+pub fn with_padding32(e: GoB32, pad: i64) -> GoB32 {
+    return GoB32{ alphabet: e.alphabet, pad: pad }
+}
+
+fn decode_map(alphabet: [i64]) -> [i64] {
+    var m = (0..256).to_list().map(|_x| 255)
+    for k in 0..alphabet.len() {
+        m[alphabet[k]] = k
+    }
+    return m
+}
+
+/// `enc.EncodeToString(data)`.
+pub fn base64_encode(e: GoB64, data: bytes) -> str {
+    let b = data.to_list()
+    var out: [i64] = []
+    var i = 0
+    while i < b.len() {
+        let n = if b.len() - i >= 3 { 3 } else { b.len() - i }
+        let v = b[i].shl(16) + (if n > 1 { b[i + 1].shl(8) } else { 0 }) + (if n > 2 { b[i + 2] } else { 0 })
+        out.push(e.alphabet[v.shr(18).bit_and(63)])
+        out.push(e.alphabet[v.shr(12).bit_and(63)])
+        if n > 1 {
+            out.push(e.alphabet[v.shr(6).bit_and(63)])
+        } else if e.pad >= 0 {
+            out.push(e.pad)
+        }
+        if n > 2 {
+            out.push(e.alphabet[v.bit_and(63)])
+        } else if e.pad >= 0 {
+            out.push(e.pad)
+        }
+        i = i + 3
+    }
+    return out.map(|c| c.to_char()).join("")
+}
+
+fn newline(c: i64) -> bool {
+    return c == 10 or c == 13
+}
+
+/// decodeQuantum: the next position, the bytes, and an error (which may
+/// come with bytes, for data after the padding).
+fn quantum(e: GoB64, m: [i64], src: [i64], si0: i64) -> (i64, [i64], Option[GoEncodingError]) {
+    var si = si0
+    var dbuf = [0, 0, 0, 0]
+    var dlen = 4
+    var err: Option[GoEncodingError] = None
+    var j = 0
+    while j < 4 {
+        if si == src.len() {
+            if j == 0 {
+                return (si, [], None)
+            }
+            if j == 1 or e.pad >= 0 {
+                return (si, [], Some(GoBase64Corrupt(si - j)))
+            }
+            dlen = j
+            break
+        }
+        let c = src[si]
+        si = si + 1
+        let v = m[c]
+        if v != 255 {
+            dbuf[j] = v
+            j = j + 1
+            continue
+        }
+        if newline(c) {
+            continue
+        }
+        if c != e.pad {
+            return (si, [], Some(GoBase64Corrupt(si - 1)))
+        }
+        if j == 0 or j == 1 {
+            return (si, [], Some(GoBase64Corrupt(si - 1)))
+        }
+        if j == 2 {
+            while si < src.len() and newline(src[si]) {
+                si = si + 1
+            }
+            if si == src.len() {
+                return (si, [], Some(GoBase64Corrupt(src.len())))
+            }
+            if src[si] != e.pad {
+                return (si, [], Some(GoBase64Corrupt(si - 1)))
+            }
+            si = si + 1
+        }
+        while si < src.len() and newline(src[si]) {
+            si = si + 1
+        }
+        if si < src.len() {
+            err = Some(GoBase64Corrupt(si))
+        }
+        dlen = j
+        break
+    }
+    let val = dbuf[0].shl(18).bit_or(dbuf[1].shl(12)).bit_or(dbuf[2].shl(6)).bit_or(dbuf[3])
+    let b0 = val.shr(16).bit_and(255)
+    let b1 = val.shr(8).bit_and(255)
+    let b2 = val.bit_and(255)
+    if dlen == 4 {
+        return (si, [b0, b1, b2], err)
+    }
+    if dlen == 3 {
+        if e.strict and b2 != 0 {
+            return (si, [], Some(GoBase64Corrupt(si - 1)))
+        }
+        return (si, [b0, b1], err)
+    }
+    if e.strict and (b1 != 0 or b2 != 0) {
+        return (si, [], Some(GoBase64Corrupt(si - 2)))
+    }
+    return (si, [b0], err)
+}
+
+/// `enc.DecodeString(text)`: the bytes decoded, and the error if any (the
+/// bytes then being those before it).
+pub fn base64_decode(e: GoB64, text: bytes) -> (bytes, Option[GoEncodingError]) {
+    let src = text.to_list()
+    let m = decode_map(e.alphabet)
+    var out: [i64] = []
+    var si = 0
+    while si < src.len() {
+        let (next, b, err) = quantum(e, m, src, si)
+        for x in b {
+            out.push(x)
+        }
+        si = next
+        if err.is_some() {
+            return (bytes_of(out), err)
+        }
+    }
+    return (bytes_of(out), None)
+}
+
+/// `enc.EncodeToString(data)` for base32.
+pub fn base32_encode(e: GoB32, data: bytes) -> str {
+    let b = data.to_list()
+    var out: [i64] = []
+    var i = 0
+    while i < b.len() {
+        let n = if b.len() - i >= 5 { 5 } else { b.len() - i }
+        var v = 0
+        for k in 0..5 {
+            v = v.shl(8) + if k < n { b[i + k] } else { 0 }
+        }
+        let chars = [2, 4, 5, 7, 8][n - 1]
+        for k in 0..8 {
+            if k < chars {
+                out.push(e.alphabet[v.shr(35 - 5 * k).bit_and(31)])
+            } else if e.pad >= 0 {
+                out.push(e.pad)
+            }
+        }
+        i = i + 5
+    }
+    return out.map(|c| c.to_char()).join("")
+}
+
+/// `enc.DecodeString(text)` for base32.
+pub fn base32_decode(e: GoB32, text: bytes) -> (bytes, Option[GoEncodingError]) {
+    var src = text.to_list().filter(|c| not newline(c))
+    let m = decode_map(e.alphabet)
+    let olen = src.len()
+    var out: [i64] = []
+    var finished = false
+    while src.len() > 0 and not finished {
+        var dbuf = [0, 0, 0, 0, 0, 0, 0, 0]
+        var dlen = 8
+        var j = 0
+        while j < 8 {
+            if src.len() == 0 {
+                if e.pad >= 0 {
+                    return (bytes_of(out), Some(GoBase32Corrupt(olen - src.len() - j)))
+                }
+                dlen = j
+                finished = true
+                break
+            }
+            let c = src[0]
+            src = src.slice(1, src.len())
+            if c == e.pad and j >= 2 and src.len() < 8 {
+                if src.len() + j < 7 {
+                    return (bytes_of(out), Some(GoBase32Corrupt(olen)))
+                }
+                for k in 0..(7 - j) {
+                    if src.len() > k and src[k] != e.pad {
+                        return (bytes_of(out), Some(GoBase32Corrupt(olen - src.len() + k - 1)))
+                    }
+                }
+                dlen = j
+                finished = true
+                if dlen == 1 or dlen == 3 or dlen == 6 {
+                    return (bytes_of(out), Some(GoBase32Corrupt(olen - src.len() - 1)))
+                }
+                break
+            }
+            dbuf[j] = m[c]
+            if dbuf[j] == 255 {
+                return (bytes_of(out), Some(GoBase32Corrupt(olen - src.len() - 1)))
+            }
+            j = j + 1
+        }
+        let bytes_out = [dbuf[0].shl(3).bit_or(dbuf[1].shr(2)), dbuf[1].shl(6).bit_or(dbuf[2].shl(1)).bit_or(dbuf[3].shr(4)),
+            dbuf[3].shl(4).bit_or(dbuf[4].shr(1)), dbuf[4].shl(7).bit_or(dbuf[5].shl(2)).bit_or(dbuf[6].shr(3)), dbuf[6].shl(5).bit_or(dbuf[7])].map(|x|
+            x.bit_and(255))
+        let count = if dlen == 8 { 5 } else if dlen == 7 { 4 } else if dlen == 5 { 3 } else if dlen == 4 { 2 } else if dlen == 2 { 1 } else { 0 }
+        for k in 0..count {
+            out.push(bytes_out[k])
+        }
+    }
+    return (bytes_of(out), None)
+}
+
+// ---- hex
+
+fn digits() -> str {
+    return "0123456789abcdef"
+}
+
+fn hex4(n: i64) -> str {
+    let d = "0123456789ABCDEF"
+    return "00" + d.substr(n.shr(4), 1) + d.substr(n.bit_and(15), 1)
+}
+
+/// strconv.IsPrint for U+0000..U+00FF.
+fn go_printable(b: i64) -> bool {
+    return (b >= 32 and b <= 126) or (b >= 161 and b <= 255 and b != 173)
+}
+
+/// `hex.EncodeToString(data)`.
+pub fn hex_encode(data: bytes) -> str {
+    return data.to_list().map(|v| digits().substr(v.shr(4), 1) + digits().substr(v.bit_and(15), 1)).join("")
+}
+
+fn hex_value(c: i64) -> i64 {
+    return if c >= 48 and c <= 57 { c - 48 } else if c >= 97 and c <= 102 { c - 87 } else if c >= 65 and c <= 70 { c - 55 } else { 0 - 1 }
+}
+
+/// `hex.DecodeString(text)`: the bytes, and the error if any (the bytes
+/// then being those before it).
+pub fn hex_decode(text: bytes) -> (bytes, Option[GoEncodingError]) {
+    let src = text.to_list()
+    var out: [i64] = []
+    var j = 1
+    while j < src.len() {
+        let a = hex_value(src[j - 1])
+        let b = hex_value(src[j])
+        if a < 0 {
+            return (bytes_of(out), Some(GoHexInvalidByte(src[j - 1])))
+        }
+        if b < 0 {
+            return (bytes_of(out), Some(GoHexInvalidByte(src[j])))
+        }
+        out.push(a * 16 + b)
+        j = j + 2
+    }
+    if src.len() % 2 == 1 {
+        if hex_value(src[j - 1]) < 0 {
+            return (bytes_of(out), Some(GoHexInvalidByte(src[j - 1])))
+        }
+        return (bytes_of(out), Some(GoHexOddLength))
+    }
+    return (bytes_of(out), None)
+}
+
+fn byte_hex(v: i64) -> str {
+    return digits().substr(v.shr(4), 1) + digits().substr(v.bit_and(15), 1)
+}
+
+/// `hex.Dump(data)`.
+pub fn hex_dump(data: bytes) -> str {
+    let b = data.to_list()
+    if b.len() == 0 {
+        return ""
+    }
+    var out = ""
+    var right = ""
+    var used = 0
+    for n in 0..b.len() {
+        if used == 0 {
+            let off = n.bit_and(4294967295)
+            out = out + byte_hex(off.shr(24)) + byte_hex(off.shr(16).bit_and(255)) + byte_hex(off.shr(8).bit_and(255)) + byte_hex(off.bit_and(255)) + "  "
+        }
+        out = out + byte_hex(b[n]) + " " + if used == 7 { " " } else if used == 15 { " |" } else { "" }
+        right = right + (if b[n] < 32 or b[n] > 126 { "." } else { b[n].to_char() })
+        used = used + 1
+        if used == 16 {
+            out = out + right + "|\n"
+            right = ""
+            used = 0
+        }
+    }
+    if used == 0 {
+        return out
+    }
+    while used < 16 {
+        out = out + "   " + if used == 7 { " " } else if used == 15 { " |" } else { "" }
+        used = used + 1
+    }
+    return out + right + "|\n"
+}
+
+// ---- ascii85
+
+/// `ascii85.Encode`.
+pub fn ascii85_encode(data: bytes) -> str {
+    let src = data.to_list()
+    var out: [i64] = []
+    var i = 0
+    while i < src.len() {
+        let n = if src.len() - i >= 4 { 4 } else { src.len() - i }
+        var v = 0
+        for k in 0..4 {
+            v = v.shl(8) + if k < n { src[i + k] } else { 0 }
+        }
+        if v == 0 and n == 4 {
+            out.push(122)
+            i = i + 4
+            continue
+        }
+        var digits = [0, 0, 0, 0, 0]
+        var k = 4
+        while k >= 0 {
+            digits[k] = 33 + v % 85
+            v = v / 85
+            k = k - 1
+        }
+        for d in digits.slice(0, n + 1) {
+            out.push(d)
+        }
+        i = i + 4
+    }
+    return out.map(|c| c.to_char()).join("")
+}
+
+fn mask32(v: i64) -> i64 {
+    return v.bit_and(4294967295)
+}
+
+/// `ascii85.Decode(dst, src, flush)` with room for everything: the bytes,
+/// how many input bytes were consumed, and the error if any.
+pub fn ascii85_decode(input: bytes, flush: bool) -> (bytes, i64, Option[GoEncodingError]) {
+    let src = input.to_list()
+    var out: [i64] = []
+    var v = 0
+    var nb = 0
+    var nsrc = 0
+    for i in 0..src.len() {
+        let b = src[i]
+        if b <= 32 {
+            continue
+        }
+        if b == 122 and nb == 0 {
+            nb = 5
+            v = 0
+        } else if b >= 33 and b <= 117 {
+            v = mask32(v * 85 + b - 33)
+            nb = nb + 1
+        } else {
+            return (bytes_of([]), 0, Some(GoAscii85Corrupt(i)))
+        }
+        if nb == 5 {
+            nsrc = i + 1
+            out.push(v.shr(24).bit_and(255))
+            out.push(v.shr(16).bit_and(255))
+            out.push(v.shr(8).bit_and(255))
+            out.push(v.bit_and(255))
+            nb = 0
+            v = 0
+        }
+    }
+    if flush {
+        nsrc = src.len()
+        if nb > 0 {
+            if nb == 1 {
+                return (bytes_of([]), 0, Some(GoAscii85Corrupt(src.len())))
+            }
+            for _k in nb..5 {
+                v = mask32(v * 85 + 84)
+            }
+            for _k in 0..(nb - 1) {
+                out.push(v.shr(24).bit_and(255))
+                v = mask32(v.shl(8))
+            }
+        }
+    }
+    return (bytes_of(out), nsrc, None)
+}

@@ -1,0 +1,4 @@
+[package]
+name = "pycalendar"
+version = "1.0.0"
+capabilities = []

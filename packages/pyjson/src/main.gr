@@ -1,0 +1,543 @@
+// Python's `json` module, as CPython 3.13 runs it through its C
+// accelerator: `json.loads` and `json.dumps`, error messages and positions
+// included.
+//
+// Python is the other side of a great deal of JSON, and a tool that has to
+// produce what `json.dumps` produces -- a cache key, a signature, a fixture
+// a Python test compares byte for byte -- or report the error `json.loads`
+// would, needs Python's rules rather than JSON's:
+//
+//   - `NaN`, `Infinity` and `-Infinity` are read and written (unless
+//     `allow_nan` is off, when writing them is a ValueError).
+//   - Integers are unbounded, up to Python's 4300-digit conversion limit,
+//     whose ValueError is reproduced; `1.0` stays a float and prints as one.
+//   - Floats print as `repr` does: `1e+16`, `1e-05`, `-0.0`.
+//   - Strings may hold lone surrogates (`"\ud800"` reads as one), so
+//     strings here are lists of code points; `ensure_ascii` writes
+//     lowercase `\u` escapes, surrogate pairs for astral characters.
+//   - A key given twice keeps its first place and its last value, as a
+//     dict does; `sort_keys` sorts by code point.
+//   - Errors are `JSONDecodeError`s with Python's message and its line,
+//     column and character position, counted in code points: `Expecting
+//     ',' delimiter: line 1 column 5 (char 4)`, `Illegal trailing comma
+//     before end of array`, `Invalid \uXXXX escape`.
+//
+// Python raises a RecursionError for nesting deep enough to reach its C
+// recursion limit, which depends on how deep the caller already is; this
+// has no such limit.
+
+import bigint
+import shortestfloat
+
+type PyJson =
+    | PjNull
+    | PjBool(b: bool)
+    | PjInt(n: BigInt)
+    | PjFloat(f: f64)
+    | PjStr(cs: [i64])
+    | PjList(items: [PyJson])
+    | PjDict(keys: [[i64]], values: [PyJson])
+
+/// A JSONDecodeError, with its message and where it points (`pos` from 0,
+/// `lineno` and `colno` from 1), or a ValueError.
+type PyJsonError =
+    | PjDecodeError(msg: str, pos: i64, lineno: i64, colno: i64)
+    | PjValueError(msg: str)
+
+/// What `str(e)` gives.
+pub fn error_text(e: PyJsonError) -> str {
+    return match e {
+        PjDecodeError(m, p, l, c) -> m + ": line " + l.to_str() + " column " + c.to_str() + " (char " + p.to_str() + ")"
+        PjValueError(m) -> m
+    }
+}
+
+fn decode_error(msg: str, doc: [i64], pos: i64) -> PyJsonError {
+    var lines = 1
+    var last = 0 - 1
+    for i in 0..pos {
+        if doc[i] == 10 {
+            lines = lines + 1
+            last = i
+        }
+    }
+    return PjDecodeError(msg, pos, lines, pos - last)
+}
+
+fn digit_limit() -> i64 {
+    return 4300
+}
+
+// ---- reading
+
+fn is_ws(c: i64) -> bool {
+    return c == 32 or c == 9 or c == 10 or c == 13
+}
+
+fn hex4(doc: [i64], at: i64) -> i64 {
+    var c = 0
+    for k in 0..4 {
+        let d = doc[at + k]
+        let v = if d >= 48 and d <= 57 { d - 48 } else if d >= 97 and d <= 102 { d - 87 } else if d >= 65 and d <= 70 { d - 55 } else { 0 - 1 }
+        if v < 0 {
+            return 0 - 1
+        }
+        c = c * 16 + v
+    }
+    return c
+}
+
+/// scanstring_unicode, strict: `end` is just past the opening quote; gives
+/// the string and the index after its closing quote.
+fn scan_string(doc: [i64], end0: i64) -> ([i64], i64) ! PyJsonError {
+    let begin = end0 - 1
+    let len = doc.len()
+    var end = end0
+    var out: [i64] = []
+    while true {
+        var next = end
+        var c = 0
+        while next < len {
+            c = doc[next]
+            if c == 34 or c == 92 {
+                break
+            }
+            if c <= 31 {
+                fail(decode_error("Invalid control character at", doc, next))
+            }
+            next = next + 1
+        }
+        if next >= len {
+            fail(decode_error("Unterminated string starting at", doc, begin))
+        }
+        for k in end..next {
+            out.push(doc[k])
+        }
+        next = next + 1
+        if c == 34 {
+            end = next
+            break
+        }
+        if next == len {
+            fail(decode_error("Unterminated string starting at", doc, begin))
+        }
+        c = doc[next]
+        if c != 117 {
+            end = next + 1
+            let at = [34, 92, 47, 98, 102, 110, 114, 116].position(c)
+            if at < 0 {
+                fail(decode_error("Invalid \\escape", doc, end - 2))
+            }
+            out.push([34, 92, 47, 8, 12, 10, 13, 9][at])
+            continue
+        }
+        next = next + 1
+        end = next + 4
+        if end >= len {
+            fail(decode_error("Invalid \\uXXXX escape", doc, next - 1))
+        }
+        c = hex4(doc, next)
+        if c < 0 {
+            fail(decode_error("Invalid \\uXXXX escape", doc, end - 5))
+        }
+        if c >= 55296 and c <= 56319 and end + 6 < len and doc[end] == 92 and doc[end + 1] == 117 {
+            end = end + 6
+            let c2 = hex4(doc, end - 4)
+            if c2 < 0 {
+                fail(decode_error("Invalid \\uXXXX escape", doc, end - 5))
+            }
+            if c2 >= 56320 and c2 <= 57343 {
+                c = 65536 + (c - 55296).shl(10) + (c2 - 56320)
+            } else {
+                end = end - 6
+            }
+        }
+        out.push(c)
+    }
+    return (out, end)
+}
+
+fn position(xs: [i64], x: i64) -> i64 {
+    for i in 0..xs.len() {
+        if xs[i] == x {
+            return i
+        }
+    }
+    return 0 - 1
+}
+
+fn is_digit(c: i64) -> bool {
+    return c >= 48 and c <= 57
+}
+
+fn expecting_value(doc: [i64], pos: i64) -> PyJsonError {
+    return decode_error("Expecting value", doc, pos)
+}
+
+/// _match_number_unicode.
+fn match_number(doc: [i64], start: i64) -> (PyJson, i64) ! PyJsonError {
+    let end_idx = doc.len() - 1
+    var idx = start
+    if doc[idx] == 45 {
+        idx = idx + 1
+        if idx > end_idx {
+            fail(expecting_value(doc, start))
+        }
+    }
+    if doc[idx] >= 49 and doc[idx] <= 57 {
+        idx = idx + 1
+        while idx <= end_idx and is_digit(doc[idx]) {
+            idx = idx + 1
+        }
+    } else if doc[idx] == 48 {
+        idx = idx + 1
+    } else {
+        fail(expecting_value(doc, start))
+    }
+    var is_float = false
+    if idx < end_idx and doc[idx] == 46 and is_digit(doc[idx + 1]) {
+        is_float = true
+        idx = idx + 2
+        while idx <= end_idx and is_digit(doc[idx]) {
+            idx = idx + 1
+        }
+    }
+    if idx < end_idx and (doc[idx] == 101 or doc[idx] == 69) {
+        let e_start = idx
+        idx = idx + 1
+        if idx < end_idx and (doc[idx] == 45 or doc[idx] == 43) {
+            idx = idx + 1
+        }
+        while idx <= end_idx and is_digit(doc[idx]) {
+            idx = idx + 1
+        }
+        if is_digit(doc[idx - 1]) {
+            is_float = true
+        } else {
+            idx = e_start
+        }
+    }
+    let text = doc.slice(start, idx).map(|c| c.to_char()).join("")
+    if is_float {
+        return (PjFloat(text.parse_float() ?? 0.0), idx)
+    }
+    let digits = idx - start - if doc[start] == 45 { 1 } else { 0 }
+    if digits > digit_limit() {
+        fail(PjValueError("Exceeds the limit (4300 digits) for integer string conversion: value has " + digits.to_str() +
+            " digits; use sys.set_int_max_str_digits() to increase the limit"))
+    }
+    return (PjInt(bigint.parse(text) ?? bigint.zero()), idx)
+}
+
+fn word_at(doc: [i64], idx: i64, w: str) -> bool {
+    let cs = w.codes()
+    if idx + cs.len() > doc.len() {
+        return false
+    }
+    for k in 0..cs.len() {
+        if doc[idx + k] != cs[k] {
+            return false
+        }
+    }
+    return true
+}
+
+fn skip_ws(doc: [i64], at: i64) -> i64 {
+    var idx = at
+    while idx < doc.len() and is_ws(doc[idx]) {
+        idx = idx + 1
+    }
+    return idx
+}
+
+/// scan_once_unicode: one value at `idx`, and the index after it.
+fn scan_once(doc: [i64], idx: i64) -> (PyJson, i64) ! PyJsonError {
+    if idx >= doc.len() {
+        fail(expecting_value(doc, idx))
+    }
+    let c = doc[idx]
+    if c == 34 {
+        let (cs, next) = try scan_string(doc, idx + 1)
+        return (PjStr(cs), next)
+    }
+    if c == 123 {
+        return try parse_object(doc, idx + 1)
+    }
+    if c == 91 {
+        return try parse_array(doc, idx + 1)
+    }
+    let words = ["null", "true", "false", "NaN", "Infinity", "-Infinity"]
+    let values = [PjNull, PjBool(true), PjBool(false), PjFloat(0.0 / 0.0), PjFloat(1.0 / 0.0), PjFloat(-1.0 / 0.0)]
+    for k in 0..words.len() {
+        if word_at(doc, idx, words[k]) {
+            return (values[k], idx + words[k].len())
+        }
+    }
+    return try match_number(doc, idx)
+}
+
+fn parse_object(doc: [i64], at: i64) -> (PyJson, i64) ! PyJsonError {
+    let end_idx = doc.len() - 1
+    var keys: [[i64]] = []
+    var values: [PyJson] = []
+    var idx = skip_ws(doc, at)
+    if idx > end_idx or doc[idx] != 125 {
+        while true {
+            if idx > end_idx or doc[idx] != 34 {
+                fail(decode_error("Expecting property name enclosed in double quotes", doc, idx))
+            }
+            let (key, after_key) = try scan_string(doc, idx + 1)
+            idx = skip_ws(doc, after_key)
+            if idx > end_idx or doc[idx] != 58 {
+                fail(decode_error("Expecting ':' delimiter", doc, idx))
+            }
+            idx = skip_ws(doc, idx + 1)
+            let (v, after) = try scan_once(doc, idx)
+            // A dict: a key given again keeps its place, takes the value.
+            let k = key_position(keys, key)
+            if k >= 0 {
+                values[k] = v
+            } else {
+                keys.push(key)
+                values.push(v)
+            }
+            idx = skip_ws(doc, after)
+            if idx <= end_idx and doc[idx] == 125 {
+                break
+            }
+            if idx > end_idx or doc[idx] != 44 {
+                fail(decode_error("Expecting ',' delimiter", doc, idx))
+            }
+            let comma = idx
+            idx = skip_ws(doc, idx + 1)
+            if idx <= end_idx and doc[idx] == 125 {
+                fail(decode_error("Illegal trailing comma before end of object", doc, comma))
+            }
+        }
+    }
+    return (PjDict(keys, values), idx + 1)
+}
+
+fn parse_array(doc: [i64], at: i64) -> (PyJson, i64) ! PyJsonError {
+    let end_idx = doc.len() - 1
+    var items: [PyJson] = []
+    var idx = skip_ws(doc, at)
+    if idx > end_idx or doc[idx] != 93 {
+        while true {
+            let (v, after) = try scan_once(doc, idx)
+            items.push(v)
+            idx = skip_ws(doc, after)
+            if idx <= end_idx and doc[idx] == 93 {
+                break
+            }
+            if idx > end_idx or doc[idx] != 44 {
+                fail(decode_error("Expecting ',' delimiter", doc, idx))
+            }
+            let comma = idx
+            idx = skip_ws(doc, idx + 1)
+            if idx <= end_idx and doc[idx] == 93 {
+                fail(decode_error("Illegal trailing comma before end of array", doc, comma))
+            }
+        }
+    }
+    return (PjList(items), idx + 1)
+}
+
+fn key_position(keys: [[i64]], k: [i64]) -> i64 {
+    for i in 0..keys.len() {
+        if keys[i] == k {
+            return i
+        }
+    }
+    return 0 - 1
+}
+
+/// `json.loads(doc)`, with the document as code points.
+pub fn loads(doc: [i64]) -> PyJson ! PyJsonError {
+    if doc.len() > 0 and doc[0] == 65279 {
+        fail(decode_error("Unexpected UTF-8 BOM (decode using utf-8-sig)", doc, 0))
+    }
+    let (v, after) = try scan_once(doc, skip_ws(doc, 0))
+    let end = skip_ws(doc, after)
+    if end != doc.len() {
+        fail(decode_error("Extra data", doc, end))
+    }
+    return v
+}
+
+/// `json.loads(text)`.
+pub fn loads_text(text: str) -> PyJson ! PyJsonError {
+    return try loads(text.codes())
+}
+
+// ---- writing
+
+/// `json.dumps`'s keyword arguments that shape the text. `indent` is the
+/// string each level adds (Python's `indent=2` is `Some("  ")`, and
+/// `indent=0` is `Some("")`, which still breaks lines); `None` keeps the
+/// value on one line.
+type PyDumpOptions = { ensure_ascii: bool, allow_nan: bool, sort_keys: bool, indent: Option[str], item_separator: str, key_separator: str }
+
+/// `json.dumps(v)`'s defaults.
+pub fn default_options() -> PyDumpOptions {
+    return PyDumpOptions{ ensure_ascii: true, allow_nan: true, sort_keys: false, indent: None, item_separator: ", ", key_separator: ": " }
+}
+
+/// The options with `indent` set and the separators left to Python, which
+/// then drops the space after a comma.
+pub fn with_indent(o: PyDumpOptions, indent: str) -> PyDumpOptions {
+    return PyDumpOptions{ ensure_ascii: o.ensure_ascii, allow_nan: o.allow_nan, sort_keys: o.sort_keys, indent: Some(indent), item_separator: ",",
+        key_separator: ": " }
+}
+
+fn hex_digit(n: i64) -> i64 {
+    return "0123456789abcdef".codes()[n]
+}
+
+fn push_u(inout out: [i64], c: i64) {
+    out.push(92)
+    out.push(117)
+    out.push(hex_digit(c.shr(12).bit_and(15)))
+    out.push(hex_digit(c.shr(8).bit_and(15)))
+    out.push(hex_digit(c.shr(4).bit_and(15)))
+    out.push(hex_digit(c.bit_and(15)))
+}
+
+/// encode_basestring_ascii, or encode_basestring without `ensure_ascii`.
+pub fn encode_string(cs: [i64], ensure_ascii: bool) -> [i64] {
+    var out = [34]
+    for c in cs {
+        let short = [92, 34, 8, 12, 10, 13, 9].position(c)
+        if short >= 0 {
+            out.push(92)
+            out.push([92, 34, 98, 102, 110, 114, 116][short])
+        } else if c < 32 or (ensure_ascii and c > 126) {
+            if c >= 65536 {
+                let v = c - 65536
+                push_u(out, 55296 + v.shr(10))
+                push_u(out, 56320 + v.bit_and(1023))
+            } else {
+                push_u(out, c)
+            }
+        } else {
+            out.push(c)
+        }
+    }
+    out.push(34)
+    return out
+}
+
+/// A float as `dumps` writes it: `repr`, or `NaN`, `Infinity` and
+/// `-Infinity` when `allow_nan` lets it.
+pub fn encode_float(f: f64, allow_nan: bool) -> str ! PyJsonError {
+    if f == f and f != 1.0 / 0.0 and f != -1.0 / 0.0 {
+        return shortestfloat.repr(f)
+    }
+    if not allow_nan {
+        let r = if f != f { "nan" } else if f > 0.0 { "inf" } else { "-inf" }
+        fail(PjValueError("Out of range float values are not JSON compliant: " + r))
+    }
+    return if f != f { "NaN" } else if f > 0.0 { "Infinity" } else { "-Infinity" }
+}
+
+fn extend(inout out: [i64], xs: [i64]) {
+    for x in xs {
+        out.push(x)
+    }
+}
+
+/// A key's code points as six hex digits each, whose string order is the
+/// code point order Python sorts by.
+fn sort_key(k: [i64]) -> str {
+    return k.map(|c| (0..6).to_list().map(|j| hex_digit(c.shr(20 - 4 * j).bit_and(15)).to_char()).join("")).join("")
+}
+
+/// Indices of `keys` in code point order.
+fn sorted_order(keys: [[i64]]) -> [i64] {
+    var order = (0..keys.len()).to_list()
+    let sort_keys = keys.map(|k| sort_key(k))
+    order.sort_by(|k| sort_keys[k])
+    return order
+}
+
+fn encode_into(inout out: [i64], v: PyJson, o: PyDumpOptions, newline: [i64]) -> () ! PyJsonError {
+    match v {
+        PjNull -> extend(out, "null".codes())
+        PjBool(b) -> extend(out, (if b { "true" } else { "false" }).codes())
+        PjInt(n) -> {
+            if bigint.digit_count(n) > digit_limit() {
+                fail(PjValueError("Exceeds the limit (4300 digits) for integer string conversion; use sys.set_int_max_str_digits() to increase the limit"))
+            }
+            extend(out, bigint.to_str(n).codes())
+        }
+        PjFloat(f) -> extend(out, (try encode_float(f, o.allow_nan)).codes())
+        PjStr(cs) -> extend(out, encode_string(cs, o.ensure_ascii))
+        PjList(items) -> {
+            if items.len() == 0 {
+                extend(out, [91, 93])
+                return ()
+            }
+            out.push(91)
+            let (inner, sep) = levels(o, newline)
+            extend(out, inner)
+            for k in 0..items.len() {
+                if k > 0 {
+                    extend(out, sep)
+                }
+                try encode_into(out, items[k], o, inner)
+            }
+            if o.indent.is_some() {
+                extend(out, newline)
+            }
+            out.push(93)
+        }
+        PjDict(keys, values) -> {
+            if keys.len() == 0 {
+                extend(out, [123, 125])
+                return ()
+            }
+            out.push(123)
+            let (inner, sep) = levels(o, newline)
+            extend(out, inner)
+            let order = if o.sort_keys { sorted_order(keys) } else { (0..keys.len()).to_list() }
+            for n in 0..order.len() {
+                if n > 0 {
+                    extend(out, sep)
+                }
+                extend(out, encode_string(keys[order[n]], o.ensure_ascii))
+                extend(out, o.key_separator.codes())
+                try encode_into(out, values[order[n]], o, inner)
+            }
+            if o.indent.is_some() {
+                extend(out, newline)
+            }
+            out.push(125)
+        }
+    }
+    return ()
+}
+
+/// The line break and indent that open a container's first element, and
+/// the separator between its elements.
+fn levels(o: PyDumpOptions, newline: [i64]) -> ([i64], [i64]) {
+    return match o.indent {
+        Some(ind) -> {
+            let inner = newline + ind.codes()
+            (inner, o.item_separator.codes() + inner)
+        }
+        None -> ([], o.item_separator.codes())
+    }
+}
+
+/// `json.dumps(v, ...)`, as code points: without `ensure_ascii` the text
+/// can hold a lone surrogate.
+pub fn dumps(v: PyJson, o: PyDumpOptions) -> [i64] ! PyJsonError {
+    var out: [i64] = []
+    try encode_into(out, v, o, if o.indent.is_some() { [10] } else { [] })
+    return out
+}
+
+/// `json.dumps(v)` with its defaults, which is always ASCII.
+pub fn dumps_text(v: PyJson) -> str ! PyJsonError {
+    return (try dumps(v, default_options())).map(|c| c.to_char()).join("")
+}

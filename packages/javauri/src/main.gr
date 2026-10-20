@@ -1,0 +1,1558 @@
+// `java.net.URI`, as Java 17 parses, prints, normalizes, resolves and
+// relativizes it.
+//
+// Java's URI is RFC 2396 with Java's own amendments: an empty authority is
+// allowed (`file:///x`), an IPv6 literal may carry a scope (`[fe80::1%en0]`),
+// an authority that does not parse as `user@host:port` is kept whole as a
+// registry name rather than refused, and characters outside ASCII that are
+// neither spaces nor controls are allowed as they are. Programs that talk to
+// Java -- a JVM service's redirect, a Maven repository URL, a JDBC string --
+// have to read URIs the way it does, refusals included.
+//
+// So this follows `java.net.URI` rather than RFC 3986, down to the corners
+// that are Java's and nobody else's:
+//
+//   - Indexes are counted in UTF-16 code units, as Java counts them, so an
+//     error at "index 7" points where Java's does.
+//   - `normalize` keeps leading `..` segments and puts `./` in front of a
+//     first segment containing `:`, so the result does not read as a scheme.
+//   - `resolve` with an empty child gives the base's directory (RFC 2396's
+//     reading), and a child that is only a fragment equal to the base's gives
+//     the base back.
+//   - The decoded getters decode with Java's UTF-8 decoder, which replaces
+//     an encoded surrogate (`%ED%A0%80`) with one U+FFFD where a WHATWG
+//     decoder writes three.
+//   - `to_ascii_string` puts the text in NFC before escaping it.
+//   - A component built by `of_parts` is quoted with Java's masks, and an
+//     opaque part that starts `//[` with no `]` vanishes, as it does in
+//     Java.
+//
+// Not here: `toURL`, and anything that consults the network or a
+// `URLStreamHandler`.
+
+import unicodenorm
+
+/// A URI. `None` is Java's `null`: an absent component, which is different
+/// from an empty one (`http://h?` has an empty query, `http://h` none).
+type JavaUri = {
+    scheme: Option[str],
+    ssp: Option[str],
+    authority: Option[str],
+    user_info: Option[str],
+    host: Option[str],
+    port: i64,
+    /// `None` for an opaque URI such as `mailto:a@b`.
+    path: Option[str],
+    query: Option[str],
+    fragment: Option[str],
+    /// The text the URI was parsed from. A URI made by `resolve`,
+    /// `normalize` or `relativize` has none until it is printed, and Java's
+    /// `getRawSchemeSpecificPart` answers differently for it.
+    text: Option[str],
+}
+
+type UriError =
+    /// `URISyntaxException`: Java's reason, and the UTF-16 index, or -1.
+    | UriSyntax(reason: str, index: i64)
+    /// `NumberFormatException`, which Java lets escape for an over-long run
+    /// of digits in an IPv4 part of an IPv6 literal.
+    | UriNumberFormat
+
+type UMask = { low: i64, high: i64 }
+
+fn m_alpha() -> UMask {
+    return UMask{ low: 0, high: 576460743847706622 }
+}
+
+fn m_scheme() -> UMask {
+    return UMask{ low: 288063250384289792, high: 576460743847706622 }
+}
+
+fn m_digit() -> UMask {
+    return UMask{ low: 287948901175001088, high: 0 }
+}
+
+fn m_hex() -> UMask {
+    return UMask{ low: 287948901175001088, high: 541165879422 }
+}
+
+fn m_uric() -> UMask {
+    return UMask{ low: 0 - 5764607720602730495, high: 5188146765093666815 }
+}
+
+fn m_path() -> UMask {
+    return UMask{ low: 3458764316252045313, high: 5188146764422578175 }
+}
+
+fn m_userinfo() -> UMask {
+    return UMask{ low: 3458623578763689985, high: 5188146764422578174 }
+}
+
+fn m_reg_name() -> UMask {
+    return UMask{ low: 3458623578763689985, high: 5188146764422578175 }
+}
+
+fn m_server() -> UMask {
+    return UMask{ low: 3458623578763689985, high: 5188146765093666815 }
+}
+
+fn m_server_percent() -> UMask {
+    return UMask{ low: 3458623716202643457, high: 5188146765093666815 }
+}
+
+fn m_alphanum() -> UMask {
+    return UMask{ low: 287948901175001088, high: 576460743847706622 }
+}
+
+fn m_alphanum_dash() -> UMask {
+    return UMask{ low: 287984085547089920, high: 576460743847706622 }
+}
+
+fn m_digit_dot() -> UMask {
+    return UMask{ low: 288019269919178752, high: 0 }
+}
+
+fn m_scope_id() -> UMask {
+    return UMask{ low: 288019269919178752, high: 576460745995190270 }
+}
+
+fn m_reg_or_server() -> UMask {
+    return UMask{ low: 3458623578763689985, high: 5188146765093666815 }
+}
+
+fn matches(c: i64, m: UMask) -> bool {
+    if c == 0 or c >= 128 {
+        return false
+    }
+    if c < 64 {
+        return 1.shl(c).bit_and(m.low) != 0
+    }
+    return 1.shl(c - 64).bit_and(m.high) != 0
+}
+
+fn escapes_allowed(m: UMask) -> bool {
+    return m.low.bit_and(1) != 0
+}
+
+/// `Character.isSpaceChar`, for a UTF-16 unit: Zs, Zl and Zp in Unicode 13.
+fn is_space_char(c: i64) -> bool {
+    return c == 32 or c == 160 or c == 5760 or (c >= 8192 and c <= 8202) or c == 8232 or c == 8233 or c == 8239 or c == 8287 or c == 12288
+}
+
+fn is_iso_control(c: i64) -> bool {
+    return c <= 31 or (c >= 127 and c <= 159)
+}
+
+// ---- strings as Java holds them: UTF-16 code units
+
+fn units(s: str) -> [i64] {
+    var out: [i64] = []
+    for c in s.codes() {
+        if c >= 65536 {
+            let v = c - 65536
+            out.push(55296 + v.shr(10))
+            out.push(56320 + v.bit_and(1023))
+        } else {
+            out.push(c)
+        }
+    }
+    return out
+}
+
+/// Units `a` to `b` back to text. The bounds never fall inside a pair: they
+/// come from ASCII delimiters.
+fn text_of(us: [i64], a: i64, b: i64) -> str {
+    var codes: [str] = []
+    var i = a
+    while i < b {
+        let c = us[i]
+        if c >= 55296 and c < 56320 and i + 1 < b and us[i + 1] >= 56320 and us[i + 1] < 57344 {
+            codes.push((65536 + (c - 55296).shl(10) + (us[i + 1] - 56320)).to_char())
+            i = i + 2
+        } else {
+            codes.push(c.to_char())
+            i = i + 1
+        }
+    }
+    return codes.join("")
+}
+
+fn index_of(s: str, c: i64) -> i64 {
+    let us = units(s)
+    for i in 0..us.len() {
+        if us[i] == c {
+            return i
+        }
+    }
+    return 0 - 1
+}
+
+// ---- decoding: sun.nio.cs.UTF_8 with every malformed sequence replaced
+
+fn cont(b: i64) -> bool {
+    return b.bit_and(192) == 128
+}
+
+/// How many bytes of a malformed sequence starting at `i` one U+FFFD
+/// stands for, given `n` bytes are left; 0 when the sequence is good.
+fn malformed_length(b: [i64], i: i64) -> i64 {
+    let n = b.len() - i
+    let b1 = b[i]
+    if b1 < 128 {
+        return 0
+    }
+    if b1 >= 194 and b1 <= 223 {
+        if n < 2 {
+            return n
+        }
+        return if cont(b[i + 1]) { 0 } else { 1 }
+    }
+    if b1 >= 224 and b1 <= 239 {
+        let bad2 = (b1 == 224 and n > 1 and b[i + 1].bit_and(224) == 128) or (n > 1 and not cont(b[i + 1]))
+        if n < 3 {
+            return if n > 1 and bad2 { 1 } else { n }
+        }
+        if bad2 {
+            return 1
+        }
+        if not cont(b[i + 2]) {
+            return 2
+        }
+        let c = (b1 - 224).shl(12) + (b[i + 1] - 128).shl(6) + (b[i + 2] - 128)
+        // An encoded surrogate is one malformed sequence of three bytes.
+        return if c >= 55296 and c <= 57343 { 3 } else { 0 }
+    }
+    if b1 >= 240 and b1 <= 247 {
+        let bad2 = n > 1 and ((b1 == 240 and (b[i + 1] < 144 or b[i + 1] > 191)) or (b1 == 244 and b[i + 1].bit_and(240) != 128) or not cont(b[i + 1]))
+        if b1 > 244 or bad2 {
+            return 1
+        }
+        if n < 4 {
+            return if n > 2 and not cont(b[i + 2]) { 2 } else { n }
+        }
+        if not cont(b[i + 2]) {
+            return 2
+        }
+        return if cont(b[i + 3]) { 0 } else { 3 }
+    }
+    return 1
+}
+
+fn utf8_decode(b: [i64]) -> str {
+    var out: [str] = []
+    var i = 0
+    while i < b.len() {
+        let bad = malformed_length(b, i)
+        if bad > 0 {
+            out.push("\u{FFFD}")
+            i = i + bad
+            continue
+        }
+        let b1 = b[i]
+        if b1 < 128 {
+            out.push(b1.to_char())
+            i = i + 1
+        } else if b1 < 224 {
+            out.push(((b1 - 192).shl(6) + (b[i + 1] - 128)).to_char())
+            i = i + 2
+        } else if b1 < 240 {
+            out.push(((b1 - 224).shl(12) + (b[i + 1] - 128).shl(6) + (b[i + 2] - 128)).to_char())
+            i = i + 3
+        } else {
+            out.push(((b1 - 240).shl(18) + (b[i + 1] - 128).shl(12) + (b[i + 2] - 128).shl(6) + (b[i + 3] - 128)).to_char())
+            i = i + 4
+        }
+    }
+    return out.join("")
+}
+
+fn hex_value(c: i64) -> i64 {
+    return if c >= 48 and c <= 57 { c - 48 } else if c >= 97 and c <= 102 { c - 87 } else { c - 55 }
+}
+
+/// URI.decode: each run of `%XX` escapes decoded as UTF-8. With
+/// `brackets` a `%` between `[` and `]` is left alone, as an IPv6 scope.
+fn decode(s: str, brackets: bool) -> str {
+    let us = units(s)
+    if index_of(s, 37) < 0 {
+        return s
+    }
+    var out = ""
+    var between = false
+    var i = 0
+    while i < us.len() {
+        let c = us[i]
+        if c == 91 {
+            between = true
+        } else if between and c == 93 {
+            between = false
+        }
+        if c != 37 or (between and brackets) {
+            out = out + text_of(us, i, i + 1 + (if c >= 55296 and c < 56320 and i + 1 < us.len() { 1 } else { 0 }))
+            i = i + (if c >= 55296 and c < 56320 and i + 1 < us.len() { 2 } else { 1 })
+            continue
+        }
+        var run: [i64] = []
+        while i < us.len() and us[i] == 37 {
+            run.push(hex_value(us[i + 1]) * 16 + hex_value(us[i + 2]))
+            i = i + 3
+        }
+        out = out + utf8_decode(run)
+    }
+    return out
+}
+
+fn opt_decode(s: Option[str], brackets: bool) -> Option[str] {
+    return match s {
+        Some(t) -> Some(decode(t, brackets))
+        None -> None
+    }
+}
+
+// ---- quoting and encoding
+
+fn hex_byte(b: i64) -> str {
+    let digits = "0123456789ABCDEF"
+    return "%" + digits.substr(b.shr(4), 1) + digits.substr(b.bit_and(15), 1)
+}
+
+fn escape_utf8(c: str) -> str {
+    return c.to_bytes().to_list().map(|b| if b >= 128 { hex_byte(b) } else { b.to_char() }).join("")
+}
+
+/// URI.quote: characters outside the mask escaped; outside ASCII, only the
+/// spaces and controls, and only where escapes are allowed at all.
+fn quote(s: str, m: UMask) -> str {
+    var out: [str] = []
+    for c in s.codes() {
+        if c < 128 {
+            out.push(if matches(c, m) { c.to_char() } else { hex_byte(c) })
+        } else if escapes_allowed(m) and c < 65536 and (is_space_char(c) or is_iso_control(c)) {
+            out.push(escape_utf8(c.to_char()))
+        } else {
+            out.push(c.to_char())
+        }
+    }
+    return out.join("")
+}
+
+/// URI.encode, for `toASCIIString`: NFC, then every byte outside ASCII
+/// escaped.
+fn encode(s: str) -> str {
+    if s.codes().all(|c| c < 128) {
+        return s
+    }
+    return escape_utf8(unicodenorm.nfc(s))
+}
+
+// ---- the parser: URI.Parser, method for method
+
+type UriParser = { input: [i64], server_required: bool, ipv6_bytes: i64, u: JavaUri }
+
+fn empty_uri() -> JavaUri {
+    return JavaUri{ scheme: None, ssp: None, authority: None, user_info: None, host: None, port: 0 - 1, path: None, query: None, fragment: None,
+        text: None }
+}
+
+fn sub(ps: UriParser, a: i64, b: i64) -> str {
+    return text_of(ps.input, a, b)
+}
+
+fn at_c(ps: UriParser, start: i64, end: i64, c: i64) -> bool {
+    return start < end and ps.input[start] == c
+}
+
+fn at_s(ps: UriParser, start: i64, end: i64, s: str) -> bool {
+    let cs = s.codes()
+    if cs.len() > end - start {
+        return false
+    }
+    for i in 0..cs.len() {
+        if ps.input[start + i] != cs[i] {
+            return false
+        }
+    }
+    return true
+}
+
+fn scan_c(ps: UriParser, start: i64, end: i64, c: i64) -> i64 {
+    return if at_c(ps, start, end, c) { start + 1 } else { start }
+}
+
+/// Up to the first character of `stop`; -1 if one of `err` comes first.
+fn scan_until(ps: UriParser, start: i64, end: i64, err: str, stop: str) -> i64 {
+    var p = start
+    while p < end {
+        let c = ps.input[p]
+        if err.codes().contains(c) {
+            return 0 - 1
+        }
+        if stop.codes().contains(c) {
+            break
+        }
+        p = p + 1
+    }
+    return p
+}
+
+fn scan_escape(ps: UriParser, p: i64, n: i64, c: i64) -> i64 ! UriError {
+    if c == 37 {
+        if p + 3 <= n and matches(ps.input[p + 1], m_hex()) and matches(ps.input[p + 2], m_hex()) {
+            return p + 3
+        }
+        fail(UriSyntax("Malformed escape pair", p))
+    }
+    if c > 128 and not is_space_char(c) and not is_iso_control(c) {
+        return p + 1
+    }
+    return p
+}
+
+fn scan_mask(ps: UriParser, start: i64, n: i64, m: UMask) -> i64 ! UriError {
+    var p = start
+    while p < n {
+        let c = ps.input[p]
+        if matches(c, m) {
+            p = p + 1
+            continue
+        }
+        if escapes_allowed(m) {
+            let q = try scan_escape(ps, p, n, c)
+            if q > p {
+                p = q
+                continue
+            }
+        }
+        break
+    }
+    return p
+}
+
+fn check_chars(ps: UriParser, start: i64, end: i64, m: UMask, what: str) ! UriError {
+    let p = try scan_mask(ps, start, end, m)
+    if p < end {
+        fail(UriSyntax("Illegal character in " + what, p))
+    }
+}
+
+fn expecting(what: str, p: i64) -> UriError {
+    return UriSyntax("Expected " + what, p)
+}
+
+/// `Integer.parseInt` of a run of digits: `None` past 2^31 - 1.
+fn int_of(ps: UriParser, a: i64, b: i64) -> Option[i64] {
+    var v = 0
+    for i in a..b {
+        v = v * 10 + ps.input[i] - 48
+        if v > 2147483647 {
+            return None
+        }
+    }
+    return Some(v)
+}
+
+fn parse_uri(inout ps: UriParser) ! UriError {
+    let n = ps.input.len()
+    var p = scan_until(ps, 0, n, "/?#", ":")
+    if p >= 0 and at_c(ps, p, n, 58) {
+        if p == 0 {
+            fail(expecting("scheme name", 0))
+        }
+        try check_chars(ps, 0, 1, m_alpha(), "scheme name")
+        try check_chars(ps, 1, p, m_scheme(), "scheme name")
+        ps.u.scheme = Some(sub(ps, 0, p))
+        p = p + 1
+        if at_c(ps, p, n, 47) {
+            p = try parse_hierarchical(ps, p, n)
+        } else {
+            let q = scan_until(ps, p, n, "", "#")
+            if q <= p {
+                fail(expecting("scheme-specific part", p))
+            }
+            try check_chars(ps, p, q, m_uric(), "opaque part")
+            ps.u.ssp = Some(sub(ps, p, q))
+            p = q
+        }
+    } else {
+        p = try parse_hierarchical(ps, 0, n)
+    }
+    if at_c(ps, p, n, 35) {
+        try check_chars(ps, p + 1, n, m_uric(), "fragment")
+        ps.u.fragment = Some(sub(ps, p + 1, n))
+        p = n
+    }
+    if p < n {
+        fail(UriSyntax("end of URI", p))
+    }
+}
+
+fn parse_hierarchical(inout ps: UriParser, start: i64, n: i64) -> i64 ! UriError {
+    var p = start
+    if at_c(ps, p, n, 47) and at_c(ps, p + 1, n, 47) {
+        p = p + 2
+        let q = scan_until(ps, p, n, "", "/?#")
+        if q > p {
+            p = try parse_authority(ps, p, q)
+        } else if q >= n {
+            // `//` with nothing after it; an empty authority before a path
+            // is allowed, Java's deviation from RFC 2396.
+            fail(expecting("authority", p))
+        }
+    }
+    var q = scan_until(ps, p, n, "", "?#")
+    try check_chars(ps, p, q, m_path(), "path")
+    ps.u.path = Some(sub(ps, p, q))
+    p = q
+    if at_c(ps, p, n, 63) {
+        p = p + 1
+        q = scan_until(ps, p, n, "", "#")
+        try check_chars(ps, p, q, m_uric(), "query")
+        ps.u.query = Some(sub(ps, p, q))
+        p = q
+    }
+    return p
+}
+
+fn forget_server(inout ps: UriParser) {
+    ps.u.user_info = None
+    ps.u.host = None
+    ps.u.port = 0 - 1
+}
+
+/// parseServer and the check after it, which Java runs inside one `try`.
+fn server_attempt(inout ps: UriParser, start: i64, n: i64, skip: bool) -> i64 ! UriError {
+    let q = try parse_server(ps, start, n, skip)
+    if q < n {
+        if skip {
+            forget_server(ps)
+            return start
+        }
+        fail(expecting("end of authority", q))
+    }
+    ps.u.authority = Some(sub(ps, start, n))
+    return q
+}
+
+fn parse_authority(inout ps: UriParser, start: i64, n: i64) -> i64 ! UriError {
+    // Java asks whether a `]` is anywhere but first, and scan answers the
+    // end when there is none, so this is nearly always the percent mask.
+    let server_chars = if scan_until(ps, start, n, "", "]") > start {
+        (try scan_mask(ps, start, n, m_server_percent())) == n
+    } else {
+        (try scan_mask(ps, start, n, m_server())) == n
+    }
+    let reg_chars = (try scan_mask(ps, start, n, m_reg_name())) == n
+    if reg_chars and not server_chars {
+        ps.u.authority = Some(sub(ps, start, n))
+        return n
+    }
+    let skip = not ps.server_required and reg_chars
+    var q = start
+    var caught: Option[UriError] = None
+    if server_chars {
+        match server_attempt(ps, start, n, skip) {
+            Ok(v) -> q = v
+            Err(e) -> match e {
+                UriNumberFormat -> fail(e)
+                _ -> {
+                    forget_server(ps)
+                    if ps.server_required {
+                        fail(e)
+                    }
+                    caught = Some(e)
+                    q = start
+                }
+            }
+        }
+    }
+    if q < n {
+        if reg_chars {
+            ps.u.authority = Some(sub(ps, start, n))
+        } else {
+            match caught {
+                Some(e) -> fail(e)
+                None -> fail(UriSyntax("Illegal character in authority", q))
+            }
+        }
+    }
+    return n
+}
+
+fn parse_bracketed(inout ps: UriParser, start: i64, n: i64) -> i64 ! UriError {
+    let p = start + 1
+    let q = scan_until(ps, p, n, "/?#", "]")
+    if not (q > p and at_c(ps, q, n, 93)) {
+        fail(expecting("closing bracket for IPv6 address", q))
+    }
+    let r = scan_until(ps, p, q, "", "%")
+    if r > p {
+        let _end = try parse_ipv6_reference(ps, p, r)
+        if r + 1 == q {
+            fail(UriSyntax("scope id expected", 0 - 1))
+        }
+        try check_chars(ps, r + 1, q, m_scope_id(), "scope id")
+    } else {
+        let _end = try parse_ipv6_reference(ps, p, q)
+    }
+    ps.u.host = Some(sub(ps, p - 1, q + 1))
+    return q + 1
+}
+
+fn parse_server(inout ps: UriParser, start: i64, n: i64, skip: bool) -> i64 ! UriError {
+    var p = start
+    var q = scan_until(ps, p, n, "/?#", "@")
+    if q >= p and at_c(ps, q, n, 64) {
+        try check_chars(ps, p, q, m_userinfo(), "user info")
+        ps.u.user_info = Some(sub(ps, p, q))
+        p = q + 1
+    }
+    if at_c(ps, p, n, 91) {
+        p = try parse_bracketed(ps, p, n)
+    } else {
+        q = parse_ipv4_address(ps, p, n)
+        if q <= p {
+            q = try parse_hostname(ps, p, n, skip)
+        }
+        p = q
+    }
+    if at_c(ps, p, n, 58) {
+        p = p + 1
+        q = scan_until(ps, p, n, "", "/")
+        if q > p {
+            try check_chars(ps, p, q, m_digit(), "port number")
+            ps.u.port = match int_of(ps, p, q) {
+                Some(v) -> v
+                None -> fail(UriSyntax("Malformed port number", p))
+            }
+            p = q
+        }
+    } else if p < n and skip {
+        return p
+    }
+    if p < n {
+        fail(expecting("port number", p))
+    }
+    return p
+}
+
+fn scan_byte(ps: UriParser, start: i64, n: i64) -> i64 ! UriError {
+    let q = try scan_mask(ps, start, n, m_digit())
+    if q <= start {
+        return q
+    }
+    return match int_of(ps, start, q) {
+        Some(v) -> if v > 255 { start } else { q }
+        None -> fail(UriNumberFormat)
+    }
+}
+
+fn scan_ipv4(ps: UriParser, start: i64, n: i64, strict: bool) -> i64 ! UriError {
+    let m = try scan_mask(ps, start, n, m_digit_dot())
+    if m <= start or (strict and m != n) {
+        return 0 - 1
+    }
+    var p = start
+    var q = p
+    for k in 0..7 {
+        q = if k % 2 == 0 { try scan_byte(ps, p, m) } else { scan_c(ps, p, m, 46) }
+        if q <= p {
+            fail(UriSyntax("Malformed IPv4 address", q))
+        }
+        p = q
+    }
+    if q < m {
+        fail(UriSyntax("Malformed IPv4 address", q))
+    }
+    return q
+}
+
+fn take_ipv4(ps: UriParser, start: i64, n: i64, expected: str) -> i64 ! UriError {
+    let p = try scan_ipv4(ps, start, n, true)
+    if p <= start {
+        fail(expecting(expected, start))
+    }
+    return p
+}
+
+fn parse_ipv4_address(inout ps: UriParser, start: i64, n: i64) -> i64 {
+    var p = match scan_ipv4(ps, start, n, false) {
+        Ok(v) -> v
+        Err(_e) -> return 0 - 1
+    }
+    if p > start and p < n and ps.input[p] != 58 {
+        p = 0 - 1
+    }
+    if p > start {
+        ps.u.host = Some(sub(ps, start, p))
+    }
+    return p
+}
+
+fn parse_hostname(inout ps: UriParser, start: i64, n: i64, skip: bool) -> i64 ! UriError {
+    var p = start
+    var last = 0 - 1
+    while true {
+        var q = try scan_mask(ps, p, n, m_alphanum())
+        if q <= p {
+            break
+        }
+        last = p
+        p = q
+        q = try scan_mask(ps, p, n, m_alphanum_dash())
+        if q > p {
+            if ps.input[q - 1] == 45 {
+                fail(UriSyntax("Illegal character in hostname", q - 1))
+            }
+            p = q
+        }
+        q = scan_c(ps, p, n, 46)
+        if q <= p {
+            break
+        }
+        p = q
+        if p >= n {
+            break
+        }
+    }
+    if p < n and not at_c(ps, p, n, 58) {
+        if skip {
+            return p
+        }
+        fail(UriSyntax("Illegal character in hostname", p))
+    }
+    if last < 0 {
+        fail(expecting("hostname", start))
+    }
+    if last > start and not matches(ps.input[last], m_alpha()) {
+        fail(UriSyntax("Illegal character in hostname", last))
+    }
+    ps.u.host = Some(sub(ps, start, p))
+    return p
+}
+
+fn parse_ipv6_reference(inout ps: UriParser, start: i64, n: i64) -> i64 ! UriError {
+    var p = start
+    var compressed = false
+    let q = try scan_hex_seq(ps, p, n)
+    if q > p {
+        p = q
+        if at_s(ps, p, n, "::") {
+            compressed = true
+            p = try scan_hex_post(ps, p + 2, n)
+        } else if at_c(ps, p, n, 58) {
+            p = try take_ipv4(ps, p + 1, n, "IPv4 address")
+            ps.ipv6_bytes = ps.ipv6_bytes + 4
+        }
+    } else if at_s(ps, p, n, "::") {
+        compressed = true
+        p = try scan_hex_post(ps, p + 2, n)
+    }
+    if p < n {
+        fail(UriSyntax("Malformed IPv6 address", start))
+    }
+    if ps.ipv6_bytes > 16 {
+        fail(UriSyntax("IPv6 address too long", start))
+    }
+    if not compressed and ps.ipv6_bytes < 16 {
+        fail(UriSyntax("IPv6 address too short", start))
+    }
+    if compressed and ps.ipv6_bytes == 16 {
+        fail(UriSyntax("Malformed IPv6 address", start))
+    }
+    return p
+}
+
+fn scan_hex_post(inout ps: UriParser, start: i64, n: i64) -> i64 ! UriError {
+    if start == n {
+        return start
+    }
+    var p = start
+    let q = try scan_hex_seq(ps, p, n)
+    if q > p {
+        p = q
+        if at_c(ps, p, n, 58) {
+            p = try take_ipv4(ps, p + 1, n, "hex digits or IPv4 address")
+            ps.ipv6_bytes = ps.ipv6_bytes + 4
+        }
+    } else {
+        p = try take_ipv4(ps, p, n, "hex digits or IPv4 address")
+        ps.ipv6_bytes = ps.ipv6_bytes + 4
+    }
+    return p
+}
+
+fn scan_hex_seq(inout ps: UriParser, start: i64, n: i64) -> i64 ! UriError {
+    var q = try scan_mask(ps, start, n, m_hex())
+    if q <= start or at_c(ps, q, n, 46) {
+        return 0 - 1
+    }
+    if q > start + 4 {
+        fail(UriSyntax("IPv6 hexadecimal digit sequence too long", start))
+    }
+    ps.ipv6_bytes = ps.ipv6_bytes + 2
+    var p = q
+    while p < n {
+        if not at_c(ps, p, n, 58) or at_c(ps, p + 1, n, 58) {
+            break
+        }
+        p = p + 1
+        q = try scan_mask(ps, p, n, m_hex())
+        if q <= p {
+            fail(expecting("digits for an IPv6 address", p))
+        }
+        if at_c(ps, q, n, 46) {
+            p = p - 1
+            break
+        }
+        if q > p + 4 {
+            fail(UriSyntax("IPv6 hexadecimal digit sequence too long", p))
+        }
+        ps.ipv6_bytes = ps.ipv6_bytes + 2
+        p = q
+    }
+    return p
+}
+
+fn run_parser(input: str, server_required: bool) -> JavaUri ! UriError {
+    var ps = UriParser{ input: units(input), server_required: server_required, ipv6_bytes: 0, u: empty_uri() }
+    try parse_uri(ps)
+    var u = ps.u
+    u.text = Some(input)
+    return u
+}
+
+/// `new URI(text)`.
+pub fn parse(text: str) -> JavaUri ! UriError {
+    return try run_parser(text, false)
+}
+
+// ---- path normalization: URI.normalize(String), on a char array where 0
+// marks the end of a segment and -1 a removed one
+
+fn needs_normalization(path: [i64]) -> i64 {
+    var normal = true
+    var segments = 0
+    let end = path.len() - 1
+    var p = 0
+    while p <= end and path[p] == 47 {
+        p = p + 1
+    }
+    if p > 1 {
+        normal = false
+    }
+    while p <= end {
+        let next = if p < end { path[p + 1] } else { 0 }
+        let next2 = if p + 1 < end { path[p + 2] } else { 0 }
+        if path[p] == 46 and (p == end or next == 47 or (next == 46 and (p + 1 == end or next2 == 47))) {
+            normal = false
+        }
+        segments = segments + 1
+        while p <= end {
+            p = p + 1
+            if path[p - 1] != 47 {
+                continue
+            }
+            while p <= end and path[p] == 47 {
+                normal = false
+                p = p + 1
+            }
+            break
+        }
+    }
+    return if normal { 0 - 1 } else { segments }
+}
+
+fn split_segments(inout path: [i64]) -> [i64] {
+    var segs: [i64] = []
+    let end = path.len() - 1
+    var p = 0
+    while p <= end and path[p] == 47 {
+        path[p] = 0
+        p = p + 1
+    }
+    while p <= end {
+        segs.push(p)
+        p = p + 1
+        while p <= end {
+            p = p + 1
+            if path[p - 1] != 47 {
+                continue
+            }
+            path[p - 1] = 0
+            while p <= end and path[p] == 47 {
+                path[p] = 0
+                p = p + 1
+            }
+            break
+        }
+    }
+    return segs
+}
+
+fn ends_at(path: [i64], p: i64) -> bool {
+    return p >= path.len() or path[p] == 0
+}
+
+fn remove_dots(path: [i64], inout segs: [i64]) {
+    let ns = segs.len()
+    var i = 0
+    while i < ns {
+        var dots = 0
+        while i < ns {
+            let p = segs[i]
+            if path[p] == 46 {
+                if ends_at(path, p + 1) {
+                    dots = 1
+                    break
+                }
+                if path[p + 1] == 46 and ends_at(path, p + 2) {
+                    dots = 2
+                    break
+                }
+            }
+            i = i + 1
+        }
+        if i > ns or dots == 0 {
+            break
+        }
+        if dots == 1 {
+            segs[i] = 0 - 1
+        } else {
+            var j = i - 1
+            while j >= 0 and segs[j] == 0 - 1 {
+                j = j - 1
+            }
+            if j >= 0 {
+                let q = segs[j]
+                if not (path[q] == 46 and path[q + 1] == 46 and ends_at(path, q + 2)) {
+                    segs[i] = 0 - 1
+                    segs[j] = 0 - 1
+                }
+            }
+        }
+        i = i + 1
+    }
+}
+
+fn maybe_add_leading_dot(inout path: [i64], inout segs: [i64]) {
+    if path[0] == 0 {
+        return
+    }
+    var f = 0
+    while f < segs.len() and segs[f] < 0 {
+        f = f + 1
+    }
+    if f >= segs.len() or f == 0 {
+        return
+    }
+    var p = segs[f]
+    while p < path.len() and path[p] != 58 and path[p] != 0 {
+        p = p + 1
+    }
+    if p >= path.len() or path[p] == 0 {
+        return
+    }
+    path[0] = 46
+    path[1] = 0
+    segs[0] = 0
+}
+
+fn join_segments(inout path: [i64], segs: [i64]) -> i64 {
+    let end = path.len() - 1
+    var p = 0
+    if path[p] == 0 {
+        path[p] = 47
+        p = p + 1
+    }
+    for q0 in segs {
+        var q = q0
+        if q == 0 - 1 {
+            continue
+        }
+        if p == q {
+            while p <= end and path[p] != 0 {
+                p = p + 1
+            }
+            if p <= end {
+                path[p] = 47
+                p = p + 1
+            }
+        } else if p < q {
+            while q <= end and path[q] != 0 {
+                path[p] = path[q]
+                p = p + 1
+                q = q + 1
+            }
+            if q <= end {
+                path[p] = 47
+                p = p + 1
+            }
+        }
+    }
+    return p
+}
+
+fn normalize_path(ps: str) -> str {
+    var path = units(ps)
+    let ns = needs_normalization(path)
+    if ns < 0 {
+        return ps
+    }
+    var segs = split_segments(path)
+    remove_dots(path, segs)
+    maybe_add_leading_dot(path, segs)
+    let n = join_segments(path, segs)
+    return text_of(path, 0, n)
+}
+
+/// `URI.normalize()`.
+pub fn normalize(u: JavaUri) -> JavaUri {
+    let p = match u.path {
+        Some(p) -> p
+        None -> return u
+    }
+    if p.len() == 0 {
+        return u
+    }
+    let np = normalize_path(p)
+    if np == p {
+        return u
+    }
+    var v = u
+    v.path = Some(np)
+    v.text = None
+    v.ssp = None
+    return v
+}
+
+fn last_slash(s: str) -> i64 {
+    let us = units(s)
+    var i = us.len() - 1
+    while i >= 0 and us[i] != 47 {
+        i = i - 1
+    }
+    return i
+}
+
+fn prefix_units(s: str, n: i64) -> str {
+    return text_of(units(s), 0, n)
+}
+
+fn resolve_path(base: str, child: str, absolute: bool) -> str {
+    let i = last_slash(base)
+    var path = ""
+    if child.len() == 0 {
+        if i >= 0 {
+            path = prefix_units(base, i + 1)
+        }
+    } else if i >= 0 or not absolute {
+        path = prefix_units(base, i + 1) + child
+    } else {
+        path = "/" + child
+    }
+    return normalize_path(path)
+}
+
+fn is_opaque(u: JavaUri) -> bool {
+    return match u.path {
+        Some(_p) -> false
+        None -> true
+    }
+}
+
+fn is_some(s: Option[str]) -> bool {
+    return match s {
+        Some(_t) -> true
+        None -> false
+    }
+}
+
+fn same_opt(a: Option[str], b: Option[str]) -> bool {
+    return match a {
+        Some(x) -> match b {
+            Some(y) -> x == y
+            None -> false
+        }
+        None -> not is_some(b)
+    }
+}
+
+/// `base.resolve(child)`.
+pub fn resolve(base: JavaUri, child: JavaUri) -> JavaUri {
+    if is_opaque(child) or is_opaque(base) {
+        return child
+    }
+    let child_path = child.path ?? ""
+    if not is_some(child.scheme) and not is_some(child.authority) and child_path.len() == 0 and is_some(child.fragment) and not is_some(child.query) {
+        if is_some(base.fragment) and same_opt(child.fragment, base.fragment) {
+            return base
+        }
+        var ru = base
+        ru.fragment = child.fragment
+        ru.text = None
+        return ru
+    }
+    if is_some(child.scheme) {
+        return child
+    }
+    var ru = empty_uri()
+    ru.scheme = base.scheme
+    ru.query = child.query
+    ru.fragment = child.fragment
+    if is_some(child.authority) {
+        ru.authority = child.authority
+        ru.host = child.host
+        ru.user_info = child.user_info
+        ru.port = child.port
+        ru.path = child.path
+        return ru
+    }
+    ru.authority = base.authority
+    ru.host = base.host
+    ru.user_info = base.user_info
+    ru.port = base.port
+    ru.path = Some(if child_path.starts_with("/") { child_path } else { resolve_path(base.path ?? "", child_path, is_some(base.scheme)) })
+    return ru
+}
+
+/// `base.resolve(String)`: the text parsed first, as `URI.create` does.
+pub fn resolve_text(base: JavaUri, text: str) -> JavaUri ! UriError {
+    return resolve(base, try parse(text))
+}
+
+/// `base.relativize(child)`.
+pub fn relativize(base: JavaUri, child: JavaUri) -> JavaUri {
+    if is_opaque(child) or is_opaque(base) {
+        return child
+    }
+    if not equal_ignoring_case(base.scheme, child.scheme) or not percent_equal(base.authority, child.authority) {
+        return child
+    }
+    var bp = normalize_path(base.path ?? "")
+    let cp = normalize_path(child.path ?? "")
+    if bp != cp {
+        if not bp.ends_with("/") {
+            bp = bp + "/"
+        }
+        if not cp.starts_with(bp) {
+            return child
+        }
+    }
+    var v = empty_uri()
+    let cu = units(cp)
+    v.path = Some(text_of(cu, units(bp).len(), cu.len()))
+    v.query = child.query
+    v.fragment = child.fragment
+    return v
+}
+
+// ---- printing
+
+fn bracket_host(host: str) -> str {
+    let needs = index_of(host, 58) >= 0 and not host.starts_with("[") and not host.ends_with("]")
+    return if needs { "[" + host + "]" } else { host }
+}
+
+/// `toString()`: the parsed text, or the components put back together.
+pub fn to_string(u: JavaUri) -> str {
+    match u.text {
+        Some(t) -> return t
+        None -> {}
+    }
+    var out = match u.scheme {
+        Some(s) -> s + ":"
+        None -> ""
+    }
+    if is_opaque(u) {
+        out = out + (u.ssp ?? "")
+    } else {
+        match u.host {
+            Some(h) -> {
+                out = out + "//" + (match u.user_info {
+                    Some(ui) -> ui + "@"
+                    None -> ""
+                }) + bracket_host(h)
+                if u.port != 0 - 1 {
+                    out = out + ":" + u.port.to_str()
+                }
+            }
+            None -> match u.authority {
+                Some(a) -> out = out + "//" + a
+                None -> {}
+            }
+        }
+        out = out + (u.path ?? "") + (match u.query {
+            Some(q) -> "?" + q
+            None -> ""
+        })
+    }
+    return out + (match u.fragment {
+        Some(f) -> "#" + f
+        None -> ""
+    })
+}
+
+/// `toASCIIString()`.
+pub fn to_ascii_string(u: JavaUri) -> str {
+    return encode(to_string(u))
+}
+
+fn quote_authority(authority: Option[str], user_info: Option[str], host: Option[str], port: i64) -> str {
+    match host {
+        Some(h) -> {
+            let ui = match user_info {
+                Some(x) -> quote(x, m_userinfo()) + "@"
+                None -> ""
+            }
+            return "//" + ui + bracket_host(h) + (if port != 0 - 1 { ":" + port.to_str() } else { "" })
+        }
+        None -> {}
+    }
+    let a = match authority {
+        Some(a) -> a
+        None -> return ""
+    }
+    if a.starts_with("[") {
+        let end = index_of(a, 93)
+        if end != 0 - 1 and index_of(a, 58) != 0 - 1 {
+            let au = units(a)
+            return "//" + text_of(au, 0, end + 1) + quote(text_of(au, end + 1, au.len()), m_reg_or_server())
+        }
+    }
+    return "//" + quote(a, m_reg_or_server())
+}
+
+fn quoted_ssp(opaque: Option[str], authority: Option[str], user_info: Option[str], host: Option[str], port: i64, path: Option[str],
+    query: Option[str]) -> str {
+    match opaque {
+        Some(o) -> {
+            if o.starts_with("//[") {
+                // Java writes nothing at all here unless the `]` and a `:`
+                // are both present.
+                let end = index_of(o, 93)
+                if end != 0 - 1 and index_of(o, 58) != 0 - 1 {
+                    let ou = units(o)
+                    return text_of(ou, 0, end + 1) + quote(text_of(ou, end + 1, ou.len()), m_uric())
+                }
+                return ""
+            }
+            return quote(o, m_uric())
+        }
+        None -> {}
+    }
+    let p = match path {
+        Some(p) -> quote(p, m_path())
+        None -> ""
+    }
+    let q = match query {
+        Some(q) -> "?" + quote(q, m_uric())
+        None -> ""
+    }
+    return quote_authority(authority, user_info, host, port) + p + q
+}
+
+/// `getRawSchemeSpecificPart()`.
+pub fn raw_scheme_specific_part(u: JavaUri) -> str {
+    match u.ssp {
+        Some(s) -> return s
+        None -> {}
+    }
+    let s = match u.text {
+        Some(t) -> t
+        None -> return quoted_ssp(None, opt_decode(u.authority, true), opt_decode(u.user_info, true), u.host, u.port, opt_decode(u.path, true),
+            opt_decode(u.query, false))
+    }
+    let su = units(s)
+    let start = match u.scheme {
+        Some(sc) -> units(sc).len() + 1
+        None -> 0
+    }
+    let end = su.len() - (match u.fragment {
+        Some(f) -> units(f).len() + 1
+        None -> 0
+    })
+    let p = u.path ?? ""
+    if is_some(u.path) and units(p).len() == end - start {
+        return p
+    }
+    return text_of(su, start, end)
+}
+
+pub fn scheme_specific_part(u: JavaUri) -> str {
+    return decode(raw_scheme_specific_part(u), true)
+}
+
+pub fn decoded_authority(u: JavaUri) -> Option[str] {
+    return opt_decode(u.authority, true)
+}
+
+pub fn decoded_user_info(u: JavaUri) -> Option[str] {
+    return opt_decode(u.user_info, true)
+}
+
+pub fn decoded_path(u: JavaUri) -> Option[str] {
+    return opt_decode(u.path, true)
+}
+
+pub fn decoded_query(u: JavaUri) -> Option[str] {
+    return opt_decode(u.query, false)
+}
+
+pub fn decoded_fragment(u: JavaUri) -> Option[str] {
+    return opt_decode(u.fragment, false)
+}
+
+// ---- equality, order and hash, with escapes compared case-blind
+
+fn lower_unit(c: i64) -> i64 {
+    return if c >= 65 and c <= 90 { c + 32 } else { c }
+}
+
+fn upper_unit(c: i64) -> i64 {
+    return if c >= 97 and c <= 122 { c - 32 } else { c }
+}
+
+fn compare_ignoring_case(a: Option[str], b: Option[str]) -> i64 {
+    let s = match a {
+        Some(s) -> units(s)
+        None -> return if is_some(b) { 0 - 1 } else { 0 }
+    }
+    let t = match b {
+        Some(t) -> units(t)
+        None -> return 1
+    }
+    for i in 0..s.len().min(t.len()) {
+        let c = lower_unit(s[i]) - lower_unit(t[i])
+        if c != 0 {
+            return c
+        }
+    }
+    return s.len() - t.len()
+}
+
+fn equal_ignoring_case(a: Option[str], b: Option[str]) -> bool {
+    return match a {
+        Some(s) -> match b {
+            Some(t) -> units(s).len() == units(t).len() and compare_ignoring_case(a, b) == 0
+            None -> false
+        }
+        None -> not is_some(b)
+    }
+}
+
+/// String.compareTo, on UTF-16 units.
+fn compare_units(s: [i64], t: [i64]) -> i64 {
+    for i in 0..s.len().min(t.len()) {
+        if s[i] != t[i] {
+            return s[i] - t[i]
+        }
+    }
+    return s.len() - t.len()
+}
+
+fn percent_comparison(a: Option[str], b: Option[str], equality: bool) -> i64 {
+    let s = match a {
+        Some(s) -> units(s)
+        None -> return if is_some(b) { 0 - 1 } else { 0 }
+    }
+    let t = match b {
+        Some(t) -> units(t)
+        None -> return 1
+    }
+    if not s.contains(37) {
+        return compare_units(s, t)
+    }
+    if s.len() != t.len() and equality {
+        return s.len() - t.len()
+    }
+    var i = 0
+    while i < s.len().min(t.len()) {
+        let c = s[i]
+        let d = t[i]
+        if c != 37 or d != 37 {
+            if c != d {
+                return c - d
+            }
+            i = i + 1
+            continue
+        }
+        for k in 1..3 {
+            let v = lower_unit(s[i + k]) - lower_unit(t[i + k])
+            if v != 0 {
+                return v
+            }
+        }
+        i = i + 3
+    }
+    return s.len() - t.len()
+}
+
+fn percent_equal(a: Option[str], b: Option[str]) -> bool {
+    return percent_comparison(a, b, true) == 0
+}
+
+/// `a.equals(b)`.
+pub fn equals(a: JavaUri, b: JavaUri) -> bool {
+    if is_opaque(a) != is_opaque(b) or not equal_ignoring_case(a.scheme, b.scheme) or not percent_equal(a.fragment, b.fragment) {
+        return false
+    }
+    if is_opaque(a) {
+        return percent_equal(a.ssp, b.ssp)
+    }
+    if not percent_equal(a.path, b.path) or not percent_equal(a.query, b.query) {
+        return false
+    }
+    if not is_some(a.authority) and not is_some(b.authority) {
+        return true
+    }
+    if is_some(a.host) {
+        return percent_equal(a.user_info, b.user_info) and equal_ignoring_case(a.host, b.host) and a.port == b.port
+    }
+    if is_some(a.authority) {
+        return percent_equal(a.authority, b.authority)
+    }
+    return false
+}
+
+/// `a.compareTo(b)`: Java's value, not only its sign.
+pub fn compare(a: JavaUri, b: JavaUri) -> i64 {
+    var c = compare_ignoring_case(a.scheme, b.scheme)
+    if c != 0 {
+        return c
+    }
+    if is_opaque(a) {
+        if not is_opaque(b) {
+            return 1
+        }
+        c = percent_comparison(a.ssp, b.ssp, false)
+        return if c != 0 { c } else { percent_comparison(a.fragment, b.fragment, false) }
+    }
+    if is_opaque(b) {
+        return 0 - 1
+    }
+    if is_some(a.host) and is_some(b.host) {
+        c = percent_comparison(a.user_info, b.user_info, false)
+        if c == 0 {
+            c = compare_ignoring_case(a.host, b.host)
+        }
+        if c == 0 {
+            c = a.port - b.port
+        }
+    } else {
+        c = percent_comparison(a.authority, b.authority, false)
+    }
+    for pair in [(a.path, b.path), (a.query, b.query), (a.fragment, b.fragment)] {
+        if c != 0 {
+            return c
+        }
+        let (x, y) = pair
+        c = percent_comparison(x, y, false)
+    }
+    return c
+}
+
+fn hash_part(h: i32, s: Option[str]) -> i32 {
+    let us = match s {
+        Some(t) -> units(t)
+        None -> return h
+    }
+    var g: i32 = 0
+    var i = 0
+    while i < us.len() {
+        g = 31 * g + us[i].as_i32()
+        if us[i] == 37 {
+            g = 31 * g + upper_unit(us[i + 1]).as_i32()
+            g = 31 * g + upper_unit(us[i + 2]).as_i32()
+            i = i + 2
+        }
+        i = i + 1
+    }
+    return h * 127 + g
+}
+
+fn hash_ignoring_case(h: i32, s: Option[str]) -> i32 {
+    var g = h
+    match s {
+        Some(t) -> {
+            for c in units(t) {
+                g = 31 * g + lower_unit(c).as_i32()
+            }
+        }
+        None -> {}
+    }
+    return g
+}
+
+/// `hashCode()`, a Java `int`.
+pub fn hash_code(u: JavaUri) -> i64 {
+    var h = hash_ignoring_case(0, u.scheme)
+    h = hash_part(h, u.fragment)
+    if is_opaque(u) {
+        h = hash_part(h, u.ssp)
+    } else {
+        h = hash_part(h, u.path)
+        h = hash_part(h, u.query)
+        if is_some(u.host) {
+            h = hash_part(h, u.user_info)
+            h = hash_ignoring_case(h, u.host)
+            h = h + 1949 * u.port.as_i32()
+        } else {
+            h = hash_part(h, u.authority)
+        }
+    }
+    return h.as_i64()
+}
+
+// ---- the other constructors, which quote what they are given
+
+fn check_path(scheme: Option[str], path: Option[str]) ! UriError {
+    if is_some(scheme) {
+        let p = path ?? "/"
+        if p.len() > 0 and not p.starts_with("/") {
+            fail(UriSyntax("Relative path in absolute URI", 0 - 1))
+        }
+    }
+}
+
+fn assemble(scheme: Option[str], opaque: Option[str], authority: Option[str], user_info: Option[str], host: Option[str], port: i64,
+    path: Option[str], query: Option[str], fragment: Option[str]) -> str {
+    let head = match scheme {
+        Some(s) -> s + ":"
+        None -> ""
+    }
+    let tail = match fragment {
+        Some(f) -> "#" + quote(f, m_uric())
+        None -> ""
+    }
+    return head + quoted_ssp(opaque, authority, user_info, host, port, path, query) + tail
+}
+
+/// `new URI(scheme, userInfo, host, port, path, query, fragment)`; the
+/// authority must parse as a server.
+pub fn of_parts(scheme: Option[str], user_info: Option[str], host: Option[str], port: i64, path: Option[str], query: Option[str],
+    fragment: Option[str]) -> JavaUri ! UriError {
+    let s = assemble(scheme, None, None, user_info, host, port, path, query, fragment)
+    try check_path(scheme, path)
+    return try run_parser(s, true)
+}
+
+/// `new URI(scheme, authority, path, query, fragment)`.
+pub fn of_authority(scheme: Option[str], authority: Option[str], path: Option[str], query: Option[str], fragment: Option[str]) -> JavaUri ! UriError {
+    let s = assemble(scheme, None, authority, None, None, 0 - 1, path, query, fragment)
+    try check_path(scheme, path)
+    return try run_parser(s, false)
+}
+
+/// `new URI(scheme, ssp, fragment)`.
+pub fn of_ssp(scheme: Option[str], ssp: Option[str], fragment: Option[str]) -> JavaUri ! UriError {
+    return try run_parser(assemble(scheme, ssp, None, None, None, 0 - 1, None, None, fragment), false)
+}
+
+/// `parseServerAuthority()`: a registry authority parsed again as a
+/// server, or the error saying why it is not one.
+pub fn parse_server_authority(u: JavaUri) -> JavaUri ! UriError {
+    if is_some(u.host) or not is_some(u.authority) {
+        return u
+    }
+    return try run_parser(to_string(u), true)
+}

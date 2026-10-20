@@ -1,0 +1,436 @@
+// Go's `encoding/csv`, byte for byte as Go 1.25 reads and writes it:
+// records, errors with their lines and byte columns, `FieldPos`,
+// `InputOffset`, and the Writer's quoting.
+//
+// A CSV file has no standard beyond RFC 4180's suggestions, so "the same
+// CSV" means the same reader. Where a Go service is the other end -- it
+// wrote the export, or it will reject the upload -- what matters is Go's
+// answers, and they are particular:
+//
+//   - `\r\n` ends a line as `\n` does, and inside a quoted field becomes a
+//     plain `\n`; a lone `\r` is data, except one ending the file.
+//   - Blank lines are skipped, and with `comment` set so are lines that
+//     begin with it; a field may span lines only inside quotes.
+//   - A `"` inside an unquoted field is an error ("bare \" in
+//     non-quoted-field") unless `lazy_quotes`; so is anything but the
+//     separator or a line end after a closing quote ("extraneous or
+//     missing \" in quoted-field").
+//   - `fields_per_record` of 0 fixes the count at the first record's;
+//     a record of another length is still returned, with "wrong number of
+//     fields".
+//   - Columns count bytes from 1; an error in a record that began on an
+//     earlier line names both lines.
+//   - Writing quotes a field holding the separator, a quote, `\r` or
+//     `\n`, one starting with a space character (Unicode's), and the field
+//     `\.`; nothing else.
+//
+// Fields are bytes, as Go strings are: invalid UTF-8 passes through.
+
+/// The Reader's settings: `comma` and `comment` are code points (`comment`
+/// 0 for none); `fields_per_record` above 0 is required, 0 is taken from
+/// the first record, below 0 is not checked.
+type CsvOptions = { comma: i64, comment: i64, fields_per_record: i64, lazy_quotes: bool, trim_leading_space: bool }
+
+type CsvErrorKind =
+    | CsvBareQuote
+    | CsvQuote
+    | CsvFieldCount
+
+/// A ParseError, or the error for a separator or comment Go refuses.
+type GoCsvError =
+    | CsvParse(start_line: i64, line: i64, column: i64, kind: CsvErrorKind)
+    | CsvInvalidDelim
+
+/// Where a field began: its line and byte column, from 1.
+type CsvPos = { line: i64, column: i64 }
+
+/// One `Read`: the record and where each field began, with the error Go
+/// returns alongside it (a record cut short by a parse error keeps the
+/// fields read before it); `eof` when the input is done.
+type CsvRead = { fields: [bytes], positions: [CsvPos], err: Option[GoCsvError], eof: bool }
+
+/// A Reader over the whole input.
+type CsvReader = { data: [i64], at: i64, num_line: i64, offset: i64, opts: CsvOptions }
+
+/// `csv.NewReader`'s defaults: a comma, no comment character.
+pub fn default_options() -> CsvOptions {
+    return CsvOptions{ comma: 44, comment: 0, fields_per_record: 0, lazy_quotes: false, trim_leading_space: false }
+}
+
+pub fn reader(data: bytes, opts: CsvOptions) -> CsvReader {
+    return CsvReader{ data: data.to_list(), at: 0, num_line: 0, offset: 0, opts: opts }
+}
+
+/// `InputOffset`: the bytes consumed so far.
+pub fn input_offset(r: CsvReader) -> i64 {
+    return r.offset
+}
+
+/// What Go's `Error()` gives.
+pub fn error_text(e: GoCsvError) -> str {
+    return match e {
+        CsvInvalidDelim -> "csv: invalid field or comment delimiter"
+        CsvParse(start, line, col, kind) -> {
+            let why = match kind {
+                CsvBareQuote -> "bare \" in non-quoted-field"
+                CsvQuote -> "extraneous or missing \" in quoted-field"
+                CsvFieldCount -> "wrong number of fields"
+            }
+            match kind {
+                CsvFieldCount -> "record on line " + line.to_str() + ": " + why
+                _ -> if start != line {
+                    "record on line " + start.to_str() + "; parse error on line " + line.to_str() + ", column " + col.to_str() + ": " + why
+                } else { "parse error on line " + line.to_str() + ", column " + col.to_str() + ": " + why }
+            }
+        }
+    }
+}
+
+// ---- runes, as Go decodes them
+
+fn utf8_of(r: i64) -> [i64] {
+    return r.to_char().to_bytes().to_list()
+}
+
+/// The rune at `i` and its width; invalid UTF-8 is U+FFFD of width 1.
+fn decode_rune(b: [i64], i: i64) -> (i64, i64) {
+    let c = b[i]
+    if c < 128 {
+        return (c, 1)
+    }
+    let n = if c >= 194 and c <= 223 { 2 } else if c >= 224 and c <= 239 { 3 } else if c >= 240 and c <= 244 { 4 } else { 0 }
+    if n == 0 or i + n > b.len() {
+        return (65533, 1)
+    }
+    let lo = if c == 224 { 160 } else if c == 240 { 144 } else { 128 }
+    let hi = if c == 237 { 159 } else if c == 244 { 143 } else { 191 }
+    if b[i + 1] < lo or b[i + 1] > hi {
+        return (65533, 1)
+    }
+    var v = c.bit_and(if n == 2 { 31 } else if n == 3 { 15 } else { 7 })
+    for k in 1..n {
+        if b[i + k] < 128 or b[i + k] > 191 {
+            return (65533, 1)
+        }
+        v = v.shl(6).bit_or(b[i + k].bit_and(63))
+    }
+    return (v, n)
+}
+
+/// unicode.IsSpace.
+fn is_space(r: i64) -> bool {
+    return (r >= 9 and r <= 13) or r == 32 or r == 133 or r == 160 or r == 5760 or (r >= 8192 and r <= 8202) or r == 8232 or r == 8233 or r == 8239 or
+    r == 8287 or r == 12288
+}
+
+fn valid_delim(r: i64) -> bool {
+    return r != 0 and r != 34 and r != 13 and r != 10 and r >= 0 and r <= 1114111 and (r < 55296 or r > 57343) and r != 65533
+}
+
+fn starts_with(line: [i64], at: i64, pat: [i64]) -> bool {
+    if at + pat.len() > line.len() {
+        return false
+    }
+    for k in 0..pat.len() {
+        if line[at + k] != pat[k] {
+            return false
+        }
+    }
+    return true
+}
+
+fn index_of(line: [i64], pat: [i64]) -> i64 {
+    var i = 0
+    while i + pat.len() <= line.len() {
+        if starts_with(line, i, pat) {
+            return i
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+fn length_nl(b: [i64]) -> i64 {
+    return if b.len() > 0 and b[b.len() - 1] == 10 { 1 } else { 0 }
+}
+
+// ---- reading
+
+/// readLine: the next line with its `\n`, `\r\n` folded to `\n`, and
+/// whether the input had already run out.
+fn read_line(inout r: CsvReader) -> ([i64], bool) {
+    var j = r.at
+    while j < r.data.len() and r.data[j] != 10 {
+        j = j + 1
+    }
+    let found = j < r.data.len()
+    var line = r.data.slice(r.at, if found { j + 1 } else { j })
+    r.at = if found { j + 1 } else { j }
+    let size = line.len()
+    let eof = not found and size == 0
+    if not found and size > 0 and line[size - 1] == 13 {
+        line = line.slice(0, size - 1)
+    }
+    r.num_line = r.num_line + 1
+    r.offset = r.offset + size
+    let n = line.len()
+    if n >= 2 and line[n - 2] == 13 and line[n - 1] == 10 {
+        line = line.slice(0, n - 2)
+        line.push(10)
+    }
+    return (line, eof)
+}
+
+/// The fields of a record as they are read.
+type CsvBuild = { buf: [i64], ends: [i64], positions: [CsvPos], err: Option[GoCsvError], done: bool }
+
+fn end_field(inout f: CsvBuild, at: CsvPos) {
+    f.ends.push(f.buf.len())
+    f.positions.push(at)
+}
+
+fn append(inout f: CsvBuild, xs: [i64]) {
+    for x in xs {
+        f.buf.push(x)
+    }
+}
+
+/// An unquoted field at the front of `line`.
+fn unquoted_field(inout r: CsvReader, inout f: CsvBuild, inout line: [i64], inout pos: CsvPos, rec_line: i64) {
+    let comma = utf8_of(r.opts.comma)
+    let i = index_of(line, comma)
+    let field = if i >= 0 { line.slice(0, i) } else { line.slice(0, line.len() - length_nl(line)) }
+    if not r.opts.lazy_quotes {
+        let j = index_of(field, [34])
+        if j >= 0 {
+            f.err = Some(CsvParse(rec_line, r.num_line, pos.column + j, CsvBareQuote))
+            f.done = true
+            return
+        }
+    }
+    append(f, field)
+    end_field(f, pos)
+    if i >= 0 {
+        line = line.slice(i + comma.len(), line.len())
+        pos.column = pos.column + i + comma.len()
+    } else {
+        f.done = true
+    }
+}
+
+/// A quoted field at the front of `line`, which may run on to later lines.
+fn quoted_field(inout r: CsvReader, inout f: CsvBuild, inout line: [i64], inout pos: CsvPos, rec_line: i64) {
+    let comma = utf8_of(r.opts.comma)
+    let field_pos = pos
+    line = line.slice(1, line.len())
+    pos.column = pos.column + 1
+    while true {
+        let i = index_of(line, [34])
+        if i >= 0 {
+            append(f, line.slice(0, i))
+            line = line.slice(i + 1, line.len())
+            pos.column = pos.column + i + 1
+            if starts_with(line, 0, [34]) {
+                f.buf.push(34)
+                line = line.slice(1, line.len())
+                pos.column = pos.column + 1
+            } else if starts_with(line, 0, comma) {
+                line = line.slice(comma.len(), line.len())
+                pos.column = pos.column + comma.len()
+                end_field(f, field_pos)
+                return
+            } else if length_nl(line) == line.len() {
+                end_field(f, field_pos)
+                f.done = true
+                return
+            } else if r.opts.lazy_quotes {
+                f.buf.push(34)
+            } else {
+                f.err = Some(CsvParse(rec_line, r.num_line, pos.column - 1, CsvQuote))
+                f.done = true
+                return
+            }
+        } else if line.len() > 0 {
+            append(f, line)
+            pos.column = pos.column + line.len()
+            let (next, _eof) = read_line(r)
+            line = next
+            if line.len() > 0 {
+                pos.line = pos.line + 1
+                pos.column = 1
+            }
+        } else {
+            if not r.opts.lazy_quotes {
+                f.err = Some(CsvParse(rec_line, pos.line, pos.column, CsvQuote))
+            } else {
+                end_field(f, field_pos)
+            }
+            f.done = true
+            return
+        }
+    }
+}
+
+fn trim_space(inout line: [i64], inout pos: CsvPos) {
+    var i = 0
+    while i < line.len() {
+        let (rn, w) = decode_rune(line, i)
+        if not is_space(rn) {
+            break
+        }
+        i = i + w
+    }
+    if i >= line.len() {
+        pos.column = pos.column - length_nl(line)
+    }
+    line = line.slice(i, line.len())
+    pos.column = pos.column + i
+}
+
+/// `Read`: the next record.
+pub fn read(inout r: CsvReader) -> CsvRead {
+    let o = r.opts
+    if o.comma == o.comment or not valid_delim(o.comma) or (o.comment != 0 and not valid_delim(o.comment)) {
+        return CsvRead{ fields: [], positions: [], err: Some(CsvInvalidDelim), eof: false }
+    }
+    var line: [i64] = []
+    var eof = false
+    while not eof {
+        let (l, e) = read_line(r)
+        line = l
+        eof = e
+        if o.comment != 0 and starts_with(line, 0, utf8_of(o.comment)) {
+            continue
+        }
+        if not eof and line.len() == length_nl(line) {
+            continue
+        }
+        break
+    }
+    if eof {
+        return CsvRead{ fields: [], positions: [], err: None, eof: true }
+    }
+    let rec_line = r.num_line
+    var f = CsvBuild{ buf: [], ends: [], positions: [], err: None, done: false }
+    var pos = CsvPos{ line: r.num_line, column: 1 }
+    while not f.done {
+        if o.trim_leading_space {
+            trim_space(line, pos)
+        }
+        if line.len() == 0 or line[0] != 34 {
+            unquoted_field(r, f, line, pos, rec_line)
+        } else {
+            quoted_field(r, f, line, pos, rec_line)
+        }
+    }
+    var fields: [bytes] = []
+    var start = 0
+    for e in f.ends {
+        fields.push(bytes_of(f.buf.slice(start, e)))
+        start = e
+    }
+    var err = f.err
+    if r.opts.fields_per_record > 0 {
+        if fields.len() != r.opts.fields_per_record and err.is_none() {
+            err = Some(CsvParse(rec_line, rec_line, 1, CsvFieldCount))
+        }
+    } else if r.opts.fields_per_record == 0 {
+        r.opts.fields_per_record = fields.len()
+    }
+    return CsvRead{ fields: fields, positions: f.positions, err: err, eof: false }
+}
+
+/// `ReadAll`: every record, or the first error.
+pub fn read_all(data: bytes, opts: CsvOptions) -> [[bytes]] ! GoCsvError {
+    var r = reader(data, opts)
+    var out: [[bytes]] = []
+    while true {
+        let rec = read(r)
+        if rec.eof {
+            break
+        }
+        match rec.err {
+            Some(e) -> fail(e)
+            None -> out.push(rec.fields)
+        }
+    }
+    return out
+}
+
+/// `ReadAll` with the defaults, on text.
+pub fn read_all_text(text: str) -> [[str]] ! GoCsvError {
+    return (try read_all(text.to_bytes(), default_options())).map(|rec| rec.map(|f| f.to_str()))
+}
+
+// ---- writing
+
+fn needs_quotes(field: [i64], comma: i64) -> bool {
+    if field.len() == 0 {
+        return false
+    }
+    if field == [92, 46] {
+        return true
+    }
+    if field.any(|c| c == 10 or c == 13 or c == 34) {
+        return true
+    }
+    if comma < 128 {
+        if field.contains(comma) {
+            return true
+        }
+    } else if index_of(field, utf8_of(comma)) >= 0 {
+        return true
+    }
+    let (r1, _w) = decode_rune(field, 0)
+    return is_space(r1)
+}
+
+/// A Writer's output for `records`: `comma` between fields, `\r\n`
+/// line ends (and inside quoted fields) when `use_crlf`.
+pub fn write(records: [[bytes]], comma: i64, use_crlf: bool) -> bytes ! GoCsvError {
+    var out: [i64] = []
+    for rec in records {
+        // Each Write checks the separator, so no records is no error.
+        if not valid_delim(comma) {
+            fail(CsvInvalidDelim)
+        }
+        for n in 0..rec.len() {
+            if n > 0 {
+                for x in utf8_of(comma) {
+                    out.push(x)
+                }
+            }
+            let field = rec[n].to_list()
+            if not needs_quotes(field, comma) {
+                for x in field {
+                    out.push(x)
+                }
+                continue
+            }
+            out.push(34)
+            for c in field {
+                if c == 34 {
+                    out.push(34)
+                    out.push(34)
+                } else if c == 13 {
+                    if not use_crlf {
+                        out.push(13)
+                    }
+                } else if c == 10 {
+                    if use_crlf {
+                        out.push(13)
+                    }
+                    out.push(10)
+                } else {
+                    out.push(c)
+                }
+            }
+            out.push(34)
+        }
+        if use_crlf {
+            out.push(13)
+        }
+        out.push(10)
+    }
+    return bytes_of(out)
+}

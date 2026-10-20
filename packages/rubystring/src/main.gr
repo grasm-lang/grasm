@@ -1,0 +1,316 @@
+// Ruby's `String#succ`, `tr`, `tr_s`, `delete`, `squeeze` and `count`, as
+// Ruby 2.6 runs them on byte strings (ASCII-8BIT), which is also what it
+// does to UTF-8 text that is all ASCII.
+//
+// Ruby code names files, versions and ids with `succ` and cleans text with
+// `tr` and `delete`, and their rules are Ruby's own:
+//
+//   - `succ` increments the rightmost letter or digit, carrying into the
+//     next one to the left and keeping case and kind (`"az"` is `"ba"`,
+//     `"Zz"` is `"AAa"`, `"a9"` is `"b0"`), and does not carry across
+//     punctuation into a letter of the other kind (`"a.9"` is `"a.10"`).
+//     A string with no letter or digit counts up its last byte instead,
+//     a 0xff wrapping and carrying into a new leading 0x01.
+//   - A character set is a list of bytes and ranges (`a-z`); a `^` first
+//     (with something after it) negates it; `\` takes the next byte
+//     literally; a backwards range is "invalid range "z-a" in string
+//     transliteration". A range whose ends are equal yields its byte twice.
+//   - `tr` maps the nth byte of the first set to the nth of the second,
+//     repeating the second's last byte when it runs out (a later mapping
+//     of the same byte wins), and deletes when the second set is empty;
+//     `tr_s` also squeezes runs of the same translated byte.
+//   - `delete`, `squeeze` and `count` take several sets and use the bytes
+//     in all of them; `squeeze` with no set squeezes every run.
+//
+// Text beyond ASCII in a UTF-8 string is outside this: there Ruby uses
+// Unicode's letters and digits and steps through UTF-8 encodings.
+
+/// ArgumentError, with Ruby's message.
+type RubyArgumentError = | RubyArgumentError(msg: str)
+
+pub fn error_text(e: RubyArgumentError) -> str {
+    return match e {
+        RubyArgumentError(m) -> m
+    }
+}
+
+// ---- succ
+
+fn is_digit(c: i64) -> bool {
+    return c >= 48 and c <= 57
+}
+
+fn is_alpha(c: i64) -> bool {
+    return (c >= 65 and c <= 90) or (c >= 97 and c <= 122)
+}
+
+/// The next alphanumeric byte of the same kind: (byte, wrapped, carry).
+/// Not alphanumeric gives (c, false, -1).
+fn succ_alnum(c: i64) -> (i64, bool, i64) {
+    if is_digit(c) {
+        return if c == 57 { (48, true, 49) } else { (c + 1, false, 0) }
+    }
+    if is_alpha(c) {
+        if c == 122 {
+            return (97, true, 97)
+        }
+        if c == 90 {
+            return (65, true, 65)
+        }
+        return (c + 1, false, 0)
+    }
+    return (c, false, 0 - 1)
+}
+
+/// `str.succ`.
+pub fn succ(s: bytes) -> bytes {
+    var b = s.to_list()
+    if b.len() == 0 {
+        return s
+    }
+    var carry = 1
+    var carry_pos = 0
+    var found_alnum = false
+    // What the byte to the right turned out to be: 0 found, 1 wrapped,
+    // 2 not a letter or digit.
+    var neighbor = 0
+    var last_alnum = 0 - 1
+    var i = b.len() - 1
+    while i >= 0 {
+        if neighbor == 2 and last_alnum >= 0 {
+            let la = b[last_alnum]
+            if (is_alpha(la) and is_digit(b[i])) or (is_digit(la) and is_alpha(b[i])) {
+                break
+            }
+        }
+        let (next, wrapped, c) = succ_alnum(b[i])
+        if c < 0 {
+            neighbor = 2
+            i = i - 1
+            continue
+        }
+        b[i] = next
+        if not wrapped {
+            return bytes_of(b)
+        }
+        neighbor = 1
+        last_alnum = i
+        found_alnum = true
+        carry = c
+        carry_pos = i
+        i = i - 1
+    }
+    if not found_alnum {
+        var k = b.len() - 1
+        while k >= 0 {
+            if b[k] < 255 {
+                b[k] = b[k] + 1
+                return bytes_of(b)
+            }
+            b[k] = 0
+            carry_pos = k
+            k = k - 1
+        }
+        carry = 1
+    }
+    var out = b.slice(0, carry_pos)
+    out.push(carry)
+    for x in b.slice(carry_pos, b.len()) {
+        out.push(x)
+    }
+    return bytes_of(out)
+}
+
+// ---- character sets
+
+type TrIter = { p: [i64], i: i64, gen: bool, now: i64, max: i64 }
+
+fn tr_iter(set: [i64]) -> TrIter {
+    return TrIter{ p: set, i: 0, gen: false, now: 0, max: 0 }
+}
+
+fn range_error(a: i64, b: i64) -> RubyArgumentError {
+    if a < 128 and b < 128 {
+        return RubyArgumentError("invalid range \"" + a.to_char() + "-" + b.to_char() + "\" in string transliteration")
+    }
+    return RubyArgumentError("invalid range in string transliteration")
+}
+
+/// trnext: the next byte the set lists, -1 at its end.
+fn trnext(inout t: TrIter) -> i64 ! RubyArgumentError {
+    if t.gen {
+        t.now = t.now + 1
+        if t.now < t.max {
+            return t.now
+        }
+        t.gen = false
+        return t.max
+    }
+    if t.i >= t.p.len() {
+        return 0 - 1
+    }
+    if t.p[t.i] == 92 and t.i + 1 < t.p.len() {
+        t.i = t.i + 1
+    }
+    t.now = t.p[t.i]
+    t.i = t.i + 1
+    if t.i < t.p.len() and t.p[t.i] == 45 and t.i + 1 < t.p.len() {
+        let c = t.p[t.i + 1]
+        t.i = t.i + 2
+        if t.now > c {
+            fail(range_error(t.now, c))
+        }
+        t.gen = true
+        t.max = c
+    }
+    return t.now
+}
+
+/// The set without its `^`, and whether it had one.
+fn negation(set: [i64]) -> ([i64], bool) {
+    if set.len() > 1 and set[0] == 94 {
+        return (set.slice(1, set.len()), true)
+    }
+    return (set, false)
+}
+
+/// Which bytes a set selects.
+fn selects(set: [i64]) -> [bool] ! RubyArgumentError {
+    let (body, negated) = negation(set)
+    var buf = (0..256).to_list().map(|_x| negated)
+    var t = tr_iter(body)
+    while true {
+        let c = try trnext(t)
+        if c < 0 {
+            break
+        }
+        buf[c] = not negated
+    }
+    return buf
+}
+
+/// The bytes all the sets select.
+fn table(sets: [bytes]) -> [bool] ! RubyArgumentError {
+    var out = (0..256).to_list().map(|_x| true)
+    for s in sets {
+        let one = try selects(s.to_list())
+        for c in 0..256 {
+            out[c] = out[c] and one[c]
+        }
+    }
+    return out
+}
+
+fn arity(sets: [bytes]) -> () ! RubyArgumentError {
+    if sets.len() == 0 {
+        fail(RubyArgumentError("wrong number of arguments (given 0, expected 1+)"))
+    }
+    return ()
+}
+
+// ---- tr, tr_s
+
+/// The translation table: each byte's replacement, -1 for none.
+fn trans_table(from: [i64], to: [i64]) -> [i64] ! RubyArgumentError {
+    let (body, negated) = negation(from)
+    var src = tr_iter(body)
+    var repl = tr_iter(to)
+    if negated {
+        var trans = (0..256).to_list().map(|_x| 1)
+        while true {
+            let c = try trnext(src)
+            if c < 0 {
+                break
+            }
+            trans[c] = 0 - 1
+        }
+        while true {
+            let r = try trnext(repl)
+            if r < 0 {
+                break
+            }
+        }
+        let last = repl.now
+        return trans.map(|x| if x < 0 { 0 - 1 } else { last })
+    }
+    var trans = (0..256).to_list().map(|_x| 0 - 1)
+    while true {
+        let c = try trnext(src)
+        if c < 0 {
+            break
+        }
+        var r = try trnext(repl)
+        if r < 0 {
+            r = repl.now
+        }
+        trans[c] = r
+    }
+    return trans
+}
+
+fn translate(s: bytes, from: bytes, to: bytes, squeeze_runs: bool) -> bytes ! RubyArgumentError {
+    if s.len() == 0 {
+        return s
+    }
+    if to.len() == 0 {
+        return try delete(s, [from])
+    }
+    let trans = try trans_table(from.to_list(), to.to_list())
+    var out: [i64] = []
+    var save = 0 - 1
+    for c in s.to_list() {
+        let r = trans[c]
+        if r < 0 {
+            save = 0 - 1
+            out.push(c)
+        } else if not (squeeze_runs and r == save) {
+            save = r
+            out.push(r)
+        }
+    }
+    return bytes_of(out)
+}
+
+/// `str.tr(from, to)`.
+pub fn tr(s: bytes, from: bytes, to: bytes) -> bytes ! RubyArgumentError {
+    return try translate(s, from, to, false)
+}
+
+/// `str.tr_s(from, to)`.
+pub fn tr_s(s: bytes, from: bytes, to: bytes) -> bytes ! RubyArgumentError {
+    return try translate(s, from, to, true)
+}
+
+// ---- delete, squeeze, count
+
+/// `str.delete(*sets)`.
+pub fn delete(s: bytes, sets: [bytes]) -> bytes ! RubyArgumentError {
+    // An empty string returns before the arguments are even counted.
+    if s.len() == 0 {
+        return s
+    }
+    try arity(sets)
+    let t = try table(sets)
+    return bytes_of(s.to_list().filter(|c| not t[c]))
+}
+
+/// `str.squeeze(*sets)`.
+pub fn squeeze(s: bytes, sets: [bytes]) -> bytes ! RubyArgumentError {
+    let t = try table(sets)
+    var out: [i64] = []
+    var save = 0 - 1
+    for c in s.to_list() {
+        if c != save or (sets.len() > 0 and not t[c]) {
+            out.push(c)
+            save = c
+        }
+    }
+    return bytes_of(out)
+}
+
+/// `str.count(*sets)`.
+pub fn count(s: bytes, sets: [bytes]) -> i64 ! RubyArgumentError {
+    try arity(sets)
+    let t = try table(sets)
+    return s.to_list().filter(|c| t[c]).len()
+}

@@ -1,0 +1,4 @@
+[package]
+name = "rubystring"
+version = "1.0.0"
+capabilities = []

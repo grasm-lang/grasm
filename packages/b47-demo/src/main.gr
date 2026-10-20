@@ -1,0 +1,84 @@
+// Seven libraries, each run once on an input whose answer came from the
+// tool it is held to. scripts/b47_diff.sh holds them to those tools on
+// thousands more.
+import httpcachesem
+import unicodeblock
+import hangul
+import lz4frame
+import pprof
+import digestauth
+import gobwire
+
+fn from_hex(h: str) -> bytes {
+    var out: [i64] = []
+    let b = h.to_bytes()
+    var i = 0
+    while i + 1 < b.len() {
+        let hi = b.at(i)
+        let lo = b.at(i + 1)
+        out.push((if hi >= 97 { hi - 87 } else { hi - 48 }) * 16 + (if lo >= 97 { lo - 87 } else { lo - 48 }))
+        i = i + 2
+    }
+    return bytes_of(out)
+}
+
+fn web() {
+    // npm's http-cache-semantics: fresh for ten minutes, plus a minute of
+    // stale-while-revalidate, asked thirty seconds later.
+    let req = HcRequest{ method: None, url: Some("/a"), headers: [("host", "h")] }
+    let res = HcResponse{ status: Some(200), headers: [("cache-control", "max-age=600, stale-while-revalidate=60"),
+        ("date", "Thu, 09 Oct 2025 08:53:20 GMT")] }
+    let p = httpcachesem.new_policy(req, res, httpcachesem.default_options(), 1760000000000.0)
+    let later = 1760000030000.0
+    assert_eq(httpcachesem.storable(p), true)
+    assert_eq(httpcachesem.max_age(p), 600.0)
+    assert_eq(httpcachesem.time_to_live(p, later), 630000.0)
+    assert_eq(httpcachesem.stale(p, later), false)
+    // RFC 2617's own example, in the header curl writes for it.
+    let ch = digestauth.parse_challenge("Digest realm=\"testrealm@host.com\", qop=\"auth,auth-int\", nonce=\"dcd98b7102dd2f0e8b11d0f600bfb0c093\"")
+    let header = match ch {
+        Some(c) -> digestauth.authorization(c, "Mufasa", "Circle Of Life", "GET", "/dir/index.html", "0a4f113b", 1)
+        None -> ""
+    }
+    assert_eq(header.contains("response=\"6629fae49393a05397450978507c4ef1\""), true)
+    print("http: fresh for {httpcachesem.time_to_live(p, later)} ms; digest answered")
+}
+
+fn text() {
+    let t = unicodeblock.table()
+    assert_eq(unicodeblock.of(t, 44032) ?? None, Some("HANGUL_SYLLABLES"))
+    assert_eq(unicodeblock.for_name(t, "basic latin"), Some("BASIC_LATIN"))
+    assert_eq(hangul.syllable_name(54620) ?? "", "HANGUL SYLLABLE HAN")
+    assert_eq(hangul.nfd("한").codes(), [4370, 4449, 4523])
+    assert_eq(hangul.nfkd("ㄱㅏ").codes(), [4352, 4449])
+    assert_eq(hangul.nfc(hangul.nfd("한글")), "한글")
+    print("text: 한 is {hangul.syllable_name(54620) ?? ""}")
+}
+
+fn binary() {
+    // `lz4` on 69 a's.
+    let frame = from_hex("04224d186440a70b0000001f6101002c50616161616100000000fcd37690")
+    let out = lz4frame.decode(frame) ?? bytes_of([])
+    assert_eq(out.len(), 69)
+    assert_eq(lz4frame.decode(lz4frame.encode(out, lz4frame.default_options())) ?? bytes_of([]), out)
+    // A profile of one sample: the text Go's own pprof parser prints for it.
+    let prof: PpProfile ! PpError = pprof.parse(from_hex("0a0408011002120312010532003203637075320b6e616e6f7365636f6e6473600a"))
+    let text = match prof {
+        Ok(p) -> pprof.to_string(p)
+        Err(_e) -> ""
+    }
+    assert_eq(text, "PeriodType:  \nPeriod: 10\nSamples:\ncpu/nanoseconds\n          5: \nLocations\nMappings\n")
+    // Go's gob for P{X: 3, Y: "hi"} and then 7.
+    let g = from_hex("1a7f030101015001ff80000102010158010400010159010c00000009ff80010601026869000304000e")
+    let s = gobwire.decode(g) ?? GobStream{ types: map(), items: [] }
+    assert_eq(s.items.len(), 2)
+    assert_eq(gobwire.render(s, s.items[0].id, Some(s.items[0].value)), "\{X=i:3,Y=s:6869\}")
+    assert_eq(gobwire.render(s, s.items[1].id, Some(s.items[1].value)), "i:7")
+    print("binary: lz4 {out.len()} bytes, pprof {text.lines().len()} lines, gob {s.items.len()} values")
+}
+
+fn main() / {io} {
+    web()
+    text()
+    binary()
+}

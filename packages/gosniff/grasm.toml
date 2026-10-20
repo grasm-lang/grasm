@@ -1,0 +1,4 @@
+[package]
+name = "gosniff"
+version = "1.0.0"
+capabilities = []

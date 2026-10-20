@@ -1,0 +1,91 @@
+// Python's `glob.translate`, `glob.escape` and `glob.has_magic`, as
+// CPython 3.13 has them.
+//
+// `glob.translate` (new in 3.13) turns a path pattern into the regular
+// expression Python matches paths with, and `pathlib`'s `full_match`
+// does the same; a tool that has to produce or check those expressions,
+// or explain why a pattern matches what it does, needs the same text:
+//
+//   - Segments split on the separators (`seps`, `/` by default); a `*`
+//     segment is one segment, `**` with `recursive` any number, two
+//     `**` in a row the same as one.
+//   - Without `include_hidden`, a wildcard never starts a segment with a
+//     dot: `[^/.][^/]*` and a `(?!\.)` before a segment that starts with
+//     `*` or `?`.
+//   - Within a segment the rest is `fnmatch`'s translation, its `*`
+//     made `[^/]*` and its `?` `[^/]`.
+//   - `escape` wraps each of `*`, `?` and `[` in brackets; `has_magic`
+//     says whether any is there.
+
+import pyfnmatch
+
+fn escaped_seps(seps: str) -> str {
+    return pyfnmatch.re_escape(seps)
+}
+
+/// `glob.translate(pat, recursive=, include_hidden=, seps=)`; `seps` ""
+/// means `/`.
+pub fn translate(pat: str, recursive: bool, include_hidden: bool, seps0: str) -> str {
+    let seps = if seps0.len() == 0 { "/" } else { seps0 }
+    let esc = escaped_seps(seps)
+    let any_sep = if seps.codes().len() > 1 { "[" + esc + "]" } else { esc }
+    let not_sep = "[^" + esc + "]"
+    let one_last = if include_hidden { not_sep + "+" } else { "[^" + esc + ".]" + not_sep + "*" }
+    let one = one_last + any_sep
+    let any_segments = if include_hidden { "(?:.+" + any_sep + ")?" } else { "(?:" + one + ")*" }
+    let any_last = if include_hidden { ".*" } else { any_segments + "(?:" + one_last + ")?" }
+    // re.split on any separator.
+    var parts: [str] = []
+    var cur = ""
+    let sep_cs = seps.codes()
+    for c in pat.codes() {
+        if sep_cs.contains(c) {
+            parts.push(cur)
+            cur = ""
+        } else {
+            cur = cur + c.to_char()
+        }
+    }
+    parts.push(cur)
+    let last = parts.len() - 1
+    var out = ""
+    for idx in 0..parts.len() {
+        let part = parts[idx]
+        if part == "*" {
+            out = out + if idx < last { one } else { one_last }
+        } else if recursive and part == "**" {
+            if idx < last {
+                if parts[idx + 1] != "**" {
+                    out = out + any_segments
+                }
+            } else {
+                out = out + any_last
+            }
+        } else {
+            if part.len() > 0 {
+                if not include_hidden and (part.starts_with("*") or part.starts_with("?")) {
+                    out = out + "(?!\\.)"
+                }
+                out = out + pyfnmatch.translate_parts(part, not_sep + "*", not_sep)
+            }
+            if idx < last {
+                out = out + any_sep
+            }
+        }
+    }
+    return "(?s:" + out + ")\\Z"
+}
+
+fn magic(c: i64) -> bool {
+    return c == 42 or c == 63 or c == 91
+}
+
+/// `glob.escape(pathname)` on POSIX.
+pub fn escape(pathname: str) -> str {
+    return pathname.codes().map(|c| if magic(c) { "[" + c.to_char() + "]" } else { c.to_char() }).join("")
+}
+
+/// `glob.has_magic(s)`.
+pub fn has_magic(s: str) -> bool {
+    return s.codes().any(|c| magic(c))
+}

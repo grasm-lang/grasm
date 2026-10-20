@@ -1,0 +1,92 @@
+// Seven libraries, each run once on an input whose answer came from the
+// tool it is held to -- Go 1.25 and Python 3.13 for two each, Java 17,
+// Node 25 and Ruby 2.6 for one each. scripts/b52_diff.sh holds them to
+// those tools on thousands more.
+import gopath
+import gosniff
+import javaduration
+import jsjson
+import nodeutilformat
+import pycsv
+import pyposixpath
+import rubyshellwords
+
+fn go() {
+    assert_eq(gopath.clean("a//b/../c/."), "a/c")
+    assert_eq(gopath.base("/x/y/"), "y")
+    assert_eq(gopath.ext("f.tar.gz"), ".gz")
+    assert(not (gopath.match_path("*.go", "dir/main.go") ?? true))
+    let bad = match gopath.match_path("[", "x") {
+        Ok(_b) -> ""
+        Err(e) -> gopath.error_text(e)
+    }
+    assert_eq(bad, "syntax error in pattern")
+    assert_eq(gopath.rel("/a/b", "/a/c/d") ?? "", "../c/d")
+    let refused = match gopath.rel("a", "/b") {
+        Ok(_r) -> ""
+        Err(e) -> gopath.error_text(e)
+    }
+    assert_eq(refused, "Rel: can't make /b relative to a")
+    assert_eq(gosniff.detect(bytes_of([137, 80, 78, 71, 13, 10, 26, 10, 46, 46])), "image/png")
+    assert_eq(gosniff.detect("  <HTML>".to_bytes()), "text/html; charset=utf-8")
+    assert_eq(gosniff.detect("plain".to_bytes()), "text/plain; charset=utf-8")
+    print("go: Go's")
+}
+
+fn python() {
+    let rows = pycsv.read_all("a,\"b,c\"\r\n1,\"x\"\"y\"\n", pycsv.excel()) ?? []
+    assert_eq(rows.len(), 2)
+    let second = rows[1].map(|v| match v {
+        PcStr(s) -> s
+        _ -> "?"
+    })
+    assert_eq(second, ["1", "x\"y"])
+    let line = pycsv.write_row([WStr("a b"), WStr("c,d"), WStr(""), WNone], pycsv.excel()) ?? ""
+    assert_eq(line, "a b,\"c,d\",,\r\n")
+    let numeric = PyCsvDialect{ delimiter: 44, quotechar: 34, escapechar: 0 - 1, doublequote: true, skipinitialspace: false, lineterminator: "\r\n",
+        quoting: pycsv.quote_nonnumeric(), strict: false }
+    let refused = match pycsv.read_all("1,x\n", numeric) {
+        Ok(_r) -> ""
+        Err(e) -> pycsv.error_text(e)
+    }
+    assert_eq(refused, "could not convert string to float: 'x'")
+    assert_eq(pyposixpath.normpath("//a/./b/../c"), "//a/c")
+    assert_eq(pyposixpath.normpath("///a"), "/a")
+    assert_eq(pyposixpath.splitext(".bashrc"), (".bashrc", ""))
+    assert_eq(pyposixpath.splitext("..x.y"), ("..x", ".y"))
+    assert_eq(pyposixpath.commonprefix(["/usr/lib", "/usr/local"]), "/usr/l")
+    assert_eq(pyposixpath.commonpath(["/usr/lib", "/usr/local"]) ?? "", "/usr")
+    print("python: CPython's")
+}
+
+fn others() {
+    let d = javaduration.duration_parse("P1DT2H30M") ?? javaduration.of_seconds(0, 0) ?? panic("duration")
+    assert_eq(javaduration.duration_text(d), "PT26H30M")
+    assert_eq(javaduration.duration_text(javaduration.of_seconds(0 - 90, 0) ?? d), "PT-1M-30S")
+    assert_eq(javaduration.duration_text(javaduration.of_seconds(0, 0 - 500000000) ?? d), "PT-0.5S")
+    assert_eq(javaduration.period_text(javaduration.period_parse("P1Y2W") ?? javaduration.period(0, 0, 0)), "P1Y14D")
+    let pt = match javaduration.duration_parse("PT") {
+        Ok(_d) -> ""
+        Err(e) -> javaduration.error_text(e)
+    }
+    assert_eq(pt, "Text cannot be parsed to a Duration")
+    let formatted = nodeutilformat.format([JvString(jsjson.units("%s=%d %j")), JvString(jsjson.units("n")), JvString(jsjson.units("0x10")), JvUndefined]) ?? []
+    assert_eq(jsjson.text(formatted), "n=16 undefined")
+    assert_eq(jsjson.text(nodeutilformat.inspect(JvString(jsjson.units("it's")))), "\"it's\"")
+    assert_eq(jsjson.text(nodeutilformat.format([JvNumber(0.0 * -1.0), JvBigInt("5")]) ?? []), "-0 5n")
+    assert_eq(rubyshellwords.split("a \"b c\" d\\ e x'y z'") ?? [], ["a", "b c", "d e", "xy z"])
+    assert_eq(rubyshellwords.escape("a+b é"), "a\\+b\\ \\é")
+    assert_eq(rubyshellwords.join(["", "x y"]), "'' x\\ y")
+    let unmatched = match rubyshellwords.split("it's") {
+        Ok(_w) -> ""
+        Err(e) -> rubyshellwords.error_text(e)
+    }
+    assert_eq(unmatched, "Unmatched double quote: \"it's\"")
+    print("java, node, ruby: theirs")
+}
+
+fn main() / {io} {
+    go()
+    python()
+    others()
+}

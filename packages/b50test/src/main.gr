@@ -1,0 +1,636 @@
+// The harness scripts/b50_diff.sh drives: each argument pair is an
+// operation and a file of cases, one per line; each answer is one line.
+import gocsv
+import goduration
+import gojson
+import gostrconv
+import jsradix
+import jsuri
+import pydatetime
+import pyfnmatch
+import pyjson
+import bigint
+
+fn unhex(h: str) -> str {
+    return bytes_of(unhex_list(h)).to_str()
+}
+
+fn unhex_list(h: str) -> [i64] {
+    if h == "-" {
+        return []
+    }
+    var out: [i64] = []
+    let b = h.to_bytes()
+    var i = 0
+    while i + 1 < b.len() {
+        let hi = b.at(i)
+        let lo = b.at(i + 1)
+        out.push((if hi >= 97 { hi - 87 } else { hi - 48 }) * 16 + (if lo >= 97 { lo - 87 } else { lo - 48 }))
+        i = i + 2
+    }
+    return out
+}
+
+fn hex_text(t: str) -> str {
+    return hex_bytes(t.to_bytes())
+}
+
+fn hex_bytes(b: bytes) -> str {
+    let digits = "0123456789abcdef"
+    let h = b.to_list().map(|x| digits.substr(x.ushr(4), 1) + digits.substr(x.bit_and(15), 1)).join("")
+    return if h.len() == 0 { "-" } else { h }
+}
+
+fn hex_u64(h: str) -> i64 {
+    var v = 0
+    for c in h.codes() {
+        let d = if c >= 97 { c - 87 } else if c >= 65 { c - 55 } else { c - 48 }
+        v = v.shl(4).bit_or(d)
+    }
+    return v
+}
+
+fn fbits(h: str) -> f64 {
+    return hex_u64(h).from_bits()
+}
+
+fn fhex(x: f64) -> str {
+    return gostrconv.format_uint(x.to_bits(), 16)
+}
+
+fn num(f: [str], k: i64) -> i64 {
+    return f[k].parse_int() ?? 0
+}
+
+fn js_text(r: str ! JsRangeError) -> str {
+    return match r {
+        Ok(t) -> hex_text(t)
+        Err(e) -> match e {
+            JsRangeError(m) -> "R" + hex_text(m)
+        }
+    }
+}
+
+fn jsradix_line(f: [str]) -> str {
+    if f[0] == "tsr" {
+        return js_text(jsradix.to_string_radix(fbits(f[1]), num(f, 2)))
+    }
+    return fhex(jsradix.parse_int(unhex(f[1]), if f[2] == "~" { 0 } else { num(f, 2) }))
+}
+
+fn units_hex(us: [i64]) -> str {
+    return if us.len() == 0 { "-" } else { us.map(|u| gostrconv.format_uint(u, 16)).join(".") }
+}
+
+fn uri_units(r: [i64] ! JsUriError) -> str {
+    return match r {
+        Ok(us) -> units_hex(us)
+        Err(_e) -> "EURIError"
+    }
+}
+
+fn encode_either(component: bool, us: [i64]) -> str ! JsUriError {
+    if component {
+        return try jsuri.encode_uri_component(us)
+    }
+    return try jsuri.encode_uri(us)
+}
+
+fn jsuri_line(f: [str]) -> str {
+    let op = f[0]
+    let us = jsuri.units(unhex(f[1]))
+    if op == "ec" or op == "eu" {
+        return match encode_either(op == "ec", us) {
+            Ok(t) -> units_hex(jsuri.units(t))
+            Err(_e) -> "EURIError"
+        }
+    }
+    if op == "dc" {
+        return uri_units(jsuri.decode_uri_component(us))
+    }
+    if op == "du" {
+        return uri_units(jsuri.decode_uri(us))
+    }
+    if op == "es" {
+        return units_hex(jsuri.units(jsuri.escape(us)))
+    }
+    return units_hex(jsuri.unescape(us))
+}
+
+fn gj_dump(v: GoJson) -> str {
+    return match v {
+        GjNull -> "n"
+        GjBool(b) -> if b { "t" } else { "f" }
+        GjNumber(f) -> "d" + fhex(f)
+        GjString(t) -> "s" + hex_bytes(t)
+        GjArray(items) -> "[" + items.map(|x| gj_dump(x)).join(",") + "]"
+        GjObject(keys, values) -> {
+            var order = (0..keys.len()).to_list()
+            let hexes = keys.map(|k| hex_bytes(k))
+            order.sort_by(|k| hexes[k])
+            "\{" + order.map(|k| "s" + hexes[k] + "=" + gj_dump(values[k])).join(",") + "}"
+        }
+    }
+}
+
+fn gj_error(e: GoJsonError) -> str {
+    return match e {
+        GjSyntax(m, o) -> "S" + hex_text(m) + ":" + o.to_str()
+        GjUnmarshalType(m) -> "U" + hex_text(m)
+        GjUnsupportedValue(m) -> "V" + hex_text(m)
+    }
+}
+
+fn gj_answer(r: bytes ! GoJsonError) -> str {
+    return match r {
+        Ok(b) -> hex_bytes(b)
+        Err(e) -> gj_error(e)
+    }
+}
+
+fn gj_syntax(d: GjDecoded) -> bool {
+    return match d.err {
+        Some(e) -> match e {
+            GjSyntax(_m, _o) -> true
+            _ -> false
+        }
+        None -> false
+    }
+}
+
+fn gojson_line(f: [str]) -> str {
+    let op = f[0]
+    let data = bytes_of(unhex_list(f[1]))
+    if op == "va" {
+        return if gojson.valid(data) { "true" } else { "false" }
+    }
+    if op == "co" {
+        return gj_answer(gojson.compact(data))
+    }
+    if op == "in" {
+        return gj_answer(gojson.indent(data, unhex(f[2]), unhex(f[3])))
+    }
+    if op == "he" {
+        return hex_bytes(gojson.html_escape(data))
+    }
+    if op == "un" {
+        let d = gojson.decode(data)
+        return gj_dump(d.value) + "|" + match d.err {
+            Some(e) -> gj_error(e)
+            None -> "-"
+        }
+    }
+    if op == "ma" or op == "mi" {
+        let d = gojson.decode(data)
+        if gj_syntax(d) {
+            return "X"
+        }
+        if op == "mi" {
+            return gj_answer(gojson.marshal_indent(d.value, unhex(f[2]), unhex(f[3])))
+        }
+        return gj_answer(gojson.marshal(d.value, f[2] == "1"))
+    }
+    if op == "nu" {
+        return match gojson.encode_number(fbits(f[1])) {
+            Ok(t) -> hex_text(t)
+            Err(e) -> gj_error(e)
+        }
+    }
+    return hex_bytes(gojson.encode_string(data, f[2] == "1"))
+}
+
+fn cps_hex(cs: [i64]) -> str {
+    return if cs.len() == 0 { "-" } else { cs.map(|c| gostrconv.format_uint(c, 16)).join(".") }
+}
+
+fn cps_of(h: str) -> [i64] {
+    return if h == "-" { [] } else { h.split(".").map(|x| hex_u64(x)) }
+}
+
+fn pj_dump(v: PyJson) -> str {
+    return match v {
+        PjNull -> "n"
+        PjBool(b) -> if b { "t" } else { "f" }
+        PjInt(n) -> "i" + bigint.to_str(n)
+        PjFloat(f) -> "d" + fhex(f)
+        PjStr(cs) -> "s" + cps_hex(cs)
+        PjList(items) -> "[" + items.map(|x| pj_dump(x)).join(",") + "]"
+        PjDict(keys, values) -> "\{" + (0..keys.len()).to_list().map(|k| "s" + cps_hex(keys[k]) + "=" + pj_dump(values[k])).join(",") + "}"
+    }
+}
+
+fn pj_error(e: PyJsonError) -> str {
+    return match e {
+        PjDecodeError(_m, _p, _l, _c) -> "E" + hex_text(pyjson.error_text(e))
+        PjValueError(m) -> "V" + hex_text(m)
+    }
+}
+
+fn pj_dumped(r: [i64] ! PyJsonError) -> str {
+    return match r {
+        Ok(cs) -> cps_hex(cs)
+        Err(e) -> pj_error(e)
+    }
+}
+
+fn pj_options(flags: str, indent: str) -> PyDumpOptions {
+    let f = flags.codes()
+    let seps = [[", ", ": "], [",", ":"], [",", ": "], [" , ", " :  "]][f[3] - 48]
+    let ind = if indent == "~" { None } else if indent.starts_with("i") {
+        Some(" ".repeat((indent.substr(1, indent.len() - 1).parse_int() ?? 0).max(0)))
+    } else { Some(cps_of(indent.substr(1, indent.len() - 1)).map(|c| c.to_char()).join("")) }
+    let default_seps = f[3] == 48
+    return PyDumpOptions{ ensure_ascii: f[0] == 49, allow_nan: f[1] == 49, sort_keys: f[2] == 49, indent: ind,
+        item_separator: if default_seps and ind.is_some() { "," } else { seps[0] }, key_separator: seps[1] }
+}
+
+fn pyjson_line(f: [str]) -> str {
+    let op = f[0]
+    if op == "lo" {
+        return match pyjson.loads(cps_of(f[1])) {
+            Ok(v) -> pj_dump(v)
+            Err(e) -> pj_error(e)
+        }
+    }
+    if op == "du" {
+        return match pyjson.loads(cps_of(f[1])) {
+            Ok(v) -> pj_dumped(pyjson.dumps(v, pj_options(f[2], f[3])))
+            Err(_e) -> "X"
+        }
+    }
+    let d = pyjson.default_options()
+    if op == "df" {
+        return pj_dumped(pyjson.dumps(PjFloat(fbits(f[1])), PyDumpOptions{ ensure_ascii: true, allow_nan: f[2] == "1", sort_keys: false, indent: None,
+            item_separator: d.item_separator, key_separator: d.key_separator }))
+    }
+    if op == "ds" {
+        return pj_dumped(pyjson.dumps(PjStr(cps_of(f[1])), PyDumpOptions{ ensure_ascii: f[2] == "1", allow_nan: true, sort_keys: false, indent: None,
+            item_separator: d.item_separator, key_separator: d.key_separator }))
+    }
+    return pj_dumped(pyjson.dumps(PjInt(bigint.parse(f[1]) ?? bigint.zero()), d))
+}
+
+fn csv_hex(b: bytes) -> str {
+    return if b.len() == 0 { "~" } else { hex_bytes(b) }
+}
+
+fn csv_options(f: [str]) -> CsvOptions {
+    return CsvOptions{ comma: num(f, 2), comment: num(f, 3), fields_per_record: num(f, 4), lazy_quotes: f[5] == "1", trim_leading_space: f[6] == "1" }
+}
+
+fn csv_error(e: Option[GoCsvError]) -> str {
+    return match e {
+        Some(x) -> hex_text(gocsv.error_text(x))
+        None -> "-"
+    }
+}
+
+fn csv_reads(f: [str]) -> str {
+    var r = gocsv.reader(bytes_of(unhex_list(f[1])), csv_options(f))
+    var out: [str] = []
+    for _k in 0..300 {
+        let rec = gocsv.read(r)
+        if rec.eof {
+            out.push("EOF")
+            break
+        }
+        let pos = rec.positions.map(|p| p.line.to_str() + ":" + p.column.to_str()).join(",")
+        out.push(rec.fields.map(|x| csv_hex(x)).join(",") + "/" + pos + "/" + csv_error(rec.err))
+        match rec.err {
+            Some(e) -> match e {
+                CsvInvalidDelim -> break
+                _ -> {}
+            }
+            None -> {}
+        }
+    }
+    return out.join(";") + " @" + gocsv.input_offset(r).to_str()
+}
+
+fn csv_records(t: str) -> [[bytes]] {
+    if t == "-" {
+        return []
+    }
+    return t.split("/").map(|r| if r == "r" { [] } else { r.substr(1, r.len() - 1).split(",").map(|x| if x == "~" { bytes_of([]) } else { bytes_of(unhex_list(x)) }) })
+}
+
+fn gocsv_line(f: [str]) -> str {
+    if f[0] == "rd" {
+        return csv_reads(f)
+    }
+    if f[0] == "ra" {
+        return match gocsv.read_all(bytes_of(unhex_list(f[1])), csv_options(f)) {
+            Ok(recs) -> recs.map(|rec| "r" + rec.map(|x| csv_hex(x)).join(",")).join("/")
+            Err(e) -> "E" + hex_text(gocsv.error_text(e))
+        }
+    }
+    return match gocsv.write(csv_records(f[1]), num(f, 2), f[3] == "1") {
+        Ok(b) -> csv_hex(b)
+        Err(e) -> "E" + hex_text(gocsv.error_text(e))
+    }
+}
+
+fn ints(t: str, sep: str) -> [i64] {
+    return t.split(sep).map(|x| x.parse_int() ?? 0)
+}
+
+fn hexs(t: str) -> str {
+    return if t.len() == 0 { "-" } else { hex_text(t) }
+}
+
+fn td_of(spec: str) -> PyTimedelta {
+    let v = ints(spec, ",")
+    return pydatetime.timedelta(0, v[0], 0, 0, v[1], 0, v[2]) ?? PyTimedelta{ days: 0, seconds: 0, microseconds: 0 }
+}
+
+fn off_of(spec: str) -> Option[PyTimedelta] {
+    return if spec == "~" { None } else { Some(td_of(spec)) }
+}
+
+fn dt_of(spec: str) -> PyDatetime ! DtError {
+    let parts = spec.split("/")
+    let v = ints(parts[0], ",")
+    return try pydatetime.datetime(v[0], v[1], v[2], v[3], v[4], v[5], v[6], off_of(parts[1]))
+}
+
+fn date_of(spec: str) -> PyDate ! DtError {
+    let v = ints(spec, ",")
+    return try pydatetime.date(v[0], v[1], v[2])
+}
+
+fn off_dump(o: Option[PyTimedelta]) -> str {
+    return match o {
+        Some(t) -> t.days.to_str() + ":" + t.seconds.to_str() + ":" + t.microseconds.to_str()
+        None -> "~"
+    }
+}
+
+fn dt_err(e: DtError) -> str {
+    return "E" + pydatetime.error_class(e) + ":" + hexs(pydatetime.error_text(e))
+}
+
+fn tdd(r: PyTimedelta ! DtError) -> str {
+    return match r {
+        Ok(t) -> "T" + t.days.to_str() + "," + t.seconds.to_str() + "," + t.microseconds.to_str() + "|" + hexs(pydatetime.td_str(t)) + "|" +
+        hexs(pydatetime.td_repr(t)) + "|" + fhex(pydatetime.total_seconds(t))
+        Err(e) -> dt_err(e)
+    }
+}
+
+fn dated(r: PyDate ! DtError) -> str {
+    return match r {
+        Ok(d) -> {
+            let (y, w, k) = pydatetime.isocalendar(d)
+            "D" + d.year.to_str() + "," + d.month.to_str() + "," + d.day.to_str() + "|" + pydatetime.date_isoformat(d) + "|" +
+            pydatetime.toordinal(d).to_str() + "|" + pydatetime.weekday(d).to_str() + "|" + pydatetime.isoweekday(d).to_str() + "|" + y.to_str() +
+            "," + w.to_str() + "," + k.to_str() + "|" + hexs(pydatetime.date_ctime(d))
+        }
+        Err(e) -> dt_err(e)
+    }
+}
+
+fn specs() -> [str] {
+    return ["auto", "hours", "minutes", "seconds", "milliseconds", "microseconds"]
+}
+
+fn timed(r: PyTime ! DtError) -> str {
+    return match r {
+        Ok(t) -> "H" + t.hour.to_str() + "," + t.minute.to_str() + "," + t.second.to_str() + "," + t.microsecond.to_str() + "," + off_dump(t.offset) +
+        "|" + specs().map(|s| hexs(pydatetime.time_isoformat(t, s) ?? "")).join("|")
+        Err(e) -> dt_err(e)
+    }
+}
+
+fn dtd(r: PyDatetime ! DtError) -> str {
+    return match r {
+        Ok(x) -> {
+            let name = match x.time.offset {
+                Some(o) -> hexs(pydatetime.timezone_name(o))
+                None -> "~"
+            }
+            let d = x.date
+            let t = x.time
+            "X" + [d.year, d.month, d.day, t.hour, t.minute, t.second, t.microsecond].map(|n| n.to_str()).join(",") + "," + off_dump(t.offset) + "|" +
+            name + "|" + hexs(pydatetime.datetime_str(x)) + "|" + hexs(pydatetime.datetime_ctime(x)) + "|" +
+            specs().map(|s| hexs(pydatetime.datetime_isoformat(x, 84, s) ?? "")).join("|") + "|" + fhex(pydatetime.timestamp(x))
+        }
+        Err(e) -> dt_err(e)
+    }
+}
+
+fn td_pair(k: str, a: PyTimedelta, b: PyTimedelta) -> str {
+    if k == "add" {
+        return tdd(pydatetime.td_add(a, b))
+    }
+    if k == "sub" {
+        return tdd(pydatetime.td_sub(a, b))
+    }
+    if k == "fdt" {
+        return match pydatetime.td_floordiv(a, b) {
+            Ok(n) -> "I" + bigint.to_str(n)
+            Err(e) -> dt_err(e)
+        }
+    }
+    if k == "mod" {
+        return tdd(pydatetime.td_mod(a, b))
+    }
+    return match pydatetime.td_truediv(a, b) {
+        Ok(x) -> "F" + fhex(x)
+        Err(e) -> dt_err(e)
+    }
+}
+
+fn td_unary(k: str, a: PyTimedelta, n: i64) -> PyTimedelta ! DtError {
+    if k == "mul" {
+        return try pydatetime.td_mul(a, n)
+    }
+    if k == "fdi" {
+        return try pydatetime.td_floordiv_int(a, n)
+    }
+    if k == "tdi" {
+        return try pydatetime.td_truediv_int(a, n)
+    }
+    if k == "neg" {
+        return try pydatetime.td_neg(a)
+    }
+    return try pydatetime.td_abs(a)
+}
+
+fn td_one(k: str, a: PyTimedelta, n: i64) -> str {
+    return tdd(td_unary(k, a, n))
+}
+
+fn date_shift(d: PyDate, t: PyTimedelta, plus: bool) -> PyDate ! DtError {
+    if plus {
+        return try pydatetime.date_add(d, t)
+    }
+    return try pydatetime.date_sub(d, t)
+}
+
+fn dt_shift(spec: str, t: PyTimedelta, plus: bool) -> PyDatetime ! DtError {
+    let x = try dt_of(spec)
+    if plus {
+        return try pydatetime.datetime_add(x, t)
+    }
+    return try pydatetime.datetime_sub(x, t)
+}
+
+fn dt_diff(a: str, b: str) -> PyTimedelta ! DtError {
+    return try pydatetime.datetime_diff(try dt_of(a), try dt_of(b))
+}
+
+fn tz_named(spec: str) -> str ! DtError {
+    return pydatetime.timezone_name(try pydatetime.timezone(td_of(spec)))
+}
+
+fn dt_text(f: [str]) -> str ! DtError {
+    let v = f.slice(1, 8).map(|x| x.parse_int() ?? 0)
+    let x = try pydatetime.datetime(v[0], v[1], v[2], v[3], v[4], v[5], v[6], off_of(f[8]))
+    return try pydatetime.datetime_isoformat(x, num(f, 9), f[10])
+}
+
+fn pydatetime_line(f: [str]) -> str {
+    let op = f[0]
+    if op == "td" {
+        let v = f.slice(1, 8).map(|x| x.parse_int() ?? 0)
+        return tdd(pydatetime.timedelta(v[0], v[1], v[2], v[3], v[4], v[5], v[6]))
+    }
+    if op == "t2" {
+        return td_pair(f[1], td_of(f[2]), td_of(f[3]))
+    }
+    if op == "t1" {
+        return td_one(f[1], td_of(f[2]), num(f, 3))
+    }
+    if op == "dn" {
+        return dated(pydatetime.date(num(f, 1), num(f, 2), num(f, 3)))
+    }
+    if op == "do" {
+        return dated(pydatetime.fromordinal(num(f, 1)))
+    }
+    if op == "dc" {
+        return dated(pydatetime.fromisocalendar(num(f, 1), num(f, 2), num(f, 3)))
+    }
+    if op == "di" {
+        return dated(pydatetime.date_fromisoformat(cps_of(f[1])))
+    }
+    if op == "da" {
+        return match date_of(f[1]) {
+            Ok(d) -> dated(date_shift(d, td_of(f[2]), f[3] == "+"))
+            Err(e) -> dt_err(e)
+        }
+    }
+    if op == "dd" {
+        return match (date_of(f[1]), date_of(f[2])) {
+            (Ok(a), Ok(b)) -> tdd(Ok(pydatetime.date_diff(a, b)))
+            _ -> "?"
+        }
+    }
+    if op == "ti" {
+        return timed(pydatetime.time_fromisoformat(cps_of(f[1])))
+    }
+    if op == "xi" {
+        return dtd(pydatetime.datetime_fromisoformat(cps_of(f[1])))
+    }
+    if op == "xa" {
+        return dtd(dt_shift(f[1], td_of(f[2]), f[3] == "+"))
+    }
+    if op == "xd" {
+        return tdd(dt_diff(f[1], f[2]))
+    }
+    if op == "xt" {
+        return dtd(pydatetime.fromtimestamp(fbits(f[1]), td_of(f[2])))
+    }
+    if op == "tz" {
+        return match tz_named(f[1]) {
+            Ok(t) -> hexs(t)
+            Err(e) -> dt_err(e)
+        }
+    }
+    if op == "tn" {
+        return timed(pydatetime.time(num(f, 1), num(f, 2), num(f, 3), num(f, 4), off_of(f[5])))
+    }
+    return match dt_text(f) {
+        Ok(t) -> hexs(t)
+        Err(e) -> dt_err(e)
+    }
+}
+
+fn cps_text(h: str) -> str {
+    return cps_of(h).map(|c| c.to_char()).join("")
+}
+
+fn pyfnmatch_line(f: [str]) -> str {
+    if f[0] == "tr" {
+        return cps_hex(pyfnmatch.translate(cps_text(f[1])).codes())
+    }
+    if f[0] == "mc" {
+        return if pyfnmatch.fnmatchcase(cps_text(f[1]), cps_text(f[2])) { "1" } else { "0" }
+    }
+    let names = f[1].split("/").map(|x| cps_text(x))
+    let kept = pyfnmatch.filter(names, cps_text(f[2]))
+    var idx: [str] = []
+    for k in kept {
+        for i in 0..names.len() {
+            if names[i] == k {
+                idx.push(i.to_str())
+                break
+            }
+        }
+    }
+    return if idx.len() == 0 { "~" } else { idx.join(",") }
+}
+
+fn goduration_line(f: [str]) -> str {
+    if f[0] == "pd" {
+        return match goduration.parse_duration_bytes(bytes_of(unhex_list(f[1]))) {
+            Ok(d) -> d.to_str()
+            Err(e) -> "E" + hex_text(goduration.error_text(e))
+        }
+    }
+    let d = num(f, 1)
+    if f[0] == "ds" {
+        return hex_text(goduration.duration_string(d)) + " " + fhex(goduration.hours(d)) + " " + fhex(goduration.minutes(d)) + " " +
+        fhex(goduration.seconds(d)) + " " + goduration.abs(d).to_str()
+    }
+    let m = num(f, 2)
+    return goduration.round(d, m).to_str() + " " + goduration.truncate(d, m).to_str()
+}
+
+fn main() / {io} {
+    let argv = args()
+    var i = 0
+    while i + 1 < argv.len() {
+        let op = argv[i]
+        let text = match read_bytes(argv[i + 1]) {
+            Ok(d) -> d.to_str()
+            Err(_e) -> ""
+        }
+        for l in text.split("\n").filter(|l| l.len() > 0) {
+            if op == "goduration" {
+                print(goduration_line(l.split(" ")))
+            }
+            if op == "pyfnmatch" {
+                print(pyfnmatch_line(l.split(" ")))
+            }
+            if op == "pydatetime" {
+                print(pydatetime_line(l.split(" ")))
+            }
+            if op == "gocsv" {
+                print(gocsv_line(l.split(" ")))
+            }
+            if op == "pyjson" {
+                print(pyjson_line(l.split(" ")))
+            }
+            if op == "gojson" {
+                print(gojson_line(l.split(" ")))
+            }
+            if op == "jsuri" {
+                print(jsuri_line(l.split(" ")))
+            }
+            if op == "jsradix" {
+                print(jsradix_line(l.split(" ")))
+            }
+        }
+        i = i + 2
+    }
+}

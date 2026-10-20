@@ -52,6 +52,8 @@ pub struct Linter<'a> {
     scopes: Vec<Vec<Binding>>,
     findings: Vec<Finding>,
     only: Option<String>,
+    /// Imports the file uses only through a type or variant they declare.
+    type_imports: Vec<String>,
 }
 
 /// Line and column (both 1-based) of a byte offset.
@@ -70,7 +72,19 @@ impl<'a> Linter<'a> {
             scopes: Vec::new(),
             findings: Vec::new(),
             only,
+            type_imports: Vec::new(),
         }
+    }
+
+    /// Imports to count as read because the file names a type or variant
+    /// they declare. Types are one program-wide namespace and are never
+    /// written qualified ([G-TYPE-NOT-QUALIFIED]), so a package imported for
+    /// its `SqlValue` is named nowhere as `sqlitefile.` -- and the file stops
+    /// compiling without the import. This tree alone cannot see that; the
+    /// caller, which can load the imports, says which ones.
+    pub fn with_type_imports(mut self, names: Vec<String>) -> Self {
+        self.type_imports = names;
+        self
     }
 
     fn report(&mut self, span: Span, rule: &'static str, message: String) {
@@ -175,6 +189,9 @@ impl<'a> Linter<'a> {
                     self.declare(last, "import");
                 }
             }
+        }
+        for name in self.type_imports.clone() {
+            self.read(&name);
         }
         for d in &m.decls {
             self.decl(d);

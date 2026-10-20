@@ -1,0 +1,105 @@
+// Seven libraries, each run once on an input whose answer came from Java
+// 17, the tool they are held to. scripts/b48_diff.sh holds them to it on
+// thousands more.
+import javarandom
+import javadouble
+import javaformat
+import javadecimalformat
+import javauri
+import javamessageformat
+import javabigdecimal
+
+fn fmt(p: str, x: f64) -> str {
+    return javadecimalformat.format_double(javadecimalformat.pattern(p) ?? panic("pattern"), x) ?? "error"
+}
+
+fn d(t: str) -> BigDec {
+    return javabigdecimal.parse(t) ?? panic("parse")
+}
+
+fn s(x: BigDec) -> str {
+    return javabigdecimal.to_string(x)
+}
+
+fn numbers() {
+    // new Random(42): nextInt(), nextInt(100), nextLong(), nextDouble(),
+    // nextGaussian(), in that order.
+    var r = javarandom.random(42)
+    assert_eq(javarandom.next_int(r), 0 - 1170105035)
+    assert_eq(javarandom.next_int_bounded(r, 100), 63)
+    assert_eq(javarandom.next_long(r), 0 - 5843495416241995736)
+    assert_eq(javarandom.next_double(r), 0.30871945533265976)
+    assert_eq(javarandom.next_gaussian(r), -1.2314225495957323)
+    // Double.toString and Float.toString.
+    assert_eq(javadouble.double_to_string(0.1 + 0.2), "0.30000000000000004")
+    assert_eq(javadouble.double_to_string(1e21), "1.0E21")
+    assert_eq(javadouble.double_to_string(0.00001), "1.0E-5")
+    assert_eq(javadouble.double_to_string(100.0), "100.0")
+    print("random and Double.toString: Java's")
+}
+
+fn formats() {
+    // String.format(Locale.US, ...); %.2f of 1.005 rounds the decimal
+    // digits half up, so 1.01.
+    let j = javaformat.format("%08.3f|%,d|%x|%-6s|%.2f|%+.1e|%b", [JDouble(3.14159), JInt(1234567), JInt(255), JStr("ab"), JDouble(1.005),
+        JDouble(12345.678), JNull]) ?? "error"
+    assert_eq(j, "0003.142|1,234,567|ff|ab    |1.01|+1.2e+04|false")
+    // DecimalFormat: a negative subpattern, exponents, the fast path and
+    // the slow one disagreeing on 0.0005, a percent multiplied in floating
+    // point, and engineering notation.
+    assert_eq(fmt("#,##0.00;(#,##0.00)", -1234.567), "(1,234.57)")
+    // The double 12345.0 rounds up and the long 12345 does not: Java
+    // marks a double's digits as inexact when it took the easy path.
+    assert_eq(fmt("0.###E0", 12345.0), "1.235E4")
+    assert_eq(javadecimalformat.format_long(javadecimalformat.pattern("0.###E0") ?? panic("pattern"), 12345) ?? "error", "1.234E4")
+    assert_eq(fmt("#,##0.###", 0.0005), "0.001")
+    assert_eq(fmt("0.###", 0.0005), "0")
+    assert_eq(fmt("#%", 0.07), "7%")
+    assert_eq(fmt("##0.##E0", 123456.0), "123.46E3")
+    // MessageFormat, with a choice that formats its argument again, and
+    // the apostrophe rules.
+    let m = javamessageformat.format_message("There \{0,choice,0#are no files|1#is one file|1<are \{0,number,integer\} files\}.", [MfLong(1273)]) ?? "error"
+    assert_eq(m, "There are 1,273 files.")
+    assert_eq(javamessageformat.format_message("It''s \{0\} '\{1\}'", [MfText("x")]) ?? "error", "It's x \{1\}")
+    print("String.format, DecimalFormat and MessageFormat: Java's")
+}
+
+fn uris() {
+    let base = javauri.parse("http://a/b/c/d;p?q") ?? panic("base")
+    assert_eq(javauri.to_string(javauri.resolve_text(base, "../g") ?? base), "http://a/b/g")
+    assert_eq(javauri.to_string(javauri.resolve_text(base, "") ?? base), "http://a/b/c/")
+    assert_eq(javauri.to_string(javauri.normalize(javauri.parse("a/../b:c") ?? base)), "./b:c")
+    assert_eq(javauri.decoded_path(javauri.parse("http://u@[::1]:8080/p%20q?x#f") ?? base) ?? "", "/p q")
+    let rel = javauri.relativize(javauri.parse("http://a/b/") ?? base, javauri.parse("http://a/b/c/d") ?? base)
+    assert_eq(javauri.to_string(rel), "c/d")
+    let refused = match javauri.parse("http://a b/") {
+        Ok(_u) -> "accepted"
+        Err(e) -> match e {
+            UriSyntax(reason, index) -> "{reason} {index}"
+            UriNumberFormat -> "number"
+        }
+    }
+    assert_eq(refused, "Illegal character in authority 7")
+    print("java.net.URI: Java's")
+}
+
+fn decimals() {
+    assert_eq(s(javabigdecimal.divide_exact(d("1.00"), d("4")) ?? d("0")), "0.25")
+    assert_eq(s(javabigdecimal.of_double(0.1) ?? d("0")), "0.1000000000000000055511151231257827021181583404541015625")
+    assert_eq(javabigdecimal.to_plain_string(d("1E+3")), "1000")
+    let five = MathContext{ precision: 5, rounding: BdHalfUp }
+    assert_eq(s(javabigdecimal.divide_mc(d("1"), d("3"), five) ?? d("0")), "0.33333")
+    assert_eq(s(javabigdecimal.round(d("9.99"), MathContext{ precision: 2, rounding: BdHalfUp }) ?? d("0")), "10")
+    assert_eq(s(javabigdecimal.add(d("1.10"), d("2.205"))), "3.305")
+    assert_eq(javabigdecimal.to_engineering_string(d("0E+3")), "0E+3")
+    assert_eq(s(javabigdecimal.multiply(d("2.50"), d("4")) ?? d("0")), "10.00")
+    assert_eq(s(javabigdecimal.strip_trailing_zeros(d("123.4500"))), "123.45")
+    print("BigDecimal: Java's")
+}
+
+fn main() {
+    numbers()
+    formats()
+    uris()
+    decimals()
+}

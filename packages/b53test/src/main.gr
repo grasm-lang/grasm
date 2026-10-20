@@ -1,0 +1,418 @@
+// The harness scripts/b53_diff.sh drives: each argument pair is an
+// operation and a file of cases, one per line; each answer is one line.
+import goencoding
+import gostrconv
+import javabiginteger
+import bigint
+import pycookies
+import pyemailutils
+import pyglob
+import nodestringdecoder
+import pyquopri
+import rubystring
+
+fn unhex_list(h: str) -> [i64] {
+    if h == "-" {
+        return []
+    }
+    var out: [i64] = []
+    let b = h.to_bytes()
+    var i = 0
+    while i + 1 < b.len() {
+        let hi = b.at(i)
+        let lo = b.at(i + 1)
+        out.push((if hi >= 97 { hi - 87 } else { hi - 48 }) * 16 + (if lo >= 97 { lo - 87 } else { lo - 48 }))
+        i = i + 2
+    }
+    return out
+}
+
+fn unhex(h: str) -> str {
+    return bytes_of(unhex_list(h)).to_str()
+}
+
+fn hex_bytes(b: bytes) -> str {
+    let digits = "0123456789abcdef"
+    let h = b.to_list().map(|x| digits.substr(x.ushr(4), 1) + digits.substr(x.bit_and(15), 1)).join("")
+    return if h.len() == 0 { "-" } else { h }
+}
+
+fn hex_text(t: str) -> str {
+    return hex_bytes(t.to_bytes())
+}
+
+fn hex_u64(h: str) -> i64 {
+    var v = 0
+    for c in h.codes() {
+        let d = if c >= 97 { c - 87 } else if c >= 65 { c - 55 } else { c - 48 }
+        v = v.shl(4).bit_or(d)
+    }
+    return v
+}
+
+fn fbits(h: str) -> f64 {
+    return hex_u64(h).from_bits()
+}
+
+fn fhex(x: f64) -> str {
+    return gostrconv.format_uint(x.to_bits(), 16)
+}
+
+fn num(f: [str], k: i64) -> i64 {
+    return f[k].parse_int() ?? 0
+}
+
+fn list(h: str) -> [str] {
+    return if h == "~" { [] } else { h.split(",").map(|x| unhex(x)) }
+}
+
+fn units_hex(us: [i64]) -> str {
+    return if us.len() == 0 { "-" } else { us.map(|u| gostrconv.format_uint(u, 16)).join(".") }
+}
+
+fn units_of(h: str) -> [i64] {
+    return if h == "-" { [] } else { h.split(".").map(|x| hex_u64(x)) }
+}
+
+fn pyglob_line(f: [str]) -> str {
+    if f[0] == "tr" {
+        return hex_text(pyglob.translate(unhex(f[1]), f[2] == "1", f[3] == "1", unhex(f[4])))
+    }
+    if f[0] == "es" {
+        return hex_text(pyglob.escape(unhex(f[1])))
+    }
+    return if pyglob.has_magic(unhex(f[1])) { "True" } else { "False" }
+}
+
+fn enc64(name: str) -> GoB64 {
+    var e = if name.starts_with("url") { goencoding.url_encoding() } else { goencoding.std_encoding() }
+    if name.contains("raw") {
+        e = goencoding.with_padding(e, 0 - 1)
+    }
+    if name.contains("star") {
+        e = goencoding.with_padding(e, 42)
+    }
+    if name.ends_with("S") {
+        e = goencoding.strict(e)
+    }
+    return e
+}
+
+fn enc32(name: str) -> GoB32 {
+    var e = if name.starts_with("hex") { goencoding.hex_encoding32() } else { goencoding.std_encoding32() }
+    if name.contains("raw") {
+        e = goencoding.with_padding32(e, 0 - 1)
+    }
+    if name.contains("star") {
+        e = goencoding.with_padding32(e, 42)
+    }
+    return e
+}
+
+fn decoded(r: (bytes, Option[GoEncodingError])) -> str {
+    let (b, err) = r
+    return hex_bytes(b) + "|" + match err {
+        Some(e) -> hex_text(goencoding.error_text(e))
+        None -> "-"
+    }
+}
+
+fn gobase64_line(f: [str]) -> str {
+    let data = bytes_of(unhex_list(f[2]))
+    if f[0] == "e64" {
+        return hex_text(goencoding.base64_encode(enc64(f[1]), data))
+    }
+    if f[0] == "d64" {
+        return decoded(goencoding.base64_decode(enc64(f[1]), data))
+    }
+    if f[0] == "e32" {
+        return hex_text(goencoding.base32_encode(enc32(f[1]), data))
+    }
+    return decoded(goencoding.base32_decode(enc32(f[1]), data))
+}
+
+fn gohexdump_line(f: [str]) -> str {
+    let data = bytes_of(unhex_list(f[1]))
+    if f[0] == "en" {
+        return hex_text(goencoding.hex_encode(data))
+    }
+    if f[0] == "de" {
+        let (b, err) = goencoding.hex_decode(data)
+        return hex_bytes(b) + "|" + match err {
+            Some(e) -> hex_text(goencoding.error_text(e))
+            None -> "-"
+        }
+    }
+    return hex_text(goencoding.hex_dump(data))
+}
+
+fn goascii85_line(f: [str]) -> str {
+    let data = bytes_of(unhex_list(f[1]))
+    if f[0] == "en" {
+        return hex_text(goencoding.ascii85_encode(data))
+    }
+    let (b, nsrc, err) = goencoding.ascii85_decode(data, f[2] == "1")
+    return hex_bytes(b) + " " + nsrc.to_str() + " " + match err {
+        Some(e) -> hex_text(goencoding.error_text(e))
+        None -> "-"
+    }
+}
+
+fn jb(t: str) -> BigInt {
+    return bigint.parse(t) ?? bigint.zero()
+}
+
+fn jb_error(e: JavaBigError) -> str {
+    return match e {
+        JbNumberFormat(m) -> "Enf:" + hex_text(m)
+        JbArithmetic(m) -> "Ear:" + hex_text(m)
+    }
+}
+
+fn jb_num(r: BigInt ! JavaBigError) -> str {
+    return match r {
+        Ok(n) -> bigint.to_str(n)
+        Err(e) -> jb_error(e)
+    }
+}
+
+fn jb_bits(a: BigInt, k: i64) -> str ! JavaBigError {
+    let t = try javabiginteger.test_bit(a, k)
+    return (if t { "true" } else { "false" }) + " " + bigint.to_str(try javabiginteger.set_bit(a, k)) + " " + bigint.to_str(try javabiginteger.clear_bit(a, k)) +
+    " " + bigint.to_str(try javabiginteger.flip_bit(a, k))
+}
+
+fn jb_long(a: BigInt) -> str ! JavaBigError {
+    let exact = try javabiginteger.long_value_exact(a)
+    return javabiginteger.long_value(a).to_str() + " " + javabiginteger.int_value(a).to_str() + " " + exact.to_str()
+}
+
+fn jb_arith(k: str, a: BigInt, b: str) -> str {
+    if k == "div" {
+        return jb_num(javabiginteger.divide(a, jb(b)))
+    }
+    if k == "rem" {
+        return jb_num(javabiginteger.remainder(a, jb(b)))
+    }
+    if k == "mod" {
+        return jb_num(javabiginteger.modulo(a, jb(b)))
+    }
+    if k == "gcd" {
+        return bigint.to_str(javabiginteger.gcd(a, jb(b)))
+    }
+    if k == "inv" {
+        return jb_num(javabiginteger.mod_inverse(a, jb(b)))
+    }
+    if k == "pow" {
+        return jb_num(javabiginteger.pow(a, b.parse_int() ?? 0))
+    }
+    return jb_num(javabiginteger.sqrt(a))
+}
+
+fn javabiginteger_line(f: [str]) -> str {
+    let op = f[0]
+    if op == "pa" {
+        return jb_num(javabiginteger.parse(unhex(f[1]), num(f, 2)))
+    }
+    if op == "ts" {
+        return javabiginteger.to_string(jb(f[1]), num(f, 2))
+    }
+    if op == "ba" {
+        return hex_bytes(javabiginteger.to_byte_array(jb(f[1])))
+    }
+    if op == "fb" {
+        return jb_num(javabiginteger.from_byte_array(bytes_of(unhex_list(f[1]))))
+    }
+    if op == "bl" {
+        let a = jb(f[1])
+        return javabiginteger.bit_length(a).to_str() + " " + javabiginteger.bit_count(a).to_str() + " " + javabiginteger.lowest_set_bit(a).to_str()
+    }
+    if op == "bw" {
+        let a = jb(f[2])
+        let b = jb(f[3])
+        let k = f[1]
+        return bigint.to_str(if k == "and" { javabiginteger.and_bits(a, b) } else if k == "or" { javabiginteger.or_bits(a, b) } else if k == "xor" {
+            javabiginteger.xor_bits(a, b)
+        } else if k == "andnot" { javabiginteger.and_not(a, b) } else { javabiginteger.not_bits(a) })
+    }
+    if op == "sh" {
+        let a = jb(f[1])
+        let k = num(f, 2)
+        return bigint.to_str(javabiginteger.shift_left(a, k)) + " " + bigint.to_str(javabiginteger.shift_right(a, k))
+    }
+    if op == "tb" {
+        return match jb_bits(jb(f[1]), num(f, 2)) {
+            Ok(t) -> t
+            Err(e) -> jb_error(e)
+        }
+    }
+    if op == "ar" {
+        return jb_arith(f[1], jb(f[2]), f[3])
+    }
+    if op == "mp" {
+        return jb_num(javabiginteger.mod_pow(jb(f[1]), jb(f[2]), jb(f[3])))
+    }
+    return match jb_long(jb(f[1])) {
+        Ok(t) -> t
+        Err(e) -> jb_error(e)
+    }
+}
+
+fn email_pair(a: PyEmailAddress) -> str {
+    return hex_text(a.name) + "|" + hex_text(a.address)
+}
+
+fn pyemailutils_line(f: [str]) -> str {
+    let op = f[0]
+    if op == "pa" {
+        return email_pair(pyemailutils.parseaddr(unhex(f[2]), f[1] == "1"))
+    }
+    if op == "ga" {
+        let out = pyemailutils.getaddresses(f.slice(2, f.len()).map(|x| unhex(x)), f[1] == "1").map(|a| email_pair(a)).join(",")
+        return if out == "" { "-" } else { out }
+    }
+    if op == "fa" {
+        return match pyemailutils.formataddr(unhex(f[1]), unhex(f[2])) {
+            Ok(t) -> hex_text(t)
+            Err(e) -> "E:" + hex_text(e)
+        }
+    }
+    if op == "qu" {
+        return hex_text(pyemailutils.quote(unhex(f[1])))
+    }
+    return hex_text(pyemailutils.unquote(unhex(f[1])))
+}
+
+fn ruby_bytes(r: bytes ! RubyArgumentError) -> str {
+    return match r {
+        Ok(b) -> hex_bytes(b)
+        Err(e) -> "E:" + hex_text(rubystring.error_text(e))
+    }
+}
+
+fn rubystring_line(f: [str]) -> str {
+    let s = bytes_of(unhex_list(f[1]))
+    let sets = f.slice(2, f.len()).map(|x| bytes_of(unhex_list(x)))
+    let op = f[0]
+    if op == "succ" {
+        return hex_bytes(rubystring.succ(s))
+    }
+    if op == "tr" {
+        return ruby_bytes(rubystring.tr(s, sets[0], sets[1]))
+    }
+    if op == "trs" {
+        return ruby_bytes(rubystring.tr_s(s, sets[0], sets[1]))
+    }
+    if op == "del" {
+        return ruby_bytes(rubystring.delete(s, sets))
+    }
+    if op == "sq" {
+        return ruby_bytes(rubystring.squeeze(s, sets))
+    }
+    return match rubystring.count(s, sets) {
+        Ok(n) -> n.to_str()
+        Err(e) -> "E:" + hex_text(rubystring.error_text(e))
+    }
+}
+
+fn unit_hex(us: [i64]) -> str {
+    if us.len() == 0 {
+        return "-"
+    }
+    let d = "0123456789abcdef"
+    return us.map(|u| d.substr(u.shr(12).bit_and(15), 1) + d.substr(u.shr(8).bit_and(15), 1) + d.substr(u.shr(4).bit_and(15), 1) + d.substr(u.bit_and(15), 1)).join(
+        "")
+}
+
+fn nodestringdecoder_line(f: [str]) -> str {
+    let name = if f[0] == "~" { None } else { Some(unhex(f[0])) }
+    var d = match nodestringdecoder.new_decoder(name) {
+        Ok(v) -> v
+        Err(e) -> return "E:" + hex_text(nodestringdecoder.error_text(e))
+    }
+    var got: [str] = []
+    for step in f.slice(1, f.len()) {
+        if step.starts_with("w:") {
+            got.push(unit_hex(nodestringdecoder.write(d, bytes_of(unhex_list(step.substr(2, step.len() - 2))))))
+        } else if step == "e" {
+            got.push(unit_hex(nodestringdecoder.end(d, None)))
+        } else {
+            got.push(unit_hex(nodestringdecoder.end(d, Some(bytes_of(unhex_list(step.substr(2, step.len() - 2)))))))
+        }
+    }
+    return got.join("|")
+}
+
+fn cookie_steps(inout c: SimpleCookie, f: [str]) -> () ! CookieError {
+    if f[0] == "ld" {
+        try pycookies.load(c, unhex(f[1]))
+        return ()
+    }
+    try pycookies.set(c, unhex(f[1]), unhex(f[2]))
+    var i = 3
+    while i + 2 < f.len() {
+        try pycookies.set_attribute(c, unhex(f[i]), unhex(f[i + 1]), if f[i + 2] == "~" { None } else { Some(unhex(f[i + 2])) })
+        i = i + 3
+    }
+    return ()
+}
+
+fn pycookies_line(f: [str]) -> str {
+    var c = pycookies.new_cookie()
+    let err = match cookie_steps(c, f) {
+        Ok(_u) -> "-"
+        Err(e) -> match e {
+            CookieError(m) -> "E:" + hex_text(m)
+            CookieKeyError(m) -> "K:" + hex_text(m)
+        }
+    }
+    let vals = pycookies.values(c).map(|kv| hex_text(kv.0) + "=" + hex_text(kv.1)).join(",")
+    return err + " " + hex_text(pycookies.output(c)) + " " + (if vals == "" { "-" } else { vals })
+}
+
+fn main() / {io} {
+    let argv = args()
+    var i = 0
+    while i + 1 < argv.len() {
+        let op = argv[i]
+        let text = match read_bytes(argv[i + 1]) {
+            Ok(d) -> d.to_str()
+            Err(_e) -> ""
+        }
+        for l in text.split("\n").filter(|l| l.len() > 0) {
+            if op == "pyemailutils" {
+                print(pyemailutils_line(l.split(" ")))
+            }
+            if op == "rubystring" {
+                print(rubystring_line(l.split(" ")))
+            }
+            if op == "nodestringdecoder" {
+                print(nodestringdecoder_line(l.split(" ")))
+            }
+            if op == "pycookies" {
+                print(pycookies_line(l.split(" ")))
+            }
+            if op == "pyquopri" {
+                let f = l.split(" ")
+                let data = bytes_of(unhex_list(f[1]))
+                print(hex_bytes(if f[0] == "en" { pyquopri.encode(data, f[2] == "1", f[3] == "1", f[4] == "1") } else { pyquopri.decode(data, f[2] == "1") }))
+            }
+            if op == "javabiginteger" {
+                print(javabiginteger_line(l.split(" ")))
+            }
+            if op == "goascii85" {
+                print(goascii85_line(l.split(" ")))
+            }
+            if op == "gohexdump" {
+                print(gohexdump_line(l.split(" ")))
+            }
+            if op == "gobase64" {
+                print(gobase64_line(l.split(" ")))
+            }
+            if op == "pyglob" {
+                print(pyglob_line(l.split(" ")))
+            }
+        }
+        i = i + 2
+    }
+}

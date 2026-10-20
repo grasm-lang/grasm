@@ -1,0 +1,506 @@
+// Python's `textwrap`, as CPython 3.13 runs it: `TextWrapper`'s `wrap`
+// and `fill` with every option, `shorten`, `dedent` and `indent`.
+//
+// `packages/textwrap` wraps prose. Python's wrapper is the one that
+// formats argparse help, docstrings, CLI output and countless reports, and
+// output meant to match it needs its particular rules:
+//
+//   - Text splits into chunks by Python's `wordsep_re`: runs of the six
+//     ASCII whitespace characters, `--` dashes between words, and words,
+//     which break after a hyphen only between letters (`goof-ball`, not
+//     `-b` or `1-2`).
+//   - Lines drop the whitespace at their ends; a word too long for a line
+//     is cut, at its last hyphen if there is one, unless
+//     `break_long_words` is off.
+//   - `max_lines` truncates with a placeholder, backing off whole chunks
+//     until it fits; `shorten` is that with one line.
+//   - `fix_sentence_endings` puts two spaces after `[a-z]` and `.!?`.
+//   - `dedent` removes the longest common run of spaces and tabs, and
+//     empties lines holding only those; `indent` prefixes every line
+//     that is not all whitespace, lines split as `str.splitlines` does.
+//   - `strip`, `split` and `\w` are Unicode's, as in Python.
+//
+// One difference: with an indent as wide as the width, CPython can loop
+// forever -- cutting a long word down to an empty chunk, or dropping a
+// no-break space, and starting the line again. Here that is an error.
+
+import pycharclass
+
+/// TextWrapper's attributes. `max_lines` None is no limit.
+type WrapOptions = {
+    width: i64,
+    initial_indent: str,
+    subsequent_indent: str,
+    expand_tabs: bool,
+    tabsize: i64,
+    replace_whitespace: bool,
+    fix_sentence_endings: bool,
+    break_long_words: bool,
+    drop_whitespace: bool,
+    break_on_hyphens: bool,
+    max_lines: Option[i64],
+    placeholder: str,
+}
+
+type WrapError = | WrapValueError(msg: str)
+
+pub fn error_text(e: WrapError) -> str {
+    return match e {
+        WrapValueError(m) -> m
+    }
+}
+
+/// `TextWrapper(width=width)`'s defaults.
+pub fn options(width: i64) -> WrapOptions {
+    return WrapOptions{ width: width, initial_indent: "", subsequent_indent: "", expand_tabs: true, tabsize: 8, replace_whitespace: true,
+        fix_sentence_endings: false, break_long_words: true, drop_whitespace: true, break_on_hyphens: true, max_lines: None, placeholder: " [...]" }
+}
+
+fn ascii_ws(c: i64) -> bool {
+    return c == 9 or c == 10 or c == 11 or c == 12 or c == 13 or c == 32
+}
+
+fn cs_of(s: str) -> [i64] {
+    return s.codes()
+}
+
+fn text_of(cs: [i64]) -> str {
+    return cs.map(|c| c.to_char()).join("")
+}
+
+/// `s.strip() == ""`: nothing but Unicode whitespace.
+fn blank(cs: [i64]) -> bool {
+    return cs.all(|c| pycharclass.is_space(c))
+}
+
+fn rstrip(cs: [i64]) -> [i64] {
+    var n = cs.len()
+    while n > 0 and pycharclass.is_space(cs[n - 1]) {
+        n = n - 1
+    }
+    return cs.slice(0, n)
+}
+
+fn lstrip(cs: [i64]) -> [i64] {
+    var i = 0
+    while i < cs.len() and pycharclass.is_space(cs[i]) {
+        i = i + 1
+    }
+    return cs.slice(i, cs.len())
+}
+
+/// `str.expandtabs(tabsize)`.
+fn expand_tabs(cs: [i64], tabsize: i64) -> [i64] {
+    var out: [i64] = []
+    var column = 0
+    for c in cs {
+        if c == 9 {
+            if tabsize > 0 {
+                let n = tabsize - column % tabsize
+                for _k in 0..n {
+                    out.push(32)
+                }
+                column = column + n
+            }
+        } else {
+            out.push(c)
+            column = column + 1
+            if c == 10 or c == 13 {
+                column = 0
+            }
+        }
+    }
+    return out
+}
+
+// ---- wordsep_re, one alternative at a time
+
+fn at(cs: [i64], i: i64) -> i64 {
+    return if i >= 0 and i < cs.len() { cs[i] } else { 0 - 1 }
+}
+
+fn word(c: i64) -> bool {
+    return c >= 0 and pycharclass.re_word(c)
+}
+
+/// `[^\d\W]`: a word character that is not a decimal digit.
+fn letter(c: i64) -> bool {
+    return word(c) and not pycharclass.re_digit(c)
+}
+
+/// `[\w!"'&.,?]`.
+fn word_punct(c: i64) -> bool {
+    return word(c) or c == 33 or c == 34 or c == 39 or c == 38 or c == 46 or c == 44 or c == 63
+}
+
+/// `-{2,}\w` at `j`.
+fn dashes_then_word(cs: [i64], j: i64) -> bool {
+    var k = j
+    while at(cs, k) == 45 {
+        k = k + 1
+    }
+    return k - j >= 2 and word(at(cs, k))
+}
+
+/// The hyphen alternative at `j`: the hyphen there ends a chunk.
+fn hyphen_breaks(cs: [i64], j: i64) -> bool {
+    if at(cs, j) != 45 {
+        return false
+    }
+    let behind = (letter(at(cs, j - 2)) and letter(at(cs, j - 1))) or (letter(at(cs, j - 3)) and at(cs, j - 2) == 45 and letter(at(cs, j - 1)))
+    if not behind {
+        return false
+    }
+    let k = j + 1
+    return letter(at(cs, k)) and ((at(cs, k + 1) == 45 and letter(at(cs, k + 2))) or letter(at(cs, k + 1)))
+}
+
+/// The end of the match `wordsep_re` finds at `i`.
+fn match_end(cs: [i64], i: i64) -> i64 {
+    let n = cs.len()
+    if ascii_ws(cs[i]) {
+        var j = i
+        while j < n and ascii_ws(cs[j]) {
+            j = j + 1
+        }
+        return j
+    }
+    if word_punct(at(cs, i - 1)) and dashes_then_word(cs, i) {
+        var j = i
+        while at(cs, j) == 45 {
+            j = j + 1
+        }
+        return j
+    }
+    var j = i + 1
+    while true {
+        if hyphen_breaks(cs, j) {
+            return j + 1
+        }
+        if j == n or ascii_ws(cs[j]) {
+            return j
+        }
+        if word_punct(at(cs, j - 1)) and dashes_then_word(cs, j) {
+            return j
+        }
+        j = j + 1
+    }
+    return j
+}
+
+/// `_split`: the chunks.
+fn split_chunks(cs: [i64], hyphens: bool) -> [[i64]] {
+    var out: [[i64]] = []
+    var i = 0
+    while i < cs.len() {
+        var j = i + 1
+        if hyphens {
+            j = match_end(cs, i)
+        } else {
+            let ws = ascii_ws(cs[i])
+            while j < cs.len() and ascii_ws(cs[j]) == ws {
+                j = j + 1
+            }
+        }
+        out.push(cs.slice(i, j))
+        i = j
+    }
+    return out
+}
+
+/// `[a-z][.!?]["']?\Z`.
+fn sentence_end(c: [i64]) -> bool {
+    var n = c.len()
+    if n > 0 and (c[n - 1] == 34 or c[n - 1] == 39) {
+        n = n - 1
+    }
+    return n >= 2 and (c[n - 1] == 46 or c[n - 1] == 33 or c[n - 1] == 63) and c[n - 2] >= 97 and c[n - 2] <= 122
+}
+
+fn chunks_of(text: str, o: WrapOptions) -> [[i64]] {
+    var cs = cs_of(text)
+    if o.expand_tabs {
+        cs = expand_tabs(cs, o.tabsize)
+    }
+    if o.replace_whitespace {
+        cs = cs.map(|c| if ascii_ws(c) { 32 } else { c })
+    }
+    var chunks = split_chunks(cs, o.break_on_hyphens)
+    if o.fix_sentence_endings {
+        var i = 0
+        while i < chunks.len() - 1 {
+            if chunks[i + 1] == [32] and sentence_end(chunks[i]) {
+                chunks[i + 1] = [32, 32]
+                i = i + 2
+            } else {
+                i = i + 1
+            }
+        }
+    }
+    return chunks
+}
+
+fn reversed(xs: [[i64]]) -> [[i64]] {
+    var out: [[i64]] = []
+    var i = xs.len() - 1
+    while i >= 0 {
+        out.push(xs[i])
+        i = i - 1
+    }
+    return out
+}
+
+fn total(line: [[i64]]) -> i64 {
+    return line.fold(0, |a, c| a + c.len())
+}
+
+fn joined(indent: [i64], line: [[i64]]) -> [i64] {
+    var out = indent
+    for c in line {
+        out = out + c
+    }
+    return out
+}
+
+/// _handle_long_word, `chunks` reversed (the next chunk last).
+fn long_word(o: WrapOptions, inout chunks: [[i64]], inout line: [[i64]], cur_len: i64, width: i64) {
+    let space_left = if width < 1 { 1 } else { width - cur_len }
+    if o.break_long_words {
+        var end = space_left
+        let chunk = chunks[chunks.len() - 1]
+        if o.break_on_hyphens and chunk.len() > space_left {
+            var hyphen = (if space_left < chunk.len() { space_left } else { chunk.len() }) - 1
+            while hyphen >= 0 and chunk[hyphen] != 45 {
+                hyphen = hyphen - 1
+            }
+            if hyphen > 0 and chunk.slice(0, hyphen).any(|c| c != 45) {
+                end = hyphen + 1
+            }
+        }
+        let cut = if end < chunk.len() { end } else { chunk.len() }
+        line.push(chunk.slice(0, cut))
+        chunks[chunks.len() - 1] = chunk.slice(cut, chunk.len())
+    } else if line.len() == 0 {
+        line.push(chunks.pop() ?? [])
+    }
+}
+
+/// The `max_lines` ending: the last line with its placeholder.
+fn truncate(o: WrapOptions, inout lines: [[i64]], indent: [i64], line0: [[i64]], len0: i64, width: i64) {
+    let placeholder = cs_of(o.placeholder)
+    var line = line0
+    var cur_len = len0
+    while line.len() > 0 {
+        if not blank(line[line.len() - 1]) and cur_len + placeholder.len() <= width {
+            line.push(placeholder)
+            lines.push(joined(indent, line))
+            return
+        }
+        cur_len = cur_len - line[line.len() - 1].len()
+        line.pop()
+    }
+    if lines.len() > 0 {
+        let prev = rstrip(lines[lines.len() - 1])
+        if prev.len() + placeholder.len() <= o.width {
+            lines[lines.len() - 1] = prev + placeholder
+            return
+        }
+    }
+    lines.push(indent + lstrip(placeholder))
+}
+
+/// _wrap_chunks.
+fn wrap_chunks(o: WrapOptions, chunks0: [[i64]]) -> [[i64]] ! WrapError {
+    if o.width <= 0 {
+        fail(WrapValueError("invalid width " + o.width.to_str() + " (must be > 0)"))
+    }
+    match o.max_lines {
+        Some(m) -> {
+            let indent = if m > 1 { o.subsequent_indent } else { o.initial_indent }
+            if cs_of(indent).len() + lstrip(cs_of(o.placeholder)).len() > o.width {
+                fail(WrapValueError("placeholder too large for max width"))
+            }
+        }
+        None -> {}
+    }
+    var chunks = reversed(chunks0)
+    var lines: [[i64]] = []
+    while chunks.len() > 0 {
+        let before = (chunks.len(), chunks[chunks.len() - 1].len())
+        var line: [[i64]] = []
+        var cur_len = 0
+        let indent = cs_of(if lines.len() > 0 { o.subsequent_indent } else { o.initial_indent })
+        let width = o.width - indent.len()
+        if o.drop_whitespace and blank(chunks[chunks.len() - 1]) and lines.len() > 0 {
+            chunks.pop()
+        }
+        while chunks.len() > 0 {
+            let l = chunks[chunks.len() - 1].len()
+            if cur_len + l > width {
+                break
+            }
+            line.push(chunks.pop() ?? [])
+            cur_len = cur_len + l
+        }
+        if chunks.len() > 0 and chunks[chunks.len() - 1].len() > width {
+            long_word(o, chunks, line, cur_len, width)
+            cur_len = total(line)
+        }
+        if o.drop_whitespace and line.len() > 0 and blank(line[line.len() - 1]) {
+            cur_len = cur_len - line[line.len() - 1].len()
+            line.pop()
+        }
+        if chunks.len() > 0 and (chunks.len(), chunks[chunks.len() - 1].len()) == before {
+            fail(WrapValueError("wrapping makes no progress: CPython loops forever on this input"))
+        }
+        if line.len() > 0 {
+            let under = match o.max_lines {
+                None -> true
+                Some(m) -> lines.len() + 1 < m or ((chunks.len() == 0 or (o.drop_whitespace and chunks.len() == 1 and blank(chunks[0]))) and
+                    cur_len <= width)
+            }
+            if under {
+                lines.push(joined(indent, line))
+            } else {
+                truncate(o, lines, indent, line, cur_len, width)
+                break
+            }
+        }
+    }
+    return lines
+}
+
+/// `TextWrapper(...).wrap(text)`.
+pub fn wrap(text: str, o: WrapOptions) -> [str] ! WrapError {
+    return (try wrap_chunks(o, chunks_of(text, o))).map(|l| text_of(l))
+}
+
+/// `TextWrapper(...).fill(text)`.
+pub fn fill(text: str, o: WrapOptions) -> str ! WrapError {
+    return (try wrap(text, o)).join("\n")
+}
+
+/// `textwrap.shorten(text, width, ...)`: `o` with one line at most.
+pub fn shorten(text: str, o: WrapOptions) -> str ! WrapError {
+    var words: [str] = []
+    var cur: [i64] = []
+    for c in cs_of(text) {
+        if pycharclass.is_space(c) {
+            if cur.len() > 0 {
+                words.push(text_of(cur))
+                cur = []
+            }
+        } else {
+            cur.push(c)
+        }
+    }
+    if cur.len() > 0 {
+        words.push(text_of(cur))
+    }
+    let one = WrapOptions{ width: o.width, initial_indent: o.initial_indent, subsequent_indent: o.subsequent_indent, expand_tabs: o.expand_tabs,
+        tabsize: o.tabsize, replace_whitespace: o.replace_whitespace, fix_sentence_endings: o.fix_sentence_endings, break_long_words: o.break_long_words,
+        drop_whitespace: o.drop_whitespace, break_on_hyphens: o.break_on_hyphens, max_lines: Some(1), placeholder: o.placeholder }
+    return try fill(words.join(" "), one)
+}
+
+// ---- dedent and indent
+
+/// Lines with their `\n`, as `^...$` in MULTILINE mode sees them.
+fn nl_lines(cs: [i64]) -> [[i64]] {
+    var out: [[i64]] = []
+    var start = 0
+    for i in 0..cs.len() {
+        if cs[i] == 10 {
+            out.push(cs.slice(start, i + 1))
+            start = i + 1
+        }
+    }
+    out.push(cs.slice(start, cs.len()))
+    return out
+}
+
+/// `textwrap.dedent(text)`.
+pub fn dedent(text: str) -> str {
+    var lines = nl_lines(cs_of(text))
+    // Lines of only spaces and tabs become empty.
+    for k in 0..lines.len() {
+        let l = lines[k]
+        let body = if l.len() > 0 and l[l.len() - 1] == 10 { l.slice(0, l.len() - 1) } else { l }
+        if body.len() > 0 and body.all(|c| c == 32 or c == 9) {
+            lines[k] = l.slice(body.len(), l.len())
+        }
+    }
+    var margin: Option[[i64]] = None
+    for l in lines {
+        var i = 0
+        while i < l.len() and (l[i] == 32 or l[i] == 9) {
+            i = i + 1
+        }
+        if i >= l.len() or l[i] == 10 {
+            continue
+        }
+        let ind = l.slice(0, i)
+        margin = match margin {
+            None -> Some(ind)
+            Some(m) -> Some(common_margin(m, ind))
+        }
+    }
+    let m = margin ?? []
+    var out: [i64] = []
+    for l in lines {
+        out = out + if m.len() > 0 and l.len() >= m.len() and l.slice(0, m.len()) == m { l.slice(m.len(), l.len()) } else { l }
+    }
+    return text_of(out)
+}
+
+fn common_margin(m: [i64], ind: [i64]) -> [i64] {
+    if ind.len() >= m.len() and ind.slice(0, m.len()) == m {
+        return m
+    }
+    if m.len() >= ind.len() and m.slice(0, ind.len()) == ind {
+        return ind
+    }
+    var i = 0
+    while i < m.len() and i < ind.len() and m[i] == ind[i] {
+        i = i + 1
+    }
+    return m.slice(0, i)
+}
+
+/// `str.splitlines(True)`.
+fn split_lines_keep(cs: [i64]) -> [[i64]] {
+    var out: [[i64]] = []
+    var start = 0
+    var i = 0
+    while i < cs.len() {
+        let c = cs[i]
+        if c == 13 and i + 1 < cs.len() and cs[i + 1] == 10 {
+            out.push(cs.slice(start, i + 2))
+            i = i + 2
+            start = i
+            continue
+        }
+        if c == 10 or c == 13 or c == 11 or c == 12 or c == 28 or c == 29 or c == 30 or c == 133 or c == 8232 or c == 8233 {
+            out.push(cs.slice(start, i + 1))
+            start = i + 1
+        }
+        i = i + 1
+    }
+    if start < cs.len() {
+        out.push(cs.slice(start, cs.len()))
+    }
+    return out
+}
+
+/// `textwrap.indent(text, prefix)`: every line that is not all
+/// whitespace.
+pub fn indent(text: str, prefix: str) -> str {
+    var out: [i64] = []
+    for l in split_lines_keep(cs_of(text)) {
+        if not pycharclass.isspace_codes(l) {
+            out = out + cs_of(prefix)
+        }
+        out = out + l
+    }
+    return text_of(out)
+}

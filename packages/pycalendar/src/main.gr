@@ -1,0 +1,258 @@
+// Python's `calendar`, as CPython 3.13 prints it in the C locale:
+// `TextCalendar.formatmonth` and `formatyear` (what `python -m calendar`
+// and `cal`-like scripts print), `HTMLCalendar`'s tables, and
+// `monthrange`, `monthcalendar`, `weekday`, `isleap`, `leapdays` and
+// `timegm`.
+//
+// `packages/calendar` lays out a month. This is Python's layout, character
+// for character, for tools whose output is compared against it:
+//
+//   - Columns are centred as `str.center` centres, which puts an odd
+//     space on the left only when the width is odd.
+//   - Day names shrink to the column (`Mo`, `Mon`, `Monday` from width
+//     9); month titles carry the year as `repr` writes it, negative years
+//     included -- the weekday arithmetic maps any year into the 400-year
+//     cycle.
+//   - Lines are right-stripped and joined by `l` newlines; a year is
+//     printed `m` months to a row with `c` spaces between them.
+//   - A month outside 1..12 is "bad month number 13; must be 1-12".
+
+type CalError = | CalValueError(msg: str)
+
+pub fn error_text(e: CalError) -> str {
+    return match e {
+        CalValueError(m) -> m
+    }
+}
+
+fn fdiv(a: i64, b: i64) -> i64 {
+    let q = a / b
+    return if a % b != 0 and ((a < 0) != (b < 0)) { q - 1 } else { q }
+}
+
+fn fmod(a: i64, b: i64) -> i64 {
+    return a - b * fdiv(a, b)
+}
+
+pub fn isleap(year: i64) -> bool {
+    return fmod(year, 4) == 0 and (fmod(year, 100) != 0 or fmod(year, 400) == 0)
+}
+
+/// Leap years in `[y1, y2)`.
+pub fn leapdays(y1: i64, y2: i64) -> i64 {
+    let a = y1 - 1
+    let b = y2 - 1
+    return (fdiv(b, 4) - fdiv(a, 4)) - (fdiv(b, 100) - fdiv(a, 100)) + (fdiv(b, 400) - fdiv(a, 400))
+}
+
+fn month_days(year: i64, month: i64) -> i64 {
+    return [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][month - 1] + if month == 2 and isleap(year) { 1 } else { 0 }
+}
+
+fn ordinal(y: i64, m: i64, d: i64) -> i64 {
+    let p = y - 1
+    let before = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334][m - 1] + if m > 2 and isleap(y) { 1 } else { 0 }
+    return p * 365 + fdiv(p, 4) - fdiv(p, 100) + fdiv(p, 400) + before + d
+}
+
+/// `calendar.weekday(year, month, day)`, Monday 0. Years outside 1..9999
+/// are taken modulo 400, as Python does.
+pub fn weekday(year: i64, month: i64, day: i64) -> i64 ! CalError {
+    let y = if year < 1 or year > 9999 { 2000 + fmod(year, 400) } else { year }
+    if month < 1 or month > 12 {
+        fail(CalValueError("month must be in 1..12"))
+    }
+    if day < 1 or day > month_days(y, month) {
+        fail(CalValueError("day is out of range for month"))
+    }
+    return (ordinal(y, month, day) + 6) % 7
+}
+
+fn check_month(month: i64) -> () ! CalError {
+    if month < 1 or month > 12 {
+        fail(CalValueError("bad month number " + month.to_str() + "; must be 1-12"))
+    }
+    return ()
+}
+
+/// `calendar.monthrange(year, month)`: the first day's weekday and the
+/// number of days.
+pub fn monthrange(year: i64, month: i64) -> (i64, i64) ! CalError {
+    try check_month(month)
+    return (try weekday(year, month, 1), month_days(year, month))
+}
+
+/// itermonthdays: the month in whole weeks, 0 outside it.
+fn month_days_list(year: i64, month: i64, first: i64) -> [i64] ! CalError {
+    let (day1, n) = try monthrange(year, month)
+    var out: [i64] = []
+    for _k in 0..fmod(day1 - first, 7) {
+        out.push(0)
+    }
+    for d in 1..(n + 1) {
+        out.push(d)
+    }
+    for _k in 0..fmod(first - day1 - n, 7) {
+        out.push(0)
+    }
+    return out
+}
+
+fn weeks(days: [i64]) -> [[i64]] {
+    var out: [[i64]] = []
+    var i = 0
+    while i < days.len() {
+        out.push(days.slice(i, i + 7))
+        i = i + 7
+    }
+    return out
+}
+
+/// `Calendar(firstweekday).monthdayscalendar(year, month)`.
+pub fn monthcalendar(year: i64, month: i64, firstweekday: i64) -> [[i64]] ! CalError {
+    return weeks(try month_days_list(year, month, fmod(firstweekday, 7)))
+}
+
+/// `str.center(width)`.
+fn center(s: str, width: i64) -> str {
+    let n = s.codes().len()
+    if n >= width {
+        return s
+    }
+    let marg = width - n
+    let left = marg / 2 + marg.bit_and(width).bit_and(1)
+    return " ".repeat(left) + s + " ".repeat(marg - left)
+}
+
+fn rstrip(s: str) -> str {
+    let cs = s.codes()
+    var n = cs.len()
+    while n > 0 and (cs[n - 1] == 32 or cs[n - 1] == 9 or cs[n - 1] == 10) {
+        n = n - 1
+    }
+    return cs.slice(0, n).map(|c| c.to_char()).join("")
+}
+
+fn day_name(d: i64, width: i64) -> str {
+    let full = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"][d]
+    let name = if width >= 9 { full } else { full.substr(0, 3) }
+    let cut = if name.len() > width { name.substr(0, width) } else { name }
+    return center(cut, width)
+}
+
+fn month_name(m: i64) -> str {
+    return ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"][m - 1]
+}
+
+fn week_header(width: i64, first: i64) -> str {
+    return (first..(first + 7)).to_list().map(|i| day_name(i % 7, width)).join(" ")
+}
+
+fn format_week(week: [i64], width: i64) -> str {
+    return week.map(|d| center(if d == 0 { "" } else if d < 10 { " " + d.to_str() } else { d.to_str() }, width)).join(" ")
+}
+
+/// `TextCalendar(firstweekday).formatmonth(year, month, w, l)`.
+pub fn formatmonth(year: i64, month: i64, w0: i64, l0: i64, firstweekday: i64) -> str ! CalError {
+    let w = if w0 < 2 { 2 } else { w0 }
+    let l = if l0 < 1 { 1 } else { l0 }
+    let first = fmod(firstweekday, 7)
+    try check_month(month)
+    let nl = "\n".repeat(l)
+    var s = rstrip(center(month_name(month) + " " + year.to_str(), 7 * (w + 1) - 1)) + nl
+    s = s + rstrip(week_header(w, first)) + nl
+    for week in weeks(try month_days_list(year, month, first)) {
+        s = s + rstrip(format_week(week, w)) + nl
+    }
+    return s
+}
+
+fn columns(cols: [str], width: i64, spacing: i64) -> str {
+    return cols.map(|c| center(c, width)).join(" ".repeat(spacing))
+}
+
+/// `TextCalendar(firstweekday).formatyear(year, w, l, c, m)`.
+pub fn formatyear(year: i64, w0: i64, l0: i64, c0: i64, m: i64, firstweekday: i64) -> str ! CalError {
+    let w = if w0 < 2 { 2 } else { w0 }
+    let l = if l0 < 1 { 1 } else { l0 }
+    let c = if c0 < 2 { 2 } else { c0 }
+    let first = fmod(firstweekday, 7)
+    let colwidth = (w + 1) * 7 - 1
+    let nl = "\n".repeat(l)
+    var out = rstrip(center(year.to_str(), colwidth * m + c * (m - 1))) + nl
+    let header = week_header(w, first)
+    var start = 1
+    while start <= 12 {
+        let months = (start..(if start + m < 13 { start + m } else { 13 })).to_list()
+        out = out + nl + rstrip(columns(months.map(|k| month_name(k)), colwidth, c)) + nl
+        out = out + rstrip(columns(months.map(|_k| header), colwidth, c)) + nl
+        var cals: [[[i64]]] = []
+        for k in months {
+            cals.push(weeks(try month_days_list(year, k, first)))
+        }
+        let height = cals.fold(0, |a, cal| if cal.len() > a { cal.len() } else { a })
+        for j in 0..height {
+            let ws = cals.map(|cal| if j >= cal.len() { "" } else { format_week(cal[j], w) })
+            out = out + rstrip(columns(ws, colwidth, c)) + nl
+        }
+        start = start + m
+    }
+    return out
+}
+
+fn css_day(d: i64) -> str {
+    return ["mon", "tue", "wed", "thu", "fri", "sat", "sun"][d]
+}
+
+/// `HTMLCalendar(firstweekday).formatmonth(year, month, withyear)`.
+pub fn html_formatmonth(year: i64, month: i64, withyear: bool, firstweekday: i64) -> str ! CalError {
+    let first = fmod(firstweekday, 7)
+    try check_month(month)
+    let name = if withyear { month_name(month) + " " + year.to_str() } else { month_name(month) }
+    var out = "<table border=\"0\" cellpadding=\"0\" cellspacing=\"0\" class=\"month\">\n"
+    out = out + "<tr><th colspan=\"7\" class=\"month\">" + name + "</th></tr>\n"
+    out = out + "<tr>" + (first..(first + 7)).to_list().map(|i| "<th class=\"" + css_day(i % 7) + "\">" + day_name(i % 7, 3) + "</th>").join("") +
+    "</tr>\n"
+    let days = try month_days_list(year, month, first)
+    var k = 0
+    for week in weeks(days) {
+        var row = "<tr>"
+        for d in week {
+            let wd = (first + k) % 7
+            row = row + if d == 0 { "<td class=\"noday\">&nbsp;</td>" } else { "<td class=\"" + css_day(wd) + "\">" + d.to_str() + "</td>" }
+            k = k + 1
+        }
+        out = out + row + "</tr>\n"
+    }
+    return out + "</table>\n"
+}
+
+/// `HTMLCalendar(firstweekday).formatyear(year, width)`.
+pub fn html_formatyear(year: i64, width0: i64, firstweekday: i64) -> str ! CalError {
+    let width = if width0 < 1 { 1 } else { width0 }
+    var out = "<table border=\"0\" cellpadding=\"0\" cellspacing=\"0\" class=\"year\">\n"
+    out = out + "<tr><th colspan=\"" + width.to_str() + "\" class=\"year\">" + year.to_str() + "</th></tr>"
+    var i = 1
+    while i <= 12 {
+        out = out + "<tr>"
+        for m in i..(if i + width < 13 { i + width } else { 13 }) {
+            out = out + "<td>" + (try html_formatmonth(year, m, false, firstweekday)) + "</td>"
+        }
+        out = out + "</tr>"
+        i = i + width
+    }
+    return out + "</table>"
+}
+
+/// `calendar.timegm((year, month, day, hour, minute, second))`: seconds
+/// since 1970 in UTC; `day` and the time may run past their ranges.
+pub fn timegm(year: i64, month: i64, day: i64, hour: i64, minute: i64, second: i64) -> i64 ! CalError {
+    if year < 1 or year > 9999 {
+        fail(CalValueError("year " + year.to_str() + " is out of range"))
+    }
+    if month < 1 or month > 12 {
+        fail(CalValueError("month must be in 1..12"))
+    }
+    let days = ordinal(year, month, 1) - 719163 + day - 1
+    return ((days * 24 + hour) * 60 + minute) * 60 + second
+}

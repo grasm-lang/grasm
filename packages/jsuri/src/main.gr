@@ -1,0 +1,232 @@
+// JavaScript's URI functions, as ECMAScript defines them and V8 runs them:
+// `encodeURI`, `encodeURIComponent`, `decodeURI`, `decodeURIComponent`,
+// `escape` and `unescape`.
+//
+// Browsers, Node and every bundle in between build query strings and paths
+// with these, and a server reading what they wrote, or a tool producing
+// links for them, needs the same four sets: which characters each leaves
+// alone, that `decodeURI` keeps `%2F` and the other reserved escapes
+// encoded while `decodeURIComponent` decodes them, that a malformed escape
+// or bad UTF-8 is a `URIError` ("URI malformed") rather than a
+// replacement character, and that the legacy `escape` writes `%uXXXX`
+// for anything past U+00FF.
+//
+// JavaScript strings are UTF-16, and `unescape("%uD800")` makes a lone
+// surrogate, so strings here are lists of UTF-16 code units; `units` and
+// `text` convert, `text` writing U+FFFD for a lone surrogate.
+
+type JsUriError = | JsUriMalformed
+
+/// A string's UTF-16 code units.
+pub fn units(s: str) -> [i64] {
+    var out: [i64] = []
+    for c in s.codes() {
+        if c >= 65536 {
+            let v = c - 65536
+            out.push(55296 + v.shr(10))
+            out.push(56320 + v.bit_and(1023))
+        } else {
+            out.push(c)
+        }
+    }
+    return out
+}
+
+fn is_high(u: i64) -> bool {
+    return u >= 55296 and u <= 56319
+}
+
+fn is_low(u: i64) -> bool {
+    return u >= 56320 and u <= 57343
+}
+
+/// Code units back to text; a lone surrogate becomes U+FFFD.
+pub fn text(us: [i64]) -> str {
+    var out: [str] = []
+    var i = 0
+    while i < us.len() {
+        let u = us[i]
+        if is_high(u) and i + 1 < us.len() and is_low(us[i + 1]) {
+            out.push((65536 + (u - 55296).shl(10) + (us[i + 1] - 56320)).to_char())
+            i = i + 2
+        } else {
+            out.push((if is_high(u) or is_low(u) { 65533 } else { u }).to_char())
+            i = i + 1
+        }
+    }
+    return out.join("")
+}
+
+fn hex2(b: i64) -> str {
+    let digits = "0123456789ABCDEF"
+    return digits.substr(b.shr(4), 1) + digits.substr(b.bit_and(15), 1)
+}
+
+fn alnum(c: i64) -> bool {
+    return (c >= 97 and c <= 122) or (c >= 65 and c <= 90) or (c >= 48 and c <= 57)
+}
+
+fn uri_mark(c: i64) -> bool {
+    return "-_.!~*'()".codes().contains(c)
+}
+
+fn uri_reserved(c: i64) -> bool {
+    return ";/?:@&=+$,".codes().contains(c)
+}
+
+fn utf8_of(cp: i64) -> [i64] {
+    return cp.to_char().to_bytes().to_list()
+}
+
+/// The spec's Encode: everything outside the unescaped set as UTF-8
+/// escapes; a lone surrogate is a URIError.
+fn encode(us: [i64], extra: bool) -> str ! JsUriError {
+    var out: [str] = []
+    var k = 0
+    while k < us.len() {
+        let c = us[k]
+        if alnum(c) or uri_mark(c) or (extra and (uri_reserved(c) or c == 35)) {
+            out.push(c.to_char())
+            k = k + 1
+            continue
+        }
+        var cp = c
+        if is_low(c) {
+            fail(JsUriMalformed)
+        }
+        if is_high(c) {
+            if k + 1 >= us.len() or not is_low(us[k + 1]) {
+                fail(JsUriMalformed)
+            }
+            cp = 65536 + (c - 55296).shl(10) + (us[k + 1] - 56320)
+            k = k + 1
+        }
+        for b in utf8_of(cp) {
+            out.push("%" + hex2(b))
+        }
+        k = k + 1
+    }
+    return out.join("")
+}
+
+/// `encodeURIComponent(s)`.
+pub fn encode_uri_component(us: [i64]) -> str ! JsUriError {
+    return try encode(us, false)
+}
+
+/// `encodeURI(s)`: the reserved characters and `#` kept.
+pub fn encode_uri(us: [i64]) -> str ! JsUriError {
+    return try encode(us, true)
+}
+
+fn hex_val(c: i64) -> i64 {
+    return if c >= 48 and c <= 57 { c - 48 } else if c >= 97 and c <= 102 { c - 87 } else if c >= 65 and c <= 70 { c - 55 } else { 0 - 1 }
+}
+
+fn escape_byte(us: [i64], k: i64) -> i64 ! JsUriError {
+    if k + 2 >= us.len() or us[k] != 37 or hex_val(us[k + 1]) < 0 or hex_val(us[k + 2]) < 0 {
+        fail(JsUriMalformed)
+    }
+    return hex_val(us[k + 1]) * 16 + hex_val(us[k + 2])
+}
+
+/// The spec's Decode: `%XX` runs as UTF-8, strictly; with `reserved`, an
+/// escape of a reserved character or `#` is left as written.
+fn decode(us: [i64], reserved: bool) -> [i64] ! JsUriError {
+    var out: [i64] = []
+    var k = 0
+    while k < us.len() {
+        if us[k] != 37 {
+            out.push(us[k])
+            k = k + 1
+            continue
+        }
+        let start = k
+        let b = try escape_byte(us, k)
+        k = k + 3
+        if b < 128 {
+            if reserved and (uri_reserved(b) or b == 35) {
+                out = out + us.slice(start, k)
+            } else {
+                out.push(b)
+            }
+            continue
+        }
+        let n = if b.bit_and(224) == 192 { 2 } else if b.bit_and(240) == 224 { 3 } else if b.bit_and(248) == 240 { 4 } else { 0 }
+        if n == 0 {
+            fail(JsUriMalformed)
+        }
+        var bytes = [b]
+        for _j in 1..n {
+            let c = try escape_byte(us, k)
+            if c.bit_and(192) != 128 {
+                fail(JsUriMalformed)
+            }
+            bytes.push(c)
+            k = k + 3
+        }
+        let cp = decode_utf8(bytes)
+        if cp < 0 {
+            fail(JsUriMalformed)
+        }
+        out = out + units(cp.to_char())
+    }
+    return out
+}
+
+/// One UTF-8 sequence's code point, or -1 if it is overlong, a surrogate
+/// or past U+10FFFF.
+fn decode_utf8(b: [i64]) -> i64 {
+    let n = b.len()
+    var cp = if n == 2 { b[0].bit_and(31) } else if n == 3 { b[0].bit_and(15) } else { b[0].bit_and(7) }
+    for i in 1..n {
+        cp = cp.shl(6).bit_or(b[i].bit_and(63))
+    }
+    let least = if n == 2 { 128 } else if n == 3 { 2048 } else { 65536 }
+    if cp < least or (cp >= 55296 and cp <= 57343) or cp > 1114111 {
+        return 0 - 1
+    }
+    return cp
+}
+
+/// `decodeURIComponent(s)`.
+pub fn decode_uri_component(us: [i64]) -> [i64] ! JsUriError {
+    return try decode(us, false)
+}
+
+/// `decodeURI(s)`: escapes of `;/?:@&=+$,#` stay escaped.
+pub fn decode_uri(us: [i64]) -> [i64] ! JsUriError {
+    return try decode(us, true)
+}
+
+/// `escape(s)`: `%XX` below U+0100, `%uXXXX` above, letters, digits and
+/// `@*_+-./` kept.
+pub fn escape(us: [i64]) -> str {
+    return us.map(|c| if alnum(c) or "@*_+-./".codes().contains(c) { c.to_char() } else if c < 256 { "%" + hex2(c) } else {
+        "%u" + hex2(c.shr(8)) + hex2(c.bit_and(255))
+    }).join("")
+}
+
+/// `unescape(s)`: `%uXXXX` and `%XX` decoded; anything else kept.
+pub fn unescape(us: [i64]) -> [i64] {
+    var out: [i64] = []
+    var k = 0
+    while k < us.len() {
+        let c = us[k]
+        if c == 37 {
+            if k + 6 <= us.len() and us[k + 1] == 117 and us.slice(k + 2, k + 6).all(|h| hex_val(h) >= 0) {
+                out.push(us.slice(k + 2, k + 6).map(|h| hex_val(h)).fold(0, |a, h| a * 16 + h))
+                k = k + 6
+                continue
+            }
+            if k + 3 <= us.len() and hex_val(us[k + 1]) >= 0 and hex_val(us[k + 2]) >= 0 {
+                out.push(hex_val(us[k + 1]) * 16 + hex_val(us[k + 2]))
+                k = k + 3
+                continue
+            }
+        }
+        out.push(c)
+        k = k + 1
+    }
+    return out
+}

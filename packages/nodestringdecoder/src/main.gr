@@ -1,0 +1,341 @@
+// Node's `string_decoder`, as Node 25 decodes a stream of byte chunks into
+// text: `new StringDecoder(encoding)`, `write(chunk)` and `end(chunk)`.
+//
+// Streams hand a program bytes in pieces that ignore character
+// boundaries, and what Node prints for each piece is part of the
+// behaviour a port has to keep -- the same text can arrive split
+// differently, and a replacement character can appear in a different
+// chunk or not at all:
+//
+//   - UTF-8: a character cut at the end of a chunk is held back and
+//     finished by the next one; if the next byte is not a continuation
+//     byte the held bytes are decoded as they are, each broken sequence
+//     becoming U+FFFD the way V8 (the WHATWG decoder) does it; `end`
+//     decodes whatever is held.
+//   - UTF-16LE: an odd byte, or a high surrogate at the end, is held for
+//     the next chunk; `end` drops a single odd byte.
+//   - base64 and base64url: bytes are held until there are three, so each
+//     write prints whole groups; `end` prints the rest with `=` padding
+//     (none for base64url).
+//   - hex, latin1 and ascii (which clears the high bit) print every chunk
+//     as it is.
+//   - The encoding name is read as Node reads it -- `utf-8`, `UCS2`,
+//     `binary`, `UTF-16LE`, a few spellings of each -- and anything else
+//     is "Unknown encoding: x".
+//
+// Output is the JavaScript string as UTF-16 code units, since UTF-16LE
+// input can leave a surrogate unpaired.
+
+type NodeStringDecoder = { encoding: str, held: [i64], missing: i64 }
+
+/// TypeError [ERR_UNKNOWN_ENCODING], with Node's message.
+type NodeEncodingError = | NodeUnknownEncoding(msg: str)
+
+pub fn error_text(e: NodeEncodingError) -> str {
+    return match e {
+        NodeUnknownEncoding(m) -> m
+    }
+}
+
+fn ascii_lower(s: str) -> str {
+    return s.codes().map(|c| if c >= 65 and c <= 90 { (c + 32).to_char() } else { c.to_char() }).join("")
+}
+
+/// Node's normalizeEncoding: the canonical name, or None. None as input
+/// is `undefined`.
+pub fn normalize_encoding(name: Option[str]) -> Option[str] {
+    let enc = match name {
+        None -> return Some("utf8")
+        Some(e) -> e
+    }
+    let low = ascii_lower(enc)
+    let n = enc.codes().len()
+    if n == 0 or enc == "utf8" or enc == "utf-8" {
+        return Some("utf8")
+    }
+    if n == 4 {
+        return if low == "utf8" { Some("utf8") } else if low == "ucs2" { Some("utf16le") } else { None }
+    }
+    if n == 3 {
+        return if low == "hex" { Some("hex") } else { None }
+    }
+    if n == 5 {
+        return if low == "utf-8" { Some("utf8") } else if low == "ascii" { Some("ascii") } else if low == "ucs-2" { Some("utf16le") } else { None }
+    }
+    if n == 6 {
+        return if low == "base64" { Some("base64") } else if low == "latin1" or low == "binary" { Some("latin1") } else { None }
+    }
+    if n == 7 {
+        return if low == "utf16le" { Some("utf16le") } else { None }
+    }
+    if n == 8 {
+        return if low == "utf-16le" { Some("utf16le") } else { None }
+    }
+    if n == 9 {
+        return if low == "base64url" { Some("base64url") } else { None }
+    }
+    return None
+}
+
+/// `new StringDecoder(encoding)`; None is `undefined`.
+pub fn new_decoder(name: Option[str]) -> NodeStringDecoder ! NodeEncodingError {
+    return match normalize_encoding(name) {
+        Some(e) -> NodeStringDecoder{ encoding: e, held: [], missing: 0 }
+        None -> fail(NodeUnknownEncoding("Unknown encoding: " + (name ?? "undefined")))
+    }
+}
+
+// ---- turning bytes into a string
+
+fn push_code_point(inout out: [i64], c: i64) {
+    if c >= 65536 {
+        out.push(55296 + (c - 65536).shr(10))
+        out.push(56320 + (c - 65536).bit_and(1023))
+    } else {
+        out.push(c)
+    }
+}
+
+/// UTF-8 to UTF-16 as the WHATWG decoder does it: each maximal broken
+/// sequence is one U+FFFD.
+fn utf8_units(b: [i64]) -> [i64] {
+    var out: [i64] = []
+    var i = 0
+    while i < b.len() {
+        let c = b[i]
+        if c < 128 {
+            out.push(c)
+            i = i + 1
+            continue
+        }
+        var need = 0
+        var lower = 128
+        var upper = 191
+        var cp = 0
+        if c >= 194 and c <= 223 {
+            need = 1
+            cp = c.bit_and(31)
+        } else if c >= 224 and c <= 239 {
+            need = 2
+            cp = c.bit_and(15)
+            if c == 224 {
+                lower = 160
+            }
+            if c == 237 {
+                upper = 159
+            }
+        } else if c >= 240 and c <= 244 {
+            need = 3
+            cp = c.bit_and(7)
+            if c == 240 {
+                lower = 144
+            }
+            if c == 244 {
+                upper = 143
+            }
+        } else {
+            out.push(65533)
+            i = i + 1
+            continue
+        }
+        var j = i + 1
+        var ok = true
+        while need > 0 {
+            if j >= b.len() or b[j] < lower or b[j] > upper {
+                ok = false
+                break
+            }
+            cp = cp.shl(6).bit_or(b[j].bit_and(63))
+            lower = 128
+            upper = 191
+            need = need - 1
+            j = j + 1
+        }
+        if ok {
+            push_code_point(out, cp)
+        } else {
+            out.push(65533)
+        }
+        i = j
+    }
+    return out
+}
+
+fn base64_units(b: [i64], url: bool) -> [i64] {
+    let alphabet = if url { "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_" } else {
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+    }.codes()
+    var out: [i64] = []
+    var i = 0
+    while i < b.len() {
+        let n = if b.len() - i >= 3 { 3 } else { b.len() - i }
+        let v = b[i].shl(16) + (if n > 1 { b[i + 1].shl(8) } else { 0 }) + (if n > 2 { b[i + 2] } else { 0 })
+        out.push(alphabet[v.shr(18).bit_and(63)])
+        out.push(alphabet[v.shr(12).bit_and(63)])
+        if n > 1 {
+            out.push(alphabet[v.shr(6).bit_and(63)])
+        } else if not url {
+            out.push(61)
+        }
+        if n > 2 {
+            out.push(alphabet[v.bit_and(63)])
+        } else if not url {
+            out.push(61)
+        }
+        i = i + 3
+    }
+    return out
+}
+
+/// MakeString: the bytes as a string in the encoding.
+fn make_string(b: [i64], encoding: str) -> [i64] {
+    if encoding == "utf8" {
+        return utf8_units(b)
+    }
+    if encoding == "utf16le" {
+        var out: [i64] = []
+        var i = 0
+        while i + 1 < b.len() {
+            out.push(b[i] + b[i + 1].shl(8))
+            i = i + 2
+        }
+        return out
+    }
+    if encoding == "base64" or encoding == "base64url" {
+        return base64_units(b, encoding == "base64url")
+    }
+    if encoding == "hex" {
+        let d = "0123456789abcdef".codes()
+        var out: [i64] = []
+        for x in b {
+            out.push(d[x.shr(4)])
+            out.push(d[x.bit_and(15)])
+        }
+        return out
+    }
+    if encoding == "ascii" {
+        return b.map(|x| x.bit_and(127))
+    }
+    return b
+}
+
+fn concat(a: [i64], b: [i64]) -> [i64] {
+    var out = a
+    for x in b {
+        out.push(x)
+    }
+    return out
+}
+
+/// How many bytes at the end of `data` begin a UTF-8 character the chunk
+/// does not finish, setting how many more it needs.
+fn utf8_tail(inout d: NodeStringDecoder, data: [i64]) -> i64 {
+    var i = data.len() - 1
+    var buffered = 0
+    while true {
+        buffered = buffered + 1
+        if data[i].bit_and(192) == 128 {
+            if buffered >= 4 or i == 0 {
+                buffered = 0
+                break
+            }
+        } else {
+            var want = 0
+            if data[i].bit_and(224) == 192 {
+                want = 2
+            } else if data[i].bit_and(240) == 224 {
+                want = 3
+            } else if data[i].bit_and(248) == 240 {
+                want = 4
+            } else {
+                buffered = 0
+                break
+            }
+            if buffered >= want {
+                want = 0
+                buffered = 0
+            }
+            d.missing = want - buffered
+            break
+        }
+        i = i - 1
+    }
+    return buffered
+}
+
+/// `decoder.write(chunk)`.
+pub fn write(inout d: NodeStringDecoder, chunk: bytes) -> [i64] {
+    var data = chunk.to_list()
+    let enc = d.encoding
+    if enc != "utf8" and enc != "utf16le" and enc != "base64" and enc != "base64url" {
+        return make_string(data, enc)
+    }
+    var prepend: [i64] = []
+    if d.missing > 0 {
+        if enc == "utf8" {
+            var i = 0
+            while i < data.len() and i < d.missing {
+                if data[i].bit_and(192) != 128 {
+                    // Not a continuation byte: the held character ends
+                    // here, broken, and this byte starts a new one.
+                    d.missing = 0
+                    d.held = concat(d.held, data.slice(0, i))
+                    data = data.slice(i, data.len())
+                    break
+                }
+                i = i + 1
+            }
+        }
+        let found = if data.len() < d.missing { data.len() } else { d.missing }
+        d.held = concat(d.held, data.slice(0, found))
+        data = data.slice(found, data.len())
+        d.missing = d.missing - found
+        if d.missing == 0 {
+            prepend = make_string(d.held, enc)
+            d.held = []
+        }
+    }
+    if data.len() == 0 {
+        return prepend
+    }
+    var keep = 0
+    let n = data.len()
+    if enc == "utf8" and data[n - 1].bit_and(128) != 0 {
+        keep = utf8_tail(d, data)
+    } else if enc == "utf16le" {
+        if n % 2 == 1 {
+            keep = 1
+            d.missing = 1
+        } else if data[n - 1].bit_and(252) == 216 {
+            keep = 2
+            d.missing = 2
+        }
+    } else if enc == "base64" or enc == "base64url" {
+        keep = n % 3
+        if keep > 0 {
+            d.missing = 3 - keep
+        }
+    }
+    if keep > 0 {
+        d.held = data.slice(n - keep, n)
+    }
+    return concat(prepend, make_string(data.slice(0, n - keep), enc))
+}
+
+/// `decoder.end(chunk)`; None writes nothing first.
+pub fn end(inout d: NodeStringDecoder, chunk: Option[bytes]) -> [i64] {
+    let first = match chunk {
+        Some(c) -> write(d, c)
+        None -> []
+    }
+    if d.held.len() == 0 {
+        return first
+    }
+    var held = d.held
+    if d.encoding == "utf16le" and held.len() % 2 == 1 {
+        held = held.slice(0, held.len() - 1)
+    }
+    d.held = []
+    d.missing = 0
+    return concat(first, make_string(held, d.encoding))
+}

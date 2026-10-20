@@ -1,0 +1,922 @@
+// Go's `encoding/json` for untyped values, byte for byte as Go 1.25
+// writes and reads JSON: `Marshal`, `Unmarshal` into `any`, `Valid`,
+// `Compact`, `Indent` and `HTMLEscape`, error messages included.
+//
+// A Go service's JSON is often signed, cached by hash or compared against
+// a golden file, so a tool on the other side needs Go's exact output, not
+// merely equal JSON:
+//
+//   - Numbers are float64, printed like JavaScript's: `1e+21`, `1e-7`
+//     (Go's two-digit exponent cut back to one), plain in between.
+//   - Strings escape `<`, `>` and `&` as `<` and friends unless
+//     HTML escaping is off, U+2028 and U+2029 always, control characters
+//     as `\n`, `\t` and the rest of the short forms or `\u00XX`, and each
+//     byte of invalid UTF-8 as `�`.
+//   - Object keys come out sorted bytewise; a key given twice keeps its
+//     last value, as a Go map does.
+//   - Reading, a lone surrogate escape becomes U+FFFD, each invalid UTF-8
+//     byte becomes U+FFFD, and a number beyond float64 is an
+//     `UnmarshalTypeError` while the rest of the value is still read.
+//   - Syntax errors carry the scanner's message -- `invalid character 'x'
+//     looking for beginning of value` -- and its byte offset.
+
+import gostrconv
+import goquote
+
+type GoJson =
+    | GjNull
+    | GjBool(b: bool)
+    | GjNumber(n: f64)
+    | GjString(s: bytes)
+    | GjArray(items: [GoJson])
+    | GjObject(keys: [bytes], values: [GoJson])
+
+/// A failure: a syntax error with its byte offset, an unmarshalling error
+/// (a number beyond float64), or a value Marshal refuses (NaN, infinity).
+type GoJsonError =
+    | GjSyntax(msg: str, offset: i64)
+    | GjUnmarshalType(msg: str)
+    | GjUnsupportedValue(msg: str)
+
+/// What Unmarshal leaves behind: the value, and the first error it saved
+/// while still reading the rest (a number out of range reads as null).
+type GjDecoded = { value: GoJson, err: Option[GoJsonError] }
+
+// ---- the scanner: Go's state machine, one byte at a time
+
+// Results of a step.
+fn scan_continue() -> i64 {
+    return 0
+}
+
+fn scan_begin_literal() -> i64 {
+    return 1
+}
+
+fn scan_begin_object() -> i64 {
+    return 2
+}
+
+fn scan_object_key() -> i64 {
+    return 3
+}
+
+fn scan_object_value() -> i64 {
+    return 4
+}
+
+fn scan_end_object() -> i64 {
+    return 5
+}
+
+fn scan_begin_array() -> i64 {
+    return 6
+}
+
+fn scan_array_value() -> i64 {
+    return 7
+}
+
+fn scan_end_array() -> i64 {
+    return 8
+}
+
+fn scan_skip_space() -> i64 {
+    return 9
+}
+
+fn scan_end() -> i64 {
+    return 10
+}
+
+fn scan_error() -> i64 {
+    return 11
+}
+
+// States, named as Go names them.
+type GjState =
+    | StBeginValue
+    | StBeginValueOrEmpty
+    | StBeginStringOrEmpty
+    | StBeginString
+    | StEndValue
+    | StEndTop
+    | StInString
+    | StInStringEsc
+    | StInStringEscU(n: i64)
+    | StNeg
+    | St1
+    | St0
+    | StDot
+    | StDot0
+    | StE
+    | StESign
+    | StE0
+    | StLiteral(rest: str, word: str)
+    | StError
+
+/// Parse states: 0 object key, 1 object value, 2 array value.
+type GjScanner = { step: GjState, end_top: bool, parse: [i64], err: Option[GoJsonError], bytes: i64 }
+
+fn new_scanner() -> GjScanner {
+    return GjScanner{ step: StBeginValue, end_top: false, parse: [], err: None, bytes: 0 }
+}
+
+fn quote_char(c: i64) -> str {
+    if c == 39 {
+        return "'\\''"
+    }
+    if c == 34 {
+        return "'\"'"
+    }
+    let q = goquote.quote(c.to_char().to_bytes())
+    return "'" + q.substr(1, q.len() - 2) + "'"
+}
+
+fn fail_step(inout s: GjScanner, c: i64, context: str) -> i64 {
+    s.step = StError
+    s.err = Some(GjSyntax("invalid character " + quote_char(c) + " " + context, s.bytes))
+    return scan_error()
+}
+
+fn is_space(c: i64) -> bool {
+    return c == 32 or c == 9 or c == 13 or c == 10
+}
+
+fn is_hex(c: i64) -> bool {
+    return (c >= 48 and c <= 57) or (c >= 97 and c <= 102) or (c >= 65 and c <= 70)
+}
+
+fn push_parse(inout s: GjScanner, c: i64, state: i64, result: i64) -> i64 {
+    s.parse.push(state)
+    if s.parse.len() <= 10000 {
+        return result
+    }
+    return fail_step(s, c, "exceeded max depth")
+}
+
+fn pop_parse(inout s: GjScanner) {
+    s.parse.pop()
+    if s.parse.len() == 0 {
+        s.step = StEndTop
+        s.end_top = true
+    } else {
+        s.step = StEndValue
+    }
+}
+
+fn begin_value(inout s: GjScanner, c: i64) -> i64 {
+    if is_space(c) {
+        return scan_skip_space()
+    }
+    if c == 123 {
+        s.step = StBeginStringOrEmpty
+        return push_parse(s, c, 0, scan_begin_object())
+    }
+    if c == 91 {
+        s.step = StBeginValueOrEmpty
+        return push_parse(s, c, 2, scan_begin_array())
+    }
+    s.step = if c == 34 { StInString } else if c == 45 { StNeg } else if c == 48 { St0 } else if c == 116 { StLiteral("rue", "true") } else if c == 102 {
+        StLiteral("alse", "false")
+    } else if c == 110 { StLiteral("ull", "null") } else if c >= 49 and c <= 57 { St1 } else { StError }
+    return match s.step {
+        StError -> fail_step(s, c, "looking for beginning of value")
+        _ -> scan_begin_literal()
+    }
+}
+
+fn end_value(inout s: GjScanner, c: i64) -> i64 {
+    let n = s.parse.len()
+    if n == 0 {
+        s.step = StEndTop
+        s.end_top = true
+        return end_top(s, c)
+    }
+    if is_space(c) {
+        s.step = StEndValue
+        return scan_skip_space()
+    }
+    let ps = s.parse[n - 1]
+    if ps == 0 {
+        if c == 58 {
+            s.parse[n - 1] = 1
+            s.step = StBeginValue
+            return scan_object_key()
+        }
+        return fail_step(s, c, "after object key")
+    }
+    if ps == 1 {
+        if c == 44 {
+            s.parse[n - 1] = 0
+            s.step = StBeginString
+            return scan_object_value()
+        }
+        if c == 125 {
+            pop_parse(s)
+            return scan_end_object()
+        }
+        return fail_step(s, c, "after object key:value pair")
+    }
+    if c == 44 {
+        s.step = StBeginValue
+        return scan_array_value()
+    }
+    if c == 93 {
+        pop_parse(s)
+        return scan_end_array()
+    }
+    return fail_step(s, c, "after array element")
+}
+
+fn end_top(inout s: GjScanner, c: i64) -> i64 {
+    if not is_space(c) {
+        fail_step(s, c, "after top-level value")
+    }
+    return scan_end()
+}
+
+fn number_step(inout s: GjScanner, c: i64) -> i64 {
+    let digit = c >= 48 and c <= 57
+    match s.step {
+        StNeg -> {
+            if c == 48 {
+                s.step = St0
+                return scan_continue()
+            }
+            if c >= 49 and c <= 57 {
+                s.step = St1
+                return scan_continue()
+            }
+            return fail_step(s, c, "in numeric literal")
+        }
+        St1 -> if digit {
+            return scan_continue()
+        }
+        StDot -> {
+            if digit {
+                s.step = StDot0
+                return scan_continue()
+            }
+            return fail_step(s, c, "after decimal point in numeric literal")
+        }
+        StDot0 -> {
+            if digit {
+                return scan_continue()
+            }
+            if c == 101 or c == 69 {
+                s.step = StE
+                return scan_continue()
+            }
+            return end_value(s, c)
+        }
+        StE -> if c == 43 or c == 45 {
+            s.step = StESign
+            return scan_continue()
+        }
+        StE0 -> {
+            if digit {
+                return scan_continue()
+            }
+            return end_value(s, c)
+        }
+        _ -> {}
+    }
+    match s.step {
+        St1 -> {}
+        St0 -> {}
+        _ -> {
+            // StE falls through to StESign, as Go's stateE does.
+            if digit {
+                s.step = StE0
+                return scan_continue()
+            }
+            return fail_step(s, c, "in exponent of numeric literal")
+        }
+    }
+    // state0, which state1 falls into.
+    if c == 46 {
+        s.step = StDot
+        return scan_continue()
+    }
+    if c == 101 or c == 69 {
+        s.step = StE
+        return scan_continue()
+    }
+    return end_value(s, c)
+}
+
+fn string_step(inout s: GjScanner, c: i64) -> i64 {
+    match s.step {
+        StInString -> {
+            if c == 34 {
+                s.step = StEndValue
+                return scan_continue()
+            }
+            if c == 92 {
+                s.step = StInStringEsc
+                return scan_continue()
+            }
+            if c < 32 {
+                return fail_step(s, c, "in string literal")
+            }
+            return scan_continue()
+        }
+        StInStringEsc -> {
+            if [98, 102, 110, 114, 116, 92, 47, 34].contains(c) {
+                s.step = StInString
+                return scan_continue()
+            }
+            if c == 117 {
+                s.step = StInStringEscU(0)
+                return scan_continue()
+            }
+            return fail_step(s, c, "in string escape code")
+        }
+        StInStringEscU(n) -> {
+            if is_hex(c) {
+                s.step = if n == 3 { StInString } else { StInStringEscU(n + 1) }
+                return scan_continue()
+            }
+            return fail_step(s, c, "in \\u hexadecimal character escape")
+        }
+        _ -> return scan_error()
+    }
+}
+
+/// One byte through the scanner.
+fn step(inout s: GjScanner, c: i64) -> i64 {
+    match s.step {
+        StBeginValue -> return begin_value(s, c)
+        StBeginValueOrEmpty -> {
+            if is_space(c) {
+                return scan_skip_space()
+            }
+            if c == 93 {
+                return end_value(s, c)
+            }
+            return begin_value(s, c)
+        }
+        StBeginStringOrEmpty -> {
+            if is_space(c) {
+                return scan_skip_space()
+            }
+            if c == 125 {
+                s.parse[s.parse.len() - 1] = 1
+                return end_value(s, c)
+            }
+            return begin_string(s, c)
+        }
+        StBeginString -> return begin_string(s, c)
+        StEndValue -> return end_value(s, c)
+        StEndTop -> return end_top(s, c)
+        StInString -> return string_step(s, c)
+        StInStringEsc -> return string_step(s, c)
+        StInStringEscU(_n) -> return string_step(s, c)
+        StLiteral(rest, word) -> {
+            let want = rest.codes()[0]
+            if c != want {
+                return fail_step(s, c, "in literal " + word + " (expecting " + quote_char(want) + ")")
+            }
+            s.step = if rest.len() == 1 { StEndValue } else { StLiteral(rest.substr(1, rest.len() - 1), word) }
+            return scan_continue()
+        }
+        StError -> return scan_error()
+        _ -> return number_step(s, c)
+    }
+}
+
+fn begin_string(inout s: GjScanner, c: i64) -> i64 {
+    if is_space(c) {
+        return scan_skip_space()
+    }
+    if c == 34 {
+        s.step = StInString
+        return scan_begin_literal()
+    }
+    return fail_step(s, c, "looking for beginning of object key string")
+}
+
+/// scanner.eof: the end of input, which completes a number or fails.
+fn eof(inout s: GjScanner) -> i64 {
+    match s.err {
+        Some(_e) -> return scan_error()
+        None -> {}
+    }
+    if s.end_top {
+        return scan_end()
+    }
+    step(s, 32)
+    if s.end_top {
+        return scan_end()
+    }
+    match s.err {
+        Some(_e) -> {}
+        None -> s.err = Some(GjSyntax("unexpected end of JSON input", s.bytes))
+    }
+    return scan_error()
+}
+
+/// checkValid: the first syntax error, or none.
+fn check_valid(data: [i64]) -> Option[GoJsonError] {
+    var s = new_scanner()
+    for c in data {
+        s.bytes = s.bytes + 1
+        if step(s, c) == scan_error() {
+            return s.err
+        }
+    }
+    if eof(s) == scan_error() {
+        return s.err
+    }
+    return None
+}
+
+/// `json.Valid(data)`.
+pub fn valid(data: bytes) -> bool {
+    return match check_valid(data.to_list()) {
+        Some(_e) -> false
+        None -> true
+    }
+}
+
+/// A failure's message, as Go's `Error()` gives it.
+pub fn error_text(e: GoJsonError) -> str {
+    return match e {
+        GjSyntax(m, _o) -> m
+        GjUnmarshalType(m) -> m
+        GjUnsupportedValue(m) -> m
+    }
+}
+
+// ---- UTF-8, as Go's utf8.DecodeRune accepts it
+
+/// The length of the valid UTF-8 sequence at `i`, or 0 if the byte there
+/// does not start one (DecodeRune's RuneError of width 1).
+fn utf8_len(b: [i64], i: i64) -> i64 {
+    let c = b[i]
+    if c < 128 {
+        return 1
+    }
+    let n = if c >= 194 and c <= 223 { 2 } else if c >= 224 and c <= 239 { 3 } else if c >= 240 and c <= 244 { 4 } else { 0 }
+    if n == 0 or i + n > b.len() {
+        return 0
+    }
+    let lo = if c == 224 { 160 } else if c == 240 { 144 } else { 128 }
+    let hi = if c == 237 { 159 } else if c == 244 { 143 } else { 191 }
+    if b[i + 1] < lo or b[i + 1] > hi {
+        return 0
+    }
+    for k in 2..n {
+        if b[i + k] < 128 or b[i + k] > 191 {
+            return 0
+        }
+    }
+    return n
+}
+
+/// Appends in place: `out = out + xs` would copy all of `out` each time.
+fn extend(inout out: [i64], xs: [i64]) {
+    for x in xs {
+        out.push(x)
+    }
+}
+
+fn push_rune(inout out: [i64], cp: i64) {
+    for x in cp.to_char().to_bytes().to_list() {
+        out.push(x)
+    }
+}
+
+// ---- reading
+
+fn position(xs: [i64], x: i64) -> i64 {
+    for i in 0..xs.len() {
+        if xs[i] == x {
+            return i
+        }
+    }
+    return 0 - 1
+}
+
+fn key_position(keys: [bytes], k: bytes) -> i64 {
+    for i in 0..keys.len() {
+        if keys[i] == k {
+            return i
+        }
+    }
+    return 0 - 1
+}
+
+fn getu4(s: [i64], at: i64) -> i64 {
+    if at + 6 > s.len() or s[at] != 92 or s[at + 1] != 117 {
+        return 0 - 1
+    }
+    var r = 0
+    for k in 2..6 {
+        let c = s[at + k]
+        let d = if c >= 48 and c <= 57 { c - 48 } else if c >= 97 and c <= 102 { c - 87 } else if c >= 65 and c <= 70 { c - 55 } else { 0 - 1 }
+        if d < 0 {
+            return 0 - 1
+        }
+        r = r * 16 + d
+    }
+    return r
+}
+
+/// unquoteBytes, on the bytes between a string literal's quotes, which the
+/// scanner has already accepted.
+fn unquote(s: [i64]) -> [i64] {
+    var out: [i64] = []
+    var r = 0
+    while r < s.len() {
+        let c = s[r]
+        if c == 92 {
+            let e = s[r + 1]
+            if e == 117 {
+                var rr = getu4(s, r)
+                r = r + 6
+                if rr >= 55296 and rr <= 57343 {
+                    let rr1 = getu4(s, r)
+                    if rr <= 56319 and rr1 >= 56320 and rr1 <= 57343 {
+                        r = r + 6
+                        push_rune(out, 65536 + (rr - 55296).shl(10) + (rr1 - 56320))
+                        continue
+                    }
+                    rr = 65533
+                }
+                push_rune(out, rr)
+                continue
+            }
+            let i = position([98, 102, 110, 114, 116], e)
+            out.push(if i >= 0 { [8, 12, 10, 13, 9][i] } else { e })
+            r = r + 2
+            continue
+        }
+        let n = utf8_len(s, r)
+        if n == 0 {
+            push_rune(out, 65533)
+            r = r + 1
+            continue
+        }
+        for k in 0..n {
+            out.push(s[r + k])
+        }
+        r = r + n
+    }
+    return out
+}
+
+type GjReader = { b: [i64], i: i64, err: Option[GoJsonError] }
+
+fn skip_ws(inout rd: GjReader) {
+    while rd.i < rd.b.len() and is_space(rd.b[rd.i]) {
+        rd.i = rd.i + 1
+    }
+}
+
+fn read_string(inout rd: GjReader) -> [i64] {
+    let start = rd.i + 1
+    var j = start
+    while rd.b[j] != 34 {
+        j = j + if rd.b[j] == 92 { 2 } else { 1 }
+    }
+    rd.i = j + 1
+    return unquote(rd.b.slice(start, j))
+}
+
+fn read_number(inout rd: GjReader) -> GoJson {
+    let start = rd.i
+    while rd.i < rd.b.len() and "-+.eE0123456789".codes().contains(rd.b[rd.i]) {
+        rd.i = rd.i + 1
+    }
+    let text = bytes_of(rd.b.slice(start, rd.i)).to_str()
+    let (f, e) = gostrconv.parse_float(text, 64)
+    match e {
+        Some(_x) -> {
+            if rd.err.is_none() {
+                rd.err = Some(GjUnmarshalType("json: cannot unmarshal number " + text + " into Go value of type float64"))
+            }
+            return GjNull
+        }
+        None -> return GjNumber(f)
+    }
+}
+
+fn read_value(inout rd: GjReader) -> GoJson {
+    skip_ws(rd)
+    let c = rd.b[rd.i]
+    if c == 123 {
+        rd.i = rd.i + 1
+        var keys: [bytes] = []
+        var values: [GoJson] = []
+        skip_ws(rd)
+        if rd.b[rd.i] == 125 {
+            rd.i = rd.i + 1
+            return GjObject(keys, values)
+        }
+        while true {
+            skip_ws(rd)
+            let k = bytes_of(read_string(rd))
+            skip_ws(rd)
+            rd.i = rd.i + 1
+            let v = read_value(rd)
+            // A map: a key given again takes its new value in place.
+            let at = key_position(keys, k)
+            if at >= 0 {
+                values[at] = v
+            } else {
+                keys.push(k)
+                values.push(v)
+            }
+            skip_ws(rd)
+            rd.i = rd.i + 1
+            if rd.b[rd.i - 1] == 125 {
+                break
+            }
+        }
+        return GjObject(keys, values)
+    }
+    if c == 91 {
+        rd.i = rd.i + 1
+        var items: [GoJson] = []
+        skip_ws(rd)
+        if rd.b[rd.i] == 93 {
+            rd.i = rd.i + 1
+            return GjArray(items)
+        }
+        while true {
+            let v = read_value(rd)
+            items.push(v)
+            skip_ws(rd)
+            rd.i = rd.i + 1
+            if rd.b[rd.i - 1] == 93 {
+                break
+            }
+        }
+        return GjArray(items)
+    }
+    if c == 34 {
+        return GjString(bytes_of(read_string(rd)))
+    }
+    if c == 116 or c == 102 or c == 110 {
+        rd.i = rd.i + if c == 102 { 5 } else { 4 }
+        return if c == 110 { GjNull } else { GjBool(c == 116) }
+    }
+    return read_number(rd)
+}
+
+/// `json.Unmarshal(data, &v)` with `v` an `any`: the value, and the first
+/// error Go would return. A syntax error leaves the value null.
+pub fn decode(data: bytes) -> GjDecoded {
+    let b = data.to_list()
+    match check_valid(b) {
+        Some(e) -> return GjDecoded{ value: GjNull, err: Some(e) }
+        None -> {}
+    }
+    var rd = GjReader{ b: b, i: 0, err: None }
+    let v = read_value(rd)
+    return GjDecoded{ value: v, err: rd.err }
+}
+
+/// `json.Unmarshal` into an `any`, failing on any error.
+pub fn unmarshal(data: bytes) -> GoJson ! GoJsonError {
+    let d = decode(data)
+    return match d.err {
+        Some(e) -> Err(e)
+        None -> Ok(d.value)
+    }
+}
+
+// ---- reformatting
+
+fn hex_digit(n: i64) -> i64 {
+    return "0123456789abcdef".codes()[n]
+}
+
+/// `json.HTMLEscape`: `<`, `>`, `&`, U+2028 and U+2029 inside the text
+/// written as `\u` escapes.
+pub fn html_escape(src: bytes) -> bytes {
+    let b = src.to_list()
+    var out: [i64] = []
+    var i = 0
+    while i < b.len() {
+        let c = b[i]
+        if c == 60 or c == 62 or c == 38 {
+            extend(out, [92, 117, 48, 48, hex_digit(c.shr(4)), hex_digit(c.bit_and(15))])
+            i = i + 1
+        } else if c == 226 and i + 2 < b.len() and b[i + 1] == 128 and (b[i + 2] == 168 or b[i + 2] == 169) {
+            extend(out, [92, 117, 50, 48, 50, hex_digit(b[i + 2].bit_and(15))])
+            i = i + 3
+        } else {
+            out.push(c)
+            i = i + 1
+        }
+    }
+    return bytes_of(out)
+}
+
+/// `json.Compact`: insignificant space removed. Go's Compact does not
+/// count bytes, so its syntax errors carry offset 0.
+pub fn compact(src: bytes) -> bytes ! GoJsonError {
+    let b = src.to_list()
+    var s = new_scanner()
+    var out: [i64] = []
+    for c in b {
+        let v = step(s, c)
+        if v == scan_error() {
+            break
+        }
+        if v < scan_skip_space() {
+            out.push(c)
+        }
+    }
+    if eof(s) == scan_error() {
+        fail(s.err ?? GjSyntax("", 0))
+    }
+    return bytes_of(out)
+}
+
+fn newline(inout out: [i64], prefix: [i64], indent: [i64], depth: i64) {
+    out.push(10)
+    extend(out, prefix)
+    for _k in 0..depth {
+        extend(out, indent)
+    }
+}
+
+fn indent_list(b: [i64], prefix: [i64], indent: [i64]) -> [i64] ! GoJsonError {
+    var s = new_scanner()
+    var out: [i64] = []
+    var need_indent = false
+    var depth = 0
+    for c in b {
+        s.bytes = s.bytes + 1
+        let v = step(s, c)
+        if v == scan_skip_space() {
+            continue
+        }
+        if v == scan_error() {
+            break
+        }
+        if need_indent and v != scan_end_object() and v != scan_end_array() {
+            need_indent = false
+            depth = depth + 1
+            newline(out, prefix, indent, depth)
+        }
+        if v == scan_continue() {
+            out.push(c)
+            continue
+        }
+        if c == 123 or c == 91 {
+            need_indent = true
+            out.push(c)
+        } else if c == 44 {
+            out.push(c)
+            newline(out, prefix, indent, depth)
+        } else if c == 58 {
+            extend(out, [58, 32])
+        } else if c == 125 or c == 93 {
+            if need_indent {
+                need_indent = false
+            } else {
+                depth = depth - 1
+                newline(out, prefix, indent, depth)
+            }
+            out.push(c)
+        } else {
+            out.push(c)
+        }
+    }
+    if eof(s) == scan_error() {
+        fail(s.err ?? GjSyntax("", 0))
+    }
+    return out
+}
+
+/// `json.Indent(dst, src, prefix, indent)`: each element on its own line,
+/// beginning with `prefix` and one `indent` per level; the first line has
+/// no prefix, and space inside the input is dropped, not kept.
+pub fn indent(src: bytes, prefix: str, indent: str) -> bytes ! GoJsonError {
+    return bytes_of(try indent_list(src.to_list(), prefix.to_bytes().to_list(), indent.to_bytes().to_list()))
+}
+
+// ---- writing
+
+/// appendString: a JSON string literal for `src`, which need not be valid
+/// UTF-8.
+pub fn encode_string(src: bytes, escape_html: bool) -> bytes {
+    let b = src.to_list()
+    var out = [34]
+    var i = 0
+    while i < b.len() {
+        let c = b[i]
+        if c < 128 {
+            let html = c == 60 or c == 62 or c == 38
+            if c >= 32 and c != 34 and c != 92 and not (escape_html and html) {
+                out.push(c)
+            } else {
+                let short = position([92, 34, 8, 12, 10, 13, 9], c)
+                if short >= 0 {
+                    extend(out, [92, [92, 34, 98, 102, 110, 114, 116][short]])
+                } else {
+                    extend(out, [92, 117, 48, 48, hex_digit(c.shr(4)), hex_digit(c.bit_and(15))])
+                }
+            }
+            i = i + 1
+            continue
+        }
+        let n = utf8_len(b, i)
+        if n == 0 {
+            extend(out, "\\ufffd".to_bytes().to_list())
+            i = i + 1
+            continue
+        }
+        if n == 3 and c == 226 and b[i + 1] == 128 and (b[i + 2] == 168 or b[i + 2] == 169) {
+            extend(out, [92, 117, 50, 48, 50, hex_digit(b[i + 2].bit_and(15))])
+        } else {
+            for k in 0..n {
+                out.push(b[i + k])
+            }
+        }
+        i = i + n
+    }
+    out.push(34)
+    return bytes_of(out)
+}
+
+/// A float64 as Marshal writes it: shortest digits, exponent form below
+/// 1e-6 and from 1e21, `e-07` cut back to `e-7`. NaN and the infinities
+/// are refused.
+pub fn encode_number(f: f64) -> str ! GoJsonError {
+    if f != f or f == 1.0 / 0.0 or f == -1.0 / 0.0 {
+        fail(GjUnsupportedValue("json: unsupported value: " + gostrconv.format_float(f, "g", 0 - 1, 64)))
+    }
+    let a = f.abs()
+    let e = a != 0.0 and (a < 0.000001 or a >= 1e21)
+    var t = gostrconv.format_float(f, if e { "e" } else { "f" }, 0 - 1, 64)
+    let n = t.len()
+    if e and n >= 4 and t.substr(n - 4, 3) == "e-0" {
+        t = t.substr(0, n - 2) + t.substr(n - 1, 1)
+    }
+    return t
+}
+
+fn hex_key(k: bytes) -> str {
+    return k.to_list().map(|x| hex_digit(x.shr(4)).to_char() + hex_digit(x.bit_and(15)).to_char()).join("")
+}
+
+fn marshal_into(inout out: [i64], v: GoJson, escape_html: bool) -> () ! GoJsonError {
+    match v {
+        GjNull -> extend(out, [110, 117, 108, 108])
+        GjBool(b) -> extend(out, (if b { "true" } else { "false" }).to_bytes().to_list())
+        GjNumber(f) -> extend(out, (try encode_number(f)).to_bytes().to_list())
+        GjString(t) -> extend(out, encode_string(t, escape_html).to_list())
+        GjArray(items) -> {
+            out.push(91)
+            for k in 0..items.len() {
+                if k > 0 {
+                    out.push(44)
+                }
+                try marshal_into(out, items[k], escape_html)
+            }
+            out.push(93)
+        }
+        GjObject(keys, values) -> {
+            // A Go map: one value a key, the last given, sorted bytewise.
+            var order: [i64] = []
+            for k in 0..keys.len() {
+                if key_position(keys.slice(k + 1, keys.len()), keys[k]) < 0 {
+                    order.push(k)
+                }
+            }
+            let hexes = keys.map(|k| hex_key(k))
+            order.sort_by(|k| hexes[k])
+            out.push(123)
+            for n in 0..order.len() {
+                if n > 0 {
+                    out.push(44)
+                }
+                extend(out, encode_string(keys[order[n]], escape_html).to_list())
+                out.push(58)
+                try marshal_into(out, values[order[n]], escape_html)
+            }
+            out.push(125)
+        }
+    }
+    return ()
+}
+
+/// `json.Marshal(v)` with `escape_html`, or an Encoder's output without
+/// its newline when `escape_html` is false (SetEscapeHTML(false)).
+pub fn marshal(v: GoJson, escape_html: bool) -> bytes ! GoJsonError {
+    var out: [i64] = []
+    try marshal_into(out, v, escape_html)
+    return bytes_of(out)
+}
+
+/// `json.MarshalIndent(v, prefix, indent)`.
+pub fn marshal_indent(v: GoJson, prefix: str, indent_text: str) -> bytes ! GoJsonError {
+    let b = try marshal(v, true)
+    return try indent(b, prefix, indent_text)
+}

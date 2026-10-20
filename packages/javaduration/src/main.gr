@@ -1,0 +1,466 @@
+// Java's `java.time.Duration` and `java.time.Period`, as Java 17 parses,
+// prints and does arithmetic on them.
+//
+// ISO 8601 durations travel through every Java API that takes a timeout
+// or a retention period -- Spring properties, Kafka configs, JSON from a
+// Jackson serialiser -- and a tool that writes them for Java, or reads
+// what Java wrote, needs Java's dialect:
+//
+//   - `Duration.parse` takes days, hours, minutes and seconds (`P2DT3H`),
+//     each signed, letters in either case, a fraction of a second up to
+//     nine digits after `.` or `,`; `PT` alone, weeks, years and months
+//     are refused. A lone lower-case `t` is accepted where `T` alone is
+//     not -- Java compares that letter case-sensitively.
+//   - `toString` uses hours, minutes and seconds only (`PT49H`), with
+//     every part negative for a negative duration (`PT-1M-30S`,
+//     `PT-0.5S`).
+//   - `Period.parse` takes years, months, weeks and days in Java ints;
+//     weeks fold into days, and their overflow is an ArithmeticException
+//     rather than a parse error.
+//   - Arithmetic is exact and fails where Java fails: "long overflow",
+//     "integer overflow", "Exceeds capacity of Duration: ...", "Cannot
+//     divide by zero".
+
+import bigint
+
+/// A Duration: seconds, and nanoseconds 0..999999999 added to them.
+type JavaDuration = { seconds: i64, nanos: i64 }
+
+/// A Period: years, months and days, each a Java int.
+type JavaPeriod = { years: i64, months: i64, days: i64 }
+
+/// DateTimeParseException or ArithmeticException, with Java's message.
+type JavaTimeError =
+    | JtParse(msg: str)
+    | JtArithmetic(msg: str)
+
+pub fn error_text(e: JavaTimeError) -> str {
+    return match e {
+        JtParse(m) -> m
+        JtArithmetic(m) -> m
+    }
+}
+
+fn nanos_per_second() -> i64 {
+    return 1000000000
+}
+
+fn big(n: i64) -> BigInt {
+    return bigint.from_i64(n)
+}
+
+fn fdiv(a: i64, b: i64) -> i64 {
+    let q = a / b
+    return if a % b != 0 and ((a < 0) != (b < 0)) { q - 1 } else { q }
+}
+
+fn long_min() -> i64 {
+    return 0 - 9223372036854775807 - 1
+}
+
+fn fits_long(n: BigInt) -> bool {
+    return bigint.compare(n, big(long_min())) >= 0 and bigint.compare(n, big(9223372036854775807)) <= 0
+}
+
+fn add_exact(a: i64, b: i64) -> i64 ! JavaTimeError {
+    let r = bigint.add(big(a), big(b))
+    if not fits_long(r) {
+        fail(JtArithmetic("long overflow"))
+    }
+    return a + b
+}
+
+fn mul_exact(a: i64, b: i64) -> i64 ! JavaTimeError {
+    let r = bigint.mul(big(a), big(b))
+    if not fits_long(r) {
+        fail(JtArithmetic("long overflow"))
+    }
+    return a * b
+}
+
+/// `Duration.ofSeconds(seconds, nanoAdjustment)`.
+pub fn of_seconds(seconds: i64, adjustment: i64) -> JavaDuration ! JavaTimeError {
+    let secs = try add_exact(seconds, fdiv(adjustment, nanos_per_second()))
+    return JavaDuration{ seconds: secs, nanos: adjustment - nanos_per_second() * fdiv(adjustment, nanos_per_second()) }
+}
+
+fn total_nanos(d: JavaDuration) -> BigInt {
+    return bigint.add(bigint.mul(big(d.seconds), big(nanos_per_second())), big(d.nanos))
+}
+
+/// create(BigDecimal): a total in nanoseconds back into a Duration.
+fn from_nanos(n: BigInt) -> JavaDuration ! JavaTimeError {
+    // BigInteger.divideAndRemainder truncates toward zero.
+    let (q, r) = bigint.divmod(n, big(nanos_per_second())) ?? (bigint.zero(), bigint.zero())
+    if not fits_long(q) {
+        fail(JtArithmetic("Exceeds capacity of Duration: " + bigint.to_str(n)))
+    }
+    return try of_seconds(bigint.to_i64(q) ?? 0, bigint.to_i64(r) ?? 0)
+}
+
+/// `a.plus(b)`.
+pub fn plus(a: JavaDuration, b: JavaDuration) -> JavaDuration ! JavaTimeError {
+    if b.seconds == 0 and b.nanos == 0 {
+        return a
+    }
+    let secs = try add_exact(a.seconds, b.seconds)
+    return try of_seconds(secs, a.nanos + b.nanos)
+}
+
+/// `d.multipliedBy(k)`.
+pub fn multiplied_by(d: JavaDuration, k: i64) -> JavaDuration ! JavaTimeError {
+    if k == 0 {
+        return JavaDuration{ seconds: 0, nanos: 0 }
+    }
+    if k == 1 {
+        return d
+    }
+    return try from_nanos(bigint.mul(total_nanos(d), big(k)))
+}
+
+/// `d.negated()`.
+pub fn negated(d: JavaDuration) -> JavaDuration ! JavaTimeError {
+    return try multiplied_by(d, 0 - 1)
+}
+
+/// `d.dividedBy(k)`, rounding toward zero.
+pub fn divided_by(d: JavaDuration, k: i64) -> JavaDuration ! JavaTimeError {
+    if k == 0 {
+        fail(JtArithmetic("Cannot divide by zero"))
+    }
+    if k == 1 {
+        return d
+    }
+    let (q, _r) = bigint.divmod(total_nanos(d), big(k)) ?? (bigint.zero(), bigint.zero())
+    return try from_nanos(q)
+}
+
+/// `a.dividedBy(b)`: how many whole `b` fit in `a`, toward zero.
+pub fn divided_by_duration(a: JavaDuration, b: JavaDuration) -> i64 ! JavaTimeError {
+    let n = total_nanos(a)
+    let m = total_nanos(b)
+    if bigint.is_zero(m) {
+        fail(JtArithmetic(if bigint.is_zero(n) { "Division undefined" } else { "Division by zero" }))
+    }
+    let (q, _r) = bigint.divmod(n, m) ?? (bigint.zero(), bigint.zero())
+    if not fits_long(q) {
+        fail(JtArithmetic("Overflow"))
+    }
+    return bigint.to_i64(q) ?? 0
+}
+
+/// `d.toMillis()`.
+pub fn to_millis(d: JavaDuration) -> i64 ! JavaTimeError {
+    var s = d.seconds
+    var n = d.nanos
+    if s < 0 {
+        s = s + 1
+        n = n - nanos_per_second()
+    }
+    return try add_exact(try mul_exact(s, 1000), n / 1000000)
+}
+
+/// `d.toNanos()`.
+pub fn to_nanos(d: JavaDuration) -> i64 ! JavaTimeError {
+    var s = d.seconds
+    var n = d.nanos
+    if s < 0 {
+        s = s + 1
+        n = n - nanos_per_second()
+    }
+    return try add_exact(try mul_exact(s, nanos_per_second()), n)
+}
+
+/// `d.toString()`.
+pub fn duration_text(d: JavaDuration) -> str {
+    if d.seconds == 0 and d.nanos == 0 {
+        return "PT0S"
+    }
+    let total = if d.seconds < 0 and d.nanos > 0 { d.seconds + 1 } else { d.seconds }
+    let hours = total / 3600
+    let minutes = total % 3600 / 60
+    let secs = total % 60
+    var out = "PT"
+    if hours != 0 {
+        out = out + hours.to_str() + "H"
+    }
+    if minutes != 0 {
+        out = out + minutes.to_str() + "M"
+    }
+    if secs == 0 and d.nanos == 0 and out.len() > 2 {
+        return out
+    }
+    out = out + if d.seconds < 0 and d.nanos > 0 and secs == 0 { "-0" } else { secs.to_str() }
+    if d.nanos > 0 {
+        var digits = (if d.seconds < 0 { 2 * nanos_per_second() - d.nanos } else { d.nanos + nanos_per_second() }).to_str()
+        while digits.ends_with("0") {
+            digits = digits.substr(0, digits.len() - 1)
+        }
+        out = out + "." + digits.substr(1, digits.len() - 1)
+    }
+    return out + "S"
+}
+
+// ---- parsing
+
+fn lower(c: i64) -> i64 {
+    return if c >= 65 and c <= 90 { c + 32 } else { c }
+}
+
+fn digit(c: i64) -> bool {
+    return c >= 48 and c <= 57
+}
+
+/// `[-+]?[0-9]+` then `letter` (any case) at `i`: where the number is,
+/// and where the match ends; or None.
+fn signed_then(cs: [i64], i: i64, letter: i64) -> Option[(i64, i64, i64)] {
+    var j = i
+    if j < cs.len() and (cs[j] == 43 or cs[j] == 45) {
+        j = j + 1
+    }
+    let d0 = j
+    while j < cs.len() and digit(cs[j]) {
+        j = j + 1
+    }
+    if j == d0 or j >= cs.len() or lower(cs[j]) != letter {
+        return None
+    }
+    return Some((i, j, j + 1))
+}
+
+/// Long.parseLong on a matched number; None when it overflows.
+fn parse_long(cs: [i64], a: i64, b: i64) -> Option[i64] {
+    let t = cs.slice(a, b).map(|c| c.to_char()).join("")
+    let n = bigint.parse(if t.starts_with("+") { t.substr(1, t.len() - 1) } else { t }) ?? bigint.zero()
+    return if fits_long(n) { bigint.to_i64(n) } else { None }
+}
+
+fn duration_error(what: str) -> JavaTimeError {
+    return JtParse("Text cannot be parsed to a Duration" + what)
+}
+
+/// parseNumber: one part as seconds; its own error when the number or the
+/// product overflows a long.
+fn part(cs: [i64], p: Option[(i64, i64, i64)], multiplier: i64, name: str) -> i64 ! JavaTimeError {
+    let (a, b) = match p {
+        None -> return 0
+        Some((x, y, _e)) -> (x, y)
+    }
+    let v = parse_long(cs, a, b)
+    if v.is_none() {
+        fail(duration_error(": " + name))
+    }
+    let r = bigint.mul(big(v ?? 0), big(multiplier))
+    if not fits_long(r) {
+        fail(duration_error(": " + name))
+    }
+    return bigint.to_i64(r) ?? 0
+}
+
+/// `Duration.parse(text)`.
+pub fn duration_parse(text: str) -> JavaDuration ! JavaTimeError {
+    let cs = text.codes()
+    var i = 0
+    var negate = false
+    if i < cs.len() and (cs[i] == 43 or cs[i] == 45) {
+        negate = cs[i] == 45
+        i = i + 1
+    }
+    if i >= cs.len() or lower(cs[i]) != 112 {
+        fail(duration_error(""))
+    }
+    i = i + 1
+    let day = signed_then(cs, i, 100)
+    i = match day {
+        Some((_a, _b, e)) -> e
+        None -> i
+    }
+    var hour: Option[(i64, i64, i64)] = None
+    var minute: Option[(i64, i64, i64)] = None
+    var second: Option[(i64, i64, i64)] = None
+    var fraction: Option[(i64, i64)] = None
+    var t_only = false
+    if i < cs.len() and lower(cs[i]) == 116 {
+        let t_at = i
+        i = i + 1
+        hour = signed_then(cs, i, 104)
+        i = match hour {
+            Some((_a, _b, e)) -> e
+            None -> i
+        }
+        minute = signed_then(cs, i, 109)
+        i = match minute {
+            Some((_a, _b, e)) -> e
+            None -> i
+        }
+        let (sec, frac, after) = seconds_part(cs, i)
+        second = sec
+        fraction = frac
+        i = after
+        t_only = i == t_at + 1 and cs[t_at] == 84
+    }
+    if i != cs.len() or t_only or (day.is_none() and hour.is_none() and minute.is_none() and second.is_none()) {
+        fail(duration_error(""))
+    }
+    let check_days = try part(cs, day, 86400, "days")
+    let hours = try part(cs, hour, 3600, "hours")
+    let minutes = try part(cs, minute, 60, "minutes")
+    let secs = try part(cs, second, 1, "seconds")
+    let negative_secs = match second {
+        Some((a, _b, _e)) -> cs[a] == 45
+        None -> false
+    }
+    var nanos = 0
+    match fraction {
+        Some((a, b)) -> if b > a {
+            nanos = cs.slice(a, b).fold(0, |acc, c| acc * 10 + c - 48)
+            for _k in (b - a)..9 {
+                nanos = nanos * 10
+            }
+            if negative_secs {
+                nanos = 0 - nanos
+            }
+        }
+        None -> {}
+    }
+    return match build(negate, check_days, hours, minutes, secs, nanos) {
+        Ok(d) -> d
+        Err(_e) -> fail(duration_error(": overflow"))
+    }
+}
+
+/// The seconds part `([-+]?[0-9]+)(?:[.,]([0-9]{0,9}))?S` at `i`.
+fn seconds_part(cs: [i64], i: i64) -> (Option[(i64, i64, i64)], Option[(i64, i64)], i64) {
+    var j = i
+    if j < cs.len() and (cs[j] == 43 or cs[j] == 45) {
+        j = j + 1
+    }
+    let d0 = j
+    while j < cs.len() and digit(cs[j]) {
+        j = j + 1
+    }
+    if j == d0 {
+        return (None, None, i)
+    }
+    let num_end = j
+    if j < cs.len() and (cs[j] == 46 or cs[j] == 44) {
+        let f0 = j + 1
+        var k = f0
+        while k < cs.len() and digit(cs[k]) and k - f0 < 9 {
+            k = k + 1
+        }
+        if k < cs.len() and lower(cs[k]) == 115 {
+            return (Some((i, num_end, k + 1)), Some((f0, k)), k + 1)
+        }
+        return (None, None, i)
+    }
+    if j < cs.len() and lower(cs[j]) == 115 {
+        return (Some((i, num_end, j + 1)), None, j + 1)
+    }
+    return (None, None, i)
+}
+
+fn build(negate: bool, days: i64, hours: i64, minutes: i64, secs: i64, nanos: i64) -> JavaDuration ! JavaTimeError {
+    let total = try add_exact(days, try add_exact(hours, try add_exact(minutes, secs)))
+    let d = try of_seconds(total, nanos)
+    return if negate { try negated(d) } else { d }
+}
+
+// ---- Period
+
+fn int_ok(n: i64) -> bool {
+    return n >= 0 - 2147483648 and n <= 2147483647
+}
+
+fn int_exact(n: i64) -> i64 ! JavaTimeError {
+    if not int_ok(n) {
+        fail(JtArithmetic("integer overflow"))
+    }
+    return n
+}
+
+/// `Period.of(years, months, days)`, each a Java int.
+pub fn period(years: i64, months: i64, days: i64) -> JavaPeriod {
+    return JavaPeriod{ years: years, months: months, days: days }
+}
+
+/// `Period.parse(text)`.
+pub fn period_parse(text: str) -> JavaPeriod ! JavaTimeError {
+    let cs = text.codes()
+    let refuse = JtParse("Text cannot be parsed to a Period")
+    var i = 0
+    var negate = 1
+    if i < cs.len() and (cs[i] == 43 or cs[i] == 45) {
+        negate = if cs[i] == 45 { 0 - 1 } else { 1 }
+        i = i + 1
+    }
+    if i >= cs.len() or lower(cs[i]) != 112 {
+        fail(refuse)
+    }
+    i = i + 1
+    var parts: [Option[(i64, i64, i64)]] = []
+    for letter in [121, 109, 119, 100] {
+        let p = signed_then(cs, i, letter)
+        parts.push(p)
+        i = match p {
+            Some((_a, _b, e)) -> e
+            None -> i
+        }
+    }
+    if i != cs.len() or parts.all(|p| p.is_none()) {
+        fail(refuse)
+    }
+    var vals: [i64] = []
+    for p in parts {
+        match p {
+            None -> vals.push(0)
+            Some((a, b, _e)) -> {
+                let v = parse_long(cs, a, b) ?? 4294967296
+                if not int_ok(v) or not int_ok(v * negate) {
+                    fail(refuse)
+                }
+                vals.push(v * negate)
+            }
+        }
+    }
+    let weeks = try int_exact(vals[2] * 7)
+    let days = try int_exact(vals[3] + weeks)
+    return JavaPeriod{ years: vals[0], months: vals[1], days: days }
+}
+
+/// `p.toString()`.
+pub fn period_text(p: JavaPeriod) -> str {
+    if p.years == 0 and p.months == 0 and p.days == 0 {
+        return "P0D"
+    }
+    var out = "P"
+    if p.years != 0 {
+        out = out + p.years.to_str() + "Y"
+    }
+    if p.months != 0 {
+        out = out + p.months.to_str() + "M"
+    }
+    if p.days != 0 {
+        out = out + p.days.to_str() + "D"
+    }
+    return out
+}
+
+/// `a.plus(b)`.
+pub fn period_plus(a: JavaPeriod, b: JavaPeriod) -> JavaPeriod ! JavaTimeError {
+    return JavaPeriod{ years: try int_exact(a.years + b.years), months: try int_exact(a.months + b.months), days: try int_exact(a.days + b.days) }
+}
+
+/// `p.multipliedBy(k)`.
+pub fn period_multiplied_by(p: JavaPeriod, k: i64) -> JavaPeriod ! JavaTimeError {
+    if (p.years == 0 and p.months == 0 and p.days == 0) or k == 1 {
+        return p
+    }
+    return JavaPeriod{ years: try int_exact(p.years * k), months: try int_exact(p.months * k), days: try int_exact(p.days * k) }
+}
+
+/// `p.normalized()`: months folded into years, the days left alone.
+pub fn period_normalized(p: JavaPeriod) -> JavaPeriod ! JavaTimeError {
+    let total = p.years * 12 + p.months
+    return JavaPeriod{ years: try int_exact(total / 12), months: total % 12, days: p.days }
+}

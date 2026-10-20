@@ -1,0 +1,8 @@
+[package]
+name = "pprof"
+version = "1.0.0"
+capabilities = []
+
+[dependencies.gzip]
+path = "../gzip"
+version = "^1.0.0"

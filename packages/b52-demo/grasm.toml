@@ -1,0 +1,36 @@
+[package]
+name = "b52_demo"
+version = "1.0.0"
+capabilities = ["io"]
+
+[dependencies.gopath]
+path = "../gopath"
+version = "^1.0.0"
+
+[dependencies.gosniff]
+path = "../gosniff"
+version = "^1.0.0"
+
+[dependencies.pycsv]
+path = "../pycsv"
+version = "^1.0.0"
+
+[dependencies.javaduration]
+path = "../javaduration"
+version = "^1.0.0"
+
+[dependencies.nodeutilformat]
+path = "../nodeutilformat"
+version = "^1.0.0"
+
+[dependencies.pyposixpath]
+path = "../pyposixpath"
+version = "^1.0.0"
+
+[dependencies.rubyshellwords]
+path = "../rubyshellwords"
+version = "^1.0.0"
+
+[dependencies.jsjson]
+path = "../jsjson"
+version = "^1.0.0"

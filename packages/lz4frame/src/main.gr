@@ -1,0 +1,400 @@
+// LZ4: the block format and the frame around it (the `.lz4` file), decoded
+// and encoded.
+//
+// Held to the `lz4` command-line tool, v1.10.0: every frame it writes --
+// block sizes 64 KB to 4 MB, independent or linked blocks, block and content
+// checksums, content size, the legacy format, skippable frames, and several
+// frames one after another -- decodes here to what `lz4 -d` gives (and is
+// refused where it refuses, trailing bytes included), and every
+// frame `encode` writes, `lz4 -d` decodes back to the input. A damaged
+// header (magic, version, reserved bits, block size, header checksum) and a
+// damaged frame that carries checksums are refused here as `lz4` refuses
+// them.
+//
+// Not held: damaged compressed data in a frame *without* checksums. Whether
+// `lz4` refuses that depends on bounds its block decoder keeps against the
+// output buffer's capacity, which this decoder does not reproduce; it refuses
+// only what cannot be decoded at all.
+import xxhash
+
+type Lz4FrameError =
+    | Truncated
+    | BadMagic(magic: i64)
+    | BadVersion
+    | ReservedBitSet
+    | BadBlockSize(id: i64)
+    | HeaderChecksum
+    | BlockTooLarge(size: i64)
+    | BlockChecksum
+    | ContentChecksum
+    | ContentSizeMismatch
+    | BadOffset
+    | BadSequence
+
+type Lz4Options = { block_max: i64, block_checksum: bool, content_checksum: bool, content_size: bool }
+
+/// What `lz4` writes when asked for nothing: 4 MB blocks, a content
+/// checksum, no block checksums, no content size.
+pub fn default_options() -> Lz4Options {
+    return Lz4Options{ block_max: 4194304, block_checksum: false, content_checksum: true, content_size: false }
+}
+
+fn u32le(b: bytes, at: i64) -> i64 {
+    return b.at(at) + b.at(at + 1) * 256 + b.at(at + 2) * 65536 + b.at(at + 3) * 16777216
+}
+
+fn put32(inout out: [i64], v: i64) {
+    out.push(v.bit_and(255))
+    out.push(v.ushr(8).bit_and(255))
+    out.push(v.ushr(16).bit_and(255))
+    out.push(v.ushr(24).bit_and(255))
+}
+
+// ---- the block format
+
+/// One compressed block, decoded onto the end of `out`. Matches may reach
+/// back into what `out` already holds -- the previous blocks of a linked
+/// frame -- but no further than 64 KB.
+pub fn block_decode_into(src: bytes, inout out: [i64], window_start: i64) -> () ! Lz4FrameError {
+    var i = 0
+    let n = src.len()
+    if n == 0 {
+        fail(BadSequence)
+    }
+    while true {
+        if i >= n {
+            fail(Truncated)
+        }
+        let token = src.at(i)
+        i = i + 1
+        var lit = token.ushr(4)
+        if lit == 15 {
+            var s = 255
+            while s == 255 {
+                if i >= n {
+                    fail(Truncated)
+                }
+                s = src.at(i)
+                i = i + 1
+                lit = lit + s
+            }
+        }
+        if i + lit > n {
+            fail(Truncated)
+        }
+        for k in 0..lit {
+            out.push(src.at(i + k))
+        }
+        i = i + lit
+        if i == n {
+            return ()
+        }
+        if i + 2 > n {
+            fail(Truncated)
+        }
+        let offset = src.at(i) + src.at(i + 1) * 256
+        i = i + 2
+        var mlen = token.bit_and(15)
+        if mlen == 15 {
+            var s = 255
+            while s == 255 {
+                if i >= n {
+                    fail(Truncated)
+                }
+                s = src.at(i)
+                i = i + 1
+                mlen = mlen + s
+            }
+        }
+        mlen = mlen + 4
+        let from = out.len() - offset
+        if offset == 0 or from < window_start {
+            fail(BadOffset)
+        }
+        for k in 0..mlen {
+            out.push(out[from + k])
+        }
+    }
+    return ()
+}
+
+/// A block on its own, with no history before it.
+pub fn block_decode(src: bytes) -> bytes ! Lz4FrameError {
+    var out: [i64] = []
+    try block_decode_into(src, out, 0)
+    return bytes_of(out)
+}
+
+fn hash4(v: i64) -> i64 {
+    return (v * 2654435761).bit_and(4294967295).ushr(20)
+}
+
+fn read4(d: bytes, at: i64) -> i64 {
+    return u32le(d, at)
+}
+
+fn emit_length(inout out: [i64], extra: i64) {
+    var rest = extra
+    while rest >= 255 {
+        out.push(255)
+        rest = rest - 255
+    }
+    out.push(rest)
+}
+
+fn emit_sequence(inout out: [i64], d: bytes, lit_start: i64, lit_end: i64, offset: i64, mlen: i64) {
+    let lit = lit_end - lit_start
+    let ml = mlen - 4
+    let hi = if lit >= 15 { 15 } else { lit }
+    let lo = if offset == 0 { 0 } else if ml >= 15 { 15 } else { ml }
+    out.push(hi * 16 + lo)
+    if lit >= 15 {
+        emit_length(out, lit - 15)
+    }
+    for k in lit_start..lit_end {
+        out.push(d.at(k))
+    }
+    if offset > 0 {
+        out.push(offset.bit_and(255))
+        out.push(offset.ushr(8))
+        if ml >= 15 {
+            emit_length(out, ml - 15)
+        }
+    }
+}
+
+/// One block, compressed greedily with a 4K-entry hash of 4-byte groups.
+/// It keeps the format's two rules for the end of a block: the last five
+/// bytes are literals, and no match starts in the last twelve.
+pub fn block_encode(d: bytes) -> bytes {
+    let n = d.len()
+    var out: [i64] = []
+    var table: [i64] = []
+    for _k in 0..4096 {
+        table.push(0 - 1)
+    }
+    var anchor = 0
+    var i = 0
+    let limit = n - 12
+    while i < limit {
+        let v = read4(d, i)
+        let h = hash4(v)
+        let cand = table[h]
+        table[h] = i
+        if cand >= 0 and i - cand <= 65535 and read4(d, cand) == v {
+            var len = 4
+            while i + len < n - 5 and d.at(cand + len) == d.at(i + len) {
+                len = len + 1
+            }
+            emit_sequence(out, d, anchor, i, i - cand, len)
+            i = i + len
+            anchor = i
+        } else {
+            i = i + 1
+        }
+    }
+    emit_sequence(out, d, anchor, n, 0, 0)
+    return bytes_of(out)
+}
+
+// ---- the frame format
+
+fn block_max_of(id: i64) -> i64 {
+    return if id == 4 { 65536 } else if id == 5 { 262144 } else if id == 6 { 1048576 } else { 4194304 }
+}
+
+fn block_id_of(max: i64) -> i64 {
+    return if max <= 65536 { 4 } else if max <= 262144 { 5 } else if max <= 1048576 { 6 } else { 7 }
+}
+
+/// Every frame in `data`, decoded and concatenated, skippable frames passed
+/// over -- what `lz4 -d` writes, and where it refuses:
+///
+///   - Anything that is not a frame is refused, first or not: trailing bytes
+///     after the last frame, even one, are an error.
+///   - Once a standard frame has been read, only standard and skippable
+///     frames may follow; a legacy stream after one is refused. Before the
+///     first, legacy streams and skippable frames mix freely.
+///   - An empty input is an empty output.
+pub fn decode(data: bytes) -> bytes ! Lz4FrameError {
+    var out: [i64] = []
+    var at = 0
+    var seen_standard = false
+    while at < data.len() {
+        if at + 4 > data.len() {
+            fail(Truncated)
+        }
+        let magic = u32le(data, at)
+        if magic == 407708164 {
+            at = try decode_frame(data, at + 4, out)
+            seen_standard = true
+        } else if magic.ushr(4) == 25481893 {
+            if at + 8 > data.len() {
+                fail(Truncated)
+            }
+            at = at + 8 + u32le(data, at + 4)
+            if at > data.len() {
+                fail(Truncated)
+            }
+        } else if magic == 407642370 and not seen_standard {
+            at = try decode_legacy(data, at + 4, out)
+        } else {
+            fail(BadMagic(magic))
+        }
+    }
+    return bytes_of(out)
+}
+
+/// A frame descriptor, read and checked.
+type Lz4Header = { independent: bool, block_sum: bool, content_sum: bool, size: i64, max: i64, body: i64 }
+
+fn read_header(data: bytes, start: i64) -> Lz4Header ! Lz4FrameError {
+    if start + 2 > data.len() {
+        fail(Truncated)
+    }
+    let flg = data.at(start)
+    let bd = data.at(start + 1)
+    if flg.ushr(6) != 1 {
+        fail(BadVersion)
+    }
+    if flg.bit_and(2) != 0 or bd.bit_and(143) != 0 {
+        fail(ReservedBitSet)
+    }
+    let id = bd.ushr(4).bit_and(7)
+    if id < 4 {
+        fail(BadBlockSize(id))
+    }
+    let has_size = flg.bit_and(8) != 0
+    let dict = flg.bit_and(1) != 0
+    let desc_len = 2 + (if has_size { 8 } else { 0 }) + (if dict { 4 } else { 0 })
+    if start + desc_len + 1 > data.len() {
+        fail(Truncated)
+    }
+    let hc = xxhash.xxh32(data.slice(start, start + desc_len), 0).ushr(8).bit_and(255)
+    if hc != data.at(start + desc_len) {
+        fail(HeaderChecksum)
+    }
+    let size = if has_size { u32le(data, start + 2) + u32le(data, start + 6) * 4294967296 } else { 0 - 1 }
+    return Lz4Header{ independent: flg.bit_and(32) != 0, block_sum: flg.bit_and(16) != 0, content_sum: flg.bit_and(4) != 0, size: size,
+        max: block_max_of(id), body: start + desc_len + 1 }
+}
+
+fn decode_frame(data: bytes, start: i64, inout out: [i64]) -> i64 ! Lz4FrameError {
+    let hd = try read_header(data, start)
+    let independent = hd.independent
+    let block_sum = hd.block_sum
+    let content_sum = hd.content_sum
+    let size = hd.size
+    let max = hd.max
+    var at = hd.body
+    let frame_start = out.len()
+    while true {
+        if at + 4 > data.len() {
+            fail(Truncated)
+        }
+        let word = u32le(data, at)
+        at = at + 4
+        if word == 0 {
+            break
+        }
+        let raw = word.bit_and(2147483648) != 0
+        let len = word.bit_and(2147483647)
+        if len > max {
+            fail(BlockTooLarge(len))
+        }
+        if at + len + (if block_sum { 4 } else { 0 }) > data.len() {
+            fail(Truncated)
+        }
+        let block = data.slice(at, at + len)
+        if block_sum and xxhash.xxh32(block, 0) != u32le(data, at + len) {
+            fail(BlockChecksum)
+        }
+        if raw {
+            for k in 0..len {
+                out.push(block.at(k))
+            }
+        } else {
+            let before = out.len()
+            let window = if independent { before } else { frame_start.max(before - 65536) }
+            try block_decode_into(block, out, window)
+            if out.len() - before > max {
+                fail(BlockTooLarge(out.len() - before))
+            }
+        }
+        at = at + len + (if block_sum { 4 } else { 0 })
+    }
+    if content_sum {
+        if at + 4 > data.len() {
+            fail(Truncated)
+        }
+        let content = bytes_of(out.slice(frame_start, out.len()))
+        if xxhash.xxh32(content, 0) != u32le(data, at) {
+            fail(ContentChecksum)
+        }
+        at = at + 4
+    }
+    if size >= 0 and out.len() - frame_start != size {
+        fail(ContentSizeMismatch)
+    }
+    return at
+}
+
+/// The legacy frame: independent 8 MB blocks, each with its compressed
+/// size, until the input ends or a size too large to be one -- the next
+/// frame's magic number.
+fn decode_legacy(data: bytes, start: i64, inout out: [i64]) -> i64 ! Lz4FrameError {
+    var at = start
+    while at + 4 <= data.len() {
+        let len = u32le(data, at)
+        if len > 8421520 {
+            return at
+        }
+        if at + 4 + len > data.len() {
+            fail(Truncated)
+        }
+        try block_decode_into(data.slice(at + 4, at + 4 + len), out, out.len())
+        at = at + 4 + len
+    }
+    if at != data.len() {
+        fail(Truncated)
+    }
+    return at
+}
+
+/// One frame holding `data`, in independent blocks.
+pub fn encode(data: bytes, o: Lz4Options) -> bytes {
+    var out: [i64] = []
+    put32(out, 407708164)
+    let flg = 64 + 32 + (if o.block_checksum { 16 } else { 0 }) + (if o.content_size { 8 } else { 0 }) + (if o.content_checksum { 4 } else { 0 })
+    let id = block_id_of(o.block_max)
+    var desc: [i64] = [flg, id * 16]
+    if o.content_size {
+        put32(desc, data.len().bit_and(4294967295))
+        put32(desc, data.len().ushr(32))
+    }
+    for b in desc {
+        out.push(b)
+    }
+    out.push(xxhash.xxh32(bytes_of(desc), 0).ushr(8).bit_and(255))
+    let max = block_max_of(id)
+    var at = 0
+    while at < data.len() {
+        let end = (at + max).min(data.len())
+        let raw = data.slice(at, end)
+        let packed = block_encode(raw)
+        let block = if packed.len() < raw.len() { packed } else { raw }
+        put32(out, block.len() + (if packed.len() < raw.len() { 0 } else { 2147483648 }))
+        for k in 0..block.len() {
+            out.push(block.at(k))
+        }
+        if o.block_checksum {
+            put32(out, xxhash.xxh32(block, 0))
+        }
+        at = end
+    }
+    put32(out, 0)
+    if o.content_checksum {
+        put32(out, xxhash.xxh32(data, 0))
+    }
+    return bytes_of(out)
+}

@@ -1,0 +1,4 @@
+[package]
+name = "pycharclass"
+version = "1.0.0"
+capabilities = []

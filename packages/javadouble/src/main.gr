@@ -1,0 +1,492 @@
+// `Double.toString` and `Float.toString` as Java 17 writes them -- the text
+// in every Java log line, every `"" + x`, and every JSON document Jackson
+// writes, which a reader comparing numbers as text has to reproduce.
+//
+// It is not always the shortest representation: Java 17's `FloatingDecimal`
+// stops generating digits by its own rule, and for some values that leaves a
+// digit more than needed. The algorithm is ported here from OpenJDK 17's
+// `jdk.internal.math` -- the long fast path, the 32- and 64-bit digit loops
+// with Java's overflow, and the big-integer loop -- and held to Java 17
+// itself on random and edge values. Java 19 replaced the algorithm; this is
+// the one before.
+//
+// `digits` also gives the digit string and decimal exponent `Formatter`
+// starts from for `%e`, `%f` and `%g`.
+
+/// The digits FloatingDecimal produces: `0.d1d2d3... x 10^exponent`.
+type JdDigits = { negative: bool, digits: str, exponent: i64, exact: bool, rounded_up: bool }
+
+// ---- an exact unsigned big integer: base-2^32 limbs, least significant first
+
+fn big_norm(a: [i64]) -> [i64] {
+    var n = a.len()
+    while n > 1 and a[n - 1] == 0 {
+        n = n - 1
+    }
+    return a.slice(0, n)
+}
+
+fn big_mul_small(a: [i64], k: i64) -> [i64] {
+    var out: [i64] = []
+    var carry = 0
+    for x in a {
+        let t = x * k + carry
+        out.push(t.bit_and(4294967295))
+        carry = t.ushr(32)
+    }
+    while carry > 0 {
+        out.push(carry.bit_and(4294967295))
+        carry = carry.ushr(32)
+    }
+    return big_norm(out)
+}
+
+fn big_shl(a: [i64], n: i64) -> [i64] {
+    var out: [i64] = []
+    for _k in 0..(n / 32) {
+        out.push(0)
+    }
+    let b = n % 32
+    var carry = 0
+    for x in a {
+        let t = x.shl(b).bit_or(carry)
+        out.push(t.bit_and(4294967295))
+        carry = if b == 0 { 0 } else { x.ushr(32 - b) }
+    }
+    if carry > 0 {
+        out.push(carry)
+    }
+    return big_norm(out)
+}
+
+fn big_cmp(a: [i64], b: [i64]) -> i64 {
+    let x = big_norm(a)
+    let y = big_norm(b)
+    if x.len() != y.len() {
+        return if x.len() < y.len() { 0 - 1 } else { 1 }
+    }
+    var i = x.len() - 1
+    while i >= 0 {
+        if x[i] != y[i] {
+            return if x[i] < y[i] { 0 - 1 } else { 1 }
+        }
+        i = i - 1
+    }
+    return 0
+}
+
+fn big_add(a: [i64], b: [i64]) -> [i64] {
+    var out: [i64] = []
+    var carry = 0
+    for i in 0..a.len().max(b.len()) {
+        let t = (if i < a.len() { a[i] } else { 0 }) + (if i < b.len() { b[i] } else { 0 }) + carry
+        out.push(t.bit_and(4294967295))
+        carry = t.ushr(32)
+    }
+    if carry > 0 {
+        out.push(carry)
+    }
+    return big_norm(out)
+}
+
+fn big_sub(a: [i64], b: [i64]) -> [i64] {
+    var out: [i64] = []
+    var borrow = 0
+    for i in 0..a.len() {
+        var t = a[i] - (if i < b.len() { b[i] } else { 0 }) - borrow
+        borrow = 0
+        if t < 0 {
+            t = t + 4294967296
+            borrow = 1
+        }
+        out.push(t)
+    }
+    return big_norm(out)
+}
+
+/// 5^p5 * 2^p2.
+fn big_pow52(p5: i64, p2: i64) -> [i64] {
+    var v: [i64] = [1]
+    for _k in 0..p5 {
+        v = big_mul_small(v, 5)
+    }
+    return big_shl(v, p2)
+}
+
+fn big_from(x: i64) -> [i64] {
+    return big_norm([x.bit_and(4294967295), x.ushr(32)])
+}
+
+// ---- FloatingDecimal
+
+fn long_5_pow(i: i64) -> i64 {
+    var v = 1
+    for _k in 0..i {
+        v = v * 5
+    }
+    return v
+}
+
+fn n_5_bits(i: i64) -> i64 {
+    let t = [0, 3, 5, 7, 10, 12, 14, 17, 19, 21, 24, 26, 28, 31, 33, 35, 38, 40, 42, 45, 47, 49, 52, 54, 56, 59, 61]
+    return if i < t.len() { t[i] } else { i * 3 }
+}
+
+fn insignificant_for_pow2(p2: i64) -> i64 {
+    let t = [0, 0, 0, 0, 1, 1, 1, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 5, 5, 5, 6, 6, 6, 6, 7, 7, 7, 8, 8, 8, 9, 9, 9, 9, 10, 10, 10, 11, 11, 11, 12, 12, 12, 12, 13, 13,
+        13, 14, 14, 14, 15, 15, 15, 15, 16, 16, 16, 17, 17, 17, 18, 18, 18, 19]
+    return if p2 > 1 and p2 < t.len() { t[p2] } else { 0 }
+}
+
+fn to_int(v: i64) -> i64 {
+    return v.shl(32).shr(32)
+}
+
+fn trailing_zeros(v: i64) -> i64 {
+    var n = 0
+    var x = v
+    while x.bit_and(1) == 0 and n < 64 {
+        x = x.ushr(1)
+        n = n + 1
+    }
+    return n
+}
+
+fn leading_zeros(v: i64) -> i64 {
+    var n = 0
+    var x = v
+    while n < 64 and x >= 0 {
+        x = x.shl(1)
+        n = n + 1
+    }
+    return n
+}
+
+/// `estimateDecExp`.
+fn estimate_dec_exp(fract: i64, bin_exp: i64) -> i64 {
+    let d2 = (1023).shl(52).bit_or(fract.bit_and(4503599627370495)).from_bits()
+    let d = (d2 - 1.5) * 0.289529654 + 0.176091259 + bin_exp.as_f64() * 0.301029995663981
+    let bits = d.to_bits()
+    let exponent = bits.bit_and(9218868437227405312).shr(52) - 1023
+    let negative = bits < 0
+    if exponent >= 0 and exponent < 52 {
+        let mask = (4503599627370495).shr(exponent)
+        let r = to_int(bits.bit_and(4503599627370495).bit_or(4503599627370496).shr(52 - exponent))
+        return if negative { if mask.bit_and(bits) == 0 { 0 - r } else { 0 - r - 1 } } else { r }
+    }
+    if exponent < 0 {
+        return if bits.bit_and(9223372036854775807) == 0 { 0 } else { if negative { 0 - 1 } else { 0 } }
+    }
+    return d.as_i64()
+}
+
+type JdState = { digits: [i64], exponent: i64, exact: bool, rounded_up: bool }
+
+fn develop_long_digits(dec0: i64, lvalue0: i64, insignificant: i64) -> JdState {
+    var dec = dec0
+    var lv = lvalue0
+    if insignificant != 0 {
+        let pow10 = long_5_pow(insignificant).shl(insignificant)
+        let residue = lv % pow10
+        lv = lv / pow10
+        dec = dec + insignificant
+        if residue >= pow10.shr(1) {
+            lv = lv + 1
+        }
+    }
+    var out: [i64] = []
+    var c = lv % 10
+    lv = lv / 10
+    while c == 0 {
+        dec = dec + 1
+        c = lv % 10
+        lv = lv / 10
+    }
+    while lv != 0 {
+        out.push(c)
+        dec = dec + 1
+        c = lv % 10
+        lv = lv / 10
+    }
+    out.push(c)
+    return JdState{ digits: out.rev(), exponent: dec + 1, exact: false, rounded_up: false }
+}
+
+fn roundup(st: JdState) -> JdState {
+    var d = st.digits
+    var i = d.len() - 1
+    var q = d[i]
+    if q == 9 {
+        while q == 9 and i > 0 {
+            d[i] = 0
+            i = i - 1
+            q = d[i]
+        }
+        if q == 9 {
+            d[0] = 1
+            return JdState{ digits: d, exponent: st.exponent + 1, exact: st.exact, rounded_up: st.rounded_up }
+        }
+    }
+    d[i] = q + 1
+    return JdState{ digits: d, exponent: st.exponent, exact: st.exact, rounded_up: true }
+}
+
+/// `dtoa`: the digits for a positive finite value with its high-order bit
+/// set at bit 52.
+fn dtoa(bin_exp: i64, fract0: i64, n_sig: i64, compatible: bool) -> JdState {
+    var fract = fract0
+    let tail = trailing_zeros(fract)
+    let n_fract_bits = 53 - tail
+    let n_tiny = 0.max(n_fract_bits - bin_exp - 1)
+    if bin_exp <= 62 and bin_exp >= 0 - 21 and n_tiny < 27 and n_fract_bits + n_5_bits(n_tiny) < 64 and n_tiny == 0 {
+        let insignificant = if bin_exp > n_sig { insignificant_for_pow2(bin_exp - n_sig - 1) } else { 0 }
+        fract = if bin_exp >= 52 { fract.shl(bin_exp - 52) } else { fract.ushr(52 - bin_exp) }
+        return develop_long_digits(0, fract, insignificant)
+    }
+    var dec_exp = estimate_dec_exp(fract, bin_exp)
+    let b5 = 0.max(0 - dec_exp)
+    var b2 = b5 + n_tiny + bin_exp
+    let s5 = 0.max(dec_exp)
+    var s2 = s5 + n_tiny
+    let m5 = b5
+    var m2 = b2 - n_sig
+    fract = fract.ushr(tail)
+    b2 = b2 - (n_fract_bits - 1)
+    let common = b2.min(s2)
+    b2 = b2 - common
+    s2 = s2 - common
+    m2 = m2 - common
+    if n_fract_bits == 1 {
+        m2 = m2 - 1
+    }
+    if m2 < 0 {
+        b2 = b2 - m2
+        s2 = s2 - m2
+        m2 = 0
+    }
+    let b_bits = n_fract_bits + b2 + n_5_bits(b5)
+    let ten_s_bits = s2 + 1 + n_5_bits(s5 + 1)
+    let p = JdParams{ fract: fract, b5: b5, b2: b2, s5: s5, s2: s2, m5: m5, m2: m2, compatible: compatible }
+    let (digits, low, high, diff, exact, dec) = if b_bits < 64 and ten_s_bits < 64 {
+        small_loop(p, dec_exp, b_bits < 32 and ten_s_bits < 32)
+    } else {
+        big_loop(p, dec_exp)
+    }
+    dec_exp = dec
+    var st = JdState{ digits: digits, exponent: dec_exp + 1, exact: exact, rounded_up: false }
+    if high {
+        if low {
+            if diff == 0 {
+                if st.digits[st.digits.len() - 1].bit_and(1) != 0 {
+                    st = roundup(st)
+                }
+            } else if diff > 0 {
+                st = roundup(st)
+            }
+        } else {
+            st = roundup(st)
+        }
+    }
+    return st
+}
+
+type JdParams = { fract: i64, b5: i64, b2: i64, s5: i64, s2: i64, m5: i64, m2: i64, compatible: bool }
+
+/// The 32- and 64-bit loops. In the 32-bit one every quantity is a Java
+/// `int`, and `m` and `2b - tens` are allowed to overflow as they do there.
+fn small_loop(p: JdParams, dec0: i64, narrow: bool) -> ([i64], bool, bool, i64, bool, i64) {
+    var dec = dec0
+    var b = (if narrow { to_int(p.fract * long_5_pow(p.b5)) } else { p.fract * long_5_pow(p.b5) }).shl(p.b2)
+    let s = long_5_pow(p.s5).shl(p.s2)
+    var m = long_5_pow(p.m5).shl(p.m2)
+    if narrow {
+        b = to_int(b)
+        m = to_int(m)
+    }
+    let tens = s * 10
+    var out: [i64] = []
+    var q = b / s
+    b = 10 * (b % s)
+    m = if narrow { to_int(m * 10) } else { m * 10 }
+    var low = b < m
+    var high = (if narrow { to_int(b + m) } else { b + m }) > tens
+    if q == 0 and not high {
+        dec = dec - 1
+    } else {
+        out.push(q)
+    }
+    if not p.compatible or dec < 0 - 3 or dec >= 8 {
+        high = false
+        low = false
+    }
+    while not low and not high {
+        q = b / s
+        b = 10 * (b % s)
+        m = if narrow { to_int(m * 10) } else { m * 10 }
+        if m > 0 {
+            low = b < m
+            high = (if narrow { to_int(b + m) } else { b + m }) > tens
+        } else {
+            low = true
+            high = true
+        }
+        out.push(q)
+    }
+    let diff = if narrow { to_int(b.shl(1) - tens) } else { b.shl(1) - tens }
+    return (out, low, high, diff, b == 0, dec)
+}
+
+fn big_loop(p: JdParams, dec0: i64) -> ([i64], bool, bool, i64, bool, i64) {
+    var dec = dec0
+    let s = big_pow52(p.s5, p.s2)
+    var b = big_shl(big_mul_big(big_from(p.fract), big_pow52(p.b5, 0)), p.b2)
+    var m = big_pow52(p.m5 + 1, p.m2 + 1)
+    let ten_s = big_pow52(p.s5 + 1, p.s2 + 1)
+    var out: [i64] = []
+    var (q, rest) = quo_rem(b, s)
+    b = rest
+    var low = big_cmp(b, m) < 0
+    var high = big_cmp(ten_s, big_add(b, m)) <= 0
+    if q == 0 and not high {
+        dec = dec - 1
+    } else {
+        out.push(q)
+    }
+    if not p.compatible or dec < 0 - 3 or dec >= 8 {
+        high = false
+        low = false
+    }
+    while not low and not high {
+        let (q2, rest2) = quo_rem(b, s)
+        b = rest2
+        m = big_mul_small(m, 10)
+        low = big_cmp(b, m) < 0
+        high = big_cmp(ten_s, big_add(b, m)) <= 0
+        out.push(q2)
+    }
+    var diff = 0
+    if high and low {
+        diff = big_cmp(big_shl(b, 1), ten_s)
+    }
+    return (out, low, high, diff, big_cmp(b, [0]) == 0, dec)
+}
+
+fn big_mul_big(a: [i64], b: [i64]) -> [i64] {
+    var acc: [i64] = [0]
+    for (i, x) in b.enumerate() {
+        acc = big_add(acc, big_shl(big_mul_small(a, x.ushr(16)), 32 * i + 16))
+        acc = big_add(acc, big_shl(big_mul_small(a, x.bit_and(65535)), 32 * i))
+    }
+    return acc
+}
+
+/// `quoRemIteration`: the quotient digit, and ten times the remainder.
+fn quo_rem(b0: [i64], s: [i64]) -> (i64, [i64]) {
+    var b = b0
+    var q = 0
+    while big_cmp(b, s) >= 0 {
+        b = big_sub(b, s)
+        q = q + 1
+    }
+    return (q, big_mul_small(b, 10))
+}
+
+/// The digits `Double.toString` is built from, or those `Formatter` starts
+/// from when `compatible` is false. `None` for NaN, an infinity, and zero.
+pub fn digits(x: f64, compatible: bool) -> Option[JdDigits] {
+    let bits = x.to_bits()
+    let negative = bits < 0
+    var fract = bits.bit_and(4503599627370495)
+    var bin_exp = bits.ushr(52).bit_and(2047)
+    if bin_exp == 2047 or (bin_exp == 0 and fract == 0) {
+        return None
+    }
+    var n_sig = 53
+    if bin_exp == 0 {
+        let lz = leading_zeros(fract)
+        let shift = lz - 11
+        fract = fract.shl(shift)
+        bin_exp = 1 - shift
+        n_sig = 64 - lz
+    } else {
+        fract = fract.bit_or(4503599627370496)
+    }
+    let st = dtoa(bin_exp - 1023, fract, n_sig, compatible)
+    return Some(JdDigits{ negative: negative, digits: st.digits.map(|d| d.to_str()).join(""), exponent: st.exponent, exact: st.exact,
+        rounded_up: st.rounded_up })
+}
+
+/// The same for a `float`, given its 32 bits.
+pub fn float_digits(fbits: i64) -> Option[JdDigits] {
+    let negative = fbits.bit_and(2147483648) != 0
+    var fract = fbits.bit_and(8388607)
+    var bin_exp = fbits.ushr(23).bit_and(255)
+    if bin_exp == 255 or (bin_exp == 0 and fract == 0) {
+        return None
+    }
+    var n_sig = 24
+    if bin_exp == 0 {
+        let lz = leading_zeros(fract.shl(32))
+        let shift = lz - 8
+        fract = fract.shl(shift)
+        bin_exp = 1 - shift
+        n_sig = 32 - lz
+    } else {
+        fract = fract.bit_or(8388608)
+    }
+    let st = dtoa(bin_exp - 127, fract.shl(29), n_sig, true)
+    return Some(JdDigits{ negative: negative, digits: st.digits.map(|d| d.to_str()).join(""), exponent: st.exponent, exact: st.exact,
+        rounded_up: st.rounded_up })
+}
+
+/// `getChars`: Java's layout of the digits.
+fn layout(d: JdDigits) -> str {
+    let n = d.digits.len()
+    let e = d.exponent
+    var out = if d.negative { "-" } else { "" }
+    if e > 0 and e < 8 {
+        let take = n.min(e)
+        out = out + d.digits.substr(0, take)
+        if take < e {
+            out = out + "0".repeat(e - take) + ".0"
+        } else {
+            out = out + "." + (if take < n { d.digits.substr(take, n - take) } else { "0" })
+        }
+        return out
+    }
+    if e <= 0 and e > 0 - 3 {
+        return out + "0." + "0".repeat(0 - e) + d.digits
+    }
+    out = out + d.digits.substr(0, 1) + "." + (if n > 1 { d.digits.substr(1, n - 1) } else { "0" }) + "E"
+    return out + (if e <= 0 { "-" + (0 - e + 1).to_str() } else { (e - 1).to_str() })
+}
+
+/// `Double.toString(x)`.
+pub fn double_to_string(x: f64) -> str {
+    if x.is_nan() {
+        return "NaN"
+    }
+    if x == 1.0 / 0.0 {
+        return "Infinity"
+    }
+    if x == -1.0 / 0.0 {
+        return "-Infinity"
+    }
+    return match digits(x, true) {
+        Some(d) -> layout(d)
+        None -> if x.to_bits() < 0 { "-0.0" } else { "0.0" }
+    }
+}
+
+/// `Float.toString(f)`, for the float whose bits are `fbits`.
+pub fn float_to_string(fbits: i64) -> str {
+    let exp = fbits.ushr(23).bit_and(255)
+    let neg = fbits.bit_and(2147483648) != 0
+    if exp == 255 {
+        return if fbits.bit_and(8388607) != 0 { "NaN" } else if neg { "-Infinity" } else { "Infinity" }
+    }
+    return match float_digits(fbits) {
+        Some(d) -> layout(d)
+        None -> if neg { "-0.0" } else { "0.0" }
+    }
+}

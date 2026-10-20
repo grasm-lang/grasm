@@ -1,0 +1,334 @@
+// Java's pseudo-random generators, number for number: the sequence a Java
+// program gets from `new Random(seed)` or `new SplittableRandom(seed)`, so a
+// simulation, a test fixture or a shuffle made in Java can be reproduced
+// here, and the other way round.
+//
+// Held to OpenJDK 17: `java.util.Random` (the 48-bit linear congruential
+// generator and every method built on it, `nextGaussian` included -- its
+// logarithm is fdlibm's, as StrictMath's is, not the platform's), the
+// bounded methods Java 17 takes from `RandomGenerator`, `SplittableRandom`
+// (SplitMix64, and `split`), and `Collections.shuffle`.
+//
+// Not reproduced: `SplittableRandom.nextGaussian` and the `nextExponential`
+// methods, which in Java 17 use the ziggurat tables of `RandomSupport`.
+//
+// A generator is a value; each call takes it `inout` and advances it.
+
+/// `java.util.Random`.
+type JRandom = { seed: i64, next_gaussian: f64, have_gaussian: bool }
+
+/// `java.util.SplittableRandom`.
+type JSplittable = { seed: i64, gamma: i64 }
+
+fn multiplier() -> i64 {
+    return 25214903917
+}
+
+fn mask48() -> i64 {
+    return 281474976710655
+}
+
+/// `new Random(seed)`.
+pub fn random(seed: i64) -> JRandom {
+    return JRandom{ seed: seed.bit_xor(multiplier()).bit_and(mask48()), next_gaussian: 0.0, have_gaussian: false }
+}
+
+/// `Random.next(bits)`: the top `bits` of the new 48-bit state, as a
+/// 32-bit signed int.
+pub fn next_bits(inout r: JRandom, bits: i64) -> i64 {
+    r.seed = (r.seed * multiplier() + 11).bit_and(mask48())
+    return to_int(r.seed.ushr(48 - bits))
+}
+
+/// Java's `(int)` cast: the low 32 bits, signed.
+fn to_int(v: i64) -> i64 {
+    return v.shl(32).shr(32)
+}
+
+pub fn next_int(inout r: JRandom) -> i64 {
+    return next_bits(r, 32)
+}
+
+/// `nextInt(bound)`, bound > 0.
+pub fn next_int_bounded(inout r: JRandom, bound: i64) -> i64 {
+    var x = next_bits(r, 31)
+    let m = bound - 1
+    if bound.bit_and(m) == 0 {
+        return (bound * x).shr(31)
+    }
+    var u = x
+    while true {
+        x = u % bound
+        if to_int(u - x + m) >= 0 {
+            break
+        }
+        u = next_bits(r, 31)
+    }
+    return x
+}
+
+/// `nextInt(origin, bound)`, Java 17's `RandomSupport.boundedNextInt`.
+pub fn next_int_range(inout r: JRandom, origin: i64, bound: i64) -> i64 {
+    var x = next_int(r)
+    if origin < bound {
+        let n = to_int(bound - origin)
+        let m = to_int(n - 1)
+        if n.bit_and(m) == 0 {
+            x = to_int(x.bit_and(m) + origin)
+        } else if n > 0 {
+            var u = x.bit_and(4294967295).ushr(1)
+            while true {
+                x = u % n
+                if to_int(u + m - x) >= 0 {
+                    break
+                }
+                u = next_int(r).bit_and(4294967295).ushr(1)
+            }
+            x = to_int(x + origin)
+        } else {
+            while x < origin or x >= bound {
+                x = next_int(r)
+            }
+        }
+    }
+    return x
+}
+
+pub fn next_long(inout r: JRandom) -> i64 {
+    let hi = next_bits(r, 32)
+    let lo = next_bits(r, 32)
+    return hi.shl(32) + lo
+}
+
+/// `nextLong(bound)`, bound > 0, Java 17's `RandomSupport.boundedNextLong`.
+pub fn next_long_bounded(inout r: JRandom, bound: i64) -> i64 {
+    let m = bound - 1
+    var x = next_long(r)
+    if bound.bit_and(m) == 0 {
+        return x.bit_and(m)
+    }
+    var u = x.ushr(1)
+    while true {
+        x = u % bound
+        if u + m - x >= 0 {
+            break
+        }
+        u = next_long(r).ushr(1)
+    }
+    return x
+}
+
+pub fn next_boolean(inout r: JRandom) -> bool {
+    return next_bits(r, 1) != 0
+}
+
+/// `nextFloat`, returned as the `f64` holding the same value.
+pub fn next_float(inout r: JRandom) -> f64 {
+    return next_bits(r, 24).as_f64() / 16777216.0
+}
+
+pub fn next_double(inout r: JRandom) -> f64 {
+    let a = next_bits(r, 26)
+    let b = next_bits(r, 27)
+    return (a.shl(27) + b).as_f64() * 0.00000000000000011102230246251565
+}
+
+/// `nextGaussian`: the polar method, two values per round.
+pub fn next_gaussian(inout r: JRandom) -> f64 {
+    if r.have_gaussian {
+        r.have_gaussian = false
+        return r.next_gaussian
+    }
+    var v1 = 0.0
+    var v2 = 0.0
+    var s = 0.0
+    while true {
+        v1 = 2.0 * next_double(r) - 1.0
+        v2 = 2.0 * next_double(r) - 1.0
+        s = v1 * v1 + v2 * v2
+        if s < 1.0 and s != 0.0 {
+            break
+        }
+    }
+    let mul = (-2.0 * fdlibm_log(s) / s).sqrt()
+    r.next_gaussian = v2 * mul
+    r.have_gaussian = true
+    return v1 * mul
+}
+
+/// `nextBytes(n)`: each `nextInt` gives four bytes, low byte first.
+pub fn next_bytes(inout r: JRandom, n: i64) -> bytes {
+    var out: [i64] = []
+    while out.len() < n {
+        var x = next_int(r)
+        var k = (n - out.len()).min(4)
+        while k > 0 {
+            out.push(x.bit_and(255))
+            x = x.shr(8)
+            k = k - 1
+        }
+    }
+    return bytes_of(out)
+}
+
+/// `Collections.shuffle(list, rnd)`, on a list of anything.
+pub fn shuffle(inout r: JRandom, xs: [i64]) -> [i64] {
+    var a = xs
+    var i = a.len()
+    while i > 1 {
+        let j = next_int_bounded(r, i)
+        let t = a[i - 1]
+        a[i - 1] = a[j]
+        a[j] = t
+        i = i - 1
+    }
+    return a
+}
+
+/// fdlibm's `__ieee754_log`, which `StrictMath.log` is: the same bits on
+/// every machine, where a platform's `log` may differ in the last place.
+pub fn fdlibm_log(x0: f64) -> f64 {
+    let ln2_hi = 0.693147180369123816490
+    let ln2_lo = 0.000000000190821492927058770002
+    let two54 = 18014398509481984.0
+    var x = x0
+    var bits = x.to_bits()
+    var hx = bits.shr(32)
+    let lx = bits.bit_and(4294967295)
+    var k = 0
+    if hx < 1048576 {
+        if hx.bit_and(2147483647).bit_or(lx) == 0 {
+            return -1.0 / 0.0
+        }
+        if hx < 0 {
+            return 0.0 / 0.0
+        }
+        k = k - 54
+        x = x * two54
+        bits = x.to_bits()
+        hx = bits.shr(32)
+    }
+    if hx >= 2146435072 {
+        return x + x
+    }
+    k = k + hx.shr(20) - 1023
+    hx = hx.bit_and(1048575)
+    let i0 = (hx + 614244).bit_and(1048576)
+    x = hx.bit_or(i0.bit_xor(1072693248)).shl(32).bit_or(x.to_bits().bit_and(4294967295)).from_bits()
+    k = k + i0.shr(20)
+    let f = x - 1.0
+    let dk = k.as_f64()
+    if (2 + hx).bit_and(1048575) < 3 {
+        if f == 0.0 {
+            return if k == 0 { 0.0 } else { dk * ln2_hi + dk * ln2_lo }
+        }
+        let r0 = f * f * (0.5 - 0.33333333333333333 * f)
+        return if k == 0 { f - r0 } else { dk * ln2_hi - ((r0 - dk * ln2_lo) - f) }
+    }
+    return log_tail(f, k, hx, dk, ln2_hi, ln2_lo)
+}
+
+fn log_tail(f: f64, k: i64, hx: i64, dk: f64, ln2_hi: f64, ln2_lo: f64) -> f64 {
+    let s = f / (2.0 + f)
+    let z = s * s
+    let w = z * z
+    let t1 = w * (0.3999999999940941908 + w * (0.2222219843214978396 + w * 0.1531383769920937332))
+    let t2 = z * (0.6666666666666735130 + w * (0.2857142874366239149 + w * (0.1818357216161805012 + w * 0.1479819860511658591)))
+    let i = (hx - 398458).bit_or(440401 - hx)
+    let r = t2 + t1
+    if i > 0 {
+        let hfsq = 0.5 * f * f
+        return if k == 0 { f - (hfsq - s * (hfsq + r)) } else { dk * ln2_hi - ((hfsq - (s * (hfsq + r) + dk * ln2_lo)) - f) }
+    }
+    return if k == 0 { f - s * (f - r) } else { dk * ln2_hi - ((s * (f - r) - dk * ln2_lo) - f) }
+}
+
+// ---- SplittableRandom
+
+fn golden_gamma() -> i64 {
+    return 0 - 7046029254386353131
+}
+
+pub fn splittable(seed: i64) -> JSplittable {
+    return JSplittable{ seed: seed, gamma: golden_gamma() }
+}
+
+fn mix64(z0: i64) -> i64 {
+    var z = z0
+    z = z.bit_xor(z.ushr(30)) * (0 - 4658895280553007687)
+    z = z.bit_xor(z.ushr(27)) * (0 - 7723592293110705685)
+    return z.bit_xor(z.ushr(31))
+}
+
+fn mix32(z0: i64) -> i64 {
+    var z = z0
+    z = z.bit_xor(z.ushr(33)) * 7109453100751455733
+    return to_int((z.bit_xor(z.ushr(28)) * (0 - 3808689974395783757)).ushr(32))
+}
+
+fn popcount(v: i64) -> i64 {
+    var n = 0
+    var x = v
+    while x != 0 {
+        n = n + x.bit_and(1)
+        x = x.ushr(1)
+    }
+    return n
+}
+
+fn mix_gamma(z0: i64) -> i64 {
+    var z = z0
+    z = z.bit_xor(z.ushr(33)) * (0 - 49064778989728563)
+    z = z.bit_xor(z.ushr(33)) * (0 - 4265267296055464877)
+    z = z.bit_xor(z.ushr(33)).bit_or(1)
+    let n = popcount(z.bit_xor(z.ushr(1)))
+    return if n < 24 { z.bit_xor(0 - 6148914691236517206) } else { z }
+}
+
+fn next_seed(inout s: JSplittable) -> i64 {
+    s.seed = s.seed + s.gamma
+    return s.seed
+}
+
+pub fn split_next_long(inout s: JSplittable) -> i64 {
+    return mix64(next_seed(s))
+}
+
+pub fn split_next_int(inout s: JSplittable) -> i64 {
+    return mix32(next_seed(s))
+}
+
+/// `split()`: a new generator whose seed and gamma come from this one.
+pub fn split(inout s: JSplittable) -> JSplittable {
+    let seed = split_next_long(s)
+    return JSplittable{ seed: seed, gamma: mix_gamma(next_seed(s)) }
+}
+
+pub fn split_next_int_bounded(inout s: JSplittable, bound: i64) -> i64 {
+    let m = bound - 1
+    var x = split_next_int(s)
+    if bound.bit_and(m) == 0 {
+        return x.bit_and(m)
+    }
+    var u = x.bit_and(4294967295).ushr(1)
+    while true {
+        x = u % bound
+        if to_int(u + m - x) >= 0 {
+            break
+        }
+        u = split_next_int(s).bit_and(4294967295).ushr(1)
+    }
+    return x
+}
+
+pub fn split_next_double(inout s: JSplittable) -> f64 {
+    return split_next_long(s).ushr(11).as_f64() * 0.00000000000000011102230246251565
+}
+
+pub fn split_next_boolean(inout s: JSplittable) -> bool {
+    return split_next_int(s) < 0
+}
+
+pub fn split_next_float(inout s: JSplittable) -> f64 {
+    return split_next_int(s).bit_and(4294967295).ushr(8).as_f64() * 0.000000059604644775390625
+}

@@ -12094,8 +12094,14 @@ this case",
             .push((step, exit, self.vars.len(), self.handlers_installed));
         self.push_scope();
         self.bind(&loop_var.name, evar, elem_vt.clone());
-        let (_, mut terminated) = self.eval_block_inner(body)?;
+        // The body's last statement is its tail, and a tail is handed back
+        // owned: `for x in xs { f() }` must release what `f()` returned, as
+        // a statement anywhere else in the body does. Dropping it here leaked
+        // one value per iteration whenever the last statement produced a
+        // boxed one -- a discarded `v.pop()` in pyurlparse's `urljoin`.
+        let (tail, mut terminated) = self.eval_block_inner(body)?;
         self.loops.pop();
+        self.dec_block_tail(tail);
         terminated |= self.is_filled();
         if terminated {
             self.pop_scope_no_decs();
@@ -22335,7 +22341,10 @@ binding, as in `let f: fn(i64) -> i64 = |x| x + 1`, or make it a top-level `fn`)
         self.push_scope();
         self.bind(&name, list_var, list_t);
 
-        let (_, collect_terminated) = self.eval_block_inner(body)?;
+        // The block's own last statement is its tail, handed back owned;
+        // nothing reads a `parallel` block's value, so it is released here.
+        let (tail, collect_terminated) = self.eval_block_inner(body)?;
+        self.dec_block_tail(tail);
         let assigned = self.task_scopes.pop().expect("pushed above").1;
         debug_assert_eq!(assigned, sites.len(), "spawn sites must be visited once");
 
@@ -22396,7 +22405,10 @@ binding, as in `let f: fn(i64) -> i64 = |x| x + 1`, or make it a top-level `fn`)
 
         for (task_body, block) in sites.iter().zip(&task_blocks) {
             self.goto_block(*block);
-            let (_, terminated) = self.eval_block_inner(task_body)?;
+            // A task's result goes nowhere: its tail is released as it ends,
+            // as the concurrent form does by binding it to `_`.
+            let (tail, terminated) = self.eval_block_inner(task_body)?;
+            self.dec_block_tail(tail);
             if !terminated && !self.is_filled() {
                 self.b.ins().jump(step, &[]);
                 self.filled = true;

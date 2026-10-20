@@ -1,0 +1,36 @@
+[package]
+name = "b48test"
+version = "1.0.0"
+capabilities = ["io"]
+
+[dependencies.javarandom]
+path = "../javarandom"
+version = "^1.0.0"
+
+[dependencies.javadouble]
+path = "../javadouble"
+version = "^1.0.0"
+
+[dependencies.javaformat]
+path = "../javaformat"
+version = "^1.0.0"
+
+[dependencies.javadecimalformat]
+path = "../javadecimalformat"
+version = "^1.0.0"
+
+[dependencies.javauri]
+path = "../javauri"
+version = "^1.0.0"
+
+[dependencies.javamessageformat]
+path = "../javamessageformat"
+version = "^1.0.0"
+
+[dependencies.javabigdecimal]
+path = "../javabigdecimal"
+version = "^1.0.0"
+
+[dependencies.bigint]
+path = "../bigint"
+version = "^1.0.0"

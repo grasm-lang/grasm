@@ -1,0 +1,16 @@
+[package]
+name = "pyrandom"
+version = "1.0.0"
+capabilities = []
+
+[dependencies.mersenne]
+path = "../mersenne"
+version = "^1.0.0"
+
+[dependencies.sha512]
+path = "../sha512"
+version = "^1.0.0"
+
+[dependencies.pymath]
+path = "../pymath"
+version = "^1.0.0"

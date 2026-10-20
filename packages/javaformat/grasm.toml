@@ -1,0 +1,8 @@
+[package]
+name = "javaformat"
+version = "1.0.0"
+capabilities = []
+
+[dependencies.javadouble]
+path = "../javadouble"
+version = "^1.0.0"

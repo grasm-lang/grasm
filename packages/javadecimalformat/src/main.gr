@@ -1,0 +1,673 @@
+// `java.text.DecimalFormat`, formatting, as Java 17 does it for `Locale.US`.
+//
+// `#,##0.00`, `0.###E0`, `##0.##E0`, `#%`, `¤#,##0.00;(¤#,##0.00)`: the
+// pattern language every Java report, invoice and log line is written in,
+// and which other programs end up having to reproduce byte for byte when
+// they read what Java wrote or write what Java reads.
+//
+// Three things here are not what a reader of the pattern expects, and are
+// Java's behaviour all the same:
+//
+//   - A double is rounded from its *shortest* decimal form, the digits of
+//     `Double.toString`, not from its exact binary value. The two differ
+//     at a tie: 0.125 is exact and rounds to `0.12` half-even, while the
+//     double nearest 1.005 is a hair below it but prints as `1.005`, and
+//     whether it goes up depends on whether those digits were themselves
+//     rounded up -- which `FloatingDecimal` records, and this reads from
+//     `packages/javadouble`.
+//   - The sign is decided before rounding, so -0.001 with `0.00` is
+//     `-0.00`.
+//   - A percent pattern multiplies in floating point first: 0.07 with `#%`
+//     is formatted from 7.000000000000001.
+//
+// Rounding modes are the eight of `java.math.RoundingMode`; `Unnecessary`
+// fails where Java throws `ArithmeticException`. Parsing text back, and
+// locales other than `Locale.US`, are not here.
+
+import javadouble
+
+type DfRounding =
+    | HalfEven
+    | HalfUp
+    | HalfDown
+    | Up
+    | Down
+    | Ceiling
+    | Floor
+    | Unnecessary
+
+type DfError =
+    | Malformed(reason: str)
+    | RoundingNeeded
+
+/// A compiled pattern. The digit counts are the ones `NumberFormat` keeps,
+/// already clamped to what a double can use (309 integer, 340 fraction).
+type DecimalPattern = {
+    pos_prefix: str,
+    pos_suffix: str,
+    neg_prefix: str,
+    neg_suffix: str,
+    min_int: i64,
+    max_int: i64,
+    min_frac: i64,
+    max_frac: i64,
+    grouping: bool,
+    group_size: i64,
+    multiplier: i64,
+    always_point: bool,
+    exponential: bool,
+    min_exp: i64,
+    /// Whether a `¤` appears, which changes the fast path's digits.
+    currency: bool,
+    rounding: DfRounding,
+}
+
+// ---- the pattern
+
+/// One pass over a pattern, positive (`positive` true) or negative. The
+/// grouping count is a Java `byte`, and wraps like one past 127 digits.
+type DfPass = {
+    pos: i64,
+    phase: i64,
+    quote: bool,
+    in_suffix: bool,
+    prefix: str,
+    suffix: str,
+    decimal_pos: i64,
+    multiplier: i64,
+    left: i64,
+    zeros: i64,
+    right: i64,
+    group: i8,
+    exponential: bool,
+    min_exp: i64,
+    currency: bool,
+    next_start: i64,
+}
+
+fn add_affix(inout st: DfPass, t: str) {
+    if st.in_suffix {
+        st.suffix = st.suffix + t
+    } else {
+        st.prefix = st.prefix + t
+    }
+}
+
+fn is_number_char(c: i64) -> bool {
+    return c == 35 or c == 48 or c == 44 or c == 46
+}
+
+/// A prefix or suffix character, phase 0 or 2. Affixes are kept in Java's
+/// own quoted form -- `'%` for a percent that multiplies, `''` for a quote
+/// -- and expanded once the pattern is read.
+fn affix_step(cs: [i64], positive: bool, inout st: DfPass) ! DfError {
+    let ch = cs[st.pos]
+    let quote_next = st.pos + 1 < cs.len() and cs[st.pos + 1] == 39
+    if st.quote {
+        if ch == 39 {
+            if quote_next {
+                st.pos = st.pos + 1
+                add_affix(st, "''")
+            } else {
+                st.quote = false
+            }
+        } else {
+            add_affix(st, ch.to_char())
+        }
+        st.pos = st.pos + 1
+        return
+    }
+    if is_number_char(ch) {
+        st.phase = 1
+        return
+    }
+    if ch == 59 {
+        if st.phase == 0 or not positive {
+            fail(Malformed("Unquoted special character ';'"))
+        }
+        st.next_start = st.pos + 1
+        st.pos = cs.len()
+        return
+    }
+    if ch == 164 {
+        let doubled = st.pos + 1 < cs.len() and cs[st.pos + 1] == 164
+        if doubled {
+            st.pos = st.pos + 1
+        }
+        st.currency = true
+        add_affix(st, if doubled { "'¤¤" } else { "'¤" })
+    } else if ch == 39 {
+        if quote_next {
+            st.pos = st.pos + 1
+            add_affix(st, "''")
+        } else {
+            st.quote = true
+        }
+    } else if ch == 37 or ch == 8240 {
+        if st.multiplier != 1 {
+            fail(Malformed("Too many percent/per mille characters"))
+        }
+        st.multiplier = if ch == 37 { 100 } else { 1000 }
+        add_affix(st, if ch == 37 { "'%" } else { "'‰" })
+    } else if ch == 45 {
+        add_affix(st, "'-")
+    } else {
+        add_affix(st, ch.to_char())
+    }
+    st.pos = st.pos + 1
+}
+
+/// A digit, `0`, `,`, `.` or the exponent, phase 1 of the positive pattern.
+fn number_step(cs: [i64], inout st: DfPass) ! DfError {
+    let ch = cs[st.pos]
+    if ch == 35 or ch == 48 {
+        if ch == 35 {
+            if st.zeros > 0 {
+                st.right = st.right + 1
+            } else {
+                st.left = st.left + 1
+            }
+        } else {
+            if st.right > 0 {
+                fail(Malformed("Unexpected '0'"))
+            }
+            st.zeros = st.zeros + 1
+        }
+        if st.group >= 0 and st.decimal_pos < 0 {
+            st.group = st.group + 1
+        }
+    } else if ch == 44 {
+        st.group = 0
+    } else if ch == 46 {
+        if st.decimal_pos >= 0 {
+            fail(Malformed("Multiple decimal separators"))
+        }
+        st.decimal_pos = st.left + st.zeros + st.right
+    } else if ch == 69 {
+        if st.exponential {
+            fail(Malformed("Multiple exponential symbols"))
+        }
+        st.exponential = true
+        st.min_exp = 0
+        st.pos = st.pos + 1
+        while st.pos < cs.len() and cs[st.pos] == 48 {
+            st.min_exp = st.min_exp + 1
+            st.pos = st.pos + 1
+        }
+        if st.left + st.zeros < 1 or st.min_exp < 1 {
+            fail(Malformed("Malformed exponential"))
+        }
+        st.phase = 2
+        st.in_suffix = true
+        return
+    } else {
+        st.phase = 2
+        st.in_suffix = true
+        return
+    }
+    st.pos = st.pos + 1
+}
+
+/// Phase 1 of the negative pattern: its digits are skipped, since only its
+/// prefix and suffix are used.
+fn skip_number(cs: [i64], inout st: DfPass) {
+    while st.pos < cs.len() {
+        if is_number_char(cs[st.pos]) or cs[st.pos] == 69 {
+            st.pos = st.pos + 1
+        } else {
+            st.phase = 2
+            st.in_suffix = true
+            return
+        }
+    }
+}
+
+fn read_pass(cs: [i64], start: i64, positive: bool) -> DfPass ! DfError {
+    var st = DfPass{ pos: start, phase: 0, quote: false, in_suffix: false, prefix: "", suffix: "", decimal_pos: 0 - 1, multiplier: 1, left: 0,
+        zeros: 0, right: 0, group: -1, exponential: false, min_exp: 0, currency: false, next_start: start }
+    while st.pos < cs.len() {
+        if st.phase == 1 {
+            if positive {
+                try number_step(cs, st)
+            } else {
+                skip_number(cs, st)
+            }
+        } else {
+            try affix_step(cs, positive, st)
+        }
+    }
+    if st.zeros == 0 and st.left > 0 and st.decimal_pos >= 0 {
+        // `####.##` has no zero digit; the one before the point becomes one.
+        let n = if st.decimal_pos == 0 { 1 } else { st.decimal_pos }
+        st.right = st.left - n
+        st.left = n - 1
+        st.zeros = 1
+    }
+    let bad_point = st.decimal_pos >= 0 and (st.decimal_pos < st.left or st.decimal_pos > st.left + st.zeros)
+    if (st.decimal_pos < 0 and st.right > 0) or bad_point or st.group == 0 or st.quote {
+        fail(Malformed("Malformed pattern"))
+    }
+    return st
+}
+
+fn expand_affix(p: str) -> str {
+    let cs = p.codes()
+    var out = ""
+    var i = 0
+    while i < cs.len() {
+        var c = cs[i]
+        i = i + 1
+        if c == 39 {
+            c = cs[i]
+            i = i + 1
+            if c == 164 {
+                if i < cs.len() and cs[i] == 164 {
+                    i = i + 1
+                    out = out + "USD"
+                } else {
+                    out = out + "$"
+                }
+                continue
+            }
+        }
+        out = out + c.to_char()
+    }
+    return out
+}
+
+/// Compile a pattern, as `new DecimalFormat(pattern,
+/// DecimalFormatSymbols.getInstance(Locale.US))` does.
+pub fn pattern(text: str) -> DecimalPattern ! DfError {
+    let cs = text.codes()
+    if cs.len() == 0 {
+        // Nothing is set from an empty pattern but the digit counts; the
+        // grouping a new DecimalFormat starts with, every three, stays.
+        return DecimalPattern{ pos_prefix: "", pos_suffix: "", neg_prefix: "-", neg_suffix: "", min_int: 0, max_int: 309, min_frac: 0,
+            max_frac: 340, grouping: true, group_size: 3, multiplier: 1, always_point: false, exponential: false, min_exp: 0, currency: false,
+            rounding: HalfEven }
+    }
+    let pos = try read_pass(cs, 0, true)
+    // With no `;`, Java reads the whole pattern again as the negative one.
+    var neg_prefix = "'-" + pos.prefix
+    var neg_suffix = pos.suffix
+    var currency = pos.currency
+    if pos.next_start < cs.len() {
+        let neg = try read_pass(cs, pos.next_start, false)
+        currency = currency or neg.currency
+        if neg.prefix != pos.prefix or neg.suffix != pos.suffix {
+            neg_prefix = neg.prefix
+            neg_suffix = neg.suffix
+        }
+    }
+    let total = pos.left + pos.zeros + pos.right
+    let point = if pos.decimal_pos >= 0 { pos.decimal_pos } else { total }
+    let min_int = point - pos.left
+    let max_int = if pos.exponential { pos.left + min_int } else { 309 }
+    let max_frac = if pos.decimal_pos >= 0 { total - pos.decimal_pos } else { 0 }
+    let min_frac = if pos.decimal_pos >= 0 { pos.left + pos.zeros - pos.decimal_pos } else { 0 }
+    let group: i64 = pos.group.as_i64()
+    return DecimalPattern{ pos_prefix: expand_affix(pos.prefix), pos_suffix: expand_affix(pos.suffix), neg_prefix: expand_affix(neg_prefix),
+        neg_suffix: expand_affix(neg_suffix), min_int: 309.min(min_int), max_int: 309.min(max_int), min_frac: 340.min(min_frac),
+        max_frac: 340.min(max_frac), grouping: group > 0, group_size: if group > 0 { group } else { 0 }, multiplier: pos.multiplier,
+        always_point: pos.decimal_pos == 0 or pos.decimal_pos == total, exponential: pos.exponential, min_exp: pos.min_exp, currency: currency,
+        rounding: HalfEven }
+}
+
+/// The same pattern, rounding another way.
+pub fn with_rounding(p: DecimalPattern, mode: DfRounding) -> DecimalPattern {
+    var q = p
+    q.rounding = mode
+    return q
+}
+
+// ---- the digit list: java.text.DigitList, digits 0-9 and where the point is
+
+type DfList = { digits: [i64], at: i64 }
+
+fn any_nonzero(d: [i64], from: i64) -> bool {
+    for i in from..d.len() {
+        if d[i] != 0 {
+            return true
+        }
+    }
+    return false
+}
+
+fn half_rule(d: [i64], max: i64, rounded_up: bool, exact: bool, mode: DfRounding) -> bool {
+    if d[max] > 5 {
+        return true
+    }
+    if d[max] < 5 {
+        return false
+    }
+    return match mode {
+        HalfEven -> if max == d.len() - 1 {
+            if rounded_up { false } else if not exact { true } else { max > 0 and d[max - 1] % 2 != 0 }
+        } else {
+            any_nonzero(d, max + 1)
+        }
+        _ -> if max != d.len() - 1 {
+            true
+        } else if exact {
+            match mode {
+                HalfUp -> true
+                _ -> false
+            }
+        } else {
+            not rounded_up
+        }
+    }
+}
+
+/// DigitList.shouldRoundUp: whether keeping `max` digits rounds up.
+fn should_round_up(d: [i64], max: i64, rounded_up: bool, exact: bool, negative: bool, mode: DfRounding) -> bool ! DfError {
+    if max >= d.len() {
+        return false
+    }
+    let rest = any_nonzero(d, max)
+    return match mode {
+        Up -> rest
+        Down -> false
+        Ceiling -> rest and not negative
+        Floor -> rest and negative
+        Unnecessary -> if rest { fail(RoundingNeeded) } else { false }
+        _ -> half_rule(d, max, rounded_up, exact, mode)
+    }
+}
+
+fn strip_zeros(inout d: [i64]) {
+    while d.len() > 1 and d[d.len() - 1] == 0 {
+        d.pop()
+    }
+}
+
+/// DigitList.round. A carry out of the first digit leaves `1` and moves the
+/// point.
+fn round_list(inout l: DfList, keep: i64, rounded_up: bool, exact: bool, negative: bool, mode: DfRounding) ! DfError {
+    if keep < 0 or keep >= l.digits.len() {
+        return
+    }
+    var count = keep
+    if try should_round_up(l.digits, keep, rounded_up, exact, negative, mode) {
+        var m = keep
+        while true {
+            m = m - 1
+            if m < 0 {
+                l.digits[0] = 1
+                l.at = l.at + 1
+                m = 0
+                break
+            }
+            l.digits[m] = l.digits[m] + 1
+            if l.digits[m] <= 9 {
+                break
+            }
+        }
+        count = m + 1
+    }
+    l.digits = l.digits.slice(0, count)
+    strip_zeros(l.digits)
+}
+
+/// DigitList.set for a double: the digits of `Double.toString`, with the
+/// record of whether they are exact or were rounded up.
+fn list_of_double(x: f64, negative: bool, max: i64, fixed: bool, mode: DfRounding) -> DfList ! DfError {
+    let jd = match javadouble.digits(x, true) {
+        Some(d) -> d
+        None -> return DfList{ digits: [], at: 0 }
+    }
+    var l = DfList{ digits: jd.digits.codes().map(|c| c - 48), at: jd.exponent }
+    if fixed {
+        if 0 - l.at > max {
+            return DfList{ digits: [], at: l.at }
+        }
+        if 0 - l.at == max {
+            if try should_round_up(l.digits, 0, jd.rounded_up, jd.exact, negative, mode) {
+                return DfList{ digits: [1], at: l.at + 1 }
+            }
+            return DfList{ digits: [], at: l.at }
+        }
+    }
+    strip_zeros(l.digits)
+    try round_list(l, if fixed { max + l.at } else { max }, jd.rounded_up, jd.exact, negative, mode)
+    return l
+}
+
+/// DigitList.set for a whole number given as its decimal digits.
+fn list_of_integer(text: str, negative: bool, max: i64, mode: DfRounding) -> DfList ! DfError {
+    var d = text.codes().map(|c| c - 48)
+    let at = d.len()
+    while d.len() > 0 and d[d.len() - 1] == 0 {
+        d.pop()
+    }
+    var l = DfList{ digits: d, at: at }
+    if max > 0 {
+        try round_list(l, max, false, true, negative, mode)
+    }
+    return l
+}
+
+fn is_zero(l: DfList) -> bool {
+    return not any_nonzero(l.digits, 0)
+}
+
+// ---- writing
+
+fn digit_at(l: DfList, i: i64) -> str {
+    return if i < l.digits.len() { l.digits[i].to_str() } else { "0" }
+}
+
+fn exponential_body(p: DecimalPattern, l: DfList) -> str {
+    var exponent = l.at
+    var min_int = p.min_int
+    let repeat = p.max_int
+    if repeat > 1 and repeat > p.min_int {
+        // Engineering notation: the exponent a multiple of the repeat.
+        exponent = if exponent >= 1 { (exponent - 1) / repeat * repeat } else { (exponent - repeat) / repeat * repeat }
+        min_int = 1
+    } else {
+        exponent = exponent - min_int
+    }
+    let int_digits = if is_zero(l) { min_int } else { l.at - exponent }
+    let min_digits = (p.min_int + p.min_frac).max(int_digits)
+    let total = l.digits.len().max(min_digits)
+    var out = ""
+    for i in 0..total {
+        if i == int_digits {
+            out = out + "."
+        }
+        out = out + digit_at(l, i)
+    }
+    if p.always_point and total == int_digits {
+        out = out + "."
+    }
+    if is_zero(l) {
+        exponent = 0
+    }
+    out = out + "E" + (if exponent < 0 { "-" } else { "" })
+    return out + exponent.abs().to_str().pad_start(p.min_exp, "0")
+}
+
+fn fixed_body(p: DecimalPattern, l: DfList, integer: bool) -> str {
+    var count = p.min_int
+    var index = 0
+    if l.at > 0 and count < l.at {
+        count = l.at
+    }
+    if count > p.max_int {
+        count = p.max_int
+        index = l.at - count
+    }
+    var out = ""
+    var i = count - 1
+    while i >= 0 {
+        if i < l.at and index < l.digits.len() {
+            out = out + l.digits[index].to_str()
+            index = index + 1
+        } else {
+            out = out + "0"
+        }
+        if p.grouping and i > 0 and p.group_size != 0 and i % p.group_size == 0 {
+            out = out + ","
+        }
+        i = i - 1
+    }
+    let fraction = p.min_frac > 0 or (not integer and index < l.digits.len())
+    if not fraction and out.len() == 0 {
+        out = "0"
+    }
+    if p.always_point or fraction {
+        out = out + "."
+    }
+    for k in 0..p.max_frac {
+        if k >= p.min_frac and (integer or index >= l.digits.len()) {
+            break
+        }
+        if 0 - 1 - k > l.at - 1 {
+            out = out + "0"
+        } else if not integer and index < l.digits.len() {
+            out = out + l.digits[index].to_str()
+            index = index + 1
+        } else {
+            out = out + "0"
+        }
+    }
+    return out
+}
+
+fn subformat(p: DecimalPattern, list: DfList, negative: bool, integer: bool) -> str {
+    var l = list
+    if is_zero(l) {
+        l.at = 0
+    }
+    let body = if p.exponential { exponential_body(p, l) } else { fixed_body(p, l, integer) }
+    return if negative { p.neg_prefix + body + p.neg_suffix } else { p.pos_prefix + body + p.pos_suffix }
+}
+
+// ---- the fast path
+//
+// For `#,##0.###` and the currency pattern `¤#,##0.00`, and anything with
+// the same digit counts, Java takes a separate path for a double below
+// 2^31: it rounds the binary value itself, deciding an apparent tie by the
+// exact error of the multiplication. It does not always agree with the
+// path above -- 0.0005 is `0.001` here and `0` with `0.###` -- and it is
+// what `format` runs, so it is reproduced.
+
+fn fast_path_applies(p: DecimalPattern) -> bool {
+    let shape = match p.rounding {
+        HalfEven -> p.grouping and p.group_size == 3 and p.multiplier == 1 and not p.always_point and not p.exponential and p.min_int == 1
+        _ -> false
+    }
+    if not shape {
+        return false
+    }
+    return if p.currency { p.min_frac == 2 and p.max_frac == 2 } else { p.min_frac == 0 and p.max_frac == 3 }
+}
+
+/// The exact sign of the error in `fraction * 1000` (or `* 100`), found by
+/// splitting the multiplier into powers of two and summing without loss.
+fn exact_round_up(fraction: f64, scaled: i64, currency: bool) -> bool {
+    let big = fraction * (if currency { 128.0 } else { 1024.0 })
+    let medium = 0.0 - fraction * (if currency { 32.0 } else { 16.0 })
+    let small = if currency { fraction * 4.0 } else { 0.0 - fraction * 8.0 }
+    var approx = medium + small
+    var virtual = approx - medium
+    let s1 = approx
+    let r1 = small - virtual
+    approx = big + s1
+    virtual = approx - big
+    let r1000 = s1 - virtual
+    let a1000 = approx
+    let total = r1 + r1000
+    approx = a1000 + total
+    virtual = approx - a1000
+    let roundoff = total - virtual
+    if roundoff > 0.0 {
+        return true
+    }
+    if roundoff < 0.0 {
+        return false
+    }
+    return scaled % 2 != 0
+}
+
+fn group_thousands(n: i64) -> str {
+    let t = n.to_str()
+    var out = ""
+    var i = 0
+    while i < t.len() {
+        if i > 0 and (t.len() - i) % 3 == 0 {
+            out = out + ","
+        }
+        out = out + t.substr(i, 1)
+        i = i + 1
+    }
+    return out
+}
+
+fn fast_format(p: DecimalPattern, value: f64) -> Option[str] {
+    if value.is_nan() or value.abs() == 1.0 / 0.0 or value.abs() > 2147483647.0 {
+        return None
+    }
+    let negative = value < 0.0 or (value == 0.0 and value.to_bits() < 0)
+    let x = value.abs()
+    var whole = x.as_i64()
+    let fraction = x - whole.as_f64()
+    let scaled = fraction * (if p.currency { 100.0 } else { 1000.0 })
+    var part = scaled.as_i64()
+    let rest = scaled - part.as_f64()
+    if rest >= 0.5 and (rest > 0.5 or exact_round_up(fraction, part, p.currency)) {
+        if part < (if p.currency { 99 } else { 999 }) {
+            part = part + 1
+        } else {
+            part = 0
+            whole = whole + 1
+        }
+    }
+    let three = part.to_str().pad_start(3, "0")
+    let frac = if p.currency { "." + part.to_str().pad_start(2, "0") } else if part == 0 { "" } else if part % 10 != 0 { "." + three } else if part % 100 != 0 {
+        "." + three.substr(0, 2)
+    } else { "." + three.substr(0, 1) }
+    let body = group_thousands(whole) + frac
+    return Some(if negative { p.neg_prefix + body + p.neg_suffix } else { p.pos_prefix + body + p.pos_suffix })
+}
+
+/// `DecimalFormat.format(double)`.
+pub fn format_double(p: DecimalPattern, value: f64) -> str ! DfError {
+    if fast_path_applies(p) {
+        match fast_format(p, value) {
+            Some(t) -> return t
+            None -> {}
+        }
+    }
+    return try format_double_tracked(p, value)
+}
+
+/// The same value by the path Java takes when the caller asks for a
+/// `FieldPosition`, as `MessageFormat` and `Format.format(Object)` do: the
+/// fast path is never tried, so 0.0005 with `#,##0.###` is `0` here and
+/// `0.001` from `format_double`.
+pub fn format_double_tracked(p: DecimalPattern, value: f64) -> str ! DfError {
+    if value.is_nan() {
+        return "NaN"
+    }
+    let negative = value < 0.0 or (value == 0.0 and value.to_bits() < 0)
+    let x = (if p.multiplier != 1 { value * p.multiplier.as_f64() } else { value }).abs()
+    if x == 1.0 / 0.0 {
+        return if negative { p.neg_prefix + "∞" + p.neg_suffix } else { p.pos_prefix + "∞" + p.pos_suffix }
+    }
+    let max = if p.exponential { p.max_int + p.max_frac } else { p.max_frac }
+    let l = try list_of_double(x, negative, max, not p.exponential, p.rounding)
+    return subformat(p, l, negative, false)
+}
+
+/// `DecimalFormat.format(long)`. The multiplier is applied exactly, as
+/// Java's BigInteger path does when the product would overflow.
+pub fn format_long(p: DecimalPattern, value: i64) -> str ! DfError {
+    let negative = value < 0
+    let magnitude = if value == 0 - 9223372036854775807 - 1 { "9223372036854775808" } else { value.abs().to_str() }
+    let scaled = if value == 0 { "0" } else if p.multiplier == 100 { magnitude + "00" } else if p.multiplier == 1000 { magnitude + "000" } else { magnitude }
+    let max = if p.exponential { p.max_int + p.max_frac } else { 0 }
+    let l = try list_of_integer(if scaled == "0" { "" } else { scaled }, negative, max, p.rounding)
+    return subformat(p, l, negative, true)
+}

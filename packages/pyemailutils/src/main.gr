@@ -1,0 +1,503 @@
+// The address helpers of CPython 3.13's `email.utils`, as Python parses
+// and writes them: `parseaddr` and `getaddresses` (strict, the default
+// since 3.13, and lenient), `formataddr`, `quote` and `unquote`. (Its date
+// parser, `parsedate_tz`, is packages/rfc2822date.)
+//
+// Mail tooling in Python splits From and To headers with these, and what
+// they return decides who a message is from. A peer has to agree with
+// Python on the odd inputs too:
+//
+//   - The address parser is the rfc822 module's: comments become the real
+//     name when there is no phrase, a phrase before `<` with comments
+//     after it gets the comments appended in parentheses, groups
+//     (`team: a@x, b@y;`) are flattened, route addresses (`<@x:a@y>`)
+//     lose the route, and quoted local parts are re-quoted.
+//   - Strict mode rejects, as `('', '')`, a value whose parentheses do not
+//     balance, an address still holding `[`, and a field that yields a
+//     different number of addresses than its commas promise.
+//   - `formataddr` quotes a name holding a special character, escapes `\`
+//     and `"`, and writes a non-ASCII name as an RFC 2047 encoded word in
+//     UTF-8, base64 or Q, whichever is shorter; a non-ASCII address is
+//     Python's UnicodeEncodeError.
+
+import goencoding
+import pycharclass
+
+/// An address as parseaddr returns it.
+type PyEmailAddress = { name: str, address: str }
+
+// ---- quoting
+
+/// `email.utils.quote(s)`: backslashes and double quotes escaped.
+pub fn quote(s: str) -> str {
+    return s.replace("\\", "\\\\").replace("\"", "\\\"")
+}
+
+/// `email.utils.unquote(s)`.
+pub fn unquote(s: str) -> str {
+    let cs = s.codes()
+    if cs.len() > 1 {
+        if cs[0] == 34 and cs[cs.len() - 1] == 34 {
+            return text(cs.slice(1, cs.len() - 1)).replace("\\\\", "\\").replace("\\\"", "\"")
+        }
+        if cs[0] == 60 and cs[cs.len() - 1] == 62 {
+            return text(cs.slice(1, cs.len() - 1))
+        }
+    }
+    return s
+}
+
+fn text(cs: [i64]) -> str {
+    return cs.map(|c| c.to_char()).join("")
+}
+
+fn has(set: str, c: i64) -> bool {
+    return set.codes().contains(c)
+}
+
+/// Python's `not s.strip()`.
+fn blank(s: str) -> bool {
+    return s.codes().all(|c| pycharclass.is_space(c))
+}
+
+// ---- the rfc822 address parser
+
+type AddrParser = { field: [i64], pos: i64, comments: [str] }
+
+fn specials() -> str {
+    return "()<>@,:;.\"[]"
+}
+
+fn atomends() -> str {
+    return specials() + " \t\r\n"
+}
+
+fn phraseends() -> str {
+    return "()<>@,:;\"[] \t\r\n"
+}
+
+fn more(p: AddrParser) -> bool {
+    return p.pos < p.field.len()
+}
+
+fn cur(p: AddrParser) -> i64 {
+    return p.field[p.pos]
+}
+
+fn gotonext(inout p: AddrParser) -> str {
+    var ws = ""
+    while more(p) {
+        let c = cur(p)
+        if c == 32 or c == 9 or c == 10 or c == 13 {
+            if c == 32 or c == 9 {
+                ws = ws + c.to_char()
+            }
+            p.pos = p.pos + 1
+        } else if c == 40 {
+            let comment = getdelimited(p, 40, ")\r", true)
+            p.comments.push(comment)
+        } else {
+            break
+        }
+    }
+    return ws
+}
+
+fn getdelimited(inout p: AddrParser, begin: i64, ends: str, comments: bool) -> str {
+    if cur(p) != begin {
+        return ""
+    }
+    var out = ""
+    var quoted = false
+    p.pos = p.pos + 1
+    while more(p) {
+        let c = cur(p)
+        if quoted {
+            out = out + c.to_char()
+            quoted = false
+        } else if has(ends, c) {
+            p.pos = p.pos + 1
+            break
+        } else if comments and c == 40 {
+            out = out + getdelimited(p, 40, ")\r", true)
+            continue
+        } else if c == 92 {
+            quoted = true
+        } else {
+            out = out + c.to_char()
+        }
+        p.pos = p.pos + 1
+    }
+    return out
+}
+
+fn getatom(inout p: AddrParser, ends: str) -> str {
+    let start = p.pos
+    while more(p) and not has(ends, cur(p)) {
+        p.pos = p.pos + 1
+    }
+    return text(p.field.slice(start, p.pos))
+}
+
+fn getphraselist(inout p: AddrParser) -> [str] {
+    var plist: [str] = []
+    while more(p) {
+        let c = cur(p)
+        if c == 32 or c == 9 or c == 13 or c == 10 {
+            p.pos = p.pos + 1
+        } else if c == 34 {
+            plist.push(getdelimited(p, 34, "\"\r", false))
+        } else if c == 40 {
+            let comment = getdelimited(p, 40, ")\r", true)
+            p.comments.push(comment)
+        } else if has(phraseends(), c) {
+            break
+        } else {
+            plist.push(getatom(p, phraseends()))
+        }
+    }
+    return plist
+}
+
+fn getdomain(inout p: AddrParser) -> str {
+    var sd: [str] = []
+    while more(p) {
+        let c = cur(p)
+        if c == 32 or c == 9 {
+            p.pos = p.pos + 1
+        } else if c == 40 {
+            let comment = getdelimited(p, 40, ")\r", true)
+            p.comments.push(comment)
+        } else if c == 91 {
+            sd.push("[" + getdelimited(p, 91, "]\r", false) + "]")
+        } else if c == 46 {
+            p.pos = p.pos + 1
+            sd.push(".")
+        } else if c == 64 {
+            return ""
+        } else if has(atomends(), c) {
+            break
+        } else {
+            sd.push(getatom(p, atomends()))
+        }
+    }
+    return sd.join("")
+}
+
+fn getaddrspec(inout p: AddrParser) -> str {
+    var aslist: [str] = []
+    gotonext(p)
+    while more(p) {
+        var preserve = true
+        let c = cur(p)
+        if c == 46 {
+            if aslist.len() > 0 and blank(aslist[aslist.len() - 1]) {
+                aslist.pop()
+            }
+            aslist.push(".")
+            p.pos = p.pos + 1
+            preserve = false
+        } else if c == 34 {
+            aslist.push("\"" + quote(getdelimited(p, 34, "\"\r", false)) + "\"")
+        } else if has(atomends(), c) {
+            if aslist.len() > 0 and blank(aslist[aslist.len() - 1]) {
+                aslist.pop()
+            }
+            break
+        } else {
+            aslist.push(getatom(p, atomends()))
+        }
+        let ws = gotonext(p)
+        if preserve and ws != "" {
+            aslist.push(ws)
+        }
+    }
+    if not more(p) or cur(p) != 64 {
+        return aslist.join("")
+    }
+    p.pos = p.pos + 1
+    gotonext(p)
+    let domain = getdomain(p)
+    if domain == "" {
+        return ""
+    }
+    return aslist.join("") + "@" + domain
+}
+
+fn getrouteaddr(inout p: AddrParser) -> str {
+    var expectroute = false
+    p.pos = p.pos + 1
+    gotonext(p)
+    var adlist = ""
+    while more(p) {
+        if expectroute {
+            getdomain(p)
+            expectroute = false
+        } else if cur(p) == 62 {
+            p.pos = p.pos + 1
+            break
+        } else if cur(p) == 64 {
+            p.pos = p.pos + 1
+            expectroute = true
+        } else if cur(p) == 58 {
+            p.pos = p.pos + 1
+        } else {
+            adlist = getaddrspec(p)
+            p.pos = p.pos + 1
+            break
+        }
+        gotonext(p)
+    }
+    return adlist
+}
+
+fn getaddress(inout p: AddrParser) -> [PyEmailAddress] {
+    p.comments = []
+    gotonext(p)
+    let oldpos = p.pos
+    let plist = getphraselist(p)
+    gotonext(p)
+    var out: [PyEmailAddress] = []
+    if not more(p) {
+        if plist.len() > 0 {
+            out = [PyEmailAddress{ name: p.comments.join(" "), address: plist[0] }]
+        }
+    } else if cur(p) == 46 or cur(p) == 64 {
+        // Python restores the comment list here, but it is the same list,
+        // so the comments read so far stay and are read again.
+        p.pos = oldpos
+        let spec = getaddrspec(p)
+        out = [PyEmailAddress{ name: p.comments.join(" "), address: spec }]
+    } else if cur(p) == 58 {
+        p.pos = p.pos + 1
+        while more(p) {
+            gotonext(p)
+            if more(p) and cur(p) == 59 {
+                p.pos = p.pos + 1
+                break
+            }
+            for a in getaddress(p) {
+                out.push(a)
+            }
+        }
+    } else if cur(p) == 60 {
+        let route = getrouteaddr(p)
+        let name = if p.comments.len() > 0 { plist.join(" ") + " (" + p.comments.join(" ") + ")" } else { plist.join(" ") }
+        out = [PyEmailAddress{ name: name, address: route }]
+    } else if plist.len() > 0 {
+        out = [PyEmailAddress{ name: p.comments.join(" "), address: plist[0] }]
+    } else if has(specials(), cur(p)) {
+        p.pos = p.pos + 1
+    }
+    gotonext(p)
+    if more(p) and cur(p) == 44 {
+        p.pos = p.pos + 1
+    }
+    return out
+}
+
+/// `_AddressList(field).addresslist`.
+fn address_list(field: str) -> [PyEmailAddress] {
+    var p = AddrParser{ field: field.codes(), pos: 0, comments: [] }
+    var out: [PyEmailAddress] = []
+    while more(p) {
+        let ad = getaddress(p)
+        if ad.len() > 0 {
+            for a in ad {
+                out.push(a)
+            }
+        } else {
+            out.push(none())
+        }
+    }
+    return out
+}
+
+fn none() -> PyEmailAddress {
+    return PyEmailAddress{ name: "", address: "" }
+}
+
+// ---- strict mode's checks
+
+/// `_iter_escaped_chars`: each character, or `\` with the next, and a
+/// trailing lone `\`.
+fn escaped(cs: [i64]) -> [(i64, i64)] {
+    var out: [(i64, i64)] = []
+    var esc = false
+    var pos = 0
+    for i in 0..cs.len() {
+        pos = i
+        if esc {
+            out.push((i, 0 - 1))
+            esc = false
+        } else if cs[i] == 92 {
+            esc = true
+        } else {
+            out.push((i, cs[i]))
+        }
+    }
+    if esc {
+        out.push((pos, 92))
+    }
+    return out
+}
+
+fn strip_quoted_realnames(s: str) -> str {
+    let cs = s.codes()
+    if not cs.contains(34) {
+        return s
+    }
+    var start = 0
+    var open = 0 - 1
+    var out = ""
+    for (pos, c) in escaped(cs) {
+        if c == 34 {
+            if open < 0 {
+                open = pos
+            } else {
+                if start != open {
+                    out = out + text(cs.slice(start, open))
+                }
+                start = pos + 1
+                open = 0 - 1
+            }
+        }
+    }
+    if start < cs.len() {
+        out = out + text(cs.slice(start, cs.len()))
+    }
+    return out
+}
+
+fn parentheses_balance(s: str) -> bool {
+    var opens = 0
+    for (_pos, c) in escaped(strip_quoted_realnames(s).codes()) {
+        if c == 40 {
+            opens = opens + 1
+        } else if c == 41 {
+            opens = opens - 1
+            if opens < 0 {
+                return false
+            }
+        }
+    }
+    return opens == 0
+}
+
+fn pre_parse(v: str) -> str {
+    return if parentheses_balance(v) { v } else { "('', '')" }
+}
+
+fn post_parse(addrs: [PyEmailAddress]) -> [PyEmailAddress] {
+    return addrs.map(|a| if a.address.contains("[") { none() } else { a })
+}
+
+/// `email.utils.parseaddr(addr, strict=strict)`.
+pub fn parseaddr(addr: str, strict: bool) -> PyEmailAddress {
+    if not strict {
+        let all = address_list(addr)
+        return if all.len() == 0 { none() } else { all[0] }
+    }
+    let addrs = post_parse(address_list(pre_parse(addr)))
+    if addrs.len() != 1 {
+        return none()
+    }
+    return addrs[0]
+}
+
+/// `email.utils.getaddresses(fields, strict=strict)`.
+pub fn getaddresses(fields: [str], strict: bool) -> [PyEmailAddress] {
+    if not strict {
+        return address_list(fields.join(", "))
+    }
+    let checked = fields.map(|v| pre_parse(v))
+    let result = post_parse(address_list(checked.join(", ")))
+    var n = 0
+    for v in checked {
+        n = n + 1 + strip_quoted_realnames(v).codes().filter(|c| c == 44).len()
+    }
+    if result.len() != n {
+        return [none()]
+    }
+    return result
+}
+
+// ---- formataddr
+
+/// Python's UnicodeEncodeError for `s.encode('ascii')`, if there is one.
+fn ascii_error(s: str) -> Option[str] {
+    let cs = s.codes()
+    for i in 0..cs.len() {
+        if cs[i] > 127 {
+            var j = i
+            while j < cs.len() and cs[j] > 127 {
+                j = j + 1
+            }
+            let what = if j - i == 1 { "character " + py_char_repr(cs[i]) + " in position " + i.to_str() } else {
+                "characters in position " + i.to_str() + "-" + (j - 1).to_str()
+            }
+            return Some("'ascii' codec can't encode " + what + ": ordinal not in range(128)")
+        }
+    }
+    return None
+}
+
+fn hex_width(n: i64, width: i64) -> str {
+    let d = "0123456789abcdef"
+    var out = ""
+    var v = n
+    for _k in 0..width {
+        out = d.substr(v.bit_and(15), 1) + out
+        v = v.shr(4)
+    }
+    return out
+}
+
+/// How UnicodeEncodeError names one character: always escaped.
+fn py_char_repr(c: i64) -> str {
+    if c < 256 {
+        return "'\\x" + hex_width(c, 2) + "'"
+    }
+    return if c < 65536 { "'\\u" + hex_width(c, 4) + "'" } else { "'\\U" + hex_width(c, 8) + "'" }
+}
+
+fn header_safe(b: i64) -> bool {
+    return (b >= 48 and b <= 57) or (b >= 65 and b <= 90) or (b >= 97 and b <= 122) or b == 45 or b == 33 or b == 42 or b == 43 or b == 47
+}
+
+/// `Charset('utf-8').header_encode(name)`: base64 or Q, whichever is
+/// shorter, Q on a tie.
+fn encoded_word(name: str) -> str {
+    let b = name.to_bytes().to_list()
+    let len64 = (b.len() + 2) / 3 * 4
+    var lenqp = 0
+    for x in b {
+        lenqp = lenqp + if header_safe(x) or x == 32 { 1 } else { 3 }
+    }
+    if len64 < lenqp {
+        return "=?utf-8?b?" + goencoding.base64_encode(goencoding.std_encoding(), name.to_bytes()) + "?="
+    }
+    let d = "0123456789ABCDEF"
+    var out = ""
+    for x in b {
+        out = out + if header_safe(x) { x.to_char() } else if x == 32 { "_" } else { "=" + d.substr(x.shr(4), 1) + d.substr(x.bit_and(15), 1) }
+    }
+    return "=?utf-8?q?" + out + "?="
+}
+
+/// `email.utils.formataddr((name, address))`; the error is Python's
+/// UnicodeEncodeError text for a non-ASCII address.
+pub fn formataddr(name: str, address: str) -> str ! str {
+    match ascii_error(address) {
+        Some(e) -> fail(e)
+        None -> ()
+    }
+    if name == "" {
+        return address
+    }
+    if ascii_error(name).is_some() {
+        return encoded_word(name) + " <" + address + ">"
+    }
+    let quotes = if name.codes().any(|c| has("[]\\()<>@,:;\".", c)) { "\"" } else { "" }
+    return quotes + quote(name) + quotes + " <" + address + ">"
+}

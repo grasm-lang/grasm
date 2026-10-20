@@ -2149,6 +2149,46 @@ fn a_literal_shift_count_outside_the_width_is_linted_but_still_runs() {
     );
 }
 
+/// An import used only for a type it declares is used. Types are never
+/// written qualified ([G-TYPE-NOT-QUALIFIED]), so the file names the package
+/// nowhere -- and deleting the import, as `unused-import` advised, stops it
+/// compiling. An import named by nothing is still reported.
+#[test]
+fn an_import_used_only_for_its_types_is_not_unused() {
+    let work = Work::new("typeimport");
+    work.package(
+        "shapes",
+        "[package]\nname = \"shapes\"\nversion = \"1.0.0\"\ncapabilities = []\n",
+        "type Shape = | Circle(r: f64) | Square(s: f64)\n\npub fn unit() -> f64 {\n    1.0\n}\n",
+    );
+    work.package(
+        "spare",
+        "[package]\nname = \"spare\"\nversion = \"1.0.0\"\ncapabilities = []\n",
+        "pub fn two() -> i64 {\n    2\n}\n",
+    );
+    let deps = "[package]\nname = \"app\"\nversion = \"1.0.0\"\ncapabilities = [\"io\"]\n\n\
+                [dependencies.shapes]\npath = \"../shapes\"\n\n[dependencies.spare]\npath = \"../spare\"\n";
+    let app = work.package(
+        "app",
+        deps,
+        "import shapes\nimport spare\n\nfn area(s: Shape) -> f64 {\n    return match s {\n        \
+         Circle(r) -> 3.0 * r * r\n        Square(x) -> x * x\n    }\n}\n\n\
+         fn main() {\n    print(area(Square(2.0)).to_str())\n}\n",
+    );
+    let src = app_entry(&app);
+    let (_, out) = run(&["lint", &src, "--only", "unused-import"]);
+    assert!(
+        !out.contains("`shapes`"),
+        "an import used for its type was called unused:\n{out}"
+    );
+    assert!(
+        out.contains("import `spare` is never read"),
+        "an import nothing names was not reported:\n{out}"
+    );
+    let (code, out) = run(&["check", &src]);
+    assert_eq!(code, 0, "the program must check as written:\n{out}");
+}
+
 /// Writing into a `bytes` ([L-LIB-BYTES-WRITE]), and the value semantics that
 /// make it safe to.
 ///

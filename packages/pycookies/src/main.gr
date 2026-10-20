@@ -1,0 +1,482 @@
+// Python's `http.cookies`, as CPython 3.13 reads and writes cookies:
+// `SimpleCookie.load`, setting a value and an attribute, `output`, and
+// the `_quote` and `_unquote` rules under them.
+//
+// Python web code (WSGI apps, test clients, scrapers) reads Cookie
+// headers through this module and writes Set-Cookie with it, and it is
+// looser and odder than RFC 6265 in ways a peer has to match:
+//
+//   - The parser is one regular expression, matched again and again: a
+//     key of `\w` and punctuation (`=` and `,` included), an optional
+//     value -- a quoted string, an `expires`-style date, or a run of
+//     value characters -- and then whitespace, `;` or the end. Its
+//     backtracking decides where a value stops: `a= "x` gives `a` an
+//     empty value, and `a=b c=d` is two cookies.
+//   - `$Path`-style attributes before the first cookie are ignored; an
+//     attribute name before it, or a bare word that is not a flag,
+//     abandons the whole header. The cookies read so far are applied in
+//     order, and an attribute Morsel does not know, or a key with a
+//     character outside the legal set, raises CookieError part way --
+//     what was applied stays.
+//   - Values come back unquoted (`\"`, `\\`, and three-digit octal
+//     escapes); a value set from Python is quoted when it holds anything
+//     but the legal characters, with octal escapes for the rest of
+//     ASCII and Latin-1.
+//   - `output` sorts cookies by key and attributes by name, writes
+//     `Secure` and `HttpOnly` as bare flags when truthy, quotes a
+//     comment, and writes an attribute set to None as `Path=None`.
+
+import pycharclass
+
+/// An attribute's value: a string, a bare flag, or None.
+type CookieAttr = | AttrText(text: str) | AttrFlag | AttrNone
+
+/// A Morsel: the key, the value, the value as written, and the attributes
+/// that are set, by their lower-case names.
+type Morsel = { key: str, value: str, coded: str, attrs: [(str, CookieAttr)] }
+
+type SimpleCookie = { morsels: [Morsel] }
+
+/// CookieError with Python's message, or the KeyError for an attribute set
+/// on a cookie that is not there (its text being the key's repr).
+type CookieError = | CookieError(msg: str) | CookieKeyError(msg: str)
+
+pub fn error_text(e: CookieError) -> str {
+    return match e {
+        CookieError(m) -> m
+        CookieKeyError(m) -> m
+    }
+}
+
+pub fn new_cookie() -> SimpleCookie {
+    return SimpleCookie{ morsels: [] }
+}
+
+fn reserved() -> [str] {
+    return ["expires", "path", "comment", "domain", "max-age", "secure", "httponly", "version", "samesite"]
+}
+
+fn reserved_name(k: str) -> str {
+    let names = ["expires", "Path", "Comment", "Domain", "Max-Age", "Secure", "HttpOnly", "Version", "SameSite"]
+    let all = reserved()
+    for i in 0..all.len() {
+        if all[i] == k {
+            return names[i]
+        }
+    }
+    return k
+}
+
+fn text(cs: [i64]) -> str {
+    return cs.map(|c| c.to_char()).join("")
+}
+
+fn lowered(s: str) -> str {
+    return s.to_lower()
+}
+
+fn has(set: str, c: i64) -> bool {
+    return set.codes().contains(c)
+}
+
+// ---- quoting
+
+fn legal_char(c: i64) -> bool {
+    return (c >= 65 and c <= 90) or (c >= 97 and c <= 122) or (c >= 48 and c <= 57) or has("!#$%&'*+-.^_`|~:", c)
+}
+
+fn is_legal_key(s: str) -> bool {
+    let cs = s.codes()
+    return cs.len() > 0 and cs.all(|c| legal_char(c))
+}
+
+fn octal3(n: i64) -> str {
+    return (n / 64).to_str() + (n / 8 % 8).to_str() + (n % 8).to_str()
+}
+
+/// `http.cookies._quote(s)`.
+pub fn quote(s: str) -> str {
+    if is_legal_key(s) {
+        return s
+    }
+    var out = "\""
+    for c in s.codes() {
+        out = out + if c == 34 { "\\\"" } else if c == 92 { "\\\\" } else if legal_char(c) or has(" ()/<=>?@[]\{}", c) or c >= 256 { c.to_char() } else {
+            "\\" + octal3(c)
+        }
+    }
+    return out + "\""
+}
+
+/// `http.cookies._unquote(s)`.
+pub fn unquote(s: str) -> str {
+    let cs = s.codes()
+    if cs.len() < 2 or cs[0] != 34 or cs[cs.len() - 1] != 34 {
+        return s
+    }
+    let body = cs.slice(1, cs.len() - 1)
+    var out = ""
+    var i = 0
+    while i < body.len() {
+        if body[i] == 92 and i + 1 < body.len() {
+            let n = body.len()
+            if i + 3 < n and body[i + 1] >= 48 and body[i + 1] <= 51 and body[i + 2] >= 48 and body[i + 2] <= 55 and body[i + 3] >= 48 and body[i + 3] <= 55 {
+                out = out + ((body[i + 1] - 48) * 64 + (body[i + 2] - 48) * 8 + body[i + 3] - 48).to_char()
+                i = i + 4
+                continue
+            }
+            if body[i + 1] != 10 {
+                out = out + body[i + 1].to_char()
+                i = i + 2
+                continue
+            }
+        }
+        out = out + body[i].to_char()
+        i = i + 1
+    }
+    return out
+}
+
+/// Python's `repr` of a string.
+fn py_repr(s: str) -> str {
+    let cs = s.codes()
+    let q = if cs.contains(39) and not cs.contains(34) { 34 } else { 39 }
+    var out = q.to_char()
+    for c in cs {
+        out = out + if c == q or c == 92 { "\\" + c.to_char() } else if c == 9 { "\\t" } else if c == 10 { "\\n" } else if c == 13 { "\\r" } else if c < 32 or c == 127 {
+            "\\x" + hex(c, 2)
+        } else if c < 128 or pycharclass.is_printable(c) { c.to_char() } else if c < 256 { "\\x" + hex(c, 2) } else if c < 65536 { "\\u" + hex(c, 4) } else {
+            "\\U" + hex(c, 8)
+        }
+    }
+    return out + q.to_char()
+}
+
+fn hex(n: i64, width: i64) -> str {
+    let d = "0123456789abcdef"
+    var out = ""
+    var v = n
+    for _k in 0..width {
+        out = d.substr(v.bit_and(15), 1) + out
+        v = v.shr(4)
+    }
+    return out
+}
+
+// ---- the cookie pattern
+
+fn ws(c: i64) -> bool {
+    return c == 32 or (c >= 9 and c <= 13)
+}
+
+fn word(c: i64) -> bool {
+    return (c >= 65 and c <= 90) or (c >= 97 and c <= 122) or (c >= 48 and c <= 57) or c == 95
+}
+
+fn key_char(c: i64) -> bool {
+    return word(c) or has("!#%&'~_`><@,:/$*+-.^|)(?}\{=", c)
+}
+
+fn value_char(c: i64) -> bool {
+    return key_char(c) or c == 91 or c == 93
+}
+
+fn skip_ws(cs: [i64], i: i64) -> i64 {
+    var j = i
+    while j < cs.len() and ws(cs[j]) {
+        j = j + 1
+    }
+    return j
+}
+
+/// `\s*(\s+|;|$)` from `at`: where the match ends, or -1.
+fn terminator(cs: [i64], at: i64) -> i64 {
+    let j = skip_ws(cs, at)
+    if j < cs.len() and cs[j] == 59 {
+        return j + 1
+    }
+    if j == cs.len() or j > at {
+        return j
+    }
+    return 0 - 1
+}
+
+/// The end of a quoted string starting at `at`, or -1.
+fn quoted_end(cs: [i64], at: i64) -> i64 {
+    if at >= cs.len() or cs[at] != 34 {
+        return 0 - 1
+    }
+    var j = at + 1
+    while j < cs.len() {
+        if cs[j] == 34 {
+            return j + 1
+        }
+        if cs[j] == 92 {
+            if j + 1 < cs.len() and cs[j + 1] != 10 {
+                j = j + 2
+                continue
+            }
+            return 0 - 1
+        }
+        j = j + 1
+    }
+    return 0 - 1
+}
+
+/// The ends `\w{3},\s[\w\d\s-]{9,11}\s[\d:]{8}\sGMT` can match from `at`,
+/// longest first.
+fn expires_ends(cs: [i64], at: i64) -> [i64] {
+    var out: [i64] = []
+    let n = cs.len()
+    if at + 5 > n or not (word(cs[at]) and word(cs[at + 1]) and word(cs[at + 2]) and cs[at + 3] == 44 and ws(cs[at + 4])) {
+        return out
+    }
+    var run = 0
+    while run < 11 and at + 5 + run < n and (word(cs[at + 5 + run]) or ws(cs[at + 5 + run]) or cs[at + 5 + run] == 45) {
+        run = run + 1
+    }
+    var k = run
+    while k >= 9 {
+        let p = at + 5 + k
+        if p + 13 <= n and ws(cs[p]) and cs.slice(p + 1, p + 9).all(|c| (c >= 48 and c <= 57) or c == 58) and ws(cs[p + 9]) and cs[p + 10] == 71 and
+        cs[p + 11] == 77 and cs[p + 12] == 84 {
+            out.push(p + 13)
+        }
+        k = k - 1
+    }
+    return out
+}
+
+/// The value alternatives from `at`, in the order the pattern tries them:
+/// the end of the value and of the whole match, or None.
+fn value_at(cs: [i64], at: i64) -> Option[(i64, i64)] {
+    let q = quoted_end(cs, at)
+    if q >= 0 {
+        let t = terminator(cs, q)
+        if t >= 0 {
+            return Some((q, t))
+        }
+    }
+    for e in expires_ends(cs, at) {
+        let t = terminator(cs, e)
+        if t >= 0 {
+            return Some((e, t))
+        }
+    }
+    var run = at
+    while run < cs.len() and value_char(cs[run]) {
+        run = run + 1
+    }
+    var e = run
+    while e >= at {
+        let t = terminator(cs, e)
+        if t >= 0 {
+            return Some((e, t))
+        }
+        e = e - 1
+    }
+    return None
+}
+
+/// One match of the cookie pattern at `i`: key, value (None when there
+/// is no `=`), and where the match ends.
+fn match_at(cs: [i64], i: i64) -> Option[(str, Option[str], i64)] {
+    let start = skip_ws(cs, i)
+    var key_end = start + 1
+    while key_end <= cs.len() and key_char(cs[key_end - 1]) {
+        let key = text(cs.slice(start, key_end))
+        let eq = skip_ws(cs, key_end)
+        if eq < cs.len() and cs[eq] == 61 {
+            // The second \s* gives back whitespace one character at a time.
+            var v = skip_ws(cs, eq + 1)
+            while v >= eq + 1 {
+                match value_at(cs, v) {
+                    Some((ve, end)) -> return Some((key, Some(text(cs.slice(v, ve))), end))
+                    None -> {}
+                }
+                v = v - 1
+            }
+        }
+        let t = terminator(cs, key_end)
+        if t >= 0 {
+            return Some((key, None, t))
+        }
+        key_end = key_end + 1
+    }
+    return None
+}
+
+// ---- cookies and morsels
+
+fn find(c: SimpleCookie, key: str) -> i64 {
+    for i in 0..c.morsels.len() {
+        if c.morsels[i].key == key {
+            return i
+        }
+    }
+    return 0 - 1
+}
+
+/// `BaseCookie.__set`: the morsel for the key, made if new, takes the
+/// value; its attributes stay.
+fn set_morsel(inout c: SimpleCookie, key: str, value: str, coded: str) -> () ! CookieError {
+    if reserved().contains(lowered(key)) {
+        fail(CookieError("Attempt to set a reserved key " + py_repr(key)))
+    }
+    if not is_legal_key(key) {
+        fail(CookieError("Illegal key " + py_repr(key)))
+    }
+    let at = find(c, key)
+    if at < 0 {
+        c.morsels.push(Morsel{ key: key, value: value, coded: coded, attrs: [] })
+    } else {
+        c.morsels[at] = Morsel{ key: key, value: value, coded: coded, attrs: c.morsels[at].attrs }
+    }
+    return ()
+}
+
+fn set_attr(inout m: Morsel, name: str, value: CookieAttr) -> () ! CookieError {
+    let k = lowered(name)
+    if not reserved().contains(k) {
+        fail(CookieError("Invalid attribute " + py_repr(k)))
+    }
+    var attrs = m.attrs.filter(|a| a.0 != k)
+    attrs.push((k, value))
+    m.attrs = attrs
+    return ()
+}
+
+/// `cookie[key] = value`.
+pub fn set(inout c: SimpleCookie, key: str, value: str) -> () ! CookieError {
+    try set_morsel(c, key, value, quote(value))
+    return ()
+}
+
+/// `cookie[key][attribute] = value` for a key already set; None is
+/// Python's None. (Python's `True` is left out: on `expires` it writes the
+/// current time.)
+pub fn set_attribute(inout c: SimpleCookie, key: str, name: str, value: Option[str]) -> () ! CookieError {
+    let at = find(c, key)
+    if at < 0 {
+        fail(CookieKeyError(py_repr(key)))
+    }
+    var m = c.morsels[at]
+    try set_attr(m, name, match value {
+        Some(t) -> AttrText(t)
+        None -> AttrNone
+    })
+    c.morsels[at] = m
+    return ()
+}
+
+type CookieItem = | PAttr(name: str, value: CookieAttr) | PPair(key: str, value: str, coded: str)
+
+/// What `__parse_string` collects before applying it, or None where it
+/// gives up on the whole header.
+fn parse_items(s: str) -> Option[[CookieItem]] {
+    let cs = s.codes()
+    var items: [CookieItem] = []
+    var seen = false
+    var i = 0
+    while i < cs.len() {
+        let (key, value, end) = match match_at(cs, i) {
+            Some(m) -> m
+            None -> break
+        }
+        i = end
+        let k = lowered(key)
+        if key.starts_with("$") {
+            if seen {
+                items.push(PAttr(text(key.codes().slice(1, key.codes().len())), match value {
+                    Some(v) -> AttrText(v)
+                    None -> AttrNone
+                }))
+            }
+        } else if reserved().contains(k) {
+            if not seen {
+                return None
+            }
+            match value {
+                Some(v) -> items.push(PAttr(key, AttrText(unquote(v))))
+                None -> if k == "secure" or k == "httponly" { items.push(PAttr(key, AttrFlag)) } else {
+                    return None
+                }
+            }
+        } else {
+            match value {
+                Some(v) -> {
+                    items.push(PPair(key, unquote(v), v))
+                    seen = true
+                }
+                None -> return None
+            }
+        }
+    }
+    return Some(items)
+}
+
+/// `cookie.load(header)`. On an error, what was applied before it stays.
+pub fn load(inout c: SimpleCookie, s: str) -> () ! CookieError {
+    let items = parse_items(s) ?? []
+    var current = 0 - 1
+    for it in items {
+        match it {
+            PPair(key, value, coded) -> {
+                try set_morsel(c, key, value, coded)
+                current = find(c, key)
+            }
+            PAttr(name, value) -> {
+                var m = c.morsels[current]
+                try set_attr(m, name, value)
+                c.morsels[current] = m
+            }
+        }
+    }
+    return ()
+}
+
+fn sorted_strs(xs: [str]) -> [str] {
+    var out = xs
+    var i = 1
+    while i < out.len() {
+        var j = i
+        while j > 0 and out[j - 1] > out[j] {
+            let t = out[j - 1]
+            out[j - 1] = out[j]
+            out[j] = t
+            j = j - 1
+        }
+        i = i + 1
+    }
+    return out
+}
+
+/// `morsel.OutputString()`.
+pub fn morsel_string(m: Morsel) -> str {
+    var parts = [m.key + "=" + m.coded]
+    for name in sorted_strs(m.attrs.map(|a| a.0)) {
+        let value = m.attrs.filter(|a| a.0 == name)[0].1
+        let shown = reserved_name(name)
+        match value {
+            AttrText(t) -> if t != "" {
+                parts.push(if name == "secure" or name == "httponly" { shown } else if name == "comment" { shown + "=" + quote(t) } else { shown + "=" + t })
+            }
+            AttrFlag -> parts.push(shown)
+            AttrNone -> if name != "secure" and name != "httponly" {
+                parts.push(shown + "=None")
+            }
+        }
+    }
+    return parts.join("; ")
+}
+
+/// `cookie.output()`: one `Set-Cookie:` line per cookie, by key.
+pub fn output(c: SimpleCookie) -> str {
+    let keys = sorted_strs(c.morsels.map(|m| m.key))
+    return keys.map(|k| "Set-Cookie: " + morsel_string(c.morsels[find(c, k)])).join("\r\n")
+}
+
+/// The cookies' keys and values, by key.
+pub fn values(c: SimpleCookie) -> [(str, str)] {
+    return sorted_strs(c.morsels.map(|m| m.key)).map(|k| (k, c.morsels[find(c, k)].value))
+}

@@ -1,0 +1,674 @@
+// Go's `net/netip`: IP addresses, prefixes and address-port pairs, parsed
+// and printed exactly as Go 1.25 does, error messages included.
+//
+// Go servers log, configure and compare addresses through this package,
+// and it is strict where other parsers are lenient: `010.1.1.1` is refused
+// for its leading zero (`inet_aton` reads it as octal 8), `1.2.3` is too
+// short rather than `1.2.0.3`, a zone needs a non-empty name, and
+// `::ffff:1.2.3.4` stays an IPv6 address that only `unmap` turns into
+// `1.2.3.4`. Printing follows RFC 5952 the way Go applies it: the leftmost
+// longest run of two or more zero groups becomes `::`, a single zero group
+// stays `0`, and a mapped IPv4 address prints with its dots.
+//
+// Two of Go's corners are kept rather than smoothed: an address compares
+// equal to the unspecified address only without a zone, so `::%eth0` is
+// not unspecified and counts as global unicast; and `contains` refuses any
+// address with a zone.
+
+import goquote
+
+/// An address: kind 0 (the invalid zero value), 4 or 6; 128 bits in two
+/// halves, an IPv4 address held as `::ffff:a.b.c.d` as Go holds it.
+type NetAddr = { kind: i64, hi: i64, lo: i64, zone: str }
+
+type NetPrefix = { addr: NetAddr, bits_plus_one: i64 }
+
+type NetAddrPort = { addr: NetAddr, port: i64 }
+
+/// The text of Go's error, whole.
+type NetipError = | NetipFailed(text: str)
+
+fn q(s: str) -> str {
+    return goquote.quote(s.to_bytes())
+}
+
+fn addr_error(input: str, msg: str, at: str) -> NetipError {
+    return NetipFailed("ParseAddr(" + q(input) + "): " + msg + (if at.len() > 0 { " (at " + q(at) + ")" } else { "" }))
+}
+
+pub fn invalid() -> NetAddr {
+    return NetAddr{ kind: 0, hi: 0, lo: 0, zone: "" }
+}
+
+fn from4(a: [i64]) -> NetAddr {
+    return NetAddr{ kind: 4, hi: 0, lo: 281470681743360.bit_or(a[0].shl(24)).bit_or(a[1].shl(16)).bit_or(a[2].shl(8)).bit_or(a[3]), zone: "" }
+}
+
+fn from16(b: [i64]) -> NetAddr {
+    var hi = 0
+    var lo = 0
+    for i in 0..8 {
+        hi = hi.shl(8).bit_or(b[i])
+        lo = lo.shl(8).bit_or(b[i + 8])
+    }
+    return NetAddr{ kind: 6, hi: hi, lo: lo, zone: "" }
+}
+
+fn substr_bytes(s: [i64], a: i64, b: i64) -> str {
+    return bytes_of(s.slice(a, b)).to_str()
+}
+
+// ---- parsing
+
+fn ipv4_fields(input: str, s: [i64]) -> [i64] ! NetipError {
+    var fields: [i64] = []
+    var val = 0
+    var digits = 0
+    for i in 0..s.len() {
+        let c = s[i]
+        if c >= 48 and c <= 57 {
+            if digits == 1 and val == 0 {
+                fail(addr_error(input, "IPv4 field has octet with leading zero", ""))
+            }
+            val = val * 10 + c - 48
+            digits = digits + 1
+            if val > 255 {
+                fail(addr_error(input, "IPv4 field has value >255", ""))
+            }
+        } else if c == 46 {
+            if i == 0 or i == s.len() - 1 or s[i - 1] == 46 {
+                fail(addr_error(input, "IPv4 field must have at least one digit", substr_bytes(s, i, s.len())))
+            }
+            if fields.len() == 3 {
+                fail(addr_error(input, "IPv4 address too long", ""))
+            }
+            fields.push(val)
+            val = 0
+            digits = 0
+        } else {
+            fail(addr_error(input, "unexpected character", substr_bytes(s, i, s.len())))
+        }
+    }
+    if fields.len() < 3 {
+        fail(addr_error(input, "IPv4 address too short", ""))
+    }
+    fields.push(val)
+    return fields
+}
+
+fn hex_digit(c: i64) -> i64 {
+    return if c >= 48 and c <= 57 { c - 48 } else if c >= 97 and c <= 102 { c - 87 } else if c >= 65 and c <= 70 { c - 55 } else { 0 - 1 }
+}
+
+/// One step of parseIPv6: a group at the front of `s`, or the embedded
+/// IPv4 address that ends it. Answers the bytes it fills and how much of
+/// `s` it used, -1 for "the IPv4 tail, done".
+fn ipv6_group(input: str, s: [i64], at: i64, filled: i64, ellipsis: i64, inout ip: [i64]) -> i64 ! NetipError {
+    var off = 0
+    var acc = 0
+    while at + off < s.len() {
+        let d = hex_digit(s[at + off])
+        if d < 0 {
+            break
+        }
+        acc = acc * 16 + d
+        if off > 3 {
+            fail(addr_error(input, "each group must have 4 or less digits", substr_bytes(s, at, s.len())))
+        }
+        off = off + 1
+    }
+    if off == 0 {
+        fail(addr_error(input, "each colon-separated field must have at least one digit", substr_bytes(s, at, s.len())))
+    }
+    if at + off < s.len() and s[at + off] == 46 {
+        if ellipsis < 0 and filled != 12 {
+            fail(addr_error(input, "embedded IPv4 address must replace the final 2 fields of the address", substr_bytes(s, at, s.len())))
+        }
+        if filled + 4 > 16 {
+            fail(addr_error(input, "too many hex fields to fit an embedded IPv4 at the end of the address", substr_bytes(s, at, s.len())))
+        }
+        let v4 = try ipv4_fields(input, s.slice(at, s.len()))
+        for k in 0..4 {
+            ip[filled + k] = v4[k]
+        }
+        return 0 - 1
+    }
+    ip[filled] = acc.ushr(8)
+    ip[filled + 1] = acc.bit_and(255)
+    return off
+}
+
+fn parse_ipv6(input: str) -> NetAddr ! NetipError {
+    var whole = input.to_bytes().to_list()
+    var zone = ""
+    var zi = 0 - 1
+    for k in 0..whole.len() {
+        if zi < 0 and whole[k] == 37 {
+            zi = k
+        }
+    }
+    if zi >= 0 {
+        zone = substr_bytes(whole, zi + 1, whole.len())
+        whole = whole.slice(0, zi)
+        if zone.len() == 0 {
+            fail(addr_error(input, "zone must be a non-empty string", ""))
+        }
+    }
+    let s = whole
+    var ip: [i64] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    var ellipsis = 0 - 1
+    var at = 0
+    if s.len() >= 2 and s[0] == 58 and s[1] == 58 {
+        ellipsis = 0
+        at = 2
+        if at == s.len() {
+            return with_zone(from16(ip), zone)
+        }
+    }
+    var i = 0
+    while i < 16 {
+        let used = try ipv6_group(input, s, at, i, ellipsis, ip)
+        if used < 0 {
+            at = s.len()
+            i = i + 4
+            break
+        }
+        i = i + 2
+        at = at + used
+        if at == s.len() {
+            break
+        }
+        if s[at] != 58 {
+            fail(addr_error(input, "unexpected character, want colon", substr_bytes(s, at, s.len())))
+        }
+        if at + 1 == s.len() {
+            fail(addr_error(input, "colon must be followed by more characters", substr_bytes(s, at, s.len())))
+        }
+        at = at + 1
+        if s[at] == 58 {
+            if ellipsis >= 0 {
+                fail(addr_error(input, "multiple :: in address", substr_bytes(s, at, s.len())))
+            }
+            ellipsis = i
+            at = at + 1
+            if at == s.len() {
+                break
+            }
+        }
+    }
+    if at != s.len() {
+        fail(addr_error(input, "trailing garbage after address", substr_bytes(s, at, s.len())))
+    }
+    if i < 16 {
+        if ellipsis < 0 {
+            fail(addr_error(input, "address string too short", ""))
+        }
+        let n = 16 - i
+        var j = i - 1
+        while j >= ellipsis {
+            ip[j + n] = ip[j]
+            j = j - 1
+        }
+        for k in ellipsis..(ellipsis + n) {
+            ip[k] = 0
+        }
+    } else if ellipsis >= 0 {
+        fail(addr_error(input, "the :: must expand to at least one field of zeros", ""))
+    }
+    return with_zone(from16(ip), zone)
+}
+
+/// `ParseAddr(s)`.
+pub fn parse_addr(s: str) -> NetAddr ! NetipError {
+    for c in s.to_bytes().to_list() {
+        if c == 46 {
+            return from4(try ipv4_fields(s, s.to_bytes().to_list()))
+        }
+        if c == 58 {
+            return try parse_ipv6(s)
+        }
+        if c == 37 {
+            fail(addr_error(s, "missing IPv6 address", ""))
+        }
+    }
+    fail(addr_error(s, "unable to parse IP", ""))
+}
+
+// ---- the address
+
+pub fn is4(a: NetAddr) -> bool {
+    return a.kind == 4
+}
+
+pub fn is6(a: NetAddr) -> bool {
+    return a.kind == 6
+}
+
+pub fn is_valid(a: NetAddr) -> bool {
+    return a.kind != 0
+}
+
+pub fn is4in6(a: NetAddr) -> bool {
+    return a.kind == 6 and a.hi == 0 and a.lo.ushr(32) == 65535
+}
+
+pub fn bit_len(a: NetAddr) -> i64 {
+    return if a.kind == 0 { 0 } else if a.kind == 4 { 32 } else { 128 }
+}
+
+pub fn zone(a: NetAddr) -> str {
+    return a.zone
+}
+
+/// `WithZone`: only an IPv6 address carries one.
+pub fn with_zone(a: NetAddr, z: str) -> NetAddr {
+    if a.kind != 6 {
+        return a
+    }
+    return NetAddr{ kind: 6, hi: a.hi, lo: a.lo, zone: z }
+}
+
+pub fn unmap(a: NetAddr) -> NetAddr {
+    if is4in6(a) {
+        return NetAddr{ kind: 4, hi: a.hi, lo: a.lo, zone: "" }
+    }
+    return a
+}
+
+fn v4(a: NetAddr, i: i64) -> i64 {
+    return a.lo.ushr(24 - 8 * i).bit_and(255)
+}
+
+fn v6u16(a: NetAddr, i: i64) -> i64 {
+    let half = if i < 4 { a.hi } else { a.lo }
+    return half.ushr(48 - 16 * (i % 4)).bit_and(65535)
+}
+
+fn same(a: NetAddr, b: NetAddr) -> bool {
+    return a.kind == b.kind and a.hi == b.hi and a.lo == b.lo and a.zone == b.zone
+}
+
+fn ult(a: i64, b: i64) -> bool {
+    return a.bit_xor(1.shl(63)) < b.bit_xor(1.shl(63))
+}
+
+/// `Compare`: by length, then value, then zone.
+pub fn compare(a: NetAddr, b: NetAddr) -> i64 {
+    if bit_len(a) != bit_len(b) {
+        return if bit_len(a) < bit_len(b) { 0 - 1 } else { 1 }
+    }
+    if a.hi != b.hi {
+        return if ult(a.hi, b.hi) { 0 - 1 } else { 1 }
+    }
+    if a.lo != b.lo {
+        return if ult(a.lo, b.lo) { 0 - 1 } else { 1 }
+    }
+    if a.kind == 6 and a.zone != b.zone {
+        return if a.zone < b.zone { 0 - 1 } else { 1 }
+    }
+    return 0
+}
+
+fn v4_view(a: NetAddr) -> NetAddr {
+    return if is4in6(a) { unmap(a) } else { a }
+}
+
+pub fn is_loopback(a0: NetAddr) -> bool {
+    let a = v4_view(a0)
+    return if a.kind == 4 { v4(a, 0) == 127 } else { a.kind == 6 and a.hi == 0 and a.lo == 1 }
+}
+
+pub fn is_multicast(a0: NetAddr) -> bool {
+    let a = v4_view(a0)
+    return if a.kind == 4 { v4(a, 0).bit_and(240) == 224 } else { a.kind == 6 and a.hi.ushr(56) == 255 }
+}
+
+pub fn is_link_local_unicast(a0: NetAddr) -> bool {
+    let a = v4_view(a0)
+    return if a.kind == 4 { v4(a, 0) == 169 and v4(a, 1) == 254 } else { a.kind == 6 and v6u16(a, 0).bit_and(65472) == 65152 }
+}
+
+pub fn is_link_local_multicast(a0: NetAddr) -> bool {
+    let a = v4_view(a0)
+    return if a.kind == 4 { v4(a, 0) == 224 and v4(a, 1) == 0 and v4(a, 2) == 0 } else { a.kind == 6 and v6u16(a, 0).bit_and(65295) == 65282 }
+}
+
+pub fn is_interface_local_multicast(a: NetAddr) -> bool {
+    return a.kind == 6 and not is4in6(a) and v6u16(a, 0).bit_and(65295) == 65281
+}
+
+pub fn is_private(a0: NetAddr) -> bool {
+    let a = v4_view(a0)
+    if a.kind == 4 {
+        return v4(a, 0) == 10 or (v4(a, 0) == 172 and v4(a, 1).bit_and(240) == 16) or (v4(a, 0) == 192 and v4(a, 1) == 168)
+    }
+    return a.kind == 6 and a.hi.ushr(56).bit_and(254) == 252
+}
+
+fn unspecified6() -> NetAddr {
+    return NetAddr{ kind: 6, hi: 0, lo: 0, zone: "" }
+}
+
+fn unspecified4() -> NetAddr {
+    return NetAddr{ kind: 4, hi: 0, lo: 281470681743360, zone: "" }
+}
+
+/// `IsUnspecified`: `0.0.0.0` or `::`, and `::` only without a zone.
+pub fn is_unspecified(a: NetAddr) -> bool {
+    return same(a, unspecified4()) or same(a, unspecified6())
+}
+
+pub fn is_global_unicast(a0: NetAddr) -> bool {
+    if a0.kind == 0 {
+        return false
+    }
+    let a = v4_view(a0)
+    if a.kind == 4 and (same(a, unspecified4()) or a.lo == 281474976710655) {
+        return false
+    }
+    return not same(a, unspecified6()) and not is_loopback(a) and not is_multicast(a) and not is_link_local_unicast(a)
+}
+
+/// The address's bytes: 4 for IPv4, 16 for IPv6, none for the zero value.
+pub fn as_slice(a: NetAddr) -> [i64] {
+    if a.kind == 0 {
+        return []
+    }
+    var out: [i64] = []
+    for i in 0..8 {
+        out.push(a.hi.ushr(56 - 8 * i).bit_and(255))
+    }
+    for i in 0..8 {
+        out.push(a.lo.ushr(56 - 8 * i).bit_and(255))
+    }
+    return if a.kind == 4 { out.slice(12, 16) } else { out }
+}
+
+/// `Next`: the following address, or the zero value past the last.
+pub fn next(a: NetAddr) -> NetAddr {
+    let lo = a.lo + 1
+    let hi = if lo == 0 { a.hi + 1 } else { a.hi }
+    if a.kind == 4 {
+        return if lo.bit_and(4294967295) == 0 { invalid() } else { NetAddr{ kind: 4, hi: hi, lo: lo, zone: a.zone } }
+    }
+    return if hi == 0 and lo == 0 { invalid() } else { NetAddr{ kind: a.kind, hi: hi, lo: lo, zone: a.zone } }
+}
+
+pub fn prev(a: NetAddr) -> NetAddr {
+    if a.kind == 4 {
+        if a.lo.bit_and(4294967295) == 0 {
+            return invalid()
+        }
+    } else if a.hi == 0 and a.lo == 0 {
+        return invalid()
+    }
+    let hi = if a.lo == 0 { a.hi - 1 } else { a.hi }
+    return NetAddr{ kind: a.kind, hi: hi, lo: a.lo - 1, zone: a.zone }
+}
+
+// ---- printing
+
+fn hex_group(x: i64) -> str {
+    let digits = "0123456789abcdef"
+    var out = ""
+    var v = x
+    while true {
+        out = digits.substr(v.bit_and(15), 1) + out
+        v = v.ushr(4)
+        if v == 0 {
+            break
+        }
+    }
+    return out
+}
+
+fn string4(a: NetAddr) -> str {
+    return "{v4(a, 0)}.{v4(a, 1)}.{v4(a, 2)}.{v4(a, 3)}"
+}
+
+fn zone_suffix(a: NetAddr) -> str {
+    return if a.zone.len() > 0 { "%" + a.zone } else { "" }
+}
+
+fn string6(a: NetAddr) -> str {
+    var zero_start = 255
+    var zero_end = 255
+    for i in 0..8 {
+        var j = i
+        while j < 8 and v6u16(a, j) == 0 {
+            j = j + 1
+        }
+        let l = j - i
+        if l >= 2 and l > zero_end - zero_start {
+            zero_start = i
+            zero_end = j
+        }
+    }
+    var out = ""
+    var i = 0
+    while i < 8 {
+        if i == zero_start {
+            out = out + "::"
+            i = zero_end
+            if i >= 8 {
+                break
+            }
+        } else if i > 0 {
+            out = out + ":"
+        }
+        out = out + hex_group(v6u16(a, i))
+        i = i + 1
+    }
+    return out + zone_suffix(a)
+}
+
+/// `String()`.
+pub fn to_string(a: NetAddr) -> str {
+    if a.kind == 0 {
+        return "invalid IP"
+    }
+    if a.kind == 4 {
+        return string4(a)
+    }
+    if is4in6(a) {
+        return "::ffff:" + string4(unmap(a)) + zone_suffix(a)
+    }
+    return string6(a)
+}
+
+/// `StringExpanded()`: every IPv6 group, four digits each.
+pub fn string_expanded(a: NetAddr) -> str {
+    if a.kind != 6 {
+        return to_string(a)
+    }
+    var groups: [str] = []
+    for i in 0..8 {
+        groups.push(hex_group(v6u16(a, i)).pad_start(4, "0"))
+    }
+    return groups.join(":") + zone_suffix(a)
+}
+
+// ---- prefixes
+
+fn mask_half(n: i64) -> i64 {
+    return if n <= 0 { 0 } else if n >= 64 { 0 - 1 } else { (1.shl(64 - n) - 1).bit_not() }
+}
+
+/// `Addr.Prefix(bits)`: the address masked to its first `bits` bits.
+pub fn prefix(a: NetAddr, bits: i64) -> NetPrefix ! NetipError {
+    if bits < 0 {
+        fail(NetipFailed("negative Prefix bits"))
+    }
+    if a.kind == 0 {
+        return NetPrefix{ addr: invalid(), bits_plus_one: 0 }
+    }
+    var effective = bits
+    if a.kind == 4 {
+        if bits > 32 {
+            fail(NetipFailed("prefix length {bits} too large for IPv4"))
+        }
+        effective = effective + 96
+    } else if bits > 128 {
+        fail(NetipFailed("prefix length {bits} too large for IPv6"))
+    }
+    let m = NetAddr{ kind: a.kind, hi: a.hi.bit_and(mask_half(effective)), lo: a.lo.bit_and(mask_half(effective - 64)), zone: a.zone }
+    return prefix_from(m, bits)
+}
+
+/// `PrefixFrom`: the zone is dropped; bits outside the range make an
+/// invalid prefix.
+pub fn prefix_from(a: NetAddr, bits: i64) -> NetPrefix {
+    let ok = a.kind != 0 and bits >= 0 and bits <= bit_len(a)
+    return NetPrefix{ addr: with_zone(a, ""), bits_plus_one: if ok { bits + 1 } else { 0 } }
+}
+
+pub fn prefix_bits(p: NetPrefix) -> i64 {
+    return p.bits_plus_one - 1
+}
+
+pub fn prefix_valid(p: NetPrefix) -> bool {
+    return p.bits_plus_one > 0
+}
+
+fn prefix_error(input: str, msg: str) -> NetipError {
+    return NetipFailed("netip.ParsePrefix(" + q(input) + "): " + msg)
+}
+
+/// `ParsePrefix(s)`.
+pub fn parse_prefix(s: str) -> NetPrefix ! NetipError {
+    let b = s.to_bytes().to_list()
+    var slash = 0 - 1
+    for k in 0..b.len() {
+        if b[k] == 47 {
+            slash = k
+        }
+    }
+    if slash < 0 {
+        fail(prefix_error(s, "no '/'"))
+    }
+    let a = match parse_addr(substr_bytes(b, 0, slash)) {
+        Ok(a) -> a
+        Err(e) -> match e {
+            NetipFailed(t) -> fail(prefix_error(s, t))
+        }
+    }
+    if a.kind == 6 and a.zone.len() > 0 {
+        fail(prefix_error(s, "IPv6 zones cannot be present in a prefix"))
+    }
+    let bits_text = substr_bytes(b, slash + 1, b.len())
+    let bt = bits_text.to_bytes().to_list()
+    let bad = prefix_error(s, "bad bits after slash: " + q(bits_text))
+    if bt.len() > 1 and (bt[0] < 49 or bt[0] > 57) {
+        fail(bad)
+    }
+    // Atoi: digits only here, and a value that fits.
+    if bt.len() == 0 or not bt.all(|c| c >= 48 and c <= 57) {
+        fail(bad)
+    }
+    let bits = match bits_text.parse_int() {
+        Some(v) -> v
+        None -> fail(bad)
+    }
+    if bits < 0 or bits > (if a.kind == 6 { 128 } else { 32 }) {
+        fail(prefix_error(s, "prefix length out of range"))
+    }
+    return prefix_from(a, bits)
+}
+
+pub fn prefix_string(p: NetPrefix) -> str {
+    if not prefix_valid(p) {
+        return "invalid Prefix"
+    }
+    return to_string(p.addr) + "/" + prefix_bits(p).to_str()
+}
+
+pub fn masked(p: NetPrefix) -> NetPrefix {
+    return prefix(p.addr, prefix_bits(p)) ?? NetPrefix{ addr: invalid(), bits_plus_one: 0 }
+}
+
+pub fn is_single_ip(p: NetPrefix) -> bool {
+    return prefix_valid(p) and prefix_bits(p) == bit_len(p.addr)
+}
+
+/// `Contains`: false for an address with a zone, or of the other family.
+pub fn contains(p: NetPrefix, a: NetAddr) -> bool {
+    if not prefix_valid(p) or (a.kind == 6 and a.zone.len() > 0) {
+        return false
+    }
+    if bit_len(p.addr) == 0 or bit_len(a) == 0 or bit_len(p.addr) != bit_len(a) {
+        return false
+    }
+    let bits = prefix_bits(p) + (if a.kind == 4 { 96 } else { 0 })
+    return a.hi.bit_xor(p.addr.hi).bit_and(mask_half(bits)) == 0 and a.lo.bit_xor(p.addr.lo).bit_and(mask_half(bits - 64)) == 0
+}
+
+pub fn overlaps(p: NetPrefix, o: NetPrefix) -> bool {
+    if not prefix_valid(p) or not prefix_valid(o) {
+        return false
+    }
+    if same(p.addr, o.addr) and p.bits_plus_one == o.bits_plus_one {
+        return true
+    }
+    if is4(p.addr) != is4(o.addr) {
+        return false
+    }
+    let min_bits = prefix_bits(p).min(prefix_bits(o))
+    if min_bits == 0 {
+        return true
+    }
+    let a = prefix(p.addr, min_bits) ?? NetPrefix{ addr: invalid(), bits_plus_one: 0 }
+    let b = prefix(o.addr, min_bits) ?? NetPrefix{ addr: invalid(), bits_plus_one: 0 }
+    return same(a.addr, b.addr)
+}
+
+// ---- address and port
+
+/// `ParseAddrPort(s)`.
+pub fn parse_addr_port(s: str) -> NetAddrPort ! NetipError {
+    let b = s.to_bytes().to_list()
+    var colon = 0 - 1
+    for k in 0..b.len() {
+        if b[k] == 58 {
+            colon = k
+        }
+    }
+    if colon < 0 {
+        fail(NetipFailed("not an ip:port"))
+    }
+    var ip = substr_bytes(b, 0, colon)
+    let port = substr_bytes(b, colon + 1, b.len())
+    if ip.len() == 0 {
+        fail(NetipFailed("no IP"))
+    }
+    if port.len() == 0 {
+        fail(NetipFailed("no port"))
+    }
+    var v6 = false
+    if ip.starts_with("[") {
+        if ip.len() < 2 or not ip.ends_with("]") {
+            fail(NetipFailed("missing ]"))
+        }
+        ip = ip.substr(1, ip.len() - 2)
+        v6 = true
+    }
+    let pn = port.to_bytes().to_list()
+    if not pn.all(|c| c >= 48 and c <= 57) or (port.parse_int() ?? 70000) > 65535 {
+        fail(NetipFailed("invalid port " + q(port) + " parsing " + q(s)))
+    }
+    let a = try parse_addr(ip)
+    if v6 and a.kind == 4 {
+        fail(NetipFailed("invalid ip:port " + q(s) + ", square brackets can only be used with IPv6 addresses"))
+    }
+    if not v6 and a.kind == 6 {
+        fail(NetipFailed("invalid ip:port " + q(s) + ", IPv6 addresses must be surrounded by square brackets"))
+    }
+    return NetAddrPort{ addr: a, port: port.parse_int() ?? 0 }
+}
+
+pub fn addr_port_string(p: NetAddrPort) -> str {
+    if p.addr.kind == 0 {
+        return "invalid AddrPort"
+    }
+    let host = if p.addr.kind == 4 { to_string(p.addr) } else { "[" + to_string(p.addr) + "]" }
+    return host + ":" + p.port.to_str()
+}

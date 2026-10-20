@@ -1,0 +1,629 @@
+// Python's `csv` module, as CPython 3.13's `_csv` reads and writes:
+// `csv.reader` and `csv.writer` with every dialect option, the six quoting
+// modes, and the errors.
+//
+// `packages/csv` reads RFC 4180 and `packages/gocsv` reads as Go does.
+// Python's reader is a third dialect of the format, and a file a Python
+// script will read, or one it wrote, follows its rules:
+//
+//   - Lines end at `\n`, `\r` or `\r\n` (a file opened with
+//     `newline=''`); a quoted field may span them. A line break inside an
+//     unquoted field, mid-line, is "new-line character seen in unquoted
+//     field".
+//   - A quote in the middle of an unquoted field is just a character, and
+//     text after a closing quote joins the field -- unless `strict`,
+//     which wants the delimiter there.
+//   - `escapechar` escapes inside and outside quotes; `skipinitialspace`
+//     drops spaces after a delimiter; an empty line is an empty record.
+//   - `QUOTE_NONNUMERIC` and `QUOTE_STRINGS` read unquoted fields as
+//     floats, with Python's `float()` -- underscores, Unicode digits,
+//     `inf` and `nan` included; `QUOTE_STRINGS` and `QUOTE_NOTNULL` read
+//     an empty unquoted field as None.
+//   - Writing quotes a field holding the delimiter, the quote, either line
+//     break or a character of the line terminator, escapes instead under
+//     `QUOTE_NONE` ("need to escape, but no escapechar set"), and quotes
+//     a lone empty field so that it reads back.
+
+import pycharclass
+
+/// csv.QUOTE_MINIMAL, ALL, NONNUMERIC, NONE, STRINGS, NOTNULL.
+pub fn quote_minimal() -> i64 {
+    return 0
+}
+
+pub fn quote_all() -> i64 {
+    return 1
+}
+
+pub fn quote_nonnumeric() -> i64 {
+    return 2
+}
+
+pub fn quote_none() -> i64 {
+    return 3
+}
+
+pub fn quote_strings() -> i64 {
+    return 4
+}
+
+pub fn quote_notnull() -> i64 {
+    return 5
+}
+
+/// A dialect; `quotechar` and `escapechar` -1 for None.
+type PyCsvDialect = { delimiter: i64, quotechar: i64, escapechar: i64, doublequote: bool, skipinitialspace: bool, lineterminator: str, quoting: i64, strict: bool }
+
+/// The error and its Python class: csv.Error, ValueError or TypeError.
+type PyCsvError = | CsvError(msg: str) | CsvValueError(msg: str) | CsvTypeError(msg: str)
+
+pub fn error_text(e: PyCsvError) -> str {
+    return match e {
+        CsvError(m) -> m
+        CsvValueError(m) -> m
+        CsvTypeError(m) -> m
+    }
+}
+
+/// `csv.excel`.
+pub fn excel() -> PyCsvDialect {
+    return PyCsvDialect{ delimiter: 44, quotechar: 34, escapechar: 0 - 1, doublequote: true, skipinitialspace: false, lineterminator: "\r\n", quoting: 0,
+        strict: false }
+}
+
+fn bad_char(name: str, c: i64, d: PyCsvDialect, allow_space: bool) -> () ! PyCsvError {
+    if c == 13 or c == 10 or (c == 32 and not allow_space) {
+        fail(CsvValueError("bad " + name + " value"))
+    }
+    if c >= 0 and d.lineterminator.codes().contains(c) {
+        fail(CsvValueError("bad " + name + " or lineterminator value"))
+    }
+    return ()
+}
+
+fn same(n1: str, n2: str, c1: i64, c2: i64) -> () ! PyCsvError {
+    if c1 == c2 and c1 >= 0 {
+        fail(CsvValueError("bad " + n1 + " or " + n2 + " value"))
+    }
+    return ()
+}
+
+/// Python's checks when a dialect is made.
+pub fn check_dialect(d: PyCsvDialect) -> () ! PyCsvError {
+    // The delimiter's type is checked as it is set, before the rest.
+    if d.delimiter < 0 {
+        fail(CsvTypeError("\"delimiter\" must be string, not NoneType"))
+    }
+    if d.quoting < 0 or d.quoting > 5 {
+        fail(CsvTypeError("bad \"quoting\" value"))
+    }
+    if d.quoting != 3 and d.quotechar < 0 {
+        fail(CsvTypeError("quotechar must be set if quoting enabled"))
+    }
+    try bad_char("delimiter", d.delimiter, d, true)
+    try bad_char("escapechar", d.escapechar, d, not d.skipinitialspace)
+    try bad_char("quotechar", d.quotechar, d, not d.skipinitialspace)
+    try same("delimiter", "escapechar", d.delimiter, d.escapechar)
+    try same("delimiter", "quotechar", d.delimiter, d.quotechar)
+    try same("escapechar", "quotechar", d.escapechar, d.quotechar)
+    return ()
+}
+
+// ---- float(), for the numeric quoting modes
+
+fn hexn(n: i64, width: i64) -> str {
+    let digits = "0123456789abcdef"
+    var out = ""
+    for k in 0..width {
+        out = out + digits.substr(n.shr(4 * (width - 1 - k)).bit_and(15), 1)
+    }
+    return out
+}
+
+/// `repr(text)`.
+fn py_repr(cs: [i64]) -> str {
+    let quote = if cs.contains(39) and not cs.contains(34) { 34 } else { 39 }
+    var out = quote.to_char()
+    for c in cs {
+        out = out + repr_char(c, quote)
+    }
+    return out + quote.to_char()
+}
+
+fn repr_char(c: i64, quote: i64) -> str {
+    if c == quote or c == 92 {
+        return "\\" + c.to_char()
+    }
+    if c == 9 {
+        return "\\t"
+    }
+    if c == 10 {
+        return "\\n"
+    }
+    if c == 13 {
+        return "\\r"
+    }
+    if pycharclass.is_printable(c) {
+        return c.to_char()
+    }
+    return if c < 256 { "\\x" + hexn(c, 2) } else if c < 65536 { "\\u" + hexn(c, 4) } else { "\\U" + hexn(c, 8) }
+}
+
+fn ascii_digit(c: i64) -> bool {
+    return c >= 48 and c <= 57
+}
+
+/// The strtod grammar: a decimal number, `inf`, `infinity` or `nan`.
+fn float_syntax(cs: [i64]) -> bool {
+    var i = 0
+    if i < cs.len() and (cs[i] == 43 or cs[i] == 45) {
+        i = i + 1
+    }
+    let word = cs.slice(i, cs.len()).map(|c| if c >= 65 and c <= 90 { c + 32 } else { c })
+    if word == "inf".codes() or word == "infinity".codes() or word == "nan".codes() {
+        return true
+    }
+    var digits = 0
+    while i < cs.len() and ascii_digit(cs[i]) {
+        i = i + 1
+        digits = digits + 1
+    }
+    if i < cs.len() and cs[i] == 46 {
+        i = i + 1
+        while i < cs.len() and ascii_digit(cs[i]) {
+            i = i + 1
+            digits = digits + 1
+        }
+    }
+    if digits == 0 {
+        return false
+    }
+    if i < cs.len() and (cs[i] == 101 or cs[i] == 69) {
+        i = i + 1
+        if i < cs.len() and (cs[i] == 43 or cs[i] == 45) {
+            i = i + 1
+        }
+        let start = i
+        while i < cs.len() and ascii_digit(cs[i]) {
+            i = i + 1
+        }
+        if i == start {
+            return false
+        }
+    }
+    return i == cs.len()
+}
+
+/// Python's `float(text)`.
+pub fn py_float(text: str) -> f64 ! PyCsvError {
+    let original = text.codes()
+    let refuse = CsvValueError("could not convert string to float: " + py_repr(original))
+    // Unicode digits and spaces to ASCII, anything else non-ASCII to '?'.
+    var cs = original.map(|c| if pycharclass.is_space(c) { 32 } else if pycharclass.is_decimal(c) { 48 + pycharclass.decimal_value(c) } else if c < 128 { c } else {
+        63
+    })
+    // Underscores only between two digits, and then dropped.
+    if cs.contains(95) {
+        for i in 0..cs.len() {
+            if cs[i] == 95 and (i == 0 or i == cs.len() - 1 or not ascii_digit(cs[i - 1]) or not ascii_digit(cs[i + 1])) {
+                fail(refuse)
+            }
+        }
+        cs = cs.filter(|c| c != 95)
+    }
+    var a = 0
+    var b = cs.len()
+    let space = |c| c == 32 or c == 9 or c == 10 or c == 13 or c == 11 or c == 12
+    while a < b and space(cs[a]) {
+        a = a + 1
+    }
+    while b > a and space(cs[b - 1]) {
+        b = b - 1
+    }
+    let body = cs.slice(a, b)
+    if not float_syntax(body) {
+        fail(refuse)
+    }
+    let t = body.map(|c| c.to_char()).join("").to_lower()
+    let neg = t.starts_with("-")
+    let bare = if t.starts_with("-") or t.starts_with("+") { t.substr(1, t.len() - 1) } else { t }
+    if bare == "inf" or bare == "infinity" {
+        return if neg { -1.0 / 0.0 } else { 1.0 / 0.0 }
+    }
+    if bare == "nan" {
+        return if neg { (0.0 / 0.0) * -1.0 } else { 0.0 / 0.0 }
+    }
+    let v = bare.parse_float() ?? 0.0
+    return if neg { v * -1.0 } else { v }
+}
+
+// ---- reading
+
+/// A value read: a string, a float, or None.
+type PyCsvValue =
+    | PcStr(s: str)
+    | PcFloat(f: f64)
+    | PcNone
+
+fn field_limit() -> i64 {
+    return 131072
+}
+
+// Reader states.
+fn s_start_record() -> i64 {
+    return 0
+}
+
+fn s_start_field() -> i64 {
+    return 1
+}
+
+fn s_escaped_char() -> i64 {
+    return 2
+}
+
+fn s_in_field() -> i64 {
+    return 3
+}
+
+fn s_in_quoted() -> i64 {
+    return 4
+}
+
+fn s_escape_in_quoted() -> i64 {
+    return 5
+}
+
+fn s_quote_in_quoted() -> i64 {
+    return 6
+}
+
+fn s_eat_crnl() -> i64 {
+    return 7
+}
+
+fn s_after_escaped_crnl() -> i64 {
+    return 8
+}
+
+/// The end-of-line marker the C code passes after each line.
+fn eol() -> i64 {
+    return 0 - 2
+}
+
+type CsvParser = { d: PyCsvDialect, state: i64, field: [i64], unquoted: bool, fields: [PyCsvValue] }
+
+fn save_field(inout p: CsvParser) -> () ! PyCsvError {
+    let q = p.d.quoting
+    if p.unquoted and p.field.len() == 0 and (q == 5 or q == 4) {
+        p.fields.push(PcNone)
+        return ()
+    }
+    let text = p.field.map(|c| c.to_char()).join("")
+    if p.unquoted and p.field.len() != 0 and (q == 2 or q == 4) {
+        p.fields.push(PcFloat(try py_float(text)))
+    } else {
+        p.fields.push(PcStr(text))
+    }
+    p.field = []
+    return ()
+}
+
+fn add_char(inout p: CsvParser, c: i64) -> () ! PyCsvError {
+    if p.field.len() >= field_limit() {
+        fail(CsvError("field larger than field limit (" + field_limit().to_str() + ")"))
+    }
+    p.field.push(c)
+    return ()
+}
+
+fn is_nl(c: i64) -> bool {
+    return c == 10 or c == 13
+}
+
+/// The states that read field text: start of field, in a field.
+fn field_char(inout p: CsvParser, c: i64) -> () ! PyCsvError {
+    let d = p.d
+    if p.state == s_start_field() {
+        p.unquoted = true
+        if is_nl(c) or c == eol() {
+            try save_field(p)
+            p.state = if c == eol() { s_start_record() } else { s_eat_crnl() }
+        } else if c == d.quotechar and d.quoting != 3 {
+            p.unquoted = false
+            p.state = s_in_quoted()
+        } else if c == d.escapechar {
+            p.state = s_escaped_char()
+        } else if c == 32 and d.skipinitialspace {
+            // Spaces at the start of a field are dropped.
+        } else if c == d.delimiter {
+            try save_field(p)
+        } else {
+            try add_char(p, c)
+            p.state = s_in_field()
+        }
+        return ()
+    }
+    if is_nl(c) or c == eol() {
+        try save_field(p)
+        p.state = if c == eol() { s_start_record() } else { s_eat_crnl() }
+    } else if c == d.escapechar {
+        p.state = s_escaped_char()
+    } else if c == d.delimiter {
+        try save_field(p)
+        p.state = s_start_field()
+    } else {
+        try add_char(p, c)
+    }
+    return ()
+}
+
+fn quoted_char(inout p: CsvParser, c0: i64) -> () ! PyCsvError {
+    let d = p.d
+    var c = c0
+    if p.state == s_in_quoted() {
+        if c == eol() {
+            // A line break inside quotes: the next line continues the field.
+        } else if c == d.escapechar {
+            p.state = s_escape_in_quoted()
+        } else if c == d.quotechar and d.quoting != 3 {
+            p.state = if d.doublequote { s_quote_in_quoted() } else { s_in_field() }
+        } else {
+            try add_char(p, c)
+        }
+        return ()
+    }
+    if p.state == s_escape_in_quoted() {
+        if c == eol() {
+            c = 10
+        }
+        try add_char(p, c)
+        p.state = s_in_quoted()
+        return ()
+    }
+    // A quote inside a quoted field.
+    if d.quoting != 3 and c == d.quotechar {
+        try add_char(p, c)
+        p.state = s_in_quoted()
+    } else if c == d.delimiter {
+        try save_field(p)
+        p.state = s_start_field()
+    } else if is_nl(c) or c == eol() {
+        try save_field(p)
+        p.state = if c == eol() { s_start_record() } else { s_eat_crnl() }
+    } else if not d.strict {
+        try add_char(p, c)
+        p.state = s_in_field()
+    } else {
+        fail(CsvError("'" + d.delimiter.to_char() + "' expected after '" + d.quotechar.to_char() + "'"))
+    }
+    return ()
+}
+
+/// parse_process_char.
+fn process(inout p: CsvParser, c0: i64) -> () ! PyCsvError {
+    var c = c0
+    let s = p.state
+    if s == s_start_record() {
+        if c == eol() {
+            return ()
+        }
+        if is_nl(c) {
+            p.state = s_eat_crnl()
+            return ()
+        }
+        p.state = s_start_field()
+        return try field_char(p, c)
+    }
+    if s == s_start_field() or s == s_in_field() {
+        return try field_char(p, c)
+    }
+    if s == s_escaped_char() {
+        if is_nl(c) {
+            try add_char(p, c)
+            p.state = s_after_escaped_crnl()
+            return ()
+        }
+        if c == eol() {
+            c = 10
+        }
+        try add_char(p, c)
+        p.state = s_in_field()
+        return ()
+    }
+    if s == s_after_escaped_crnl() {
+        if c == eol() {
+            return ()
+        }
+        // The C code falls through to the in-field case without leaving
+        // this state, so ordinary characters keep it here and a line end
+        // does not end the record.
+        return try field_char(p, c)
+    }
+    if s == s_eat_crnl() {
+        if is_nl(c) {
+            return ()
+        }
+        if c == eol() {
+            p.state = s_start_record()
+            return ()
+        }
+        fail(CsvError("new-line character seen in unquoted field - do you need to open the file with newline=''?"))
+    }
+    return try quoted_char(p, c)
+}
+
+/// The lines `io.StringIO(text, newline='')` yields: each with its `\n`,
+/// `\r` or `\r\n`.
+pub fn lines(text: str) -> [[i64]] {
+    let cs = text.codes()
+    var out: [[i64]] = []
+    var start = 0
+    var i = 0
+    while i < cs.len() {
+        if cs[i] == 13 and i + 1 < cs.len() and cs[i + 1] == 10 {
+            out.push(cs.slice(start, i + 2))
+            i = i + 2
+            start = i
+        } else if cs[i] == 10 or cs[i] == 13 {
+            out.push(cs.slice(start, i + 1))
+            i = i + 1
+            start = i
+        } else {
+            i = i + 1
+        }
+    }
+    if start < cs.len() {
+        out.push(cs.slice(start, cs.len()))
+    }
+    return out
+}
+
+/// `list(csv.reader(io.StringIO(text, newline=''), dialect))`.
+pub fn read_all(text: str, d: PyCsvDialect) -> [[PyCsvValue]] ! PyCsvError {
+    try check_dialect(d)
+    let ls = lines(text)
+    var rows: [[PyCsvValue]] = []
+    var k = 0
+    var p = CsvParser{ d: d, state: s_start_record(), field: [], unquoted: false, fields: [] }
+    while true {
+        p.state = s_start_record()
+        p.field = []
+        p.unquoted = false
+        p.fields = []
+        var done = false
+        while true {
+            if k >= ls.len() {
+                if p.field.len() != 0 or p.state == s_in_quoted() {
+                    if d.strict {
+                        fail(CsvError("unexpected end of data"))
+                    }
+                    try save_field(p)
+                    rows.push(p.fields)
+                }
+                done = true
+                break
+            }
+            for c in ls[k] {
+                try process(p, c)
+            }
+            try process(p, eol())
+            k = k + 1
+            if p.state == s_start_record() {
+                rows.push(p.fields)
+                break
+            }
+        }
+        if done {
+            break
+        }
+    }
+    return rows
+}
+
+// ---- writing
+
+/// A value to write: a string, a number as `str()` writes it, or None.
+type PyCsvField =
+    | WStr(s: str)
+    | WNumber(text: str)
+    | WNone
+
+/// join_append_data, both passes: the field's characters, and whether it
+/// had to be quoted.
+fn field_text(d: PyCsvDialect, field: [i64], quoted0: bool) -> ([i64], bool) ! PyCsvError {
+    var quoted = quoted0
+    var out: [i64] = []
+    let term = d.lineterminator.codes()
+    for c in field {
+        if c == d.delimiter or c == d.escapechar or c == d.quotechar or c == 10 or c == 13 or term.contains(c) {
+            var want_escape = false
+            if d.quoting == 3 {
+                want_escape = true
+            } else {
+                if c == d.quotechar {
+                    if d.doublequote {
+                        out.push(d.quotechar)
+                    } else {
+                        want_escape = true
+                    }
+                } else if c == d.escapechar {
+                    want_escape = true
+                }
+                if not want_escape {
+                    quoted = true
+                }
+            }
+            if want_escape {
+                if d.escapechar < 0 {
+                    fail(CsvError("need to escape, but no escapechar set"))
+                }
+                out.push(d.escapechar)
+            }
+        }
+        out.push(c)
+    }
+    return (out, quoted)
+}
+
+fn join_field(d: PyCsvDialect, inout rec: [i64], inout count: i64, field: Option[str], quoted0: bool) -> () ! PyCsvError {
+    var quoted = quoted0
+    let cs = match field {
+        Some(s) -> s.codes()
+        None -> []
+    }
+    if cs.len() == 0 and d.delimiter == 32 and d.skipinitialspace {
+        if d.quoting == 3 or (field.is_none() and (d.quoting == 4 or d.quoting == 5)) {
+            fail(CsvError("empty field must be quoted if delimiter is a space and skipinitialspace is true"))
+        }
+        quoted = true
+    }
+    let (text, q) = try field_text(d, cs, quoted)
+    if count > 0 {
+        rec.push(d.delimiter)
+    }
+    if q {
+        rec.push(d.quotechar)
+    }
+    for c in text {
+        rec.push(c)
+    }
+    if q {
+        rec.push(d.quotechar)
+    }
+    count = count + 1
+    return ()
+}
+
+/// `writer.writerow(fields)`: the line it writes.
+pub fn write_row(fields: [PyCsvField], d: PyCsvDialect) -> str ! PyCsvError {
+    try check_dialect(d)
+    var rec: [i64] = []
+    var count = 0
+    var null_field = false
+    for f in fields {
+        let quoted = match f {
+            WStr(_s) -> d.quoting == 1 or d.quoting == 2 or d.quoting == 4 or d.quoting == 5
+            WNumber(_t) -> d.quoting == 1 or d.quoting == 5
+            WNone -> d.quoting == 1 or d.quoting == 2
+        }
+        null_field = match f {
+            WNone -> true
+            _ -> false
+        }
+        let text = match f {
+            WStr(s) -> Some(s)
+            WNumber(t) -> Some(t)
+            WNone -> None
+        }
+        try join_field(d, rec, count, text, quoted)
+    }
+    if count > 0 and rec.len() == 0 {
+        if d.quoting == 3 or (null_field and (d.quoting == 4 or d.quoting == 5)) {
+            fail(CsvError("single empty field record must be quoted"))
+        }
+        count = count - 1
+        try join_field(d, rec, count, None, true)
+    }
+    return rec.map(|c| c.to_char()).join("") + d.lineterminator
+}

@@ -1,0 +1,4 @@
+[package]
+name = "pyquopri"
+version = "1.0.0"
+capabilities = []

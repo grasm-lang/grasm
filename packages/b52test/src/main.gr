@@ -1,0 +1,406 @@
+// The harness scripts/b52_diff.sh drives: each argument pair is an
+// operation and a file of cases, one per line; each answer is one line.
+import gopath
+import javaduration
+import jsjson
+import nodeutilformat
+import gosniff
+import pycsv
+import pyposixpath
+import rubyshellwords
+import shortestfloat
+import gostrconv
+
+fn unhex_list(h: str) -> [i64] {
+    if h == "-" {
+        return []
+    }
+    var out: [i64] = []
+    let b = h.to_bytes()
+    var i = 0
+    while i + 1 < b.len() {
+        let hi = b.at(i)
+        let lo = b.at(i + 1)
+        out.push((if hi >= 97 { hi - 87 } else { hi - 48 }) * 16 + (if lo >= 97 { lo - 87 } else { lo - 48 }))
+        i = i + 2
+    }
+    return out
+}
+
+fn unhex(h: str) -> str {
+    return bytes_of(unhex_list(h)).to_str()
+}
+
+fn hex_bytes(b: bytes) -> str {
+    let digits = "0123456789abcdef"
+    let h = b.to_list().map(|x| digits.substr(x.ushr(4), 1) + digits.substr(x.bit_and(15), 1)).join("")
+    return if h.len() == 0 { "-" } else { h }
+}
+
+fn hex_text(t: str) -> str {
+    return hex_bytes(t.to_bytes())
+}
+
+fn hex_u64(h: str) -> i64 {
+    var v = 0
+    for c in h.codes() {
+        let d = if c >= 97 { c - 87 } else if c >= 65 { c - 55 } else { c - 48 }
+        v = v.shl(4).bit_or(d)
+    }
+    return v
+}
+
+fn fbits(h: str) -> f64 {
+    return hex_u64(h).from_bits()
+}
+
+fn fhex(x: f64) -> str {
+    return gostrconv.format_uint(x.to_bits(), 16)
+}
+
+fn num(f: [str], k: i64) -> i64 {
+    return f[k].parse_int() ?? 0
+}
+
+fn list(h: str) -> [str] {
+    return if h == "~" { [] } else { h.split(",").map(|x| unhex(x)) }
+}
+
+fn units_hex(us: [i64]) -> str {
+    return if us.len() == 0 { "-" } else { us.map(|u| gostrconv.format_uint(u, 16)).join(".") }
+}
+
+fn units_of(h: str) -> [i64] {
+    return if h == "-" { [] } else { h.split(".").map(|x| hex_u64(x)) }
+}
+
+fn path_err(e: GoPathError) -> str {
+    return "E" + hex_text(gopath.error_text(e))
+}
+
+fn gopath_line(f: [str]) -> str {
+    let op = f[0]
+    if op == "cl" {
+        return hex_text(gopath.clean(unhex(f[1])))
+    }
+    if op == "jo" {
+        return hex_text(gopath.join(list(f[1])))
+    }
+    if op == "fj" {
+        return hex_text(gopath.filepath_join(list(f[1])))
+    }
+    if op == "sp" {
+        let (d, b) = gopath.split(unhex(f[1]))
+        return hex_text(d) + " " + hex_text(b)
+    }
+    if op == "ex" {
+        return hex_text(gopath.ext(unhex(f[1])))
+    }
+    if op == "ba" {
+        return hex_text(gopath.base(unhex(f[1])))
+    }
+    if op == "di" {
+        return hex_text(gopath.dir(unhex(f[1])))
+    }
+    if op == "ia" {
+        return if gopath.is_abs(unhex(f[1])) { "true" } else { "false" }
+    }
+    if op == "ma" {
+        return match gopath.match_path(unhex(f[1]), unhex(f[2])) {
+            Ok(b) -> if b { "true" } else { "false" }
+            Err(e) -> path_err(e)
+        }
+    }
+    if op == "re" {
+        return match gopath.rel(unhex(f[1]), unhex(f[2])) {
+            Ok(r) -> hex_text(r)
+            Err(e) -> path_err(e)
+        }
+    }
+    return "[" + gopath.split_list(unhex(f[1])).map(|x| hex_text(x)).join(",") + "]"
+}
+
+fn csv_char(x: str) -> i64 {
+    return if x == "~" { 0 - 1 } else { x.parse_int() ?? 0 }
+}
+
+fn csv_dialect(spec: str) -> PyCsvDialect {
+    let f = spec.split("/")
+    return PyCsvDialect{ delimiter: csv_char(f[0]), quotechar: csv_char(f[1]), escapechar: csv_char(f[2]), doublequote: f[3] == "1",
+        skipinitialspace: f[4] == "1", lineterminator: unhex(f[5]), quoting: f[6].parse_int() ?? 0, strict: f[7] == "1" }
+}
+
+fn csv_error(e: PyCsvError) -> str {
+    let cls = match e {
+        CsvError(_m) -> "csv"
+        CsvValueError(_m) -> "value"
+        CsvTypeError(_m) -> "type"
+    }
+    return "E" + cls + ":" + hex_text(pycsv.error_text(e))
+}
+
+fn csv_value(v: PyCsvValue) -> str {
+    return match v {
+        PcNone -> "n"
+        PcFloat(x) -> "f" + fhex(x)
+        PcStr(t) -> "s" + hex_text(t)
+    }
+}
+
+fn csv_field(t: str) -> PyCsvField {
+    if t == "n" {
+        return WNone
+    }
+    if t.starts_with("i") {
+        return WNumber(t.substr(1, t.len() - 1))
+    }
+    if t.starts_with("d") {
+        return WNumber(pyrepr_float(fbits(t.substr(1, t.len() - 1))))
+    }
+    return WStr(unhex(t.substr(1, t.len() - 1)))
+}
+
+fn pyrepr_float(x: f64) -> str {
+    return shortestfloat.repr(x)
+}
+
+fn pycsv_line(f: [str]) -> str {
+    if f[0] == "rd" {
+        return match pycsv.read_all(unhex(f[1]), csv_dialect(f[2])) {
+            Ok(rows) -> if rows.len() == 0 { "-" } else { rows.map(|r| if r.len() == 0 { "~" } else { r.map(|v| csv_value(v)).join(",") }).join("/") }
+            Err(e) -> csv_error(e)
+        }
+    }
+    if f[0] == "wr" {
+        let fields = if f[1] == "~" { [] } else { f[1].split(",").map(|x| csv_field(x)) }
+        return match pycsv.write_row(fields, csv_dialect(f[2])) {
+            Ok(t) -> hex_text(t)
+            Err(e) -> csv_error(e)
+        }
+    }
+    return match pycsv.py_float(unhex(f[1])) {
+        Ok(x) -> "f" + fhex(x)
+        Err(e) -> csv_error(e)
+    }
+}
+
+fn jt_error(e: JavaTimeError) -> str {
+    let cls = match e {
+        JtParse(_m) -> "parse"
+        JtArithmetic(_m) -> "arith"
+    }
+    return "E" + cls + ":" + hex_text(javaduration.error_text(e))
+}
+
+fn jdur(r: JavaDuration ! JavaTimeError) -> str {
+    return match r {
+        Ok(d) -> d.seconds.to_str() + " " + d.nanos.to_str() + " " + hex_text(javaduration.duration_text(d))
+        Err(e) -> jt_error(e)
+    }
+}
+
+fn jper(r: JavaPeriod ! JavaTimeError) -> str {
+    return match r {
+        Ok(p) -> p.years.to_str() + " " + p.months.to_str() + " " + p.days.to_str() + " " + hex_text(javaduration.period_text(p))
+        Err(e) -> jt_error(e)
+    }
+}
+
+fn jlong(r: i64 ! JavaTimeError) -> str {
+    return match r {
+        Ok(n) -> n.to_str()
+        Err(e) -> jt_error(e)
+    }
+}
+
+fn dur_op(k: str, a: JavaDuration, f: [str]) -> str {
+    if k == "plus" or k == "divd" {
+        let b = match javaduration.of_seconds(num(f, 4), num(f, 5)) {
+            Ok(d) -> d
+            Err(e) -> return jt_error(e)
+        }
+        return if k == "plus" { jdur(javaduration.plus(a, b)) } else { jlong(javaduration.divided_by_duration(a, b)) }
+    }
+    if k == "mul" {
+        return jdur(javaduration.multiplied_by(a, num(f, 4)))
+    }
+    if k == "div" {
+        return jdur(javaduration.divided_by(a, num(f, 4)))
+    }
+    if k == "neg" {
+        return jdur(javaduration.negated(a))
+    }
+    if k == "millis" {
+        return jlong(javaduration.to_millis(a))
+    }
+    return jlong(javaduration.to_nanos(a))
+}
+
+fn javaduration_line(f: [str]) -> str {
+    let op = f[0]
+    if op == "dp" {
+        return jdur(javaduration.duration_parse(unhex(f[1])))
+    }
+    if op == "dt" {
+        return jdur(javaduration.of_seconds(num(f, 1), num(f, 2)))
+    }
+    if op == "da" {
+        return match javaduration.of_seconds(num(f, 2), num(f, 3)) {
+            Ok(a) -> dur_op(f[1], a, f)
+            Err(e) -> jt_error(e)
+        }
+    }
+    if op == "pp" {
+        return jper(javaduration.period_parse(unhex(f[1])))
+    }
+    let p = javaduration.period(num(f, 2), num(f, 3), num(f, 4))
+    if f[1] == "plus" {
+        return jper(javaduration.period_plus(p, javaduration.period(num(f, 5), num(f, 6), num(f, 7))))
+    }
+    if f[1] == "mul" {
+        return jper(javaduration.period_multiplied_by(p, num(f, 5)))
+    }
+    if f[1] == "norm" {
+        return jper(javaduration.period_normalized(p))
+    }
+    return jper(Ok(p))
+}
+
+fn js_arg(t: str) -> UtilValue {
+    let rest = t.substr(1, t.len() - 1)
+    if t.starts_with("s") {
+        return JvString(units_of(rest))
+    }
+    if t.starts_with("n") {
+        return JvNumber(fbits(rest))
+    }
+    if t.starts_with("b") {
+        return JvBigInt(rest)
+    }
+    if t == "t" {
+        return JvBool(true)
+    }
+    if t == "f" {
+        return JvBool(false)
+    }
+    return if t == "l" { JvNull } else { JvUndefined }
+}
+
+fn nodeutilformat_line(f: [str]) -> str {
+    let args = if f[1] == "~" { [] } else { f[1].split(",").map(|t| js_arg(t)) }
+    if f[0] == "in" {
+        return units_hex(nodeutilformat.inspect(args[0]))
+    }
+    return match nodeutilformat.format(args) {
+        Ok(us) -> units_hex(us)
+        Err(e) -> "E" + units_hex(jsjson.units(nodeutilformat.error_text(e)))
+    }
+}
+
+fn pair(a: (str, str)) -> str {
+    return hex_text(a.0) + " " + hex_text(a.1)
+}
+
+fn ppath_error(e: PosixPathError) -> str {
+    return "E" + hex_text(pyposixpath.error_text(e))
+}
+
+fn pyposixpath_line(f: [str]) -> str {
+    let cwd = unhex(f[1])
+    let op = f[0]
+    if op == "np" {
+        return hex_text(pyposixpath.normpath(unhex(f[2])))
+    }
+    if op == "jo" {
+        let parts = list(f[2])
+        return if parts.len() == 0 { "~" } else { hex_text(pyposixpath.join(parts)) }
+    }
+    if op == "sp" {
+        return pair(pyposixpath.split(unhex(f[2])))
+    }
+    if op == "se" {
+        return pair(pyposixpath.splitext(unhex(f[2])))
+    }
+    if op == "sr" {
+        let (d, r, t) = pyposixpath.splitroot(unhex(f[2]))
+        return hex_text(d) + " " + hex_text(r) + " " + hex_text(t)
+    }
+    if op == "bn" {
+        return hex_text(pyposixpath.basename(unhex(f[2])))
+    }
+    if op == "dn" {
+        return hex_text(pyposixpath.dirname(unhex(f[2])))
+    }
+    if op == "ia" {
+        return if pyposixpath.isabs(unhex(f[2])) { "True" } else { "False" }
+    }
+    if op == "cp" {
+        return hex_text(pyposixpath.commonprefix(list(f[2])))
+    }
+    if op == "cm" {
+        return match pyposixpath.commonpath(list(f[2])) {
+            Ok(t) -> hex_text(t)
+            Err(e) -> ppath_error(e)
+        }
+    }
+    if op == "ab" {
+        return hex_text(pyposixpath.abspath(unhex(f[2]), cwd))
+    }
+    return match pyposixpath.relpath(unhex(f[2]), unhex(f[3]), cwd) {
+        Ok(t) -> hex_text(t)
+        Err(e) -> ppath_error(e)
+    }
+}
+
+fn rubyshellwords_line(f: [str]) -> str {
+    let op = f[0]
+    if op == "sp" {
+        return match rubyshellwords.split(unhex(f[1])) {
+            Ok(ws) -> if ws.len() == 0 { "~" } else { ws.map(|w| hex_text(w)).join(",") }
+            Err(e) -> "E" + hex_text(rubyshellwords.error_text(e))
+        }
+    }
+    if op == "es" {
+        return hex_text(rubyshellwords.escape(unhex(f[1])))
+    }
+    if op == "jo" {
+        return hex_text(rubyshellwords.join(list(f[1])))
+    }
+    return hex_text(rubyshellwords.inspect(unhex(f[1])))
+}
+
+fn main() / {io} {
+    let argv = args()
+    var i = 0
+    while i + 1 < argv.len() {
+        let op = argv[i]
+        let text = match read_bytes(argv[i + 1]) {
+            Ok(d) -> d.to_str()
+            Err(_e) -> ""
+        }
+        for l in text.split("\n").filter(|l| l.len() > 0) {
+            if op == "rubyshellwords" {
+                print(rubyshellwords_line(l.split(" ")))
+            }
+            if op == "pyposixpath" {
+                print(pyposixpath_line(l.split(" ")))
+            }
+            if op == "nodeutilformat" {
+                print(nodeutilformat_line(l.split(" ")))
+            }
+            if op == "javaduration" {
+                print(javaduration_line(l.split(" ")))
+            }
+            if op == "pycsv" {
+                print(pycsv_line(l.split(" ")))
+            }
+            if op == "gosniff" {
+                print(gosniff.detect(bytes_of(unhex_list(l.split(" ")[1]))))
+            }
+            if op == "gopath" {
+                print(gopath_line(l.split(" ")))
+            }
+        }
+        i = i + 2
+    }
+}

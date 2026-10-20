@@ -1,0 +1,48 @@
+[package]
+name = "b53test"
+version = "1.0.0"
+capabilities = ["io"]
+
+[dependencies.pyglob]
+path = "../pyglob"
+version = "^1.0.0"
+
+[dependencies.gostrconv]
+path = "../gostrconv"
+version = "^1.0.0"
+
+[dependencies.javabiginteger]
+path = "../javabiginteger"
+version = "^1.0.0"
+
+[dependencies.bigint]
+path = "../bigint"
+version = "^1.0.0"
+
+[dependencies.pycharclass]
+path = "../pycharclass"
+version = "^1.0.0"
+
+[dependencies.pyquopri]
+path = "../pyquopri"
+version = "^1.0.0"
+
+[dependencies.pyemailutils]
+path = "../pyemailutils"
+version = "^1.0.0"
+
+[dependencies.goencoding]
+path = "../goencoding"
+version = "^1.0.0"
+
+[dependencies.rubystring]
+path = "../rubystring"
+version = "^1.0.0"
+
+[dependencies.nodestringdecoder]
+path = "../nodestringdecoder"
+version = "^1.0.0"
+
+[dependencies.pycookies]
+path = "../pycookies"
+version = "^1.0.0"

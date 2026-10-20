@@ -1,0 +1,8 @@
+[package]
+name = "gomime"
+version = "1.0.0"
+capabilities = []
+
+[dependencies.goquote]
+path = "../goquote"
+version = "^1.0.0"

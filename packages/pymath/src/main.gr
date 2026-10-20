@@ -1,0 +1,734 @@
+// The parts of Python's `math` that are Python's own algorithms rather
+// than calls into the platform's maths library, as CPython 3.13 computes
+// them, errors included.
+//
+// `math.fsum` is Shewchuk's exactly rounded sum with CPython's handling of
+// infinities and intermediate overflow; `math.sumprod` is the Ogita-Rump-
+// Oishi triple-length dot product, which is accurate but not always
+// correctly rounded, so its answer is reproduced step by step; `hypot`
+// and `dist` are CPython's scaled, corrected vector norm; `gamma` and
+// `lgamma` are its Lanczos sums; `remainder`, `nextafter` with `steps` and
+// `ulp` are its bit-level definitions; `fma` is a single rounding of the
+// exact `x * y + z`; `isqrt`, `comb`, `perm`, `factorial`, `gcd` and
+// `lcm` are exact.
+//
+// One platform fact is part of the answer: CPython is compiled by clang,
+// which fuses `a * b + c` into one fused multiply-add on arm64, and the
+// Homebrew Python 3.13 these are held to was built that way. So the
+// Lanczos sums here fuse the same multiply-adds; on a CPython built
+// without contraction, `gamma` and `lgamma` differ from these in the last
+// bit. The other functions do not depend on it.
+
+import bigint
+
+type PyMathError =
+    | PyMathValueError(text: str)
+    | PyMathOverflowError(text: str)
+
+fn domain() -> PyMathError {
+    return PyMathValueError("math domain error")
+}
+
+fn range_error() -> PyMathError {
+    return PyMathOverflowError("math range error")
+}
+
+// ---- exact fused multiply-add
+
+/// A finite double as m * 2^e.
+fn split_double(x: f64) -> (i64, i64) {
+    let b = x.to_bits()
+    let e0 = b.ushr(52).bit_and(2047)
+    let m = b.bit_and(4503599627370495)
+    let mant = if e0 == 0 { m } else { m.bit_or(4503599627370496) }
+    let e = if e0 == 0 { 0 - 1074 } else { e0 - 1075 }
+    return (if b < 0 { 0 - mant } else { mant }, e)
+}
+
+fn pow2(k: i64) -> BigInt {
+    return bigint.pow(bigint.from_i64(2), k)
+}
+
+/// q * 2^e exactly, for 0 <= q <= 2^53; infinity past the largest double.
+fn scaled(q: i64, e: i64) -> f64 {
+    if q == 0 {
+        return 0.0
+    }
+    var v = q.as_f64()
+    var k = e
+    while k > 1000 {
+        v = v * (1023 + 1000).shl(52).from_bits()
+        k = k - 1000
+    }
+    while k < 0 - 1000 {
+        v = v * (1023 - 1000).shl(52).from_bits()
+        k = k + 1000
+    }
+    return v * (1023 + k).shl(52).from_bits()
+}
+
+/// a * b + c rounded once, half to even, for finite arguments.
+fn exact_fma(a: f64, b: f64, c: f64) -> f64 {
+    let (ma, ea) = split_double(a)
+    let (mb, eb) = split_double(b)
+    let (mc, ec) = split_double(c)
+    let ep = ea + eb
+    let e = ep.min(ec)
+    let v = bigint.add(bigint.mul(bigint.mul(bigint.from_i64(ma), bigint.from_i64(mb)), pow2(ep - e)), bigint.mul(bigint.from_i64(mc), pow2(ec - e)))
+    if bigint.is_zero(v) {
+        // An exact zero: IEEE gives -0 only when both addends are -0, or
+        // under the product's sign when c is 0 of the same sign.
+        return a * b + c
+    }
+    let negative = bigint.sign(v) < 0
+    let mag = if negative { bigint.negate(v) } else { v }
+    var shift = (bigint.bit_length(mag) - 53).max(0 - 1074 - e)
+    var q = 0
+    if shift > 0 {
+        let (hi, rest) = bigint.divmod(mag, pow2(shift)) ?? (bigint.zero(), bigint.zero())
+        q = bigint.to_i64(hi) ?? 0
+        let twice = bigint.compare(bigint.add(rest, rest), pow2(shift))
+        if twice > 0 or (twice == 0 and q % 2 == 1) {
+            q = q + 1
+        }
+        if q == 9007199254740992 {
+            q = q / 2
+            shift = shift + 1
+        }
+    } else {
+        q = bigint.to_i64(bigint.mul(mag, pow2(0 - shift))) ?? 0
+    }
+    let out = scaled(q, e + shift)
+    return if negative { 0.0 - out } else { out }
+}
+
+/// Fused multiply-add the way C's `fma` gives it: no error, IEEE special
+/// values.
+fn cfma(a: f64, b: f64, c: f64) -> f64 {
+    // The exact product of two finite doubles is finite however large, so
+    // an infinite c decides the sum.
+    if a.is_finite() and b.is_finite() and c.abs() == 1.0 / 0.0 {
+        return c
+    }
+    if not (a.is_finite() and b.is_finite() and c.is_finite()) or a == 0.0 or b == 0.0 {
+        return a * b + c
+    }
+    if c == 0.0 {
+        return a * b
+    }
+    return exact_fma(a, b, c)
+}
+
+/// `math.fma(x, y, z)`.
+pub fn fma(x: f64, y: f64, z: f64) -> f64 ! PyMathError {
+    let r = cfma(x, y, z)
+    if r.is_finite() {
+        return r
+    }
+    if r.is_nan() {
+        if not x.is_nan() and not y.is_nan() and not z.is_nan() {
+            fail(PyMathValueError("invalid operation in fma"))
+        }
+    } else if x.is_finite() and y.is_finite() and z.is_finite() {
+        fail(PyMathOverflowError("overflow in fma"))
+    }
+    return r
+}
+
+// ---- fsum and sumprod
+
+/// `math.fsum(xs)`.
+pub fn fsum(xs: [f64]) -> f64 ! PyMathError {
+    var p: [f64] = []
+    var special = 0.0
+    var inf_sum = 0.0
+    var lo = 0.0
+    for x0 in xs {
+        var x = x0
+        var kept: [f64] = []
+        for y0 in p {
+            var y = y0
+            if x.abs() < y.abs() {
+                let t = x
+                x = y
+                y = t
+            }
+            let hi = x + y
+            let yr = hi - x
+            lo = y - yr
+            if lo != 0.0 {
+                kept.push(lo)
+            }
+            x = hi
+        }
+        p = kept
+        if x != 0.0 {
+            if not x.is_finite() {
+                if x0.is_finite() {
+                    fail(PyMathOverflowError("intermediate overflow in fsum"))
+                }
+                if x0.abs() == 1.0 / 0.0 {
+                    inf_sum = inf_sum + x0
+                }
+                special = special + x0
+                p = []
+            } else {
+                p.push(x)
+            }
+        }
+    }
+    if special != 0.0 {
+        if inf_sum.is_nan() {
+            fail(PyMathValueError("-inf + inf in fsum"))
+        }
+        return special
+    }
+    var hi = 0.0
+    var n = p.len()
+    if n > 0 {
+        n = n - 1
+        hi = p[n]
+        while n > 0 {
+            let x = hi
+            n = n - 1
+            let y = p[n]
+            hi = x + y
+            let yr = hi - x
+            lo = y - yr
+            if lo != 0.0 {
+                break
+            }
+        }
+        if n > 0 and ((lo < 0.0 and p[n - 1] < 0.0) or (lo > 0.0 and p[n - 1] > 0.0)) {
+            let y = lo * 2.0
+            let x = hi + y
+            let yr = x - hi
+            if y == yr {
+                hi = x
+            }
+        }
+    }
+    return hi
+}
+
+/// Error-free sum: a + b as hi and lo.
+fn two_sum(a: f64, b: f64) -> (f64, f64) {
+    let x = a + b
+    let z = x - a
+    return (x, (a - (x - z)) + (b - z))
+}
+
+fn two_product(x: f64, y: f64) -> (f64, f64) {
+    let z = x * y
+    return (z, cfma(x, y, 0.0 - z))
+}
+
+/// `math.sumprod(p, q)` over floats: CPython's triple-length accumulator,
+/// and, from the first product that overflows it, plain arithmetic.
+pub fn sumprod(p: [f64], q: [f64]) -> f64 ! PyMathError {
+    if p.len() != q.len() {
+        fail(PyMathValueError("Inputs are not the same length"))
+    }
+    var hi = 0.0
+    var mid = 0.0
+    var tiny = 0.0
+    var used = false
+    var i = 0
+    while i < p.len() {
+        let (ph, pl) = two_product(p[i], q[i])
+        let (sh, sl) = two_sum(hi, ph)
+        let (r1h, r1l) = two_sum(mid, pl)
+        let (r2h, r2l) = two_sum(r1h, sl)
+        if not sh.is_finite() {
+            break
+        }
+        hi = sh
+        mid = r2h
+        tiny = tiny + r1l + r2l
+        used = true
+        i = i + 1
+    }
+    var total = 0.0
+    if used {
+        let (lh, ll) = two_sum(mid, hi)
+        // Added to the integer 0 Python starts from, so -0.0 becomes 0.0.
+        total = 0.0 + (tiny + ll + lh)
+    }
+    while i < p.len() {
+        total = total + p[i] * q[i]
+        i = i + 1
+    }
+    return total
+}
+
+/// `math.prod(xs)` over floats: left to right.
+pub fn prod(xs: [f64]) -> f64 {
+    var r = 1.0
+    for x in xs {
+        r = r * x
+    }
+    return r
+}
+
+// ---- gamma and lgamma
+
+fn lanczos_num() -> [f64] {
+    return [23531376880.410759688572007674451636754734846804940, 42919803642.649098768957899047001988850926355848959,
+        35711959237.355668049440185451547166705960488635843, 17921034426.037209699919755754458931112671403265390,
+        6039542586.3520280050642916443072979210699388420708, 1439720407.3117216736632230727949123939715485786772,
+        248874557.86205415651146038641322942321632125127801, 31426415.585400194380614231628318205362874684987640,
+        2876370.6289353724412254090516208496135991145378768, 186056.26539522349504029498971604569928220784236328,
+        8071.6720023658162106380029022722506138218516325024, 210.82427775157934587250973392071336271166969580291,
+        2.5066282746310002701649081771338373386264310793408]
+}
+
+fn lanczos_den() -> [f64] {
+    return [0.0, 39916800.0, 120543840.0, 150917976.0, 105258076.0, 45995730.0, 13339535.0, 2637558.0, 357423.0, 32670.0, 1925.0, 66.0, 1.0]
+}
+
+fn lanczos_g() -> f64 {
+    return 6.024680040776729583740234375
+}
+
+fn lanczos_g_minus_half() -> f64 {
+    return 5.524680040776729583740234375
+}
+
+fn lanczos_sum(x: f64) -> f64 {
+    let nc = lanczos_num()
+    let dc = lanczos_den()
+    var num = 0.0
+    var den = 0.0
+    if x < 5.0 {
+        var i = 12
+        while i >= 0 {
+            num = cfma(num, x, nc[i])
+            den = cfma(den, x, dc[i])
+            i = i - 1
+        }
+    } else {
+        for i in 0..13 {
+            num = num / x + nc[i]
+            den = den / x + dc[i]
+        }
+    }
+    return num / den
+}
+
+fn pi() -> f64 {
+    return 3.141592653589793
+}
+
+/// sin(pi x), exact at the integers and half-integers.
+fn sinpi(x: f64) -> f64 {
+    let y = x.abs() % 2.0
+    let n = (2.0 * y).round().as_i64()
+    let r = if n == 0 { (pi() * y).sin() } else if n == 1 { (pi() * (y - 0.5)).cos() } else if n == 2 { (pi() * (1.0 - y)).sin() } else if n == 3 {
+        0.0 - (pi() * (y - 1.5)).cos()
+    } else { (pi() * (y - 2.0)).sin() }
+    return if x.to_bits() < 0 { 0.0 - r } else { r }
+}
+
+fn gamma_integral(k: i64) -> f64 {
+    let table = [1.0, 1.0, 2.0, 6.0, 24.0, 120.0, 720.0, 5040.0, 40320.0, 362880.0, 3628800.0, 39916800.0, 479001600.0, 6227020800.0, 87178291200.0,
+        1307674368000.0, 20922789888000.0, 355687428096000.0, 6402373705728000.0, 121645100408832000.0, 2432902008176640000.0,
+        51090942171709440000.0, 1124000727777607680000.0]
+    return table[k - 1]
+}
+
+/// `math.lgamma(x)`.
+pub fn lgamma(x: f64) -> f64 ! PyMathError {
+    if x.is_nan() {
+        return x
+    }
+    if not x.is_finite() {
+        return 1.0 / 0.0
+    }
+    if x == x.floor() and x <= 2.0 {
+        if x <= 0.0 {
+            fail(domain())
+        }
+        return 0.0
+    }
+    let absx = x.abs()
+    if absx < 1e-20 {
+        return 0.0 - absx.ln()
+    }
+    var r = lanczos_sum(absx).ln() - lanczos_g()
+    r = cfma(absx - 0.5, (absx + lanczos_g() - 0.5).ln() - 1.0, r)
+    if x < 0.0 {
+        r = 1.144729885849400174143427351353058711647 - sinpi(absx).abs().ln() - absx.ln() - r
+    }
+    if r.abs() == 1.0 / 0.0 {
+        fail(range_error())
+    }
+    return r
+}
+
+/// `math.gamma(x)`.
+pub fn gamma(x: f64) -> f64 ! PyMathError {
+    if not x.is_finite() {
+        if x.is_nan() or x > 0.0 {
+            return x
+        }
+        fail(domain())
+    }
+    if x == 0.0 {
+        fail(domain())
+    }
+    if x == x.floor() {
+        if x < 0.0 {
+            fail(domain())
+        }
+        if x <= 23.0 {
+            return gamma_integral(x.as_i64())
+        }
+    }
+    let absx = x.abs()
+    if absx < 1e-20 {
+        let r = 1.0 / x
+        if r.abs() == 1.0 / 0.0 {
+            fail(range_error())
+        }
+        return r
+    }
+    if absx > 200.0 {
+        if x < 0.0 {
+            return 0.0 / sinpi(x)
+        }
+        fail(range_error())
+    }
+    let y = absx + lanczos_g_minus_half()
+    var z = if absx > lanczos_g_minus_half() { (y - absx) - lanczos_g_minus_half() } else { (y - lanczos_g_minus_half()) - absx }
+    z = z * lanczos_g() / y
+    var r = 0.0
+    if x < 0.0 {
+        r = 0.0 - pi() / sinpi(absx) / absx * y.exp() / lanczos_sum(absx)
+        r = cfma(0.0 - z, r, r)
+        if absx < 140.0 {
+            r = r / y ^ (absx - 0.5)
+        } else {
+            let sqrtpow = y ^ (absx / 2.0 - 0.25)
+            r = r / sqrtpow
+            r = r / sqrtpow
+        }
+    } else {
+        r = lanczos_sum(absx) / y.exp()
+        r = cfma(z, r, r)
+        if absx < 140.0 {
+            r = r * y ^ (absx - 0.5)
+        } else {
+            let sqrtpow = y ^ (absx / 2.0 - 0.25)
+            r = r * sqrtpow
+            r = r * sqrtpow
+        }
+    }
+    if r.abs() == 1.0 / 0.0 {
+        fail(range_error())
+    }
+    return r
+}
+
+// ---- norms
+
+fn dl_fast_sum(a: f64, b: f64) -> (f64, f64) {
+    let x = a + b
+    return (x, (a - x) + b)
+}
+
+fn frexp_exponent(x: f64) -> i64 {
+    let e0 = x.to_bits().ushr(52).bit_and(2047)
+    if e0 != 0 {
+        return e0 - 1022
+    }
+    var m = x.to_bits().bit_and(4503599627370495)
+    var e = 0 - 1022
+    while m < 4503599627370496 {
+        m = m.shl(1)
+        e = e - 1
+    }
+    return e
+}
+
+/// CPython's vector_norm: scaled by a power of two, squared without loss,
+/// summed with two compensations, and corrected once.
+fn vector_norm(v0: [f64], max0: f64, found_nan: bool) -> f64 {
+    if max0.abs() == 1.0 / 0.0 {
+        return max0
+    }
+    if found_nan {
+        return 0.0 / 0.0
+    }
+    if max0 == 0.0 or v0.len() <= 1 {
+        return max0
+    }
+    let dbl_min = 2.2250738585072014e-308
+    let max_e = frexp_exponent(max0)
+    if max_e < 0 - 1023 {
+        return dbl_min * vector_norm(v0.map(|x| x / dbl_min), max0 / dbl_min, found_nan)
+    }
+    // ldexp(1, -max_e), subnormal when max is near the top of the range.
+    let scale = if 0 - max_e >= 0 - 1022 { (1023 - max_e).shl(52).from_bits() } else { 1.shl(1074 - max_e).from_bits() }
+    var csum = 1.0
+    var frac1 = 0.0
+    var frac2 = 0.0
+    for x0 in v0 {
+        let x = x0 * scale
+        let (ph, pl) = two_product(x, x)
+        let (sh, sl) = dl_fast_sum(csum, ph)
+        csum = sh
+        frac1 = frac1 + pl
+        frac2 = frac2 + sl
+    }
+    var h = (csum - 1.0 + (frac1 + frac2)).sqrt()
+    let (ph, pl) = two_product(0.0 - h, h)
+    let (sh, sl) = dl_fast_sum(csum, ph)
+    csum = sh
+    frac1 = frac1 + pl
+    frac2 = frac2 + sl
+    let x = csum - 1.0 + (frac1 + frac2)
+    h = h + x / (2.0 * h)
+    return h / scale
+}
+
+fn norm_of(abs_values: [f64]) -> f64 {
+    var max = 0.0
+    var nan = false
+    for x in abs_values {
+        nan = nan or x.is_nan()
+        if x > max {
+            max = x
+        }
+    }
+    return vector_norm(abs_values, max, nan)
+}
+
+/// `math.hypot(*coordinates)`.
+pub fn hypot(coordinates: [f64]) -> f64 {
+    return norm_of(coordinates.map(|x| x.abs()))
+}
+
+/// `math.dist(p, q)`.
+pub fn dist(p: [f64], q: [f64]) -> f64 ! PyMathError {
+    if p.len() != q.len() {
+        fail(PyMathValueError("both points must have the same number of dimensions"))
+    }
+    var d: [f64] = []
+    for i in 0..p.len() {
+        d.push((p[i] - q[i]).abs())
+    }
+    return norm_of(d)
+}
+
+// ---- bits
+
+/// `math.remainder(x, y)`: x - n*y with n the nearest integer, ties even.
+pub fn remainder(x: f64, y: f64) -> f64 ! PyMathError {
+    if x.is_finite() and y.is_finite() {
+        if y == 0.0 {
+            fail(domain())
+        }
+        let absx = x.abs()
+        let absy = y.abs()
+        let m = absx % absy
+        let c = absy - m
+        let r = if m < c { m } else if m > c { 0.0 - c } else { m - 2.0 * ((0.5 * (absx - m)) % absy) }
+        return if x.to_bits() < 0 { -1.0 * r } else { r }
+    }
+    if x.is_nan() {
+        return x
+    }
+    if y.is_nan() {
+        return y
+    }
+    if not x.is_finite() {
+        fail(domain())
+    }
+    return x
+}
+
+fn next_toward(x: f64, y: f64) -> f64 {
+    if x.is_nan() or y.is_nan() {
+        return x + y
+    }
+    if x == y {
+        return y
+    }
+    if x == 0.0 {
+        let tiny = 1.from_bits()
+        return if y > 0.0 { tiny } else { 0.0 - tiny }
+    }
+    let b = x.to_bits()
+    return (if (y > x) == (x > 0.0) { b + 1 } else { b - 1 }).from_bits()
+}
+
+fn ult(a: i64, b: i64) -> bool {
+    return a.bit_xor(1.shl(63)) < b.bit_xor(1.shl(63))
+}
+
+/// `math.nextafter(x, y, steps=...)`; `steps` None is a single step.
+pub fn nextafter(x: f64, y: f64, steps: Option[i64]) -> f64 ! PyMathError {
+    let n = match steps {
+        None -> return next_toward(x, y)
+        Some(k) -> k
+    }
+    if n < 0 {
+        fail(PyMathValueError("steps must be a non-negative integer"))
+    }
+    if n == 0 or x.is_nan() {
+        return x
+    }
+    if y.is_nan() {
+        return y
+    }
+    let ux = x.to_bits()
+    let uy = y.to_bits()
+    if ux == uy {
+        return x
+    }
+    let sign = 1.shl(63)
+    let ax = ux.bit_and(sign.bit_not())
+    let ay = uy.bit_and(sign.bit_not())
+    if ux.bit_xor(uy).bit_and(sign) != 0 {
+        // ax + ay can pass 2^63; compared as the unsigned 64 bits C has.
+        if not ult(n, ax + ay) {
+            return y
+        }
+        if ax < n {
+            return uy.bit_and(sign).bit_or(n - ax).from_bits()
+        }
+        return (ux - n).from_bits()
+    }
+    if ax > ay {
+        return if ax - ay >= n { (ux - n).from_bits() } else { y }
+    }
+    return if ay - ax >= n { (ux + n).from_bits() } else { y }
+}
+
+/// `math.ulp(x)`.
+pub fn ulp(x0: f64) -> f64 {
+    if x0.is_nan() {
+        return x0
+    }
+    let x = x0.abs()
+    if x == 1.0 / 0.0 {
+        return x
+    }
+    let x2 = next_toward(x, 1.0 / 0.0)
+    if x2 == 1.0 / 0.0 {
+        return x - next_toward(x, -1.0 / 0.0)
+    }
+    return x2 - x
+}
+
+// ---- integers
+
+/// `math.isqrt(n)`.
+pub fn isqrt(n: i64) -> i64 ! PyMathError {
+    if n < 0 {
+        fail(PyMathValueError("isqrt() argument must be nonnegative"))
+    }
+    var r = n.as_f64().sqrt().as_i64()
+    while r * r > n {
+        r = r - 1
+    }
+    while (r + 1) * (r + 1) <= n and (r + 1) <= 3037000499 {
+        r = r + 1
+    }
+    return r
+}
+
+/// `math.comb(n, k)`, as decimal digits.
+pub fn comb(n: i64, k: i64) -> str ! PyMathError {
+    if n < 0 {
+        fail(PyMathValueError("n must be a non-negative integer"))
+    }
+    if k < 0 {
+        fail(PyMathValueError("k must be a non-negative integer"))
+    }
+    if k > n {
+        return "0"
+    }
+    let kk = k.min(n - k)
+    var acc = bigint.from_i64(1)
+    for i in 0..kk {
+        acc = bigint.div(bigint.mul(acc, bigint.from_i64(n - i)), bigint.from_i64(i + 1)) ?? acc
+    }
+    return bigint.to_str(acc)
+}
+
+/// `math.perm(n, k)`; `k` None is `factorial(n)`.
+pub fn perm(n: i64, k: Option[i64]) -> str ! PyMathError {
+    let kk = match k {
+        Some(v) -> v
+        None -> return try factorial(n)
+    }
+    if n < 0 {
+        fail(PyMathValueError("n must be a non-negative integer"))
+    }
+    if kk < 0 {
+        fail(PyMathValueError("k must be a non-negative integer"))
+    }
+    if kk > n {
+        return "0"
+    }
+    var acc = bigint.from_i64(1)
+    for i in 0..kk {
+        acc = bigint.mul(acc, bigint.from_i64(n - i))
+    }
+    return bigint.to_str(acc)
+}
+
+/// `math.factorial(n)`.
+pub fn factorial(n: i64) -> str ! PyMathError {
+    if n < 0 {
+        fail(PyMathValueError("factorial() not defined for negative values"))
+    }
+    return bigint.to_str(bigint.factorial(n))
+}
+
+fn gcd2(a: i64, b: i64) -> i64 {
+    var x = a.abs()
+    var y = b.abs()
+    while y != 0 {
+        let t = x % y
+        x = y
+        y = t
+    }
+    return x
+}
+
+/// `math.gcd(*integers)`.
+pub fn gcd(xs: [i64]) -> i64 {
+    var g = 0
+    for x in xs {
+        g = gcd2(g, x)
+    }
+    return g
+}
+
+/// `math.lcm(*integers)`, as decimal digits; 1 for none, 0 if any is 0.
+pub fn lcm(xs: [i64]) -> str {
+    var acc = bigint.from_i64(1)
+    for x in xs {
+        if x == 0 {
+            return "0"
+        }
+        let a = if bigint.sign(acc) < 0 { bigint.negate(acc) } else { acc }
+        let b = bigint.from_i64(x.abs())
+        let g = big_gcd(a, b)
+        acc = bigint.mul(bigint.div(a, g) ?? a, b)
+    }
+    return bigint.to_str(acc)
+}
+
+fn big_gcd(a0: BigInt, b0: BigInt) -> BigInt {
+    var a = a0
+    var b = b0
+    while not bigint.is_zero(b) {
+        let t = bigint.rem(a, b) ?? bigint.zero()
+        a = b
+        b = t
+    }
+    return a
+}

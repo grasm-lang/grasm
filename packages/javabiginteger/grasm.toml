@@ -1,0 +1,12 @@
+[package]
+name = "javabiginteger"
+version = "1.0.0"
+capabilities = []
+
+[dependencies.bigint]
+path = "../bigint"
+version = "^1.0.0"
+
+[dependencies.pycharclass]
+path = "../pycharclass"
+version = "^1.0.0"

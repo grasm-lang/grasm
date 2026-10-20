@@ -1,0 +1,12 @@
+[package]
+name = "gojson"
+version = "1.0.0"
+capabilities = []
+
+[dependencies.gostrconv]
+path = "../gostrconv"
+version = "^1.0.0"
+
+[dependencies.goquote]
+path = "../goquote"
+version = "^1.0.0"

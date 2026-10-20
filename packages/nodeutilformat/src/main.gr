@@ -1,0 +1,308 @@
+// Node's `util.format` and `util.inspect` for primitive values, as Node 25
+// formats them: what `console.log` prints for strings, numbers, bigints,
+// booleans, `null` and `undefined`.
+//
+// Log lines are compared, grepped and parsed, and a tool that produces the
+// same lines a Node service would -- or reads them back -- needs Node's
+// rules:
+//
+//   - `%s` prints numbers as `inspect` does (`-0`), bigints with an `n`,
+//     the rest as `String()`; `%d` is `Number(x)`, `%i` `parseInt`, `%f`
+//     `parseFloat`; `%j` is `JSON.stringify` (so `undefined` prints as
+//     `undefined`, and a bigint throws); `%o` and `%O` inspect; `%c`
+//     swallows its argument; `%%` is `%`.
+//   - A placeholder with no argument left stays as written, and arguments
+//     left over follow, strings as they are and anything else inspected.
+//   - `inspect` quotes a string with `'`, or `"` if it holds `'`, or a
+//     backtick if it holds both; escapes control characters as `\n`,
+//     `\x0B` and the like, C1 controls as `\x85`, and a lone surrogate as
+//     `\ud800`; and splits one longer than 76 units after each newline,
+//     joining the pieces with ` +` and a new line.
+//
+// Strings are UTF-16 code units, as in JavaScript.
+
+import jsjson
+import jsnumber
+import jsradix
+
+/// A JavaScript primitive.
+type UtilValue =
+    | JvString(us: [i64])
+    | JvNumber(n: f64)
+    | JvBigInt(digits: str)
+    | JvBool(b: bool)
+    | JvNull
+    | JvUndefined
+
+/// The TypeError `%j` raises for a bigint.
+type UtilFormatError = | UfTypeError(msg: str)
+
+pub fn error_text(e: UtilFormatError) -> str {
+    return match e {
+        UfTypeError(m) -> m
+    }
+}
+
+fn units(s: str) -> [i64] {
+    return jsjson.units(s)
+}
+
+/// formatNumber without separators: `-0` for negative zero.
+fn number_text(n: f64) -> [i64] {
+    if n == 0.0 and n.to_bits() < 0 {
+        return units("-0")
+    }
+    return units(jsnumber.to_string(n))
+}
+
+fn meta(c: i64) -> str {
+    if c == 8 {
+        return "\\b"
+    }
+    if c == 9 {
+        return "\\t"
+    }
+    if c == 10 {
+        return "\\n"
+    }
+    if c == 12 {
+        return "\\f"
+    }
+    if c == 13 {
+        return "\\r"
+    }
+    if c == 39 {
+        return "\\'"
+    }
+    if c == 92 {
+        return "\\\\"
+    }
+    let digits = "0123456789ABCDEF"
+    return "\\x" + digits.substr(c.shr(4), 1) + digits.substr(c.bit_and(15), 1)
+}
+
+/// strEscape: the string quoted and escaped.
+fn str_escape(us: [i64]) -> [i64] {
+    var quote = 39
+    if us.contains(39) {
+        if not us.contains(34) {
+            quote = 34
+        } else if not us.contains(96) and not has_dollar_brace(us) {
+            quote = 96
+        }
+    }
+    var out = [quote]
+    var i = 0
+    while i < us.len() {
+        let c = us[i]
+        if (c == 39 and quote == 39) or c == 92 or c < 32 or (c > 126 and c < 160) {
+            out = out + units(meta(c))
+        } else if c >= 55296 and c <= 57343 {
+            if c <= 56319 and i + 1 < us.len() and us[i + 1] >= 56320 and us[i + 1] <= 57343 {
+                out.push(c)
+                out.push(us[i + 1])
+                i = i + 1
+            } else {
+                out = out + units("\\u" + hex(c))
+            }
+        } else {
+            out.push(c)
+        }
+        i = i + 1
+    }
+    out.push(quote)
+    return out
+}
+
+fn has_dollar_brace(us: [i64]) -> bool {
+    for i in 0..(us.len() - 1) {
+        if us[i] == 36 and us[i + 1] == 123 {
+            return true
+        }
+    }
+    return false
+}
+
+fn hex(n: i64) -> str {
+    let digits = "0123456789abcdef"
+    var out = ""
+    var v = n
+    while v > 0 {
+        out = digits.substr(v % 16, 1) + out
+        v = v / 16
+    }
+    return if out.len() == 0 { "0" } else { out }
+}
+
+/// formatPrimitive for a string: cut at 10000 units, split after
+/// newlines when longer than 76.
+fn inspect_string(us0: [i64]) -> [i64] {
+    var us = us0
+    var trailer: [i64] = []
+    if us.len() > 10000 {
+        let remaining = us.len() - 10000
+        us = us.slice(0, 10000)
+        trailer = units("... " + remaining.to_str() + " more character" + if remaining > 1 { "s" } else { "" })
+    }
+    if us.len() > 16 and us.len() > 76 {
+        var pieces: [[i64]] = []
+        var start = 0
+        for i in 0..us.len() {
+            if us[i] == 10 and i + 1 < us.len() {
+                pieces.push(us.slice(start, i + 1))
+                start = i + 1
+            }
+        }
+        pieces.push(us.slice(start, us.len()))
+        var out: [i64] = []
+        for k in 0..pieces.len() {
+            if k > 0 {
+                out = out + units(" +\n  ")
+            }
+            out = out + str_escape(pieces[k])
+        }
+        return out + trailer
+    }
+    return str_escape(us) + trailer
+}
+
+/// `util.inspect(v)`.
+pub fn inspect(v: UtilValue) -> [i64] {
+    return match v {
+        JvString(us) -> inspect_string(us)
+        JvNumber(n) -> number_text(n)
+        JvBigInt(d) -> units(d + "n")
+        JvBool(b) -> units(if b { "true" } else { "false" })
+        JvNull -> units("null")
+        JvUndefined -> units("undefined")
+    }
+}
+
+/// `String(v)`.
+fn string_of(v: UtilValue) -> [i64] {
+    return match v {
+        JvString(us) -> us
+        JvNumber(n) -> units(jsnumber.to_string(n))
+        JvBigInt(d) -> units(d)
+        JvBool(b) -> units(if b { "true" } else { "false" })
+        JvNull -> units("null")
+        JvUndefined -> units("undefined")
+    }
+}
+
+/// `Number(v)`.
+fn number_of(v: UtilValue) -> f64 {
+    return match v {
+        JvString(us) -> jsnumber.number(jsjson.text(us))
+        JvNumber(n) -> n
+        JvBigInt(_d) -> 0.0
+        JvBool(b) -> if b { 1.0 } else { 0.0 }
+        JvNull -> 0.0
+        JvUndefined -> 0.0 / 0.0
+    }
+}
+
+fn placeholder(c: i64, v: UtilValue) -> [i64] ! UtilFormatError {
+    let big = match v {
+        JvBigInt(d) -> Some(d)
+        _ -> None
+    }
+    if c == 115 {
+        return match v {
+            JvNumber(n) -> number_text(n)
+            JvBigInt(d) -> units(d + "n")
+            _ -> string_of(v)
+        }
+    }
+    if c == 106 {
+        return match v {
+            JvString(us) -> jsjson.quote(us)
+            JvNumber(n) -> if n != n or n == 1.0 / 0.0 or n == -1.0 / 0.0 { units("null") } else { units(jsnumber.to_string(n)) }
+            JvBigInt(_d) -> fail(UfTypeError("Do not know how to serialize a BigInt"))
+            JvBool(b) -> units(if b { "true" } else { "false" })
+            JvNull -> units("null")
+            JvUndefined -> units("undefined")
+        }
+    }
+    if c == 100 {
+        return match big {
+            Some(d) -> units(d + "n")
+            None -> number_text(number_of(v))
+        }
+    }
+    if c == 105 {
+        return match big {
+            Some(d) -> units(d + "n")
+            None -> number_text(jsradix.parse_int(jsjson.text(string_of(v)), 0))
+        }
+    }
+    if c == 102 {
+        return number_text(jsnumber.parse_float(jsjson.text(string_of(v))))
+    }
+    // %o and %O.
+    return inspect(v)
+}
+
+/// `util.format(...args)`, as UTF-16 code units.
+pub fn format(args: [UtilValue]) -> [i64] ! UtilFormatError {
+    var str: [i64] = []
+    var join: [i64] = []
+    var a = 0
+    match args.len() > 0 and match args[0] {
+        JvString(_us) -> true
+        _ -> false
+    } {
+        true -> {
+            let first = match args[0] {
+                JvString(us) -> us
+                _ -> []
+            }
+            if args.len() == 1 {
+                return first
+            }
+            var last = 0
+            var i = 0
+            while i < first.len() - 1 {
+                if first[i] == 37 {
+                    i = i + 1
+                    let next = first[i]
+                    if a + 1 != args.len() {
+                        if next == 37 {
+                            str = str + first.slice(last, i)
+                            last = i + 1
+                        } else if [115, 106, 100, 79, 111, 105, 102, 99].contains(next) {
+                            a = a + 1
+                            let piece = if next == 99 { [] } else { try placeholder(next, args[a]) }
+                            if last != i - 1 {
+                                str = str + first.slice(last, i - 1)
+                            }
+                            str = str + piece
+                            last = i + 1
+                        }
+                    } else if next == 37 {
+                        str = str + first.slice(last, i)
+                        last = i + 1
+                    }
+                }
+                i = i + 1
+            }
+            if last != 0 {
+                a = a + 1
+                join = [32]
+                if last < first.len() {
+                    str = str + first.slice(last, first.len())
+                }
+            }
+        }
+        false -> {}
+    }
+    while a < args.len() {
+        str = str + join + match args[a] {
+            JvString(us) -> us
+            _ -> inspect(args[a])
+        }
+        join = [32]
+        a = a + 1
+    }
+    return str
+}

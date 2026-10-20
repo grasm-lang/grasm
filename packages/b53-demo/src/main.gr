@@ -1,0 +1,84 @@
+// Eight libraries, each run once on an input whose answer came from the
+// tool it is held to -- Python 3.13 for four, Go 1.25, Java 17, Node 25
+// and Ruby 2.6 for one each. scripts/b53_diff.sh holds them to those
+// tools on thousands more.
+import bigint
+import goencoding
+import javabiginteger
+import nodestringdecoder
+import pycookies
+import pyemailutils
+import pyglob
+import pyquopri
+import rubystring
+
+fn go() {
+    let (b, err) = goencoding.base64_decode(goencoding.std_encoding(), "YWJj\nZA=x".to_bytes())
+    assert_eq(b.to_str(), "abc")
+    assert_eq(goencoding.error_text(err ?? GoHexOddLength), "illegal base64 data at input byte 7")
+    let (_h, herr) = goencoding.hex_decode("4g".to_bytes())
+    assert_eq(goencoding.error_text(herr ?? GoHexOddLength), "encoding/hex: invalid byte: U+0067 'g'")
+    let (a, used, aerr) = goencoding.ascii85_decode("87cURD]i,".to_bytes(), false)
+    assert_eq(a.to_str(), "Hell")
+    assert_eq(used, 5)
+    assert(aerr.is_none())
+    assert_eq(goencoding.hex_dump("grasm".to_bytes()), "00000000  67 72 61 73 6d                                    |grasm|\n")
+    print("go: Go's")
+}
+
+fn java() {
+    let n = javabiginteger.parse("-ff", 16) ?? bigint.zero()
+    assert_eq(bigint.to_str(n), "-255")
+    assert_eq(javabiginteger.to_byte_array(javabiginteger.parse("-256", 10) ?? bigint.zero()).to_list(), [255, 0])
+    assert_eq(bigint.to_str(javabiginteger.mod_inverse(bigint.from_i64(3), bigint.from_i64(11)) ?? bigint.zero()), "4")
+    assert_eq(bigint.to_str(javabiginteger.shift_right(bigint.from_i64(0 - 5), 1)), "-3")
+    assert_eq(bigint.to_str(javabiginteger.and_bits(bigint.from_i64(0 - 7), bigint.from_i64(12))), "8")
+    let msg = match javabiginteger.parse("12x4", 10) {
+        Ok(_v) -> ""
+        Err(e) -> javabiginteger.error_text(e)
+    }
+    assert_eq(msg, "For input string: \"12x4\"")
+    print("java: Java's")
+}
+
+fn node() {
+    var d = nodestringdecoder.new_decoder(Some("utf8")) ?? nodestringdecoder.new_decoder(None) ?? NodeStringDecoder{ encoding: "", held: [], missing: 0 }
+    let euro = "€".to_bytes().to_list()
+    assert_eq(nodestringdecoder.write(d, bytes_of(euro.slice(0, 1))), [])
+    assert_eq(nodestringdecoder.write(d, bytes_of(euro.slice(1, 3))), [8364])
+    assert_eq(nodestringdecoder.end(d, Some(bytes_of([226]))), [65533])
+    print("node: Node's")
+}
+
+fn ruby() {
+    assert_eq(rubystring.succ("Zz".to_bytes()).to_str(), "AAa")
+    assert_eq(rubystring.succ("a.9".to_bytes()).to_str(), "a.10")
+    assert_eq((rubystring.tr("hello".to_bytes(), "el".to_bytes(), "ip".to_bytes()) ?? bytes_of([])).to_str(), "hippo")
+    assert_eq((rubystring.squeeze("aaabbbccc".to_bytes(), ["a-b".to_bytes()]) ?? bytes_of([])).to_str(), "abccc")
+    assert_eq(rubystring.count("hello world".to_bytes(), ["lo".to_bytes(), "o".to_bytes()]) ?? 0, 2)
+    print("ruby: Ruby's")
+}
+
+fn python() {
+    assert_eq(pyglob.translate("**/*.py", true, false, "/"), "(?s:(?:[^/.][^/]*/)*(?!\\.)[^/]*\\.py)\\Z")
+    assert_eq(pyquopri.encode("café \nx".to_bytes(), false, true, false).to_str(), "caf=C3=A9=20\nx")
+    let who = pyemailutils.parseaddr("\"Doe, John\" <j@x.org>", true)
+    assert_eq(who.name, "Doe, John")
+    assert_eq(who.address, "j@x.org")
+    assert_eq(pyemailutils.parseaddr("j@x.org (John)", true).name, "John")
+    assert_eq(pyemailutils.getaddresses(["a@b, (bad"], true).map(|a| a.address), [""])
+    assert_eq(pyemailutils.formataddr("Jean-Pierre Lefèvre", "jp@x.fr") ?? "", "=?utf-8?q?Jean-Pierre_Lef=C3=A8vre?= <jp@x.fr>")
+    var c = pycookies.new_cookie()
+    assert((pycookies.load(c, "a=b; Path=/; Secure; c=\"x\\073y\"") ?? ()) == ())
+    assert_eq(pycookies.output(c), "Set-Cookie: a=b; Path=/; Secure\r\nSet-Cookie: c=\"x\\073y\"")
+    assert_eq(pycookies.values(c)[1].1, "x;y")
+    print("python: CPython's")
+}
+
+fn main() / {io} {
+    go()
+    java()
+    node()
+    ruby()
+    python()
+}

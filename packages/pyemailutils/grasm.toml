@@ -1,0 +1,12 @@
+[package]
+name = "pyemailutils"
+version = "1.0.0"
+capabilities = []
+
+[dependencies.pycharclass]
+path = "../pycharclass"
+version = "^1.0.0"
+
+[dependencies.goencoding]
+path = "../goencoding"
+version = "^1.0.0"

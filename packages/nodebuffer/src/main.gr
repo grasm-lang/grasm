@@ -1,0 +1,356 @@
+// Node's `Buffer` string conversions, as Node 25 does them:
+// `Buffer.from(string, encoding)`, `buf.toString(encoding)` and
+// `Buffer.byteLength(string, encoding)`, for `utf8`, `utf16le`, `latin1`,
+// `ascii`, `base64`, `base64url` and `hex`.
+//
+// Node decodes leniently and never throws on bad input, so data that
+// passed through a Node service carries Node's guesses; reading it the
+// same way needs the same rules:
+//
+//   - base64 and base64url read both alphabets, skip anything else, and
+//     stop at the first `=`; a final group of two or three characters
+//     gives one or two bytes, a lone character nothing.
+//   - hex stops at the first pair that is not hex, and drops an odd last
+//     digit.
+//   - Both read only the low byte of each UTF-16 unit, so `ř` (U+0159)
+//     is read as `Y`, and the first half of an emoji (U+D83D) as `=`,
+//     which ends the data.
+//   - `latin1` and `ascii` both keep the low byte of each UTF-16 unit;
+//     reading, `ascii` clears the top bit.
+//   - UTF-8 writes a lone surrogate as U+FFFD and reads each maximal
+//     invalid subsequence as one U+FFFD; UTF-16 reading drops an odd byte.
+//   - `byteLength` for base64 is arithmetic on the length, not a decode:
+//     `byteLength("YQ===", "base64")` is 2 where the bytes are 1.
+//
+// Strings are lists of UTF-16 code units, as in JavaScript, so a lone
+// surrogate can be written and read back; `units` and `text` convert.
+
+type NodeEncoding =
+    | EncUtf8
+    | EncUtf16le
+    | EncLatin1
+    | EncAscii
+    | EncBase64
+    | EncBase64url
+    | EncHex
+
+/// Node's `ERR_UNKNOWN_ENCODING`.
+type NodeBufferError = | UnknownEncoding(name: str)
+
+pub fn error_text(e: NodeBufferError) -> str {
+    return match e {
+        UnknownEncoding(n) -> "Unknown encoding: " + n
+    }
+}
+
+/// An encoding by any name Node accepts, in any case.
+pub fn encoding(name: str) -> NodeEncoding ! NodeBufferError {
+    let n = name.to_lower()
+    if n == "utf8" or n == "utf-8" {
+        return EncUtf8
+    }
+    if n == "ucs2" or n == "ucs-2" or n == "utf16le" or n == "utf-16le" {
+        return EncUtf16le
+    }
+    if n == "latin1" or n == "binary" {
+        return EncLatin1
+    }
+    if n == "ascii" {
+        return EncAscii
+    }
+    if n == "base64" {
+        return EncBase64
+    }
+    if n == "base64url" {
+        return EncBase64url
+    }
+    if n == "hex" {
+        return EncHex
+    }
+    fail(UnknownEncoding(name))
+}
+
+/// A string's UTF-16 code units.
+pub fn units(s: str) -> [i64] {
+    var out: [i64] = []
+    for c in s.codes() {
+        if c >= 65536 {
+            out.push(55296 + (c - 65536).shr(10))
+            out.push(56320 + (c - 65536).bit_and(1023))
+        } else {
+            out.push(c)
+        }
+    }
+    return out
+}
+
+/// Code units back to text, a lone surrogate as U+FFFD.
+pub fn text(us: [i64]) -> str {
+    return code_points(us).map(|c| c.to_char()).join("")
+}
+
+/// Code points, pairing surrogates; a lone one becomes U+FFFD.
+fn code_points(us: [i64]) -> [i64] {
+    var out: [i64] = []
+    var i = 0
+    while i < us.len() {
+        let u = us[i]
+        if u >= 55296 and u <= 56319 and i + 1 < us.len() and us[i + 1] >= 56320 and us[i + 1] <= 57343 {
+            out.push(65536 + (u - 55296).shl(10) + (us[i + 1] - 56320))
+            i = i + 2
+        } else {
+            out.push(if u >= 55296 and u <= 57343 { 65533 } else { u })
+            i = i + 1
+        }
+    }
+    return out
+}
+
+fn b64_value(c: i64) -> i64 {
+    if c >= 65 and c <= 90 {
+        return c - 65
+    }
+    if c >= 97 and c <= 122 {
+        return c - 71
+    }
+    if c >= 48 and c <= 57 {
+        return c + 4
+    }
+    if c == 43 or c == 45 {
+        return 62
+    }
+    if c == 47 or c == 95 {
+        return 63
+    }
+    return 0 - 1
+}
+
+fn hex_value(c: i64) -> i64 {
+    return if c >= 48 and c <= 57 { c - 48 } else if c >= 97 and c <= 102 { c - 87 } else if c >= 65 and c <= 70 { c - 55 } else { 0 - 1 }
+}
+
+fn decode_base64(us: [i64]) -> [i64] {
+    var vals: [i64] = []
+    for c in us {
+        if c == 61 {
+            break
+        }
+        let v = b64_value(c)
+        if v >= 0 {
+            vals.push(v)
+        }
+    }
+    var out: [i64] = []
+    var i = 0
+    while i + 1 < vals.len() {
+        let n = if vals.len() - i >= 4 { 4 } else { vals.len() - i }
+        let a = vals[i]
+        let b = vals[i + 1]
+        out.push(a.shl(2).bit_or(b.shr(4)))
+        if n >= 3 {
+            out.push(b.bit_and(15).shl(4).bit_or(vals[i + 2].shr(2)))
+        }
+        if n == 4 {
+            out.push(vals[i + 2].bit_and(3).shl(6).bit_or(vals[i + 3]))
+        }
+        i = i + 4
+    }
+    return out
+}
+
+fn encode_utf8(us: [i64]) -> [i64] {
+    var out: [i64] = []
+    for cp in code_points(us) {
+        for b in cp.to_char().to_bytes().to_list() {
+            out.push(b)
+        }
+    }
+    return out
+}
+
+/// `Buffer.from(string, encoding)`, the string as UTF-16 code units.
+pub fn from_string(us: [i64], enc: NodeEncoding) -> bytes {
+    let out = match enc {
+        EncUtf8 -> encode_utf8(us)
+        EncUtf16le -> {
+            var b: [i64] = []
+            for u in us {
+                b.push(u.bit_and(255))
+                b.push(u.shr(8))
+            }
+            b
+        }
+        EncLatin1 -> us.map(|u| u.bit_and(255))
+        EncAscii -> us.map(|u| u.bit_and(255))
+        EncBase64 -> decode_base64(us.map(|u| u.bit_and(255)))
+        EncBase64url -> decode_base64(us.map(|u| u.bit_and(255)))
+        EncHex -> {
+            let low = us.map(|u| u.bit_and(255))
+            var b: [i64] = []
+            var i = 0
+            while i + 1 < low.len() and hex_value(low[i]) >= 0 and hex_value(low[i + 1]) >= 0 {
+                b.push(hex_value(low[i]) * 16 + hex_value(low[i + 1]))
+                i = i + 2
+            }
+            b
+        }
+    }
+    return bytes_of(out)
+}
+
+/// `Buffer.byteLength(string, encoding)`.
+pub fn byte_length(us: [i64], enc: NodeEncoding) -> i64 {
+    return match enc {
+        EncUtf8 -> encode_utf8(us).len()
+        EncUtf16le -> us.len() * 2
+        EncLatin1 -> us.len()
+        EncAscii -> us.len()
+        EncHex -> us.len().shr(1)
+        _ -> {
+            var n = us.len()
+            if n > 0 and us[n - 1] == 61 {
+                n = n - 1
+            }
+            if n > 1 and us[n - 1] == 61 {
+                n = n - 1
+            }
+            (n * 3).shr(2)
+        }
+    }
+}
+
+/// UTF-8 to code points, each maximal invalid subsequence as one U+FFFD.
+fn decode_utf8(b: [i64]) -> [i64] {
+    var out: [i64] = []
+    var i = 0
+    while i < b.len() {
+        let c = b[i]
+        if c < 128 {
+            out.push(c)
+            i = i + 1
+            continue
+        }
+        let n = if c >= 194 and c <= 223 { 2 } else if c >= 224 and c <= 239 { 3 } else if c >= 240 and c <= 244 { 4 } else { 0 }
+        if n == 0 {
+            out.push(65533)
+            i = i + 1
+            continue
+        }
+        var cp = c.bit_and(if n == 2 { 31 } else if n == 3 { 15 } else { 7 })
+        var k = 1
+        var ok = true
+        while k < n {
+            if i + k >= b.len() {
+                ok = false
+                break
+            }
+            let lo = if k == 1 and c == 224 { 160 } else if k == 1 and c == 240 { 144 } else { 128 }
+            let hi = if k == 1 and c == 237 { 159 } else if k == 1 and c == 244 { 143 } else { 191 }
+            if b[i + k] < lo or b[i + k] > hi {
+                ok = false
+                break
+            }
+            cp = cp.shl(6).bit_or(b[i + k].bit_and(63))
+            k = k + 1
+        }
+        if ok {
+            out.push(cp)
+            i = i + n
+        } else {
+            out.push(65533)
+            i = i + k
+        }
+    }
+    return out
+}
+
+fn to_units(cps: [i64]) -> [i64] {
+    var out: [i64] = []
+    for c in cps {
+        if c >= 65536 {
+            out.push(55296 + (c - 65536).shr(10))
+            out.push(56320 + (c - 65536).bit_and(1023))
+        } else {
+            out.push(c)
+        }
+    }
+    return out
+}
+
+fn encode_base64(b: [i64], url: bool) -> [i64] {
+    let alphabet = (if url { "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_" } else {
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+    }).codes()
+    var out: [i64] = []
+    var i = 0
+    while i < b.len() {
+        let n = if b.len() - i >= 3 { 3 } else { b.len() - i }
+        let x = b[i].shl(16) + (if n > 1 { b[i + 1].shl(8) } else { 0 }) + (if n > 2 { b[i + 2] } else { 0 })
+        out.push(alphabet[x.shr(18).bit_and(63)])
+        out.push(alphabet[x.shr(12).bit_and(63)])
+        if n > 1 {
+            out.push(alphabet[x.shr(6).bit_and(63)])
+        } else if not url {
+            out.push(61)
+        }
+        if n > 2 {
+            out.push(alphabet[x.bit_and(63)])
+        } else if not url {
+            out.push(61)
+        }
+        i = i + 3
+    }
+    return out
+}
+
+/// `buf.toString(encoding)`, as UTF-16 code units.
+pub fn to_string(buf: bytes, enc: NodeEncoding) -> [i64] {
+    let b = buf.to_list()
+    return match enc {
+        EncUtf8 -> to_units(decode_utf8(b))
+        EncUtf16le -> {
+            var out: [i64] = []
+            var i = 0
+            while i + 1 < b.len() {
+                out.push(b[i] + b[i + 1].shl(8))
+                i = i + 2
+            }
+            out
+        }
+        EncLatin1 -> b
+        EncAscii -> b.map(|x| x.bit_and(127))
+        EncBase64 -> encode_base64(b, false)
+        EncBase64url -> encode_base64(b, true)
+        EncHex -> {
+            let digits = "0123456789abcdef".codes()
+            var out: [i64] = []
+            for x in b {
+                out.push(digits[x.shr(4)])
+                out.push(digits[x.bit_and(15)])
+            }
+            out
+        }
+    }
+}
+
+/// `Buffer.from(string, name)`: an unknown name throws, even for "".
+pub fn from_string_named(us: [i64], name: str) -> bytes ! NodeBufferError {
+    return from_string(us, try encoding(name))
+}
+
+/// `buf.toString(name)`: an empty buffer is "" before the name is looked
+/// at.
+pub fn to_string_named(buf: bytes, name: str) -> [i64] ! NodeBufferError {
+    if buf.len() == 0 {
+        return []
+    }
+    return to_string(buf, try encoding(name))
+}
+
+/// `Buffer.byteLength(string, name)`: an unknown name counts as UTF-8.
+pub fn byte_length_named(us: [i64], name: str) -> i64 {
+    return match encoding(name) {
+        Ok(e) -> byte_length(us, e)
+        Err(_e) -> encode_utf8(us).len()
+    }
+}

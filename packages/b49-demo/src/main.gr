@@ -1,0 +1,126 @@
+// Eight libraries, each run once on an input whose answer came from the
+// tool it is held to -- Go 1.25 for four, Python 3.13 for four.
+// scripts/b49_diff.sh holds them to those tools on thousands more.
+import gostrconv
+import gonetip
+import gourl
+import gomime
+import pyurlparse
+import pyrandom
+import pymath
+import pystatistics
+
+fn go_numbers() {
+    assert_eq(gostrconv.format_float(1e21, "g", 0 - 1, 64), "1e+21")
+    assert_eq(gostrconv.format_float(3.0, "x", 0 - 1, 64), "0x1.8p+01")
+    // 0.1 printed as the float32 it rounds to, in as few digits as that needs.
+    assert_eq(gostrconv.format_float(0.1, "g", 0 - 1, 32), "0.1")
+    assert_eq(gostrconv.format_float(2.5, "f", 0, 64), "2")
+    assert_eq(gostrconv.format_float(1.0 / 3.0, "e", 3, 64), "3.333e-01")
+    let (v, e) = gostrconv.parse_float("1e400", 64)
+    assert_eq(v, 1.0 / 0.0)
+    assert_eq(match e {
+        Some(x) -> gostrconv.error_text(x)
+        None -> ""
+    }, "strconv.ParseFloat: parsing \"1e400\": value out of range")
+    let (i, _e) = gostrconv.parse_int("0x_1f", 0, 64)
+    assert_eq(i, 31)
+    let (j, e2) = gostrconv.parse_int("300", 10, 8)
+    assert_eq(j, 127)
+    assert_eq(match e2 {
+        Some(x) -> x.err
+        None -> ""
+    }, "value out of range")
+    print("strconv: Go's")
+}
+
+fn go_net() {
+    let a = gonetip.parse_addr("2001:db8:0:0:0:0:0:1") ?? gonetip.invalid()
+    assert_eq(gonetip.to_string(a), "2001:db8::1")
+    let b = gonetip.parse_addr("::ffff:1.2.3.4") ?? gonetip.invalid()
+    assert_eq(gonetip.to_string(b), "::ffff:1.2.3.4")
+    assert_eq(gonetip.to_string(gonetip.unmap(b)), "1.2.3.4")
+    let refused = match gonetip.parse_addr("010.1.1.1") {
+        Ok(_a) -> "accepted"
+        Err(e) -> match e {
+            NetipFailed(t) -> t
+        }
+    }
+    assert_eq(refused, "ParseAddr(\"010.1.1.1\"): IPv4 field has octet with leading zero")
+    let p = gonetip.parse_prefix("10.1.2.3/8") ?? NetPrefix{ addr: gonetip.invalid(), bits_plus_one: 0 }
+    assert_eq(gonetip.prefix_string(gonetip.masked(p)), "10.0.0.0/8")
+    let u = gourl.parse("http://u:p@h:80/a%2Fb?x=1#f") ?? panic("url")
+    assert_eq(gourl.to_string(u), "http://u:p@h:80/a%2Fb?x=1#f")
+    assert_eq(gourl.escaped_path(u), "/a%2Fb")
+    assert_eq(u.path.to_str(), "/a/b")
+    assert_eq(gourl.redacted(u), "http://u:xxxxx@h:80/a%2Fb?x=1#f")
+    assert_eq(gourl.port(u), "80")
+    let base = gourl.parse("http://a/b/c/d;p?q") ?? panic("url")
+    assert_eq(gourl.to_string(gourl.parse_reference(base, "../g/./h/..") ?? base), "http://a/b/g/")
+    let bad = match gourl.parse("http://[::1") {
+        Ok(_u) -> "accepted"
+        Err(e) -> match e {
+            UrlFailed(t) -> t
+        }
+    }
+    assert_eq(bad, "parse \"http://[::1\": missing ']' in host")
+    let (t, params, _err) = gomime.parse_media_type("form-data; name=\"f\"; filename*=utf-8''%E2%82%AC.txt")
+    assert_eq(t, "form-data")
+    assert_eq(params.map(|pr| pr.0 + "=" + pr.1.to_str()).join(";"), "filename=€.txt;name=f")
+    assert_eq(gomime.format_media_type("text/plain", [("charset", "utf-8"), ("title", "a b")]), "text/plain; charset=utf-8; title=\"a b\"")
+    assert_eq(gomime.encode_word("q", "utf-8", "café"), "=?utf-8?q?caf=C3=A9?=")
+    assert_eq((gomime.decode_header("=?utf-8?q?caf=C3=A9?= =?utf-8?b?w6k=?= ok") ?? bytes_of([])).to_str(), "caféé ok")
+    print("netip, url and mime: Go's")
+}
+
+fn python_urls() {
+    let s = pyurlparse.urlsplit("HTTP://User@Example.COM:8080/a;p?q=1#f", "", true) ?? panic("split")
+    assert_eq(s.scheme, "http")
+    assert_eq(s.netloc, "User@Example.COM:8080")
+    assert_eq(s.path, "/a;p")
+    assert_eq(pyurlparse.hostname(s.netloc) ?? "", "example.com")
+    assert_eq((pyurlparse.port(s.netloc) ?? None) ?? 0, 8080)
+    assert_eq(pyurlparse.urljoin("http://a/b/c/d;p?q", "../g", true) ?? "", "http://a/b/g")
+    assert_eq(pyurlparse.quote("a b/c", "/"), "a%20b/c")
+    assert_eq(pyurlparse.quote_plus("a b&c", ""), "a+b%26c")
+    assert_eq(pyurlparse.unquote("%E2%82%AC%zz"), "€%zz")
+    var o = pyurlparse.default_query_options()
+    o.keep_blank_values = true
+    let pairs = pyurlparse.parse_qsl("a=1&b=&a=2", o) ?? []
+    assert_eq(pairs.map(|p| p.0 + "=" + p.1).join("&"), "a=1&b=&a=2")
+    print("urllib.parse: Python's")
+}
+
+fn python_numbers() {
+    var r = pyrandom.seeded(42)
+    assert_eq(pyrandom.random(r), 0.6394267984578837)
+    assert_eq(pyrandom.randrange_below(r, 10) ?? 0 - 1, 0)
+    assert_eq(pyrandom.choice_index(r, 3) ?? 0 - 1, 2)
+    // gauss uses the platform's cos and log, as CPython does: CPython gives
+    // ...246 on arm64 macOS and ...247 under x86_64 macOS, and so does this.
+    let g = pyrandom.gauss(r, 0.0, 1.0)
+    assert(g == -0.11131586156766246 or g == -0.11131586156766247)
+    assert_eq(pyrandom.sample_indices(r, 100, 3) ?? [], [94, 13, 86])
+    // fsum is exact where adding in order loses the 1.0.
+    assert_eq(pymath.fsum([1e16, 1.0, -1e16]) ?? 0.0, 1.0)
+    assert_eq(pymath.sumprod([1e16, 1.0, -1e16], [1.0, 1.0, 1.0]) ?? 0.0, 1.0)
+    assert_eq(pymath.lgamma(10.0) ?? 0.0, 12.801827480081467)
+    assert_eq(pymath.gamma(0.5) ?? 0.0, 1.7724538509055159)
+    assert_eq(pymath.hypot([3.0, 4.0, 12.0]), 13.0)
+    assert_eq(pymath.comb(52, 5) ?? "", "2598960")
+    assert_eq(pystatistics.mean([1e16, 1.0, -1e16]) ?? 0.0, 0.3333333333333333)
+    assert_eq(pystatistics.stdev([2.0, 4.0, 4.0, 4.0, 5.0, 5.0, 7.0, 9.0], None) ?? 0.0, 2.138089935299395)
+    assert_eq(pystatistics.median([3.0, 1.0, 2.0, 10.0]) ?? 0.0, 2.5)
+    assert_eq(pystatistics.quantiles([1.0, 2.0, 3.0, 4.0, 5.0], 4, "exclusive") ?? [], [1.5, 3.0, 4.5])
+    let nd = pystatistics.normal(0.0, 1.0) ?? panic("normal")
+    assert_eq(pystatistics.inv_cdf(nd, 0.975) ?? 0.0, 1.9599639845400534)
+    assert_eq(pystatistics.correlation([1.0, 2.0, 3.0, 4.0], [2.0, 4.1, 6.0, 8.2], "linear") ?? 0.0, 0.9996432605867812)
+    print("random, math and statistics: Python's")
+}
+
+fn main() {
+    go_numbers()
+    go_net()
+    python_urls()
+    python_numbers()
+}

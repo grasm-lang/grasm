@@ -1,0 +1,48 @@
+[package]
+name = "b50test"
+version = "1.0.0"
+capabilities = ["io"]
+
+[dependencies.jsradix]
+path = "../jsradix"
+version = "^1.0.0"
+
+[dependencies.jsnumber]
+path = "../jsnumber"
+version = "^1.0.0"
+
+[dependencies.gostrconv]
+path = "../gostrconv"
+version = "^1.0.0"
+
+[dependencies.jsuri]
+path = "../jsuri"
+version = "^1.0.0"
+
+[dependencies.gojson]
+path = "../gojson"
+version = "^1.0.0"
+
+[dependencies.pyjson]
+path = "../pyjson"
+version = "^1.0.0"
+
+[dependencies.bigint]
+path = "../bigint"
+version = "^1.0.0"
+
+[dependencies.gocsv]
+path = "../gocsv"
+version = "^1.0.0"
+
+[dependencies.pydatetime]
+path = "../pydatetime"
+version = "^1.0.0"
+
+[dependencies.pyfnmatch]
+path = "../pyfnmatch"
+version = "^1.0.0"
+
+[dependencies.goduration]
+path = "../goduration"
+version = "^1.0.0"

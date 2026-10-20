@@ -1,0 +1,493 @@
+// `java.text.MessageFormat` and `java.text.ChoiceFormat`, as Java 17 formats
+// for `Locale.US`.
+//
+//   There {0,choice,0#are no files|1#is one file|1<are {0,number,integer} files}.
+//
+// Java's resource bundles, its logging, Spring's messages and every
+// `.properties` file of translated strings are written in this, so a
+// program that reads them, or checks a translation, has to expand them the
+// way Java does -- apostrophes included, which is where people trip: `'`
+// quotes, `''` is one apostrophe, and `don't {0}` loses its apostrophe and
+// prints `{0}` literally.
+//
+// Java's corners, kept:
+//
+//   - A choice result containing `{` is formatted again as a message, after
+//     ChoiceFormat has removed its quotes, so `'{'` inside a choice does
+//     not stay literal.
+//   - Unbalanced braces are an error only when no `{` was left open inside
+//     the placeholder; `a{0,choice,{x` quietly drops the placeholder.
+//   - An argument with no format: a number goes through `#,##0.###`, text
+//     as it is, a missing argument prints `{n}`, and an absent one `null`.
+//   - A choice with no intervals fails when it is used, as Java's index
+//     error does.
+//
+// Numbers are formatted as `Format.format(Object)` formats them, which never
+// takes DecimalFormat's fast path: 0.0005 in `{0}` is `0`, though
+// `NumberFormat.format(0.0005)` is `0.001`.
+//
+// Not here: `date` and `time` placeholders, which fail with `Unsupported`;
+// choice limits written as hex floats, likewise; argument numbers in
+// digits other than ASCII, which Java's `Integer.parseInt` also takes.
+// Numbers are formatted by `packages/javadecimalformat`.
+
+import javadecimalformat
+
+type MfArg =
+    | MfLong(v: i64)
+    | MfDouble(v: f64)
+    | MfText(s: str)
+    | MfNull
+
+type MfError =
+    /// The pattern is refused, where Java's constructor throws.
+    | MfPattern(reason: str)
+    /// A value cannot be formatted the way its placeholder asks.
+    | MfArgument(reason: str)
+    /// A choice with no intervals was used.
+    | MfEmptyChoice
+    | MfUnsupported(what: str)
+
+type ChoicePattern = { limits: [f64], formats: [str] }
+
+type MfFormat =
+    | NoFormat
+    | NumberAs(p: DecimalPattern)
+    | ChoiceAs(c: ChoicePattern)
+
+/// A placeholder: the literal text before it, its argument and its format.
+type MfPart = { before: str, arg: i64, format: MfFormat }
+
+type MessagePattern = { parts: [MfPart], tail: str }
+
+// ---- Double.parseDouble, for choice limits
+
+fn is_digit(c: i64) -> bool {
+    return c >= 48 and c <= 57
+}
+
+/// Java's syntax: optional sign, then `NaN`, `Infinity`, or digits with an
+/// optional point and exponent, and an optional `f`/`d` suffix; surrounding
+/// characters up to a space are trimmed.
+fn java_double(text: str) -> Option[f64] {
+    let t = java_trim(text)
+    var cs = t.codes()
+    if cs.len() == 0 {
+        return None
+    }
+    var negative = false
+    var i = 0
+    if cs[0] == 43 or cs[0] == 45 {
+        negative = cs[0] == 45
+        i = 1
+    }
+    let rest = t.substr(i, t.len() - i)
+    if rest == "NaN" {
+        return Some(0.0 / 0.0)
+    }
+    if rest == "Infinity" {
+        return Some(if negative { -1.0 / 0.0 } else { 1.0 / 0.0 })
+    }
+    var end = cs.len()
+    if end > i and [70, 102, 68, 100].contains(cs[end - 1]) {
+        end = end - 1
+    }
+    var digits = 0
+    var k = i
+    while k < end and is_digit(cs[k]) {
+        k = k + 1
+        digits = digits + 1
+    }
+    if k < end and cs[k] == 46 {
+        k = k + 1
+        while k < end and is_digit(cs[k]) {
+            k = k + 1
+            digits = digits + 1
+        }
+    }
+    if digits == 0 {
+        return None
+    }
+    if k < end and (cs[k] == 101 or cs[k] == 69) {
+        k = k + 1
+        if k < end and (cs[k] == 43 or cs[k] == 45) {
+            k = k + 1
+        }
+        let start = k
+        while k < end and is_digit(cs[k]) {
+            k = k + 1
+        }
+        if k == start {
+            return None
+        }
+    }
+    if k != end {
+        return None
+    }
+    let v = t.substr(i, end - i).parse_float() ?? 0.0
+    return Some(if negative { 0.0 - v } else { v })
+}
+
+/// String.trim: everything up to U+0020 off both ends.
+fn java_trim(s: str) -> str {
+    let cs = s.codes()
+    var a = 0
+    var b = cs.len()
+    while a < b and cs[a] <= 32 {
+        a = a + 1
+    }
+    while b > a and cs[b - 1] <= 32 {
+        b = b - 1
+    }
+    return cs.slice(a, b).map(|c| c.to_char()).join("")
+}
+
+/// Math.nextUp.
+fn next_up(d: f64) -> f64 {
+    if d.is_nan() or d == 1.0 / 0.0 {
+        return d
+    }
+    if d == 0.0 {
+        return 1.from_bits()
+    }
+    let b = d.to_bits()
+    return (if d > 0.0 { b + 1 } else { b - 1 }).from_bits()
+}
+
+// ---- ChoiceFormat
+
+fn choice_limit(text: str, sign: i64) -> f64 ! MfError {
+    let v = if text == "∞" {
+        1.0 / 0.0
+    } else if text == "-∞" {
+        -1.0 / 0.0
+    } else {
+        match java_double(text) {
+            Some(x) -> x
+            None -> {
+                if java_trim(text).to_lower().contains("0x") {
+                    fail(MfUnsupported("a hex choice limit"))
+                }
+                fail(MfPattern("Choice Pattern incorrect"))
+            }
+        }
+    }
+    if sign == 60 and v != 1.0 / 0.0 and v != -1.0 / 0.0 {
+        return next_up(v)
+    }
+    return v
+}
+
+/// `new ChoiceFormat(pattern)`: `limit#text`, `limit<text` (just above the
+/// limit) or `limit≤text`, separated by `|`.
+pub fn choice(pattern: str) -> ChoicePattern ! MfError {
+    var limits: [f64] = []
+    var formats: [str] = []
+    var number = ""
+    var text = ""
+    var in_text = false
+    var quote = false
+    var start = 0.0
+    var old = 0.0 / 0.0
+    let cs = pattern.codes()
+    var i = 0
+    while i < cs.len() {
+        let c = cs[i]
+        if c == 39 {
+            if i + 1 < cs.len() and cs[i + 1] == 39 {
+                if in_text { text = text + "'" } else { number = number + "'" }
+                i = i + 1
+            } else {
+                quote = not quote
+            }
+        } else if quote {
+            if in_text { text = text + c.to_char() } else { number = number + c.to_char() }
+        } else if c == 60 or c == 35 or c == 8804 {
+            if number.len() == 0 {
+                fail(MfPattern("Each interval must contain a number before a format"))
+            }
+            start = try choice_limit(number, c)
+            if start <= old {
+                fail(MfPattern("Incorrect order of intervals, must be in ascending order"))
+            }
+            number = ""
+            in_text = true
+        } else if c == 124 {
+            limits.push(start)
+            formats.push(text)
+            old = start
+            text = ""
+            in_text = false
+        } else if in_text {
+            text = text + c.to_char()
+        } else {
+            number = number + c.to_char()
+        }
+        i = i + 1
+    }
+    if in_text {
+        limits.push(start)
+        formats.push(text)
+    }
+    return ChoicePattern{ limits: limits, formats: formats }
+}
+
+/// ChoiceFormat.format: the text of the last interval whose limit the value
+/// reaches, or the first.
+pub fn choice_format(c: ChoicePattern, x: f64) -> str ! MfError {
+    if c.formats.len() == 0 {
+        fail(MfEmptyChoice)
+    }
+    var i = 0
+    while i < c.limits.len() and x >= c.limits[i] {
+        i = i + 1
+    }
+    return c.formats[0.max(i - 1)]
+}
+
+// ---- MessageFormat
+
+/// The four segments of a placeholder as Java collects them: the text
+/// before it, the argument number, the type and the style.
+type MfScan = { raw: str, index: str, kind: str, style: str, part: i64, quote: bool, braces: i64 }
+
+fn add_segment(inout sc: MfScan, t: str) {
+    if sc.part == 0 {
+        sc.raw = sc.raw + t
+    } else if sc.part == 1 {
+        sc.index = sc.index + t
+    } else if sc.part == 2 {
+        sc.kind = sc.kind + t
+    } else {
+        sc.style = sc.style + t
+    }
+}
+
+/// `Integer.parseInt`, for ASCII digits.
+fn java_int(s: str) -> Option[i64] {
+    let cs = s.codes()
+    var i = 0
+    var negative = false
+    if cs.len() > 0 and (cs[0] == 43 or cs[0] == 45) {
+        negative = cs[0] == 45
+        i = 1
+    }
+    if i >= cs.len() {
+        return None
+    }
+    var v = 0
+    while i < cs.len() {
+        if not is_digit(cs[i]) {
+            return None
+        }
+        v = v * 10 + cs[i] - 48
+        if v > 2147483648 {
+            return None
+        }
+        i = i + 1
+    }
+    if not negative and v > 2147483647 {
+        return None
+    }
+    return Some(if negative { 0 - v } else { v })
+}
+
+fn keyword(s: str, list: [str]) -> i64 {
+    for i in 0..list.len() {
+        if s == list[i] {
+            return i
+        }
+    }
+    let ls = java_trim(s).to_lower()
+    for i in 0..list.len() {
+        if ls == list[i] {
+            return i
+        }
+    }
+    return 0 - 1
+}
+
+fn decimal(pattern: str) -> MfFormat ! MfError {
+    return match javadecimalformat.pattern(pattern) {
+        Ok(p) -> NumberAs(p)
+        Err(_e) -> fail(MfPattern("Malformed pattern"))
+    }
+}
+
+fn number_format(style: str) -> MfFormat ! MfError {
+    let k = keyword(style, ["", "currency", "percent", "integer"])
+    let p = if k == 0 { "#,##0.###" } else if k == 1 { "¤#,##0.00" } else if k == 2 { "#,##0%" } else if k == 3 { "#,##0" } else { style }
+    return try decimal(p)
+}
+
+/// makeFormat: the placeholder's argument number and format.
+fn make_part(sc: MfScan) -> MfPart ! MfError {
+    let arg = match java_int(sc.index) {
+        Some(n) -> n
+        None -> fail(MfPattern("can't parse argument number: " + sc.index))
+    }
+    if arg < 0 {
+        fail(MfPattern("negative argument number: " + arg.to_str()))
+    }
+    if sc.kind.len() == 0 {
+        return MfPart{ before: sc.raw, arg: arg, format: NoFormat }
+    }
+    let k = keyword(sc.kind, ["", "number", "date", "time", "choice"])
+    let format = if k == 0 {
+        NoFormat
+    } else if k == 1 {
+        try number_format(sc.style)
+    } else if k == 4 {
+        match choice(sc.style) {
+            Ok(c) -> ChoiceAs(c)
+            Err(e) -> match e {
+                MfUnsupported(_w) -> fail(e)
+                _ -> fail(MfPattern("Choice Pattern incorrect: " + sc.style))
+            }
+        }
+    } else if k == 2 or k == 3 {
+        fail(MfUnsupported("a " + sc.kind.trim() + " placeholder"))
+    } else {
+        fail(MfPattern("unknown format type: " + sc.kind))
+    }
+    return MfPart{ before: sc.raw, arg: arg, format: format }
+}
+
+/// One character inside a placeholder, outside quotes.
+fn placeholder_char(inout sc: MfScan, inout parts: [MfPart], c: i64) ! MfError {
+    if c == 44 {
+        if sc.part < 3 {
+            sc.part = sc.part + 1
+        } else {
+            add_segment(sc, ",")
+        }
+    } else if c == 123 {
+        sc.braces = sc.braces + 1
+        add_segment(sc, "\{")
+    } else if c == 125 {
+        if sc.braces == 0 {
+            parts.push(try make_part(sc))
+            sc = MfScan{ raw: "", index: "", kind: "", style: "", part: 0, quote: false, braces: 0 }
+        } else {
+            sc.braces = sc.braces - 1
+            add_segment(sc, "\}")
+        }
+    } else if c == 32 {
+        // Leading spaces of the type are dropped.
+        if sc.part != 2 or sc.kind.len() > 0 {
+            add_segment(sc, " ")
+        }
+    } else {
+        if c == 39 {
+            sc.quote = true
+        }
+        add_segment(sc, c.to_char())
+    }
+}
+
+/// `new MessageFormat(pattern, Locale.US)`.
+pub fn compile(pattern: str) -> MessagePattern ! MfError {
+    var sc = MfScan{ raw: "", index: "", kind: "", style: "", part: 0, quote: false, braces: 0 }
+    var parts: [MfPart] = []
+    let cs = pattern.codes()
+    var i = 0
+    while i < cs.len() {
+        let c = cs[i]
+        if sc.part == 0 {
+            if c == 39 {
+                if i + 1 < cs.len() and cs[i + 1] == 39 {
+                    sc.raw = sc.raw + "'"
+                    i = i + 1
+                } else {
+                    sc.quote = not sc.quote
+                }
+            } else if c == 123 and not sc.quote {
+                sc.part = 1
+            } else {
+                sc.raw = sc.raw + c.to_char()
+            }
+        } else if sc.quote {
+            add_segment(sc, c.to_char())
+            if c == 39 {
+                sc.quote = false
+            }
+        } else {
+            try placeholder_char(sc, parts, c)
+        }
+        i = i + 1
+    }
+    if sc.braces == 0 and sc.part != 0 {
+        fail(MfPattern("Unmatched braces in the pattern."))
+    }
+    return MessagePattern{ parts: parts, tail: sc.raw }
+}
+
+fn as_number(a: MfArg) -> f64 ! MfError {
+    return match a {
+        MfLong(v) -> v.as_f64()
+        MfDouble(v) -> v
+        _ -> fail(MfArgument("Cannot format given Object as a Number"))
+    }
+}
+
+fn number_text(p: DecimalPattern, a: MfArg) -> str ! MfError {
+    let r: str ! DfError = match a {
+        MfLong(v) -> javadecimalformat.format_long(p, v)
+        MfDouble(v) -> javadecimalformat.format_double_tracked(p, v)
+        _ -> fail(MfArgument("Cannot format given Object as a Number"))
+    }
+    return match r {
+        Ok(t) -> t
+        Err(_e) -> fail(MfArgument("Rounding needed"))
+    }
+}
+
+fn argument_text(part: MfPart, args: [MfArg]) -> str ! MfError {
+    if part.arg >= args.len() {
+        return "\{" + part.arg.to_str() + "\}"
+    }
+    let a = args[part.arg]
+    match a {
+        MfNull -> return "null"
+        _ -> {}
+    }
+    return match part.format {
+        ChoiceAs(c) -> {
+            let t = try choice_format(c, try as_number(a))
+            if t.contains("\{") {
+                // Formatted again as a message, with the same arguments.
+                match compile(t) {
+                    Ok(inner) -> try format(inner, args)
+                    Err(e) -> match e {
+                        MfPattern(reason) -> fail(MfArgument(reason))
+                        _ -> fail(e)
+                    }
+                }
+            } else {
+                t
+            }
+        }
+        NumberAs(p) -> try number_text(p, a)
+        NoFormat -> match a {
+            MfText(s) -> s
+            _ -> match try number_format("") {
+                NumberAs(p) -> try number_text(p, a)
+                _ -> ""
+            }
+        }
+    }
+}
+
+/// `format(arguments)`.
+pub fn format(p: MessagePattern, args: [MfArg]) -> str ! MfError {
+    var out = ""
+    for part in p.parts {
+        out = out + part.before + (try argument_text(part, args))
+    }
+    return out + p.tail
+}
+
+/// `MessageFormat.format(pattern, arguments)`, in one step.
+pub fn format_message(pattern: str, args: [MfArg]) -> str ! MfError {
+    return try format(try compile(pattern), args)
+}

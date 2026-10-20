@@ -1,0 +1,344 @@
+// Go's `time.Duration` text, as Go 1.25 reads and writes it:
+// `ParseDuration`, `Duration.String`, and `Round`, `Truncate`, `Abs`,
+// `Hours`, `Minutes` and `Seconds`.
+//
+// Go programs put durations in flags, config files and logs -- `1h30m`,
+// `250ms`, `1.5µs` -- and something reading or writing them for a Go
+// program needs Go's answers:
+//
+//   - Units are `ns`, `us`, `µs` (U+00B5), `μs` (U+03BC), `ms`, `s`, `m`
+//     and `h`, each number may have a fraction, and components add up:
+//     `1h1h` is two hours. A bare `0` needs no unit; nothing else may go
+//     without.
+//   - A fraction is applied in floating point, as Go does
+//     (`1.0000000000000000001h` is an hour), and the total is a signed
+//     64-bit count of nanoseconds; going past it is an error, except that
+//     `-9223372036854775808ns` is the minimum.
+//   - `String` prints the largest units first with the seconds' fraction
+//     trimmed (`1h0m0.5s`), and sub-second values in the unit that keeps
+//     them whole (`1.5µs`, `0s`).
+//   - Errors quote the input as Go's `time` package does, non-ASCII bytes
+//     as `\xNN`: `time: unknown unit "x" in duration "1x"`.
+//
+// A duration is an `i64` of nanoseconds.
+
+type GoDurationError = | GoDurationInvalid(msg: str)
+
+pub fn error_text(e: GoDurationError) -> str {
+    return match e {
+        GoDurationInvalid(m) -> m
+    }
+}
+
+fn min_i64() -> i64 {
+    return 0 - 9223372036854775807 - 1
+}
+
+/// a > b, both read as unsigned 64-bit.
+fn ugt(a: i64, b: i64) -> bool {
+    return a.bit_xor(min_i64()) > b.bit_xor(min_i64())
+}
+
+/// floor(u / m) for unsigned `u` and an even `m` > 0.
+fn udiv(u: i64, m: i64) -> i64 {
+    return u.ushr(1) / (m / 2)
+}
+
+fn hex2(b: i64) -> str {
+    let digits = "0123456789abcdef"
+    return "\\x" + digits.substr(b.shr(4), 1) + digits.substr(b.bit_and(15), 1)
+}
+
+/// time's `quote`: ASCII from space up as itself (with `\"` and `\\`),
+/// every byte of anything else as `\xNN`.
+fn quote(b: [i64]) -> str {
+    var out = "\""
+    var i = 0
+    while i < b.len() {
+        let c = b[i]
+        if c >= 32 and c < 128 {
+            out = out + (if c == 34 or c == 92 { "\\" } else { "" }) + c.to_char()
+            i = i + 1
+        } else {
+            let w = if c < 128 { 1 } else { rune_width(b, i) }
+            for j in 0..w {
+                out = out + hex2(b[i + j])
+            }
+            i = i + w
+        }
+    }
+    return out + "\""
+}
+
+/// The width of the UTF-8 sequence at `i`, or 1 if it is not valid.
+fn rune_width(b: [i64], i: i64) -> i64 {
+    let c = b[i]
+    let n = if c >= 194 and c <= 223 { 2 } else if c >= 224 and c <= 239 { 3 } else if c >= 240 and c <= 244 { 4 } else { 0 }
+    if n == 0 or i + n > b.len() {
+        return 1
+    }
+    let lo = if c == 224 { 160 } else if c == 240 { 144 } else { 128 }
+    let hi = if c == 237 { 159 } else if c == 244 { 143 } else { 191 }
+    if b[i + 1] < lo or b[i + 1] > hi {
+        return 1
+    }
+    for k in 2..n {
+        if b[i + k] < 128 or b[i + k] > 191 {
+            return 1
+        }
+    }
+    return n
+}
+
+fn invalid(orig: [i64]) -> GoDurationError {
+    return GoDurationInvalid("time: invalid duration " + quote(orig))
+}
+
+fn is_digit(c: i64) -> bool {
+    return c >= 48 and c <= 57
+}
+
+/// A unit's nanoseconds, or 0.
+fn unit_of(u: [i64]) -> i64 {
+    let names = [[110, 115], [117, 115], [194, 181, 115], [206, 188, 115], [109, 115], [115], [109], [104]]
+    let values = [1, 1000, 1000, 1000, 1000000, 1000000000, 60000000000, 3600000000000]
+    for k in 0..names.len() {
+        if u == names[k] {
+            return values[k]
+        }
+    }
+    return 0
+}
+
+/// One number and unit at `s[at]`: the nanoseconds (as unsigned bits)
+/// and where it ends.
+fn component(s: [i64], at: i64, orig: [i64]) -> (i64, i64) ! GoDurationError {
+    var i = at
+    if not (s[i] == 46 or is_digit(s[i])) {
+        fail(invalid(orig))
+    }
+    // leadingInt
+    var v = 0
+    let start = i
+    while i < s.len() and is_digit(s[i]) {
+        if ugt(v, 922337203685477580) {
+            fail(invalid(orig))
+        }
+        v = v * 10 + s[i] - 48
+        if ugt(v, min_i64()) {
+            fail(invalid(orig))
+        }
+        i = i + 1
+    }
+    let pre = i != start
+    var f = 0
+    var scale = 1.0
+    var post = false
+    if i < s.len() and s[i] == 46 {
+        i = i + 1
+        let fstart = i
+        var overflow = false
+        while i < s.len() and is_digit(s[i]) {
+            if not overflow {
+                if ugt(f, 922337203685477580) {
+                    overflow = true
+                } else {
+                    let y = f * 10 + s[i] - 48
+                    if ugt(y, min_i64()) {
+                        overflow = true
+                    } else {
+                        f = y
+                        scale = scale * 10.0
+                    }
+                }
+            }
+            i = i + 1
+        }
+        post = i != fstart
+    }
+    if not pre and not post {
+        fail(invalid(orig))
+    }
+    let ustart = i
+    while i < s.len() and not (s[i] == 46 or is_digit(s[i])) {
+        i = i + 1
+    }
+    if i == ustart {
+        fail(GoDurationInvalid("time: missing unit in duration " + quote(orig)))
+    }
+    let unit = unit_of(s.slice(ustart, i))
+    if unit == 0 {
+        fail(GoDurationInvalid("time: unknown unit " + quote(s.slice(ustart, i)) + " in duration " + quote(orig)))
+    }
+    // 1<<63 / unit, unsigned.
+    let limit = if unit == 1 { min_i64() } else { 9223372036854775807 / unit }
+    if ugt(v, limit) {
+        fail(invalid(orig))
+    }
+    v = v * unit
+    if f > 0 or f == min_i64() {
+        let ff = if f < 0 { f.as_f64() + 18446744073709551616.0 } else { f.as_f64() }
+        v = v + (ff * (unit.as_f64() / scale)).as_i64()
+        if ugt(v, min_i64()) {
+            fail(invalid(orig))
+        }
+    }
+    return (v, i)
+}
+
+/// `time.ParseDuration(s)`: nanoseconds.
+pub fn parse_duration(text: str) -> i64 ! GoDurationError {
+    return try parse_duration_bytes(text.to_bytes())
+}
+
+/// `time.ParseDuration` on a Go string's bytes, which need not be UTF-8.
+pub fn parse_duration_bytes(text: bytes) -> i64 ! GoDurationError {
+    let orig = text.to_list()
+    var s = orig
+    var neg = false
+    if s.len() > 0 and (s[0] == 45 or s[0] == 43) {
+        neg = s[0] == 45
+        s = s.slice(1, s.len())
+    }
+    if s == [48] {
+        return 0
+    }
+    if s.len() == 0 {
+        fail(invalid(orig))
+    }
+    var d = 0
+    var i = 0
+    while i < s.len() {
+        let (v, next) = try component(s, i, orig)
+        i = next
+        d = d + v
+        if ugt(d, min_i64()) {
+            fail(invalid(orig))
+        }
+    }
+    if neg {
+        return 0 - d
+    }
+    if ugt(d, 9223372036854775807) {
+        fail(invalid(orig))
+    }
+    return d
+}
+
+/// fmtFrac: the fraction's digits, trailing zeros dropped, and what is left.
+fn frac(u: i64, prec: i64) -> (str, i64) {
+    var v = u
+    var out = ""
+    var print = false
+    for _i in 0..prec {
+        let q = udiv(v, 10)
+        let digit = v - q * 10
+        print = print or digit != 0
+        if print {
+            out = digit.to_str() + out
+        }
+        v = q
+    }
+    return (if print { "." + out } else { "" }, v)
+}
+
+fn uint_text(u: i64) -> str {
+    if u == 0 {
+        return "0"
+    }
+    var v = u
+    var out = ""
+    while v != 0 {
+        let q = udiv(v, 10)
+        out = (v - q * 10).to_str() + out
+        v = q
+    }
+    return out
+}
+
+/// `d.String()`.
+pub fn duration_string(d: i64) -> str {
+    let neg = d < 0
+    let u = if neg { 0 - d } else { d }
+    var out = ""
+    if not ugt(u, 999999999) {
+        if u == 0 {
+            return "0s"
+        }
+        let (prec, unit) = if u < 1000 { (0, "ns") } else if u < 1000000 { (3, "µs") } else { (6, "ms") }
+        let (f, rest) = frac(u, prec)
+        out = uint_text(rest) + f + unit
+    } else {
+        let (f, rest) = frac(u, 9)
+        let mins = udiv(rest, 60)
+        out = uint_text(rest - mins * 60) + f + "s"
+        if mins != 0 {
+            let hours = udiv(mins, 60)
+            out = uint_text(mins - hours * 60) + "m" + out
+            if hours != 0 {
+                out = uint_text(hours) + "h" + out
+            }
+        }
+    }
+    return if neg { "-" + out } else { out }
+}
+
+/// `d.Truncate(m)`.
+pub fn truncate(d: i64, m: i64) -> i64 {
+    if m <= 0 {
+        return d
+    }
+    return d - d % m
+}
+
+fn less_than_half(x: i64, y: i64) -> bool {
+    return ugt(y, x + x)
+}
+
+/// `d.Round(m)`, half away from zero, saturating at the extremes.
+pub fn round(d: i64, m: i64) -> i64 {
+    if m <= 0 {
+        return d
+    }
+    var r = d % m
+    if d < 0 {
+        r = 0 - r
+        if less_than_half(r, m) {
+            return d + r
+        }
+        let d1 = d - m + r
+        return if d1 < d { d1 } else { min_i64() }
+    }
+    if less_than_half(r, m) {
+        return d - r
+    }
+    let d1 = d + m - r
+    return if d1 > d { d1 } else { 9223372036854775807 }
+}
+
+/// `d.Abs()`, the minimum giving the maximum.
+pub fn abs(d: i64) -> i64 {
+    if d >= 0 {
+        return d
+    }
+    return if d == min_i64() { 9223372036854775807 } else { 0 - d }
+}
+
+fn split(d: i64, unit: i64) -> f64 {
+    return (d / unit).as_f64() + (d % unit).as_f64() / unit.as_f64()
+}
+
+/// `d.Seconds()`.
+pub fn seconds(d: i64) -> f64 {
+    return split(d, 1000000000)
+}
+
+/// `d.Minutes()`.
+pub fn minutes(d: i64) -> f64 {
+    return split(d, 60000000000)
+}
+
+/// `d.Hours()`.
+pub fn hours(d: i64) -> f64 {
+    return split(d, 3600000000000)
+}

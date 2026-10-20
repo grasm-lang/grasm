@@ -46,9 +46,11 @@ pub fn zero() -> BigInt {
 
 pub fn from_i64(v: i64) -> BigInt {
     var out = BigInt{ limb: [], negative: v < 0 }
-    var left = if v < 0 { 0 - v } else { v }
-    while left > 0 {
-        out.limb.push(left % base())
+    // Counted down on the negative side, where i64::MIN fits: negating it
+    // overflows, and the loop then never ran and MIN came out as 0.
+    var left = if v < 0 { v } else { 0 - v }
+    while left < 0 {
+        out.limb.push(0 - left % base())
         left = left / base()
     }
     return out
@@ -492,21 +494,27 @@ pub fn to_i64(n: BigInt) -> Option[i64] {
     if n.limb.len() > 3 {
         return None
     }
+    // Accumulated as a negative number, where i64::MIN fits; the positive
+    // magnitude of MIN does not, and it used to come back as None.
+    let min = 0 - 9223372036854775807 - 1
     var v = 0
     var i = n.limb.len() - 1
     while i >= 0 {
-        if v > 9223372036854775807 / base() {
+        if v < min / base() {
             return None
         }
         let scaled = v * base()
-        if scaled > 9223372036854775807 - n.limb[i] {
+        if scaled < min + n.limb[i] {
             return None
         }
-        v = scaled + n.limb[i]
+        v = scaled - n.limb[i]
         i = i - 1
     }
     if n.negative {
-        return Some(0 - v)
+        return Some(v)
     }
-    return Some(v)
+    if v == min {
+        return None
+    }
+    return Some(0 - v)
 }

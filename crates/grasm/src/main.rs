@@ -677,7 +677,8 @@ fn run() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             }
-            let mut l = lint::Linter::new(&src, only);
+            let type_imports = imports_used_for_types(std::path::Path::new(&path), &src);
+            let mut l = lint::Linter::new(&src, only).with_type_imports(type_imports);
             l.module(&parsed.module);
             let findings = l.finish();
             if args.iter().any(|a| a == "--json") {
@@ -1198,6 +1199,48 @@ fn registry_packages(path: &std::path::Path) -> Result<HashMap<String, PathBuf>,
         .filter(|p| !same_dir(&p.dir, &pkg_dir))
         .map(|p| (p.name.clone(), p.dir.clone()))
         .collect())
+}
+
+/// The file's imports it uses only through a type or variant they declare,
+/// for `lint`: a mention of such a name is a use of the import, though the
+/// file never writes `pkg.` (types are not qualified). Best effort -- a graph
+/// that does not load answers nothing, and the lint stays as syntactic as it
+/// was.
+fn imports_used_for_types(entry: &std::path::Path, src: &str) -> Vec<String> {
+    let Ok(resolved) = registry_packages(entry) else {
+        return Vec::new();
+    };
+    let Ok(program) = loader::load_from_disk_in(entry, &resolved, Some(src.to_string())) else {
+        return Vec::new();
+    };
+    let Some(main) = program.files.first() else {
+        return Vec::new();
+    };
+    let mentioned: std::collections::HashSet<String> = grasm_syntax::lex(src)
+        .into_iter()
+        .filter_map(|t| match t.kind {
+            grasm_syntax::token::TokenKind::Ident(n) => Some(n),
+            _ => None,
+        })
+        .collect();
+    let mut used = Vec::new();
+    for (alias, full) in &main.imports {
+        let Some(file) = program.files.iter().find(|f| &f.name == full) else {
+            continue;
+        };
+        let declares = file.module.decls.iter().any(|d| match d {
+            grasm_syntax::ast::Decl::Type(t) => {
+                mentioned.contains(&t.name.name)
+                    || matches!(&t.body, grasm_syntax::ast::TypeBody::Sum(vs)
+                        if vs.iter().any(|v| mentioned.contains(&v.name.name)))
+            }
+            _ => false,
+        });
+        if declares {
+            used.push(alias.clone());
+        }
+    }
+    used
 }
 
 /// Load (following imports), typecheck, render diagnostics per file.

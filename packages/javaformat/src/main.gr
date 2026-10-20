@@ -1,0 +1,854 @@
+// `String.format` as Java 17 does it, for Locale.US: the same text, and an
+// error wherever Java throws.
+//
+// The specifier is `%[index$][flags][width][.precision]conversion`, read by
+// the regex `java.util.Formatter` uses -- whose flags group takes every
+// leading `0`, so `%00010d` has the flags `000` and is refused as
+// duplicates -- and every specifier is checked before anything is printed.
+// Arguments are typed, because Java's answer depends on the type: `%x` of an
+// `int` -1 is `ffffffff` and of a `long` -1 is sixteen `f`s, and `%h` is
+// each type's `hashCode`.
+//
+// Floating point follows `FormattedFloatingDecimal`: `%e`, `%f` and `%g`
+// round the digits `Double.toString`'s algorithm produces, half up, rather
+// than the exact binary value -- so `%.2f` of 1.005 is `1.01` here and in
+// Java where C says `1.00` -- through `javadouble`. A `float` argument is
+// widened to `double` first, as Java does.
+//
+// Lengths, precision cuts and `String.hashCode` count UTF-16 code units, as
+// Java does; a cut through a surrogate pair gives `?`, what Java writes for
+// the lone surrogate it leaves. Not reproduced: the date/time conversions (`%t`), `BigInteger`
+// and `BigDecimal` arguments, `Formattable`, and locales other than US.
+import javadouble
+
+type JfArg =
+    | JInt(v: i64)
+    | JLong(v: i64)
+    | JByte(v: i64)
+    | JShort(v: i64)
+    | JDouble(v: f64)
+    | JFloat(bits: i64)
+    | JStr(s: str)
+    | JChar(c: i64)
+    | JBool(b: bool)
+    | JNull
+
+type JfError =
+    | UnknownConversion(c: str)
+    | DuplicateFlags
+    | UnknownFlags
+    | IllegalFlags
+    | FlagsMismatch(flag: str, conv: str)
+    | MissingWidth
+    | IllegalWidth
+    | IllegalPrecision
+    | IllegalIndex
+    | MissingArgument
+    | ConversionMismatch
+    | IllegalCodePoint
+
+/// One parsed specifier. `index` is -2 for text, -1 for `<`, 0 for the next
+/// argument, and n for `n$`.
+type JfSpec = { text: str, index: i64, flags: str, width: i64, precision: i64, conv: str, upper: bool }
+
+fn is_flag(c: i64) -> bool {
+    return c == 45 or c == 35 or c == 43 or c == 32 or c == 48 or c == 44 or c == 40 or c == 60
+}
+
+fn is_digit(c: i64) -> bool {
+    return c >= 48 and c <= 57
+}
+
+fn is_conv(c: i64) -> bool {
+    return (c >= 65 and c <= 90) or (c >= 97 and c <= 122) or c == 37
+}
+
+fn valid_conversion(c: str) -> bool {
+    return ["b", "B", "h", "H", "s", "S", "c", "C", "d", "o", "x", "X", "e", "E", "f", "g", "G", "a", "A", "%", "n"].contains(c)
+}
+
+fn has(s: JfSpec, flag: str) -> bool {
+    return s.flags.contains(flag)
+}
+
+/// `parse`: text and specifiers, with Java's checks for each specifier.
+pub fn parse(format: str) -> [JfSpec] ! JfError {
+    let cs = format.codes()
+    var out: [JfSpec] = []
+    var i = 0
+    var text = ""
+    while i < cs.len() {
+        if cs[i] != 37 {
+            text = text + cs[i].to_char()
+            i = i + 1
+            continue
+        }
+        if text.len() > 0 {
+            out.push(JfSpec{ text: text, index: 0 - 2, flags: "", width: 0 - 1, precision: 0 - 1, conv: "", upper: false })
+            text = ""
+        }
+        i = i + 1
+        if i >= cs.len() {
+            fail(UnknownConversion("%"))
+        }
+        let c = cs[i].to_char()
+        if valid_conversion(c) {
+            // The fast path: one character, no flags, nothing checked.
+            out.push(simple_spec(c))
+            i = i + 1
+            continue
+        }
+        let (spec, next) = try parse_full(cs, i)
+        out.push(spec)
+        i = next
+    }
+    if text.len() > 0 {
+        out.push(JfSpec{ text: text, index: 0 - 2, flags: "", width: 0 - 1, precision: 0 - 1, conv: "", upper: false })
+    }
+    return out
+}
+
+fn simple_spec(c: str) -> JfSpec {
+    let lower = c.to_lower()
+    let upper = c != lower
+    let index = if lower == "%" or lower == "n" { 0 - 2 } else { 0 }
+    return JfSpec{ text: "", index: index, flags: "", width: 0 - 1, precision: 0 - 1, conv: lower, upper: upper }
+}
+
+/// `%(\d+\$)?([-#+ 0,(\<]*)?(\d+)?(\.\d+)?([tT])?([a-zA-Z%])` at `i`.
+fn parse_full(cs: [i64], start: i64) -> (JfSpec, i64) ! JfError {
+    var i = start
+    var index = 0
+    var j = i
+    while j < cs.len() and is_digit(cs[j]) {
+        j = j + 1
+    }
+    if j > i and j < cs.len() and cs[j] == 36 {
+        let n = digits_value(cs, i, j)
+        if n <= 0 {
+            fail(IllegalIndex)
+        }
+        index = n
+        i = j + 1
+    }
+    var flags = ""
+    while i < cs.len() and is_flag(cs[i]) {
+        let f = cs[i].to_char()
+        if flags.contains(f) {
+            fail(DuplicateFlags)
+        }
+        flags = flags + f
+        i = i + 1
+    }
+    var width = 0 - 1
+    j = i
+    while j < cs.len() and is_digit(cs[j]) {
+        j = j + 1
+    }
+    if j > i {
+        width = digits_value(cs, i, j)
+        if width < 0 {
+            fail(IllegalWidth)
+        }
+        i = j
+    }
+    var precision = 0 - 1
+    if i + 1 < cs.len() and cs[i] == 46 and is_digit(cs[i + 1]) {
+        j = i + 1
+        while j < cs.len() and is_digit(cs[j]) {
+            j = j + 1
+        }
+        precision = digits_value(cs, i + 1, j)
+        if precision < 0 {
+            fail(IllegalPrecision)
+        }
+        i = j
+    }
+    if i < cs.len() and (cs[i] == 116 or cs[i] == 84) {
+        // A date/time conversion: not supported here.
+        fail(UnknownConversion("t"))
+    }
+    if i >= cs.len() or not is_conv(cs[i]) {
+        fail(UnknownConversion(if start < cs.len() { cs[start].to_char() } else { "%" }))
+    }
+    let c = cs[i].to_char()
+    if not valid_conversion(c) {
+        fail(UnknownConversion(c))
+    }
+    let lower = c.to_lower()
+    if flags.contains("<") {
+        index = 0 - 1
+    }
+    if lower == "%" or lower == "n" {
+        index = 0 - 2
+    }
+    let spec = JfSpec{ text: "", index: index, flags: flags, width: width, precision: precision, conv: lower, upper: c != lower }
+    try check(spec)
+    return (spec, i + 1)
+}
+
+/// `Integer.parseInt`: too many digits for an `int` is an error.
+fn digits_value(cs: [i64], a: i64, b: i64) -> i64 {
+    var v = 0
+    for k in a..b {
+        v = v * 10 + cs[k] - 48
+        if v > 2147483647 {
+            return 0 - 1
+        }
+    }
+    return v
+}
+
+fn bad_flags(s: JfSpec, flags: [str]) -> () ! JfError {
+    for f in flags {
+        if has(s, f) {
+            fail(FlagsMismatch(f, s.conv))
+        }
+    }
+    return ()
+}
+
+fn check(s: JfSpec) -> () ! JfError {
+    let c = s.conv
+    if c == "b" or c == "h" or c == "s" {
+        if (c == "b" or c == "h") and has(s, "#") {
+            fail(FlagsMismatch("#", c))
+        }
+        if s.width == 0 - 1 and has(s, "-") {
+            fail(MissingWidth)
+        }
+        try bad_flags(s, ["+", " ", "0", ",", "("])
+    } else if c == "c" {
+        if s.precision != 0 - 1 {
+            fail(IllegalPrecision)
+        }
+        try bad_flags(s, ["#", "+", " ", "0", ",", "("])
+        if s.width == 0 - 1 and has(s, "-") {
+            fail(MissingWidth)
+        }
+    } else if c == "d" or c == "o" or c == "x" {
+        try check_numeric(s)
+        if s.precision != 0 - 1 {
+            fail(IllegalPrecision)
+        }
+        if c == "d" {
+            try bad_flags(s, ["#"])
+        } else {
+            try bad_flags(s, [","])
+        }
+    } else if c == "e" or c == "f" or c == "g" or c == "a" {
+        try check_numeric(s)
+        if c == "a" {
+            try bad_flags(s, ["(", ","])
+        } else if c == "e" {
+            try bad_flags(s, [","])
+        } else if c == "g" {
+            try bad_flags(s, ["#"])
+        }
+    } else {
+        if s.precision != 0 - 1 {
+            fail(IllegalPrecision)
+        }
+        if c == "%" {
+            if s.flags != "" and s.flags != "-" {
+                fail(IllegalFlags)
+            }
+            if s.width == 0 - 1 and has(s, "-") {
+                fail(MissingWidth)
+            }
+        } else {
+            if s.width != 0 - 1 {
+                fail(IllegalWidth)
+            }
+            if s.flags != "" {
+                fail(IllegalFlags)
+            }
+        }
+    }
+    return ()
+}
+
+fn check_numeric(s: JfSpec) -> () ! JfError {
+    if s.width == 0 - 1 and (has(s, "-") or has(s, "0")) {
+        fail(MissingWidth)
+    }
+    if (has(s, "+") and has(s, " ")) or (has(s, "-") and has(s, "0")) {
+        fail(IllegalFlags)
+    }
+    return ()
+}
+
+// ---- printing
+
+fn utf16_len(s: str) -> i64 {
+    var n = 0
+    for c in s.codes() {
+        n = n + (if c >= 65536 { 2 } else { 1 })
+    }
+    return n
+}
+
+/// The first `n` UTF-16 code units. A cut through a surrogate pair leaves
+/// Java a lone surrogate, which is not text; it is `?` here, the character
+/// Java writes for it in UTF-8.
+fn utf16_prefix(s: str, n: i64) -> str {
+    var out = ""
+    var used = 0
+    for c in s.codes() {
+        let w = if c >= 65536 { 2 } else { 1 }
+        if used + w > n {
+            if used < n {
+                out = out + "?"
+            }
+            break
+        }
+        out = out + c.to_char()
+        used = used + w
+    }
+    return out
+}
+
+fn justify(s: JfSpec, text: str) -> str {
+    if s.width == 0 - 1 {
+        return text
+    }
+    let pad = " ".repeat(0.max(s.width - utf16_len(text)))
+    return if has(s, "-") { text + pad } else { pad + text }
+}
+
+fn print_text(s: JfSpec, t0: str) -> str {
+    var t = t0
+    if s.precision != 0 - 1 and s.precision < utf16_len(t) {
+        t = utf16_prefix(t, s.precision)
+    }
+    if s.upper {
+        t = t.to_upper()
+    }
+    return justify(s, t)
+}
+
+fn java_string(a: JfArg) -> str {
+    return match a {
+        JInt(v) -> v.to_str()
+        JLong(v) -> v.to_str()
+        JByte(v) -> v.to_str()
+        JShort(v) -> v.to_str()
+        JDouble(v) -> javadouble.double_to_string(v)
+        JFloat(b) -> javadouble.float_to_string(b)
+        JStr(t) -> t
+        JChar(c) -> c.to_char()
+        JBool(b) -> if b { "true" } else { "false" }
+        JNull -> "null"
+    }
+}
+
+fn to_int(v: i64) -> i64 {
+    return v.shl(32).shr(32)
+}
+
+/// Each argument type's `hashCode`.
+fn hash_code(a: JfArg) -> i64 {
+    return match a {
+        JInt(v) -> v
+        JByte(v) -> v
+        JShort(v) -> v
+        JLong(v) -> to_int(v.bit_xor(v.ushr(32)))
+        JDouble(v) -> {
+            let b = if v.is_nan() { 9221120237041090560 } else { v.to_bits() }
+            to_int(b.bit_xor(b.ushr(32)))
+        }
+        JFloat(b) -> if b.bit_and(2139095040) == 2139095040 and b.bit_and(8388607) != 0 { 2143289344 } else { to_int(b) }
+        JStr(t) -> {
+            var h = 0
+            for c in t.codes() {
+                if c >= 65536 {
+                    let u = c - 65536
+                    h = to_int(31 * h + 55296 + u.ushr(10))
+                    h = to_int(31 * h + 56320 + u.bit_and(1023))
+                } else {
+                    h = to_int(31 * h + c)
+                }
+            }
+            h
+        }
+        JChar(c) -> c
+        JBool(b) -> if b { 1231 } else { 1237 }
+        JNull -> 0
+    }
+}
+
+fn hex32(v: i64) -> str {
+    return v.bit_and(4294967295).to_base(16)
+}
+
+fn print_one(s: JfSpec, a: JfArg) -> str ! JfError {
+    let c = s.conv
+    if c == "b" {
+        return print_text(s, match a {
+            JBool(b) -> if b { "true" } else { "false" }
+            JNull -> "false"
+            _ -> "true"
+        })
+    }
+    if c == "h" {
+        return print_text(s, match a {
+            JNull -> "null"
+            _ -> hex32(hash_code(a))
+        })
+    }
+    if c == "s" {
+        if has(s, "#") {
+            fail(FlagsMismatch("#", "s"))
+        }
+        return print_text(s, java_string(a))
+    }
+    if c == "c" {
+        return print_text(s, try char_text(a))
+    }
+    if c == "d" or c == "o" or c == "x" {
+        return try print_integer(s, a)
+    }
+    return try print_float(s, a)
+}
+
+fn char_text(a: JfArg) -> str ! JfError {
+    return match a {
+        JNull -> "null"
+        JChar(c) -> c.to_char()
+        JByte(v) -> try code_point(v)
+        JShort(v) -> try code_point(v)
+        JInt(v) -> try code_point(v)
+        _ -> fail(ConversionMismatch)
+    }
+}
+
+fn code_point(v: i64) -> str ! JfError {
+    if v < 0 or v > 1114111 {
+        fail(IllegalCodePoint)
+    }
+    return v.to_char()
+}
+
+fn leading_sign(s: JfSpec, neg: bool) -> str {
+    if not neg {
+        return if has(s, "+") { "+" } else if has(s, " ") { " " } else { "" }
+    }
+    return if has(s, "(") { "(" } else { "-" }
+}
+
+fn trailing_sign(s: JfSpec, neg: bool) -> str {
+    return if neg and has(s, "(") { ")" } else { "" }
+}
+
+/// `localizedMagnitude` for Locale.US: grouping by threes before the point
+/// when asked, and zero padding after whatever sign `prefix` holds.
+fn magnitude(s: JfSpec, prefix: str, digits: str, width: i64) -> str {
+    let cs = digits.codes()
+    let dot = (digits.index_of(".") ?? digits.len())
+    var body = ""
+    var group = has(s, ",")
+    for j in 0..cs.len() {
+        if j == dot {
+            body = body + "."
+            group = false
+            continue
+        }
+        body = body + cs[j].to_char()
+        if group and j != dot - 1 and (dot - j) % 3 == 1 {
+            body = body + ","
+        }
+    }
+    let have = utf16_len(prefix) + utf16_len(body)
+    if width > have and has(s, "0") {
+        body = "0".repeat(width - have) + body
+    }
+    return prefix + body
+}
+
+fn adjust_width(s: JfSpec, width: i64, neg: bool) -> i64 {
+    return if width != 0 - 1 and neg and has(s, "(") { width - 1 } else { width }
+}
+
+fn print_integer(s: JfSpec, a: JfArg) -> str ! JfError {
+    let (v, bits) = match a {
+        JNull -> return print_text(JfSpec{ text: s.text, index: s.index, flags: s.flags, width: s.width, precision: 0 - 1, conv: s.conv, upper: s.upper },
+            "null")
+        JInt(x) -> (x, 32)
+        JLong(x) -> (x, 64)
+        JByte(x) -> (x, 8)
+        JShort(x) -> (x, 16)
+        _ -> fail(ConversionMismatch)
+    }
+    if s.conv == "d" {
+        let neg = v < 0
+        let digits = if neg { if v == 0 - 9223372036854775807 - 1 { "9223372036854775808" } else { (0 - v).to_str() } } else { v.to_str() }
+        let pre = leading_sign(s, neg)
+        return justify(s, magnitude(s, pre, digits, adjust_width(s, s.width, neg)) + trailing_sign(s, neg))
+    }
+    try bad_flags(s, ["(", " ", "+"])
+    let u = if v < 0 and bits < 64 { v + 1.shl(bits) } else { v }
+    var body = if s.conv == "o" { octal(u) } else { unsigned_hex(u) }
+    let prefix = if has(s, "#") { if s.conv == "o" { "0" } else if s.upper { "0X" } else { "0x" } } else { "" }
+    if has(s, "0") {
+        body = "0".repeat(0.max(s.width - utf16_len(prefix) - utf16_len(body))) + body
+    }
+    if s.upper {
+        body = body.to_upper()
+    }
+    return justify(s, prefix + body)
+}
+
+fn octal(v: i64) -> str {
+    if v == 0 {
+        return "0"
+    }
+    var out = ""
+    var x = v
+    while x != 0 {
+        out = x.bit_and(7).to_str() + out
+        x = x.ushr(3)
+    }
+    return out
+}
+
+fn unsigned_hex(v: i64) -> str {
+    if v == 0 {
+        return "0"
+    }
+    var out = ""
+    var x = v
+    while x != 0 {
+        out = "0123456789abcdef".substr(x.bit_and(15), 1) + out
+        x = x.ushr(4)
+    }
+    return out
+}
+
+// ---- floating point: FormattedFloatingDecimal
+
+type JfFloat = { mantissa: str, exponent: Option[str], rounded: i64 }
+
+/// `applyPrecision`: round the digits half up at `prec` digits; the
+/// decimal exponent, one more when the rounding carried out of the first.
+fn apply_precision(dec: i64, digits0: [i64], prec: i64) -> (i64, [i64]) {
+    var d = digits0
+    let n = d.len()
+    if prec >= n or prec < 0 {
+        return (dec, d)
+    }
+    if prec == 0 {
+        if d[0] >= 5 {
+            d[0] = 1
+            for k in 1..n {
+                d[k] = 0
+            }
+            return (dec + 1, d)
+        }
+        for k in 0..n {
+            d[k] = 0
+        }
+        return (dec, d)
+    }
+    if d[prec] >= 5 {
+        var i = prec - 1
+        var q = d[i]
+        if q == 9 {
+            while q == 9 and i > 0 {
+                i = i - 1
+                q = d[i]
+            }
+            if q == 9 {
+                d[0] = 1
+                for k in 1..n {
+                    d[k] = 0
+                }
+                return (dec + 1, d)
+            }
+        }
+        d[i] = q + 1
+        for k in (i + 1)..n {
+            d[k] = 0
+        }
+    } else {
+        for k in prec..n {
+            d[k] = 0
+        }
+    }
+    return (dec, d)
+}
+
+fn text_of(d: [i64], a: i64, b: i64) -> str {
+    var out = ""
+    for k in a..b {
+        out = out + d[k].to_str()
+    }
+    return out
+}
+
+fn fill_decimal(prec: i64, d: [i64], exp: i64) -> str {
+    let n = d.len()
+    if exp > 0 {
+        if n < exp {
+            return text_of(d, 0, n) + "0".repeat(exp - n)
+        }
+        let t = (n - exp).min(prec)
+        return text_of(d, 0, exp) + (if t > 0 { "." + text_of(d, exp, exp + t) } else { "" })
+    }
+    let zeros = 0.max((0 - exp).min(prec))
+    let t = 0.max(n.min(prec + exp))
+    if zeros > 0 {
+        return "0." + "0".repeat(zeros) + (if t > 0 { text_of(d, 0, t) } else { "" })
+    }
+    if t > 0 {
+        return "0." + text_of(d, 0, t)
+    }
+    return "0"
+}
+
+fn fill_scientific(prec: i64, d: [i64], exp: i64) -> (str, str) {
+    let n = d.len()
+    let t = 0.max((n - 1).min(prec))
+    let mant = if t > 0 { d[0].to_str() + "." + text_of(d, 1, 1 + t) } else { d[0].to_str() }
+    let neg = exp <= 0
+    let e = if neg { 0 - exp + 1 } else { exp - 1 }
+    let digits = if e <= 9 { "0" + e.to_str() } else { e.to_str() }
+    return (mant, (if neg { "-" } else { "+" }) + digits)
+}
+
+/// `FormattedFloatingDecimal.valueOf(v, precision, form)` for a positive,
+/// finite, non-zero `v`; `form` is "e", "f" or "g".
+fn formatted(v: f64, precision: i64, form: str) -> JfFloat {
+    let fd = javadouble.digits(v, false) ?? JdDigits{ negative: false, digits: "0", exponent: 1, exact: true, rounded_up: false }
+    let d0 = fd.digits.codes().map(|c| c - 48)
+    if form == "f" {
+        let (exp, d) = apply_precision(fd.exponent, d0, fd.exponent + precision)
+        return JfFloat{ mantissa: fill_decimal(precision, d, exp), exponent: None, rounded: exp }
+    }
+    if form == "e" {
+        let (exp, d) = apply_precision(fd.exponent, d0, precision + 1)
+        let (m, e) = fill_scientific(precision, d, exp)
+        return JfFloat{ mantissa: m, exponent: Some(e), rounded: exp }
+    }
+    let (exp, d) = apply_precision(fd.exponent, d0, precision)
+    if exp - 1 < 0 - 4 or exp - 1 >= precision {
+        let (m, e) = fill_scientific(precision - 1, d, exp)
+        return JfFloat{ mantissa: m, exponent: Some(e), rounded: exp }
+    }
+    return JfFloat{ mantissa: fill_decimal(precision - exp, d, exp), exponent: None, rounded: exp }
+}
+
+/// `addZeros`: pad the fraction out to `prec` digits, adding the point if
+/// there is none.
+fn add_zeros(m: str, prec: i64) -> str {
+    let dot = m.index_of(".")
+    let have = match dot {
+        Some(i) -> m.len() - i - 1
+        None -> 0
+    }
+    if have >= prec {
+        return m
+    }
+    return m + (if dot.is_none() { "." } else { "" }) + "0".repeat(prec - have)
+}
+
+fn print_float(s: JfSpec, a: JfArg) -> str ! JfError {
+    let v = match a {
+        // Through `print(String)`: the precision cuts "null" here.
+        JNull -> return print_text(s, "null")
+        JDouble(x) -> x
+        JFloat(b) -> float_value(b)
+        _ -> fail(ConversionMismatch)
+    }
+    if v.is_nan() {
+        return justify(s, if s.upper { "NAN" } else { "NaN" })
+    }
+    let neg = v.to_bits() < 0
+    let x = v.abs()
+    let pre = leading_sign(s, neg)
+    if x == 1.0 / 0.0 {
+        return justify(s, pre + (if s.upper { "INFINITY" } else { "Infinity" }) + trailing_sign(s, neg))
+    }
+    let body = if s.conv == "a" { hex_float(s, x, neg, pre) } else { decimal_float(s, x, neg, pre) }
+    return justify(s, body + trailing_sign(s, neg))
+}
+
+fn decimal_float(s: JfSpec, x: f64, neg: bool, pre: str) -> str {
+    let c = s.conv
+    let e_char = if s.upper { "E" } else { "e" }
+    if c == "e" {
+        let prec = if s.precision == 0 - 1 { 6 } else { s.precision }
+        let f = formatted(x, prec, "e")
+        var m = add_zeros(if x == 0.0 { zero_mantissa(prec) } else { f.mantissa }, prec)
+        if has(s, "#") and prec == 0 {
+            m = m + "."
+        }
+        let exp = if x == 0.0 { "+00" } else { f.exponent ?? "+00" }
+        let w = if s.width != 0 - 1 { adjust_width(s, s.width - exp.len() - 1, neg) } else { s.width }
+        return magnitude(s, pre, m, w) + e_char + exp
+    }
+    if c == "f" {
+        let prec = if s.precision == 0 - 1 { 6 } else { s.precision }
+        var m = add_zeros(if x == 0.0 { "0" } else { formatted(x, prec, "f").mantissa }, prec)
+        if has(s, "#") and prec == 0 {
+            m = m + "."
+        }
+        return magnitude(s, pre, m, adjust_width(s, s.width, neg))
+    }
+    var prec = if s.precision == 0 - 1 { 6 } else if s.precision == 0 { 1 } else { s.precision }
+    var m = "0"
+    var exp: Option[str] = None
+    var rounded = 0
+    if x != 0.0 {
+        let f = formatted(x, prec, "g")
+        m = f.mantissa
+        exp = f.exponent
+        rounded = f.rounded - 1
+    }
+    prec = if exp.is_some() { prec - 1 } else { prec - (rounded + 1) }
+    m = add_zeros(m, prec)
+    if has(s, "#") and prec == 0 {
+        m = m + "."
+    }
+    return match exp {
+        Some(e) -> magnitude(s, pre, m, if s.width != 0 - 1 { adjust_width(s, s.width - e.len() - 1, neg) } else { s.width }) + e_char + e
+        None -> magnitude(s, pre, m, adjust_width(s, s.width, neg))
+    }
+}
+
+/// Zero has no digits: Java's mantissa for it is "0".
+fn zero_mantissa(prec: i64) -> str {
+    let _ = prec
+    return "0"
+}
+
+fn float_value(b: i64) -> f64 {
+    let sign = if b.bit_and(2147483648) != 0 { -1.0 } else { 1.0 }
+    let e = b.ushr(23).bit_and(255)
+    let m = b.bit_and(8388607)
+    if e == 255 {
+        return if m != 0 { 0.0 / 0.0 } else { sign / 0.0 }
+    }
+    if e == 0 {
+        return sign * m.as_f64() * 1.401298464324817e-45
+    }
+    let bits = (e - 127 + 1023).shl(52).bit_or(m.shl(29))
+    return sign * bits.from_bits()
+}
+
+// ---- %a
+
+/// `Double.toHexString` for a positive finite value, without its `0x`.
+fn hex_string(d: f64) -> str {
+    if d == 0.0 {
+        return "0.0p0"
+    }
+    let bits = d.to_bits()
+    let e = bits.ushr(52).bit_and(2047)
+    let m = bits.bit_and(4503599627370495)
+    var frac = ""
+    var x = m
+    for _k in 0..13 {
+        frac = "0123456789abcdef".substr(x.bit_and(15), 1) + frac
+        x = x.ushr(4)
+    }
+    while frac.len() > 1 and frac.ends_with("0") {
+        frac = frac.substr(0, frac.len() - 1)
+    }
+    if e == 0 {
+        return "0." + frac + "p-1022"
+    }
+    return "1." + frac + "p" + (e - 1023).to_str()
+}
+
+/// `hexDouble`: `Double.toHexString`, rounded half-even to `prec` hex digits
+/// when 1 <= prec <= 12.
+fn hex_double(d0: f64, prec: i64) -> str {
+    if d0 == 0.0 or prec == 0 or prec >= 13 {
+        return hex_string(d0)
+    }
+    var d = d0
+    var exponent = d.to_bits().ushr(52).bit_and(2047) - 1023
+    let subnormal = exponent == 0 - 1023
+    if subnormal {
+        d = d * 18014398509481984.0
+        exponent = d.to_bits().ushr(52).bit_and(2047) - 1023
+    }
+    let shift = 53 - (1 + prec * 4)
+    let bits = d.to_bits()
+    var signif = bits.bit_and(9223372036854775807).shr(shift)
+    let rounding = bits.bit_and((0 - 1).shl(shift).bit_not())
+    let least_zero = signif.bit_and(1) == 0
+    let round = 1.shl(shift - 1).bit_and(rounding) != 0
+    let sticky = shift > 1 and 1.shl(shift - 1).bit_not().bit_and(rounding) != 0
+    if (least_zero and round and sticky) or (not least_zero and round) {
+        signif = signif + 1
+    }
+    let result = signif.shl(shift).from_bits()
+    if result == 1.0 / 0.0 {
+        return "1.0p1024"
+    }
+    let res = hex_string(result)
+    if not subnormal {
+        return res
+    }
+    let idx = res.index_of("p") ?? res.len()
+    let e = (res.substr(idx + 1, res.len() - idx - 1).parse_int() ?? 0) - 54
+    return res.substr(0, idx) + "p" + e.to_str()
+}
+
+fn hex_float(s: JfSpec, x: f64, neg: bool, pre: str) -> str {
+    let prec = if s.precision == 0 - 1 { 0 } else if s.precision == 0 { 1 } else { s.precision }
+    let t = hex_double(x, prec)
+    var out = pre + (if s.upper { "0X" } else { "0x" })
+    if has(s, "0") {
+        let lead = if has(s, " ") or has(s, "+") or neg { 3 } else { 2 }
+        out = out + "0".repeat(0.max(s.width - t.len() - lead))
+    }
+    let idx = t.index_of("p") ?? t.len()
+    var mant = t.substr(0, idx)
+    if s.upper {
+        mant = mant.to_upper()
+    }
+    if prec != 0 {
+        mant = add_zeros(mant, prec)
+    }
+    return out + mant + (if s.upper { "P" } else { "p" }) + t.substr(idx + 1, t.len() - idx - 1)
+}
+
+// ---- the driver
+
+/// `String.format(Locale.US, format, args...)`.
+pub fn format(fmt: str, args: [JfArg]) -> str ! JfError {
+    let specs = try parse(fmt)
+    var out = ""
+    var last = 0 - 1
+    var lasto = 0 - 1
+    for s in specs {
+        if s.index == 0 - 2 {
+            out = out + (if s.conv == "%" { print_text(s, "%") } else if s.conv == "n" { "\n" } else { s.text })
+            continue
+        }
+        var at = 0
+        if s.index == 0 - 1 {
+            if last < 0 or last > args.len() - 1 {
+                fail(MissingArgument)
+            }
+            at = last
+        } else if s.index == 0 {
+            lasto = lasto + 1
+            last = lasto
+            if lasto > args.len() - 1 {
+                fail(MissingArgument)
+            }
+            at = lasto
+        } else {
+            last = s.index - 1
+            if last > args.len() - 1 {
+                fail(MissingArgument)
+            }
+            at = last
+        }
+        out = out + try print_one(s, args[at])
+    }
+    return out
+}

@@ -1,0 +1,4 @@
+[package]
+name = "nodepath"
+version = "1.0.0"
+capabilities = []

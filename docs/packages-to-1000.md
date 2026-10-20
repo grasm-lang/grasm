@@ -260,6 +260,89 @@ becomes buildable the day its reference is installed.
 
 ## Landed
 
+- [x] **B53: strings as five runtimes handle them** — `pyglob`
+  (`glob.translate`, `escape`, `has_magic`) `goencoding` (Go's base64,
+  base32, hex and ascii85) `javabiginteger` `pyquopri` `pyemailutils`
+  (the address helpers of `email.utils`) `rubystring` (`succ`, `tr`,
+  `tr_s`, `delete`, `squeeze`, `count`) `nodestringdecoder`
+  `pycookies` (`http.cookies`), and the harness `b53test`; the new gate
+  `b53diff` runs 70,000 lines against CPython 3.13, Go 1.25, Java 17,
+  Ruby 2.6 and Node 25. `goencoding` is one package where four were
+  written: the four encodings share Go's `CorruptInputError` reporting,
+  and four packages would have been one API split by file. Found on the
+  way: Ruby checks `delete`'s arity after it has returned `""` for an
+  empty receiver, and setting an attribute on a cookie that is not in the
+  jar is a `KeyError`, which `pycookies` now reports.
+
+- [x] **B52: paths, sniffing, CSV and shell words** — `gopath`
+  `gosniff` (`http.DetectContentType`) `pycsv` `javaduration`
+  (`Duration` and `Period`) `nodeutilformat` (`util.format`, and
+  `util.inspect` for primitives) `pyposixpath` `rubyshellwords`, and the
+  harness `b52test`; the new gate `b52diff` runs 64,002 lines against
+  Go 1.25, CPython 3.13, Java 17, Node 25 and Ruby 2.6. Found on the way,
+  by `javaduration`'s seconds at the edge of a long: `bigint` turned
+  i64::MIN into 0 (`from_i64` negated it, which overflows) and back into
+  None (`to_i64` accumulated a positive magnitude MIN does not have).
+  Both now count on the negative side; every package that depends on
+  `bigint` was re-run.
+
+- [x] **B51: Node's buffers and paths, Python's text** — `nodepath`
+  (`path.posix`) `nodebuffer` (`Buffer`'s string conversions) `jsjson`
+  (`JSON.parse` and `JSON.stringify`) `pycharclass`
+  (`unicodedata.category`, the `str` predicates and `re`'s `\w`, `\d`,
+  `\s`, Unicode 15.1) `pytextwrap` `pycalendar`
+  `pyfractions`, and the harness `b51test`; the new gate `b51diff` runs
+  44,017 lines against Node 25 (V8 14) and CPython 3.13.
+
+- [x] **B50: numbers, URIs, JSON, CSV and time as text** — `jsradix`
+  (`Number.prototype.toString(radix)` and `parseInt`) `jsuri`
+  (`encodeURI`, `decodeURI`, their `Component` forms, `escape`,
+  `unescape`) `gojson` `pyjson` `gocsv`
+  `pydatetime` `pyfnmatch` `goduration`, and the harness `b50test`; the
+  new gate `b50diff` runs 54,000 lines against Node 25, Go 1.25 and
+  CPython 3.13. `jsradix` started as a second `jsnumber`: the repository
+  already had `jsnumber` (`Number.prototype.toString` and
+  `parseFloat`), so the new package keeps only the radix half and imports
+  the rest.
+
+- [x] **B49: Go's and Python's numbers and URLs** — `gostrconv`
+  `gonetip` `gourl` `gomime` `pyurlparse` `pyrandom` `pymath`
+  `pystatistics`, and the harness `b49test`; the new gate `b49diff` runs
+  45,000 lines against Go 1.25 and CPython 3.13. Overlaps, kept because
+  each package answers as its own runtime does: `gostrconv.format_float`
+  covers ground `goprintf` prints through, `pymath` has its own `fsum`,
+  `remainder`, `nextafter` and `ulp` beside `floatmath`'s (Python's
+  signatures and errors), and `pyrandom` is built on `mersenne`. Found on
+  the way, by the leak gate on this batch's demo: a compiled loop over a
+  list dropped its body's last value without releasing it, so
+  `for s in xs { f() }` leaked what `f` returned on every pass, and both
+  forms of `parallel` block did the same with their last statement
+  (`pyurlparse.urljoin`'s discarded `pop()` was the first case traced).
+  Fixed in the native backend; `examples/loop_tails.gr` keeps it fixed.
+
+- [x] **B48: Java's numbers and text** — `javarandom`
+  (`java.util.Random`, `SplittableRandom`) `javadouble`
+  (`Double.toString`, `Float.toString`) `javaformat` (`String.format`)
+  `javadecimalformat` `javauri` (`java.net.URI`) `javamessageformat`
+  (`MessageFormat`, `ChoiceFormat`) `javabigdecimal`, and the harness
+  `b48test`; the new gate `b48diff` runs 32,065 lines against Java 17.
+
+- [x] **B47: what HTTP and profiles carry** — `httpcachesem` (npm's
+  `http-cache-semantics` 4.2.0) `unicodeblock` (Java 17's
+  `Character.UnicodeBlock`) `hangul` (Python 3.13's `unicodedata`)
+  `lz4frame` (the `.lz4` frame format, against the `lz4` tool 1.10)
+  `pprof` (Go 1.25's profile parser) `digestauth` (curl 8.7.1) `gobwire`
+  (Go 1.25's `encoding/gob` decoder), and the harness `b47test`; the new
+  gate `b47diff` runs 684 cases. `httpcachesem` sits beside `httpcache`,
+  which states RFC 9111's rules; this one answers as the npm package does,
+  where it reads the RFC loosely. `lz4` deliberately does not write the
+  frame format; `lz4frame` does, with its own copy of the block codec.
+
+Four candidates written for B47-B52 were dropped before landing because
+the repository already had them under other names: `ssri` (`sri`),
+`cprintf` (`cformat`), `pyshlex` (`shlex`) and `pystringtemplate`
+(`stringtemplate`). Each batch's count above is what landed.
+
 - [x] **B46: what packages say about themselves, as npm and pip read it**
   — `braceexpansion` `npmini` (npm's INI, `.npmrc`) `spdxcorrect`
   `npminstallchecks` (engines, platforms, devEngines) `pickmanifest`
@@ -295,7 +378,8 @@ becomes buildable the day its reference is installed.
   cache key); and a pattern that binds a name and then fails on a later
   part -- `(Some(x), Some(y))` against `(Some(s), None)`, or `P(x, R())`
   against `P(s, Q())` -- leaked what it bound on every try. The count
-  reaches 1000.
+  of package directories reached 1000 here; counted as libraries it was
+  891 (see "Where it stands").
 
 - [x] **B45: the files a toolchain leaves behind** — `dyldinfo` (rebase
   and bind opcodes, before chained fixups) `machobuild` (LC_BUILD_VERSION
@@ -963,7 +1047,7 @@ becomes buildable the day its reference is installed.
 | | |
 |---|---|
 | At the start | 669 package directories, test harnesses included |
-| Now | 1000 package directories: **891 libraries** (a package exporting a `pub fn`) and 109 test harnesses |
+| Now | 1059 package directories besides the demos: **943 libraries** (a package exporting a `pub fn`) and 116 test harnesses |
 | Candidates above | 316 packages in 28 batches, plus `ecc`, `rfc6979` and `goprintf` |
 | Harnesses, one a batch | 28 |
 | If every candidate lands | 1016 |
@@ -972,8 +1056,9 @@ becomes buildable the day its reference is installed.
 The "1000" these batches reached counted every package directory but the
 `-demo` ones, and so counted the harnesses (`b47test`, `uritdiff`,
 `gostdtest`, ...) that drive the diffs: programs with a `main` and no API,
-which nobody would depend on. Counted as libraries the set is 891, and 109
-more are needed for the target. `scripts/site.py` counts the same way now.
+which nobody would depend on. Counted as libraries the set was 891, with
+109 more needed for the target; B47-B53 bring it to 943, and 57 are still
+needed. `scripts/site.py` counts the same way now.
 
 The margin over 1000 is 16. It is there because some
 candidate will turn out to exist already under a name the grep missed, or to

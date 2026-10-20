@@ -1,0 +1,692 @@
+// `java.math.BigDecimal`, as Java 17 computes and prints it.
+//
+// A BigDecimal is an unscaled integer and a scale: 1.50 is 150 with scale
+// 2, and is *not* the same BigDecimal as 1.5, though it compares equal.
+// Money in every JVM service, `NUMERIC` columns through JDBC, and the
+// numbers in a great deal of JSON written by Jackson are these, so a
+// program that reads or checks their output has to reproduce three things
+// exactly:
+//
+//   - **The text.** `toString` switches to exponent form when the scale is
+//     negative or the number is below 10^-6 (`1E+3`, `1.2E-7`),
+//     `toEngineeringString` keeps exponents to multiples of three and
+//     writes zero as `0.00E+3`, and `toPlainString` never uses one.
+//   - **The scale of every result.** `1.10 + 2.205` is `3.305`; `2.50 *
+//     4` is `10.00`; `1.00 / 4` is `0.25` but `1 / 4.0` is `0.25` too, by
+//     the preferred-scale rule, and an exact quotient is stripped of
+//     trailing zeros only down to it.
+//   - **Rounding.** The eight modes of `RoundingMode`, to a scale or to a
+//     precision (`MathContext`); a carry that adds a digit (9.99 to 3
+//     digits is 10.0) costs one place of scale.
+//
+// Covered: `new BigDecimal(String)`, `new BigDecimal(double)` (the exact
+// binary value), `valueOf(double)` (its `Double.toString` digits, from
+// `packages/javadouble`), the three printers, `add`, `subtract`,
+// `multiply` and `divide` with and without a `MathContext`, `divide` to a
+// scale, `divideToIntegralValue`, `remainder`, `pow`, `setScale`,
+// `round`, `stripTrailingZeros`, the point movers, `compareTo`, `equals`,
+// `hashCode`, `doubleValue`, `longValue` and `toBigInteger`.
+//
+// Not here: `sqrt` (Java 17's has known errors under directed rounding),
+// `pow` with a `MathContext` (an X3.274 algorithm that is not correctly
+// rounded), and digits other than ASCII in parsed text, which Java also
+// accepts. Failures are reported by kind; Java's messages are not
+// reproduced.
+
+import bigint
+import javadouble
+
+type BigDec = { unscaled: BigInt, scale: i64 }
+
+type BdRounding =
+    | BdUp
+    | BdDown
+    | BdCeiling
+    | BdFloor
+    | BdHalfUp
+    | BdHalfDown
+    | BdHalfEven
+    | BdUnnecessary
+
+/// A precision in significant digits, 0 for unlimited, and how to round.
+type MathContext = { precision: i64, rounding: BdRounding }
+
+type BdError =
+    /// `NumberFormatException`: text that is not a number, or NaN or an
+    /// infinity where a value is needed.
+    | BdFormat
+    /// `ArithmeticException`: division by zero, rounding under
+    /// `Unnecessary` that is needed, a non-terminating exact quotient, or a
+    /// scale outside a Java `int`.
+    | BdArithmetic(kind: str)
+
+// ---- small helpers over bigint
+
+fn big(v: i64) -> BigInt {
+    return bigint.from_i64(v)
+}
+
+fn ten_pow(n: i64) -> BigInt {
+    return bigint.pow(big(10), n)
+}
+
+fn magnitude(n: BigInt) -> BigInt {
+    return if bigint.sign(n) < 0 { bigint.negate(n) } else { n }
+}
+
+fn with_sign(n: BigInt, negative: bool) -> BigInt {
+    return if negative { bigint.negate(n) } else { n }
+}
+
+fn divmod(a: BigInt, b: BigInt) -> (BigInt, BigInt) {
+    return match bigint.divmod(a, b) {
+        Ok(qr) -> qr
+        Err(_e) -> (bigint.zero(), bigint.zero())
+    }
+}
+
+fn check_scale(s: i64) -> i64 ! BdError {
+    if s > 2147483647 {
+        fail(BdArithmetic("Underflow"))
+    }
+    if s < 0 - 2147483648 {
+        fail(BdArithmetic("Overflow"))
+    }
+    return s
+}
+
+fn saturate(s: i64) -> i64 {
+    return (0 - 2147483648).max(2147483647.min(s))
+}
+
+fn value(u: BigInt, scale: i64) -> BigDec {
+    return BigDec{ unscaled: u, scale: scale }
+}
+
+pub fn of_long(v: i64, scale: i64) -> BigDec {
+    return value(big(v), scale)
+}
+
+pub fn signum(d: BigDec) -> i64 {
+    return bigint.sign(d.unscaled)
+}
+
+/// Significant digits of the unscaled value; 1 for zero.
+pub fn precision(d: BigDec) -> i64 {
+    return bigint.digit_count(d.unscaled)
+}
+
+pub fn unscaled_text(d: BigDec) -> str {
+    return bigint.to_str(d.unscaled)
+}
+
+// ---- parsing
+
+fn digit(c: i64) -> bool {
+    return c >= 48 and c <= 57
+}
+
+/// `new BigDecimal(String)`: a sign, digits with at most one point, and an
+/// exponent; no spaces.
+pub fn parse(text: str) -> BigDec ! BdError {
+    let cs = text.codes()
+    var i = 0
+    var negative = false
+    if cs.len() > 0 and (cs[0] == 45 or cs[0] == 43) {
+        negative = cs[0] == 45
+        i = 1
+    }
+    var digits = ""
+    var after_point = 0
+    var point = false
+    while i < cs.len() and (digit(cs[i]) or cs[i] == 46) {
+        if cs[i] == 46 {
+            if point {
+                fail(BdFormat)
+            }
+            point = true
+        } else {
+            digits = digits + cs[i].to_char()
+            if point {
+                after_point = after_point + 1
+            }
+        }
+        i = i + 1
+    }
+    if digits.len() == 0 {
+        fail(BdFormat)
+    }
+    var exponent = 0
+    if i < cs.len() {
+        if cs[i] != 101 and cs[i] != 69 {
+            fail(BdFormat)
+        }
+        exponent = try parse_exponent(cs, i + 1)
+    }
+    let scale = after_point - exponent
+    if scale > 2147483647 or scale < 0 - 2147483648 {
+        fail(BdFormat)
+    }
+    let u = match bigint.parse(digits) {
+        Ok(n) -> n
+        Err(_e) -> fail(BdFormat)
+    }
+    return value(with_sign(u, negative), scale)
+}
+
+fn parse_exponent(cs: [i64], start: i64) -> i64 ! BdError {
+    var i = start
+    var negative = false
+    if i < cs.len() and (cs[i] == 45 or cs[i] == 43) {
+        negative = cs[i] == 45
+        i = i + 1
+    }
+    if i >= cs.len() {
+        fail(BdFormat)
+    }
+    var e = 0
+    while i < cs.len() {
+        if not digit(cs[i]) {
+            fail(BdFormat)
+        }
+        e = e * 10 + cs[i] - 48
+        if e > 2147483648 {
+            fail(BdFormat)
+        }
+        i = i + 1
+    }
+    if not negative and e > 2147483647 {
+        fail(BdFormat)
+    }
+    return if negative { 0 - e } else { e }
+}
+
+/// `new BigDecimal(double)`: the double's exact binary value.
+pub fn of_double(x: f64) -> BigDec ! BdError {
+    if x.is_nan() or x.abs() == 1.0 / 0.0 {
+        fail(BdFormat)
+    }
+    let bits = x.to_bits()
+    let e0 = bits.ushr(52).bit_and(2047)
+    var m = bits.bit_and(4503599627370495)
+    var e = if e0 == 0 { 0 - 1074 } else { e0 - 1075 }
+    if e0 != 0 {
+        m = m.bit_or(4503599627370496)
+    }
+    if m == 0 {
+        return of_long(0, 0)
+    }
+    while m.bit_and(1) == 0 {
+        m = m.shr(1)
+        e = e + 1
+    }
+    let negative = bits < 0
+    if e >= 0 {
+        return value(with_sign(bigint.mul(big(m), bigint.pow(big(2), e)), negative), 0)
+    }
+    return value(with_sign(bigint.mul(big(m), bigint.pow(big(5), 0 - e)), negative), 0 - e)
+}
+
+/// `BigDecimal.valueOf(double)`: the digits `Double.toString` prints.
+pub fn value_of(x: f64) -> BigDec ! BdError {
+    return try parse(javadouble.double_to_string(x))
+}
+
+// ---- printing: BigDecimal.layoutChars and toPlainString
+
+fn layout(d: BigDec, scientific: bool) -> str {
+    if d.scale == 0 {
+        return bigint.to_str(d.unscaled)
+    }
+    let coeff = bigint.to_str(magnitude(d.unscaled))
+    let sign = if signum(d) < 0 { "-" } else { "" }
+    let n = coeff.len()
+    var adjusted = 0 - d.scale + (n - 1)
+    if d.scale >= 0 and adjusted >= 0 - 6 {
+        let pad = d.scale - n
+        if pad >= 0 {
+            return sign + "0." + "0".repeat(pad) + coeff
+        }
+        return sign + coeff.substr(0, 0 - pad) + "." + coeff.substr(0 - pad, d.scale)
+    }
+    var body = ""
+    if scientific {
+        body = coeff.substr(0, 1) + (if n > 1 { "." + coeff.substr(1, n - 1) } else { "" })
+    } else {
+        var sig = adjusted % 3
+        if sig < 0 {
+            sig = sig + 3
+        }
+        adjusted = adjusted - sig
+        sig = sig + 1
+        if signum(d) == 0 {
+            if sig == 2 {
+                body = "0.00"
+                adjusted = adjusted + 3
+            } else if sig == 3 {
+                body = "0.0"
+                adjusted = adjusted + 3
+            } else {
+                body = "0"
+            }
+        } else if sig >= n {
+            body = coeff + "0".repeat(sig - n)
+        } else {
+            body = coeff.substr(0, sig) + "." + coeff.substr(sig, n - sig)
+        }
+    }
+    let exp = if adjusted == 0 { "" } else if adjusted > 0 { "E+" + adjusted.to_str() } else { "E" + adjusted.to_str() }
+    return sign + body + exp
+}
+
+/// `toString()`.
+pub fn to_string(d: BigDec) -> str {
+    return layout(d, true)
+}
+
+/// `toEngineeringString()`.
+pub fn to_engineering_string(d: BigDec) -> str {
+    return layout(d, false)
+}
+
+/// `toPlainString()`.
+pub fn to_plain_string(d: BigDec) -> str {
+    if d.scale == 0 {
+        return bigint.to_str(d.unscaled)
+    }
+    if d.scale < 0 {
+        if signum(d) == 0 {
+            return "0"
+        }
+        return bigint.to_str(d.unscaled) + "0".repeat(0 - d.scale)
+    }
+    let digits = bigint.to_str(magnitude(d.unscaled))
+    let neg = signum(d) < 0
+    let point = digits.len() - d.scale
+    if point == 0 {
+        return (if neg { "-0." } else { "0." }) + digits
+    }
+    if point > 0 {
+        return (if neg { "-" } else { "" }) + digits.substr(0, point) + "." + digits.substr(point, d.scale)
+    }
+    return (if neg { "-0." } else { "0." }) + "0".repeat(0 - point) + digits
+}
+
+// ---- rounding
+
+/// n / d for non-negative n and positive d, rounded to an integer by `mode`
+/// for a quotient of the given sign.
+fn round_div(n: BigInt, d: BigInt, negative: bool, mode: BdRounding) -> BigInt ! BdError {
+    let (q, r) = divmod(n, d)
+    if bigint.is_zero(r) {
+        return q
+    }
+    let half = bigint.compare(bigint.add(r, r), d)
+    let odd = bigint.is_zero(bigint.rem(q, big(2)) ?? bigint.zero()) == false
+    let up = match mode {
+        BdUp -> true
+        BdDown -> false
+        BdCeiling -> not negative
+        BdFloor -> negative
+        BdHalfUp -> half >= 0
+        BdHalfDown -> half > 0
+        BdHalfEven -> half > 0 or (half == 0 and odd)
+        BdUnnecessary -> fail(BdArithmetic("Rounding necessary"))
+    }
+    return if up { bigint.add(q, big(1)) } else { q }
+}
+
+/// The value at `scale`, from a quotient num / den of the given sign.
+fn quotient_at(num: BigInt, den: BigInt, negative: bool, scale: i64, mode: BdRounding) -> BigDec ! BdError {
+    return value(with_sign(try round_div(num, den, negative, mode), negative), scale)
+}
+
+/// a / b at `scale`: |ua| * 10^(scale - sa + sb) / |ub|, rounded.
+fn divide_at(a: BigDec, b: BigDec, scale: i64, mode: BdRounding) -> BigDec ! BdError {
+    let negative = signum(a) * signum(b) < 0
+    let e = scale - a.scale + b.scale
+    let num = if e >= 0 { bigint.mul(magnitude(a.unscaled), ten_pow(e)) } else { magnitude(a.unscaled) }
+    let den = if e >= 0 { magnitude(b.unscaled) } else { bigint.mul(magnitude(b.unscaled), ten_pow(0 - e)) }
+    return try quotient_at(num, den, negative, scale, mode)
+}
+
+/// BigDecimal.doRound: digits dropped until the precision fits, the scale
+/// falling one for each.
+fn do_round(d: BigDec, mc: MathContext) -> BigDec ! BdError {
+    if mc.precision == 0 {
+        return d
+    }
+    var v = d
+    var drop = precision(v) - mc.precision
+    while drop > 0 {
+        let scale = try check_scale(v.scale - drop)
+        v = try quotient_at(magnitude(v.unscaled), ten_pow(drop), signum(v) < 0, scale, mc.rounding)
+        drop = precision(v) - mc.precision
+    }
+    return v
+}
+
+/// `round(mc)`, which is also `plus(mc)`.
+pub fn round(d: BigDec, mc: MathContext) -> BigDec ! BdError {
+    return try do_round(d, mc)
+}
+
+/// `setScale(scale, mode)`.
+pub fn set_scale(d: BigDec, scale: i64, mode: BdRounding) -> BigDec ! BdError {
+    if scale == d.scale {
+        return d
+    }
+    if signum(d) == 0 {
+        return value(bigint.zero(), scale)
+    }
+    if scale > d.scale {
+        return value(bigint.mul(d.unscaled, ten_pow(scale - d.scale)), scale)
+    }
+    return try quotient_at(magnitude(d.unscaled), ten_pow(d.scale - scale), signum(d) < 0, scale, mode)
+}
+
+/// Trailing zeros removed while the scale is above `preferred`, never from
+/// a single digit.
+fn strip_to(d: BigDec, preferred: i64) -> BigDec {
+    var u = d.unscaled
+    var s = d.scale
+    while s > preferred and bigint.compare(magnitude(u), big(10)) >= 0 {
+        let (q, r) = divmod(u, big(10))
+        if not bigint.is_zero(r) {
+            break
+        }
+        u = q
+        s = s - 1
+    }
+    return value(u, s)
+}
+
+/// `stripTrailingZeros()`; zero becomes plain `0`.
+pub fn strip_trailing_zeros(d: BigDec) -> BigDec {
+    if signum(d) == 0 {
+        return of_long(0, 0)
+    }
+    return strip_to(d, 0 - 9223372036854775807)
+}
+
+// ---- arithmetic
+
+fn aligned(a: BigDec, s: i64) -> BigInt {
+    return bigint.mul(a.unscaled, ten_pow(s - a.scale))
+}
+
+pub fn negate(d: BigDec) -> BigDec {
+    return value(bigint.negate(d.unscaled), d.scale)
+}
+
+pub fn abs(d: BigDec) -> BigDec {
+    return value(magnitude(d.unscaled), d.scale)
+}
+
+/// `add`: exact, at the larger scale.
+pub fn add(a: BigDec, b: BigDec) -> BigDec {
+    let s = a.scale.max(b.scale)
+    return value(bigint.add(aligned(a, s), aligned(b, s)), s)
+}
+
+pub fn subtract(a: BigDec, b: BigDec) -> BigDec {
+    return add(a, negate(b))
+}
+
+/// `multiply`: exact, at the sum of the scales.
+pub fn multiply(a: BigDec, b: BigDec) -> BigDec ! BdError {
+    return value(bigint.mul(a.unscaled, b.unscaled), try check_scale(a.scale + b.scale))
+}
+
+/// `add(b, mc)`. With a zero operand Java keeps as much of the larger scale
+/// as the precision allows.
+pub fn add_mc(a: BigDec, b: BigDec, mc: MathContext) -> BigDec ! BdError {
+    if mc.precision == 0 {
+        return add(a, b)
+    }
+    let a_zero = signum(a) == 0
+    let b_zero = signum(b) == 0
+    if not a_zero and not b_zero {
+        return try do_round(add(a, b), mc)
+    }
+    let preferred = a.scale.max(b.scale)
+    if a_zero and b_zero {
+        return value(bigint.zero(), preferred)
+    }
+    let r = try do_round(if a_zero { b } else { a }, mc)
+    if r.scale == preferred {
+        return r
+    }
+    if r.scale > preferred {
+        return strip_to(r, preferred)
+    }
+    let room = mc.precision - precision(r)
+    let want = preferred - r.scale
+    return try set_scale(r, if room >= want { preferred } else { r.scale + room }, BdUnnecessary)
+}
+
+pub fn subtract_mc(a: BigDec, b: BigDec, mc: MathContext) -> BigDec ! BdError {
+    return try add_mc(a, negate(b), mc)
+}
+
+pub fn multiply_mc(a: BigDec, b: BigDec, mc: MathContext) -> BigDec ! BdError {
+    return try do_round(try multiply(a, b), mc)
+}
+
+fn check_divisor(a: BigDec, b: BigDec) ! BdError {
+    if signum(b) == 0 {
+        fail(BdArithmetic(if signum(a) == 0 { "Division undefined" } else { "Division by zero" }))
+    }
+}
+
+/// `divide(b, scale, mode)`.
+pub fn divide_to_scale(a: BigDec, b: BigDec, scale: i64, mode: BdRounding) -> BigDec ! BdError {
+    try check_divisor(a, b)
+    return try divide_at(a, b, scale, mode)
+}
+
+/// `divide(b, mode)`: at the dividend's scale.
+pub fn divide_rounding(a: BigDec, b: BigDec, mode: BdRounding) -> BigDec ! BdError {
+    return try divide_to_scale(a, b, a.scale, mode)
+}
+
+/// The integer digits of |a| / |b| truncated: compared by the position of
+/// the leading digit, the quantity `precision - scale`.
+fn leading_position(d: BigDec) -> i64 {
+    return precision(d) - d.scale
+}
+
+/// `divide(b, mc)`: the quotient to `mc.precision` digits; an exact one is
+/// stripped of trailing zeros down to the preferred scale `a.scale -
+/// b.scale`.
+pub fn divide_mc(a: BigDec, b: BigDec, mc: MathContext) -> BigDec ! BdError {
+    if mc.precision == 0 {
+        return try divide_exact(a, b)
+    }
+    try check_divisor(a, b)
+    let preferred = a.scale - b.scale
+    if signum(a) == 0 {
+        return value(bigint.zero(), saturate(preferred))
+    }
+    // The scale at which the truncated quotient has exactly p digits.
+    var s = mc.precision - (leading_position(a) - leading_position(b))
+    let probe = try divide_at(abs(a), abs(b), s, BdDown)
+    if precision(probe) > mc.precision {
+        s = s - 1
+    } else if precision(probe) < mc.precision {
+        s = s + 1
+    }
+    s = try check_scale(s)
+    let exact = try divide_at(a, b, s, BdDown)
+    let back = try multiply(exact, b)
+    if compare(back, a) == 0 {
+        return strip_to(exact, preferred)
+    }
+    return try do_round(try divide_at(a, b, s, mc.rounding), mc)
+}
+
+/// `divide(b)`: the exact quotient, at the preferred scale or the least
+/// above it that holds the quotient; a quotient that does not terminate
+/// fails.
+pub fn divide_exact(a: BigDec, b: BigDec) -> BigDec ! BdError {
+    try check_divisor(a, b)
+    let preferred = saturate(a.scale - b.scale)
+    if signum(a) == 0 {
+        return value(bigint.zero(), preferred)
+    }
+    let digits = precision(a) + (10 * precision(b) + 2) / 3
+    let q = match divide_mc(a, b, MathContext{ precision: digits.min(2147483647), rounding: BdUnnecessary }) {
+        Ok(q) -> q
+        Err(_e) -> fail(BdArithmetic("Non-terminating decimal expansion; no exact representable decimal result."))
+    }
+    if preferred > q.scale {
+        return try set_scale(q, preferred, BdUnnecessary)
+    }
+    return q
+}
+
+/// `divideToIntegralValue(b)`.
+pub fn divide_to_integral(a: BigDec, b: BigDec) -> BigDec ! BdError {
+    let preferred = saturate(a.scale - b.scale)
+    if compare(abs(a), abs(b)) < 0 {
+        return value(bigint.zero(), preferred)
+    }
+    if signum(a) == 0 and signum(b) != 0 {
+        return try set_scale(a, preferred, BdUnnecessary)
+    }
+    let gap = (a.scale - b.scale).abs()
+    let digits = (precision(a) + (10 * precision(b) + 2) / 3 + gap + 2).min(2147483647)
+    var q = try divide_mc(a, b, MathContext{ precision: digits, rounding: BdDown })
+    if q.scale > 0 {
+        q = strip_to(try set_scale(q, 0, BdDown), preferred)
+    }
+    if q.scale < preferred {
+        q = try set_scale(q, preferred, BdUnnecessary)
+    }
+    return q
+}
+
+/// `remainder(b)`: a - divideToIntegralValue(a, b) * b.
+pub fn remainder(a: BigDec, b: BigDec) -> BigDec ! BdError {
+    return subtract(a, try multiply(try divide_to_integral(a, b), b))
+}
+
+/// `pow(n)` for 0 <= n <= 999999999, exact.
+pub fn pow(d: BigDec, n: i64) -> BigDec ! BdError {
+    if n < 0 or n > 999999999 {
+        fail(BdArithmetic("Invalid operation"))
+    }
+    return value(bigint.pow(d.unscaled, n), try check_scale(d.scale * n))
+}
+
+pub fn move_point_left(d: BigDec, n: i64) -> BigDec ! BdError {
+    if n == 0 {
+        return d
+    }
+    let v = value(d.unscaled, try check_scale(d.scale + n))
+    return if v.scale < 0 { try set_scale(v, 0, BdUnnecessary) } else { v }
+}
+
+pub fn move_point_right(d: BigDec, n: i64) -> BigDec ! BdError {
+    if n == 0 {
+        return d
+    }
+    let v = value(d.unscaled, try check_scale(d.scale - n))
+    return if v.scale < 0 { try set_scale(v, 0, BdUnnecessary) } else { v }
+}
+
+pub fn scale_by_power_of_ten(d: BigDec, n: i64) -> BigDec ! BdError {
+    return value(d.unscaled, try check_scale(d.scale - n))
+}
+
+/// `ulp()`: one unit in the last place, at the same scale.
+pub fn ulp(d: BigDec) -> BigDec {
+    return of_long(1, d.scale)
+}
+
+// ---- comparison, hashing, conversion
+
+/// `compareTo`: -1, 0 or 1, by value alone.
+pub fn compare(a: BigDec, b: BigDec) -> i64 {
+    let sa = signum(a)
+    let sb = signum(b)
+    if sa != sb {
+        return if sa < sb { 0 - 1 } else { 1 }
+    }
+    if sa == 0 {
+        return 0
+    }
+    let pa = leading_position(a)
+    let pb = leading_position(b)
+    if pa != pb {
+        return if (pa > pb) == (sa > 0) { 1 } else { 0 - 1 }
+    }
+    let s = a.scale.max(b.scale)
+    return bigint.compare(aligned(a, s), aligned(b, s))
+}
+
+/// `equals`: value and scale both.
+pub fn equals(a: BigDec, b: BigDec) -> bool {
+    return a.scale == b.scale and bigint.compare(a.unscaled, b.unscaled) == 0
+}
+
+pub fn min(a: BigDec, b: BigDec) -> BigDec {
+    return if compare(a, b) <= 0 { a } else { b }
+}
+
+pub fn max(a: BigDec, b: BigDec) -> BigDec {
+    return if compare(a, b) >= 0 { a } else { b }
+}
+
+/// `BigInteger.hashCode` of the unscaled value: its 32-bit words, most
+/// significant first, folded by 31, times the sign.
+fn big_hash(n: BigInt) -> i32 {
+    let bytes = (bigint.to_bytes(magnitude(n), 0) ?? bytes_of([])).to_list()
+    var padded: [i64] = []
+    for _k in 0..((4 - bytes.len() % 4) % 4) {
+        padded.push(0)
+    }
+    for x in bytes {
+        padded.push(x)
+    }
+    var h: i32 = 0
+    var i = 0
+    while i < padded.len() {
+        let word = padded[i].shl(24) + padded[i + 1].shl(16) + padded[i + 2].shl(8) + padded[i + 3]
+        h = 31 * h + word.as_i32()
+        i = i + 4
+    }
+    return h * bigint.sign(n).as_i32()
+}
+
+/// `hashCode()`.
+pub fn hash_code(d: BigDec) -> i64 {
+    return (31 * big_hash(d.unscaled) + d.scale.as_i32()).as_i64()
+}
+
+/// `doubleValue()`: the nearest double.
+pub fn to_double(d: BigDec) -> f64 {
+    return to_string(d).parse_float() ?? 0.0
+}
+
+/// `toBigInteger()`: the integer part, as decimal digits.
+pub fn to_big_integer(d: BigDec) -> str {
+    return bigint.to_str((set_scale(d, 0, BdDown) ?? d).unscaled)
+}
+
+/// `toBigIntegerExact()`.
+pub fn to_big_integer_exact(d: BigDec) -> str ! BdError {
+    return bigint.to_str((try set_scale(d, 0, BdUnnecessary)).unscaled)
+}
+
+/// `longValue()`: the low 64 bits of the integer part.
+pub fn long_value(d: BigDec) -> i64 {
+    let t = (set_scale(d, 0, BdDown) ?? d).unscaled
+    let (_q, r) = divmod(magnitude(t), bigint.pow(big(2), 64))
+    let bytes = (bigint.to_bytes(r, 8) ?? bytes_of([])).to_list()
+    var v = 0
+    for x in bytes {
+        v = v.shl(8).bit_or(x)
+    }
+    return if bigint.sign(t) < 0 { 0 - v } else { v }
+}

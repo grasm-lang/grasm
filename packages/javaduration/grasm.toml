@@ -1,0 +1,8 @@
+[package]
+name = "javaduration"
+version = "1.0.0"
+capabilities = []
+
+[dependencies.bigint]
+path = "../bigint"
+version = "^1.0.0"

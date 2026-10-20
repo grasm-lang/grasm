@@ -1,0 +1,8 @@
+[package]
+name = "pyglob"
+version = "1.0.0"
+capabilities = []
+
+[dependencies.pyfnmatch]
+path = "../pyfnmatch"
+version = "^1.0.0"

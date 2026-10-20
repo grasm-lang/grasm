@@ -1,0 +1,734 @@
+// Python's `fractions.Fraction`, as CPython 3.13 has it: the string and
+// float constructors, arithmetic, `limit_denominator`, rounding, `float()`,
+// `str`, `repr` and the 3.12 format mini-language (`f"{x:.3f}"`,
+// `f"{x:_>10}"`, `f"{x:e}"`).
+//
+// `packages/rational` and `packages/bigrational` are exact fractions.
+// This is Python's, for tools that must print and parse what Python does:
+//
+//   - `Fraction("1.5e-3")`, `Fraction(" -3/4 ")`, `Fraction("1_000")`;
+//     digits and spaces may be any Unicode decimals and whitespace, as
+//     `int()` reads them. Anything else is "Invalid literal for Fraction".
+//   - `Fraction(1.1)` is the float's exact value; `limit_denominator`
+//     finds the closest fraction with a bounded denominator.
+//   - `round` and the `e`, `f`, `g` and `%` formats round half to even on
+//     the exact value, never through a float; `float()` rounds once.
+//   - Without a presentation type, the format writes `n/d` (or `n` for an
+//     integer, unless `#`), with fill, alignment, sign and `,`/`_`
+//     grouping.
+//   - Dividing by zero is "Fraction(n, 0)" as Python reports it.
+
+import bigint
+import pycharclass
+
+/// A fraction in lowest terms, the denominator positive.
+type Fraction = { num: BigInt, den: BigInt }
+
+type FractionError =
+    | FrValueError(msg: str)
+    | FrZeroDivision(msg: str)
+    | FrOverflow(msg: str)
+
+pub fn error_text(e: FractionError) -> str {
+    return match e {
+        FrValueError(m) -> m
+        FrZeroDivision(m) -> m
+        FrOverflow(m) -> m
+    }
+}
+
+fn big(n: i64) -> BigInt {
+    return bigint.from_i64(n)
+}
+
+fn zero() -> BigInt {
+    return bigint.zero()
+}
+
+fn is_zero(n: BigInt) -> bool {
+    return bigint.is_zero(n)
+}
+
+fn neg(n: BigInt) -> BigInt {
+    return bigint.negate(n)
+}
+
+fn babs(n: BigInt) -> BigInt {
+    return if bigint.sign(n) < 0 { neg(n) } else { n }
+}
+
+/// divmod, floored as Python floors it.
+fn fdivmod(a: BigInt, b: BigInt) -> (BigInt, BigInt) {
+    let (q, r) = bigint.divmod(a, b) ?? (zero(), zero())
+    if not is_zero(r) and bigint.sign(r) != bigint.sign(b) {
+        return (bigint.sub(q, big(1)), bigint.add(r, b))
+    }
+    return (q, r)
+}
+
+fn fdiv(a: BigInt, b: BigInt) -> BigInt {
+    let (q, _r) = fdivmod(a, b)
+    return q
+}
+
+fn gcd(a0: BigInt, b0: BigInt) -> BigInt {
+    var a = babs(a0)
+    var b = babs(b0)
+    while not is_zero(b) {
+        let (_q, r) = bigint.divmod(a, b) ?? (zero(), zero())
+        a = b
+        b = r
+    }
+    return a
+}
+
+fn pow10(n: i64) -> BigInt {
+    return bigint.pow(big(10), n)
+}
+
+/// `Fraction(n, d)`.
+pub fn from_ints(n: BigInt, d: BigInt) -> Fraction ! FractionError {
+    if is_zero(d) {
+        fail(FrZeroDivision("Fraction(" + bigint.to_str(n) + ", 0)"))
+    }
+    var g = gcd(n, d)
+    if bigint.sign(d) < 0 {
+        g = neg(g)
+    }
+    return Fraction{ num: fdiv(n, g), den: fdiv(d, g) }
+}
+
+pub fn from_i64(n: i64, d: i64) -> Fraction ! FractionError {
+    return try from_ints(big(n), big(d))
+}
+
+fn coprime(n: BigInt, d: BigInt) -> Fraction {
+    return Fraction{ num: n, den: d }
+}
+
+// ---- parsing
+
+fn digits_value(cs: [i64]) -> BigInt {
+    var v = zero()
+    for c in cs {
+        if c != 95 {
+            v = bigint.add(bigint.mul(v, big(10)), big(pycharclass.decimal_value(c)))
+        }
+    }
+    return v
+}
+
+fn is_digit(c: i64) -> bool {
+    return c >= 0 and pycharclass.re_digit(c)
+}
+
+/// `\d+(_\d+)*` at `i`: where it ends, or `i` if nothing matches.
+fn digit_run(cs: [i64], i: i64) -> i64 {
+    var j = i
+    if j >= cs.len() or not is_digit(cs[j]) {
+        return i
+    }
+    while j < cs.len() and is_digit(cs[j]) {
+        j = j + 1
+    }
+    while j + 1 < cs.len() and cs[j] == 95 and is_digit(cs[j + 1]) {
+        j = j + 1
+        while j < cs.len() and is_digit(cs[j]) {
+            j = j + 1
+        }
+    }
+    return j
+}
+
+fn skip_space(cs: [i64], i: i64) -> i64 {
+    var j = i
+    while j < cs.len() and pycharclass.is_space(cs[j]) {
+        j = j + 1
+    }
+    return j
+}
+
+fn invalid(s: str) -> FractionError {
+    return FrValueError("Invalid literal for Fraction: " + py_repr(s.codes()))
+}
+
+/// `Fraction(text)`.
+pub fn from_string(s: str) -> Fraction ! FractionError {
+    let cs = s.codes()
+    var i = skip_space(cs, 0)
+    var negative = false
+    if i < cs.len() and (cs[i] == 43 or cs[i] == 45) {
+        negative = cs[i] == 45
+        i = i + 1
+    }
+    let at = |k| if k < cs.len() { cs[k] } else { 0 - 1 }
+    if not (is_digit(at(i)) or (at(i) == 46 and is_digit(at(i + 1)))) {
+        fail(invalid(s))
+    }
+    let num_end = digit_run(cs, i)
+    var num = digits_value(cs.slice(i, num_end))
+    var den = big(1)
+    i = num_end
+    // A denominator, or a fraction and exponent.
+    let after = skip_space(cs, i)
+    if after < cs.len() and cs[after] == 47 {
+        let d0 = skip_space(cs, after + 1)
+        let d1 = digit_run(cs, d0)
+        if d1 == d0 {
+            fail(invalid(s))
+        }
+        den = digits_value(cs.slice(d0, d1))
+        i = d1
+    } else {
+        if at(i) == 46 {
+            let f1 = digit_run(cs, i + 1)
+            let frac = cs.slice(i + 1, f1).filter(|c| c != 95)
+            let scale = pow10(frac.len())
+            num = bigint.add(bigint.mul(num, scale), digits_value(frac))
+            den = bigint.mul(den, scale)
+            i = f1
+        }
+        if at(i) == 101 or at(i) == 69 {
+            var j = i + 1
+            var eneg = false
+            if at(j) == 43 or at(j) == 45 {
+                eneg = at(j) == 45
+                j = j + 1
+            }
+            let e1 = digit_run(cs, j)
+            if e1 > j {
+                let e = bigint.to_i64(digits_value(cs.slice(j, e1))) ?? 0
+                if eneg {
+                    den = bigint.mul(den, pow10(e))
+                } else {
+                    num = bigint.mul(num, pow10(e))
+                }
+                i = e1
+            }
+        }
+    }
+    if skip_space(cs, i) != cs.len() {
+        fail(invalid(s))
+    }
+    if negative {
+        num = neg(num)
+    }
+    return try from_ints(num, den)
+}
+
+/// `Fraction(x)` for a float: its exact value.
+pub fn from_float(x: f64) -> Fraction ! FractionError {
+    if x != x {
+        fail(FrValueError("cannot convert NaN to integer ratio"))
+    }
+    if x == 1.0 / 0.0 or x == -1.0 / 0.0 {
+        fail(FrOverflow("cannot convert Infinity to integer ratio"))
+    }
+    let b = x.to_bits()
+    let e = b.shr(52).bit_and(2047)
+    var m = b.bit_and(4503599627370495)
+    if e != 0 {
+        m = m + 4503599627370496
+    }
+    let exp = (if e == 0 { 1 } else { e }) - 1075
+    var n = big(m)
+    var d = big(1)
+    if exp >= 0 {
+        n = bigint.mul(n, bigint.pow(big(2), exp))
+    } else {
+        d = bigint.pow(big(2), 0 - exp)
+    }
+    if b < 0 {
+        n = neg(n)
+    }
+    return try from_ints(n, d)
+}
+
+// ---- arithmetic
+
+pub fn add(a: Fraction, b: Fraction) -> Fraction {
+    return from_ints(bigint.add(bigint.mul(a.num, b.den), bigint.mul(b.num, a.den)), bigint.mul(a.den, b.den)) ?? a
+}
+
+pub fn sub(a: Fraction, b: Fraction) -> Fraction {
+    return from_ints(bigint.sub(bigint.mul(a.num, b.den), bigint.mul(b.num, a.den)), bigint.mul(a.den, b.den)) ?? a
+}
+
+pub fn mul(a: Fraction, b: Fraction) -> Fraction {
+    return from_ints(bigint.mul(a.num, b.num), bigint.mul(a.den, b.den)) ?? a
+}
+
+/// `a / b`.
+pub fn div(a: Fraction, b: Fraction) -> Fraction ! FractionError {
+    if is_zero(b.num) {
+        fail(FrZeroDivision("Fraction(" + bigint.to_str(b.den) + ", 0)"))
+    }
+    return try from_ints(bigint.mul(a.num, b.den), bigint.mul(a.den, b.num))
+}
+
+/// `a // b`, an integer.
+pub fn floordiv(a: Fraction, b: Fraction) -> BigInt ! FractionError {
+    if is_zero(b.num) {
+        fail(FrZeroDivision("integer division or modulo by zero"))
+    }
+    return fdiv(bigint.mul(a.num, b.den), bigint.mul(a.den, b.num))
+}
+
+/// `a % b`.
+pub fn modulo(a: Fraction, b: Fraction) -> Fraction ! FractionError {
+    if is_zero(b.num) {
+        fail(FrZeroDivision("integer modulo by zero"))
+    }
+    let (_q, r) = fdivmod(bigint.mul(a.num, b.den), bigint.mul(b.num, a.den))
+    return try from_ints(r, bigint.mul(a.den, b.den))
+}
+
+/// `a ** n`.
+pub fn pow(a: Fraction, n: i64) -> Fraction ! FractionError {
+    if n >= 0 {
+        return coprime(bigint.pow(a.num, n), bigint.pow(a.den, n))
+    }
+    if is_zero(a.num) {
+        fail(FrZeroDivision("Fraction(" + bigint.to_str(bigint.pow(a.den, 0 - n)) + ", 0)"))
+    }
+    if bigint.sign(a.num) > 0 {
+        return coprime(bigint.pow(a.den, 0 - n), bigint.pow(a.num, 0 - n))
+    }
+    return coprime(bigint.pow(neg(a.den), 0 - n), bigint.pow(neg(a.num), 0 - n))
+}
+
+pub fn negate(a: Fraction) -> Fraction {
+    return coprime(neg(a.num), a.den)
+}
+
+pub fn abs(a: Fraction) -> Fraction {
+    return coprime(babs(a.num), a.den)
+}
+
+/// -1, 0 or 1.
+pub fn compare(a: Fraction, b: Fraction) -> i64 {
+    return bigint.compare(bigint.mul(a.num, b.den), bigint.mul(b.num, a.den))
+}
+
+pub fn floor(a: Fraction) -> BigInt {
+    return fdiv(a.num, a.den)
+}
+
+pub fn ceil(a: Fraction) -> BigInt {
+    return neg(fdiv(neg(a.num), a.den))
+}
+
+pub fn trunc(a: Fraction) -> BigInt {
+    return if bigint.sign(a.num) < 0 { ceil(a) } else { floor(a) }
+}
+
+/// `round(a)`: the nearest integer, ties to even.
+pub fn round(a: Fraction) -> BigInt {
+    let (fl, rem) = fdivmod(a.num, a.den)
+    let c = bigint.compare(bigint.add(rem, rem), a.den)
+    if c < 0 {
+        return fl
+    }
+    if c > 0 {
+        return bigint.add(fl, big(1))
+    }
+    let (_q, r2) = fdivmod(fl, big(2))
+    return if is_zero(r2) { fl } else { bigint.add(fl, big(1)) }
+}
+
+/// `round(a, ndigits)`.
+pub fn round_to(a: Fraction, ndigits: i64) -> Fraction {
+    let shift = pow10(if ndigits < 0 { 0 - ndigits } else { ndigits })
+    if ndigits > 0 {
+        return from_ints(round(mul(a, coprime(shift, big(1)))), shift) ?? a
+    }
+    let q = div(a, coprime(shift, big(1))) ?? a
+    return coprime(bigint.mul(round(q), shift), big(1))
+}
+
+/// `a.limit_denominator(max_denominator)`.
+pub fn limit_denominator(a: Fraction, max_den: BigInt) -> Fraction ! FractionError {
+    if bigint.compare(max_den, big(1)) < 0 {
+        fail(FrValueError("max_denominator should be at least 1"))
+    }
+    if bigint.compare(a.den, max_den) <= 0 {
+        return a
+    }
+    var p0 = zero()
+    var q0 = big(1)
+    var p1 = big(1)
+    var q1 = zero()
+    var n = a.num
+    var d = a.den
+    while true {
+        let k = fdiv(n, d)
+        let q2 = bigint.add(q0, bigint.mul(k, q1))
+        if bigint.compare(q2, max_den) > 0 {
+            break
+        }
+        let np1 = bigint.add(p0, bigint.mul(k, p1))
+        p0 = p1
+        q0 = q1
+        p1 = np1
+        q1 = q2
+        let nd = bigint.sub(n, bigint.mul(k, d))
+        n = d
+        d = nd
+    }
+    let k = fdiv(bigint.sub(max_den, q0), q1)
+    let lhs = bigint.mul(bigint.mul(big(2), d), bigint.add(q0, bigint.mul(k, q1)))
+    if bigint.compare(lhs, a.den) <= 0 {
+        return coprime(p1, q1)
+    }
+    return coprime(bigint.add(p0, bigint.mul(k, p1)), bigint.add(q0, bigint.mul(k, q1)))
+}
+
+/// `float(a)`: correctly rounded, as Python's int division rounds.
+pub fn to_float(a: Fraction) -> f64 ! FractionError {
+    if is_zero(a.num) {
+        return 0.0
+    }
+    let n = babs(a.num)
+    let d = a.den
+    let e = bigint.bit_length(n) - bigint.bit_length(d)
+    // floor(log2(n / d)) is e or e - 1.
+    let ge = if e >= 0 { bigint.compare(n, bigint.mul(d, bigint.pow(big(2), e))) >= 0 } else {
+        bigint.compare(bigint.mul(n, bigint.pow(big(2), 0 - e)), d) >= 0
+    }
+    let l = if ge { e } else { e - 1 }
+    let k = if l - 52 > 0 - 1074 { l - 52 } else { 0 - 1074 }
+    // m = round(n / (d * 2^k)), ties to even.
+    let (num, den) = if k >= 0 { (n, bigint.mul(d, bigint.pow(big(2), k))) } else { (bigint.mul(n, bigint.pow(big(2), 0 - k)), d) }
+    let (q, r) = fdivmod(num, den)
+    let c = bigint.compare(bigint.add(r, r), den)
+    var m = bigint.to_i64(q) ?? 0
+    if c > 0 or (c == 0 and m % 2 == 1) {
+        m = m + 1
+    }
+    // m * 2^k is a double unless it reaches 2^1024.
+    var bits = 0
+    while m.shr(bits) > 0 {
+        bits = bits + 1
+    }
+    if bits + k > 1024 {
+        fail(FrOverflow("integer division result too large for a float"))
+    }
+    var v = m.as_f64()
+    if k >= 0 {
+        for _j in 0..k {
+            v = v * 2.0
+        }
+    } else {
+        for _j in 0..(0 - k) {
+            v = v * 0.5
+        }
+    }
+    return if bigint.sign(a.num) < 0 { v * -1.0 } else { v }
+}
+
+// ---- text
+
+pub fn to_str(a: Fraction) -> str {
+    if bigint.compare(a.den, big(1)) == 0 {
+        return bigint.to_str(a.num)
+    }
+    return bigint.to_str(a.num) + "/" + bigint.to_str(a.den)
+}
+
+pub fn repr(a: Fraction) -> str {
+    return "Fraction(" + bigint.to_str(a.num) + ", " + bigint.to_str(a.den) + ")"
+}
+
+fn hexn(n: i64, width: i64) -> str {
+    let digits = "0123456789abcdef"
+    var out = ""
+    for k in 0..width {
+        out = out + digits.substr(n.shr(4 * (width - 1 - k)).bit_and(15), 1)
+    }
+    return out
+}
+
+fn printable(c: i64) -> bool {
+    return pycharclass.is_printable(c)
+}
+
+/// `repr(text)`.
+fn py_repr(cs: [i64]) -> str {
+    let quote = if cs.contains(39) and not cs.contains(34) { 34 } else { 39 }
+    var out = quote.to_char()
+    for c in cs {
+        out = out + if c == quote or c == 92 { "\\" + c.to_char() } else if c == 9 { "\\t" } else if c == 10 { "\\n" } else if c == 13 { "\\r" } else if printable(c) {
+            c.to_char()
+        } else if c < 256 { "\\x" + hexn(c, 2) } else if c < 65536 { "\\u" + hexn(c, 4) } else { "\\U" + hexn(c, 8) }
+    }
+    return out + quote.to_char()
+}
+
+// ---- format
+
+/// A parsed format specification; -1 or 0 where a part is absent.
+type FmtSpec = { fill: i64, align: i64, sign: i64, z: bool, alt: bool, zeropad: bool, width: i64, sep: i64, precision: i64, kind: i64 }
+
+fn is_ascii_digit(c: i64) -> bool {
+    return c >= 48 and c <= 57
+}
+
+fn is_align(c: i64) -> bool {
+    return c == 60 or c == 62 or c == 61 or c == 94
+}
+
+fn at(cs: [i64], i: i64) -> i64 {
+    return if i >= 0 and i < cs.len() { cs[i] } else { 0 - 1 }
+}
+
+/// `0|[1-9][0-9]*` at `i`: the number and where it ends, or (-1, i).
+fn number_at(cs: [i64], i: i64) -> (i64, i64) {
+    if at(cs, i) == 48 {
+        return (0, i + 1)
+    }
+    if at(cs, i) >= 49 and at(cs, i) <= 57 {
+        var j = i
+        var v = 0
+        while is_ascii_digit(at(cs, j)) {
+            v = v * 10 + cs[j] - 48
+            j = j + 1
+        }
+        return (v, j)
+    }
+    return (0 - 1, i)
+}
+
+/// The rest of a specification after the fill and alignment; `float`
+/// asks for the float form (`z`, zero padding, precision, a type).
+fn parse_rest(cs: [i64], i0: i64, fill: i64, align: i64, float: bool) -> Option[FmtSpec] {
+    var i = i0
+    var sign = 0
+    if at(cs, i) == 45 or at(cs, i) == 43 or at(cs, i) == 32 {
+        sign = cs[i]
+        i = i + 1
+    }
+    var z = false
+    if float and at(cs, i) == 122 {
+        z = true
+        i = i + 1
+    }
+    var alt = false
+    if at(cs, i) == 35 {
+        alt = true
+        i = i + 1
+    }
+    var zeropad = false
+    if float and at(cs, i) == 48 and is_ascii_digit(at(cs, i + 1)) {
+        zeropad = true
+        i = i + 1
+    }
+    let (width, after_width) = number_at(cs, i)
+    i = after_width
+    var sep = 0
+    if at(cs, i) == 44 or at(cs, i) == 95 {
+        sep = cs[i]
+        i = i + 1
+    }
+    var precision = 0 - 1
+    var kind = 0
+    if float {
+        if at(cs, i) == 46 {
+            let (p, after) = number_at(cs, i + 1)
+            if p < 0 {
+                return None
+            }
+            precision = p
+            i = after
+        }
+        if not "eEfFgG%".codes().contains(at(cs, i)) {
+            return None
+        }
+        kind = cs[i]
+        i = i + 1
+    }
+    if i != cs.len() {
+        return None
+    }
+    return Some(FmtSpec{ fill: fill, align: align, sign: sign, z: z, alt: alt, zeropad: zeropad, width: width, sep: sep, precision: precision,
+        kind: kind })
+}
+
+/// The spec as the regex matches it: a fill and alignment, an alignment
+/// alone, or neither, whichever lets the rest match.
+fn parse_spec(cs: [i64], float: bool) -> Option[FmtSpec] {
+    if cs.len() >= 2 and is_align(cs[1]) {
+        match parse_rest(cs, 2, cs[0], cs[1], float) {
+            Some(s) -> return Some(s)
+            None -> {}
+        }
+    }
+    if cs.len() >= 1 and is_align(cs[0]) {
+        match parse_rest(cs, 1, 0 - 1, cs[0], float) {
+            Some(s) -> return Some(s)
+            None -> {}
+        }
+    }
+    return parse_rest(cs, 0, 0 - 1, 0 - 1, float)
+}
+
+fn group(digits: str, sep: i64) -> str {
+    if sep == 0 {
+        return digits
+    }
+    let cs = digits.codes()
+    let first = 1 + (cs.len() - 1) % 3
+    var out = cs.slice(0, first).map(|c| c.to_char()).join("")
+    var pos = first
+    while pos < cs.len() {
+        out = out + sep.to_char() + cs.slice(pos, pos + 3).map(|c| c.to_char()).join("")
+        pos = pos + 3
+    }
+    return out
+}
+
+fn padded(spec: FmtSpec, sign: str, body: str) -> str {
+    let fill = if spec.fill >= 0 { spec.fill.to_char() } else { " " }
+    let align = if spec.align >= 0 { spec.align } else { 62 }
+    let n = spec.width - sign.codes().len() - body.codes().len()
+    let padding = if n > 0 { fill.repeat(n) } else { "" }
+    if align == 62 {
+        return padding + sign + body
+    }
+    if align == 60 {
+        return sign + body + padding
+    }
+    if align == 94 {
+        let half = padding.codes().len() / 2
+        let pc = padding.codes()
+        return pc.slice(0, half).map(|c| c.to_char()).join("") + sign + body + pc.slice(half, pc.len()).map(|c| c.to_char()).join("")
+    }
+    return sign + padding + body
+}
+
+fn pos_sign(spec: FmtSpec) -> str {
+    return if spec.sign == 0 or spec.sign == 45 { "" } else { spec.sign.to_char() }
+}
+
+fn format_general(a: Fraction, spec: FmtSpec) -> str {
+    let n = bigint.to_str(babs(a.num))
+    let body = if bigint.compare(a.den, big(1)) > 0 or spec.alt { group(n, spec.sep) + "/" + group(bigint.to_str(a.den), spec.sep) } else {
+        group(n, spec.sep)
+    }
+    let sign = if bigint.sign(a.num) < 0 { "-" } else { pos_sign(spec) }
+    return padded(spec, sign, body)
+}
+
+/// _round_to_exponent: the sign and the magnitude of n/d rounded to a
+/// multiple of 10^exponent, ties to even.
+fn round_to_exponent(n0: BigInt, d0: BigInt, exponent: i64, no_neg_zero: bool) -> (bool, BigInt) {
+    var n = n0
+    var d = d0
+    if exponent >= 0 {
+        d = bigint.mul(d, pow10(exponent))
+    } else {
+        n = bigint.mul(n, pow10(0 - exponent))
+    }
+    let (q0, r) = fdivmod(bigint.add(n, fdiv(d, big(2))), d)
+    var q = q0
+    let (_dq, dr) = fdivmod(d, big(2))
+    if is_zero(r) and is_zero(dr) {
+        let (_qq, qr) = fdivmod(q, big(2))
+        q = bigint.sub(q, qr)
+    }
+    let negative = if no_neg_zero { bigint.sign(q) < 0 } else { bigint.sign(n) < 0 }
+    return (negative, babs(q))
+}
+
+/// _round_to_figures.
+fn round_to_figures(n: BigInt, d: BigInt, figures: i64) -> (bool, BigInt, i64) {
+    if is_zero(n) {
+        return (false, zero(), 1 - figures)
+    }
+    let sn = bigint.to_str(babs(n))
+    let sd = bigint.to_str(d)
+    // `str_d <= str_n` compares the strings, as Python does.
+    let m = sn.len() - sd.len() + if sd <= sn { 1 } else { 0 }
+    var exponent = m - figures
+    let (negative, sig0) = round_to_exponent(n, d, exponent, false)
+    var sig = sig0
+    if bigint.to_str(sig).len() == figures + 1 {
+        sig = fdiv(sig, big(10))
+        exponent = exponent + 1
+    }
+    return (negative, sig, exponent)
+}
+
+fn zfill(s: str, width: i64) -> str {
+    let n = s.len()
+    return if n >= width { s } else { "0".repeat(width - n) + s }
+}
+
+fn floor_div(a: i64, b: i64) -> i64 {
+    let q = a / b
+    return if a % b != 0 and ((a < 0) != (b < 0)) { q - 1 } else { q }
+}
+
+fn format_float(a: Fraction, spec: FmtSpec) -> str {
+    let kind = spec.kind.to_char()
+    let precision = if spec.precision >= 0 { spec.precision } else { 6 }
+    let trim_zeros = (kind == "g" or kind == "G") and not spec.alt
+    let indicator = if kind == "E" or kind == "F" or kind == "G" { "E" } else { "e" }
+    var negative = false
+    var sig = zero()
+    var exponent = 0
+    var scientific = false
+    var point = 0
+    if kind == "f" or kind == "F" or kind == "%" {
+        exponent = 0 - precision - if kind == "%" { 2 } else { 0 }
+        let (ng, s) = round_to_exponent(a.num, a.den, exponent, spec.z)
+        negative = ng
+        sig = s
+        point = precision
+    } else {
+        let figures = if kind == "g" or kind == "G" { if precision > 1 { precision } else { 1 } } else { precision + 1 }
+        let (ng, s, e) = round_to_figures(a.num, a.den, figures)
+        negative = ng
+        sig = s
+        exponent = e
+        scientific = kind == "e" or kind == "E" or exponent > 0 or exponent + figures <= 0 - 4
+        point = if scientific { figures - 1 } else { 0 - exponent }
+    }
+    let shown = exponent + point
+    let suffix = if kind == "%" { "%" } else if scientific {
+        indicator + (if shown < 0 { "-" } else { "+" }) + zfill((if shown < 0 { 0 - shown } else { shown }).to_str(), 2)
+    } else { "" }
+    let digits = zfill(bigint.to_str(sig), point + 1)
+    let sign = if negative { "-" } else { pos_sign(spec) }
+    var leading = digits.substr(0, digits.len() - point)
+    var frac = digits.substr(digits.len() - point, point)
+    if trim_zeros {
+        var k = frac.len()
+        while k > 0 and frac.substr(k - 1, 1) == "0" {
+            k = k - 1
+        }
+        frac = frac.substr(0, k)
+    }
+    let separator = if not spec.alt and frac.len() == 0 { "" } else { "." }
+    let trailing = separator + frac + suffix
+    if spec.zeropad {
+        let min_leading = spec.width - sign.codes().len() - trailing.codes().len()
+        leading = zfill(leading, if spec.sep != 0 { floor_div(3 * min_leading, 4) + 1 } else { min_leading })
+    }
+    return padded(spec, sign, group(leading, spec.sep) + trailing)
+}
+
+/// `format(a, spec)`.
+pub fn format(a: Fraction, spec_text: str) -> str ! FractionError {
+    let cs = spec_text.codes()
+    match parse_spec(cs, false) {
+        Some(s) -> return format_general(a, s)
+        None -> {}
+    }
+    match parse_spec(cs, true) {
+        Some(s) -> if s.align < 0 or not s.zeropad {
+            return format_float(a, s)
+        }
+        None -> {}
+    }
+    fail(FrValueError("Invalid format specifier " + py_repr(cs) + " for object of type 'Fraction'"))
+}

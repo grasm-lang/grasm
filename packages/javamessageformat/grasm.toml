@@ -1,0 +1,8 @@
+[package]
+name = "javamessageformat"
+version = "1.0.0"
+capabilities = []
+
+[dependencies.javadecimalformat]
+path = "../javadecimalformat"
+version = "^1.0.0"

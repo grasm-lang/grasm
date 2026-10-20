@@ -1,7 +1,7 @@
 {
   "agreeing": 44,
-  "corpus": 605,
-  "cross": 605,
+  "corpus": 620,
+  "cross": 620,
   "depth_cap": 31093,
   "laws": 208,
   "taken": {
@@ -13,6 +13,6 @@
     "wasm_ok": "2026-10-20",
     "wasm_skip": "2026-10-20"
   },
-  "wasm_ok": 486,
-  "wasm_skip": 122
+  "wasm_ok": 492,
+  "wasm_skip": 131
 }

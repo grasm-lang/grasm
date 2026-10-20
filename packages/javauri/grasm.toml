@@ -1,0 +1,8 @@
+[package]
+name = "javauri"
+version = "1.0.0"
+capabilities = []
+
+[dependencies.unicodenorm]
+path = "../unicodenorm"
+version = "^1.0.0"

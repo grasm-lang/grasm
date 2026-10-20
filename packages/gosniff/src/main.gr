@@ -1,0 +1,188 @@
+// Go's `http.DetectContentType`, as Go 1.25 sniffs: the media type a Go
+// server sends for content nobody labelled.
+//
+// `packages/magicbytes` identifies files thoroughly. This is the one
+// answer a Go web server gives -- `http.ServeContent`, `http.FileServer`
+// for an unknown extension, every handler that calls `DetectContentType`
+// -- and a proxy, cache or test that must predict the `Content-Type` a Go
+// service will send needs that answer, with its limits:
+//
+//   - Only the first 512 bytes count, and they are tried against a fixed
+//     list in order: HTML tags (case-insensitive, after leading
+//     whitespace, and only when followed by a space or `>`), `<?xml`,
+//     PDF, PostScript, byte-order marks, images, audio, video, fonts,
+//     archives and WebAssembly.
+//   - An MP4 is an `ftyp` box whose declared size fits the data, is a
+//     multiple of 4, and lists `mp4` among its brands.
+//   - Anything without a control character other than tab, newline,
+//     form feed, carriage return and escape is `text/plain; charset=utf-8`;
+//     everything else is `application/octet-stream`.
+
+fn ws(b: i64) -> bool {
+    return b == 9 or b == 10 or b == 12 or b == 13 or b == 32
+}
+
+fn html_sig(data: [i64], first: i64, sig: str) -> bool {
+    let d = data.slice(first, data.len())
+    let h = sig.to_bytes().to_list()
+    if d.len() < h.len() + 1 {
+        return false
+    }
+    for i in 0..h.len() {
+        let db = if h[i] >= 65 and h[i] <= 90 { d[i].bit_and(223) } else { d[i] }
+        if db != h[i] {
+            return false
+        }
+    }
+    return d[h.len()] == 32 or d[h.len()] == 62
+}
+
+fn masked(data: [i64], mask: [i64], pat: [i64]) -> bool {
+    if data.len() < pat.len() {
+        return false
+    }
+    for i in 0..pat.len() {
+        if data[i].bit_and(mask[i]) != pat[i] {
+            return false
+        }
+    }
+    return true
+}
+
+fn exact(data: [i64], sig: [i64]) -> bool {
+    return data.len() >= sig.len() and data.slice(0, sig.len()) == sig
+}
+
+fn mp4(data: [i64]) -> bool {
+    if data.len() < 12 {
+        return false
+    }
+    let size = data[0].shl(24) + data[1].shl(16) + data[2].shl(8) + data[3]
+    if data.len() < size or size % 4 != 0 {
+        return false
+    }
+    if data.slice(4, 8) != [102, 116, 121, 112] {
+        return false
+    }
+    var st = 8
+    while st < size {
+        if st != 12 and data.slice(st, st + 3) == [109, 112, 52] {
+            return true
+        }
+        st = st + 4
+    }
+    return false
+}
+
+fn text_like(data: [i64]) -> bool {
+    for b in data {
+        if b <= 8 or b == 11 or (b >= 14 and b <= 26) or (b >= 28 and b <= 31) {
+            return false
+        }
+    }
+    return true
+}
+
+fn b(s: str) -> [i64] {
+    return s.to_bytes().to_list()
+}
+
+/// The exact signatures after the masked byte-order marks, in Go's order.
+fn exact_table() -> ([[i64]], [str]) {
+    let sigs = [[0, 0, 1, 0], [0, 0, 2, 0], b("BM"), b("GIF87a"), b("GIF89a")]
+    let cts = ["image/x-icon", "image/x-icon", "image/bmp", "image/gif", "image/gif"]
+    return (sigs, cts)
+}
+
+/// `http.DetectContentType(data)`.
+pub fn detect(input: bytes) -> str {
+    var data = input.to_list()
+    if data.len() > 512 {
+        data = data.slice(0, 512)
+    }
+    var first = 0
+    while first < data.len() and ws(data[first]) {
+        first = first + 1
+    }
+    let tags = ["<!DOCTYPE HTML", "<HTML", "<HEAD", "<SCRIPT", "<IFRAME", "<H1", "<DIV", "<FONT", "<TABLE", "<A", "<STYLE", "<TITLE", "<B", "<BODY", "<BR",
+        "<P", "<!--"]
+    for t in tags {
+        if html_sig(data, first, t) {
+            return "text/html; charset=utf-8"
+        }
+    }
+    if masked(data.slice(first, data.len()), [255, 255, 255, 255, 255], b("<?xml")) {
+        return "text/xml; charset=utf-8"
+    }
+    if exact(data, b("%PDF-")) {
+        return "application/pdf"
+    }
+    if exact(data, b("%!PS-Adobe-")) {
+        return "application/postscript"
+    }
+    if masked(data, [255, 255, 0, 0], [254, 255, 0, 0]) {
+        return "text/plain; charset=utf-16be"
+    }
+    if masked(data, [255, 255, 0, 0], [255, 254, 0, 0]) {
+        return "text/plain; charset=utf-16le"
+    }
+    if masked(data, [255, 255, 255, 0], [239, 187, 191, 0]) {
+        return "text/plain; charset=utf-8"
+    }
+    let (sigs, cts) = exact_table()
+    for k in 0..sigs.len() {
+        if exact(data, sigs[k]) {
+            return cts[k]
+        }
+    }
+    let riff = [255, 255, 255, 255, 0, 0, 0, 0, 255, 255, 255, 255]
+    if masked(data, riff + [255, 255], b("RIFF") + [0, 0, 0, 0] + b("WEBPVP")) {
+        return "image/webp"
+    }
+    if exact(data, [137, 80, 78, 71, 13, 10, 26, 10]) {
+        return "image/png"
+    }
+    if exact(data, [255, 216, 255]) {
+        return "image/jpeg"
+    }
+    if masked(data, riff, b("FORM") + [0, 0, 0, 0] + b("AIFF")) {
+        return "audio/aiff"
+    }
+    if exact(data, b("ID3")) {
+        return "audio/mpeg"
+    }
+    if exact(data, b("OggS") + [0]) {
+        return "application/ogg"
+    }
+    if exact(data, b("MThd") + [0, 0, 0, 6]) {
+        return "audio/midi"
+    }
+    if masked(data, riff, b("RIFF") + [0, 0, 0, 0] + b("AVI ")) {
+        return "video/avi"
+    }
+    if masked(data, riff, b("RIFF") + [0, 0, 0, 0] + b("WAVE")) {
+        return "audio/wave"
+    }
+    if mp4(data) {
+        return "video/mp4"
+    }
+    if exact(data, [26, 69, 223, 163]) {
+        return "video/webm"
+    }
+    if data.len() >= 36 and data[34] == 76 and data[35] == 80 {
+        return "application/vnd.ms-fontobject"
+    }
+    let tail = [[0, 1, 0, 0], b("OTTO"), b("ttcf"), b("wOFF"), b("wOF2"), [31, 139, 8], b("PK") + [3, 4], b("Rar!") + [26, 7, 0], b("Rar!") + [26, 7, 1, 0],
+        [0, 97, 115, 109]]
+    let tail_ct = ["font/ttf", "font/otf", "font/collection", "font/woff", "font/woff2", "application/x-gzip", "application/zip",
+        "application/x-rar-compressed", "application/x-rar-compressed", "application/wasm"]
+    for k in 0..tail.len() {
+        if exact(data, tail[k]) {
+            return tail_ct[k]
+        }
+    }
+    if text_like(data.slice(first, data.len())) {
+        return "text/plain; charset=utf-8"
+    }
+    return "application/octet-stream"
+}

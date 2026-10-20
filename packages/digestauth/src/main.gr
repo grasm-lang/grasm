@@ -1,0 +1,274 @@
+// HTTP Digest authentication, the client side (RFC 7616): read a server's
+// `WWW-Authenticate: Digest` challenge and write the `Authorization` header
+// that answers it.
+//
+// Held to curl 8.7.1, header for header, including how it reads a
+// challenge loosely:
+//
+//   - Names are compared without case; a value is quoted (backslash escapes
+//     its next character) or runs to the next comma -- trailing spaces
+//     included, so `algorithm=SHA-256 ,` names no algorithm curl knows and
+//     it does not answer at all.
+//   - An unterminated quote at the end of the header is accepted. A name
+//     longer than 255 characters or a value longer than 1023 is cut there.
+//   - From `qop` it takes `auth` if offered, else `auth-int`, else neither;
+//     a token keeps its trailing spaces, so `" auth "` is neither.
+//   - MD5, SHA-256 and SHA-512-256, each optionally `-sess`; anything else,
+//     a challenge without a nonce, and a `-sess` algorithm without a qop are
+//     refused. `userhash=true` sends H(user:realm) as the username.
+//   - `auth-int` hashes an empty body, as curl does for every request.
+//   - The algorithm is echoed as the server spelled it.
+import md5
+import crypto_hash
+import sha512
+
+type DigestAlgo =
+    | DaMd5
+    | DaSha256
+    | DaSha512_256
+
+type DigestChallenge = {
+    realm: Option[str],
+    nonce: str,
+    opaque: Option[str],
+    qop: Option[str],
+    algorithm: Option[str],
+    algo: DigestAlgo,
+    session: bool,
+    userhash: bool,
+    stale: bool,
+}
+
+fn blank(c: i64) -> bool {
+    return c == 32 or c == 9
+}
+
+fn lower(s: str) -> str {
+    return s.to_lower()
+}
+
+/// One `name=value` pair at `at`: the name, the value, and where parsing
+/// continues. `None` where curl's `Curl_auth_digest_get_pair` gives up.
+fn get_pair(cs: [i64], at: i64) -> Option[(str, str, i64)] {
+    var i = at
+    var name: [i64] = []
+    var room = 255
+    while i < cs.len() and cs[i] != 61 and room > 0 {
+        name.push(cs[i])
+        i = i + 1
+        room = room - 1
+    }
+    if i >= cs.len() or cs[i] != 61 {
+        return None
+    }
+    i = i + 1
+    var quoted = false
+    if i < cs.len() and cs[i] == 34 {
+        quoted = true
+        i = i + 1
+    }
+    var value: [i64] = []
+    var left = 1023
+    var escape = false
+    while i < cs.len() and left > 0 {
+        let c = cs[i]
+        left = left - 1
+        if not escape {
+            if c == 92 and quoted {
+                escape = true
+                i = i + 1
+                continue
+            }
+            if c == 44 and not quoted {
+                i = i + 1
+                break
+            }
+            if c == 13 or c == 10 {
+                if quoted {
+                    return None
+                }
+                i = i + 1
+                break
+            }
+            if c == 34 {
+                if quoted {
+                    i = i + 1
+                    break
+                }
+                return None
+            }
+        }
+        escape = false
+        value.push(c)
+        i = i + 1
+    }
+    if escape {
+        return None
+    }
+    return Some((text_of(name), text_of(value), i))
+}
+
+fn text_of(cs: [i64]) -> str {
+    var out = ""
+    for c in cs {
+        out = out + c.to_char()
+    }
+    return out
+}
+
+/// A `WWW-Authenticate` value, `Digest ...`; `None` where curl would not
+/// answer it.
+pub fn parse_challenge(header: str) -> Option[DigestChallenge] {
+    let cs = header.codes()
+    if cs.len() < 7 or lower(header.substr(0, 6)) != "digest" or not blank(cs[6]) {
+        return None
+    }
+    var i = 6
+    var realm: Option[str] = None
+    var nonce: Option[str] = None
+    var opaque: Option[str] = None
+    var qop: Option[str] = None
+    var algorithm: Option[str] = None
+    var algo = DaMd5
+    var session = false
+    var userhash = false
+    var stale = false
+    while true {
+        while i < cs.len() and blank(cs[i]) {
+            i = i + 1
+        }
+        let (name, value, next) = match get_pair(cs, i) {
+            Some(p) -> p
+            None -> break
+        }
+        i = next
+        let key = lower(name)
+        if key == "nonce" {
+            nonce = Some(value)
+        } else if key == "stale" {
+            if lower(value) == "true" {
+                stale = true
+            }
+        } else if key == "realm" {
+            realm = Some(value)
+        } else if key == "opaque" {
+            opaque = Some(value)
+        } else if key == "qop" {
+            var auth = false
+            var auth_int = false
+            for raw in value.split(",") {
+                var t = raw
+                while t.len() > 0 and (t.starts_with(" ") or t.starts_with("\t")) {
+                    t = t.substr(1, t.len() - 1)
+                }
+                if lower(t) == "auth" {
+                    auth = true
+                } else if lower(t) == "auth-int" {
+                    auth_int = true
+                }
+            }
+            if auth {
+                qop = Some("auth")
+            } else if auth_int {
+                qop = Some("auth-int")
+            }
+        } else if key == "algorithm" {
+            algorithm = Some(value)
+            let a = lower(value)
+            if a == "md5" or a == "md5-sess" {
+                algo = DaMd5
+            } else if a == "sha-256" or a == "sha-256-sess" {
+                algo = DaSha256
+            } else if a == "sha-512-256" or a == "sha-512-256-sess" {
+                algo = DaSha512_256
+            } else {
+                return None
+            }
+            session = a.ends_with("-sess")
+        } else if key == "userhash" {
+            if lower(value) == "true" {
+                userhash = true
+            }
+        }
+        while i < cs.len() and blank(cs[i]) {
+            i = i + 1
+        }
+        if i < cs.len() and cs[i] == 44 {
+            i = i + 1
+        }
+    }
+    let n = match nonce {
+        Some(x) -> x
+        None -> return None
+    }
+    if qop.is_none() and session {
+        return None
+    }
+    return Some(DigestChallenge{ realm: realm, nonce: n, opaque: opaque, qop: qop, algorithm: algorithm, algo: algo, session: session, userhash: userhash,
+        stale: stale })
+}
+
+fn hex(b: bytes) -> str {
+    let d = "0123456789abcdef"
+    var out = ""
+    for x in b.to_list() {
+        out = out + d.substr(x.ushr(4), 1) + d.substr(x.bit_and(15), 1)
+    }
+    return out
+}
+
+/// The challenge's hash of some text, as lower-case hex.
+pub fn h(ch: DigestChallenge, s: str) -> str {
+    let data = s.to_bytes()
+    return hex(match ch.algo {
+        DaMd5 -> md5.hash(data)
+        DaSha256 -> crypto_hash.sha256_of(data)
+        DaSha512_256 -> sha512.sha512_256(data)
+    })
+}
+
+/// Backslash before `"` and `\`, for a quoted header value.
+fn quoted(s: str) -> str {
+    return s.replace("\\", "\\\\").replace("\"", "\\\"")
+}
+
+fn hex8(n: i64) -> str {
+    return n.to_base(16).pad_start(8, "0")
+}
+
+/// The `Authorization` value answering `ch` for one request, with the
+/// client nonce and nonce count given (curl makes its cnonce at random).
+pub fn authorization(ch: DigestChallenge, user: str, password: str, method: str, uri: str, cnonce: str, nc: i64) -> str {
+    let realm = ch.realm ?? ""
+    var ha1 = h(ch, user + ":" + realm + ":" + password)
+    if ch.session {
+        ha1 = h(ch, ha1 + ":" + ch.nonce + ":" + cnonce)
+    }
+    var a2 = method + ":" + uri
+    if ch.qop == Some("auth-int") {
+        a2 = a2 + ":" + h(ch, "")
+    }
+    let ha2 = h(ch, a2)
+    let response = match ch.qop {
+        Some(q) -> h(ch, ha1 + ":" + ch.nonce + ":" + hex8(nc) + ":" + cnonce + ":" + q + ":" + ha2)
+        None -> h(ch, ha1 + ":" + ch.nonce + ":" + ha2)
+    }
+    let name = if ch.userhash { h(ch, user + ":" + realm) } else { user }
+    var out = "Digest username=\"" + quoted(name) + "\", realm=\"" + quoted(realm) + "\", nonce=\"" + quoted(ch.nonce) + "\", uri=\"" + uri + "\", "
+    out = out + match ch.qop {
+        Some(q) -> "cnonce=\"" + cnonce + "\", nc=" + hex8(nc) + ", qop=" + q + ", response=\"" + response + "\""
+        None -> "response=\"" + response + "\""
+    }
+    match ch.opaque {
+        Some(o) -> out = out + ", opaque=\"" + quoted(o) + "\""
+        None -> {}
+    }
+    match ch.algorithm {
+        Some(a) -> out = out + ", algorithm=" + a
+        None -> {}
+    }
+    if ch.userhash {
+        out = out + ", userhash=true"
+    }
+    return out
+}

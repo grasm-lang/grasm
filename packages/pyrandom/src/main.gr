@@ -1,0 +1,559 @@
+// Python's `random` module: the same numbers, in the same order, from the
+// same seed, as Python 3.13 gives.
+//
+// Simulations, test fixtures, shuffled datasets and "random" samples
+// written by Python programs are reproducible from their seed only by
+// something that consumes the Mersenne Twister exactly as `random.Random`
+// does. This does: `seed` from an int (all its bits) or from text or bytes
+// (Python's version 2, through SHA-512); `getrandbits` in 32-bit words, low
+// word first; `randrange` and `randint` through `_randbelow`'s rejection
+// loop; `shuffle`, `choice`, `sample` with its two strategies and the
+// table-size rule that picks between them; `choices` with and without
+// weights; and every distribution, `gauss` keeping its second value for
+// the next call.
+//
+// The distributions call `log`, `exp`, `sqrt`, `sin`, `cos`, `acos`,
+// `log2` and `pow` from the platform's maths library, as CPython does, so
+// they agree with the Python on the same machine. `binomialvariate` also
+// needs `lgamma`, which is CPython's own and comes from `packages/pymath`.
+// Errors carry Python's messages.
+
+import mersenne
+import pymath
+import sha512
+
+type PyRandom = { mt: MersenneRng, gauss_next: Option[f64] }
+
+type PyRandomError =
+    | PyValueError(text: str)
+    | PyIndexError(text: str)
+
+fn from_key(key: [i64]) -> PyRandom {
+    return PyRandom{ mt: mersenne.seeded_by_array(key), gauss_next: None }
+}
+
+/// `Random(n)`: every bit of `abs(n)`, in 32-bit words, low first.
+pub fn seeded(n: i64) -> PyRandom {
+    if n == 0 - 9223372036854775807 - 1 {
+        return from_key([0, 2147483648])
+    }
+    return from_key(mersenne.python_key(n))
+}
+
+/// `Random(b)` for bytes: the integer read big-endian from `b` followed by
+/// its SHA-512.
+pub fn seeded_bytes(b: bytes) -> PyRandom {
+    var data = b.to_list() + sha512.sha512(b).to_list()
+    var start = 0
+    while start < data.len() and data[start] == 0 {
+        start = start + 1
+    }
+    data = data.slice(start, data.len())
+    if data.len() == 0 {
+        return from_key([0])
+    }
+    var key: [i64] = []
+    var end = data.len()
+    while end > 0 {
+        let from = 0.max(end - 4)
+        var w = 0
+        for i in from..end {
+            w = w.shl(8).bit_or(data[i])
+        }
+        key.push(w)
+        end = from
+    }
+    return from_key(key)
+}
+
+/// `Random(s)` for text: its UTF-8.
+pub fn seeded_text(s: str) -> PyRandom {
+    return seeded_bytes(s.to_bytes())
+}
+
+/// `random()`: 53 bits from two draws.
+pub fn random(inout r: PyRandom) -> f64 {
+    let a = mersenne.next_u32(r.mt).ushr(5)
+    let b = mersenne.next_u32(r.mt).ushr(6)
+    return (a.as_f64() * 67108864.0 + b.as_f64()) * (1.0 / 9007199254740992.0)
+}
+
+/// `getrandbits(k)` for 0 <= k <= 63.
+pub fn getrandbits(inout r: PyRandom, k: i64) -> i64 {
+    if k <= 0 {
+        return 0
+    }
+    var out = 0
+    var left = k
+    var shift = 0
+    while left > 0 {
+        var w = mersenne.next_u32(r.mt)
+        if left < 32 {
+            w = w.ushr(32 - left)
+        }
+        out = out.bit_or(w.shl(shift))
+        shift = shift + 32
+        left = left - 32
+    }
+    return out
+}
+
+fn bit_length(n: i64) -> i64 {
+    var k = 0
+    var x = n
+    while x > 0 {
+        x = x.ushr(1)
+        k = k + 1
+    }
+    return k
+}
+
+/// `_randbelow(n)` for n > 0: `getrandbits(n.bit_length())` until it is
+/// below n.
+pub fn randbelow(inout r: PyRandom, n: i64) -> i64 {
+    let k = bit_length(n)
+    var v = getrandbits(r, k)
+    while v >= n {
+        v = getrandbits(r, k)
+    }
+    return v
+}
+
+/// `randbytes(n)`: `getrandbits(8n)` written little-endian.
+pub fn randbytes(inout r: PyRandom, n: i64) -> bytes {
+    var out: [i64] = []
+    var left = n * 8
+    while left > 0 {
+        var w = mersenne.next_u32(r.mt)
+        if left < 32 {
+            w = w.ushr(32 - left)
+        }
+        for i in 0..4 {
+            if out.len() < n {
+                out.push(w.ushr(8 * i).bit_and(255))
+            }
+        }
+        left = left - 32
+    }
+    return bytes_of(out)
+}
+
+/// Python's floor division.
+fn floordiv(a: i64, b: i64) -> i64 {
+    let q = a / b
+    return if (a % b != 0) and ((a < 0) != (b < 0)) { q - 1 } else { q }
+}
+
+/// `randrange(start, stop, step)`.
+pub fn randrange(inout r: PyRandom, start: i64, stop: i64, step: i64) -> i64 ! PyRandomError {
+    let width = stop - start
+    if step == 1 {
+        if width > 0 {
+            return start + randbelow(r, width)
+        }
+        fail(PyValueError("empty range in randrange({start}, {stop})"))
+    }
+    let n = if step > 0 { floordiv(width + step - 1, step) } else if step < 0 { floordiv(width + step + 1, step) } else {
+        fail(PyValueError("zero step for randrange()"))
+    }
+    if n <= 0 {
+        fail(PyValueError("empty range in randrange({start}, {stop}, {step})"))
+    }
+    return start + step * randbelow(r, n)
+}
+
+/// `randrange(stop)`.
+pub fn randrange_below(inout r: PyRandom, stop: i64) -> i64 ! PyRandomError {
+    if stop > 0 {
+        return randbelow(r, stop)
+    }
+    fail(PyValueError("empty range for randrange()"))
+}
+
+/// `randint(a, b)`: both ends included.
+pub fn randint(inout r: PyRandom, a: i64, b: i64) -> i64 ! PyRandomError {
+    return try randrange(r, a, b + 1, 1)
+}
+
+/// `choice(seq)`, by index.
+pub fn choice_index(inout r: PyRandom, n: i64) -> i64 ! PyRandomError {
+    if n == 0 {
+        fail(PyIndexError("Cannot choose from an empty sequence"))
+    }
+    return randbelow(r, n)
+}
+
+/// `shuffle(x)`: a shuffled copy.
+pub fn shuffle[T](inout r: PyRandom, xs: [T]) -> [T] {
+    var out = xs
+    var i = out.len() - 1
+    while i >= 1 {
+        let j = randbelow(r, i + 1)
+        let t = out[i]
+        out[i] = out[j]
+        out[j] = t
+        i = i - 1
+    }
+    return out
+}
+
+/// `sample(range(n), k)`: the chosen indexes, by Python's choice of a pool
+/// or a set of the ones already taken.
+pub fn sample_indices(inout r: PyRandom, n: i64, k: i64) -> [i64] ! PyRandomError {
+    if k < 0 or k > n {
+        fail(PyValueError("Sample larger than population or is negative"))
+    }
+    var setsize = 21
+    if k > 5 {
+        setsize = setsize + 4 ^ ((k * 3).as_f64().ln() / 4.0.ln()).ceil().as_i64()
+    }
+    var out: [i64] = []
+    if n <= setsize {
+        var pool: [i64] = []
+        for i in 0..n {
+            pool.push(i)
+        }
+        for i in 0..k {
+            let j = randbelow(r, n - i)
+            out.push(pool[j])
+            pool[j] = pool[n - i - 1]
+        }
+        return out
+    }
+    var taken: Map[i64, bool] = map()
+    for _i in 0..k {
+        var j = randbelow(r, n)
+        while taken.has(j) {
+            j = randbelow(r, n)
+        }
+        taken.set(j, true)
+        out.push(j)
+    }
+    return out
+}
+
+/// `sample(population, k)`.
+pub fn sample[T](inout r: PyRandom, population: [T], k: i64) -> [T] ! PyRandomError {
+    return (try sample_indices(r, population.len(), k)).map(|i| population[i])
+}
+
+/// `choices(range(n), k=k)` with no weights: `floor(random() * n)`.
+pub fn choices_uniform(inout r: PyRandom, n: i64, k: i64) -> [i64] {
+    var out: [i64] = []
+    for _i in 0..k {
+        out.push((random(r) * n.as_f64()).floor().as_i64())
+    }
+    return out
+}
+
+fn bisect_right(xs: [f64], x: f64, hi: i64) -> i64 {
+    var lo = 0
+    var h = hi
+    while lo < h {
+        let mid = (lo + h) / 2
+        if x < xs[mid] {
+            h = mid
+        } else {
+            lo = mid + 1
+        }
+    }
+    return lo
+}
+
+/// `choices(range(n), cum_weights=cw, k=k)`; give `weights` accumulated
+/// with `accumulate` for the `weights=` form.
+pub fn choices_cumulative(inout r: PyRandom, cum_weights: [f64], k: i64) -> [i64] ! PyRandomError {
+    let n = cum_weights.len()
+    if n == 0 {
+        fail(PyIndexError("list index out of range"))
+    }
+    let total = cum_weights[n - 1]
+    if total <= 0.0 {
+        fail(PyValueError("Total of weights must be greater than zero"))
+    }
+    if not total.is_finite() {
+        fail(PyValueError("Total of weights must be finite"))
+    }
+    var out: [i64] = []
+    for _i in 0..k {
+        out.push(bisect_right(cum_weights, random(r) * total, n - 1))
+    }
+    return out
+}
+
+/// `itertools.accumulate` over weights.
+pub fn accumulate(weights: [f64]) -> [f64] {
+    var out: [f64] = []
+    var sum = 0.0
+    for i in 0..weights.len() {
+        sum = if i == 0 { weights[0] } else { sum + weights[i] }
+        out.push(sum)
+    }
+    return out
+}
+
+// ---- distributions
+
+fn two_pi() -> f64 {
+    return 2.0 * 3.141592653589793
+}
+
+fn log4() -> f64 {
+    return 4.0.ln()
+}
+
+fn nv_magic() -> f64 {
+    return 4.0 * (0.0 - 0.5).exp() / 2.0.sqrt()
+}
+
+fn sg_magic() -> f64 {
+    return 1.0 + 4.5.ln()
+}
+
+/// Python's float `%`: the result takes the divisor's sign.
+fn py_mod(a: f64, b: f64) -> f64 {
+    var m = a % b
+    if m != 0.0 {
+        if (b < 0.0) != (m < 0.0) {
+            m = m + b
+        }
+        return m
+    }
+    return if b < 0.0 { -0.0 } else { 0.0 }
+}
+
+pub fn uniform(inout r: PyRandom, a: f64, b: f64) -> f64 {
+    return a + (b - a) * random(r)
+}
+
+/// `triangular(low, high, mode)`; `mode` None is the midpoint.
+pub fn triangular(inout r: PyRandom, low0: f64, high0: f64, mode: Option[f64]) -> f64 {
+    var u = random(r)
+    var low = low0
+    var high = high0
+    var c = 0.5
+    match mode {
+        Some(m) -> {
+            if high - low == 0.0 {
+                return low
+            }
+            c = (m - low) / (high - low)
+        }
+        None -> {}
+    }
+    if u > c {
+        u = 1.0 - u
+        c = 1.0 - c
+        let t = low
+        low = high
+        high = t
+    }
+    return low + (high - low) * (u * c).sqrt()
+}
+
+pub fn normalvariate(inout r: PyRandom, mu: f64, sigma: f64) -> f64 {
+    var z = 0.0
+    while true {
+        let u1 = random(r)
+        let u2 = 1.0 - random(r)
+        z = nv_magic() * (u1 - 0.5) / u2
+        let zz = z * z / 4.0
+        if zz <= 0.0 - u2.ln() {
+            break
+        }
+    }
+    return mu + z * sigma
+}
+
+/// `gauss(mu, sigma)`: two values a time, the second kept for the next call.
+pub fn gauss(inout r: PyRandom, mu: f64, sigma: f64) -> f64 {
+    var z = 0.0
+    match r.gauss_next {
+        Some(g) -> {
+            z = g
+            r.gauss_next = None
+        }
+        None -> {
+            let x2pi = random(r) * two_pi()
+            let g2rad = (-2.0 * (1.0 - random(r)).ln()).sqrt()
+            z = x2pi.cos() * g2rad
+            r.gauss_next = Some(x2pi.sin() * g2rad)
+        }
+    }
+    return mu + z * sigma
+}
+
+pub fn lognormvariate(inout r: PyRandom, mu: f64, sigma: f64) -> f64 {
+    return normalvariate(r, mu, sigma).exp()
+}
+
+pub fn expovariate(inout r: PyRandom, lambd: f64) -> f64 {
+    return 0.0 - (1.0 - random(r)).ln() / lambd
+}
+
+pub fn vonmisesvariate(inout r: PyRandom, mu: f64, kappa: f64) -> f64 {
+    if kappa <= 0.000001 {
+        return two_pi() * random(r)
+    }
+    let s = 0.5 / kappa
+    let rr = s + (1.0 + s * s).sqrt()
+    var z = 0.0
+    while true {
+        let u1 = random(r)
+        z = (3.141592653589793 * u1).cos()
+        let d = z / (rr + z)
+        let u2 = random(r)
+        if u2 < 1.0 - d * d or u2 <= (1.0 - d) * d.exp() {
+            break
+        }
+    }
+    let q = 1.0 / rr
+    let f = (q + z) / (1.0 + q * z)
+    let u3 = random(r)
+    return if u3 > 0.5 { py_mod(mu + f.acos(), two_pi()) } else { py_mod(mu - f.acos(), two_pi()) }
+}
+
+pub fn gammavariate(inout r: PyRandom, alpha: f64, beta: f64) -> f64 ! PyRandomError {
+    if alpha <= 0.0 or beta <= 0.0 {
+        fail(PyValueError("gammavariate: alpha and beta must be > 0.0"))
+    }
+    if alpha > 1.0 {
+        let ainv = (2.0 * alpha - 1.0).sqrt()
+        let bbb = alpha - log4()
+        let ccc = alpha + ainv
+        while true {
+            let u1 = random(r)
+            if not (0.0000001 < u1 and u1 < 0.9999999) {
+                continue
+            }
+            let u2 = 1.0 - random(r)
+            let v = (u1 / (1.0 - u1)).ln() / ainv
+            let x = alpha * v.exp()
+            let z = u1 * u1 * u2
+            let rr = bbb + ccc * v - x
+            if rr + sg_magic() - 4.5 * z >= 0.0 or rr >= z.ln() {
+                return x * beta
+            }
+        }
+    }
+    if alpha == 1.0 {
+        return 0.0 - (1.0 - random(r)).ln() * beta
+    }
+    var x = 0.0
+    while true {
+        let u = random(r)
+        let b = (2.718281828459045 + alpha) / 2.718281828459045
+        let p = b * u
+        x = if p <= 1.0 { p ^ (1.0 / alpha) } else { 0.0 - ((b - p) / alpha).ln() }
+        let u1 = random(r)
+        if p > 1.0 {
+            if u1 <= x ^ (alpha - 1.0) {
+                break
+            }
+        } else if u1 <= (0.0 - x).exp() {
+            break
+        }
+    }
+    return x * beta
+}
+
+pub fn betavariate(inout r: PyRandom, alpha: f64, beta: f64) -> f64 ! PyRandomError {
+    let y = try gammavariate(r, alpha, 1.0)
+    if y != 0.0 {
+        return y / (y + (try gammavariate(r, beta, 1.0)))
+    }
+    return 0.0
+}
+
+pub fn paretovariate(inout r: PyRandom, alpha: f64) -> f64 {
+    let u = 1.0 - random(r)
+    return u ^ (-1.0 / alpha)
+}
+
+pub fn weibullvariate(inout r: PyRandom, alpha: f64, beta: f64) -> f64 {
+    let u = 1.0 - random(r)
+    return alpha * (0.0 - u.ln()) ^ (1.0 / beta)
+}
+
+/// `binomialvariate(n, p)`: Python's BTRS for np >= 10, its geometric walk
+/// below.
+pub fn binomialvariate(inout r: PyRandom, n: i64, p: f64) -> i64 ! PyRandomError {
+    if n < 0 {
+        fail(PyValueError("n must be non-negative"))
+    }
+    if p <= 0.0 or p >= 1.0 {
+        if p == 0.0 {
+            return 0
+        }
+        if p == 1.0 {
+            return n
+        }
+        fail(PyValueError("p must be in the range 0.0 <= p <= 1.0"))
+    }
+    if n == 1 {
+        return if random(r) < p { 1 } else { 0 }
+    }
+    if p > 0.5 {
+        return n - (try binomialvariate(r, n, 1.0 - p))
+    }
+    if n.as_f64() * p < 10.0 {
+        var x = 0
+        var y = 0
+        let c = (1.0 - p).log2()
+        if c == 0.0 {
+            return x
+        }
+        while true {
+            y = y + (random(r).log2() / c).floor().as_i64() + 1
+            if y > n {
+                return x
+            }
+            x = x + 1
+        }
+    }
+    return btrs(r, n, p)
+}
+
+/// `math.lgamma` at a positive integer above 2, where it cannot fail.
+fn lg(x: f64) -> f64 {
+    return pymath.lgamma(x) ?? 0.0
+}
+
+fn btrs(inout r: PyRandom, n: i64, p: f64) -> i64 {
+    let nf = n.as_f64()
+    let spq = (nf * p * (1.0 - p)).sqrt()
+    let b = 1.15 + 2.53 * spq
+    let a = -0.0873 + 0.0248 * b + 0.01 * p
+    let c = nf * p + 0.5
+    let vr = 0.92 - 4.2 / b
+    var setup = false
+    var alpha = 0.0
+    var lpq = 0.0
+    var m = 0
+    var h = 0.0
+    while true {
+        var u = random(r)
+        u = u - 0.5
+        let us = 0.5 - u.abs()
+        let k = ((2.0 * a / us + b) * u + c).floor().as_i64()
+        if k < 0 or k > n {
+            continue
+        }
+        var v = random(r)
+        if us >= 0.07 and v <= vr {
+            return k
+        }
+        if not setup {
+            alpha = (2.83 + 5.1 / b) * spq
+            lpq = (p / (1.0 - p)).ln()
+            m = ((nf + 1.0) * p).floor().as_i64()
+            h = lg((m + 1).as_f64()) + lg((n - m + 1).as_f64())
+            setup = true
+        }
+        v = v * alpha / (a / (us * us) + b)
+        if v.ln() <= h - lg((k + 1).as_f64()) - lg((n - k + 1).as_f64()) + (k - m).as_f64() * lpq {
+            return k
+        }
+    }
+    return 0
+}

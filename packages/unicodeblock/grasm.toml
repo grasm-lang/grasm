@@ -1,0 +1,4 @@
+[package]
+name = "unicodeblock"
+version = "1.0.0"
+capabilities = []

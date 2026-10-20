@@ -1,0 +1,360 @@
+// The harness scripts/b51_diff.sh drives: each argument pair is an
+// operation and a file of cases, one per line; each answer is one line.
+import bigint
+import gostrconv
+import jsjson
+import nodebuffer
+import nodepath
+import pycalendar
+import pycharclass
+import pyfractions
+import pytextwrap
+
+fn unhex_list(h: str) -> [i64] {
+    if h == "-" {
+        return []
+    }
+    var out: [i64] = []
+    let b = h.to_bytes()
+    var i = 0
+    while i + 1 < b.len() {
+        let hi = b.at(i)
+        let lo = b.at(i + 1)
+        out.push((if hi >= 97 { hi - 87 } else { hi - 48 }) * 16 + (if lo >= 97 { lo - 87 } else { lo - 48 }))
+        i = i + 2
+    }
+    return out
+}
+
+fn unhex(h: str) -> str {
+    return bytes_of(unhex_list(h)).to_str()
+}
+
+fn hex_bytes(b: bytes) -> str {
+    let digits = "0123456789abcdef"
+    let h = b.to_list().map(|x| digits.substr(x.ushr(4), 1) + digits.substr(x.bit_and(15), 1)).join("")
+    return if h.len() == 0 { "-" } else { h }
+}
+
+fn hex_text(t: str) -> str {
+    return hex_bytes(t.to_bytes())
+}
+
+fn hex_u64(h: str) -> i64 {
+    var v = 0
+    for c in h.codes() {
+        let d = if c >= 97 { c - 87 } else if c >= 65 { c - 55 } else { c - 48 }
+        v = v.shl(4).bit_or(d)
+    }
+    return v
+}
+
+fn fbits(h: str) -> f64 {
+    return hex_u64(h).from_bits()
+}
+
+fn fhex(x: f64) -> str {
+    return gostrconv.format_uint(x.to_bits(), 16)
+}
+
+fn num(f: [str], k: i64) -> i64 {
+    return f[k].parse_int() ?? 0
+}
+
+fn list(h: str) -> [str] {
+    return if h == "~" { [] } else { h.split(",").map(|x| unhex(x)) }
+}
+
+fn nodepath_line(f: [str]) -> str {
+    let op = f[0]
+    let cwd = unhex(f[1])
+    if op == "no" {
+        return hex_text(nodepath.normalize(unhex(f[2])))
+    }
+    if op == "jo" {
+        return hex_text(nodepath.join(list(f[2])))
+    }
+    if op == "re" {
+        return hex_text(nodepath.resolve(cwd, list(f[2])))
+    }
+    if op == "rl" {
+        return hex_text(nodepath.relative(cwd, unhex(f[2]), unhex(f[3])))
+    }
+    if op == "dn" {
+        return hex_text(nodepath.dirname(unhex(f[2])))
+    }
+    if op == "bn" {
+        return hex_text(nodepath.basename(unhex(f[2]), if f[3] == "~" { None } else { Some(unhex(f[3])) }))
+    }
+    if op == "ex" {
+        return hex_text(nodepath.extname(unhex(f[2])))
+    }
+    if op == "ab" {
+        return if nodepath.is_absolute(unhex(f[2])) { "true" } else { "false" }
+    }
+    if op == "pa" {
+        let p = nodepath.parse(unhex(f[2]))
+        return [p.root, p.dir, p.base, p.ext, p.name].map(|x| hex_text(x)).join(",")
+    }
+    let v = list(f[2])
+    return hex_text(nodepath.format(NodePathParts{ root: v[0], dir: v[1], base: v[2], ext: v[3], name: v[4] }))
+}
+
+fn units_hex(us: [i64]) -> str {
+    return if us.len() == 0 { "-" } else { us.map(|u| gostrconv.format_uint(u, 16)).join(".") }
+}
+
+fn units_of(h: str) -> [i64] {
+    return if h == "-" { [] } else { h.split(".").map(|x| hex_u64(x)) }
+}
+
+fn nodebuffer_line(f: [str]) -> str {
+    if f[0] == "fs" {
+        let us = units_of(f[1])
+        return match nodebuffer.from_string_named(us, f[2]) {
+            Ok(b) -> hex_bytes(b) + " " + nodebuffer.byte_length_named(us, f[2]).to_str()
+            Err(e) -> "E" + hex_text(nodebuffer.error_text(e))
+        }
+    }
+    return match nodebuffer.to_string_named(bytes_of(unhex_list(f[1])), f[2]) {
+        Ok(us) -> units_hex(us)
+        Err(e) -> "E" + hex_text(nodebuffer.error_text(e))
+    }
+}
+
+fn jsjson_line(f: [str]) -> str {
+    return match jsjson.parse(units_of(f[1])) {
+        Ok(v) -> {
+            let space = f[2]
+            let gap = if f[0] == "pa" or space == "~" { [] } else if space.starts_with("n") {
+                jsjson.gap_of_number(space.substr(1, space.len() - 1).parse_float() ?? 0.0)
+            } else { jsjson.gap_of_string(units_of(space.substr(1, space.len() - 1))) }
+            units_hex(jsjson.stringify(v, gap))
+        }
+        Err(e) -> "E" + units_hex(jsjson.error_units(e))
+    }
+}
+
+fn bits(ts: [bool]) -> str {
+    return ts.map(|t| if t { "1" } else { "0" }).join("")
+}
+
+fn char_code(c: i64) -> str {
+    let k = pycharclass.classes(c)
+    return k.category + bits([k.alpha, k.decimal, k.digit, k.numeric, k.space, k.printable, k.upper, k.lower, k.title, k.identifier_start,
+        k.identifier_continue, k.alnum, k.re_word, k.decimal, k.space]) + pycharclass.decimal_value(c).to_str()
+}
+
+fn pycharclass_line(f: [str]) -> str {
+    if f[0] == "rg" {
+        var runs: [str] = []
+        var last = ""
+        for cp in hex_u64(f[1])..hex_u64(f[2]) {
+            let v = char_code(cp)
+            if v != last {
+                runs.push(gostrconv.format_uint(cp, 16) + ":" + v)
+                last = v
+            }
+        }
+        return runs.join(",")
+    }
+    let s = units_of(f[1])
+    return bits([pycharclass.isalpha_codes(s), pycharclass.isalnum_codes(s), pycharclass.isdecimal_codes(s), pycharclass.isdigit_codes(s),
+        pycharclass.isnumeric_codes(s), pycharclass.isspace_codes(s), pycharclass.isprintable_codes(s), pycharclass.isupper_codes(s),
+        pycharclass.islower_codes(s), pycharclass.istitle_codes(s), pycharclass.isidentifier_codes(s), pycharclass.isascii_codes(s)])
+}
+
+fn wrap_options(spec: str) -> WrapOptions {
+    let f = spec.split("/")
+    return WrapOptions{ width: f[0].parse_int() ?? 0, initial_indent: unhex(f[1]), subsequent_indent: unhex(f[2]), expand_tabs: f[3] == "1",
+        tabsize: f[4].parse_int() ?? 0, replace_whitespace: f[5] == "1", fix_sentence_endings: f[6] == "1", break_long_words: f[7] == "1",
+        drop_whitespace: f[8] == "1", break_on_hyphens: f[9] == "1", max_lines: if f[10] == "~" { None } else { f[10].parse_int() }, placeholder: unhex(f[11]) }
+}
+
+fn pytextwrap_line(f: [str]) -> str {
+    let op = f[0]
+    if op == "wr" {
+        return match pytextwrap.wrap(unhex(f[1]), wrap_options(f[2])) {
+            Ok(ls) -> if ls.len() == 0 { "~" } else { ls.map(|l| hex_text(l)).join(",") }
+            Err(e) -> "E" + hex_text(pytextwrap.error_text(e))
+        }
+    }
+    if op == "sh" {
+        return match pytextwrap.shorten(unhex(f[1]), wrap_options(f[2])) {
+            Ok(t) -> hex_text(t)
+            Err(e) -> "E" + hex_text(pytextwrap.error_text(e))
+        }
+    }
+    if op == "de" {
+        return hex_text(pytextwrap.dedent(unhex(f[1])))
+    }
+    return hex_text(pytextwrap.indent(unhex(f[1]), unhex(f[2])))
+}
+
+fn cal_text(r: str ! CalError) -> str {
+    return match r {
+        Ok(t) -> hex_text(t)
+        Err(e) -> "E" + hex_text(pycalendar.error_text(e))
+    }
+}
+
+fn pycalendar_line(f: [str]) -> str {
+    let op = f[0]
+    let a = f.slice(1, f.len()).map(|x| x.parse_int() ?? 0)
+    if op == "fm" {
+        return cal_text(pycalendar.formatmonth(a[0], a[1], a[2], a[3], a[4]))
+    }
+    if op == "fy" {
+        return cal_text(pycalendar.formatyear(a[0], a[1], a[2], a[3], a[4], a[5]))
+    }
+    if op == "hm" {
+        return cal_text(pycalendar.html_formatmonth(a[0], a[1], a[2] == 1, a[3]))
+    }
+    if op == "hy" {
+        return cal_text(pycalendar.html_formatyear(a[0], a[1], a[2]))
+    }
+    if op == "mr" {
+        return match pycalendar.monthrange(a[0], a[1]) {
+            Ok((d, n)) -> d.to_str() + "," + n.to_str()
+            Err(e) -> "E" + hex_text(pycalendar.error_text(e))
+        }
+    }
+    if op == "mc" {
+        return match pycalendar.monthcalendar(a[0], a[1], a[2]) {
+            Ok(ws) -> ws.map(|w| w.map(|d| d.to_str()).join(",")).join("/")
+            Err(e) -> "E" + hex_text(pycalendar.error_text(e))
+        }
+    }
+    if op == "wd" {
+        return match pycalendar.weekday(a[0], a[1], a[2]) {
+            Ok(d) -> d.to_str()
+            Err(e) -> "E" + hex_text(pycalendar.error_text(e))
+        }
+    }
+    if op == "ld" {
+        return pycalendar.leapdays(a[0], a[1]).to_str()
+    }
+    if op == "il" {
+        return if pycalendar.isleap(a[0]) { "True" } else { "False" }
+    }
+    return match pycalendar.timegm(a[0], a[1], a[2], a[3], a[4], a[5]) {
+        Ok(t) -> t.to_str()
+        Err(e) -> "E" + hex_text(pycalendar.error_text(e))
+    }
+}
+
+fn fr_of(t: str) -> Fraction {
+    let p = t.split("/")
+    return pyfractions.from_ints(bigint.parse(p[0]) ?? bigint.zero(), bigint.parse(p[1]) ?? bigint.from_i64(1)) ?? Fraction{ num: bigint.zero(), den: bigint.from_i64(1) }
+}
+
+fn fr_show(f: Fraction) -> str {
+    return bigint.to_str(f.num) + "/" + bigint.to_str(f.den)
+}
+
+fn fr_error(e: FractionError) -> str {
+    let cls = match e {
+        FrValueError(_m) -> "ValueError"
+        FrZeroDivision(_m) -> "ZeroDivisionError"
+        FrOverflow(_m) -> "OverflowError"
+    }
+    return "E" + cls + ":" + hex_text(pyfractions.error_text(e))
+}
+
+fn fr_result(r: Fraction ! FractionError) -> str {
+    return match r {
+        Ok(f) -> fr_show(f)
+        Err(e) -> fr_error(e)
+    }
+}
+
+fn fr_arith(k: str, a: Fraction, bt: str) -> str {
+    if k == "pow" {
+        return fr_result(pyfractions.pow(a, bt.parse_int() ?? 0))
+    }
+    let b = fr_of(bt)
+    if k == "fdiv" {
+        return match pyfractions.floordiv(a, b) {
+            Ok(n) -> bigint.to_str(n)
+            Err(e) -> fr_error(e)
+        }
+    }
+    if k == "div" {
+        return fr_result(pyfractions.div(a, b))
+    }
+    if k == "mod" {
+        return fr_result(pyfractions.modulo(a, b))
+    }
+    return fr_show(if k == "add" { pyfractions.add(a, b) } else if k == "sub" { pyfractions.sub(a, b) } else { pyfractions.mul(a, b) })
+}
+
+fn pyfractions_line(f: [str]) -> str {
+    let op = f[0]
+    if op == "fs" {
+        return fr_result(pyfractions.from_string(unhex(f[1])))
+    }
+    if op == "ff" {
+        return fr_result(pyfractions.from_float(fbits(f[1])))
+    }
+    if op == "ar" {
+        return fr_arith(f[1], fr_of(f[2]), f[3])
+    }
+    if op == "ld" {
+        return fr_result(pyfractions.limit_denominator(fr_of(f[1]), bigint.parse(f[2]) ?? bigint.zero()))
+    }
+    if op == "rd" {
+        let a = fr_of(f[1])
+        return if f[2] == "~" { bigint.to_str(pyfractions.round(a)) } else { fr_show(pyfractions.round_to(a, f[2].parse_int() ?? 0)) }
+    }
+    if op == "fl" {
+        let a = fr_of(f[1])
+        return match pyfractions.to_float(a) {
+            Ok(x) -> fhex(x) + " " + bigint.to_str(pyfractions.floor(a)) + " " + bigint.to_str(pyfractions.ceil(a)) + " " + bigint.to_str(pyfractions.trunc(a))
+            Err(e) -> fr_error(e)
+        }
+    }
+    if op == "fm" {
+        return match pyfractions.format(fr_of(f[1]), unhex(f[2])) {
+            Ok(t) -> hex_text(t)
+            Err(e) -> fr_error(e)
+        }
+    }
+    let a = fr_of(f[1])
+    return hex_text(pyfractions.to_str(a)) + " " + hex_text(pyfractions.repr(a))
+}
+
+fn main() / {io} {
+    let argv = args()
+    var i = 0
+    while i + 1 < argv.len() {
+        let op = argv[i]
+        let text = match read_bytes(argv[i + 1]) {
+            Ok(d) -> d.to_str()
+            Err(_e) -> ""
+        }
+        for l in text.split("\n").filter(|l| l.len() > 0) {
+            if op == "pyfractions" {
+                print(pyfractions_line(l.split(" ")))
+            }
+            if op == "pycalendar" {
+                print(pycalendar_line(l.split(" ")))
+            }
+            if op == "pytextwrap" {
+                print(pytextwrap_line(l.split(" ")))
+            }
+            if op == "pycharclass" {
+                print(pycharclass_line(l.split(" ")))
+            }
+            if op == "jsjson" {
+                print(jsjson_line(l.split(" ")))
+            }
+            if op == "nodebuffer" {
+                print(nodebuffer_line(l.split(" ")))
+            }
+            if op == "nodepath" {
+                print(nodepath_line(l.split(" ")))
+            }
+        }
+        i = i + 2
+    }
+}

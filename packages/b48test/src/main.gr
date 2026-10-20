@@ -1,0 +1,437 @@
+// The harness scripts/b48_diff.py drives: each (op, path) pair names a case
+// file, and the answer is the file's answers, one line each.
+import javarandom
+import javadouble
+import javaformat
+import javadecimalformat
+import javauri
+import javamessageformat
+import javabigdecimal
+
+fn bits(x: f64) -> str {
+    let b = x.to_bits()
+    if b == 0 {
+        return "0"
+    }
+    var out = ""
+    var v = b
+    while v != 0 {
+        out = "0123456789abcdef".substr(v.bit_and(15), 1) + out
+        v = v.ushr(4)
+    }
+    return out
+}
+
+fn two_hex(x: i64) -> str {
+    return "0123456789abcdef".substr(x.ushr(4).bit_and(15), 1) + "0123456789abcdef".substr(x.bit_and(15), 1)
+}
+
+fn java_random(f: [str]) -> str {
+    var r = javarandom.random(f[1].parse_int() ?? 0)
+    var out: [str] = []
+    for k in 2..f.len() {
+        let op = f[k].split(":")
+        let n = op[0]
+        if n == "i" {
+            out.push(javarandom.next_int(r).to_str())
+        } else if n == "ib" {
+            out.push(javarandom.next_int_bounded(r, op[1].parse_int() ?? 1).to_str())
+        } else if n == "ir" {
+            out.push(javarandom.next_int_range(r, op[1].parse_int() ?? 0, op[2].parse_int() ?? 1).to_str())
+        } else if n == "l" {
+            out.push(javarandom.next_long(r).to_str())
+        } else if n == "lb" {
+            out.push(javarandom.next_long_bounded(r, op[1].parse_int() ?? 1).to_str())
+        } else if n == "z" {
+            out.push(if javarandom.next_boolean(r) { "t" } else { "f" })
+        } else if n == "f" {
+            out.push(bits(javarandom.next_float(r)))
+        } else if n == "d" {
+            out.push(bits(javarandom.next_double(r)))
+        } else if n == "g" {
+            out.push(bits(javarandom.next_gaussian(r)))
+        } else if n == "b" {
+            out.push("x" + javarandom.next_bytes(r, op[1].parse_int() ?? 0).to_list().map(|x| two_hex(x)).join(""))
+        } else if n == "s" {
+            var xs: [i64] = []
+            for i in 0..(op[1].parse_int() ?? 0) {
+                xs.push(i)
+            }
+            out.push("p" + javarandom.shuffle(r, xs).map(|x| x.to_str() + ",").join(""))
+        }
+    }
+    return out.join(" ")
+}
+
+fn java_splittable(f: [str]) -> str {
+    var r = javarandom.splittable(f[1].parse_int() ?? 0)
+    var out: [str] = []
+    for k in 2..f.len() {
+        let op = f[k].split(":")
+        let n = op[0]
+        if n == "i" {
+            out.push(javarandom.split_next_int(r).to_str())
+        } else if n == "ib" {
+            out.push(javarandom.split_next_int_bounded(r, op[1].parse_int() ?? 1).to_str())
+        } else if n == "l" {
+            out.push(javarandom.split_next_long(r).to_str())
+        } else if n == "z" {
+            out.push(if javarandom.split_next_boolean(r) { "t" } else { "f" })
+        } else if n == "f" {
+            out.push(bits(javarandom.split_next_float(r)))
+        } else if n == "d" {
+            out.push(bits(javarandom.split_next_double(r)))
+        } else if n == "sp" {
+            r = javarandom.split(r)
+            out.push("split")
+        }
+    }
+    return out.join(" ")
+}
+
+fn unhex(h: str) -> str {
+    if h == "-" {
+        return ""
+    }
+    var out: [i64] = []
+    let b = h.to_bytes()
+    var i = 0
+    while i + 1 < b.len() {
+        let hi = b.at(i)
+        let lo = b.at(i + 1)
+        out.push((if hi >= 97 { hi - 87 } else { hi - 48 }) * 16 + (if lo >= 97 { lo - 87 } else { lo - 48 }))
+        i = i + 2
+    }
+    return bytes_of(out).to_str()
+}
+
+fn jarg(a: str) -> JfArg {
+    let v = if a.len() > 2 { a.substr(2, a.len() - 2) } else { "" }
+    let k = a.substr(0, 1)
+    return if k == "i" { JInt(v.parse_int() ?? 0) } else if k == "l" { JLong(v.parse_int() ?? 0) } else if k == "b" { JByte(v.parse_int() ?? 0) } else if k == "s" {
+        JShort(v.parse_int() ?? 0)
+    } else if k == "d" { JDouble(hex_u64(v).from_bits()) } else if k == "f" { JFloat(hex_u64(v)) } else if k == "S" { JStr(unhex(v)) } else if k == "c" {
+        JChar(v.parse_int() ?? 0)
+    } else if k == "z" { JBool(v == "t") } else { JNull }
+}
+
+fn jformat(f: [str]) -> str {
+    var args: [JfArg] = []
+    for k in 1..f.len() {
+        args.push(jarg(f[k]))
+    }
+    return match javaformat.format(unhex(f[0]), args) {
+        Ok(t) -> {
+            let digits = "0123456789abcdef"
+            let h = t.to_bytes().to_list().map(|x| digits.substr(x.ushr(4), 1) + digits.substr(x.bit_and(15), 1)).join("")
+            if h.len() == 0 { "-" } else { h }
+        }
+        Err(_e) -> "error"
+    }
+}
+
+fn rounding_named(name: str) -> DfRounding {
+    return if name == "HALF_UP" { HalfUp } else if name == "HALF_DOWN" { HalfDown } else if name == "UP" { Up } else if name == "DOWN" { Down } else if name == "CEILING" {
+        Ceiling
+    } else if name == "FLOOR" { Floor } else if name == "UNNECESSARY" { Unnecessary } else { HalfEven }
+}
+
+fn decimal_text(p: DecimalPattern, is_double: bool, v: str) -> str ! DfError {
+    if is_double {
+        return try javadecimalformat.format_double(p, hex_u64(v).from_bits())
+    }
+    return try javadecimalformat.format_long(p, v.parse_int() ?? 0)
+}
+
+fn jdecimal(f: [str]) -> str {
+    let p = match javadecimalformat.pattern(unhex(f[0])) {
+        Ok(p) -> javadecimalformat.with_rounding(p, rounding_named(f[1]))
+        Err(_e) -> return "bad"
+    }
+    let v = f[2].substr(2, f[2].len() - 2)
+    return match decimal_text(p, f[2].starts_with("d"), v) {
+        Ok(t) -> {
+            let digits = "0123456789abcdef"
+            let h = t.to_bytes().to_list().map(|x| digits.substr(x.ushr(4), 1) + digits.substr(x.bit_and(15), 1)).join("")
+            if h.len() == 0 { "-" } else { h }
+        }
+        Err(_e) -> "arith"
+    }
+}
+
+fn hex_text(t: str) -> str {
+    let digits = "0123456789abcdef"
+    let h = t.to_bytes().to_list().map(|x| digits.substr(x.ushr(4), 1) + digits.substr(x.bit_and(15), 1)).join("")
+    return if h.len() == 0 { "-" } else { h }
+}
+
+fn hex_opt(t: Option[str]) -> str {
+    return match t {
+        Some(x) -> hex_text(x)
+        None -> "~"
+    }
+}
+
+fn opt_arg(h: str) -> Option[str] {
+    return if h == "~" { None } else { Some(unhex(h)) }
+}
+
+fn uri_desc(u: JavaUri) -> str {
+    let raw = javauri.raw_scheme_specific_part(u)
+    let fields = [hex_opt(u.scheme), hex_text(raw), hex_opt(u.authority), hex_opt(u.user_info), hex_opt(u.host), hex_text(u.port.to_str()),
+        hex_opt(u.path), hex_opt(u.query), hex_opt(u.fragment), hex_text(javauri.scheme_specific_part(u)), hex_opt(javauri.decoded_authority(u)),
+        hex_opt(javauri.decoded_user_info(u)), hex_opt(javauri.decoded_path(u)), hex_opt(javauri.decoded_query(u)),
+        hex_opt(javauri.decoded_fragment(u)), hex_text(javauri.to_string(u)), hex_text(javauri.to_ascii_string(u)),
+        hex_text(javauri.to_string(javauri.normalize(u))), hex_text(javauri.hash_code(u).to_str()),
+        hex_text(match u.path {
+            Some(_p) -> "false"
+            None -> "true"
+    })]
+    return fields.join(",")
+}
+
+fn uri_op(f: [str]) -> str ! UriError {
+    let op = f[0]
+    if op == "p" {
+        return uri_desc(try javauri.parse(unhex(f[1])))
+    }
+    if op == "a" {
+        return uri_desc(try javauri.parse_server_authority(try javauri.parse(unhex(f[1]))))
+    }
+    if op == "r" {
+        return uri_desc(javauri.resolve(try javauri.parse(unhex(f[1])), try javauri.parse(unhex(f[2]))))
+    }
+    if op == "l" {
+        return uri_desc(javauri.relativize(try javauri.parse(unhex(f[1])), try javauri.parse(unhex(f[2]))))
+    }
+    if op == "q" {
+        let a = try javauri.parse(unhex(f[1]))
+        let b = try javauri.parse(unhex(f[2]))
+        return "{javauri.equals(a, b)} {javauri.compare(a, b)} {javauri.hash_code(a)} {javauri.hash_code(b)}"
+    }
+    if op == "c7" {
+        return uri_desc(try javauri.of_parts(opt_arg(f[1]), opt_arg(f[2]), opt_arg(f[3]), f[4].parse_int() ?? 0, opt_arg(f[5]), opt_arg(f[6]),
+            opt_arg(f[7])))
+    }
+    if op == "c5" {
+        return uri_desc(try javauri.of_authority(opt_arg(f[1]), opt_arg(f[2]), opt_arg(f[3]), opt_arg(f[4]), opt_arg(f[5])))
+    }
+    return uri_desc(try javauri.of_ssp(opt_arg(f[1]), opt_arg(f[2]), opt_arg(f[3])))
+}
+
+fn juri(f: [str]) -> str {
+    return match uri_op(f) {
+        Ok(t) -> t
+        Err(e) -> match e {
+            UriSyntax(reason, index) -> "E {index} " + hex_text(reason)
+            UriNumberFormat -> "N"
+        }
+    }
+}
+
+fn jmessage(f: [str]) -> str {
+    var args: [MfArg] = []
+    for k in 1..f.len() {
+        let a = f[k]
+        let v = a.substr(2, a.len() - 2)
+        let kind = a.substr(0, 1)
+        args.push(if kind == "l" { MfLong(v.parse_int() ?? 0) } else if kind == "d" { MfDouble(hex_u64(v).from_bits()) } else if kind == "s" {
+            MfText(unhex(v))
+        } else { MfNull })
+    }
+    let p = match javamessageformat.compile(unhex(f[0])) {
+        Ok(p) -> p
+        Err(e) -> return match e {
+            MfUnsupported(w) -> "unsupported " + w
+            _ -> "bad"
+        }
+    }
+    return match javamessageformat.format(p, args) {
+        Ok(t) -> hex_text(t)
+        Err(e) -> match e {
+            MfEmptyChoice -> "index"
+            MfUnsupported(w) -> "unsupported " + w
+            _ -> "fmt"
+        }
+    }
+}
+
+fn big_desc(x: BigDec) -> str {
+    return "{javabigdecimal.to_string(x)} {javabigdecimal.to_engineering_string(x)} {javabigdecimal.to_plain_string(x)} {x.scale} " +
+    "{javabigdecimal.precision(x)} {javabigdecimal.unscaled_text(x)} {javabigdecimal.hash_code(x)} {javabigdecimal.signum(x)}"
+}
+
+fn bd_mode(name: str) -> BdRounding {
+    return if name == "UP" { BdUp } else if name == "DOWN" { BdDown } else if name == "CEILING" { BdCeiling } else if name == "FLOOR" { BdFloor } else if name == "HALF_UP" {
+        BdHalfUp
+    } else if name == "HALF_DOWN" { BdHalfDown } else if name == "UNNECESSARY" { BdUnnecessary } else { BdHalfEven }
+}
+
+fn bd_mc(p: str, m: str) -> MathContext {
+    return MathContext{ precision: p.parse_int() ?? 0, rounding: bd_mode(m) }
+}
+
+fn hex_bits(v: i64) -> str {
+    let digits = "0123456789abcdef"
+    var out = ""
+    var x = v
+    while x != 0 {
+        out = digits.substr(x.bit_and(15), 1) + out
+        x = x.ushr(4)
+    }
+    return if out.len() == 0 { "0" } else { out }
+}
+
+fn big_unary(f: [str], a: BigDec) -> str ! BdError {
+    let op = f[0]
+    let n = if f.len() > 2 { f[2].parse_int() ?? 0 } else { 0 }
+    if op == "s" {
+        return big_desc(a) + " " + hex_bits(javabigdecimal.to_double(a).to_bits()) + " " + javabigdecimal.to_string(javabigdecimal.strip_trailing_zeros(a)) +
+        " " + javabigdecimal.to_big_integer(a) + " {javabigdecimal.long_value(a)} " + javabigdecimal.to_string(javabigdecimal.ulp(a))
+    }
+    if op == "round" {
+        return big_desc(try javabigdecimal.round(a, bd_mc(f[2], f[3])))
+    }
+    if op == "sets" {
+        return big_desc(try javabigdecimal.set_scale(a, n, bd_mode(f[3])))
+    }
+    if op == "pow" {
+        return big_desc(try javabigdecimal.pow(a, n))
+    }
+    if op == "mpl" {
+        return big_desc(try javabigdecimal.move_point_left(a, n))
+    }
+    if op == "mpr" {
+        return big_desc(try javabigdecimal.move_point_right(a, n))
+    }
+    return big_desc(try javabigdecimal.scale_by_power_of_ten(a, n))
+}
+
+fn big_binary(f: [str], a: BigDec, b: BigDec) -> str ! BdError {
+    let op = f[0]
+    if op == "add" {
+        return big_desc(javabigdecimal.add(a, b))
+    }
+    if op == "sub" {
+        return big_desc(javabigdecimal.subtract(a, b))
+    }
+    if op == "mul" {
+        return big_desc(try javabigdecimal.multiply(a, b))
+    }
+    if op == "div" {
+        return big_desc(try javabigdecimal.divide_exact(a, b))
+    }
+    if op == "dti" {
+        return big_desc(try javabigdecimal.divide_to_integral(a, b))
+    }
+    if op == "rem" {
+        return big_desc(try javabigdecimal.remainder(a, b))
+    }
+    if op == "cmp" {
+        return "{javabigdecimal.compare(a, b)} {javabigdecimal.equals(a, b)} " + javabigdecimal.to_string(javabigdecimal.min(a, b)) + " " +
+        javabigdecimal.to_string(javabigdecimal.max(a, b))
+    }
+    if op == "divs" {
+        return big_desc(try javabigdecimal.divide_to_scale(a, b, f[3].parse_int() ?? 0, bd_mode(f[4])))
+    }
+    if op == "divm" {
+        return big_desc(try javabigdecimal.divide_rounding(a, b, bd_mode(f[3])))
+    }
+    let mc = bd_mc(f[3], f[4])
+    if op == "addc" {
+        return big_desc(try javabigdecimal.add_mc(a, b, mc))
+    }
+    if op == "subc" {
+        return big_desc(try javabigdecimal.subtract_mc(a, b, mc))
+    }
+    if op == "mulc" {
+        return big_desc(try javabigdecimal.multiply_mc(a, b, mc))
+    }
+    return big_desc(try javabigdecimal.divide_mc(a, b, mc))
+}
+
+fn big_op(f: [str]) -> str ! BdError {
+    let op = f[0]
+    if op == "nbd" {
+        return big_desc(try javabigdecimal.of_double(hex_u64(f[1]).from_bits()))
+    }
+    if op == "vod" {
+        return big_desc(try javabigdecimal.value_of(hex_u64(f[1]).from_bits()))
+    }
+    let a = try javabigdecimal.parse(unhex(f[1]))
+    if ["s", "round", "sets", "pow", "mpl", "mpr", "sbp"].contains(op) {
+        return try big_unary(f, a)
+    }
+    return try big_binary(f, a, try javabigdecimal.parse(unhex(f[2])))
+}
+
+fn jbig(f: [str]) -> str {
+    return match big_op(f) {
+        Ok(t) -> t
+        Err(e) -> match e {
+            BdFormat -> "nfe"
+            BdArithmetic(_k) -> "arith"
+        }
+    }
+}
+
+/// Hex to the 64 bits it spells, sign bit included.
+fn hex_u64(h: str) -> i64 {
+    var v = 0
+    for c in h.codes() {
+        let d = if c >= 97 { c - 87 } else if c >= 65 { c - 55 } else { c - 48 }
+        v = v.shl(4).bit_or(d)
+    }
+    return v
+}
+
+fn main() / {io} {
+    let argv = args()
+    var i = 0
+    while i + 1 < argv.len() {
+        let op = argv[i]
+        let text = match read_bytes(argv[i + 1]) {
+            Ok(d) -> d.to_str()
+            Err(_e) -> ""
+        }
+        if op == "jdouble" {
+            for l in text.split("\n").filter(|l| l.len() > 0) {
+                let f = l.split(" ")
+                let b = f[1].parse_int_base(16) ?? hex_u64(f[1])
+                print(if f[0] == "d" { javadouble.double_to_string(b.from_bits()) } else { javadouble.float_to_string(b) })
+            }
+        }
+        if op == "jformat" {
+            for l in text.split("\n").filter(|l| l.len() > 0) {
+                print(jformat(l.split(" ")))
+            }
+        }
+        if op == "jdecimal" {
+            for l in text.split("\n").filter(|l| l.len() > 0) {
+                print(jdecimal(l.split(" ")))
+            }
+        }
+        if op == "juri" {
+            for l in text.split("\n").filter(|l| l.len() > 0) {
+                print(juri(l.split(" ")))
+            }
+        }
+        if op == "jmessage" {
+            for l in text.split("\n").filter(|l| l.len() > 0) {
+                print(jmessage(l.split(" ")))
+            }
+        }
+        if op == "jbig" {
+            for l in text.split("\n").filter(|l| l.len() > 0) {
+                print(jbig(l.split(" ")))
+            }
+        }
+        if op == "jrand" {
+            for l in text.split("\n").filter(|l| l.len() > 0) {
+                let f = l.split(" ")
+                print(if f[0] == "R" { java_random(f) } else { java_splittable(f) })
+            }
+        }
+        i = i + 2
+    }
+}

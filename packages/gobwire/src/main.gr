@@ -1,0 +1,519 @@
+// Go's `encoding/gob`, read without Go: the stream a Go program writes with
+// `gob.NewEncoder(w).Encode(v)`, decoded from the type definitions it
+// carries into values anything can walk.
+//
+// Held to Go 1.25's own decoder: a stream of values of structs (nested,
+// recursive through pointers and slices), slices, arrays, maps, every
+// integer and float width, complex numbers, strings, byte slices,
+// interfaces holding registered types, and types with their own
+// `GobEncode` (`time.Time`), decodes here to what `gob.Decoder` gives,
+// shown in `render`'s canonical form; a stream cut short is refused, as Go
+// refuses it.
+//
+// Gob leaves zero values off the wire, so a field the stream does not carry
+// is the zero of its type; a missing struct-typed field was a nil pointer
+// (a struct is always sent otherwise) and renders as `nil`. Strings are
+// kept as bytes: a Go string need not be UTF-8.
+//
+// Not held: a damaged stream that still parses. Go decodes into the types
+// of the program reading it and refuses a stream whose types do not match
+// them; this decoder has no such types and reads what the stream says.
+
+type GobType =
+    | GtBool
+    | GtInt
+    | GtUint
+    | GtFloat
+    | GtBytes
+    | GtString
+    | GtComplex
+    | GtIface
+    | GtArray(name: str, elem: i64, len: i64)
+    | GtSlice(name: str, elem: i64)
+    | GtStruct(name: str, fields: [(str, i64)])
+    | GtMap(name: str, key: i64, elem: i64)
+    | GtOpaque(kind: str, name: str)
+
+type GobValue =
+    | GvBool(b: bool)
+    | GvInt(i: i64)
+    | GvUint(u: i64)
+    | GvFloat(f: f64)
+    | GvComplex(re: f64, im: f64)
+    | GvBytes(data: bytes)
+    | GvStr(data: bytes)
+    | GvList(items: [GobValue])
+    | GvMap(entries: [(GobValue, GobValue)])
+    | GvStruct(fields: [Option[GobValue]])
+    | GvIface(name: str, id: i64, value: Option[GobValue])
+    | GvOpaque(data: bytes)
+
+/// A top-level value and the id of its type.
+type GobItem = { id: i64, value: GobValue }
+
+type GobStream = { types: Map[i64, GobType], items: [GobItem] }
+
+type GobError =
+    | Truncated
+    | BadUint
+    | UnknownType(id: i64)
+    | FieldOutOfRange
+    | LengthMismatch
+    | BadSingleton
+    | ExtraData
+    | TooBig
+
+/// `end` is where the current message stops.
+type GobReader = { data: bytes, pos: i64, end: i64 }
+
+/// Moves to the message that starts where the current one ends.
+fn next_message(inout r: GobReader) -> () ! GobError {
+    var whole = GobReader{ data: r.data, pos: r.pos, end: r.data.len() }
+    let count = try read_uint(whole)
+    if count < 0 or count > r.data.len() - whole.pos {
+        fail(Truncated)
+    }
+    r.pos = whole.pos
+    r.end = whole.pos + count
+    return ()
+}
+
+fn read_uint(inout r: GobReader) -> i64 ! GobError {
+    if r.pos >= r.end {
+        fail(Truncated)
+    }
+    let b = r.data.at(r.pos)
+    r.pos = r.pos + 1
+    if b < 128 {
+        return b
+    }
+    let n = 256 - b
+    if n > 8 {
+        fail(BadUint)
+    }
+    if r.pos + n > r.end {
+        fail(Truncated)
+    }
+    var v = 0
+    for k in 0..n {
+        v = v.shl(8).bit_or(r.data.at(r.pos + k))
+    }
+    r.pos = r.pos + n
+    return v
+}
+
+fn read_int(inout r: GobReader) -> i64 ! GobError {
+    let u = try read_uint(r)
+    return if u.bit_and(1) == 1 { u.ushr(1).bit_not() } else { u.ushr(1) }
+}
+
+fn read_float(inout r: GobReader) -> f64 ! GobError {
+    let u = try read_uint(r)
+    // The float's bits, byte-reversed, so small exponents encode short.
+    var v = 0
+    var x = u
+    for _k in 0..8 {
+        v = v.shl(8).bit_or(x.bit_and(255))
+        x = x.ushr(8)
+    }
+    return v.from_bits()
+}
+
+fn read_bytes_field(inout r: GobReader) -> bytes ! GobError {
+    let n = try read_uint(r)
+    if n < 0 or n > r.end - r.pos {
+        fail(Truncated)
+    }
+    let b = r.data.slice(r.pos, r.pos + n)
+    r.pos = r.pos + n
+    return b
+}
+
+fn builtin(id: i64) -> Option[GobType] {
+    return if id == 1 { Some(GtBool) } else if id == 2 { Some(GtInt) } else if id == 3 { Some(GtUint) } else if id == 4 { Some(GtFloat) } else if id == 5 {
+        Some(GtBytes)
+    } else if id == 6 { Some(GtString) } else if id == 7 { Some(GtComplex) } else if id == 8 { Some(GtIface) } else { None }
+}
+
+fn type_of(types: Map[i64, GobType], id: i64) -> GobType ! GobError {
+    return match builtin(id) {
+        Some(t) -> t
+        None -> match types.get(id) {
+            Some(t) -> t
+            None -> fail(UnknownType(id))
+        }
+    }
+}
+
+fn read_value(inout types: Map[i64, GobType], id: i64, inout r: GobReader) -> GobValue ! GobError {
+    let t = try type_of(types, id)
+    return match t {
+        GtBool -> GvBool(try read_uint(r) != 0)
+        GtInt -> GvInt(try read_int(r))
+        GtUint -> GvUint(try read_uint(r))
+        GtFloat -> GvFloat(try read_float(r))
+        GtComplex -> {
+            let re = try read_float(r)
+            GvComplex(re, try read_float(r))
+        }
+        GtBytes -> GvBytes(try read_bytes_field(r))
+        GtString -> GvStr(try read_bytes_field(r))
+        GtIface -> try read_iface(types, r)
+        GtArray(_n, elem, len) -> {
+            let n = try read_uint(r)
+            if n != len {
+                fail(LengthMismatch)
+            }
+            GvList(try read_elems(types, elem, n, r))
+        }
+        GtSlice(_n, elem) -> {
+            let n = try read_uint(r)
+            if n < 0 or n > r.end - r.pos {
+                fail(TooBig)
+            }
+            GvList(try read_elems(types, elem, n, r))
+        }
+        GtMap(_n, key, elem) -> {
+            let n = try read_uint(r)
+            if n < 0 or n > r.end - r.pos {
+                fail(TooBig)
+            }
+            var entries: [(GobValue, GobValue)] = []
+            for _k in 0..n {
+                let kv = try read_value(types, key, r)
+                entries.push((kv, try read_value(types, elem, r)))
+            }
+            GvMap(entries)
+        }
+        GtStruct(_n, fields) -> try read_struct(types, fields, r)
+        GtOpaque(_k, _n) -> GvOpaque(try read_bytes_field(r))
+    }
+}
+
+fn read_elems(inout types: Map[i64, GobType], elem: i64, n: i64, inout r: GobReader) -> [GobValue] ! GobError {
+    var out: [GobValue] = []
+    for _k in 0..n {
+        out.push(try read_value(types, elem, r))
+    }
+    return out
+}
+
+fn read_struct(inout types: Map[i64, GobType], fields: [(str, i64)], inout r: GobReader) -> GobValue ! GobError {
+    var vals: [Option[GobValue]] = []
+    for _f in fields {
+        vals.push(None)
+    }
+    var at = 0 - 1
+    while true {
+        let delta = try read_uint(r)
+        if delta == 0 {
+            break
+        }
+        at = at + delta
+        if delta < 0 or at < 0 or at >= fields.len() {
+            fail(FieldOutOfRange)
+        }
+        vals[at] = Some(try read_value(types, fields[at].1, r))
+    }
+    return GvStruct(vals)
+}
+
+/// A value whose type is not a struct is sent as a struct of one field:
+/// delta 0, then the value.
+fn read_top(inout types: Map[i64, GobType], id: i64, inout r: GobReader) -> GobValue ! GobError {
+    match try type_of(types, id) {
+        GtStruct(_n, fields) -> return try read_struct(types, fields, r)
+        _ -> {}
+    }
+    if try read_uint(r) != 0 {
+        fail(BadSingleton)
+    }
+    return try read_value(types, id, r)
+}
+
+fn read_iface(inout types: Map[i64, GobType], inout r: GobReader) -> GobValue ! GobError {
+    let name = try read_bytes_field(r)
+    if name.len() == 0 {
+        return GvIface("", 0, None)
+    }
+    // The concrete type's definition may come first: a negative id and the
+    // definition, which can end the message -- the value then goes on in
+    // the next one, the only place gob lets a value cross a message. Left
+    // over after a definition, a count is skipped (Go's decodeTypeSequence).
+    var id = 0
+    while true {
+        if r.pos == r.end {
+            try next_message(r)
+        }
+        id = try read_int(r)
+        if id >= 0 {
+            break
+        }
+        types.set(0 - id, try read_wire_type(r))
+        if r.pos < r.end {
+            let _skip = try read_uint(r)
+        }
+    }
+    let count = try read_uint(r)
+    if count < 0 or count > r.end - r.pos {
+        fail(Truncated)
+    }
+    let start = r.pos
+    var inner = GobReader{ data: r.data, pos: start, end: start + count }
+    let v = try read_top(types, id, inner)
+    r.pos = start + count
+    return GvIface(name.to_str(), id, Some(v))
+}
+
+// ---- type definitions: a `wireType`, itself sent as a gob struct
+
+fn common(inout r: GobReader) -> str ! GobError {
+    // CommonType{Name string; Id typeId}
+    var name = ""
+    var at = 0 - 1
+    while true {
+        let delta = try read_uint(r)
+        if delta == 0 {
+            break
+        }
+        at = at + delta
+        if at == 0 {
+            name = (try read_bytes_field(r)).to_str()
+        } else if at == 1 {
+            let _id = try read_int(r)
+        } else {
+            fail(FieldOutOfRange)
+        }
+    }
+    return name
+}
+
+fn read_wire_type(inout r: GobReader) -> GobType ! GobError {
+    var result: Option[GobType] = None
+    var at = 0 - 1
+    while true {
+        let delta = try read_uint(r)
+        if delta == 0 {
+            break
+        }
+        at = at + delta
+        result = Some(try read_kind(at, r))
+    }
+    return match result {
+        Some(t) -> t
+        None -> fail(FieldOutOfRange)
+    }
+}
+
+/// One of wireType's fields: ArrayT, SliceT, StructT, MapT, then the three
+/// marshaler kinds, each a struct whose first field is its CommonType.
+fn read_kind(kind: i64, inout r: GobReader) -> GobType ! GobError {
+    var name = ""
+    var elem = 0
+    var key = 0
+    var len = 0
+    var fields: [(str, i64)] = []
+    var at = 0 - 1
+    while true {
+        let delta = try read_uint(r)
+        if delta == 0 {
+            break
+        }
+        at = at + delta
+        if at == 0 {
+            name = try common(r)
+        } else if kind == 0 and at == 1 {
+            elem = try read_int(r)
+        } else if kind == 0 and at == 2 {
+            len = try read_int(r)
+        } else if kind == 1 and at == 1 {
+            elem = try read_int(r)
+        } else if kind == 2 and at == 1 {
+            let n = try read_uint(r)
+            for _k in 0..n {
+                fields.push(try read_field_type(r))
+            }
+        } else if kind == 3 and at == 1 {
+            key = try read_int(r)
+        } else if kind == 3 and at == 2 {
+            elem = try read_int(r)
+        } else {
+            fail(FieldOutOfRange)
+        }
+    }
+    return if kind == 0 { GtArray(name, elem, len) } else if kind == 1 { GtSlice(name, elem) } else if kind == 2 { GtStruct(name, fields) } else if kind == 3 {
+        GtMap(name, key, elem)
+    } else { GtOpaque(if kind == 4 { "GobEncoder" } else if kind == 5 { "BinaryMarshaler" } else { "TextMarshaler" }, name) }
+}
+
+fn read_field_type(inout r: GobReader) -> (str, i64) ! GobError {
+    var name = ""
+    var id = 0
+    var at = 0 - 1
+    while true {
+        let delta = try read_uint(r)
+        if delta == 0 {
+            break
+        }
+        at = at + delta
+        if at == 0 {
+            name = (try read_bytes_field(r)).to_str()
+        } else if at == 1 {
+            id = try read_int(r)
+        } else {
+            fail(FieldOutOfRange)
+        }
+    }
+    return (name, id)
+}
+
+/// Every value in a gob stream, with the types the stream defined.
+pub fn decode(data: bytes) -> GobStream ! GobError {
+    var types: Map[i64, GobType] = map()
+    var items: [GobItem] = []
+    var r = GobReader{ data: data, pos: 0, end: 0 }
+    while r.pos < data.len() {
+        try next_message(r)
+        let id = try read_int(r)
+        if id < 0 {
+            types.set(0 - id, try read_wire_type(r))
+        } else {
+            items.push(GobItem{ id: id, value: try read_top(types, id, r) })
+        }
+        if r.pos != r.end {
+            fail(ExtraData)
+        }
+    }
+    return GobStream{ types: types, items: items }
+}
+
+// ---- the canonical rendering
+
+fn hex(b: bytes) -> str {
+    let d = "0123456789abcdef"
+    var out = ""
+    for x in b.to_list() {
+        out = out + d.substr(x.ushr(4), 1) + d.substr(x.bit_and(15), 1)
+    }
+    return out
+}
+
+fn udec(v: i64) -> str {
+    if v >= 0 {
+        return v.to_str()
+    }
+    let q = v.ushr(1) / 5
+    return q.to_str() + (v - q * 10).to_str()
+}
+
+fn bits(f: f64) -> str {
+    let b = f.to_bits()
+    return b.ushr(32).to_base(16).pad_start(8, "0") + b.bit_and(4294967295).to_base(16).pad_start(8, "0")
+}
+
+/// `t`/`f`, `i:N`, `u:N`, `f:<bits>`, `c:<bits>,<bits>`, `s:<hex>`,
+/// `b:<hex>`, `[a,b]`, `{k:v,...}` sorted by key, `{Field=v,...}` for a
+/// struct, `I(name:v)` or `nil` for an interface, `G:<hex>` for a
+/// self-encoding type (`G-` when absent).
+pub fn render(s: GobStream, id: i64, v: Option[GobValue]) -> str {
+    let t = match type_of(s.types, id) {
+        Ok(x) -> x
+        Err(_e) -> return "?"
+    }
+    return match v {
+        Some(x) -> render_value(s, t, x)
+        None -> render_zero(s, t, 0)
+    }
+}
+
+fn render_value(s: GobStream, t: GobType, v: GobValue) -> str {
+    return match v {
+        GvBool(b) -> if b { "t" } else { "f" }
+        GvInt(i) -> "i:" + i.to_str()
+        GvUint(u) -> "u:" + udec(u)
+        GvFloat(f) -> "f:" + bits(f)
+        GvComplex(re, im) -> "c:" + bits(re) + "," + bits(im)
+        GvBytes(b) -> "b:" + hex(b)
+        GvStr(b) -> "s:" + hex(b)
+        GvList(items) -> {
+            let elem = match t {
+                GtArray(_n, e, _l) -> e
+                GtSlice(_n, e) -> e
+                _ -> 0
+            }
+            "[" + items.map(|x| render(s, elem, Some(x))).join(",") + "]"
+        }
+        GvMap(entries) -> {
+            let (kt, et) = match t {
+                GtMap(_n, k, e) -> (k, e)
+                _ -> (0, 0)
+            }
+            var parts = entries.map(|e| render(s, kt, Some(e.0)) + ":" + render(s, et, Some(e.1)))
+            parts.sort()
+            "\{" + parts.join(",") + "\}"
+        }
+        GvStruct(vals) -> {
+            let fields = match t {
+                GtStruct(_n, f) -> f
+                _ -> []
+            }
+            var parts: [str] = []
+            for k in 0..fields.len() {
+                parts.push(fields[k].0 + "=" + render(s, fields[k].1, vals[k]))
+            }
+            "\{" + parts.join(",") + "\}"
+        }
+        GvIface(name, id, inner) -> match inner {
+            Some(x) -> "I(" + name + ":" + render(s, id, Some(x)) + ")"
+            None -> "nil"
+        }
+        GvOpaque(b) -> "G:" + hex(b)
+    }
+}
+
+/// The zero of a type, as Go's decoder leaves a field the stream did not
+/// carry.
+fn render_zero(s: GobStream, t: GobType, depth: i64) -> str {
+    return match t {
+        GtBool -> "f"
+        GtInt -> "i:0"
+        GtUint -> "u:0"
+        GtFloat -> "f:0000000000000000"
+        GtComplex -> "c:0000000000000000,0000000000000000"
+        GtBytes -> "b:"
+        GtString -> "s:"
+        GtIface -> "nil"
+        GtSlice(_n, _e) -> "[]"
+        GtMap(_n, _k, _e) -> "\{\}"
+        GtStruct(_n, _f) -> if depth == 0 { "nil" } else { render_zero_struct(s, t, depth) }
+        GtArray(_n, elem, len) -> {
+            let z = match type_of(s.types, elem) {
+                Ok(et) -> render_zero(s, et, depth + 1)
+                Err(_e) -> "?"
+            }
+            var parts: [str] = []
+            for _k in 0..len {
+                parts.push(z)
+            }
+            "[" + parts.join(",") + "]"
+        }
+        GtOpaque(_k, _n) -> "G-"
+    }
+}
+
+fn render_zero_struct(s: GobStream, t: GobType, depth: i64) -> str {
+    let fields = match t {
+        GtStruct(_n, f) -> f
+        _ -> []
+    }
+    var parts: [str] = []
+    for (name, id) in fields {
+        let z = match type_of(s.types, id) {
+            Ok(ft) -> render_zero(s, ft, 0)
+            Err(_e) -> "?"
+        }
+        parts.push(name + "=" + z)
+    }
+    let _ = depth
+    return "\{" + parts.join(",") + "\}"
+}

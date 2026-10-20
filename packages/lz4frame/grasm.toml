@@ -1,0 +1,8 @@
+[package]
+name = "lz4frame"
+version = "1.0.0"
+capabilities = []
+
+[dependencies.xxhash]
+path = "../xxhash"
+version = "^1.0.0"

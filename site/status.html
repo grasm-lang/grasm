@@ -70,18 +70,18 @@ where each one stands.</p>
 <h2>What holds</h2>
 <div class="figures">
   <div class="fig"><b>511</b><span>programs, engines identical</span></div>
-  <div class="fig"><b>486</b><span>identical in wasm</span></div>
-  <div class="fig"><b>605</b><span>cross-compiled, agreeing</span></div>
+  <div class="fig"><b>492</b><span>identical in wasm</span></div>
+  <div class="fig"><b>620</b><span>cross-compiled, agreeing</span></div>
   <div class="fig"><b>262</b><span>conformance programs</span></div>
   <div class="fig"><b>101</b><span>findings recorded</span></div>
   <div class="fig"><b>16</b><span>fuzz generators</span></div>
 </div>
 <p>Interpreter, bundle and native builds agree byte for byte on stdout, exit
-code and diagnostics. All 605 are also compiled for x86_64 and run under
+code and diagnostics. All 620 are also compiled for x86_64 and run under
 Rosetta, every one of them agreeing, on 20 October 2026. Every generated program
 is checked for what it keeps as well as for what it prints.</p>
 <h2>Which run wrote which figure</h2>
-<p>The corpus is <b>608</b> standalone programs, counted as this page is
+<p>The corpus is <b>623</b> standalone programs, counted as this page is
 written and by difftest's own filter — so a program added today is in that
 number today. Everything below it needs a run, and these are not all from one
 run. <code>site/facts.json</code> used to carry no date at all, which is how a
@@ -90,10 +90,10 @@ from the run that proved it; it carries one per figure now, and this is the
 whole record:</p>
 <div class="scroll"><table>
 <tr><th>Gate</th><th>What it compared</th><th>Figure</th><th>Taken</th></tr>
-<tr><td><code>difftest</code></td><td>interpreter, bundle and native identical</td><td>605</td><td>20 October 2026</td></tr>
-<tr><td><code>wasmtest</code></td><td>identical in the browser engine</td><td>486</td><td>20 October 2026</td></tr>
-<tr><td><code>wasmtest</code></td><td>skipped: no filesystem, socket, process or thread</td><td>122</td><td>20 October 2026</td></tr>
-<tr><td><code>crosstest</code></td><td>cross-compiled to x86_64, identical under Rosetta</td><td>605</td><td>20 October 2026</td></tr>
+<tr><td><code>difftest</code></td><td>interpreter, bundle and native identical</td><td>620</td><td>20 October 2026</td></tr>
+<tr><td><code>wasmtest</code></td><td>identical in the browser engine</td><td>492</td><td>20 October 2026</td></tr>
+<tr><td><code>wasmtest</code></td><td>skipped: no filesystem, socket, process or thread</td><td>131</td><td>20 October 2026</td></tr>
+<tr><td><code>crosstest</code></td><td>cross-compiled to x86_64, identical under Rosetta</td><td>620</td><td>20 October 2026</td></tr>
 <tr><td><code>ProjectGold</code></td><td>whole programs agreeing on every engine</td><td>44</td><td>20 October 2026</td></tr>
 <tr><td><code>fuzz_laws</code></td><td>laws that held against arithmetic</td><td>208</td><td>20 October 2026</td></tr>
 <tr><td><code>depth</code></td><td>nested calls the interpreter reaches, against 10,000 promised</td><td>31,093</td><td>20 October 2026</td></tr>
@@ -133,7 +133,7 @@ table because the margin moved once already with nothing noticing: see
 <h2>What does not work</h2>
 <div class="scroll"><table>
 <tr><th>Limit</th><th>Detail</th></tr>
-<tr><td>891 libraries, all first-party</td><td>See <a href="packages.html">Packages</a>; the plan for the rest is in <code>docs/packages-plan.md</code>. Anything else you need, you write, or bind to C with <code>extern fn</code>.</td></tr>
+<tr><td>943 libraries, all first-party</td><td>See <a href="packages.html">Packages</a>; the plan for the rest is in <code>docs/packages-plan.md</code>. Anything else you need, you write, or bind to C with <code>extern fn</code>.</td></tr>
 <tr><td>Blade is local only</td><td>A <code>path</code> dependency and a local Blade registry both work. Nothing fetches from or publishes to a remote one yet.</td></tr>
 <tr><td>Downloads are not code-signed</td><td>macOS binaries for both architectures are published on the <a href="https://github.com/grasm-lang/grasm/releases/latest">releases page</a> with SHA-256 sums, but they carry no Apple Developer signature, so Gatekeeper will ask before the first run. Notarisation is release work, not language work.</td></tr>
 <tr><td>Not faster than Rust</td><td>The geomean is 0.965× of it, 0.955× with the harness floor taken out of both sides, against a 0.95× target — so the goal is met and the claim is not available. <code>tree</code> at 0.51× is the worst row. On the systems suite Grasm loses <code>etl</code> by 3.6×, and wins memory everywhere — 8× on <code>chat</code>. <a href="performance.html">Every row →</a></td></tr>

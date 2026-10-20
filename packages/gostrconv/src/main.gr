@@ -1,0 +1,870 @@
+// Go's `strconv` for numbers: `FormatFloat`, `ParseFloat`, `ParseInt`,
+// `ParseUint`, `Atoi`, `FormatInt`, `FormatUint` and `ParseBool`, as Go
+// 1.25 answers them, error messages included.
+//
+// Go programs write numbers this way into JSON, logs, Prometheus metrics,
+// YAML and their command lines, and read them back the same way; a tool
+// on the other side has to agree on every one, including the formats
+// nobody else uses: `'b'` (`4503599627370496p-52`), `'x'` (`0x1.8p+01`,
+// with Go's two-digit exponent), `'g'` switching to an exponent at 21
+// digits for the shortest form, `float32` values printed as `float32`,
+// underscores in literals (`1_000`, but not `_1`), `ParseFloat` returning
+// both `+Inf` and a range error, and `ParseInt` returning the clamped
+// value with its error.
+//
+// Floats are converted exactly, both ways: printing uses the digits of the
+// binary value (Go's `bigFtoa`, the reference its faster paths are tested
+// against), and parsing rounds the decimal exactly to the nearest `float64`
+// or `float32`. A `float32` is passed as the `f64` holding it, which every
+// `float32` fits in exactly.
+//
+// `uint64` results are returned as the `i64` with the same 64 bits;
+// `format_uint` prints one.
+
+import bigint
+import goquote
+
+type GoNumError = { func_name: str, num: str, err: str }
+
+/// `NumError.Error()`.
+pub fn error_text(e: GoNumError) -> str {
+    return "strconv." + e.func_name + ": parsing " + goquote.quote(e.num.to_bytes()) + ": " + e.err
+}
+
+// ---- decimals: Go's `decimal`, exact (no 800-digit truncation arises for
+// a float's own value)
+
+/// Digits 0-9 with no trailing zero, and the point: 0.d1d2... * 10^dp.
+type GoDec = { d: [i64], dp: i64 }
+
+fn trim(inout a: GoDec) {
+    while a.d.len() > 0 and a.d[a.d.len() - 1] == 0 {
+        a.d.pop()
+    }
+    if a.d.len() == 0 {
+        a.dp = 0
+    }
+}
+
+/// mant * 2^shift exactly.
+fn dec_of(mant: i64, shift: i64) -> GoDec {
+    if mant == 0 {
+        return GoDec{ d: [], dp: 0 }
+    }
+    let n = if shift >= 0 { bigint.mul(bigint.from_i64(mant), bigint.pow(bigint.from_i64(2), shift)) } else {
+        bigint.mul(bigint.from_i64(mant), bigint.pow(bigint.from_i64(5), 0 - shift))
+    }
+    let t = bigint.to_str(n)
+    var a = GoDec{ d: t.codes().map(|c| c - 48), dp: if shift >= 0 { t.len() } else { t.len() + shift } }
+    trim(a)
+    return a
+}
+
+fn should_round_up(a: GoDec, nd: i64) -> bool {
+    if nd < 0 or nd >= a.d.len() {
+        return false
+    }
+    if a.d[nd] == 5 and nd + 1 == a.d.len() {
+        return nd > 0 and a.d[nd - 1] % 2 != 0
+    }
+    return a.d[nd] >= 5
+}
+
+fn round_down(inout a: GoDec, nd: i64) {
+    if nd < 0 or nd >= a.d.len() {
+        return
+    }
+    a.d = a.d.slice(0, nd)
+    trim(a)
+}
+
+fn round_up(inout a: GoDec, nd: i64) {
+    if nd < 0 or nd >= a.d.len() {
+        return
+    }
+    var i = nd - 1
+    while i >= 0 {
+        if a.d[i] < 9 {
+            a.d[i] = a.d[i] + 1
+            a.d = a.d.slice(0, i + 1)
+            return
+        }
+        i = i - 1
+    }
+    a.d = [1]
+    a.dp = a.dp + 1
+}
+
+fn round_to(inout a: GoDec, nd: i64) {
+    if should_round_up(a, nd) {
+        round_up(a, nd)
+    } else {
+        round_down(a, nd)
+    }
+}
+
+/// The float layout: mantissa bits, exponent bits, bias.
+type GoFloatInfo = { mantbits: i64, expbits: i64, bias: i64 }
+
+fn info(bit_size: i64) -> GoFloatInfo {
+    return if bit_size == 32 { GoFloatInfo{ mantbits: 23, expbits: 8, bias: 0 - 127 } } else { GoFloatInfo{ mantbits: 52, expbits: 11, bias: 0 - 1023 } }
+}
+
+fn digit_at(a: GoDec, i: i64) -> i64 {
+    return if i >= 0 and i < a.d.len() { a.d[i] } else { 0 }
+}
+
+/// roundShortest: the fewest digits that still read back as the same
+/// float, rounding the exact value where both neighbours would do.
+fn round_shortest(inout d: GoDec, mant: i64, exp: i64, flt: GoFloatInfo) {
+    if mant == 0 {
+        d.d = []
+        return
+    }
+    let minexp = flt.bias + 1
+    if exp > minexp and 332 * (d.dp - d.d.len()) >= 100 * (exp - flt.mantbits) {
+        return
+    }
+    let upper = dec_of(mant * 2 + 1, exp - flt.mantbits - 1)
+    let low_even = mant > 1.shl(flt.mantbits) or exp == minexp
+    let lower = if low_even { dec_of((mant - 1) * 2 + 1, exp - flt.mantbits - 1) } else { dec_of((mant * 2 - 1) * 2 + 1, exp - 1 - flt.mantbits - 1) }
+    let inclusive = mant % 2 == 0
+    var upperdelta = 0
+    var ui = 0
+    while true {
+        let mi = ui - upper.dp + d.dp
+        if mi >= d.d.len() {
+            break
+        }
+        let li = ui - upper.dp + lower.dp
+        let l = digit_at(lower, li)
+        let m = if mi >= 0 { d.d[mi] } else { 0 }
+        let u = if ui < upper.d.len() { upper.d[ui] } else { 0 }
+        let okdown = l != m or (inclusive and li + 1 == lower.d.len())
+        if upperdelta == 0 and m + 1 < u {
+            upperdelta = 2
+        } else if upperdelta == 0 and m != u {
+            upperdelta = 1
+        } else if upperdelta == 1 and (m != 9 or u != 0) {
+            upperdelta = 2
+        }
+        let okup = upperdelta > 0 and (inclusive or upperdelta > 1 or ui + 1 < upper.d.len())
+        if okdown and okup {
+            round_to(d, mi + 1)
+            return
+        }
+        if okdown {
+            round_down(d, mi + 1)
+            return
+        }
+        if okup {
+            round_up(d, mi + 1)
+            return
+        }
+        ui = ui + 1
+    }
+}
+
+// ---- writing
+
+fn digits_text(a: GoDec, from: i64, to: i64) -> str {
+    var out = ""
+    for i in from..to {
+        out = out + digit_at(a, i).to_str()
+    }
+    return out
+}
+
+fn fmt_e(neg: bool, d: GoDec, prec: i64, letter: str) -> str {
+    var out = (if neg { "-" } else { "" }) + (if d.d.len() != 0 { d.d[0].to_str() } else { "0" })
+    if prec > 0 {
+        out = out + "." + digits_text(d, 1, d.d.len().min(prec + 1)) + "0".repeat(0.max(prec + 1 - d.d.len().min(prec + 1).max(1)))
+    }
+    var exp = if d.d.len() == 0 { 0 } else { d.dp - 1 }
+    let sign = if exp < 0 { "-" } else { "+" }
+    exp = exp.abs()
+    return out + letter + sign + (if exp < 10 { "0" + exp.to_str() } else { exp.to_str() })
+}
+
+fn fmt_f(neg: bool, d: GoDec, prec: i64) -> str {
+    var out = if neg { "-" } else { "" }
+    if d.dp > 0 {
+        let m = d.d.len().min(d.dp)
+        out = out + digits_text(d, 0, m) + "0".repeat(d.dp - m)
+    } else {
+        out = out + "0"
+    }
+    if prec > 0 {
+        out = out + "." + digits_text(d, d.dp, d.dp + prec)
+    }
+    return out
+}
+
+fn fmt_b(neg: bool, mant: i64, exp: i64, flt: GoFloatInfo) -> str {
+    let e = exp - flt.mantbits
+    return (if neg { "-" } else { "" }) + mant.to_str() + "p" + (if e >= 0 { "+" } else { "" }) + e.to_str()
+}
+
+fn fmt_x(prec: i64, upper_case: bool, neg: bool, mant0: i64, exp0: i64, flt: GoFloatInfo) -> str {
+    var exp = if mant0 == 0 { 0 } else { exp0 }
+    var mant = mant0.shl(60 - flt.mantbits)
+    while mant != 0 and mant.bit_and(1.shl(60)) == 0 {
+        mant = mant.shl(1)
+        exp = exp - 1
+    }
+    if prec >= 0 and prec < 15 {
+        let shift = prec * 4
+        let extra = mant.shl(shift).bit_and(1.shl(60) - 1)
+        mant = mant.ushr(60 - shift)
+        if extra.bit_or(mant.bit_and(1)) > 1.shl(59) {
+            mant = mant + 1
+        }
+        mant = mant.shl(60 - shift)
+        if mant.bit_and(1.shl(61)) != 0 {
+            mant = mant.ushr(1)
+            exp = exp + 1
+        }
+    }
+    let hex = if upper_case { "0123456789ABCDEF" } else { "0123456789abcdef" }
+    var out = (if neg { "-" } else { "" }) + "0" + (if upper_case { "X" } else { "x" }) + mant.ushr(60).bit_and(1).to_str()
+    mant = mant.shl(4)
+    if prec < 0 and mant != 0 {
+        out = out + "."
+        while mant != 0 {
+            out = out + hex.substr(mant.ushr(60).bit_and(15), 1)
+            mant = mant.shl(4)
+        }
+    } else if prec > 0 {
+        out = out + "."
+        for _i in 0..prec {
+            out = out + hex.substr(mant.ushr(60).bit_and(15), 1)
+            mant = mant.shl(4)
+        }
+    }
+    out = out + (if upper_case { "P" } else { "p" }) + (if exp < 0 { "-" } else { "+" })
+    let e = exp.abs()
+    return out + (if e < 10 { "0" + e.to_str() } else { e.to_str() })
+}
+
+fn format_digits(shortest: bool, neg: bool, digs: GoDec, prec0: i64, fmt: str) -> str {
+    var prec = prec0
+    if fmt == "e" or fmt == "E" {
+        return fmt_e(neg, digs, prec, fmt)
+    }
+    if fmt == "f" {
+        return fmt_f(neg, digs, prec)
+    }
+    var eprec = prec
+    if eprec > digs.d.len() and digs.d.len() >= digs.dp {
+        eprec = digs.d.len()
+    }
+    if shortest {
+        eprec = 6
+    }
+    let exp = digs.dp - 1
+    if exp < 0 - 4 or exp >= eprec {
+        if prec > digs.d.len() {
+            prec = digs.d.len()
+        }
+        return fmt_e(neg, digs, prec - 1, if fmt == "g" { "e" } else { "E" })
+    }
+    if prec > digs.dp {
+        prec = digs.d.len()
+    }
+    return fmt_f(neg, digs, 0.max(prec - digs.dp))
+}
+
+/// The float32 nearest a float64, as its 32 bits: round half to even,
+/// overflow to infinity, NaN kept.
+pub fn float32_bits(x: f64) -> i64 {
+    let b = x.to_bits()
+    let sign = b.ushr(63).shl(31)
+    let e = b.ushr(52).bit_and(2047)
+    let m = b.bit_and(1.shl(52) - 1)
+    if e == 2047 {
+        return sign.bit_or(2139095040).bit_or(if m != 0 { 4194304 } else { 0 })
+    }
+    if e == 0 and m == 0 {
+        return sign
+    }
+    // value = full * 2^(e2), full with 53 bits (or fewer, subnormal).
+    let full = if e == 0 { m } else { m.bit_or(1.shl(52)) }
+    let e2 = (if e == 0 { 1 } else { e }) - 1075
+    // The float32 ulp exponent: 2^(top - 23), at least 2^-149.
+    var top = e2 + 52
+    if e == 0 {
+        var t = full
+        top = e2 - 1
+        while t != 0 {
+            t = t.ushr(1)
+            top = top + 1
+        }
+    }
+    let ulp = (top - 23).max(0 - 149)
+    let drop = ulp - e2
+    var q = full
+    if drop > 0 {
+        if drop >= 63 {
+            return sign
+        }
+        q = full.ushr(drop)
+        let rest = full.bit_and(1.shl(drop) - 1)
+        let half = 1.shl(drop - 1)
+        if rest > half or (rest == half and q.bit_and(1) == 1) {
+            q = q + 1
+        }
+    } else {
+        q = full.shl(0 - drop)
+    }
+    var u = ulp
+    if q >= 1.shl(24) {
+        q = q.ushr(1)
+        u = u + 1
+    }
+    if u + 23 > 127 {
+        return sign.bit_or(2139095040)
+    }
+    if q < 1.shl(23) {
+        return sign.bit_or(q)
+    }
+    return sign.bit_or((u + 23 + 127).shl(23)).bit_or(q - 1.shl(23))
+}
+
+/// The f64 holding a float32's value.
+pub fn float32_value(bits: i64) -> f64 {
+    let sign = if bits.bit_and(2147483648) != 0 { -1.0 } else { 1.0 }
+    let e = bits.ushr(23).bit_and(255)
+    let m = bits.bit_and(8388607)
+    if e == 255 {
+        return if m != 0 { 0.0 / 0.0 } else { sign / 0.0 }
+    }
+    let q = if e == 0 { m } else { m.bit_or(8388608) }
+    let p = (if e == 0 { 1 } else { e }) - 150
+    return sign * q.as_f64() * (p + 1023).shl(52).from_bits()
+}
+
+/// `FormatFloat(f, fmt, prec, bitSize)`, fmt one of `b e E f g G x X`.
+pub fn format_float(f: f64, fmt: str, prec0: i64, bit_size: i64) -> str {
+    let flt = info(bit_size)
+    let bits = if bit_size == 32 { float32_bits(f) } else { f.to_bits() }
+    let neg = bits.ushr(flt.expbits + flt.mantbits) != 0
+    var exp = bits.ushr(flt.mantbits).bit_and(1.shl(flt.expbits) - 1)
+    var mant = bits.bit_and(1.shl(flt.mantbits) - 1)
+    if exp == 1.shl(flt.expbits) - 1 {
+        return if mant != 0 { "NaN" } else if neg { "-Inf" } else { "+Inf" }
+    }
+    if exp == 0 {
+        exp = exp + 1
+    } else {
+        mant = mant.bit_or(1.shl(flt.mantbits))
+    }
+    exp = exp + flt.bias
+    if fmt == "b" {
+        return fmt_b(neg, mant, exp, flt)
+    }
+    if fmt == "x" or fmt == "X" {
+        return fmt_x(prec0, fmt == "X", neg, mant, exp, flt)
+    }
+    var prec = prec0
+    var d = dec_of(mant, exp - flt.mantbits)
+    let shortest = prec < 0
+    if shortest {
+        round_shortest(d, mant, exp, flt)
+        prec = if fmt == "e" or fmt == "E" { d.d.len() - 1 } else if fmt == "f" { 0.max(d.d.len() - d.dp) } else { d.d.len() }
+    } else if fmt == "e" or fmt == "E" {
+        round_to(d, prec + 1)
+    } else if fmt == "f" {
+        round_to(d, d.dp + prec)
+    } else {
+        if prec == 0 {
+            prec = 1
+        }
+        round_to(d, prec)
+    }
+    if not ["e", "E", "f", "g", "G"].contains(fmt) {
+        return "%" + fmt
+    }
+    return format_digits(shortest, neg, d, prec, fmt)
+}
+
+// ---- reading floats
+
+fn lower(c: i64) -> i64 {
+    return c.bit_or(32)
+}
+
+fn prefix_ignore_case(s: [i64], at: i64, word: str) -> i64 {
+    let w = word.codes()
+    var n = 0
+    while n < w.len() and at + n < s.len() and lower(s[at + n]) == w[n] {
+        n = n + 1
+    }
+    return n
+}
+
+/// `special`: `inf`, `infinity` (either with a sign) or `nan`, as a prefix.
+fn special(s: [i64]) -> Option[(f64, i64)] {
+    if s.len() == 0 {
+        return None
+    }
+    var at = 0
+    var sign = 1.0
+    if s[0] == 43 or s[0] == 45 {
+        sign = if s[0] == 45 { -1.0 } else { 1.0 }
+        at = 1
+    } else if lower(s[0]) == 110 {
+        return if prefix_ignore_case(s, 0, "nan") == 3 { Some((0.0 / 0.0, 3)) } else { None }
+    } else if lower(s[0]) != 105 {
+        return None
+    }
+    var n = prefix_ignore_case(s, at, "infinity")
+    if n > 3 and n < 8 {
+        n = 3
+    }
+    return if n == 3 or n == 8 { Some((sign / 0.0, at + n)) } else { None }
+}
+
+fn underscore_ok(s: [i64]) -> bool {
+    var saw = 94
+    var i = 0
+    var start = 0
+    if s.len() >= 1 and (s[0] == 45 or s[0] == 43) {
+        start = 1
+    }
+    var hex = false
+    i = start
+    if s.len() - start >= 2 and s[start] == 48 and [98, 111, 120].contains(lower(s[start + 1])) {
+        i = start + 2
+        saw = 48
+        hex = lower(s[start + 1]) == 120
+    }
+    while i < s.len() {
+        let c = s[i]
+        if (c >= 48 and c <= 57) or (hex and lower(c) >= 97 and lower(c) <= 102) {
+            saw = 48
+        } else if c == 95 {
+            if saw != 48 {
+                return false
+            }
+            saw = 95
+        } else {
+            if saw == 95 {
+                return false
+            }
+            saw = 33
+        }
+        i = i + 1
+    }
+    return saw != 95
+}
+
+/// What `readFloat` takes from the text: for a decimal, every digit and the
+/// point's position (0.digits * 10^dp); for hex, Go's 16-digit mantissa,
+/// binary exponent and whether digits were dropped.
+type GoFloatText = { neg: bool, hex: bool, digits: str, dp: i64, mantissa: i64, exp: i64, trunc: bool, used: i64 }
+
+/// The digits and point of a float, as readFloat scans them.
+type GoDigitScan = { nd: i64, nd_mant: i64, dp: i64, sawdot: bool, sawdigits: bool, underscores: bool }
+
+fn scan_digits(s: [i64], inout i: i64, base: i64, inout r: GoFloatText) -> GoDigitScan {
+    var sc = GoDigitScan{ nd: 0, nd_mant: 0, dp: 0, sawdot: false, sawdigits: false, underscores: false }
+    let max_digits = if base == 16 { 16 } else { 19 }
+    while i < s.len() {
+        let c = s[i]
+        let hex_letter = base == 16 and lower(c) >= 97 and lower(c) <= 102
+        if c == 95 {
+            sc.underscores = true
+        } else if c == 46 {
+            if sc.sawdot {
+                break
+            }
+            sc.sawdot = true
+            sc.dp = sc.nd
+        } else if c == 48 and sc.nd == 0 {
+            sc.sawdigits = true
+            sc.dp = sc.dp - 1
+        } else if (c >= 48 and c <= 57) or hex_letter {
+            let v = if hex_letter { lower(c) - 87 } else { c - 48 }
+            sc.sawdigits = true
+            sc.nd = sc.nd + 1
+            r.digits = r.digits + c.to_char()
+            if sc.nd_mant < max_digits {
+                r.mantissa = r.mantissa * base + v
+                sc.nd_mant = sc.nd_mant + 1
+            } else if c != 48 {
+                r.trunc = true
+            }
+        } else {
+            break
+        }
+        i = i + 1
+    }
+    return sc
+}
+
+/// The exponent after `e` or `p`: None when it is malformed. Go stops
+/// growing it at 10000.
+fn scan_exponent(s: [i64], inout i: i64, inout underscores: bool) -> Option[i64] {
+    i = i + 1
+    if i >= s.len() {
+        return None
+    }
+    var esign = 1
+    if s[i] == 43 or s[i] == 45 {
+        esign = if s[i] == 45 { 0 - 1 } else { 1 }
+        i = i + 1
+    }
+    if i >= s.len() or s[i] < 48 or s[i] > 57 {
+        return None
+    }
+    var e = 0
+    while i < s.len() and ((s[i] >= 48 and s[i] <= 57) or s[i] == 95) {
+        if s[i] == 95 {
+            underscores = true
+        } else if e < 10000 {
+            e = e * 10 + s[i] - 48
+        }
+        i = i + 1
+    }
+    return Some(e * esign)
+}
+
+fn read_float(s: [i64]) -> Option[GoFloatText] {
+    var r = GoFloatText{ neg: false, hex: false, digits: "", dp: 0, mantissa: 0, exp: 0, trunc: false, used: 0 }
+    var i = 0
+    if i >= s.len() {
+        return None
+    }
+    if s[i] == 43 or s[i] == 45 {
+        r.neg = s[i] == 45
+        i = i + 1
+    }
+    let base = if i + 2 < s.len() and s[i] == 48 and lower(s[i + 1]) == 120 { 16 } else { 10 }
+    if base == 16 {
+        i = i + 2
+        r.hex = true
+    }
+    var sc = scan_digits(s, i, base, r)
+    if not sc.sawdigits {
+        return None
+    }
+    var dp = if sc.sawdot { sc.dp } else { sc.nd }
+    var nd_mant = sc.nd_mant
+    if base == 16 {
+        dp = dp * 4
+        nd_mant = nd_mant * 4
+    }
+    var underscores = sc.underscores
+    if i < s.len() and lower(s[i]) == (if base == 16 { 112 } else { 101 }) {
+        match scan_exponent(s, i, underscores) {
+            Some(e) -> dp = dp + e
+            None -> return None
+        }
+    } else if base == 16 {
+        return None
+    }
+    if r.mantissa != 0 {
+        r.exp = dp - nd_mant
+    }
+    if underscores and not underscore_ok(s.slice(0, i)) {
+        return None
+    }
+    r.dp = dp
+    r.used = i
+    return Some(r)
+}
+
+/// atofHex: Go's rounding of a hex mantissa, two guard bits and a sticky.
+fn atof_hex(t: GoFloatText, flt: GoFloatInfo) -> (i64, bool) {
+    let max_exp = 1.shl(flt.expbits) + flt.bias - 2
+    let min_exp = flt.bias + 1
+    var mantissa = t.mantissa
+    var exp = t.exp + flt.mantbits
+    while mantissa != 0 and mantissa.ushr(flt.mantbits + 2) == 0 {
+        mantissa = mantissa.shl(1)
+        exp = exp - 1
+    }
+    if t.trunc {
+        mantissa = mantissa.bit_or(1)
+    }
+    while mantissa.ushr(1 + flt.mantbits + 2) != 0 {
+        mantissa = mantissa.ushr(1).bit_or(mantissa.bit_and(1))
+        exp = exp + 1
+    }
+    while mantissa > 1 and exp < min_exp - 2 {
+        mantissa = mantissa.ushr(1).bit_or(mantissa.bit_and(1))
+        exp = exp + 1
+    }
+    var round = mantissa.bit_and(3)
+    mantissa = mantissa.ushr(2)
+    round = round.bit_or(mantissa.bit_and(1))
+    exp = exp + 2
+    if round == 3 {
+        mantissa = mantissa + 1
+        if mantissa == 1.shl(1 + flt.mantbits) {
+            mantissa = mantissa.ushr(1)
+            exp = exp + 1
+        }
+    }
+    if mantissa.ushr(flt.mantbits) == 0 {
+        exp = flt.bias
+    }
+    var overflow = false
+    if exp > max_exp {
+        mantissa = 1.shl(flt.mantbits)
+        exp = max_exp + 1
+        overflow = true
+    }
+    var bits = mantissa.bit_and(1.shl(flt.mantbits) - 1).bit_or((exp - flt.bias).bit_and(1.shl(flt.expbits) - 1).shl(flt.mantbits))
+    if t.neg {
+        bits = bits.bit_or(1.shl(flt.mantbits + flt.expbits))
+    }
+    return (bits, overflow)
+}
+
+/// The decimal 0.digits * 10^dp rounded exactly to the nearest float of
+/// the layout: its bits, and whether it overflowed.
+fn decimal_bits(t: GoFloatText, flt: GoFloatInfo) -> (i64, bool) {
+    let sign = if t.neg { 1.shl(flt.mantbits + flt.expbits) } else { 0 }
+    let m = bigint.parse(if t.digits.len() == 0 { "0" } else { t.digits }) ?? bigint.zero()
+    if bigint.is_zero(m) or t.dp < 0 - 330 {
+        return (sign, false)
+    }
+    let inf = sign.bit_or((1.shl(flt.expbits) - 1).shl(flt.mantbits))
+    if t.dp > 310 {
+        return (inf, true)
+    }
+    let e10 = t.dp - t.digits.len()
+    let num = if e10 >= 0 { bigint.mul(m, bigint.pow(bigint.from_i64(10), e10)) } else { m }
+    let den = if e10 >= 0 { bigint.from_i64(1) } else { bigint.pow(bigint.from_i64(10), 0 - e10) }
+    let min_b = flt.bias + 1 - flt.mantbits
+    var b = (bigint.bit_length(num) - bigint.bit_length(den) - flt.mantbits - 1).max(min_b)
+    var qr = scaled_divide(num, den, b)
+    while bigint.compare(qr.0, bigint.pow(bigint.from_i64(2), flt.mantbits + 1)) >= 0 {
+        b = b + 1
+        qr = scaled_divide(num, den, b)
+    }
+    while b > min_b and bigint.compare(qr.0, bigint.pow(bigint.from_i64(2), flt.mantbits)) < 0 {
+        b = b - 1
+        qr = scaled_divide(num, den, b)
+    }
+    var q = bigint.to_i64(qr.0) ?? 0
+    let twice = bigint.compare(bigint.add(qr.1, qr.1), qr.2)
+    if twice > 0 or (twice == 0 and q % 2 == 1) {
+        q = q + 1
+    }
+    if q == 1.shl(flt.mantbits + 1) {
+        q = q.ushr(1)
+        b = b + 1
+    }
+    if b + flt.mantbits > 0 - flt.bias {
+        return (inf, true)
+    }
+    if q < 1.shl(flt.mantbits) {
+        return (sign.bit_or(q), false)
+    }
+    let field = b + flt.mantbits - flt.bias
+    return (sign.bit_or(field.shl(flt.mantbits)).bit_or(q - 1.shl(flt.mantbits)), false)
+}
+
+/// num / den / 2^b: quotient, remainder and divisor.
+fn scaled_divide(num: BigInt, den: BigInt, b: i64) -> (BigInt, BigInt, BigInt) {
+    let n = if b < 0 { bigint.mul(num, bigint.pow(bigint.from_i64(2), 0 - b)) } else { num }
+    let d = if b > 0 { bigint.mul(den, bigint.pow(bigint.from_i64(2), b)) } else { den }
+    let (q, r) = bigint.divmod(n, d) ?? (bigint.zero(), bigint.zero())
+    return (q, r, d)
+}
+
+fn bits_value(bits: i64, bit_size: i64) -> f64 {
+    return if bit_size == 32 { float32_value(bits) } else { bits.from_bits() }
+}
+
+/// `ParseFloat(s, bitSize)`: the value and, when there is one, the error.
+/// Out of range gives an infinity along with the error, as Go does.
+pub fn parse_float(text: str, bit_size: i64) -> (f64, Option[GoNumError]) {
+    let s = text.to_bytes().to_list()
+    let syntax = (0.0, Some(GoNumError{ func_name: "ParseFloat", num: text, err: "invalid syntax" }))
+    let flt = info(bit_size)
+    match special(s) {
+        Some(sp) -> {
+            if sp.1 != s.len() {
+                return syntax
+            }
+            // Go's NaN is 0x7FF8000000000001; through float32 the low bit
+            // is lost.
+            if sp.0.is_nan() {
+                return ((if bit_size == 32 { 9221120237041090560 } else { 9221120237041090561 }).from_bits(), None)
+            }
+            return (sp.0, None)
+        }
+        None -> {}
+    }
+    let t = match read_float(s) {
+        Some(t) -> t
+        None -> return syntax
+    }
+    if t.used != s.len() {
+        return syntax
+    }
+    let (bits, overflow) = if t.hex { atof_hex(t, flt) } else { decimal_bits(t, flt) }
+    let v = bits_value(bits, bit_size)
+    return (v, if overflow { Some(GoNumError{ func_name: "ParseFloat", num: text, err: "value out of range" }) } else { None })
+}
+
+// ---- integers; a uint64 is held in an i64's bits
+
+fn ult(a: i64, b: i64) -> bool {
+    return a.bit_xor(1.shl(63)) < b.bit_xor(1.shl(63))
+}
+
+/// Unsigned division by a small positive divisor.
+fn udiv(a: i64, d: i64) -> i64 {
+    if a >= 0 {
+        return a / d
+    }
+    let q = a.ushr(1) / d * 2
+    let r = a - q * d
+    return if ult(r, d) { q } else { q + 1 }
+}
+
+fn num_error(f: str, s: str, e: str) -> Option[GoNumError] {
+    return Some(GoNumError{ func_name: f, num: s, err: e })
+}
+
+/// `ParseUint(s, base, bitSize)`.
+pub fn parse_uint(text: str, base0: i64, bit_size0: i64) -> (i64, Option[GoNumError]) {
+    let f = "ParseUint"
+    if text.len() == 0 {
+        return (0, num_error(f, text, "invalid syntax"))
+    }
+    var s = text.to_bytes().to_list()
+    var base = base0
+    if base == 0 {
+        base = 10
+        if s[0] == 48 {
+            if s.len() >= 3 and [98, 111, 120].contains(lower(s[1])) {
+                base = if lower(s[1]) == 98 { 2 } else if lower(s[1]) == 111 { 8 } else { 16 }
+                s = s.slice(2, s.len())
+            } else {
+                base = 8
+                s = s.slice(1, s.len())
+            }
+        }
+    } else if base < 2 or base > 36 {
+        return (0, num_error(f, text, "invalid base " + base0.to_str()))
+    }
+    var bit_size = bit_size0
+    if bit_size == 0 {
+        bit_size = 64
+    } else if bit_size < 0 or bit_size > 64 {
+        return (0, num_error(f, text, "invalid bit size " + bit_size0.to_str()))
+    }
+    let cutoff = udiv(0 - 1, base) + 1
+    let max_val = if bit_size == 64 { 0 - 1 } else { 1.shl(bit_size) - 1 }
+    var underscores = false
+    var n = 0
+    for c in s {
+        var d = 0
+        if c == 95 and base0 == 0 {
+            underscores = true
+            continue
+        } else if c >= 48 and c <= 57 {
+            d = c - 48
+        } else if lower(c) >= 97 and lower(c) <= 122 {
+            d = lower(c) - 87
+        } else {
+            return (0, num_error(f, text, "invalid syntax"))
+        }
+        if d >= base {
+            return (0, num_error(f, text, "invalid syntax"))
+        }
+        if not ult(n, cutoff) {
+            return (max_val, num_error(f, text, "value out of range"))
+        }
+        n = n * base
+        let n1 = n + d
+        if ult(n1, n) or ult(max_val, n1) {
+            return (max_val, num_error(f, text, "value out of range"))
+        }
+        n = n1
+    }
+    if underscores and not underscore_ok(text.to_bytes().to_list()) {
+        return (0, num_error(f, text, "invalid syntax"))
+    }
+    return (n, None)
+}
+
+/// `ParseInt(s, base, bitSize)`.
+pub fn parse_int(text: str, base: i64, bit_size0: i64) -> (i64, Option[GoNumError]) {
+    let f = "ParseInt"
+    if text.len() == 0 {
+        return (0, num_error(f, text, "invalid syntax"))
+    }
+    var s = text
+    var neg = false
+    if s.starts_with("+") or s.starts_with("-") {
+        neg = s.starts_with("-")
+        s = s.substr(1, s.len() - 1)
+    }
+    let (un, err) = parse_uint(s, base, bit_size0)
+    match err {
+        Some(e) -> if e.err != "value out of range" {
+            return (0, Some(GoNumError{ func_name: f, num: text, err: e.err }))
+        }
+        None -> {}
+    }
+    let bit_size = if bit_size0 == 0 { 64 } else { bit_size0 }
+    let cutoff = 1.shl(bit_size - 1)
+    if not neg and not ult(un, cutoff) {
+        return (cutoff - 1, num_error(f, text, "value out of range"))
+    }
+    if neg and ult(cutoff, un) {
+        return (0 - cutoff, num_error(f, text, "value out of range"))
+    }
+    return (if neg { 0 - un } else { un }, None)
+}
+
+/// `Atoi(s)`: ParseInt in base 10, reported as Atoi.
+pub fn atoi(text: str) -> (i64, Option[GoNumError]) {
+    let (v, err) = parse_int(text, 10, 0)
+    return match err {
+        Some(e) -> (v, Some(GoNumError{ func_name: "Atoi", num: e.num, err: e.err }))
+        None -> (v, None)
+    }
+}
+
+/// `ParseBool(s)`.
+pub fn parse_bool(text: str) -> (bool, Option[GoNumError]) {
+    if ["1", "t", "T", "TRUE", "true", "True"].contains(text) {
+        return (true, None)
+    }
+    if ["0", "f", "F", "FALSE", "false", "False"].contains(text) {
+        return (false, None)
+    }
+    return (false, num_error("ParseBool", text, "invalid syntax"))
+}
+
+/// `FormatUint(bits, base)`, the i64's bits read as unsigned.
+pub fn format_uint(v: i64, base: i64) -> str {
+    let digits = "0123456789abcdefghijklmnopqrstuvwxyz"
+    if v == 0 {
+        return "0"
+    }
+    var out = ""
+    var n = v
+    while n != 0 {
+        let q = udiv(n, base)
+        out = digits.substr(n - q * base, 1) + out
+        n = q
+    }
+    return out
+}
+
+/// `FormatInt(v, base)`.
+pub fn format_int(v: i64, base: i64) -> str {
+    return if v < 0 { "-" + format_uint(0 - v, base) } else { format_uint(v, base) }
+}
+
+pub fn format_bool(b: bool) -> str {
+    return if b { "true" } else { "false" }
+}

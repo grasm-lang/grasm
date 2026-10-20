@@ -1,0 +1,32 @@
+[package]
+name = "b47test"
+version = "1.0.0"
+capabilities = ["io"]
+
+[dependencies.httpcachesem]
+path = "../httpcachesem"
+version = "^1.0.0"
+
+[dependencies.unicodeblock]
+path = "../unicodeblock"
+version = "^1.0.0"
+
+[dependencies.hangul]
+path = "../hangul"
+version = "^1.0.0"
+
+[dependencies.lz4frame]
+path = "../lz4frame"
+version = "^1.0.0"
+
+[dependencies.pprof]
+path = "../pprof"
+version = "^1.0.0"
+
+[dependencies.digestauth]
+path = "../digestauth"
+version = "^1.0.0"
+
+[dependencies.gobwire]
+path = "../gobwire"
+version = "^1.0.0"

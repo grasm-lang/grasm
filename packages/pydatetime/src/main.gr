@@ -1,0 +1,998 @@
+// Python's `datetime` as CPython 3.13's C module computes it: `date`,
+// `time`, `datetime` with fixed-offset `timezone`s, and `timedelta`, with
+// Python's error messages.
+//
+// Python is where a great many timestamps are written and read, and a tool
+// that shares them needs Python's exact behaviour, which is particular:
+//
+//   - `fromisoformat` takes the extended forms 3.11 added (`20210101`,
+//     `2021-W01-1`, `T12`, `12:30:45,5`, offsets with seconds and
+//     fractions), any single character between date and time, and refuses
+//     the rest with `Invalid isoformat string: '...'`, the string as
+//     `repr` writes it.
+//   - A `timedelta` is days, seconds and microseconds normalised so that
+//     only days are negative: `-timedelta(seconds=1)` prints as
+//     `-1 day, 23:59:59`. Its arithmetic is exact (multiplying, dividing
+//     with round-half-even, `//` and `%` floored), and it overflows past
+//     999999999 days with Python's message.
+//   - `date + timedelta` uses only the days; `datetime` arithmetic keeps
+//     the offset of the left operand, and subtracting aware datetimes
+//     corrects for their offsets.
+//   - `fromtimestamp` rounds to the microsecond half to even, as Python
+//     does, and `timestamp()` is a correctly rounded float.
+//
+// Not modelled: local time (`now`, naive `fromtimestamp` and
+// `timestamp`), `strftime`/`strptime`, which follow the C library, and
+// `tzinfo` classes other than fixed offsets. `timestamp` takes a naive
+// datetime as UTC, where Python would use the local zone.
+
+import bigint
+
+type PyTimedelta = { days: i64, seconds: i64, microseconds: i64 }
+
+type PyDate = { year: i64, month: i64, day: i64 }
+
+/// A time of day, with its UTC offset when it is aware.
+type PyTime = { hour: i64, minute: i64, second: i64, microsecond: i64, offset: Option[PyTimedelta] }
+
+type PyDatetime = { date: PyDate, time: PyTime }
+
+/// Python's exception, by class, with its message.
+type DtError =
+    | DtValueError(msg: str)
+    | DtOverflowError(msg: str)
+    | DtZeroDivisionError(msg: str)
+    | DtTypeError(msg: str)
+
+/// `str(e)`.
+pub fn error_text(e: DtError) -> str {
+    return match e {
+        DtValueError(m) -> m
+        DtOverflowError(m) -> m
+        DtZeroDivisionError(m) -> m
+        DtTypeError(m) -> m
+    }
+}
+
+/// The exception's class name.
+pub fn error_class(e: DtError) -> str {
+    return match e {
+        DtValueError(_m) -> "ValueError"
+        DtOverflowError(_m) -> "OverflowError"
+        DtZeroDivisionError(_m) -> "ZeroDivisionError"
+        DtTypeError(_m) -> "TypeError"
+    }
+}
+
+// ---- integers, floored as Python floors them
+
+fn fdiv(a: i64, b: i64) -> i64 {
+    let q = a / b
+    return if (a % b != 0) and ((a < 0) != (b < 0)) { q - 1 } else { q }
+}
+
+fn fmod(a: i64, b: i64) -> i64 {
+    return a - b * fdiv(a, b)
+}
+
+fn big(n: i64) -> BigInt {
+    return bigint.from_i64(n)
+}
+
+/// divmod on BigInts, floored.
+fn big_divmod(a: BigInt, b: BigInt) -> (BigInt, BigInt) {
+    let (q, r) = bigint.divmod(a, b) ?? (bigint.zero(), bigint.zero())
+    if not bigint.is_zero(r) and bigint.sign(r) != bigint.sign(b) {
+        return (bigint.sub(q, big(1)), bigint.add(r, b))
+    }
+    return (q, r)
+}
+
+fn pad(n: i64, width: i64) -> str {
+    let t = n.abs().to_str()
+    let z = if t.len() < width { "0".repeat(width - t.len()) + t } else { t }
+    return if n < 0 { "-" + z } else { z }
+}
+
+// ---- the proleptic Gregorian calendar
+
+fn is_leap(y: i64) -> bool {
+    return fmod(y, 4) == 0 and (fmod(y, 100) != 0 or fmod(y, 400) == 0)
+}
+
+fn days_in_month(y: i64, m: i64) -> i64 {
+    if m == 2 and is_leap(y) {
+        return 29
+    }
+    return [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][m - 1]
+}
+
+fn days_before_year(y: i64) -> i64 {
+    let p = y - 1
+    return p * 365 + fdiv(p, 4) - fdiv(p, 100) + fdiv(p, 400)
+}
+
+fn days_before_month(y: i64, m: i64) -> i64 {
+    let before = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334][m - 1]
+    return before + if m > 2 and is_leap(y) { 1 } else { 0 }
+}
+
+fn ymd_to_ord(y: i64, m: i64, d: i64) -> i64 {
+    return days_before_year(y) + days_before_month(y, m) + d
+}
+
+/// The date of an ordinal, day 1 being 0001-01-01; any ordinal, so that a
+/// year out of range can be named.
+fn ord_to_ymd(ordinal: i64) -> PyDate {
+    var n = ordinal - 1
+    let n400 = fdiv(n, 146097)
+    n = fmod(n, 146097)
+    var year = n400 * 400 + 1
+    let n100 = n / 36524
+    n = n % 36524
+    let n4 = n / 1461
+    n = n % 1461
+    let n1 = n / 365
+    n = n % 365
+    year = year + n100 * 100 + n4 * 4 + n1
+    if n1 == 4 or n100 == 4 {
+        return PyDate{ year: year - 1, month: 12, day: 31 }
+    }
+    let leap = n1 == 3 and (n4 != 24 or n100 == 3)
+    var month = (n + 50).shr(5)
+    let before = [0, 0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334]
+    var preceding = before[month] + if month > 2 and leap { 1 } else { 0 }
+    if preceding > n {
+        month = month - 1
+        preceding = before[month] + if month > 2 and leap { 1 } else { 0 }
+    }
+    return PyDate{ year: year, month: month, day: n - preceding + 1 }
+}
+
+fn max_ordinal() -> i64 {
+    return 3652059
+}
+
+// ---- timedelta
+
+fn us_per_day() -> i64 {
+    return 86400000000
+}
+
+fn c_int_min() -> i64 {
+    return 0 - 2147483648
+}
+
+fn check_days(days: i64) -> () ! DtError {
+    if days < 0 - 999999999 or days > 999999999 {
+        fail(DtOverflowError("days=" + days.to_str() + "; must have magnitude <= 999999999"))
+    }
+    return ()
+}
+
+/// microseconds_to_delta: a total number of microseconds as a timedelta.
+fn from_microseconds(total: BigInt) -> PyTimedelta ! DtError {
+    let (secs, us) = big_divmod(total, big(1000000))
+    let (days, s) = big_divmod(secs, big(86400))
+    let d = bigint.to_i64(days) ?? c_int_min() - 1
+    if d < c_int_min() or d > 2147483647 {
+        fail(DtOverflowError("Python int too large to convert to C int"))
+    }
+    try check_days(d)
+    return PyTimedelta{ days: d, seconds: bigint.to_i64(s) ?? 0, microseconds: bigint.to_i64(us) ?? 0 }
+}
+
+/// new_delta with normalising: components that may be out of range.
+fn normalized(days: i64, seconds: i64, microseconds: i64) -> PyTimedelta ! DtError {
+    let s = seconds + fdiv(microseconds, 1000000)
+    let us = fmod(microseconds, 1000000)
+    let d = days + fdiv(s, 86400)
+    try check_days(d)
+    return PyTimedelta{ days: d, seconds: fmod(s, 86400), microseconds: us }
+}
+
+/// `timedelta(weeks=, days=, hours=, minutes=, seconds=, milliseconds=,
+/// microseconds=)` with integer arguments.
+pub fn timedelta(weeks: i64, days: i64, hours: i64, minutes: i64, seconds: i64, milliseconds: i64, microseconds: i64) -> PyTimedelta ! DtError {
+    let parts = [weeks, days, hours, minutes, seconds, milliseconds, microseconds]
+    let factors = [604800000000, us_per_day(), 3600000000, 60000000, 1000000, 1000, 1]
+    var total = bigint.zero()
+    for k in 0..7 {
+        total = bigint.add(total, bigint.mul(big(parts[k]), big(factors[k])))
+    }
+    return try from_microseconds(total)
+}
+
+/// The total as microseconds.
+pub fn to_microseconds(t: PyTimedelta) -> BigInt {
+    return bigint.add(bigint.mul(big(t.days), big(us_per_day())), big(t.seconds * 1000000 + t.microseconds))
+}
+
+pub fn td_add(a: PyTimedelta, b: PyTimedelta) -> PyTimedelta ! DtError {
+    return try normalized(a.days + b.days, a.seconds + b.seconds, a.microseconds + b.microseconds)
+}
+
+pub fn td_sub(a: PyTimedelta, b: PyTimedelta) -> PyTimedelta ! DtError {
+    return try normalized(a.days - b.days, a.seconds - b.seconds, a.microseconds - b.microseconds)
+}
+
+/// `-t`, which overflows for `-timedelta.max`.
+pub fn td_neg(t: PyTimedelta) -> PyTimedelta ! DtError {
+    return try normalized(0 - t.days, 0 - t.seconds, 0 - t.microseconds)
+}
+
+pub fn td_abs(t: PyTimedelta) -> PyTimedelta ! DtError {
+    if t.days < 0 {
+        return try td_neg(t)
+    }
+    return t
+}
+
+/// `t * n`.
+pub fn td_mul(t: PyTimedelta, n: i64) -> PyTimedelta ! DtError {
+    return try from_microseconds(bigint.mul(to_microseconds(t), big(n)))
+}
+
+/// `t // n`, floored.
+pub fn td_floordiv_int(t: PyTimedelta, n: i64) -> PyTimedelta ! DtError {
+    if n == 0 {
+        fail(DtZeroDivisionError("integer division or modulo by zero"))
+    }
+    let (q, _r) = big_divmod(to_microseconds(t), big(n))
+    return try from_microseconds(q)
+}
+
+/// `t / n`: to the nearest microsecond, ties to even.
+pub fn td_truediv_int(t: PyTimedelta, n: i64) -> PyTimedelta ! DtError {
+    if n == 0 {
+        fail(DtZeroDivisionError("integer division or modulo by zero"))
+    }
+    return try from_microseconds(divide_nearest(to_microseconds(t), big(n)))
+}
+
+fn divide_nearest(a: BigInt, b: BigInt) -> BigInt {
+    let (q, r) = big_divmod(a, b)
+    let twice = bigint.add(r, r)
+    let c = bigint.compare(twice, b)
+    let over = if bigint.sign(b) > 0 { c > 0 } else { c < 0 }
+    let odd = not bigint.is_zero(bigint.rem(q, big(2)) ?? bigint.zero())
+    if over or (c == 0 and odd) {
+        return bigint.add(q, big(1))
+    }
+    return q
+}
+
+fn is_zero_td(t: PyTimedelta) -> bool {
+    return t.days == 0 and t.seconds == 0 and t.microseconds == 0
+}
+
+/// `a // b`, an integer.
+pub fn td_floordiv(a: PyTimedelta, b: PyTimedelta) -> BigInt ! DtError {
+    if is_zero_td(b) {
+        fail(DtZeroDivisionError("integer division or modulo by zero"))
+    }
+    let (q, _r) = big_divmod(to_microseconds(a), to_microseconds(b))
+    return q
+}
+
+/// `a % b`.
+pub fn td_mod(a: PyTimedelta, b: PyTimedelta) -> PyTimedelta ! DtError {
+    if is_zero_td(b) {
+        fail(DtZeroDivisionError("integer modulo by zero"))
+    }
+    let (_q, r) = big_divmod(to_microseconds(a), to_microseconds(b))
+    return try from_microseconds(r)
+}
+
+/// `a / b`, a float.
+pub fn td_truediv(a: PyTimedelta, b: PyTimedelta) -> f64 ! DtError {
+    if is_zero_td(b) {
+        fail(DtZeroDivisionError("division by zero"))
+    }
+    return ratio(to_microseconds(a), to_microseconds(b))
+}
+
+/// `t.total_seconds()`.
+pub fn total_seconds(t: PyTimedelta) -> f64 {
+    return ratio(to_microseconds(t), big(1000000))
+}
+
+/// n / d correctly rounded, as Python's int true division gives it; the
+/// quotients here are far from the subnormal range.
+fn ratio(n: BigInt, d: BigInt) -> f64 {
+    if bigint.is_zero(n) {
+        // Zero takes the divisor's sign, as Python's int division gives it.
+        return if bigint.sign(d) < 0 { 0.0 * -1.0 } else { 0.0 }
+    }
+    let negative = bigint.sign(n) != bigint.sign(d)
+    let a = if bigint.sign(n) < 0 { bigint.negate(n) } else { n }
+    let b = if bigint.sign(d) < 0 { bigint.negate(d) } else { d }
+    // Scale so that the quotient has 55 or 56 bits.
+    let k = bigint.bit_length(a) - bigint.bit_length(b) - 55
+    let (q0, r) = if k >= 0 { bigint.divmod(a, bigint.mul(b, bigint.pow(big(2), k))) ?? (bigint.zero(), bigint.zero()) } else {
+        bigint.divmod(bigint.mul(a, bigint.pow(big(2), 0 - k)), b) ?? (bigint.zero(), bigint.zero())
+    }
+    var q = bigint.to_i64(q0) ?? 0
+    // Down to 53 bits, ties to even, the remainder deciding a tie.
+    var shift = 0
+    while q.shr(shift) >= 9007199254740992 {
+        shift = shift + 1
+    }
+    let drop = q.bit_and(1.shl(shift) - 1)
+    let half = 1.shl(shift - 1)
+    q = q.shr(shift)
+    var e = k + shift
+    if drop > half or (drop == half and (not bigint.is_zero(r) or q % 2 == 1)) {
+        q = q + 1
+        if q == 9007199254740992 {
+            q = q / 2
+            e = e + 1
+        }
+    }
+    return if negative { 0.0 - scale(q, e) } else { scale(q, e) }
+}
+
+fn scale(m: i64, e: i64) -> f64 {
+    var v = m.as_f64()
+    if e >= 0 {
+        for _k in 0..e {
+            v = v * 2.0
+        }
+    } else {
+        for _k in 0..(0 - e) {
+            v = v * 0.5
+        }
+    }
+    return v
+}
+
+/// `str(t)`: `-1 day, 23:59:59.500000`.
+pub fn td_str(t: PyTimedelta) -> str {
+    let hms = (t.seconds / 3600).to_str() + ":" + pad(t.seconds / 60 % 60, 2) + ":" + pad(t.seconds % 60, 2) + if t.microseconds != 0 {
+        "." + pad(t.microseconds, 6)
+    } else { "" }
+    if t.days == 0 {
+        return hms
+    }
+    return t.days.to_str() + " day" + (if t.days == 1 or t.days == 0 - 1 { "" } else { "s" }) + ", " + hms
+}
+
+/// `repr(t)`: `datetime.timedelta(days=-1, seconds=86399)`.
+pub fn td_repr(t: PyTimedelta) -> str {
+    var parts: [str] = []
+    if t.days != 0 {
+        parts.push("days=" + t.days.to_str())
+    }
+    if t.seconds != 0 {
+        parts.push("seconds=" + t.seconds.to_str())
+    }
+    if t.microseconds != 0 {
+        parts.push("microseconds=" + t.microseconds.to_str())
+    }
+    return "datetime.timedelta(" + (if parts.len() == 0 { "0" } else { parts.join(", ") }) + ")"
+}
+
+/// -1, 0 or 1.
+pub fn td_compare(a: PyTimedelta, b: PyTimedelta) -> i64 {
+    let x = [a.days, a.seconds, a.microseconds]
+    let y = [b.days, b.seconds, b.microseconds]
+    for k in 0..3 {
+        if x[k] != y[k] {
+            return if x[k] < y[k] { 0 - 1 } else { 1 }
+        }
+    }
+    return 0
+}
+
+// ---- date
+
+fn check_date(y: i64, m: i64, d: i64) -> PyDate ! DtError {
+    if y < 1 or y > 9999 {
+        fail(DtValueError("year " + y.to_str() + " is out of range"))
+    }
+    if m < 1 or m > 12 {
+        fail(DtValueError("month must be in 1..12"))
+    }
+    if d < 1 or d > days_in_month(y, m) {
+        fail(DtValueError("day is out of range for month"))
+    }
+    return PyDate{ year: y, month: m, day: d }
+}
+
+/// `date(year, month, day)`.
+pub fn date(year: i64, month: i64, day: i64) -> PyDate ! DtError {
+    return try check_date(year, month, day)
+}
+
+pub fn toordinal(d: PyDate) -> i64 {
+    return ymd_to_ord(d.year, d.month, d.day)
+}
+
+/// `date.fromordinal(n)`.
+pub fn fromordinal(n: i64) -> PyDate ! DtError {
+    if n < 1 {
+        fail(DtValueError("ordinal must be >= 1"))
+    }
+    let d = ord_to_ymd(n)
+    return try check_date(d.year, d.month, d.day)
+}
+
+/// Monday is 0.
+pub fn weekday(d: PyDate) -> i64 {
+    return (toordinal(d) + 6) % 7
+}
+
+/// Monday is 1.
+pub fn isoweekday(d: PyDate) -> i64 {
+    return weekday(d) + 1
+}
+
+fn iso_week1_monday(y: i64) -> i64 {
+    let first = ymd_to_ord(y, 1, 1)
+    let wd = (first + 6) % 7
+    return first - wd + if wd > 3 { 7 } else { 0 }
+}
+
+/// `d.isocalendar()`: ISO year, week and weekday.
+pub fn isocalendar(d: PyDate) -> (i64, i64, i64) {
+    var year = d.year
+    var week1 = iso_week1_monday(year)
+    let today = toordinal(d)
+    var week = fdiv(today - week1, 7)
+    let day = fmod(today - week1, 7)
+    if week < 0 {
+        year = year - 1
+        week1 = iso_week1_monday(year)
+        week = fdiv(today - week1, 7)
+    } else if week >= 52 and today >= iso_week1_monday(year + 1) {
+        year = year + 1
+        week = 0
+    }
+    return (year, week + 1, day + 1)
+}
+
+/// iso_to_ymd: 0, or -4 for the year, -2 for the week, -3 for the day.
+fn iso_to_ymd(y: i64, w: i64, d: i64) -> (i64, PyDate) {
+    let none = PyDate{ year: 0, month: 0, day: 0 }
+    if y < 1 or y > 9999 {
+        return (0 - 4, none)
+    }
+    if w <= 0 or w >= 53 {
+        var out = true
+        if w == 53 {
+            let first = (ymd_to_ord(y, 1, 1) + 6) % 7
+            if first == 3 or (first == 2 and is_leap(y)) {
+                out = false
+            }
+        }
+        if out {
+            return (0 - 2, none)
+        }
+    }
+    if d <= 0 or d >= 8 {
+        return (0 - 3, none)
+    }
+    return (0, ord_to_ymd(iso_week1_monday(y) + (w - 1) * 7 + d - 1))
+}
+
+/// `date.fromisocalendar(year, week, day)`.
+pub fn fromisocalendar(year: i64, week: i64, day: i64) -> PyDate ! DtError {
+    let (rv, d) = iso_to_ymd(year, week, day)
+    if rv == 0 - 4 {
+        fail(DtValueError("Year is out of range: " + year.to_str()))
+    }
+    if rv == 0 - 2 {
+        fail(DtValueError("Invalid week: " + week.to_str()))
+    }
+    if rv == 0 - 3 {
+        fail(DtValueError("Invalid day: " + day.to_str() + " (range is [1, 7])"))
+    }
+    return try check_date(d.year, d.month, d.day)
+}
+
+/// `d.isoformat()`.
+pub fn date_isoformat(d: PyDate) -> str {
+    return pad(d.year, 4) + "-" + pad(d.month, 2) + "-" + pad(d.day, 2)
+}
+
+fn ctime_of(d: PyDate, h: i64, mi: i64, s: i64) -> str {
+    let days = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+    let months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+    let dd = if d.day < 10 { " " + d.day.to_str() } else { d.day.to_str() }
+    return days[weekday(d)] + " " + months[d.month - 1] + " " + dd + " " + pad(h, 2) + ":" + pad(mi, 2) + ":" + pad(s, 2) + " " + pad(d.year, 4)
+}
+
+/// `d.ctime()`: `Mon Jan  1 00:00:00 2001`.
+pub fn date_ctime(d: PyDate) -> str {
+    return ctime_of(d, 0, 0, 0)
+}
+
+fn date_from_ordinal_checked(ordinal: i64) -> PyDate ! DtError {
+    if ordinal < 1 or ordinal > max_ordinal() {
+        fail(DtOverflowError("date value out of range"))
+    }
+    return ord_to_ymd(ordinal)
+}
+
+/// `d + t`, which uses only `t.days`.
+pub fn date_add(d: PyDate, t: PyTimedelta) -> PyDate ! DtError {
+    return try date_from_ordinal_checked(toordinal(d) + t.days)
+}
+
+/// `d - t`.
+pub fn date_sub(d: PyDate, t: PyTimedelta) -> PyDate ! DtError {
+    return try date_from_ordinal_checked(toordinal(d) - t.days)
+}
+
+/// `a - b`.
+pub fn date_diff(a: PyDate, b: PyDate) -> PyTimedelta {
+    return PyTimedelta{ days: toordinal(a) - toordinal(b), seconds: 0, microseconds: 0 }
+}
+
+// ---- repr of a string, for error messages
+
+fn printable(c: i64) -> bool {
+    if c < 32 or (c >= 127 and c <= 160) or c == 173 {
+        return false
+    }
+    // The separators and format characters a timestamp might meet.
+    return not ((c >= 55296 and c <= 57343) or c == 5760 or (c >= 8192 and c <= 8207) or (c >= 8232 and c <= 8239) or (c >= 8287 and c <= 8303) or
+        c == 12288 or c == 65279 or (c >= 65529 and c <= 65531))
+}
+
+fn hexn(n: i64, width: i64) -> str {
+    let digits = "0123456789abcdef"
+    var out = ""
+    for k in 0..width {
+        out = out + digits.substr(n.shr(4 * (width - 1 - k)).bit_and(15), 1)
+    }
+    return out
+}
+
+/// `repr(text)` for the characters a timestamp string is made of.
+pub fn py_repr(cs: [i64]) -> str {
+    let quote = if cs.contains(39) and not cs.contains(34) { 34 } else { 39 }
+    var out = quote.to_char()
+    for c in cs {
+        out = out + if c == quote or c == 92 { "\\" + c.to_char() } else if c == 9 { "\\t" } else if c == 10 { "\\n" } else if c == 13 {
+            "\\r"
+        } else if printable(c) { c.to_char() } else if c < 256 { "\\x" + hexn(c, 2) } else if c < 65536 { "\\u" + hexn(c, 4) } else {
+            "\\U" + hexn(c, 8)
+        }
+    }
+    return out + quote.to_char()
+}
+
+// ---- ISO 8601 parsing, as the C module does it: over the UTF-8 bytes,
+// which end in a NUL that the parsers may read past a part's length
+
+fn at(buf: [i64], i: i64) -> i64 {
+    return if i >= 0 and i < buf.len() { buf[i] } else { 0 }
+}
+
+/// parse_digits: `n` digits from `p`, or -1 as the new position.
+fn digits(buf: [i64], p: i64, n: i64) -> (i64, i64) {
+    var v = 0
+    for k in 0..n {
+        let c = at(buf, p + k)
+        if c < 48 or c > 57 {
+            return (0, 0 - 1)
+        }
+        v = v * 10 + c - 48
+    }
+    return (v, p + n)
+}
+
+/// parse_isoformat_date: 0 and the fields, or a negative code.
+fn parse_date(buf: [i64], len: i64) -> (i64, PyDate) {
+    let none = PyDate{ year: 0, month: 0, day: 0 }
+    let (y, p0) = digits(buf, 0, 4)
+    if p0 < 0 {
+        return (0 - 1, none)
+    }
+    let sep = at(buf, p0) == 45
+    var p = p0 + if sep { 1 } else { 0 }
+    if at(buf, p) == 87 {
+        let (w, p1) = digits(buf, p + 1, 2)
+        if p1 < 0 {
+            return (0 - 3, none)
+        }
+        p = p1
+        var d = 1
+        if p < len {
+            if sep {
+                let c = at(buf, p)
+                p = p + 1
+                if c != 45 {
+                    return (0 - 2, none)
+                }
+            }
+            let (dd, p2) = digits(buf, p, 1)
+            if p2 < 0 {
+                return (0 - 4, none)
+            }
+            d = dd
+        }
+        let (rv, date) = iso_to_ymd(y, w, d)
+        return (if rv == 0 { 0 } else { rv - 3 }, date)
+    }
+    let (m, p1) = digits(buf, p, 2)
+    if p1 < 0 {
+        return (0 - 1, none)
+    }
+    p = p1
+    if sep {
+        let c = at(buf, p)
+        p = p + 1
+        if c != 45 {
+            return (0 - 2, none)
+        }
+    }
+    let (d, p2) = digits(buf, p, 2)
+    if p2 < 0 {
+        return (0 - 1, none)
+    }
+    return (0, PyDate{ year: y, month: m, day: d })
+}
+
+/// parse_hh_mm_ss_ff between `p` and `p_end`: the return code (1 when
+/// something follows) and hour, minute, second, microsecond.
+fn parse_hms(buf: [i64], p0: i64, p_end: i64) -> (i64, [i64]) {
+    var vals = [0, 0, 0, 0]
+    var p = p0
+    var has_sep = true
+    for i in 0..3 {
+        let (v, p1) = digits(buf, p, 2)
+        if p1 < 0 {
+            return (0 - 3, vals)
+        }
+        vals[i] = v
+        let c = at(buf, p1)
+        p = p1 + 1
+        if i == 0 {
+            has_sep = c == 58
+        }
+        if p >= p_end {
+            return (if c != 0 { 1 } else { 0 }, vals)
+        } else if has_sep and c == 58 {
+            continue
+        } else if c == 46 or c == 44 {
+            break
+        } else if not has_sep {
+            p = p - 1
+        } else {
+            return (0 - 4, vals)
+        }
+    }
+    let to_parse = if p_end - p >= 6 { 6 } else { p_end - p }
+    let (us, p2) = digits(buf, p, to_parse)
+    if p2 < 0 {
+        return (0 - 3, vals)
+    }
+    vals[3] = if to_parse < 6 { us * [100000, 10000, 1000, 100, 10][to_parse - 1] } else { us }
+    p = p2
+    while at(buf, p) >= 48 and at(buf, p) <= 57 {
+        p = p + 1
+    }
+    return (if at(buf, p) != 0 { 1 } else { 0 }, vals)
+}
+
+/// What parse_isoformat_time found: the return code (0 no offset, 1 an
+/// offset), the time fields, and the offset in seconds and microseconds.
+type IsoTime = { rv: i64, vals: [i64], tz_seconds: i64, tz_us: i64 }
+
+fn parse_time(buf: [i64], p: i64, len: i64) -> IsoTime {
+    let p_end = p + len
+    var tz = p
+    while true {
+        let c = at(buf, tz)
+        if c == 90 or c == 43 or c == 45 {
+            break
+        }
+        tz = tz + 1
+        if tz >= p_end {
+            break
+        }
+    }
+    let (rv, vals) = parse_hms(buf, p, tz)
+    if rv < 0 {
+        return IsoTime{ rv: rv, vals: vals, tz_seconds: 0, tz_us: 0 }
+    }
+    if tz == p_end {
+        return IsoTime{ rv: if rv == 1 { 0 - 5 } else { 0 }, vals: vals, tz_seconds: 0, tz_us: 0 }
+    }
+    if at(buf, tz) == 90 {
+        return IsoTime{ rv: if at(buf, tz + 1) != 0 { 0 - 5 } else { 1 }, vals: vals, tz_seconds: 0, tz_us: 0 }
+    }
+    let sign = if at(buf, tz) == 45 { 0 - 1 } else { 1 }
+    let (rv2, t) = parse_hms(buf, tz + 1, p_end)
+    return IsoTime{ rv: if rv2 != 0 { 0 - 5 } else { 1 }, vals: vals, tz_seconds: sign * (t[0] * 3600 + t[1] * 60 + t[2]), tz_us: sign * t[3] }
+}
+
+fn invalid(cs: [i64]) -> DtError {
+    return DtValueError("Invalid isoformat string: " + py_repr(cs))
+}
+
+/// tzinfo_from_isoformat_results. An offset of zero seconds is UTC even
+/// with microseconds, as in the C module.
+fn iso_offset(t: IsoTime) -> Option[PyTimedelta] ! DtError {
+    if t.rv != 1 {
+        return None
+    }
+    if t.tz_seconds == 0 {
+        return Some(PyTimedelta{ days: 0, seconds: 0, microseconds: 0 })
+    }
+    return Some(try timezone(try normalized(0, t.tz_seconds, t.tz_us)))
+}
+
+fn utf8_buf(cs: [i64]) -> [i64] {
+    var out: [i64] = []
+    for c in cs {
+        for b in c.to_char().to_bytes().to_list() {
+            out.push(b)
+        }
+    }
+    out.push(0)
+    return out
+}
+
+/// `date.fromisoformat(text)`, the text as code points.
+pub fn date_fromisoformat(cs: [i64]) -> PyDate ! DtError {
+    let buf = utf8_buf(cs)
+    let len = buf.len() - 1
+    let (rv, d) = if len == 7 or len == 8 or len == 10 { parse_date(buf, len) } else { (0 - 1, PyDate{ year: 0, month: 0, day: 0 }) }
+    if rv < 0 {
+        fail(invalid(cs))
+    }
+    return try check_date(d.year, d.month, d.day)
+}
+
+/// `time.fromisoformat(text)`.
+pub fn time_fromisoformat(cs: [i64]) -> PyTime ! DtError {
+    let buf = utf8_buf(cs)
+    let start = if at(buf, 0) == 84 { 1 } else { 0 }
+    let t = parse_time(buf, start, buf.len() - 1 - start)
+    if t.rv < 0 {
+        fail(invalid(cs))
+    }
+    let offset = try iso_offset(t)
+    return try check_time(t.vals[0], t.vals[1], t.vals[2], t.vals[3], offset)
+}
+
+/// _find_isoformat_datetime_separator.
+fn find_separator(buf: [i64], len: i64) -> i64 {
+    if len == 7 {
+        return 7
+    }
+    let digit = |c| c >= 48 and c <= 57
+    if buf[4] == 45 {
+        if buf[5] != 87 {
+            return 10
+        }
+        if len > 8 and buf[8] == 45 {
+            if len == 9 {
+                return 0 - 1
+            }
+            return if len > 10 and digit(buf[10]) { 8 } else { 10 }
+        }
+        return 8
+    }
+    if buf[4] != 87 {
+        return 8
+    }
+    var idx = 7
+    while idx < len and digit(buf[idx]) {
+        idx = idx + 1
+    }
+    if idx < 9 {
+        return idx
+    }
+    return if idx % 2 == 0 { 7 } else { 8 }
+}
+
+/// `datetime.fromisoformat(text)`.
+pub fn datetime_fromisoformat(cs: [i64]) -> PyDatetime ! DtError {
+    if cs.len() < 7 {
+        fail(invalid(cs))
+    }
+    let buf = utf8_buf(cs)
+    let len = buf.len() - 1
+    let sep = find_separator(buf, len)
+    // A separator of -1 is a length of SIZE_MAX to the C parser.
+    let (rv0, d) = parse_date(buf, if sep < 0 { 9223372036854775807 } else { sep })
+    var t = IsoTime{ rv: rv0, vals: [0, 0, 0, 0], tz_seconds: 0, tz_us: 0 }
+    if rv0 == 0 and len > sep {
+        let lead = buf[sep]
+        let p = sep + if lead < 128 { 1 } else if lead.bit_and(240) == 224 { 3 } else if lead.bit_and(240) == 240 { 4 } else { 2 }
+        t = parse_time(buf, p, len - p)
+    }
+    if t.rv < 0 {
+        fail(invalid(cs))
+    }
+    let offset = try iso_offset(t)
+    let date = try check_date(d.year, d.month, d.day)
+    let time = try check_time(t.vals[0], t.vals[1], t.vals[2], t.vals[3], offset)
+    return PyDatetime{ date: date, time: time }
+}
+
+// ---- time, datetime and timezone
+
+/// `timezone(offset)`: the offset, if strictly inside a day.
+pub fn timezone(offset: PyTimedelta) -> PyTimedelta ! DtError {
+    if (offset.days == 0 - 1 and offset.seconds == 0 and offset.microseconds < 1) or offset.days < 0 - 1 or offset.days >= 1 {
+        fail(DtValueError("offset must be a timedelta strictly between -timedelta(hours=24) and timedelta(hours=24), not " + td_repr(offset) + "."))
+    }
+    return offset
+}
+
+fn offset_text(offset: PyTimedelta) -> str {
+    let negative = offset.days < 0
+    let o = if negative { normalized(0 - offset.days, 0 - offset.seconds, 0 - offset.microseconds) ?? offset } else { offset }
+    let hm = pad(o.seconds / 3600, 2) + ":" + pad(o.seconds / 60 % 60, 2)
+    let rest = if o.microseconds != 0 { ":" + pad(o.seconds % 60, 2) + "." + pad(o.microseconds, 6) } else if o.seconds % 60 != 0 {
+        ":" + pad(o.seconds % 60, 2)
+    } else { "" }
+    return (if negative { "-" } else { "+" }) + hm + rest
+}
+
+/// `str(timezone(offset))`: `UTC`, `UTC+05:30`, `UTC-00:00:01`.
+pub fn timezone_name(offset: PyTimedelta) -> str {
+    return if is_zero_td(offset) { "UTC" } else { "UTC" + offset_text(offset) }
+}
+
+fn check_time(h: i64, mi: i64, s: i64, us: i64, offset: Option[PyTimedelta]) -> PyTime ! DtError {
+    if h < 0 or h > 23 {
+        fail(DtValueError("hour must be in 0..23"))
+    }
+    if mi < 0 or mi > 59 {
+        fail(DtValueError("minute must be in 0..59"))
+    }
+    if s < 0 or s > 59 {
+        fail(DtValueError("second must be in 0..59"))
+    }
+    if us < 0 or us > 999999 {
+        fail(DtValueError("microsecond must be in 0..999999"))
+    }
+    return PyTime{ hour: h, minute: mi, second: s, microsecond: us, offset: offset }
+}
+
+/// `time(hour, minute, second, microsecond, tzinfo)`.
+pub fn time(hour: i64, minute: i64, second: i64, microsecond: i64, offset: Option[PyTimedelta]) -> PyTime ! DtError {
+    return try check_time(hour, minute, second, microsecond, offset)
+}
+
+/// `datetime(...)`.
+pub fn datetime(year: i64, month: i64, day: i64, hour: i64, minute: i64, second: i64, microsecond: i64, offset: Option[PyTimedelta]) -> PyDatetime ! DtError {
+    let d = try check_date(year, month, day)
+    let t = try check_time(hour, minute, second, microsecond, offset)
+    return PyDatetime{ date: d, time: t }
+}
+
+fn time_text(t: PyTime, timespec: str) -> str ! DtError {
+    let spec = if timespec == "auto" { if t.microsecond == 0 { "seconds" } else { "microseconds" } } else { timespec }
+    let hh = pad(t.hour, 2)
+    let hm = hh + ":" + pad(t.minute, 2)
+    let hms = hm + ":" + pad(t.second, 2)
+    let body = if spec == "hours" { hh } else if spec == "minutes" { hm } else if spec == "seconds" { hms } else if spec == "milliseconds" {
+        hms + "." + pad(t.microsecond / 1000, 3)
+    } else if spec == "microseconds" { hms + "." + pad(t.microsecond, 6) } else { "" }
+    if body == "" {
+        fail(DtValueError("Unknown timespec value"))
+    }
+    return body + match t.offset {
+        Some(o) -> offset_text(o)
+        None -> ""
+    }
+}
+
+/// `t.isoformat(timespec)`; `timespec` is `auto`, `hours`, `minutes`,
+/// `seconds`, `milliseconds` or `microseconds`.
+pub fn time_isoformat(t: PyTime, timespec: str) -> str ! DtError {
+    return try time_text(t, timespec)
+}
+
+/// `dt.isoformat(sep, timespec)`, `sep` a code point.
+pub fn datetime_isoformat(dt: PyDatetime, sep: i64, timespec: str) -> str ! DtError {
+    return date_isoformat(dt.date) + sep.to_char() + (try time_text(dt.time, timespec))
+}
+
+/// `str(dt)`.
+pub fn datetime_str(dt: PyDatetime) -> str {
+    return datetime_isoformat(dt, 32, "auto") ?? ""
+}
+
+/// `dt.ctime()`.
+pub fn datetime_ctime(dt: PyDatetime) -> str {
+    return ctime_of(dt.date, dt.time.hour, dt.time.minute, dt.time.second)
+}
+
+/// add_datetime_timedelta: `dt + t` (factor 1) or `dt - t` (factor -1);
+/// the result keeps `dt`'s offset.
+fn shift(dt: PyDatetime, t: PyTimedelta, factor: i64) -> PyDatetime ! DtError {
+    var us = dt.time.microsecond + t.microseconds * factor
+    var s = dt.time.second + t.seconds * factor + fdiv(us, 1000000)
+    us = fmod(us, 1000000)
+    var mi = dt.time.minute + fdiv(s, 60)
+    s = fmod(s, 60)
+    var h = dt.time.hour + fdiv(mi, 60)
+    mi = fmod(mi, 60)
+    let day = dt.date.day + t.days * factor + fdiv(h, 24)
+    h = fmod(h, 24)
+    let d = try date_from_ordinal_checked(ymd_to_ord(dt.date.year, dt.date.month, 1) + day - 1)
+    return PyDatetime{ date: d, time: PyTime{ hour: h, minute: mi, second: s, microsecond: us, offset: dt.time.offset } }
+}
+
+pub fn datetime_add(dt: PyDatetime, t: PyTimedelta) -> PyDatetime ! DtError {
+    return try shift(dt, t, 1)
+}
+
+pub fn datetime_sub(dt: PyDatetime, t: PyTimedelta) -> PyDatetime ! DtError {
+    return try shift(dt, t, 0 - 1)
+}
+
+/// `a - b`, corrected for their offsets when both are aware.
+pub fn datetime_diff(a: PyDatetime, b: PyDatetime) -> PyTimedelta ! DtError {
+    if a.time.offset.is_some() != b.time.offset.is_some() {
+        fail(DtTypeError("can't subtract offset-naive and offset-aware datetimes"))
+    }
+    let days = toordinal(a.date) - toordinal(b.date)
+    let secs = (a.time.hour - b.time.hour) * 3600 + (a.time.minute - b.time.minute) * 60 + (a.time.second - b.time.second)
+    let raw = try normalized(days, secs, a.time.microsecond - b.time.microsecond)
+    return match (a.time.offset, b.time.offset) {
+        (Some(x), Some(y)) -> if td_compare(x, y) != 0 { try td_sub(raw, try td_sub(x, y)) } else { raw }
+        _ -> raw
+    }
+}
+
+/// `dt.timestamp()` for an aware datetime; a naive one is taken as UTC.
+pub fn timestamp(dt: PyDatetime) -> f64 {
+    let zero = PyTimedelta{ days: 0, seconds: 0, microseconds: 0 }
+    let aware = PyDatetime{ date: dt.date, time: PyTime{ hour: dt.time.hour, minute: dt.time.minute, second: dt.time.second,
+        microsecond: dt.time.microsecond, offset: Some(dt.time.offset ?? zero) } }
+    let epoch = PyDatetime{ date: PyDate{ year: 1970, month: 1, day: 1 }, time: PyTime{ hour: 0, minute: 0, second: 0, microsecond: 0, offset: Some(zero) } }
+    return total_seconds(datetime_diff(aware, epoch) ?? zero)
+}
+
+fn round_half_even(x: f64) -> f64 {
+    let t = x.as_i64().as_f64()
+    let diff = x - t
+    let away = if diff >= 0.5 { t + 1.0 } else if diff <= -0.5 { t - 1.0 } else { t }
+    if (x - away).abs() == 0.5 {
+        let h = x / 2.0
+        let th = h.as_i64().as_f64()
+        let dh = h - th
+        let rh = if dh >= 0.5 { th + 1.0 } else if dh <= -0.5 { th - 1.0 } else { th }
+        return 2.0 * rh
+    }
+    return away
+}
+
+/// `datetime.fromtimestamp(ts, timezone(offset))`.
+pub fn fromtimestamp(ts: f64, offset: PyTimedelta) -> PyDatetime ! DtError {
+    // The timezone exists before the timestamp is looked at.
+    let tz = try timezone(offset)
+    if ts != ts {
+        fail(DtValueError("Invalid value NaN (not a number)"))
+    }
+    if not (ts > -9.3e18 and ts < 9.3e18) {
+        fail(DtOverflowError("timestamp out of range for platform time_t"))
+    }
+    var intpart = ts.as_i64().as_f64()
+    var frac = round_half_even((ts - intpart) * 1000000.0)
+    if frac >= 1000000.0 {
+        frac = frac - 1000000.0
+        intpart = intpart + 1.0
+    } else if frac < 0.0 {
+        frac = frac + 1000000.0
+        intpart = intpart - 1.0
+    }
+    if intpart < -9223372036854775808.0 or intpart >= 9223372036854775808.0 {
+        fail(DtOverflowError("timestamp out of range for platform time_t"))
+    }
+    let secs = intpart.as_i64()
+    let days = fdiv(secs, 86400)
+    let rem = fmod(secs, 86400)
+    let d = ord_to_ymd(days + 719163)
+    let utc = try datetime(d.year, d.month, d.day, rem / 3600, rem / 60 % 60, rem % 60, frac.as_i64(), Some(tz))
+    return try shift(utc, tz, 1)
+}

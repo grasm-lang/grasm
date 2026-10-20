@@ -1,0 +1,249 @@
+// JavaScript's numbers in other bases, as V8 14 (Node 25) writes and
+// reads them: `x.toString(radix)` and `parseInt(s, radix)`. Base ten,
+// `toFixed`, `Number(s)` and `parseFloat` are packages/jsnumber's.
+//
+// Ids, colour values and compact counters go through these two, and a
+// reader that has to agree with Node needs V8's exact digits:
+//
+//   - `toString(radix)` for a fraction is V8's own algorithm, digits until
+//     the double is pinned down -- `(0.1).toString(3)` is
+//     `0.0022002200220022002200220022002201` -- ported here as V8 writes it,
+//     including the carry back through digits already written.
+//   - `parseInt` trims JavaScript's whitespace (which includes U+FEFF and
+//     the line terminators), takes a sign, takes `0x` only for radix 16 or
+//     none, and stops at the first character that is not a digit. Radix 2,
+//     4, 8, 16 and 32 are rounded correctly from all the digits; ten is
+//     read as a decimal literal; any other radix is folded 32 bits at a
+//     time with a fused multiply-add, as V8 does, which rounds once per
+//     part beyond 2^53.
+//
+// Inputs are JavaScript strings of code points without lone surrogates.
+
+import bigint
+import jsnumber
+import pymath
+
+type JsRangeError = | JsRangeError(text: str)
+
+fn special(x: f64) -> Option[str] {
+    if x.is_nan() {
+        return Some("NaN")
+    }
+    if x == 1.0 / 0.0 {
+        return Some("Infinity")
+    }
+    if x == -1.0 / 0.0 {
+        return Some("-Infinity")
+    }
+    if x == 0.0 {
+        return Some("0")
+    }
+    return None
+}
+
+// ---- toString(radix): V8's DoubleToRadixStringView
+
+fn next_up(x: f64) -> f64 {
+    return (x.to_bits() + 1).from_bits()
+}
+
+/// `x.toString(radix)`.
+pub fn to_string_radix(x: f64, radix: i64) -> str ! JsRangeError {
+    if radix < 2 or radix > 36 {
+        fail(JsRangeError("toString() radix argument must be between 2 and 36"))
+    }
+    if radix == 10 {
+        return jsnumber.to_string(x)
+    }
+    match special(x) {
+        Some(t) -> return t
+        None -> {}
+    }
+    let chars = "0123456789abcdefghijklmnopqrstuvwxyz"
+    let negative = x < 0.0
+    let value = x.abs()
+    var integer = value.floor()
+    var fraction = value - integer
+    var delta = 0.5 * (next_up(value) - value)
+    if delta <= 0.0 {
+        delta = 1.from_bits()
+    }
+    var frac_digits: [i64] = []
+    if fraction >= delta {
+        while true {
+            fraction = fraction * radix.as_f64()
+            delta = delta * radix.as_f64()
+            var digit = fraction.as_i64()
+            frac_digits.push(digit)
+            fraction = fraction - digit.as_f64()
+            if fraction > 0.5 or (fraction == 0.5 and digit % 2 == 1) {
+                if fraction + delta > 1.0 {
+                    // Carry back through the digits already written.
+                    while true {
+                        if frac_digits.len() == 0 {
+                            integer = integer + 1.0
+                            break
+                        }
+                        digit = frac_digits.pop() ?? 0
+                        if digit + 1 < radix {
+                            frac_digits.push(digit + 1)
+                            break
+                        }
+                    }
+                    break
+                }
+            }
+            if not (fraction >= delta) {
+                break
+            }
+        }
+    }
+    var int_digits = ""
+    while (integer / radix.as_f64()).to_bits().ushr(52).bit_and(2047) - 1075 > 0 {
+        integer = integer / radix.as_f64()
+        int_digits = "0" + int_digits
+    }
+    while true {
+        let rem = integer % radix.as_f64()
+        int_digits = chars.substr(rem.as_i64(), 1) + int_digits
+        integer = (integer - rem) / radix.as_f64()
+        if not (integer > 0.0) {
+            break
+        }
+    }
+    let frac = if frac_digits.len() > 0 { "." + frac_digits.map(|d| chars.substr(d, 1)).join("") } else { "" }
+    return (if negative { "-" } else { "" }) + int_digits + frac
+}
+
+// ---- parsing
+
+/// ECMAScript's StrWhiteSpaceChar: WhiteSpace and LineTerminator.
+fn js_space(c: i64) -> bool {
+    return c == 9 or c == 10 or c == 11 or c == 12 or c == 13 or c == 32 or c == 160 or c == 5760 or (c >= 8192 and c <= 8202) or c == 8232 or c == 8233 or
+    c == 8239 or c == 8287 or c == 12288 or c == 65279
+}
+
+fn trim_start(cs: [i64]) -> [i64] {
+    var i = 0
+    while i < cs.len() and js_space(cs[i]) {
+        i = i + 1
+    }
+    return cs.slice(i, cs.len())
+}
+
+fn digit_value(c: i64) -> i64 {
+    return if c >= 48 and c <= 57 { c - 48 } else if c >= 97 and c <= 122 { c - 87 } else if c >= 65 and c <= 90 { c - 55 } else { 99 }
+}
+
+fn nan() -> f64 {
+    return 0.0 / 0.0
+}
+
+/// Digits in radix 2, 4, 8, 16 or 32, correctly rounded:
+/// InternalStringToIntDouble.
+fn power_of_two_value(digits: [i64], radix: i64) -> f64 {
+    var value = bigint.zero()
+    for c in digits {
+        value = bigint.add(bigint.mul(value, bigint.from_i64(radix)), bigint.from_i64(digit_value(c)))
+    }
+    return big_to_double(value)
+}
+
+/// A non-negative integer rounded to the nearest double, ties to even.
+fn big_to_double(n: BigInt) -> f64 {
+    let bits = bigint.bit_length(n)
+    if bits <= 53 {
+        return (bigint.to_i64(n) ?? 0).as_f64()
+    }
+    let shift = bits - 53
+    let two = bigint.pow(bigint.from_i64(2), shift)
+    let (q, r) = bigint.divmod(n, two) ?? (bigint.zero(), bigint.zero())
+    var m = bigint.to_i64(q) ?? 0
+    let half = bigint.compare(bigint.add(r, r), two)
+    var e = shift
+    if half > 0 or (half == 0 and m % 2 == 1) {
+        m = m + 1
+        if m == 9007199254740992 {
+            m = m / 2
+            e = e + 1
+        }
+    }
+    if e + 52 > 1023 {
+        return 1.0 / 0.0
+    }
+    var v = m.as_f64()
+    for _k in 0..e {
+        v = v * 2.0
+    }
+    return v
+}
+
+/// `parseInt(s, radix)`; radix 0 is undefined.
+pub fn parse_int(s: str, radix0: i64) -> f64 {
+    var cs = trim_start(s.codes())
+    var negative = false
+    if cs.len() > 0 and (cs[0] == 43 or cs[0] == 45) {
+        negative = cs[0] == 45
+        cs = cs.slice(1, cs.len())
+    }
+    var radix = radix0.shl(32).shr(32)
+    var strip = true
+    if radix != 0 {
+        if radix < 2 or radix > 36 {
+            return nan()
+        }
+        if radix != 16 {
+            strip = false
+        }
+    } else {
+        radix = 10
+    }
+    if strip and cs.len() >= 2 and cs[0] == 48 and cs[1].bit_or(32) == 120 {
+        cs = cs.slice(2, cs.len())
+        radix = 16
+    }
+    var end = 0
+    while end < cs.len() and digit_value(cs[end]) < radix {
+        end = end + 1
+    }
+    if end == 0 {
+        return nan()
+    }
+    // Leading zeros are skipped before the digits are read, which moves
+    // where the generic fold's 32-bit parts begin.
+    var first = 0
+    while first < end - 1 and cs[first] == 48 {
+        first = first + 1
+    }
+    let digits = cs.slice(first, end)
+    let v = if radix == 10 { jsnumber.parse_float(digits.map(|c| c.to_char()).join("")) } else if radix == 2 or radix == 4 or radix == 8 or radix == 16 or radix == 32 {
+        power_of_two_value(digits, radix)
+    } else { generic_value(digits, radix) }
+    // Times -1 rather than 0 - v, so that -0 stays -0.
+    return if negative { v * -1.0 } else { v }
+}
+
+/// V8's HandleGenericCase: digits gathered into 32-bit parts, each folded
+/// into a double with one fused multiply-add, which rounds once a part when
+/// the value passes 2^53.
+fn generic_value(digits: [i64], radix: i64) -> f64 {
+    var result = 0.0
+    var i = 0
+    let limit = 4294967295 / 36
+    while i < digits.len() {
+        var part = 0
+        var multiplier = 1
+        while i < digits.len() {
+            let m = multiplier * radix
+            if m > limit {
+                break
+            }
+            part = part * radix + digit_value(digits[i])
+            multiplier = m
+            i = i + 1
+        }
+        // clang fuses this multiply-add on arm64, and V8 is built with it.
+        result = pymath.fma(result, multiplier.as_f64(), part.as_f64()) ?? (result * multiplier.as_f64() + part.as_f64())
+    }
+    return result
+}

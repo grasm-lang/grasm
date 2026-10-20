@@ -1,0 +1,4 @@
+[package]
+name = "gocsv"
+version = "1.0.0"
+capabilities = []

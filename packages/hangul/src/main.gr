@@ -1,0 +1,190 @@
+// Hangul: syllables to jamo and back, the syllables' names, and the
+// compatibility jamo keyboards produce, by the arithmetic Unicode defines
+// (chapter 3.12) rather than by table.
+//
+// Held to Python 3.13's `unicodedata` (Unicode 15.1): `nfd`, `nfc` and
+// `nfkd` give what `normalize` gives on text whose only decomposable
+// characters are Hangul -- for `nfkd` that includes the compatibility
+// (U+3131..318E) and halfwidth (U+FFA0..FFDC) jamo -- and `syllable_name`
+// and `lookup` what `name` and `lookup` give for the 11,172 syllables.
+//
+// A syllable is S = 0xAC00 + (L * 21 + V) * 28 + T, for 19 leading
+// consonants L, 21 vowels V and 27 trailing consonants T (T = 0 for none).
+// Old jamo outside those -- U+1113 and up -- have no syllable and are left
+// as they are, as normalization leaves them.
+
+fn s_base() -> i64 {
+    return 44032
+}
+
+fn l_base() -> i64 {
+    return 4352
+}
+
+fn v_base() -> i64 {
+    return 4449
+}
+
+fn t_base() -> i64 {
+    return 4519
+}
+
+fn l_names() -> [str] {
+    return ["G", "GG", "N", "D", "DD", "R", "M", "B", "BB", "S", "SS", "", "J", "JJ", "C", "K", "T", "P", "H"]
+}
+
+fn v_names() -> [str] {
+    return ["A", "AE", "YA", "YAE", "EO", "E", "YEO", "YE", "O", "WA", "WAE", "OE", "YO", "U", "WEO", "WE", "WI", "YU", "EU", "YI", "I"]
+}
+
+fn t_names() -> [str] {
+    return ["", "G", "GG", "GS", "N", "NJ", "NH", "D", "L", "LG", "LM", "LB", "LS", "LT", "LP", "LH", "M", "B", "BS", "S", "SS", "NG", "J", "C",
+        "K", "T", "P", "H"]
+}
+
+pub fn is_syllable(cp: i64) -> bool {
+    return cp >= 44032 and cp < 44032 + 11172
+}
+
+pub fn is_leading(cp: i64) -> bool {
+    return cp >= 4352 and cp < 4352 + 19
+}
+
+pub fn is_vowel(cp: i64) -> bool {
+    return cp >= 4449 and cp < 4449 + 21
+}
+
+/// A trailing consonant that can close a syllable (U+11A8..11C2).
+pub fn is_trailing(cp: i64) -> bool {
+    return cp > 4519 and cp < 4519 + 28
+}
+
+/// A syllable's jamo: leading consonant, vowel, and trailing consonant when
+/// it has one.
+pub fn decompose_syllable(cp: i64) -> [i64] {
+    if not is_syllable(cp) {
+        return [cp]
+    }
+    let s = cp - s_base()
+    let l = l_base() + s / 588
+    let v = v_base() + s % 588 / 28
+    let t = s % 28
+    return if t == 0 { [l, v] } else { [l, v, t_base() + t] }
+}
+
+/// The syllable for a leading consonant and a vowel, with a trailing
+/// consonant or 0 for none.
+pub fn compose(l: i64, v: i64, t: i64) -> Option[i64] {
+    if not is_leading(l) or not is_vowel(v) or not (t == 0 or is_trailing(t)) {
+        return None
+    }
+    let ti = if t == 0 { 0 } else { t - t_base() }
+    return Some(s_base() + ((l - l_base()) * 21 + v - v_base()) * 28 + ti)
+}
+
+/// Canonical decomposition of every syllable; everything else unchanged.
+pub fn nfd(s: str) -> str {
+    var out: [i64] = []
+    for c in s.codes() {
+        for j in decompose_syllable(c) {
+            out.push(j)
+        }
+    }
+    return codes_text(out)
+}
+
+fn codes_text(cs: [i64]) -> str {
+    var out = ""
+    for c in cs {
+        out = out + c.to_char()
+    }
+    return out
+}
+
+/// Canonical composition: a leading consonant and a vowel become a
+/// syllable, and a syllable without a final takes a following trailing
+/// consonant -- the only compositions there are among these characters.
+pub fn nfc(s: str) -> str {
+    var out: [i64] = []
+    for c in s.codes() {
+        if out.len() > 0 {
+            let last = out[out.len() - 1]
+            if is_leading(last) and is_vowel(c) {
+                out[out.len() - 1] = compose(last, c, 0) ?? last
+                continue
+            }
+            if is_syllable(last) and (last - s_base()) % 28 == 0 and is_trailing(c) {
+                out[out.len() - 1] = last + c - t_base()
+                continue
+            }
+        }
+        out.push(c)
+    }
+    return codes_text(out)
+}
+
+/// `HANGUL SYLLABLE GAG` for U+AC01; `None` for anything not a syllable.
+pub fn syllable_name(cp: i64) -> Option[str] {
+    if not is_syllable(cp) {
+        return None
+    }
+    let s = cp - s_base()
+    return Some("HANGUL SYLLABLE " + l_names()[s / 588] + v_names()[s % 588 / 28] + t_names()[s % 28])
+}
+
+/// The syllable a name names: exact, upper-case, one space, as
+/// `unicodedata.lookup` wants it.
+pub fn lookup(name: str) -> Option[i64] {
+    let prefix = "HANGUL SYLLABLE "
+    if not name.starts_with(prefix) {
+        return None
+    }
+    let rest = name.substr(prefix.len(), name.len() - prefix.len())
+    // The leading consonant's name is a prefix; the longest that leaves a
+    // vowel and a trailing name is the reading, and there is only one.
+    for (li, ln) in l_names().enumerate() {
+        if not rest.starts_with(ln) {
+            continue
+        }
+        let r1 = rest.substr(ln.len(), rest.len() - ln.len())
+        for (vi, vn) in v_names().enumerate() {
+            if not r1.starts_with(vn) {
+                continue
+            }
+            let r2 = r1.substr(vn.len(), r1.len() - vn.len())
+            for (ti, tn) in t_names().enumerate() {
+                if tn == r2 {
+                    return Some(s_base() + (li * 21 + vi) * 28 + ti)
+                }
+            }
+        }
+    }
+    return None
+}
+
+fn compat_table() -> [(i64, i64)] {
+    // BEGIN COMPAT (scripts/lib/b47/gen_hangul.py, from Python 3.13's NFKD)
+    return [(0x3131, 0x1100), (0x3132, 0x1101), (0x3133, 0x11aa), (0x3134, 0x1102), (0x3135, 0x11ac), (0x3136, 0x11ad), (0x3137, 0x1103), (0x3138, 0x1104), (0x3139, 0x1105), (0x313a, 0x11b0), (0x313b, 0x11b1), (0x313c, 0x11b2), (0x313d, 0x11b3), (0x313e, 0x11b4), (0x313f, 0x11b5), (0x3140, 0x111a), (0x3141, 0x1106), (0x3142, 0x1107), (0x3143, 0x1108), (0x3144, 0x1121), (0x3145, 0x1109), (0x3146, 0x110a), (0x3147, 0x110b), (0x3148, 0x110c), (0x3149, 0x110d), (0x314a, 0x110e), (0x314b, 0x110f), (0x314c, 0x1110), (0x314d, 0x1111), (0x314e, 0x1112), (0x314f, 0x1161), (0x3150, 0x1162), (0x3151, 0x1163), (0x3152, 0x1164), (0x3153, 0x1165), (0x3154, 0x1166), (0x3155, 0x1167), (0x3156, 0x1168), (0x3157, 0x1169), (0x3158, 0x116a), (0x3159, 0x116b), (0x315a, 0x116c), (0x315b, 0x116d), (0x315c, 0x116e), (0x315d, 0x116f), (0x315e, 0x1170), (0x315f, 0x1171), (0x3160, 0x1172), (0x3161, 0x1173), (0x3162, 0x1174), (0x3163, 0x1175), (0x3164, 0x1160), (0x3165, 0x1114), (0x3166, 0x1115), (0x3167, 0x11c7), (0x3168, 0x11c8), (0x3169, 0x11cc), (0x316a, 0x11ce), (0x316b, 0x11d3), (0x316c, 0x11d7), (0x316d, 0x11d9), (0x316e, 0x111c), (0x316f, 0x11dd), (0x3170, 0x11df), (0x3171, 0x111d), (0x3172, 0x111e), (0x3173, 0x1120), (0x3174, 0x1122), (0x3175, 0x1123), (0x3176, 0x1127), (0x3177, 0x1129), (0x3178, 0x112b), (0x3179, 0x112c), (0x317a, 0x112d), (0x317b, 0x112e), (0x317c, 0x112f), (0x317d, 0x1132), (0x317e, 0x1136), (0x317f, 0x1140), (0x3180, 0x1147), (0x3181, 0x114c), (0x3182, 0x11f1), (0x3183, 0x11f2), (0x3184, 0x1157), (0x3185, 0x1158), (0x3186, 0x1159), (0x3187, 0x1184), (0x3188, 0x1185), (0x3189, 0x1188), (0x318a, 0x1191), (0x318b, 0x1192), (0x318c, 0x1194), (0x318d, 0x119e), (0x318e, 0x11a1), (0xffa0, 0x1160), (0xffa1, 0x1100), (0xffa2, 0x1101), (0xffa3, 0x11aa), (0xffa4, 0x1102), (0xffa5, 0x11ac), (0xffa6, 0x11ad), (0xffa7, 0x1103), (0xffa8, 0x1104), (0xffa9, 0x1105), (0xffaa, 0x11b0), (0xffab, 0x11b1), (0xffac, 0x11b2), (0xffad, 0x11b3), (0xffae, 0x11b4), (0xffaf, 0x11b5), (0xffb0, 0x111a), (0xffb1, 0x1106), (0xffb2, 0x1107), (0xffb3, 0x1108), (0xffb4, 0x1121), (0xffb5, 0x1109), (0xffb6, 0x110a), (0xffb7, 0x110b), (0xffb8, 0x110c), (0xffb9, 0x110d), (0xffba, 0x110e), (0xffbb, 0x110f), (0xffbc, 0x1110), (0xffbd, 0x1111), (0xffbe, 0x1112), (0xffc2, 0x1161), (0xffc3, 0x1162), (0xffc4, 0x1163), (0xffc5, 0x1164), (0xffc6, 0x1165), (0xffc7, 0x1166), (0xffca, 0x1167), (0xffcb, 0x1168), (0xffcc, 0x1169), (0xffcd, 0x116a), (0xffce, 0x116b), (0xffcf, 0x116c), (0xffd2, 0x116d), (0xffd3, 0x116e), (0xffd4, 0x116f), (0xffd5, 0x1170), (0xffd6, 0x1171), (0xffd7, 0x1172), (0xffda, 0x1173), (0xffdb, 0x1174), (0xffdc, 0x1175)]
+    // END COMPAT
+}
+
+/// Compatibility and halfwidth jamo as the conjoining jamo NFKD maps them
+/// to; everything else unchanged.
+pub fn compat_to_conjoining(s: str) -> str {
+    let t = compat_table()
+    var m: Map[i64, i64] = map()
+    for (a, b) in t {
+        m.set(a, b)
+    }
+    var out: [i64] = []
+    for c in s.codes() {
+        out.push(m.get(c) ?? c)
+    }
+    return codes_text(out)
+}
+
+/// NFKD of text whose only decomposable characters are Hangul: the
+/// compatibility and halfwidth jamo mapped, then every syllable decomposed.
+pub fn nfkd(s: str) -> str {
+    return nfd(compat_to_conjoining(s))
+}

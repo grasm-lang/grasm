@@ -1,0 +1,972 @@
+// HTTP caching policy: may this response be stored, for how long is it
+// fresh, can a stored copy answer this request, and what to send to
+// revalidate it (RFC 9111, the rules RFC 7234 had before it).
+//
+// Held to npm's `http-cache-semantics` 4.2.0 -- the package npm, `got` and
+// `make-fetch-happen` cache with -- answer for answer, including where it
+// reads the RFC loosely:
+//
+//   - A directive value keeps everything up to a second `=`; the rest is
+//     dropped (`max-age=1=2` is `1`). One pair of quotes is stripped.
+//   - Truth is JavaScript's: `max-age=0` is a non-empty string and counts as
+//     present; `max-age=` is empty and does not.
+//   - `immutable` raises the minimum lifetime to `immutable_min_ttl`, which
+//     it measures in milliseconds and compares with seconds -- a day by
+//     default, used as 86,400,000 seconds. Copied, because a cache that
+//     disagrees with npm's about when an entry expires is a cache bug.
+//   - Dates are read the way V8's `Date.parse` reads them: a bare number is
+//     a year, two-digit years land in 1950..2049, and February 31 is
+//     March 2. A date with no zone is read as UTC (the reference runs under
+//     TZ=UTC).
+//
+// The clock is an argument -- milliseconds since the epoch -- so nothing
+// here performs an effect, and a test can say what time it is.
+
+type HcVal =
+    | HcFlag
+    | HcText(text: str)
+
+type HcRequest = { method: Option[str], url: Option[str], headers: [(str, str)] }
+
+type HcResponse = { status: Option[i64], headers: [(str, str)] }
+
+type HcOptions = { shared: bool, heuristic: f64, immutable_min_ttl: f64, ignore_cargo_cult: bool }
+
+type HcPolicy = {
+    response_time: f64,
+    shared: bool,
+    heuristic: f64,
+    immutable_min_ttl: f64,
+    ignore_cargo_cult: bool,
+    status: i64,
+    res_headers: [(str, str)],
+    rescc: [(str, HcVal)],
+    method: str,
+    url: Option[str],
+    host: Option[str],
+    no_authorization: bool,
+    req_headers: Option[[(str, str)]],
+    reqcc: [(str, HcVal)],
+}
+
+type HcRevalidation = { synchronous: bool, headers: [(str, str)] }
+
+/// What `evaluate_request` decides: the stored response's headers when it
+/// may be used, and the revalidation to send, if any.
+type HcEvaluation = { response: Option[[(str, str)]], revalidation: Option[HcRevalidation] }
+
+type HcRevalidated = { policy: HcPolicy, modified: bool, matches: bool }
+
+type HcError =
+    | ResponseMissing
+
+/// The options `http-cache-semantics` uses when none are given.
+pub fn default_options() -> HcOptions {
+    return HcOptions{ shared: true, heuristic: 0.1, immutable_min_ttl: 86400000.0, ignore_cargo_cult: false }
+}
+
+// ---- headers as a JavaScript object: insertion order, assignment in place
+
+pub fn hget(h: [(str, str)], name: str) -> Option[str] {
+    for (k, v) in h {
+        if k == name {
+            return Some(v)
+        }
+    }
+    return None
+}
+
+pub fn hset(h: [(str, str)], name: str, value: str) -> [(str, str)] {
+    var out: [(str, str)] = []
+    var found = false
+    for (k, v) in h {
+        if k == name {
+            out.push((k, value))
+            found = true
+        } else {
+            out.push((k, v))
+        }
+    }
+    if not found {
+        out.push((name, value))
+    }
+    return out
+}
+
+pub fn hdel(h: [(str, str)], name: str) -> [(str, str)] {
+    return h.filter(|e| e.0 != name)
+}
+
+fn truthy(v: Option[str]) -> bool {
+    return match v {
+        Some(s) -> s.len() > 0
+        None -> false
+    }
+}
+
+fn cc_get(cc: [(str, HcVal)], k: str) -> Option[HcVal] {
+    for (key, v) in cc {
+        if key == k {
+            return Some(v)
+        }
+    }
+    return None
+}
+
+fn cc_has(cc: [(str, HcVal)], k: str) -> bool {
+    return cc_get(cc, k).is_some()
+}
+
+fn cc_truthy(cc: [(str, HcVal)], k: str) -> bool {
+    return match cc_get(cc, k) {
+        Some(HcFlag) -> true
+        Some(HcText(s)) -> s.len() > 0
+        None -> false
+    }
+}
+
+/// The directive's value as text, the way JavaScript would turn it into
+/// one: a bare directive is `true`.
+fn cc_text(cc: [(str, HcVal)], k: str) -> Option[str] {
+    return match cc_get(cc, k) {
+        Some(HcFlag) -> Some("true")
+        Some(HcText(s)) -> Some(s)
+        None -> None
+    }
+}
+
+fn cc_set(cc: [(str, HcVal)], k: str, v: HcVal) -> [(str, HcVal)] {
+    var out: [(str, HcVal)] = []
+    var found = false
+    for (key, old) in cc {
+        if key == k {
+            out.push((key, v))
+            found = true
+        } else {
+            out.push((key, old))
+        }
+    }
+    if not found {
+        out.push((k, v))
+    }
+    return out
+}
+
+fn cc_del(cc: [(str, HcVal)], k: str) -> [(str, HcVal)] {
+    return cc.filter(|e| e.0 != k)
+}
+
+// ---- JavaScript's text handling
+
+fn js_ws(c: i64) -> bool {
+    return c == 9 or c == 10 or c == 11 or c == 12 or c == 13 or c == 32 or c == 160 or c == 5760 or (c >= 8192 and c <= 8202) or
+    c == 8232 or c == 8233 or c == 8239 or c == 8287 or c == 12288 or c == 65279
+}
+
+/// `String.prototype.trim`.
+pub fn js_trim(s: str) -> str {
+    let cs = s.codes()
+    var a = 0
+    var b = cs.len()
+    while a < b and js_ws(cs[a]) {
+        a = a + 1
+    }
+    while b > a and js_ws(cs[b - 1]) {
+        b = b - 1
+    }
+    return s.substr(a, b - a)
+}
+
+fn is_digit(c: i64) -> bool {
+    return c >= 48 and c <= 57
+}
+
+fn nan() -> f64 {
+    return 0.0 / 0.0
+}
+
+/// `parseInt(s, 10)`: leading whitespace, a sign, then as many digits as
+/// there are. No digits is NaN.
+pub fn parse_int_js(s: str) -> f64 {
+    let cs = s.codes()
+    var i = 0
+    while i < cs.len() and js_ws(cs[i]) {
+        i = i + 1
+    }
+    var neg = false
+    if i < cs.len() and (cs[i] == 43 or cs[i] == 45) {
+        neg = cs[i] == 45
+        i = i + 1
+    }
+    let start = i
+    while i < cs.len() and is_digit(cs[i]) {
+        i = i + 1
+    }
+    if i == start {
+        return nan()
+    }
+    let v = s.substr(start, i - start).parse_float() ?? nan()
+    return if neg { -v } else { v }
+}
+
+/// `toNumberOrZero`: `parseInt`, and zero for anything that is not finite.
+fn number_or_zero(s: Option[str]) -> f64 {
+    let v = match s {
+        Some(t) -> parse_int_js(t)
+        None -> nan()
+    }
+    return if v.is_finite() { v } else { 0.0 }
+}
+
+fn radix_value(body: str, radix: i64) -> f64 {
+    if body.len() == 0 {
+        return nan()
+    }
+    var v = 0.0
+    for c in body.codes() {
+        let d = if is_digit(c) { c - 48 } else if c >= 97 and c <= 122 { c - 87 } else if c >= 65 and c <= 90 { c - 55 } else { 99 }
+        if d >= radix {
+            return nan()
+        }
+        v = v * radix.as_f64() + d.as_f64()
+    }
+    return v
+}
+
+fn decimal_literal(t: str) -> bool {
+    let cs = t.codes()
+    var i = 0
+    if i < cs.len() and (cs[i] == 43 or cs[i] == 45) {
+        i = i + 1
+    }
+    var digits = 0
+    while i < cs.len() and is_digit(cs[i]) {
+        i = i + 1
+        digits = digits + 1
+    }
+    if i < cs.len() and cs[i] == 46 {
+        i = i + 1
+        while i < cs.len() and is_digit(cs[i]) {
+            i = i + 1
+            digits = digits + 1
+        }
+    }
+    if digits == 0 {
+        return false
+    }
+    if i < cs.len() and (cs[i] == 101 or cs[i] == 69) {
+        i = i + 1
+        if i < cs.len() and (cs[i] == 43 or cs[i] == 45) {
+            i = i + 1
+        }
+        let e0 = i
+        while i < cs.len() and is_digit(cs[i]) {
+            i = i + 1
+        }
+        if i == e0 {
+            return false
+        }
+    }
+    return i == cs.len()
+}
+
+/// `Number(s)`, which is what `>` does to a string compared with a number.
+pub fn js_to_number(s: str) -> f64 {
+    let t = js_trim(s)
+    if t.len() == 0 {
+        return 0.0
+    }
+    if t == "Infinity" or t == "+Infinity" {
+        return 1.0 / 0.0
+    }
+    if t == "-Infinity" {
+        return -1.0 / 0.0
+    }
+    let lower = t.to_lower()
+    if lower.starts_with("0x") {
+        return radix_value(t.substr(2, t.len() - 2), 16)
+    }
+    if lower.starts_with("0o") {
+        return radix_value(t.substr(2, t.len() - 2), 8)
+    }
+    if lower.starts_with("0b") {
+        return radix_value(t.substr(2, t.len() - 2), 2)
+    }
+    if not decimal_literal(t) {
+        return nan()
+    }
+    return t.parse_float() ?? nan()
+}
+
+/// `Math.round`: halves go up, toward positive infinity.
+pub fn js_round(x: f64) -> f64 {
+    return (x + 0.5).floor()
+}
+
+/// A whole number the way JavaScript prints it: no point, and `-0` is `0`.
+pub fn js_int_text(x: f64) -> str {
+    if x == 0.0 {
+        return "0"
+    }
+    return x.as_i64().to_str()
+}
+
+// ---- Cache-Control
+
+/// `parseCacheControl`: split on commas, then each part at its first `=`.
+pub fn parse_cache_control(header: Option[str]) -> [(str, HcVal)] {
+    var cc: [(str, HcVal)] = []
+    let h = header ?? ""
+    if h.len() == 0 {
+        return cc
+    }
+    for part in js_trim(h).split(",") {
+        let pieces = part.split("=")
+        let k = js_trim(pieces[0])
+        if pieces.len() == 1 {
+            cc = cc_set(cc, k, HcFlag)
+        } else {
+            cc = cc_set(cc, k, HcText(unquote(js_trim(pieces[1]))))
+        }
+    }
+    return cc
+}
+
+/// `.replace(/^"|"$/g, '')`: one quote off the front and one off the end,
+/// and a lone `"` is one match, not two.
+fn unquote(v: str) -> str {
+    var s = v
+    if s.starts_with("\"") {
+        s = s.substr(1, s.len() - 1)
+        if s.ends_with("\"") and v.len() > 1 {
+            s = s.substr(0, s.len() - 1)
+        }
+        return s
+    }
+    if s.ends_with("\"") {
+        return s.substr(0, s.len() - 1)
+    }
+    return s
+}
+
+pub fn format_cache_control(cc: [(str, HcVal)]) -> Option[str] {
+    var parts: [str] = []
+    for (k, v) in cc {
+        parts.push(match v {
+            HcFlag -> k
+            HcText(t) -> k + "=" + t
+        })
+    }
+    if parts.len() == 0 {
+        return None
+    }
+    return Some(parts.join(", "))
+}
+
+// ---- dates, as V8's `Date.parse` reads the forms HTTP uses
+
+type HcTok =
+    | HcNum(value: i64, digits: i64)
+    | HcWord(word: str)
+    | HcSym(sym: i64)
+
+fn date_tokens(s: str) -> [HcTok] {
+    let cs = s.codes()
+    var out: [HcTok] = []
+    var i = 0
+    while i < cs.len() {
+        let c = cs[i]
+        if is_digit(c) {
+            var v = 0
+            let st = i
+            while i < cs.len() and is_digit(cs[i]) {
+                if i - st < 15 {
+                    v = v * 10 + cs[i] - 48
+                }
+                i = i + 1
+            }
+            out.push(HcNum(v, i - st))
+        } else if (c >= 65 and c <= 90) or (c >= 97 and c <= 122) {
+            let st = i
+            while i < cs.len() and ((cs[i] >= 65 and cs[i] <= 90) or (cs[i] >= 97 and cs[i] <= 122)) {
+                i = i + 1
+            }
+            out.push(HcWord(s.substr(st, i - st).to_lower()))
+        } else {
+            if not js_ws(c) and c != 44 {
+                out.push(HcSym(c))
+            }
+            i = i + 1
+        }
+    }
+    return out
+}
+
+fn month_of(w: str) -> i64 {
+    let names = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"]
+    if w.len() < 3 {
+        return 0
+    }
+    let head = w.substr(0, 3)
+    for (i, n) in names.enumerate() {
+        if n == head {
+            return i + 1
+        }
+    }
+    return 0
+}
+
+/// Days from 1970-01-01 to the first of a month, any year.
+fn days_from_civil(y0: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y0 - 1 } else { y0 }
+    let era = if y >= 0 { y / 400 } else { (y - 399) / 400 }
+    let yoe = y - era * 400
+    let mp = if m > 2 { m - 3 } else { m + 9 }
+    let doy = (153 * mp + 2) / 5 + d - 1
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy
+    return era * 146097 + doe - 719468
+}
+
+type HcClock = { h: i64, m: i64, s: i64, set: bool }
+
+/// The time part after a number and a colon: `hh:mm` or `hh:mm:ss`.
+fn read_clock(toks: [HcTok], at: i64, h: i64) -> (HcClock, i64) {
+    var i = at + 1
+    var mm = 0
+    var ss = 0
+    var ok = false
+    if i < toks.len() {
+        match toks[i] {
+            HcNum(v, _d) -> {
+                mm = v
+                ok = true
+                i = i + 1
+            }
+            _ -> {}
+        }
+    }
+    if ok and i + 1 < toks.len() {
+        match (toks[i], toks[i + 1]) {
+            (HcSym(58), HcNum(v, _d)) -> {
+                ss = v
+                i = i + 2
+            }
+            _ -> {}
+        }
+    }
+    return (HcClock{ h: h, m: mm, s: ss, set: ok }, i)
+}
+
+/// `Date.parse` for the shapes an HTTP date takes -- IMF-fixdate, RFC 850,
+/// asctime -- and for a bare number, which V8 reads as a year. NaN for
+/// anything it cannot read.
+pub fn date_parse(s: str) -> f64 {
+    let toks = date_tokens(s)
+    var nums: [i64] = []
+    var month = 0
+    var clock = HcClock{ h: 0, m: 0, s: 0, set: false }
+    var tz = 0
+    var seen_number = false
+    var i = 0
+    while i < toks.len() {
+        match toks[i] {
+            HcNum(v, _d) -> {
+                seen_number = true
+                let colon = i + 1 < toks.len() and match toks[i + 1] {
+                    HcSym(58) -> true
+                    _ -> false
+                }
+                if colon and not clock.set {
+                    let (c, next) = read_clock(toks, i + 1, v)
+                    if not c.set {
+                        return nan()
+                    }
+                    clock = c
+                    i = next
+                    continue
+                }
+                nums.push(v)
+            }
+            HcWord(w) -> {
+                let m = month_of(w)
+                if m > 0 {
+                    month = m
+                } else if w == "gmt" or w == "utc" or w == "ut" or w == "z" {
+                    tz = 0
+                } else if seen_number {
+                    return nan()
+                }
+            }
+            HcSym(c) -> {
+                // A sign after the time is an offset, `+0200` or `-05:30`.
+                if (c == 43 or c == 45) and clock.set and i + 1 < toks.len() {
+                    match toks[i + 1] {
+                        HcNum(v, d) -> {
+                            let mins = if d <= 2 { v * 60 } else { v / 100 * 60 + v % 100 }
+                            tz = if c == 45 { 0 - mins } else { mins }
+                            i = i + 2
+                            continue
+                        }
+                        _ -> {}
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+    return compose_date(nums, month, clock, tz)
+}
+
+fn compose_date(nums: [i64], month: i64, clock: HcClock, tz: i64) -> f64 {
+    var year = 0
+    var mon = month
+    var day = 1
+    if month > 0 {
+        if nums.len() != 2 {
+            return nan()
+        }
+        day = nums[0]
+        year = nums[1]
+    } else {
+        if nums.len() != 1 {
+            return nan()
+        }
+        year = nums[0]
+        mon = 1
+    }
+    if year >= 0 and year <= 49 {
+        year = year + 2000
+    } else if year >= 50 and year <= 99 {
+        year = year + 1900
+    }
+    if day < 1 or day > 31 {
+        return nan()
+    }
+    let midnight = clock.h == 24 and clock.m == 0 and clock.s == 0
+    if (clock.h > 23 and not midnight) or clock.m > 59 or clock.s > 59 {
+        return nan()
+    }
+    let days = days_from_civil(year, mon, 1) + day - 1
+    let ms = days.as_f64() * 86400000.0 + (clock.h * 3600 + clock.m * 60 + clock.s - tz * 60).as_f64() * 1000.0
+    if ms.abs() > 8640000000000000.0 {
+        return nan()
+    }
+    return ms
+}
+
+fn pad2(n: i64) -> str {
+    return if n < 10 { "0" + n.to_str() } else { n.to_str() }
+}
+
+/// `Date.prototype.toUTCString`.
+pub fn to_utc_string(ms: f64) -> str {
+    let days = (ms / 86400000.0).floor().as_i64()
+    let secs = ((ms - days.as_f64() * 86400000.0) / 1000.0).floor().as_i64()
+    let z = days + 719468
+    let era = if z >= 0 { z / 146097 } else { (z - 146096) / 146097 }
+    let doe = z - era * 146097
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100)
+    let mp = (5 * doy + 2) / 153
+    let d = doy - (153 * mp + 2) / 5 + 1
+    let m = if mp < 10 { mp + 3 } else { mp - 9 }
+    let y = yoe + era * 400 + (if m <= 2 { 1 } else { 0 })
+    let wd = ((days + 4) % 7 + 7) % 7
+    let wnames = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
+    let mnames = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+    let year = y.to_str().pad_start(4, "0")
+    return "{wnames[wd]}, {pad2(d)} {mnames[m - 1]} {year} {pad2(secs / 3600)}:{pad2(secs / 60 % 60)}:{pad2(secs % 60)} GMT"
+}
+
+// ---- the policy
+
+fn understood_status(s: i64) -> bool {
+    return [200, 203, 204, 300, 301, 302, 303, 307, 308, 404, 405, 410, 414, 501].contains(s)
+}
+
+fn cacheable_by_default(s: i64) -> bool {
+    return [200, 203, 204, 206, 300, 301, 308, 404, 405, 410, 414, 501].contains(s)
+}
+
+fn hop_by_hop(name: str) -> bool {
+    return ["date", "connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailer", "transfer-encoding",
+        "upgrade"].contains(name)
+}
+
+/// A new policy for a response to a request, received at `now`.
+pub fn new_policy(req: HcRequest, res: HcResponse, opts: HcOptions, now: f64) -> HcPolicy {
+    var res_headers = res.headers
+    var rescc = parse_cache_control(hval(res.headers, "cache-control"))
+    if opts.ignore_cargo_cult and cc_has(rescc, "pre-check") and cc_has(rescc, "post-check") {
+        for k in ["pre-check", "post-check", "no-cache", "no-store", "must-revalidate"] {
+            rescc = cc_del(rescc, k)
+        }
+        res_headers = match format_cache_control(rescc) {
+            Some(t) -> hset(res_headers, "cache-control", t)
+            // JavaScript assigns `undefined`, which keeps the key.
+            None -> hset(res_headers, "cache-control", "\u{0}undefined")
+        }
+        res_headers = hdel(hdel(res_headers, "expires"), "pragma")
+    }
+    if hval(res.headers, "cache-control").is_none() and (hval(res.headers, "pragma") ?? "undefined").contains("no-cache") {
+        rescc = cc_set(rescc, "no-cache", HcFlag)
+    }
+    return HcPolicy{
+        response_time: now,
+        shared: opts.shared,
+        heuristic: opts.heuristic,
+        immutable_min_ttl: opts.immutable_min_ttl,
+        ignore_cargo_cult: opts.ignore_cargo_cult,
+        status: res.status ?? 200,
+        res_headers: res_headers,
+        rescc: rescc,
+        method: req.method ?? "GET",
+        url: req.url,
+        host: hget(req.headers, "host"),
+        no_authorization: not truthy(hget(req.headers, "authorization")),
+        req_headers: if truthy(hval(res.headers, "vary")) { Some(req.headers) } else { None },
+        reqcc: parse_cache_control(hget(req.headers, "cache-control")),
+    }
+}
+
+fn rh(p: HcPolicy, name: str) -> Option[str] {
+    return hval(p.res_headers, name)
+}
+
+/// A header's value, where the `undefined` the cargo-cult rewrite can leave
+/// behind reads as absent, as it does in JavaScript.
+fn hval(h: [(str, str)], name: str) -> Option[str] {
+    return match hget(h, name) {
+        Some(t) -> if t == "\u{0}undefined" { None } else { Some(t) }
+        None -> None
+    }
+}
+
+fn has_explicit_expiration(p: HcPolicy) -> bool {
+    return (p.shared and cc_truthy(p.rescc, "s-maxage")) or cc_truthy(p.rescc, "max-age") or truthy(rh(p, "expires"))
+}
+
+fn allows_storing_authenticated(p: HcPolicy) -> bool {
+    return cc_truthy(p.rescc, "must-revalidate") or cc_truthy(p.rescc, "public") or cc_truthy(p.rescc, "s-maxage")
+}
+
+pub fn storable(p: HcPolicy) -> bool {
+    let method_ok = p.method == "GET" or p.method == "HEAD" or (p.method == "POST" and has_explicit_expiration(p))
+    let lifetime = truthy(rh(p, "expires")) or cc_truthy(p.rescc, "max-age") or (p.shared and cc_truthy(p.rescc, "s-maxage")) or
+    cc_truthy(p.rescc, "public") or cacheable_by_default(p.status)
+    return not cc_truthy(p.reqcc, "no-store") and method_ok and understood_status(p.status) and not cc_truthy(p.rescc, "no-store") and
+    (not p.shared or not cc_truthy(p.rescc, "private")) and (not p.shared or p.no_authorization or allows_storing_authenticated(p)) and
+    lifetime
+}
+
+/// The server's `Date`, or when the response arrived.
+pub fn server_date(p: HcPolicy) -> f64 {
+    let d = date_parse(rh(p, "date") ?? "")
+    return if d.is_finite() { d } else { p.response_time }
+}
+
+pub fn age(p: HcPolicy, now: f64) -> f64 {
+    return number_or_zero(rh(p, "age")) + (now - p.response_time) / 1000.0
+}
+
+/// Freshness lifetime in seconds.
+pub fn max_age(p: HcPolicy) -> f64 {
+    if not storable(p) or cc_truthy(p.rescc, "no-cache") {
+        return 0.0
+    }
+    if p.shared and truthy(rh(p, "set-cookie")) and not cc_truthy(p.rescc, "public") and not cc_truthy(p.rescc, "immutable") {
+        return 0.0
+    }
+    if rh(p, "vary") == Some("*") {
+        return 0.0
+    }
+    if p.shared {
+        if cc_truthy(p.rescc, "proxy-revalidate") {
+            return 0.0
+        }
+        if cc_truthy(p.rescc, "s-maxage") {
+            return number_or_zero(cc_text(p.rescc, "s-maxage"))
+        }
+    }
+    if cc_truthy(p.rescc, "max-age") {
+        return number_or_zero(cc_text(p.rescc, "max-age"))
+    }
+    let floor_ttl = if cc_truthy(p.rescc, "immutable") { p.immutable_min_ttl } else { 0.0 }
+    let sd = server_date(p)
+    if truthy(rh(p, "expires")) {
+        let ex = date_parse(rh(p, "expires") ?? "")
+        if ex.is_nan() or ex < sd {
+            return 0.0
+        }
+        return floor_ttl.max((ex - sd) / 1000.0)
+    }
+    if truthy(rh(p, "last-modified")) {
+        let lm = date_parse(rh(p, "last-modified") ?? "")
+        if lm.is_finite() and sd > lm {
+            return floor_ttl.max((sd - lm) / 1000.0 * p.heuristic)
+        }
+    }
+    return floor_ttl
+}
+
+pub fn stale(p: HcPolicy, now: f64) -> bool {
+    return max_age(p) <= age(p, now)
+}
+
+/// Milliseconds the entry is worth keeping, stale-if-error and
+/// stale-while-revalidate included.
+pub fn time_to_live(p: HcPolicy, now: f64) -> f64 {
+    let a = max_age(p) - age(p, now)
+    let sie = a + number_or_zero(cc_text(p.rescc, "stale-if-error"))
+    let swr = a + number_or_zero(cc_text(p.rescc, "stale-while-revalidate"))
+    return js_round(0.0.max(a).max(sie).max(swr) * 1000.0)
+}
+
+fn use_stale_if_error(p: HcPolicy, now: f64) -> bool {
+    return max_age(p) + number_or_zero(cc_text(p.rescc, "stale-if-error")) > age(p, now)
+}
+
+pub fn use_stale_while_revalidate(p: HcPolicy, now: f64) -> bool {
+    let swr = number_or_zero(cc_text(p.rescc, "stale-while-revalidate"))
+    return swr > 0.0 and max_age(p) + swr > age(p, now)
+}
+
+fn vary_matches(p: HcPolicy, req: HcRequest) -> bool {
+    let vary = rh(p, "vary")
+    if not truthy(vary) {
+        return true
+    }
+    let v = vary ?? ""
+    if v == "*" {
+        return false
+    }
+    let stored = p.req_headers ?? []
+    for raw in js_trim(v).to_lower().split(",") {
+        let name = js_trim_ws_only(raw)
+        if hget(req.headers, name) != hget(stored, name) {
+            return false
+        }
+    }
+    return true
+}
+
+/// The pieces of `split(/\s*,\s*/)`: whitespace beside the commas goes, and
+/// only that whitespace -- `\s` is JavaScript's, the same set `trim` uses.
+fn js_trim_ws_only(s: str) -> str {
+    return js_trim(s)
+}
+
+fn request_matches(p: HcPolicy, req: HcRequest, allow_head: bool) -> bool {
+    let url_ok = match p.url {
+        Some(u) -> u.len() == 0 or req.url == Some(u)
+        None -> true
+    }
+    let method_ok = match req.method {
+        Some(m) -> m.len() == 0 or m == p.method or (allow_head and m == "HEAD")
+        None -> true
+    }
+    return url_ok and p.host == hget(req.headers, "host") and method_ok and vary_matches(p, req)
+}
+
+fn copy_without_hop_by_hop(h: [(str, str)]) -> [(str, str)] {
+    var out = h.filter(|e| not hop_by_hop(e.0))
+    match hget(h, "connection") {
+        Some(c) -> {
+            if c.len() > 0 {
+                for raw in js_trim(c).split(",") {
+                    out = hdel(out, js_trim(raw))
+                }
+            }
+        }
+        None -> {}
+    }
+    match hget(out, "warning") {
+        Some(w) -> {
+            if w.len() > 0 {
+                let kept = w.split(",").filter(|x| not warning_1xx(x))
+                if kept.len() == 0 {
+                    out = hdel(out, "warning")
+                } else {
+                    out = hset(out, "warning", js_trim(kept.join(",")))
+                }
+            }
+        }
+        None -> {}
+    }
+    return out
+}
+
+/// `/^\s*1[0-9][0-9]/`.
+fn warning_1xx(w: str) -> bool {
+    let cs = js_trim(w + "x").codes()
+    return cs.len() >= 3 and cs[0] == 49 and is_digit(cs[1]) and is_digit(cs[2])
+}
+
+/// The stored response's headers as they should be served at `now`, with
+/// `Age` and `Date` brought up to date.
+pub fn response_headers(p: HcPolicy, now: f64) -> [(str, str)] {
+    var h = copy_without_hop_by_hop(p.res_headers.filter(|e| e.1 != "\u{0}undefined"))
+    let a = age(p, now)
+    if a > 86400.0 and not has_explicit_expiration(p) and max_age(p) > 86400.0 {
+        let prior = hget(h, "warning") ?? ""
+        h = hset(h, "warning", (if prior.len() > 0 { prior + ", " } else { "" }) + "113 - \"rfc7234 5.5.4\"")
+    }
+    h = hset(h, "age", js_int_text(js_round(a)))
+    return hset(h, "date", to_utc_string(now))
+}
+
+/// The headers to send upstream to revalidate the stored response.
+pub fn revalidation_headers(p: HcPolicy, req: HcRequest) -> [(str, str)] {
+    var h = hdel(copy_without_hop_by_hop(req.headers), "if-range")
+    if not request_matches(p, req, true) or not storable(p) {
+        return hdel(hdel(h, "if-none-match"), "if-modified-since")
+    }
+    match rh(p, "etag") {
+        Some(etag) -> {
+            if etag.len() > 0 {
+                let prior = hget(h, "if-none-match") ?? ""
+                h = hset(h, "if-none-match", if prior.len() > 0 { prior + ", " + etag } else { etag })
+            }
+        }
+        None -> {}
+    }
+    let forbids_weak = truthy(hget(h, "accept-ranges")) or truthy(hget(h, "if-match")) or truthy(hget(h, "if-unmodified-since")) or
+    (p.method.len() > 0 and p.method != "GET")
+    if forbids_weak {
+        h = hdel(h, "if-modified-since")
+        let inm = hget(h, "if-none-match") ?? ""
+        if inm.len() > 0 {
+            let strong = inm.split(",").filter(|t| not weak_etag(t))
+            if strong.len() == 0 {
+                h = hdel(h, "if-none-match")
+            } else {
+                h = hset(h, "if-none-match", js_trim(strong.join(",")))
+            }
+        }
+    } else if truthy(rh(p, "last-modified")) and not truthy(hget(h, "if-modified-since")) {
+        h = hset(h, "if-modified-since", rh(p, "last-modified") ?? "")
+    }
+    return h
+}
+
+/// `/^\s*W\//`.
+fn weak_etag(t: str) -> bool {
+    return js_trim(t + "x").starts_with("W/")
+}
+
+fn strip_weak(t: str) -> str {
+    let s = js_trim(t + "x")
+    let body = s.substr(0, s.len() - 1)
+    if body.starts_with("W/") {
+        return body.substr(2, body.len() - 2)
+    }
+    return t
+}
+
+fn miss(p: HcPolicy, req: HcRequest) -> HcEvaluation {
+    return HcEvaluation{ response: None, revalidation: Some(HcRevalidation{ synchronous: true, headers: revalidation_headers(p, req) }) }
+}
+
+/// Whether the stored response may answer `req` at `now`, and what to
+/// revalidate with when it may not, or may only while revalidating.
+pub fn evaluate_request(p: HcPolicy, req: HcRequest, now: f64) -> HcEvaluation {
+    if cc_truthy(p.rescc, "must-revalidate") or not request_matches(p, req, false) {
+        return miss(p, req)
+    }
+    let rcc = parse_cache_control(hget(req.headers, "cache-control"))
+    if cc_truthy(rcc, "no-cache") or (hget(req.headers, "pragma") ?? "undefined").contains("no-cache") {
+        return miss(p, req)
+    }
+    if cc_truthy(rcc, "max-age") and age(p, now) > number_or_zero(cc_text(rcc, "max-age")) {
+        return miss(p, req)
+    }
+    if cc_truthy(rcc, "min-fresh") and max_age(p) - age(p, now) < number_or_zero(cc_text(rcc, "min-fresh")) {
+        return miss(p, req)
+    }
+    if stale(p, now) {
+        let allows = match cc_get(rcc, "max-stale") {
+            Some(HcFlag) -> true
+            Some(HcText(t)) -> js_to_number(t) > age(p, now) - max_age(p)
+            None -> false
+        }
+        if allows {
+            return HcEvaluation{ response: Some(response_headers(p, now)), revalidation: None }
+        }
+        if use_stale_while_revalidate(p, now) {
+            return HcEvaluation{ response: Some(response_headers(p, now)),
+                revalidation: Some(HcRevalidation{ synchronous: false, headers: revalidation_headers(p, req) }) }
+        }
+        return miss(p, req)
+    }
+    return HcEvaluation{ response: Some(response_headers(p, now)), revalidation: None }
+}
+
+pub fn satisfies_without_revalidation(p: HcPolicy, req: HcRequest, now: f64) -> bool {
+    return evaluate_request(p, req, now).revalidation.is_none()
+}
+
+fn is_error_response(res: Option[HcResponse]) -> bool {
+    return match res {
+        Some(r) -> match r.status {
+            Some(s) -> [500, 502, 503, 504].contains(s)
+            None -> false
+        }
+        None -> true
+    }
+}
+
+fn options_of(p: HcPolicy) -> HcOptions {
+    return HcOptions{ shared: p.shared, heuristic: p.heuristic, immutable_min_ttl: p.immutable_min_ttl, ignore_cargo_cult: p.ignore_cargo_cult }
+}
+
+fn validators_match(p: HcPolicy, res: HcResponse) -> bool {
+    match res.status {
+        Some(s) -> {
+            if s != 304 {
+                return false
+            }
+        }
+        None -> {}
+    }
+    let new_etag = hget(res.headers, "etag") ?? ""
+    let old_etag = rh(p, "etag") ?? ""
+    if new_etag.len() > 0 and not weak_etag(new_etag) {
+        return old_etag.len() > 0 and strip_weak(old_etag) == new_etag
+    }
+    if old_etag.len() > 0 and new_etag.len() > 0 {
+        return strip_weak(old_etag) == strip_weak(new_etag)
+    }
+    if truthy(rh(p, "last-modified")) {
+        return rh(p, "last-modified") == hget(res.headers, "last-modified")
+    }
+    return old_etag.len() == 0 and not truthy(rh(p, "last-modified")) and new_etag.len() == 0 and
+    not truthy(hget(res.headers, "last-modified"))
+}
+
+/// The policy after a revalidation response arrives at `now`: a 304 whose
+/// validators match updates the stored headers; anything else replaces the
+/// entry. An error, or no response, keeps the old entry while
+/// `stale-if-error` allows.
+pub fn revalidated_policy(p: HcPolicy, req: HcRequest, res: Option[HcResponse], now: f64) -> HcRevalidated ! HcError {
+    if use_stale_if_error(p, now) and is_error_response(res) {
+        return HcRevalidated{ policy: p, modified: false, matches: true }
+    }
+    let r = match res {
+        Some(x) -> x
+        None -> fail(ResponseMissing)
+    }
+    let not_304 = match r.status {
+        Some(s) -> s != 304
+        None -> true
+    }
+    if not validators_match(p, r) {
+        return HcRevalidated{ policy: new_policy(req, r, options_of(p), now), modified: not_304, matches: false }
+    }
+    var headers: [(str, str)] = []
+    for (k, v) in p.res_headers {
+        let replace = hget(r.headers, k).is_some() and not ["content-length", "content-encoding", "transfer-encoding", "content-range"].contains(k)
+        headers.push((k, if replace { hget(r.headers, k) ?? v } else { v }))
+    }
+    let merged = HcResponse{ status: Some(p.status), headers: headers }
+    return HcRevalidated{ policy: new_policy(req, merged, options_of(p), now), modified: false, matches: true }
+}

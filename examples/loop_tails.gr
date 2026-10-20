@@ -1,0 +1,41 @@
+// What a block's last statement leaves behind when nothing reads it.
+//
+// A block hands its last statement's value back to whoever ran it, owned, so
+// a loop over a list must release it each time round: `for s in xs { f() }`
+// throws away what `f()` returned. The loop over a range did; the loop over a
+// list dropped the value without releasing it, one per iteration, and the
+// answer printed was right. pyurlparse's `urljoin` met it as a discarded
+// `resolved.pop()`. Both forms of `parallel` block -- its own body and each
+// `spawn` in it -- had the same fault. scripts/leakcheck.sh runs this.
+fn word(n: i64) -> str {
+    return "w" + n.to_str()
+}
+
+fn main() {
+    var stack = [word(1), word(2), word(3)]
+    for s in ["..", "a", ".."] {
+        if s == ".." {
+            stack.pop()
+        } else {
+            stack.push(s + "!")
+        }
+    }
+    print(stack.join("/"))
+
+    var seen = 0
+    for k in [4, 5] {
+        seen = seen + k
+        word(k)
+    }
+    print(seen.to_str())
+
+    var log = ""
+    parallel {
+        spawn {
+            log += "a"
+            word(6)
+        }
+        word(7)
+    }
+    print(log)
+}

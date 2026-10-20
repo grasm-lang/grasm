@@ -1,0 +1,723 @@
+// pprof profiles: the `profile.proto` that Go's `runtime/pprof`, Linux
+// `perf` converters, Java async-profiler and most profilers now write,
+// gzipped or not, read and printed back.
+//
+// Held to the parser Go 1.25 ships (`github.com/google/pprof/profile`, as
+// vendored in the toolchain): `parse` accepts what its `ParseData` accepts
+// -- the protobuf form; the old text formats it falls back to are not read
+// here and come back as errors -- with the same checks, and `to_string`
+// writes what its `String` writes, which is what `go tool pprof -raw`
+// prints before that tool merges and aggregates. Times print in UTC (the
+// reference runs under TZ=UTC).
+//
+// IDs and addresses are unsigned 64-bit in the format. They are held here
+// in an `i64` with the same bits, and printed unsigned.
+import gzip
+
+type PpValueType = { kind: str, unit: str }
+
+type PpLabel = { key: str, text: Option[str], num: i64, unit: Option[str] }
+
+type PpSample = { locations: [i64], values: [i64], labels: [PpLabel] }
+
+type PpMapping = {
+    id: i64,
+    start: i64,
+    limit: i64,
+    offset: i64,
+    file: str,
+    build_id: str,
+    has_functions: bool,
+    has_filenames: bool,
+    has_line_numbers: bool,
+    has_inline_frames: bool,
+}
+
+type PpLine = { function_id: i64, line: i64, column: i64 }
+
+type PpLocation = { id: i64, mapping_id: i64, address: i64, lines: [PpLine], is_folded: bool }
+
+type PpFunction = { id: i64, name: str, system_name: str, filename: str, start_line: i64 }
+
+type PpProfile = {
+    sample_types: [PpValueType],
+    samples: [PpSample],
+    mappings: [PpMapping],
+    locations: [PpLocation],
+    functions: [PpFunction],
+    drop_frames: str,
+    keep_frames: str,
+    time_nanos: i64,
+    duration_nanos: i64,
+    period_type: PpValueType,
+    period: i64,
+    comments: [str],
+    default_sample_type: str,
+    doc_url: str,
+}
+
+type PpError =
+    | Empty
+    | Gzip
+    | Malformed(why: str)
+    | Concatenated
+    | Invalid(why: str)
+
+// ---- the wire format, as the reference decodes it
+
+type PpField = { number: i64, wire: i64, value: i64, data: bytes }
+
+fn varint(d: bytes, at: i64) -> (i64, i64) ! PpError {
+    var u = 0
+    var i = 0
+    while true {
+        if i >= 10 or at + i >= d.len() {
+            fail(Malformed("bad varint"))
+        }
+        let b = d.at(at + i)
+        u = u.bit_or(b.bit_and(127).shl(7 * i))
+        if b.bit_and(128) == 0 {
+            return (u, at + i + 1)
+        }
+        i = i + 1
+    }
+    return (u, at)
+}
+
+fn u_le(d: bytes, at: i64, n: i64) -> i64 {
+    var v = 0
+    for k in 0..n {
+        v = v.bit_or(d.at(at + k).shl(8 * k))
+    }
+    return v
+}
+
+/// Every field of one message, in order.
+fn fields(d: bytes) -> [PpField] ! PpError {
+    var out: [PpField] = []
+    var at = 0
+    let empty = bytes_of([])
+    while at < d.len() {
+        let (key, next) = try varint(d, at)
+        at = next
+        let wire = key.bit_and(7)
+        let number = key.ushr(3)
+        if wire == 0 {
+            let (v, n2) = try varint(d, at)
+            at = n2
+            out.push(PpField{ number: number, wire: 0, value: v, data: empty })
+        } else if wire == 1 {
+            if at + 8 > d.len() {
+                fail(Malformed("not enough data"))
+            }
+            out.push(PpField{ number: number, wire: 1, value: u_le(d, at, 8), data: empty })
+            at = at + 8
+        } else if wire == 2 {
+            let (n, n2) = try varint(d, at)
+            at = n2
+            // The length is unsigned: a varint above 2^63 is "too much".
+            if n < 0 or n > d.len() - at {
+                fail(Malformed("too much data"))
+            }
+            out.push(PpField{ number: number, wire: 2, value: 0, data: d.slice(at, at + n) })
+            at = at + n
+        } else if wire == 5 {
+            if at + 4 > d.len() {
+                fail(Malformed("not enough data"))
+            }
+            out.push(PpField{ number: number, wire: 5, value: u_le(d, at, 4), data: empty })
+            at = at + 4
+        } else {
+            fail(Malformed("unknown wire type"))
+        }
+    }
+    return out
+}
+
+fn int_of(f: PpField) -> i64 ! PpError {
+    if f.wire != 0 {
+        fail(Malformed("type mismatch"))
+    }
+    return f.value
+}
+
+/// A repeated integer field, packed or one at a time.
+fn ints_of(f: PpField, inout out: [i64]) -> () ! PpError {
+    if f.wire == 2 {
+        var at = 0
+        while at < f.data.len() {
+            let (v, n) = try varint(f.data, at)
+            out.push(v)
+            at = n
+        }
+        return ()
+    }
+    out.push(try int_of(f))
+    return ()
+}
+
+fn message_of(f: PpField) -> [PpField] ! PpError {
+    if f.wire != 2 {
+        fail(Malformed("type mismatch"))
+    }
+    return try fields(f.data)
+}
+
+// ---- the raw messages, with string-table indices still unresolved
+
+type PpRawLabel = { key: i64, text: i64, num: i64, unit: i64 }
+
+type PpRaw = {
+    sample_types: [(i64, i64)],
+    samples: [([i64], [i64], [PpRawLabel])],
+    mappings: [(PpMapping, i64, i64)],
+    locations: [PpLocation],
+    functions: [(i64, i64, i64, i64, i64)],
+    strings: [str],
+    drop: i64,
+    keep: i64,
+    time: i64,
+    duration: i64,
+    period_type: Option[(i64, i64)],
+    period: i64,
+    comments: [i64],
+    default_type: i64,
+    doc: i64,
+}
+
+fn value_type(f: PpField) -> (i64, i64) ! PpError {
+    var t = 0
+    var u = 0
+    for g in try message_of(f) {
+        if g.number == 1 {
+            t = try int_of(g)
+        } else if g.number == 2 {
+            u = try int_of(g)
+        }
+    }
+    return (t, u)
+}
+
+fn raw_sample(f: PpField) -> ([i64], [i64], [PpRawLabel]) ! PpError {
+    var locs: [i64] = []
+    var values: [i64] = []
+    var labels: [PpRawLabel] = []
+    for g in try message_of(f) {
+        if g.number == 1 {
+            try ints_of(g, locs)
+        } else if g.number == 2 {
+            try ints_of(g, values)
+        } else if g.number == 3 {
+            var l = PpRawLabel{ key: 0, text: 0, num: 0, unit: 0 }
+            for h in try message_of(g) {
+                if h.number == 1 {
+                    l = PpRawLabel{ key: try int_of(h), text: l.text, num: l.num, unit: l.unit }
+                } else if h.number == 2 {
+                    l = PpRawLabel{ key: l.key, text: try int_of(h), num: l.num, unit: l.unit }
+                } else if h.number == 3 {
+                    l = PpRawLabel{ key: l.key, text: l.text, num: try int_of(h), unit: l.unit }
+                } else if h.number == 4 {
+                    l = PpRawLabel{ key: l.key, text: l.text, num: l.num, unit: try int_of(h) }
+                }
+            }
+            labels.push(l)
+        }
+    }
+    return (locs, values, labels)
+}
+
+fn raw_mapping(f: PpField) -> (PpMapping, i64, i64) ! PpError {
+    var m = PpMapping{ id: 0, start: 0, limit: 0, offset: 0, file: "", build_id: "", has_functions: false, has_filenames: false,
+        has_line_numbers: false, has_inline_frames: false }
+    var file = 0
+    var build = 0
+    for g in try message_of(f) {
+        let n = g.number
+        if n >= 1 and n <= 10 {
+            let v = try int_of(g)
+            if n == 1 {
+                m = PpMapping{ id: v, start: m.start, limit: m.limit, offset: m.offset, file: m.file, build_id: m.build_id, has_functions: m.has_functions,
+                    has_filenames: m.has_filenames, has_line_numbers: m.has_line_numbers, has_inline_frames: m.has_inline_frames }
+            } else if n == 2 {
+                m = PpMapping{ id: m.id, start: v, limit: m.limit, offset: m.offset, file: m.file, build_id: m.build_id, has_functions: m.has_functions,
+                    has_filenames: m.has_filenames, has_line_numbers: m.has_line_numbers, has_inline_frames: m.has_inline_frames }
+            } else if n == 3 {
+                m = PpMapping{ id: m.id, start: m.start, limit: v, offset: m.offset, file: m.file, build_id: m.build_id, has_functions: m.has_functions,
+                    has_filenames: m.has_filenames, has_line_numbers: m.has_line_numbers, has_inline_frames: m.has_inline_frames }
+            } else if n == 4 {
+                m = PpMapping{ id: m.id, start: m.start, limit: m.limit, offset: v, file: m.file, build_id: m.build_id, has_functions: m.has_functions,
+                    has_filenames: m.has_filenames, has_line_numbers: m.has_line_numbers, has_inline_frames: m.has_inline_frames }
+            } else if n == 5 {
+                file = v
+            } else if n == 6 {
+                build = v
+            } else {
+                m = mapping_flag(m, n, v != 0)
+            }
+        }
+    }
+    return (m, file, build)
+}
+
+fn mapping_flag(m: PpMapping, n: i64, b: bool) -> PpMapping {
+    return PpMapping{ id: m.id, start: m.start, limit: m.limit, offset: m.offset, file: m.file, build_id: m.build_id,
+        has_functions: if n == 7 { b } else { m.has_functions }, has_filenames: if n == 8 { b } else { m.has_filenames },
+        has_line_numbers: if n == 9 { b } else { m.has_line_numbers }, has_inline_frames: if n == 10 { b } else { m.has_inline_frames } }
+}
+
+fn raw_location(f: PpField) -> PpLocation ! PpError {
+    var id = 0
+    var mapping = 0
+    var address = 0
+    var lines: [PpLine] = []
+    var folded = false
+    for g in try message_of(f) {
+        if g.number == 1 {
+            id = try int_of(g)
+        } else if g.number == 2 {
+            mapping = try int_of(g)
+        } else if g.number == 3 {
+            address = try int_of(g)
+        } else if g.number == 4 {
+            var ln = PpLine{ function_id: 0, line: 0, column: 0 }
+            for h in try message_of(g) {
+                if h.number == 1 {
+                    ln = PpLine{ function_id: try int_of(h), line: ln.line, column: ln.column }
+                } else if h.number == 2 {
+                    ln = PpLine{ function_id: ln.function_id, line: try int_of(h), column: ln.column }
+                } else if h.number == 3 {
+                    ln = PpLine{ function_id: ln.function_id, line: ln.line, column: try int_of(h) }
+                }
+            }
+            lines.push(ln)
+        } else if g.number == 5 {
+            folded = try int_of(g) != 0
+        }
+    }
+    return PpLocation{ id: id, mapping_id: mapping, address: address, lines: lines, is_folded: folded }
+}
+
+fn raw_function(f: PpField) -> (i64, i64, i64, i64, i64) ! PpError {
+    var v: [i64] = [0, 0, 0, 0, 0]
+    for g in try message_of(f) {
+        if g.number >= 1 and g.number <= 5 {
+            v[g.number - 1] = try int_of(g)
+        }
+    }
+    return (v[0], v[1], v[2], v[3], v[4])
+}
+
+fn decode_raw(d: bytes) -> PpRaw ! PpError {
+    var r = PpRaw{ sample_types: [], samples: [], mappings: [], locations: [], functions: [], strings: [], drop: 0, keep: 0, time: 0, duration: 0,
+        period_type: None, period: 0, comments: [], default_type: 0, doc: 0 }
+    for f in try fields(d) {
+        let n = f.number
+        if n == 1 {
+            r.sample_types.push(try value_type(f))
+        } else if n == 2 {
+            r.samples.push(try raw_sample(f))
+        } else if n == 3 {
+            r.mappings.push(try raw_mapping(f))
+        } else if n == 4 {
+            r.locations.push(try raw_location(f))
+        } else if n == 5 {
+            r.functions.push(try raw_function(f))
+        } else if n == 6 {
+            if f.wire != 2 {
+                fail(Malformed("type mismatch"))
+            }
+            r.strings.push(f.data.to_str())
+            if r.strings[0] != "" {
+                fail(Malformed("string_table[0] must be ''"))
+            }
+        } else if n == 7 {
+            r.drop = try int_of(f)
+        } else if n == 8 {
+            r.keep = try int_of(f)
+        } else if n == 9 {
+            if r.time != 0 {
+                fail(Concatenated)
+            }
+            r.time = try int_of(f)
+        } else if n == 10 {
+            r.duration = try int_of(f)
+        } else if n == 11 {
+            r.period_type = Some(try value_type(f))
+        } else if n == 12 {
+            r.period = try int_of(f)
+        } else if n == 13 {
+            try ints_of(f, r.comments)
+        } else if n == 14 {
+            r.default_type = try int_of(f)
+        } else if n == 15 {
+            r.doc = try int_of(f)
+        }
+    }
+    return r
+}
+
+// ---- resolution, as `postDecode` does it
+
+fn str_at(strings: [str], i: i64) -> str ! PpError {
+    if i < 0 or i >= strings.len() {
+        fail(Malformed("string index"))
+    }
+    return strings[i]
+}
+
+fn resolve(r: PpRaw) -> PpProfile ! PpError {
+    let st = r.strings
+    var mappings: [PpMapping] = []
+    for (m, file, build) in r.mappings {
+        let f = try str_at(st, file)
+        let b = try str_at(st, build)
+        mappings.push(PpMapping{ id: m.id, start: m.start, limit: m.limit, offset: m.offset, file: f, build_id: b, has_functions: m.has_functions,
+            has_filenames: m.has_filenames, has_line_numbers: m.has_line_numbers, has_inline_frames: m.has_inline_frames })
+    }
+    var functions: [PpFunction] = []
+    for (id, name, system, file, start) in r.functions {
+        functions.push(PpFunction{ id: id, name: try str_at(st, name), system_name: try str_at(st, system), filename: try str_at(st, file), start_line: start })
+    }
+    var types: [PpValueType] = []
+    for (t, u) in r.sample_types {
+        types.push(PpValueType{ kind: try str_at(st, t), unit: try str_at(st, u) })
+    }
+    var samples: [PpSample] = []
+    for (locs, values, raw) in r.samples {
+        var labels: [PpLabel] = []
+        for l in raw {
+            let key = try str_at(st, l.key)
+            if l.text != 0 {
+                labels.push(PpLabel{ key: key, text: Some(try str_at(st, l.text)), num: 0, unit: None })
+            } else if l.num != 0 or l.unit != 0 {
+                let unit = if l.unit != 0 { Some(try str_at(st, l.unit)) } else { None }
+                labels.push(PpLabel{ key: key, text: None, num: l.num, unit: unit })
+            }
+        }
+        samples.push(PpSample{ locations: locs, values: values, labels: labels })
+    }
+    let drop = try str_at(st, r.drop)
+    let keep = try str_at(st, r.keep)
+    let (pt, pu) = r.period_type ?? (0, 0)
+    let period_type = PpValueType{ kind: try str_at(st, pt), unit: try str_at(st, pu) }
+    var comments: [str] = []
+    for c in r.comments {
+        comments.push(try str_at(st, c))
+    }
+    let dflt = try str_at(st, r.default_type)
+    let doc = try str_at(st, r.doc)
+    return PpProfile{ sample_types: types, samples: samples, mappings: mappings, locations: r.locations, functions: functions, drop_frames: drop,
+        keep_frames: keep, time_nanos: r.time, duration_nanos: r.duration, period_type: period_type, period: r.period, comments: comments,
+        default_sample_type: dflt, doc_url: doc }
+}
+
+// ---- `CheckValid`
+
+fn check_valid(p: PpProfile) -> () ! PpError {
+    let n = p.sample_types.len()
+    if n == 0 and p.samples.len() != 0 {
+        fail(Invalid("missing sample type information"))
+    }
+    var loc_ids: Map[i64, bool] = map()
+    var map_ids: Map[i64, bool] = map()
+    var fn_ids: Map[i64, bool] = map()
+    for m in p.mappings {
+        if m.id == 0 or map_ids.has(m.id) {
+            fail(Invalid("mapping id"))
+        }
+        map_ids.set(m.id, true)
+    }
+    for f in p.functions {
+        if f.id == 0 or fn_ids.has(f.id) {
+            fail(Invalid("function id"))
+        }
+        fn_ids.set(f.id, true)
+    }
+    for l in p.locations {
+        loc_ids.set(l.id, true)
+    }
+    for s in p.samples {
+        if s.values.len() != n {
+            fail(Invalid("sample values"))
+        }
+        for id in s.locations {
+            if not loc_ids.has(id) {
+                fail(Invalid("sample has nil location"))
+            }
+        }
+    }
+    var seen: Map[i64, bool] = map()
+    for l in p.locations {
+        if l.id == 0 or seen.has(l.id) {
+            fail(Invalid("location id"))
+        }
+        seen.set(l.id, true)
+        for ln in l.lines {
+            if not fn_ids.has(ln.function_id) {
+                fail(Invalid("line with nil function"))
+            }
+        }
+    }
+    return ()
+}
+
+/// A profile from its bytes: gzipped or not.
+pub fn parse(data: bytes) -> PpProfile ! PpError {
+    var d = data
+    if d.len() >= 2 and d.at(0) == 31 and d.at(1) == 139 {
+        d = match gzip.decode_all(d, 1073741824) {
+            Ok(x) -> x
+            Err(_e) -> fail(Gzip)
+        }
+    }
+    if d.len() == 0 {
+        fail(Empty)
+    }
+    let p = try resolve(try decode_raw(d))
+    try check_valid(p)
+    return p
+}
+
+// ---- Go's formatting
+
+fn digits() -> str {
+    return "0123456789abcdef"
+}
+
+/// An unsigned 64-bit value held in an `i64`, in decimal.
+pub fn udec(v: i64) -> str {
+    if v >= 0 {
+        return v.to_str()
+    }
+    // Halve it unsigned, then put the two halves of the division back.
+    let half = v.ushr(1)
+    let q = half / 5
+    let r = v - q * 10
+    return q.to_str() + r.to_str()
+}
+
+/// `%#x` of an unsigned value.
+pub fn uhex(v: i64) -> str {
+    if v == 0 {
+        return "0x0"
+    }
+    var out = ""
+    var x = v
+    while x != 0 {
+        out = digits().substr(x.bit_and(15), 1) + out
+        x = x.ushr(4)
+    }
+    return "0x" + out
+}
+
+fn pad(s: str, w: i64) -> str {
+    return s.pad_start(w, " ")
+}
+
+fn frac(v0: i64, prec: i64) -> (str, i64) {
+    var v = v0
+    var out = ""
+    var print = false
+    for _i in 0..prec {
+        let d = v % 10
+        print = print or d != 0
+        if print {
+            out = d.to_str() + out
+        }
+        v = v / 10
+    }
+    return (if print { "." + out } else { "" }, v)
+}
+
+/// Go's `time.Duration.String`.
+pub fn duration_string(d: i64) -> str {
+    if d == 0 {
+        return "0s"
+    }
+    if d == 0 - 9223372036854775807 - 1 {
+        return "-2562047h47m16.854775808s"
+    }
+    let neg = d < 0
+    let u = if neg { 0 - d } else { d }
+    var body = ""
+    if u < 1000000000 {
+        let (unit, prec) = if u < 1000 { ("ns", 0) } else if u < 1000000 { ("µs", 3) } else { ("ms", 6) }
+        let (f, rest) = frac(u, prec)
+        body = rest.to_str() + f + unit
+    } else {
+        let (f, secs) = frac(u, 9)
+        body = (secs % 60).to_str() + f + "s"
+        let mins = secs / 60
+        if mins > 0 {
+            body = (mins % 60).to_str() + "m" + body
+            let hours = mins / 60
+            if hours > 0 {
+                body = hours.to_str() + "h" + body
+            }
+        }
+    }
+    return if neg { "-" + body } else { body }
+}
+
+fn two(n: i64) -> str {
+    return if n < 10 { "0" + n.to_str() } else { n.to_str() }
+}
+
+/// Go's `time.Time.String` for `time.Unix(0, nanos)` in UTC.
+pub fn time_string(nanos: i64) -> str {
+    let secs = if nanos >= 0 { nanos / 1000000000 } else { (nanos - 999999999) / 1000000000 }
+    let ns = nanos - secs * 1000000000
+    let days = if secs >= 0 { secs / 86400 } else { (secs - 86399) / 86400 }
+    let sod = secs - days * 86400
+    let z = days + 719468
+    let era = if z >= 0 { z / 146097 } else { (z - 146096) / 146097 }
+    let doe = z - era * 146097
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100)
+    let mp = (5 * doy + 2) / 153
+    let day = doy - (153 * mp + 2) / 5 + 1
+    let month = if mp < 10 { mp + 3 } else { mp - 9 }
+    let year = yoe + era * 400 + (if month <= 2 { 1 } else { 0 })
+    let (f, _rest) = frac(ns, 9)
+    return year.to_str().pad_start(4, "0") + "-" + two(month) + "-" + two(day) + " " + two(sod / 3600) + ":" + two(sod / 60 % 60) + ":" +
+    two(sod % 60) + f + " +0000 UTC"
+}
+
+fn label_groups(labels: [PpLabel], numeric: bool) -> [(str, [PpLabel])] {
+    var keys: [str] = []
+    var groups: Map[str, [PpLabel]] = map()
+    for l in labels {
+        if l.text.is_some() == numeric {
+            continue
+        }
+        var g = groups.get(l.key) ?? {
+            keys.push(l.key)
+            []
+        }
+        g.push(l)
+        groups.set(l.key, g)
+    }
+    return keys.map(|k| (k, groups.get(k) ?? []))
+}
+
+fn labels_text(labels: [PpLabel]) -> str {
+    var parts: [str] = []
+    for (k, g) in label_groups(labels, false) {
+        parts.push(k + ":[" + g.map(|l| l.text ?? "").join(" ") + "]")
+    }
+    parts.sort()
+    return parts.join(" ")
+}
+
+fn num_labels_text(labels: [PpLabel]) -> str {
+    var parts: [str] = []
+    for (k, g) in label_groups(labels, true) {
+        // The units list pads with "" up to each unit's position, then to
+        // the number of values -- unless no value had one.
+        let any_unit = g.any(|l| l.unit.is_some())
+        if any_unit {
+            parts.push(k + ":[" + g.map(|l| l.num.to_str() + " " + (l.unit ?? "")).join(" ") + "]")
+        } else {
+            parts.push(k + ":[" + g.map(|l| l.num.to_str()).join(" ") + "]")
+        }
+    }
+    parts.sort()
+    return parts.join(" ")
+}
+
+fn sample_text(s: PpSample) -> str {
+    var sv = ""
+    for v in s.values {
+        sv = sv + " " + pad(v.to_str(), 10)
+    }
+    sv = sv + ": "
+    for id in s.locations {
+        sv = sv + udec(id) + " "
+    }
+    var out = [sv]
+    let header = "                "
+    if s.labels.any(|l| l.text.is_some()) {
+        out.push(header + labels_text(s.labels))
+    }
+    if s.labels.any(|l| l.text.is_none()) {
+        out.push(header + num_labels_text(s.labels))
+    }
+    return out.join("\n")
+}
+
+fn location_text(l: PpLocation, fns: Map[i64, PpFunction], maps: Map[i64, bool]) -> str {
+    var head = pad(udec(l.id), 6) + ": " + uhex(l.address) + " "
+    if maps.has(l.mapping_id) {
+        head = head + "M=" + udec(l.mapping_id) + " "
+    }
+    if l.is_folded {
+        head = head + "[F] "
+    }
+    if l.lines.len() == 0 {
+        return head
+    }
+    var out: [str] = []
+    for ln in l.lines {
+        let f = fns.get(ln.function_id) ?? PpFunction{ id: 0, name: "", system_name: "", filename: "", start_line: 0 }
+        var t = f.name + " " + f.filename + ":" + ln.line.to_str() + ":" + ln.column.to_str() + " s=" + f.start_line.to_str()
+        if f.name != f.system_name {
+            t = t + "(" + f.system_name + ")"
+        }
+        out.push(head + t)
+        head = "             "
+    }
+    return out.join("\n")
+}
+
+fn mapping_text(m: PpMapping) -> str {
+    let bits = (if m.has_functions { "[FN]" } else { "" }) + (if m.has_filenames { "[FL]" } else { "" }) + (if m.has_line_numbers { "[LN]" } else { "" }) +
+    (if m.has_inline_frames { "[IN]" } else { "" })
+    return udec(m.id) + ": " + uhex(m.start) + "/" + uhex(m.limit) + "/" + uhex(m.offset) + " " + m.file + " " + m.build_id + " " + bits
+}
+
+/// What the reference's `Profile.String` writes.
+pub fn to_string(p: PpProfile) -> str {
+    var out: [str] = []
+    for c in p.comments {
+        out.push("Comment: " + c)
+    }
+    if p.doc_url.len() > 0 {
+        out.push("Doc: " + p.doc_url)
+    }
+    out.push("PeriodType: " + p.period_type.kind + " " + p.period_type.unit)
+    out.push("Period: " + p.period.to_str())
+    if p.time_nanos != 0 {
+        out.push("Time: " + time_string(p.time_nanos))
+    }
+    if p.duration_nanos != 0 {
+        // `%.4v`: the first four characters.
+        let d = duration_string(p.duration_nanos)
+        out.push("Duration: " + d.substr(0, 4.min(d.len())))
+    }
+    out.push("Samples:")
+    var head = ""
+    for t in p.sample_types {
+        head = head + t.kind + "/" + t.unit + (if t.kind == p.default_sample_type { "[dflt]" } else { "" }) + " "
+    }
+    out.push(head.trim())
+    for s in p.samples {
+        out.push(sample_text(s))
+    }
+    var fns: Map[i64, PpFunction] = map()
+    for f in p.functions {
+        fns.set(f.id, f)
+    }
+    var maps: Map[i64, bool] = map()
+    for m in p.mappings {
+        maps.set(m.id, true)
+    }
+    out.push("Locations")
+    for l in p.locations {
+        out.push(location_text(l, fns, maps))
+    }
+    out.push("Mappings")
+    for m in p.mappings {
+        out.push(mapping_text(m))
+    }
+    return out.join("\n") + "\n"
+}

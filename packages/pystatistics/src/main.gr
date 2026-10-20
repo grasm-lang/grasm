@@ -1,0 +1,850 @@
+// Python's `statistics` module over floats, as Python 3.13 computes it,
+// errors included.
+//
+// Python's statistics are not the textbook formulas evaluated in floating
+// point. `mean`, `variance` and `stdev` add the data *exactly*, as
+// fractions, and round once at the end -- `stdev` through a correctly
+// rounded square root of that fraction -- so `mean([1e16, 1.0, -1e16])` is
+// `0.3333333333333333`, not `0.0`. `fmean` uses `math.fsum`, and
+// `covariance`, `correlation` and `linear_regression` use `math.sumprod`,
+// CPython's triple-length dot product, which is accurate but is not exact,
+// so its answer is reproduced step by step (from `packages/pymath`). A
+// notebook's numbers, a report's, a test's expected values: these are what
+// a reimplementation has to give.
+//
+// Covered: `mean`, `fmean` (weighted too), `geometric_mean`,
+// `harmonic_mean` (weighted too), `median`, `median_low`, `median_high`,
+// `median_grouped`, `mode`, `multimode`, `quantiles`, `variance`,
+// `pvariance`, `stdev`, `pstdev`, `covariance`, `correlation` (linear and
+// ranked), `linear_regression`, and `NormalDist`'s `from_samples`, `pdf`,
+// `inv_cdf`, `quantiles` and `zscore`.
+//
+// Not covered: `int`, `Fraction` and `Decimal` data, whose results keep
+// their type; `NormalDist.cdf` and `overlap`, which call the platform's
+// `erf`; `kde`. `inv_cdf` is CPython's C version, whose polynomials clang
+// fuses into multiply-adds on arm64, so they are fused here.
+
+import bigint
+import pymath
+import shortestfloat
+
+type PyStatError =
+    | StatisticsError(text: str)
+    | StatValueError(text: str)
+    /// Python 3.13 raises AttributeError from `stdev` and `pstdev` when the
+    /// data hold an infinity or a NaN.
+    | StatAttributeError(text: str)
+
+// ---- exact arithmetic: x = num * 2^exp
+
+fn split_double(x: f64) -> (i64, i64) {
+    let b = x.to_bits()
+    let e0 = b.ushr(52).bit_and(2047)
+    let m = b.bit_and(4503599627370495)
+    let mant = if e0 == 0 { m } else { m.bit_or(4503599627370496) }
+    let e = if e0 == 0 { 0 - 1074 } else { e0 - 1075 }
+    return (if b < 0 { 0 - mant } else { mant }, e)
+}
+
+fn pow2(k: i64) -> BigInt {
+    return bigint.pow(bigint.from_i64(2), k)
+}
+
+fn big(v: i64) -> BigInt {
+    return bigint.from_i64(v)
+}
+
+fn magnitude(n: BigInt) -> BigInt {
+    return if bigint.sign(n) < 0 { bigint.negate(n) } else { n }
+}
+
+/// The finite values of `xs` as integers over one power of two: (sum of
+/// num, sum of num^2, exp), each x being num * 2^exp.
+fn exact_sums(xs: [f64]) -> (BigInt, BigInt, i64) {
+    var emin = 0
+    var first = true
+    for x in xs {
+        let (_m, e) = split_double(x)
+        if first or e < emin {
+            emin = e
+            first = false
+        }
+    }
+    var s = bigint.zero()
+    var ss = bigint.zero()
+    for x in xs {
+        let (m, e) = split_double(x)
+        let v = bigint.mul(big(m), pow2(e - emin))
+        s = bigint.add(s, v)
+        ss = bigint.add(ss, bigint.mul(v, v))
+    }
+    return (s, ss, emin)
+}
+
+/// num / den correctly rounded to a double, half to even.
+fn ratio_to_float(num: BigInt, den0: BigInt) -> f64 {
+    if bigint.is_zero(num) {
+        return 0.0
+    }
+    let negative = (bigint.sign(num) < 0) != (bigint.sign(den0) < 0)
+    let n = magnitude(num)
+    let den = magnitude(den0)
+    var b = (bigint.bit_length(n) - bigint.bit_length(den) - 53).max(0 - 1074)
+    var qr = scaled_divide(n, den, b)
+    while bigint.compare(qr.0, pow2(53)) >= 0 {
+        b = b + 1
+        qr = scaled_divide(n, den, b)
+    }
+    while b > 0 - 1074 and bigint.compare(qr.0, pow2(52)) < 0 {
+        b = b - 1
+        qr = scaled_divide(n, den, b)
+    }
+    var q = bigint.to_i64(qr.0) ?? 0
+    let twice = bigint.compare(bigint.add(qr.1, qr.1), qr.2)
+    if twice > 0 or (twice == 0 and q % 2 == 1) {
+        q = q + 1
+    }
+    if q == 9007199254740992 {
+        q = q / 2
+        b = b + 1
+    }
+    let v = if b + 52 > 1023 { 1.0 / 0.0 } else { scaled(q, b) }
+    return if negative { 0.0 - v } else { v }
+}
+
+fn scaled_divide(num: BigInt, den: BigInt, b: i64) -> (BigInt, BigInt, BigInt) {
+    let n = if b < 0 { bigint.mul(num, pow2(0 - b)) } else { num }
+    let d = if b > 0 { bigint.mul(den, pow2(b)) } else { den }
+    let (q, r) = bigint.divmod(n, d) ?? (bigint.zero(), bigint.zero())
+    return (q, r, d)
+}
+
+/// q * 2^e exactly, for 0 <= q < 2^53 and a result in range.
+fn scaled(q: i64, e: i64) -> f64 {
+    var v = q.as_f64()
+    var k = e
+    while k > 1000 {
+        v = v * (1023 + 1000).shl(52).from_bits()
+        k = k - 1000
+    }
+    while k < 0 - 1000 {
+        v = v * (1023 - 1000).shl(52).from_bits()
+        k = k + 1000
+    }
+    return v * (1023 + k).shl(52).from_bits()
+}
+
+/// num * 2^exp / den as a double.
+fn exact_to_float(num: BigInt, exp: i64, den: BigInt) -> f64 {
+    return if exp >= 0 { ratio_to_float(bigint.mul(num, pow2(exp)), den) } else { ratio_to_float(num, bigint.mul(den, pow2(0 - exp))) }
+}
+
+fn big_gcd(a0: BigInt, b0: BigInt) -> BigInt {
+    var a = magnitude(a0)
+    var b = magnitude(b0)
+    while not bigint.is_zero(b) {
+        let t = bigint.rem(a, b) ?? bigint.zero()
+        a = b
+        b = t
+    }
+    return a
+}
+
+fn big_isqrt(n: BigInt) -> BigInt {
+    if bigint.is_zero(n) {
+        return n
+    }
+    var x = pow2((bigint.bit_length(n) + 1) / 2)
+    while true {
+        let y = bigint.div(bigint.add(x, bigint.div(n, x) ?? x), big(2)) ?? x
+        if bigint.compare(y, x) >= 0 {
+            return x
+        }
+        x = y
+    }
+    return x
+}
+
+fn floor_div(a: i64, b: i64) -> i64 {
+    let q = a / b
+    return if a % b != 0 and ((a < 0) != (b < 0)) { q - 1 } else { q }
+}
+
+/// `_float_sqrt_of_frac`: sqrt(n/m) correctly rounded, by an integer
+/// square root rounded to odd with 109 bits to spare.
+fn sqrt_of_frac(n0: BigInt, m0: BigInt) -> f64 {
+    let g = big_gcd(n0, m0)
+    let n = bigint.div(n0, g) ?? n0
+    let m = bigint.div(m0, g) ?? m0
+    let q = floor_div(bigint.bit_length(n) - bigint.bit_length(m) - 109, 2)
+    if q >= 0 {
+        let num = bigint.mul(isqrt_rto(n, bigint.mul(m, pow2(2 * q))), pow2(q))
+        return ratio_to_float(num, big(1))
+    }
+    return ratio_to_float(isqrt_rto(bigint.mul(n, pow2(0 - 2 * q)), m), pow2(0 - q))
+}
+
+fn isqrt_rto(n: BigInt, m: BigInt) -> BigInt {
+    let a = big_isqrt(bigint.div(n, m) ?? n)
+    let exact = bigint.compare(bigint.mul(bigint.mul(a, a), m), n) == 0
+    if exact or not bigint.is_zero(bigint.rem(a, big(2)) ?? bigint.zero()) {
+        return a
+    }
+    return bigint.add(a, big(1))
+}
+
+fn non_finite_sum(xs: [f64]) -> Option[f64] {
+    var found = false
+    var s = 0.0
+    for x in xs {
+        if not x.is_finite() {
+            s = if found { s + x } else { x }
+            found = true
+        }
+    }
+    return if found { Some(s) } else { None }
+}
+
+// ---- means
+
+/// `mean(data)`: the exact sum, divided and rounded once.
+pub fn mean(data: [f64]) -> f64 ! PyStatError {
+    let n = data.len()
+    if n < 1 {
+        fail(StatisticsError("mean requires at least one data point"))
+    }
+    match non_finite_sum(data) {
+        Some(s) -> return s / n.as_f64()
+        None -> {}
+    }
+    let (s, _ss, e) = exact_sums(data)
+    return exact_to_float(s, e, big(n))
+}
+
+/// `fmean(data)`: `fsum(data) / len(data)`.
+pub fn fmean(data: [f64]) -> f64 ! PyStatError {
+    if data.len() == 0 {
+        fail(StatisticsError("fmean requires at least one data point"))
+    }
+    return (try fsum(data)) / data.len().as_f64()
+}
+
+fn fsum(xs: [f64]) -> f64 ! PyStatError {
+    return match pymath.fsum(xs) {
+        Ok(v) -> v
+        Err(e) -> fail(math_error(e))
+    }
+}
+
+fn sumprod(a: [f64], b: [f64]) -> f64 ! PyStatError {
+    return match pymath.sumprod(a, b) {
+        Ok(v) -> v
+        Err(e) -> fail(math_error(e))
+    }
+}
+
+fn math_error(e: PyMathError) -> PyStatError {
+    return match e {
+        PyMathValueError(t) -> StatValueError(t)
+        PyMathOverflowError(t) -> StatValueError(t)
+    }
+}
+
+/// `fmean(data, weights)`: `sumprod(data, weights) / fsum(weights)`.
+pub fn fmean_weighted(data: [f64], weights: [f64]) -> f64 ! PyStatError {
+    if data.len() != weights.len() {
+        fail(StatisticsError("data and weights must be the same length"))
+    }
+    let num = try sumprod(data, weights)
+    let den = try fsum(weights)
+    if den == 0.0 {
+        fail(StatisticsError("sum of weights must be non-zero"))
+    }
+    return num / den
+}
+
+/// `geometric_mean(data)`.
+pub fn geometric_mean(data: [f64]) -> f64 ! PyStatError {
+    var logs: [f64] = []
+    var found_zero = false
+    for x in data {
+        if x > 0.0 or x.is_nan() {
+            logs.push(x.ln())
+        } else if x == 0.0 {
+            found_zero = true
+        } else {
+            fail(StatisticsError("('No negative inputs allowed', " + shortestfloat.repr(x) + ")"))
+        }
+    }
+    let total = try fsum(logs)
+    if data.len() == 0 {
+        fail(StatisticsError("Must have a non-empty dataset"))
+    }
+    if total.is_nan() {
+        return 0.0 / 0.0
+    }
+    if found_zero {
+        return if total == 1.0 / 0.0 { 0.0 / 0.0 } else { 0.0 }
+    }
+    return (total / data.len().as_f64()).exp()
+}
+
+/// `harmonic_mean(data, weights)`; `weights` None is all ones.
+pub fn harmonic_mean(data: [f64], weights: Option[[f64]]) -> f64 ! PyStatError {
+    let msg = "harmonic mean does not support negative values"
+    let n = data.len()
+    if n < 1 {
+        fail(StatisticsError("harmonic_mean requires at least one data point"))
+    }
+    let w = match weights {
+        Some(ws) -> ws
+        None -> {
+            if n == 1 {
+                if data[0] < 0.0 {
+                    fail(StatisticsError(msg))
+                }
+                return data[0]
+            }
+            data.map(|_x| 1.0)
+        }
+    }
+    if w.len() != n {
+        fail(StatisticsError("Number of weights does not match data size"))
+    }
+    // Every weight is checked before any datum, as Python reads them.
+    if w.any(|x| x < 0.0) {
+        fail(StatisticsError(msg))
+    }
+    var terms: [f64] = []
+    for i in 0..n {
+        if data[i] < 0.0 {
+            fail(StatisticsError(msg))
+        }
+        if w[i] != 0.0 {
+            if data[i] == 0.0 {
+                return 0.0
+            }
+            terms.push(w[i] / data[i])
+        }
+    }
+    let (ws, _a, we) = exact_sums(w)
+    match non_finite_sum(terms) {
+        Some(t) -> {
+            if t <= 0.0 {
+                fail(StatisticsError("Weighted sum must be positive"))
+            }
+            return exact_to_float(ws, we, big(1)) / t
+        }
+        None -> {}
+    }
+    let (ts, _b, te) = exact_sums(terms)
+    if bigint.sign(ts) <= 0 {
+        fail(StatisticsError("Weighted sum must be positive"))
+    }
+    // (sum w) / (sum terms), both exact.
+    return if we >= te { ratio_to_float(bigint.mul(ws, pow2(we - te)), ts) } else { ratio_to_float(ws, bigint.mul(ts, pow2(te - we))) }
+}
+
+// ---- spread
+
+/// Python's `_ss`: the sum of squared deviations as an exact fraction
+/// num / den, or, when the data hold an infinity or NaN, the float Python
+/// carries instead.
+type SquaredDeviations = { num: BigInt, den: BigInt, special: Option[f64], n: i64 }
+
+fn squared_deviations(data: [f64], center: Option[f64]) -> SquaredDeviations {
+    let n = data.len()
+    match center {
+        Some(c) -> {
+            let terms = data.map(|x| (x - c) * (x - c))
+            match non_finite_sum(terms) {
+                Some(s) -> return SquaredDeviations{ num: bigint.zero(), den: big(1), special: Some(s), n: n }
+                None -> {}
+            }
+            let (s, _q, e) = exact_sums(terms)
+            return if e >= 0 { SquaredDeviations{ num: bigint.mul(s, pow2(e)), den: big(1), special: None, n: n } } else {
+                SquaredDeviations{ num: s, den: pow2(0 - e), special: None, n: n }
+            }
+        }
+        None -> {}
+    }
+    match non_finite_sum(data) {
+        Some(s) -> return SquaredDeviations{ num: bigint.zero(), den: big(1), special: Some(s), n: n }
+        None -> {}
+    }
+    if n == 0 {
+        return SquaredDeviations{ num: bigint.zero(), den: big(1), special: None, n: 0 }
+    }
+    // (n * sxx - sx^2) / n, with sx = SX 2^e and sxx = SXX 2^2e.
+    let (sx, sxx, e) = exact_sums(data)
+    let top = bigint.sub(bigint.mul(big(n), sxx), bigint.mul(sx, sx))
+    return if e >= 0 { SquaredDeviations{ num: bigint.mul(top, pow2(2 * e)), den: big(n), special: None, n: n } } else {
+        SquaredDeviations{ num: top, den: bigint.mul(big(n), pow2(0 - 2 * e)), special: None, n: n }
+    }
+}
+
+fn spread(data: [f64], center: Option[f64], ddof: i64, name: str, least: i64) -> f64 ! PyStatError {
+    let sd = squared_deviations(data, center)
+    if sd.n < least {
+        fail(StatisticsError(name + " requires at least " + (if least == 2 { "two data points" } else { "one data point" })))
+    }
+    return match sd.special {
+        Some(s) -> s / (sd.n - ddof).as_f64()
+        None -> ratio_to_float(sd.num, bigint.mul(sd.den, big(sd.n - ddof)))
+    }
+}
+
+fn root_spread(data: [f64], center: Option[f64], ddof: i64, name: str, least: i64) -> f64 ! PyStatError {
+    let sd = squared_deviations(data, center)
+    if sd.n < least {
+        fail(StatisticsError(name + " requires at least " + (if least == 2 { "two data points" } else { "one data point" })))
+    }
+    return match sd.special {
+        Some(_s) -> fail(StatAttributeError("'float' object has no attribute 'numerator'"))
+        None -> sqrt_of_frac(sd.num, bigint.mul(sd.den, big(sd.n - ddof)))
+    }
+}
+
+/// `variance(data, xbar)`: the sample variance, exact until one rounding.
+pub fn variance(data: [f64], xbar: Option[f64]) -> f64 ! PyStatError {
+    return try spread(data, xbar, 1, "variance", 2)
+}
+
+/// `pvariance(data, mu)`.
+pub fn pvariance(data: [f64], mu: Option[f64]) -> f64 ! PyStatError {
+    return try spread(data, mu, 0, "pvariance", 1)
+}
+
+/// `stdev(data, xbar)`: a correctly rounded square root of the exact
+/// variance.
+pub fn stdev(data: [f64], xbar: Option[f64]) -> f64 ! PyStatError {
+    return try root_spread(data, xbar, 1, "stdev", 2)
+}
+
+/// `pstdev(data, mu)`.
+pub fn pstdev(data: [f64], mu: Option[f64]) -> f64 ! PyStatError {
+    return try root_spread(data, mu, 0, "pstdev", 1)
+}
+
+// ---- order statistics
+
+/// Python's `sorted` for floats: stable, by `<` alone, so 0.0 and -0.0 keep
+/// their input order.
+fn sorted(data: [f64]) -> [f64] {
+    if data.len() <= 1 {
+        return data
+    }
+    let mid = data.len() / 2
+    let a = sorted(data.slice(0, mid))
+    let b = sorted(data.slice(mid, data.len()))
+    var out: [f64] = []
+    var i = 0
+    var j = 0
+    while i < a.len() and j < b.len() {
+        if b[j] < a[i] {
+            out.push(b[j])
+            j = j + 1
+        } else {
+            out.push(a[i])
+            i = i + 1
+        }
+    }
+    while i < a.len() {
+        out.push(a[i])
+        i = i + 1
+    }
+    while j < b.len() {
+        out.push(b[j])
+        j = j + 1
+    }
+    return out
+}
+
+fn need_data(n: i64) ! PyStatError {
+    if n == 0 {
+        fail(StatisticsError("no median for empty data"))
+    }
+}
+
+pub fn median(data: [f64]) -> f64 ! PyStatError {
+    let xs = sorted(data)
+    let n = xs.len()
+    try need_data(n)
+    return if n % 2 == 1 { xs[n / 2] } else { (xs[n / 2 - 1] + xs[n / 2]) / 2.0 }
+}
+
+pub fn median_low(data: [f64]) -> f64 ! PyStatError {
+    let xs = sorted(data)
+    let n = xs.len()
+    try need_data(n)
+    return if n % 2 == 1 { xs[n / 2] } else { xs[n / 2 - 1] }
+}
+
+pub fn median_high(data: [f64]) -> f64 ! PyStatError {
+    let xs = sorted(data)
+    try need_data(xs.len())
+    return xs[xs.len() / 2]
+}
+
+/// `median_grouped(data, interval)`.
+pub fn median_grouped(data: [f64], interval: f64) -> f64 ! PyStatError {
+    let xs = sorted(data)
+    let n = xs.len()
+    try need_data(n)
+    let x = xs[n / 2]
+    var i = 0
+    while i < n and xs[i] < x {
+        i = i + 1
+    }
+    var j = i
+    while j < n and not (x < xs[j]) {
+        j = j + 1
+    }
+    let l = x - interval / 2.0
+    return l + interval * (n.as_f64() / 2.0 - i.as_f64()) / (j - i).as_f64()
+}
+
+/// Distinct values in first-seen order with their counts; equal values
+/// (0.0 and -0.0 among them) share the first one's entry.
+fn counted(data: [f64]) -> [(f64, i64)] {
+    var out: [(f64, i64)] = []
+    for x in data {
+        var found = false
+        for k in 0..out.len() {
+            if not found and out[k].0 == x {
+                out[k] = (out[k].0, out[k].1 + 1)
+                found = true
+            }
+        }
+        if not found {
+            out.push((x, 1))
+        }
+    }
+    return out
+}
+
+/// `mode(data)`: the first of the most common values.
+pub fn mode(data: [f64]) -> f64 ! PyStatError {
+    let c = counted(data)
+    if c.len() == 0 {
+        fail(StatisticsError("no mode for empty data"))
+    }
+    var best = c[0]
+    for p in c {
+        if p.1 > best.1 {
+            best = p
+        }
+    }
+    return best.0
+}
+
+/// `multimode(data)`: every most common value, in first-seen order.
+pub fn multimode(data: [f64]) -> [f64] {
+    let c = counted(data)
+    var top = 0
+    for p in c {
+        top = top.max(p.1)
+    }
+    return c.filter(|p| p.1 == top).map(|p| p.0)
+}
+
+/// `quantiles(data, n=n, method=method)`.
+pub fn quantiles(data: [f64], n: i64, method: str) -> [f64] ! PyStatError {
+    if n < 1 {
+        fail(StatisticsError("n must be at least 1"))
+    }
+    let xs = sorted(data)
+    let ld = xs.len()
+    if ld < 2 {
+        if ld == 1 {
+            var out: [f64] = []
+            for _i in 0..(n - 1) {
+                out.push(xs[0])
+            }
+            return out
+        }
+        fail(StatisticsError("must have at least one data point"))
+    }
+    var out: [f64] = []
+    if method == "inclusive" {
+        let m = ld - 1
+        for i in 1..n {
+            let j = i * m / n
+            let delta = i * m % n
+            out.push((xs[j] * (n - delta).as_f64() + xs[j + 1] * delta.as_f64()) / n.as_f64())
+        }
+        return out
+    }
+    if method == "exclusive" {
+        let m = ld + 1
+        for i in 1..n {
+            let j = 1.max((ld - 1).min(i * m / n))
+            let delta = i * m - j * n
+            out.push((xs[j - 1] * (n - delta).as_f64() + xs[j] * delta.as_f64()) / n.as_f64())
+        }
+        return out
+    }
+    fail(StatValueError("Unknown method: " + py_str_repr(method)))
+}
+
+/// Python's `repr` of a plain ASCII string.
+fn py_str_repr(s: str) -> str {
+    let quote = if s.contains("'") and not s.contains("\"") { "\"" } else { "'" }
+    return quote + s.replace("\\", "\\\\").replace(quote, "\\" + quote) + quote
+}
+
+// ---- two variables
+
+fn same_length(x: [f64], y: [f64], what: str) ! PyStatError {
+    if x.len() != y.len() {
+        fail(StatisticsError(what + " requires that both inputs have same number of data points"))
+    }
+    if x.len() < 2 {
+        fail(StatisticsError(what + " requires at least two data points"))
+    }
+}
+
+/// `covariance(x, y)`.
+pub fn covariance(x: [f64], y: [f64]) -> f64 ! PyStatError {
+    try same_length(x, y, "covariance")
+    let n = x.len().as_f64()
+    let xbar = (try fsum(x)) / n
+    let ybar = (try fsum(y)) / n
+    return (try sumprod(x.map(|v| v - xbar), y.map(|v| v - ybar))) / (n - 1.0)
+}
+
+/// `_sqrtprod(x, y)`: sqrt(x * y) without overflow, corrected by a
+/// triple-length residual.
+fn sqrtprod(x: f64, y: f64) -> f64 ! PyStatError {
+    let h = (x * y).sqrt()
+    if not h.is_finite() {
+        if h.abs() == 1.0 / 0.0 and x.is_finite() and y.is_finite() {
+            let scale = (1023 - 512).shl(52).from_bits()
+            return (try sqrtprod(scale * x, scale * y)) / scale
+        }
+        return h
+    }
+    if h == 0.0 {
+        if x != 0.0 and y != 0.0 {
+            let scale = (1023 + 537).shl(52).from_bits()
+            return (try sqrtprod(scale * x, scale * y)) / scale
+        }
+        return h
+    }
+    let d = try sumprod([x, h], [y, 0.0 - h])
+    return h + d / (2.0 * h)
+}
+
+/// `_rank(data, start=start)`: ranks counted from `start`, ties averaged.
+fn ranks(data: [f64], start: f64) -> [f64] {
+    var order: [i64] = []
+    for i in 0..data.len() {
+        order.push(i)
+    }
+    // Stable by value, then by position, as sorted(zip(data, count())).
+    let idx = sort_indices(data, order)
+    var out = data.map(|_v| 0.0)
+    var i = start - 1.0
+    var k = 0
+    while k < idx.len() {
+        // A group always holds its first element: a NaN equals nothing, and
+        // Python's groupby gives each its own group.
+        var end = k + 1
+        while end < idx.len() and data[idx[end]] == data[idx[k]] {
+            end = end + 1
+        }
+        let size = (end - k).as_f64()
+        let rank = i + (size + 1.0) / 2.0
+        for t in k..end {
+            out[idx[t]] = rank
+        }
+        i = i + size
+        k = end
+    }
+    return out
+}
+
+fn sort_indices(data: [f64], idx: [i64]) -> [i64] {
+    if idx.len() <= 1 {
+        return idx
+    }
+    let mid = idx.len() / 2
+    let a = sort_indices(data, idx.slice(0, mid))
+    let b = sort_indices(data, idx.slice(mid, idx.len()))
+    var out: [i64] = []
+    var i = 0
+    var j = 0
+    while i < a.len() and j < b.len() {
+        if data[b[j]] < data[a[i]] {
+            out.push(b[j])
+            j = j + 1
+        } else {
+            out.push(a[i])
+            i = i + 1
+        }
+    }
+    return out + a.slice(i, a.len()) + b.slice(j, b.len())
+}
+
+/// `correlation(x, y, method=method)`: Pearson's for "linear", Spearman's
+/// for "ranked".
+pub fn correlation(x0: [f64], y0: [f64], method: str) -> f64 ! PyStatError {
+    try same_length(x0, y0, "correlation")
+    if method != "linear" and method != "ranked" {
+        fail(StatValueError("Unknown method: " + py_str_repr(method)))
+    }
+    let n = x0.len()
+    var x = x0
+    var y = y0
+    if method == "ranked" {
+        let start = (n - 1).as_f64() / -2.0
+        x = ranks(x0, start)
+        y = ranks(y0, start)
+    } else {
+        let xbar = (try fsum(x0)) / n.as_f64()
+        let ybar = (try fsum(y0)) / n.as_f64()
+        x = x0.map(|v| v - xbar)
+        y = y0.map(|v| v - ybar)
+    }
+    let sxy = try sumprod(x, y)
+    let sxx = try sumprod(x, x)
+    let syy = try sumprod(y, y)
+    let d = try sqrtprod(sxx, syy)
+    if d == 0.0 {
+        fail(StatisticsError("at least one of the inputs is constant"))
+    }
+    return sxy / d
+}
+
+/// `linear_regression(x, y, proportional=...)`: (slope, intercept).
+pub fn linear_regression(x0: [f64], y0: [f64], proportional: bool) -> (f64, f64) ! PyStatError {
+    if x0.len() != y0.len() {
+        fail(StatisticsError("linear regression requires that both inputs have same number of data points"))
+    }
+    if x0.len() < 2 {
+        fail(StatisticsError("linear regression requires at least two data points"))
+    }
+    let n = x0.len().as_f64()
+    var x = x0
+    var y = y0
+    var xbar = 0.0
+    var ybar = 0.0
+    if not proportional {
+        xbar = (try fsum(x0)) / n
+        ybar = (try fsum(y0)) / n
+        x = x0.map(|v| v - xbar)
+        y = y0.map(|v| v - ybar)
+    }
+    let sxy = (try sumprod(x, y)) + 0.0
+    let sxx = try sumprod(x, x)
+    if sxx == 0.0 {
+        fail(StatisticsError("x is constant"))
+    }
+    let slope = sxy / sxx
+    return (slope, if proportional { 0.0 } else { ybar - slope * xbar })
+}
+
+// ---- NormalDist
+
+type NormalDist = { mu: f64, sigma: f64 }
+
+/// `NormalDist(mu, sigma)`.
+pub fn normal(mu: f64, sigma: f64) -> NormalDist ! PyStatError {
+    if sigma < 0.0 {
+        fail(StatisticsError("sigma must be non-negative"))
+    }
+    return NormalDist{ mu: mu, sigma: sigma }
+}
+
+/// `NormalDist.from_samples(data)`: the exact mean and the correctly
+/// rounded sample standard deviation.
+pub fn from_samples(data: [f64]) -> NormalDist ! PyStatError {
+    let sd = squared_deviations(data, None)
+    if sd.n < 2 {
+        fail(StatisticsError("stdev requires at least two data points"))
+    }
+    match sd.special {
+        // Python's `_ss` hands back the float sum itself as the mean here.
+        Some(s) -> return try normal(s, s / s)
+        None -> {}
+    }
+    let (sx, _q, e) = exact_sums(data)
+    let xbar = exact_to_float(sx, e, big(sd.n))
+    return try normal(xbar, sqrt_of_frac(sd.num, bigint.mul(sd.den, big(sd.n - 1))))
+}
+
+pub fn pdf(d: NormalDist, x: f64) -> f64 ! PyStatError {
+    let variance = d.sigma * d.sigma
+    if variance == 0.0 {
+        fail(StatisticsError("pdf() not defined when sigma is zero"))
+    }
+    let diff = x - d.mu
+    return (diff * diff / (-2.0 * variance)).exp() / (6.283185307179586 * variance).sqrt()
+}
+
+pub fn zscore(d: NormalDist, x: f64) -> f64 ! PyStatError {
+    if d.sigma == 0.0 {
+        fail(StatisticsError("zscore() not defined when sigma is zero"))
+    }
+    return (x - d.mu) / d.sigma
+}
+
+fn fma(a: f64, b: f64, c: f64) -> f64 {
+    return pymath.fma(a, b, c) ?? (a * b + c)
+}
+
+fn poly(coeffs: [f64], r: f64) -> f64 {
+    var v = coeffs[0]
+    for k in 1..coeffs.len() {
+        v = fma(v, r, coeffs[k])
+    }
+    return v
+}
+
+/// `NormalDist.inv_cdf(p)`: Wichura's AS241, as CPython's C code computes
+/// it with its multiply-adds fused.
+pub fn inv_cdf(d: NormalDist, p: f64) -> f64 ! PyStatError {
+    if p <= 0.0 or p >= 1.0 {
+        fail(StatisticsError("p must be in the range 0.0 < p < 1.0"))
+    }
+    let q = p - 0.5
+    if q.abs() <= 0.425 {
+        let r = fma(0.0 - q, q, 0.180625)
+        let num = poly([2.5090809287301226727e+3, 3.3430575583588128105e+4, 6.7265770927008700853e+4, 4.5921953931549871457e+4, 1.3731693765509461125e+4,
+            1.9715909503065514427e+3, 1.3314166789178437745e+2, 3.3871328727963666080e+0], r) * q
+        let den = poly([5.2264952788528545610e+3, 2.8729085735721942674e+4, 3.9307895800092710610e+4, 2.1213794301586595867e+4, 5.3941960214247511077e+3,
+            6.8718700749205790830e+2, 4.2313330701600911252e+1, 1.0], r)
+        return fma(num / den, d.sigma, d.mu)
+    }
+    var r = if q <= 0.0 { p } else { 1.0 - p }
+    r = (0.0 - r.ln()).sqrt()
+    var num = 0.0
+    var den = 0.0
+    if r <= 5.0 {
+        r = r - 1.6
+        num = poly([7.74545014278341407640e-4, 2.27238449892691845833e-2, 2.41780725177450611770e-1, 1.27045825245236838258e+0, 3.64784832476320460504e+0,
+            5.76949722146069140550e+0, 4.63033784615654529590e+0, 1.42343711074968357734e+0], r)
+        den = poly([1.05075007164441684324e-9, 5.47593808499534494600e-4, 1.51986665636164571966e-2, 1.48103976427480074590e-1, 6.89767334985100004550e-1,
+            1.67638483018380384940e+0, 2.05319162663775882187e+0, 1.0], r)
+    } else {
+        r = r - 5.0
+        num = poly([2.01033439929228813265e-7, 2.71155556874348757815e-5, 1.24266094738807843860e-3, 2.65321895265761230930e-2, 2.96560571828504891230e-1,
+            1.78482653991729133580e+0, 5.46378491116411436990e+0, 6.65790464350110377720e+0], r)
+        den = poly([2.04426310338993978564e-15, 1.42151175831644588870e-7, 1.84631831751005468180e-5, 7.86869131145613259100e-4, 1.48753612908506148525e-2,
+            1.36929880922735805310e-1, 5.99832206555887937690e-1, 1.0], r)
+    }
+    var x = num / den
+    if q < 0.0 {
+        x = 0.0 - x
+    }
+    return fma(x, d.sigma, d.mu)
+}
+
+/// `NormalDist.quantiles(n)`.
+pub fn normal_quantiles(d: NormalDist, n: i64) -> [f64] ! PyStatError {
+    var out: [f64] = []
+    for i in 1..n {
+        out.push(try inv_cdf(d, i.as_f64() / n.as_f64()))
+    }
+    return out
+}

@@ -1,0 +1,20 @@
+[package]
+name = "nodeutilformat"
+version = "1.0.0"
+capabilities = []
+
+[dependencies.jsnumber]
+path = "../jsnumber"
+version = "^1.0.0"
+
+[dependencies.jsjson]
+path = "../jsjson"
+version = "^1.0.0"
+
+[dependencies.jsradix]
+path = "../jsradix"
+version = "^1.0.0"
+
+[dependencies.pymath]
+path = "../pymath"
+version = "^1.0.0"

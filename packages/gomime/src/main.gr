@@ -1,0 +1,761 @@
+// Go's `mime` package: media types (`ParseMediaType`, `FormatMediaType`)
+// and RFC 2047 encoded words (`WordEncoder`, `WordDecoder`), as Go 1.25
+// writes and reads them, errors included.
+//
+// Every Go HTTP server reads `Content-Type` and `Content-Disposition`
+// through `ParseMediaType`, and every Go mail library writes subjects
+// through `WordEncoder`, so their exact behaviour is what a client or a
+// test on the other side sees:
+//
+//   - Parameters split across `name*0`, `name*1*` are joined, with RFC
+//     2231 decoding for `utf-8` and `us-ascii` only; a parameter given
+//     twice with different values is an error, and a stray `;` at the end
+//     is allowed.
+//   - `FormatMediaType` lowercases, sorts the parameters, quotes what is
+//     not a token, and switches to `name*=utf-8''...` for anything outside
+//     printable ASCII; a type or name that is not a token gives "".
+//   - The encoder splits a UTF-8 word at 75 bytes without cutting a
+//     character, writes `b` and `q` in lower case, and leaves text that
+//     needs no encoding alone.
+//   - The decoder handles `utf-8`, `iso-8859-1` and `us-ascii` itself and
+//     refuses any other charset, as Go does without a `CharsetReader`;
+//     `DecodeHeader` drops the whitespace between two encoded words and
+//     keeps a word it cannot decode as text.
+//
+// Decoded text can be bytes that are not UTF-8 (`=?utf-8?q?=FF?=`), so
+// decoded words and parameter values are `bytes`.
+
+import goquote
+
+// ---- character classes
+
+fn is_token_char(c: i64) -> bool {
+    return (c >= 48 and c <= 57) or (c >= 97 and c <= 122) or (c >= 65 and c <= 90) or "!#$%&'*+-.^_`\{|\}~".codes().contains(c)
+}
+
+fn is_tspecial(c: i64) -> bool {
+    return "()<>@,;:\\\"/[]?=".codes().contains(c)
+}
+
+fn is_token(s: [i64]) -> bool {
+    return s.len() > 0 and s.all(|c| is_token_char(c))
+}
+
+/// Go's `unicode.IsSpace`.
+fn is_space(c: i64) -> bool {
+    return (c >= 9 and c <= 13) or c == 32 or c == 133 or c == 160 or c == 5760 or (c >= 8192 and c <= 8202) or c == 8232 or c == 8233 or c == 8239 or
+    c == 8287 or c == 12288
+}
+
+fn trim_left_space(s: str) -> str {
+    let cs = s.codes()
+    var i = 0
+    while i < cs.len() and is_space(cs[i]) {
+        i = i + 1
+    }
+    return cs.slice(i, cs.len()).map(|c| c.to_char()).join("")
+}
+
+fn trim_space(s: str) -> str {
+    let cs = s.codes()
+    var a = 0
+    var b = cs.len()
+    while a < b and is_space(cs[a]) {
+        a = a + 1
+    }
+    while b > a and is_space(cs[b - 1]) {
+        b = b - 1
+    }
+    return cs.slice(a, b).map(|c| c.to_char()).join("")
+}
+
+/// `strings.ToLower` as far as it matters here: ASCII, and the two
+/// characters whose simple lower case is ASCII (U+0130 and U+212A).
+fn go_lower(s: str) -> str {
+    return s.codes().map(|c| (if c >= 65 and c <= 90 { c + 32 } else if c == 304 { 105 } else if c == 8490 { 107 } else { c }).to_char()).join("")
+}
+
+fn bytes_text(b: [i64]) -> str {
+    return bytes_of(b).to_str()
+}
+
+// ---- ParseMediaType
+
+/// A token at the front: the token and what follows it.
+fn consume_token(v: str) -> (str, str) {
+    let b = v.to_bytes().to_list()
+    var i = 0
+    while i < b.len() and is_token_char(b[i]) {
+        i = i + 1
+    }
+    return (bytes_text(b.slice(0, i)), bytes_text(b.slice(i, b.len())))
+}
+
+fn check_media_type(s: str) -> Option[str] {
+    let (typ, rest) = consume_token(s)
+    if typ.len() == 0 {
+        return Some("mime: no media type")
+    }
+    if rest.len() == 0 {
+        return None
+    }
+    if not rest.starts_with("/") {
+        return Some("mime: expected slash after first token")
+    }
+    let (sub, rest2) = consume_token(rest.substr(1, rest.len() - 1))
+    if sub.len() == 0 {
+        return Some("mime: expected token after slash")
+    }
+    if rest2.len() > 0 {
+        return Some("mime: unexpected content after media subtype")
+    }
+    return None
+}
+
+/// consumeValue: a token, or a quoted string with `\` escaping a special.
+fn consume_value(v: [i64]) -> (Option[[i64]], [i64]) {
+    if v.len() == 0 {
+        return (None, v)
+    }
+    if v[0] != 34 {
+        var i = 0
+        while i < v.len() and is_token_char(v[i]) {
+            i = i + 1
+        }
+        return (if i == 0 { None } else { Some(v.slice(0, i)) }, v.slice(i, v.len()))
+    }
+    var out: [i64] = []
+    var i = 1
+    while i < v.len() {
+        let r = v[i]
+        if r == 34 {
+            return (Some(out), v.slice(i + 1, v.len()))
+        }
+        if r == 92 and i + 1 < v.len() and is_tspecial(v[i + 1]) {
+            out.push(v[i + 1])
+            i = i + 2
+            continue
+        }
+        if r == 13 or r == 10 {
+            return (None, v)
+        }
+        out.push(r)
+        i = i + 1
+    }
+    return (None, v)
+}
+
+/// consumeMediaParam: `; key=value`, or nothing when it is not one.
+fn consume_param(v: str) -> Option[(str, [i64], str)] {
+    var rest = trim_left_space(v)
+    if not rest.starts_with(";") {
+        return None
+    }
+    rest = trim_left_space(rest.substr(1, rest.len() - 1))
+    let (param0, rest2) = consume_token(rest)
+    let param = go_lower(param0)
+    if param.len() == 0 {
+        return None
+    }
+    rest = trim_left_space(rest2)
+    if not rest.starts_with("=") {
+        return None
+    }
+    rest = trim_left_space(rest.substr(1, rest.len() - 1))
+    let rb = rest.to_bytes().to_list()
+    let (value, after) = consume_value(rb)
+    let val = match value {
+        Some(x) -> x
+        None -> return None
+    }
+    if val.len() == 0 and after.len() == rb.len() {
+        return None
+    }
+    return Some((param, val, bytes_text(after)))
+}
+
+fn hex_val(c: i64) -> i64 {
+    return if c >= 48 and c <= 57 { c - 48 } else if c >= 97 and c <= 102 { c - 87 } else if c >= 65 and c <= 70 { c - 55 } else { 0 - 1 }
+}
+
+fn percent_unescape(s: [i64]) -> Option[[i64]] {
+    var out: [i64] = []
+    var i = 0
+    while i < s.len() {
+        if s[i] != 37 {
+            out.push(s[i])
+            i = i + 1
+            continue
+        }
+        if i + 2 >= s.len() or hex_val(s[i + 1]) < 0 or hex_val(s[i + 2]) < 0 {
+            return None
+        }
+        out.push(hex_val(s[i + 1]) * 16 + hex_val(s[i + 2]))
+        i = i + 3
+    }
+    return Some(out)
+}
+
+/// RFC 2231 `charset'language'value`, for utf-8 and us-ascii only.
+fn decode2231(v: [i64]) -> Option[[i64]] {
+    var quotes: [i64] = []
+    for i in 0..v.len() {
+        if v[i] == 39 and quotes.len() < 2 {
+            quotes.push(i)
+        }
+    }
+    if quotes.len() != 2 {
+        return None
+    }
+    let charset = go_lower(bytes_text(v.slice(0, quotes[0])))
+    if charset != "us-ascii" and charset != "utf-8" {
+        return None
+    }
+    return percent_unescape(v.slice(quotes[1] + 1, v.len()))
+}
+
+/// Parameters, in a list kept sorted by name.
+type MimeParams = [(str, bytes)]
+
+fn put(inout m: [(str, [i64])], k: str, v: [i64]) {
+    for i in 0..m.len() {
+        if m[i].0 == k {
+            m[i] = (k, v)
+            return
+        }
+    }
+    m.push((k, v))
+}
+
+fn lookup(m: [(str, [i64])], k: str) -> Option[[i64]] {
+    for p in m {
+        if p.0 == k {
+            return Some(p.1)
+        }
+    }
+    return None
+}
+
+fn sorted_params(m: [(str, [i64])]) -> MimeParams {
+    var out: MimeParams = m.map(|p| (p.0, bytes_of(p.1)))
+    out.sort_by(|p| p.0)
+    return out
+}
+
+/// Joins `name*0`, `name*1*`, ... and decodes `name*`, as Go does after
+/// reading every parameter.
+fn join_continuations(inout params: [(str, [i64])], continuation: [(str, [(str, [i64])])]) {
+    for entry in continuation {
+        let (key, pieces) = entry
+        match lookup(pieces, key + "*") {
+            Some(v) -> {
+                match decode2231(v) {
+                    Some(d) -> put(params, key, d)
+                    None -> {}
+                }
+                continue
+            }
+            None -> {}
+        }
+        var buf: [i64] = []
+        var valid = false
+        var n = 0
+        while true {
+            let simple = key + "*" + n.to_str()
+            match lookup(pieces, simple) {
+                Some(v) -> {
+                    valid = true
+                    buf = buf + v
+                    n = n + 1
+                    continue
+                }
+                None -> {}
+            }
+            let encoded = match lookup(pieces, simple + "*") {
+                Some(v) -> v
+                None -> break
+            }
+            valid = true
+            buf = buf + (if n == 0 { decode2231(encoded) ?? [] } else { percent_unescape(encoded) ?? [] })
+            n = n + 1
+        }
+        if valid {
+            put(params, key, buf)
+        }
+    }
+}
+
+/// `ParseMediaType(v)`: the lowercased type, its parameters by name, and
+/// the error. On a bad parameter Go still returns the type.
+pub fn parse_media_type(v: str) -> (str, MimeParams, Option[str]) {
+    let all = v.to_bytes().to_list()
+    var semi = all.len()
+    for i in 0..all.len() {
+        if all[i] == 59 and semi == all.len() {
+            semi = i
+        }
+    }
+    let mediatype = trim_space(go_lower(bytes_text(all.slice(0, semi))))
+    match check_media_type(mediatype) {
+        Some(e) -> return ("", [], Some(e))
+        None -> {}
+    }
+    var params: [(str, [i64])] = []
+    var continuation: [(str, [(str, [i64])])] = []
+    var rest = bytes_text(all.slice(semi, all.len()))
+    while rest.len() > 0 {
+        rest = trim_left_space(rest)
+        if rest.len() == 0 {
+            break
+        }
+        let (key, value, after) = match consume_param(rest) {
+            Some(p) -> p
+            None -> {
+                if trim_space(rest) == ";" {
+                    break
+                }
+                return (mediatype, [], Some("mime: invalid media parameter"))
+            }
+        }
+        let star = key.index_of("*") ?? (0 - 1)
+        if star >= 0 {
+            let base = key.substr(0, star)
+            var at = 0 - 1
+            for i in 0..continuation.len() {
+                if continuation[i].0 == base {
+                    at = i
+                }
+            }
+            if at < 0 {
+                continuation.push((base, []))
+                at = continuation.len() - 1
+            }
+            var pmap = continuation[at].1
+            match lookup(pmap, key) {
+                Some(old) -> if old != value {
+                    return ("", [], Some("mime: duplicate parameter name"))
+                }
+                None -> {}
+            }
+            put(pmap, key, value)
+            continuation[at] = (base, pmap)
+        } else {
+            match lookup(params, key) {
+                Some(old) -> if old != value {
+                    return ("", [], Some("mime: duplicate parameter name"))
+                }
+                None -> {}
+            }
+            put(params, key, value)
+        }
+        rest = after
+    }
+    join_continuations(params, continuation)
+    return (mediatype, sorted_params(params), None)
+}
+
+// ---- FormatMediaType
+
+fn needs_encoding(s: str) -> bool {
+    return s.codes().any(|c| (c < 32 or c > 126) and c != 9)
+}
+
+/// `FormatMediaType(t, params)`: "" when the type or a name is not a token.
+/// `params` is read as a Go map would be built from it: a name given
+/// twice keeps its last value.
+pub fn format_media_type(t: str, params: [(str, str)]) -> str {
+    let tb = t.to_bytes().to_list()
+    var slash = 0 - 1
+    for i in 0..tb.len() {
+        if tb[i] == 47 and slash < 0 {
+            slash = i
+        }
+    }
+    var out = ""
+    if slash < 0 {
+        if not is_token(tb) {
+            return ""
+        }
+        out = go_lower(t)
+    } else {
+        let major = tb.slice(0, slash)
+        let sub = tb.slice(slash + 1, tb.len())
+        if not is_token(major) or not is_token(sub) {
+            return ""
+        }
+        out = go_lower(bytes_text(major)) + "/" + go_lower(bytes_text(sub))
+    }
+    var sorted: [(str, str)] = []
+    for p in params {
+        var replaced = false
+        for i in 0..sorted.len() {
+            if sorted[i].0 == p.0 {
+                sorted[i] = p
+                replaced = true
+            }
+        }
+        if not replaced {
+            sorted.push(p)
+        }
+    }
+    sorted.sort_by(|p| p.0)
+    for p in sorted {
+        let (name, value) = p
+        out = out + "; "
+        if not is_token(name.to_bytes().to_list()) {
+            return ""
+        }
+        out = out + go_lower(name)
+        if needs_encoding(value) {
+            out = out + "*=utf-8''" + value.to_bytes().to_list().map(|c| encode_2231_byte(c)).join("")
+        } else if is_token(value.to_bytes().to_list()) {
+            out = out + "=" + value
+        } else {
+            out = out + "=\"" + value.codes().map(|c| (if c == 34 or c == 92 { "\\" } else { "" }) + c.to_char()).join("") + "\""
+        }
+    }
+    return out
+}
+
+fn upper_hex(b: i64) -> str {
+    let digits = "0123456789ABCDEF"
+    return digits.substr(b.ushr(4), 1) + digits.substr(b.bit_and(15), 1)
+}
+
+fn encode_2231_byte(c: i64) -> str {
+    if c <= 32 or c >= 127 or c == 42 or c == 39 or c == 37 or is_tspecial(c) {
+        return "%" + upper_hex(c)
+    }
+    return c.to_char()
+}
+
+// ---- WordEncoder
+
+/// `strings.EqualFold` against an ASCII name: case aside, U+017F folds
+/// to `s` and U+212A to `k`.
+fn fold(s: str) -> str {
+    return s.codes().map(|c| (if c >= 65 and c <= 90 { c + 32 } else if c == 383 { 115 } else if c == 8490 { 107 } else { c }).to_char()).join("")
+}
+
+fn is_utf8(charset: str) -> bool {
+    return fold(charset) == "utf-8"
+}
+
+fn base64_text(b: [i64]) -> str {
+    let alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+    var out = ""
+    var i = 0
+    while i < b.len() {
+        let n = (b.len() - i).min(3)
+        let v = b[i].shl(16) + (if n > 1 { b[i + 1].shl(8) } else { 0 }) + (if n > 2 { b[i + 2] } else { 0 })
+        out = out + alphabet.substr(v.ushr(18).bit_and(63), 1) + alphabet.substr(v.ushr(12).bit_and(63), 1)
+        out = out + (if n > 1 { alphabet.substr(v.ushr(6).bit_and(63), 1) } else { "=" }) + (if n > 2 { alphabet.substr(v.bit_and(63), 1) } else { "=" })
+        i = i + 3
+    }
+    return out
+}
+
+fn q_text(b: [i64]) -> str {
+    return b.map(|c| if c == 32 { "_" } else if c >= 33 and c <= 126 and c != 61 and c != 63 and c != 95 { c.to_char() } else { "=" + upper_hex(c) }).join("")
+}
+
+/// `WordEncoder.Encode(charset, s)` with `kind` "b" or "q".
+pub fn encode_word(kind: str, charset: str, s: str) -> str {
+    if not needs_encoding(s) {
+        return s
+    }
+    let open = "=?" + charset + "?" + kind + "?"
+    let split = "?= " + open
+    let b = s.to_bytes().to_list()
+    var out = open
+    if kind == "b" {
+        if not is_utf8(charset) or (b.len() + 2) / 3 * 4 <= 63 {
+            return out + base64_text(b) + "?="
+        }
+        var last = 0
+        var current = 0
+        for ch in s.codes() {
+            let n = ch.to_char().to_bytes().len()
+            let i = last + current
+            if current + n <= 45 {
+                current = current + n
+            } else {
+                out = out + base64_text(b.slice(last, i)) + split
+                last = i
+                current = n
+            }
+        }
+        return out + base64_text(b.slice(last, b.len())) + "?="
+    }
+    if not is_utf8(charset) {
+        return out + q_text(b) + "?="
+    }
+    var current = 0
+    for ch in s.codes() {
+        let piece = ch.to_char().to_bytes().to_list()
+        let first = piece[0]
+        let enc = if first >= 32 and first <= 126 and first != 61 and first != 63 and first != 95 { 1 } else { 3 * piece.len() }
+        if current + enc > 63 {
+            out = out + split
+            current = 0
+        }
+        out = out + q_text(piece)
+        current = current + enc
+    }
+    return out + "?="
+}
+
+// ---- WordDecoder
+
+fn b64_value(c: i64) -> i64 {
+    return if c >= 65 and c <= 90 { c - 65 } else if c >= 97 and c <= 122 { c - 71 } else if c >= 48 and c <= 57 { c + 4 } else if c == 43 { 62 } else if c == 47 {
+        63
+    } else { 0 - 1 }
+}
+
+fn corrupt(at: i64) -> str {
+    return "illegal base64 data at input byte " + at.to_str()
+}
+
+fn skip_newlines(src: [i64], at: i64) -> i64 {
+    var si = at
+    while si < src.len() and (src[si] == 10 or src[si] == 13) {
+        si = si + 1
+    }
+    return si
+}
+
+/// One quantum of `encoding/base64`'s StdEncoding: up to four characters,
+/// newlines skipped. Answers the next position and the bytes, or Go's
+/// error.
+fn decode_quantum(src: [i64], at: i64, inout out: [i64]) -> i64 ! str {
+    var buf = [0, 0, 0, 0]
+    var dlen = 4
+    var si = at
+    var j = 0
+    var trailing = 0 - 1
+    while j < 4 {
+        if si == src.len() {
+            if j == 0 {
+                return si
+            }
+            fail(corrupt(si - j))
+        }
+        let c = src[si]
+        si = si + 1
+        let v = b64_value(c)
+        if v >= 0 {
+            buf[j] = v
+            j = j + 1
+            continue
+        }
+        if c == 10 or c == 13 {
+            continue
+        }
+        if c != 61 or j < 2 {
+            fail(corrupt(si - 1))
+        }
+        if j == 2 {
+            si = skip_newlines(src, si)
+            if si == src.len() {
+                fail(corrupt(src.len()))
+            }
+            if src[si] != 61 {
+                fail(corrupt(si - 1))
+            }
+            si = si + 1
+        }
+        si = skip_newlines(src, si)
+        if si < src.len() {
+            trailing = si
+        }
+        dlen = j
+        break
+    }
+    let val = buf[0].shl(18) + buf[1].shl(12) + buf[2].shl(6) + buf[3]
+    let bytes3 = [val.ushr(16).bit_and(255), val.ushr(8).bit_and(255), val.bit_and(255)]
+    for k in 0..(dlen - 1) {
+        out.push(bytes3[k])
+    }
+    if trailing >= 0 {
+        fail(corrupt(trailing))
+    }
+    return si
+}
+
+fn base64_decode(text: [i64]) -> [i64] ! str {
+    var out: [i64] = []
+    var si = 0
+    while si < text.len() {
+        si = try decode_quantum(text, si, out)
+    }
+    return out
+}
+
+fn q_decode(s: [i64]) -> [i64] ! str {
+    var out: [i64] = []
+    var i = 0
+    while i < s.len() {
+        let c = s[i]
+        if c == 95 {
+            out.push(32)
+        } else if c == 61 {
+            if i + 2 >= s.len() {
+                fail("mime: invalid RFC 2047 encoded-word")
+            }
+            for k in 1..3 {
+                if hex_val(s[i + k]) < 0 {
+                    fail("mime: invalid hex byte 0x" + (if s[i + k] < 16 { "0" } else { "" }) + s[i + k].to_base(16))
+                }
+            }
+            out.push(hex_val(s[i + 1]) * 16 + hex_val(s[i + 2]))
+            i = i + 2
+        } else if (c <= 126 and c >= 32) or c == 10 or c == 13 or c == 9 {
+            out.push(c)
+        } else {
+            fail("mime: invalid RFC 2047 encoded-word")
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn decode_text(encoding: i64, text: [i64]) -> [i64] ! str {
+    if encoding == 66 or encoding == 98 {
+        return try base64_decode(text)
+    }
+    if encoding == 81 or encoding == 113 {
+        return try q_decode(text)
+    }
+    fail("mime: invalid RFC 2047 encoded-word")
+}
+
+fn utf8_of(c: i64) -> [i64] {
+    return c.to_char().to_bytes().to_list()
+}
+
+/// The decoded bytes in UTF-8, by charset; any charset but these three is
+/// refused, as Go refuses it without a CharsetReader.
+fn convert(charset: [i64], content: [i64]) -> [i64] ! str {
+    let name = fold(bytes_text(charset))
+    if name == "utf-8" {
+        return content
+    }
+    var out: [i64] = []
+    if name == "iso-8859-1" {
+        for c in content {
+            out = out + utf8_of(c)
+        }
+        return out
+    }
+    if name == "us-ascii" {
+        for c in content {
+            out = out + (if c >= 128 { [239, 191, 189] } else { [c] })
+        }
+        return out
+    }
+    fail("mime: unhandled charset " + goquote.quote(bytes_of(charset)))
+}
+
+fn count_of(s: [i64], c: i64) -> i64 {
+    return s.filter(|x| x == c).len()
+}
+
+fn find(s: [i64], from: i64, pat: [i64]) -> i64 {
+    var i = from
+    while i + pat.len() <= s.len() {
+        var ok = true
+        for k in 0..pat.len() {
+            if s[i + k] != pat[k] {
+                ok = false
+            }
+        }
+        if ok {
+            return i
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+/// `WordDecoder.Decode(word)`: one encoded word.
+pub fn decode_word(word: str) -> bytes ! str {
+    let w = word.to_bytes().to_list()
+    if w.len() < 8 or w[0] != 61 or w[1] != 63 or w[w.len() - 2] != 63 or w[w.len() - 1] != 61 or count_of(w, 63) != 4 {
+        fail("mime: invalid RFC 2047 encoded-word")
+    }
+    let inner = w.slice(2, w.len() - 2)
+    let q1 = find(inner, 0, [63])
+    let charset = inner.slice(0, q1)
+    if charset.len() == 0 {
+        fail("mime: invalid RFC 2047 encoded-word")
+    }
+    let rest = inner.slice(q1 + 1, inner.len())
+    let q2 = find(rest, 0, [63])
+    if q2 != 1 {
+        fail("mime: invalid RFC 2047 encoded-word")
+    }
+    let content = try decode_text(rest[0], rest.slice(2, rest.len()))
+    return bytes_of(try convert(charset, content))
+}
+
+fn has_non_whitespace(s: [i64]) -> bool {
+    return bytes_text(s).codes().any(|c| c != 32 and c != 9 and c != 10 and c != 13)
+}
+
+/// `WordDecoder.DecodeHeader(header)`: every encoded word decoded, the
+/// whitespace between two of them dropped.
+pub fn decode_header(header: str) -> bytes ! str {
+    var h = header.to_bytes().to_list()
+    let first = find(h, 0, [61, 63])
+    if first < 0 {
+        return bytes_of(h)
+    }
+    var out = h.slice(0, first)
+    h = h.slice(first, h.len())
+    var between = false
+    while true {
+        let start = find(h, 0, [61, 63])
+        if start < 0 {
+            break
+        }
+        var cur = start + 2
+        let qm = find(h, cur, [63])
+        if qm < 0 {
+            break
+        }
+        let charset = h.slice(cur, qm)
+        cur = qm + 1
+        if h.len() < cur + 4 {
+            break
+        }
+        let encoding = h[cur]
+        cur = cur + 1
+        if h[cur] != 63 {
+            break
+        }
+        cur = cur + 1
+        let end_mark = find(h, cur, [63, 61])
+        if end_mark < 0 {
+            break
+        }
+        let text = h.slice(cur, end_mark)
+        let finish = end_mark + 2
+        let content = match decode_text(encoding, text) {
+            Ok(c) -> c
+            Err(_e) -> {
+                between = false
+                out = out + h.slice(0, start + 2)
+                h = h.slice(start + 2, h.len())
+                continue
+            }
+        }
+        if start > 0 and (not between or has_non_whitespace(h.slice(0, start))) {
+            out = out + h.slice(0, start)
+        }
+        out = out + (try convert(charset, content))
+        h = h.slice(finish, h.len())
+        between = true
+    }
+    return bytes_of(out + h)
+}

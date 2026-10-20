@@ -1,0 +1,36 @@
+[package]
+name = "b49test"
+version = "1.0.0"
+capabilities = ["io"]
+
+[dependencies.gostrconv]
+path = "../gostrconv"
+version = "^1.0.0"
+
+[dependencies.gonetip]
+path = "../gonetip"
+version = "^1.0.0"
+
+[dependencies.gourl]
+path = "../gourl"
+version = "^1.0.0"
+
+[dependencies.gomime]
+path = "../gomime"
+version = "^1.0.0"
+
+[dependencies.pyurlparse]
+path = "../pyurlparse"
+version = "^1.0.0"
+
+[dependencies.pyrandom]
+path = "../pyrandom"
+version = "^1.0.0"
+
+[dependencies.pymath]
+path = "../pymath"
+version = "^1.0.0"
+
+[dependencies.pystatistics]
+path = "../pystatistics"
+version = "^1.0.0"

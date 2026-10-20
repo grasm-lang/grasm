@@ -1,0 +1,286 @@
+// The harness scripts/b47_diff.py drives: each (op, path) pair names a case
+// file, and the answer is one hex-encoded line.
+import httpcachesem
+import unicodeblock
+import hangul
+import lz4frame
+import pprof
+import digestauth
+import gobwire
+
+fn hexs(s: str) -> str {
+    let digits = "0123456789abcdef"
+    var parts: [str] = []
+    for x in s.to_bytes().to_list() {
+        parts.push(digits.substr(x.ushr(4), 1) + digits.substr(x.bit_and(15), 1))
+    }
+    let out = parts.join("")
+    return if out.len() == 0 { "-" } else { out }
+}
+
+fn unhex(h: str) -> str {
+    if h == "-" {
+        return ""
+    }
+    var out: [i64] = []
+    let b = h.to_bytes()
+    var i = 0
+    while i + 1 < b.len() {
+        let hi = b.at(i)
+        let lo = b.at(i + 1)
+        out.push((if hi >= 97 { hi - 87 } else { hi - 48 }) * 16 + (if lo >= 97 { lo - 87 } else { lo - 48 }))
+        i = i + 2
+    }
+    return bytes_of(out).to_str()
+}
+
+fn opt(h: str) -> Option[str] {
+    return if h == "_" { None } else { Some(unhex(h)) }
+}
+
+/// An f64's IEEE-754 bits as sixteen hex digits, which is what the oracle
+/// prints: two engines' decimal renderings could agree on a wrong value.
+fn bits(x: f64) -> str {
+    let b = x.to_bits()
+    let hi = b.ushr(32).to_base(16).pad_start(8, "0")
+    let lo = b.bit_and(4294967295).to_base(16).pad_start(8, "0")
+    return hi + lo
+}
+
+fn enc(h: [(str, str)]) -> str {
+    let parts = h.filter(|e| e.1 != "\u{0}undefined").map(|e| hexs(e.0) + "=" + hexs(e.1))
+    return if parts.len() == 0 { "-" } else { parts.join(",") }
+}
+
+fn flag(b: bool) -> str {
+    return if b { "1" } else { "0" }
+}
+
+type HcCase = {
+    opts: HcOptions,
+    req: HcRequest,
+    res: HcResponse,
+    q: HcRequest,
+    r2: Option[HcResponse],
+    t: [f64],
+}
+
+fn read_case(text: str) -> HcCase {
+    var opts = httpcachesem.default_options()
+    var req = HcRequest{ method: None, url: None, headers: [] }
+    var res = HcResponse{ status: None, headers: [] }
+    var q = HcRequest{ method: None, url: None, headers: [] }
+    var r2: Option[HcResponse] = None
+    var r2h: [(str, str)] = []
+    var r2_status: Option[i64] = None
+    var r2_none = false
+    var t: [f64] = []
+    for line in text.split("\n") {
+        let f = line.split(" ")
+        let k = f[0]
+        if k == "OPT" {
+            opts = HcOptions{ shared: f[1] == "1", heuristic: f[2].parse_float() ?? 0.1, immutable_min_ttl: if f[4] == "-" { 86400000.0 } else { f[4].parse_float() ?? 0.0 },
+                ignore_cargo_cult: f[3] == "1" }
+        } else if k == "REQ" {
+            req = HcRequest{ method: opt(f[1]), url: opt(f[2]), headers: [] }
+        } else if k == "RQH" {
+            req = HcRequest{ method: req.method, url: req.url, headers: httpcachesem.hset(req.headers, unhex(f[1]), unhex(f[2])) }
+        } else if k == "RES" {
+            res = HcResponse{ status: if f[1] == "_" { None } else { f[1].parse_int() }, headers: [] }
+        } else if k == "RSH" {
+            res = HcResponse{ status: res.status, headers: httpcachesem.hset(res.headers, unhex(f[1]), unhex(f[2])) }
+        } else if k == "Q" {
+            q = HcRequest{ method: opt(f[1]), url: opt(f[2]), headers: [] }
+        } else if k == "QH" {
+            q = HcRequest{ method: q.method, url: q.url, headers: httpcachesem.hset(q.headers, unhex(f[1]), unhex(f[2])) }
+        } else if k == "R2" {
+            r2_none = f[1] == "none"
+            r2_status = if f[1] == "_" or f[1] == "none" { None } else { f[1].parse_int() }
+        } else if k == "R2H" {
+            r2h = httpcachesem.hset(r2h, unhex(f[1]), unhex(f[2]))
+        } else if k == "T" {
+            t = f.slice(1, f.len()).map(|x| x.parse_float() ?? 0.0)
+        }
+    }
+    if not r2_none {
+        r2 = Some(HcResponse{ status: r2_status, headers: r2h })
+    }
+    return HcCase{ opts: opts, req: req, res: res, q: q, r2: r2, t: t }
+}
+
+fn httpcache(text: str) -> str {
+    let c = read_case(text)
+    let p = httpcachesem.new_policy(c.req, c.res, c.opts, c.t[0])
+    let now = c.t[1]
+    var out: [str] = []
+    out.push("S " + flag(httpcachesem.storable(p)))
+    out.push("M " + bits(httpcachesem.max_age(p)))
+    out.push("A " + bits(httpcachesem.age(p, now)))
+    out.push("L " + httpcachesem.js_int_text(httpcachesem.time_to_live(p, now)))
+    out.push("X " + flag(httpcachesem.stale(p, now)))
+    let ev = httpcachesem.evaluate_request(p, c.q, now)
+    let hit = match ev.response {
+        Some(h) -> enc(h)
+        None -> "_"
+    }
+    let rv = match ev.revalidation {
+        Some(r) -> flag(r.synchronous) + " " + enc(r.headers)
+        None -> "_"
+    }
+    out.push("E " + hit + " " + rv)
+    out.push("V " + enc(httpcachesem.revalidation_headers(p, c.q)))
+    let now2 = c.t[2]
+    out.push(match httpcachesem.revalidated_policy(p, c.q, c.r2, now2) {
+        Ok(r) -> "P " + flag(r.modified) + " " + flag(r.matches) + " " + flag(httpcachesem.storable(r.policy)) + " " +
+        httpcachesem.js_int_text(httpcachesem.time_to_live(r.policy, now2)) + " " + enc(httpcachesem.response_headers(r.policy, now2))
+        Err(_e) -> "P error"
+    })
+    return out.join("\n")
+}
+
+fn raw(h: str) -> bytes {
+    var out: [i64] = []
+    if h != "-" {
+        let b = h.to_bytes()
+        var i = 0
+        while i + 1 < b.len() {
+            let hi = b.at(i)
+            let lo = b.at(i + 1)
+            out.push((if hi >= 97 { hi - 87 } else { hi - 48 }) * 16 + (if lo >= 97 { lo - 87 } else { lo - 48 }))
+            i = i + 2
+        }
+    }
+    return bytes_of(out)
+}
+
+fn bytes_hex(b: bytes) -> str {
+    let digits = "0123456789abcdef"
+    var parts: [str] = []
+    for x in b.to_list() {
+        parts.push(digits.substr(x.ushr(4), 1) + digits.substr(x.bit_and(15), 1))
+    }
+    let out = parts.join("")
+    return if out.len() == 0 { "-" } else { out }
+}
+
+/// `dec <path>`: the file decoded, as hex, or `error`. `enc <hex> <max>
+/// <block-sum> <content-sum> <content-size>`: the frame written, as hex.
+fn lz4_answer(f: [str]) -> str / {io} {
+    if f[0] == "dec" {
+        let data = match read_bytes(f[1]) {
+            Ok(d) -> d
+            Err(_e) -> return "unreadable"
+        }
+        return match lz4frame.decode(data) {
+            Ok(b) -> bytes_hex(b)
+            Err(_e) -> "error"
+        }
+    }
+    let o = Lz4Options{ block_max: f[2].parse_int() ?? 4194304, block_checksum: f[3] == "1", content_checksum: f[4] == "1", content_size: f[5] == "1" }
+    return bytes_hex(lz4frame.encode(raw(f[1]), o))
+}
+
+/// `<path> <count>`: the first `count` values of the stream, rendered and
+/// joined by newlines, as hex; `error` when the stream does not hold them.
+fn gob_answer(f: [str]) -> str / {io} {
+    let data = match read_bytes(f[0]) {
+        Ok(d) -> d
+        Err(_e) -> return "unreadable"
+    }
+    let want = f[1].parse_int() ?? 0
+    let s = match gobwire.decode(data) {
+        Ok(x) -> x
+        Err(_e) -> return "error"
+    }
+    if s.items.len() < want {
+        return "error"
+    }
+    var outs: [str] = []
+    for k in 0..want {
+        outs.push(gobwire.render(s, s.items[k].id, Some(s.items[k].value)))
+    }
+    return hexs(outs.join("\n"))
+}
+
+/// `<challenge> <user> <password> <method> <uri> <cnonce>`, hex each: the
+/// `Authorization` value, or `none` where the challenge is not answered.
+fn digest_answer(f: [str]) -> str {
+    return match digestauth.parse_challenge(unhex(f[1])) {
+        Some(ch) -> digestauth.authorization(ch, unhex(f[2]), unhex(f[3]), unhex(f[4]), unhex(f[5]), unhex(f[6]), 1)
+        None -> "none"
+    }
+}
+
+fn pprof_answer(path: str) -> str / {io} {
+    let data = match read_bytes(path) {
+        Ok(d) -> d
+        Err(_e) -> return "unreadable"
+    }
+    return match pprof.parse(data) {
+        Ok(p) -> hexs(pprof.to_string(p))
+        Err(_e) -> "error"
+    }
+}
+
+fn hangul_answer(f: [str]) -> str {
+    let op = f[0]
+    if op == "nfd" {
+        return hangul.nfd(unhex(f[1]))
+    }
+    if op == "nfc" {
+        return hangul.nfc(unhex(f[1]))
+    }
+    if op == "compat" {
+        return hangul.nfkd(unhex(f[1]))
+    }
+    if op == "name" {
+        return hangul.syllable_name(f[1].parse_int_base(16) ?? 0) ?? "null"
+    }
+    if op == "lookup" {
+        return match hangul.lookup(unhex(f[1])) {
+            Some(c) -> c.to_base(16)
+            None -> "null"
+        }
+    }
+    return hangul.decompose_syllable(f[1].parse_int_base(16) ?? 0).map(|c| c.to_base(16)).join(" ")
+}
+
+fn block_answer(t: UbTable, f: [str]) -> str {
+    if f[0] == "of" {
+        return match unicodeblock.of(t, f[1].parse_int_base(16) ?? 0 - 1) {
+            Ok(Some(b)) -> b
+            Ok(None) -> "null"
+            Err(_e) -> "error"
+        }
+    }
+    return unicodeblock.for_name(t, unhex(f[1])) ?? "error"
+}
+
+fn main() / {io} {
+    let argv = args()
+    var i = 0
+    while i + 1 < argv.len() {
+        let op = argv[i]
+        let text = match read_bytes(argv[i + 1]) {
+            Ok(d) -> d.to_str()
+            Err(_e) -> ""
+        }
+        if op == "httpcache" {
+            print(hexs(httpcache(text)))
+        } else if op == "gob" {
+            print(text.split("\n").filter(|l| l.len() > 0).map(|l| gob_answer(l.split(" "))).join(";"))
+        } else if op == "digest" {
+            print(text.split("\n").filter(|l| l.len() > 0).map(|l| hexs(digest_answer(l.split(" ")))).join(";"))
+        } else if op == "pprof" {
+            print(text.split("\n").filter(|l| l.len() > 0).map(|l| pprof_answer(l)).join(";"))
+        } else if op == "lz4" {
+            print(text.split("\n").filter(|l| l.len() > 0).map(|l| lz4_answer(l.split(" "))).join(";"))
+        } else if op == "hangul" {
+            print(text.split("\n").filter(|l| l.len() > 0).map(|l| hexs(hangul_answer(l.split(" ")))).join(";"))
+        } else if op == "block" {
+            let t = unicodeblock.table()
+            print(text.split("\n").filter(|l| l.len() > 0).map(|l| hexs(block_answer(t, l.split(" ")))).join(";"))
+        }
+        i = i + 2
+    }
+}

@@ -1,0 +1,36 @@
+[package]
+name = "b51_demo"
+version = "1.0.0"
+capabilities = ["io"]
+
+[dependencies.nodepath]
+path = "../nodepath"
+version = "^1.0.0"
+
+[dependencies.nodebuffer]
+path = "../nodebuffer"
+version = "^1.0.0"
+
+[dependencies.jsjson]
+path = "../jsjson"
+version = "^1.0.0"
+
+[dependencies.pycharclass]
+path = "../pycharclass"
+version = "^1.0.0"
+
+[dependencies.pytextwrap]
+path = "../pytextwrap"
+version = "^1.0.0"
+
+[dependencies.pycalendar]
+path = "../pycalendar"
+version = "^1.0.0"
+
+[dependencies.pyfractions]
+path = "../pyfractions"
+version = "^1.0.0"
+
+[dependencies.bigint]
+path = "../bigint"
+version = "^1.0.0"

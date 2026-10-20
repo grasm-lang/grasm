@@ -682,6 +682,11 @@ for path, ev, ld in zip(yaml_files, ruby_ev, ruby_load):
 
 
 def check_emit(got, ld):
+    # A document Psych reads as events but cannot load (an alias to an anchor
+    # that is never defined) has nothing to round-trip: the emitter has to
+    # refuse it too.
+    if ld == "ERR":
+        return got == "ERR", "ERR", got
     if got in ("ERR", "NOFILE"):
         return False, "YAML", got
     text = bytes.fromhex(got).decode()

@@ -1,0 +1,12 @@
+[package]
+name = "gourl"
+version = "1.0.0"
+capabilities = []
+
+[dependencies.gonetip]
+path = "../gonetip"
+version = "^1.0.0"
+
+[dependencies.goquote]
+path = "../goquote"
+version = "^1.0.0"
