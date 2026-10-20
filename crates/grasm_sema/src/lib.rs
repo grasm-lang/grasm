@@ -5,6 +5,7 @@ pub mod check;
 pub mod docs;
 pub mod effects;
 pub mod loader;
+pub mod tirfacts;
 pub mod types;
 
 pub use check::{check, Analysis};

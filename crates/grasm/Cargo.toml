@@ -13,6 +13,7 @@ path = "src/main.rs"
 grasm_journal = { path = "../grasm_journal" }
 grasm_syntax = { path = "../grasm_syntax" }
 grasm_sema = { path = "../grasm_sema" }
+grasm_tir = { path = "../grasm_tir" }
 grasm_interp = { path = "../grasm_interp" }
 grasm_native = { path = "../grasm_native" }
 grasm_lsp = { path = "../grasm_lsp" }

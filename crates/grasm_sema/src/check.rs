@@ -202,6 +202,9 @@ pub struct Analysis {
     /// may run their tasks on several cores: no order of running them could
     /// be told apart from the written one. See `parallel_independent`.
     pub parallel_ok: std::collections::HashSet<u32>,
+    /// What the checker decided, for TIR (`docs/tir.md`). Present only when
+    /// the program was checked with [`check_program_tir`].
+    pub tir: Option<crate::tirfacts::TirFacts>,
 }
 
 pub fn check(module: &Module) -> Analysis {
@@ -376,11 +379,27 @@ pub fn check_program(program: &crate::loader::Program) -> Analysis {
             imports: f.imports.clone(),
         })
         .collect();
-    check_modules_in(&files, &program.deps.iter().cloned().collect())
+    check_modules_in(&files, &program.deps.iter().cloned().collect(), false)
+}
+
+/// [`check_program`], recording every decision TIR needs
+/// ([`crate::tirfacts`]). Checking is otherwise the same: the same
+/// diagnostics, the same tables.
+pub fn check_program_tir(program: &crate::loader::Program) -> Analysis {
+    let files: Vec<ModuleView> = program
+        .files
+        .iter()
+        .map(|f| ModuleView {
+            name: f.name.clone(),
+            module: &f.module,
+            imports: f.imports.clone(),
+        })
+        .collect();
+    check_modules_in(&files, &program.deps.iter().cloned().collect(), true)
 }
 
 fn check_modules(files: &[ModuleView]) -> Analysis {
-    check_modules_in(files, &std::collections::BTreeSet::new())
+    check_modules_in(files, &std::collections::BTreeSet::new(), false)
 }
 
 /// `check_modules`, told which module names are dependency packages.
@@ -394,8 +413,10 @@ fn check_modules(files: &[ModuleView]) -> Analysis {
 fn check_modules_in(
     files: &[ModuleView],
     packages: &std::collections::BTreeSet<String>,
+    record_tir: bool,
 ) -> Analysis {
     let mut c = Checker::new();
+    c.record_tir = record_tir;
     // The effect fixpoint runs first: a function's row is part of its type,
     // and nothing can be typed until the rows are known ([T-FN-TYPE-ROW]).
     let (rows, closure_rows) = crate::effects::rows_and_closures(files);
@@ -585,6 +606,11 @@ fn check_modules_in(
             Some((k, shown))
         })
         .collect();
+    let tir = if c.record_tir {
+        Some(c.finish_tir())
+    } else {
+        None
+    };
     let mut diagnostics = c.diags;
     diagnostics.extend(crate::effects::check_effects_multi_with(
         files,
@@ -648,6 +674,7 @@ fn check_modules_in(
         empty_types,
         float_sums: c.float_sums,
         parallel_ok: c.parallel_ok.clone(),
+        tir,
         defs: c.defs,
         diagnostics,
     }
@@ -715,6 +742,11 @@ struct EffectOp {
 }
 
 struct Checker {
+    /// Whether to write down each decision for TIR (`check_program_tir`).
+    record_tir: bool,
+    /// The decisions, as made: types here may still hold inference variables,
+    /// which `finish_tir` resolves once checking is done.
+    tir: crate::tirfacts::TirFacts,
     defs: TypeDefs,
     aliases: HashMap<String, Type>,
     fns: HashMap<String, FnInfo>,
@@ -1003,6 +1035,110 @@ struct DeferredClosure {
 }
 
 impl Checker {
+    /// TIR: what a bare name in an expression resolved to.
+    fn tir_name(&mut self, span: Span, r: crate::tirfacts::NameRes) {
+        if self.record_tir {
+            self.tir.names.insert((span.start, span.end), r);
+        }
+    }
+
+    /// TIR: what a call reached.
+    fn tir_call(&mut self, span: Span, r: crate::tirfacts::CallRes) {
+        if self.record_tir {
+            self.tir.calls.insert((span.start, span.end), r);
+        }
+    }
+
+    /// TIR: how a method call dispatched.
+    fn tir_method(&mut self, span: Span, r: crate::tirfacts::MethodRes) {
+        if self.record_tir {
+            self.tir.methods.insert((span.start, span.end), r);
+        }
+    }
+
+    /// TIR: the type a binding was given, keyed by the name that binds it.
+    fn tir_bind(&mut self, name: &Ident, ty: &Type) {
+        if self.record_tir {
+            self.tir
+                .binds
+                .insert((name.span.start, name.span.end), ty.clone());
+        }
+    }
+
+    /// Resolves every type the TIR tables hold, and adds the signatures,
+    /// constants and effects, once checking is done.
+    fn finish_tir(&mut self) -> crate::tirfacts::TirFacts {
+        use crate::tirfacts::{CallRes, EffectSig, FnSig, NameRes};
+        let mut t = std::mem::take(&mut self.tir);
+        let uni = &self.uni;
+        for ty in t.binds.values_mut() {
+            *ty = uni.resolve(ty);
+        }
+        for ty in t.wraps.values_mut() {
+            *ty = uni.resolve(ty);
+        }
+        t.types = self
+            .resolved_types
+            .iter()
+            .map(|(k, ty)| (*k, uni.resolve(ty)))
+            .collect();
+        for (k, ty) in std::mem::take(&mut t.checked) {
+            t.types.entry(k).or_insert_with(|| uni.resolve(&ty));
+        }
+        for r in t.names.values_mut() {
+            if let NameRes::Fn(_, args) = r {
+                for a in args.iter_mut() {
+                    *a = uni.resolve(a);
+                }
+            }
+        }
+        for r in t.calls.values_mut() {
+            if let CallRes::Fn(_, args) = r {
+                for a in args.iter_mut() {
+                    *a = uni.resolve(a);
+                }
+            }
+        }
+        for (name, info) in &self.fns {
+            t.fns.insert(
+                name.clone(),
+                FnSig {
+                    generics: info.generics,
+                    bounds: info.bounds.clone(),
+                    params: info.params.iter().map(|p| uni.resolve(p)).collect(),
+                    modes: info.modes.clone(),
+                    ret: uni.resolve(&info.ret),
+                    err: info.err.as_ref().map(|e| uni.resolve(e)),
+                    row: self.fn_rows.get(name).map(|r| r.iter().cloned().collect()),
+                    is_pub: info.is_pub,
+                    is_extern: self.extern_names.contains(name),
+                },
+            );
+        }
+        for (name, (ty, _)) in &self.consts {
+            t.consts.insert(name.clone(), uni.resolve(ty));
+        }
+        for (name, (ops, _)) in &self.effects {
+            t.effects.insert(
+                name.clone(),
+                EffectSig {
+                    ops: ops
+                        .iter()
+                        .map(|op| {
+                            (
+                                op.name.clone(),
+                                op.params.iter().map(|p| uni.resolve(p)).collect(),
+                                uni.resolve(&op.ret),
+                            )
+                        })
+                        .collect(),
+                },
+            );
+        }
+        t.parallel_ok = self.parallel_ok.iter().copied().collect();
+        t
+    }
+
     fn new() -> Self {
         let defs = TypeDefs::new();
         let mut variants = HashMap::new();
@@ -1048,6 +1184,8 @@ impl Checker {
             bound_obligations: Vec::new(),
             expr_types: SpanMap::default(),
             resolved_types: SpanMap::default(),
+            record_tir: false,
+            tir: crate::tirfacts::TirFacts::default(),
             empty_lits: Vec::new(),
             float_sums: std::collections::HashSet::new(),
             effects: HashMap::new(),
@@ -2111,6 +2249,16 @@ nothing says who owns it, how long it lives, or how long it is"
                 self.check_expr(a, p);
             }
             self.iface_calls.insert((span.start, span.end));
+            let bound = bounds
+                .iter()
+                .find(|b| {
+                    self.interfaces
+                        .get(*b)
+                        .is_some_and(|iface| iface.methods.iter().any(|m| m.name.name == name.name))
+                })
+                .cloned()
+                .unwrap_or_default();
+            self.tir_method(span, crate::tirfacts::MethodRes::Bound(bound));
             return Some(ret);
         }
         let key = self.impl_key(recv_res)?;
@@ -2123,6 +2271,7 @@ nothing says who owns it, how long it lives, or how long it is"
         full_args.push(recv.clone());
         full_args.extend(args.iter().cloned());
         self.iface_calls.insert((span.start, span.end));
+        self.tir_method(span, crate::tirfacts::MethodRes::Interface);
         Some(self.check_fn_call_in(&owner, &fname, &info, &full_args, span))
     }
 
@@ -2705,6 +2854,7 @@ different name, or call it as a method if you meant to extend a type (UFCS)",
                                  those, and `Option` of those",
                             );
                         }
+                        self.tir_bind(&p.name, &ty);
                         scope.insert(
                             p.name.name.clone(),
                             Binding {
@@ -2869,6 +3019,7 @@ different name, or call it as a method if you meant to extend a type (UFCS)",
         };
         let mut scope = HashMap::new();
         for (p, ty) in f.params.iter().zip(&info.params) {
+            self.tir_bind(&p.name, ty);
             scope.insert(
                 p.name.name.clone(),
                 Binding {
@@ -3717,6 +3868,7 @@ closing brace — yield a number from the region and return that",
     }
 
     fn bind(&mut self, name: &Ident, ty: Type, mutable: bool) {
+        self.tir_bind(name, &ty);
         let decl_loop_depth = self.loop_depth;
         self.scopes.last_mut().unwrap().insert(
             name.name.clone(),
@@ -4482,6 +4634,11 @@ afterwards has nowhere to send the effect — call it here, or return what it co
             // where it lands. Only the checker knows which branches those are.
             Some(Stmt::Expr(e)) => {
                 self.ok_wrapped.insert((e.span().start, e.span().end));
+                if self.record_tir {
+                    self.tir
+                        .wraps
+                        .insert((e.span().start, e.span().end), want.clone());
+                }
                 (**ok).clone()
             }
             _ => (**ok).clone(),
@@ -4610,6 +4767,18 @@ write back to — copy it into a local first, as in `var {} = {}`",
     // ------------------------------------------------------------------
 
     fn check_expr(&mut self, e: &Expr, expected: &Type) {
+        self.check_expr_inner(e, expected);
+        // TIR: an expression checked against a type has that type, and some
+        // shapes (a `match`, an `if`, a literal written against `f64`) are
+        // checked here without ever being inferred, so nothing else records
+        // it. Inference's own answer, where there is one, is kept.
+        if self.record_tir {
+            let k = (e.span().start, e.span().end);
+            self.tir.checked.insert(k, expected.clone());
+        }
+    }
+
+    fn check_expr_inner(&mut self, e: &Expr, expected: &Type) {
         let tail_fn = self.tail_fn.take();
         let want = self.uni.shallow_resolve(expected);
         // Int literal adapts to f64. Recorded, not just allowed: the engines
@@ -4728,6 +4897,13 @@ write back to — copy it into a local first, as in `var {} = {}`",
                         _ => None,
                     };
                     if let Some(inner) = inner {
+                        // TIR: the same decision `infer_call` records.
+                        let r = if id.name == "Some" {
+                            crate::tirfacts::CallRes::Variant
+                        } else {
+                            crate::tirfacts::CallRes::Builtin(id.name.clone())
+                        };
+                        self.tir_call(e.span(), r);
                         self.check_expr(&args[0], &inner);
                         return;
                     }
@@ -5499,6 +5675,7 @@ only a number or a `bool` can come out — compute what you need and yield that"
 
     fn infer_ident(&mut self, id: &Ident) -> Type {
         if let Some(b) = self.lookup(&id.name) {
+            self.tir_name(id.span, crate::tirfacts::NameRes::Local);
             self.reject_dead_capture(id);
             let captured = self.closure_floors.last().is_some_and(|floor| {
                 self.scopes
@@ -5526,6 +5703,7 @@ only a number or a `bool` can come out — compute what you need and yield that"
         if let Some(cands) = self.variants.get(&id.name).cloned() {
             if cands.len() == 1 {
                 let (def_id, vi) = cands[0];
+                self.tir_name(id.span, crate::tirfacts::NameRes::Variant);
                 return self.instantiate_variant(def_id, vi, &[], id.span);
             } else if cands.len() > 1 {
                 // A module's own variant wins, as it does for one with
@@ -5534,6 +5712,7 @@ only a number or a `bool` can come out — compute what you need and yield that"
                 // module that declared it — `aes` could not name its own
                 // `NotAuthentic` once `tls13` declared one too (F91).
                 if let Some((def_id, vi)) = self.own_variant(&cands) {
+                    self.tir_name(id.span, crate::tirfacts::NameRes::Variant);
                     return self.instantiate_variant(def_id, vi, &[], id.span);
                 }
                 return self.error_help(
@@ -5554,6 +5733,8 @@ only a number or a `bool` can come out — compute what you need and yield that"
             .get(&format!("{}::{}", self.current_module, id.name))
             .cloned()
         {
+            let q = format!("{}::{}", self.current_module, id.name);
+            self.tir_name(id.span, crate::tirfacts::NameRes::Const(q));
             return ty;
         }
         // Function referenced as a value. A fallible function's `! E` is
@@ -5573,6 +5754,8 @@ only a number or a `bool` can come out — compute what you need and yield that"
             let own_row = self.row_of_fn(&id.name);
             if info.generics > 0 {
                 let fresh: Vec<Type> = (0..info.generics).map(|_| self.uni.fresh()).collect();
+                let q = format!("{}::{}", self.current_module, id.name);
+                self.tir_name(id.span, crate::tirfacts::NameRes::Fn(q, fresh.clone()));
                 let ret = ret_of(&info.ret, &info.err);
                 return Type::Fn {
                     params: info
@@ -5584,6 +5767,8 @@ only a number or a `bool` can come out — compute what you need and yield that"
                     row: own_row,
                 };
             }
+            let q = format!("{}::{}", self.current_module, id.name);
+            self.tir_name(id.span, crate::tirfacts::NameRes::Fn(q, Vec::new()));
             return Type::Fn {
                 params: info.params.clone(),
                 ret: Box::new(ret_of(&info.ret, &info.err)),
@@ -5760,6 +5945,11 @@ only a number or a `bool` can come out — compute what you need and yield that"
         if let Expr::Ident(id) = callee {
             // Local binding takes priority (closure in a variable).
             if self.lookup(&id.name).is_none() {
+                // TIR: a built-in if one of the arms below takes it. Every other
+                // way a call can resolve (a variant, a declared function, a
+                // function value) records itself afterwards and replaces this,
+                // so what survives is exactly the calls a built-in arm returned.
+                self.tir_call(span, crate::tirfacts::CallRes::Builtin(id.name.clone()));
                 // Builtin free functions.
                 match id.name.as_str() {
                     // `eprint` is `print` to the other stream ([L-LIB-EPRINT]).
@@ -6487,6 +6677,7 @@ fail outside it",
                 if let Some(cands) = self.variants.get(&id.name).cloned() {
                     if cands.len() == 1 {
                         let (def_id, vi) = cands[0];
+                        self.tir_call(span, crate::tirfacts::CallRes::Variant);
                         return self.instantiate_variant(def_id, vi, args, span);
                     } else if cands.len() > 1 {
                         // **A module's own variant wins.**
@@ -6506,6 +6697,7 @@ fail outside it",
                         // reserved for the case that really is one: a module
                         // with no `Io` of its own, seeing two.
                         if let Some((def_id, vi)) = self.own_variant(&cands) {
+                            self.tir_call(span, crate::tirfacts::CallRes::Variant);
                             return self.instantiate_variant(def_id, vi, args, span);
                         }
                         return self.error_help(
@@ -6533,6 +6725,7 @@ fail outside it",
         if let Expr::Ident(id) = callee {
             self.reject_region_escape(id, "call");
         }
+        self.tir_call(span, crate::tirfacts::CallRes::Value);
         let callee_ty = self.infer_expr(callee);
         // Calling something whose type a deferred closure body will supply:
         // `let mk = |n| |m| n + m` then `mk(3)(4)` through a binding. The
@@ -6639,6 +6832,10 @@ fail outside it",
     ) -> Type {
         self.check_region_call_in(owner, name, args, span);
         let fresh: Vec<Type> = (0..info.generics).map(|_| self.uni.fresh()).collect();
+        self.tir_call(
+            span,
+            crate::tirfacts::CallRes::Fn(format!("{owner}::{name}"), fresh.clone()),
+        );
         for (v, b) in fresh.iter().zip(&info.bounds) {
             if !b.is_empty() {
                 self.bound_obligations.push((
@@ -6869,6 +7066,7 @@ parts have names worth writing",
                 if let Some(&def_id) = self.defs.by_name.get(&tid.name) {
                     if let TypeDefKind::Sum { variants } = &self.defs.get(def_id).kind {
                         if let Some(vi) = variants.iter().position(|v| v.name == name.name) {
+                            self.tir_name(span, crate::tirfacts::NameRes::Variant);
                             return self.instantiate_variant(def_id, vi, &[], span);
                         }
                     }
@@ -6921,6 +7119,7 @@ parts have names worth writing",
                     let qual = format!("{target_mod}::{}", name.name);
                     if let Some((ty, is_pub)) = self.consts.get(&qual).cloned() {
                         if is_pub {
+                            self.tir_name(span, crate::tirfacts::NameRes::Const(qual.clone()));
                             return ty;
                         }
                         return self.error_help(
@@ -6973,6 +7172,10 @@ parts have names worth writing",
                             // naming a function contributes its row to the
                             // function doing the naming, and says nothing
                             // about which module it was declared in.
+                            self.tir_name(
+                                span,
+                                crate::tirfacts::NameRes::Fn(qual.clone(), fresh.clone()),
+                            );
                             let own_row = self.row_of_qualified(&target_mod, &name.name);
                             return Type::Fn {
                                 params: info
@@ -7151,6 +7354,7 @@ parts have names worth writing",
 declare the `unsafe` capability, which is what makes it visible to everyone who depends on you",
                                 );
                             }
+                            self.tir_method(span, crate::tirfacts::MethodRes::Module);
                             return self.check_fn_call_in(
                                 &target_mod,
                                 &name.name,
@@ -7176,6 +7380,7 @@ declare the `unsafe` capability, which is what makes it visible to everyone who 
                             if let Some(cands) = self.variants.get(&name.name).cloned() {
                                 if cands.len() == 1 {
                                     let (def_id, vi) = cands[0];
+                                    self.tir_method(span, crate::tirfacts::MethodRes::Variant);
                                     return self.instantiate_variant(def_id, vi, args, span);
                                 }
                             }
@@ -7224,6 +7429,13 @@ Perform the effect after the closing brace, or yield a number and do the work ou
                             }
                             let params = op.params.clone();
                             let ret = op.ret.clone();
+                            self.tir_method(
+                                span,
+                                crate::tirfacts::MethodRes::EffectOp(
+                                    tid.name.clone(),
+                                    name.name.clone(),
+                                ),
+                            );
                             for (a, p) in args.iter().zip(&params) {
                                 self.check_expr(a, p);
                             }
@@ -7245,6 +7457,7 @@ Perform the effect after the closing brace, or yield a number and do the work ou
                 if let Some(&def_id) = self.defs.by_name.get(&tid.name) {
                     if let TypeDefKind::Sum { variants } = &self.defs.get(def_id).kind {
                         if let Some(vi) = variants.iter().position(|v| v.name == name.name) {
+                            self.tir_method(span, crate::tirfacts::MethodRes::Variant);
                             return self.instantiate_variant(def_id, vi, args, span);
                         }
                     }
@@ -7296,6 +7509,7 @@ Perform the effect after the closing brace, or yield a number and do the work ou
             return result;
         }
         if let Some(result) = self.builtin_method(&recv_res, recv, name, args, span) {
+            self.tir_method(span, crate::tirfacts::MethodRes::Builtin);
             return result;
         }
         // UFCS: `x.f(a)` → `f(x, a)`.
@@ -7320,6 +7534,7 @@ Perform the effect after the closing brace, or yield a number and do the work ou
             let mut full_args: Vec<Expr> = Vec::with_capacity(args.len() + 1);
             full_args.push(recv.clone());
             full_args.extend(args.iter().cloned());
+            self.tir_method(span, crate::tirfacts::MethodRes::Ufcs);
             return self.check_fn_call(&name.name, &info, &full_args, span);
         }
         // A field holding a function, called through the field. Storing one
@@ -7333,6 +7548,7 @@ Perform the effect after the closing brace, or yield a number and do the work ou
             // with the struct, so a program the checker had resolved to the
             // field printed the free function's answer instead.
             self.field_calls.insert((span.start, span.end));
+            self.tir_method(span, crate::tirfacts::MethodRes::FieldFn);
             let ft = self.infer_field(recv, name, span);
             let resolved = self.uni.shallow_resolve(&ft);
             if let Type::Fn { params, ret, row } = resolved {
@@ -9204,6 +9420,12 @@ bind the component to a `var`, or use a struct when the parts have names worth w
                             if !matches!(self.uni.shallow_resolve(&arm_ty), Type::Fallible(..)) {
                                 self.ok_wrapped
                                     .insert((arm.body.span().start, arm.body.span().end));
+                                if self.record_tir {
+                                    self.tir.wraps.insert(
+                                        (arm.body.span().start, arm.body.span().end),
+                                        t.clone(),
+                                    );
+                                }
                             }
                             let _ = self.uni.unify(&result, &t);
                         }
@@ -9265,6 +9487,11 @@ bind the component to a `var`, or use a struct when the parts have names worth w
                     // Accepted as the bare half, so its value is wrapped where
                     // it lands ([T-OK-ERR-RETURN]).
                     self.ok_wrapped.insert((body.span().start, body.span().end));
+                    if self.record_tir {
+                        self.tir
+                            .wraps
+                            .insert((body.span().start, body.span().end), r.clone());
+                    }
                     self.check_expr(body, &ok);
                     continue;
                 }

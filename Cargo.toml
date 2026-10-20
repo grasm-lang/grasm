@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/grasm_syntax",
     "crates/grasm_sema",
+    "crates/grasm_tir",
     "crates/grasm_interp",
     "crates/grasm_native",
     "crates/grasm_lsp",

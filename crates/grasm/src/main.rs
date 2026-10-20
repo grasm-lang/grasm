@@ -907,6 +907,39 @@ fn run() -> ExitCode {
             );
             ExitCode::SUCCESS
         }
+        // TIR, the typed intermediate representation (docs/tir.md): the
+        // program with every decision the checker made written down. Anything
+        // the checker left unrecorded is a hole, printed as `?`, listed on
+        // stderr and a failure, so a gate can demand a corpus with none.
+        Some("tir") => {
+            let Some(path) = args.get(1) else {
+                eprintln!("usage: grasm tir <file.gr>");
+                return ExitCode::FAILURE;
+            };
+            let program = match load_and_check(path) {
+                Ok(p) => p,
+                Err(code) => return code,
+            };
+            let analysis = grasm_sema::check::check_program_tir(&program);
+            match grasm_tir::emit(&program, &analysis) {
+                Ok(out) => {
+                    print!("{}", out.text);
+                    if out.holes.is_empty() {
+                        ExitCode::SUCCESS
+                    } else {
+                        for h in &out.holes {
+                            eprintln!("hole {h}");
+                        }
+                        eprintln!("{} hole(s)", out.holes.len());
+                        ExitCode::FAILURE
+                    }
+                }
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
         Some("tokens") => {
             let Some(path) = args.get(1) else {
                 eprintln!("usage: grasm tokens <file.gr>");
