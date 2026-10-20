@@ -214,18 +214,17 @@ Randomness and time arrive as arguments. → [`docs/grasmwire.md`](docs/grasmwir
 ## Start
 
 ```sh
-curl -fLO https://github.com/grasm-lang/grasm/releases/latest/download/grasm-aarch64-apple-darwin
-chmod +x grasm-aarch64-apple-darwin && mv grasm-aarch64-apple-darwin grasm
-./grasm run hello.gr
+curl -fLO https://github.com/grasm-lang/grasm/releases/latest/download/grasm-macos-arm64.tar.gz
+tar -xzf grasm-macos-arm64.tar.gz
+./grasm-macos-arm64/grasm run hello.gr
 ```
 
-**One binary, seventeen subcommands.** On its own it checks, formats,
-lints, tests and runs programs. Compiling to a native executable
-(`grasm build --native`) also needs the runtime library `libgrasm_rt_abi.a`
-beside it and a C toolchain's `cc` to link with, and the v1.0.0 downloads do
-not carry the library: for native builds, build from source for now. Intel
-Macs take `grasm-x86_64-apple-darwin`; checksums are in `SHA256SUMS` beside
-them. [All downloads →](https://github.com/grasm-lang/grasm/releases/latest)
+**One binary, seventeen subcommands**, with the runtime library that native
+builds link beside it in the archive. On its own it checks, formats, lints,
+tests and runs programs; `grasm build --native` also needs a C toolchain's
+`cc` to link with, until Grasm's own linker exists. Intel Macs take
+`grasm-macos-x86_64.tar.gz`; checksums are in `SHA256SUMS` beside them.
+[All downloads →](https://github.com/grasm-lang/grasm/releases/latest)
 
 Building from source needs a Rust toolchain to bootstrap the compiler, the way
 every language starts — [`docs/overview.md`](docs/overview.md) has it, and
