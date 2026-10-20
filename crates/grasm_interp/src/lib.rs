@@ -145,6 +145,7 @@ pub fn run_src_capturing_fault_with_stdin<W: Write + Send>(
                 .collect();
             let mut interp = Interp::new_program(&files, out);
             interp.set_float_literals(analysis.float_literals);
+            interp.set_narrow_ints(analysis.narrow_ints);
             interp.set_ok_wrapped(analysis.ok_wrapped);
             interp.set_field_calls(analysis.field_calls);
 
@@ -215,6 +216,7 @@ fn run_program_traced_here(
     // ([T-INT-TO-FLOAT]); this engine has no types of its own.
     let analysis = grasm_sema::check::check_program(program);
     interp.set_float_literals(analysis.float_literals);
+    interp.set_narrow_ints(analysis.narrow_ints);
     interp.set_ok_wrapped(analysis.ok_wrapped);
     interp.set_field_calls(analysis.field_calls);
 
@@ -252,6 +254,7 @@ fn run_program_here(
     // ([T-INT-TO-FLOAT]); this engine has no types of its own.
     let analysis = grasm_sema::check::check_program(program);
     interp.set_float_literals(analysis.float_literals);
+    interp.set_narrow_ints(analysis.narrow_ints);
     interp.set_ok_wrapped(analysis.ok_wrapped);
     interp.set_field_calls(analysis.field_calls);
 
@@ -300,6 +303,7 @@ fn test_program_here(
     // ([T-INT-TO-FLOAT]); this engine has no types of its own.
     let analysis = grasm_sema::check::check_program(program);
     interp.set_float_literals(analysis.float_literals);
+    interp.set_narrow_ints(analysis.narrow_ints);
     interp.set_ok_wrapped(analysis.ok_wrapped);
     interp.set_field_calls(analysis.field_calls);
 
@@ -445,10 +449,9 @@ fn test_program_here(
                 let refuse = if !f.generics.is_empty() {
                     Some("it is generic, and there is no one type to generate".to_string())
                 } else {
-                    f.params
-                        .iter()
-                        .find(|p| !generatable(&p.ty))
-                        .map(|p| format!("`{}` has a type the generator cannot produce", p.name.name))
+                    f.params.iter().find(|p| !generatable(&p.ty)).map(|p| {
+                        format!("`{}` has a type the generator cannot produce", p.name.name)
+                    })
                 };
                 if let Some(why) = refuse {
                     interp.report(&format!("test \"{label}\" ... not fuzzed: {why}"));
@@ -486,7 +489,11 @@ fn test_program_here(
                         ));
                         passed += 1;
                     }
-                    testing::PropertyOutcome::Failed { inputs, message, case } => {
+                    testing::PropertyOutcome::Failed {
+                        inputs,
+                        message,
+                        case,
+                    } => {
                         interp.report(&format!(
                             "test \"{label}\" ... FAILED on case {case} of {}\n  {}\n  counterexample: {}\n  replay: --contracts --seed {} --cases {}",
                             opts.cases,
@@ -653,6 +660,7 @@ fn run_examples_together(
         let mut sink = shared.clone();
         let mut interp = Interp::new_program(&files, &mut sink);
         interp.set_float_literals(analysis.float_literals.clone());
+        interp.set_narrow_ints(analysis.narrow_ints.clone());
         interp.set_ok_wrapped(analysis.ok_wrapped.clone());
         interp.set_field_calls(analysis.field_calls.clone());
         interp.set_interfaces(analysis.iface_calls.clone(), analysis.impl_fns.clone());
@@ -757,6 +765,7 @@ fn run_one_example(
     let outcome = {
         let mut interp = Interp::new_program(&files, &mut buf);
         interp.set_float_literals(analysis.float_literals.clone());
+        interp.set_narrow_ints(analysis.narrow_ints.clone());
         interp.set_ok_wrapped(analysis.ok_wrapped.clone());
         interp.set_field_calls(analysis.field_calls.clone());
         interp.set_interfaces(analysis.iface_calls.clone(), analysis.impl_fns.clone());
@@ -907,6 +916,7 @@ fn bench_program_here(
     // ([T-INT-TO-FLOAT]); this engine has no types of its own.
     let analysis = grasm_sema::check::check_program(program);
     interp.set_float_literals(analysis.float_literals);
+    interp.set_narrow_ints(analysis.narrow_ints);
     interp.set_ok_wrapped(analysis.ok_wrapped);
     interp.set_field_calls(analysis.field_calls);
 

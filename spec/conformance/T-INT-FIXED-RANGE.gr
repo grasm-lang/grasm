@@ -1,0 +1,8 @@
+//! tag: T-INT-FIXED-RANGE
+//! expect: error
+//! does not fit in `u8`
+// A literal outside the type's range is not a value of that type.
+fn main() {
+    let a: u8 = 256
+    print(a)
+}

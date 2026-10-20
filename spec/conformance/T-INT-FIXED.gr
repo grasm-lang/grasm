@@ -1,0 +1,25 @@
+//! tag: T-INT-FIXED
+//! expect: output
+//! 0 127 0 4 -56
+//! 255 [1, 2, 250] 253
+//! true 60 127
+// Fixed-width integers wrap at their width, as i64 wraps at 64. These names
+// used to be spellings of i64, and `a + 1` below printed 256.
+type Px = { r: u8, g: u8, b: u8 }
+
+fn bump(x: u8) -> u8 {
+    return x + 1
+}
+
+fn main() {
+    let a: u8 = 255
+    let c: i8 = -128
+    var e: u16 = 65535
+    e += 1
+    let p = Px{ r: 250, g: 1, b: 7 }
+    print("{bump(a)} {c - 1} {e} {p.r + 10} {(200).as_i8()}")
+    let xs: [u8] = [1, 2, 250]
+    print("{a} {xs} {xs.sum()}")
+    let m: i8 = -16
+    print("{a > p.r} {m.ushr(2)} {c.bit_not().as_u8()}")
+}

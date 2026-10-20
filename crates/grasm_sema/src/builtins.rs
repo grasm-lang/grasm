@@ -45,7 +45,15 @@
 /// A method listed here must be implemented in `mutate_in_place`, and the
 /// checker must call `require_mutable` for it.
 pub const MUTATING_METHODS: &[&str] = &[
-    "push", "pop", "set", "delete", "sort", "sort_by", "remove", "fill", "copy_from",
+    "push",
+    "pop",
+    "set",
+    "delete",
+    "sort",
+    "sort_by",
+    "remove",
+    "fill",
+    "copy_from",
 ];
 
 /// The effects a builtin performs. Empty means it reaches nothing outside the

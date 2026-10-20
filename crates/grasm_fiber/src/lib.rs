@@ -26,7 +26,10 @@ use core::cell::Cell;
 
 /// Whether this target can run fibers.
 pub const fn supported() -> bool {
-    cfg!(all(unix, any(target_arch = "aarch64", target_arch = "x86_64")))
+    cfg!(all(
+        unix,
+        any(target_arch = "aarch64", target_arch = "x86_64")
+    ))
 }
 
 /// Where a suspended fiber (or the thread that resumed one) left off: its
@@ -52,7 +55,6 @@ struct Inner {
     finished: bool,
     /// Was: a panic that escaped the body, carried back to the resumer.
     /// than unwound off the end of a stack it does not belong to.
-
     stack: Stack,
 }
 
@@ -181,7 +183,8 @@ const PAGE: usize = 16 * 1024;
 #[cfg(unix)]
 mod sys {
     extern "C" {
-        pub fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
+        pub fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64)
+            -> *mut u8;
         pub fn munmap(addr: *mut u8, len: usize) -> i32;
         pub fn mprotect(addr: *mut u8, len: usize, prot: i32) -> i32;
     }
@@ -422,10 +425,10 @@ mod arch {
 #[cfg(all(test, unix, any(target_arch = "aarch64", target_arch = "x86_64")))]
 mod tests {
     // `std`'s prelude is gone; tests need `alloc`'s names explicitly.
-    #[allow(unused_imports)]
-    use alloc::{format, string::String, string::ToString, vec, vec::Vec};
     use super::*;
     use alloc::rc::Rc;
+    #[allow(unused_imports)]
+    use alloc::{format, string::String, string::ToString, vec, vec::Vec};
 
     #[test]
     fn a_fiber_runs_to_its_end() {
@@ -521,7 +524,11 @@ mod tests {
     #[test]
     fn deep_recursion_fits_a_big_stack() {
         fn depth(n: u64) -> u64 {
-            if n == 0 { 0 } else { 1 + depth(core::hint::black_box(n - 1)) }
+            if n == 0 {
+                0
+            } else {
+                1 + depth(core::hint::black_box(n - 1))
+            }
         }
         let r = Rc::new(Cell::new(0));
         let r2 = r.clone();

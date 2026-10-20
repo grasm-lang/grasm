@@ -18,17 +18,44 @@ use grasm_syntax::ast::{
 /// resolved type of every expression (by span).
 /// Methods that read their receiver and change nothing in it.
 const READ_ONLY_METHODS: &[&str] = &[
-    "len", "is_empty", "byte_len", "contains", "starts_with", "ends_with", "at",
-    "get", "first", "last", "slice", "index_of", "split", "chars", "codes",
-    "lines", "words", "trim", "trim_start", "trim_end", "to_upper", "to_lower",
-    "to_str", "to_bytes", "keys", "values", "entries", "contains_key",
-    "parse_int", "parse_float", "substr", "join", "sum", "min", "max",
+    "len",
+    "is_empty",
+    "byte_len",
+    "contains",
+    "starts_with",
+    "ends_with",
+    "at",
+    "get",
+    "first",
+    "last",
+    "slice",
+    "index_of",
+    "split",
+    "chars",
+    "codes",
+    "lines",
+    "words",
+    "trim",
+    "trim_start",
+    "trim_end",
+    "to_upper",
+    "to_lower",
+    "to_str",
+    "to_bytes",
+    "keys",
+    "values",
+    "entries",
+    "contains_key",
+    "parse_int",
+    "parse_float",
+    "substr",
+    "join",
+    "sum",
+    "min",
+    "max",
 ];
 
-pub fn eligible(
-    modules: &[&Module],
-    types: &HashMap<(u32, u32), String>,
-) -> BTreeSet<String> {
+pub fn eligible(modules: &[&Module], types: &HashMap<(u32, u32), String>) -> BTreeSet<String> {
     let mut candidates: BTreeSet<String> = BTreeSet::new();
     for m in modules {
         for d in &m.decls {
@@ -73,8 +100,10 @@ pub fn eligible(
                 },
                 Decl::Fn(f) => {
                     if f.generics.is_empty() {
-                        out.fns
-                            .insert(f.name.name.clone(), f.params.iter().map(|p| p.mode).collect());
+                        out.fns.insert(
+                            f.name.name.clone(),
+                            f.params.iter().map(|p| p.mode).collect(),
+                        );
                     }
                     for p in &f.params {
                         out.type_uses(&p.ty, p.mode == ParamMode::Let);
@@ -505,8 +534,11 @@ impl Fields<'_> {
 
     /// Whether `e` is a candidate field whose declared type is text.
     fn is_str_field(&self, e: &Expr) -> bool {
-        self.named(e)
-            .is_some_and(|_| self.types.get(&(e.span().start, e.span().end)).is_some_and(|t| t == "str"))
+        self.named(e).is_some_and(|_| {
+            self.types
+                .get(&(e.span().start, e.span().end))
+                .is_some_and(|t| t == "str")
+        })
     }
 
     fn ban(&mut self, e: &Expr) {
@@ -588,7 +620,10 @@ impl Fields<'_> {
             Expr::Unary { expr, .. } => self.expr(expr),
             Expr::Binary { op, lhs, rhs, .. } => {
                 // Comparing text reads it.
-                let cmp = matches!(op, grasm_syntax::ast::BinaryOp::Eq | grasm_syntax::ast::BinaryOp::NotEq);
+                let cmp = matches!(
+                    op,
+                    grasm_syntax::ast::BinaryOp::Eq | grasm_syntax::ast::BinaryOp::NotEq
+                );
                 for side in [lhs, rhs] {
                     if cmp && self.is_str_field(side) {
                         self.inner(side);

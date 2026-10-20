@@ -220,7 +220,10 @@ enum Run<'b> {
 impl<'a, W: Write> Interp<'a, W> {
     /// Puts this interpreter's slab where the next one to run will take it.
     pub(crate) fn park_slab(&mut self) {
-        let slab = (std::mem::take(&mut self.slab), std::mem::take(&mut self.slab_free));
+        let slab = (
+            std::mem::take(&mut self.slab),
+            std::mem::take(&mut self.slab_free),
+        );
         self.chans.borrow_mut().slab_hold = Some(slab);
     }
 
@@ -276,7 +279,9 @@ impl<'a, W: Write> Interp<'a, W> {
         loop {
             {
                 let mut guard = self.chans.borrow_mut();
-                let Chans { chans, progress, .. } = &mut *guard;
+                let Chans {
+                    chans, progress, ..
+                } = &mut *guard;
                 let Some(c) = chans.get_mut(id) else {
                     return Err(Flow::Panic("not a channel".into()));
                 };
@@ -318,7 +323,9 @@ impl<'a, W: Write> Interp<'a, W> {
         loop {
             {
                 let mut guard = self.chans.borrow_mut();
-                let Chans { chans, progress, .. } = &mut *guard;
+                let Chans {
+                    chans, progress, ..
+                } = &mut *guard;
                 let Some(c) = chans.get_mut(id) else {
                     return Err(Flow::Panic("not a channel".into()));
                 };
@@ -349,7 +356,9 @@ impl<'a, W: Write> Interp<'a, W> {
             _ => return Err(Flow::Panic("not a list of channels".into())),
         };
         if ids.is_empty() {
-            return Err(Flow::Panic("`chan_select` of no channels would wait forever".into()));
+            return Err(Flow::Panic(
+                "`chan_select` of no channels would wait forever".into(),
+            ));
         }
         loop {
             {
@@ -373,12 +382,16 @@ impl<'a, W: Write> Interp<'a, W> {
     pub(crate) fn chan_close(&mut self, ch: &Value) -> EResult {
         let id = chan_id(ch)?;
         let mut guard = self.chans.borrow_mut();
-        let Chans { chans, progress, .. } = &mut *guard;
+        let Chans {
+            chans, progress, ..
+        } = &mut *guard;
         let Some(c) = chans.get_mut(id) else {
             return Err(Flow::Panic("not a channel".into()));
         };
         if c.closed {
-            return Err(Flow::Panic("closing a channel that is already closed".into()));
+            return Err(Flow::Panic(
+                "closing a channel that is already closed".into(),
+            ));
         }
         c.closed = true;
         *progress += 1;
@@ -397,16 +410,14 @@ impl<'a, W: Write> Interp<'a, W> {
 
     /// Runs a `concurrent` block's tasks to completion, in the fixed order
     /// described at the top of this file.
-    pub(crate) fn run_tasks(
-        &mut self,
-        tasks: Vec<Task>,
-    ) -> EResult {
+    pub(crate) fn run_tasks(&mut self, tasks: Vec<Task>) -> EResult {
         if tasks.is_empty() {
             return Ok(Value::Unit);
         }
         if !grasm_fiber::supported() {
             return Err(Flow::Panic(
-                "`concurrent` needs a platform that can switch stacks, which this one cannot".into(),
+                "`concurrent` needs a platform that can switch stacks, which this one cannot"
+                    .into(),
             ));
         }
         self.chans.borrow_mut().blocks_run += 1;

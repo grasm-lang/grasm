@@ -449,9 +449,19 @@ conversion between unrelated types.
 (IEEE-754 double), `bool`, `str` (UTF-8 text), and `()` (unit, the type of a
 statement that yields nothing).
 
-**[T-INT-ALIAS]** The names `i8`, `i16`, `i32`, `u8`, `u16`, `u32`, `u64`,
-`usize`, and `int` are currently aliases for `i64`; `f32` and `float` are
-aliases for `f64`. Distinct fixed-width types are designed but unimplemented.
+**[T-INT-FIXED]** `i8`, `i16`, `i32`, `u8`, `u16` and `u32` are integer types
+of their own, each holding its width's range: `u8` is 0 to 255, `i8` is -128
+to 127. **[T-INT-FIXED-MIX]** None converts to another or to `i64` on its own;
+`.as_U()` and `.try_U()` convert ([L-LIB-INT-CONV]). **[T-INT-FIXED-RANGE]** An
+integer literal takes the fixed-width type it is written against -- an
+annotation, a parameter, a field, the other operand -- and one outside that
+type's range is a compile error.
+Arithmetic (`+ - * / % ^`, negation, `abs`, `shl`, `bit_not`, the `+=` forms,
+`sum`) wraps to the width in two's complement, as `i64` wraps at 64
+([E-ARITH-INT]): a `u8` `255 + 1` is `0`. `shr` is arithmetic on the value,
+`ushr` logical on its bits at the width. `int` is another name for `i64` and
+`float` for `f64`. **[T-INT-FIXED-REFUSED]** `u64`, `usize` and `f32` are refused: they were aliases for
+`i64` and `f64`, and a name that does not do what it says is worse than none.
 
 **[T-UNIT-RETURN]** A function returning `()` may say so and may `return ()`
 anywhere, including from a branch. A backend may give it no return value at
@@ -466,7 +476,7 @@ with a `T ! E`, whichever way its handler ended: a value becomes `Ok`, a
 `fail` inside the handler becomes `Err`. So `try`, `match` and `??` all
 consume one, the same as any other fallible value.
 
-**[T-MAP-KEY]** `K` must be `i64`, `str`, or `bool`; any other key type is a
+**[T-MAP-KEY]** `K` must be an integer type, `str`, or `bool`; any other key type is a
 compile error.
 
 **[T-MAP-KEY-GENERIC]** A *type parameter* is allowed where a map key goes,
@@ -1064,14 +1074,7 @@ so the constructors worked everywhere a fallible value could be *stored* and
 nowhere one was *produced*.
 
 The wrapping happens wherever the branch lands, not only on the way out of a
-function. A fallible function re-wraps its whole body, which masked a gap
-everywhere except the positions that do not — a `let` annotation, a struct
-field, a list element — where the interpreter stored the *raw* value:
-`let a: i64 ! E = if true { 1 } else { Ok(2) }` held `1` rather than `Ok(1)`,
-so it printed as `1`, compared unequal to `Ok(1)`, and matched no arm of a
-`match` over it. A native build, which wraps by produced type, answered
-correctly — the normative engine was the wrong one, at exit 0 with nothing on
-stderr.
+function: a `let` annotation, a struct field and a list element wrap it too.
 
 Nesting does not change the position. A branch whose own body branches is at
 the fallible position too, so `if a { if b { 1 } else { Ok(2) } } else { Ok(3) }`
@@ -1237,19 +1240,13 @@ including a function type, a map, and a fallible one — and when a function's
 declared return type resolves to `T ! E`, the function is fallible even though
 its declaration does not spell the `!` out.
 
-**[T-EXTERN-POINTER]** An `extern fn` **parameter** may be `i64`, `f64`, `str`
+**[T-EXTERN-POINTER]** An `extern fn` **parameter** may be an integer type, `f64`, `str`
 or `bytes`. A `str` or `bytes` argument crosses as a pointer:
 
 ```grasm
 extern fn strlen(s: str) -> i64
 extern fn memcmp(a: bytes, b: bytes, n: i64) -> i64
 ```
-
-Without this the C boundary carried scalars only, which excluded `open`, `read`,
-`write`, `system`, `getenv`, `socket` — every libc function taking a pointer,
-which is nearly all of the useful ones. What could be called was `abs`, `sqrt`,
-`pow` and their kind, so "C ABI import overhead: zero-cost" was true and
-described arithmetic.
 
 A `str` crosses as a **NUL-terminated copy**. Grasm strings carry their length
 and are not terminated; C decides where a string ends by looking for the NUL,
@@ -1534,8 +1531,9 @@ while its binary called libc. Every other spelling — `labs(n)`, `n |> labs`,
 
 **[T-EXTERN]** `extern fn name(a: i64) -> f64` declares a C function. It has
 no body: a compiled build resolves the symbol at link time, and `grasm run`
-finds it in the interpreter's own process. Parameters and results are `i64`
-and `f64` only — `bool` is excluded because C's is one byte and Grasm's is a
+finds it in the interpreter's own process. Parameters and results are integer
+types ([T-INT-FIXED]; a narrower result is read at its own width, since C
+leaves the rest of the register unspecified) and `f64` — `bool` is excluded because C's is one byte and Grasm's is a
 register, and a width mismatch at an FFI boundary surfaces as garbage far from
 its cause.
 
@@ -1674,11 +1672,8 @@ is a function.
 
 Because the initializer is effect-free, when it runs is unobservable, and an
 engine may build the value once and hand out copies — which both of them do.
-This is a promise about cost, not only a permission: rebuilding per mention
-made every *read* of an n-element constant O(n), so a loop of k reads over a
-4 000-entry dispatch table took 632 ms where the same loop over a local copy
-took 1 ms. A constant is the shape this clause recommends for a table read in
-a loop, and reading one is O(1).
+This is a promise about cost, not only a permission: a constant is the shape
+this clause recommends for a table read in a loop, and reading one is O(1).
 
 **[E-CONST-REF]** A constant's value may not take a reference. A reference
 names a slot with a lifetime, and a constant has no place to put one: built
@@ -1735,6 +1730,7 @@ of a fallible value, says what it means with brackets.
 **[E-ARITH-INT]** `+ - *` on `i64` wrap on overflow (two's complement), and
 so does `/`: `i64::MIN / -1` has no representable result and yields `i64::MIN`
 rather than trapping. `i64::MIN % -1` is `0`, as `x % -1` is for every `x`.
+The fixed-width types wrap the same way at their own width ([T-INT-FIXED]).
 
 **[E-DIV-ZERO]** Integer `/` or `%` by zero panics.
 
@@ -2078,11 +2074,7 @@ the refusal §11 promises.
 **[E-PAR-FAIL]** A `par_map` or `par_filter` whose closure fails produces the
 failure, exactly as the `map` or `filter` written in its place would. Because
 the result never depends on how many cores ran it, an implementation is free to
-run such a closure sequentially, and the native backend does: its parallel
-workers carry one machine word of result and no error channel, so a `fail`
-inside one used to leave the error's address in the result slot —
-`[1, 2, 3].par_map(|x| if x == 2 { fail(e) } else { x })` printed a raw pointer
-as its middle element and exited 0.
+run such a closure sequentially, and the native backend does.
 
 ## 9. Ownership at runtime
 
@@ -2380,6 +2372,21 @@ Conversion is by method, not by a cast or a `int(...)`-style function. A `str`
 becomes a number with `parse_int` / `parse_float`, which return `Option`
 because the text may not be a number.
 
+**[L-LIB-INT-CONV]** On every integer type `T`, with `U` any of `i8 i16 i32
+u8 u16 u32` ([T-INT-FIXED]):
+
+| method | type | notes |
+|--------|------|-------|
+| `n.as_U()` | `T -> U` | wraps to `U`'s width |
+| `n.try_U()` | `T -> Option[U]` | `None` when the value does not fit |
+| `n.as_i64()` | `T -> i64` | the same value |
+| `x.as_U()` | `f64 -> U` | toward zero, held to `U`'s range; NaN is `0` |
+| `a.checked_add(b)`, `_sub`, `_mul` | `(T, T) -> Option[T]` | `None` when the true result is outside `T` |
+| `a.saturating_add(b)`, `_sub`, `_mul` | `(T, T) -> T` | the true result, held to `T`'s range |
+
+The methods of [L-LIB-NUM] and [L-LIB-BITS] apply to every integer type and
+answer in it; a shift count is an `i64`.
+
 **[L-LIB-MATH]** Trigonometry, exponentials and logarithms, on `f64`:
 
 | method | type | notes |
@@ -2407,10 +2414,7 @@ identifier that taking it outright would break working programs.
 
 **[L-LIB-TO-STR]** `to_str` produces exactly what `print` would. In
 particular an `f64` keeps its point at every magnitude: `(1.0).to_str()` is
-`"1.0"`. The interpreter used to hand the job to its host language, which drops
-the point on a whole value, so it answered `"1"` where the compiled backend
-answered `"1.0"` — and the documented idiom `xs.map(|v| v.to_str()).join(", ")`
-printed a `[f64]` as a list of integers, which [L-DISPLAY] exists to prevent.
+`"1.0"`.
 
 **[L-LIB-AS-I64]** `as_i64` is total: every `f64` has an answer, so it never
 panics. Too large gives `i64`'s maximum, too small its minimum, `NaN` gives `0`
@@ -2470,18 +2474,11 @@ are what lets a program compute *on* text — hash it, encode it, parse a number
 by hand — rather than only cut and compare it.
 
 `len`, `code_at` and `substr` all answer in constant time (`substr` in time
-proportional to the slice it returns), whatever the text. They
-count *characters*, so each used to decode the string from the start:
-`while i < s.len()` was quadratic in two ways at once, and 400 000 characters
-took 6.7 seconds where the identical loop over a list took 0.21. A string
+proportional to the slice it returns), whatever the text. A string
 never changes once built, so its character count is computed once and kept.
 When that count equals the byte count the text is ASCII and an index is an
 index; when it does not, a character index is built once, the first time one
-is asked for by position. Fixing only the ASCII half left the same 6.3 seconds
-waiting behind a single two-byte character, and building the index for
-`code_at` while leaving `substr` to walk from the start left a `substr(i, 1)`
-scan quadratic — 39 seconds over 262 144 characters — next to a `code_at` scan
-of the same string costing 0.11.
+is asked for by position.
 
 **[L-LIB-WORDS]** `s.words()` splits on runs of whitespace and yields no
 empty elements, which is what reading a line of aligned columns needs.
@@ -2984,8 +2981,8 @@ a `slice` taken before one is unaffected. **The length never changes**: a
 
 **`bytes` is distinct from `[i64]` on purpose.** A list of integers cannot
 promise its elements are bytes, stores eight per element, and cannot be handed
-to a buffer — the promise is the type. `at` gives `0..255`; one integer type is
-the trade. It **prints as hex**, and `to_str` is lossy for `tcp_read`'s reason.
+to a buffer — the promise is the type. `at` gives `0..255` as an `i64`, which
+is the trade. It **prints as hex**, and `to_str` is lossy for `tcp_read`'s reason.
 
 
 <!-- ===== docs/tutorial.md ===== -->
@@ -3700,6 +3697,28 @@ only trace was a column in `grasm deps`. Because effects are inferred from sourc
 quietly starts reading the filesystem exceeds its declared ceiling and fails
 to build **in every consumer** — a compile error, not a runtime surprise, and
 not something a reviewer has to happen to notice.
+
+A package that calls an `extern fn` names the library those symbols come
+from:
+
+```toml
+[package]
+name = "sdl"
+version = "1.0.0"
+capabilities = ["io", "unsafe"]
+links = ["SDL2"]           # `-lSDL2` on the link line
+```
+
+An `extern fn` is resolved by the system linker, so without this the library
+has to be named at every call site -- `grasm build --link SDL2` -- and
+forgetting it fails with one error per missing symbol rather than one naming
+the library. The libraries of every package in the graph go on the line, each
+one once. Where that library *lives* is still the machine's business: a
+search path belongs in `--link -L...`, not in a manifest that other people
+check out.
+
+`grasm links <file.gr>` prints what a program needs, which is how the gates
+tell a program they structurally cannot run from one the backend declined.
 
 A capability is what a package needs from **outside** itself, so what counts is
 what *escapes*: the effects `main` performs, the effects left in a `pub`

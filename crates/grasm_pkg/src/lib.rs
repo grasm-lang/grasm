@@ -209,15 +209,13 @@ impl Manifest {
                     // being checked separately is the whole difference
                     // between rejecting `-lSDL2` and accepting it.
                     let shape_ok = !name.is_empty()
-                        && name
-                            .chars()
-                            .all(|c| {
-                                c.is_ascii_alphanumeric()
-                                    || c == '_'
-                                    || c == '-'
-                                    || c == '.'
-                                    || c == '+'
-                            })
+                        && name.chars().all(|c| {
+                            c.is_ascii_alphanumeric()
+                                || c == '_'
+                                || c == '-'
+                                || c == '.'
+                                || c == '+'
+                        })
                         && name.starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_');
                     if !shape_ok {
                         return Err(format!(

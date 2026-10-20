@@ -16,8 +16,8 @@
 use alloc::format;
 use alloc::vec::Vec;
 
-use alloc::collections::VecDeque;
 use crate::sync::Mutex;
+use alloc::collections::VecDeque;
 
 use crate::{dec, inc, none_val, rt_panic, some_of, RtPayload, RtVal, LOCAL, STACK_BUDGET};
 
@@ -265,7 +265,9 @@ pub unsafe extern "C" fn grasm_chan_send(ch: i64, v: *mut RtVal) {
     loop {
         {
             let mut guard = chans();
-            let Chans { chans, progress, .. } = &mut *guard;
+            let Chans {
+                chans, progress, ..
+            } = &mut *guard;
             let c = &mut chans[at];
             if let Some(t) = ticket {
                 if c.taken > t {
@@ -304,7 +306,9 @@ pub extern "C" fn grasm_chan_recv(ch: i64) -> *mut RtVal {
     loop {
         {
             let mut guard = chans();
-            let Chans { chans, progress, .. } = &mut *guard;
+            let Chans {
+                chans, progress, ..
+            } = &mut *guard;
             let c = &mut chans[at];
             if let Some(v) = c.buf.pop_front() {
                 c.taken += 1;
@@ -357,7 +361,9 @@ pub unsafe extern "C" fn grasm_chan_select(chs: *mut RtVal) -> i64 {
 pub extern "C" fn grasm_chan_close(ch: i64) {
     let mut guard = chans();
     let at = index(ch, &guard);
-    let Chans { chans, progress, .. } = &mut *guard;
+    let Chans {
+        chans, progress, ..
+    } = &mut *guard;
     let c = &mut chans[at];
     if c.closed {
         drop(guard);

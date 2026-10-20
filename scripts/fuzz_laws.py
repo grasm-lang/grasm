@@ -345,7 +345,8 @@ CLAUSES = {
     "T-GENERIC-INST": "a generic instantiation",
     "T-GENERIC-TYPE": "a generic type",
     "T-INFER-LOCAL": "a local is inferred",
-    "T-INT-ALIAS": "int aliases are one type",
+    "T-INT-FIXED": "fixed widths wrap",
+    "L-LIB-INT-CONV": "conversions follow the range",
     "T-INT-TO-FLOAT": "an int becomes a float",
     "T-INT-TO-FLOAT-CARRIED": "promotion is carried",
     "T-LIST": "a list holds one type",
@@ -611,6 +612,22 @@ LAWS = {
  "a read borrows":            'let xs = [1, 2]\n    let a = xs[0]\n    let b = xs[0]\n    say(a == b and xs.len() == 2)',
  "coalesce is lazy":          'let seen = ref(0)\n    let o: Option[i64] = Some(1)\n    let v = o ?? bump(seen)\n    let n = seen.value\n    release(seen)\n    say(v == 1 and n == 0)',
  "coalesce takes the else":   'let o: Option[i64] = None\n    say((o ?? 9) == 9)',
+ # `fill` takes the whole buffer and has no second answer of its own, so the
+ # relation is to the constructor that was already there: filling with v must
+ # give what `bytes_filled` gives, byte for byte and length for length. The
+ # second half fills a buffer that already held something else, which rules
+ # out a `fill` that only writes where the buffer happened to be zero.
+ "a filled buffer is the filled constructor":
+                              'var a = bytes_filled(16, 0)\n    a.fill(7)\n    let b = bytes_filled(16, 7)\n    var same = a.len() == b.len()\n    for i in 0..16 {\n        if a.at(i) != b.at(i) { same = false }\n    }\n    var c = bytes_filled(16, 3)\n    c.fill(9)\n    var over = true\n    for i in 0..16 {\n        if c.at(i) != 9 { over = false }\n    }\n    say(same and over)',
+ # `copy_from` relates to itself at a different granularity: copying a source
+ # in one call and copying it in two halves must leave the same bytes. That
+ # is the relation an offset error cannot survive -- a destination index used
+ # where a source index belongs puts the second half in the wrong place, and
+ # the one-call copy says where it should have gone. Copying a buffer onto
+ # itself is the other half: it must be a no-op rather than a buffer that
+ # ate its own tail.
+ "copying in two halves is copying once":
+                              'var src = bytes_filled(12, 0)\n    for i in 0..12 {\n        src.set(i, i * 7 + 1)\n    }\n    var one = bytes_filled(12, 0)\n    one.copy_from(0, src)\n    var two = bytes_filled(12, 0)\n    two.copy_from(0, src.slice(0, 6))\n    two.copy_from(6, src.slice(6, 12))\n    var same = true\n    for i in 0..12 {\n        if one.at(i) != two.at(i) { same = false }\n        if one.at(i) != src.at(i) { same = false }\n    }\n    var self_copy = bytes_filled(12, 0)\n    self_copy.copy_from(0, src)\n    self_copy.copy_from(0, self_copy)\n    var unchanged = true\n    for i in 0..12 {\n        if self_copy.at(i) != src.at(i) { unchanged = false }\n    }\n    say(same and unchanged)',
  "a const is its value":      'say(LIMIT == 10)',
  "copy on write":             'var a = [1, 2]\n    var b = a\n    b.push(3)\n    say(a.len() == 2 and b.len() == 3)',
  "an error propagates":       'say((chain() ?? 0 - 1) == 0 - 1)',
@@ -652,7 +669,12 @@ LAWS = {
  "a generic instantiation":     'say(same(1) == 1 and same("a") == "a" and same(true) == true)',
  "a generic type":              'let a = Box{ v: 1 }\n    let b = Box{ v: "x" }\n    say(a.v == 1 and b.v == "x")',
  "a local is inferred":         'let n = 1 + 2\n    say(n == 3)',
- "int aliases are one type":    'let a: i32 = 1\n    let b: u8 = 2\n    say(a + b == 3)',
+ # A fixed width is pinned to i64 arithmetic taken modulo its range, not to a
+ # symmetry: an implementation that forgot to wrap would print the true sum.
+ "fixed widths wrap":           'var ok = true\n    for k in 0..600 {\n        let x = k - 300\n        for y in [0 - 129, 0 - 1, 0, 1, 7, 127, 128, 255] {\n            let a = x.as_u8()\n            let b = y.as_u8()\n            if (a + b).as_i64() != ((x + y) % 256 + 256) % 256 or (a * b).as_i64() != ((x * y) % 256 + 256) % 256 {\n                ok = false\n            }\n            let p = x.as_i8()\n            let q = y.as_i8()\n            if (p - q).as_i64() != ((x - y) % 256 + 256 + 128) % 256 - 128 {\n                ok = false\n            }\n        }\n    }\n    say(ok)',
+ # try_U is Some exactly when the value fits, and the checked and saturating
+ # forms give the true sum, or None, or the clamped sum -- each against i64.
+ "conversions follow the range": 'var ok = true\n    for k in 0..1000 {\n        let x = k * 37 - 18000\n        let fits = x >= 0 - 32768 and x <= 32767\n        match x.try_i16() {\n            Some(v) -> if not fits or v.as_i64() != x {\n                ok = false\n            }\n            None -> if fits {\n                ok = false\n            }\n        }\n        let a = x.as_i16()\n        let twice = 2 * a.as_i64()\n        if a.saturating_add(a).as_i64() != twice.max(0 - 32768).min(32767) {\n            ok = false\n        }\n        match a.checked_add(a) {\n            Some(v) -> if v.as_i64() != twice {\n                ok = false\n            }\n            None -> if twice >= 0 - 32768 and twice <= 32767 {\n                ok = false\n            }\n        }\n    }\n    say(ok)',
  "an int becomes a float":      'let x: f64 = 2\n    say(x == 2.0)',
  "promotion is carried":        'let xs: [f64] = [1, 2]\n    say(xs[0] + xs[1] == 3.0)',
  "a list holds one type":       'let xs: [i64] = [1, 2]\n    say(xs.len() == 2)',

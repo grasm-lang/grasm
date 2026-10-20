@@ -51,6 +51,14 @@ must not be able to lie about it.
 A replay that ends with records unread says so: it stopped earlier than the run
 it was replaying, and silence would let that pass for success.
 
+**A C function is not replayed; a replay stops at it.** Whatever an `extern fn`
+reads or changes happens outside the journaled builtins, so a recording holds
+none of it. Until 2026-10-19 a replay simply called the function again, for
+real -- `getpid()` printed a new number under a run that said it was a replay.
+Now the first C call of a replay stops it with exit status 7 and the
+function's name, in both engines, however the function is reached. A program
+that calls C can be recorded, and replayed up to its first C call.
+
 ## What it costs
 
 A run with neither variable set reads one thread-local per journaled call and

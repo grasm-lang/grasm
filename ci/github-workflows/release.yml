@@ -1,8 +1,14 @@
 name: Release
 
-# Builds a downloadable archive per platform. `grasm build --native` links
-# libgrasm_rt_abi.a, so the archive ships both and the binary finds the runtime
-# beside itself — a download that cannot compile is not a release.
+# One archive per platform, published with SHA256SUMS, then downloaded again
+# and checked the way a user meets it.
+#
+# `grasm build --native` links libgrasm_rt_abi.a, so the archive ships both and
+# the binary finds the runtime beside itself. v1.0.0 was uploaded by hand as
+# two bare binaries and `--native` failed from the download -- a release that
+# cannot compile is not a release, and nothing had checked. Every step below
+# is a script that also runs on a laptop: scripts/package.sh builds and
+# verifies one archive, scripts/verify_release.sh checks a published tag.
 on:
   push:
     tags: ["v*"]
@@ -21,28 +27,54 @@ jobs:
           - os: macos-13
             name: macos-x86_64
     runs-on: ${{ matrix.os }}
-    name: ${{ matrix.name }}
+    name: archive ${{ matrix.name }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo build --release --workspace
-      - name: Verify the archive actually works
-        # Build a program from a scratch directory using only what ships, so a
-        # broken archive fails here rather than for whoever downloads it.
-        run: |
-          mkdir -p dist/grasm-${{ matrix.name }}
-          cp target/release/grasm dist/grasm-${{ matrix.name }}/
-          cp target/release/libgrasm_rt_abi.a dist/grasm-${{ matrix.name }}/
-          cp README.md LICENSE NOTICE dist/grasm-${{ matrix.name }}/
-          cp dist/grasm-language-pack.md dist/grasm-${{ matrix.name }}/
-          mkdir -p /tmp/verify && cd /tmp/verify
-          printf 'fn main() {\n    print("release ok")\n}\n' > check.gr
-          "$GITHUB_WORKSPACE/dist/grasm-${{ matrix.name }}/grasm" run check.gr
-          "$GITHUB_WORKSPACE/dist/grasm-${{ matrix.name }}/grasm" build check.gr --native -o check
-          ./check | grep -q "release ok"
-      - name: Package
-        run: tar -czf grasm-${{ matrix.name }}.tar.gz -C dist grasm-${{ matrix.name }}
+      - name: Build, pack, and run from the archive alone
+        run: bash scripts/package.sh
       - uses: actions/upload-artifact@v4
         with:
           name: grasm-${{ matrix.name }}
-          path: grasm-${{ matrix.name }}.tar.gz
+          path: dist/grasm-${{ matrix.name }}.tar.gz
+
+  publish:
+    needs: archive
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: out
+          merge-multiple: true
+      - name: Checksums and release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          cd out
+          sha256sum grasm-*.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+          if gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" grasm-*.tar.gz SHA256SUMS --clobber -R "$GITHUB_REPOSITORY"
+          else
+            gh release create "$TAG" grasm-*.tar.gz SHA256SUMS --verify-tag \
+              --title "Grasm $TAG" --notes "Built from $GITHUB_SHA." -R "$GITHUB_REPOSITORY"
+          fi
+
+  verify-download:
+    needs: publish
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, macos-13]
+    runs-on: ${{ matrix.os }}
+    name: download check ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download the published release and use it
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash scripts/verify_release.sh --tag "${{ github.ref_name }}" -R "$GITHUB_REPOSITORY"

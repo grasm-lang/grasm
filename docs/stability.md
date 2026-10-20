@@ -110,8 +110,7 @@ exists to prevent.
    Today: **91 stable, 20 provisional, 16 experimental**, of 127. The twenty
    are the ones that fail a promotion rule and say which — library
    inventories that will grow, the effect system where this month's work
-   happened, generic bounds as the known next step, `T-INT-ALIAS` naming
-   types the implementation admits are unfinished, and the clauses written
+   happened, generic bounds as the known next step, and the clauses written
    too recently for "no problem found" to mean anything.
 2. The native backend compiles every program the interpreter runs. It does
    today — `scripts/difftest.sh` reports 130 identical and 0 unsupported — and

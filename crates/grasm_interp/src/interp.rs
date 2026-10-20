@@ -123,9 +123,9 @@ fn accept_once(
             stream.set_nonblocking(false)?;
             Ok((stream, addr))
         }
-        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Err(std::io::Error::other(
-            "no connection is waiting",
-        )),
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+            Err(std::io::Error::other("no connection is waiting"))
+        }
         Err(e) => Err(e),
     }
 }
@@ -166,6 +166,9 @@ pub struct Interp<'a, W: Write> {
     const_cache: HashMap<String, Value>,
     /// Integer literals the checker resolved to `f64`, by span start.
     float_literals: std::collections::HashSet<u32>,
+    /// See `Analysis::narrow_ints`: the width each fixed-width integer
+    /// operation wraps to, by span. Empty for a program that uses none.
+    narrow: std::collections::HashMap<(u32, u32), u8>,
     /// See `Analysis::ok_wrapped`.
     ok_wrapped: std::collections::HashSet<(u32, u32)>,
     /// Method calls the checker resolved to a struct field. See
@@ -859,6 +862,7 @@ impl<'a, W: Write> Interp<'a, W> {
         // — so no caller is asked to remember.
         let a = grasm_sema::check::check(module);
         me.float_literals = a.float_literals;
+        me.narrow = a.narrow_ints;
         me.ok_wrapped = a.ok_wrapped;
         me.field_calls = a.field_calls;
         me.iface_calls = a.iface_calls;
@@ -883,6 +887,30 @@ impl<'a, W: Write> Interp<'a, W> {
     /// wrong but not worse than it was.
     pub fn set_float_literals(&mut self, spans: std::collections::HashSet<u32>) {
         self.float_literals = spans;
+    }
+
+    /// The fixed-width integer operations and their widths, from `Analysis`
+    /// ([T-INT-FIXED]). Without it a `u8` computes as the `i64` it is held in.
+    pub fn set_narrow_ints(&mut self, spans: std::collections::HashMap<(u32, u32), u8>) {
+        self.narrow = spans;
+    }
+
+    /// The width an operation at `span` wraps to, if it is a fixed-width one.
+    fn narrow_at(&self, span: grasm_syntax::Span) -> Option<grasm_sema::types::IntKind> {
+        if self.narrow.is_empty() {
+            return None;
+        }
+        self.narrow
+            .get(&(span.start, span.end))
+            .and_then(|t| grasm_sema::types::IntKind::from_tag(*t))
+    }
+
+    /// An integer result wrapped to the width of the operation that made it.
+    fn narrowed(&self, span: grasm_syntax::Span, v: Value) -> Value {
+        match (v, self.narrow_at(span)) {
+            (Value::Int(i), Some(k)) => Value::Int(k.wrap(i)),
+            (v, _) => v,
+        }
     }
 
     /// The branch tails the checker accepted as the bare ok half, from
@@ -1480,6 +1508,7 @@ impl<'a, W: Write> Interp<'a, W> {
             consts: HashMap::new(),
             const_cache: HashMap::new(),
             float_literals: std::collections::HashSet::new(),
+            narrow: std::collections::HashMap::new(),
             ok_wrapped: std::collections::HashSet::new(),
             field_calls: Default::default(),
             iface_calls: Default::default(),
@@ -1535,6 +1564,7 @@ impl<'a, W: Write> Interp<'a, W> {
             consts: self.consts.clone(),
             const_cache: self.const_cache.clone(),
             float_literals: self.float_literals.clone(),
+            narrow: self.narrow.clone(),
             ok_wrapped: self.ok_wrapped.clone(),
             field_calls: self.field_calls.clone(),
             iface_calls: self.iface_calls.clone(),
@@ -1983,7 +2013,10 @@ impl<'a, W: Write> Interp<'a, W> {
                 Ok(Value::Unit)
             }
             Stmt::Assign {
-                target, op, value, ..
+                target,
+                op,
+                value,
+                span,
             } => {
                 // The target's own subexpressions come first: `xs[f()] = g()`
                 // runs `f` before `g` ([E-ORDER-LTR]). Evaluating the value
@@ -2015,7 +2048,8 @@ impl<'a, W: Write> Interp<'a, W> {
                         AssignOp::Div => BinaryOp::Div,
                         AssignOp::Assign => unreachable!(),
                     };
-                    self.apply_binary(bop, old, new)?
+                    let v = self.apply_binary(bop, old, new)?;
+                    self.narrowed(*span, v)
                 };
                 match resolved {
                     Some(segs) => {
@@ -2697,16 +2731,18 @@ impl<'a, W: Write> Interp<'a, W> {
                     (r, i) => Err(Flow::Panic(format!("cannot index `{r}` with `{i}`"))),
                 }
             }
-            Expr::Unary { op, expr, .. } => {
+            Expr::Unary { op, expr, span } => {
                 let v = self.eval_expr(expr)?;
                 match (op, v) {
-                    (UnaryOp::Neg, Value::Int(i)) => Ok(Value::Int(-i)),
+                    (UnaryOp::Neg, Value::Int(i)) => {
+                        Ok(self.narrowed(*span, Value::Int(i.wrapping_neg())))
+                    }
                     (UnaryOp::Neg, Value::Float(f)) => Ok(Value::Float(-f)),
                     (UnaryOp::Not, Value::Bool(b)) => Ok(Value::Bool(!b)),
                     (_, v) => Err(Flow::Panic(format!("invalid unary operand `{v}`"))),
                 }
             }
-            Expr::Binary { op, lhs, rhs, .. } => {
+            Expr::Binary { op, lhs, rhs, span } => {
                 // Short-circuit and/or.
                 match op {
                     BinaryOp::And => {
@@ -2739,7 +2775,8 @@ impl<'a, W: Write> Interp<'a, W> {
                 }
                 let l = self.eval_expr(lhs)?;
                 let r = self.eval_expr(rhs)?;
-                self.apply_binary(*op, l, r)
+                let v = self.apply_binary(*op, l, r)?;
+                Ok(self.narrowed(*span, v))
             }
             Expr::Range {
                 start,
@@ -2923,6 +2960,7 @@ impl<'a, W: Write> Interp<'a, W> {
         args: Vec<Value>,
     ) -> EResult {
         use crate::ffi::{CArg, CKind, CRet};
+        grasm_journal::refuse_foreign(&e.name.name);
         let Some(sym) = crate::ffi::find(&e.name.name) else {
             return Err(Flow::Panic(format!(
                 "cannot find the C function `{}` in this process — a compiled \
@@ -2992,8 +3030,19 @@ uses to mark the end of a string"
         // the checker restricted the declared parameter and result types to
         // `i64` and `f64` ([T-EXTERN]) — which is exactly what `cargs` and
         // `ret` describe here.
+        // A C function returning a narrower integer leaves the upper bits of
+        // the register unspecified, so the result is read at its own width.
+        let narrow_ret = match &e.ret {
+            Some(grasm_syntax::ast::TypeExpr::Name { path, .. }) => {
+                grasm_sema::types::IntKind::from_name(&path.segments[0].name)
+            }
+            _ => None,
+        };
         match unsafe { crate::ffi::call(sym, &cargs, ret) } {
-            Some(CRet::I64(v)) => Ok(Value::Int(v)),
+            Some(CRet::I64(v)) => Ok(Value::Int(match narrow_ret {
+                Some(k) => k.wrap(v),
+                None => v,
+            })),
             Some(CRet::F64(v)) => Ok(Value::Float(v)),
             Some(CRet::Unit) => Ok(Value::Unit),
             None => Err(Flow::Panic(format!(
@@ -3087,7 +3136,11 @@ uses to mark the end of a string"
                         }
                         let mut out = Vec::with_capacity(n.max(0) as usize);
                         for i in 0..n.max(0) {
-                            out.push(self.call_value(f.clone(), vec![Value::Int(i)], "net_workers")?);
+                            out.push(self.call_value(
+                                f.clone(),
+                                vec![Value::Int(i)],
+                                "net_workers",
+                            )?);
                         }
                         return Ok(Value::List(Rc::new(out)));
                     }
@@ -4091,13 +4144,23 @@ uses to mark the end of a string"
                 Value::List(_) => "[]".to_string(),
                 _ => String::new(),
             };
-            let Some(qual) = self.impl_fns.get(&(tname.clone(), name.name.clone())).cloned() else {
-                return Err(Flow::Panic(format!("no `impl` provides `{}` for `{tname}`", name.name)));
+            let Some(qual) = self
+                .impl_fns
+                .get(&(tname.clone(), name.name.clone()))
+                .cloned()
+            else {
+                return Err(Flow::Panic(format!(
+                    "no `impl` provides `{}` for `{tname}`",
+                    name.name
+                )));
             };
             let Some(f) = self.fns.get(&qual).copied() else {
                 return Err(Flow::Panic(format!("`{qual}` is not a function")));
             };
-            let module = qual.rsplit_once("::").map(|(m, _)| m.to_string()).unwrap_or_default();
+            let module = qual
+                .rsplit_once("::")
+                .map(|(m, _)| m.to_string())
+                .unwrap_or_default();
             let mut vs = Vec::with_capacity(args.len() + 1);
             vs.push(recv_v);
             for a in args {
@@ -4156,9 +4219,12 @@ uses to mark the end of a string"
             }
         }
         let recv_v = self.eval_expr(recv)?;
+        if let Some(r) = self.int_width_method(recv, &recv_v, name, args)? {
+            return Ok(r);
+        }
         // Try builtin method on the value.
         if let Some(r) = self.builtin_method(recv_v.clone(), name, args)? {
-            return Ok(r);
+            return Ok(self.narrowed(span, r));
         }
         // UFCS: x.f(a) → f(x, a) — unless the checker resolved this call to a
         // field of the receiver instead.
@@ -4528,6 +4594,96 @@ uses to mark the end of a string"
         Ok(Some(result))
     }
 
+    /// The integer methods that depend on the receiver's width
+    /// ([L-LIB-INT-CONV]): conversions to a fixed width, the checked and
+    /// saturating operations, and `ushr`, which shifts the bits of the value
+    /// at its own width -- `(-16).ushr(2)` is `60` for an `i8`, not the
+    /// enormous number it is for an `i64`.
+    fn int_width_method(
+        &mut self,
+        recv: &Expr,
+        recv_v: &Value,
+        name: &Ident,
+        args: &[Expr],
+    ) -> Result<Option<Value>, Flow> {
+        use grasm_sema::types::IntKind;
+        let n = name.name.as_str();
+        let (lo, hi, kind) = match self.narrow_at(recv.span()) {
+            Some(k) => (k.min() as i128, k.max() as i128, Some(k)),
+            None => (i64::MIN as i128, i64::MAX as i128, None),
+        };
+        match recv_v {
+            Value::Float(x) => {
+                if let Some(k) = n.strip_prefix("as_").and_then(IntKind::from_name) {
+                    // Toward zero, held to the range; NaN is 0, as `as_i64` has it.
+                    let t = if x.is_nan() { 0.0 } else { x.trunc() };
+                    let v = if t <= k.min() as f64 {
+                        k.min()
+                    } else if t >= k.max() as f64 {
+                        k.max()
+                    } else {
+                        t as i64
+                    };
+                    return Ok(Some(Value::Int(v)));
+                }
+                Ok(None)
+            }
+            Value::Int(i) => {
+                let i = *i;
+                // Widening: every fixed-width value is already the `i64` it
+                // stands for.
+                if n == "as_i64" {
+                    return Ok(Some(Value::Int(i)));
+                }
+                if let Some(k) = n.strip_prefix("as_").and_then(IntKind::from_name) {
+                    return Ok(Some(Value::Int(k.wrap(i))));
+                }
+                if let Some(k) = n.strip_prefix("try_").and_then(IntKind::from_name) {
+                    return Ok(Some(if k.fits(i) {
+                        Value::some(Value::Int(i))
+                    } else {
+                        Value::none()
+                    }));
+                }
+                let arg = |me: &mut Self| -> Result<i64, Flow> {
+                    match me.eval_expr(&args[0])? {
+                        Value::Int(j) => Ok(j),
+                        other => Err(Flow::Panic(format!("`{n}` expects an int, got `{other}`"))),
+                    }
+                };
+                let exact = |op: &str, a: i64, b: i64| -> i128 {
+                    let (a, b) = (a as i128, b as i128);
+                    match op {
+                        "add" => a + b,
+                        "sub" => a - b,
+                        _ => a * b,
+                    }
+                };
+                if let Some(op) = n.strip_prefix("checked_") {
+                    let j = arg(self)?;
+                    let r = exact(op, i, j);
+                    return Ok(Some(if r >= lo && r <= hi {
+                        Value::some(Value::Int(r as i64))
+                    } else {
+                        Value::none()
+                    }));
+                }
+                if let Some(op) = n.strip_prefix("saturating_") {
+                    let j = arg(self)?;
+                    let r = exact(op, i, j).clamp(lo, hi);
+                    return Ok(Some(Value::Int(r as i64)));
+                }
+                if let (Some(k), "ushr") = (kind, n) {
+                    let j = arg(self)?;
+                    let bits = (i as u64) & (u64::MAX >> (64 - k.bits()));
+                    return Ok(Some(Value::Int(k.wrap(bits.wrapping_shr(j as u32) as i64))));
+                }
+                Ok(None)
+            }
+            _ => Ok(None),
+        }
+    }
+
     fn builtin_method(
         &mut self,
         recv: Value,
@@ -4832,14 +4988,14 @@ uses to mark the end of a string"
                     // A count that cannot fit in memory is a panic with a
                     // message, not a Rust `capacity overflow` and a
                     // 19-frame backtrace ([E-PANIC-EXIT]).
-                    Value::Int(k) if k >= 0 => {
-                        match (k as usize).checked_mul(s.len()) {
-                            Some(bytes) if bytes <= MAX_ALLOC => Value::str(s.repeat(k as usize)),
-                            _ => return Err(Flow::Panic(format!(
+                    Value::Int(k) if k >= 0 => match (k as usize).checked_mul(s.len()) {
+                        Some(bytes) if bytes <= MAX_ALLOC => Value::str(s.repeat(k as usize)),
+                        _ => {
+                            return Err(Flow::Panic(format!(
                                 "repeat would need more memory than a string can hold ({k} copies)"
-                            ))),
+                            )))
                         }
-                    }
+                    },
                     _ => {
                         return Err(Flow::Panic(
                             "repeat count must be a non-negative int".into(),
@@ -5022,7 +5178,10 @@ uses to mark the end of a string"
                         b.len()
                     )));
                 }
-                match b[from as usize..].iter().position(|&x| i64::from(x) == byte) {
+                match b[from as usize..]
+                    .iter()
+                    .position(|&x| i64::from(x) == byte)
+                {
                     Some(i) => Value::some(Value::Int(from + i as i64)),
                     None => Value::none(),
                 }

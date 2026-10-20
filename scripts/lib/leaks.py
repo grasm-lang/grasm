@@ -30,7 +30,14 @@ def leaked(exe, timeout=180):
         timeout=timeout,
         env={**os.environ, "GRASM_LEAK_CHECK": "1"},
     )
-    if p.returncode == 0:
-        return None
     lines = p.stderr.strip().splitlines()
+    # Clean is the runtime saying so. Exit 0 alone also describes a program
+    # that never reached the check -- `exit(0)` part-way through -- and a
+    # death by signal is a negative code here, never a clean run.
+    if p.returncode == 0 and "leak check: nothing live at exit" in lines:
+        return None
+    if p.returncode < 0:
+        return f"killed by signal {-p.returncode} before the leak check"
+    if p.returncode == 0:
+        return "exit 0 without the leak check running (main did not return)"
     return lines[0] if lines else f"exit {p.returncode} with nothing on stderr"

@@ -603,10 +603,16 @@ impl Parser {
             return Ok(Decl::Bench(self.parse_bench_decl()?));
         }
         let linear_type = matches!(self.cur(), TokenKind::Ident(n) if n == "linear")
-            && matches!(self.toks.get(self.i + 1).map(|t| &t.kind), Some(TokenKind::KwType));
+            && matches!(
+                self.toks.get(self.i + 1).map(|t| &t.kind),
+                Some(TokenKind::KwType)
+            );
         // `actor Counter { ... }`: `actor` is a word only here.
         let actor = matches!(self.cur(), TokenKind::Ident(n) if n == "actor")
-            && matches!(self.toks.get(self.i + 1).map(|t| &t.kind), Some(TokenKind::Ident(_)));
+            && matches!(
+                self.toks.get(self.i + 1).map(|t| &t.kind),
+                Some(TokenKind::Ident(_))
+            );
         if actor {
             return Ok(Decl::Type(self.parse_actor(is_pub)?));
         }
@@ -744,7 +750,12 @@ impl Parser {
                 self.no_struct_lit = prev;
                 let cond = cond?;
                 let text = self.quote(cond.span());
-                out.push(Contract { binder: None, cond, text, span: start });
+                out.push(Contract {
+                    binder: None,
+                    cond,
+                    text,
+                    span: start,
+                });
             } else if is(self.cur(), "ensures") {
                 let start = self.cur_span();
                 self.bump();
@@ -757,7 +768,12 @@ impl Parser {
                 self.no_struct_lit = prev;
                 let cond = cond?;
                 let text = self.quote(open.merge(cond.span()));
-                out.push(Contract { binder: Some(binder), cond, text, span: start });
+                out.push(Contract {
+                    binder: Some(binder),
+                    cond,
+                    text,
+                    span: start,
+                });
             } else {
                 self.i = save;
                 return Ok(out);
@@ -808,17 +824,31 @@ impl Parser {
             next.set(next.get() + 1);
             Span::new(at, at)
         };
-        let ident = |n: &str| Ident { name: n.to_string(), span: fresh() };
-        let var = |n: &str| Expr::Ident(Ident { name: n.to_string(), span: fresh() });
+        let ident = |n: &str| Ident {
+            name: n.to_string(),
+            span: fresh(),
+        };
+        let var = |n: &str| {
+            Expr::Ident(Ident {
+                name: n.to_string(),
+                span: fresh(),
+            })
+        };
         let call = |callee: &str, args: Vec<Expr>| Expr::Call {
             callee: Box::new(var(callee)),
             args,
             span: fresh(),
         };
         let param_args: Vec<Expr> = f.params.iter().map(|p| var(&p.name.name)).collect();
-        let ok_ty = f.ret.clone().unwrap_or(TypeExpr::Tuple(Vec::new(), fresh()));
+        let ok_ty = f
+            .ret
+            .clone()
+            .unwrap_or(TypeExpr::Tuple(Vec::new(), fresh()));
         let bool_ty = TypeExpr::Name {
-            path: Path { segments: vec![ident("bool")], span: fresh() },
+            path: Path {
+                segments: vec![ident("bool")],
+                span: fresh(),
+            },
             args: Vec::new(),
             span: fresh(),
         };
@@ -848,7 +878,10 @@ impl Parser {
             let (helper, msg) = match &c.binder {
                 None => {
                     nr += 1;
-                    (format!("{name}@requires{nr}"), format!("requires `{}` failed in `{name}`", c.text))
+                    (
+                        format!("{name}@requires{nr}"),
+                        format!("requires `{}` failed in `{name}`", c.text),
+                    )
                 }
                 Some(b) => {
                     ne += 1;
@@ -858,19 +891,28 @@ impl Parser {
                         ty: ok_ty.clone(),
                         span: b.span,
                     });
-                    (format!("{name}@ensures{ne}"), format!("ensures `{}` failed in `{name}`", c.text))
+                    (
+                        format!("{name}@ensures{ne}"),
+                        format!("ensures `{}` failed in `{name}`", c.text),
+                    )
                 }
             };
             self.lowered.push(Decl::Fn(FnDecl {
                 is_pub: false,
-                name: Ident { name: helper.clone(), span: c.span },
+                name: Ident {
+                    name: helper.clone(),
+                    span: c.span,
+                },
                 generics: f.generics.clone(),
                 bounds: f.bounds.clone(),
                 params,
                 ret: Some(bool_ty.clone()),
                 err: None,
                 effects: Some(Vec::new()),
-                body: Block { stmts: vec![Stmt::Expr(c.cond)], span: c.span },
+                body: Block {
+                    stmts: vec![Stmt::Expr(c.cond)],
+                    span: c.span,
+                },
                 span: c.span,
             }));
             match c.binder {
@@ -885,7 +927,10 @@ impl Parser {
         let body_name = format!("{name}@body");
         let mut run = call(&body_name, param_args.clone());
         if f.err.is_some() {
-            run = Expr::Try { expr: Box::new(run), span: fresh() };
+            run = Expr::Try {
+                expr: Box::new(run),
+                span: fresh(),
+            };
         }
         stmts.push(Stmt::Let {
             mutable: false,
@@ -897,12 +942,18 @@ impl Parser {
         stmts.extend(post);
         stmts.push(Stmt::Expr(var("\u{a7}result")));
         let wrapper = FnDecl {
-            body: Block { stmts, span: f.body.span },
+            body: Block {
+                stmts,
+                span: f.body.span,
+            },
             ..f.clone()
         };
         self.lowered.push(Decl::Fn(FnDecl {
             is_pub: false,
-            name: Ident { name: body_name, span: f.name.span },
+            name: Ident {
+                name: body_name,
+                span: f.name.span,
+            },
             ..f
         }));
         Ok(wrapper)
@@ -1237,7 +1288,10 @@ impl Parser {
         let state_lit = Expr::StructLit {
             name: path_of(&state, fresh(0)),
             base: None,
-            fields: fields.iter().map(|(f, e)| (f.name.clone(), e.clone())).collect(),
+            fields: fields
+                .iter()
+                .map(|(f, e)| (f.name.clone(), e.clone()))
+                .collect(),
             span: fresh(1),
         };
         let cell = Expr::Call {
@@ -1361,7 +1415,10 @@ impl Parser {
                 self.bump();
             }
             if matches!(self.cur(), TokenKind::Ident(n) if n == "self")
-                && !matches!(self.toks.get(self.i + 1).map(|t| &t.kind), Some(TokenKind::Colon))
+                && !matches!(
+                    self.toks.get(self.i + 1).map(|t| &t.kind),
+                    Some(TokenKind::Colon)
+                )
             {
                 let Some(st) = self_ty else {
                     self.error_here(
@@ -1375,7 +1432,11 @@ impl Parser {
                 }
                 let name = self.ident()?;
                 params.push(Param {
-                    mode: if inout_self { ParamMode::Inout } else { ParamMode::Let },
+                    mode: if inout_self {
+                        ParamMode::Inout
+                    } else {
+                        ParamMode::Let
+                    },
                     name,
                     ty: st.clone(),
                     span: start,
@@ -1922,9 +1983,17 @@ impl Parser {
                 let body = self.parse_block()?;
                 let span = start.merge(body.span);
                 return Ok(if is_parallel {
-                    Stmt::Parallel { body, span, concurrent }
+                    Stmt::Parallel {
+                        body,
+                        span,
+                        concurrent,
+                    }
                 } else {
-                    Stmt::Spawn { body, span, concurrent }
+                    Stmt::Spawn {
+                        body,
+                        span,
+                        concurrent,
+                    }
                 });
             }
         }

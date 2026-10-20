@@ -962,12 +962,18 @@ becomes buildable the day its reference is installed.
 
 | | |
 |---|---|
-| At the start | 669 |
-| Now | 1000 |
+| At the start | 669 package directories, test harnesses included |
+| Now | 1000 package directories: **891 libraries** (a package exporting a `pub fn`) and 109 test harnesses |
 | Candidates above | 316 packages in 28 batches, plus `ecc`, `rfc6979` and `goprintf` |
 | Harnesses, one a batch | 28 |
 | If every candidate lands | 1016 |
-| Target | 1000 |
+| Target | 1000 libraries |
+
+The "1000" these batches reached counted every package directory but the
+`-demo` ones, and so counted the harnesses (`b47test`, `uritdiff`,
+`gostdtest`, ...) that drive the diffs: programs with a `main` and no API,
+which nobody would depend on. Counted as libraries the set is 891, and 109
+more are needed for the target. `scripts/site.py` counts the same way now.
 
 The margin over 1000 is 16. It is there because some
 candidate will turn out to exist already under a name the grep missed, or to

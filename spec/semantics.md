@@ -53,11 +53,8 @@ is a function.
 
 Because the initializer is effect-free, when it runs is unobservable, and an
 engine may build the value once and hand out copies — which both of them do.
-This is a promise about cost, not only a permission: rebuilding per mention
-made every *read* of an n-element constant O(n), so a loop of k reads over a
-4 000-entry dispatch table took 632 ms where the same loop over a local copy
-took 1 ms. A constant is the shape this clause recommends for a table read in
-a loop, and reading one is O(1).
+This is a promise about cost, not only a permission: a constant is the shape
+this clause recommends for a table read in a loop, and reading one is O(1).
 
 **[E-CONST-REF]** A constant's value may not take a reference. A reference
 names a slot with a lifetime, and a constant has no place to put one: built
@@ -114,6 +111,7 @@ of a fallible value, says what it means with brackets.
 **[E-ARITH-INT]** `+ - *` on `i64` wrap on overflow (two's complement), and
 so does `/`: `i64::MIN / -1` has no representable result and yields `i64::MIN`
 rather than trapping. `i64::MIN % -1` is `0`, as `x % -1` is for every `x`.
+The fixed-width types wrap the same way at their own width ([T-INT-FIXED]).
 
 **[E-DIV-ZERO]** Integer `/` or `%` by zero panics.
 
@@ -457,11 +455,7 @@ the refusal §11 promises.
 **[E-PAR-FAIL]** A `par_map` or `par_filter` whose closure fails produces the
 failure, exactly as the `map` or `filter` written in its place would. Because
 the result never depends on how many cores ran it, an implementation is free to
-run such a closure sequentially, and the native backend does: its parallel
-workers carry one machine word of result and no error channel, so a `fail`
-inside one used to leave the error's address in the result slot —
-`[1, 2, 3].par_map(|x| if x == 2 { fail(e) } else { x })` printed a raw pointer
-as its middle element and exited 0.
+run such a closure sequentially, and the native backend does.
 
 ## 9. Ownership at runtime
 

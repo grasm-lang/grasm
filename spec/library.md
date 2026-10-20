@@ -204,6 +204,21 @@ Conversion is by method, not by a cast or a `int(...)`-style function. A `str`
 becomes a number with `parse_int` / `parse_float`, which return `Option`
 because the text may not be a number.
 
+**[L-LIB-INT-CONV]** On every integer type `T`, with `U` any of `i8 i16 i32
+u8 u16 u32` ([T-INT-FIXED]):
+
+| method | type | notes |
+|--------|------|-------|
+| `n.as_U()` | `T -> U` | wraps to `U`'s width |
+| `n.try_U()` | `T -> Option[U]` | `None` when the value does not fit |
+| `n.as_i64()` | `T -> i64` | the same value |
+| `x.as_U()` | `f64 -> U` | toward zero, held to `U`'s range; NaN is `0` |
+| `a.checked_add(b)`, `_sub`, `_mul` | `(T, T) -> Option[T]` | `None` when the true result is outside `T` |
+| `a.saturating_add(b)`, `_sub`, `_mul` | `(T, T) -> T` | the true result, held to `T`'s range |
+
+The methods of [L-LIB-NUM] and [L-LIB-BITS] apply to every integer type and
+answer in it; a shift count is an `i64`.
+
 **[L-LIB-MATH]** Trigonometry, exponentials and logarithms, on `f64`:
 
 | method | type | notes |
@@ -231,10 +246,7 @@ identifier that taking it outright would break working programs.
 
 **[L-LIB-TO-STR]** `to_str` produces exactly what `print` would. In
 particular an `f64` keeps its point at every magnitude: `(1.0).to_str()` is
-`"1.0"`. The interpreter used to hand the job to its host language, which drops
-the point on a whole value, so it answered `"1"` where the compiled backend
-answered `"1.0"` — and the documented idiom `xs.map(|v| v.to_str()).join(", ")`
-printed a `[f64]` as a list of integers, which [L-DISPLAY] exists to prevent.
+`"1.0"`.
 
 **[L-LIB-AS-I64]** `as_i64` is total: every `f64` has an answer, so it never
 panics. Too large gives `i64`'s maximum, too small its minimum, `NaN` gives `0`
@@ -294,18 +306,11 @@ are what lets a program compute *on* text — hash it, encode it, parse a number
 by hand — rather than only cut and compare it.
 
 `len`, `code_at` and `substr` all answer in constant time (`substr` in time
-proportional to the slice it returns), whatever the text. They
-count *characters*, so each used to decode the string from the start:
-`while i < s.len()` was quadratic in two ways at once, and 400 000 characters
-took 6.7 seconds where the identical loop over a list took 0.21. A string
+proportional to the slice it returns), whatever the text. A string
 never changes once built, so its character count is computed once and kept.
 When that count equals the byte count the text is ASCII and an index is an
 index; when it does not, a character index is built once, the first time one
-is asked for by position. Fixing only the ASCII half left the same 6.3 seconds
-waiting behind a single two-byte character, and building the index for
-`code_at` while leaving `substr` to walk from the start left a `substr(i, 1)`
-scan quadratic — 39 seconds over 262 144 characters — next to a `code_at` scan
-of the same string costing 0.11.
+is asked for by position.
 
 **[L-LIB-WORDS]** `s.words()` splits on runs of whitespace and yields no
 empty elements, which is what reading a line of aligned columns needs.
@@ -808,5 +813,5 @@ a `slice` taken before one is unaffected. **The length never changes**: a
 
 **`bytes` is distinct from `[i64]` on purpose.** A list of integers cannot
 promise its elements are bytes, stores eight per element, and cannot be handed
-to a buffer — the promise is the type. `at` gives `0..255`; one integer type is
-the trade. It **prints as hex**, and `to_str` is lossy for `tcp_read`'s reason.
+to a buffer — the promise is the type. `at` gives `0..255` as an `i64`, which
+is the trade. It **prints as hex**, and `to_str` is lossy for `tcp_read`'s reason.

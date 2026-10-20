@@ -186,7 +186,10 @@ pub mod tls {
     #[cfg(not(target_arch = "wasm32"))]
     impl<T: 'static> Local<T> {
         pub const fn new(init: fn() -> T) -> Local<T> {
-            Local { key: AtomicU64::new(0), init }
+            Local {
+                key: AtomicU64::new(0),
+                init,
+            }
         }
 
         /// The key, made once. Two threads racing both make one; the loser
@@ -444,7 +447,13 @@ pub mod io {
     fn write_fully(fd: i32, bytes: &[u8]) -> Result<()> {
         let mut done = 0;
         while done < bytes.len() {
-            let n = unsafe { sys_write(fd, bytes[done..].as_ptr() as *const core::ffi::c_void, bytes.len() - done) };
+            let n = unsafe {
+                sys_write(
+                    fd,
+                    bytes[done..].as_ptr() as *const core::ffi::c_void,
+                    bytes.len() - done,
+                )
+            };
             if n > 0 {
                 done += n as usize;
             } else if n < 0 && errno() == EINTR {
@@ -550,7 +559,11 @@ pub mod io {
 
         /// Flush unless the lock is held, for `flush_all` on the way out.
         pub fn flush_if_free(&self) -> Result<()> {
-            let held = if self.fd == 1 { OUT.try_lock() } else { ERR.try_lock() };
+            let held = if self.fd == 1 {
+                OUT.try_lock()
+            } else {
+                ERR.try_lock()
+            };
             match held {
                 Some(held) => Stream { fd: self.fd, held }.flush(),
                 None => Ok(()),
@@ -701,11 +714,13 @@ pub mod process {
             next.push(0);
             owned.push(next);
         }
-        let mut pointers: Vec<*const u8> =
-            owned.iter().map(|a| a.as_ptr()).collect();
+        let mut pointers: Vec<*const u8> = owned.iter().map(|a| a.as_ptr()).collect();
         // `execvp` reads until it sees a null, so the array must end with one.
         pointers.push(core::ptr::null());
-        Argv { _owned: owned, pointers }
+        Argv {
+            _owned: owned,
+            pointers,
+        }
     }
 
     pub struct Pipe {
@@ -727,7 +742,10 @@ pub mod process {
         for fd in ends {
             unsafe { fcntl(fd, F_SETFD, FD_CLOEXEC) };
         }
-        Ok(Pipe { reader: ends[0], writer: ends[1] })
+        Ok(Pipe {
+            reader: ends[0],
+            writer: ends[1],
+        })
     }
 
     pub fn shut(fd: i32) {
@@ -838,7 +856,11 @@ pub mod process {
         let mut done = 0;
         while done < bytes.len() {
             let n = unsafe {
-                sys_write(fd, bytes[done..].as_ptr() as *const core::ffi::c_void, bytes.len() - done)
+                sys_write(
+                    fd,
+                    bytes[done..].as_ptr() as *const core::ffi::c_void,
+                    bytes.len() - done,
+                )
             };
             if n > 0 {
                 done += n as usize;
@@ -862,14 +884,20 @@ pub mod process {
         while out >= 0 || err >= 0 {
             let mut watching: Vec<PollFd> = Vec::with_capacity(2);
             if out >= 0 {
-                watching.push(PollFd { fd: out, wanted: POLLIN, got: 0 });
+                watching.push(PollFd {
+                    fd: out,
+                    wanted: POLLIN,
+                    got: 0,
+                });
             }
             if err >= 0 {
-                watching.push(PollFd { fd: err, wanted: POLLIN, got: 0 });
+                watching.push(PollFd {
+                    fd: err,
+                    wanted: POLLIN,
+                    got: 0,
+                });
             }
-            let r = unsafe {
-                poll(watching.as_mut_ptr(), watching.len() as u32, -1)
-            };
+            let r = unsafe { poll(watching.as_mut_ptr(), watching.len() as u32, -1) };
             if r < 0 {
                 if errno() == EINTR {
                     continue;
@@ -881,7 +909,11 @@ pub mod process {
                     continue;
                 }
                 let n = unsafe {
-                    sys_read(watched.fd, chunk.as_mut_ptr() as *mut core::ffi::c_void, chunk.len())
+                    sys_read(
+                        watched.fd,
+                        chunk.as_mut_ptr() as *mut core::ffi::c_void,
+                        chunk.len(),
+                    )
                 };
                 let into = if watched.fd == out {
                     &mut got_out
@@ -916,13 +948,7 @@ pub mod process {
                 return Err(e);
             }
         };
-        let pid = start(
-            program,
-            args,
-            None,
-            Some(out.writer),
-            Some(err.writer),
-        );
+        let pid = start(program, args, None, Some(out.writer), Some(err.writer));
         // The parent holds no writer: while it does, the reader never sees
         // end of file even after the child exits.
         shut(out.writer);
@@ -1052,9 +1078,7 @@ pub mod thread {
                 pthread_attr_destroy(at);
                 r
             },
-            None => unsafe {
-                pthread_create(&mut handle, core::ptr::null(), run, start)
-            },
+            None => unsafe { pthread_create(&mut handle, core::ptr::null(), run, start) },
         };
         if made != 0 {
             // The thread was never made, so nothing will take the box back.
@@ -1167,8 +1191,9 @@ pub mod thread {
             // every thread before `'scope` ends, so the borrow cannot outlive
             // what it points at. Erasing the lifetime is what `pthread_create`
             // needs and what that join pays for.
-            let erased: Box<dyn FnOnce() + Send> =
-                unsafe { core::mem::transmute(Box::new(body) as Box<dyn FnOnce() + Send + 'scope>) };
+            let erased: Box<dyn FnOnce() + Send> = unsafe {
+                core::mem::transmute(Box::new(body) as Box<dyn FnOnce() + Send + 'scope>)
+            };
             match spawn_raw(erased, name, stack) {
                 Some(handle) => {
                     // Safety: `Scope` is not `Sync`, so only the thread that
@@ -1208,9 +1233,7 @@ pub mod thread {
     ///
     /// It also removes the `transmute` the first version needed: with the
     /// bound, borrowing the local is enough.
-    pub fn scope<'env, R>(
-        body: impl for<'scope> FnOnce(&'scope Scope<'scope, 'env>) -> R,
-    ) -> R {
+    pub fn scope<'env, R>(body: impl for<'scope> FnOnce(&'scope Scope<'scope, 'env>) -> R) -> R {
         let held: Scope<'_, 'env> = Scope {
             running: UnsafeCell::new(Vec::new()),
             _scope: PhantomData,
@@ -1228,7 +1251,10 @@ pub mod thread {
 
     impl Builder {
         pub fn new() -> Builder {
-            Builder { name: None, stack: None }
+            Builder {
+                name: None,
+                stack: None,
+            }
         }
 
         pub fn name(mut self, name: String) -> Builder {
@@ -1334,14 +1360,33 @@ pub mod net {
         fn connect(fd: i32, addr: *const u8, len: u32) -> i32;
         fn send(fd: i32, buf: *const u8, n: usize, flags: i32) -> isize;
         fn recv(fd: i32, buf: *mut u8, n: usize, flags: i32) -> isize;
-        fn sendto(fd: i32, buf: *const u8, n: usize, flags: i32, addr: *const u8, alen: u32) -> isize;
-        fn recvfrom(fd: i32, buf: *mut u8, n: usize, flags: i32, addr: *mut u8, alen: *mut u32) -> isize;
+        fn sendto(
+            fd: i32,
+            buf: *const u8,
+            n: usize,
+            flags: i32,
+            addr: *const u8,
+            alen: u32,
+        ) -> isize;
+        fn recvfrom(
+            fd: i32,
+            buf: *mut u8,
+            n: usize,
+            flags: i32,
+            addr: *mut u8,
+            alen: *mut u32,
+        ) -> isize;
         fn setsockopt(fd: i32, level: i32, name: i32, value: *const u8, len: u32) -> i32;
         fn shutdown(fd: i32, how: i32) -> i32;
         fn close(fd: i32) -> i32;
         // Variadic too, for the same reason as `open` above.
         fn fcntl(fd: i32, cmd: i32, ...) -> i32;
-        fn getaddrinfo(host: *const u8, service: *const u8, hint: *const AddrInfo, out: *mut *const AddrInfo) -> i32;
+        fn getaddrinfo(
+            host: *const u8,
+            service: *const u8,
+            hint: *const AddrInfo,
+            out: *mut *const AddrInfo,
+        ) -> i32;
         fn freeaddrinfo(at: *const AddrInfo);
         fn getsockname(fd: i32, addr: *mut u8, len: *mut u32) -> i32;
         fn getpeername(fd: i32, addr: *mut u8, len: *mut u32) -> i32;
@@ -1360,14 +1405,14 @@ pub mod net {
 
     impl Addr {
         /// A sender's address, clamped to the buffer it was read into.
-    ///
-    /// `recvfrom`, `getsockname` and `getpeername` all report the address's
-    /// *actual* size rather than how much they stored, and POSIX allows that
-    /// to exceed the buffer. Slicing to the reported length panics on any
-    /// address family wider than the 128 bytes here, so both call sites take
-    /// the smaller of the two.
-    ///
-    /// The port, and the address as text.
+        ///
+        /// `recvfrom`, `getsockname` and `getpeername` all report the address's
+        /// *actual* size rather than how much they stored, and POSIX allows that
+        /// to exceed the buffer. Slicing to the reported length panics on any
+        /// address family wider than the 128 bytes here, so both call sites take
+        /// the smaller of the two.
+        ///
+        /// The port, and the address as text.
         ///
         /// `sin_port` sits at offset 2 in network byte order for IPv4 and
         /// IPv6 alike, and on both platforms -- macOS splits the family field
@@ -1406,9 +1451,7 @@ pub mod net {
             }
             let len = text.iter().position(|&b| b == 0).unwrap_or(0);
             (
-                core::str::from_utf8(&text[..len])
-                    .unwrap_or("")
-                    .into(),
+                core::str::from_utf8(&text[..len]).unwrap_or("").into(),
                 port,
             )
         }
@@ -1615,9 +1658,7 @@ pub mod net {
         pub fn write_all(&self, bytes: &[u8]) -> Result<()> {
             let mut done = 0;
             while done < bytes.len() {
-                let n = unsafe {
-                    send(self.fd, bytes[done..].as_ptr(), bytes.len() - done, 0)
-                };
+                let n = unsafe { send(self.fd, bytes[done..].as_ptr(), bytes.len() - done, 0) };
                 if n > 0 {
                     done += n as usize;
                 } else if n < 0 && errno() == EINTR {
@@ -1643,9 +1684,7 @@ pub mod net {
 
         pub fn accept(&self) -> Result<Socket> {
             loop {
-                let fd = unsafe {
-                    accept(self.fd, core::ptr::null_mut(), core::ptr::null_mut())
-                };
+                let fd = unsafe { accept(self.fd, core::ptr::null_mut(), core::ptr::null_mut()) };
                 if fd >= 0 {
                     return Ok(Socket { fd });
                 }
@@ -1767,9 +1806,7 @@ pub mod net {
             // `EINTR` means the attempt was interrupted, not that it
             // failed, so it retries this address rather than moving on.
             loop {
-                let r = unsafe {
-                    connect(sock.fd, addr.bytes.as_ptr(), addr.bytes.len() as u32)
-                };
+                let r = unsafe { connect(sock.fd, addr.bytes.as_ptr(), addr.bytes.len() as u32) };
                 if r >= 0 {
                     return Ok(sock);
                 }
@@ -1950,7 +1987,13 @@ pub mod fs {
 
         pub fn read(&mut self, into: &mut [u8]) -> Result<usize> {
             loop {
-                let n = unsafe { sys_read(self.fd, into.as_mut_ptr() as *mut core::ffi::c_void, into.len()) };
+                let n = unsafe {
+                    sys_read(
+                        self.fd,
+                        into.as_mut_ptr() as *mut core::ffi::c_void,
+                        into.len(),
+                    )
+                };
                 if n >= 0 {
                     return Ok(n as usize);
                 }
@@ -1995,7 +2038,11 @@ pub mod fs {
             let mut done = 0;
             while done < bytes.len() {
                 let n = unsafe {
-                    sys_write(self.fd, bytes[done..].as_ptr() as *const core::ffi::c_void, bytes.len() - done)
+                    sys_write(
+                        self.fd,
+                        bytes[done..].as_ptr() as *const core::ffi::c_void,
+                        bytes.len() - done,
+                    )
                 };
                 if n > 0 {
                     done += n as usize;
@@ -2334,7 +2381,9 @@ pub mod sys {
             return None;
         }
         let bytes = unsafe { c_bytes(at) };
-        core::str::from_utf8(bytes).ok().map(alloc::borrow::ToOwned::to_owned)
+        core::str::from_utf8(bytes)
+            .ok()
+            .map(alloc::borrow::ToOwned::to_owned)
     }
 }
 
@@ -2367,8 +2416,8 @@ pub mod sync {
             value: UnsafeCell<T>,
         }
 
-    unsafe impl<T: Send> Send for Mutex<T> {}
-    unsafe impl<T: Send> Sync for Mutex<T> {}
+        unsafe impl<T: Send> Send for Mutex<T> {}
+        unsafe impl<T: Send> Sync for Mutex<T> {}
 
         impl<T> Mutex<T> {
             pub const fn new(value: T) -> Mutex<T> {
@@ -2387,7 +2436,10 @@ pub mod sync {
                     return None;
                 }
                 self.held.set(true);
-                Some(Guard { held: &self.held, value: self.value.get() })
+                Some(Guard {
+                    held: &self.held,
+                    value: self.value.get(),
+                })
             }
 
             pub fn lock(&self) -> Guard<'_, T> {
@@ -2396,7 +2448,10 @@ pub mod sync {
                     "a lock was taken twice on the one thread wasm32 has, which a pthread mutex would deadlock on"
                 );
                 self.held.set(true);
-                Guard { held: &self.held, value: self.value.get() }
+                Guard {
+                    held: &self.held,
+                    value: self.value.get(),
+                }
             }
         }
 
@@ -2405,20 +2460,20 @@ pub mod sync {
             value: *mut T,
         }
 
-    impl<T> Deref for Guard<'_, T> {
+        impl<T> Deref for Guard<'_, T> {
             type Target = T;
             fn deref(&self) -> &T {
                 unsafe { &*self.value }
             }
         }
 
-    impl<T> DerefMut for Guard<'_, T> {
+        impl<T> DerefMut for Guard<'_, T> {
             fn deref_mut(&mut self) -> &mut T {
                 unsafe { &mut *self.value }
             }
         }
 
-    impl<T> Drop for Guard<'_, T> {
+        impl<T> Drop for Guard<'_, T> {
             fn drop(&mut self) {
                 self.held.set(false);
             }
@@ -2432,8 +2487,8 @@ pub mod sync {
             value: UnsafeCell<T>,
         }
 
-    unsafe impl<T: Send> Send for RwLock<T> {}
-    unsafe impl<T: Send + Sync> Sync for RwLock<T> {}
+        unsafe impl<T: Send> Send for RwLock<T> {}
+        unsafe impl<T: Send + Sync> Sync for RwLock<T> {}
 
         impl<T> RwLock<T> {
             pub const fn new(value: T) -> RwLock<T> {
@@ -2447,7 +2502,10 @@ pub mod sync {
             pub fn read(&self) -> ReadGuard<'_, T> {
                 assert!(!self.writing.get(), "a read while writing, on one thread");
                 self.readers.set(self.readers.get() + 1);
-                ReadGuard { readers: &self.readers, value: self.value.get() }
+                ReadGuard {
+                    readers: &self.readers,
+                    value: self.value.get(),
+                }
             }
 
             /// Correct with `Guard` here, unlike the pthread version: this
@@ -2458,7 +2516,10 @@ pub mod sync {
                     "a write while the lock is held, on one thread"
                 );
                 self.writing.set(true);
-                Guard { held: &self.writing, value: self.value.get() }
+                Guard {
+                    held: &self.writing,
+                    value: self.value.get(),
+                }
             }
         }
 
@@ -2467,14 +2528,14 @@ pub mod sync {
             value: *mut T,
         }
 
-    impl<T> Deref for ReadGuard<'_, T> {
+        impl<T> Deref for ReadGuard<'_, T> {
             type Target = T;
             fn deref(&self) -> &T {
                 unsafe { &*self.value }
             }
         }
 
-    impl<T> Drop for ReadGuard<'_, T> {
+        impl<T> Drop for ReadGuard<'_, T> {
             fn drop(&mut self) {
                 self.readers.set(self.readers.get() - 1);
             }
@@ -2571,7 +2632,11 @@ pub mod sync {
         pub fn lock(&self) -> Guard<'_, T> {
             let at = self.raw();
             unsafe { pthread_mutex_lock(at) };
-            Guard { at, value: self.value.get(), _held: core::marker::PhantomData }
+            Guard {
+                at,
+                value: self.value.get(),
+                _held: core::marker::PhantomData,
+            }
         }
 
         /// `None` when the lock is already held, rather than waiting for it.
@@ -2587,7 +2652,11 @@ pub mod sync {
             if unsafe { pthread_mutex_trylock(at) } != 0 {
                 return None;
             }
-            Some(Guard { at, value: self.value.get(), _held: core::marker::PhantomData })
+            Some(Guard {
+                at,
+                value: self.value.get(),
+                _held: core::marker::PhantomData,
+            })
         }
     }
 
@@ -2676,13 +2745,21 @@ pub mod sync {
         pub fn read(&self) -> ReadGuard<'_, T> {
             let at = self.raw();
             unsafe { pthread_rwlock_rdlock(at) };
-            ReadGuard { at, value: self.value.get(), _held: core::marker::PhantomData }
+            ReadGuard {
+                at,
+                value: self.value.get(),
+                _held: core::marker::PhantomData,
+            }
         }
 
         pub fn write(&self) -> WriteGuard<'_, T> {
             let at = self.raw();
             unsafe { pthread_rwlock_wrlock(at) };
-            WriteGuard { at, value: self.value.get(), _held: core::marker::PhantomData }
+            WriteGuard {
+                at,
+                value: self.value.get(),
+                _held: core::marker::PhantomData,
+            }
         }
     }
 
@@ -2797,9 +2874,7 @@ pub mod sync {
                         self.state.store(READY, Ordering::Release);
                         return unsafe { (*at).assume_init_ref() };
                     }
-                    Err(READY) => {
-                        return unsafe { (*self.value.get()).assume_init_ref() }
-                    }
+                    Err(READY) => return unsafe { (*self.value.get()).assume_init_ref() },
                     // Another thread is running its `make`. It may take a
                     // while, but a `OnceLock` initialiser here is short and
                     // this only happens on the first touch.
@@ -2809,12 +2884,10 @@ pub mod sync {
         }
 
         pub fn set(&self, value: T) -> Result<(), T> {
-            match self.state.compare_exchange(
-                UNSET,
-                SETTING,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
+            match self
+                .state
+                .compare_exchange(UNSET, SETTING, Ordering::AcqRel, Ordering::Acquire)
+            {
                 Ok(_) => {
                     unsafe { (*self.value.get()).write(value) };
                     self.state.store(READY, Ordering::Release);
@@ -3227,7 +3300,10 @@ mod tests {
         let seen_elsewhere = std::thread::spawn(|| COUNT.with(|c| c.get()))
             .join()
             .unwrap();
-        assert_eq!(seen_elsewhere, 0, "a second thread must not see the first's 7");
+        assert_eq!(
+            seen_elsewhere, 0,
+            "a second thread must not see the first's 7"
+        );
         assert_eq!(COUNT.with(|c| c.get()), 7);
     }
 
@@ -3243,7 +3319,11 @@ mod tests {
                 });
             }
         });
-        assert_eq!(*TOTAL.lock(), 8000, "a lost update means the lock is not one");
+        assert_eq!(
+            *TOTAL.lock(),
+            8000,
+            "a lost update means the lock is not one"
+        );
 
         static MADE: crate::sync::OnceLock<i64> = crate::sync::OnceLock::new();
         static TIMES: core::sync::atomic::AtomicI64 = core::sync::atomic::AtomicI64::new(0);
@@ -3363,7 +3443,11 @@ mod tests {
             }
         });
         for (i, got) in out.iter().enumerate() {
-            assert_eq!(*got, i as i64 * 2, "slot {i} was not written before scope returned");
+            assert_eq!(
+                *got,
+                i as i64 * 2,
+                "slot {i} was not written before scope returned"
+            );
         }
     }
 
@@ -3434,7 +3518,10 @@ mod tests {
     fn a_child_reports_its_status_and_its_stderr() {
         let (code, out, err) = crate::process::run(
             "sh",
-            &["-c".to_string(), "echo mine; echo theirs >&2; exit 3".to_string()],
+            &[
+                "-c".to_string(),
+                "echo mine; echo theirs >&2; exit 3".to_string(),
+            ],
         )
         .unwrap();
         assert_eq!(code, 3);

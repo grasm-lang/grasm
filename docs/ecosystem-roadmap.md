@@ -395,7 +395,7 @@ and the industry frameworks — FinTech, GIS, game development.
 **One honest note on the AI tier.** "Machine learning wrappers" is a binding to
 a C++ runtime, which is P3. A *native* tensor library — matrix maths, autograd,
 a small inference engine for a known format — is buildable in Grasm and would
-be genuinely novel. Grasm has one integer type and no SIMD, so it would be
+be genuinely novel. Grasm has no 32-bit float and no SIMD, so it would be
 correct and slow. Correct and slow is worth shipping; a wrapper that cannot be
 built is not.
 

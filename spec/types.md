@@ -10,9 +10,19 @@ conversion between unrelated types.
 (IEEE-754 double), `bool`, `str` (UTF-8 text), and `()` (unit, the type of a
 statement that yields nothing).
 
-**[T-INT-ALIAS]** The names `i8`, `i16`, `i32`, `u8`, `u16`, `u32`, `u64`,
-`usize`, and `int` are currently aliases for `i64`; `f32` and `float` are
-aliases for `f64`. Distinct fixed-width types are designed but unimplemented.
+**[T-INT-FIXED]** `i8`, `i16`, `i32`, `u8`, `u16` and `u32` are integer types
+of their own, each holding its width's range: `u8` is 0 to 255, `i8` is -128
+to 127. **[T-INT-FIXED-MIX]** None converts to another or to `i64` on its own;
+`.as_U()` and `.try_U()` convert ([L-LIB-INT-CONV]). **[T-INT-FIXED-RANGE]** An
+integer literal takes the fixed-width type it is written against -- an
+annotation, a parameter, a field, the other operand -- and one outside that
+type's range is a compile error.
+Arithmetic (`+ - * / % ^`, negation, `abs`, `shl`, `bit_not`, the `+=` forms,
+`sum`) wraps to the width in two's complement, as `i64` wraps at 64
+([E-ARITH-INT]): a `u8` `255 + 1` is `0`. `shr` is arithmetic on the value,
+`ushr` logical on its bits at the width. `int` is another name for `i64` and
+`float` for `f64`. **[T-INT-FIXED-REFUSED]** `u64`, `usize` and `f32` are refused: they were aliases for
+`i64` and `f64`, and a name that does not do what it says is worse than none.
 
 **[T-UNIT-RETURN]** A function returning `()` may say so and may `return ()`
 anywhere, including from a branch. A backend may give it no return value at
@@ -27,7 +37,7 @@ with a `T ! E`, whichever way its handler ended: a value becomes `Ok`, a
 `fail` inside the handler becomes `Err`. So `try`, `match` and `??` all
 consume one, the same as any other fallible value.
 
-**[T-MAP-KEY]** `K` must be `i64`, `str`, or `bool`; any other key type is a
+**[T-MAP-KEY]** `K` must be an integer type, `str`, or `bool`; any other key type is a
 compile error.
 
 **[T-MAP-KEY-GENERIC]** A *type parameter* is allowed where a map key goes,
@@ -625,14 +635,7 @@ so the constructors worked everywhere a fallible value could be *stored* and
 nowhere one was *produced*.
 
 The wrapping happens wherever the branch lands, not only on the way out of a
-function. A fallible function re-wraps its whole body, which masked a gap
-everywhere except the positions that do not — a `let` annotation, a struct
-field, a list element — where the interpreter stored the *raw* value:
-`let a: i64 ! E = if true { 1 } else { Ok(2) }` held `1` rather than `Ok(1)`,
-so it printed as `1`, compared unequal to `Ok(1)`, and matched no arm of a
-`match` over it. A native build, which wraps by produced type, answered
-correctly — the normative engine was the wrong one, at exit 0 with nothing on
-stderr.
+function: a `let` annotation, a struct field and a list element wrap it too.
 
 Nesting does not change the position. A branch whose own body branches is at
 the fallible position too, so `if a { if b { 1 } else { Ok(2) } } else { Ok(3) }`
@@ -798,19 +801,13 @@ including a function type, a map, and a fallible one — and when a function's
 declared return type resolves to `T ! E`, the function is fallible even though
 its declaration does not spell the `!` out.
 
-**[T-EXTERN-POINTER]** An `extern fn` **parameter** may be `i64`, `f64`, `str`
+**[T-EXTERN-POINTER]** An `extern fn` **parameter** may be an integer type, `f64`, `str`
 or `bytes`. A `str` or `bytes` argument crosses as a pointer:
 
 ```grasm
 extern fn strlen(s: str) -> i64
 extern fn memcmp(a: bytes, b: bytes, n: i64) -> i64
 ```
-
-Without this the C boundary carried scalars only, which excluded `open`, `read`,
-`write`, `system`, `getenv`, `socket` — every libc function taking a pointer,
-which is nearly all of the useful ones. What could be called was `abs`, `sqrt`,
-`pow` and their kind, so "C ABI import overhead: zero-cost" was true and
-described arithmetic.
 
 A `str` crosses as a **NUL-terminated copy**. Grasm strings carry their length
 and are not terminated; C decides where a string ends by looking for the NUL,
@@ -1095,8 +1092,9 @@ while its binary called libc. Every other spelling — `labs(n)`, `n |> labs`,
 
 **[T-EXTERN]** `extern fn name(a: i64) -> f64` declares a C function. It has
 no body: a compiled build resolves the symbol at link time, and `grasm run`
-finds it in the interpreter's own process. Parameters and results are `i64`
-and `f64` only — `bool` is excluded because C's is one byte and Grasm's is a
+finds it in the interpreter's own process. Parameters and results are integer
+types ([T-INT-FIXED]; a narrower result is read at its own width, since C
+leaves the rest of the register unspecified) and `f64` — `bool` is excluded because C's is one byte and Grasm's is a
 register, and a width mismatch at an FFI boundary surfaces as garbage far from
 its cause.
 

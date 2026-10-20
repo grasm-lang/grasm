@@ -1,6 +1,6 @@
 # Grasm — conformance programs: types
 
-The type and effect system — what a program means before it runs. 108 executable program(s), one per normative clause of
+The type and effect system — what a program means before it runs. 111 executable program(s), one per normative clause of
 `grasm-language-pack.md`. Each header states the tag it demonstrates and the
 exact expected behaviour, and every one is run by `cargo test -p grasm_spec`, so
 a program here cannot describe behaviour the implementation does not have.
@@ -412,6 +412,7 @@ fn every_world_touching_builtin(path: str) / {io} {
     match rename_file(path, path) { Ok(v) -> {} Err(e) -> {} }
     match remove_file(path) { Ok(v) -> {} Err(e) -> {} }
     match make_dir(path) { Ok(v) -> {} Err(e) -> {} }
+    match make_dir_new(path) { Ok(v) -> {} Err(e) -> {} }
     match list_dir(path) { Ok(v) -> {} Err(e) -> {} }
     let _e = file_exists(path)
     // Never reached, so this does not wait for a line — the function is
@@ -1730,17 +1731,74 @@ fn main() {
 }
 ```
 
-## `T-INT-ALIAS.gr`
+## `T-INT-FIXED-MIX.gr`
 
 ```grasm
-//! tag: T-INT-ALIAS
-//! expect: output
-//! 3 5.0
-fn add(a: i32, b: u8) -> int {
-    a + b
-}
+//! tag: T-INT-FIXED-MIX
+//! expect: error
+//! expected `u8`, found `i64`
+// A u8 and an i64 do not mix without a conversion, in either direction.
 fn main() {
-    print("{add(1, 2)} {5.0}")
+    let a: u8 = 7
+    let n = 3
+    print(a + n)
+}
+```
+
+## `T-INT-FIXED-RANGE.gr`
+
+```grasm
+//! tag: T-INT-FIXED-RANGE
+//! expect: error
+//! does not fit in `u8`
+// A literal outside the type's range is not a value of that type.
+fn main() {
+    let a: u8 = 256
+    print(a)
+}
+```
+
+## `T-INT-FIXED-REFUSED.gr`
+
+```grasm
+//! tag: T-INT-FIXED-REFUSED
+//! expect: error
+//! is not implemented yet
+// u64 was an alias for i64, so its arithmetic was signed. Refused until it
+// is real, rather than kept as a name that says something it does not do.
+fn main() {
+    let a: u64 = 1
+    print(a)
+}
+```
+
+## `T-INT-FIXED.gr`
+
+```grasm
+//! tag: T-INT-FIXED
+//! expect: output
+//! 0 127 0 4 -56
+//! 255 [1, 2, 250] 253
+//! true 60 127
+// Fixed-width integers wrap at their width, as i64 wraps at 64. These names
+// used to be spellings of i64, and `a + 1` below printed 256.
+type Px = { r: u8, g: u8, b: u8 }
+
+fn bump(x: u8) -> u8 {
+    return x + 1
+}
+
+fn main() {
+    let a: u8 = 255
+    let c: i8 = -128
+    var e: u16 = 65535
+    e += 1
+    let p = Px{ r: 250, g: 1, b: 7 }
+    print("{bump(a)} {c - 1} {e} {p.r + 10} {(200).as_i8()}")
+    let xs: [u8] = [1, 2, 250]
+    print("{a} {xs} {xs.sum()}")
+    let m: i8 = -16
+    print("{a > p.r} {m.ushr(2)} {c.bit_not().as_u8()}")
 }
 ```
 

@@ -2021,11 +2021,25 @@ fn an_incremental_rebuild_sees_a_changed_struct_layout() {
     .unwrap();
 
     let build_and_run = |expect: &str, what: &str| {
-        let (code, msg) = run(&["build", main.to_str().unwrap(), "--native", "-o", out.to_str().unwrap()]);
+        let (code, msg) = run(&[
+            "build",
+            main.to_str().unwrap(),
+            "--native",
+            "-o",
+            out.to_str().unwrap(),
+        ]);
         assert_eq!(code, 0, "{what}: {msg}");
         let got = Command::new(&out).output().expect("runs");
-        assert!(got.status.success(), "{what}: the binary failed with {:?}", got.status);
-        assert_eq!(String::from_utf8_lossy(&got.stdout).trim(), expect, "{what}");
+        assert!(
+            got.status.success(),
+            "{what}: the binary failed with {:?}",
+            got.status
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&got.stdout).trim(),
+            expect,
+            "{what}"
+        );
     };
 
     // Captured in a closure: the struct stays boxed.
@@ -2062,9 +2076,18 @@ fn contracts_are_fuzzed_on_request() {
 
     let (code, out) = run(&["test", p, "--contracts", "--cases", "300"]);
     assert_eq!(code, 1, "{out}");
-    assert!(out.contains("test \"contracts of isqrt\" ... ok (300 cases"), "{out}");
-    assert!(out.contains("test \"contracts of sloppy\" ... FAILED"), "{out}");
-    assert!(out.contains("ensures `|r| r * r <= n and (r + 1) * (r + 1) > n` failed in `sloppy`"), "{out}");
+    assert!(
+        out.contains("test \"contracts of isqrt\" ... ok (300 cases"),
+        "{out}"
+    );
+    assert!(
+        out.contains("test \"contracts of sloppy\" ... FAILED"),
+        "{out}"
+    );
+    assert!(
+        out.contains("ensures `|r| r * r <= n and (r + 1) * (r + 1) > n` failed in `sloppy`"),
+        "{out}"
+    );
     assert!(out.contains("counterexample: n = "), "{out}");
     assert!(out.contains("contracts of first\" ... not fuzzed"), "{out}");
 

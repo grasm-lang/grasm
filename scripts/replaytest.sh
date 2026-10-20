@@ -111,6 +111,46 @@ for n in $NAMES; do
   fi
 done
 
+# A C function reached through `extern fn` is not journaled: whatever it read
+# or changed was never written down. Replay used to call it again, for real,
+# and say nothing -- `getpid()` printed a new number under a "replay". It must
+# refuse instead, in each way a C function can be called: directly, as a
+# method ([L-UFCS]), and through a function value, which compiles to a wrapper
+# of its own.
+for form in direct method value; do
+  case $form in
+    direct) body='let p = unsafe { getpid() }
+  print(p > 0)' ;;
+    method) body='let n = unsafe { "abc".strlen() }
+  print(n)' ;;
+    value) body='let q = unsafe { twice(getpid) }
+  print(q > 0)' ;;
+  esac
+  src="$WORK/c_$form.gr"
+  printf 'extern fn getpid() -> i64\nextern fn strlen(s: str) -> i64\n\nfn twice(f: fn() -> i64 / {io, unsafe}) -> i64 / {io, unsafe} {\n  return f() + f()\n}\n\nfn main() / {io, unsafe} {\n  %s\n}\n' "$body" > "$src"
+  bad=""
+  for engine in run native; do
+    if [ "$engine" = run ]; then
+      out=$(GRASM_REPLAY="$WORK/empty.jrnl" "$GRASM" run "$src" 2>&1); code=$?
+    else
+      if ! "$GRASM" build --native "$src" -o "$WORK/c_$form.bin" >/dev/null 2>&1; then
+        bad="$bad native(did not build)"; continue
+      fi
+      out=$(GRASM_REPLAY="$WORK/empty.jrnl" "$WORK/c_$form.bin" 2>&1); code=$?
+    fi
+    case "$code:$out" in
+      7:*"calls the C function"*) ;;
+      *) bad="$bad $engine(exit $code)" ;;
+    esac
+  done
+  if [ -n "$bad" ]; then
+    echo "  C call ($form): ran for real under replay —$bad"
+    unhooked=$((unhooked+1))
+  else
+    hooked=$((hooked+1))
+  fi
+done
+
 # And once end to end, on every engine, with the *values* on the page.
 #
 # The per-builtin checks above prove a hook exists; they do not prove the value

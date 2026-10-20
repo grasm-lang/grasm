@@ -1,0 +1,9 @@
+//! tag: T-INT-FIXED-MIX
+//! expect: error
+//! expected `u8`, found `i64`
+// A u8 and an i64 do not mix without a conversion, in either direction.
+fn main() {
+    let a: u8 = 7
+    let n = 3
+    print(a + n)
+}

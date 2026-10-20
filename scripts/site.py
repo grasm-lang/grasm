@@ -88,32 +88,24 @@ def facts():
     f["spec_lines"] = "{:,}".format(sum(
         open(q).read().count("\n") for q in glob.glob(os.path.join(ROOT, "spec", "*.md"))
     ))
-    # Packages a consumer could depend on: the `-demo` directories exist to be
-    # run by the gates, not to be imported.
-    f["packages"] = len([
-        d for d in glob.glob(os.path.join(ROOT, "packages", "*", "grasm.toml"))
-        if not os.path.basename(os.path.dirname(d)).endswith("-demo")
-    ])
+    # Libraries a consumer could depend on: a package that exports a `pub fn`.
+    # The `-demo` directories exist to be run by the gates, and so do the
+    # test harnesses (`b47test`, `uritdiff`, ...) -- programs with a `main` and
+    # no API -- so neither is counted. Counting every directory said 1000 when
+    # 891 were libraries.
+    libs = library_manifests()
+    f["packages"] = len(libs)
     # How many of those declare nothing at all. The site's whole argument is
     # that reach is separable from computation, and this is the one number that
     # says whether the library set actually does that or only could.
-    f["packages_pure"] = len([
-        d for d in glob.glob(os.path.join(ROOT, "packages", "*", "grasm.toml"))
-        if not os.path.basename(os.path.dirname(d)).endswith("-demo")
-        and (lambda m: bool(m) and not m.group(1).strip())(
-            re.search(r"^capabilities\s*=\s*\[(.*?)\]", open(d).read(), re.M | re.S))
-    ])
+    caps = {d: (lambda m: m.group(1) if m else None)(
+        re.search(r"^capabilities\s*=\s*\[(.*?)\]", open(d).read(), re.M | re.S)) for d in libs}
+    f["packages_pure"] = len([d for d in libs if caps[d] is not None and not caps[d].strip()])
     f["packages_reaching"] = f["packages"] - f["packages_pure"]
     # And which capability the rest ask for, because "96 reach something" and
     # "one of 651 may call into C" are different facts about the same set.
     for cap in ("io", "net", "unsafe"):
-        f["cap_" + cap] = len([
-            d for d in glob.glob(os.path.join(ROOT, "packages", "*", "grasm.toml"))
-            if not os.path.basename(os.path.dirname(d)).endswith("-demo")
-            and (lambda m: bool(m) and ('"%s"' % cap) in m.group(1))(
-                re.search(r"^capabilities\s*=\s*\[(.*?)\]",
-                          open(d).read(), re.M | re.S))
-        ])
+        f["cap_" + cap] = len([d for d in libs if caps[d] is not None and ('"%s"' % cap) in caps[d]])
     f["gates"] = gate_count()
     f["version"] = re.search(
         r'^version = "([^"]+)"', open(os.path.join(ROOT, "Cargo.toml")).read(), re.M).group(1)
@@ -283,6 +275,20 @@ def scorecard():
             # have moved one and not the other.
             "goals_distinct": len({r[0] for r in rows}),
             "goals_split": len(rows) - len({r[0] for r in rows})}
+
+
+def library_manifests():
+    """The grasm.toml of every package that is a library: not a `-demo`, and
+    exporting at least one `pub fn` from src/main.gr."""
+    out = []
+    for d in sorted(glob.glob(os.path.join(ROOT, "packages", "*", "grasm.toml"))):
+        pkg = os.path.dirname(d)
+        main = os.path.join(pkg, "src", "main.gr")
+        if pkg.endswith("-demo") or not os.path.exists(main):
+            continue
+        if re.search(r"^pub fn ", open(main).read(), re.M):
+            out.append(d)
+    return out
 
 
 def gate_count():

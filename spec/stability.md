@@ -7,7 +7,7 @@ before it is listed as stable.
 `crates/grasm_spec` fails if a clause here is missing, unknown, or listed twice,
 so this file cannot drift away from the specification it describes.
 
-Today: 167 stable, 26 provisional, 65 experimental, of 258.
+Today: 167 stable, 25 provisional, 70 experimental, of 262.
 
 ## Stable
 
@@ -188,8 +188,7 @@ programs. May change in a minor release, with a changelog entry.
 
 These are the clauses that fail one of the promotion rules: the library
 inventories will grow, the effect system is where this month's work happened,
-generic bounds are the known next step, `T-INT-ALIAS` names types the
-implementation admits are unfinished, and the rest were written too recently
+generic bounds are the known next step, and the rest were written too recently
 for "no problem found" to mean anything.
 
 - `E-CLOSURE-CAPTURE` — provisional
@@ -208,7 +207,6 @@ for "no problem found" to mean anything.
 - `T-EMPTY-LIT` — provisional
 - `T-FN-TYPE` — provisional
 - `T-GENERIC-TYPE` — provisional
-- `T-INT-ALIAS` — provisional
 - `T-MAP-KEY-GENERIC` — provisional
 - `T-OK-ERR-RETURN` — provisional
 - `T-REF-CAPTURE` — provisional
@@ -249,6 +247,11 @@ May change or be removed in any release. New surface starts here.
 - `L-LEADING-DOT` — experimental
 - `L-LIB-BASE` — experimental
 - `L-LIB-BITS` — experimental
+- `L-LIB-INT-CONV` — experimental
+- `T-INT-FIXED` — experimental
+- `T-INT-FIXED-MIX` — experimental
+- `T-INT-FIXED-RANGE` — experimental
+- `T-INT-FIXED-REFUSED` — experimental
 - `L-LIB-BYTES` — experimental
 - `L-LIB-BYTES-WRITE` — experimental
 - `L-LIB-EPRINT` — experimental

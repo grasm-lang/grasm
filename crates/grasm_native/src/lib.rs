@@ -347,7 +347,10 @@ pub fn layout_fingerprint(program: &grasm_sema::loader::Program) -> String {
     let types: HashMap<(u32, u32), String> = analysis.resolved_types.into_iter().collect();
     let modules: Vec<&AstModule> = program.files.iter().map(|f| &f.module).collect();
     let ok = values::eligible(&modules, &types);
-    let mut out = format!("values: {}", ok.iter().cloned().collect::<Vec<_>>().join(","));
+    let mut out = format!(
+        "values: {}",
+        ok.iter().cloned().collect::<Vec<_>>().join(",")
+    );
     if std::env::var("GRASM_NO_INLINE").is_ok_and(|v| v == "1") {
         out.push_str("\ninline off");
     } else {
@@ -390,6 +393,7 @@ fn compile_object_scoped(
     let mut cg = Codegen::new(&mut module);
     let analysis = grasm_sema::check::check_program(program);
     cg.float_literals = analysis.float_literals;
+    cg.narrow = analysis.narrow_ints;
     cg.map_get_value_kind = analysis.map_get_value_kind;
     cg.field_calls = analysis.field_calls;
     cg.iface_calls = analysis.iface_calls;
@@ -406,7 +410,10 @@ fn compile_object_scoped(
         let modules: Vec<&AstModule> = program.files.iter().map(|f| &f.module).collect();
         let ok = values::eligible(&modules, &cg.resolved_types);
         if std::env::var("GRASM_VALUES_REPORT").is_ok() {
-            eprintln!("value structs: {}", ok.iter().cloned().collect::<Vec<_>>().join(", "));
+            eprintln!(
+                "value structs: {}",
+                ok.iter().cloned().collect::<Vec<_>>().join(", ")
+            );
         }
         // Which of their fields are held inline rather than in a box of
         // their own. `GRASM_NO_INLINE=1` keeps every field a pointer, so the
@@ -414,8 +421,7 @@ fn compile_object_scoped(
         if !std::env::var("GRASM_NO_INLINE").is_ok_and(|v| v == "1") {
             let fields = values::inline_fields(&modules, &cg.resolved_types, &ok);
             if std::env::var("GRASM_INLINE_REPORT").is_ok() {
-                let shown: Vec<String> =
-                    fields.iter().map(|(t, f)| format!("{t}.{f}")).collect();
+                let shown: Vec<String> = fields.iter().map(|(t, f)| format!("{t}.{f}")).collect();
                 eprintln!("inline fields: {}", shown.join(", "));
             }
             cg.inline_fields = fields.into_iter().collect();
@@ -708,6 +714,10 @@ struct Codegen<'m> {
     /// The checker already knows which literals are floats; asking it once is
     /// both correct and the same answer the interpreter gets.
     float_literals: std::collections::HashSet<u32>,
+    /// The width each fixed-width integer operation wraps to, from the
+    /// checker ([T-INT-FIXED]; `Analysis::narrow_ints`). Read while compiling,
+    /// so an `i64` program carries no trace of it.
+    narrow: std::collections::HashMap<(u32, u32), u8>,
     /// The value type of each `m.get(k)`, from the checker. See
     /// `Analysis::map_get_value_kind`.
     map_get_value_kind: std::collections::HashMap<(u32, u32), u8>,
@@ -827,6 +837,7 @@ impl<'m> Codegen<'m> {
             pending_generics: Vec::new(),
             generic_subst: HashMap::new(),
             float_literals: std::collections::HashSet::new(),
+            narrow: std::collections::HashMap::new(),
             map_get_value_kind: std::collections::HashMap::new(),
             field_calls: Default::default(),
             iface_calls: Default::default(),
@@ -892,6 +903,18 @@ impl<'m> Codegen<'m> {
             ("grasm_val_cmp", vec![i64t, i64t], Some(i64t)),
             ("grasm_assert_eq", vec![i64t, i64t], None),
             ("grasm_stack_check", vec![i64t], None),
+            ("grasm_int_try", vec![i64t, i64t], Some(i64t)),
+            (
+                "grasm_int_checked",
+                vec![i64t, i64t, i64t, i64t],
+                Some(i64t),
+            ),
+            (
+                "grasm_int_saturating",
+                vec![i64t, i64t, i64t, i64t],
+                Some(i64t),
+            ),
+            ("grasm_foreign_call", vec![i64t, i64t], None),
             ("grasm_stack_floor", vec![i64t], Some(i64t)),
             ("grasm_panic_stack", vec![], None),
             ("grasm_val_release", vec![i64t, i64t], None),
@@ -956,8 +979,16 @@ impl<'m> Codegen<'m> {
             ("grasm_result_split", vec![i64t, ptr, i64t], Some(types::I8)),
             ("grasm_result_box", vec![i64t, i64t, i64t], Some(i64t)),
             ("grasm_try_take_bits", vec![i64t, ptr], Some(types::I8)),
-            ("grasm_variant_new1", vec![ptr, i64t, ptr, i64t, i64t], Some(i64t)),
-            ("grasm_variant_new2", vec![ptr, i64t, ptr, i64t, i64t, i64t], Some(i64t)),
+            (
+                "grasm_variant_new1",
+                vec![ptr, i64t, ptr, i64t, i64t],
+                Some(i64t),
+            ),
+            (
+                "grasm_variant_new2",
+                vec![ptr, i64t, ptr, i64t, i64t, i64t],
+                Some(i64t),
+            ),
             ("grasm_variant_is", vec![i64t, ptr, i64t], Some(i8t)),
             ("grasm_variant_field", vec![i64t, i64t], Some(i64t)),
             ("grasm_ok_new", vec![i64t], Some(i64t)),
@@ -1102,7 +1133,11 @@ impl<'m> Codegen<'m> {
             ("grasm_bytes_len", vec![i64t], Some(i64t)),
             ("grasm_bytes_at", vec![i64t, i64t], Some(i64t)),
             ("grasm_bytes_slice", vec![i64t, i64t, i64t], Some(i64t)),
-            ("grasm_bytes_slice_to_str", vec![i64t, i64t, i64t], Some(i64t)),
+            (
+                "grasm_bytes_slice_to_str",
+                vec![i64t, i64t, i64t],
+                Some(i64t),
+            ),
             ("grasm_bytes_index_of", vec![i64t, i64t, i64t], Some(i64t)),
             ("grasm_bytes_concat", vec![i64t, i64t], Some(i64t)),
             // Writes ([L-LIB-BYTES-WRITE]). Each consumes the receiver's
@@ -2280,8 +2315,23 @@ arguments nor the type this is bound to",
 
     /// Built-in methods that only read their receiver.
     const READS_ONLY: &'static [&'static str] = &[
-        "len", "is_empty", "byte_len", "contains", "contains_key", "get", "at", "first", "last",
-        "slice", "index_of", "keys", "values", "entries", "starts_with", "ends_with", "to_str",
+        "len",
+        "is_empty",
+        "byte_len",
+        "contains",
+        "contains_key",
+        "get",
+        "at",
+        "first",
+        "last",
+        "slice",
+        "index_of",
+        "keys",
+        "values",
+        "entries",
+        "starts_with",
+        "ends_with",
+        "to_str",
         "to_bytes",
     ];
 
@@ -2441,8 +2491,7 @@ arguments nor the type this is bound to",
         // this is a lookup rather than a walk of every function in the
         // program for every function in the program.
         let shadowed = &fcx.cg.shadowed_builtins;
-        let reads_only =
-            |m: &str| Self::READS_ONLY.contains(&m) && !shadowed.contains(m);
+        let reads_only = |m: &str| Self::READS_ONLY.contains(&m) && !shadowed.contains(m);
         fcx.fn_mutated = grasm_sema::check::possibly_mutated(&f.body, &reads_only);
         for (i, p) in f.params.iter().enumerate() {
             let vt = sig_params[i].clone();
@@ -2545,24 +2594,24 @@ arguments nor the type this is bound to",
                         fcx.emit_scope_decs_all();
                         fcx.ret_ok_raw(inner, &ok_t);
                     } else {
-                    if !already_fallible {
-                        if let VType::Fallible(ok_t, _) = want.clone() {
-                            let mut inner = v;
-                            if *ok_t == VType::F64 && vt == VType::I64 {
-                                inner = fcx.b.ins().fcvt_from_sint(types::F64, inner);
+                        if !already_fallible {
+                            if let VType::Fallible(ok_t, _) = want.clone() {
+                                let mut inner = v;
+                                if *ok_t == VType::F64 && vt == VType::I64 {
+                                    inner = fcx.b.ins().fcvt_from_sint(types::F64, inner);
+                                }
+                                let boxed = fcx.box_value(inner, &ok_t);
+                                v = fcx.call_rt("grasm_ok_new", &[boxed]).unwrap();
+                            } else if *want == VType::F64 && vt == VType::I64 {
+                                v = fcx.b.ins().fcvt_from_sint(types::F64, v);
                             }
-                            let boxed = fcx.box_value(inner, &ok_t);
-                            v = fcx.call_rt("grasm_ok_new", &[boxed]).unwrap();
-                        } else if *want == VType::F64 && vt == VType::I64 {
-                            v = fcx.b.ins().fcvt_from_sint(types::F64, v);
                         }
-                    }
-                    fcx.emit_scope_decs_all();
-                    if matches!(want, VType::Fallible(..)) {
-                        fcx.ret_result(v);
-                    } else {
-                        fcx.b.ins().return_(&[v]);
-                    }
+                        fcx.emit_scope_decs_all();
+                        if matches!(want, VType::Fallible(..)) {
+                            fcx.ret_result(v);
+                        } else {
+                            fcx.b.ins().return_(&[v]);
+                        }
                     }
                 }
                 (VType::Fallible(_, _), None) => {
@@ -3009,6 +3058,18 @@ operation's",
         } else {
             None
         };
+        if sig_info.is_extern {
+            // The same refusal under replay as a direct call makes.
+            let c_name = key.rsplit("::").next().unwrap_or(key).to_string();
+            let data_id = self.intern_string(&c_name);
+            let gv = self.module.declare_data_in_func(data_id, b.func);
+            let name_ptr = b.ins().global_value(ptr_ty, gv);
+            let name_len = b.ins().iconst(types::I64, c_name.len() as i64);
+            let f = self
+                .module
+                .declare_func_in_func(self.runtime["grasm_foreign_call"], b.func);
+            b.ins().call(f, &[name_ptr, name_len]);
+        }
         let inst = b.ins().call(target, &call_args);
         let mut results: Vec<Value> = b.inst_results(inst).to_vec();
         if let (Some(slot), VType::Fallible(ok_t, _)) = (split_slot, &sig_info.ret) {
@@ -6157,7 +6218,10 @@ fn while_bce_plan(cond: &Expr, body: &grasm_syntax::ast::Block) -> Option<BcePla
     let mut step = None;
     let mut writes = 0;
     for st in &body.stmts {
-        let Stmt::Assign { target, op, value, .. } = st else {
+        let Stmt::Assign {
+            target, op, value, ..
+        } = st
+        else {
             continue;
         };
         let Expr::Ident(t) = target else { continue };
@@ -6830,7 +6894,9 @@ fn scan_uses_expr(
         }
         // Everything below is a use that could alias, resize, or retain.
         Expr::Ident(id) => bad.push(id.name.clone()),
-        Expr::Unary { expr, .. } | Expr::Try { expr, .. } => scan_uses_expr(expr, indexed, bad, written),
+        Expr::Unary { expr, .. } | Expr::Try { expr, .. } => {
+            scan_uses_expr(expr, indexed, bad, written)
+        }
         Expr::Binary { lhs, rhs, .. } => {
             scan_uses_expr(lhs, indexed, bad, written);
             scan_uses_expr(rhs, indexed, bad, written);
@@ -6861,7 +6927,9 @@ fn scan_uses_expr(
             }
         }
         Expr::Closure { body, .. } => scan_uses_expr(body, indexed, bad, written),
-        Expr::Block(b) | Expr::Unsafe(b) | Expr::Region(b) => scan_uses_block(b, indexed, bad, written),
+        Expr::Block(b) | Expr::Unsafe(b) | Expr::Region(b) => {
+            scan_uses_block(b, indexed, bad, written)
+        }
         Expr::If {
             cond,
             then_block,
@@ -7254,7 +7322,12 @@ impl FnCx<'_, '_> {
     fn scope_snapshot(&self) -> HashMap<String, u32> {
         self.vars
             .last()
-            .map(|scope| scope.iter().map(|(n, (v, _))| (n.clone(), v.as_u32())).collect())
+            .map(|scope| {
+                scope
+                    .iter()
+                    .map(|(n, (v, _))| (n.clone(), v.as_u32()))
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
@@ -7454,13 +7527,13 @@ impl FnCx<'_, '_> {
             // `xs[i] = v` a store, as for a list of scalars.
             if matches!(*elem, VType::Val(_)) {
                 let ptr_ty = self.cg.module.target_config().pointer_type();
-                let slot = self
-                    .b
-                    .create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
-                        cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
-                        16,
-                        3,
-                    ));
+                let slot =
+                    self.b
+                        .create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
+                            cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+                            16,
+                            3,
+                        ));
                 let data_out = self.b.ins().stack_addr(ptr_ty, slot, 0);
                 let len_out = self.b.ins().stack_addr(ptr_ty, slot, 8);
                 let cur = self.b.use_var(var);
@@ -8308,7 +8381,11 @@ impl FnCx<'_, '_> {
     /// scalars, a list of values, or a string stored among the struct's own
     /// words rather than behind a pointer.
     fn inline_kind(&self, s: &str, n: &str, t: &VType) -> Option<u8> {
-        if !self.cg.inline_fields.contains(&(s.to_string(), n.to_string())) {
+        if !self
+            .cg
+            .inline_fields
+            .contains(&(s.to_string(), n.to_string()))
+        {
             return None;
         }
         match t {
@@ -8425,7 +8502,10 @@ impl FnCx<'_, '_> {
         };
         if name.name == "is_empty" {
             let zero = self.b.ins().iconst(types::I64, 0);
-            return Ok(Some((self.b.ins().icmp(IntCC::Equal, n, zero), VType::Bool)));
+            return Ok(Some((
+                self.b.ins().icmp(IntCC::Equal, n, zero),
+                VType::Bool,
+            )));
         }
         Ok(Some((n, VType::I64)))
     }
@@ -8567,7 +8647,10 @@ impl FnCx<'_, '_> {
             return false;
         }
         let fs = self.val_fields(s);
-        !fs.is_empty() && fs.iter().all(|t| matches!(t, VType::I64 | VType::F64 | VType::Bool))
+        !fs.is_empty()
+            && fs
+                .iter()
+                .all(|t| matches!(t, VType::I64 | VType::F64 | VType::Bool))
     }
 
     /// The fields of the value at `v` in fresh variables.
@@ -8615,7 +8698,11 @@ impl FnCx<'_, '_> {
     /// `load_val_scalar`.
     fn store_val_scalar(&mut self, v: Value, at: Value, off: i32, ft: &VType) {
         let flags = cranelift_codegen::ir::MemFlags::trusted();
-        let w = if *ft == VType::F64 { v } else { self.scalar_bits_of(v, ft) };
+        let w = if *ft == VType::F64 {
+            v
+        } else {
+            self.scalar_bits_of(v, ft)
+        };
         self.b.ins().store(flags, w, at, off);
     }
 
@@ -8660,7 +8747,10 @@ impl FnCx<'_, '_> {
         let offs = self.val_offs(s);
         for (i, ft) in self.val_fields(s).iter().enumerate() {
             if ft.boxed() {
-                let w = self.b.ins().load(types::I64, flags, at, (8 * offs[i]) as i32);
+                let w = self
+                    .b
+                    .ins()
+                    .load(types::I64, flags, at, (8 * offs[i]) as i32);
                 self.call_rt("grasm_val_dec", &[w]);
             }
         }
@@ -8679,7 +8769,10 @@ impl FnCx<'_, '_> {
         let offs = self.val_offs(s);
         for (i, ft) in self.val_fields(s).iter().enumerate() {
             if ft.boxed() {
-                let w = self.b.ins().load(types::I64, flags, at, (8 * offs[i]) as i32);
+                let w = self
+                    .b
+                    .ins()
+                    .load(types::I64, flags, at, (8 * offs[i]) as i32);
                 self.call_rt("grasm_val_inc", &[w]);
             }
         }
@@ -8724,15 +8817,19 @@ impl FnCx<'_, '_> {
                 _ => None,
             })
             .collect();
-        self.cg
-            .define_struct_desc(id, s, &names, &kinds, &elem_ids);
+        self.cg.define_struct_desc(id, s, &names, &kinds, &elem_ids);
         id
     }
 
     /// `S{ f: e, ... }` for a value struct: its words in a fresh slot. Fields
     /// are evaluated as written and stored as declared; a boxed field's
     /// reference belongs to the value.
-    fn eval_val_lit(&mut self, s: &str, fields: &[(Ident, Expr)], span: Span) -> CResult<(Value, VType)> {
+    fn eval_val_lit(
+        &mut self,
+        s: &str,
+        fields: &[(Ident, Expr)],
+        span: Span,
+    ) -> CResult<(Value, VType)> {
         if self.val_has_inline(s) {
             return self.eval_val_lit_inline(s, fields, span);
         }
@@ -8771,7 +8868,11 @@ impl FnCx<'_, '_> {
             // there is no string value made, copied out of and freed.
             if let (Some((FK_INSTR, _)), Expr::Str(pieces, _)) = (self.inline_field_of(s, i), fexpr)
             {
-                if pieces.iter().filter(|p| matches!(p, StrPiece::Expr(_))).count() > 0
+                if pieces
+                    .iter()
+                    .filter(|p| matches!(p, StrPiece::Expr(_)))
+                    .count()
+                    > 0
                     && pieces.len() >= 2
                 {
                     let dst = self.b.ins().iadd_imm(at, i64::from(off));
@@ -8920,7 +9021,10 @@ impl FnCx<'_, '_> {
                 // write here would put a pointer over the first of its three
                 // words, so it is refused rather than miscompiled.
                 if self.inline_field_of(&s, i).is_some() {
-                    return nope(span, format!("a write to the inline field `{s}.{}`", name.name));
+                    return nope(
+                        span,
+                        format!("a write to the inline field `{s}.{}`", name.name),
+                    );
                 }
                 if let Some(fs) = self.split_vals.get(&var.as_u32()).cloned() {
                     let (mut nv, mut nt) = self.eval_expr_expecting(value, Some(&ft))?;
@@ -9000,7 +9104,8 @@ impl FnCx<'_, '_> {
                     if let Some((vvar, _)) = self.lookup(&vid.name) {
                         if let Some(fs) = self.split_vals.get(&vvar.as_u32()).cloned() {
                             let (iv, _) = self.index_value(index)?;
-                            let row = self.row_address(index.span(), self.val_stride(&VType::Val(s.clone())));
+                            let row = self
+                                .row_address(index.span(), self.val_stride(&VType::Val(s.clone())));
                             let at = if let Some(r) = row {
                                 r
                             } else if let Some((data, len, pt)) = self.pinned_list(&root.name) {
@@ -9148,7 +9253,10 @@ impl FnCx<'_, '_> {
     /// safe wherever it is moved to, because every box is wider than its tag.
     fn bytes_tag(&mut self, bv: Value) -> Value {
         let flags = cranelift_codegen::ir::MemFlags::trusted().with_readonly();
-        let tag = self.b.ins().load(types::I8, flags, bv, LAYOUT_PAYLOAD_TAG as i32);
+        let tag = self
+            .b
+            .ins()
+            .load(types::I8, flags, bv, LAYOUT_PAYLOAD_TAG as i32);
         self.b.ins().uextend(types::I32, tag)
     }
 
@@ -9177,12 +9285,17 @@ impl FnCx<'_, '_> {
         let tag = if pure {
             self.bytes_tag(bv)
         } else {
-            self.b.ins().uload8(types::I32, flags, bv, LAYOUT_PAYLOAD_TAG as i32)
+            self.b
+                .ins()
+                .uload8(types::I32, flags, bv, LAYOUT_PAYLOAD_TAG as i32)
         };
         let is_bytes = self.b.ins().icmp_imm(IntCC::Equal, tag, LAYOUT_TAG_BYTES);
         // Read whatever the box holds there; every box is wider than this,
         // and the answer is used only when the tag says bytes.
-        let n = self.b.ins().load(types::I64, flags, bv, LAYOUT_BYTES_LEN as i32);
+        let n = self
+            .b
+            .ins()
+            .load(types::I64, flags, bv, LAYOUT_BYTES_LEN as i32);
         let zero = self.b.ins().iconst(types::I64, 0);
         self.b.ins().select(is_bytes, n, zero)
     }
@@ -9202,7 +9315,10 @@ impl FnCx<'_, '_> {
         // path is a call, and a call in the loop pushes everything the loop
         // carries into callee-saved registers.
         if at.is_some_and(|sp| self.unchecked_idx.contains(&(sp.start, sp.end))) {
-            let base = self.b.ins().load(types::I64, flags, bv, LAYOUT_BYTES_PTR as i32);
+            let base = self
+                .b
+                .ins()
+                .load(types::I64, flags, bv, LAYOUT_BYTES_PTR as i32);
             let addr = self.b.ins().iadd(base, iv);
             return self.b.ins().uload8(types::I64, flags, addr, 0);
         }
@@ -9215,7 +9331,10 @@ impl FnCx<'_, '_> {
         let inside = self.b.ins().icmp(IntCC::UnsignedLessThan, iv, n);
         self.b.ins().brif(inside, fast, &[], slow, &[]);
         self.goto_block(fast);
-        let base = self.b.ins().load(types::I64, flags, bv, LAYOUT_BYTES_PTR as i32);
+        let base = self
+            .b
+            .ins()
+            .load(types::I64, flags, bv, LAYOUT_BYTES_PTR as i32);
         let addr = self.b.ins().iadd(base, iv);
         // `uload8`, not a pure load: the address is only good once the check
         // above has passed, and a pure load could be moved ahead of it.
@@ -9235,8 +9354,14 @@ impl FnCx<'_, '_> {
     /// takes the runtime call it always did.
     fn list_is_inline(&mut self, lv: Value) -> Value {
         let flags = cranelift_codegen::ir::MemFlags::trusted();
-        let ptag = self.b.ins().uload8(types::I32, flags, lv, LAYOUT_PAYLOAD_TAG as i32);
-        let ltag = self.b.ins().uload8(types::I32, flags, lv, LAYOUT_LIST_DATA_TAG as i32);
+        let ptag = self
+            .b
+            .ins()
+            .uload8(types::I32, flags, lv, LAYOUT_PAYLOAD_TAG as i32);
+        let ltag = self
+            .b
+            .ins()
+            .uload8(types::I32, flags, lv, LAYOUT_LIST_DATA_TAG as i32);
         let is_list = self.b.ins().icmp_imm(IntCC::Equal, ptag, LAYOUT_TAG_LIST);
         let is_inline = self.b.ins().icmp_imm(IntCC::Equal, ltag, LAYOUT_INLINE);
         self.b.ins().band(is_list, is_inline)
@@ -9251,9 +9376,18 @@ impl FnCx<'_, '_> {
         // checked with one 16-bit load (little-endian: the tag is the low
         // byte). Every push and every length asks this.
         const _: () = assert!(LAYOUT_SCALAR_KIND == LAYOUT_PAYLOAD_TAG + 1);
-        let tag_kind = self.b.ins().uload16(types::I32, flags, lv, LAYOUT_PAYLOAD_TAG as i32);
-        let dtag = self.b.ins().uload8(types::I32, flags, lv, LAYOUT_SCALAR_DATA_TAG as i32);
-        let a = self.b.ins().icmp_imm(IntCC::Equal, tag_kind, LAYOUT_TAG_LIST_SCALAR | (k << 8));
+        let tag_kind = self
+            .b
+            .ins()
+            .uload16(types::I32, flags, lv, LAYOUT_PAYLOAD_TAG as i32);
+        let dtag = self
+            .b
+            .ins()
+            .uload8(types::I32, flags, lv, LAYOUT_SCALAR_DATA_TAG as i32);
+        let a = self
+            .b
+            .ins()
+            .icmp_imm(IntCC::Equal, tag_kind, LAYOUT_TAG_LIST_SCALAR | (k << 8));
         let c = self.b.ins().icmp_imm(IntCC::Equal, dtag, i64::from(k == 2));
         self.b.ins().band(a, c)
     }
@@ -9277,8 +9411,14 @@ impl FnCx<'_, '_> {
     fn vals_push_fast(&mut self, lv: Value, owned: Value, s: &str) -> Value {
         let w = self.val_words(s) as i64;
         let flags = cranelift_codegen::ir::MemFlags::trusted();
-        let ptag = self.b.ins().uload8(types::I32, flags, lv, LAYOUT_PAYLOAD_TAG as i32);
-        let is_vals = self.b.ins().icmp_imm(IntCC::Equal, ptag, LAYOUT_TAG_LIST_VALS);
+        let ptag = self
+            .b
+            .ins()
+            .uload8(types::I32, flags, lv, LAYOUT_PAYLOAD_TAG as i32);
+        let is_vals = self
+            .b
+            .ins()
+            .icmp_imm(IntCC::Equal, ptag, LAYOUT_TAG_LIST_VALS);
         let check = self.b.create_block();
         let fast = self.b.create_block();
         let slow = self.b.create_block();
@@ -9328,10 +9468,18 @@ impl FnCx<'_, '_> {
         // time after the paths meet -- 42 instructions an entity in `ecs`.
         let slot = self.val_slot(s);
         for (i, word) in words {
-            self.b.ins().store(flags, *word, slot, (8 * offs[*i]) as i32);
+            self.b
+                .ins()
+                .store(flags, *word, slot, (8 * offs[*i]) as i32);
         }
-        let ptag = self.b.ins().uload8(types::I32, flags, lv, LAYOUT_PAYLOAD_TAG as i32);
-        let is_vals = self.b.ins().icmp_imm(IntCC::Equal, ptag, LAYOUT_TAG_LIST_VALS);
+        let ptag = self
+            .b
+            .ins()
+            .uload8(types::I32, flags, lv, LAYOUT_PAYLOAD_TAG as i32);
+        let is_vals = self
+            .b
+            .ins()
+            .icmp_imm(IntCC::Equal, ptag, LAYOUT_TAG_LIST_VALS);
         let check = self.b.create_block();
         let fast = self.b.create_block();
         let slow = self.b.create_block();
@@ -9392,7 +9540,9 @@ impl FnCx<'_, '_> {
         self.b.ins().jump(join, &[v]);
         self.goto_block(slow);
         let kc = self.b.ins().iconst(types::I64, k);
-        let r = self.call_rt("grasm_list_get_scalar", &[lv, iv, kc]).unwrap();
+        let r = self
+            .call_rt("grasm_list_get_scalar", &[lv, iv, kc])
+            .unwrap();
         self.b.ins().jump(join, &[r]);
         self.goto_block(join);
         self.b.block_params(join)[0]
@@ -9428,11 +9578,15 @@ impl FnCx<'_, '_> {
         }
         let n1 = self.b.ins().iadd_imm(n, 1);
         let (_, vl, _) = vec_layout();
-        self.b.ins().store(flags, n1, lv, (LAYOUT_SCALAR_VEC + vl) as i32);
+        self.b
+            .ins()
+            .store(flags, n1, lv, (LAYOUT_SCALAR_VEC + vl) as i32);
         self.b.ins().jump(join, &[lv]);
         self.goto_block(slow);
         let kc = self.b.ins().iconst(types::I64, k);
-        let r = self.call_rt("grasm_list_push_scalar", &[lv, bits, kc]).unwrap();
+        let r = self
+            .call_rt("grasm_list_push_scalar", &[lv, bits, kc])
+            .unwrap();
         self.b.ins().jump(join, &[r]);
         self.goto_block(join);
         self.b.block_params(join)[0]
@@ -9446,7 +9600,10 @@ impl FnCx<'_, '_> {
     fn vals_len_inline(&mut self, lv: Value, sname: &str) -> Value {
         let (_, vl, _) = vec_layout();
         let flags = cranelift_codegen::ir::MemFlags::trusted();
-        let words = self.b.ins().load(types::I64, flags, lv, (LAYOUT_VALS_VEC + vl) as i32);
+        let words = self
+            .b
+            .ins()
+            .load(types::I64, flags, lv, (LAYOUT_VALS_VEC + vl) as i32);
         let w = self.val_words(sname).max(1) as i64;
         if w == 1 {
             words
@@ -9462,7 +9619,9 @@ impl FnCx<'_, '_> {
     fn vals_data_inline(&mut self, lv: Value) -> Value {
         let (vp, _, _) = vec_layout();
         let flags = cranelift_codegen::ir::MemFlags::trusted();
-        self.b.ins().load(types::I64, flags, lv, (LAYOUT_VALS_VEC + vp) as i32)
+        self.b
+            .ins()
+            .load(types::I64, flags, lv, (LAYOUT_VALS_VEC + vp) as i32)
     }
 
     /// `xs.len()` for a list of boxed values: a byte load when the list is
@@ -9499,7 +9658,10 @@ impl FnCx<'_, '_> {
         self.b.ins().brif(inline, fast, &[], slow, &[]);
         self.goto_block(fast);
         let flags = cranelift_codegen::ir::MemFlags::trusted();
-        let n = self.b.ins().uload8(types::I64, flags, lv, LAYOUT_LIST_INLINE_LEN as i32);
+        let n = self
+            .b
+            .ins()
+            .uload8(types::I64, flags, lv, LAYOUT_LIST_INLINE_LEN as i32);
         self.b.ins().jump(join, &[n]);
         self.goto_block(slow);
         let m = self.call_rt("grasm_list_len", &[lv]).unwrap();
@@ -9521,7 +9683,10 @@ impl FnCx<'_, '_> {
         let off = self.b.ins().ishl_imm(iv, 3);
         let at = self.b.ins().iadd(lv, off);
         let flags = cranelift_codegen::ir::MemFlags::trusted();
-        let e = self.b.ins().load(types::I64, flags, at, LAYOUT_LIST_INLINE_VALS as i32);
+        let e = self
+            .b
+            .ins()
+            .load(types::I64, flags, at, LAYOUT_LIST_INLINE_VALS as i32);
         self.b.ins().jump(join, &[e]);
         self.goto_block(slow);
         let c = self.call_rt("grasm_list_borrow_at", &[lv, iv]).unwrap();
@@ -10139,9 +10304,10 @@ impl FnCx<'_, '_> {
                     // the call copies first, as it always did.
                     if let (VType::Struct(sn), [PlaceSeg::Field(f)]) = (&root_t, path.as_slice()) {
                         let sn = sn.clone();
-                        if let (Some(i), true) =
-                            (self.struct_field_index(&sn, f), scalar_kind_i64(&elem_t).is_some())
-                        {
+                        if let (Some(i), true) = (
+                            self.struct_field_index(&sn, f),
+                            scalar_kind_i64(&elem_t).is_some(),
+                        ) {
                             let inline = self.cg.structs.get(&sn).is_some_and(|fs| fs.len() <= 4);
                             if inline {
                                 let cur = self.b.use_var(var);
@@ -10471,19 +10637,20 @@ impl FnCx<'_, '_> {
                 // once, here, and a second copy of the loop keeps the checks
                 // for when it fails -- so a panic still lands on the access
                 // that caused it.
-                let plan = if self.in_bce_copy
-                    || std::env::var("GRASM_NO_BCE").is_ok_and(|v| v == "1")
-                {
-                    None
-                } else {
-                    while_bce_plan(cond, body)
-                };
+                let plan =
+                    if self.in_bce_copy || std::env::var("GRASM_NO_BCE").is_ok_and(|v| v == "1") {
+                        None
+                    } else {
+                        while_bce_plan(cond, body)
+                    };
                 let guarded = match plan {
                     Some(p) => self.bce_guard(&p)?,
                     None => None,
                 };
                 let Some((spans, guard)) = guarded else {
-                    return self.emit_while_loop(cond, body).map(|()| StmtOut::Value(None));
+                    return self
+                        .emit_while_loop(cond, body)
+                        .map(|()| StmtOut::Value(None));
                 };
                 let fast = self.b.create_block();
                 let slow = self.b.create_block();
@@ -11168,7 +11335,11 @@ this case",
         // Stepping element pointers, from wherever the index now starts.
         let mut ptr_steps: Vec<(Variable, i64)> = Vec::new();
         for (sp, row, stride) in std::mem::take(&mut self.ptr_rows_next) {
-            let pv = match ptr_steps.iter().zip(&self.ptr_row_origin).find(|(_, (r, st))| *r == row && *st == stride) {
+            let pv = match ptr_steps
+                .iter()
+                .zip(&self.ptr_row_origin)
+                .find(|(_, (r, st))| *r == row && *st == stride)
+            {
                 Some(((pv, _), _)) => *pv,
                 None => {
                     let pv = self.new_var(&VType::I64);
@@ -11371,10 +11542,7 @@ this case",
         }
         let i0 = self.b.use_var(ivar);
         let zero = self.b.ins().iconst(types::I64, 0);
-        let mut ok = self
-            .b
-            .ins()
-            .icmp(IntCC::SignedGreaterThanOrEqual, i0, zero);
+        let mut ok = self.b.ins().icmp(IntCC::SignedGreaterThanOrEqual, i0, zero);
         let n0 = self.b.use_var(nvar);
         for bv in bufs {
             let bval = self.b.use_var(bv);
@@ -11382,10 +11550,7 @@ this case",
             // guard fails and the checked copy runs -- which is also what
             // makes the unchecked load safe without a tag test of its own.
             let len = self.bytes_len_fast(bval);
-            let within = self
-                .b
-                .ins()
-                .icmp(IntCC::SignedLessThanOrEqual, n0, len);
+            let within = self.b.ins().icmp(IntCC::SignedLessThanOrEqual, n0, len);
             ok = self.b.ins().band(ok, within);
         }
         Ok(Some((plan.spans.clone(), ok)))
@@ -11394,11 +11559,7 @@ this case",
     /// A `while` loop, emitted. Separate from the statement arm because a
     /// loop whose bounds checks can be skipped is emitted twice, once each
     /// way, behind the guard that decides.
-    fn emit_while_loop(
-        &mut self,
-        cond: &Expr,
-        body: &grasm_syntax::ast::Block,
-    ) -> CResult<()> {
+    fn emit_while_loop(&mut self, cond: &Expr, body: &grasm_syntax::ast::Block) -> CResult<()> {
         // Pinning emits code, so it has to happen while the current
         // block is still open — before the jump that closes it.
         // Lists the body only indexes get a raw pointer for the whole
@@ -11464,7 +11625,7 @@ this case",
         self.goto_block(exit);
         self.close_loop_appends();
         Ok(())
-}
+    }
 
     /// Whether a counted loop can run without a bounds check per element:
     /// if so, the index spans that may skip it, with the guard that decides
@@ -11646,7 +11807,9 @@ this case",
                     if !std::env::var("GRASM_NO_HOIST_FLOATS").is_ok_and(|v| v == "1") {
                         for f in grasm_sema::check::block_float_literals(body) {
                             let k = f.to_bits();
-                            if let std::collections::hash_map::Entry::Vacant(e) = self.hoisted_floats.entry(k) {
+                            if let std::collections::hash_map::Entry::Vacant(e) =
+                                self.hoisted_floats.entry(k)
+                            {
                                 // Loaded, not built: Cranelift rebuilds a
                                 // constant at each use however early it is
                                 // made, and a load it leaves where it is.
@@ -11903,7 +12066,9 @@ this case",
             self.b.ins().jump(join, &[bits]);
             self.goto_block(slow);
             let kc = self.b.ins().iconst(types::I64, k);
-            let r = self.call_rt("grasm_list_get_scalar", &[lv2, iv2, kc]).unwrap();
+            let r = self
+                .call_rt("grasm_list_get_scalar", &[lv2, iv2, kc])
+                .unwrap();
             self.b.ins().jump(join, &[r]);
             self.goto_block(join);
             let bits = self.b.block_params(join)[0];
@@ -12539,7 +12704,8 @@ this case",
                         Some(k) => {
                             let bits = self.scalar_bits_of(v, &vt);
                             let kc = self.b.ins().iconst(types::I64, k);
-                            self.call_rt("grasm_list_push_scalar", &[list, bits, kc]).unwrap()
+                            self.call_rt("grasm_list_push_scalar", &[list, bits, kc])
+                                .unwrap()
                         }
                         None => self.list_push_elem(list, v, &vt),
                     };
@@ -12670,7 +12836,11 @@ this case",
             Expr::Unary { op, expr, span } => {
                 let (v, vt) = self.eval_expr_val(expr)?;
                 match (op, &vt) {
-                    (UnaryOp::Neg, VType::I64) => Ok(Some((self.b.ins().ineg(v), VType::I64))),
+                    (UnaryOp::Neg, VType::I64) => {
+                        let n = self.b.ins().ineg(v);
+                        let n = self.narrowed(*span, n, &VType::I64);
+                        Ok(Some((n, VType::I64)))
+                    }
                     (UnaryOp::Neg, VType::F64) => Ok(Some((self.b.ins().fneg(v), VType::F64))),
                     (UnaryOp::Not, VType::Bool) => {
                         let one = self.b.ins().iconst(types::I8, 1);
@@ -14446,8 +14616,15 @@ this case",
             // into the list's storage when it has room, with no slot between
             // -- a struct built in a slot and then copied in was most of
             // what filling a list of them cost.
-            if let (VType::Val(sn), Expr::StructLit { name: lit, base: None, fields, span: lsp }) =
-                (&*elem_t, &args[0])
+            if let (
+                VType::Val(sn),
+                Expr::StructLit {
+                    name: lit,
+                    base: None,
+                    fields,
+                    span: lsp,
+                },
+            ) = (&*elem_t, &args[0])
             {
                 if lit.segments.len() == 1
                     && lit.segments[0].name == *sn
@@ -14828,7 +15005,7 @@ this case",
         }
     }
 
-/// `b.slice(from, end).to_str()` as one runtime call; see
+    /// `b.slice(from, end).to_str()` as one runtime call; see
     /// `grasm_bytes_slice_to_str`. The receiver, then `from`, then `end` are
     /// evaluated in that order, as the unfused calls would.
     fn fused_slice_to_str(
@@ -14840,7 +15017,13 @@ this case",
         if name.name != "to_str" || !args.is_empty() {
             return Ok(None);
         }
-        let Expr::MethodCall { recv: inner, name: m, args: sargs, .. } = recv else {
+        let Expr::MethodCall {
+            recv: inner,
+            name: m,
+            args: sargs,
+            ..
+        } = recv
+        else {
             return Ok(None);
         };
         if m.name != "slice" || sargs.len() != 2 {
@@ -14963,7 +15146,10 @@ this case",
         };
         if (&vt, name.name.as_str()) == (&VType::Bytes, "is_empty") {
             let zero = self.b.ins().iconst(types::I64, 0);
-            return Ok(Some((self.b.ins().icmp(IntCC::Equal, v, zero), VType::Bool)));
+            return Ok(Some((
+                self.b.ins().icmp(IntCC::Equal, v, zero),
+                VType::Bool,
+            )));
         }
         // This match must name every method the table above accepts. It used to
         // end in `(VType::Str, _) => VType::Str`, and that catch-all is a trap:
@@ -14992,6 +15178,89 @@ this case",
             _ => return Ok(None),
         };
         Ok(Some((v, out_t)))
+    }
+
+    /// The integer methods that depend on a width ([L-LIB-INT-CONV]): the
+    /// conversions, the checked and saturating operations, and `ushr` on a
+    /// fixed-width receiver, which shifts the value's bits at its own width.
+    /// The same answers the interpreter's `int_width_method` gives.
+    fn int_width_method(
+        &mut self,
+        rv: Value,
+        rt: &VType,
+        recv: &Expr,
+        m: &str,
+        args: &[Expr],
+    ) -> CResult<Option<(Value, VType)>> {
+        use grasm_sema::types::IntKind;
+        let recv_kind = self.narrow_at(recv.span());
+        let tag = i64::from(recv_kind.map(|k| k.tag()).unwrap_or(255));
+        if *rt == VType::F64 {
+            let Some(k) = m.strip_prefix("as_").and_then(IntKind::from_name) else {
+                return Ok(None);
+            };
+            // Toward zero, then held to the range; NaN is 0, as `as_i64`.
+            let wide = self.b.ins().fcvt_to_sint_sat(types::I64, rv);
+            let lo = self.b.ins().iconst(types::I64, k.min());
+            let hi = self.b.ins().iconst(types::I64, k.max());
+            let v = self.b.ins().smax(wide, lo);
+            let v = self.b.ins().smin(v, hi);
+            return Ok(Some((v, VType::I64)));
+        }
+        if m == "as_i64" {
+            return Ok(Some((rv, VType::I64)));
+        }
+        if let Some(k) = m.strip_prefix("as_").and_then(IntKind::from_name) {
+            let v = self.wrap_to(rv, k);
+            return Ok(Some((v, VType::I64)));
+        }
+        if let Some(k) = m.strip_prefix("try_").and_then(IntKind::from_name) {
+            let t = self.b.ins().iconst(types::I64, i64::from(k.tag()));
+            let v = self.call_rt("grasm_int_try", &[t, rv]).unwrap();
+            return Ok(Some((v, VType::Option(Box::new(VType::I64)))));
+        }
+        let op = |name: &str| match name {
+            "add" => 0,
+            "sub" => 1,
+            _ => 2,
+        };
+        if let Some(o) = m.strip_prefix("checked_") {
+            let (a, at) = self.eval_expr_val(&args[0])?;
+            if at != VType::I64 {
+                return nope(args[0].span(), "an argument of a different type");
+            }
+            let t = self.b.ins().iconst(types::I64, tag);
+            let o = self.b.ins().iconst(types::I64, op(o));
+            let v = self.call_rt("grasm_int_checked", &[t, o, rv, a]).unwrap();
+            return Ok(Some((v, VType::Option(Box::new(VType::I64)))));
+        }
+        if let Some(o) = m.strip_prefix("saturating_") {
+            let (a, at) = self.eval_expr_val(&args[0])?;
+            if at != VType::I64 {
+                return nope(args[0].span(), "an argument of a different type");
+            }
+            let t = self.b.ins().iconst(types::I64, tag);
+            let o = self.b.ins().iconst(types::I64, op(o));
+            let v = self
+                .call_rt("grasm_int_saturating", &[t, o, rv, a])
+                .unwrap();
+            return Ok(Some((v, VType::I64)));
+        }
+        if let (Some(k), "ushr") = (recv_kind, m) {
+            let (a, at) = self.eval_expr_val(&args[0])?;
+            if at != VType::I64 {
+                return nope(args[0].span(), "an argument of a different type");
+            }
+            let bits = self
+                .b
+                .ins()
+                .band_imm(rv, (u64::MAX >> (64 - k.bits())) as i64);
+            let count = self.b.ins().band_imm(a, 63);
+            let shifted = self.b.ins().ushr(bits, count);
+            let v = self.wrap_to(shifted, k);
+            return Ok(Some((v, VType::I64)));
+        }
+        Ok(None)
     }
 
     fn dispatch_method(
@@ -15028,6 +15297,11 @@ this case",
                 }
                 av
             }};
+        }
+        if matches!(rt, VType::I64 | VType::F64) && !iface_call {
+            if let Some(done) = self.int_width_method(rv, &rt, recv, m, args)? {
+                return Ok(Some(done));
+            }
         }
         let out: (Value, VType) = match (&rt, m) {
             // ---- str ----
@@ -15608,10 +15882,7 @@ this case",
             (VType::F64, "sqrt") => (self.b.ins().sqrt(rv), VType::F64),
             (VType::F64, "floor") => (self.b.ins().floor(rv), VType::F64),
             (VType::F64, "ceil") => (self.b.ins().ceil(rv), VType::F64),
-            (VType::F64, "round") => (
-                self.call_rt("grasm_f64_round", &[rv]).unwrap(),
-                VType::F64,
-            ),
+            (VType::F64, "round") => (self.call_rt("grasm_f64_round", &[rv]).unwrap(), VType::F64),
             // The math library. Every one is `f64 -> f64` with no allocation
             // and no effect, so it lowers to a direct runtime call.
             (
@@ -15714,9 +15985,10 @@ this case",
                                 all.push(recv.clone());
                                 all.extend(args.iter().cloned());
                                 let arg_types = self.generic_arg_types(&q, &all)?;
-                                Some(self.cg.instantiate_generic(
-                                    &module, &fname, &arg_types, span,
-                                )?)
+                                Some(
+                                    self.cg
+                                        .instantiate_generic(&module, &fname, &arg_types, span)?,
+                                )
                             } else {
                                 Some(q)
                             }
@@ -15828,9 +16100,9 @@ this case",
                             // mutation does not copy what it was handed --
                             // unless an argument still to be evaluated reads
                             // the same variable and would find the hole.
-                            let take = !args.iter().any(|x| {
-                                grasm_sema::check::expr_mentions(x, &root_id.name)
-                            });
+                            let take = !args
+                                .iter()
+                                .any(|x| grasm_sema::check::expr_mentions(x, &root_id.name));
                             let held = self.read_place_boxed(cur, &path, &root_t, take)?;
                             let (raw, _) = self.unbox(held, &want)?;
                             let slot = self.b.create_sized_stack_slot(
@@ -15945,11 +16217,21 @@ this case",
                         let f = self.floor_arg();
                         vals.insert(0, f);
                     }
+                    if is_extern {
+                        // A replay refuses here rather than call C for real.
+                        let (p, l) = self.str_ptr_len(&name.name);
+                        self.call_rt("grasm_foreign_call", &[p, l]);
+                    }
                     let fref = self.cg.module.declare_func_in_func(fid, self.b.func);
                     let split_slot = self.split_call_slot(split_ret_call, &mut vals);
                     let inst = self.b.ins().call(fref, &vals);
                     let results: Vec<Value> = self.b.inst_results(inst).to_vec();
-                    let results = self.split_call_result(split_slot, results, &ret, span);
+                    let mut results = self.split_call_result(split_slot, results, &ret, span);
+                    // A C function answering a narrower integer leaves the
+                    // register's upper bits unspecified ([T-INT-FIXED]).
+                    if is_extern && ret == VType::I64 && results.len() == 1 {
+                        results[0] = self.narrowed(span, results[0], &VType::I64);
+                    }
                     for v in lent_temps {
                         self.call_rt("grasm_val_dec", &[v]);
                     }
@@ -16037,6 +16319,9 @@ checker did",
                 return nope(span, format!("the method `{}`", name.name));
             }
         };
+        // A method answering a fixed-width integer -- `b.abs()`, `b.shl(1)`,
+        // `xs.sum()` on a `[u8]` -- answers at that width ([T-INT-FIXED]).
+        let out = (self.narrowed(span, out.0, &out.1), out.1);
         Ok(Some(out))
     }
 
@@ -16053,7 +16338,9 @@ checker did",
                 ..
             } => self.cheap_pure_bool(expr),
             Expr::Binary { op, lhs, rhs, .. } => match op {
-                BinaryOp::And | BinaryOp::Or => self.cheap_pure_bool(lhs) && self.cheap_pure_bool(rhs),
+                BinaryOp::And | BinaryOp::Or => {
+                    self.cheap_pure_bool(lhs) && self.cheap_pure_bool(rhs)
+                }
                 BinaryOp::Eq
                 | BinaryOp::NotEq
                 | BinaryOp::Lt
@@ -16132,7 +16419,64 @@ checker did",
         Ok(Some((out, VType::Bool)))
     }
 
+    /// The width an operation at `span` wraps to, if it is a fixed-width one.
+    fn narrow_at(&self, span: Span) -> Option<grasm_sema::types::IntKind> {
+        if self.cg.narrow.is_empty() {
+            return None;
+        }
+        self.cg
+            .narrow
+            .get(&(span.start, span.end))
+            .and_then(|t| grasm_sema::types::IntKind::from_tag(*t))
+    }
+
+    /// `v` wrapped to `k`'s width: its low bits, sign-extended for a signed
+    /// type. Two instructions at most, and none for an `i64`.
+    fn wrap_to(&mut self, v: Value, k: grasm_sema::types::IntKind) -> Value {
+        let shift = i64::from(64 - k.bits());
+        if k.signed() {
+            let up = self.b.ins().ishl_imm(v, shift);
+            self.b.ins().sshr_imm(up, shift)
+        } else {
+            self.b.ins().band_imm(v, (u64::MAX >> shift) as i64)
+        }
+    }
+
+    /// An integer result wrapped to the width of the operation at `span`.
+    fn narrowed(&mut self, span: Span, v: Value, vt: &VType) -> Value {
+        match (vt, self.narrow_at(span)) {
+            (VType::I64, Some(k)) => self.wrap_to(v, k),
+            _ => v,
+        }
+    }
+
     fn binop_values(
+        &mut self,
+        op: BinaryOp,
+        lv: Value,
+        lt: VType,
+        rv: Value,
+        rt: VType,
+        span: Span,
+    ) -> CResult<(Value, VType)> {
+        let (v, vt) = self.binop_values_wide(op, lv, lt, rv, rt, span)?;
+        let v = if matches!(
+            op,
+            BinaryOp::Add
+                | BinaryOp::Sub
+                | BinaryOp::Mul
+                | BinaryOp::Div
+                | BinaryOp::Rem
+                | BinaryOp::Pow
+        ) {
+            self.narrowed(span, v, &vt)
+        } else {
+            v
+        };
+        Ok((v, vt))
+    }
+
+    fn binop_values_wide(
         &mut self,
         op: BinaryOp,
         mut lv: Value,
@@ -16937,13 +17281,21 @@ checker did",
                 return Ok(Some((self.b.ins().iconst(types::I64, 0), VType::Unit)));
             }
             "chan_recv" => {
-                let t = match self.cg.resolved_types.get(&(call_span.start, call_span.end)) {
-                    Some(text) => grasm_syntax::parse_type_src(text)
-                        .and_then(|te| self.cg.vtype_of(&te).ok()),
+                let t = match self
+                    .cg
+                    .resolved_types
+                    .get(&(call_span.start, call_span.end))
+                {
+                    Some(text) => {
+                        grasm_syntax::parse_type_src(text).and_then(|te| self.cg.vtype_of(&te).ok())
+                    }
                     None => None,
                 };
                 let Some(t @ VType::Option(_)) = t else {
-                    return nope(call_span, "a `chan_recv` whose type the checker did not settle");
+                    return nope(
+                        call_span,
+                        "a `chan_recv` whose type the checker did not settle",
+                    );
                 };
                 let (ch, _) = self.eval_expr_val(&args[0])?;
                 let v = self.call_rt("grasm_chan_recv", &[ch]).unwrap();
@@ -17691,11 +18043,21 @@ type parameters",
             }
             _ => None,
         };
+        if is_extern {
+            // A replay refuses here rather than call C for real.
+            let (p, l) = self.str_ptr_len(&id.name);
+            self.call_rt("grasm_foreign_call", &[p, l]);
+        }
         let fref = self.cg.module.declare_func_in_func(fid, self.b.func);
         let split_slot = self.split_call_slot(split_ret_call, &mut vals);
         let inst = self.b.ins().call(fref, &vals);
         let results: Vec<Value> = self.b.inst_results(inst).to_vec();
-        let results = self.split_call_result(split_slot, results, &ret, call_span);
+        let mut results = self.split_call_result(split_slot, results, &ret, call_span);
+        // A C function answering a narrower integer leaves the register's
+        // upper bits unspecified ([T-INT-FIXED]).
+        if is_extern && ret == VType::I64 && results.len() == 1 {
+            results[0] = self.narrowed(call_span, results[0], &VType::I64);
+        }
         // Temporaries handed to a parameter the callee only reads: nobody on
         // the other side released them.
         for v in lent_temps {
@@ -17930,7 +18292,11 @@ type parameters",
         let (tp, tl) = self.str_ptr_len(parent);
         let (vp, vl) = self.str_ptr_len(vname);
         match fields {
-            [a] => return Ok(self.call_rt("grasm_variant_new1", &[tp, tl, vp, vl, *a]).unwrap()),
+            [a] => {
+                return Ok(self
+                    .call_rt("grasm_variant_new1", &[tp, tl, vp, vl, *a])
+                    .unwrap())
+            }
             [a, b] => {
                 return Ok(self
                     .call_rt("grasm_variant_new2", &[tp, tl, vp, vl, *a, *b])
@@ -18307,7 +18673,10 @@ fields, not the type this is bound to, not an enclosing generic",
                     if kind != FK_INSTR {
                         return nope(
                             span,
-                            format!("an inline list field (`{}.{}`) used as a list", s, name.name),
+                            format!(
+                                "an inline list field (`{}.{}`) used as a list",
+                                s, name.name
+                            ),
                         );
                     }
                     // A string value made from the bytes, for a use that
@@ -18524,14 +18893,19 @@ fields, not the type this is bound to, not an enclosing generic",
         let err_blk = self.b.create_block();
         // The `Ok` side is taken in the same call that tests it: a scalar's
         // bits through a slot, anything else as its (owned) box.
-        let scalar = matches!(*ok_t, VType::I64 | VType::F64 | VType::Bool | VType::Ref(_) | VType::Unit);
+        let scalar = matches!(
+            *ok_t,
+            VType::I64 | VType::F64 | VType::Bool | VType::Ref(_) | VType::Unit
+        );
         let ptr_ty = self.cg.module.target_config().pointer_type();
         let (taken, bits_slot) = if scalar {
-            let slot = self.b.create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
-                cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
-                8,
-                3,
-            ));
+            let slot = self
+                .b
+                .create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
+                    cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+                    8,
+                    3,
+                ));
             let addr = self.b.ins().stack_addr(ptr_ty, slot, 0);
             let ok = self.call_rt("grasm_try_take_bits", &[fv, addr]).unwrap();
             self.b.ins().brif(ok, ok_blk, &[], err_blk, &[]);
@@ -19348,11 +19722,12 @@ fields, not the type this is bound to, not an enclosing generic",
                                 Box::new(VType::Str),
                                 Box::new(VType::Sum("IoError".into())),
                             )),
-                            "write_file" | "remove_file" | "make_dir"
-                            | "make_dir_new" => Some(VType::Fallible(
-                                Box::new(VType::Unit),
-                                Box::new(VType::Sum("IoError".into())),
-                            )),
+                            "write_file" | "remove_file" | "make_dir" | "make_dir_new" => {
+                                Some(VType::Fallible(
+                                    Box::new(VType::Unit),
+                                    Box::new(VType::Sum("IoError".into())),
+                                ))
+                            }
                             "bytes_of" | "bytes_filled" => Some(VType::Bytes),
                             "random_bytes" => Some(VType::Fallible(
                                 Box::new(VType::Bytes),
@@ -19809,6 +20184,20 @@ fields, not the type this is bound to, not an enclosing generic",
                 "codes" => VType::List(Box::new(VType::I64)),
                 "as_f64" => VType::F64,
                 "as_i64" => VType::I64,
+                n if n.starts_with("as_")
+                    && grasm_sema::types::IntKind::from_name(&n[3..]).is_some() =>
+                {
+                    VType::I64
+                }
+                n if n.starts_with("try_")
+                    && grasm_sema::types::IntKind::from_name(&n[4..]).is_some() =>
+                {
+                    VType::Option(Box::new(VType::I64))
+                }
+                "checked_add" | "checked_sub" | "checked_mul" => {
+                    VType::Option(Box::new(VType::I64))
+                }
+                "saturating_add" | "saturating_sub" | "saturating_mul" => VType::I64,
                 "to_bits" => VType::I64,
                 "from_bits" => VType::F64,
                 // Numeric methods. Their absence here did not merely make a
@@ -21840,16 +22229,27 @@ binding, as in `let f: fn(i64) -> i64 = |x| x + 1`, or make it a top-level `fn`)
             let Stmt::Spawn { body: task, .. } = st else {
                 return self.emit_parallel(body);
             };
-            let [Stmt::Assign { target: Expr::Ident(v), value, .. }] = task.stmts.as_slice() else {
+            let [Stmt::Assign {
+                target: Expr::Ident(v),
+                value,
+                ..
+            }] = task.stmts.as_slice()
+            else {
                 return self.emit_parallel(body);
             };
             tasks.push((v.clone(), value.clone()));
         }
-        let k = Ident { name: "\u{a7}k".to_string(), span: fresh() };
+        let k = Ident {
+            name: "\u{a7}k".to_string(),
+            span: fresh(),
+        };
         // `if §k == 0 { e0 } else if §k == 1 { e1 } ... else { eN }`
         let mut chain = tasks.last().expect("two or more tasks").1.clone();
         for (i, (_, e)) in tasks.iter().enumerate().rev().skip(1) {
-            let one = |e: Expr| grasm_syntax::ast::Block { stmts: vec![Stmt::Expr(e)], span: fresh() };
+            let one = |e: Expr| grasm_syntax::ast::Block {
+                stmts: vec![Stmt::Expr(e)],
+                span: fresh(),
+            };
             chain = Expr::If {
                 cond: Box::new(Expr::Binary {
                     op: BinaryOp::Eq,
@@ -21863,12 +22263,17 @@ binding, as in `let f: fn(i64) -> i64 = |x| x + 1`, or make it a top-level `fn`)
             };
         }
         let indices = Expr::List(
-            (0..tasks.len()).map(|i| Expr::Int(i as i64, fresh())).collect(),
+            (0..tasks.len())
+                .map(|i| Expr::Int(i as i64, fresh()))
+                .collect(),
             fresh(),
         );
         let run = Expr::MethodCall {
             recv: Box::new(indices),
-            name: Ident { name: "par_map".to_string(), span: fresh() },
+            name: Ident {
+                name: "par_map".to_string(),
+                span: fresh(),
+            },
             args: vec![Expr::Closure {
                 params: vec![k.clone()],
                 body: Box::new(chain),
@@ -21876,7 +22281,10 @@ binding, as in `let f: fn(i64) -> i64 = |x| x + 1`, or make it a top-level `fn`)
             }],
             span: fresh(),
         };
-        let par = Ident { name: "\u{a7}par".to_string(), span: fresh() };
+        let par = Ident {
+            name: "\u{a7}par".to_string(),
+            span: fresh(),
+        };
         let mut stmts = vec![Stmt::Let {
             mutable: false,
             name: par.clone(),
@@ -21896,7 +22304,10 @@ binding, as in `let f: fn(i64) -> i64 = |x| x + 1`, or make it a top-level `fn`)
                 span: fresh(),
             });
         }
-        let block = grasm_syntax::ast::Block { stmts, span: fresh() };
+        let block = grasm_syntax::ast::Block {
+            stmts,
+            span: fresh(),
+        };
         // The `par_map` below is the first parallel map this block runs.
         self.call_rt("grasm_par_tasks_next", &[]);
         let (tail, _) = self.eval_block_inner(&block)?;

@@ -535,6 +535,26 @@ pub fn gate(name: &str) -> Option<Wire> {
     })
 }
 
+/// Stops a replay that is about to call C.
+///
+/// A recording holds what the journaled builtins saw. A C function reached
+/// through `extern fn` is not one of them: whatever it read or changed was
+/// never written down, so on replay it would simply run again, for real, and
+/// the run would go on looking like a replay while doing something new --
+/// `getpid()` answered a different number every time and nothing said so.
+/// Called before every C call; it does nothing unless this run is replaying.
+pub fn refuse_foreign(name: &str) {
+    if !replaying() {
+        return;
+    }
+    eprint_line!(
+        "grasm: this run calls the C function `{name}`, and a recording holds \
+         nothing a C function did — replaying would call it for real, so the \
+         replay stops here"
+    );
+    grasm_sys::sys::exit(7);
+}
+
 /// Says how much of the journal a replay consumed, if it is short.
 ///
 /// A replay that ends with records left over did *not* reproduce the recorded
@@ -559,9 +579,9 @@ extern crate std;
 #[cfg(test)]
 mod tests {
     // `std`'s prelude is gone; tests need `alloc`'s names explicitly.
+    use super::Wire;
     #[allow(unused_imports)]
     use alloc::{format, string::String, string::ToString, vec, vec::Vec};
-    use super::Wire;
 
     /// Every shape survives a round trip, including the awkward ones: an empty
     /// list is not a missing list, and a byte string is not text.

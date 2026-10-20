@@ -118,7 +118,13 @@ fn run() -> ExitCode {
             "run" => (&[], &[]),
             "test" => (
                 &["--coverage", "--contracts"],
-                &["--seed", "--cases", "--filter", "--schedules", "--schedule-seed"],
+                &[
+                    "--seed",
+                    "--cases",
+                    "--filter",
+                    "--schedules",
+                    "--schedule-seed",
+                ],
             ),
             "bench" => (&[], &["--filter"]),
             "check" => (&[], &[]),
@@ -233,7 +239,13 @@ fn run() -> ExitCode {
             // printed the usage line, which reads as "that file is wrong".
             let Some(path) = first_operand(
                 &args[1..],
-                &["--seed", "--cases", "--filter", "--schedules", "--schedule-seed"],
+                &[
+                    "--seed",
+                    "--cases",
+                    "--filter",
+                    "--schedules",
+                    "--schedule-seed",
+                ],
             ) else {
                 eprintln!("usage: grasm test <file.gr> [--coverage] [--contracts] [--seed N] [--cases N] [--filter TEXT] [--schedules N] [--schedule-seed S]");
                 return ExitCode::FAILURE;
@@ -518,7 +530,7 @@ fn run() -> ExitCode {
                         Some(t),
                     ) {
                         Ok(()) => {
-                            println!("emitted `{obj}` for {t} (link it with a {t} toolchain + libgrasm_rt.a)");
+                            println!("emitted `{obj}` for {t} (link it with a {t} toolchain + libgrasm_rt_abi.a)");
                             ExitCode::SUCCESS
                         }
                         Err(e) => {
@@ -1787,7 +1799,7 @@ fn find_runtime() -> Result<PathBuf, String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let dir = exe.parent().ok_or("cannot locate the grasm binary")?;
     let candidates = [
-        dir.join("libgrasm_rt_abi.a"),              // release archive, cargo target
+        dir.join("libgrasm_rt_abi.a"), // release archive, cargo target
         dir.join("../lib/grasm/libgrasm_rt_abi.a"), // bin/ + lib/ install layout
         dir.join("lib/libgrasm_rt_abi.a"),
         dir.join("../lib/libgrasm_rt_abi.a"),
@@ -1807,12 +1819,14 @@ fn find_runtime() -> Result<PathBuf, String> {
          \n\
          Looked next to `{}` and in ../lib.\n\
          \n\
-         If you downloaded a release, keep `grasm` and `libgrasm_rt.a` in the\n\
-         same directory. From a source checkout, run:\n\
+         If you downloaded a release archive, keep `grasm` and\n\
+         `libgrasm_rt_abi.a` in the same directory. v1.0.0 shipped `grasm`\n\
+         alone, without the runtime; build from source for `--native` with it.\n\
+         From a source checkout, run:\n\
          \n\
              cargo build --release --workspace\n\
          \n\
-         Or point at it directly:  GRASM_RUNTIME=/path/to/libgrasm_rt.a\n\
+         Or point at it directly:  GRASM_RUNTIME=/path/to/libgrasm_rt_abi.a\n\
          \n\
          `grasm run` needs none of this — only `--native` links the runtime.",
         dir.display()

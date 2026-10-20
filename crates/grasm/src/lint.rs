@@ -472,7 +472,11 @@ impl<'a> Linter<'a> {
         // the case most worth catching.
         let (n, span) = match args {
             [Expr::Int(n, span)] => (*n, *span),
-            [Expr::Unary { op: UnaryOp::Neg, expr, span }] => match expr.as_ref() {
+            [Expr::Unary {
+                op: UnaryOp::Neg,
+                expr,
+                span,
+            }] => match expr.as_ref() {
                 Expr::Int(n, _) => (-*n, *span),
                 _ => return,
             },

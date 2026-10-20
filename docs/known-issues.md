@@ -7,6 +7,41 @@ makes shipping them honest rather than quiet.
 
 **Open S1: none. Open S2: none. Open S3: none. Open S4: none.**
 
+## Found on 2026-10-19 by an outside review
+
+**The published release cannot build natively -- *open*.** v1.0.0 is two bare
+binaries and `SHA256SUMS`. `grasm run` works from the download; `grasm build
+--native` stops with "cannot find the Grasm runtime", because
+`libgrasm_rt_abi.a` is not in it, and the message told the user to keep a
+`libgrasm_rt.a` beside `grasm` that no release has shipped. Reproducer:
+`scripts/verify_release.sh --tag v1.0.0 -R grasm-lang/grasm` (exits 1: "v1.0.0
+has no .tar.gz archives"). `scripts/package.sh` now makes an archive with the
+runtime and BUILD-INFO and refuses to checksum one that cannot build a program
+from an empty directory; `.github/workflows/release.yml` runs it, publishes,
+and downloads the result again to check it. None of that has produced a
+published release yet, so this stays open until one is.
+
+**CI has never run -- *open*.** The workflows are written; the public
+repository holds them in `ci/github-workflows/`, because the import was pushed
+without GitHub's `workflow` scope. Every gate result in this repository comes
+from one arm64 Mac. No Linux binary has been linked or run anywhere.
+
+**Replay called C functions for real -- S1, *closed*.** Under `GRASM_REPLAY`
+an `extern fn` ran live: `unsafe { getpid() }` recorded 18839 and replayed
+18847, exit 0, in both engines. A recording holds nothing a C function did, so
+both engines now stop at the first C call of a replay, with exit 7 and the
+function's name -- a direct call, a method call and a function value alike.
+`scripts/replaytest.sh` checks all three on both engines.
+
+**`leakcheck` counted crashes and early exits as leak-free -- *closed*.** Only
+exit 7 was a leak and only a timeout was set aside; everything else, a segfault
+included, was "clean". The runtime now prints `leak check: nothing live at
+exit` when the check runs and finds nothing, and only that counts as clean. A
+death by signal is reported as a crash and fails. A program that ends before
+`main` returns is named; 25 do so on purpose and are listed in the script, and
+a new one fails. Those 25 had been counted leak-free without the check running;
+none of the 604 crashed.
+
 **One gate was red, and it was right to be: the specification is over the
 budget it binds itself to.** `unittests` failed on
 `the_kernel_budgets_do_not_regress` until 2026-10-19 (below); the spec is
@@ -55,6 +90,72 @@ deliberately.
 and from 2026-10-12 that suite did not fail -- it **hung**, on F101's panic
 deadlock, which landed the same day. Two defects from one day, and the first
 one hid the second.
+
+**Paid for again the same day.** [T-INT-FIXED], its three sub-clauses and
+[L-LIB-INT-CONV] added 30 lines, which would have made the spec 3,576 lines --
+71 pages, over the tripwire. The history below, sentences of record inside
+seven normative paragraphs, came out to pay for them: 3,546 lines, 70 pages,
+where the day started. The rule in each paragraph stayed; only the account of
+what went wrong before it was written moved here.
+
+> From [T-EXTERN-POINTER]:
+>
+> Without this the C boundary carried scalars only, which excluded `open`, `read`,
+> `write`, `system`, `getenv`, `socket` — every libc function taking a pointer,
+> which is nearly all of the useful ones. What could be called was `abs`, `sqrt`,
+> `pow` and their kind, so "C ABI import overhead: zero-cost" was true and
+> described arithmetic.
+>
+> From [L-LIB-TO-STR]:
+>
+> `"1.0"`. The interpreter used to hand the job to its host language, which drops
+> the point on a whole value, so it answered `"1"` where the compiled backend
+> answered `"1.0"` — and the documented idiom `xs.map(|v| v.to_str()).join(", ")`
+> printed a `[f64]` as a list of integers, which [L-DISPLAY] exists to prevent.
+>
+> From [L-LIB-STR] character counts:
+>
+> proportional to the slice it returns), whatever the text. They
+> count *characters*, so each used to decode the string from the start:
+> `while i < s.len()` was quadratic in two ways at once, and 400 000 characters
+> took 6.7 seconds where the identical loop over a list took 0.21. A string
+> never changes once built, so its character count is computed once and kept.
+>
+> From [L-LIB-STR] character index:
+>
+> is asked for by position. Fixing only the ASCII half left the same 6.3 seconds
+> waiting behind a single two-byte character, and building the index for
+> `code_at` while leaving `substr` to walk from the start left a `substr(i, 1)`
+> scan quadratic — 39 seconds over 262 144 characters — next to a `code_at` scan
+> of the same string costing 0.11.
+>
+> From [E-CONST]:
+>
+> This is a promise about cost, not only a permission: rebuilding per mention
+> made every *read* of an n-element constant O(n), so a loop of k reads over a
+> 4 000-entry dispatch table took 632 ms where the same loop over a local copy
+> took 1 ms. A constant is the shape this clause recommends for a table read in
+> a loop, and reading one is O(1).
+>
+> From [E-PAR-FAIL]:
+>
+> run such a closure sequentially, and the native backend does: its parallel
+> workers carry one machine word of result and no error channel, so a `fail`
+> inside one used to leave the error's address in the result slot —
+> `[1, 2, 3].par_map(|x| if x == 2 { fail(e) } else { x })` printed a raw pointer
+> as its middle element and exited 0.
+>
+> From [T-OK-ERR-RETURN]:
+>
+> The wrapping happens wherever the branch lands, not only on the way out of a
+> function. A fallible function re-wraps its whole body, which masked a gap
+> everywhere except the positions that do not — a `let` annotation, a struct
+> field, a list element — where the interpreter stored the *raw* value:
+> `let a: i64 ! E = if true { 1 } else { Ok(2) }` held `1` rather than `Ok(1)`,
+> so it printed as `1`, compared unequal to `Ok(1)`, and matched no arm of a
+> `match` over it. A native build, which wraps by produced type, answered
+> correctly — the normative engine was the wrong one, at exit 0 with nothing on
+> stderr.
 
 **Back to 70 pages on 2026-10-19, still 20 over.** `spec/core.md` carried the
 two paragraphs below -- how the page and interpreter figures moved, with
@@ -158,23 +259,10 @@ silently mix old objects into new binaries. With a cold cache both programs run
 clean, `usecheck` reports no use-after-free, and the previously failing
 difftest slice is 71 of 71.
 
-**`leakcheck` is red: `E-VALUE-SEMANTICS.gr` holds 16 allocations at exit.**
-Found on 2026-10-15 and present at `HEAD` before that day's work, so it is not
-new that day -- but it was not written down, and the site's gate table said
-"0 leaks", which is the only reason it was not. The ratchet is at zero by
-design: 27 programs leaked the day the gate was written and none did
-afterwards, so one leak fails it.
-
-```
-grasm build spec/conformance/E-VALUE-SEMANTICS.gr --native -o /tmp/evs
-GRASM_LEAK_CHECK=1 /tmp/evs        # exit 7, 16 allocations
-```
-
-The program uses no `bytes`; it pushes into lists, structs and a nested place
-(`bag.items.push(7)`), which is where `write_place` is already recorded above
-as leaking intermediates. That is the first place to look, and the three
-repairs tried against it are described in `scripts/leakcheck.sh` -- each was
-wrong in a different way, which is why this is open rather than quick.
+**`leakcheck` was red on `E-VALUE-SEMANTICS.gr` (16 allocations at exit) --
+*closed*.** Found on 2026-10-15. On 2026-10-19 the program prints `leak check:
+nothing live at exit` and the gate reports 0 leaking of 579 checked; the commit
+that fixed it was not recorded here.
 
 `scripts/usecheck.sh` and the `poison` feature stay. They are what turned an
 intermittent segfault into a named, repeatable `use after free`, and the gate
@@ -209,12 +297,15 @@ write here. They are collected because the first person outside this repository
 to port a real application hit every one of them in a week, and the list is
 more useful than the sum of the clauses that imply it.
 
-**One integer width, one float width.** `spec/types.md` [T-INT-ALIAS]: `i8`,
-`i16`, `i32`, `u8`, `u16`, `u32`, `u64`, `usize` and `int` are aliases for
-`i64`, and `f32` and `float` are aliases for `f64`. Distinct fixed-width types
-are designed and unimplemented. There is no unsigned arithmetic, no wrapping
-`u8`/`u16`/`u32`, and a `u32` hash wants masking by hand. Code that packs
-binary32 writes the bit layout itself.
+**One float width, no unsigned 64-bit, no packed layout.** *Narrowed on
+2026-10-19 by [T-INT-FIXED].* `i8 i16 i32 u8 u16 u32` are types of their own
+that wrap at their width in both engines, checked against an exact oracle by
+`scripts/fuzz_intwidth.py`; a `u32` hash no longer wants masking by hand.
+What is still missing: `u64` and `usize` (unsigned 64-bit arithmetic) and
+`f32` are refused rather than implemented, so code that packs binary32 still
+writes the bit layout itself. Every integer is held in 64 bits in a list or a
+struct -- a `[u8]` is not a byte array, and there is no C struct layout -- and
+`bytes` indexing still answers an `i64`.
 
 **No mutable byte buffer.** *Closed on 2026-10-15 by [L-LIB-BYTES-WRITE].*
 `bytes_filled(n, byte)` makes a buffer and `set`, `fill` and `copy_from` write

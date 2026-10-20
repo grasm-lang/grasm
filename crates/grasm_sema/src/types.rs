@@ -6,9 +6,108 @@ use std::fmt;
 pub type TypeDefId = usize;
 pub type VarId = u32;
 
+/// A fixed-width integer type other than `i64` ([T-INT-FIXED]).
+///
+/// Each is its own type: a `u8` is not an `i64`, and the two do not mix
+/// without a conversion. Every engine holds the value in 64 bits -- the true
+/// value, sign- or zero-extended -- and wraps the result of each operation to
+/// the type's width, the way `i64` wraps to 64 ([E-ARITH-INT]). That is what
+/// makes `255 + 1` a `u8` `0` rather than the `i64` `256` these names used to
+/// stand for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum IntKind {
+    I8,
+    I16,
+    I32,
+    U8,
+    U16,
+    U32,
+}
+
+impl IntKind {
+    pub const ALL: [IntKind; 6] = [
+        IntKind::I8,
+        IntKind::I16,
+        IntKind::I32,
+        IntKind::U8,
+        IntKind::U16,
+        IntKind::U32,
+    ];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            IntKind::I8 => "i8",
+            IntKind::I16 => "i16",
+            IntKind::I32 => "i32",
+            IntKind::U8 => "u8",
+            IntKind::U16 => "u16",
+            IntKind::U32 => "u32",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<IntKind> {
+        IntKind::ALL.into_iter().find(|k| k.name() == name)
+    }
+
+    pub fn bits(self) -> u32 {
+        match self {
+            IntKind::I8 | IntKind::U8 => 8,
+            IntKind::I16 | IntKind::U16 => 16,
+            IntKind::I32 | IntKind::U32 => 32,
+        }
+    }
+
+    pub fn signed(self) -> bool {
+        matches!(self, IntKind::I8 | IntKind::I16 | IntKind::I32)
+    }
+
+    pub fn min(self) -> i64 {
+        if self.signed() {
+            -(1i64 << (self.bits() - 1))
+        } else {
+            0
+        }
+    }
+
+    pub fn max(self) -> i64 {
+        if self.signed() {
+            (1i64 << (self.bits() - 1)) - 1
+        } else {
+            (1i64 << self.bits()) - 1
+        }
+    }
+
+    /// `v` wrapped to this width: its low `bits` bits, sign-extended for a
+    /// signed type. Two's complement, as `i64` arithmetic already is.
+    pub fn wrap(self, v: i64) -> i64 {
+        let shift = 64 - self.bits();
+        if self.signed() {
+            (v << shift) >> shift
+        } else {
+            ((v as u64) << shift >> shift) as i64
+        }
+    }
+
+    pub fn fits(self, v: i64) -> bool {
+        v >= self.min() && v <= self.max()
+    }
+
+    /// A one-byte tag for the engines, which keep a map from an operation's
+    /// span to the width it wraps to.
+    pub fn tag(self) -> u8 {
+        self as u8
+    }
+
+    pub fn from_tag(t: u8) -> Option<IntKind> {
+        IntKind::ALL.get(t as usize).copied()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Type {
     I64,
+    /// `i8`, `i16`, `i32`, `u8`, `u16`, `u32` ([T-INT-FIXED]).
+    Int(IntKind),
     F64,
     Bool,
     Str,
@@ -280,6 +379,7 @@ impl Unifier {
                 true
             }
             (_, Type::Var(_)) => self.unify(&b, &a),
+            (Type::Int(a), Type::Int(b)) => a == b,
             (Type::I64, Type::I64)
             | (Type::F64, Type::F64)
             | (Type::Bool, Type::Bool)
@@ -384,6 +484,7 @@ fn write_type(f: &mut fmt::Formatter<'_>, ty: &Type, defs: &TypeDefs) -> fmt::Re
             write_type(f, inner, defs)
         }
         Type::I64 => write!(f, "i64"),
+        Type::Int(k) => write!(f, "{}", k.name()),
         Type::F64 => write!(f, "f64"),
         Type::Bool => write!(f, "bool"),
         Type::Str => write!(f, "str"),

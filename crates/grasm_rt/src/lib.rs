@@ -40,14 +40,14 @@ use alloc::vec::Vec;
 // every call site: `crate::io::`, `crate::fs::` and the rest still resolve.
 pub use grasm_sys::{fs, io, net, process, sync, sys, thread, tls};
 
+use core::sync::atomic::AtomicI64;
+use core::sync::atomic::Ordering::{Acquire, Relaxed, Release};
 /// The record-and-replay journal.
 ///
 /// Re-exported rather than defined here: the interpreter and the browser build
 /// share the journal and cannot link this runtime, so the format lives in its
 /// own crate. Every `replay::` path in this file is unchanged.
 pub use grasm_journal as replay;
-use core::sync::atomic::AtomicI64;
-use core::sync::atomic::Ordering::{Acquire, Relaxed, Release};
 
 // ---------------------------------------------------------------------------
 // Output (print / interpolation are lowered to piecewise `out` calls)
@@ -2706,7 +2706,8 @@ pub extern "C" fn grasm_live_allocations() -> i64 {
 /// property of the implementation and not something a program's user can act
 /// on — and printing it unasked would put it on the stderr the differential
 /// harness compares. Under the variable it prints a line and exits 7, a code
-/// nothing else here uses.
+/// nothing else here uses, or prints `leak check: nothing live at exit` and
+/// returns -- the line is what shows the check ran.
 #[no_mangle]
 pub extern "C" fn grasm_check_leaks() {
     if crate::sys::env_var("GRASM_ALLOC_STATS").is_some() {
@@ -2745,6 +2746,14 @@ pub extern "C" fn grasm_check_leaks() {
     let live = LOCAL.with(|l| l.live.get()) + ESCAPED.load(Relaxed);
     let copies = C_COPIES.load(Relaxed);
     if live == 0 && copies == 0 {
+        // Said out loud, because silence and exit 0 also describe a program
+        // that never got here: `exit(0)` part-way through ends the process
+        // without returning from `main`, so the check never ran. A harness
+        // that counted exit 0 as clean counted that too, and counted a crash
+        // as clean as well.
+        let mut err = crate::io::stderr().lock();
+        let _ = writeln!(err, "leak check: nothing live at exit");
+        let _ = err.flush();
         return;
     }
     let _ = crate::io::stdout().flush();
@@ -2893,7 +2902,6 @@ pub unsafe extern "C" fn grasm_region_pop() {
         });
     }
 }
-
 
 /// Small integers worth interning. Covers loop counters, indices, flags, and
 /// the small constants that dominate real programs.
@@ -3744,12 +3752,7 @@ pub unsafe extern "C" fn grasm_str_pin_i64(data: i64, at: i64, v: i64) -> i64 {
 /// # Safety: `data + at` through `data + at + len` is writable, and `ptr`
 /// through `ptr + len` is readable.
 #[no_mangle]
-pub unsafe extern "C" fn grasm_str_pin_text(
-    data: i64,
-    at: i64,
-    ptr: *const u8,
-    len: i64,
-) -> i64 {
+pub unsafe extern "C" fn grasm_str_pin_text(data: i64, at: i64, ptr: *const u8, len: i64) -> i64 {
     core::ptr::copy_nonoverlapping(ptr, (data as *mut u8).add(at as usize), len as usize);
     len
 }
@@ -5181,21 +5184,21 @@ unsafe fn display(v: *mut RtVal) -> String {
                             match kind {
                                 FK_BOXED => format!("{k}: {}", display(*x as *mut RtVal)),
                                 FK_INSTR => {
-                                    let v = core::mem::ManuallyDrop::new(
-                                        inline_vec::<u8>(&el[at..at + 3]),
-                                    );
+                                    let v = core::mem::ManuallyDrop::new(inline_vec::<u8>(
+                                        &el[at..at + 3],
+                                    ));
                                     format!("{k}: {}", String::from_utf8_lossy(&v))
                                 }
                                 FK_INLIST => {
-                                    let v = core::mem::ManuallyDrop::new(
-                                        inline_vec::<i64>(&el[at..at + 3]),
-                                    );
+                                    let v = core::mem::ManuallyDrop::new(inline_vec::<i64>(
+                                        &el[at..at + 3],
+                                    ));
                                     format!("{k}: {:?}", &v[..])
                                 }
                                 FK_INVALS => {
-                                    let v = core::mem::ManuallyDrop::new(
-                                        inline_vec::<i64>(&el[at..at + 3]),
-                                    );
+                                    let v = core::mem::ManuallyDrop::new(inline_vec::<i64>(
+                                        &el[at..at + 3],
+                                    ));
                                     let et = ty.elem_ty(i);
                                     format!("{k}: [{} values]", v.len() / et.width.max(1))
                                 }
@@ -6023,7 +6026,11 @@ pub unsafe extern "C" fn grasm_result_split(res: *mut RtVal, out: *mut i64, kind
     }
     dec(res);
     if is_ok && kind >= 0 {
-        *out = if kind == 4 { 0 } else { unbox_field_bits(payload) };
+        *out = if kind == 4 {
+            0
+        } else {
+            unbox_field_bits(payload)
+        };
         dec(payload);
     } else {
         *out = payload as i64;
@@ -6515,8 +6522,7 @@ pub unsafe extern "C" fn grasm_map_set(m: *mut RtVal, k: *mut RtVal, v: *mut RtV
 ///
 /// # Safety: `ptr`/`len` are valid UTF-8 for the length of the call.
 unsafe fn with_key_bytes<R>(ptr: *const u8, len: i64, f: impl FnOnce(&MapKey) -> R) -> R {
-    let text =
-        core::str::from_utf8_unchecked(core::slice::from_raw_parts(ptr, len as usize));
+    let text = core::str::from_utf8_unchecked(core::slice::from_raw_parts(ptr, len as usize));
     f(&MapKey::Str(KeyStr::of(text)))
 }
 
@@ -7141,6 +7147,22 @@ pub extern "C" fn grasm_panic_stack() -> ! {
     rt_panic("stack overflow: recursion too deep")
 }
 
+/// Called by compiled code before every call to an `extern fn`, with the C
+/// function's name. Refuses under `GRASM_REPLAY`; see
+/// [`grasm_journal::refuse_foreign`].
+///
+/// # Safety
+/// `name` must point to `len` bytes (guaranteed: the compiler only passes the
+/// name it embedded itself).
+#[no_mangle]
+pub unsafe extern "C" fn grasm_foreign_call(name: *const u8, len: i64) {
+    if !grasm_journal::replaying() {
+        return;
+    }
+    let bytes = core::slice::from_raw_parts(name, len as usize);
+    grasm_journal::refuse_foreign(core::str::from_utf8(bytes).unwrap_or("?"));
+}
+
 /// Panics if the stack has run down past this thread's floor.
 ///
 /// Called on entry to every function that can recurse. [E-RECURSION-DEPTH]
@@ -7388,6 +7410,63 @@ pub unsafe extern "C" fn grasm_str_index_of(s: *mut RtVal, needle: *mut RtVal) -
         }
         None => none_val(),
     }
+}
+
+/// The range of an integer width by the tag the compiler passes: 0..=5 are
+/// `i8 i16 i32 u8 u16 u32` (the order of `IntKind`), anything else `i64`
+/// ([T-INT-FIXED]).
+fn int_range(tag: i64) -> (i128, i128) {
+    match tag {
+        0 => (i8::MIN as i128, i8::MAX as i128),
+        1 => (i16::MIN as i128, i16::MAX as i128),
+        2 => (i32::MIN as i128, i32::MAX as i128),
+        3 => (0, u8::MAX as i128),
+        4 => (0, u16::MAX as i128),
+        5 => (0, u32::MAX as i128),
+        _ => (i64::MIN as i128, i64::MAX as i128),
+    }
+}
+
+fn int_exact(op: i64, a: i64, b: i64) -> i128 {
+    let (a, b) = (a as i128, b as i128);
+    match op {
+        0 => a + b,
+        1 => a - b,
+        _ => a * b,
+    }
+}
+
+/// `v.try_u8()` and its siblings: `Some(v)` when it fits ([L-LIB-INT-CONV]).
+#[no_mangle]
+pub extern "C" fn grasm_int_try(tag: i64, v: i64) -> *mut RtVal {
+    let (lo, hi) = int_range(tag);
+    if (v as i128) >= lo && (v as i128) <= hi {
+        some_of(grasm_box_i64(v))
+    } else {
+        none_val()
+    }
+}
+
+/// `a.checked_add(b)` and its siblings, at the receiver's width: `None`
+/// where the true result is out of range ([L-LIB-INT-CONV]). `op` is 0 for
+/// add, 1 for sub, 2 for mul.
+#[no_mangle]
+pub extern "C" fn grasm_int_checked(tag: i64, op: i64, a: i64, b: i64) -> *mut RtVal {
+    let (lo, hi) = int_range(tag);
+    let r = int_exact(op, a, b);
+    if r >= lo && r <= hi {
+        some_of(grasm_box_i64(r as i64))
+    } else {
+        none_val()
+    }
+}
+
+/// `a.saturating_add(b)` and its siblings: the true result, held to the
+/// receiver's range.
+#[no_mangle]
+pub extern "C" fn grasm_int_saturating(tag: i64, op: i64, a: i64, b: i64) -> i64 {
+    let (lo, hi) = int_range(tag);
+    int_exact(op, a, b).clamp(lo, hi) as i64
 }
 
 fn none_val() -> *mut RtVal {
@@ -8277,7 +8356,9 @@ thread_local! {
 
 /// Reads once through the thread's read buffer, answering with the bytes read
 /// in a buffer of exactly their size.
-fn read_sized<T>(read: impl FnOnce(&mut [u8]) -> crate::io::Result<(usize, T)>) -> crate::io::Result<(Vec<u8>, T)> {
+fn read_sized<T>(
+    read: impl FnOnce(&mut [u8]) -> crate::io::Result<(usize, T)>,
+) -> crate::io::Result<(Vec<u8>, T)> {
     READ_BUF.with(|b| {
         let mut b = b.borrow_mut();
         if b.len() < 65536 {
@@ -8596,7 +8677,9 @@ fn kq_wait(wanted: &[i64], timeout_ms: i32) -> Option<Waited> {
             }
             let mut changes: Vec<KEvent> = Vec::new();
             for (rfd, rs) in &w.registered {
-                let kept = held.iter().any(|s| core::ptr::eq(rs.as_ptr(), alloc::sync::Arc::as_ptr(s)));
+                let kept = held
+                    .iter()
+                    .any(|s| core::ptr::eq(rs.as_ptr(), alloc::sync::Arc::as_ptr(s)));
                 if kept {
                     continue;
                 }
@@ -8607,10 +8690,9 @@ fn kq_wait(wanted: &[i64], timeout_ms: i32) -> Option<Waited> {
                 }
             }
             for (s, &fd) in held.iter().zip(&fds) {
-                let known = w
-                    .registered
-                    .iter()
-                    .any(|(rfd, rs)| *rfd == fd && core::ptr::eq(rs.as_ptr(), alloc::sync::Arc::as_ptr(s)));
+                let known = w.registered.iter().any(|(rfd, rs)| {
+                    *rfd == fd && core::ptr::eq(rs.as_ptr(), alloc::sync::Arc::as_ptr(s))
+                });
                 if !known {
                     changes.push(KEvent::new(fd, EV_ADD | EV_RECEIPT));
                 }
@@ -8632,19 +8714,30 @@ fn kq_wait(wanted: &[i64], timeout_ms: i32) -> Option<Waited> {
                 }
                 // A delete that finds nothing is fine; an add that fails is not.
                 for r in &receipts[..n as usize] {
-                    let added = changes.iter().any(|c| c.ident == r.ident && c.flags & EV_ADD != 0);
+                    let added = changes
+                        .iter()
+                        .any(|c| c.ident == r.ident && c.flags & EV_ADD != 0);
                     if r.flags & EV_ERROR != 0 && r.data != 0 && added {
                         // What is registered is no longer known; start over.
                         unsafe { close(w.kq) };
                         w.kq = unsafe { kqueue() };
                         w.handles.clear();
                         w.registered.clear();
-                        return Some(Err(crate::io::Error::from_raw_os_error(r.data as i32).to_string()));
+                        return Some(Err(
+                            crate::io::Error::from_raw_os_error(r.data as i32).to_string()
+                        ));
                     }
                 }
             }
-            w.registered = held.iter().zip(&fds).map(|(s, &fd)| (fd, alloc::sync::Arc::downgrade(s))).collect();
-            w.listener = held.iter().map(|s| matches!(&**s, Socket::Listener(_))).collect();
+            w.registered = held
+                .iter()
+                .zip(&fds)
+                .map(|(s, &fd)| (fd, alloc::sync::Arc::downgrade(s)))
+                .collect();
+            w.listener = held
+                .iter()
+                .map(|s| matches!(&**s, Socket::Listener(_)))
+                .collect();
             w.handles = wanted.to_vec();
             w.position = position;
         }
@@ -8662,7 +8755,16 @@ fn kq_wait(wanted: &[i64], timeout_ms: i32) -> Option<Waited> {
             &ts as *const TimeSpec
         };
         loop {
-            let n = unsafe { kevent(w.kq, core::ptr::null(), 0, w.events.as_mut_ptr(), cap as i32, tp) };
+            let n = unsafe {
+                kevent(
+                    w.kq,
+                    core::ptr::null(),
+                    0,
+                    w.events.as_mut_ptr(),
+                    cap as i32,
+                    tp,
+                )
+            };
             if n >= 0 {
                 let mut ready = vec![false; wanted.len()];
                 for e in &w.events[..n as usize] {
@@ -8723,7 +8825,12 @@ fn socket_fds(held: &[alloc::sync::Arc<Socket>]) -> Vec<i32> {
 fn poll_wait(wanted: &[i64], timeout_ms: i32) -> Waited {
     let held = socket_set(wanted)?;
     let ready = wait_readable(&socket_fds(&held), timeout_ms)?;
-    Ok((ready, held.iter().map(|s| matches!(&**s, Socket::Listener(_))).collect()))
+    Ok((
+        ready,
+        held.iter()
+            .map(|s| matches!(&**s, Socket::Listener(_)))
+            .collect(),
+    ))
 }
 
 /// The local port a handle is bound to.
@@ -9084,12 +9191,10 @@ unsafe fn grasm_tcp_read_bytes_now(handle: *mut RtVal) -> *mut RtVal {
         _ => return err_of(io_err("IoFailed", "handle must be an integer".to_string())),
     };
     let read = socket_with(h, |s| match s {
-        Socket::Stream(stream) => {
-            match read_sized(|b| stream.read(b).map(|n| (n, ()))) {
-                Ok((buf, ())) => Ok(buf),
-                Err(e) => Err(e.to_string()),
-            }
-        }
+        Socket::Stream(stream) => match read_sized(|b| stream.read(b).map(|n| (n, ()))) {
+            Ok((buf, ())) => Ok(buf),
+            Err(e) => Err(e.to_string()),
+        },
         Socket::Listener(_) => Err(format!("socket {h} is a listener, not a connection")),
         Socket::Datagram(_) => Err(format!(
             "socket {h} is a datagram socket — use udp_recv, which keeps message boundaries"
@@ -9126,9 +9231,7 @@ unsafe fn grasm_tcp_write_bytes_now(handle: *mut RtVal, data: *mut RtVal) -> *mu
     let wrote = socket_with(h, |s| match s {
         // Unbuffered, so there is nothing to flush after the write: `send`
         // has already handed the bytes to the kernel.
-        Socket::Stream(stream) => stream
-            .write_all(&payload)
-            .map_err(|e| e.to_string()),
+        Socket::Stream(stream) => stream.write_all(&payload).map_err(|e| e.to_string()),
         Socket::Listener(_) => Err(format!("socket {h} is a listener, not a connection")),
         Socket::Datagram(_) => Err(format!(
             "socket {h} is a datagram socket — use udp_send, which needs a destination"
@@ -9161,9 +9264,7 @@ unsafe fn grasm_tcp_write_now(handle: *mut RtVal, data: *mut RtVal) -> *mut RtVa
     let text = as_str(data).to_string();
     let wrote = socket_with(h, |s| match s {
         // Unbuffered, as in `tcp_send_bytes` above.
-        Socket::Stream(stream) => stream
-            .write_all(text.as_bytes())
-            .map_err(|e| e.to_string()),
+        Socket::Stream(stream) => stream.write_all(text.as_bytes()).map_err(|e| e.to_string()),
         Socket::Listener(_) => Err(format!("socket {h} is a listener, not a connection")),
         Socket::Datagram(_) => Err(format!(
             "socket {h} is a datagram socket — use udp_send, which needs a destination"
@@ -9198,7 +9299,6 @@ pub unsafe extern "C" fn grasm_proc_pipeline(stages: *mut RtVal, input: *mut RtV
 }
 
 unsafe fn grasm_proc_pipeline_now(stages: *mut RtVal, input: *mut RtVal) -> *mut RtVal {
-
     let RtPayload::List(items) = &(*stages).payload else {
         return err_of(io_err(
             "IoFailed",
@@ -9241,10 +9341,7 @@ unsafe fn grasm_proc_pipeline_now(stages: *mut RtVal, input: *mut RtVal) -> *mut
     for (i, (program, argv)) in plan.iter().enumerate() {
         let is_last = i + 1 == plan.len();
 
-        let give_up = |message: String,
-                           pids: Vec<i32>,
-                           open: &[i32]|
-         -> *mut RtVal {
+        let give_up = |message: String, pids: Vec<i32>, open: &[i32]| -> *mut RtVal {
             // Everything already started is killed and reaped, so a pipeline
             // that fails halfway leaves nothing running.
             for pid in pids {
@@ -9259,13 +9356,7 @@ unsafe fn grasm_proc_pipeline_now(stages: *mut RtVal, input: *mut RtVal) -> *mut
 
         let out = match new_pipe() {
             Ok(p) => p,
-            Err(e) => {
-                return give_up(
-                    format!("{program}: {e}"),
-                    pids,
-                    &[from_previous, to_first],
-                )
-            }
+            Err(e) => return give_up(format!("{program}: {e}"), pids, &[from_previous, to_first]),
         };
         // Only the last stage's stderr is answered with. An earlier stage's
         // goes to this program's own stderr rather than being discarded: a
@@ -9303,13 +9394,7 @@ unsafe fn grasm_proc_pipeline_now(stages: *mut RtVal, input: *mut RtVal) -> *mut
             from_previous
         };
 
-        let started = start(
-            program,
-            argv,
-            Some(stdin_fd),
-            Some(out.writer),
-            err_writer,
-        );
+        let started = start(program, argv, Some(stdin_fd), Some(out.writer), err_writer);
 
         // The parent's copies go now: a reader sees no end of file while any
         // writer is open, its own included.
@@ -9364,8 +9449,12 @@ unsafe fn grasm_proc_pipeline_now(stages: *mut RtVal, input: *mut RtVal) -> *mut
     }
     let fields = vec![
         alloc(RtPayload::I64(code)),
-        alloc(RtPayload::Str(RtStr::of(&String::from_utf8_lossy(&got_out)))),
-        alloc(RtPayload::Str(RtStr::of(&String::from_utf8_lossy(&got_err)))),
+        alloc(RtPayload::Str(RtStr::of(&String::from_utf8_lossy(
+            &got_out,
+        )))),
+        alloc(RtPayload::Str(RtStr::of(&String::from_utf8_lossy(
+            &got_err,
+        )))),
     ];
     ok_of(alloc(RtPayload::Tuple(fields.into())))
 }
@@ -9595,12 +9684,10 @@ unsafe fn grasm_udp_recv_now(handle: *mut RtVal) -> *mut RtVal {
         _ => return err_of(io_err("IoFailed", "handle must be an integer".to_string())),
     };
     let got = socket_with(h, |s| match s {
-        Socket::Datagram(d) => {
-            match read_sized(|b| d.recv_from(b)) {
-                Ok((buf, _)) => Ok(buf),
-                Err(e) => Err(e.to_string()),
-            }
-        }
+        Socket::Datagram(d) => match read_sized(|b| d.recv_from(b)) {
+            Ok((buf, _)) => Ok(buf),
+            Err(e) => Err(e.to_string()),
+        },
         _ => Err(format!("socket {h} is not a datagram socket")),
     });
     match got {
@@ -9629,12 +9716,10 @@ unsafe fn grasm_udp_recv_from_now(handle: *mut RtVal) -> *mut RtVal {
         _ => return err_of(io_err("IoFailed", "handle must be an integer".to_string())),
     };
     let got = socket_with(h, |s| match s {
-        Socket::Datagram(d) => {
-            match read_sized(|b| d.recv_from(b)) {
-                Ok((buf, from)) => Ok((buf, from.ip_text(), i64::from(from.port()))),
-                Err(e) => Err(e.to_string()),
-            }
-        }
+        Socket::Datagram(d) => match read_sized(|b| d.recv_from(b)) {
+            Ok((buf, from)) => Ok((buf, from.ip_text(), i64::from(from.port()))),
+            Err(e) => Err(e.to_string()),
+        },
         _ => Err(format!("socket {h} is not a datagram socket")),
     });
     match got {
@@ -10054,7 +10139,11 @@ fn str_of_bytes(b: &[u8]) -> RtStr {
 ///
 /// # Safety: boxed values.
 #[no_mangle]
-pub unsafe extern "C" fn grasm_bytes_slice_to_str(v: *mut RtVal, from: i64, end: i64) -> *mut RtVal {
+pub unsafe extern "C" fn grasm_bytes_slice_to_str(
+    v: *mut RtVal,
+    from: i64,
+    end: i64,
+) -> *mut RtVal {
     let b = as_bytes(v);
     if from < 0 || end < from || end as usize > b.len() {
         rt_panic(&format!(
@@ -10644,12 +10733,10 @@ pub unsafe extern "C" fn grasm_list_min_max(v: *mut RtVal, want_max: i8) -> *mut
 
 /// Names outlive the values that carry them, and a journal holds few of them.
 fn interned(text: &str) -> &'static str {
-    use hashbrown::HashMap;
     use crate::sync::{Mutex, OnceLock};
+    use hashbrown::HashMap;
     static NAMES: OnceLock<Mutex<HashMap<String, &'static str>>> = OnceLock::new();
-    let mut map = NAMES
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock();
+    let mut map = NAMES.get_or_init(|| Mutex::new(HashMap::new())).lock();
     if let Some(s) = map.get(text) {
         return s;
     }
@@ -10741,9 +10828,9 @@ unsafe fn journaled(name: &str, body: impl FnOnce() -> *mut RtVal) -> *mut RtVal
 #[cfg(test)]
 mod small_string_tests {
     // `std`'s prelude is gone; tests need `alloc`'s names explicitly.
+    use crate::RtStr;
     #[allow(unused_imports)]
     use alloc::{format, string::String, string::ToString, vec, vec::Vec};
-    use crate::RtStr;
 
     /// The inline and heap paths must be indistinguishable to every reader.
     #[test]
@@ -10945,9 +11032,9 @@ pub unsafe extern "C" fn grasm_range_inclusive(r: *mut RtVal) -> i8 {
 #[cfg(test)]
 mod scalar_kind_tests {
     // `std`'s prelude is gone; tests need `alloc`'s names explicitly.
+    use super::ScalarKind;
     #[allow(unused_imports)]
     use alloc::{format, string::String, string::ToString, vec, vec::Vec};
-    use super::ScalarKind;
 
     /// The two directions agree. They are read by different sides of the ABI —
     /// the backend writes a number, the runtime reads one — so a mapping that
@@ -11081,11 +11168,11 @@ pub unsafe extern "C" fn grasm_handler_install(h: *mut RtVal) {
 #[cfg(test)]
 mod maphash_tests {
     // `std`'s prelude is gone; tests need `alloc`'s names explicitly.
+    use super::maphash::MapHash;
     #[allow(unused_imports)]
     use alloc::{format, string::String, string::ToString, vec, vec::Vec};
-    use super::maphash::MapHash;
-    use hashbrown::HashSet;
     use core::hash::{BuildHasher, Hash};
+    use hashbrown::HashSet;
 
     fn hash_of<T: Hash>(b: &MapHash, v: &T) -> u64 {
         b.hash_one(v)
@@ -11218,9 +11305,9 @@ mod poison_tests {
 #[cfg(test)]
 mod layout_tests {
     // `std`'s prelude is gone; tests need `alloc`'s names explicitly.
+    use super::*;
     #[allow(unused_imports)]
     use alloc::{format, string::String, string::ToString, vec, vec::Vec};
-    use super::*;
 
     /// The offsets in `layout`, measured on real values: a reordering of a
     /// variant or a field moves these, and this is where it would show.
@@ -11229,7 +11316,8 @@ mod layout_tests {
         unsafe {
             let a = grasm_box_i64(1_000_000_007);
             let b = grasm_box_i64(2_000_000_011);
-            let ty: &'static StructTy = Box::leak(Box::new(StructTy::of("P", vec!["a", "b"], vec![0, 0])));
+            let ty: &'static StructTy =
+                Box::leak(Box::new(StructTy::of("P", vec!["a", "b"], vec![0, 0])));
             let s = alloc(RtPayload::Struct {
                 ty,
                 fields: StructFields::from_values(vec![a, b]),
@@ -11238,8 +11326,14 @@ mod layout_tests {
             assert_eq!(*sb.add(layout::PAYLOAD_TAG), layout::TAG_STRUCT);
             assert_eq!(*sb.add(layout::STRUCT_FIELDS_TAG), layout::INLINE);
             assert_eq!(*sb.add(layout::STRUCT_INLINE_LEN), 2);
-            assert_eq!(*(sb.add(layout::STRUCT_INLINE_VALS) as *const *mut RtVal), a);
-            assert_eq!(*(sb.add(layout::STRUCT_INLINE_VALS + 8) as *const *mut RtVal), b);
+            assert_eq!(
+                *(sb.add(layout::STRUCT_INLINE_VALS) as *const *mut RtVal),
+                a
+            );
+            assert_eq!(
+                *(sb.add(layout::STRUCT_INLINE_VALS + 8) as *const *mut RtVal),
+                b
+            );
             let l = alloc(RtPayload::List(ListData::Inline {
                 len: 2,
                 vals: [b, a, core::ptr::null_mut(), core::ptr::null_mut()],
@@ -11261,17 +11355,27 @@ mod layout_tests {
             assert_eq!(*(vec_at.add(vl) as *const usize), 2);
             assert_eq!(*(*(vec_at.add(vp) as *const *const i64)).add(1), 6);
             let ty: &'static StructTy = Box::leak(Box::new(StructTy::of("V", vec!["a"], vec![0])));
-            let lv = alloc(RtPayload::ListVals { ty, words: vec![4, 5] });
+            let lv = alloc(RtPayload::ListVals {
+                ty,
+                words: vec![4, 5],
+            });
             let lvb = lv as *const u8;
             assert_eq!(*lvb.add(layout::PAYLOAD_TAG), layout::TAG_LIST_VALS);
             let (vp2, vl2, _) = vec_layout();
-            assert_eq!(*(lvb.add(24 + vl2) as *const usize), 2, "ListVals keeps its Vec at 24");
+            assert_eq!(
+                *(lvb.add(24 + vl2) as *const usize),
+                2,
+                "ListVals keeps its Vec at 24"
+            );
             assert_eq!(*(*(lvb.add(24 + vp2) as *const *const i64)).add(1), 5);
             let by = alloc(RtPayload::Bytes(RtBytes::new(vec![7, 8, 9])));
             let bb = by as *const u8;
             assert_eq!(*bb.add(layout::PAYLOAD_TAG), layout::TAG_BYTES);
             assert_eq!(*(bb.add(layout::BYTES_LEN) as *const usize), 3);
-            assert_eq!(*(*(bb.add(layout::BYTES_PTR) as *const *const u8)).add(2), 9);
+            assert_eq!(
+                *(*(bb.add(layout::BYTES_PTR) as *const *const u8)).add(2),
+                9
+            );
             assert_eq!((*s).rc.load(Relaxed), 1);
             assert_eq!(*(sb as *const i64), 1, "the count is the first word");
         }
@@ -11281,9 +11385,9 @@ mod layout_tests {
 #[cfg(test)]
 mod value_list_tests {
     // `std`'s prelude is gone; tests need `alloc`'s names explicitly.
+    use super::*;
     #[allow(unused_imports)]
     use alloc::{format, string::String, string::ToString, vec, vec::Vec};
-    use super::*;
 
     fn live() -> i64 {
         LOCAL.with(|l| l.live.get())
@@ -11295,9 +11399,16 @@ mod value_list_tests {
     #[test]
     fn value_list_owns_its_boxed_fields() {
         unsafe {
-            let ty: &'static StructTy = Box::leak(Box::new(StructTy::of("N", vec!["v", "s"], vec![FK_I64, FK_BOXED])));
+            let ty: &'static StructTy = Box::leak(Box::new(StructTy::of(
+                "N",
+                vec!["v", "s"],
+                vec![FK_I64, FK_BOXED],
+            )));
             let before = live();
-            let mut l = alloc(RtPayload::ListVals { ty, words: Vec::new() });
+            let mut l = alloc(RtPayload::ListVals {
+                ty,
+                words: Vec::new(),
+            });
             for k in 0..5i64 {
                 let s = alloc(RtPayload::Str(RtStr::of(&format!("s{k}"))));
                 let el = [k * 10, s as i64];

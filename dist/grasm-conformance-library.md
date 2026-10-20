@@ -1,6 +1,6 @@
 # Grasm — conformance programs: library
 
-The standard library. 59 executable program(s), one per normative clause of
+The standard library. 60 executable program(s), one per normative clause of
 `grasm-language-pack.md`. Each header states the tag it demonstrates and the
 exact expected behaviour, and every one is run by `cargo test -p grasm_spec`, so
 a program here cannot describe behaviour the implementation does not have.
@@ -993,6 +993,31 @@ fn main() / {io} {
     // Leave nothing behind: running the suite twice is the same as once.
     let _rb = remove_file(dir + "/b.txt") ?? ()
     let _rc = remove_file(dir + "/c.txt") ?? ()
+}
+```
+
+## `L-LIB-INT-CONV.gr`
+
+```grasm
+//! tag: L-LIB-INT-CONV
+//! expect: output
+//! 4464 None Some(200) 70000
+//! 255 0 -128
+//! None Some(254) 255 0
+// Conversions between integer widths, and the operations that report or
+// clamp an out-of-range result instead of wrapping it.
+fn main() {
+    let big = 70000
+    let small = 200
+    let a: u16 = big.as_u16()
+    print("{a} {big.try_u16()} {small.try_u8()} {big.as_i64()}")
+    let f = 300.7
+    let g = 0.0 / 0.0
+    let h = -1000.5
+    print("{f.as_u8()} {g.as_u8()} {h.as_i8()}")
+    let b: u8 = 250
+    let one: u8 = 1
+    print("{b.checked_add(10)} {b.checked_add(4)} {b.saturating_add(10)} {one.saturating_sub(5)}")
 }
 ```
 

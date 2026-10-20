@@ -23,6 +23,7 @@
 import json
 import os
 import random
+import shutil
 import struct
 import subprocess
 import sys
@@ -505,4 +506,9 @@ thin = [k for k, (a, d) in families.items() if a + d < 100]
 if thin or len(families) < 12:
     print(f"too few cases to mean anything: {thin} ({len(families)} families)"); sys.exit(1)
 print(f"cases: {len(cases)}   agreeing: {agree}   differing: {differ}")
-sys.exit(1 if differ else 0)
+if differ:
+    print(f"files kept in {work}")
+    sys.exit(1)
+# A passing run leaves nothing behind: each one wrote 31 MB here.
+shutil.rmtree(work, ignore_errors=True)
+sys.exit(0)

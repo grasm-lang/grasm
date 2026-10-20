@@ -85,6 +85,10 @@ leaked=0
 skipped=0
 external=0
 timedout=0
+crashed=0
+early=0
+declare -a CRASHED=()
+declare -a EARLY=()
 declare -a SKIPPED=()
 declare -a LEAKS=()
 declare -a EXTERNAL=()
@@ -122,29 +126,82 @@ for src in $programs; do
         SKIPPED+=("$src — ${reason:-$(echo "$build_log" | head -1)}")
         continue
     fi
-    err=$(GRASM_LEAK_CHECK=1 $RUN_LIMIT "$bin" 2>&1 >/dev/null </dev/null)
-    code=$?
-    # Exit 7 is a leak and 0 is clean. 124 is neither: the program was
-    # stopped at its wall clock and never reached the check, so it leaked
-    # nothing only in the sense that it never finished. `else clean` counted
-    # it as leak-free.
-    if [ $code -eq 124 ]; then
+    ended=$(GRASM_LEAK_CHECK=1 python3 scripts/lib/exitkind.py "$RUN_LIMIT_SECONDS" "$bin" 2>"$WORK/err")
+    err=$(cat "$WORK/err")
+    code=${ended#exit }
+    # A timeout is neither leak nor clean: the program was stopped at its wall
+    # clock and never reached the check, so it leaked nothing only in the
+    # sense that it never finished. `else clean` counted it as leak-free.
+    #
+    # Clean is the runtime saying so: `main` returned, the check ran, and it
+    # printed that nothing was live. Exit 0 alone is not that -- `exit(0)`
+    # part-way through ends the process without the check -- and `else clean`
+    # used to count a segfault as leak-free too. A death by signal is a crash
+    # and fails. Any other way of ending before the check (a panic, an error
+    # out of `main`, `exit(n)`) is a program this gate did not check, and is
+    # counted and named as that.
+    if [ "$ended" = timeout ]; then
         timedout=$((timedout + 1))
         TIMEDOUT+=("$src")
         echo "TIMED OUT: $src after ${RUN_LIMIT_SECONDS}s"
-    elif [ $code -eq 7 ]; then
+    elif [ "${ended%% *}" = signal ]; then
+        crashed=$((crashed + 1))
+        CRASHED+=("$src — killed by ${ended}")
+    elif [ "$code" = 7 ] && grep -q '^leak: ' <<<"$err"; then
         leaked=$((leaked + 1))
         LEAKS+=("$src — $(grep -o 'leak: .*' <<<"$err" | head -1)")
-    else
+    elif [ "$code" = 0 ] && grep -q '^leak check: nothing live at exit$' <<<"$err"; then
         clean=$((clean + 1))
+    else
+        early=$((early + 1))
+        EARLY+=("$src — exit $code: $(tail -1 <<<"$err" | cut -c1-100)")
     fi
 done
 
 echo
 echo "=========================================="
 echo "leak-free: $clean   leaking: $leaked   not compiled: $skipped   \
-external: $external   timed out: $timedout"
+external: $external   timed out: $timedout   crashed: $crashed   \
+ended before the check: $early"
 echo "=========================================="
+
+# Programs that end before `main` returns on purpose, so the check cannot run
+# in them. Until 2026-10-19 all of these were counted leak-free. Each is here
+# for a reason, and a program not on the list that ends early fails the gate:
+# it is either a new way to stop that should be added with its reason, or a
+# program that used to return and now does not.
+#   spec/conformance/E-*, L-LIB-*, T-CONTRACT-*, T-REF-STALE: they exist to
+#     show a panic, an error out of `main`, or `exit(-1)`.
+#   *-demo that read a file or stdin: stdin is closed here, so they stop on
+#     their "not a ... file" error.
+#   cjktest, h2diff, httpsdiff: harnesses driven by arguments, given none.
+KNOWN_EARLY="
+spec/conformance/E-CHANNEL.gr spec/conformance/E-DEADLOCK.gr
+spec/conformance/E-DIV-ZERO.gr spec/conformance/E-INDEX-BOUNDS.gr
+spec/conformance/E-MAIN-ERR.gr spec/conformance/E-PANIC-TRACE.gr
+spec/conformance/E-POW-NEG.gr spec/conformance/E-TASK-PANIC.gr
+spec/conformance/L-LIB-BYTES-WRITE.gr spec/conformance/L-LIB-BYTES.gr
+spec/conformance/L-LIB-CODES.gr spec/conformance/L-LIB-EXIT.gr
+spec/conformance/L-LIB-REMOVE.gr spec/conformance/T-CONTRACT-ENSURES.gr
+spec/conformance/T-CONTRACT-REQUIRES.gr spec/conformance/T-REF-STALE.gr
+packages/image-demo/src/main.gr packages/pcfont-demo/src/main.gr
+packages/ron-demo/src/main.gr packages/tiff-demo/src/main.gr
+packages/webp-demo/src/main.gr packages/zstd-demo/src/main.gr
+packages/cjktest/src/main.gr packages/h2diff/src/main.gr
+packages/httpsdiff/src/main.gr
+"
+new_early=0
+if [ "$early" -gt 0 ]; then
+    echo
+    echo "these ended before main returned, so the check never ran:"
+    for entry in "${EARLY[@]}"; do
+        src="${entry%% —*}"
+        case " $(echo $KNOWN_EARLY) " in
+            *" $src "*) echo "  $entry" ;;
+            *) echo "  NEW: $entry"; new_early=$((new_early + 1)) ;;
+        esac
+    done
+fi
 
 # The list is empty: every program in the corpus frees everything it allocates,
 # so any leak at all is a regression and fails. It was a ratchet with one entry
@@ -185,6 +242,19 @@ if [ "$timedout" -gt 0 ]; then
     echo
     echo "these did not finish, so they were not checked for leaks:"
     printf '  %s\n' "${TIMEDOUT[@]}"
+    exit 1
+fi
+
+if [ "$new_early" -gt 0 ]; then
+    echo
+    echo "$new_early program(s) ended before the check and are not on the known list."
+    exit 1
+fi
+
+if [ "$crashed" -gt 0 ]; then
+    echo
+    echo "these died on a signal, so nothing about their leaks is known:"
+    printf '  %s\n' "${CRASHED[@]}"
     exit 1
 fi
 

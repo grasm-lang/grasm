@@ -83,9 +83,7 @@ pub fn format_src(src: &str) -> String {
             // A contract clause continues the signature above it, between the
             // `-> T` and the body's brace ([T-CONTRACT-REQUIRES]).
             let continues = |text: &str| {
-                text.starts_with('|')
-                    || text.starts_with('.')
-                    || contract_clause(text)
+                text.starts_with('|') || text.starts_with('.') || contract_clause(text)
             };
             let pipe_extra = if trimmed.starts_with("//") {
                 let next = lines[index + 1..]
@@ -934,7 +932,9 @@ fn contract_clause(text: &str) -> bool {
         text.strip_prefix(kw).is_some_and(|rest| {
             let rest = rest.trim_start();
             !(rest.starts_with('=') && !rest.starts_with("=="))
-                && !["+=", "-=", "*=", "/="].iter().any(|op| rest.starts_with(op))
+                && !["+=", "-=", "*=", "/="]
+                    .iter()
+                    .any(|op| rest.starts_with(op))
         })
     })
 }

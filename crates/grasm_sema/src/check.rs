@@ -99,6 +99,15 @@ pub struct Analysis {
     /// Spans are globally unique across a program — the loader gives each file
     /// a disjoint base — so the start offset identifies the literal.
     pub float_literals: std::collections::HashSet<u32>,
+    /// The width each fixed-width integer operation wraps to ([T-INT-FIXED]),
+    /// keyed by the span of the expression -- or the `x += …` statement --
+    /// that computes it, as an [`IntKind::tag`].
+    ///
+    /// The engines hold every integer in 64 bits and have no types of their
+    /// own, so an operation on two `u8`s computes the `i64` answer; this is
+    /// what tells them to wrap it to eight bits. An `i64` program has nothing
+    /// in it and pays nothing for it.
+    pub narrow_ints: std::collections::HashMap<(u32, u32), u8>,
     /// Start offsets of expressions that give the bare ok half where the whole
     /// `T ! E` is wanted, and so have to be wrapped in `Ok` at run time.
     ///
@@ -552,6 +561,17 @@ fn check_modules_in(
             ),
         );
     }
+    // Every expression the checker settled on a fixed-width integer type,
+    // plus the compound assignments, which are statements.
+    let mut narrow_ints: std::collections::HashMap<(u32, u32), u8> = c
+        .resolved_types
+        .iter()
+        .filter_map(|(k, t)| match c.uni.resolve(t) {
+            Type::Int(kind) => Some((*k, kind.tag())),
+            _ => None,
+        })
+        .collect();
+    narrow_ints.extend(c.narrow_assigns.iter().map(|(k, kind)| (*k, kind.tag())));
     // Rendered before `c.diags` is moved out, since `show` borrows `c`.
     let resolved_types: SpanMap<String> = c
         .resolved_types
@@ -605,6 +625,7 @@ fn check_modules_in(
             })
             .collect(),
         float_literals: c.float_literals,
+        narrow_ints,
         value_rows: c.value_rows.clone(),
         callee_rows: c.callee_rows.clone(),
         field_calls: c.field_calls.clone(),
@@ -773,6 +794,8 @@ struct Checker {
     /// Integer literals promoted to `f64`, by span start. See
     /// `Analysis::float_literals`.
     float_literals: std::collections::HashSet<u32>,
+    /// `x += …` statements whose target is a fixed-width integer.
+    narrow_assigns: std::collections::HashMap<(u32, u32), IntKind>,
     /// The effect row of every expression whose type is a function, keyed by
     /// its whole span. See `record_value_row`.
     value_rows: SpanMap<std::collections::BTreeSet<String>>,
@@ -1011,6 +1034,7 @@ impl Checker {
             region_floors: Vec::new(),
             extern_names: std::collections::HashSet::new(),
             float_literals: std::collections::HashSet::new(),
+            narrow_assigns: std::collections::HashMap::new(),
             value_rows: SpanMap::default(),
             callee_rows: SpanMap::default(),
             field_calls: SpanSet::default(),
@@ -1147,10 +1171,14 @@ if you own neither, ask whichever is yours to prefix its types",
                 continue;
             }
             if !t.generics.is_empty() || !matches!(t.body, grasm_syntax::ast::TypeBody::Struct(_)) {
-                self.error(t.name.span, "a `linear type` is a struct with no type parameters");
+                self.error(
+                    t.name.span,
+                    "a `linear type` is a struct with no type parameters",
+                );
                 continue;
             }
-            self.linear_types.insert(t.name.name.clone(), self.current_module.clone());
+            self.linear_types
+                .insert(t.name.name.clone(), self.current_module.clone());
         }
     }
 
@@ -1162,9 +1190,17 @@ if you own neither, ask whichever is yours to prefix its types",
             if t.is_linear {
                 continue;
             }
-            let grasm_syntax::ast::TypeBody::Struct(fields) = &t.body else { continue };
+            let grasm_syntax::ast::TypeBody::Struct(fields) = &t.body else {
+                continue;
+            };
             for fd in fields {
-                let ty = self.resolve_type(&fd.ty, &t.generics.iter().map(|g| g.name.clone()).collect::<Vec<_>>());
+                let ty = self.resolve_type(
+                    &fd.ty,
+                    &t.generics
+                        .iter()
+                        .map(|g| g.name.clone())
+                        .collect::<Vec<_>>(),
+                );
                 if self.is_linear(&ty) || self.holds_linear(&ty) {
                     self.error_help(
                         fd.span,
@@ -1712,7 +1748,7 @@ nothing says who owns it, how long it lives, or how long it is"
     /// register, and a silent width mismatch at an FFI boundary is the kind of
     /// bug that shows up as garbage three calls later.
     fn is_c_abi_type(t: &Type) -> bool {
-        matches!(t, Type::I64 | Type::F64)
+        matches!(t, Type::I64 | Type::Int(_) | Type::F64)
     }
 
     /// What may cross *into* C.
@@ -1723,7 +1759,10 @@ nothing says who owns it, how long it lives, or how long it is"
     /// returned pointer is the opposite — nothing says who owns it, how long it
     /// lives, or how long it is — so that stays refused ([T-EXTERN-POINTER]).
     fn is_c_param_type(t: &Type) -> bool {
-        matches!(t, Type::I64 | Type::F64 | Type::Str | Type::Bytes)
+        matches!(
+            t,
+            Type::I64 | Type::Int(_) | Type::F64 | Type::Str | Type::Bytes
+        )
     }
 
     /// The name an `impl` is keyed by for a type, if the type can have one:
@@ -1731,6 +1770,7 @@ nothing says who owns it, how long it lives, or how long it is"
     fn impl_key(&self, t: &Type) -> Option<String> {
         match t {
             Type::I64 => Some("i64".to_string()),
+            Type::Int(k) => Some(k.name().to_string()),
             Type::F64 => Some("f64".to_string()),
             Type::Bool => Some("bool".to_string()),
             Type::Str => Some("str".to_string()),
@@ -1757,7 +1797,10 @@ nothing says who owns it, how long it lives, or how long it is"
                     if !seen.insert(m.name.name.clone()) {
                         self.error(
                             m.name.span,
-                            format!("interface `{}` declares `{}` twice", i.name.name, m.name.name),
+                            format!(
+                                "interface `{}` declares `{}` twice",
+                                i.name.name, m.name.name
+                            ),
                         );
                     }
                     let first_is_self = m.params.first().is_some_and(|p| p.name.name == "self");
@@ -1780,7 +1823,12 @@ nothing says who owns it, how long it lives, or how long it is"
     fn collect_impls(&mut self, module: &Module) {
         for decl in &module.decls {
             let Decl::Impl(im) = decl else { continue };
-            let iname = im.iface.segments.last().map(|s| s.name.clone()).unwrap_or_default();
+            let iname = im
+                .iface
+                .segments
+                .last()
+                .map(|s| s.name.clone())
+                .unwrap_or_default();
             // An actor's methods ([E-ACTOR]): the parser lowered them as an
             // `impl` of an interface no program can name, so there is no
             // signature to hold them to -- only the calls to resolve.
@@ -1790,7 +1838,10 @@ nothing says who owns it, how long it lives, or how long it is"
                     let key = format!("{}::{lowered}", self.current_module);
                     let slot = (im.type_name.clone(), n.name.clone());
                     if self.impls.contains_key(&slot) {
-                        self.error(n.span, format!("actor `{}` has two methods `{}`", im.type_name, n.name));
+                        self.error(
+                            n.span,
+                            format!("actor `{}` has two methods `{}`", im.type_name, n.name),
+                        );
                         continue;
                     }
                     self.impls.insert(slot, (key, iname.clone()));
@@ -1863,11 +1914,12 @@ nothing says who owns it, how long it lives, or how long it is"
                     continue;
                 };
                 let key = format!("{}::{lowered}", self.current_module);
-                let Some(info) = self.fns.get(&key).cloned() else { continue };
+                let Some(info) = self.fns.get(&key).cloned() else {
+                    continue;
+                };
                 // `Self` is the shape the `impl` is for, so the `impl`'s own
                 // parameters have to be in scope to read it.
-                let gnames: Vec<String> =
-                    im.generics.iter().map(|g| g.name.clone()).collect();
+                let gnames: Vec<String> = im.generics.iter().map(|g| g.name.clone()).collect();
                 // The interface's signature with `Self` read as this type.
                 let want_params: Vec<Type> = m
                     .params
@@ -1940,8 +1992,7 @@ nothing says who owns it, how long it lives, or how long it is"
                     let shown = if allowed.is_empty() {
                         "performs nothing".to_string()
                     } else {
-                        let names: Vec<String> =
-                            allowed.iter().map(|a| format!("`{a}`")).collect();
+                        let names: Vec<String> = allowed.iter().map(|a| format!("`{a}`")).collect();
                         format!("performs {}", names.join(", "))
                     };
                     // At the `impl`'s own method, which is the one to change.
@@ -1993,7 +2044,11 @@ nothing says who owns it, how long it lives, or how long it is"
     ) -> Option<Type> {
         if let Type::Generic(i) = recv_res {
             let i = *i as usize;
-            let gname = self.current_generics.get(i).cloned().unwrap_or_else(|| "T".to_string());
+            let gname = self
+                .current_generics
+                .get(i)
+                .cloned()
+                .unwrap_or_else(|| "T".to_string());
             let bounds = self.current_bounds.get(i).cloned().unwrap_or_default();
             let found = bounds.iter().find_map(|b| {
                 self.interfaces
@@ -2030,13 +2085,26 @@ nothing says who owns it, how long it lives, or how long it is"
             // `Self` is this type parameter.
             let mut names = vec![String::new(); i + 1];
             names[i] = "Self".to_string();
-            let params: Vec<Type> =
-                sig.params.iter().skip(1).map(|p| self.resolve_type(&p.ty, &names)).collect();
-            let ret = sig.ret.as_ref().map(|t| self.resolve_type(t, &names)).unwrap_or(Type::Unit);
+            let params: Vec<Type> = sig
+                .params
+                .iter()
+                .skip(1)
+                .map(|p| self.resolve_type(&p.ty, &names))
+                .collect();
+            let ret = sig
+                .ret
+                .as_ref()
+                .map(|t| self.resolve_type(t, &names))
+                .unwrap_or(Type::Unit);
             if args.len() != params.len() {
                 return Some(self.error(
                     span,
-                    format!("`{}` takes {} argument(s), got {}", name.name, params.len(), args.len()),
+                    format!(
+                        "`{}` takes {} argument(s), got {}",
+                        name.name,
+                        params.len(),
+                        args.len()
+                    ),
                 ));
             }
             for (a, p) in args.iter().zip(&params) {
@@ -2047,7 +2115,9 @@ nothing says who owns it, how long it lives, or how long it is"
         }
         let key = self.impl_key(recv_res)?;
         let (qual, _) = self.impls.get(&(key, name.name.clone()))?.clone();
-        let (owner, fname) = qual.rsplit_once("::").map(|(a, b)| (a.to_string(), b.to_string()))?;
+        let (owner, fname) = qual
+            .rsplit_once("::")
+            .map(|(a, b)| (a.to_string(), b.to_string()))?;
         let info = self.fns.get(&qual).cloned()?;
         let mut full_args: Vec<Expr> = Vec::with_capacity(args.len() + 1);
         full_args.push(recv.clone());
@@ -2083,7 +2153,9 @@ nothing says who owns it, how long it lives, or how long it is"
                 _ => {
                     let key = self.impl_key(&t);
                     for i in &ifaces {
-                        let ok = key.as_ref().is_some_and(|k| self.impl_of.contains(&(i.clone(), k.clone())));
+                        let ok = key
+                            .as_ref()
+                            .is_some_and(|k| self.impl_of.contains(&(i.clone(), k.clone())));
                         if !ok {
                             let shown = self.show(&t);
                             self.error_help(
@@ -2133,14 +2205,19 @@ nothing says who owns it, how long it lives, or how long it is"
     /// names a linear binding ([T-LINEAR]).
     fn consume(&mut self, e: &Expr) {
         let Expr::Ident(id) = e else { return };
-        let Some(b) = self.lookup(&id.name) else { return };
+        let Some(b) = self.lookup(&id.name) else {
+            return;
+        };
         if b.moved || !self.is_linear(&b.ty) {
             return;
         }
         if !b.owned && b.kind == BindKind::Param {
             self.error_help(
                 id.span,
-                format!("cannot give away `{}`: it is lent to this function, not owned by it", id.name),
+                format!(
+                    "cannot give away `{}`: it is lent to this function, not owned by it",
+                    id.name
+                ),
                 "take the parameter as `own` to be able to consume it ([T-LINEAR])",
             );
             return;
@@ -2157,7 +2234,9 @@ nothing says who owns it, how long it lives, or how long it is"
                 // module is how that module ends one -- `close`, `commit` --
                 // so it owes nothing. Everywhere else it is owed like a local.
                 let ends_own_type = b.kind == BindKind::Param
-                    && self.linear_module_of(&b.ty).is_some_and(|m| m == self.current_module);
+                    && self
+                        .linear_module_of(&b.ty)
+                        .is_some_and(|m| m == self.current_module);
                 if b.owned && !b.moved && !ends_own_type && self.is_linear(&b.ty) {
                     owed.push((name.clone(), b.at, b.ty.clone()));
                 }
@@ -2205,12 +2284,16 @@ nothing says who owns it, how long it lives, or how long it is"
     }
 
     fn merge_linear(&mut self, branches: &[(MoveSnapshot, bool)], at: Span) {
-        let Some((first, _)) = branches.first() else { return };
+        let Some((first, _)) = branches.first() else {
+            return;
+        };
         for (si, scope) in first.iter().enumerate() {
             for (name, _) in scope {
-                let linear = self.scopes.get(si).and_then(|sc| sc.get(name)).is_some_and(|b| {
-                    b.owned && self.is_linear(&b.ty)
-                });
+                let linear = self
+                    .scopes
+                    .get(si)
+                    .and_then(|sc| sc.get(name))
+                    .is_some_and(|b| b.owned && self.is_linear(&b.ty));
                 if !linear {
                     continue;
                 }
@@ -2223,11 +2306,15 @@ nothing says who owns it, how long it lives, or how long it is"
                             .map(|(_, m)| *m)
                     })
                     .collect();
-                let Some(&first_vote) = votes.first() else { continue };
+                let Some(&first_vote) = votes.first() else {
+                    continue;
+                };
                 if votes.iter().any(|v| *v != first_vote) {
                     self.error_help(
                         at,
-                        format!("linear value `{name}` is consumed on one path here and not on another"),
+                        format!(
+                            "linear value `{name}` is consumed on one path here and not on another"
+                        ),
                         "every way through must consume it, or none may ([T-LINEAR])",
                     );
                 }
@@ -2256,13 +2343,21 @@ nothing says who owns it, how long it lives, or how long it is"
         let mut exprs: Vec<&Expr> = Vec::new();
         let mut ty: Option<Type> = None;
         for st in &body.stmts {
-            let Stmt::Spawn { body: task, .. } = st else { return false };
-            let [Stmt::Assign { target: Expr::Ident(v), op: AssignOp::Assign, value, .. }] =
-                task.stmts.as_slice()
+            let Stmt::Spawn { body: task, .. } = st else {
+                return false;
+            };
+            let [Stmt::Assign {
+                target: Expr::Ident(v),
+                op: AssignOp::Assign,
+                value,
+                ..
+            }] = task.stmts.as_slice()
             else {
                 return false;
             };
-            let Some(b) = self.lookup(&v.name) else { return false };
+            let Some(b) = self.lookup(&v.name) else {
+                return false;
+            };
             let t = self.uni.resolve(&b.ty);
             match &ty {
                 None => ty = Some(t),
@@ -2276,15 +2371,14 @@ nothing says who owns it, how long it lives, or how long it is"
             exprs.push(value);
         }
         exprs.iter().enumerate().all(|(i, e)| {
-            self.pure_task_expr(e)
-                && {
-                    let mut names = Vec::new();
-                    crate::check::idents_in(e, &mut names);
-                    targets
-                        .iter()
-                        .enumerate()
-                        .all(|(j, t)| j == i || !names.contains(t))
-                }
+            self.pure_task_expr(e) && {
+                let mut names = Vec::new();
+                crate::check::idents_in(e, &mut names);
+                targets
+                    .iter()
+                    .enumerate()
+                    .all(|(j, t)| j == i || !names.contains(t))
+            }
         })
     }
 
@@ -2295,7 +2389,9 @@ nothing says who owns it, how long it lives, or how long it is"
             Expr::Unary { expr, .. } => self.pure_task_expr(expr),
             Expr::Binary { lhs, rhs, .. } => self.pure_task_expr(lhs) && self.pure_task_expr(rhs),
             Expr::Call { callee, args, .. } => {
-                let Expr::Ident(f) = &**callee else { return false };
+                let Expr::Ident(f) = &**callee else {
+                    return false;
+                };
                 if self.lookup(&f.name).is_some() {
                     return false;
                 }
@@ -2358,7 +2454,11 @@ different name, or call it as a method if you meant to extend a type (UFCS)",
                 for (g, bs) in f.generics.iter().zip(&f.bounds) {
                     let mut names = Vec::new();
                     for b in bs {
-                        let iname = b.segments.last().map(|s| s.name.clone()).unwrap_or_default();
+                        let iname = b
+                            .segments
+                            .last()
+                            .map(|s| s.name.clone())
+                            .unwrap_or_default();
                         if !self.interfaces.contains_key(&iname) {
                             self.error(
                                 b.span,
@@ -2462,9 +2562,26 @@ different name, or call it as a method if you meant to extend a type (UFCS)",
                     return Type::Generic(i as u32);
                 }
                 let prim = match name.as_str() {
-                    "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64" | "usize"
-                    | "int" => Some(Type::I64),
-                    "f32" | "f64" | "float" => Some(Type::F64),
+                    // [T-INT-FIXED]: each its own type, wrapping at its width.
+                    "i8" | "i16" | "i32" | "u8" | "u16" | "u32" => {
+                        IntKind::from_name(name).map(Type::Int)
+                    }
+                    "i64" | "int" => Some(Type::I64),
+                    // These used to be silent aliases, and a silent alias is a
+                    // promise broken without a word: `u64` arithmetic was
+                    // signed, `f32` was a double. Refused until they are real.
+                    "u64" | "usize" | "f32" => {
+                        let (what, instead) = match name.as_str() {
+                            "f32" => ("single-precision floating point", "f64"),
+                            _ => ("unsigned 64-bit arithmetic", "i64"),
+                        };
+                        return self.error_help(
+                            *span,
+                            format!("`{name}` is not implemented yet: Grasm does not have {what}"),
+                            format!("it used to be another name for `{instead}` and behaved like one; write `{instead}` ([T-INT-FIXED])"),
+                        );
+                    }
+                    "f64" | "float" => Some(Type::F64),
                     "bool" => Some(Type::Bool),
                     "str" => Some(Type::Str),
                     "bytes" => Some(Type::Bytes),
@@ -3286,7 +3403,10 @@ is a failure nothing reports",
                 Type::Unit
             }
             Stmt::Assign {
-                target, op, value, ..
+                target,
+                op,
+                value,
+                span,
             } => {
                 // Re-initializing a moved variable revives it -- unless what
                 // it holds is linear and still owed ([T-LINEAR]): the write
@@ -3328,8 +3448,14 @@ is a failure nothing reports",
                     // Compound: numeric (or str for +=).
                     self.check_expr(value, &target_ty);
                     let t = self.uni.shallow_resolve(&target_ty);
-                    let ok = matches!(t, Type::I64 | Type::F64 | Type::Error)
+                    let ok = matches!(t, Type::I64 | Type::Int(_) | Type::F64 | Type::Error)
                         || (t == Type::Str && *op == AssignOp::Add);
+                    // `x += 1` on a `u8` wraps like `x = x + 1` does; the
+                    // statement is not an expression, so its width is
+                    // recorded by hand for the engines.
+                    if let Type::Int(k) = t {
+                        self.narrow_assigns.insert((span.start, span.end), k);
+                    }
                     if !ok {
                         let shown = self.show(&target_ty);
                         self.error(
@@ -3711,7 +3837,13 @@ closing brace — yield a number from the region and return that",
             // `own r: ref N` consumed the caller's, which is neither what the
             // clause says nor useful: the point of a reference is that several
             // places hold it.
-            Type::I64 | Type::F64 | Type::Bool | Type::Unit | Type::Range | Type::Ref(_)
+            Type::I64
+                | Type::Int(_)
+                | Type::F64
+                | Type::Bool
+                | Type::Unit
+                | Type::Range
+                | Type::Ref(_)
         )
     }
 
@@ -3762,20 +3894,31 @@ closing brace — yield a number from the region and return that",
             Type::Ref(inner) => !want_fn || self.carries_in(&inner, want_fn, actors_ok, seen),
             Type::Fn { params, ret, .. } => {
                 want_fn
-                    || params.iter().any(|p| self.carries_in(p, want_fn, actors_ok, seen))
+                    || params
+                        .iter()
+                        .any(|p| self.carries_in(p, want_fn, actors_ok, seen))
                     || self.carries_in(&ret, want_fn, actors_ok, seen)
             }
             Type::List(e) => self.carries_in(&e, want_fn, actors_ok, seen),
-            Type::Map(k, v) => self.carries_in(&k, want_fn, actors_ok, seen) || self.carries_in(&v, want_fn, actors_ok, seen),
-            Type::Tuple(items) => items.iter().any(|i| self.carries_in(i, want_fn, actors_ok, seen)),
+            Type::Map(k, v) => {
+                self.carries_in(&k, want_fn, actors_ok, seen)
+                    || self.carries_in(&v, want_fn, actors_ok, seen)
+            }
+            Type::Tuple(items) => items
+                .iter()
+                .any(|i| self.carries_in(i, want_fn, actors_ok, seen)),
             Type::Fallible(a, b) => {
-                self.carries_in(&a, want_fn, actors_ok, seen) || self.carries_in(&b, want_fn, actors_ok, seen)
+                self.carries_in(&a, want_fn, actors_ok, seen)
+                    || self.carries_in(&b, want_fn, actors_ok, seen)
             }
             Type::Named { id, args } => {
                 if actors_ok && self.actor_types.contains(&self.defs.get(id).name) {
                     return false;
                 }
-                if args.iter().any(|a| self.carries_in(a, want_fn, actors_ok, seen)) {
+                if args
+                    .iter()
+                    .any(|a| self.carries_in(a, want_fn, actors_ok, seen))
+                {
                     return true;
                 }
                 // A recursive type is reached twice; the second visit answers
@@ -3793,7 +3936,9 @@ closing brace — yield a number from the region and return that",
                         .flat_map(|v| v.fields.iter().map(|(_, t)| t.clone()))
                         .collect(),
                 };
-                let found = inner.iter().any(|t| self.carries_in(t, want_fn, actors_ok, seen));
+                let found = inner
+                    .iter()
+                    .any(|t| self.carries_in(t, want_fn, actors_ok, seen));
                 seen.pop();
                 found
             }
@@ -4474,6 +4619,35 @@ write back to — copy it into a local first, as in `var {} = {}`",
             self.float_literals.insert(e.span().start);
             return;
         }
+        // [T-INT-FIXED]: a literal takes the fixed-width type it is written
+        // against, if it fits. It is the same number in every engine, so
+        // nothing needs recording beyond the type itself.
+        if let (Expr::Int(v, sp), Type::Int(k)) = (e, &want) {
+            if !k.fits(*v) {
+                self.literal_out_of_range(*sp, *v, *k);
+            }
+            self.resolved_types.insert((sp.start, sp.end), want.clone());
+            return;
+        }
+        if let (
+            Expr::Unary {
+                op: UnaryOp::Neg,
+                expr,
+                span: nsp,
+            },
+            Type::Int(k),
+        ) = (e, &want)
+        {
+            if let Expr::Int(v, _) = **expr {
+                let n = v.wrapping_neg();
+                if !k.fits(n) {
+                    self.literal_out_of_range(*nsp, n, *k);
+                }
+                self.resolved_types
+                    .insert((nsp.start, nsp.end), want.clone());
+                return;
+            }
+        }
         if let (
             Expr::Unary {
                 op: UnaryOp::Neg,
@@ -4615,7 +4789,10 @@ write back to — copy it into a local first, as in `var {} = {}`",
                 };
                 let after_else = self.moved_snapshot();
                 self.merge_branches(
-                    vec![(after_then, block_leaves(then_block)), (after_else, else_leaves)],
+                    vec![
+                        (after_then, block_leaves(then_block)),
+                        (after_else, else_leaves),
+                    ],
                     e.span(),
                 );
                 return;
@@ -4733,6 +4910,12 @@ write back to — copy it into a local first, as in `var {} = {}`",
                     span,
                     format!("type mismatch: expected `{w}`, found `{g}`"),
                     "a value that cannot fail is written `Ok(...)` here; in a `match`, either wrap the arms that cannot fail or add `try` to the ones that can, so every arm is the same shape",
+                );
+            } else if let Some(help) = int_mix_help(&got_r, &self.uni.shallow_resolve(want)) {
+                self.error_help(
+                    span,
+                    format!("type mismatch: expected `{w}`, found `{g}`"),
+                    help,
                 );
             } else if matches!(
                 (&got_r, self.uni.shallow_resolve(want)),
@@ -5077,7 +5260,10 @@ allocates could outlive it — move the work out of the region, or yield a numbe
                 UnaryOp::Neg => {
                     let t = self.infer_expr(expr);
                     let r = self.uni.shallow_resolve(&t);
-                    if matches!(r, Type::I64 | Type::F64 | Type::Var(_) | Type::Error) {
+                    if matches!(
+                        r,
+                        Type::I64 | Type::Int(_) | Type::F64 | Type::Var(_) | Type::Error
+                    ) {
                         if let Type::Var(_) = r {
                             self.uni.unify(&t, &Type::I64);
                             return Type::I64;
@@ -5288,7 +5474,13 @@ is a failure nothing reports",
                 let r = self.uni.resolve(&t);
                 if !matches!(
                     r,
-                    Type::Unit | Type::I64 | Type::F64 | Type::Bool | Type::Var(_) | Type::Error
+                    Type::Unit
+                        | Type::I64
+                        | Type::Int(_)
+                        | Type::F64
+                        | Type::Bool
+                        | Type::Var(_)
+                        | Type::Error
                 ) {
                     let shown = self.show(&t);
                     self.error_help(
@@ -6042,16 +6234,23 @@ only a number or a `bool` can come out — compute what you need and yield that"
                             self.check_expr(n, &Type::I64);
                         }
                         let t = self.uni.fresh();
-                        return Type::Named { id: self.defs.chan_id, args: vec![t] };
+                        return Type::Named {
+                            id: self.defs.chan_id,
+                            args: vec![t],
+                        };
                     }
                     // The first of several channels a `chan_recv` would not
                     // wait on ([E-CHANNEL]).
                     "chan_select" => {
                         if args.len() != 1 {
-                            return self.error(span, "`chan_select` takes 1 argument, a list of channels");
+                            return self
+                                .error(span, "`chan_select` takes 1 argument, a list of channels");
                         }
                         let t = self.uni.fresh();
-                        let want = Type::List(Box::new(Type::Named { id: self.defs.chan_id, args: vec![t] }));
+                        let want = Type::List(Box::new(Type::Named {
+                            id: self.defs.chan_id,
+                            args: vec![t],
+                        }));
                         self.check_expr(&args[0], &want);
                         return Type::I64;
                     }
@@ -6065,7 +6264,10 @@ only a number or a `bool` can come out — compute what you need and yield that"
                             );
                         }
                         let t = self.uni.fresh();
-                        let chan = Type::Named { id: self.defs.chan_id, args: vec![t.clone()] };
+                        let chan = Type::Named {
+                            id: self.defs.chan_id,
+                            args: vec![t.clone()],
+                        };
                         self.check_expr(&args[0], &chan);
                         return match name {
                             "chan_send" => {
@@ -6084,7 +6286,10 @@ only a number or a `bool` can come out — compute what you need and yield that"
                                 }
                                 Type::Unit
                             }
-                            "chan_recv" => Type::Named { id: self.defs.option_id, args: vec![t] },
+                            "chan_recv" => Type::Named {
+                                id: self.defs.option_id,
+                                args: vec![t],
+                            },
                             _ => Type::Unit,
                         };
                     }
@@ -6514,9 +6719,9 @@ fail outside it",
             match mode {
                 ParamMode::Own => {
                     if let Expr::Ident(id) = a {
-                        let lent_linear = self
-                            .lookup(&id.name)
-                            .is_some_and(|b| !b.owned && b.kind == BindKind::Param && self.is_linear(&b.ty));
+                        let lent_linear = self.lookup(&id.name).is_some_and(|b| {
+                            !b.owned && b.kind == BindKind::Param && self.is_linear(&b.ty)
+                        });
                         if lent_linear {
                             self.error_help(
                                 id.span,
@@ -7056,8 +7261,7 @@ Perform the effect after the closing brace, or yield a number and do the work ou
         // typed first, `keep.push(Box{ f: || made })` reported "a function
         // value cannot be used inside a region" about `keep`, with help
         // asking for a closure written inside the region — which it was.
-        if self.region_depth > 0
-            && crate::builtins::MUTATING_METHODS.contains(&name.name.as_str())
+        if self.region_depth > 0 && crate::builtins::MUTATING_METHODS.contains(&name.name.as_str())
         {
             let mut root = recv;
             while let Expr::Field { recv, .. } | Expr::Index { recv, .. } = root {
@@ -7498,7 +7702,10 @@ Perform the effect after the closing brace, or yield a number and do the work ou
                     "sum" => {
                         check_arity(self, 0);
                         let r = self.uni.shallow_resolve(&elem);
-                        if !matches!(r, Type::I64 | Type::F64 | Type::Var(_) | Type::Error) {
+                        if !matches!(
+                            r,
+                            Type::I64 | Type::Int(_) | Type::F64 | Type::Var(_) | Type::Error
+                        ) {
                             let shown = self.show(&elem);
                             self.error(span, format!("cannot sum a list of `{shown}`"));
                         }
@@ -7878,64 +8085,108 @@ Perform the effect after the closing brace, or yield a number and do the work ou
                 _ => return None,
             },
             Type::Tuple(_) if name.name == "cmp" => return self.check_cmp(recv, args, span),
-            Type::I64 => match name.name.as_str() {
-                "cmp" => return self.check_cmp(recv, args, span),
-                "from_bits" => {
+            Type::I64 | Type::Int(_) => {
+                // Every integer type has the same methods, answering in its
+                // own type: `b.abs()` on a `u8` is a `u8` ([T-INT-FIXED]).
+                let me = recv_ty.clone();
+                let n = name.name.as_str();
+                // Conversions to another integer width: `as_u8` wraps, the
+                // way arithmetic does; `try_u8` answers `None` for a value
+                // that does not fit ([L-LIB-INT-CONV]).
+                if let Some(target) = n.strip_prefix("as_").and_then(IntKind::from_name) {
                     check_arity(self, 0);
-                    Type::F64
+                    return Some(Type::Int(target));
                 }
-                "as_f64" => {
+                if let Some(target) = n.strip_prefix("try_").and_then(IntKind::from_name) {
                     check_arity(self, 0);
-                    Type::F64
+                    return Some(self.defs.option_some(Type::Int(target)));
                 }
-                // The other half of `code_at`: a code point back to text.
-                "to_char" => {
-                    check_arity(self, 0);
-                    Type::Str
-                }
-                "abs" => {
-                    check_arity(self, 0);
-                    Type::I64
-                }
-                "min" | "max" => {
-                    if check_arity(self, 1) {
-                        self.check_expr(&args[0], &Type::I64);
+                match n {
+                    "cmp" => return self.check_cmp(recv, args, span),
+                    "from_bits" if me == Type::I64 => {
+                        check_arity(self, 0);
+                        Type::F64
                     }
-                    Type::I64
-                }
-                // Bit manipulation, as methods rather than operators
-                // ([L-LIB-BITS]). The three obvious symbols are all taken or
-                // ambiguous: `^` is exponentiation, `|` begins a closure and
-                // separates sum-type variants, and `&&` is already reported as
-                // "written `and`". Words would collide with the logical
-                // operators, which are `and`/`or`/`not` — so methods, which is
-                // what `.abs()` and `.cmp()` already are.
-                "bit_and" | "bit_or" | "bit_xor" | "shl" | "shr" | "ushr" => {
-                    if check_arity(self, 1) {
-                        self.check_expr(&args[0], &Type::I64);
+                    "as_f64" => {
+                        check_arity(self, 0);
+                        Type::F64
                     }
-                    Type::I64
-                }
-                "bit_not" => {
-                    check_arity(self, 0);
-                    Type::I64
-                }
-                "to_str" => {
-                    check_arity(self, 0);
-                    Type::Str
-                }
-                // Base ten is not the only base a systems program needs. Every
-                // protocol, hash, colour and permission mask is read and
-                // written in hex or binary, and those are the same programs
-                // that needed [L-LIB-BITS].
-                "to_base" => {
-                    if check_arity(self, 1) {
-                        self.check_expr(&args[0], &Type::I64);
+                    // Widening, so it never loses anything; on an `i64` it is
+                    // the value itself.
+                    "as_i64" => {
+                        check_arity(self, 0);
+                        Type::I64
                     }
-                    Type::Str
+                    // The other half of `code_at`: a code point back to text.
+                    "to_char" => {
+                        check_arity(self, 0);
+                        Type::Str
+                    }
+                    "abs" => {
+                        check_arity(self, 0);
+                        me
+                    }
+                    "min" | "max" => {
+                        if check_arity(self, 1) {
+                            self.check_expr(&args[0], &me);
+                        }
+                        me
+                    }
+                    // [L-LIB-INT-CONV]: `None` where the true result is out of
+                    // range, or the nearest end of the range.
+                    "checked_add" | "checked_sub" | "checked_mul" => {
+                        if check_arity(self, 1) {
+                            self.check_expr(&args[0], &me);
+                        }
+                        self.defs.option_some(me)
+                    }
+                    "saturating_add" | "saturating_sub" | "saturating_mul" => {
+                        if check_arity(self, 1) {
+                            self.check_expr(&args[0], &me);
+                        }
+                        me
+                    }
+                    // Bit manipulation, as methods rather than operators
+                    // ([L-LIB-BITS]). The three obvious symbols are all taken or
+                    // ambiguous: `^` is exponentiation, `|` begins a closure and
+                    // separates sum-type variants, and `&&` is already reported as
+                    // "written `and`". Words would collide with the logical
+                    // operators, which are `and`/`or`/`not` — so methods, which is
+                    // what `.abs()` and `.cmp()` already are.
+                    "bit_and" | "bit_or" | "bit_xor" => {
+                        if check_arity(self, 1) {
+                            self.check_expr(&args[0], &me);
+                        }
+                        me
+                    }
+                    // A shift count is a count, whatever the width shifted.
+                    "shl" | "shr" | "ushr" => {
+                        if check_arity(self, 1) {
+                            self.check_expr(&args[0], &Type::I64);
+                        }
+                        me
+                    }
+                    "bit_not" => {
+                        check_arity(self, 0);
+                        me
+                    }
+                    "to_str" => {
+                        check_arity(self, 0);
+                        Type::Str
+                    }
+                    // Base ten is not the only base a systems program needs. Every
+                    // protocol, hash, colour and permission mask is read and
+                    // written in hex or binary, and those are the same programs
+                    // that needed [L-LIB-BITS].
+                    "to_base" => {
+                        if check_arity(self, 1) {
+                            self.check_expr(&args[0], &Type::I64);
+                        }
+                        Type::Str
+                    }
+                    _ => return None,
                 }
-                _ => return None,
-            },
+            }
             Type::F64 => match name.name.as_str() {
                 "cmp" => return self.check_cmp(recv, args, span),
                 // Defensive parsing needs these: `parse_float` accepts `nan`
@@ -7957,6 +8208,12 @@ Perform the effect after the closing brace, or yield a number and do the work ou
                 "as_i64" => {
                     check_arity(self, 0);
                     Type::I64
+                }
+                // Toward zero, then held to the type's range, the way
+                // `as_i64` is held to `i64`'s ([L-LIB-INT-CONV]).
+                n if n.strip_prefix("as_").and_then(IntKind::from_name).is_some() => {
+                    check_arity(self, 0);
+                    Type::Int(IntKind::from_name(&n[3..]).expect("checked above"))
                 }
                 // The IEEE-754 bit pattern, and back.
                 //
@@ -8311,7 +8568,13 @@ same slot would race — pass a type that holds no `ref`, or use `map` inside th
         }
         if !matches!(
             r,
-            Type::I64 | Type::Str | Type::Bool | Type::Var(_) | Type::Generic(_) | Type::Error
+            Type::I64
+                | Type::Int(_)
+                | Type::Str
+                | Type::Bool
+                | Type::Var(_)
+                | Type::Generic(_)
+                | Type::Error
         ) {
             let shown = self.show(k);
             self.error_help(
@@ -8555,7 +8818,7 @@ bind the component to a `var`, or use a struct when the parts have names worth w
     /// would make `sort` quietly pick an arbitrary answer.
     fn is_ordered(&mut self, t: &Type) -> bool {
         match self.uni.shallow_resolve(t) {
-            Type::I64 | Type::F64 | Type::Str | Type::Var(_) | Type::Error => true,
+            Type::I64 | Type::Int(_) | Type::F64 | Type::Str | Type::Var(_) | Type::Error => true,
             Type::Tuple(parts) => !parts.is_empty() && parts.iter().all(|p| self.is_ordered(p)),
             _ => false,
         }
@@ -8567,6 +8830,40 @@ bind the component to a `var`, or use a struct when the parts have names worth w
     /// Walking it twice made a right-nested chain exponential: `2^2^…^2`
     /// thirty terms long doubled the work per term, and `check` never
     /// finished on a program `[G-NEST-LIMIT]` promises a diagnostic for.
+    /// A literal written beside a fixed-width integer takes its type, if it
+    /// fits: `b + 1` and `1 + b` are both `u8` for `b: u8` ([T-INT-FIXED]).
+    fn literal_adopts(&mut self, lit: &Expr, k: IntKind) {
+        let (v, sp) = match lit {
+            Expr::Int(v, sp) => (*v, *sp),
+            Expr::Unary {
+                op: UnaryOp::Neg,
+                expr,
+                span,
+            } => match **expr {
+                Expr::Int(v, _) => (v.wrapping_neg(), *span),
+                _ => return,
+            },
+            _ => return,
+        };
+        if !k.fits(v) {
+            self.literal_out_of_range(sp, v, k);
+        }
+        self.resolved_types.insert((sp.start, sp.end), Type::Int(k));
+    }
+
+    fn literal_out_of_range(&mut self, span: Span, v: i64, k: IntKind) {
+        self.error_help(
+            span,
+            format!("`{v}` does not fit in `{}`", k.name()),
+            format!(
+                "`{}` holds {} to {}; a value outside that is not written as a literal of it ([T-INT-FIXED])",
+                k.name(),
+                k.min(),
+                k.max()
+            ),
+        );
+    }
+
     fn float_aware_lhs_seen(&mut self, lhs: &Expr, rhs: &Expr) -> (Type, Option<Type>) {
         let lhs_ty = self.infer_expr(lhs);
         let literal_span = match lhs {
@@ -8584,6 +8881,10 @@ bind the component to a `var`, or use a struct when the parts have names worth w
                 if self.uni.shallow_resolve(&probe) == Type::F64 {
                     self.float_literals.insert(at);
                     return (Type::F64, Some(probe));
+                }
+                if let Type::Int(k) = self.uni.shallow_resolve(&probe) {
+                    self.literal_adopts(lhs, k);
+                    return (Type::Int(k), Some(probe));
                 }
                 return (lhs_ty, Some(probe));
             }
@@ -8613,6 +8914,10 @@ bind the component to a `var`, or use a struct when the parts have names worth w
                 if self.uni.shallow_resolve(&probe) == Type::F64 {
                     self.float_literals.insert(at);
                     return Type::F64;
+                }
+                if let Type::Int(k) = self.uni.shallow_resolve(&probe) {
+                    self.literal_adopts(lhs, k);
+                    return Type::Int(k);
                 }
             }
         }
@@ -8693,7 +8998,7 @@ bind the component to a `var`, or use a struct when the parts have names worth w
                 }
                 let r = self.uni.shallow_resolve(&lhs_ty);
                 match r {
-                    Type::I64 | Type::F64 => r,
+                    Type::I64 | Type::F64 | Type::Int(_) => r,
                     Type::Str if op == Add => Type::Str,
                     // Lists concatenate. `+` already joins strings, and a
                     // list is the other thing programs build by appending.
@@ -9151,7 +9456,13 @@ bind the component to a `var`, or use a struct when the parts have names worth w
                 }
             }
             Pattern::Wildcard(_) => None,
-            Pattern::Int(_, span) => {
+            Pattern::Int(v, span) => {
+                if let Type::Int(k) = self.uni.shallow_resolve(expected) {
+                    if !k.fits(*v) {
+                        self.literal_out_of_range(*span, *v, k);
+                    }
+                    return Some("<int>".into());
+                }
                 self.unify_or_report(*span, &Type::I64, expected);
                 Some("<int>".into())
             }
@@ -9750,11 +10061,7 @@ pub fn possibly_mutated(
             _ => None,
         }
     }
-    fn block(
-        b: &Block,
-        out: &mut std::collections::HashSet<String>,
-        ro: &dyn Fn(&str) -> bool,
-    ) {
+    fn block(b: &Block, out: &mut std::collections::HashSet<String>, ro: &dyn Fn(&str) -> bool) {
         for st in &b.stmts {
             match st {
                 Stmt::Assign { target, .. } => {
@@ -9997,6 +10304,28 @@ enum PlaceSeg {
 /// because a call still reaches them first.
 fn is_builtin_fn_name(name: &str) -> bool {
     BUILTIN_FREE_FNS.contains(&name) || matches!(name, "fail" | "map" | "ref" | "release" | "alive")
+}
+
+/// Help for two integer types that met where one was wanted: they do not
+/// convert on their own, in either direction ([T-INT-FIXED]).
+fn int_mix_help(got: &Type, want: &Type) -> Option<String> {
+    let name = |t: &Type| match t {
+        Type::I64 => Some("i64"),
+        Type::Int(k) => Some(k.name()),
+        _ => None,
+    };
+    let (g, w) = (name(got)?, name(want)?);
+    if g == w {
+        return None;
+    }
+    if w == "i64" {
+        return Some(format!(
+            "`{g}` and `i64` are different types and do not convert on their own -- `.as_i64()` gives the same value as an `i64`"
+        ));
+    }
+    Some(format!(
+        "`{g}` and `{w}` are different types and do not convert on their own -- convert with `.as_{w}()`, which wraps to the width, or `.try_{w}()`, which answers `None` when the value does not fit"
+    ))
 }
 
 /// Names `resolve_type` answers for before it consults any declaration.

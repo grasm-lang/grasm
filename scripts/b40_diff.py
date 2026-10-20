@@ -393,6 +393,11 @@ def parse_javap(text):
         m = re.match(r"  flags: \(0x([0-9a-f]+)\)", l)
         if m and "access" not in head:
             head["access"] = int(m.group(1), 16)
+        if l == "}":
+            # The class body ends here. What follows are class attributes,
+            # and a record's `Record:` attribute lists its components with
+            # `descriptor:` lines of their own -- not members.
+            break
         m = re.match(r"    descriptor: (.*)$", l)
         if m:
             fl = re.match(r"    flags: \(0x([0-9a-f]+)\)", lines[i + 1])
@@ -662,7 +667,10 @@ ruby_ev = run(["ruby", os.path.join(LIB, "yaml.rb"), "ev"] + yaml_files).splitli
 ruby_load = run(["ruby", os.path.join(LIB, "yaml.rb"), "load"] + yaml_files).splitlines()
 # Where Psych's values are its own and not YAML 1.1's (Ruby symbols, an
 # untagged reading of unknown tags, "!" ignored), values are not compared.
-PSYCH_OWN = re.compile(r"(^|[\s\[{,:-])!(?!!)|:\s*:")
+# An unknown tag in YAML's own namespace counts: a damaged `!!str` becomes
+# `!!st`, which Psych reads as if untagged and YAML 1.1 as a string.
+YAML11_TYPES = "str|int|float|bool|null|binary|timestamp|seq|map|set|omap|pairs|merge|value|yaml"
+PSYCH_OWN = re.compile(r"(^|[\s\[{,:-])!(?!!)|:\s*:|!!(?!(?:" + YAML11_TYPES + r")(?![\w-]))")
 for path, ev, ld in zip(yaml_files, ruby_ev, ruby_load):
     cases.append(("yev", path, (lambda got, ev=ev: (got == ev, bytes.fromhex(ev).decode(errors="replace")[:300] if ev != "ERR" else ev,
                                                       bytes.fromhex(got).decode(errors="replace")[:300] if got not in ("ERR", "NOFILE") else got)), "yaml-events"))

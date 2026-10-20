@@ -1,9 +1,0 @@
-//! tag: T-INT-ALIAS
-//! expect: output
-//! 3 5.0
-fn add(a: i32, b: u8) -> int {
-    a + b
-}
-fn main() {
-    print("{add(1, 2)} {5.0}")
-}

@@ -139,7 +139,7 @@ reproducible enough to pin, and what makes forty-five protocol properties
 testable with no socket and no waiting. Three minutes of session lifetime is
 tested in no time at all.
 
-**Ten limbs, not five.** Grasm has one integer type, `i64`. A field element in
+**Ten limbs, not five.** Grasm's widest integer is `i64`. A field element in
 five 51-bit limbs needs a 102-bit product, which does not fit. Ten limbs of
 26 and 25 bits keeps every product under 52 bits. This is a real cost the
 language imposed and the arithmetic absorbed it.

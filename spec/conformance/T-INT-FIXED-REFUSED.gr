@@ -1,0 +1,9 @@
+//! tag: T-INT-FIXED-REFUSED
+//! expect: error
+//! is not implemented yet
+// u64 was an alias for i64, so its arithmetic was signed. Refused until it
+// is real, rather than kept as a name that says something it does not do.
+fn main() {
+    let a: u64 = 1
+    print(a)
+}

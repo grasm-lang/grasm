@@ -1881,9 +1881,16 @@ pub fn pairs(doc: YamlDoc, node: i64) -> [(i64, i64)] ! YamlSyntaxError {
         }
         _ -> {}
     }
-    var out = direct
+    // Merged keys come first, in their merged order, where PyYAML puts them
+    // and where Psych does for the usual "<<" written first; a key the
+    // mapping also has itself keeps that place and takes its own value.
+    var out: [(i64, i64)] = []
     for pr in merged {
-        if has_key(doc, direct, pr.0) < 0 {
+        let at = has_key(doc, direct, pr.0)
+        out.push(if at >= 0 { (pr.0, direct[at].1) } else { pr })
+    }
+    for pr in direct {
+        if has_key(doc, merged, pr.0) < 0 {
             out.push(pr)
         }
     }
