@@ -86,7 +86,7 @@ def java_line():
 
 
 lines = [java_line() for _ in range(int(os.environ.get("JRAND_LINES", "2000")))]
-want = subprocess.run(["java", "-cp", JAVA, "RandomOracle"], input="\n".join(lines) + "\n", capture_output=True, text=True).stdout.splitlines()
+want = subprocess.run(["java", "-XX:-OmitStackTraceInFastThrow", "-cp", JAVA, "RandomOracle"], input="\n".join(lines) + "\n", capture_output=True, text=True).stdout.splitlines()
 if len(want) != len(lines):
     print(f"Java answered {len(want)} of {len(lines)}"); sys.exit(1)
 for k in range(0, len(lines), 200):
@@ -134,7 +134,7 @@ for _ in range(int(os.environ.get("JDOUBLE_LINES", "3000"))):
     else:
         jd_lines.append(float_line())
 jd_lines += ["d 7ff8000000000000", "d 7ff0000000000000", "d fff0000000000000", "f 7fc00000", "f ff800000", "f 80000000"]
-want = subprocess.run(["java", "-cp", JAVA, "DoubleOracle"], input="\n".join(jd_lines) + "\n", capture_output=True, text=True).stdout.splitlines()
+want = subprocess.run(["java", "-XX:-OmitStackTraceInFastThrow", "-cp", JAVA, "DoubleOracle"], input="\n".join(jd_lines) + "\n", capture_output=True, text=True).stdout.splitlines()
 if len(want) != len(jd_lines):
     print(f"Java answered {len(want)} of {len(jd_lines)}"); sys.exit(1)
 for k in range(0, len(jd_lines), 500):
@@ -239,7 +239,7 @@ jf_lines = [format_line() for _ in range(int(os.environ.get("JFORMAT_LINES", "40
 jf_lines += [hx(f) + " " + a for f, a in [("%.2f", "d:%016x" % dbits(1.005)), ("%.2f", "d:%016x" % dbits(0.125)), ("%00010d", "i:5"), ("%,d", "l:-1234567"),
                                          ("%x", "i:-1"), ("%x", "l:-1"), ("%h", "S:" + hx("hello")), ("%e", "d:0000000000000000"), ("%g", "d:%016x" % dbits(0.0001)),
                                          ("%a", "d:%016x" % dbits(1.0)), ("%.3a", "d:%016x" % dbits(0.1)), ("%s", "d:%016x" % dbits(1e23)), ("%-5c|", "i:65")]]
-want = subprocess.run(["java", "-cp", JAVA, "FormatOracle"], input="\n".join(jf_lines) + "\n", capture_output=True, text=True).stdout.splitlines()
+want = subprocess.run(["java", "-XX:-OmitStackTraceInFastThrow", "-cp", JAVA, "FormatOracle"], input="\n".join(jf_lines) + "\n", capture_output=True, text=True).stdout.splitlines()
 if len(want) != len(jf_lines):
     print(f"Java answered {len(want)} of {len(jf_lines)}"); sys.exit(1)
 for k in range(0, len(jf_lines), 500):
@@ -296,7 +296,7 @@ def decimal_value():
 
 
 dec_lines = [f"{hx(random_pattern())} {rng.choice(MODES)} {decimal_value()}" for _ in range(int(os.environ.get("JDECIMAL_LINES", "6000")))]
-want = subprocess.run(["java", "-cp", JAVA, "DecimalOracle"], input="\n".join(dec_lines) + "\n", capture_output=True, text=True).stdout.splitlines()
+want = subprocess.run(["java", "-XX:-OmitStackTraceInFastThrow", "-cp", JAVA, "DecimalOracle"], input="\n".join(dec_lines) + "\n", capture_output=True, text=True).stdout.splitlines()
 if len(want) != len(dec_lines):
     print(f"Java answered {len(want)} of {len(dec_lines)}"); sys.exit(1)
 for k in range(0, len(dec_lines), 500):
@@ -398,7 +398,7 @@ def uri_line():
 
 uri_lines = [uri_line() for _ in range(int(os.environ.get("JURI_LINES", "6000")))]
 uri_lines += [f"r {ux(RFC_BASE)} {ux(c)}" for c in RFC_CHILDREN]
-want = subprocess.run(["java", "-cp", JAVA, "UriOracle"], input="\n".join(uri_lines) + "\n", capture_output=True, text=True).stdout.splitlines()
+want = subprocess.run(["java", "-XX:-OmitStackTraceInFastThrow", "-cp", JAVA, "UriOracle"], input="\n".join(uri_lines) + "\n", capture_output=True, text=True).stdout.splitlines()
 if len(want) != len(uri_lines):
     print(f"Java answered {len(want)} of {len(uri_lines)}"); sys.exit(1)
 for k in range(0, len(uri_lines), 500):
@@ -453,7 +453,7 @@ def message_arg():
 
 msg_lines = [hx(message_pattern()) + " " + " ".join(message_arg() for _ in range(rng.randrange(0, 4))) for _ in range(int(os.environ.get("JMESSAGE_LINES", "5000")))]
 msg_lines = [l.rstrip() for l in msg_lines]
-want = subprocess.run(["java", "-cp", JAVA, "MessageOracle"], input="\n".join(msg_lines) + "\n", capture_output=True, text=True).stdout.splitlines()
+want = subprocess.run(["java", "-XX:-OmitStackTraceInFastThrow", "-cp", JAVA, "MessageOracle"], input="\n".join(msg_lines) + "\n", capture_output=True, text=True).stdout.splitlines()
 if len(want) != len(msg_lines):
     print(f"Java answered {len(want)} of {len(msg_lines)}"); sys.exit(1)
 for k in range(0, len(msg_lines), 500):
@@ -505,7 +505,7 @@ def bd_line():
 
 
 bd_lines = [bd_line() for _ in range(int(os.environ.get("JBIG_LINES", "6000")))]
-want = subprocess.run(["java", "-cp", JAVA, "BigOracle"], input="\n".join(bd_lines) + "\n", capture_output=True, text=True).stdout.splitlines()
+want = subprocess.run(["java", "-XX:-OmitStackTraceInFastThrow", "-cp", JAVA, "BigOracle"], input="\n".join(bd_lines) + "\n", capture_output=True, text=True).stdout.splitlines()
 if len(want) != len(bd_lines):
     print(f"Java answered {len(want)} of {len(bd_lines)}"); sys.exit(1)
 for k in range(0, len(bd_lines), 500):

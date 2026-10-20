@@ -23,7 +23,10 @@ GRASM="${GRASM_BIN:-target/release/grasm}"
 checked=0
 unformatted=0
 unparseable=0
-for f in $(find . -name '*.gr' -not -path './target/*' | sed 's|^\./||' | sort); do
+# The repository's own files, tracked or new: not whatever else sits in the
+# directory. `find .` also read the copy of the whole corpus in a git-ignored
+# worktree kept inside the repository, and judged it.
+for f in $(git ls-files --cached --others --exclude-standard -- '*.gr' | sort -u); do
     [ "$f" = "$EXCLUDE" ] && continue
     out=$("$GRASM" fmt "$f" --check 2>&1)
     if [ $? -eq 0 ]; then

@@ -313,7 +313,7 @@ def javaduration_line():
 
 
 family("javaduration", "javaduration", [javaduration_line() for _ in range(int(os.environ.get("JAVADURATION_LINES", "8000")))],
-       ["java", "-cp", JAVA, "DurationOracle"])
+       ["java", "-XX:-OmitStackTraceInFastThrow", "-cp", JAVA, "DurationOracle"])
 
 
 # --- Node's util.format, against Node 25 ------------------------------------------------------------------------

@@ -484,7 +484,7 @@ def javaintegers_line():
 
 
 family("javaintegers", "javaintegers", [javaintegers_line() for _ in range(int(os.environ.get("JAVAINTEGERS_LINES", "10000")))],
-       ["java", "-cp", JAVA, "IntegersOracle"])
+       ["java", "-XX:-OmitStackTraceInFastThrow", "-cp", JAVA, "IntegersOracle"])
 
 
 # --- run ------------------------------------------------------------------------------------------------

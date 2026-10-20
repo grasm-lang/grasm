@@ -21,7 +21,10 @@ linted=0
 findings=0
 unparseable=0
 broke=0
-for f in $(find . -name '*.gr' -not -path './target/*' | sed 's|^\./||' | sort); do
+# The repository's own files, tracked or new: not whatever else sits in the
+# directory. `find .` also read the copy of the whole corpus in a git-ignored
+# worktree kept inside the repository, and judged it.
+for f in $(git ls-files --cached --others --exclude-standard -- '*.gr' | sort -u); do
     out=$("$GRASM" lint "$f" 2>&1)
     code=$?
     case "$code" in

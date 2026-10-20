@@ -212,6 +212,12 @@ fn block_id_of(max: i64) -> i64 {
 ///
 ///   - Anything that is not a frame is refused, first or not: trailing bytes
 ///     after the last frame, even one, are an error.
+///   - A skippable frame whose size runs past the end ends the stream, and
+///     whatever it would have covered is not read -- until a standard frame
+///     has been read; after one, it is an error. `lz4` passes over a
+///     skippable frame with a seek, which succeeds past the end of a file,
+///     but once a standard frame has been read the frame decoder holds the
+///     bytes that follow and needs all of them.
 ///   - Once a standard frame has been read, only standard and skippable
 ///     frames may follow; a legacy stream after one is refused. Before the
 ///     first, legacy streams and skippable frames mix freely.
@@ -234,7 +240,10 @@ pub fn decode(data: bytes) -> bytes ! Lz4FrameError {
             }
             at = at + 8 + u32le(data, at + 4)
             if at > data.len() {
-                fail(Truncated)
+                if seen_standard {
+                    fail(Truncated)
+                }
+                at = data.len()
             }
         } else if magic == 407642370 and not seen_standard {
             at = try decode_legacy(data, at + 4, out)

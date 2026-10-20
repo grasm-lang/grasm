@@ -5,7 +5,49 @@ before 2.0. Anything marked `provisional` may change in a minor release with a
 migration note here; anything `experimental` may change in any release. See
 `docs/stability.md`.
 
-## Unreleased — since 1.0.0
+## 1.1.0 — 2026-10-20
+
+### Added
+
+- **Fixed-width integers.** `i8 i16 i32 u8 u16 u32` are types of their own
+  rather than names for `i64`: a literal takes the type it is written
+  against and is range-checked, the types do not mix without `.as_U()` or
+  `.try_U()`, and arithmetic wraps to the width ([T-INT-FIXED]). `u64`,
+  `usize` and `f32` are refused rather than accepted as aliases that do not
+  do what they say.
+- **Release archives that carry their runtime.** `scripts/package.sh`
+  builds an archive holding `grasm`, `libgrasm_rt_abi.a` and a BUILD-INFO
+  naming the commit, and checks it from an empty directory before writing
+  its checksum: run, build natively, run the result. v1.0.0 shipped bare
+  binaries, with which `grasm build --native` failed.
+- **124 libraries in sixteen batches (B47-B62)**, each held by a gate of its
+  own to the runtime it ports: CPython 3.13, Go 1.25, Java 17, Node 25,
+  Ruby 2.6, Perl 5.34, Lua 5.5, SQLite 3.51, jq 1.7.1, SBCL 2.6.8 and rustc
+  1.99. Counted as packages that export a `pub fn`, the set is 1015 libraries
+  (`docs/packages-to-1000.md`).
+- **The plan for a self-hosted toolchain**, `docs/self-hosting.md`: the
+  compiler, its backends, the linker and the runtime in Grasm, with the
+  stages, gates and decisions that get there.
+
+### Fixed
+
+- **A replay ran C functions for real.** Under `GRASM_REPLAY` an
+  `extern fn` was called again rather than replayed; both engines now stop
+  at the first C call of a replay with exit 7.
+- **`leakcheck` counted a crash as leak-free.** Only the runtime's own
+  `leak check: nothing live at exit` counts now, and a death by signal fails
+  the gate.
+- **A `for` loop over a list leaked its body's last value** in compiled
+  code, one per iteration, as did a `parallel` block's body and each
+  `spawn`. `examples/loop_tails.gr` holds all three forms.
+- **`grasm lint` called an import unused when only its types were used.**
+- **`bigint` turned `i64::MIN` into 0 and back into None.**
+- **Gates that judged the wrong thing:** `b40diff` required output from an
+  emitter for a document the oracle itself refuses to load; Java oracles
+  could report a `null` exception message once HotSpot compiled a hot throw
+  site (they now run with `-XX:-OmitStackTraceInFastThrow`); `fmttest` and
+  `linttest` read any `.gr` file under the directory, including a
+  git-ignored worktree, rather than the repository's own files.
 
 ### Added
 

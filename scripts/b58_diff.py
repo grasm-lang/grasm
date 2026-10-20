@@ -59,6 +59,10 @@ def dbits(v):
     return struct.unpack("<Q", struct.pack("<d", v))[0]
 
 
+# Every Java oracle runs with -XX:-OmitStackTraceInFastThrow: once HotSpot's
+# C2 has compiled a site that throws often, it rethrows one preallocated
+# exception with no message, so a run with enough ClassCastExceptions saw the
+# message turn into `null` part-way through (seed 320589281, 35 lines).
 JAVA = os.path.join(work, "java")
 os.makedirs(JAVA)
 if os.path.isdir(os.path.join(LIB, "java")):
@@ -629,7 +633,7 @@ def javaurlencoder_line():
 
 
 family("javaurlencoder", "javaurlencoder", [javaurlencoder_line() for _ in range(lines_for("javaurlencoder", 12000))],
-       ["java", "-cp", JAVA, "B58UrlOracle"])
+       ["java", "-XX:-OmitStackTraceInFastThrow", "-cp", JAVA, "B58UrlOracle"])
 
 
 # --- Java's DateTimeFormatter.ofPattern(p, Locale.US), against Java 17 ----------------------------------------
@@ -725,7 +729,7 @@ def javadatetimeformatter_line():
 
 
 family("javadatetimeformatter", "javadatetimeformatter", [javadatetimeformatter_line() for _ in range(lines_for("javadatetimeformatter", 14000))],
-       ["java", "-cp", JAVA, "B58DtfOracle"])
+       ["java", "-XX:-OmitStackTraceInFastThrow", "-cp", JAVA, "B58DtfOracle"])
 
 
 # --- Go's html escaping, against Go 1.25 ---------------------------------------------------------------------
@@ -942,7 +946,7 @@ def javasimpledateformat_line():
 
 
 family("javasimpledateformat", "javasimpledateformat", [javasimpledateformat_line() for _ in range(lines_for("javasimpledateformat", 12000))],
-       ["java", "-cp", JAVA, "B58SdfOracle"])
+       ["java", "-XX:-OmitStackTraceInFastThrow", "-cp", JAVA, "B58SdfOracle"])
 
 
 # --- run ------------------------------------------------------------------------------------------------

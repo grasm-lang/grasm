@@ -235,7 +235,7 @@ for line in want_tables.splitlines():
         sys.exit(1)
 names = [l.split()[0].replace("~", " ") for l in subprocess.run(
     ["java", "--add-opens", "java.base/java.lang=ALL-UNNAMED", "-cp", JAVA, "BlockNames"], capture_output=True, text=True).stdout.splitlines()]
-starts = [int(l.split()[0], 16) for l in subprocess.run(["java", "-cp", JAVA, "Blocks"], capture_output=True, text=True).stdout.splitlines()]
+starts = [int(l.split()[0], 16) for l in subprocess.run(["java", "-XX:-OmitStackTraceInFastThrow", "-cp", JAVA, "Blocks"], capture_output=True, text=True).stdout.splitlines()]
 
 
 def recase(n):
@@ -274,7 +274,7 @@ def block_lines():
 
 
 block_paths = [case_file(block_lines()) for _ in range(int(os.environ.get("BLOCK_CASES", "20")))]
-block_out = subprocess.run(["java", "-cp", JAVA, "BlockQuery"], input="\n".join(block_paths) + "\n", capture_output=True, text=True).stdout.splitlines()
+block_out = subprocess.run(["java", "-XX:-OmitStackTraceInFastThrow", "-cp", JAVA, "BlockQuery"], input="\n".join(block_paths) + "\n", capture_output=True, text=True).stdout.splitlines()
 if len(block_out) != len(block_paths):
     print(f"Java answered {len(block_out)} of {len(block_paths)}"); sys.exit(1)
 for p, w in zip(block_paths, block_out):
@@ -431,7 +431,11 @@ def lz4_fixed():
     text = b"hello hello hello hello hello"
     f, l = lz4_file(text, ["-1"]), lz4_file(text, ["-l"])
     skip0 = (0x184D2A50).to_bytes(4, "little") + bytes(4)
-    shapes = [b"", b"xyz", f + b"\x00", f + b"\x01\x02\x03\x04\x05", l + b"xyz", l + b"\x01\x02\x03\x04\x05", l + f, l + l, f + l,
+    # A skippable frame that claims more bytes than there are: the end of the
+    # stream before any standard frame, an error after one (seed 948121430).
+    over = (0x184D2A50).to_bytes(4, "little") + (100).to_bytes(4, "little") + b"ab"
+    shapes = [over, over + f, l + over, f + over, over + over, skip0 + f + over,
+              b"", b"xyz", f + b"\x00", f + b"\x01\x02\x03\x04\x05", l + b"xyz", l + b"\x01\x02\x03\x04\x05", l + f, l + l, f + l,
               skip0, skip0 + f, l + bytes(4), l + skip0, f + skip0, f + skip0[:6], f + f, f + (0x184D2A5F).to_bytes(4, "little") + bytes([5, 0, 0, 0]) + b"ab"]
     lines, wants = [], []
     for blob in shapes:

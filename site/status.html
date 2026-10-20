@@ -70,14 +70,14 @@ where each one stands.</p>
 <h2>What holds</h2>
 <div class="figures">
   <div class="fig"><b>511</b><span>programs, engines identical</span></div>
-  <div class="fig"><b>492</b><span>identical in wasm</span></div>
-  <div class="fig"><b>620</b><span>cross-compiled, agreeing</span></div>
+  <div class="fig"><b>501</b><span>identical in wasm</span></div>
+  <div class="fig"><b>638</b><span>cross-compiled, agreeing</span></div>
   <div class="fig"><b>262</b><span>conformance programs</span></div>
   <div class="fig"><b>101</b><span>findings recorded</span></div>
   <div class="fig"><b>16</b><span>fuzz generators</span></div>
 </div>
 <p>Interpreter, bundle and native builds agree byte for byte on stdout, exit
-code and diagnostics. All 620 are also compiled for x86_64 and run under
+code and diagnostics. All 638 are also compiled for x86_64 and run under
 Rosetta, every one of them agreeing, on 20 October 2026. Every generated program
 is checked for what it keeps as well as for what it prints.</p>
 <h2>Which run wrote which figure</h2>
@@ -90,10 +90,10 @@ from the run that proved it; it carries one per figure now, and this is the
 whole record:</p>
 <div class="scroll"><table>
 <tr><th>Gate</th><th>What it compared</th><th>Figure</th><th>Taken</th></tr>
-<tr><td><code>difftest</code></td><td>interpreter, bundle and native identical</td><td>620</td><td>20 October 2026</td></tr>
-<tr><td><code>wasmtest</code></td><td>identical in the browser engine</td><td>492</td><td>20 October 2026</td></tr>
-<tr><td><code>wasmtest</code></td><td>skipped: no filesystem, socket, process or thread</td><td>131</td><td>20 October 2026</td></tr>
-<tr><td><code>crosstest</code></td><td>cross-compiled to x86_64, identical under Rosetta</td><td>620</td><td>20 October 2026</td></tr>
+<tr><td><code>difftest</code></td><td>interpreter, bundle and native identical</td><td>638</td><td>20 October 2026</td></tr>
+<tr><td><code>wasmtest</code></td><td>identical in the browser engine</td><td>501</td><td>20 October 2026</td></tr>
+<tr><td><code>wasmtest</code></td><td>skipped: no filesystem, socket, process or thread</td><td>140</td><td>20 October 2026</td></tr>
+<tr><td><code>crosstest</code></td><td>cross-compiled to x86_64, identical under Rosetta</td><td>638</td><td>20 October 2026</td></tr>
 <tr><td><code>ProjectGold</code></td><td>whole programs agreeing on every engine</td><td>44</td><td>20 October 2026</td></tr>
 <tr><td><code>fuzz_laws</code></td><td>laws that held against arithmetic</td><td>208</td><td>20 October 2026</td></tr>
 <tr><td><code>depth</code></td><td>nested calls the interpreter reaches, against 10,000 promised</td><td>31,093</td><td>20 October 2026</td></tr>

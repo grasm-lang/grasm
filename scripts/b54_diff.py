@@ -588,7 +588,7 @@ def javalocaldate_line():
 
 
 family("javalocaldate", "javalocaldate", [javalocaldate_line() for _ in range(int(os.environ.get("JAVALOCALDATE_LINES", "8000")))],
-       ["java", "-cp", JAVA, "LocalDateOracle"])
+       ["java", "-XX:-OmitStackTraceInFastThrow", "-cp", JAVA, "LocalDateOracle"])
 
 
 # --- Perl's Data::Dumper, against Data::Dumper 2.179 (XS, Perl 5.34) ---------------------------------------------

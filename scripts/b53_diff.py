@@ -264,7 +264,7 @@ def javabiginteger_line():
 
 
 family("javabiginteger", "javabiginteger", [javabiginteger_line() for _ in range(int(os.environ.get("JAVABIGINTEGER_LINES", "6000")))],
-       ["java", "-cp", JAVA, "BigIntegerOracle"])
+       ["java", "-XX:-OmitStackTraceInFastThrow", "-cp", JAVA, "BigIntegerOracle"])
 
 
 # --- Python's quoted-printable, against CPython 3.13 -----------------------------------------------------------

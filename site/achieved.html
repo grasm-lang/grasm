@@ -89,7 +89,7 @@ last recorded run on this machine:</p>
 <tr><td>difftest / corpus</td><td>511 programs</td><td><b>0 differences</b> across the engines</td></tr>
 <tr><td><code>leakcheck</code></td><td>226 programs</td><td><b>1 leaking</b> — <code>spec/conformance/E-VALUE-SEMANTICS.gr</code> holds 16 allocations at exit, so this gate is <b>red</b>. The ratchet is at zero, which is why one leak fails it. See <code>docs/known-issues.md</code>.</td></tr>
 <tr><td><code>usecheck</code>, the <code>poison</code> build</td><td>197 programs</td><td><b>0 differences</b></td></tr>
-<tr><td><code>crosstest</code> x86_64 under Rosetta</td><td>224 programs</td><td><b>195 pass</b>, 0 real failures, 60 declined — <em>retaken on a quiet machine on 20 October 2026: all 620, nothing declined</em></td></tr>
+<tr><td><code>crosstest</code> x86_64 under Rosetta</td><td>224 programs</td><td><b>195 pass</b>, 0 real failures, 60 declined — <em>retaken on a quiet machine on 20 October 2026: all 638, nothing declined</em></td></tr>
 <tr><td><code>clippy --all-targets</code></td><td>native and wasm32</td><td>0</td></tr>
 <tr><td>unit tests</td><td>every crate</td><td><b>609 pass</b></td></tr>
 <tr><td><code>replaytest</code></td><td>every journalled builtin</td><td>each one refuses under an empty journal</td></tr>
