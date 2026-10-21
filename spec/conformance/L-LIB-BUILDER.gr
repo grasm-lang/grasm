@@ -1,0 +1,43 @@
+//! tag: L-LIB-BUILDER
+//! expect: output
+//! héllo, world 12 false
+//! héllo 5
+//! 0x41ff8000c3a9 6 255 0x41ff8000c3a9
+//! 0x41ff00 0x41ff8000c3a9
+//! 30000 true
+// Builders append at the end in amortized constant time, and stay values: a
+// copy is a copy, before and after an append.
+type Out = { text: StrBuilder, n: i64 }
+
+fn emit(inout o: Out, s: str) {
+    o.text.push_str(s)
+    o.n += 1
+}
+
+fn main() {
+    var s = str_builder()
+    s.push_str("héllo")
+    let kept = s
+    s.push_str(", world")
+    print("{s} {s.len()} {s.is_empty()}")
+    print("{kept} {kept.len()}")
+
+    var b = byte_builder()
+    b.push_byte(0x41)
+    b.push_byte(255)
+    b.push_bytes(bytes_of([128, 0]))
+    let before = b
+    b.push_str("é")
+    print("{b} {b.len()} {b.at(1)} {b.to_bytes()}")
+    var c = before
+    c.set(2, 0)
+    print("{c.to_bytes().slice(0, 3)} {b}")
+
+    var o = Out{ text: str_builder(), n: 0 }
+    var i = 0
+    while i < 10000 {
+        emit(o, "abc")
+        i += 1
+    }
+    print("{o.text.len()} {o.text.to_str() == "abc".repeat(10000)}")
+}

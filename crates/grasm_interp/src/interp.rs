@@ -98,6 +98,47 @@ fn int_in_base(v: i64, base: i64) -> String {
     String::from_utf8_lossy(&buf[i..]).into_owned()
 }
 
+/// A `u64`'s text in a given base: [`int_in_base`] without a sign, since a
+/// `u64` from 2^63 up is a large number and not a negative one ([T-U64]).
+fn u64_in_base(mut n: u64, base: i64) -> String {
+    const DIGITS: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    let base = base as u64;
+    let mut buf = [0u8; 64];
+    let mut i = buf.len();
+    loop {
+        i -= 1;
+        buf[i] = DIGITS[(n % base) as usize];
+        n /= base;
+        if n == 0 {
+            break;
+        }
+    }
+    String::from_utf8_lossy(&buf[i..]).into_owned()
+}
+
+/// `a ^ b` on `u64`, modulo 2^64, with the whole exponent: square and
+/// multiply, so every bit of `b` counts ([T-U64]).
+fn u64_pow(mut base: u64, mut exp: u64) -> u64 {
+    let mut acc: u64 = 1;
+    while exp > 0 {
+        if exp & 1 == 1 {
+            acc = acc.wrapping_mul(base);
+        }
+        base = base.wrapping_mul(base);
+        exp >>= 1;
+    }
+    acc
+}
+
+/// The value of an integer method's result at the receiver's width: a `u64`
+/// stays one, everything else is the `i64` it stands for.
+fn int_value(kind: Option<grasm_sema::types::IntKind>, v: i128) -> Value {
+    match kind {
+        Some(grasm_sema::types::IntKind::U64) => Value::U64(v as u64),
+        _ => Value::Int(v as i64),
+    }
+}
+
 /// The most workers one `net_workers` call may start. A thread each, so a
 /// count from a miscomputed argument should be a refusal rather than ten
 /// thousand threads ([L-LIB-NET-WORKERS]). The runtime has the same number.
@@ -487,6 +528,61 @@ fn mutate_in_place(
             buf[i as usize] = byte_or_panic(v, "set")?;
             Value::Unit
         }
+        // Appending to a builder ([L-LIB-BUILDER]). Through `make_mut`, so a
+        // builder shared with another value is copied first and value
+        // semantics hold ([E-COW]); held alone, the append is the
+        // underlying buffer's own amortized push.
+        (Value::StrBuf(b), "push_str") => {
+            let Value::Str(t) = args.remove(0) else {
+                return Err(Flow::Panic("push_str expects a str".into()));
+            };
+            let tb = Rc::make_mut(b);
+            builder_room(tb.text.len(), t.len())?;
+            tb.text.push_str(t.as_str());
+            tb.chars += t.char_len();
+            Value::Unit
+        }
+        (Value::ByteBuf(b), "push_str") => {
+            let Value::Str(t) = args.remove(0) else {
+                return Err(Flow::Panic("push_str expects a str".into()));
+            };
+            builder_room(b.len(), t.len())?;
+            Rc::make_mut(b).extend_from_slice(t.as_bytes());
+            Value::Unit
+        }
+        (Value::ByteBuf(b), "push_byte") => {
+            let Value::Int(v) = args.remove(0) else {
+                return Err(Flow::Panic("push_byte expects an integer".into()));
+            };
+            let v = byte_or_panic(v, "push_byte")?;
+            builder_room(b.len(), 1)?;
+            Rc::make_mut(b).push(v);
+            Value::Unit
+        }
+        (Value::ByteBuf(b), "push_bytes") => {
+            let Value::Bytes(src) = args.remove(0) else {
+                return Err(Flow::Panic("push_bytes expects bytes".into()));
+            };
+            builder_room(b.len(), src.len())?;
+            Rc::make_mut(b).extend_from_slice(&src);
+            Value::Unit
+        }
+        (Value::ByteBuf(b), "set") => {
+            let v = args.pop().unwrap();
+            let i = args.pop().unwrap();
+            let (Value::Int(i), Value::Int(v)) = (i, v) else {
+                return Err(Flow::Panic("set expects two integers".into()));
+            };
+            if i < 0 || i as usize >= b.len() {
+                return Err(Flow::Panic(format!(
+                    "index {i} out of bounds (len {})",
+                    b.len()
+                )));
+            }
+            let v = byte_or_panic(v, "set")?;
+            Rc::make_mut(b)[i as usize] = v;
+            Value::Unit
+        }
         (Value::Bytes(b), "fill") => {
             let Value::Int(v) = args.pop().unwrap() else {
                 return Err(Flow::Panic("fill expects an integer".into()));
@@ -520,6 +616,18 @@ fn mutate_in_place(
         _ => return Ok(None),
     };
     Ok(Some(r))
+}
+
+/// The panic both engines give for a builder that would pass what memory can
+/// hold, before the allocator aborts the process instead ([E-PANIC-EXIT]).
+fn builder_room(have: usize, more: usize) -> Result<(), Flow> {
+    match have.checked_add(more) {
+        Some(n) if n <= MAX_ALLOC => Ok(()),
+        _ => Err(Flow::Panic(format!(
+            "a builder would need more memory than one can hold ({} bytes)",
+            have as u128 + more as u128
+        ))),
+    }
 }
 
 /// A byte, or the panic both engines print for a value that is not one.
@@ -908,6 +1016,8 @@ impl<'a, W: Write> Interp<'a, W> {
     /// An integer result wrapped to the width of the operation that made it.
     fn narrowed(&self, span: grasm_syntax::Span, v: Value) -> Value {
         match (v, self.narrow_at(span)) {
+            // Its bits are already its value; what changes is how it reads.
+            (Value::Int(i), Some(grasm_sema::types::IntKind::U64)) => Value::U64(i as u64),
             (Value::Int(i), Some(k)) => Value::Int(k.wrap(i)),
             (v, _) => v,
         }
@@ -2622,6 +2732,10 @@ impl<'a, W: Write> Interp<'a, W> {
             // calls normative.
             Expr::Int(v, sp) => Ok(if self.float_literals.contains(&sp.start) {
                 Value::Float(*v as f64)
+            } else if self.narrow_at(*sp) == Some(grasm_sema::types::IntKind::U64) {
+                // A literal the checker settled on `u64`: the same bits, read
+                // unsigned from here on ([T-U64]).
+                Value::U64(*v as u64)
             } else {
                 Value::Int(*v)
             }),
@@ -2737,6 +2851,7 @@ impl<'a, W: Write> Interp<'a, W> {
                     (UnaryOp::Neg, Value::Int(i)) => {
                         Ok(self.narrowed(*span, Value::Int(i.wrapping_neg())))
                     }
+                    (UnaryOp::Neg, Value::U64(u)) => Ok(Value::U64(u.wrapping_neg())),
                     (UnaryOp::Neg, Value::Float(f)) => Ok(Value::Float(-f)),
                     (UnaryOp::Not, Value::Bool(b)) => Ok(Value::Bool(!b)),
                     (_, v) => Err(Flow::Panic(format!("invalid unary operand `{v}`"))),
@@ -2978,6 +3093,7 @@ build links it, `grasm run` can only reach what is already loaded",
         for a in args {
             cargs.push(match a {
                 Value::Int(i) => CArg::I64(i),
+                Value::U64(u) => CArg::I64(u as i64),
                 Value::Float(f) => CArg::F64(f),
                 // A `str` crosses as a **NUL-terminated copy**. Grasm strings
                 // carry their length and are not terminated, and C decides
@@ -3039,10 +3155,11 @@ uses to mark the end of a string"
             _ => None,
         };
         match unsafe { crate::ffi::call(sym, &cargs, ret) } {
-            Some(CRet::I64(v)) => Ok(Value::Int(match narrow_ret {
-                Some(k) => k.wrap(v),
-                None => v,
-            })),
+            Some(CRet::I64(v)) => Ok(match narrow_ret {
+                Some(grasm_sema::types::IntKind::U64) => Value::U64(v as u64),
+                Some(k) => Value::Int(k.wrap(v)),
+                None => Value::Int(v),
+            }),
             Some(CRet::F64(v)) => Ok(Value::Float(v)),
             Some(CRet::Unit) => Ok(Value::Unit),
             None => Err(Flow::Panic(format!(
@@ -3362,6 +3479,11 @@ uses to mark the end of a string"
                     // there — so a program can make its own working directory
                     // without first asking whether it exists ([L-LIB-FS]).
                     // [L-LIB-BYTES]
+                    // [L-LIB-BUILDER]: an empty one of each.
+                    "str_builder" => {
+                        return Ok(Value::StrBuf(Rc::new(crate::value::TextBuf::default())));
+                    }
+                    "byte_builder" => return Ok(Value::ByteBuf(Rc::new(Vec::new()))),
                     "bytes_of" => {
                         let v = self.eval_expr(&args[0])?;
                         let Value::List(items) = v else {
@@ -4608,9 +4730,14 @@ uses to mark the end of a string"
     ) -> Result<Option<Value>, Flow> {
         use grasm_sema::types::IntKind;
         let n = name.name.as_str();
-        let (lo, hi, kind) = match self.narrow_at(recv.span()) {
-            Some(k) => (k.min() as i128, k.max() as i128, Some(k)),
-            None => (i64::MIN as i128, i64::MAX as i128, None),
+        // A `u64` says so itself; a narrower width only by the checker's tag.
+        let kind = match recv_v {
+            Value::U64(_) => Some(IntKind::U64),
+            _ => self.narrow_at(recv.span()),
+        };
+        let (lo, hi) = match kind {
+            Some(k) => (k.min(), k.max()),
+            None => (i128::from(i64::MIN), i128::from(i64::MAX)),
         };
         match recv_v {
             Value::Float(x) => {
@@ -4622,66 +4749,151 @@ uses to mark the end of a string"
                     } else if t >= k.max() as f64 {
                         k.max()
                     } else {
-                        t as i64
+                        t as i128
                     };
-                    return Ok(Some(Value::Int(v)));
+                    return Ok(Some(int_value(Some(k), v)));
                 }
                 Ok(None)
             }
-            Value::Int(i) => {
-                let i = *i;
-                // Widening: every fixed-width value is already the `i64` it
-                // stands for.
+            Value::Int(_) | Value::U64(_) => {
+                let bits = match recv_v {
+                    Value::U64(u) => *u as i64,
+                    Value::Int(i) => *i,
+                    _ => unreachable!("matched above"),
+                };
+                // The number the receiver stands for, which for a `u64` is
+                // not its bits read as an `i64`.
+                let val = kind.map_or(i128::from(bits), |k| k.value(bits));
+                // Every narrower value is already the `i64` it stands for; a
+                // `u64` gives its bits ([T-U64]).
                 if n == "as_i64" {
-                    return Ok(Some(Value::Int(i)));
+                    return Ok(Some(Value::Int(bits)));
+                }
+                if n == "try_i64" {
+                    return Ok(Some(match i64::try_from(val) {
+                        Ok(v) => Value::some(Value::Int(v)),
+                        Err(_) => Value::none(),
+                    }));
                 }
                 if let Some(k) = n.strip_prefix("as_").and_then(IntKind::from_name) {
-                    return Ok(Some(Value::Int(k.wrap(i))));
+                    return Ok(Some(int_value(Some(k), k.value(k.wrap(bits)))));
                 }
                 if let Some(k) = n.strip_prefix("try_").and_then(IntKind::from_name) {
-                    return Ok(Some(if k.fits(i) {
-                        Value::some(Value::Int(i))
+                    return Ok(Some(if k.fits(val) {
+                        Value::some(int_value(Some(k), val))
                     } else {
                         Value::none()
                     }));
                 }
-                let arg = |me: &mut Self| -> Result<i64, Flow> {
+                let arg = |me: &mut Self| -> Result<i128, Flow> {
                     match me.eval_expr(&args[0])? {
-                        Value::Int(j) => Ok(j),
+                        Value::Int(j) => Ok(kind.map_or(i128::from(j), |k| k.value(j))),
+                        Value::U64(j) => Ok(i128::from(j)),
                         other => Err(Flow::Panic(format!("`{n}` expects an int, got `{other}`"))),
                     }
                 };
-                let exact = |op: &str, a: i64, b: i64| -> i128 {
-                    let (a, b) = (a as i128, b as i128);
+                // `None` only where `u64 * u64` passes `i128`, which is past
+                // every range there is.
+                let exact = |op: &str, a: i128, b: i128| -> Option<i128> {
                     match op {
-                        "add" => a + b,
-                        "sub" => a - b,
-                        _ => a * b,
+                        "add" => a.checked_add(b),
+                        "sub" => a.checked_sub(b),
+                        _ => a.checked_mul(b),
                     }
                 };
                 if let Some(op) = n.strip_prefix("checked_") {
                     let j = arg(self)?;
-                    let r = exact(op, i, j);
-                    return Ok(Some(if r >= lo && r <= hi {
-                        Value::some(Value::Int(r as i64))
-                    } else {
-                        Value::none()
+                    return Ok(Some(match exact(op, val, j) {
+                        Some(r) if r >= lo && r <= hi => Value::some(int_value(kind, r)),
+                        _ => Value::none(),
                     }));
                 }
                 if let Some(op) = n.strip_prefix("saturating_") {
                     let j = arg(self)?;
-                    let r = exact(op, i, j).clamp(lo, hi);
-                    return Ok(Some(Value::Int(r as i64)));
+                    let r = exact(op, val, j).map_or(hi, |r| r.clamp(lo, hi));
+                    return Ok(Some(int_value(kind, r)));
+                }
+                if matches!(
+                    n,
+                    "rotate_left"
+                        | "rotate_right"
+                        | "count_ones"
+                        | "leading_zeros"
+                        | "trailing_zeros"
+                        | "swap_bytes"
+                ) {
+                    return self.bits_at_width(n, kind, bits, args).map(Some);
                 }
                 if let (Some(k), "ushr") = (kind, n) {
-                    let j = arg(self)?;
-                    let bits = (i as u64) & (u64::MAX >> (64 - k.bits()));
-                    return Ok(Some(Value::Int(k.wrap(bits.wrapping_shr(j as u32) as i64))));
+                    let j = match self.eval_expr(&args[0])? {
+                        Value::Int(j) => j,
+                        other => {
+                            return Err(Flow::Panic(format!("`{n}` expects an int, got `{other}`")))
+                        }
+                    };
+                    let bits = (bits as u64) & (u64::MAX >> (64 - k.bits()));
+                    let shifted = bits.wrapping_shr(j as u32) as i64;
+                    return Ok(Some(int_value(Some(k), k.value(k.wrap(shifted)))));
                 }
                 Ok(None)
             }
             _ => Ok(None),
         }
+    }
+
+    /// [L-LIB-BITS-WIDTH]: the six methods that read an integer's bits at its
+    /// own width -- 64 for `i64` and `u64`, 8 for `i8` -- with Rust's answers:
+    /// a rotation count taken modulo the width, and zero having as many
+    /// leading and trailing zeros as the width has bits. A signed width's
+    /// result is its bits read back two's-complement, as every result is.
+    fn bits_at_width(
+        &mut self,
+        n: &str,
+        kind: Option<grasm_sema::types::IntKind>,
+        bits: i64,
+        args: &[Expr],
+    ) -> Result<Value, Flow> {
+        let w = kind.map_or(64, |k| k.bits());
+        let mask = u64::MAX >> (64 - w);
+        let x = (bits as u64) & mask;
+        let count = |c: u32| Value::Int(i64::from(c));
+        let out: u64 = match n {
+            "count_ones" => return Ok(count(x.count_ones())),
+            "leading_zeros" => return Ok(count(x.leading_zeros() - (64 - w))),
+            "trailing_zeros" => return Ok(count(if x == 0 { w } else { x.trailing_zeros() })),
+            "swap_bytes" => match w {
+                8 => x,
+                16 => u64::from((x as u16).swap_bytes()),
+                32 => u64::from((x as u32).swap_bytes()),
+                _ => x.swap_bytes(),
+            },
+            _ => {
+                let j = match self.eval_expr(&args[0])? {
+                    Value::Int(j) => j,
+                    other => {
+                        return Err(Flow::Panic(format!("`{n}` expects an int, got `{other}`")))
+                    }
+                };
+                // Modulo the width, as Rust's `rotate_left(j as u32)`: a
+                // negative count turns the other way.
+                let left = (j as u32) & (w - 1);
+                let left = if n == "rotate_right" {
+                    (w - left) & (w - 1)
+                } else {
+                    left
+                };
+                if left == 0 {
+                    x
+                } else {
+                    ((x << left) | (x >> (w - left))) & mask
+                }
+            }
+        };
+        let read = kind.map_or(out as i64, |k| k.wrap(out as i64));
+        Ok(int_value(
+            kind,
+            kind.map_or(i128::from(read), |k| k.value(read)),
+        ))
     }
 
     fn builtin_method(
@@ -4756,6 +4968,7 @@ uses to mark the end of a string"
             }
             (Value::List(items), "sum") => {
                 let mut int_sum = 0i64;
+                let mut u64_sum: Option<u64> = None;
                 // Folded from the first element, not from a `+0.0` seed:
                 // `-0.0 + -0.0` is `-0.0` under IEEE-754, and seeding with
                 // `+0.0` turned it into `+0.0`. `-0.0` is an observable
@@ -4765,7 +4978,8 @@ uses to mark the end of a string"
                 let mut is_float = false;
                 for item in items.iter() {
                     match item {
-                        Value::Int(i) => int_sum += i,
+                        Value::Int(i) => int_sum = int_sum.wrapping_add(*i),
+                        Value::U64(u) => u64_sum = Some(u64_sum.unwrap_or(0).wrapping_add(*u)),
                         Value::Float(f) => {
                             is_float = true;
                             float_sum = Some(match float_sum {
@@ -4788,6 +5002,8 @@ uses to mark the end of a string"
                         Some(f) => Value::Float(f + int_sum as f64),
                         None => Value::Float(int_sum as f64),
                     }
+                } else if let Some(u) = u64_sum {
+                    Value::U64(u)
                 } else {
                     Value::Int(int_sum)
                 }
@@ -5065,6 +5281,27 @@ uses to mark the end of a string"
                     Err(_) => Value::none(),
                 }
             }
+            // [T-U64]: digits only, a `+` allowed and a `-` refused, even on
+            // zero -- a `u64` has no sign to read.
+            (Value::Str(s), "parse_u64") => match s.trim().parse::<u64>() {
+                Ok(v) => Value::some(Value::U64(v)),
+                Err(_) => Value::none(),
+            },
+            (Value::Str(s), "parse_u64_base") => {
+                let base = match self.eval_expr(&args[0])? {
+                    Value::Int(n) => n,
+                    _ => 10,
+                };
+                if !(2..=36).contains(&base) {
+                    return Err(Flow::Panic(format!(
+                        "parse_u64_base takes a base in 2..36, not {base}"
+                    )));
+                }
+                match u64::from_str_radix(s.trim(), base as u32) {
+                    Ok(v) => Value::some(Value::U64(v)),
+                    Err(_) => Value::none(),
+                }
+            }
             (Value::Str(s), "parse_float") => match s.trim().parse::<f64>() {
                 Ok(v) => Value::some(Value::Float(v)),
                 Err(_) => Value::none(),
@@ -5107,13 +5344,36 @@ uses to mark the end of a string"
                 }
                 Value::str(crate::value::fixed_text(*f, places))
             }
-            (Value::Int(_) | Value::Float(_) | Value::Str(_) | Value::Tuple(_), "cmp") => {
+            (
+                Value::Int(_) | Value::U64(_) | Value::Float(_) | Value::Str(_) | Value::Tuple(_),
+                "cmp",
+            ) => {
                 let other = self.eval_expr(&args[0])?;
                 Value::Int(match compare_values(&recv, &other) {
                     std::cmp::Ordering::Less => -1,
                     std::cmp::Ordering::Equal => 0,
                     std::cmp::Ordering::Greater => 1,
                 })
+            }
+            // [L-LIB-BUILDER]: reading a builder never changes it.
+            (Value::StrBuf(b), "len") => Value::Int(b.chars as i64),
+            (Value::ByteBuf(b), "len") => Value::Int(b.len() as i64),
+            (Value::StrBuf(b), "is_empty") => Value::Bool(b.text.is_empty()),
+            (Value::ByteBuf(b), "is_empty") => Value::Bool(b.is_empty()),
+            (Value::StrBuf(b), "to_str") => Value::str(b.text.clone()),
+            (Value::ByteBuf(b), "to_str") => Value::str(String::from_utf8_lossy(b).into_owned()),
+            (Value::ByteBuf(b), "to_bytes") => Value::Bytes(Rc::new(b.as_ref().clone())),
+            (Value::ByteBuf(b), "at") => {
+                let Value::Int(i) = self.eval_expr(&args[0])? else {
+                    return Err(Flow::Panic("at expects an integer".into()));
+                };
+                if i < 0 || i as usize >= b.len() {
+                    return Err(Flow::Panic(format!(
+                        "index {i} out of bounds (len {})",
+                        b.len()
+                    )));
+                }
+                Value::Int(i64::from(b[i as usize]))
             }
             (Value::Bytes(b), "len") => Value::Int(b.len() as i64),
             (Value::Bytes(b), "is_empty") => Value::Bool(b.is_empty()),
@@ -5195,6 +5455,51 @@ uses to mark the end of a string"
             (Value::Bytes(b), "to_str") => Value::str(String::from_utf8_lossy(b).into_owned()),
             (Value::Str(s), "to_bytes") => Value::Bytes(Rc::new(s.to_string().into_bytes())),
             (Value::Int(i), "as_f64") => Value::Float(*i as f64),
+            // [T-U64]: the same methods, unsigned.
+            (Value::U64(u), "as_f64") => Value::Float(*u as f64),
+            (Value::U64(u), "to_str") => Value::str(u.to_string()),
+            (Value::U64(u), "abs") => Value::U64(*u),
+            (Value::U64(u), "bit_not") => Value::U64(!*u),
+            (Value::U64(u), "to_base") => {
+                let base = match self.eval_expr(&args[0])? {
+                    Value::Int(n) => n,
+                    _ => 10,
+                };
+                if !(2..=36).contains(&base) {
+                    return Err(Flow::Panic(format!(
+                        "to_base takes a base in 2..36, not {base}"
+                    )));
+                }
+                Value::str(u64_in_base(*u, base))
+            }
+            (Value::U64(u), op @ ("bit_and" | "bit_or" | "bit_xor" | "min" | "max")) => {
+                let Value::U64(j) = self.eval_expr(&args[0])? else {
+                    return Err(Flow::Panic(format!("`{op}` expects a u64")));
+                };
+                Value::U64(match op {
+                    "bit_and" => u & j,
+                    "bit_or" => u | j,
+                    "bit_xor" => u ^ j,
+                    "min" => (*u).min(j),
+                    _ => (*u).max(j),
+                })
+            }
+            // A `u64` is never negative, so `shr` has no sign to keep and is
+            // `ushr`.
+            (Value::U64(u), op @ ("shl" | "shr" | "ushr")) => {
+                let Value::Int(j) = self.eval_expr(&args[0])? else {
+                    return Err(Flow::Panic(format!("`{op}` expects an int")));
+                };
+                Value::U64(if op == "shl" {
+                    u.wrapping_shl(j as u32)
+                } else {
+                    u.wrapping_shr(j as u32)
+                })
+            }
+            (Value::U64(u), "to_char") => match u32::try_from(*u).ok().and_then(char::from_u32) {
+                Some(c) => Value::str(c.to_string()),
+                None => return Err(Flow::Panic(format!("{u} is not a Unicode code point"))),
+            },
             // Base ten is not the only base a systems program needs.
             (Value::Int(i), "to_base") => {
                 let base = match self.eval_expr(&args[0])? {
@@ -5385,6 +5690,10 @@ uses to mark the end of a string"
         let (l, r) = match (l, r) {
             (Value::Int(a), Value::Float(b)) => (Value::Float(a as f64), Value::Float(b)),
             (Value::Float(a), Value::Int(b)) => (Value::Float(a), Value::Float(b as f64)),
+            // The checker never mixes `u64` with `i64`, so an `Int` beside a
+            // `U64` is a literal of it that reached here untagged.
+            (Value::U64(a), Value::Int(b)) => (Value::U64(a), Value::U64(b as u64)),
+            (Value::Int(a), Value::U64(b)) => (Value::U64(a as u64), Value::U64(b)),
             other => other,
         };
         match op {
@@ -5423,8 +5732,41 @@ uses to mark the end of a string"
                                 "negative integer exponent (use floats)".into(),
                             ));
                         }
-                        Value::Int(a.wrapping_pow(b.min(u32::MAX as i64) as u32))
+                        // Every bit of the exponent counts: clamping it at
+                        // `u32::MAX`, as this did, made `3 ^ 4294967296` the
+                        // answer for `3 ^ 4294967295`. Multiplication modulo
+                        // 2^64 is one operation on the bits however they are
+                        // read, so the unsigned power is the signed one.
+                        Value::Int(u64_pow(a as u64, b as u64) as i64)
                     }
+                    Lt => Value::Bool(a < b),
+                    LtEq => Value::Bool(a <= b),
+                    Gt => Value::Bool(a > b),
+                    GtEq => Value::Bool(a >= b),
+                    _ => return Err(Flow::Panic("invalid int operation".into())),
+                })
+            }
+            // [T-U64]: the same operations on the same bits, read unsigned.
+            (Value::U64(a), Value::U64(b)) => {
+                let a = *a;
+                let b = *b;
+                Ok(match op {
+                    Add => Value::U64(a.wrapping_add(b)),
+                    Sub => Value::U64(a.wrapping_sub(b)),
+                    Mul => Value::U64(a.wrapping_mul(b)),
+                    Div => {
+                        if b == 0 {
+                            return Err(Flow::Panic("division by zero".into()));
+                        }
+                        Value::U64(a / b)
+                    }
+                    Rem => {
+                        if b == 0 {
+                            return Err(Flow::Panic("remainder by zero".into()));
+                        }
+                        Value::U64(a % b)
+                    }
+                    Pow => Value::U64(u64_pow(a, b)),
                     Lt => Value::Bool(a < b),
                     LtEq => Value::Bool(a <= b),
                     Gt => Value::Bool(a > b),
@@ -5488,7 +5830,11 @@ uses to mark the end of a string"
             // is nothing to reconcile between the branches.
             Pattern::Or(alts, _) => alts.iter().any(|a| self.match_pattern(a, v, bindings)),
             Pattern::Wildcard(_) => true,
-            Pattern::Int(p, _) => matches!(v, Value::Int(x) if x == p),
+            Pattern::Int(p, _) => match v {
+                Value::Int(x) => x == p,
+                Value::U64(x) => *x as i64 == *p,
+                _ => false,
+            },
             Pattern::Bool(p, _) => matches!(v, Value::Bool(x) if x == p),
             Pattern::Str(p, _) => matches!(v, Value::Str(x) if x.as_str() == p),
             Pattern::Bind(id) => {
@@ -5622,6 +5968,7 @@ fn compare_values(a: &Value, b: &Value) -> std::cmp::Ordering {
     use std::cmp::Ordering;
     match (a, b) {
         (Value::Int(x), Value::Int(y)) => x.cmp(y),
+        (Value::U64(x), Value::U64(y)) => x.cmp(y),
         // `total_cmp`, not `partial_cmp`. Calling every NaN comparison `Equal`
         // is not a total order, and a sort given one does not merely misplace
         // the NaN — it returns a list that is not sorted at all. One `nan`

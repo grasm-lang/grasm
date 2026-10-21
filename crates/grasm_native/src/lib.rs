@@ -65,6 +65,10 @@ fn nope<T>(span: Span, what: impl Into<String>) -> CResult<T> {
 #[derive(Clone, PartialEq, Debug)]
 enum VType {
     I64,
+    /// A `u64` ([T-U64]): the one-word scalar an `I64` is, carried as its own
+    /// type because the same bits divide, compare, print and sort differently
+    /// -- which matters wherever the value goes, a list or a struct included.
+    U64,
     F64,
     Bool,
     Unit,
@@ -72,6 +76,10 @@ enum VType {
     /// A contiguous run of bytes ([L-LIB-BYTES]). Carried as a boxed runtime
     /// value, like `Str` — a byte buffer has no scalar representation.
     Bytes,
+    /// `StrBuilder` and `ByteBuilder` ([L-LIB-BUILDER]), boxed like `Bytes`;
+    /// an append answers the box to keep, as a `bytes` write does.
+    StrBuf,
+    ByteBuf,
     List(Box<VType>),
     /// An effect handler carried as a value.
     ///
@@ -140,12 +148,15 @@ impl VType {
     fn mangle(&self) -> String {
         match self {
             VType::I64 => "i64".into(),
+            VType::U64 => "u64".into(),
             VType::Ref(inner) => format!("ref_{}", inner.mangle()),
             VType::F64 => "f64".into(),
             VType::Bool => "bool".into(),
             VType::Unit => "unit".into(),
             VType::Str => "str".into(),
             VType::Bytes => "bytes".into(),
+            VType::StrBuf => "strbuf".into(),
+            VType::ByteBuf => "bytebuf".into(),
             VType::Range => "range".into(),
             VType::Handler(e) => format!("h{e}"),
             VType::Any => "any".into(),
@@ -173,11 +184,14 @@ impl VType {
     fn show(&self) -> String {
         match self {
             VType::I64 => "i64".into(),
+            VType::U64 => "u64".into(),
             VType::F64 => "f64".into(),
             VType::Bool => "bool".into(),
             VType::Unit => "()".into(),
             VType::Str => "str".into(),
             VType::Bytes => "bytes".into(),
+            VType::StrBuf => "StrBuilder".into(),
+            VType::ByteBuf => "ByteBuilder".into(),
             VType::Range => "a range".into(),
             VType::Handler(e) => format!("{e}Handler"),
             VType::Any => "an inferred type".into(),
@@ -201,7 +215,7 @@ impl VType {
 
     fn cl(&self) -> types::Type {
         match self {
-            VType::I64 => types::I64,
+            VType::I64 | VType::U64 => types::I64,
             // One word: slot index and generation packed together.
             VType::Ref(_) => types::I64,
             VType::F64 => types::F64,
@@ -211,6 +225,8 @@ impl VType {
             VType::Handler(_)
             | VType::Str
             | VType::Bytes
+            | VType::StrBuf
+            | VType::ByteBuf
             | VType::Range
             | VType::List(_)
             | VType::Struct(_)
@@ -231,6 +247,8 @@ impl VType {
             VType::Handler(_)
                 | VType::Str
                 | VType::Bytes
+                | VType::StrBuf
+                | VType::ByteBuf
                 | VType::Range
                 | VType::List(_)
                 | VType::Struct(_)
@@ -859,6 +877,24 @@ impl<'m> Codegen<'m> {
         let decls: &[(&str, Vec<types::Type>, Option<types::Type>)] = &[
             ("grasm_out_text", vec![ptr, i64t], None),
             ("grasm_out_i64", vec![i64t], None),
+            ("grasm_out_u64", vec![i64t], None),
+            ("grasm_strbuf_new", vec![], Some(i64t)),
+            ("grasm_bytebuf_new", vec![], Some(i64t)),
+            ("grasm_builder_push_str", vec![i64t, i64t], Some(i64t)),
+            ("grasm_bytebuf_push_byte", vec![i64t, i64t], Some(i64t)),
+            ("grasm_bytebuf_push_bytes", vec![i64t, i64t], Some(i64t)),
+            ("grasm_bytebuf_set", vec![i64t, i64t, i64t], Some(i64t)),
+            ("grasm_bytebuf_at", vec![i64t, i64t], Some(i64t)),
+            ("grasm_builder_len", vec![i64t], Some(i64t)),
+            ("grasm_builder_to_str", vec![i64t], Some(i64t)),
+            ("grasm_bytebuf_to_bytes", vec![i64t], Some(i64t)),
+            ("grasm_box_u64", vec![i64t], Some(i64t)),
+            ("grasm_pow_u64", vec![i64t, i64t], Some(i64t)),
+            ("grasm_str_from_u64", vec![i64t], Some(i64t)),
+            ("grasm_u64_to_base", vec![i64t, i64t], Some(i64t)),
+            ("grasm_u64_to_char", vec![i64t], Some(i64t)),
+            ("grasm_str_parse_u64", vec![i64t], Some(i64t)),
+            ("grasm_str_parse_u64_base", vec![i64t, i64t], Some(i64t)),
             ("grasm_out_f64", vec![f64t], None),
             ("grasm_out_bool", vec![i8t], None),
             ("grasm_out_val", vec![i64t], None),
@@ -903,7 +939,7 @@ impl<'m> Codegen<'m> {
             ("grasm_val_cmp", vec![i64t, i64t], Some(i64t)),
             ("grasm_assert_eq", vec![i64t, i64t], None),
             ("grasm_stack_check", vec![i64t], None),
-            ("grasm_int_try", vec![i64t, i64t], Some(i64t)),
+            ("grasm_int_try", vec![i64t, i64t, i64t], Some(i64t)),
             (
                 "grasm_int_checked",
                 vec![i64t, i64t, i64t, i64t],
@@ -1312,12 +1348,15 @@ impl<'m> Codegen<'m> {
                             return Ok(bound.clone());
                         }
                         match n {
-                            "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64"
-                            | "usize" | "int" => return Ok(VType::I64),
+                            "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "usize"
+                            | "int" => return Ok(VType::I64),
+                            "u64" => return Ok(VType::U64),
                             "f32" | "f64" | "float" => return Ok(VType::F64),
                             "bool" => return Ok(VType::Bool),
                             "str" => return Ok(VType::Str),
                             "bytes" => return Ok(VType::Bytes),
+                            "StrBuilder" => return Ok(VType::StrBuf),
+                            "ByteBuilder" => return Ok(VType::ByteBuf),
                             "range" => return Ok(VType::Range),
                             _ if n
                                 .strip_suffix("Handler")
@@ -4868,6 +4907,8 @@ const FK_BOXED: u8 = 0;
 const FK_INLIST: u8 = 6;
 const FK_INVALS: u8 = 7;
 const FK_INSTR: u8 = 8;
+/// A `u64` field: one word, like an `i64`, read unsigned ([T-U64]).
+const FK_U64: u8 = 9;
 
 /// Words a field of this kind takes (`grasm_rt::kind_width`).
 fn kind_width(k: u8) -> usize {
@@ -4885,6 +4926,7 @@ fn field_kind(t: &VType) -> u8 {
         VType::Bool => 3,
         VType::Ref(_) => 4,
         VType::Unit => 5,
+        VType::U64 => FK_U64,
         _ => 0,
     }
 }
@@ -6971,6 +7013,9 @@ fn scalar_kind_i64(vt: &VType) -> Option<i64> {
         VType::Ref(_) => Some(3),
         VType::F64 => Some(1),
         VType::Bool => Some(2),
+        // Words, like an `i64`, sorted and printed unsigned. Not 4, which a
+        // split result's kind uses for unit.
+        VType::U64 => Some(5),
         _ => None,
     }
 }
@@ -7030,7 +7075,7 @@ fn signed_magic(d: i64) -> (i64, u32) {
 fn const_words(items: &[Expr], elem_t: &VType) -> Option<Vec<i64>> {
     fn one(e: &Expr, t: &VType) -> Option<i64> {
         match (e, t) {
-            (Expr::Int(n, _), VType::I64) => Some(*n),
+            (Expr::Int(n, _), VType::I64 | VType::U64) => Some(*n),
             (Expr::Int(n, _), VType::F64) => Some((*n as f64).to_bits() as i64),
             (Expr::Float(f, _), VType::F64) => Some(f.to_bits() as i64),
             (Expr::Bool(b, _), VType::Bool) => Some(i64::from(*b)),
@@ -8242,7 +8287,7 @@ impl FnCx<'_, '_> {
     fn scalar_bits_of(&mut self, v: Value, vt: &VType) -> Value {
         match vt {
             // A reference is already the word it is stored as.
-            VType::I64 | VType::Ref(_) => v,
+            VType::I64 | VType::U64 | VType::Ref(_) => v,
             VType::F64 => {
                 self.b
                     .ins()
@@ -8267,7 +8312,7 @@ impl FnCx<'_, '_> {
             // variable with it panicked inside Cranelift's frontend --
             // "declared type of variable var0 doesn't match type of value"
             // -- rather than refusing anything (F50).
-            VType::I64 | VType::F64 | VType::Bool | VType::Unit | VType::Ref(_) => {
+            VType::I64 | VType::U64 | VType::F64 | VType::Bool | VType::Unit | VType::Ref(_) => {
                 self.scalar_bits_of(v, vt)
             }
             _ => v,
@@ -8276,7 +8321,7 @@ impl FnCx<'_, '_> {
 
     fn bits_to_value(&mut self, bits: Value, vt: &VType) -> Value {
         match vt {
-            VType::I64 | VType::F64 | VType::Bool | VType::Unit | VType::Ref(_) => {
+            VType::I64 | VType::U64 | VType::F64 | VType::Bool | VType::Unit | VType::Ref(_) => {
                 self.scalar_of_bits(bits, vt)
             }
             _ => bits,
@@ -8285,7 +8330,7 @@ impl FnCx<'_, '_> {
 
     fn scalar_of_bits(&mut self, bits: Value, vt: &VType) -> Value {
         match vt {
-            VType::I64 | VType::Ref(_) => bits,
+            VType::I64 | VType::U64 | VType::Ref(_) => bits,
             VType::F64 => {
                 self.b
                     .ins()
@@ -8407,7 +8452,9 @@ impl FnCx<'_, '_> {
         match t {
             VType::Str => Some(FK_INSTR),
             VType::List(e) if matches!(**e, VType::Val(_)) => Some(FK_INVALS),
-            VType::List(e) if scalar_kind_i64(e).is_some() => Some(FK_INLIST),
+            // A `[u64]` stays a list of its own, whose kind says how to print
+            // it; an inline list's words are printed as `i64`s.
+            VType::List(e) if scalar_kind_i64(e).is_some() && **e != VType::U64 => Some(FK_INLIST),
             _ => None,
         }
     }
@@ -12147,10 +12194,10 @@ this case",
     /// (boxed types keep the +1 from list_get).
     fn unbox(&mut self, boxed: Value, want: &VType) -> CResult<(Value, VType)> {
         match want {
-            VType::I64 => {
+            VType::I64 | VType::U64 => {
                 let v = self.call_rt("grasm_unbox_i64", &[boxed]).unwrap();
                 self.call_rt("grasm_val_dec", &[boxed]);
-                Ok((v, VType::I64))
+                Ok((v, want.clone()))
             }
             // The same word, kept at its own type so a later field read still
             // knows to go through the slab.
@@ -12195,6 +12242,7 @@ this case",
             // and generation, as a number nobody can read.
             VType::Ref(_) => self.call_rt("grasm_box_ref", &[v]).unwrap(),
             VType::I64 => self.call_rt("grasm_box_i64", &[v]).unwrap(),
+            VType::U64 => self.call_rt("grasm_box_u64", &[v]).unwrap(),
             VType::F64 => self.call_rt("grasm_box_f64", &[v]).unwrap(),
             VType::Bool => self.call_rt("grasm_box_bool", &[v]).unwrap(),
             // Already boxed: ownership transfers into the container.
@@ -12548,6 +12596,11 @@ this case",
             Expr::Int(v, sp) if self.cg.float_literals.contains(&sp.start) => {
                 Ok(Some((self.b.ins().f64const(*v as f64), VType::F64)))
             }
+            // A literal the checker settled on `u64` is that type from here
+            // on ([T-U64]).
+            Expr::Int(v, sp) if self.narrow_at(*sp) == Some(grasm_sema::types::IntKind::U64) => {
+                Ok(Some((self.b.ins().iconst(types::I64, *v), VType::U64)))
+            }
             Expr::Int(v, _) => Ok(Some((self.b.ins().iconst(types::I64, *v), VType::I64))),
             Expr::Map(entries, mspan) => {
                 let mut m = self.call_rt("grasm_map_new", &[]).unwrap();
@@ -12863,6 +12916,7 @@ this case",
                         let n = self.narrowed(*span, n, &VType::I64);
                         Ok(Some((n, VType::I64)))
                     }
+                    (UnaryOp::Neg, VType::U64) => Ok(Some((self.b.ins().ineg(v), VType::U64))),
                     (UnaryOp::Neg, VType::F64) => Ok(Some((self.b.ins().fneg(v), VType::F64))),
                     (UnaryOp::Not, VType::Bool) => {
                         let one = self.b.ins().iconst(types::I8, 1);
@@ -13070,6 +13124,7 @@ this case",
                     let (v, vt) = self.eval_expr_val(inner)?;
                     match vt {
                         VType::I64 => self.call_rt("grasm_str_from_i64", &[v]).unwrap(),
+                        VType::U64 => self.call_rt("grasm_str_from_u64", &[v]).unwrap(),
                         VType::F64 => self.call_rt("grasm_str_from_f64", &[v]).unwrap(),
                         VType::Bool => self.call_rt("grasm_str_from_bool", &[v]).unwrap(),
                         VType::Str => v,
@@ -13182,6 +13237,12 @@ this case",
                 let (v, vt) = self.eval_expr_val(inner)?;
                 match vt {
                     VType::I64 => self.call_rt("grasm_str_append_i64", &[cur, v]).unwrap(),
+                    VType::U64 => {
+                        let sv = self.call_rt("grasm_str_from_u64", &[v]).unwrap();
+                        let out = self.call_rt("grasm_str_append", &[cur, sv]).unwrap();
+                        self.call_rt("grasm_val_dec", &[sv]);
+                        out
+                    }
                     VType::F64 => {
                         let bits = self.b.ins().bitcast(
                             types::I64,
@@ -13233,6 +13294,11 @@ this case",
                     match vt {
                         VType::I64 => {
                             self.call_rt("grasm_str_build_i64", &[at, v]);
+                        }
+                        VType::U64 => {
+                            let sv = self.call_rt("grasm_str_from_u64", &[v]).unwrap();
+                            self.call_rt("grasm_str_build_str", &[at, sv]);
+                            self.call_rt("grasm_val_dec", &[sv]);
                         }
                         VType::F64 => {
                             let bits = self.b.ins().bitcast(
@@ -13744,6 +13810,9 @@ this case",
             return Ok(None);
         }
         let elem_t = match &**body {
+            Expr::Int(_, sp) if self.narrow_at(*sp) == Some(grasm_sema::types::IntKind::U64) => {
+                VType::U64
+            }
             Expr::Int(..) => VType::I64,
             Expr::Float(..) => VType::F64,
             Expr::Bool(..) => VType::Bool,
@@ -14028,6 +14097,51 @@ this case",
                 Ok(("grasm_bytes_copy_from", vec![at, src]))
             }
             _ => nope(span, "this write to a bytes buffer"),
+        }
+    }
+
+    /// The runtime function for an append to a builder ([L-LIB-BUILDER]),
+    /// its arguments after the receiver, and the box among them this call
+    /// owns and must release once the write has read it -- as
+    /// `bytes_write_args` is for a `bytes`, and for the same reason.
+    fn builder_write_args(
+        &mut self,
+        bt: &VType,
+        name: &Ident,
+        args: &[Expr],
+        span: Span,
+    ) -> CResult<(&'static str, Vec<Value>, Option<Value>)> {
+        match (bt, name.name.as_str()) {
+            (_, "push_str") => {
+                let (sv, st) = self.eval_expr_val(&args[0])?;
+                if st != VType::Str {
+                    return nope(span, "push_str of something other than a str");
+                }
+                Ok(("grasm_builder_push_str", vec![sv], Some(sv)))
+            }
+            (VType::ByteBuf, "push_byte") => {
+                let (bv, btt) = self.eval_expr_val(&args[0])?;
+                if btt != VType::I64 {
+                    return nope(span, "a non-integer byte");
+                }
+                Ok(("grasm_bytebuf_push_byte", vec![bv], None))
+            }
+            (VType::ByteBuf, "push_bytes") => {
+                let (bv, btt) = self.eval_expr_val(&args[0])?;
+                if btt != VType::Bytes {
+                    return nope(span, "push_bytes of something other than bytes");
+                }
+                Ok(("grasm_bytebuf_push_bytes", vec![bv], Some(bv)))
+            }
+            (VType::ByteBuf, "set") => {
+                let (iv, it) = self.eval_expr_val(&args[0])?;
+                let (bv, btt) = self.eval_expr_val(&args[1])?;
+                if it != VType::I64 || btt != VType::I64 {
+                    return nope(span, "a non-integer index or byte");
+                }
+                Ok(("grasm_bytebuf_set", vec![iv, bv], None))
+            }
+            _ => nope(span, "this write to a builder"),
         }
     }
 
@@ -14541,6 +14655,28 @@ this case",
                 // function returns the value to keep, which is a fresh buffer
                 // when the old one was shared, so the result is written back
                 // over the place exactly as a list push is.
+                // Appending to a builder held in a place: the same shape as a
+                // `bytes` write, the box answered written back over it.
+                (
+                    VType::StrBuf | VType::ByteBuf,
+                    "push_str" | "push_byte" | "push_bytes" | "set",
+                ) => {
+                    let bt = inner_t.clone();
+                    let (f, rt_args, owned) = self.builder_write_args(&bt, name, args, span)?;
+                    let cur = self.b.use_var(var);
+                    let bv = self.read_place_boxed(cur, &path, &root_t, true)?;
+                    let mut call = vec![bv];
+                    call.extend(rt_args);
+                    let newb = self.call_rt(f, &call).unwrap();
+                    if let Some(o) = owned {
+                        self.call_rt("grasm_val_dec", &[o]);
+                    }
+                    let cur2 = self.b.use_var(var);
+                    self.begin_write();
+                    let updated = self.write_place(span, cur2, &path, &root_t, newb)?;
+                    self.b.def_var(var, updated);
+                    return Ok(None);
+                }
                 (VType::Bytes, "set" | "fill" | "copy_from") => {
                     let (f, rt_args) = self.bytes_write_args(name, args, span)?;
                     // The boxed source of a `copy_from`, which this owns and
@@ -14575,6 +14711,26 @@ this case",
                     let newb = self.call_rt(f, &call).unwrap();
                     if let Some(src) = owned_src {
                         self.call_rt("grasm_val_dec", &[src]);
+                    }
+                    self.b.def_var(var, newb);
+                    return Ok(None);
+                }
+            }
+        }
+        // Appending to a builder held in a plain variable ([L-LIB-BUILDER]).
+        if matches!(
+            name.name.as_str(),
+            "push_str" | "push_byte" | "push_bytes" | "set"
+        ) {
+            if let Expr::Ident(id) = recv {
+                if let Some((var, bt @ (VType::StrBuf | VType::ByteBuf))) = self.lookup(&id.name) {
+                    let (f, rt_args, owned) = self.builder_write_args(&bt, name, args, span)?;
+                    let cur = self.b.use_var(var);
+                    let mut call = vec![cur];
+                    call.extend(rt_args);
+                    let newb = self.call_rt(f, &call).unwrap();
+                    if let Some(o) = owned {
+                        self.call_rt("grasm_val_dec", &[o]);
                     }
                     self.b.def_var(var, newb);
                     return Ok(None);
@@ -15215,16 +15371,32 @@ this case",
         args: &[Expr],
     ) -> CResult<Option<(Value, VType)>> {
         use grasm_sema::types::IntKind;
-        let recv_kind = self.narrow_at(recv.span());
+        // A `u64` says so by its type; a narrower width only by the tag.
+        let recv_kind = if *rt == VType::U64 {
+            Some(IntKind::U64)
+        } else {
+            self.narrow_at(recv.span())
+        };
         let tag = i64::from(recv_kind.map(|k| k.tag()).unwrap_or(255));
+        let at_kind = |k: IntKind| {
+            if k == IntKind::U64 {
+                VType::U64
+            } else {
+                VType::I64
+            }
+        };
         if *rt == VType::F64 {
             let Some(k) = m.strip_prefix("as_").and_then(IntKind::from_name) else {
                 return Ok(None);
             };
             // Toward zero, then held to the range; NaN is 0, as `as_i64`.
+            if k == IntKind::U64 {
+                let v = self.b.ins().fcvt_to_uint_sat(types::I64, rv);
+                return Ok(Some((v, VType::U64)));
+            }
             let wide = self.b.ins().fcvt_to_sint_sat(types::I64, rv);
-            let lo = self.b.ins().iconst(types::I64, k.min());
-            let hi = self.b.ins().iconst(types::I64, k.max());
+            let lo = self.b.ins().iconst(types::I64, k.min() as i64);
+            let hi = self.b.ins().iconst(types::I64, k.max() as i64);
             let v = self.b.ins().smax(wide, lo);
             let v = self.b.ins().smin(v, hi);
             return Ok(Some((v, VType::I64)));
@@ -15232,14 +15404,21 @@ this case",
         if m == "as_i64" {
             return Ok(Some((rv, VType::I64)));
         }
+        if m == "try_i64" {
+            let t = self.b.ins().iconst(types::I64, 255);
+            let src = self.b.ins().iconst(types::I64, tag);
+            let v = self.call_rt("grasm_int_try", &[t, src, rv]).unwrap();
+            return Ok(Some((v, VType::Option(Box::new(VType::I64)))));
+        }
         if let Some(k) = m.strip_prefix("as_").and_then(IntKind::from_name) {
             let v = self.wrap_to(rv, k);
-            return Ok(Some((v, VType::I64)));
+            return Ok(Some((v, at_kind(k))));
         }
         if let Some(k) = m.strip_prefix("try_").and_then(IntKind::from_name) {
             let t = self.b.ins().iconst(types::I64, i64::from(k.tag()));
-            let v = self.call_rt("grasm_int_try", &[t, rv]).unwrap();
-            return Ok(Some((v, VType::Option(Box::new(VType::I64)))));
+            let src = self.b.ins().iconst(types::I64, tag);
+            let v = self.call_rt("grasm_int_try", &[t, src, rv]).unwrap();
+            return Ok(Some((v, VType::Option(Box::new(at_kind(k))))));
         }
         let op = |name: &str| match name {
             "add" => 0,
@@ -15248,17 +15427,17 @@ this case",
         };
         if let Some(o) = m.strip_prefix("checked_") {
             let (a, at) = self.eval_expr_val(&args[0])?;
-            if at != VType::I64 {
+            if at != *rt {
                 return nope(args[0].span(), "an argument of a different type");
             }
             let t = self.b.ins().iconst(types::I64, tag);
             let o = self.b.ins().iconst(types::I64, op(o));
             let v = self.call_rt("grasm_int_checked", &[t, o, rv, a]).unwrap();
-            return Ok(Some((v, VType::Option(Box::new(VType::I64)))));
+            return Ok(Some((v, VType::Option(Box::new(rt.clone())))));
         }
         if let Some(o) = m.strip_prefix("saturating_") {
             let (a, at) = self.eval_expr_val(&args[0])?;
-            if at != VType::I64 {
+            if at != *rt {
                 return nope(args[0].span(), "an argument of a different type");
             }
             let t = self.b.ins().iconst(types::I64, tag);
@@ -15266,23 +15445,121 @@ this case",
             let v = self
                 .call_rt("grasm_int_saturating", &[t, o, rv, a])
                 .unwrap();
-            return Ok(Some((v, VType::I64)));
+            return Ok(Some((v, rt.clone())));
+        }
+        if matches!(
+            m,
+            "rotate_left"
+                | "rotate_right"
+                | "count_ones"
+                | "leading_zeros"
+                | "trailing_zeros"
+                | "swap_bytes"
+        ) {
+            return self.bits_at_width(rv, rt, recv_kind, m, args).map(Some);
         }
         if let (Some(k), "ushr") = (recv_kind, m) {
             let (a, at) = self.eval_expr_val(&args[0])?;
             if at != VType::I64 {
                 return nope(args[0].span(), "an argument of a different type");
             }
-            let bits = self
-                .b
-                .ins()
-                .band_imm(rv, (u64::MAX >> (64 - k.bits())) as i64);
+            let bits = if k.bits() == 64 {
+                rv
+            } else {
+                self.b
+                    .ins()
+                    .band_imm(rv, (u64::MAX >> (64 - k.bits())) as i64)
+            };
             let count = self.b.ins().band_imm(a, 63);
             let shifted = self.b.ins().ushr(bits, count);
             let v = self.wrap_to(shifted, k);
-            return Ok(Some((v, VType::I64)));
+            return Ok(Some((v, rt.clone())));
         }
         Ok(None)
+    }
+
+    /// [L-LIB-BITS-WIDTH], the interpreter's `bits_at_width` in instructions:
+    /// the value's bits at its width, masked off from the 64 the engine holds
+    /// it in, and the result read back at that width.
+    fn bits_at_width(
+        &mut self,
+        rv: Value,
+        rt: &VType,
+        kind: Option<grasm_sema::types::IntKind>,
+        m: &str,
+        args: &[Expr],
+    ) -> CResult<(Value, VType)> {
+        let w = kind.map_or(64, |k| k.bits());
+        let x = if w == 64 {
+            rv
+        } else {
+            self.b.ins().band_imm(rv, (u64::MAX >> (64 - w)) as i64)
+        };
+        let out = match m {
+            "count_ones" => return Ok((self.b.ins().popcnt(x), VType::I64)),
+            "leading_zeros" => {
+                let z = self.b.ins().clz(x);
+                let v = self.b.ins().iadd_imm(z, -i64::from(64 - w));
+                return Ok((v, VType::I64));
+            }
+            // A bit just past the width stops the count there, so a zero
+            // answers the width.
+            "trailing_zeros" => {
+                let v = if w == 64 {
+                    self.b.ins().ctz(x)
+                } else {
+                    let fenced = self.b.ins().bor_imm(x, 1i64 << w);
+                    self.b.ins().ctz(fenced)
+                };
+                return Ok((v, VType::I64));
+            }
+            "swap_bytes" => match w {
+                8 => x,
+                64 => self.b.ins().bswap(x),
+                _ => {
+                    let narrow = if w == 16 { types::I16 } else { types::I32 };
+                    let small = self.b.ins().ireduce(narrow, x);
+                    let swapped = self.b.ins().bswap(small);
+                    self.b.ins().uextend(types::I64, swapped)
+                }
+            },
+            _ => {
+                let (a, at) = self.eval_expr_val(&args[0])?;
+                if at != VType::I64 {
+                    return nope(args[0].span(), "an argument of a different type");
+                }
+                // Modulo the width, as Rust's `rotate_left(n as u32)`.
+                let c = self.b.ins().band_imm(a, i64::from(w - 1));
+                if w == 64 {
+                    if m == "rotate_left" {
+                        self.b.ins().rotl(x, c)
+                    } else {
+                        self.b.ins().rotr(x, c)
+                    }
+                } else {
+                    // Turning right by c is turning left by w - c.
+                    let left = if m == "rotate_left" {
+                        c
+                    } else {
+                        let wc = self.b.ins().iconst(types::I64, i64::from(w));
+                        let back = self.b.ins().isub(wc, c);
+                        self.b.ins().band_imm(back, i64::from(w - 1))
+                    };
+                    let wc = self.b.ins().iconst(types::I64, i64::from(w));
+                    let right = self.b.ins().isub(wc, left);
+                    let hi = self.b.ins().ishl(x, left);
+                    let lo = self.b.ins().ushr(x, right);
+                    let both = self.b.ins().bor(hi, lo);
+                    self.b.ins().band_imm(both, (u64::MAX >> (64 - w)) as i64)
+                }
+            }
+        };
+        // Read back at the width: a signed one sign-extends its top bit.
+        let v = match kind {
+            Some(k) => self.wrap_to(out, k),
+            None => out,
+        };
+        Ok((v, rt.clone()))
     }
 
     fn dispatch_method(
@@ -15320,12 +15597,39 @@ this case",
                 av
             }};
         }
-        if matches!(rt, VType::I64 | VType::F64) && !iface_call {
+        if matches!(rt, VType::I64 | VType::U64 | VType::F64) && !iface_call {
             if let Some(done) = self.int_width_method(rv, &rt, recv, m, args)? {
                 return Ok(Some(done));
             }
         }
         let out: (Value, VType) = match (&rt, m) {
+            // ---- builders ([L-LIB-BUILDER]) ----
+            // Each reads the receiver and keeps nothing, so each releases it.
+            (VType::StrBuf | VType::ByteBuf, "len" | "is_empty") => {
+                let n = self.call_rt("grasm_builder_len", &[rv]).unwrap();
+                self.call_rt("grasm_val_dec", &[rv]);
+                if m == "len" {
+                    (n, VType::I64)
+                } else {
+                    (self.b.ins().icmp_imm(IntCC::Equal, n, 0), VType::Bool)
+                }
+            }
+            (VType::StrBuf | VType::ByteBuf, "to_str") => {
+                let v = self.call_rt("grasm_builder_to_str", &[rv]).unwrap();
+                self.call_rt("grasm_val_dec", &[rv]);
+                (v, VType::Str)
+            }
+            (VType::ByteBuf, "to_bytes") => {
+                let v = self.call_rt("grasm_bytebuf_to_bytes", &[rv]).unwrap();
+                self.call_rt("grasm_val_dec", &[rv]);
+                (v, VType::Bytes)
+            }
+            (VType::ByteBuf, "at") => {
+                let i = arg_scalar!(0, VType::I64);
+                let v = self.call_rt("grasm_bytebuf_at", &[rv, i]).unwrap();
+                self.call_rt("grasm_val_dec", &[rv]);
+                (v, VType::I64)
+            }
             // ---- str ----
             (VType::Str, "len") => {
                 let v = self.call_rt("grasm_str_len", &[rv]).unwrap();
@@ -15469,6 +15773,19 @@ this case",
                 self.call_rt("grasm_val_dec", &[rv]);
                 (v, VType::Option(Box::new(VType::I64)))
             }
+            (VType::Str, "parse_u64") => {
+                let v = self.call_rt("grasm_str_parse_u64", &[rv]).unwrap();
+                self.call_rt("grasm_val_dec", &[rv]);
+                (v, VType::Option(Box::new(VType::U64)))
+            }
+            (VType::Str, "parse_u64_base") => {
+                let base = arg_scalar!(0, VType::I64);
+                let v = self
+                    .call_rt("grasm_str_parse_u64_base", &[rv, base])
+                    .unwrap();
+                self.call_rt("grasm_val_dec", &[rv]);
+                (v, VType::Option(Box::new(VType::U64)))
+            }
             (VType::Str, "parse_float") => {
                 let v = self.call_rt("grasm_str_parse_float", &[rv]).unwrap();
                 self.call_rt("grasm_val_dec", &[rv]);
@@ -15541,7 +15858,12 @@ this case",
                 };
                 let v = self.call_rt(f, &[rv]).unwrap();
                 self.call_rt("grasm_val_dec", &[rv]);
-                (v, if is_float { VType::F64 } else { VType::I64 })
+                let t = match **e {
+                    VType::F64 => VType::F64,
+                    VType::U64 => VType::U64,
+                    _ => VType::I64,
+                };
+                (v, t)
             }
             (VType::List(e), "any" | "all" | "find") => {
                 let elem_t = (**e).clone();
@@ -15738,7 +16060,7 @@ this case",
             }
             // ---- numeric ----
             // The same total order sorting uses ([L-LIB-SORT-NAN]), callable.
-            (VType::I64 | VType::F64 | VType::Str | VType::Tuple(_), "cmp") => {
+            (VType::I64 | VType::U64 | VType::F64 | VType::Str | VType::Tuple(_), "cmp") => {
                 let rt2 = rt.clone();
                 let ab = self.box_value(rv, &rt2);
                 let (ov, ovt) = self.eval_expr_val(&args[0])?;
@@ -15747,6 +16069,45 @@ this case",
                 self.call_rt("grasm_val_dec", &[ab]);
                 self.call_rt("grasm_val_dec", &[bb]);
                 (v, VType::I64)
+            }
+            // [T-U64]: the methods whose answer depends on reading the bits
+            // unsigned. The rest share the `i64` arms below.
+            (VType::U64, "as_f64") => (self.b.ins().fcvt_from_uint(types::F64, rv), VType::F64),
+            (VType::U64, "to_str") => (
+                self.call_rt("grasm_str_from_u64", &[rv]).unwrap(),
+                VType::Str,
+            ),
+            (VType::U64, "to_base") => {
+                let base = arg_scalar!(0, VType::I64);
+                (
+                    self.call_rt("grasm_u64_to_base", &[rv, base]).unwrap(),
+                    VType::Str,
+                )
+            }
+            (VType::U64, "to_char") => {
+                let v = self.call_rt("grasm_u64_to_char", &[rv]).unwrap();
+                (v, VType::Str)
+            }
+            (VType::U64, "abs") => (rv, VType::U64),
+            (VType::U64, "min" | "max") => {
+                let a = arg_scalar!(0, VType::U64);
+                let out = if m == "min" {
+                    self.b.ins().umin(rv, a)
+                } else {
+                    self.b.ins().umax(rv, a)
+                };
+                (out, VType::U64)
+            }
+            // Never negative, so there is no sign for `shr` to keep.
+            (VType::U64, "shl" | "shr" | "ushr") => {
+                let a = arg_scalar!(0, VType::I64);
+                let count = self.b.ins().band_imm(a, 63);
+                let out = if m == "shl" {
+                    self.b.ins().ishl(rv, count)
+                } else {
+                    self.b.ins().ushr(rv, count)
+                };
+                (out, VType::U64)
             }
             (VType::I64, "as_f64") => (self.b.ins().fcvt_from_sint(types::F64, rv), VType::F64),
             (VType::I64, "to_str") => (
@@ -15840,16 +16201,16 @@ this case",
                 self.call_rt("grasm_val_dec", &[rv]);
                 (v, VType::Bytes)
             }
-            (VType::I64, "bit_and" | "bit_or" | "bit_xor") => {
-                let a = arg_scalar!(0, VType::I64);
+            (VType::I64 | VType::U64, "bit_and" | "bit_or" | "bit_xor") => {
+                let a = arg_scalar!(0, rt.clone());
                 let out = match m {
                     "bit_and" => self.b.ins().band(rv, a),
                     "bit_or" => self.b.ins().bor(rv, a),
                     _ => self.b.ins().bxor(rv, a),
                 };
-                (out, VType::I64)
+                (out, rt.clone())
             }
-            (VType::I64, "bit_not") => (self.b.ins().bnot(rv), VType::I64),
+            (VType::I64 | VType::U64, "bit_not") => (self.b.ins().bnot(rv), rt.clone()),
             (VType::I64, "shl" | "shr" | "ushr") => {
                 let a = arg_scalar!(0, VType::I64);
                 let sixty_three = self.b.ins().iconst(types::I64, 63);
@@ -16344,6 +16705,12 @@ checker did",
         // A method answering a fixed-width integer -- `b.abs()`, `b.shl(1)`,
         // `xs.sum()` on a `[u8]` -- answers at that width ([T-INT-FIXED]).
         let out = (self.narrowed(span, out.0, &out.1), out.1);
+        // A method the checker typed `u64` answers one, whichever arm made the
+        // word ([T-U64]).
+        let out = match (&out.1, self.narrow_at(span)) {
+            (VType::I64, Some(grasm_sema::types::IntKind::U64)) => (out.0, VType::U64),
+            _ => out,
+        };
         Ok(Some(out))
     }
 
@@ -16455,6 +16822,9 @@ checker did",
     /// `v` wrapped to `k`'s width: its low bits, sign-extended for a signed
     /// type. Two instructions at most, and none for an `i64`.
     fn wrap_to(&mut self, v: Value, k: grasm_sema::types::IntKind) -> Value {
+        if k.bits() == 64 {
+            return v;
+        }
         let shift = i64::from(64 - k.bits());
         if k.signed() {
             let up = self.b.ins().ishl_imm(v, shift);
@@ -16531,6 +16901,12 @@ checker did",
         if rt == VType::I64 && lt == VType::F64 {
             rv = self.b.ins().fcvt_from_sint(types::F64, rv);
             rt = VType::F64;
+        }
+        // The checker never mixes `u64` with `i64`: an `i64` beside a `u64`
+        // is a literal of it, and its bits are already the `u64`'s.
+        if (lt == VType::U64 && rt == VType::I64) || (lt == VType::I64 && rt == VType::U64) {
+            lt = VType::U64;
+            rt = VType::U64;
         }
         // `Any` is what a value with nothing to say about its element type
         // carries — `None`, an `Err` with no ok half. Comparing it with a
@@ -16628,6 +17004,42 @@ checker did",
             return nope(span, "this operator on boxed values");
         }
         let out = match (&lt, op) {
+            // [T-U64]: the ring operations are the `i64` ones on the same
+            // bits; the rest read them unsigned. Neither division can trap
+            // past the zero check: there is no `MIN / -1` without a sign.
+            (VType::U64, Add) => (self.b.ins().iadd(lv, rv), VType::U64),
+            (VType::U64, Sub) => (self.b.ins().isub(lv, rv), VType::U64),
+            (VType::U64, Mul) => (self.b.ins().imul(lv, rv), VType::U64),
+            (VType::U64, Div) => {
+                self.guard_zero(rv, "grasm_panic_div_zero");
+                (self.b.ins().udiv(lv, rv), VType::U64)
+            }
+            (VType::U64, Rem) => {
+                self.guard_zero(rv, "grasm_panic_rem_zero");
+                (self.b.ins().urem(lv, rv), VType::U64)
+            }
+            (VType::U64, Pow) => (
+                self.call_rt("grasm_pow_u64", &[lv, rv]).unwrap(),
+                VType::U64,
+            ),
+            (VType::U64, Eq) => (self.b.ins().icmp(IntCC::Equal, lv, rv), VType::Bool),
+            (VType::U64, NotEq) => (self.b.ins().icmp(IntCC::NotEqual, lv, rv), VType::Bool),
+            (VType::U64, Lt) => (
+                self.b.ins().icmp(IntCC::UnsignedLessThan, lv, rv),
+                VType::Bool,
+            ),
+            (VType::U64, LtEq) => (
+                self.b.ins().icmp(IntCC::UnsignedLessThanOrEqual, lv, rv),
+                VType::Bool,
+            ),
+            (VType::U64, Gt) => (
+                self.b.ins().icmp(IntCC::UnsignedGreaterThan, lv, rv),
+                VType::Bool,
+            ),
+            (VType::U64, GtEq) => (
+                self.b.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, lv, rv),
+                VType::Bool,
+            ),
             (VType::I64, Add) => (self.b.ins().iadd(lv, rv), VType::I64),
             (VType::I64, Sub) => (self.b.ins().isub(lv, rv), VType::I64),
             (VType::I64, Mul) => (self.b.ins().imul(lv, rv), VType::I64),
@@ -17580,6 +17992,15 @@ checker did",
                 self.call_rt("grasm_val_dec", &[lv]);
                 return Ok(Some((v, VType::Bytes)));
             }
+            // [L-LIB-BUILDER]: an empty one of each.
+            "str_builder" => {
+                let v = self.call_rt("grasm_strbuf_new", &[]).unwrap();
+                return Ok(Some((v, VType::StrBuf)));
+            }
+            "byte_builder" => {
+                let v = self.call_rt("grasm_bytebuf_new", &[]).unwrap();
+                return Ok(Some((v, VType::ByteBuf)));
+            }
             // No list to build and throw away, which is the reason it exists
             // ([L-LIB-BYTES-WRITE]).
             "bytes_filled" => {
@@ -18191,6 +18612,9 @@ type parameters",
                                 VType::I64 => {
                                     self.call_rt("grasm_out_i64", &[v]);
                                 }
+                                VType::U64 => {
+                                    self.call_rt("grasm_out_u64", &[v]);
+                                }
                                 VType::F64 => {
                                     self.call_rt("grasm_out_f64", &[v]);
                                 }
@@ -18226,6 +18650,9 @@ type parameters",
                 match vt {
                     VType::I64 => {
                         self.call_rt("grasm_out_i64", &[v]);
+                    }
+                    VType::U64 => {
+                        self.call_rt("grasm_out_u64", &[v]);
                     }
                     VType::F64 => {
                         self.call_rt("grasm_out_f64", &[v]);
@@ -18582,7 +19009,12 @@ fields, not the type this is bound to, not an enclosing generic",
             if ft.boxed()
                 || matches!(
                     ft,
-                    VType::I64 | VType::F64 | VType::Bool | VType::Unit | VType::Ref(_)
+                    VType::I64
+                        | VType::U64
+                        | VType::F64
+                        | VType::Bool
+                        | VType::Unit
+                        | VType::Ref(_)
                 )
             {
                 let hv = self.new_var(&VType::Str);
@@ -18917,7 +19349,7 @@ fields, not the type this is bound to, not an enclosing generic",
         // bits through a slot, anything else as its (owned) box.
         let scalar = matches!(
             *ok_t,
-            VType::I64 | VType::F64 | VType::Bool | VType::Ref(_) | VType::Unit
+            VType::I64 | VType::U64 | VType::F64 | VType::Bool | VType::Ref(_) | VType::Unit
         );
         let ptr_ty = self.cg.module.target_config().pointer_type();
         let (taken, bits_slot) = if scalar {
@@ -19454,6 +19886,9 @@ fields, not the type this is bound to, not an enclosing generic",
             // gets one type declared and the other jumped to it
             // ([T-INT-TO-FLOAT-CARRIED]).
             Expr::Int(_, sp) if self.cg.float_literals.contains(&sp.start) => VType::F64,
+            Expr::Int(_, sp) if self.narrow_at(*sp) == Some(grasm_sema::types::IntKind::U64) => {
+                VType::U64
+            }
             Expr::Int(..) => VType::I64,
             Expr::Float(..) => VType::F64,
             Expr::Bool(..) => VType::Bool,
@@ -19751,6 +20186,8 @@ fields, not the type this is bound to, not an enclosing generic",
                                 ))
                             }
                             "bytes_of" | "bytes_filled" => Some(VType::Bytes),
+                            "str_builder" => Some(VType::StrBuf),
+                            "byte_builder" => Some(VType::ByteBuf),
                             "random_bytes" => Some(VType::Fallible(
                                 Box::new(VType::Bytes),
                                 Box::new(VType::Sum("IoError".into())),
@@ -20206,6 +20643,9 @@ fields, not the type this is bound to, not an enclosing generic",
                 "codes" => VType::List(Box::new(VType::I64)),
                 "as_f64" => VType::F64,
                 "as_i64" => VType::I64,
+                "as_u64" => VType::U64,
+                "try_u64" | "parse_u64" | "parse_u64_base" => VType::Option(Box::new(VType::U64)),
+                "try_i64" => VType::Option(Box::new(VType::I64)),
                 n if n.starts_with("as_")
                     && grasm_sema::types::IntKind::from_name(&n[3..]).is_some() =>
                 {
@@ -20216,10 +20656,16 @@ fields, not the type this is bound to, not an enclosing generic",
                 {
                     VType::Option(Box::new(VType::I64))
                 }
-                "checked_add" | "checked_sub" | "checked_mul" => {
-                    VType::Option(Box::new(VType::I64))
+                "checked_add" | "checked_sub" | "checked_mul" => match self.probe_type(recv)? {
+                    VType::U64 => VType::Option(Box::new(VType::U64)),
+                    _ => VType::Option(Box::new(VType::I64)),
+                },
+                "saturating_add" | "saturating_sub" | "saturating_mul" => {
+                    match self.probe_type(recv)? {
+                        VType::U64 => VType::U64,
+                        _ => VType::I64,
+                    }
                 }
-                "saturating_add" | "saturating_sub" | "saturating_mul" => VType::I64,
                 "to_bits" => VType::I64,
                 "from_bits" => VType::F64,
                 // Numeric methods. Their absence here did not merely make a
@@ -20238,7 +20684,12 @@ fields, not the type this is bound to, not an enclosing generic",
                 // Without this the probe could not type `(v.ushr(8)).bit_and(0xFF)`
                 // — a chain that every little-endian field in a binary format
                 // is built from.
-                "bit_and" | "bit_or" | "bit_xor" | "bit_not" | "shl" | "shr" | "ushr" => VType::I64,
+                "count_ones" | "leading_zeros" | "trailing_zeros" => VType::I64,
+                "bit_and" | "bit_or" | "bit_xor" | "bit_not" | "shl" | "shr" | "ushr"
+                | "rotate_left" | "rotate_right" | "swap_bytes" => match self.probe_type(recv)? {
+                    VType::U64 => VType::U64,
+                    _ => VType::I64,
+                },
                 // Bytes ([L-LIB-BYTES]).
                 "to_bytes" => VType::Bytes,
                 "at" => VType::I64,
@@ -20343,7 +20794,7 @@ fields, not the type this is bound to, not an enclosing generic",
                 // yields the receiver's own type.
                 "min" | "max" => match self.probe_type(recv)? {
                     VType::List(elem) => VType::Option(elem),
-                    n @ (VType::I64 | VType::F64) => n,
+                    n @ (VType::I64 | VType::U64 | VType::F64) => n,
                     _ => {
                         return nope(
                             e.span(),

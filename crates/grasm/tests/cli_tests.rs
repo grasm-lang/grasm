@@ -2381,3 +2381,91 @@ fn writing_a_bytes_buffer_needs_a_mutable_binding() {
         "writing through a `let` was not refused with the usual message:\n{text}"
     );
 }
+
+/// A `u64` is unsigned in both engines and in every place it can be: printed
+/// alone, inside a list and a struct, compared and divided ([T-U64]). The
+/// two engines agreeing is not the test -- each must print the unsigned
+/// answer, written out here.
+#[test]
+fn u64_is_unsigned_in_both_engines() {
+    let w = Work::new("u64");
+    let src = w.0.join("u.gr");
+    let out = w.0.join("u");
+    std::fs::write(
+        &src,
+        "type H = { h: u64 }\n\nfn main() {\n    let top: u64 = 18446744073709551615\n    \
+         let xs: [u64] = [top, 1]\n    print(\"{top} {top / 2} {top > 1} {xs} {H{ h: top }}\")\n}\n",
+    )
+    .unwrap();
+    let want = "18446744073709551615 9223372036854775807 true [18446744073709551615, 1] H{h: 18446744073709551615}";
+    let (code, msg) = run(&["run", src.to_str().unwrap()]);
+    assert_eq!(code, 0, "{msg}");
+    assert_eq!(msg.trim(), want, "grasm run");
+    let (code, msg) = run(&[
+        "build",
+        src.to_str().unwrap(),
+        "--native",
+        "-o",
+        out.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "{msg}");
+    let got = Command::new(&out).output().expect("runs");
+    assert!(
+        got.status.success(),
+        "the binary failed with {:?}",
+        got.status
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&got.stdout).trim(),
+        want,
+        "--native"
+    );
+}
+
+/// A builder is a value in both engines ([L-LIB-BUILDER]): the copy taken
+/// before an append does not see it, whether the builder is a variable or a
+/// field reached through an `inout` parameter -- the two places an in-place
+/// append could leak through a shared buffer -- and the compiled program
+/// leaves nothing live.
+#[test]
+fn a_builder_copy_does_not_see_later_appends() {
+    let w = Work::new("builder");
+    let src = w.0.join("b.gr");
+    let out = w.0.join("b");
+    std::fs::write(
+        &src,
+        "type Out = { text: StrBuilder }\n\nfn emit(inout o: Out, s: str) {\n    o.text.push_str(s)\n}\n\n\
+         fn main() {\n    var b = byte_builder()\n    b.push_byte(1)\n    let kept = b\n    b.push_bytes(bytes_of([2, 3]))\n    \
+         var o = Out{ text: str_builder() }\n    emit(o, \"ab\")\n    let snap = o\n    emit(o, \"cd\")\n    \
+         print(\"{kept} {b} {snap.text} {o.text} {o.text.len()}\")\n}\n",
+    )
+    .unwrap();
+    let want = "0x01 0x010203 ab abcd 4";
+    let (code, msg) = run(&["run", src.to_str().unwrap()]);
+    assert_eq!(code, 0, "{msg}");
+    assert_eq!(msg.trim(), want, "grasm run");
+    let (code, msg) = run(&[
+        "build",
+        src.to_str().unwrap(),
+        "--native",
+        "-o",
+        out.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "{msg}");
+    let got = Command::new(&out)
+        .env("GRASM_LEAK_CHECK", "1")
+        .output()
+        .expect("runs");
+    assert!(
+        got.status.success(),
+        "the binary failed with {:?}",
+        got.status
+    );
+    let text = String::from_utf8_lossy(&got.stdout);
+    assert_eq!(text.lines().next().unwrap_or(""), want, "--native");
+    assert!(
+        String::from_utf8_lossy(&got.stderr).contains("nothing live at exit")
+            || text.contains("nothing live at exit"),
+        "the leak check did not run clean: {text}"
+    );
+}

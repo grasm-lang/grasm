@@ -1,0 +1,25 @@
+//! tag: T-U64
+//! expect: output
+//! 18446744073709551615 0 6148914691236517205 5 true
+//! [1, 9223372036854775808, 18446744073709551615] Some(18446744073709551615)
+//! H{h: 18446744073709551615} {1: a, 18446744073709551615: z}
+//! 9223372036854775807 ffffffffffffffff -1 None Some(5)
+//! Some(18446744073709551615) None None 18446744073709551615
+// The top half of a u64 reads as a large number, not a negative i64: in
+// division, comparison, printing and sorting, alone or inside a value.
+type H = { h: u64 }
+
+fn main() {
+    let top: u64 = 18446744073709551615
+    let one: u64 = 1
+    print("{top} {top + one} {top / 3} {top % 10} {top > one}")
+    var xs: [u64] = [top, 1, 0x8000_0000_0000_0000]
+    xs.sort()
+    print("{xs} {xs.max()}")
+    var m: Map[u64, str] = {}
+    m.set(top, "z")
+    m.set(1, "a")
+    print("{H{ h: top }} {m}")
+    print("{top.shr(1)} {top.to_base(16)} {top.as_i64()} {top.try_i64()} {(5).as_u64().try_i64()}")
+    print("{"18446744073709551615".parse_u64()} {"-0".parse_u64()} {"18446744073709551616".parse_u64()} {(0 - 1).as_u64()}")
+}

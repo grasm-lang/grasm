@@ -36,6 +36,11 @@ pub struct Module {
     /// Kept beside the tree rather than on every node so adding documentation
     /// never changes how anything compiles.
     pub docs: std::collections::BTreeMap<u32, String>,
+    /// Where each decimal literal above `i64`'s range was written, by span
+    /// start ([T-U64]). The literal is an `Expr::Int` holding its bits, which
+    /// read as a negative `i64`; this is what tells the checker it was written
+    /// as a large number, so it can be refused anywhere but a `u64`.
+    pub wide_ints: Vec<u32>,
 }
 
 impl Module {

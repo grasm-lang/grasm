@@ -14,6 +14,12 @@ pub type VarId = u32;
 /// the type's width, the way `i64` wraps to 64 ([E-ARITH-INT]). That is what
 /// makes `255 + 1` a `u8` `0` rather than the `i64` `256` these names used to
 /// stand for.
+///
+/// `u64` is the one whose 64 bits are not its value read as an `i64`: from
+/// 2^63 up, the same bits an `i64` reads as negative. So it is the one width
+/// the engines cannot treat as an `i64` with a wrap after each operation; each
+/// carries it as a kind of value of its own ([T-U64]), and the range helpers
+/// below answer in `i128`, where every width's range fits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum IntKind {
     I8,
@@ -22,16 +28,18 @@ pub enum IntKind {
     U8,
     U16,
     U32,
+    U64,
 }
 
 impl IntKind {
-    pub const ALL: [IntKind; 6] = [
+    pub const ALL: [IntKind; 7] = [
         IntKind::I8,
         IntKind::I16,
         IntKind::I32,
         IntKind::U8,
         IntKind::U16,
         IntKind::U32,
+        IntKind::U64,
     ];
 
     pub fn name(self) -> &'static str {
@@ -42,6 +50,7 @@ impl IntKind {
             IntKind::U8 => "u8",
             IntKind::U16 => "u16",
             IntKind::U32 => "u32",
+            IntKind::U64 => "u64",
         }
     }
 
@@ -54,6 +63,7 @@ impl IntKind {
             IntKind::I8 | IntKind::U8 => 8,
             IntKind::I16 | IntKind::U16 => 16,
             IntKind::I32 | IntKind::U32 => 32,
+            IntKind::U64 => 64,
         }
     }
 
@@ -61,24 +71,25 @@ impl IntKind {
         matches!(self, IntKind::I8 | IntKind::I16 | IntKind::I32)
     }
 
-    pub fn min(self) -> i64 {
+    pub fn min(self) -> i128 {
         if self.signed() {
-            -(1i64 << (self.bits() - 1))
+            -(1i128 << (self.bits() - 1))
         } else {
             0
         }
     }
 
-    pub fn max(self) -> i64 {
+    pub fn max(self) -> i128 {
         if self.signed() {
-            (1i64 << (self.bits() - 1)) - 1
+            (1i128 << (self.bits() - 1)) - 1
         } else {
-            (1i64 << self.bits()) - 1
+            (1i128 << self.bits()) - 1
         }
     }
 
     /// `v` wrapped to this width: its low `bits` bits, sign-extended for a
-    /// signed type. Two's complement, as `i64` arithmetic already is.
+    /// signed type. Two's complement, as `i64` arithmetic already is. A `u64`
+    /// keeps all 64 bits as they are.
     pub fn wrap(self, v: i64) -> i64 {
         let shift = 64 - self.bits();
         if self.signed() {
@@ -88,7 +99,18 @@ impl IntKind {
         }
     }
 
-    pub fn fits(self, v: i64) -> bool {
+    /// The number a value of this width, held in 64 bits, stands for: the
+    /// bits read as an `i64` for every width but `u64`, whose top half is
+    /// 2^63 and up rather than negative.
+    pub fn value(self, bits: i64) -> i128 {
+        if self == IntKind::U64 {
+            i128::from(bits as u64)
+        } else {
+            i128::from(bits)
+        }
+    }
+
+    pub fn fits(self, v: i128) -> bool {
         v >= self.min() && v <= self.max()
     }
 
@@ -106,7 +128,8 @@ impl IntKind {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Type {
     I64,
-    /// `i8`, `i16`, `i32`, `u8`, `u16`, `u32` ([T-INT-FIXED]).
+    /// `i8`, `i16`, `i32`, `u8`, `u16`, `u32` ([T-INT-FIXED]) and `u64`
+    /// ([T-U64]).
     Int(IntKind),
     F64,
     Bool,
@@ -122,6 +145,10 @@ pub enum Type {
     /// re-encodes anything above 127 as UTF-8, which is correct for text and
     /// fatal for a BMP header or a machine instruction ([L-LIB-BYTES]).
     Bytes,
+    /// `StrBuilder` and `ByteBuilder` ([L-LIB-BUILDER]): text and bytes that
+    /// grow at the end in amortized constant time, as values like any other.
+    StrBuf,
+    ByteBuf,
     Unit,
     /// `0..n` — iterable of i64.
     Range,
@@ -385,6 +412,8 @@ impl Unifier {
             | (Type::Bool, Type::Bool)
             | (Type::Str, Type::Str)
             | (Type::Bytes, Type::Bytes)
+            | (Type::StrBuf, Type::StrBuf)
+            | (Type::ByteBuf, Type::ByteBuf)
             | (Type::Unit, Type::Unit)
             | (Type::Range, Type::Range) => true,
             (Type::Generic(x), Type::Generic(y)) => x == y,
@@ -489,6 +518,8 @@ fn write_type(f: &mut fmt::Formatter<'_>, ty: &Type, defs: &TypeDefs) -> fmt::Re
         Type::Bool => write!(f, "bool"),
         Type::Str => write!(f, "str"),
         Type::Bytes => write!(f, "bytes"),
+        Type::StrBuf => write!(f, "StrBuilder"),
+        Type::ByteBuf => write!(f, "ByteBuilder"),
         Type::Unit => write!(f, "()"),
         Type::Range => write!(f, "range"),
         Type::Tuple(items) => {

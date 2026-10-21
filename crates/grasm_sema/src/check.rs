@@ -330,6 +330,8 @@ pub const BUILTIN_FREE_FNS: &[&str] = &[
     "make_dir_new",
     "bytes_of",
     "bytes_filled",
+    "str_builder",
+    "byte_builder",
     "read_bytes",
     "read_bytes_at",
     "append_bytes",
@@ -424,6 +426,7 @@ fn check_modules_in(
     c.closure_rows = closure_rows;
     for f in files {
         c.module_imports.insert(f.name.clone(), f.imports.clone());
+        c.wide_ints.extend(f.module.wide_ints.iter().copied());
     }
     for f in files {
         c.current_module = f.name.clone();
@@ -828,6 +831,8 @@ struct Checker {
     float_literals: std::collections::HashSet<u32>,
     /// `x += …` statements whose target is a fixed-width integer.
     narrow_assigns: std::collections::HashMap<(u32, u32), IntKind>,
+    /// Span starts of decimal literals past `i64` (`Module::wide_ints`).
+    wide_ints: std::collections::HashSet<u32>,
     /// The effect row of every expression whose type is a function, keyed by
     /// its whole span. See `record_value_row`.
     value_rows: SpanMap<std::collections::BTreeSet<String>>,
@@ -1171,6 +1176,7 @@ impl Checker {
             extern_names: std::collections::HashSet::new(),
             float_literals: std::collections::HashSet::new(),
             narrow_assigns: std::collections::HashMap::new(),
+            wide_ints: std::collections::HashSet::new(),
             value_rows: SpanMap::default(),
             callee_rows: SpanMap::default(),
             field_calls: SpanSet::default(),
@@ -2711,29 +2717,39 @@ different name, or call it as a method if you meant to extend a type (UFCS)",
                     return Type::Generic(i as u32);
                 }
                 let prim = match name.as_str() {
-                    // [T-INT-FIXED]: each its own type, wrapping at its width.
-                    "i8" | "i16" | "i32" | "u8" | "u16" | "u32" => {
+                    // [T-INT-FIXED], [T-U64]: each its own type, wrapping at
+                    // its width.
+                    "i8" | "i16" | "i32" | "u8" | "u16" | "u32" | "u64" => {
                         IntKind::from_name(name).map(Type::Int)
                     }
                     "i64" | "int" => Some(Type::I64),
                     // These used to be silent aliases, and a silent alias is a
-                    // promise broken without a word: `u64` arithmetic was
-                    // signed, `f32` was a double. Refused until they are real.
-                    "u64" | "usize" | "f32" => {
+                    // promise broken without a word: `f32` was a double, and
+                    // `usize` would say "the platform's width" about a type
+                    // that has one width everywhere. Refused until they are
+                    // real.
+                    "usize" | "f32" => {
                         let (what, instead) = match name.as_str() {
                             "f32" => ("single-precision floating point", "f64"),
-                            _ => ("unsigned 64-bit arithmetic", "i64"),
+                            _ => ("a platform-sized integer", "i64"),
+                        };
+                        let write = if name == "usize" {
+                            "`u64` or `i64`"
+                        } else {
+                            "`f64`"
                         };
                         return self.error_help(
                             *span,
                             format!("`{name}` is not implemented yet: Grasm does not have {what}"),
-                            format!("it used to be another name for `{instead}` and behaved like one; write `{instead}` ([T-INT-FIXED])"),
+                            format!("it used to be another name for `{instead}` and behaved like one; write {write} ([T-INT-FIXED])"),
                         );
                     }
                     "f64" | "float" => Some(Type::F64),
                     "bool" => Some(Type::Bool),
                     "str" => Some(Type::Str),
                     "bytes" => Some(Type::Bytes),
+                    "StrBuilder" => Some(Type::StrBuf),
+                    "ByteBuilder" => Some(Type::ByteBuf),
                     // `Type::Range` has displayed as `range` since ranges
                     // became values, so the name was already in the language's
                     // error messages -- and nowhere else. Nothing parsed it, so
@@ -4784,7 +4800,11 @@ write back to — copy it into a local first, as in `var {} = {}`",
         // Int literal adapts to f64. Recorded, not just allowed: the engines
         // have no types of their own and would otherwise keep the value an
         // integer for the whole run ([T-INT-TO-FLOAT]).
-        if let (Expr::Int(..), Type::F64) = (e, &want) {
+        if let (Expr::Int(_, sp), Type::F64) = (e, &want) {
+            if self.wide_ints.contains(&sp.start) {
+                self.wide_literal(*sp, "f64");
+                return;
+            }
             self.float_literals.insert(e.span().start);
             return;
         }
@@ -4792,8 +4812,9 @@ write back to — copy it into a local first, as in `var {} = {}`",
         // against, if it fits. It is the same number in every engine, so
         // nothing needs recording beyond the type itself.
         if let (Expr::Int(v, sp), Type::Int(k)) = (e, &want) {
-            if !k.fits(*v) {
-                self.literal_out_of_range(*sp, *v, *k);
+            let n = self.lit_value(*k, *v, *sp, false);
+            if !k.fits(n) {
+                self.literal_out_of_range(*sp, n, *k);
             }
             self.resolved_types.insert((sp.start, sp.end), want.clone());
             return;
@@ -4807,8 +4828,8 @@ write back to — copy it into a local first, as in `var {} = {}`",
             Type::Int(k),
         ) = (e, &want)
         {
-            if let Expr::Int(v, _) = **expr {
-                let n = v.wrapping_neg();
+            if let Expr::Int(v, isp) = **expr {
+                let n = self.lit_value(*k, v, isp, true);
                 if !k.fits(n) {
                     self.literal_out_of_range(*nsp, n, *k);
                 }
@@ -4826,7 +4847,11 @@ write back to — copy it into a local first, as in `var {} = {}`",
             Type::F64,
         ) = (e, &want)
         {
-            if matches!(**expr, Expr::Int(..)) {
+            if let Expr::Int(_, isp) = **expr {
+                if self.wide_ints.contains(&isp.start) {
+                    self.wide_literal(isp, "f64");
+                    return;
+                }
                 self.float_literals.insert(expr.span().start);
                 return;
             }
@@ -5314,6 +5339,10 @@ allocates could outlive it — move the work out of the region, or yield a numbe
             self.discarding = false;
         }
         match e {
+            Expr::Int(_, sp) if self.wide_ints.contains(&sp.start) => {
+                self.wide_literal(*sp, "i64");
+                Type::Error
+            }
             Expr::Int(..) => Type::I64,
             Expr::Float(..) => Type::F64,
             Expr::Bool(..) => Type::Bool,
@@ -5433,6 +5462,15 @@ allocates could outlive it — move the work out of the region, or yield a numbe
                 }
             }
             Expr::Unary { op, expr, span } => match op {
+                // `-9223372036854775808` is `i64`'s least value, written as
+                // it is printed: the literal is 2^63, past `i64`, and its
+                // negation is not ([T-U64]).
+                UnaryOp::Neg
+                    if matches!(**expr, Expr::Int(v, sp)
+                        if v == i64::MIN && self.wide_ints.contains(&sp.start)) =>
+                {
+                    Type::I64
+                }
                 UnaryOp::Neg => {
                     let t = self.infer_expr(expr);
                     let r = self.uni.shallow_resolve(&t);
@@ -6276,6 +6314,17 @@ only a number or a `bool` can come out — compute what you need and yield that"
                         self.check_expr(&args[0], &Type::I64);
                         self.check_expr(&args[1], &Type::I64);
                         return Type::Bytes;
+                    }
+                    // [L-LIB-BUILDER]: an empty one of each.
+                    "str_builder" | "byte_builder" => {
+                        if !args.is_empty() {
+                            return self.error(span, format!("{} takes no arguments", id.name));
+                        }
+                        return if id.name == "str_builder" {
+                            Type::StrBuf
+                        } else {
+                            Type::ByteBuf
+                        };
                     }
                     "random_bytes" => {
                         if args.len() != 1 {
@@ -8154,6 +8203,18 @@ Perform the effect after the closing brace, or yield a number and do the work ou
                     }
                     self.defs.option_some(Type::I64)
                 }
+                // `parse_int` answers an `i64`, which has no room for the top
+                // half of a `u64` ([T-U64]).
+                "parse_u64" => {
+                    check_arity(self, 0);
+                    self.defs.option_some(Type::Int(IntKind::U64))
+                }
+                "parse_u64_base" => {
+                    if check_arity(self, 1) {
+                        self.check_expr(&args[0], &Type::I64);
+                    }
+                    self.defs.option_some(Type::Int(IntKind::U64))
+                }
                 "parse_float" => {
                     check_arity(self, 0);
                     self.defs.option_some(Type::F64)
@@ -8300,6 +8361,65 @@ Perform the effect after the closing brace, or yield a number and do the work ou
                 }
                 _ => return None,
             },
+            // The builders ([L-LIB-BUILDER]). Each append writes through
+            // the receiver, so it needs a mutable place, as `push` does.
+            t @ (Type::StrBuf | Type::ByteBuf) => {
+                let bytes = matches!(t, Type::ByteBuf);
+                match (name.name.as_str(), bytes) {
+                    ("push_str", _) => {
+                        if check_arity(self, 1) {
+                            self.check_expr(&args[0], &Type::Str);
+                            self.require_mutable(recv, name);
+                        }
+                        Type::Unit
+                    }
+                    ("push_byte", true) => {
+                        if check_arity(self, 1) {
+                            self.check_expr(&args[0], &Type::I64);
+                            self.require_mutable(recv, name);
+                        }
+                        Type::Unit
+                    }
+                    ("push_bytes", true) => {
+                        if check_arity(self, 1) {
+                            self.check_expr(&args[0], &Type::Bytes);
+                            self.require_mutable(recv, name);
+                        }
+                        Type::Unit
+                    }
+                    ("set", true) => {
+                        if check_arity(self, 2) {
+                            self.check_expr(&args[0], &Type::I64);
+                            self.check_expr(&args[1], &Type::I64);
+                            self.require_mutable(recv, name);
+                        }
+                        Type::Unit
+                    }
+                    ("at", true) => {
+                        if check_arity(self, 1) {
+                            self.check_expr(&args[0], &Type::I64);
+                        }
+                        Type::I64
+                    }
+                    ("len", _) => {
+                        check_arity(self, 0);
+                        Type::I64
+                    }
+                    ("is_empty", _) => {
+                        check_arity(self, 0);
+                        Type::Bool
+                    }
+                    ("to_str", _) => {
+                        check_arity(self, 0);
+                        Type::Str
+                    }
+                    ("to_bytes", true) => {
+                        check_arity(self, 0);
+                        Type::Bytes
+                    }
+                    _ => return None,
+                }
+            }
             Type::Tuple(_) if name.name == "cmp" => return self.check_cmp(recv, args, span),
             Type::I64 | Type::Int(_) => {
                 // Every integer type has the same methods, answering in its
@@ -8328,10 +8448,15 @@ Perform the effect after the closing brace, or yield a number and do the work ou
                         Type::F64
                     }
                     // Widening, so it never loses anything; on an `i64` it is
-                    // the value itself.
+                    // the value itself. A `u64` from 2^63 up has no `i64`
+                    // with its value, and gives its bits ([T-U64]).
                     "as_i64" => {
                         check_arity(self, 0);
                         Type::I64
+                    }
+                    "try_i64" => {
+                        check_arity(self, 0);
+                        self.defs.option_some(Type::I64)
                     }
                     // The other half of `code_at`: a code point back to text.
                     "to_char" => {
@@ -8383,6 +8508,23 @@ Perform the effect after the closing brace, or yield a number and do the work ou
                         me
                     }
                     "bit_not" => {
+                        check_arity(self, 0);
+                        me
+                    }
+                    // [L-LIB-BITS-WIDTH]: the bits at the receiver's own
+                    // width. A count is an `i64`, as a shift count is, and so
+                    // is the answer of the three that count.
+                    "rotate_left" | "rotate_right" => {
+                        if check_arity(self, 1) {
+                            self.check_expr(&args[0], &Type::I64);
+                        }
+                        me
+                    }
+                    "count_ones" | "leading_zeros" | "trailing_zeros" => {
+                        check_arity(self, 0);
+                        Type::I64
+                    }
+                    "swap_bytes" => {
                         check_arity(self, 0);
                         me
                     }
@@ -9050,13 +9192,13 @@ bind the component to a `var`, or use a struct when the parts have names worth w
     /// fits: `b + 1` and `1 + b` are both `u8` for `b: u8` ([T-INT-FIXED]).
     fn literal_adopts(&mut self, lit: &Expr, k: IntKind) {
         let (v, sp) = match lit {
-            Expr::Int(v, sp) => (*v, *sp),
+            Expr::Int(v, sp) => (self.lit_value(k, *v, *sp, false), *sp),
             Expr::Unary {
                 op: UnaryOp::Neg,
                 expr,
                 span,
             } => match **expr {
-                Expr::Int(v, _) => (v.wrapping_neg(), *span),
+                Expr::Int(v, isp) => (self.lit_value(k, v, isp, true), *span),
                 _ => return,
             },
             _ => return,
@@ -9067,20 +9209,65 @@ bind the component to a `var`, or use a struct when the parts have names worth w
         self.resolved_types.insert((sp.start, sp.end), Type::Int(k));
     }
 
-    fn literal_out_of_range(&mut self, span: Span, v: i64, k: IntKind) {
+    /// The number a literal stands for against `k`: [`literal_value`], except
+    /// that a decimal literal past `i64` is the large number it was written
+    /// as whatever the width ([T-U64]).
+    fn lit_value(&self, k: IntKind, v: i64, at: Span, negated: bool) -> i128 {
+        if self.wide_ints.contains(&at.start) {
+            let n = i128::from(v as u64);
+            return if negated { -n } else { n };
+        }
+        literal_value(k, v, negated)
+    }
+
+    /// A decimal literal past `i64`, somewhere other than a `u64`.
+    fn wide_literal(&mut self, at: Span, ty: &str) {
+        self.error_help(
+            at,
+            format!("this literal is too large for `{ty}`"),
+            "only a `u64` holds a number past 9223372036854775807; write it where a `u64` is expected -- an annotation, a parameter, a field, or beside another `u64` ([T-U64])",
+        );
+    }
+
+    /// Whether `e` is a decimal literal past `i64`, or its negation.
+    fn is_wide_literal(&self, e: &Expr) -> bool {
+        match e {
+            Expr::Int(_, sp) => self.wide_ints.contains(&sp.start),
+            Expr::Unary {
+                op: UnaryOp::Neg,
+                expr,
+                ..
+            } => self.is_wide_literal(expr),
+            _ => false,
+        }
+    }
+
+    fn literal_out_of_range(&mut self, span: Span, v: i128, k: IntKind) {
         self.error_help(
             span,
             format!("`{v}` does not fit in `{}`", k.name()),
             format!(
-                "`{}` holds {} to {}; a value outside that is not written as a literal of it ([T-INT-FIXED])",
+                "`{}` holds {} to {}; a value outside that is not written as a literal of it ([{}])",
                 k.name(),
                 k.min(),
-                k.max()
+                k.max(),
+                if k == IntKind::U64 { "T-U64" } else { "T-INT-FIXED" }
             ),
         );
     }
 
     fn float_aware_lhs_seen(&mut self, lhs: &Expr, rhs: &Expr) -> (Type, Option<Type>) {
+        // `18446744073709551615 - x` for a `u64` x: the literal has no type
+        // of its own to infer, so the other side is asked first ([T-U64]).
+        if self.is_wide_literal(lhs) {
+            let probe = self.infer_expr(rhs);
+            if let Type::Int(k) = self.uni.shallow_resolve(&probe) {
+                self.literal_adopts(lhs, k);
+                return (Type::Int(k), Some(probe));
+            }
+            let lhs_ty = self.infer_expr(lhs);
+            return (lhs_ty, Some(probe));
+        }
         let lhs_ty = self.infer_expr(lhs);
         let literal_span = match lhs {
             Expr::Int(..) => Some(lhs.span().start),
@@ -9109,6 +9296,10 @@ bind the component to a `var`, or use a struct when the parts have names worth w
     }
 
     fn float_aware_lhs(&mut self, lhs: &Expr, rhs: &Expr) -> Type {
+        if self.is_wide_literal(lhs) {
+            let (t, _) = self.float_aware_lhs_seen(lhs, rhs);
+            return t;
+        }
         let lhs_ty = self.infer_expr(lhs);
         // A negated literal is a literal: `-3` is `Neg` applied to `3`, and
         // matching only the bare shape meant `2.5 * -3` worked while
@@ -9683,10 +9874,28 @@ bind the component to a `var`, or use a struct when the parts have names worth w
                 }
             }
             Pattern::Wildcard(_) => None,
+            Pattern::Int(_, span) if self.wide_ints.contains(&span.start) => {
+                self.error_help(
+                    *span,
+                    "a pattern names a value from 0 to 9223372036854775807",
+                    "a `u64` past that is matched with a guard: `n if n == 18446744073709551615` ([T-U64])",
+                );
+                Some("<int>".into())
+            }
             Pattern::Int(v, span) => {
                 if let Type::Int(k) = self.uni.shallow_resolve(expected) {
-                    if !k.fits(*v) {
-                        self.literal_out_of_range(*span, *v, k);
+                    // A pattern's literal arrives already negated, so a
+                    // `u64` pattern is read as the `i64` it was written as:
+                    // `-1` is refused rather than taken for 2^64 - 1, and a
+                    // value from 2^63 up is matched in a guard ([T-U64]).
+                    if k == IntKind::U64 && *v < 0 {
+                        self.error_help(
+                            *span,
+                            "a pattern on a `u64` names a value from 0 to 9223372036854775807",
+                            "a negative number is no `u64`, and one from 2^63 up is matched with a guard: `n if n == 0xFFFF_FFFF_FFFF_FFFF` ([T-U64])",
+                        );
+                    } else if !k.fits(i128::from(*v)) {
+                        self.literal_out_of_range(*span, i128::from(*v), k);
                     }
                     return Some("<int>".into());
                 }
@@ -10545,6 +10754,11 @@ fn int_mix_help(got: &Type, want: &Type) -> Option<String> {
     if g == w {
         return None;
     }
+    if w == "i64" && g == "u64" {
+        return Some(
+            "`u64` and `i64` are different types and do not convert on their own -- `.try_i64()` gives the same value or `None` past `i64`, `.as_i64()` gives the bits ([T-U64])".to_string(),
+        );
+    }
     if w == "i64" {
         return Some(format!(
             "`{g}` and `i64` are different types and do not convert on their own -- `.as_i64()` gives the same value as an `i64`"
@@ -10693,5 +10907,19 @@ pub(crate) fn idents_in(e: &Expr, out: &mut Vec<String>) {
             }
         }
         _ => {}
+    }
+}
+
+/// The number an integer literal written against `k` stands for, for its
+/// range check ([T-INT-FIXED-RANGE]). A hex or binary literal is a bit
+/// pattern, so `0xFFFF_FFFF_FFFF_FFFF` arrives as the `i64` -1; against a
+/// `u64` it is read as the pattern, 2^64 - 1, and only zero survives a
+/// negation. Every other width reads the `i64` as it always has.
+fn literal_value(k: IntKind, v: i64, negated: bool) -> i128 {
+    match (k, negated) {
+        (IntKind::U64, false) => k.value(v),
+        (IntKind::U64, true) => -k.value(v),
+        (_, false) => i128::from(v),
+        (_, true) => i128::from(v.wrapping_neg()),
     }
 }

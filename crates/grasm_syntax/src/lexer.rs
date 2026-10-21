@@ -341,13 +341,15 @@ impl<'a> Lexer<'a> {
         } else {
             match text.parse::<i64>() {
                 Ok(v) => self.tok(TokenKind::Int(v), start),
+                // Past `i64` and within `u64`: a number only a `u64` can
+                // hold. The checker refuses it in any other place ([T-U64]).
+                Err(_) if text.parse::<u64>().is_ok() => {
+                    self.tok(TokenKind::WideInt(text.parse::<u64>().unwrap_or(0)), start)
+                }
+                // Past `u64` too, so past every integer type there is.
                 Err(_) => self.tok(
-                    // Naming the workaround, because the most-negative i64
-                    // has no literal spelling at all: `-9223372036854775808`
-                    // is a negation applied to a literal one past the range,
-                    // and every program that needs it writes the subtraction.
                     TokenKind::Error(format!(
-                        "integer literal `{text}` is too large — the range is -9223372036854775808 to 9223372036854775807, and the most negative one is written `0 - 9223372036854775807 - 1`"
+                        "integer literal `{text}` is too large — the largest integer is 18446744073709551615, a `u64`, and the largest `i64` 9223372036854775807"
                     )),
                     start,
                 ),

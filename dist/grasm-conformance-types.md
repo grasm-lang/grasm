@@ -1,6 +1,6 @@
 # Grasm — conformance programs: types
 
-The type and effect system — what a program means before it runs. 111 executable program(s), one per normative clause of
+The type and effect system — what a program means before it runs. 112 executable program(s), one per normative clause of
 `grasm-language-pack.md`. Each header states the tag it demonstrates and the
 exact expected behaviour, and every one is run by `cargo test -p grasm_spec`, so
 a program here cannot describe behaviour the implementation does not have.
@@ -1764,10 +1764,11 @@ fn main() {
 //! tag: T-INT-FIXED-REFUSED
 //! expect: error
 //! is not implemented yet
-// u64 was an alias for i64, so its arithmetic was signed. Refused until it
-// is real, rather than kept as a name that says something it does not do.
+// usize was an alias for i64, so its arithmetic was signed and its width was
+// not the platform's. Refused until it is real, rather than kept as a name
+// that says something it does not do. (u64 is real now: [T-U64].)
 fn main() {
-    let a: u64 = 1
+    let a: usize = 1
     print(a)
 }
 ```
@@ -3959,6 +3960,36 @@ pub type Point = { x: i64, y: i64 }
 
 fn main() {
     print("{Point{ x: 1, y: 2 }.x}")
+}
+```
+
+## `T-U64.gr`
+
+```grasm
+//! tag: T-U64
+//! expect: output
+//! 18446744073709551615 0 6148914691236517205 5 true
+//! [1, 9223372036854775808, 18446744073709551615] Some(18446744073709551615)
+//! H{h: 18446744073709551615} {1: a, 18446744073709551615: z}
+//! 9223372036854775807 ffffffffffffffff -1 None Some(5)
+//! Some(18446744073709551615) None None 18446744073709551615
+// The top half of a u64 reads as a large number, not a negative i64: in
+// division, comparison, printing and sorting, alone or inside a value.
+type H = { h: u64 }
+
+fn main() {
+    let top: u64 = 18446744073709551615
+    let one: u64 = 1
+    print("{top} {top + one} {top / 3} {top % 10} {top > one}")
+    var xs: [u64] = [top, 1, 0x8000_0000_0000_0000]
+    xs.sort()
+    print("{xs} {xs.max()}")
+    var m: Map[u64, str] = {}
+    m.set(top, "z")
+    m.set(1, "a")
+    print("{H{ h: top }} {m}")
+    print("{top.shr(1)} {top.to_base(16)} {top.as_i64()} {top.try_i64()} {(5).as_u64().try_i64()}")
+    print("{"18446744073709551615".parse_u64()} {"-0".parse_u64()} {"18446744073709551616".parse_u64()} {(0 - 1).as_u64()}")
 }
 ```
 

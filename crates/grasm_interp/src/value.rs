@@ -76,6 +76,11 @@ pub fn float_text(v: f64) -> String {
 #[derive(Debug, Clone)]
 pub enum Value {
     Int(i64),
+    /// A `u64` ([T-U64]). Every other integer width is the `i64` it stands
+    /// for, so it can be an `Int`; a `u64` from 2^63 up is not, and it is the
+    /// value that knows to print, compare and divide as unsigned -- inside a
+    /// list, a struct or a map as much as on its own.
+    U64(u64),
     Float(f64),
     Bool(bool),
     Str(Rc<GStr>),
@@ -85,6 +90,12 @@ pub enum Value {
     /// promise this type makes — every element is a byte — is exactly what the
     /// representation should carry. It is also eight times smaller.
     Bytes(Rc<Vec<u8>>),
+    /// A `StrBuilder` ([L-LIB-BUILDER]): text that grows at its end.
+    /// `Rc::make_mut` is the copy-on-write, so an append to the only holder
+    /// is the `String`'s own amortized push and a copy is still a copy.
+    StrBuf(Rc<TextBuf>),
+    /// A `ByteBuilder`: bytes that grow at the end, the same way.
+    ByteBuf(Rc<Vec<u8>>),
     Unit,
     Range(i64, i64, bool),
     List(Rc<Vec<Value>>),
@@ -135,18 +146,30 @@ pub enum ClosureBody {
     Block(Block),
 }
 
+/// A `StrBuilder`'s text, with its character count kept as it grows so `len`
+/// answers without a walk, as a `str`'s does ([L-LIB-STR]).
+#[derive(Debug, Clone, Default)]
+pub struct TextBuf {
+    pub text: String,
+    pub chars: usize,
+}
+
 /// Orderable map key (checker restricts keys to these).
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum MapKey {
     Bool(bool),
     Int(i64),
     Str(String),
+    /// A map has one key type, so this sorting after the others never
+    /// matters; among themselves `u64` keys sort unsigned ([E-MAP-ORDER]).
+    U64(u64),
 }
 
 impl MapKey {
     pub fn from_value(v: &Value) -> Option<MapKey> {
         match v {
             Value::Int(i) => Some(MapKey::Int(*i)),
+            Value::U64(u) => Some(MapKey::U64(*u)),
             Value::Bool(b) => Some(MapKey::Bool(*b)),
             Value::Str(s) => Some(MapKey::Str(s.as_str().to_string())),
             _ => None,
@@ -156,6 +179,7 @@ impl MapKey {
     pub fn to_value(&self) -> Value {
         match self {
             MapKey::Int(i) => Value::Int(*i),
+            MapKey::U64(u) => Value::U64(*u),
             MapKey::Bool(b) => Value::Bool(*b),
             MapKey::Str(s) => Value::str(s.clone()),
         }
@@ -324,6 +348,7 @@ impl Value {
     pub fn eq_value(&self, other: &Value) -> bool {
         match (self, other) {
             (Value::Int(a), Value::Int(b)) => a == b,
+            (Value::U64(a), Value::U64(b)) => a == b,
             // Two references are equal when they name the same live slot.
             // Missing this arm made a `ref` unequal to *itself* — and the
             // failure was contagious: any struct, list, tuple or `Option`
@@ -342,6 +367,9 @@ impl Value {
             // insecure got through a MAC check written as `mac == want` — it
             // simply rejected every message, including the right one.
             (Value::Bytes(a), Value::Bytes(b)) => a == b,
+            // Two builders are equal when they hold the same contents.
+            (Value::StrBuf(a), Value::StrBuf(b)) => a.text == b.text,
+            (Value::ByteBuf(a), Value::ByteBuf(b)) => a == b,
             (Value::Unit, Value::Unit) => true,
             (Value::Range(a1, a2, a3), Value::Range(b1, b2, b3)) => {
                 a1 == b1 && a2 == b2 && a3 == b3
@@ -430,6 +458,7 @@ impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Value::Int(v) => write!(f, "{v}"),
+            Value::U64(v) => write!(f, "{v}"),
             // Printing a reference prints the slot it names, not the value —
             // the value may be gone, and reading it to render a message would
             // be the exact use-after-free the tier prevents.
@@ -440,13 +469,16 @@ impl fmt::Display for Value {
             // Hex, two digits per byte, no separator. Not the text it might
             // decode to: a `bytes` is shown as bytes, which is the whole point
             // of it being a different type from `str` ([L-LIB-BYTES]).
-            Value::Bytes(b) => {
+            Value::Bytes(b) | Value::ByteBuf(b) => {
                 write!(f, "0x")?;
                 for byte in b.iter() {
                     write!(f, "{byte:02x}")?;
                 }
                 Ok(())
             }
+            // A builder prints what it holds, as the `str` or `bytes` it
+            // would become.
+            Value::StrBuf(b) => write!(f, "{}", b.text),
             Value::Unit => write!(f, "()"),
             Value::Range(a, b, incl) => {
                 write!(f, "{a}..{}{b}", if *incl { "=" } else { "" })

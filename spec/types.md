@@ -21,8 +21,21 @@ Arithmetic (`+ - * / % ^`, negation, `abs`, `shl`, `bit_not`, the `+=` forms,
 `sum`) wraps to the width in two's complement, as `i64` wraps at 64
 ([E-ARITH-INT]): a `u8` `255 + 1` is `0`. `shr` is arithmetic on the value,
 `ushr` logical on its bits at the width. `int` is another name for `i64` and
-`float` for `f64`. **[T-INT-FIXED-REFUSED]** `u64`, `usize` and `f32` are refused: they were aliases for
+`float` for `f64`. **[T-INT-FIXED-REFUSED]** `usize` and `f32` are refused: they were aliases for
 `i64` and `f64`, and a name that does not do what it says is worse than none.
+
+**[T-U64]** `u64` is one too, holding 0 to 2^64 − 1 in the same 64 bits. Its
+`+ - * ^`, negation, `+=` forms and `sum` wrap modulo 2^64; `/` and `%` divide
+unsigned; `<`, `min`, `max`, `cmp`, `sort` and a map's key order are unsigned;
+`shr` shifts in zeros and `abs` is the value; and it prints, `to_str`s and
+`to_base`s unsigned wherever it is — alone, in a list, a struct or a map. A
+literal written against it may be any hex or binary pattern, or a decimal up
+to 18446744073709551615 (past `i64`, a decimal is refused against any other
+type, but `-9223372036854775808` is `i64`'s least value); a negated literal is
+refused unless it is `-0`; a pattern names 0 to 2^63 − 1,
+and a larger value is matched in a guard. `n.as_i64()` gives its bits,
+`n.try_i64()` the value or `None`, and `s.parse_u64()` reads one, taking a `+`
+and never a `-` ([L-LIB-INT-CONV]).
 
 **[T-UNIT-RETURN]** A function returning `()` may say so and may `return ()`
 anywhere, including from a branch. A backend may give it no return value at
@@ -376,27 +389,19 @@ be discovered.
 loop is rejected: the second iteration would use a value that is gone. A
 closure body is the same case — it runs once per call, and the second call
 would find the value gone — so moving a *captured* binding out of one is
-rejected too. It was refused in the loop and accepted in the closure, which
-are the same program written two ways.
+rejected too.
 
 **[T-COPY]** `i64`, `f64`, `bool`, and `()` are copied rather than moved, so
 `own` on them never invalidates the caller's binding.
 
 **[T-PARAM-INOUT-PLACES]** A mutating method works on any place, not only a
 plain variable: `vm.stack.pop()`, `bag.items.set(k, v)`, `rows[0].xs.remove(i)`.
-And an `inout` parameter crosses a module boundary like any other. Both were
-compiled-backend gaps, and both mattered more than they sound — `inout` is the
-answer [T-CAPTURE-WRITE] gives for threading mutable state, so its stopping at
-a file edge reshaped a public API.
+And an `inout` parameter crosses a module boundary like any other.
 
 **[T-PARAM-INOUT]** An `inout` parameter is an exclusive mutable borrow.
 **[T-MUTATE-PLACE]** A mutating method's receiver must be a *place* — a
 binding, or a field or index reached from one. `[3, 1, 2].remove(0)` and
-`mk().pop()` are not: there is nowhere for the mutation to land, and they were
-accepted and then panicked at run time, one of them printing a
-compiler-internal `Span { start: .., end: .. }` into the terminal. Writing to
-a `let` binding was already a compile error, so the temporary was the one
-receiver nothing checked.
+`mk().pop()` are not: there is nowhere for the mutation to land.
 
 **[T-INOUT-PLACE]** Its argument must be a variable, field, or index
 expression — never a temporary. **[T-INOUT-MUTABLE]** That place must be
@@ -471,19 +476,14 @@ closure bound to a name and never called, with no function type to take them
 from, still has nothing to infer from and is an error.
 
 **[T-FIELD-CALL]** A struct field of function type is called through the
-field: `n.run(5)`. Building the value and reading the field back both worked
-from the start and the call did not, so the only spelling that ran was
-`let f = n.run` followed by `f(5)` — which nothing pointed to, while the error
-suggested declaring a free `fn run(Node, ...)`, a different function that would
-not call the field at all. A field shadows nothing: a real method or a UFCS
-free function of the same name still wins, and a non-function field called this
+field: `n.run(5)`. A field shadows nothing: a real method or a UFCS free
+function of the same name still wins, and a non-function field called this
 way is still "no method".
 
 The same holds for the two other things a field can be reached through. A
 tuple's components are fields spelled with numbers, so `p.0(4)` calls the
-function in the first position; the error used to be "no method `0`", with
-help suggesting a free `fn 0(...)`, which is not a name that can be written.
-And a `ref` is read through, so `c.f(3)` calls the field of the referent.
+function in the first position. And a `ref` is read through, so `c.f(3)`
+calls the field of the referent.
 
 **[T-FN-TYPE-ROW-CARRIED]** The row is part of the **type**, so it is checked
 wherever a function value meets a written type — a parameter, a return type, a
@@ -643,30 +643,16 @@ merges to `i64 ! E` exactly as the flat form does.
 
 This is a rule about the *position*, not about how it was reached: an
 annotation naming `T ! E` — a `let`, a struct field, a parameter — accepts the
-same two shapes per branch, and demanding the whole type of every branch made
-`let v: f64 ! E = if c { 3.0 } else { Ok(4.5) }` a type mismatch while the same
-expression without the annotation was an unhandled failure whose help says to
-annotate it. Two diagnostics pointing at each other is no way to write the
-program at all.
+same two shapes per branch, so `let v: f64 ! E = if c { 3.0 } else { Ok(4.5) }`
+is well typed.
 
 `return` takes either half too, including through a branching expression:
-`return if c { 3 } else { Ok(4) }` is the two shapes in one statement. Only the
-tail expression was taught this, so `return Ok(1)` was "this expression can
-fail but `i64` is required" — a message about the wrong problem, in the shape
-early exits are written in, and the workaround was to rewrite every one of them
-as `fail`. Deciding by *how the value was written* rather than by what it
-turned out to be left the same hole one level out: an `if` whose branches
-merged to the whole `T ! E` was wrapped a second time on the way out, and the
-caller printed a heap address.
+`return if c { 3 } else { Ok(4) }` is the two shapes in one statement.
 
 The two halves mix *within one expression*: an `if` may give the bare ok half
 in one branch and the whole `T ! E` in another, and a `match` may do the same
 across its arms. What the expression is worth is the wider of the two — the
 whole `T ! E` — and the branches giving only the ok half are the ones wrapped.
-Taking the type from whichever branch came first instead meant
-`if n == 1 { 10 } else { Ok(n * 3) }` was typed `i64`: the `Ok` branch's value
-travelled as a machine word and was wrapped a second time on the way out, so a
-caller that matched `Ok(v)` printed a heap address where the number was.
 
 **[T-FALLIBLE-VALUE]** A function's `! E` is part of what it answers with, so
 it travels with the function *as a value*: `risky` referenced by name has type
@@ -1107,15 +1093,10 @@ guarantees — and it was, in the first version of this feature.
 **[T-MODULE-NS]** Functions are per-module; types and effects share one global
 namespace, so a type name may not be declared twice across a program — and an
 *effect* is one of the things that claims a name, two of them in fact: `effect
-Clock` declares `Clock` and `ClockHandler`. Both were free to collide with a
-type, and both names stayed usable afterwards. One
-namespace means one namespace: an effect operation's signature may name a type
-from any module, the same as an ordinary function's. A *type alias* is a type
-declaration like any other, and it was the one that escaped both this rule and
-[T-TYPE-NO-PUB]: aliases resolve a pass after struct and sum bodies, so
-nothing had registered the first `type Id = i64` when the second was
-collected, and two declarations of one name checked clean with the later one
-silently winning.
+Clock` declares `Clock` and `ClockHandler`. One namespace means one
+namespace: an effect operation's signature may name a type from any module,
+the same as an ordinary function's. A *type alias* is a type declaration like
+any other, held to this rule and to [T-TYPE-NO-PUB].
 
 **[T-TYPE-NO-PUB]** It follows that `pub` on a type is meaningless, so it is
 **rejected** rather than accepted and ignored. A type is reachable from every

@@ -72,16 +72,16 @@ where each one stands.</p>
   <div class="fig"><b>511</b><span>programs, engines identical</span></div>
   <div class="fig"><b>501</b><span>identical in wasm</span></div>
   <div class="fig"><b>638</b><span>cross-compiled, agreeing</span></div>
-  <div class="fig"><b>262</b><span>conformance programs</span></div>
+  <div class="fig"><b>265</b><span>conformance programs</span></div>
   <div class="fig"><b>101</b><span>findings recorded</span></div>
-  <div class="fig"><b>16</b><span>fuzz generators</span></div>
+  <div class="fig"><b>17</b><span>fuzz generators</span></div>
 </div>
 <p>Interpreter, bundle and native builds agree byte for byte on stdout, exit
 code and diagnostics. All 638 are also compiled for x86_64 and run under
 Rosetta, every one of them agreeing, on 20 October 2026. Every generated program
 is checked for what it keeps as well as for what it prints.</p>
 <h2>Which run wrote which figure</h2>
-<p>The corpus is <b>641</b> standalone programs, counted as this page is
+<p>The corpus is <b>644</b> standalone programs, counted as this page is
 written and by difftest's own filter — so a program added today is in that
 number today. Everything below it needs a run, and these are not all from one
 run. <code>site/facts.json</code> used to carry no date at all, which is how a
@@ -137,13 +137,13 @@ table because the margin moved once already with nothing noticing: see
 <tr><td>Blade is local only</td><td>A <code>path</code> dependency and a local Blade registry both work. Nothing fetches from or publishes to a remote one yet.</td></tr>
 <tr><td>Downloads are not code-signed</td><td>macOS binaries for both architectures are published on the <a href="https://github.com/grasm-lang/grasm/releases/latest">releases page</a> with SHA-256 sums, but they carry no Apple Developer signature, so Gatekeeper will ask before the first run. Notarisation is release work, not language work.</td></tr>
 <tr><td>Not faster than Rust</td><td>The geomean is 0.965× of it, 0.955× with the harness floor taken out of both sides, against a 0.95× target — so the goal is met and the claim is not available. <code>tree</code> at 0.51× is the worst row. On the systems suite Grasm loses <code>etl</code> by 3.6×, and wins memory everywhere — 8× on <code>chat</code>. <a href="performance.html">Every row →</a></td></tr>
-<tr><td>No 64-bit unsigned integer, no 32-bit float</td><td><code>i8</code>, <code>i16</code>, <code>i32</code>, <code>u8</code>, <code>u16</code> and <code>u32</code> are real types that wrap at their width (<code>spec/types.md</code> [T-INT-FIXED]), converted with <code>as_U</code> and <code>try_U</code>; <code>u64</code>, <code>usize</code> and <code>f32</code> are refused rather than aliased. There is nothing wider than 64 bits. <code>bytes</code> is writable in place at one byte each, so a byte buffer is no longer eightfold — but a buffer of <em>samples</em> is still <code>[f64]</code> at eight bytes apiece.</td></tr>
+<tr><td>No 32-bit float</td><td><code>i8</code>, <code>i16</code>, <code>i32</code>, <code>u8</code>, <code>u16</code>, <code>u32</code> and <code>u64</code> are real types that wrap at their width (<code>spec/types.md</code> [T-INT-FIXED], [T-U64]), converted with <code>as_U</code> and <code>try_U</code>; a <code>u64</code> divides, compares, sorts and prints unsigned. <code>usize</code> and <code>f32</code> are refused rather than aliased. There is nothing wider than 64 bits. <code>bytes</code> is writable in place at one byte each, so a byte buffer is no longer eightfold — but a buffer of <em>samples</em> is still <code>[f64]</code> at eight bytes apiece.</td></tr>
 <tr><td>No shared mutable state across threads</td><td><code>par_map</code> and <code>par_filter</code> demand an empty effect row and will not reach a <code>ref</code> from outside; a task cannot be spawned per list element. No mutable globals, statics or thread-locals, and a handler holds no state between calls — which is what makes a recording replay.</td></tr>
 <tr><td>No SIMD, no file handles, no string builder</td><td>No intrinsics or autovectoriser. Whole-file and ranged reads only — no <code>seek</code>, no <code>mmap</code>, no streaming encoder. <code>str</code> is immutable, so appending in a loop is quadratic; collect and <code>join</code>.</td></tr>
 <tr><td>A window, but no widgets</td><td><code>packages/sdl</code> binds SDL2 — window, renderer, streaming texture, event poll — and <code>scripts/sdltest.sh</code> drives the whole path at <b>0.4 ms a frame</b> at 256&times;256 RGBA, gated with no display. What is missing above that is the toolkit: no buttons, sliders, text fields or layout, and no glyph rasteriser, so text means binding SDL2_ttf. Nothing addresses the GPU, and the wasm build ships the interpreter without DOM reach.</td></tr>
 <tr><td>A union error cannot be narrowed</td><td><code>(A|B)</code> is raised, propagated and printed, never destructured. Declare one sum type and match it.</td></tr>
 <tr><td>Polymorphic recursion</td><td>Refused by name at build time. It is what monomorphization is; no work removes it.</td></tr>
-<tr><td>Small standard library</td><td>86 methods. Enough for 44 whole programs and 12 applications; you will find gaps in something larger.</td></tr>
+<tr><td>Small standard library</td><td>94 methods. Enough for 44 whole programs and 12 applications; you will find gaps in something larger.</td></tr>
 <tr><td>Linux never linked or run here</td><td>The 2,100 lines of the operating-system layer written for Linux went through a compiler on this machine for the first time on 15 October 2026: <code>cargo check --release --target x86_64-unknown-linux-gnu --workspace</code> passes for every crate. Nothing has been linked or run, and a type-check does not catch a wrong constant — which is how <code>AF_INET6</code> was 30 on Linux for four commits. CI compiles it properly.</td></tr>
 <tr><td>Tasks refuse every effect</td><td>1,000,000 tasks run, and none of them may do I/O. G6's <em>uncolored</em> half is the open one.</td></tr>
 <tr><td>One gate is red, on purpose</td><td>The specification is <b>70</b> pages against the 50 §19.2 binds it to, and <code>crates/grasm_spec/tests/core.rs</code> fails past 70 because that is where recording the gap stops being enough. It crossed on 12 October when <code>[E-SCHEDULE]</code> was rewritten. The ceiling is not being raised and the metric is not being re-scoped, because <code>spec/core.md</code> rules both out: <em>a number that is met by redefining what counts is not a number</em>. <code>docs/known-issues.md</code> has what closing it costs.</td></tr>

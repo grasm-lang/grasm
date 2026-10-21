@@ -1,0 +1,25 @@
+//! tag: L-LIB-BITS-WIDTH
+//! expect: output
+//! 15 120 4 0 4 240
+//! -128 -1 8 0 8
+//! 13330 256 2014458966 2014458966
+//! 32 32 0 -9223372036854775808 63 64
+//! 578437695752307201 1 3752061439553044480 7
+// Rotations, counts and byte swaps read the bits at the receiver's own width:
+// an i8 has eight of them, a u64 sixty-four.
+fn main() {
+    let b: u8 = 0xF0
+    print("{b.rotate_left(4)} {b.rotate_right(1)} {b.count_ones()} {b.leading_zeros()} {b.trailing_zeros()} {b.swap_bytes()}")
+    let one: i8 = 1
+    let all: i8 = -1
+    print("{one.rotate_right(1)} {all.rotate_left(3)} {all.count_ones()} {all.leading_zeros()} {(0).as_i8().trailing_zeros()}")
+    let h: u16 = 0x1234
+    let s: i16 = 1
+    let w: u32 = 0x12345678
+    print("{h.swap_bytes()} {s.swap_bytes()} {w.rotate_right(8)} {w.rotate_left(-8)}")
+    let z: i32 = 0
+    print("{z.leading_zeros()} {z.trailing_zeros()} {z.count_ones()} {(1).rotate_right(1)} {(1).leading_zeros()} {(0).trailing_zeros()}")
+    let q: u64 = 0x0102030405060708
+    let u: u64 = 1
+    print("{q.swap_bytes()} {u.rotate_left(64)} {(0x1234).swap_bytes()} {(0xFF00).as_u16().count_ones() - 1}")
+}

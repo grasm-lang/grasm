@@ -494,7 +494,8 @@ impl<'a> Linter<'a> {
                 expr,
                 span,
             }] => match expr.as_ref() {
-                Expr::Int(n, _) => (-*n, *span),
+                // Wrapping: `-9223372036854775808` is a literal now ([T-U64]).
+                Expr::Int(n, _) => (n.wrapping_neg(), *span),
                 _ => return,
             },
             _ => return,

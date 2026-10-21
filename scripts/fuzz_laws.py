@@ -347,6 +347,9 @@ CLAUSES = {
     "T-INFER-LOCAL": "a local is inferred",
     "T-INT-FIXED": "fixed widths wrap",
     "L-LIB-INT-CONV": "conversions follow the range",
+    "T-U64": "u64 is unsigned",
+    "L-LIB-BITS-WIDTH": "bits are read at the width",
+    "L-LIB-BUILDER": "a builder is the concatenation",
     "T-INT-TO-FLOAT": "an int becomes a float",
     "T-INT-TO-FLOAT-CARRIED": "promotion is carried",
     "T-LIST": "a list holds one type",
@@ -674,6 +677,20 @@ LAWS = {
  "fixed widths wrap":           'var ok = true\n    for k in 0..600 {\n        let x = k - 300\n        for y in [0 - 129, 0 - 1, 0, 1, 7, 127, 128, 255] {\n            let a = x.as_u8()\n            let b = y.as_u8()\n            if (a + b).as_i64() != ((x + y) % 256 + 256) % 256 or (a * b).as_i64() != ((x * y) % 256 + 256) % 256 {\n                ok = false\n            }\n            let p = x.as_i8()\n            let q = y.as_i8()\n            if (p - q).as_i64() != ((x - y) % 256 + 256 + 128) % 256 - 128 {\n                ok = false\n            }\n        }\n    }\n    say(ok)',
  # try_U is Some exactly when the value fits, and the checked and saturating
  # forms give the true sum, or None, or the clamped sum -- each against i64.
+ # The top half of a `u64` is large, not negative: pinned by numbers a signed
+ # reading gets wrong (`top / 2`, `top % 10`), and then by relations -- the
+ # division identity, a value from 2^63 up being greater than one below it,
+ # and text that reads back as the same number.
+ "u64 is unsigned":             'var ok = true\n    let top: u64 = 0xFFFF_FFFF_FFFF_FFFF\n    if top / 2 != 9223372036854775807 or top % 10 != 5 or top.shr(63) != 1 {\n        ok = false\n    }\n    for k in 0..400 {\n        let a = (k * 7919).as_u64() * 0x9E37_79B9_7F4A_7C15\n        let b = (k + 1).as_u64() * 0x1_0000_0001\n        if a / b * b + a % b != a or a % b >= b {\n            ok = false\n        }\n        if a.as_i64() < 0 and b.as_i64() >= 0 and not (a > b) {\n            ok = false\n        }\n        if (a < b) == (b <= a) or a + (top - a) != top {\n            ok = false\n        }\n        if a.to_str().parse_u64() != Some(a) or a.to_base(16).parse_u64_base(16) != Some(a) {\n            ok = false\n        }\n        match a.try_i64() {\n            Some(v) -> if v.as_u64() != a or a > 9223372036854775807 {\n                ok = false\n            }\n            None -> if a <= 9223372036854775807 {\n                ok = false\n            }\n        }\n    }\n    say(ok)',
+ # The six width-aware bit methods, against a count done one bit at a time
+ # with `ushr` and `bit_and`, and pinned where a degenerate rotation (the
+ # identity, or one at the wrong width) would still satisfy the round trips.
+ "bits are read at the width":  'var ok = true\n    let p: u8 = 0x81\n    if p.rotate_left(1) != 3 or p.rotate_right(1) != 0xC0 or (0xAB12).as_u16().swap_bytes() != 0x12AB {\n        ok = false\n    }\n    for k in 0..300 {\n        let x = (k * 2654435761 + 12345).as_u32()\n        let n = k % 70 - 3\n        if x.rotate_left(n).rotate_right(n) != x or x.swap_bytes().swap_bytes() != x {\n            ok = false\n        }\n        var ones = 0\n        var top = 0\n        var low = 32\n        for i in 0..32 {\n            if x.ushr(i).bit_and(1) == 1 {\n                ones += 1\n                top = i + 1\n                if low == 32 {\n                    low = i\n                }\n            }\n        }\n        if x.count_ones() != ones or x.rotate_left(n).count_ones() != ones {\n            ok = false\n        }\n        if x.leading_zeros() != 32 - top or x.trailing_zeros() != low {\n            ok = false\n        }\n        let y = x.as_i64()\n        if y.leading_zeros() != 64 - top or y.count_ones() != ones {\n            ok = false\n        }\n    }\n    say(ok)',
+ # A builder holds exactly what was appended, in order -- the concatenation a
+ # string built with `+` gives -- and a copy taken midway does not see what is
+ # appended after it, which is the value semantics an in-place append could
+ # break.
+ "a builder is the concatenation": 'var ok = true\n    var s = str_builder()\n    var b = byte_builder()\n    var t = ""\n    for k in 0..300 {\n        let piece = k.to_str()\n        s.push_str(piece)\n        t = t + piece\n        b.push_byte(k % 256)\n        b.push_bytes(bytes_of([k % 7]))\n        if k == 150 {\n            let snap = s\n            let bsnap = b\n            s.push_str("x")\n            b.push_byte(1)\n            if snap.len() + 1 != s.len() or bsnap.len() + 1 != b.len() or snap.to_str() == s.to_str() {\n                ok = false\n            }\n            s = snap\n            b = bsnap\n        }\n    }\n    if s.to_str() != t or s.len() != t.len() or b.len() != 600 {\n        ok = false\n    }\n    for k in 0..300 {\n        if b.at(2 * k) != k % 256 or b.at(2 * k + 1) != k % 7 {\n            ok = false\n        }\n    }\n    var c = byte_builder()\n    c.push_str("é")\n    if c.len() != 2 or c.to_bytes() != "é".to_bytes() {\n        ok = false\n    }\n    say(ok)',
  "conversions follow the range": 'var ok = true\n    for k in 0..1000 {\n        let x = k * 37 - 18000\n        let fits = x >= 0 - 32768 and x <= 32767\n        match x.try_i16() {\n            Some(v) -> if not fits or v.as_i64() != x {\n                ok = false\n            }\n            None -> if fits {\n                ok = false\n            }\n        }\n        let a = x.as_i16()\n        let twice = 2 * a.as_i64()\n        if a.saturating_add(a).as_i64() != twice.max(0 - 32768).min(32767) {\n            ok = false\n        }\n        match a.checked_add(a) {\n            Some(v) -> if v.as_i64() != twice {\n                ok = false\n            }\n            None -> if twice >= 0 - 32768 and twice <= 32767 {\n                ok = false\n            }\n        }\n    }\n    say(ok)',
  "an int becomes a float":      'let x: f64 = 2\n    say(x == 2.0)',
  "promotion is carried":        'let xs: [f64] = [1, 2]\n    say(xs[0] + xs[1] == 3.0)',

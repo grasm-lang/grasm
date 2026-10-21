@@ -1,6 +1,6 @@
 # Grasm — conformance programs: library
 
-The standard library. 60 executable program(s), one per normative clause of
+The standard library. 62 executable program(s), one per normative clause of
 `grasm-language-pack.md`. Each header states the tag it demonstrates and the
 exact expected behaviour, and every one is run by `cargo test -p grasm_spec`, so
 a program here cannot describe behaviour the implementation does not have.
@@ -468,6 +468,36 @@ fn main() / {io} {
 }
 ```
 
+## `L-LIB-BITS-WIDTH.gr`
+
+```grasm
+//! tag: L-LIB-BITS-WIDTH
+//! expect: output
+//! 15 120 4 0 4 240
+//! -128 -1 8 0 8
+//! 13330 256 2014458966 2014458966
+//! 32 32 0 -9223372036854775808 63 64
+//! 578437695752307201 1 3752061439553044480 7
+// Rotations, counts and byte swaps read the bits at the receiver's own width:
+// an i8 has eight of them, a u64 sixty-four.
+fn main() {
+    let b: u8 = 0xF0
+    print("{b.rotate_left(4)} {b.rotate_right(1)} {b.count_ones()} {b.leading_zeros()} {b.trailing_zeros()} {b.swap_bytes()}")
+    let one: i8 = 1
+    let all: i8 = -1
+    print("{one.rotate_right(1)} {all.rotate_left(3)} {all.count_ones()} {all.leading_zeros()} {(0).as_i8().trailing_zeros()}")
+    let h: u16 = 0x1234
+    let s: i16 = 1
+    let w: u32 = 0x12345678
+    print("{h.swap_bytes()} {s.swap_bytes()} {w.rotate_right(8)} {w.rotate_left(-8)}")
+    let z: i32 = 0
+    print("{z.leading_zeros()} {z.trailing_zeros()} {z.count_ones()} {(1).rotate_right(1)} {(1).leading_zeros()} {(0).trailing_zeros()}")
+    let q: u64 = 0x0102030405060708
+    let u: u64 = 1
+    print("{q.swap_bytes()} {u.rotate_left(64)} {(0x1234).swap_bytes()} {(0xFF00).as_u16().count_ones() - 1}")
+}
+```
+
 ## `L-LIB-BITS.gr`
 
 ```grasm
@@ -513,6 +543,54 @@ fn hex(v: i64) -> str {
         i = i - 1
     }
     out
+}
+```
+
+## `L-LIB-BUILDER.gr`
+
+```grasm
+//! tag: L-LIB-BUILDER
+//! expect: output
+//! héllo, world 12 false
+//! héllo 5
+//! 0x41ff8000c3a9 6 255 0x41ff8000c3a9
+//! 0x41ff00 0x41ff8000c3a9
+//! 30000 true
+// Builders append at the end in amortized constant time, and stay values: a
+// copy is a copy, before and after an append.
+type Out = { text: StrBuilder, n: i64 }
+
+fn emit(inout o: Out, s: str) {
+    o.text.push_str(s)
+    o.n += 1
+}
+
+fn main() {
+    var s = str_builder()
+    s.push_str("héllo")
+    let kept = s
+    s.push_str(", world")
+    print("{s} {s.len()} {s.is_empty()}")
+    print("{kept} {kept.len()}")
+
+    var b = byte_builder()
+    b.push_byte(0x41)
+    b.push_byte(255)
+    b.push_bytes(bytes_of([128, 0]))
+    let before = b
+    b.push_str("é")
+    print("{b} {b.len()} {b.at(1)} {b.to_bytes()}")
+    var c = before
+    c.set(2, 0)
+    print("{c.to_bytes().slice(0, 3)} {b}")
+
+    var o = Out{ text: str_builder(), n: 0 }
+    var i = 0
+    while i < 10000 {
+        emit(o, "abc")
+        i += 1
+    }
+    print("{o.text.len()} {o.text.to_str() == "abc".repeat(10000)}")
 }
 ```
 

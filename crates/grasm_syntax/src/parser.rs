@@ -116,7 +116,8 @@ pub fn parse_type_src(src: &str) -> Option<TypeExpr> {
 
 /// Parse a single expression (used by the REPL and interpolation).
 pub fn parse_expr_src(src: &str, offset: u32) -> (Option<Expr>, Vec<Diagnostic>) {
-    parse_expr_src_at(src, offset, 0, None)
+    let (e, d, _) = parse_expr_src_at(src, offset, 0, None);
+    (e, d)
 }
 
 /// The same, starting from a depth already spent.
@@ -166,7 +167,7 @@ fn parse_expr_src_at(
     offset: u32,
     depth: u32,
     actor_fields: Option<&[String]>,
-) -> (Option<Expr>, Vec<Diagnostic>) {
+) -> (Option<Expr>, Vec<Diagnostic>, Vec<u32>) {
     let mut tokens = lex(src);
     for t in &mut tokens {
         t.span = Span::new(t.span.start + offset, t.span.end + offset);
@@ -196,7 +197,7 @@ fn parse_expr_src_at(
             .with_help("close the interpolation before this, or join the parts with an operator"),
         );
     }
-    (expr, p.diags)
+    (expr, p.diags, p.wide_ints)
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -255,6 +256,8 @@ struct Parser {
     /// contract's panic can quote the clause as written ([T-CONTRACT-REQUIRES]).
     src: String,
     src_offset: u32,
+    /// See `Module::wide_ints`.
+    wide_ints: Vec<u32>,
 }
 
 /// What to write instead, for an operator this language does not have.
@@ -289,6 +292,7 @@ impl Parser {
             lowered: Vec::new(),
             src: String::new(),
             src_offset: 0,
+            wide_ints: Vec::new(),
         }
     }
 
@@ -571,6 +575,12 @@ impl Parser {
     // ------------------------------------------------------------------
 
     fn parse_module(&mut self) -> Module {
+        let mut module = self.parse_module_decls();
+        module.wide_ints = std::mem::take(&mut self.wide_ints);
+        module
+    }
+
+    fn parse_module_decls(&mut self) -> Module {
         let mut module = Module::default();
         loop {
             self.skip_newlines();
@@ -2628,6 +2638,13 @@ impl Parser {
                 self.bump();
                 Ok(Expr::Int(v, start))
             }
+            // Its bits, as every other literal; where it was written is what
+            // lets the checker hold it to a `u64` ([T-U64]).
+            TokenKind::WideInt(v) => {
+                self.bump();
+                self.wide_ints.push(start.start);
+                Ok(Expr::Int(v as i64, start))
+            }
             TokenKind::Float(v) => {
                 self.bump();
                 Ok(Expr::Float(v, start))
@@ -2647,13 +2664,14 @@ impl Parser {
                     match part {
                         StrPart::Text(t) => pieces.push(StrPiece::Text(t)),
                         StrPart::Interp { src, offset } => {
-                            let (expr, mut diags) = parse_expr_src_at(
+                            let (expr, mut diags, mut wide) = parse_expr_src_at(
                                 &src,
                                 offset,
                                 self.depth + 1,
                                 self.actor_fields.as_deref(),
                             );
                             self.diags.append(&mut diags);
+                            self.wide_ints.append(&mut wide);
                             match expr {
                                 Some(e) => pieces.push(StrPiece::Expr(e)),
                                 None => {
@@ -3154,12 +3172,21 @@ impl Parser {
                 self.bump();
                 Ok(Pattern::Int(v, start))
             }
+            // Recorded like an expression's, so the checker can refuse it: a
+            // pattern names a value below 2^63 ([T-U64]).
+            TokenKind::WideInt(v) => {
+                self.bump();
+                self.wide_ints.push(start.start);
+                Ok(Pattern::Int(v as i64, start))
+            }
             TokenKind::Minus => {
                 self.bump();
                 let span = self.cur_span();
                 if let TokenKind::Int(v) = self.cur().clone() {
                     self.bump();
-                    Ok(Pattern::Int(-v, start.merge(span)))
+                    // Wrapping, so `-0x8000_0000_0000_0000` is the least `i64`
+                    // rather than an overflow in a debug build.
+                    Ok(Pattern::Int(v.wrapping_neg(), start.merge(span)))
                 } else {
                     self.error_here("expected an integer after `-` in pattern");
                     Err(())

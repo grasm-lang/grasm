@@ -1641,6 +1641,31 @@ operand with a reference and releases it after the call, so the concatenation
 never sees a uniquely-held list to append into. It needs the same self-append
 shape the string form uses.
 
+### Builders, appended to 800,000 times -- 2026-10-21
+
+`StrBuilder` and `ByteBuilder` ([L-LIB-BUILDER]) exist so emitting a large
+output is linear without depending on the backend recognising
+`s = s + x`, which only the compiled engine does and only for `str`.
+`scripts/builder_bench.py` times both against the idiom each replaces, in
+both engines, best of two runs:
+
+    run           100000      200000      400000      800000   growth per doubling
+      str  s = s + x          0.505s      1.311s      4.964s     30.907s   2.6x 3.8x 6.2x
+      str  StrBuilder         0.041s      0.071s      0.138s      0.266s   1.8x 1.9x 1.9x
+      bytes  b = b.concat(x)  0.394s      0.965s      2.556s     10.110s   2.5x 2.6x 4.0x
+      bytes  ByteBuilder      0.045s      0.064s      0.120s      0.246s   1.4x 1.9x 2.0x
+
+    native        100000      200000      400000      800000   growth per doubling
+      str  s = s + x          0.005s      0.006s      0.006s      0.007s   1.3x 1.0x 1.2x
+      str  StrBuilder         0.004s      0.005s      0.007s      0.011s   1.2x 1.3x 1.6x
+      bytes  b = b.concat(x)  0.408s      0.996s      2.483s      9.865s   2.4x 2.5x 4.0x
+      bytes  ByteBuilder      0.004s      0.005s      0.006s      0.008s   1.1x 1.2x 1.4x
+
+A builder doubles per doubling; `bytes.concat` in both engines and the
+interpreter's `s = s + x` reach 4x and 6x at the top. At 800,000 appends a
+builder is 116x the text idiom under `grasm run` and about 1,200x
+`bytes.concat` natively.
+
 ### Three more scaling traps, and why the obvious fix is wrong
 
 Scaling is one measurement that survives a busy machine: a 4x ratio for a

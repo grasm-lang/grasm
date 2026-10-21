@@ -212,8 +212,7 @@ and the error names that spelling.
 
 **[G-TYPE-NOT-QUALIFIED]** A type is named by a bare identifier, never
 `module.Type`. Types share one global namespace ([T-MODULE-NS]), so the
-qualifier would carry no information — and the grammar used to allow one,
-which meant the only way to find out was the error.
+qualifier would carry no information.
 
 **[G-TYPE-UNIT]** `()` is the unit type.
 
@@ -317,19 +316,12 @@ closure      = "|" ( identifier ( "," identifier )* )? "|" ( expression | block 
 **[G-STRUCT-NONEMPTY]** A struct has at least one field, and a struct literal
 names at least one field or a base. `{}` after a name is a *block* — that is
 what makes `with C handled_by h { … }` unambiguous — so a zero-field struct
-would be a type with no way to write a value of it. The rules above used to
-make both the field list and the literal's contents optional, so `type E = { }`
-was declared, accepted, and unbuildable, and `E{}` failed with "expected end of
-line after statement". For a value that carries nothing, use a sum variant:
-`type Marker = | Done`.
+would be a type with no way to write a value of it. For a value that carries
+nothing, use a sum variant: `type Marker = | Done`.
 
 **[G-MATCH-ARM-EXPR]** A match arm's body is an *expression*. `for`, `while`,
 `let`, `var` and `with` are statements, so they need a block: `1 -> { for i in
-0..2 { … } }`, not `1 -> for i in 0..2 { … }`. The rule used to read
-`( expression | statement )`, which the parser had never accepted — a grammar
-that promises more than the implementation gives is a worse guide than no
-grammar, because a reader trusts it and gets a parse error with no idea which
-of the two is wrong.
+0..2 { … } }`, not `1 -> for i in 0..2 { … }`.
 
 **[G-PIPE]** `x |> f(a)` is exactly `f(x, a)`; `x |> f` is `f(x)`.
 

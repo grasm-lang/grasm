@@ -111,6 +111,15 @@ pub extern "C" fn grasm_out_i64(v: i64) {
     });
 }
 
+/// A `u64`, as the unsigned number its bits are ([T-U64]).
+#[no_mangle]
+pub extern "C" fn grasm_out_u64(v: i64) {
+    let v = v as u64;
+    emit(|out| {
+        let _ = write!(out, "{v}");
+    });
+}
+
 /// A float, always distinguishable from an integer.
 ///
 /// [L-DISPLAY] promises a point, and the point is the property: without it a
@@ -212,7 +221,26 @@ pub extern "C" fn grasm_pow_i64(base: i64, exp: i64) -> i64 {
     if exp < 0 {
         grasm_panic_neg_pow();
     }
-    base.wrapping_pow(exp.min(u32::MAX as i64) as u32)
+    // The whole exponent, as `grasm_pow_u64` takes it: clamped at `u32::MAX`
+    // it made `3 ^ 4294967296` the answer for `3 ^ 4294967295`.
+    grasm_pow_u64(base, exp)
+}
+
+/// `a ^ b` on `u64`, modulo 2^64, over the whole exponent: square and
+/// multiply, so every bit of `b` counts. A `u64` exponent is never negative,
+/// so nothing here panics ([T-U64]).
+#[no_mangle]
+pub extern "C" fn grasm_pow_u64(base: i64, exp: i64) -> i64 {
+    let (mut base, mut exp) = (base as u64, exp as u64);
+    let mut acc: u64 = 1;
+    while exp > 0 {
+        if exp & 1 == 1 {
+            acc = acc.wrapping_mul(base);
+        }
+        base = base.wrapping_mul(base);
+        exp >>= 1;
+    }
+    acc as i64
 }
 
 #[no_mangle]
@@ -247,6 +275,9 @@ pub enum ScalarKind {
     /// tier — but it is not an integer, and printed as one it disclosed the
     /// packed slot and generation as a raw number.
     Ref,
+    /// A `u64` ([T-U64]): stored as the same word an `i64` is, and ordered
+    /// and printed as the unsigned number it is.
+    U64,
 }
 
 impl ScalarKind {
@@ -258,6 +289,7 @@ impl ScalarKind {
             ScalarKind::F64 => 1,
             ScalarKind::Ref => 3,
             ScalarKind::Bool => 2,
+            ScalarKind::U64 => 5,
         }
     }
 
@@ -266,6 +298,7 @@ impl ScalarKind {
             0 => ScalarKind::I64,
             1 => ScalarKind::F64,
             3 => ScalarKind::Ref,
+            5 => ScalarKind::U64,
             _ => ScalarKind::Bool,
         }
     }
@@ -450,6 +483,9 @@ pub enum MapKey {
     /// including one already in the table — four hundred thousand allocations
     /// for eight distinct one-byte keys.
     Str(KeyStr),
+    /// A map has one key type, so where this sorts against the others never
+    /// matters; among themselves `u64` keys sort unsigned ([E-MAP-ORDER]).
+    U64(u64),
 }
 
 thread_local! {
@@ -483,6 +519,7 @@ unsafe fn with_key<R>(v: *mut RtVal, f: impl FnOnce(&MapKey) -> R) -> R {
     match &(*v).payload {
         RtPayload::Bool(b) => f(&MapKey::Bool(*b)),
         RtPayload::I64(n) => f(&MapKey::I64(*n)),
+        RtPayload::U64(n) => f(&MapKey::U64(*n)),
         // Short text needs no buffer at all: the inline form *is* the key.
         // Long text still borrows the scratch buffer, so a probe with a long
         // key does not allocate either.
@@ -512,6 +549,7 @@ impl MapKey {
         match &(*v).payload {
             RtPayload::Bool(b) => MapKey::Bool(*b),
             RtPayload::I64(n) => MapKey::I64(*n),
+            RtPayload::U64(n) => MapKey::U64(*n),
             RtPayload::Str(s) => MapKey::Str(KeyStr::of(s)),
             _ => rt_panic(&format!("invalid map key `{}`", display(v))),
         }
@@ -521,6 +559,7 @@ impl MapKey {
         match self {
             MapKey::Bool(b) => interned_bool(*b),
             MapKey::I64(n) => grasm_box_i64(*n),
+            MapKey::U64(n) => alloc(RtPayload::U64(*n)),
             MapKey::Str(s) => alloc(RtPayload::Str(RtStr::of(s.as_str()))),
         }
     }
@@ -670,6 +709,7 @@ impl ScalarData {
         if let ScalarData::Words(v) = self {
             match kind {
                 ScalarKind::I64 | ScalarKind::Ref => v.sort_unstable(),
+                ScalarKind::U64 => v.sort_unstable_by_key(|&w| w as u64),
                 ScalarKind::F64 => v.sort_unstable_by(|&a, &b| {
                     f64::from_bits(a as u64).total_cmp(&f64::from_bits(b as u64))
                 }),
@@ -855,6 +895,8 @@ pub const FK_INLIST: u8 = 6;
 pub const FK_INVALS: u8 = 7;
 /// An inline string: a `Vec<u8>` of its UTF-8.
 pub const FK_INSTR: u8 = 8;
+/// A `u64` ([T-U64]): one word, like `FK_I64`, read unsigned.
+pub const FK_U64: u8 = 9;
 
 /// Words a field of this kind takes.
 pub fn kind_width(k: u8) -> usize {
@@ -1219,6 +1261,7 @@ unsafe fn box_field_bits(kind: u8, bits: i64) -> *mut RtVal {
         FK_BOOL => grasm_box_bool(i8::from(bits != 0)),
         FK_REF => grasm_box_ref(bits),
         FK_UNIT => grasm_box_unit(),
+        FK_U64 => grasm_box_u64(bits),
         _ => grasm_box_i64(bits),
     }
 }
@@ -1227,6 +1270,7 @@ unsafe fn box_field_bits(kind: u8, bits: i64) -> *mut RtVal {
 unsafe fn unbox_field_bits(v: *mut RtVal) -> i64 {
     match &(*v).payload {
         RtPayload::I64(x) => *x,
+        RtPayload::U64(x) => *x as i64,
         RtPayload::Bool(b) => i64::from(*b),
         RtPayload::F64(f) => f.to_bits() as i64,
         RtPayload::Ref(r) => *r,
@@ -2269,6 +2313,21 @@ pub enum RtPayload {
         ty: &'static StructTy,
         words: Vec<i64>,
     },
+    /// A `u64` ([T-U64]). The word an `I64` holds, kept as its own kind so a
+    /// `u64` inside a list, a struct or an `Option` prints, compares and keys
+    /// a map as the unsigned number it is. Last, so no earlier tag moved.
+    U64(u64),
+    /// A `StrBuilder` ([L-LIB-BUILDER]): text that grows at its end, with its
+    /// character count kept so `len` is not a walk. Unlike `Str` it is never
+    /// inline and never a window, so the `String` is the whole story and an
+    /// append to a sole owner is a `push_str`.
+    StrBuf {
+        text: String,
+        chars: usize,
+    },
+    /// A `ByteBuilder`: bytes that grow at the end. Not `Bytes`, whose length
+    /// is fixed because a `bytes` may be a window `slice` did not copy.
+    ByteBuf(Vec<u8>),
 }
 
 #[repr(C)]
@@ -3935,6 +3994,7 @@ unsafe fn scalar_words(list: *mut RtVal, what: &str) -> Vec<i64> {
             .iter()
             .map(|&p| match &(*p).payload {
                 RtPayload::I64(v) => *v,
+                RtPayload::U64(v) => *v as i64,
                 RtPayload::F64(v) => v.to_bits() as i64,
                 RtPayload::Bool(b) => i64::from(*b),
                 _ => rt_panic(&format!("{what} on a list of non-scalars")),
@@ -4456,6 +4516,7 @@ pub unsafe extern "C" fn grasm_par_filter_scalar(
             Some(RtPayload::F64(_)) => ScalarKind::F64,
             Some(RtPayload::Bool(_)) => ScalarKind::Bool,
             Some(RtPayload::Ref(_)) => ScalarKind::Ref,
+            Some(RtPayload::U64(_)) => ScalarKind::U64,
             _ => ScalarKind::I64,
         },
         _ => grasm_panic_msg_str("par_filter on a non-list"),
@@ -4593,6 +4654,7 @@ pub unsafe extern "C" fn grasm_par_filter_boxed(
 fn scalar_box(kind: ScalarKind, bits: i64) -> *mut RtVal {
     match kind {
         ScalarKind::I64 => grasm_box_i64(bits),
+        ScalarKind::U64 => grasm_box_u64(bits),
         ScalarKind::Ref => grasm_box_ref(bits),
         ScalarKind::F64 => alloc(RtPayload::F64(f64::from_bits(bits as u64))),
         ScalarKind::Bool => interned_bool(bits != 0),
@@ -4604,6 +4666,7 @@ fn scalar_box(kind: ScalarKind, bits: i64) -> *mut RtVal {
 unsafe fn scalar_unbox_val(kind: ScalarKind, v: *mut RtVal) -> i64 {
     match (kind, &(*v).payload) {
         (ScalarKind::I64, RtPayload::I64(x)) => *x,
+        (ScalarKind::U64, RtPayload::U64(x)) => *x as i64,
         (ScalarKind::Ref, RtPayload::Ref(x)) => *x,
         (ScalarKind::F64, RtPayload::F64(x)) => x.to_bits() as i64,
         (ScalarKind::F64, RtPayload::I64(x)) => (*x as f64).to_bits() as i64,
@@ -4620,6 +4683,7 @@ fn scalar_cmp(kind: ScalarKind, a: i64, b: i64) -> core::cmp::Ordering {
     use core::cmp::Ordering;
     match kind {
         ScalarKind::I64 | ScalarKind::Ref => a.cmp(&b),
+        ScalarKind::U64 => (a as u64).cmp(&(b as u64)),
         // A total order — see `cmp_vals`. An unboxed list of floats is the
         // one most likely to hold a NaN and be sorted.
         ScalarKind::F64 => f64::from_bits(a as u64).total_cmp(&f64::from_bits(b as u64)),
@@ -4640,6 +4704,7 @@ fn scalar_eq(kind: ScalarKind, a: i64, b: i64) -> bool {
 fn scalar_display(kind: ScalarKind, bits: i64) -> String {
     match kind {
         ScalarKind::I64 => bits.to_string(),
+        ScalarKind::U64 => (bits as u64).to_string(),
         ScalarKind::Ref => {
             let (i, gen) = unpack_ref(bits);
             format!("ref#{i}.{gen}")
@@ -4906,7 +4971,7 @@ fn empty_list_of(kind: Option<ScalarKind>) -> *mut RtVal {
     // One per shape: a list of boxed values, and one per scalar width, because
     // the first push writes into whichever storage is already there.
     static BOXED: crate::sync::OnceLock<usize> = crate::sync::OnceLock::new();
-    static SCALARS: crate::sync::OnceLock<[usize; 5]> = crate::sync::OnceLock::new();
+    static SCALARS: crate::sync::OnceLock<[usize; 6]> = crate::sync::OnceLock::new();
     match kind {
         None => *BOXED.get_or_init(|| {
             Box::into_raw(Box::new(RtVal {
@@ -4916,7 +4981,7 @@ fn empty_list_of(kind: Option<ScalarKind>) -> *mut RtVal {
         }) as *mut RtVal,
         Some(k) => {
             let table = SCALARS.get_or_init(|| {
-                let mut out = [0usize; 5];
+                let mut out = [0usize; 6];
                 for (i, slot) in out.iter_mut().enumerate() {
                     let of = ScalarKind::from_i64(i as i64);
                     *slot = Box::into_raw(Box::new(RtVal {
@@ -4929,7 +4994,7 @@ fn empty_list_of(kind: Option<ScalarKind>) -> *mut RtVal {
                 }
                 out
             });
-            let at = k.to_i64().clamp(0, 4) as usize;
+            let at = k.to_i64().clamp(0, 5) as usize;
             table[at] as *mut RtVal
         }
     }
@@ -5104,6 +5169,12 @@ pub extern "C" fn grasm_box_ref(v: i64) -> *mut RtVal {
     alloc(RtPayload::Ref(v))
 }
 
+/// Boxes a `u64`'s word so it keeps being read unsigned ([T-U64]).
+#[no_mangle]
+pub extern "C" fn grasm_box_u64(v: i64) -> *mut RtVal {
+    alloc(RtPayload::U64(v as u64))
+}
+
 #[no_mangle]
 pub extern "C" fn grasm_box_f64(v: f64) -> *mut RtVal {
     alloc(RtPayload::F64(v))
@@ -5120,6 +5191,8 @@ pub extern "C" fn grasm_box_bool(v: i8) -> *mut RtVal {
 pub unsafe extern "C" fn grasm_unbox_i64(v: *mut RtVal) -> i64 {
     match &(*v).payload {
         RtPayload::I64(x) => *x,
+        // A `u64` is the same word, unboxed into the same register.
+        RtPayload::U64(x) => *x as i64,
         // A reference is one machine word, and the compiled backend keeps it
         // in an integer register. It boxes as itself so it can be told apart
         // when rendered, and unboxes back into that word.
@@ -5299,6 +5372,16 @@ unsafe fn display(v: *mut RtVal) -> String {
             None => "<closure>".to_string(),
         },
         RtPayload::I64(x) => x.to_string(),
+        RtPayload::U64(x) => x.to_string(),
+        RtPayload::StrBuf { text, .. } => text.clone(),
+        RtPayload::ByteBuf(b) => {
+            let mut out = String::with_capacity(2 + 2 * b.len());
+            out.push_str("0x");
+            for byte in b {
+                out.push_str(&format!("{byte:02x}"));
+            }
+            out
+        }
         RtPayload::F64(x) => float_text(*x),
         RtPayload::Bool(x) => x.to_string(),
         RtPayload::Str(s) => s.to_string(),
@@ -5435,6 +5518,7 @@ pub unsafe extern "C" fn grasm_struct_scalar_at(s: *mut RtVal, i: i64) -> i64 {
     match fields.get(i as usize) {
         Some(v) => match &(**v).payload {
             RtPayload::I64(x) => *x,
+            RtPayload::U64(x) => *x as i64,
             RtPayload::Bool(b) => i64::from(*b),
             RtPayload::F64(f) => f.to_bits() as i64,
             RtPayload::Ref(r) => *r,
@@ -6202,6 +6286,10 @@ unsafe fn val_eq(a: *mut RtVal, b: *mut RtVal) -> bool {
     rt_stack_check();
     match (&(*a).payload, &(*b).payload) {
         (RtPayload::I64(x), RtPayload::I64(y)) => x == y,
+        (RtPayload::U64(x), RtPayload::U64(y)) => x == y,
+        // Two builders are equal when they hold the same contents.
+        (RtPayload::StrBuf { text: x, .. }, RtPayload::StrBuf { text: y, .. }) => x == y,
+        (RtPayload::ByteBuf(x), RtPayload::ByteBuf(y)) => x == y,
         // Unit has exactly one value, so two of them are always equal.
         (RtPayload::Unit, RtPayload::Unit) => true,
         // Two references are the same reference when they name the same slot
@@ -6249,6 +6337,7 @@ unsafe fn val_eq(a: *mut RtVal, b: *mut RtVal) -> bool {
                     .zip(items)
                     .all(|(bits, &boxed)| match (*kind, &(*boxed).payload) {
                         (ScalarKind::I64, RtPayload::I64(x)) => bits == *x,
+                        (ScalarKind::U64, RtPayload::U64(x)) => bits as u64 == *x,
                         (ScalarKind::Ref, RtPayload::Ref(x)) => bits == *x,
                         (ScalarKind::F64, RtPayload::F64(x)) => f64::from_bits(bits as u64) == *x,
                         (ScalarKind::Bool, RtPayload::Bool(x)) => (bits != 0) == *x,
@@ -7412,9 +7501,9 @@ pub unsafe extern "C" fn grasm_str_index_of(s: *mut RtVal, needle: *mut RtVal) -
     }
 }
 
-/// The range of an integer width by the tag the compiler passes: 0..=5 are
-/// `i8 i16 i32 u8 u16 u32` (the order of `IntKind`), anything else `i64`
-/// ([T-INT-FIXED]).
+/// The range of an integer width by the tag the compiler passes: 0..=6 are
+/// `i8 i16 i32 u8 u16 u32 u64` (the order of `IntKind`), anything else `i64`
+/// ([T-INT-FIXED], [T-U64]).
 fn int_range(tag: i64) -> (i128, i128) {
     match tag {
         0 => (i8::MIN as i128, i8::MAX as i128),
@@ -7423,25 +7512,50 @@ fn int_range(tag: i64) -> (i128, i128) {
         3 => (0, u8::MAX as i128),
         4 => (0, u16::MAX as i128),
         5 => (0, u32::MAX as i128),
+        6 => (0, u64::MAX as i128),
         _ => (i64::MIN as i128, i64::MAX as i128),
     }
 }
 
-fn int_exact(op: i64, a: i64, b: i64) -> i128 {
-    let (a, b) = (a as i128, b as i128);
+/// The number the word `v` of width `tag` stands for: the word read as an
+/// `i64`, except for a `u64`, read unsigned.
+fn int_value(tag: i64, v: i64) -> i128 {
+    if tag == U64_TAG {
+        v as u64 as i128
+    } else {
+        v as i128
+    }
+}
+
+/// `IntKind::U64`'s tag.
+const U64_TAG: i64 = 6;
+
+/// A boxed integer of width `tag` holding `v`, which is in its range.
+fn int_box(tag: i64, v: i128) -> *mut RtVal {
+    if tag == U64_TAG {
+        grasm_box_u64(v as u64 as i64)
+    } else {
+        grasm_box_i64(v as i64)
+    }
+}
+
+/// `None` only where `u64 * u64` passes `i128`, which is past every range.
+fn int_exact(op: i64, a: i128, b: i128) -> Option<i128> {
     match op {
-        0 => a + b,
-        1 => a - b,
-        _ => a * b,
+        0 => a.checked_add(b),
+        1 => a.checked_sub(b),
+        _ => a.checked_mul(b),
     }
 }
 
 /// `v.try_u8()` and its siblings: `Some(v)` when it fits ([L-LIB-INT-CONV]).
+/// `src` is the width `v` is read at; `tag` the one it is wanted in.
 #[no_mangle]
-pub extern "C" fn grasm_int_try(tag: i64, v: i64) -> *mut RtVal {
+pub extern "C" fn grasm_int_try(tag: i64, src: i64, v: i64) -> *mut RtVal {
     let (lo, hi) = int_range(tag);
-    if (v as i128) >= lo && (v as i128) <= hi {
-        some_of(grasm_box_i64(v))
+    let n = int_value(src, v);
+    if n >= lo && n <= hi {
+        some_of(int_box(tag, n))
     } else {
         none_val()
     }
@@ -7453,11 +7567,9 @@ pub extern "C" fn grasm_int_try(tag: i64, v: i64) -> *mut RtVal {
 #[no_mangle]
 pub extern "C" fn grasm_int_checked(tag: i64, op: i64, a: i64, b: i64) -> *mut RtVal {
     let (lo, hi) = int_range(tag);
-    let r = int_exact(op, a, b);
-    if r >= lo && r <= hi {
-        some_of(grasm_box_i64(r as i64))
-    } else {
-        none_val()
+    match int_exact(op, int_value(tag, a), int_value(tag, b)) {
+        Some(r) if r >= lo && r <= hi => some_of(int_box(tag, r)),
+        _ => none_val(),
     }
 }
 
@@ -7466,7 +7578,12 @@ pub extern "C" fn grasm_int_checked(tag: i64, op: i64, a: i64, b: i64) -> *mut R
 #[no_mangle]
 pub extern "C" fn grasm_int_saturating(tag: i64, op: i64, a: i64, b: i64) -> i64 {
     let (lo, hi) = int_range(tag);
-    int_exact(op, a, b).clamp(lo, hi) as i64
+    let r = int_exact(op, int_value(tag, a), int_value(tag, b)).map_or(hi, |r| r.clamp(lo, hi));
+    if tag == U64_TAG {
+        r as u64 as i64
+    } else {
+        r as i64
+    }
 }
 
 fn none_val() -> *mut RtVal {
@@ -7491,6 +7608,78 @@ pub unsafe extern "C" fn grasm_str_parse_int(s: *mut RtVal) -> *mut RtVal {
     match as_str(s).trim().parse::<i64>() {
         Ok(v) => some_of(alloc(RtPayload::I64(v))),
         Err(_) => none_val(),
+    }
+}
+
+/// `s.parse_u64()`: digits, an optional `+`, no `-` even on zero ([T-U64]).
+///
+/// # Safety: live pointer.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_str_parse_u64(s: *mut RtVal) -> *mut RtVal {
+    match as_str(s).trim().parse::<u64>() {
+        Ok(v) => some_of(alloc(RtPayload::U64(v))),
+        Err(_) => none_val(),
+    }
+}
+
+/// `s.parse_u64_base(b)`: as `parse_int_base`, read unsigned.
+///
+/// # Safety: live pointer.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_str_parse_u64_base(s: *mut RtVal, base: i64) -> *mut RtVal {
+    if !(2..=36).contains(&base) {
+        rt_panic(&format!("parse_u64_base takes a base in 2..36, not {base}"));
+    }
+    match u64::from_str_radix(as_str(s).trim(), base as u32) {
+        Ok(v) => some_of(alloc(RtPayload::U64(v))),
+        Err(_) => none_val(),
+    }
+}
+
+/// A `u64`'s text in a given base, with no sign: its top half is large, not
+/// negative ([T-U64]).
+///
+/// # Safety: none beyond the call.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_u64_to_base(v: i64, base: i64) -> *mut RtVal {
+    if !(2..=36).contains(&base) {
+        rt_panic(&format!("to_base takes a base in 2..36, not {base}"));
+    }
+    const DIGITS: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    let base = base as u64;
+    let mut n = v as u64;
+    let mut buf = [0u8; 64];
+    let mut i = buf.len();
+    loop {
+        i -= 1;
+        buf[i] = DIGITS[(n % base) as usize];
+        n /= base;
+        if n == 0 {
+            break;
+        }
+    }
+    alloc(RtPayload::Str(RtStr::of(core::str::from_utf8_unchecked(
+        &buf[i..],
+    ))))
+}
+
+/// A `u64` as text, unsigned ([T-U64]).
+#[no_mangle]
+pub unsafe extern "C" fn grasm_str_from_u64(v: i64) -> *mut RtVal {
+    alloc(RtPayload::Str(RtStr::of(&(v as u64).to_string())))
+}
+
+/// `n.to_char()` on a `u64`: the code point, or the panic `to_char` gives,
+/// with the number written unsigned.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_u64_to_char(v: i64) -> *mut RtVal {
+    let u = v as u64;
+    match u32::try_from(u).ok().and_then(char::from_u32) {
+        Some(c) => {
+            let mut b = [0u8; 4];
+            alloc(RtPayload::Str(RtStr::of(c.encode_utf8(&mut b))))
+        }
+        None => rt_panic(&format!("{u} is not a Unicode code point")),
     }
 }
 
@@ -7601,6 +7790,7 @@ unsafe fn cmp_vals(a: *mut RtVal, b: *mut RtVal) -> core::cmp::Ordering {
     use core::cmp::Ordering;
     match (&(*a).payload, &(*b).payload) {
         (RtPayload::I64(x), RtPayload::I64(y)) => x.cmp(y),
+        (RtPayload::U64(x), RtPayload::U64(y)) => x.cmp(y),
         // A total order, so a sort stays a sort even with a NaN in the list
         // ([L-LIB-SORT-NAN]).
         (RtPayload::F64(x), RtPayload::F64(y)) => x.total_cmp(y),
@@ -7857,6 +8047,7 @@ pub unsafe extern "C" fn grasm_list_contains(v: *mut RtVal, needle: *mut RtVal) 
         Items::Boxed(items) => items.iter().any(|&i| val_eq(i, needle)),
         Items::Scalar(kind, data) => match (kind, &(*needle).payload) {
             (ScalarKind::I64, RtPayload::I64(x)) => data.iter().any(|b| b == *x),
+            (ScalarKind::U64, RtPayload::U64(x)) => data.iter().any(|b| b as u64 == *x),
             (ScalarKind::Ref, RtPayload::Ref(x)) => data.iter().any(|b| b == *x),
             (ScalarKind::F64, RtPayload::F64(x)) => {
                 data.iter().any(|b| f64::from_bits(b as u64) == *x)
@@ -7934,15 +8125,19 @@ pub unsafe extern "C" fn grasm_list_sum_i64(v: *mut RtVal) -> i64 {
         Items::Boxed(items) => {
             let mut total = 0i64;
             for &i in items {
-                if let RtPayload::I64(x) = &(*i).payload {
-                    total += x;
+                match &(*i).payload {
+                    RtPayload::I64(x) => total = total.wrapping_add(*x),
+                    RtPayload::U64(x) => total = total.wrapping_add(*x as i64),
+                    _ => {}
                 }
             }
             total
         }
-        Items::Scalar(ScalarKind::I64, data) => match data.as_words() {
-            Some(w) => w.iter().sum(),
-            None => data.iter().sum(),
+        // The same wrapping sum for a `u64`: two's complement addition is one
+        // operation on the bits, whichever way they are read ([T-U64]).
+        Items::Scalar(ScalarKind::I64 | ScalarKind::U64, data) => match data.as_words() {
+            Some(w) => w.iter().fold(0i64, |a, &b| a.wrapping_add(b)),
+            None => data.iter().fold(0i64, |a, b| a.wrapping_add(b)),
         },
         Items::Scalar(..) => 0,
     }
@@ -9999,6 +10194,184 @@ unsafe fn cow_bytes(v: *mut RtVal) -> *mut RtVal {
     fresh
 }
 
+// ---------------------------------------------------------------------------
+// Builders ([L-LIB-BUILDER])
+// ---------------------------------------------------------------------------
+//
+// Every append takes the receiver's reference and answers the box to keep, as
+// a `bytes` write does: the same box when this was its only holder, so the
+// append is the `Vec`'s own amortized push, and a copy when something else can
+// see it, so value semantics hold ([E-COW]).
+
+/// An empty `StrBuilder`.
+#[no_mangle]
+pub extern "C" fn grasm_strbuf_new() -> *mut RtVal {
+    alloc(RtPayload::StrBuf {
+        text: String::new(),
+        chars: 0,
+    })
+}
+
+/// An empty `ByteBuilder`.
+#[no_mangle]
+pub extern "C" fn grasm_bytebuf_new() -> *mut RtVal {
+    alloc(RtPayload::ByteBuf(Vec::new()))
+}
+
+/// `v`, or a copy of it this caller alone holds, releasing `v` if copied.
+///
+/// # Safety: a live builder whose reference transfers here.
+unsafe fn cow_builder(v: *mut RtVal) -> *mut RtVal {
+    if (*v).rc.load(Relaxed) == 1 {
+        return v;
+    }
+    let fresh = match &(*v).payload {
+        RtPayload::StrBuf { text, chars } => alloc(RtPayload::StrBuf {
+            text: text.clone(),
+            chars: *chars,
+        }),
+        RtPayload::ByteBuf(b) => alloc(RtPayload::ByteBuf(b.clone())),
+        _ => grasm_panic_msg_str("an append to a value that is not a builder"),
+    };
+    dec(v);
+    fresh
+}
+
+/// The panic both engines give for a builder past what memory can hold.
+fn builder_room(have: usize, more: usize) {
+    if have.checked_add(more).is_none_or(|n| n > MAX_ALLOC) {
+        rt_panic(&format!(
+            "a builder would need more memory than one can hold ({} bytes)",
+            have as u128 + more as u128
+        ));
+    }
+}
+
+/// Appends `bytes` to a builder this caller alone holds; on a `StrBuilder`
+/// they are UTF-8 text with `chars` characters.
+///
+/// # Safety: `v` came from `cow_builder`.
+unsafe fn builder_append(v: *mut RtVal, bytes: &[u8], chars: usize) {
+    match &mut (*v).payload {
+        RtPayload::StrBuf { text, chars: n } => {
+            builder_room(text.len(), bytes.len());
+            text.push_str(core::str::from_utf8_unchecked(bytes));
+            *n += chars;
+        }
+        RtPayload::ByteBuf(b) => {
+            builder_room(b.len(), bytes.len());
+            b.extend_from_slice(bytes);
+        }
+        _ => grasm_panic_msg_str("an append to a value that is not a builder"),
+    }
+}
+
+/// `b.push_str(s)`. `s` is borrowed.
+///
+/// # Safety: live boxes; `b`'s reference transfers and the answer is kept.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_builder_push_str(b: *mut RtVal, s: *mut RtVal) -> *mut RtVal {
+    // `s` is a `str` and `b` a builder, so they are never one box, and the
+    // text can be read in place while the receiver is written.
+    let RtPayload::Str(t) = &(*s).payload else {
+        grasm_panic_msg_str("push_str expects a str")
+    };
+    let chars = t.char_len();
+    let target = cow_builder(b);
+    builder_append(target, t.as_bytes(), chars);
+    target
+}
+
+/// `b.push_byte(x)`; a value outside 0..255 panics, as `bytes_of` does.
+///
+/// # Safety: as `grasm_builder_push_str`.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_bytebuf_push_byte(b: *mut RtVal, x: i64) -> *mut RtVal {
+    let byte = byte_or_panic(x, "push_byte");
+    let target = cow_builder(b);
+    builder_append(target, &[byte], 1);
+    target
+}
+
+/// `b.push_bytes(bs)`. `bs` is borrowed.
+///
+/// # Safety: as `grasm_builder_push_str`.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_bytebuf_push_bytes(b: *mut RtVal, bs: *mut RtVal) -> *mut RtVal {
+    // A `bytes` and a builder are never one box, as for `push_str`.
+    let src = as_bytes(bs);
+    let target = cow_builder(b);
+    builder_append(target, src, src.len());
+    target
+}
+
+/// `b.set(i, x)` on a `ByteBuilder`, with `bytes.set`'s panics.
+///
+/// # Safety: as `grasm_builder_push_str`.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_bytebuf_set(b: *mut RtVal, i: i64, x: i64) -> *mut RtVal {
+    let n = grasm_builder_len(b);
+    if i < 0 || i >= n {
+        rt_panic(&format!("index {i} out of bounds (len {n})"));
+    }
+    let byte = byte_or_panic(x, "set");
+    let target = cow_builder(b);
+    if let RtPayload::ByteBuf(buf) = &mut (*target).payload {
+        buf[i as usize] = byte;
+    }
+    target
+}
+
+/// `b.at(i)` on a `ByteBuilder`. Borrows `b`.
+///
+/// # Safety: a live `ByteBuilder`.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_bytebuf_at(b: *mut RtVal, i: i64) -> i64 {
+    match &(*b).payload {
+        RtPayload::ByteBuf(buf) => match usize::try_from(i).ok().and_then(|i| buf.get(i)) {
+            Some(x) => i64::from(*x),
+            None => rt_panic(&format!("index {i} out of bounds (len {})", buf.len())),
+        },
+        _ => grasm_panic_msg_str("at on a value that is not a byte builder"),
+    }
+}
+
+/// Characters in a `StrBuilder`, bytes in a `ByteBuilder`. Borrows `b`.
+///
+/// # Safety: a live builder.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_builder_len(b: *mut RtVal) -> i64 {
+    match &(*b).payload {
+        RtPayload::StrBuf { chars, .. } => *chars as i64,
+        RtPayload::ByteBuf(buf) => buf.len() as i64,
+        _ => grasm_panic_msg_str("len on a value that is not a builder"),
+    }
+}
+
+/// What a builder holds, as a `str`: exact for a `StrBuilder`, and lossy for
+/// a `ByteBuilder`, as `bytes.to_str` is. Borrows `b`.
+///
+/// # Safety: a live builder.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_builder_to_str(b: *mut RtVal) -> *mut RtVal {
+    match &(*b).payload {
+        RtPayload::StrBuf { text, .. } => alloc(RtPayload::Str(RtStr::of(text))),
+        RtPayload::ByteBuf(buf) => alloc(RtPayload::Str(RtStr::of(&String::from_utf8_lossy(buf)))),
+        _ => grasm_panic_msg_str("to_str on a value that is not a builder"),
+    }
+}
+
+/// What a `ByteBuilder` holds, as `bytes`. Borrows `b`.
+///
+/// # Safety: a live `ByteBuilder`.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_bytebuf_to_bytes(b: *mut RtVal) -> *mut RtVal {
+    match &(*b).payload {
+        RtPayload::ByteBuf(buf) => alloc(RtPayload::Bytes(RtBytes::new(buf.clone()))),
+        _ => grasm_panic_msg_str("to_bytes on a value that is not a byte builder"),
+    }
+}
+
 /// The buffer of a value `cow_bytes` just returned.
 ///
 /// # Safety: `v` came from `cow_bytes`, so it is a sole-owner full window.
@@ -10779,6 +11152,9 @@ unsafe fn wire_of(v: *mut RtVal) -> replay::Wire {
         RtPayload::Handler { .. } => replay::Wire::of_unsupported("handler"),
         RtPayload::Env { .. } => replay::Wire::of_unsupported("environment"),
         RtPayload::Ref(_) => replay::Wire::of_unsupported("reference"),
+        RtPayload::U64(_) => replay::Wire::of_unsupported("u64"),
+        RtPayload::StrBuf { .. } => replay::Wire::of_unsupported("string builder"),
+        RtPayload::ByteBuf(_) => replay::Wire::of_unsupported("byte builder"),
         RtPayload::Map(_) => replay::Wire::of_unsupported("map"),
         RtPayload::Struct { .. } => replay::Wire::of_unsupported("struct"),
         RtPayload::Fn { .. } => replay::Wire::of_unsupported("function"),

@@ -226,8 +226,7 @@ and the error names that spelling.
 
 **[G-TYPE-NOT-QUALIFIED]** A type is named by a bare identifier, never
 `module.Type`. Types share one global namespace ([T-MODULE-NS]), so the
-qualifier would carry no information — and the grammar used to allow one,
-which meant the only way to find out was the error.
+qualifier would carry no information.
 
 **[G-TYPE-UNIT]** `()` is the unit type.
 
@@ -331,19 +330,12 @@ closure      = "|" ( identifier ( "," identifier )* )? "|" ( expression | block 
 **[G-STRUCT-NONEMPTY]** A struct has at least one field, and a struct literal
 names at least one field or a base. `{}` after a name is a *block* — that is
 what makes `with C handled_by h { … }` unambiguous — so a zero-field struct
-would be a type with no way to write a value of it. The rules above used to
-make both the field list and the literal's contents optional, so `type E = { }`
-was declared, accepted, and unbuildable, and `E{}` failed with "expected end of
-line after statement". For a value that carries nothing, use a sum variant:
-`type Marker = | Done`.
+would be a type with no way to write a value of it. For a value that carries
+nothing, use a sum variant: `type Marker = | Done`.
 
 **[G-MATCH-ARM-EXPR]** A match arm's body is an *expression*. `for`, `while`,
 `let`, `var` and `with` are statements, so they need a block: `1 -> { for i in
-0..2 { … } }`, not `1 -> for i in 0..2 { … }`. The rule used to read
-`( expression | statement )`, which the parser had never accepted — a grammar
-that promises more than the implementation gives is a worse guide than no
-grammar, because a reader trusts it and gets a parse error with no idea which
-of the two is wrong.
+0..2 { … } }`, not `1 -> for i in 0..2 { … }`.
 
 **[G-PIPE]** `x |> f(a)` is exactly `f(x, a)`; `x |> f` is `f(x)`.
 
@@ -460,8 +452,21 @@ Arithmetic (`+ - * / % ^`, negation, `abs`, `shl`, `bit_not`, the `+=` forms,
 `sum`) wraps to the width in two's complement, as `i64` wraps at 64
 ([E-ARITH-INT]): a `u8` `255 + 1` is `0`. `shr` is arithmetic on the value,
 `ushr` logical on its bits at the width. `int` is another name for `i64` and
-`float` for `f64`. **[T-INT-FIXED-REFUSED]** `u64`, `usize` and `f32` are refused: they were aliases for
+`float` for `f64`. **[T-INT-FIXED-REFUSED]** `usize` and `f32` are refused: they were aliases for
 `i64` and `f64`, and a name that does not do what it says is worse than none.
+
+**[T-U64]** `u64` is one too, holding 0 to 2^64 − 1 in the same 64 bits. Its
+`+ - * ^`, negation, `+=` forms and `sum` wrap modulo 2^64; `/` and `%` divide
+unsigned; `<`, `min`, `max`, `cmp`, `sort` and a map's key order are unsigned;
+`shr` shifts in zeros and `abs` is the value; and it prints, `to_str`s and
+`to_base`s unsigned wherever it is — alone, in a list, a struct or a map. A
+literal written against it may be any hex or binary pattern, or a decimal up
+to 18446744073709551615 (past `i64`, a decimal is refused against any other
+type, but `-9223372036854775808` is `i64`'s least value); a negated literal is
+refused unless it is `-0`; a pattern names 0 to 2^63 − 1,
+and a larger value is matched in a guard. `n.as_i64()` gives its bits,
+`n.try_i64()` the value or `None`, and `s.parse_u64()` reads one, taking a `+`
+and never a `-` ([L-LIB-INT-CONV]).
 
 **[T-UNIT-RETURN]** A function returning `()` may say so and may `return ()`
 anywhere, including from a branch. A backend may give it no return value at
@@ -815,27 +820,19 @@ be discovered.
 loop is rejected: the second iteration would use a value that is gone. A
 closure body is the same case — it runs once per call, and the second call
 would find the value gone — so moving a *captured* binding out of one is
-rejected too. It was refused in the loop and accepted in the closure, which
-are the same program written two ways.
+rejected too.
 
 **[T-COPY]** `i64`, `f64`, `bool`, and `()` are copied rather than moved, so
 `own` on them never invalidates the caller's binding.
 
 **[T-PARAM-INOUT-PLACES]** A mutating method works on any place, not only a
 plain variable: `vm.stack.pop()`, `bag.items.set(k, v)`, `rows[0].xs.remove(i)`.
-And an `inout` parameter crosses a module boundary like any other. Both were
-compiled-backend gaps, and both mattered more than they sound — `inout` is the
-answer [T-CAPTURE-WRITE] gives for threading mutable state, so its stopping at
-a file edge reshaped a public API.
+And an `inout` parameter crosses a module boundary like any other.
 
 **[T-PARAM-INOUT]** An `inout` parameter is an exclusive mutable borrow.
 **[T-MUTATE-PLACE]** A mutating method's receiver must be a *place* — a
 binding, or a field or index reached from one. `[3, 1, 2].remove(0)` and
-`mk().pop()` are not: there is nowhere for the mutation to land, and they were
-accepted and then panicked at run time, one of them printing a
-compiler-internal `Span { start: .., end: .. }` into the terminal. Writing to
-a `let` binding was already a compile error, so the temporary was the one
-receiver nothing checked.
+`mk().pop()` are not: there is nowhere for the mutation to land.
 
 **[T-INOUT-PLACE]** Its argument must be a variable, field, or index
 expression — never a temporary. **[T-INOUT-MUTABLE]** That place must be
@@ -910,19 +907,14 @@ closure bound to a name and never called, with no function type to take them
 from, still has nothing to infer from and is an error.
 
 **[T-FIELD-CALL]** A struct field of function type is called through the
-field: `n.run(5)`. Building the value and reading the field back both worked
-from the start and the call did not, so the only spelling that ran was
-`let f = n.run` followed by `f(5)` — which nothing pointed to, while the error
-suggested declaring a free `fn run(Node, ...)`, a different function that would
-not call the field at all. A field shadows nothing: a real method or a UFCS
-free function of the same name still wins, and a non-function field called this
+field: `n.run(5)`. A field shadows nothing: a real method or a UFCS free
+function of the same name still wins, and a non-function field called this
 way is still "no method".
 
 The same holds for the two other things a field can be reached through. A
 tuple's components are fields spelled with numbers, so `p.0(4)` calls the
-function in the first position; the error used to be "no method `0`", with
-help suggesting a free `fn 0(...)`, which is not a name that can be written.
-And a `ref` is read through, so `c.f(3)` calls the field of the referent.
+function in the first position. And a `ref` is read through, so `c.f(3)`
+calls the field of the referent.
 
 **[T-FN-TYPE-ROW-CARRIED]** The row is part of the **type**, so it is checked
 wherever a function value meets a written type — a parameter, a return type, a
@@ -1082,30 +1074,16 @@ merges to `i64 ! E` exactly as the flat form does.
 
 This is a rule about the *position*, not about how it was reached: an
 annotation naming `T ! E` — a `let`, a struct field, a parameter — accepts the
-same two shapes per branch, and demanding the whole type of every branch made
-`let v: f64 ! E = if c { 3.0 } else { Ok(4.5) }` a type mismatch while the same
-expression without the annotation was an unhandled failure whose help says to
-annotate it. Two diagnostics pointing at each other is no way to write the
-program at all.
+same two shapes per branch, so `let v: f64 ! E = if c { 3.0 } else { Ok(4.5) }`
+is well typed.
 
 `return` takes either half too, including through a branching expression:
-`return if c { 3 } else { Ok(4) }` is the two shapes in one statement. Only the
-tail expression was taught this, so `return Ok(1)` was "this expression can
-fail but `i64` is required" — a message about the wrong problem, in the shape
-early exits are written in, and the workaround was to rewrite every one of them
-as `fail`. Deciding by *how the value was written* rather than by what it
-turned out to be left the same hole one level out: an `if` whose branches
-merged to the whole `T ! E` was wrapped a second time on the way out, and the
-caller printed a heap address.
+`return if c { 3 } else { Ok(4) }` is the two shapes in one statement.
 
 The two halves mix *within one expression*: an `if` may give the bare ok half
 in one branch and the whole `T ! E` in another, and a `match` may do the same
 across its arms. What the expression is worth is the wider of the two — the
 whole `T ! E` — and the branches giving only the ok half are the ones wrapped.
-Taking the type from whichever branch came first instead meant
-`if n == 1 { 10 } else { Ok(n * 3) }` was typed `i64`: the `Ok` branch's value
-travelled as a machine word and was wrapped a second time on the way out, so a
-caller that matched `Ok(v)` printed a heap address where the number was.
 
 **[T-FALLIBLE-VALUE]** A function's `! E` is part of what it answers with, so
 it travels with the function *as a value*: `risky` referenced by name has type
@@ -1546,15 +1524,10 @@ guarantees — and it was, in the first version of this feature.
 **[T-MODULE-NS]** Functions are per-module; types and effects share one global
 namespace, so a type name may not be declared twice across a program — and an
 *effect* is one of the things that claims a name, two of them in fact: `effect
-Clock` declares `Clock` and `ClockHandler`. Both were free to collide with a
-type, and both names stayed usable afterwards. One
-namespace means one namespace: an effect operation's signature may name a type
-from any module, the same as an ordinary function's. A *type alias* is a type
-declaration like any other, and it was the one that escaped both this rule and
-[T-TYPE-NO-PUB]: aliases resolve a pass after struct and sum bodies, so
-nothing had registered the first `type Id = i64` when the second was
-collected, and two declarations of one name checked clean with the later one
-silently winning.
+Clock` declares `Clock` and `ClockHandler`. One namespace means one
+namespace: an effect operation's signature may name a type from any module,
+the same as an ordinary function's. A *type alias* is a type declaration like
+any other, held to this rule and to [T-TYPE-NO-PUB].
 
 **[T-TYPE-NO-PUB]** It follows that `pub` on a type is meaningless, so it is
 **rejected** rather than accepted and ignored. A type is reachable from every
@@ -1821,10 +1794,9 @@ the length. `list.get(i)` returns `Option` instead of panicking.
 `ys`'s. Neither operand is changed. `+` on lists never means element-wise
 addition.
 
-Building a *string* with `+` in a loop costs the same way, for the same
-reason: strings are immutable, so each `s = s + x` copies everything so far.
-400 000 appends take about 2.4 seconds. There is no string builder; collect the
-pieces in a list and `join` them, which is linear.
+Building a *string* with `+` in a loop may cost the same way: a string never
+changes once built, so `s = s + x` can copy everything so far. A `StrBuilder`
+appends in amortized constant time ([L-LIB-BUILDER]).
 
 **[E-MAP-LIT]** `{k: v, ...}` builds a map. Entries are evaluated left to
 right, each key before its own value, and a repeated key keeps the last value
@@ -1865,18 +1837,13 @@ otherwise it is a statement of type `()`, and using its value is an error.
 
 A branch that must deliver a value has to *end in an expression*. The expected
 type is pushed into a tail expression and there is nothing to push it into
-otherwise, so a branch ending in a `with`, `for` or `while` statement sailed
-past the demand entirely: `if c { 7 } else { with D handled_by h { n } }` in an
-`-> i64` function checked clean, `grasm run` printed `()` where the integer
-belonged and a compiled build printed `0` — while the same `with` as the
-*whole* body was refused. A branch that leaves — `return`, `break`, `continue`
-— delivers its value by not coming back, and is not this case.
+otherwise, so a branch ending in a `with`, `for` or `while` statement is
+refused there. A branch that leaves — `return`, `break`, `continue` —
+delivers its value by not coming back, and is not this case.
 
 **[E-IF-FALLIBLE-MERGE]** When the branches are `Err(e)` and `Ok(v)`, the
 `if` is worth `T ! E` with `T` from the `Ok` side. `Err(e)` says nothing about
-the ok half, so a branch that is only `Err` cannot decide the type by itself —
-taking it anyway made `xs.map(|x| if p { Err(e) } else { Ok(x) })` produce a
-list whose elements were later read as the wrong thing.
+the ok half, so a branch that is only `Err` cannot decide the type by itself.
 
 **[E-MATCH-ORDER]** Match arms are tried top to bottom; the first whose pattern
 matches and whose guard passes is taken.
@@ -2149,11 +2116,7 @@ both are refused, because nothing calls `main` and nothing reads its value.
 Writing `fn main() -> i64` and ending the body with `2` looked like a status
 code, and the program exited 0 — the status a program reports is `exit(n)`,
 and an error reaching `main` is [E-MAIN-ERR]. A `! E` on `main` is allowed and
-means what that clause says. Only the return type was refused for a while, so
-`fn main(x: i64)` checked clean and then panicked at run time with
-`unknown name \`x\`` — a compiler-internal message arriving after the point
-where types are supposed to be settled. Read the command line with [E-ARGS]
-instead.
+means what that clause says. Read the command line with [E-ARGS] instead.
 
 **[E-ARGS]** `args()` returns the arguments the program was given, excluding
 the program's own name. How they are given depends on how the program is run,
@@ -2373,13 +2336,13 @@ becomes a number with `parse_int` / `parse_float`, which return `Option`
 because the text may not be a number.
 
 **[L-LIB-INT-CONV]** On every integer type `T`, with `U` any of `i8 i16 i32
-u8 u16 u32` ([T-INT-FIXED]):
+u8 u16 u32 u64` ([T-INT-FIXED], [T-U64]):
 
 | method | type | notes |
 |--------|------|-------|
 | `n.as_U()` | `T -> U` | wraps to `U`'s width |
-| `n.try_U()` | `T -> Option[U]` | `None` when the value does not fit |
-| `n.as_i64()` | `T -> i64` | the same value |
+| `n.try_U()`, `n.try_i64()` | `T -> Option[U]` | `None` when the value does not fit |
+| `n.as_i64()` | `T -> i64` | the same value; a `u64` from 2^63 up gives its bits |
 | `x.as_U()` | `f64 -> U` | toward zero, held to `U`'s range; NaN is `0` |
 | `a.checked_add(b)`, `_sub`, `_mul` | `(T, T) -> Option[T]` | `None` when the true result is outside `T` |
 | `a.saturating_add(b)`, `_sub`, `_mul` | `(T, T) -> T` | the true result, held to `T`'s range |
@@ -2460,6 +2423,7 @@ and `trim` cannot tell you that.
 | `s.parse_int()` | `-> Option[i64]` | surrounding space and a leading `+` are accepted; `1_000` and `0xFF` are **not** ([L-LIB-PARSE]) |
 | `n.to_base(b)` | `(i64) -> str` | digits `0-9a-z`; a base outside `2..36` panics ([L-LIB-BASE]) |
 | `s.parse_int_base(b)` | `(i64) -> Option[i64]` | the other direction; no prefix accepted ([L-LIB-BASE]) |
+| `s.parse_u64()`, `s.parse_u64_base(b)` | `-> Option[u64]` | as the two above, up to 2^64 − 1; a `-` is refused ([T-U64]) |
 | `s.parse_float()` | `-> Option[f64]` | accepts `inf`, `-inf`, `nan`; overflow gives an infinity, not `None` ([L-LIB-PARSE]) |
 | `x.is_nan()`, `x.is_finite()` | `-> bool` | what `parse_float` makes necessary ([L-LIB-PARSE]) |
 | `s.code_at(i)` | `(i64) -> i64` | Unicode code point of character `i`; panics out of range ([L-LIB-CODES]) |
@@ -2539,15 +2503,12 @@ element, which is where a list of structs gets its order from — `sort` needs
 the *elements* ordered, and a struct is not. The key is `i64`, `f64`, `str`, or
 a **tuple** of those, which is what makes
 `xs.sort_by(|p| (p.dept, p.age, p.name))` a multi-key sort rather than an error
-([L-LIB-TUPLE]). This clause said "must be `i64`, `f64` or `str`" while tuple
-keys worked in all three engines — two clauses of one document disagreeing, and
-the one that was wrong was the one a reader would find first. The sort is stable: elements with equal keys stay in the order they
-were written. It sorts **ascending**, always; descending is
+([L-LIB-TUPLE]). The sort is stable: elements with equal keys stay in the
+order they were written. It sorts **ascending**, always; descending is
 `xs.sort_by(k)` followed by `xs = xs.rev()`. Negating the key works for a
 number and has no counterpart for a `str`, so the reversal is the general
 answer and the one to reach for. The assignment is the whole point: `sort_by`
-mutates and `rev` answers with a new list, so the clause's earlier wording —
-`xs.rev()` on its own line — left the list ascending and said nothing.
+mutates and `rev` answers with a new list.
 
 **[L-LIB-PAIRS]** `xs.enumerate()` pairs each element with its index and
 `xs.zip(ys)` pairs the two lists positionally, stopping at the shorter — there
@@ -2559,9 +2520,7 @@ is no element to invent past the end of one. Both give `[(A, B)]`, which
 component by component. That is what `<` on tuples means, what `sort` on a
 list of them does, `min`/`max` included, and what makes
 `xs.sort_by(|p| (p.dept, p.age, p.name))` a multi-key sort rather than an
-error. `min` and `max` used to spell out the types they accepted instead of
-asking whether the element was ordered, so `xs.enumerate().min()` was refused
-on a list `sort` orders happily.
+error.
 
 That example is worth spelling out, because it does *not* mean "index of the
 smallest": components compare left to right, so `enumerate().min()` compares
@@ -2854,9 +2813,24 @@ out-of-range count undefined, which would make the two engines disagree.
 `shr` preserves the sign and `ushr` does not, which is the only reason both
 exist: `(-16).shr(2)` is `-4` and `(-16).ushr(60)` is `15`.
 
-There is no unsigned integer type, so a program working in 32 bits masks with
-`0xFFFFFFFF` itself. `spec/conformance/L-LIB-BITS.gr` shows the rotation that
-SHA-256 needs, written that way.
+On a fixed-width type each applies at its width ([L-LIB-INT-CONV]), so a `u32`
+needs no `0xFFFFFFFF` mask; `spec/conformance/L-LIB-BITS.gr` shows SHA-256's
+rotation written on an `i64` with one.
+
+**[L-LIB-BITS-WIDTH]** Six more, on every integer type `T`, read its bits at
+its own width — 64 for `i64` and `u64`, 8 for `i8` — and answer as Rust does:
+
+| | | |
+|---|---|---|
+| `a.rotate_left(n)`, `a.rotate_right(n)` | `(T, i64) -> T` | turned around the width, `n` taken modulo it |
+| `a.count_ones()` | `(T) -> i64` | the bits that are set |
+| `a.leading_zeros()`, `a.trailing_zeros()` | `(T) -> i64` | zeros above the highest set bit, below the lowest; the width for `0` |
+| `a.swap_bytes()` | `(T) -> T` | the bytes in reverse order; the value itself on `i8` and `u8` |
+
+`n` modulo the width is Rust's `rotate_left(n as u32)`, so a negative `n`
+turns the other way. A signed type answers for its two's-complement bits:
+`(0 - 1).as_i8().count_ones()` is `8` and `(1).as_i8().rotate_right(1)` is
+`-128`.
 
 ## The other stream — [L-LIB-EPRINT]
 
@@ -2983,6 +2957,31 @@ a `slice` taken before one is unaffected. **The length never changes**: a
 promise its elements are bytes, stores eight per element, and cannot be handed
 to a buffer — the promise is the type. `at` gives `0..255` as an `i64`, which
 is the trade. It **prints as hex**, and `to_str` is lossy for `tcp_read`'s reason.
+
+## Builders — [L-LIB-BUILDER]
+
+**[L-LIB-BUILDER]** A `StrBuilder` collects text and a `ByteBuilder` bytes,
+each appended at its end in amortized constant time, so emitting an output
+— code, an object file, a report — takes time linear in its size.
+
+| | type | |
+|---|---|---|
+| `str_builder()`, `byte_builder()` | `-> StrBuilder`, `-> ByteBuilder` | empty |
+| `b.push_str(s)` | `(str)` | appends the text; its UTF-8 on a `ByteBuilder` |
+| `b.push_byte(x)` | `(i64)` | `ByteBuilder`; outside `0..255` panics |
+| `b.push_bytes(bs)` | `(bytes)` | `ByteBuilder` |
+| `b.len()`, `b.is_empty()` | `-> i64`, `-> bool` | characters in a `StrBuilder`, bytes in a `ByteBuilder` |
+| `b.at(i)`, `b.set(i, x)` | `(i64) -> i64`, `(i64, i64)` | `ByteBuilder`, with `bytes`' panics |
+| `b.to_str()`, `b.to_bytes()` | `-> str`, `-> bytes` | a copy of the contents; lossy on a `ByteBuilder`, as `bytes.to_str` is |
+
+A builder is a value ([E-VALUE-SEMANTICS]): `let c = b` copies, and an
+append to one is never seen through the other. An append needs a mutable
+place, as `push` does, and copies only a buffer another value holds
+([E-COW]). It is a type of its own because `str` and `bytes` each promise
+something growth would break: a `str` never changes once built, so its
+character count and index are kept, and a `bytes` may be a window `slice` did
+not copy, so its length is fixed ([L-LIB-BYTES-WRITE]). A builder prints as
+its text or as hex, and two are equal when their contents are.
 
 
 <!-- ===== docs/tutorial.md ===== -->

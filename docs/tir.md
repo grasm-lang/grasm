@@ -63,7 +63,8 @@ that global offset space.
 
 ```
 type =
-  | i64 | i8 | i16 | i32 | u8 | u16 | u32 | f64 | bool | str | bytes | unit | range
+  | i64 | i8 | i16 | i32 | u8 | u16 | u32 | u64 | f64 | bool | str | bytes | unit | range
+  | strbuilder | bytebuilder
   | tuple [type]
   | list type
   | map type type
@@ -116,7 +117,7 @@ Every expression carries its type and its span. The kinds:
 ### 6.1 Leaves
 
 ```
-int v k          -- integer literal, k its integer type
+int v k          -- integer literal, k its integer type; a u64 value is printed unsigned
 float v          -- written as the shortest repr that reads back exactly
 bool b
 str [piece]      -- piece = text "..." | value expr (formatted by its type, §8)

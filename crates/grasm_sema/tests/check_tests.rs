@@ -4270,3 +4270,104 @@ fn a_generic_impl_is_for_a_shape_and_its_own_parameters() {
         "for every element type",
     );
 }
+
+/// `u64` is a type of its own ([T-U64]): its literals are range-checked by
+/// what they stand for, a decimal past `i64` is a `u64` and nothing else, and
+/// it mixes with no other integer without a conversion.
+#[test]
+fn u64_literals_and_mixing() {
+    check_ok(
+        "fn f() -> u64 {\n    let a: u64 = 18446744073709551615\n    let b: u64 = 0xFFFF_FFFF_FFFF_FFFF\n    let c: u64 = -0\n    let d = 18446744073709551615 - a\n    return a + b + c + d + 1\n}\n",
+    );
+    check_ok("fn f() -> i64 {\n    return -9223372036854775808\n}\n");
+    check_err(
+        "fn f() {\n    let a: u64 = -1\n}\n",
+        "`-1` does not fit in `u64`",
+    );
+    check_err(
+        "fn f() {\n    let a = 9223372036854775808\n}\n",
+        "too large for `i64`",
+    );
+    check_err(
+        "fn f() {\n    let a: f64 = 9223372036854775808\n}\n",
+        "too large for `f64`",
+    );
+    check_err(
+        "fn f() {\n    let a: u8 = 18446744073709551615\n}\n",
+        "does not fit in `u8`",
+    );
+    check_err(
+        "fn f(a: u64) -> i64 {\n    return a\n}\n",
+        "expected `i64`, found `u64`",
+    );
+    check_err(
+        "fn f(a: u64, b: i64) {\n    let c = a + b\n}\n",
+        "type mismatch",
+    );
+    check_err(
+        "fn f() {\n    let a: usize = 1\n}\n",
+        "is not implemented yet",
+    );
+    check_err(
+        "fn f(a: u64) -> i64 {\n    return match a {\n        18446744073709551615 -> 1\n        _ -> 2\n    }\n}\n",
+        "a pattern names a value from 0 to 9223372036854775807",
+    );
+    check_err(
+        "fn f(a: u64) -> i64 {\n    return match a {\n        0xFFFF_FFFF_FFFF_FFFF -> 1\n        _ -> 2\n    }\n}\n",
+        "a pattern on a `u64` names a value from 0 to 9223372036854775807",
+    );
+    // The methods answer in their own types.
+    check_ok(
+        "fn f(a: u64) -> Option[u64] {\n    let s: str = a.to_str()\n    let i: i64 = a.as_i64()\n    let t: Option[i64] = a.try_i64()\n    let u: Option[u64] = s.parse_u64()\n    return \"ff\".parse_u64_base(16)\n}\n",
+    );
+}
+
+/// The width-aware bit methods ([L-LIB-BITS-WIDTH]): a rotation or a byte
+/// swap answers in the receiver's own type, a count in `i64`, and the
+/// rotation count is an `i64` whatever is rotated, as a shift count is.
+#[test]
+fn bit_methods_answer_in_their_types() {
+    check_ok(
+        "fn f(a: u8, b: i16, c: u64) -> i64 {\n    let x: u8 = a.rotate_left(3)\n    let y: i16 = b.swap_bytes()\n    let z: u64 = c.rotate_right(-1)\n    return a.count_ones() + b.leading_zeros() + c.trailing_zeros()\n}\n",
+    );
+    check_err(
+        "fn f(a: u8) {\n    let x: i64 = a.rotate_left(1)\n}\n",
+        "expected `i64`, found `u8`",
+    );
+    check_err(
+        "fn f(a: u8, n: u8) {\n    let x = a.rotate_left(n)\n}\n",
+        "type mismatch",
+    );
+    check_err(
+        "fn f(a: i64) {\n    let x = a.count_ones(1)\n}\n",
+        "argument",
+    );
+}
+
+/// Builders ([L-LIB-BUILDER]) are values: an append writes through its
+/// receiver, so it needs a `var`, and each kind has only its own appends.
+#[test]
+fn builders_grow_through_a_var() {
+    check_ok(
+        "fn f() -> str {\n    var s = str_builder()\n    s.push_str(\"a\")\n    var b = byte_builder()\n    b.push_byte(1)\n    b.push_bytes(bytes_of([2]))\n    b.push_str(\"c\")\n    b.set(0, 9)\n    let n: i64 = b.at(0) + b.len() + s.len()\n    let bs: bytes = b.to_bytes()\n    let empty: bool = s.is_empty()\n    return s.to_str() + b.to_str()\n}\n",
+    );
+    check_ok(
+        "type Out = { text: StrBuilder, raw: ByteBuilder }\n\nfn emit(inout o: Out, s: str) {\n    o.text.push_str(s)\n    o.raw.push_str(s)\n}\n",
+    );
+    check_err(
+        "fn f() {\n    let s = str_builder()\n    s.push_str(\"a\")\n}\n",
+        "cannot mutate `s`",
+    );
+    check_err(
+        "fn f() {\n    var t = str_builder()\n    t.push_byte(1)\n}\n",
+        "no method `push_byte` on `StrBuilder`",
+    );
+    check_err(
+        "fn f() {\n    var b = byte_builder()\n    b.push_str(1)\n}\n",
+        "expected `str`, found `i64`",
+    );
+    check_err(
+        "fn f() {\n    let u = str_builder(1)\n}\n",
+        "takes no arguments",
+    );
+}

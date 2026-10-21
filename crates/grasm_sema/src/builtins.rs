@@ -54,6 +54,9 @@ pub const MUTATING_METHODS: &[&str] = &[
     "remove",
     "fill",
     "copy_from",
+    "push_str",
+    "push_byte",
+    "push_bytes",
 ];
 
 /// The effects a builtin performs. Empty means it reaches nothing outside the
@@ -393,6 +396,18 @@ pub const BUILTINS: &[Builtin] = &[
     // write pixels into should not build a million boxed integers to get it.
     Builtin {
         name: "bytes_filled",
+        row: PURE,
+        journal: Journal::Untouched,
+    },
+    // The two builders ([L-LIB-BUILDER]): empty, and pure, as `bytes_filled`
+    // is -- making one reaches nothing outside the program.
+    Builtin {
+        name: "str_builder",
+        row: PURE,
+        journal: Journal::Untouched,
+    },
+    Builtin {
+        name: "byte_builder",
         row: PURE,
         journal: Journal::Untouched,
     },

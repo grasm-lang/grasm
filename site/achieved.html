@@ -82,7 +82,7 @@ is met on all four engines, and the ≥99% figure is unmeasurable because nobody
 has run a Grasm program in production.</p>
 
 <h2>The gates, and what each one would catch</h2>
-<p>Judged by exit code alone, 176 of them. These are the figures from the
+<p>Judged by exit code alone, 180 of them. These are the figures from the
 last recorded run on this machine:</p>
 <div class="scroll"><table>
 <tr><th>Gate</th><th>Scope</th><th>Result</th></tr>
@@ -93,8 +93,8 @@ last recorded run on this machine:</p>
 <tr><td><code>clippy --all-targets</code></td><td>native and wasm32</td><td>0</td></tr>
 <tr><td>unit tests</td><td>every crate</td><td><b>609 pass</b></td></tr>
 <tr><td><code>replaytest</code></td><td>every journalled builtin</td><td>each one refuses under an empty journal</td></tr>
-<tr><td>fuzzers</td><td>16 generators</td><td>clean</td></tr>
-<tr><td>conformance</td><td>262 programs</td><td>one per normative clause</td></tr>
+<tr><td>fuzzers</td><td>17 generators</td><td>clean</td></tr>
+<tr><td>conformance</td><td>265 programs</td><td>one per normative clause</td></tr>
 </table></div>
 <p><code>leakcheck</code> and <code>usecheck</code> are the two no other check
 replaces: a leaking program produces exactly the right output, and a premature
@@ -145,7 +145,7 @@ a receiver rather than another sender, and a round costs what is runnable.</p>
 <p>That changed an observable rule, so the specification changed with it:
 <code>[E-SCHEDULE]</code> now wakes the longest-waiting sender or receiver
 instead of going round-robin. It is an <em>experimental</em> clause, and all
-262 conformance programs produce identical output across the change.
+265 conformance programs produce identical output across the change.
 The interpreter stops near 285,000 tasks and is allowed to: an
 interpreter frame costs about 10 KB where a compiled one costs 30 bytes.</p>
 

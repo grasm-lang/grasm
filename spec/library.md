@@ -205,13 +205,13 @@ becomes a number with `parse_int` / `parse_float`, which return `Option`
 because the text may not be a number.
 
 **[L-LIB-INT-CONV]** On every integer type `T`, with `U` any of `i8 i16 i32
-u8 u16 u32` ([T-INT-FIXED]):
+u8 u16 u32 u64` ([T-INT-FIXED], [T-U64]):
 
 | method | type | notes |
 |--------|------|-------|
 | `n.as_U()` | `T -> U` | wraps to `U`'s width |
-| `n.try_U()` | `T -> Option[U]` | `None` when the value does not fit |
-| `n.as_i64()` | `T -> i64` | the same value |
+| `n.try_U()`, `n.try_i64()` | `T -> Option[U]` | `None` when the value does not fit |
+| `n.as_i64()` | `T -> i64` | the same value; a `u64` from 2^63 up gives its bits |
 | `x.as_U()` | `f64 -> U` | toward zero, held to `U`'s range; NaN is `0` |
 | `a.checked_add(b)`, `_sub`, `_mul` | `(T, T) -> Option[T]` | `None` when the true result is outside `T` |
 | `a.saturating_add(b)`, `_sub`, `_mul` | `(T, T) -> T` | the true result, held to `T`'s range |
@@ -292,6 +292,7 @@ and `trim` cannot tell you that.
 | `s.parse_int()` | `-> Option[i64]` | surrounding space and a leading `+` are accepted; `1_000` and `0xFF` are **not** ([L-LIB-PARSE]) |
 | `n.to_base(b)` | `(i64) -> str` | digits `0-9a-z`; a base outside `2..36` panics ([L-LIB-BASE]) |
 | `s.parse_int_base(b)` | `(i64) -> Option[i64]` | the other direction; no prefix accepted ([L-LIB-BASE]) |
+| `s.parse_u64()`, `s.parse_u64_base(b)` | `-> Option[u64]` | as the two above, up to 2^64 − 1; a `-` is refused ([T-U64]) |
 | `s.parse_float()` | `-> Option[f64]` | accepts `inf`, `-inf`, `nan`; overflow gives an infinity, not `None` ([L-LIB-PARSE]) |
 | `x.is_nan()`, `x.is_finite()` | `-> bool` | what `parse_float` makes necessary ([L-LIB-PARSE]) |
 | `s.code_at(i)` | `(i64) -> i64` | Unicode code point of character `i`; panics out of range ([L-LIB-CODES]) |
@@ -371,15 +372,12 @@ element, which is where a list of structs gets its order from — `sort` needs
 the *elements* ordered, and a struct is not. The key is `i64`, `f64`, `str`, or
 a **tuple** of those, which is what makes
 `xs.sort_by(|p| (p.dept, p.age, p.name))` a multi-key sort rather than an error
-([L-LIB-TUPLE]). This clause said "must be `i64`, `f64` or `str`" while tuple
-keys worked in all three engines — two clauses of one document disagreeing, and
-the one that was wrong was the one a reader would find first. The sort is stable: elements with equal keys stay in the order they
-were written. It sorts **ascending**, always; descending is
+([L-LIB-TUPLE]). The sort is stable: elements with equal keys stay in the
+order they were written. It sorts **ascending**, always; descending is
 `xs.sort_by(k)` followed by `xs = xs.rev()`. Negating the key works for a
 number and has no counterpart for a `str`, so the reversal is the general
 answer and the one to reach for. The assignment is the whole point: `sort_by`
-mutates and `rev` answers with a new list, so the clause's earlier wording —
-`xs.rev()` on its own line — left the list ascending and said nothing.
+mutates and `rev` answers with a new list.
 
 **[L-LIB-PAIRS]** `xs.enumerate()` pairs each element with its index and
 `xs.zip(ys)` pairs the two lists positionally, stopping at the shorter — there
@@ -391,9 +389,7 @@ is no element to invent past the end of one. Both give `[(A, B)]`, which
 component by component. That is what `<` on tuples means, what `sort` on a
 list of them does, `min`/`max` included, and what makes
 `xs.sort_by(|p| (p.dept, p.age, p.name))` a multi-key sort rather than an
-error. `min` and `max` used to spell out the types they accepted instead of
-asking whether the element was ordered, so `xs.enumerate().min()` was refused
-on a list `sort` orders happily.
+error.
 
 That example is worth spelling out, because it does *not* mean "index of the
 smallest": components compare left to right, so `enumerate().min()` compares
@@ -686,9 +682,24 @@ out-of-range count undefined, which would make the two engines disagree.
 `shr` preserves the sign and `ushr` does not, which is the only reason both
 exist: `(-16).shr(2)` is `-4` and `(-16).ushr(60)` is `15`.
 
-There is no unsigned integer type, so a program working in 32 bits masks with
-`0xFFFFFFFF` itself. `spec/conformance/L-LIB-BITS.gr` shows the rotation that
-SHA-256 needs, written that way.
+On a fixed-width type each applies at its width ([L-LIB-INT-CONV]), so a `u32`
+needs no `0xFFFFFFFF` mask; `spec/conformance/L-LIB-BITS.gr` shows SHA-256's
+rotation written on an `i64` with one.
+
+**[L-LIB-BITS-WIDTH]** Six more, on every integer type `T`, read its bits at
+its own width — 64 for `i64` and `u64`, 8 for `i8` — and answer as Rust does:
+
+| | | |
+|---|---|---|
+| `a.rotate_left(n)`, `a.rotate_right(n)` | `(T, i64) -> T` | turned around the width, `n` taken modulo it |
+| `a.count_ones()` | `(T) -> i64` | the bits that are set |
+| `a.leading_zeros()`, `a.trailing_zeros()` | `(T) -> i64` | zeros above the highest set bit, below the lowest; the width for `0` |
+| `a.swap_bytes()` | `(T) -> T` | the bytes in reverse order; the value itself on `i8` and `u8` |
+
+`n` modulo the width is Rust's `rotate_left(n as u32)`, so a negative `n`
+turns the other way. A signed type answers for its two's-complement bits:
+`(0 - 1).as_i8().count_ones()` is `8` and `(1).as_i8().rotate_right(1)` is
+`-128`.
 
 ## The other stream — [L-LIB-EPRINT]
 
@@ -815,3 +826,28 @@ a `slice` taken before one is unaffected. **The length never changes**: a
 promise its elements are bytes, stores eight per element, and cannot be handed
 to a buffer — the promise is the type. `at` gives `0..255` as an `i64`, which
 is the trade. It **prints as hex**, and `to_str` is lossy for `tcp_read`'s reason.
+
+## Builders — [L-LIB-BUILDER]
+
+**[L-LIB-BUILDER]** A `StrBuilder` collects text and a `ByteBuilder` bytes,
+each appended at its end in amortized constant time, so emitting an output
+— code, an object file, a report — takes time linear in its size.
+
+| | type | |
+|---|---|---|
+| `str_builder()`, `byte_builder()` | `-> StrBuilder`, `-> ByteBuilder` | empty |
+| `b.push_str(s)` | `(str)` | appends the text; its UTF-8 on a `ByteBuilder` |
+| `b.push_byte(x)` | `(i64)` | `ByteBuilder`; outside `0..255` panics |
+| `b.push_bytes(bs)` | `(bytes)` | `ByteBuilder` |
+| `b.len()`, `b.is_empty()` | `-> i64`, `-> bool` | characters in a `StrBuilder`, bytes in a `ByteBuilder` |
+| `b.at(i)`, `b.set(i, x)` | `(i64) -> i64`, `(i64, i64)` | `ByteBuilder`, with `bytes`' panics |
+| `b.to_str()`, `b.to_bytes()` | `-> str`, `-> bytes` | a copy of the contents; lossy on a `ByteBuilder`, as `bytes.to_str` is |
+
+A builder is a value ([E-VALUE-SEMANTICS]): `let c = b` copies, and an
+append to one is never seen through the other. An append needs a mutable
+place, as `push` does, and copies only a buffer another value holds
+([E-COW]). It is a type of its own because `str` and `bytes` each promise
+something growth would break: a `str` never changes once built, so its
+character count and index are kept, and a `bytes` may be a window `slice` did
+not copy, so its length is fixed ([L-LIB-BYTES-WRITE]). A builder prints as
+its text or as hex, and two are equal when their contents are.

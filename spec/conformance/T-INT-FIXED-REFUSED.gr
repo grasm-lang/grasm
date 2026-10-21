@@ -1,9 +1,10 @@
 //! tag: T-INT-FIXED-REFUSED
 //! expect: error
 //! is not implemented yet
-// u64 was an alias for i64, so its arithmetic was signed. Refused until it
-// is real, rather than kept as a name that says something it does not do.
+// usize was an alias for i64, so its arithmetic was signed and its width was
+// not the platform's. Refused until it is real, rather than kept as a name
+// that says something it does not do. (u64 is real now: [T-U64].)
 fn main() {
-    let a: u64 = 1
+    let a: usize = 1
     print(a)
 }

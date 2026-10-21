@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Fixed-width integers, against an oracle that is not either engine.
 
-`i8 i16 i32 u8 u16 u32` are their own types ([T-INT-FIXED]): every engine
-holds the value in 64 bits and wraps each result to the type's width. Before
+`i8 i16 i32 u8 u16 u32 u64` are their own types ([T-INT-FIXED], [T-U64]):
+every engine holds the value in 64 bits and wraps each result to the type's
+width. `u64` is the width whose bits are not its value read as an `i64`, so
+it also has to divide, compare, convert and print unsigned. Before
 they were, the names were spellings of `i64`, and `let a: u8 = 255; a + 1`
 printed 256 in both engines -- which agreed, so the agreement gates saw
 nothing. Two engines agreeing is not evidence that either is right, so the
@@ -19,6 +21,20 @@ wraps it by the rule as written:
   try_T                         Some when it fits in T
   checked_op / saturating_op    the exact result: None / held to the range
   x op= y                       the same as x = x op y
+  as_i64 / try_i64              the bits read signed / Some when it fits
+  to_base(16), parse_u64        u64 only: unsigned digits, and back
+  as_f64().as_u64()             u64 only: the nearest double, held to range
+  i64 ^ e                       every bit of e, however large
+  rotate_left/right(n)          the bits at the width, turned by n mod width
+  count_ones, leading_zeros,    the bits at the width; zero counts the width
+  trailing_zeros                ([L-LIB-BITS-WIDTH])
+  swap_bytes                    the width's bytes reversed, read back
+
+`i64` is one of the kinds as well, so its own answers are held to the oracle
+rather than only to the other engine.
+
+A `u64` literal past 2^63 is written in hex or in decimal at random, since
+both reach the checker by different roads.
 
 Each program is run by `grasm run` and by a native build, both must print
 the oracle's lines, and the native one must leak nothing.
@@ -54,7 +70,8 @@ build_native = _lib("inplace").build
 _lib("fresh").fresh_or_stop(GRASM)
 
 KINDS = {"i8": (8, True), "i16": (16, True), "i32": (32, True),
-         "u8": (8, False), "u16": (16, False), "u32": (32, False)}
+         "u8": (8, False), "u16": (16, False), "u32": (32, False),
+         "u64": (64, False), "i64": (64, True)}
 
 
 def lo(k):
@@ -87,11 +104,37 @@ def opt(v):
 def pick(rng, k):
     # The ends of the range, the values next to them, zero, and anything.
     edges = [lo(k), lo(k) + 1, hi(k), hi(k) - 1, 0, 1, -1 if KINDS[k][1] else 2]
+    if k == "u64":
+        # Where reading the bits as an `i64` changes sign.
+        edges += [1 << 63, (1 << 63) - 1, (1 << 63) + 1]
     return rng.choice(edges) if rng.random() < 0.4 else rng.randint(lo(k), hi(k))
 
 
-def lit(v):
-    return f"({v})" if v < 0 else str(v)
+def lit(v, rng=None):
+    if v < 0:
+        return f"({v})"
+    # Past `i64` a `u64` may be written either way ([T-U64]).
+    if v >= 1 << 63 and rng is not None and rng.random() < 0.5:
+        return hex(v)
+    return str(v)
+
+
+def rot(k, v, n):
+    w = KINDS[k][0]
+    x = v & ((1 << w) - 1)
+    n %= w
+    return wrap(k, ((x << n) | (x >> (w - n))) if n else x)
+
+
+def swap(k, v):
+    w = KINDS[k][0]
+    x = v & ((1 << w) - 1)
+    return wrap(k, int.from_bytes(x.to_bytes(w // 8, "big"), "little"))
+
+
+def signed64(v):
+    v &= (1 << 64) - 1
+    return v - (1 << 64) if v >= 1 << 63 else v
 
 
 def program(rng, idx):
@@ -103,13 +146,16 @@ def program(rng, idx):
         n = rng.choice([0, 1, 3, 7, 8, 15, 16, 31, 33, 63, 64])
         p = rng.choice([0, 1, 2, 3, 5])
         big = rng.choice([rng.randint(-(1 << 40), 1 << 40), hi(k) + 1, lo(k) - 1, rng.randint(lo(k), hi(k))])
-        f = rng.choice([300.7, -300.7, 1e12, -1e12, 0.5, -0.5, 65535.9, float("nan")])
+        # `big` is an `i64`, which has no room for the top of a `u64`.
+        big = max(-(1 << 63), min((1 << 63) - 1, big))
+        f = rng.choice([300.7, -300.7, 1e12, -1e12, 0.5, -0.5, 65535.9, float("nan"),
+                        1e19, 2e19, -1e19])
         j = rng.choice(list(KINDS))
         tag = f"c{idx}_{case}"
-        lines.append(f"    let a{case}: {k} = {lit(a)}")
-        lines.append(f"    let b{case}: {k} = {lit(b)}")
-        lines.append(f"    let z{case}: {k} = {lit(nz)}")
-        lines.append(f"    var x{case}: {k} = {lit(a)}")
+        lines.append(f"    let a{case}: {k} = {lit(a, rng)}")
+        lines.append(f"    let b{case}: {k} = {lit(b, rng)}")
+        lines.append(f"    let z{case}: {k} = {lit(nz, rng)}")
+        lines.append(f"    var x{case}: {k} = {lit(a, rng)}")
         lines.append(f"    let big{case}: i64 = {lit(big)}")
         fl = "0.0 / 0.0" if math.isnan(f) else repr(f)
         lines.append(f"    let f{case}: f64 = {fl}")
@@ -133,7 +179,8 @@ def program(rng, idx):
             (f"{A}.shr({n})", wrap(k, a >> (n & 63))),
             (f"{A}.ushr({n})", wrap(k, (a & ((1 << KINDS[k][0]) - 1)) >> (n & 63))),
             (f"{A}.as_{j}()", wrap(j, a)),
-            (f"{A}.as_i64()", a),
+            (f"{A}.as_i64()", signed64(a)),
+            (f"{A}.try_i64()", opt(a if a < 1 << 63 else None)),
             (f"big{case}.as_{k}()", wrap(k, big)),
             (f"big{case}.try_{k}()", opt(big if lo(k) <= big <= hi(k) else None)),
             (f"f{case}.as_{k}()", 0 if math.isnan(f) else max(lo(k), min(hi(k), math.trunc(f)))),
@@ -146,7 +193,30 @@ def program(rng, idx):
             (f"{A} < {B}", "true" if a < b else "false"),
             (f"{A} == {B}", "true" if a == b else "false"),
             (f"[{A}, {B}, {Z}].sum()", wrap(k, a + b + nz)),
+            (f"[{A}, {B}, {Z}].max()", opt(max(a, b, nz))),
         ]
+        w = KINDS[k][0]
+        x = a & ((1 << w) - 1)
+        r = rng.choice([0, 1, 3, 7, 8, 15, 31, 33, 63, 64, 65, -1, -9, rng.randint(-200, 200)])
+        exprs += [
+            (f"{A}.rotate_left({lit(r)})", rot(k, a, r)),
+            (f"{A}.rotate_right({lit(r)})", rot(k, a, -r)),
+            (f"{A}.count_ones()", bin(x).count("1")),
+            (f"{A}.leading_zeros()", w - x.bit_length()),
+            (f"{A}.trailing_zeros()", w if x == 0 else (x & -x).bit_length() - 1),
+            (f"{A}.swap_bytes()", swap(k, a)),
+        ]
+        if k == "u64":
+            exprs += [
+                (f"{A}.to_base(16)", format(a, "x")),
+                (f'"{a}".parse_u64()', opt(a)),
+                (f'"{format(a, "x")}".parse_u64_base(16)', opt(a)),
+                (f"{A}.as_f64().as_u64()", min(int(float(a)), hi(k))),
+                (f"{A}.cmp({B})", (a > b) - (a < b)),
+            ]
+        # `i64`'s `^` with every bit of a large exponent ([E-ARITH-INT]).
+        base, ex = rng.randint(-50, 50), rng.choice([rng.randint(0, 70), rng.randint(1 << 32, 1 << 40)])
+        exprs.append((f"{lit(base)} ^ {ex}", signed64(pow(base, ex, 1 << 64))))
         for i, (e, v) in enumerate(exprs):
             lines.append(f'    print("{tag}.{i} {{{e}}}")')
             want.append(f"{tag}.{i} {v}")
@@ -169,9 +239,11 @@ def main():
     rng = random.Random(o.seed)
     work = tempfile.mkdtemp(prefix="grasm_intwidth_")
     bad = 0
+    checked = 0
     try:
         for idx in range(o.programs):
             src, want = program(rng, idx)
+            checked += 2 * len(want.splitlines())
             path = os.path.join(work, "p.gr")
             exe = os.path.join(work, "p.bin")
             with open(path, "w") as fh:
@@ -201,8 +273,7 @@ def main():
             if held:
                 bad += 1
                 print(f"program {idx}: LEAKS {held}")
-        lines = o.programs * 6 * 32
-        print(f"programs: {o.programs}   checked lines: {lines}   disagreed: {bad}   (SEED={o.seed})")
+        print(f"programs: {o.programs}   checked lines: {checked}   disagreed: {bad}   (SEED={o.seed})")
     finally:
         if not o.keep:
             shutil.rmtree(work, ignore_errors=True)

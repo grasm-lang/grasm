@@ -7,6 +7,10 @@ pub enum TokenKind {
     // Literals
     Ident(String),
     Int(i64),
+    /// A decimal integer literal above `i64`'s range and within `u64`'s. Only
+    /// a `u64` can be one ([T-U64]); the parser records where it was written
+    /// so the checker can refuse it anywhere else.
+    WideInt(u64),
     Float(f64),
     /// String literal parts: text segments interleaved with `{expr}` interpolation
     /// slots. A plain string is a single `Text` part.
@@ -165,6 +169,7 @@ impl TokenKind {
         match self {
             Ident(n) => format!("identifier `{n}`"),
             Int(v) => format!("integer `{v}`"),
+            WideInt(v) => format!("integer `{v}`"),
             Float(v) => format!("float `{v}`"),
             Str(_) => "string literal".into(),
             Newline => "end of line".into(),
@@ -249,7 +254,9 @@ impl TokenKind {
             SlashEq => "/=",
             Underscore => "_",
             At => "@",
-            Ident(_) | Int(_) | Float(_) | Str(_) | Newline | Error(_) | Eof => unreachable!(),
+            Ident(_) | Int(_) | WideInt(_) | Float(_) | Str(_) | Newline | Error(_) | Eof => {
+                unreachable!()
+            }
         }
     }
 }

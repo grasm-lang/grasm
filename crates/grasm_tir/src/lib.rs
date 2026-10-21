@@ -166,6 +166,8 @@ impl<'a> Emitter<'a> {
             Type::Bool => "bool".into(),
             Type::Str => "str".into(),
             Type::Bytes => "bytes".into(),
+            Type::StrBuf => "strbuilder".into(),
+            Type::ByteBuf => "bytebuilder".into(),
             Type::Unit => "unit".into(),
             Type::Range => "range".into(),
             Type::Tuple(ts) => self.ty_list("tuple", ts),
@@ -738,6 +740,11 @@ impl<'a> Emitter<'a> {
                     return Node::leaf(format!("float f64 {} 0x{bits:016x}", span_atom(sp)));
                 }
                 let h = self.head("int", sp);
+                // A `u64` literal is held as its bits in an `i64`; it is
+                // printed as the number that was written.
+                if h.starts_with("int u64 ") {
+                    return Node::leaf(format!("{h} {}", *v as u64));
+                }
                 Node::leaf(format!("{h} {v}"))
             }
             Expr::Float(f, _) => Node::leaf(format!(

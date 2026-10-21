@@ -7,7 +7,7 @@ before it is listed as stable.
 `crates/grasm_spec` fails if a clause here is missing, unknown, or listed twice,
 so this file cannot drift away from the specification it describes.
 
-Today: 167 stable, 25 provisional, 70 experimental, of 262.
+Today: 167 stable, 25 provisional, 73 experimental, of 265.
 
 ## Stable
 
@@ -247,13 +247,16 @@ May change or be removed in any release. New surface starts here.
 - `L-LEADING-DOT` — experimental
 - `L-LIB-BASE` — experimental
 - `L-LIB-BITS` — experimental
+- `L-LIB-BITS-WIDTH` — experimental
 - `L-LIB-INT-CONV` — experimental
 - `T-INT-FIXED` — experimental
 - `T-INT-FIXED-MIX` — experimental
 - `T-INT-FIXED-RANGE` — experimental
 - `T-INT-FIXED-REFUSED` — experimental
+- `T-U64` — experimental
 - `L-LIB-BYTES` — experimental
 - `L-LIB-BYTES-WRITE` — experimental
+- `L-LIB-BUILDER` — experimental
 - `L-LIB-EPRINT` — experimental
 - `L-LIB-FS` — experimental
 - `L-LIB-NET` — experimental

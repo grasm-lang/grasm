@@ -182,6 +182,151 @@ it, as `spec/core.md` says.
 > wall. What would shrink it is moving builtins out of the engine into Grasm,
 > which needs a standard library written in the language.
 
+**Paid for again on 2026-10-20, by [T-U64].** The `u64` clause and its library
+rows took the spec to 3,561 lines, 71 pages. The history below came out of
+[T-FIELD-CALL] and [T-OK-ERR-RETURN] -- accounts of what each rule's absence
+did, inside the rule -- and the spec is 3,542 lines, 70 pages, with every
+rule still where it was. Nothing was excluded from the count and the ceiling
+did not move.
+
+> From [T-FIELD-CALL]:
+>
+> field: `n.run(5)`. Building the value and reading the field back both worked
+> from the start and the call did not, so the only spelling that ran was
+> `let f = n.run` followed by `f(5)` — which nothing pointed to, while the error
+> suggested declaring a free `fn run(Node, ...)`, a different function that would
+> not call the field at all.
+>
+> function in the first position; the error used to be "no method `0`", with
+> help suggesting a free `fn 0(...)`, which is not a name that can be written.
+>
+> From [T-OK-ERR-RETURN], on annotations:
+>
+> same two shapes per branch, and demanding the whole type of every branch made
+> `let v: f64 ! E = if c { 3.0 } else { Ok(4.5) }` a type mismatch while the same
+> expression without the annotation was an unhandled failure whose help says to
+> annotate it. Two diagnostics pointing at each other is no way to write the
+> program at all.
+>
+> On `return`:
+>
+> `return if c { 3 } else { Ok(4) }` is the two shapes in one statement. Only the
+> tail expression was taught this, so `return Ok(1)` was "this expression can
+> fail but `i64` is required" — a message about the wrong problem, in the shape
+> early exits are written in, and the workaround was to rewrite every one of them
+> as `fail`. Deciding by *how the value was written* rather than by what it
+> turned out to be left the same hole one level out: an `if` whose branches
+> merged to the whole `T ! E` was wrapped a second time on the way out, and the
+> caller printed a heap address.
+>
+> On mixing the halves:
+>
+> Taking the type from whichever branch came first instead meant
+> `if n == 1 { 10 } else { Ok(n * 3) }` was typed `i64`: the `Ok` branch's value
+> travelled as a machine word and was wrapped a second time on the way out, so a
+> caller that matched `Ok(v)` printed a heap address where the number was.
+
+**And again for [L-LIB-BITS-WIDTH].** Its six rows and two paragraphs came to
+15 lines; the history below, from [L-LIB-SORT-BY], [L-LIB-TUPLE],
+[G-STRUCT-NONEMPTY] and [G-MATCH-ARM-EXPR], paid for them. Each rule is where
+it was.
+
+> From [L-LIB-SORT-BY]:
+>
+> ([L-LIB-TUPLE]). This clause said "must be `i64`, `f64` or `str`" while tuple
+> keys worked in all three engines — two clauses of one document disagreeing, and
+> the one that was wrong was the one a reader would find first.
+>
+> mutates and `rev` answers with a new list, so the clause's earlier wording —
+> `xs.rev()` on its own line — left the list ascending and said nothing.
+>
+> From [L-LIB-TUPLE]:
+>
+> error. `min` and `max` used to spell out the types they accepted instead of
+> asking whether the element was ordered, so `xs.enumerate().min()` was refused
+> on a list `sort` orders happily.
+>
+> From [G-STRUCT-NONEMPTY]:
+>
+> would be a type with no way to write a value of it. The rules above used to
+> make both the field list and the literal's contents optional, so `type E = { }`
+> was declared, accepted, and unbuildable, and `E{}` failed with "expected end of
+> line after statement".
+>
+> From [G-MATCH-ARM-EXPR]:
+>
+> 0..2 { … } }`, not `1 -> for i in 0..2 { … }`. The rule used to read
+> `( expression | statement )`, which the parser had never accepted — a grammar
+> that promises more than the implementation gives is a worse guide than no
+> grammar, because a reader trusts it and gets a parse error with no idea which
+> of the two is wrong.
+
+**And for [L-LIB-BUILDER].** The builders' clause, table and the reason they
+are types of their own came to 25 lines. These paid for them, each an account
+of a defect inside the rule that closed it; the rules stay.
+
+> From [T-MOVE-LOOP]:
+>
+> rejected too. It was refused in the loop and accepted in the closure, which
+> are the same program written two ways.
+>
+> From [T-PARAM-INOUT-PLACES]:
+>
+> And an `inout` parameter crosses a module boundary like any other. Both were
+> compiled-backend gaps, and both mattered more than they sound — `inout` is the
+> answer [T-CAPTURE-WRITE] gives for threading mutable state, so its stopping at
+> a file edge reshaped a public API.
+>
+> From [T-MUTATE-PLACE]:
+>
+> `mk().pop()` are not: there is nowhere for the mutation to land, and they were
+> accepted and then panicked at run time, one of them printing a
+> compiler-internal `Span { start: .., end: .. }` into the terminal. Writing to
+> a `let` binding was already a compile error, so the temporary was the one
+> receiver nothing checked.
+>
+> From [T-MODULE-NS]:
+>
+> Clock` declares `Clock` and `ClockHandler`. Both were free to collide with a
+> type, and both names stayed usable afterwards. [...] A *type alias* is a type
+> declaration like any other, and it was the one that escaped both this rule and
+> [T-TYPE-NO-PUB]: aliases resolve a pass after struct and sum bodies, so
+> nothing had registered the first `type Id = i64` when the second was
+> collected, and two declarations of one name checked clean with the later one
+> silently winning.
+>
+> From [G-TYPE-NOT-QUALIFIED]:
+>
+> qualifier would carry no information — and the grammar used to allow one,
+> which meant the only way to find out was the error.
+>
+> From [E-IF-VALUE]:
+>
+> otherwise, so a branch ending in a `with`, `for` or `while` statement sailed
+> past the demand entirely: `if c { 7 } else { with D handled_by h { n } }` in an
+> `-> i64` function checked clean, `grasm run` printed `()` where the integer
+> belonged and a compiled build printed `0` — while the same `with` as the
+> *whole* body was refused.
+>
+> From [E-ENTRY]:
+>
+> means what that clause says. Only the return type was refused for a while, so
+> `fn main(x: i64)` checked clean and then panicked at run time with
+> `unknown name \`x\`` — a compiler-internal message arriving after the point
+> where types are supposed to be settled.
+>
+> From [E-IF-FALLIBLE-MERGE]:
+>
+> the ok half, so a branch that is only `Err` cannot decide the type by itself —
+> taking it anyway made `xs.map(|x| if p { Err(e) } else { Ok(x) })` produce a
+> list whose elements were later read as the wrong thing.
+>
+> From [E-LIST-CONCAT], replaced by a pointer to [L-LIB-BUILDER]:
+>
+> reason: strings are immutable, so each `s = s + x` copies everything so far.
+> 400 000 appends take about 2.4 seconds. There is no string builder; collect the
+> pieces in a list and `join` them, which is linear.
+
 Closed on 2026-09-22: a second `var` of a name already bound in the same block
 leaked what the first binding owned. `FnCx::bind` inserted into the innermost
 scope map and dropped whatever entry was there, and `pop_scope_with_decs`
@@ -297,15 +442,30 @@ write here. They are collected because the first person outside this repository
 to port a real application hit every one of them in a week, and the list is
 more useful than the sum of the clauses that imply it.
 
-**One float width, no unsigned 64-bit, no packed layout.** *Narrowed on
-2026-10-19 by [T-INT-FIXED].* `i8 i16 i32 u8 u16 u32` are types of their own
-that wrap at their width in both engines, checked against an exact oracle by
-`scripts/fuzz_intwidth.py`; a `u32` hash no longer wants masking by hand.
-What is still missing: `u64` and `usize` (unsigned 64-bit arithmetic) and
-`f32` are refused rather than implemented, so code that packs binary32 still
-writes the bit layout itself. Every integer is held in 64 bits in a list or a
-struct -- a `[u8]` is not a byte array, and there is no C struct layout -- and
+**One float width, no packed layout.** *Narrowed on 2026-10-19 by
+[T-INT-FIXED], and on 2026-10-20 by [T-U64].* `i8 i16 i32 u8 u16 u32 u64` are
+types of their own that wrap at their width in both engines, checked against
+an exact oracle by `scripts/fuzz_intwidth.py`; a `u32` hash no longer wants
+masking by hand, and a 64-bit hash (FNV, xxhash, SipHash) prints, compares and
+divides as the unsigned number it is. What is still missing: `usize` and `f32`
+are refused rather than implemented, so code that packs binary32 still writes
+the bit layout itself. Every integer is held in 64 bits in a list or a struct
+-- a `[u8]` is not a byte array, and there is no C struct layout -- and
 `bytes` indexing still answers an `i64`.
+
+One edge of `u64` is a limit rather than a defect. A `match` pattern on a
+`u64` names 0 to 2^63 − 1: the parser folds a pattern's minus sign into its
+literal, so `-1` and `0xFFFF_FFFF_FFFF_FFFF` arrive as the same number and
+cannot be told apart; a value from 2^63 up is matched in a guard, `n if n ==
+0xFFFF_FFFF_FFFF_FFFF`, and both spellings in a pattern are refused rather than
+read either way.
+
+Closed on 2026-10-20, found while writing `u64`'s `^`: `i64`'s `^` clamped its
+exponent at 4294967295 in both engines (`wrapping_pow` takes a `u32`), so
+`3 ^ 4294967296` printed 830436559519656619, the answer for `3 ^ 4294967295`,
+where [E-ARITH-INT] wrapping gives 2491309678558969857. The two engines agreed,
+so no agreement gate could see it. Both now multiply over every bit of the
+exponent, and `scripts/fuzz_intwidth.py` draws exponents past 2^32.
 
 **No mutable byte buffer.** *Closed on 2026-10-15 by [L-LIB-BYTES-WRITE].*
 `bytes_filled(n, byte)` makes a buffer and `set`, `fill` and `copy_from` write
@@ -320,8 +480,8 @@ a larger allocation, since `slice` does not copy, so every write first checks
 that nothing else can see the buffer and copies it when something can
 ([E-COW]). The check is one atomic refcount test and two comparisons, which is
 what the timing above includes. Growing a buffer would move the allocation out
-from under every window on it, so the length is fixed and `concat` is how a
-program grows one.
+from under every window on it, so the length is fixed. A buffer that grows is
+a `ByteBuilder` ([L-LIB-BUILDER]), below.
 
 What remains is the integer width above, not the buffer: a `[f64]` of samples
 is still eight bytes a sample, and packing binary32 still means writing the bit
@@ -355,9 +515,37 @@ There is no reader object, no `seek`, no `mmap` and no streaming encoder.
 Random-access container parsing works, by offset arithmetic rather than by a
 cursor.
 
-**No string builder.** `str` is immutable, so `s = s + x` in a loop is
-quadratic; the external port measured roughly 2.4 s for 400,000 appends.
-Collect into a list and `join`.
+**No string builder.** *Closed on 2026-10-21 by [L-LIB-BUILDER].* `str` is
+immutable, so `s = s + x` in a loop is quadratic under `grasm run`; the
+external port measured roughly 2.4 s for 400,000 appends. `StrBuilder` and
+`ByteBuilder` append in amortized constant time in both engines and stay
+values -- a copy is a copy, before and after an append, which
+`scripts/fuzz_builder.py` checks against a Python model through variables,
+struct fields, list elements and `inout` parameters. Measured with
+`scripts/builder_bench.py --sizes 100000,200000,400000,800000 --reps 2`
+(best of two, on a loaded machine; growth per doubling is the number that
+survives load):
+
+    run           100000      200000      400000      800000   growth per doubling
+      str  s = s + x          0.505s      1.311s      4.964s     30.907s   2.6x 3.8x 6.2x
+      str  StrBuilder         0.041s      0.071s      0.138s      0.266s   1.8x 1.9x 1.9x
+      bytes  b = b.concat(x)  0.394s      0.965s      2.556s     10.110s   2.5x 2.6x 4.0x
+      bytes  ByteBuilder      0.045s      0.064s      0.120s      0.246s   1.4x 1.9x 2.0x
+
+    native        100000      200000      400000      800000   growth per doubling
+      str  s = s + x          0.005s      0.006s      0.006s      0.007s   1.3x 1.0x 1.2x
+      str  StrBuilder         0.004s      0.005s      0.007s      0.011s   1.2x 1.3x 1.6x
+      bytes  b = b.concat(x)  0.408s      0.996s      2.483s      9.865s   2.4x 2.5x 4.0x
+      bytes  ByteBuilder      0.004s      0.005s      0.006s      0.008s   1.1x 1.2x 1.4x
+
+Linear doubles; quadratic quadruples. Both builders double in both engines,
+where the interpreter's `s = s + x` and both engines' `bytes.concat` go
+past 4x at 800,000 -- 116 times slower than the builder for text under
+`grasm run`, 1,200 times for bytes natively. The compiled `s = s + x` was
+already linear: it appends in place when the string is the only holder of
+its buffer (docs/performance.md, "A chained append was quadratic"); that
+rewrite has no interpreter counterpart and no `bytes` one, and a builder does
+not depend on recognising the shape.
 
 **A union error cannot be narrowed.** `(A|B)` can be raised, propagated and
 printed, but not destructured back into its arms. The way to branch on which

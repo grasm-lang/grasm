@@ -202,10 +202,9 @@ the length. `list.get(i)` returns `Option` instead of panicking.
 `ys`'s. Neither operand is changed. `+` on lists never means element-wise
 addition.
 
-Building a *string* with `+` in a loop costs the same way, for the same
-reason: strings are immutable, so each `s = s + x` copies everything so far.
-400 000 appends take about 2.4 seconds. There is no string builder; collect the
-pieces in a list and `join` them, which is linear.
+Building a *string* with `+` in a loop may cost the same way: a string never
+changes once built, so `s = s + x` can copy everything so far. A `StrBuilder`
+appends in amortized constant time ([L-LIB-BUILDER]).
 
 **[E-MAP-LIT]** `{k: v, ...}` builds a map. Entries are evaluated left to
 right, each key before its own value, and a repeated key keeps the last value
@@ -246,18 +245,13 @@ otherwise it is a statement of type `()`, and using its value is an error.
 
 A branch that must deliver a value has to *end in an expression*. The expected
 type is pushed into a tail expression and there is nothing to push it into
-otherwise, so a branch ending in a `with`, `for` or `while` statement sailed
-past the demand entirely: `if c { 7 } else { with D handled_by h { n } }` in an
-`-> i64` function checked clean, `grasm run` printed `()` where the integer
-belonged and a compiled build printed `0` — while the same `with` as the
-*whole* body was refused. A branch that leaves — `return`, `break`, `continue`
-— delivers its value by not coming back, and is not this case.
+otherwise, so a branch ending in a `with`, `for` or `while` statement is
+refused there. A branch that leaves — `return`, `break`, `continue` —
+delivers its value by not coming back, and is not this case.
 
 **[E-IF-FALLIBLE-MERGE]** When the branches are `Err(e)` and `Ok(v)`, the
 `if` is worth `T ! E` with `T` from the `Ok` side. `Err(e)` says nothing about
-the ok half, so a branch that is only `Err` cannot decide the type by itself —
-taking it anyway made `xs.map(|x| if p { Err(e) } else { Ok(x) })` produce a
-list whose elements were later read as the wrong thing.
+the ok half, so a branch that is only `Err` cannot decide the type by itself.
 
 **[E-MATCH-ORDER]** Match arms are tried top to bottom; the first whose pattern
 matches and whose guard passes is taken.
@@ -530,11 +524,7 @@ both are refused, because nothing calls `main` and nothing reads its value.
 Writing `fn main() -> i64` and ending the body with `2` looked like a status
 code, and the program exited 0 — the status a program reports is `exit(n)`,
 and an error reaching `main` is [E-MAIN-ERR]. A `! E` on `main` is allowed and
-means what that clause says. Only the return type was refused for a while, so
-`fn main(x: i64)` checked clean and then panicked at run time with
-`unknown name \`x\`` — a compiler-internal message arriving after the point
-where types are supposed to be settled. Read the command line with [E-ARGS]
-instead.
+means what that clause says. Read the command line with [E-ARGS] instead.
 
 **[E-ARGS]** `args()` returns the arguments the program was given, excluding
 the program's own name. How they are given depends on how the program is run,
