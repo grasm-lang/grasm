@@ -7,8 +7,25 @@ migration note here; anything `experimental` may change in any release. See
 
 ## Unreleased — since 1.1.0
 
+### Security
+
+- **A function could reach the network or run programs while declaring that
+  it performs nothing.** `net` and `proc` were not reserved as effect
+  names, so a program could declare `effect net { ... }` and wrap code in
+  `with net handled_by ...`, which discharged the built-in capability: a
+  function declared `/ {}` opened a listening socket, another ran
+  `/usr/bin/touch`, and `grasm check` reported no errors. A package
+  declaring `capabilities = []` could do the same. `io` had been closed
+  this way already; `net` and `proc` arrived in August without it. Every
+  capability name is now reserved from one list. Affects 1.0.0 and 1.1.0.
+
 ### Fixed
 
+- **Three packages declared type names other packages already used**
+  (`JsonReader`, `WrapOptions`, `WrapError`, `Breaker`), so no program
+  could import both packages of a pair. The newer packages now prefix
+  them: `jqformat`'s `JqReader`, `perltextwrap`'s `PerlWrapOptions`,
+  `PerlWrapError` and `PerlBreaker`.
 - **Native builds were not reproducible.** The same program compiled to a
   different executable from one build to the next -- 120 of 156 sampled
   corpus programs. The backend released a scope's variables in the scope
