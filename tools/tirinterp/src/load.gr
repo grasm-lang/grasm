@@ -1,0 +1,1125 @@
+// From the parsed text to what the evaluator walks: every node becomes an
+// opcode and up to three integer operands in flat arrays, with its children
+// in `kids`. Names are resolved here once -- a call holds the callee's index,
+// a variant its type's -- so evaluation compares integers, never text.
+//
+// Nothing here is inferred. Every operand comes from the node's own text:
+// the width an operator wraps to is the type written on it, a `for` says what
+// it iterates, a call names its function. Where the evaluator needs a fact
+// the TIR does not hold, that is a gap in TIR and is reported, not guessed.
+import sexp
+import value
+import builtins
+
+// Opcodes. The evaluator matches on the numbers, which are listed with their
+// names beside each arm; the commonest come first.
+pub let OP_LOCAL = 1
+pub let OP_LIT = 2
+pub let OP_BINARY = 3
+pub let OP_CALL = 4
+pub let OP_METHOD = 5
+pub let OP_FIELD = 6
+pub let OP_STR = 7
+pub let OP_LET = 8
+pub let OP_IF = 9
+pub let OP_ASSIGN = 10
+pub let OP_RETURN = 11
+pub let OP_INDEX = 12
+pub let OP_VARIANT = 13
+pub let OP_BUILTIN = 14
+pub let OP_LIST = 15
+pub let OP_BLOCK = 16
+pub let OP_UNARY = 17
+pub let OP_FOR = 18
+pub let OP_WHILE = 19
+pub let OP_STRUCT = 20
+pub let OP_TRY = 21
+pub let OP_TUPLE = 22
+pub let OP_RANGE = 23
+pub let OP_BLOCKEXPR = 24
+pub let OP_MATCH = 25
+pub let OP_TUPLEFIELD = 26
+pub let OP_CONST = 27
+pub let OP_CONTINUE = 28
+pub let OP_BREAK = 29
+pub let OP_CLOSURE = 30
+pub let OP_LETTUPLE = 31
+pub let OP_WRAPOK = 32
+pub let OP_CALLVALUE = 33
+pub let OP_MAPLIT = 34
+pub let OP_FNREF = 35
+pub let OP_DEREF = 36
+pub let OP_EFFECTOP = 37
+pub let OP_WITH = 38
+pub let OP_SPAWN = 39
+pub let OP_PARALLEL = 40
+pub let OP_BOUNDCALL = 41
+pub let OP_CALLEXTERN = 42
+// Parts of the nodes above, never evaluated on their own.
+pub let OP_TEXT = 50
+pub let OP_ENTRY = 52
+pub let OP_SFIELD = 53
+pub let OP_SBASE = 54
+pub let OP_ARM = 55
+pub let OP_ELSE = 57
+pub let OP_ELSEIF = 58
+pub let OP_VAR = 59
+// Places: the left of an assignment.
+pub let OP_PL_LOCAL = 70
+pub let OP_PL_FIELD = 71
+pub let OP_PL_INDEX = 72
+pub let OP_PL_DEREF = 73
+// Patterns.
+pub let OP_P_WILD = 80
+pub let OP_P_INT = 81
+pub let OP_P_BOOL = 82
+pub let OP_P_STR = 83
+pub let OP_P_BIND = 84
+pub let OP_P_VARIANT = 85
+pub let OP_P_OK = 86
+pub let OP_P_ERR = 87
+pub let OP_P_TUPLE = 88
+pub let OP_P_OR = 89
+
+/// The program, ready to run.
+type Prog = {
+    op: [i64],
+    a: [i64],
+    b: [i64],
+    c: [i64],
+    s: [str],
+    lit: [Value],
+    k0: [i64],
+    nk: [i64],
+    kids: [i64],
+    ty_name: [str],
+    ty_sum: [bool],
+    ty_fields: [[str]],
+    ty_variants: [[str]],
+    fn_name: [str],
+    fn_body: [i64],
+    fn_params: [[i64]],
+    fn_modes: [[i64]],
+    fn_frame: [[Value]],
+    fn_fallible: [bool],
+    fn_extern: [bool],
+    const_name: [str],
+    const_init: [i64],
+    const_frame: [[Value]],
+    eff_name: [str],
+    clo_caps: [[i64]],
+    clo_params: [[i64]],
+    clo_frame: [[Value]],
+    impls: Map[str, i64],
+    main_fn: i64,
+    option_ty: i64,
+    some_idx: i64,
+    none_idx: i64,
+    ioerror_ty: i64,
+}
+
+/// What loading builds, and what it needs along the way.
+///
+/// The program's lists are fields of the loader itself rather than of a
+/// `Prog` inside it: in compiled code a push to a list two structs deep
+/// copies the list, which made loading a 4.7 MB program take minutes.
+type Loader = {
+    op: [i64],
+    a: [i64],
+    b: [i64],
+    c: [i64],
+    s: [str],
+    lit: [Value],
+    k0: [i64],
+    nk: [i64],
+    kids: [i64],
+    ty_name: [str],
+    ty_sum: [bool],
+    ty_fields: [[str]],
+    ty_variants: [[str]],
+    fn_name: [str],
+    fn_body: [i64],
+    fn_params: [[i64]],
+    fn_modes: [[i64]],
+    fn_frame: [[Value]],
+    fn_fallible: [bool],
+    fn_extern: [bool],
+    const_name: [str],
+    const_init: [i64],
+    const_frame: [[Value]],
+    eff_name: [str],
+    clo_caps: [[i64]],
+    clo_params: [[i64]],
+    clo_frame: [[Value]],
+    impls: Map[str, i64],
+    main_fn: i64,
+    option_ty: i64,
+    some_idx: i64,
+    none_idx: i64,
+    ioerror_ty: i64,
+    t: Tree,
+    fn_ids: Map[str, i64],
+    const_ids: Map[str, i64],
+    type_ids: Map[str, i64],
+    eff_ids: Map[str, i64],
+    builtins: Map[str, i64],
+    methods: Map[str, i64],
+    max_var: i64,
+    ref_log: [i64],
+    decl_log: [i64],
+    errors: [str],
+}
+
+// ----- reading the tree ------------------------------------------------------
+
+/// Element `i` of list `e`.
+fn at(t: Tree, e: i64, i: i64) -> i64 {
+    t.elems[t.first[e] + i]
+}
+
+/// The text of element `i` of list `e` (an atom or a decoded string).
+fn word(t: Tree, e: i64, i: i64) -> str {
+    if i >= t.count[e] {
+        return ""
+    }
+    t.text[at(t, e, i)]
+}
+
+fn int_at(t: Tree, e: i64, i: i64) -> i64 {
+    word(t, e, i).parse_int() ?? 0
+}
+
+/// How many of `e`'s elements are on its own line: the head. The rest are
+/// its children, each on a line of its own.
+fn head_len(t: Tree, e: i64) -> i64 {
+    var i = 1
+    while i < t.count[e] and not t.nl[at(t, e, i)] {
+        i += 1
+    }
+    i
+}
+
+fn kid_elems(t: Tree, e: i64) -> [i64] {
+    var out: [i64] = []
+    for i in head_len(t, e)..t.count[e] {
+        out.push(at(t, e, i))
+    }
+    out
+}
+
+/// The keyword of a node: its first atom.
+fn kw(t: Tree, e: i64) -> str {
+    if t.kind[e] != 2 or t.count[e] == 0 {
+        return ""
+    }
+    t.text[at(t, e, 0)]
+}
+
+/// The width code of an integer type written as element `e`: 0 for `i64`
+/// and anything that is not an integer, then `i8 i16 i32 u8 u16 u32`.
+fn narrow_of(t: Tree, e: i64) -> i64 {
+    if t.kind[e] != 0 {
+        return 0
+    }
+    match t.text[e] {
+        "i8" -> 1
+        "i16" -> 2
+        "i32" -> 3
+        "u8" -> 4
+        "u16" -> 5
+        "u32" -> 6
+        "u64" -> 7
+        _ -> 0
+    }
+}
+
+/// Whether a value of the type written as element `e` can be a `ref`: one
+/// that is, or a type parameter that may be instantiated with one.
+fn may_be_ref(t: Tree, e: i64) -> bool {
+    let k = kw(t, e)
+    k == "ref" or k == "generic"
+}
+
+/// `(named "T" ...)` → the type's index, or -1.
+fn named_type(ld: Loader, e: i64) -> i64 {
+    if kw(ld.t, e) != "named" {
+        return -1
+    }
+    ld.type_ids.get(word(ld.t, e, 1)) ?? -1
+}
+
+fn hex_bits(h: str) -> i64 {
+    // `0x` and sixteen digits; two halves, since a pattern with its top bit
+    // set does not parse as a positive `i64`.
+    let digits = h.substr(2, 16)
+    let hi = digits.substr(0, 8).parse_int_base(16) ?? 0
+    let lo = digits.substr(8, 8).parse_int_base(16) ?? 0
+    hi.shl(32).bit_or(lo)
+}
+
+// ----- building nodes ----------------------------------------------------------
+
+fn new_node(inout ld: Loader, op: i64) -> i64 {
+    let id = ld.op.len()
+    ld.op.push(op)
+    ld.a.push(0)
+    ld.b.push(0)
+    ld.c.push(0)
+    ld.s.push("")
+    ld.lit.push(VUnit)
+    ld.k0.push(0)
+    ld.nk.push(0)
+    id
+}
+
+fn set_kids(inout ld: Loader, id: i64, ks: [i64]) {
+    ld.k0[id] = ld.kids.len()
+    ld.nk[id] = ks.len()
+    for k in ks {
+        ld.kids.push(k)
+    }
+}
+
+fn err(inout ld: Loader, msg: str) {
+    ld.errors.push(msg)
+}
+
+fn note_var(inout ld: Loader, v: i64) {
+    if v > ld.max_var {
+        ld.max_var = v
+    }
+}
+
+/// A local read. Every read is logged, so a closure can find the ones in
+/// its body: they are the entries logged while it was being loaded.
+fn note_ref(inout ld: Loader, v: i64) {
+    note_var(ld, v)
+    ld.ref_log.push(v)
+}
+
+/// A binding site, logged the same way.
+fn note_decl(inout ld: Loader, v: i64) {
+    note_var(ld, v)
+    ld.decl_log.push(v)
+}
+
+fn exprs(inout ld: Loader, es: [i64]) -> [i64] {
+    var out: [i64] = []
+    for e in es {
+        out.push(expr(ld, e))
+    }
+    out
+}
+
+/// A node whose children are all expressions.
+fn with_kids(inout ld: Loader, op: i64, e: i64) -> i64 {
+    let id = new_node(ld, op)
+    let ks = exprs(ld, kid_elems(ld.t, e))
+    set_kids(ld, id, ks)
+    id
+}
+
+fn lit(inout ld: Loader, v: Value) -> i64 {
+    let id = new_node(ld, OP_LIT)
+    ld.lit[id] = v
+    id
+}
+
+fn binop_code(name: str) -> i64 {
+    match name {
+        "add" -> 1
+        "sub" -> 2
+        "mul" -> 3
+        "div" -> 4
+        "rem" -> 5
+        "pow" -> 6
+        "eq" -> 7
+        "ne" -> 8
+        "lt" -> 9
+        "le" -> 10
+        "gt" -> 11
+        "ge" -> 12
+        "and" -> 13
+        "or" -> 14
+        "coalesce" -> 15
+        _ -> 0
+    }
+}
+
+/// A node with operands `a`, `b` and `s` whose children are all
+/// expressions.
+fn node_with(inout ld: Loader, e: i64, op: i64, a: i64, b: i64, s: str) -> i64 {
+    let id = new_node(ld, op)
+    ld.a[id] = a
+    ld.b[id] = b
+    ld.s[id] = s
+    let ks = exprs(ld, kid_elems(ld.t, e))
+    set_kids(ld, id, ks)
+    id
+}
+
+/// The index `table` gives `name`, or -1 and a complaint.
+fn resolve(inout ld: Loader, table: Map[str, i64], name: str, what: str) -> i64 {
+    match table.get(name) {
+        Some(i) -> i
+        None -> {
+            err(ld, "{what} `{name}` is not declared")
+            -1
+        }
+    }
+}
+
+/// An expression or a statement. The commonest kinds are here and the
+/// rest in `expr_more`.
+fn expr(inout ld: Loader, e: i64) -> i64 {
+    let t = ld.t
+    match kw(t, e) {
+        "local" -> {
+            let id = new_node(ld, OP_LOCAL)
+            let v = int_at(t, e, 3)
+            ld.a[id] = v
+            note_ref(ld, v)
+            id
+        }
+        // A `u64` literal is written as the unsigned number it is.
+        "int" -> if narrow_of(t, at(t, e, 1)) == 7 {
+            lit(ld, VU64(word(t, e, 3).parse_u64() ?? 0))
+        } else {
+            lit(ld, VInt(int_at(t, e, 3)))
+        }
+        "binary" -> node_with(ld, e, OP_BINARY, binop_code(word(t, e, 3)), narrow_of(t, at(t, e, 1)), "")
+        "call" -> call_node(ld, e)
+        "method" -> method_node(ld, e)
+        "field" -> node_with(ld, e, OP_FIELD, int_at(t, e, 3), 0, "")
+        "str" -> str_node(ld, e)
+        "let" -> {
+            let id = node_with(ld, e, OP_LET, int_at(t, e, 1), 0, "")
+            note_decl(ld, ld.a[id])
+            id
+        }
+        "if" -> if_node(ld, e)
+        "assign" -> assign_node(ld, e)
+        "return" -> with_kids(ld, OP_RETURN, e)
+        "index" -> with_kids(ld, OP_INDEX, e)
+        "variant" -> {
+            let ty = resolve(ld, ld.type_ids, word(t, e, 3), "type")
+            node_with(ld, e, OP_VARIANT, ty, int_at(t, e, 4), "")
+        }
+        "builtin" -> {
+            let name = word(t, e, 3)
+            let code = resolve(ld, ld.builtins, name, "built-in")
+            node_with(ld, e, OP_BUILTIN, code, 0, name)
+        }
+        "list" -> with_kids(ld, OP_LIST, e)
+        "block" -> with_kids(ld, OP_BLOCK, e)
+        "unary" -> {
+            let negate = if word(t, e, 3) == "not" { 1 } else { 0 }
+            node_with(ld, e, OP_UNARY, negate, narrow_of(t, at(t, e, 1)), "")
+        }
+        "bool" -> lit(ld, VBool(word(t, e, 3) == "true"))
+        "for" -> for_node(ld, e)
+        "while" -> with_kids(ld, OP_WHILE, e)
+        "float" -> lit(ld, VFloat(hex_bits(word(t, e, 3)).from_bits()))
+        "struct" -> struct_node(ld, e)
+        "try" -> with_kids(ld, OP_TRY, e)
+        "tuple" -> with_kids(ld, OP_TUPLE, e)
+        "match" -> match_node(ld, e)
+        _ -> expr_more(ld, e)
+    }
+}
+
+fn expr_more(inout ld: Loader, e: i64) -> i64 {
+    let t = ld.t
+    let k = kw(t, e)
+    match k {
+        "range" -> node_with(ld, e, OP_RANGE, if word(t, e, 3) == "inclusive" { 1 } else { 0 }, 0, "")
+        // `region` and `unsafe` have no run-time effect: each is its block.
+        "blockexpr" -> with_kids(ld, OP_BLOCKEXPR, e)
+        "region" -> with_kids(ld, OP_BLOCKEXPR, e)
+        "unsafe" -> with_kids(ld, OP_BLOCKEXPR, e)
+        "tuplefield" -> node_with(ld, e, OP_TUPLEFIELD, int_at(t, e, 3), 0, "")
+        "const" -> node_with(ld, e, OP_CONST, resolve(ld, ld.const_ids, word(t, e, 3), "constant"), 0, "")
+        "continue" -> new_node(ld, OP_CONTINUE)
+        "break" -> new_node(ld, OP_BREAK)
+        "closure" -> closure_node(ld, e)
+        "lettuple" -> let_tuple_node(ld, e)
+        "wrapok" -> with_kids(ld, OP_WRAPOK, e)
+        "callvalue" -> with_kids(ld, OP_CALLVALUE, e)
+        "maplit" -> {
+            let id = new_node(ld, OP_MAPLIT)
+            var ks: [i64] = []
+            for en in kid_elems(t, e) {
+                ks.push(with_kids(ld, OP_ENTRY, en))
+            }
+            set_kids(ld, id, ks)
+            id
+        }
+        "fnref" -> node_with(ld, e, OP_FNREF, resolve(ld, ld.fn_ids, word(t, e, 3), "function"), 0, "")
+        "deref" -> with_kids(ld, OP_DEREF, e)
+        // The operation's result type says whether it can fail.
+        "effectop" -> {
+            let eff = resolve(ld, ld.eff_ids, word(t, e, 3), "effect")
+            let fallible = if kw(t, at(t, e, 1)) == "fallible" { 1 } else { 0 }
+            node_with(ld, e, OP_EFFECTOP, eff, fallible, word(t, e, 4))
+        }
+        "with" -> node_with(ld, e, OP_WITH, resolve(ld, ld.eff_ids, word(t, e, 1), "effect"), 0, "")
+        "spawn" -> node_with(ld, e, OP_SPAWN, if word(t, e, 1) == "concurrent" { 1 } else { 0 }, 0, "")
+        "parallel" -> node_with(ld, e, OP_PARALLEL, if word(t, e, 1) == "concurrent" { 1 } else { 0 }, 0, "")
+        "boundcall" -> node_with(ld, e, OP_BOUNDCALL, 0, 0, word(t, e, 4))
+        "callextern" -> node_with(ld, e, OP_CALLEXTERN, 0, 0, word(t, e, 3))
+        _ -> {
+            err(ld, "unknown node `{k}`")
+            new_node(ld, 0)
+        }
+    }
+}
+
+/// `(lettuple (vars (var ...) ...) init)`: the initializer is evaluated
+/// before any name is bound.
+fn let_tuple_node(inout ld: Loader, e: i64) -> i64 {
+    let t = ld.t
+    let id = new_node(ld, OP_LETTUPLE)
+    let ks = kid_elems(t, e)
+    let init = expr(ld, ks[1])
+    var vars: [i64] = [init]
+    for ve in kid_elems(t, ks[0]) {
+        let vn = new_node(ld, OP_VAR)
+        let v = int_at(t, ve, 1)
+        ld.a[vn] = v
+        note_decl(ld, v)
+        vars.push(vn)
+    }
+    set_kids(ld, id, vars)
+    id
+}
+
+fn str_node(inout ld: Loader, e: i64) -> i64 {
+    let t = ld.t
+    let pieces = kid_elems(t, e)
+    var all_text = true
+    for pc in pieces {
+        if kw(t, pc) != "text" {
+            all_text = false
+        }
+    }
+    if all_text {
+        var parts: [str] = []
+        for pc in pieces {
+            parts.push(word(t, pc, 1))
+        }
+        return lit(ld, VStr(parts.join("")))
+    }
+    let id = new_node(ld, OP_STR)
+    var ks: [i64] = []
+    for pc in pieces {
+        if kw(t, pc) == "text" {
+            let tn = new_node(ld, OP_TEXT)
+            ld.s[tn] = word(t, pc, 1)
+            ks.push(tn)
+        } else {
+            ks.push(expr(ld, at(t, pc, 1)))
+        }
+    }
+    set_kids(ld, id, ks)
+    id
+}
+
+fn if_node(inout ld: Loader, e: i64) -> i64 {
+    let t = ld.t
+    let id = new_node(ld, OP_IF)
+    let parts = kid_elems(t, e)
+    var ks: [i64] = [expr(ld, parts[0]), expr(ld, parts[1])]
+    if parts.len() > 2 {
+        let eb = parts[2]
+        // `else` holds a block, `elseif` the next `if`: either way the one
+        // child is what runs.
+        ks.push(expr(ld, at(t, eb, 1)))
+    }
+    set_kids(ld, id, ks)
+    id
+}
+
+fn assign_node(inout ld: Loader, e: i64) -> i64 {
+    let t = ld.t
+    let id = new_node(ld, OP_ASSIGN)
+    ld.a[id] = match word(t, e, 1) {
+        "set" -> 0
+        "add" -> 1
+        "sub" -> 2
+        "mul" -> 3
+        "div" -> 4
+        _ -> 0
+    }
+    ld.b[id] = narrow_of(t, at(t, e, 2))
+    let parts = kid_elems(t, e)
+    let pl = place(ld, parts[0])
+    let v = expr(ld, parts[1])
+    set_kids(ld, id, [pl, v])
+    id
+}
+
+/// An assignment target: a local, then fields, indexes and `.value`s.
+fn place(inout ld: Loader, e: i64) -> i64 {
+    let t = ld.t
+    match kw(t, e) {
+        "local" -> {
+            let id = new_node(ld, OP_PL_LOCAL)
+            let v = int_at(t, e, 1)
+            ld.a[id] = v
+            note_ref(ld, v)
+            id
+        }
+        "field" -> {
+            let id = new_node(ld, OP_PL_FIELD)
+            ld.a[id] = int_at(t, e, 1)
+            let inner = place(ld, kid_elems(t, e)[0])
+            set_kids(ld, id, [inner])
+            id
+        }
+        "index" -> {
+            let id = new_node(ld, OP_PL_INDEX)
+            let parts = kid_elems(t, e)
+            let inner = place(ld, parts[0])
+            let ix = expr(ld, parts[1])
+            set_kids(ld, id, [inner, ix])
+            id
+        }
+        "deref" -> {
+            let id = new_node(ld, OP_PL_DEREF)
+            let inner = place(ld, kid_elems(t, e)[0])
+            set_kids(ld, id, [inner])
+            id
+        }
+        other -> {
+            err(ld, "unknown place `{other}`")
+            new_node(ld, 0)
+        }
+    }
+}
+
+fn for_node(inout ld: Loader, e: i64) -> i64 {
+    let t = ld.t
+    let id = new_node(ld, OP_FOR)
+    ld.a[id] = match word(t, e, 1) {
+        "range" -> 0
+        "list" -> 1
+        "str" -> 2
+        "bytes" -> 3
+        _ -> 1
+    }
+    let parts = kid_elems(t, e)
+    // (var ...) then the iterable then the body; the iterable is evaluated
+    // before the variable exists.
+    let it = expr(ld, parts[1])
+    let v = int_at(t, parts[0], 1)
+    note_decl(ld, v)
+    ld.b[id] = v
+    let body = expr(ld, parts[2])
+    set_kids(ld, id, [it, body])
+    id
+}
+
+fn struct_node(inout ld: Loader, e: i64) -> i64 {
+    let t = ld.t
+    let id = new_node(ld, OP_STRUCT)
+    let ty = named_type(ld, at(t, e, 1))
+    ld.a[id] = ty
+    if ty < 0 {
+        err(ld, "struct literal of an unknown type")
+    }
+    var ks: [i64] = []
+    for part in kid_elems(t, e) {
+        if kw(t, part) == "base" {
+            let bn = new_node(ld, OP_SBASE)
+            let x = expr(ld, at(t, part, 1))
+            set_kids(ld, bn, [x])
+            ks.push(bn)
+            ld.b[id] = 1
+        } else {
+            let fnode = new_node(ld, OP_SFIELD)
+            ld.a[fnode] = int_at(t, part, 1)
+            let x = expr(ld, at(t, part, 2))
+            set_kids(ld, fnode, [x])
+            ks.push(fnode)
+        }
+    }
+    set_kids(ld, id, ks)
+    id
+}
+
+fn match_node(inout ld: Loader, e: i64) -> i64 {
+    let t = ld.t
+    let id = new_node(ld, OP_MATCH)
+    let parts = kid_elems(t, e)
+    // Matching through a reference matches its referent; whether the
+    // scrutinee can be one at all is written on it.
+    ld.c[id] = if may_be_ref(t, at(t, parts[0], 1)) { 1 } else { 0 }
+    var ks: [i64] = [expr(ld, parts[0])]
+    for i in 1..parts.len() {
+        let arm = parts[i]
+        let an = new_node(ld, OP_ARM)
+        let aparts = kid_elems(t, arm)
+        let pat = pattern(ld, aparts[0])
+        var aks: [i64] = [pat]
+        if aparts.len() == 3 {
+            ld.a[an] = 1
+            aks.push(expr(ld, at(t, aparts[1], 1)))
+            aks.push(expr(ld, aparts[2]))
+        } else {
+            aks.push(expr(ld, aparts[1]))
+        }
+        set_kids(ld, an, aks)
+        ks.push(an)
+    }
+    set_kids(ld, id, ks)
+    id
+}
+
+fn pattern(inout ld: Loader, e: i64) -> i64 {
+    let t = ld.t
+    match kw(t, e) {
+        "pwild" -> new_node(ld, OP_P_WILD)
+        "pbind" -> {
+            let id = new_node(ld, OP_P_BIND)
+            let v = int_at(t, e, 2)
+            ld.a[id] = v
+            note_decl(ld, v)
+            id
+        }
+        "pvariant" -> {
+            let id = new_node(ld, OP_P_VARIANT)
+            ld.a[id] = ld.type_ids.get(word(t, e, 2)) ?? -1
+            ld.b[id] = int_at(t, e, 3)
+            var ks: [i64] = []
+            for x in kid_elems(t, e) {
+                ks.push(pattern(ld, x))
+            }
+            set_kids(ld, id, ks)
+            id
+        }
+        "pint" -> {
+            let id = new_node(ld, OP_P_INT)
+            ld.a[id] = int_at(t, e, 2)
+            id
+        }
+        "pstr" -> {
+            let id = new_node(ld, OP_P_STR)
+            ld.s[id] = word(t, e, 2)
+            id
+        }
+        "pbool" -> {
+            let id = new_node(ld, OP_P_BOOL)
+            ld.a[id] = if word(t, e, 2) == "true" { 1 } else { 0 }
+            id
+        }
+        "pok" -> pattern_kids(ld, OP_P_OK, e)
+        "perr" -> pattern_kids(ld, OP_P_ERR, e)
+        "ptuple" -> pattern_kids(ld, OP_P_TUPLE, e)
+        "por" -> pattern_kids(ld, OP_P_OR, e)
+        other -> {
+            err(ld, "unknown pattern `{other}`")
+            new_node(ld, OP_P_WILD)
+        }
+    }
+}
+
+fn pattern_kids(inout ld: Loader, op: i64, e: i64) -> i64 {
+    let id = new_node(ld, op)
+    var ks: [i64] = []
+    for x in kid_elems(ld.t, e) {
+        ks.push(pattern(ld, x))
+    }
+    set_kids(ld, id, ks)
+    id
+}
+
+fn closure_node(inout ld: Loader, e: i64) -> i64 {
+    let t = ld.t
+    let id = new_node(ld, OP_CLOSURE)
+    let ci = ld.clo_caps.len()
+    ld.clo_caps.push([])
+    ld.clo_params.push([])
+    ld.clo_frame.push([])
+    ld.a[id] = ci
+    ld.b[id] = if word(t, e, 3) == "fallible" { 1 } else { 0 }
+    let refs_from = ld.ref_log.len()
+    let decls_from = ld.decl_log.len()
+    let parts = kid_elems(t, e)
+    var params: [i64] = []
+    for ve in kid_elems(t, parts[0]) {
+        let v = int_at(t, ve, 1)
+        note_decl(ld, v)
+        params.push(v)
+    }
+    let body = expr(ld, parts[1])
+    // What the body reads and does not bind is what the closure captures,
+    // by value, when it is created ([E-CLOSURE-CAPTURE]).
+    var declared: Map[i64, bool] = map()
+    var top = -1
+    for i in decls_from..ld.decl_log.len() {
+        let v = ld.decl_log[i]
+        declared.set(v, true)
+        top = top.max(v)
+    }
+    var seen: Map[i64, bool] = map()
+    for i in refs_from..ld.ref_log.len() {
+        let v = ld.ref_log[i]
+        top = top.max(v)
+        if not declared.has(v) {
+            seen.set(v, true)
+        }
+    }
+    ld.clo_caps[ci] = seen.keys()
+    ld.clo_params[ci] = params
+    ld.clo_frame[ci] = frame_of(top + 1)
+    set_kids(ld, id, [body])
+    id
+}
+
+fn frame_of(n: i64) -> [Value] {
+    var fr: [Value] = []
+    for _ in 0..n {
+        fr.push(VUnit)
+    }
+    fr
+}
+
+/// A call of a declared function. `b` has bit `i` set when argument `i` is
+/// a place another argument also mentions, which decides when an `inout`
+/// argument is read (`eval_call_args_paths`).
+fn call_node(inout ld: Loader, e: i64) -> i64 {
+    let t = ld.t
+    let name = word(t, e, 3)
+    let id = new_node(ld, OP_CALL)
+    let fid = ld.fn_ids.get(name) ?? -1
+    ld.a[id] = fid
+    if fid < 0 {
+        err(ld, "function `{name}` is not declared")
+    }
+    let ks = exprs(ld, kid_elems(t, e))
+    set_kids(ld, id, ks)
+    if fid >= 0 {
+        let modes = ld.fn_modes[fid]
+        var inout_any = false
+        for m in modes {
+            if m == 1 {
+                inout_any = true
+            }
+        }
+        if inout_any {
+            ld.c[id] = 1
+            ld.b[id] = aliased_args(ld, ks)
+        }
+    }
+    id
+}
+
+/// Bit `i` set when argument `i` is a place rooted at a local that another
+/// argument mentions.
+fn aliased_args(p: Loader, ks: [i64]) -> i64 {
+    var bits = 0
+    for i in 0..ks.len() {
+        let root = place_root(p, ks[i])
+        if root >= 0 {
+            for j in 0..ks.len() {
+                if j != i and mentions(p, ks[j], root) {
+                    bits = bits.bit_or(1.shl(i))
+                }
+            }
+        }
+    }
+    bits
+}
+
+/// The local an expression-shaped place is rooted at, or -1.
+fn place_root(p: Loader, e: i64) -> i64 {
+    var cur = e
+    while true {
+        let op = p.op[cur]
+        if op == OP_LOCAL {
+            return p.a[cur]
+        }
+        if op == OP_FIELD or op == OP_TUPLEFIELD or op == OP_INDEX or op == OP_DEREF {
+            cur = p.kids[p.k0[cur]]
+        } else {
+            return -1
+        }
+    }
+    -1
+}
+
+/// Whether the subtree at `e` reads or writes local `v`.
+fn mentions(p: Loader, e: i64, v: i64) -> bool {
+    var todo: [i64] = [e]
+    while not todo.is_empty() {
+        let n = todo.pop() ?? 0
+        let op = p.op[n]
+        if (op == OP_LOCAL or op == OP_PL_LOCAL) and p.a[n] == v {
+            return true
+        }
+        if op == OP_CLOSURE {
+            for c in p.clo_caps[p.a[n]] {
+                if c == v {
+                    return true
+                }
+            }
+        }
+        for i in 0..p.nk[n] {
+            todo.push(p.kids[p.k0[n] + i])
+        }
+    }
+    false
+}
+
+fn method_node(inout ld: Loader, e: i64) -> i64 {
+    let t = ld.t
+    let name = word(t, e, 3)
+    let id = new_node(ld, OP_METHOD)
+    ld.s[id] = name
+    ld.a[id] = ld.methods.get(name) ?? 0
+    if ld.a[id] == 0 {
+        err(ld, "method `{name}` is not implemented")
+    }
+    ld.b[id] = narrow_of(t, at(t, e, 1))
+    let parts = kid_elems(t, e)
+    // The receiver's width, for the methods whose answer depends on it.
+    ld.c[id] = narrow_of(t, at(t, parts[0], 1))
+    if name == "sum" and word(t, e, 1) == "f64" {
+        ld.c[id] = 100
+    }
+    let ks = exprs(ld, parts)
+    set_kids(ld, id, ks)
+    id
+}
+
+// ----- declarations ----------------------------------------------------------
+
+fn register(inout ld: Loader, e: i64) {
+    let t = ld.t
+    match kw(t, e) {
+        "type" -> {
+            let name = word(t, e, 1)
+            let ti = ld.ty_name.len()
+            ld.type_ids.set(name, ti)
+            ld.ty_name.push(name)
+            if name == "Option" and ld.option_ty < 0 {
+                ld.option_ty = ti
+            }
+            if name == "IoError" and ld.ioerror_ty < 0 {
+                ld.ioerror_ty = ti
+            }
+            let body = kid_elems(t, e)[0]
+            var fields: [str] = []
+            var variants: [str] = []
+            let is_sum = kw(t, body) == "sum"
+            for part in kid_elems(t, body) {
+                if is_sum {
+                    variants.push(word(t, part, 1))
+                } else {
+                    fields.push(word(t, part, 1))
+                }
+            }
+            // Which of `Option`'s variants is which, as the prelude declares
+            // them: built-ins answer with them.
+            if ti == ld.option_ty {
+                for i in 0..variants.len() {
+                    if variants[i] == "Some" {
+                        ld.some_idx = i
+                    } else if variants[i] == "None" {
+                        ld.none_idx = i
+                    }
+                }
+            }
+            ld.ty_sum.push(is_sum)
+            ld.ty_fields.push(fields)
+            ld.ty_variants.push(variants)
+        }
+        "fn" -> {
+            let name = word(t, e, 1)
+            ld.fn_ids.set(name, ld.fn_name.len())
+            ld.fn_name.push(name)
+            var params: [i64] = []
+            var modes: [i64] = []
+            for pe in kid_elems(t, kid_elems(t, e)[0]) {
+                params.push(int_at(t, pe, 2))
+                modes.push(match word(t, pe, 1) {
+                    "inout" -> 1
+                    "own" -> 2
+                    _ -> 0
+                })
+            }
+            ld.fn_params.push(params)
+            ld.fn_modes.push(modes)
+            ld.fn_body.push(-1)
+            ld.fn_frame.push([])
+            // Fallible when it declares `! E`, or when its return type is a
+            // `T ! E` (an alias, resolved away by TIR).
+            let fallible = word(t, e, 5) != "none" or kw(t, at(t, e, 4)) == "fallible"
+            ld.fn_fallible.push(fallible)
+            ld.fn_extern.push(false)
+        }
+        "extern" -> {
+            let name = word(t, e, 1)
+            ld.fn_ids.set(name, ld.fn_name.len())
+            ld.fn_name.push(name)
+            ld.fn_params.push([])
+            ld.fn_modes.push([])
+            ld.fn_body.push(-1)
+            ld.fn_frame.push([])
+            ld.fn_fallible.push(false)
+            ld.fn_extern.push(true)
+        }
+        "const" -> {
+            let name = word(t, e, 1)
+            ld.const_ids.set(name, ld.const_name.len())
+            ld.const_name.push(name)
+            ld.const_init.push(-1)
+            ld.const_frame.push([])
+        }
+        "effect" -> {
+            let name = word(t, e, 1)
+            ld.eff_ids.set(name, ld.eff_name.len())
+            ld.eff_name.push(name)
+        }
+        _ -> ()
+    }
+}
+
+fn define(inout ld: Loader, e: i64) {
+    let t = ld.t
+    match kw(t, e) {
+        "fn" -> {
+            let fid = ld.fn_ids.get(word(t, e, 1)) ?? 0
+            ld.max_var = -1
+            for v in ld.fn_params[fid] {
+                note_var(ld, v)
+            }
+            let body = expr(ld, kid_elems(t, e)[1])
+            ld.fn_body[fid] = body
+            ld.fn_frame[fid] = frame_of(ld.max_var + 1)
+        }
+        "const" -> {
+            let ci = ld.const_ids.get(word(t, e, 1)) ?? 0
+            ld.max_var = -1
+            let init = expr(ld, kid_elems(t, e)[0])
+            ld.const_init[ci] = init
+            ld.const_frame[ci] = frame_of(ld.max_var + 1)
+        }
+        "impl" -> {
+            let ty = word(t, e, 2)
+            for m in kid_elems(t, e) {
+                let fid = ld.fn_ids.get(word(t, m, 2)) ?? -1
+                ld.impls.set(ty + " " + word(t, m, 1), fid)
+            }
+        }
+        "main" -> {
+            ld.main_fn = ld.fn_ids.get(word(t, e, 1)) ?? -1
+        }
+        _ -> ()
+    }
+}
+
+fn code_table(names: [str]) -> Map[str, i64] {
+    var m: Map[str, i64] = map()
+    for i in 0..names.len() {
+        m.set(names[i], i + 1)
+    }
+    m
+}
+
+/// The program in `t`, or what in it this interpreter cannot run.
+pub fn load(t: Tree) -> Prog ! [str] {
+    var ld = Loader{
+        op: [],
+        a: [],
+        b: [],
+        c: [],
+        s: [],
+        lit: [],
+        k0: [],
+        nk: [],
+        kids: [],
+        ty_name: [],
+        ty_sum: [],
+        ty_fields: [],
+        ty_variants: [],
+        fn_name: [],
+        fn_body: [],
+        fn_params: [],
+        fn_modes: [],
+        fn_frame: [],
+        fn_fallible: [],
+        fn_extern: [],
+        const_name: [],
+        const_init: [],
+        const_frame: [],
+        eff_name: [],
+        clo_caps: [],
+        clo_params: [],
+        clo_frame: [],
+        impls: map(),
+        main_fn: -1,
+        option_ty: -1,
+        some_idx: 0,
+        none_idx: 1,
+        ioerror_ty: -1,
+        t: t,
+        fn_ids: map(),
+        const_ids: map(),
+        type_ids: map(),
+        eff_ids: map(),
+        builtins: code_table(builtins.builtin_names()),
+        methods: code_table(builtins.method_names()),
+        max_var: -1,
+        ref_log: [],
+        decl_log: [],
+        errors: [],
+    }
+    for r in t.roots {
+        register(ld, r)
+    }
+    for r in t.roots {
+        define(ld, r)
+    }
+    if ld.main_fn < 0 {
+        ld.errors.push("the program has no `main`")
+    }
+    if not ld.errors.is_empty() {
+        fail(ld.errors)
+    }
+    Prog{
+        op: ld.op,
+        a: ld.a,
+        b: ld.b,
+        c: ld.c,
+        s: ld.s,
+        lit: ld.lit,
+        k0: ld.k0,
+        nk: ld.nk,
+        kids: ld.kids,
+        ty_name: ld.ty_name,
+        ty_sum: ld.ty_sum,
+        ty_fields: ld.ty_fields,
+        ty_variants: ld.ty_variants,
+        fn_name: ld.fn_name,
+        fn_body: ld.fn_body,
+        fn_params: ld.fn_params,
+        fn_modes: ld.fn_modes,
+        fn_frame: ld.fn_frame,
+        fn_fallible: ld.fn_fallible,
+        fn_extern: ld.fn_extern,
+        const_name: ld.const_name,
+        const_init: ld.const_init,
+        const_frame: ld.const_frame,
+        eff_name: ld.eff_name,
+        clo_caps: ld.clo_caps,
+        clo_params: ld.clo_params,
+        clo_frame: ld.clo_frame,
+        impls: ld.impls,
+        main_fn: ld.main_fn,
+        option_ty: ld.option_ty,
+        some_idx: ld.some_idx,
+        none_idx: ld.none_idx,
+        ioerror_ty: ld.ioerror_ty,
+    }
+}

@@ -1,0 +1,283 @@
+// The TIR text form (docs/tir.md §9): s-expressions of atoms, JSON-escaped
+// strings and lists, one top-level form per declaration.
+//
+// The reader keeps every element in flat arrays, and it keeps one thing a
+// plain s-expression reader would throw away: whether an element began on a
+// new line. The emitter writes a node's head inline -- keyword, types, spans,
+// operands -- and each child node on a line of its own, two spaces deeper.
+// That flag is all the printer needs to write the same bytes back.
+//
+// Both directions are iterative. Expression chains nest hundreds deep in the
+// corpus, and the language guarantees only 10,000 nested calls, so neither
+// the reader nor the printer recurses per level.
+
+/// A parsed TIR file. Element `e` is an atom (`kind` 0), a string (1) or a
+/// list (2); a list's elements are `elems[first[e] .. first[e] + count[e]]`.
+type Tree = {
+    kind: [i64],
+    text: [str],
+    first: [i64],
+    count: [i64],
+    nl: [bool],
+    elems: [i64],
+    roots: [i64],
+}
+
+pub fn new_tree() -> Tree {
+    Tree{ kind: [], text: [], first: [], count: [], nl: [], elems: [], roots: [] }
+}
+
+fn add_elem(inout t: Tree, kind: i64, text: str, nl: bool) -> i64 {
+    let id = t.kind.len()
+    t.kind.push(kind)
+    t.text.push(text)
+    t.first.push(0)
+    t.count.push(0)
+    t.nl.push(nl)
+    id
+}
+
+/// Whether a byte ends an atom.
+fn delimits(c: i64) -> bool {
+    c == 32 or c == 10 or c == 40 or c == 41 or c == 34 or c == 13 or c == 9
+}
+
+fn hex_digit(c: i64) -> i64 {
+    if c >= 48 and c <= 57 {
+        c - 48
+    } else if c >= 97 and c <= 102 {
+        c - 87
+    } else if c >= 65 and c <= 70 {
+        c - 55
+    } else {
+        -1
+    }
+}
+
+/// The JSON string starting at `start` (just past its opening quote):
+/// its decoded text and the offset just past its closing quote.
+fn read_string(src: bytes, start: i64) -> (str, i64) ! str {
+    let n = src.len()
+    var parts: [str] = []
+    var run = start
+    var i = start
+    while i < n {
+        let c = src.at(i)
+        if c == 34 {
+            if i > run {
+                parts.push(src.slice(run, i).to_str())
+            }
+            return (parts.join(""), i + 1)
+        }
+        if c == 92 {
+            if i > run {
+                parts.push(src.slice(run, i).to_str())
+            }
+            if i + 1 >= n {
+                fail("unterminated escape at byte {i}")
+            }
+            let e = src.at(i + 1)
+            if e == 110 {
+                parts.push("\n")
+                i += 2
+            } else if e == 116 {
+                parts.push("\t")
+                i += 2
+            } else if e == 114 {
+                parts.push("\r")
+                i += 2
+            } else if e == 34 {
+                parts.push("\"")
+                i += 2
+            } else if e == 92 {
+                parts.push("\\")
+                i += 2
+            } else if e == 47 {
+                parts.push("/")
+                i += 2
+            } else if e == 117 {
+                if i + 6 > n {
+                    fail("short \\u escape at byte {i}")
+                }
+                var code = 0
+                for k in 2..6 {
+                    let d = hex_digit(src.at(i + k))
+                    if d < 0 {
+                        fail("bad \\u escape at byte {i}")
+                    }
+                    code = code * 16 + d
+                }
+                parts.push(code.to_char())
+                i += 6
+            } else {
+                fail("unknown escape at byte {i}")
+            }
+            run = i
+        } else {
+            i += 1
+        }
+    }
+    fail("unterminated string at byte {start}")
+}
+
+/// Reads a whole TIR file.
+pub fn read(src: bytes) -> Tree ! str {
+    var t = new_tree()
+    // The lists still open, innermost last, and where each one's elements
+    // begin in `pending`.
+    var open: [i64] = []
+    var marks: [i64] = []
+    var pending: [i64] = []
+    var saw_nl = false
+    let n = src.len()
+    var i = 0
+    while i < n {
+        let c = src.at(i)
+        if c == 10 {
+            saw_nl = true
+            i += 1
+        } else if c == 32 or c == 13 or c == 9 {
+            i += 1
+        } else if c == 40 {
+            let id = add_elem(t, 2, "", saw_nl)
+            pending.push(id)
+            open.push(id)
+            marks.push(pending.len())
+            saw_nl = false
+            i += 1
+        } else if c == 41 {
+            if open.is_empty() {
+                fail("unbalanced `)` at byte {i}")
+            }
+            let id = open.pop() ?? 0
+            let m = marks.pop() ?? 0
+            t.first[id] = t.elems.len()
+            t.count[id] = pending.len() - m
+            for j in m..pending.len() {
+                t.elems.push(pending[j])
+            }
+            while pending.len() > m {
+                pending.pop()
+            }
+            saw_nl = false
+            i += 1
+        } else if c == 34 {
+            let (text, next) = try read_string(src, i + 1)
+            pending.push(add_elem(t, 1, text, saw_nl))
+            saw_nl = false
+            i = next
+        } else {
+            var j = i
+            while j < n and not delimits(src.at(j)) {
+                j += 1
+            }
+            pending.push(add_elem(t, 0, src.slice(i, j).to_str(), saw_nl))
+            saw_nl = false
+            i = j
+        }
+    }
+    if not open.is_empty() {
+        fail("{open.len()} list(s) not closed at the end of the file")
+    }
+    t.roots = pending
+    t
+}
+
+/// A string as a JSON string literal, exactly as the emitter writes it
+/// (`grasm_tir::quote`).
+pub fn quote(s: str) -> str {
+    let b = s.to_bytes()
+    var plain = true
+    for k in 0..b.len() {
+        let c = b.at(k)
+        if c < 32 or c == 34 or c == 92 or c == 127 {
+            plain = false
+            break
+        }
+    }
+    if plain {
+        return "\"" + s + "\""
+    }
+    var parts: [str] = ["\""]
+    for code in s.codes() {
+        if code == 34 {
+            parts.push("\\\"")
+        } else if code == 92 {
+            parts.push("\\\\")
+        } else if code == 10 {
+            parts.push("\\n")
+        } else if code == 13 {
+            parts.push("\\r")
+        } else if code == 9 {
+            parts.push("\\t")
+        } else if code < 32 or code == 127 {
+            parts.push("\\u" + code.to_base(16).pad_start(4, "0"))
+        } else {
+            parts.push(code.to_char())
+        }
+    }
+    parts.push("\"")
+    parts.join("")
+}
+
+fn elem_text(t: Tree, e: i64) -> str {
+    if t.kind[e] == 1 {
+        quote(t.text[e])
+    } else {
+        t.text[e]
+    }
+}
+
+/// Writes the tree back out: each top-level form, then a newline.
+pub fn print_tree(t: Tree) -> str {
+    var out: [str] = []
+    for r in t.roots {
+        print_elem(t, r, out)
+        out.push("\n")
+    }
+    out.join("")
+}
+
+/// One element, without recursion: a stack of (list, next position, depth).
+fn print_elem(t: Tree, root: i64, inout out: [str]) {
+    if t.kind[root] != 2 {
+        out.push(elem_text(t, root))
+        return
+    }
+    var lists: [i64] = [root]
+    var poss: [i64] = [0]
+    var depths: [i64] = [0]
+    out.push("(")
+    while not lists.is_empty() {
+        let top = lists.len() - 1
+        let l = lists[top]
+        let p = poss[top]
+        if p >= t.count[l] {
+            out.push(")")
+            lists.pop()
+            poss.pop()
+            depths.pop()
+        } else {
+            poss[top] = p + 1
+            let c = t.elems[t.first[l] + p]
+            let d = depths[top]
+            var cd = d
+            if p > 0 {
+                if t.nl[c] {
+                    cd = d + 1
+                    out.push("\n" + "  ".repeat(cd))
+                } else {
+                    out.push(" ")
+                }
+            }
+            if t.kind[c] == 2 {
+                out.push("(")
+                lists.push(c)
+                poss.push(0)
+                depths.push(cd)
+            } else {
+                out.push(elem_text(t, c))
+            }
+        }
+    }
+}

@@ -1,0 +1,2007 @@
+// The evaluator: TIR nodes to values, following the reference interpreter
+// (`crates/grasm_interp/src/interp.rs`) rule for rule.
+//
+// Each function call gets a frame: a list indexed by variable number, since
+// TIR numbers every binding in a function from 0 and a closure shares its
+// function's numbering. Leaving a construct early -- `break`, `continue`,
+// `return`, and an error on its way out (`try`, `fail`) -- is a flag on the
+// context that every caller checks after evaluating a child, the way the
+// reference passes `Flow` up through `?`. A panic ends the process here and
+// now, with the host's own `panic`, which prints what the reference prints.
+//
+// Each call of the program is several nested host calls here, inside the
+// 6 MiB a native program may use, so the host stack is spent with care. A
+// block, an `if` and a matched arm continue in the same host call rather
+// than recursing into their last part. A call runs its callee's body from
+// the host frame that evaluated its arguments. And the frame being evaluated
+// lives in the context rather than in a second `inout` parameter, because
+// the native backend gives every `inout` argument of every call site a stack
+// slot of its own: `ev` has a call site per kind of node, and a second
+// `inout` made each nesting level of the program cost 576 bytes of stack.
+// Past that, deep recursion moves to fresh stacks (see "deep recursion").
+import load
+import value
+import builtins
+
+/// Why evaluation is unwinding: nothing, a loop exit, a return, or an error
+/// propagating to the nearest function that can fail.
+pub let CTL_BREAK = 1
+pub let CTL_CONTINUE = 2
+pub let CTL_RETURN = 3
+pub let CTL_ERR = 4
+
+/// Everything a run carries: the program, the frame being evaluated, and
+/// the state the program's statements change.
+///
+/// The node arrays are copied out of the program to the top level: reading
+/// a field of a struct is a runtime call in compiled code, and `cx.op[e]`
+/// is one where `cx.p.op[e]` was two.
+type Cx = {
+    op: [i64],
+    a: [i64],
+    b: [i64],
+    c: [i64],
+    s: [str],
+    lit: [Value],
+    k0: [i64],
+    nk: [i64],
+    kids: [i64],
+    p: Prog,
+    fr: [Value],
+    ctl: i64,
+    carry: Value,
+    slab: [Value],
+    gens: [i64],
+    live: [bool],
+    free: [i64],
+    h_eff: [i64],
+    h_val: [Value],
+    consts: [Value],
+    const_built: [bool],
+    spawns: [[i64]],
+    go_bodies: [[i64]],
+    go_frames: [[Value]],
+    chans: [Chan[Value]],
+    baton: [Chan[Slab]],
+    wb: [Value],
+    serial: i64,
+    depth: i64,
+    hop_result: Value,
+    args: [str],
+}
+
+pub fn new_cx(p: Prog, args: [str]) -> Cx {
+    var consts: [Value] = []
+    var built: [bool] = []
+    for _ in 0..p.const_name.len() {
+        consts.push(VUnit)
+        built.push(false)
+    }
+    Cx{
+        op: p.op,
+        a: p.a,
+        b: p.b,
+        c: p.c,
+        s: p.s,
+        lit: p.lit,
+        k0: p.k0,
+        nk: p.nk,
+        kids: p.kids,
+        p: p,
+        fr: [],
+        ctl: 0,
+        carry: VUnit,
+        slab: [],
+        gens: [],
+        live: [],
+        free: [],
+        h_eff: [],
+        h_val: [],
+        consts: consts,
+        const_built: built,
+        spawns: [],
+        go_bodies: [],
+        go_frames: [],
+        chans: [],
+        baton: [],
+        wb: [],
+        serial: 0,
+        depth: 0,
+        hop_result: VUnit,
+        args: args,
+    }
+}
+
+/// What frame slot `v` holds, moved out and the slot left `()`, so the
+/// value is held once. Written as a read and a write: passing
+/// `cx.fr[v]` to an `inout` parameter copies the whole frame in compiled
+/// code, which cost a copy of every frame on every `push`.
+pub fn take_local(inout cx: Cx, v: i64) -> Value {
+    let old = cx.fr[v]
+    cx.fr[v] = VUnit
+    old
+}
+
+/// The same for a slot of the slab.
+fn take_slab_slot(inout cx: Cx, s: i64) -> Value {
+    let old = cx.slab[s]
+    cx.slab[s] = VUnit
+    old
+}
+
+/// Child `i` of node `e`.
+pub fn kid(cx: Cx, e: i64, i: i64) -> i64 {
+    cx.kids[cx.k0[e] + i]
+}
+
+pub fn is_true(v: Value) -> bool {
+    match v {
+        VBool(b) -> b
+        _ -> false
+    }
+}
+
+/// An integer wrapped to a fixed width ([T-INT-FIXED]): `1` to `6` are
+/// `i8 i16 i32 u8 u16 u32`, anything else is `i64`.
+pub fn wrap(kind: i64, x: i64) -> i64 {
+    match kind {
+        4 -> x.bit_and(255)
+        1 -> {
+            let m = x.bit_and(255)
+            if m >= 128 { m - 256 } else { m }
+        }
+        5 -> x.bit_and(65535)
+        2 -> {
+            let m = x.bit_and(65535)
+            if m >= 32768 { m - 65536 } else { m }
+        }
+        6 -> x.bit_and(4294967295)
+        3 -> {
+            let m = x.bit_and(4294967295)
+            if m >= 2147483648 { m - 4294967296 } else { m }
+        }
+        _ -> x
+    }
+}
+
+pub fn narrowed(kind: i64, v: Value) -> Value {
+    if kind == 0 {
+        return v
+    }
+    match v {
+        // A `u64` result: the same bits, read unsigned from here on.
+        VInt(x) -> if kind == 7 { VU64(x.as_u64()) } else { VInt(wrap(kind, x)) }
+        _ -> v
+    }
+}
+
+// ----- the evaluator ------------------------------------------------------------
+
+/// The value of node `start`, in the frame `cx.fr`.
+pub fn ev(inout cx: Cx, start: i64) -> Value {
+    // Dispatch only, with a call site for each kind of node that is common
+    // enough to sit between two calls of the program; the rest share one.
+    var e = start
+    while true {
+        match cx.op[e] {
+            // OP_LOCAL
+            1 -> return cx.fr[cx.a[e]]
+            // OP_LIT
+            2 -> return cx.lit[e]
+            // OP_BINARY
+            3 -> return binary(cx, e)
+            // OP_CALL
+            4 -> return call_node(cx, e)
+            // OP_METHOD
+            5 -> return builtins.method(cx, e)
+            // OP_FIELD
+            6 -> return field(cx, e)
+            // OP_STR
+            7 -> return interpolate(cx, e)
+            // OP_LET
+            8 -> return let_stmt(cx, e)
+            // OP_IF: the chosen branch runs in this call.
+            9 -> {
+                e = if_branch(cx, e)
+                if e < 0 {
+                    return VUnit
+                }
+            }
+            // OP_BLOCK: every statement but the last, then the last in
+            // this call.
+            16 -> {
+                e = block_prefix(cx, e)
+                if e < 0 {
+                    return VUnit
+                }
+            }
+            // OP_BLOCKEXPR, `region` and `unsafe` alike: no run-time effect.
+            24 -> e = cx.kids[cx.k0[e]]
+            // OP_MATCH: the arm that matched runs in this call.
+            25 -> {
+                e = match_arm(cx, e)
+                if e < 0 {
+                    return VUnit
+                }
+            }
+            // OP_BUILTIN
+            14 -> return builtins.builtin(cx, e)
+            // OP_RETURN
+            11 -> return return_stmt(cx, e)
+            _ -> return ev_rest(cx, e)
+        }
+    }
+    VUnit
+}
+
+fn ev_rest(inout cx: Cx, e: i64) -> Value {
+    match cx.op[e] {
+        // OP_ASSIGN
+        10 -> assign(cx, e)
+        // OP_INDEX
+        12 -> index(cx, e)
+        // OP_VARIANT
+        13 -> variant(cx, e)
+        // OP_LIST
+        15 -> list_lit(cx, e)
+        // OP_UNARY
+        17 -> unary(cx, e)
+        // OP_FOR
+        18 -> for_loop(cx, e)
+        // OP_WHILE
+        19 -> while_loop(cx, e)
+        // OP_STRUCT
+        20 -> struct_lit(cx, e)
+        // OP_TRY
+        21 -> try_expr(cx, e)
+        // OP_TUPLE
+        22 -> tuple_lit(cx, e)
+        // OP_RANGE
+        23 -> range(cx, e)
+        // OP_TUPLEFIELD
+        26 -> tuple_field(cx, e)
+        // OP_CONST
+        27 -> const_value(cx, cx.a[e])
+        // OP_CONTINUE
+        28 -> {
+            cx.ctl = CTL_CONTINUE
+            VUnit
+        }
+        // OP_BREAK
+        29 -> {
+            cx.ctl = CTL_BREAK
+            VUnit
+        }
+        // OP_CLOSURE
+        30 -> closure(cx, e)
+        // OP_LETTUPLE
+        31 -> let_tuple(cx, e)
+        // OP_WRAPOK
+        32 -> wrap_ok(cx, e)
+        // OP_CALLVALUE
+        33 -> call_value_node(cx, e)
+        // OP_MAPLIT
+        34 -> map_lit(cx, e)
+        // OP_FNREF
+        35 -> VFn(cx.a[e])
+        // OP_DEREF
+        36 -> deref_node(cx, e)
+        // OP_EFFECTOP
+        37 -> effect_op(cx, e)
+        // OP_WITH
+        38 -> with_handler(cx, e)
+        // OP_SPAWN
+        39 -> spawn(cx, e)
+        // OP_PARALLEL
+        40 -> parallel(cx, e)
+        // OP_BOUNDCALL
+        41 -> bound_call(cx, e)
+        // OP_CALLEXTERN
+        42 -> {
+            let name = cx.s[e]
+            panic("cannot find the C function `{name}` in this process — a compiled build links it, the TIR interpreter can only reach what is already loaded")
+        }
+        _ -> panic("tirinterp: node {e} has no evaluation (opcode {cx.op[e]})")
+    }
+}
+
+/// Evaluates children `from..` of `e` into `out`; false when one of them
+/// started unwinding.
+pub fn eval_kids(inout cx: Cx, e: i64, from: i64, inout out: [Value]) -> bool {
+    let base = cx.k0[e]
+    for i in from..cx.nk[e] {
+        let v = ev(cx, cx.kids[base + i])
+        if cx.ctl != 0 {
+            return false
+        }
+        out.push(v)
+    }
+    true
+}
+
+fn let_stmt(inout cx: Cx, e: i64) -> Value {
+    let k = cx.kids[cx.k0[e]]
+    let v = if cx.op[k] == 4 { call_node(cx, k) } else { ev(cx, k) }
+    if cx.ctl != 0 {
+        return VUnit
+    }
+    cx.fr[cx.a[e]] = v
+    VUnit
+}
+
+/// The branch of an `if` that runs, or -1 when none does or the condition
+/// started unwinding.
+fn if_branch(inout cx: Cx, e: i64) -> i64 {
+    let base = cx.k0[e]
+    let c = ev(cx, cx.kids[base])
+    if cx.ctl != 0 {
+        return -1
+    }
+    if is_true(c) {
+        return cx.kids[base + 1]
+    }
+    if cx.nk[e] == 3 {
+        return cx.kids[base + 2]
+    }
+    -1
+}
+
+/// Runs all of a block but its last statement, which it answers; -1 when
+/// the block is empty or a statement started unwinding.
+fn block_prefix(inout cx: Cx, e: i64) -> i64 {
+    let n = cx.nk[e]
+    if n == 0 {
+        return -1
+    }
+    let base = cx.k0[e]
+    for i in 0..(n - 1) {
+        ev(cx, cx.kids[base + i])
+        if cx.ctl != 0 {
+            return -1
+        }
+    }
+    cx.kids[base + n - 1]
+}
+
+fn return_stmt(inout cx: Cx, e: i64) -> Value {
+    var v = VUnit
+    if cx.nk[e] > 0 {
+        let k = cx.kids[cx.k0[e]]
+        v = if cx.op[k] == 4 { call_node(cx, k) } else { ev(cx, k) }
+        if cx.ctl != 0 {
+            return VUnit
+        }
+    }
+    cx.ctl = CTL_RETURN
+    cx.carry = v
+    VUnit
+}
+
+fn variant(inout cx: Cx, e: i64) -> Value {
+    var fs: [Value] = []
+    if not eval_kids(cx, e, 0, fs) {
+        return VUnit
+    }
+    VVariant(cx.a[e], cx.b[e], fs)
+}
+
+fn list_lit(inout cx: Cx, e: i64) -> Value {
+    var xs: [Value] = []
+    if not eval_kids(cx, e, 0, xs) {
+        return VUnit
+    }
+    VList(xs)
+}
+
+fn tuple_lit(inout cx: Cx, e: i64) -> Value {
+    if cx.nk[e] == 0 {
+        return VUnit
+    }
+    var xs: [Value] = []
+    if not eval_kids(cx, e, 0, xs) {
+        return VUnit
+    }
+    VTuple(xs)
+}
+
+fn try_expr(inout cx: Cx, e: i64) -> Value {
+    let v = ev(cx, kid(cx, e, 0))
+    if cx.ctl != 0 {
+        return VUnit
+    }
+    match v {
+        VOk(x) -> x
+        VErr(x) -> {
+            cx.ctl = CTL_ERR
+            cx.carry = x
+            VUnit
+        }
+        _ -> v
+    }
+}
+
+/// A closure captures what its body reads, by value, now
+/// ([E-CLOSURE-CAPTURE]).
+fn closure(inout cx: Cx, e: i64) -> Value {
+    let ci = cx.a[e]
+    var caps: [Value] = []
+    for v in cx.p.clo_caps[ci] {
+        caps.push(cx.fr[v])
+    }
+    cx.serial += 1
+    VClosure(e, cx.serial, caps)
+}
+
+fn wrap_ok(inout cx: Cx, e: i64) -> Value {
+    let v = ev(cx, kid(cx, e, 0))
+    if cx.ctl != 0 {
+        return VUnit
+    }
+    match v {
+        VOk(_) -> v
+        VErr(_) -> v
+        _ -> VOk(v)
+    }
+}
+
+fn call_value_node(inout cx: Cx, e: i64) -> Value {
+    let f = ev(cx, kid(cx, e, 0))
+    if cx.ctl != 0 {
+        return VUnit
+    }
+    var args: [Value] = []
+    if not eval_kids(cx, e, 1, args) {
+        return VUnit
+    }
+    call_value(cx, f, args)
+}
+
+fn deref_node(inout cx: Cx, e: i64) -> Value {
+    let v = ev(cx, kid(cx, e, 0))
+    if cx.ctl != 0 {
+        return VUnit
+    }
+    deref(cx, v)
+}
+
+// ----- operators -------------------------------------------------------------------
+
+fn binary(inout cx: Cx, e: i64) -> Value {
+    let op = cx.a[e]
+    let base = cx.k0[e]
+    // A call operand is made from here, with no `ev` between: this is the
+    // shape of most deep recursion (`f(n - 1) + 1`).
+    let lk = cx.kids[base]
+    let l = if cx.op[lk] == 4 { call_node(cx, lk) } else { ev(cx, lk) }
+    if cx.ctl != 0 {
+        return VUnit
+    }
+    // `and`, `or` and `??` decide whether the right side runs at all.
+    if op >= 13 and not runs_right(cx.p, op, l) {
+        return short_value(cx.p, l)
+    }
+    let rk = cx.kids[base + 1]
+    let r = if cx.op[rk] == 4 { call_node(cx, rk) } else { ev(cx, rk) }
+    if cx.ctl != 0 or op >= 13 {
+        return r
+    }
+    match l {
+        VInt(x) -> match r {
+            VInt(y) -> return narrowed(cx.b[e], int_op(op, x, y))
+            _ -> ()
+        }
+        _ -> ()
+    }
+    narrowed(cx.b[e], apply_binary(cx.p, op, l, r))
+}
+
+/// Whether `and`, `or` or `??` needs its right side, given its left.
+fn runs_right(p: Prog, op: i64, l: Value) -> bool {
+    match l {
+        VBool(b) -> if op == 13 { b } else if op == 14 { not b } else { false }
+        VVariant(ty, idx, _) -> ty == p.option_ty and idx == p.none_idx
+        VErr(_) -> true
+        _ -> false
+    }
+}
+
+/// What a short-circuited `and`, `or` or `??` answers: the left side, or
+/// what `Some` or `Ok` carry.
+fn short_value(p: Prog, l: Value) -> Value {
+    match l {
+        VVariant(ty, idx, fs) -> if ty == p.option_ty and idx == p.some_idx { fs[0] } else { l }
+        VOk(x) -> x
+        _ -> l
+    }
+}
+
+fn int_op(op: i64, x: i64, y: i64) -> Value {
+    match op {
+        1 -> VInt(x + y)
+        2 -> VInt(x - y)
+        3 -> VInt(x * y)
+        9 -> VBool(x < y)
+        7 -> VBool(x == y)
+        8 -> VBool(x != y)
+        10 -> VBool(x <= y)
+        11 -> VBool(x > y)
+        12 -> VBool(x >= y)
+        4 -> {
+            if y == 0 {
+                panic("division by zero")
+            }
+            VInt(x / y)
+        }
+        5 -> {
+            if y == 0 {
+                panic("remainder by zero")
+            }
+            VInt(x % y)
+        }
+        6 -> {
+            if y < 0 {
+                panic("negative integer exponent (use floats)")
+            }
+            VInt(x ^ y)
+        }
+        _ -> panic("invalid int operation")
+    }
+}
+
+/// The integer operators on `u64`: the same bits as on `i64`, read
+/// unsigned in `/`, `%`, `^` and the comparisons ([T-U64]).
+fn u64_op(op: i64, x: u64, y: u64) -> Value {
+    match op {
+        1 -> VU64(x + y)
+        2 -> VU64(x - y)
+        3 -> VU64(x * y)
+        9 -> VBool(x < y)
+        7 -> VBool(x == y)
+        8 -> VBool(x != y)
+        10 -> VBool(x <= y)
+        11 -> VBool(x > y)
+        12 -> VBool(x >= y)
+        4 -> {
+            if y == 0 {
+                panic("division by zero")
+            }
+            VU64(x / y)
+        }
+        5 -> {
+            if y == 0 {
+                panic("remainder by zero")
+            }
+            VU64(x % y)
+        }
+        6 -> VU64(x ^ y)
+        _ -> panic("invalid int operation")
+    }
+}
+
+fn float_op(op: i64, x: f64, y: f64) -> Value {
+    match op {
+        1 -> VFloat(x + y)
+        2 -> VFloat(x - y)
+        3 -> VFloat(x * y)
+        4 -> VFloat(x / y)
+        9 -> VBool(x < y)
+        10 -> VBool(x <= y)
+        11 -> VBool(x > y)
+        12 -> VBool(x >= y)
+        7 -> VBool(x == y)
+        8 -> VBool(x != y)
+        5 -> VFloat(x % y)
+        6 -> VFloat(x ^ y)
+        _ -> panic("invalid float operation")
+    }
+}
+
+/// `apply_binary`: the operator on two evaluated operands.
+pub fn apply_binary(p: Prog, op: i64, l: Value, r: Value) -> Value {
+    match l {
+        VInt(x) -> match r {
+            VInt(y) -> return int_op(op, x, y)
+            VFloat(y) -> return float_op(op, x.as_f64(), y)
+            _ -> ()
+        }
+        VFloat(x) -> match r {
+            VFloat(y) -> return float_op(op, x, y)
+            VInt(y) -> return float_op(op, x, y.as_f64())
+            _ -> ()
+        }
+        // The checker never mixes `u64` with `i64`; an `i64` beside a `u64`
+        // is a literal of it, read as its bits, as the reference reads it.
+        VU64(x) -> match r {
+            VU64(y) -> return u64_op(op, x, y)
+            VInt(y) -> return u64_op(op, x, y.as_u64())
+            _ -> ()
+        }
+        _ -> ()
+    }
+    match r {
+        VU64(y) -> match l {
+            VInt(x) -> return u64_op(op, x.as_u64(), y)
+            _ -> ()
+        }
+        _ -> ()
+    }
+    if op == 7 {
+        return VBool(value.equal(l, r))
+    }
+    if op == 8 {
+        return VBool(not value.equal(l, r))
+    }
+    match l {
+        VStr(x) -> match r {
+            VStr(y) -> {
+                match op {
+                    1 -> return VStr(x + y)
+                    9 -> return VBool(x < y)
+                    10 -> return VBool(x <= y)
+                    11 -> return VBool(x > y)
+                    12 -> return VBool(x >= y)
+                    _ -> panic("invalid string operation")
+                }
+            }
+            _ -> ()
+        }
+        VTuple(_) -> match r {
+            VTuple(_) -> {
+                if op >= 9 and op <= 12 {
+                    let c = value.compare(l, r)
+                    return VBool(match op {
+                        9 -> c < 0
+                        10 -> c <= 0
+                        11 -> c > 0
+                        _ -> c >= 0
+                    })
+                }
+            }
+            _ -> ()
+        }
+        VList(xs) -> match r {
+            VList(ys) -> if op == 1 {
+                return VList(xs + ys)
+            }
+            _ -> ()
+        }
+        _ -> ()
+    }
+    panic("invalid operands `{value.show(p, l)}` and `{value.show(p, r)}`")
+}
+
+fn unary(inout cx: Cx, e: i64) -> Value {
+    let v = ev(cx, kid(cx, e, 0))
+    if cx.ctl != 0 {
+        return VUnit
+    }
+    if cx.a[e] == 1 {
+        return match v {
+            VBool(b) -> VBool(not b)
+            _ -> panic("invalid unary operand `{value.show(cx.p, v)}`")
+        }
+    }
+    match v {
+        VInt(x) -> narrowed(cx.b[e], VInt(0 - x))
+        VFloat(x) -> VFloat(-x)
+        VU64(x) -> VU64(0 - x)
+        _ -> panic("invalid unary operand `{value.show(cx.p, v)}`")
+    }
+}
+
+fn range(inout cx: Cx, e: i64) -> Value {
+    let a = ev(cx, kid(cx, e, 0))
+    if cx.ctl != 0 {
+        return VUnit
+    }
+    let b = ev(cx, kid(cx, e, 1))
+    if cx.ctl != 0 {
+        return VUnit
+    }
+    match a {
+        VInt(lo) -> match b {
+            VInt(hi) -> VRange(lo, hi, cx.a[e] == 1)
+            _ -> panic("range bounds must be ints")
+        }
+        _ -> panic("range bounds must be ints")
+    }
+}
+
+// ----- reading -----------------------------------------------------------------------
+
+/// What a reference points at; a stale one panics ([T-REF-STALE]).
+pub fn deref(cx: Cx, v: Value) -> Value {
+    match v {
+        VRef(slot, gen) -> {
+            if slot < cx.slab.len() and cx.gens[slot] == gen and cx.live[slot] {
+                return cx.slab[slot]
+            }
+            panic("stale reference: the value it pointed to was released")
+        }
+        _ -> v
+    }
+}
+
+fn field(inout cx: Cx, e: i64) -> Value {
+    let raw = ev(cx, cx.kids[cx.k0[e]])
+    if cx.ctl != 0 {
+        return VUnit
+    }
+    match raw {
+        VStruct(_, fs) -> return fs[cx.a[e]]
+        _ -> ()
+    }
+    let v = deref(cx, raw)
+    match v {
+        VStruct(_, fs) -> fs[cx.a[e]]
+        _ -> panic("`{value.show(cx.p, v)}` has no field `{cx.a[e]}`")
+    }
+}
+
+fn tuple_field(inout cx: Cx, e: i64) -> Value {
+    let raw = ev(cx, kid(cx, e, 0))
+    if cx.ctl != 0 {
+        return VUnit
+    }
+    let i = cx.a[e]
+    match raw {
+        VTuple(items) -> if i < items.len() {
+            return items[i]
+        }
+        _ -> ()
+    }
+    let v = deref(cx, raw)
+    match v {
+        VTuple(items) -> {
+            if i < items.len() {
+                return items[i]
+            }
+            panic("no component `.{i}`")
+        }
+        VStruct(_, fs) -> fs[i]
+        _ -> panic("no component `.{i}`")
+    }
+}
+
+fn index(inout cx: Cx, e: i64) -> Value {
+    let r = ev(cx, kid(cx, e, 0))
+    if cx.ctl != 0 {
+        return VUnit
+    }
+    let i = ev(cx, kid(cx, e, 1))
+    if cx.ctl != 0 {
+        return VUnit
+    }
+    match r {
+        VList(items) -> match i {
+            VInt(ix) -> {
+                if ix < 0 or ix >= items.len() {
+                    panic("index {ix} out of bounds (len {items.len()})")
+                }
+                return items[ix]
+            }
+            _ -> ()
+        }
+        _ -> ()
+    }
+    panic("cannot index `{value.show(cx.p, r)}` with `{value.show(cx.p, i)}`")
+}
+
+fn interpolate(inout cx: Cx, e: i64) -> Value {
+    var parts: [str] = []
+    let base = cx.k0[e]
+    for i in 0..cx.nk[e] {
+        let k = cx.kids[base + i]
+        if cx.op[k] == load.OP_TEXT {
+            parts.push(cx.s[k])
+        } else {
+            let v = ev(cx, k)
+            if cx.ctl != 0 {
+                return VUnit
+            }
+            parts.push(value.show(cx.p, v))
+        }
+    }
+    VStr(parts.join(""))
+}
+
+pub fn const_value(inout cx: Cx, ci: i64) -> Value {
+    if cx.const_built[ci] {
+        return cx.consts[ci]
+    }
+    // Effect-free, so when it is built is unobservable, and it is built
+    // once ([E-CONST]).
+    var other = cx.p.const_frame[ci]
+    swap_frame(cx, other)
+    let v = ev(cx, cx.p.const_init[ci])
+    swap_frame(cx, other)
+    if cx.ctl != 0 {
+        return VUnit
+    }
+    cx.consts[ci] = v
+    cx.const_built[ci] = true
+    v
+}
+
+// ----- building ------------------------------------------------------------------------
+
+fn struct_lit(inout cx: Cx, e: i64) -> Value {
+    let ty = cx.a[e]
+    let n = cx.nk[e]
+    var fs: [Value] = []
+    // `..base` is evaluated first, whatever its place in the literal
+    // ([G-STRUCT-UPDATE]); TIR writes it last.
+    if cx.b[e] == 1 {
+        let bn = kid(cx, e, n - 1)
+        var bv = ev(cx, kid(cx, bn, 0))
+        if cx.ctl != 0 {
+            return VUnit
+        }
+        match bv {
+            VStruct(_, _) -> ()
+            _ -> panic("`..` in a struct literal needs a struct, got `{value.show(cx.p, bv)}`")
+        }
+        fs = value.fields_of(value.take(bv))
+    } else {
+        for _ in 0..cx.p.ty_fields[ty].len() {
+            fs.push(VUnit)
+        }
+    }
+    for i in 0..n {
+        let fnode = kid(cx, e, i)
+        if cx.op[fnode] == load.OP_SFIELD {
+            let v = ev(cx, kid(cx, fnode, 0))
+            if cx.ctl != 0 {
+                return VUnit
+            }
+            fs[cx.a[fnode]] = v
+        }
+    }
+    VStruct(ty, fs)
+}
+
+fn map_lit(inout cx: Cx, e: i64) -> Value {
+    var m = value.empty_map()
+    for i in 0..cx.nk[e] {
+        let en = kid(cx, e, i)
+        let k = ev(cx, kid(cx, en, 0))
+        if cx.ctl != 0 {
+            return VUnit
+        }
+        let v = ev(cx, kid(cx, en, 1))
+        if cx.ctl != 0 {
+            return VUnit
+        }
+        map_set(cx.p, m, k, v)
+    }
+    m
+}
+
+/// `m.set(k, v)` on a map held uniquely by `m`.
+pub fn map_set(p: Prog, inout m: Value, k: Value, v: Value) {
+    var whole = value.take(m)
+    match k {
+        VStr(s) -> {
+            var ks = str_map(value.take(whole))
+            ks.set(s, v)
+            m = VMap(map(), map(), ks, map())
+            return
+        }
+        VInt(i) -> {
+            var ki = int_map(value.take(whole))
+            ki.set(i, v)
+            m = VMap(map(), ki, map(), map())
+            return
+        }
+        VBool(b) -> {
+            var kb = bool_map(value.take(whole))
+            kb.set(b, v)
+            m = VMap(kb, map(), map(), map())
+            return
+        }
+        VU64(u) -> {
+            var ku = u64_map(value.take(whole))
+            ku.set(u, v)
+            m = VMap(map(), map(), map(), ku)
+            return
+        }
+        _ -> panic("invalid map key `{value.show(p, k)}`")
+    }
+}
+
+pub fn str_map(v: Value) -> Map[str, Value] {
+    match v {
+        VMap(_, _, ks, _) -> ks
+        _ -> map()
+    }
+}
+
+pub fn int_map(v: Value) -> Map[i64, Value] {
+    match v {
+        VMap(_, ki, _, _) -> ki
+        _ -> map()
+    }
+}
+
+pub fn bool_map(v: Value) -> Map[bool, Value] {
+    match v {
+        VMap(kb, _, _, _) -> kb
+        _ -> map()
+    }
+}
+
+pub fn u64_map(v: Value) -> Map[u64, Value] {
+    match v {
+        VMap(_, _, _, ku) -> ku
+        _ -> map()
+    }
+}
+
+// ----- statements ------------------------------------------------------------------
+
+fn let_tuple(inout cx: Cx, e: i64) -> Value {
+    let v = ev(cx, kid(cx, e, 0))
+    if cx.ctl != 0 {
+        return VUnit
+    }
+    let names = cx.nk[e] - 1
+    match v {
+        VTuple(items) -> {
+            if items.len() != names {
+                panic("this tuple has {items.len()} component(s) but {names} name(s) were given")
+            }
+            for i in 0..names {
+                cx.fr[cx.a[kid(cx, e, i + 1)]] = items[i]
+            }
+            VUnit
+        }
+        _ -> panic("destructuring a non-tuple")
+    }
+}
+
+/// After a loop body: whether to go round again. A `break` or `continue` is
+/// this loop's and is spent here; anything else keeps unwinding.
+fn loop_goes_on(inout cx: Cx) -> bool {
+    if cx.ctl == 0 {
+        return true
+    }
+    if cx.ctl == CTL_CONTINUE {
+        cx.ctl = 0
+        return true
+    }
+    if cx.ctl == CTL_BREAK {
+        cx.ctl = 0
+    }
+    false
+}
+
+fn while_loop(inout cx: Cx, e: i64) -> Value {
+    let cond = kid(cx, e, 0)
+    let body = kid(cx, e, 1)
+    while true {
+        let c = ev(cx, cond)
+        if cx.ctl != 0 {
+            return VUnit
+        }
+        if not is_true(c) {
+            return VUnit
+        }
+        ev(cx, body)
+        if not loop_goes_on(cx) {
+            return VUnit
+        }
+    }
+    VUnit
+}
+
+fn for_loop(inout cx: Cx, e: i64) -> Value {
+    var it = ev(cx, kid(cx, e, 0))
+    if cx.ctl != 0 {
+        return VUnit
+    }
+    // A list's elements are copied out and the list let go before the body
+    // runs, as the reference collects them first: a body that pushes onto
+    // the list it walks then writes it in place instead of copying it.
+    if value.shape(it) == 1 {
+        return for_items(cx, e, value.list_copy(value.take(it)))
+    }
+    let var_id = cx.b[e]
+    let body = kid(cx, e, 1)
+    match it {
+        // Walked, not built ([E-LOOP-RANGE-MAX]): the last value of an
+        // inclusive range is its end, and stepping past it would wrap.
+        VRange(lo, hi, incl) -> {
+            var i = lo
+            while true {
+                if incl {
+                    if i > hi {
+                        return VUnit
+                    }
+                } else if i >= hi {
+                    return VUnit
+                }
+                cx.fr[var_id] = VInt(i)
+                ev(cx, body)
+                if not loop_goes_on(cx) {
+                    return VUnit
+                }
+                if incl and i == hi {
+                    return VUnit
+                }
+                i += 1
+            }
+            VUnit
+        }
+        VStr(s) -> {
+            for c in s.chars() {
+                cx.fr[var_id] = VStr(c)
+                ev(cx, body)
+                if not loop_goes_on(cx) {
+                    return VUnit
+                }
+            }
+            VUnit
+        }
+        _ -> panic("cannot iterate over `{value.show(cx.p, it)}`")
+    }
+}
+
+fn for_items(inout cx: Cx, e: i64, items: [Value]) -> Value {
+    let var_id = cx.b[e]
+    let body = kid(cx, e, 1)
+    for x in items {
+        cx.fr[var_id] = x
+        ev(cx, body)
+        if not loop_goes_on(cx) {
+            return VUnit
+        }
+    }
+    VUnit
+}
+
+/// The body of the arm that matches, or -1 when evaluation started
+/// unwinding first.
+fn match_arm(inout cx: Cx, e: i64) -> i64 {
+    let raw = ev(cx, kid(cx, e, 0))
+    if cx.ctl != 0 {
+        return -1
+    }
+    // Matching through a reference matches what it points at.
+    let v = if cx.c[e] == 1 { deref(cx, raw) } else { raw }
+    for i in 1..cx.nk[e] {
+        let arm = kid(cx, e, i)
+        if pmatch(cx, kid(cx, arm, 0), v) {
+            if cx.a[arm] == 1 {
+                let g = ev(cx, kid(cx, arm, 1))
+                if cx.ctl != 0 {
+                    return -1
+                }
+                if is_true(g) {
+                    return kid(cx, arm, 2)
+                }
+            } else {
+                return kid(cx, arm, 1)
+            }
+        }
+    }
+    panic("no match arm matched `{value.show(cx.p, v)}`")
+}
+
+/// Whether pattern `pt` matches `v`, binding into the frame as it goes.
+fn pmatch(inout cx: Cx, pt: i64, v: Value) -> bool {
+    match cx.op[pt] {
+        // OP_P_BIND
+        84 -> {
+            cx.fr[cx.a[pt]] = v
+            true
+        }
+        // OP_P_VARIANT
+        85 -> match v {
+            VVariant(ty, idx, fs) -> {
+                if idx != cx.b[pt] or ty != cx.a[pt] or fs.len() != cx.nk[pt] {
+                    return false
+                }
+                for i in 0..fs.len() {
+                    if not pmatch(cx, kid(cx, pt, i), fs[i]) {
+                        return false
+                    }
+                }
+                true
+            }
+            _ -> false
+        }
+        // OP_P_WILD
+        80 -> true
+        // OP_P_OK
+        86 -> match v {
+            VOk(x) -> pmatch(cx, kid(cx, pt, 0), x)
+            _ -> false
+        }
+        // OP_P_ERR
+        87 -> match v {
+            VErr(x) -> pmatch(cx, kid(cx, pt, 0), x)
+            _ -> false
+        }
+        // OP_P_INT
+        81 -> match v {
+            VInt(x) -> x == cx.a[pt]
+            VU64(x) -> x.as_i64() == cx.a[pt]
+            _ -> false
+        }
+        // OP_P_STR
+        83 -> match v {
+            VStr(s) -> s == cx.s[pt]
+            _ -> false
+        }
+        // OP_P_TUPLE
+        88 -> match v {
+            VTuple(items) -> {
+                if items.len() != cx.nk[pt] {
+                    return false
+                }
+                for i in 0..items.len() {
+                    if not pmatch(cx, kid(cx, pt, i), items[i]) {
+                        return false
+                    }
+                }
+                true
+            }
+            _ -> false
+        }
+        // OP_P_BOOL
+        82 -> match v {
+            VBool(b) -> b == (cx.a[pt] == 1)
+            _ -> false
+        }
+        // OP_P_OR
+        89 -> {
+            for i in 0..cx.nk[pt] {
+                if pmatch(cx, kid(cx, pt, i), v) {
+                    return true
+                }
+            }
+            false
+        }
+        _ -> false
+    }
+}
+
+// ----- places ---------------------------------------------------------------------
+//
+// A place is a local and a path of steps into it: 0 a struct field, 1 a
+// tuple component, 2 a list element, 3 the referent of a `ref`. A step into
+// a value held by a `ref` goes through to the slab, wherever on the path the
+// `ref` is ([T-REF-WRITE]).
+
+/// The root's variable number, then a (kind, value) pair per step. A list
+/// of integers rather than a struct: reading a list element is inline in
+/// compiled code, and growing a struct's field is a lookup by name.
+type Path = [i64]
+
+fn steps(path: Path) -> i64 {
+    (path.len() - 1) / 2
+}
+
+/// The path of an assignment target, its indexes evaluated root to leaf.
+/// `root` is -1 when evaluation started unwinding.
+fn place_path(inout cx: Cx, e: i64) -> Path {
+    var steps: [i64] = []
+    var cur = e
+    while cx.op[cur] != load.OP_PL_LOCAL {
+        steps.push(cur)
+        cur = kid(cx, cur, 0)
+    }
+    var path = [cx.a[cur]]
+    var i = steps.len() - 1
+    while i >= 0 {
+        let s = steps[i]
+        let op = cx.op[s]
+        if op == load.OP_PL_FIELD {
+            path.push(0)
+            path.push(cx.a[s])
+        } else if op == load.OP_PL_DEREF {
+            path.push(3)
+            path.push(0)
+        } else {
+            let ix = ev(cx, kid(cx, s, 1))
+            if cx.ctl != 0 {
+                path[0] = -1
+                return path
+            }
+            path.push(2)
+            path.push(index_value(cx.p, ix))
+        }
+        i -= 1
+    }
+    path
+}
+
+fn index_value(p: Prog, ix: Value) -> i64 {
+    match ix {
+        VInt(n) -> {
+            if n < 0 {
+                panic("negative index {n}")
+            }
+            n
+        }
+        _ -> panic("index must be an int, got `{value.show(p, ix)}`")
+    }
+}
+
+/// The path of an expression that names a place -- an `inout` argument or
+/// a mutating method's receiver. `root` is -1 when it is not a place, and
+/// -2 when evaluating an index started unwinding.
+pub fn expr_path(inout cx: Cx, e: i64) -> Path {
+    var steps: [i64] = []
+    var cur = e
+    while cx.op[cur] != load.OP_LOCAL {
+        let op = cx.op[cur]
+        if op != load.OP_FIELD and op != load.OP_TUPLEFIELD and op != load.OP_INDEX and op != load.OP_DEREF {
+            return [-1]
+        }
+        steps.push(cur)
+        cur = kid(cx, cur, 0)
+    }
+    var path = [cx.a[cur]]
+    var i = steps.len() - 1
+    while i >= 0 {
+        let s = steps[i]
+        let op = cx.op[s]
+        if op == load.OP_FIELD {
+            path.push(0)
+            path.push(cx.a[s])
+        } else if op == load.OP_TUPLEFIELD {
+            path.push(1)
+            path.push(cx.a[s])
+        } else if op == load.OP_DEREF {
+            path.push(3)
+            path.push(0)
+        } else {
+            let ix = ev(cx, kid(cx, s, 1))
+            if cx.ctl != 0 {
+                path[0] = -2
+                return path
+            }
+            path.push(2)
+            path.push(index_value(cx.p, ix))
+        }
+        i -= 1
+    }
+    path
+}
+
+/// The value at a path.
+pub fn read_path(inout cx: Cx, path: Path) -> Value {
+    var v = cx.fr[path[0]]
+    for k in 0..steps(path) {
+        let kind = path[1 + 2 * k]
+        let i = path[2 + 2 * k]
+        v = deref(cx, v)
+        if kind == 3 {
+            continue
+        }
+        v = match v {
+            VStruct(_, fs) -> fs[i]
+            VTuple(items) -> {
+                if i >= items.len() {
+                    panic("no component `{i}`")
+                }
+                items[i]
+            }
+            VList(items) -> {
+                if i >= items.len() {
+                    panic("index {i} out of bounds (len {items.len()})")
+                }
+                items[i]
+            }
+            _ -> panic("cannot access a part of `{value.show(cx.p, v)}`")
+        }
+    }
+    v
+}
+
+/// Puts `nv` at the path and answers what was there.
+///
+/// A write through a reference changes the referent, not what holds the
+/// reference, so everything on the path up to the last reference it passes
+/// is only read, and the write happens inside that reference's slot
+/// (`assign_in_slab`). That is also what makes a cycle writable:
+/// `a.out[0].out[0].name` passes `a`'s slot twice and writes only `a`.
+/// Past that point the containers are taken out and put back, so one
+/// nothing else holds is written where it lies.
+pub fn swap_path(inout cx: Cx, path: Path, nv: Value) -> Value {
+    let n = steps(path)
+    if n == 0 {
+        let old = take_local(cx, path[0])
+        cx.fr[path[0]] = nv
+        return old
+    }
+    var v = cx.fr[path[0]]
+    var at = -1
+    var slot = 0
+    for k in 0..n {
+        match v {
+            VRef(s, g) -> {
+                if not (s < cx.slab.len() and cx.gens[s] == g and cx.live[s]) {
+                    panic("stale reference: the value it pointed to was released")
+                }
+                at = k
+                slot = s
+                v = cx.slab[s]
+            }
+            _ -> ()
+        }
+        if path[1 + 2 * k] != 3 and k + 1 < n {
+            v = peek(v, path[2 + 2 * k])
+        }
+    }
+    if at < 0 {
+        var root = take_local(cx, path[0])
+        let old = swap_in(cx, root, path, 0, nv)
+        cx.fr[path[0]] = root
+        return old
+    }
+    let from = if path[1 + 2 * at] == 3 { at + 1 } else { at }
+    var inner = take_slab_slot(cx, slot)
+    let old = swap_in(cx, inner, path, from, nv)
+    cx.slab[slot] = inner
+    old
+}
+
+/// One step of a path, read; `()` where there is nothing to step to (the
+/// write that follows reports it).
+fn peek(v: Value, i: i64) -> Value {
+    match v {
+        VStruct(_, fs) -> if i < fs.len() { fs[i] } else { VUnit }
+        VList(items) -> if i < items.len() { items[i] } else { VUnit }
+        VTuple(items) -> if i < items.len() { items[i] } else { VUnit }
+        _ -> VUnit
+    }
+}
+
+/// The write itself, on a path that passes no further reference.
+fn swap_in(inout cx: Cx, inout slot: Value, path: Path, k: i64, nv: Value) -> Value {
+    if k == steps(path) {
+        let old = value.take(slot)
+        slot = nv
+        return old
+    }
+    let kind = path[1 + 2 * k]
+    if kind == 3 {
+        // `.value` of something that is not a reference: the place is the
+        // value itself.
+        return swap_in(cx, slot, path, k + 1, nv)
+    }
+    let i = path[2 + 2 * k]
+    var whole = value.take(slot)
+    if kind == 2 {
+        match whole {
+            VList(_) -> ()
+            _ -> panic("cannot index into `{value.show(cx.p, whole)}`")
+        }
+        var xs = value.list_of(value.take(whole))
+        if i >= xs.len() {
+            panic("index {i} out of bounds (len {xs.len()})")
+        }
+        var child = value.take(xs[i])
+        let old = swap_in(cx, child, path, k + 1, nv)
+        xs[i] = child
+        slot = VList(xs)
+        return old
+    }
+    let ty = match whole {
+        VStruct(t, _) -> t
+        VTuple(_) -> -2
+        _ -> panic("cannot access a field of `{value.show(cx.p, whole)}`")
+    }
+    var fs = value.fields_of(value.take(whole))
+    if i >= fs.len() {
+        panic("no field {i}")
+    }
+    var child = value.take(fs[i])
+    let old = swap_in(cx, child, path, k + 1, nv)
+    fs[i] = child
+    slot = if ty == -2 { VTuple(fs) } else { VStruct(ty, fs) }
+    old
+}
+
+fn assign_element(inout cx: Cx, e: i64, pl: i64, slot: i64) -> Value {
+    let ix = ev(cx, kid(cx, pl, 1))
+    if cx.ctl != 0 {
+        return VUnit
+    }
+    let i = index_value(cx.p, ix)
+    let v = ev(cx, kid(cx, e, 1))
+    if cx.ctl != 0 {
+        return VUnit
+    }
+    var whole = take_local(cx, slot)
+    var xs = value.list_of(value.take(whole))
+    if i >= xs.len() {
+        panic("index {i} out of bounds (len {xs.len()})")
+    }
+    let op = cx.a[e]
+    if op == 0 {
+        xs[i] = v
+    } else {
+        xs[i] = narrowed(cx.b[e], apply_binary(cx.p, op, xs[i], v))
+    }
+    cx.fr[slot] = VList(xs)
+    VUnit
+}
+
+fn assign_field(inout cx: Cx, e: i64, f: i64, slot: i64) -> Value {
+    let v = ev(cx, kid(cx, e, 1))
+    if cx.ctl != 0 {
+        return VUnit
+    }
+    var whole = take_local(cx, slot)
+    let ty = match whole {
+        VStruct(t, _) -> t
+        _ -> 0
+    }
+    var fs = value.fields_of(value.take(whole))
+    let op = cx.a[e]
+    if op == 0 {
+        fs[f] = v
+    } else {
+        fs[f] = narrowed(cx.b[e], apply_binary(cx.p, op, fs[f], v))
+    }
+    cx.fr[slot] = VStruct(ty, fs)
+    VUnit
+}
+
+fn assign(inout cx: Cx, e: i64) -> Value {
+    let pl = kid(cx, e, 0)
+    let op = cx.a[e]
+    // The fast path: a plain local.
+    if cx.op[pl] == load.OP_PL_LOCAL {
+        let v = ev(cx, kid(cx, e, 1))
+        if cx.ctl != 0 {
+            return VUnit
+        }
+        let slot = cx.a[pl]
+        if op == 0 {
+            cx.fr[slot] = v
+        } else {
+            cx.fr[slot] = narrowed(cx.b[e], apply_binary(cx.p, op, cx.fr[slot], v))
+        }
+        return VUnit
+    }
+    // `xs[i] = v` and `p.f = v` on a local holding the list or struct
+    // itself, the commonest two, without building a path.
+    if cx.op[kid(cx, pl, 0)] == load.OP_PL_LOCAL {
+        let slot = cx.a[kid(cx, pl, 0)]
+        let shape = value.shape(cx.fr[slot])
+        if cx.op[pl] == load.OP_PL_INDEX and shape == 1 {
+            return assign_element(cx, e, pl, slot)
+        }
+        if cx.op[pl] == load.OP_PL_FIELD and shape == 4 {
+            return assign_field(cx, e, cx.a[pl], slot)
+        }
+    }
+    // The target's own subexpressions first ([E-ORDER-LTR]).
+    let path = place_path(cx, pl)
+    if path[0] < 0 {
+        return VUnit
+    }
+    let v = ev(cx, kid(cx, e, 1))
+    if cx.ctl != 0 {
+        return VUnit
+    }
+    if op == 0 {
+        swap_path(cx, path, v)
+    } else {
+        let old = read_path(cx, path)
+        swap_path(cx, path, narrowed(cx.b[e], apply_binary(cx.p, op, old, v)))
+    }
+    VUnit
+}
+
+// ----- calls ---------------------------------------------------------------------------
+
+// ----- deep recursion ------------------------------------------------------------
+//
+// [E-RECURSION-DEPTH] promises 10,000 nested calls, and the reference
+// interpreter allows 100,000. Here each call of the program is several
+// nested calls of this one, and how many depends on the shape of the code:
+// a call made from inside a `try` inside a `push` costs about ten. A native
+// program has 6 MiB of stack, which held only about 1,300 calls of
+// `scheme-demo` -- a Scheme interpreter written in Grasm, so recursion
+// two levels deep in interpreters.
+//
+// So every `HOP` nested calls the evaluation moves to a new task of the
+// host, which runs on a fiber with a stack of its own, and the context comes
+// back through a channel when the body is done. The waiting task runs
+// nothing meanwhile, so the order of everything the program does is
+// unchanged. At 100,000 calls, the reference's own bound, the recursion
+// stops with the panic every engine words the same way.
+
+let HOP = 500
+let MAX_DEPTH = 100000
+
+/// A function's or a closure's body, one call deeper.
+fn body(inout cx: Cx, node: i64) -> Value {
+    if cx.depth >= MAX_DEPTH {
+        panic("stack overflow: recursion too deep")
+    }
+    cx.depth += 1
+    // Not inside a task of a `concurrent` block: the host runs a nested
+    // block's tasks by themselves, so a task of the program waiting on a
+    // channel there could not be woken by its siblings outside it.
+    let hop = cx.depth % HOP == 0 and cx.baton.is_empty()
+    let r = if hop { ev_elsewhere(cx, node) } else { ev(cx, node) }
+    cx.depth -= 1
+    r
+}
+
+/// `ev` on a fresh stack: a host task's.
+fn ev_elsewhere(inout cx: Cx, node: i64) -> Value {
+    let start = cx
+    let back: Chan[Cx] = chan_new(1)
+    concurrent {
+        go {
+            var mine = start
+            mine.hop_result = ev(mine, node)
+            chan_send(back, mine)
+        }
+    }
+    match chan_recv(back) {
+        Some(c) -> cx = c
+        None -> ()
+    }
+    value.take(cx.hop_result)
+}
+
+/// After a body: the value it produced, wrapped if the function is fallible,
+/// with a `return` spent and an error turned into `Err` where the function
+/// can fail.
+fn finish(inout cx: Cx, r: Value, fallible: bool) -> Value {
+    var v = r
+    if cx.ctl == CTL_RETURN {
+        v = value.take(cx.carry)
+        cx.ctl = 0
+    } else if cx.ctl == CTL_ERR {
+        if fallible {
+            cx.ctl = 0
+            return VErr(value.take(cx.carry))
+        }
+        return VUnit
+    } else if cx.ctl != 0 {
+        cx.ctl = 0
+    }
+    if not fallible {
+        return v
+    }
+    match v {
+        VOk(_) -> v
+        VErr(_) -> v
+        _ -> VOk(v)
+    }
+}
+
+/// Puts `other` in as the frame being evaluated, and the one that was in
+/// `other`. Neither is then held twice, so the first write to a frame does
+/// not copy it, as it would if a local still held it.
+fn swap_frame(inout cx: Cx, inout other: [Value]) {
+    let mine = cx.fr
+    cx.fr = other
+    other = mine
+}
+
+/// Runs a declared function's body in `frame`, which holds its arguments.
+fn run_fn(inout cx: Cx, fid: i64, inout frame: [Value]) -> Value {
+    swap_frame(cx, frame)
+    let r = body(cx, cx.p.fn_body[fid])
+    // What each `inout` parameter holds at the end goes back to the caller
+    // -- after a failure too ([E-INOUT-FAIL]).
+    let modes = cx.p.fn_modes[fid]
+    var wb: [Value] = []
+    for i in 0..modes.len() {
+        if modes[i] == 1 {
+            wb.push(take_local(cx, cx.p.fn_params[fid][i]))
+        }
+    }
+    cx.wb = wb
+    swap_frame(cx, frame)
+    finish(cx, r, cx.p.fn_fallible[fid])
+}
+
+/// Calls a declared function. The arguments are moved out of `args`, so a
+/// value the caller gave up is the callee's alone.
+pub fn call_fn(inout cx: Cx, fid: i64, inout args: [Value]) -> Value {
+    if cx.p.fn_extern[fid] {
+        let name = cx.p.fn_name[fid]
+        panic("cannot find the C function `{name}` in this process — a compiled build links it, the TIR interpreter can only reach what is already loaded")
+    }
+    var frame = cx.p.fn_frame[fid]
+    let params = cx.p.fn_params[fid]
+    for i in 0..params.len() {
+        frame[params[i]] = value.take(args[i])
+    }
+    run_fn(cx, fid, frame)
+}
+
+/// Calls a function value: a closure or a named function.
+pub fn call_value(inout cx: Cx, f: Value, inout args: [Value]) -> Value {
+    match f {
+        VClosure(node, _, caps) -> {
+            let ci = cx.a[node]
+            var frame = cx.p.clo_frame[ci]
+            let cv = cx.p.clo_caps[ci]
+            for i in 0..cv.len() {
+                frame[cv[i]] = caps[i]
+            }
+            let params = cx.p.clo_params[ci]
+            for i in 0..params.len() {
+                if i < args.len() {
+                    frame[params[i]] = value.take(args[i])
+                }
+            }
+            swap_frame(cx, frame)
+            let r = body(cx, kid(cx, node, 0))
+            swap_frame(cx, frame)
+            finish(cx, r, cx.b[node] == 1)
+        }
+        VFn(fid) -> call_fn(cx, fid, args)
+        _ -> panic("`{value.show(cx.p, f)}` is not callable (call)")
+    }
+}
+
+/// `f(x)` for a function value.
+pub fn call1(inout cx: Cx, f: Value, x: Value) -> Value {
+    var args = [x]
+    call_value(cx, f, args)
+}
+
+/// `f(x, y)` for a function value.
+pub fn call2(inout cx: Cx, f: Value, x: Value, y: Value) -> Value {
+    var args = [x, y]
+    call_value(cx, f, args)
+}
+
+/// A call of a declared function with no `inout` parameter: the arguments
+/// go straight into the callee's frame, and the body runs from here -- one
+/// host frame per call of the program being run.
+fn call_node(inout cx: Cx, e: i64) -> Value {
+    if cx.c[e] != 0 {
+        return call_inout(cx, e)
+    }
+    let fid = cx.a[e]
+    var callee = cx.p.fn_frame[fid]
+    let params = cx.p.fn_params[fid]
+    let base = cx.k0[e]
+    for i in 0..cx.nk[e] {
+        let k = cx.kids[base + i]
+        let v = if cx.op[k] == 4 { call_node(cx, k) } else { ev(cx, k) }
+        if cx.ctl != 0 {
+            return VUnit
+        }
+        callee[params[i]] = v
+    }
+    swap_frame(cx, callee)
+    let r = body(cx, cx.p.fn_body[fid])
+    swap_frame(cx, callee)
+    finish(cx, r, cx.p.fn_fallible[fid])
+}
+
+/// A call with an `inout` parameter. Its argument is a place, read now --
+/// moved out, so the callee holds it alone -- and written back after. A
+/// place another argument mentions is read only once the others have run,
+/// so it is what they left there (`eval_call_args_paths`).
+fn call_inout(inout cx: Cx, e: i64) -> Value {
+    let fid = cx.a[e]
+    var args: [Value] = []
+    let modes = cx.p.fn_modes[fid]
+    let aliased = cx.b[e]
+    let n = cx.nk[e]
+    var paths: [Path] = []
+    var deferred: [i64] = []
+    for i in 0..n {
+        let a = kid(cx, e, i)
+        if i < modes.len() and modes[i] == 1 {
+            let path = expr_path(cx, a)
+            if path[0] == -2 {
+                return VUnit
+            }
+            if path[0] == -1 {
+                let v = ev(cx, a)
+                if cx.ctl != 0 {
+                    return VUnit
+                }
+                args.push(v)
+            } else if aliased.ushr(i).bit_and(1) == 1 {
+                deferred.push(i)
+                args.push(VUnit)
+            } else {
+                args.push(swap_path(cx, path, VUnit))
+            }
+            paths.push(path)
+        } else {
+            let v = ev(cx, a)
+            if cx.ctl != 0 {
+                return VUnit
+            }
+            args.push(v)
+            paths.push([-1])
+        }
+    }
+    for i in deferred {
+        args[i] = read_path(cx, paths[i])
+    }
+    let r = call_fn(cx, fid, args)
+    // Taken, not shared: a written-back value the context still held would
+    // be copied by the next write to it, which made a loop of `inout` calls
+    // on a growing structure quadratic.
+    var wb = cx.wb
+    cx.wb = []
+    var w = 0
+    for i in 0..n {
+        if i < modes.len() and modes[i] == 1 {
+            if paths[i][0] >= 0 and w < wb.len() {
+                swap_path(cx, paths[i], value.take(wb[w]))
+            }
+            w += 1
+        }
+    }
+    r
+}
+
+/// The name an `impl` is keyed by for a value's runtime type.
+fn impl_key(p: Prog, v: Value) -> str {
+    match v {
+        VInt(_) -> "i64"
+        VStr(_) -> "str"
+        VBool(_) -> "bool"
+        VFloat(_) -> "f64"
+        VStruct(ty, _) -> p.ty_name[ty]
+        VVariant(ty, _, _) -> p.ty_name[ty]
+        VList(_) -> "[]"
+        VU64(_) -> "u64"
+        _ -> ""
+    }
+}
+
+/// An interface method on a generic receiver: the function the receiver's
+/// type provides, through the program's `impl` table.
+fn bound_call(inout cx: Cx, e: i64) -> Value {
+    var args: [Value] = []
+    if not eval_kids(cx, e, 0, args) {
+        return VUnit
+    }
+    let name = cx.s[e]
+    let key = impl_key(cx.p, args[0])
+    let fid = cx.p.impls.get(key + " " + name) ?? -1
+    if fid < 0 {
+        panic("no `impl` provides `{name}` for `{key}`")
+    }
+    call_fn(cx, fid, args)
+}
+
+// ----- effects --------------------------------------------------------------------------
+
+fn with_handler(inout cx: Cx, e: i64) -> Value {
+    let h = ev(cx, kid(cx, e, 0))
+    if cx.ctl != 0 {
+        return VUnit
+    }
+    match h {
+        VStruct(_, _) -> ()
+        _ -> {
+            let name = cx.p.eff_name[cx.a[e]]
+            panic("handler for effect `{name}` must be a handler struct")
+        }
+    }
+    cx.h_eff.push(cx.a[e])
+    cx.h_val.push(h)
+    ev(cx, kid(cx, e, 1))
+    cx.h_eff.pop()
+    cx.h_val.pop()
+    VUnit
+}
+
+fn effect_op(inout cx: Cx, e: i64) -> Value {
+    let eff = cx.a[e]
+    let op = cx.s[e]
+    // The innermost handler for the effect ([E-HANDLER-INNERMOST]).
+    var f = VUnit
+    var found = false
+    var i = cx.h_eff.len() - 1
+    while i >= 0 and not found {
+        if cx.h_eff[i] == eff {
+            match cx.h_val[i] {
+                VStruct(ty, fs) -> {
+                    let names = cx.p.ty_fields[ty]
+                    for j in 0..names.len() {
+                        if names[j] == op {
+                            f = fs[j]
+                            found = true
+                        }
+                    }
+                }
+                _ -> ()
+            }
+            if not found {
+                i = -1
+            }
+        }
+        i -= 1
+    }
+    if not found {
+        let name = if eff >= 0 { cx.p.eff_name[eff] } else { "?" }
+        panic("unhandled effect `{name}.{op}` — no handler installed")
+    }
+    var args: [Value] = []
+    if not eval_kids(cx, e, 0, args) {
+        return VUnit
+    }
+    let out = call_value(cx, f, args)
+    if cx.b[e] == 0 {
+        return out
+    }
+    // A fallible operation answers with a `T ! E` however the handler
+    // ended: a value is `Ok`, a `fail` is `Err` ([T-EFFECT-FALLIBLE]).
+    if cx.ctl == CTL_ERR {
+        cx.ctl = 0
+        return VErr(value.take(cx.carry))
+    }
+    if cx.ctl != 0 {
+        return VUnit
+    }
+    match out {
+        VOk(_) -> out
+        VErr(_) -> out
+        _ -> VOk(out)
+    }
+}
+
+// ----- tasks ------------------------------------------------------------------------------
+
+fn spawn(inout cx: Cx, e: i64) -> Value {
+    if cx.a[e] == 1 {
+        return go(cx, e)
+    }
+    if cx.spawns.is_empty() {
+        panic("`spawn` outside a `parallel` block")
+    }
+    let top = cx.spawns.len() - 1
+    cx.spawns[top].push(kid(cx, e, 0))
+    VUnit
+}
+
+/// A `parallel` block's statements, then the tasks they spawned, in spawn
+/// order, each seeing the enclosing scope ([E-SPAWN-ORDER],
+/// [E-SPAWN-SHARED]). That is the order every engine must behave as if it
+/// ran them in ([E-NOT-PARALLEL]).
+fn parallel(inout cx: Cx, e: i64) -> Value {
+    if cx.a[e] == 1 {
+        return concurrent_block(cx, e)
+    }
+    cx.spawns.push([])
+    ev(cx, kid(cx, e, 0))
+    let tasks = cx.spawns.pop() ?? []
+    if cx.ctl != 0 {
+        return VUnit
+    }
+    for t in tasks {
+        ev(cx, t)
+        if cx.ctl != 0 {
+            return VUnit
+        }
+    }
+    VUnit
+}
+
+// A `concurrent` block's tasks take turns at channel operations
+// ([E-SCHEDULE]), which means a task that has to wait is put aside in the
+// middle of evaluating an expression. This evaluator recurses on the host's
+// stack, so each task of the program runs as a task of the host: the host
+// gives it a stack of its own, puts it aside where it waits, and chooses
+// who runs next by the same rules, so the program's tasks take their turns
+// in the order every engine gives them.
+//
+// What tasks share is the slab -- an actor's state is a `ref` every handle
+// reaches -- and each host task has its own copy of the context. So the
+// slab is handed on through a channel of capacity one, as the reference
+// hands it between its task interpreters (`park_slab`): a task holds it
+// while it runs, and puts it back before any operation that may wait and
+// when it ends. Neither handing it back nor taking it ever waits, so the
+// hand-over adds no turn of its own.
+
+/// The `go` bodies of each open `concurrent` block, with the frame each saw
+/// when its `go` ran: a task sees its surroundings by value ([E-CONCURRENT]).
+fn go(inout cx: Cx, e: i64) -> Value {
+    if cx.go_bodies.is_empty() {
+        panic("`go` outside a `concurrent` block")
+    }
+    let top = cx.go_bodies.len() - 1
+    cx.go_bodies[top].push(kid(cx, e, 0))
+    cx.go_frames[top].push(VList(cx.fr))
+    VUnit
+}
+
+fn concurrent_block(inout cx: Cx, e: i64) -> Value {
+    cx.go_bodies.push([])
+    cx.go_frames.push([])
+    ev(cx, kid(cx, e, 0))
+    let bodies = cx.go_bodies.pop() ?? []
+    let frames = cx.go_frames.pop() ?? []
+    if cx.ctl != 0 or bodies.is_empty() {
+        return VUnit
+    }
+    run_tasks(cx, bodies, frames)
+    VUnit
+}
+
+/// The shared slab, as it is handed from task to task.
+type Slab = { slab: [Value], gens: [i64], live: [bool], free: [i64] }
+
+fn slab_out(inout cx: Cx) -> Slab {
+    let s = Slab{ slab: cx.slab, gens: cx.gens, live: cx.live, free: cx.free }
+    cx.slab = []
+    cx.gens = []
+    cx.live = []
+    cx.free = []
+    s
+}
+
+fn slab_in(inout cx: Cx, s: Slab) {
+    cx.slab = s.slab
+    cx.gens = s.gens
+    cx.live = s.live
+    cx.free = s.free
+}
+
+/// Before a channel operation that may wait: a task puts the slab back for
+/// whichever runs next.
+pub fn park_slab(inout cx: Cx) {
+    if not cx.baton.is_empty() {
+        chan_send(cx.baton[0], slab_out(cx))
+    }
+}
+
+/// After it: the slab is taken back, from whoever had it last.
+pub fn take_slab(inout cx: Cx) {
+    if not cx.baton.is_empty() {
+        match chan_recv(cx.baton[0]) {
+            Some(s) -> slab_in(cx, s)
+            None -> ()
+        }
+    }
+}
+
+fn run_tasks(inout cx: Cx, bodies: [i64], frames: [Value]) {
+    let baton: Chan[Slab] = chan_new(1)
+    chan_send(baton, slab_out(cx))
+    let outcomes: Chan[Value] = chan_new(bodies.len())
+    let base = cx
+    concurrent {
+        for i in 0..bodies.len() {
+            go {
+                var mine = base
+                mine.fr = value.list_of(frames[i])
+                mine.baton = [baton]
+                take_slab(mine)
+                ev(mine, bodies[i])
+                // A `return` ends the task; an error leaves the block
+                // through it, as the reference's `run_tasks` has it.
+                let outcome = if mine.ctl == CTL_ERR { VErr(mine.carry) } else { VUnit }
+                park_slab(mine)
+                chan_send(outcomes, outcome)
+            }
+        }
+    }
+    match chan_recv(baton) {
+        Some(s) -> slab_in(cx, s)
+        None -> ()
+    }
+    for _ in 0..bodies.len() {
+        match chan_recv(outcomes) {
+            Some(VErr(x)) -> if cx.ctl == 0 {
+                cx.ctl = CTL_ERR
+                cx.carry = x
+            }
+            _ -> ()
+        }
+    }
+}

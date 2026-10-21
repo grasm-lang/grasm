@@ -1,0 +1,99 @@
+// `tirinterp` -- the TIR interpreter (docs/self-hosting.md, stage S0).
+//
+//     tirinterp <program.tir> [-- args...]    runs the program's `main`
+//     tirinterp --print <in.tir> <out.tir>     reads and writes the TIR back
+//
+// It runs a program from its TIR alone, and is held to print and exit
+// exactly as `grasm run` does (`scripts/tirinterp.sh`): that is what shows
+// TIR carries the whole meaning of a program.
+import sexp
+import load
+import eval
+import value
+
+fn usage() {
+    eprint("usage: tirinterp <program.tir> [-- args...]")
+    eprint("       tirinterp --print <in.tir> <out.tir>")
+    exit(2)
+}
+
+fn read_tree(path: str) -> Tree {
+    match read_bytes(path) {
+        Ok(src) -> match sexp.read(src) {
+            Ok(t) -> t
+            Err(msg) -> {
+                eprint("tirinterp: {path}: {msg}")
+                exit(2)
+                sexp.new_tree()
+            }
+        }
+        Err(e) -> {
+            eprint("tirinterp: cannot read {path}: {e}")
+            exit(2)
+            sexp.new_tree()
+        }
+    }
+}
+
+fn reprint(inp: str, outp: str) {
+    let t = read_tree(inp)
+    match write_file(outp, sexp.print_tree(t)) {
+        Ok(_) -> ()
+        Err(e) -> {
+            eprint("tirinterp: cannot write {outp}: {e}")
+            exit(2)
+        }
+    }
+}
+
+/// Runs `main` and leaves as `grasm run` does: an error reaching `main` is
+/// reported and exits 1 ([E-MAIN-ERR]); a panic has already ended the run
+/// with 101.
+fn run(path: str, prog_args: [str]) {
+    let t = read_tree(path)
+    match load.load(t) {
+        Ok(p) -> {
+            var cx = eval.new_cx(p, prog_args)
+            var none: [Value] = []
+            let r = eval.call_fn(cx, p.main_fn, none)
+            if cx.ctl == 4 {
+                eprint("error: unhandled error from main: {value.show(p, cx.carry)}")
+                exit(1)
+            }
+            match r {
+                VErr(x) -> {
+                    eprint("error: unhandled error from main: {value.show(p, x)}")
+                    exit(1)
+                }
+                _ -> ()
+            }
+        }
+        Err(problems) -> {
+            for m in problems {
+                eprint("tirinterp: {path}: {m}")
+            }
+            exit(3)
+        }
+    }
+}
+
+fn main() {
+    let a = args()
+    if a.len() == 3 and a[0] == "--print" {
+        reprint(a[1], a[2])
+        return
+    }
+    if a.is_empty() or a[0].starts_with("-") {
+        usage()
+        return
+    }
+    var rest: [str] = []
+    if a.len() > 1 {
+        if a[1] != "--" {
+            usage()
+            return
+        }
+        rest = a.slice(2, a.len())
+    }
+    run(a[0], rest)
+}

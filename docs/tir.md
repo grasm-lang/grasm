@@ -92,7 +92,7 @@ fndef     = qualified name, generic names, bounds per generic, params, ret, err,
 param     = mode (let | inout | own), var id, type
 constdef  = qualified name, type, init expr
 externdef = name, params, ret
-effectdef = name, ops [(name, params, ret, err)]
+effectdef = name, ops [(name, params, ret)]   -- printed (op name (params) ret)
 impldef   = interface name, type (as written), generics, [(method name, fn id)]
 testdef   = name, params, body
 benchdef  = name, body
@@ -100,6 +100,10 @@ benchdef  = name, body
 
 `row` is the function's declared or inferred effect row as a sorted list of
 effect names.
+
+An effect operation has no separate error type: one declared `! E` has the
+return type `T ! E`, so its `ret` is printed `(fallible T E)` and an
+`effectop` node's type says the same.
 
 ## 5. Variables
 
@@ -168,7 +172,7 @@ generic is instantiated with, through the program's `impl` table.
 field expr index          -- struct field, by position (also through a `ref`)
 tuplefield expr index
 deref expr                -- `.value` of a `ref` to anything but a struct or tuple
-index expr expr           -- list, map, str or bytes: the receiver's type says which
+index expr expr           -- a list element; nothing else can be indexed
 range expr expr inclusive
 ```
 
@@ -218,10 +222,13 @@ parallel concurrent proved block | spawn concurrent block
 with effect handler block
 ```
 
-`iter` records what is iterated (a range, a list, a map's keys, a string's
-characters, bytes) by the iterable's type. `place` is a local, a field
-path, or an index path rooted at a local. `proved` is the checker's
-[E-SPAWN-ORDER] verdict that a `parallel` block's tasks are independent.
+`iter` records what is iterated, by the iterable's type: `range`, `list`,
+`str` (its characters) or `bytes`. A map is walked through a list such as
+`m.keys()`. Only `range` and `list` occur in the corpus, so the `str` and
+`bytes` kinds are unexercised: nothing has run them from TIR. `place` is a
+local, a field path, or an index path rooted at a local. `proved` is the
+checker's [E-SPAWN-ORDER] verdict that a `parallel` block's tasks are
+independent.
 
 ```
 pattern = pwild | pint v | pbool b | pstr s | pbind var
@@ -264,3 +271,13 @@ emit with none.
 S0 in progress. The Rust emitter lives in `crates/grasm_tir`; the checker
 records the decisions it makes (name resolution, call and method targets,
 type arguments) in tables for it, so no resolution is done twice.
+
+The TIR interpreter is `tools/tirinterp`, written in Grasm and built
+natively. It reads the text form with its own reader and runs `main` from
+the TIR alone, and `scripts/tirinterp.sh` holds it to `grasm run`: every
+corpus program that emits TIR must read and print back to the same bytes,
+and every program with a `main` must print and exit as the reference does.
+The one rule that skips a program is a declared `extern fn`, which an
+interpreter written in Grasm cannot call (Grasm has no function pointers,
+docs/self-hosting.md §5). No program in the corpus needed anything the TIR
+does not say.

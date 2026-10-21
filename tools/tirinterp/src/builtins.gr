@@ -1,0 +1,1893 @@
+// The built-in functions and methods (`builtin` and `method` nodes).
+//
+// Wherever the host language has the same operation it is used directly:
+// this interpreter runs on the real thing, so `s.to_upper()` is the host's
+// `to_upper` and an `IoError` is the host's, renamed into the program's own
+// prelude type. What is written out here is what the reference interpreter
+// decides for itself -- the higher-order methods, which call back into the
+// program, and every panic message the reference words in its own way.
+import eval
+import load
+import value
+
+/// The largest string or buffer the reference will build (`MAX_ALLOC`).
+let MAX_ALLOC = 8589934592
+
+pub fn builtin_names() -> [str] {
+    [
+        "print",
+        "fail",
+        "bytes_of",
+        "args",
+        "assert_eq",
+        "panic",
+        "ref",
+        "read_bytes",
+        "assert",
+        "map",
+        "bytes_filled",
+        "write_bytes",
+        "release",
+        "alive",
+        "net_close",
+        "read_file",
+        "file_exists",
+        "make_dir",
+        "pi",
+        "net_port",
+        "net_wait",
+        "tcp_connect",
+        "tcp_accept",
+        "sync_file",
+        "tcp_listen",
+        "remove_file",
+        "tcp_write",
+        "tcp_write_bytes",
+        "tcp_read_bytes",
+        "rename_file",
+        "tcp_read",
+        "write_file",
+        "Ok",
+        "list_dir",
+        "file_size",
+        "random_bytes",
+        "Err",
+        "now_millis",
+        "append_bytes",
+        "env",
+        "read_bytes_at",
+        "eprint",
+        "chan_send",
+        "chan_recv",
+        "monotonic_millis",
+        "chan_new",
+        "exit",
+        "udp_bind",
+        "udp_send",
+        "udp_recv",
+        "input",
+        "chan_close",
+        "tcp_listen_on",
+        "udp_recv_from",
+        "make_dir_new",
+        "chan_select",
+        "e",
+        "sleep_millis",
+        "tcp_peer",
+        "monotonic_nanos",
+        "net_workers",
+        "proc_run",
+        "proc_pipeline",
+        "str_builder",
+        "byte_builder",
+    ]
+}
+
+pub fn method_names() -> [str] {
+    [
+        "len",
+        "push",
+        "substr",
+        "at",
+        "to_bytes",
+        "chars",
+        "bit_and",
+        "split",
+        "to_str",
+        "parse_int",
+        "bit_or",
+        "ushr",
+        "join",
+        "shl",
+        "starts_with",
+        "ends_with",
+        "to_list",
+        "slice",
+        "bit_xor",
+        "index_of",
+        "to_lower",
+        "parse_int_base",
+        "contains",
+        "codes",
+        "as_f64",
+        "trim",
+        "replace",
+        "to_char",
+        "set",
+        "to_upper",
+        "pop",
+        "get",
+        "as_i64",
+        "bit_not",
+        "map",
+        "is_empty",
+        "code_at",
+        "repeat",
+        "parse_float",
+        "rev",
+        "shr",
+        "min",
+        "sort",
+        "abs",
+        "to_base",
+        "filter",
+        "sort_by",
+        "to_bits",
+        "pad_start",
+        "concat",
+        "max",
+        "has",
+        "from_bits",
+        "is_none",
+        "is_some",
+        "sqrt",
+        "floor",
+        "all",
+        "any",
+        "pad_end",
+        "sin",
+        "exp",
+        "ln",
+        "byte_len",
+        "lines",
+        "cos",
+        "keys",
+        "sum",
+        "round",
+        "unwrap_or",
+        "is_nan",
+        "delete",
+        "words",
+        "entries",
+        "remove",
+        "is_finite",
+        "trim_end",
+        "ceil",
+        "fold",
+        "par_map",
+        "first",
+        "copy_from",
+        "values",
+        "find",
+        "enumerate",
+        "to_fixed",
+        "trim_start",
+        "tan",
+        "atan",
+        "atan2",
+        "log10",
+        "par_filter",
+        "zip",
+        "hypot",
+        "acos",
+        "tanh",
+        "last",
+        "log2",
+        "cmp",
+        "asin",
+        "sinh",
+        "cbrt",
+        "cosh",
+        "fill",
+        "log",
+        "to_radians",
+        "to_degrees",
+        "expect",
+        "as_i8",
+        "as_i16",
+        "as_i32",
+        "as_u8",
+        "as_u16",
+        "as_u32",
+        "try_i8",
+        "try_i16",
+        "try_i32",
+        "try_u8",
+        "try_u16",
+        "try_u32",
+        "checked_add",
+        "checked_sub",
+        "checked_mul",
+        "saturating_add",
+        "saturating_sub",
+        "saturating_mul",
+        "try_i64",
+        "as_u64",
+        "try_u64",
+        "parse_u64",
+        "parse_u64_base",
+        "rotate_left",
+        "rotate_right",
+        "count_ones",
+        "leading_zeros",
+        "trailing_zeros",
+        "swap_bytes",
+        "push_str",
+        "push_byte",
+        "push_bytes",
+    ]
+}
+
+// ----- unpacking arguments ----------------------------------------------------------
+
+fn int_of(v: Value) -> i64 {
+    match v {
+        VInt(n) -> n
+        _ -> 0
+    }
+}
+
+fn float_of(v: Value) -> f64 {
+    match v {
+        VFloat(f) -> f
+        VInt(n) -> n.as_f64()
+        _ -> 0.0
+    }
+}
+
+fn str_of(p: Prog, v: Value) -> str {
+    match v {
+        VStr(s) -> s
+        _ -> value.show(p, v)
+    }
+}
+
+fn ints_of(v: Value) -> [i64] {
+    var out: [i64] = []
+    for x in value.list_of(v) {
+        out.push(int_of(x))
+    }
+    out
+}
+
+fn strs_of(p: Prog, v: Value) -> [str] {
+    var out: [str] = []
+    for x in value.list_of(v) {
+        out.push(str_of(p, x))
+    }
+    out
+}
+
+fn str_list(xs: [str]) -> Value {
+    var out: [Value] = []
+    for x in xs {
+        out.push(VStr(x))
+    }
+    VList(out)
+}
+
+fn int_list(xs: [i64]) -> Value {
+    var out: [Value] = []
+    for x in xs {
+        out.push(VInt(x))
+    }
+    VList(out)
+}
+
+/// The host's `IoError`, as the program's own.
+fn io_err(p: Prog, e: IoError) -> Value {
+    match e {
+        NotFound(path) -> VErr(VVariant(p.ioerror_ty, variant_named(p, p.ioerror_ty, "NotFound"), [VStr(path)]))
+        IoFailed(msg) -> VErr(VVariant(p.ioerror_ty, variant_named(p, p.ioerror_ty, "IoFailed"), [VStr(msg)]))
+    }
+}
+
+/// The index of variant `name` of sum type `ty`, as the program declares it.
+fn variant_named(p: Prog, ty: i64, name: str) -> i64 {
+    let names = p.ty_variants[ty]
+    for i in 0..names.len() {
+        if names[i] == name {
+            return i
+        }
+    }
+    panic("tirinterp: the program's `{p.ty_name[ty]}` has no variant `{name}`")
+}
+
+fn byte_or_panic(n: i64, op: str) -> i64 {
+    if n < 0 or n > 255 {
+        panic("{n} is not a byte — {op} takes values in 0..255")
+    }
+    n
+}
+
+fn opt(p: Prog, o: Option[Value]) -> Value {
+    match o {
+        Some(v) -> value.some_v(p, v)
+        None -> value.none_v(p)
+    }
+}
+
+// ----- built-in functions -------------------------------------------------------------
+
+pub fn builtin(inout cx: Cx, e: i64) -> Value {
+    let code = cx.a[e]
+    var args: [Value] = []
+    if not eval.eval_kids(cx, e, 0, args) {
+        return VUnit
+    }
+    let p = cx.p
+    match code {
+        // print
+        1 -> {
+            print(value.show(p, args[0]))
+            VUnit
+        }
+        // fail
+        2 -> {
+            cx.ctl = eval.CTL_ERR
+            cx.carry = value.take(args[0])
+            VUnit
+        }
+        // bytes_of
+        3 -> {
+            let xs = ints_of(args[0])
+            for x in xs {
+                byte_or_panic(x, "bytes_of")
+            }
+            VBytes(bytes_of(xs))
+        }
+        // args
+        4 -> str_list(cx.args)
+        // assert_eq
+        5 -> {
+            if not value.equal(args[0], args[1]) {
+                panic("assertion failed: `{value.show(p, args[0])}` != `{value.show(p, args[1])}`")
+            }
+            VUnit
+        }
+        // panic
+        6 -> panic(value.show(p, args[0]))
+        // ref
+        7 -> new_ref(cx, value.take(args[0]))
+        // assert
+        9 -> {
+            if not eval.is_true(args[0]) {
+                panic("assertion failed")
+            }
+            VUnit
+        }
+        // map
+        10 -> value.empty_map()
+        // bytes_filled
+        11 -> {
+            let n = int_of(args[0])
+            if n < 0 {
+                panic("bytes_filled: a buffer cannot have {n} bytes")
+            }
+            if n > MAX_ALLOC {
+                panic("bytes_filled would need more memory than a buffer can hold ({n} bytes)")
+            }
+            VBytes(bytes_filled(n, byte_or_panic(int_of(args[1]), "bytes_filled")))
+        }
+        // release
+        13 -> {
+            release_ref(cx, args[0])
+            VUnit
+        }
+        // alive
+        14 -> match args[0] {
+            VRef(i, g) -> VBool(i < cx.slab.len() and cx.gens[i] == g and cx.live[i])
+            _ -> VBool(false)
+        }
+        // pi, e
+        19 -> VFloat(pi())
+        57 -> VFloat(euler())
+        // Ok, Err
+        33 -> VOk(value.take(args[0]))
+        37 -> VErr(value.take(args[0]))
+        // eprint
+        42 -> {
+            eprint(value.show(p, args[0]))
+            VUnit
+        }
+        // exit
+        47 -> {
+            exit(int_of(args[0]))
+            VUnit
+        }
+        // net_workers
+        61 -> run_net_workers(cx, args)
+        // str_builder, byte_builder: an empty one of each
+        64 -> VStrB(str_builder())
+        65 -> VByteB(byte_builder())
+        // chan_send, chan_recv, chan_new, chan_close, chan_select
+        43 -> channel(cx, code, args)
+        44 -> channel(cx, code, args)
+        46 -> channel(cx, code, args)
+        52 -> channel(cx, code, args)
+        56 -> channel(cx, code, args)
+        _ -> files(p, code, args, cx.s[e])
+    }
+}
+
+/// A channel is an integer naming one of the host's channels, as it is in
+/// the reference ([E-CHANNEL]). An operation that may wait puts the shared
+/// slab back first, since another task may run before it returns.
+fn channel(inout cx: Cx, code: i64, inout args: [Value]) -> Value {
+    if code == 46 {
+        let cap = if args.is_empty() { 0 } else { int_of(args[0]).max(0) }
+        let c: Chan[Value] = chan_new(cap)
+        cx.chans.push(c)
+        return VInt(cx.chans.len() - 1)
+    }
+    if code == 56 {
+        var cs: [Chan[Value]] = []
+        for x in value.list_of(args[0]) {
+            cs.push(chan_at(cx, x))
+        }
+        eval.park_slab(cx)
+        let i = chan_select(cs)
+        eval.take_slab(cx)
+        return VInt(i)
+    }
+    let c = chan_at(cx, args[0])
+    if code == 52 {
+        chan_close(c)
+        return VUnit
+    }
+    if code == 43 {
+        eval.park_slab(cx)
+        chan_send(c, value.take(args[1]))
+        eval.take_slab(cx)
+        return VUnit
+    }
+    eval.park_slab(cx)
+    let got = chan_recv(c)
+    eval.take_slab(cx)
+    opt(cx.p, got)
+}
+
+fn chan_at(cx: Cx, v: Value) -> Chan[Value] {
+    let i = int_of(v)
+    if i < 0 or i >= cx.chans.len() {
+        panic("not a channel")
+    }
+    cx.chans[i]
+}
+
+/// `ref(v)`: a slot in the slab, reusing the last one released
+/// (`interp.rs`, so a reference prints the same `ref#slot.gen`).
+fn new_ref(inout cx: Cx, v: Value) -> Value {
+    match cx.free.pop() {
+        Some(i) -> {
+            cx.slab[i] = v
+            cx.live[i] = true
+            VRef(i, cx.gens[i])
+        }
+        None -> {
+            let i = cx.slab.len()
+            cx.slab.push(v)
+            cx.gens.push(0)
+            cx.live.push(true)
+            VRef(i, 0)
+        }
+    }
+}
+
+/// `release(r)`: the slot is emptied and its generation moves on, so every
+/// reference to its old occupant is stale.
+fn release_ref(inout cx: Cx, r: Value) {
+    match r {
+        VRef(i, g) -> {
+            if i < cx.slab.len() and cx.gens[i] == g {
+                cx.slab[i] = VUnit
+                cx.live[i] = false
+                cx.gens[i] = g + 1
+                cx.free.push(i)
+            }
+        }
+        _ -> ()
+    }
+}
+
+/// `net_workers(n, f)`: `f(0)` ... `f(n - 1)` one after another, in index
+/// order, as `grasm run` does ([L-LIB-NET-WORKERS]).
+fn run_net_workers(inout cx: Cx, inout args: [Value]) -> Value {
+    let n = int_of(args[0])
+    if n > 256 {
+        panic("net_workers: at most 256 workers, asked for {n}")
+    }
+    var out: [Value] = []
+    for i in 0..n.max(0) {
+        let v = eval.call1(cx, args[1], VInt(i))
+        if cx.ctl != 0 {
+            return VUnit
+        }
+        out.push(v)
+    }
+    VList(out)
+}
+
+/// The built-ins that reach the filesystem, the clock, the environment and
+/// other programs: each is the host's own.
+fn files(p: Prog, code: i64, args: [Value], name: str) -> Value {
+    match code {
+        // read_bytes
+        8 -> match read_bytes(str_of(p, args[0])) {
+            Ok(b) -> VOk(VBytes(b))
+            Err(x) -> io_err(p, x)
+        }
+        // write_bytes
+        12 -> unit_result(p, write_bytes(str_of(p, args[0]), value.bytes_of_value(args[1])))
+        // read_file
+        16 -> match read_file(str_of(p, args[0])) {
+            Ok(s) -> VOk(VStr(s))
+            Err(x) -> io_err(p, x)
+        }
+        // file_exists
+        17 -> VBool(file_exists(str_of(p, args[0])))
+        // make_dir
+        18 -> unit_result(p, make_dir(str_of(p, args[0])))
+        // sync_file
+        24 -> unit_result(p, sync_file(str_of(p, args[0])))
+        // remove_file
+        26 -> unit_result(p, remove_file(str_of(p, args[0])))
+        // rename_file
+        30 -> unit_result(p, rename_file(str_of(p, args[0]), str_of(p, args[1])))
+        // write_file
+        32 -> unit_result(p, write_file(str_of(p, args[0]), str_of(p, args[1])))
+        // list_dir
+        34 -> match list_dir(str_of(p, args[0])) {
+            Ok(names) -> VOk(str_list(names))
+            Err(x) -> io_err(p, x)
+        }
+        // file_size
+        35 -> int_result(p, file_size(str_of(p, args[0])))
+        // random_bytes
+        36 -> match random_bytes(int_of(args[0])) {
+            Ok(b) -> VOk(VBytes(b))
+            Err(x) -> io_err(p, x)
+        }
+        // now_millis
+        38 -> VInt(now_millis())
+        // append_bytes
+        39 -> unit_result(p, append_bytes(str_of(p, args[0]), value.bytes_of_value(args[1])))
+        // env
+        40 -> match env(str_of(p, args[0])) {
+            Some(v) -> value.some_v(p, VStr(v))
+            None -> value.none_v(p)
+        }
+        // read_bytes_at
+        41 -> match read_bytes_at(str_of(p, args[0]), int_of(args[1]), int_of(args[2])) {
+            Ok(b) -> VOk(VBytes(b))
+            Err(x) -> io_err(p, x)
+        }
+        // monotonic_millis
+        45 -> VInt(monotonic_millis())
+        // input
+        51 -> VStr(input())
+        // make_dir_new
+        55 -> unit_result(p, make_dir_new(str_of(p, args[0])))
+        // sleep_millis
+        58 -> {
+            sleep_millis(int_of(args[0]))
+            VUnit
+        }
+        // monotonic_nanos
+        60 -> VInt(monotonic_nanos())
+        // proc_run
+        62 -> proc_answer(p, proc_run(str_of(p, args[0]), strs_of(p, args[1])))
+        // proc_pipeline
+        63 -> {
+            var stages: [(str, [str])] = []
+            for st in value.list_of(args[0]) {
+                let parts = value.list_of(st)
+                stages.push((str_of(p, parts[0]), strs_of(p, parts[1])))
+            }
+            proc_answer(p, proc_pipeline(stages, str_of(p, args[1])))
+        }
+        _ -> network(p, code, args, name)
+    }
+}
+
+/// The `net` built-ins: handles are the host's own.
+fn network(p: Prog, code: i64, args: [Value], name: str) -> Value {
+    match code {
+        // net_close
+        15 -> {
+            net_close(int_of(args[0]))
+            VUnit
+        }
+        // net_port
+        20 -> int_result(p, net_port(int_of(args[0])))
+        // net_wait
+        21 -> match net_wait(ints_of(args[0]), int_of(args[1])) {
+            Ok(hs) -> VOk(int_list(hs))
+            Err(x) -> io_err(p, x)
+        }
+        // tcp_connect
+        22 -> int_result(p, tcp_connect(str_of(p, args[0]), int_of(args[1])))
+        // tcp_accept
+        23 -> int_result(p, tcp_accept(int_of(args[0])))
+        // tcp_listen
+        25 -> int_result(p, tcp_listen(int_of(args[0])))
+        // tcp_write
+        27 -> unit_result(p, tcp_write(int_of(args[0]), str_of(p, args[1])))
+        // tcp_write_bytes
+        28 -> unit_result(p, tcp_write_bytes(int_of(args[0]), value.bytes_of_value(args[1])))
+        // tcp_read_bytes
+        29 -> match tcp_read_bytes(int_of(args[0])) {
+            Ok(b) -> VOk(VBytes(b))
+            Err(x) -> io_err(p, x)
+        }
+        // tcp_read
+        31 -> match tcp_read(int_of(args[0])) {
+            Ok(s) -> VOk(VStr(s))
+            Err(x) -> io_err(p, x)
+        }
+        // udp_bind
+        48 -> int_result(p, udp_bind(int_of(args[0])))
+        // udp_send
+        49 -> int_result(
+            p,
+            udp_send(int_of(args[0]), str_of(p, args[1]), int_of(args[2]), value.bytes_of_value(args[3])),
+        )
+        // udp_recv
+        50 -> match udp_recv(int_of(args[0])) {
+            Ok(b) -> VOk(VBytes(b))
+            Err(x) -> io_err(p, x)
+        }
+        // tcp_listen_on
+        53 -> int_result(p, tcp_listen_on(str_of(p, args[0]), int_of(args[1])))
+        // udp_recv_from
+        54 -> match udp_recv_from(int_of(args[0])) {
+            Ok(t) -> {
+                let (b, host, port) = t
+                VOk(VTuple([VBytes(b), VStr(host), VInt(port)]))
+            }
+            Err(x) -> io_err(p, x)
+        }
+        // tcp_peer
+        59 -> match tcp_peer(int_of(args[0])) {
+            Ok(t) -> {
+                let (host, port) = t
+                VOk(VTuple([VStr(host), VInt(port)]))
+            }
+            Err(x) -> io_err(p, x)
+        }
+        _ -> panic("tirinterp: the built-in `{name}` is not supported")
+    }
+}
+
+/// Euler's number, `std::f64::consts::E`. Written out: inside `builtin`
+/// the name `e` is a node, and the native backend cannot call the built-in
+/// `e` from here.
+fn euler() -> f64 {
+    2.718281828459045
+}
+
+fn unit_result(p: Prog, r: () ! IoError) -> Value {
+    match r {
+        Ok(_) -> VOk(VUnit)
+        Err(x) -> io_err(p, x)
+    }
+}
+
+fn int_result(p: Prog, r: i64 ! IoError) -> Value {
+    match r {
+        Ok(n) -> VOk(VInt(n))
+        Err(x) -> io_err(p, x)
+    }
+}
+
+fn proc_answer(p: Prog, r: (i64, str, str) ! IoError) -> Value {
+    match r {
+        Ok(t) -> {
+            let (code, out, err) = t
+            VOk(VTuple([VInt(code), VStr(out), VStr(err)]))
+        }
+        Err(x) -> io_err(p, x)
+    }
+}
+
+// ----- methods ---------------------------------------------------------------------------
+
+/// Whether method `code` writes its receiver: `push pop sort sort_by
+/// remove set delete fill copy_from push_str push_byte push_bytes`.
+fn mutates(code: i64) -> bool {
+    code == 2 or code == 31 or code == 43 or code == 47 or code == 75 or code == 29 or code == 72 or code == 104 or code == 82 or (code >= 138 and code <= 140)
+}
+
+pub fn method(inout cx: Cx, e: i64) -> Value {
+    let code = cx.a[e]
+    if mutates(code) {
+        return mutate(cx, e, code)
+    }
+    let recv = eval.ev(cx, eval.kid(cx, e, 0))
+    if cx.ctl != 0 {
+        return VUnit
+    }
+    // `unwrap_or` and `expect` evaluate their argument only when it is
+    // needed.
+    if code == 70 or code == 108 {
+        match recv {
+            VVariant(ty, idx, fs) -> if ty == cx.p.option_ty and idx == cx.p.some_idx {
+                return fs[0]
+            }
+            _ -> ()
+        }
+        let d = eval.ev(cx, eval.kid(cx, e, 1))
+        if cx.ctl != 0 {
+            return VUnit
+        }
+        if code == 108 {
+            panic(value.show(cx.p, d))
+        }
+        return d
+    }
+    var args: [Value] = []
+    if not eval.eval_kids(cx, e, 1, args) {
+        return VUnit
+    }
+    let r = apply_method(cx, e, code, recv, args)
+    eval.narrowed(cx.b[e], r)
+}
+
+/// A method that writes its receiver. When the receiver is a place its
+/// value is taken out, changed where it lies and put back
+/// (`try_mutating_method`); otherwise a temporary is changed.
+fn mutate(inout cx: Cx, e: i64, code: i64) -> Value {
+    let recv_node = eval.kid(cx, e, 0)
+    // The commonest receiver, a plain local, needs no path.
+    if cx.op[recv_node] == load.OP_LOCAL {
+        var args: [Value] = []
+        if not eval.eval_kids(cx, e, 1, args) {
+            return VUnit
+        }
+        let slot = cx.a[recv_node]
+        var cur = eval.take_local(cx, slot)
+        let r = mutate_value(cx, code, cur, args)
+        cx.fr[slot] = cur
+        return r
+    }
+    let path = eval.expr_path(cx, recv_node)
+    if path[0] == -2 {
+        return VUnit
+    }
+    var args: [Value] = []
+    var cur = VUnit
+    if path[0] == -1 {
+        cur = eval.ev(cx, recv_node)
+        if cx.ctl != 0 {
+            return VUnit
+        }
+        if not eval.eval_kids(cx, e, 1, args) {
+            return VUnit
+        }
+    } else {
+        if not eval.eval_kids(cx, e, 1, args) {
+            return VUnit
+        }
+        cur = eval.swap_path(cx, path, VUnit)
+    }
+    let r = mutate_value(cx, code, cur, args)
+    if path[0] >= 0 {
+        eval.swap_path(cx, path, cur)
+    }
+    r
+}
+
+/// Changes `cur` in place. Its shape is decided before anything is taken
+/// out of it: a `match` holds its scrutinee for the length of the arm, so a
+/// container taken inside an arm matching on it is shared, and the write
+/// copies it -- which made `xs.push(v)` in a loop quadratic.
+fn mutate_value(inout cx: Cx, code: i64, inout cur: Value, inout args: [Value]) -> Value {
+    let p = cx.p
+    let shape = value.shape(cur)
+    if shape == 1 {
+        var xs = value.list_of(value.take(cur))
+        let r = list_mutation(cx, code, xs, args)
+        cur = VList(xs)
+        return r
+    }
+    if shape == 2 {
+        let k = args[0]
+        if code == 29 {
+            eval.map_set(p, cur, k, value.take(args[1]))
+            return VUnit
+        }
+        if code == 72 {
+            return VBool(map_delete(p, cur, k))
+        }
+    }
+    if shape == 3 {
+        var b = value.bytes_of_value(value.take(cur))
+        let r = bytes_mutation(code, b, args)
+        cur = VBytes(b)
+        return r
+    }
+    // A builder appends where it lies when it is held once, and copies
+    // first when another value holds it ([L-LIB-BUILDER]).
+    if shape == 5 and code == 138 {
+        var sb = str_builder_of(value.take(cur))
+        sb.push_str(str_of(p, args[0]))
+        cur = VStrB(sb)
+        return VUnit
+    }
+    if shape == 6 {
+        var bb = byte_builder_of(value.take(cur))
+        byte_builder_mutation(code, bb, args)
+        cur = VByteB(bb)
+        return VUnit
+    }
+    panic("no method `{method_names()[code - 1]}` on `{value.show(p, cur)}`")
+}
+
+fn list_mutation(inout cx: Cx, code: i64, inout xs: [Value], inout args: [Value]) -> Value {
+    let p = cx.p
+    match code {
+        // push
+        2 -> {
+            xs.push(value.take(args[0]))
+            VUnit
+        }
+        // pop
+        31 -> match xs.pop() {
+            Some(v) -> value.some_v(p, v)
+            None -> value.none_v(p)
+        }
+        // sort
+        43 -> {
+            xs = value.sort_values(xs)
+            VUnit
+        }
+        // sort_by: a key per element, then a stable sort by the keys.
+        47 -> {
+            var keys: [Value] = []
+            for x in xs {
+                let k = eval.call1(cx, args[0], x)
+                if cx.ctl != 0 {
+                    return VUnit
+                }
+                keys.push(k)
+            }
+            let order = value.sort_order(keys)
+            var sorted: [Value] = []
+            for i in order {
+                sorted.push(xs[i])
+            }
+            xs = sorted
+            VUnit
+        }
+        // remove
+        75 -> {
+            let i = int_of(args[0])
+            let n = xs.len()
+            if i < 0 or i >= n {
+                panic("remove {i} out of bounds (len {n})")
+            }
+            xs.remove(i)
+        }
+        _ -> panic("no method `{method_names()[code - 1]}` on a list")
+    }
+}
+
+fn bytes_mutation(code: i64, inout b: bytes, inout args: [Value]) -> Value {
+    match code {
+        // set
+        29 -> {
+            let i = int_of(args[0])
+            if i < 0 or i >= b.len() {
+                panic("index {i} out of bounds (len {b.len()})")
+            }
+            b.set(i, byte_or_panic(int_of(args[1]), "set"))
+        }
+        // fill
+        104 -> b.fill(byte_or_panic(int_of(args[0]), "fill"))
+        // copy_from
+        82 -> {
+            let at = int_of(args[0])
+            let src = value.bytes_of_value(args[1])
+            let m = src.len()
+            let n = b.len()
+            if at < 0 or at > n or at + m > n {
+                panic("copy_from writes {m} bytes at {at}, past the end (len {n})")
+            }
+            b.copy_from(at, src)
+        }
+        _ -> panic("no method `{method_names()[code - 1]}` on bytes")
+    }
+    VUnit
+}
+
+fn str_builder_of(v: Value) -> StrBuilder {
+    match v {
+        VStrB(b) -> b
+        _ -> str_builder()
+    }
+}
+
+fn byte_builder_of(v: Value) -> ByteBuilder {
+    match v {
+        VByteB(b) -> b
+        _ -> byte_builder()
+    }
+}
+
+fn byte_builder_mutation(code: i64, inout b: ByteBuilder, inout args: [Value]) {
+    match code {
+        // push_str: its UTF-8
+        138 -> b.push_str(match args[0] {
+            VStr(s) -> s
+            _ -> ""
+        })
+        // push_byte
+        139 -> b.push_byte(byte_or_panic(int_of(args[0]), "push_byte"))
+        // push_bytes
+        140 -> b.push_bytes(value.bytes_of_value(args[0]))
+        // set
+        29 -> {
+            let i = int_of(args[0])
+            if i < 0 or i >= b.len() {
+                panic("index {i} out of bounds (len {b.len()})")
+            }
+            b.set(i, byte_or_panic(int_of(args[1]), "set"))
+        }
+        _ -> panic("no method `{method_names()[code - 1]}` on a ByteBuilder")
+    }
+}
+
+fn map_delete(p: Prog, inout m: Value, k: Value) -> bool {
+    var whole = value.take(m)
+    match k {
+        VStr(s) -> {
+            var ks = eval.str_map(value.take(whole))
+            let had = ks.delete(s)
+            m = VMap(map(), map(), ks, map())
+            had
+        }
+        VInt(i) -> {
+            var ki = eval.int_map(value.take(whole))
+            let had = ki.delete(i)
+            m = VMap(map(), ki, map(), map())
+            had
+        }
+        VBool(b) -> {
+            var kb = eval.bool_map(value.take(whole))
+            let had = kb.delete(b)
+            m = VMap(kb, map(), map(), map())
+            had
+        }
+        VU64(u) -> {
+            var ku = eval.u64_map(value.take(whole))
+            let had = ku.delete(u)
+            m = VMap(map(), map(), map(), ku)
+            had
+        }
+        _ -> panic("invalid map key `{value.show(p, k)}`")
+    }
+}
+
+fn map_get(p: Prog, m: Value, k: Value) -> Option[Value] {
+    match m {
+        VMap(kb, ki, ks, ku) -> match k {
+            VStr(s) -> ks.get(s)
+            VInt(i) -> ki.get(i)
+            VBool(b) -> kb.get(b)
+            VU64(u) -> ku.get(u)
+            _ -> panic("invalid map key `{value.show(p, k)}`")
+        }
+        _ -> None
+    }
+}
+
+fn map_len(m: Value) -> i64 {
+    match m {
+        VMap(kb, ki, ks, ku) -> kb.len() + ki.len() + ks.len() + ku.len()
+        _ -> 0
+    }
+}
+
+/// `checked_` and `saturating_` arithmetic, exactly: the true result and
+/// whether it is outside `kind`'s range.
+fn exact(op: str, a: i64, b: i64, kind: i64) -> (i64, i64) {
+    // (value, -1 below / 0 inside / 1 above)
+    let r = if op == "add" { a + b } else if op == "sub" { a - b } else { a * b }
+    // Whether the i64 operation itself overflowed, and which way.
+    var over = 0
+    if op == "add" {
+        if a >= 0 and b >= 0 and r < 0 {
+            over = 1
+        } else if a < 0 and b < 0 and r >= 0 {
+            over = -1
+        }
+    } else if op == "sub" {
+        if a >= 0 and b < 0 and r < 0 {
+            over = 1
+        } else if a < 0 and b >= 0 and r >= 0 {
+            over = -1
+        }
+    } else if a != 0 and b != 0 {
+        let wrong = r / b != a or (a == -1 and b == -9223372036854775807 - 1) or (b == -1 and a == -9223372036854775807 - 1)
+        if wrong {
+            over = if (a < 0) == (b < 0) { 1 } else { -1 }
+        }
+    }
+    if over != 0 {
+        return (r, over)
+    }
+    let (lo, hi) = int_range(kind)
+    if r < lo {
+        return (r, -1)
+    }
+    if r > hi {
+        return (r, 1)
+    }
+    (r, 0)
+}
+
+fn int_range(kind: i64) -> (i64, i64) {
+    match kind {
+        1 -> (-128, 127)
+        2 -> (-32768, 32767)
+        3 -> (-2147483648, 2147483647)
+        4 -> (0, 255)
+        5 -> (0, 65535)
+        6 -> (0, 4294967295)
+        _ -> (-9223372036854775807 - 1, 9223372036854775807)
+    }
+}
+
+fn kind_named(name: str) -> i64 {
+    match name {
+        "i8" -> 1
+        "i16" -> 2
+        "i32" -> 3
+        "u8" -> 4
+        "u16" -> 5
+        "u32" -> 6
+        _ -> 0
+    }
+}
+
+fn fits(kind: i64, x: i64) -> bool {
+    let (lo, hi) = int_range(kind)
+    x >= lo and x <= hi
+}
+
+fn range_list(lo: i64, hi: i64, incl: bool) -> Value {
+    var out: [Value] = []
+    if incl {
+        if lo <= hi {
+            var i = lo
+            while true {
+                out.push(VInt(i))
+                if i == hi {
+                    break
+                }
+                i += 1
+            }
+        }
+    } else {
+        var i = lo
+        while i < hi {
+            out.push(VInt(i))
+            i += 1
+        }
+    }
+    VList(out)
+}
+
+fn apply_method(inout cx: Cx, e: i64, code: i64, recv: Value, inout args: [Value]) -> Value {
+    let p = cx.p
+    // A range answers the list methods by becoming its list first
+    // ([L-LIB-RANGE-OPS]).
+    match recv {
+        VRange(lo, hi, incl) -> {
+            if code == 17 or code == 35 or code == 46 or code == 68 or code == 1 {
+                let as_list = range_list(lo, hi, incl)
+                if code == 17 {
+                    return as_list
+                }
+                return apply_method(cx, e, code, as_list, args)
+            }
+        }
+        _ -> ()
+    }
+    match recv {
+        VStr(s) -> return str_method(cx, code, s, args)
+        VInt(n) -> return int_method(cx, e, code, n, args)
+        VList(xs) -> return list_method(cx, e, code, xs, args)
+        VFloat(x) -> return float_method(cx, code, x, args)
+        VBytes(b) -> return bytes_method(cx, code, b, args)
+        VU64(u) -> return u64_method(cx, code, u, args)
+        VStrB(b) -> return builder_method(code, b)
+        VByteB(b) -> return byte_builder_method(code, b, args)
+        VMap(_, _, _, _) -> {
+            match code {
+                // len
+                1 -> return VInt(map_len(recv))
+                // get
+                32 -> return opt(p, map_get(p, recv, args[0]))
+                // has
+                52 -> return VBool(map_get(p, recv, args[0]).is_some())
+                // is_empty
+                36 -> return VBool(map_len(recv) == 0)
+                // keys
+                67 -> return VList(value.map_keys(recv))
+                // values
+                83 -> return VList(value.map_values(recv))
+                // entries
+                74 -> {
+                    var out: [Value] = []
+                    let ks = value.map_keys(recv)
+                    let vs = value.map_values(recv)
+                    for i in 0..ks.len() {
+                        out.push(VTuple([ks[i], vs[i]]))
+                    }
+                    return VList(out)
+                }
+                _ -> ()
+            }
+        }
+        VVariant(ty, idx, _) -> {
+            // is_some / is_none
+            if code == 55 {
+                return VBool(ty == p.option_ty and idx == p.some_idx)
+            }
+            if code == 54 {
+                return VBool(ty == p.option_ty and idx == p.none_idx)
+            }
+        }
+        VTuple(_) -> {
+            // cmp
+            if code == 99 {
+                return VInt(value.compare(recv, args[0]))
+            }
+        }
+        _ -> ()
+    }
+    panic("no method `{method_names()[code - 1]}` on `{value.show(p, recv)}`")
+}
+
+fn str_method(inout cx: Cx, code: i64, s: str, inout args: [Value]) -> Value {
+    let p = cx.p
+    match code {
+        // len
+        1 -> VInt(s.len())
+        // substr
+        3 -> VStr(s.substr(int_of(args[0]), int_of(args[1])))
+        // to_bytes
+        5 -> VBytes(s.to_bytes())
+        // chars
+        6 -> str_list(s.chars())
+        // split
+        8 -> {
+            let sep = str_of(p, args[0])
+            if sep == "" {
+                str_list(s.chars())
+            } else {
+                str_list(s.split(sep))
+            }
+        }
+        // to_str
+        9 -> VStr(s)
+        // parse_int
+        10 -> match s.parse_int() {
+            Some(n) -> value.some_v(p, VInt(n))
+            None -> value.none_v(p)
+        }
+        // starts_with
+        15 -> VBool(s.starts_with(str_of(p, args[0])))
+        // ends_with
+        16 -> VBool(s.ends_with(str_of(p, args[0])))
+        // index_of
+        20 -> match s.index_of(str_of(p, args[0])) {
+            Some(n) -> value.some_v(p, VInt(n))
+            None -> value.none_v(p)
+        }
+        // to_lower
+        21 -> VStr(s.to_lower())
+        // parse_int_base
+        22 -> {
+            let base = int_of(args[0])
+            if base < 2 or base > 36 {
+                panic("parse_int_base takes a base in 2..36, not {base}")
+            }
+            match s.parse_int_base(base) {
+                Some(n) -> value.some_v(p, VInt(n))
+                None -> value.none_v(p)
+            }
+        }
+        // contains
+        23 -> VBool(s.contains(str_of(p, args[0])))
+        // codes
+        24 -> int_list(s.codes())
+        // trim
+        26 -> VStr(s.trim())
+        // replace
+        27 -> VStr(s.replace(str_of(p, args[0]), str_of(p, args[1])))
+        // to_upper
+        30 -> VStr(s.to_upper())
+        // is_empty
+        36 -> VBool(s.is_empty())
+        // code_at
+        37 -> {
+            let i = int_of(args[0])
+            let n = s.len()
+            if i < 0 or i >= n {
+                panic("code_at {i} out of bounds (len {n})")
+            }
+            VInt(s.code_at(i))
+        }
+        // repeat
+        38 -> {
+            let k = int_of(args[0])
+            if k < 0 {
+                panic("repeat count must be a non-negative int")
+            }
+            let bl = s.byte_len()
+            if bl > 0 and k > MAX_ALLOC / bl {
+                panic("repeat would need more memory than a string can hold ({k} copies)")
+            }
+            VStr(s.repeat(k))
+        }
+        // parse_u64, parse_u64_base: a `-` refused, even on zero ([T-U64])
+        130 -> opt_u64(p, s.parse_u64())
+        131 -> {
+            let base = int_of(args[0])
+            if base < 2 or base > 36 {
+                panic("parse_u64_base takes a base in 2..36, not {base}")
+            }
+            opt_u64(p, s.parse_u64_base(base))
+        }
+        // parse_float
+        39 -> match s.parse_float() {
+            Some(f) -> value.some_v(p, VFloat(f))
+            None -> value.none_v(p)
+        }
+        // cmp
+        99 -> VInt(value.compare(VStr(s), args[0]))
+        // pad_start / pad_end
+        49 -> VStr(pad(s, args, true))
+        60 -> VStr(pad(s, args, false))
+        // byte_len
+        64 -> VInt(s.byte_len())
+        // lines
+        65 -> str_list(s.lines())
+        // words
+        73 -> str_list(s.words())
+        // trim_end
+        77 -> VStr(s.trim_end())
+        // trim_start
+        87 -> VStr(s.trim_start())
+        _ -> panic("no method `{method_names()[code - 1]}` on `{s}`")
+    }
+}
+
+fn pad(s: str, args: [Value], at_start: bool) -> str {
+    let width = int_of(args[0]).max(0)
+    let fill = match args[1] {
+        VStr(f) -> f
+        _ -> ""
+    }
+    if fill == "" {
+        panic("pad fill must not be empty")
+    }
+    if width > MAX_ALLOC {
+        panic("pad width {width} is larger than a string can hold")
+    }
+    if at_start {
+        s.pad_start(width, fill)
+    } else {
+        s.pad_end(width, fill)
+    }
+}
+
+fn int_method(inout cx: Cx, e: i64, code: i64, n: i64, inout args: [Value]) -> Value {
+    let p = cx.p
+    let kind = p.c[e]
+    // The width conversions and the exact arithmetic ([L-LIB-INT-CONV]).
+    if code >= 109 and code <= 114 {
+        return VInt(eval.wrap(kind_named(method_names()[code - 1].substr(3, 3)), n))
+    }
+    if code >= 115 and code <= 120 {
+        let k = kind_named(method_names()[code - 1].substr(4, 3))
+        return if fits(k, n) { value.some_v(p, VInt(n)) } else { value.none_v(p) }
+    }
+    // try_i64: every narrower value fits; as_u64 its bits, read unsigned;
+    // try_u64 when it is not negative ([T-U64]).
+    if code == 127 {
+        return value.some_v(p, VInt(n))
+    }
+    if code == 128 {
+        return VU64(n.as_u64())
+    }
+    if code == 129 {
+        return if n >= 0 { value.some_v(p, VU64(n.as_u64())) } else { value.none_v(p) }
+    }
+    if code >= 132 and code <= 137 {
+        return bits_at_width(code, kind, n.as_u64(), args)
+    }
+    if code >= 121 and code <= 126 {
+        let name = method_names()[code - 1]
+        let op = name.substr(name.len() - 3, 3)
+        let (r, side) = exact(op, n, int_of(args[0]), kind)
+        if code <= 123 {
+            return if side == 0 { value.some_v(p, VInt(r)) } else { value.none_v(p) }
+        }
+        let (lo, hi) = int_range(kind)
+        return VInt(if side < 0 { lo } else if side > 0 { hi } else { r })
+    }
+    match code {
+        // bit_and
+        7 -> VInt(n.bit_and(int_of(args[0])))
+        // to_str
+        9 -> VStr("{n}")
+        // bit_or
+        11 -> VInt(n.bit_or(int_of(args[0])))
+        // ushr: the bits at the receiver's own width
+        12 -> {
+            let j = int_of(args[0])
+            if kind != 0 {
+                let (lo, hi) = int_range(kind)
+                let bits = if lo < 0 { n.bit_and(hi * 2 + 1) } else { n.bit_and(hi) }
+                VInt(eval.wrap(kind, bits.ushr(j.bit_and(63))))
+            } else {
+                VInt(n.ushr(j))
+            }
+        }
+        // shl
+        14 -> VInt(n.shl(int_of(args[0])))
+        // bit_xor
+        19 -> VInt(n.bit_xor(int_of(args[0])))
+        // as_f64
+        25 -> VFloat(n.as_f64())
+        // to_char
+        28 -> {
+            if n < 0 or n > 1114111 or (n >= 55296 and n <= 57343) {
+                panic("{n} is not a Unicode code point")
+            }
+            VStr(n.to_char())
+        }
+        // as_i64
+        33 -> VInt(n)
+        // bit_not
+        34 -> VInt(n.bit_not())
+        // shr
+        41 -> VInt(n.shr(int_of(args[0])))
+        // min / max
+        42 -> VInt(n.min(int_of(args[0])))
+        51 -> VInt(n.max(int_of(args[0])))
+        // abs
+        44 -> VInt(n.abs())
+        // to_base
+        45 -> {
+            let base = int_of(args[0])
+            if base < 2 or base > 36 {
+                panic("to_base takes a base in 2..36, not {base}")
+            }
+            VStr(n.to_base(base))
+        }
+        // from_bits
+        53 -> VFloat(n.from_bits())
+        // cmp
+        99 -> VInt(value.compare(VInt(n), args[0]))
+        _ -> panic("no method `{method_names()[code - 1]}` on `{n}`")
+    }
+}
+
+/// [L-LIB-BITS-WIDTH]: rotations, counts and byte swaps on the bits of an
+/// integer at its own width (`kind`, 0 for `i64`, 7 for `u64`), with Rust's
+/// answers; a signed width answers for its two's-complement bits.
+fn bits_at_width(code: i64, kind: i64, raw: u64, args: [Value]) -> Value {
+    let w = width_of(kind)
+    let all: u64 = 18446744073709551615
+    let mask = if w == 64 { all } else { all.ushr(64 - w) }
+    let x = raw.bit_and(mask)
+    if code == 134 {
+        return VInt(x.count_ones())
+    }
+    if code == 135 {
+        return VInt(x.leading_zeros() - (64 - w))
+    }
+    if code == 136 {
+        return VInt(if x == 0 { w } else { x.trailing_zeros() })
+    }
+    var out = x
+    if code == 137 {
+        out = if w == 8 {
+            x
+        } else if w == 16 {
+            x.bit_and(255).shl(8).bit_or(x.ushr(8))
+        } else if w == 32 {
+            x.swap_bytes().ushr(32)
+        } else {
+            x.swap_bytes()
+        }
+    } else {
+        // Modulo the width, as Rust's `rotate_left(n as u32)`: a negative
+        // count turns the other way.
+        var left = int_of(args[0]).bit_and(w - 1)
+        if code == 133 {
+            left = (w - left).bit_and(w - 1)
+        }
+        if left != 0 {
+            out = x.shl(left).bit_or(x.ushr(w - left)).bit_and(mask)
+        }
+    }
+    if kind == 7 {
+        return VU64(out)
+    }
+    VInt(eval.wrap(kind, out.as_i64()))
+}
+
+fn width_of(kind: i64) -> i64 {
+    match kind {
+        1 -> 8
+        4 -> 8
+        2 -> 16
+        5 -> 16
+        3 -> 32
+        6 -> 32
+        _ -> 64
+    }
+}
+
+fn u64_of(v: Value) -> u64 {
+    match v {
+        VU64(u) -> u
+        VInt(n) -> n.as_u64()
+        _ -> 0
+    }
+}
+
+/// The methods of a `u64` ([T-U64]): the host's own, on the host's `u64`.
+fn u64_method(inout cx: Cx, code: i64, u: u64, inout args: [Value]) -> Value {
+    let p = cx.p
+    // as_i8 .. as_u32: its bits, wrapped to the width
+    if code >= 109 and code <= 114 {
+        return VInt(eval.wrap(kind_named(method_names()[code - 1].substr(3, 3)), u.as_i64()))
+    }
+    // try_i8 .. try_u32, try_i64: when the number fits
+    if (code >= 115 and code <= 120) or code == 127 {
+        let k = if code == 127 { 0 } else { kind_named(method_names()[code - 1].substr(4, 3)) }
+        let fits_i64 = u.try_i64().is_some()
+        return if fits_i64 and fits(k, u.as_i64()) { value.some_v(p, VInt(u.as_i64())) } else { value.none_v(p) }
+    }
+    if code >= 132 and code <= 137 {
+        return bits_at_width(code, 7, u, args)
+    }
+    match code {
+        // to_str, as_f64, as_i64, as_u64, try_u64, abs, bit_not
+        9 -> VStr("{u}")
+        25 -> VFloat(u.as_f64())
+        33 -> VInt(u.as_i64())
+        128 -> VU64(u)
+        129 -> value.some_v(p, VU64(u))
+        44 -> VU64(u)
+        34 -> VU64(u.bit_not())
+        // bit_and, bit_or, bit_xor, min, max
+        7 -> VU64(u.bit_and(u64_of(args[0])))
+        11 -> VU64(u.bit_or(u64_of(args[0])))
+        19 -> VU64(u.bit_xor(u64_of(args[0])))
+        42 -> VU64(u.min(u64_of(args[0])))
+        51 -> VU64(u.max(u64_of(args[0])))
+        // shl; shr and ushr alike, since a `u64` has no sign to keep
+        14 -> VU64(u.shl(int_of(args[0])))
+        41 -> VU64(u.ushr(int_of(args[0])))
+        12 -> VU64(u.ushr(int_of(args[0])))
+        // to_base
+        45 -> {
+            let base = int_of(args[0])
+            if base < 2 or base > 36 {
+                panic("to_base takes a base in 2..36, not {base}")
+            }
+            VStr(u.to_base(base))
+        }
+        // to_char
+        28 -> {
+            let fits_i64 = u.try_i64().is_some()
+            let n = u.as_i64()
+            if not fits_i64 or n > 1114111 or (n >= 55296 and n <= 57343) {
+                panic("{u} is not a Unicode code point")
+            }
+            VStr(n.to_char())
+        }
+        // checked_add, _sub, _mul
+        121 -> opt_u64(p, u.checked_add(u64_of(args[0])))
+        122 -> opt_u64(p, u.checked_sub(u64_of(args[0])))
+        123 -> opt_u64(p, u.checked_mul(u64_of(args[0])))
+        // saturating_add, _sub, _mul
+        124 -> VU64(u.saturating_add(u64_of(args[0])))
+        125 -> VU64(u.saturating_sub(u64_of(args[0])))
+        126 -> VU64(u.saturating_mul(u64_of(args[0])))
+        // cmp
+        99 -> VInt(value.compare(VU64(u), args[0]))
+        _ -> panic("no method `{method_names()[code - 1]}` on `{u}`")
+    }
+}
+
+fn opt_u64(p: Prog, o: Option[u64]) -> Value {
+    match o {
+        Some(u) -> value.some_v(p, VU64(u))
+        None -> value.none_v(p)
+    }
+}
+
+/// What a `StrBuilder` answers without changing ([L-LIB-BUILDER]).
+fn builder_method(code: i64, b: StrBuilder) -> Value {
+    match code {
+        1 -> VInt(b.len())
+        36 -> VBool(b.is_empty())
+        9 -> VStr(b.to_str())
+        _ -> panic("no method `{method_names()[code - 1]}` on a StrBuilder")
+    }
+}
+
+/// What a `ByteBuilder` answers without changing.
+fn byte_builder_method(code: i64, b: ByteBuilder, args: [Value]) -> Value {
+    match code {
+        1 -> VInt(b.len())
+        36 -> VBool(b.is_empty())
+        // to_str is lossy, as `bytes.to_str` is
+        9 -> VStr(b.to_str())
+        5 -> VBytes(b.to_bytes())
+        4 -> {
+            let i = int_of(args[0])
+            if i < 0 or i >= b.len() {
+                panic("index {i} out of bounds (len {b.len()})")
+            }
+            VInt(b.at(i))
+        }
+        _ -> panic("no method `{method_names()[code - 1]}` on a ByteBuilder")
+    }
+}
+
+fn float_method(inout cx: Cx, code: i64, x: f64, inout args: [Value]) -> Value {
+    // as_u64: toward zero, held to `u64`'s range, NaN 0
+    if code == 128 {
+        return VU64(x.as_u64())
+    }
+    if code >= 109 and code <= 114 {
+        // Toward zero, held to the range; NaN is 0.
+        let k = kind_named(method_names()[code - 1].substr(3, 3))
+        let (lo, hi) = int_range(k)
+        if x.is_nan() {
+            return VInt(0)
+        }
+        let t = if x < 0.0 { (0.0 - x).floor() * -1.0 } else { x.floor() }
+        if t <= lo.as_f64() {
+            return VInt(lo)
+        }
+        if t >= hi.as_f64() {
+            return VInt(hi)
+        }
+        return VInt(t.as_i64())
+    }
+    match code {
+        // to_str
+        9 -> VStr("{x}")
+        // as_i64
+        33 -> VInt(x.as_i64())
+        // min / max
+        42 -> VFloat(x.min(float_of(args[0])))
+        51 -> VFloat(x.max(float_of(args[0])))
+        // abs
+        44 -> VFloat(x.abs())
+        // to_bits
+        48 -> VInt(x.to_bits())
+        // sqrt floor round ceil
+        56 -> VFloat(x.sqrt())
+        57 -> VFloat(x.floor())
+        69 -> VFloat(x.round())
+        78 -> VFloat(x.ceil())
+        // the transcendental functions
+        61 -> VFloat(x.sin())
+        62 -> VFloat(x.exp())
+        63 -> VFloat(x.ln())
+        66 -> VFloat(x.cos())
+        88 -> VFloat(x.tan())
+        89 -> VFloat(x.atan())
+        90 -> VFloat(x.atan2(float_of(args[0])))
+        91 -> VFloat(x.log10())
+        94 -> VFloat(x.hypot(float_of(args[0])))
+        95 -> VFloat(x.acos())
+        96 -> VFloat(x.tanh())
+        98 -> VFloat(x.log2())
+        100 -> VFloat(x.asin())
+        101 -> VFloat(x.sinh())
+        102 -> VFloat(x.cbrt())
+        103 -> VFloat(x.cosh())
+        105 -> VFloat(x.log(float_of(args[0])))
+        106 -> VFloat(x.to_radians())
+        107 -> VFloat(x.to_degrees())
+        // is_nan / is_finite
+        71 -> VBool(x.is_nan())
+        76 -> VBool(x.is_finite())
+        // to_fixed
+        86 -> {
+            let places = int_of(args[0])
+            if places < 0 or places > 17 {
+                panic("to_fixed({places}): places must be 0 to 17")
+            }
+            VStr(x.to_fixed(places))
+        }
+        // cmp
+        99 -> VInt(value.compare(VFloat(x), args[0]))
+        _ -> panic("no method `{method_names()[code - 1]}` on `{x}`")
+    }
+}
+
+fn bytes_method(inout cx: Cx, code: i64, b: bytes, inout args: [Value]) -> Value {
+    let p = cx.p
+    match code {
+        // len
+        1 -> VInt(b.len())
+        // at
+        4 -> {
+            let i = int_of(args[0])
+            if i < 0 or i >= b.len() {
+                panic("index {i} out of bounds (len {b.len()})")
+            }
+            VInt(b.at(i))
+        }
+        // to_str
+        9 -> VStr(b.to_str())
+        // to_list
+        17 -> int_list(b.to_list())
+        // slice
+        18 -> {
+            let from = int_of(args[0])
+            let end = int_of(args[1])
+            if from < 0 or end < from or end > b.len() {
+                panic("slice {from}..{end} out of bounds (len {b.len()})")
+            }
+            VBytes(b.slice(from, end))
+        }
+        // index_of
+        20 -> {
+            let byte = int_of(args[0])
+            let from = int_of(args[1])
+            if from < 0 or from > b.len() {
+                panic("index_of from {from} out of bounds (len {b.len()})")
+            }
+            if byte < 0 or byte > 255 {
+                return value.none_v(p)
+            }
+            match b.index_of(byte, from) {
+                Some(i) -> value.some_v(p, VInt(i))
+                None -> value.none_v(p)
+            }
+        }
+        // is_empty
+        36 -> VBool(b.is_empty())
+        // concat
+        50 -> VBytes(b.concat(value.bytes_of_value(args[0])))
+        _ -> panic("no method `{method_names()[code - 1]}` on `{value.show(p, VBytes(b))}`")
+    }
+}
+
+fn list_method(inout cx: Cx, e: i64, code: i64, xs: [Value], inout args: [Value]) -> Value {
+    let p = cx.p
+    match code {
+        // len
+        1 -> VInt(xs.len())
+        // join
+        13 -> {
+            var parts: [str] = []
+            for x in xs {
+                parts.push(value.show(p, x))
+            }
+            VStr(parts.join(str_of(p, args[0])))
+        }
+        // slice: clamps at both ends
+        18 -> {
+            let len = xs.len()
+            let s = int_of(args[0]).max(0).min(len)
+            let t = int_of(args[1]).max(0).min(len)
+            if s <= t {
+                VList(xs.slice(s, t))
+            } else {
+                VList([])
+            }
+        }
+        // contains
+        23 -> {
+            for x in xs {
+                if value.equal(x, args[0]) {
+                    return VBool(true)
+                }
+            }
+            VBool(false)
+        }
+        // get
+        32 -> {
+            let i = int_of(args[0])
+            if i >= 0 and i < xs.len() {
+                value.some_v(p, xs[i])
+            } else {
+                value.none_v(p)
+            }
+        }
+        // map / par_map: in order, on this thread ([E-PAR-MAP-ORDER])
+        35 -> list_map(cx, xs, args[0])
+        80 -> list_map(cx, xs, args[0])
+        // is_empty
+        36 -> VBool(xs.is_empty())
+        // rev
+        40 -> VList(xs.rev())
+        // min / max
+        42 -> list_best(p, xs, false)
+        51 -> list_best(p, xs, true)
+        // filter / par_filter
+        46 -> list_filter(cx, xs, args[0])
+        92 -> list_filter(cx, xs, args[0])
+        // all / any: stop at the deciding element ([E-SEARCH-SHORTCIRCUIT])
+        58 -> {
+            for x in xs {
+                let r = eval.call1(cx, args[0], x)
+                if cx.ctl != 0 {
+                    return VUnit
+                }
+                if not eval.is_true(r) {
+                    return VBool(false)
+                }
+            }
+            VBool(true)
+        }
+        59 -> {
+            for x in xs {
+                let r = eval.call1(cx, args[0], x)
+                if cx.ctl != 0 {
+                    return VUnit
+                }
+                if eval.is_true(r) {
+                    return VBool(true)
+                }
+            }
+            VBool(false)
+        }
+        // sum
+        68 -> list_sum(p, xs, p.c[e] == 100)
+        // enumerate
+        85 -> {
+            var out: [Value] = []
+            for i in 0..xs.len() {
+                out.push(VTuple([VInt(i), xs[i]]))
+            }
+            VList(out)
+        }
+        // fold
+        79 -> {
+            var acc = args[0]
+            for x in xs {
+                acc = eval.call2(cx, args[1], value.take(acc), x)
+                if cx.ctl != 0 {
+                    return VUnit
+                }
+            }
+            acc
+        }
+        // first / last
+        81 -> opt(p, xs.first())
+        97 -> opt(p, xs.last())
+        // find
+        84 -> {
+            for x in xs {
+                let r = eval.call1(cx, args[0], x)
+                if cx.ctl != 0 {
+                    return VUnit
+                }
+                if eval.is_true(r) {
+                    return value.some_v(p, x)
+                }
+            }
+            value.none_v(p)
+        }
+        // zip
+        93 -> {
+            let ys = value.list_of(args[0])
+            var out: [Value] = []
+            for i in 0..xs.len().min(ys.len()) {
+                out.push(VTuple([xs[i], ys[i]]))
+            }
+            VList(out)
+        }
+        _ -> panic("no method `{method_names()[code - 1]}` on a list")
+    }
+}
+
+fn list_map(inout cx: Cx, xs: [Value], f: Value) -> Value {
+    var out: [Value] = []
+    for x in xs {
+        let v = eval.call1(cx, f, x)
+        if cx.ctl != 0 {
+            return VUnit
+        }
+        out.push(v)
+    }
+    VList(out)
+}
+
+fn list_filter(inout cx: Cx, xs: [Value], f: Value) -> Value {
+    var out: [Value] = []
+    for x in xs {
+        let v = eval.call1(cx, f, x)
+        if cx.ctl != 0 {
+            return VUnit
+        }
+        if eval.is_true(v) {
+            out.push(x)
+        }
+    }
+    VList(out)
+}
+
+fn list_best(p: Prog, xs: [Value], want_max: bool) -> Value {
+    if xs.is_empty() {
+        return value.none_v(p)
+    }
+    var best = xs[0]
+    for i in 1..xs.len() {
+        let c = value.compare(xs[i], best)
+        if (want_max and c > 0) or (not want_max and c < 0) {
+            best = xs[i]
+        }
+    }
+    value.some_v(p, best)
+}
+
+/// `sum`: integers wrap; floats fold from the first element, so `-0.0`
+/// survives; an empty list is the zero the checker says the sum is
+/// ([L-LIB-SUM]).
+fn list_sum(p: Prog, xs: [Value], float_sum: bool) -> Value {
+    var int_sum = 0
+    var fsum = 0.0
+    var have_float = false
+    var is_float = false
+    var usum: u64 = 0
+    var have_u64 = false
+    for x in xs {
+        match x {
+            VInt(n) -> int_sum += n
+            VU64(u) -> {
+                usum = usum + u
+                have_u64 = true
+            }
+            VFloat(f) -> {
+                is_float = true
+                if have_float {
+                    fsum = fsum + f
+                } else {
+                    fsum = f
+                    have_float = true
+                }
+            }
+            _ -> panic("cannot sum `{value.show(p, x)}`")
+        }
+    }
+    if is_float or float_sum {
+        if have_float {
+            if int_sum == 0 {
+                return VFloat(fsum)
+            }
+            return VFloat(fsum + int_sum.as_f64())
+        }
+        return VFloat(int_sum.as_f64())
+    }
+    if have_u64 {
+        return VU64(usum)
+    }
+    VInt(int_sum)
+}
