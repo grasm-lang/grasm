@@ -49,6 +49,9 @@ mkdir -p "$LOGS"
 # What git did not track before the run, so the `litter` gate can tell what
 # the run itself left behind.
 git ls-files --others --exclude-standard | sort > "$LOGS/untracked-before.txt"
+# And what sits at the top of the checkout: git lists no empty directory,
+# and two conformance programs left two empty ones at the root for weeks.
+ls -A | sort > "$LOGS/top-before.txt"
 failed=0
 ran=0
 skipped=0
@@ -303,6 +306,14 @@ litter() {
     git ls-files --others --exclude-standard | sort > "$LOGS/untracked-after.txt"
     local new
     new=$(comm -13 "$LOGS/untracked-before.txt" "$LOGS/untracked-after.txt")
+    ls -A | sort > "$LOGS/top-after.txt"
+    local entry
+    for entry in $(comm -13 "$LOGS/top-before.txt" "$LOGS/top-after.txt"); do
+        # Ignored paths (target/, a build's cache) are allowed to appear.
+        git check-ignore -q "$entry" || new="$new
+$entry/"
+    done
+    new=$(printf '%s\n' "$new" | sed '/^$/d' | sort -u)
     if [ -n "$new" ]; then
         echo "files that appeared in the checkout during this run:"
         echo "$new" | sed 's/^/  /'

@@ -738,7 +738,10 @@ fn main() / {io} {
     print("text is {text.len()} characters and {text.to_bytes().len()} bytes")
     print("round trip: {text.to_bytes().to_str()}")
 
-    let dir = "grasm_bytes_conformance"
+    // Under `target/`, which git ignores: there is no way to remove a
+    // directory, so whatever this makes stays, and the gates run every
+    // conformance program from the repository root.
+    let dir = "target/grasm_bytes_conformance"
     let _mk = make_dir(dir) ?? ()
     let path = dir + "/code.bin"
     match write_bytes(path, code) {
@@ -1129,9 +1132,12 @@ fn main() {
 //! listing an absent directory reports NotFound
 // Files can be removed, and a directory can be read ([L-LIB-FS]).
 fn main() / {io} {
-    let dir = "grasm_fs_conformance"
-    // The program makes its own working directory, so it is self-contained and
-    // leaves nothing behind. `make_dir` succeeds if it already exists.
+    // Under `target/`, which git ignores: there is no way to remove a
+    // directory, so whatever this makes stays, and the gates run every
+    // conformance program from the repository root.
+    let dir = "target/grasm_fs_conformance"
+    // The program makes its own working directory, so it is self-contained.
+    // `make_dir` creates the whole path and succeeds if it already exists.
     let _mk = make_dir(dir) ?? ()
     // Written out of order on purpose: `list_dir` sorts, so the order below is
     // the sorted one and not the order the filesystem happens to hold.

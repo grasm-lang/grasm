@@ -32,7 +32,10 @@ fn main() / {io} {
     print("text is {text.len()} characters and {text.to_bytes().len()} bytes")
     print("round trip: {text.to_bytes().to_str()}")
 
-    let dir = "grasm_bytes_conformance"
+    // Under `target/`, which git ignores: there is no way to remove a
+    // directory, so whatever this makes stays, and the gates run every
+    // conformance program from the repository root.
+    let dir = "target/grasm_bytes_conformance"
     let _mk = make_dir(dir) ?? ()
     let path = dir + "/code.bin"
     match write_bytes(path, code) {
