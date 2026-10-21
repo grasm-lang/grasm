@@ -809,17 +809,33 @@ Decided 2026-10-20:
    systems subset (§5).
 5. **Linux** in S7.
 
-## 11. Starting now
+## 11. Where it stands (2026-10-21)
 
-S0 and S1 run in parallel. They depend on nothing else, and every later
-stage depends on them:
+Measured, not estimated; each line is a gate's result on master.
 
-- S0: TIR's specification; `--emit tir` in the Rust compiler; the TIR text
-  form and its round-trip test; the TIR interpreter in Grasm; the
-  `tirinterp` gate.
-- S1: `u64` and the bit intrinsics; the byte buffer and string builder;
-  then the address type, atomics, thread-locals and `export fn`, each with
-  its spec clause, both engines, conformance tests and a fuzz gate.
+- **S0 done.** TIR is specified (`docs/tir.md`) and `grasm tir` emits it
+  for 1,671 corpus files with no holes. The TIR interpreter in Grasm
+  (`tools/tirinterp`) prints and exits as `grasm run` does on all 651
+  corpus programs with a `main`, none skipped, and gives the same panic
+  on 25 sandbox-misuse programs.
+- **S1 done except the context switch.** `u64`, bit operations, the
+  builders, raw memory and atomics, function addresses, `call_c`,
+  `export fn`, thread-local cells and tuple map keys, each with spec
+  clauses, both engines, conformance tests, a fuzz gate and controls
+  (§5.1-§5.4). The context switch is deferred to S3/S5 (§5.5).
+- **S3 started.** `compiler/` holds an aarch64 backend in Grasm -- MIR,
+  rule-based selection, linear scan with a checker, an encoder checked
+  against `clang -c`, a Mach-O object writer -- on a subset: 37 of 648
+  corpus programs (scalars, control flow, calls, printing) build with it
+  and behave exactly as the Cranelift build. fib(35) is about 1.9x slower
+  than Cranelift's code. Heap values and RC, fallible functions,
+  closures, generics, effects, f64 and the rest of the corpus are S3
+  part two onward.
+- **Not started:** S2 (the frontend in Grasm), S4 (the linker), S5 (the
+  runtime in Grasm), S6 (self-compilation), S7-S9.
+
+Order from here follows the critical path S3 -> S4 -> S6, one stage at a
+time; S2 and S5 follow.
 
 ## References
 

@@ -65,6 +65,10 @@ migration note here; anything `experimental` may change in any release. See
   its own width, and **`StrBuilder` / `ByteBuilder`**, whose appends are
   amortised rather than copying ([T-U64], [L-LIB-BITS-WIDTH],
   [L-LIB-BUILDER]).
+- **An aarch64 backend written in Grasm** (`compiler/`, self-hosting stage
+  S3, part one): TIR to MIR to machine code to a Mach-O object, on a
+  subset of the language. 37 corpus programs build with it and behave as
+  the Cranelift build does. `grasm build` still uses Cranelift.
 - **Raw memory and atomics**, only inside `unsafe` and only in a package
   that declares the new `mem` capability: an `addr` type, allocation, typed
   loads and stores, and atomic load/store/compare-exchange/add with
