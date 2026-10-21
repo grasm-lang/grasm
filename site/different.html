@@ -121,9 +121,9 @@ stdout, exit code and diagnostics.</p>
 programs in the corpus run through the interpreter, the bundle and the native
 build and are compared on every build; the last recorded run of that gate
 covered 511 of them. 508 also run in the browser engine
-— 140 are skipped, because they want a filesystem, a socket, a
+— 143 are skipped, because they want a filesystem, a socket, a
 process or threads, and both figures are from a run on 21 October 2026 — and
-all 645 are compiled for x86_64, linked
+all 648 are compiled for x86_64, linked
 with <code>cc -arch x86_64</code> and <strong>run under Rosetta</strong>, which
 reaches code the arm64 build never does: <code>readdir$INODE64</code> exists
 only there, and x86_64 passes variadic arguments in registers where arm64 puts
