@@ -3,6 +3,7 @@
 //! effect name `io` is reserved by the language
 //! effect name `net` is reserved by the language
 //! effect name `proc` is reserved by the language
+//! effect name `mem` is reserved by the language
 // A capability the runtime discharges is not an effect a program handles.
 //
 // `io` and `async` are not keywords, so this parsed — and the
@@ -22,6 +23,10 @@ effect net {
 }
 
 effect proc {
+    fn ping() -> i64
+}
+
+effect mem {
     fn ping() -> i64
 }
 

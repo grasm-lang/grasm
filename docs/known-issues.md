@@ -327,6 +327,126 @@ of a defect inside the rule that closed it; the rules stay.
 > 400 000 appends take about 2.4 seconds. There is no string builder; collect the
 > pieces in a list and `join` them, which is linear.
 
+**And for raw memory and atomics, 2026-10-21.** [T-ADDR], [T-MEM-UNSAFE],
+[L-LIB-MEM], [L-LIB-ATOMIC] and [E-MEM-UNCHECKED], their stability entries
+and `mem` in [T-EFFECT-RESERVED] came to 70 lines. They were paid for
+by restating [T-FN-TYPE-ROW-CARRIED] and [T-FN-VALUE-ROW] as their rules alone:
+every rule in them is still there, and the accounts of what each one's absence
+did are here instead. 3,543 lines, 70 pages; nothing excluded from the count
+and the ceiling unmoved.
+
+> From [T-FN-TYPE-ROW-CARRIED], as it read:
+>
+> This needed saying because it was not true. The row lived only in the syntax
+> someone wrote and never in the type, so `fn(i64) -> i64` and
+> `fn(i64) -> i64 / {io}` were the same type here and nothing could compare them;
+> one hand-written check covered direct call arguments and nothing else. Every
+> other route dropped the row, which made each of them a way to hand a printing
+> function to a `/ {}` row, to `par_map` past [T-PAR-MAP-PURE], to the
+> missing-handler backstop [E-HANDLER-MISSING] says well-typed programs never
+> reach, and to a package declaring `capabilities = []`.
+>
+> That is the rule for a value *arriving* at a written type. Calling one that
+> arrived is the other half, and it was only carried by `let`. `let f = fs[0]`
+> charged `io` and `for f in fs` charged nothing — the same program, one keyword
+> apart — and so did a `match` payload, a tuple destructuring and a closure
+> parameter. Each of those is a `for` loop away from a printing function running
+> inside a `/ {}` function, on `par_map`'s workers, and in a package declaring
+> `capabilities = []`. A call through a local that no binder accounts for is
+> charged every row written in the *enclosing function's own signature* at a
+> position with no field name — its list elements, its tuple components, its
+> `Option` payloads. Scoped to that signature rather than to the program: the
+> wider pool charged `io` to a function whose own element type declares no
+> effects, on the strength of an unrelated declaration elsewhere in the file.
+>
+> And the pool is reached for only where nothing is known about the part. Where
+> every binding the expression reads has a written type, *those* types say what
+> came out: a tuple component, a `??` between two known carriers, a block around
+> one. Each of those drew the pool anyway, so a `/ {}` body performing nothing
+> was refused on the strength of an unrelated parameter — including a parameter
+> whose own row is charged exactly, at every mention of it. Where both a field
+> name and the binding's own type are known, the answer is their
+> **intersection**: each over-approximates the true row, so the intersection
+> does too, and it is the tighter of the two.
+>
+> An **empty** carried row is a fact, not the absence of one. A parameter written
+> `fs: [fn(i64) -> i64]` says its elements perform nothing, and reading one out
+> hands that on — but only non-empty rows were recorded, so `let f = fs[0]`
+> looked unaccounted and drew the whole pool: a sibling parameter whose own
+> *named field* holds an `io` function refused a `/ {}` body that performs
+> nothing, which is the shape this clause already records as fixed, one scope
+> level in.
+>
+> Reading a part out of a binding hands on *that* binding's sources, and so does
+> copying one whole: `let f = step` is `step`'s row, not the pool. A plain named
+> parameter is not a position "with no field name", but the copy fell through to
+> the fallback anyway, so an unrelated `log: fn(str) / {io}` in the same
+> signature charged `io` to a call through a pure `step` — while `xs.map(step)`
+> written directly was accepted. The same program one `let` apart, again.
+>
+> A `type` name counts as the type it stands for, here as everywhere
+> ([T-TYPE-ALIAS]). This is inferred from written syntax rather than from
+> resolved types, and a row behind a name was not there: `f: Cb` for
+> `type Cb = fn(i64) -> i64 / {io}` recorded an *empty* row, which then shadowed
+> every fallback. One `type` line laundered `io` past all four of the guarantees
+> above.
+
+> From [T-FN-VALUE-ROW], as it read:
+>
+> *And for every name, not only a function's.* A binding spelled like an imported
+> module made `binding.field` take the *module function's* row: an `io` field
+> looked pure, so a printing function reached `par_map` and a `capabilities = []`
+> package; and a pure field was charged an unreachable private helper's `io`, so
+> a package that performs nothing failed to build in its consumer. A parameter
+> spelled like an **effect** demanded a handler for an effect the body never
+> performs. Both directions of one defect, and both are the rule below applied
+> to a name that is not a function's.
+>
+> *And only when it is a function.* Scope decides at a **call** as well as at a
+> mention: the two arms disagreed, so a *parameter* spelled like a private helper
+> was charged that helper's row — a `capabilities = []` package broke in every
+> consumer, and `par_map`'s purity proof failed, over one parameter's spelling.
+> A local of that name is a different thing:
+> a parameter spelled like a private helper charged that helper's row, which
+> broke a `capabilities = []` package in every consumer and failed a `par_map`
+> purity proof over a closure parameter's spelling. Scope decides, here as
+> everywhere else.
+>
+> *However it is named.* `lib.shout` is the same function `shout` would be and
+> carries the same row, and it did not: only the bare spelling was charged, so
+> one `import` emptied the row and with it every rule that rests on it —
+> `/ {}`, [T-PAR-MAP-PURE], [E-CONST]'s constant table, [T-REGION-FOREIGN],
+> [E-HANDLER-MISSING]'s "well-typed programs never reach it", and a package
+> declaring `capabilities = []`, which `grasm deps` then certified as performing
+> nothing while it printed. A capability ceiling one `import` away from
+> meaningless is not a ceiling.
+>
+> This is deliberately conservative: storing an effectful function and never
+> calling it is refused, and the way out is to declare the row. The alternative
+> was worse. A built-in higher-order method's function parameter is
+> unconstrained by design, since `xs.map(|x| print(x))` is ordinary code — so a
+> *named* effectful function passed to one had no row to check against, and
+> `[1, 2].map(shout)` inside a `/ {}` function typechecked and printed. One hop
+> further, `let fs = [uses]` and then `fs.map(call)`, went past `par_map`'s own
+> purity check as well: the effectful function is never called in the source,
+> only mentioned, and something else calls it. That reached through `/ {}`,
+> [T-PAR-MAP-PURE], the [E-HANDLER-MISSING] backstop, and a package's
+> `capabilities = []` ceiling.
+>
+> That covers a named function. A function value that arrives as a *parameter*
+> carries its row on its written type instead, and mentioning one is the same
+> permission as mentioning a name: `xs.map(f)` where `f: fn(i64) -> i64 / {io}`
+> performs `io`, exactly as `f(x)` does. Only the direct call was charged, so
+> `map`, `fold`, `filter`, `any`, `all`, `find` and `sort_by` each carried an
+> effect past a declared row. `par_map` was checked, which is what made the hole
+> look closed.
+>
+> A declared C function has no body to infer a row from and what it does is
+> unknowable, so its row is `{io, unsafe}` — and that travels with the value.
+> Without it, pushing `sqrt` into a `[fn(f64) -> f64 / {io}]` inside an `unsafe`
+> block was accepted, and calling it back out ran libc from a function declaring
+> nothing at all.
+
 Closed on 2026-09-22: a second `var` of a name already bound in the same block
 leaked what the first binding owned. `FnCx::bind` inserted into the innermost
 scope map and dropped whatever entry was there, and `pop_scope_with_decs`
@@ -577,6 +697,29 @@ SDL2_ttf or writing one over the font tables that already exist (`sfnt`,
 the wasm build ships the interpreter without reach into the DOM. A library
 that passes structures by value or wants a callback -- raylib, Cocoa through
 `objc_msgSend` -- still cannot cross the boundary at all.
+
+**Raw memory stops at the process's own allocations.** *Added on 2026-10-21
+with [L-LIB-MEM] and [L-LIB-ATOMIC].* What is not there yet, each on purpose:
+
+- An `extern fn` still takes and returns integers, not `addr`. A pointer from
+  C reaches Grasm as an `i64` and becomes an address with `mem_addr`, and one
+  goes back with `as_i64`. Under `grasm run` such an address points into no
+  allocation the sandbox made, so every access through it is refused: memory
+  that C owns can be used only by a compiled build.
+- There is no `mem_copy` or `mem_fill`; a loop of loads and stores does it.
+  Nor is there a way to move bytes between raw memory and a `bytes`.
+- `mem_size_of` and `mem_align_of` answer for layout types only. A struct has
+  no layout a program may rely on, so a runtime written in Grasm writes its
+  own offsets down.
+- Atomics are observed from one thread. No Grasm program runs two threads over
+  shared memory yet, so nothing has tested them under contention; what the
+  gates check is their values, widths, wrapping and orderings, and that a
+  compiled build emits atomic instructions for them (`scripts/fuzz_rawmem.py`).
+  A compiled build makes every ordering sequentially consistent.
+- The interpreter's addresses are made up and its sandbox is bounded only by
+  the host: an allocation larger than 2^40 bytes is refused by both engines,
+  and one the host cannot meet panics, but a large one that the host *can*
+  meet is held in full, as a compiled build's would be.
 
 ## Nothing open
 

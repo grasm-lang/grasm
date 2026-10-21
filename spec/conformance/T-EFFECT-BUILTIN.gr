@@ -100,6 +100,19 @@ fn every_proc_builtin(program: str) / {proc} {
     match proc_pipeline([], "") { Ok(v) -> {} Err(e) -> {} }
 }
 
+/// And for `mem`, which also needs `unsafe` around it ([T-MEM-UNSAFE]). A
+/// method on an address is charged the same row at its call, by the checker,
+/// which is the one pass that knows the receiver is an address.
+fn every_mem_builtin(n: i64) / {unsafe, mem} {
+    unsafe {
+        let a = mem_alloc(n, 8)
+        let b = mem_addr(a.as_i64())
+        let _s = mem_size_of(i64) + mem_align_of(i64)
+        let _v = b.load_i64() + b.atomic_add_i64(1, SeqCst)
+        mem_free(a)
+    }
+}
+
 fn main() / {io, async} {
     writes()
     concurrent()

@@ -117,7 +117,7 @@ output change". Grasm has four engines — interpreter, bundle, ahead-of-time
 native, and wasm — and the interpreter is <em>normative</em>: the specification
 is written against it and the other three have to match it byte for byte on
 stdout, exit code and diagnostics.</p>
-<p>That turns a test suite into an oracle. All 644 standalone
+<p>That turns a test suite into an oracle. All 648 standalone
 programs in the corpus run through the interpreter, the bundle and the native
 build and are compared on every build; the last recorded run of that gate
 covered 511 of them. 501 also run in the browser engine
@@ -159,12 +159,12 @@ grep finds every place they do.</p>
 collector either. <a href="tiers.html">The four tiers →</a></p>
 
 <h2>6. The specification is normative, and every clause has a program</h2>
-<p>258 normative clauses in 3,548 lines, under a hard ceiling —
+<p>263 normative clauses in 3,543 lines, under a hard ceiling —
 every addition since has been paid for by compressing prose already written —
-and 265 programs in <code>spec/conformance</code>, so a clause is
+and 270 programs in <code>spec/conformance</code>, so a clause is
 not a sentence about intent but a file that fails. 167 clauses are
 <code>stable</code> and will not change incompatibly before 2.0;
-25 are <code>provisional</code> and 73 are
+25 are <code>provisional</code> and 78 are
 <code>experimental</code>, and a clause moves between those levels one at a
 time, on its own evidence.</p>
 

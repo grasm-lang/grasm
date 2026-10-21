@@ -1,0 +1,36 @@
+//! tag: L-LIB-ATOMIC
+//! expect: output
+//! 10 15 15
+//! 15 99 false 99
+//! 255 0 -128 127
+//! 18446744073709551615 0 1
+//! 7 7 7 7 7
+// Each atomic answers what was in memory before it acted: a fetch-add the old
+// value, a compare-exchange the value it found, whether or not it stored. Each
+// works at its type's width and wraps there, and touches no byte beside it.
+fn main() / {io, unsafe, mem} {
+    unsafe {
+        let a = mem_alloc(16, 8)
+        a.atomic_store_i64(10, Release)
+        let old = a.atomic_add_i64(5, AcqRel)
+        print("{old} {a.atomic_load_i64(Acquire)} {a.load_i64()}")
+        // A compare-exchange stores only when it finds what it expects.
+        let hit = a.atomic_cas_i64(15, 99, SeqCst)
+        let miss = a.atomic_cas_i64(15, 7, SeqCst)
+        print("{hit} {a.load_i64()} {miss == 15} {miss}")
+        // A u8 wraps at eight bits, and the byte after it does not move.
+        a.offset(8).store_u8(255)
+        a.offset(9).store_i8(-128)
+        let b = a.offset(8).atomic_add_u8(1, Relaxed)
+        print("{b} {a.offset(8).atomic_load_u8(Relaxed)} {a.offset(9).atomic_add_i8(-1, SeqCst)} {a.offset(9).load_i8()}")
+        let top: u64 = 18446744073709551615
+        a.atomic_store_u64(top, SeqCst)
+        print("{a.atomic_add_u64(1, Relaxed)} {a.atomic_load_u64(SeqCst)} {a.atomic_add_u64(1, Relaxed) + 1}")
+        // Every width and ordering a load may have.
+        a.atomic_store_i32(7, Relaxed)
+        a.offset(4).atomic_store_u16(7, SeqCst)
+        a.offset(6).atomic_store_i16(7, Release)
+        print("{a.atomic_load_i32(Relaxed)} {a.atomic_load_u32(SeqCst)} {a.offset(4).atomic_load_u16(Acquire)} {a.offset(6).atomic_load_i16(Relaxed)} {a.offset(4).atomic_cas_u16(7, 7, AcqRel)}")
+        mem_free(a)
+    }
+}

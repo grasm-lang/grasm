@@ -212,6 +212,12 @@ pub struct Interp<'a, W: Write> {
     narrow: std::collections::HashMap<(u32, u32), u8>,
     /// See `Analysis::ok_wrapped`.
     ok_wrapped: std::collections::HashSet<(u32, u32)>,
+    /// See `Analysis::mem_ops`: every raw-memory call, resolved.
+    mem_ops: HashMap<(u32, u32), grasm_sema::mem::MemOp>,
+    /// Raw memory's sandbox ([`crate::mem`]), shared with every task's
+    /// interpreter as the channel table is, and never borrowed across a
+    /// switch.
+    pub(crate) mem: Rc<std::cell::RefCell<crate::mem::Heap>>,
     /// Method calls the checker resolved to a struct field. See
     /// `set_field_calls`.
     field_calls: grasm_sema::check::SpanSet,
@@ -971,6 +977,7 @@ impl<'a, W: Write> Interp<'a, W> {
         let a = grasm_sema::check::check(module);
         me.float_literals = a.float_literals;
         me.narrow = a.narrow_ints;
+        me.mem_ops = a.mem_ops;
         me.ok_wrapped = a.ok_wrapped;
         me.field_calls = a.field_calls;
         me.iface_calls = a.iface_calls;
@@ -1001,6 +1008,41 @@ impl<'a, W: Write> Interp<'a, W> {
     /// ([T-INT-FIXED]). Without it a `u8` computes as the `i64` it is held in.
     pub fn set_narrow_ints(&mut self, spans: std::collections::HashMap<(u32, u32), u8>) {
         self.narrow = spans;
+    }
+
+    /// The raw-memory operations, from `Analysis` ([L-LIB-MEM]).
+    pub fn set_mem_ops(&mut self, ops: HashMap<(u32, u32), grasm_sema::mem::MemOp>) {
+        self.mem_ops = ops;
+    }
+
+    /// A raw-memory operation the checker resolved. The receiver, if any, is
+    /// the address; a layout's type and an atomic's ordering are names and
+    /// are not evaluated.
+    fn eval_mem(
+        &mut self,
+        op: grasm_sema::mem::MemOp,
+        recv: Option<&Expr>,
+        args: &[Expr],
+    ) -> EResult {
+        use grasm_sema::mem::MemOp;
+        let at = match recv {
+            Some(r) => match self.eval_expr(r)? {
+                Value::Int(i) => i as u64,
+                _ => 0,
+            },
+            None => 0,
+        };
+        let n = match op {
+            MemOp::Atomic(a, ..) => a.values(),
+            MemOp::Size(_) | MemOp::Align(_) => 0,
+            _ => args.len(),
+        };
+        let mut vs = Vec::with_capacity(n);
+        for a in &args[..n] {
+            vs.push(self.eval_expr(a)?);
+        }
+        let r = self.mem.borrow_mut().run(op, at, &vs);
+        r.map_err(Flow::Panic)
     }
 
     /// The width an operation at `span` wraps to, if it is a fixed-width one.
@@ -1620,6 +1662,8 @@ impl<'a, W: Write> Interp<'a, W> {
             float_literals: std::collections::HashSet::new(),
             narrow: std::collections::HashMap::new(),
             ok_wrapped: std::collections::HashSet::new(),
+            mem_ops: HashMap::new(),
+            mem: Default::default(),
             field_calls: Default::default(),
             iface_calls: Default::default(),
             impl_fns: HashMap::new(),
@@ -1676,6 +1720,8 @@ impl<'a, W: Write> Interp<'a, W> {
             float_literals: self.float_literals.clone(),
             narrow: self.narrow.clone(),
             ok_wrapped: self.ok_wrapped.clone(),
+            mem_ops: self.mem_ops.clone(),
+            mem: self.mem.clone(),
             field_calls: self.field_calls.clone(),
             iface_calls: self.iface_calls.clone(),
             impl_fns: self.impl_fns.clone(),
@@ -2820,13 +2866,19 @@ impl<'a, W: Write> Interp<'a, W> {
                     fields: Rc::new(vs),
                 })
             }
-            Expr::Call { callee, args, .. } => self.eval_call(callee, args),
+            Expr::Call { callee, args, span } => match self.mem_ops.get(&(span.start, span.end)) {
+                Some(op) => self.eval_mem(*op, None, args),
+                None => self.eval_call(callee, args),
+            },
             Expr::MethodCall {
                 recv,
                 name,
                 args,
                 span,
-            } => self.eval_method_call(recv, name, args, *span),
+            } => match self.mem_ops.get(&(span.start, span.end)) {
+                Some(op) => self.eval_mem(*op, Some(recv), args),
+                None => self.eval_method_call(recv, name, args, *span),
+            },
             Expr::Field { recv, name, .. } => self.eval_field(recv, name),
             Expr::Index { recv, index, .. } => {
                 let r = self.eval_expr(recv)?;

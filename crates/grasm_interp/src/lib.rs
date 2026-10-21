@@ -3,6 +3,7 @@
 pub mod ffi;
 pub mod interp;
 pub mod journal;
+pub mod mem;
 pub mod tasks;
 pub mod testing;
 pub mod value;
@@ -146,6 +147,7 @@ pub fn run_src_capturing_fault_with_stdin<W: Write + Send>(
             let mut interp = Interp::new_program(&files, out);
             interp.set_float_literals(analysis.float_literals);
             interp.set_narrow_ints(analysis.narrow_ints);
+            interp.set_mem_ops(analysis.mem_ops);
             interp.set_ok_wrapped(analysis.ok_wrapped);
             interp.set_field_calls(analysis.field_calls);
 
@@ -217,6 +219,7 @@ fn run_program_traced_here(
     let analysis = grasm_sema::check::check_program(program);
     interp.set_float_literals(analysis.float_literals);
     interp.set_narrow_ints(analysis.narrow_ints);
+    interp.set_mem_ops(analysis.mem_ops);
     interp.set_ok_wrapped(analysis.ok_wrapped);
     interp.set_field_calls(analysis.field_calls);
 
@@ -255,6 +258,7 @@ fn run_program_here(
     let analysis = grasm_sema::check::check_program(program);
     interp.set_float_literals(analysis.float_literals);
     interp.set_narrow_ints(analysis.narrow_ints);
+    interp.set_mem_ops(analysis.mem_ops);
     interp.set_ok_wrapped(analysis.ok_wrapped);
     interp.set_field_calls(analysis.field_calls);
 
@@ -304,6 +308,7 @@ fn test_program_here(
     let analysis = grasm_sema::check::check_program(program);
     interp.set_float_literals(analysis.float_literals);
     interp.set_narrow_ints(analysis.narrow_ints);
+    interp.set_mem_ops(analysis.mem_ops);
     interp.set_ok_wrapped(analysis.ok_wrapped);
     interp.set_field_calls(analysis.field_calls);
 
@@ -661,6 +666,7 @@ fn run_examples_together(
         let mut interp = Interp::new_program(&files, &mut sink);
         interp.set_float_literals(analysis.float_literals.clone());
         interp.set_narrow_ints(analysis.narrow_ints.clone());
+        interp.set_mem_ops(analysis.mem_ops.clone());
         interp.set_ok_wrapped(analysis.ok_wrapped.clone());
         interp.set_field_calls(analysis.field_calls.clone());
         interp.set_interfaces(analysis.iface_calls.clone(), analysis.impl_fns.clone());
@@ -766,6 +772,7 @@ fn run_one_example(
         let mut interp = Interp::new_program(&files, &mut buf);
         interp.set_float_literals(analysis.float_literals.clone());
         interp.set_narrow_ints(analysis.narrow_ints.clone());
+        interp.set_mem_ops(analysis.mem_ops.clone());
         interp.set_ok_wrapped(analysis.ok_wrapped.clone());
         interp.set_field_calls(analysis.field_calls.clone());
         interp.set_interfaces(analysis.iface_calls.clone(), analysis.impl_fns.clone());
@@ -917,6 +924,7 @@ fn bench_program_here(
     let analysis = grasm_sema::check::check_program(program);
     interp.set_float_literals(analysis.float_literals);
     interp.set_narrow_ints(analysis.narrow_ints);
+    interp.set_mem_ops(analysis.mem_ops);
     interp.set_ok_wrapped(analysis.ok_wrapped);
     interp.set_field_calls(analysis.field_calls);
 

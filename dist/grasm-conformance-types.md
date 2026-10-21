@@ -1,6 +1,6 @@
 # Grasm — conformance programs: types
 
-The type and effect system — what a program means before it runs. 112 executable program(s), one per normative clause of
+The type and effect system — what a program means before it runs. 114 executable program(s), one per normative clause of
 `grasm-language-pack.md`. Each header states the tag it demonstrates and the
 exact expected behaviour, and every one is run by `cargo test -p grasm_spec`, so
 a program here cannot describe behaviour the implementation does not have.
@@ -12,6 +12,40 @@ see it settled by a program.
 The programs are split by area because together they no longer fit in one
 context, and a reader with a rule in dispute needs one area rather than four.
 The other parts are `grasm-conformance-grammar`, `grasm-conformance-types`, `grasm-conformance-semantics`, `grasm-conformance-library`.
+
+## `T-ADDR.gr`
+
+```grasm
+//! tag: T-ADDR
+//! expect: output
+//! true false true
+//! true 2 true
+//! held without unsafe: true
+// An address is a value like an integer: it copies, compares with `==`, and
+// sits in a list, a struct field, a tuple or an Option. Its integer is not
+// printed here, because the language does not say what it is.
+type Node = { at: addr, next: Option[addr] }
+
+// Safe code may hold and pass an address; it cannot use one.
+fn same(a: addr, b: addr) -> bool {
+    a == b
+}
+
+fn main() / {io, unsafe, mem} {
+    let a = unsafe { mem_alloc(16, 8) }
+    let b = unsafe { a.offset(8) }
+    let c = a
+    print("{a == c} {a == b} {same(b, unsafe { c.offset(8) })}")
+    let n = Node{ at: a, next: Some(b) }
+    let xs = [a, b]
+    let pair = (a, b)
+    print("{n.next == Some(b)} {xs.len()} {pair.0 == xs[0]}")
+    print("held without unsafe: {same(n.at, c)}")
+    unsafe {
+        mem_free(a)
+    }
+}
+```
 
 ## `T-ALIAS-NOT-RECURSIVE.gr`
 
@@ -457,6 +491,19 @@ fn every_proc_builtin(program: str) / {proc} {
     match proc_pipeline([], "") { Ok(v) -> {} Err(e) -> {} }
 }
 
+/// And for `mem`, which also needs `unsafe` around it ([T-MEM-UNSAFE]). A
+/// method on an address is charged the same row at its call, by the checker,
+/// which is the one pass that knows the receiver is an address.
+fn every_mem_builtin(n: i64) / {unsafe, mem} {
+    unsafe {
+        let a = mem_alloc(n, 8)
+        let b = mem_addr(a.as_i64())
+        let _s = mem_size_of(i64) + mem_align_of(i64)
+        let _v = b.load_i64() + b.atomic_add_i64(1, SeqCst)
+        mem_free(a)
+    }
+}
+
 fn main() / {io, async} {
     writes()
     concurrent()
@@ -711,6 +758,7 @@ fn main() {
 //! effect name `io` is reserved by the language
 //! effect name `net` is reserved by the language
 //! effect name `proc` is reserved by the language
+//! effect name `mem` is reserved by the language
 // A capability the runtime discharges is not an effect a program handles.
 //
 // `io` and `async` are not keywords, so this parsed — and the
@@ -730,6 +778,10 @@ effect net {
 }
 
 effect proc {
+    fn ping() -> i64
+}
+
+effect mem {
     fn ping() -> i64
 }
 
@@ -2536,6 +2588,52 @@ fn describe(o: Outer) -> str {
 
 fn main() {
     print("{describe(Wrap(B))}")
+}
+```
+
+## `T-MEM-UNSAFE.gr`
+
+```grasm
+//! tag: T-MEM-UNSAFE
+//! expect: error
+//! `mem_alloc` reaches raw memory, so it can only be used inside `unsafe`
+//! `load_i64` reaches raw memory, so it can only be used inside `unsafe`
+//! `str` has no layout in raw memory
+//! an atomic store cannot be `Acquire`
+//! an atomic load cannot be `Release`
+//! `atomic_add_i64` takes a memory ordering, written as its name
+//! function `tidy` performs effect(s) `mem` not in its declared row
+//! cannot compare `addr` values
+// Every raw-memory operation is Tier 3, as a C function is, and performs
+// `mem`, which travels through rows to the package's ceiling like any other
+// capability. The checker also refuses what it can see is wrong before the
+// program runs: a layout of a type that has none, and an ordering the
+// operation cannot have, which must be a name written at the call.
+fn outside() -> i64 {
+    let a = mem_alloc(8, 8)
+    a.load_i64()
+}
+
+fn wrong() / {unsafe, mem} {
+    unsafe {
+        let a = mem_alloc(8, 8)
+        let n = mem_size_of(str)
+        a.atomic_store_i64(1, Acquire)
+        let x = a.atomic_load_i64(Release)
+        let o = SeqCst
+        let y = a.atomic_add_i64(1, o)
+        let z = a < a.offset(1)
+    }
+}
+
+// `unsafe` alone does not cover it: raw memory is `mem` as well.
+fn tidy(a: addr) / {unsafe} {
+    unsafe {
+        mem_free(a)
+    }
+}
+
+fn main() {
 }
 ```
 

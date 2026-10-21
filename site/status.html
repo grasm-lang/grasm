@@ -72,16 +72,16 @@ where each one stands.</p>
   <div class="fig"><b>511</b><span>programs, engines identical</span></div>
   <div class="fig"><b>501</b><span>identical in wasm</span></div>
   <div class="fig"><b>638</b><span>cross-compiled, agreeing</span></div>
-  <div class="fig"><b>265</b><span>conformance programs</span></div>
+  <div class="fig"><b>270</b><span>conformance programs</span></div>
   <div class="fig"><b>101</b><span>findings recorded</span></div>
-  <div class="fig"><b>17</b><span>fuzz generators</span></div>
+  <div class="fig"><b>18</b><span>fuzz generators</span></div>
 </div>
 <p>Interpreter, bundle and native builds agree byte for byte on stdout, exit
 code and diagnostics. All 638 are also compiled for x86_64 and run under
 Rosetta, every one of them agreeing, on 20 October 2026. Every generated program
 is checked for what it keeps as well as for what it prints.</p>
 <h2>Which run wrote which figure</h2>
-<p>The corpus is <b>644</b> standalone programs, counted as this page is
+<p>The corpus is <b>648</b> standalone programs, counted as this page is
 written and by difftest's own filter — so a program added today is in that
 number today. Everything below it needs a run, and these are not all from one
 run. <code>site/facts.json</code> used to carry no date at all, which is how a
@@ -143,7 +143,7 @@ table because the margin moved once already with nothing noticing: see
 <tr><td>A window, but no widgets</td><td><code>packages/sdl</code> binds SDL2 — window, renderer, streaming texture, event poll — and <code>scripts/sdltest.sh</code> drives the whole path at <b>0.4 ms a frame</b> at 256&times;256 RGBA, gated with no display. What is missing above that is the toolkit: no buttons, sliders, text fields or layout, and no glyph rasteriser, so text means binding SDL2_ttf. Nothing addresses the GPU, and the wasm build ships the interpreter without DOM reach.</td></tr>
 <tr><td>A union error cannot be narrowed</td><td><code>(A|B)</code> is raised, propagated and printed, never destructured. Declare one sum type and match it.</td></tr>
 <tr><td>Polymorphic recursion</td><td>Refused by name at build time. It is what monomorphization is; no work removes it.</td></tr>
-<tr><td>Small standard library</td><td>94 methods. Enough for 44 whole programs and 12 applications; you will find gaps in something larger.</td></tr>
+<tr><td>Small standard library</td><td>95 methods. Enough for 44 whole programs and 12 applications; you will find gaps in something larger.</td></tr>
 <tr><td>Linux never linked or run here</td><td>The 2,100 lines of the operating-system layer written for Linux went through a compiler on this machine for the first time on 15 October 2026: <code>cargo check --release --target x86_64-unknown-linux-gnu --workspace</code> passes for every crate. Nothing has been linked or run, and a type-check does not catch a wrong constant — which is how <code>AF_INET6</code> was 30 on Linux for four commits. CI compiles it properly.</td></tr>
 <tr><td>Tasks refuse every effect</td><td>1,000,000 tasks run, and none of them may do I/O. G6's <em>uncolored</em> half is the open one.</td></tr>
 <tr><td>One gate is red, on purpose</td><td>The specification is <b>70</b> pages against the 50 §19.2 binds it to, and <code>crates/grasm_spec/tests/core.rs</code> fails past 70 because that is where recording the gap stops being enough. It crossed on 12 October when <code>[E-SCHEDULE]</code> was rewritten. The ceiling is not being raised and the metric is not being re-scoped, because <code>spec/core.md</code> rules both out: <em>a number that is met by redefining what counts is not a number</em>. <code>docs/known-issues.md</code> has what closing it costs.</td></tr>

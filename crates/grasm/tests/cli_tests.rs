@@ -2469,3 +2469,122 @@ fn a_builder_copy_does_not_see_later_appends() {
         "the leak check did not run clean: {text}"
     );
 }
+
+const RAWLIB_SRC: &str =
+    "pub fn peek(a: addr) -> i64 {\n    unsafe {\n        a.load_i64()\n    }\n}\n";
+const RAWAPP_SRC: &str = "import rawlib\n\nfn main() {\n    unsafe {\n        let a = mem_alloc(8, 8)\n        a.store_i64(41)\n        print(\"{rawlib.peek(a) + 1}\")\n        mem_free(a)\n    }\n}\n";
+
+fn rawlib_manifest(caps: &str) -> String {
+    format!("[package]\nname = \"rawlib\"\nversion = \"0.1.0\"\ncapabilities = [{caps}]\n")
+}
+
+fn rawapp_manifest(caps: &str) -> String {
+    format!(
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\ncapabilities = [{caps}]\n\n[dependencies.rawlib]\npath = \"../lib\"\n"
+    )
+}
+
+/// Raw memory is `mem`, and the ceiling carries it through dependencies as it
+/// carries `io` ([T-MEM-UNSAFE], [T-CAPABILITY]): a library that reads memory
+/// through a *method* -- charged by the checker at the call, since only the
+/// checker knows the receiver is an address -- without declaring `mem` fails
+/// every consumer's build, and so does a consumer that calls it without
+/// declaring `mem` itself.
+#[test]
+fn raw_memory_needs_mem_in_every_manifest_it_crosses() {
+    let w = Work::new("mem_ceiling");
+    w.package("lib", &rawlib_manifest("\"unsafe\""), RAWLIB_SRC);
+    let app = w.package(
+        "app",
+        &rawapp_manifest("\"io\", \"unsafe\", \"mem\""),
+        RAWAPP_SRC,
+    );
+    let entry = app_entry(&app);
+    let bin = w.0.join("out");
+    for args in [
+        vec!["check", entry.as_str()],
+        vec!["run", entry.as_str()],
+        vec![
+            "build",
+            entry.as_str(),
+            "--native",
+            "-o",
+            bin.to_str().unwrap(),
+        ],
+    ] {
+        let (code, text) = run(&args);
+        assert_eq!(code, 1, "`grasm {}` should fail:\n{text}", args[0]);
+        assert!(
+            text.contains("package `rawlib` performs `mem` but its manifest only permits `unsafe`"),
+            "`grasm {}` should name the violation:\n{text}",
+            args[0]
+        );
+    }
+    assert!(!bin.exists(), "a failed build must not leave a binary");
+
+    // The library declares it; a consumer that does not is refused too.
+    w.package("lib", &rawlib_manifest("\"unsafe\", \"mem\""), RAWLIB_SRC);
+    w.package("app", &rawapp_manifest("\"io\""), RAWAPP_SRC);
+    let (code, text) = run(&["check", entry.as_str()]);
+    assert_eq!(code, 1, "{text}");
+    assert!(
+        text.contains("package `app` performs `mem`, `unsafe` but its manifest only permits `io`"),
+        "{text}"
+    );
+
+    // Declared on both sides, it builds, and both engines agree.
+    w.package(
+        "app",
+        &rawapp_manifest("\"io\", \"unsafe\", \"mem\""),
+        RAWAPP_SRC,
+    );
+    let (code, text) = run(&["run", entry.as_str()]);
+    assert_eq!((code, text.trim()), (0, "42"), "grasm run");
+    let (code, text) = run(&[
+        "build",
+        entry.as_str(),
+        "--native",
+        "-o",
+        bin.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "{text}");
+    let got = Command::new(&bin).output().expect("runs");
+    assert_eq!(
+        String::from_utf8_lossy(&got.stdout).trim(),
+        "42",
+        "--native"
+    );
+}
+
+/// The engines find a raw-memory operation by what the checker resolved, not
+/// by its name. Natively an address is held as an `i64`, so going by name
+/// would have turned a user's own `fn offset(n: i64, ..)`, called on an
+/// integer, into pointer arithmetic.
+#[test]
+fn a_function_named_like_an_address_method_is_not_raw_memory() {
+    let w = Work::new("mem_names");
+    let src = w.0.join("names.gr");
+    let out = w.0.join("names");
+    std::fs::write(
+        &src,
+        "fn offset(n: i64, by: i64) -> i64 {\n    n * 100 + by\n}\n\nfn diff(n: i64, m: i64) -> i64 {\n    n * m\n}\n\nfn load_i64(n: i64) -> i64 {\n    n - 1\n}\n\nfn main() / {io, unsafe, mem} {\n    let n = 5\n    unsafe {\n        let a = mem_alloc(16, 8)\n        a.offset(8).store_i64(n.offset(3))\n        print(\"{n.offset(3)} {n.diff(4)} {n.load_i64()} {a.offset(8).load_i64()} {a.offset(8).diff(a)}\")\n        mem_free(a)\n    }\n}\n",
+    )
+    .unwrap();
+    let want = "503 20 4 503 8";
+    let (code, msg) = run(&["run", src.to_str().unwrap()]);
+    assert_eq!((code, msg.trim()), (0, want), "grasm run");
+    let (code, msg) = run(&[
+        "build",
+        src.to_str().unwrap(),
+        "--native",
+        "-o",
+        out.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "{msg}");
+    let got = Command::new(&out).output().expect("runs");
+    assert_eq!(
+        String::from_utf8_lossy(&got.stdout).trim(),
+        want,
+        "--native"
+    );
+}

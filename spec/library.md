@@ -851,3 +851,41 @@ something growth would break: a `str` never changes once built, so its
 character count and index are kept, and a `bytes` may be a window `slice` did
 not copy, so its length is fixed ([L-LIB-BYTES-WRITE]). A builder prints as
 its text or as hex, and two are equal when their contents are.
+
+## Raw memory — the `mem` capability
+
+**[L-LIB-MEM]** Every row here is `unsafe` and performs `mem` ([T-MEM-UNSAFE]).
+`T` is a layout type: `i8 i16 i32 i64 u8 u16 u32 u64 f64 addr`, each as large as
+it is aligned (1, 2, 4 or 8 bytes); memory is little-endian.
+
+| | type | |
+|---|---|---|
+| `mem_alloc(size, align)` | `(i64, i64) -> addr` | `size` zeroed bytes at a multiple of `align` |
+| `mem_free(a)` | `(addr)` | gives back what `mem_alloc` made |
+| `mem_addr(n)` | `(i64) -> addr` | the address whose integer is `n` |
+| `mem_size_of(T)`, `mem_align_of(T)` | `-> i64` | `T` is written as a type: `mem_size_of(u16)` is 2 |
+| `a.offset(n)`, `a.diff(b)` | `(i64) -> addr`, `(addr) -> i64` | `n` bytes on; `a` minus `b` in bytes; both wrap |
+| `a.as_i64()` | `-> i64` | its integer: `mem_addr(a.as_i64()) == a` |
+| `a.load_T()`, `a.store_T(v)` | `-> T`, `(T)` | the `T` at `a`; puts `v` there |
+
+`mem_alloc` panics on a negative size, an alignment that is not a power of two
+from 1 to 4096, a size past 2^40, and a request the system cannot meet; zero
+bytes is a live allocation holding none. What else can go wrong is
+[E-MEM-UNCHECKED].
+
+**[L-LIB-ATOMIC]** On an address, for each integer type `T`, with an ordering
+written at the call — `Relaxed`, `Acquire`, `Release`, `AcqRel` or `SeqCst` — a
+name and not a value, since it must be known when the program is compiled:
+
+| | type | orderings |
+|---|---|---|
+| `a.atomic_load_T(o)` | `-> T` | `Relaxed`, `Acquire`, `SeqCst` |
+| `a.atomic_store_T(v, o)` | `(T)` | `Relaxed`, `Release`, `SeqCst` |
+| `a.atomic_cas_T(want, new, o)` | `(T, T) -> T` | any; stores `new` if `want` is there, and answers what was |
+| `a.atomic_add_T(n, o)` | `(T) -> T` | any; adds `n`, wrapping at the width, and answers what was there |
+
+Any other ordering is a compile error; a compare-exchange that fails orders as
+`o` without its release half. A compiled build makes every atomic sequentially
+consistent, which is at least what any ordering asks. No program runs two
+threads over shared memory yet — `par_map` and a multi-core `parallel` take only
+pure work — so today an atomic is observed from one thread.

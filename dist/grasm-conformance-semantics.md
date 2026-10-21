@@ -1,6 +1,6 @@
 # Grasm — conformance programs: semantics
 
-Evaluation — what a program does when it runs. 71 executable program(s), one per normative clause of
+Evaluation — what a program does when it runs. 72 executable program(s), one per normative clause of
 `grasm-language-pack.md`. Each header states the tag it demonstrates and the
 exact expected behaviour, and every one is run by `cargo test -p grasm_spec`, so
 a program here cannot describe behaviour the implementation does not have.
@@ -1783,6 +1783,87 @@ fn main() {
         _ -> "third"
     }
     print(r)
+}
+```
+
+## `E-MEM-UNCHECKED.gr`
+
+```grasm
+//! tag: E-MEM-UNCHECKED
+//! expect: test-output
+//! load_i64 of 8 byte(s) at offset 8 of a 12-byte allocation
+//! store_i64 after its allocation was freed
+//! load_i64 at an address not aligned to 8
+//! load_u8 through the null address
+//! atomic_load_i32 through an address no allocation holds
+//! mem_free of an allocation already freed
+//! mem_free of an address inside an allocation, not its start
+//! test "in bounds" ... ok
+// Each of these is undefined in a compiled build, which checks none of them;
+// `grasm run` keeps raw memory in a sandbox and refuses every one, saying
+// which it was. They are tests rather than `main` so the compiled build never
+// runs them: a program that does any of these has no defined output to
+// compare.
+test "past the end" {
+    unsafe {
+        let a = mem_alloc(12, 8)
+        let x = a.offset(8).load_i64()
+    }
+}
+
+test "after free" {
+    unsafe {
+        let a = mem_alloc(8, 8)
+        mem_free(a)
+        a.store_i64(1)
+    }
+}
+
+test "misaligned" {
+    unsafe {
+        let a = mem_alloc(16, 8)
+        let x = a.offset(4).load_i64()
+    }
+}
+
+test "null" {
+    unsafe {
+        let x = mem_addr(0).load_u8()
+    }
+}
+
+// An address no allocation ever held, made from an integer.
+test "wild" {
+    unsafe {
+        let x = mem_addr(123456789).atomic_load_i32(SeqCst)
+    }
+}
+
+test "freed twice" {
+    unsafe {
+        let a = mem_alloc(8, 8)
+        mem_free(a)
+        mem_free(a)
+    }
+}
+
+test "freed from inside" {
+    unsafe {
+        let a = mem_alloc(8, 8)
+        mem_free(a.offset(4))
+    }
+}
+
+test "in bounds" {
+    unsafe {
+        let a = mem_alloc(12, 4)
+        a.offset(8).store_u32(1)
+        assert(a.offset(8).load_u32() == 1)
+        mem_free(a)
+    }
+}
+
+fn main() {
 }
 ```
 

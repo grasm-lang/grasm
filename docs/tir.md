@@ -65,6 +65,7 @@ that global offset space.
 type =
   | i64 | i8 | i16 | i32 | u8 | u16 | u32 | u64 | f64 | bool | str | bytes | unit | range
   | strbuilder | bytebuilder
+  | addr                           -- an address in raw memory ([T-ADDR])
   | tuple [type]
   | list type
   | map type type
@@ -157,6 +158,14 @@ effectop effect op [expr]        -- an effect operation
 method name [expr]               -- a built-in method; args[0] is the receiver
 boundcall interface method [expr] -- an interface method on a generic receiver
 ```
+
+Two raw-memory arguments are names rather than values ([L-LIB-MEM],
+[L-LIB-ATOMIC]), and print as leaves with no type: the type `mem_size_of`
+and `mem_align_of` take is `(type u16)`, and an atomic's ordering, its last
+argument, is `(order acquire)` with its span (`relaxed`, `acquire`,
+`release`, `acqrel`, `seqcst`). A consumer must not evaluate either. Every
+other raw-memory operation is an ordinary `builtin` (`mem_alloc`, ...) or
+`method` (`offset`, `load_u8`, `atomic_cas_i64`, ...) node.
 
 A method call in the source becomes one of these, by the checker's
 resolution: a built-in method (`method`), a UFCS call of a free function

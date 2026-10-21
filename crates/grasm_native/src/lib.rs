@@ -412,6 +412,7 @@ fn compile_object_scoped(
     let analysis = grasm_sema::check::check_program(program);
     cg.float_literals = analysis.float_literals;
     cg.narrow = analysis.narrow_ints;
+    cg.mem_ops = analysis.mem_ops;
     cg.map_get_value_kind = analysis.map_get_value_kind;
     cg.field_calls = analysis.field_calls;
     cg.iface_calls = analysis.iface_calls;
@@ -736,6 +737,10 @@ struct Codegen<'m> {
     /// checker ([T-INT-FIXED]; `Analysis::narrow_ints`). Read while compiling,
     /// so an `i64` program carries no trace of it.
     narrow: std::collections::HashMap<(u32, u32), u8>,
+    /// See `Analysis::mem_ops`: every raw-memory call, resolved by the
+    /// checker. An address is an `I64` here, so these are found by span and
+    /// never by a method's name.
+    mem_ops: HashMap<(u32, u32), grasm_sema::mem::MemOp>,
     /// The value type of each `m.get(k)`, from the checker. See
     /// `Analysis::map_get_value_kind`.
     map_get_value_kind: std::collections::HashMap<(u32, u32), u8>,
@@ -856,6 +861,7 @@ impl<'m> Codegen<'m> {
             generic_subst: HashMap::new(),
             float_literals: std::collections::HashSet::new(),
             narrow: std::collections::HashMap::new(),
+            mem_ops: HashMap::new(),
             map_get_value_kind: std::collections::HashMap::new(),
             field_calls: Default::default(),
             iface_calls: Default::default(),
@@ -878,6 +884,8 @@ impl<'m> Codegen<'m> {
             ("grasm_out_text", vec![ptr, i64t], None),
             ("grasm_out_i64", vec![i64t], None),
             ("grasm_out_u64", vec![i64t], None),
+            ("grasm_mem_alloc", vec![i64t, i64t], Some(i64t)),
+            ("grasm_mem_free", vec![i64t], None),
             ("grasm_strbuf_new", vec![], Some(i64t)),
             ("grasm_bytebuf_new", vec![], Some(i64t)),
             ("grasm_builder_push_str", vec![i64t, i64t], Some(i64t)),
@@ -1348,8 +1356,10 @@ impl<'m> Codegen<'m> {
                             return Ok(bound.clone());
                         }
                         match n {
+                            // An address ([T-ADDR]) is a machine word, held as
+                            // an `i64`: it copies, compares and prints as one.
                             "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "usize"
-                            | "int" => return Ok(VType::I64),
+                            | "int" | "addr" => return Ok(VType::I64),
                             "u64" => return Ok(VType::U64),
                             "f32" | "f64" | "float" => return Ok(VType::F64),
                             "bool" => return Ok(VType::Bool),
@@ -12907,7 +12917,10 @@ this case",
                 name,
                 args,
                 span,
-            } => self.eval_method(recv, name, args, *span),
+            } => match self.cg.mem_ops.get(&(span.start, span.end)) {
+                Some(op) => self.eval_mem(*op, Some(recv), args),
+                None => self.eval_method(recv, name, args, *span),
+            },
             Expr::Unary { op, expr, span } => {
                 let (v, vt) = self.eval_expr_val(expr)?;
                 match (op, &vt) {
@@ -12971,7 +12984,11 @@ this case",
                 else_branch,
                 ..
             } => self.eval_if(cond, then_block, else_branch.as_deref()),
-            Expr::Call { callee, args, span } => self.eval_call(callee, args, *span),
+            Expr::Call { callee, args, span } => match self.cg.mem_ops.get(&(span.start, span.end))
+            {
+                Some(op) => self.eval_mem(*op, None, args),
+                None => self.eval_call(callee, args, *span),
+            },
             Expr::Block(b) | Expr::Unsafe(b) => {
                 let (last, terminated) = self.eval_block_inner(b)?;
                 if terminated {
@@ -14143,6 +14160,127 @@ this case",
             }
             _ => nope(span, "this write to a builder"),
         }
+    }
+
+    /// A raw-memory operation the checker resolved ([L-LIB-MEM],
+    /// [L-LIB-ATOMIC]). Nothing is checked: an access is one instruction, and
+    /// what [E-MEM-UNCHECKED] lists is undefined here. A layout's type and an
+    /// atomic's ordering are names, not values, and are not evaluated.
+    ///
+    /// Cranelift makes every atomic sequentially consistent, which is at
+    /// least what any ordering asks for, so the ordering chooses nothing yet.
+    fn eval_mem(
+        &mut self,
+        op: grasm_sema::mem::MemOp,
+        recv: Option<&Expr>,
+        args: &[Expr],
+    ) -> CResult<Option<(Value, VType)>> {
+        use cranelift_codegen::ir::{AtomicRmwOp, MemFlags};
+        use grasm_sema::mem::{Atomic, MemOp, MemTy};
+        let at = match recv {
+            Some(r) => Some(self.eval_expr_val(r)?.0),
+            None => None,
+        };
+        let n = match op {
+            MemOp::Atomic(a, ..) => a.values(),
+            MemOp::Size(_) | MemOp::Align(_) => 0,
+            _ => args.len(),
+        };
+        let mut vs = Vec::with_capacity(n);
+        for a in &args[..n] {
+            vs.push(self.eval_expr_val(a)?.0);
+        }
+        // The address: the receiver of a method, the argument of `mem_free`
+        // and `mem_addr`. Nothing reads it for the others.
+        let at = match (at, vs.first()) {
+            (Some(a), _) | (None, Some(&a)) => a,
+            (None, None) => self.b.ins().iconst(types::I64, 0),
+        };
+        let vt = |t: MemTy| match t {
+            MemTy::U64 => VType::U64,
+            MemTy::F64 => VType::F64,
+            _ => VType::I64,
+        };
+        // The machine type an access moves, and a narrow result widened back
+        // to the word this backend holds every integer in.
+        let mty = |t: MemTy| match t.size() {
+            1 => types::I8,
+            2 => types::I16,
+            4 => types::I32,
+            _ if t == MemTy::F64 => types::F64,
+            _ => types::I64,
+        };
+        let flags = MemFlags::new();
+        let out = match op {
+            MemOp::Alloc => (self.call_rt("grasm_mem_alloc", &vs).unwrap(), VType::I64),
+            MemOp::Free => {
+                self.call_rt("grasm_mem_free", &vs);
+                return Ok(None);
+            }
+            MemOp::FromInt | MemOp::ToInt => (at, VType::I64),
+            MemOp::Size(t) | MemOp::Align(t) => {
+                (self.b.ins().iconst(types::I64, t.size()), VType::I64)
+            }
+            MemOp::Offset => (self.b.ins().iadd(at, vs[0]), VType::I64),
+            MemOp::Diff => (self.b.ins().isub(at, vs[0]), VType::I64),
+            MemOp::Load(t) => {
+                let ins = self.b.ins();
+                let v = match (t.size(), t.signed()) {
+                    (1, true) => ins.sload8(types::I64, flags, at, 0),
+                    (1, false) => ins.uload8(types::I64, flags, at, 0),
+                    (2, true) => ins.sload16(types::I64, flags, at, 0),
+                    (2, false) => ins.uload16(types::I64, flags, at, 0),
+                    (4, true) => ins.sload32(flags, at, 0),
+                    (4, false) => ins.uload32(flags, at, 0),
+                    _ => ins.load(mty(t), flags, at, 0),
+                };
+                (v, vt(t))
+            }
+            MemOp::Store(t) => {
+                let ins = self.b.ins();
+                match t.size() {
+                    1 => ins.istore8(flags, vs[0], at, 0),
+                    2 => ins.istore16(flags, vs[0], at, 0),
+                    4 => ins.istore32(flags, vs[0], at, 0),
+                    _ => ins.store(flags, vs[0], at, 0),
+                };
+                return Ok(None);
+            }
+            MemOp::Atomic(a, t, _) => {
+                let w = mty(t);
+                let narrow = |b: &mut FunctionBuilder, v: Value| {
+                    if w == types::I64 {
+                        v
+                    } else {
+                        b.ins().ireduce(w, v)
+                    }
+                };
+                let r = match a {
+                    Atomic::Load => self.b.ins().atomic_load(w, flags, at),
+                    Atomic::Store => {
+                        let v = narrow(&mut self.b, vs[0]);
+                        self.b.ins().atomic_store(flags, v, at);
+                        return Ok(None);
+                    }
+                    Atomic::Cas => {
+                        let want = narrow(&mut self.b, vs[0]);
+                        let new = narrow(&mut self.b, vs[1]);
+                        self.b.ins().atomic_cas(flags, at, want, new)
+                    }
+                    Atomic::Add => {
+                        let d = narrow(&mut self.b, vs[0]);
+                        self.b.ins().atomic_rmw(w, flags, AtomicRmwOp::Add, at, d)
+                    }
+                };
+                let r = match (w == types::I64, t.signed()) {
+                    (true, _) => r,
+                    (false, true) => self.b.ins().sextend(types::I64, r),
+                    (false, false) => self.b.ins().uextend(types::I64, r),
+                };
+                (r, vt(t))
+            }
+        };
+        Ok(Some(out))
     }
 
     fn eval_method(

@@ -115,11 +115,19 @@ pub const UNSAFE: &str = "unsafe";
 /// Concurrency.
 pub const ASYNC: &str = "async";
 
+/// Raw memory ([T-MEM-UNSAFE]): reading and writing bytes no Grasm value
+/// owns. A capability of its own, as `net` and `proc` are: it is not `io`,
+/// since nothing outside the process is reached, and a manifest saying
+/// `["unsafe", "mem"]` tells a reader the package touches memory and does not
+/// call C.
+pub const MEM: &str = "mem";
+
 const IO_ROW: &[&str] = &[IO];
 const NET_ROW: &[&str] = &[NET];
 const PROC_ROW: &[&str] = &[PROC];
 const PURE: &[&str] = &[];
 const ASYNC_ROW: &[&str] = &[ASYNC];
+const MEM_ROW: &[&str] = &[MEM];
 
 pub const BUILTINS: &[Builtin] = &[
     // --- channels between the tasks of a `concurrent` block
@@ -409,6 +417,34 @@ pub const BUILTINS: &[Builtin] = &[
     Builtin {
         name: "byte_builder",
         row: PURE,
+        journal: Journal::Untouched,
+    },
+    // Raw memory ([L-LIB-MEM]). Each is `mem`, and a method on an `addr` is
+    // charged the same row by the checker at its call site. Nothing outside
+    // the process is involved, so a replay changes nothing.
+    Builtin {
+        name: "mem_alloc",
+        row: MEM_ROW,
+        journal: Journal::Untouched,
+    },
+    Builtin {
+        name: "mem_free",
+        row: MEM_ROW,
+        journal: Journal::Untouched,
+    },
+    Builtin {
+        name: "mem_addr",
+        row: MEM_ROW,
+        journal: Journal::Untouched,
+    },
+    Builtin {
+        name: "mem_size_of",
+        row: MEM_ROW,
+        journal: Journal::Untouched,
+    },
+    Builtin {
+        name: "mem_align_of",
+        row: MEM_ROW,
         journal: Journal::Untouched,
     },
     Builtin {

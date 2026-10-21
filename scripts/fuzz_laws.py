@@ -350,6 +350,9 @@ CLAUSES = {
     "T-U64": "u64 is unsigned",
     "L-LIB-BITS-WIDTH": "bits are read at the width",
     "L-LIB-BUILDER": "a builder is the concatenation",
+    "T-ADDR": "an address is a value",
+    "L-LIB-MEM": "a store is read back at its width",
+    "L-LIB-ATOMIC": "an atomic answers what was there",
     "T-INT-TO-FLOAT": "an int becomes a float",
     "T-INT-TO-FLOAT-CARRIED": "promotion is carried",
     "T-LIST": "a list holds one type",
@@ -690,6 +693,18 @@ LAWS = {
  # string built with `+` gives -- and a copy taken midway does not see what is
  # appended after it, which is the value semantics an in-place append could
  # break.
+ # An address is a value: it copies into a list and a tuple, compares, and
+ # `offset` and `diff` undo each other -- the arithmetic a runtime's
+ # allocator is made of, with no integer of an address ever printed.
+ "an address is a value": 'var ok = true\n    unsafe {\n        let a = mem_alloc(64, 16)\n        let b = a.offset(8)\n        let xs = [a, b]\n        let pair = (b, a)\n        for k in 0 - 40..40 {\n            if a.offset(k).diff(a) != k or a.offset(k).offset(0 - k) != a {\n                ok = false\n            }\n        }\n        if mem_addr(a.as_i64()) != a or xs[1] != pair.0 or a == b or Some(b) != Some(a.offset(8)) or a.as_i64() % 16 != 0 {\n            ok = false\n        }\n        mem_free(a)\n    }\n    say(ok)',
+ # A store is read back at its width: every narrower load of an i64 is that
+ # i64 converted, two bytes stored one at a time read back as their
+ # little-endian u16, and an f64 and an address keep their bits.
+ "a store is read back at its width": 'var ok = true\n    unsafe {\n        let a = mem_alloc(16, 8)\n        for k in 0..300 {\n            let x = k * 2654435761 - 400000000000\n            a.store_i64(x)\n            if a.load_i64() != x or a.load_u64() != x.as_u64() or a.load_i32() != x.as_i32() or a.load_u32() != x.as_u32() {\n                ok = false\n            }\n            if a.load_i16() != x.as_i16() or a.load_u16() != x.as_u16() or a.load_i8() != x.as_i8() or a.load_u8() != x.as_u8() {\n                ok = false\n            }\n            a.offset(8).store_u8(x.as_u8())\n            a.offset(9).store_u8(x.shr(8).as_u8())\n            if a.offset(8).load_u16().as_i64() != x.bit_and(0xFFFF) {\n                ok = false\n            }\n            let f = x.as_f64() / 7.0\n            a.offset(8).store_f64(f)\n            if a.offset(8).load_f64() != f or a.offset(8).load_i64() != f.to_bits() {\n                ok = false\n            }\n            a.offset(8).store_addr(a)\n            if a.offset(8).load_addr() != a or a.offset(8).load_i64() != a.as_i64() {\n                ok = false\n            }\n        }\n        if mem_size_of(u16) + mem_align_of(i32) + mem_size_of(addr) != 14 {\n            ok = false\n        }\n        mem_free(a)\n    }\n    say(ok)',
+ # An atomic answers what was there: a run of fetch-adds answers the running
+ # sum, a compare-exchange stores only when it finds what it expects, and a
+ # u8 wraps at eight bits without touching the byte beside it.
+ "an atomic answers what was there": 'var ok = true\n    unsafe {\n        let a = mem_alloc(16, 8)\n        var sum = 0\n        for k in 0..200 {\n            if a.atomic_add_i64(k, AcqRel) != sum {\n                ok = false\n            }\n            sum += k\n        }\n        if a.atomic_load_i64(SeqCst) != sum or a.load_i64() != sum {\n            ok = false\n        }\n        for k in 0..50 {\n            let seen = a.atomic_load_i64(Acquire)\n            let miss = a.atomic_cas_i64(seen + 1, 0, SeqCst)\n            let hit = a.atomic_cas_i64(seen, seen + k, AcqRel)\n            if miss != seen or hit != seen or a.load_i64() != seen + k {\n                ok = false\n            }\n        }\n        a.offset(8).atomic_store_u8(250, Release)\n        var wraps = 0\n        for k in 0..10 {\n            let before = a.offset(8).atomic_add_u8(1, Relaxed)\n            if before == 255 {\n                wraps += 1\n            }\n        }\n        if wraps != 1 or a.offset(8).atomic_load_u8(Relaxed) != 4 or a.offset(9).load_u8() != 0 {\n            ok = false\n        }\n        mem_free(a)\n    }\n    say(ok)',
  "a builder is the concatenation": 'var ok = true\n    var s = str_builder()\n    var b = byte_builder()\n    var t = ""\n    for k in 0..300 {\n        let piece = k.to_str()\n        s.push_str(piece)\n        t = t + piece\n        b.push_byte(k % 256)\n        b.push_bytes(bytes_of([k % 7]))\n        if k == 150 {\n            let snap = s\n            let bsnap = b\n            s.push_str("x")\n            b.push_byte(1)\n            if snap.len() + 1 != s.len() or bsnap.len() + 1 != b.len() or snap.to_str() == s.to_str() {\n                ok = false\n            }\n            s = snap\n            b = bsnap\n        }\n    }\n    if s.to_str() != t or s.len() != t.len() or b.len() != 600 {\n        ok = false\n    }\n    for k in 0..300 {\n        if b.at(2 * k) != k % 256 or b.at(2 * k + 1) != k % 7 {\n            ok = false\n        }\n    }\n    var c = byte_builder()\n    c.push_str("é")\n    if c.len() != 2 or c.to_bytes() != "é".to_bytes() {\n        ok = false\n    }\n    say(ok)',
  "conversions follow the range": 'var ok = true\n    for k in 0..1000 {\n        let x = k * 37 - 18000\n        let fits = x >= 0 - 32768 and x <= 32767\n        match x.try_i16() {\n            Some(v) -> if not fits or v.as_i64() != x {\n                ok = false\n            }\n            None -> if fits {\n                ok = false\n            }\n        }\n        let a = x.as_i16()\n        let twice = 2 * a.as_i64()\n        if a.saturating_add(a).as_i64() != twice.max(0 - 32768).min(32767) {\n            ok = false\n        }\n        match a.checked_add(a) {\n            Some(v) -> if v.as_i64() != twice {\n                ok = false\n            }\n            None -> if twice >= 0 - 32768 and twice <= 32767 {\n                ok = false\n            }\n        }\n    }\n    say(ok)',
  "an int becomes a float":      'let x: f64 = 2\n    say(x == 2.0)',
@@ -843,6 +858,9 @@ def main():
                 for w in ("par_map", "par_filter", "parallel", "spawn", "concurrent", "chan_")
             )
             row = "{io, async, Src}" if needs_async else "{io, Src}"
+            # Raw memory is Tier 3 and its own capability ([T-MEM-UNSAFE]).
+            if "unsafe {" in law:
+                row = row[:-1] + ", unsafe, mem}"
             src = PRELUDE + "fn main() / " + row + " {\n    " + law + "\n}\n"
             with open(path, "w") as f:
                 f.write(src)

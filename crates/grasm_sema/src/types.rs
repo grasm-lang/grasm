@@ -149,6 +149,10 @@ pub enum Type {
     /// grow at the end in amortized constant time, as values like any other.
     StrBuf,
     ByteBuf,
+    /// `addr` ([T-ADDR]): an address in raw memory, one machine word. Safe
+    /// code may hold one; every operation on it is `unsafe` and performs
+    /// `mem` ([T-MEM-UNSAFE]).
+    Addr,
     Unit,
     /// `0..n` — iterable of i64.
     Range,
@@ -414,6 +418,7 @@ impl Unifier {
             | (Type::Bytes, Type::Bytes)
             | (Type::StrBuf, Type::StrBuf)
             | (Type::ByteBuf, Type::ByteBuf)
+            | (Type::Addr, Type::Addr)
             | (Type::Unit, Type::Unit)
             | (Type::Range, Type::Range) => true,
             (Type::Generic(x), Type::Generic(y)) => x == y,
@@ -520,6 +525,7 @@ fn write_type(f: &mut fmt::Formatter<'_>, ty: &Type, defs: &TypeDefs) -> fmt::Re
         Type::Bytes => write!(f, "bytes"),
         Type::StrBuf => write!(f, "StrBuilder"),
         Type::ByteBuf => write!(f, "ByteBuilder"),
+        Type::Addr => write!(f, "addr"),
         Type::Unit => write!(f, "()"),
         Type::Range => write!(f, "range"),
         Type::Tuple(items) => {

@@ -1,6 +1,6 @@
 # Grasm — conformance programs: library
 
-The standard library. 62 executable program(s), one per normative clause of
+The standard library. 64 executable program(s), one per normative clause of
 `grasm-language-pack.md`. Each header states the tag it demonstrates and the
 exact expected behaviour, and every one is run by `cargo test -p grasm_spec`, so
 a program here cannot describe behaviour the implementation does not have.
@@ -413,6 +413,47 @@ fn main() {
     let huge = 1.0e30
     let nan = 0.0 / 0.0
     print("{huge.as_i64()} {(-huge).as_i64()} {nan.as_i64()}")
+}
+```
+
+## `L-LIB-ATOMIC.gr`
+
+```grasm
+//! tag: L-LIB-ATOMIC
+//! expect: output
+//! 10 15 15
+//! 15 99 false 99
+//! 255 0 -128 127
+//! 18446744073709551615 0 1
+//! 7 7 7 7 7
+// Each atomic answers what was in memory before it acted: a fetch-add the old
+// value, a compare-exchange the value it found, whether or not it stored. Each
+// works at its type's width and wraps there, and touches no byte beside it.
+fn main() / {io, unsafe, mem} {
+    unsafe {
+        let a = mem_alloc(16, 8)
+        a.atomic_store_i64(10, Release)
+        let old = a.atomic_add_i64(5, AcqRel)
+        print("{old} {a.atomic_load_i64(Acquire)} {a.load_i64()}")
+        // A compare-exchange stores only when it finds what it expects.
+        let hit = a.atomic_cas_i64(15, 99, SeqCst)
+        let miss = a.atomic_cas_i64(15, 7, SeqCst)
+        print("{hit} {a.load_i64()} {miss == 15} {miss}")
+        // A u8 wraps at eight bits, and the byte after it does not move.
+        a.offset(8).store_u8(255)
+        a.offset(9).store_i8(-128)
+        let b = a.offset(8).atomic_add_u8(1, Relaxed)
+        print("{b} {a.offset(8).atomic_load_u8(Relaxed)} {a.offset(9).atomic_add_i8(-1, SeqCst)} {a.offset(9).load_i8()}")
+        let top: u64 = 18446744073709551615
+        a.atomic_store_u64(top, SeqCst)
+        print("{a.atomic_add_u64(1, Relaxed)} {a.atomic_load_u64(SeqCst)} {a.atomic_add_u64(1, Relaxed) + 1}")
+        // Every width and ordering a load may have.
+        a.atomic_store_i32(7, Relaxed)
+        a.offset(4).atomic_store_u16(7, SeqCst)
+        a.offset(6).atomic_store_i16(7, Release)
+        print("{a.atomic_load_i32(Relaxed)} {a.atomic_load_u32(SeqCst)} {a.offset(4).atomic_load_u16(Acquire)} {a.offset(6).atomic_load_i16(Relaxed)} {a.offset(4).atomic_cas_u16(7, 7, AcqRel)}")
+        mem_free(a)
+    }
 }
 ```
 
@@ -1281,6 +1322,46 @@ fn main() {
     print("{(3.0).hypot(4.0).to_fixed(2)} {(27.0).cbrt().to_fixed(2)} {(81.0).log(3.0).to_fixed(4)} {(0.5).acos().to_fixed(6)}")
     print("{(180.0).to_radians().to_fixed(6)} {pi().to_degrees().to_fixed(2)} {(1.0).sinh().to_fixed(4)} {(1.0).tanh().to_fixed(4)}")
     print("{shadowed()}")
+}
+```
+
+## `L-LIB-MEM.gr`
+
+```grasm
+//! tag: L-LIB-MEM
+//! expect: output
+//! 0 0 0.0
+//! -2 254 -2 65534 -2 4294967294 -2 18446744073709551614
+//! 1.5 true 0x123456789abcdef 0x89abcdef 0x67 0x1
+//! 1 2 4 8 8 8 | 1 2 4 8 8 8
+//! 24 -24 true true
+//! 0 true
+// A fresh allocation is zeroed. Each layout type is stored and read back at
+// its width, a narrow one read signed or not as its type says, and memory is
+// little-endian, so the low byte of a word is at its address.
+fn main() / {io, unsafe, mem} {
+    unsafe {
+        let a = mem_alloc(40, 8)
+        print("{a.load_i64()} {a.offset(8).load_u8()} {a.offset(16).load_f64()}")
+        a.store_i8(-2)
+        a.offset(2).store_i16(-2)
+        a.offset(4).store_i32(-2)
+        a.offset(8).store_i64(-2)
+        print("{a.load_i8()} {a.load_u8()} {a.offset(2).load_i16()} {a.offset(2).load_u16()} {a.offset(4).load_i32()} {a.offset(4).load_u32()} {a.offset(8).load_i64()} {a.offset(8).load_u64()}")
+        a.offset(16).store_f64(1.5)
+        a.offset(24).store_addr(a)
+        let w: u64 = 0x0123_4567_89ab_cdef
+        a.offset(32).store_u64(w)
+        print("{a.offset(16).load_f64()} {a.offset(24).load_addr() == a} 0x{a.offset(32).load_u64().to_base(16)} 0x{a.offset(32).load_u32().to_base(16)} 0x{a.offset(36).load_u8().to_base(16)} 0x{a.offset(39).load_u8().to_base(16)}")
+        print("{mem_size_of(u8)} {mem_size_of(i16)} {mem_size_of(u32)} {mem_size_of(i64)} {mem_size_of(f64)} {mem_size_of(addr)} | {mem_align_of(i8)} {mem_align_of(u16)} {mem_align_of(i32)} {mem_align_of(u64)} {mem_align_of(f64)} {mem_align_of(addr)}")
+        let end = a.offset(32)
+        print("{end.diff(a.offset(8))} {a.offset(8).diff(end)} {mem_addr(a.as_i64()) == a} {end.offset(-32) == a}")
+        mem_free(a)
+        // Zero bytes is an allocation too, aligned as asked, and freed the same.
+        let z = mem_alloc(0, 4096)
+        print("{z.as_i64() % 4096} {z.offset(0) == z}")
+        mem_free(z)
+    }
 }
 ```
 

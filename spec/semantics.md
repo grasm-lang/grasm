@@ -474,6 +474,13 @@ release can be placed there instead of counted for.
 **[E-OWN-RUNTIME]** `own` has no runtime effect beyond an ordinary pass; the
 guarantee it provides is entirely static.
 
+**[E-MEM-UNCHECKED]** Undefined, and unchecked by a compiled build: an access
+through an address outside a live allocation — null, freed, past either end, or
+never allocated — or not a multiple of its type's size; and `mem_free` of
+anything but a live allocation's start. `grasm run` keeps raw memory in a
+sandbox, at addresses it never reuses, checks every access and panics saying
+which of these it was, so it is the place to run code that uses `mem`.
+
 ## 10. Testing
 
 **[E-TEST-PROPERTY]** A property test runs its body once per generated case.

@@ -22,6 +22,9 @@ pub const ASYNC: &str = "async";
 /// together would make that sentence unsayable.
 pub const NET: &str = "net";
 
+/// Raw memory ([T-MEM-UNSAFE]).
+pub use crate::builtins::MEM;
+
 /// Running another program. Strictly larger than either `io` or `net`: a
 /// program that can run `curl` has the network whether or not it declared
 /// `net`, and one that can run `rm` has the filesystem. Folding it into `io`
@@ -30,10 +33,10 @@ pub use crate::builtins::PROC;
 
 /// The capabilities the runtime discharges at `main` and in tests, and
 /// that a row may name with no `effect` declaring them. One list, because it
-/// was written out three times -- and a fourth copy, the reserved names, had
-/// lost `net` and `proc`.
+/// was written out three times, and adding `mem` to two of them would have
+/// left the third refusing a `main` that uses raw memory.
 pub fn is_capability(e: &str) -> bool {
-    matches!(e, IO | ASYNC | UNSAFE | NET | PROC)
+    matches!(e, IO | ASYNC | UNSAFE | NET | PROC | MEM)
 }
 
 // Which builtins perform what is **not written here**: `builtins::row_of` reads it from
@@ -180,6 +183,7 @@ pub fn effect_vocabulary(program: &crate::loader::Program) -> BTreeSet<String> {
         NET.to_string(),
         PROC.to_string(),
         UNSAFE.to_string(),
+        MEM.to_string(),
     ]
     .into();
     for file in &program.files {
@@ -1069,8 +1073,7 @@ once inside `main`",
             let declared_set: BTreeSet<String> = declared.iter().map(|p| p.dotted()).collect();
             for d in &declared_set {
                 let base = d.split('.').next().unwrap_or(d);
-                if !is_capability(base) && !ctx.effect_names.contains(base)
-                {
+                if !is_capability(base) && !ctx.effect_names.contains(base) {
                     diags.push(Diagnostic::error(
                         f.name.span,
                         format!("function `{}` declares unknown effect `{d}`", f.name.name),
@@ -1192,10 +1195,7 @@ is installed, not around the calls to it ([E-HANDLER-OWN-ROW])",
                 let mut fnb = FnBindings::default();
                 collect_fn_bindings(body, &ctx, &f.name, &mut fnb);
                 walk_block(body, &f.name, &mut active, &ctx, &fnb, &mut row);
-                let leftover: Vec<&String> = row
-                    .iter()
-                    .filter(|e| !is_capability(e))
-                    .collect();
+                let leftover: Vec<&String> = row.iter().filter(|e| !is_capability(e)).collect();
                 if !leftover.is_empty() {
                     let list = leftover
                         .iter()
@@ -2992,7 +2992,16 @@ fn site_expr(
                     out.push((tid.name.clone(), *span));
                 }
             }
-            let _ = name;
+            // A load, store or atomic on an address. Only for *where* the
+            // ceiling message points, so the names alone are enough: the
+            // checker charges the row, at the call, by the receiver's type.
+            if ["load_", "store_", "atomic_"]
+                .iter()
+                .any(|p| name.name.starts_with(p))
+                && crate::mem::method(&name.name).is_some()
+            {
+                out.push((MEM.to_string(), *span));
+            }
             site_expr(recv, externs, effects, out);
             for a in args {
                 site_expr(a, externs, effects, out);

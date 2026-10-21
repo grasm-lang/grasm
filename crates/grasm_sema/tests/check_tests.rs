@@ -3902,12 +3902,14 @@ fn every_effectful_builtin_is_named_in_conformance() {
 /// classification is not optional, so the test makes it not optional.
 #[test]
 fn every_effectful_builtin_says_what_a_replay_owes_it() {
-    use grasm_sema::builtins::{Journal, ASYNC, BUILTINS};
+    use grasm_sema::builtins::{Journal, ASYNC, BUILTINS, MEM};
     for b in BUILTINS {
         // `async` alone does not reach the world: a channel operation talks
         // to another task of the same program, under a schedule that is fixed,
-        // so a replay does it again and gets the same answer.
-        if b.row.iter().all(|e| *e == ASYNC) {
+        // so a replay does it again and gets the same answer. Nor does `mem`:
+        // raw memory is the program's own, and a replay allocates, reads and
+        // writes it again ([L-LIB-MEM]).
+        if b.row.iter().all(|e| *e == ASYNC || *e == MEM) {
             assert_eq!(
                 b.journal,
                 Journal::Untouched,
@@ -4372,12 +4374,97 @@ fn builders_grow_through_a_var() {
     );
 }
 
+/// Raw memory ([T-ADDR], [T-MEM-UNSAFE], [L-LIB-MEM]): every operation sits
+/// inside `unsafe` and performs `mem`; holding an address does not.
+#[test]
+fn raw_memory_is_unsafe_and_performs_mem() {
+    check_ok(
+        "type Cell = { at: addr, next: Option[addr] }\n\nfn keep(c: Cell) -> bool {\n    c.next == Some(c.at)\n}\n\nfn peek(a: addr) -> i64 / {unsafe, mem} {\n    unsafe {\n        let b = a.offset(8)\n        b.store_u16(7)\n        let d: i64 = b.diff(a) + a.as_i64() + mem_size_of(u16) + mem_align_of(addr)\n        a.load_i64() + d + b.load_u16().as_i64()\n    }\n}\n\nfn main() / {unsafe, mem} {\n    let a = unsafe { mem_alloc(16, 8) }\n    let c = Cell{ at: a, next: None }\n    unsafe {\n        mem_free(mem_addr(a.as_i64()))\n    }\n}\n",
+    );
+    check_err(
+        "fn f() -> addr {\n    mem_alloc(8, 8)\n}\n",
+        "`mem_alloc` reaches raw memory, so it can only be used inside `unsafe`",
+    );
+    check_err(
+        "fn f(a: addr) -> i64 {\n    a.load_i64()\n}\n",
+        "`load_i64` reaches raw memory, so it can only be used inside `unsafe`",
+    );
+    check_err(
+        "fn f(a: addr) -> i64 / {unsafe} {\n    unsafe {\n        a.load_i64()\n    }\n}\n",
+        "performs effect(s) `mem` not in its declared row",
+    );
+    check_err(
+        "fn f() -> i64 / {unsafe, mem} {\n    unsafe {\n        mem_size_of(str)\n    }\n}\n",
+        "`str` has no layout in raw memory",
+    );
+    check_err(
+        "fn f[T](x: T) -> i64 / {unsafe, mem} {\n    unsafe {\n        mem_size_of(T)\n    }\n}\n",
+        "has no layout in raw memory",
+    );
+    check_err(
+        "fn f(a: addr, b: addr) -> bool {\n    a < b\n}\n",
+        "cannot compare `addr` values",
+    );
+    check_err(
+        "fn f(a: addr) {\n    var m: Map[addr, i64] = {}\n}\n",
+        "addr",
+    );
+    // Not pure: a parallel map refuses it ([T-PAR-MAP-PURE]).
+    check_err(
+        "fn f(a: addr) -> [i64] / {unsafe, mem} {\n    [0, 8].par_map(|i| unsafe { a.offset(i).load_i64() })\n}\n",
+        "performs `mem`",
+    );
+}
+
+/// Atomics ([L-LIB-ATOMIC]) take an ordering written at the call, and refuse
+/// one the operation cannot have, before the program runs.
+#[test]
+fn atomics_take_an_ordering_they_can_have() {
+    check_ok(
+        "fn f(a: addr) -> u64 / {unsafe, mem} {\n    unsafe {\n        a.atomic_store_u64(1, Release)\n        let x: u64 = a.atomic_load_u64(Acquire) + a.atomic_add_u64(2, AcqRel)\n        let y: i8 = a.atomic_cas_i8(1, 2, SeqCst)\n        let z: u16 = a.atomic_load_u16(Relaxed)\n        x\n    }\n}\n",
+    );
+    for (call, want) in [
+        (
+            "a.atomic_store_i64(1, Acquire)",
+            "an atomic store cannot be `Acquire`",
+        ),
+        (
+            "a.atomic_store_i64(1, AcqRel)",
+            "an atomic store cannot be `AcqRel`",
+        ),
+        (
+            "let x = a.atomic_load_i32(Release)",
+            "an atomic load cannot be `Release`",
+        ),
+        (
+            "let x = a.atomic_load_i32(AcqRel)",
+            "an atomic load cannot be `AcqRel`",
+        ),
+        (
+            "let x = a.atomic_add_i64(1, Bogus)",
+            "takes a memory ordering, written as its name",
+        ),
+        ("let x = a.atomic_add_i64(1)", "takes 2 argument(s), got 1"),
+        (
+            "let x = a.atomic_add_f64(1.0, SeqCst)",
+            "no method `atomic_add_f64`",
+        ),
+    ] {
+        check_err(
+            &format!(
+                "fn f(a: addr) / {{unsafe, mem}} {{\n    unsafe {{\n        {call}\n    }}\n}}\n"
+            ),
+            want,
+        );
+    }
+}
+
 /// A capability cannot be declared as an effect and handled away
 /// ([T-EFFECT-RESERVED]) -- `net` and `proc` as much as `io`.
 #[test]
 fn every_capability_is_a_reserved_effect_name() {
     // `unsafe` is a keyword, so `effect unsafe` does not parse at all.
-    for name in ["io", "async", "net", "proc"] {
+    for name in ["io", "async", "net", "proc", "mem"] {
         check_err(
             &format!("effect {name} {{\n    fn ping() -> i64\n}}\n"),
             &format!("effect name `{name}` is reserved by the language"),

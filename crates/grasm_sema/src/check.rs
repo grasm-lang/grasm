@@ -202,6 +202,12 @@ pub struct Analysis {
     /// may run their tasks on several cores: no order of running them could
     /// be told apart from the written one. See `parallel_independent`.
     pub parallel_ok: std::collections::HashSet<u32>,
+    /// Every raw-memory operation ([L-LIB-MEM], [L-LIB-ATOMIC]), by the
+    /// call's whole span. The engines dispatch on this rather than on a
+    /// method's name: natively an `addr` is an `i64`, and a user's UFCS
+    /// `fn offset(n: i64, ..)` is not pointer arithmetic. A layout's type and
+    /// an atomic's ordering are written as names, not values, and live here.
+    pub mem_ops: HashMap<(u32, u32), crate::mem::MemOp>,
     /// What the checker decided, for TIR (`docs/tir.md`). Present only when
     /// the program was checked with [`check_program_tir`].
     pub tir: Option<crate::tirfacts::TirFacts>,
@@ -332,6 +338,11 @@ pub const BUILTIN_FREE_FNS: &[&str] = &[
     "bytes_filled",
     "str_builder",
     "byte_builder",
+    "mem_alloc",
+    "mem_free",
+    "mem_addr",
+    "mem_size_of",
+    "mem_align_of",
     "read_bytes",
     "read_bytes_at",
     "append_bytes",
@@ -677,6 +688,7 @@ fn check_modules_in(
         empty_types,
         float_sums: c.float_sums,
         parallel_ok: c.parallel_ok.clone(),
+        mem_ops: c.mem_ops.clone(),
         tir,
         defs: c.defs,
         diagnostics,
@@ -801,6 +813,8 @@ struct Checker {
     handler_ids: std::collections::HashSet<TypeDefId>,
     /// How many `unsafe` blocks enclose the expression being checked.
     unsafe_depth: u32,
+    /// See `Analysis::mem_ops`.
+    mem_ops: HashMap<(u32, u32), crate::mem::MemOp>,
     /// How many `region` blocks enclose it.
     /// Whether the block being checked has its value thrown away.
     ///
@@ -1167,6 +1181,7 @@ impl Checker {
             hof_closures: std::collections::HashSet::new(),
             handler_ids: std::collections::HashSet::new(),
             unsafe_depth: 0,
+            mem_ops: HashMap::new(),
             discarding: false,
             tail_fn: None,
             tail_fn_name: None,
@@ -1658,7 +1673,7 @@ already reachable from every module — drop the `pub`",
                     self.error_help(
                         e.name.span,
                         format!("effect name `{}` is reserved by the language", e.name.name),
-                        "`io`, `async`, `net`, `proc` and `unsafe` are capabilities the \
+                        "`io`, `async`, `net`, `proc`, `unsafe` and `mem` are capabilities the \
 runtime discharges, not effects a program declares or handles — there is no `with io handled_by` \
 ([T-EFFECT-BUILTIN]); rename this one",
                     );
@@ -2753,6 +2768,7 @@ different name, or call it as a method if you meant to extend a type (UFCS)",
                     "bytes" => Some(Type::Bytes),
                     "StrBuilder" => Some(Type::StrBuf),
                     "ByteBuilder" => Some(Type::ByteBuf),
+                    "addr" => Some(Type::Addr),
                     // `Type::Range` has displayed as `range` since ranges
                     // became values, so the name was already in the language's
                     // error messages -- and nowhere else. Nothing parsed it, so
@@ -4297,6 +4313,194 @@ perform it",
 `unsafe` capability, which is what makes it visible to everyone who depends on you",
             );
         }
+    }
+
+    /// Tier 3 for raw memory ([T-MEM-UNSAFE]): every operation on an address
+    /// sits inside `unsafe`, as a C function does, and performs `mem`.
+    fn require_unsafe_mem(&mut self, name: &str, span: Span) {
+        if self.unsafe_depth > 0 {
+            return;
+        }
+        self.error_help(
+            span,
+            format!("`{name}` reaches raw memory, so it can only be used inside `unsafe`"),
+            "wrap the use in `unsafe { ... }`; the package must then declare the \
+`unsafe` and `mem` capabilities, which is what makes it visible to everyone who depends on you",
+        );
+    }
+
+    /// `mem_alloc`, `mem_free`, `mem_addr`, `mem_size_of` and `mem_align_of`
+    /// ([L-LIB-MEM]). Their row, `mem`, comes from `crate::builtins`.
+    fn check_mem_fn(&mut self, id: &Ident, args: &[Expr], span: Span) -> Type {
+        use crate::mem::MemOp;
+        self.require_unsafe_mem(&id.name, id.span);
+        let want = if id.name == "mem_alloc" { 2 } else { 1 };
+        if args.len() != want {
+            return self.error(
+                span,
+                format!("`{}` takes {want} argument(s), got {}", id.name, args.len()),
+            );
+        }
+        let (op, ret) = match id.name.as_str() {
+            "mem_alloc" => {
+                self.check_expr(&args[0], &Type::I64);
+                self.check_expr(&args[1], &Type::I64);
+                (MemOp::Alloc, Type::Addr)
+            }
+            "mem_free" => {
+                self.check_expr(&args[0], &Type::Addr);
+                (MemOp::Free, Type::Unit)
+            }
+            "mem_addr" => {
+                self.check_expr(&args[0], &Type::I64);
+                (MemOp::FromInt, Type::Addr)
+            }
+            _ => {
+                let Some(t) = self.mem_layout_arg(&args[0], &id.name) else {
+                    return Type::Error;
+                };
+                let op = if id.name == "mem_size_of" {
+                    MemOp::Size(t)
+                } else {
+                    MemOp::Align(t)
+                };
+                (op, Type::I64)
+            }
+        };
+        self.mem_ops.insert((span.start, span.end), op);
+        ret
+    }
+
+    /// The `T` of `mem_size_of(T)`: written where a value would go, read as a
+    /// type and never evaluated, and one with a layout. A `str` or a struct
+    /// has none a program may rely on, and a generic parameter has no single
+    /// one.
+    fn mem_layout_arg(&mut self, arg: &Expr, fname: &str) -> Option<crate::mem::MemTy> {
+        let Expr::Ident(t) = arg else {
+            self.error_help(
+                arg.span(),
+                format!("`{fname}` takes a type, written as its name"),
+                "for example `mem_size_of(u32)`",
+            );
+            return None;
+        };
+        let te = TypeExpr::Name {
+            path: grasm_syntax::ast::Path {
+                segments: vec![t.clone()],
+                span: t.span,
+            },
+            args: vec![],
+            span: t.span,
+        };
+        let generics = self.current_generics.clone();
+        let ty = self.resolve_type(&te, &generics);
+        if matches!(ty, Type::Error) {
+            return None;
+        }
+        let found = crate::mem::MemTy::of(&ty);
+        if found.is_none() {
+            let shown = self.show(&ty);
+            self.error_help(
+                t.span,
+                format!("`{shown}` has no layout in raw memory"),
+                "a layout type is one of i8, i16, i32, i64, u8, u16, u32, u64, f64 and addr: \
+the only types a load or a store moves ([L-LIB-MEM])",
+            );
+        }
+        found
+    }
+
+    /// A method on an `addr` ([L-LIB-MEM], [L-LIB-ATOMIC]).
+    fn check_mem_method(
+        &mut self,
+        kind: crate::mem::MethodKind,
+        name: &Ident,
+        args: &[Expr],
+        span: Span,
+    ) -> Type {
+        use crate::mem::{MemOp, MethodKind, Order};
+        self.require_unsafe_mem(&name.name, name.span);
+        // The checker knows the receiver is an address and the effect pass
+        // does not, so the call site says what it performs, as a call
+        // through a field does.
+        let row: std::collections::BTreeSet<String> = [crate::effects::MEM.to_string()].into();
+        self.callee_rows.insert((span.start, span.end), row);
+        let arity = |c: &mut Self, want: usize| -> bool {
+            if args.len() == want {
+                return true;
+            }
+            c.error(
+                span,
+                format!(
+                    "`{}` takes {want} argument(s), got {}",
+                    name.name,
+                    args.len()
+                ),
+            );
+            false
+        };
+        let (op, ret) =
+            match kind {
+                MethodKind::Plain(op) => {
+                    let (params, ret) = match op {
+                        MemOp::Offset => (vec![Type::I64], Type::Addr),
+                        MemOp::Diff => (vec![Type::Addr], Type::I64),
+                        MemOp::ToInt => (vec![], Type::I64),
+                        MemOp::Load(t) => (vec![], t.ty()),
+                        MemOp::Store(t) => (vec![t.ty()], Type::Unit),
+                        _ => unreachable!("only methods come from `mem::method`"),
+                    };
+                    if !arity(self, params.len()) {
+                        return Type::Error;
+                    }
+                    for (a, p) in args.iter().zip(&params) {
+                        self.check_expr(a, p);
+                    }
+                    (op, ret)
+                }
+                MethodKind::Atomic(at, t) => {
+                    let values = at.values();
+                    if !arity(self, values + 1) {
+                        return Type::Error;
+                    }
+                    for a in &args[..values] {
+                        self.check_expr(a, &t.ty());
+                    }
+                    let last = &args[values];
+                    let order = match last {
+                        Expr::Ident(o) => Order::from_name(&o.name),
+                        _ => None,
+                    };
+                    let Some(order) = order else {
+                        return self.error_help(
+                        last.span(),
+                        format!("`{}` takes a memory ordering, written as its name", name.name),
+                        "one of `Relaxed`, `Acquire`, `Release`, `AcqRel` or `SeqCst`; it must \
+be known when the program is compiled, so it cannot be a value ([L-LIB-ATOMIC])",
+                    );
+                    };
+                    if !at.allows(order) {
+                        let ok: Vec<&str> = Order::ALL
+                            .into_iter()
+                            .filter(|o| at.allows(*o))
+                            .map(|o| o.name())
+                            .collect();
+                        return self.error_help(
+                            last.span(),
+                            format!("an atomic {} cannot be `{}`", at.name(), order.name()),
+                            format!("a {} may be {} ([L-LIB-ATOMIC])", at.name(), ok.join(", ")),
+                        );
+                    }
+                    let ret = if at == crate::mem::Atomic::Store {
+                        Type::Unit
+                    } else {
+                        t.ty()
+                    };
+                    (MemOp::Atomic(at, t, order), ret)
+                }
+            };
+        self.mem_ops.insert((span.start, span.end), op);
+        ret
     }
 
     /// Rejects a task body's reference to a binding that will not exist when
@@ -6318,6 +6522,10 @@ only a number or a `bool` can come out — compute what you need and yield that"
                         self.check_expr(&args[1], &Type::I64);
                         return Type::Bytes;
                     }
+                    // Raw memory ([L-LIB-MEM]).
+                    "mem_alloc" | "mem_free" | "mem_addr" | "mem_size_of" | "mem_align_of" => {
+                        return self.check_mem_fn(id, args, span);
+                    }
                     // [L-LIB-BUILDER]: an empty one of each.
                     "str_builder" | "byte_builder" => {
                         if !args.is_empty() {
@@ -6834,7 +7042,7 @@ fail outside it",
         if let Some(row) = self.row_of_qualified(owner, name) {
             let user: Vec<&String> = row
                 .iter()
-                .filter(|e| !matches!(e.as_str(), "io" | "async" | "unsafe"))
+                .filter(|e| !matches!(e.as_str(), "io" | "async" | "unsafe" | "mem"))
                 .collect();
             if let Some(first) = user.first() {
                 self.error_help(
@@ -8364,6 +8572,12 @@ Perform the effect after the closing brace, or yield a number and do the work ou
                 }
                 _ => return None,
             },
+            // Raw memory through an address ([L-LIB-MEM], [L-LIB-ATOMIC]).
+            // Any other name falls through to UFCS, as on every type.
+            Type::Addr => {
+                let kind = crate::mem::method(&name.name)?;
+                return Some(self.check_mem_method(kind, name, args, span));
+            }
             // The builders ([L-LIB-BUILDER]). Each append writes through
             // the receiver, so it needs a mutable place, as `push` does.
             t @ (Type::StrBuf | Type::ByteBuf) => {

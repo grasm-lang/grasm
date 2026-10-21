@@ -1,0 +1,35 @@
+//! tag: L-LIB-MEM
+//! expect: output
+//! 0 0 0.0
+//! -2 254 -2 65534 -2 4294967294 -2 18446744073709551614
+//! 1.5 true 0x123456789abcdef 0x89abcdef 0x67 0x1
+//! 1 2 4 8 8 8 | 1 2 4 8 8 8
+//! 24 -24 true true
+//! 0 true
+// A fresh allocation is zeroed. Each layout type is stored and read back at
+// its width, a narrow one read signed or not as its type says, and memory is
+// little-endian, so the low byte of a word is at its address.
+fn main() / {io, unsafe, mem} {
+    unsafe {
+        let a = mem_alloc(40, 8)
+        print("{a.load_i64()} {a.offset(8).load_u8()} {a.offset(16).load_f64()}")
+        a.store_i8(-2)
+        a.offset(2).store_i16(-2)
+        a.offset(4).store_i32(-2)
+        a.offset(8).store_i64(-2)
+        print("{a.load_i8()} {a.load_u8()} {a.offset(2).load_i16()} {a.offset(2).load_u16()} {a.offset(4).load_i32()} {a.offset(4).load_u32()} {a.offset(8).load_i64()} {a.offset(8).load_u64()}")
+        a.offset(16).store_f64(1.5)
+        a.offset(24).store_addr(a)
+        let w: u64 = 0x0123_4567_89ab_cdef
+        a.offset(32).store_u64(w)
+        print("{a.offset(16).load_f64()} {a.offset(24).load_addr() == a} 0x{a.offset(32).load_u64().to_base(16)} 0x{a.offset(32).load_u32().to_base(16)} 0x{a.offset(36).load_u8().to_base(16)} 0x{a.offset(39).load_u8().to_base(16)}")
+        print("{mem_size_of(u8)} {mem_size_of(i16)} {mem_size_of(u32)} {mem_size_of(i64)} {mem_size_of(f64)} {mem_size_of(addr)} | {mem_align_of(i8)} {mem_align_of(u16)} {mem_align_of(i32)} {mem_align_of(u64)} {mem_align_of(f64)} {mem_align_of(addr)}")
+        let end = a.offset(32)
+        print("{end.diff(a.offset(8))} {a.offset(8).diff(end)} {mem_addr(a.as_i64()) == a} {end.offset(-32) == a}")
+        mem_free(a)
+        // Zero bytes is an allocation too, aligned as asked, and freed the same.
+        let z = mem_alloc(0, 4096)
+        print("{z.as_i64() % 4096} {z.offset(0) == z}")
+        mem_free(z)
+    }
+}

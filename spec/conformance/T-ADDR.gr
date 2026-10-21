@@ -1,0 +1,29 @@
+//! tag: T-ADDR
+//! expect: output
+//! true false true
+//! true 2 true
+//! held without unsafe: true
+// An address is a value like an integer: it copies, compares with `==`, and
+// sits in a list, a struct field, a tuple or an Option. Its integer is not
+// printed here, because the language does not say what it is.
+type Node = { at: addr, next: Option[addr] }
+
+// Safe code may hold and pass an address; it cannot use one.
+fn same(a: addr, b: addr) -> bool {
+    a == b
+}
+
+fn main() / {io, unsafe, mem} {
+    let a = unsafe { mem_alloc(16, 8) }
+    let b = unsafe { a.offset(8) }
+    let c = a
+    print("{a == c} {a == b} {same(b, unsafe { c.offset(8) })}")
+    let n = Node{ at: a, next: Some(b) }
+    let xs = [a, b]
+    let pair = (a, b)
+    print("{n.next == Some(b)} {xs.len()} {pair.0 == xs[0]}")
+    print("held without unsafe: {same(n.at, c)}")
+    unsafe {
+        mem_free(a)
+    }
+}

@@ -5,6 +5,7 @@ pub mod check;
 pub mod docs;
 pub mod effects;
 pub mod loader;
+pub mod mem;
 pub mod tirfacts;
 pub mod types;
 

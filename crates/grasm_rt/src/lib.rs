@@ -10195,6 +10195,75 @@ unsafe fn cow_bytes(v: *mut RtVal) -> *mut RtVal {
 }
 
 // ---------------------------------------------------------------------------
+// Raw memory ([L-LIB-MEM])
+// ---------------------------------------------------------------------------
+//
+// Only allocation lives here. A load, a store, an offset and every atomic is
+// one instruction the compiled code emits itself, and none of them is checked:
+// what [E-MEM-UNCHECKED] lists is undefined in a compiled build, which is the
+// bargain `unsafe` and the `mem` capability make visible. `grasm run` checks
+// all of it (`grasm_interp::mem`).
+
+/// The largest allocation `mem_alloc` attempts; the interpreter's is the same.
+const MEM_MAX: i64 = 1 << 40;
+
+/// `mem_alloc(size, align)`: `size` zeroed bytes at a multiple of `align`.
+///
+/// Zeroed so a fresh allocation reads the same in both engines. A header of
+/// `max(align, 16)` bytes sits below the answer and records the layout in its
+/// last two words, so `mem_free` takes the address alone, as C's `free` does.
+/// The panics are the interpreter's, word for word.
+#[no_mangle]
+pub extern "C" fn grasm_mem_alloc(size: i64, align: i64) -> i64 {
+    if size < 0 {
+        rt_panic(&format!("mem_alloc: negative size {size}"));
+    }
+    if !(1..=4096).contains(&align) || align & (align - 1) != 0 {
+        rt_panic(&format!(
+            "mem_alloc: alignment {align} is not a power of two from 1 to 4096"
+        ));
+    }
+    if size > MEM_MAX {
+        rt_panic(&format!(
+            "mem_alloc: {size} bytes is more than an allocation can hold"
+        ));
+    }
+    let head = align.max(16) as usize;
+    let Ok(layout) = core::alloc::Layout::from_size_align(head + size as usize, head) else {
+        rt_panic("mem_alloc: out of memory");
+    };
+    // SAFETY: the layout is non-zero-sized (the header is at least 16 bytes)
+    // and was validated by `from_size_align`.
+    let base = unsafe { alloc::alloc::alloc_zeroed(layout) };
+    if base.is_null() {
+        rt_panic("mem_alloc: out of memory");
+    }
+    // SAFETY: `base` holds `head >= 16` bytes before the answer, aligned to
+    // `head`, so the two words just below it are in bounds and aligned.
+    unsafe {
+        let at = base.add(head);
+        (at as *mut i64).sub(1).write(size);
+        (at as *mut i64).sub(2).write(head as i64);
+        at as i64
+    }
+}
+
+/// `mem_free(a)`: gives back what `mem_alloc` made. Anything else is
+/// undefined, as it is in C ([E-MEM-UNCHECKED]).
+///
+/// # Safety: `at` came from `grasm_mem_alloc` and has not been freed.
+#[no_mangle]
+pub unsafe extern "C" fn grasm_mem_free(at: i64) {
+    let at = at as *mut u8;
+    let size = (at as *mut i64).sub(1).read() as usize;
+    let head = (at as *mut i64).sub(2).read() as usize;
+    alloc::alloc::dealloc(
+        at.sub(head),
+        core::alloc::Layout::from_size_align_unchecked(head + size, head),
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Builders ([L-LIB-BUILDER])
 // ---------------------------------------------------------------------------
 //

@@ -168,6 +168,7 @@ impl<'a> Emitter<'a> {
             Type::Bytes => "bytes".into(),
             Type::StrBuf => "strbuilder".into(),
             Type::ByteBuf => "bytebuilder".into(),
+            Type::Addr => "addr".into(),
             Type::Unit => "unit".into(),
             Type::Range => "range".into(),
             Type::Tuple(ts) => self.ty_list("tuple", ts),
@@ -1042,7 +1043,7 @@ impl<'a> Emitter<'a> {
                 } else {
                     self.head("builtin", span)
                 };
-                let kids = args.iter().map(|a| self.expr(a)).collect();
+                let kids = self.mem_args(args, span);
                 Node::new(format!("{h} {}", quote(&name)), kids)
             }
             Some(CallRes::Fn(q, targs)) => self.fn_call(&q, &targs, None, args, span),
@@ -1066,6 +1067,26 @@ impl<'a> Emitter<'a> {
                 let x = self.hole(span, "what a call reaches");
                 Node::leaf(format!("call {x}"))
             }
+        }
+    }
+
+    /// A built-in's arguments. Two raw-memory arguments are names, not values
+    /// ([L-LIB-MEM], [L-LIB-ATOMIC]): `mem_size_of(u16)` takes a type, printed
+    /// `(type u16)`, and an atomic's ordering is printed `(order acquire)`.
+    fn mem_args(&mut self, args: &[Expr], span: Span) -> Vec<Node> {
+        use grasm_sema::mem::MemOp;
+        match self.an.mem_ops.get(&key(span)) {
+            Some(MemOp::Size(t) | MemOp::Align(t)) => {
+                vec![Node::leaf(format!("type {}", t.name()))]
+            }
+            Some(MemOp::Atomic(_, _, o)) => {
+                let (last, values) = args.split_last().expect("an atomic has its ordering");
+                let mut kids: Vec<Node> = values.iter().map(|a| self.expr(a)).collect();
+                let o = o.name().to_ascii_lowercase();
+                kids.push(Node::leaf(format!("order {o} {}", span_atom(last.span()))));
+                kids
+            }
+            _ => args.iter().map(|a| self.expr(a)).collect(),
         }
     }
 
@@ -1129,7 +1150,7 @@ impl<'a> Emitter<'a> {
             Some(MethodRes::Builtin) => {
                 let h = self.head("method", span);
                 let mut kids = vec![self.expr(recv)];
-                kids.extend(args.iter().map(|a| self.expr(a)));
+                kids.extend(self.mem_args(args, span));
                 Node::new(format!("{h} {}", quote(&name.name)), kids)
             }
             Some(MethodRes::FieldFn) => {

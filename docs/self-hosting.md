@@ -170,6 +170,121 @@ Each addition gets spec clauses, implementations in both engines,
 conformance tests and a fuzz gate, exactly as fixed-width integers did.
 This is the only language growth during the migration.
 
+### 5.1 Raw memory and atomics: the design (S1 part two)
+
+Written before the code, 2026-10-21. The normative text is [T-ADDR],
+[T-MEM-UNSAFE], [L-LIB-MEM], [L-LIB-ATOMIC] and [E-MEM-UNCHECKED]; this
+section is why they say what they say.
+
+**What it builds on.** Tier 3 already has its gate: a C function is usable
+only inside `unsafe` ([T-UNSAFE-FFI]), an `unsafe` block puts `unsafe` in its
+function's row, rows reach the package's ceiling ([T-CAPABILITY]), and a
+dependency over its ceiling fails every consumer's build. Raw memory adds no
+second mechanism. Every raw-memory operation must sit inside `unsafe`, with
+the same diagnostic a C function gets, and performs a new built-in capability,
+**`mem`**, through the same rows. A package that uses raw memory therefore
+declares `capabilities = [..., "unsafe", "mem"]`, and one that does not
+declare `mem` fails its consumers' builds as it would for `io`. `mem` is a
+capability of its own for the reason `net` and `proc` are: a manifest saying
+`["unsafe", "mem"]` and not `io` tells a reviewer the package touches memory
+and does not call C. `mem` is reserved as an effect name (an `effect mem`
+with a handler would discharge it), exempt from the region rule as `unsafe`
+is (an address never points into a region's arena), and impure, so `par_map`
+and the multi-core `parallel` path refuse it.
+
+**Surface.** One type, five free functions, methods on the type. No new
+syntax: the parser is unchanged.
+
+- `addr`: an address, one machine word. It copies, `==` compares it, it
+  prints as an integer the language does not specify, it may sit in a list,
+  a field, a tuple or an Option; it is not a map key, has no order and no
+  operators. Holding one is safe; using one is not.
+- `mem_alloc(size, align)`, `mem_free(a)`, `mem_addr(n)` (an address from an
+  integer: forging, which is the point of `unsafe`), `mem_size_of(T)`,
+  `mem_align_of(T)`. The `mem_` prefix because `size_of` is already a `pub
+  fn` in ten packages and a built-in name cannot be redeclared.
+- `a.offset(n)`, `a.diff(b)`, `a.as_i64()`, and `a.load_T()`/`a.store_T(v)`
+  for each *layout type* `T`: the eight integer types, `f64` and `addr`.
+- `a.atomic_load_T(o)`, `a.atomic_store_T(v, o)`, `a.atomic_cas_T(want,
+  new, o)` and `a.atomic_add_T(n, o)` for the eight integer types. CAS and
+  add answer the value that was there.
+
+Two arguments are not values. `mem_size_of(u16)` takes a *type*, and an
+atomic's ordering is one of `Relaxed`, `Acquire`, `Release`, `AcqRel`,
+`SeqCst` written at the call. Grasm has no type-level expressions and no
+compile-time evaluation, and both of these must be known when the program is
+compiled (Zig requires an ordering to be `comptime` for the same reason). The
+checker reads them where they are written, so a store that `Acquire`s or a
+layout asked of a `str` is a compile error rather than a run-time panic.
+
+**What is checked where.**
+
+| | checker | interpreter | native |
+|---|---|---|---|
+| operation outside `unsafe`; `mem` over the ceiling | error | -- | -- |
+| layout of a non-layout type; an ordering the operation cannot have | error | -- | -- |
+| negative size, bad alignment, allocation that cannot be met | -- | panic | panic |
+| null, wild, freed or out-of-bounds access; misaligned access; bad `mem_free` | -- | panic | **undefined** |
+
+The last row is what `unsafe` is for. The interpreter detects all of it
+because it has no real addresses to give out: it keeps raw memory in a
+sandbox of its own, one byte array per allocation in a sorted map, at
+deterministic addresses starting at 64 KiB, aligned as asked, with a gap
+after each allocation and **never reused**, so a stale address always finds
+the tombstone (or nothing) rather than someone else's bytes. Every access is
+checked for a live allocation, bounds and alignment, and the panic says
+which. The sandbox is shared by every task interpreter of a run, behind the
+same `Rc<RefCell<..>>` discipline as the channel table, and is never
+borrowed across a switch. At run time an address is the interpreter's
+ordinary integer value, so lists, fields, printing and the journal need
+nothing new. A compiled build checks nothing: an access is one load or store
+instruction.
+
+**Engines.** Both engines look a raw-memory operation up by span in a table
+the checker writes (`Analysis::mem_ops`), the way they find a fixed-width
+operation's width, rather than by method name: natively an address is held
+as an `i64`, and a user's UFCS `fn offset(n: i64, ..)` must not turn into
+pointer arithmetic. The native backend lowers loads and stores to Cranelift
+`load`/`store` at the width (sign- or zero-extending narrow results), atomics
+to `atomic_load`, `atomic_store`, `atomic_cas` and `atomic_rmw add`, and
+`mem_alloc`/`mem_free` to two runtime functions over the system allocator
+(zeroed, so both engines read zeros from fresh memory). Cranelift makes
+every atomic sequentially consistent, which is at least what any ordering
+asks for; the ordering is kept in TIR for the S3 backend, which will choose
+`ldar`/`stlr`/`ldxr` by it.
+
+**Refcounted values.** No operation takes the address of a Grasm value, and
+a load or store moves only a layout type, never a `str`, list, struct,
+closure or `ref`. So raw memory and the values the runtime counts are
+disjoint: no address can name a live or freed `RtVal`, and nothing read from
+memory becomes one. In the interpreter this is total, since its values are
+not in the sandbox at all. Natively, `mem_addr` can forge an address into
+the runtime's own heap; that is undefined behaviour, in the same class as a
+C function writing through a pointer it was given, and it is exactly what
+`unsafe` plus `mem` in the manifest make visible.
+
+**Atomics and threads.** No Grasm program runs two threads over shared
+memory today: `par_map` and the multi-core `parallel` path take only pure
+work, and concurrent tasks are fibers on one thread. So the gates check what
+can be observed now (values, results, widths, wrapping, the CAS rule, the
+ordering rules) and, natively, that the instructions emitted are the atomic
+ones. Atomicity under contention becomes testable when threads that share
+memory arrive (S5's runtime, or `export fn` callbacks).
+
+**TIR.** `addr` is a type; `mem_size_of` and `mem_align_of` print their
+argument as `(type T)` and an atomic prints its ordering as `(order o)`;
+everything else is an ordinary `builtin` or `method` node.
+
+**Left for the owner.** Two choices were made conservatively and are worth a
+second look: the capability's name (`mem`), and that the interpreter
+*panics* on misuse rather than treating it as undefined (so a program that
+runs under `grasm run` may still crash when compiled, but never the other
+way round).
+
+**Status.** Built to this design on 2026-10-21, with `scripts/fuzz_rawmem.py`
+as its gate. The rest of §5 -- thread-locals, `export fn` and function
+addresses, a context switch, wider map keys -- is S1 part three.
+
 ## 6. Order of work
 
 Each stage ends with its exit criteria met and every gate green. Stages

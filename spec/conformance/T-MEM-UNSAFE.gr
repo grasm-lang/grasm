@@ -1,0 +1,41 @@
+//! tag: T-MEM-UNSAFE
+//! expect: error
+//! `mem_alloc` reaches raw memory, so it can only be used inside `unsafe`
+//! `load_i64` reaches raw memory, so it can only be used inside `unsafe`
+//! `str` has no layout in raw memory
+//! an atomic store cannot be `Acquire`
+//! an atomic load cannot be `Release`
+//! `atomic_add_i64` takes a memory ordering, written as its name
+//! function `tidy` performs effect(s) `mem` not in its declared row
+//! cannot compare `addr` values
+// Every raw-memory operation is Tier 3, as a C function is, and performs
+// `mem`, which travels through rows to the package's ceiling like any other
+// capability. The checker also refuses what it can see is wrong before the
+// program runs: a layout of a type that has none, and an ordering the
+// operation cannot have, which must be a name written at the call.
+fn outside() -> i64 {
+    let a = mem_alloc(8, 8)
+    a.load_i64()
+}
+
+fn wrong() / {unsafe, mem} {
+    unsafe {
+        let a = mem_alloc(8, 8)
+        let n = mem_size_of(str)
+        a.atomic_store_i64(1, Acquire)
+        let x = a.atomic_load_i64(Release)
+        let o = SeqCst
+        let y = a.atomic_add_i64(1, o)
+        let z = a < a.offset(1)
+    }
+}
+
+// `unsafe` alone does not cover it: raw memory is `mem` as well.
+fn tidy(a: addr) / {unsafe} {
+    unsafe {
+        mem_free(a)
+    }
+}
+
+fn main() {
+}
