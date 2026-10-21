@@ -14,6 +14,12 @@
 // shows; a zero record count in the first header means nothing to undo
 // (a journal emptied in PERSIST mode).
 //
+// The page and sector sizes are read from the first header only; later
+// headers carry them but SQLite never looks (pager.c, readJournalHdr).
+// And a first header whose sizes are out of range is not an error: the
+// process that wrote it died before it was synced, so playback stops
+// there and the database is left as it is.
+//
 // `parse` reads the segments, `records` the records that count, and
 // `rollback` the database a playback leaves.
 
@@ -56,22 +62,30 @@ fn header_at(j: bytes, at: i64) -> JournalHeader ! JournalError {
     if at + 28 > j.len() or not is_magic(j, at) {
         fail(JournalMalformed("no journal header at {at}"))
     }
-    let h = JournalHeader{ records: be(j, at + 8), nonce: be(j, at + 12), db_pages: be(j, at + 16), sector: be(j, at + 20), page_size: be(j, at + 24), at: at }
-    if h.page_size < 512 or h.page_size > 65536 or h.page_size.bit_and(h.page_size - 1) != 0 {
-        fail(JournalMalformed("a page size of {h.page_size}"))
-    }
-    if h.sector < 32 or h.sector > 65536 or h.sector.bit_and(h.sector - 1) != 0 {
-        fail(JournalMalformed("a sector size of {h.sector}"))
-    }
-    return h
+    return JournalHeader{ records: be(j, at + 8), nonce: be(j, at + 12), db_pages: be(j, at + 16), sector: be(j, at + 20), page_size: be(j, at + 24), at: at }
+}
+
+/// Whether a first header's sizes are ones SQLite would play back with:
+/// powers of two, the page from 512 and the sector from 32, both at most
+/// 65536.
+fn sizes_in_range(h: JournalHeader) -> bool {
+    let page_ok = h.page_size >= 512 and h.page_size <= 65536 and h.page_size.bit_and(h.page_size - 1) == 0
+    let sector_ok = h.sector >= 32 and h.sector <= 65536 and h.sector.bit_and(h.sector - 1) == 0
+    return page_ok and sector_ok
 }
 
 /// The segments' headers, and the records of each that count.
 pub fn parse(j: bytes) -> [(JournalHeader, [JournalRecord])] ! JournalError {
     var out: [(JournalHeader, [JournalRecord])] = []
     var at = 0
-    while at < j.len() and is_magic(j, at) {
+    while at + 28 <= j.len() and is_magic(j, at) {
         let h = try header_at(j, at)
+        // An unsynced first header ends playback before it starts. Later
+        // headers' sizes are never read: a torn or flipped one there used
+        // to fail the whole rollback, where SQLite plays the journal back.
+        if out.len() == 0 and not sizes_in_range(h) {
+            break
+        }
         // Every segment uses the first header's page size.
         let size = if out.len() > 0 { out[0].0.page_size } else { h.page_size }
         let sector = if out.len() > 0 { out[0].0.sector } else { h.sector }

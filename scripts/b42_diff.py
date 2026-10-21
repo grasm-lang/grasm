@@ -559,6 +559,43 @@ for i in range(12):
     spec = write(f"{snap_db} {snap_j}\n", "spec")
     cases.append(("journal", spec, file_check(spec + ".out", open(os.path.join(o, "j.db"), "rb").read()), "journal"))
 
+# Pinned: a damaged size field in a journal header. SQLite reads the page
+# and sector sizes from the first header only, and an out-of-range pair
+# there stops playback rather than failing it (pager.c, readJournalHdr).
+# sqlitejournal failed the whole rollback when a *later* header's sector
+# field had a flipped bit -- a random seed of the bit-flip cases above found
+# it once in many runs, so the shapes are pinned here rather than left to
+# chance. cache_size=1 makes SQLite spill, which writes a header per spill.
+MAGIC = bytes.fromhex("d9d505f920a163d7")
+for where, field, bit in [("later", 20, 18), ("later", 24, 3), ("first", 20, 18), ("first", 24, 1)]:
+    d = tempfile.mkdtemp(dir=work)
+    c = sqlite3.connect(os.path.join(d, "j.db"), isolation_level=None)
+    c.execute("PRAGMA page_size=512"); c.execute("PRAGMA journal_mode=PERSIST")
+    c.execute("CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT)")
+    c.execute("BEGIN"); fill(c, 300); c.execute("COMMIT"); c.close()
+    run([sys.executable, "-c", CHILD % (1, 3, 100, 4)], cwd=d)
+    j = bytearray(open(os.path.join(d, "j.db-journal"), "rb").read())
+    heads = [i for i in range(0, len(j), 512) if j[i:i + 8] == MAGIC]
+    assert len(heads) >= 2, f"the pinned journal has {len(heads)} header(s); it needs several"
+    at = heads[1] if where == "later" else heads[0]
+    j[at + field + 3 - bit // 8] ^= 1 << (bit % 8)
+    snap_db, snap_j = path_for("db"), path_for("journal")
+    shutil.copy(os.path.join(d, "j.db"), snap_db)
+    open(snap_j, "wb").write(bytes(j))
+    o = tempfile.mkdtemp(dir=work)
+    shutil.copy(snap_db, os.path.join(o, "j.db")); shutil.copy(snap_j, os.path.join(o, "j.db-journal"))
+    oc = sqlite3.connect(os.path.join(o, "j.db"))
+    try:
+        oc.execute("SELECT count(*) FROM t").fetchall()
+    except sqlite3.DatabaseError:
+        # A first header SQLite will not play back leaves the half-written
+        # database in place, and reading it then reports it malformed. The
+        # bytes on disk are still the answer.
+        assert where == "first", "a damaged later header should still roll back"
+    oc.close()
+    spec = write(f"{snap_db} {snap_j}\n", "spec")
+    cases.append(("journal", spec, file_check(spec + ".out", open(os.path.join(o, "j.db"), "rb").read()), "journal"))
+
 
 # --- x86-64 lengths --------------------------------------------------------------------------------------
 
