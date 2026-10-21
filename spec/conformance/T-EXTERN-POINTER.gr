@@ -7,6 +7,7 @@
 //! the length is the program's to pass: 0 true
 //! a str is copied, so the original is untouched: hello 5
 //! every spelling is the same call: 5 5 5 5
+//! an addr comes back, and goes back: true
 // A `str` or `bytes` argument to an `extern fn` crosses as a pointer.
 //
 // The functions used here are the ones every C library has and whose answers
@@ -14,6 +15,8 @@
 extern fn strlen(s: str) -> i64
 extern fn atoi(s: str) -> i64
 extern fn memcmp(a: bytes, b: bytes, n: i64) -> i64
+extern fn strchr(s: str, c: i32) -> addr
+extern fn free(p: addr)
 
 fn main() / {io, unsafe} {
     unsafe {
@@ -47,5 +50,12 @@ fn main() / {io, unsafe} {
         // boxed value's own address and `strlen` answered 1 for every string,
         // while `grasm run` answered correctly.
         print("every spelling is the same call: {strlen(s)} {s.strlen()} {s |> strlen} {[s].map(strlen)[0]}")
+
+        // An `addr` crosses both ways ([T-ADDR]). A character that is not in
+        // the string is a null pointer each time, and an address C gave can
+        // be given back to C -- `free` of a null pointer does nothing.
+        let none = strchr("abc", 122)
+        print("an addr comes back, and goes back: {none == strchr("xyz", 97)}")
+        free(none)
     }
 }

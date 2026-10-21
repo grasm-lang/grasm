@@ -415,8 +415,13 @@ pub fn effects_of_program(program: &crate::loader::Program) -> BTreeSet<String> 
             continue;
         }
         let escapes = ctx.fns[key].is_pub || (module == entry_module && name == "main");
-        if escapes {
+        if escapes || ctx.fns[key].is_export {
             all.extend(row.iter().cloned());
+        }
+        // C may call an export with anything, from anywhere, any number of
+        // times: declaring one is Tier 3, whatever its body does ([T-EXPORT]).
+        if ctx.fns[key].is_export {
+            all.insert(UNSAFE.to_string());
         }
     }
     // Doc examples count, for the same reason and more sharply. `grasm test`
@@ -2917,6 +2922,9 @@ pub fn effect_sites(program: &crate::loader::Program) -> HashMap<String, String>
         };
         for decl in &file.module.decls {
             let Decl::Fn(f) = decl else { continue };
+            if f.is_export {
+                note(UNSAFE, f.name.span);
+            }
             let mut sites: Vec<(String, Span)> = Vec::new();
             site_block(&f.body, &externs, &effect_names, &mut sites);
             for (n, sp) in sites {

@@ -201,6 +201,14 @@ pub enum MemOp {
     Store(MemTy),
     /// The ordering argument is a name, not a value, and is not evaluated.
     Atomic(Atomic, MemTy, Order),
+    /// `mem_fn_addr(f)` ([T-FN-ADDR]); which function is in [`CFacts::ops`].
+    FnAddr,
+    /// `a.call_c(Sig, ..)` ([L-LIB-CALL-C]); the signature is in
+    /// [`CFacts::ops`].
+    CallC,
+    /// `mem_tls(C)` ([T-TLS]), a cell of this layout type; which cell is in
+    /// [`CFacts::ops`].
+    Tls(MemTy),
 }
 
 /// What a method name on an `addr` asks for, before its ordering (if any) is
@@ -210,6 +218,7 @@ pub fn method(name: &str) -> Option<MethodKind> {
         "offset" => return Some(MethodKind::Plain(MemOp::Offset)),
         "diff" => return Some(MethodKind::Plain(MemOp::Diff)),
         "as_i64" => return Some(MethodKind::Plain(MemOp::ToInt)),
+        "call_c" => return Some(MethodKind::CallC),
         _ => {}
     }
     if let Some(rest) = name.strip_prefix("atomic_") {
@@ -239,6 +248,8 @@ pub enum MethodKind {
     Plain(MemOp),
     /// The ordering comes from the call's last argument.
     Atomic(Atomic, MemTy),
+    /// `call_c`: the signature comes from the call's first argument.
+    CallC,
 }
 
 /// The built-in free functions of raw memory.
@@ -248,8 +259,110 @@ pub const FREE_FNS: &[&str] = &[
     "mem_addr",
     "mem_size_of",
     "mem_align_of",
+    "mem_fn_addr",
+    "mem_tls",
 ];
 
 /// The largest alignment `mem_alloc` takes: a page, which is the most any
 /// allocator the runtime will be built from needs.
 pub const MAX_ALIGN: i64 = 4096;
+
+/// What may cross between Grasm and C: a layout type, or -- into C only -- a
+/// `str` (as a NUL-terminated copy) or `bytes` (as its buffer)
+/// ([T-EXTERN-POINTER]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CTy {
+    Layout(MemTy),
+    Str,
+    Bytes,
+}
+
+impl CTy {
+    pub fn name(self) -> &'static str {
+        match self {
+            CTy::Layout(t) => t.name(),
+            CTy::Str => "str",
+            CTy::Bytes => "bytes",
+        }
+    }
+}
+
+/// A C signature: what an `extern fn` declares, what a `call_c` is told, and
+/// what an exported or addressed Grasm function has. `ret` is `None` for no
+/// result.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CSig {
+    pub params: Vec<CTy>,
+    pub ret: Option<MemTy>,
+}
+
+impl CSig {
+    /// As a reader writes it: `(i64, addr) -> i32`, or `(f64)` for no result.
+    pub fn show(&self) -> String {
+        let ps: Vec<&str> = self.params.iter().map(|p| p.name()).collect();
+        match self.ret {
+            Some(r) => format!("({}) -> {}", ps.join(", "), r.name()),
+            None => format!("({})", ps.join(", ")),
+        }
+    }
+}
+
+/// A function-address operation, resolved ([T-FN-ADDR], [L-LIB-CALL-C]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum COp {
+    /// `mem_fn_addr(f)`: `f` qualified, and whether it is a C function.
+    FnAddr { target: String, is_extern: bool },
+    /// `a.call_c(Sig, ..)`: the signature `Sig` names.
+    CallC(CSig),
+    /// `mem_tls(C)`: the cell, qualified.
+    Tls { cell: String },
+}
+
+/// Everything the engines need about the C boundary and per-thread cells,
+/// from the checker.
+#[derive(Clone, Debug, Default)]
+pub struct CFacts {
+    /// Each `mem_fn_addr` and `call_c`, by the call's whole span.
+    pub ops: std::collections::HashMap<(u32, u32), COp>,
+    /// The C signature of every `extern fn`, and of every Grasm function that
+    /// is exported or has its address taken, by qualified name.
+    pub sigs: std::collections::BTreeMap<String, CSig>,
+    /// Every `export fn`, qualified, in program order.
+    pub exports: Vec<String>,
+    /// Every Grasm function whose address is taken, qualified.
+    pub addressed: std::collections::BTreeSet<String>,
+    /// Every `thread_local` cell, qualified, and its layout type ([T-TLS]).
+    pub cells: std::collections::BTreeMap<String, MemTy>,
+}
+
+impl CFacts {
+    /// Where each cell sits in a thread's block, and the block's size: cells
+    /// in order of qualified name, each at a multiple of its own size, the
+    /// block a multiple of 8. The whole program's, so every module agrees.
+    pub fn tls_layout(&self) -> (std::collections::BTreeMap<String, i64>, i64) {
+        let mut at = 0i64;
+        let mut out = std::collections::BTreeMap::new();
+        for (name, t) in &self.cells {
+            let n = t.size();
+            at = (at + n - 1) / n * n;
+            out.insert(name.clone(), at);
+            at += n;
+        }
+        (out, (at + 7) / 8 * 8)
+    }
+}
+
+/// The capabilities a function C reaches may perform: those no handler
+/// discharges and that need no task scheduler ([T-FN-ADDR]).
+pub fn c_reachable_effect(e: &str) -> bool {
+    matches!(e, "io" | "net" | "proc" | "unsafe" | "mem")
+}
+
+/// Symbol names the toolchain gives its own code, which an `export fn` may
+/// not take ([T-EXPORT]).
+pub fn reserved_symbol(name: &str) -> bool {
+    name == "main"
+        || ["grasm_", "g_", "gc_", "gp_", "gpf_", "gv_", "gx_"]
+            .iter()
+            .any(|p| name.starts_with(p))
+}

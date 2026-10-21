@@ -953,25 +953,31 @@ fn map_delete(p: Prog, inout m: Value, k: Value) -> bool {
         VStr(s) -> {
             var ks = eval.str_map(value.take(whole))
             let had = ks.delete(s)
-            m = VMap(map(), map(), ks, map())
+            m = VMap(map(), map(), ks, map(), map())
             had
         }
         VInt(i) -> {
             var ki = eval.int_map(value.take(whole))
             let had = ki.delete(i)
-            m = VMap(map(), ki, map(), map())
+            m = VMap(map(), ki, map(), map(), map())
             had
         }
         VBool(b) -> {
             var kb = eval.bool_map(value.take(whole))
             let had = kb.delete(b)
-            m = VMap(kb, map(), map(), map())
+            m = VMap(kb, map(), map(), map(), map())
             had
         }
         VU64(u) -> {
             var ku = eval.u64_map(value.take(whole))
             let had = ku.delete(u)
-            m = VMap(map(), map(), map(), ku)
+            m = VMap(map(), map(), map(), ku, map())
+            had
+        }
+        VTuple(_) -> {
+            var kt = eval.tuple_map(value.take(whole))
+            let had = kt.delete(value.key_text(k))
+            m = VMap(map(), map(), map(), map(), kt)
             had
         }
         _ -> panic("invalid map key `{value.show(p, k)}`")
@@ -980,7 +986,11 @@ fn map_delete(p: Prog, inout m: Value, k: Value) -> bool {
 
 fn map_get(p: Prog, m: Value, k: Value) -> Option[Value] {
     match m {
-        VMap(kb, ki, ks, ku) -> match k {
+        VMap(kb, ki, ks, ku, kt) -> match k {
+            VTuple(_) -> match kt.get(value.key_text(k)) {
+                Some(e) -> Some(value.pair_half(Some(e), 1))
+                None -> None
+            }
             VStr(s) -> ks.get(s)
             VInt(i) -> ki.get(i)
             VBool(b) -> kb.get(b)
@@ -993,7 +1003,7 @@ fn map_get(p: Prog, m: Value, k: Value) -> Option[Value] {
 
 fn map_len(m: Value) -> i64 {
     match m {
-        VMap(kb, ki, ks, ku) -> kb.len() + ki.len() + ks.len() + ku.len()
+        VMap(kb, ki, ks, ku, kt) -> kb.len() + ki.len() + ks.len() + ku.len() + kt.len()
         _ -> 0
     }
 }
@@ -1113,7 +1123,7 @@ fn apply_method(inout cx: Cx, e: i64, code: i64, recv: Value, inout args: [Value
         VU64(u) -> return u64_method(cx, code, u, args)
         VStrB(b) -> return builder_method(code, b)
         VByteB(b) -> return byte_builder_method(code, b, args)
-        VMap(_, _, _, _) -> {
+        VMap(_, _, _, _, _) -> {
             match code {
                 // len
                 1 -> return VInt(map_len(recv))

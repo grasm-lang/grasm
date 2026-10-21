@@ -208,6 +208,9 @@ pub struct Analysis {
     /// `fn offset(n: i64, ..)` is not pointer arithmetic. A layout's type and
     /// an atomic's ordering are written as names, not values, and live here.
     pub mem_ops: HashMap<(u32, u32), crate::mem::MemOp>,
+    /// The C boundary ([T-FN-ADDR], [L-LIB-CALL-C], [T-EXPORT]): each
+    /// `mem_fn_addr` and `call_c`, the C signatures, the exports.
+    pub c_facts: crate::mem::CFacts,
     /// What the checker decided, for TIR (`docs/tir.md`). Present only when
     /// the program was checked with [`check_program_tir`].
     pub tir: Option<crate::tirfacts::TirFacts>,
@@ -343,6 +346,8 @@ pub const BUILTIN_FREE_FNS: &[&str] = &[
     "mem_addr",
     "mem_size_of",
     "mem_align_of",
+    "mem_fn_addr",
+    "mem_tls",
     "read_bytes",
     "read_bytes_at",
     "append_bytes",
@@ -492,6 +497,10 @@ fn check_modules_in(
     for f in files {
         c.current_module = f.name.clone();
         c.collect_consts(f.module);
+    }
+    for f in files {
+        c.current_module = f.name.clone();
+        c.collect_thread_locals(f.module);
     }
     for f in files {
         c.current_module = f.name.clone();
@@ -689,6 +698,7 @@ fn check_modules_in(
         float_sums: c.float_sums,
         parallel_ok: c.parallel_ok.clone(),
         mem_ops: c.mem_ops.clone(),
+        c_facts: c.c_facts.clone(),
         tir,
         defs: c.defs,
         diagnostics,
@@ -815,6 +825,11 @@ struct Checker {
     unsafe_depth: u32,
     /// See `Analysis::mem_ops`.
     mem_ops: HashMap<(u32, u32), crate::mem::MemOp>,
+    /// See `Analysis::c_facts`.
+    c_facts: crate::mem::CFacts,
+    /// Each `export fn`'s symbol, with where it was declared: one name, one
+    /// symbol ([T-EXPORT]).
+    export_names: std::collections::BTreeMap<String, Span>,
     /// How many `region` blocks enclose it.
     /// Whether the block being checked has its value thrown away.
     ///
@@ -1182,6 +1197,8 @@ impl Checker {
             handler_ids: std::collections::HashSet::new(),
             unsafe_depth: 0,
             mem_ops: HashMap::new(),
+            c_facts: Default::default(),
+            export_names: Default::default(),
             discarding: false,
             tail_fn: None,
             tail_fn_name: None,
@@ -1872,9 +1889,24 @@ capability visible to everyone who depends on you",
                     self.error_help(
                         p.ty.span(),
                         format!("`{shown}` has no C representation"),
-                        "an `extern fn` parameter is `i64`, `f64`, `str` or `bytes`",
+                        "an `extern fn` parameter is an integer type, `f64`, `addr`, `str` or `bytes`",
                     );
                 }
+            }
+            // One symbol, one meaning: an `export fn` of the same name would
+            // be the definition this declaration links to ([T-EXPORT]).
+            if self.export_names.contains_key(&e.name.name) {
+                self.error_help(
+                    e.name.span,
+                    format!(
+                        "`{}` is both an `extern fn` and an `export fn`",
+                        e.name.name
+                    ),
+                    "they would be one symbol; call the exported function by its Grasm name",
+                );
+            }
+            if let Some(sig) = self.c_sig_of(&params, &ret) {
+                self.c_facts.sigs.insert(key.clone(), sig);
             }
             if ret != Type::Unit && !Self::is_c_abi_type(&ret) {
                 let shown = self.show(&ret);
@@ -1885,7 +1917,7 @@ capability visible to everyone who depends on you",
 valid for the call and the buffer belongs to Grasm. It may not *return* one: \
 nothing says who owns it, how long it lives, or how long it is"
                 } else {
-                    "an `extern fn` returns `i64`, `f64` or nothing"
+                    "an `extern fn` returns an integer type, `f64`, `addr` or nothing"
                 };
                 self.error_help(e.span, format!("`{shown}` has no C representation"), help);
             }
@@ -1910,7 +1942,26 @@ nothing says who owns it, how long it lives, or how long it is"
     /// register, and a silent width mismatch at an FFI boundary is the kind of
     /// bug that shows up as garbage three calls later.
     fn is_c_abi_type(t: &Type) -> bool {
-        matches!(t, Type::I64 | Type::Int(_) | Type::F64)
+        matches!(t, Type::I64 | Type::Int(_) | Type::F64 | Type::Addr)
+    }
+
+    /// The C signature of parameters and a result that all cross
+    /// ([T-EXTERN-POINTER]), or `None` if one does not.
+    fn c_sig_of(&self, params: &[Type], ret: &Type) -> Option<crate::mem::CSig> {
+        use crate::mem::{CTy, MemTy};
+        let mut ps = Vec::with_capacity(params.len());
+        for p in params {
+            ps.push(match p {
+                Type::Str => CTy::Str,
+                Type::Bytes => CTy::Bytes,
+                t => CTy::Layout(MemTy::of(t)?),
+            });
+        }
+        let ret = match ret {
+            Type::Unit => None,
+            t => Some(MemTy::of(t)?),
+        };
+        Some(crate::mem::CSig { params: ps, ret })
     }
 
     /// What may cross *into* C.
@@ -1923,7 +1974,7 @@ nothing says who owns it, how long it lives, or how long it is"
     fn is_c_param_type(t: &Type) -> bool {
         matches!(
             t,
-            Type::I64 | Type::Int(_) | Type::F64 | Type::Str | Type::Bytes
+            Type::I64 | Type::Int(_) | Type::F64 | Type::Addr | Type::Str | Type::Bytes
         )
     }
 
@@ -2644,19 +2695,50 @@ different name, or call it as a method if you meant to extend a type (UFCS)",
                     bounds.push(names);
                 }
                 bounds.resize(generics.len(), Vec::new());
-                self.fns.insert(
-                    key,
-                    FnInfo {
-                        is_pub: f.is_pub,
-                        generics: generics.len(),
-                        bounds,
-                        params,
-                        modes: f.params.iter().map(|p| p.mode).collect(),
-                        ret,
-                        err,
-                    },
-                );
+                let info = FnInfo {
+                    is_pub: f.is_pub,
+                    generics: generics.len(),
+                    bounds,
+                    params,
+                    modes: f.params.iter().map(|p| p.mode).collect(),
+                    ret,
+                    err,
+                };
+                if f.is_export {
+                    self.check_export(f, &key, &info);
+                }
+                self.fns.insert(key, info);
             }
+        }
+    }
+
+    /// `export fn` ([T-EXPORT]): C reaches it by its own name, so the name is
+    /// one symbol in the program and the signature is one C can call.
+    fn check_export(&mut self, f: &FnDecl, key: &str, info: &FnInfo) {
+        let name = &f.name.name;
+        if crate::mem::reserved_symbol(name) {
+            self.error_help(
+                f.name.span,
+                format!(
+                    "`{name}` cannot be exported: the toolchain gives that name to its own code"
+                ),
+                "`main` is the program's C entry, and names beginning `grasm_`, `g_`, `gc_`, \
+`gp_`, `gpf_`, `gv_` or `gx_` are the runtime's and the compiler's",
+            );
+            return;
+        }
+        if self.export_names.contains_key(name) {
+            self.error_help(
+                f.name.span,
+                format!("`{name}` is exported twice"),
+                "an export's name is its C symbol, and a program can define a symbol once",
+            );
+            return;
+        }
+        self.export_names.insert(name.clone(), f.name.span);
+        if let Some(sig) = self.c_entry_sig(key, info, f.name.span, "be exported") {
+            self.c_facts.sigs.insert(key.to_string(), sig);
+            self.c_facts.exports.push(key.to_string());
         }
     }
 
@@ -4315,6 +4397,276 @@ perform it",
         }
     }
 
+    /// The cell `mem_tls`'s argument names ([T-TLS]): written as a name, and
+    /// one this module declares.
+    fn tls_cell(&mut self, arg: &Expr) -> Option<(String, crate::mem::MemTy)> {
+        let found = match arg {
+            Expr::Ident(id) if self.lookup(&id.name).is_none() => {
+                let key = format!("{}::{}", self.current_module, id.name);
+                self.c_facts.cells.get(&key).map(|t| (key, *t))
+            }
+            _ => None,
+        };
+        if found.is_none() {
+            self.error_help(
+                arg.span(),
+                "`mem_tls` takes the name of a `thread_local` cell this module declares"
+                    .to_string(),
+                "declare one with `thread_local NAME: T`; a cell is private to its module, so \
+another module is handed its address by a function ([T-TLS])",
+            );
+        }
+        found
+    }
+
+    /// `thread_local NAME: T` ([T-TLS]): a layout type, private to the module.
+    fn collect_thread_locals(&mut self, module: &Module) {
+        for decl in &module.decls {
+            let Decl::ThreadLocal(t) = decl else { continue };
+            let key = format!("{}::{}", self.current_module, t.name.name);
+            if self.fns.contains_key(&key)
+                || self.consts.contains_key(&key)
+                || self.c_facts.cells.contains_key(&key)
+            {
+                self.error(t.name.span, format!("duplicate name `{}`", t.name.name));
+                continue;
+            }
+            if t.is_pub {
+                self.error_help(
+                    t.name.span,
+                    format!("thread-local cell `{}` cannot be `pub`", t.name.name),
+                    "a cell is private to its module; hand out its address from a `pub fn` \
+whose body is `unsafe`",
+                );
+            }
+            let ty = self.resolve_type(&t.ty, &[]);
+            if matches!(ty, Type::Error) {
+                continue;
+            }
+            match crate::mem::MemTy::of(&ty) {
+                Some(m) => {
+                    self.c_facts.cells.insert(key, m);
+                }
+                None => {
+                    let shown = self.show(&ty);
+                    self.error_help(
+                        t.ty.span(),
+                        format!("a thread-local cell cannot hold `{shown}`"),
+                        "a cell holds a layout type -- i8, i16, i32, i64, u8, u16, u32, u64, f64 \
+or addr -- and never a value the runtime counts ([T-TLS])",
+                    );
+                }
+            }
+        }
+    }
+
+    /// The function `mem_fn_addr`'s argument names ([T-FN-ADDR]): written as
+    /// a name, `f` or `module.f`, and never evaluated. A Grasm function must
+    /// have a signature C can call; a C function already has one.
+    fn fn_addr_target(&mut self, arg: &Expr) -> Option<crate::mem::COp> {
+        let (key, at) = match arg {
+            Expr::Ident(id) if self.lookup(&id.name).is_none() => {
+                (format!("{}::{}", self.current_module, id.name), id.span)
+            }
+            Expr::Field { recv, name, .. } => {
+                let target = match &**recv {
+                    Expr::Ident(m) if self.lookup(&m.name).is_none() => self
+                        .module_imports
+                        .get(&self.current_module)
+                        .and_then(|i| i.get(&m.name))
+                        .cloned(),
+                    _ => None,
+                };
+                match target {
+                    Some(t) => (format!("{t}::{}", name.name), name.span),
+                    None => (String::new(), arg.span()),
+                }
+            }
+            _ => (String::new(), arg.span()),
+        };
+        let Some(info) = self.fns.get(&key).cloned() else {
+            self.error_help(
+                at,
+                "`mem_fn_addr` takes the name of a declared function".to_string(),
+                "write the function's name, `f` or `module.f`; a closure or a value held in a \
+variable has no address C can call ([T-FN-ADDR])",
+            );
+            return None;
+        };
+        if self.extern_names.contains(&key) {
+            return Some(crate::mem::COp::FnAddr {
+                target: key,
+                is_extern: true,
+            });
+        }
+        if !key.starts_with(&format!("{}::", self.current_module)) && !info.is_pub {
+            self.error(at, format!("function `{key}` is private to its module"));
+            return None;
+        }
+        let sig = self.c_entry_sig(&key, &info, at, "have its address taken")?;
+        self.c_facts.sigs.insert(key.clone(), sig);
+        self.c_facts.addressed.insert(key.clone());
+        Some(crate::mem::COp::FnAddr {
+            target: key,
+            is_extern: false,
+        })
+    }
+
+    /// The C signature of a Grasm function C will reach -- exported, or
+    /// through its address -- or `None`, having said why it has none
+    /// ([T-FN-ADDR]).
+    fn c_entry_sig(
+        &mut self,
+        key: &str,
+        info: &FnInfo,
+        at: Span,
+        what: &str,
+    ) -> Option<crate::mem::CSig> {
+        let name = key.rsplit("::").next().unwrap_or(key).to_string();
+        let mut ok = true;
+        if info.generics > 0 {
+            self.error_help(
+                at,
+                format!("generic function `{name}` cannot {what}"),
+                "C calls one machine function, and a generic has one per instantiation",
+            );
+            return None;
+        }
+        if info.err.is_some() {
+            self.error_help(
+                at,
+                format!("fallible function `{name}` cannot {what}"),
+                "C has no way to receive a Grasm error; return a status code instead",
+            );
+            ok = false;
+        }
+        if info.modes.iter().any(|m| *m != ParamMode::Let) {
+            self.error_help(
+                at,
+                format!("`{name}` cannot {what}: it has an `inout` or `own` parameter"),
+                "C passes values, not Grasm places",
+            );
+            ok = false;
+        }
+        let ret = Some(&info.ret).filter(|r| !matches!(r, Type::Unit));
+        for t in info.params.iter().chain(ret) {
+            if crate::mem::MemTy::of(t).is_none() {
+                let shown = self.show(t);
+                self.error_help(
+                    at,
+                    format!("`{name}` cannot {what}: `{shown}` does not cross to C"),
+                    "its parameters and result must be layout types: the integer types, \
+`f64` and `addr` ([T-FN-ADDR])",
+                );
+                ok = false;
+            }
+        }
+        let row = self.fn_rows.get(key).cloned().unwrap_or_default();
+        let held: Vec<String> = row
+            .into_iter()
+            .filter(|e| !crate::mem::c_reachable_effect(e))
+            .collect();
+        if !held.is_empty() {
+            self.error_help(
+                at,
+                format!(
+                    "`{name}` cannot {what}: it performs `{}`",
+                    held.join("`, `")
+                ),
+                "C calls it outside every `with` and outside the task scheduler, so it may \
+perform only `io`, `net`, `proc`, `unsafe` and `mem` ([T-FN-ADDR])",
+            );
+            ok = false;
+        }
+        if !ok {
+            return None;
+        }
+        self.c_sig_of(&info.params, &info.ret)
+    }
+
+    /// `a.call_c(Sig, ..)` ([L-LIB-CALL-C]): `Sig` names a function type,
+    /// read where a value would go and never evaluated.
+    fn check_call_c(&mut self, name: &Ident, args: &[Expr], span: Span) -> Type {
+        let Some(Expr::Ident(t)) = args.first() else {
+            return self.error_help(
+                span,
+                "`call_c` takes a signature first, written as the name of a type alias".to_string(),
+                "for example `type Cmp = fn(addr, addr) -> i32` and then `a.call_c(Cmp, x, y)`",
+            );
+        };
+        let te = TypeExpr::Name {
+            path: grasm_syntax::ast::Path {
+                segments: vec![t.clone()],
+                span: t.span,
+            },
+            args: vec![],
+            span: t.span,
+        };
+        let generics = self.current_generics.clone();
+        let ty = self.resolve_type(&te, &generics);
+        if matches!(ty, Type::Error) {
+            return Type::Error;
+        }
+        let Type::Fn { params, ret, .. } = ty else {
+            let shown = self.show(&ty);
+            return self.error_help(
+                t.span,
+                format!("`call_c` takes a function type, and `{shown}` is not one"),
+                "name a type alias such as `type Cmp = fn(addr, addr) -> i32`",
+            );
+        };
+        let mut ok = true;
+        for p in &params {
+            if !Self::is_c_param_type(p) {
+                let shown = self.show(p);
+                self.error_help(
+                    t.span,
+                    format!("`{shown}` has no C representation"),
+                    "a `call_c` parameter is what an `extern fn` may take: an integer \
+type, `f64`, `addr`, `str` or `bytes`",
+                );
+                ok = false;
+            }
+        }
+        if !matches!(*ret, Type::Unit) && !Self::is_c_abi_type(&ret) {
+            let shown = self.show(&ret);
+            self.error_help(
+                t.span,
+                format!("`{shown}` has no C representation"),
+                "a `call_c` result is an integer type, `f64`, `addr` or nothing",
+            );
+            ok = false;
+        }
+        let values = &args[1..];
+        if values.len() != params.len() {
+            return self.error(
+                span,
+                format!(
+                    "`{}` through `{}` takes {} argument(s) after the signature, got {}",
+                    name.name,
+                    t.name,
+                    params.len(),
+                    values.len()
+                ),
+            );
+        }
+        for (a, p) in values.iter().zip(&params) {
+            self.check_expr(a, p);
+        }
+        if !ok {
+            return Type::Error;
+        }
+        let Some(sig) = self.c_sig_of(&params, &ret) else {
+            return Type::Error;
+        };
+        self.mem_ops
+            .insert((span.start, span.end), crate::mem::MemOp::CallC);
+        self.c_facts
+            .ops
+            .insert((span.start, span.end), crate::mem::COp::CallC(sig));
+        *ret
+    }
+
     /// Tier 3 for raw memory ([T-MEM-UNSAFE]): every operation on an address
     /// sits inside `unsafe`, as a C function does, and performs `mem`.
     fn require_unsafe_mem(&mut self, name: &str, span: Span) {
@@ -4354,6 +4706,22 @@ perform it",
             "mem_addr" => {
                 self.check_expr(&args[0], &Type::I64);
                 (MemOp::FromInt, Type::Addr)
+            }
+            "mem_fn_addr" => {
+                let Some(op) = self.fn_addr_target(&args[0]) else {
+                    return Type::Error;
+                };
+                self.c_facts.ops.insert((span.start, span.end), op);
+                (MemOp::FnAddr, Type::Addr)
+            }
+            "mem_tls" => {
+                let Some((cell, t)) = self.tls_cell(&args[0]) else {
+                    return Type::Error;
+                };
+                self.c_facts
+                    .ops
+                    .insert((span.start, span.end), crate::mem::COp::Tls { cell });
+                (MemOp::Tls(t), Type::Addr)
             }
             _ => {
                 let Some(t) = self.mem_layout_arg(&args[0], &id.name) else {
@@ -4423,8 +4791,17 @@ the only types a load or a store moves ([L-LIB-MEM])",
         // The checker knows the receiver is an address and the effect pass
         // does not, so the call site says what it performs, as a call
         // through a field does.
-        let row: std::collections::BTreeSet<String> = [crate::effects::MEM.to_string()].into();
+        let mut row: std::collections::BTreeSet<String> = [crate::effects::MEM.to_string()].into();
+        if kind == MethodKind::CallC {
+            // What a call through an address reaches cannot be known, so it
+            // performs what an `extern` call does ([L-LIB-CALL-C]).
+            row.insert(crate::effects::IO.to_string());
+            row.insert(crate::effects::UNSAFE.to_string());
+        }
         self.callee_rows.insert((span.start, span.end), row);
+        if kind == MethodKind::CallC {
+            return self.check_call_c(name, args, span);
+        }
         let arity = |c: &mut Self, want: usize| -> bool {
             if args.len() == want {
                 return true;
@@ -4441,6 +4818,7 @@ the only types a load or a store moves ([L-LIB-MEM])",
         };
         let (op, ret) =
             match kind {
+                MethodKind::CallC => unreachable!("handled above"),
                 MethodKind::Plain(op) => {
                     let (params, ret) = match op {
                         MemOp::Offset => (vec![Type::I64], Type::Addr),
@@ -6523,7 +6901,8 @@ only a number or a `bool` can come out — compute what you need and yield that"
                         return Type::Bytes;
                     }
                     // Raw memory ([L-LIB-MEM]).
-                    "mem_alloc" | "mem_free" | "mem_addr" | "mem_size_of" | "mem_align_of" => {
+                    "mem_alloc" | "mem_free" | "mem_addr" | "mem_size_of" | "mem_align_of"
+                    | "mem_fn_addr" | "mem_tls" => {
                         return self.check_mem_fn(id, args, span);
                     }
                     // [L-LIB-BUILDER]: an empty one of each.
@@ -9123,9 +9502,33 @@ same slot would race — pass a type that holds no `ref`, or use `map` inside th
         }
     }
 
-    /// Map keys must be orderable primitives.
+    /// Map keys must be orderable primitives, or tuples of them
+    /// ([T-MAP-KEY]).
     fn require_map_key(&mut self, k: &Type, span: Span) {
+        if !self.map_key_ok(k) {
+            let shown = self.show(k);
+            self.error_help(
+                span,
+                format!(
+                    "map keys must be an integer type, `str`, `bool` or a tuple of those, not `{shown}`"
+                ),
+                "use a key of those types, or a tuple of them for a key with several parts",
+            );
+        }
+    }
+
+    /// Whether `k` is a key type, noting each type parameter that is one --
+    /// inside a tuple as much as alone -- so its call sites can be held to it
+    /// ([T-MAP-KEY-GENERIC]).
+    fn map_key_ok(&mut self, k: &Type) -> bool {
         let r = self.uni.resolve(k);
+        if let Type::Tuple(items) = &r {
+            let mut ok = !items.is_empty();
+            for t in items.clone() {
+                ok &= self.map_key_ok(&t);
+            }
+            return ok;
+        }
         // A type *parameter* is allowed here and checked at each call site
         // instead ([T-MAP-KEY]). Without this a generic helper over maps —
         // `fn bump[K](inout m: Map[K, i64], k: K)`, the most repeated shape
@@ -9141,7 +9544,7 @@ same slot would race — pass a type that holds no `ref`, or use `map` inside th
                     .insert(i as usize);
             }
         }
-        if !matches!(
+        matches!(
             r,
             Type::I64
                 | Type::Int(_)
@@ -9150,14 +9553,7 @@ same slot would race — pass a type that holds no `ref`, or use `map` inside th
                 | Type::Var(_)
                 | Type::Generic(_)
                 | Type::Error
-        ) {
-            let shown = self.show(k);
-            self.error_help(
-                span,
-                format!("map keys must be `i64`, `str`, or `bool`, not `{shown}`"),
-                "use a primitive key, or serialize the value to a string key",
-            );
-        }
+        )
     }
 
     /// The function argument of a parallel operation, checked knowing it runs

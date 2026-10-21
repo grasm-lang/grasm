@@ -1,0 +1,222 @@
+// The C boundary ([T-EXTERN], [T-EXTERN-POINTER], [T-FN-ADDR],
+// [L-LIB-CALL-C]), crossed the way `grasm run` crosses it
+// (`crates/grasm_interp/src/interp.rs`, `c_call`, `fn_addr`, `call_c`).
+//
+// A C function is found in this process by its name, with `dlsym`, which is
+// how `grasm run` finds `getpid` in itself: this interpreter is a compiled
+// program, so it has libc loaded too. It is then called through its address
+// with the shape its declaration gives, by one of the call sites `ccall`
+// writes out. A Grasm function's address is made up, from the raw-memory
+// sandbox's next address, as the reference makes it; `call_c` through it
+// runs the function when the signature is the function's own. An address
+// the sandbox made cannot be handed to C, and one C handed over can be
+// called and handed back.
+import eval
+import load
+import value
+import ccall
+import rawmem
+
+/// Everything already loaded in this process, to `dlsym` on macOS.
+extern fn dlsym(handle: addr, name: str) -> addr
+
+/// Where the sandbox's first address goes, and the gap after each.
+let BASE = 65536
+let GAP = 64
+
+/// The C function `name`, found as `grasm run` finds one, or 0.
+fn find(name: str) -> i64 {
+    unsafe {
+        dlsym(mem_addr(-2), name).as_i64()
+    }
+}
+
+fn short(q: str) -> str {
+    let parts = q.split("::")
+    parts[parts.len() - 1]
+}
+
+fn not_found(name: str) {
+    panic("cannot find the C function `{name}` in this process — a compiled build links it, `grasm run` can only reach what is already loaded")
+}
+
+/// Whether the sandbox made `at`, for memory or for a function.
+fn made(cx: Cx, at: i64) -> bool {
+    at >= BASE and at < cx.mem_next and not cx.c_addrs.has(at)
+}
+
+/// Node `e`, an `OP_CALLEXTERN`: the arguments, then the call.
+pub fn call_extern_node(inout cx: Cx, e: i64) -> Value {
+    var vs: [Value] = []
+    if not eval.eval_kids(cx, e, 0, vs) {
+        return VUnit
+    }
+    call_extern(cx, cx.a[e], vs)
+}
+
+/// Calls the C function `fid` declares.
+pub fn call_extern(inout cx: Cx, fid: i64, inout args: [Value]) -> Value {
+    let name = short(cx.p.fn_name[fid])
+    let at = find(name)
+    if at == 0 {
+        not_found(name)
+    }
+    c_call(cx, name, at, cx.p.fn_csig[fid], args)
+}
+
+/// The parameter and result types of a signature `(i64, str) -> i64`.
+fn sig_parts(sig: str) -> ([str], str) {
+    let close = sig.index_of(")") ?? 0
+    let inner = sig.substr(1, close - 1)
+    let params: [str] = if inner.is_empty() { [] } else { inner.split(", ") }
+    let arrow = sig.index_of(" -> ") ?? -1
+    let ret = if arrow < 0 { "unit" } else { sig.substr(arrow + 4, sig.len() - arrow - 4) }
+    (params, ret)
+}
+
+/// The width code `eval.wrap` takes for a narrow integer type, or 0.
+fn narrow_code(t: str) -> i64 {
+    match t {
+        "i8" -> 1
+        "i16" -> 2
+        "i32" -> 3
+        "u8" -> 4
+        "u16" -> 5
+        "u32" -> 6
+        _ -> 0
+    }
+}
+
+/// Calls the C function at `at` by `sig`, as `grasm run`'s `c_call` does.
+fn c_call(inout cx: Cx, name: str, at: i64, sig: str, args: [Value]) -> Value {
+    let (params, ret) = sig_parts(sig)
+    var ks: [str] = []
+    for i in 0..args.len() {
+        let p = if i < params.len() { params[i] } else { "" }
+        let k = match args[i] {
+            VInt(n) -> {
+                if p == "addr" and made(cx, n) {
+                    panic("`grasm run` cannot hand C an address from its own sandbox (argument {i + 1} of `{name}`): C would read a made-up number, not memory")
+                }
+                "i"
+            }
+            VU64(_) -> "i"
+            VFloat(_) -> "f"
+            VStr(_) -> "s"
+            VBytes(_) -> "b"
+            _ -> {
+                panic("`{name}` cannot take this value across the C boundary")
+                ""
+            }
+        }
+        ks.push(k)
+    }
+    let rk = if ret == "unit" { "v" } else if ret == "f64" { "f" } else { "i" }
+    let got = unsafe {
+        ccall.call(mem_addr(at), ks.join(""), rk, args)
+    }
+    match got {
+        Some(VInt(x)) -> {
+            // A narrower result leaves the register's upper bits unspecified,
+            // so it is read at its own width.
+            if ret == "u64" {
+                VU64(x.as_u64())
+            } else if ret == "addr" {
+                if x != 0 {
+                    cx.c_addrs.set(x, true)
+                }
+                VInt(x)
+            } else {
+                VInt(eval.wrap(narrow_code(ret), x))
+            }
+        }
+        Some(v) -> v
+        None -> {
+            panic("`{name}` has a signature this interpreter cannot call (at most three arguments, and no mixed shapes past two)")
+            VUnit
+        }
+    }
+}
+
+/// Node `e`, an `OP_FNADDR` ([T-FN-ADDR]): a C function's real address, or
+/// the one made up for a Grasm function, the same each time.
+pub fn fn_addr(inout cx: Cx, e: i64) -> Value {
+    let fid = cx.a[e]
+    if cx.p.fn_extern[fid] {
+        let name = short(cx.p.fn_name[fid])
+        let at = find(name)
+        if at == 0 {
+            not_found(name)
+        }
+        cx.c_addrs.set(at, true)
+        return VInt(at)
+    }
+    match cx.fn_addr_of.get(fid) {
+        Some(at) -> VInt(at)
+        None -> {
+            let from = if cx.mem_next > BASE { cx.mem_next } else { BASE }
+            let at = (from + 15) / 16 * 16
+            cx.mem_next = at + 16 + GAP
+            cx.fn_at.set(at, fid)
+            cx.fn_addr_of.set(fid, at)
+            VInt(at)
+        }
+    }
+}
+
+/// Node `e`, an `OP_CALLC` ([L-LIB-CALL-C]): the receiver and the arguments,
+/// then the call through the address.
+pub fn call_c_node(inout cx: Cx, e: i64) -> Value {
+    var vs: [Value] = []
+    if not eval.eval_kids(cx, e, 0, vs) {
+        return VUnit
+    }
+    let at = match vs[0] {
+        VInt(n) -> n
+        _ -> 0
+    }
+    var args: [Value] = vs.slice(1, vs.len())
+    let sig = cx.s[e]
+    if at == 0 {
+        panic("call_c through the null address")
+    }
+    match cx.fn_at.get(at) {
+        Some(fid) -> {
+            let mine = cx.p.fn_csig[fid]
+            if mine != sig {
+                let f = short(cx.p.fn_name[fid])
+                panic("call_c through the address of `{f}`, which is {mine}, as {sig}")
+            }
+            eval.call_fn(cx, fid, args)
+        }
+        None -> {
+            if cx.c_addrs.has(at) {
+                c_call(cx, "call_c", at, sig, args)
+            } else {
+                panic("call_c through an address that holds no function")
+                VUnit
+            }
+        }
+    }
+}
+
+/// Node `e`, an `OP_TLS` ([T-TLS]): the cell's address, made the first time
+/// it is asked for, as `grasm run` makes it: a live allocation of the
+/// sandbox's, of the cell's size and alignment, zero until written, which
+/// `mem_free` refuses. One thread runs here, so there is one of each cell.
+pub fn tls_cell(inout cx: Cx, e: i64) -> Value {
+    let name = cx.s[e]
+    match cx.cells.get(name) {
+        Some(at) -> VInt(at)
+        None -> {
+            let size = cx.a[e]
+            let at = match rawmem.alloc(cx, size, size) {
+                VInt(a) -> a
+                _ -> 0
+            }
+            cx.cells.set(name, at)
+            cx.cell_at.set(at, true)
+            VInt(at)
+        }
+    }
+}

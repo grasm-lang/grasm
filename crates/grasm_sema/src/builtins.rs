@@ -447,6 +447,19 @@ pub const BUILTINS: &[Builtin] = &[
         row: MEM_ROW,
         journal: Journal::Untouched,
     },
+    // A function's address ([T-FN-ADDR]). The function's own row is charged
+    // too, by the effect pass, because its name is written as the argument.
+    Builtin {
+        name: "mem_fn_addr",
+        row: MEM_ROW,
+        journal: Journal::Untouched,
+    },
+    // The calling thread's cell ([T-TLS]).
+    Builtin {
+        name: "mem_tls",
+        row: MEM_ROW,
+        journal: Journal::Untouched,
+    },
     Builtin {
         name: "exit",
         row: PURE,

@@ -1,0 +1,11 @@
+// A thread-local cell's address handed to C: the sandbox made it up, so
+// C would read a number that names nothing ([T-FN-ADDR], [T-TLS]).
+extern fn free(p: addr)
+
+thread_local CELL: i64
+
+fn main() / {io, unsafe, mem} {
+    unsafe {
+        free(mem_tls(CELL))
+    }
+}

@@ -179,3 +179,71 @@ Those two used to be the same answer, so a value match whose arms it did not
 understand compiled to no value at all and the enclosing function returned
 whatever was in the register. A wrong answer with nothing reported is the worst
 outcome available, and strictly worse than the refusal that replaced it.
+
+## spec/types.md ([T-EXTERN-POINTER]), restated 2026-10-21
+
+Moved out when `addr` joined what crosses (S1 part three), to pay for the
+clauses that came with it. A string containing a NUL byte panics rather than
+being cut short at it — the two engines say the same words because the
+compiled build sees a pointer, not a declaration. `bytes` crosses with no
+copy and no terminator because it is already contiguous, is not text, and a
+NUL would change its length. The pointer living for the call alone is the
+whole reason this was expressible: nothing about ownership had to be decided
+at the boundary. A returned pointer was refused from the start, and the
+asymmetry was the point. Widening what may cross did not widen what a package
+can hide: the `{io, unsafe}` row was already there.
+
+## spec/types.md ([T-EXTERN-VALUE])
+
+Without the rule, `xs.par_map(sqrt)` typechecked and the capability ceiling
+had a door straight through it.
+
+## spec/types.md ([T-UNSAFE-FFI]), on `pub extern fn`
+
+Exporting the name carried a C function past every gate that makes Tier 3
+visible: `libext.getpid()` in another module needed no `unsafe`, charged no
+capability, panicked under the interpreter with `module has no function` and
+printed an answer from a native build — three engines, two of them wrong,
+over a symbol the consumer's manifest never mentioned.
+
+## spec/types.md ([T-UNSAFE-UFCS])
+
+Only the `f(x)` spelling was gated at first: `n.close()` reached libc with no
+`unsafe`, no `io` in the row and no capability, and a package declaring
+`capabilities = []` was reported as `performs []` while its compiled binary
+called C. `unsafe` could not be written in a row either, being a keyword.
+
+Gating `unsafe` on `x.f()` and leaving `io` behind turned the same defect down
+by one bit rather than closing it: `n.labs()` inside an `unsafe` block charged
+nothing while `labs(n)` charged `io`, so a package declaring
+`capabilities = ["unsafe"]` was reported as reaching no `io` while its binary
+called libc. Every other spelling — `labs(n)`, `n |> labs`, `let f = labs`
+then `f(n)`, `[n].map(labs)` — was charged.
+
+## spec/types.md ([T-EXTERN])
+
+Without the `io` row FFI would be a hole straight through both the capability
+ceiling and [T-PAR-MAP-PURE] — and it was, in the first version of the
+feature.
+
+## spec/types.md ([T-EFFECT-OP-RESULT]), restated 2026-10-21
+
+An operation answering `-> fn(i64) -> i64 / {io}` gave out a printing function
+that nothing charged, so a function declaring `/ {Mk}` printed, `par_map`'s
+purity proof passed, and a package permitting only `Mk` reached `io` — while
+the same signature written as an ordinary `fn` was refused, one keyword apart.
+
+## spec/types.md ([T-REGION-FOREIGN])
+
+However the call was spelled, it had to count: the row was read under the
+*calling* module, so `region { lib.cfg_user() }` carried none and was
+accepted, while the same function called unqualified was refused.
+
+## spec/types.md ([T-MAP-KEY-GENERIC])
+
+Only the parameters were checked at first, so `fn fresh[K](k: K) ->
+Map[K, i64]`, which puts the key type nowhere in its parameters, let
+`fresh(2.5)` past the checker and into a runtime `invalid map key`. A type
+parameter reaching a map only inside the body is named in no part of the
+signature at all: `fn tally[T](xs: [T]) -> i64` holding a `Map[T, i64]` let
+`tally([1.5, 2.5])` through.

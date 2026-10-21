@@ -335,6 +335,26 @@ every rule in them is still there, and the accounts of what each one's absence
 did are here instead. 3,543 lines, 70 pages; nothing excluded from the count
 and the ceiling unmoved.
 
+**And for function addresses and `export fn`, 2026-10-21.** [T-FN-ADDR],
+[T-EXPORT] and [L-LIB-CALL-C], `addr` in [T-EXTERN-POINTER] and [T-EXTERN],
+`call_c` in [E-MEM-UNCHECKED] and their stability entries came to 32 lines.
+They were paid for by restating [T-EXTERN-POINTER], [T-EXTERN-VALUE],
+[T-UNSAFE-FFI], [T-UNSAFE-UFCS] and [T-EXTERN] as their rules alone, the
+accounts of what each one's absence did moved to `docs/spec-history.md`: 29
+lines saved.
+3,546 lines, 70 pages.
+
+**And for thread-local cells, 2026-10-21.** [T-TLS], `mem_tls` in
+[L-LIB-MEM]'s table, the declaration's rewrite in `spec/core.md` and its
+stability entry came to 11 lines. They were paid
+for by restating [T-EFFECT-OP-RESULT], [T-REGION-FOREIGN] and
+[T-MAP-KEY-GENERIC] as their rules alone, the history moved to
+`docs/spec-history.md`: 14 lines saved. 3,543 lines, 70 pages.
+
+**And for tuple map keys, 2026-10-21.** Widening [T-MAP-KEY], [E-MAP-ORDER]
+and [L-LIB-MAP] came to one line net, inside the slack: 3,544 lines, 70
+pages.
+
 > From [T-FN-TYPE-ROW-CARRIED], as it read:
 >
 > This needed saying because it was not true. The row lived only in the syntax
@@ -701,25 +721,73 @@ that passes structures by value or wants a callback -- raylib, Cocoa through
 **Raw memory stops at the process's own allocations.** *Added on 2026-10-21
 with [L-LIB-MEM] and [L-LIB-ATOMIC].* What is not there yet, each on purpose:
 
-- An `extern fn` still takes and returns integers, not `addr`. A pointer from
-  C reaches Grasm as an `i64` and becomes an address with `mem_addr`, and one
-  goes back with `as_i64`. Under `grasm run` such an address points into no
-  allocation the sandbox made, so every access through it is refused: memory
-  that C owns can be used only by a compiled build.
+- *Closed in S1 part three:* an `extern fn` takes and returns `addr`
+  ([T-EXTERN-POINTER]). Under `grasm run` an address C returns points into no
+  allocation the sandbox made, so every access through it is refused, and an
+  address the sandbox made cannot be handed to C at all: memory C owns, and C
+  reading memory Grasm allocated, need a compiled build.
 - There is no `mem_copy` or `mem_fill`; a loop of loads and stores does it.
   Nor is there a way to move bytes between raw memory and a `bytes`.
 - `mem_size_of` and `mem_align_of` answer for layout types only. A struct has
   no layout a program may rely on, so a runtime written in Grasm writes its
   own offsets down.
-- Atomics are observed from one thread. No Grasm program runs two threads over
-  shared memory yet, so nothing has tested them under contention; what the
-  gates check is their values, widths, wrapping and orderings, and that a
-  compiled build emits atomic instructions for them (`scripts/fuzz_rawmem.py`).
-  A compiled build makes every ordering sequentially consistent.
+- Atomics were observed from one thread until S1 part three. Threads C starts
+  now run Grasm ([T-FN-ADDR]), and a CLI test and `scripts/fuzz_tls.py` add to
+  one counter from up to six of them and get the exact total; the orderings
+  weaker than sequential consistency are still untested, because a compiled
+  build makes every ordering sequentially consistent.
 - The interpreter's addresses are made up and its sandbox is bounded only by
   the host: an allocation larger than 2^40 bytes is refused by both engines,
   and one the host cannot meet panics, but a large one that the host *can*
   meet is held in full, as a compiled build's would be.
+
+**C reaching Grasm is native only.** *Added on 2026-10-21 with [T-FN-ADDR],
+[L-LIB-CALL-C] and [T-EXPORT].* What is not there yet, each on purpose:
+
+- `grasm run` cannot make machine code for a Grasm function, so it cannot give
+  C one: handing C a function's address (a `qsort` comparator, a signal
+  handler) panics there and works compiled, and an `export fn` is not in the
+  interpreter's process for `dlsym` to find. Those programs are tested by CLI
+  tests and `scripts/fuzz_fnaddr.py`, natively. The interpreter does call C
+  through an address C handed it, and Grasm through a Grasm address.
+- No variadic C function (`printf`), no struct passed or returned by value, and
+  no closure as a callback: a closure has an environment C cannot pass, so a
+  callback that takes a `void *` context gets an `addr` instead.
+- `grasm run` and the TIR interpreter call C only in the shapes
+  `crates/grasm_interp/src/ffi.rs` enumerates: at most three arguments, and no
+  mixed integer and `f64` shapes past two. A compiled build calls any shape.
+- A callback C runs on a thread it made gets the stack floor the main thread
+  would have, so deep recursion on a small C-made stack can fault rather than
+  panic.
+- Names beginning `grasm_` cannot be exported, so a runtime written in Grasm
+  cannot yet define the symbols `libgrasm_rt_abi.a` does; S5 lifts that for the
+  package that replaces it.
+- Executables are `arm64`, whose code pointers are not signed. An `arm64e`
+  target would have to sign in `mem_fn_addr` and authenticate in `call_c`.
+
+**A tuple key costs a probe.** *Added on 2026-10-21 with tuple keys
+([T-MAP-KEY]).* A compiled lookup builds the key's tuple and then a probe
+key from its components, one allocation each, where a `str` probe reuses a
+buffer: 2,000,000 lookups in a 1,000-entry map took 64 ns each with a `(i64,
+i64)` key, 53 with the same two parts joined into a `str`, and 26 with them
+packed into one `i64` (three interleaved runs each, all within a
+nanosecond). A borrowed probe that hashes the components where they lie
+would close most of it; S5 rewrites the map and is the place for it.
+
+**Thread-local cells hold a word.** *Added on 2026-10-21 with [T-TLS].* What
+is not there yet, each on purpose:
+
+- A cell holds one layout type; a pool or a struct of per-thread state is an
+  `addr` cell pointing at memory the thread allocates the first time it finds
+  the cell zero.
+- Natively a thread's block holds every cell of the program and is made the
+  first time the thread asks for any, by a runtime call per `mem_tls`; S3 may
+  lower it to the platform's own thread-local variables.
+- `grasm run` has one thread and one of each cell. The TIR interpreter reads
+  the declarations and the operation, and gives each cell an address as
+  `grasm run` does, but the bytes behind it wait for the raw-memory sandbox
+  another branch is adding there: until the two meet, a program using a cell
+  fails `scripts/tirinterp.sh` as the other raw-memory programs do.
 
 ## Nothing open
 

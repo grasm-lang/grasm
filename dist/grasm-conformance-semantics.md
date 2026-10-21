@@ -1686,6 +1686,9 @@ type Holder = { items: Map[str, i64] }
 //! {alpha: 1, beta: 2, zulu: 3}
 //! across the inline boundary: [, 0123456789abcde, 0123456789abcdef, a, b]
 //! the same text two ways is one key: 2 entries
+//! {(a, 2): 1, (a, 10): 2, (ab, 1): 3, (b, -1): 4}
+//! [(false, (2, z)), (true, (1, y)), (true, (1, z))]
+//! the order sort gives: true
 fn main() {
     var m = map()
     m.set("zulu", 3)
@@ -1712,6 +1715,23 @@ fn main() {
     same.set("0123456789abcdef", 1)
     same.set("0123456789abcde" + "f", 2)
     print("the same text two ways is one key: {same.len()} entries")
+
+    // Tuple keys ([T-MAP-KEY]) sort component by component, each by its own
+    // order: a string before every string it begins, then the next part.
+    var parts: Map[(str, i64), i64] = {}
+    parts.set(("b", -1), 4)
+    parts.set(("ab", 1), 3)
+    parts.set(("a", 10), 2)
+    parts.set(("a", 2), 1)
+    print("{parts}")
+    var deep: Map[(bool, (i64, str)), i64] = {}
+    for k in [(true, (1, "z")), (false, (2, "z")), (true, (1, "y"))] {
+        deep.set(k, 0)
+    }
+    print("{deep.keys()}")
+    var sorted = parts.keys()
+    sorted.sort()
+    print("the order sort gives: {sorted == parts.keys()}")
 }
 ```
 
@@ -1798,6 +1818,12 @@ fn main() {
 //! atomic_load_i32 through an address no allocation holds
 //! mem_free of an allocation already freed
 //! mem_free of an address inside an allocation, not its start
+//! call_c through the address of `twice`, which is (i64) -> i64, as (i64, i64) -> i64
+//! call_c through the null address
+//! call_c through an address that holds no function
+//! load_i64 through the address of a function
+//! `grasm run` cannot hand C an address from its own sandbox (argument 1 of `free`)
+//! mem_free of a thread-local cell
 //! test "in bounds" ... ok
 // Each of these is undefined in a compiled build, which checks none of them;
 // `grasm run` keeps raw memory in a sandbox and refuses every one, saying
@@ -1851,6 +1877,58 @@ test "freed from inside" {
     unsafe {
         let a = mem_alloc(8, 8)
         mem_free(a.offset(4))
+    }
+}
+
+// A call through an address is unchecked too ([L-LIB-CALL-C]). The
+// interpreter knows each function's signature and that its addresses are
+// made up, so it refuses a call by the wrong signature, through an address
+// that holds no function, and handing one of its addresses to C.
+extern fn free(p: addr)
+
+type Unary = fn(i64) -> i64
+type Wide = fn(i64, i64) -> i64
+
+fn twice(n: i64) -> i64 {
+    n * 2
+}
+
+test "wrong signature" {
+    unsafe {
+        let x = mem_fn_addr(twice).call_c(Wide, 1, 2)
+    }
+}
+
+test "through null" {
+    unsafe {
+        let x = mem_addr(0).call_c(Unary, 1)
+    }
+}
+
+test "through memory" {
+    unsafe {
+        let x = mem_alloc(8, 8).call_c(Unary, 1)
+    }
+}
+
+test "load a function" {
+    unsafe {
+        let x = mem_fn_addr(twice).load_i64()
+    }
+}
+
+test "sandbox to C" {
+    unsafe {
+        free(mem_alloc(8, 8))
+    }
+}
+
+// A thread-local cell is not an allocation the program made ([T-TLS]).
+thread_local CELL: i64
+
+test "free a cell" {
+    unsafe {
+        mem_free(mem_tls(CELL))
     }
 }
 

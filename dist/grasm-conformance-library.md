@@ -1,6 +1,6 @@
 # Grasm — conformance programs: library
 
-The standard library. 64 executable program(s), one per normative clause of
+The standard library. 65 executable program(s), one per normative clause of
 `grasm-language-pack.md`. Each header states the tag it demonstrates and the
 exact expected behaviour, and every one is run by `cargo test -p grasm_spec`, so
 a program here cannot describe behaviour the implementation does not have.
@@ -824,6 +824,58 @@ fn made(n: i64) -> bytes {
         xs.push(i % 200)
     }
     bytes_of(xs)
+}
+```
+
+## `L-LIB-CALL-C.gr`
+
+```grasm
+//! tag: L-LIB-CALL-C
+//! expect: output
+//! 5 true true
+//! 8.0 7
+//! 4660 18446744073709551615 1.5
+// `a.call_c(Sig, ..)` calls the code at an address by the C convention, with
+// the parameters and result of the function type `Sig` names. Arguments
+// cross as they cross to an `extern fn`: a `str` as a NUL-terminated copy,
+// `bytes` as its buffer, and a narrower integer result is read at its width.
+// A C function's address and a Grasm function's are called the same way.
+extern fn strlen(s: str) -> i64
+extern fn memcmp(a: bytes, b: bytes, n: i64) -> i32
+extern fn pow(x: f64, y: f64) -> f64
+extern fn abs(n: i32) -> i32
+
+type Measure = fn(str) -> i64
+type Compare = fn(bytes, bytes, i64) -> i32
+type Power = fn(f64, f64) -> f64
+type Small = fn(i32) -> i32
+type Pack = fn(u8, u8) -> u16
+type Huge = fn(u64) -> u64
+type Half = fn(f64) -> f64
+
+fn pack(hi: u8, lo: u8) -> u16 {
+    hi.as_u16().shl(8) + lo.as_u16()
+}
+
+fn flip(n: u64) -> u64 {
+    n.bit_not()
+}
+
+fn half(x: f64) -> f64 {
+    x / 2.0
+}
+
+fn main() {
+    unsafe {
+        let a = bytes_of([1, 2, 3])
+        let b = bytes_of([1, 2, 4])
+        let cmp = mem_fn_addr(memcmp)
+        print("{mem_fn_addr(strlen).call_c(Measure, "hello")} {cmp.call_c(Compare, a, b, 3) < 0} {cmp.call_c(Compare, a, a, 3) == 0}")
+        let n: i32 = -7
+        print("{mem_fn_addr(pow).call_c(Power, 2.0, 3.0)} {mem_fn_addr(abs).call_c(Small, n)}")
+        let zero: u64 = 0
+        print("{mem_fn_addr(pack).call_c(Pack, 18, 52)} {mem_fn_addr(flip).call_c(Huge, zero)} {mem_fn_addr(half).call_c(Half, 3.0)}")
+    }
 }
 ```
 

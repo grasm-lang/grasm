@@ -123,7 +123,7 @@
         },
         {
           "name": "support.function.grasm",
-          "match": "\\b(monotonic_millis|monotonic_nanos|tcp_write_bytes|tcp_read_bytes|proc_pipeline|read_bytes_at|tcp_listen_on|udp_recv_from|append_bytes|byte_builder|bytes_filled|make_dir_new|mem_align_of|random_bytes|sleep_millis|chan_select|file_exists|mem_size_of|net_workers|remove_file|rename_file|str_builder|tcp_connect|write_bytes|chan_close|now_millis|read_bytes|tcp_accept|tcp_listen|write_file|assert_eq|chan_recv|chan_send|file_size|mem_alloc|net_close|read_file|sync_file|tcp_write|bytes_of|chan_new|list_dir|make_dir|mem_addr|mem_free|net_port|net_wait|proc_run|tcp_peer|tcp_read|udp_bind|udp_recv|udp_send|assert|eprint|input|panic|print|args|exit|env)\\b(?=\\s*\\()"
+          "match": "\\b(monotonic_millis|monotonic_nanos|tcp_write_bytes|tcp_read_bytes|proc_pipeline|read_bytes_at|tcp_listen_on|udp_recv_from|append_bytes|byte_builder|bytes_filled|make_dir_new|mem_align_of|random_bytes|sleep_millis|chan_select|file_exists|mem_fn_addr|mem_size_of|net_workers|remove_file|rename_file|str_builder|tcp_connect|write_bytes|chan_close|now_millis|read_bytes|tcp_accept|tcp_listen|write_file|assert_eq|chan_recv|chan_send|file_size|mem_alloc|net_close|read_file|sync_file|tcp_write|bytes_of|chan_new|list_dir|make_dir|mem_addr|mem_free|net_port|net_wait|proc_run|tcp_peer|tcp_read|udp_bind|udp_recv|udp_send|mem_tls|assert|eprint|input|panic|print|args|exit|env)\\b(?=\\s*\\()"
         }
       ]
     },

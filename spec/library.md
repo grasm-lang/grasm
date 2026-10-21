@@ -398,7 +398,7 @@ it was, put the value first — `xs.enumerate().map(|p| (p.1, p.0)).min()`.
 
 ## 5. `Map[K, V]`
 
-**[L-LIB-MAP]** Keys are `i64`, `str`, or `bool`. Iteration is in sorted key
+**[L-LIB-MAP]** Keys are what [T-MAP-KEY] allows. Iteration is in sorted key
 order ([E-MAP-ORDER]).
 
 | method | type | notes |
@@ -867,6 +867,7 @@ it is aligned (1, 2, 4 or 8 bytes); memory is little-endian.
 | `a.offset(n)`, `a.diff(b)` | `(i64) -> addr`, `(addr) -> i64` | `n` bytes on; `a` minus `b` in bytes; both wrap |
 | `a.as_i64()` | `-> i64` | its integer: `mem_addr(a.as_i64()) == a` |
 | `a.load_T()`, `a.store_T(v)` | `-> T`, `(T)` | the `T` at `a`; puts `v` there |
+| `mem_tls(C)` | `-> addr` | the calling thread's cell `C`, written as a name ([T-TLS]) |
 
 `mem_alloc` panics on a negative size, an alignment that is not a power of two
 from 1 to 4096, a size past 2^40, and a request the system cannot meet; zero
@@ -889,3 +890,11 @@ Any other ordering is a compile error; a compare-exchange that fails orders as
 consistent, which is at least what any ordering asks. No program runs two
 threads over shared memory yet — `par_map` and a multi-core `parallel` take only
 pure work — so today an atomic is observed from one thread.
+
+**[L-LIB-CALL-C]** `a.call_c(Sig, x, ..)` calls the code at `a` by the C
+convention ([T-FN-ADDR]). `Sig` names a type alias for a function type, written
+where a value would go and read when the program is compiled: its parameters,
+which may be anything an `extern fn` takes and cross the same way, type the
+arguments, and its result is the call's ([T-EXTERN-POINTER]). A call performs
+`io` and `unsafe` besides `mem`, as an `extern` call does. Calling by a
+signature the code does not have is [E-MEM-UNCHECKED].

@@ -469,11 +469,12 @@ pub type MapTable = hashbrown::HashMap<MapKey, *mut RtVal, maphash::MapHash>;
 
 /// A map key, owned.
 ///
-/// Keys are restricted to `i64`, `str`, and `bool` ([T-MAP-KEY]), which makes
-/// them hashable — so lookup is a hash probe rather than a binary search over
-/// boxed values. The derived `Ord` puts the variants in exactly the order the
-/// specification requires for iteration ([E-MAP-ORDER]): false before true,
-/// then integers ascending, then strings lexicographically.
+/// Keys are restricted to integers, `str`, `bool` and tuples of those
+/// ([T-MAP-KEY]), which makes them hashable — so lookup is a hash probe rather
+/// than a binary search over boxed values. The derived `Ord` puts the variants
+/// in exactly the order the specification requires for iteration
+/// ([E-MAP-ORDER]): false before true, then integers ascending, then strings
+/// lexicographically, and tuples component by component.
 #[derive(PartialEq, Eq, Hash, PartialOrd, Ord, Clone)]
 pub enum MapKey {
     Bool(bool),
@@ -486,6 +487,10 @@ pub enum MapKey {
     /// A map has one key type, so where this sorts against the others never
     /// matters; among themselves `u64` keys sort unsigned ([E-MAP-ORDER]).
     U64(u64),
+    /// A tuple of keys ([T-MAP-KEY]). The derived order is component by
+    /// component, left to right ([E-MAP-ORDER]), and the derived hash feeds
+    /// each component, in order, through the map's seeded hasher.
+    Tuple(Box<[MapKey]>),
 }
 
 thread_local! {
@@ -524,6 +529,9 @@ unsafe fn with_key<R>(v: *mut RtVal, f: impl FnOnce(&MapKey) -> R) -> R {
         // Long text still borrows the scratch buffer, so a probe with a long
         // key does not allocate either.
         RtPayload::Str(s) if s.len() <= KEY_INLINE_CAP => f(&MapKey::Str(KeyStr::of(s))),
+        // A tuple's probe is built, component by component: one allocation
+        // per lookup, where a `str` probe has none.
+        RtPayload::Tuple(_) => f(&MapKey::of(v)),
         RtPayload::Str(s) => PROBE.with(|cell| {
             let mut buf = cell.borrow_mut();
             buf.clear();
@@ -551,6 +559,9 @@ impl MapKey {
             RtPayload::I64(n) => MapKey::I64(*n),
             RtPayload::U64(n) => MapKey::U64(*n),
             RtPayload::Str(s) => MapKey::Str(KeyStr::of(s)),
+            RtPayload::Tuple(items) => {
+                MapKey::Tuple(items.iter().map(|&i| MapKey::of(i)).collect())
+            }
             _ => rt_panic(&format!("invalid map key `{}`", display(v))),
         }
     }
@@ -561,6 +572,10 @@ impl MapKey {
             MapKey::I64(n) => grasm_box_i64(*n),
             MapKey::U64(n) => alloc(RtPayload::U64(*n)),
             MapKey::Str(s) => alloc(RtPayload::Str(RtStr::of(s.as_str()))),
+            MapKey::Tuple(items) => {
+                let parts: Vec<*mut RtVal> = items.iter().map(MapKey::boxed).collect();
+                alloc(RtPayload::Tuple(parts.into()))
+            }
         }
     }
 }
@@ -10246,6 +10261,29 @@ pub extern "C" fn grasm_mem_alloc(size: i64, align: i64) -> i64 {
         (at as *mut i64).sub(2).write(head as i64);
         at as i64
     }
+}
+
+thread_local! {
+    /// This thread's `thread_local` cells ([T-TLS]): one zeroed block, made
+    /// the first time the thread asks and dropped with the thread. Words, so
+    /// every cell -- at most 8 bytes, at a multiple of its size -- is aligned.
+    static TLS_BLOCK: core::cell::RefCell<Vec<u64>> = const { core::cell::RefCell::new(Vec::new()) };
+}
+
+/// `mem_tls(C)` before `C`'s offset is added: the calling thread's block of
+/// cells, `size` bytes, zero until written. The compiler passes the whole
+/// program's size every time, so the block is made once, at that size, and
+/// never moves.
+#[no_mangle]
+pub extern "C" fn grasm_tls_block(size: i64) -> i64 {
+    TLS_BLOCK.with(|b| {
+        let mut b = b.borrow_mut();
+        if b.is_empty() {
+            let words = (size.max(8) as usize).div_ceil(8);
+            *b = vec![0u64; words];
+        }
+        b.as_mut_ptr() as i64
+    })
 }
 
 /// `mem_free(a)`: gives back what `mem_alloc` made. Anything else is

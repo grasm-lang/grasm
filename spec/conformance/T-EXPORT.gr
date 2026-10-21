@@ -1,0 +1,44 @@
+//! tag: T-EXPORT
+//! expect: output
+//! 15 21
+//! 42 true false
+//! -3 4294967295
+//! 2.0 5
+// An `export fn` is an ordinary function -- Grasm calls it as it calls any
+// other -- that C can also reach by its own name, by the C calling
+// convention. Its address, like any function's, is an `addr` that `call_c`
+// calls through ([T-FN-ADDR], [L-LIB-CALL-C]); a C function's address is the
+// C function's own. The same function always has the same address. A
+// compiled build also exports the symbol `conf_triple`, which only C can see.
+extern fn labs(n: i64) -> i64
+extern fn sqrt(x: f64) -> f64
+
+type Unary = fn(i64) -> i64
+type Mixed = fn(i8, u32) -> i64
+type Real = fn(f64) -> f64
+
+export fn conf_triple(n: i64) -> i64 {
+    n * 3
+}
+
+fn twice(n: i64) -> i64 {
+    n * 2
+}
+
+fn mixed(a: i8, b: u32) -> i64 {
+    a.as_i64() * b.as_i64()
+}
+
+fn main() {
+    print("{conf_triple(5)} {unsafe { mem_fn_addr(conf_triple).call_c(Unary, 7) }}")
+    unsafe {
+        let t = mem_fn_addr(twice)
+        let fs = [t, mem_fn_addr(conf_triple)]
+        print("{fs[0].call_c(Unary, 21)} {t == mem_fn_addr(twice)} {t == fs[1]}")
+        let m = mem_fn_addr(mixed)
+        let big: u32 = 4294967295
+        print("{m.call_c(Mixed, -3, 1)} {m.call_c(Mixed, 1, big)}")
+        let s = mem_fn_addr(sqrt)
+        print("{s.call_c(Real, 4.0)} {mem_fn_addr(labs).call_c(Unary, -5)}")
+    }
+}

@@ -58,6 +58,11 @@ pub let OP_CALLEXTERN = 42
 /// A raw-memory operation ([L-LIB-MEM], [L-LIB-ATOMIC]): `a` says which, as
 /// `rawmem` numbers them, `b` is its layout type's code and `s` its name.
 pub let OP_MEM = 43
+// A function's address, and a call through one ([T-FN-ADDR], [L-LIB-CALL-C]).
+pub let OP_FNADDR = 44
+pub let OP_CALLC = 45
+// A thread-local cell's address ([T-TLS]).
+pub let OP_TLS = 46
 // Parts of the nodes above, never evaluated on their own.
 pub let OP_TEXT = 50
 pub let OP_ENTRY = 52
@@ -106,6 +111,8 @@ type Prog = {
     fn_frame: [[Value]],
     fn_fallible: [bool],
     fn_extern: [bool],
+    /// Each function's C signature, as `grasm run` shows one: `(i64, str) -> i64`.
+    fn_csig: [str],
     const_name: [str],
     const_init: [i64],
     const_frame: [[Value]],
@@ -147,6 +154,8 @@ type Loader = {
     fn_frame: [[Value]],
     fn_fallible: [bool],
     fn_extern: [bool],
+    /// Each function's C signature, as `grasm run` shows one: `(i64, str) -> i64`.
+    fn_csig: [str],
     const_name: [str],
     const_init: [i64],
     const_frame: [[Value]],
@@ -167,6 +176,7 @@ type Loader = {
     eff_ids: Map[str, i64],
     builtins: Map[str, i64],
     methods: Map[str, i64],
+    cells: Map[str, i64],
     max_var: i64,
     ref_log: [i64],
     decl_log: [i64],
@@ -411,7 +421,11 @@ fn expr(inout ld: Loader, e: i64) -> i64 {
         "builtin" -> {
             let name = word(t, e, 3)
             let mop = mem_builtin(name)
-            if mop > 0 {
+            if name == "mem_fn_addr" {
+                fn_addr_node(ld, e)
+            } else if name == "mem_tls" {
+                tls_node(ld, e)
+            } else if mop > 0 {
                 mem_builtin_node(ld, e, mop, name)
             } else {
                 let code = resolve(ld, ld.builtins, name, "built-in")
@@ -474,7 +488,10 @@ fn expr_more(inout ld: Loader, e: i64) -> i64 {
         "spawn" -> node_with(ld, e, OP_SPAWN, if word(t, e, 1) == "concurrent" { 1 } else { 0 }, 0, "")
         "parallel" -> node_with(ld, e, OP_PARALLEL, if word(t, e, 1) == "concurrent" { 1 } else { 0 }, 0, "")
         "boundcall" -> node_with(ld, e, OP_BOUNDCALL, 0, 0, word(t, e, 4))
-        "callextern" -> node_with(ld, e, OP_CALLEXTERN, 0, 0, word(t, e, 3))
+        "callextern" -> {
+            let name = word(t, e, 3)
+            node_with(ld, e, OP_CALLEXTERN, resolve(ld, ld.fn_ids, name, "C function"), 0, name)
+        }
         _ -> {
             err(ld, "unknown node `{k}`")
             new_node(ld, 0)
@@ -879,14 +896,76 @@ fn mentions(p: Loader, e: i64, v: i64) -> bool {
     false
 }
 
+/// `(builtin addr @s "mem_fn_addr" (fnname "m::f"))`: the function is a name,
+/// not a value ([T-FN-ADDR]).
+fn fn_addr_node(inout ld: Loader, e: i64) -> i64 {
+    let t = ld.t
+    let arg = kid_elems(t, e)[0]
+    let id = new_node(ld, OP_FNADDR)
+    ld.a[id] = resolve(ld, ld.fn_ids, word(t, arg, 1), "function")
+    id
+}
+
+/// `(builtin addr @s "mem_tls" (tlsname "m::C"))`: the cell is a name, not a
+/// value ([T-TLS]). The node keeps the cell's name and its size, which is
+/// also its alignment.
+fn tls_node(inout ld: Loader, e: i64) -> i64 {
+    let t = ld.t
+    let arg = kid_elems(t, e)[0]
+    let name = word(t, arg, 1)
+    let id = new_node(ld, OP_TLS)
+    ld.s[id] = name
+    match ld.cells.get(name) {
+        Some(n) -> {
+            ld.a[id] = n
+        }
+        None -> err(ld, "cell `{name}` is not declared")
+    }
+    id
+}
+
+/// `(method T @s "call_c" recv (sig (i64 str) i64) args...)` ([L-LIB-CALL-C]):
+/// its children are the receiver and the values; the signature, a name, is
+/// kept as `grasm run` shows one.
+fn call_c_node(inout ld: Loader, e: i64) -> i64 {
+    let t = ld.t
+    let parts = kid_elems(t, e)
+    let sig = parts[1]
+    let pl = at(t, sig, 1)
+    var ptys: [str] = []
+    for i in 0..t.count[pl] {
+        ptys.push(word(t, pl, i))
+    }
+    let id = new_node(ld, OP_CALLC)
+    ld.s[id] = csig_text(ptys, word(t, sig, 2))
+    var vals: [i64] = [parts[0]]
+    for i in 2..parts.len() {
+        vals.push(parts[i])
+    }
+    let ks = exprs(ld, vals)
+    set_kids(ld, id, ks)
+    id
+}
+
+/// A C signature as `grasm run` shows one: `(i64, str) -> i64`, or `(f64)`
+/// for no result.
+pub fn csig_text(params: [str], ret: str) -> str {
+    let ps = "(" + params.join(", ") + ")"
+    if ret == "unit" { ps } else { ps + " -> " + ret }
+}
+
 fn method_node(inout ld: Loader, e: i64) -> i64 {
     let t = ld.t
     let name = word(t, e, 3)
-    // A built-in method on an `addr` is a raw-memory operation. The
-    // receiver's type says so, as the checker's table does for the
-    // reference: nothing is decided by the name alone.
+    // A built-in method on an `addr` is a raw-memory operation, a call
+    // through it among them ([L-LIB-CALL-C]). The receiver's type says so,
+    // as the checker's table does for the reference: nothing is decided by
+    // the name alone.
     let recv = kid_elems(t, e)[0]
     if t.kind[at(t, recv, 1)] == 0 and word(t, recv, 1) == "addr" {
+        if name == "call_c" {
+            return call_c_node(ld, e)
+        }
         let (mop, ty) = mem_method(name)
         if mop > 0 {
             return mem_node(ld, e, mop, ty, name)
@@ -1093,6 +1172,11 @@ fn register(inout ld: Loader, e: i64) {
             let fallible = word(t, e, 5) != "none" or kw(t, at(t, e, 4)) == "fallible"
             ld.fn_fallible.push(fallible)
             ld.fn_extern.push(false)
+            var ptys: [str] = []
+            for pe in kid_elems(t, kid_elems(t, e)[0]) {
+                ptys.push(word(t, pe, 4))
+            }
+            ld.fn_csig.push(csig_text(ptys, word(t, e, 4)))
         }
         "extern" -> {
             let name = word(t, e, 1)
@@ -1104,6 +1188,25 @@ fn register(inout ld: Loader, e: i64) {
             ld.fn_frame.push([])
             ld.fn_fallible.push(false)
             ld.fn_extern.push(true)
+            // `(extern "m::f" (i64 str) i64)`: the parameter types are a
+            // list on the head line.
+            let pl = at(t, e, 2)
+            var ptys: [str] = []
+            for i in 0..t.count[pl] {
+                ptys.push(word(t, pl, i))
+            }
+            ld.fn_csig.push(csig_text(ptys, word(t, e, 3)))
+        }
+        // `(threadlocal "m::C" u16)`: a cell's name and the size of its
+        // layout type ([T-TLS]).
+        "threadlocal" -> {
+            let size = match word(t, e, 2) {
+                "i8" | "u8" -> 1
+                "i16" | "u16" -> 2
+                "i32" | "u32" -> 4
+                _ -> 8
+            }
+            ld.cells.set(word(t, e, 1), size)
         }
         "const" -> {
             let name = word(t, e, 1)
@@ -1186,6 +1289,7 @@ pub fn load(t: Tree) -> Prog ! [str] {
         fn_frame: [],
         fn_fallible: [],
         fn_extern: [],
+        fn_csig: [],
         const_name: [],
         const_init: [],
         const_frame: [],
@@ -1206,6 +1310,7 @@ pub fn load(t: Tree) -> Prog ! [str] {
         eff_ids: map(),
         builtins: code_table(builtins.builtin_names()),
         methods: code_table(builtins.method_names()),
+        cells: map(),
         max_var: -1,
         ref_log: [],
         decl_log: [],
@@ -1244,6 +1349,7 @@ pub fn load(t: Tree) -> Prog ! [str] {
         fn_frame: ld.fn_frame,
         fn_fallible: ld.fn_fallible,
         fn_extern: ld.fn_extern,
+        fn_csig: ld.fn_csig,
         const_name: ld.const_name,
         const_init: ld.const_init,
         const_frame: ld.const_frame,

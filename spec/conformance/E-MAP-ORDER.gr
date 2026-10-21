@@ -4,6 +4,9 @@
 //! {alpha: 1, beta: 2, zulu: 3}
 //! across the inline boundary: [, 0123456789abcde, 0123456789abcdef, a, b]
 //! the same text two ways is one key: 2 entries
+//! {(a, 2): 1, (a, 10): 2, (ab, 1): 3, (b, -1): 4}
+//! [(false, (2, z)), (true, (1, y)), (true, (1, z))]
+//! the order sort gives: true
 fn main() {
     var m = map()
     m.set("zulu", 3)
@@ -30,4 +33,21 @@ fn main() {
     same.set("0123456789abcdef", 1)
     same.set("0123456789abcde" + "f", 2)
     print("the same text two ways is one key: {same.len()} entries")
+
+    // Tuple keys ([T-MAP-KEY]) sort component by component, each by its own
+    // order: a string before every string it begins, then the next part.
+    var parts: Map[(str, i64), i64] = {}
+    parts.set(("b", -1), 4)
+    parts.set(("ab", 1), 3)
+    parts.set(("a", 10), 2)
+    parts.set(("a", 2), 1)
+    print("{parts}")
+    var deep: Map[(bool, (i64, str)), i64] = {}
+    for k in [(true, (1, "z")), (false, (2, "z")), (true, (1, "y"))] {
+        deep.set(k, 0)
+    }
+    print("{deep.keys()}")
+    var sorted = parts.keys()
+    sorted.sort()
+    print("the order sort gives: {sorted == parts.keys()}")
 }

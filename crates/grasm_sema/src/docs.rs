@@ -348,6 +348,14 @@ pub fn module_signature(module: &Module) -> String {
                 out.push_str(&extern_signature(e));
                 out.push('\n');
             }
+            Decl::ThreadLocal(t) => {
+                out.push_str(&format!(
+                    "thread_local {}: {}",
+                    t.name.name,
+                    type_text(&t.ty)
+                ));
+                out.push('\n');
+            }
             Decl::Type(t) => {
                 out.push_str(&type_signature(t));
                 out.push('\n');
@@ -487,6 +495,7 @@ fn decl_name(d: &Decl) -> String {
         Decl::Fn(f) => f.name.name.clone(),
         Decl::Const(c) => c.name.name.clone(),
         Decl::Extern(e) => e.name.name.clone(),
+        Decl::ThreadLocal(t) => t.name.name.clone(),
         Decl::Type(t) => t.name.name.clone(),
         Decl::Effect(e) => e.name.name.clone(),
         Decl::Test(t) => t.name.clone(),

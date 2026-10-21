@@ -1,0 +1,12 @@
+// A load through a function's address ([T-FN-ADDR]): it names code, not
+// bytes the program can read.
+fn twice(n: i64) -> i64 {
+    n * 2
+}
+
+fn main() / {io, unsafe, mem} {
+    unsafe {
+        print("before")
+        let x = mem_fn_addr(twice).load_i64()
+    }
+}

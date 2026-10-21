@@ -30,7 +30,7 @@ type Value =
     | VBytes(v: bytes)
     | VOk(v: Value)
     | VErr(v: Value)
-    | VMap(kb: Map[bool, Value], ki: Map[i64, Value], ks: Map[str, Value], ku: Map[u64, Value])
+    | VMap(kb: Map[bool, Value], ki: Map[i64, Value], ks: Map[str, Value], ku: Map[u64, Value], kt: Map[str, Value])
     | VRange(lo: i64, hi: i64, incl: bool)
     | VRef(slot: i64, gen: i64)
     | VClosure(node: i64, serial: i64, caps: [Value])
@@ -60,7 +60,7 @@ pub fn take(inout slot: Value) -> Value {
 pub fn shape(v: Value) -> i64 {
     match v {
         VList(_) -> 1
-        VMap(_, _, _, _) -> 2
+        VMap(_, _, _, _, _) -> 2
         VBytes(_) -> 3
         VStruct(_, _) -> 4
         VStrB(_) -> 5
@@ -116,7 +116,7 @@ pub fn some_v(p: Prog, v: Value) -> Value {
 }
 
 pub fn empty_map() -> Value {
-    VMap(map(), map(), map(), map())
+    VMap(map(), map(), map(), map(), map())
 }
 
 // ----- printing ------------------------------------------------------------
@@ -197,7 +197,7 @@ fn show_into(p: Prog, v: Value, inout out: [str]) {
             show_into(p, x, out)
             out.push(")")
         }
-        VMap(_, _, _, _) -> show_map(p, v, out)
+        VMap(_, _, _, _, _) -> show_map(p, v, out)
         VRange(lo, hi, incl) -> {
             out.push("{lo}..")
             if incl {
@@ -249,9 +249,12 @@ fn show_map(p: Prog, m: Value, inout out: [str]) {
 pub fn map_keys(m: Value) -> [Value] {
     var out: [Value] = []
     match m {
-        VMap(kb, ki, ks, ku) -> {
+        VMap(kb, ki, ks, ku, kt) -> {
             for k in kb.keys() {
                 out.push(VBool(k))
+            }
+            for k in kt.keys() {
+                out.push(pair_half(kt.get(k), 0))
             }
             for k in ki.keys() {
                 out.push(VInt(k))
@@ -272,9 +275,12 @@ pub fn map_keys(m: Value) -> [Value] {
 pub fn map_values(m: Value) -> [Value] {
     var out: [Value] = []
     match m {
-        VMap(kb, ki, ks, ku) -> {
+        VMap(kb, ki, ks, ku, kt) -> {
             for k in kb.keys() {
                 out.push(kb.get(k) ?? VUnit)
+            }
+            for k in kt.keys() {
+                out.push(pair_half(kt.get(k), 1))
             }
             for k in ki.keys() {
                 out.push(ki.get(k) ?? VUnit)
@@ -289,6 +295,48 @@ pub fn map_values(m: Value) -> [Value] {
         _ -> ()
     }
     out
+}
+
+/// Half of a tuple-keyed entry, which is held as `(key, value)`.
+pub fn pair_half(e: Option[Value], i: i64) -> Value {
+    match e {
+        Some(VTuple(kv)) -> kv[i]
+        _ -> VUnit
+    }
+}
+
+/// A tuple key as text ([T-MAP-KEY]), for the host map that holds them: the
+/// text order is [E-MAP-ORDER]'s, component by component, and no two keys
+/// share a text, because every component is fixed in width or ended. An
+/// integer is sixteen hex digits with its sign bit flipped, so unsigned order
+/// is signed order; a `u64` is its sixteen digits; a `bool` one digit; a
+/// string six hex digits per character, its code point plus one, ended by six
+/// zeros, which sort before any character -- so a string sorts before every
+/// string it begins.
+pub fn key_text(k: Value) -> str {
+    var out: [str] = []
+    key_text_into(k, out)
+    out.join("")
+}
+
+fn key_text_into(k: Value, inout out: [str]) {
+    match k {
+        VInt(i) -> out.push(i.bit_xor(-9223372036854775808).as_u64().to_base(16).pad_start(16, "0"))
+        VU64(u) -> out.push(u.to_base(16).pad_start(16, "0"))
+        VBool(b) -> out.push(if b { "1" } else { "0" })
+        VStr(s) -> {
+            for c in s.codes() {
+                out.push((c + 1).to_base(16).pad_start(6, "0"))
+            }
+            out.push("000000")
+        }
+        VTuple(items) -> {
+            for x in items {
+                key_text_into(x, out)
+            }
+        }
+        _ -> ()
+    }
 }
 
 // ----- equality ------------------------------------------------------------
@@ -346,8 +394,8 @@ pub fn equal(a: Value, b: Value) -> bool {
             VErr(y) -> equal(x, y)
             _ -> false
         }
-        VMap(_, _, _, _) -> match b {
-            VMap(_, _, _, _) -> equal_seq(map_keys(a), map_keys(b)) and equal_seq(map_values(a), map_values(b))
+        VMap(_, _, _, _, _) -> match b {
+            VMap(_, _, _, _, _) -> equal_seq(map_keys(a), map_keys(b)) and equal_seq(map_values(a), map_values(b))
             _ -> false
         }
         VRange(a1, a2, a3) -> match b {

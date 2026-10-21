@@ -1,0 +1,8 @@
+// `call_c` through the null address ([L-LIB-CALL-C]).
+type U = fn(i64) -> i64
+
+fn main() / {io, unsafe, mem} {
+    unsafe {
+        let x = mem_addr(0).call_c(U, 1)
+    }
+}

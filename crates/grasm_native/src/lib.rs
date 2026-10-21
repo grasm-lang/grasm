@@ -358,15 +358,30 @@ pub fn compile_module_object(
 /// It reads the same switches as `compile_object_scoped`, so a build with
 /// value structs or inline fields turned off keys differently too.
 pub fn layout_fingerprint(program: &grasm_sema::loader::Program) -> String {
-    if std::env::var("GRASM_VALUES").is_ok_and(|v| v == "0") {
-        return "values off".to_string();
-    }
     let analysis = grasm_sema::check::check_program(program);
+    // Which functions have a C entry, and under which name, is decided by
+    // the whole program: a module emits the entry of a function another
+    // module takes the address of ([T-FN-ADDR]).
+    let c = &analysis.c_facts;
+    let (cells, _) = c.tls_layout();
+    let entries = format!(
+        "c entries: {} exports: {} cells: {}",
+        c.addressed.iter().cloned().collect::<Vec<_>>().join(","),
+        c.exports.join(","),
+        cells
+            .iter()
+            .map(|(k, v)| format!("{k}@{v}"))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    if std::env::var("GRASM_VALUES").is_ok_and(|v| v == "0") {
+        return format!("values off\n{entries}");
+    }
     let types: HashMap<(u32, u32), String> = analysis.resolved_types.into_iter().collect();
     let modules: Vec<&AstModule> = program.files.iter().map(|f| &f.module).collect();
     let ok = values::eligible(&modules, &types);
     let mut out = format!(
-        "values: {}",
+        "values: {}\n{entries}",
         ok.iter().cloned().collect::<Vec<_>>().join(",")
     );
     if std::env::var("GRASM_NO_INLINE").is_ok_and(|v| v == "1") {
@@ -413,6 +428,7 @@ fn compile_object_scoped(
     cg.float_literals = analysis.float_literals;
     cg.narrow = analysis.narrow_ints;
     cg.mem_ops = analysis.mem_ops;
+    cg.c_facts = analysis.c_facts;
     cg.map_get_value_kind = analysis.map_get_value_kind;
     cg.field_calls = analysis.field_calls;
     cg.iface_calls = analysis.iface_calls;
@@ -741,6 +757,11 @@ struct Codegen<'m> {
     /// checker. An address is an `I64` here, so these are found by span and
     /// never by a method's name.
     mem_ops: HashMap<(u32, u32), grasm_sema::mem::MemOp>,
+    /// See `Analysis::c_facts`: the C boundary ([T-FN-ADDR], [T-EXPORT]).
+    c_facts: grasm_sema::mem::CFacts,
+    /// The C entry of each Grasm function C reaches, by qualified name: its
+    /// export symbol, or `gx_<module>_<name>`. See `c_entries`.
+    c_entries: HashMap<String, FuncId>,
     /// The value type of each `m.get(k)`, from the checker. See
     /// `Analysis::map_get_value_kind`.
     map_get_value_kind: std::collections::HashMap<(u32, u32), u8>,
@@ -862,6 +883,8 @@ impl<'m> Codegen<'m> {
             float_literals: std::collections::HashSet::new(),
             narrow: std::collections::HashMap::new(),
             mem_ops: HashMap::new(),
+            c_facts: Default::default(),
+            c_entries: HashMap::new(),
             map_get_value_kind: std::collections::HashMap::new(),
             field_calls: Default::default(),
             iface_calls: Default::default(),
@@ -886,6 +909,7 @@ impl<'m> Codegen<'m> {
             ("grasm_out_u64", vec![i64t], None),
             ("grasm_mem_alloc", vec![i64t, i64t], Some(i64t)),
             ("grasm_mem_free", vec![i64t], None),
+            ("grasm_tls_block", vec![i64t], Some(i64t)),
             ("grasm_strbuf_new", vec![], Some(i64t)),
             ("grasm_bytebuf_new", vec![], Some(i64t)),
             ("grasm_builder_push_str", vec![i64t, i64t], Some(i64t)),
@@ -1504,6 +1528,8 @@ impl<'m> Codegen<'m> {
             // before getting here, so this is a backstop.
             return nope(Span::new(0, 1), "programs without a `main` function");
         }
+        // Before any body: a body may take the address of one.
+        self.c_entries()?;
         for (name, m, _) in views {
             self.current_module = name.clone();
             if !self.emitting_current() {
@@ -2197,14 +2223,148 @@ arguments nor the type this is bound to",
                         self.inlinable.insert(key_for_inline, (small, names));
                     }
                 }
+                // A cell has no symbol: it is an offset into the thread's block
+                // ([T-TLS]; see `tls_layout`).
                 Decl::Test(_)
                 | Decl::Bench(_)
                 | Decl::Import(_)
                 | Decl::Type(_)
                 | Decl::Effect(_)
                 | Decl::Interface(_)
+                | Decl::ThreadLocal(_)
                 | Decl::Impl(_) => {}
             }
+        }
+        Ok(())
+    }
+
+    /// The C entry of every Grasm function C reaches ([T-FN-ADDR],
+    /// [T-EXPORT]): a function with the C signature that calls it.
+    ///
+    /// Two things stand between C and a Grasm function. C leaves the bits
+    /// above a narrow integer argument unspecified, and this backend holds
+    /// every integer as a canonical word, so each narrow argument is cut to
+    /// its width and extended again. And a function that can recurse takes
+    /// the thread's stack floor as a hidden first argument C cannot pass, so
+    /// the entry asks for it, as `fn_value_wrapper` does.
+    ///
+    /// An export's entry is its own name, global. Any other is
+    /// `gx_<module>_<name>`, and only the module defining the function emits
+    /// it -- local in a whole-program build, exported to the other objects in
+    /// a per-module one -- so a function's address is one value everywhere.
+    fn c_entries(&mut self) -> CResult<()> {
+        use grasm_sema::mem::CTy;
+        let exports: std::collections::BTreeSet<String> =
+            self.c_facts.exports.iter().cloned().collect();
+        let mut all: Vec<String> = self.c_facts.exports.clone();
+        all.extend(
+            self.c_facts
+                .addressed
+                .iter()
+                .filter(|q| !exports.contains(*q))
+                .cloned(),
+        );
+        for qual in all {
+            let (Some(target), Some(csig)) = (
+                self.fns.get(&qual).cloned(),
+                self.c_facts.sigs.get(&qual).cloned(),
+            ) else {
+                continue;
+            };
+            let (module, name) = qual.rsplit_once("::").unwrap_or(("main", &qual));
+            let here = match &self.only_module {
+                None => true,
+                Some(m) => m == module,
+            };
+            let (sym, linkage) = if exports.contains(&qual) {
+                (
+                    name.to_string(),
+                    if here {
+                        Linkage::Export
+                    } else {
+                        Linkage::Import
+                    },
+                )
+            } else {
+                (
+                    format!("gx_{}_{name}", module.replace('.', "_")),
+                    match (&self.only_module, here) {
+                        (None, _) => Linkage::Local,
+                        (Some(_), true) => Linkage::Export,
+                        (Some(_), false) => Linkage::Import,
+                    },
+                )
+            };
+            let mut sig = self.module.make_signature();
+            for p in &target.params {
+                sig.params.push(AbiParam::new(p.cl()));
+            }
+            if target.ret != VType::Unit {
+                sig.returns.push(AbiParam::new(target.ret.cl()));
+            }
+            let id = self
+                .module
+                .declare_function(&sym, linkage, &sig)
+                .map_err(|e| Unsupported {
+                    span: Span::new(0, 1),
+                    what: format!("declaring the C entry `{sym}`: {e}"),
+                })?;
+            self.c_entries.insert(qual.clone(), id);
+            if !here {
+                continue;
+            }
+            let mut ctx = self.module.make_context();
+            ctx.func.signature = sig;
+            let mut fbcx = FunctionBuilderContext::new();
+            let mut b = FunctionBuilder::new(&mut ctx.func, &mut fbcx);
+            let entry = b.create_block();
+            b.append_block_params_for_function_params(entry);
+            b.switch_to_block(entry);
+            let params: Vec<Value> = b.block_params(entry).to_vec();
+            let mut args: Vec<Value> = Vec::with_capacity(params.len() + 1);
+            if target.takes_floor {
+                let ptr_ty = self.module.target_config().pointer_type();
+                let here_sp = b.ins().get_stack_pointer(ptr_ty);
+                let f = self
+                    .module
+                    .declare_func_in_func(self.runtime["grasm_stack_floor"], b.func);
+                let call = b.ins().call(f, &[here_sp]);
+                args.push(b.inst_results(call)[0]);
+            }
+            for (p, ct) in params.iter().zip(&csig.params) {
+                let narrow = match ct {
+                    CTy::Layout(t) if t.is_int() && t.size() < 8 => Some(*t),
+                    _ => None,
+                };
+                args.push(match narrow {
+                    Some(t) => {
+                        let w = match t.size() {
+                            1 => types::I8,
+                            2 => types::I16,
+                            _ => types::I32,
+                        };
+                        let cut = b.ins().ireduce(w, *p);
+                        if t.signed() {
+                            b.ins().sextend(types::I64, cut)
+                        } else {
+                            b.ins().uextend(types::I64, cut)
+                        }
+                    }
+                    None => *p,
+                });
+            }
+            let fref = self.module.declare_func_in_func(target.id, b.func);
+            let inst = b.ins().call(fref, &args);
+            let results = b.inst_results(inst).to_vec();
+            b.ins().return_(&results);
+            b.seal_all_blocks();
+            b.finalize();
+            self.module
+                .define_function(id, &mut ctx)
+                .map_err(|e| Unsupported {
+                    span: Span::new(0, 1),
+                    what: format!("{INTERNAL}  {e}"),
+                })?;
         }
         Ok(())
     }
@@ -12918,7 +13078,7 @@ this case",
                 args,
                 span,
             } => match self.cg.mem_ops.get(&(span.start, span.end)) {
-                Some(op) => self.eval_mem(*op, Some(recv), args),
+                Some(op) => self.eval_mem(*op, Some(recv), args, *span),
                 None => self.eval_method(recv, name, args, *span),
             },
             Expr::Unary { op, expr, span } => {
@@ -12986,7 +13146,7 @@ this case",
             } => self.eval_if(cond, then_block, else_branch.as_deref()),
             Expr::Call { callee, args, span } => match self.cg.mem_ops.get(&(span.start, span.end))
             {
-                Some(op) => self.eval_mem(*op, None, args),
+                Some(op) => self.eval_mem(*op, None, args, *span),
                 None => self.eval_call(callee, args, *span),
             },
             Expr::Block(b) | Expr::Unsafe(b) => {
@@ -14174,9 +14334,17 @@ this case",
         op: grasm_sema::mem::MemOp,
         recv: Option<&Expr>,
         args: &[Expr],
+        span: Span,
     ) -> CResult<Option<(Value, VType)>> {
         use cranelift_codegen::ir::{AtomicRmwOp, MemFlags};
         use grasm_sema::mem::{Atomic, MemOp, MemTy};
+        // Each has an argument that is a name and is not evaluated.
+        match (op, recv) {
+            (MemOp::FnAddr, _) => return self.fn_addr(span),
+            (MemOp::CallC, Some(r)) => return self.call_c(r, args, span),
+            (MemOp::Tls(_), _) => return self.tls_addr(span),
+            _ => {}
+        }
         let at = match recv {
             Some(r) => Some(self.eval_expr_val(r)?.0),
             None => None,
@@ -14218,6 +14386,9 @@ this case",
                 return Ok(None);
             }
             MemOp::FromInt | MemOp::ToInt => (at, VType::I64),
+            MemOp::FnAddr | MemOp::CallC | MemOp::Tls(_) => {
+                return nope(span, "a function address or a cell here")
+            }
             MemOp::Size(t) | MemOp::Align(t) => {
                 (self.b.ins().iconst(types::I64, t.size()), VType::I64)
             }
@@ -14281,6 +14452,132 @@ this case",
             }
         };
         Ok(Some(out))
+    }
+
+    /// `mem_tls(C)` ([T-TLS]): the calling thread's block of cells, which the
+    /// runtime makes the first time the thread asks, plus `C`'s offset in the
+    /// whole program's layout.
+    fn tls_addr(&mut self, span: Span) -> CResult<Option<(Value, VType)>> {
+        let Some(grasm_sema::mem::COp::Tls { cell }) =
+            self.cg.c_facts.ops.get(&(span.start, span.end)).cloned()
+        else {
+            return nope(span, "an unresolved `mem_tls`");
+        };
+        let (offsets, size) = self.cg.c_facts.tls_layout();
+        let Some(off) = offsets.get(&cell).copied() else {
+            return nope(span, "a cell that is not in the layout");
+        };
+        let n = self.b.ins().iconst(types::I64, size);
+        let block = self.call_rt("grasm_tls_block", &[n]).unwrap();
+        let at = self.b.ins().iadd_imm(block, off);
+        Ok(Some((at, VType::I64)))
+    }
+
+    /// `mem_fn_addr(f)` ([T-FN-ADDR]): the address of a Grasm function's C
+    /// entry, or of a C function itself, exactly as the linker gives it. An
+    /// `arm64` code pointer is not signed, and nothing here signs or strips
+    /// one.
+    fn fn_addr(&mut self, span: Span) -> CResult<Option<(Value, VType)>> {
+        let Some(grasm_sema::mem::COp::FnAddr { target, is_extern }) =
+            self.cg.c_facts.ops.get(&(span.start, span.end)).cloned()
+        else {
+            return nope(span, "an unresolved `mem_fn_addr`");
+        };
+        let fid = if is_extern {
+            self.cg.fns.get(&target).map(|s| s.id)
+        } else {
+            self.cg.c_entries.get(&target).copied()
+        };
+        let Some(fid) = fid else {
+            return nope(span, "the address of a function with no C entry");
+        };
+        let ptr_ty = self.cg.module.target_config().pointer_type();
+        let fref = self.cg.module.declare_func_in_func(fid, self.b.func);
+        let v = self.b.ins().func_addr(ptr_ty, fref);
+        Ok(Some((v, VType::I64)))
+    }
+
+    /// `a.call_c(Sig, ..)` ([L-LIB-CALL-C]): an indirect call by the C
+    /// convention, its arguments crossing as an `extern` call's do -- a `str`
+    /// as a NUL-terminated copy, `bytes` as its buffer -- and a narrow result
+    /// read at its width. Nothing is checked: a wrong signature is undefined.
+    fn call_c(
+        &mut self,
+        recv: &Expr,
+        args: &[Expr],
+        span: Span,
+    ) -> CResult<Option<(Value, VType)>> {
+        use grasm_sema::mem::{CTy, MemTy};
+        let Some(grasm_sema::mem::COp::CallC(sig)) =
+            self.cg.c_facts.ops.get(&(span.start, span.end)).cloned()
+        else {
+            return nope(span, "an unresolved `call_c`");
+        };
+        let (at, _) = self.eval_expr_val(recv)?;
+        let mut vals: Vec<Value> = Vec::with_capacity(sig.params.len());
+        // (the boxed value, whether it is a `str` copy, the pointer C sees)
+        let mut c_args: Vec<(Value, bool, Value)> = Vec::new();
+        let mut csig = self.cg.module.make_signature();
+        for (a, p) in args.iter().skip(1).zip(&sig.params) {
+            let want = match p {
+                CTy::Layout(MemTy::F64) => VType::F64,
+                CTy::Layout(MemTy::U64) => VType::U64,
+                CTy::Layout(_) => VType::I64,
+                CTy::Str => VType::Str,
+                CTy::Bytes => VType::Bytes,
+            };
+            let (mut v, vt) = self.eval_expr_expecting(a, Some(&want))?;
+            if want == VType::F64 && vt == VType::I64 {
+                v = self.b.ins().fcvt_from_sint(types::F64, v);
+            }
+            match p {
+                CTy::Str => {
+                    let ptr = self.call_rt("grasm_str_c_new", &[v]).unwrap();
+                    c_args.push((v, true, ptr));
+                    vals.push(ptr);
+                }
+                CTy::Bytes => {
+                    let ptr = self.call_rt("grasm_bytes_ptr", &[v]).unwrap();
+                    c_args.push((v, false, ptr));
+                    vals.push(ptr);
+                }
+                CTy::Layout(_) => vals.push(v),
+            }
+            csig.params.push(AbiParam::new(if want == VType::F64 {
+                types::F64
+            } else {
+                types::I64
+            }));
+        }
+        let ret = match sig.ret {
+            None => VType::Unit,
+            Some(MemTy::F64) => VType::F64,
+            Some(MemTy::U64) => VType::U64,
+            Some(_) => VType::I64,
+        };
+        if ret != VType::Unit {
+            csig.returns.push(AbiParam::new(ret.cl()));
+        }
+        // A replay refuses here, whatever the address holds: nothing can tell.
+        let (p, l) = self.str_ptr_len("call_c");
+        self.call_rt("grasm_foreign_call", &[p, l]);
+        let sref = self.b.import_signature(csig);
+        let inst = self.b.ins().call_indirect(sref, at, &vals);
+        let results: Vec<Value> = self.b.inst_results(inst).to_vec();
+        for (boxed, is_str, ptr) in c_args {
+            if is_str {
+                self.call_rt("grasm_str_c_free", &[ptr]);
+            }
+            self.call_rt("grasm_val_dec", &[boxed]);
+        }
+        if ret == VType::Unit {
+            return Ok(None);
+        }
+        let mut r = results[0];
+        if ret == VType::I64 {
+            r = self.narrowed(span, r, &VType::I64);
+        }
+        Ok(Some((r, ret)))
     }
 
     fn eval_method(

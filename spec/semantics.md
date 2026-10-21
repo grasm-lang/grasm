@@ -215,8 +215,9 @@ carry a `:` where the first entry's colon would sit. The braces that belong to
 not in expression position.
 
 **[E-MAP-ORDER]** Map iteration (`keys`, `values`, printing) is in sorted key
-order — `false` before `true`, then integers ascending, then strings
-lexicographically — so program output is deterministic.
+order — `false` before `true`, integers ascending, strings lexicographically,
+tuples component by component by those rules — so program output is
+deterministic.
 
 **[E-STR-CHARS]** String length and indexing operate on Unicode characters,
 not bytes.
@@ -476,10 +477,13 @@ guarantee it provides is entirely static.
 
 **[E-MEM-UNCHECKED]** Undefined, and unchecked by a compiled build: an access
 through an address outside a live allocation — null, freed, past either end, or
-never allocated — or not a multiple of its type's size; and `mem_free` of
-anything but a live allocation's start. `grasm run` keeps raw memory in a
-sandbox, at addresses it never reuses, checks every access and panics saying
-which of these it was, so it is the place to run code that uses `mem`.
+never allocated — or not a multiple of its type's size; `mem_free` of
+anything but a live allocation's start; and `call_c` by a signature the code
+does not have, or through an address that holds none ([L-LIB-CALL-C]).
+`grasm run` keeps raw memory in a sandbox, at addresses it never reuses, checks
+every access and call and panics saying which of these it was, so it is the
+place to run code that uses `mem`. Its addresses are made up, so it panics on
+handing one to C rather than give C a number that names nothing.
 
 ## 10. Testing
 

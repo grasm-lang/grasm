@@ -1,0 +1,11 @@
+// `mem_free` of a thread-local cell ([T-TLS]): the sandbox made it, the
+// program did not, so it is not the program's to free.
+thread_local CELL: i64
+
+fn main() / {io, unsafe, mem} {
+    unsafe {
+        mem_tls(CELL).store_i64(3)
+        print("{mem_tls(CELL).load_i64()}")
+        mem_free(mem_tls(CELL))
+    }
+}

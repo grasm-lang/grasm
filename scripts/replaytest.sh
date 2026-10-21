@@ -117,7 +117,9 @@ done
 # refuse instead, in each way a C function can be called: directly, as a
 # method ([L-UFCS]), and through a function value, which compiles to a wrapper
 # of its own.
-for form in direct method value; do
+# And through an address ([L-LIB-CALL-C]): natively nothing can tell a C
+# function's address from a Grasm one's, so every `call_c` is refused.
+for form in direct method value address; do
   case $form in
     direct) body='let p = unsafe { getpid() }
   print(p > 0)' ;;
@@ -125,9 +127,11 @@ for form in direct method value; do
   print(n)' ;;
     value) body='let q = unsafe { twice(getpid) }
   print(q > 0)' ;;
+    address) body='let q = unsafe { mem_fn_addr(getpid).call_c(Pid) }
+  print(q > 0)' ;;
   esac
   src="$WORK/c_$form.gr"
-  printf 'extern fn getpid() -> i64\nextern fn strlen(s: str) -> i64\n\nfn twice(f: fn() -> i64 / {io, unsafe}) -> i64 / {io, unsafe} {\n  return f() + f()\n}\n\nfn main() / {io, unsafe} {\n  %s\n}\n' "$body" > "$src"
+  printf 'extern fn getpid() -> i64\nextern fn strlen(s: str) -> i64\n\ntype Pid = fn() -> i64\n\nfn twice(f: fn() -> i64 / {io, unsafe}) -> i64 / {io, unsafe} {\n  return f() + f()\n}\n\nfn main() / {io, unsafe, mem} {\n  %s\n}\n' "$body" > "$src"
   bad=""
   for engine in run native; do
     if [ "$engine" = run ]; then

@@ -110,7 +110,18 @@ fn every_mem_builtin(n: i64) / {unsafe, mem} {
         let _s = mem_size_of(i64) + mem_align_of(i64)
         let _v = b.load_i64() + b.atomic_add_i64(1, SeqCst)
         mem_free(a)
+        let _f = mem_fn_addr(pure_for_address)
+        let _c = mem_tls(CELL_FOR_ROW)
     }
+}
+
+/// A thread-local cell's address is `mem` too ([T-TLS]).
+thread_local CELL_FOR_ROW: i64
+
+/// Taking a function's address performs `mem` and that function's own row
+/// ([T-FN-ADDR]); this one's is empty, so the row above is all it needs.
+fn pure_for_address(n: i64) -> i64 {
+    n
 }
 
 fn main() / {io, async} {

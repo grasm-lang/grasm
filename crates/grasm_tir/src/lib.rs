@@ -286,6 +286,13 @@ impl<'a> Emitter<'a> {
                 if let Some(n) = self.decl_node(module, d) {
                     out.push(n);
                 }
+                // [T-EXPORT]: C reaches this function by its own name too.
+                if let Decl::Fn(f) = d {
+                    if f.is_export {
+                        let q = format!("{module}::{}", f.name.name);
+                        out.push(Node::leaf(format!("export {}", quote(&q))));
+                    }
+                }
             }
         }
         if self.facts.fns.contains_key("main::main") {
@@ -334,6 +341,15 @@ impl<'a> Emitter<'a> {
     fn decl_node(&mut self, module: &str, d: &Decl) -> Option<Node> {
         match d {
             Decl::Fn(f) => Some(self.fn_node(module, f)),
+            // [T-TLS]: a cell, by its qualified name and layout type.
+            Decl::ThreadLocal(t) => {
+                let q = format!("{module}::{}", t.name.name);
+                let ty = match self.an.c_facts.cells.get(&q) {
+                    Some(ty) => ty.name().to_string(),
+                    None => self.hole(t.span, "a cell's type"),
+                };
+                Some(Node::leaf(format!("threadlocal {} {ty}", quote(&q))))
+            }
             Decl::Const(c) => {
                 let q = format!("{module}::{}", c.name.name);
                 let t = match self.facts.consts.get(&q) {
@@ -1084,6 +1100,33 @@ impl<'a> Emitter<'a> {
                 let mut kids: Vec<Node> = values.iter().map(|a| self.expr(a)).collect();
                 let o = o.name().to_ascii_lowercase();
                 kids.push(Node::leaf(format!("order {o} {}", span_atom(last.span()))));
+                kids
+            }
+            // [T-TLS]: the cell is a name, and is not evaluated.
+            Some(MemOp::Tls(_)) => match self.an.c_facts.ops.get(&key(span)) {
+                Some(grasm_sema::mem::COp::Tls { cell }) => {
+                    vec![Node::leaf(format!("tlsname {}", quote(cell)))]
+                }
+                _ => vec![Node::leaf(self.hole(span, "the cell an address names"))],
+            },
+            // [T-FN-ADDR]: the function is a name, and is not evaluated.
+            Some(MemOp::FnAddr) => match self.an.c_facts.ops.get(&key(span)) {
+                Some(grasm_sema::mem::COp::FnAddr { target, .. }) => {
+                    vec![Node::leaf(format!("fnname {}", quote(target)))]
+                }
+                _ => vec![Node::leaf(self.hole(span, "the function an address names"))],
+            },
+            // [L-LIB-CALL-C]: the signature is a name, and is not evaluated.
+            Some(MemOp::CallC) => {
+                let mut kids = match self.an.c_facts.ops.get(&key(span)) {
+                    Some(grasm_sema::mem::COp::CallC(sig)) => {
+                        let ps: Vec<&str> = sig.params.iter().map(|p| p.name()).collect();
+                        let r = sig.ret.map_or("unit", |r| r.name());
+                        vec![Node::leaf(format!("sig ({}) {r}", ps.join(" ")))]
+                    }
+                    _ => vec![Node::leaf(self.hole(span, "a call's C signature"))],
+                };
+                kids.extend(args.iter().skip(1).map(|a| self.expr(a)));
                 kids
             }
             _ => args.iter().map(|a| self.expr(a)).collect(),

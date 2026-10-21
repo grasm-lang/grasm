@@ -1,0 +1,14 @@
+// `call_c` through a function's address by a signature it does not have
+// ([L-LIB-CALL-C]).
+type Wide = fn(i64, i64) -> i64
+
+fn twice(n: i64) -> i64 {
+    n * 2
+}
+
+fn main() / {io, unsafe, mem} {
+    unsafe {
+        print("before")
+        let x = mem_fn_addr(twice).call_c(Wide, 1, 2)
+    }
+}

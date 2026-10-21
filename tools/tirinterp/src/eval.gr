@@ -22,6 +22,7 @@
 import load
 import value
 import builtins
+import cabi
 import rawmem
 
 /// Why evaluation is unwinding: nothing, a loop exit, a return, or an error
@@ -78,6 +79,16 @@ type Cx = {
     mem_next: i64,
     mem_freed: [i64],
     mem_forgot: i64,
+    // Function addresses ([T-FN-ADDR]): each Grasm function's, made from
+    // the sandbox's next address as `grasm run` makes them, and the
+    // addresses C handed over, which `call_c` may call.
+    fn_at: Map[i64, i64],
+    fn_addr_of: Map[i64, i64],
+    c_addrs: Map[i64, bool],
+    // Each thread-local cell's address ([T-TLS]), by name: an allocation of
+    // the sandbox's, which `mem_free` refuses.
+    cells: Map[str, i64],
+    cell_at: Map[i64, bool],
 }
 
 pub fn new_cx(p: Prog, args: [str]) -> Cx {
@@ -126,6 +137,11 @@ pub fn new_cx(p: Prog, args: [str]) -> Cx {
         mem_next: 0,
         mem_freed: [],
         mem_forgot: 0,
+        fn_at: map(),
+        fn_addr_of: map(),
+        c_addrs: map(),
+        cells: map(),
+        cell_at: map(),
     }
 }
 
@@ -316,10 +332,13 @@ fn ev_rest(inout cx: Cx, e: i64) -> Value {
         // OP_MEM
         43 -> rawmem.mem_op(cx, e)
         // OP_CALLEXTERN
-        42 -> {
-            let name = cx.s[e]
-            panic("cannot find the C function `{name}` in this process — a compiled build links it, the TIR interpreter can only reach what is already loaded")
-        }
+        42 -> cabi.call_extern_node(cx, e)
+        // OP_FNADDR
+        44 -> cabi.fn_addr(cx, e)
+        // OP_CALLC
+        45 -> cabi.call_c_node(cx, e)
+        // OP_TLS
+        46 -> cabi.tls_cell(cx, e)
         _ -> panic("tirinterp: node {e} has no evaluation (opcode {cx.op[e]})")
     }
 }
@@ -903,25 +922,32 @@ pub fn map_set(p: Prog, inout m: Value, k: Value, v: Value) {
         VStr(s) -> {
             var ks = str_map(value.take(whole))
             ks.set(s, v)
-            m = VMap(map(), map(), ks, map())
+            m = VMap(map(), map(), ks, map(), map())
             return
         }
         VInt(i) -> {
             var ki = int_map(value.take(whole))
             ki.set(i, v)
-            m = VMap(map(), ki, map(), map())
+            m = VMap(map(), ki, map(), map(), map())
             return
         }
         VBool(b) -> {
             var kb = bool_map(value.take(whole))
             kb.set(b, v)
-            m = VMap(kb, map(), map(), map())
+            m = VMap(kb, map(), map(), map(), map())
             return
         }
         VU64(u) -> {
             var ku = u64_map(value.take(whole))
             ku.set(u, v)
-            m = VMap(map(), map(), map(), ku)
+            m = VMap(map(), map(), map(), ku, map())
+            return
+        }
+        // A tuple key, held by its text with the key beside the value.
+        VTuple(_) -> {
+            var kt = tuple_map(value.take(whole))
+            kt.set(value.key_text(k), VTuple([k, v]))
+            m = VMap(map(), map(), map(), map(), kt)
             return
         }
         _ -> panic("invalid map key `{value.show(p, k)}`")
@@ -930,28 +956,35 @@ pub fn map_set(p: Prog, inout m: Value, k: Value, v: Value) {
 
 pub fn str_map(v: Value) -> Map[str, Value] {
     match v {
-        VMap(_, _, ks, _) -> ks
+        VMap(_, _, ks, _, _) -> ks
         _ -> map()
     }
 }
 
 pub fn int_map(v: Value) -> Map[i64, Value] {
     match v {
-        VMap(_, ki, _, _) -> ki
+        VMap(_, ki, _, _, _) -> ki
         _ -> map()
     }
 }
 
 pub fn bool_map(v: Value) -> Map[bool, Value] {
     match v {
-        VMap(kb, _, _, _) -> kb
+        VMap(kb, _, _, _, _) -> kb
+        _ -> map()
+    }
+}
+
+pub fn tuple_map(v: Value) -> Map[str, Value] {
+    match v {
+        VMap(_, _, _, _, kt) -> kt
         _ -> map()
     }
 }
 
 pub fn u64_map(v: Value) -> Map[u64, Value] {
     match v {
-        VMap(_, _, _, ku) -> ku
+        VMap(_, _, _, ku, _) -> ku
         _ -> map()
     }
 }
@@ -1630,8 +1663,7 @@ fn run_fn(inout cx: Cx, fid: i64, inout frame: [Value]) -> Value {
 /// value the caller gave up is the callee's alone.
 pub fn call_fn(inout cx: Cx, fid: i64, inout args: [Value]) -> Value {
     if cx.p.fn_extern[fid] {
-        let name = cx.p.fn_name[fid]
-        panic("cannot find the C function `{name}` in this process — a compiled build links it, the TIR interpreter can only reach what is already loaded")
+        return cabi.call_extern(cx, fid, args)
     }
     var frame = cx.p.fn_frame[fid]
     let params = cx.p.fn_params[fid]

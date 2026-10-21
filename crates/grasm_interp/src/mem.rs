@@ -14,9 +14,9 @@
 //! printing need nothing new. One thread runs at a time ([`crate::tasks`]), so
 //! an atomic is a plain access here, and every ordering is trivially kept.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-use grasm_sema::mem::{Atomic, MemOp, MemTy, MAX_ALIGN};
+use grasm_sema::mem::{Atomic, CSig, MemOp, MemTy, MAX_ALIGN};
 
 use crate::value::Value;
 
@@ -47,6 +47,18 @@ pub struct Heap {
     next: u64,
     /// Freed allocations, oldest first, so tombstones can be forgotten.
     freed: VecDeque<u64>,
+    /// The address given to each Grasm function `mem_fn_addr` was asked for
+    /// ([T-FN-ADDR]), reserved like an allocation and never reused: what it
+    /// names, and the C signature it has.
+    funcs: BTreeMap<u64, (String, Option<CSig>)>,
+    by_name: BTreeMap<String, u64>,
+    /// Addresses C handed over -- an `extern` result, or a C function's own
+    /// address -- which `call_c` may call and C may be given back.
+    from_c: BTreeSet<u64>,
+    /// Each `thread_local` cell, by name, and where it was put ([T-TLS]).
+    /// One thread runs here, so there is one of each.
+    cells: BTreeMap<String, u64>,
+    cell_at: BTreeSet<u64>,
 }
 
 impl Heap {
@@ -65,6 +77,9 @@ impl Heap {
             MemOp::Store(t) => {
                 let what = format!("store_{}", t.name());
                 self.store(t, at, &vs[0], &what).map(|_| Value::Unit)
+            }
+            MemOp::FnAddr | MemOp::CallC | MemOp::Tls(_) => {
+                unreachable!("run by the interpreter itself")
             }
             MemOp::Atomic(op, t, _) => {
                 let what = format!("atomic_{}_{}", op.name(), t.name());
@@ -113,7 +128,63 @@ impl Heap {
         Ok(Value::Int(at as i64))
     }
 
+    /// A Grasm function's address: the same one every time it is asked for,
+    /// from the sandbox's own range, so it can never be an allocation's.
+    pub fn fn_addr(&mut self, name: &str, sig: Option<CSig>) -> u64 {
+        if let Some(at) = self.by_name.get(name) {
+            return *at;
+        }
+        let at = self.next.max(BASE).div_ceil(16) * 16;
+        self.next = at + 16 + GAP;
+        self.funcs.insert(at, (name.to_string(), sig));
+        self.by_name.insert(name.to_string(), at);
+        at
+    }
+
+    /// The function at `at`, if `mem_fn_addr` gave out that address.
+    pub fn func_at(&self, at: u64) -> Option<&(String, Option<CSig>)> {
+        self.funcs.get(&at)
+    }
+
+    /// The cell `name`: an allocation of its type's size and alignment, zero
+    /// until written, made the first time it is asked for and never freed.
+    pub fn tls_cell(&mut self, name: &str, t: MemTy) -> Result<u64, String> {
+        if let Some(at) = self.cells.get(name) {
+            return Ok(*at);
+        }
+        let at = match self.alloc(t.size(), t.size())? {
+            Value::Int(i) => i as u64,
+            _ => unreachable!("an allocation is an address"),
+        };
+        self.cells.insert(name.to_string(), at);
+        self.cell_at.insert(at);
+        Ok(at)
+    }
+
+    /// Remembers an address C handed over.
+    pub fn note_from_c(&mut self, at: u64) {
+        if at != 0 {
+            self.from_c.insert(at);
+        }
+    }
+
+    pub fn is_from_c(&self, at: u64) -> bool {
+        self.from_c.contains(&at)
+    }
+
+    /// Whether the sandbox made this address, for memory or for a function:
+    /// one C must not be given, since it would read made-up numbers.
+    pub fn made(&self, at: u64) -> bool {
+        at >= BASE && at < self.next && !self.from_c.contains(&at)
+    }
+
     fn free(&mut self, at: u64) -> Result<(), String> {
+        if self.funcs.contains_key(&at) {
+            return Err("mem_free of the address of a function".into());
+        }
+        if self.cell_at.contains(&at) {
+            return Err("mem_free of a thread-local cell".into());
+        }
         let inside = self.find(at).is_some();
         match self.blocks.get_mut(&at) {
             Some(Block {
@@ -147,6 +218,9 @@ impl Heap {
     fn span(&mut self, at: u64, n: u64, what: &str) -> Result<&mut [u8], String> {
         if at == 0 {
             return Err(format!("{what} through the null address"));
+        }
+        if self.funcs.contains_key(&at) {
+            return Err(format!("{what} through the address of a function"));
         }
         let Some((base, b)) = self.find(at) else {
             return Err(format!("{what} through an address no allocation holds"));

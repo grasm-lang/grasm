@@ -220,6 +220,7 @@ impl<'a> Linter<'a> {
             | Decl::Type(_)
             | Decl::Effect(_)
             | Decl::Extern(_)
+            | Decl::ThreadLocal(_)
             | Decl::Interface(_)
             | Decl::Impl(_) => {}
         }

@@ -4471,3 +4471,198 @@ fn every_capability_is_a_reserved_effect_name() {
         );
     }
 }
+
+/// A function's address and a call through one ([T-FN-ADDR], [L-LIB-CALL-C])
+/// are raw-memory operations: inside `unsafe`, performing `mem`, and a call
+/// through an address performs what an `extern` call does besides. Taking an
+/// address carries the function's own row.
+#[test]
+fn function_addresses_are_unsafe_and_carry_rows() {
+    check_ok(
+        "type Unary = fn(i64) -> i64\n\nextern fn labs(n: i64) -> i64\n\nfn twice(n: i64) -> i64 {\n    n * 2\n}\n\nfn f() -> i64 / {io, unsafe, mem} {\n    unsafe {\n        let a = mem_fn_addr(twice)\n        let b = mem_fn_addr(labs)\n        a.call_c(Unary, 4) + b.call_c(Unary, -3)\n    }\n}\n",
+    );
+    check_err(
+        "type Unary = fn(i64) -> i64\n\nfn twice(n: i64) -> i64 {\n    n * 2\n}\n\nfn f(a: addr) -> i64 {\n    a.call_c(Unary, 4)\n}\n",
+        "`call_c` reaches raw memory, so it can only be used inside `unsafe`",
+    );
+    // A call through an address reaches what cannot be known.
+    check_err(
+        "type Unary = fn(i64) -> i64\n\nfn f(a: addr) -> i64 / {unsafe, mem} {\n    unsafe {\n        a.call_c(Unary, 4)\n    }\n}\n",
+        "performs effect(s) `io` not in its declared row",
+    );
+    // Taking the address of a C function carries its `io`.
+    check_err(
+        "extern fn labs(n: i64) -> i64\n\nfn f() -> addr / {unsafe, mem} {\n    unsafe {\n        mem_fn_addr(labs)\n    }\n}\n",
+        "performs effect(s) `io` not in its declared row",
+    );
+    // Not pure: a parallel map refuses it ([T-PAR-MAP-PURE]).
+    check_err(
+        "fn twice(n: i64) -> i64 {\n    n * 2\n}\n\nfn f() -> [addr] / {unsafe, mem} {\n    [1, 2].par_map(|i| unsafe { mem_fn_addr(twice) })\n}\n",
+        "performs `mem`",
+    );
+}
+
+/// `call_c`'s signature is a type alias for a function type whose parameters
+/// and result cross to C, written where a value would go ([L-LIB-CALL-C]).
+#[test]
+fn call_c_takes_a_signature_that_crosses() {
+    for (decl, call, want) in [
+        (
+            "type Sig = fn(i64) -> i64",
+            "a.call_c(Sig, 1, 2)",
+            "takes 1 argument(s) after the signature, got 2",
+        ),
+        (
+            "type Sig = fn(i64) -> str",
+            "a.call_c(Sig, 1)",
+            "`str` has no C representation",
+        ),
+        (
+            "type Sig = fn(bool) -> i64",
+            "a.call_c(Sig, true)",
+            "`bool` has no C representation",
+        ),
+        (
+            "type Sig = [i64]",
+            "a.call_c(Sig, 1)",
+            "`call_c` takes a function type",
+        ),
+        (
+            "type Sig = fn(i64) -> i64",
+            "a.call_c(1)",
+            "`call_c` takes a signature first",
+        ),
+        (
+            "type Sig = fn(str) -> i64",
+            "a.call_c(Sig, 7)",
+            "expected `str`",
+        ),
+    ] {
+        check_err(
+            &format!("{decl}\n\nfn f(a: addr) / {{io, unsafe, mem}} {{\n    unsafe {{\n        let x = {call}\n    }}\n}}\n"),
+            want,
+        );
+    }
+    // What an `extern fn` may take, a call through an address may pass.
+    check_ok(
+        "type Sig = fn(str, bytes, addr, f64, u8) -> u64\n\nfn f(a: addr) -> u64 / {io, unsafe, mem} {\n    unsafe {\n        a.call_c(Sig, \"s\", bytes_of([1]), a, 1.5, 7)\n    }\n}\n",
+    );
+}
+
+/// An `export fn` is one C symbol ([T-EXPORT]): its name may not be one the
+/// toolchain gives its own code, nor an `extern fn`'s, and its signature is
+/// one C can call.
+#[test]
+fn an_export_is_one_symbol_with_a_c_signature() {
+    for name in [
+        "main",
+        "grasm_start",
+        "g_main_f",
+        "gx_main_f",
+        "gv_x",
+        "gc_x",
+        "gp_x",
+        "gpf_x",
+    ] {
+        check_err(
+            &format!("export fn {name}() {{\n}}\n"),
+            &format!("`{name}` cannot be exported: the toolchain gives that name to its own code"),
+        );
+    }
+    check_err(
+        "extern fn shared(n: i64) -> i64\n\nexport fn shared(n: i64) -> i64 {\n    n\n}\n",
+        "duplicate function",
+    );
+    check_err(
+        "export fn ok_name(s: str) -> i64 {\n    1\n}\n",
+        "`ok_name` cannot be exported: `str` does not cross to C",
+    );
+    check_err(
+        "export fn ok_name(n: i64) -> i64 ! str {\n    n\n}\n",
+        "fallible function `ok_name` cannot be exported",
+    );
+    check_err(
+        "export fn ok_name[T](x: T) -> T {\n    x\n}\n",
+        "generic function `ok_name` cannot be exported",
+    );
+    check_err(
+        "effect Ask {\n    fn ask() -> i64\n}\n\nexport fn ok_name() -> i64 {\n    Ask.ask()\n}\n",
+        "`ok_name` cannot be exported: it performs `Ask`",
+    );
+    // `export` is a word only before `fn`.
+    check_ok(
+        "export fn plain_export(n: i64, x: f64, p: addr) -> u32 {\n    7\n}\n\nfn export(n: i64) -> i64 {\n    n\n}\n\nfn main() {\n    let export = plain_export(1, 2.0, unsafe { mem_addr(0) })\n    print(\"{export}\")\n}\n",
+    );
+}
+
+/// A thread-local cell ([T-TLS]) holds a layout type, is private to its
+/// module, and is reached only through `mem_tls`, a raw-memory operation.
+#[test]
+fn thread_local_cells_hold_layout_types_behind_unsafe() {
+    check_ok(
+        "thread_local A: i64\nthread_local B: u8\nthread_local C: f64\nthread_local D: addr\n\nfn f() -> i64 / {unsafe, mem} {\n    unsafe {\n        mem_tls(B).store_u8(1)\n        let d = mem_tls(D)\n        mem_tls(A).load_i64() + mem_tls(C).load_f64().as_i32().as_i64()\n    }\n}\n",
+    );
+    for (src, want) in [
+        ("thread_local A: str\n", "a thread-local cell cannot hold `str`"),
+        ("thread_local A: [i64]\n", "a thread-local cell cannot hold `[i64]`"),
+        ("thread_local A: bool\n", "a thread-local cell cannot hold `bool`"),
+        ("pub thread_local A: i64\n", "thread-local cell `A` cannot be `pub`"),
+        ("thread_local A: i64\nthread_local A: u8\n", "duplicate name `A`"),
+        (
+            "thread_local A: i64\n\nfn f() -> addr {\n    mem_tls(A)\n}\n",
+            "`mem_tls` reaches raw memory, so it can only be used inside `unsafe`",
+        ),
+        (
+            "thread_local A: i64\n\nfn f() -> addr / {unsafe} {\n    unsafe {\n        mem_tls(A)\n    }\n}\n",
+            "performs effect(s) `mem` not in its declared row",
+        ),
+        (
+            "fn f() -> addr / {unsafe, mem} {\n    unsafe {\n        mem_tls(B)\n    }\n}\n",
+            "`mem_tls` takes the name of a `thread_local` cell this module declares",
+        ),
+        (
+            "thread_local A: i64\n\nfn f(A: i64) -> addr / {unsafe, mem} {\n    unsafe {\n        mem_tls(A)\n    }\n}\n",
+            "`mem_tls` takes the name of a `thread_local` cell this module declares",
+        ),
+    ] {
+        check_err(src, want);
+    }
+    // `thread_local` is a word only before a name and a colon.
+    check_ok(
+        "fn thread_local(n: i64) -> i64 {\n    n\n}\n\nfn main() {\n    let thread_local = 3\n    print(\"{thread_local}\")\n}\n",
+    );
+}
+
+/// A map key may be a tuple of key types, nested or not ([T-MAP-KEY]); a
+/// component with no key order is refused, and a type parameter inside a
+/// tuple key is held to the rule where it is instantiated
+/// ([T-MAP-KEY-GENERIC]).
+#[test]
+fn tuple_map_keys_are_tuples_of_key_types() {
+    check_ok(
+        "fn f() -> i64 {\n    var m: Map[(str, i64), i64] = {(\"a\", 1): 2}\n    var n: Map[(bool, (u8, str)), str] = {}\n    n.set((true, (1, \"x\")), \"y\")\n    m.set((\"b\", 2), 3)\n    m.get((\"a\", 1)) ?? 0\n}\n",
+    );
+    for (src, want) in [
+        (
+            "fn f() {\n    var m: Map[(f64, i64), i64] = {}\n}\n",
+            "map keys must be an integer type, `str`, `bool` or a tuple of those, not `(f64, i64)`",
+        ),
+        (
+            "fn f() {\n    var m: Map[(i64, (str, [i64])), i64] = {}\n}\n",
+            "not `(i64, (str, [i64]))`",
+        ),
+        (
+            "fn f() {\n    var m = map()\n    m.set((\"a\", 1.5), 1)\n}\n",
+            "not `(str, f64)`",
+        ),
+        (
+            "fn g[T](x: T) -> i64 {\n    var m: Map[(T, i64), i64] = {}\n    m.set((x, 1), 1)\n    m.len()\n}\n\nfn f() -> i64 {\n    g(1.5)\n}\n",
+            "not `f64`",
+        ),
+    ] {
+        check_err(src, want);
+    }
+    check_ok(
+        "fn g[T](x: T) -> i64 {\n    var m: Map[(T, i64), i64] = {}\n    m.set((x, 1), 1)\n    m.len()\n}\n\nfn f() -> i64 {\n    g(\"ok\") + g((1, true))\n}\n",
+    );
+}

@@ -72,16 +72,16 @@ where each one stands.</p>
   <div class="fig"><b>511</b><span>programs, engines identical</span></div>
   <div class="fig"><b>508</b><span>identical in wasm</span></div>
   <div class="fig"><b>645</b><span>cross-compiled, agreeing</span></div>
-  <div class="fig"><b>270</b><span>conformance programs</span></div>
+  <div class="fig"><b>274</b><span>conformance programs</span></div>
   <div class="fig"><b>101</b><span>findings recorded</span></div>
-  <div class="fig"><b>18</b><span>fuzz generators</span></div>
+  <div class="fig"><b>21</b><span>fuzz generators</span></div>
 </div>
 <p>Interpreter, bundle and native builds agree byte for byte on stdout, exit
 code and diagnostics. All 645 are also compiled for x86_64 and run under
 Rosetta, every one of them agreeing, on 21 October 2026. Every generated program
 is checked for what it keeps as well as for what it prints.</p>
 <h2>Which run wrote which figure</h2>
-<p>The corpus is <b>648</b> standalone programs, counted as this page is
+<p>The corpus is <b>651</b> standalone programs, counted as this page is
 written and by difftest's own filter — so a program added today is in that
 number today. Everything below it needs a run, and these are not all from one
 run. <code>site/facts.json</code> used to carry no date at all, which is how a

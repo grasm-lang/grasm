@@ -1,0 +1,11 @@
+// `mem_free` of a function's address ([T-FN-ADDR]).
+fn twice(n: i64) -> i64 {
+    n * 2
+}
+
+fn main() / {io, unsafe, mem} {
+    unsafe {
+        print("before")
+        mem_free(mem_fn_addr(twice))
+    }
+}

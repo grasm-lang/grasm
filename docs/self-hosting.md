@@ -285,6 +285,399 @@ way round).
 as its gate. The rest of §5 -- thread-locals, `export fn` and function
 addresses, a context switch, wider map keys -- is S1 part three.
 
+### 5.2 Function addresses and `export fn`: the design (S1 part three)
+
+Written before the code, 2026-10-21. The normative text will be [T-FN-ADDR],
+[L-LIB-CALL-C] and [T-EXPORT], with [T-EXTERN-POINTER] widened to `addr`.
+
+**What it is for.** The runtime written in Grasm (S5) is entered from
+compiled code through the C convention at some three hundred named entry
+points; it hands C functions callbacks (`qsort`, `sigaction`,
+`pthread_create`, `atexit`); and it calls through code addresses it holds (a
+closure's code word, a function a table names). That is three things: the
+address of a named function, a call through an address, and a function C can
+find by its name.
+
+**Surface.** One declaration form, one free function, one method. Everything
+else is [T-ADDR]'s `addr`.
+
+- `export fn name(a: i32, p: addr) -> i64 { ... }`: an ordinary Grasm function
+  in every way -- Grasm code calls it like any other -- that is *also*
+  reachable from C under its own name by the platform's C calling convention.
+  `export` is a word only before `fn`, as `extern` is, so `hpke.export(..)`
+  and `fn export(..)` keep compiling.
+- `mem_fn_addr(f)`: the address of the named function `f`, an `addr`. `f` is
+  written as a name (`f`, `module.f`) and is not evaluated, as `mem_size_of`'s
+  type is not. For an `extern fn` it is the C function's own address; for a
+  Grasm function, the address of an entry to it that takes the C convention.
+- `a.call_c(Sig, x, y)`: calls the code at `a` by the C convention. `Sig` names
+  a type alias for a function type -- `type Cmp = fn(addr, addr) -> i32` --
+  written where a value would go and read by the checker, the way
+  `mem_size_of(u16)` reads its type; the arguments are checked against its
+  parameters and the call's type is its result. Only the parameter and result
+  types are read; the call's row is fixed (below). An alias rather than a new
+  type syntax keeps the parser unchanged outside `export`.
+
+`extern fn` parameters and results gain `addr` ([T-EXTERN-POINTER]), which
+is what lets an address reach C at all: `qsort(base, n, 8, mem_fn_addr(cmp))`,
+`dlsym(handle, "sqrt")`.
+
+**C-compatible signatures.** A Grasm function that is exported or has its
+address taken has `let` parameters of layout types (the eight integer
+types, `f64`, `addr`) and a layout result or none, and is not generic, not
+fallible, not an `impl` method; and its row holds only capabilities that need
+no handler -- `io`, `net`, `proc`, `unsafe`, `mem` -- because C reaches it
+outside every `with`, and outside the task scheduler `async` needs. A
+signature for `call_c` may have what an `extern fn` may declare: parameters of
+an integer type, `f64`, `str`, `bytes` or `addr` (a `str` crossing as a
+NUL-terminated copy, `bytes` as its buffer, as for an `extern` call), and an
+integer, `f64` or `addr` result or none. `bool` is out everywhere, for the
+reason [T-EXTERN] gives.
+
+**Tier 3, through what already exists.** `mem_fn_addr` and `call_c` are
+raw-memory operations ([T-MEM-UNSAFE]): inside `unsafe`, performing `mem`.
+Taking an address also carries the function's own row, as naming an `extern`
+carries `io` ([T-EXTERN-VALUE]): whoever holds the address can call it, so
+`mem_fn_addr(sqrt)` performs `io`. A call through an address performs `io`
+and `unsafe` besides, exactly as an `extern` call does, because what it
+reaches cannot be known. An `export fn` is Tier 3 by being declared: C may
+call it with any arguments, from any thread, any number of times. Its package
+performs `unsafe` for the declaration, charged at it, and the function's row
+escapes the package as a `pub` function's does. So each of the three is
+visible in the manifest of the package that uses it and of every consumer's
+dependency graph, through the ceiling that already exists, with no new
+mechanism.
+
+**Names.** An export's symbol is its own name, so the name is unique in the
+program (two exports of one name are an error here, rather than a duplicate
+symbol at link time) and is not `main`, which the compiler emits as the C
+entry, nor a name the toolchain gives its own symbols: one beginning with
+`grasm_` (the runtime) or `g_`, `gc_`, `gp_`, `gpf_`, `gv_`, `gx_` (the
+compiler). S5's runtime, which must define `grasm_` symbols, lifts that
+reservation in its own design when it is linked in place of
+`libgrasm_rt_abi.a`. An export named like a C library function (`write`)
+replaces it for the whole program, the statically linked runtime included;
+that is Tier 3 and is said so in the clause.
+
+**Natively.** For each Grasm function that is exported or whose address is
+taken, the backend emits a *C entry*: a function with the C signature that
+re-extends every narrow argument from its own width (C leaves the bits above
+an `i8` or an `i32` unspecified, and this backend holds every integer as a
+canonical word), asks for the thread's stack floor if the function can
+recurse (the hidden argument C cannot pass, as `fn_value_wrapper` does), and
+calls the function. An export's entry is the global symbol `name`; any other
+is local, `gx_<module>_<name>`, emitted once, by the module that defines the
+function, so a function's address is one value everywhere and `==` holds
+across modules under the incremental build too (the set of address-taken
+functions joins the layout fingerprint that keys the object cache).
+`mem_fn_addr` is Cranelift's `func_addr`; `call_c` is `call_indirect` with
+the C signature, its arguments crossing exactly as an `extern` call's do, a
+narrow result read at its width. The system linker dead-strips a function
+nothing references, and `strip` drops exports from the export trie, so every
+export is named to both: `-exported_symbol _name` at the link (which also
+roots it) and `strip -s` with the export list.
+
+**Pointer authentication.** Grasm's executables are `arm64`, not `arm64e`
+(`otool -h`: cpusubtype `ALL`); on `arm64` neither the system linker nor
+dyld signs code pointers, and Cranelift has no `arm64e` target. An address is
+used exactly as it was given and is never stripped, so `call_c` is a plain
+`blr`. A future target that signs code pointers (`arm64e`, in S3 or S7) must
+sign in `mem_fn_addr` and authenticate in `call_c` (`blraaz`); it is written
+here so it is not lost. Return addresses *are* signed: Cranelift turns on
+`sign_return_address` with the B key for every function on macOS
+(`pacibsp`/`retab`), and a C entry is a function like any other.
+
+**Interpreter.** It has no machine code for a Grasm function and cannot make
+any, so:
+
+- `mem_fn_addr` of a Grasm function gives an address from the raw-memory
+  sandbox, reserved like an allocation and never reused, one per function, so
+  the same function always has the same address. `call_c` through it compares
+  `Sig` with the function's own signature and calls it, or panics saying both
+  (natively a mismatch is undefined).
+- `mem_fn_addr` of an `extern fn` is the C function's real address, found in
+  the interpreter's own process as a call finds it. `call_c` through an address
+  C handed over -- that, or an `addr` an `extern` call returned -- is made as
+  an `extern` call is, with the shapes it supports. Through any other address
+  it panics: null, wild, or an allocation's.
+- An address the sandbox made, memory or function, cannot be handed to C: C
+  would be reading the sandbox's made-up numbers. Passing one to an `extern`
+  panics; C's own addresses pass through. Loading or storing through a
+  function's address panics.
+
+So a program that gives C a callback runs compiled and panics under
+`grasm run`. That is the one place the interpreter does less than the
+compiled build rather than more, and the reason is the one above; those
+programs are tested natively, by CLI tests and the fuzz gate, and the corpus
+uses only what both engines can run. Under `GRASM_REPLAY`, `call_c` is
+refused as an `extern` call is, in both engines and whatever the address
+holds, because natively nothing can tell.
+
+**TIR.** `mem_fn_addr`'s argument prints `(fnname "module::f")` and
+`call_c`'s signature `(sig (addr addr) i32)`, leaves a consumer must not
+evaluate, as `(type u16)` is. An export prints `(export "module::f")` right
+after its function.
+
+**The TIR interpreter, and the question the brief asks.** Calling an `extern
+fn` through an address obtained at run time -- from `dlsym`, or loaded from a
+table in raw memory -- **is in scope**: it is what `call_c` is. It also closes
+the gap that made `scripts/tirinterp.sh` skip the eight programs that declare
+an `extern fn`: `tools/tirinterp` finds the symbol in its own process with
+`dlsym` (its own `extern fn`) and calls it with `call_c`. Grasm has no
+variadic call, so each shape needs a call site with a signature of its own;
+the interpreter enumerates exactly the shapes `crates/grasm_interp/src/ffi.rs`
+does, so a shape outside them panics in both with the same words, and the skip
+rule goes. Not in scope: variadic C functions, structs by value, and a
+closure as a callback -- a closure has an environment C cannot pass; a C
+callback that takes a `void *` context gets an `addr`.
+
+**Threads.** A callback C calls on a thread of its own runs Grasm code there.
+That is Tier 3, and it is sound as far as the language goes: the callback
+receives only layout values, safe Grasm has no shared mutable state to race
+on (no mutable globals, and §5.3's thread-locals are per thread), and the
+runtime keeps its own state per thread or behind locks. What it does not get
+on a foreign thread is a sized stack floor: the floor assumes the main
+thread's budget, so deep recursion on a small C-made stack can fault instead
+of panicking.
+
+**Gate.** `scripts/fuzz_fnaddr.py`: random C-compatible functions over every
+layout type, their addresses taken and called through `call_c`, and the same
+values passed through an `extern` -- in both engines, against a Python model;
+natively also C calling Grasm (`qsort` with a generated comparator over raw
+memory, and exports found back with `dlsym` and called), and a caller that
+leaves an argument's upper bits set, which only the C entry's re-extension
+gets right. Mutation controls as in §5.1, one per engine and one per checker
+rule.
+
+**Status.** Built to this design on 2026-10-21, with
+`scripts/fuzz_fnaddr.py` as its gate.
+
+### 5.3 Thread-local cells: the design (S1 part three)
+
+Written before the code, 2026-10-21. The normative text will be [T-TLS], with
+`mem_tls` a row of [L-LIB-MEM]'s table (written so: a clause of its own cost
+more lines than the budget had) and `mem_free` of a cell already undefined by
+[E-MEM-UNCHECKED], since a cell is no allocation.
+
+**What it is for.** The runtime written in Grasm keeps state per thread: an
+allocator's free lists and pools, a scheduler's current task, a stack floor.
+The owner's rule stands -- no `static mut`, no unsound global mutable state,
+and safe Grasm must not be able to observe a data race -- and the compiler
+itself passes its context explicitly, so this is for the runtime alone.
+
+**Surface.** One declaration form and one free function; everything else is
+raw memory ([L-LIB-MEM], [L-LIB-ATOMIC]).
+
+- `thread_local POOL: addr` at module level declares a *cell* of a layout type
+  (the eight integer types, `f64`, `addr`). Every thread has its own, and each
+  starts as zero bits: `0`, `0.0`, the null address -- as `mem_alloc`'s memory
+  does. There is no initializer, because there is no moment that is "before"
+  a thread C creates. `thread_local` is a word only at the start of a
+  declaration followed by a name and `:`, as `linear` is before `type`.
+- `mem_tls(POOL)`: the address of the calling thread's cell, an `addr`. `POOL`
+  is a name, as `mem_size_of`'s type is, resolved in the module that declares
+  it: a cell is private to its module, and a module that wants to share one
+  writes a function that hands out the address. It is a raw-memory operation
+  ([T-MEM-UNSAFE]): inside `unsafe`, performing `mem`. The cell is then read
+  and written as `T` -- `load_T`, `store_T`, the atomics -- at `T`'s size and
+  alignment.
+
+A cell holds a layout type, never a counted value, and is reached only
+through an address, for the reason §5.1 keeps raw memory apart from the heap:
+a counted value in per-thread storage would be shared between the tasks of a
+thread and visible to whatever C does with the address, and the refcounts
+were never made for that. With layout types only, the runtime's counting
+never meets per-thread state, and there is no second mechanism to make safe.
+
+**Why this cannot race in safe Grasm.** Safe code cannot reach a cell, since
+`mem_tls` is `unsafe`. Grasm itself starts other threads only for `par_map`
+and the multi-core `parallel`, and both refuse work that performs `mem`
+([T-PAR-MAP-PURE]), so a cell is touched only by the thread that runs `main`
+and by threads C starts (§5.2), each its own. Concurrent tasks are fibers on
+one thread and share its cell: a value one task stores is seen by the next to
+run, at the points [E-SCHEDULE] fixes, the same in both engines. Two threads
+see one cell only if its address is handed across through C, which is Tier 3
+and spelled in the manifest.
+
+**Natively.** The runtime keeps one zeroed block per thread, made the first
+time the thread asks and released when it ends (its own `thread_local!`, the
+mechanism it already uses for its per-thread state; no `static mut`). The
+compiler lays every cell of the program out in that block -- ordered by
+qualified name, each at a multiple of its size -- and `mem_tls(POOL)` is a
+call for the block, with the program's total size, plus `POOL`'s offset. The
+layout is the whole program's, so it joins the layout fingerprint that keys
+the incremental build's objects. Cranelift's own Mach-O thread-local
+variables are not used: nothing here exercises them, crosstest runs x86-64
+under Rosetta, and a runtime call is the same on both, costing about what a
+Rust `thread_local!` access costs on macOS, which is also a call. The block is
+not `mem_alloc` memory: freeing a cell's address is undefined.
+
+**Interpreter.** One thread, so one cell per declaration: a sandbox
+allocation of `T`'s size and alignment, zeroed, made the first time it is
+asked for and never freed. Every access through it is checked like any
+other; `mem_free` of it panics ("mem_free of a thread-local cell"), where a
+compiled build would free something that was never allocated.
+
+**TIR.** `(threadlocal "module::POOL" addr)` declares a cell, in source order
+with the other declarations, and `mem_tls`'s argument prints
+`(tlsname "module::POOL")`, a name a consumer must not evaluate.
+
+**The TIR interpreter.** A cell is an allocation from the raw-memory sandbox,
+which another branch is adding to `tools/tirinterp`. Until the two meet, the
+loader reads the declarations and the operation and the run fails as the
+other raw-memory programs do -- counted in the report, not skipped.
+
+**Gate.** `scripts/fuzz_tls.py`: random programs over several cells of every
+layout type, stored, loaded and updated atomically through their addresses,
+held in lists and passed to functions, against a model of one value per
+cell, in both engines; natively, threads C starts (`pthread_create` with a
+Grasm entry, §5.2) each find their own cells zero, write them without
+disturbing the main thread's, and add to one shared counter atomically -- the
+first time a Grasm atomic runs under contention; the interpreter's refusal to
+free a cell; and the checker's refusals: a non-layout type, `pub`, use outside
+`unsafe`, a name that is not a cell, a cell of another module.
+
+**Status.** Built to this design on 2026-10-21, with `scripts/fuzz_tls.py` as
+its gate. Up to six threads C starts each kept their own cells and added to
+one counter atomically to the exact total: the contention test §5.1 had to
+leave for later.
+
+### 5.4 Wider map keys: the design (S1 part three)
+
+Written before the code, 2026-10-21. The normative text is [T-MAP-KEY],
+[E-MAP-ORDER] and [L-LIB-MAP], widened.
+
+**What it is for.** A compiler's tables are keyed by more than one thing: a
+type and a field name, a module and a function, a node and a slot. Today a
+key is an integer, a `str` or a `bool`, so a program joins the parts into a
+string, which is slow, allocates per lookup, and is one forgotten separator
+from two keys colliding.
+
+**Two ways it could go, and the one taken.** The brief offered tuple keys or
+a documented packing idiom with a helper. A packing idiom puts the
+encoding in every program that needs one, and the encoding has to be
+injective and preserve order, which an `a + ":" + b` is not. Tuple keys put
+it in two engines and a runtime, once, where the gates can see it. So: tuple
+keys.
+
+**Surface.** No new syntax. [T-MAP-KEY] widens: a key type is an integer
+type, `str`, `bool`, or a tuple of key types -- `Map[(str, i64), V]`,
+`Map[(i64, (bool, str)), V]`. Every map operation, map literals and
+[T-MAP-KEY-GENERIC]'s checking at call sites apply unchanged; a type
+parameter inside a tuple key is a key parameter as one outside it is.
+
+**Order.** [E-MAP-ORDER] gains one rule: tuple keys sort component by
+component, left to right, each by its own key order -- which is the order
+`sort` gives tuples of the types it orders ([L-LIB-TUPLE]), so a map's `keys()` and the
+sorted list of its keys are the same list. Determinism is kept: iteration
+reads the keys in that order and never the hash table's.
+
+**Hashing and flooding.** A tuple key hashes its components, in order,
+through the same seeded hasher every key goes through, so the
+flooding resistance is the same as for its parts.
+
+**Engines.** The interpreter's sorted `MapKey` gains a tuple variant whose
+derived order is the lexicographic one. The runtime's `MapKey` gains one
+too, built from a tuple value's components on insert and on lookup -- a
+lookup with a tuple key allocates the probe key, where a `str` probe does
+not; that cost is measured and left for S5, which rewrites the map anyway --
+and turned back into a tuple value for `keys()` and `entries()`. The native
+backend already passes a key it does not specialise as a boxed value, which
+is what a tuple is. TIR needs nothing: a tuple type prints as one.
+
+**The TIR interpreter.** Grasm's maps take only scalar keys of one static
+type, so the interpreter, written in Grasm, keeps tuple-keyed entries in a
+fifth host map keyed by text: each component written so that the text order
+is the key order and no two keys share a text -- an integer as sixteen hex
+digits with its sign bit flipped, a character as six hex digits of its code
+point plus one, a string ended by six zeros -- with the key and the value
+kept beside it. That is the packing idiom, once, in the one program that
+cannot use the feature.
+
+**Gate.** `scripts/fuzz_mapkeys.py`: random tuple key types two and three
+deep over every key type, random sets, deletes, gets, `has`, `keys`,
+`values`, `entries`, printing and equality, against a Python dict whose
+iteration is sorted by the same rule, in both engines, leak-checked; keys
+that differ only inside a component (`("a", 1)` against `("a", 2)`, `("ab",
+"c")` against `("a", "bc")`) are drawn on purpose, which is where an encoding
+or a hash would collide. The checker's refusals: a component with no order
+(`f64`, a list, a struct).
+
+**Status.** Built to this design on 2026-10-21, with
+`scripts/fuzz_mapkeys.py` as its gate. A compiled lookup with a tuple key
+took 64 ns against 53 for the same parts joined into a string and 26 for
+them packed into one integer (docs/known-issues.md).
+
+### 5.5 A context switch: deferred to S3, and what S5 will need
+
+Decided 2026-10-21, as S1 part three's last row. The brief allowed deferring
+it with the reason written down; it is deferred, for three reasons.
+
+**No meaning both engines can give.** Every other row of §5 has one in the
+interpreter: a sandbox address, a made-up function address that checks its
+signature, a cell that is a sandbox allocation. A context switch moves the
+machine's registers and stack pointer from one stack to another, and the
+definitional interpreter walks trees and has no machine stack to move. A
+program using one could only run compiled, and it is the one primitive whose
+misuse the interpreter could not even describe. What fibers *mean* is already
+in the language, in both engines and agreeing -- [E-SCHEDULE], `concurrent`
+and `go`, channels -- and none of that changes; what S5 needs is the
+mechanism underneath, and a mechanism is the backend's business.
+
+**The Rust backend cannot emit one.** Cranelift has no inline assembly and
+no naked functions. An intrinsic here would lower to a call to a routine
+written in Rust's assembly -- `grasm_fiber`'s `arch::switch` and
+`arch::prepare`, which the runtime already uses -- and the point of S5 is to
+remove that Rust. Naming it in Grasm today would add a clause, a capability
+story and a gate for a call the S5 runtime cannot keep.
+
+**Its contract is S3's to fix.** Which registers are preserved across a
+call in the new backend's own convention, how it lays frames out for the
+stack-floor check, and how it signs return addresses are decided by the
+aarch64 backend (S3), and a switch is exactly as correct as its agreement
+with those decisions.
+
+**What S5's fibers will need, from S3.** Two intrinsics in the backend's
+lowering rules, each `unsafe`, performing `mem`, and both taking addresses
+only (§5.1):
+
+- `ctx_switch(from: addr, to: addr)`: store the callee-saved state at
+  `from` -- on arm64 x19 to x28, x29, x30, sp and d8 to d15; on x86-64 rbx,
+  rbp, r12 to r15 and rsp -- load it from `to`, and return into it. A leaf
+  with no frame of its own, so it signs and authenticates nothing: each
+  return address it moves stays signed against the stack it belongs to, and
+  that stack comes back with it. Return-address signing (`pacibsp`/`retab`,
+  B key, on every Cranelift function on macOS today) must keep working on
+  both sides of a switch, and the gate must show it.
+- `ctx_init(ctx: addr, stack_top: addr, entry: addr, arg: addr)`: lay a
+  context out so the first switch into it calls `entry(arg)`, where `entry`
+  is a C-convention function address (§5.2) that never returns.
+
+And from what exists now: a stack with a guard page, from `mmap` and
+`mprotect` through `extern fn` now that `addr` crosses (§5.2); each fiber's
+own stack floor, which recursive functions take as a hidden argument and
+which today is per thread -- a cell (§5.3) holding the running fiber's floor,
+switched with it; and the per-thread scheduler state in cells too. The gate
+for it is the corpus's concurrent programs run on the Grasm runtime
+(`rtswap`), agreeing with both interpreters, plus a fuzz over random switch
+orders against a model of which fiber runs.
+
+**Status.** Not built, on purpose. Rows one to three of S1 part three are
+§5.2 to §5.4.
+
+**S1 part three, measured on its final tree (2026-10-21).** difftest 648
+identical; crosstest (x86-64 under Rosetta) 648 identical; leakcheck 623
+leak-free; usecheck 648 clean; agreetest 29; tirtest 1,671 emitted, no holes;
+reprotest 160 built twice, none differing; replaytest 44 journaled; wasmtest
+508 identical; fuzz_fnaddr, fuzz_tls and fuzz_mapkeys 40, 40 and 60 programs
+with none disagreeing; fuzz_rawmem, fuzz_laws (218 laws), fuzz_modules,
+nativegaps, gatecheck, fmttest, gfmttest, grammar, depth, litter, clippy and
+764 unit tests clean. `tirinterp` read and printed back all 1,671 programs and
+agreed on 646, the eight that declare a C function among them; the five it
+did not are the raw-memory programs (four from part two, and T-TLS) waiting
+for the sandbox another branch is adding to it. Seventeen planted faults, one
+per engine per feature at least, were each caught.
+
 ## 6. Order of work
 
 Each stage ends with its exit criteria met and every gate green. Stages

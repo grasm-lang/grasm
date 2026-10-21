@@ -204,6 +204,23 @@ fn twice_i(n: i64) -> i64 {
     n * 2
 }
 
+// [T-EXPORT], [L-LIB-CALL-C]: functions C could reach, and the signatures a
+// call through an address names.
+type LawUnary = fn(i64) -> i64
+type LawMix = fn(i8, u16) -> i32
+
+export fn law_export_twice(n: i64) -> i64 {
+    n * 2
+}
+
+fn law_mix(a: i8, b: u16) -> i32 {
+    a.as_i32() * 1000 + b.as_i32()
+}
+
+// [T-TLS]: cells of two widths.
+thread_local LAW_CELL: i64
+thread_local LAW_BYTE: u8
+
 type Count = i64
 type Box[T] = { v: T }
 type Ops = { f: fn(i64) -> i64 }
@@ -353,6 +370,9 @@ CLAUSES = {
     "T-ADDR": "an address is a value",
     "L-LIB-MEM": "a store is read back at its width",
     "L-LIB-ATOMIC": "an atomic answers what was there",
+    "T-EXPORT": "an export is the function its address calls",
+    "L-LIB-CALL-C": "a call through an address is the direct call",
+    "T-TLS": "a cell starts at zero and keeps what it is given",
     "T-INT-TO-FLOAT": "an int becomes a float",
     "T-INT-TO-FLOAT-CARRIED": "promotion is carried",
     "T-LIST": "a list holds one type",
@@ -583,6 +603,10 @@ LAWS = {
  "equality is structural":     'say([[1], [2, 3]] == [[1], [2, 3]] and Pt{ x: 1, y: 2 } != Pt{ x: 1, y: 3 })',
  "built two ways is equal":    'var a: [i64] = []\n    a.push(1)\n    a.push(2)\n    say(a == [1, 2])',
  "map order does not matter":  'var m: Map[str, i64] = map()\n    m.set("a", 1)\n    m.set("b", 2)\n    var n: Map[str, i64] = map()\n    n.set("b", 2)\n    n.set("a", 1)\n    say(m == n)',
+ # A tuple-keyed map is the map of its keys whatever order they went in, its
+ # keys come out in the order sort gives them, and parts that only differ
+ # inside a component stay apart.
+ "tuple keys sort as tuples": "var m: Map[(str, i64), i64] = {}\n    var n: Map[(str, i64), i64] = {}\n    var ks: [(str, i64)] = []\n    for k in 0..60 {\n        let key = ((k * 7 % 5).to_str(), k % 4 - 2)\n        ks.push(key)\n        m.set(key, k)\n    }\n    var i = ks.len()\n    while i > 0 {\n        i -= 1\n        if not n.has(ks[i]) {\n            n.set(ks[i], m.get(ks[i]) ?? 0)\n        }\n    }\n    let same = m == n\n    var sorted = m.keys()\n    sorted.sort()\n    m.set((\"ab\", 1), 1)\n    m.set((\"a\", 1), 2)\n    let apart = m.get((\"ab\", 1)) == Some(1) and m.get((\"a\", 1)) == Some(2)\n    say(same and m.len() == 22 and sorted.len() == 20 and sorted == n.keys() and apart)",
  "scalars copy":               'var a = 1\n    var b = a\n    b = 9\n    say(a == 1)',
  "a field read is a copy":     'let p = Pt{ x: 1, y: 2 }\n    var c = p.x\n    c = 9\n    say(p.x == 1)',
  "int promotes to float":      'let xs: [f64] = [1, 2.5]\n    say(xs[0] == 1.0)',
@@ -702,6 +726,15 @@ LAWS = {
  # little-endian u16, and an f64 and an address keep their bits.
  "a store is read back at its width": 'var ok = true\n    unsafe {\n        let a = mem_alloc(16, 8)\n        for k in 0..300 {\n            let x = k * 2654435761 - 400000000000\n            a.store_i64(x)\n            if a.load_i64() != x or a.load_u64() != x.as_u64() or a.load_i32() != x.as_i32() or a.load_u32() != x.as_u32() {\n                ok = false\n            }\n            if a.load_i16() != x.as_i16() or a.load_u16() != x.as_u16() or a.load_i8() != x.as_i8() or a.load_u8() != x.as_u8() {\n                ok = false\n            }\n            a.offset(8).store_u8(x.as_u8())\n            a.offset(9).store_u8(x.shr(8).as_u8())\n            if a.offset(8).load_u16().as_i64() != x.bit_and(0xFFFF) {\n                ok = false\n            }\n            let f = x.as_f64() / 7.0\n            a.offset(8).store_f64(f)\n            if a.offset(8).load_f64() != f or a.offset(8).load_i64() != f.to_bits() {\n                ok = false\n            }\n            a.offset(8).store_addr(a)\n            if a.offset(8).load_addr() != a or a.offset(8).load_i64() != a.as_i64() {\n                ok = false\n            }\n        }\n        if mem_size_of(u16) + mem_align_of(i32) + mem_size_of(addr) != 14 {\n            ok = false\n        }\n        mem_free(a)\n    }\n    say(ok)',
  # An atomic answers what was there: a run of fetch-adds answers the running
+ # An export is the function its address calls: one function, one address,
+ # two functions, two, and through either the answer the direct call gives.
+ "an export is the function its address calls": 'var ok = true\n    unsafe {\n        let a = mem_fn_addr(law_export_twice)\n        let b = mem_fn_addr(twice_i)\n        if a != mem_fn_addr(law_export_twice) or a == b {\n            ok = false\n        }\n        for k in 0 - 50..50 {\n            if a.call_c(LawUnary, k) != law_export_twice(k) or b.call_c(LawUnary, k) != twice_i(k) {\n                ok = false\n            }\n        }\n    }\n    say(ok)',
+ # A cell starts at zero and keeps what it is given, at its width, at one
+ # address on one thread.
+ "a cell starts at zero and keeps what it is given": 'var ok = true\n    unsafe {\n        let c = mem_tls(LAW_CELL)\n        let b = mem_tls(LAW_BYTE)\n        if c.load_i64() != 0 or b.load_u8() != 0 or c != mem_tls(LAW_CELL) or c == b {\n            ok = false\n        }\n        var total = 0\n        for k in 0..300 {\n            mem_tls(LAW_CELL).store_i64(mem_tls(LAW_CELL).load_i64() + k)\n            total += k\n            b.store_u8(k.as_u8())\n            if c.load_i64() != total or mem_tls(LAW_BYTE).load_u8() != k.as_u8() {\n                ok = false\n            }\n        }\n    }\n    say(ok)',
+ # A call through an address is the direct call, narrow arguments and a
+ # narrow result included, and both are the arithmetic.
+ "a call through an address is the direct call": 'var ok = true\n    unsafe {\n        let m = mem_fn_addr(law_mix)\n        for k in 0..300 {\n            let a = (k * 7 - 1000).as_i8()\n            let b = (k * 977).as_u16()\n            if m.call_c(LawMix, a, b) != law_mix(a, b) or m.call_c(LawMix, a, b) != a.as_i32() * 1000 + b.as_i32() {\n                ok = false\n            }\n        }\n    }\n    say(ok)',
  # sum, a compare-exchange stores only when it finds what it expects, and a
  # u8 wraps at eight bits without touching the byte beside it.
  "an atomic answers what was there": 'var ok = true\n    unsafe {\n        let a = mem_alloc(16, 8)\n        var sum = 0\n        for k in 0..200 {\n            if a.atomic_add_i64(k, AcqRel) != sum {\n                ok = false\n            }\n            sum += k\n        }\n        if a.atomic_load_i64(SeqCst) != sum or a.load_i64() != sum {\n            ok = false\n        }\n        for k in 0..50 {\n            let seen = a.atomic_load_i64(Acquire)\n            let miss = a.atomic_cas_i64(seen + 1, 0, SeqCst)\n            let hit = a.atomic_cas_i64(seen, seen + k, AcqRel)\n            if miss != seen or hit != seen or a.load_i64() != seen + k {\n                ok = false\n            }\n        }\n        a.offset(8).atomic_store_u8(250, Release)\n        var wraps = 0\n        for k in 0..10 {\n            let before = a.offset(8).atomic_add_u8(1, Relaxed)\n            if before == 255 {\n                wraps += 1\n            }\n        }\n        if wraps != 1 or a.offset(8).atomic_load_u8(Relaxed) != 4 or a.offset(9).load_u8() != 0 {\n            ok = false\n        }\n        mem_free(a)\n    }\n    say(ok)',

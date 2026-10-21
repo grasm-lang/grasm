@@ -1,6 +1,6 @@
 //! tag: T-MAP-KEY-GENERIC
 //! expect: error
-//! map keys must be `i64`, `str`, or `bool`, not `f64`
+//! map keys must be an integer type, `str`, `bool` or a tuple of those, not `f64`
 // A type parameter used as a map key is checked at the call site.
 //
 // Only the parameters were checked, and this function puts `K` nowhere in its

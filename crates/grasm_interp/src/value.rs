@@ -163,6 +163,11 @@ pub enum MapKey {
     /// A map has one key type, so this sorting after the others never
     /// matters; among themselves `u64` keys sort unsigned ([E-MAP-ORDER]).
     U64(u64),
+    /// A tuple of keys ([T-MAP-KEY]). The derived order compares the
+    /// components left to right, each by its own order ([E-MAP-ORDER]); the
+    /// components at one position share a type, so how variants order
+    /// against each other never matters here either.
+    Tuple(Vec<MapKey>),
 }
 
 impl MapKey {
@@ -172,6 +177,11 @@ impl MapKey {
             Value::U64(u) => Some(MapKey::U64(*u)),
             Value::Bool(b) => Some(MapKey::Bool(*b)),
             Value::Str(s) => Some(MapKey::Str(s.as_str().to_string())),
+            Value::Tuple(items) => items
+                .iter()
+                .map(MapKey::from_value)
+                .collect::<Option<Vec<_>>>()
+                .map(MapKey::Tuple),
             _ => None,
         }
     }
@@ -182,6 +192,9 @@ impl MapKey {
             MapKey::U64(u) => Value::U64(*u),
             MapKey::Bool(b) => Value::Bool(*b),
             MapKey::Str(s) => Value::str(s.clone()),
+            MapKey::Tuple(items) => {
+                Value::Tuple(Rc::new(items.iter().map(MapKey::to_value).collect()))
+            }
         }
     }
 }

@@ -2588,3 +2588,217 @@ fn a_function_named_like_an_address_method_is_not_raw_memory() {
         "--native"
     );
 }
+
+/// What only a compiled build can show ([T-FN-ADDR], [T-EXPORT],
+/// [L-LIB-CALL-C]): C calling Grasm. `qsort` calls a Grasm comparator; an
+/// export is found by its name with `dlsym` and is the same address
+/// `mem_fn_addr` gives; and a caller that leaves the bits above a narrow
+/// argument set -- a call through a wider signature, which is what C may do
+/// -- still reaches the function with the argument at its width, because the
+/// C entry cuts and re-extends it. An export nothing in the program names is
+/// found too: the linker would dead-strip it and `strip` would drop it from
+/// the export trie, unless told it is exported. `grasm run` cannot give C a Grasm
+/// function, and says so rather than hand over a number that names nothing.
+#[test]
+fn c_calls_grasm_through_addresses_and_exports() {
+    let w = Work::new("fnaddr_native");
+    let src = w.0.join("cb.gr");
+    let out = w.0.join("cb");
+    std::fs::write(
+        &src,
+        "extern fn qsort(base: addr, n: i64, width: i64, cmp: addr)\nextern fn dlsym(handle: addr, name: str) -> addr\n\ntype Unary = fn(i64) -> i64\ntype Wide = fn(i64, i64) -> i64\n\nfn by_value(a: addr, b: addr) -> i32 / {unsafe, mem} {\n    var r: i32 = 0\n    unsafe {\n        let x = a.load_i32()\n        let y = b.load_i32()\n        if x < y {\n            r = -1\n        } else if x > y {\n            r = 1\n        }\n    }\n    r\n}\n\nexport fn cli_triple(n: i64) -> i64 {\n    n * 3\n}\n\nexport fn cli_narrow(a: i8, b: u16) -> i64 {\n    a.as_i64() * 100000 + b.as_i64()\n}\n\n// Named by nothing in the program: only `dlsym` reaches it.\nexport fn cli_lonely(n: i64) -> i64 {\n    n + 100\n}\n\nfn main() {\n    unsafe {\n        let xs = [5, -3, 9, -1, 7, 0]\n        let base = mem_alloc(4 * xs.len(), 4)\n        for i in 0..xs.len() {\n            base.offset(4 * i).store_i32(xs[i].as_i32())\n        }\n        qsort(base, xs.len(), 4, mem_fn_addr(by_value))\n        var sorted: [i32] = []\n        for i in 0..xs.len() {\n            sorted.push(base.offset(4 * i).load_i32())\n        }\n        mem_free(base)\n        print(\"{sorted}\")\n        let found = dlsym(mem_addr(-2), \"cli_triple\")\n        print(\"{found == mem_fn_addr(cli_triple)} {found.call_c(Unary, 14)}\")\n        print(\"{mem_fn_addr(cli_narrow).call_c(Wide, 0x1ff, 0x7fff0005)}\")\n        print(\"{dlsym(mem_addr(-2), \"cli_lonely\").call_c(Unary, 1)}\")\n    }\n}\n",
+    )
+    .unwrap();
+    let (code, msg) = run(&[
+        "build",
+        src.to_str().unwrap(),
+        "--native",
+        "-o",
+        out.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "{msg}");
+    let got = Command::new(&out).output().expect("runs");
+    assert_eq!(
+        String::from_utf8_lossy(&got.stdout),
+        "[-3, -1, 0, 5, 7, 9]\ntrue 42\n-99995\n101\n",
+        "--native: {}",
+        String::from_utf8_lossy(&got.stderr)
+    );
+    let (code, msg) = run(&["run", src.to_str().unwrap()]);
+    assert_eq!(code, 101, "{msg}");
+    assert!(
+        msg.contains(
+            "`grasm run` cannot hand C an address from its own sandbox (argument 1 of `qsort`)"
+        ),
+        "{msg}"
+    );
+}
+
+const XLIB_SRC: &str = "pub fn quiet(n: i64) -> i64 {\n    n\n}\n\nexport fn xlib_twice(n: i64) -> i64 {\n    n * 2\n}\n";
+const XAPP_SRC: &str = "import xlib\n\nfn main() {\n    print(\"{xlib.quiet(4)}\")\n}\n";
+
+fn xlib_manifest(caps: &str) -> String {
+    format!("[package]\nname = \"xlib\"\nversion = \"0.1.0\"\ncapabilities = [{caps}]\n")
+}
+
+fn xapp_manifest() -> String {
+    "[package]\nname = \"app\"\nversion = \"0.1.0\"\ncapabilities = [\"io\"]\n\n[dependencies.xlib]\npath = \"../lib\"\n".to_string()
+}
+
+/// Declaring an `export fn` is Tier 3 ([T-EXPORT]): C can call it with
+/// anything, from anywhere. Its package performs `unsafe` for it, whatever
+/// the function does, so a library exporting one must say so -- and a
+/// consumer that only calls its ordinary `pub` functions is not charged.
+#[test]
+fn an_export_makes_its_package_perform_unsafe() {
+    let w = Work::new("export_ceiling");
+    w.package("lib", &xlib_manifest(""), XLIB_SRC);
+    let app = w.package("app", &xapp_manifest(), XAPP_SRC);
+    let entry = app_entry(&app);
+    let (code, text) = run(&["check", entry.as_str()]);
+    assert_eq!(code, 1, "{text}");
+    assert!(
+        text.contains("package `xlib` performs `unsafe` but its manifest only permits nothing"),
+        "{text}"
+    );
+    w.package("lib", &xlib_manifest("\"unsafe\""), XLIB_SRC);
+    let (code, text) = run(&["run", entry.as_str()]);
+    assert_eq!((code, text.trim()), (0, "4"), "{text}");
+}
+
+/// One name, one symbol ([T-EXPORT]): two modules exporting the same name
+/// are refused by the checker, rather than by the linker as a duplicate
+/// symbol in a build that does not name either module.
+#[test]
+fn an_export_name_is_one_symbol_across_modules() {
+    let w = Work::new("export_twice");
+    let dir = w.0.join("p");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("other.gr"),
+        "export fn twice_named(n: i64) -> i64 {\n    n\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("main.gr"),
+        "import other\n\nexport fn twice_named(n: i64) -> i64 {\n    n * 2\n}\n\nfn main() {\n    print(\"{twice_named(1)}\")\n}\n",
+    )
+    .unwrap();
+    let (code, text) = run(&["check", dir.join("main.gr").to_str().unwrap()]);
+    assert_eq!(code, 1, "{text}");
+    assert!(text.contains("`twice_named` is exported twice"), "{text}");
+}
+
+/// A function's address is one value in every module, also when each module
+/// is compiled to an object of its own (the incremental build): the C entry
+/// is emitted once, by the module defining the function, and the others link
+/// to it.
+#[test]
+fn a_function_address_is_the_same_in_every_module() {
+    let w = Work::new("fnaddr_modules");
+    let dir = w.0.join("p");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("helpers.gr"),
+        "pub fn inc(n: i64) -> i64 {\n    n + 1\n}\n\npub fn inc_at() -> addr / {unsafe, mem} {\n    unsafe {\n        mem_fn_addr(inc)\n    }\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("main.gr"),
+        "import helpers\n\ntype Unary = fn(i64) -> i64\n\nfn main() {\n    unsafe {\n        let here = mem_fn_addr(helpers.inc)\n        print(\"{here == helpers.inc_at()} {here.call_c(Unary, 41)}\")\n    }\n}\n",
+    )
+    .unwrap();
+    let main = dir.join("main.gr");
+    let (code, text) = run(&["run", main.to_str().unwrap()]);
+    assert_eq!((code, text.trim()), (0, "true 42"), "grasm run");
+    for incremental in [true, false] {
+        let out = w.0.join(if incremental { "inc" } else { "whole" });
+        let mut args = vec![
+            "build",
+            main.to_str().unwrap(),
+            "--native",
+            "-o",
+            out.to_str().unwrap(),
+        ];
+        if !incremental {
+            args.push("--no-incremental");
+        }
+        let (code, msg) = run(&args);
+        assert_eq!(code, 0, "{msg}");
+        let got = Command::new(&out).output().expect("runs");
+        assert_eq!(
+            String::from_utf8_lossy(&got.stdout).trim(),
+            "true 42",
+            "incremental: {incremental}"
+        );
+    }
+}
+
+/// Each thread has its own cells ([T-TLS]), which only threads C starts can
+/// show: four threads from `pthread_create`, entered at a Grasm function
+/// through its address ([T-FN-ADDR]), each find their cell zero and count to
+/// 100000 in it while the main thread's cell keeps its 7, and all four add
+/// to one counter atomically and it comes to exactly 400000 -- a Grasm
+/// atomic under contention. `grasm run` has one thread and cannot hand C a
+/// Grasm function, and says so.
+#[test]
+fn threads_c_starts_have_their_own_cells() {
+    let w = Work::new("tls_threads");
+    let src = w.0.join("threads.gr");
+    let out = w.0.join("threads");
+    std::fs::write(&src, "extern fn pthread_create(thread: addr, attr: addr, start: addr, arg: addr) -> i32\nextern fn pthread_join(thread: addr, ret: addr) -> i32\n\nthread_local MINE: i64\n\n// Each thread finds its own cell at zero, counts into it, and adds to the\n// shared counter atomically; it reports what it saw at the start.\nfn worker(arg: addr) -> addr / {unsafe, mem} {\n    unsafe {\n        let start = mem_tls(MINE).load_i64()\n        for i in 0..100000 {\n            mem_tls(MINE).store_i64(mem_tls(MINE).load_i64() + 1)\n            let _old = arg.atomic_add_i64(1, AcqRel)\n        }\n        mem_addr(start * 1000000 + mem_tls(MINE).load_i64())\n    }\n}\n\nfn main() {\n    unsafe {\n        mem_tls(MINE).store_i64(7)\n        let shared = mem_alloc(8, 8)\n        let ts = mem_alloc(32, 8)\n        let rs = mem_alloc(32, 8)\n        for k in 0..4 {\n            let rc = pthread_create(ts.offset(8 * k), mem_addr(0), mem_fn_addr(worker), shared)\n            if rc != 0 {\n                print(\"pthread_create failed {rc}\")\n            }\n        }\n        for k in 0..4 {\n            let rc = pthread_join(ts.offset(8 * k).load_addr(), rs.offset(8 * k))\n        }\n        for k in 0..4 {\n            print(\"thread {k}: {rs.offset(8 * k).load_addr().as_i64()}\")\n        }\n        print(\"shared {shared.load_i64()} main still {mem_tls(MINE).load_i64()}\")\n        mem_free(shared)\n        mem_free(ts)\n        mem_free(rs)\n    }\n}\n").unwrap();
+    let (code, msg) = run(&[
+        "build",
+        src.to_str().unwrap(),
+        "--native",
+        "-o",
+        out.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "{msg}");
+    let got = Command::new(&out).output().expect("runs");
+    assert_eq!(
+        String::from_utf8_lossy(&got.stdout),
+        "thread 0: 100000\nthread 1: 100000\nthread 2: 100000\nthread 3: 100000\nshared 400000 main still 7\n",
+        "--native: {}",
+        String::from_utf8_lossy(&got.stderr)
+    );
+    let (code, msg) = run(&["run", src.to_str().unwrap()]);
+    assert_eq!(code, 101, "{msg}");
+    assert!(
+        msg.contains("`grasm run` cannot hand C an address from its own sandbox (argument 1 of `pthread_create`)"),
+        "{msg}"
+    );
+}
+
+/// A cell is private to the module that declares it ([T-TLS]): another
+/// module cannot name it, and is handed its address by a function instead.
+#[test]
+fn a_cell_is_private_to_its_module() {
+    let w = Work::new("tls_private");
+    let dir = w.0.join("p");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("other.gr"),
+        "thread_local HIDDEN: i64\n\npub fn hidden_at() -> addr / {unsafe, mem} {\n    unsafe {\n        mem_tls(HIDDEN)\n    }\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("main.gr"),
+        "import other\n\nfn main() {\n    unsafe {\n        let a = mem_tls(other.HIDDEN)\n    }\n}\n",
+    )
+    .unwrap();
+    let main = dir.join("main.gr");
+    let (code, text) = run(&["check", main.to_str().unwrap()]);
+    assert_eq!(code, 1, "{text}");
+    assert!(
+        text.contains("`mem_tls` takes the name of a `thread_local` cell this module declares"),
+        "{text}"
+    );
+    std::fs::write(
+        dir.join("main.gr"),
+        "import other\n\nfn main() {\n    unsafe {\n        let a = other.hidden_at()\n        a.store_i64(5)\n        print(\"{other.hidden_at().load_i64()}\")\n    }\n}\n",
+    )
+    .unwrap();
+    let (code, text) = run(&["run", main.to_str().unwrap()]);
+    assert_eq!((code, text.trim()), (0, "5"), "{text}");
+}

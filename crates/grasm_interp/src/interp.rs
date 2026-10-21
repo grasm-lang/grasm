@@ -214,6 +214,8 @@ pub struct Interp<'a, W: Write> {
     ok_wrapped: std::collections::HashSet<(u32, u32)>,
     /// See `Analysis::mem_ops`: every raw-memory call, resolved.
     mem_ops: HashMap<(u32, u32), grasm_sema::mem::MemOp>,
+    /// See `Analysis::c_facts`: the C boundary, resolved.
+    c_facts: Rc<grasm_sema::mem::CFacts>,
     /// Raw memory's sandbox ([`crate::mem`]), shared with every task's
     /// interpreter as the channel table is, and never borrowed across a
     /// switch.
@@ -978,6 +980,7 @@ impl<'a, W: Write> Interp<'a, W> {
         me.float_literals = a.float_literals;
         me.narrow = a.narrow_ints;
         me.mem_ops = a.mem_ops;
+        me.c_facts = Rc::new(a.c_facts);
         me.ok_wrapped = a.ok_wrapped;
         me.field_calls = a.field_calls;
         me.iface_calls = a.iface_calls;
@@ -1015,6 +1018,11 @@ impl<'a, W: Write> Interp<'a, W> {
         self.mem_ops = ops;
     }
 
+    /// The C boundary, from `Analysis` ([T-FN-ADDR], [L-LIB-CALL-C]).
+    pub fn set_c_facts(&mut self, c: grasm_sema::mem::CFacts) {
+        self.c_facts = Rc::new(c);
+    }
+
     /// A raw-memory operation the checker resolved. The receiver, if any, is
     /// the address; a layout's type and an atomic's ordering are names and
     /// are not evaluated.
@@ -1023,6 +1031,7 @@ impl<'a, W: Write> Interp<'a, W> {
         op: grasm_sema::mem::MemOp,
         recv: Option<&Expr>,
         args: &[Expr],
+        span: grasm_syntax::Span,
     ) -> EResult {
         use grasm_sema::mem::MemOp;
         let at = match recv {
@@ -1032,6 +1041,26 @@ impl<'a, W: Write> Interp<'a, W> {
             },
             None => 0,
         };
+        match op {
+            MemOp::FnAddr => return self.fn_addr(span),
+            MemOp::Tls(t) => {
+                let Some(grasm_sema::mem::COp::Tls { cell }) =
+                    self.c_facts.ops.get(&(span.start, span.end)).cloned()
+                else {
+                    return Err(Flow::Panic("`mem_tls` was not resolved".into()));
+                };
+                let at = self.mem.borrow_mut().tls_cell(&cell, t);
+                return at.map(|a| Value::Int(a as i64)).map_err(Flow::Panic);
+            }
+            MemOp::CallC => {
+                let mut vs = Vec::with_capacity(args.len().saturating_sub(1));
+                for a in args.iter().skip(1) {
+                    vs.push(self.eval_expr(a)?);
+                }
+                return self.call_c(at, vs, span);
+            }
+            _ => {}
+        }
         let n = match op {
             MemOp::Atomic(a, ..) => a.values(),
             MemOp::Size(_) | MemOp::Align(_) => 0,
@@ -1663,6 +1692,7 @@ impl<'a, W: Write> Interp<'a, W> {
             narrow: std::collections::HashMap::new(),
             ok_wrapped: std::collections::HashSet::new(),
             mem_ops: HashMap::new(),
+            c_facts: Default::default(),
             mem: Default::default(),
             field_calls: Default::default(),
             iface_calls: Default::default(),
@@ -1721,6 +1751,7 @@ impl<'a, W: Write> Interp<'a, W> {
             narrow: self.narrow.clone(),
             ok_wrapped: self.ok_wrapped.clone(),
             mem_ops: self.mem_ops.clone(),
+            c_facts: self.c_facts.clone(),
             mem: self.mem.clone(),
             field_calls: self.field_calls.clone(),
             iface_calls: self.iface_calls.clone(),
@@ -2052,7 +2083,7 @@ impl<'a, W: Write> Interp<'a, W> {
             }
             Value::FnRef(name) => {
                 if let Some(e) = self.externs.get(name.as_str()).copied() {
-                    return self.call_extern_values(e, args);
+                    return self.call_extern_values(name.as_str(), e, args);
                 }
                 let Some(f) = self.fns.get(name.as_str()).copied() else {
                     return Err(Flow::Panic(format!("unknown function `{name}`")));
@@ -2867,7 +2898,7 @@ impl<'a, W: Write> Interp<'a, W> {
                 })
             }
             Expr::Call { callee, args, span } => match self.mem_ops.get(&(span.start, span.end)) {
-                Some(op) => self.eval_mem(*op, None, args),
+                Some(op) => self.eval_mem(*op, None, args, *span),
                 None => self.eval_call(callee, args),
             },
             Expr::MethodCall {
@@ -2876,7 +2907,7 @@ impl<'a, W: Write> Interp<'a, W> {
                 args,
                 span,
             } => match self.mem_ops.get(&(span.start, span.end)) {
-                Some(op) => self.eval_mem(*op, Some(recv), args),
+                Some(op) => self.eval_mem(*op, Some(recv), args, *span),
                 None => self.eval_method_call(recv, name, args, *span),
             },
             Expr::Field { recv, name, .. } => self.eval_field(recv, name),
@@ -3112,21 +3143,26 @@ impl<'a, W: Write> Interp<'a, W> {
     }
 
     /// Calls a declared C function.
-    fn call_extern(&mut self, e: &grasm_syntax::ast::ExternDecl, args: &[Expr]) -> EResult {
+    fn call_extern(
+        &mut self,
+        qual: &str,
+        e: &grasm_syntax::ast::ExternDecl,
+        args: &[Expr],
+    ) -> EResult {
         let mut vals = Vec::with_capacity(args.len());
         for a in args {
             vals.push(self.eval_expr(a)?);
         }
-        self.call_extern_values(e, vals)
+        self.call_extern_values(qual, e, vals)
     }
 
     /// The same, with the arguments already evaluated.
     fn call_extern_values(
         &mut self,
+        qual: &str,
         e: &grasm_syntax::ast::ExternDecl,
         args: Vec<Value>,
     ) -> EResult {
-        use crate::ffi::{CArg, CKind, CRet};
         grasm_journal::refuse_foreign(&e.name.name);
         let Some(sym) = crate::ffi::find(&e.name.name) else {
             return Err(Flow::Panic(format!(
@@ -3135,6 +3171,25 @@ build links it, `grasm run` can only reach what is already loaded",
                 e.name.name
             )));
         };
+        let sig = match self.c_facts.sigs.get(qual) {
+            Some(s) => s.clone(),
+            None => sig_of_decl(e),
+        };
+        self.c_call(&e.name.name, sym, &sig, args)
+    }
+
+    /// Calls the C function at `sym` with the signature `sig`
+    /// ([T-EXTERN-POINTER]): an `extern` call, or `call_c` through an address
+    /// C handed over. `name` is what a refusal calls it.
+    fn c_call(
+        &mut self,
+        name: &str,
+        sym: *mut std::ffi::c_void,
+        sig: &grasm_sema::mem::CSig,
+        args: Vec<Value>,
+    ) -> EResult {
+        use crate::ffi::{CArg, CKind, CRet};
+        use grasm_sema::mem::{CTy, MemTy};
         let mut cargs = Vec::with_capacity(args.len());
         // Temporaries that the pointers below point *into*. They are dropped
         // when this function returns, which is after the call — a `CString`
@@ -3142,8 +3197,22 @@ build links it, `grasm run` can only reach what is already loaded",
         // it, and the C function would read whatever took its place.
         let mut owned: Vec<std::ffi::CString> = Vec::new();
         let mut buffers: Vec<std::rc::Rc<Vec<u8>>> = Vec::new();
-        for a in args {
+        for (i, a) in args.into_iter().enumerate() {
+            let want = sig.params.get(i).copied();
             cargs.push(match a {
+                // An address this engine made names nothing C can read: its
+                // memory and its functions live in the sandbox, at made-up
+                // numbers ([T-FN-ADDR]). C's own addresses go back as they came.
+                Value::Int(p)
+                    if want == Some(CTy::Layout(MemTy::Addr))
+                        && self.mem.borrow().made(p as u64) =>
+                {
+                    return Err(Flow::Panic(format!(
+                        "`grasm run` cannot hand C an address from its own sandbox \
+(argument {} of `{name}`): C would read a made-up number, not memory",
+                        i + 1
+                    )));
+                }
                 Value::Int(i) => CArg::I64(i),
                 Value::U64(u) => CArg::I64(u as i64),
                 Value::Float(f) => CArg::F64(f),
@@ -3178,48 +3247,104 @@ uses to mark the end of a string"
                 }
                 other => {
                     return Err(Flow::Panic(format!(
-                        "`{}` cannot take `{other}` across the C boundary",
-                        e.name.name
+                        "`{name}` cannot take `{other}` across the C boundary"
                     )))
                 }
             });
         }
-        let ret = match &e.ret {
+        let ret = match sig.ret {
             None => None,
-            Some(grasm_syntax::ast::TypeExpr::Name { path, .. }) => {
-                match path.segments[0].name.as_str() {
-                    "f64" => Some(CKind::F64),
-                    _ => Some(CKind::I64),
-                }
-            }
+            Some(MemTy::F64) => Some(CKind::F64),
             Some(_) => Some(CKind::I64),
         };
-        // SAFETY: `sym` came from `find` for this declaration's own name, and
-        // the checker restricted the declared parameter and result types to
-        // `i64` and `f64` ([T-EXTERN]) — which is exactly what `cargs` and
-        // `ret` describe here.
-        // A C function returning a narrower integer leaves the upper bits of
-        // the register unspecified, so the result is read at its own width.
-        let narrow_ret = match &e.ret {
-            Some(grasm_syntax::ast::TypeExpr::Name { path, .. }) => {
-                grasm_sema::types::IntKind::from_name(&path.segments[0].name)
-            }
-            _ => None,
-        };
+        // SAFETY: `sym` is a C function: one this process's own symbol table
+        // gave for a declaration's name, or an address C handed over, which
+        // `unsafe` in the program vouches for. The checker restricted the
+        // signature to what crosses ([T-EXTERN]), which is exactly what
+        // `cargs` and `ret` describe here.
         match unsafe { crate::ffi::call(sym, &cargs, ret) } {
-            Some(CRet::I64(v)) => Ok(match narrow_ret {
-                Some(grasm_sema::types::IntKind::U64) => Value::U64(v as u64),
-                Some(k) => Value::Int(k.wrap(v)),
+            // A C function returning a narrower integer leaves the upper bits
+            // of the register unspecified, so the result is read at its own
+            // width.
+            Some(CRet::I64(v)) => Ok(match sig.ret {
+                Some(MemTy::U64) => Value::U64(v as u64),
+                Some(MemTy::Addr) => {
+                    self.mem.borrow_mut().note_from_c(v as u64);
+                    Value::Int(v)
+                }
+                Some(t) => match grasm_sema::types::IntKind::from_name(t.name()) {
+                    Some(k) => Value::Int(k.wrap(v)),
+                    None => Value::Int(v),
+                },
                 None => Value::Int(v),
             }),
             Some(CRet::F64(v)) => Ok(Value::Float(v)),
             Some(CRet::Unit) => Ok(Value::Unit),
             None => Err(Flow::Panic(format!(
-                "`{}` has a signature this interpreter cannot call \
-(at most three arguments, and no mixed shapes past two)",
-                e.name.name
+                "`{name}` has a signature this interpreter cannot call \
+(at most three arguments, and no mixed shapes past two)"
             ))),
         }
+    }
+
+    /// `mem_fn_addr(f)` ([T-FN-ADDR]): a Grasm function's sandbox address, or
+    /// a C function's real one.
+    fn fn_addr(&mut self, span: grasm_syntax::Span) -> EResult {
+        let Some(grasm_sema::mem::COp::FnAddr { target, is_extern }) =
+            self.c_facts.ops.get(&(span.start, span.end)).cloned()
+        else {
+            return Err(Flow::Panic("`mem_fn_addr` was not resolved".into()));
+        };
+        if is_extern {
+            let name = target.rsplit("::").next().unwrap_or(&target);
+            let Some(sym) = crate::ffi::find(name) else {
+                return Err(Flow::Panic(format!(
+                    "cannot find the C function `{name}` in this process — a compiled \
+build links it, `grasm run` can only reach what is already loaded"
+                )));
+            };
+            let at = sym as u64;
+            self.mem.borrow_mut().note_from_c(at);
+            return Ok(Value::Int(at as i64));
+        }
+        let sig = self.c_facts.sigs.get(&target).cloned();
+        let at = self.mem.borrow_mut().fn_addr(&target, sig);
+        Ok(Value::Int(at as i64))
+    }
+
+    /// `a.call_c(Sig, ..)` ([L-LIB-CALL-C]): through a Grasm function's
+    /// address, that function, if `Sig` is its signature; through an address
+    /// C handed over, a C call; through anything else, a panic.
+    fn call_c(&mut self, at: u64, args: Vec<Value>, span: grasm_syntax::Span) -> EResult {
+        let Some(grasm_sema::mem::COp::CallC(sig)) =
+            self.c_facts.ops.get(&(span.start, span.end)).cloned()
+        else {
+            return Err(Flow::Panic("`call_c` was not resolved".into()));
+        };
+        // Natively nothing can tell a Grasm function's address from a C
+        // function's, so a replay refuses both.
+        grasm_journal::refuse_foreign("call_c");
+        if at == 0 {
+            return Err(Flow::Panic("call_c through the null address".into()));
+        }
+        let found = self.mem.borrow().func_at(at).cloned();
+        if let Some((name, own)) = found {
+            if own.as_ref() != Some(&sig) {
+                let shown = own.map_or_else(|| "?".to_string(), |s| s.show());
+                return Err(Flow::Panic(format!(
+                    "call_c through the address of `{}`, which is {shown}, as {}",
+                    name.rsplit("::").next().unwrap_or(&name),
+                    sig.show()
+                )));
+            }
+            return self.call_value(Value::FnRef(Rc::new(name)), args, "call_c");
+        }
+        if self.mem.borrow().is_from_c(at) {
+            return self.c_call("call_c", at as usize as *mut std::ffi::c_void, &sig, args);
+        }
+        Err(Flow::Panic(
+            "call_c through an address that holds no function".into(),
+        ))
     }
 
     fn eval_call(&mut self, callee: &Expr, args: &[Expr]) -> EResult {
@@ -3230,7 +3355,7 @@ uses to mark the end of a string"
             if !is_local {
                 let qual = format!("{}::{}", self.current_module, id.name);
                 if let Some(e) = self.externs.get(&qual).copied() {
-                    return self.call_extern(e, args);
+                    return self.call_extern(&qual, e, args);
                 }
             }
             if !is_local {
@@ -4413,7 +4538,7 @@ uses to mark the end of a string"
             for a in args {
                 vs.push(self.eval_expr(a)?);
             }
-            return self.call_extern_values(e, vs);
+            return self.call_extern_values(&ufcs_qual, e, vs);
         }
         if let (false, Some(f)) = (is_field_call, self.fns.get(&ufcs_qual).copied()) {
             let module = self.current_module.clone();
@@ -6040,4 +6165,33 @@ fn compare_values(a: &Value, b: &Value) -> std::cmp::Ordering {
         }
         _ => Ordering::Equal,
     }
+}
+
+/// An `extern fn`'s C signature read off its declaration, for an interpreter
+/// that was not handed the checker's (`set_c_facts`): every written name is
+/// what it says, and anything else is a word.
+fn sig_of_decl(e: &grasm_syntax::ast::ExternDecl) -> grasm_sema::mem::CSig {
+    use grasm_sema::mem::{CTy, MemTy};
+    let name = |t: &grasm_syntax::ast::TypeExpr| match t {
+        grasm_syntax::ast::TypeExpr::Name { path, .. } => path
+            .segments
+            .last()
+            .map(|s| s.name.clone())
+            .unwrap_or_default(),
+        _ => String::new(),
+    };
+    let params = e
+        .params
+        .iter()
+        .map(|p| match name(&p.ty).as_str() {
+            "str" => CTy::Str,
+            "bytes" => CTy::Bytes,
+            n => CTy::Layout(MemTy::from_name(n).unwrap_or(MemTy::I64)),
+        })
+        .collect();
+    let ret = e
+        .ret
+        .as_ref()
+        .map(|t| MemTy::from_name(&name(t)).unwrap_or(MemTy::I64));
+    grasm_sema::mem::CSig { params, ret }
 }

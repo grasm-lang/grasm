@@ -1,0 +1,41 @@
+//! tag: T-TLS
+//! expect: output
+//! 0 0 0.0 true
+//! 1 2 3
+//! 250 4 true
+//! true false
+//! 3.5
+// A thread-local cell: one value of a layout type per thread, zero bits on
+// every thread until written, reached only through its address, which
+// `mem_tls` gives inside `unsafe` and which is the same each time on one
+// thread. The program's tasks run on one thread here, so they would share
+// these; a thread C starts gets cells of its own.
+thread_local COUNT: i64
+thread_local SMALL: u8
+thread_local RATIO: f64
+thread_local HELD: addr
+
+type Counter = { at: addr }
+
+fn bump(c: Counter) -> i64 / {unsafe, mem} {
+    unsafe {
+        c.at.store_i64(c.at.load_i64() + 1)
+        c.at.load_i64()
+    }
+}
+
+fn main() {
+    unsafe {
+        let none = mem_tls(HELD).load_addr() == mem_addr(0)
+        print("{mem_tls(COUNT).load_i64()} {mem_tls(SMALL).load_u8()} {mem_tls(RATIO).load_f64()} {none}")
+        let c = Counter{ at: mem_tls(COUNT) }
+        print("{bump(c)} {bump(c)} {bump(c)}")
+        mem_tls(SMALL).store_u8(250)
+        let before = mem_tls(SMALL).atomic_add_u8(10, SeqCst)
+        print("{before} {mem_tls(SMALL).load_u8()} {mem_tls(COUNT).load_i64() == 3}")
+        print("{mem_tls(COUNT) == c.at} {mem_tls(COUNT) == mem_tls(HELD)}")
+        mem_tls(RATIO).store_f64(1.25)
+        mem_tls(RATIO).store_f64(mem_tls(RATIO).load_f64() + 2.25)
+        print("{mem_tls(RATIO).load_f64()}")
+    }
+}

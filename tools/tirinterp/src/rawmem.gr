@@ -115,7 +115,7 @@ fn mask(ty: i64) -> i64 {
     }
 }
 
-fn alloc(inout cx: Cx, size: i64, align: i64) -> Value {
+pub fn alloc(inout cx: Cx, size: i64, align: i64) -> Value {
     if size < 0 {
         panic("mem_alloc: negative size {size}")
     }
@@ -163,6 +163,14 @@ fn find(inout cx: Cx, at: i64) -> i64 {
 }
 
 fn free(inout cx: Cx, at: i64) {
+    // A function's address and a thread-local cell are the sandbox's too
+    // ([T-FN-ADDR], [T-TLS]), and neither is the program's to free.
+    if cx.fn_at.has(at) {
+        panic("mem_free of the address of a function")
+    }
+    if cx.cell_at.has(at) {
+        panic("mem_free of a thread-local cell")
+    }
     let k = find(cx, at)
     if k >= 0 and cx.mem_base[k] == at {
         if cx.mem_state[k] != LIVE {
@@ -191,6 +199,9 @@ fn free(inout cx: Cx, at: i64) {
 fn span(inout cx: Cx, at: i64, n: i64, what: str) -> i64 {
     if at == 0 {
         panic("{what} through the null address")
+    }
+    if cx.fn_at.has(at) {
+        panic("{what} through the address of a function")
     }
     let k = find(cx, at)
     if k < 0 {

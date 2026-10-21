@@ -626,6 +626,43 @@ impl Parser {
         if actor {
             return Ok(Decl::Type(self.parse_actor(is_pub)?));
         }
+        // `export fn f(..)`: `export` is a word only here, as `extern` is.
+        let export = matches!(self.cur(), TokenKind::Ident(n) if n == "export")
+            && matches!(
+                self.toks.get(self.i + 1).map(|t| &t.kind),
+                Some(TokenKind::KwFn)
+            );
+        if export {
+            self.bump();
+            let mut f = self.parse_fn(is_pub)?;
+            f.is_export = true;
+            return Ok(Decl::Fn(f));
+        }
+        // `thread_local POOL: addr` ([T-TLS]): a word only before a name and
+        // a colon, as `linear` is before `type`.
+        let cell = matches!(self.cur(), TokenKind::Ident(n) if n == "thread_local")
+            && matches!(
+                self.toks.get(self.i + 1).map(|t| &t.kind),
+                Some(TokenKind::Ident(_))
+            )
+            && matches!(
+                self.toks.get(self.i + 2).map(|t| &t.kind),
+                Some(TokenKind::Colon)
+            );
+        if cell {
+            let start = self.cur_span();
+            self.bump();
+            let name = self.ident()?;
+            self.expect(&TokenKind::Colon)?;
+            let ty = self.parse_type()?;
+            let span = start.merge(ty.span());
+            return Ok(Decl::ThreadLocal(ThreadLocalDecl {
+                is_pub,
+                name,
+                ty,
+                span,
+            }));
+        }
         match self.cur() {
             TokenKind::KwFn => Ok(Decl::Fn(self.parse_fn(is_pub)?)),
             // `extern fn abs(n: i64) -> i64` — a C function.
@@ -727,6 +764,7 @@ impl Parser {
         let span = start.merge(body.span);
         let f = FnDecl {
             is_pub,
+            is_export: false,
             name,
             generics,
             bounds,
@@ -909,6 +947,7 @@ impl Parser {
             };
             self.lowered.push(Decl::Fn(FnDecl {
                 is_pub: false,
+                is_export: false,
                 name: Ident {
                     name: helper.clone(),
                     span: c.span,
@@ -960,6 +999,7 @@ impl Parser {
         };
         self.lowered.push(Decl::Fn(FnDecl {
             is_pub: false,
+            is_export: false,
             name: Ident {
                 name: body_name,
                 span: f.name.span,
@@ -1332,6 +1372,7 @@ impl Parser {
         }));
         self.lowered.push(Decl::Fn(FnDecl {
             is_pub,
+            is_export: false,
             name: name.clone(),
             generics: Vec::new(),
             bounds: Vec::new(),

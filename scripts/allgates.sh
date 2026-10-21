@@ -88,6 +88,7 @@ run_gate agreetest     scripts/agreetest.sh
 run_gate nativegaps    scripts/nativegaps.sh
 run_gate tirtest       scripts/tirtest.sh
 run_gate tirinterp     scripts/tirinterp.sh
+run_gate tirccall      python3 scripts/tirinterp_ccall.py --check
 run_gate reprotest     scripts/reprotest.sh
 run_gate brokertest    scripts/broker_test.sh
 run_gate audiodiff     scripts/audio_diff.sh

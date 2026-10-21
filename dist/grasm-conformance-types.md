@@ -1,6 +1,6 @@
 # Grasm — conformance programs: types
 
-The type and effect system — what a program means before it runs. 114 executable program(s), one per normative clause of
+The type and effect system — what a program means before it runs. 117 executable program(s), one per normative clause of
 `grasm-language-pack.md`. Each header states the tag it demonstrates and the
 exact expected behaviour, and every one is run by `cargo test -p grasm_spec`, so
 a program here cannot describe behaviour the implementation does not have.
@@ -501,7 +501,18 @@ fn every_mem_builtin(n: i64) / {unsafe, mem} {
         let _s = mem_size_of(i64) + mem_align_of(i64)
         let _v = b.load_i64() + b.atomic_add_i64(1, SeqCst)
         mem_free(a)
+        let _f = mem_fn_addr(pure_for_address)
+        let _c = mem_tls(CELL_FOR_ROW)
     }
+}
+
+/// A thread-local cell's address is `mem` too ([T-TLS]).
+thread_local CELL_FOR_ROW: i64
+
+/// Taking a function's address performs `mem` and that function's own row
+/// ([T-FN-ADDR]); this one's is empty, so the row above is all it needs.
+fn pure_for_address(n: i64) -> i64 {
+    n
 }
 
 fn main() / {io, async} {
@@ -906,6 +917,55 @@ fn main() {
 }
 ```
 
+## `T-EXPORT.gr`
+
+```grasm
+//! tag: T-EXPORT
+//! expect: output
+//! 15 21
+//! 42 true false
+//! -3 4294967295
+//! 2.0 5
+// An `export fn` is an ordinary function -- Grasm calls it as it calls any
+// other -- that C can also reach by its own name, by the C calling
+// convention. Its address, like any function's, is an `addr` that `call_c`
+// calls through ([T-FN-ADDR], [L-LIB-CALL-C]); a C function's address is the
+// C function's own. The same function always has the same address. A
+// compiled build also exports the symbol `conf_triple`, which only C can see.
+extern fn labs(n: i64) -> i64
+extern fn sqrt(x: f64) -> f64
+
+type Unary = fn(i64) -> i64
+type Mixed = fn(i8, u32) -> i64
+type Real = fn(f64) -> f64
+
+export fn conf_triple(n: i64) -> i64 {
+    n * 3
+}
+
+fn twice(n: i64) -> i64 {
+    n * 2
+}
+
+fn mixed(a: i8, b: u32) -> i64 {
+    a.as_i64() * b.as_i64()
+}
+
+fn main() {
+    print("{conf_triple(5)} {unsafe { mem_fn_addr(conf_triple).call_c(Unary, 7) }}")
+    unsafe {
+        let t = mem_fn_addr(twice)
+        let fs = [t, mem_fn_addr(conf_triple)]
+        print("{fs[0].call_c(Unary, 21)} {t == mem_fn_addr(twice)} {t == fs[1]}")
+        let m = mem_fn_addr(mixed)
+        let big: u32 = 4294967295
+        print("{m.call_c(Mixed, -3, 1)} {m.call_c(Mixed, 1, big)}")
+        let s = mem_fn_addr(sqrt)
+        print("{s.call_c(Real, 4.0)} {mem_fn_addr(labs).call_c(Unary, -5)}")
+    }
+}
+```
+
 ## `T-EXTERN-POINTER.gr`
 
 ```grasm
@@ -918,6 +978,7 @@ fn main() {
 //! the length is the program's to pass: 0 true
 //! a str is copied, so the original is untouched: hello 5
 //! every spelling is the same call: 5 5 5 5
+//! an addr comes back, and goes back: true
 // A `str` or `bytes` argument to an `extern fn` crosses as a pointer.
 //
 // The functions used here are the ones every C library has and whose answers
@@ -925,6 +986,8 @@ fn main() {
 extern fn strlen(s: str) -> i64
 extern fn atoi(s: str) -> i64
 extern fn memcmp(a: bytes, b: bytes, n: i64) -> i64
+extern fn strchr(s: str, c: i32) -> addr
+extern fn free(p: addr)
 
 fn main() / {io, unsafe} {
     unsafe {
@@ -958,6 +1021,13 @@ fn main() / {io, unsafe} {
         // boxed value's own address and `strlen` answered 1 for every string,
         // while `grasm run` answered correctly.
         print("every spelling is the same call: {strlen(s)} {s.strlen()} {s |> strlen} {[s].map(strlen)[0]}")
+
+        // An `addr` crosses both ways ([T-ADDR]). A character that is not in
+        // the string is a null pointer each time, and an address C gave can
+        // be given back to C -- `free` of a null pointer does nothing.
+        let none = strchr("abc", 122)
+        print("an addr comes back, and goes back: {none == strchr("xyz", 97)}")
+        free(none)
     }
 }
 ```
@@ -1335,6 +1405,98 @@ fn main() {
     print("{r.run(3)}")
     // A field shadows nothing: a UFCS free function of the same name wins.
     print("{Plain{ step: twice }.step(5)}")
+}
+```
+
+## `T-FN-ADDR.gr`
+
+```grasm
+//! tag: T-FN-ADDR
+//! expect: error
+//! `mem_fn_addr` reaches raw memory, so it can only be used inside `unsafe`
+//! generic function `same` cannot have its address taken
+//! fallible function `risky` cannot have its address taken
+//! `bump` cannot have its address taken: it has an `inout` or `own` parameter
+//! `shout` cannot have its address taken: `str` does not cross to C
+//! `logs` cannot have its address taken: it performs `Log`
+//! `flag` cannot be exported: `bool` does not cross to C
+//! `main` cannot be exported: the toolchain gives that name to its own code
+//! `mem_fn_addr` takes the name of a declared function
+//! function `quiet` performs effect(s) `io` not in its declared row
+//! function `tidy` performs effect(s) `mem` not in its declared row
+// C reaches a function through its address or its exported name, so its
+// signature must be one C can call: layout types in and out, `let`
+// parameters, one machine function, no error to receive, and nothing in its
+// row that needs a handler C cannot install. Taking an address is Tier 3,
+// and it carries the function's own row: whoever holds the address can
+// call it.
+effect Log {
+    fn note(s: str)
+}
+
+fn same[T](x: T) -> T {
+    x
+}
+
+fn risky(n: i64) -> i64 ! str {
+    n
+}
+
+fn bump(inout n: i64) {
+    n += 1
+}
+
+fn shout(s: str) -> i64 {
+    s.len()
+}
+
+fn logs(n: i64) -> i64 / {Log} {
+    Log.note("{n}")
+    n
+}
+
+fn loud(n: i64) -> i64 {
+    print("{n}")
+    n
+}
+
+fn twice(n: i64) -> i64 {
+    n * 2
+}
+
+export fn flag(b: bool) -> i64 {
+    1
+}
+
+fn outside() -> addr {
+    mem_fn_addr(twice)
+}
+
+fn refused() / {unsafe, mem} {
+    unsafe {
+        let a = mem_fn_addr(same)
+        let b = mem_fn_addr(risky)
+        let c = mem_fn_addr(bump)
+        let d = mem_fn_addr(shout)
+        let e = mem_fn_addr(logs)
+        let f = |n| n + 1
+        let g = mem_fn_addr(f)
+    }
+}
+
+fn quiet() / {unsafe, mem} {
+    unsafe {
+        let a = mem_fn_addr(loud)
+    }
+}
+
+fn tidy() / {unsafe} {
+    unsafe {
+        let a = mem_fn_addr(twice)
+    }
+}
+
+export fn main() {
 }
 ```
 
@@ -2383,7 +2545,7 @@ fn main() {
 ```grasm
 //! tag: T-MAP-KEY-GENERIC
 //! expect: error
-//! map keys must be `i64`, `str`, or `bool`, not `f64`
+//! map keys must be an integer type, `str`, `bool` or a tuple of those, not `f64`
 // A type parameter used as a map key is checked at the call site.
 //
 // Only the parameters were checked, and this function puts `K` nowhere in its
@@ -3904,6 +4066,52 @@ fn main() {
         }
     }
     print(log.join(","))
+}
+```
+
+## `T-TLS.gr`
+
+```grasm
+//! tag: T-TLS
+//! expect: output
+//! 0 0 0.0 true
+//! 1 2 3
+//! 250 4 true
+//! true false
+//! 3.5
+// A thread-local cell: one value of a layout type per thread, zero bits on
+// every thread until written, reached only through its address, which
+// `mem_tls` gives inside `unsafe` and which is the same each time on one
+// thread. The program's tasks run on one thread here, so they would share
+// these; a thread C starts gets cells of its own.
+thread_local COUNT: i64
+thread_local SMALL: u8
+thread_local RATIO: f64
+thread_local HELD: addr
+
+type Counter = { at: addr }
+
+fn bump(c: Counter) -> i64 / {unsafe, mem} {
+    unsafe {
+        c.at.store_i64(c.at.load_i64() + 1)
+        c.at.load_i64()
+    }
+}
+
+fn main() {
+    unsafe {
+        let none = mem_tls(HELD).load_addr() == mem_addr(0)
+        print("{mem_tls(COUNT).load_i64()} {mem_tls(SMALL).load_u8()} {mem_tls(RATIO).load_f64()} {none}")
+        let c = Counter{ at: mem_tls(COUNT) }
+        print("{bump(c)} {bump(c)} {bump(c)}")
+        mem_tls(SMALL).store_u8(250)
+        let before = mem_tls(SMALL).atomic_add_u8(10, SeqCst)
+        print("{before} {mem_tls(SMALL).load_u8()} {mem_tls(COUNT).load_i64() == 3}")
+        print("{mem_tls(COUNT) == c.at} {mem_tls(COUNT) == mem_tls(HELD)}")
+        mem_tls(RATIO).store_f64(1.25)
+        mem_tls(RATIO).store_f64(mem_tls(RATIO).load_f64() + 2.25)
+        print("{mem_tls(RATIO).load_f64()}")
+    }
 }
 ```
 

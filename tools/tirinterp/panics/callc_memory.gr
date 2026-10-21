@@ -1,0 +1,9 @@
+// `call_c` through an allocation's address, which holds bytes and no
+// function ([L-LIB-CALL-C]).
+type U = fn(i64) -> i64
+
+fn main() / {io, unsafe, mem} {
+    unsafe {
+        let x = mem_alloc(8, 8).call_c(U, 1)
+    }
+}

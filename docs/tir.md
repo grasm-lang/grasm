@@ -45,6 +45,8 @@ program
   consts   : [constdef]
   externs  : [externdef]
   fns      : [fndef]        -- functions, impl methods, contract functions
+  exports  : [fn id]        -- each `export fn`, printed right after its fn
+  cells    : [celldef]      -- each `thread_local`, in source order with the rest
   impls    : [impldef]      -- (interface, type) -> fn ids
   tests    : [testdef]
   benches  : [benchdef]
@@ -93,6 +95,7 @@ fndef     = qualified name, generic names, bounds per generic, params, ret, err,
 param     = mode (let | inout | own), var id, type
 constdef  = qualified name, type, init expr
 externdef = name, params, ret
+celldef   = qualified name, layout type        -- printed (threadlocal "m::C" u16)
 effectdef = name, ops [(name, params, ret)]   -- printed (op name (params) ret)
 impldef   = interface name, type (as written), generics, [(method name, fn id)]
 testdef   = name, params, body
@@ -100,7 +103,8 @@ benchdef  = name, body
 ```
 
 `row` is the function's declared or inferred effect row as a sorted list of
-effect names.
+effect names. An `export fn` ([T-EXPORT]) is an ordinary `fndef` followed by
+`(export "module::f")`.
 
 An effect operation has no separate error type: one declared `! E` has the
 return type `T ! E`, so its `ret` is printed `(fallible T E)` and an
@@ -163,9 +167,13 @@ Two raw-memory arguments are names rather than values ([L-LIB-MEM],
 [L-LIB-ATOMIC]), and print as leaves with no type: the type `mem_size_of`
 and `mem_align_of` take is `(type u16)`, and an atomic's ordering, its last
 argument, is `(order acquire)` with its span (`relaxed`, `acquire`,
-`release`, `acqrel`, `seqcst`). A consumer must not evaluate either. Every
-other raw-memory operation is an ordinary `builtin` (`mem_alloc`, ...) or
-`method` (`offset`, `load_u8`, `atomic_cas_i64`, ...) node. A `method` node
+`release`, `acqrel`, `seqcst`). Three more are names ([T-FN-ADDR],
+[L-LIB-CALL-C], [T-TLS]): the function `mem_fn_addr` takes is `(fnname "module::f")`,
+the signature that is `call_c`'s first argument is `(sig (i64 str) i64)`,
+`unit` for no result, and the cell `mem_tls` takes is
+`(tlsname "module::C")`. A consumer must not evaluate any of them. Every other
+raw-memory operation is an ordinary `builtin` (`mem_alloc`, ...) or `method`
+(`offset`, `load_u8`, `atomic_cas_i64`, `call_c`, ...) node. A `method` node
 is a raw-memory one exactly when its receiver's type is `addr`, since an
 address has no other built-in methods. A consumer goes by that, as the
 engines go by the checker's table, and not by the name alone: `as_i64` is
@@ -290,11 +298,13 @@ natively. It reads the text form with its own reader and runs `main` from
 the TIR alone, and `scripts/tirinterp.sh` holds it to `grasm run`: every
 corpus program that emits TIR must read and print back to the same bytes,
 and every program with a `main` must print and exit as the reference does.
-The one rule that skips a program is a declared `extern fn`, which an
-interpreter written in Grasm cannot call (Grasm has no function pointers,
-docs/self-hosting.md §5). No program in the corpus needed anything the TIR
-does not say. Raw memory runs in a sandbox of the interpreter's own, built
-as the reference's is ([E-MEM-UNCHECKED]): the same made-up addresses, the
-same checks, the same panics. A compiled build checks none of those, so the
-programs that hold the interpreter to them cannot be corpus programs; they
-are in `tools/tirinterp/panics`, one per panic, and only this gate runs them.
+No program is skipped: a C function is found in the interpreter's own
+process with `dlsym` and called through `call_c`, as `grasm run` finds and
+calls one in itself (docs/self-hosting.md §5.2). No program in the corpus
+needed anything the TIR does not say. Raw memory runs in a sandbox of the
+interpreter's own, built as the reference's is ([E-MEM-UNCHECKED]): the same
+made-up addresses, the same checks, the same panics; a function's address and
+a thread-local cell are made from it as the reference makes them. A compiled
+build checks none of those, so the programs that hold the interpreter to them
+cannot be corpus programs; they are in `tools/tirinterp/panics`, one per
+panic, and only this gate runs them.

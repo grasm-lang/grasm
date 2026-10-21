@@ -481,8 +481,8 @@ with a `T ! E`, whichever way its handler ended: a value becomes `Ok`, a
 `fail` inside the handler becomes `Err`. So `try`, `match` and `??` all
 consume one, the same as any other fallible value.
 
-**[T-MAP-KEY]** `K` must be an integer type, `str`, or `bool`; any other key type is a
-compile error.
+**[T-MAP-KEY]** `K` must be an integer type, `str`, `bool`, or a tuple of key
+types, such as `(str, i64)`; any other key type is a compile error.
 
 **[T-MAP-KEY-GENERIC]** A *type parameter* is allowed where a map key goes,
 and [T-MAP-KEY] is applied at each call site instead, once the arguments have
@@ -490,17 +490,9 @@ said what the parameter is. There is no bounds syntax, so without this a
 generic helper over maps — `fn bump[K](inout m: Map[K, i64], k: K)`, which is
 the most repeated shape a counting program has — could not be written at all.
 
-"Each call site" means the whole instantiated signature — the parameters and
-the **result**. Only the parameters were checked, so
-`fn fresh[K](k: K) -> Map[K, i64]`, which puts the key type nowhere in its
-parameters, let `fresh(2.5)` past the checker and into a runtime
-`invalid map key`.
-
-A type parameter reaching a map *only* inside the body counts too, and is
-named in no part of the signature at all: `fn tally[T](xs: [T]) -> i64`
-holding a `Map[T, i64]` let `tally([1.5, 2.5])` through. What a body does with
-its type parameters is known once every body has been walked, so these call
-sites are checked at the end of the analysis rather than where they appear.
+"Each call site" means the whole instantiated signature, the **result**
+included, and a type parameter that reaches a map *only* inside the body counts
+too; those call sites are checked once every body has been walked.
 
 **[T-TUPLE]** `(A, B, …)` is a fixed-size heterogeneous product.
 
@@ -1143,56 +1135,38 @@ including a function type, a map, and a fallible one — and when a function's
 declared return type resolves to `T ! E`, the function is fallible even though
 its declaration does not spell the `!` out.
 
-**[T-EXTERN-POINTER]** An `extern fn` **parameter** may be an integer type, `f64`, `str`
-or `bytes`. A `str` or `bytes` argument crosses as a pointer:
+**[T-EXTERN-POINTER]** An `extern fn` **parameter** may be an integer type,
+`f64`, `addr`, `str` or `bytes`, and its result an integer type, `f64`, `addr`
+or nothing:
 
 ```grasm
 extern fn strlen(s: str) -> i64
 extern fn memcmp(a: bytes, b: bytes, n: i64) -> i64
 ```
 
-A `str` crosses as a **NUL-terminated copy**. Grasm strings carry their length
-and are not terminated; C decides where a string ends by looking for the NUL,
-so handing over the raw bytes would have the callee read past the end of the
-buffer. A string containing a NUL byte panics rather than being silently cut
-short at it — the two engines say the same words, because the compiled build
-sees a pointer and not a declaration.
+A `str` crosses as a **NUL-terminated copy**: C finds a string's end by its
+NUL, and a Grasm string carries its length instead. One holding a NUL byte
+panics, in the same words in both engines. `bytes` crosses as a pointer to its
+own buffer, unterminated, so **its length is the program's to pass**:
+`memcmp(a, b, a.len())`. Either pointer is valid **for the duration of the
+call** and the buffer stays Grasm's, so nothing about ownership is decided at
+the boundary. Neither may come back: nothing about a returned pointer says who
+owns it, how long it lives or how long it is. An `addr` crosses as itself.
 
-`bytes` crosses as a pointer to the buffer itself, with no copy and no
-terminator: it is already contiguous, it is not text, and appending a NUL would
-change its length. **How long it is stays the program's to pass**, because C has
-no way to ask — `memcmp(a, b, a.len())`, not `memcmp(a, b)`.
-
-The pointer is valid **for the duration of the call** and the buffer belongs to
-Grasm. That is the whole reason this is expressible: nothing about ownership has
-to be decided at the boundary.
-
-**A pointer may not come back.** A returned `str` or `bytes` is refused, and the
-asymmetry is the point: nothing about a returned pointer says who owns it, how
-long it lives, or how long it is. An `extern fn` returns `i64`, `f64` or
-nothing.
-
-None of this makes the boundary safe, and none of it is meant to. C may write
-through a pointer it was handed, and Grasm cannot see that. This is why a
-declared C function's row is `{io, unsafe}` and every use sits inside `unsafe`
-([T-EXTERN-VALUE]) — the capability was already there, and widening what may
-cross did not widen what a package can hide.
+None of this makes the boundary safe: C may write through a pointer it was
+handed. That is why a C function's row is `{io, unsafe}` and every use sits
+inside `unsafe` ([T-EXTERN-VALUE]).
 
 **[T-EXTERN-VALUE]** A C function may be named without being called, the way
 any function may. Naming one carries the same `io` a call does: holding a
 reference to it *is* the permission to call it, so a bare mention counts
 against a package's capability ceiling and disqualifies a function from
-`par_map`. Without that rule, `xs.par_map(sqrt)` typechecked and the ceiling
-had a door straight through it.
+`par_map`.
 
 **[T-EFFECT-OP-RESULT]** An operation's declared *result* carries its row like
 any other written type. [E-HANDLER-OWN-ROW] exempts the handler's own
 operations from the installing function's row; it says nothing about the value
-an operation hands back. An operation answering
-`-> fn(i64) -> i64 / {io}` gave out a printing function that nothing charged,
-so a function declaring `/ {Mk}` printed, `par_map`'s purity proof passed, and
-a package permitting only `Mk` reached `io` — while the same signature written
-as an ordinary `fn` was refused, one keyword apart.
+an operation hands back.
 
 **[T-CAPABILITY]** A package's manifest may declare `capabilities`: the set of
 effects it is permitted to perform. What counts against it is what *escapes*
@@ -1370,9 +1344,7 @@ anything outside, a region and a reference do not mix.
 carries state: an effect operation, whose handler is written outside and may
 keep what it is given, and a call through a function *value* bound outside,
 which is a closure and carries its captures. However the call is spelled: the
-row was read under the *calling* module, so `region { lib.cfg_user() }`
-carried none and was accepted, while the same function called unqualified was
-refused. A closure written *inside* the
+row is the callee's own, wherever it is declared. A closure written *inside* the
 region is fine — it can only capture what a region already allows. This is the
 same rule as the one above seen from the other side: the earlier rules ask
 what a region's own text may write, and this one asks whose text runs there.
@@ -1400,14 +1372,9 @@ weakened here.
 the safe tiers do not apply. Using a declared C function — calling one *or
 naming one*, which are the same permission — is allowed only inside it.
 
-An `extern fn` may not be `pub`. A C function is a link-time symbol of the
-package that declares it, and exporting the name carried it past every gate
-that makes Tier 3 visible: `libext.getpid()` in another module needed no
-`unsafe`, charged no capability, panicked under the interpreter with `module
-has no function` and printed an answer from a native build — three engines,
-two of them wrong, over a symbol the consumer's manifest never mentioned. A
-package offers a C function by wrapping it: `pub fn root(x) { unsafe { sqrt(x)
-} }`, which is the spelling that shows up in the ceiling.
+An `extern fn` may not be `pub`: a C function is a link-time symbol of the
+package that declares it, which offers one by wrapping it, `pub fn root(x) {
+unsafe { sqrt(x) } }`, the spelling that shows up in the ceiling.
 
 The block is not merely syntax. An `unsafe` block puts `unsafe` in the
 enclosing function's effect row, so it reaches the package's capability ceiling
@@ -1418,33 +1385,23 @@ quietly contain an `unsafe` block, and a consumer can refuse to depend on one
 that does. `unsafe` is a capability rather than a handleable effect — there is
 no `with unsafe handled_by`, the same as for `io`.
 
-**[T-UNSAFE-UFCS]** The `unsafe` requirement applies to `x.f()` exactly as to
-`f(x)`, because [L-UFCS] makes them the same call. Only the second spelling was
-gated: `n.close()` reached libc with no `unsafe`, no `io` in the row and no
-capability, and a package declaring `capabilities = []` was reported as
-`performs []` while its compiled binary called C. `unsafe` is also writable in
-an effect row — `/ {io, unsafe}` — which it was not, being a keyword.
-
-Both halves, at that. Gating `unsafe` on `x.f()` and leaving `io` behind
-turned the same defect down by one bit rather than closing it: `n.labs()`
-inside an `unsafe` block charged nothing while `labs(n)` charged `io`, so a
-package declaring `capabilities = ["unsafe"]` was reported as reaching no `io`
-while its binary called libc. Every other spelling — `labs(n)`, `n |> labs`,
-`let f = labs` then `f(n)`, `[n].map(labs)` — was charged.
+**[T-UNSAFE-UFCS]** The `unsafe` requirement, and the `io` a call performs,
+apply to `x.f()` exactly as to `f(x)`, because [L-UFCS] makes them the same
+call; so do `n |> f`, `let g = f` then `g(n)`, and `[n].map(f)`. `unsafe` is
+writable in an effect row: `/ {io, unsafe}`.
 
 **[T-EXTERN]** `extern fn name(a: i64) -> f64` declares a C function. It has
 no body: a compiled build resolves the symbol at link time, and `grasm run`
 finds it in the interpreter's own process. Parameters and results are integer
 types ([T-INT-FIXED]; a narrower result is read at its own width, since C
-leaves the rest of the register unspecified) and `f64` — `bool` is excluded because C's is one byte and Grasm's is a
-register, and a width mismatch at an FFI boundary surfaces as garbage far from
-its cause.
+leaves the rest of the register unspecified), `f64` and `addr` — `bool` is
+excluded because C's is one byte and Grasm's is a register, and a width
+mismatch at an FFI boundary surfaces as garbage far from its cause.
 
 **Calling one performs `io`.** What a C function does cannot be known, so the
 conservative row is the only sound one: an `extern` call counts against a
 package's capability ceiling and disqualifies a function from `par_map`
-([T-PAR-MAP-PURE]). Without that, FFI would be a hole straight through both
-guarantees — and it was, in the first version of this feature.
+([T-PAR-MAP-PURE]).
 
 **[T-ADDR]** `addr` is an address: a machine word naming a byte of raw memory,
 which no Grasm value owns. It copies, `==` compares it, it prints as an integer
@@ -1465,6 +1422,32 @@ Raw memory and the values the language manages never meet. Nothing takes the
 address of a Grasm value, and a load or store moves only a *layout type* — an
 integer type, `f64` or `addr` — so no address names a `str`, a list or a
 closure, and nothing read from memory becomes one.
+
+**[T-FN-ADDR]** `mem_fn_addr(f)` is the address of the function named `f`, an
+`addr` ([T-MEM-UNSAFE]); `f` is a name, `f` or `module.f`, and not a value. A C
+function's address is its own; a Grasm function's is that of an entry taking
+the C convention, the same at every use. That function is not generic, fallible
+or a method of an `impl`, takes `let` parameters of layout types, answers one or
+nothing, and performs only `io`, `net`, `proc`, `unsafe` and `mem`, since C calls
+it outside every handler. Taking the address also performs the function's own
+row, as naming a C function does ([T-EXTERN-VALUE]).
+
+**[T-EXPORT]** `export fn f(..)` declares an ordinary function that C can also
+call by the C convention and its own name, `f`; its signature is held to
+[T-FN-ADDR]'s rule. Declaring one performs `unsafe`, and its row counts toward
+the package's ceiling as a `pub` function's does ([T-CAPABILITY]). The name is
+one symbol in the program: not exported twice, not an `extern fn`'s, and not
+`main` or one beginning `grasm_`, `g_`, `gc_`, `gp_`, `gpf_`, `gv_` or `gx_`, the
+toolchain's own. An export named like a C library function replaces it for the
+whole program.
+
+**[T-TLS]** `thread_local C: T` declares a *cell*: one `T`, a layout type, per
+thread, zero bits on each until written. `mem_tls(C)` is the calling thread's
+cell, an `addr` read and written as `T` ([L-LIB-MEM], [L-LIB-ATOMIC]); `C` is a
+name, private to the module declaring it, and a cell is never `pub`. Safe code
+cannot reach a cell, and Grasm starts a thread only for work that performs
+nothing ([T-PAR-MAP-PURE]), so two threads meet in one only through C. The
+tasks of a thread share its cells.
 
 **[T-MODULE-NS]** Functions are per-module; types and effects share one global
 namespace, so a type name may not be declared twice across a program — and an
@@ -1752,8 +1735,9 @@ carry a `:` where the first entry's colon would sit. The braces that belong to
 not in expression position.
 
 **[E-MAP-ORDER]** Map iteration (`keys`, `values`, printing) is in sorted key
-order — `false` before `true`, then integers ascending, then strings
-lexicographically — so program output is deterministic.
+order — `false` before `true`, integers ascending, strings lexicographically,
+tuples component by component by those rules — so program output is
+deterministic.
 
 **[E-STR-CHARS]** String length and indexing operate on Unicode characters,
 not bytes.
@@ -2013,10 +1997,13 @@ guarantee it provides is entirely static.
 
 **[E-MEM-UNCHECKED]** Undefined, and unchecked by a compiled build: an access
 through an address outside a live allocation — null, freed, past either end, or
-never allocated — or not a multiple of its type's size; and `mem_free` of
-anything but a live allocation's start. `grasm run` keeps raw memory in a
-sandbox, at addresses it never reuses, checks every access and panics saying
-which of these it was, so it is the place to run code that uses `mem`.
+never allocated — or not a multiple of its type's size; `mem_free` of
+anything but a live allocation's start; and `call_c` by a signature the code
+does not have, or through an address that holds none ([L-LIB-CALL-C]).
+`grasm run` keeps raw memory in a sandbox, at addresses it never reuses, checks
+every access and call and panics saying which of these it was, so it is the
+place to run code that uses `mem`. Its addresses are made up, so it panics on
+handing one to C rather than give C a number that names nothing.
 
 ## 10. Testing
 
@@ -2481,7 +2468,7 @@ it was, put the value first — `xs.enumerate().map(|p| (p.1, p.0)).min()`.
 
 ## 5. `Map[K, V]`
 
-**[L-LIB-MAP]** Keys are `i64`, `str`, or `bool`. Iteration is in sorted key
+**[L-LIB-MAP]** Keys are what [T-MAP-KEY] allows. Iteration is in sorted key
 order ([E-MAP-ORDER]).
 
 | method | type | notes |
@@ -2950,6 +2937,7 @@ it is aligned (1, 2, 4 or 8 bytes); memory is little-endian.
 | `a.offset(n)`, `a.diff(b)` | `(i64) -> addr`, `(addr) -> i64` | `n` bytes on; `a` minus `b` in bytes; both wrap |
 | `a.as_i64()` | `-> i64` | its integer: `mem_addr(a.as_i64()) == a` |
 | `a.load_T()`, `a.store_T(v)` | `-> T`, `(T)` | the `T` at `a`; puts `v` there |
+| `mem_tls(C)` | `-> addr` | the calling thread's cell `C`, written as a name ([T-TLS]) |
 
 `mem_alloc` panics on a negative size, an alignment that is not a power of two
 from 1 to 4096, a size past 2^40, and a request the system cannot meet; zero
@@ -2972,6 +2960,14 @@ Any other ordering is a compile error; a compare-exchange that fails orders as
 consistent, which is at least what any ordering asks. No program runs two
 threads over shared memory yet — `par_map` and a multi-core `parallel` take only
 pure work — so today an atomic is observed from one thread.
+
+**[L-LIB-CALL-C]** `a.call_c(Sig, x, ..)` calls the code at `a` by the C
+convention ([T-FN-ADDR]). `Sig` names a type alias for a function type, written
+where a value would go and read when the program is compiled: its parameters,
+which may be anything an `extern fn` takes and cross the same way, type the
+arguments, and its result is the call's ([T-EXTERN-POINTER]). A call performs
+`io` and `unsafe` besides `mem`, as an `extern` call does. Calling by a
+signature the code does not have is [E-MEM-UNCHECKED].
 
 
 <!-- ===== docs/tutorial.md ===== -->

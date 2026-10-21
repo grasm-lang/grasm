@@ -1,0 +1,87 @@
+//! tag: T-FN-ADDR
+//! expect: error
+//! `mem_fn_addr` reaches raw memory, so it can only be used inside `unsafe`
+//! generic function `same` cannot have its address taken
+//! fallible function `risky` cannot have its address taken
+//! `bump` cannot have its address taken: it has an `inout` or `own` parameter
+//! `shout` cannot have its address taken: `str` does not cross to C
+//! `logs` cannot have its address taken: it performs `Log`
+//! `flag` cannot be exported: `bool` does not cross to C
+//! `main` cannot be exported: the toolchain gives that name to its own code
+//! `mem_fn_addr` takes the name of a declared function
+//! function `quiet` performs effect(s) `io` not in its declared row
+//! function `tidy` performs effect(s) `mem` not in its declared row
+// C reaches a function through its address or its exported name, so its
+// signature must be one C can call: layout types in and out, `let`
+// parameters, one machine function, no error to receive, and nothing in its
+// row that needs a handler C cannot install. Taking an address is Tier 3,
+// and it carries the function's own row: whoever holds the address can
+// call it.
+effect Log {
+    fn note(s: str)
+}
+
+fn same[T](x: T) -> T {
+    x
+}
+
+fn risky(n: i64) -> i64 ! str {
+    n
+}
+
+fn bump(inout n: i64) {
+    n += 1
+}
+
+fn shout(s: str) -> i64 {
+    s.len()
+}
+
+fn logs(n: i64) -> i64 / {Log} {
+    Log.note("{n}")
+    n
+}
+
+fn loud(n: i64) -> i64 {
+    print("{n}")
+    n
+}
+
+fn twice(n: i64) -> i64 {
+    n * 2
+}
+
+export fn flag(b: bool) -> i64 {
+    1
+}
+
+fn outside() -> addr {
+    mem_fn_addr(twice)
+}
+
+fn refused() / {unsafe, mem} {
+    unsafe {
+        let a = mem_fn_addr(same)
+        let b = mem_fn_addr(risky)
+        let c = mem_fn_addr(bump)
+        let d = mem_fn_addr(shout)
+        let e = mem_fn_addr(logs)
+        let f = |n| n + 1
+        let g = mem_fn_addr(f)
+    }
+}
+
+fn quiet() / {unsafe, mem} {
+    unsafe {
+        let a = mem_fn_addr(loud)
+    }
+}
+
+fn tidy() / {unsafe} {
+    unsafe {
+        let a = mem_fn_addr(twice)
+    }
+}
+
+export fn main() {
+}

@@ -1,0 +1,10 @@
+// A load wider than the cell it reads ([T-TLS]): a `u8` cell is a
+// one-byte allocation.
+thread_local SMALL: u8
+
+fn main() / {io, unsafe, mem} {
+    unsafe {
+        print("{mem_tls(SMALL).load_u8()}")
+        let x = mem_tls(SMALL).load_i64()
+    }
+}

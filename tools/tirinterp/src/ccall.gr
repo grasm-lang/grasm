@@ -1,0 +1,266 @@
+// Calls a C function at an address with a shape known only when the
+// program runs ([L-LIB-CALL-C]), by choosing among call sites that each
+// have one: Grasm has no variadic call. The shapes are exactly those
+// `crates/grasm_interp/src/ffi.rs` can call, so one outside them is refused
+// in both interpreters in the same words.
+//
+// Written by scripts/tirinterp_ccall.py; edit that, not this.
+import value
+
+type C_0_v = fn()
+type C_0_i = fn() -> i64
+type C_0_f = fn() -> f64
+type C_i_v = fn(i64)
+type C_i_i = fn(i64) -> i64
+type C_i_f = fn(i64) -> f64
+type C_s_v = fn(str)
+type C_s_i = fn(str) -> i64
+type C_s_f = fn(str) -> f64
+type C_b_v = fn(bytes)
+type C_b_i = fn(bytes) -> i64
+type C_b_f = fn(bytes) -> f64
+type C_f_v = fn(f64)
+type C_f_i = fn(f64) -> i64
+type C_f_f = fn(f64) -> f64
+type C_ii_i = fn(i64, i64) -> i64
+type C_ii_f = fn(i64, i64) -> f64
+type C_ii_v = fn(i64, i64)
+type C_is_i = fn(i64, str) -> i64
+type C_is_f = fn(i64, str) -> f64
+type C_is_v = fn(i64, str)
+type C_ib_i = fn(i64, bytes) -> i64
+type C_ib_f = fn(i64, bytes) -> f64
+type C_ib_v = fn(i64, bytes)
+type C_si_i = fn(str, i64) -> i64
+type C_si_f = fn(str, i64) -> f64
+type C_si_v = fn(str, i64)
+type C_ss_i = fn(str, str) -> i64
+type C_ss_f = fn(str, str) -> f64
+type C_ss_v = fn(str, str)
+type C_sb_i = fn(str, bytes) -> i64
+type C_sb_f = fn(str, bytes) -> f64
+type C_sb_v = fn(str, bytes)
+type C_bi_i = fn(bytes, i64) -> i64
+type C_bi_f = fn(bytes, i64) -> f64
+type C_bi_v = fn(bytes, i64)
+type C_bs_i = fn(bytes, str) -> i64
+type C_bs_f = fn(bytes, str) -> f64
+type C_bs_v = fn(bytes, str)
+type C_bb_i = fn(bytes, bytes) -> i64
+type C_bb_f = fn(bytes, bytes) -> f64
+type C_bb_v = fn(bytes, bytes)
+type C_if_i = fn(i64, f64) -> i64
+type C_if_f = fn(i64, f64) -> f64
+type C_sf_i = fn(str, f64) -> i64
+type C_sf_f = fn(str, f64) -> f64
+type C_bf_i = fn(bytes, f64) -> i64
+type C_bf_f = fn(bytes, f64) -> f64
+type C_fi_i = fn(f64, i64) -> i64
+type C_fi_f = fn(f64, i64) -> f64
+type C_fs_i = fn(f64, str) -> i64
+type C_fs_f = fn(f64, str) -> f64
+type C_fb_i = fn(f64, bytes) -> i64
+type C_fb_f = fn(f64, bytes) -> f64
+type C_ff_i = fn(f64, f64) -> i64
+type C_ff_f = fn(f64, f64) -> f64
+type C_ff_v = fn(f64, f64)
+type C_iii_i = fn(i64, i64, i64) -> i64
+type C_iis_i = fn(i64, i64, str) -> i64
+type C_iib_i = fn(i64, i64, bytes) -> i64
+type C_isi_i = fn(i64, str, i64) -> i64
+type C_iss_i = fn(i64, str, str) -> i64
+type C_isb_i = fn(i64, str, bytes) -> i64
+type C_ibi_i = fn(i64, bytes, i64) -> i64
+type C_ibs_i = fn(i64, bytes, str) -> i64
+type C_ibb_i = fn(i64, bytes, bytes) -> i64
+type C_sii_i = fn(str, i64, i64) -> i64
+type C_sis_i = fn(str, i64, str) -> i64
+type C_sib_i = fn(str, i64, bytes) -> i64
+type C_ssi_i = fn(str, str, i64) -> i64
+type C_sss_i = fn(str, str, str) -> i64
+type C_ssb_i = fn(str, str, bytes) -> i64
+type C_sbi_i = fn(str, bytes, i64) -> i64
+type C_sbs_i = fn(str, bytes, str) -> i64
+type C_sbb_i = fn(str, bytes, bytes) -> i64
+type C_bii_i = fn(bytes, i64, i64) -> i64
+type C_bis_i = fn(bytes, i64, str) -> i64
+type C_bib_i = fn(bytes, i64, bytes) -> i64
+type C_bsi_i = fn(bytes, str, i64) -> i64
+type C_bss_i = fn(bytes, str, str) -> i64
+type C_bsb_i = fn(bytes, str, bytes) -> i64
+type C_bbi_i = fn(bytes, bytes, i64) -> i64
+type C_bbs_i = fn(bytes, bytes, str) -> i64
+type C_bbb_i = fn(bytes, bytes, bytes) -> i64
+type C_fff_f = fn(f64, f64, f64) -> f64
+
+fn iv(v: Value) -> i64 {
+    match v {
+        VInt(n) -> n
+        VU64(u) -> u.as_i64()
+        _ -> 0
+    }
+}
+
+fn fv(v: Value) -> f64 {
+    match v {
+        VFloat(f) -> f
+        _ -> 0.0
+    }
+}
+
+fn sv(v: Value) -> str {
+    match v {
+        VStr(s) -> s
+        _ -> ""
+    }
+}
+
+fn bv(v: Value) -> bytes {
+    match v {
+        VBytes(b) -> b
+        _ -> bytes_of([])
+    }
+}
+
+/// Calls `f` with `args`, whose kinds are `ks` -- a letter each: `i` an
+/// integer or address, `s` a `str`, `b` `bytes`, `f` an `f64` -- for a
+/// result `r`: `i` an integer word, `f` an `f64`, `v` none. `None` when no
+/// call site has the shape.
+pub fn call(f: addr, ks: str, r: str, args: [Value]) -> Option[Value] / {io, mem, unsafe} {
+    let a = args
+    unsafe {
+        match ks + ">" + r {
+            ">v" -> {
+                f.call_c(C_0_v)
+                Some(VUnit)
+            }
+            ">i" -> Some(VInt(f.call_c(C_0_i)))
+            ">f" -> Some(VFloat(f.call_c(C_0_f)))
+            "i>v" -> {
+                f.call_c(C_i_v, iv(a[0]))
+                Some(VUnit)
+            }
+            "i>i" -> Some(VInt(f.call_c(C_i_i, iv(a[0]))))
+            "i>f" -> Some(VFloat(f.call_c(C_i_f, iv(a[0]))))
+            "s>v" -> {
+                f.call_c(C_s_v, sv(a[0]))
+                Some(VUnit)
+            }
+            "s>i" -> Some(VInt(f.call_c(C_s_i, sv(a[0]))))
+            "s>f" -> Some(VFloat(f.call_c(C_s_f, sv(a[0]))))
+            "b>v" -> {
+                f.call_c(C_b_v, bv(a[0]))
+                Some(VUnit)
+            }
+            "b>i" -> Some(VInt(f.call_c(C_b_i, bv(a[0]))))
+            "b>f" -> Some(VFloat(f.call_c(C_b_f, bv(a[0]))))
+            "f>v" -> {
+                f.call_c(C_f_v, fv(a[0]))
+                Some(VUnit)
+            }
+            "f>i" -> Some(VInt(f.call_c(C_f_i, fv(a[0]))))
+            "f>f" -> Some(VFloat(f.call_c(C_f_f, fv(a[0]))))
+            "ii>i" -> Some(VInt(f.call_c(C_ii_i, iv(a[0]), iv(a[1]))))
+            "ii>f" -> Some(VFloat(f.call_c(C_ii_f, iv(a[0]), iv(a[1]))))
+            "ii>v" -> {
+                f.call_c(C_ii_v, iv(a[0]), iv(a[1]))
+                Some(VUnit)
+            }
+            "is>i" -> Some(VInt(f.call_c(C_is_i, iv(a[0]), sv(a[1]))))
+            "is>f" -> Some(VFloat(f.call_c(C_is_f, iv(a[0]), sv(a[1]))))
+            "is>v" -> {
+                f.call_c(C_is_v, iv(a[0]), sv(a[1]))
+                Some(VUnit)
+            }
+            "ib>i" -> Some(VInt(f.call_c(C_ib_i, iv(a[0]), bv(a[1]))))
+            "ib>f" -> Some(VFloat(f.call_c(C_ib_f, iv(a[0]), bv(a[1]))))
+            "ib>v" -> {
+                f.call_c(C_ib_v, iv(a[0]), bv(a[1]))
+                Some(VUnit)
+            }
+            "si>i" -> Some(VInt(f.call_c(C_si_i, sv(a[0]), iv(a[1]))))
+            "si>f" -> Some(VFloat(f.call_c(C_si_f, sv(a[0]), iv(a[1]))))
+            "si>v" -> {
+                f.call_c(C_si_v, sv(a[0]), iv(a[1]))
+                Some(VUnit)
+            }
+            "ss>i" -> Some(VInt(f.call_c(C_ss_i, sv(a[0]), sv(a[1]))))
+            "ss>f" -> Some(VFloat(f.call_c(C_ss_f, sv(a[0]), sv(a[1]))))
+            "ss>v" -> {
+                f.call_c(C_ss_v, sv(a[0]), sv(a[1]))
+                Some(VUnit)
+            }
+            "sb>i" -> Some(VInt(f.call_c(C_sb_i, sv(a[0]), bv(a[1]))))
+            "sb>f" -> Some(VFloat(f.call_c(C_sb_f, sv(a[0]), bv(a[1]))))
+            "sb>v" -> {
+                f.call_c(C_sb_v, sv(a[0]), bv(a[1]))
+                Some(VUnit)
+            }
+            "bi>i" -> Some(VInt(f.call_c(C_bi_i, bv(a[0]), iv(a[1]))))
+            "bi>f" -> Some(VFloat(f.call_c(C_bi_f, bv(a[0]), iv(a[1]))))
+            "bi>v" -> {
+                f.call_c(C_bi_v, bv(a[0]), iv(a[1]))
+                Some(VUnit)
+            }
+            "bs>i" -> Some(VInt(f.call_c(C_bs_i, bv(a[0]), sv(a[1]))))
+            "bs>f" -> Some(VFloat(f.call_c(C_bs_f, bv(a[0]), sv(a[1]))))
+            "bs>v" -> {
+                f.call_c(C_bs_v, bv(a[0]), sv(a[1]))
+                Some(VUnit)
+            }
+            "bb>i" -> Some(VInt(f.call_c(C_bb_i, bv(a[0]), bv(a[1]))))
+            "bb>f" -> Some(VFloat(f.call_c(C_bb_f, bv(a[0]), bv(a[1]))))
+            "bb>v" -> {
+                f.call_c(C_bb_v, bv(a[0]), bv(a[1]))
+                Some(VUnit)
+            }
+            "if>i" -> Some(VInt(f.call_c(C_if_i, iv(a[0]), fv(a[1]))))
+            "if>f" -> Some(VFloat(f.call_c(C_if_f, iv(a[0]), fv(a[1]))))
+            "sf>i" -> Some(VInt(f.call_c(C_sf_i, sv(a[0]), fv(a[1]))))
+            "sf>f" -> Some(VFloat(f.call_c(C_sf_f, sv(a[0]), fv(a[1]))))
+            "bf>i" -> Some(VInt(f.call_c(C_bf_i, bv(a[0]), fv(a[1]))))
+            "bf>f" -> Some(VFloat(f.call_c(C_bf_f, bv(a[0]), fv(a[1]))))
+            "fi>i" -> Some(VInt(f.call_c(C_fi_i, fv(a[0]), iv(a[1]))))
+            "fi>f" -> Some(VFloat(f.call_c(C_fi_f, fv(a[0]), iv(a[1]))))
+            "fs>i" -> Some(VInt(f.call_c(C_fs_i, fv(a[0]), sv(a[1]))))
+            "fs>f" -> Some(VFloat(f.call_c(C_fs_f, fv(a[0]), sv(a[1]))))
+            "fb>i" -> Some(VInt(f.call_c(C_fb_i, fv(a[0]), bv(a[1]))))
+            "fb>f" -> Some(VFloat(f.call_c(C_fb_f, fv(a[0]), bv(a[1]))))
+            "ff>i" -> Some(VInt(f.call_c(C_ff_i, fv(a[0]), fv(a[1]))))
+            "ff>f" -> Some(VFloat(f.call_c(C_ff_f, fv(a[0]), fv(a[1]))))
+            "ff>v" -> {
+                f.call_c(C_ff_v, fv(a[0]), fv(a[1]))
+                Some(VUnit)
+            }
+            "iii>i" -> Some(VInt(f.call_c(C_iii_i, iv(a[0]), iv(a[1]), iv(a[2]))))
+            "iis>i" -> Some(VInt(f.call_c(C_iis_i, iv(a[0]), iv(a[1]), sv(a[2]))))
+            "iib>i" -> Some(VInt(f.call_c(C_iib_i, iv(a[0]), iv(a[1]), bv(a[2]))))
+            "isi>i" -> Some(VInt(f.call_c(C_isi_i, iv(a[0]), sv(a[1]), iv(a[2]))))
+            "iss>i" -> Some(VInt(f.call_c(C_iss_i, iv(a[0]), sv(a[1]), sv(a[2]))))
+            "isb>i" -> Some(VInt(f.call_c(C_isb_i, iv(a[0]), sv(a[1]), bv(a[2]))))
+            "ibi>i" -> Some(VInt(f.call_c(C_ibi_i, iv(a[0]), bv(a[1]), iv(a[2]))))
+            "ibs>i" -> Some(VInt(f.call_c(C_ibs_i, iv(a[0]), bv(a[1]), sv(a[2]))))
+            "ibb>i" -> Some(VInt(f.call_c(C_ibb_i, iv(a[0]), bv(a[1]), bv(a[2]))))
+            "sii>i" -> Some(VInt(f.call_c(C_sii_i, sv(a[0]), iv(a[1]), iv(a[2]))))
+            "sis>i" -> Some(VInt(f.call_c(C_sis_i, sv(a[0]), iv(a[1]), sv(a[2]))))
+            "sib>i" -> Some(VInt(f.call_c(C_sib_i, sv(a[0]), iv(a[1]), bv(a[2]))))
+            "ssi>i" -> Some(VInt(f.call_c(C_ssi_i, sv(a[0]), sv(a[1]), iv(a[2]))))
+            "sss>i" -> Some(VInt(f.call_c(C_sss_i, sv(a[0]), sv(a[1]), sv(a[2]))))
+            "ssb>i" -> Some(VInt(f.call_c(C_ssb_i, sv(a[0]), sv(a[1]), bv(a[2]))))
+            "sbi>i" -> Some(VInt(f.call_c(C_sbi_i, sv(a[0]), bv(a[1]), iv(a[2]))))
+            "sbs>i" -> Some(VInt(f.call_c(C_sbs_i, sv(a[0]), bv(a[1]), sv(a[2]))))
+            "sbb>i" -> Some(VInt(f.call_c(C_sbb_i, sv(a[0]), bv(a[1]), bv(a[2]))))
+            "bii>i" -> Some(VInt(f.call_c(C_bii_i, bv(a[0]), iv(a[1]), iv(a[2]))))
+            "bis>i" -> Some(VInt(f.call_c(C_bis_i, bv(a[0]), iv(a[1]), sv(a[2]))))
+            "bib>i" -> Some(VInt(f.call_c(C_bib_i, bv(a[0]), iv(a[1]), bv(a[2]))))
+            "bsi>i" -> Some(VInt(f.call_c(C_bsi_i, bv(a[0]), sv(a[1]), iv(a[2]))))
+            "bss>i" -> Some(VInt(f.call_c(C_bss_i, bv(a[0]), sv(a[1]), sv(a[2]))))
+            "bsb>i" -> Some(VInt(f.call_c(C_bsb_i, bv(a[0]), sv(a[1]), bv(a[2]))))
+            "bbi>i" -> Some(VInt(f.call_c(C_bbi_i, bv(a[0]), bv(a[1]), iv(a[2]))))
+            "bbs>i" -> Some(VInt(f.call_c(C_bbs_i, bv(a[0]), bv(a[1]), sv(a[2]))))
+            "bbb>i" -> Some(VInt(f.call_c(C_bbb_i, bv(a[0]), bv(a[1]), bv(a[2]))))
+            "fff>f" -> Some(VFloat(f.call_c(C_fff_f, fv(a[0]), fv(a[1]), fv(a[2]))))
+            _ -> None
+        }
+    }
+}

@@ -2036,6 +2036,22 @@ fn link_flags() -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Every `export fn`'s symbol, sorted ([T-EXPORT]).
+fn exported_symbols(program: &Program) -> Vec<String> {
+    let mut out: Vec<String> = program
+        .files
+        .iter()
+        .flat_map(|f| f.module.decls.iter())
+        .filter_map(|d| match d {
+            grasm_syntax::ast::Decl::Fn(f) if f.is_export => Some(f.name.name.clone()),
+            _ => None,
+        })
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
 fn build_native(program: &Program, out_path: &str) -> Result<u64, String> {
     build_native_incremental(program, out_path, true)
 }
@@ -2179,9 +2195,20 @@ fn build_native_incremental(
     // Strip runtime code the program never calls. The archive carries the
     // whole stdlib surface; a hello-world only needs a sliver of it, and
     // without this every binary pays for all of it (1.5 MB -> ~0.5 MB).
+    //
+    // An `export fn` is reached by C through its name and by nothing in the
+    // program, so dead-stripping removed it and `dlsym` found nothing
+    // ([T-EXPORT]). Naming it to the linker as exported also roots it.
+    let exports = exported_symbols(program);
     if cfg!(target_os = "macos") {
         link.arg("-Wl,-dead_strip");
+        for e in &exports {
+            link.arg(format!("-Wl,-exported_symbol,_{e}"));
+        }
     } else if cfg!(target_os = "linux") {
+        for e in &exports {
+            link.arg(format!("-Wl,--export-dynamic-symbol={e}"));
+        }
         link.arg("-Wl,--gc-sections");
         // Linux strips fully at link time; macOS needs the tool, below.
         if !std::env::var("GRASM_KEEP_SYMBOLS").is_ok_and(|v| v != "0") {
@@ -2267,10 +2294,17 @@ fn build_native_incremental(
     // because the table is a quarter of the binary and no program reads it.
     let keep = std::env::var("GRASM_KEEP_SYMBOLS").is_ok_and(|v| v != "0");
     if cfg!(target_os = "macos") && !keep {
-        let _ = std::process::Command::new("strip")
-            .arg("-no_uuid")
-            .arg(out_path)
-            .output();
+        let mut strip = std::process::Command::new("strip");
+        strip.arg("-no_uuid");
+        // `strip` rebuilds the export trie from what it keeps, so an export it
+        // is not told about is gone from it, and `dlsym` with it.
+        if !exports.is_empty() {
+            let list = scratch.join("exports.txt");
+            let text: String = exports.iter().map(|e| format!("_{e}\n")).collect();
+            std::fs::write(&list, text).map_err(|e| e.to_string())?;
+            strip.arg("-s").arg(&list);
+        }
+        let _ = strip.arg(out_path).output();
     }
     let size = std::fs::metadata(out_path)
         .map_err(|e| e.to_string())?

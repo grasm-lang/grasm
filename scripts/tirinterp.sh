@@ -20,10 +20,12 @@
 #     stderr the two may differ about is the reference's panic trace
 #     ([E-PANIC-TRACE]): the interpreter is a native build, which prints none.
 #
-# A program this interpreter structurally cannot run is skipped by a rule that
-# names the reason, and the count is printed. A skip is coverage lost, so
-# there is one rule, it is narrow, and it is asked of the TIR rather than
-# guessed from a failure.
+# No program is skipped. The one rule there was -- a program declaring an
+# `extern fn`, which an interpreter written in Grasm could not call -- went in
+# S1 part three: the interpreter finds the C function in its own process with
+# `dlsym` and calls it through `call_c` (docs/self-hosting.md §5.2), so those
+# programs are compared like any other. A rule added back must name its
+# reason and be counted in the sum checked at the end.
 #
 # Then the raw-memory sandbox's panics, from `tools/tirinterp/panics`, which
 # are not corpus programs; the section that runs them says why.
@@ -57,8 +59,6 @@ timedout=0
 mains=0
 declare -a FAILED=()
 declare -a TIMEDOUT=()
-declare -a SKIPPED=()
-skip_extern=0
 
 for src in $(corpus_programs); do
     # Conformance programs that must not compile have no TIR.
@@ -80,21 +80,6 @@ for src in $(corpus_programs); do
 
     grep -cE '^[[:space:]]*(pub )?fn main\(' "$src" >/dev/null || continue
     mains=$((mains + 1))
-
-    # A C function is reached through a linker, or through a process that
-    # already has it loaded, which is how `grasm run` finds `write` and
-    # `system` in itself. The interpreter is a Grasm program, and Grasm can
-    # call only the C functions it was compiled against: it has no function
-    # pointers to call a symbol it looked up (docs/self-hosting.md §5). So a
-    # program that declares one -- to call it, or to pass it as a value, as
-    # `T-EXTERN-VALUE` passes `sqrt` to `map` -- is outside what any
-    # interpreter written in Grasm can run today. Asked of the TIR, which
-    # writes every `extern` declaration out.
-    if grep -c '^(extern ' "$tir" >/dev/null; then
-        skip_extern=$((skip_extern + 1))
-        SKIPPED+=("$src — declares a C function (\`extern fn\`)")
-        continue
-    fi
 
     ref_out="$WORK/ref.out"
     ref_err="$WORK/ref.err"
@@ -124,7 +109,10 @@ done
 
 # The sandbox's panics ([E-MEM-UNCHECKED]). `grasm run` refuses a null, wild,
 # freed, out-of-bounds or misaligned access and a bad `mem_free` or
-# `mem_alloc`, each with its own message; a compiled build checks none of it,
+# `mem_alloc`, each with its own message -- and, since S1 part three, a
+# freed or over-read thread-local cell, a function's address freed or read
+# through, a `call_c` by the wrong signature or through no function, and a
+# made-up address handed to C; a compiled build checks none of it,
 # so a program that does one has no output both engines agree on and cannot
 # be a corpus program -- difftest would see them differ, by design. And the
 # corpus's own cases are `test` blocks, which this gate does not run. So,
@@ -167,17 +155,11 @@ for src in tools/tirinterp/panics/*.gr; do
     fi
 done
 
-skipped=$skip_extern
 echo
 echo "round trip: $roundtrip identical, $rt_failed not"
-echo "identical: $pass   mismatched: $fail   timed out: $timedout   skipped (declares a C function): $skipped"
+echo "identical: $pass   mismatched: $fail   timed out: $timedout   skipped: 0"
 echo "panics: $panic_pass identical, $panic_fail not"
 
-if [ ${#SKIPPED[@]} -gt 0 ]; then
-    echo
-    echo "skipped -- the interpreter structurally cannot run these:"
-    printf '  %s\n' "${SKIPPED[@]}"
-fi
 if [ ${#TIMEDOUT[@]} -gt 0 ]; then
     echo
     echo "TIMED OUT after ${RUN_LIMIT_SECONDS}s (not agreement):"
@@ -189,11 +171,11 @@ if [ ${#FAILED[@]} -gt 0 ]; then
     printf '  %s\n' "${FAILED[@]}"
 fi
 
-# Every program with a `main` was compared, skipped by a named rule, or is a
+# Every program with a `main` was compared or is a
 # failure above: the counts must add up, or a program fell through a gap in
 # this script.
-if [ $((pass + fail + timedout + skipped)) -ne "$mains" ]; then
-    echo "the counts do not add up: $pass + $fail + $timedout + $skipped is not $mains programs with a main"
+if [ $((pass + fail + timedout)) -ne "$mains" ]; then
+    echo "the counts do not add up: $pass + $fail + $timedout is not $mains programs with a main"
     exit 1
 fi
 if [ "$fail" -ne 0 ] || [ "$rt_failed" -ne 0 ] || [ "$timedout" -ne 0 ] || [ "$panic_fail" -ne 0 ]; then
@@ -202,8 +184,8 @@ fi
 # Every panic program agreed, and there are as many as the directory held
 # when this was written: a directory that went missing or shrank would
 # otherwise read as one that passes.
-if [ "$panic_pass" -lt "$panic_files" ] || [ "$panic_files" -lt 17 ]; then
-    echo "panic programs: $panic_pass of $panic_files agreed, and there should be at least 17"
+if [ "$panic_pass" -lt "$panic_files" ] || [ "$panic_files" -lt 25 ]; then
+    echo "panic programs: $panic_pass of $panic_files agreed, and there should be at least 25"
     exit 1
 fi
 # A gate that compared nothing has checked nothing. The floors are the

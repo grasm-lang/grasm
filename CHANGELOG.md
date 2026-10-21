@@ -59,7 +59,7 @@ migration note here; anything `experimental` may change in any release. See
   self-hosting plan. The `tirtest` gate holds the whole corpus to it.
 - **A TIR interpreter written in Grasm** (`tools/tirinterp`), which runs a
   program from its TIR alone. `tirinterp` holds it to `grasm run` on every
-  corpus program with a `main` except the eight that declare a C function.
+  corpus program with a `main`.
 - **`u64`**, bit operations (`rotate_left/right`, `count_ones`,
   `leading_zeros`, `trailing_zeros`, `swap_bytes`) on every integer type at
   its own width, and **`StrBuilder` / `ByteBuilder`**, whose appends are
@@ -70,6 +70,29 @@ migration note here; anything `experimental` may change in any release. See
   loads and stores, and atomic load/store/compare-exchange/add with
   explicit orderings ([T-ADDR], [L-LIB-MEM], [L-LIB-ATOMIC]). `grasm run`
   checks every access in a sandbox; a native build checks none.
+- **Function addresses and calls through them**: `mem_fn_addr(f)` is a
+  named function's address, a Grasm function's or a C function's, and
+  `a.call_c(Sig, ..)` calls the code at an address by the C convention,
+  with `Sig` a type alias for its signature. Both are raw-memory operations
+  ([T-FN-ADDR], [L-LIB-CALL-C]). `extern fn` takes and returns `addr`, so C
+  can be handed a callback -- a `qsort` comparator, a thread's entry -- by a
+  compiled build; `grasm run` cannot make machine code for a Grasm function
+  and refuses to hand C any address it made up.
+- **`export fn`**: an ordinary function that C can also call by its own
+  name. Declaring one makes its package perform `unsafe` ([T-EXPORT]).
+- **Thread-local cells**: `thread_local POOL: addr` declares one value of a
+  layout type per thread, zero until written, and `mem_tls(POOL)` is the
+  calling thread's cell, only inside `unsafe` and under `mem` ([T-TLS]).
+- **Tuple map keys**: a key may be a tuple of key types, `Map[(str, i64),
+  V]`, iterating component by component ([T-MAP-KEY], [E-MAP-ORDER]).
+
+### Changed
+
+- **The TIR interpreter runs the eight programs that declare a C
+  function.** It finds the function in its own process with `dlsym` and
+  calls it through `call_c`, as `grasm run` finds one in itself, so
+  `tirinterp` now compares every corpus program with a `main` and skips
+  none.
 
 ## 1.1.0 — 2026-10-20
 

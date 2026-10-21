@@ -56,6 +56,7 @@ pub fn decl_span(d: &Decl) -> Span {
         Decl::Fn(f) => f.span,
         Decl::Const(c) => c.span,
         Decl::Extern(e) => e.span,
+        Decl::ThreadLocal(t) => t.span,
         Decl::Type(t) => t.span,
         Decl::Effect(e) => e.span,
         Decl::Test(t) => t.span,
@@ -73,6 +74,8 @@ pub enum Decl {
     Const(ConstDecl),
     /// `extern fn name(a: i64) -> i64` — a C function, resolved at link time.
     Extern(ExternDecl),
+    /// `thread_local POOL: addr` — a per-thread cell ([T-TLS]).
+    ThreadLocal(ThreadLocalDecl),
     Type(TypeDecl),
     Effect(EffectDecl),
     Test(TestDecl),
@@ -140,6 +143,16 @@ pub struct ExternDecl {
     pub span: Span,
 }
 
+/// A thread-local cell ([T-TLS]): one value of a layout type per thread,
+/// zero at the start of each, reached only through `mem_tls(NAME)`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ThreadLocalDecl {
+    pub is_pub: bool,
+    pub name: Ident,
+    pub ty: TypeExpr,
+    pub span: Span,
+}
+
 /// A module-level constant. Immutable, and its initializer must be free of
 /// effects, because it is evaluated wherever the name is used.
 #[derive(Debug, Clone, PartialEq)]
@@ -154,6 +167,9 @@ pub struct ConstDecl {
 #[derive(Debug, Clone, PartialEq)]
 pub struct FnDecl {
     pub is_pub: bool,
+    /// `export fn` ([T-EXPORT]): also reachable from C, by its own name, with
+    /// the C calling convention.
+    pub is_export: bool,
     pub name: Ident,
     pub generics: Vec<Ident>,
     /// The interfaces each generic parameter is bounded by, in the same
