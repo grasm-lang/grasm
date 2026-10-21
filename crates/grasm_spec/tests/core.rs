@@ -217,6 +217,7 @@ fn every_ast_form_is_classified() {
         ("Type", "type T ="),
         ("Effect", "effect E {"),
         ("Extern", "extern fn"),
+        ("ThreadLocal", "thread_local C: T"),
         ("Import", "import m"),
         ("Const", "at module level"),
         ("Test", "test \"name\""),
