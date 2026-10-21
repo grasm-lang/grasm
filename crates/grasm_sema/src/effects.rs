@@ -28,6 +28,14 @@ pub const NET: &str = "net";
 /// would make every capability claim in the language weaker than it reads.
 pub use crate::builtins::PROC;
 
+/// The capabilities the runtime discharges at `main` and in tests, and
+/// that a row may name with no `effect` declaring them. One list, because it
+/// was written out three times -- and a fourth copy, the reserved names, had
+/// lost `net` and `proc`.
+pub fn is_capability(e: &str) -> bool {
+    matches!(e, IO | ASYNC | UNSAFE | NET | PROC)
+}
+
 // Which builtins perform what is **not written here**: `builtins::row_of` reads it from
 // `crate::builtins`, once, with the names — because it used to be written in
 // both places and the two disagreed for as long as `bytes` had existed
@@ -1061,12 +1069,7 @@ once inside `main`",
             let declared_set: BTreeSet<String> = declared.iter().map(|p| p.dotted()).collect();
             for d in &declared_set {
                 let base = d.split('.').next().unwrap_or(d);
-                if base != IO
-                    && base != ASYNC
-                    && base != UNSAFE
-                    && base != NET
-                    && base != PROC
-                    && !ctx.effect_names.contains(base)
+                if !is_capability(base) && !ctx.effect_names.contains(base)
                 {
                     diags.push(Diagnostic::error(
                         f.name.span,
@@ -1153,7 +1156,7 @@ once inside `main`",
     if let Some(main) = ctx.fns.get("main::main") {
         let leftover: Vec<&String> = ctx.rows["main::main"]
             .iter()
-            .filter(|e| *e != IO && *e != ASYNC && *e != UNSAFE && *e != NET && *e != PROC)
+            .filter(|e| !is_capability(e))
             .collect();
         if !leftover.is_empty() {
             let list = leftover
@@ -1191,7 +1194,7 @@ is installed, not around the calls to it ([E-HANDLER-OWN-ROW])",
                 walk_block(body, &f.name, &mut active, &ctx, &fnb, &mut row);
                 let leftover: Vec<&String> = row
                     .iter()
-                    .filter(|e| *e != IO && *e != ASYNC && *e != UNSAFE && *e != NET && *e != PROC)
+                    .filter(|e| !is_capability(e))
                     .collect();
                 if !leftover.is_empty() {
                     let list = leftover

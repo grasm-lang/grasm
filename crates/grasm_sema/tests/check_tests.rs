@@ -4371,3 +4371,16 @@ fn builders_grow_through_a_var() {
         "takes no arguments",
     );
 }
+
+/// A capability cannot be declared as an effect and handled away
+/// ([T-EFFECT-RESERVED]) -- `net` and `proc` as much as `io`.
+#[test]
+fn every_capability_is_a_reserved_effect_name() {
+    // `unsafe` is a keyword, so `effect unsafe` does not parse at all.
+    for name in ["io", "async", "net", "proc"] {
+        check_err(
+            &format!("effect {name} {{\n    fn ping() -> i64\n}}\n"),
+            &format!("effect name `{name}` is reserved by the language"),
+        );
+    }
+}

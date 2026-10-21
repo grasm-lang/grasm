@@ -1648,15 +1648,18 @@ already reachable from every module — drop the `pub`",
                 // files while `grasm deps` certified it as performing nothing.
                 // One word in a manifest is the whole capability story; a
                 // dependency must not be able to write it away.
-                if matches!(
-                    e.name.name.as_str(),
-                    crate::effects::IO | crate::effects::ASYNC | crate::effects::UNSAFE
-                ) {
+                //
+                // Every capability, from the one list `effects` keeps. `net`
+                // and `proc` were left off this one when they arrived, so
+                // `effect net` and a `with net handled_by` let a function
+                // declaring `/ {}` open a socket -- the hole described above,
+                // one capability over.
+                if crate::effects::is_capability(&e.name.name) {
                     self.error_help(
                         e.name.span,
                         format!("effect name `{}` is reserved by the language", e.name.name),
-                        "`io`, `async` and `unsafe` are capabilities the runtime discharges, \
-not effects a program declares or handles — there is no `with io handled_by` \
+                        "`io`, `async`, `net`, `proc` and `unsafe` are capabilities the \
+runtime discharges, not effects a program declares or handles — there is no `with io handled_by` \
 ([T-EFFECT-BUILTIN]); rename this one",
                     );
                     continue;

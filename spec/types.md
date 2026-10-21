@@ -448,10 +448,10 @@ builtins. `async` is performed by `parallel`/`spawn`, `concurrent`/`go` and
 `chan_send`, `chan_recv`, `chan_close`. Both are discharged by the runtime at
 `main` and in tests.
 
-**[T-EFFECT-RESERVED]** `io`, `async` and `unsafe` may not be declared as
-effects. They are capabilities the runtime discharges, not effects a program
-handles — there is no `with io handled_by`, the same point [T-UNSAFE-FFI]
-makes for `unsafe`.
+**[T-EFFECT-RESERVED]** `io`, `async`, `net`, `proc` and `unsafe` may not be
+declared as effects. They are capabilities the runtime discharges, not effects
+a program handles — there is no `with io handled_by`, the same point
+[T-UNSAFE-FFI] makes for `unsafe`.
 
 **[T-EFFECT-DISCHARGE]** `with E handled_by h { … }` discharges `E` inside the
 block. Any user effect still outstanding at `main` or in a test is an error.

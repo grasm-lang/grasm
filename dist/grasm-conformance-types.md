@@ -709,6 +709,8 @@ fn main() {
 //! tag: T-EFFECT-RESERVED
 //! expect: error
 //! effect name `io` is reserved by the language
+//! effect name `net` is reserved by the language
+//! effect name `proc` is reserved by the language
 // A capability the runtime discharges is not an effect a program handles.
 //
 // `io` and `async` are not keywords, so this parsed — and the
@@ -719,6 +721,16 @@ fn main() {
 // files while `grasm deps` certified it as performing nothing.
 effect io {
     fn nothing() -> i64
+}
+
+// And every other capability. `net` and `proc` were not reserved, so the same
+// two lines opened a socket from a function declaring `/ {}`.
+effect net {
+    fn ping() -> i64
+}
+
+effect proc {
+    fn ping() -> i64
 }
 
 fn quiet(n: i64) -> i64 / {} {
