@@ -1,0 +1,9 @@
+// An atomic through an address no allocation ever held, made from an
+// integer.
+fn main() / {io, unsafe, mem} {
+    unsafe {
+        let a = mem_alloc(8, 8)
+        print("{a.atomic_add_i32(5, SeqCst)} {a.load_i32()}")
+        print("{mem_addr(123456789).atomic_load_i32(SeqCst)}")
+    }
+}

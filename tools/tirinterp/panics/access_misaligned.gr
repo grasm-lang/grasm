@@ -1,0 +1,8 @@
+// An access in bounds at an address that is not a multiple of its size.
+fn main() / {io, unsafe, mem} {
+    unsafe {
+        let a = mem_alloc(16, 8)
+        print("{a.offset(4).load_i32()}")
+        print("{a.offset(4).load_i64()}")
+    }
+}

@@ -1,0 +1,14 @@
+// The sandbox remembers the 65,536 allocations freed most recently, and
+// this is the oldest of them: an access through it is still named as one
+// after its allocation was freed.
+fn main() / {io, unsafe, mem} {
+    unsafe {
+        let first = mem_alloc(8, 8)
+        mem_free(first)
+        for _ in 0..65535 {
+            mem_free(mem_alloc(8, 8))
+        }
+        print("{mem_alloc(8, 8).diff(first)}")
+        print("{first.offset(4).load_i32()}")
+    }
+}

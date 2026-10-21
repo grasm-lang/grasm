@@ -1,0 +1,245 @@
+// Raw memory and atomics ([L-LIB-MEM], [L-LIB-ATOMIC], [E-MEM-UNCHECKED]),
+// in the sandbox the reference keeps (`crates/grasm_interp/src/mem.rs`).
+//
+// There are no real addresses to give out, so each allocation is a buffer
+// of its own at an address made up for it: from 64 KiB up, aligned as
+// asked (and to 16 at least), with 64 empty bytes after it, and never
+// handed out again. Every access is checked against the allocation it falls
+// in, so a null, wild, freed, out-of-bounds or misaligned access panics, as
+// does a `mem_free` of anything but a live allocation's start, each saying
+// which it was in the reference's words. Because nothing is reused, a stale
+// address finds its own allocation's tombstone, or nothing.
+//
+// An address is an ordinary integer value, as it is in the reference, so a
+// list, a field, `==` and printing need nothing new. Allocations are made
+// at rising addresses, so the context's lists of them are in address order
+// and the allocation an address falls in is a binary search away. One task
+// runs at a time, so an atomic is a plain access and every ordering is kept.
+import eval
+import load
+
+/// Where the first allocation goes.
+let BASE = 65536
+/// Bytes left empty after each allocation: running off its end lands in a
+/// gap that still names it.
+let GAP = 64
+/// Freed allocations remembered by name; past this many the oldest is
+/// forgotten, and an address in it then belongs to no allocation.
+let TOMBSTONES = 65536
+/// The largest allocation either engine attempts, 2^40.
+let MAX_SIZE = 1099511627776
+/// The largest buffer this interpreter's host will build.
+let MAX_HOST = 8589934592
+
+// An allocation's state.
+let LIVE = 0
+let FREED = 1
+let FORGOTTEN = 2
+
+/// Node `e`, an `OP_MEM`: its children evaluated in order, receiver first,
+/// then the operation.
+pub fn mem_op(inout cx: Cx, e: i64) -> Value {
+    var vs: [Value] = []
+    if not eval.eval_kids(cx, e, 0, vs) {
+        return VUnit
+    }
+    let op = cx.a[e]
+    if op <= 3 {
+        return match op {
+            1 -> alloc(cx, int_of(vs[0]), int_of(vs[1]))
+            2 -> {
+                free(cx, int_of(vs[0]))
+                VUnit
+            }
+            _ -> VInt(int_of(vs[0]))
+        }
+    }
+    // A method: the receiver is the address.
+    let at = int_of(vs[0])
+    let ty = cx.b[e]
+    let what = cx.s[e]
+    match op {
+        // offset, diff, as_i64: each wraps.
+        6 -> VInt(at + int_of(vs[1]))
+        7 -> VInt(at - int_of(vs[1]))
+        8 -> VInt(at)
+        // load_T, atomic_load_T
+        9 | 11 -> read_at(cx, ty, at, what)
+        // store_T, atomic_store_T
+        10 | 12 -> {
+            write_at(cx, ty, at, bits(vs[1]), what)
+            VUnit
+        }
+        // atomic_cas_T: stores only when the value there is the one
+        // expected, compared at the width, and answers what was there.
+        13 -> {
+            let old = read_at(cx, ty, at, what)
+            let m = mask(ty)
+            if bits(old).bit_and(m) == bits(vs[1]).bit_and(m) {
+                write_at(cx, ty, at, bits(vs[2]), what)
+            }
+            old
+        }
+        // atomic_add_T: adds, wrapping at the width, and answers what was
+        // there.
+        _ -> {
+            let old = read_at(cx, ty, at, what)
+            write_at(cx, ty, at, bits(old) + bits(vs[1]), what)
+            old
+        }
+    }
+}
+
+/// A value's bits, as a load or a store moves them.
+fn bits(v: Value) -> i64 {
+    match v {
+        VInt(i) -> i
+        VU64(u) -> u.as_i64()
+        VFloat(f) -> f.to_bits()
+        _ -> 0
+    }
+}
+
+/// An address or an integer argument.
+fn int_of(v: Value) -> i64 {
+    bits(v)
+}
+
+/// The bits of a layout type's width.
+fn mask(ty: i64) -> i64 {
+    match load.layout_size(ty) {
+        1 -> 255
+        2 -> 65535
+        4 -> 4294967295
+        _ -> -1
+    }
+}
+
+fn alloc(inout cx: Cx, size: i64, align: i64) -> Value {
+    if size < 0 {
+        panic("mem_alloc: negative size {size}")
+    }
+    if align < 1 or align > 4096 or align.bit_and(align - 1) != 0 {
+        panic("mem_alloc: alignment {align} is not a power of two from 1 to 4096")
+    }
+    if size > MAX_SIZE {
+        panic("mem_alloc: {size} bytes is more than an allocation can hold")
+    }
+    if size > MAX_HOST {
+        panic("mem_alloc: out of memory")
+    }
+    let step = if align > 16 { align } else { 16 }
+    let from = if cx.mem_next > BASE { cx.mem_next } else { BASE }
+    let at = (from + step - 1) / step * step
+    cx.mem_next = at + size + GAP
+    cx.mem_base.push(at)
+    cx.mem_len.push(size)
+    cx.mem_state.push(LIVE)
+    cx.mem_data.push(bytes_filled(size, 0))
+    VInt(at)
+}
+
+/// The allocation `at` belongs to, if it is inside one or in the gap after
+/// it: the last made at or below it. -1 for none, and for one forgotten.
+fn find(inout cx: Cx, at: i64) -> i64 {
+    var lo = 0
+    var hi = cx.mem_base.len()
+    while lo < hi {
+        let mid = (lo + hi) / 2
+        if cx.mem_base[mid] <= at {
+            lo = mid + 1
+        } else {
+            hi = mid
+        }
+    }
+    if lo == 0 {
+        return -1
+    }
+    let k = lo - 1
+    if cx.mem_state[k] == FORGOTTEN or at - cx.mem_base[k] >= cx.mem_len[k] + GAP {
+        return -1
+    }
+    k
+}
+
+fn free(inout cx: Cx, at: i64) {
+    let k = find(cx, at)
+    if k >= 0 and cx.mem_base[k] == at {
+        if cx.mem_state[k] != LIVE {
+            panic("mem_free of an allocation already freed")
+        }
+        cx.mem_state[k] = FREED
+        cx.mem_data[k] = bytes_filled(0, 0)
+        cx.mem_freed.push(k)
+        if cx.mem_freed.len() - cx.mem_forgot > TOMBSTONES {
+            cx.mem_state[cx.mem_freed[cx.mem_forgot]] = FORGOTTEN
+            cx.mem_forgot += 1
+        }
+        return
+    }
+    if at == 0 {
+        panic("mem_free of the null address")
+    }
+    if k >= 0 {
+        panic("mem_free of an address inside an allocation, not its start")
+    }
+    panic("mem_free of an address no allocation holds")
+}
+
+/// The allocation `n` bytes at `at` lie in, checked: live, in bounds and
+/// aligned.
+fn span(inout cx: Cx, at: i64, n: i64, what: str) -> i64 {
+    if at == 0 {
+        panic("{what} through the null address")
+    }
+    let k = find(cx, at)
+    if k < 0 {
+        panic("{what} through an address no allocation holds")
+    }
+    if cx.mem_state[k] != LIVE {
+        panic("{what} after its allocation was freed")
+    }
+    let off = at - cx.mem_base[k]
+    let len = cx.mem_len[k]
+    if off + n > len {
+        panic("{what} of {n} byte(s) at offset {off} of a {len}-byte allocation")
+    }
+    if at % n != 0 {
+        panic("{what} at an address not aligned to {n}")
+    }
+    k
+}
+
+/// The value of layout type `ty` at `at`, little-endian; a narrow signed
+/// type is sign-extended.
+fn read_at(inout cx: Cx, ty: i64, at: i64, what: str) -> Value {
+    let n = load.layout_size(ty)
+    let k = span(cx, at, n, what)
+    let off = at - cx.mem_base[k]
+    var raw = 0
+    for j in 0..n {
+        raw = raw.bit_or(cx.mem_data[k].at(off + j).shl(8 * j))
+    }
+    match ty {
+        0 -> VInt(if raw >= 128 { raw - 256 } else { raw })
+        1 -> VInt(if raw >= 32768 { raw - 65536 } else { raw })
+        2 -> VInt(if raw >= 2147483648 { raw - 4294967296 } else { raw })
+        7 -> VU64(raw.as_u64())
+        8 -> VFloat(raw.from_bits())
+        _ -> VInt(raw)
+    }
+}
+
+/// Puts the low bytes of `raw` at `at`, little-endian. The buffer is taken
+/// out of the context while it is written, so the write is in place.
+fn write_at(inout cx: Cx, ty: i64, at: i64, raw: i64, what: str) {
+    let n = load.layout_size(ty)
+    let k = span(cx, at, n, what)
+    let off = at - cx.mem_base[k]
+    var buf = cx.mem_data[k]
+    cx.mem_data[k] = bytes_filled(0, 0)
+    for j in 0..n {
+        buf.set(off + j, raw.ushr(8 * j).bit_and(255))
+    }
+    cx.mem_data[k] = buf
+}

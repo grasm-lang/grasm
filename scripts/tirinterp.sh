@@ -24,6 +24,9 @@
 # names the reason, and the count is printed. A skip is coverage lost, so
 # there is one rule, it is narrow, and it is asked of the TIR rather than
 # guessed from a failure.
+#
+# Then the raw-memory sandbox's panics, from `tools/tirinterp/panics`, which
+# are not corpus programs; the section that runs them says why.
 set -uo pipefail
 cd "$(dirname "$0")/.."
 GRASM=${GRASM:-./target/release/grasm}
@@ -119,10 +122,56 @@ for src in $(corpus_programs); do
     fi
 done
 
+# The sandbox's panics ([E-MEM-UNCHECKED]). `grasm run` refuses a null, wild,
+# freed, out-of-bounds or misaligned access and a bad `mem_free` or
+# `mem_alloc`, each with its own message; a compiled build checks none of it,
+# so a program that does one has no output both engines agree on and cannot
+# be a corpus program -- difftest would see them differ, by design. And the
+# corpus's own cases are `test` blocks, which this gate does not run. So,
+# without these, a bounds check off by one in the direction that lets an
+# access through passed this gate. They live outside `scripts/lib/corpus.sh`
+# so that no other gate runs them.
+#
+# Each must panic under `grasm run` -- one that stopped panicking would check
+# nothing -- and the interpreter must print the same stdout, exit the same
+# and say the same panic, the trace stripped as above.
+panic_files=0
+panic_pass=0
+panic_fail=0
+for src in tools/tirinterp/panics/*.gr; do
+    [ -e "$src" ] || continue
+    panic_files=$((panic_files + 1))
+    tir="$WORK/p.tir"
+    if ! "$GRASM" tir "$src" >"$tir" 2>"$WORK/emit.err"; then
+        panic_fail=$((panic_fail + 1))
+        FAILED+=("$src — emits no TIR: $(head -1 "$WORK/emit.err")")
+        continue
+    fi
+    $RUN_LIMIT "$GRASM" run "$src" >"$WORK/ref.out" 2>"$WORK/ref.err" </dev/null
+    ref_code=$?
+    $RUN_LIMIT "$TIRINTERP" "$tir" >"$WORK/tir.out" 2>"$WORK/tir.err" </dev/null
+    tir_code=$?
+    ref_diag=$(strip_trace "$(cat "$WORK/ref.err")")
+    tir_diag=$(cat "$WORK/tir.err")
+    if [ "$ref_code" != 101 ] || [[ "$ref_diag" != "panic: "* ]]; then
+        panic_fail=$((panic_fail + 1))
+        FAILED+=("$src — does not panic under grasm run (exit $ref_code), so it checks nothing")
+    elif cmp -s "$WORK/ref.out" "$WORK/tir.out" && [ "$ref_code" = "$tir_code" ] && [ "$ref_diag" == "$tir_diag" ]; then
+        panic_pass=$((panic_pass + 1))
+    else
+        panic_fail=$((panic_fail + 1))
+        FAILED+=("$src — exit $ref_code (grasm run) vs $tir_code (tirinterp)")
+        echo "MISMATCH: $src (exit $ref_code vs $tir_code)"
+        diff "$WORK/ref.out" "$WORK/tir.out" | head -8 | sed 's/^/  /'
+        diff <(echo "$ref_diag") <(echo "$tir_diag") | head -6 | sed 's/^/  /'
+    fi
+done
+
 skipped=$skip_extern
 echo
 echo "round trip: $roundtrip identical, $rt_failed not"
 echo "identical: $pass   mismatched: $fail   timed out: $timedout   skipped (declares a C function): $skipped"
+echo "panics: $panic_pass identical, $panic_fail not"
 
 if [ ${#SKIPPED[@]} -gt 0 ]; then
     echo
@@ -147,7 +196,14 @@ if [ $((pass + fail + timedout + skipped)) -ne "$mains" ]; then
     echo "the counts do not add up: $pass + $fail + $timedout + $skipped is not $mains programs with a main"
     exit 1
 fi
-if [ "$fail" -ne 0 ] || [ "$rt_failed" -ne 0 ] || [ "$timedout" -ne 0 ]; then
+if [ "$fail" -ne 0 ] || [ "$rt_failed" -ne 0 ] || [ "$timedout" -ne 0 ] || [ "$panic_fail" -ne 0 ]; then
+    exit 1
+fi
+# Every panic program agreed, and there are as many as the directory held
+# when this was written: a directory that went missing or shrank would
+# otherwise read as one that passes.
+if [ "$panic_pass" -lt "$panic_files" ] || [ "$panic_files" -lt 17 ]; then
+    echo "panic programs: $panic_pass of $panic_files agreed, and there should be at least 17"
     exit 1
 fi
 # A gate that compared nothing has checked nothing. The floors are the

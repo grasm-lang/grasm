@@ -1,0 +1,9 @@
+// `mem_alloc` of more than 2^40 bytes.
+fn main() / {io, unsafe, mem} {
+    unsafe {
+        let a = mem_alloc(1, 1)
+        print("{a.offset(1).diff(a)}")
+        let b = mem_alloc(1099511627777, 8)
+        print("{a == b}")
+    }
+}

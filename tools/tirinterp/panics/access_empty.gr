@@ -1,0 +1,8 @@
+// An allocation of zero bytes is live and holds none.
+fn main() / {io, unsafe, mem} {
+    unsafe {
+        let a = mem_alloc(0, 8)
+        print("{a.offset(0) == a}")
+        print("{a.load_u8()}")
+    }
+}

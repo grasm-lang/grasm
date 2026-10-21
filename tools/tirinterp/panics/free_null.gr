@@ -1,0 +1,9 @@
+// `mem_free` of the null address.
+fn main() / {io, unsafe, mem} {
+    unsafe {
+        let a = mem_alloc(8, 8)
+        mem_free(a)
+        print("freed")
+        mem_free(mem_addr(0))
+    }
+}

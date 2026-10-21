@@ -1,0 +1,9 @@
+// A load through the null address.
+fn main() / {io, unsafe, mem} {
+    unsafe {
+        let a = mem_alloc(8, 8)
+        a.store_u8(7)
+        print("{a.load_u8()}")
+        print("{mem_addr(0).load_u8()}")
+    }
+}

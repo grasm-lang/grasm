@@ -1,0 +1,13 @@
+// A store after the allocation was freed: the address finds its
+// tombstone, never someone else's bytes.
+fn main() / {io, unsafe, mem} {
+    unsafe {
+        let a = mem_alloc(8, 8)
+        a.store_i64(-3)
+        print("{a.load_i64()}")
+        mem_free(a)
+        let b = mem_alloc(8, 8)
+        print("{a == b}")
+        a.store_i64(1)
+    }
+}

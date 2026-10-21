@@ -22,6 +22,7 @@
 import load
 import value
 import builtins
+import rawmem
 
 /// Why evaluation is unwinding: nothing, a loop exit, a return, or an error
 /// propagating to the nearest function that can fail.
@@ -68,6 +69,15 @@ type Cx = {
     depth: i64,
     hop_result: Value,
     args: [str],
+    // Raw memory's sandbox (see `rawmem`): one entry per allocation ever
+    // made, in address order, which is the order they were made in.
+    mem_base: [i64],
+    mem_len: [i64],
+    mem_state: [i64],
+    mem_data: [bytes],
+    mem_next: i64,
+    mem_freed: [i64],
+    mem_forgot: i64,
 }
 
 pub fn new_cx(p: Prog, args: [str]) -> Cx {
@@ -109,6 +119,13 @@ pub fn new_cx(p: Prog, args: [str]) -> Cx {
         depth: 0,
         hop_result: VUnit,
         args: args,
+        mem_base: [],
+        mem_len: [],
+        mem_state: [],
+        mem_data: [],
+        mem_next: 0,
+        mem_freed: [],
+        mem_forgot: 0,
     }
 }
 
@@ -296,6 +313,8 @@ fn ev_rest(inout cx: Cx, e: i64) -> Value {
         40 -> parallel(cx, e)
         // OP_BOUNDCALL
         41 -> bound_call(cx, e)
+        // OP_MEM
+        43 -> rawmem.mem_op(cx, e)
         // OP_CALLEXTERN
         42 -> {
             let name = cx.s[e]
@@ -1933,15 +1952,45 @@ fn concurrent_block(inout cx: Cx, e: i64) -> Value {
     VUnit
 }
 
-/// The shared slab, as it is handed from task to task.
-type Slab = { slab: [Value], gens: [i64], live: [bool], free: [i64] }
+/// The shared slab, as it is handed from task to task, and raw memory's
+/// sandbox with it: every task of a run sees the same allocations.
+type Slab = {
+    slab: [Value],
+    gens: [i64],
+    live: [bool],
+    free: [i64],
+    mem_base: [i64],
+    mem_len: [i64],
+    mem_state: [i64],
+    mem_data: [bytes],
+    mem_next: i64,
+    mem_freed: [i64],
+    mem_forgot: i64,
+}
 
 fn slab_out(inout cx: Cx) -> Slab {
-    let s = Slab{ slab: cx.slab, gens: cx.gens, live: cx.live, free: cx.free }
+    let s = Slab{
+        slab: cx.slab,
+        gens: cx.gens,
+        live: cx.live,
+        free: cx.free,
+        mem_base: cx.mem_base,
+        mem_len: cx.mem_len,
+        mem_state: cx.mem_state,
+        mem_data: cx.mem_data,
+        mem_next: cx.mem_next,
+        mem_freed: cx.mem_freed,
+        mem_forgot: cx.mem_forgot,
+    }
     cx.slab = []
     cx.gens = []
     cx.live = []
     cx.free = []
+    cx.mem_base = []
+    cx.mem_len = []
+    cx.mem_state = []
+    cx.mem_data = []
+    cx.mem_freed = []
     s
 }
 
@@ -1950,6 +1999,13 @@ fn slab_in(inout cx: Cx, s: Slab) {
     cx.gens = s.gens
     cx.live = s.live
     cx.free = s.free
+    cx.mem_base = s.mem_base
+    cx.mem_len = s.mem_len
+    cx.mem_state = s.mem_state
+    cx.mem_data = s.mem_data
+    cx.mem_next = s.mem_next
+    cx.mem_freed = s.mem_freed
+    cx.mem_forgot = s.mem_forgot
 }
 
 /// Before a channel operation that may wait: a task puts the slab back for

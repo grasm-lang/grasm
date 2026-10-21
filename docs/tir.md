@@ -165,7 +165,11 @@ and `mem_align_of` take is `(type u16)`, and an atomic's ordering, its last
 argument, is `(order acquire)` with its span (`relaxed`, `acquire`,
 `release`, `acqrel`, `seqcst`). A consumer must not evaluate either. Every
 other raw-memory operation is an ordinary `builtin` (`mem_alloc`, ...) or
-`method` (`offset`, `load_u8`, `atomic_cas_i64`, ...) node.
+`method` (`offset`, `load_u8`, `atomic_cas_i64`, ...) node. A `method` node
+is a raw-memory one exactly when its receiver's type is `addr`, since an
+address has no other built-in methods. A consumer goes by that, as the
+engines go by the checker's table, and not by the name alone: `as_i64` is
+also a method of every integer type.
 
 A method call in the source becomes one of these, by the checker's
 resolution: a built-in method (`method`), a UFCS call of a free function
@@ -289,4 +293,8 @@ and every program with a `main` must print and exit as the reference does.
 The one rule that skips a program is a declared `extern fn`, which an
 interpreter written in Grasm cannot call (Grasm has no function pointers,
 docs/self-hosting.md §5). No program in the corpus needed anything the TIR
-does not say.
+does not say. Raw memory runs in a sandbox of the interpreter's own, built
+as the reference's is ([E-MEM-UNCHECKED]): the same made-up addresses, the
+same checks, the same panics. A compiled build checks none of those, so the
+programs that hold the interpreter to them cannot be corpus programs; they
+are in `tools/tirinterp/panics`, one per panic, and only this gate runs them.

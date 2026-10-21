@@ -1,0 +1,8 @@
+// `mem_free` of an address inside an allocation rather than its start.
+fn main() / {io, unsafe, mem} {
+    unsafe {
+        let a = mem_alloc(8, 8)
+        print("{a.offset(4).diff(a)}")
+        mem_free(a.offset(4))
+    }
+}

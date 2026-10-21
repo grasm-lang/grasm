@@ -1,0 +1,8 @@
+// A wide access that starts inside and runs past the end.
+fn main() / {io, unsafe, mem} {
+    unsafe {
+        let a = mem_alloc(12, 8)
+        print("{a.offset(4).load_u32()}")
+        print("{a.offset(8).load_i64()}")
+    }
+}

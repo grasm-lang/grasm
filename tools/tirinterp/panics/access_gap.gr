@@ -1,0 +1,8 @@
+// An address in the gap after an allocation still names it.
+fn main() / {io, unsafe, mem} {
+    unsafe {
+        let a = mem_alloc(8, 8)
+        print("{a.offset(7).load_u8()}")
+        print("{a.offset(40).load_u8()}")
+    }
+}

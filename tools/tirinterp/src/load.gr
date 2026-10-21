@@ -55,6 +55,9 @@ pub let OP_SPAWN = 39
 pub let OP_PARALLEL = 40
 pub let OP_BOUNDCALL = 41
 pub let OP_CALLEXTERN = 42
+/// A raw-memory operation ([L-LIB-MEM], [L-LIB-ATOMIC]): `a` says which, as
+/// `rawmem` numbers them, `b` is its layout type's code and `s` its name.
+pub let OP_MEM = 43
 // Parts of the nodes above, never evaluated on their own.
 pub let OP_TEXT = 50
 pub let OP_ENTRY = 52
@@ -407,8 +410,13 @@ fn expr(inout ld: Loader, e: i64) -> i64 {
         }
         "builtin" -> {
             let name = word(t, e, 3)
-            let code = resolve(ld, ld.builtins, name, "built-in")
-            node_with(ld, e, OP_BUILTIN, code, 0, name)
+            let mop = mem_builtin(name)
+            if mop > 0 {
+                mem_builtin_node(ld, e, mop, name)
+            } else {
+                let code = resolve(ld, ld.builtins, name, "built-in")
+                node_with(ld, e, OP_BUILTIN, code, 0, name)
+            }
         }
         "list" -> with_kids(ld, OP_LIST, e)
         "block" -> with_kids(ld, OP_BLOCK, e)
@@ -874,6 +882,16 @@ fn mentions(p: Loader, e: i64, v: i64) -> bool {
 fn method_node(inout ld: Loader, e: i64) -> i64 {
     let t = ld.t
     let name = word(t, e, 3)
+    // A built-in method on an `addr` is a raw-memory operation. The
+    // receiver's type says so, as the checker's table does for the
+    // reference: nothing is decided by the name alone.
+    let recv = kid_elems(t, e)[0]
+    if t.kind[at(t, recv, 1)] == 0 and word(t, recv, 1) == "addr" {
+        let (mop, ty) = mem_method(name)
+        if mop > 0 {
+            return mem_node(ld, e, mop, ty, name)
+        }
+    }
     let id = new_node(ld, OP_METHOD)
     ld.s[id] = name
     ld.a[id] = ld.methods.get(name) ?? 0
@@ -888,6 +906,124 @@ fn method_node(inout ld: Loader, e: i64) -> i64 {
         ld.c[id] = 100
     }
     let ks = exprs(ld, parts)
+    set_kids(ld, id, ks)
+    id
+}
+
+// ----- raw memory ------------------------------------------------------------
+
+/// The code of a layout type ([L-LIB-MEM]), in the order `MemTy` lists
+/// them, or -1.
+pub fn layout_code(name: str) -> i64 {
+    match name {
+        "i8" -> 0
+        "i16" -> 1
+        "i32" -> 2
+        "i64" -> 3
+        "u8" -> 4
+        "u16" -> 5
+        "u32" -> 6
+        "u64" -> 7
+        "f64" -> 8
+        "addr" -> 9
+        _ -> -1
+    }
+}
+
+/// A layout type's size in bytes, which is also its alignment.
+pub fn layout_size(code: i64) -> i64 {
+    match code {
+        0 | 4 -> 1
+        1 | 5 -> 2
+        2 | 6 -> 4
+        _ -> 8
+    }
+}
+
+/// Which raw-memory free function `name` is, or 0.
+fn mem_builtin(name: str) -> i64 {
+    match name {
+        "mem_alloc" -> 1
+        "mem_free" -> 2
+        "mem_addr" -> 3
+        "mem_size_of" -> 4
+        "mem_align_of" -> 5
+        _ -> 0
+    }
+}
+
+/// Which raw-memory method `name` is, and its layout type, as
+/// `grasm_sema::mem::method` reads the name: `(0, -1)` when it is none.
+fn mem_method(name: str) -> (i64, i64) {
+    match name {
+        "offset" -> return (6, -1)
+        "diff" -> return (7, -1)
+        "as_i64" -> return (8, -1)
+        _ -> ()
+    }
+    if name.starts_with("atomic_") {
+        let rest = name.substr(7, name.len() - 7)
+        let cut = rest.index_of("_") ?? -1
+        if cut < 0 {
+            return (0, -1)
+        }
+        let ty = layout_code(rest.substr(cut + 1, rest.len() - cut - 1))
+        // An atomic is on an integer type only.
+        if ty < 0 or ty == 8 or ty == 9 {
+            return (0, -1)
+        }
+        let op = match rest.substr(0, cut) {
+            "load" -> 11
+            "store" -> 12
+            "cas" -> 13
+            "add" -> 14
+            _ -> 0
+        }
+        return (op, ty)
+    }
+    if name.starts_with("load_") {
+        let ty = layout_code(name.substr(5, name.len() - 5))
+        return if ty < 0 { (0, -1) } else { (9, ty) }
+    }
+    if name.starts_with("store_") {
+        let ty = layout_code(name.substr(6, name.len() - 6))
+        return if ty < 0 { (0, -1) } else { (10, ty) }
+    }
+    (0, -1)
+}
+
+/// `mem_size_of(T)` and `mem_align_of(T)` answer a constant: their argument
+/// is a type, written `(type T)`, and is not evaluated.
+fn mem_builtin_node(inout ld: Loader, e: i64, mop: i64, name: str) -> i64 {
+    let t = ld.t
+    if mop == 4 or mop == 5 {
+        let arg = kid_elems(t, e)[0]
+        let ty = if kw(t, arg) == "type" { layout_code(word(t, arg, 1)) } else { -1 }
+        if ty < 0 {
+            err(ld, "`{name}` takes a layout type, written `(type T)`")
+            return new_node(ld, 0)
+        }
+        return lit(ld, VInt(layout_size(ty)))
+    }
+    mem_node(ld, e, mop, -1, name)
+}
+
+/// A raw-memory operation. Its children are its receiver, for a method,
+/// then its value arguments; an atomic's ordering, `(order o)`, is a name
+/// that changes nothing where one thread runs at a time, and is not one.
+fn mem_node(inout ld: Loader, e: i64, mop: i64, ty: i64, name: str) -> i64 {
+    let t = ld.t
+    let id = new_node(ld, OP_MEM)
+    ld.a[id] = mop
+    ld.b[id] = ty
+    ld.s[id] = name
+    var vals: [i64] = []
+    for k in kid_elems(t, e) {
+        if kw(t, k) != "order" {
+            vals.push(k)
+        }
+    }
+    let ks = exprs(ld, vals)
     set_kids(ld, id, ks)
     id
 }

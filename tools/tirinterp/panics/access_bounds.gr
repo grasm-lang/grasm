@@ -1,0 +1,9 @@
+// One byte past the end: the last byte is in bounds and the next is not.
+fn main() / {io, unsafe, mem} {
+    unsafe {
+        let a = mem_alloc(12, 4)
+        a.offset(11).store_u8(255)
+        print("{a.offset(11).load_u8()} {a.offset(8).load_u32()}")
+        print("{a.offset(12).load_u8()}")
+    }
+}

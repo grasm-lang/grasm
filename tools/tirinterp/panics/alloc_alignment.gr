@@ -1,0 +1,9 @@
+// `mem_alloc` with an alignment that is not a power of two up to 4096.
+fn main() / {io, unsafe, mem} {
+    unsafe {
+        let a = mem_alloc(1, 4096)
+        print("{a.as_i64() % 4096}")
+        let b = mem_alloc(8, 8192)
+        print("{a == b}")
+    }
+}

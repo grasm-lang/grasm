@@ -1,0 +1,14 @@
+// One free more and the oldest is forgotten. Its addresses are never
+// handed out again, so an access through one is through an address no
+// allocation holds.
+fn main() / {io, unsafe, mem} {
+    unsafe {
+        let first = mem_alloc(8, 8)
+        mem_free(first)
+        for _ in 0..65536 {
+            mem_free(mem_alloc(8, 8))
+        }
+        print("{mem_alloc(8, 8).diff(first)}")
+        print("{first.offset(4).load_i32()}")
+    }
+}
