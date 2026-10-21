@@ -30,6 +30,11 @@ type Store = {
     dir: str,
     memtable: [TableRecord],
     tables: [str],
+    // The same tables, opened: their index and filter in memory. A table is
+    // never changed once written, so it is opened once, when it joins the
+    // store, instead of on every read -- `get` used to read every table's
+    // footer, index and filter from disk for each key it looked up.
+    opened: [Table],
     next_id: i64,
     durable: bool,
     flush_at: i64,
@@ -74,6 +79,11 @@ pub fn open_store(dir: str, durable: bool) -> Store ! StoreError / {io} {
         insert(mem, TableRecord{ key: e.key, value: e.value, deleted: e.deleted })
     }
 
+    var opened: [Table] = []
+    for t in tables {
+        opened.push(try open_one(dir, t))
+    }
+
     var highest = 0
     for t in tables {
         let id = id_of(t)
@@ -86,6 +96,7 @@ pub fn open_store(dir: str, durable: bool) -> Store ! StoreError / {io} {
         dir: dir,
         memtable: mem,
         tables: tables,
+        opened: opened,
         next_id: highest + 1,
         durable: durable,
         flush_at: default_flush_at(),
@@ -208,14 +219,10 @@ pub fn get(s: Store, key: bytes) -> Option[bytes] ! StoreError / {io} {
         }
         None -> {}
     }
-    var i = s.tables.len() - 1
+    var i = s.opened.len() - 1
     while i >= 0 {
         let path = "{s.dir}/{s.tables[i]}"
-        let t = match sstable.open_table(path) {
-            Ok(tb) -> tb
-            Err(_e) -> fail(Corrupt(path))
-        }
-        match sstable.get(t, key) {
+        match sstable.get(s.opened[i], key) {
             Ok(hit) -> {
                 match hit {
                     Some(r) -> {
@@ -257,6 +264,7 @@ pub fn flush(inout s: Store) -> () ! StoreError / {io} {
         Ok(_u) -> {}
         Err(_e) -> fail(Io("resetting the log"))
     }
+    s.opened.push(try open_one(s.dir, name))
     s.tables = next
     s.next_id = s.next_id + 1
     var empty: [TableRecord] = []
@@ -273,13 +281,9 @@ pub fn compact(inout s: Store) -> () ! StoreError / {io} {
         return
     }
     var merged: [TableRecord] = []
-    for name in s.tables {
-        let path = "{s.dir}/{name}"
-        let t = match sstable.open_table(path) {
-            Ok(tb) -> tb
-            Err(_e) -> fail(Corrupt(path))
-        }
-        match sstable.entries(t) {
+    for k in 0..s.tables.len() {
+        let path = "{s.dir}/{s.tables[k]}"
+        match sstable.entries(s.opened[k]) {
             Ok(rs) -> {
                 // Older tables come first, so a later insert overwrites an
                 // earlier one and the newest record wins.
@@ -312,8 +316,18 @@ pub fn compact(inout s: Store) -> () ! StoreError / {io} {
             Err(_e) -> {}
         }
     }
+    s.opened = [try open_one(s.dir, name)]
     s.tables = [name]
     s.next_id = s.next_id + 1
+}
+
+/// Open one of the store's tables, or say which one would not open.
+fn open_one(dir: str, name: str) -> Table ! StoreError / {io} {
+    let path = "{dir}/{name}"
+    match sstable.open_table(path) {
+        Ok(t) -> t
+        Err(_e) -> fail(Corrupt(path))
+    }
 }
 
 /// The manifest: a count, then each table's name.
