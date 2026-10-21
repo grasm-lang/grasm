@@ -37,6 +37,13 @@ migration note here; anything `experimental` may change in any release. See
 - **`walkdir-demo` walked the whole checkout when given no argument**, so
   the interpreter and the compiled program counted different trees whenever
   a build ran beside them. It walks a fixed directory now.
+- **`sqlitejournal` failed a rollback SQLite completes** when a later
+  journal header had a damaged page or sector size. SQLite reads those
+  from the first header only, and treats bad ones there as the end of the
+  journal, not an error; the package now does both. `b42diff` pins the
+  shapes. `i64 ^` also ignored exponent bits above 2^32-1 in both engines.
+- **`lsm` read every table from disk on every lookup.** It opens each one
+  once now: `kvstore verify` on a 250-table store went from 14 min to 9 s.
 - **Two demos wrote 31 images into the repository root**, and a commit that
   staged everything published them, together with an unreferenced
   screenshot from the WebAssembly work. `pngwrite-demo` and `tiffwrite-demo`
@@ -50,6 +57,19 @@ migration note here; anything `experimental` may change in any release. See
 - **TIR** (`docs/tir.md`): `grasm tir` prints a checked program with every
   decision the checker made written down, the first stage of the
   self-hosting plan. The `tirtest` gate holds the whole corpus to it.
+- **A TIR interpreter written in Grasm** (`tools/tirinterp`), which runs a
+  program from its TIR alone. `tirinterp` holds it to `grasm run` on every
+  corpus program with a `main` except the eight that declare a C function.
+- **`u64`**, bit operations (`rotate_left/right`, `count_ones`,
+  `leading_zeros`, `trailing_zeros`, `swap_bytes`) on every integer type at
+  its own width, and **`StrBuilder` / `ByteBuilder`**, whose appends are
+  amortised rather than copying ([T-U64], [L-LIB-BITS-WIDTH],
+  [L-LIB-BUILDER]).
+- **Raw memory and atomics**, only inside `unsafe` and only in a package
+  that declares the new `mem` capability: an `addr` type, allocation, typed
+  loads and stores, and atomic load/store/compare-exchange/add with
+  explicit orderings ([T-ADDR], [L-LIB-MEM], [L-LIB-ATOMIC]). `grasm run`
+  checks every access in a sandbox; a native build checks none.
 
 ## 1.1.0 — 2026-10-20
 
