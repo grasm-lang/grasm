@@ -32,7 +32,7 @@ import regex
 type WrapHuge = | HugeWrap | HugeOverflow | HugeDie
 
 /// Text::Wrap's package variables.
-type WrapOptions = {
+type PerlWrapOptions = {
     columns: i64,
     huge: WrapHuge,
     unexpand: bool,
@@ -45,9 +45,9 @@ type WrapOptions = {
 
 /// Perl's `die`: a word that would not fit under `huge` = die (the text
 /// being wrapped), or a `break` this package cannot use.
-type WrapError = | WrapDied(text: str) | WrapBadBreak(msg: str)
+type PerlWrapError = | WrapDied(text: str) | WrapBadBreak(msg: str)
 
-pub fn error_text(e: WrapError) -> str {
+pub fn error_text(e: PerlWrapError) -> str {
     return match e {
         WrapDied(t) -> "couldn't wrap '" + t + "'"
         WrapBadBreak(m) -> m
@@ -55,8 +55,8 @@ pub fn error_text(e: WrapError) -> str {
 }
 
 /// Text::Wrap's defaults: 76 columns, wrap, unexpand, tabstop 8, "\n".
-pub fn default_options() -> WrapOptions {
-    return WrapOptions{ columns: 76, huge: HugeWrap, unexpand: true, tabstop: 8, separator: "\n", separator2: None, brk: None }
+pub fn default_options() -> PerlWrapOptions {
+    return PerlWrapOptions{ columns: 76, huge: HugeWrap, unexpand: true, tabstop: 8, separator: "\n", separator2: None, brk: None }
 }
 
 // ---- characters and clusters
@@ -172,7 +172,7 @@ pub fn unexpand(text: str, tabstop: i64) -> str {
 
 // ---- breaks
 
-type Breaker = | DefaultBreak | RegexBreak(r: Regex)
+type PerlBreaker = | DefaultBreak | RegexBreak(r: Regex)
 
 /// `\s` and `\S` written out as Perl means them.
 fn perl_classes(pattern: str) -> str {
@@ -205,7 +205,7 @@ fn perl_classes(pattern: str) -> str {
     return out
 }
 
-fn breaker(o: WrapOptions) -> Breaker ! WrapError {
+fn breaker(o: PerlWrapOptions) -> PerlBreaker ! PerlWrapError {
     let pattern = match o.brk {
         Some(p) -> p
         None -> return DefaultBreak
@@ -221,7 +221,7 @@ fn breaker(o: WrapOptions) -> Breaker ! WrapError {
 }
 
 /// How many characters `$break` takes at `p`, or -1.
-fn break_at(b: Breaker, cs: [str], p: i64) -> i64 {
+fn break_at(b: PerlBreaker, cs: [str], p: i64) -> i64 {
     return match b {
         DefaultBreak -> if p < cs.len() and is_ws(cs[p]) { cluster_len(cs, p) } else { 0 - 1 }
         RegexBreak(r) -> match regex.find(r, slice_text(cs, p, cs.len())) {
@@ -232,7 +232,7 @@ fn break_at(b: Breaker, cs: [str], p: i64) -> i64 {
 }
 
 /// `($break|\n+|\z)` at `p`: the characters it takes, or -1.
-fn terminator_at(b: Breaker, cs: [str], p: i64) -> i64 {
+fn terminator_at(b: PerlBreaker, cs: [str], p: i64) -> i64 {
     let k = break_at(b, cs, p)
     if k >= 0 {
         return k
@@ -248,7 +248,7 @@ fn terminator_at(b: Breaker, cs: [str], p: i64) -> i64 {
 }
 
 /// `\G(?:$break)*\Z`: where the match ends, or -1.
-fn only_breaks_left(b: Breaker, cs: [str], p: i64) -> i64 {
+fn only_breaks_left(b: PerlBreaker, cs: [str], p: i64) -> i64 {
     var ends = [p]
     var q = p
     while true {
@@ -284,7 +284,7 @@ fn cluster_ends(cs: [str], p: i64, limit: i64) -> [i64] {
 
 /// One line: (where its text ends, where the match ends, remainder), or
 /// None where `huge` = die refuses.
-fn next_line(b: Breaker, cs: [str], p: i64, ll: i64, o: WrapOptions) -> Option[(i64, i64, str)] {
+fn next_line(b: PerlBreaker, cs: [str], p: i64, ll: i64, o: PerlWrapOptions) -> Option[(i64, i64, str)] {
     let ends = cluster_ends(cs, p, ll)
     var k = ends.len() - 1
     while k >= 0 {
@@ -319,7 +319,7 @@ fn next_line(b: Breaker, cs: [str], p: i64, ll: i64, o: WrapOptions) -> Option[(
 }
 
 /// `wrap($initial_tab, $subsequent_tab, @text)`.
-pub fn wrap(ip: str, xp: str, texts: [str], o: WrapOptions) -> str ! WrapError {
+pub fn wrap(ip: str, xp: str, texts: [str], o: PerlWrapOptions) -> str ! PerlWrapError {
     let b = try breaker(o)
     var joined = ""
     var i = 0
@@ -421,7 +421,7 @@ fn squeeze(text: str) -> str {
 }
 
 /// `fill($initial_tab, $subsequent_tab, @raw)`.
-pub fn fill(ip: str, xp: str, raw: [str], o: WrapOptions) -> str ! WrapError {
+pub fn fill(ip: str, xp: str, raw: [str], o: PerlWrapOptions) -> str ! PerlWrapError {
     var paras: [str] = []
     for pp in paragraphs(raw.join("\n")) {
         paras.push(try wrap(ip, xp, [squeeze(pp)], o))

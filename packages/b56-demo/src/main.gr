@@ -93,7 +93,7 @@ fn rust_escapes() {
     print("escape_debug, escape_default, escape_unicode and \{:?}: Rust's")
 }
 
-fn wrapped(r: str ! WrapError) -> str {
+fn wrapped(r: str ! PerlWrapError) -> str {
     return match r {
         Ok(t) -> t
         Err(e) -> "E:" + perltextwrap.error_text(e)

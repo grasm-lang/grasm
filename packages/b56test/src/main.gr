@@ -237,7 +237,7 @@ fn tw_opt(h: str) -> Option[str] {
     return if h == "u" { None } else { Some(unhex(h)) }
 }
 
-fn tw_run(wrapping: bool, ip: str, xp: str, texts: [str], o: WrapOptions) -> str ! WrapError {
+fn tw_run(wrapping: bool, ip: str, xp: str, texts: [str], o: PerlWrapOptions) -> str ! PerlWrapError {
     if wrapping {
         return try perltextwrap.wrap(ip, xp, texts, o)
     }
@@ -253,7 +253,7 @@ fn perltextwrap_line(f: [str]) -> str {
         return hex_text(perltextwrap.unexpand(unhex(f[2]), f[1].parse_int() ?? 8))
     }
     let huge = if f[2] == "die" { HugeDie } else if f[2] == "overflow" { HugeOverflow } else { HugeWrap }
-    let o = WrapOptions{ columns: f[1].parse_int() ?? 76, huge: huge, unexpand: f[3] == "1", tabstop: f[4].parse_int() ?? 8, separator: unhex(f[5]), separator2: tw_opt(f[6]), brk: tw_opt(f[7]) }
+    let o = PerlWrapOptions{ columns: f[1].parse_int() ?? 76, huge: huge, unexpand: f[3] == "1", tabstop: f[4].parse_int() ?? 8, separator: unhex(f[5]), separator2: tw_opt(f[6]), brk: tw_opt(f[7]) }
     let texts = f.slice(10, f.len()).map(|h| unhex(h))
     return match tw_run(op == "w", unhex(f[8]), unhex(f[9]), texts, o) {
         Ok(t) -> hex_text(t)

@@ -489,13 +489,13 @@ pub fn format(name: str, v: JqValue) -> str ! JqError {
 
 // ---- reading JSON
 
-type JsonReader = { b: [i64], i: i64 }
+type JqReader = { b: [i64], i: i64 }
 
 fn bad_json() -> JqError {
     return JqError("invalid JSON")
 }
 
-fn skip_ws(inout r: JsonReader) {
+fn skip_ws(inout r: JqReader) {
     while r.i < r.b.len() and (r.b[r.i] == 32 or r.b[r.i] == 9 or r.b[r.i] == 10 or r.b[r.i] == 13) {
         r.i = r.i + 1
     }
@@ -505,7 +505,7 @@ fn hex_digit(c: i64) -> i64 {
     return if c >= 48 and c <= 57 { c - 48 } else if c >= 97 and c <= 102 { c - 87 } else if c >= 65 and c <= 70 { c - 55 } else { 0 - 1 }
 }
 
-fn read_u4(inout r: JsonReader) -> i64 ! JqError {
+fn read_u4(inout r: JqReader) -> i64 ! JqError {
     var v = 0
     for _k in 0..4 {
         let h = hex_digit(if r.i < r.b.len() { r.b[r.i] } else { 0 })
@@ -533,7 +533,7 @@ fn utf8_of(c: i64) -> [i64] {
 
 /// A `\u` escape (after the `u`), a surrogate pair joined; a lone half
 /// is refused, as jq refuses it.
-fn unicode_escape(inout r: JsonReader) -> i64 ! JqError {
+fn unicode_escape(inout r: JqReader) -> i64 ! JqError {
     let c = try read_u4(r)
     if c >= 55296 and c <= 56319 and r.i + 1 < r.b.len() and r.b[r.i] == 92 and r.b[r.i + 1] == 117 {
         let save = r.i
@@ -550,7 +550,7 @@ fn unicode_escape(inout r: JsonReader) -> i64 ! JqError {
     return c
 }
 
-fn read_string(inout r: JsonReader) -> str ! JqError {
+fn read_string(inout r: JqReader) -> str ! JqError {
     r.i = r.i + 1
     var out: [i64] = []
     while true {
@@ -589,7 +589,7 @@ fn read_string(inout r: JsonReader) -> str ! JqError {
     return jq_string(out)
 }
 
-fn read_value(inout r: JsonReader) -> JqValue ! JqError {
+fn read_value(inout r: JqReader) -> JqValue ! JqError {
     skip_ws(r)
     if r.i >= r.b.len() {
         fail(bad_json())
@@ -621,7 +621,7 @@ fn read_value(inout r: JsonReader) -> JqValue ! JqError {
     }
 }
 
-fn read_array(inout r: JsonReader) -> JqValue ! JqError {
+fn read_array(inout r: JqReader) -> JqValue ! JqError {
     r.i = r.i + 1
     var items: [JqValue] = []
     skip_ws(r)
@@ -646,7 +646,7 @@ fn read_array(inout r: JsonReader) -> JqValue ! JqError {
     return JqArray(items)
 }
 
-fn read_object(inout r: JsonReader) -> JqValue ! JqError {
+fn read_object(inout r: JqReader) -> JqValue ! JqError {
     r.i = r.i + 1
     var entries: [(str, JqValue)] = []
     skip_ws(r)
@@ -693,7 +693,7 @@ fn read_object(inout r: JsonReader) -> JqValue ! JqError {
 
 /// One JSON value, as jq reads its input (see the note above on errors).
 pub fn parse(text: str) -> JqValue ! JqError {
-    var r = JsonReader{ b: ascii(text), i: 0 }
+    var r = JqReader{ b: ascii(text), i: 0 }
     let v = try read_value(r)
     skip_ws(r)
     if r.i != r.b.len() {
