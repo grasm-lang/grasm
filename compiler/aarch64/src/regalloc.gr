@@ -1,0 +1,685 @@
+// Register allocation: linear scan (Poletto and Sarkar, "Linear Scan
+// Register Allocation", TOPLAS 1999).
+//
+// Each virtual register gets one lifetime interval, from the first point it
+// is live to the last, computed from block liveness, and keeps one location
+// for all of it: a register, or a stack slot when there are not enough. The
+// calling convention is respected by the intervals of physical registers,
+// which no virtual register may overlap in the same register, and by calls,
+// which clobber x0..x17: an interval that spans a call goes to a register the
+// callee preserves (x19..x28) or to the stack.
+//
+// A spilled register is reloaded into a scratch register (x15..x17, which the
+// allocator never hands out) before every instruction that reads it, and
+// stored after every instruction that writes it.
+//
+// Nothing here is trusted: `check.gr` replays the result symbolically and
+// fails the build on any error.
+import mach
+import vcode
+
+pub let LOC_NONE = -1
+/// A location at or above this is spill slot `loc - LOC_SPILL`.
+pub let LOC_SPILL = 1000
+pub let K_ORIG = 0
+pub let K_RELOAD = 1
+pub let K_SPILL = 2
+
+/// The code after allocation: every operand physical, with what it was
+/// before beside it.
+type Alloc = {
+    mop: [i64],
+    rd: [i64],
+    rn: [i64],
+    rm: [i64],
+    ra: [i64],
+    imm: [i64],
+    imm2: [i64],
+    cc: [i64],
+    tgt: [i64],
+    symk: [i64],
+    sym_id: [i64],
+    od: [i64],
+    on: [i64],
+    om: [i64],
+    oa: [i64],
+    kind: [i64],
+    slot: [i64],
+    bi0: [i64],
+    bni: [i64],
+    nparams: i64,
+    nslots: i64,
+    nspill: i64,
+    loc: [i64],
+    used_callee: [bool],
+    /// How many functions a deliberate corruption was applied to: the
+    /// checker's control (`ra_check`).
+    corrupted: i64,
+}
+
+// ----- operands ----------------------------------------------------------------
+
+fn keep(o: i64) -> bool {
+    o >= 0 and o != mach.R_ZR and o != mach.R_SP
+}
+
+/// The registers an instruction reads.
+pub fn uses_f(m: i64, d: i64, n: i64, mm: i64, a: i64, imm: i64, imm2: i64) -> [i64] {
+    var out: [i64] = []
+    if m == mach.A_BL {
+        for k in 0..imm2 {
+            out.push(k)
+        }
+        return out
+    }
+    if m == mach.P_RETURN {
+        if imm == 1 {
+            out.push(0)
+        }
+        return out
+    }
+    let rdr = mach.role_d(m)
+    if (rdr == mach.ROLE_USE or rdr == mach.ROLE_USEDEF) and keep(d) {
+        out.push(d)
+    }
+    if mach.role_n(m) == mach.ROLE_USE and keep(n) {
+        out.push(n)
+    }
+    if mach.role_m(m) == mach.ROLE_USE and keep(mm) {
+        out.push(mm)
+    }
+    if mach.role_a(m) == mach.ROLE_USE and keep(a) {
+        out.push(a)
+    }
+    out
+}
+
+/// The registers an instruction writes (a call's clobbers aside).
+pub fn defs_f(m: i64, d: i64, n: i64, mm: i64, a: i64, imm: i64, imm2: i64) -> [i64] {
+    var out: [i64] = []
+    if m == mach.A_BL {
+        if imm == 1 {
+            out.push(0)
+        }
+        return out
+    }
+    let rdr = mach.role_d(m)
+    if (rdr == mach.ROLE_DEF or rdr == mach.ROLE_USEDEF) and keep(d) {
+        out.push(d)
+    }
+    if mach.role_m(m) == mach.ROLE_DEF and keep(mm) {
+        out.push(mm)
+    }
+    out
+}
+
+fn uses_at(vc: VCode, i: i64) -> [i64] {
+    uses_f(vc.mop[i], vc.rd[i], vc.rn[i], vc.rm[i], vc.ra[i], vc.imm[i], vc.imm2[i])
+}
+
+fn defs_at(vc: VCode, i: i64) -> [i64] {
+    defs_f(vc.mop[i], vc.rd[i], vc.rn[i], vc.rm[i], vc.ra[i], vc.imm[i], vc.imm2[i])
+}
+
+/// Registers a call may change: everything below x18, the callee-saved ones
+/// excepted (AAPCS64; x18 is the platform's on Darwin and never used).
+pub fn caller_saved(r: i64) -> bool {
+    r >= 0 and r <= 17
+}
+
+pub fn callee_saved(r: i64) -> bool {
+    r >= 19 and r <= 28
+}
+
+/// The registers handed out, in the order they are tried.
+fn caller_order() -> [i64] {
+    [9, 10, 11, 12, 13, 14, 8, 7, 6, 5, 4, 3, 2, 1, 0]
+}
+
+fn callee_order() -> [i64] {
+    [19, 20, 21, 22, 23, 24, 25, 26, 27, 28]
+}
+
+/// Under `max_regs`, the registers kept, in this order: a few of each kind,
+/// so a starved allocation still has somewhere to put a value that lives
+/// across a call.
+fn stress_order() -> [i64] {
+    [9, 19, 10, 20, 11, 21, 12, 22, 13, 23, 14, 24, 8, 25, 7, 26, 6, 27, 5, 28, 4, 3, 2, 1, 0]
+}
+
+pub fn scratch(k: i64) -> i64 {
+    if k == 0 { 16 } else if k == 1 { 17 } else { 15 }
+}
+
+// ----- liveness and intervals ----------------------------------------------------
+
+type Live = {
+    start: [i64],
+    end: [i64],
+    fr_reg: [i64],
+    fr_from: [i64],
+    fr_to: [i64],
+    calls: [i64],
+}
+
+fn intervals(vc: VCode) -> Live {
+    let nb = vcode.nblocks(vc)
+    let nv = vc.nvregs
+    // Which virtual registers are read in a block they were not written in
+    // first: only those need block liveness.
+    var defstamp: [i64] = []
+    var global: [bool] = []
+    for v in 0..nv {
+        defstamp.push(-1)
+        global.push(false)
+    }
+    for b in 0..nb {
+        for i in vc.bi0[b]..(vc.bi0[b] + vc.bni[b]) {
+            for u in uses_at(vc, i) {
+                if mach.is_vreg(u) and defstamp[u - mach.VR] != b {
+                    global[u - mach.VR] = true
+                }
+            }
+            for d in defs_at(vc, i) {
+                if mach.is_vreg(d) {
+                    defstamp[d - mach.VR] = b
+                }
+            }
+        }
+    }
+    var gvars: [i64] = []
+    var gidx: [i64] = []
+    for v in 0..nv {
+        if global[v] {
+            gidx.push(gvars.len())
+            gvars.push(v)
+        } else {
+            gidx.push(-1)
+        }
+    }
+    let ng = gvars.len()
+    var ue: [bool] = []
+    var df: [bool] = []
+    var lin: [bool] = []
+    for k in 0..(nb * ng) {
+        ue.push(false)
+        df.push(false)
+        lin.push(false)
+    }
+    for b in 0..nb {
+        let base = b * ng
+        for i in vc.bi0[b]..(vc.bi0[b] + vc.bni[b]) {
+            for u in uses_at(vc, i) {
+                if mach.is_vreg(u) {
+                    let g = gidx[u - mach.VR]
+                    if g >= 0 and not df[base + g] {
+                        ue[base + g] = true
+                    }
+                }
+            }
+            for d in defs_at(vc, i) {
+                if mach.is_vreg(d) {
+                    let g = gidx[d - mach.VR]
+                    if g >= 0 {
+                        df[base + g] = true
+                    }
+                }
+            }
+        }
+    }
+    var succ: [[i64]] = []
+    for b in 0..nb {
+        succ.push(vcode.succs(vc, b))
+    }
+    var changed = true
+    while changed {
+        changed = false
+        var b = nb - 1
+        while b >= 0 {
+            let base = b * ng
+            for g in 0..ng {
+                var out = false
+                for s in succ[b] {
+                    if lin[s * ng + g] {
+                        out = true
+                    }
+                }
+                let now = ue[base + g] or (out and not df[base + g])
+                if now != lin[base + g] {
+                    lin[base + g] = now
+                    changed = true
+                }
+            }
+            b -= 1
+        }
+    }
+    var lv = Live{ start: [], end: [], fr_reg: [], fr_from: [], fr_to: [], calls: [] }
+    let big = 9223372036854775807
+    for v in 0..nv {
+        lv.start.push(big)
+        lv.end.push(-1)
+    }
+    for b in 0..nb {
+        let bs = 2 * vc.bi0[b]
+        let be = 2 * (vc.bi0[b] + vc.bni[b]) - 1
+        let base = b * ng
+        for g in 0..ng {
+            let v = gvars[g]
+            if lin[base + g] {
+                extend(lv, v, bs)
+            }
+            var out = false
+            for s in succ[b] {
+                if lin[s * ng + g] {
+                    out = true
+                }
+            }
+            if out {
+                extend(lv, v, bs)
+                extend(lv, v, be)
+            }
+        }
+        // Physical registers, block-local by construction: from the write
+        // to the last read before the next write. The entry's parameter
+        // registers are written before the function starts.
+        var is_open: [bool] = []
+        var from: [i64] = []
+        var last: [i64] = []
+        for r in 0..31 {
+            is_open.push(false)
+            from.push(0)
+            last.push(0)
+        }
+        if b == 0 {
+            for k in 0..vc.nparams {
+                is_open[k] = true
+                from[k] = -1
+                last[k] = -1
+            }
+        }
+        for i in vc.bi0[b]..(vc.bi0[b] + vc.bni[b]) {
+            for u in uses_at(vc, i) {
+                if mach.is_vreg(u) {
+                    extend(lv, u - mach.VR, 2 * i)
+                } else if is_open[u] {
+                    last[u] = 2 * i
+                } else {
+                    lv.fr_reg.push(u)
+                    lv.fr_from.push(bs)
+                    lv.fr_to.push(2 * i)
+                }
+            }
+            for d in defs_at(vc, i) {
+                if mach.is_vreg(d) {
+                    extend(lv, d - mach.VR, 2 * i + 1)
+                } else {
+                    if is_open[d] {
+                        lv.fr_reg.push(d)
+                        lv.fr_from.push(from[d])
+                        lv.fr_to.push(last[d])
+                    }
+                    is_open[d] = true
+                    from[d] = 2 * i + 1
+                    last[d] = 2 * i + 1
+                }
+            }
+            if vc.mop[i] == mach.A_BL {
+                lv.calls.push(2 * i + 1)
+            }
+        }
+        for r in 0..31 {
+            if is_open[r] {
+                lv.fr_reg.push(r)
+                lv.fr_from.push(from[r])
+                lv.fr_to.push(last[r])
+            }
+        }
+    }
+    lv
+}
+
+fn extend(inout lv: Live, v: i64, p: i64) {
+    if p < lv.start[v] {
+        lv.start[v] = p
+    }
+    if p > lv.end[v] {
+        lv.end[v] = p
+    }
+}
+
+fn fixed_overlap(lv: Live, r: i64, s: i64, e: i64) -> bool {
+    for k in 0..lv.fr_reg.len() {
+        if lv.fr_reg[k] == r and lv.fr_from[k] <= e and s <= lv.fr_to[k] {
+            return true
+        }
+    }
+    false
+}
+
+fn crosses_call(lv: Live, s: i64, e: i64) -> bool {
+    for p in lv.calls {
+        if s < p and p < e {
+            return true
+        }
+    }
+    false
+}
+
+// ----- the scan ----------------------------------------------------------------------
+
+/// Allocates every virtual register of `vc`. `max_regs` < 0 hands out every
+/// allocatable register; otherwise only that many, which forces spilling
+/// (the stress mode the `ra_check` gate runs). `corrupt` plants an
+/// allocation error for the checker to find.
+pub fn allocate(vc: VCode, max_regs: i64, corrupt: bool) -> Alloc ! str {
+    let lv = intervals(vc)
+    let nv = vc.nvregs
+    if nv >= 1048576 {
+        fail("{vc.sym}: too many virtual registers ({nv})")
+    }
+    var allowed: [bool] = []
+    for r in 0..32 {
+        allowed.push(max_regs < 0)
+    }
+    if max_regs >= 0 {
+        let so = stress_order()
+        for k in 0..so.len() {
+            if k < max_regs {
+                allowed[so[k]] = true
+            }
+        }
+    }
+    var cand_caller: [i64] = []
+    for r in caller_order() {
+        if allowed[r] {
+            cand_caller.push(r)
+        }
+    }
+    var cand_callee: [i64] = []
+    for r in callee_order() {
+        if allowed[r] {
+            cand_callee.push(r)
+        }
+    }
+    // Intervals by start, ties by number: deterministic.
+    var keys: [i64] = []
+    for v in 0..nv {
+        if lv.start[v] <= lv.end[v] {
+            keys.push((lv.start[v] + 1) * 1048576 + v)
+        }
+    }
+    keys.sort()
+    var loc: [i64] = []
+    for v in 0..nv {
+        loc.push(LOC_NONE)
+    }
+    var nspill = 0
+    var active: [i64] = []
+    for key in keys {
+        let v = key.bit_and(1048575)
+        let s = lv.start[v]
+        let e = lv.end[v]
+        // Expire what ended before this starts.
+        var still: [i64] = []
+        for w in active {
+            if lv.end[w] >= s {
+                still.push(w)
+            }
+        }
+        active = still
+        let across = crosses_call(lv, s, e)
+        var cands: [i64] = []
+        if not across {
+            for r in cand_caller {
+                cands.push(r)
+            }
+        }
+        for r in cand_callee {
+            cands.push(r)
+        }
+        var chosen = -1
+        for r in cands {
+            if chosen < 0 {
+                var busy = false
+                for w in active {
+                    if loc[w] == r {
+                        busy = true
+                    }
+                }
+                if not busy and not fixed_overlap(lv, r, s, e) {
+                    chosen = r
+                }
+            }
+        }
+        if chosen >= 0 {
+            loc[v] = chosen
+            active.push(v)
+            continue
+        }
+        // Nothing free: spill whichever of this and the intervals holding a
+        // register it could use ends last.
+        var victim = -1
+        for w in active {
+            let r = loc[w]
+            var usable = false
+            for c in cands {
+                if c == r {
+                    usable = true
+                }
+            }
+            if usable and not fixed_overlap(lv, r, s, e) {
+                if victim < 0 or lv.end[w] > lv.end[victim] {
+                    victim = w
+                }
+            }
+        }
+        if victim >= 0 and lv.end[victim] > e {
+            loc[v] = loc[victim]
+            loc[victim] = LOC_SPILL + nspill
+            nspill += 1
+            var kept: [i64] = []
+            for w in active {
+                if w != victim {
+                    kept.push(w)
+                }
+            }
+            kept.push(v)
+            active = kept
+        } else {
+            loc[v] = LOC_SPILL + nspill
+            nspill += 1
+        }
+    }
+    var corrupted = 0
+    if corrupt {
+        corrupted = plant(vc, loc)
+    }
+    rewrite(vc, loc, nspill, corrupted)
+}
+
+fn in_reg(loc: [i64], o: i64) -> bool {
+    mach.is_vreg(o) and loc[o - mach.VR] >= 0 and loc[o - mach.VR] < 31
+}
+
+/// The checker's control: makes the allocation wrong in a way no correct
+/// checker can miss, and answers 1 when it could. Two kinds of allocator bug,
+/// first found first:
+///
+///   * a missed interference -- an instruction reads two virtual registers
+///     held in two registers, and one is given the other's register for its
+///     whole life, so one of the two reads finds the wrong value;
+///   * a missed fixed register -- a call's second argument is given x0, which
+///     the move of the first argument has already filled.
+///
+/// A mere overlap of two intervals is not enough: an interval is a
+/// conservative hull, and two that overlap may never be live at once, in
+/// which case sharing a register is a correct allocation and the checker is
+/// right to accept it.
+fn plant(vc: VCode, inout loc: [i64]) -> i64 {
+    for i in 0..vc.mop.len() {
+        let us = uses_at(vc, i)
+        for p in 0..us.len() {
+            for q in 0..us.len() {
+                let v = us[p]
+                let w = us[q]
+                if v != w and in_reg(loc, v) and in_reg(loc, w) and loc[v - mach.VR] != loc[w - mach.VR] {
+                    loc[w - mach.VR] = loc[v - mach.VR]
+                    return 1
+                }
+            }
+        }
+    }
+    for i in 0..vc.mop.len() {
+        if vc.mop[i] == mach.A_BL and vc.imm2[i] >= 2 and i >= 2 {
+            // The argument moves just before it: `mov x0, a` ... `mov x1, b`.
+            var first = -1
+            var second = -1
+            for j in 0..i {
+                if vc.mop[j] == mach.A_MOV and vc.rd[j] == 0 {
+                    first = j
+                }
+                if vc.mop[j] == mach.A_MOV and vc.rd[j] == 1 {
+                    second = j
+                }
+            }
+            if first >= 0 and second > first and in_reg(loc, vc.rm[second]) and loc[vc.rm[second] - mach.VR] != 0 {
+                loc[vc.rm[second] - mach.VR] = 0
+                return 1
+            }
+        }
+    }
+    0
+}
+
+fn push_a(inout al: Alloc, m: i64, d: i64, n: i64, mm: i64, a: i64, imm: i64, kind: i64, slot: i64) -> i64 {
+    let i = al.mop.len()
+    al.mop.push(m)
+    al.rd.push(d)
+    al.rn.push(n)
+    al.rm.push(mm)
+    al.ra.push(a)
+    al.imm.push(imm)
+    al.imm2.push(0)
+    al.cc.push(-1)
+    al.tgt.push(-1)
+    al.symk.push(0)
+    al.sym_id.push(-1)
+    al.od.push(-1)
+    al.on.push(-1)
+    al.om.push(-1)
+    al.oa.push(-1)
+    al.kind.push(kind)
+    al.slot.push(slot)
+    i
+}
+
+/// The frame offset of spill slot `k`: above the `inout` slots.
+pub fn spill_offset(al: Alloc, k: i64) -> i64 {
+    8 * (al.nslots + k)
+}
+
+/// Rewrites every operand to its location, with reloads and spills around
+/// the instructions that touch a spilled register.
+fn rewrite(vc: VCode, loc: [i64], nspill: i64, corrupted: i64) -> Alloc ! str {
+    var al = Alloc{
+        mop: [], rd: [], rn: [], rm: [], ra: [], imm: [], imm2: [], cc: [], tgt: [],
+        symk: [], sym_id: [], od: [], on: [], om: [], oa: [], kind: [], slot: [],
+        bi0: [], bni: [], nparams: vc.nparams, nslots: vc.nslots, nspill: nspill, loc: loc,
+        used_callee: [], corrupted: corrupted,
+    }
+    for r in 0..32 {
+        al.used_callee.push(false)
+    }
+    for v in 0..loc.len() {
+        if loc[v] >= 0 and loc[v] < 31 and callee_saved(loc[v]) {
+            al.used_callee[loc[v]] = true
+        }
+    }
+    if 8 * (vc.nslots + nspill) > 32760 {
+        fail("{vc.sym}: the frame needs {vc.nslots + nspill} slots, more than one load can reach")
+    }
+    let nb = vcode.nblocks(vc)
+    for b in 0..nb {
+        al.bi0.push(al.mop.len())
+        for i in vc.bi0[b]..(vc.bi0[b] + vc.bni[b]) {
+            let m = vc.mop[i]
+            var ops = [vc.rd[i], vc.rn[i], vc.rm[i], vc.ra[i]]
+            let roles = [mach.role_d(m), mach.role_n(m), mach.role_m(m), mach.role_a(m)]
+            var phys = [-1, -1, -1, -1]
+            // Reads of spilled registers: reload each into a scratch.
+            var sv: [i64] = []
+            var sr: [i64] = []
+            for k in 0..4 {
+                let o = ops[k]
+                if o < 0 {
+                    continue
+                }
+                if not mach.is_vreg(o) {
+                    phys[k] = o
+                    continue
+                }
+                let l = loc[o - mach.VR]
+                if l == LOC_NONE {
+                    fail("{vc.sym}: v{o - mach.VR} has no location")
+                }
+                if l < LOC_SPILL {
+                    phys[k] = l
+                } else if roles[k] == mach.ROLE_USE or roles[k] == mach.ROLE_USEDEF {
+                    var sc = -1
+                    for q in 0..sv.len() {
+                        if sv[q] == o {
+                            sc = sr[q]
+                        }
+                    }
+                    if sc < 0 {
+                        sc = scratch(sv.len())
+                        sv.push(o)
+                        sr.push(sc)
+                        let rslot = l - LOC_SPILL
+                        let off = spill_offset(al, rslot)
+                        push_a(al, mach.A_LDR, sc, mach.R_SP, -1, -1, off, K_RELOAD, rslot)
+                    }
+                    phys[k] = sc
+                }
+            }
+            // Writes of spilled registers: into a scratch, stored after.
+            var after_reg: [i64] = []
+            var after_slot: [i64] = []
+            for k in 0..4 {
+                let o = ops[k]
+                if o < 0 or not mach.is_vreg(o) {
+                    continue
+                }
+                let l = loc[o - mach.VR]
+                if l < LOC_SPILL {
+                    continue
+                }
+                if roles[k] == mach.ROLE_DEF or roles[k] == mach.ROLE_USEDEF {
+                    var sc = phys[k]
+                    if sc < 0 {
+                        sc = scratch(sv.len() + after_reg.len())
+                    }
+                    phys[k] = sc
+                    after_reg.push(sc)
+                    after_slot.push(l - LOC_SPILL)
+                }
+            }
+            let x = push_a(al, m, phys[0], phys[1], phys[2], phys[3], vc.imm[i], K_ORIG, -1)
+            al.imm2[x] = vc.imm2[i]
+            al.cc[x] = vc.cc[i]
+            al.tgt[x] = vc.tgt[i]
+            al.symk[x] = vc.symk[i]
+            al.sym_id[x] = vc.sym_id[i]
+            al.od[x] = ops[0]
+            al.on[x] = ops[1]
+            al.om[x] = ops[2]
+            al.oa[x] = ops[3]
+            for q in 0..after_reg.len() {
+                let off = spill_offset(al, after_slot[q])
+                push_a(al, mach.A_STR, after_reg[q], mach.R_SP, -1, -1, off, K_SPILL, after_slot[q])
+            }
+        }
+        al.bni.push(al.mop.len() - al.bi0[b])
+    }
+    al
+}

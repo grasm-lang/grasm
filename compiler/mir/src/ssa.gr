@@ -1,0 +1,690 @@
+// From the variable form to SSA with block arguments.
+//
+// The construction is the textbook one in its plainest shape: compute which
+// variables are live into each block, give every block a parameter for each
+// of them, and rename. A variable read only in the block that wrote it never
+// becomes a parameter, so liveness is computed over the few variables that
+// cross a block boundary. That places parameters wherever a variable is live,
+// not only where two definitions meet, so the result is then cleaned the way
+// Braun et al. ("Simple and Efficient Construction of SSA Form", CC 2013)
+// remove trivial phis: a parameter every incoming edge passes the same value
+// for is that value. What remains is minimal for the reducible control flow
+// the subset produces.
+//
+// Then dead code goes, and every edge that passes arguments out of a block
+// with two successors gets a block of its own, so the moves that implement
+// the arguments have somewhere to live (`aarch64/isel.gr`).
+import ir
+import lower
+
+fn succs_of(v: Vir, b: i64) -> [i64] {
+    let k = v.btk[b]
+    if k == ir.M_JUMP {
+        [v.btt[b]]
+    } else if k == ir.M_BRIF {
+        [v.btt[b], v.btf[b]]
+    } else {
+        []
+    }
+}
+
+/// The variables an instruction reads.
+fn reads_of(v: Vir, i: i64) -> [i64] {
+    let op = v.op[i]
+    var out: [i64] = []
+    let n = ir.nreads(op)
+    if n >= 1 {
+        out.push(v.a[i])
+    }
+    if n >= 2 {
+        out.push(v.b[i])
+    }
+    if op == ir.M_CALL or op == ir.M_CALLRT {
+        for j in v.ca0[i]..(v.ca0[i] + v.can[i]) {
+            out.push(v.cargs[j])
+        }
+    }
+    out
+}
+
+fn term_reads(v: Vir, b: i64) -> [i64] {
+    let k = v.btk[b]
+    if (k == ir.M_BRIF or k == ir.M_RET) and v.btv[b] >= 0 {
+        [v.btv[b]]
+    } else {
+        []
+    }
+}
+
+/// Builds the SSA form of `v`.
+pub fn to_ssa(v: Vir, name: str, sym: str) -> MirFn ! str {
+    let nb_all = v.bstart.len()
+    // Blocks reachable from the entry, in the order they were filled.
+    var reach: [bool] = []
+    for b in 0..nb_all {
+        reach.push(false)
+    }
+    var work: [i64] = [0]
+    while not work.is_empty() {
+        let b = work.pop() ?? 0
+        if reach[b] {
+            continue
+        }
+        if v.btk[b] < 0 {
+            fail("block {b} of `{name}` is branched to but never finished")
+        }
+        reach[b] = true
+        for s in succs_of(v, b) {
+            work.push(s)
+        }
+    }
+    var order: [i64] = []
+    for b in 0..nb_all {
+        if reach[b] {
+            order.push(b)
+        }
+    }
+    // Stable insertion sort by where each block's code begins.
+    for i in 1..order.len() {
+        var j = i
+        while j > 0 and v.bstart[order[j - 1]] > v.bstart[order[j]] {
+            let tmp = order[j - 1]
+            order[j - 1] = order[j]
+            order[j] = tmp
+            j -= 1
+        }
+    }
+    let nb = order.len()
+    var newid: [i64] = []
+    for b in 0..nb_all {
+        newid.push(-1)
+    }
+    for i in 0..nb {
+        newid[order[i]] = i
+    }
+
+    // Which variables cross a block boundary.
+    let nv = v.nvars
+    var defstamp: [i64] = []
+    var global: [bool] = []
+    for x in 0..nv {
+        defstamp.push(-1)
+        global.push(false)
+    }
+    for x in 0..v.nparams {
+        defstamp[x] = 0
+    }
+    for nbi in 0..nb {
+        let b = order[nbi]
+        for i in v.bstart[b]..v.bend[b] {
+            for x in reads_of(v, i) {
+                if defstamp[x] != nbi {
+                    global[x] = true
+                }
+            }
+            if v.dst[i] >= 0 {
+                defstamp[v.dst[i]] = nbi
+            }
+        }
+        for x in term_reads(v, b) {
+            if defstamp[x] != nbi {
+                global[x] = true
+            }
+        }
+    }
+    var gidx: [i64] = []
+    var gvars: [i64] = []
+    for x in 0..nv {
+        if global[x] {
+            gidx.push(gvars.len())
+            gvars.push(x)
+        } else {
+            gidx.push(-1)
+        }
+    }
+    let ng = gvars.len()
+
+    // Liveness of those, per block.
+    var ue: [bool] = []
+    var df: [bool] = []
+    var lin: [bool] = []
+    for k in 0..(nb * ng) {
+        ue.push(false)
+        df.push(false)
+        lin.push(false)
+    }
+    for nbi in 0..nb {
+        let b = order[nbi]
+        let base = nbi * ng
+        if nbi == 0 {
+            for x in 0..v.nparams {
+                if gidx[x] >= 0 {
+                    df[base + gidx[x]] = true
+                }
+            }
+        }
+        for i in v.bstart[b]..v.bend[b] {
+            for x in reads_of(v, i) {
+                let g = gidx[x]
+                if g >= 0 and not df[base + g] {
+                    ue[base + g] = true
+                }
+            }
+            let d = v.dst[i]
+            if d >= 0 and gidx[d] >= 0 {
+                df[base + gidx[d]] = true
+            }
+        }
+        for x in term_reads(v, b) {
+            let g = gidx[x]
+            if g >= 0 and not df[base + g] {
+                ue[base + g] = true
+            }
+        }
+    }
+    var nsucc: [[i64]] = []
+    for nbi in 0..nb {
+        var ss: [i64] = []
+        for s in succs_of(v, order[nbi]) {
+            ss.push(newid[s])
+        }
+        nsucc.push(ss)
+    }
+    var changed = true
+    while changed {
+        changed = false
+        var nbi = nb - 1
+        while nbi >= 0 {
+            let base = nbi * ng
+            for g in 0..ng {
+                var out = false
+                for s in nsucc[nbi] {
+                    if lin[s * ng + g] {
+                        out = true
+                    }
+                }
+                let now = ue[base + g] or (out and not df[base + g])
+                if now != lin[base + g] {
+                    lin[base + g] = now
+                    changed = true
+                }
+            }
+            nbi -= 1
+        }
+    }
+
+    // Each block's parameters: the global variables live into it. The
+    // entry's are the function's own; a variable live into the entry that is
+    // not a parameter is read before any assignment on some path, and starts
+    // at zero.
+    var pvars: [[i64]] = []
+    var zero_init: [i64] = []
+    for nbi in 0..nb {
+        var ps: [i64] = []
+        if nbi == 0 {
+            for x in 0..v.nparams {
+                ps.push(x)
+            }
+            for g in 0..ng {
+                if lin[g] and gvars[g] >= v.nparams {
+                    zero_init.push(gvars[g])
+                }
+            }
+        } else {
+            for g in 0..ng {
+                if lin[nbi * ng + g] {
+                    ps.push(gvars[g])
+                }
+            }
+        }
+        pvars.push(ps)
+    }
+
+    // Rename.
+    var f = ir.new_fn(name, sym)
+    f.nparams = v.nparams
+    f.returns = v.returns
+    f.nslots = v.nslots
+    f.floor = v.floor >= 0
+    var cur: [i64] = []
+    var stamp: [i64] = []
+    for x in 0..nv {
+        cur.push(-1)
+        stamp.push(-1)
+    }
+    var nvals = 0
+    for nbi in 0..nb {
+        let b = order[nbi]
+        f.bp0.push(f.bparams.len())
+        f.bnp.push(pvars[nbi].len())
+        for x in pvars[nbi] {
+            f.bparams.push(nvals)
+            cur[x] = nvals
+            stamp[x] = nbi
+            nvals += 1
+        }
+        f.bi0.push(f.op.len())
+        if nbi == 0 {
+            for x in zero_init {
+                f.op.push(ir.M_ICONST)
+                f.res.push(nvals)
+                f.a.push(-1)
+                f.b.push(-1)
+                f.imm.push(0)
+                f.ca0.push(f.cargs.len())
+                f.can.push(0)
+                cur[x] = nvals
+                stamp[x] = 0
+                nvals += 1
+            }
+        }
+        for i in v.bstart[b]..v.bend[b] {
+            let op = v.op[i]
+            var ra = -1
+            var rb = -1
+            let n = ir.nreads(op)
+            if n >= 1 {
+                let x = v.a[i]
+                if stamp[x] != nbi {
+                    fail("`{name}`: variable {x} is read in block {nbi} where it has no value")
+                }
+                ra = cur[x]
+            }
+            if n >= 2 {
+                let x = v.b[i]
+                if stamp[x] != nbi {
+                    fail("`{name}`: variable {x} is read in block {nbi} where it has no value")
+                }
+                rb = cur[x]
+            }
+            if op == ir.M_COPY {
+                cur[v.dst[i]] = ra
+                stamp[v.dst[i]] = nbi
+                continue
+            }
+            let ca0 = f.cargs.len()
+            if op == ir.M_CALL or op == ir.M_CALLRT {
+                for j in v.ca0[i]..(v.ca0[i] + v.can[i]) {
+                    let x = v.cargs[j]
+                    if stamp[x] != nbi {
+                        fail("`{name}`: variable {x} is read in block {nbi} where it has no value")
+                    }
+                    f.cargs.push(cur[x])
+                }
+            }
+            var res = -1
+            if v.dst[i] >= 0 {
+                res = nvals
+                nvals += 1
+                cur[v.dst[i]] = res
+                stamp[v.dst[i]] = nbi
+            }
+            f.op.push(op)
+            f.res.push(res)
+            f.a.push(ra)
+            f.b.push(rb)
+            f.imm.push(v.imm[i])
+            f.ca0.push(ca0)
+            f.can.push(f.cargs.len() - ca0)
+        }
+        f.bni.push(f.op.len() - f.bi0[nbi])
+        let k = v.btk[b]
+        f.tk.push(k)
+        var tv = -1
+        if (k == ir.M_BRIF or k == ir.M_RET) and v.btv[b] >= 0 {
+            let x = v.btv[b]
+            if stamp[x] != nbi {
+                fail("`{name}`: variable {x} is read in block {nbi} where it has no value")
+            }
+            tv = cur[x]
+        }
+        f.tv.push(tv)
+        var tt = -1
+        var tf = -1
+        f.ta0.push(f.targs.len())
+        if k == ir.M_JUMP or k == ir.M_BRIF {
+            tt = newid[v.btt[b]]
+            for x in pvars[tt] {
+                if stamp[x] != nbi {
+                    fail("`{name}`: variable {x} is live into block {tt} but has no value at the end of block {nbi}")
+                }
+                f.targs.push(cur[x])
+            }
+        }
+        f.tan.push(f.targs.len() - f.ta0[nbi])
+        f.fa0.push(f.targs.len())
+        if k == ir.M_BRIF {
+            tf = newid[v.btf[b]]
+            for x in pvars[tf] {
+                if stamp[x] != nbi {
+                    fail("`{name}`: variable {x} is live into block {tf} but has no value at the end of block {nbi}")
+                }
+                f.targs.push(cur[x])
+            }
+        }
+        f.fan.push(f.targs.len() - f.fa0[nbi])
+        f.tt.push(tt)
+        f.tf.push(tf)
+    }
+    f.nvals = nvals
+    remove_trivial_params(f)
+    remove_dead(f)
+    split_edges(f)
+    f
+}
+
+fn find(repl: [i64], x: i64) -> i64 {
+    var y = x
+    while repl[y] != y {
+        y = repl[y]
+    }
+    y
+}
+
+/// A block parameter that every incoming edge passes the same value for
+/// (or itself, round a loop) is that value.
+fn remove_trivial_params(inout f: MirFn) {
+    let nb = ir.nblocks(f)
+    var repl: [i64] = []
+    var gone: [bool] = []
+    for x in 0..f.nvals {
+        repl.push(x)
+        gone.push(false)
+    }
+    var changed = true
+    while changed {
+        changed = false
+        for b in 1..nb {
+            for k in 0..f.bnp[b] {
+                let p = f.bparams[f.bp0[b] + k]
+                if gone[p] {
+                    continue
+                }
+                var same = -1
+                var trivial = true
+                for pb in 0..nb {
+                    if f.tk[pb] == ir.M_JUMP or f.tk[pb] == ir.M_BRIF {
+                        if f.tt[pb] == b {
+                            let a = find(repl, f.targs[f.ta0[pb] + k])
+                            if a != p {
+                                if same < 0 {
+                                    same = a
+                                } else if same != a {
+                                    trivial = false
+                                }
+                            }
+                        }
+                    }
+                    if f.tk[pb] == ir.M_BRIF and f.tf[pb] == b {
+                        let a = find(repl, f.targs[f.fa0[pb] + k])
+                        if a != p {
+                            if same < 0 {
+                                same = a
+                            } else if same != a {
+                                trivial = false
+                            }
+                        }
+                    }
+                }
+                if trivial and same >= 0 {
+                    repl[p] = same
+                    gone[p] = true
+                    changed = true
+                }
+            }
+        }
+    }
+    rebuild(f, repl, gone)
+}
+
+/// Rewrites every operand through `repl` and drops the parameters in
+/// `gone`, with the arguments every edge passed for them.
+fn rebuild(inout f: MirFn, repl: [i64], gone: [bool]) {
+    let nb = ir.nblocks(f)
+    for i in 0..f.op.len() {
+        if f.a[i] >= 0 {
+            f.a[i] = find(repl, f.a[i])
+        }
+        if f.b[i] >= 0 {
+            f.b[i] = find(repl, f.b[i])
+        }
+    }
+    for j in 0..f.cargs.len() {
+        f.cargs[j] = find(repl, f.cargs[j])
+    }
+    for b in 0..nb {
+        if f.tv[b] >= 0 {
+            f.tv[b] = find(repl, f.tv[b])
+        }
+    }
+    // Which parameter positions survive, per block.
+    var keep: [bool] = []
+    for j in 0..f.bparams.len() {
+        keep.push(not gone[f.bparams[j]])
+    }
+    var bparams: [i64] = []
+    var bp0: [i64] = []
+    var bnp: [i64] = []
+    for b in 0..nb {
+        bp0.push(bparams.len())
+        for k in 0..f.bnp[b] {
+            if keep[f.bp0[b] + k] {
+                bparams.push(f.bparams[f.bp0[b] + k])
+            }
+        }
+        bnp.push(bparams.len() - bp0[b])
+    }
+    var targs: [i64] = []
+    var ta0: [i64] = []
+    var tan: [i64] = []
+    var fa0: [i64] = []
+    var fan: [i64] = []
+    for b in 0..nb {
+        ta0.push(targs.len())
+        if f.tk[b] == ir.M_JUMP or f.tk[b] == ir.M_BRIF {
+            let s = f.tt[b]
+            for k in 0..f.tan[b] {
+                if keep[f.bp0[s] + k] {
+                    targs.push(find(repl, f.targs[f.ta0[b] + k]))
+                }
+            }
+        }
+        tan.push(targs.len() - ta0[b])
+        fa0.push(targs.len())
+        if f.tk[b] == ir.M_BRIF {
+            let s = f.tf[b]
+            for k in 0..f.fan[b] {
+                if keep[f.bp0[s] + k] {
+                    targs.push(find(repl, f.targs[f.fa0[b] + k]))
+                }
+            }
+        }
+        fan.push(targs.len() - fa0[b])
+    }
+    f.bparams = bparams
+    f.bp0 = bp0
+    f.bnp = bnp
+    f.targs = targs
+    f.ta0 = ta0
+    f.tan = tan
+    f.fa0 = fa0
+    f.fan = fan
+}
+
+/// Drops instructions whose results nothing needs, and block parameters
+/// nothing reads (with the arguments passed for them).
+fn remove_dead(inout f: MirFn) {
+    let nb = ir.nblocks(f)
+    let nv = f.nvals
+    var def_inst: [i64] = []
+    var def_blk: [i64] = []
+    var def_pos: [i64] = []
+    var used: [bool] = []
+    for x in 0..nv {
+        def_inst.push(-1)
+        def_blk.push(-1)
+        def_pos.push(-1)
+        used.push(false)
+    }
+    for i in 0..f.op.len() {
+        if f.res[i] >= 0 {
+            def_inst[f.res[i]] = i
+        }
+    }
+    for b in 0..nb {
+        for k in 0..f.bnp[b] {
+            let p = f.bparams[f.bp0[b] + k]
+            def_blk[p] = b
+            def_pos[p] = k
+        }
+    }
+    var work: [i64] = []
+    for i in 0..f.op.len() {
+        if not ir.pure_op(f.op[i]) {
+            if f.a[i] >= 0 {
+                work.push(f.a[i])
+            }
+            if f.b[i] >= 0 {
+                work.push(f.b[i])
+            }
+            for j in f.ca0[i]..(f.ca0[i] + f.can[i]) {
+                work.push(f.cargs[j])
+            }
+        }
+    }
+    for b in 0..nb {
+        if f.tv[b] >= 0 {
+            work.push(f.tv[b])
+        }
+    }
+    // The entry's parameters are the function's: always kept.
+    for k in 0..f.bnp[0] {
+        work.push(f.bparams[f.bp0[0] + k])
+    }
+    while not work.is_empty() {
+        let x = work.pop() ?? 0
+        if used[x] {
+            continue
+        }
+        used[x] = true
+        let i = def_inst[x]
+        if i >= 0 {
+            if f.a[i] >= 0 {
+                work.push(f.a[i])
+            }
+            if f.b[i] >= 0 {
+                work.push(f.b[i])
+            }
+            for j in f.ca0[i]..(f.ca0[i] + f.can[i]) {
+                work.push(f.cargs[j])
+            }
+        } else if def_blk[x] >= 0 {
+            let b = def_blk[x]
+            let k = def_pos[x]
+            for pb in 0..nb {
+                if (f.tk[pb] == ir.M_JUMP or f.tk[pb] == ir.M_BRIF) and f.tt[pb] == b {
+                    work.push(f.targs[f.ta0[pb] + k])
+                }
+                if f.tk[pb] == ir.M_BRIF and f.tf[pb] == b {
+                    work.push(f.targs[f.fa0[pb] + k])
+                }
+            }
+        }
+    }
+    // Unused parameters go the way trivial ones did.
+    var repl: [i64] = []
+    var gone: [bool] = []
+    for x in 0..nv {
+        repl.push(x)
+        gone.push(false)
+    }
+    for b in 1..nb {
+        for k in 0..f.bnp[b] {
+            let p = f.bparams[f.bp0[b] + k]
+            if not used[p] {
+                gone[p] = true
+            }
+        }
+    }
+    rebuild(f, repl, gone)
+    // Then the instructions, block by block, keeping each block's run
+    // contiguous.
+    var op: [i64] = []
+    var res: [i64] = []
+    var a: [i64] = []
+    var bb: [i64] = []
+    var imm: [i64] = []
+    var ca0: [i64] = []
+    var can: [i64] = []
+    var bi0: [i64] = []
+    var bni: [i64] = []
+    for b in 0..nb {
+        bi0.push(op.len())
+        for i in f.bi0[b]..(f.bi0[b] + f.bni[b]) {
+            if ir.pure_op(f.op[i]) and (f.res[i] < 0 or not used[f.res[i]]) {
+                continue
+            }
+            op.push(f.op[i])
+            res.push(f.res[i])
+            a.push(f.a[i])
+            bb.push(f.b[i])
+            imm.push(f.imm[i])
+            ca0.push(f.ca0[i])
+            can.push(f.can[i])
+        }
+        bni.push(op.len() - bi0[b])
+    }
+    f.op = op
+    f.res = res
+    f.a = a
+    f.b = bb
+    f.imm = imm
+    f.ca0 = ca0
+    f.can = can
+    f.bi0 = bi0
+    f.bni = bni
+}
+
+fn add_jump_block(inout f: MirFn, target: i64, a0: i64, n: i64) -> i64 {
+    let id = ir.nblocks(f)
+    f.bp0.push(f.bparams.len())
+    f.bnp.push(0)
+    f.bi0.push(f.op.len())
+    f.bni.push(0)
+    f.tk.push(ir.M_JUMP)
+    f.tv.push(-1)
+    f.tt.push(target)
+    f.tf.push(-1)
+    let start = f.targs.len()
+    for k in 0..n {
+        let x = f.targs[a0 + k]
+        f.targs.push(x)
+    }
+    f.ta0.push(start)
+    f.tan.push(n)
+    f.fa0.push(f.targs.len())
+    f.fan.push(0)
+    id
+}
+
+/// An edge that passes arguments out of a block with two successors gets a
+/// block of its own: the moves that pass them cannot go at the end of the
+/// source, where they would run on the other edge too.
+fn split_edges(inout f: MirFn) {
+    let nb = ir.nblocks(f)
+    for b in 0..nb {
+        if f.tk[b] != ir.M_BRIF {
+            continue
+        }
+        if f.tan[b] > 0 {
+            let nbk = add_jump_block(f, f.tt[b], f.ta0[b], f.tan[b])
+            f.tt[b] = nbk
+            f.tan[b] = 0
+        }
+        if f.fan[b] > 0 {
+            let nbk = add_jump_block(f, f.tf[b], f.fa0[b], f.fan[b])
+            f.tf[b] = nbk
+            f.fan[b] = 0
+        }
+    }
+}

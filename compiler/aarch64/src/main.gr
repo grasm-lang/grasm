@@ -1,0 +1,102 @@
+// `aarch64`: MIR in, AArch64 machine code out (docs/self-hosting.md, S3).
+//
+//     rules.gr     instruction selection, as data, and the table's checker
+//     isel.gr      MIR to VCode by those rules, plus the calling convention
+//     vcode.gr     machine instructions over virtual registers
+//     regalloc.gr  linear-scan allocation
+//     check.gr     the symbolic checker every allocation must pass
+//     emit.gr      frame, branches, relocations, bytes
+//     mach.gr      the instructions: roles, encodings, assembly text
+//     enctest.gr   the encoder's test cases
+import mach
+import rules
+import vcode
+import isel
+import regalloc
+import check
+import emit
+import enctest
+import mir.ir
+
+type A64Opts = {
+    /// Registers the allocator may hand out; negative for all of them.
+    max_regs: i64,
+    /// Plant an allocation error, so the checker can be seen to catch it.
+    corrupt: bool,
+    want_asm: bool,
+}
+
+pub fn default_opts() -> A64Opts {
+    A64Opts{ max_regs: -1, corrupt: false, want_asm: false }
+}
+
+/// What compiling one function produced.
+type A64Result = {
+    code: A64Code,
+    /// The allocation checker's findings: empty, or the build fails.
+    ra_errors: [str],
+    corrupted: i64,
+    vcode_text: str,
+}
+
+fn rt_names() -> [str] {
+    var out: [str] = []
+    for k in 0..ir.RT_COUNT {
+        out.push(ir.rt_name(k))
+    }
+    out
+}
+
+/// Selects, allocates, checks and encodes one function.
+pub fn compile_fn(f: MirFn, rs: [Rule], ccm: [i64], opts: A64Opts, callee_sym: [str]) -> A64Result ! str {
+    let vc = try isel.select(f, rs, ccm)
+    let al = try regalloc.allocate(vc, opts.max_regs, opts.corrupt)
+    let errs = check.check(al)
+    var vtext = ""
+    if opts.want_asm {
+        vtext = vcode.print_vcode(vc)
+    }
+    let code = try emit.emit(al, f.sym, opts.want_asm, callee_sym, rt_names())
+    A64Result{ code: code, ra_errors: errs, corrupted: al.corrupted, vcode_text: vtext }
+}
+
+pub fn rule_table() -> [Rule] {
+    rules.rules()
+}
+
+pub fn cond_map() -> [i64] {
+    rules.cc_map()
+}
+
+/// Everything wrong with the rule table, or nothing.
+pub fn check_rules() -> [str] {
+    rules.check(rules.rules())
+}
+
+/// Every instruction form compiled code can contain: what the rules emit,
+/// and what the calling convention, the allocator and the frame add.
+pub fn emittable_forms() -> [str] {
+    var seen: [bool] = []
+    for m in 0..64 {
+        seen.push(false)
+    }
+    for m in rules.rule_mops(rules.rules()) {
+        seen[m] = true
+    }
+    // Calls and their argument moves; spills and reloads; the prologue,
+    // the epilogue and frame adjustment; branches as emission rewrites them.
+    for m in [mach.A_MOV, mach.A_BL, mach.A_LDR, mach.A_STR, mach.A_PACIBSP, mach.A_STP_PRE, mach.A_LDP_POST, mach.A_ADDI, mach.A_SUBI, mach.A_RETAB, mach.A_B, mach.A_BCOND, mach.A_CBZ, mach.A_CBNZ] {
+        seen[m] = true
+    }
+    var out: [str] = []
+    for m in 0..64 {
+        if seen[m] {
+            out.push(mach.form_name(m))
+        }
+    }
+    out
+}
+
+pub fn encode_cases() -> EncCases ! str {
+    enctest.cases()
+}

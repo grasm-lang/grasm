@@ -1,0 +1,489 @@
+// Instruction selection: MIR to VCode, by the rules in `rules.gr`.
+//
+// Each MIR value becomes the virtual register of the same number. For every
+// instruction the first rule whose guard holds is chosen, then the chosen
+// templates are expanded; an instruction whose every use was absorbed into
+// another's encoding -- a constant used only as an immediate, a comparison
+// folded into its branch -- is not emitted at all.
+//
+// The calling convention is not in the table, because it is not a choice:
+// arguments go in x0..x7 and the result comes back in x0 (AAPCS64), so a call
+// is moves into those registers, the `bl`, and a move out. Block arguments
+// become moves at the end of the jumping block, sequenced so that no move
+// overwrites a value another still has to read.
+import mach
+import rules
+import vcode
+import mir.ir
+
+type Sel = {
+    def_inst: [i64],
+    uses: [i64],
+    ruses: [i64],
+    rule_of: [i64],
+    term_rule: [i64],
+    inner: [i64],
+    absorbed: [bool],
+}
+
+fn const_of(f: MirFn, s: Sel, v: i64) -> (bool, i64) {
+    if v < 0 {
+        return (false, 0)
+    }
+    let i = s.def_inst[v]
+    if i >= 0 and f.op[i] == ir.M_ICONST {
+        return (true, f.imm[i])
+    }
+    (false, 0)
+}
+
+fn b_guard(g: i64, k: i64) -> bool {
+    if g == rules.G_B_UIMM12 {
+        k >= 0 and k <= 4095
+    } else if g == rules.G_B_UIMM12_HI {
+        k > 4095 and k.bit_and(4095) == 0 and k.shr(12) <= 4095
+    } else if g == rules.G_B_NIMM12 {
+        k >= -4095 and k <= -1
+    } else {
+        false
+    }
+}
+
+/// Whether guard `g` holds for instruction `i` (or, with `i` < 0, for the
+/// terminator of block `b`, whose candidate comparison is `j`).
+fn guard_holds(f: MirFn, s: Sel, g: i64, i: i64, j: i64) -> bool {
+    if g == rules.G_ANY {
+        return true
+    }
+    if g == rules.G_B_UIMM12 or g == rules.G_B_UIMM12_HI or g == rules.G_B_NIMM12 {
+        if i < 0 or ir.nreads(f.op[i]) != 2 {
+            return false
+        }
+        let (isk, k) = const_of(f, s, f.b[i])
+        return isk and b_guard(g, k)
+    }
+    // The fusing guards: `j` is a comparison only this branch reads.
+    if j < 0 {
+        return false
+    }
+    if g == rules.G_FUSE {
+        return true
+    }
+    let (isk, k) = const_of(f, s, f.b[j])
+    if g == rules.G_FUSE_IMM {
+        return isk and k >= 0 and k <= 4095
+    }
+    if g == rules.G_FUSE_NIMM {
+        return isk and k >= -4095 and k <= -1
+    }
+    if g == rules.G_FUSE_ZERO_EQ {
+        return isk and k == 0 and f.imm[j] == ir.CC_EQ
+    }
+    if g == rules.G_FUSE_ZERO_NE {
+        return isk and k == 0 and f.imm[j] == ir.CC_NE
+    }
+    false
+}
+
+fn choose(f: MirFn, s: Sel, rs: [Rule], op: i64, i: i64, j: i64) -> i64 {
+    for k in 0..rs.len() {
+        if rs[k].op == op and guard_holds(f, s, rs[k].guard, i, j) {
+            return k
+        }
+    }
+    -1
+}
+
+fn bump(inout s: Sel, v: i64) {
+    if v >= 0 {
+        s.ruses[v] += 1
+    }
+}
+
+/// Counts the register reads a chosen rule makes.
+fn count_rule(f: MirFn, inout s: Sel, ru: Rule, a: i64, b: i64, ia: i64, ib: i64) {
+    for tm in ru.emit {
+        for sel in [tm.d, tm.n, tm.m, tm.a] {
+            if sel == rules.S_A {
+                bump(s, a)
+            } else if sel == rules.S_B {
+                bump(s, b)
+            } else if sel == rules.S_IA {
+                bump(s, ia)
+            } else if sel == rules.S_IB {
+                bump(s, ib)
+            }
+        }
+    }
+}
+
+/// Chooses a rule for every instruction and terminator, and counts what is
+/// left to read in registers.
+fn plan(f: MirFn, rs: [Rule]) -> Sel ! str {
+    let nv = f.nvals
+    var s = Sel{ def_inst: [], uses: [], ruses: [], rule_of: [], term_rule: [], inner: [], absorbed: [] }
+    for v in 0..nv {
+        s.def_inst.push(-1)
+        s.uses.push(0)
+        s.ruses.push(0)
+    }
+    for i in 0..f.op.len() {
+        if f.res[i] >= 0 {
+            s.def_inst[f.res[i]] = i
+        }
+        let n = ir.nreads(f.op[i])
+        if n >= 1 {
+            s.uses[f.a[i]] += 1
+        }
+        if n >= 2 {
+            s.uses[f.b[i]] += 1
+        }
+        for j in f.ca0[i]..(f.ca0[i] + f.can[i]) {
+            s.uses[f.cargs[j]] += 1
+        }
+        s.rule_of.push(-1)
+        s.absorbed.push(false)
+    }
+    let nb = ir.nblocks(f)
+    for b in 0..nb {
+        if f.tv[b] >= 0 {
+            s.uses[f.tv[b]] += 1
+        }
+        for j in f.ta0[b]..(f.ta0[b] + f.tan[b]) {
+            s.uses[f.targs[j]] += 1
+        }
+        for j in f.fa0[b]..(f.fa0[b] + f.fan[b]) {
+            s.uses[f.targs[j]] += 1
+        }
+    }
+    for b in 0..nb {
+        // The terminator first: it may absorb a comparison.
+        let k = f.tk[b]
+        var tr = -1
+        var j = -1
+        if k == ir.M_BRIF {
+            let c = f.tv[b]
+            let d = s.def_inst[c]
+            if d >= f.bi0[b] and d < f.bi0[b] + f.bni[b] and f.op[d] == ir.M_ICMP and s.uses[c] == 1 {
+                j = d
+            }
+            tr = choose(f, s, rs, ir.M_BRIF, -1, j)
+            if tr >= 0 and rules.guard_fuses(rs[tr].guard) {
+                s.absorbed[j] = true
+            } else {
+                j = -1
+            }
+        } else if k == ir.M_JUMP or k == ir.M_TRAP {
+            tr = choose(f, s, rs, k, -1, -1)
+        }
+        if (k == ir.M_BRIF or k == ir.M_JUMP or k == ir.M_TRAP) and tr < 0 {
+            fail("no rule selects `{ir.op_name(k)}`")
+        }
+        s.term_rule.push(tr)
+        s.inner.push(j)
+        for i in f.bi0[b]..(f.bi0[b] + f.bni[b]) {
+            let op = f.op[i]
+            if op == ir.M_CALL or op == ir.M_CALLRT {
+                continue
+            }
+            let ri = choose(f, s, rs, op, i, -1)
+            if ri < 0 {
+                fail("no rule selects `{ir.op_name(op)}`")
+            }
+            s.rule_of[i] = ri
+        }
+    }
+    // Register reads: from every instruction that will be emitted.
+    for i in 0..f.op.len() {
+        if s.absorbed[i] {
+            continue
+        }
+        let op = f.op[i]
+        if op == ir.M_CALL or op == ir.M_CALLRT {
+            for j in f.ca0[i]..(f.ca0[i] + f.can[i]) {
+                bump(s, f.cargs[j])
+            }
+        } else {
+            count_rule(f, s, rs[s.rule_of[i]], f.a[i], f.b[i], -1, -1)
+        }
+    }
+    for b in 0..nb {
+        let k = f.tk[b]
+        if k == ir.M_RET {
+            bump(s, f.tv[b])
+        } else if k == ir.M_BRIF {
+            let j = s.inner[b]
+            var ia = -1
+            var ib = -1
+            if j >= 0 {
+                ia = f.a[j]
+                ib = f.b[j]
+            }
+            count_rule(f, s, rs[s.term_rule[b]], f.tv[b], -1, ia, ib)
+        }
+        for j in f.ta0[b]..(f.ta0[b] + f.tan[b]) {
+            bump(s, f.targs[j])
+        }
+        for j in f.fa0[b]..(f.fa0[b] + f.fan[b]) {
+            bump(s, f.targs[j])
+        }
+    }
+    // A pure instruction nobody reads in a register is not emitted, and
+    // stops counting as a reader of its own operands. Repeat to a fixpoint,
+    // walking backwards so a chain goes in one pass.
+    var changed = true
+    while changed {
+        changed = false
+        var i = f.op.len() - 1
+        while i >= 0 {
+            if not s.absorbed[i] and ir.pure_op(f.op[i]) and f.res[i] >= 0 and s.ruses[f.res[i]] == 0 {
+                s.absorbed[i] = true
+                changed = true
+                let ru = rs[s.rule_of[i]]
+                for tm in ru.emit {
+                    for sel in [tm.d, tm.n, tm.m, tm.a] {
+                        if sel == rules.S_A and f.a[i] >= 0 {
+                            s.ruses[f.a[i]] -= 1
+                        } else if sel == rules.S_B and f.b[i] >= 0 {
+                            s.ruses[f.b[i]] -= 1
+                        }
+                    }
+                }
+            }
+            i -= 1
+        }
+    }
+    s
+}
+
+fn vr(v: i64) -> i64 {
+    if v < 0 { -1 } else { mach.VR + v }
+}
+
+fn sel_reg(sel: i64, res: i64, a: i64, b: i64, t0: i64, ia: i64, ib: i64) -> i64 {
+    match sel {
+        1 -> vr(res)
+        2 -> vr(a)
+        3 -> vr(b)
+        4 -> t0
+        5 -> mach.R_ZR
+        6 -> mach.R_SP
+        7 -> vr(ia)
+        8 -> vr(ib)
+        _ -> -1
+    }
+}
+
+/// Expands one rule application. `i` is the instruction (-1 for a
+/// terminator), `j` the comparison a branch absorbed, `tt`/`tf` the branch
+/// targets.
+fn expand(inout vc: VCode, f: MirFn, s: Sel, ru: Rule, ccm: [i64], i: i64, j: i64, tt: i64, tf: i64, cond: i64) -> () ! str {
+    var res = -1
+    var a = -1
+    var b = -1
+    var own_imm = 0
+    if i >= 0 {
+        res = f.res[i]
+        a = f.a[i]
+        b = f.b[i]
+        own_imm = f.imm[i]
+    } else {
+        a = cond
+    }
+    var ia = -1
+    var ib = -1
+    if j >= 0 {
+        ia = f.a[j]
+        ib = f.b[j]
+    }
+    var t0 = -1
+    for tm in ru.emit {
+        if t0 < 0 and (tm.d == rules.S_T0 or tm.n == rules.S_T0 or tm.m == rules.S_T0 or tm.a == rules.S_T0) {
+            t0 = vcode.new_vreg(vc)
+        }
+    }
+    for tm in ru.emit {
+        let d = sel_reg(tm.d, res, a, b, t0, ia, ib)
+        let n = sel_reg(tm.n, res, a, b, t0, ia, ib)
+        let m = sel_reg(tm.m, res, a, b, t0, ia, ib)
+        let ra = sel_reg(tm.a, res, a, b, t0, ia, ib)
+        var imms: [i64] = []
+        for k in [tm.imm, tm.imm2] {
+            if k >= 0 {
+                imms.push(k)
+            } else if k == rules.K_B or k == rules.K_NB or k == rules.K_B_HI {
+                let (isk, c) = const_of(f, s, b)
+                if not isk {
+                    fail("a rule took operand b as an immediate, and it is not a constant")
+                }
+                imms.push(if k == rules.K_B { c } else if k == rules.K_NB { 0 - c } else { c.shr(12) })
+            } else if k == rules.K_IB or k == rules.K_NIB {
+                let (isk, c) = const_of(f, s, ib)
+                if not isk {
+                    fail("a rule took the comparison's b as an immediate, and it is not a constant")
+                }
+                imms.push(if k == rules.K_IB { c } else { 0 - c })
+            } else if k == rules.K_IMM {
+                imms.push(own_imm)
+            } else if k == rules.K_SLOT {
+                if own_imm * 8 > 4095 {
+                    fail("frame slot {own_imm} is out of reach of an immediate")
+                }
+                imms.push(own_imm * 8)
+            } else {
+                fail("unknown immediate selector {k}")
+            }
+        }
+        if tm.mop == mach.P_MOVIMM {
+            let seq = mach.movimm_seq(imms[0])
+            var q = 0
+            while q < seq.len() {
+                let x = vcode.push(vc, seq[q], d, -1, -1)
+                vc.imm[x] = seq[q + 1]
+                vc.imm2[x] = seq[q + 2]
+                q += 3
+            }
+            continue
+        }
+        let x = vcode.push(vc, tm.mop, d, n, m)
+        vc.ra[x] = ra
+        vc.imm[x] = imms[0]
+        vc.imm2[x] = imms[1]
+        if tm.cc == rules.CC_OWN {
+            vc.cc[x] = ccm[own_imm]
+        } else if tm.cc == rules.CC_INNER {
+            vc.cc[x] = ccm[f.imm[j]]
+        }
+        if tm.tgt == rules.T_THEN {
+            vc.tgt[x] = tt
+        } else if tm.tgt == rules.T_ELSE {
+            vc.tgt[x] = tf
+        }
+        if tm.sym == rules.Y_STR {
+            vc.symk[x] = vcode.SYM_STR
+            vc.sym_id[x] = own_imm
+        }
+    }
+    ()
+}
+
+fn mov(inout vc: VCode, d: i64, src: i64) {
+    vcode.push(vc, mach.A_MOV, d, -1, src)
+}
+
+/// Moves that happen at once: each `dsts[k]` gets the value `srcs[k]` had
+/// before any of them. Emitted one at a time, a destination is written only
+/// once nothing still to come reads it; a cycle is broken through a fresh
+/// register.
+fn par_moves(inout vc: VCode, dsts: [i64], srcs: [i64]) {
+    var pd: [i64] = []
+    var ps: [i64] = []
+    for k in 0..dsts.len() {
+        if dsts[k] != srcs[k] {
+            pd.push(dsts[k])
+            ps.push(srcs[k])
+        }
+    }
+    while pd.len() > 0 {
+        var done = -1
+        for k in 0..pd.len() {
+            if done < 0 {
+                var read_later = false
+                for q in 0..ps.len() {
+                    if q != k and ps[q] == pd[k] {
+                        read_later = true
+                    }
+                }
+                if not read_later {
+                    done = k
+                }
+            }
+        }
+        if done >= 0 {
+            mov(vc, pd[done], ps[done])
+            pd.remove(done)
+            ps.remove(done)
+        } else {
+            // A cycle: keep the first destination's value, then it is free.
+            let keep = pd[0]
+            let t = vcode.new_vreg(vc)
+            mov(vc, t, keep)
+            for q in 0..ps.len() {
+                if ps[q] == keep {
+                    ps[q] = t
+                }
+            }
+        }
+    }
+}
+
+/// Selects machine instructions for a whole function.
+pub fn select(f: MirFn, rs: [Rule], ccm: [i64]) -> VCode ! str {
+    let s = try plan(f, rs)
+    var vc = vcode.new_vcode(f.sym)
+    vc.nvregs = f.nvals
+    vc.nparams = f.nparams
+    vc.nslots = f.nslots
+    if f.nparams > 8 {
+        fail("`{f.name}` takes {f.nparams} arguments; only eight travel in registers")
+    }
+    let nb = ir.nblocks(f)
+    for b in 0..nb {
+        vc.bi0.push(vc.mop.len())
+        if b == 0 {
+            // Parameters arrive in x0..x7.
+            for k in 0..f.bnp[0] {
+                mov(vc, vr(f.bparams[f.bp0[0] + k]), k)
+            }
+        }
+        for i in f.bi0[b]..(f.bi0[b] + f.bni[b]) {
+            if s.absorbed[i] {
+                continue
+            }
+            let op = f.op[i]
+            if op == ir.M_CALL or op == ir.M_CALLRT {
+                let n = f.can[i]
+                if n > 8 {
+                    fail("a call with {n} arguments; only eight travel in registers")
+                }
+                for k in 0..n {
+                    mov(vc, k, vr(f.cargs[f.ca0[i] + k]))
+                }
+                let x = vcode.push(vc, mach.A_BL, -1, -1, -1)
+                vc.imm[x] = if f.res[i] >= 0 { 1 } else { 0 }
+                vc.imm2[x] = n
+                vc.symk[x] = if op == ir.M_CALL { vcode.SYM_FN } else { vcode.SYM_RT }
+                vc.sym_id[x] = f.imm[i]
+                if f.res[i] >= 0 {
+                    mov(vc, vr(f.res[i]), 0)
+                }
+                continue
+            }
+            try expand(vc, f, s, rs[s.rule_of[i]], ccm, i, -1, -1, -1, -1)
+        }
+        let k = f.tk[b]
+        if k == ir.M_RET {
+            if f.tv[b] >= 0 {
+                mov(vc, 0, vr(f.tv[b]))
+            }
+            let x = vcode.push(vc, mach.P_RETURN, -1, -1, -1)
+            vc.imm[x] = if f.tv[b] >= 0 { 1 } else { 0 }
+        } else {
+            if k == ir.M_JUMP {
+                let t = f.tt[b]
+                var dsts: [i64] = []
+                var srcs: [i64] = []
+                for q in 0..f.tan[b] {
+                    dsts.push(vr(f.bparams[f.bp0[t] + q]))
+                    srcs.push(vr(f.targs[f.ta0[b] + q]))
+                }
+                par_moves(vc, dsts, srcs)
+            } else if k == ir.M_BRIF and (f.tan[b] > 0 or f.fan[b] > 0) {
+                fail("a conditional branch passes arguments: its edges were not split")
+            }
+            try expand(vc, f, s, rs[s.term_rule[b]], ccm, -1, s.inner[b], f.tt[b], f.tf[b], f.tv[b])
+        }
+        vc.bni.push(vc.mop.len() - vc.bi0[b])
+    }
+    vc
+}

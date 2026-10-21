@@ -1,0 +1,105 @@
+// VCode: machine instructions over virtual registers, in the blocks MIR had.
+//
+// An operand is a register number as `mach.gr` defines them: physical
+// registers where the calling convention fixes one (arguments, results,
+// the stack pointer), virtual ones (`mach.VR + n`) everywhere else. A block
+// is a contiguous run of instructions and ends in its branches; a branch's
+// target is a block number.
+import mach
+
+type VCode = {
+    sym: str,
+    nvregs: i64,
+    nparams: i64,
+    nslots: i64,
+    mop: [i64],
+    rd: [i64],
+    rn: [i64],
+    rm: [i64],
+    ra: [i64],
+    imm: [i64],
+    imm2: [i64],
+    cc: [i64],
+    tgt: [i64],
+    /// What a call or an address refers to: 1 a compiled callable, 2 a
+    /// runtime function, 3 a string literal; `sym_id` says which.
+    symk: [i64],
+    sym_id: [i64],
+    bi0: [i64],
+    bni: [i64],
+}
+
+pub let SYM_NONE = 0
+pub let SYM_FN = 1
+pub let SYM_RT = 2
+pub let SYM_STR = 3
+
+pub fn new_vcode(sym: str) -> VCode {
+    VCode{
+        sym: sym, nvregs: 0, nparams: 0, nslots: 0,
+        mop: [], rd: [], rn: [], rm: [], ra: [], imm: [], imm2: [], cc: [], tgt: [],
+        symk: [], sym_id: [], bi0: [], bni: [],
+    }
+}
+
+pub fn push(inout vc: VCode, mop: i64, rd: i64, rn: i64, rm: i64) -> i64 {
+    let i = vc.mop.len()
+    vc.mop.push(mop)
+    vc.rd.push(rd)
+    vc.rn.push(rn)
+    vc.rm.push(rm)
+    vc.ra.push(-1)
+    vc.imm.push(0)
+    vc.imm2.push(0)
+    vc.cc.push(-1)
+    vc.tgt.push(-1)
+    vc.symk.push(0)
+    vc.sym_id.push(-1)
+    i
+}
+
+pub fn new_vreg(inout vc: VCode) -> i64 {
+    let v = vc.nvregs
+    vc.nvregs += 1
+    mach.VR + v
+}
+
+pub fn nblocks(vc: VCode) -> i64 {
+    vc.bi0.len()
+}
+
+/// A call's argument registers are x0 .. x(n-1), `imm2` of them; it writes
+/// x0 when `imm` is 1.
+pub fn call_nargs(vc: VCode, i: i64) -> i64 {
+    vc.imm2[i]
+}
+
+/// The blocks a block can branch to, in the order its branches name them.
+pub fn succs(vc: VCode, b: i64) -> [i64] {
+    var out: [i64] = []
+    for i in vc.bi0[b]..(vc.bi0[b] + vc.bni[b]) {
+        if vc.tgt[i] >= 0 {
+            out.push(vc.tgt[i])
+        }
+    }
+    out
+}
+
+/// The function as text, for reading.
+pub fn print_vcode(vc: VCode) -> str {
+    var out = str_builder()
+    out.push_str("vcode {vc.sym} vregs={vc.nvregs} params={vc.nparams} slots={vc.nslots}\n")
+    for b in 0..nblocks(vc) {
+        out.push_str("  b{b}:\n")
+        for i in vc.bi0[b]..(vc.bi0[b] + vc.bni[b]) {
+            var target = ""
+            if vc.tgt[i] >= 0 {
+                target = "b{vc.tgt[i]}"
+            } else if vc.symk[i] > 0 {
+                target = "sym{vc.symk[i]}:{vc.sym_id[i]}"
+            }
+            out.push_str("    " + mach.asm_text(vc.mop[i], vc.rd[i], vc.rn[i], vc.rm[i], vc.ra[i], vc.imm[i], vc.imm2[i], vc.cc[i], 0, target) + "\n")
+        }
+    }
+    out.to_str()
+}

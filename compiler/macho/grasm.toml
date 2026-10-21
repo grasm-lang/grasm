@@ -1,0 +1,8 @@
+[package]
+name = "macho"
+version = "0.1.0"
+entry = "src/main.gr"
+
+# Lays out a relocatable Mach-O object in memory. Pure computation: the
+# caller writes the bytes.
+capabilities = []

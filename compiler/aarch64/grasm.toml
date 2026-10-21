@@ -1,0 +1,11 @@
+[package]
+name = "aarch64"
+version = "0.1.0"
+entry = "src/main.gr"
+
+# MIR in, machine code out: instruction selection, register allocation and
+# its checker, encoding. Pure computation.
+capabilities = []
+
+[dependencies.mir]
+path = "../mir"

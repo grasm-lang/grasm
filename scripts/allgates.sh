@@ -92,6 +92,11 @@ run_gate nativegaps    scripts/nativegaps.sh
 run_gate tirtest       scripts/tirtest.sh
 run_gate tirinterp     scripts/tirinterp.sh
 run_gate tirccall      python3 scripts/tirinterp_ccall.py --check
+run_gate s3subset      scripts/s3subset.sh
+run_gate encodetest    scripts/encodetest.sh
+run_gate objtest       scripts/objtest.sh
+run_gate ra_check      scripts/ra_check.sh
+run_gate s3controls    scripts/s3controls.sh
 run_gate reprotest     scripts/reprotest.sh
 run_gate brokertest    scripts/broker_test.sh
 run_gate audiodiff     scripts/audio_diff.sh

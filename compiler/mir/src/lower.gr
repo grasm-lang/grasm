@@ -1,0 +1,1261 @@
+// TIR to the variable form: three-address code over variables, in basic
+// blocks, before SSA.
+//
+// Every TIR local is a variable, and so is every intermediate result: an
+// expression's value is the variable it was computed into. That makes the
+// lowering a plain walk with no bookkeeping about which value is live across
+// which branch -- `ssa.gr` works that out afterwards, from liveness, and
+// turns each variable into the SSA values and block parameters it needs.
+//
+// This is also where the subset is decided. A construct this part does not
+// compile is refused here, by name and span, rather than compiled wrongly;
+// `scripts/s3subset.sh` holds the refusals to an independent statement of
+// the subset (`scripts/s3_subset.py`), so a refusal cannot quietly shrink
+// what is checked.
+import sexp
+import ir
+import prog
+
+/// A function in the variable form, and the state of building it.
+type Vir = {
+    nvars: i64,
+    vty: [i64],
+    /// Variables `0 .. nparams` are the parameters, the floor first.
+    nparams: i64,
+    // Blocks: where their instructions start and end, and their terminators.
+    bstart: [i64],
+    bend: [i64],
+    btk: [i64],
+    btv: [i64],
+    btt: [i64],
+    btf: [i64],
+    // Instructions: `dst = op(a, b)`, with `imm`, or a call's arguments in
+    // `cargs[ca0 .. ca0 + can]`.
+    op: [i64],
+    dst: [i64],
+    a: [i64],
+    b: [i64],
+    imm: [i64],
+    ca0: [i64],
+    can: [i64],
+    cargs: [i64],
+    // Building state.
+    cur: i64,
+    open: bool,
+    loop_cont: [i64],
+    loop_brk: [i64],
+    tvar: Map[i64, i64],
+    io_val: [i64],
+    io_addr: [i64],
+    nslots: i64,
+    slot_var: [i64],
+    floor: i64,
+    returns: bool,
+    strs: [str],
+    str_ix: Map[str, i64],
+    errors: [str],
+}
+
+pub fn new_vir() -> Vir {
+    Vir{
+        nvars: 0, vty: [], nparams: 0,
+        bstart: [], bend: [], btk: [], btv: [], btt: [], btf: [],
+        op: [], dst: [], a: [], b: [], imm: [], ca0: [], can: [], cargs: [],
+        cur: -1, open: false, loop_cont: [], loop_brk: [], tvar: {},
+        io_val: [], io_addr: [], nslots: 0, slot_var: [], floor: -1, returns: false,
+        strs: [], str_ix: {}, errors: [],
+    }
+}
+
+// ----- building ------------------------------------------------------------------
+
+fn bad(inout v: Vir, msg: str) {
+    v.errors.push(msg)
+}
+
+fn new_var(inout v: Vir, ty: i64) -> i64 {
+    let id = v.nvars
+    v.nvars += 1
+    v.vty.push(ty)
+    id
+}
+
+fn new_block(inout v: Vir) -> i64 {
+    let id = v.bstart.len()
+    v.bstart.push(-1)
+    v.bend.push(-1)
+    v.btk.push(-1)
+    v.btv.push(-1)
+    v.btt.push(-1)
+    v.btf.push(-1)
+    id
+}
+
+/// Makes `b` the block being filled. A block still open is closed with a
+/// jump to it, so falling into a block is always explicit.
+fn switch_to(inout v: Vir, b: i64) {
+    if v.open {
+        term_jump(v, b)
+    }
+    v.cur = b
+    v.bstart[b] = v.op.len()
+    v.open = true
+}
+
+/// Code after a `return`, `break` or a call that does not return still has
+/// to go somewhere: a fresh block nothing branches to, which SSA
+/// construction drops.
+fn ensure_open(inout v: Vir) {
+    if not v.open {
+        let b = new_block(v)
+        switch_to(v, b)
+    }
+}
+
+fn emit(inout v: Vir, op: i64, dst: i64, a: i64, b: i64, imm: i64) -> i64 {
+    ensure_open(v)
+    let id = v.op.len()
+    v.op.push(op)
+    v.dst.push(dst)
+    v.a.push(a)
+    v.b.push(b)
+    v.imm.push(imm)
+    v.ca0.push(v.cargs.len())
+    v.can.push(0)
+    id
+}
+
+fn finish(inout v: Vir, k: i64, val: i64, t: i64, f: i64) {
+    ensure_open(v)
+    let b = v.cur
+    v.bend[b] = v.op.len()
+    v.btk[b] = k
+    v.btv[b] = val
+    v.btt[b] = t
+    v.btf[b] = f
+    v.open = false
+}
+
+fn term_jump(inout v: Vir, target: i64) {
+    finish(v, ir.M_JUMP, -1, target, -1)
+}
+
+fn term_brif(inout v: Vir, c: i64, t: i64, f: i64) {
+    finish(v, ir.M_BRIF, c, t, f)
+}
+
+fn term_trap(inout v: Vir) {
+    finish(v, ir.M_TRAP, -1, -1, -1)
+}
+
+fn konst(inout v: Vir, k: i64) -> i64 {
+    let d = new_var(v, ir.TY_I64)
+    emit(v, ir.M_ICONST, d, -1, -1, k)
+    d
+}
+
+fn copy_to(inout v: Vir, dst: i64, src: i64) {
+    emit(v, ir.M_COPY, dst, src, -1, 0)
+}
+
+fn op1(inout v: Vir, op: i64, a: i64) -> i64 {
+    let d = new_var(v, ir.TY_I64)
+    emit(v, op, d, a, -1, 0)
+    d
+}
+
+fn op2(inout v: Vir, op: i64, a: i64, b: i64) -> i64 {
+    let d = new_var(v, ir.TY_I64)
+    emit(v, op, d, a, b, 0)
+    d
+}
+
+fn icmp(inout v: Vir, cc: i64, a: i64, b: i64) -> i64 {
+    let d = new_var(v, ir.TY_BOOL)
+    emit(v, ir.M_ICMP, d, a, b, cc)
+    d
+}
+
+/// A call into the runtime. One that does not return ends the block.
+fn callrt(inout v: Vir, sym: i64, args: [i64]) -> i64 {
+    var d = -1
+    if ir.rt_returns(sym) {
+        d = new_var(v, ir.TY_I64)
+    }
+    let i = emit(v, ir.M_CALLRT, d, -1, -1, sym)
+    v.ca0[i] = v.cargs.len()
+    v.can[i] = args.len()
+    for x in args {
+        v.cargs.push(x)
+    }
+    if ir.rt_noreturn(sym) {
+        term_trap(v)
+    }
+    d
+}
+
+fn call_fn(inout v: Vir, callee: i64, args: [i64], returns: bool) -> i64 {
+    var d = -1
+    if returns {
+        d = new_var(v, ir.TY_I64)
+    }
+    let i = emit(v, ir.M_CALL, d, -1, -1, callee)
+    v.ca0[i] = v.cargs.len()
+    v.can[i] = args.len()
+    for x in args {
+        v.cargs.push(x)
+    }
+    d
+}
+
+fn str_id(inout v: Vir, s: str) -> i64 {
+    match v.str_ix.get(s) {
+        Some(i) -> i
+        None -> {
+            let i = v.strs.len()
+            v.strs.push(s)
+            v.str_ix.set(s, i)
+            i
+        }
+    }
+}
+
+/// The address and byte length of a literal, ready for the runtime.
+fn text_args(inout v: Vir, s: str) -> [i64] {
+    let id = str_id(v, s)
+    let p = new_var(v, ir.TY_I64)
+    emit(v, ir.M_STRADDR, p, -1, -1, id)
+    let l = konst(v, s.to_bytes().len())
+    [p, l]
+}
+
+fn out_text(inout v: Vir, s: str) {
+    let args = text_args(v, s)
+    callrt(v, ir.RT_OUT_TEXT, args)
+}
+
+/// A frame slot for variable `w`, the home of an `inout` argument.
+fn slot_for(inout v: Vir, w: i64) -> i64 {
+    for k in 0..v.slot_var.len() {
+        if v.slot_var[k] == w {
+            return k
+        }
+    }
+    v.slot_var.push(w)
+    v.nslots += 1
+    v.nslots - 1
+}
+
+// ----- reading TIR ---------------------------------------------------------------
+
+/// The type written as element `i` of node `e`.
+fn ty_at(t: TirTree, e: i64, i: i64) -> i64 {
+    if i >= t.count[e] {
+        return ir.TY_OTHER
+    }
+    let x = sexp.at(t, e, i)
+    if t.kind[x] != 0 {
+        return ir.TY_OTHER
+    }
+    ir.ty_of_name(t.text[x])
+}
+
+/// The type written as element `i`, as TIR spells it, for a message.
+fn ty_text(t: TirTree, e: i64, i: i64) -> str {
+    if i >= t.count[e] {
+        return "?"
+    }
+    let x = sexp.at(t, e, i)
+    if t.kind[x] == 2 {
+        return "({sexp.word(t, x, 0)} ...)"
+    }
+    t.text[x]
+}
+
+/// An expression node's type: its element 1.
+fn node_ty(t: TirTree, e: i64) -> i64 {
+    ty_at(t, e, 1)
+}
+
+/// Where a node is, for a message: its first `@start:end`.
+fn span_of(t: TirTree, e: i64) -> str {
+    if t.kind[e] != 2 {
+        return ""
+    }
+    for i in 0..t.count[e] {
+        let w = sexp.word(t, e, i)
+        if w.starts_with("@") {
+            return w
+        }
+    }
+    ""
+}
+
+fn is_stmt(k: str) -> bool {
+    k == "let" or k == "lettuple" or k == "assign" or k == "return" or k == "break" or k == "continue" or k == "while" or k == "for" or k == "parallel" or k == "spawn" or k == "with"
+}
+
+fn tvar_of(inout v: Vir, id: i64) -> i64 {
+    match v.tvar.get(id) {
+        Some(x) -> x
+        None -> {
+            bad(v, "local {id} is read before it is bound")
+            let x = new_var(v, ir.TY_I64)
+            v.tvar.set(id, x)
+            x
+        }
+    }
+}
+
+/// The variable a TIR binding site names, made on first sight: the
+/// alternatives of an or-pattern bind the same TIR variable.
+fn bind_tvar(inout v: Vir, id: i64, ty: i64) -> i64 {
+    match v.tvar.get(id) {
+        Some(x) -> x
+        None -> {
+            let x = new_var(v, ty)
+            v.tvar.set(id, x)
+            x
+        }
+    }
+}
+
+// ----- expressions ---------------------------------------------------------------
+
+/// The value of an expression, as a variable; 0 for one that has none.
+fn value_of(info: TirInfo, inout v: Vir, e: i64) -> i64 {
+    let x = lower_expr(info, v, e)
+    if x >= 0 {
+        x
+    } else {
+        konst(v, 0)
+    }
+}
+
+/// Lowers an expression or a statement. The answer is the variable holding
+/// its value, or -1 when it has none (unit, a statement, a `never`).
+fn lower_expr(info: TirInfo, inout v: Vir, e: i64) -> i64 {
+    let t = info.t
+    if t.kind[e] != 2 {
+        bad(v, "outside the subset: a bare atom where an expression was expected")
+        return -1
+    }
+    let k = sexp.kw(t, e)
+    match k {
+        "int" -> lower_int(info, v, e)
+        "bool" -> konst(v, if sexp.word(t, e, 3) == "true" { 1 } else { 0 })
+        "unit" -> -1
+        "local" -> lower_local(info, v, e)
+        "binary" -> lower_binary(info, v, e)
+        "unary" -> lower_unary(info, v, e)
+        "call" -> lower_call(info, v, e)
+        "const" -> lower_const_read(info, v, e)
+        "builtin" -> lower_builtin(info, v, e)
+        "if" -> lower_if(info, v, e)
+        "block" -> lower_block(info, v, e)
+        "blockexpr" -> {
+            if not ir.ty_scalar(node_ty(t, e)) {
+                bad(v, "outside the subset: a block of type {ty_text(t, e, 1)} {span_of(t, e)}")
+            }
+            lower_block(info, v, sexp.kids(t, e)[0])
+        }
+        "match" -> lower_match(info, v, e)
+        "let" -> lower_let(info, v, e)
+        "assign" -> lower_assign(info, v, e)
+        "return" -> lower_return(info, v, e)
+        "break" -> {
+            if v.loop_brk.is_empty() {
+                bad(v, "`break` outside a loop")
+            } else {
+                term_jump(v, v.loop_brk[v.loop_brk.len() - 1])
+            }
+            -1
+        }
+        "continue" -> {
+            if v.loop_cont.is_empty() {
+                bad(v, "`continue` outside a loop")
+            } else {
+                term_jump(v, v.loop_cont[v.loop_cont.len() - 1])
+            }
+            -1
+        }
+        "while" -> lower_while(info, v, e)
+        "for" -> lower_for(info, v, e)
+        _ -> {
+            bad(v, "outside the subset: `{k}` {span_of(t, e)}")
+            -1
+        }
+    }
+}
+
+fn lower_int(info: TirInfo, inout v: Vir, e: i64) -> i64 {
+    let t = info.t
+    let ty = node_ty(t, e)
+    if not ir.ty_int(ty) {
+        bad(v, "outside the subset: an integer of type {ty_text(t, e, 1)} {span_of(t, e)}")
+        return konst(v, 0)
+    }
+    let text = sexp.word(t, e, 3)
+    if ty == ir.TY_U64 {
+        let u = text.parse_u64() ?? 0
+        return konst(v, u.as_i64())
+    }
+    konst(v, text.parse_int() ?? 0)
+}
+
+/// A local read. The value is copied out, so a later assignment to the
+/// local -- an `inout` argument written back between two operands, say --
+/// does not change what was read.
+fn lower_local(info: TirInfo, inout v: Vir, e: i64) -> i64 {
+    let t = info.t
+    let ty = node_ty(t, e)
+    if not ir.ty_scalar(ty) {
+        bad(v, "outside the subset: a local of type {ty_text(t, e, 1)} {span_of(t, e)}")
+        return -1
+    }
+    let w = tvar_of(v, sexp.word(t, e, 3).parse_int() ?? -1)
+    let d = new_var(v, ty)
+    copy_to(v, d, w)
+    d
+}
+
+/// Wraps a result to its type's width ([T-INT-FIXED]); `i64` and `u64` wrap
+/// by themselves.
+fn wrap(inout v: Vir, ty: i64, x: i64) -> i64 {
+    if ty == ir.TY_I8 {
+        op1(v, ir.M_SEXT8, x)
+    } else if ty == ir.TY_I16 {
+        op1(v, ir.M_SEXT16, x)
+    } else if ty == ir.TY_I32 {
+        op1(v, ir.M_SEXT32, x)
+    } else if ty == ir.TY_U8 {
+        op1(v, ir.M_UEXT8, x)
+    } else if ty == ir.TY_U16 {
+        op1(v, ir.M_UEXT16, x)
+    } else if ty == ir.TY_U32 {
+        op1(v, ir.M_UEXT32, x)
+    } else {
+        x
+    }
+}
+
+/// Panics through `sym` when `x` is zero ([E-DIV-ZERO]).
+fn zero_check(inout v: Vir, x: i64, sym: i64) {
+    let z = konst(v, 0)
+    let c = icmp(v, ir.CC_EQ, x, z)
+    let bad_b = new_block(v)
+    let ok_b = new_block(v)
+    term_brif(v, c, bad_b, ok_b)
+    switch_to(v, bad_b)
+    callrt(v, sym, [])
+    switch_to(v, ok_b)
+}
+
+/// `a <op> b` at type `ty`, with the language's wrapping and its panics.
+fn arith(inout v: Vir, op: str, ty: i64, a: i64, b: i64) -> i64 {
+    let u = ty == ir.TY_U64 or ty == ir.TY_U8 or ty == ir.TY_U16 or ty == ir.TY_U32
+    match op {
+        "add" -> {
+            let r = op2(v, ir.M_ADD, a, b)
+            wrap(v, ty, r)
+        }
+        "sub" -> {
+            let r = op2(v, ir.M_SUB, a, b)
+            wrap(v, ty, r)
+        }
+        "mul" -> {
+            let r = op2(v, ir.M_MUL, a, b)
+            wrap(v, ty, r)
+        }
+        "div" -> {
+            zero_check(v, b, ir.RT_PANIC_DIV_ZERO)
+            let r = op2(v, if u { ir.M_UDIV } else { ir.M_SDIV }, a, b)
+            wrap(v, ty, r)
+        }
+        "rem" -> {
+            zero_check(v, b, ir.RT_PANIC_REM_ZERO)
+            let r = op2(v, if u { ir.M_UREM } else { ir.M_SREM }, a, b)
+            wrap(v, ty, r)
+        }
+        _ -> {
+            bad(v, "outside the subset: operator `{op}`")
+            a
+        }
+    }
+}
+
+fn cmp_cc(op: str, unsigned: bool) -> i64 {
+    match op {
+        "eq" -> ir.CC_EQ
+        "ne" -> ir.CC_NE
+        "lt" -> if unsigned { ir.CC_ULT } else { ir.CC_SLT }
+        "le" -> if unsigned { ir.CC_ULE } else { ir.CC_SLE }
+        "gt" -> if unsigned { ir.CC_UGT } else { ir.CC_SGT }
+        "ge" -> if unsigned { ir.CC_UGE } else { ir.CC_SGE }
+        _ -> -1
+    }
+}
+
+fn lower_binary(info: TirInfo, inout v: Vir, e: i64) -> i64 {
+    let t = info.t
+    let op = sexp.word(t, e, 3)
+    let ot = ty_at(t, e, 4)
+    let ks = sexp.kids(t, e)
+    if op == "and" or op == "or" {
+        let a = value_of(info, v, ks[0])
+        let r = new_var(v, ir.TY_BOOL)
+        copy_to(v, r, a)
+        let rhs_b = new_block(v)
+        let join = new_block(v)
+        if op == "and" {
+            term_brif(v, a, rhs_b, join)
+        } else {
+            term_brif(v, a, join, rhs_b)
+        }
+        switch_to(v, rhs_b)
+        let x = value_of(info, v, ks[1])
+        copy_to(v, r, x)
+        term_jump(v, join)
+        switch_to(v, join)
+        return r
+    }
+    let cc = cmp_cc(op, ir.ty_unsigned(ot) or ot == ir.TY_BOOL)
+    if cc >= 0 {
+        if not (ir.ty_int(ot) or ot == ir.TY_BOOL) {
+            bad(v, "outside the subset: `{op}` on {ty_text(t, e, 4)} {span_of(t, e)}")
+            return konst(v, 0)
+        }
+        let a = value_of(info, v, ks[0])
+        let b = value_of(info, v, ks[1])
+        return icmp(v, cc, a, b)
+    }
+    if not ir.ty_int(ot) {
+        bad(v, "outside the subset: `{op}` on {ty_text(t, e, 4)} {span_of(t, e)}")
+        return konst(v, 0)
+    }
+    if op == "pow" {
+        if ot != ir.TY_I64 {
+            bad(v, "outside the subset: `^` on {ty_text(t, e, 4)} {span_of(t, e)}")
+            return konst(v, 0)
+        }
+        let a = value_of(info, v, ks[0])
+        let b = value_of(info, v, ks[1])
+        return callrt(v, ir.RT_POW_I64, [a, b])
+    }
+    if op != "add" and op != "sub" and op != "mul" and op != "div" and op != "rem" {
+        bad(v, "outside the subset: operator `{op}` {span_of(t, e)}")
+        return konst(v, 0)
+    }
+    let a = value_of(info, v, ks[0])
+    let b = value_of(info, v, ks[1])
+    arith(v, op, ot, a, b)
+}
+
+fn lower_unary(info: TirInfo, inout v: Vir, e: i64) -> i64 {
+    let t = info.t
+    let op = sexp.word(t, e, 3)
+    let ot = ty_at(t, e, 4)
+    let x = value_of(info, v, sexp.kids(t, e)[0])
+    if op == "not" and ot == ir.TY_BOOL {
+        let one = konst(v, 1)
+        return op2(v, ir.M_XOR, x, one)
+    }
+    if op == "neg" and ir.ty_int(ot) {
+        let n = op1(v, ir.M_NEG, x)
+        return wrap(v, ot, n)
+    }
+    bad(v, "outside the subset: `{op}` on {ty_text(t, e, 4)} {span_of(t, e)}")
+    x
+}
+
+/// The parameters a callable declares: `(param mode id "name" T)` each.
+fn params_of(info: TirInfo, c: i64) -> [i64] {
+    if info.c_const[c] {
+        return []
+    }
+    let t = info.t
+    let ks = sexp.kids(t, info.c_elem[c])
+    sexp.kids(t, ks[0])
+}
+
+fn returns_value(info: TirInfo, c: i64) -> bool {
+    let t = info.t
+    let e = info.c_elem[c]
+    let ty = if info.c_const[c] { ty_at(t, e, 2) } else { ty_at(t, e, 4) }
+    ty != ir.TY_UNIT and ty != ir.TY_NEVER
+}
+
+/// The hidden first argument of a function that can reach itself: this
+/// function's own floor when it has one, else the runtime's, asked here --
+/// which happens once per entry into a recursion, not once per level.
+fn floor_arg(inout v: Vir) -> i64 {
+    if v.floor >= 0 {
+        return v.floor
+    }
+    let sp = new_var(v, ir.TY_I64)
+    emit(v, ir.M_GETSP, sp, -1, -1, 0)
+    callrt(v, ir.RT_STACK_FLOOR, [sp])
+}
+
+fn lower_call(info: TirInfo, inout v: Vir, e: i64) -> i64 {
+    let t = info.t
+    let name = sexp.word(t, e, 3)
+    let c = info.fn_ix.get(name) ?? -1
+    if c < 0 {
+        bad(v, "outside the subset: a call of `{name}`, which is not a function here {span_of(t, e)}")
+        return -1
+    }
+    let targs = sexp.at(t, e, 4)
+    if t.count[targs] > 1 {
+        bad(v, "outside the subset: a generic call of `{name}` {span_of(t, e)}")
+    }
+    let rty = node_ty(t, e)
+    if not ir.ty_scalar(rty) {
+        bad(v, "outside the subset: a call of `{name}` answering {ty_text(t, e, 1)} {span_of(t, e)}")
+    }
+    let params = params_of(info, c)
+    let ks = sexp.kids(t, e)
+    if ks.len() != params.len() {
+        bad(v, "a call of `{name}` with {ks.len()} arguments for {params.len()} parameters")
+        return -1
+    }
+    // Arguments left to right; an `inout` one is a place, read and written
+    // back around the call itself.
+    var vals: [i64] = []
+    var homes: [i64] = []
+    for i in 0..ks.len() {
+        let mode = sexp.word(t, params[i], 1)
+        if mode == "inout" {
+            let a = ks[i]
+            if sexp.kw(t, a) != "local" {
+                bad(v, "outside the subset: an `inout` argument that is not a local {span_of(t, a)}")
+                vals.push(-1)
+                homes.push(-1)
+            } else {
+                vals.push(-1)
+                homes.push(tvar_of(v, sexp.word(t, a, 3).parse_int() ?? -1))
+            }
+        } else {
+            vals.push(value_of(info, v, ks[i]))
+            homes.push(-1)
+        }
+    }
+    var args: [i64] = []
+    if info.recursive[c] {
+        args.push(floor_arg(v))
+    }
+    var slots: [i64] = []
+    for i in 0..ks.len() {
+        if homes[i] >= 0 {
+            let k = slot_for(v, homes[i])
+            let addr = new_var(v, ir.TY_I64)
+            emit(v, ir.M_SLOTADDR, addr, -1, -1, k)
+            emit(v, ir.M_STORE, -1, addr, homes[i], 0)
+            args.push(addr)
+            slots.push(k)
+        } else {
+            args.push(vals[i])
+            slots.push(-1)
+        }
+    }
+    let r = call_fn(v, c, args, returns_value(info, c))
+    for i in 0..ks.len() {
+        if slots[i] >= 0 {
+            let addr = new_var(v, ir.TY_I64)
+            emit(v, ir.M_SLOTADDR, addr, -1, -1, slots[i])
+            emit(v, ir.M_LOAD, homes[i], addr, -1, 0)
+        }
+    }
+    r
+}
+
+fn lower_const_read(info: TirInfo, inout v: Vir, e: i64) -> i64 {
+    let t = info.t
+    let name = sexp.word(t, e, 3)
+    let c = info.const_ix.get(name) ?? -1
+    if c < 0 {
+        bad(v, "a read of `{name}`, which is not a constant {span_of(t, e)}")
+        return -1
+    }
+    if not ir.ty_scalar(node_ty(t, e)) {
+        bad(v, "outside the subset: a constant of type {ty_text(t, e, 1)} {span_of(t, e)}")
+        return -1
+    }
+    var args: [i64] = []
+    if info.recursive[c] {
+        args.push(floor_arg(v))
+    }
+    call_fn(v, c, args, returns_value(info, c))
+}
+
+/// Writes one interpolated value as `print` does ([L-DISPLAY]).
+fn out_value(inout v: Vir, x: i64, ty: i64, where_: str) {
+    if ty == ir.TY_U64 {
+        callrt(v, ir.RT_OUT_U64, [x])
+    } else if ir.ty_int(ty) {
+        callrt(v, ir.RT_OUT_I64, [x])
+    } else if ty == ir.TY_BOOL {
+        callrt(v, ir.RT_OUT_BOOL, [x])
+    } else if ty == ir.TY_UNIT {
+        out_text(v, "()")
+    } else {
+        bad(v, "outside the subset: printing a value of this type {where_}")
+    }
+    ()
+}
+
+/// `print` and `eprint`. Every interpolated value is computed before
+/// anything is written ([E-PRINT-ATOMIC]). `eprint` selects stderr before
+/// evaluating, as the Cranelift build does.
+fn lower_print(info: TirInfo, inout v: Vir, arg: i64, to_err: bool) {
+    let t = info.t
+    if to_err {
+        let one = konst(v, 1)
+        callrt(v, ir.RT_OUT_TO_STDERR, [one])
+    }
+    if sexp.kw(t, arg) == "str" {
+        let pieces = sexp.kids(t, arg)
+        var vals: [i64] = []
+        var tys: [i64] = []
+        for pc in pieces {
+            if sexp.kw(t, pc) == "value" {
+                let x = sexp.at(t, pc, 1)
+                tys.push(node_ty(t, x))
+                vals.push(value_of(info, v, x))
+            } else {
+                tys.push(-1)
+                vals.push(-1)
+            }
+        }
+        for i in 0..pieces.len() {
+            let pc = pieces[i]
+            if sexp.kw(t, pc) == "text" {
+                let s = sexp.word(t, pc, 1)
+                if s != "" {
+                    out_text(v, s)
+                }
+            } else {
+                out_value(v, vals[i], tys[i], span_of(t, arg))
+            }
+        }
+    } else {
+        let ty = node_ty(t, arg)
+        let x = value_of(info, v, arg)
+        out_value(v, x, ty, span_of(t, arg))
+    }
+    callrt(v, ir.RT_OUT_NL, [])
+    if to_err {
+        let zero = konst(v, 0)
+        callrt(v, ir.RT_OUT_TO_STDERR, [zero])
+    }
+}
+
+/// `panic(msg)`: a literal message goes to the runtime as bytes; an
+/// interpolated one is built first, values before any text, then handed
+/// over as a string.
+fn lower_panic(info: TirInfo, inout v: Vir, arg: i64) {
+    let t = info.t
+    if sexp.kw(t, arg) != "str" {
+        bad(v, "outside the subset: a panic message that is not a string literal {span_of(t, arg)}")
+        return
+    }
+    let pieces = sexp.kids(t, arg)
+    var all_text = true
+    var text = ""
+    for pc in pieces {
+        if sexp.kw(t, pc) == "text" {
+            text = text + sexp.word(t, pc, 1)
+        } else {
+            all_text = false
+        }
+    }
+    if all_text {
+        let args = text_args(v, text)
+        callrt(v, ir.RT_PANIC_MSG, args)
+        return
+    }
+    var vals: [i64] = []
+    var tys: [i64] = []
+    for pc in pieces {
+        if sexp.kw(t, pc) == "value" {
+            let x = sexp.at(t, pc, 1)
+            tys.push(node_ty(t, x))
+            vals.push(value_of(info, v, x))
+        } else {
+            tys.push(-1)
+            vals.push(-1)
+        }
+    }
+    let sb = callrt(v, ir.RT_STR_BUILD, [])
+    for i in 0..pieces.len() {
+        let pc = pieces[i]
+        let ty = tys[i]
+        if sexp.kw(t, pc) == "text" {
+            let s = sexp.word(t, pc, 1)
+            if s != "" {
+                let ta = text_args(v, s)
+                callrt(v, ir.RT_STR_BUILD_TEXT, [sb, ta[0], ta[1]])
+            }
+        } else if ir.ty_int(ty) and ty != ir.TY_U64 {
+            callrt(v, ir.RT_STR_BUILD_I64, [sb, vals[i]])
+        } else if ty == ir.TY_BOOL {
+            callrt(v, ir.RT_STR_BUILD_BOOL, [sb, vals[i]])
+        } else if ty == ir.TY_UNIT {
+            let ta = text_args(v, "()")
+            callrt(v, ir.RT_STR_BUILD_TEXT, [sb, ta[0], ta[1]])
+        } else {
+            bad(v, "outside the subset: a panic message interpolating this type {span_of(t, arg)}")
+        }
+    }
+    let s = callrt(v, ir.RT_STR_BUILD_END, [sb])
+    callrt(v, ir.RT_PANIC_VALUE, [s])
+}
+
+fn lower_builtin(info: TirInfo, inout v: Vir, e: i64) -> i64 {
+    let t = info.t
+    let name = sexp.word(t, e, 3)
+    let ks = sexp.kids(t, e)
+    if (name == "print" or name == "eprint") and ks.len() == 1 {
+        lower_print(info, v, ks[0], name == "eprint")
+        return -1
+    }
+    if name == "assert" and ks.len() == 1 {
+        if node_ty(t, ks[0]) != ir.TY_BOOL {
+            bad(v, "outside the subset: `assert` of a non-bool {span_of(t, e)}")
+        }
+        let c = value_of(info, v, ks[0])
+        let fail_b = new_block(v)
+        let ok_b = new_block(v)
+        term_brif(v, c, ok_b, fail_b)
+        switch_to(v, fail_b)
+        callrt(v, ir.RT_PANIC_ASSERT, [])
+        switch_to(v, ok_b)
+        return -1
+    }
+    if name == "exit" and ks.len() == 1 {
+        if not ir.ty_int(node_ty(t, ks[0])) {
+            bad(v, "outside the subset: `exit` of a non-integer {span_of(t, e)}")
+        }
+        let x = value_of(info, v, ks[0])
+        callrt(v, ir.RT_EXIT, [x])
+        return -1
+    }
+    if name == "panic" and ks.len() == 1 {
+        lower_panic(info, v, ks[0])
+        return -1
+    }
+    bad(v, "outside the subset: built-in `{name}` {span_of(t, e)}")
+    -1
+}
+
+fn lower_block(info: TirInfo, inout v: Vir, e: i64) -> i64 {
+    let t = info.t
+    let ks = sexp.kids(t, e)
+    var last = -1
+    for i in 0..ks.len() {
+        let x = lower_expr(info, v, ks[i])
+        if i == ks.len() - 1 and not is_stmt(sexp.kw(t, ks[i])) {
+            last = x
+        }
+    }
+    last
+}
+
+/// Whether an expression of type `ty` yields a value worth carrying.
+fn valued(ty: i64) -> bool {
+    ty != ir.TY_UNIT and ty != ir.TY_NEVER
+}
+
+fn lower_if(info: TirInfo, inout v: Vir, e: i64) -> i64 {
+    let t = info.t
+    let ty = node_ty(t, e)
+    if not ir.ty_scalar(ty) {
+        bad(v, "outside the subset: an `if` of type {ty_text(t, e, 1)} {span_of(t, e)}")
+    }
+    let ks = sexp.kids(t, e)
+    let c = value_of(info, v, ks[0])
+    var r = -1
+    if valued(ty) {
+        r = new_var(v, ty)
+    }
+    let then_b = new_block(v)
+    let join = new_block(v)
+    var else_b = join
+    if ks.len() > 2 {
+        else_b = new_block(v)
+    }
+    term_brif(v, c, then_b, else_b)
+    switch_to(v, then_b)
+    let x = lower_expr(info, v, ks[1])
+    if v.open {
+        if r >= 0 {
+            let xv = if x >= 0 { x } else { konst(v, 0) }
+            copy_to(v, r, xv)
+        }
+        term_jump(v, join)
+    }
+    if ks.len() > 2 {
+        switch_to(v, else_b)
+        let y = lower_expr(info, v, sexp.at(t, ks[2], 1))
+        if v.open {
+            if r >= 0 {
+                let yv = if y >= 0 { y } else { konst(v, 0) }
+                copy_to(v, r, yv)
+            }
+            term_jump(v, join)
+        }
+    }
+    switch_to(v, join)
+    r
+}
+
+/// Tests pattern `p` against the value in `s`: falls through when it
+/// matches, with its names bound, and branches to `no` when it does not.
+fn lower_pat(info: TirInfo, inout v: Vir, p: i64, s: i64, sty: i64, no: i64) {
+    let t = info.t
+    match sexp.kw(t, p) {
+        "pwild" -> ()
+        "pbind" -> {
+            let w = bind_tvar(v, sexp.word(t, p, 2).parse_int() ?? -1, sty)
+            copy_to(v, w, s)
+        }
+        "pint" -> {
+            let text = sexp.word(t, p, 2)
+            let k = konst(v, text.parse_int() ?? 0)
+            let c = icmp(v, ir.CC_EQ, s, k)
+            let yes = new_block(v)
+            term_brif(v, c, yes, no)
+            switch_to(v, yes)
+        }
+        "pbool" -> {
+            let yes = new_block(v)
+            if sexp.word(t, p, 2) == "true" {
+                term_brif(v, s, yes, no)
+            } else {
+                term_brif(v, s, no, yes)
+            }
+            switch_to(v, yes)
+        }
+        "por" -> {
+            let alts = sexp.kids(t, p)
+            let matched = new_block(v)
+            for i in 0..alts.len() {
+                let next = if i == alts.len() - 1 { no } else { new_block(v) }
+                lower_pat(info, v, alts[i], s, sty, next)
+                term_jump(v, matched)
+                if i < alts.len() - 1 {
+                    switch_to(v, next)
+                }
+            }
+            switch_to(v, matched)
+        }
+        other -> bad(v, "outside the subset: pattern `{other}` {span_of(t, p)}")
+    }
+}
+
+fn lower_match(info: TirInfo, inout v: Vir, e: i64) -> i64 {
+    let t = info.t
+    let ty = node_ty(t, e)
+    if not ir.ty_scalar(ty) {
+        bad(v, "outside the subset: a `match` of type {ty_text(t, e, 1)} {span_of(t, e)}")
+    }
+    let ks = sexp.kids(t, e)
+    let sty = node_ty(t, ks[0])
+    if not (ir.ty_int(sty) or sty == ir.TY_BOOL) {
+        bad(v, "outside the subset: matching on {ty_text(t, ks[0], 1)} {span_of(t, e)}")
+    }
+    let s0 = value_of(info, v, ks[0])
+    let s = new_var(v, sty)
+    copy_to(v, s, s0)
+    var r = -1
+    if valued(ty) {
+        r = new_var(v, ty)
+    }
+    let join = new_block(v)
+    for i in 1..ks.len() {
+        let arm = ks[i]
+        let parts = sexp.kids(t, arm)
+        let next = new_block(v)
+        lower_pat(info, v, parts[0], s, sty, next)
+        var body = parts[1]
+        if parts.len() == 3 {
+            let g = value_of(info, v, sexp.at(t, parts[1], 1))
+            let yes = new_block(v)
+            term_brif(v, g, yes, next)
+            switch_to(v, yes)
+            body = parts[2]
+        }
+        let x = lower_expr(info, v, body)
+        if v.open {
+            if r >= 0 {
+                let xv = if x >= 0 { x } else { konst(v, 0) }
+                copy_to(v, r, xv)
+            }
+            term_jump(v, join)
+        }
+        switch_to(v, next)
+    }
+    // The checker proved the arms exhaustive.
+    term_trap(v)
+    switch_to(v, join)
+    r
+}
+
+fn lower_let(info: TirInfo, inout v: Vir, e: i64) -> i64 {
+    let t = info.t
+    let ty = ty_at(t, e, 4)
+    if not ir.ty_scalar(ty) {
+        bad(v, "outside the subset: a binding of type {ty_text(t, e, 4)} {span_of(t, sexp.kids(t, e)[0])}")
+    }
+    let x = value_of(info, v, sexp.kids(t, e)[0])
+    let w = bind_tvar(v, sexp.word(t, e, 1).parse_int() ?? -1, ty)
+    copy_to(v, w, x)
+    -1
+}
+
+fn lower_assign(info: TirInfo, inout v: Vir, e: i64) -> i64 {
+    let t = info.t
+    let op = sexp.word(t, e, 1)
+    let ty = ty_at(t, e, 2)
+    let ks = sexp.kids(t, e)
+    if sexp.kw(t, ks[0]) != "local" {
+        bad(v, "outside the subset: assignment to a `{sexp.kw(t, ks[0])}` {span_of(t, ks[1])}")
+        return -1
+    }
+    if not ir.ty_scalar(ty) {
+        bad(v, "outside the subset: assignment of type {ty_text(t, e, 2)} {span_of(t, ks[1])}")
+        return -1
+    }
+    let w = tvar_of(v, sexp.word(t, ks[0], 1).parse_int() ?? -1)
+    let x = value_of(info, v, ks[1])
+    if op == "set" {
+        copy_to(v, w, x)
+    } else if ir.ty_int(ty) {
+        let r = arith(v, op, ty, w, x)
+        copy_to(v, w, r)
+    } else {
+        bad(v, "outside the subset: `{op}=` on {ty_text(t, e, 2)}")
+    }
+    -1
+}
+
+/// Writes every `inout` parameter back through its address and returns.
+fn do_return(inout v: Vir, x: i64) {
+    for i in 0..v.io_val.len() {
+        emit(v, ir.M_STORE, -1, v.io_addr[i], v.io_val[i], 0)
+    }
+    finish(v, ir.M_RET, if v.returns { x } else { -1 }, -1, -1)
+}
+
+fn lower_return(info: TirInfo, inout v: Vir, e: i64) -> i64 {
+    let t = info.t
+    let ks = sexp.kids(t, e)
+    var x = -1
+    if ks.len() > 0 {
+        x = value_of(info, v, ks[0])
+    }
+    if v.returns and x < 0 {
+        x = konst(v, 0)
+    }
+    do_return(v, x)
+    -1
+}
+
+fn lower_while(info: TirInfo, inout v: Vir, e: i64) -> i64 {
+    let t = info.t
+    let ks = sexp.kids(t, e)
+    let head = new_block(v)
+    let body = new_block(v)
+    let exit = new_block(v)
+    switch_to(v, head)
+    let c = value_of(info, v, ks[0])
+    term_brif(v, c, body, exit)
+    switch_to(v, body)
+    v.loop_cont.push(head)
+    v.loop_brk.push(exit)
+    lower_expr(info, v, ks[1])
+    v.loop_cont.pop()
+    v.loop_brk.pop()
+    if v.open {
+        term_jump(v, head)
+    }
+    switch_to(v, exit)
+    -1
+}
+
+/// `for i in lo..hi` and `lo..=hi`. Both ends are evaluated once, and an
+/// inclusive range stops *before* stepping past its end, so `..=i64::MAX`
+/// ends ([E-LOOP-RANGE-MAX]).
+fn lower_for(info: TirInfo, inout v: Vir, e: i64) -> i64 {
+    let t = info.t
+    if sexp.word(t, e, 1) != "range" {
+        bad(v, "outside the subset: `for` over a {sexp.word(t, e, 1)} {span_of(t, e)}")
+        return -1
+    }
+    let ks = sexp.kids(t, e)
+    let it = ks[1]
+    if sexp.kw(t, it) != "range" {
+        bad(v, "outside the subset: `for` over a range that is not written in place {span_of(t, it)}")
+        return -1
+    }
+    let incl = sexp.word(t, it, 3) == "inclusive"
+    let ends = sexp.kids(t, it)
+    let lo = value_of(info, v, ends[0])
+    let hi = value_of(info, v, ends[1])
+    let ctr = new_var(v, ir.TY_I64)
+    copy_to(v, ctr, lo)
+    let end = new_var(v, ir.TY_I64)
+    copy_to(v, end, hi)
+    let head = new_block(v)
+    let body = new_block(v)
+    let step = new_block(v)
+    let exit = new_block(v)
+    switch_to(v, head)
+    let c = icmp(v, if incl { ir.CC_SLE } else { ir.CC_SLT }, ctr, end)
+    term_brif(v, c, body, exit)
+    switch_to(v, body)
+    let iv = bind_tvar(v, sexp.word(t, ks[0], 1).parse_int() ?? -1, ir.TY_I64)
+    copy_to(v, iv, ctr)
+    v.loop_cont.push(step)
+    v.loop_brk.push(exit)
+    lower_expr(info, v, ks[2])
+    v.loop_cont.pop()
+    v.loop_brk.pop()
+    if v.open {
+        term_jump(v, step)
+    }
+    switch_to(v, step)
+    if incl {
+        let done = icmp(v, ir.CC_EQ, ctr, end)
+        let bump = new_block(v)
+        term_brif(v, done, exit, bump)
+        switch_to(v, bump)
+    }
+    let one = konst(v, 1)
+    let nx = op2(v, ir.M_ADD, ctr, one)
+    copy_to(v, ctr, nx)
+    term_jump(v, head)
+    switch_to(v, exit)
+    -1
+}
+
+// ----- functions -------------------------------------------------------------------
+
+/// Lowers callable `c` (a function or a constant). Anything outside the
+/// subset is in `errors` of the result.
+pub fn lower_callable(info: TirInfo, c: i64) -> Vir {
+    let t = info.t
+    var v = new_vir()
+    let e = info.c_elem[c]
+    var body = -1
+    if info.c_const[c] {
+        let ty = ty_at(t, e, 2)
+        if not ir.ty_scalar(ty) {
+            bad(v, "outside the subset: constant `{info.c_name[c]}` of type {ty_text(t, e, 2)}")
+        }
+        v.returns = valued(ty)
+        body = sexp.kids(t, e)[0]
+    } else {
+        if t.count[sexp.at(t, e, 2)] > 1 {
+            bad(v, "outside the subset: generic function `{info.c_name[c]}`")
+        }
+        if sexp.word(t, e, 5) != "none" {
+            bad(v, "outside the subset: `{info.c_name[c]}` can fail")
+        }
+        let rty = ty_at(t, e, 4)
+        if not ir.ty_scalar(rty) {
+            bad(v, "outside the subset: `{info.c_name[c]}` answers {ty_text(t, e, 4)}")
+        }
+        v.returns = valued(rty)
+        body = sexp.kids(t, e)[1]
+    }
+    if info.recursive[c] {
+        v.floor = new_var(v, ir.TY_I64)
+    }
+    let params = params_of(info, c)
+    if params.len() > 7 {
+        bad(v, "outside the subset: `{info.c_name[c]}` has more than seven parameters")
+    }
+    var inout_ids: [i64] = []
+    var inout_addr: [i64] = []
+    var inout_ty: [i64] = []
+    for p in params {
+        let mode = sexp.word(t, p, 1)
+        let id = sexp.word(t, p, 2).parse_int() ?? -1
+        let ty = ty_at(t, p, 4)
+        if not ir.ty_scalar(ty) {
+            bad(v, "outside the subset: parameter of type {ty_text(t, p, 4)} in `{info.c_name[c]}`")
+        }
+        let pv = new_var(v, ty)
+        if mode == "inout" {
+            inout_ids.push(id)
+            inout_addr.push(pv)
+            inout_ty.push(ty)
+        } else {
+            v.tvar.set(id, pv)
+        }
+    }
+    v.nparams = v.nvars
+    let entry = new_block(v)
+    switch_to(v, entry)
+    // An `inout` parameter arrives as the address of the caller's slot: it
+    // is read once here and written back at every return.
+    for i in 0..inout_ids.len() {
+        let val = new_var(v, inout_ty[i])
+        emit(v, ir.M_LOAD, val, inout_addr[i], -1, 0)
+        v.tvar.set(inout_ids[i], val)
+        v.io_val.push(val)
+        v.io_addr.push(inout_addr[i])
+    }
+    // [E-RECURSION-DEPTH]: a function that can reach itself checks the
+    // stack against the floor it was handed.
+    if v.floor >= 0 {
+        let sp = new_var(v, ir.TY_I64)
+        emit(v, ir.M_GETSP, sp, -1, -1, 0)
+        let lowc = icmp(v, ir.CC_ULT, sp, v.floor)
+        let over = new_block(v)
+        let ok = new_block(v)
+        term_brif(v, lowc, over, ok)
+        switch_to(v, over)
+        callrt(v, ir.RT_PANIC_STACK, [])
+        switch_to(v, ok)
+    }
+    let x = lower_expr(info, v, body)
+    if v.open {
+        var r = x
+        if v.returns and r < 0 {
+            r = konst(v, 0)
+        }
+        do_return(v, r)
+    }
+    v
+}
+
+/// The C entry point: publishes `argv` for `args()`, runs `main`, and
+/// returns 0 -- what the Cranelift build's `main` does, less the layout
+/// checks, which guard inline reads of runtime values this backend does not
+/// make.
+pub fn lower_entry(info: TirInfo) -> Vir {
+    var v = new_vir()
+    let argc = new_var(v, ir.TY_I64)
+    let argv = new_var(v, ir.TY_I64)
+    v.nparams = 2
+    v.returns = true
+    let entry = new_block(v)
+    switch_to(v, entry)
+    let n = op1(v, ir.M_SEXT32, argc)
+    let one = konst(v, 1)
+    let n1 = op2(v, ir.M_SUB, n, one)
+    let eight = konst(v, 8)
+    let av = op2(v, ir.M_ADD, argv, eight)
+    callrt(v, ir.RT_SET_ARGS, [n1, av])
+    var args: [i64] = []
+    if info.recursive[info.main_c] {
+        args.push(floor_arg(v))
+    }
+    call_fn(v, info.main_c, args, false)
+    callrt(v, ir.RT_CHECK_LEAKS, [])
+    let z = konst(v, 0)
+    do_return(v, z)
+    v
+}

@@ -1,0 +1,198 @@
+// The program as a whole, read from its TIR: what can be called, what `main`
+// reaches, which functions can reach themselves, and what each is called in
+// the object file.
+//
+// Functions and module-level constants are both *callables*. A constant is
+// evaluated wherever it is read ([T-CONST]: "a top-level `let` is
+// re-evaluated on every read"), so it compiles to a function of no arguments
+// and a read is a call -- which also puts it in the call graph, where
+// [E-RECURSION-DEPTH] says it belongs.
+import sexp
+
+type TirInfo = {
+    t: TirTree,
+    /// Per callable, in declaration order: TIR functions first, then
+    /// constants.
+    c_name: [str],
+    c_elem: [i64],
+    c_const: [bool],
+    fn_ix: Map[str, i64],
+    const_ix: Map[str, i64],
+    main_c: i64,
+    /// What each callable calls or reads: `edges[e0[c] .. e0[c] + en[c]]`.
+    e0: [i64],
+    en: [i64],
+    edges: [i64],
+    reach: [bool],
+    recursive: [bool],
+    sym: [str],
+}
+
+/// Keeps a symbol to the characters every tool accepts.
+fn sanitize(s: str) -> str {
+    var out = str_builder()
+    for c in s.codes() {
+        if (c >= 48 and c <= 57) or (c >= 65 and c <= 90) or (c >= 97 and c <= 122) or c == 95 {
+            out.push_str(c.to_char())
+        } else {
+            out.push_str("_")
+        }
+    }
+    out.to_str()
+}
+
+/// `main::fib` -> `_g_main_fib`, as the Cranelift backend names it, with the
+/// characters a symbol should not hold replaced.
+fn symbol_for(name: str, is_const: bool) -> str {
+    let parts = name.split("::")
+    var module = ""
+    var short = name
+    if parts.len() >= 2 {
+        module = parts.slice(0, parts.len() - 1).join("_")
+        short = parts[parts.len() - 1]
+    }
+    let prefix = if is_const { "_gk_" } else { "_g_" }
+    prefix + sanitize(module.replace(".", "_")) + "_" + sanitize(short)
+}
+
+/// Every `call` and constant read anywhere under element `root`.
+fn callees_of(info: TirInfo, root: i64) -> [i64] {
+    let t = info.t
+    var out: [i64] = []
+    var stack: [i64] = [root]
+    while not stack.is_empty() {
+        let e = stack.pop() ?? 0
+        if t.kind[e] != 2 {
+            continue
+        }
+        let k = sexp.kw(t, e)
+        if k == "call" {
+            let c = info.fn_ix.get(sexp.word(t, e, 3)) ?? -1
+            if c >= 0 {
+                out.push(c)
+            }
+        } else if k == "const" and sexp.word(t, e, 2).starts_with("@") {
+            let c = info.const_ix.get(sexp.word(t, e, 3)) ?? -1
+            if c >= 0 {
+                out.push(c)
+            }
+        }
+        var i = t.count[e] - 1
+        while i >= 0 {
+            let x = sexp.at(t, e, i)
+            if t.kind[x] == 2 {
+                stack.push(x)
+            }
+            i -= 1
+        }
+    }
+    out
+}
+
+/// Indexes the program and answers the whole-program questions.
+pub fn index(t: TirTree) -> TirInfo ! str {
+    var info = TirInfo{
+        t: t, c_name: [], c_elem: [], c_const: [], fn_ix: {}, const_ix: {}, main_c: -1,
+        e0: [], en: [], edges: [], reach: [], recursive: [], sym: [],
+    }
+    var main_name = ""
+    var consts: [i64] = []
+    for r in t.roots {
+        let k = sexp.kw(t, r)
+        if k == "fn" {
+            let name = sexp.word(t, r, 1)
+            info.fn_ix.set(name, info.c_name.len())
+            info.c_name.push(name)
+            info.c_elem.push(r)
+            info.c_const.push(false)
+        } else if k == "const" {
+            consts.push(r)
+        } else if k == "main" {
+            main_name = sexp.word(t, r, 1)
+        }
+    }
+    for r in consts {
+        let name = sexp.word(t, r, 1)
+        info.const_ix.set(name, info.c_name.len())
+        info.c_name.push(name)
+        info.c_elem.push(r)
+        info.c_const.push(true)
+    }
+    if main_name == "" {
+        fail("the program has no `main`")
+    }
+    info.main_c = info.fn_ix.get(main_name) ?? -1
+    if info.main_c < 0 {
+        fail("`main` names `{main_name}`, which is not a function")
+    }
+    let n = info.c_name.len()
+    for c in 0..n {
+        info.e0.push(info.edges.len())
+        let cs = callees_of(info, info.c_elem[c])
+        info.en.push(cs.len())
+        for x in cs {
+            info.edges.push(x)
+        }
+        info.reach.push(false)
+        info.recursive.push(false)
+    }
+    // What `main` reaches.
+    var work: [i64] = [info.main_c]
+    while not work.is_empty() {
+        let c = work.pop() ?? 0
+        if info.reach[c] {
+            continue
+        }
+        info.reach[c] = true
+        for j in info.e0[c]..(info.e0[c] + info.en[c]) {
+            work.push(info.edges[j])
+        }
+    }
+    // Which of those can reach themselves.
+    for c in 0..n {
+        if not info.reach[c] {
+            continue
+        }
+        var seen: [bool] = []
+        for k2 in 0..n {
+            seen.push(false)
+        }
+        var st: [i64] = []
+        for j in info.e0[c]..(info.e0[c] + info.en[c]) {
+            st.push(info.edges[j])
+        }
+        while not st.is_empty() {
+            let x = st.pop() ?? 0
+            if x == c {
+                info.recursive[c] = true
+                break
+            }
+            if seen[x] {
+                continue
+            }
+            seen[x] = true
+            for j in info.e0[x]..(info.e0[x] + info.en[x]) {
+                st.push(info.edges[j])
+            }
+        }
+    }
+    // Symbols, unique within the object.
+    var used: Map[str, i64] = {}
+    used.set("_main", 1)
+    for c in 0..n {
+        if not info.reach[c] {
+            info.sym.push("")
+            continue
+        }
+        let base = symbol_for(info.c_name[c], info.c_const[c])
+        var s = base
+        var k = 2
+        while used.has(s) {
+            s = base + "_{k}"
+            k += 1
+        }
+        used.set(s, 1)
+        info.sym.push(s)
+    }
+    info
+}

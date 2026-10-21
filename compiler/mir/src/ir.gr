@@ -1,0 +1,398 @@
+// MIR: what the backend's middle speaks (docs/self-hosting.md §4).
+//
+// SSA with block arguments: every value is defined once, either as a block
+// parameter or as an instruction's result, and a branch passes its target's
+// parameters explicitly -- no phi nodes. Values are machine words; the types
+// that decide an operation's meaning (signedness, width) have already been
+// turned into the choice of operation, so MIR has one value type.
+//
+// Everything is in flat arrays addressed by integer ids (§3.5): a block's
+// instructions are a contiguous run, its parameters a run of `bparams`, a
+// call's arguments a run of `cargs`.
+//
+// Reference counting is not here yet. The subset this part compiles has no
+// heap values (S3 part two adds `inc`/`dec` as explicit instructions).
+
+// ----- opcodes -------------------------------------------------------------
+// The same numbers serve the variable form the lowering builds first
+// (`lower.gr`) and the SSA form it becomes (`ssa.gr`).
+
+pub let M_ICONST = 1
+/// Only in the variable form: SSA construction turns every copy into a
+/// renaming, so no `M_COPY` survives into MIR.
+pub let M_COPY = 2
+pub let M_ADD = 3
+pub let M_SUB = 4
+pub let M_MUL = 5
+pub let M_SDIV = 6
+pub let M_UDIV = 7
+pub let M_SREM = 8
+pub let M_UREM = 9
+pub let M_AND = 10
+pub let M_OR = 11
+pub let M_XOR = 12
+pub let M_SHL = 13
+pub let M_SSHR = 14
+pub let M_USHR = 15
+pub let M_NEG = 16
+pub let M_NOT = 17
+pub let M_SEXT8 = 18
+pub let M_SEXT16 = 19
+pub let M_SEXT32 = 20
+pub let M_UEXT8 = 21
+pub let M_UEXT16 = 22
+pub let M_UEXT32 = 23
+/// `res = a <cc> b`, 0 or 1; `imm` is the condition (`CC_*`).
+pub let M_ICMP = 24
+/// A call of a compiled function: `imm` is the callee's callable id.
+pub let M_CALL = 25
+/// A call into the runtime: `imm` is the symbol (`RT_*`).
+pub let M_CALLRT = 26
+/// The address of string literal `imm` in the object's data.
+pub let M_STRADDR = 27
+/// The stack pointer, for the recursion-depth check ([E-RECURSION-DEPTH]).
+pub let M_GETSP = 28
+/// The address of 8-byte frame slot `imm` (an `inout` argument's home).
+pub let M_SLOTADDR = 29
+pub let M_LOAD = 30
+pub let M_STORE = 31
+// Terminators.
+pub let M_JUMP = 40
+pub let M_BRIF = 41
+pub let M_RET = 42
+/// Control cannot reach here: after a call that does not return, or past a
+/// `match` the checker proved exhaustive.
+pub let M_TRAP = 43
+
+/// Whether an instruction has no effect but its result, so it may be
+/// removed when nothing reads the result.
+pub fn pure_op(op: i64) -> bool {
+    op != M_CALL and op != M_CALLRT and op != M_STORE and op < M_JUMP
+}
+
+// ----- conditions ------------------------------------------------------------
+
+pub let CC_EQ = 0
+pub let CC_NE = 1
+pub let CC_SLT = 2
+pub let CC_SLE = 3
+pub let CC_SGT = 4
+pub let CC_SGE = 5
+pub let CC_ULT = 6
+pub let CC_ULE = 7
+pub let CC_UGT = 8
+pub let CC_UGE = 9
+
+pub fn cc_name(cc: i64) -> str {
+    match cc {
+        0 -> "eq"
+        1 -> "ne"
+        2 -> "slt"
+        3 -> "sle"
+        4 -> "sgt"
+        5 -> "sge"
+        6 -> "ult"
+        7 -> "ule"
+        8 -> "ugt"
+        9 -> "uge"
+        _ -> "cc?"
+    }
+}
+
+// ----- the types TIR writes, as the subset knows them ------------------------
+
+pub let TY_OTHER = -1
+pub let TY_UNIT = 0
+pub let TY_I64 = 1
+pub let TY_BOOL = 2
+pub let TY_I8 = 3
+pub let TY_I16 = 4
+pub let TY_I32 = 5
+pub let TY_U8 = 6
+pub let TY_U16 = 7
+pub let TY_U32 = 8
+pub let TY_U64 = 9
+pub let TY_NEVER = 10
+
+pub fn ty_of_name(name: str) -> i64 {
+    match name {
+        "unit" -> 0
+        "i64" -> 1
+        "bool" -> 2
+        "i8" -> 3
+        "i16" -> 4
+        "i32" -> 5
+        "u8" -> 6
+        "u16" -> 7
+        "u32" -> 8
+        "u64" -> 9
+        "never" -> 10
+        _ -> -1
+    }
+}
+
+/// An integer type: what arithmetic is defined on.
+pub fn ty_int(t: i64) -> bool {
+    t == TY_I64 or (t >= TY_I8 and t <= TY_U64)
+}
+
+pub fn ty_unsigned(t: i64) -> bool {
+    t >= TY_U8 and t <= TY_U64
+}
+
+/// A type the subset holds in a register.
+pub fn ty_scalar(t: i64) -> bool {
+    t >= TY_UNIT and t <= TY_NEVER
+}
+
+// ----- runtime symbols -------------------------------------------------------
+// The C functions of `crates/grasm_rt` this backend calls: the same symbols,
+// with the same arguments, as the Cranelift backend uses for the same
+// constructs (`crates/grasm_native`).
+
+pub let RT_OUT_TEXT = 0
+pub let RT_OUT_I64 = 1
+pub let RT_OUT_U64 = 2
+pub let RT_OUT_BOOL = 3
+pub let RT_OUT_NL = 4
+pub let RT_OUT_TO_STDERR = 5
+pub let RT_PANIC_DIV_ZERO = 6
+pub let RT_PANIC_REM_ZERO = 7
+pub let RT_PANIC_MSG = 8
+pub let RT_PANIC_ASSERT = 9
+pub let RT_PANIC_VALUE = 10
+pub let RT_STR_BUILD = 11
+pub let RT_STR_BUILD_TEXT = 12
+pub let RT_STR_BUILD_I64 = 13
+pub let RT_STR_BUILD_BOOL = 14
+pub let RT_STR_BUILD_END = 15
+pub let RT_EXIT = 16
+pub let RT_STACK_FLOOR = 17
+pub let RT_PANIC_STACK = 18
+pub let RT_SET_ARGS = 19
+pub let RT_CHECK_LEAKS = 20
+pub let RT_POW_I64 = 21
+pub let RT_COUNT = 22
+
+pub fn rt_name(id: i64) -> str {
+    match id {
+        0 -> "grasm_out_text"
+        1 -> "grasm_out_i64"
+        2 -> "grasm_out_u64"
+        3 -> "grasm_out_bool"
+        4 -> "grasm_out_nl"
+        5 -> "grasm_out_to_stderr"
+        6 -> "grasm_panic_div_zero"
+        7 -> "grasm_panic_rem_zero"
+        8 -> "grasm_panic_msg"
+        9 -> "grasm_panic_assert"
+        10 -> "grasm_panic_value"
+        11 -> "grasm_str_build"
+        12 -> "grasm_str_build_text"
+        13 -> "grasm_str_build_i64"
+        14 -> "grasm_str_build_bool"
+        15 -> "grasm_str_build_end"
+        16 -> "grasm_exit"
+        17 -> "grasm_stack_floor"
+        18 -> "grasm_panic_stack"
+        19 -> "grasm_set_args"
+        20 -> "grasm_check_leaks"
+        21 -> "grasm_pow_i64"
+        _ -> "grasm_unknown"
+    }
+}
+
+/// Whether a runtime function returns a value.
+pub fn rt_returns(id: i64) -> bool {
+    id == RT_STR_BUILD or id == RT_STR_BUILD_END or id == RT_STACK_FLOOR or id == RT_POW_I64
+}
+
+/// Whether a runtime function never returns (it panics or exits).
+pub fn rt_noreturn(id: i64) -> bool {
+    id == RT_PANIC_DIV_ZERO or id == RT_PANIC_REM_ZERO or id == RT_PANIC_MSG or id == RT_PANIC_ASSERT or id == RT_PANIC_VALUE or id == RT_EXIT or id == RT_PANIC_STACK
+}
+
+// ----- the IR ------------------------------------------------------------------
+
+/// One function in SSA form.
+type MirFn = {
+    /// The TIR name (`main::fib`), or `<entry>` for the C `main`.
+    name: str,
+    /// The object symbol, leading underscore included.
+    sym: str,
+    /// Takes the hidden stack floor as its first parameter.
+    floor: bool,
+    /// Parameters, the floor included: the entry block's parameters.
+    nparams: i64,
+    /// Whether it returns a value in x0.
+    returns: bool,
+    /// 8-byte frame slots for `inout` arguments.
+    nslots: i64,
+    nvals: i64,
+    // Blocks. Block 0 is the entry.
+    bp0: [i64],
+    bnp: [i64],
+    bparams: [i64],
+    bi0: [i64],
+    bni: [i64],
+    // Each block's terminator: its kind, the value it reads (the condition of
+    // a `M_BRIF`, the result of a `M_RET`, else -1), its targets, and the
+    // arguments passed to each target.
+    tk: [i64],
+    tv: [i64],
+    tt: [i64],
+    tf: [i64],
+    ta0: [i64],
+    tan: [i64],
+    fa0: [i64],
+    fan: [i64],
+    targs: [i64],
+    // Instructions.
+    op: [i64],
+    res: [i64],
+    a: [i64],
+    b: [i64],
+    imm: [i64],
+    ca0: [i64],
+    can: [i64],
+    cargs: [i64],
+}
+
+pub fn new_fn(name: str, sym: str) -> MirFn {
+    MirFn{
+        name: name, sym: sym, floor: false, nparams: 0, returns: false, nslots: 0, nvals: 0,
+        bp0: [], bnp: [], bparams: [], bi0: [], bni: [],
+        tk: [], tv: [], tt: [], tf: [], ta0: [], tan: [], fa0: [], fan: [], targs: [],
+        op: [], res: [], a: [], b: [], imm: [], ca0: [], can: [], cargs: [],
+    }
+}
+
+/// The whole program: every function the subset compiles, in TIR order,
+/// then the C entry; and the string literals they print.
+type MirProg = {
+    fns: [MirFn],
+    /// Per callable id (TIR functions, then constants): its symbol, or ""
+    /// when nothing reachable from `main` calls it.
+    callee_sym: [str],
+    strs: [str],
+}
+
+// ----- reading it back -----------------------------------------------------------
+
+pub fn nblocks(f: MirFn) -> i64 {
+    f.bi0.len()
+}
+
+pub fn op_name(op: i64) -> str {
+    match op {
+        1 -> "iconst"
+        2 -> "copy"
+        3 -> "add"
+        4 -> "sub"
+        5 -> "mul"
+        6 -> "sdiv"
+        7 -> "udiv"
+        8 -> "srem"
+        9 -> "urem"
+        10 -> "and"
+        11 -> "or"
+        12 -> "xor"
+        13 -> "shl"
+        14 -> "sshr"
+        15 -> "ushr"
+        16 -> "neg"
+        17 -> "not"
+        18 -> "sext8"
+        19 -> "sext16"
+        20 -> "sext32"
+        21 -> "uext8"
+        22 -> "uext16"
+        23 -> "uext32"
+        24 -> "icmp"
+        25 -> "call"
+        26 -> "callrt"
+        27 -> "straddr"
+        28 -> "getsp"
+        29 -> "slotaddr"
+        30 -> "load"
+        31 -> "store"
+        40 -> "jump"
+        41 -> "brif"
+        42 -> "ret"
+        43 -> "trap"
+        _ -> "op?"
+    }
+}
+
+/// How many value operands an instruction reads from `a` and `b`.
+pub fn nreads(op: i64) -> i64 {
+    if op == M_ICONST or op == M_STRADDR or op == M_GETSP or op == M_SLOTADDR or op == M_CALL or op == M_CALLRT {
+        0
+    } else if op == M_COPY or op == M_NEG or op == M_NOT or (op >= M_SEXT8 and op <= M_UEXT32) or op == M_LOAD {
+        1
+    } else {
+        2
+    }
+}
+
+fn vname(v: i64) -> str {
+    if v < 0 {
+        "_"
+    } else {
+        "v{v}"
+    }
+}
+
+fn arg_list(xs: [i64], from: i64, n: i64) -> str {
+    var parts: [str] = []
+    for i in from..(from + n) {
+        parts.push(vname(xs[i]))
+    }
+    parts.join(", ")
+}
+
+/// The function as text, one instruction a line, for reading and for
+/// debugging the stages after it.
+pub fn print_fn(f: MirFn, callee_sym: [str]) -> str {
+    var out = str_builder()
+    out.push_str("fn {f.sym} ({f.name}) params={f.nparams} floor={f.floor} returns={f.returns} slots={f.nslots}\n")
+    for b in 0..nblocks(f) {
+        out.push_str("  b{b}({arg_list(f.bparams, f.bp0[b], f.bnp[b])}):\n")
+        for i in f.bi0[b]..(f.bi0[b] + f.bni[b]) {
+            let op = f.op[i]
+            var line = "    "
+            if f.res[i] >= 0 {
+                line = line + "v{f.res[i]} = "
+            }
+            line = line + op_name(op)
+            if op == M_ICONST or op == M_SLOTADDR {
+                line = line + " {f.imm[i]}"
+            } else if op == M_STRADDR {
+                line = line + " s{f.imm[i]}"
+            } else if op == M_ICMP {
+                line = line + "." + cc_name(f.imm[i]) + " {vname(f.a[i])}, {vname(f.b[i])}"
+            } else if op == M_CALL {
+                let callee = if f.imm[i] >= 0 and f.imm[i] < callee_sym.len() { callee_sym[f.imm[i]] } else { "?" }
+                line = line + " {callee}({arg_list(f.cargs, f.ca0[i], f.can[i])})"
+            } else if op == M_CALLRT {
+                line = line + " {rt_name(f.imm[i])}({arg_list(f.cargs, f.ca0[i], f.can[i])})"
+            } else if nreads(op) == 1 {
+                line = line + " {vname(f.a[i])}"
+            } else if nreads(op) == 2 {
+                line = line + " {vname(f.a[i])}, {vname(f.b[i])}"
+            }
+            out.push_str(line + "\n")
+        }
+        let k = f.tk[b]
+        if k == M_JUMP {
+            out.push_str("    jump b{f.tt[b]}({arg_list(f.targs, f.ta0[b], f.tan[b])})\n")
+        } else if k == M_BRIF {
+            out.push_str("    brif {vname(f.tv[b])}, b{f.tt[b]}({arg_list(f.targs, f.ta0[b], f.tan[b])}), b{f.tf[b]}({arg_list(f.targs, f.fa0[b], f.fan[b])})\n")
+        } else if k == M_RET {
+            out.push_str("    ret {vname(f.tv[b])}\n")
+        } else {
+            out.push_str("    trap\n")
+        }
+    }
+    out.to_str()
+}

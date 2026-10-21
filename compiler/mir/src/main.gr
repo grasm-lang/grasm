@@ -1,0 +1,105 @@
+// `mir`: TIR in, SSA MIR out (docs/self-hosting.md, stage S3).
+//
+//     sexp.gr   the TIR text reader
+//     prog.gr   the whole program: callables, reachability, recursion, symbols
+//     lower.gr  TIR to three-address code over variables; decides the subset
+//     ssa.gr    variables to SSA with block arguments
+//     ir.gr     MIR itself: opcodes, the function record, a printer
+import sexp
+import ir
+import prog
+import lower
+import ssa
+
+/// Reads a program's TIR and builds the MIR of every function `main`
+/// reaches, plus the C entry point. A program outside the subset is an
+/// error naming every construct that put it there.
+pub fn build(src: bytes) -> MirProg ! str {
+    let t = try sexp.read(src)
+    let info = try prog.index(t)
+    var errors: [str] = []
+    let me = info.c_elem[info.main_c]
+    if sexp.kids(t, sexp.kids(t, me)[0]).len() > 0 {
+        errors.push("outside the subset: `main` takes parameters")
+    }
+    let mret = sexp.word(t, me, 4)
+    if mret != "unit" {
+        errors.push("outside the subset: `main` answers {mret}")
+    }
+    var fns: [MirFn] = []
+    var strs: [str] = []
+    var str_ix: Map[str, i64] = {}
+    var order: [i64] = []
+    for c in 0..info.c_name.len() {
+        if info.reach[c] {
+            order.push(c)
+        }
+    }
+    // The C entry, last.
+    order.push(-1)
+    for c in order {
+        var v = if c >= 0 { lower.lower_callable(info, c) } else { lower.lower_entry(info) }
+        let name = if c >= 0 { info.c_name[c] } else { "<entry>" }
+        let sym = if c >= 0 { info.sym[c] } else { "_main" }
+        for m in v.errors {
+            errors.push("{name}: {m}")
+        }
+        if v.errors.len() > 0 {
+            continue
+        }
+        // String literals go into one pool for the object, each once.
+        for i in 0..v.op.len() {
+            if v.op[i] == ir.M_STRADDR {
+                let s = v.strs[v.imm[i]]
+                let g = match str_ix.get(s) {
+                    Some(k) -> k
+                    None -> {
+                        let k = strs.len()
+                        strs.push(s)
+                        str_ix.set(s, k)
+                        k
+                    }
+                }
+                v.imm[i] = g
+            }
+        }
+        let f = try ssa.to_ssa(v, name, sym)
+        fns.push(f)
+    }
+    if errors.len() > 0 {
+        fail(errors.join("\n"))
+    }
+    MirProg{ fns: fns, callee_sym: info.sym, strs: strs }
+}
+
+/// The whole program as text.
+pub fn print_prog(p: MirProg) -> str {
+    var out = str_builder()
+    for i in 0..p.strs.len() {
+        out.push_str("s{i} = {sexp_quote(p.strs[i])}\n")
+    }
+    for f in p.fns {
+        out.push_str(ir.print_fn(f, p.callee_sym))
+    }
+    out.to_str()
+}
+
+fn sexp_quote(s: str) -> str {
+    var out = str_builder()
+    out.push_str("\"")
+    for c in s.codes() {
+        if c == 34 {
+            out.push_str("\\\"")
+        } else if c == 92 {
+            out.push_str("\\\\")
+        } else if c == 10 {
+            out.push_str("\\n")
+        } else if c < 32 or c == 127 {
+            out.push_str("\\u" + c.to_base(16).pad_start(4, "0"))
+        } else {
+            out.push_str(c.to_char())
+        }
+    }
+    out.push_str("\"")
+    out.to_str()
+}

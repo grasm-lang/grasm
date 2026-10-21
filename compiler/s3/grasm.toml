@@ -1,0 +1,16 @@
+[package]
+name = "s3"
+version = "0.1.0"
+entry = "src/main.gr"
+
+# The driver: reads a TIR file and writes an object file, nothing else.
+capabilities = ["io"]
+
+[dependencies.mir]
+path = "../mir"
+
+[dependencies.aarch64]
+path = "../aarch64"
+
+[dependencies.macho]
+path = "../macho"

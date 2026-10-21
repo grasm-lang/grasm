@@ -1,0 +1,762 @@
+// The AArch64 instructions this backend emits: what each one is called,
+// which of its operands it reads and writes, how it is encoded and how the
+// system assembler spells it.
+//
+// Every attribute is a lookup on the opcode, so one table answers the
+// register allocator (roles), the checker (roles), the encoder (format and
+// base word) and the assembly printer (mnemonic, register widths). The
+// encoder is held to the assembler by `scripts/encodetest.sh`, across every
+// form the lowering rules and the frame code can emit, with generated
+// operands -- the printer is how that gate asks the assembler.
+//
+// Registers are numbered as operands: 0..30 are x0..x30, `R_ZR` is the zero
+// register and `R_SP` the stack pointer (both 31 in an encoding; which one an
+// encoding means depends on the field, and the encoder refuses the wrong one),
+// and `VR + n` is virtual register n before allocation.
+
+pub let R_ZR = 31
+pub let R_SP = 32
+pub let VR = 64
+
+pub fn is_vreg(o: i64) -> bool {
+    o >= 64
+}
+
+// ----- opcodes ---------------------------------------------------------------
+
+pub let A_ADDR = 1
+pub let A_SUBR = 2
+pub let A_ANDR = 3
+pub let A_ORRR = 4
+pub let A_EORR = 5
+pub let A_MUL = 6
+pub let A_SDIV = 7
+pub let A_UDIV = 8
+pub let A_LSLV = 9
+pub let A_LSRV = 10
+pub let A_ASRV = 11
+pub let A_MSUB = 12
+pub let A_CMPR = 13
+pub let A_NEG = 14
+pub let A_MVN = 15
+pub let A_MOV = 16
+pub let A_MOVW = 17
+pub let A_SXTB = 18
+pub let A_SXTH = 19
+pub let A_SXTW = 20
+pub let A_UXTB = 21
+pub let A_UXTH = 22
+pub let A_CSET = 23
+pub let A_ADDI = 24
+pub let A_SUBI = 25
+pub let A_CMPI = 26
+pub let A_CMNI = 27
+pub let A_MOVZ = 28
+pub let A_MOVN = 29
+pub let A_MOVK = 30
+pub let A_LDR = 31
+pub let A_STR = 32
+pub let A_STP_PRE = 33
+pub let A_LDP_POST = 34
+pub let A_B = 35
+pub let A_BL = 36
+pub let A_BCOND = 37
+pub let A_CBZ = 38
+pub let A_CBNZ = 39
+pub let A_RET = 40
+pub let A_RETAB = 41
+pub let A_PACIBSP = 42
+pub let A_BRK = 43
+pub let A_ADRP = 44
+pub let A_ADDPO = 45
+/// Not an instruction: the function's return, which becomes the epilogue.
+/// `imm` 1 when it returns x0.
+pub let P_RETURN = 60
+/// Not an instruction: a 64-bit constant, which instruction selection
+/// expands into `movz`/`movn` and `movk`s.
+pub let P_MOVIMM = 61
+
+/// The opcodes that are real instructions, for whoever wants all of them.
+pub fn all_mops() -> [i64] {
+    var out: [i64] = []
+    for m in 1..46 {
+        out.push(m)
+    }
+    out
+}
+
+pub fn mop_name(m: i64) -> str {
+    match m {
+        1 -> "add"
+        2 -> "sub"
+        3 -> "and"
+        4 -> "orr"
+        5 -> "eor"
+        6 -> "mul"
+        7 -> "sdiv"
+        8 -> "udiv"
+        9 -> "lsl"
+        10 -> "lsr"
+        11 -> "asr"
+        12 -> "msub"
+        13 -> "cmp"
+        14 -> "neg"
+        15 -> "mvn"
+        16 -> "mov"
+        17 -> "mov"
+        18 -> "sxtb"
+        19 -> "sxth"
+        20 -> "sxtw"
+        21 -> "uxtb"
+        22 -> "uxth"
+        23 -> "cset"
+        24 -> "add"
+        25 -> "sub"
+        26 -> "cmp"
+        27 -> "cmn"
+        28 -> "movz"
+        29 -> "movn"
+        30 -> "movk"
+        31 -> "ldr"
+        32 -> "str"
+        33 -> "stp"
+        34 -> "ldp"
+        35 -> "b"
+        36 -> "bl"
+        37 -> "b."
+        38 -> "cbz"
+        39 -> "cbnz"
+        40 -> "ret"
+        41 -> "retab"
+        42 -> "pacibsp"
+        43 -> "brk"
+        44 -> "adrp"
+        45 -> "add"
+        60 -> "<return>"
+        61 -> "<movimm>"
+        _ -> "<?>"
+    }
+}
+
+/// A short name for the form, unique per opcode, for gate output.
+pub fn form_name(m: i64) -> str {
+    match m {
+        1 -> "add-reg"
+        2 -> "sub-reg"
+        3 -> "and-reg"
+        4 -> "orr-reg"
+        5 -> "eor-reg"
+        6 -> "mul"
+        7 -> "sdiv"
+        8 -> "udiv"
+        9 -> "lslv"
+        10 -> "lsrv"
+        11 -> "asrv"
+        12 -> "msub"
+        13 -> "cmp-reg"
+        14 -> "neg"
+        15 -> "mvn"
+        16 -> "mov-reg"
+        17 -> "mov-w"
+        18 -> "sxtb"
+        19 -> "sxth"
+        20 -> "sxtw"
+        21 -> "uxtb"
+        22 -> "uxth"
+        23 -> "cset"
+        24 -> "add-imm"
+        25 -> "sub-imm"
+        26 -> "cmp-imm"
+        27 -> "cmn-imm"
+        28 -> "movz"
+        29 -> "movn"
+        30 -> "movk"
+        31 -> "ldr-uimm"
+        32 -> "str-uimm"
+        33 -> "stp-pre"
+        34 -> "ldp-post"
+        35 -> "b"
+        36 -> "bl"
+        37 -> "b.cond"
+        38 -> "cbz"
+        39 -> "cbnz"
+        40 -> "ret"
+        41 -> "retab"
+        42 -> "pacibsp"
+        43 -> "brk"
+        44 -> "adrp"
+        45 -> "add-pageoff"
+        _ -> "?"
+    }
+}
+
+// Formats.
+let F_RRR = 1
+let F_CMPR = 2
+let F_RRRR = 3
+let F_RM = 4
+let F_RN = 5
+let F_CSET = 6
+let F_IMM12 = 7
+let F_CMPI = 8
+let F_MOVW = 9
+let F_LDST = 10
+let F_PAIR = 11
+let F_B26 = 12
+let F_B19 = 13
+let F_CB = 14
+let F_FIXED = 15
+let F_BRK = 16
+let F_ADRP = 17
+let F_ADDPO = 18
+
+fn mop_fmt(m: i64) -> i64 {
+    if m <= 11 {
+        1
+    } else if m == 12 {
+        3
+    } else if m == 13 {
+        2
+    } else if m <= 17 {
+        4
+    } else if m <= 22 {
+        5
+    } else if m == 23 {
+        6
+    } else if m <= 25 {
+        7
+    } else if m <= 27 {
+        8
+    } else if m <= 30 {
+        9
+    } else if m <= 32 {
+        10
+    } else if m <= 34 {
+        11
+    } else if m <= 36 {
+        12
+    } else if m == 37 {
+        13
+    } else if m <= 39 {
+        14
+    } else if m <= 42 {
+        15
+    } else if m == 43 {
+        16
+    } else if m == 44 {
+        17
+    } else if m == 45 {
+        18
+    } else {
+        0
+    }
+}
+
+/// The instruction word with every operand field zero.
+fn mop_base(m: i64) -> i64 {
+    match m {
+        1 -> 0x8B000000
+        2 -> 0xCB000000
+        3 -> 0x8A000000
+        4 -> 0xAA000000
+        5 -> 0xCA000000
+        6 -> 0x9B007C00
+        7 -> 0x9AC00C00
+        8 -> 0x9AC00800
+        9 -> 0x9AC02000
+        10 -> 0x9AC02400
+        11 -> 0x9AC02800
+        12 -> 0x9B008000
+        13 -> 0xEB00001F
+        14 -> 0xCB0003E0
+        15 -> 0xAA2003E0
+        16 -> 0xAA0003E0
+        17 -> 0x2A0003E0
+        18 -> 0x93401C00
+        19 -> 0x93403C00
+        20 -> 0x93407C00
+        21 -> 0x53001C00
+        22 -> 0x53003C00
+        23 -> 0x9A9F07E0
+        24 -> 0x91000000
+        25 -> 0xD1000000
+        26 -> 0xF100001F
+        27 -> 0xB100001F
+        28 -> 0xD2800000
+        29 -> 0x92800000
+        30 -> 0xF2800000
+        31 -> 0xF9400000
+        32 -> 0xF9000000
+        33 -> 0xA9800000
+        34 -> 0xA8C00000
+        35 -> 0x14000000
+        36 -> 0x94000000
+        37 -> 0x54000000
+        38 -> 0xB4000000
+        39 -> 0xB5000000
+        40 -> 0xD65F03C0
+        41 -> 0xD65F0FFF
+        42 -> 0xD503237F
+        43 -> 0xD4200000
+        44 -> 0x90000000
+        45 -> 0x91000000
+        _ -> 0
+    }
+}
+
+// ----- operand roles -----------------------------------------------------------
+// 0: unused, 1: written, 2: read, 3: read and written.
+
+pub let ROLE_NONE = 0
+pub let ROLE_DEF = 1
+pub let ROLE_USE = 2
+pub let ROLE_USEDEF = 3
+
+pub fn role_d(m: i64) -> i64 {
+    if m == A_CMPR or m == A_CMPI or m == A_CMNI or m == A_B or m == A_BL or m == A_BCOND or m == A_CBZ or m == A_CBNZ or m == A_RET or m == A_RETAB or m == A_PACIBSP or m == A_BRK or m == P_RETURN {
+        0
+    } else if m == A_MOVK {
+        3
+    } else if m == A_STR or m == A_STP_PRE {
+        2
+    } else {
+        1
+    }
+}
+
+pub fn role_n(m: i64) -> i64 {
+    let f = mop_fmt(m)
+    if f == 1 or f == 2 or f == 3 or f == 5 or f == 7 or f == 8 or f == 10 or f == 11 or f == 14 or f == 18 {
+        2
+    } else {
+        0
+    }
+}
+
+pub fn role_m(m: i64) -> i64 {
+    let f = mop_fmt(m)
+    if f == 1 or f == 2 or f == 3 or f == 4 {
+        2
+    } else if m == A_STP_PRE {
+        2
+    } else if m == A_LDP_POST {
+        1
+    } else {
+        0
+    }
+}
+
+pub fn role_a(m: i64) -> i64 {
+    if m == A_MSUB { 2 } else { 0 }
+}
+
+/// Which fields may name the stack pointer (where 31 means `sp`); every
+/// other register field means the zero register by 31.
+fn sp_field(m: i64, field: i64) -> bool {
+    if m == A_ADDI or m == A_SUBI or m == A_ADDPO {
+        field == 0 or field == 1
+    } else if m == A_CMPI or m == A_CMNI or m == A_LDR or m == A_STR or m == A_STP_PRE or m == A_LDP_POST {
+        field == 1
+    } else {
+        false
+    }
+}
+
+/// Which fields are 32-bit (`w`) registers in the assembly.
+fn w_field(m: i64, field: i64) -> bool {
+    if m == A_MOVW {
+        field == 0 or field == 2
+    } else if m == A_UXTB or m == A_UXTH {
+        field == 0 or field == 1
+    } else if m == A_SXTB or m == A_SXTH or m == A_SXTW {
+        field == 1
+    } else {
+        false
+    }
+}
+
+// ----- conditions ----------------------------------------------------------------
+
+pub let C_EQ = 0
+pub let C_NE = 1
+pub let C_HS = 2
+pub let C_LO = 3
+pub let C_HI = 8
+pub let C_LS = 9
+pub let C_GE = 10
+pub let C_LT = 11
+pub let C_GT = 12
+pub let C_LE = 13
+
+pub fn cond_name(c: i64) -> str {
+    match c {
+        0 -> "eq"
+        1 -> "ne"
+        2 -> "hs"
+        3 -> "lo"
+        4 -> "mi"
+        5 -> "pl"
+        6 -> "vs"
+        7 -> "vc"
+        8 -> "hi"
+        9 -> "ls"
+        10 -> "ge"
+        11 -> "lt"
+        12 -> "gt"
+        13 -> "le"
+        14 -> "al"
+        _ -> "nv"
+    }
+}
+
+/// The condition that holds exactly when `c` does not.
+pub fn cond_invert(c: i64) -> i64 {
+    c.bit_xor(1)
+}
+
+// ----- encoding ------------------------------------------------------------------
+
+/// A register operand as its 5-bit field, refusing the wrong kind of 31.
+fn reg_field(m: i64, field: i64, o: i64) -> i64 ! str {
+    if o < 0 {
+        fail("{form_name(m)}: operand {field} is missing")
+    }
+    if is_vreg(o) {
+        fail("{form_name(m)}: operand {field} is still virtual (v{o - 64})")
+    }
+    if o == R_SP {
+        if not sp_field(m, field) {
+            fail("{form_name(m)}: operand {field} cannot be sp")
+        }
+        return 31
+    }
+    if o == R_ZR {
+        if sp_field(m, field) {
+            fail("{form_name(m)}: operand {field} cannot be the zero register")
+        }
+        return 31
+    }
+    if o > 30 {
+        fail("{form_name(m)}: no register {o}")
+    }
+    o
+}
+
+fn uimm(m: i64, what: str, v: i64, bits: i64) -> i64 ! str {
+    if v < 0 or v >= 1.shl(bits) {
+        fail("{form_name(m)}: {what} {v} does not fit in {bits} bits")
+    }
+    v
+}
+
+/// A branch displacement in instructions, as a `bits`-wide field.
+fn disp(m: i64, off: i64, bits: i64) -> i64 ! str {
+    if off.bit_and(3) != 0 {
+        fail("{form_name(m)}: branch offset {off} is not a multiple of 4")
+    }
+    let w = off.shr(2)
+    let lim = 1.shl(bits - 1)
+    if w < 0 - lim or w >= lim {
+        fail("{form_name(m)}: branch offset {off} is out of range")
+    }
+    w.bit_and(1.shl(bits) - 1)
+}
+
+/// One instruction word. `off` is a branch's byte offset from itself; an
+/// instruction a relocation completes (`bl` to a symbol, `adrp`, the
+/// page-offset `add`) is encoded with the field zero, as the assembler
+/// leaves it for the linker.
+pub fn encode(m: i64, rd: i64, rn: i64, rm: i64, ra: i64, imm: i64, imm2: i64, cc: i64, off: i64) -> i64 ! str {
+    let base = mop_base(m)
+    let f = mop_fmt(m)
+    if f == 1 {
+        let d = try reg_field(m, 0, rd)
+        let n = try reg_field(m, 1, rn)
+        let mm = try reg_field(m, 2, rm)
+        return base.bit_or(mm.shl(16)).bit_or(n.shl(5)).bit_or(d)
+    }
+    if f == 2 {
+        let n = try reg_field(m, 1, rn)
+        let mm = try reg_field(m, 2, rm)
+        return base.bit_or(mm.shl(16)).bit_or(n.shl(5))
+    }
+    if f == 3 {
+        let d = try reg_field(m, 0, rd)
+        let n = try reg_field(m, 1, rn)
+        let mm = try reg_field(m, 2, rm)
+        let a = try reg_field(m, 3, ra)
+        return base.bit_or(mm.shl(16)).bit_or(a.shl(10)).bit_or(n.shl(5)).bit_or(d)
+    }
+    if f == 4 {
+        let d = try reg_field(m, 0, rd)
+        let mm = try reg_field(m, 2, rm)
+        return base.bit_or(mm.shl(16)).bit_or(d)
+    }
+    if f == 5 {
+        let d = try reg_field(m, 0, rd)
+        let n = try reg_field(m, 1, rn)
+        return base.bit_or(n.shl(5)).bit_or(d)
+    }
+    if f == 6 {
+        let d = try reg_field(m, 0, rd)
+        let c = try uimm(m, "condition", cc, 4)
+        if c >= 14 {
+            fail("cset: condition {c} has no inverse")
+        }
+        return base.bit_or(cond_invert(c).shl(12)).bit_or(d)
+    }
+    if f == 7 or f == 8 {
+        var d = 0
+        if f == 7 {
+            d = try reg_field(m, 0, rd)
+        }
+        let n = try reg_field(m, 1, rn)
+        let k = try uimm(m, "immediate", imm, 12)
+        let sh = try uimm(m, "shift", imm2, 1)
+        return base.bit_or(sh.shl(22)).bit_or(k.shl(10)).bit_or(n.shl(5)).bit_or(d)
+    }
+    if f == 9 {
+        let d = try reg_field(m, 0, rd)
+        let k = try uimm(m, "immediate", imm, 16)
+        let hw = try uimm(m, "shift", imm2, 2)
+        return base.bit_or(hw.shl(21)).bit_or(k.shl(5)).bit_or(d)
+    }
+    if f == 10 {
+        let t = try reg_field(m, 0, rd)
+        let n = try reg_field(m, 1, rn)
+        if imm.bit_and(7) != 0 {
+            fail("{form_name(m)}: offset {imm} is not a multiple of 8")
+        }
+        let k = try uimm(m, "offset", imm.shr(3), 12)
+        return base.bit_or(k.shl(10)).bit_or(n.shl(5)).bit_or(t)
+    }
+    if f == 11 {
+        let t = try reg_field(m, 0, rd)
+        let n = try reg_field(m, 1, rn)
+        let t2 = try reg_field(m, 2, rm)
+        if imm.bit_and(7) != 0 {
+            fail("{form_name(m)}: offset {imm} is not a multiple of 8")
+        }
+        let w = imm.shr(3)
+        if w < -64 or w > 63 {
+            fail("{form_name(m)}: offset {imm} is out of range")
+        }
+        return base.bit_or(w.bit_and(127).shl(15)).bit_or(t2.shl(10)).bit_or(n.shl(5)).bit_or(t)
+    }
+    if f == 12 {
+        let w = try disp(m, off, 26)
+        return base.bit_or(w)
+    }
+    if f == 13 {
+        let w = try disp(m, off, 19)
+        let c = try uimm(m, "condition", cc, 4)
+        return base.bit_or(w.shl(5)).bit_or(c)
+    }
+    if f == 14 {
+        let t = try reg_field(m, 1, rn)
+        let w = try disp(m, off, 19)
+        return base.bit_or(w.shl(5)).bit_or(t)
+    }
+    if f == 15 {
+        return base
+    }
+    if f == 16 {
+        let k = try uimm(m, "immediate", imm, 16)
+        return base.bit_or(k.shl(5))
+    }
+    if f == 17 {
+        let d = try reg_field(m, 0, rd)
+        return base.bit_or(d)
+    }
+    if f == 18 {
+        let d = try reg_field(m, 0, rd)
+        let n = try reg_field(m, 1, rn)
+        return base.bit_or(n.shl(5)).bit_or(d)
+    }
+    fail("opcode {m} has no encoding")
+}
+
+// ----- assembly text -------------------------------------------------------------
+
+pub fn reg_text(m: i64, field: i64, o: i64) -> str {
+    let w = w_field(m, field)
+    if o == R_SP {
+        return "sp"
+    }
+    if o == R_ZR {
+        return if w { "wzr" } else { "xzr" }
+    }
+    if is_vreg(o) {
+        return "v{o - 64}"
+    }
+    if w {
+        "w{o}"
+    } else {
+        "x{o}"
+    }
+}
+
+fn rel_text(off: i64) -> str {
+    if off < 0 {
+        ".-{0 - off}"
+    } else {
+        ".+{off}"
+    }
+}
+
+/// The instruction as the system assembler reads it. `target` is what a
+/// branch or a relocated instruction refers to: a symbol, or `""` to write
+/// the branch as an offset from itself.
+pub fn asm_text(m: i64, rd: i64, rn: i64, rm: i64, ra: i64, imm: i64, imm2: i64, cc: i64, off: i64, target: str) -> str {
+    let name = mop_name(m)
+    let f = mop_fmt(m)
+    let d = reg_text(m, 0, rd)
+    let n = reg_text(m, 1, rn)
+    let mm = reg_text(m, 2, rm)
+    if f == 1 {
+        return "{name} {d}, {n}, {mm}"
+    }
+    if f == 2 {
+        return "{name} {n}, {mm}"
+    }
+    if f == 3 {
+        return "{name} {d}, {n}, {mm}, {reg_text(m, 3, ra)}"
+    }
+    if f == 4 {
+        return "{name} {d}, {mm}"
+    }
+    if f == 5 {
+        return "{name} {d}, {n}"
+    }
+    if f == 6 {
+        return "{name} {d}, {cond_name(cc)}"
+    }
+    if f == 7 or f == 8 {
+        let sh = if imm2 == 1 { ", lsl #12" } else { "" }
+        if f == 7 {
+            return "{name} {d}, {n}, #{imm}{sh}"
+        }
+        return "{name} {n}, #{imm}{sh}"
+    }
+    if f == 9 {
+        if imm2 > 0 {
+            return "{name} {d}, #{imm}, lsl #{imm2 * 16}"
+        }
+        return "{name} {d}, #{imm}"
+    }
+    if f == 10 {
+        return "{name} {d}, [{n}, #{imm}]"
+    }
+    if f == 11 {
+        if m == A_STP_PRE {
+            return "{name} {d}, {mm}, [{n}, #{imm}]!"
+        }
+        return "{name} {d}, {mm}, [{n}], #{imm}"
+    }
+    if f == 12 {
+        if target != "" {
+            return "{name} {target}"
+        }
+        return "{name} {rel_text(off)}"
+    }
+    if f == 13 {
+        if target != "" {
+            return "b.{cond_name(cc)} {target}"
+        }
+        return "b.{cond_name(cc)} {rel_text(off)}"
+    }
+    if f == 14 {
+        if target != "" {
+            return "{name} {n}, {target}"
+        }
+        return "{name} {n}, {rel_text(off)}"
+    }
+    if f == 15 {
+        return name
+    }
+    if f == 16 {
+        return "{name} #{imm}"
+    }
+    if f == 17 {
+        return "{name} {d}, {target}@PAGE"
+    }
+    if f == 18 {
+        return "{name} {d}, {n}, {target}@PAGEOFF"
+    }
+    if m == P_RETURN {
+        return "<return>"
+    }
+    if m == P_MOVIMM {
+        return "<movimm> {d}, #{imm}"
+    }
+    "<?>"
+}
+
+/// The register a 16-bit chunk sequence materialises `k` with: (opcode,
+/// chunk, shift) triples, first a `movz` or `movn`, then `movk`s.
+pub fn movimm_seq(k: i64) -> [i64] {
+    var chunks: [i64] = []
+    for i in 0..4 {
+        chunks.push(k.ushr(16 * i).bit_and(65535))
+    }
+    var nzero = 0
+    var nones = 0
+    for c in chunks {
+        if c == 0 {
+            nzero += 1
+        }
+        if c == 65535 {
+            nones += 1
+        }
+    }
+    var out: [i64] = []
+    if nones > nzero {
+        // Start from all ones: `movn` writes the complement of its chunk.
+        var first = -1
+        for i in 0..4 {
+            if first < 0 and chunks[i] != 65535 {
+                first = i
+            }
+        }
+        if first < 0 {
+            out.push(A_MOVN)
+            out.push(0)
+            out.push(0)
+            return out
+        }
+        out.push(A_MOVN)
+        out.push(chunks[first].bit_xor(65535))
+        out.push(first)
+        for i in 0..4 {
+            if i != first and chunks[i] != 65535 {
+                out.push(A_MOVK)
+                out.push(chunks[i])
+                out.push(i)
+            }
+        }
+        return out
+    }
+    var first = -1
+    for i in 0..4 {
+        if first < 0 and chunks[i] != 0 {
+            first = i
+        }
+    }
+    if first < 0 {
+        out.push(A_MOVZ)
+        out.push(0)
+        out.push(0)
+        return out
+    }
+    out.push(A_MOVZ)
+    out.push(chunks[first])
+    out.push(first)
+    for i in 0..4 {
+        if i != first and chunks[i] != 0 {
+            out.push(A_MOVK)
+            out.push(chunks[i])
+            out.push(i)
+        }
+    }
+    out
+}

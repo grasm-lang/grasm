@@ -1,0 +1,228 @@
+// From allocated code to bytes: the frame, the prologue and epilogue, block
+// layout and branches, relocations.
+//
+// The frame follows what the Cranelift build does on this platform: the
+// return address is signed on entry (`pacibsp`) and authenticated on return
+// (`retab`), the frame-pointer chain is kept (`stp x29, x30` / `mov x29,
+// sp`), the callee-saved registers the body writes are saved in pairs, and
+// the rest of the frame -- `inout` slots, then spill slots -- is below them.
+//
+//     [x29, x30] [callee-saved pairs] [spill slots] [inout slots] <- sp
+//
+// Branches to the next block are dropped; a conditional branch to the next
+// block followed by a jump becomes the inverted branch. A call, and an
+// address of a string, leaves its field zero and a relocation for the
+// linker, so functions stay separate atoms (`MH_SUBSECTIONS_VIA_SYMBOLS`).
+import mach
+import regalloc
+import vcode
+
+pub let REL_BRANCH26 = 2
+pub let REL_PAGE21 = 3
+pub let REL_PAGEOFF12 = 4
+
+type A64Code = {
+    sym: str,
+    words: [i64],
+    rel_off: [i64],
+    rel_kind: [i64],
+    rel_symk: [i64],
+    rel_sym: [i64],
+    asm: [str],
+    frame: i64,
+    nspill: i64,
+    nsaved: i64,
+}
+
+type Emit = {
+    words: [i64],
+    rel_off: [i64],
+    rel_kind: [i64],
+    rel_symk: [i64],
+    rel_sym: [i64],
+    asm: [str],
+    want_asm: bool,
+    // Branches to blocks, patched once every block has its address.
+    fx_word: [i64],
+    fx_mop: [i64],
+    fx_reg: [i64],
+    fx_cc: [i64],
+    fx_tgt: [i64],
+}
+
+fn word(inout e: Emit, m: i64, rd: i64, rn: i64, rm: i64, imm: i64, imm2: i64) -> () ! str {
+    let w = try mach.encode(m, rd, rn, rm, -1, imm, imm2, -1, 0)
+    e.words.push(w)
+    if e.want_asm {
+        e.asm.push(mach.asm_text(m, rd, rn, rm, -1, imm, imm2, -1, 0, ""))
+    }
+    ()
+}
+
+/// `sp -= n` (or `+=`), in at most two instructions: the frame is at most a
+/// few pages.
+fn adjust_sp(inout e: Emit, n: i64, down: bool) -> () ! str {
+    if n == 0 {
+        return ()
+    }
+    let m = if down { mach.A_SUBI } else { mach.A_ADDI }
+    let hi = n.shr(12)
+    let lo = n.bit_and(4095)
+    if hi > 0 {
+        try word(e, m, mach.R_SP, mach.R_SP, -1, hi, 1)
+    }
+    if lo > 0 {
+        try word(e, m, mach.R_SP, mach.R_SP, -1, lo, 0)
+    }
+    ()
+}
+
+fn sym_text(symk: i64, id: i64, callee_sym: [str], rt_names: [str]) -> str {
+    if symk == vcode.SYM_FN {
+        if id >= 0 and id < callee_sym.len() { callee_sym[id] } else { "?" }
+    } else if symk == vcode.SYM_RT {
+        if id >= 0 and id < rt_names.len() { "_" + rt_names[id] } else { "?" }
+    } else if symk == vcode.SYM_STR {
+        "l_.str.{id}"
+    } else {
+        "?"
+    }
+}
+
+fn is_cond_branch(m: i64) -> bool {
+    m == mach.A_BCOND or m == mach.A_CBZ or m == mach.A_CBNZ
+}
+
+/// Encodes a function. `callee_sym` and `rt_names` only name things in the
+/// assembly listing.
+pub fn emit(al: Alloc, sym: str, want_asm: bool, callee_sym: [str], rt_names: [str]) -> A64Code ! str {
+    var e = Emit{
+        words: [], rel_off: [], rel_kind: [], rel_symk: [], rel_sym: [], asm: [],
+        want_asm: want_asm, fx_word: [], fx_mop: [], fx_reg: [], fx_cc: [], fx_tgt: [],
+    }
+    var pairs_a: [i64] = []
+    var pairs_b: [i64] = []
+    var r = 19
+    while r <= 27 {
+        if al.used_callee[r] or al.used_callee[r + 1] {
+            pairs_a.push(r)
+            pairs_b.push(r + 1)
+        }
+        r += 2
+    }
+    let slots = al.nslots + al.nspill
+    let frame = (8 * slots + 15).bit_and(-16)
+    // Prologue.
+    let pac = try mach.encode(mach.A_PACIBSP, -1, -1, -1, -1, 0, 0, -1, 0)
+    e.words.push(pac)
+    if want_asm {
+        e.asm.push("pacibsp")
+    }
+    try word(e, mach.A_STP_PRE, 29, mach.R_SP, 30, -16, 0)
+    try word(e, mach.A_ADDI, 29, mach.R_SP, -1, 0, 0)
+    for k in 0..pairs_a.len() {
+        try word(e, mach.A_STP_PRE, pairs_a[k], mach.R_SP, pairs_b[k], -16, 0)
+    }
+    try adjust_sp(e, frame, true)
+    let nb = al.bi0.len()
+    var label: [i64] = []
+    for b in 0..nb {
+        label.push(-1)
+    }
+    for b in 0..nb {
+        label[b] = e.words.len()
+        if want_asm {
+            e.asm.push("Lb{b}:")
+        }
+        let end = al.bi0[b] + al.bni[b]
+        var i = al.bi0[b]
+        while i < end {
+            let m = al.mop[i]
+            if m == mach.A_MOV and al.rd[i] == al.rm[i] {
+                i += 1
+                continue
+            }
+            if m == mach.A_B and al.tgt[i] == b + 1 {
+                i += 1
+                continue
+            }
+            if m == mach.P_RETURN {
+                try adjust_sp(e, frame, false)
+                var k = pairs_a.len() - 1
+                while k >= 0 {
+                    try word(e, mach.A_LDP_POST, pairs_a[k], mach.R_SP, pairs_b[k], 16, 0)
+                    k -= 1
+                }
+                try word(e, mach.A_LDP_POST, 29, mach.R_SP, 30, 16, 0)
+                try word(e, mach.A_RETAB, -1, -1, -1, 0, 0)
+                i += 1
+                continue
+            }
+            if al.tgt[i] >= 0 {
+                var mm = m
+                var cc = al.cc[i]
+                var tgt = al.tgt[i]
+                var skip_next = false
+                // `b.cc next; b other` is `b.!cc other`.
+                if is_cond_branch(m) and tgt == b + 1 and i + 1 < end and al.mop[i + 1] == mach.A_B {
+                    tgt = al.tgt[i + 1]
+                    skip_next = true
+                    if m == mach.A_BCOND {
+                        cc = mach.cond_invert(cc)
+                    } else if m == mach.A_CBZ {
+                        mm = mach.A_CBNZ
+                    } else {
+                        mm = mach.A_CBZ
+                    }
+                }
+                e.fx_word.push(e.words.len())
+                e.fx_mop.push(mm)
+                e.fx_reg.push(al.rn[i])
+                e.fx_cc.push(cc)
+                e.fx_tgt.push(tgt)
+                e.words.push(0)
+                if want_asm {
+                    e.asm.push(mach.asm_text(mm, -1, al.rn[i], -1, -1, 0, 0, cc, 0, "Lb{tgt}"))
+                }
+                i += if skip_next { 2 } else { 1 }
+                continue
+            }
+            var target = ""
+            if al.symk[i] > 0 {
+                target = sym_text(al.symk[i], al.sym_id[i], callee_sym, rt_names)
+                var kind = -1
+                if m == mach.A_BL {
+                    kind = REL_BRANCH26
+                } else if m == mach.A_ADRP {
+                    kind = REL_PAGE21
+                } else if m == mach.A_ADDPO {
+                    kind = REL_PAGEOFF12
+                } else {
+                    fail("{sym}: {mach.form_name(m)} refers to a symbol it cannot be relocated against")
+                }
+                e.rel_off.push(4 * e.words.len())
+                e.rel_kind.push(kind)
+                e.rel_symk.push(al.symk[i])
+                e.rel_sym.push(al.sym_id[i])
+            }
+            let w = try mach.encode(m, al.rd[i], al.rn[i], al.rm[i], al.ra[i], al.imm[i], al.imm2[i], al.cc[i], 0)
+            e.words.push(w)
+            if want_asm {
+                e.asm.push(mach.asm_text(m, al.rd[i], al.rn[i], al.rm[i], al.ra[i], al.imm[i], al.imm2[i], al.cc[i], 0, target))
+            }
+            i += 1
+        }
+    }
+    // Branches, now that every block has an address.
+    for k in 0..e.fx_word.len() {
+        let at = e.fx_word[k]
+        let off = 4 * (label[e.fx_tgt[k]] - at)
+        let w = try mach.encode(e.fx_mop[k], -1, e.fx_reg[k], -1, -1, 0, 0, e.fx_cc[k], off)
+        e.words[at] = w
+    }
+    A64Code{
+        sym: sym, words: e.words, rel_off: e.rel_off, rel_kind: e.rel_kind,
+        rel_symk: e.rel_symk, rel_sym: e.rel_sym, asm: e.asm,
+        frame: frame, nspill: al.nspill, nsaved: 2 * pairs_a.len(),
+    }
+}

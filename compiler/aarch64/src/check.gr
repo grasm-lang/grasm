@@ -1,0 +1,221 @@
+// The register allocation checker: replays the allocated code symbolically
+// and proves every read gets the value the code before allocation meant it
+// to get (the design regalloc2 ships, after Chris Fallin's "A symbolic
+// checker for register allocation").
+//
+// The state says, for every location -- each register and each spill slot
+// -- which value it holds: a virtual register, the value an explicit move
+// put in a physical register (the calling convention's), or nothing known.
+// An instruction that read virtual register v from register r is correct
+// exactly when r holds v at that point on every path. Writes set their
+// location and forget the value anywhere else it was; a reload or a spill
+// copies what its source holds; a call forgets every register it may
+// change. Where paths meet, a location keeps a value only if every path
+// agrees on it.
+//
+// It knows nothing of how the allocator decided: it reads the code before
+// and after, nothing else. That is the point -- an allocator bug that the
+// corpus happens not to reach is still an error here, in every function
+// compiled.
+import mach
+import regalloc
+
+let UNKNOWN = -1
+let TOP = -2
+
+fn nloc(al: Alloc) -> i64 {
+    32 + al.nspill
+}
+
+fn meet(a: i64, b: i64) -> i64 {
+    if a == TOP {
+        b
+    } else if b == TOP or a == b {
+        a
+    } else {
+        UNKNOWN
+    }
+}
+
+fn show(v: i64) -> str {
+    if v == UNKNOWN {
+        "nothing known"
+    } else if v == TOP {
+        "nothing (unreached)"
+    } else if mach.is_vreg(v) {
+        "v{v - mach.VR}"
+    } else {
+        "the value moved into x{v}"
+    }
+}
+
+fn where_(r: i64) -> str {
+    if r >= 32 {
+        "spill slot {r - 32}"
+    } else {
+        "x{r}"
+    }
+}
+
+/// Applies instruction `i` to `st`. With `errs` collecting, also checks it.
+fn step(al: Alloc, inout st: [i64], i: i64, checking: bool, inout errs: [str]) {
+    let k = al.kind[i]
+    if k == regalloc.K_RELOAD or k == regalloc.K_SPILL {
+        // A slot or a register the frame does not have is an error in
+        // itself, not something to index with.
+        let s = al.slot[i]
+        let r = al.rd[i]
+        if s < 0 or s >= al.nspill or r < 0 or r > 30 {
+            if checking {
+                let what = if k == regalloc.K_RELOAD { "reload" } else { "spill" }
+                errs.push("instruction {i}: {what} between x{r} and spill slot {s}, of {al.nspill} slots")
+            }
+            if r >= 0 and r <= 30 and k == regalloc.K_RELOAD {
+                st[r] = UNKNOWN
+            }
+            return
+        }
+        if k == regalloc.K_RELOAD {
+            st[r] = st[32 + s]
+        } else {
+            st[32 + s] = st[r]
+        }
+        return
+    }
+    let m = al.mop[i]
+    let ou = regalloc.uses_f(m, al.od[i], al.on[i], al.om[i], al.oa[i], al.imm[i], al.imm2[i])
+    let pu = regalloc.uses_f(m, al.rd[i], al.rn[i], al.rm[i], al.ra[i], al.imm[i], al.imm2[i])
+    if checking {
+        if ou.len() != pu.len() {
+            errs.push("instruction {i} ({mach.form_name(m)}): reads {ou.len()} registers before allocation and {pu.len()} after")
+        } else {
+            for q in 0..ou.len() {
+                let want = ou[q]
+                let r = pu[q]
+                if r < 0 or r > 30 {
+                    errs.push("instruction {i} ({mach.form_name(m)}): reads a register that is not one ({r})")
+                } else if st[r] != want {
+                    errs.push("instruction {i} ({mach.form_name(m)}): reads {show(want)} from x{r}, which holds {show(st[r])}")
+                }
+            }
+        }
+    }
+    if m == mach.A_BL {
+        for r in 0..18 {
+            st[r] = UNKNOWN
+        }
+    }
+    let od = regalloc.defs_f(m, al.od[i], al.on[i], al.om[i], al.oa[i], al.imm[i], al.imm2[i])
+    let pd = regalloc.defs_f(m, al.rd[i], al.rn[i], al.rm[i], al.ra[i], al.imm[i], al.imm2[i])
+    if checking and od.len() != pd.len() {
+        errs.push("instruction {i} ({mach.form_name(m)}): writes {od.len()} registers before allocation and {pd.len()} after")
+        return
+    }
+    for q in 0..od.len() {
+        let o = od[q]
+        let r = pd[q]
+        if r < 0 or r > 30 {
+            if checking {
+                errs.push("instruction {i} ({mach.form_name(m)}): writes a register that is not one ({r})")
+            }
+            continue
+        }
+        if checking {
+            if r == 18 or r == 29 or r == 30 {
+                errs.push("instruction {i} ({mach.form_name(m)}): writes x{r}, which the function body must not touch")
+            }
+            if regalloc.callee_saved(r) and not al.used_callee[r] {
+                errs.push("instruction {i} ({mach.form_name(m)}): writes x{r}, which the prologue does not save")
+            }
+        }
+        if mach.is_vreg(o) {
+            for l in 0..st.len() {
+                if st[l] == o {
+                    st[l] = UNKNOWN
+                }
+            }
+            st[r] = o
+        } else {
+            st[r] = o
+        }
+    }
+}
+
+fn succs(al: Alloc, b: i64) -> [i64] {
+    var out: [i64] = []
+    for i in al.bi0[b]..(al.bi0[b] + al.bni[b]) {
+        if al.tgt[i] >= 0 {
+            out.push(al.tgt[i])
+        }
+    }
+    out
+}
+
+/// Every allocation error in the function, or none.
+pub fn check(al: Alloc) -> [str] {
+    let nb = al.bi0.len()
+    let nl = nloc(al)
+    var errs: [str] = []
+    var inst: [i64] = []
+    for k in 0..(nb * nl) {
+        inst.push(TOP)
+    }
+    // At entry the parameters are in x0..x7, put there by the caller.
+    for l in 0..nl {
+        inst[l] = UNKNOWN
+    }
+    for k in 0..al.nparams {
+        inst[k] = k
+    }
+    var queued: [bool] = []
+    for b in 0..nb {
+        queued.push(false)
+    }
+    var work: [i64] = [0]
+    queued[0] = true
+    var none: [str] = []
+    while not work.is_empty() {
+        let b = work.pop() ?? 0
+        queued[b] = false
+        var st: [i64] = []
+        for l in 0..nl {
+            st.push(inst[b * nl + l])
+        }
+        for i in al.bi0[b]..(al.bi0[b] + al.bni[b]) {
+            step(al, st, i, false, none)
+        }
+        for s in succs(al, b) {
+            if s < 0 or s >= nb {
+                errs.push("block {b} branches to block {s}, which does not exist")
+                return errs
+            }
+            var changed = false
+            for l in 0..nl {
+                let x = meet(inst[s * nl + l], st[l])
+                if x != inst[s * nl + l] {
+                    inst[s * nl + l] = x
+                    changed = true
+                }
+            }
+            if changed and not queued[s] {
+                queued[s] = true
+                work.push(s)
+            }
+        }
+    }
+    // The states have settled: check every instruction against them.
+    for b in 0..nb {
+        if inst[b * nl] == TOP {
+            errs.push("block {b} is never reached")
+            continue
+        }
+        var st: [i64] = []
+        for l in 0..nl {
+            st.push(inst[b * nl + l])
+        }
+        for i in al.bi0[b]..(al.bi0[b] + al.bni[b]) {
+            step(al, st, i, true, errs)
+        }
+    }
+    errs
+}

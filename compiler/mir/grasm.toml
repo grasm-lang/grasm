@@ -1,0 +1,8 @@
+[package]
+name = "mir"
+version = "0.1.0"
+entry = "src/main.gr"
+
+# TIR in, SSA out. It reads bytes it is handed and computes; it never touches
+# the filesystem or the terminal, and says so.
+capabilities = []
