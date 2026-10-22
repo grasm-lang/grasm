@@ -16,17 +16,27 @@ do, from the whole subset (`scripts/s3_subset.py`) and nothing outside it:
     inclusive ranges, `break` and `continue`;
   * functions that call earlier ones, with `inout` parameters, one that
     recurses, constants, `print` and `eprint` of interpolated values;
+  * heap values (`HeapGen`): strings built and appended to, lists pushed,
+    popped, indexed, assigned and walked with `break` and `continue`, a
+    struct with a list in it changed through field and element paths and
+    passed `inout`, a sum type matched with guards, maps, tuples and
+    `let (a, b)`, options under `??`, and functions that can fail -- `fail`,
+    `try` through each other, and their results matched as `Ok`/`Err` or
+    under `??`;
   * now and then a deliberate panic, a failed `assert` or an `exit`.
 
 Each program must be in the subset by the rule, compile with the backend (a
 refusal is a failure, not a skip), link, and print and exit exactly as the
 Cranelift build does -- and again with the allocator held to three registers,
-so the same program runs mostly out of spill slots.
+so the same program runs mostly out of spill slots. One that returns from
+`main` is run once more with `GRASM_LEAK_CHECK=1`, and must have nothing
+live at exit.
 
     scripts/fuzz_s3.py [--programs N] [--seed S] [--keep]
 """
 
 import argparse
+import json
 import os
 import random
 import shutil
@@ -36,7 +46,7 @@ import tempfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 GRASM = os.environ.get("GRASM") or os.path.join(ROOT, "target", "release", "grasm")
-RUNTIME = os.path.join(ROOT, "target", "release", "libgrasm_rt_abi.a")
+RUNTIME = os.environ.get("S3_RT") or os.path.join(ROOT, "target", "release", "libgrasm_rt_abi.a")
 
 import importlib.util as _ilu
 
@@ -436,8 +446,22 @@ class Gen:
         ]
         for idx in range(r.randint(2, 6)):
             lines += self.function(idx)
+        # Heap values and fallible code, in functions of their own that
+        # `main` calls among its scalar statements.
+        hg = HeapGen(random.Random(r.random()))
+        lines += HEAP_DECLS.split("\n")
+        lines += hg.fallible_fns()
+        nheap = r.randint(1, 3)
+        for k in range(nheap):
+            lines += hg.function(f"heap{k}")
         self.depth = 0
         body, _ = self.block([], r.randint(6, 14), budget=2)
+        # Between two of main's own statements: before a line that starts
+        # one, or at the end.
+        for k in range(nheap):
+            spots = [i for i, line in enumerate(body)
+                     if line.startswith("    ") and line[4:5] not in (" ", "}")] + [len(body)]
+            body.insert(r.choice(spots), f"    heap{k}()")
         ending = []
         c = r.random()
         if c < 0.05:
@@ -452,9 +476,228 @@ class Gen:
         return "\n".join(lines) + "\n"
 
 
-def run(cmd, timeout=60):
+HEAP_DECLS = """type Pt = { a: i64, s: str, tags: [str] }
+
+type Sh = | Ci(r: i64) | Sq(w: i64, h: i64) | Lbl(name: str, p: Pt) | Nothing
+
+type Oops = | Small(n: i64) | Named(why: str)
+
+fn describe(xs: [i64], label: str) -> str {
+    var out = label
+    for x in xs {
+        out += "{x},"
+    }
+    out
+}
+
+fn first_long(xs: [str], k: i64) -> str {
+    for x in xs {
+        if x.len() > k {
+            return x
+        }
+    }
+    "none"
+}
+
+fn bump(inout p: Pt, by: i64) {
+    p.a += by
+    p.tags.push("b{by}")
+}
+"""
+
+WORDS = ["a", "bc", "Dog", "xyz", "", "hello world", "q-r", "ZZ top", "e"]
+
+
+class HeapGen:
+    """Statements over strings, lists, structs, a sum type, maps, tuples,
+    options and fallible functions -- every heap construct of the subset --
+    each printing what it computed, so a wrong count or a wrong value shows.
+    Loops `break` and `continue` and helpers `return` early with values live,
+    which is where a missing or an extra release would hide."""
+
+    def __init__(self, rng):
+        self.rng = rng
+        self.n = 0
+        self.nfall = 0
+
+    def fresh(self, base):
+        self.n += 1
+        return f"{base}{self.n}"
+
+    def lit(self):
+        return json.dumps(self.rng.choice(WORDS))
+
+    def small(self):
+        return str(self.rng.randint(-5, 9))
+
+    def fallible_fns(self):
+        """Functions that can fail, some through others' `try`."""
+        r = self.rng
+        out = []
+        self.nfall = r.randint(1, 3)
+        for k in range(self.nfall):
+            m = r.randint(2, 5)
+            out += [
+                f"fn ck{k}(x: i64) -> i64 ! Oops {{",
+                f"    if x % {m} == {r.randint(0, m - 1)} {{",
+                "        fail(Small(x))",
+                "    }",
+                f"    if x < {r.randint(-9, 0)} {{",
+                "        fail(Named(\"neg {x}\"))",
+                "    }",
+                f"    x * {r.randint(1, 4)} + {r.randint(-3, 3)}",
+                "}",
+                "",
+                f"fn chain{k}(x: i64) -> str ! Oops {{",
+                f"    let a = try ck{k}(x)",
+                f"    let b = try ck{r.randint(0, k)}(a + {r.randint(1, 3)})",
+                "    var parts: [str] = []",
+                "    parts.push(\"{a}\")",
+                "    parts.push(\"{b}\")",
+                "    parts.join(\"-\")",
+                "}",
+                "",
+            ]
+        return out
+
+    def function(self, name):
+        r = self.rng
+        lines = [f"fn {name}() {{"]
+        self.vars = {"str": [], "list": [], "slist": [], "pt": [], "map": []}
+        for _ in range(r.randint(8, 16)):
+            lines += ["    " + x for x in self.stmt()]
+        lines += ["}", ""]
+        return lines
+
+    def pick(self, kind):
+        vs = self.vars[kind]
+        return self.rng.choice(vs) if vs else None
+
+    def stmt(self):
+        r = self.rng
+        c = r.random()
+        if c < 0.12 or not self.vars["str"]:
+            v = self.fresh("s")
+            self.vars["str"].append(v)
+            if r.random() < 0.5:
+                return [f"var {v} = {self.lit()}"]
+            return [f"var {v} = \"<{{{self.small()}}}|{{{self.lit()}}}>\""]
+        if c < 0.20:
+            v = self.pick("str")
+            if r.random() < 0.5:
+                return [f"{v} += {self.lit()}", f"print({v})"]
+            o = self.pick("str")
+            return [f"{v} = {v} + \"[\" + {o} + \"]\"", f"print({v})"]
+        if c < 0.27:
+            v = self.pick("str")
+            return [f"print(\"{{{v}.len()}} {{{v}.to_upper()}} {{{v}.contains(\"o\")}} "
+                    f"{{{v}.trim()}} {{{v}.replace(\"o\", \"0\")}} {{{v}.split(\" \").join(\"_\")}} "
+                    f"{{{v}.pad_start(8, \".\")}} {{{v} == {self.lit()}}} {{{v} < {self.lit()}}}\")"]
+        if c < 0.35 or not self.vars["list"]:
+            v = self.fresh("xs")
+            self.vars["list"].append(v)
+            items = ", ".join(self.small() for _ in range(r.randint(1, 5)))
+            return [f"var {v} = [{items}]"]
+        if c < 0.43:
+            v = self.pick("list")
+            k = r.randint(0, 7)
+            out = [f"{v}.push({self.small()})", f"{v}[{k} % {v}.len()] = {self.small()}"]
+            if r.random() < 0.4:
+                out += [f"if {v}.len() > 1 {{", f"    print(\"popped {{{v}.pop() ?? -100}}\")", "}"]
+            if r.random() < 0.3:
+                out += [f"{v}.sort()"]
+            return out + [f"print(\"{{{v}}} {{{v}.sum()}} {{{v}.rev()}} {{{v}.slice(1, 3)}} "
+                          f"{{{v}.contains(3)}} {{{v}.get({k}) ?? -1}} {{describe({v}, \"L\")}}\")"]
+        if c < 0.50:
+            v = self.pick("list")
+            acc = self.fresh("acc")
+            lim = r.randint(0, 6)
+            return [f"var {acc} = \"\"",
+                    f"for x in {v} {{",
+                    f"    if x > {lim} {{",
+                    f"        {r.choice(['break', 'continue'])}",
+                    "    }",
+                    "    let t = \"<{x}>\"",
+                    f"    if x == {r.randint(-2, 4)} {{",
+                    "        continue",
+                    "    }",
+                    f"    {acc} += t",
+                    "}",
+                    f"print({acc})"]
+        if c < 0.58:
+            v = self.fresh("p")
+            self.vars["pt"].append(v)
+            s = self.pick("str")
+            return [f"var {v} = Pt{{ a: {self.small()}, s: {s}, tags: [{self.lit()}] }}",
+                    f"{v}.a += {self.small()}",
+                    f"{v}.tags.push({s})",
+                    f"bump({v}, {self.small()})",
+                    f"print({v})"]
+        if c < 0.64 and self.vars["pt"]:
+            p = self.pick("pt")
+            ps = self.fresh("ps")
+            return [f"var {ps}: [Pt] = [{p}]",
+                    f"{ps}.push(Pt{{ a: 1, s: \"n\", tags: [] }})",
+                    f"{ps}[0].a = {self.small()}",
+                    f"{ps}[1].tags.push({self.lit()})",
+                    f"print({ps})",
+                    f"print({p}.s)"]
+        if c < 0.72:
+            sh = self.fresh("sh")
+            s = self.pick("str")
+            ctor = r.choice([f"Ci({self.small()})", f"Sq({self.small()}, {self.small()})",
+                             f"Lbl({s}, Pt{{ a: 2, s: {s}, tags: [{s}] }})", "Nothing"])
+            return [f"let {sh} = {ctor}",
+                    f"match {sh} {{",
+                    f"    Ci(r) if r > {r.randint(0, 5)} -> print(\"big circle {{r}}\")",
+                    "    Ci(r) -> print(\"circle {r}\")",
+                    "    Sq(w, h) -> print(\"square {w * h}\")",
+                    "    Lbl(n, q) -> print(\"label {n} {q.a} {q.tags}\")",
+                    "    Nothing -> print(\"nothing\")",
+                    "}",
+                    f"print({sh})"]
+        if c < 0.80:
+            m = self.fresh("m")
+            s = self.pick("str")
+            out = [f"var {m}: Map[str, i64] = {{}}"]
+            for _ in range(r.randint(1, 4)):
+                out.append(f"{m}.set({r.choice([s, self.lit()])}, {self.small()})")
+            out += [f"print(\"{{{m}}} {{{m}.len()}} {{{m}.get({s}) ?? -1}} {{{m}.has({self.lit()})}} {{{m}.keys()}}\")",
+                    f"print({m}.delete({self.lit()}))"]
+            return out
+        if c < 0.86:
+            t = self.fresh("t")
+            s = self.pick("str")
+            return [f"let {t} = ({self.small()}, {s})",
+                    f"let ({t}a, {t}b) = {t}",
+                    f"print(\"{{{t}.0}} {{{t}.1}} {{{t}a}} {{{t}b}} {{{t}}}\")",
+                    f"match {t} {{",
+                    f"    ({r.randint(-1, 3)}, w) -> print(\"tuple {{w}}\")",
+                    "    _ -> print(\"tuple other\")",
+                    "}"]
+        if c < 0.94 and self.nfall > 0:
+            k = r.randrange(self.nfall)
+            x = self.small()
+            return [f"match ck{k}({x}) {{",
+                    "    Ok(v) -> print(\"ok {v}\")",
+                    "    Err(Small(n)) -> print(\"small {n}\")",
+                    "    Err(Named(w)) -> print(\"named {w}\")",
+                    "}",
+                    f"print(\"{{ck{k}({self.small()}) ?? -7}}\")",
+                    f"match chain{k}({x}) {{",
+                    "    Ok(s) -> print(\"chain {s}\")",
+                    "    Err(e) -> print(\"chain failed {e}\")",
+                    "}"]
+        sl = self.fresh("ws")
+        s = self.pick("str")
+        return [f"let {sl} = [{self.lit()}, {s}, {self.lit()}]",
+                f"print(first_long({sl}, {r.randint(0, 5)}))",
+                f"print(\"{{{sl}}} {{{sl}.len()}} {{{sl}.join(\"+\")}}\")"]
+
+
+def run(cmd, timeout=20, env=None):
     try:
-        p = subprocess.run(cmd, capture_output=True, timeout=timeout, stdin=subprocess.DEVNULL)
+        p = subprocess.run(cmd, capture_output=True, timeout=timeout, stdin=subprocess.DEVNULL, env=env)
         return p.returncode, p.stdout, p.stderr
     except subprocess.TimeoutExpired:
         return 124, b"", b"timeout"
@@ -497,6 +740,7 @@ def main():
     agree = 0
     stressed = 0
     panicked = 0
+    leak_checked = 0
     failures = []
     for idx in range(args.programs):
         g = Gen(random.Random(rng.random()))
@@ -555,6 +799,15 @@ def main():
                                       f"  s3:        {got[1][-300:]!r} {got[2][-200:]!r}", src_text))
                 ok = False
                 break
+            # Its reference counting: nothing live when `main` returns
+            # (`scripts/s3rc.sh` checks the corpus the same way).
+            if regs is None and want[0] == 0:
+                lk = run([exe], env=dict(os.environ, GRASM_LEAK_CHECK="1"))
+                if lk[0] != 0 or b"leak check: nothing live at exit" not in lk[2]:
+                    failures.append((idx, f"the leak check: exit {lk[0]}, {lk[2][-200:]!r}", src_text))
+                    ok = False
+                    break
+                leak_checked += 1
             if regs is not None:
                 stressed += 1
         if ok:
@@ -569,8 +822,14 @@ def main():
     if not args.keep:
         shutil.rmtree(work, ignore_errors=True)
     print(f"programs: {args.programs}   compared: {made}   identical: {agree}   stressed: {stressed}   "
-          f"panicked: {panicked}   failed: {len(failures)}   not checked: {not_checked}")
+          f"leak-checked: {leak_checked}   panicked: {panicked}   failed: {len(failures)}   "
+          f"not checked: {not_checked}")
     if failures:
+        return 1
+    # Most programs end by returning from `main`, and every one of those was
+    # leak-checked; a fuzzer whose programs all panicked checked no counts.
+    if leak_checked < agree // 2:
+        print(f"only {leak_checked} of {agree} programs were leak-checked")
         return 1
     # A generator whose programs mostly fail to check is testing nothing.
     if not_checked * 10 > args.programs or agree < args.programs * 8 // 10:

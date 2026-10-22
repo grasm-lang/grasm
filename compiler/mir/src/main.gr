@@ -29,6 +29,13 @@ pub fn build(src: bytes) -> MirProg ! str {
     var fns: [MirFn] = []
     var strs: [str] = []
     var str_ix: Map[str, i64] = {}
+    var descs: [MirDesc] = []
+    var desc_ix: Map[str, i64] = {}
+    var rt_syms = ir.rt_fixed()
+    var rt_ix: Map[str, i64] = {}
+    for k in 0..rt_syms.len() {
+        rt_ix.set(rt_syms[k], k)
+    }
     var order: [i64] = []
     for c in 0..info.c_name.len() {
         if info.reach[c] {
@@ -62,6 +69,41 @@ pub fn build(src: bytes) -> MirProg ! str {
                 }
                 v.imm[i] = g
             }
+            // Struct descriptors, each once, their names in the string pool.
+            if v.op[i] == ir.M_DATAADDR {
+                let d = v.descs[v.imm[i]]
+                let key = lower.desc_key(d)
+                let g = match desc_ix.get(key) {
+                    Some(k) -> k
+                    None -> {
+                        let k = descs.len()
+                        var nd = d
+                        nd.name_str = intern(strs, str_ix, d.name)
+                        nd.field_strs = []
+                        for fname in d.fields {
+                            nd.field_strs.push(intern(strs, str_ix, fname))
+                        }
+                        descs.push(nd)
+                        desc_ix.set(key, k)
+                        k
+                    }
+                }
+                v.imm[i] = g
+            }
+            // So do the runtime functions it names, after the fixed ones.
+            if v.op[i] == ir.M_CALLRT and v.imm[i] >= ir.RT_COUNT {
+                let name = v.rts[v.imm[i] - ir.RT_COUNT]
+                let g = match rt_ix.get(name) {
+                    Some(k) -> k
+                    None -> {
+                        let k = rt_syms.len()
+                        rt_syms.push(name)
+                        rt_ix.set(name, k)
+                        k
+                    }
+                }
+                v.imm[i] = g
+            }
         }
         let f = try ssa.to_ssa(v, name, sym)
         fns.push(f)
@@ -69,7 +111,20 @@ pub fn build(src: bytes) -> MirProg ! str {
     if errors.len() > 0 {
         fail(errors.join("\n"))
     }
-    MirProg{ fns: fns, callee_sym: info.sym, strs: strs }
+    MirProg{ fns: fns, callee_sym: info.sym, strs: strs, rt_syms: rt_syms, descs: descs }
+}
+
+/// Text `s`'s index in the string pool, adding it once.
+fn intern(inout strs: [str], inout str_ix: Map[str, i64], s: str) -> i64 {
+    match str_ix.get(s) {
+        Some(k) -> k
+        None -> {
+            let k = strs.len()
+            strs.push(s)
+            str_ix.set(s, k)
+            k
+        }
+    }
 }
 
 /// The whole program as text.
@@ -79,7 +134,7 @@ pub fn print_prog(p: MirProg) -> str {
         out.push_str("s{i} = {sexp_quote(p.strs[i])}\n")
     }
     for f in p.fns {
-        out.push_str(ir.print_fn(f, p.callee_sym))
+        out.push_str(ir.print_fn(f, p.callee_sym, p.rt_syms))
     }
     out.to_str()
 }

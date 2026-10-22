@@ -86,9 +86,9 @@ for k in "${!S3_SRC[@]}"; do
         FAILED+=("$src — the Cranelift build fails: $(head -1 "$WORK/cl.log")")
         continue
     fi
-    $RUN_LIMIT "$WORK/p.cl" >"$WORK/cl.out" 2>"$WORK/cl.err" </dev/null
+    $S3_RUN "$WORK/p.cl" >"$WORK/cl.out" 2>"$WORK/cl.err" </dev/null
     cl_code=$?
-    $RUN_LIMIT "$WORK/p.s3" >"$WORK/s3run.out" 2>"$WORK/s3run.err" </dev/null
+    $S3_RUN "$WORK/p.s3" >"$WORK/s3run.out" 2>"$WORK/s3run.err" </dev/null
     s3_code=$?
     if [ "$cl_code" = 124 ] || [ "$s3_code" = 124 ]; then
         timedout=$((timedout + 1))
@@ -120,7 +120,7 @@ if [ ${#S3_NOTIR[@]} -gt 0 ]; then
 fi
 if [ ${#TIMEDOUT[@]} -gt 0 ]; then
     echo
-    echo "TIMED OUT after ${RUN_LIMIT_SECONDS}s (not agreement):"
+    echo "TIMED OUT after ${S3_RUN_SECONDS}s (not agreement):"
     printf '  %s\n' "${TIMEDOUT[@]}"
 fi
 if [ ${#FAILED[@]} -gt 0 ]; then

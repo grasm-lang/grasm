@@ -17,6 +17,9 @@
 pub let R_ZR = 31
 pub let R_SP = 32
 pub let VR = 64
+/// x29, the frame pointer: set by the prologue, never allocated, and read
+/// for the arguments that arrived on the stack.
+pub let R_FP = 29
 
 pub fn is_vreg(o: i64) -> bool {
     o >= 64

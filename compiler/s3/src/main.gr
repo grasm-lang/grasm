@@ -97,11 +97,19 @@ fn encode_test(prefix: str) -> i64 {
     }
 }
 
+fn put64(inout b: ByteBuilder, v: i64) {
+    for k in 0..8 {
+        b.push_byte(v.ushr(8 * k).bit_and(255))
+    }
+}
+
 fn reloc_symbol(p: MirProg, symk: i64, id: i64) -> str {
     if symk == 1 {
         p.callee_sym[id]
     } else if symk == 2 {
-        "_" + ir.rt_name(id)
+        "_" + p.rt_syms[id]
+    } else if symk == 4 {
+        "l_.desc.{id}"
     } else {
         "l_.str.{id}"
     }
@@ -147,7 +155,7 @@ fn compile(inp: str, out: str, opts: A64Opts, listing: str, check: bool, stats: 
     var caught = 0
     var spills = 0
     for f in p.fns {
-        match aarch64.compile_fn(f, rs, ccm, opts, p.callee_sym) {
+        match aarch64.compile_fn(f, rs, ccm, opts, p.callee_sym, p.rt_syms) {
             Ok(r) -> {
                 if r.corrupted > 0 {
                     corrupted += 1
@@ -209,6 +217,34 @@ fn compile(inp: str, out: str, opts: A64Opts, listing: str, check: bool, stats: 
     for k in 0..p.strs.len() {
         obj.dsym.push("l_.str.{k}")
         obj.dbytes.push(p.strs[k].to_bytes())
+    }
+    // Struct descriptors, laid out as the runtime's `StructDesc`: a cache word
+    // the runtime fills in, the type's name, the field count, then each
+    // field's name and kind, then a zero auxiliary word per field.
+    var doff = 0
+    for k in 0..p.descs.len() {
+        let d = p.descs[k]
+        let n = d.fields.len()
+        var b = byte_builder()
+        put64(b, 0)
+        put64(b, 0)
+        put64(b, d.name.to_bytes().len())
+        put64(b, n)
+        obj.wrel_off.push(doff + 8)
+        obj.wrel_sym.push("l_.str.{d.name_str}")
+        for i in 0..n {
+            obj.wrel_off.push(doff + 32 + 24 * i)
+            obj.wrel_sym.push("l_.str.{d.field_strs[i]}")
+            put64(b, 0)
+            put64(b, d.fields[i].to_bytes().len())
+            put64(b, d.kinds[i])
+        }
+        for i in 0..n {
+            put64(b, 0)
+        }
+        obj.wsym.push("l_.desc.{k}")
+        obj.wbytes.push(b.to_bytes())
+        doff += 32 + 32 * n
     }
     let bytes = match macho.write(obj) {
         Ok(b) -> b

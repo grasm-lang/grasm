@@ -6,7 +6,10 @@
                                             the encoder's, case by case
     s3_macho.py relocs <obj>                objtest: every relocation lands on the
                                             instruction its kind relocates, and
-                                            every such instruction has one
+                                            every such instruction has one; in
+                                            `__data`, every descriptor address
+                                            has a 64-bit pointer relocation and
+                                            nothing else does
 
 It reads the file itself rather than parsing `otool` output, so a change in a
 tool's presentation cannot make a gate pass or fail. The tools themselves are
@@ -156,10 +159,57 @@ def cmd_relocs(path):
             problems.append(f"the `bl` at {4 * i:#x} has no BRANCH26 relocation")
         if is_adrp(w) and rel.get(4 * i) != 3:
             problems.append(f"the `adrp` at {4 * i:#x} has no PAGE21 relocation")
+    ndata = check_data_relocs(data, syms, problems)
     for p in problems[:20]:
         print(p)
-    print(f"relocations: {len(rel)}   problems: {len(problems)}")
+    print(f"relocations: {len(rel)}   data relocations: {ndata}   problems: {len(problems)}")
     return 1 if problems else 0
+
+
+def check_data_relocs(data, syms, problems):
+    """`__DATA,__data` holds struct descriptors, the runtime's `StructDesc`:
+    a cache word, the type name's address and length, the field count, then
+    per field its name's address, length and kind, then an auxiliary word per
+    field. Each address -- and nothing else -- must carry a 64-bit absolute
+    relocation (ARM64_RELOC_UNSIGNED) against a symbol, so the linker fills it
+    in. Answers how many relocations the section has."""
+    secs, _ = sections(data)
+    d = secs.get(("__DATA", "__data"))
+    if d is None:
+        return 0
+    got = set()
+    for k in range(d["nreloc"]):
+        addr, info = struct.unpack_from("<iI", data, d["reloff"] + 8 * k)
+        symnum = info & 0xFFFFFF
+        pcrel = (info >> 24) & 1
+        length = (info >> 25) & 3
+        ext = (info >> 27) & 1
+        rtype = info >> 28
+        if rtype != 0 or length != 3 or pcrel or not ext:
+            problems.append(f"data relocation {k} at {addr:#x}: type {rtype}, length {length}, pcrel {pcrel}, extern {ext}")
+        if addr % 8 or addr + 8 > d["size"]:
+            problems.append(f"data relocation {k} at {addr:#x} is not an aligned word of __data")
+        if symnum >= len(syms):
+            problems.append(f"data relocation {k} at {addr:#x} names no symbol")
+        if addr in got:
+            problems.append(f"two data relocations at {addr:#x}")
+        got.add(addr)
+    want = set()
+    # Sections are numbered from 1 in the order the load command lists them.
+    data_sect = 1 + list(secs.values()).index(d)
+    for name, ntype, nsect, value in syms:
+        if nsect != data_sect or not name.startswith("l_.desc."):
+            continue
+        off = value - d["addr"]
+        nfields = struct.unpack_from("<Q", data, d["off"] + off + 24)[0]
+        want.add(off + 8)
+        for i in range(nfields):
+            want.add(off + 32 + 24 * i)
+    for a in sorted(want - got):
+        problems.append(f"the descriptor word at __data+{a:#x} is an address with no relocation")
+    for a in sorted(got - want):
+        problems.append(f"the data relocation at __data+{a:#x} is on no descriptor's address")
+    return len(got)
 
 
 def main():

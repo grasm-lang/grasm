@@ -5,9 +5,12 @@
 // return address is signed on entry (`pacibsp`) and authenticated on return
 // (`retab`), the frame-pointer chain is kept (`stp x29, x30` / `mov x29,
 // sp`), the callee-saved registers the body writes are saved in pairs, and
-// the rest of the frame -- `inout` slots, then spill slots -- is below them.
+// the rest of the frame -- the outgoing stack arguments of the largest
+// call, the slots handed out by address (`inout`, a struct's words, a split
+// result), then spill slots -- is below them. Arguments that arrived on the
+// stack are above the saved pair, at `x29 + 16`.
 //
-//     [x29, x30] [callee-saved pairs] [spill slots] [inout slots] <- sp
+//     [args in] [x29, x30] [callee-saved pairs] [spill] [slots] [args out] <- sp
 //
 // Branches to the next block are dropped; a conditional branch to the next
 // block followed by a jump becomes the inverted branch. A call, and an
@@ -84,6 +87,8 @@ fn sym_text(symk: i64, id: i64, callee_sym: [str], rt_names: [str]) -> str {
         if id >= 0 and id < rt_names.len() { "_" + rt_names[id] } else { "?" }
     } else if symk == vcode.SYM_STR {
         "l_.str.{id}"
+    } else if symk == vcode.SYM_DATA {
+        "l_.desc.{id}"
     } else {
         "?"
     }
@@ -110,7 +115,7 @@ pub fn emit(al: Alloc, sym: str, want_asm: bool, callee_sym: [str], rt_names: [s
         }
         r += 2
     }
-    let slots = al.nslots + al.nspill
+    let slots = al.nout + al.nslots + al.nspill
     let frame = (8 * slots + 15).bit_and(-16)
     // Prologue.
     let pac = try mach.encode(mach.A_PACIBSP, -1, -1, -1, -1, 0, 0, -1, 0)

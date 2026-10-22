@@ -11,8 +11,10 @@
 #   * be read by `nm`, defining `_main` as an external;
 #   * carry a relocation on every instruction the linker must complete -- a
 #     BRANCH26 on each `bl`, a PAGE21 on each `adrp`, a PAGEOFF12 on each
-#     page-offset `add` -- and none anywhere else (`scripts/s3_macho.py`,
-#     which reads the file itself rather than a tool's presentation of it);
+#     page-offset `add` -- and none anywhere else, and in `__data` a 64-bit
+#     pointer relocation on every address a struct descriptor holds and on
+#     nothing else (`scripts/s3_macho.py`, which reads the file itself rather
+#     than a tool's presentation of it);
 #   * link with `cc` and the runtime, with nothing on the linker's output:
 #     the Cranelift build's objects make `ld` warn that they name no platform,
 #     and this writer's must not.

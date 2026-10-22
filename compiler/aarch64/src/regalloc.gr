@@ -49,6 +49,8 @@ type Alloc = {
     bni: [i64],
     nparams: i64,
     nslots: i64,
+    /// Words of outgoing stack arguments at the bottom of the frame.
+    nout: i64,
     nspill: i64,
     loc: [i64],
     used_callee: [bool],
@@ -123,6 +125,12 @@ fn defs_at(vc: VCode, i: i64) -> [i64] {
 
 /// Registers a call may change: everything below x18, the callee-saved ones
 /// excepted (AAPCS64; x18 is the platform's on Darwin and never used).
+/// How many of a function's `n` parameters arrive in registers (x0..x7);
+/// the rest arrive on the stack.
+pub fn reg_params(n: i64) -> i64 {
+    if n > 8 { 8 } else { n }
+}
+
 pub fn caller_saved(r: i64) -> bool {
     r >= 0 and r <= 17
 }
@@ -160,6 +168,12 @@ type Live = {
     fr_from: [i64],
     fr_to: [i64],
     calls: [i64],
+    /// Per physical register, its ranges' starts in ascending order, and the
+    /// furthest end of any range up to each: so whether a range of `r`
+    /// overlaps `[s, e]` is one binary search (`fixed_overlap`). A function
+    /// made mostly of runtime calls has a fixed range per argument per call.
+    pr_from: [[i64]],
+    pr_maxto: [[i64]],
 }
 
 fn intervals(vc: VCode) -> Live {
@@ -253,7 +267,7 @@ fn intervals(vc: VCode) -> Live {
             b -= 1
         }
     }
-    var lv = Live{ start: [], end: [], fr_reg: [], fr_from: [], fr_to: [], calls: [] }
+    var lv = Live{ start: [], end: [], fr_reg: [], fr_from: [], fr_to: [], calls: [], pr_from: [], pr_maxto: [] }
     let big = 9223372036854775807
     for v in 0..nv {
         lv.start.push(big)
@@ -291,7 +305,7 @@ fn intervals(vc: VCode) -> Live {
             last.push(0)
         }
         if b == 0 {
-            for k in 0..vc.nparams {
+            for k in 0..reg_params(vc.nparams) {
                 is_open[k] = true
                 from[k] = -1
                 last[k] = -1
@@ -335,7 +349,46 @@ fn intervals(vc: VCode) -> Live {
             }
         }
     }
+    index_fixed(lv)
     lv
+}
+
+/// Sorts each register's fixed ranges by start and keeps the running
+/// furthest end, for `fixed_overlap`.
+fn index_fixed(inout lv: Live) {
+    var keys: [[i64]] = []
+    for r in 0..32 {
+        keys.push([])
+    }
+    let fr = lv.fr_reg
+    let ff = lv.fr_from
+    for k in 0..fr.len() {
+        // Starts are at least -1; shifted so the key sorts by start, then
+        // by range.
+        keys[fr[k]].push((ff[k] + 1) * 4194304 + k)
+    }
+    let ft = lv.fr_to
+    var pf: [[i64]] = []
+    var pm: [[i64]] = []
+    for r in 0..32 {
+        var ks = keys[r]
+        ks.sort()
+        var froms: [i64] = []
+        var maxto: [i64] = []
+        var m = -9223372036854775807
+        for key in ks {
+            let k = key.bit_and(4194303)
+            froms.push(ff[k])
+            if ft[k] > m {
+                m = ft[k]
+            }
+            maxto.push(m)
+        }
+        pf.push(froms)
+        pm.push(maxto)
+    }
+    lv.pr_from = pf
+    lv.pr_maxto = pm
 }
 
 fn extend(inout lv: Live, v: i64, p: i64) {
@@ -347,22 +400,38 @@ fn extend(inout lv: Live, v: i64, p: i64) {
     }
 }
 
+/// Whether a fixed range of register `r` overlaps `[s, e]`: among the
+/// ranges starting at or before `e`, whether the furthest end reaches `s`.
 fn fixed_overlap(lv: Live, r: i64, s: i64, e: i64) -> bool {
-    for k in 0..lv.fr_reg.len() {
-        if lv.fr_reg[k] == r and lv.fr_from[k] <= e and s <= lv.fr_to[k] {
-            return true
+    let froms = lv.pr_from[r]
+    var lo = 0
+    var hi = froms.len()
+    while lo < hi {
+        let mid = (lo + hi) / 2
+        if froms[mid] <= e {
+            lo = mid + 1
+        } else {
+            hi = mid
         }
     }
-    false
+    lo > 0 and lv.pr_maxto[r][lo - 1] >= s
 }
 
+/// Whether a call lies strictly inside `(s, e)`; the calls are in program
+/// order.
 fn crosses_call(lv: Live, s: i64, e: i64) -> bool {
-    for p in lv.calls {
-        if s < p and p < e {
-            return true
+    let calls = lv.calls
+    var lo = 0
+    var hi = calls.len()
+    while lo < hi {
+        let mid = (lo + hi) / 2
+        if calls[mid] <= s {
+            lo = mid + 1
+        } else {
+            hi = mid
         }
     }
-    false
+    lo < calls.len() and calls[lo] < e
 }
 
 // ----- the scan ----------------------------------------------------------------------
@@ -413,7 +482,8 @@ pub fn allocate(vc: VCode, max_regs: i64, corrupt: bool) -> Alloc ! str {
     for v in 0..nv {
         loc.push(LOC_NONE)
     }
-    var nspill = 0
+    // Per spill slot, the furthest end of any interval it has held.
+    var slot_end: [i64] = []
     var active: [i64] = []
     for key in keys {
         let v = key.bit_and(1048575)
@@ -475,8 +545,7 @@ pub fn allocate(vc: VCode, max_regs: i64, corrupt: bool) -> Alloc ! str {
         }
         if victim >= 0 and lv.end[victim] > e {
             loc[v] = loc[victim]
-            loc[victim] = LOC_SPILL + nspill
-            nspill += 1
+            loc[victim] = LOC_SPILL + spill_slot(slot_end, lv.start[victim], lv.end[victim])
             var kept: [i64] = []
             for w in active {
                 if w != victim {
@@ -486,15 +555,31 @@ pub fn allocate(vc: VCode, max_regs: i64, corrupt: bool) -> Alloc ! str {
             kept.push(v)
             active = kept
         } else {
-            loc[v] = LOC_SPILL + nspill
-            nspill += 1
+            loc[v] = LOC_SPILL + spill_slot(slot_end, s, e)
         }
     }
+    let nspill = slot_end.len()
     var corrupted = 0
     if corrupt {
         corrupted = plant(vc, loc)
     }
     rewrite(vc, loc, nspill, corrupted)
+}
+
+/// A spill slot for an interval `[s, e]`: the first whose every earlier
+/// holder ended before `s`, else a new one. Intervals arrive by start, so a
+/// slot is shared only by intervals that never overlap, and a function whose
+/// spilled values each live briefly -- a long list literal -- needs a few
+/// slots, not one per value.
+fn spill_slot(inout slot_end: [i64], s: i64, e: i64) -> i64 {
+    for k in 0..slot_end.len() {
+        if slot_end[k] < s {
+            slot_end[k] = e
+            return k
+        }
+    }
+    slot_end.push(e)
+    slot_end.len() - 1
 }
 
 fn in_reg(loc: [i64], o: i64) -> bool {
@@ -575,7 +660,7 @@ fn push_a(inout al: Alloc, m: i64, d: i64, n: i64, mm: i64, a: i64, imm: i64, ki
 
 /// The frame offset of spill slot `k`: above the `inout` slots.
 pub fn spill_offset(al: Alloc, k: i64) -> i64 {
-    8 * (al.nslots + k)
+    8 * (al.nout + al.nslots + k)
 }
 
 /// Rewrites every operand to its location, with reloads and spills around
@@ -584,7 +669,7 @@ fn rewrite(vc: VCode, loc: [i64], nspill: i64, corrupted: i64) -> Alloc ! str {
     var al = Alloc{
         mop: [], rd: [], rn: [], rm: [], ra: [], imm: [], imm2: [], cc: [], tgt: [],
         symk: [], sym_id: [], od: [], on: [], om: [], oa: [], kind: [], slot: [],
-        bi0: [], bni: [], nparams: vc.nparams, nslots: vc.nslots, nspill: nspill, loc: loc,
+        bi0: [], bni: [], nparams: vc.nparams, nslots: vc.nslots, nout: vc.nout, nspill: nspill, loc: loc,
         used_callee: [], corrupted: corrupted,
     }
     for r in 0..32 {
@@ -595,8 +680,8 @@ fn rewrite(vc: VCode, loc: [i64], nspill: i64, corrupted: i64) -> Alloc ! str {
             al.used_callee[loc[v]] = true
         }
     }
-    if 8 * (vc.nslots + nspill) > 32760 {
-        fail("{vc.sym}: the frame needs {vc.nslots + nspill} slots, more than one load can reach")
+    if 8 * (vc.nout + vc.nslots + nspill) > 32760 {
+        fail("{vc.sym}: the frame needs {vc.nout + vc.nslots + nspill} slots, more than one load can reach")
     }
     let nb = vcode.nblocks(vc)
     for b in 0..nb {

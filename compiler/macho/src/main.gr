@@ -4,7 +4,10 @@
 // lays out its own objects:
 //
 //     mach_header_64          MH_OBJECT, MH_SUBSECTIONS_VIA_SYMBOLS
-//     LC_SEGMENT_64           one unnamed segment: __text, __cstring, __const
+//     LC_SEGMENT_64           one unnamed segment: __text, __cstring, __const,
+//                             and __DATA,__data for what the runtime writes
+//                             into (a struct descriptor's cache), with its
+//                             pointers as ARM64_RELOC_UNSIGNED relocations
 //     LC_BUILD_VERSION        macOS; the Cranelift build omits it, and ld then
 //                             warns "no platform load command found"
 //     LC_SYMTAB, LC_DYSYMTAB  locals, then defined externals, then undefined
@@ -35,14 +38,26 @@ type MoObj = {
     /// else in `__const`.
     dsym: [str],
     dbytes: [bytes],
+    /// Writable data in `__DATA,__data`, each a symbol of its own, 8-byte
+    /// aligned: what the runtime writes into (a struct descriptor's cache
+    /// word). `wrel_off`/`wrel_sym` are 64-bit absolute pointers in it, at
+    /// byte offsets from the start of the section, to a symbol.
+    wsym: [str],
+    wbytes: [bytes],
+    wrel_off: [i64],
+    wrel_sym: [str],
 }
 
+pub let R_UNSIGNED = 0
 pub let R_BRANCH26 = 2
 pub let R_PAGE21 = 3
 pub let R_PAGEOFF12 = 4
 
 pub fn new_obj() -> MoObj {
-    MoObj{ text: [], fsym: [], foff: [], fext: [], rel_off: [], rel_kind: [], rel_sym: [], dsym: [], dbytes: [] }
+    MoObj{
+        text: [], fsym: [], foff: [], fext: [], rel_off: [], rel_kind: [], rel_sym: [], dsym: [], dbytes: [],
+        wsym: [], wbytes: [], wrel_off: [], wrel_sym: [],
+    }
 }
 
 // ----- bytes ----------------------------------------------------------------------
@@ -120,9 +135,16 @@ pub fn write(o: MoObj) -> bytes ! str {
     for k in const_ix {
         const_size += o.dbytes[k].len()
     }
+    var data_size = 0
+    var wsym_off: [i64] = []
+    for k in 0..o.wsym.len() {
+        wsym_off.push(data_size)
+        data_size += align_up(o.wbytes[k].len(), 8)
+    }
     var nsect = 1
     var cstr_sect = -1
     var const_sect = -1
+    var data_sect = -1
     if cstr_ix.len() > 0 {
         nsect += 1
         cstr_sect = nsect
@@ -131,11 +153,16 @@ pub fn write(o: MoObj) -> bytes ! str {
         nsect += 1
         const_sect = nsect
     }
+    if o.wsym.len() > 0 {
+        nsect += 1
+        data_sect = nsect
+    }
     // Addresses within the segment.
     let text_addr = 0
     let cstr_addr = text_size
     let const_addr = cstr_addr + cstr_size
-    let vmsize = const_addr + const_size
+    let data_addr = if data_sect > 0 { align_up(const_addr + const_size, 8) } else { const_addr + const_size }
+    let vmsize = data_addr + data_size
     // Where each datum sits.
     var daddr: [i64] = []
     var dsect: [i64] = []
@@ -186,6 +213,13 @@ pub fn write(o: MoObj) -> bytes ! str {
         ssect.push(dsect[k])
         svalue.push(daddr[k])
     }
+    for k in 0..o.wsym.len() {
+        defined.set(o.wsym[k], sname.len())
+        sname.push(o.wsym[k])
+        stype.push(14)
+        ssect.push(data_sect)
+        svalue.push(data_addr + wsym_off[k])
+    }
     let nlocal = sname.len()
     var ext: [str] = []
     for k in 0..o.fsym.len() {
@@ -211,6 +245,12 @@ pub fn write(o: MoObj) -> bytes ! str {
     var undef: [str] = []
     var seen: Map[str, i64] = {}
     for s in o.rel_sym {
+        if not defined.has(s) and not seen.has(s) {
+            seen.set(s, 1)
+            undef.push(s)
+        }
+    }
+    for s in o.wrel_sym {
         if not defined.has(s) and not seen.has(s) {
             seen.set(s, 1)
             undef.push(s)
@@ -270,13 +310,39 @@ pub fn write(o: MoObj) -> bytes ! str {
     if o.rel_off.len() >= 65536 {
         fail("too many relocations ({o.rel_off.len()})")
     }
+    // The data's pointers: 64-bit absolute (ARM64_RELOC_UNSIGNED, length 3),
+    // each against the symbol it points at, last address first.
+    var dkeys: [i64] = []
+    for k in 0..o.wrel_off.len() {
+        if o.wrel_off[k] % 8 != 0 or o.wrel_off[k] + 8 > data_size {
+            fail("data relocation at {o.wrel_off[k]} is not an aligned word of `__data`")
+        }
+        dkeys.push(o.wrel_off[k] * 65536 + k)
+    }
+    dkeys.sort()
+    if o.wrel_off.len() >= 65536 {
+        fail("too many data relocations ({o.wrel_off.len()})")
+    }
+    var drels = byte_builder()
+    var dq = dkeys.len() - 1
+    while dq >= 0 {
+        let k = dkeys[dq].bit_and(65535)
+        let sym = defined.get(o.wrel_sym[k]) ?? -1
+        if sym < 0 {
+            fail("data relocation against `{o.wrel_sym[k]}`, which has no symbol")
+        }
+        put32(drels, o.wrel_off[k])
+        put32(drels, sym.bit_or(3.shl(25)).bit_or(1.shl(27)).bit_or(R_UNSIGNED.shl(28)))
+        dq -= 1
+    }
 
     // Layout.
     let seg_cmd_size = 72 + 80 * nsect
     let sizeofcmds = seg_cmd_size + 24 + 24 + 80
     let data_off = align_up(32 + sizeofcmds, 16)
     let rel_off = align_up(data_off + vmsize, 8)
-    let sym_off = align_up(rel_off + rels.len(), 8)
+    let drel_off = rel_off + rels.len()
+    let sym_off = align_up(drel_off + drels.len(), 8)
     let str_off = sym_off + 16 * nsyms
 
     var b = byte_builder()
@@ -343,6 +409,21 @@ pub fn write(o: MoObj) -> bytes ! str {
         put32(b, 0)
         put32(b, 0)
     }
+    if data_sect > 0 {
+        // S_REGULAR, aligned to 2^3.
+        name16(b, "__data")
+        name16(b, "__DATA")
+        put64(b, data_addr)
+        put64(b, data_size)
+        put32(b, data_off + data_addr)
+        put32(b, 3)
+        put32(b, if o.wrel_off.len() > 0 { drel_off } else { 0 })
+        put32(b, o.wrel_off.len())
+        put32(b, 0)
+        put32(b, 0)
+        put32(b, 0)
+        put32(b, 0)
+    }
     // LC_BUILD_VERSION: macOS, minimum 11.0, SDK 11.0, no tools.
     put32(b, 0x32)
     put32(b, 24)
@@ -384,11 +465,23 @@ pub fn write(o: MoObj) -> bytes ! str {
     for k in const_ix {
         b.push_bytes(o.dbytes[k])
     }
+    if data_sect > 0 {
+        while b.len() < data_off + data_addr {
+            put8(b, 0)
+        }
+        for k in 0..o.wsym.len() {
+            b.push_bytes(o.wbytes[k])
+            while b.len() < data_off + data_addr + wsym_off[k] + align_up(o.wbytes[k].len(), 8) {
+                put8(b, 0)
+            }
+        }
+    }
     if b.len() != data_off + vmsize {
         fail("section contents end at {b.len()}, not {data_off + vmsize}")
     }
     pad_to(b, 8)
     b.push_bytes(rels.to_bytes())
+    b.push_bytes(drels.to_bytes())
     pad_to(b, 8)
     // nlist_64
     for k in 0..nsyms {

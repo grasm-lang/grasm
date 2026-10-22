@@ -183,7 +183,7 @@ fn plan(f: MirFn, rs: [Rule]) -> Sel ! str {
         s.inner.push(j)
         for i in f.bi0[b]..(f.bi0[b] + f.bni[b]) {
             let op = f.op[i]
-            if op == ir.M_CALL or op == ir.M_CALLRT {
+            if is_call(op) {
                 continue
             }
             let ri = choose(f, s, rs, op, i, -1)
@@ -203,6 +203,8 @@ fn plan(f: MirFn, rs: [Rule]) -> Sel ! str {
             for j in f.ca0[i]..(f.ca0[i] + f.can[i]) {
                 bump(s, f.cargs[j])
             }
+        } else if op == ir.M_INC or op == ir.M_DEC {
+            bump(s, f.a[i])
         } else {
             count_rule(f, s, rs[s.rule_of[i]], f.a[i], f.b[i], -1, -1)
         }
@@ -254,6 +256,11 @@ fn plan(f: MirFn, rs: [Rule]) -> Sel ! str {
         }
     }
     s
+}
+
+/// Operations that follow the calling convention rather than the rule table.
+fn is_call(op: i64) -> bool {
+    op == ir.M_CALL or op == ir.M_CALLRT or op == ir.M_INC or op == ir.M_DEC
 }
 
 fn vr(v: i64) -> i64 {
@@ -326,10 +333,12 @@ fn expand(inout vc: VCode, f: MirFn, s: Sel, ru: Rule, ccm: [i64], i: i64, j: i6
             } else if k == rules.K_IMM {
                 imms.push(own_imm)
             } else if k == rules.K_SLOT {
-                if own_imm * 8 > 4095 {
+                // Above the outgoing stack arguments.
+                let off = (own_imm + vc.nout) * 8
+                if off > 4095 {
                     fail("frame slot {own_imm} is out of reach of an immediate")
                 }
-                imms.push(own_imm * 8)
+                imms.push(off)
             } else {
                 fail("unknown immediate selector {k}")
             }
@@ -361,6 +370,9 @@ fn expand(inout vc: VCode, f: MirFn, s: Sel, ru: Rule, ccm: [i64], i: i64, j: i6
         }
         if tm.sym == rules.Y_STR {
             vc.symk[x] = vcode.SYM_STR
+            vc.sym_id[x] = own_imm
+        } else if tm.sym == rules.Y_DATA {
+            vc.symk[x] = vcode.SYM_DATA
             vc.sym_id[x] = own_imm
         }
     }
@@ -424,16 +436,31 @@ pub fn select(f: MirFn, rs: [Rule], ccm: [i64]) -> VCode ! str {
     vc.nvregs = f.nvals
     vc.nparams = f.nparams
     vc.nslots = f.nslots
-    if f.nparams > 8 {
-        fail("`{f.name}` takes {f.nparams} arguments; only eight travel in registers")
+    // Arguments past the eighth travel on the stack (AAPCS64), eight bytes
+    // each: the caller stores them at the bottom of its frame, where `sp`
+    // points at the call, and the callee reads them above its saved frame
+    // pointer. The outgoing area is as big as the largest call needs.
+    for i in 0..f.op.len() {
+        if f.op[i] == ir.M_CALL and f.can[i] - 8 > vc.nout {
+            vc.nout = f.can[i] - 8
+        }
+        if f.op[i] == ir.M_CALLRT and f.can[i] > 8 {
+            fail("a runtime call with {f.can[i]} arguments; only eight travel in registers")
+        }
     }
     let nb = ir.nblocks(f)
     for b in 0..nb {
         vc.bi0.push(vc.mop.len())
         if b == 0 {
-            // Parameters arrive in x0..x7.
+            // Parameters arrive in x0..x7, and the rest at the frame
+            // pointer: past the saved pair, where the caller's `sp` was.
             for k in 0..f.bnp[0] {
-                mov(vc, vr(f.bparams[f.bp0[0] + k]), k)
+                if k < 8 {
+                    mov(vc, vr(f.bparams[f.bp0[0] + k]), k)
+                } else {
+                    let x = vcode.push(vc, mach.A_LDR, vr(f.bparams[f.bp0[0] + k]), mach.R_FP, -1)
+                    vc.imm[x] = 16 + 8 * (k - 8)
+                }
             }
         }
         for i in f.bi0[b]..(f.bi0[b] + f.bni[b]) {
@@ -443,20 +470,37 @@ pub fn select(f: MirFn, rs: [Rule], ccm: [i64]) -> VCode ! str {
             let op = f.op[i]
             if op == ir.M_CALL or op == ir.M_CALLRT {
                 let n = f.can[i]
-                if n > 8 {
-                    fail("a call with {n} arguments; only eight travel in registers")
+                // The stack arguments first: storing them reads registers the
+                // moves below may be about to fill.
+                for k in 8..n {
+                    let x = vcode.push(vc, mach.A_STR, vr(f.cargs[f.ca0[i] + k]), mach.R_SP, -1)
+                    vc.imm[x] = 8 * (k - 8)
                 }
                 for k in 0..n {
-                    mov(vc, k, vr(f.cargs[f.ca0[i] + k]))
+                    if k < 8 {
+                        mov(vc, k, vr(f.cargs[f.ca0[i] + k]))
+                    }
                 }
                 let x = vcode.push(vc, mach.A_BL, -1, -1, -1)
                 vc.imm[x] = if f.res[i] >= 0 { 1 } else { 0 }
-                vc.imm2[x] = n
+                vc.imm2[x] = if n > 8 { 8 } else { n }
                 vc.symk[x] = if op == ir.M_CALL { vcode.SYM_FN } else { vcode.SYM_RT }
                 vc.sym_id[x] = f.imm[i]
                 if f.res[i] >= 0 {
                     mov(vc, vr(f.res[i]), 0)
                 }
+                continue
+            }
+            if op == ir.M_INC or op == ir.M_DEC {
+                // Reference counting is the runtime's: a call, so the count
+                // is changed atomically and a release that reaches zero frees
+                // what it must, exactly as for the Cranelift build.
+                mov(vc, 0, vr(f.a[i]))
+                let x = vcode.push(vc, mach.A_BL, -1, -1, -1)
+                vc.imm[x] = 0
+                vc.imm2[x] = 1
+                vc.symk[x] = vcode.SYM_RT
+                vc.sym_id[x] = if op == ir.M_INC { ir.RT_VAL_INC } else { ir.RT_VAL_DEC }
                 continue
             }
             try expand(vc, f, s, rs[s.rule_of[i]], ccm, i, -1, -1, -1, -1)

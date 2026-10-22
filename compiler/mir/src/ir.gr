@@ -10,8 +10,10 @@
 // instructions are a contiguous run, its parameters a run of `bparams`, a
 // call's arguments a run of `cargs`.
 //
-// Reference counting is not here yet. The subset this part compiles has no
-// heap values (S3 part two adds `inc`/`dec` as explicit instructions).
+// Reference counting is explicit: a value of a boxed type (a pointer to one
+// of the runtime's 64-byte `RtVal`s) is retained by `inc` and released by
+// `dec`, written where the lowering decides ownership changes hands
+// (`lower.gr` says where), so a later pass can see them and remove them.
 
 // ----- opcodes -------------------------------------------------------------
 // The same numbers serve the variable form the lowering builds first
@@ -56,6 +58,14 @@ pub let M_GETSP = 28
 pub let M_SLOTADDR = 29
 pub let M_LOAD = 30
 pub let M_STORE = 31
+/// Retains the boxed value `a` (`grasm_val_inc`); a null pointer is left be.
+pub let M_INC = 32
+/// Releases the boxed value `a` (`grasm_val_dec`), freeing it and whatever it
+/// was the last owner of when its count reaches zero.
+pub let M_DEC = 33
+/// The address of writable data object `imm` of the program (`MirProg.descs`:
+/// a struct descriptor the runtime reads and caches its type in).
+pub let M_DATAADDR = 34
 // Terminators.
 pub let M_JUMP = 40
 pub let M_BRIF = 41
@@ -67,7 +77,7 @@ pub let M_TRAP = 43
 /// Whether an instruction has no effect but its result, so it may be
 /// removed when nothing reads the result.
 pub fn pure_op(op: i64) -> bool {
-    op != M_CALL and op != M_CALLRT and op != M_STORE and op < M_JUMP
+    op != M_CALL and op != M_CALLRT and op != M_STORE and op != M_INC and op != M_DEC and op < M_JUMP
 }
 
 // ----- conditions ------------------------------------------------------------
@@ -113,6 +123,8 @@ pub let TY_U16 = 7
 pub let TY_U32 = 8
 pub let TY_U64 = 9
 pub let TY_NEVER = 10
+/// A boxed value: a counted pointer to an `RtVal`, owned by whoever holds it.
+pub let TY_BOX = 11
 
 pub fn ty_of_name(name: str) -> i64 {
     match name {
@@ -145,6 +157,11 @@ pub fn ty_scalar(t: i64) -> bool {
     t >= TY_UNIT and t <= TY_NEVER
 }
 
+/// A counted pointer, which `inc` and `dec` keep alive.
+pub fn ty_boxed(t: i64) -> bool {
+    t == TY_BOX
+}
+
 // ----- runtime symbols -------------------------------------------------------
 // The C functions of `crates/grasm_rt` this backend calls: the same symbols,
 // with the same arguments, as the Cranelift backend uses for the same
@@ -172,7 +189,11 @@ pub let RT_PANIC_STACK = 18
 pub let RT_SET_ARGS = 19
 pub let RT_CHECK_LEAKS = 20
 pub let RT_POW_I64 = 21
-pub let RT_COUNT = 22
+pub let RT_VAL_INC = 22
+pub let RT_VAL_DEC = 23
+/// Runtime symbols past the fixed ones are named by the program: a
+/// `M_CALLRT` with `imm >= RT_COUNT` calls `MirProg.rt_syms[imm]`.
+pub let RT_COUNT = 24
 
 pub fn rt_name(id: i64) -> str {
     match id {
@@ -198,8 +219,19 @@ pub fn rt_name(id: i64) -> str {
         19 -> "grasm_set_args"
         20 -> "grasm_check_leaks"
         21 -> "grasm_pow_i64"
+        22 -> "grasm_val_inc"
+        23 -> "grasm_val_dec"
         _ -> "grasm_unknown"
     }
+}
+
+/// The fixed runtime symbols, by id: the start of every program's pool.
+pub fn rt_fixed() -> [str] {
+    var out: [str] = []
+    for k in 0..RT_COUNT {
+        out.push(rt_name(k))
+    }
+    out
 }
 
 /// Whether a runtime function returns a value.
@@ -275,7 +307,30 @@ type MirProg = {
     /// when nothing reachable from `main` calls it.
     callee_sym: [str],
     strs: [str],
+    /// Every runtime symbol a `M_CALLRT` names, by id: `rt_fixed()` first,
+    /// then the ones the program's functions asked for, each once.
+    rt_syms: [str],
+    /// The struct descriptors `M_DATAADDR` names, by id.
+    descs: [MirDesc],
 }
+
+/// A struct type's descriptor, as the runtime's `StructDesc` reads it
+/// (`crates/grasm_rt`, the `StructDesc` comment): the type's name, each
+/// field's name and kind (`FK_*`), each name a string of the pool.
+type MirDesc = {
+    name: str,
+    fields: [str],
+    kinds: [i64],
+    name_str: i64,
+    field_strs: [i64],
+}
+
+// Field kinds, the runtime's `FK_*`.
+pub let FK_BOXED = 0
+pub let FK_I64 = 1
+pub let FK_BOOL = 3
+pub let FK_UNIT = 5
+pub let FK_U64 = 9
 
 // ----- reading it back -----------------------------------------------------------
 
@@ -316,6 +371,9 @@ pub fn op_name(op: i64) -> str {
         29 -> "slotaddr"
         30 -> "load"
         31 -> "store"
+        32 -> "inc"
+        33 -> "dec"
+        34 -> "dataaddr"
         40 -> "jump"
         41 -> "brif"
         42 -> "ret"
@@ -326,9 +384,9 @@ pub fn op_name(op: i64) -> str {
 
 /// How many value operands an instruction reads from `a` and `b`.
 pub fn nreads(op: i64) -> i64 {
-    if op == M_ICONST or op == M_STRADDR or op == M_GETSP or op == M_SLOTADDR or op == M_CALL or op == M_CALLRT {
+    if op == M_ICONST or op == M_STRADDR or op == M_GETSP or op == M_SLOTADDR or op == M_CALL or op == M_CALLRT or op == M_DATAADDR {
         0
-    } else if op == M_COPY or op == M_NEG or op == M_NOT or (op >= M_SEXT8 and op <= M_UEXT32) or op == M_LOAD {
+    } else if op == M_COPY or op == M_NEG or op == M_NOT or (op >= M_SEXT8 and op <= M_UEXT32) or op == M_LOAD or op == M_INC or op == M_DEC {
         1
     } else {
         2
@@ -353,7 +411,7 @@ fn arg_list(xs: [i64], from: i64, n: i64) -> str {
 
 /// The function as text, one instruction a line, for reading and for
 /// debugging the stages after it.
-pub fn print_fn(f: MirFn, callee_sym: [str]) -> str {
+pub fn print_fn(f: MirFn, callee_sym: [str], rt_syms: [str]) -> str {
     var out = str_builder()
     out.push_str("fn {f.sym} ({f.name}) params={f.nparams} floor={f.floor} returns={f.returns} slots={f.nslots}\n")
     for b in 0..nblocks(f) {
@@ -369,13 +427,16 @@ pub fn print_fn(f: MirFn, callee_sym: [str]) -> str {
                 line = line + " {f.imm[i]}"
             } else if op == M_STRADDR {
                 line = line + " s{f.imm[i]}"
+            } else if op == M_DATAADDR {
+                line = line + " d{f.imm[i]}"
             } else if op == M_ICMP {
                 line = line + "." + cc_name(f.imm[i]) + " {vname(f.a[i])}, {vname(f.b[i])}"
             } else if op == M_CALL {
                 let callee = if f.imm[i] >= 0 and f.imm[i] < callee_sym.len() { callee_sym[f.imm[i]] } else { "?" }
                 line = line + " {callee}({arg_list(f.cargs, f.ca0[i], f.can[i])})"
             } else if op == M_CALLRT {
-                line = line + " {rt_name(f.imm[i])}({arg_list(f.cargs, f.ca0[i], f.can[i])})"
+                let rn = if f.imm[i] >= 0 and f.imm[i] < rt_syms.len() { rt_syms[f.imm[i]] } else { "?" }
+                line = line + " {rn}({arg_list(f.cargs, f.ca0[i], f.can[i])})"
             } else if nreads(op) == 1 {
                 line = line + " {vname(f.a[i])}"
             } else if nreads(op) == 2 {

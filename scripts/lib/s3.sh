@@ -27,10 +27,12 @@ s3_driver() {
 # build --native` links a Cranelift object, writing through `$2` if it exists
 # so the file keeps its inode and macOS its verdict on it (`lib/native.sh`
 # explains the ~450ms that saves per program). The linker's own output goes
-# to `$3`. Fails, leaving no executable behind, when the link does.
+# to `$3`. Fails, leaving no executable behind, when the link does. `$4`, if
+# given, is the runtime to link instead of `$S3_RT` (the RC gate's poisoned
+# one).
 s3_link() {
-    local obj=$1 out=$2 log=$3 stage="$2.stage"
-    if ! cc "$obj" "$S3_RT" -o "$stage" -Wl,-dead_strip >"$log" 2>&1; then
+    local obj=$1 out=$2 log=$3 stage="$2.stage" rt=${4:-$S3_RT}
+    if ! cc "$obj" "$rt" -o "$stage" -Wl,-dead_strip >"$log" 2>&1; then
         rm -f "$out" "$stage"
         return 1
     fi
@@ -42,9 +44,10 @@ s3_link() {
     fi
 }
 
-# The runtime every native build links against.
+# The runtime every native build links against; `S3_RT=` names another
+# build of the same sources.
 s3_runtime() {
-    S3_RT=./target/release/libgrasm_rt_abi.a
+    S3_RT=${S3_RT:-./target/release/libgrasm_rt_abi.a}
     if [ ! -f "$S3_RT" ]; then
         echo "error: $S3_RT is missing"
         exit 1
@@ -79,7 +82,22 @@ s3_collect() {
     done <"$WORK/collected.tsv"
 }
 
+# How long one run of one program may take in these gates. A program in the
+# subset finishes in well under a second, and the corpus limit (`corpus.sh`,
+# 1800 s, sized for an interpreted password KDF) let a planted fault that
+# loops forever -- `s3controls` plants them on purpose -- spend half an hour
+# on each program it broke: one control ran for three hours. A run past this
+# is a failure in a gate and a difference found in a control.
+# `S3_RUN_LIMIT=` overrides it.
+S3_RUN_SECONDS=${S3_RUN_LIMIT:-20}
+if command -v timeout >/dev/null 2>&1; then
+    S3_RUN="timeout $S3_RUN_SECONDS"
+else
+    S3_RUN=""
+fi
+
 # How many programs the rule has in; a floor below which the subset is too
 # small for agreement on it to mean much. 37 programs were in when the gates
-# were written (2026-10-21); a shrinking subset should be noticed.
-S3_SUBSET_FLOOR=30
+# were written (2026-10-21), 278 once part two added heap values and
+# fallible functions (2026-10-22); a shrinking subset should be noticed.
+S3_SUBSET_FLOOR=250

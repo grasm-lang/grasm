@@ -69,9 +69,11 @@ pub let T_NONE = 0
 pub let T_THEN = 1
 pub let T_ELSE = 2
 
-// Symbols: a string literal named by the instruction's `imm`.
+// Symbols: a string literal or a writable data object (a struct
+// descriptor) named by the instruction's `imm`.
 pub let Y_NONE = 0
 pub let Y_STR = 3
+pub let Y_DATA = 4
 
 // Guards.
 pub let G_ANY = 0
@@ -217,6 +219,11 @@ pub fn rules() -> [Rule] {
     var pageoff = t(mach.A_ADDPO, S_RES, S_RES, S_NONE)
     pageoff.sym = Y_STR
     rs.push(r("straddr", ir.M_STRADDR, G_ANY, [adrp, pageoff]))
+    var dadrp = t(mach.A_ADRP, S_RES, S_NONE, S_NONE)
+    dadrp.sym = Y_DATA
+    var dpageoff = t(mach.A_ADDPO, S_RES, S_RES, S_NONE)
+    dpageoff.sym = Y_DATA
+    rs.push(r("dataaddr", ir.M_DATAADDR, G_ANY, [dadrp, dpageoff]))
     rs.push(r("getsp", ir.M_GETSP, G_ANY, [ti(mach.A_ADDI, S_RES, S_SP, 0, 0)]))
     rs.push(r("slotaddr", ir.M_SLOTADDR, G_ANY, [ti(mach.A_ADDI, S_RES, S_SP, K_SLOT, 0)]))
     rs.push(r("load", ir.M_LOAD, G_ANY, [ti(mach.A_LDR, S_RES, S_A, 0, 0)]))
@@ -241,7 +248,7 @@ pub fn ruled_ops() -> [i64] {
         ir.M_ICONST, ir.M_ADD, ir.M_SUB, ir.M_MUL, ir.M_SDIV, ir.M_UDIV, ir.M_SREM, ir.M_UREM,
         ir.M_AND, ir.M_OR, ir.M_XOR, ir.M_SHL, ir.M_SSHR, ir.M_USHR, ir.M_NEG, ir.M_NOT,
         ir.M_SEXT8, ir.M_SEXT16, ir.M_SEXT32, ir.M_UEXT8, ir.M_UEXT16, ir.M_UEXT32,
-        ir.M_ICMP, ir.M_STRADDR, ir.M_GETSP, ir.M_SLOTADDR, ir.M_LOAD, ir.M_STORE,
+        ir.M_ICMP, ir.M_STRADDR, ir.M_DATAADDR, ir.M_GETSP, ir.M_SLOTADDR, ir.M_LOAD, ir.M_STORE,
         ir.M_BRIF, ir.M_JUMP, ir.M_TRAP,
     ]
 }

@@ -19,6 +19,23 @@
 #              -> s3subset
 #   allocator  a reload reads the spill slot after the one it should
 #              -> ra_check (the checker, under register pressure)
+#   missing-dec  a scope's end releases nothing -> s3rc (a leak)
+#   extra-dec    a read of a boxed local takes no reference of its own, so
+#                its release is one too many -> s3rc (a use after free)
+#   err-tag      `fail` and a failed `try` answer the `Ok` tag
+#                -> s3subset (programs print the wrong thing)
+#   rc-select    `inc` is selected as a call of `grasm_val_dec`
+#                -> s3rc (a use after free)
+#   dataaddr     the address of a struct descriptor takes its page from a
+#                string's symbol -> s3subset
+#   datarelocs   every pointer relocation in `__data` is a word late
+#                -> objtest (descriptor addresses with no relocation)
+#   method       `to_upper` calls the runtime's lower-casing
+#                -> s3subset
+#
+# A fault that sends a program into a loop shows as a run stopped at the
+# gates' limit (`S3_RUN_SECONDS` in `scripts/lib/s3.sh`, 20 s against well
+# under a second for any subset program), and counts as caught.
 #
 # The unmutated gates are run by `scripts/allgates.sh` on their own; this
 # gate only shows that each of them can fail.
@@ -65,6 +82,12 @@ control() {
         if [ "$code" != 0 ] && grep -cF -- "$symptom" "$log" >/dev/null; then
             caught=$((caught + 1))
             echo "caught: $name by $(basename "$gate" .sh) (exit $code; \"$symptom\")"
+        elif [ "$code" != 0 ] && grep -ciE -- "timed out after" "$log" >/dev/null; then
+            # A program the fault sent into a loop: stopped at the gates' run
+            # limit (`S3_RUN_SECONDS`), where its right build had finished in
+            # well under a second. A difference found, not a different reason.
+            caught=$((caught + 1))
+            echo "caught: $name by $(basename "$gate" .sh) (exit $code; a program ran past the limit)"
         elif [ "$code" != 0 ]; then
             MISSED+=("$name: $(basename "$gate" .sh) failed (exit $code) but not with \"$symptom\"; see its last lines below")
             tail -5 "$log" | sed 's/^/    /'
@@ -94,6 +117,38 @@ control allocator compiler/aarch64/src/regalloc.gr \
     "let rslot = l - LOC_SPILL" "let rslot = l - LOC_SPILL + 1" -- \
     scripts/ra_check.sh "register allocation check failed" -
 
+# Part two's ownership rules, the lowering families it added, and the
+# object's new section.
+control missing-dec compiler/mir/src/lower.gr \
+    "        while k >= m {" "        while k >= m and false {" -- \
+    scripts/s3rc.sh "LEAKS:" -
+
+control extra-dec compiler/mir/src/lower.gr \
+    "    emit(v, ir.M_INC, -1, d, -1, 0)" "    ()" -- \
+    scripts/s3rc.sh "use after free" -
+
+control err-tag compiler/mir/src/lower.gr \
+    "        split_return(v, 1, x)" "        split_return(v, 0, x)" -- \
+    scripts/s3subset.sh "MISMATCH:" -
+
+control rc-select compiler/aarch64/src/isel.gr \
+    "if op == ir.M_INC { ir.RT_VAL_INC } else { ir.RT_VAL_DEC }" \
+    "if op == ir.M_INC { ir.RT_VAL_DEC } else { ir.RT_VAL_DEC }" -- \
+    scripts/s3rc.sh "use after free" -
+
+control dataaddr compiler/aarch64/src/rules.gr \
+    "    dadrp.sym = Y_DATA" "    dadrp.sym = Y_STR" -- \
+    scripts/s3subset.sh "FAILED:" -
+
+control datarelocs compiler/macho/src/main.gr \
+    "        put32(drels, o.wrel_off[k])" "        put32(drels, o.wrel_off[k] + 8)" -- \
+    scripts/objtest.sh "is an address with no relocation" -
+
+control method compiler/mir/src/lower.gr \
+    "\"str.to_upper/0\" -> read_method(info, v, e, \"grasm_str_upper\"" \
+    "\"str.to_upper/0\" -> read_method(info, v, e, \"grasm_str_lower\"" -- \
+    scripts/s3subset.sh "MISMATCH:" -
+
 echo
 echo "controls: $controls   caught: $caught   missed: ${#MISSED[@]}"
 if [ ${#MISSED[@]} -gt 0 ]; then
@@ -102,9 +157,9 @@ if [ ${#MISSED[@]} -gt 0 ]; then
     printf '  %s\n' "${MISSED[@]}"
     exit 1
 fi
-# Seven gate runs over four faults, and every one must have failed.
-if [ "$controls" -ne 7 ] || [ "$caught" -ne 7 ]; then
-    echo "expected 7 controls caught, ran $controls and caught $caught"
+# Fourteen gate runs over eleven faults, and every one must have failed.
+if [ "$controls" -ne 14 ] || [ "$caught" -ne 14 ]; then
+    echo "expected 14 controls caught, ran $controls and caught $caught"
     exit 1
 fi
 exit 0

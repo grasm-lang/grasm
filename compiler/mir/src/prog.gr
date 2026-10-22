@@ -26,6 +26,8 @@ type TirInfo = {
     reach: [bool],
     recursive: [bool],
     sym: [str],
+    /// Each named type's declaration, by name: `(type "N" (generics ..) body)`.
+    type_ix: Map[str, i64],
 }
 
 /// Keeps a symbol to the characters every tool accepts.
@@ -93,13 +95,15 @@ fn callees_of(info: TirInfo, root: i64) -> [i64] {
 pub fn index(t: TirTree) -> TirInfo ! str {
     var info = TirInfo{
         t: t, c_name: [], c_elem: [], c_const: [], fn_ix: {}, const_ix: {}, main_c: -1,
-        e0: [], en: [], edges: [], reach: [], recursive: [], sym: [],
+        e0: [], en: [], edges: [], reach: [], recursive: [], sym: [], type_ix: {},
     }
     var main_name = ""
     var consts: [i64] = []
     for r in t.roots {
         let k = sexp.kw(t, r)
-        if k == "fn" {
+        if k == "type" {
+            info.type_ix.set(sexp.word(t, r, 1), r)
+        } else if k == "fn" {
             let name = sexp.word(t, r, 1)
             info.fn_ix.set(name, info.c_name.len())
             info.c_name.push(name)

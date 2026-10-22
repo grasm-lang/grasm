@@ -68,7 +68,14 @@ migration note here; anything `experimental` may change in any release. See
 - **An aarch64 backend written in Grasm** (`compiler/`, self-hosting stage
   S3, part one): TIR to MIR to machine code to a Mach-O object, on a
   subset of the language. 37 corpus programs build with it and behave as
-  the Cranelift build does. `grasm build` still uses Cranelift.
+  the Cranelift build does. `grasm build` still uses Cranelift. Part two
+  added heap values -- strings, bytes, lists, tuples, structs, sum types,
+  options, maps -- with every reference count change an explicit `inc` or
+  `dec` instruction of the backend's MIR, fallible functions by the
+  Cranelift build's split-result convention, and the built-in methods and
+  one-call built-ins those programs use, arguments past the eighth on the
+  stack and places passed `inout`: 289 corpus programs now, each leak-free
+  and free of uses after free (the new `s3rc` gate).
 - **Raw memory and atomics**, only inside `unsafe` and only in a package
   that declares the new `mem` capability: an `addr` type, allocation, typed
   loads and stores, and atomic load/store/compare-exchange/add with

@@ -741,6 +741,76 @@ published; Rust removed from the main branch and kept on the tag
 Dependencies: S0 → S2 and S3; S1 → S5; S3 → S4; S2, S3, S4, S5 → S6;
 S6 → S7, S8 → S9.
 
+### 6.1 S3 part two: heap values, explicit RC, fallible functions
+
+The Grasm backend holds every value the runtime boxes -- `str`, `bytes`,
+lists, tuples, structs, sum types and `Option`, maps, results -- as the
+pointer to the runtime's 64-byte `RtVal` that the Cranelift build holds,
+built and read through the same `extern "C"` functions of `grasm_rt` with
+the same arguments, so objects from either backend link against the same
+`libgrasm_rt_abi.a`. Lists of integers, `u64`s and `bool`s are the
+runtime's scalar lists; a tuple's elements and a variant's fields are
+boxes; a struct holds a scalar field's bits and a boxed field's pointer,
+as its descriptor says. The descriptors are the runtime's `StructDesc`,
+written by the backend into a `__DATA,__data` section of the object, with
+each name's address as an `ARM64_RELOC_UNSIGNED` pointer relocation; the
+runtime caches its type in the descriptor's first word.
+
+**Ownership** is explicit in MIR: `inc` and `dec` are instructions, each a
+call of `grasm_val_inc`/`grasm_val_dec` after selection, as they are in the
+Cranelift build. The rules (`compiler/mir/src/lower.gr`, "Reference
+counting"):
+
+- every boxed value an expression computes is owned -- one reference for
+  whoever receives it -- and is a temporary until it is handed on or
+  released, so a `return`, `break` or `continue` part-way through an
+  expression releases it;
+- a variable owns a reference while its scope is open: a read retains a
+  copy (`inc`), leaving the scope by any path releases it, an assignment
+  releases the old value after computing the new one;
+- parameters are owned by the callee, the Cranelift build's default; an
+  `inout` parameter's value travels back to the caller instead;
+- each runtime call borrows or consumes its arguments as its contract says,
+  and what was only lent is released after it.
+
+Mutating a place -- `xs.push(x)`, `p.items.push(x)`, `g.rows[i][j] = v`,
+`s += t` -- hands the place's own reference to the runtime and stores what
+comes back, taking each container on the way down out of its parent when
+the parent is its only holder (`grasm_struct_take`, `grasm_list_take`), so a
+sole owner is changed in place rather than copied; the arguments and the
+path's indices are computed first. This matches the Cranelift build's
+ownership, not its elisions: its borrowed parameters, last-use moves,
+pinned buffers and value structs are not reproduced, so the Grasm build
+performs more `inc`/`dec` pairs. Removing the pairs that cancel is the
+Perceus-style pass of §4, to be measured against these counts.
+
+**Fallible functions** use the Cranelift build's split-result convention:
+a function `-> T ! E` that is not generic and not named `main` takes the
+address of a word as a hidden last argument and answers a tag, 0 for `Ok`
+and 1 for `Err`; through the address it writes the `Ok` payload's bits (0
+for unit) or an owned box, or the error's owned box. `try` on such a call
+reads the tag and the word directly; anywhere else the pair is boxed into a
+result (`grasm_result_box`), which `match` reads with `Ok`/`Err` patterns,
+`??` reads lazily, and `try` takes apart with `grasm_try_take`. A fallible
+`main` answers its whole result as a box, and the C entry reports its error
+(`grasm_report_main_err`, exit 1) as the Cranelift build's does.
+
+**Calls** pass the stack floor, the arguments and a split function's
+address for its word in x0..x7 and then on the stack, eight bytes each, as
+AAPCS64 does: the caller stores them at the bottom of its frame and the
+callee reads them above its saved frame pointer. An `inout` argument is a
+frame slot whose address the callee gets; a local's value is stored in it
+where the argument stands and loaded back after the call, and a place
+inside a variable (`bump(s.xs)`, `fill(rows[0])`) is read out of its
+container -- moved out when no later argument reads the same variable --
+and written back after the call, as the Cranelift build does.
+
+The gate that holds the counting to account is `scripts/s3rc.sh`: every
+program in the subset built by the Grasm backend is run under the
+leak check (`GRASM_LEAK_CHECK=1`) and against the poisoned runtime
+(`--features grasm_rt/poison`), as `leakcheck` and `usecheck` run the
+Cranelift build.
+
 ## 7. Bootstrap and trust
 
 - **During the migration:** stage 0 is the Rust-built `grasm`.
@@ -809,7 +879,7 @@ Decided 2026-10-20:
    systems subset (§5).
 5. **Linux** in S7.
 
-## 11. Where it stands (2026-10-21)
+## 11. Where it stands (2026-10-22)
 
 Measured, not estimated; each line is a gate's result on master.
 
@@ -823,14 +893,22 @@ Measured, not estimated; each line is a gate's result on master.
   `export fn`, thread-local cells and tuple map keys, each with spec
   clauses, both engines, conformance tests, a fuzz gate and controls
   (§5.1-§5.4). The context switch is deferred to S3/S5 (§5.5).
-- **S3 started.** `compiler/` holds an aarch64 backend in Grasm -- MIR,
-  rule-based selection, linear scan with a checker, an encoder checked
-  against `clang -c`, a Mach-O object writer -- on a subset: 37 of 648
-  corpus programs (scalars, control flow, calls, printing) build with it
-  and behave exactly as the Cranelift build. fib(35) is about 1.9x slower
-  than Cranelift's code. Heap values and RC, fallible functions,
-  closures, generics, effects, f64 and the rest of the corpus are S3
-  part two onward.
+- **S3 in progress.** `compiler/` holds an aarch64 backend in Grasm --
+  MIR with explicit `inc`/`dec`, rule-based selection, linear scan with a
+  checker, an encoder checked against `clang -c`, a Mach-O object writer
+  -- on a subset: 289 of 651 corpus programs with a `main` build with it
+  and print and exit exactly as the Cranelift build does (part one had 37:
+  scalars, control flow, calls, printing; part two added heap values with
+  explicit reference counting, fallible functions, 111 built-in methods
+  over seven receiver families, 22 one-call built-ins, arguments on the
+  stack and places passed `inout`, §6.1). All of them run with nothing live
+  at exit (those that reach the leak check; a few end by design before it)
+  and no use after free under the poisoned runtime. fib(35) was about 1.9x
+  slower than Cranelift's code at part one. What still keeps programs out,
+  by count of the 362 left: f64 (198), closures and function values (91,
+  with the list methods that take one: `map` 99, `filter` 58, `sort_by`
+  46), generics (72), references (72); effects, tasks and raw memory after
+  them.
 - **Not started:** S2 (the frontend in Grasm), S4 (the linker), S5 (the
   runtime in Grasm), S6 (self-compilation), S7-S9.
 

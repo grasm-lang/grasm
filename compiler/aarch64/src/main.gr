@@ -39,16 +39,9 @@ type A64Result = {
     vcode_text: str,
 }
 
-fn rt_names() -> [str] {
-    var out: [str] = []
-    for k in 0..ir.RT_COUNT {
-        out.push(ir.rt_name(k))
-    }
-    out
-}
-
-/// Selects, allocates, checks and encodes one function.
-pub fn compile_fn(f: MirFn, rs: [Rule], ccm: [i64], opts: A64Opts, callee_sym: [str]) -> A64Result ! str {
+/// Selects, allocates, checks and encodes one function. `rt_syms` names the
+/// runtime functions its calls reach, by id (`MirProg.rt_syms`).
+pub fn compile_fn(f: MirFn, rs: [Rule], ccm: [i64], opts: A64Opts, callee_sym: [str], rt_syms: [str]) -> A64Result ! str {
     let vc = try isel.select(f, rs, ccm)
     let al = try regalloc.allocate(vc, opts.max_regs, opts.corrupt)
     let errs = check.check(al)
@@ -56,7 +49,7 @@ pub fn compile_fn(f: MirFn, rs: [Rule], ccm: [i64], opts: A64Opts, callee_sym: [
     if opts.want_asm {
         vtext = vcode.print_vcode(vc)
     }
-    let code = try emit.emit(al, f.sym, opts.want_asm, callee_sym, rt_names())
+    let code = try emit.emit(al, f.sym, opts.want_asm, callee_sym, rt_syms)
     A64Result{ code: code, ra_errors: errs, corrupted: al.corrupted, vcode_text: vtext }
 }
 

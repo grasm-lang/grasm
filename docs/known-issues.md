@@ -5,7 +5,66 @@ Every defect that is known and not fixed, with its severity from
 to paste. S1 and S2 block a release; S3 and S4 do not, and this file is what
 makes shipping them honest rather than quiet.
 
-**Open S1: none. Open S2: none. Open S3: none. Open S4: none.**
+**Open S1: two (below, found 2026-10-22). Open S2: none. Open S3: none. Open S4: none.**
+
+## Found on 2026-10-22 by the Grasm backend (S3)
+
+Writing a second native backend means deciding every case the first one
+decided, and two of its decisions turned out to be wrong. Both are in the
+Cranelift build; the interpreter and the S3 backend agree with each other.
+
+**A bare `Err` pattern means different things in the two engines -- *open,
+S1*.** In `match r { Err -> ..., Ok(v) -> ... }` the interpreter (and TIR)
+read `Err` as a binding that matches anything, so an `Ok` takes the first
+arm; the native build reads it as a variant test, so an `Ok` takes the
+second. The checker accepts the program. Reproducer:
+
+```
+fn f(x: i64) -> i64 ! str {
+    if x < 0 {
+        fail("negative")
+    }
+    return x
+}
+
+fn main() {
+    let r: i64 ! str = f(5)
+    match r {
+        Err -> print("first arm: the bare Err matched an Ok")
+        Ok(v) -> print("second arm: ok {v}")
+    }
+}
+```
+
+`grasm run` prints the first arm, the native binary the second. Which one
+is right is a language decision (a bare `Err` most likely should be refused,
+or be a variant test everywhere); until it is made, one engine is wrong.
+
+**A `() ! E` function whose body ends in a value leaks that value natively --
+*open, S1*.** The checker accepts a non-unit tail in a function returning
+`() ! E` and discards it; the native build never releases it.
+
+```
+fn step(n: i64) -> () ! str {
+    if n < 0 {
+        fail("negative")
+    }
+    "a value nobody asked for {n}"
+}
+
+fn main() {
+    for i in 0..100000 {
+        step(i) ?? ()
+    }
+    print("done")
+}
+```
+
+Built natively and run with `GRASM_LEAK_CHECK=1`: `leak: 100000
+allocation(s) still live at exit`; with the tail replaced by `let _unused =
+n`, `nothing live at exit`. `leakcheck` never saw it because no corpus
+program has this shape.
+
 
 ## Found on 2026-10-19 by an outside review
 

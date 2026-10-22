@@ -56,7 +56,7 @@ for k in "${!S3_SRC[@]}"; do
         FAILED+=("$src — the Cranelift build fails: $(head -1 "$WORK/cl.log")")
         continue
     fi
-    $RUN_LIMIT "$WORK/p.cl" >"$WORK/cl.out" 2>"$WORK/cl.err" </dev/null
+    $S3_RUN "$WORK/p.cl" >"$WORK/cl.out" 2>"$WORK/cl.err" </dev/null
     cl_code=$?
     for regs in 0 2 5; do
         runs=$((runs + 1))
@@ -84,7 +84,7 @@ for k in "${!S3_SRC[@]}"; do
             FAILED+=("$src — with $regs registers the object does not link")
             continue
         fi
-        $RUN_LIMIT "$WORK/p.s3" >"$WORK/s3run.out" 2>"$WORK/s3run.err" </dev/null
+        $S3_RUN "$WORK/p.s3" >"$WORK/s3run.out" 2>"$WORK/s3run.err" </dev/null
         s3_code=$?
         if cmp -s "$WORK/cl.out" "$WORK/s3run.out" && [ "$cl_code" = "$s3_code" ] && cmp -s "$WORK/cl.err" "$WORK/s3run.err"; then
             pass=$((pass + 1))
