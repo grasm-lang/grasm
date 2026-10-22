@@ -77,8 +77,19 @@ control() {
         [ "$extra" = "-" ] && extra=""
         controls=$((controls + 1))
         local log="$WORK/$name-$(basename "$gate" .sh).log"
+        git ls-files --others --exclude-standard | sort >"$WORK/untracked-before"
         S3="$driver" S3_EXTRA="$extra" "$gate" >"$log" 2>&1
         local code=$?
+        # A mutated backend can make a program write wherever it can reach.
+        # The extra-dec and rc-select faults free a string still in use, and
+        # under them L-LIB-FS wrote files named `c` and `b` into the
+        # repository root, which `litter` then reported. Remove what this
+        # run created, and say so.
+        git ls-files --others --exclude-standard | sort | comm -13 "$WORK/untracked-before" - |
+            while read -r stray; do
+                rm -f -- "$stray"
+                echo "    removed $stray, written by the $name build"
+            done
         if [ "$code" != 0 ] && grep -cF -- "$symptom" "$log" >/dev/null; then
             caught=$((caught + 1))
             echo "caught: $name by $(basename "$gate" .sh) (exit $code; \"$symptom\")"
