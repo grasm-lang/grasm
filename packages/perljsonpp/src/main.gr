@@ -731,8 +731,14 @@ fn number_value(n: str, is_dec: bool, is_exp: bool) -> PerlJsonValue {
     let x = n.parse_float() ?? 0.0
     let integral = x == x and x.abs() != 1.0 / 0.0 and x == x.floor() and x >= 0.0 - two_pow(63) and x < two_pow(64)
     if is_dec {
-        // `$v/1.0`: Perl divides as integers only past 2^53.
-        return if integral and x.abs() > two_pow(53) { JppInt(bigint.parse(perlsprintf_integer(x)) ?? bigint.zero()) } else { JppNum(x) }
+        // `$v/1.0`. Perl divides as integers only when both sides read as
+        // integers, and text with a decimal point and no exponent never
+        // does -- grok_number marks it "not an integer" at the point, so
+        // `99999999999999999.5999` stays a double although it rounds to an
+        // integral 1e17. Through an exponent the text is read as a double
+        // first, and an integral one past 2^53 then counts as an integer:
+        // `1.0e17` is an IV, `99999999999999999.0` an NV.
+        return if is_exp and integral and x.abs() > two_pow(53) { JppInt(bigint.parse(perlsprintf_integer(x)) ?? bigint.zero()) } else { JppNum(x) }
     }
     if is_exp {
         return if integral { JppInt(bigint.parse(perlsprintf_integer(x)) ?? bigint.zero()) } else { JppNum(x) }

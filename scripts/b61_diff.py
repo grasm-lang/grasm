@@ -839,7 +839,16 @@ def perljsonpp_line():
     return pj_encode_line() if rng.random() < 0.45 else pj_decode_line()
 
 
-family("perljsonpp", "perljsonpp", [perljsonpp_line() for _ in range(int(os.environ.get("PERLJSONPP_LINES", "10000")))],
+# Pinned: decimals that round to an integral double past 2^53. Perl reads a
+# decimal point without an exponent as "not an integer" and keeps a double;
+# through an exponent the same value becomes an integer. A random seed found
+# the first shape once in many runs, so the boundary is pinned on both sides.
+PJ_PINNED = ["99999999999999999.5999", "99999999999999999.0", "[99999999999999999.5999]", "-99999999999999999.5",
+             "1.0e17", "99999999999999999.5999e0", "9007199254740994.0e0", "9007199254740992.0e0", "9007199254740994.0",
+             "1.0e16", "1.0e15", "123.0", "123.0e0", "1e17"]
+
+family("perljsonpp", "perljsonpp", [f"dec - {hx(t)}" for t in PJ_PINNED] +
+       [perljsonpp_line() for _ in range(int(os.environ.get("PERLJSONPP_LINES", "10000")))],
        ["perl", os.path.join(LIB, "perljsonpp/oracle.pl")])
 
 
