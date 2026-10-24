@@ -2787,7 +2787,24 @@ arguments nor the type this is bound to",
                 (VType::Val(_), Some((v, _))) => {
                     fcx.emit_val_return(v);
                 }
-                (want, Some((mut v, vt))) => {
+                (want, Some((mut v, mut vt))) => {
+                    // A `() ! E` body that ends in a value: the checker
+                    // discards it, and so must the build. Passed on as the
+                    // `Ok` payload of a unit result it was never released --
+                    // one allocation per call, 100,000 of them for a loop of
+                    // 100,000 -- while the interpreter dropped it.
+                    if let VType::Fallible(ok_t, _) = &want {
+                        if **ok_t == VType::Unit && !matches!(vt, VType::Fallible(..) | VType::Unit) {
+                            if let VType::Val(st) = &vt {
+                                let st = st.clone();
+                                fcx.drop_val(v, &st);
+                            } else if vt.boxed() {
+                                fcx.call_rt("grasm_val_dec", &[v]);
+                            }
+                            v = fcx.b.ins().iconst(types::I64, 0);
+                            vt = VType::Unit;
+                        }
+                    }
                     // A body that already produced a `T ! E` is the result;
                     // wrapping it again would make an `Ok(Ok(..))`. Falls
                     // through to the shared return below.

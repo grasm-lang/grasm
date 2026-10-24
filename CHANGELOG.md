@@ -21,6 +21,12 @@ migration note here; anything `experimental` may change in any release. See
 
 ### Fixed
 
+- **A bare `Ok` or `Err` pattern over a fallible value is refused**, as
+  [G-PAT-BIND] already said for every variant that carries fields. It was
+  accepted as a binding, and `grasm run` and the compiled build then took
+  different arms of the same `match`.
+- **A `() ! E` function whose body ends in a value leaked it in the compiled
+  build**, once per call. It is released now.
 - **Three packages declared type names other packages already used**
   (`JsonReader`, `WrapOptions`, `WrapError`, `Breaker`), so no program
   could import both packages of a pair. The newer packages now prefix

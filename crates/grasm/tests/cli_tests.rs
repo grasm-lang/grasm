@@ -2470,6 +2470,44 @@ fn a_builder_copy_does_not_see_later_appends() {
     );
 }
 
+/// A `() ! E` function whose body ends in a value discards that value, and
+/// the compiled build has to release it. It was passed on as the payload of
+/// the unit `Ok` and never freed: a loop of 1,000 calls left 1,000
+/// allocations live, which `leakcheck` never saw because no corpus program
+/// has the shape.
+#[test]
+fn a_unit_fallible_function_releases_the_value_it_ends_on() {
+    let w = Work::new("unittail");
+    let src = w.0.join("t.gr");
+    let out = w.0.join("t");
+    std::fs::write(
+        &src,
+        "fn step(n: i64) -> () ! str {\n    if n < 0 {\n        fail(\"negative\")\n    }\n    \"a value nobody asked for {n}\"\n}\n\n\
+         fn main() {\n    for i in 0..1000 {\n        step(i) ?? ()\n    }\n    print(\"done\")\n}\n",
+    )
+    .unwrap();
+    let (code, msg) = run(&[
+        "build",
+        src.to_str().unwrap(),
+        "--native",
+        "-o",
+        out.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "{msg}");
+    let got = Command::new(&out)
+        .env("GRASM_LEAK_CHECK", "1")
+        .output()
+        .expect("runs");
+    assert!(got.status.success(), "the binary failed with {:?}", got.status);
+    let all = format!(
+        "{}{}",
+        String::from_utf8_lossy(&got.stdout),
+        String::from_utf8_lossy(&got.stderr)
+    );
+    assert!(all.contains("done"), "{all}");
+    assert!(all.contains("nothing live at exit"), "the discarded tail leaked: {all}");
+}
+
 const RAWLIB_SRC: &str =
     "pub fn peek(a: addr) -> i64 {\n    unsafe {\n        a.load_i64()\n    }\n}\n";
 const RAWAPP_SRC: &str = "import rawlib\n\nfn main() {\n    unsafe {\n        let a = mem_alloc(8, 8)\n        a.store_i64(41)\n        print(\"{rawlib.peek(a) + 1}\")\n        mem_free(a)\n    }\n}\n";

@@ -4666,3 +4666,20 @@ fn tuple_map_keys_are_tuples_of_key_types() {
         "fn g[T](x: T) -> i64 {\n    var m: Map[(T, i64), i64] = {}\n    m.set((x, 1), 1)\n    m.len()\n}\n\nfn f() -> i64 {\n    g(\"ok\") + g((1, true))\n}\n",
     );
 }
+
+/// A bare `Ok` or `Err` over a fallible value is a variant written without
+/// its payload ([G-PAT-BIND]), not a binding. Read as a binding, `Err ->`
+/// matched an `Ok` under the interpreter while the compiled build tested
+/// for an error, so the two engines took different arms.
+#[test]
+fn bare_ok_and_err_over_a_fallible_value_are_refused() {
+    for name in ["Ok", "Err"] {
+        check_err(
+            &format!(
+                "fn f(x: i64) -> i64 ! str {{\n    if x < 0 {{\n        fail(\"neg\")\n    }}\n    return x\n}}\n\n\
+                 fn main() {{\n    let r: i64 ! str = f(5)\n    match r {{\n        {name} -> print(\"a\")\n        _ -> print(\"b\")\n    }}\n}}\n"
+            ),
+            &format!("variant `{name}` has 1 field(s)"),
+        );
+    }
+}

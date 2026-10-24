@@ -5,7 +5,7 @@ Every defect that is known and not fixed, with its severity from
 to paste. S1 and S2 block a release; S3 and S4 do not, and this file is what
 makes shipping them honest rather than quiet.
 
-**Open S1: two (below, found 2026-10-22). Open S2: none. Open S3: none. Open S4: none.**
+**Open S1: none. Open S2: none. Open S3: none. Open S4: none.**
 
 ## Found on 2026-10-22 by the Grasm backend (S3)
 
@@ -13,7 +13,7 @@ Writing a second native backend means deciding every case the first one
 decided, and two of its decisions turned out to be wrong. Both are in the
 Cranelift build; the interpreter and the S3 backend agree with each other.
 
-**A bare `Err` pattern means different things in the two engines -- *open,
+**A bare `Err` pattern meant different things in the two engines -- *closed,
 S1*.** In `match r { Err -> ..., Ok(v) -> ... }` the interpreter (and TIR)
 read `Err` as a binding that matches anything, so an `Ok` takes the first
 arm; the native build reads it as a variant test, so an `Ok` takes the
@@ -36,12 +36,16 @@ fn main() {
 }
 ```
 
-`grasm run` prints the first arm, the native binary the second. Which one
-is right is a language decision (a bare `Err` most likely should be refused,
-or be a variant test everywhere); until it is made, one engine is wrong.
+`grasm run` printed the first arm, the native binary the second.
+[G-PAT-BIND] already decides it: a bare name that is a variant carrying
+fields is refused, because it is a payload left off far more often than a
+binding. The checker applied that to declared sum types only; `Ok` and `Err`
+over a fallible value are refused now too ("variant `Err` has 1 field(s) —
+bind them: `Err(..)`"), pinned by a check test that fails against the old
+checker.
 
-**A `() ! E` function whose body ends in a value leaks that value natively --
-*open, S1*.** The checker accepts a non-unit tail in a function returning
+**A `() ! E` function whose body ends in a value leaked that value natively --
+*closed, S1*.** The checker accepts a non-unit tail in a function returning
 `() ! E` and discards it; the native build never releases it.
 
 ```
@@ -63,7 +67,9 @@ fn main() {
 Built natively and run with `GRASM_LEAK_CHECK=1`: `leak: 100000
 allocation(s) still live at exit`; with the tail replaced by `let _unused =
 n`, `nothing live at exit`. `leakcheck` never saw it because no corpus
-program has this shape.
+program has this shape. The native backend now releases the discarded value
+before returning the unit `Ok`; a CLI test builds this program and requires
+a clean leak check, and fails against the old backend.
 
 
 ## Found on 2026-10-19 by an outside review

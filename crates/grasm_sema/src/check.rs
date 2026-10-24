@@ -10524,6 +10524,22 @@ bind the component to a `var`, or use a struct when the parts have names worth w
                 Some("<str>".into())
             }
             Pattern::Bind(id) => {
+                // `Ok` and `Err` over a fallible value are variants that carry
+                // a payload, so [G-PAT-BIND] refuses them bare exactly as it
+                // refuses `Circle` for `| Circle(r: i64)`. Read as a binding,
+                // a bare `Err` arm matched an `Ok` under the interpreter while
+                // the compiled build tested for an error: the engines took
+                // different arms of the same match.
+                if let Type::Fallible(..) = self.uni.resolve(expected) {
+                    if id.name == "Ok" || id.name == "Err" {
+                        let vname = id.name.clone();
+                        self.error(
+                            id.span,
+                            format!("variant `{vname}` has 1 field(s) — bind them: `{vname}(..)`"),
+                        );
+                        return Some(vname);
+                    }
+                }
                 // A nullary variant of the expected sum type?
                 if let Type::Named { id: def_id, args } = self.uni.resolve(expected) {
                     if let TypeDefKind::Sum { variants } = &self.defs.get(def_id).kind {
