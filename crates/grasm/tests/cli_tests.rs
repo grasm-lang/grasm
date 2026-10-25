@@ -2508,6 +2508,51 @@ fn a_unit_fallible_function_releases_the_value_it_ends_on() {
     assert!(all.contains("nothing live at exit"), "the discarded tail leaked: {all}");
 }
 
+/// `+=` on a string field or element releases the old string once. The
+/// compiled build read the place as a borrowed value, which `+` then
+/// consumed, so the old string was released by the operator and again by the
+/// write: the second `+=` on a heap string was a use after free -- through a
+/// `ref`, a `var` struct, a nested field and a list element alike -- and the
+/// program below crashed with a segfault. The Grasm backend found it.
+#[test]
+fn a_compound_string_assignment_releases_the_old_string_once() {
+    let w = Work::new("strplaceq");
+    let src = w.0.join("t.gr");
+    let out = w.0.join("t");
+    std::fs::write(
+        &src,
+        "type Leaf = | L(n: i64)\n\ntype Cell = { tag: str }\n\ntype Box2 = { c: Cell, xs: [str] }\n\n\
+         fn bump(c: ref Cell) {\n    c.tag += \"+\"\n}\n\n\
+         fn main() {\n    let c = ref(Cell{ tag: \"xyz\" })\n    bump(c)\n    bump(c)\n\
+         \x20   let more = [ref(L(8)), ref(L(9))]\n\
+         \x20   var b = Box2{ c: Cell{ tag: \"a\" }, xs: [\"p\", \"q\"] }\n\
+         \x20   for i in 0..100 {\n        b.c.tag += \"+\"\n        b.xs[0] += \"!\"\n    }\n\
+         \x20   let r = ref(\"s\")\n    r.value += \"t\"\n    r.value += \"u\"\n\
+         \x20   print(\"{c.tag} {more.len()} {b.c.tag.len()} {b.xs[0].len()} {r.value} at {r}\")\n    print(r)\n}\n",
+    )
+    .unwrap();
+    let (code, msg) = run(&[
+        "build",
+        src.to_str().unwrap(),
+        "--native",
+        "-o",
+        out.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "{msg}");
+    let got = Command::new(&out)
+        .env("GRASM_LEAK_CHECK", "1")
+        .output()
+        .expect("runs");
+    assert!(got.status.success(), "the binary failed with {:?}", got.status);
+    let all = format!(
+        "{}{}",
+        String::from_utf8_lossy(&got.stdout),
+        String::from_utf8_lossy(&got.stderr)
+    );
+    assert!(all.contains("xyz++ 2 101 101 stu at ref#3.0\nref#3.0\n"), "{all}");
+    assert!(all.contains("nothing live at exit"), "{all}");
+}
+
 /// A `return` inside a closure passed to `map`, `fold`, `filter`,
 /// `sort_by`, `any` or `find` returns from the closure, in the compiled
 /// build as under `grasm run`. The backend inlines such closures into a

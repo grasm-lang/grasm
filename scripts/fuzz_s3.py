@@ -1075,7 +1075,7 @@ fn rn_sum(t: ref RNode) -> i64 {
 fn r_bump(c: ref RCell, k: i64) {
     c.v += k
     c.items.push(k)
-    c.tag = c.tag + "+"
+    c.tag += "+"
 }
 
 fn r_span(a: i64, n: i64) -> range {
@@ -1096,9 +1096,9 @@ class Part4Gen:
     order, a parallel map, a struct updated with `..`, a builder, and the
     bit operations at a width. Each prints what it computed.
 
-    A string field is appended to through a reference as `c.tag = c.tag +
-    ..`, not `+=`: the Cranelift build, the reference here, crashes on the
-    second `+=` (docs/known-issues.md, 2026-10-25)."""
+    A string field is appended to through a reference with `+=`: the second
+    `+=` on a heap string was a use after free in the Cranelift build, which
+    this generator found (docs/known-issues.md, 2026-10-25)."""
 
     def __init__(self, rng):
         self.rng = rng

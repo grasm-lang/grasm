@@ -13593,6 +13593,17 @@ this case",
                             self.call_rt("grasm_str_build_str", &[at, sv]);
                             self.call_rt("grasm_val_dec", &[sv]);
                         }
+                        // A reference renders as the slot it names, as `print`
+                        // writes it. It is a packed word, not a pointer, so it
+                        // is boxed before the runtime formats it; with no arm
+                        // here `"at {r}"` was an `unreachable!` in the compiler.
+                        VType::Ref(_) => {
+                            let bv = self.box_value(v, &vt);
+                            let sv = self.call_rt("grasm_str_from_val", &[bv]).unwrap();
+                            self.call_rt("grasm_val_dec", &[bv]);
+                            self.call_rt("grasm_str_build_str", &[at, sv]);
+                            self.call_rt("grasm_val_dec", &[sv]);
+                        }
                         _ => unreachable!(),
                     }
                 }
@@ -19184,6 +19195,11 @@ type parameters",
                     VType::Bool => {
                         self.call_rt("grasm_out_bool", &[v]);
                     }
+                    // `print(r)` of a bare reference, as the interpolated
+                    // form above already writes it.
+                    VType::Ref(_) => {
+                        self.call_rt("grasm_out_ref", &[v]);
+                    }
                     ref vt2 if vt2.boxed() => {
                         self.call_rt("grasm_out_val", &[v]);
                         self.call_rt("grasm_val_dec", &[v]);
@@ -21900,6 +21916,7 @@ fields, not the type this is bound to, not an enclosing generic",
     }
 
     /// Reads the (boxed-then-unboxed) value at a place, for compound assigns.
+    /// The value is owned: the operator that combines it consumes it.
     fn read_place(
         &mut self,
         root: Value,
@@ -21944,9 +21961,6 @@ fields, not the type this is bound to, not an enclosing generic",
             {
                 if is_last {
                     let (v, _) = self.unbox(cur, elem_t)?;
-                    if elem_t.boxed() {
-                        self.call_rt("grasm_val_dec", &[cur]);
-                    }
                     return Ok(v);
                 }
                 continue;
@@ -21977,12 +21991,14 @@ fields, not the type this is bound to, not an enclosing generic",
                 self.call_rt("grasm_val_dec", &[prev]);
             }
             if is_last {
+                // The answer is the caller's, with the count the accessor
+                // gave it: a scalar's box is released by `unbox`, and a boxed
+                // value *is* the box. Releasing that box here as well handed
+                // back a borrowed value, which the operator then consumed --
+                // so `c.tag += "+"` released the old string once in `+` and
+                // again when the write replaced it, and the second `+=` on a
+                // heap string was a use after free.
                 let (v, _) = self.unbox(boxed, elem_t)?;
-                if elem_t.boxed() {
-                    // The unboxed value is the caller's; the box it came from
-                    // is this walk's and is finished with.
-                    self.call_rt("grasm_val_dec", &[boxed]);
-                }
                 return Ok(v);
             }
             cur = boxed;

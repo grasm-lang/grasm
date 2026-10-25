@@ -5,12 +5,12 @@ Every defect that is known and not fixed, with its severity from
 to paste. S1 and S2 block a release; S3 and S4 do not, and this file is what
 makes shipping them honest rather than quiet.
 
-**Open S1: one. Open S2: none. Open S3: one. Open S4: none.**
+**Open S1: none. Open S2: none. Open S3: none. Open S4: none.**
 
 ## Found on 2026-10-25 by the Grasm backend (S3, part four)
 
-**`+=` on a string field through a reference, twice, corrupts the heap in the
-native build -- *open, S1*.** Found by `fuzz_s3`'s part-four generator, the
+**`+=` on a string field or element, twice, was a use after free in the
+native build -- *closed, S1*.** Found by `fuzz_s3`'s part-four generator, the
 Cranelift build being its reference; reduced by hand:
 
 ```
@@ -42,11 +42,24 @@ behind a reference (the place path of `eval_stmt`'s `Stmt::Assign`, through
 `read_place` and `write_place` in `crates/grasm_native/src/lib.rs`) that
 leaves the heap inconsistent, and a later allocation that trips on it. No
 corpus program has the shape: `difftest` and the S3 gates agree on all of
-them. Not fixed here (part four changes no Rust); `fuzz_s3` writes the
-append as `c.tag = c.tag + ..` until it is.
+them.
 
-**Interpolating a `ref` into a string is an internal compiler error in the
-native build -- *open, S3*.** `grasm run` writes a reference as the slot it
+Closed on 2026-10-25. The reference was not the cause: under the poisoned
+runtime, `c.tag += "+"` twice on a `var` struct, `b.c.tag` on a nested field
+and `xs[0]` on a list element failed the same way. `read_place` hands the
+compound assignment the place's current value, and for a boxed type it
+released the count the accessor had given it -- `unbox` passes a boxed value
+through, so the box it released *was* the value it returned. `+` then
+consumed that borrowed string and the write released it again as the old
+field, so the second `+=` on a heap string released it twice; the first one
+was over a literal, which no count frees. The value is now handed over with
+its count. `a_compound_string_assignment_releases_the_old_string_once` in
+`crates/grasm/tests/cli_tests.rs` builds the program above (and the other
+shapes) natively and requires the interpreter's output with nothing live at
+exit; with the release put back, its binary dies with SIGSEGV.
+
+**Interpolating a `ref` into a string was an internal compiler error in the
+native build -- *closed, S3*.** `grasm run` writes a reference as the slot it
 names (`ref#0.0`), and so does `print` of one in the native build
 (`grasm_out_ref`), but a reference interpolated into a string that is built
 -- anything other than the direct argument of `print` -- reaches
@@ -69,8 +82,12 @@ The S3 backend writes the piece as a boxed reference displays
 (`grasm_box_ref`, then `grasm_str_from_val`) and prints `at ref#0.0`, as the
 interpreter does; with no Cranelift build to compare against, no gate
 compares that. The fix belongs in `emit_pieces`: a `VType::Ref` arm that
-boxes the word with `grasm_box_ref` and writes it as the boxed arm does. Not
-changed here: part four changes no Rust.
+boxes the word with `grasm_box_ref` and writes it as the boxed arm does.
+
+Closed on 2026-10-25 with that arm. `print(r)` of a bare reference -- the
+argument itself, not an interpolation -- reached the same `unreachable!()`
+in `lower_print` and now writes it with `grasm_out_ref`. The CLI test above
+covers both.
 
 **TIR does not record which system libraries a program links.** A program
 whose package graph declares `links` (the three SDL programs: `sdl-demo`,

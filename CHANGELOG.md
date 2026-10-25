@@ -21,6 +21,14 @@ migration note here; anything `experimental` may change in any release. See
 
 ### Fixed
 
+- **`+=` on a string field or list element was a use after free in the
+  compiled build** from its second application on: the old string was
+  released once by `+` and again by the write. `c.tag += "+"` twice on a
+  struct, through a `ref`, on a nested field or on `xs[i]` crashed or
+  corrupted the heap. The Grasm backend's fuzzer found it. Interpolating a
+  `ref` into a string, and `print(r)` of one, were internal compiler errors
+  in the compiled build; both now write `ref#slot.generation`, as `grasm
+  run` does.
 - **The gates hold every port to the oracle version it follows.** A Homebrew
   upgrade moved `python3` to 3.15, `python3.13` to 3.13.17, pip to 26.2.2,
   SQLite to 3.54.1 and OpenSSL to 4.0.3 in one step, and twenty-five gates
