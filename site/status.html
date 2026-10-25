@@ -74,11 +74,11 @@ where each one stands.</p>
   <div class="fig"><b>648</b><span>cross-compiled, agreeing</span></div>
   <div class="fig"><b>274</b><span>conformance programs</span></div>
   <div class="fig"><b>101</b><span>findings recorded</span></div>
-  <div class="fig"><b>21</b><span>fuzz generators</span></div>
+  <div class="fig"><b>22</b><span>fuzz generators</span></div>
 </div>
 <p>Interpreter, bundle and native builds agree byte for byte on stdout, exit
 code and diagnostics. All 648 are also compiled for x86_64 and run under
-Rosetta, every one of them agreeing, on 21 October 2026. Every generated program
+Rosetta, every one of them agreeing, on 25 October 2026. Every generated program
 is checked for what it keeps as well as for what it prints.</p>
 <h2>Which run wrote which figure</h2>
 <p>The corpus is <b>651</b> standalone programs, counted as this page is
@@ -90,13 +90,13 @@ from the run that proved it; it carries one per figure now, and this is the
 whole record:</p>
 <div class="scroll"><table>
 <tr><th>Gate</th><th>What it compared</th><th>Figure</th><th>Taken</th></tr>
-<tr><td><code>difftest</code></td><td>interpreter, bundle and native identical</td><td>648</td><td>21 October 2026</td></tr>
-<tr><td><code>wasmtest</code></td><td>identical in the browser engine</td><td>508</td><td>21 October 2026</td></tr>
-<tr><td><code>wasmtest</code></td><td>skipped: no filesystem, socket, process or thread</td><td>143</td><td>21 October 2026</td></tr>
-<tr><td><code>crosstest</code></td><td>cross-compiled to x86_64, identical under Rosetta</td><td>648</td><td>21 October 2026</td></tr>
-<tr><td><code>ProjectGold</code></td><td>whole programs agreeing on every engine</td><td>44</td><td>21 October 2026</td></tr>
-<tr><td><code>fuzz_laws</code></td><td>laws that held against arithmetic</td><td>218</td><td>21 October 2026</td></tr>
-<tr><td><code>depth</code></td><td>nested calls the interpreter reaches, against 10,000 promised</td><td>31,093</td><td>21 October 2026</td></tr>
+<tr><td><code>difftest</code></td><td>interpreter, bundle and native identical</td><td>648</td><td>25 October 2026</td></tr>
+<tr><td><code>wasmtest</code></td><td>identical in the browser engine</td><td>508</td><td>25 October 2026</td></tr>
+<tr><td><code>wasmtest</code></td><td>skipped: no filesystem, socket, process or thread</td><td>143</td><td>25 October 2026</td></tr>
+<tr><td><code>crosstest</code></td><td>cross-compiled to x86_64, identical under Rosetta</td><td>648</td><td>25 October 2026</td></tr>
+<tr><td><code>ProjectGold</code></td><td>whole programs agreeing on every engine</td><td>44</td><td>25 October 2026</td></tr>
+<tr><td><code>fuzz_laws</code></td><td>laws that held against arithmetic</td><td>218</td><td>25 October 2026</td></tr>
+<tr><td><code>depth</code></td><td>nested calls the interpreter reaches, against 10,000 promised</td><td>31,093</td><td>25 October 2026</td></tr>
 </table></div>
 <p class="note"><b>Every figure in this table was taken today</b>, which has
 not been true before and is the only reason the paragraphs that used to sit

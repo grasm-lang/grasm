@@ -82,18 +82,18 @@ is met on all four engines, and the ≥99% figure is unmeasurable because nobody
 has run a Grasm program in production.</p>
 
 <h2>The gates, and what each one would catch</h2>
-<p>Judged by exit code alone, 186 of them. These are the figures from the
+<p>Judged by exit code alone, 193 of them. These are the figures from the
 last recorded run on this machine:</p>
 <div class="scroll"><table>
 <tr><th>Gate</th><th>Scope</th><th>Result</th></tr>
 <tr><td>difftest / corpus</td><td>511 programs</td><td><b>0 differences</b> across the engines</td></tr>
 <tr><td><code>leakcheck</code></td><td>226 programs</td><td><b>1 leaking</b> — <code>spec/conformance/E-VALUE-SEMANTICS.gr</code> holds 16 allocations at exit, so this gate is <b>red</b>. The ratchet is at zero, which is why one leak fails it. See <code>docs/known-issues.md</code>.</td></tr>
 <tr><td><code>usecheck</code>, the <code>poison</code> build</td><td>197 programs</td><td><b>0 differences</b></td></tr>
-<tr><td><code>crosstest</code> x86_64 under Rosetta</td><td>224 programs</td><td><b>195 pass</b>, 0 real failures, 60 declined — <em>retaken on a quiet machine on 21 October 2026: all 648, nothing declined</em></td></tr>
+<tr><td><code>crosstest</code> x86_64 under Rosetta</td><td>224 programs</td><td><b>195 pass</b>, 0 real failures, 60 declined — <em>retaken on a quiet machine on 25 October 2026: all 648, nothing declined</em></td></tr>
 <tr><td><code>clippy --all-targets</code></td><td>native and wasm32</td><td>0</td></tr>
 <tr><td>unit tests</td><td>every crate</td><td><b>609 pass</b></td></tr>
 <tr><td><code>replaytest</code></td><td>every journalled builtin</td><td>each one refuses under an empty journal</td></tr>
-<tr><td>fuzzers</td><td>21 generators</td><td>clean</td></tr>
+<tr><td>fuzzers</td><td>22 generators</td><td>clean</td></tr>
 <tr><td>conformance</td><td>274 programs</td><td>one per normative clause</td></tr>
 </table></div>
 <p><code>leakcheck</code> and <code>usecheck</code> are the two no other check
