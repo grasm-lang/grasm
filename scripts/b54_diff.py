@@ -82,8 +82,18 @@ def go_tool(name, src):
     return out
 
 
+# The SQLite these families reproduce is 3.51.1, reached through Python's
+# sqlite3 module, which loads whatever libsqlite3 Homebrew links today.
+# GRASM_SQLITE_ORACLE names the 3.51.1 library directory (allgates.sh sets it);
+# DYLD_LIBRARY_PATH is set here, on the oracle process, because macOS strips it
+# from anything started through /usr/bin/env.
+ORACLE_ENV = dict(os.environ)
+if os.path.isdir(os.environ.get("GRASM_SQLITE_ORACLE", "")):
+    ORACLE_ENV["DYLD_LIBRARY_PATH"] = os.environ["GRASM_SQLITE_ORACLE"]
+
+
 def family(name, op, lines, oracle_argv, chunk=500):
-    want = subprocess.run(oracle_argv, input="\n".join(lines) + "\n", capture_output=True, text=True).stdout.splitlines()
+    want = subprocess.run(oracle_argv, input="\n".join(lines) + "\n", capture_output=True, text=True, env=ORACLE_ENV).stdout.splitlines()
     if len(want) != len(lines):
         print(f"{name}: the oracle answered {len(want)} of {len(lines)}"); sys.exit(1)
     for k in range(0, len(lines), chunk):

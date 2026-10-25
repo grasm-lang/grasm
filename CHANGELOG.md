@@ -21,6 +21,15 @@ migration note here; anything `experimental` may change in any release. See
 
 ### Fixed
 
+- **The gates hold every port to the oracle version it follows.** A Homebrew
+  upgrade moved `python3` to 3.15, `python3.13` to 3.13.17, pip to 26.2.2,
+  SQLite to 3.54.1 and OpenSSL to 4.0.3 in one step, and twenty-five gates
+  failed on code that had not changed. `scripts/allgates.sh` now pins
+  `python3` to 3.14, `python3.13` to 3.13.1, pip to the 24.3.1 wheel CPython
+  3.13.1 bundles, and SQLite to 3.51.1 (passed to the b54 oracle by name,
+  since macOS strips `DYLD_*` from scripts started through `/usr/bin/env`),
+  each overridable, and prints the versions it ran against. The curve table's
+  staleness check no longer counts the OpenSSL version in its header.
 - **A `return` inside a closure passed to `map`, `filter`, `fold`,
   `sort_by` or a search returned from the calling function in the compiled
   build**, because the closure was inlined into the caller's loop: wrong

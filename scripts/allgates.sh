@@ -46,6 +46,34 @@ matches() {
 
 LOGS=${LOGS:-$(mktemp -d)}
 mkdir -p "$LOGS"
+# The oracles are pinned for the run. Several gates hold ports to CPython's
+# standard library, to pip, and to SQLite through Python's sqlite3 module, and
+# the ports document the versions they follow: CPython 3.13.1, pip 24.3.1,
+# SQLite 3.51.1. On 2026-10-25 a Homebrew upgrade moved all of them at once --
+# `python3` to 3.15 (no Pillow), `python3.13` to 3.13.17, pip to 26.2.2,
+# SQLite to 3.54.1 -- and twenty-five gates failed on code that had not
+# changed. Each pin can be overridden; when the pinned version is not
+# installed the gate runs against whatever is, and the line below says so.
+PYSHIM=$(mktemp -d)
+PY3=${GRASM_PYTHON3:-python3.14}
+command -v "$PY3" >/dev/null 2>&1 && ln -s "$(command -v "$PY3")" "$PYSHIM/python3"
+PY313=${GRASM_PYTHON313:-/opt/homebrew/Cellar/python@3.13/3.13.1/bin/python3.13}
+[ -x "$PY313" ] && ln -s "$PY313" "$PYSHIM/python3.13"
+export PATH="$PYSHIM:$PATH"
+# pip 24.3.1 is the wheel CPython 3.13.1 bundles for ensurepip.
+PIPWHL=${GRASM_PIP_ORACLE:-$(dirname "$(dirname "$PY313")")/Frameworks/Python.framework/Versions/3.13/lib/python3.13/ensurepip/_bundled/pip-24.3.1-py3-none-any.whl}
+[ -f "$PIPWHL" ] && export PYTHONPATH="$PIPWHL${PYTHONPATH:+:$PYTHONPATH}"
+# The SQLite library goes by name rather than as DYLD_LIBRARY_PATH: macOS
+# strips DYLD_* from the environment of every protected binary it starts, and
+# the gate scripts start through /usr/bin/env, so the variable never reached
+# the oracle. b54_diff.py sets it on the oracle process itself.
+SQLITELIB=${GRASM_SQLITE_ORACLE:-/opt/homebrew/Cellar/sqlite/3.51.1/lib}
+[ -d "$SQLITELIB" ] && export GRASM_SQLITE_ORACLE="$SQLITELIB"
+echo "oracles: python3 $(python3 -c 'import sys; print(sys.version.split()[0])' 2>/dev/null)," \
+    "python3.13 $(python3.13 -c 'import sys; print(sys.version.split()[0])' 2>/dev/null)," \
+    "pip $(python3.13 -c 'import pip; print(pip.__version__)' 2>/dev/null)," \
+    "sqlite $(DYLD_LIBRARY_PATH=${GRASM_SQLITE_ORACLE:-} python3.13 -c 'import sqlite3; print(sqlite3.sqlite_version)' 2>/dev/null)," \
+    "$(openssl version 2>/dev/null)"
 # What git did not track before the run, so the `litter` gate can tell what
 # the run itself left behind.
 git ls-files --others --exclude-standard | sort > "$LOGS/untracked-before.txt"
