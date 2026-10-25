@@ -2508,6 +2508,29 @@ fn a_unit_fallible_function_releases_the_value_it_ends_on() {
     assert!(all.contains("nothing live at exit"), "the discarded tail leaked: {all}");
 }
 
+/// A `return` inside a closure passed to `map`, `fold`, `filter`,
+/// `sort_by`, `any` or `find` returns from the closure, in the compiled
+/// build as under `grasm run`. The backend inlines such closures into a
+/// loop in the calling function, and a `return` there left the caller:
+/// `map` printed `big` for a `[str]`, `fold` answered wrongly, `sort_by`
+/// crashed and `filter` failed the verifier.
+#[test]
+fn a_return_in_an_inlined_closure_returns_from_the_closure() {
+    let w = Work::new("retclosure");
+    let src = w.0.join("r.gr");
+    let out = w.0.join("r");
+    std::fs::write(&src, "fn early(xs: [i64]) -> [str] {\n    xs.map(|x| {\n        if x > 2 {\n            return \"big\"\n        }\n        \"small {x}\"\n    })\n}\n\nfn total(xs: [i64]) -> i64 {\n    xs.fold(0, |acc, x| {\n        if x > 2 {\n            return acc + 100\n        }\n        acc + x\n    })\n}\n\nfn keep(xs: [i64]) -> [i64] {\n    xs.filter(|x| {\n        if x == 3 {\n            return false\n        }\n        true\n    })\n}\n\nfn order(xs: [i64]) -> [i64] {\n    var ys = xs\n    ys.sort_by(|a| {\n        if a == 1 {\n            return 100\n        }\n        0 - a\n    })\n    ys\n}\n\nfn anybig(xs: [i64]) -> bool {\n    xs.any(|x| {\n        if x > 3 {\n            return true\n        }\n        false\n    })\n}\n\nfn first(xs: [i64]) -> Option[i64] {\n    xs.find(|x| {\n        if x > 1 {\n            return true\n        }\n        false\n    })\n}\n\nfn main() {\n    print(early([1, 2, 3, 4]))\n    print(total([1, 2, 3, 4]))\n    print(keep([1, 2, 3, 4]))\n    print(order([3, 1, 4, 1, 5]))\n    print(anybig([1, 2, 3, 4]))\n    print(first([1, 2, 3]) ?? -1)\n}\n").unwrap();
+    let want = "[small 1, small 2, big, big]\n203\n[1, 2, 4]\n[5, 4, 3, 1, 1]\ntrue\n2";
+    let (code, msg) = run(&["run", src.to_str().unwrap()]);
+    assert_eq!(code, 0, "{msg}");
+    assert_eq!(msg.trim(), want, "grasm run");
+    let (code, msg) = run(&["build", src.to_str().unwrap(), "--native", "-o", out.to_str().unwrap()]);
+    assert_eq!(code, 0, "{msg}");
+    let got = Command::new(&out).output().expect("runs");
+    assert!(got.status.success(), "the binary failed with {:?}", got.status);
+    assert_eq!(String::from_utf8_lossy(&got.stdout).trim(), want, "--native");
+}
+
 const RAWLIB_SRC: &str =
     "pub fn peek(a: addr) -> i64 {\n    unsafe {\n        a.load_i64()\n    }\n}\n";
 const RAWAPP_SRC: &str = "import rawlib\n\nfn main() {\n    unsafe {\n        let a = mem_alloc(8, 8)\n        a.store_i64(41)\n        print(\"{rawlib.peek(a) + 1}\")\n        mem_free(a)\n    }\n}\n";

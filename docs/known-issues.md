@@ -5,12 +5,12 @@ Every defect that is known and not fixed, with its severity from
 to paste. S1 and S2 block a release; S3 and S4 do not, and this file is what
 makes shipping them honest rather than quiet.
 
-**Open S1: one (below). Open S2: none. Open S3: none. Open S4: none.**
+**Open S1: none. Open S2: none. Open S3: none. Open S4: none.**
 
 ## Found on 2026-10-22 by the Grasm backend (S3, part three)
 
 **`return` inside a closure passed to `map` returns from the enclosing
-function in the native build -- *open, S1*.** The Cranelift build compiles
+function in the native build -- *closed, S1*.** The Cranelift build compiles
 `xs.map(|x| ..)`, `filter`, `fold`, `sort_by` and the searches by inlining
 the closure's body into a loop in the calling function, and a `return` in
 that body then leaves the *calling* function, with the closure's value as
@@ -42,10 +42,15 @@ shape. Twelve closures in three corpus programs (`numeric3-demo`,
 `tui-demo`, `web-demo`) contain a `return`, but each is bound to a name or
 returned rather than passed to one of those methods, so the Cranelift build
 compiles it as a function of its own; all three programs are in the S3
-subset and agree. Not fixed here: the S3 work changes no Rust.
+subset and agree. Fixed: a closure literal whose body has a `return` of
+its own is now bound to a local before the call, so the backend compiles it
+as a function of its own and calls through it, as it already did for a
+closure bound to a name. A CLI test runs all six shapes (`map`, `fold`,
+`filter`, `sort_by`, `any`, `find`) in both engines; against the old backend
+it fails, because `filter` does not build.
 
 **An operator is written with the wrong operand type when an integer literal
-on its left meets an `f64` -- TIR, no effect on any engine.** [E-NUM-PROMOTE]
+on its left meets an `f64` -- TIR, no effect on any engine -- *closed*.** [E-NUM-PROMOTE]
 makes the literal a double, and TIR writes it as a `float` node, but the
 `binary` node keeps the literal's type as its operand type: `3 + f` is
 `(binary f64 add i64 (float ..) (local f64 ..))`, and `5 == 5.0` is `eq
@@ -53,7 +58,9 @@ i64`. docs/tir.md §6.5 says the operator is written "with the operand type
 that decides its meaning". Five nodes in two corpus programs
 (`E-NUM-PROMOTE`, `L-LIB-TO-STR`). The TIR interpreter decides by the values
 it holds and is unaffected; the S3 backend decides by the operands' own types
-when both are `f64` (`lower_binary`).
+when both are `f64` (`lower_binary`). Fixed: the emitter writes `f64` as
+the operand type when the left operand is a promoted literal, negated or
+not.
 
 ## Found on 2026-10-22 by the Grasm backend (S3)
 

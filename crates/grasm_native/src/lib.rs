@@ -4822,125 +4822,134 @@ fn straight_idents(e: &Expr, out: &mut Vec<String>) {
 
 fn elem_can_leave(e: &Expr) -> bool {
     let mut found = false;
-    scan_leave_expr(e, &mut found);
+    scan_leave_expr(e, &mut found, false);
     found
 }
 
-fn scan_leave_block(b: &grasm_syntax::ast::Block, found: &mut bool) {
+/// Whether a closure's body holds a `return` of its own -- one not inside a
+/// closure nested in it.
+fn closure_returns(body: &Expr) -> bool {
+    let mut found = false;
+    scan_leave_expr(body, &mut found, true);
+    found
+}
+
+fn scan_leave_block(b: &grasm_syntax::ast::Block, found: &mut bool, ret_only: bool) {
     for st in &b.stmts {
         if *found {
             return;
         }
         match st {
-            Stmt::Return(..) | Stmt::Break(_) | Stmt::Continue(_) => *found = true,
-            Stmt::Let { init, .. } | Stmt::LetTuple { init, .. } => scan_leave_expr(init, found),
+            Stmt::Return(..) => *found = true,
+            Stmt::Break(_) | Stmt::Continue(_) => *found = *found || !ret_only,
+            Stmt::Let { init, .. } | Stmt::LetTuple { init, .. } => scan_leave_expr(init, found, ret_only),
             Stmt::Assign { target, value, .. } => {
-                scan_leave_expr(target, found);
-                scan_leave_expr(value, found);
+                scan_leave_expr(target, found, ret_only);
+                scan_leave_expr(value, found, ret_only);
             }
-            Stmt::Expr(e) => scan_leave_expr(e, found),
+            Stmt::Expr(e) => scan_leave_expr(e, found, ret_only),
             Stmt::While { cond, body, .. } => {
-                scan_leave_expr(cond, found);
-                scan_leave_block(body, found);
+                scan_leave_expr(cond, found, ret_only);
+                scan_leave_block(body, found, ret_only);
             }
             Stmt::For { iter, body, .. } => {
-                scan_leave_expr(iter, found);
-                scan_leave_block(body, found);
+                scan_leave_expr(iter, found, ret_only);
+                scan_leave_block(body, found, ret_only);
             }
-            Stmt::Parallel { body, .. } | Stmt::Spawn { body, .. } => scan_leave_block(body, found),
+            Stmt::Parallel { body, .. } | Stmt::Spawn { body, .. } => scan_leave_block(body, found, ret_only),
             Stmt::With { handler, body, .. } => {
-                scan_leave_expr(handler, found);
-                scan_leave_block(body, found);
+                scan_leave_expr(handler, found, ret_only);
+                scan_leave_block(body, found, ret_only);
             }
         }
     }
 }
 
-fn scan_leave_expr(e: &Expr, found: &mut bool) {
+fn scan_leave_expr(e: &Expr, found: &mut bool, ret_only: bool) {
     if *found {
         return;
     }
     match e {
-        Expr::Try { .. } => *found = true,
+        Expr::Try { .. } => *found = *found || !ret_only,
         Expr::Call { callee, args, .. } => {
-            if matches!(&**callee, Expr::Ident(id) if id.name == "fail") {
+            if !ret_only && matches!(&**callee, Expr::Ident(id) if id.name == "fail") {
                 *found = true;
                 return;
             }
-            scan_leave_expr(callee, found);
+            scan_leave_expr(callee, found, ret_only);
             for a in args {
-                scan_leave_expr(a, found);
+                scan_leave_expr(a, found, ret_only);
             }
         }
         Expr::MethodCall { recv, args, .. } => {
-            scan_leave_expr(recv, found);
+            scan_leave_expr(recv, found, ret_only);
             for a in args {
-                scan_leave_expr(a, found);
+                scan_leave_expr(a, found, ret_only);
             }
         }
-        Expr::Block(b) | Expr::Unsafe(b) | Expr::Region(b) => scan_leave_block(b, found),
+        Expr::Block(b) | Expr::Unsafe(b) | Expr::Region(b) => scan_leave_block(b, found, ret_only),
         Expr::If {
             cond,
             then_block,
             else_branch,
             ..
         } => {
-            scan_leave_expr(cond, found);
-            scan_leave_block(then_block, found);
+            scan_leave_expr(cond, found, ret_only);
+            scan_leave_block(then_block, found, ret_only);
             match else_branch.as_deref() {
                 None => {}
-                Some(grasm_syntax::ast::ElseBranch::Else(b)) => scan_leave_block(b, found),
-                Some(grasm_syntax::ast::ElseBranch::ElseIf(x)) => scan_leave_expr(x, found),
+                Some(grasm_syntax::ast::ElseBranch::Else(b)) => scan_leave_block(b, found, ret_only),
+                Some(grasm_syntax::ast::ElseBranch::ElseIf(x)) => scan_leave_expr(x, found, ret_only),
             }
         }
         Expr::Match {
             scrutinee, arms, ..
         } => {
-            scan_leave_expr(scrutinee, found);
+            scan_leave_expr(scrutinee, found, ret_only);
             for a in arms {
                 if let Some(g) = &a.guard {
-                    scan_leave_expr(g, found);
+                    scan_leave_expr(g, found, ret_only);
                 }
-                scan_leave_expr(&a.body, found);
+                scan_leave_expr(&a.body, found, ret_only);
             }
         }
         Expr::List(items, _) | Expr::Tuple(items, _) => {
             for i in items {
-                scan_leave_expr(i, found);
+                scan_leave_expr(i, found, ret_only);
             }
         }
         Expr::Map(pairs, _) => {
             for (k, v) in pairs {
-                scan_leave_expr(k, found);
-                scan_leave_expr(v, found);
+                scan_leave_expr(k, found, ret_only);
+                scan_leave_expr(v, found, ret_only);
             }
         }
         Expr::StructLit { fields, base, .. } => {
             if let Some(b) = base {
-                scan_leave_expr(b, found);
+                scan_leave_expr(b, found, ret_only);
             }
             for (_, v) in fields {
-                scan_leave_expr(v, found);
+                scan_leave_expr(v, found, ret_only);
             }
         }
         Expr::Index { recv, index, .. } => {
-            scan_leave_expr(recv, found);
-            scan_leave_expr(index, found);
+            scan_leave_expr(recv, found, ret_only);
+            scan_leave_expr(index, found, ret_only);
         }
-        Expr::Field { recv, .. } => scan_leave_expr(recv, found),
-        Expr::Unary { expr, .. } => scan_leave_expr(expr, found),
+        Expr::Field { recv, .. } => scan_leave_expr(recv, found, ret_only),
+        Expr::Unary { expr, .. } => scan_leave_expr(expr, found, ret_only),
         Expr::Binary { lhs, rhs, .. } => {
-            scan_leave_expr(lhs, found);
-            scan_leave_expr(rhs, found);
+            scan_leave_expr(lhs, found, ret_only);
+            scan_leave_expr(rhs, found, ret_only);
         }
         Expr::Range { start, end, .. } => {
-            scan_leave_expr(start, found);
-            scan_leave_expr(end, found);
+            scan_leave_expr(start, found, ret_only);
+            scan_leave_expr(end, found, ret_only);
         }
         Expr::Str(pieces, _) => {
             for p in pieces {
                 if let grasm_syntax::ast::StrPiece::Expr(x) = p {
-                    scan_leave_expr(x, found);
+                    scan_leave_expr(x, found, ret_only);
                 }
             }
         }
@@ -13094,10 +13103,73 @@ this case",
                 name,
                 args,
                 span,
-            } => match self.cg.mem_ops.get(&(span.start, span.end)) {
-                Some(op) => self.eval_mem(*op, Some(recv), args, *span),
-                None => self.eval_method(recv, name, args, *span),
-            },
+            } => {
+                // A closure literal passed to `map`, `filter`, `fold`,
+                // `sort_by` and the searches is inlined into a loop in the
+                // calling function, so a `return` in its body left the
+                // *caller* -- with the closure's value as the caller's
+                // result. `map` and `fold` answered wrongly, `sort_by` died
+                // with SIGSEGV and `filter` failed the verifier. Bound to a
+                // local first it is compiled as a function of its own and
+                // called through, which is what the interpreter does. The
+                // receiver is bound before it when it is not a place, so
+                // the two are still evaluated in the order written.
+                if args
+                    .iter()
+                    .any(|a| matches!(a, Expr::Closure { body, .. } if closure_returns(body)))
+                {
+                    let mut stmts = Vec::new();
+                    let place = matches!(&**recv, Expr::Ident(_) | Expr::Field { .. } | Expr::Index { .. });
+                    let recv_expr = if place {
+                        (**recv).clone()
+                    } else {
+                        let id = Ident {
+                            name: format!(" receiver {}", span.start),
+                            span: recv.span(),
+                        };
+                        stmts.push(Stmt::Let {
+                            mutable: false,
+                            name: id.clone(),
+                            ty: None,
+                            init: (**recv).clone(),
+                            span: recv.span(),
+                        });
+                        Expr::Ident(id)
+                    };
+                    let mut new_args = Vec::new();
+                    for (k, a) in args.iter().enumerate() {
+                        if let Expr::Closure { body, span: cs, .. } = a {
+                            if closure_returns(body) {
+                                let id = Ident {
+                                    name: format!(" returning closure {} {k}", cs.start),
+                                    span: *cs,
+                                };
+                                stmts.push(Stmt::Let {
+                                    mutable: false,
+                                    name: id.clone(),
+                                    ty: None,
+                                    init: a.clone(),
+                                    span: *cs,
+                                });
+                                new_args.push(Expr::Ident(id));
+                                continue;
+                            }
+                        }
+                        new_args.push(a.clone());
+                    }
+                    stmts.push(Stmt::Expr(Expr::MethodCall {
+                        recv: Box::new(recv_expr),
+                        name: name.clone(),
+                        args: new_args,
+                        span: *span,
+                    }));
+                    return self.eval_expr(&Expr::Block(grasm_syntax::ast::Block { stmts, span: *span }));
+                }
+                match self.cg.mem_ops.get(&(span.start, span.end)) {
+                    Some(op) => self.eval_mem(*op, Some(recv), args, *span),
+                    None => self.eval_method(recv, name, args, *span),
+                }
+            }
             Expr::Unary { op, expr, span } => {
                 let (v, vt) = self.eval_expr_val(expr)?;
                 match (op, &vt) {

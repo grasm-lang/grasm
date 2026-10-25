@@ -21,6 +21,13 @@ migration note here; anything `experimental` may change in any release. See
 
 ### Fixed
 
+- **A `return` inside a closure passed to `map`, `filter`, `fold`,
+  `sort_by` or a search returned from the calling function in the compiled
+  build**, because the closure was inlined into the caller's loop: wrong
+  answers, a crash in `sort_by`, a refused build for `filter`. Such a
+  closure is now compiled as a function of its own.
+- **TIR wrote `3 + f` as an `i64` operation** when an integer literal on the
+  left was promoted to a double; it writes `f64` now.
 - **A bare `Ok` or `Err` pattern over a fallible value is refused**, as
   [G-PAT-BIND] already said for every variant that carries fields. It was
   accepted as a binding, and `grasm run` and the compiled build then took

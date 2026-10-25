@@ -748,6 +748,19 @@ impl<'a> Emitter<'a> {
         format!("{kw} {t} {}", span_atom(span))
     }
 
+    /// An integer literal the checker made a double, negated or not.
+    fn is_promoted_literal(&self, e: &Expr) -> bool {
+        match e {
+            Expr::Int(_, sp) => self.an.float_literals.contains(&sp.start),
+            Expr::Unary {
+                op: UnaryOp::Neg,
+                expr,
+                ..
+            } => self.is_promoted_literal(expr),
+            _ => false,
+        }
+    }
+
     fn expr_inner(&mut self, e: &Expr) -> Node {
         let sp = e.span();
         match e {
@@ -864,7 +877,15 @@ impl<'a> Emitter<'a> {
             }
             Expr::Binary { op, lhs, rhs, span } => {
                 let h = self.head("binary", *span);
-                let ot = self.expr_ty(lhs.span());
+                // An integer literal promoted to a double by [E-NUM-PROMOTE]
+                // is written as a `float` node, but its recorded type is
+                // still the literal's: `3 + f` came out as `add i64` over two
+                // doubles. The operator's meaning is the double one.
+                let ot = if self.is_promoted_literal(lhs) {
+                    "f64".to_string()
+                } else {
+                    self.expr_ty(lhs.span())
+                };
                 let op = match op {
                     BinaryOp::Add => "add",
                     BinaryOp::Sub => "sub",
