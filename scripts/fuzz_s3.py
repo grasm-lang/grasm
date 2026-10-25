@@ -33,6 +33,10 @@ do, from the whole subset (`scripts/s3_subset.py`) and nothing outside it:
     closures stored and called, named functions as values, closures made by
     functions, the higher-order list methods, `sort_by`, closures answering
     `Ok`/`Err`, a closure making another;
+  * part four's constructs (`Part4Gen`): references written and read through,
+    a structure of them matched, released and asked after; ranges held as
+    values; an effect handled, nested; `parallel` tasks; the parallel maps; a
+    struct updated with `..`; a builder; the bit operations at a width;
   * now and then a deliberate panic, a failed `assert` or an `exit`.
 
 Each program must be in the subset by the rule, compile with the backend (a
@@ -476,12 +480,18 @@ class Gen:
         nclo = r.randint(1, 2)
         for k in range(nclo):
             lines += cg.function(f"clo{k}")
+        # And part four's references, ranges, effects and tasks.
+        pg = Part4Gen(random.Random(r.random()))
+        lines += PART4_DECLS.split("\n")
+        npart4 = r.randint(1, 2)
+        for k in range(npart4):
+            lines += pg.function(f"p4_{k}")
         self.depth = 0
         body, _ = self.block([], r.randint(6, 14), budget=2)
         # Between two of main's own statements: before a line that starts
         # one, or at the end.
         calls = ([f"heap{k}" for k in range(nheap)] + [f"flt{k}" for k in range(nflt)]
-                 + [f"clo{k}" for k in range(nclo)])
+                 + [f"clo{k}" for k in range(nclo)] + [f"p4_{k}" for k in range(npart4)])
         for name in calls:
             spots = [i for i, line in enumerate(body)
                      if line.startswith("    ") and line[4:5] not in (" ", "}")] + [len(body)]
@@ -1045,6 +1055,154 @@ class ClosureGen:
                     f"print({sq}.map(|op| op.f({self.small()})))"]
         return [f"print((0..{r.randint(0, 5)}).map(|i| i * {c}))",
                 f"print((1..={r.randint(1, 6)}).filter(|i| i % 2 == 1))"]
+
+
+PART4_DECLS = """type RNode = | RLeaf(n: i64) | RPair(l: ref RNode, r: ref RNode)
+
+type RCell = { v: i64, items: [i64], tag: str }
+
+effect REmit {
+    fn emit(n: i64) -> i64
+}
+
+fn rn_sum(t: ref RNode) -> i64 {
+    match t {
+        RLeaf(n) -> n
+        RPair(l, r) -> rn_sum(l) * 2 + rn_sum(r)
+    }
+}
+
+fn r_bump(c: ref RCell, k: i64) {
+    c.v += k
+    c.items.push(k)
+    c.tag = c.tag + "+"
+}
+
+fn r_span(a: i64, n: i64) -> range {
+    a..(a + n)
+}
+
+fn r_emit_twice(x: i64) -> i64 / {REmit} {
+    REmit.emit(x) + REmit.emit(x + 1)
+}
+"""
+
+
+class Part4Gen:
+    """Part four's constructs: references -- cells written through `.value`
+    and through fields and elements, a structure of them matched, a list of
+    them, released and asked after -- ranges held as values and walked, an
+    effect handled (nested, the innermost answering), `parallel` tasks in
+    order, a parallel map, a struct updated with `..`, a builder, and the
+    bit operations at a width. Each prints what it computed.
+
+    A string field is appended to through a reference as `c.tag = c.tag +
+    ..`, not `+=`: the Cranelift build, the reference here, crashes on the
+    second `+=` (docs/known-issues.md, 2026-10-25)."""
+
+    def __init__(self, rng):
+        self.rng = rng
+        self.n = 0
+
+    def fresh(self, base):
+        self.n += 1
+        return f"{base}{self.n}"
+
+    def small(self):
+        return str(self.rng.randint(-4, 9))
+
+    def function(self, name):
+        lines = [f"fn {name}() {{"]
+        for _ in range(self.rng.randint(4, 9)):
+            lines += ["    " + x for x in self.stmt()]
+        lines += ["}", ""]
+        return lines
+
+    def stmt(self):
+        r = self.rng
+        k = r.random()
+        if k < 0.12:
+            c = self.fresh("cell")
+            return [f"let {c} = ref({self.small()})",
+                    f"{c}.value += {self.small()}",
+                    f"{c}.value = {c}.value * {self.small()}",
+                    f"print(\"{{{c}.value}} {{alive({c})}}\")"]
+        if k < 0.24:
+            c = self.fresh("rc")
+            return [f"let {c} = ref(RCell{{ v: {self.small()}, items: [], tag: {json.dumps(r.choice(WORDS))} }})",
+                    f"r_bump({c}, {self.small()})",
+                    f"r_bump({c}, {self.small()})",
+                    f"{c}.items[{r.randint(0, 1)}] = {self.small()}",
+                    f"{c}.items.push({c}.v)",
+                    f"print(\"{{{c}.v}} {{{c}.items}} {{{c}.tag}}\")"]
+        if k < 0.34:
+            t = self.fresh("tree")
+            a, b, c = self.small(), self.small(), self.small()
+            return [f"let {t} = ref(RPair(ref(RLeaf({a})), ref(RPair(ref(RLeaf({b})), ref(RLeaf({c}))))))",
+                    f"print(rn_sum({t}))"]
+        if k < 0.44:
+            rs = self.fresh("rs")
+            tot = self.fresh("tot")
+            return [f"let {rs} = [ref({self.small()}), ref({self.small()}), ref({self.small()})]",
+                    f"{rs}[{r.randint(0, 2)}].value = {self.small()}",
+                    f"var {tot} = 0",
+                    f"for x in {rs} {{",
+                    f"    {tot} += x.value",
+                    "}",
+                    f"release({rs}[2])",
+                    f"print(\"{{{tot}}} {{{rs}[0] == {rs}[0]}} {{{rs}[0] == {rs}[1]}} {{alive({rs}[2])}}\")"]
+        if k < 0.56:
+            g = self.fresh("rg")
+            a, n = self.small(), r.randint(0, 5)
+            incl = r.choice(["..", "..="])
+            return [f"let {g} = r_span({a}, {n})",
+                    f"let {g}b = {a}{incl}{r.randint(-2, 8)}",
+                    f"print(\"{{{g}}} {{{g}.len()}} {{{g}.sum()}} {{{g}.to_list()}} {{{g}b}} {{{g}b.len()}} {{{g} == {g}b}}\")",
+                    f"print({g}.map(|i| i * {self.small()}))",
+                    f"for i in {g}b {{",
+                    "    print(i)",
+                    "}"]
+        if k < 0.66:
+            m = self.small()
+            return [f"with REmit handled_by REmitHandler{{ emit: |n| n * {m} }} {{",
+                    f"    print(r_emit_twice({self.small()}))",
+                    f"    with REmit handled_by REmitHandler{{ emit: |n| n + {self.small()} }} {{",
+                    f"        print(REmit.emit({self.small()}))",
+                    "    }",
+                    f"    print(REmit.emit({self.small()}))",
+                    "}"]
+        if k < 0.74:
+            lg = self.fresh("log")
+            return [f"var {lg} = \"\"",
+                    "parallel {",
+                    "    spawn {",
+                    f"        {lg} += \"a\"",
+                    "    }",
+                    "    spawn {",
+                    f"        {lg} += \"{r.choice(WORDS)}\"",
+                    "    }",
+                    "}",
+                    f"print({lg})"]
+        if k < 0.82:
+            xs = ", ".join(self.small() for _ in range(r.randint(0, 7)))
+            return [f"print([{xs}].par_map(|x| x * {self.small()} + 1))",
+                    f"print([{xs}].par_filter(|x| x % 2 == 0))"]
+        if k < 0.88:
+            c = self.fresh("up")
+            return [f"let {c} = RCell{{ v: {self.small()}, items: [{self.small()}], tag: \"t\" }}",
+                    f"let {c}b = RCell{{ ..{c}, v: {self.small()} }}",
+                    f"print(\"{{{c}}} {{{c}b}}\")"]
+        if k < 0.94:
+            sb = self.fresh("sb")
+            return [f"var {sb} = str_builder()",
+                    f"{sb}.push_str({json.dumps(r.choice(WORDS))})",
+                    f"{sb}.push_str(\"{{{self.small()}}}\")",
+                    f"print(\"{{{sb}.len()}} {{{sb}.to_str()}}\")"]
+        w = r.choice(["u8", "i8", "u16", "i32", "u64", "i64"])
+        v = self.fresh("bv")
+        return [f"let {v}: {w} = {r.randint(0, 120)}",
+                f"print(\"{{{v}.count_ones()}} {{{v}.leading_zeros()}} {{{v}.trailing_zeros()}} "
+                f"{{{v}.rotate_left({r.randint(0, 70)})}} {{{v}.rotate_right({r.randint(0, 70)})}} {{{v}.swap_bytes()}}\")"]
 
 
 def run(cmd, timeout=20, env=None):

@@ -103,7 +103,16 @@ migration note here; anything `experimental` may change in any release. See
   closures and function values with environments captured by value and
   reference-counted, the higher-order list methods, and generic functions
   by monomorphization, interface methods on generic receivers included:
-  474 corpus programs now.
+  474 corpus programs. Part four added the rest: references read, matched
+  and written through the shared heap, ranges held as values, effect
+  handlers and operations, the parallel maps, `net_workers`, `parallel`
+  and `concurrent` blocks and channels, the clock, process and network
+  built-ins, raw memory with load-acquire, store-release and the LSE
+  compare-and-swap and fetch-add, thread-local cells, C functions called,
+  used as values and addressed through the global offset table, `call_c`,
+  `export fn`, the builders and the bit operations at a width: all 648
+  corpus programs with a `main` that do not link a system library (the
+  three that link SDL are set aside, as `difftest` does).
 - **Raw memory and atomics**, only inside `unsafe` and only in a package
   that declares the new `mem` capability: an `addr` type, allocation, typed
   loads and stores, and atomic load/store/compare-exchange/add with

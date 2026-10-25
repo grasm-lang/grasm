@@ -109,7 +109,7 @@ fn put64(inout b: ByteBuilder, v: i64) {
 fn reloc_symbol(p: MirProg, symk: i64, id: i64) -> str {
     if symk == 1 {
         p.callee_sym[id]
-    } else if symk == 2 {
+    } else if symk == 2 or symk == 5 {
         "_" + p.rt_syms[id]
     } else if symk == 4 {
         "l_.desc.{id}"
@@ -184,7 +184,8 @@ fn compile(inp: str, out: str, opts: A64Opts, listing: str, check: bool, stats: 
                 let base = 4 * obj.text.len()
                 obj.fsym.push(f.sym)
                 obj.foff.push(base)
-                obj.fext.push(f.sym == "_main")
+                // The C entry and every `export fn`'s are global symbols.
+                obj.fext.push(f.sym == "_main" or f.global)
                 for w in r.code.words {
                     obj.text.push(w)
                 }

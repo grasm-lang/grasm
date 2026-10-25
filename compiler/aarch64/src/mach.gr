@@ -120,22 +120,89 @@ pub let A_FSTP_PRE = 65
 pub let A_FLDP_POST = 66
 /// `blr xn`: a call through a register, a function value's code.
 pub let A_BLR = 67
+// Bits, on general registers.
+pub let A_CLZ = 68
+pub let A_RBIT = 69
+/// `rev xd, xn`: the eight bytes reversed.
+pub let A_REV = 70
+/// `rev16 wd, wn`: the bytes of each halfword swapped, the upper half of
+/// the `x` register cleared.
+pub let A_REV16W = 71
+/// `rev wd, wn`: the four bytes reversed, the upper half cleared.
+pub let A_REVW = 72
+/// `ror xd, xn, xm`: turned right by `xm` modulo 64.
+pub let A_RORV = 73
+// Raw memory ([L-LIB-MEM]): loads and stores of a byte, a halfword and a
+// word, at an unsigned offset scaled by the size. A load into `w` clears
+// the upper half; the `s` forms sign-extend into the whole `x` register.
+pub let A_LDRB = 74
+pub let A_LDRSB = 75
+pub let A_LDRH = 76
+pub let A_LDRSH = 77
+pub let A_LDRW = 78
+pub let A_LDRSW = 79
+pub let A_STRB = 80
+pub let A_STRH = 81
+pub let A_STRW = 82
+// Atomics ([L-LIB-ATOMIC]), each sequentially consistent, as the Cranelift
+// build makes every one: load-acquire, store-release, and the LSE
+// compare-and-swap and fetch-add with both acquire and release, at four
+// widths each.
+pub let A_LDARB = 83
+pub let A_LDARH = 84
+pub let A_LDARW = 85
+pub let A_LDARX = 86
+pub let A_STLRB = 87
+pub let A_STLRH = 88
+pub let A_STLRW = 89
+pub let A_STLRX = 90
+/// `casal rs, rt, [xn]`, written here with `rs` in field 0 (read as the
+/// expected value, written with what memory held) and `rt` in field 2.
+pub let A_CASALB = 91
+pub let A_CASALH = 92
+pub let A_CASALW = 93
+pub let A_CASALX = 94
+/// `ldaddal rs, rt, [xn]`, written here with `rt` in field 0 (written with
+/// what memory held) and `rs` in field 2 (the addend).
+pub let A_LDADDALB = 95
+pub let A_LDADDALH = 96
+pub let A_LDADDALW = 97
+pub let A_LDADDALX = 98
+/// `adrp xd, sym@GOTPAGE`: the page of a symbol's slot in the global offset
+/// table, which the linker fills (a C function's address, [T-FN-ADDR]).
+pub let A_ADRP_GOT = 99
+/// `ldr xd, [xn, sym@GOTPAGEOFF]`: the address in that slot.
+pub let A_LDR_GOT = 100
 /// Not an instruction: the function's return, which becomes the epilogue.
 /// `imm` 1 when it returns x0, 2 when it returns d0.
-pub let P_RETURN = 90
+pub let P_RETURN = 150
 /// Not an instruction: a 64-bit constant, which instruction selection
 /// expands into `movz`/`movn` and `movk`s.
-pub let P_MOVIMM = 91
+pub let P_MOVIMM = 151
 /// One past the largest opcode: the size of a table indexed by opcode.
-pub let NMOPS = 96
+pub let NMOPS = 160
 
 /// The opcodes that are real instructions, for whoever wants all of them.
 pub fn all_mops() -> [i64] {
     var out: [i64] = []
-    for m in 1..68 {
+    for m in 1..101 {
         out.push(m)
     }
     out
+}
+
+/// The bytes a raw-memory access moves (1, 2, 4 or 8): what its offset is
+/// scaled by.
+pub fn access_size(m: i64) -> i64 {
+    if m == A_LDRB or m == A_LDRSB or m == A_STRB or m == A_LDARB or m == A_STLRB or m == A_CASALB or m == A_LDADDALB {
+        1
+    } else if m == A_LDRH or m == A_LDRSH or m == A_STRH or m == A_LDARH or m == A_STLRH or m == A_CASALH or m == A_LDADDALH {
+        2
+    } else if m == A_LDRW or m == A_LDRSW or m == A_STRW or m == A_LDARW or m == A_STLRW or m == A_CASALW or m == A_LDADDALW {
+        4
+    } else {
+        8
+    }
 }
 
 /// Whether `m` is a call: `bl` to a symbol or `blr` through a register. Both
@@ -214,8 +281,41 @@ pub fn mop_name(m: i64) -> str {
         65 -> "stp"
         66 -> "ldp"
         67 -> "blr"
-        90 -> "<return>"
-        91 -> "<movimm>"
+        68 -> "clz"
+        69 -> "rbit"
+        70 -> "rev"
+        71 -> "rev16"
+        72 -> "rev"
+        73 -> "ror"
+        74 -> "ldrb"
+        75 -> "ldrsb"
+        76 -> "ldrh"
+        77 -> "ldrsh"
+        78 -> "ldr"
+        79 -> "ldrsw"
+        80 -> "strb"
+        81 -> "strh"
+        82 -> "str"
+        83 -> "ldarb"
+        84 -> "ldarh"
+        85 -> "ldar"
+        86 -> "ldar"
+        87 -> "stlrb"
+        88 -> "stlrh"
+        89 -> "stlr"
+        90 -> "stlr"
+        91 -> "casalb"
+        92 -> "casalh"
+        93 -> "casal"
+        94 -> "casal"
+        95 -> "ldaddalb"
+        96 -> "ldaddalh"
+        97 -> "ldaddal"
+        98 -> "ldaddal"
+        99 -> "adrp"
+        100 -> "ldr"
+        150 -> "<return>"
+        151 -> "<movimm>"
         _ -> "<?>"
     }
 }
@@ -290,6 +390,39 @@ pub fn form_name(m: i64) -> str {
         65 -> "stp-d-pre"
         66 -> "ldp-d-post"
         67 -> "blr"
+        68 -> "clz"
+        69 -> "rbit"
+        70 -> "rev"
+        71 -> "rev16-w"
+        72 -> "rev-w"
+        73 -> "rorv"
+        74 -> "ldrb-uimm"
+        75 -> "ldrsb-uimm"
+        76 -> "ldrh-uimm"
+        77 -> "ldrsh-uimm"
+        78 -> "ldr-w-uimm"
+        79 -> "ldrsw-uimm"
+        80 -> "strb-uimm"
+        81 -> "strh-uimm"
+        82 -> "str-w-uimm"
+        83 -> "ldarb"
+        84 -> "ldarh"
+        85 -> "ldar-w"
+        86 -> "ldar-x"
+        87 -> "stlrb"
+        88 -> "stlrh"
+        89 -> "stlr-w"
+        90 -> "stlr-x"
+        91 -> "casalb"
+        92 -> "casalh"
+        93 -> "casal-w"
+        94 -> "casal-x"
+        95 -> "ldaddalb"
+        96 -> "ldaddalh"
+        97 -> "ldaddal-w"
+        98 -> "ldaddal-x"
+        99 -> "adrp-got"
+        100 -> "ldr-gotpageoff"
         _ -> "?"
     }
 }
@@ -314,6 +447,16 @@ let F_BRK = 16
 let F_ADRP = 17
 let F_ADDPO = 18
 let F_BLR = 19
+/// A load or store of 1, 2 or 4 bytes: Rt, [Rn, #uimm12 * size].
+let F_LDSTN = 20
+/// A load-acquire or store-release: Rt, [Rn].
+let F_ACQREL = 21
+/// A compare-and-swap: Rs (field 0), Rt (field 2), [Rn].
+let F_CAS = 22
+/// A fetch-add: Rs (field 2), Rt (field 0), [Rn].
+let F_LDADD = 23
+/// A load of a global offset table slot: Rt, [Rn, sym@GOTPAGEOFF].
+let F_LDRGOT = 24
 
 fn mop_fmt(m: i64) -> i64 {
     if m >= A_FADD {
@@ -379,6 +522,24 @@ fn fp_fmt(m: i64) -> i64 {
         F_PAIR
     } else if m == A_BLR {
         F_BLR
+    } else if m >= A_CLZ and m <= A_REVW {
+        // The bit operations past the floating-point ones, laid out as
+        // `sxtb` (Rd, Rn) and `lsrv` (Rd, Rn, Rm).
+        F_RN
+    } else if m == A_RORV {
+        F_RRR
+    } else if m >= A_LDRB and m <= A_STRW {
+        F_LDSTN
+    } else if m >= A_LDARB and m <= A_STLRX {
+        F_ACQREL
+    } else if m >= A_CASALB and m <= A_CASALX {
+        F_CAS
+    } else if m >= A_LDADDALB and m <= A_LDADDALX {
+        F_LDADD
+    } else if m == A_ADRP_GOT {
+        F_ADRP
+    } else if m == A_LDR_GOT {
+        F_LDRGOT
     } else {
         0
     }
@@ -476,6 +637,39 @@ fn mop_base(m: i64) -> i64 {
         65 -> 0x6D800000
         66 -> 0x6CC00000
         67 -> 0xD63F0000
+        68 -> 0xDAC01000
+        69 -> 0xDAC00000
+        70 -> 0xDAC00C00
+        71 -> 0x5AC00400
+        72 -> 0x5AC00800
+        73 -> 0x9AC02C00
+        74 -> 0x39400000
+        75 -> 0x39800000
+        76 -> 0x79400000
+        77 -> 0x79800000
+        78 -> 0xB9400000
+        79 -> 0xB9800000
+        80 -> 0x39000000
+        81 -> 0x79000000
+        82 -> 0xB9000000
+        83 -> 0x08DFFC00
+        84 -> 0x48DFFC00
+        85 -> 0x88DFFC00
+        86 -> 0xC8DFFC00
+        87 -> 0x089FFC00
+        88 -> 0x489FFC00
+        89 -> 0x889FFC00
+        90 -> 0xC89FFC00
+        91 -> 0x08E0FC00
+        92 -> 0x48E0FC00
+        93 -> 0x88E0FC00
+        94 -> 0xC8E0FC00
+        95 -> 0x38E00000
+        96 -> 0x78E00000
+        97 -> 0xB8E00000
+        98 -> 0xF8E00000
+        99 -> 0x90000000
+        100 -> 0xF9400000
         _ -> 0
     }
 }
@@ -491,9 +685,9 @@ pub let ROLE_USEDEF = 3
 pub fn role_d(m: i64) -> i64 {
     if m == A_CMPR or m == A_CMPI or m == A_CMNI or m == A_FCMP or m == A_B or m == A_BL or m == A_BLR or m == A_BCOND or m == A_CBZ or m == A_CBNZ or m == A_RET or m == A_RETAB or m == A_PACIBSP or m == A_BRK or m == P_RETURN {
         0
-    } else if m == A_MOVK {
+    } else if m == A_MOVK or (m >= A_CASALB and m <= A_CASALX) {
         3
-    } else if m == A_STR or m == A_STP_PRE or m == A_FSTR or m == A_FSTP_PRE {
+    } else if m == A_STR or m == A_STP_PRE or m == A_FSTR or m == A_FSTP_PRE or (m >= A_STRB and m <= A_STRW) or (m >= A_STLRB and m <= A_STLRX) {
         2
     } else {
         1
@@ -502,7 +696,7 @@ pub fn role_d(m: i64) -> i64 {
 
 pub fn role_n(m: i64) -> i64 {
     let f = mop_fmt(m)
-    if f == 1 or f == 2 or f == 3 or f == 5 or f == 7 or f == 8 or f == 10 or f == 11 or f == 14 or f == 18 or f == 19 {
+    if f == 1 or f == 2 or f == 3 or f == 5 or f == 7 or f == 8 or f == 10 or f == 11 or f == 14 or f == 18 or f == 19 or (f >= F_LDSTN and f <= F_LDRGOT) {
         2
     } else {
         0
@@ -511,7 +705,7 @@ pub fn role_n(m: i64) -> i64 {
 
 pub fn role_m(m: i64) -> i64 {
     let f = mop_fmt(m)
-    if f == 1 or f == 2 or f == 3 or f == 4 {
+    if f == 1 or f == 2 or f == 3 or f == 4 or f == F_CAS or f == F_LDADD {
         2
     } else if m == A_STP_PRE or m == A_FSTP_PRE {
         2
@@ -533,6 +727,9 @@ fn sp_field(m: i64, field: i64) -> bool {
         field == 0 or field == 1
     } else if m == A_CMPI or m == A_CMNI or m == A_LDR or m == A_STR or m == A_STP_PRE or m == A_LDP_POST or m == A_FLDR or m == A_FSTR or m == A_FSTP_PRE or m == A_FLDP_POST {
         field == 1
+    } else if (m >= A_LDRB and m <= A_LDADDALX) or m == A_LDR_GOT {
+        // The base of every raw-memory access may be `sp`.
+        field == 1
     } else {
         false
     }
@@ -546,6 +743,16 @@ fn w_field(m: i64, field: i64) -> bool {
         field == 0 or field == 1
     } else if m == A_SXTB or m == A_SXTH or m == A_SXTW {
         field == 1
+    } else if m == A_REV16W or m == A_REVW {
+        field == 0 or field == 1
+    } else if m == A_LDRB or m == A_LDRH or m == A_LDRW or (m >= A_STRB and m <= A_STRW) {
+        // The narrow loads and stores name a `w` register; the sign-extending
+        // ones load into the whole `x`.
+        field == 0
+    } else if (m >= A_LDARB and m <= A_LDARW) or (m >= A_STLRB and m <= A_STLRW) {
+        field == 0
+    } else if (m >= A_CASALB and m <= A_CASALW) or (m >= A_LDADDALB and m <= A_LDADDALW) {
+        field == 0 or field == 2
     } else {
         false
     }
@@ -763,6 +970,41 @@ pub fn encode(m: i64, rd: i64, rn: i64, rm: i64, ra: i64, imm: i64, imm2: i64, c
         let n = try reg_field(m, 1, rn)
         return base.bit_or(n.shl(5))
     }
+    if f == F_LDSTN {
+        let t = try reg_field(m, 0, rd)
+        let n = try reg_field(m, 1, rn)
+        let sz = access_size(m)
+        if imm % sz != 0 {
+            fail("{form_name(m)}: offset {imm} is not a multiple of {sz}")
+        }
+        let k = try uimm(m, "offset", imm / sz, 12)
+        return base.bit_or(k.shl(10)).bit_or(n.shl(5)).bit_or(t)
+    }
+    if f == F_ACQREL {
+        let t = try reg_field(m, 0, rd)
+        let n = try reg_field(m, 1, rn)
+        return base.bit_or(n.shl(5)).bit_or(t)
+    }
+    if f == F_CAS {
+        // Rs is field 0 here, Rt field 2.
+        let s = try reg_field(m, 0, rd)
+        let n = try reg_field(m, 1, rn)
+        let t = try reg_field(m, 2, rm)
+        return base.bit_or(s.shl(16)).bit_or(n.shl(5)).bit_or(t)
+    }
+    if f == F_LDADD {
+        // Rt is field 0 here, Rs field 2.
+        let t = try reg_field(m, 0, rd)
+        let n = try reg_field(m, 1, rn)
+        let s = try reg_field(m, 2, rm)
+        return base.bit_or(s.shl(16)).bit_or(n.shl(5)).bit_or(t)
+    }
+    if f == F_LDRGOT {
+        // The offset is the linker's.
+        let t = try reg_field(m, 0, rd)
+        let n = try reg_field(m, 1, rn)
+        return base.bit_or(n.shl(5)).bit_or(t)
+    }
     fail("opcode {m} has no encoding")
 }
 
@@ -871,13 +1113,31 @@ pub fn asm_text(m: i64, rd: i64, rn: i64, rm: i64, ra: i64, imm: i64, imm2: i64,
         return "{name} #{imm}"
     }
     if f == 17 {
+        if m == A_ADRP_GOT {
+            return "{name} {d}, {target}@GOTPAGE"
+        }
         return "{name} {d}, {target}@PAGE"
+    }
+    if f == F_LDRGOT {
+        return "{name} {d}, [{n}, {target}@GOTPAGEOFF]"
     }
     if f == 18 {
         return "{name} {d}, {n}, {target}@PAGEOFF"
     }
     if f == 19 {
         return "{name} {n}"
+    }
+    if f == F_LDSTN {
+        return "{name} {d}, [{n}, #{imm}]"
+    }
+    if f == F_ACQREL {
+        return "{name} {d}, [{n}]"
+    }
+    if f == F_CAS {
+        return "{name} {d}, {mm}, [{n}]"
+    }
+    if f == F_LDADD {
+        return "{name} {mm}, {d}, [{n}]"
     }
     if m == P_RETURN {
         return "<return>"

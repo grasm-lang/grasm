@@ -34,7 +34,7 @@ type TirInfo = {
 }
 
 /// Keeps a symbol to the characters every tool accepts.
-fn sanitize(s: str) -> str {
+pub fn sanitize(s: str) -> str {
     var out = str_builder()
     for c in s.codes() {
         if (c >= 48 and c <= 57) or (c >= 65 and c <= 90) or (c >= 97 and c <= 122) or c == 95 {
@@ -75,6 +75,12 @@ fn callees_of(info: TirInfo, root: i64) -> [i64] {
         if k == "call" or k == "fnref" {
             // A function used as a value is reached as surely as one called.
             let c = info.fn_ix.get(sexp.word(t, e, 3)) ?? -1
+            if c >= 0 {
+                out.push(c)
+            }
+        } else if k == "fnname" {
+            // So is one whose address is taken ([T-FN-ADDR]).
+            let c = info.fn_ix.get(sexp.word(t, e, 1)) ?? -1
             if c >= 0 {
                 out.push(c)
             }

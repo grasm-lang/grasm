@@ -48,6 +48,20 @@
 #                of a generic function reaches whichever instance came first
 #                -> s3subset
 #
+# Part four's references, atomics, effects, ranges and tasks:
+#
+#   ref-cell     `r.value = x` writes the next slot of the shared heap, not
+#                the one `r` names -> s3subset
+#   atomic-plain a fetch-add is selected as a plain 64-bit load, add and
+#                store, whatever its width -> s3subset (a narrow add carries
+#                into the next byte)
+#   handler      an effect operation answers one more than its handler did
+#                -> s3subset
+#   range-bound  a range held as a value is made with its end one past
+#                -> s3subset
+#   task-result  a parallel map's worker answers 0 for every integer result
+#                -> s3subset
+#
 # A fault that sends a program into a loop shows as a run stopped at the
 # gates' limit (`S3_RUN_SECONDS` in `scripts/lib/s3.sh`, 20 s against well
 # under a second for any subset program), and counts as caught.
@@ -195,6 +209,31 @@ control mono compiler/mir/src/mono.gr \
     "    let iname = inst_name(m.t, name, targs)" "    let iname = name + \"[]\"" -- \
     scripts/s3subset.sh "FAILED:" -
 
+control ref-cell compiler/mir/src/lower.gr \
+    '        rt(v, "grasm_ref_set", [raw, fb], R_VOID)' \
+    '        rt(v, "grasm_ref_set", [op2(v, ir.M_ADD, raw, konst(v, 4294967296)), fb], R_VOID)' -- \
+    scripts/s3subset.sh "MISMATCH:" -
+
+control atomic-plain compiler/aarch64/src/rules.gr \
+    '        rs.push(r("aadd" + widths[k], ir.M_AADD8 + k, G_ANY, [t(mach.A_LDADDALB + k, S_RES, S_A, S_B)]))' \
+    '        rs.push(r("aadd" + widths[k], ir.M_AADD8 + k, G_ANY, [ti(mach.A_LDR, S_RES, S_A, 0, 0), t(mach.A_ADDR, S_T0, S_RES, S_B), ti(mach.A_STR, S_T0, S_A, 0, 0)]))' -- \
+    scripts/s3subset.sh "MISMATCH:" -
+
+control handler compiler/mir/src/lower.gr \
+    '    call_value(v, f, args, rk)' \
+    $'    let got = call_value(v, f, args, rk)\n    if ir.ty_int(rk) {\n        return op2(v, ir.M_ADD, got, konst(v, 1))\n    }\n    got' -- \
+    scripts/s3subset.sh "MISMATCH:" -
+
+control range-bound compiler/mir/src/lower.gr \
+    '    rt(v, "grasm_range_new", [lo, hi, kc], R_BOX)' \
+    '    rt(v, "grasm_range_new", [lo, op2(v, ir.M_ADD, hi, konst(v, 1)), kc], R_BOX)' -- \
+    scripts/s3subset.sh "MISMATCH:" -
+
+control task-result compiler/mir/src/lower.gr \
+    $'    } else {\n        bits = r\n    }\n    do_return(v, bits)' \
+    $'    } else {\n        bits = konst(v, 0)\n    }\n    do_return(v, bits)' -- \
+    scripts/s3subset.sh "MISMATCH:" -
+
 echo
 echo "controls: $controls   caught: $caught   missed: ${#MISSED[@]}"
 if [ ${#MISSED[@]} -gt 0 ]; then
@@ -203,9 +242,9 @@ if [ ${#MISSED[@]} -gt 0 ]; then
     printf '  %s\n' "${MISSED[@]}"
     exit 1
 fi
-# Nineteen gate runs over fifteen faults, and every one must have failed.
-if [ "$controls" -ne 19 ] || [ "$caught" -ne 19 ]; then
-    echo "expected 19 controls caught, ran $controls and caught $caught"
+# Twenty-four gate runs over twenty faults, and every one must have failed.
+if [ "$controls" -ne 24 ] || [ "$caught" -ne 24 ]; then
+    echo "expected 24 controls caught, ran $controls and caught $caught"
     exit 1
 fi
 exit 0

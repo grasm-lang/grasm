@@ -5,7 +5,82 @@ Every defect that is known and not fixed, with its severity from
 to paste. S1 and S2 block a release; S3 and S4 do not, and this file is what
 makes shipping them honest rather than quiet.
 
-**Open S1: none. Open S2: none. Open S3: none. Open S4: none.**
+**Open S1: one. Open S2: none. Open S3: one. Open S4: none.**
+
+## Found on 2026-10-25 by the Grasm backend (S3, part four)
+
+**`+=` on a string field through a reference, twice, corrupts the heap in the
+native build -- *open, S1*.** Found by `fuzz_s3`'s part-four generator, the
+Cranelift build being its reference; reduced by hand:
+
+```
+type Leaf = | L(n: i64)
+
+type Cell = { tag: str }
+
+fn bump(c: ref Cell) {
+    c.tag += "+"
+}
+
+fn main() {
+    let c = ref(Cell{ tag: "xyz" })
+    bump(c)
+    bump(c)
+    let more = [ref(L(8)), ref(L(9))]
+    print("{c.tag} {more.len()}")
+}
+```
+
+`grasm run` prints `xyz++ 2`; so does the S3 backend's build, with nothing
+live at exit and nothing touched after its release under the poisoned
+runtime. The native build exits with SIGSEGV (139) and prints nothing, or
+with SIGBUS in a larger program. Each of these makes it go away: one `bump`
+instead of two; `c.tag = c.tag + "+"` instead of `+=`; an `i64` field `+=`
+instead of the string; references to integers instead of to a sum's
+variants afterwards. So it is the compound string assignment to a place
+behind a reference (the place path of `eval_stmt`'s `Stmt::Assign`, through
+`read_place` and `write_place` in `crates/grasm_native/src/lib.rs`) that
+leaves the heap inconsistent, and a later allocation that trips on it. No
+corpus program has the shape: `difftest` and the S3 gates agree on all of
+them. Not fixed here (part four changes no Rust); `fuzz_s3` writes the
+append as `c.tag = c.tag + ..` until it is.
+
+**Interpolating a `ref` into a string is an internal compiler error in the
+native build -- *open, S3*.** `grasm run` writes a reference as the slot it
+names (`ref#0.0`), and so does `print` of one in the native build
+(`grasm_out_ref`), but a reference interpolated into a string that is built
+-- anything other than the direct argument of `print` -- reaches
+`emit_pieces` in `crates/grasm_native/src/lib.rs`, whose match over the
+piece's type has no arm for `VType::Ref` and ends in `unreachable!()`:
+
+```
+fn main() {
+    let r = ref(5)
+    let s = "at {r}"
+    print(s)
+}
+```
+
+`grasm run` prints `at ref#0.0`; `grasm build --native` stops with "the
+backend panicked while generating code ... entered unreachable code at
+crates/grasm_native/src/lib.rs:13596:30". No corpus program has the shape (a
+program that has it does not build natively, so `difftest` would show it).
+The S3 backend writes the piece as a boxed reference displays
+(`grasm_box_ref`, then `grasm_str_from_val`) and prints `at ref#0.0`, as the
+interpreter does; with no Cranelift build to compare against, no gate
+compares that. The fix belongs in `emit_pieces`: a `VType::Ref` arm that
+boxes the word with `grasm_box_ref` and writes it as the boxed arm does. Not
+changed here: part four changes no Rust.
+
+**TIR does not record which system libraries a program links.** A program
+whose package graph declares `links` (the three SDL programs: `sdl-demo`,
+`pcview-demo`, `pcedit-demo`) can only be linked where the library is, and
+`scripts/sdltest.sh` is the gate that builds them. The S3 gates ask the
+compiler (`grasm links`) and set those programs aside, counted, as
+`difftest` does; nothing in the TIR text says it, so a consumer of TIR alone
+-- the S2 frontend's output included -- cannot tell. Not a defect in any
+engine; written down so that S4's linker, which has to put the library on
+the link line, knows to ask for it.
 
 ## Found on 2026-10-22 by the Grasm backend (S3, part three)
 

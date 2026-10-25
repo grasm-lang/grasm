@@ -885,6 +885,105 @@ types are made the same way, so a pattern taking a `Tree[i64]` apart reads
 `Tree[i64]` fields rather than `Tree[T]` ones. The subset rule runs the same
 pass, in Python, before it decides anything.
 
+### 6.3 S3 part four: the rest of the corpus
+
+Taken in the order that admitted the most programs per unit of work, measured
+before each step by the blockers each program still had (a program counts
+under each of its blockers, and as "only" under one when it has no other).
+At the start, of the 177 programs out: references 72 (only 31; with the
+generic code at a reference type they also kept out, 49), tasks 26 (23),
+effects 22 (15), ranges held as values 22 (20), the clock, entropy and
+process built-ins 19 (10), raw memory and C 16 (14), the network built-ins
+15 (7), `push` on a receiver that is not a place 11 (always with a
+reference), the builders 1, the bit operations at a width 3, and 7 more.
+In: 496 after the one-call built-ins, 516 after ranges, 580 after
+references, 602 after effects, 627 after tasks, 634 after the small
+families, 640 after C functions, 645 after raw memory, 647 after function
+addresses, and 648 after closures that fail the function around them --
+every program with a `main` but the three that link SDL, which the S3 gates
+set aside, counted, as `difftest` does (TIR does not say what a program
+links; the gates ask `grasm links`).
+
+**References** are one word ([T-REF-GENERATIONAL]), a slot of the runtime's
+shared heap and its generation, held in an integer register and owning
+nothing. Reading through one -- `r.value`, a field of what it points at, a
+`match` on it -- asks the heap for an owned copy of the box
+(`grasm_ref_get`, which panics on a stale reference). A write through one
+lands in the heap, below the last reference its path crosses: the containers
+above it are only read, what that reference points at is made the slot's only
+holder (`grasm_ref_make_unique`) and the rest of the path written in place
+under it, or, when the path ends at the referent (`r.value = x`), it is
+replaced whole (`grasm_ref_set`). A mutating method through a reference is
+the same: `r.items.push(x)` pushes into the referent's field in place. A list
+of references is a scalar list of its own kind, a struct's field of one its
+own field kind, as in the Cranelift build. A closure that only writes through
+a captured reference reads it untyped, so the capture analysis takes a
+written place's root too, typed by its binding.
+
+**Ranges held as values** are the runtime's boxed `Range`; their elements are
+built when walked (`grasm_range_to_list`), as the Cranelift build and the
+interpreter both do, and their length is the bounds' (`grasm_range_len`).
+
+**Effects.** A handler is a struct of function values, one per operation.
+`with` installs it on the runtime's handler stack (`grasm_handler_push`,
+`grasm_handler_op`), each operation's function value standing as both its
+code and its environment, held by the block and released after the pop; an
+operation asks the stack for the innermost handler's function
+(`grasm_handler_lookup`) and calls it as any function value. Every way out of
+the block -- its end, `break`, `continue`, `return`, `fail`, a failed `try` --
+pops what it installed, as the Cranelift build does since F59 and F61.
+
+**Tasks.** `par_map` and `par_filter` are the runtime's parallel maps over a
+worker of the C signature `fn(*const i64, i64) -> i64`, one per pair of
+element and result classes, whose one-word environment is the function value
+(the threads share it; the counts are atomic). `net_workers` is the same
+machine, a thread a worker. Where the Cranelift build maps in order on the
+calling thread instead -- a result of no value, a function that can fail --
+so does this one. A `parallel` block records the `spawn` sites that fire and
+then runs their bodies in that order in the block's frame ([E-SPAWN-ORDER]);
+the Cranelift build runs a block of independent `v = e` tasks the checker
+proved (`proved`) on worker threads, and running them in order gives the
+same values, which is what this backend does. A `concurrent` block collects a
+closure of no arguments per `go` and hands them to the runtime's fiber
+scheduler (`grasm_conc_run`); a channel is a handle, a word.
+
+**Raw memory and C.** An `addr` is a word, as in the Cranelift build. Loads
+and stores move 1, 2, 4 or 8 bytes (`ldrb`/`ldrsb`/`ldrh`/`ldrsh`/`ldr w`/
+`ldrsw`, `strb`/`strh`/`str w`, and the existing 64-bit and `d` forms); every
+atomic is sequentially consistent whatever ordering is written, as there:
+`ldar`, `stlr`, and the LSE `casal` and `ldaddal`, at four widths each, a
+narrow signed answer sign-extended. A compare-and-swap has three operands,
+the third carried as a call's arguments are (`ir.has_cargs`, the rule
+selector `S_C`). Thread-local cells are the runtime's per-thread block
+(`grasm_tls_block`) at the offsets the Cranelift build's `tls_layout` gives,
+cells in name order. An `extern fn` is called by the C convention with a
+`str` as a NUL-terminated copy and `bytes` as its buffer, a narrow answer
+read at its width, `grasm_foreign_call` told first; used as a value it goes
+through a wrapper of the closure convention. `mem_fn_addr` of a C function is
+its own address, loaded from the global offset table (`adrp`/`ldr` with
+`ARM64_RELOC_GOT_LOAD_PAGE21`/`_PAGEOFF12`); of a Grasm function, its C
+entry, which re-extends each narrow argument and asks for a stack floor if
+the function can recurse. An `export fn`'s C entry is the global symbol of
+its own name. `call_c` is a `blr` through the address with the arguments
+crossing as an `extern` call's do.
+
+**A closure whose failure fails the function around it.** TIR marks a
+closure `total` when it cannot fail itself; one that is `total` and still
+has a `fail` or `try` -- `xs.par_map(|x| if x == 2 { fail(E{..}) } else { x
+})` -- fails the function it is written in ([E-PAR-FAIL]). The Cranelift
+build gets that by inlining the body into the loop; this backend does the
+same for such a closure written as the argument of `map`, `filter`, `fold`,
+`any`, `all`, `find` and the parallel maps (which then map in order), and
+keeps any other out.
+
+The remaining one-liners -- a struct literal with `..base` (the base first,
+then the fields as written, set by the runtime's copy-on-write setter), `==`
+on `()`, the two builders, the bit operations at a width (`clz`, `rbit`,
+`rev`, `rev16`, `ror`; the population count in bit-parallel arithmetic),
+`checked_*`, `saturating_*` and `try_*` by the runtime -- are each the
+Cranelift build's lowering. Thirty-three new instruction forms, every one in
+`encodetest` against `clang -c`.
+
 ## 7. Bootstrap and trust
 
 - **During the migration:** stage 0 is the Rust-built `grasm`.
@@ -953,7 +1052,7 @@ Decided 2026-10-20:
    systems subset (§5).
 5. **Linux** in S7.
 
-## 11. Where it stands (2026-10-22)
+## 11. Where it stands (2026-10-25)
 
 Measured, not estimated; each line is a gate's result on master.
 
@@ -970,27 +1069,23 @@ Measured, not estimated; each line is a gate's result on master.
 - **S3 in progress.** `compiler/` holds an aarch64 backend in Grasm --
   MIR with explicit `inc`/`dec`, rule-based selection, linear scan with a
   checker, an encoder checked against `clang -c`, a Mach-O object writer
-  -- on a subset: 474 of 651 corpus programs with a `main` build with it
-  and print and exit exactly as the Cranelift build does (part one had 37:
-  scalars, control flow, calls, printing; part two, 289, added heap values
-  with explicit reference counting, fallible functions, 111 built-in
-  methods over seven receiver families, 22 one-call built-ins, arguments on
-  the stack and places passed `inout`, §6.1; part three added `f64` as a
-  second register class, closures and function values with the
-  higher-order list methods, and generics by monomorphization, §6.2: 357
-  with doubles, 457 with function values, 474 with generics). All of them
-  run with nothing live at exit (those that reach the leak check; a few end
-  by design before it) and no use after free under the poisoned runtime.
+  -- and every corpus program with a `main` that does not link a system
+  library builds with it: 648 of 651, each printing and exiting exactly as
+  the Cranelift build does; the three that link SDL are set aside, as
+  `difftest` sets them aside. Part one had 37 (scalars, control flow,
+  calls, printing); part two, 289, added heap values with explicit
+  reference counting, fallible functions, the built-in methods, arguments
+  on the stack and places passed `inout` (§6.1); part three, 474, added
+  `f64` as a second register class, closures and function values, and
+  generics by monomorphization (§6.2); part four added references, ranges
+  held as values, effects, tasks, raw memory and atomics, C functions,
+  function addresses and `export fn`, and the rest (§6.3). All of them run
+  with nothing live at exit (those that reach the leak check; a few end by
+  design before it) and no use after free under the poisoned runtime.
   fib(35) was about 1.9x slower than Cranelift's code at part one. What
-  still keeps programs out, by count of the 177 left (a program counts
-  under each reason it has): references (72), and among the rest raw
-  memory and `unsafe` (71), the network built-ins (52), effects (`with`
-  50, effect operations 43), ranges held as values (`to_list` 49, a range
-  local 21), parallel and task operations (`par_map` 16 and more). No
-  program is kept out by doubles, function values or generics alone any
-  more; they still appear in 9, 10 and 28 programs something else keeps
-  out (a function type over a reference, generic code at a reference
-  type).
+  §6 still asks of S3 and `compiler/` does not have: DWARF line tables,
+  the release (backtracking) allocator, the differential and operator
+  fuzzers pointed at it, and benchmarks against the Cranelift build.
 - **Not started:** S2 (the frontend in Grasm), S4 (the linker), S5 (the
   runtime in Grasm), S6 (self-compilation), S7-S9.
 

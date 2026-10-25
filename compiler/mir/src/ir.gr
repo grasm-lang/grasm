@@ -116,6 +116,57 @@ pub let M_FFROMBITS = 66
 /// `M_LOAD` and `M_STORE` of a double.
 pub let M_FLOAD = 67
 pub let M_FSTORE = 68
+// Bits ([L-LIB-BITS-WIDTH]), all on the 64-bit word.
+/// The number of leading zero bits (64 for zero).
+pub let M_CLZ = 80
+/// The bits in reverse order.
+pub let M_RBIT = 81
+/// The eight bytes in reverse order.
+pub let M_BSWAP64 = 82
+/// The low two bytes swapped, the rest zero.
+pub let M_BSWAP16 = 83
+/// The low four bytes in reverse order, the rest zero.
+pub let M_BSWAP32 = 84
+/// `a` turned right by `b` modulo 64.
+pub let M_ROTR = 85
+// Raw memory ([L-LIB-MEM]): a load of 1, 2 or 4 bytes at address `a`,
+// zero- or sign-extended to the word; a store of the low bytes of `b` at `a`.
+pub let M_LOAD8U = 86
+pub let M_LOAD8S = 87
+pub let M_LOAD16U = 88
+pub let M_LOAD16S = 89
+pub let M_LOAD32U = 90
+pub let M_LOAD32S = 91
+pub let M_STORE8 = 92
+pub let M_STORE16 = 93
+pub let M_STORE32 = 94
+// Atomics ([L-LIB-ATOMIC]) at address `a`, of 1, 2, 4 or 8 bytes, each
+// sequentially consistent: a load (zero-extended), a store of `b`, a
+// fetch-add of `b`, and a compare-and-swap that stores the third operand
+// (`cargs`) where `b` was found; the last two answer what was there.
+pub let M_ALOAD8 = 95
+pub let M_ALOAD64 = 98
+pub let M_ASTORE8 = 99
+pub let M_ASTORE64 = 102
+pub let M_AADD8 = 103
+pub let M_AADD64 = 106
+pub let M_ACAS8 = 107
+pub let M_ACAS64 = 110
+/// The address of C function `imm` (a runtime-symbol id, as `M_CALLRT`'s),
+/// through the global offset table ([T-FN-ADDR]).
+pub let M_GOTADDR = 111
+
+/// The atomic of class `base` (`M_ALOAD8`, `M_ASTORE8`, `M_AADD8`,
+/// `M_ACAS8`) at `size` bytes.
+pub fn atomic_at(base: i64, size: i64) -> i64 {
+    base + if size == 1 { 0 } else if size == 2 { 1 } else if size == 4 { 2 } else { 3 }
+}
+
+/// Whether an instruction reads operands from `cargs` past `a` and `b`: a
+/// call's arguments, a compare-and-swap's new value.
+pub fn has_cargs(op: i64) -> bool {
+    op == M_CALL or op == M_CALLRT or op == M_CALLIND or (op >= M_ACAS8 and op <= M_ACAS64)
+}
 
 pub fn is_terminator(op: i64) -> bool {
     op >= M_JUMP and op <= M_TRAP
@@ -124,7 +175,7 @@ pub fn is_terminator(op: i64) -> bool {
 /// Whether an instruction has no effect but its result, so it may be
 /// removed when nothing reads the result.
 pub fn pure_op(op: i64) -> bool {
-    op != M_CALL and op != M_CALLRT and op != M_CALLIND and op != M_STORE and op != M_FSTORE and op != M_INC and op != M_DEC and not is_terminator(op)
+    op != M_CALL and op != M_CALLRT and op != M_CALLIND and op != M_STORE and op != M_FSTORE and op != M_INC and op != M_DEC and not is_terminator(op) and not (op >= M_STORE8 and op <= M_ACAS64)
 }
 
 /// Whether an instruction's result is a double. A call's is whatever the
@@ -195,6 +246,10 @@ pub let TY_NEVER = 10
 pub let TY_BOX = 11
 /// A double, held in a floating-point register.
 pub let TY_F64 = 12
+/// A generational reference ([T-REF-GENERATIONAL]): one word, a slot of the
+/// runtime's shared heap and the generation it was on, in an integer
+/// register. It owns nothing, so no `inc` or `dec` keeps it.
+pub let TY_REF = 13
 
 pub fn ty_of_name(name: str) -> i64 {
     match name {
@@ -210,6 +265,9 @@ pub fn ty_of_name(name: str) -> i64 {
         "u64" -> 9
         "never" -> 10
         "f64" -> 12
+        // An address ([T-ADDR]) is a word, held as the Cranelift build holds
+        // it: as an `i64`.
+        "addr" -> 1
         _ -> -1
     }
 }
@@ -230,7 +288,7 @@ pub fn ty_unsigned(t: i64) -> bool {
 
 /// A type the subset holds in a register.
 pub fn ty_scalar(t: i64) -> bool {
-    (t >= TY_UNIT and t <= TY_NEVER) or t == TY_F64
+    (t >= TY_UNIT and t <= TY_NEVER) or t == TY_F64 or t == TY_REF
 }
 
 /// A counted pointer, which `inc` and `dec` keep alive.
@@ -334,6 +392,8 @@ type MirFn = {
     nparams: i64,
     /// Whether it returns a value in x0.
     returns: bool,
+    /// Whether its symbol is global: an `export fn`'s C entry ([T-EXPORT]).
+    global: bool,
     /// 8-byte frame slots for `inout` arguments.
     nslots: i64,
     nvals: i64,
@@ -370,7 +430,7 @@ type MirFn = {
 
 pub fn new_fn(name: str, sym: str) -> MirFn {
     MirFn{
-        name: name, sym: sym, floor: false, nparams: 0, returns: false, nslots: 0, nvals: 0, vfp: [],
+        name: name, sym: sym, floor: false, nparams: 0, returns: false, global: false, nslots: 0, nvals: 0, vfp: [],
         bp0: [], bnp: [], bparams: [], bi0: [], bni: [],
         tk: [], tv: [], tt: [], tf: [], ta0: [], tan: [], fa0: [], fan: [], targs: [],
         op: [], res: [], a: [], b: [], imm: [], ca0: [], can: [], cargs: [],
@@ -408,6 +468,7 @@ pub let FK_BOXED = 0
 pub let FK_I64 = 1
 pub let FK_F64 = 2
 pub let FK_BOOL = 3
+pub let FK_REF = 4
 pub let FK_UNIT = 5
 pub let FK_U64 = 9
 
@@ -478,15 +539,51 @@ pub fn op_name(op: i64) -> str {
         66 -> "ffrombits"
         67 -> "fload"
         68 -> "fstore"
+        80 -> "clz"
+        81 -> "rbit"
+        82 -> "bswap64"
+        83 -> "bswap16"
+        84 -> "bswap32"
+        85 -> "rotr"
+        86 -> "load8u"
+        87 -> "load8s"
+        88 -> "load16u"
+        89 -> "load16s"
+        90 -> "load32u"
+        91 -> "load32s"
+        92 -> "store8"
+        93 -> "store16"
+        94 -> "store32"
+        95 -> "aload8"
+        96 -> "aload16"
+        97 -> "aload32"
+        98 -> "aload64"
+        99 -> "astore8"
+        100 -> "astore16"
+        101 -> "astore32"
+        102 -> "astore64"
+        103 -> "aadd8"
+        104 -> "aadd16"
+        105 -> "aadd32"
+        106 -> "aadd64"
+        107 -> "acas8"
+        108 -> "acas16"
+        109 -> "acas32"
+        110 -> "acas64"
+        111 -> "gotaddr"
         _ -> "op?"
     }
 }
 
 /// How many value operands an instruction reads from `a` and `b`.
 pub fn nreads(op: i64) -> i64 {
-    if op == M_ICONST or op == M_STRADDR or op == M_GETSP or op == M_SLOTADDR or op == M_CALL or op == M_CALLRT or op == M_DATAADDR or op == M_FCONST or op == M_FNADDR {
+    if op == M_ICONST or op == M_STRADDR or op == M_GETSP or op == M_SLOTADDR or op == M_CALL or op == M_CALLRT or op == M_DATAADDR or op == M_FCONST or op == M_FNADDR or op == M_GOTADDR {
         0
     } else if op == M_COPY or op == M_NEG or op == M_NOT or (op >= M_SEXT8 and op <= M_UEXT32) or op == M_LOAD or op == M_INC or op == M_DEC or op == M_CALLIND {
+        1
+    } else if op >= M_CLZ and op <= M_BSWAP32 {
+        1
+    } else if (op >= M_LOAD8U and op <= M_LOAD32S) or (op >= M_ALOAD8 and op <= M_ALOAD64) {
         1
     } else if (op >= M_FNEG and op <= M_FCEIL) or (op >= M_SCVTF and op <= M_FLOAD) {
         1
@@ -544,11 +641,16 @@ pub fn print_fn(f: MirFn, callee_sym: [str], rt_syms: [str]) -> str {
             } else if op == M_CALLRT {
                 let rn = if f.imm[i] >= 0 and f.imm[i] < rt_syms.len() { rt_syms[f.imm[i]] } else { "?" }
                 line = line + " {rn}({arg_list(f.cargs, f.ca0[i], f.can[i])})"
+            } else if op == M_GOTADDR {
+                let rn = if f.imm[i] >= 0 and f.imm[i] < rt_syms.len() { rt_syms[f.imm[i]] } else { "?" }
+                line = line + " {rn}"
             } else if op == M_FNADDR {
                 let callee = if f.imm[i] >= 0 and f.imm[i] < callee_sym.len() { callee_sym[f.imm[i]] } else { "?" }
                 line = line + " {callee}"
             } else if op == M_CALLIND {
                 line = line + " *{vname(f.a[i])}({arg_list(f.cargs, f.ca0[i], f.can[i])})"
+            } else if op >= M_ACAS8 and op <= M_ACAS64 {
+                line = line + " {vname(f.a[i])}, {vname(f.b[i])}, {arg_list(f.cargs, f.ca0[i], f.can[i])}"
             } else if nreads(op) == 1 {
                 line = line + " {vname(f.a[i])}"
             } else if nreads(op) == 2 {

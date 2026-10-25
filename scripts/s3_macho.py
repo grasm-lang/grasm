@@ -118,6 +118,10 @@ def is_add_imm64(w):
     return w & 0xFF800000 == 0x91000000
 
 
+def is_ldr_imm64(w):
+    return w & 0xFFC00000 == 0xF9400000
+
+
 def cmd_relocs(path):
     data = open(path, "rb").read()
     words, t = text_words(data)
@@ -140,7 +144,10 @@ def cmd_relocs(path):
         if length != 2:
             problems.append(f"relocation {k} at {addr:#x} has length {length}")
         w = words[addr // 4]
-        want = {2: (is_bl, 1, "bl"), 3: (is_adrp, 1, "adrp"), 4: (is_add_imm64, 0, "add")}.get(rtype)
+        # 5 and 6: a C function's address through its GOT slot
+        # (ARM64_RELOC_GOT_LOAD_PAGE21, _PAGEOFF12).
+        want = {2: (is_bl, 1, "bl"), 3: (is_adrp, 1, "adrp"), 4: (is_add_imm64, 0, "add"),
+                5: (is_adrp, 1, "adrp"), 6: (is_ldr_imm64, 0, "ldr")}.get(rtype)
         if want is None:
             problems.append(f"relocation {k} at {addr:#x} has type {rtype}, which this backend never writes")
             continue
@@ -157,7 +164,7 @@ def cmd_relocs(path):
     for i, w in enumerate(words):
         if is_bl(w) and rel.get(4 * i) != 2:
             problems.append(f"the `bl` at {4 * i:#x} has no BRANCH26 relocation")
-        if is_adrp(w) and rel.get(4 * i) != 3:
+        if is_adrp(w) and rel.get(4 * i) not in (3, 5):
             problems.append(f"the `adrp` at {4 * i:#x} has no PAGE21 relocation")
     ndata = check_data_relocs(data, syms, problems)
     for p in problems[:20]:

@@ -19,6 +19,11 @@
 #     must be identical. Both are native builds, so neither prints a panic
 #     trace ([E-PANIC-TRACE]) and stderr is compared whole.
 #
+# A program that links a system library (`grasm links`; the SDL programs) is
+# set aside before either check, counted as external, and must be one
+# `scripts/sdltest.sh` builds, as `difftest` requires of the ones it sets
+# aside.
+#
 # The count in the subset is printed and held to a floor (`scripts/lib/s3.sh`)
 # so a subset that shrank cannot pass by checking less.
 #
@@ -48,9 +53,11 @@ out_subset=0
 pass=0
 fail=0
 timedout=0
+external=0
 declare -a FAILED=()
 declare -a TIMEDOUT=()
 declare -a IN=()
+declare -a EXTERNAL=()
 
 for k in "${!S3_SRC[@]}"; do
     src=${S3_SRC[$k]}
@@ -58,6 +65,15 @@ for k in "${!S3_SRC[@]}"; do
     rule=${S3_RULE[$k]}
     obj="$WORK/p.o"
     rm -f "$obj"
+    case "$rule" in
+    external:*)
+        # It links a system library: built and run by `sdltest`, set aside
+        # here, and counted (`s3_collect.py`).
+        external=$((external + 1))
+        EXTERNAL+=("$src")
+        continue
+        ;;
+    esac
     # shellcheck disable=SC2086
     "$S3" "$tir" -o "$obj" $EXTRA >"$WORK/s3.out" 2>"$WORK/s3.err"
     code=$?
@@ -110,8 +126,12 @@ echo
 echo "in the subset, by scripts/s3_subset.py:"
 printf '  %s\n' "${IN[@]}"
 echo
-echo "subset: $in_subset in, $out_subset out, of ${#S3_SRC[@]} programs with a main"
+echo "subset: $in_subset in, $out_subset out, $external external, of ${#S3_SRC[@]} programs with a main"
 echo "identical: $pass   mismatched: $fail   timed out: $timedout   no TIR: ${#S3_NOTIR[@]}"
+if [ "$external" -gt 0 ]; then
+    # Set aside only because another gate builds them.
+    corpus_external_covered "${EXTERNAL[@]}" || exit 1
+fi
 
 if [ ${#S3_NOTIR[@]} -gt 0 ]; then
     echo
@@ -131,8 +151,8 @@ fi
 
 # Every program was in or out, and every one in was compared or failed: the
 # counts must add up, or a program fell through a gap in this script.
-if [ $((in_subset + out_subset)) -ne ${#S3_SRC[@]} ]; then
-    echo "the counts do not add up: $in_subset + $out_subset is not ${#S3_SRC[@]}"
+if [ $((in_subset + out_subset + external)) -ne ${#S3_SRC[@]} ]; then
+    echo "the counts do not add up: $in_subset + $out_subset + $external is not ${#S3_SRC[@]}"
     exit 1
 fi
 if [ "$fail" -ne 0 ] || [ "$timedout" -ne 0 ] || [ ${#S3_NOTIR[@]} -ne 0 ]; then

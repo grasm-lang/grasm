@@ -25,6 +25,10 @@ import vcode
 pub let REL_BRANCH26 = 2
 pub let REL_PAGE21 = 3
 pub let REL_PAGEOFF12 = 4
+/// The page of a symbol's slot in the global offset table, and the slot's
+/// offset in it (`ARM64_RELOC_GOT_LOAD_PAGE21`, `_PAGEOFF12`).
+pub let REL_GOT_PAGE21 = 5
+pub let REL_GOT_PAGEOFF12 = 6
 
 type A64Code = {
     sym: str,
@@ -85,7 +89,7 @@ fn adjust_sp(inout e: Emit, n: i64, down: bool) -> () ! str {
 fn sym_text(symk: i64, id: i64, callee_sym: [str], rt_names: [str]) -> str {
     if symk == vcode.SYM_FN {
         if id >= 0 and id < callee_sym.len() { callee_sym[id] } else { "?" }
-    } else if symk == vcode.SYM_RT {
+    } else if symk == vcode.SYM_RT or symk == vcode.SYM_GOT {
         if id >= 0 and id < rt_names.len() { "_" + rt_names[id] } else { "?" }
     } else if symk == vcode.SYM_STR {
         "l_.str.{id}"
@@ -222,6 +226,10 @@ pub fn emit(al: Alloc, sym: str, want_asm: bool, callee_sym: [str], rt_names: [s
                     kind = REL_PAGE21
                 } else if m == mach.A_ADDPO {
                     kind = REL_PAGEOFF12
+                } else if m == mach.A_ADRP_GOT {
+                    kind = REL_GOT_PAGE21
+                } else if m == mach.A_LDR_GOT {
+                    kind = REL_GOT_PAGEOFF12
                 } else {
                     fail("{sym}: {mach.form_name(m)} refers to a symbol it cannot be relocated against")
                 }

@@ -61,7 +61,14 @@ pub fn build(src: bytes) -> MirProg ! str {
             used.set(s, 1)
         }
     }
-    var lifts = Lifted{ key: {}, kind: [], elem: [], caps: [], capte: [], name: [] }
+    var lifts = Lifted{ key: {}, kind: [], elem: [], caps: [], capte: [], name: [], global: [] }
+    // Each `export fn`, by name ([T-EXPORT]).
+    var exports: Map[str, bool] = {}
+    for r in t.roots {
+        if sexp.kw(t, r) == "export" {
+            exports.set(sexp.word(t, r, 1), true)
+        }
+    }
     var q = 0
     var done_own = false
     while true {
@@ -91,6 +98,12 @@ pub fn build(src: bytes) -> MirProg ! str {
             let k = c - nc
             if lifts.kind[k] == lower.LIFT_CLOSURE {
                 v = lower.lower_lifted_closure(info, lifts.elem[k], lifts.caps[k], lifts.capte[k])
+            } else if lifts.kind[k] == lower.LIFT_WORKER {
+                v = lower.lower_worker(lifts.elem[k])
+            } else if lifts.kind[k] == lower.LIFT_EXTERN {
+                v = lower.lower_extern_wrapper(info, lifts.elem[k])
+            } else if lifts.kind[k] == lower.LIFT_CENTRY {
+                v = lower.lower_centry(info, lifts.elem[k])
             } else {
                 v = lower.lower_wrapper(info, lifts.elem[k])
             }
@@ -107,39 +120,13 @@ pub fn build(src: bytes) -> MirProg ! str {
         for i in 0..v.op.len() {
             if v.op[i] == ir.M_FNADDR {
                 let li = v.imm[i]
-                let lk = v.lift_kind[li]
-                let le = v.lift_elem[li]
-                let key = if lk == lower.LIFT_CLOSURE { "c{le}" } else { "w{le}" }
-                v.imm[i] = match lifts.key.get(key) {
-                    Some(id) -> id
-                    None -> {
-                        let id = nc + lifts.kind.len()
-                        lifts.key.set(key, id)
-                        lifts.kind.push(lk)
-                        lifts.elem.push(le)
-                        lifts.caps.push(v.lift_caps[li])
-                        lifts.capte.push(v.lift_capte[li])
-                        var base = ""
-                        if lk == lower.LIFT_CLOSURE {
-                            let at = lower.closure_at(t, le)
-                            lifts.name.push("{name}::<closure@{at}>")
-                            base = "_gc_" + sym.substr(3, sym.len() - 3) + "_{at}"
-                        } else {
-                            lifts.name.push("{info.c_name[le]} as a value")
-                            base = "_gv_" + info.sym[le].substr(3, info.sym[le].len() - 3)
-                        }
-                        var s = base
-                        var n = 2
-                        while used.has(s) {
-                            s = base + "_{n}"
-                            n += 1
-                        }
-                        used.set(s, 1)
-                        callee_sym.push(s)
-                        id
-                    }
-                }
+                v.imm[i] = register(lifts, callee_sym, used, info, nc, exports, v.lift_kind[li], v.lift_elem[li], v.lift_caps[li], v.lift_capte[li], name, sym)
             }
+        }
+        // An `export fn` has its C entry whether or not its address is
+        // taken: C finds it by name ([T-EXPORT]).
+        if c >= 0 and c < nc and exports.has(info.c_name[c]) and lower.c_compatible(info, c) {
+            register(lifts, callee_sym, used, info, nc, exports, lower.LIFT_CENTRY, c, [], [], name, sym)
         }
         // String literals go into one pool for the object, each once.
         for i in 0..v.op.len() {
@@ -178,7 +165,7 @@ pub fn build(src: bytes) -> MirProg ! str {
                 v.imm[i] = g
             }
             // So do the runtime functions it names, after the fixed ones.
-            if v.op[i] == ir.M_CALLRT and v.imm[i] >= ir.RT_COUNT {
+            if (v.op[i] == ir.M_CALLRT or v.op[i] == ir.M_GOTADDR) and v.imm[i] >= ir.RT_COUNT {
                 let name = v.rts[v.imm[i] - ir.RT_COUNT]
                 let g = match rt_ix.get(name) {
                     Some(k) -> k
@@ -192,7 +179,10 @@ pub fn build(src: bytes) -> MirProg ! str {
                 v.imm[i] = g
             }
         }
-        let f = try ssa.to_ssa(v, name, sym)
+        var f = try ssa.to_ssa(v, name, sym)
+        if c >= nc and lifts.global[c - nc] {
+            f.global = true
+        }
         fns.push(f)
     }
     if errors.len() > 0 {
@@ -210,6 +200,67 @@ type Lifted = {
     caps: [[i64]],
     capte: [[i64]],
     name: [str],
+    /// Whether its symbol is global: an `export fn`'s C entry.
+    global: [bool],
+}
+
+/// The callable id of lifted function `(lk, le)`, made the first time it is
+/// asked for: its kind, element and captures recorded, and a symbol of its
+/// own given it. `name` and `sym` are the function asking, which names a
+/// closure lifted from it.
+fn register(inout lifts: Lifted, inout callee_sym: [str], inout used: Map[str, i64], info: TirInfo, nc: i64, exports: Map[str, bool], lk: i64, le: i64, caps: [i64], capte: [i64], name: str, sym: str) -> i64 {
+    let t = info.t
+    let key = if lk == lower.LIFT_CLOSURE { "c{le}" } else if lk == lower.LIFT_WORKER { "k{le}" } else if lk == lower.LIFT_EXTERN { "x{le}" } else if lk == lower.LIFT_CENTRY { "e{le}" } else { "w{le}" }
+    match lifts.key.get(key) {
+        Some(id) -> id
+        None -> {
+            let id = nc + lifts.kind.len()
+            lifts.key.set(key, id)
+            lifts.kind.push(lk)
+            lifts.elem.push(le)
+            lifts.caps.push(caps)
+            lifts.capte.push(capte)
+            var global = false
+            var base = ""
+            if lk == lower.LIFT_CLOSURE {
+                let at = lower.closure_at(t, le)
+                lifts.name.push("{name}::<closure@{at}>")
+                base = "_gc_" + sym.substr(3, sym.len() - 3) + "_{at}"
+            } else if lk == lower.LIFT_WORKER {
+                // One per pair of element and result classes, whoever asked
+                // for it first.
+                lifts.name.push("<parallel worker {le}>")
+                base = "_gw_worker_{le}"
+            } else if lk == lower.LIFT_EXTERN {
+                let xn = sexp.word(t, le, 1)
+                lifts.name.push("{xn} as a value")
+                base = "_gv_" + prog.sanitize(xn.replace("::", "_"))
+            } else if lk == lower.LIFT_CENTRY {
+                lifts.name.push("{info.c_name[le]} from C")
+                if exports.has(info.c_name[le]) {
+                    // An export's entry is C's: its own name, global.
+                    let parts = info.c_name[le].split("::")
+                    base = "_" + parts[parts.len() - 1]
+                    global = true
+                } else {
+                    base = "_gx_" + info.sym[le].substr(3, info.sym[le].len() - 3)
+                }
+            } else {
+                lifts.name.push("{info.c_name[le]} as a value")
+                base = "_gv_" + info.sym[le].substr(3, info.sym[le].len() - 3)
+            }
+            lifts.global.push(global)
+            var s = base
+            var n = 2
+            while used.has(s) {
+                s = base + "_{n}"
+                n += 1
+            }
+            used.set(s, 1)
+            callee_sym.push(s)
+            id
+        }
+    }
 }
 
 /// Text `s`'s index in the string pool, adding it once.

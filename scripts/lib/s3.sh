@@ -100,5 +100,9 @@ fi
 # small for agreement on it to mean much. 37 programs were in when the gates
 # were written (2026-10-21), 289 once part two added heap values and
 # fallible functions, 474 once part three added doubles, function values and
-# generics (both 2026-10-22); a shrinking subset should be noticed.
-S3_SUBSET_FLOOR=450
+# generics (both 2026-10-22), and 648 -- every program with a `main` that
+# does not link a system library -- once part four added the rest
+# (2026-10-25); a shrinking subset should be noticed. `s3rc` holds the
+# programs that reach its leak check to the same floor, and 25 of the 648
+# end by design before it (a panic, an `exit`), so the floor sits below 623.
+S3_SUBSET_FLOOR=620

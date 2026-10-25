@@ -52,6 +52,10 @@ pub let R_UNSIGNED = 0
 pub let R_BRANCH26 = 2
 pub let R_PAGE21 = 3
 pub let R_PAGEOFF12 = 4
+/// A symbol's slot in the global offset table: its page, pc-relative, and
+/// its offset in the page (`ARM64_RELOC_GOT_LOAD_PAGE21`, `_PAGEOFF12`).
+pub let R_GOT_PAGE21 = 5
+pub let R_GOT_PAGEOFF12 = 6
 
 pub fn new_obj() -> MoObj {
     MoObj{
@@ -278,36 +282,38 @@ pub fn write(o: MoObj) -> bytes ! str {
     }
     pad_to(strtab, 8)
 
-    // Relocations, last address first, as clang writes them.
+    // Relocations, last address first, as clang writes them. Each is sorted
+    // by its address with its own position in the low 24 bits of the key: a
+    // program of a hundred thousand calls has a hundred thousand of them.
     var order: [i64] = []
     for k in 0..o.rel_off.len() {
         order.push(k)
     }
     var keys: [i64] = []
     for k in order {
-        keys.push(o.rel_off[k] * 65536 + k)
+        keys.push(o.rel_off[k] * 16777216 + k)
     }
     keys.sort()
     var rels = byte_builder()
     var q = keys.len() - 1
     while q >= 0 {
-        let k = keys[q].bit_and(65535)
+        let k = keys[q].bit_and(16777215)
         let sym = defined.get(o.rel_sym[k]) ?? -1
         if sym < 0 {
             fail("relocation against `{o.rel_sym[k]}`, which has no symbol")
         }
         let kind = o.rel_kind[k]
         var pcrel = 0
-        if kind == R_BRANCH26 or kind == R_PAGE21 {
+        if kind == R_BRANCH26 or kind == R_PAGE21 or kind == R_GOT_PAGE21 {
             pcrel = 1
-        } else if kind != R_PAGEOFF12 {
+        } else if kind != R_PAGEOFF12 and kind != R_GOT_PAGEOFF12 {
             fail("relocation kind {kind} is not one this writer knows")
         }
         put32(rels, o.rel_off[k])
         put32(rels, sym.bit_or(pcrel.shl(24)).bit_or(2.shl(25)).bit_or(1.shl(27)).bit_or(kind.shl(28)))
         q -= 1
     }
-    if o.rel_off.len() >= 65536 {
+    if o.rel_off.len() >= 16777216 {
         fail("too many relocations ({o.rel_off.len()})")
     }
     // The data's pointers: 64-bit absolute (ARM64_RELOC_UNSIGNED, length 3),
@@ -317,16 +323,16 @@ pub fn write(o: MoObj) -> bytes ! str {
         if o.wrel_off[k] % 8 != 0 or o.wrel_off[k] + 8 > data_size {
             fail("data relocation at {o.wrel_off[k]} is not an aligned word of `__data`")
         }
-        dkeys.push(o.wrel_off[k] * 65536 + k)
+        dkeys.push(o.wrel_off[k] * 16777216 + k)
     }
     dkeys.sort()
-    if o.wrel_off.len() >= 65536 {
+    if o.wrel_off.len() >= 16777216 {
         fail("too many data relocations ({o.wrel_off.len()})")
     }
     var drels = byte_builder()
     var dq = dkeys.len() - 1
     while dq >= 0 {
-        let k = dkeys[dq].bit_and(65535)
+        let k = dkeys[dq].bit_and(16777215)
         let sym = defined.get(o.wrel_sym[k]) ?? -1
         if sym < 0 {
             fail("data relocation against `{o.wrel_sym[k]}`, which has no symbol")

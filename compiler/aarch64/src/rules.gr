@@ -48,6 +48,9 @@ pub let S_SP = 6
 /// The operands of the comparison a branch absorbed.
 pub let S_IA = 7
 pub let S_IB = 8
+/// The third operand, of an operation that has one (`ir.has_cargs`): a
+/// compare-and-swap's new value.
+pub let S_C = 9
 
 // Immediates: a literal when non-negative, else computed.
 pub let K_B = -1
@@ -79,6 +82,8 @@ pub let Y_NONE = 0
 pub let Y_FN = 1
 pub let Y_STR = 3
 pub let Y_DATA = 4
+/// A C function, through the global offset table ([T-FN-ADDR]).
+pub let Y_GOT = 5
 
 // Guards.
 pub let G_ANY = 0
@@ -252,6 +257,11 @@ pub fn rules() -> [Rule] {
     var fpageoff = t(mach.A_ADDPO, S_RES, S_RES, S_NONE)
     fpageoff.sym = Y_FN
     rs.push(r("fnaddr", ir.M_FNADDR, G_ANY, [fadrp, fpageoff]))
+    var gadrp = t(mach.A_ADRP_GOT, S_RES, S_NONE, S_NONE)
+    gadrp.sym = Y_GOT
+    var gldr = t(mach.A_LDR_GOT, S_RES, S_RES, S_NONE)
+    gldr.sym = Y_GOT
+    rs.push(r("gotaddr", ir.M_GOTADDR, G_ANY, [gadrp, gldr]))
     rs.push(r("getsp", ir.M_GETSP, G_ANY, [ti(mach.A_ADDI, S_RES, S_SP, 0, 0)]))
     rs.push(r("slotaddr", ir.M_SLOTADDR, G_ANY, [ti(mach.A_ADDI, S_RES, S_SP, K_SLOT, 0)]))
     rs.push(r("load", ir.M_LOAD, G_ANY, [ti(mach.A_LDR, S_RES, S_A, 0, 0)]))
@@ -278,6 +288,34 @@ pub fn rules() -> [Rule] {
     rs.push(unary("fcvtzu", ir.M_FCVTZU, mach.A_FCVTZU))
     rs.push(unary("fbits", ir.M_FBITS, mach.A_FMOV_XD))
     rs.push(unary("ffrombits", ir.M_FFROMBITS, mach.A_FMOV_DX))
+    // Bits ([L-LIB-BITS-WIDTH]): one instruction each, the narrow widths
+    // done around them by the lowering.
+    rs.push(unary("clz", ir.M_CLZ, mach.A_CLZ))
+    rs.push(unary("rbit", ir.M_RBIT, mach.A_RBIT))
+    rs.push(unary("bswap64", ir.M_BSWAP64, mach.A_REV))
+    rs.push(unary("bswap16", ir.M_BSWAP16, mach.A_REV16W))
+    rs.push(unary("bswap32", ir.M_BSWAP32, mach.A_REVW))
+    rs.push(plain("rotr", ir.M_ROTR, mach.A_RORV))
+    // Raw memory ([L-LIB-MEM]): each access at offset 0 of its address.
+    rs.push(r("load8u", ir.M_LOAD8U, G_ANY, [ti(mach.A_LDRB, S_RES, S_A, 0, 0)]))
+    rs.push(r("load8s", ir.M_LOAD8S, G_ANY, [ti(mach.A_LDRSB, S_RES, S_A, 0, 0)]))
+    rs.push(r("load16u", ir.M_LOAD16U, G_ANY, [ti(mach.A_LDRH, S_RES, S_A, 0, 0)]))
+    rs.push(r("load16s", ir.M_LOAD16S, G_ANY, [ti(mach.A_LDRSH, S_RES, S_A, 0, 0)]))
+    rs.push(r("load32u", ir.M_LOAD32U, G_ANY, [ti(mach.A_LDRW, S_RES, S_A, 0, 0)]))
+    rs.push(r("load32s", ir.M_LOAD32S, G_ANY, [ti(mach.A_LDRSW, S_RES, S_A, 0, 0)]))
+    rs.push(r("store8", ir.M_STORE8, G_ANY, [ti(mach.A_STRB, S_B, S_A, 0, 0)]))
+    rs.push(r("store16", ir.M_STORE16, G_ANY, [ti(mach.A_STRH, S_B, S_A, 0, 0)]))
+    rs.push(r("store32", ir.M_STORE32, G_ANY, [ti(mach.A_STRW, S_B, S_A, 0, 0)]))
+    // Atomics ([L-LIB-ATOMIC]), all sequentially consistent. A
+    // compare-and-swap reads the expected value in the register it answers
+    // in, so the expected value is moved there first.
+    let widths = ["8", "16", "32", "64"]
+    for k in 0..4 {
+        rs.push(r("aload" + widths[k], ir.M_ALOAD8 + k, G_ANY, [t(mach.A_LDARB + k, S_RES, S_A, S_NONE)]))
+        rs.push(r("astore" + widths[k], ir.M_ASTORE8 + k, G_ANY, [t(mach.A_STLRB + k, S_B, S_A, S_NONE)]))
+        rs.push(r("aadd" + widths[k], ir.M_AADD8 + k, G_ANY, [t(mach.A_LDADDALB + k, S_RES, S_A, S_B)]))
+        rs.push(r("acas" + widths[k], ir.M_ACAS8 + k, G_ANY, [t(mach.A_MOV, S_RES, S_NONE, S_B), t(mach.A_CASALB + k, S_RES, S_A, S_C)]))
+    }
     rs.push(r("fload", ir.M_FLOAD, G_ANY, [ti(mach.A_FLDR, S_RES, S_A, 0, 0)]))
     rs.push(r("fstore", ir.M_FSTORE, G_ANY, [ti(mach.A_FSTR, S_B, S_A, 0, 0)]))
 
@@ -301,12 +339,24 @@ pub fn ruled_ops() -> [i64] {
         ir.M_ICONST, ir.M_ADD, ir.M_SUB, ir.M_MUL, ir.M_SDIV, ir.M_UDIV, ir.M_SREM, ir.M_UREM,
         ir.M_AND, ir.M_OR, ir.M_XOR, ir.M_SHL, ir.M_SSHR, ir.M_USHR, ir.M_NEG, ir.M_NOT,
         ir.M_SEXT8, ir.M_SEXT16, ir.M_SEXT32, ir.M_UEXT8, ir.M_UEXT16, ir.M_UEXT32,
-        ir.M_ICMP, ir.M_STRADDR, ir.M_DATAADDR, ir.M_FNADDR, ir.M_GETSP, ir.M_SLOTADDR, ir.M_LOAD, ir.M_STORE,
+        ir.M_ICMP, ir.M_STRADDR, ir.M_DATAADDR, ir.M_FNADDR, ir.M_GOTADDR, ir.M_GETSP, ir.M_SLOTADDR, ir.M_LOAD, ir.M_STORE,
         ir.M_FCONST, ir.M_FADD, ir.M_FSUB, ir.M_FMUL, ir.M_FDIV, ir.M_FNEG, ir.M_FABS, ir.M_FSQRT,
         ir.M_FFLOOR, ir.M_FCEIL, ir.M_FCMP, ir.M_SCVTF, ir.M_UCVTF, ir.M_FCVTZS, ir.M_FCVTZU,
         ir.M_FBITS, ir.M_FFROMBITS, ir.M_FLOAD, ir.M_FSTORE,
+        ir.M_CLZ, ir.M_RBIT, ir.M_BSWAP64, ir.M_BSWAP16, ir.M_BSWAP32, ir.M_ROTR,
+        ir.M_LOAD8U, ir.M_LOAD8S, ir.M_LOAD16U, ir.M_LOAD16S, ir.M_LOAD32U, ir.M_LOAD32S,
+        ir.M_STORE8, ir.M_STORE16, ir.M_STORE32,
+        ir.M_ALOAD8, ir.M_ALOAD8 + 1, ir.M_ALOAD8 + 2, ir.M_ALOAD64,
+        ir.M_ASTORE8, ir.M_ASTORE8 + 1, ir.M_ASTORE8 + 2, ir.M_ASTORE64,
+        ir.M_AADD8, ir.M_AADD8 + 1, ir.M_AADD8 + 2, ir.M_AADD64,
+        ir.M_ACAS8, ir.M_ACAS8 + 1, ir.M_ACAS8 + 2, ir.M_ACAS64,
         ir.M_BRIF, ir.M_JUMP, ir.M_TRAP,
     ]
+}
+
+/// The operations with no result: the stores and the terminators.
+fn no_result(op: i64) -> bool {
+    op == ir.M_STORE or op == ir.M_FSTORE or (op >= ir.M_STORE8 and op <= ir.M_STORE32) or (op >= ir.M_ASTORE8 and op <= ir.M_ASTORE64) or op == ir.M_BRIF or op == ir.M_JUMP or op == ir.M_TRAP
 }
 
 fn binary_op(op: i64) -> bool {
@@ -344,7 +394,7 @@ fn sel_class(op: i64, g: i64, s: i64) -> i64 {
     if s == S_IA or s == S_IB {
         return if guard_ffuses(g) { 1 } else { 0 }
     }
-    if s == S_ZR or s == S_SP {
+    if s == S_ZR or s == S_SP or s == S_C {
         return 0
     }
     -1
@@ -461,6 +511,9 @@ pub fn check(rs: [Rule]) -> [str] {
                     if s == S_B and guard_reads_b(ri.guard) {
                         problems.push("rule {ri.name}: reads b as a register though its guard took it as an immediate")
                     }
+                    if s == S_C and not ir.has_cargs(ri.op) {
+                        problems.push("rule {ri.name}: reads a third operand its operation does not have")
+                    }
                     if (s == S_IA or s == S_IB) and not (guard_fuses(ri.guard) or guard_ffuses(ri.guard)) {
                         problems.push("rule {ri.name}: reads an absorbed comparison it has not absorbed")
                     }
@@ -519,11 +572,11 @@ pub fn check(rs: [Rule]) -> [str] {
             if branch != (tm.tgt != T_NONE) {
                 problems.push("rule {ri.name}: {mach.form_name(m)} and its branch target disagree")
             }
-            if (m == mach.A_ADRP or m == mach.A_ADDPO) != (tm.sym != Y_NONE) {
+            if (m == mach.A_ADRP or m == mach.A_ADDPO or m == mach.A_ADRP_GOT or m == mach.A_LDR_GOT) != (tm.sym != Y_NONE) {
                 problems.push("rule {ri.name}: {mach.form_name(m)} and its symbol disagree")
             }
         }
-        if ri.op != ir.M_STORE and ri.op != ir.M_FSTORE and ri.op != ir.M_BRIF and ri.op != ir.M_JUMP and ri.op != ir.M_TRAP and not defined_res {
+        if not no_result(ri.op) and not defined_res {
             problems.push("rule {ri.name} never writes its result")
         }
     }

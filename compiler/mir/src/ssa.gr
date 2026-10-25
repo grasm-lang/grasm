@@ -39,7 +39,7 @@ fn reads_of(v: Vir, i: i64) -> [i64] {
     if n >= 2 {
         out.push(v.b[i])
     }
-    if op == ir.M_CALL or op == ir.M_CALLRT or op == ir.M_CALLIND {
+    if ir.has_cargs(op) {
         for j in v.ca0[i]..(v.ca0[i] + v.can[i]) {
             out.push(v.cargs[j])
         }
@@ -309,7 +309,7 @@ pub fn to_ssa(v: Vir, name: str, sym: str) -> MirFn ! str {
                 continue
             }
             let ca0 = f.cargs.len()
-            if op == ir.M_CALL or op == ir.M_CALLRT or op == ir.M_CALLIND {
+            if ir.has_cargs(op) {
                 for j in v.ca0[i]..(v.ca0[i] + v.can[i]) {
                     let x = v.cargs[j]
                     if stamp[x] != nbi {

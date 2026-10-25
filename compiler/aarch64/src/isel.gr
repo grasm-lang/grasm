@@ -220,6 +220,13 @@ fn plan(f: MirFn, rs: [Rule]) -> Sel ! str {
             bump(s, f.a[i])
         } else {
             count_rule(f, s, rs[s.rule_of[i]], f.a[i], f.b[i], -1, -1)
+            // A third operand (a compare-and-swap's new value) is read once,
+            // in a register, by its rule.
+            if ir.has_cargs(op) {
+                for j in f.ca0[i]..(f.ca0[i] + f.can[i]) {
+                    bump(s, f.cargs[j])
+                }
+            }
         }
     }
     for b in 0..nb {
@@ -280,7 +287,7 @@ fn vr(v: i64) -> i64 {
     if v < 0 { -1 } else { mach.VR + v }
 }
 
-fn sel_reg(sel: i64, res: i64, a: i64, b: i64, t0: i64, ia: i64, ib: i64) -> i64 {
+fn sel_reg(sel: i64, res: i64, a: i64, b: i64, t0: i64, ia: i64, ib: i64, c: i64) -> i64 {
     match sel {
         1 -> vr(res)
         2 -> vr(a)
@@ -290,6 +297,7 @@ fn sel_reg(sel: i64, res: i64, a: i64, b: i64, t0: i64, ia: i64, ib: i64) -> i64
         6 -> mach.R_SP
         7 -> vr(ia)
         8 -> vr(ib)
+        9 -> vr(c)
         _ -> -1
     }
 }
@@ -316,6 +324,11 @@ fn expand(inout vc: VCode, f: MirFn, s: Sel, ru: Rule, ccm: [i64], fccm: [i64], 
         ia = f.a[j]
         ib = f.b[j]
     }
+    // A third operand, for the operation that has one.
+    var c3 = -1
+    if i >= 0 and ir.has_cargs(f.op[i]) and f.can[i] > 0 {
+        c3 = f.cargs[f.ca0[i]]
+    }
     // The temporary, of the class of the field it is first named in.
     var t0 = -1
     for tm in ru.emit {
@@ -327,10 +340,10 @@ fn expand(inout vc: VCode, f: MirFn, s: Sel, ru: Rule, ccm: [i64], fccm: [i64], 
         }
     }
     for tm in ru.emit {
-        let d = sel_reg(tm.d, res, a, b, t0, ia, ib)
-        let n = sel_reg(tm.n, res, a, b, t0, ia, ib)
-        let m = sel_reg(tm.m, res, a, b, t0, ia, ib)
-        let ra = sel_reg(tm.a, res, a, b, t0, ia, ib)
+        let d = sel_reg(tm.d, res, a, b, t0, ia, ib, c3)
+        let n = sel_reg(tm.n, res, a, b, t0, ia, ib, c3)
+        let m = sel_reg(tm.m, res, a, b, t0, ia, ib, c3)
+        let ra = sel_reg(tm.a, res, a, b, t0, ia, ib, c3)
         var imms: [i64] = []
         for k in [tm.imm, tm.imm2] {
             if k >= 0 {
@@ -397,6 +410,9 @@ fn expand(inout vc: VCode, f: MirFn, s: Sel, ru: Rule, ccm: [i64], fccm: [i64], 
             vc.sym_id[x] = own_imm
         } else if tm.sym == rules.Y_DATA {
             vc.symk[x] = vcode.SYM_DATA
+            vc.sym_id[x] = own_imm
+        } else if tm.sym == rules.Y_GOT {
+            vc.symk[x] = vcode.SYM_GOT
             vc.sym_id[x] = own_imm
         }
     }
