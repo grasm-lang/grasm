@@ -1063,23 +1063,41 @@ def ffmpeg_view(samples, tag, table):
     else:
         out = list(samples[:table])
     frag = list(samples[table:])
-    # FFmpeg leaves the last ctts entry (the trailing run of one offset)
-    # out of the shift, as a guard against files that end badly.
+    # FFmpeg leaves the last *two* ctts entries out of the shift -- each
+    # entry is a run of one offset -- as a guard against files that end badly
+    # (mov_read_ctts updates the shift only `if (i+2<entries)`). This model
+    # left out one, which agrees with ffprobe until the second-to-last run
+    # holds the most negative offset: a five-frame `+negative_cts_offsets`
+    # file has ctts 0, 4096, -2048 x2, 0, and ffprobe moves nothing back
+    # where the model moved the first decode time to -2048.
     by_dts = sorted(out, key=lambda s: s[2])
     tail = len(by_dts)
-    while tail > 0 and by_dts[tail - 1][3] - by_dts[tail - 1][2] == by_dts[-1][3] - by_dts[-1][2]:
-        tail -= 1
+    for _ in range(2):
+        run = by_dts[tail - 1][3] - by_dts[tail - 1][2] if tail else None
+        while tail > 0 and by_dts[tail - 1][3] - by_dts[tail - 1][2] == run:
+            tail -= 1
     back = max([0] + [s[2] - s[3] for s in by_dts[:tail]])
     forward = max([0] + [s[2] - s[3] for s in frag])
     return [(s[0], s[1], s[2] - back, s[3], s[4], s[5]) for s in out] + \
         [(s[0], s[1], s[2], s[3] + forward, s[4], s[5]) for s in frag]
 
 
-for i in range(len(MP4_VARIANTS) * 2):
-    fmt, codecs, flags = MP4_VARIANTS[i % len(MP4_VARIANTS)]
-    seconds = round(rng.uniform(0.3, 2.5), 2)
-    inputs = av_inputs(seconds, video=fmt != "ipod", rate=rng.choice([8000, 22050, 44100, 48000]), ch=rng.choice([1, 2]),
-                       size=rng.choice(["64x48", "32x32", "96x64"]), fps=rng.choice([5, 10, 25]))
+# Each variant twice at random sizes, then one fixed file: five frames of
+# `+negative_cts_offsets` (variant 11), whose ctts ends 0, 4096, -2048 x2, 0
+# -- the shape where FFmpeg's guard leaves out the second-to-last run too. A
+# random seed reached it once in several hundred runs.
+MP4_PINNED = [(11, 1.0, 8000, 1, "64x48", 5)]
+for i in range(len(MP4_VARIANTS) * 2 + len(MP4_PINNED)):
+    if i < len(MP4_VARIANTS) * 2:
+        fmt, codecs, flags = MP4_VARIANTS[i % len(MP4_VARIANTS)]
+        seconds = round(rng.uniform(0.3, 2.5), 2)
+        inputs = av_inputs(seconds, video=fmt != "ipod", rate=rng.choice([8000, 22050, 44100, 48000]), ch=rng.choice([1, 2]),
+                           size=rng.choice(["64x48", "32x32", "96x64"]), fps=rng.choice([5, 10, 25]))
+    else:
+        v, seconds, rate, ch, size, fps = MP4_PINNED[i - len(MP4_VARIANTS) * 2]
+        i = v
+        fmt, codecs, flags = MP4_VARIANTS[v]
+        inputs = av_inputs(seconds, video=fmt != "ipod", rate=rate, ch=ch, size=size, fps=fps)
     out = path_for(f"v{i % len(MP4_VARIANTS)}." + ("mp4" if fmt in ("mp4", "ipod", "ismv") else "mov"))
     ffmpeg(*inputs, *codecs, *flags, "-strict", "-1", "-f", fmt, out)
     d = probe(out, "-ignore_editlist", "1", "-show_packets", "-show_streams")
