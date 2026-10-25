@@ -14,7 +14,7 @@ set -uo pipefail
 cd "$(dirname "$0")/.."
 GRASM=${GRASM:-./target/release/grasm}
 . "$(dirname "$0")/lib/fresh.sh"
-fresh_or_stop "$GRASM"
+fresh_or_stop "./target/release/grasm"
 . "$(dirname "$0")/lib/corpus.sh"
 corpus_require
 
