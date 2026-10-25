@@ -98,6 +98,7 @@ fi
 
 # How many programs the rule has in; a floor below which the subset is too
 # small for agreement on it to mean much. 37 programs were in when the gates
-# were written (2026-10-21), 278 once part two added heap values and
-# fallible functions (2026-10-22); a shrinking subset should be noticed.
-S3_SUBSET_FLOOR=250
+# were written (2026-10-21), 289 once part two added heap values and
+# fallible functions, 474 once part three added doubles, function values and
+# generics (both 2026-10-22); a shrinking subset should be noticed.
+S3_SUBSET_FLOOR=450

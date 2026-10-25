@@ -59,19 +59,24 @@ pub let K_IMM = -6
 pub let K_SLOT = -7
 
 // Conditions: through the condition map, from the instruction itself or
-// from the comparison its branch absorbed.
+// from the comparison its branch absorbed; through the floating-point map
+// (`fcc_map`) for a comparison of doubles.
 pub let CC_NONE = -3
 pub let CC_OWN = -1
 pub let CC_INNER = -2
+pub let CC_FOWN = -4
+pub let CC_FINNER = -5
 
 // Branch targets.
 pub let T_NONE = 0
 pub let T_THEN = 1
 pub let T_ELSE = 2
 
-// Symbols: a string literal or a writable data object (a struct
-// descriptor) named by the instruction's `imm`.
+// Symbols: a compiled function (a function value's code), a string literal
+// or a writable data object (a struct descriptor) named by the
+// instruction's `imm`.
 pub let Y_NONE = 0
+pub let Y_FN = 1
 pub let Y_STR = 3
 pub let Y_DATA = 4
 
@@ -93,6 +98,8 @@ pub let G_FUSE_NIMM = 6
 pub let G_FUSE_ZERO_EQ = 7
 /// ... `ne` against zero.
 pub let G_FUSE_ZERO_NE = 8
+/// A `brif` on an `fcmp` in its block that nothing else reads.
+pub let G_FFUSE = 9
 
 pub fn guard_name(g: i64) -> str {
     match g {
@@ -105,6 +112,7 @@ pub fn guard_name(g: i64) -> str {
         6 -> "fuse-icmp b:-uimm12"
         7 -> "fuse-icmp eq 0"
         8 -> "fuse-icmp ne 0"
+        9 -> "fuse-fcmp"
         _ -> "?"
     }
 }
@@ -153,6 +161,21 @@ pub fn cc_map() -> [i64] {
         mach.C_LS,
         mach.C_HI,
         mach.C_HS,
+    ]
+}
+
+/// MIR's conditions on doubles, `CC_EQ` .. `CC_SGE`, as AArch64 condition
+/// codes read after `fcmp`. Not the integer ones: an unordered comparison
+/// (a NaN) sets C and V, so `lt` is `mi` (N alone) and `le` is `ls`, which
+/// both leave false, where the integer `lt` and `le` would read it as true.
+pub fn fcc_map() -> [i64] {
+    [
+        mach.C_EQ,
+        mach.C_NE,
+        mach.C_MI,
+        mach.C_LS,
+        mach.C_GT,
+        mach.C_GE,
     ]
 }
 
@@ -224,12 +247,42 @@ pub fn rules() -> [Rule] {
     var dpageoff = t(mach.A_ADDPO, S_RES, S_RES, S_NONE)
     dpageoff.sym = Y_DATA
     rs.push(r("dataaddr", ir.M_DATAADDR, G_ANY, [dadrp, dpageoff]))
+    var fadrp = t(mach.A_ADRP, S_RES, S_NONE, S_NONE)
+    fadrp.sym = Y_FN
+    var fpageoff = t(mach.A_ADDPO, S_RES, S_RES, S_NONE)
+    fpageoff.sym = Y_FN
+    rs.push(r("fnaddr", ir.M_FNADDR, G_ANY, [fadrp, fpageoff]))
     rs.push(r("getsp", ir.M_GETSP, G_ANY, [ti(mach.A_ADDI, S_RES, S_SP, 0, 0)]))
     rs.push(r("slotaddr", ir.M_SLOTADDR, G_ANY, [ti(mach.A_ADDI, S_RES, S_SP, K_SLOT, 0)]))
     rs.push(r("load", ir.M_LOAD, G_ANY, [ti(mach.A_LDR, S_RES, S_A, 0, 0)]))
     rs.push(r("store", ir.M_STORE, G_ANY, [ti(mach.A_STR, S_B, S_A, 0, 0)]))
 
+    // Doubles. A constant is its bits made in a general register and moved
+    // across; the comparison's condition goes through the floating-point map.
+    rs.push(r("fconst", ir.M_FCONST, G_ANY, [ti(mach.P_MOVIMM, S_T0, S_NONE, K_IMM, 0), t(mach.A_FMOV_DX, S_RES, S_T0, S_NONE)]))
+    rs.push(plain("fadd", ir.M_FADD, mach.A_FADD))
+    rs.push(plain("fsub", ir.M_FSUB, mach.A_FSUB))
+    rs.push(plain("fmul", ir.M_FMUL, mach.A_FMUL))
+    rs.push(plain("fdiv", ir.M_FDIV, mach.A_FDIV))
+    rs.push(unary("fneg", ir.M_FNEG, mach.A_FNEG))
+    rs.push(unary("fabs", ir.M_FABS, mach.A_FABS))
+    rs.push(unary("fsqrt", ir.M_FSQRT, mach.A_FSQRT))
+    rs.push(unary("ffloor", ir.M_FFLOOR, mach.A_FRINTM))
+    rs.push(unary("fceil", ir.M_FCEIL, mach.A_FRINTP))
+    var fcset = t(mach.A_CSET, S_RES, S_NONE, S_NONE)
+    fcset.cc = CC_FOWN
+    rs.push(r("fcmp", ir.M_FCMP, G_ANY, [t(mach.A_FCMP, S_NONE, S_A, S_B), fcset]))
+    rs.push(unary("scvtf", ir.M_SCVTF, mach.A_SCVTF))
+    rs.push(unary("ucvtf", ir.M_UCVTF, mach.A_UCVTF))
+    rs.push(unary("fcvtzs", ir.M_FCVTZS, mach.A_FCVTZS))
+    rs.push(unary("fcvtzu", ir.M_FCVTZU, mach.A_FCVTZU))
+    rs.push(unary("fbits", ir.M_FBITS, mach.A_FMOV_XD))
+    rs.push(unary("ffrombits", ir.M_FFROMBITS, mach.A_FMOV_DX))
+    rs.push(r("fload", ir.M_FLOAD, G_ANY, [ti(mach.A_FLDR, S_RES, S_A, 0, 0)]))
+    rs.push(r("fstore", ir.M_FSTORE, G_ANY, [ti(mach.A_FSTR, S_B, S_A, 0, 0)]))
+
     let b_else = tb(mach.A_B, S_NONE, CC_NONE, T_ELSE)
+    rs.push(r("brif-fcmp", ir.M_BRIF, G_FFUSE, [t(mach.A_FCMP, S_NONE, S_IA, S_IB), tb(mach.A_BCOND, S_NONE, CC_FINNER, T_THEN), b_else]))
     rs.push(r("brif-cbz", ir.M_BRIF, G_FUSE_ZERO_EQ, [tb(mach.A_CBZ, S_IA, CC_NONE, T_THEN), b_else]))
     rs.push(r("brif-cbnz", ir.M_BRIF, G_FUSE_ZERO_NE, [tb(mach.A_CBNZ, S_IA, CC_NONE, T_THEN), b_else]))
     rs.push(r("brif-cmp-imm", ir.M_BRIF, G_FUSE_IMM, [ti(mach.A_CMPI, S_NONE, S_IA, K_IB, 0), tb(mach.A_BCOND, S_NONE, CC_INNER, T_THEN), b_else]))
@@ -248,21 +301,53 @@ pub fn ruled_ops() -> [i64] {
         ir.M_ICONST, ir.M_ADD, ir.M_SUB, ir.M_MUL, ir.M_SDIV, ir.M_UDIV, ir.M_SREM, ir.M_UREM,
         ir.M_AND, ir.M_OR, ir.M_XOR, ir.M_SHL, ir.M_SSHR, ir.M_USHR, ir.M_NEG, ir.M_NOT,
         ir.M_SEXT8, ir.M_SEXT16, ir.M_SEXT32, ir.M_UEXT8, ir.M_UEXT16, ir.M_UEXT32,
-        ir.M_ICMP, ir.M_STRADDR, ir.M_DATAADDR, ir.M_GETSP, ir.M_SLOTADDR, ir.M_LOAD, ir.M_STORE,
+        ir.M_ICMP, ir.M_STRADDR, ir.M_DATAADDR, ir.M_FNADDR, ir.M_GETSP, ir.M_SLOTADDR, ir.M_LOAD, ir.M_STORE,
+        ir.M_FCONST, ir.M_FADD, ir.M_FSUB, ir.M_FMUL, ir.M_FDIV, ir.M_FNEG, ir.M_FABS, ir.M_FSQRT,
+        ir.M_FFLOOR, ir.M_FCEIL, ir.M_FCMP, ir.M_SCVTF, ir.M_UCVTF, ir.M_FCVTZS, ir.M_FCVTZU,
+        ir.M_FBITS, ir.M_FFROMBITS, ir.M_FLOAD, ir.M_FSTORE,
         ir.M_BRIF, ir.M_JUMP, ir.M_TRAP,
     ]
 }
 
 fn binary_op(op: i64) -> bool {
-    ir.nreads(op) == 2 and op < ir.M_JUMP
+    ir.nreads(op) == 2 and not ir.is_terminator(op)
 }
 
 fn guard_reads_b(g: i64) -> bool {
     g == G_B_UIMM12 or g == G_B_UIMM12_HI or g == G_B_NIMM12
 }
 
+/// A guard that absorbs an integer comparison into its branch.
 pub fn guard_fuses(g: i64) -> bool {
     g >= G_FUSE and g <= G_FUSE_ZERO_NE
+}
+
+/// A guard that absorbs a comparison of doubles into its branch.
+pub fn guard_ffuses(g: i64) -> bool {
+    g == G_FFUSE
+}
+
+/// The class a selector names in a rule for MIR `op` under guard `g`: 1 a
+/// double, 0 an integer, -1 nothing a class can be asked of (a temporary,
+/// whose class is the field it is first written in).
+fn sel_class(op: i64, g: i64, s: i64) -> i64 {
+    if s == S_RES {
+        return if ir.res_fp(op) { 1 } else { 0 }
+    }
+    if s == S_A {
+        // A branch's `a` is its condition, an integer.
+        return if op != ir.M_BRIF and ir.arg_fp(op, 0) { 1 } else { 0 }
+    }
+    if s == S_B {
+        return if ir.arg_fp(op, 1) { 1 } else { 0 }
+    }
+    if s == S_IA or s == S_IB {
+        return if guard_ffuses(g) { 1 } else { 0 }
+    }
+    if s == S_ZR or s == S_SP {
+        return 0
+    }
+    -1
 }
 
 /// The AArch64 condition a signed or unsigned MIR condition must become,
@@ -321,7 +406,7 @@ pub fn check(rs: [Rule]) -> [str] {
         if guard_reads_b(ri.guard) and not binary_op(ri.op) {
             problems.push("rule {ri.name}: guard {guard_name(ri.guard)} on an operation with no operand b")
         }
-        if guard_fuses(ri.guard) and ri.op != ir.M_BRIF {
+        if (guard_fuses(ri.guard) or guard_ffuses(ri.guard)) and ri.op != ir.M_BRIF {
             problems.push("rule {ri.name}: only a branch can absorb a comparison")
         }
         if ri.emit.is_empty() {
@@ -330,6 +415,8 @@ pub fn check(rs: [Rule]) -> [str] {
         // Templates: what each field may read and write.
         var defined_res = false
         var defined_t0 = false
+        // The temporary's class: the class of the field it is first written in.
+        var t0_class = -1
         for tm in ri.emit {
             let m = tm.mop
             if m != mach.P_MOVIMM and mach.form_name(m) == "?" {
@@ -342,6 +429,21 @@ pub fn check(rs: [Rule]) -> [str] {
                 let role = roles[k]
                 if role == mach.ROLE_NONE and s != S_NONE and not (m == mach.A_CBZ or m == mach.A_CBNZ) {
                     problems.push("rule {ri.name}: {mach.form_name(m)} has no operand {k} to fill")
+                }
+                // Register classes: what fills a field is of the field's file.
+                if s != S_NONE and role != mach.ROLE_NONE {
+                    let want = if mach.fp_field(m, k) { 1 } else { 0 }
+                    var have = sel_class(ri.op, ri.guard, s)
+                    if s == S_T0 {
+                        if t0_class < 0 {
+                            t0_class = want
+                        }
+                        have = t0_class
+                    }
+                    if have >= 0 and have != want {
+                        let fw = if want == 1 { "a floating-point" } else { "a general" }
+                        problems.push("rule {ri.name}: operand {k} of {mach.form_name(m)} is {fw} register, and what fills it is not")
+                    }
                 }
                 if role == mach.ROLE_DEF and not (s == S_RES or s == S_T0) {
                     problems.push("rule {ri.name}: {mach.form_name(m)} writes operand {k}, which must be the result or a temporary")
@@ -359,10 +461,10 @@ pub fn check(rs: [Rule]) -> [str] {
                     if s == S_B and guard_reads_b(ri.guard) {
                         problems.push("rule {ri.name}: reads b as a register though its guard took it as an immediate")
                     }
-                    if (s == S_IA or s == S_IB) and not guard_fuses(ri.guard) {
+                    if (s == S_IA or s == S_IB) and not (guard_fuses(ri.guard) or guard_ffuses(ri.guard)) {
                         problems.push("rule {ri.name}: reads an absorbed comparison it has not absorbed")
                     }
-                    if s == S_IB and ri.guard != G_FUSE {
+                    if s == S_IB and ri.guard != G_FUSE and ri.guard != G_FFUSE {
                         problems.push("rule {ri.name}: reads the comparison's b as a register though its guard took it as an immediate")
                     }
                 }
@@ -401,8 +503,14 @@ pub fn check(rs: [Rule]) -> [str] {
             if tm.cc == CC_INNER and not guard_fuses(ri.guard) {
                 problems.push("rule {ri.name}: takes the condition of a comparison it has not absorbed")
             }
+            if tm.cc == CC_FINNER and not guard_ffuses(ri.guard) {
+                problems.push("rule {ri.name}: takes the condition of a comparison of doubles it has not absorbed")
+            }
             if tm.cc == CC_OWN and ri.op != ir.M_ICMP {
-                problems.push("rule {ri.name}: only a comparison has a condition of its own")
+                problems.push("rule {ri.name}: only an integer comparison reads the integer condition map")
+            }
+            if tm.cc == CC_FOWN and ri.op != ir.M_FCMP {
+                problems.push("rule {ri.name}: only a comparison of doubles reads the floating-point condition map")
             }
             if (m == mach.A_CSET or m == mach.A_BCOND) and tm.cc == CC_NONE {
                 problems.push("rule {ri.name}: {mach.form_name(m)} needs a condition")
@@ -415,9 +523,12 @@ pub fn check(rs: [Rule]) -> [str] {
                 problems.push("rule {ri.name}: {mach.form_name(m)} and its symbol disagree")
             }
         }
-        if ri.op != ir.M_STORE and ri.op != ir.M_BRIF and ri.op != ir.M_JUMP and ri.op != ir.M_TRAP and not defined_res {
+        if ri.op != ir.M_STORE and ri.op != ir.M_FSTORE and ri.op != ir.M_BRIF and ri.op != ir.M_JUMP and ri.op != ir.M_TRAP and not defined_res {
             problems.push("rule {ri.name} never writes its result")
         }
+    }
+    for p in check_fcc(fcc_map()) {
+        problems.push(p)
     }
     // The condition map, checked against what the conditions mean: for
     // pairs of values at the edges of both orders, the AArch64 condition,
@@ -486,6 +597,80 @@ fn cond_holds(cond: i64, a: i64, b: i64) -> bool {
     let z = r == 0
     let cf = not ult(a, b)
     let v = (a < 0) != (b < 0) and (r < 0) != (a < 0)
+    flags_hold(cond, n, z, cf, v)
+}
+
+/// The floating-point condition map, checked as the integer one is: for
+/// pairs of doubles at the edges -- both zeros, both infinities, the
+/// smallest and largest finite values, a subnormal and a NaN -- the AArch64
+/// condition, read off the flags `fcmp a, b` sets, must hold exactly when
+/// the comparison does by IEEE 754: false for every ordered relation a NaN
+/// takes part in, true for `!=`. Grasm's own `f64` comparisons, which are
+/// IEEE's, are the reference. Each condition's inverse must also be what the
+/// emitter makes of `b.cc next; b other`.
+fn check_fcc(fm: [i64]) -> [str] {
+    var problems: [str] = []
+    if fm.len() != 6 {
+        problems.push("the floating-point condition map has {fm.len()} entries for 6 conditions")
+        return problems
+    }
+    let zero = 0.0
+    let nan = zero / zero
+    let inf = 1.0 / zero
+    let big = 0x7FEFFFFFFFFFFFFF.from_bits()
+    let tiny = 1.from_bits()
+    let vals = [0.0, -zero, 1.0, -1.0, 2.5, -2.5, inf, -inf, nan, big, -big, tiny, -tiny]
+    for c in 0..6 {
+        var wrong = 0
+        var example = ""
+        for a in vals {
+            for b in vals {
+                if fcond_holds(fm[c], a, b) != fmir_holds(c, a, b) {
+                    if wrong == 0 {
+                        example = "{a} vs {b}"
+                    }
+                    wrong += 1
+                }
+            }
+        }
+        if wrong > 0 {
+            problems.push("on doubles, {ir.cc_name(c)} maps to {mach.cond_name(fm[c])}, which disagrees on {wrong} pairs, first {example}")
+        }
+    }
+    problems
+}
+
+/// What a MIR condition on doubles says of `a` and `b`.
+fn fmir_holds(c: i64, a: f64, b: f64) -> bool {
+    match c {
+        0 -> a == b
+        1 -> a != b
+        2 -> a < b
+        3 -> a <= b
+        4 -> a > b
+        5 -> a >= b
+        _ -> false
+    }
+}
+
+/// Whether AArch64 condition `cond` holds after `fcmp a, b` (Arm ARM,
+/// FPCompare): equal sets Z and C, less sets N, greater sets C, and
+/// unordered sets C and V.
+fn fcond_holds(cond: i64, a: f64, b: f64) -> bool {
+    if a.is_nan() or b.is_nan() {
+        return flags_hold(cond, false, false, true, true)
+    }
+    if a == b {
+        return flags_hold(cond, false, true, true, false)
+    }
+    if a < b {
+        return flags_hold(cond, true, false, false, false)
+    }
+    flags_hold(cond, false, false, true, false)
+}
+
+/// Whether condition `cond` holds of flags N, Z, C, V.
+fn flags_hold(cond: i64, n: bool, z: bool, cf: bool, v: bool) -> bool {
     match cond {
         0 -> z
         1 -> not z
@@ -508,7 +693,7 @@ fn cond_holds(cond: i64, a: i64, b: i64) -> bool {
 /// Every opcode a rule can emit, with `P_MOVIMM` as what it expands to.
 pub fn rule_mops(rs: [Rule]) -> [i64] {
     var seen: [bool] = []
-    for m in 0..64 {
+    for m in 0..mach.NMOPS {
         seen.push(false)
     }
     for ru in rs {
@@ -517,13 +702,13 @@ pub fn rule_mops(rs: [Rule]) -> [i64] {
                 seen[mach.A_MOVZ] = true
                 seen[mach.A_MOVN] = true
                 seen[mach.A_MOVK] = true
-            } else if tm.mop < 64 {
+            } else if tm.mop < mach.NMOPS {
                 seen[tm.mop] = true
             }
         }
     }
     var out: [i64] = []
-    for m in 0..64 {
+    for m in 0..mach.NMOPS {
         if seen[m] {
             out.push(m)
         }

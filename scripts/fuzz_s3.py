@@ -23,6 +23,16 @@ do, from the whole subset (`scripts/s3_subset.py`) and nothing outside it:
     `let (a, b)`, options under `??`, and functions that can fail -- `fail`,
     `try` through each other, and their results matched as `Ok`/`Err` or
     under `??`;
+  * doubles (`FloatGen`): literals at the edges and NaN and the infinities,
+    arithmetic, every comparison as a value and as a branch with NaN among
+    the operands, conversions to and from every integer type and the bits,
+    the math methods, doubles in lists, structs, tuples, options, maps and
+    results, a call with twelve arguments (two doubles on the stack), and
+    twenty doubles live across calls;
+  * closures and function values (`ClosureGen`): captures of every kind,
+    closures stored and called, named functions as values, closures made by
+    functions, the higher-order list methods, `sort_by`, closures answering
+    `Ok`/`Err`, a closure making another;
   * now and then a deliberate panic, a failed `assert` or an `exit`.
 
 Each program must be in the subset by the rule, compile with the backend (a
@@ -454,14 +464,28 @@ class Gen:
         nheap = r.randint(1, 3)
         for k in range(nheap):
             lines += hg.function(f"heap{k}")
+        # Doubles, likewise.
+        fg = FloatGen(random.Random(r.random()))
+        lines += FLOAT_DECLS.split("\n")
+        nflt = r.randint(1, 2)
+        for k in range(nflt):
+            lines += fg.function(f"flt{k}")
+        # And closures.
+        cg = ClosureGen(random.Random(r.random()))
+        lines += CLOSURE_DECLS.split("\n")
+        nclo = r.randint(1, 2)
+        for k in range(nclo):
+            lines += cg.function(f"clo{k}")
         self.depth = 0
         body, _ = self.block([], r.randint(6, 14), budget=2)
         # Between two of main's own statements: before a line that starts
         # one, or at the end.
-        for k in range(nheap):
+        calls = ([f"heap{k}" for k in range(nheap)] + [f"flt{k}" for k in range(nflt)]
+                 + [f"clo{k}" for k in range(nclo)])
+        for name in calls:
             spots = [i for i, line in enumerate(body)
                      if line.startswith("    ") and line[4:5] not in (" ", "}")] + [len(body)]
-            body.insert(r.choice(spots), f"    heap{k}()")
+            body.insert(r.choice(spots), f"    {name}()")
         ending = []
         c = r.random()
         if c < 0.05:
@@ -695,6 +719,334 @@ class HeapGen:
                 f"print(\"{{{sl}}} {{{sl}.len()}} {{{sl}.join(\"+\")}}\")"]
 
 
+FLOAT_DECLS = """type Vec2 = { x: f64, y: f64, tag: i64 }
+
+fn fnan() -> f64 {
+    let z = 0.0
+    z / z
+}
+
+fn finf() -> f64 {
+    1.0 / 0.0
+}
+
+fn fmix(a: f64, b: i64, c: f64, d: f64, e: f64, f: f64, g: f64, h: f64, i: f64, j: f64, k: i64, l: f64) -> f64 {
+    a * 1.5 + b.as_f64() - c / 2.0 + d * e - f + g * h + i - j + k.as_f64() * l
+}
+
+fn fdiv(x: f64, y: f64) -> f64 ! str {
+    if y == 0.0 {
+        fail("divide {x} by zero")
+    }
+    x / y
+}
+
+fn fchain(x: f64, y: f64) -> f64 ! str {
+    let q = try fdiv(x, y)
+    let r = try fdiv(q, x - 1.0)
+    q + r
+}
+
+fn fscale(inout v: Vec2, by: f64) {
+    v.x *= by
+    v.y = v.y * by + 0.5
+    v.tag += 1
+}
+
+fn fsum(xs: [f64]) -> f64 {
+    var t = 0.0
+    for x in xs {
+        if x != x {
+            continue
+        }
+        t += x
+    }
+    t
+}
+"""
+
+FLOAT_LITS = ["0.0", "-0.0", "1.0", "-1.0", "0.5", "-2.5", "0.1", "3.0", "1e300", "-1e300",
+              "2.5e-3", "1e-310", "123456.789", "9007199254740993.0", "4.9e-324", "255.9", "-128.5",
+              "1.7976931348623157e308", "0.30000000000000004", "65535.5"]
+
+
+class FloatGen:
+    """Statements over `f64`: literals at the edges (both zeros, subnormals,
+    the largest finite values) and NaN and the infinities computed; the four
+    operations, `%` and `^`; every comparison, as a value and as a branch, NaN
+    among the operands; conversions to and from every integer type and to the
+    bits; the methods compiled as instructions and the ones the runtime does;
+    doubles in lists, structs (one changed through an `inout` parameter),
+    tuples, options, maps and results; a call with twelve arguments, ten of
+    them doubles, so two travel on the stack; and twenty doubles live across
+    calls, more than the registers a call preserves."""
+
+    def __init__(self, rng):
+        self.rng = rng
+        self.n = 0
+
+    def fresh(self, base):
+        self.n += 1
+        return f"{base}{self.n}"
+
+    def lit(self):
+        x = self.rng.choice(FLOAT_LITS)
+        return f"({x})" if x.startswith("-") else x
+
+    def leaf(self, fs):
+        r = self.rng.random()
+        if fs and r < 0.55:
+            return self.rng.choice(fs)
+        if r < 0.65:
+            return self.rng.choice(["fnan()", "finf()", "(-finf())"])
+        return self.lit()
+
+    def fexpr(self, fs, d=0):
+        r = self.rng
+        if d >= 3 or r.random() < 0.3:
+            return self.leaf(fs)
+        c = r.random()
+        if c < 0.45:
+            op = r.choice(["+", "-", "*", "/", "+", "*"])
+            return f"({self.fexpr(fs, d + 1)} {op} {self.fexpr(fs, d + 1)})"
+        if c < 0.52:
+            return f"({self.fexpr(fs, d + 1)} % {self.fexpr(fs, d + 1)})"
+        if c < 0.56:
+            return f"({self.fexpr(fs, d + 1)} ^ {r.choice(['2.0', '0.5', '-1.0', '3.0'])})"
+        if c < 0.64:
+            return f"(-{self.fexpr(fs, d + 1)})"
+        if c < 0.80:
+            m = r.choice(["abs", "sqrt", "floor", "ceil", "round", "sin", "exp", "ln"])
+            return f"{self.fexpr(fs, d + 1)}.{m}()"
+        if c < 0.86:
+            m = r.choice(["min", "max", "atan2", "hypot"])
+            return f"{self.fexpr(fs, d + 1)}.{m}({self.fexpr(fs, d + 1)})"
+        if c < 0.92:
+            return f"({r.randint(-9, 9)}).as_f64()"
+        cmp = r.choice(["<", "<=", ">", ">=", "==", "!="])
+        return (f"(if {self.fexpr(fs, d + 1)} {cmp} {self.fexpr(fs, d + 1)} "
+                f"{{ {self.fexpr(fs, d + 1)} }} else {{ {self.fexpr(fs, d + 1)} }})")
+
+    def function(self, name):
+        r = self.rng
+        lines = [f"fn {name}() {{"]
+        fs = []
+        for _ in range(r.randint(2, 4)):
+            v = self.fresh("g")
+            lines.append(f"    var {v}: f64 = {self.fexpr(fs)}")
+            fs.append(v)
+        for _ in range(r.randint(8, 14)):
+            lines += ["    " + x for x in self.stmt(fs)]
+        lines += ["}", ""]
+        return lines
+
+    def stmt(self, fs):
+        r = self.rng
+        c = r.random()
+        a = r.choice(fs)
+        b = r.choice(fs)
+        if c < 0.10:
+            v = self.fresh("g")
+            line = f"var {v}: f64 = {self.fexpr(fs)}"
+            fs.append(v)
+            return [line]
+        if c < 0.18:
+            op = r.choice(["=", "+=", "-=", "*=", "/="])
+            return [f"{a} {op} {self.fexpr(fs)}", f"print({a})"]
+        if c < 0.26:
+            return [f"print(\"{{{a} < {b}}} {{{a} <= {b}}} {{{a} > {b}}} {{{a} >= {b}}} {{{a} == {b}}} {{{a} != {b}}}\")"]
+        if c < 0.34:
+            cmp = r.choice(["<", "<=", ">", ">=", "==", "!="])
+            neg = r.choice(["", "not "])
+            return [f"if {neg}({a} {cmp} {b}) {{",
+                    f"    print(\"{self.fresh('br')} taken {{{a}}}\")",
+                    "} else {",
+                    f"    print(\"{self.fresh('br')} not taken {{{b}}}\")",
+                    "}"]
+        if c < 0.42:
+            return [f"print(\"{{{a}.as_i64()}} {{{a}.as_u64()}} {{{a}.as_u8()}} {{{a}.as_i8()}} {{{a}.as_i32()}} "
+                    f"{{{a}.as_u16()}} {{{a}.to_bits()}} {{{a}.to_bits().from_bits()}} {{{a}.is_nan()}} {{{a}.is_finite()}}\")"]
+        if c < 0.50:
+            n = r.randint(-300, 300)
+            u = r.randint(0, 2 ** 64 - 1)
+            ci = self.fresh("ci")
+            cu = self.fresh("cu")
+            return [f"let {ci}: i32 = {n}",
+                    f"let {cu}: u64 = {u}",
+                    f"print(\"{{{ci}.as_f64()}} {{{cu}.as_f64() / 3.0}} {{{a}.to_str()}} {{{a}.to_fixed({r.randint(0, 4)})}} {{{a}.cmp({b})}}\")"]
+        if c < 0.58:
+            xs = self.fresh("fl")
+            return [f"var {xs}: [f64] = [{a}, {self.fexpr(fs)}, {self.lit()}]",
+                    f"{xs}.push({b})",
+                    f"{xs}[{r.randint(0, 3)}] = {self.fexpr(fs)}",
+                    f"{xs}[0] += 1.5",
+                    f"print(\"{{{xs}}} {{{xs}.len()}} {{fsum({xs})}} {{{xs}[1]}}\")",
+                    f"{xs}.sort()",
+                    f"print(\"{{{xs}}} {{{xs}.contains({a})}}\")"]
+        if c < 0.66:
+            p = self.fresh("vv")
+            return [f"var {p} = Vec2{{ x: {a}, y: {self.fexpr(fs)}, tag: {r.randint(-3, 3)} }}",
+                    f"fscale({p}, {self.fexpr(fs)})",
+                    f"{p}.y -= {b}",
+                    f"var {p}s: [Vec2] = [{p}]",
+                    f"{p}s[0].x = {self.lit()}",
+                    f"fscale({p}s[0], 2.0)",
+                    f"print(\"{{{p}}} {{{p}.x + {p}.y}} {{{p}s}}\")"]
+        if c < 0.72:
+            t = self.fresh("ft")
+            return [f"let {t} = ({a}, {r.randint(0, 9)}, {b})",
+                    f"let ({t}a, {t}n, {t}b) = {t}",
+                    f"let {t}o: Option[f64] = if {t}n > 4 {{ Some({t}a) }} else {{ None }}",
+                    f"var {t}m: Map[str, f64] = {{}}",
+                    f"{t}m.set(\"k\", {t}b)",
+                    f"print(\"{{{t}}} {{{t}.0}} {{{t}a * {t}b}} {{{t}o ?? -1.0}} {{{t}m.get(\"k\") ?? 0.0}} {{{t}m}}\")"]
+        if c < 0.80:
+            return [f"match fdiv({a}, {r.choice([b, '0.0', self.lit()])}) {{",
+                    "    Ok(q) -> print(\"quotient {q}\")",
+                    "    Err(e) -> print(\"failed: {e}\")",
+                    "}",
+                    f"print(\"{{fchain({a}, {b}) ?? -9.5}}\")"]
+        if c < 0.88:
+            args = [self.fexpr(fs, 2) if k not in (1, 10) else str(r.randint(-5, 5)) for k in range(12)]
+            return [f"print(fmix({', '.join(args)}))"]
+        # Twenty doubles live across a call.
+        names = [self.fresh("h") for _ in range(20)]
+        out = []
+        for k, nm in enumerate(names):
+            out.append(f"let {nm} = {r.choice(fs)} * {k + 1}.0 + {self.lit()}")
+        margs = [("2" if k == 1 else "3" if k == 10 else names[k]) for k in range(12)]
+        out.append(f"print(\"mid {{fsum([{names[0]}, {names[1]}])}} {{fmix({', '.join(margs)})}}\")")
+        out.append(f"print({' + '.join(names)})")
+        return out
+
+
+CLOSURE_DECLS = """type Ops = { name: str, f: fn(i64) -> i64 }
+
+fn cl_add(x: i64) -> i64 {
+    x + 1
+}
+
+fn cl_adder(n: i64) -> fn(i64) -> i64 {
+    |x| x + n
+}
+
+fn cl_apply(f: fn(i64) -> i64, x: i64) -> i64 {
+    f(x)
+}
+
+fn cl_twice(f: fn(i64) -> i64) -> fn(i64) -> i64 {
+    |x| f(f(x))
+}
+
+fn cl_label(tag: str) -> fn(i64) -> str {
+    |x| "{tag}{x}"
+}
+"""
+
+
+class ClosureGen:
+    """Closures and function values: closures capturing integers, strings,
+    doubles, lists and structs by value, made, stored (in variables, a list,
+    a struct's field) and called; named functions as values; closures
+    answered by functions and closing over their parameters; the
+    higher-order list methods with closure literals and named functions,
+    `sort_by` through a struct's field; closures that answer `Ok` or `Err`;
+    a closure making and calling another. Each prints what it computed."""
+
+    def __init__(self, rng):
+        self.rng = rng
+        self.n = 0
+
+    def fresh(self, base):
+        self.n += 1
+        return f"{base}{self.n}"
+
+    def small(self):
+        return str(self.rng.randint(-4, 9))
+
+    def function(self, name):
+        r = self.rng
+        c = self.fresh("c")
+        s = self.fresh("s")
+        f = self.fresh("fl")
+        xs = self.fresh("xs")
+        ws = self.fresh("ws")
+        items = ", ".join(self.small() for _ in range(r.randint(0, 6)))
+        lines = [f"fn {name}() {{",
+                 f"    let {c} = {self.small()}",
+                 f"    let {s} = {json.dumps(r.choice(WORDS))}",
+                 f"    let {f} = {r.choice(['0.5', '1.25', '-2.0', '3.0'])}",
+                 f"    var {xs}: [i64] = [{items}]",
+                 f"    let {ws}: [str] = [{', '.join(json.dumps(r.choice(WORDS)) for _ in range(r.randint(0, 4)))}]"]
+        for _ in range(r.randint(6, 12)):
+            lines += ["    " + x for x in self.stmt(c, s, f, xs, ws)]
+        lines += ["}", ""]
+        return lines
+
+    def stmt(self, c, s, f, xs, ws):
+        r = self.rng
+        k = r.random()
+        if k < 0.10:
+            g = self.fresh("g")
+            return [f"let {g}: fn(i64) -> i64 = |x| x * {c} + {self.small()}",
+                    f"print(\"{{{g}(3)}} {{cl_apply({g}, {self.small()})}} {{cl_twice({g})(1)}}\")"]
+        if k < 0.20:
+            op = r.choice(["+", "-", "*"])
+            return [f"print({xs}.map(|x| x {op} {c}))",
+                    f"print({xs}.filter(|x| x % 2 == 0 or x > {c}))"]
+        if k < 0.28:
+            return [f"print(\"{{{xs}.fold(0, |a, x| a + x * {c})}} {{{xs}.any(|x| x > {c})}} "
+                    f"{{{xs}.all(|x| x != {c})}} {{{xs}.find(|x| x > {c})}}\")"]
+        if k < 0.36:
+            return [f"print({ws}.map(|w| w + {s}))",
+                    f"print({ws}.filter(|w| w.len() > {r.randint(0, 3)}))",
+                    f"print({ws}.fold({s}, |a, w| a + \"|\" + w))"]
+        if k < 0.42:
+            return [f"print({xs}.map(|x| x.as_f64() * {f}))",
+                    f"print({xs}.map(|x| \"<{{x}}{{{s}}}>\"))"]
+        if k < 0.50:
+            ys = self.fresh("ys")
+            return [f"var {ys} = {xs}",
+                    f"{ys}.push({self.small()})",
+                    f"{ys}.sort_by(|x| {r.choice(['0 - x', 'x * x', 'x % 3'])})",
+                    f"print({ys})"]
+        if k < 0.56:
+            h = self.fresh("h")
+            return [f"let {h}: fn(i64) -> i64 = cl_add",
+                    f"print({xs}.map(cl_add))",
+                    f"print(\"{{{h}(41)}} {{cl_adder({c})(10)}} {{cl_label({s})(7)}} {{{h}}}\")"]
+        if k < 0.64:
+            o = self.fresh("ops")
+            return [f"let {o} = [Ops{{ name: {s}, f: |x| x + {c} }}, Ops{{ name: \"sq\", f: |x| x * x }}, Ops{{ name: \"k\", f: cl_adder({self.small()}) }}]",
+                    f"for op in {o} {{",
+                    f"    print(\"{{op.name}} {{op.f({self.small()})}}\")",
+                    "}",
+                    f"print({o}.map(|op| op.f(2)))"]
+        if k < 0.72:
+            rs = self.fresh("rs")
+            return [f"let {rs} = {xs}.map(|x| if x > {c} {{ Err(\"big {{x}}\") }} else {{ Ok(x * 2) }})",
+                    f"print({rs})",
+                    f"if {rs}.len() > 0 {{",
+                    f"    print({rs}[0] ?? -1)",
+                    "}"]
+        if k < 0.80:
+            o = self.fresh("outer")
+            return [f"let {o}: fn(i64) -> i64 = |a| {{",
+                    f"    let inner: fn(i64) -> i64 = |b| a + b + {c}",
+                    "    inner(a * 2)",
+                    "}",
+                    f"print(\"{{{o}(1)}} {{{o}({self.small()})}}\")"]
+        if k < 0.88:
+            sq = self.fresh("pq")
+            return [f"var {sq}: [Ops] = []",
+                    f"for i in 0..{r.randint(0, 3)} {{",
+                    f"    {sq}.push(Ops{{ name: \"n{{i}}\", f: cl_adder(i * {c}) }})",
+                    "}",
+                    f"print({sq}.map(|op| op.f({self.small()})))"]
+        return [f"print((0..{r.randint(0, 5)}).map(|i| i * {c}))",
+                f"print((1..={r.randint(1, 6)}).filter(|i| i % 2 == 1))"]
+
+
 def run(cmd, timeout=20, env=None):
     try:
         p = subprocess.run(cmd, capture_output=True, timeout=timeout, stdin=subprocess.DEVNULL, env=env)
@@ -727,13 +1079,18 @@ def main():
     ap.add_argument("--keep", action="store_true")
     args = ap.parse_args()
     work = tempfile.mkdtemp(prefix="fuzz_s3_")
-    s3 = os.path.join(work, "s3")
-    p = subprocess.run([GRASM, "build", os.path.join(ROOT, "compiler/s3/src/main.gr"), "--native", "-o", s3],
-                       capture_output=True, text=True, cwd=ROOT)
-    if p.returncode != 0:
-        print("compiler/s3 does not build:")
-        print(p.stdout + p.stderr)
-        return 1
+    # `S3=<binary>` fuzzes that driver instead of one built here, with
+    # `S3_EXTRA` added to each compilation, as the other S3 gates take them
+    # (`scripts/s3controls.sh` points them at a deliberately broken one).
+    s3 = os.environ.get("S3") or os.path.join(work, "s3")
+    extra = (os.environ.get("S3_EXTRA") or "").split()
+    if not os.environ.get("S3"):
+        p = subprocess.run([GRASM, "build", os.path.join(ROOT, "compiler/s3/src/main.gr"), "--native", "-o", s3],
+                           capture_output=True, text=True, cwd=ROOT)
+        if p.returncode != 0:
+            print("compiler/s3 does not build:")
+            print(p.stdout + p.stderr)
+            return 1
     rng = random.Random(args.seed)
     made = 0
     not_checked = 0
@@ -780,7 +1137,7 @@ def main():
         ok = True
         for regs in (None, 3):
             obj = os.path.join(work, "p.o")
-            cmd = [s3, tir, "-o", obj] + ([] if regs is None else ["--max-regs", str(regs)])
+            cmd = [s3, tir, "-o", obj] + ([] if regs is None else ["--max-regs", str(regs)]) + extra
             c = run(cmd)
             if c[0] != 0:
                 failures.append((idx, f"the backend answered {c[0]} (regs {regs}): {c[2][:300]!r}", src_text))

@@ -8,24 +8,36 @@ refusals in `compiler/mir/src/lower.gr` are held to it by
 `scripts/s3subset.sh`, in both directions):
 
 A program is in the subset when its TIR declares a `main`, and every function
-and module-level constant that `main` reaches -- through `call` nodes and
-constant reads, transitively -- satisfies all of the following.
+and module-level constant that `main` reaches -- through `call` nodes,
+functions used as values (`fnref`) and constant reads, transitively --
+satisfies all of the following, after monomorphization.
+
+Monomorphization. Every generic function the program uses is instantiated at
+each list of type arguments it is used at, as a copy with its type
+parameters replaced (`monomorphize`, the backend's `compiler/mir/src/mono.gr`
+in Python); every use names its instance, and every `boundcall` -- an
+interface method on a receiver of a generic type -- becomes a call of what
+the receiver's `impl` provides, itself instantiated when that `impl` is
+generic. What follows is asked of the instances. A generic function asking
+for ever bigger instances of itself (polymorphic recursion) is outside.
 
 Types. The *held* types are the scalars -- i64, i8, i16, i32, u8, u16, u32,
-u64, bool, unit (also written as the empty tuple), never -- and the boxed
-types built from held types: str,
+u64, f64, bool, unit (also written as the empty tuple), never -- and the
+boxed types built from held types: str,
 bytes, a list, a tuple, a map, a named struct or sum type with held type
-arguments, a result `T ! E` (E may be `never`), and a union of boxed types.
-f64, functions, references, ranges as values, builders, raw addresses and
-generic parameters are not held.
+arguments, a result `T ! E` (E may be `never`), a union of boxed types, and
+a function type whose parameters and result are held (a function value).
+References, ranges as values, builders and raw addresses are not held. An
+f64 lives in a floating-point register and travels in d0..d7 (AAPCS64).
 
-  1. Declarations. A function is not generic, and has held parameter types
-     (any mode; past the eighth argument they travel on the stack) and a
+  1. Declarations. A function has held parameter types (any mode; past the
+     eighth argument of each register class they travel on the stack) and a
      held return type. One that can fail fails with a boxed type. A constant
      has a held type. `main` takes no parameters and answers `unit`.
 
   2. Nodes. Its body holds only:
        int, bool, unit                     literals
+       float                               a literal, which TIR writes as bits
        local, const                        of a held type
        str                                 a literal, or one interpolating
                                            held values other than `never`
@@ -36,16 +48,16 @@ generic parameters are not held.
        field                               answering a held type, of a named
                                            type
        variant                             of a sum type, every field held
-       binary add sub mul div rem          on an integer type
-       binary pow                          on i64
-       binary eq ne lt le gt ge            on an integer type or bool
+       binary add sub mul div rem          on an integer type or f64
+       binary pow                          on i64 or f64
+       binary eq ne lt le gt ge            on an integer type, f64 or bool
        binary and or
        binary add                          on str or a list
        binary eq ne                        on any boxed type
        binary lt le gt ge                  on str or a tuple
        binary coalesce                     on an Option or a result, answering
                                            a held type
-       unary neg                           on an integer type
+       unary neg                           on an integer type or f64
        unary not                           on bool
        call                                not generic, answering a held type;
                                            an argument for an `inout`
@@ -59,6 +71,7 @@ generic parameters are not held.
        builtin fail                        of a boxed value
        builtin listed in RT_BUILTINS       of held values, answering a held
                                            type (one runtime call each)
+       builtin pi, e                       of nothing, answering f64
        maplit                              of a held map type
        try                                 answering a held type
        wrapok                              of a held type
@@ -76,18 +89,25 @@ generic parameters are not held.
                                            path of struct fields (each held,
                                            not generic) and list elements
                                            rooted at a local
-       assign add|sub|mul|div|rem          of an integer type, to such a place
+       assign add|sub|mul|div|rem          of an integer type or f64, to such a
+                                           place
        assign add                          of str, to such a place
        return, break, continue, while
        for range                           over a range written in place
        for list                            over elements of a held type
+       closure                             of a held function type, every
+                                           variable it captures (reads and
+                                           does not bind) of a held type
+       fnref                               of a function with no `inout`
+                                           parameter, as a held type
+       callvalue                           of a held function type
 
 A method listed in MUTATING changes its receiver, which must then be a
 place: a local, or struct fields and list elements of held types rooted at
-one.
+one. A method on a range (`map`, `filter`) is on a range written in place.
 
-Everything else -- closures, generics, effects, raw memory, C functions,
-floats, references, builders, tasks -- is outside, for a later part.
+Everything else -- effects, raw memory, C functions, references, builders,
+tasks -- is outside, for a later part.
 
 The count of programs in and out is printed by the gate, never assumed.
 """
@@ -95,7 +115,7 @@ import json
 import re
 import sys
 
-SCALAR = {"i64", "i8", "i16", "i32", "u8", "u16", "u32", "u64", "bool", "unit", "never"}
+SCALAR = {"i64", "i8", "i16", "i32", "u8", "u16", "u32", "u64", "f64", "bool", "unit", "never"}
 INTS = {"i64", "i8", "i16", "i32", "u8", "u16", "u32", "u64"}
 STMTS = {"let", "lettuple", "assign", "return", "break", "continue", "while", "for",
          "parallel", "spawn", "with"}
@@ -198,10 +218,27 @@ METHODS = {
 }
 for _fam in ("int", "u64"):
     for _m in ("bit_and/1", "bit_or/1", "bit_xor/1", "bit_not/0", "shl/1", "shr/1",
-               "ushr/1", "to_char/0", "to_str/0", "to_base/1", "abs/0", "min/1", "max/1"):
+               "ushr/1", "to_char/0", "to_str/0", "to_base/1", "abs/0", "min/1", "max/1",
+               "as_f64/0", "cmp/1"):
         METHODS.add(f"{_fam}.{_m}")
     for _w in INTS:
         METHODS.add(f"{_fam}.as_{_w}/0")
+METHODS |= {"int.from_bits/0", "str.parse_float/0", "str.cmp/1", "tuple.cmp/1"}
+# The higher-order methods: a loop calling the function value per element.
+# A range's are on a range written in place.
+METHODS |= {"list.map/1", "list.filter/1", "list.all/1", "list.any/1", "list.find/1",
+            "list.fold/2", "list.sort_by/1", "range.map/1", "range.filter/1"}
+# The methods of f64: four as instructions (abs, sqrt, floor, ceil), the
+# conversions to integers (toward zero, saturating, NaN to 0), its bits, and
+# the rest -- round, min, max, the math library, formatting -- by the runtime.
+for _m in ("abs", "sqrt", "floor", "ceil", "round", "to_bits", "to_str", "is_nan",
+           "is_finite", "sin", "cos", "tan", "asin", "acos", "atan", "sinh", "cosh",
+           "tanh", "exp", "ln", "log2", "log10", "cbrt", "to_radians", "to_degrees"):
+    METHODS.add(f"f64.{_m}/0")
+for _m in ("min", "max", "atan2", "hypot", "log", "to_fixed", "cmp"):
+    METHODS.add(f"f64.{_m}/1")
+for _w in INTS:
+    METHODS.add(f"f64.as_{_w}/0")
 
 # The built-ins that are one runtime call, by how many arguments they take.
 RT_BUILTINS = {
@@ -214,7 +251,7 @@ RT_BUILTINS = {
 # The methods that change their receiver, which must then be a place: a local,
 # or a path of struct fields and list elements rooted at one.
 MUTATING = {"list.push/1", "list.sort/0", "list.pop/0", "list.remove/1", "bytes.set/2",
-            "bytes.fill/1", "bytes.copy_from/2", "map.set/2", "map.delete/1"}
+            "bytes.fill/1", "bytes.copy_from/2", "map.set/2", "map.delete/1", "list.sort_by/1"}
 
 
 class Checker:
@@ -247,6 +284,11 @@ class Checker:
             return "b" if all(self.kind(x) == "b" for x in t[1:]) else None
         if h == "tuple" and len(t) == 1:
             return "s"
+        if h == "fn":
+            # (fn (P..) R row): a function value, boxed, when what it takes
+            # and answers are held.
+            ps = t[1] if isinstance(t[1], list) else []
+            return "b" if all(self.kind(x) for x in ps) and self.kind(t[2]) else None
         if h in ("tuple", "map", "named"):
             rest = t[2:] if h == "named" else t[1:]
             return "b" if all(self.kind(x) for x in rest) else None
@@ -302,6 +344,10 @@ class Checker:
             if k == "int" and e[1] not in INTS:
                 self.bad(f"an integer of type {show(e[1])}")
             return
+        if k == "float":
+            if e[1] != "f64":
+                self.bad(f"a float literal of type {show(e[1])}")
+            return
         if k in ("local", "const"):
             if not self.held(e[1]):
                 self.bad(f"a {k} of type {show(e[1])} {span(e)}")
@@ -314,7 +360,7 @@ class Checker:
             return
         if k == "unary":
             op, ot = e[3], e[4]
-            if not ((op == "neg" and atom(ot) in INTS) or (op == "not" and ot == "bool")):
+            if not ((op == "neg" and (atom(ot) in INTS or ot == "f64")) or (op == "not" and ot == "bool")):
                 self.bad(f"`{op}` on {show(ot)} {span(e)}")
             self.expr(kids(e)[0])
             return
@@ -433,7 +479,60 @@ class Checker:
                 self.bad(f"`Ok` of type {show(e[1])} {span(e)}")
             self.expr(kids(e)[0])
             return
+        if k == "closure":
+            self.closure(e)
+            return
+        if k == "fnref":
+            name = unq(e[3])
+            f = self.fns.get(name)
+            if f is None:
+                self.bad(f"`{name}` as a value, which is not a function")
+            elif len(e[4]) > 1:
+                self.bad(f"a generic function `{name}` as a value {span(e)}")
+            elif not self.held(e[1]):
+                self.bad(f"a function value of type {show(e[1])} {span(e)}")
+            elif any(p[1] == "inout" for p in kids(f[7])):
+                self.bad(f"`{name}`, which has `inout` parameters, as a value {span(e)}")
+            return
+        if k == "callvalue":
+            ks = kids(e)
+            ft = ks[0][1]
+            if head(ft) != "fn" or not self.held(ft):
+                self.bad(f"calling a value of type {show(ft)} {span(e)}")
+            for x in ks:
+                self.expr(x)
+            return
         self.bad(f"`{k}` {span(e)}")
+
+    def closure(self, e):
+        """A closure: of a held function type, every variable it captures
+        held, its parameters bound for its body."""
+        if not self.held(e[1]):
+            self.bad(f"a closure of type {show(e[1])} {span(e)}")
+            return
+        bound, reads = set(), {}
+
+        def walk(x):
+            if isinstance(x, list) and x:
+                if x[0] in ("var", "let") and len(x) > 1:
+                    bound.add(int(x[1]))
+                elif x[0] == "pbind" and len(x) > 2:
+                    bound.add(int(x[2]))
+                elif x[0] == "local" and len(x) >= 4:
+                    reads.setdefault(int(x[3]), x[1])
+                for y in x:
+                    walk(y)
+
+        walk(e)
+        for vid, t in sorted(reads.items()):
+            if vid not in bound and not self.held(t):
+                self.bad(f"a closure capturing a value of type {show(t)} {span(e)}")
+        ks = kids(e)
+        for p in kids(ks[0]):
+            self.vars[int(p[1])] = p[4]
+            if not self.held(p[4]):
+                self.bad(f"a closure parameter of type {show(p[4])}")
+        self.expr(ks[1])
 
     def pieces(self, s):
         """A `str` node's interpolated values: held, and not `never`."""
@@ -465,13 +564,13 @@ class Checker:
             else:
                 self.bad(f"`{op}` on {show(ot)} {span(e)}")
         elif op in ("eq", "ne", "lt", "le", "gt", "ge"):
-            if atom(ot) not in INTS and ot != "bool":
+            if atom(ot) not in INTS and ot != "bool" and ot != "f64":
                 self.bad(f"`{op}` on {show(ot)} {span(e)}")
         elif op == "pow":
-            if ot != "i64":
+            if ot != "i64" and ot != "f64":
                 self.bad(f"`^` on {show(ot)} {span(e)}")
         elif op in ("add", "sub", "mul", "div", "rem"):
-            if atom(ot) not in INTS:
+            if atom(ot) not in INTS and ot != "f64":
                 self.bad(f"`{op}` on {show(ot)} {span(e)}")
         else:
             self.bad(f"operator `{op}` {span(e)}")
@@ -538,6 +637,8 @@ class Checker:
                 return
             self.expr(args[0])
             return
+        if name in ("pi", "e") and not args and e[1] == "f64":
+            return
         if RT_BUILTINS.get(name) == len(args):
             if not self.held(e[1]):
                 self.bad(f"built-in `{name}` answering {show(e[1])} {span(e)}")
@@ -562,6 +663,11 @@ class Checker:
         if sig in MUTATING and not self.place_receiver(recv):
             self.bad(f"`{name}` on a receiver that is not a place {span(e)}")
             return
+        if family(recv[1]) == "range":
+            if recv[0] != "range":
+                self.bad(f"`{name}` on a range that is not written in place {span(e)}")
+                return
+            ks = kids(recv) + ks[1:]
         for x in ks:
             self.expr(x)
 
@@ -625,7 +731,7 @@ class Checker:
             for j, sub in enumerate(kids(p)):
                 if sub[0] == "pwild":
                     continue
-                ft = self.subst(fields[j][2], args)
+                ft = copy_sub(fields[j][2], args)
                 if not self.field_held(fields[j][2], args) or self.has_generic(ft):
                     self.bad(f"a variant field of type {show(ft)} {span(p)}")
                     continue
@@ -656,7 +762,7 @@ class Checker:
             if b is None or b[0] != "struct" or i >= len(kids(b)):
                 self.bad(f"an assignment to a field of {show(ct)}")
                 return None
-            ft = self.subst(kids(b)[i][2], ct[2:])
+            ft = copy_sub(kids(b)[i][2], ct[2:])
             if self.has_generic(ft) or not self.held(ft):
                 self.bad(f"an assignment to a field of type {show(ft)}")
                 return None
@@ -683,7 +789,7 @@ class Checker:
             self.bad(f"assignment of type {show(e[2])}")
             return
         op = e[1]
-        if op != "set" and atom(e[2]) not in INTS and not (op == "add" and e[2] == "str"):
+        if op != "set" and atom(e[2]) not in INTS and e[2] != "f64" and not (op == "add" and e[2] == "str"):
             self.bad(f"`{op}=` on {show(e[2])}")
         self.expr(ks[1])
 
@@ -752,9 +858,145 @@ def family(t):
     return h
 
 
+class Outside(Exception):
+    """A program monomorphization finds outside the subset."""
+
+
+def node(items, h):
+    n = Node(items)
+    n.head = h
+    return n
+
+
+def copy_sub(x, subst):
+    """A copy of `x` with every `(generic n)` read as `subst[n]` (copied)."""
+    if isinstance(x, list):
+        if x and x[0] == "generic" and len(x) == 2:
+            n = int(x[1])
+            if 0 <= n < len(subst):
+                return copy_sub(subst[n], [])
+        return node([copy_sub(c, subst) for c in x], getattr(x, "head", None) if getattr(x, "head", None) is not None else len(x))
+    return x
+
+
+def has_generic(t):
+    if not isinstance(t, list):
+        return False
+    if t and t[0] == "generic":
+        return True
+    return any(has_generic(x) for x in t[1:])
+
+
+def impl_key(t):
+    if isinstance(t, str):
+        return t
+    if head(t) == "named":
+        return unq(t[1])
+    if head(t) == "list":
+        return "[]"
+    return show(t)
+
+
+def unify(p, c, binds):
+    if isinstance(p, list) and p and p[0] == "generic" and len(p) == 2:
+        n = int(p[1])
+        if not 0 <= n < len(binds):
+            return False
+        if binds[n] is None:
+            binds[n] = c
+            return True
+        return show(binds[n]) == show(c)
+    if isinstance(p, list) != isinstance(c, list):
+        return False
+    if not isinstance(p, list):
+        return p == c
+    return len(p) == len(c) and all(unify(a, b, binds) for a, b in zip(p, c))
+
+
+def monomorphize(tree):
+    """Every generic function the program uses, instantiated at the type
+    arguments it is used at, as a non-generic copy named `name[T1,T2]`
+    (`compiler/mir/src/mono.gr`, which the backend runs): each use rewritten
+    to name its instance, and each `boundcall` to a call of the function its
+    receiver's `impl` provides -- an instance itself when that `impl` is
+    generic. The subset is then decided on the instances."""
+    fns, impls, start = {}, {}, []
+    for d in list(tree):
+        if not isinstance(d, list) or not d:
+            continue
+        if d[0] == "fn":
+            fns[unq(d[1])] = d
+            if len(d[2]) <= 1:
+                start.append(d)
+        elif d[0] == "const":
+            start.append(d)
+        elif d[0] == "impl":
+            for meth in kids(d):
+                if isinstance(meth, list) and meth and meth[0] == "method":
+                    impls[(unq(d[1]), unq(d[2]), unq(meth[1]))] = unq(meth[2])
+    made = {}
+    work = []
+
+    def instance(name, targs):
+        iname = name + "[" + ",".join(show(a) for a in targs) + "]"
+        if iname in made:
+            return iname
+        if len(made) >= 4000 or len(iname) > 600:
+            raise Outside(f"polymorphic recursion in `{name}`")
+        g = fns.get(name)
+        if g is None:
+            raise Outside(f"a call of `{name}`, which is not a function")
+        c = copy_sub(g, targs)
+        c[1] = json.dumps(iname)
+        c[2] = node(["generics"], 1)
+        c[3] = node(["bounds"], 1)
+        tree.append(c)
+        fns[iname] = c
+        made[iname] = c
+        work.append(c)
+        return iname
+
+    def rewrite(r):
+        stack = [r]
+        while stack:
+            e = stack.pop()
+            if not isinstance(e, list) or not e:
+                continue
+            if e[0] in ("call", "fnref") and len(e) > 4 and isinstance(e[4], list) and len(e[4]) > 1:
+                e[3] = json.dumps(instance(unq(e[3]), list(e[4][1:])))
+                e[4] = node(["targs"], 1)
+            elif e[0] == "boundcall":
+                iface, meth = unq(e[3]), unq(e[4])
+                rt = kids(e)[0][1]
+                if has_generic(rt):
+                    raise Outside(f"a `boundcall` of `{meth}` on {show(rt)}")
+                f = impls.get((iface, impl_key(rt), meth))
+                if f is None or f not in fns:
+                    raise Outside(f"no `impl {iface}` for {show(rt)} to call `{meth}` on")
+                callee = f
+                ng = len(fns[f][2]) - 1
+                if ng > 0:
+                    ps = kids(kids(fns[f])[0])
+                    binds = [None] * ng
+                    if not ps or not unify(ps[0][4], rt, binds) or any(b is None for b in binds):
+                        raise Outside(f"`{f}` does not take {show(rt)}")
+                    callee = instance(f, binds)
+                e[0] = "call"
+                e[3] = json.dumps(callee)
+                e[4] = node(["targs"], 1)
+            for x in reversed(e):
+                if isinstance(x, list):
+                    stack.append(x)
+
+    for r in start:
+        rewrite(r)
+    while work:
+        rewrite(work.pop(0))
+
+
 def callees(e, acc):
     if isinstance(e, list):
-        if e and e[0] == "call":
+        if e and e[0] in ("call", "fnref"):
             acc.add(("fn", unq(e[3])))
         if e and e[0] == "const" and len(e) > 3 and isinstance(e[2], str) and e[2].startswith("@"):
             acc.add(("const", unq(e[3])))
@@ -766,6 +1008,10 @@ def classify(tree):
     # Expression chains nest hundreds deep in the corpus, and this walk
     # recurses once per node.
     sys.setrecursionlimit(max(sys.getrecursionlimit(), 20000))
+    try:
+        monomorphize(tree)
+    except Outside as why:
+        return [str(why)]
     fns, consts, types, main = {}, {}, {}, None
     for d in tree:
         if not isinstance(d, list) or not d:

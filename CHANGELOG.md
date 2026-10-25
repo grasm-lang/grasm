@@ -80,8 +80,14 @@ migration note here; anything `experimental` may change in any release. See
   `dec` instruction of the backend's MIR, fallible functions by the
   Cranelift build's split-result convention, and the built-in methods and
   one-call built-ins those programs use, arguments past the eighth on the
-  stack and places passed `inout`: 289 corpus programs now, each leak-free
-  and free of uses after free (the new `s3rc` gate).
+  stack and places passed `inout`: 289 corpus programs, each leak-free
+  and free of uses after free (the new `s3rc` gate). Part three added
+  `f64` as a second register class -- selection, allocation, the
+  allocation checker and the encoder, AAPCS64's d0..d7 for doubles --
+  closures and function values with environments captured by value and
+  reference-counted, the higher-order list methods, and generic functions
+  by monomorphization, interface methods on generic receivers included:
+  474 corpus programs now.
 - **Raw memory and atomics**, only inside `unsafe` and only in a package
   that declares the new `mem` capability: an `addr` type, allocation, typed
   loads and stores, and atomic load/store/compare-exchange/add with

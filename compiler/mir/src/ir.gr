@@ -2,9 +2,13 @@
 //
 // SSA with block arguments: every value is defined once, either as a block
 // parameter or as an instruction's result, and a branch passes its target's
-// parameters explicitly -- no phi nodes. Values are machine words; the types
-// that decide an operation's meaning (signedness, width) have already been
-// turned into the choice of operation, so MIR has one value type.
+// parameters explicitly -- no phi nodes. Values are machine words of two
+// classes: integers (and addresses, and boxed values' pointers), and doubles
+// (`MirFn.vfp`), which live in the floating-point registers. The types that
+// decide an operation's meaning (signedness, width) have already been turned
+// into the choice of operation, and an operation fixes the class of what it
+// reads and writes (`res_fp`, `arg_fp`): the only ways across are the
+// conversions and the bit moves (`M_FBITS`, `M_FFROMBITS`).
 //
 // Everything is in flat arrays addressed by integer ids (§3.5): a block's
 // instructions are a contiguous run, its parameters a run of `bparams`, a
@@ -66,6 +70,12 @@ pub let M_DEC = 33
 /// The address of writable data object `imm` of the program (`MirProg.descs`:
 /// a struct descriptor the runtime reads and caches its type in).
 pub let M_DATAADDR = 34
+/// The address of compiled function `imm` (a callable id): the code of a
+/// function value (`grasm_fn_new`).
+pub let M_FNADDR = 35
+/// A call through a code address `a`, with the arguments in `cargs`: a
+/// function value's code, which takes the value's environment first.
+pub let M_CALLIND = 36
 // Terminators.
 pub let M_JUMP = 40
 pub let M_BRIF = 41
@@ -73,11 +83,69 @@ pub let M_RET = 42
 /// Control cannot reach here: after a call that does not return, or past a
 /// `match` the checker proved exhaustive.
 pub let M_TRAP = 43
+// Doubles. Arithmetic is IEEE 754 binary64 with the default rounding, as
+// the Cranelift build's `fadd` .. `fdiv`.
+/// A double whose bits are `imm`.
+pub let M_FCONST = 50
+pub let M_FADD = 51
+pub let M_FSUB = 52
+pub let M_FMUL = 53
+pub let M_FDIV = 54
+/// The sign bit flipped (so `-0.0` from `0.0`).
+pub let M_FNEG = 55
+pub let M_FABS = 56
+pub let M_FSQRT = 57
+pub let M_FFLOOR = 58
+pub let M_FCEIL = 59
+/// `res = a <cc> b` on doubles, 0 or 1; `imm` is one of `CC_EQ` .. `CC_SGE`,
+/// read as IEEE comparisons: ordered (false on a NaN) but for `ne`, which a
+/// NaN makes true.
+pub let M_FCMP = 60
+/// A signed integer to a double.
+pub let M_SCVTF = 61
+/// An unsigned integer to a double.
+pub let M_UCVTF = 62
+/// A double to a signed integer, toward zero, saturating; NaN is 0.
+pub let M_FCVTZS = 63
+/// A double to an unsigned integer, toward zero, saturating; NaN is 0.
+pub let M_FCVTZU = 64
+/// The double's bits, as an integer.
+pub let M_FBITS = 65
+/// The integer's bits, as a double.
+pub let M_FFROMBITS = 66
+/// `M_LOAD` and `M_STORE` of a double.
+pub let M_FLOAD = 67
+pub let M_FSTORE = 68
+
+pub fn is_terminator(op: i64) -> bool {
+    op >= M_JUMP and op <= M_TRAP
+}
 
 /// Whether an instruction has no effect but its result, so it may be
 /// removed when nothing reads the result.
 pub fn pure_op(op: i64) -> bool {
-    op != M_CALL and op != M_CALLRT and op != M_STORE and op != M_INC and op != M_DEC and op < M_JUMP
+    op != M_CALL and op != M_CALLRT and op != M_CALLIND and op != M_STORE and op != M_FSTORE and op != M_INC and op != M_DEC and not is_terminator(op)
+}
+
+/// Whether an instruction's result is a double. A call's is whatever the
+/// value it defines is (`MirFn.vfp`); every other operation fixes it.
+pub fn res_fp(op: i64) -> bool {
+    op == M_FCONST or (op >= M_FADD and op <= M_FCEIL) or op == M_SCVTF or op == M_UCVTF or op == M_FFROMBITS or op == M_FLOAD
+}
+
+/// Whether operand `k` (0 for `a`, 1 for `b`) of an instruction is a double.
+pub fn arg_fp(op: i64, k: i64) -> bool {
+    if (op >= M_FADD and op <= M_FCEIL) or op == M_FCMP {
+        return true
+    }
+    if op == M_FCVTZS or op == M_FCVTZU or op == M_FBITS {
+        return k == 0
+    }
+    if op == M_FSTORE {
+        // The address, then the double stored there.
+        return k == 1
+    }
+    false
 }
 
 // ----- conditions ------------------------------------------------------------
@@ -125,6 +193,8 @@ pub let TY_U64 = 9
 pub let TY_NEVER = 10
 /// A boxed value: a counted pointer to an `RtVal`, owned by whoever holds it.
 pub let TY_BOX = 11
+/// A double, held in a floating-point register.
+pub let TY_F64 = 12
 
 pub fn ty_of_name(name: str) -> i64 {
     match name {
@@ -139,8 +209,14 @@ pub fn ty_of_name(name: str) -> i64 {
         "u32" -> 8
         "u64" -> 9
         "never" -> 10
+        "f64" -> 12
         _ -> -1
     }
+}
+
+/// A type held in a floating-point register.
+pub fn ty_fp(t: i64) -> bool {
+    t == TY_F64
 }
 
 /// An integer type: what arithmetic is defined on.
@@ -154,7 +230,7 @@ pub fn ty_unsigned(t: i64) -> bool {
 
 /// A type the subset holds in a register.
 pub fn ty_scalar(t: i64) -> bool {
-    t >= TY_UNIT and t <= TY_NEVER
+    (t >= TY_UNIT and t <= TY_NEVER) or t == TY_F64
 }
 
 /// A counted pointer, which `inc` and `dec` keep alive.
@@ -261,6 +337,8 @@ type MirFn = {
     /// 8-byte frame slots for `inout` arguments.
     nslots: i64,
     nvals: i64,
+    /// Per value: whether it is a double (in a floating-point register).
+    vfp: [bool],
     // Blocks. Block 0 is the entry.
     bp0: [i64],
     bnp: [i64],
@@ -292,7 +370,7 @@ type MirFn = {
 
 pub fn new_fn(name: str, sym: str) -> MirFn {
     MirFn{
-        name: name, sym: sym, floor: false, nparams: 0, returns: false, nslots: 0, nvals: 0,
+        name: name, sym: sym, floor: false, nparams: 0, returns: false, nslots: 0, nvals: 0, vfp: [],
         bp0: [], bnp: [], bparams: [], bi0: [], bni: [],
         tk: [], tv: [], tt: [], tf: [], ta0: [], tan: [], fa0: [], fan: [], targs: [],
         op: [], res: [], a: [], b: [], imm: [], ca0: [], can: [], cargs: [],
@@ -328,6 +406,7 @@ type MirDesc = {
 // Field kinds, the runtime's `FK_*`.
 pub let FK_BOXED = 0
 pub let FK_I64 = 1
+pub let FK_F64 = 2
 pub let FK_BOOL = 3
 pub let FK_UNIT = 5
 pub let FK_U64 = 9
@@ -374,19 +453,42 @@ pub fn op_name(op: i64) -> str {
         32 -> "inc"
         33 -> "dec"
         34 -> "dataaddr"
+        35 -> "fnaddr"
+        36 -> "callind"
         40 -> "jump"
         41 -> "brif"
         42 -> "ret"
         43 -> "trap"
+        50 -> "fconst"
+        51 -> "fadd"
+        52 -> "fsub"
+        53 -> "fmul"
+        54 -> "fdiv"
+        55 -> "fneg"
+        56 -> "fabs"
+        57 -> "fsqrt"
+        58 -> "ffloor"
+        59 -> "fceil"
+        60 -> "fcmp"
+        61 -> "scvtf"
+        62 -> "ucvtf"
+        63 -> "fcvtzs"
+        64 -> "fcvtzu"
+        65 -> "fbits"
+        66 -> "ffrombits"
+        67 -> "fload"
+        68 -> "fstore"
         _ -> "op?"
     }
 }
 
 /// How many value operands an instruction reads from `a` and `b`.
 pub fn nreads(op: i64) -> i64 {
-    if op == M_ICONST or op == M_STRADDR or op == M_GETSP or op == M_SLOTADDR or op == M_CALL or op == M_CALLRT or op == M_DATAADDR {
+    if op == M_ICONST or op == M_STRADDR or op == M_GETSP or op == M_SLOTADDR or op == M_CALL or op == M_CALLRT or op == M_DATAADDR or op == M_FCONST or op == M_FNADDR {
         0
-    } else if op == M_COPY or op == M_NEG or op == M_NOT or (op >= M_SEXT8 and op <= M_UEXT32) or op == M_LOAD or op == M_INC or op == M_DEC {
+    } else if op == M_COPY or op == M_NEG or op == M_NOT or (op >= M_SEXT8 and op <= M_UEXT32) or op == M_LOAD or op == M_INC or op == M_DEC or op == M_CALLIND {
+        1
+    } else if (op >= M_FNEG and op <= M_FCEIL) or (op >= M_SCVTF and op <= M_FLOAD) {
         1
     } else {
         2
@@ -420,11 +522,16 @@ pub fn print_fn(f: MirFn, callee_sym: [str], rt_syms: [str]) -> str {
             let op = f.op[i]
             var line = "    "
             if f.res[i] >= 0 {
-                line = line + "v{f.res[i]} = "
+                let cls = if f.res[i] < f.vfp.len() and f.vfp[f.res[i]] { ":f" } else { "" }
+                line = line + "v{f.res[i]}{cls} = "
             }
             line = line + op_name(op)
             if op == M_ICONST or op == M_SLOTADDR {
                 line = line + " {f.imm[i]}"
+            } else if op == M_FCONST {
+                line = line + " 0x" + f.imm[i].as_u64().to_base(16).pad_start(16, "0")
+            } else if op == M_FCMP {
+                line = line + "." + cc_name(f.imm[i]) + " {vname(f.a[i])}, {vname(f.b[i])}"
             } else if op == M_STRADDR {
                 line = line + " s{f.imm[i]}"
             } else if op == M_DATAADDR {
@@ -437,6 +544,11 @@ pub fn print_fn(f: MirFn, callee_sym: [str], rt_syms: [str]) -> str {
             } else if op == M_CALLRT {
                 let rn = if f.imm[i] >= 0 and f.imm[i] < rt_syms.len() { rt_syms[f.imm[i]] } else { "?" }
                 line = line + " {rn}({arg_list(f.cargs, f.ca0[i], f.can[i])})"
+            } else if op == M_FNADDR {
+                let callee = if f.imm[i] >= 0 and f.imm[i] < callee_sym.len() { callee_sym[f.imm[i]] } else { "?" }
+                line = line + " {callee}"
+            } else if op == M_CALLIND {
+                line = line + " *{vname(f.a[i])}({arg_list(f.cargs, f.ca0[i], f.can[i])})"
             } else if nreads(op) == 1 {
                 line = line + " {vname(f.a[i])}"
             } else if nreads(op) == 2 {

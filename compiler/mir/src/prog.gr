@@ -28,6 +28,9 @@ type TirInfo = {
     sym: [str],
     /// Each named type's declaration, by name: `(type "N" (generics ..) body)`.
     type_ix: Map[str, i64],
+    /// The field types of instantiated generic types (`mono.field_types`),
+    /// by `mono.field_key`.
+    field_ty: Map[str, i64],
 }
 
 /// Keeps a symbol to the characters every tool accepts.
@@ -57,7 +60,8 @@ fn symbol_for(name: str, is_const: bool) -> str {
     prefix + sanitize(module.replace(".", "_")) + "_" + sanitize(short)
 }
 
-/// Every `call` and constant read anywhere under element `root`.
+/// Every `call`, function used as a value (`fnref`) and constant read
+/// anywhere under element `root`.
 fn callees_of(info: TirInfo, root: i64) -> [i64] {
     let t = info.t
     var out: [i64] = []
@@ -68,7 +72,8 @@ fn callees_of(info: TirInfo, root: i64) -> [i64] {
             continue
         }
         let k = sexp.kw(t, e)
-        if k == "call" {
+        if k == "call" or k == "fnref" {
+            // A function used as a value is reached as surely as one called.
             let c = info.fn_ix.get(sexp.word(t, e, 3)) ?? -1
             if c >= 0 {
                 out.push(c)
@@ -95,7 +100,7 @@ fn callees_of(info: TirInfo, root: i64) -> [i64] {
 pub fn index(t: TirTree) -> TirInfo ! str {
     var info = TirInfo{
         t: t, c_name: [], c_elem: [], c_const: [], fn_ix: {}, const_ix: {}, main_c: -1,
-        e0: [], en: [], edges: [], reach: [], recursive: [], sym: [], type_ix: {},
+        e0: [], en: [], edges: [], reach: [], recursive: [], sym: [], type_ix: {}, field_ty: {},
     }
     var main_name = ""
     var consts: [i64] = []

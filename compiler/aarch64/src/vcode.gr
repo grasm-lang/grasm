@@ -10,7 +10,13 @@ import mach
 type VCode = {
     sym: str,
     nvregs: i64,
+    /// Per virtual register, its class (`mach.CLS_INT` or `mach.CLS_FP`).
+    vcls: [i64],
     nparams: i64,
+    /// How many parameters arrive in x0.. and in d0.. (AAPCS64 counts the two
+    /// files apart; the rest arrive on the stack).
+    nreg_int: i64,
+    nreg_fp: i64,
     nslots: i64,
     /// Words at the bottom of the frame for the stack arguments of the
     /// largest call: the frame's slots begin above them.
@@ -41,7 +47,7 @@ pub let SYM_DATA = 4
 
 pub fn new_vcode(sym: str) -> VCode {
     VCode{
-        sym: sym, nvregs: 0, nparams: 0, nslots: 0, nout: 0,
+        sym: sym, nvregs: 0, vcls: [], nparams: 0, nreg_int: 0, nreg_fp: 0, nslots: 0, nout: 0,
         mop: [], rd: [], rn: [], rm: [], ra: [], imm: [], imm2: [], cc: [], tgt: [],
         symk: [], sym_id: [], bi0: [], bni: [],
     }
@@ -63,20 +69,48 @@ pub fn push(inout vc: VCode, mop: i64, rd: i64, rn: i64, rm: i64) -> i64 {
     i
 }
 
-pub fn new_vreg(inout vc: VCode) -> i64 {
+/// A fresh virtual register of class `cls`.
+pub fn new_vreg(inout vc: VCode, cls: i64) -> i64 {
     let v = vc.nvregs
     vc.nvregs += 1
+    vc.vcls.push(cls)
     mach.VR + v
+}
+
+/// The class of operand `o`: a virtual register's own, or a physical
+/// register's file.
+pub fn cls_of(vc: VCode, o: i64) -> i64 {
+    if mach.is_vreg(o) {
+        vc.vcls[o - mach.VR]
+    } else if mach.is_fpr(o) {
+        mach.CLS_FP
+    } else {
+        mach.CLS_INT
+    }
 }
 
 pub fn nblocks(vc: VCode) -> i64 {
     vc.bi0.len()
 }
 
-/// A call's argument registers are x0 .. x(n-1), `imm2` of them; it writes
-/// x0 when `imm` is 1.
-pub fn call_nargs(vc: VCode, i: i64) -> i64 {
-    vc.imm2[i]
+// A call (`bl`) says what it reads and writes in its immediates: `imm2` is
+// the number of argument registers of each file, `n_int + 16 * n_fp` (x0..,
+// d0..), and `imm` the result, 0 none, 1 in x0, 2 in d0. `P_RETURN`'s `imm`
+// says the same of the function's own result.
+pub let RES_NONE = 0
+pub let RES_X0 = 1
+pub let RES_D0 = 2
+
+pub fn call_args_code(nint: i64, nfp: i64) -> i64 {
+    nint + 16 * nfp
+}
+
+pub fn call_nint(code: i64) -> i64 {
+    code.bit_and(15)
+}
+
+pub fn call_nfp(code: i64) -> i64 {
+    code.shr(4)
 }
 
 /// The blocks a block can branch to, in the order its branches name them.

@@ -3,15 +3,22 @@
 // to get (the design regalloc2 ships, after Chris Fallin's "A symbolic
 // checker for register allocation").
 //
-// The state says, for every location -- each register and each spill slot
-// -- which value it holds: a virtual register, the value an explicit move
-// put in a physical register (the calling convention's), or nothing known.
-// An instruction that read virtual register v from register r is correct
-// exactly when r holds v at that point on every path. Writes set their
-// location and forget the value anywhere else it was; a reload or a spill
-// copies what its source holds; a call forgets every register it may
-// change. Where paths meet, a location keeps a value only if every path
-// agrees on it.
+// The state says, for every location -- each general register, each
+// floating-point register and each spill slot -- which value it holds: a
+// virtual register, the value an explicit move put in a physical register
+// (the calling convention's), or nothing known. An instruction that read
+// virtual register v from register r is correct exactly when r holds v at
+// that point on every path. Writes set their location and forget the value
+// anywhere else it was; a reload or a spill copies what its source holds; a
+// call forgets every register it may change. Where paths meet, a location
+// keeps a value only if every path agrees on it.
+//
+// Every operand is also of the right class: a field of a form is a general
+// or a floating-point register (`mach.fp_field`), and both what selection
+// put there (a virtual register's class) and what allocation put there (a
+// physical register's file) must be that. A double in a general register,
+// or an integer in a floating-point one, is an error here before the encoder
+// ever sees it.
 //
 // It knows nothing of how the allocator decided: it reads the code before
 // and after, nothing else. That is the point -- an allocator bug that the
@@ -22,9 +29,23 @@ import regalloc
 
 let UNKNOWN = -1
 let TOP = -2
+/// Locations: x0..x30 at 0..30, d0..d31 at 32..63, spill slots from 64.
+let SLOT0 = 64
 
 fn nloc(al: Alloc) -> i64 {
-    32 + al.nspill
+    SLOT0 + al.nspill
+}
+
+/// The location index of physical register `r`, or -1 for one that is not a
+/// location (the zero register, `sp`, anything else).
+fn loc_of(r: i64) -> i64 {
+    if r >= 0 and r <= 30 {
+        r
+    } else if mach.is_fpr(r) {
+        32 + (r - mach.R_D0)
+    } else {
+        -1
+    }
 }
 
 fn meet(a: i64, b: i64) -> i64 {
@@ -37,6 +58,14 @@ fn meet(a: i64, b: i64) -> i64 {
     }
 }
 
+fn reg_name(r: i64) -> str {
+    if mach.is_fpr(r) {
+        "d{r - mach.R_D0}"
+    } else {
+        "x{r}"
+    }
+}
+
 fn show(v: i64) -> str {
     if v == UNKNOWN {
         "nothing known"
@@ -45,16 +74,20 @@ fn show(v: i64) -> str {
     } else if mach.is_vreg(v) {
         "v{v - mach.VR}"
     } else {
-        "the value moved into x{v}"
+        "the value moved into {reg_name(v)}"
     }
 }
 
-fn where_(r: i64) -> str {
-    if r >= 32 {
-        "spill slot {r - 32}"
-    } else {
-        "x{r}"
+fn class_name(fp: bool) -> str {
+    if fp { "floating-point" } else { "general" }
+}
+
+/// Whether operand `o` as selection wrote it is of the class `fp` says.
+fn orig_class_ok(al: Alloc, o: i64, fp: bool) -> bool {
+    if mach.is_vreg(o) {
+        return (al.vcls[o - mach.VR] == mach.CLS_FP) == fp
     }
+    mach.is_fpr(o) == fp
 }
 
 /// Applies instruction `i` to `st`. With `errs` collecting, also checks it.
@@ -62,59 +95,75 @@ fn step(al: Alloc, inout st: [i64], i: i64, checking: bool, inout errs: [str]) {
     let k = al.kind[i]
     if k == regalloc.K_RELOAD or k == regalloc.K_SPILL {
         // A slot or a register the frame does not have is an error in
-        // itself, not something to index with.
+        // itself, not something to index with; so is a register of the
+        // wrong file for the load or store that moves it.
         let s = al.slot[i]
         let r = al.rd[i]
-        if s < 0 or s >= al.nspill or r < 0 or r > 30 {
+        let lr = loc_of(r)
+        let fp_form = mach.fp_field(al.mop[i], 0)
+        if s < 0 or s >= al.nspill or lr < 0 or mach.is_fpr(r) != fp_form {
             if checking {
                 let what = if k == regalloc.K_RELOAD { "reload" } else { "spill" }
-                errs.push("instruction {i}: {what} between x{r} and spill slot {s}, of {al.nspill} slots")
+                errs.push("instruction {i}: {what} between {reg_name(r)} and spill slot {s}, of {al.nspill} slots, by a {class_name(fp_form)} {mach.form_name(al.mop[i])}")
             }
-            if r >= 0 and r <= 30 and k == regalloc.K_RELOAD {
-                st[r] = UNKNOWN
+            if lr >= 0 and k == regalloc.K_RELOAD {
+                st[lr] = UNKNOWN
             }
             return
         }
         if k == regalloc.K_RELOAD {
-            st[r] = st[32 + s]
+            st[lr] = st[SLOT0 + s]
         } else {
-            st[32 + s] = st[r]
+            st[SLOT0 + s] = st[lr]
         }
         return
     }
     let m = al.mop[i]
-    let ou = regalloc.uses_f(m, al.od[i], al.on[i], al.om[i], al.oa[i], al.imm[i], al.imm2[i])
-    let pu = regalloc.uses_f(m, al.rd[i], al.rn[i], al.rm[i], al.ra[i], al.imm[i], al.imm2[i])
+    let ou = regalloc.uses_of(m, al.od[i], al.on[i], al.om[i], al.oa[i], al.imm[i], al.imm2[i])
+    let pu = regalloc.uses_of(m, al.rd[i], al.rn[i], al.rm[i], al.ra[i], al.imm[i], al.imm2[i])
     if checking {
-        if ou.len() != pu.len() {
-            errs.push("instruction {i} ({mach.form_name(m)}): reads {ou.len()} registers before allocation and {pu.len()} after")
+        if ou.regs.len() != pu.regs.len() {
+            errs.push("instruction {i} ({mach.form_name(m)}): reads {ou.regs.len()} registers before allocation and {pu.regs.len()} after")
         } else {
-            for q in 0..ou.len() {
-                let want = ou[q]
-                let r = pu[q]
-                if r < 0 or r > 30 {
+            for q in 0..ou.regs.len() {
+                let want = ou.regs[q]
+                let r = pu.regs[q]
+                let fp = pu.fps[q]
+                let lr = loc_of(r)
+                if lr < 0 {
                     errs.push("instruction {i} ({mach.form_name(m)}): reads a register that is not one ({r})")
-                } else if st[r] != want {
-                    errs.push("instruction {i} ({mach.form_name(m)}): reads {show(want)} from x{r}, which holds {show(st[r])}")
+                } else if mach.is_fpr(r) != fp {
+                    errs.push("instruction {i} ({mach.form_name(m)}): reads {show(want)} from {reg_name(r)}, in a field that holds a {class_name(fp)} register")
+                } else if not orig_class_ok(al, want, fp) {
+                    errs.push("instruction {i} ({mach.form_name(m)}): reads {show(want)}, of the other class, in a {class_name(fp)} field")
+                } else if st[lr] != want {
+                    errs.push("instruction {i} ({mach.form_name(m)}): reads {show(want)} from {reg_name(r)}, which holds {show(st[lr])}")
                 }
             }
         }
     }
-    if m == mach.A_BL {
+    if mach.is_call(m) {
         for r in 0..18 {
             st[r] = UNKNOWN
         }
+        for d in 0..32 {
+            if regalloc.caller_saved(mach.R_D0 + d) {
+                st[32 + d] = UNKNOWN
+            }
+        }
     }
-    let od = regalloc.defs_f(m, al.od[i], al.on[i], al.om[i], al.oa[i], al.imm[i], al.imm2[i])
-    let pd = regalloc.defs_f(m, al.rd[i], al.rn[i], al.rm[i], al.ra[i], al.imm[i], al.imm2[i])
-    if checking and od.len() != pd.len() {
-        errs.push("instruction {i} ({mach.form_name(m)}): writes {od.len()} registers before allocation and {pd.len()} after")
+    let od = regalloc.defs_of(m, al.od[i], al.on[i], al.om[i], al.oa[i], al.imm[i], al.imm2[i])
+    let pd = regalloc.defs_of(m, al.rd[i], al.rn[i], al.rm[i], al.ra[i], al.imm[i], al.imm2[i])
+    if checking and od.regs.len() != pd.regs.len() {
+        errs.push("instruction {i} ({mach.form_name(m)}): writes {od.regs.len()} registers before allocation and {pd.regs.len()} after")
         return
     }
-    for q in 0..od.len() {
-        let o = od[q]
-        let r = pd[q]
-        if r < 0 or r > 30 {
+    for q in 0..od.regs.len() {
+        let o = od.regs[q]
+        let r = pd.regs[q]
+        let fp = pd.fps[q]
+        let lr = loc_of(r)
+        if lr < 0 {
             if checking {
                 errs.push("instruction {i} ({mach.form_name(m)}): writes a register that is not one ({r})")
             }
@@ -125,7 +174,12 @@ fn step(al: Alloc, inout st: [i64], i: i64, checking: bool, inout errs: [str]) {
                 errs.push("instruction {i} ({mach.form_name(m)}): writes x{r}, which the function body must not touch")
             }
             if regalloc.callee_saved(r) and not al.used_callee[r] {
-                errs.push("instruction {i} ({mach.form_name(m)}): writes x{r}, which the prologue does not save")
+                errs.push("instruction {i} ({mach.form_name(m)}): writes {reg_name(r)}, which the prologue does not save")
+            }
+            if mach.is_fpr(r) != fp {
+                errs.push("instruction {i} ({mach.form_name(m)}): writes {show(o)} to {reg_name(r)}, in a field that holds a {class_name(fp)} register")
+            } else if not orig_class_ok(al, o, fp) {
+                errs.push("instruction {i} ({mach.form_name(m)}): writes {show(o)}, of the other class, in a {class_name(fp)} field")
             }
         }
         if mach.is_vreg(o) {
@@ -134,10 +188,8 @@ fn step(al: Alloc, inout st: [i64], i: i64, checking: bool, inout errs: [str]) {
                     st[l] = UNKNOWN
                 }
             }
-            st[r] = o
-        } else {
-            st[r] = o
         }
+        st[lr] = o
     }
 }
 
@@ -160,12 +212,16 @@ pub fn check(al: Alloc) -> [str] {
     for k in 0..(nb * nl) {
         inst.push(TOP)
     }
-    // At entry the parameters are in x0..x7, put there by the caller.
+    // At entry the parameters are in x0..x7 and d0..d7, put there by the
+    // caller.
     for l in 0..nl {
         inst[l] = UNKNOWN
     }
-    for k in 0..regalloc.reg_params(al.nparams) {
+    for k in 0..al.nreg_int {
         inst[k] = k
+    }
+    for k in 0..al.nreg_fp {
+        inst[32 + k] = mach.R_D0 + k
     }
     // The frame pointer, which the prologue sets and nothing in the body
     // writes: what a stack argument is read through.

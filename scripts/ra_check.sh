@@ -11,14 +11,20 @@
 # checker can fail:
 #
 #   * stress -- every program in the subset is compiled again with the
-#     allocator limited to 0, 2 and 5 registers, so nearly every value
-#     spills and reloads, crosses calls in the few callee-saved registers
+#     allocator limited to 0, 2 and 5 registers of each class, so nearly
+#     every value spills and reloads -- doubles through d29..d31 as integers
+#     through x15..x17 -- crosses calls in the few callee-saved registers
 #     left, and meets block arguments in the stack. The checker must pass
 #     each, and each binary must still print and exit as the Cranelift build
 #     does. That spilling happened is asserted from the driver's own count.
 #   * control -- with `--ra-corrupt` the driver plants the classic allocator
 #     bug, one register given to two intervals that overlap, in every function
-#     where two such intervals exist; the checker must catch every one.
+#     where two such intervals exist; the checker must catch every one. Two
+#     more plant only in the floating-point file, so its checking is seen
+#     too: `--ra-corrupt=fp`, the same bugs among doubles alone, and
+#     `--ra-corrupt=class`, a double given the general register of its
+#     number. Every function that holds a double in a register (the driver's
+#     `with doubles` count) must have the class error planted and caught.
 set -uo pipefail
 cd "$(dirname "$0")/.."
 GRASM=${GRASM:-./target/release/grasm}
@@ -44,13 +50,44 @@ spilled=0
 functions=0
 planted=0
 caught=0
+fp_planted=0
+fp_caught=0
+class_planted=0
+class_caught=0
+with_fp=0
+fp_programs=0
 declare -a FAILED=()
+
+# corrupt KIND -- plants KIND in the program `$tir`, and sets `cn` (planted)
+# and `ck` (caught) from the driver's line, or fails the program.
+corrupt() {
+    local flag=$1
+    cn=""
+    ck=""
+    "$S3" "$tir" "$flag" >"$WORK/corrupt.out" 2>&1
+    # ra-corrupt: corrupted N of M functions, the checker caught K
+    local line
+    line=$(grep '^ra-corrupt:' "$WORK/corrupt.out")
+    cn=$(echo "$line" | sed -E 's/.*corrupted ([0-9]+) of.*/\1/')
+    ck=$(echo "$line" | sed -E 's/.*caught ([0-9]+)$/\1/')
+    if [ -z "$line" ] || [ -z "$cn" ] || [ -z "$ck" ]; then
+        fail=$((fail + 1))
+        FAILED+=("$src — the $flag control printed nothing it could be held to")
+        return 1
+    fi
+    if [ "$ck" != "$cn" ]; then
+        fail=$((fail + 1))
+        FAILED+=("$src — $flag: $cn corruptions planted, the checker caught $ck")
+    fi
+    return 0
+}
 
 for k in "${!S3_SRC[@]}"; do
     [ "${S3_RULE[$k]}" = "in" ] || continue
     src=${S3_SRC[$k]}
     tir=${S3_TIR[$k]}
     programs=$((programs + 1))
+    prog_fp=0
     if ! grasm_build_native "$src" "$WORK/p.cl" >"$WORK/cl.log" 2>&1; then
         fail=$((fail + 1))
         FAILED+=("$src — the Cranelift build fails: $(head -1 "$WORK/cl.log")")
@@ -68,9 +105,10 @@ for k in "${!S3_SRC[@]}"; do
             FAILED+=("$src — with $regs registers the backend answered $code: $(head -3 "$WORK/s3.err" | tr '\n' ' ')")
             continue
         fi
-        # functions: F   checked: C   spill slots: S   words: W
-        read -r _ f _ c _ _ s _ _ <"$WORK/s3.out"
+        # functions: F   checked: C   spill slots: S   words: W   with doubles: D
+        read -r _ f _ c _ _ s _ _ _ _ dbl <"$WORK/s3.out"
         functions=$((functions + c))
+        prog_fp=$dbl
         if [ "$c" != "$f" ]; then
             fail=$((fail + 1))
             FAILED+=("$src — with $regs registers only $c of $f functions passed the checker")
@@ -95,27 +133,34 @@ for k in "${!S3_SRC[@]}"; do
             diff "$WORK/cl.out" "$WORK/s3run.out" | head -6 | sed 's/^/  /'
         fi
     done
-    # The control.
-    "$S3" "$tir" --ra-corrupt >"$WORK/corrupt.out" 2>&1
-    # ra-corrupt: corrupted N of M functions, the checker caught K
-    line=$(grep '^ra-corrupt:' "$WORK/corrupt.out")
-    n=$(echo "$line" | sed -E 's/.*corrupted ([0-9]+) of.*/\1/')
-    kk=$(echo "$line" | sed -E 's/.*caught ([0-9]+)$/\1/')
-    if [ -z "$line" ] || [ -z "$n" ] || [ -z "$kk" ]; then
+    # The controls.
+    corrupt --ra-corrupt || continue
+    planted=$((planted + cn))
+    caught=$((caught + ck))
+    corrupt --ra-corrupt=fp || continue
+    fp_planted=$((fp_planted + cn))
+    fp_caught=$((fp_caught + ck))
+    corrupt --ra-corrupt=class || continue
+    class_planted=$((class_planted + cn))
+    class_caught=$((class_caught + ck))
+    if [ "${prog_fp:-0}" -gt 0 ]; then
+        fp_programs=$((fp_programs + 1))
+        with_fp=$((with_fp + prog_fp))
+        if [ "$cn" -lt 1 ]; then
+            fail=$((fail + 1))
+            FAILED+=("$src — $prog_fp functions hold doubles, and no class error could be planted")
+        fi
+    elif [ "$cn" != 0 ]; then
         fail=$((fail + 1))
-        FAILED+=("$src — the corruption control printed nothing it could be held to")
-        continue
-    fi
-    planted=$((planted + n))
-    caught=$((caught + kk))
-    if [ "$kk" != "$n" ]; then
-        fail=$((fail + 1))
-        FAILED+=("$src — $n corruptions planted, the checker caught $kk")
+        FAILED+=("$src — no function holds a double, yet $cn class errors were planted")
     fi
 done
 
 echo "programs: $programs   stressed runs: $runs   identical: $pass   failed: $fail"
 echo "functions checked: $functions   programs that spilled with no registers: $spilled"
+echo "programs with doubles: $fp_programs   functions with doubles: $with_fp"
+echo "control, doubles only: planted: $fp_planted   caught: $fp_caught"
+echo "control, a double in a general register: planted: $class_planted   caught: $class_caught"
 echo "control: planted: $planted   caught: $caught"
 if [ ${#FAILED[@]} -gt 0 ]; then
     echo
@@ -131,6 +176,16 @@ fi
 # entry point's arguments), so every program must have had one planted.
 if [ "$planted" -lt "$programs" ] || [ "$caught" -ne "$planted" ]; then
     echo "the control planted $planted errors in $programs programs and the checker caught $caught"
+    exit 1
+fi
+# The floating-point file is checked too: errors were planted among doubles,
+# of both kinds, and every one was caught.
+if [ "$fp_planted" -lt 1 ] || [ "$fp_caught" -ne "$fp_planted" ]; then
+    echo "the doubles-only control planted $fp_planted errors and the checker caught $fp_caught"
+    exit 1
+fi
+if [ "$class_planted" -lt "$fp_programs" ] || [ "$class_caught" -ne "$class_planted" ] || [ "$fp_programs" -lt 1 ]; then
+    echo "the class control planted $class_planted errors in $fp_programs programs with doubles and the checker caught $class_caught"
     exit 1
 fi
 if [ -z "${DIRS:-}" ] && [ "$programs" -lt "$S3_SUBSET_FLOOR" ]; then

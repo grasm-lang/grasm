@@ -5,7 +5,55 @@ Every defect that is known and not fixed, with its severity from
 to paste. S1 and S2 block a release; S3 and S4 do not, and this file is what
 makes shipping them honest rather than quiet.
 
-**Open S1: none. Open S2: none. Open S3: none. Open S4: none.**
+**Open S1: one (below). Open S2: none. Open S3: none. Open S4: none.**
+
+## Found on 2026-10-22 by the Grasm backend (S3, part three)
+
+**`return` inside a closure passed to `map` returns from the enclosing
+function in the native build -- *open, S1*.** The Cranelift build compiles
+`xs.map(|x| ..)`, `filter`, `fold`, `sort_by` and the searches by inlining
+the closure's body into a loop in the calling function, and a `return` in
+that body then leaves the *calling* function, with the closure's value as
+that function's result. `grasm run`, the TIR interpreter and the S3 backend
+(which lifts the closure into a function of its own) all return from the
+closure. Measured on the shapes below with one `return` in the closure:
+`map` and `fold` answer wrongly, `sort_by` exits with SIGSEGV (139), and
+`filter` is refused ("codegen bug ... Verifier errors").
+
+```
+fn early(xs: [i64]) -> [str] {
+    xs.map(|x| {
+        if x > 2 {
+            return "big"
+        }
+        "small {x}"
+    })
+}
+
+fn main() {
+    print(early([1, 2, 3, 4]))
+}
+```
+
+`grasm run` prints `[small 1, small 2, big, big]`; the native binary prints
+`big` -- a `str` returned from a function declared `-> [str]`, so the value
+that comes back is not even of the declared type. No corpus program has the
+shape. Twelve closures in three corpus programs (`numeric3-demo`,
+`tui-demo`, `web-demo`) contain a `return`, but each is bound to a name or
+returned rather than passed to one of those methods, so the Cranelift build
+compiles it as a function of its own; all three programs are in the S3
+subset and agree. Not fixed here: the S3 work changes no Rust.
+
+**An operator is written with the wrong operand type when an integer literal
+on its left meets an `f64` -- TIR, no effect on any engine.** [E-NUM-PROMOTE]
+makes the literal a double, and TIR writes it as a `float` node, but the
+`binary` node keeps the literal's type as its operand type: `3 + f` is
+`(binary f64 add i64 (float ..) (local f64 ..))`, and `5 == 5.0` is `eq
+i64`. docs/tir.md §6.5 says the operator is written "with the operand type
+that decides its meaning". Five nodes in two corpus programs
+(`E-NUM-PROMOTE`, `L-LIB-TO-STR`). The TIR interpreter decides by the values
+it holds and is unaffected; the S3 backend decides by the operands' own types
+when both are `f64` (`lower_binary`).
 
 ## Found on 2026-10-22 by the Grasm backend (S3)
 

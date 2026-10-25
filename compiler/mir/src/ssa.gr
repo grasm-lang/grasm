@@ -39,7 +39,7 @@ fn reads_of(v: Vir, i: i64) -> [i64] {
     if n >= 2 {
         out.push(v.b[i])
     }
-    if op == ir.M_CALL or op == ir.M_CALLRT {
+    if op == ir.M_CALL or op == ir.M_CALLRT or op == ir.M_CALLIND {
         for j in v.ca0[i]..(v.ca0[i] + v.can[i]) {
             out.push(v.cargs[j])
         }
@@ -259,6 +259,7 @@ pub fn to_ssa(v: Vir, name: str, sym: str) -> MirFn ! str {
         f.bnp.push(pvars[nbi].len())
         for x in pvars[nbi] {
             f.bparams.push(nvals)
+            f.vfp.push(ir.ty_fp(v.vty[x]))
             cur[x] = nvals
             stamp[x] = nbi
             nvals += 1
@@ -266,7 +267,9 @@ pub fn to_ssa(v: Vir, name: str, sym: str) -> MirFn ! str {
         f.bi0.push(f.op.len())
         if nbi == 0 {
             for x in zero_init {
-                f.op.push(ir.M_ICONST)
+                let fp = ir.ty_fp(v.vty[x])
+                f.op.push(if fp { ir.M_FCONST } else { ir.M_ICONST })
+                f.vfp.push(fp)
                 f.res.push(nvals)
                 f.a.push(-1)
                 f.b.push(-1)
@@ -298,12 +301,15 @@ pub fn to_ssa(v: Vir, name: str, sym: str) -> MirFn ! str {
                 rb = cur[x]
             }
             if op == ir.M_COPY {
+                if f.vfp[ra] != ir.ty_fp(v.vty[v.dst[i]]) {
+                    fail("`{name}`: a copy between a double and an integer (variable {v.a[i]} to {v.dst[i]})")
+                }
                 cur[v.dst[i]] = ra
                 stamp[v.dst[i]] = nbi
                 continue
             }
             let ca0 = f.cargs.len()
-            if op == ir.M_CALL or op == ir.M_CALLRT {
+            if op == ir.M_CALL or op == ir.M_CALLRT or op == ir.M_CALLIND {
                 for j in v.ca0[i]..(v.ca0[i] + v.can[i]) {
                     let x = v.cargs[j]
                     if stamp[x] != nbi {
@@ -316,6 +322,7 @@ pub fn to_ssa(v: Vir, name: str, sym: str) -> MirFn ! str {
             if v.dst[i] >= 0 {
                 res = nvals
                 nvals += 1
+                f.vfp.push(ir.ty_fp(v.vty[v.dst[i]]))
                 cur[v.dst[i]] = res
                 stamp[v.dst[i]] = nbi
             }
@@ -367,10 +374,61 @@ pub fn to_ssa(v: Vir, name: str, sym: str) -> MirFn ! str {
         f.tf.push(tf)
     }
     f.nvals = nvals
+    try check_classes(f)
     remove_trivial_params(f)
     remove_dead(f)
     split_edges(f)
     f
+}
+
+/// Every value is read as the class it was made: an operation's operands
+/// and result are the classes it fixes (`ir.res_fp`, `ir.arg_fp`), a branch
+/// tests an integer, and a block argument is the class of the parameter it
+/// is passed for. A lowering that mixed them would otherwise be found only
+/// by a program computing the wrong thing.
+fn check_classes(f: MirFn) -> () ! str {
+    let name = f.name
+    for i in 0..f.op.len() {
+        let op = f.op[i]
+        if op == ir.M_CALL or op == ir.M_CALLRT or op == ir.M_CALLIND or op == ir.M_INC or op == ir.M_DEC {
+            if (op == ir.M_INC or op == ir.M_DEC or op == ir.M_CALLIND) and f.vfp[f.a[i]] {
+                fail("`{name}`: {ir.op_name(op)} of a double")
+            }
+            continue
+        }
+        let n = ir.nreads(op)
+        if n >= 1 and f.vfp[f.a[i]] != ir.arg_fp(op, 0) {
+            fail("`{name}`: {ir.op_name(op)} reads v{f.a[i]} as the wrong class")
+        }
+        if n >= 2 and f.vfp[f.b[i]] != ir.arg_fp(op, 1) {
+            fail("`{name}`: {ir.op_name(op)} reads v{f.b[i]} as the wrong class")
+        }
+        if f.res[i] >= 0 and f.vfp[f.res[i]] != ir.res_fp(op) {
+            fail("`{name}`: {ir.op_name(op)} writes v{f.res[i]} as the wrong class")
+        }
+    }
+    for b in 0..ir.nblocks(f) {
+        if f.tk[b] == ir.M_BRIF and f.vfp[f.tv[b]] {
+            fail("`{name}`: block {b} branches on a double")
+        }
+        if f.tk[b] == ir.M_JUMP or f.tk[b] == ir.M_BRIF {
+            let s = f.tt[b]
+            for k in 0..f.tan[b] {
+                if f.vfp[f.targs[f.ta0[b] + k]] != f.vfp[f.bparams[f.bp0[s] + k]] {
+                    fail("`{name}`: block {b} passes an argument of the wrong class to block {s}")
+                }
+            }
+        }
+        if f.tk[b] == ir.M_BRIF {
+            let s = f.tf[b]
+            for k in 0..f.fan[b] {
+                if f.vfp[f.targs[f.fa0[b] + k]] != f.vfp[f.bparams[f.bp0[s] + k]] {
+                    fail("`{name}`: block {b} passes an argument of the wrong class to block {s}")
+                }
+            }
+        }
+    }
+    ()
 }
 
 fn find(repl: [i64], x: i64) -> i64 {

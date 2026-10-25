@@ -1,0 +1,445 @@
+// Monomorphization: every generic function the program uses, made once per
+// list of type arguments it is used at, as an ordinary function in the tree.
+//
+// TIR is not monomorphized (docs/tir.md §1): a generic function appears
+// once, `(generic n)` standing for its n-th type parameter, and every use
+// says the type arguments (`(targs ..)`). This pass runs before anything
+// else reads the program. From every non-generic function and constant, it
+// rewrites each use of a generic function -- a `call` or a `fnref` with type
+// arguments -- to name an instance, `name[T1,T2]`, which it makes the first
+// time it is asked for: a deep copy of the generic function with every
+// `(generic n)` replaced by a copy of the n-th type argument, its own
+// generics and bounds emptied. Each instance is then rewritten in turn, so a
+// generic function calling another reaches the right instance of it.
+//
+// A `boundcall` -- an interface method on a receiver of a generic type
+// ([T-INTERFACE-GENERIC]) -- is concrete once its function is: its
+// receiver's type picks the `impl` (`(impl "Iface" "key" (method "m" "f"))`,
+// keyed by a type's name, `[]` for a list), and it becomes a `call` of that
+// method's function -- itself an instance when the `impl` is generic, at the
+// type arguments that make its receiver parameter the receiver's type. That
+// is the Cranelift build's resolution "by the receiver's type: after
+// monomorphization a generic body's `x.show()` has one concrete type here".
+//
+// The tree only grows: copies and rewritten nodes are new elements, and a
+// generic function's own body is never changed, so it can be copied again.
+// The instances are new roots after the program's own, in the order they
+// were first asked for, which is deterministic.
+import sexp
+
+/// Instances beyond this many, or type arguments past this size, mean
+/// polymorphic recursion -- an instance that asks for a bigger one of itself
+/// -- which no finite set of copies satisfies.
+let MAX_INSTANCES = 4000
+let MAX_TYPE_TEXT = 600
+
+type Mono = {
+    t: TirTree,
+    /// Every function root, by name.
+    fn_root: Map[str, i64],
+    /// `Iface|key|method` -> the function an `impl` provides.
+    impl_fn: Map[str, str],
+    /// Instances made, by name.
+    made: Map[str, i64],
+    work: [i64],
+    /// The field types of instantiated generic types (`field_types`).
+    field_ty: Map[str, i64],
+}
+
+/// What monomorphization answers: the program, every generic function it
+/// uses instantiated, and the field types of every instantiated generic type
+/// it holds, by `field_key`.
+type MonoOut = {
+    t: TirTree,
+    field_ty: Map[str, i64],
+}
+
+/// The key of field `j` of variant `vidx` (-1 for a struct) of named type
+/// `x`, in `MonoOut.field_ty`.
+pub fn field_key(t: TirTree, x: i64, vidx: i64, j: i64) -> str {
+    "{type_text(t, x)}|{vidx}|{j}"
+}
+
+fn add_elem(inout t: TirTree, kind: i64, text: str, nl: bool) -> i64 {
+    let id = t.kind.len()
+    t.kind.push(kind)
+    t.text.push(text)
+    t.first.push(0)
+    t.count.push(0)
+    t.nl.push(nl)
+    id
+}
+
+/// A new list element holding `items`.
+fn add_list(inout t: TirTree, items: [i64], nl: bool) -> i64 {
+    let id = add_elem(t, 2, "", nl)
+    t.first[id] = t.elems.len()
+    t.count[id] = items.len()
+    for x in items {
+        t.elems.push(x)
+    }
+    id
+}
+
+/// Replaces element `i` of list `e`.
+fn set_at(inout t: TirTree, e: i64, i: i64, x: i64) {
+    t.elems[t.first[e] + i] = x
+}
+
+/// A copy of `x` whose root begins a line exactly when `nl` says.
+fn with_nl(inout t: TirTree, x: i64, nl: bool) -> i64 {
+    if t.nl[x] == nl {
+        return x
+    }
+    if t.kind[x] == 2 {
+        var items: [i64] = []
+        for j in 0..t.count[x] {
+            items.push(sexp.at(t, x, j))
+        }
+        return add_list(t, items, nl)
+    }
+    add_elem(t, t.kind[x], t.text[x], nl)
+}
+
+/// A copy of `x` with every `(generic n)` replaced by `subst[n]`. Leaves are
+/// shared; every list is new, so rewriting the copy never touches the
+/// original.
+fn copy_sub(inout t: TirTree, x: i64, subst: [i64]) -> i64 {
+    if t.kind[x] != 2 {
+        return x
+    }
+    if sexp.kw(t, x) == "generic" and t.count[x] == 2 {
+        let n = sexp.word(t, x, 1).parse_int() ?? -1
+        if n >= 0 and n < subst.len() {
+            let y = copy_sub(t, subst[n], [])
+            return with_nl(t, y, t.nl[x])
+        }
+    }
+    var items: [i64] = []
+    for j in 0..t.count[x] {
+        items.push(copy_sub(t, sexp.at(t, x, j), subst))
+    }
+    add_list(t, items, t.nl[x])
+}
+
+/// A type as text: what names an instance.
+pub fn type_text(t: TirTree, x: i64) -> str {
+    if t.kind[x] == 1 {
+        return "\"" + t.text[x] + "\""
+    }
+    if t.kind[x] == 0 {
+        return t.text[x]
+    }
+    var parts: [str] = []
+    for j in 0..t.count[x] {
+        parts.push(type_text(t, sexp.at(t, x, j)))
+    }
+    "(" + parts.join(" ") + ")"
+}
+
+/// Whether type `x` mentions a type parameter.
+fn has_generic(t: TirTree, x: i64) -> bool {
+    if t.kind[x] != 2 {
+        return false
+    }
+    if sexp.kw(t, x) == "generic" {
+        return true
+    }
+    for j in 0..t.count[x] {
+        if has_generic(t, sexp.at(t, x, j)) {
+            return true
+        }
+    }
+    false
+}
+
+/// The name an instance of `name` at `targs` goes by.
+fn inst_name(t: TirTree, name: str, targs: [i64]) -> str {
+    var parts: [str] = []
+    for a in targs {
+        parts.push(type_text(t, a))
+    }
+    name + "[" + parts.join(",") + "]"
+}
+
+/// The instance of generic function `name` at `targs`, made if new.
+fn instance(inout m: Mono, name: str, targs: [i64]) -> str ! str {
+    let iname = inst_name(m.t, name, targs)
+    if m.made.has(iname) {
+        return iname
+    }
+    if m.made.len() >= MAX_INSTANCES or iname.len() > MAX_TYPE_TEXT {
+        fail("outside the subset: polymorphic recursion in `{name}`")
+    }
+    let g = m.fn_root.get(name) ?? -1
+    if g < 0 {
+        fail("outside the subset: a call of `{name}`, which is not a function")
+    }
+    let r = copy_sub(m.t, g, targs)
+    // Each new element is bound before the next call that changes the tree:
+    // in `f(m.t, g(m.t))` with both `inout`, `f` would be handed the tree as
+    // it was before `g` added to it.
+    let nm = add_elem(m.t, 1, iname, false)
+    set_at(m.t, r, 1, nm)
+    let gk = add_elem(m.t, 0, "generics", false)
+    let gl = add_list(m.t, [gk], false)
+    set_at(m.t, r, 2, gl)
+    let bk = add_elem(m.t, 0, "bounds", false)
+    let bl = add_list(m.t, [bk], false)
+    set_at(m.t, r, 3, bl)
+    m.t.roots.push(r)
+    m.made.set(iname, r)
+    m.fn_root.set(iname, r)
+    m.work.push(r)
+    iname
+}
+
+/// Points call (or `fnref`) node `e` at function `name`, with no type
+/// arguments left to give.
+fn retarget(inout t: TirTree, e: i64, name: str) {
+    let nm = add_elem(t, 1, name, false)
+    set_at(t, e, 3, nm)
+    let tk = add_elem(t, 0, "targs", false)
+    let tl = add_list(t, [tk], false)
+    set_at(t, e, 4, tl)
+}
+
+/// The key an `impl` is found by for a receiver of type `x`: a scalar's or
+/// `str`'s name, a named type's name, `[]` for any list.
+fn impl_key(t: TirTree, x: i64) -> str {
+    if t.kind[x] == 0 {
+        return t.text[x]
+    }
+    let k = sexp.kw(t, x)
+    if k == "named" {
+        return sexp.word(t, x, 1)
+    }
+    if k == "list" {
+        return "[]"
+    }
+    type_text(t, x)
+}
+
+/// Binds the type parameters of pattern `p` so that it is `c`; false when no
+/// binding does.
+fn unify(t: TirTree, p: i64, c: i64, inout binds: [i64]) -> bool {
+    if t.kind[p] == 2 and sexp.kw(t, p) == "generic" and t.count[p] == 2 {
+        let n = sexp.word(t, p, 1).parse_int() ?? -1
+        if n < 0 or n >= binds.len() {
+            return false
+        }
+        if binds[n] < 0 {
+            binds[n] = c
+            return true
+        }
+        return type_text(t, binds[n]) == type_text(t, c)
+    }
+    if t.kind[p] != t.kind[c] {
+        return false
+    }
+    if t.kind[p] != 2 {
+        return t.text[p] == t.text[c]
+    }
+    if t.count[p] != t.count[c] {
+        return false
+    }
+    for j in 0..t.count[p] {
+        if not unify(t, sexp.at(t, p, j), sexp.at(t, c, j), binds) {
+            return false
+        }
+    }
+    true
+}
+
+/// Rewrites every use of a generic function under root `r` to name its
+/// instance, and every `boundcall` to the call it is.
+fn rewrite(inout m: Mono, r: i64) -> () ! str {
+    var stack: [i64] = [r]
+    while not stack.is_empty() {
+        let e = stack.pop() ?? 0
+        if m.t.kind[e] != 2 {
+            continue
+        }
+        let k = sexp.kw(m.t, e)
+        if (k == "call" or k == "fnref") and m.t.count[e] > 4 {
+            let ta = sexp.at(m.t, e, 4)
+            if m.t.kind[ta] == 2 and m.t.count[ta] > 1 {
+                var targs: [i64] = []
+                for j in 1..m.t.count[ta] {
+                    targs.push(sexp.at(m.t, ta, j))
+                }
+                let iname = try instance(m, sexp.word(m.t, e, 3), targs)
+                retarget(m.t, e, iname)
+            }
+        } else if k == "boundcall" {
+            // (boundcall T @span "Iface" "method" receiver args..)
+            let iface = sexp.word(m.t, e, 3)
+            let meth = sexp.word(m.t, e, 4)
+            let ks = sexp.kids(m.t, e)
+            if ks.is_empty() {
+                fail("a `boundcall` of `{meth}` with no receiver")
+            }
+            let rt = sexp.at(m.t, ks[0], 1)
+            if has_generic(m.t, rt) {
+                fail("outside the subset: a `boundcall` of `{meth}` on {type_text(m.t, rt)}")
+            }
+            let key = impl_key(m.t, rt)
+            let f = m.impl_fn.get("{iface}|{key}|{meth}") ?? ""
+            if f == "" {
+                fail("outside the subset: no `impl {iface}` for {type_text(m.t, rt)} to call `{meth}` on")
+            }
+            var callee = f
+            let froot = m.fn_root.get(f) ?? -1
+            if froot < 0 {
+                fail("outside the subset: no `impl {iface}` for {type_text(m.t, rt)} to call `{meth}` on")
+            }
+            let gens = sexp.at(m.t, froot, 2)
+            let ng = m.t.count[gens] - 1
+            if ng > 0 {
+                // A generic `impl`: its type parameters are what make its
+                // receiver parameter the receiver's type.
+                let ps = sexp.kids(m.t, sexp.kids(m.t, froot)[0])
+                var binds: [i64] = []
+                for j in 0..ng {
+                    binds.push(-1)
+                }
+                if ps.is_empty() or not unify(m.t, sexp.at(m.t, ps[0], 4), rt, binds) {
+                    fail("outside the subset: `{f}` does not take {type_text(m.t, rt)}")
+                }
+                for b in binds {
+                    if b < 0 {
+                        fail("outside the subset: `{f}` has a type parameter its receiver does not fix")
+                    }
+                }
+                callee = try instance(m, f, binds)
+            }
+            let ck = add_elem(m.t, 0, "call", false)
+            set_at(m.t, e, 0, ck)
+            retarget(m.t, e, callee)
+        }
+        var i = m.t.count[e] - 1
+        while i >= 0 {
+            let x = sexp.at(m.t, e, i)
+            if m.t.kind[x] == 2 {
+                stack.push(x)
+            }
+            i -= 1
+        }
+    }
+    ()
+}
+
+/// A generic struct or sum type's field types at the arguments it is used
+/// at: for every instantiated named type in the program -- `(named "Tree"
+/// i64)` -- each field's declared type with the type's own parameters
+/// replaced, made as a new element, and the same for the named types those
+/// fields hold in turn. A pattern that takes a `Tree[i64]` apart, or an
+/// assignment down a path through one, reads its fields' types here: the
+/// declaration says only `Tree[T]`.
+fn field_types(inout m: Mono) {
+    var decl: Map[str, i64] = {}
+    for r in m.t.roots {
+        if sexp.kw(m.t, r) == "type" {
+            decl.set(sexp.word(m.t, r, 1), r)
+        }
+    }
+    var todo: [i64] = []
+    let n = m.t.kind.len()
+    for x in 0..n {
+        if m.t.kind[x] == 2 and m.t.count[x] > 2 and sexp.kw(m.t, x) == "named" {
+            todo.push(x)
+        }
+    }
+    var seen: Map[str, bool] = {}
+    while not todo.is_empty() {
+        let x = todo.pop() ?? 0
+        if m.t.kind[x] != 2 or has_generic(m.t, x) {
+            continue
+        }
+        if sexp.kw(m.t, x) != "named" {
+            // A list, a tuple, a map of named types: each of them.
+            for j in 1..m.t.count[x] {
+                todo.push(sexp.at(m.t, x, j))
+            }
+            continue
+        }
+        let key = type_text(m.t, x)
+        if seen.has(key) {
+            continue
+        }
+        seen.set(key, true)
+        let d = decl.get(sexp.word(m.t, x, 1)) ?? -1
+        if d < 0 {
+            continue
+        }
+        var args: [i64] = []
+        for j in 2..m.t.count[x] {
+            args.push(sexp.at(m.t, x, j))
+        }
+        let dk = sexp.kids(m.t, d)
+        if dk.is_empty() {
+            continue
+        }
+        let body = dk[dk.len() - 1]
+        var groups: [i64] = []
+        var gidx: [i64] = []
+        if sexp.kw(m.t, body) == "struct" {
+            groups.push(body)
+            gidx.push(-1)
+        } else {
+            let vs = sexp.kids(m.t, body)
+            for vi in 0..vs.len() {
+                groups.push(vs[vi])
+                gidx.push(vi)
+            }
+        }
+        for g in 0..groups.len() {
+            let fs = sexp.kids(m.t, groups[g])
+            for j in 0..fs.len() {
+                let fe = sexp.at(m.t, fs[j], 2)
+                let c = copy_sub(m.t, fe, args)
+                m.field_ty.set("{key}|{gidx[g]}|{j}", c)
+                if m.t.kind[c] == 2 {
+                    todo.push(c)
+                }
+            }
+        }
+    }
+    ()
+}
+
+/// The program with every generic function it uses instantiated.
+pub fn monomorphize(t0: TirTree) -> MonoOut ! str {
+    var m = Mono{ t: t0, fn_root: {}, impl_fn: {}, made: {}, work: [], field_ty: {} }
+    var start: [i64] = []
+    for r in t0.roots {
+        let k = sexp.kw(t0, r)
+        if k == "fn" {
+            m.fn_root.set(sexp.word(t0, r, 1), r)
+            if t0.count[sexp.at(t0, r, 2)] <= 1 {
+                start.push(r)
+            }
+        } else if k == "const" {
+            start.push(r)
+        } else if k == "impl" {
+            let iface = sexp.word(t0, r, 1)
+            let key = sexp.word(t0, r, 2)
+            for meth in sexp.kids(t0, r) {
+                if sexp.kw(t0, meth) == "method" {
+                    m.impl_fn.set("{iface}|{key}|{sexp.word(t0, meth, 1)}", sexp.word(t0, meth, 2))
+                }
+            }
+        }
+    }
+    for r in start {
+        try rewrite(m, r)
+    }
+    while not m.work.is_empty() {
+        // First made, first rewritten: the order the instances appear in.
+        let r = m.work[0]
+        m.work.remove(0)
+        try rewrite(m, r)
+    }
+    field_types(m)
+    MonoOut{ t: m.t, field_ty: m.field_ty }
+}

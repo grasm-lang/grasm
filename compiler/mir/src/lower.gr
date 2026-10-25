@@ -15,6 +15,7 @@
 import sexp
 import ir
 import prog
+import mono
 
 /// A function in the variable form, and the state of building it.
 type Vir = {
@@ -85,8 +86,23 @@ type Vir = {
     boxed_result: bool,
     /// The type element of the `T` it answers.
     ok_te: i64,
+    // Functions this one makes values of (`M_FNADDR`'s `imm` indexes these
+    // until the driver gives each its callable id): a closure lifted out of
+    // the body (`LIFT_CLOSURE`, its TIR element and the variables it
+    // captures, with their types), or the wrapper a named function is called
+    // through as a value (`LIFT_WRAPPER`, the callable).
+    lift_kind: [i64],
+    lift_elem: [i64],
+    lift_caps: [[i64]],
+    lift_capte: [[i64]],
+    /// The kind of what the function answers, when it answers a value
+    /// directly: what a placeholder for a missing one is made as.
+    ret_kind: i64,
     errors: [str],
 }
+
+pub let LIFT_CLOSURE = 0
+pub let LIFT_WRAPPER = 1
 
 pub fn new_vir() -> Vir {
     Vir{
@@ -99,6 +115,7 @@ pub fn new_vir() -> Vir {
         owned: [], scope_mark: [], temps: [], loop_owned: [], loop_temps: [],
         descs: [], desc_ix: {}, argv_base: -1, argv_n: 0, tvty: {},
         split_out: -1, boxed_result: false, ok_te: -1,
+        lift_kind: [], lift_elem: [], lift_caps: [], lift_capte: [], ret_kind: ir.TY_I64,
         errors: [],
     }
 }
@@ -212,6 +229,92 @@ fn icmp(inout v: Vir, cc: i64, a: i64, b: i64) -> i64 {
     d
 }
 
+// ----- doubles -------------------------------------------------------------------
+//
+// An `f64` lives in a floating-point register: its variables are `TY_F64`,
+// its operations the `M_F*` ones. Where the runtime takes or answers a
+// double's *bits* in an integer register -- a scalar list's element, a
+// struct's word, a split result's word, an interpolated piece -- the bits
+// cross with `M_FBITS` and `M_FFROMBITS`, as the Cranelift build's `bitcast`.
+
+/// The double whose bits are `bits`.
+fn fkonst(inout v: Vir, bits: i64) -> i64 {
+    let d = new_var(v, ir.TY_F64)
+    emit(v, ir.M_FCONST, d, -1, -1, bits)
+    d
+}
+
+fn fop1(inout v: Vir, op: i64, a: i64) -> i64 {
+    let d = new_var(v, ir.TY_F64)
+    emit(v, op, d, a, -1, 0)
+    d
+}
+
+fn fop2(inout v: Vir, op: i64, a: i64, b: i64) -> i64 {
+    let d = new_var(v, ir.TY_F64)
+    emit(v, op, d, a, b, 0)
+    d
+}
+
+fn fcmp(inout v: Vir, cc: i64, a: i64, b: i64) -> i64 {
+    let d = new_var(v, ir.TY_BOOL)
+    emit(v, ir.M_FCMP, d, a, b, cc)
+    d
+}
+
+/// A double's bits, as an integer.
+fn fbits(inout v: Vir, x: i64) -> i64 {
+    let d = new_var(v, ir.TY_I64)
+    emit(v, ir.M_FBITS, d, x, -1, 0)
+    d
+}
+
+/// An integer's bits, as a double.
+fn from_bits(inout v: Vir, x: i64) -> i64 {
+    fop1(v, ir.M_FFROMBITS, x)
+}
+
+/// `x` as a word for the runtime: a double's bits, anything else itself.
+fn word_of(inout v: Vir, x: i64) -> i64 {
+    if x >= 0 and ir.ty_fp(v.vty[x]) {
+        return fbits(v, x)
+    }
+    x
+}
+
+/// A runtime word read back as kind `k`: the bits of a double become one.
+fn word_as(inout v: Vir, w: i64, k: i64) -> i64 {
+    if ir.ty_fp(k) {
+        return from_bits(v, w)
+    }
+    w
+}
+
+/// Stores `x` at address `addr`: a double from its register, anything else
+/// as a word.
+fn store_at(inout v: Vir, addr: i64, x: i64) {
+    let op = if x >= 0 and ir.ty_fp(v.vty[x]) { ir.M_FSTORE } else { ir.M_STORE }
+    emit(v, op, -1, addr, x, 0)
+    ()
+}
+
+/// Loads a value of kind `k` from `addr` into `dst`.
+fn load_into(inout v: Vir, dst: i64, addr: i64) {
+    let op = if ir.ty_fp(v.vty[dst]) { ir.M_FLOAD } else { ir.M_LOAD }
+    emit(v, op, dst, addr, -1, 0)
+    ()
+}
+
+/// A placeholder of `x`'s class where no value arrives: an expression that
+/// cannot finish, in code that never runs.
+fn zero_like(inout v: Vir, ty: i64) -> i64 {
+    if ir.ty_fp(ty) {
+        fkonst(v, 0)
+    } else {
+        konst(v, 0)
+    }
+}
+
 /// A call into the runtime. One that does not return ends the block.
 fn callrt(inout v: Vir, sym: i64, args: [i64]) -> i64 {
     var d = -1
@@ -241,6 +344,30 @@ let R_BOOL8 = 2
 let R_BOX = 3
 /// Nothing: it panics or exits.
 let R_NEVER = 4
+/// A double, in d0.
+let R_F64 = 5
+
+/// Which arguments of runtime function `name` are doubles (in d0..d7 by the
+/// C convention, AAPCS64), as one letter each: `f` a double, `w` a word. ""
+/// for a function that takes no double, which is every other one.
+fn rt_fp_args(name: str) -> str {
+    match name {
+        "grasm_out_f64" -> "f"
+        "grasm_box_f64" -> "f"
+        "grasm_str_from_f64" -> "f"
+        "grasm_f64_is_nan" -> "f"
+        "grasm_f64_is_finite" -> "f"
+        "grasm_f64_to_fixed" -> "fw"
+        "grasm_pow_f64" -> "ff"
+        "grasm_f64_rem" -> "ff"
+        "grasm_f64_atan2" -> "ff"
+        "grasm_f64_hypot" -> "ff"
+        "grasm_f64_log" -> "ff"
+        "grasm_f64_min" -> "ff"
+        "grasm_f64_max" -> "ff"
+        _ -> if name.starts_with("grasm_f64_") { "f" } else { "" }
+    }
+}
 
 fn rt_id(inout v: Vir, name: str) -> i64 {
     match v.rt_ix.get(name) {
@@ -257,9 +384,20 @@ fn rt_id(inout v: Vir, name: str) -> i64 {
 /// A call of runtime function `name`, the same symbol with the same
 /// arguments as the Cranelift build calls for the same construct.
 fn rt(inout v: Vir, name: str, args: [i64], ret: i64) -> i64 {
+    // The classes the C function takes, held to what is passed: a double
+    // handed to a function that reads a word (or the reverse) would be read
+    // from the other register file.
+    let sig = rt_fp_args(name)
+    for k in 0..args.len() {
+        let want = k < sig.len() and sig.substr(k, 1) == "f"
+        let x = args[k]
+        if x >= 0 and ir.ty_fp(v.vty[x]) != want {
+            bad(v, "internal: argument {k} of `{name}` is of the wrong register class")
+        }
+    }
     var d = -1
-    if ret == R_WORD or ret == R_BOOL8 or ret == R_BOX {
-        d = new_var(v, if ret == R_BOX { ir.TY_BOX } else { ir.TY_I64 })
+    if ret == R_WORD or ret == R_BOOL8 or ret == R_BOX or ret == R_F64 {
+        d = new_var(v, if ret == R_BOX { ir.TY_BOX } else if ret == R_F64 { ir.TY_F64 } else { ir.TY_I64 })
     }
     let i = emit(v, ir.M_CALLRT, d, -1, -1, rt_id(v, name))
     v.ca0[i] = v.cargs.len()
@@ -444,6 +582,10 @@ fn build_piece(inout v: Vir, t: TirTree, sb: i64, x: i64, te: i64, where_: str) 
         callrt(v, ir.RT_STR_BUILD_I64, [sb, x])
     } else if k == ir.TY_BOOL {
         callrt(v, ir.RT_STR_BUILD_BOOL, [sb, x])
+    } else if ir.ty_fp(k) {
+        // The builder takes the bits, as the Cranelift build passes them.
+        let bits = fbits(v, x)
+        rt(v, "grasm_str_build_f64", [sb, bits], R_VOID)
     } else if k == ir.TY_UNIT {
         let ta = text_args(v, "()")
         callrt(v, ir.RT_STR_BUILD_TEXT, [sb, ta[0], ta[1]])
@@ -515,6 +657,8 @@ fn scalar_kind(t: TirTree, te: i64) -> i64 {
         5
     } else if ir.ty_int(k) {
         0
+    } else if ir.ty_fp(k) {
+        1
     } else if k == ir.TY_BOOL {
         2
     } else {
@@ -530,6 +674,8 @@ fn box_kind(inout v: Vir, x: i64, k: i64) -> i64 {
         rt(v, "grasm_box_u64", [x], R_BOX)
     } else if ir.ty_int(k) {
         rt(v, "grasm_box_i64", [x], R_BOX)
+    } else if ir.ty_fp(k) {
+        rt(v, "grasm_box_f64", [x], R_BOX)
     } else if k == ir.TY_BOOL {
         rt(v, "grasm_box_bool", [x], R_BOX)
     } else {
@@ -546,6 +692,8 @@ fn unbox_kind(inout v: Vir, b: i64, k: i64) -> i64 {
     var x = -1
     if ir.ty_int(k) {
         x = rt(v, "grasm_unbox_i64", [b], R_WORD)
+    } else if ir.ty_fp(k) {
+        x = rt(v, "grasm_unbox_f64", [b], R_F64)
     } else if k == ir.TY_BOOL {
         x = rt(v, "grasm_unbox_bool", [b], R_BOOL8)
     } else {
@@ -601,6 +749,20 @@ fn has_generic(t: TirTree, x: i64) -> bool {
         }
     }
     false
+}
+
+/// The type of field `j` of variant `vidx` (-1 for a struct) of named type
+/// `x`, whose declared type is `fe`: the declared type when it is concrete,
+/// the type argument when it is one, else the instantiated type
+/// monomorphization made (`mono.field_types`) -- or the declared type, still
+/// generic, which the caller refuses.
+fn field_te(info: TirInfo, x: i64, vidx: i64, j: i64, fe: i64) -> i64 {
+    let t = info.t
+    let s = subst(t, fe, named_args(t, x))
+    if not has_generic(t, s) {
+        return s
+    }
+    info.field_ty.get(mono.field_key(t, x, vidx, j)) ?? s
 }
 
 /// The kind of a declared field type under `args`.
@@ -709,8 +871,9 @@ fn lower_list(info: TirInfo, inout v: Vir, e: i64) -> i64 {
         let xv = value_of(info, v, x)
         if sk >= 0 {
             let kc = konst(v, sk)
+            let w = word_of(v, xv)
             forget_temp(v, l)
-            l = rt(v, "grasm_list_push_scalar", [l, xv, kc], R_BOX)
+            l = rt(v, "grasm_list_push_scalar", [l, w, kc], R_BOX)
         } else {
             let b = box_kind(v, xv, ek)
             forget_temp(v, l)
@@ -753,7 +916,8 @@ fn list_elem(inout v: Vir, t: TirTree, l: i64, i: i64, te: i64) -> i64 {
     let sk = scalar_kind(t, te)
     if sk >= 0 {
         let kc = konst(v, sk)
-        return rt(v, "grasm_list_get_scalar", [l, i, kc], R_WORD)
+        let w = rt(v, "grasm_list_get_scalar", [l, i, kc], R_WORD)
+        return word_as(v, w, ty_kind(t, te))
     }
     let b = rt(v, "grasm_list_get", [l, i], R_BOX)
     unbox_kind(v, b, ty_kind(t, te))
@@ -918,7 +1082,7 @@ fn struct_desc(info: TirInfo, inout v: Vir, x: i64) -> i64 {
     for f in sexp.kids(t, body) {
         d.fields.push(sexp.word(t, f, 1))
         let k = field_kind(t, sexp.at(t, f, 2), args)
-        d.kinds.push(if k == ir.TY_U64 { ir.FK_U64 } else if ir.ty_int(k) { ir.FK_I64 } else if k == ir.TY_BOOL { ir.FK_BOOL } else if k == ir.TY_UNIT { ir.FK_UNIT } else { ir.FK_BOXED })
+        d.kinds.push(if k == ir.TY_U64 { ir.FK_U64 } else if ir.ty_int(k) { ir.FK_I64 } else if ir.ty_fp(k) { ir.FK_F64 } else if k == ir.TY_BOOL { ir.FK_BOOL } else if k == ir.TY_UNIT { ir.FK_UNIT } else { ir.FK_BOXED })
         if not held(k) {
             bad(v, "outside the subset: struct `{d.name}` has a field of a type this part does not hold")
         }
@@ -987,7 +1151,8 @@ fn lower_struct(info: TirInfo, inout v: Vir, e: i64) -> i64 {
     for i in 0..nf {
         let addr = new_var(v, ir.TY_I64)
         emit(v, ir.M_SLOTADDR, addr, -1, -1, base + i)
-        emit(v, ir.M_STORE, -1, addr, words[i], 0)
+        // A double's word is its bits, stored from its own register.
+        store_at(v, addr, words[i])
         if is_temp(v, words[i]) {
             forget_temp(v, words[i])
         }
@@ -1018,7 +1183,8 @@ fn lower_field(info: TirInfo, inout v: Vir, e: i64) -> i64 {
     if ir.ty_boxed(k) {
         r = rt(v, "grasm_struct_get_at", [s, ic], R_BOX)
     } else {
-        r = rt(v, "grasm_struct_scalar_at", [s, ic], R_WORD)
+        let w = rt(v, "grasm_struct_scalar_at", [s, ic], R_WORD)
+        r = word_as(v, w, k)
     }
     drop_temp(v, s)
     r
@@ -1172,6 +1338,14 @@ fn ty_kind(t: TirTree, x: i64) -> i64 {
         // `()` written as a tuple of nothing is the unit value.
         return ir.TY_UNIT
     }
+    if k == "fn" {
+        // A function value, `(fn (P..) R row)`: the runtime's boxed `Fn`, its
+        // code and its captures, when what it takes and answers are held.
+        if fn_sig_held(t, x) {
+            return ir.TY_BOX
+        }
+        return ir.TY_OTHER
+    }
     if k == "tuple" or k == "map" or k == "named" {
         let from = if k == "named" { 2 } else { 1 }
         for j in from..t.count[x] {
@@ -1182,6 +1356,37 @@ fn ty_kind(t: TirTree, x: i64) -> i64 {
         return ir.TY_BOX
     }
     ir.TY_OTHER
+}
+
+/// Whether a function type `(fn (P..) R row)` takes and answers held types.
+fn fn_sig_held(t: TirTree, x: i64) -> bool {
+    if t.count[x] < 3 {
+        return false
+    }
+    let ps = sexp.at(t, x, 1)
+    if t.kind[ps] != 2 {
+        return false
+    }
+    for j in 0..t.count[ps] {
+        if not held(ty_kind(t, sexp.at(t, ps, j))) {
+            return false
+        }
+    }
+    held(ty_kind(t, sexp.at(t, x, 2)))
+}
+
+/// A function type's parameter types and its result type.
+fn fn_params(t: TirTree, x: i64) -> [i64] {
+    var out: [i64] = []
+    let ps = sexp.at(t, x, 1)
+    for j in 0..t.count[ps] {
+        out.push(sexp.at(t, ps, j))
+    }
+    out
+}
+
+fn fn_ret(t: TirTree, x: i64) -> i64 {
+    sexp.at(t, x, 2)
 }
 
 /// The kind of element `i` of node `e`'s type.
@@ -1264,7 +1469,7 @@ fn value_of(info: TirInfo, inout v: Vir, e: i64) -> i64 {
     if x >= 0 {
         x
     } else {
-        konst(v, 0)
+        zero_like(v, kind_at(info.t, e, 1))
     }
 }
 
@@ -1279,6 +1484,7 @@ fn lower_expr(info: TirInfo, inout v: Vir, e: i64) -> i64 {
     let k = sexp.kw(t, e)
     match k {
         "int" -> lower_int(info, v, e)
+        "float" -> lower_float(info, v, e)
         "bool" -> konst(v, if sexp.word(t, e, 3) == "true" { 1 } else { 0 })
         "unit" -> -1
         "local" -> lower_local(info, v, e)
@@ -1334,6 +1540,9 @@ fn lower_expr(info: TirInfo, inout v: Vir, e: i64) -> i64 {
         }
         "while" -> lower_while(info, v, e)
         "for" -> lower_for(info, v, e)
+        "closure" -> lower_closure(info, v, e)
+        "fnref" -> lower_fnref(info, v, e)
+        "callvalue" -> lower_callvalue(info, v, e)
         _ -> {
             bad(v, "outside the subset: `{k}` {span_of(t, e)}")
             -1
@@ -1354,6 +1563,33 @@ fn lower_int(info: TirInfo, inout v: Vir, e: i64) -> i64 {
         return konst(v, u.as_i64())
     }
     konst(v, text.parse_int() ?? 0)
+}
+
+/// A float literal: TIR writes its bits, `0x` and sixteen hex digits, so the
+/// double is exact by construction.
+fn lower_float(info: TirInfo, inout v: Vir, e: i64) -> i64 {
+    let t = info.t
+    let text = sexp.word(t, e, 3)
+    let bits = hex_bits(text)
+    if bits.is_none() or node_ty(t, e) != ir.TY_F64 {
+        bad(v, "a float literal written `{text}` {span_of(t, e)}")
+        return fkonst(v, 0)
+    }
+    fkonst(v, bits ?? 0)
+}
+
+/// `0x` and sixteen hex digits as the 64 bits they spell.
+pub fn hex_bits(text: str) -> Option[i64] {
+    if text.len() != 18 or not text.starts_with("0x") {
+        return None
+    }
+    // Two halves, each in range of a non-negative `i64`.
+    let hi = text.substr(2, 8).parse_int_base(16) ?? -1
+    let lo = text.substr(10, 8).parse_int_base(16) ?? -1
+    if hi < 0 or lo < 0 {
+        return None
+    }
+    Some(hi.shl(32).bit_or(lo))
 }
 
 /// A local read. The value is copied out, so a later assignment to the
@@ -1462,6 +1698,29 @@ fn arith(inout v: Vir, op: str, ty: i64, a: i64, b: i64) -> i64 {
     }
 }
 
+/// `a <op> b` on doubles: the four operations as instructions, `%` and `^`
+/// by the runtime (the Cranelift build's `grasm_f64_rem` and
+/// `grasm_pow_f64`), and the comparisons IEEE's -- a NaN is unordered, so
+/// it makes every comparison false but `!=`.
+fn farith(inout v: Vir, op: str, a: i64, b: i64, where_: str) -> i64 {
+    match op {
+        "add" -> fop2(v, ir.M_FADD, a, b)
+        "sub" -> fop2(v, ir.M_FSUB, a, b)
+        "mul" -> fop2(v, ir.M_FMUL, a, b)
+        "div" -> fop2(v, ir.M_FDIV, a, b)
+        "rem" -> rt(v, "grasm_f64_rem", [a, b], R_F64)
+        "pow" -> rt(v, "grasm_pow_f64", [a, b], R_F64)
+        _ -> {
+            let cc = cmp_cc(op, false)
+            if cc < 0 {
+                bad(v, "outside the subset: `{op}` on f64 {where_}")
+                return fkonst(v, 0)
+            }
+            fcmp(v, cc, a, b)
+        }
+    }
+}
+
 fn cmp_cc(op: str, unsigned: bool) -> i64 {
     match op {
         "eq" -> ir.CC_EQ
@@ -1477,8 +1736,14 @@ fn cmp_cc(op: str, unsigned: bool) -> i64 {
 fn lower_binary(info: TirInfo, inout v: Vir, e: i64) -> i64 {
     let t = info.t
     let op = sexp.word(t, e, 3)
-    let ot = ty_at(t, e, 4)
+    var ot = ty_at(t, e, 4)
     let ks = sexp.kids(t, e)
+    // An integer literal on the left of an `f64` ([E-NUM-PROMOTE], `3 + f`)
+    // is a `float` node in TIR, but the operator is still written with the
+    // literal's `i64` (`add i64`): the operands' own types are what decide.
+    if ir.ty_int(ot) and ks.len() == 2 and kind_at(t, ks[0], 1) == ir.TY_F64 and kind_at(t, ks[1], 1) == ir.TY_F64 {
+        ot = ir.TY_F64
+    }
     if op == "and" or op == "or" {
         let a = value_of(info, v, ks[0])
         let r = new_var(v, ir.TY_BOOL)
@@ -1502,6 +1767,11 @@ fn lower_binary(info: TirInfo, inout v: Vir, e: i64) -> i64 {
     }
     if ir.ty_boxed(kind_at(t, e, 4)) {
         return lower_boxed_binary(info, v, e, op, ty_el(t, e, 4))
+    }
+    if ir.ty_fp(ot) {
+        let a = value_of(info, v, ks[0])
+        let b = value_of(info, v, ks[1])
+        return farith(v, op, a, b, span_of(t, e))
     }
     let cc = cmp_cc(op, ir.ty_unsigned(ot) or ot == ir.TY_BOOL)
     if cc >= 0 {
@@ -1610,6 +1880,10 @@ fn lower_unary(info: TirInfo, inout v: Vir, e: i64) -> i64 {
         let n = op1(v, ir.M_NEG, x)
         return wrap(v, ot, n)
     }
+    if op == "neg" and ir.ty_fp(ot) {
+        // The sign flipped, as Cranelift's `fneg`: `-0.0` from `0.0`.
+        return fop1(v, ir.M_FNEG, x)
+    }
     bad(v, "outside the subset: `{op}` on {ty_text(t, e, 4)} {span_of(t, e)}")
     x
 }
@@ -1711,7 +1985,7 @@ fn call_parts(info: TirInfo, inout v: Vir, e: i64) -> (i64, i64, i64) {
             let w = tvar_of(v, sexp.word(t, a, 3).parse_int() ?? -1)
             let k = slot_for(v, w)
             let addr = slot_addr(v, k)
-            emit(v, ir.M_STORE, -1, addr, w, 0)
+            store_at(v, addr, w)
             vals.push(addr)
             homes[i] = w
             slots[i] = k
@@ -1746,10 +2020,14 @@ fn call_parts(info: TirInfo, inout v: Vir, e: i64) -> (i64, i64, i64) {
         }
     }
     var r = call_fn(v, c, args, returns_value(info, c))
+    if r >= 0 and out_slot < 0 and ir.ty_fp(rty) {
+        // A double comes back in d0.
+        v.vty[r] = ir.TY_F64
+    }
     for i in 0..ks.len() {
         if slots[i] >= 0 {
             let addr = slot_addr(v, slots[i])
-            emit(v, ir.M_LOAD, homes[i], addr, -1, 0)
+            load_into(v, homes[i], addr)
         }
     }
     for pl in places {
@@ -1789,6 +2067,9 @@ fn lower_const_read(info: TirInfo, inout v: Vir, e: i64) -> i64 {
         v.vty[r] = ir.TY_BOX
         own_temp(v, r)
     }
+    if r >= 0 and ir.ty_fp(k) {
+        v.vty[r] = ir.TY_F64
+    }
     r
 }
 
@@ -1804,6 +2085,8 @@ fn out_value(inout v: Vir, x: i64, ty: i64, where_: str) {
         callrt(v, ir.RT_OUT_I64, [x])
     } else if ty == ir.TY_BOOL {
         callrt(v, ir.RT_OUT_BOOL, [x])
+    } else if ir.ty_fp(ty) {
+        rt(v, "grasm_out_f64", [x], R_VOID)
     } else if ty == ir.TY_UNIT {
         out_text(v, "()")
     } else {
@@ -1914,6 +2197,11 @@ fn lower_builtin(info: TirInfo, inout v: Vir, e: i64) -> i64 {
     }
     if name == "fail" and ks.len() == 1 {
         return lower_fail(info, v, e)
+    }
+    if (name == "pi" or name == "e") and ks.len() == 0 and node_ty(t, e) == ir.TY_F64 {
+        // `std::f64::consts::PI` and `E`, the doubles the Cranelift build
+        // writes for them.
+        return fkonst(v, if name == "pi" { 0x400921FB54442D18 } else { 0x4005BF0A8B145769 })
     }
     let r = rt_builtin(info, v, e, name, ks)
     if r != -2 {
@@ -2041,7 +2329,7 @@ fn branch_value(inout v: Vir, r: i64, x: i64) {
         return
     }
     if r >= 0 {
-        let xv = if x >= 0 { x } else { konst(v, 0) }
+        let xv = if x >= 0 { x } else { zero_like(v, v.vty[r]) }
         copy_to(v, r, xv)
         if is_temp(v, xv) {
             forget_temp(v, xv)
@@ -2211,7 +2499,7 @@ fn lower_pat(info: TirInfo, inout v: Vir, p: i64, s: i64, ste: i64, no: PatFail)
                 if sexp.kw(t, subs[j]) == "pwild" {
                     continue
                 }
-                let fte = subst(t, sexp.at(t, fdecls[j], 2), args)
+                let fte = field_te(info, ste, idx, j, sexp.at(t, fdecls[j], 2))
                 let k = field_kind(t, sexp.at(t, fdecls[j], 2), args)
                 if not held(k) or has_generic(t, fte) {
                     bad(v, "outside the subset: a variant field of a type this part does not hold {span_of(t, p)}")
@@ -2390,6 +2678,9 @@ fn lower_assign(info: TirInfo, inout v: Vir, e: i64) -> i64 {
     } else if ir.ty_int(ty) {
         let r = arith(v, op, ty, w, x)
         copy_to(v, w, r)
+    } else if ir.ty_fp(ty) {
+        let r = farith(v, op, w, x, span_of(t, ks[1]))
+        copy_to(v, w, r)
     } else {
         bad(v, "outside the subset: `{op}=` on {ty_text(t, e, 2)}")
     }
@@ -2406,7 +2697,8 @@ fn read_child(inout v: Vir, t: TirTree, c: i64, is_field: bool, key: i64, te: i6
         if ir.ty_boxed(k) {
             return rt(v, "grasm_struct_get_at", [c, ic], R_BOX)
         }
-        return rt(v, "grasm_struct_scalar_at", [c, ic], R_WORD)
+        let w = rt(v, "grasm_struct_scalar_at", [c, ic], R_WORD)
+        return word_as(v, w, k)
     }
     list_elem(v, t, c, key, te)
 }
@@ -2427,7 +2719,8 @@ fn write_child(inout v: Vir, t: TirTree, c: i64, is_field: bool, key: i64, te: i
     let sk = scalar_kind(t, te)
     if sk >= 0 {
         let kc = konst(v, sk)
-        return rt(v, "grasm_list_set_scalar", [c, key, x, kc], R_BOX)
+        let w = word_of(v, x)
+        return rt(v, "grasm_list_set_scalar", [c, key, w, kc], R_BOX)
     }
     let b = box_kind(v, x, k)
     forget_temp(v, b)
@@ -2643,7 +2936,7 @@ fn inout_place(info: TirInfo, inout v: Vir, a: i64, ks: [i64], i: i64, pte: i64)
     }
     pl.slot = fresh_slot(v)
     let addr = slot_addr(v, pl.slot)
-    emit(v, ir.M_STORE, -1, addr, leaf, 0)
+    store_at(v, addr, leaf)
     // The slot holds the reference now; the write-back hands it on.
     if is_temp(v, leaf) {
         forget_temp(v, leaf)
@@ -2657,9 +2950,9 @@ fn write_back_place(t: TirTree, inout v: Vir, pl: InoutPlace) {
     let rp = pl.rp
     let n = rp.fields.len()
     let lk = ty_kind(t, rp.tes[n])
-    let x = new_var(v, if ir.ty_boxed(lk) { ir.TY_BOX } else { ir.TY_I64 })
+    let x = new_var(v, if ir.ty_boxed(lk) { ir.TY_BOX } else if ir.ty_fp(lk) { ir.TY_F64 } else { ir.TY_I64 })
     let addr = slot_addr(v, pl.slot)
-    emit(v, ir.M_LOAD, x, addr, -1, 0)
+    load_into(v, x, addr)
     if ir.ty_boxed(lk) {
         own_temp(v, x)
     }
@@ -2676,7 +2969,9 @@ fn write_back_place(t: TirTree, inout v: Vir, pl: InoutPlace) {
 /// A method that changes its receiver: `new = fname(recv, args.., extra..)`
 /// stored back where the receiver was. `codes` per argument: `w` a word,
 /// `X` a value boxed and handed over, `B` a boxed value lent, `P` the
-/// element of a `push`. Answers the variable holding the call's result.
+/// element of a `push`, `K` a key function whose keys over the receiver are
+/// computed and lent (`sort_by`). Answers the variable holding the call's
+/// result.
 fn mut_method(info: TirInfo, inout v: Vir, e: i64, fname: str, codes: str, extra: [i64]) -> i64 {
     let t = info.t
     let ks = sexp.kids(t, e)
@@ -2701,13 +2996,33 @@ fn mut_method(info: TirInfo, inout v: Vir, e: i64, fname: str, codes: str, extra
         let x = value_of(info, v, ks[i])
         let code = codes.substr(i - 1, 1)
         let k = kind_at(t, ks[i], 1)
-        if code == "X" or code == "B" {
+        if code == "K" {
+            // A key function (`sort_by`): every key computed now, over a copy
+            // of the receiver read down the path, and lent to the call.
+            var cur = retain_copy(v, rp.root)
+            for j in 0..n {
+                let nx = read_child(v, t, cur, rp.fields[j], kv[j], rp.tes[j + 1])
+                drop_temp(v, cur)
+                cur = nx
+            }
+            let fty = ty_el(t, ks[i], 1)
+            let rte = fn_ret(t, fty)
+            let keys = empty_list_for(v, t, rte)
+            var w = walk_list(v, cur, ty_arg(t, rp.tes[n], 1))
+            walk_head(v, w)
+            let el = walk_elem(v, t, w)
+            let y = call_value(v, x, [el], ty_kind(t, rte))
+            push_elem(v, t, keys, y, rte)
+            walk_next(v, w)
+            discard(v, x)
+            av.push(keys)
+        } else if code == "X" or code == "B" {
             av.push(box_kind(v, x, k))
         } else if code == "P" {
             let sk = scalar_kind(t, ty_arg(t, rp.tes[n], 1))
             if sk >= 0 {
                 push_scalar = sk
-                av.push(x)
+                av.push(word_of(v, x))
             } else {
                 av.push(box_kind(v, x, ty_kind(t, ty_arg(t, rp.tes[n], 1))))
             }
@@ -2749,7 +3064,7 @@ fn mut_method(info: TirInfo, inout v: Vir, e: i64, fname: str, codes: str, extra
     }
     let r = rt(v, fn_name, call, R_BOX)
     for i in 0..av.len() {
-        if codes.substr(i, 1) == "B" {
+        if codes.substr(i, 1) == "B" or codes.substr(i, 1) == "K" {
             discard(v, av[i])
         }
     }
@@ -2847,6 +3162,14 @@ fn int_method(info: TirInfo, inout v: Vir, e: i64, name: str, is_u64: bool) -> i
     let x = value_of(info, v, ks[0])
     if name == "bit_not" {
         return wrap_result(v, t, e, op1(v, ir.M_NOT, x))
+    }
+    if name == "as_f64" {
+        // A narrow value is held extended to 64 bits by its sign, so it
+        // converts as an `i64`; a `u64` converts unsigned.
+        return fop1(v, if is_u64 { ir.M_UCVTF } else { ir.M_SCVTF }, x)
+    }
+    if name == "from_bits" {
+        return from_bits(v, x)
     }
     if name == "as_i64" {
         return x
@@ -2965,6 +3288,13 @@ fn lower_method(info: TirInfo, inout v: Vir, e: i64) -> i64 {
     let na = ks.len() - 1
     let rk = kind_at(t, e, 1)
     let sig = "{fam}.{name}/{na}"
+    if hof_known(sig) {
+        if not held(rk) {
+            bad(v, "outside the subset: method `{name}` answering {ty_text(t, e, 1)} {span_of(t, e)}")
+            return konst(v, 0)
+        }
+        return hof_method(info, v, e, name)
+    }
     if not held(rk) or not method_known(sig) {
         bad(v, "outside the subset: method `{name}` on {ty_text(t, ks[0], 1)} {span_of(t, e)}")
         return konst(v, 0)
@@ -3002,7 +3332,13 @@ fn lower_method(info: TirInfo, inout v: Vir, e: i64) -> i64 {
         "list.get/1" -> read_method(info, v, e, "grasm_list_get_opt", "w", [], R_BOX)
         "list.contains/1" -> read_method(info, v, e, "grasm_list_contains", "x", [], R_BOOL8)
         "list.join/1" -> read_method(info, v, e, "grasm_list_join", "b", [], R_BOX)
-        "list.sum/0" -> wrap_result(v, t, e, read_method(info, v, e, "grasm_list_sum_i64", "", [], R_WORD))
+        "list.sum/0" -> {
+            if ir.ty_fp(rk) {
+                read_method(info, v, e, "grasm_list_sum_f64", "", [], R_F64)
+            } else {
+                wrap_result(v, t, e, read_method(info, v, e, "grasm_list_sum_i64", "", [], R_WORD))
+            }
+        }
         "list.rev/0" -> read_method(info, v, e, "grasm_list_rev", "", [], R_BOX)
         "list.slice/2" -> read_method(info, v, e, "grasm_list_slice", "ww", [], R_BOX)
         "list.first/0" -> read_method(info, v, e, "grasm_list_first", "", [], R_BOX)
@@ -3043,7 +3379,164 @@ fn lower_method(info: TirInfo, inout v: Vir, e: i64) -> i64 {
         "option.is_none/0" -> option_method(info, v, e, name)
         "option.unwrap_or/1" -> option_method(info, v, e, name)
         "option.expect/1" -> option_method(info, v, e, name)
-        _ -> int_method(info, v, e, name, fam == "u64")
+        "str.parse_float/0" -> read_method(info, v, e, "grasm_str_parse_float", "", [], R_BOX)
+        _ -> {
+            if name == "cmp" and na == 1 {
+                return cmp_method(info, v, e)
+            }
+            if fam == "f64" {
+                return f64_method(info, v, e, name)
+            }
+            int_method(info, v, e, name, fam == "u64")
+        }
+    }
+}
+
+/// `a.cmp(b)`: the total order sorting uses ([L-LIB-SORT-NAN]), asked of the
+/// runtime on both values boxed, as the Cranelift build asks it.
+fn cmp_method(info: TirInfo, inout v: Vir, e: i64) -> i64 {
+    let t = info.t
+    let ks = sexp.kids(t, e)
+    let a = value_of(info, v, ks[0])
+    let ab = box_kind(v, a, kind_at(t, ks[0], 1))
+    let b = value_of(info, v, ks[1])
+    let bb = box_kind(v, b, kind_at(t, ks[1], 1))
+    let r = rt(v, "grasm_val_cmp", [ab, bb], R_WORD)
+    drop_temp(v, ab)
+    drop_temp(v, bb)
+    r
+}
+
+/// The methods of `f64`, as the Cranelift build lowers each: `abs`, `sqrt`,
+/// `floor` and `ceil` as one instruction; `round` (halves away from zero,
+/// which no instruction does), `min`, `max` and the math library by the
+/// runtime; conversions to an integer toward zero and saturating, NaN to 0.
+fn f64_method(info: TirInfo, inout v: Vir, e: i64, name: str) -> i64 {
+    let t = info.t
+    let ks = sexp.kids(t, e)
+    if name == "to_str" {
+        return read_method(info, v, e, "grasm_str_from_f64", "", [], R_BOX)
+    }
+    if name == "to_fixed" {
+        return read_method(info, v, e, "grasm_f64_to_fixed", "w", [], R_BOX)
+    }
+    if name == "is_nan" or name == "is_finite" {
+        return read_method(info, v, e, "grasm_f64_" + name, "", [], R_BOOL8)
+    }
+    if name == "round" or name == "min" or name == "max" or f64_libm(name) {
+        return read_method(info, v, e, "grasm_f64_" + name, "w", [], R_F64)
+    }
+    let x = value_of(info, v, ks[0])
+    match name {
+        "abs" -> fop1(v, ir.M_FABS, x)
+        "sqrt" -> fop1(v, ir.M_FSQRT, x)
+        "floor" -> fop1(v, ir.M_FFLOOR, x)
+        "ceil" -> fop1(v, ir.M_FCEIL, x)
+        "to_bits" -> fbits(v, x)
+        "as_i64" -> op1(v, ir.M_FCVTZS, x)
+        "as_u64" -> {
+            let d = new_var(v, ir.TY_U64)
+            emit(v, ir.M_FCVTZU, d, x, -1, 0)
+            d
+        }
+        _ -> {
+            // `as_i8` .. `as_u32`: toward zero and saturating to an `i64`,
+            // then held to the width's range.
+            let k = kind_at(t, e, 1)
+            if not (name.starts_with("as_") and ir.ty_int(k)) {
+                bad(v, "outside the subset: method `{name}` on f64 {span_of(t, e)}")
+                return x
+            }
+            let wide = op1(v, ir.M_FCVTZS, x)
+            let (lo, hi) = int_range(k)
+            clamp(v, wide, lo, hi, k)
+        }
+    }
+}
+
+/// The math library's one- and two-argument functions of a double.
+fn f64_libm(name: str) -> bool {
+    match name {
+        "sin" -> true
+        "cos" -> true
+        "tan" -> true
+        "asin" -> true
+        "acos" -> true
+        "atan" -> true
+        "sinh" -> true
+        "cosh" -> true
+        "tanh" -> true
+        "exp" -> true
+        "ln" -> true
+        "log2" -> true
+        "log10" -> true
+        "cbrt" -> true
+        "to_radians" -> true
+        "to_degrees" -> true
+        "atan2" -> true
+        "hypot" -> true
+        "log" -> true
+        _ -> false
+    }
+}
+
+/// The smallest and largest value of a narrow integer type.
+fn int_range(k: i64) -> (i64, i64) {
+    if k == ir.TY_I8 {
+        (-128, 127)
+    } else if k == ir.TY_I16 {
+        (-32768, 32767)
+    } else if k == ir.TY_I32 {
+        (-2147483648, 2147483647)
+    } else if k == ir.TY_U8 {
+        (0, 255)
+    } else if k == ir.TY_U16 {
+        (0, 65535)
+    } else if k == ir.TY_U32 {
+        (0, 4294967295)
+    } else {
+        (-9223372036854775807 - 1, 9223372036854775807)
+    }
+}
+
+/// `x` held to `lo..=hi`, signed: Cranelift's `smax` then `smin`.
+fn clamp(inout v: Vir, x: i64, lo: i64, hi: i64, k: i64) -> i64 {
+    let r = new_var(v, k)
+    copy_to(v, r, x)
+    let lk = konst(v, lo)
+    let below = icmp(v, ir.CC_SLT, r, lk)
+    let set_lo = new_block(v)
+    let mid = new_block(v)
+    term_brif(v, below, set_lo, mid)
+    switch_to(v, set_lo)
+    copy_to(v, r, lk)
+    term_jump(v, mid)
+    switch_to(v, mid)
+    let hk = konst(v, hi)
+    let above = icmp(v, ir.CC_SGT, r, hk)
+    let set_hi = new_block(v)
+    let join = new_block(v)
+    term_brif(v, above, set_hi, join)
+    switch_to(v, set_hi)
+    copy_to(v, r, hk)
+    term_jump(v, join)
+    switch_to(v, join)
+    r
+}
+
+/// The higher-order methods, which take a function (`hof_method`).
+pub fn hof_known(sig: str) -> bool {
+    match sig {
+        "list.map/1" -> true
+        "list.filter/1" -> true
+        "list.all/1" -> true
+        "list.any/1" -> true
+        "list.find/1" -> true
+        "list.fold/2" -> true
+        "list.sort_by/1" -> true
+        "range.map/1" -> true
+        "range.filter/1" -> true
+        _ -> false
     }
 }
 
@@ -3146,8 +3639,41 @@ pub fn method_known(sig: str) -> bool {
         "u64.abs/0" -> true
         "u64.min/1" -> true
         "u64.max/1" -> true
-        _ -> int_conversion(sig)
+        "int.as_f64/0" -> true
+        "u64.as_f64/0" -> true
+        "int.from_bits/0" -> true
+        "str.parse_float/0" -> true
+        "int.cmp/1" -> true
+        "u64.cmp/1" -> true
+        "f64.cmp/1" -> true
+        "str.cmp/1" -> true
+        "tuple.cmp/1" -> true
+        _ -> int_conversion(sig) or f64_known(sig)
     }
+}
+
+/// The methods of `f64` this part compiles (`f64_method`).
+fn f64_known(sig: str) -> bool {
+    if not sig.starts_with("f64.") {
+        return false
+    }
+    let rest = sig.substr(4, sig.len() - 4)
+    let parts = rest.split("/")
+    let name = parts[0]
+    let n = parts[1].parse_int() ?? -1
+    if n == 0 {
+        if name == "abs" or name == "sqrt" or name == "floor" or name == "ceil" or name == "round" or name == "to_bits" or name == "to_str" or name == "is_nan" or name == "is_finite" or name == "as_i64" or name == "as_u64" {
+            return true
+        }
+        if name.starts_with("as_") and ir.ty_int(ir.ty_of_name(name.substr(3, name.len() - 3))) {
+            return true
+        }
+        return f64_libm(name) and name != "atan2" and name != "hypot" and name != "log"
+    }
+    if n == 1 {
+        return name == "min" or name == "max" or name == "atan2" or name == "hypot" or name == "log" or name == "to_fixed"
+    }
+    false
 }
 
 /// `as_i64`, `as_u64`, `as_i8` ... on any integer: a wrap to the width.
@@ -3208,7 +3734,7 @@ fn lower_place_assign(info: TirInfo, inout v: Vir, e: i64) -> i64 {
             let body = type_body(info, ct)
             if body >= 0 and sexp.kw(t, body) == "struct" and keys[j] < sexp.kids(t, body).len() {
                 let fd = sexp.kids(t, body)[keys[j]]
-                child = subst(t, sexp.at(t, fd, 2), named_args(t, ct))
+                child = field_te(info, ct, -1, keys[j], sexp.at(t, fd, 2))
                 names[j] = sexp.word(t, fd, 1)
             }
         } else if ty_head(t, ct) == "list" {
@@ -3247,6 +3773,8 @@ fn lower_place_assign(info: TirInfo, inout v: Vir, e: i64) -> i64 {
             drop_temp(v, x)
         } else if ir.ty_int(vk) {
             fin = arith(v, op, vk, old, x)
+        } else if ir.ty_fp(vk) {
+            fin = farith(v, op, old, x, span_of(t, ks[1]))
         } else {
             bad(v, "outside the subset: `{op}=` on {ty_text(t, e, 2)} {span_of(t, ks[1])}")
             return -1
@@ -3273,7 +3801,7 @@ fn do_return(inout v: Vir, x: i64) {
     }
     release_from(v, 0, 0)
     for i in 0..v.io_val.len() {
-        emit(v, ir.M_STORE, -1, v.io_addr[i], v.io_val[i], 0)
+        store_at(v, v.io_addr[i], v.io_val[i])
     }
     finish(v, ir.M_RET, if v.returns { x } else { -1 }, -1, -1)
 }
@@ -3290,7 +3818,7 @@ fn lower_return(info: TirInfo, inout v: Vir, e: i64) -> i64 {
         return -1
     }
     if v.returns and x < 0 {
-        x = konst(v, 0)
+        x = zero_like(v, v.ret_kind)
     }
     if not v.returns {
         discard(v, x)
@@ -3319,6 +3847,8 @@ fn result_kind(t: TirTree, te: i64) -> i64 {
         5
     } else if ir.ty_int(k) {
         0
+    } else if ir.ty_fp(k) {
+        1
     } else if k == ir.TY_BOOL {
         2
     } else {
@@ -3369,7 +3899,7 @@ fn slot_addr(inout v: Vir, k: i64) -> i64 {
 fn finish_return(inout v: Vir, x: i64) {
     release_from(v, 0, 0)
     for i in 0..v.io_val.len() {
-        emit(v, ir.M_STORE, -1, v.io_addr[i], v.io_val[i], 0)
+        store_at(v, v.io_addr[i], v.io_val[i])
     }
     finish(v, ir.M_RET, if v.returns { x } else { -1 }, -1, -1)
 }
@@ -3377,7 +3907,7 @@ fn finish_return(inout v: Vir, x: i64) {
 /// Leaves a split function with tag `tag` and the word `w` through its
 /// hidden address.
 fn split_return(inout v: Vir, tag: i64, w: i64) {
-    emit(v, ir.M_STORE, -1, v.split_out, w, 0)
+    store_at(v, v.split_out, w)
     let k = konst(v, tag)
     finish_return(v, k)
 }
@@ -3431,8 +3961,8 @@ fn lower_try(info: TirInfo, inout v: Vir, e: i64) -> i64 {
         leave_err(v, ep)
         switch_to(v, okb)
         let a = slot_addr(v, slot)
-        let w = new_var(v, if ir.ty_boxed(k) { ir.TY_BOX } else { ir.TY_I64 })
-        emit(v, ir.M_LOAD, w, a, -1, 0)
+        let w = new_var(v, if ir.ty_boxed(k) { ir.TY_BOX } else if ir.ty_fp(k) { ir.TY_F64 } else { ir.TY_I64 })
+        load_into(v, w, a)
         if ir.ty_boxed(k) {
             own_temp(v, w)
         }
@@ -3470,8 +4000,8 @@ fn lower_try(info: TirInfo, inout v: Vir, e: i64) -> i64 {
         return w
     }
     let a2 = slot_addr(v, slot)
-    let x = new_var(v, ir.TY_I64)
-    emit(v, ir.M_LOAD, x, a2, -1, 0)
+    let x = new_var(v, if ir.ty_fp(k) { ir.TY_F64 } else { ir.TY_I64 })
+    load_into(v, x, a2)
     x
 }
 
@@ -3574,7 +4104,7 @@ fn leave_with(t: TirTree, inout v: Vir, x: i64, xte: i64) {
             v.cargs.push(kc)
             let tg = op1(v, ir.M_UEXT8, tag)
             for j in 0..v.io_val.len() {
-                emit(v, ir.M_STORE, -1, v.io_addr[j], v.io_val[j], 0)
+                store_at(v, v.io_addr[j], v.io_val[j])
             }
             finish(v, ir.M_RET, tg, -1, -1)
             return
@@ -3696,6 +4226,518 @@ fn lower_for(info: TirInfo, inout v: Vir, e: i64) -> i64 {
     -1
 }
 
+// ----- function values ---------------------------------------------------------------
+//
+// A function value is the runtime's boxed `Fn` (`grasm_fn_new`): the address
+// of compiled code and an environment, a list of the captured values, boxed.
+// The code takes the environment first, then the arguments, and owns all of
+// them, as any function here owns its parameters. A closure's body is lifted
+// into a function of its own (`lower_lifted_closure`); a named function used
+// as a value is reached through a wrapper (`lower_wrapper`) that releases the
+// empty environment and calls it -- the Cranelift build's `fn_value_wrapper`,
+// with the same name in the value, so it prints as `<fn module::name>`.
+// Calling a value (`callvalue`) reads its code and a reference to its
+// environment out of it (`grasm_fn_code`, `grasm_fn_env`) and calls through
+// the address.
+//
+// Captures are by value, at the closure's creation ([E-CLOSURE-CAPTURE]):
+// each variable the body reads and does not bind is copied into the
+// environment then, a boxed one retained, and nothing can write to one
+// afterwards ([T-CAPTURE-WRITE]). TIR does not list them (docs/tir.md §8); a
+// closure shares its function's variable numbering, so they are the body's
+// reads less its bindings.
+
+/// Records a function this one makes a value of; answers its index for
+/// `M_FNADDR` until the driver gives it a callable id.
+fn add_lift(inout v: Vir, kind: i64, elem: i64, caps: [i64], capte: [i64]) -> i64 {
+    if kind == LIFT_WRAPPER {
+        for k in 0..v.lift_kind.len() {
+            if v.lift_kind[k] == kind and v.lift_elem[k] == elem {
+                return k
+            }
+        }
+    }
+    v.lift_kind.push(kind)
+    v.lift_elem.push(elem)
+    v.lift_caps.push(caps)
+    v.lift_capte.push(capte)
+    v.lift_kind.len() - 1
+}
+
+/// The variables closure `e` captures, by number, and the type each is read
+/// at: every local its body reads that it does not bind (a parameter, a
+/// `let`, a loop or pattern variable, a nested closure's parameter).
+pub fn closure_captures(t: TirTree, e: i64) -> ([i64], [i64]) {
+    var bound: Map[i64, bool] = {}
+    var reads: Map[i64, i64] = {}
+    var stack: [i64] = [e]
+    while not stack.is_empty() {
+        let x = stack.pop() ?? 0
+        if t.kind[x] != 2 {
+            continue
+        }
+        let k = sexp.kw(t, x)
+        if k == "var" or k == "let" {
+            bound.set(sexp.word(t, x, 1).parse_int() ?? -1, true)
+        } else if k == "pbind" {
+            bound.set(sexp.word(t, x, 2).parse_int() ?? -1, true)
+        } else if k == "local" and t.count[x] >= 4 {
+            let id = sexp.word(t, x, 3).parse_int() ?? -1
+            if not reads.has(id) {
+                reads.set(id, sexp.at(t, x, 1))
+            }
+        }
+        for j in 0..t.count[x] {
+            let y = sexp.at(t, x, j)
+            if t.kind[y] == 2 {
+                stack.push(y)
+            }
+        }
+    }
+    var ids: [i64] = []
+    for id in reads.keys() {
+        if not bound.has(id) {
+            ids.push(id)
+        }
+    }
+    ids.sort()
+    var tes: [i64] = []
+    for id in ids {
+        tes.push(reads.get(id) ?? -1)
+    }
+    (ids, tes)
+}
+
+/// A closure as a value: its captures copied into a fresh environment, in
+/// the order the lifted body unpacks them, and the lifted body's address.
+fn lower_closure(info: TirInfo, inout v: Vir, e: i64) -> i64 {
+    let t = info.t
+    if not ir.ty_boxed(kind_at(t, e, 1)) {
+        bad(v, "outside the subset: a closure of type {ty_text(t, e, 1)} {span_of(t, e)}")
+        return konst(v, 0)
+    }
+    let (ids, tes) = closure_captures(t, e)
+    for k in 0..ids.len() {
+        if not held(ty_kind(t, tes[k])) {
+            bad(v, "outside the subset: a closure capturing a value of a type this part does not hold {span_of(t, e)}")
+            return konst(v, 0)
+        }
+    }
+    var env = rt(v, "grasm_list_new", [], R_BOX)
+    for k in 0..ids.len() {
+        let kind = ty_kind(t, tes[k])
+        let w = tvar_of(v, ids[k])
+        var x = -1
+        if ir.ty_boxed(kind) {
+            x = retain_copy(v, w)
+        } else {
+            x = new_var(v, kind)
+            copy_to(v, x, w)
+        }
+        let b = box_kind(v, x, kind)
+        forget_temp(v, env)
+        forget_temp(v, b)
+        env = rt(v, "grasm_list_push", [env, b], R_BOX)
+    }
+    let li = add_lift(v, LIFT_CLOSURE, e, ids, tes)
+    let code = new_var(v, ir.TY_I64)
+    emit(v, ir.M_FNADDR, code, -1, -1, li)
+    forget_temp(v, env)
+    let z = konst(v, 0)
+    rt(v, "grasm_fn_new", [code, env, z, z], R_BOX)
+}
+
+/// A named function as a value: its wrapper's address, an empty
+/// environment, and its name.
+fn lower_fnref(info: TirInfo, inout v: Vir, e: i64) -> i64 {
+    let t = info.t
+    let name = sexp.word(t, e, 3)
+    let c = info.fn_ix.get(name) ?? -1
+    if c < 0 {
+        bad(v, "outside the subset: `{name}` as a value, which is not a function here {span_of(t, e)}")
+        return konst(v, 0)
+    }
+    if t.count[sexp.at(t, e, 4)] > 1 {
+        bad(v, "outside the subset: a generic function `{name}` as a value {span_of(t, e)}")
+        return konst(v, 0)
+    }
+    if not ir.ty_boxed(kind_at(t, e, 1)) {
+        bad(v, "outside the subset: a function value of type {ty_text(t, e, 1)} {span_of(t, e)}")
+        return konst(v, 0)
+    }
+    for p in params_of(info, c) {
+        if sexp.word(t, p, 1) == "inout" {
+            bad(v, "outside the subset: `{name}`, which has `inout` parameters, as a value {span_of(t, e)}")
+            return konst(v, 0)
+        }
+    }
+    let li = add_lift(v, LIFT_WRAPPER, c, [], [])
+    let code = new_var(v, ir.TY_I64)
+    emit(v, ir.M_FNADDR, code, -1, -1, li)
+    let env = rt(v, "grasm_list_new", [], R_BOX)
+    let nm = text_args(v, name)
+    forget_temp(v, env)
+    rt(v, "grasm_fn_new", [code, env, nm[0], nm[1]], R_BOX)
+}
+
+/// `f(a, b)` where `f` is a value: the value computed, then the arguments,
+/// then the call through its code; the value is released after.
+fn lower_callvalue(info: TirInfo, inout v: Vir, e: i64) -> i64 {
+    let t = info.t
+    let ks = sexp.kids(t, e)
+    let fty = ty_el(t, ks[0], 1)
+    if ty_head(t, fty) != "fn" or not ir.ty_boxed(ty_kind(t, fty)) {
+        bad(v, "outside the subset: calling a value of type {ty_text(t, ks[0], 1)} {span_of(t, e)}")
+        return konst(v, 0)
+    }
+    let f = value_of(info, v, ks[0])
+    var args: [i64] = []
+    for i in 1..ks.len() {
+        args.push(value_of(info, v, ks[i]))
+    }
+    let r = call_value(v, f, args, ty_kind(t, fn_ret(t, fty)))
+    discard(v, f)
+    r
+}
+
+/// Calls function value `f` (held, not consumed) with `args`, each handed
+/// over; answers what it returns -- an owned temporary when boxed -- or -1.
+fn call_value(inout v: Vir, f: i64, args: [i64], rk: i64) -> i64 {
+    let code = rt(v, "grasm_fn_code", [f], R_WORD)
+    let env = rt(v, "grasm_fn_env", [f], R_BOX)
+    var all: [i64] = [env]
+    for a in args {
+        all.push(a)
+    }
+    for a in all {
+        if is_temp(v, a) {
+            forget_temp(v, a)
+        }
+    }
+    var d = -1
+    if valued(rk) {
+        d = new_var(v, if ir.ty_boxed(rk) { ir.TY_BOX } else if ir.ty_fp(rk) { ir.TY_F64 } else { ir.TY_I64 })
+    }
+    let i = emit(v, ir.M_CALLIND, d, code, -1, 0)
+    v.ca0[i] = v.cargs.len()
+    v.can[i] = all.len()
+    for x in all {
+        v.cargs.push(x)
+    }
+    if d >= 0 and ir.ty_boxed(rk) {
+        own_temp(v, d)
+    }
+    d
+}
+
+/// Retires temporary `x` from the bookkeeping and records `y` in its place,
+/// for a variable whose value a runtime call replaced: `x` now holds `y`.
+fn replace_temp(inout v: Vir, x: i64, y: i64) {
+    copy_to(v, x, y)
+    forget_temp(v, y)
+}
+
+// The higher-order methods of a list -- `map`, `filter`, `fold`, `any`,
+// `all`, `find`, `sort_by` -- and `map` and `filter` of a range written in
+// place, as loops calling the function value once per element in order, as
+// the Cranelift build's inlined loops do: `map` keeps a scalar result inline
+// (a scalar list) and boxes any other; `filter` keeps the input's
+// representation; `any` and `all` stop at the first element that decides
+// them and `find` at the first that matches; `sort_by` computes every key
+// first and sorts by them in the runtime's order ([L-LIB-SORT-NAN]). The
+// receiver is computed first, then the function.
+
+/// The elements a higher-order method walks: a list (owned, released when
+/// the walk ends) or a range written in place.
+type Walk = {
+    is_range: bool,
+    l: i64,
+    te: i64,
+    ctr: i64,
+    end: i64,
+    incl: bool,
+    n: i64,
+    head: i64,
+    body: i64,
+    step: i64,
+    exit: i64,
+}
+
+/// Computes what `recv` walks.
+fn walk_src(info: TirInfo, inout v: Vir, recv: i64) -> Walk {
+    let t = info.t
+    var w = Walk{ is_range: false, l: -1, te: -1, ctr: -1, end: -1, incl: false, n: -1, head: -1, body: -1, step: -1, exit: -1 }
+    if sexp.kw(t, recv) == "range" {
+        w.is_range = true
+        w.incl = sexp.word(t, recv, 3) == "inclusive"
+        let ends = sexp.kids(t, recv)
+        let lo = value_of(info, v, ends[0])
+        let hi = value_of(info, v, ends[1])
+        w.ctr = new_var(v, ir.TY_I64)
+        copy_to(v, w.ctr, lo)
+        w.end = new_var(v, ir.TY_I64)
+        copy_to(v, w.end, hi)
+        return w
+    }
+    w.te = ty_arg(t, ty_el(t, recv, 1), 1)
+    w.l = value_of(info, v, recv)
+    w.n = rt(v, "grasm_list_len", [w.l], R_WORD)
+    w.ctr = new_var(v, ir.TY_I64)
+    let z = konst(v, 0)
+    copy_to(v, w.ctr, z)
+    w
+}
+
+/// Opens the loop: the test, then the body, where control now is.
+fn walk_head(inout v: Vir, inout w: Walk) {
+    w.head = new_block(v)
+    w.body = new_block(v)
+    w.step = new_block(v)
+    w.exit = new_block(v)
+    switch_to(v, w.head)
+    var c = -1
+    if w.is_range {
+        c = icmp(v, if w.incl { ir.CC_SLE } else { ir.CC_SLT }, w.ctr, w.end)
+    } else {
+        c = icmp(v, ir.CC_SLT, w.ctr, w.n)
+    }
+    term_brif(v, c, w.body, w.exit)
+    switch_to(v, w.body)
+}
+
+/// The current element, owned when boxed.
+fn walk_elem(inout v: Vir, t: TirTree, w: Walk) -> i64 {
+    if w.is_range {
+        let x = new_var(v, ir.TY_I64)
+        copy_to(v, x, w.ctr)
+        return x
+    }
+    list_elem(v, t, w.l, w.ctr, w.te)
+}
+
+/// The element's kind.
+fn walk_kind(t: TirTree, w: Walk) -> i64 {
+    if w.is_range { ir.TY_I64 } else { ty_kind(t, w.te) }
+}
+
+/// Ends the body: on to the next element. An inclusive range stops before
+/// stepping past its end ([E-LOOP-RANGE-MAX]).
+fn walk_next(inout v: Vir, w: Walk) {
+    if v.open {
+        term_jump(v, w.step)
+    }
+    switch_to(v, w.step)
+    if w.is_range and w.incl {
+        let done = icmp(v, ir.CC_EQ, w.ctr, w.end)
+        let bump = new_block(v)
+        term_brif(v, done, w.exit, bump)
+        switch_to(v, bump)
+    }
+    let one = konst(v, 1)
+    let nx = op2(v, ir.M_ADD, w.ctr, one)
+    copy_to(v, w.ctr, nx)
+    term_jump(v, w.head)
+    switch_to(v, w.exit)
+    if w.l >= 0 {
+        drop_temp(v, w.l)
+    }
+}
+
+/// An empty list to hold elements of type `te`: a scalar list for a scalar.
+fn empty_list_for(inout v: Vir, t: TirTree, te: i64) -> i64 {
+    let sk = scalar_kind(t, te)
+    if sk >= 0 {
+        let kc = konst(v, sk)
+        return rt(v, "grasm_list_new_scalar", [kc], R_BOX)
+    }
+    rt(v, "grasm_list_new", [], R_BOX)
+}
+
+/// Appends `x` (owned when boxed; -1 for unit) of type `te` to the list in
+/// temporary `out`, which then holds the list the runtime answers.
+fn push_elem(inout v: Vir, t: TirTree, out: i64, x: i64, te: i64) {
+    let sk = scalar_kind(t, te)
+    forget_temp(v, out)
+    var nl = -1
+    if sk >= 0 {
+        let kc = konst(v, sk)
+        let w = word_of(v, x)
+        nl = rt(v, "grasm_list_push_scalar", [out, w, kc], R_BOX)
+    } else {
+        let b = box_kind(v, x, ty_kind(t, te))
+        forget_temp(v, b)
+        nl = rt(v, "grasm_list_push", [out, b], R_BOX)
+    }
+    replace_temp(v, out, nl)
+    own_temp(v, out)
+}
+
+/// The function argument `k` of method `e`, and its type: `(fn (P..) R row)`.
+fn fn_arg(info: TirInfo, inout v: Vir, e: i64, k: i64) -> (i64, i64) {
+    let t = info.t
+    let a = sexp.kids(t, e)[k]
+    let fty = ty_el(t, a, 1)
+    let f = value_of(info, v, a)
+    (f, fty)
+}
+
+fn hof_method(info: TirInfo, inout v: Vir, e: i64, name: str) -> i64 {
+    let t = info.t
+    let ks = sexp.kids(t, e)
+    if name == "sort_by" {
+        return sort_by_method(info, v, e)
+    }
+    var w = walk_src(info, v, ks[0])
+    let ek = walk_kind(t, w)
+    let ete = if w.is_range { -1 } else { w.te }
+    if name == "fold" {
+        let ak = kind_at(t, e, 1)
+        let a0 = value_of(info, v, ks[1])
+        let (f, _fty) = fn_arg(info, v, e, 2)
+        let acc = new_var(v, ak)
+        copy_to(v, acc, a0)
+        if is_temp(v, a0) {
+            forget_temp(v, a0)
+            own_temp(v, acc)
+        }
+        walk_head(v, w)
+        let x = walk_elem(v, t, w)
+        let r = call_value(v, f, [acc, x], ak)
+        if r >= 0 {
+            copy_to(v, acc, r)
+            if is_temp(v, r) {
+                forget_temp(v, r)
+                own_temp(v, acc)
+            }
+        }
+        walk_next(v, w)
+        discard(v, f)
+        return acc
+    }
+    let (f, fty) = fn_arg(info, v, e, 1)
+    let rte = fn_ret(t, fty)
+    let rk = ty_kind(t, rte)
+    if name == "map" {
+        let out = empty_list_for(v, t, rte)
+        walk_head(v, w)
+        let x = walk_elem(v, t, w)
+        let y = call_value(v, f, [x], rk)
+        push_elem(v, t, out, y, rte)
+        walk_next(v, w)
+        discard(v, f)
+        return out
+    }
+    if name == "filter" {
+        var out = -1
+        if w.is_range {
+            let kc = konst(v, 0)
+            out = rt(v, "grasm_list_new_scalar", [kc], R_BOX)
+        } else {
+            out = empty_list_for(v, t, w.te)
+        }
+        walk_head(v, w)
+        let x = walk_elem(v, t, w)
+        let xa = if ir.ty_boxed(ek) { retain_copy(v, x) } else { x }
+        let keep = call_value(v, f, [xa], ir.TY_BOOL)
+        let yes = new_block(v)
+        let no = new_block(v)
+        term_brif(v, keep, yes, no)
+        switch_to(v, yes)
+        if w.is_range {
+            let kc = konst(v, 0)
+            forget_temp(v, out)
+            let nl = rt(v, "grasm_list_push_scalar", [out, x, kc], R_BOX)
+            replace_temp(v, out, nl)
+            own_temp(v, out)
+        } else {
+            push_elem(v, t, out, x, ete)
+        }
+        term_jump(v, w.step)
+        if ir.ty_boxed(ek) {
+            own_temp(v, x)
+        }
+        switch_to(v, no)
+        if ir.ty_boxed(ek) {
+            drop_temp(v, x)
+        }
+        walk_next(v, w)
+        discard(v, f)
+        return out
+    }
+    if name == "any" or name == "all" {
+        let res = new_var(v, ir.TY_BOOL)
+        let init = konst(v, if name == "all" { 1 } else { 0 })
+        copy_to(v, res, init)
+        walk_head(v, w)
+        let x = walk_elem(v, t, w)
+        let c = call_value(v, f, [x], ir.TY_BOOL)
+        let stop = new_block(v)
+        let cont = new_block(v)
+        if name == "all" {
+            term_brif(v, c, cont, stop)
+        } else {
+            term_brif(v, c, stop, cont)
+        }
+        switch_to(v, stop)
+        let fin = konst(v, if name == "all" { 0 } else { 1 })
+        copy_to(v, res, fin)
+        term_jump(v, w.exit)
+        switch_to(v, cont)
+        walk_next(v, w)
+        discard(v, f)
+        return res
+    }
+    // `find`: the first element that matches, as `Some`, else `None`.
+    let tn = text_args(v, "Option")
+    let nn = text_args(v, "None")
+    let res = rt(v, "grasm_variant_new", [tn[0], tn[1], nn[0], nn[1]], R_BOX)
+    walk_head(v, w)
+    let x = walk_elem(v, t, w)
+    let xa = if ir.ty_boxed(ek) { retain_copy(v, x) } else { x }
+    let c = call_value(v, f, [xa], ir.TY_BOOL)
+    let hit = new_block(v)
+    let miss = new_block(v)
+    term_brif(v, c, hit, miss)
+    switch_to(v, hit)
+    // The `None` it started as goes; the element is the `Some`'s now.
+    emit(v, ir.M_DEC, -1, res, -1, 0)
+    let b = box_kind(v, x, ek)
+    forget_temp(v, b)
+    let tn2 = text_args(v, "Option")
+    let sn = text_args(v, "Some")
+    let some = rt(v, "grasm_variant_new1", [tn2[0], tn2[1], sn[0], sn[1], b], R_BOX)
+    replace_temp(v, res, some)
+    term_jump(v, w.exit)
+    if ir.ty_boxed(ek) {
+        own_temp(v, x)
+    }
+    switch_to(v, miss)
+    if ir.ty_boxed(ek) {
+        drop_temp(v, x)
+    }
+    walk_next(v, w)
+    discard(v, f)
+    res
+}
+
+/// `xs.sort_by(key)`: every key computed first, over a copy of the list,
+/// then the list sorted by them (`grasm_list_sort_by`, which lends the keys)
+/// and stored back where it was, as a mutating method stores its receiver.
+fn sort_by_method(info: TirInfo, inout v: Vir, e: i64) -> i64 {
+    mut_method(info, v, e, "grasm_list_sort_by", "K", [])
+}
+
+/// A walk over list `l` (an owned temporary, released when the walk ends)
+/// of elements of type `te`.
+fn walk_list(inout v: Vir, l: i64, te: i64) -> Walk {
+    var w = Walk{ is_range: false, l: l, te: te, ctr: -1, end: -1, incl: false, n: -1, head: -1, body: -1, step: -1, exit: -1 }
+    w.n = rt(v, "grasm_list_len", [l], R_WORD)
+    w.ctr = new_var(v, ir.TY_I64)
+    let z = konst(v, 0)
+    copy_to(v, w.ctr, z)
+    w
+}
+
 // ----- functions -------------------------------------------------------------------
 
 /// The type element of a block's value: its last child's, when that is an
@@ -3725,6 +4767,7 @@ pub fn lower_callable(info: TirInfo, c: i64) -> Vir {
             bad(v, "outside the subset: constant `{info.c_name[c]}` of type {ty_text(t, e, 2)}")
         }
         v.returns = valued(ty)
+        v.ret_kind = ty
         body = sexp.kids(t, e)[0]
     } else {
         if t.count[sexp.at(t, e, 2)] > 1 {
@@ -3735,6 +4778,7 @@ pub fn lower_callable(info: TirInfo, c: i64) -> Vir {
             bad(v, "outside the subset: `{info.c_name[c]}` answers {ty_text(t, e, 4)}")
         }
         v.returns = valued(rty)
+        v.ret_kind = rty
         if fn_err(info, c) >= 0 {
             if not ir.ty_boxed(kind_at(t, e, 5)) {
                 bad(v, "outside the subset: `{info.c_name[c]}` fails with {ty_text(t, e, 5)}")
@@ -3790,7 +4834,7 @@ pub fn lower_callable(info: TirInfo, c: i64) -> Vir {
     // is read once here and written back at every return.
     for i in 0..inout_ids.len() {
         let val = new_var(v, inout_ty[i])
-        emit(v, ir.M_LOAD, val, inout_addr[i], -1, 0)
+        load_into(v, val, inout_addr[i])
         v.tvar.set(inout_ids[i], val)
         v.io_val.push(val)
         v.io_addr.push(inout_addr[i])
@@ -3831,7 +4875,7 @@ pub fn lower_callable(info: TirInfo, c: i64) -> Vir {
             discard(v, r)
             r = -1
         } else if r < 0 {
-            r = konst(v, 0)
+            r = zero_like(v, v.ret_kind)
         }
         do_return(v, r)
     }
@@ -3881,4 +4925,160 @@ pub fn lower_entry(info: TirInfo) -> Vir {
     let z = konst(v, 0)
     do_return(v, z)
     v
+}
+
+/// The type element of expression `x`'s value: a block's tail's, nothing
+/// for a statement, else its own.
+fn expr_te(t: TirTree, x: i64) -> i64 {
+    let k = sexp.kw(t, x)
+    if k == "block" {
+        return block_tail_te(t, x)
+    }
+    if is_stmt(k) {
+        return -1
+    }
+    ty_el(t, x, 1)
+}
+
+/// The function closure `e` is lifted into: its environment, then its
+/// parameters, all owned and released when it returns; the captures `ids`
+/// (of types `tes`) unpacked from the environment at entry, each bound to
+/// the variable number it was captured from, so the body reads them as it
+/// would have read the originals. A closure that can fail answers its whole
+/// result as a box, as a fallible `main` does.
+pub fn lower_lifted_closure(info: TirInfo, e: i64, ids: [i64], tes: [i64]) -> Vir {
+    let t = info.t
+    var v = new_vir()
+    let fty = ty_el(t, e, 1)
+    let rte = fn_ret(t, fty)
+    let rk = ty_kind(t, rte)
+    let ks = sexp.kids(t, e)
+    let params = sexp.kids(t, ks[0])
+    let body = ks[1]
+    if ty_head(t, rte) == "fallible" {
+        v.returns = true
+        v.ok_te = ty_arg(t, rte, 1)
+        v.boxed_result = true
+    } else {
+        v.returns = valued(rk)
+        v.ret_kind = rk
+    }
+    open_scope(v)
+    let env = new_var(v, ir.TY_BOX)
+    var owned: [i64] = [env]
+    for p in params {
+        // (var id "name" mode T)
+        let id = sexp.word(t, p, 1).parse_int() ?? -1
+        let te = ty_el(t, p, 4)
+        let k = ty_kind(t, te)
+        if not held(k) {
+            bad(v, "outside the subset: a closure parameter of type {ty_text(t, p, 4)} {span_of(t, e)}")
+        }
+        let pv = new_var(v, if held(k) { k } else { ir.TY_I64 })
+        v.tvar.set(id, pv)
+        v.tvty.set(id, te)
+        if ir.ty_boxed(k) {
+            owned.push(pv)
+        }
+    }
+    for x in owned {
+        own_var(v, x)
+    }
+    v.nparams = v.nvars
+    let entry = new_block(v)
+    switch_to(v, entry)
+    for k in 0..ids.len() {
+        let kind = ty_kind(t, tes[k])
+        let ic = konst(v, k)
+        let b = rt(v, "grasm_list_get", [env, ic], R_BOX)
+        let x = unbox_kind(v, b, kind)
+        let w = bind_tvar(v, ids[k], kind, tes[k])
+        copy_to(v, w, x)
+        if ir.ty_boxed(kind) {
+            forget_temp(v, x)
+            own_var(v, w)
+        }
+    }
+    let x = lower_expr(info, v, body)
+    if v.open and v.boxed_result {
+        leave_with(t, v, x, expr_te(t, body))
+    }
+    if v.open {
+        var r = x
+        if not v.returns {
+            discard(v, r)
+            r = -1
+        } else if r < 0 {
+            r = zero_like(v, rk)
+        }
+        do_return(v, r)
+    }
+    v.scope_mark.pop()
+    v
+}
+
+/// The function a named function `c` is called through as a value: the
+/// closure convention's environment first, which it releases, then `c`'s
+/// parameters, handed on. A function that can reach itself is given a stack
+/// floor here, where the recursion is entered, as the Cranelift build's
+/// wrapper does; one that answers by the split-result convention has its
+/// tag and word boxed into the result a value's caller expects.
+pub fn lower_wrapper(info: TirInfo, c: i64) -> Vir {
+    let t = info.t
+    var v = new_vir()
+    let e = info.c_elem[c]
+    let split = is_split(info, c)
+    let rk = kind_at(t, e, 4)
+    v.returns = returns_value(info, c)
+    open_scope(v)
+    let env = new_var(v, ir.TY_BOX)
+    own_var(v, env)
+    var pvs: [i64] = []
+    for p in params_of(info, c) {
+        let k = kind_at(t, p, 4)
+        if sexp.word(t, p, 1) == "inout" or not held(k) {
+            bad(v, "outside the subset: `{info.c_name[c]}` as a value")
+        }
+        pvs.push(new_var(v, if held(k) { k } else { ir.TY_I64 }))
+    }
+    v.nparams = v.nvars
+    let entry = new_block(v)
+    switch_to(v, entry)
+    var args: [i64] = []
+    if info.recursive[c] {
+        args.push(floor_arg(v))
+    }
+    for p in pvs {
+        args.push(p)
+    }
+    var out_slot = -1
+    if split {
+        out_slot = fresh_slot(v)
+        args.push(slot_addr(v, out_slot))
+    }
+    var r = call_fn(v, c, args, returns_value(info, c))
+    if r >= 0 and not split and ir.ty_fp(rk) {
+        v.vty[r] = ir.TY_F64
+    }
+    if split {
+        let tag = op1(v, ir.M_UEXT8, r)
+        let w = new_var(v, ir.TY_I64)
+        let a = slot_addr(v, out_slot)
+        emit(v, ir.M_LOAD, w, a, -1, 0)
+        let kc = konst(v, result_kind(t, sexp.at(t, e, 4)))
+        r = rt(v, "grasm_result_box", [tag, w, kc], R_BOX)
+    }
+    do_return(v, if v.returns { r } else { -1 })
+    v.scope_mark.pop()
+    v
+}
+
+/// Where closure `e` begins in the source: the start of its span, which
+/// names its lifted function.
+pub fn closure_at(t: TirTree, e: i64) -> str {
+    let s = span_of(t, e)
+    if s.starts_with("@") {
+        return s.substr(1, s.len() - 1).split(":")[0]
+    }
+    "0"
 }

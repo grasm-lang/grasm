@@ -1,11 +1,13 @@
 // `mir`: TIR in, SSA MIR out (docs/self-hosting.md, stage S3).
 //
 //     sexp.gr   the TIR text reader
+//     mono.gr   generic functions instantiated at the types they are used at
 //     prog.gr   the whole program: callables, reachability, recursion, symbols
 //     lower.gr  TIR to three-address code over variables; decides the subset
 //     ssa.gr    variables to SSA with block arguments
 //     ir.gr     MIR itself: opcodes, the function record, a printer
 import sexp
+import mono
 import ir
 import prog
 import lower
@@ -15,8 +17,11 @@ import ssa
 /// reaches, plus the C entry point. A program outside the subset is an
 /// error naming every construct that put it there.
 pub fn build(src: bytes) -> MirProg ! str {
-    let t = try sexp.read(src)
-    let info = try prog.index(t)
+    let t0 = try sexp.read(src)
+    let mo = try mono.monomorphize(t0)
+    let t = mo.t
+    var info = try prog.index(t)
+    info.field_ty = mo.field_ty
     var errors: [str] = []
     let me = info.c_elem[info.main_c]
     if sexp.kids(t, sexp.kids(t, me)[0]).len() > 0 {
@@ -42,17 +47,99 @@ pub fn build(src: bytes) -> MirProg ! str {
             order.push(c)
         }
     }
-    // The C entry, last.
-    order.push(-1)
-    for c in order {
-        var v = if c >= 0 { lower.lower_callable(info, c) } else { lower.lower_entry(info) }
-        let name = if c >= 0 { info.c_name[c] } else { "<entry>" }
-        let sym = if c >= 0 { info.sym[c] } else { "_main" }
+    // Lifted functions -- closures' bodies and named functions' wrappers --
+    // made as the functions that use them are lowered, each once, and each
+    // given a callable id past the program's own (`nc + k`) and a symbol of
+    // its own. They are lowered after the program's functions, in the order
+    // they were found; the C entry is last.
+    let nc = info.c_name.len()
+    var callee_sym = info.sym
+    var used: Map[str, i64] = {}
+    used.set("_main", 1)
+    for s in info.sym {
+        if s != "" {
+            used.set(s, 1)
+        }
+    }
+    var lifts = Lifted{ key: {}, kind: [], elem: [], caps: [], capte: [], name: [] }
+    var q = 0
+    var done_own = false
+    while true {
+        var c = -2
+        if q < order.len() {
+            c = order[q]
+            q += 1
+        } else if lifts.kind.len() > q - order.len() {
+            c = nc + (q - order.len())
+            q += 1
+        } else if not done_own {
+            c = -1
+            done_own = true
+        } else {
+            break
+        }
+        var v = lower.new_vir()
+        var name = "<entry>"
+        var sym = "_main"
+        if c == -1 {
+            v = lower.lower_entry(info)
+        } else if c < nc {
+            v = lower.lower_callable(info, c)
+            name = info.c_name[c]
+            sym = info.sym[c]
+        } else {
+            let k = c - nc
+            if lifts.kind[k] == lower.LIFT_CLOSURE {
+                v = lower.lower_lifted_closure(info, lifts.elem[k], lifts.caps[k], lifts.capte[k])
+            } else {
+                v = lower.lower_wrapper(info, lifts.elem[k])
+            }
+            name = lifts.name[k]
+            sym = callee_sym[c]
+        }
         for m in v.errors {
             errors.push("{name}: {m}")
         }
         if v.errors.len() > 0 {
             continue
+        }
+        // The functions it makes values of, each found once in the program.
+        for i in 0..v.op.len() {
+            if v.op[i] == ir.M_FNADDR {
+                let li = v.imm[i]
+                let lk = v.lift_kind[li]
+                let le = v.lift_elem[li]
+                let key = if lk == lower.LIFT_CLOSURE { "c{le}" } else { "w{le}" }
+                v.imm[i] = match lifts.key.get(key) {
+                    Some(id) -> id
+                    None -> {
+                        let id = nc + lifts.kind.len()
+                        lifts.key.set(key, id)
+                        lifts.kind.push(lk)
+                        lifts.elem.push(le)
+                        lifts.caps.push(v.lift_caps[li])
+                        lifts.capte.push(v.lift_capte[li])
+                        var base = ""
+                        if lk == lower.LIFT_CLOSURE {
+                            let at = lower.closure_at(t, le)
+                            lifts.name.push("{name}::<closure@{at}>")
+                            base = "_gc_" + sym.substr(3, sym.len() - 3) + "_{at}"
+                        } else {
+                            lifts.name.push("{info.c_name[le]} as a value")
+                            base = "_gv_" + info.sym[le].substr(3, info.sym[le].len() - 3)
+                        }
+                        var s = base
+                        var n = 2
+                        while used.has(s) {
+                            s = base + "_{n}"
+                            n += 1
+                        }
+                        used.set(s, 1)
+                        callee_sym.push(s)
+                        id
+                    }
+                }
+            }
         }
         // String literals go into one pool for the object, each once.
         for i in 0..v.op.len() {
@@ -111,7 +198,18 @@ pub fn build(src: bytes) -> MirProg ! str {
     if errors.len() > 0 {
         fail(errors.join("\n"))
     }
-    MirProg{ fns: fns, callee_sym: info.sym, strs: strs, rt_syms: rt_syms, descs: descs }
+    MirProg{ fns: fns, callee_sym: callee_sym, strs: strs, rt_syms: rt_syms, descs: descs }
+}
+
+/// The lifted functions found so far: by key (`c<element>` for a closure,
+/// `w<callable>` for a wrapper), and in the order found.
+type Lifted = {
+    key: Map[str, i64],
+    kind: [i64],
+    elem: [i64],
+    caps: [[i64]],
+    capte: [[i64]],
+    name: [str],
 }
 
 /// Text `s`'s index in the string pool, adding it once.

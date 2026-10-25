@@ -7,10 +7,13 @@
 // folded into its branch -- is not emitted at all.
 //
 // The calling convention is not in the table, because it is not a choice:
-// arguments go in x0..x7 and the result comes back in x0 (AAPCS64), so a call
-// is moves into those registers, the `bl`, and a move out. Block arguments
-// become moves at the end of the jumping block, sequenced so that no move
-// overwrites a value another still has to read.
+// integer arguments go in x0..x7 and doubles in d0..d7, the two counted
+// apart, the rest on the stack in argument order, and the result comes back
+// in x0 or d0 (AAPCS64), so a call is moves into those registers, the `bl`,
+// and a move out. Block arguments become moves at the end of the jumping
+// block, sequenced so that no move overwrites a value another still has to
+// read. Every virtual register has the class of the MIR value it holds
+// (`MirFn.vfp`), and a move is `mov` or `fmov` by it.
 import mach
 import rules
 import vcode
@@ -62,8 +65,15 @@ fn guard_holds(f: MirFn, s: Sel, g: i64, i: i64, j: i64) -> bool {
         let (isk, k) = const_of(f, s, f.b[i])
         return isk and b_guard(g, k)
     }
-    // The fusing guards: `j` is a comparison only this branch reads.
+    // The fusing guards: `j` is a comparison only this branch reads, of
+    // integers for the `G_FUSE` family and of doubles for `G_FFUSE`.
     if j < 0 {
+        return false
+    }
+    if g == rules.G_FFUSE {
+        return f.op[j] == ir.M_FCMP
+    }
+    if f.op[j] != ir.M_ICMP {
         return false
     }
     if g == rules.G_FUSE {
@@ -164,11 +174,11 @@ fn plan(f: MirFn, rs: [Rule]) -> Sel ! str {
         if k == ir.M_BRIF {
             let c = f.tv[b]
             let d = s.def_inst[c]
-            if d >= f.bi0[b] and d < f.bi0[b] + f.bni[b] and f.op[d] == ir.M_ICMP and s.uses[c] == 1 {
+            if d >= f.bi0[b] and d < f.bi0[b] + f.bni[b] and (f.op[d] == ir.M_ICMP or f.op[d] == ir.M_FCMP) and s.uses[c] == 1 {
                 j = d
             }
             tr = choose(f, s, rs, ir.M_BRIF, -1, j)
-            if tr >= 0 and rules.guard_fuses(rs[tr].guard) {
+            if tr >= 0 and (rules.guard_fuses(rs[tr].guard) or rules.guard_ffuses(rs[tr].guard)) {
                 s.absorbed[j] = true
             } else {
                 j = -1
@@ -199,7 +209,10 @@ fn plan(f: MirFn, rs: [Rule]) -> Sel ! str {
             continue
         }
         let op = f.op[i]
-        if op == ir.M_CALL or op == ir.M_CALLRT {
+        if op == ir.M_CALL or op == ir.M_CALLRT or op == ir.M_CALLIND {
+            if op == ir.M_CALLIND {
+                bump(s, f.a[i])
+            }
             for j in f.ca0[i]..(f.ca0[i] + f.can[i]) {
                 bump(s, f.cargs[j])
             }
@@ -260,7 +273,7 @@ fn plan(f: MirFn, rs: [Rule]) -> Sel ! str {
 
 /// Operations that follow the calling convention rather than the rule table.
 fn is_call(op: i64) -> bool {
-    op == ir.M_CALL or op == ir.M_CALLRT or op == ir.M_INC or op == ir.M_DEC
+    op == ir.M_CALL or op == ir.M_CALLRT or op == ir.M_CALLIND or op == ir.M_INC or op == ir.M_DEC
 }
 
 fn vr(v: i64) -> i64 {
@@ -284,7 +297,7 @@ fn sel_reg(sel: i64, res: i64, a: i64, b: i64, t0: i64, ia: i64, ib: i64) -> i64
 /// Expands one rule application. `i` is the instruction (-1 for a
 /// terminator), `j` the comparison a branch absorbed, `tt`/`tf` the branch
 /// targets.
-fn expand(inout vc: VCode, f: MirFn, s: Sel, ru: Rule, ccm: [i64], i: i64, j: i64, tt: i64, tf: i64, cond: i64) -> () ! str {
+fn expand(inout vc: VCode, f: MirFn, s: Sel, ru: Rule, ccm: [i64], fccm: [i64], i: i64, j: i64, tt: i64, tf: i64, cond: i64) -> () ! str {
     var res = -1
     var a = -1
     var b = -1
@@ -303,10 +316,14 @@ fn expand(inout vc: VCode, f: MirFn, s: Sel, ru: Rule, ccm: [i64], i: i64, j: i6
         ia = f.a[j]
         ib = f.b[j]
     }
+    // The temporary, of the class of the field it is first named in.
     var t0 = -1
     for tm in ru.emit {
-        if t0 < 0 and (tm.d == rules.S_T0 or tm.n == rules.S_T0 or tm.m == rules.S_T0 or tm.a == rules.S_T0) {
-            t0 = vcode.new_vreg(vc)
+        let sels = [tm.d, tm.n, tm.m, tm.a]
+        for k in 0..4 {
+            if t0 < 0 and sels[k] == rules.S_T0 {
+                t0 = vcode.new_vreg(vc, if mach.fp_field(tm.mop, k) { mach.CLS_FP } else { mach.CLS_INT })
+            }
         }
     }
     for tm in ru.emit {
@@ -362,6 +379,10 @@ fn expand(inout vc: VCode, f: MirFn, s: Sel, ru: Rule, ccm: [i64], i: i64, j: i6
             vc.cc[x] = ccm[own_imm]
         } else if tm.cc == rules.CC_INNER {
             vc.cc[x] = ccm[f.imm[j]]
+        } else if tm.cc == rules.CC_FOWN {
+            vc.cc[x] = fccm[own_imm]
+        } else if tm.cc == rules.CC_FINNER {
+            vc.cc[x] = fccm[f.imm[j]]
         }
         if tm.tgt == rules.T_THEN {
             vc.tgt[x] = tt
@@ -371,6 +392,9 @@ fn expand(inout vc: VCode, f: MirFn, s: Sel, ru: Rule, ccm: [i64], i: i64, j: i6
         if tm.sym == rules.Y_STR {
             vc.symk[x] = vcode.SYM_STR
             vc.sym_id[x] = own_imm
+        } else if tm.sym == rules.Y_FN {
+            vc.symk[x] = vcode.SYM_FN
+            vc.sym_id[x] = own_imm
         } else if tm.sym == rules.Y_DATA {
             vc.symk[x] = vcode.SYM_DATA
             vc.sym_id[x] = own_imm
@@ -379,8 +403,16 @@ fn expand(inout vc: VCode, f: MirFn, s: Sel, ru: Rule, ccm: [i64], i: i64, j: i6
     ()
 }
 
+/// A register-to-register move within one class: `mov` (an `orr` with the
+/// zero register, Rm the source) for integers, `fmov` (Rn the source) for
+/// doubles.
 fn mov(inout vc: VCode, d: i64, src: i64) {
-    vcode.push(vc, mach.A_MOV, d, -1, src)
+    if vcode.cls_of(vc, d) == mach.CLS_FP {
+        vcode.push(vc, mach.A_FMOV, d, src, -1)
+    } else {
+        vcode.push(vc, mach.A_MOV, d, -1, src)
+    }
+    ()
 }
 
 /// Moves that happen at once: each `dsts[k]` gets the value `srcs[k]` had
@@ -418,7 +450,7 @@ fn par_moves(inout vc: VCode, dsts: [i64], srcs: [i64]) {
         } else {
             // A cycle: keep the first destination's value, then it is free.
             let keep = pd[0]
-            let t = vcode.new_vreg(vc)
+            let t = vcode.new_vreg(vc, vcode.cls_of(vc, keep))
             mov(vc, t, keep)
             for q in 0..ps.len() {
                 if ps[q] == keep {
@@ -429,37 +461,94 @@ fn par_moves(inout vc: VCode, dsts: [i64], srcs: [i64]) {
     }
 }
 
+/// Where AAPCS64 puts each of a call's (or a function's) arguments, given
+/// which are doubles: integers in x0..x7 and doubles in d0..d7, counted
+/// apart, and whatever does not fit in its file on the stack, eight bytes
+/// each in argument order. `reg[k]` is argument k's register, or -1 when it
+/// travels on the stack at slot `slot[k]`.
+type ArgPlan = {
+    reg: [i64],
+    slot: [i64],
+    nint: i64,
+    nfp: i64,
+    nstack: i64,
+}
+
+fn plan_args(fp: [bool]) -> ArgPlan {
+    var p = ArgPlan{ reg: [], slot: [], nint: 0, nfp: 0, nstack: 0 }
+    for k in 0..fp.len() {
+        if fp[k] and p.nfp < 8 {
+            p.reg.push(mach.R_D0 + p.nfp)
+            p.slot.push(-1)
+            p.nfp += 1
+        } else if not fp[k] and p.nint < 8 {
+            p.reg.push(p.nint)
+            p.slot.push(-1)
+            p.nint += 1
+        } else {
+            p.reg.push(-1)
+            p.slot.push(p.nstack)
+            p.nstack += 1
+        }
+    }
+    p
+}
+
+/// The classes of instruction `i`'s arguments.
+fn call_fp(f: MirFn, i: i64) -> [bool] {
+    var out: [bool] = []
+    for j in f.ca0[i]..(f.ca0[i] + f.can[i]) {
+        out.push(f.vfp[f.cargs[j]])
+    }
+    out
+}
+
 /// Selects machine instructions for a whole function.
-pub fn select(f: MirFn, rs: [Rule], ccm: [i64]) -> VCode ! str {
+pub fn select(f: MirFn, rs: [Rule], ccm: [i64], fccm: [i64]) -> VCode ! str {
     let s = try plan(f, rs)
     var vc = vcode.new_vcode(f.sym)
     vc.nvregs = f.nvals
+    for v in 0..f.nvals {
+        vc.vcls.push(if f.vfp[v] { mach.CLS_FP } else { mach.CLS_INT })
+    }
     vc.nparams = f.nparams
     vc.nslots = f.nslots
-    // Arguments past the eighth travel on the stack (AAPCS64), eight bytes
-    // each: the caller stores them at the bottom of its frame, where `sp`
-    // points at the call, and the callee reads them above its saved frame
-    // pointer. The outgoing area is as big as the largest call needs.
+    // Arguments that do not fit in registers travel on the stack (AAPCS64),
+    // eight bytes each: the caller stores them at the bottom of its frame,
+    // where `sp` points at the call, and the callee reads them above its
+    // saved frame pointer. The outgoing area is as big as the largest call
+    // needs.
     for i in 0..f.op.len() {
-        if f.op[i] == ir.M_CALL and f.can[i] - 8 > vc.nout {
-            vc.nout = f.can[i] - 8
-        }
-        if f.op[i] == ir.M_CALLRT and f.can[i] > 8 {
-            fail("a runtime call with {f.can[i]} arguments; only eight travel in registers")
+        if f.op[i] == ir.M_CALL or f.op[i] == ir.M_CALLRT or f.op[i] == ir.M_CALLIND {
+            let ap = plan_args(call_fp(f, i))
+            if f.op[i] == ir.M_CALLRT and ap.nstack > 0 {
+                fail("a runtime call with {f.can[i]} arguments; only eight of each class travel in registers")
+            }
+            if ap.nstack > vc.nout {
+                vc.nout = ap.nstack
+            }
         }
     }
+    var pfp: [bool] = []
+    for k in 0..f.bnp[0] {
+        pfp.push(f.vfp[f.bparams[f.bp0[0] + k]])
+    }
+    let pp = plan_args(pfp)
+    vc.nreg_int = pp.nint
+    vc.nreg_fp = pp.nfp
     let nb = ir.nblocks(f)
     for b in 0..nb {
         vc.bi0.push(vc.mop.len())
         if b == 0 {
-            // Parameters arrive in x0..x7, and the rest at the frame
-            // pointer: past the saved pair, where the caller's `sp` was.
+            // Parameters arrive in x0..x7 and d0..d7, and the rest at the
+            // frame pointer: past the saved pair, where the caller's `sp` was.
             for k in 0..f.bnp[0] {
-                if k < 8 {
-                    mov(vc, vr(f.bparams[f.bp0[0] + k]), k)
+                let p = vr(f.bparams[f.bp0[0] + k])
+                if pp.reg[k] >= 0 {
+                    mov(vc, p, pp.reg[k])
                 } else {
-                    let x = vcode.push(vc, mach.A_LDR, vr(f.bparams[f.bp0[0] + k]), mach.R_FP, -1)
-                    vc.imm[x] = 16 + 8 * (k - 8)
+                    let x = vcode.push(vc, if pfp[k] { mach.A_FLDR } else { mach.A_LDR }, p, mach.R_FP, -1)
+                    vc.imm[x] = 16 + 8 * pp.slot[k]
                 }
             }
         }
@@ -468,26 +557,37 @@ pub fn select(f: MirFn, rs: [Rule], ccm: [i64]) -> VCode ! str {
                 continue
             }
             let op = f.op[i]
-            if op == ir.M_CALL or op == ir.M_CALLRT {
+            if op == ir.M_CALL or op == ir.M_CALLRT or op == ir.M_CALLIND {
                 let n = f.can[i]
+                let cfp = call_fp(f, i)
+                let ap = plan_args(cfp)
                 // The stack arguments first: storing them reads registers the
                 // moves below may be about to fill.
-                for k in 8..n {
-                    let x = vcode.push(vc, mach.A_STR, vr(f.cargs[f.ca0[i] + k]), mach.R_SP, -1)
-                    vc.imm[x] = 8 * (k - 8)
-                }
                 for k in 0..n {
-                    if k < 8 {
-                        mov(vc, k, vr(f.cargs[f.ca0[i] + k]))
+                    if ap.reg[k] < 0 {
+                        let x = vcode.push(vc, if cfp[k] { mach.A_FSTR } else { mach.A_STR }, vr(f.cargs[f.ca0[i] + k]), mach.R_SP, -1)
+                        vc.imm[x] = 8 * ap.slot[k]
                     }
                 }
-                let x = vcode.push(vc, mach.A_BL, -1, -1, -1)
-                vc.imm[x] = if f.res[i] >= 0 { 1 } else { 0 }
-                vc.imm2[x] = if n > 8 { 8 } else { n }
-                vc.symk[x] = if op == ir.M_CALL { vcode.SYM_FN } else { vcode.SYM_RT }
-                vc.sym_id[x] = f.imm[i]
+                for k in 0..n {
+                    if ap.reg[k] >= 0 {
+                        mov(vc, ap.reg[k], vr(f.cargs[f.ca0[i] + k]))
+                    }
+                }
+                // A call through a function value's code is `blr` on the
+                // register holding it, which the argument moves above cannot
+                // have overwritten: its interval spans them, so it was never
+                // given one of their registers.
+                let x = if op == ir.M_CALLIND { vcode.push(vc, mach.A_BLR, -1, vr(f.a[i]), -1) } else { vcode.push(vc, mach.A_BL, -1, -1, -1) }
+                let res_fp = f.res[i] >= 0 and f.vfp[f.res[i]]
+                vc.imm[x] = if f.res[i] < 0 { vcode.RES_NONE } else if res_fp { vcode.RES_D0 } else { vcode.RES_X0 }
+                vc.imm2[x] = vcode.call_args_code(ap.nint, ap.nfp)
+                if op != ir.M_CALLIND {
+                    vc.symk[x] = if op == ir.M_CALL { vcode.SYM_FN } else { vcode.SYM_RT }
+                    vc.sym_id[x] = f.imm[i]
+                }
                 if f.res[i] >= 0 {
-                    mov(vc, vr(f.res[i]), 0)
+                    mov(vc, vr(f.res[i]), if res_fp { mach.R_D0 } else { 0 })
                 }
                 continue
             }
@@ -497,21 +597,29 @@ pub fn select(f: MirFn, rs: [Rule], ccm: [i64]) -> VCode ! str {
                 // what it must, exactly as for the Cranelift build.
                 mov(vc, 0, vr(f.a[i]))
                 let x = vcode.push(vc, mach.A_BL, -1, -1, -1)
-                vc.imm[x] = 0
-                vc.imm2[x] = 1
+                vc.imm[x] = vcode.RES_NONE
+                vc.imm2[x] = vcode.call_args_code(1, 0)
                 vc.symk[x] = vcode.SYM_RT
                 vc.sym_id[x] = if op == ir.M_INC { ir.RT_VAL_INC } else { ir.RT_VAL_DEC }
                 continue
             }
-            try expand(vc, f, s, rs[s.rule_of[i]], ccm, i, -1, -1, -1, -1)
+            try expand(vc, f, s, rs[s.rule_of[i]], ccm, fccm, i, -1, -1, -1, -1)
         }
         let k = f.tk[b]
         if k == ir.M_RET {
+            // The result in x0, or a double in d0.
+            var rk = vcode.RES_NONE
             if f.tv[b] >= 0 {
-                mov(vc, 0, vr(f.tv[b]))
+                if f.vfp[f.tv[b]] {
+                    mov(vc, mach.R_D0, vr(f.tv[b]))
+                    rk = vcode.RES_D0
+                } else {
+                    mov(vc, 0, vr(f.tv[b]))
+                    rk = vcode.RES_X0
+                }
             }
             let x = vcode.push(vc, mach.P_RETURN, -1, -1, -1)
-            vc.imm[x] = if f.tv[b] >= 0 { 1 } else { 0 }
+            vc.imm[x] = rk
         } else {
             if k == ir.M_JUMP {
                 let t = f.tt[b]
@@ -525,7 +633,7 @@ pub fn select(f: MirFn, rs: [Rule], ccm: [i64]) -> VCode ! str {
             } else if k == ir.M_BRIF and (f.tan[b] > 0 or f.fan[b] > 0) {
                 fail("a conditional branch passes arguments: its edges were not split")
             }
-            try expand(vc, f, s, rs[s.term_rule[b]], ccm, -1, s.inner[b], f.tt[b], f.tf[b], f.tv[b])
+            try expand(vc, f, s, rs[s.term_rule[b]], ccm, fccm, -1, s.inner[b], f.tt[b], f.tf[b], f.tv[b])
         }
         vc.bni.push(vc.mop.len() - vc.bi0[b])
     }

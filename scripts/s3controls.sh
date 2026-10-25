@@ -33,6 +33,21 @@
 #   method       `to_upper` calls the runtime's lower-casing
 #                -> s3subset
 #
+# Part three's doubles, function values and generics:
+#
+#   fp-cc        a comparison of doubles' `lt` reads the integer `lt`
+#                condition, which an unordered comparison (a NaN) satisfies
+#                -> encodetest (the floating-point map checked against IEEE)
+#                -> fuzz_s3, with the table's checks skipped (a NaN compared)
+#   fp-class     every move is the integer `mov`, doubles' too: a double in a
+#                general register's field
+#                -> s3subset (the allocation checker's class check)
+#   capture-rc   a closure's boxed capture goes into its environment without
+#                a reference of its own -> s3rc (a use after free)
+#   mono         an instance is named for its function alone, so every use
+#                of a generic function reaches whichever instance came first
+#                -> s3subset
+#
 # A fault that sends a program into a loop shows as a run stopped at the
 # gates' limit (`S3_RUN_SECONDS` in `scripts/lib/s3.sh`, 20 s against well
 # under a second for any subset program), and counts as caught.
@@ -78,7 +93,10 @@ control() {
         controls=$((controls + 1))
         local log="$WORK/$name-$(basename "$gate" .sh).log"
         git ls-files --others --exclude-standard | sort >"$WORK/untracked-before"
-        S3="$driver" S3_EXTRA="$extra" "$gate" >"$log" 2>&1
+        case "$gate" in
+            *.py) S3="$driver" S3_EXTRA="$extra" python3 "$gate" >"$log" 2>&1 ;;
+            *) S3="$driver" S3_EXTRA="$extra" "$gate" >"$log" 2>&1 ;;
+        esac
         local code=$?
         # A mutated backend can make a program write wherever it can reach.
         # The extra-dec and rc-select faults free a string still in use, and
@@ -160,6 +178,23 @@ control method compiler/mir/src/lower.gr \
     "\"str.to_upper/0\" -> read_method(info, v, e, \"grasm_str_lower\"" -- \
     scripts/s3subset.sh "MISMATCH:" -
 
+control fp-cc compiler/aarch64/src/rules.gr \
+    "        mach.C_MI," "        mach.C_LT," -- \
+    scripts/encodetest.sh "on doubles, slt maps to lt" - \
+    scripts/fuzz_s3.py "FAILED program" --no-rule-check
+
+control fp-class compiler/aarch64/src/isel.gr \
+    "    if vcode.cls_of(vc, d) == mach.CLS_FP {" "    if false {" -- \
+    scripts/s3subset.sh "register allocation check failed" -
+
+control capture-rc compiler/mir/src/lower.gr \
+    "            x = retain_copy(v, w)" "            x = w" -- \
+    scripts/s3rc.sh "use after free" -
+
+control mono compiler/mir/src/mono.gr \
+    "    let iname = inst_name(m.t, name, targs)" "    let iname = name + \"[]\"" -- \
+    scripts/s3subset.sh "FAILED:" -
+
 echo
 echo "controls: $controls   caught: $caught   missed: ${#MISSED[@]}"
 if [ ${#MISSED[@]} -gt 0 ]; then
@@ -168,9 +203,9 @@ if [ ${#MISSED[@]} -gt 0 ]; then
     printf '  %s\n' "${MISSED[@]}"
     exit 1
 fi
-# Fourteen gate runs over eleven faults, and every one must have failed.
-if [ "$controls" -ne 14 ] || [ "$caught" -ne 14 ]; then
-    echo "expected 14 controls caught, ran $controls and caught $caught"
+# Nineteen gate runs over fifteen faults, and every one must have failed.
+if [ "$controls" -ne 19 ] || [ "$caught" -ne 19 ]; then
+    echo "expected 19 controls caught, ran $controls and caught $caught"
     exit 1
 fi
 exit 0

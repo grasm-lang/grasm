@@ -21,13 +21,24 @@ import mir.ir
 type A64Opts = {
     /// Registers the allocator may hand out; negative for all of them.
     max_regs: i64,
-    /// Plant an allocation error, so the checker can be seen to catch it.
-    corrupt: bool,
+    /// Plant an allocation error, so the checker can be seen to catch it:
+    /// `regalloc.PLANT_*`, `PLANT_NONE` for none.
+    corrupt: i64,
     want_asm: bool,
 }
 
 pub fn default_opts() -> A64Opts {
-    A64Opts{ max_regs: -1, corrupt: false, want_asm: false }
+    A64Opts{ max_regs: -1, corrupt: regalloc.PLANT_NONE, want_asm: false }
+}
+
+/// The kinds of planted allocation error, by the names the driver takes.
+pub fn plant_kind(name: str) -> i64 {
+    match name {
+        "any" -> regalloc.PLANT_ANY
+        "fp" -> regalloc.PLANT_FP
+        "class" -> regalloc.PLANT_CLASS
+        _ -> -1
+    }
 }
 
 /// What compiling one function produced.
@@ -41,13 +52,19 @@ type A64Result = {
 
 /// Selects, allocates, checks and encodes one function. `rt_syms` names the
 /// runtime functions its calls reach, by id (`MirProg.rt_syms`).
-pub fn compile_fn(f: MirFn, rs: [Rule], ccm: [i64], opts: A64Opts, callee_sym: [str], rt_syms: [str]) -> A64Result ! str {
-    let vc = try isel.select(f, rs, ccm)
+pub fn compile_fn(f: MirFn, rs: [Rule], ccm: [i64], fccm: [i64], opts: A64Opts, callee_sym: [str], rt_syms: [str]) -> A64Result ! str {
+    let vc = try isel.select(f, rs, ccm, fccm)
     let al = try regalloc.allocate(vc, opts.max_regs, opts.corrupt)
     let errs = check.check(al)
     var vtext = ""
     if opts.want_asm {
         vtext = vcode.print_vcode(vc)
+    }
+    if errs.len() > 0 {
+        // Code the checker refused is not encoded: an operand in the wrong
+        // register file is no instruction at all.
+        let none = A64Code{ sym: f.sym, words: [], rel_off: [], rel_kind: [], rel_symk: [], rel_sym: [], asm: [], frame: 0, nspill: al.nspill, nsaved: 0 }
+        return A64Result{ code: none, ra_errors: errs, corrupted: al.corrupted, vcode_text: vtext }
     }
     let code = try emit.emit(al, f.sym, opts.want_asm, callee_sym, rt_syms)
     A64Result{ code: code, ra_errors: errs, corrupted: al.corrupted, vcode_text: vtext }
@@ -61,6 +78,10 @@ pub fn cond_map() -> [i64] {
     rules.cc_map()
 }
 
+pub fn fcond_map() -> [i64] {
+    rules.fcc_map()
+}
+
 /// Everything wrong with the rule table, or nothing.
 pub fn check_rules() -> [str] {
     rules.check(rules.rules())
@@ -70,7 +91,7 @@ pub fn check_rules() -> [str] {
 /// and what the calling convention, the allocator and the frame add.
 pub fn emittable_forms() -> [str] {
     var seen: [bool] = []
-    for m in 0..64 {
+    for m in 0..mach.NMOPS {
         seen.push(false)
     }
     for m in rules.rule_mops(rules.rules()) {
@@ -78,11 +99,11 @@ pub fn emittable_forms() -> [str] {
     }
     // Calls and their argument moves; spills and reloads; the prologue,
     // the epilogue and frame adjustment; branches as emission rewrites them.
-    for m in [mach.A_MOV, mach.A_BL, mach.A_LDR, mach.A_STR, mach.A_PACIBSP, mach.A_STP_PRE, mach.A_LDP_POST, mach.A_ADDI, mach.A_SUBI, mach.A_RETAB, mach.A_B, mach.A_BCOND, mach.A_CBZ, mach.A_CBNZ] {
+    for m in [mach.A_MOV, mach.A_BL, mach.A_LDR, mach.A_STR, mach.A_PACIBSP, mach.A_STP_PRE, mach.A_LDP_POST, mach.A_ADDI, mach.A_SUBI, mach.A_RETAB, mach.A_B, mach.A_BCOND, mach.A_CBZ, mach.A_CBNZ, mach.A_FMOV, mach.A_FLDR, mach.A_FSTR, mach.A_FSTP_PRE, mach.A_FLDP_POST, mach.A_BLR] {
         seen[m] = true
     }
     var out: [str] = []
-    for m in 0..64 {
+    for m in 0..mach.NMOPS {
         if seen[m] {
             out.push(mach.form_name(m))
         }

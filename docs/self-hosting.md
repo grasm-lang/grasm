@@ -811,6 +811,80 @@ leak check (`GRASM_LEAK_CHECK=1`) and against the poisoned runtime
 (`--features grasm_rt/poison`), as `leakcheck` and `usecheck` run the
 Cranelift build.
 
+### 6.2 S3 part three: doubles, function values, generics
+
+Taken in the order the blocking counts gave (part two measured f64 in 198 of
+the 362 programs left out, closures and function values in 187, generics in
+74).
+
+**Doubles** are a second register class. A MIR value carries its class
+(`MirFn.vfp`), every operation fixes the class of what it reads and writes,
+and SSA construction refuses a lowering that mixes them. Selection is by the
+rule table, as for integers: `fadd fsub fmul fdiv fneg fabs fsqrt`,
+`frintm`/`frintp` for `floor`/`ceil`, `scvtf`/`ucvtf`, and `fcvtzs`/`fcvtzu`
+for the conversions to integers, which round toward zero and saturate with
+NaN to 0 as the Cranelift build's `fcvt_to_sint_sat` does (a narrow target
+is then clamped to its range). A literal's bits, which TIR writes exactly
+(`0x400921fb54442d18`), are made in a general register and moved across with
+`fmov`. `%`, `^`, `round`, `min`, `max`, the math library and the formatting
+are the runtime's functions, the same ones the Cranelift build calls.
+Comparisons go through a floating-point condition map -- `eq ne mi ls gt ge`,
+not the integer `lt le`, which an unordered comparison satisfies -- checked
+by the rule table's own checks against IEEE semantics on NaN, both zeros,
+the infinities, the largest finite values and subnormals, as the integer map
+is checked against two's complement. Where the runtime holds a double's bits
+in a word -- a scalar list's element, a struct's field, a split result's
+word, an interpolated piece -- `fmov` crosses between the files.
+
+The allocator gives each class its own registers: d16..d28 and d0..d7 to an
+interval that crosses no call, d8..d15 (whose low halves AAPCS64 has the
+callee preserve, and which the prologue saves in pairs when the body writes
+them) to one that does, and d29..d31 for reloads. Calls follow AAPCS64:
+integers in x0..x7 and doubles in d0..d7, counted apart, whatever does not
+fit on the stack in argument order, a double answered in d0. The allocation
+checker tracks the floating-point registers as locations of their own and
+checks every operand's class twice -- what selection put in a field (a
+virtual register's class) and what allocation put there (a physical
+register's file) -- so a double in a general register is an error before the
+encoder sees it. Every new form is in `encodetest` against `clang -c`.
+
+**Function values** are the runtime's boxed `Fn` (`grasm_fn_new`): the
+address of compiled code and an environment, a list of the captured values.
+The code takes the environment first and then the arguments, and owns all
+of them. A closure's body is lifted into a function of its own; it captures
+by value at its creation ([E-CLOSURE-CAPTURE]), each variable its body reads
+and does not bind copied into the environment -- TIR does not list captures
+(docs/tir.md §8), and a closure shares its function's variable numbering, so
+they are the body's reads less its bindings -- and unpacks them at entry,
+bound to the variable numbers they came from. A named function used as a
+value is called through a wrapper that releases the empty environment and
+calls it, asking for a stack floor where the recursion is entered, the
+Cranelift build's `fn_value_wrapper`; its name is in the value, so it prints
+as `<fn module::name>`. A call through a value reads the code and a
+reference to the environment out of it (`grasm_fn_code`, `grasm_fn_env`) and
+is a `blr` on the register holding the code. `map`, `filter`, `fold`,
+`any`, `all`, `find`, `sort_by`, and `map` and `filter` of a range written in
+place, are loops calling the value once per element in order: `map` keeps a
+scalar result inline (a scalar list), `filter` keeps its input's
+representation, the searches stop at the first element that decides them,
+and `sort_by` computes every key over a copy of its receiver before taking
+the receiver to sort it in place. The Cranelift build inlines the closure's
+body into the loop instead, and a `return` in it then leaves the calling
+function (docs/known-issues.md, open S1); the lifted closure returns from
+itself, as the interpreter does.
+
+**Generics** are instantiated before anything else reads the program
+(`compiler/mir/src/mono.gr`): every use of a generic function -- a `call` or
+a `fnref` with type arguments -- names an instance, `name[T1,T2]`, made the
+first time it is asked for as a copy of the function with each `(generic n)`
+replaced by its argument. A `boundcall` -- an interface method on a receiver
+of a generic type -- is concrete once its function is: the receiver's type
+picks the `impl`, and the call is to the function it provides, an instance
+itself when the `impl` is generic. The field types of instantiated generic
+types are made the same way, so a pattern taking a `Tree[i64]` apart reads
+`Tree[i64]` fields rather than `Tree[T]` ones. The subset rule runs the same
+pass, in Python, before it decides anything.
+
 ## 7. Bootstrap and trust
 
 - **During the migration:** stage 0 is the Rust-built `grasm`.
@@ -896,19 +970,27 @@ Measured, not estimated; each line is a gate's result on master.
 - **S3 in progress.** `compiler/` holds an aarch64 backend in Grasm --
   MIR with explicit `inc`/`dec`, rule-based selection, linear scan with a
   checker, an encoder checked against `clang -c`, a Mach-O object writer
-  -- on a subset: 289 of 651 corpus programs with a `main` build with it
+  -- on a subset: 474 of 651 corpus programs with a `main` build with it
   and print and exit exactly as the Cranelift build does (part one had 37:
-  scalars, control flow, calls, printing; part two added heap values with
-  explicit reference counting, fallible functions, 111 built-in methods
-  over seven receiver families, 22 one-call built-ins, arguments on the
-  stack and places passed `inout`, §6.1). All of them run with nothing live
-  at exit (those that reach the leak check; a few end by design before it)
-  and no use after free under the poisoned runtime. fib(35) was about 1.9x
-  slower than Cranelift's code at part one. What still keeps programs out,
-  by count of the 362 left: f64 (198), closures and function values (91,
-  with the list methods that take one: `map` 99, `filter` 58, `sort_by`
-  46), generics (72), references (72); effects, tasks and raw memory after
-  them.
+  scalars, control flow, calls, printing; part two, 289, added heap values
+  with explicit reference counting, fallible functions, 111 built-in
+  methods over seven receiver families, 22 one-call built-ins, arguments on
+  the stack and places passed `inout`, §6.1; part three added `f64` as a
+  second register class, closures and function values with the
+  higher-order list methods, and generics by monomorphization, §6.2: 357
+  with doubles, 457 with function values, 474 with generics). All of them
+  run with nothing live at exit (those that reach the leak check; a few end
+  by design before it) and no use after free under the poisoned runtime.
+  fib(35) was about 1.9x slower than Cranelift's code at part one. What
+  still keeps programs out, by count of the 177 left (a program counts
+  under each reason it has): references (72), and among the rest raw
+  memory and `unsafe` (71), the network built-ins (52), effects (`with`
+  50, effect operations 43), ranges held as values (`to_list` 49, a range
+  local 21), parallel and task operations (`par_map` 16 and more). No
+  program is kept out by doubles, function values or generics alone any
+  more; they still appear in 9, 10 and 28 programs something else keeps
+  out (a function type over a reference, generic code at a reference
+  type).
 - **Not started:** S2 (the frontend in Grasm), S4 (the linker), S5 (the
   runtime in Grasm), S6 (self-compilation), S7-S9.
 

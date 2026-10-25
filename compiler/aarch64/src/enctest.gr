@@ -44,6 +44,22 @@ fn reg_for(inout g: Rng, k: i64, f: i64, alt: i64) -> i64 {
     }
 }
 
+/// The register for case `k` of field `f` of form `m`: a floating-point one
+/// where the form takes one there (no 31 means anything else in those), else
+/// as `reg_for`.
+fn any_reg(inout g: Rng, m: i64, k: i64, f: i64, alt: i64) -> i64 {
+    if mach.fp_field(m, f) {
+        var r = 0
+        if k < 32 {
+            r = (k * (2 * f + 1) + 7 * f) % 32
+        } else {
+            r = pick(g, 0, 31)
+        }
+        return mach.R_D0 + r
+    }
+    reg_for(g, k, f, alt)
+}
+
 fn add(inout c: EncCases, m: i64, rd: i64, rn: i64, rm: i64, ra: i64, imm: i64, imm2: i64, cc: i64, off: i64, target: str) -> () ! str {
     let w = try mach.encode(m, rd, rn, rm, ra, imm, imm2, cc, off)
     c.form.push(mach.form_name(m))
@@ -192,6 +208,53 @@ pub fn cases() -> EncCases ! str {
                 let rd = reg_for(g, k, 0, mach.R_SP)
                 let rn = reg_for(g, k, 1, mach.R_SP)
                 try add(c, m, rd, rn, -1, -1, 0, 0, -1, 0, "_s3_encode_data{k % 3}")
+            }
+        } else if m >= mach.A_FADD and m <= mach.A_FDIV {
+            for k in 0..n {
+                let rd = any_reg(g, m, k, 0, mach.R_ZR)
+                let rn = any_reg(g, m, k, 1, mach.R_ZR)
+                let rm = any_reg(g, m, k, 2, mach.R_ZR)
+                try add(c, m, rd, rn, rm, -1, 0, 0, -1, 0, "")
+            }
+        } else if (m >= mach.A_FNEG and m <= mach.A_FMOV_DX) or (m >= mach.A_SCVTF and m <= mach.A_FCVTZU) {
+            // One operand, of either class: a general register's 31 is the
+            // zero register here (`fmov d0, xzr` is how a zero is made).
+            for k in 0..n {
+                let rd = any_reg(g, m, k, 0, mach.R_ZR)
+                let rn = any_reg(g, m, k, 1, mach.R_ZR)
+                try add(c, m, rd, rn, -1, -1, 0, 0, -1, 0, "")
+            }
+        } else if m == mach.A_FCMP {
+            for k in 0..n {
+                let rn = any_reg(g, m, k, 1, mach.R_ZR)
+                let rm = any_reg(g, m, k, 2, mach.R_ZR)
+                try add(c, m, -1, rn, rm, -1, 0, 0, -1, 0, "")
+            }
+        } else if m == mach.A_FLDR or m == mach.A_FSTR {
+            for k in 0..n {
+                let rt = any_reg(g, m, k, 0, mach.R_ZR)
+                let rn = reg_for(g, k, 1, mach.R_SP)
+                try add(c, m, rt, rn, -1, -1, 8 * uimm_for(g, k, 12), 0, -1, 0, "")
+            }
+        } else if m == mach.A_BLR {
+            for k in 0..31 {
+                try add(c, m, -1, k, -1, -1, 0, 0, -1, 0, "")
+            }
+        } else if m == mach.A_FSTP_PRE or m == mach.A_FLDP_POST {
+            var k = 0
+            var made = 0
+            while made < n {
+                let rt = any_reg(g, m, k, 0, mach.R_ZR)
+                let rt2 = any_reg(g, m, k, 2, mach.R_ZR)
+                let rn = reg_for(g, k, 1, mach.R_SP)
+                let w = if k < 128 { k - 64 } else { pick(g, -64, 63) }
+                k += 1
+                // Loading both halves into one register is unpredictable.
+                if m == mach.A_FLDP_POST and rt == rt2 {
+                    continue
+                }
+                try add(c, m, rt, rn, rt2, -1, 8 * w, 0, -1, 0, "")
+                made += 1
             }
         } else {
             fail("no test cases for opcode {m}")

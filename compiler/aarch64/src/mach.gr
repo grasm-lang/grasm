@@ -12,17 +12,35 @@
 // Registers are numbered as operands: 0..30 are x0..x30, `R_ZR` is the zero
 // register and `R_SP` the stack pointer (both 31 in an encoding; which one an
 // encoding means depends on the field, and the encoder refuses the wrong one),
-// and `VR + n` is virtual register n before allocation.
+// `R_D0 + k` is the floating-point register dk (the 64-bit view of vk), and
+// `VR + n` is virtual register n before allocation.
+//
+// There are two register classes. Every field of every form is one or the
+// other (`fp_field`): a general register (x, or w) or a floating-point one
+// (d). The encoder refuses a register of the wrong class in a field, the
+// allocator hands each virtual register one of its own class, and the
+// checker proves both.
 
 pub let R_ZR = 31
 pub let R_SP = 32
-pub let VR = 64
+/// d0; dk is `R_D0 + k`.
+pub let R_D0 = 64
+pub let VR = 128
 /// x29, the frame pointer: set by the prologue, never allocated, and read
 /// for the arguments that arrived on the stack.
 pub let R_FP = 29
 
+/// The register classes.
+pub let CLS_INT = 0
+pub let CLS_FP = 1
+
 pub fn is_vreg(o: i64) -> bool {
-    o >= 64
+    o >= VR
+}
+
+/// A physical floating-point register.
+pub fn is_fpr(o: i64) -> bool {
+    o >= R_D0 and o < R_D0 + 32
 }
 
 // ----- opcodes ---------------------------------------------------------------
@@ -72,20 +90,59 @@ pub let A_PACIBSP = 42
 pub let A_BRK = 43
 pub let A_ADRP = 44
 pub let A_ADDPO = 45
+// Floating point, all on doubles.
+pub let A_FADD = 46
+pub let A_FSUB = 47
+pub let A_FMUL = 48
+pub let A_FDIV = 49
+pub let A_FNEG = 50
+pub let A_FABS = 51
+pub let A_FSQRT = 52
+/// Round toward minus infinity: `floor`.
+pub let A_FRINTM = 53
+/// Round toward plus infinity: `ceil`.
+pub let A_FRINTP = 54
+/// `fmov dd, dn`.
+pub let A_FMOV = 55
+/// `fmov xd, dn`: the bits of a double into a general register.
+pub let A_FMOV_XD = 56
+/// `fmov dd, xn`: the bits in a general register as a double.
+pub let A_FMOV_DX = 57
+pub let A_FCMP = 58
+pub let A_SCVTF = 59
+pub let A_UCVTF = 60
+/// Toward zero, saturating; NaN is 0.
+pub let A_FCVTZS = 61
+pub let A_FCVTZU = 62
+pub let A_FLDR = 63
+pub let A_FSTR = 64
+pub let A_FSTP_PRE = 65
+pub let A_FLDP_POST = 66
+/// `blr xn`: a call through a register, a function value's code.
+pub let A_BLR = 67
 /// Not an instruction: the function's return, which becomes the epilogue.
-/// `imm` 1 when it returns x0.
-pub let P_RETURN = 60
+/// `imm` 1 when it returns x0, 2 when it returns d0.
+pub let P_RETURN = 90
 /// Not an instruction: a 64-bit constant, which instruction selection
 /// expands into `movz`/`movn` and `movk`s.
-pub let P_MOVIMM = 61
+pub let P_MOVIMM = 91
+/// One past the largest opcode: the size of a table indexed by opcode.
+pub let NMOPS = 96
 
 /// The opcodes that are real instructions, for whoever wants all of them.
 pub fn all_mops() -> [i64] {
     var out: [i64] = []
-    for m in 1..46 {
+    for m in 1..68 {
         out.push(m)
     }
     out
+}
+
+/// Whether `m` is a call: `bl` to a symbol or `blr` through a register. Both
+/// read their argument registers, write their result's, and clobber what a
+/// call may change (`imm`, `imm2`: `vcode.RES_*`, `vcode.call_args_code`).
+pub fn is_call(m: i64) -> bool {
+    m == A_BL or m == A_BLR
 }
 
 pub fn mop_name(m: i64) -> str {
@@ -135,8 +192,30 @@ pub fn mop_name(m: i64) -> str {
         43 -> "brk"
         44 -> "adrp"
         45 -> "add"
-        60 -> "<return>"
-        61 -> "<movimm>"
+        46 -> "fadd"
+        47 -> "fsub"
+        48 -> "fmul"
+        49 -> "fdiv"
+        50 -> "fneg"
+        51 -> "fabs"
+        52 -> "fsqrt"
+        53 -> "frintm"
+        54 -> "frintp"
+        55 -> "fmov"
+        56 -> "fmov"
+        57 -> "fmov"
+        58 -> "fcmp"
+        59 -> "scvtf"
+        60 -> "ucvtf"
+        61 -> "fcvtzs"
+        62 -> "fcvtzu"
+        63 -> "ldr"
+        64 -> "str"
+        65 -> "stp"
+        66 -> "ldp"
+        67 -> "blr"
+        90 -> "<return>"
+        91 -> "<movimm>"
         _ -> "<?>"
     }
 }
@@ -189,6 +268,28 @@ pub fn form_name(m: i64) -> str {
         43 -> "brk"
         44 -> "adrp"
         45 -> "add-pageoff"
+        46 -> "fadd"
+        47 -> "fsub"
+        48 -> "fmul"
+        49 -> "fdiv"
+        50 -> "fneg"
+        51 -> "fabs"
+        52 -> "fsqrt"
+        53 -> "frintm"
+        54 -> "frintp"
+        55 -> "fmov-d"
+        56 -> "fmov-x-d"
+        57 -> "fmov-d-x"
+        58 -> "fcmp"
+        59 -> "scvtf"
+        60 -> "ucvtf"
+        61 -> "fcvtzs"
+        62 -> "fcvtzu"
+        63 -> "ldr-d-uimm"
+        64 -> "str-d-uimm"
+        65 -> "stp-d-pre"
+        66 -> "ldp-d-post"
+        67 -> "blr"
         _ -> "?"
     }
 }
@@ -212,8 +313,12 @@ let F_FIXED = 15
 let F_BRK = 16
 let F_ADRP = 17
 let F_ADDPO = 18
+let F_BLR = 19
 
 fn mop_fmt(m: i64) -> i64 {
+    if m >= A_FADD {
+        return fp_fmt(m)
+    }
     if m <= 11 {
         1
     } else if m == 12 {
@@ -252,6 +357,52 @@ fn mop_fmt(m: i64) -> i64 {
         18
     } else {
         0
+    }
+}
+
+/// The floating-point forms, each laid out as an integer one is: the
+/// three-register arithmetic as `add`, a compare as `cmp`, the one-operand
+/// operations and the moves between classes as `sxtb` (Rd, Rn), loads and
+/// stores and pairs as theirs.
+fn fp_fmt(m: i64) -> i64 {
+    if m >= A_FADD and m <= A_FDIV {
+        F_RRR
+    } else if m >= A_FNEG and m <= A_FMOV_DX {
+        F_RN
+    } else if m == A_FCMP {
+        F_CMPR
+    } else if m >= A_SCVTF and m <= A_FCVTZU {
+        F_RN
+    } else if m == A_FLDR or m == A_FSTR {
+        F_LDST
+    } else if m == A_FSTP_PRE or m == A_FLDP_POST {
+        F_PAIR
+    } else if m == A_BLR {
+        F_BLR
+    } else {
+        0
+    }
+}
+
+/// Whether field `field` (0 Rd/Rt, 1 Rn, 2 Rm/Rt2, 3 Ra) of opcode `m` is a
+/// floating-point register; every other register field is a general one.
+pub fn fp_field(m: i64, field: i64) -> bool {
+    if m >= A_FADD and m <= A_FDIV {
+        field <= 2
+    } else if m >= A_FNEG and m <= A_FMOV {
+        field <= 1
+    } else if m == A_FMOV_XD or m == A_FCVTZS or m == A_FCVTZU {
+        field == 1
+    } else if m == A_FMOV_DX or m == A_SCVTF or m == A_UCVTF {
+        field == 0
+    } else if m == A_FCMP {
+        field == 1 or field == 2
+    } else if m == A_FLDR or m == A_FSTR {
+        field == 0
+    } else if m == A_FSTP_PRE or m == A_FLDP_POST {
+        field == 0 or field == 2
+    } else {
+        false
     }
 }
 
@@ -303,6 +454,28 @@ fn mop_base(m: i64) -> i64 {
         43 -> 0xD4200000
         44 -> 0x90000000
         45 -> 0x91000000
+        46 -> 0x1E602800
+        47 -> 0x1E603800
+        48 -> 0x1E600800
+        49 -> 0x1E601800
+        50 -> 0x1E614000
+        51 -> 0x1E60C000
+        52 -> 0x1E61C000
+        53 -> 0x1E654000
+        54 -> 0x1E64C000
+        55 -> 0x1E604000
+        56 -> 0x9E660000
+        57 -> 0x9E670000
+        58 -> 0x1E602000
+        59 -> 0x9E620000
+        60 -> 0x9E630000
+        61 -> 0x9E780000
+        62 -> 0x9E790000
+        63 -> 0xFD400000
+        64 -> 0xFD000000
+        65 -> 0x6D800000
+        66 -> 0x6CC00000
+        67 -> 0xD63F0000
         _ -> 0
     }
 }
@@ -316,11 +489,11 @@ pub let ROLE_USE = 2
 pub let ROLE_USEDEF = 3
 
 pub fn role_d(m: i64) -> i64 {
-    if m == A_CMPR or m == A_CMPI or m == A_CMNI or m == A_B or m == A_BL or m == A_BCOND or m == A_CBZ or m == A_CBNZ or m == A_RET or m == A_RETAB or m == A_PACIBSP or m == A_BRK or m == P_RETURN {
+    if m == A_CMPR or m == A_CMPI or m == A_CMNI or m == A_FCMP or m == A_B or m == A_BL or m == A_BLR or m == A_BCOND or m == A_CBZ or m == A_CBNZ or m == A_RET or m == A_RETAB or m == A_PACIBSP or m == A_BRK or m == P_RETURN {
         0
     } else if m == A_MOVK {
         3
-    } else if m == A_STR or m == A_STP_PRE {
+    } else if m == A_STR or m == A_STP_PRE or m == A_FSTR or m == A_FSTP_PRE {
         2
     } else {
         1
@@ -329,7 +502,7 @@ pub fn role_d(m: i64) -> i64 {
 
 pub fn role_n(m: i64) -> i64 {
     let f = mop_fmt(m)
-    if f == 1 or f == 2 or f == 3 or f == 5 or f == 7 or f == 8 or f == 10 or f == 11 or f == 14 or f == 18 {
+    if f == 1 or f == 2 or f == 3 or f == 5 or f == 7 or f == 8 or f == 10 or f == 11 or f == 14 or f == 18 or f == 19 {
         2
     } else {
         0
@@ -340,9 +513,9 @@ pub fn role_m(m: i64) -> i64 {
     let f = mop_fmt(m)
     if f == 1 or f == 2 or f == 3 or f == 4 {
         2
-    } else if m == A_STP_PRE {
+    } else if m == A_STP_PRE or m == A_FSTP_PRE {
         2
-    } else if m == A_LDP_POST {
+    } else if m == A_LDP_POST or m == A_FLDP_POST {
         1
     } else {
         0
@@ -358,7 +531,7 @@ pub fn role_a(m: i64) -> i64 {
 fn sp_field(m: i64, field: i64) -> bool {
     if m == A_ADDI or m == A_SUBI or m == A_ADDPO {
         field == 0 or field == 1
-    } else if m == A_CMPI or m == A_CMNI or m == A_LDR or m == A_STR or m == A_STP_PRE or m == A_LDP_POST {
+    } else if m == A_CMPI or m == A_CMNI or m == A_LDR or m == A_STR or m == A_STP_PRE or m == A_LDP_POST or m == A_FLDR or m == A_FSTR or m == A_FSTP_PRE or m == A_FLDP_POST {
         field == 1
     } else {
         false
@@ -384,6 +557,7 @@ pub let C_EQ = 0
 pub let C_NE = 1
 pub let C_HS = 2
 pub let C_LO = 3
+pub let C_MI = 4
 pub let C_HI = 8
 pub let C_LS = 9
 pub let C_GE = 10
@@ -425,7 +599,16 @@ fn reg_field(m: i64, field: i64, o: i64) -> i64 ! str {
         fail("{form_name(m)}: operand {field} is missing")
     }
     if is_vreg(o) {
-        fail("{form_name(m)}: operand {field} is still virtual (v{o - 64})")
+        fail("{form_name(m)}: operand {field} is still virtual (v{o - VR})")
+    }
+    if fp_field(m, field) {
+        if not is_fpr(o) {
+            fail("{form_name(m)}: operand {field} is a floating-point register, not {reg_text(A_ADDR, 0, o)}")
+        }
+        return o - R_D0
+    }
+    if is_fpr(o) {
+        fail("{form_name(m)}: operand {field} is a general register, not d{o - R_D0}")
     }
     if o == R_SP {
         if not sp_field(m, field) {
@@ -576,6 +759,10 @@ pub fn encode(m: i64, rd: i64, rn: i64, rm: i64, ra: i64, imm: i64, imm2: i64, c
         let n = try reg_field(m, 1, rn)
         return base.bit_or(n.shl(5)).bit_or(d)
     }
+    if f == 19 {
+        let n = try reg_field(m, 1, rn)
+        return base.bit_or(n.shl(5))
+    }
     fail("opcode {m} has no encoding")
 }
 
@@ -583,14 +770,17 @@ pub fn encode(m: i64, rd: i64, rn: i64, rm: i64, ra: i64, imm: i64, imm2: i64, c
 
 pub fn reg_text(m: i64, field: i64, o: i64) -> str {
     let w = w_field(m, field)
+    if is_vreg(o) {
+        return "v{o - VR}"
+    }
+    if is_fpr(o) {
+        return "d{o - R_D0}"
+    }
     if o == R_SP {
         return "sp"
     }
     if o == R_ZR {
         return if w { "wzr" } else { "xzr" }
-    }
-    if is_vreg(o) {
-        return "v{o - 64}"
     }
     if w {
         "w{o}"
@@ -651,7 +841,7 @@ pub fn asm_text(m: i64, rd: i64, rn: i64, rm: i64, ra: i64, imm: i64, imm2: i64,
         return "{name} {d}, [{n}, #{imm}]"
     }
     if f == 11 {
-        if m == A_STP_PRE {
+        if m == A_STP_PRE or m == A_FSTP_PRE {
             return "{name} {d}, {mm}, [{n}, #{imm}]!"
         }
         return "{name} {d}, {mm}, [{n}], #{imm}"
@@ -685,6 +875,9 @@ pub fn asm_text(m: i64, rd: i64, rn: i64, rm: i64, ra: i64, imm: i64, imm2: i64,
     }
     if f == 18 {
         return "{name} {d}, {n}, {target}@PAGEOFF"
+    }
+    if f == 19 {
+        return "{name} {n}"
     }
     if m == P_RETURN {
         return "<return>"
