@@ -720,7 +720,7 @@ capabilities = ["io", "unsafe"]
 links = ["SDL2"]           # `-lSDL2` on the link line
 ```
 
-An `extern fn` is resolved by the system linker, so without this the library
+An `extern fn` is resolved by the linker, so without this the library
 has to be named at every call site -- `grasm build --link SDL2` -- and
 forgetting it fails with one error per missing symbol rather than one naming
 the library. The libraries of every package in the graph go on the line, each

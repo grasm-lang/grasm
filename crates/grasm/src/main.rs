@@ -1909,6 +1909,61 @@ fn find_runtime() -> Result<PathBuf, String> {
     ))
 }
 
+/// Locates `grasm-link`, the linker written in Grasm (`compiler/link`,
+/// docs/self-hosting.md stage S4), which links native builds for arm64 macOS
+/// instead of `cc`. `None` means link with `cc`: on any other host, or when
+/// `GRASM_LINKER=cc` asks for it -- kept for one release, as the way back if
+/// the linker gets something wrong. `GRASM_LINKER=<path>` names another build
+/// of the linker.
+///
+/// Looked for where `find_runtime` looks for the runtime, so a release
+/// archive (both beside `grasm`) and a cargo checkout (`target/release/`,
+/// where `scripts/lib/fresh.sh` builds it) work without configuration.
+fn find_linker() -> Result<Option<PathBuf>, String> {
+    match std::env::var("GRASM_LINKER") {
+        Ok(v) if v == "cc" => return Ok(None),
+        Ok(v) if !v.is_empty() => {
+            let p = PathBuf::from(&v);
+            if p.exists() {
+                return Ok(Some(p));
+            }
+            return Err(format!(
+                "GRASM_LINKER is set to `{v}`, but no file is there"
+            ));
+        }
+        _ => {}
+    }
+    if !cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+        return Ok(None);
+    }
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let dir = exe.parent().ok_or("cannot locate the grasm binary")?;
+    let candidates = [
+        dir.join("grasm-link"),
+        dir.join("../lib/grasm/grasm-link"),
+        dir.join("lib/grasm-link"),
+        dir.join("../lib/grasm-link"),
+    ];
+    for c in &candidates {
+        if c.exists() {
+            return Ok(Some(c.clone()));
+        }
+    }
+    Err(format!(
+        "cannot find the Grasm linker (grasm-link).\n\
+         \n\
+         Looked next to `{}` and in ../lib.\n\
+         \n\
+         A release archive carries it beside `grasm`. From a source checkout,\n\
+         build it with the compiler and `cc`:\n\
+         \n\
+             GRASM_LINKER=cc target/release/grasm build compiler/link/src/main.gr --native -o target/release/grasm-link\n\
+         \n\
+         Or link with the system's cc instead:  GRASM_LINKER=cc",
+        dir.display()
+    ))
+}
+
 /// Cache key for one module's object file.
 ///
 /// Two things can invalidate it: the module's own source (its bodies), and the
@@ -2183,15 +2238,7 @@ fn build_native_incremental(
     }
 
     let rt = find_runtime()?;
-    let mut link = std::process::Command::new("cc");
-    for o in &objects {
-        link.arg(o);
-    }
-    link.arg(&rt).arg("-o").arg(out_path);
-    // After the objects, so a library satisfies the symbols they reference.
-    for f in link_flags() {
-        link.arg(f);
-    }
+    let keep = std::env::var("GRASM_KEEP_SYMBOLS").is_ok_and(|v| v != "0");
     // Strip runtime code the program never calls. The archive carries the
     // whole stdlib surface; a hello-world only needs a sliver of it, and
     // without this every binary pays for all of it (1.5 MB -> ~0.5 MB).
@@ -2200,36 +2247,81 @@ fn build_native_incremental(
     // program, so dead-stripping removed it and `dlsym` found nothing
     // ([T-EXPORT]). Naming it to the linker as exported also roots it.
     let exports = exported_symbols(program);
-    if cfg!(target_os = "macos") {
-        link.arg("-Wl,-dead_strip");
-        for e in &exports {
-            link.arg(format!("-Wl,-exported_symbol,_{e}"));
+    // On arm64 macOS, Grasm's own linker (docs/self-hosting.md, S4): the same
+    // objects, runtime, libraries and exports `cc` is given below, and with
+    // `-strip` the symbol table `strip -no_uuid` would have left, so no
+    // second tool runs after it.
+    let own = if cfg!(target_os = "macos") {
+        find_linker()?
+    } else {
+        None
+    };
+    let linker_name = if own.is_some() { "grasm-link" } else { "cc" };
+    let mut link = match &own {
+        // Ours takes the same inputs in the same order, with its own flags.
+        Some(path) => {
+            let mut c = std::process::Command::new(path);
+            for o in &objects {
+                c.arg(o);
+            }
+            c.arg(&rt);
+            for f in link_flags() {
+                c.arg(f);
+            }
+            c.arg("-dead_strip");
+            for e in &exports {
+                c.arg("-exported_symbol").arg(format!("_{e}"));
+            }
+            if !keep {
+                c.arg("-strip");
+            }
+            c.arg("-o").arg(out_path);
+            c
         }
-    } else if cfg!(target_os = "linux") {
-        for e in &exports {
-            link.arg(format!("-Wl,--export-dynamic-symbol={e}"));
+        None => {
+            let mut c = std::process::Command::new("cc");
+            for o in &objects {
+                c.arg(o);
+            }
+            c.arg(&rt).arg("-o").arg(out_path);
+            // After the objects, so a library satisfies the symbols they reference.
+            for f in link_flags() {
+                c.arg(f);
+            }
+            if cfg!(target_os = "macos") {
+                c.arg("-Wl,-dead_strip");
+                for e in &exports {
+                    c.arg(format!("-Wl,-exported_symbol,_{e}"));
+                }
+            } else if cfg!(target_os = "linux") {
+                for e in &exports {
+                    c.arg(format!("-Wl,--export-dynamic-symbol={e}"));
+                }
+                c.arg("-Wl,--gc-sections");
+                // Linux strips fully at link time; macOS needs the tool, below.
+                if !keep {
+                    c.arg("-Wl,-s");
+                }
+            }
+            c
         }
-        link.arg("-Wl,--gc-sections");
-        // Linux strips fully at link time; macOS needs the tool, below.
-        if !std::env::var("GRASM_KEEP_SYMBOLS").is_ok_and(|v| v != "0") {
-            link.arg("-Wl,-s");
-        }
-    }
+    };
     // Captured rather than inherited: the linker's own text names a temporary
     // object file, an internal symbol and an architecture, and four lines of
     // it arrived before grasm's own one-line diagnostic. The one thing in it
     // a reader needs is which symbol was missing.
     let out = link
         .output()
-        .map_err(|e| format!("failed to run `cc`: {e}"))?;
+        .map_err(|e| format!("failed to run `{linker_name}`: {e}"))?;
     if !out.status.success() {
         let text = String::from_utf8_lossy(&out.stderr);
         let missing: Vec<String> = text
             .lines()
             .filter_map(|l| {
                 let l = l.trim();
-                // `"_sym", referenced from:` (macOS) and
-                // `undefined reference to \`sym'` (GNU ld).
+                // `"_sym", referenced from:` (macOS, and grasm-link, which
+                // reports them in ld's words) and `undefined reference to
+                // \`sym'` (GNU ld).
                 let name = match l.strip_prefix('"') {
                     Some(rest) => rest.split('"').next()?.trim_start_matches('_').to_string(),
                     None => {
@@ -2255,7 +2347,7 @@ fn build_native_incremental(
             names.sort();
             names.dedup();
             return Err(format!(
-                "cannot find the C function(s) {} — an `extern fn` is resolved by the system linker, so the library defining it has to be on the link line",
+                "cannot find the C function(s) {} — an `extern fn` is resolved by the linker, so the library defining it has to be on the link line",
                 names
                     .iter()
                     .map(|n| format!("`{n}`"))
@@ -2292,8 +2384,8 @@ fn build_native_incremental(
     // `???`, so "where does this program spend its time" cannot be answered
     // about the thing that actually ships. The default is still to strip,
     // because the table is a quarter of the binary and no program reads it.
-    let keep = std::env::var("GRASM_KEEP_SYMBOLS").is_ok_and(|v| v != "0");
-    if cfg!(target_os = "macos") && !keep {
+    // grasm-link strips as it links (`-strip`), so only `cc` needs the tool.
+    if cfg!(target_os = "macos") && !keep && own.is_none() {
         let mut strip = std::process::Command::new("strip");
         strip.arg("-no_uuid");
         // `strip` rebuilds the export trie from what it keeps, so an export it

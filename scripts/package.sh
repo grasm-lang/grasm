@@ -5,7 +5,8 @@
 #
 # Leaves dist/grasm-<platform>.tar.gz and a line for it in dist/SHA256SUMS.
 # The archive holds `grasm`, `libgrasm_rt_abi.a` (what `--native` links),
-# the README, licence and language pack, and BUILD-INFO naming the commit it
+# on arm64 macOS `grasm-link` (what links it, docs/self-hosting.md S4), the
+# README, licence and language pack, and BUILD-INFO naming the commit it
 # was built from. v1.0.0 shipped two bare binaries: `grasm run` worked from
 # the download and `grasm build --native` failed with "cannot find the Grasm
 # runtime", because the runtime was not in it. Nothing had tried.
@@ -48,10 +49,21 @@ else
     OUT=target/$TARGET/release
 fi
 
+# The linker `--native` links with on arm64 macOS (compiler/link), built by
+# the compiler just built, linked by cc and then by itself; elsewhere `cc`
+# links, and the archive has no linker of its own.
+LINKER=()
+if [ "$TARGET" = aarch64-apple-darwin ] && [ "$TARGET" = "$HOST" ]; then
+    GRASM_LINKER=cc "$OUT/grasm" build compiler/link/src/main.gr --native -o "$OUT/grasm-link.stage"
+    GRASM_LINKER="$PWD/$OUT/grasm-link.stage" "$OUT/grasm" build compiler/link/src/main.gr --native -o "$OUT/grasm-link"
+    rm -f "$OUT/grasm-link.stage"
+    LINKER=("$OUT/grasm-link")
+fi
+
 DIR=dist/grasm-$NAME
 rm -rf "$DIR" "dist/grasm-$NAME.tar.gz"
 mkdir -p "$DIR"
-cp "$OUT/grasm" "$OUT/libgrasm_rt_abi.a" README.md LICENSE NOTICE "$DIR/"
+cp "$OUT/grasm" "$OUT/libgrasm_rt_abi.a" ${LINKER[@]+"${LINKER[@]}"} README.md LICENSE NOTICE "$DIR/"
 [ -f dist/grasm-language-pack.md ] && cp dist/grasm-language-pack.md "$DIR/"
 {
     echo "commit: $COMMIT"

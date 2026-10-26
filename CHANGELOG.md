@@ -144,6 +144,14 @@ migration note here; anything `experimental` may change in any release. See
 
 ### Changed
 
+- **`grasm build --native` links with Grasm's own linker on arm64 macOS**
+  (`compiler/link`, self-hosting stage S4), not `cc`: `grasm-link`, shipped
+  beside `grasm` in the release archive and built into `target/release` by
+  the gates. It writes the bytes `cc` and `strip -no_uuid` wrote, but for
+  one: LC_BUILD_VERSION names no tool, since it is not ld. With
+  `GRASM_KEEP_SYMBOLS` the sections and symbols are ld's, without ld's debug
+  map. `GRASM_LINKER=cc` links with `cc` as before, for this release; on
+  other hosts `cc` still links.
 - **The TIR interpreter runs the eight programs that declare a C
   function.** It finds the function in its own process with `dlsym` and
   calls it through `call_c`, as `grasm run` finds one in itself, so

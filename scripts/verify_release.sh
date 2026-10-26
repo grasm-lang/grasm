@@ -51,7 +51,9 @@ for a in "${archives[@]}"; do
     mkdir -p "$d/unpacked" "$d/project"
     tar -xzf "$a" -C "$d/unpacked"
     g=$(ls -d "$d/unpacked"/*/grasm)
-    for f in grasm libgrasm_rt_abi.a BUILD-INFO; do
+    need=(grasm libgrasm_rt_abi.a BUILD-INFO)
+    case "$n" in *macos-arm64) need+=(grasm-link) ;; esac
+    for f in "${need[@]}"; do
         [ -f "$(dirname "$g")/$f" ] || { echo "FAIL $n: the archive has no $f"; fail=1; continue 2; }
     done
     cd "$d/project"
@@ -66,6 +68,16 @@ for a in "${archives[@]}"; do
     if ! out=$(./check 2>&1) || [ "$out" != "release ok 3" ]; then
         echo "FAIL $n: the native binary: $out"; fail=1; cd "$ROOT"; continue
     fi
+    # On arm64 macOS the archive's own linker made it, not cc: ld names
+    # itself in LC_BUILD_VERSION and grasm-link names no tool.
+    case "$n" in
+    *macos-arm64)
+        tools=$(otool -l check | awk '/cmd LC_BUILD_VERSION/ { f = 1 } f && /ntools/ { print $2; exit }')
+        if [ "$tools" != 0 ]; then
+            echo "FAIL $n: the native binary was not linked by grasm-link (LC_BUILD_VERSION names $tools tool(s))"; fail=1; cd "$ROOT"; continue
+        fi
+        ;;
+    esac
     echo "ok $n: run, build --native and the native binary all work from the archive alone ($(grep '^commit' "$(dirname "$g")/BUILD-INFO"))"
     cd "$ROOT"
 done
