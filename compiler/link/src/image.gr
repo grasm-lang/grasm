@@ -123,7 +123,8 @@ fn symbols(l: Ld, files: [i64]) -> (Syms, i64, i64, i64) {
             }
             let o = l.s_out[l.a_sec[ca]]
             let addr = sym_addr(l, y)
-            add_sym(locals, clean_name(name), if pext { 0x1e } else { 0x0e }, ord.get(o) ?? 0, 0, addr)
+            // A weak definition keeps N_WEAK_DEF, hidden or not, as ld writes it.
+            add_sym(locals, clean_name(name), if pext { 0x1e } else { 0x0e }, ord.get(o) ?? 0, l.y_desc[y].bit_and(0x80), addr)
             lkey.push((addr, n))
             n += 1
         }
