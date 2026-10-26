@@ -733,6 +733,13 @@ Linux ELF on x86-64 and arm64 with a system-call layer and an ELF linker.
 **S8. The rest of the toolchain:** every `grasm` subcommand (today 17),
 the LSP on the query engine, DAP, packages, journal and replay, `doc` and
 `api`, and the wasm32 backend with the playground built by it.
+The manifest stays `grasm.toml`: self-hosting changes who reads it, not its
+format (decided 2026-10-26; a manifest in Grasm's own syntax, as Zig's
+`.zon`, would cost every TOML-aware tool and a migration of every package,
+and the language is frozen until S9). Its reader becomes `packages/toml` in
+place of `crates/grasm_pkg/src/toml.rs`, with a gate the package lacks
+today: every manifest in the repository, and fuzzed ones, parsed by both
+and by Python's `tomllib`, agreeing.
 
 **S9. Cutover.** A release built entirely by stage 2; the DDC check
 published; Rust removed from the main branch and kept on the tag
