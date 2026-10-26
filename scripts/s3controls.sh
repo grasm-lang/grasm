@@ -74,6 +74,12 @@
 #   engine-unused  a generator never hands a program to the engine
 #                  -> fuzz_operators (the same)
 #
+# The release allocator (`backtrack.gr`), the default:
+#
+#   backtrack      a register is free wherever no physical register's own
+#                  range is, whoever holds it -> fuzz_s3 (the allocation
+#                  checker)
+#
 # A fault that sends a program into a loop shows as a run stopped at the
 # gates' limit (`S3_RUN_SECONDS` in `scripts/lib/s3.sh`, 20 s against well
 # under a second for any subset program), and counts as caught.
@@ -252,6 +258,10 @@ control dwarf-line compiler/s3/src/main.gr \
     "    (k + 1, lo + 1)" "    (k + 1, lo + 2)" -- \
     scripts/objtest.sh "maps to line" -
 
+control backtrack compiler/aarch64/src/backtrack.gr \
+    " or busy(occ[r], sg.seg_s[k], sg.seg_e[k])) {" ") {" -- \
+    scripts/fuzz_s3.py "register allocation check failed" -
+
 # script_control NAME FILE OLD NEW GATE SYMPTOM
 # The fault is planted in a copy of `scripts/` -- the generators' shared
 # engine (`scripts/lib/s3engine.py`) or a generator -- and the copied
@@ -302,10 +312,10 @@ if [ ${#MISSED[@]} -gt 0 ]; then
     printf '  %s\n' "${MISSED[@]}"
     exit 1
 fi
-# Twenty-eight gate runs over twenty-three faults, and every one must have
+# Twenty-nine gate runs over twenty-four faults, and every one must have
 # failed.
-if [ "$controls" -ne 28 ] || [ "$caught" -ne 28 ]; then
-    echo "expected 28 controls caught, ran $controls and caught $caught"
+if [ "$controls" -ne 29 ] || [ "$caught" -ne 29 ]; then
+    echo "expected 29 controls caught, ran $controls and caught $caught"
     exit 1
 fi
 exit 0

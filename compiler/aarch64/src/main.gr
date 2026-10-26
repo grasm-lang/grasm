@@ -3,7 +3,8 @@
 //     rules.gr     instruction selection, as data, and the table's checker
 //     isel.gr      MIR to VCode by those rules, plus the calling convention
 //     vcode.gr     machine instructions over virtual registers
-//     regalloc.gr  linear-scan allocation
+//     regalloc.gr  linear-scan allocation, for fast builds
+//     backtrack.gr the release allocator: backtracking by spill weight
 //     check.gr     the symbolic checker every allocation must pass
 //     emit.gr      frame, branches, relocations, bytes
 //     mach.gr      the instructions: roles, encodings, assembly text
@@ -13,6 +14,7 @@ import rules
 import vcode
 import isel
 import regalloc
+import backtrack
 import check
 import emit
 import enctest
@@ -25,10 +27,15 @@ type A64Opts = {
     /// `regalloc.PLANT_*`, `PLANT_NONE` for none.
     corrupt: i64,
     want_asm: bool,
+    /// Which allocator: `RA_LINEAR` or `RA_BACKTRACK`.
+    ra: i64,
 }
 
+pub let RA_LINEAR = 0
+pub let RA_BACKTRACK = 1
+
 pub fn default_opts() -> A64Opts {
-    A64Opts{ max_regs: -1, corrupt: regalloc.PLANT_NONE, want_asm: false }
+    A64Opts{ max_regs: -1, corrupt: regalloc.PLANT_NONE, want_asm: false, ra: RA_BACKTRACK }
 }
 
 /// The kinds of planted allocation error, by the names the driver takes.
@@ -54,7 +61,7 @@ type A64Result = {
 /// runtime functions its calls reach, by id (`MirProg.rt_syms`).
 pub fn compile_fn(f: MirFn, rs: [Rule], ccm: [i64], fccm: [i64], opts: A64Opts, callee_sym: [str], rt_syms: [str]) -> A64Result ! str {
     let vc = try isel.select(f, rs, ccm, fccm)
-    let al = try regalloc.allocate(vc, opts.max_regs, opts.corrupt)
+    let al = if opts.ra == RA_BACKTRACK { try backtrack.allocate(vc, opts.max_regs, opts.corrupt) } else { try regalloc.allocate(vc, opts.max_regs, opts.corrupt) }
     let errs = check.check(al)
     var vtext = ""
     if opts.want_asm {

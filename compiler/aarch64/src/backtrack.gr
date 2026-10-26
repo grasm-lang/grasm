@@ -1,0 +1,646 @@
+// The release allocator: backtracking, after regalloc2's and LLVM's greedy
+// allocator, without their splitting (docs/self-hosting.md §4).
+//
+// Where linear scan (`regalloc.gr`) gives each virtual register one hull
+// from its first live point to its last and visits the hulls in order of
+// start, this one:
+//
+//   * gives each its live range as it is -- a segment per block it is live
+//     in, from where it becomes live there to where it dies -- so two
+//     values whose hulls overlap but whose lives do not share a register;
+//   * visits them by priority, the longest first, from a heap, and when no
+//     register is free, evicts the values holding one if every one of them
+//     is cheaper to spill than this one is -- a spill weight is the uses
+//     and definitions, each counted 8 times per enclosing loop, over the
+//     length of the range -- and requeues them; a value evicted four times
+//     is not evicted again, so the search ends;
+//   * spills a value only when it can neither find a register nor buy one;
+//   * tries first the register a move hints at: the physical register a
+//     call's argument or result is moved to or from, or the register the
+//     other side of a block argument's move already has -- each hint taken
+//     makes a move from a register to itself, which emission drops.
+//
+// The constraints are linear scan's: a value is never given a register a
+// physical register's own range (an argument, a result) overlaps, nor a
+// register a call clobbers when any of its segments spans a call; spilled
+// values are reloaded into the scratch registers before each read and
+// stored after each write (`regalloc.rewrite`), and `check.gr` replays every
+// allocation, so nothing here is trusted either.
+import mach
+import vcode
+import regalloc
+
+/// Each virtual register's segments, in position order: `seg_s[k]..seg_e[k]`
+/// for `k` in `first[v] .. first[v] + count[v]`.
+type Segs = {
+    seg_s: [i64],
+    seg_e: [i64],
+    first: [i64],
+    count: [i64],
+    /// Per virtual register, its uses and definitions, each weighted 8^depth.
+    occ: [i64],
+}
+
+/// Each block's loop depth: how many back edges (a branch to a block at or
+/// before it) span it.
+fn loop_depth(vc: VCode) -> [i64] {
+    let nb = vcode.nblocks(vc)
+    var depth: [i64] = []
+    for b in 0..nb {
+        depth.push(0)
+    }
+    for b in 0..nb {
+        for s in vcode.succs(vc, b) {
+            if s <= b {
+                for x in s..(b + 1) {
+                    depth[x] = depth[x] + 1
+                }
+            }
+        }
+    }
+    depth
+}
+
+fn segments(vc: VCode) -> Segs {
+    let nb = vcode.nblocks(vc)
+    let nv = vc.nvregs
+    // Block liveness, as `regalloc.intervals` computes it: only the
+    // registers read in a block they were not written in first need it.
+    var defstamp: [i64] = []
+    var global: [bool] = []
+    for v in 0..nv {
+        defstamp.push(-1)
+        global.push(false)
+    }
+    for b in 0..nb {
+        for i in vc.bi0[b]..(vc.bi0[b] + vc.bni[b]) {
+            for u in regalloc.uses_at(vc, i) {
+                if mach.is_vreg(u) and defstamp[u - mach.VR] != b {
+                    global[u - mach.VR] = true
+                }
+            }
+            for d in regalloc.defs_at(vc, i) {
+                if mach.is_vreg(d) {
+                    defstamp[d - mach.VR] = b
+                }
+            }
+        }
+    }
+    var gvars: [i64] = []
+    var gidx: [i64] = []
+    for v in 0..nv {
+        if global[v] {
+            gidx.push(gvars.len())
+            gvars.push(v)
+        } else {
+            gidx.push(-1)
+        }
+    }
+    let ng = gvars.len()
+    var ue: [bool] = []
+    var df: [bool] = []
+    var lin: [bool] = []
+    for k in 0..(nb * ng) {
+        ue.push(false)
+        df.push(false)
+        lin.push(false)
+    }
+    for b in 0..nb {
+        let base = b * ng
+        for i in vc.bi0[b]..(vc.bi0[b] + vc.bni[b]) {
+            for u in regalloc.uses_at(vc, i) {
+                if mach.is_vreg(u) {
+                    let g = gidx[u - mach.VR]
+                    if g >= 0 and not df[base + g] {
+                        ue[base + g] = true
+                    }
+                }
+            }
+            for d in regalloc.defs_at(vc, i) {
+                if mach.is_vreg(d) {
+                    let g = gidx[d - mach.VR]
+                    if g >= 0 {
+                        df[base + g] = true
+                    }
+                }
+            }
+        }
+    }
+    var succ: [[i64]] = []
+    for b in 0..nb {
+        succ.push(vcode.succs(vc, b))
+    }
+    var changed = true
+    while changed {
+        changed = false
+        var b = nb - 1
+        while b >= 0 {
+            let base = b * ng
+            for g in 0..ng {
+                var out = false
+                for s in succ[b] {
+                    if lin[s * ng + g] {
+                        out = true
+                    }
+                }
+                let now = ue[base + g] or (out and not df[base + g])
+                if now != lin[base + g] {
+                    lin[base + g] = now
+                    changed = true
+                }
+            }
+            b -= 1
+        }
+    }
+    let depth = loop_depth(vc)
+    // The segments, block by block: a register opens where it becomes live
+    // in the block (its start, if it is live in) and closes at its last
+    // read, or the block's end if it is live out.
+    var sv: [i64] = []
+    var ss: [i64] = []
+    var se: [i64] = []
+    var open_s: [i64] = []
+    var open_e: [i64] = []
+    var occ: [i64] = []
+    for v in 0..nv {
+        open_s.push(-1)
+        open_e.push(-1)
+        occ.push(0)
+    }
+    for b in 0..nb {
+        let bs = 2 * vc.bi0[b]
+        let be = 2 * (vc.bi0[b] + vc.bni[b]) - 1
+        if be < bs {
+            continue
+        }
+        let base = b * ng
+        var w = 1
+        var dd = depth[b]
+        while dd > 0 and w < 32768 {
+            w = w * 8
+            dd -= 1
+        }
+        var opened: [i64] = []
+        for g in 0..ng {
+            if lin[base + g] {
+                let v = gvars[g]
+                open_s[v] = bs
+                open_e[v] = bs
+                opened.push(v)
+            }
+        }
+        for i in vc.bi0[b]..(vc.bi0[b] + vc.bni[b]) {
+            for u in regalloc.uses_at(vc, i) {
+                if mach.is_vreg(u) {
+                    let v = u - mach.VR
+                    if open_s[v] < 0 {
+                        open_s[v] = 2 * i
+                        opened.push(v)
+                    }
+                    open_e[v] = 2 * i
+                    occ[v] = occ[v] + w
+                }
+            }
+            for d in regalloc.defs_at(vc, i) {
+                if mach.is_vreg(d) {
+                    let v = d - mach.VR
+                    if open_s[v] < 0 {
+                        open_s[v] = 2 * i + 1
+                        opened.push(v)
+                    }
+                    if open_e[v] < 2 * i + 1 {
+                        open_e[v] = 2 * i + 1
+                    }
+                    occ[v] = occ[v] + w
+                }
+            }
+        }
+        for g in 0..ng {
+            var out = false
+            for s in succ[b] {
+                if lin[s * ng + g] {
+                    out = true
+                }
+            }
+            if out {
+                let v = gvars[g]
+                if open_s[v] < 0 {
+                    open_s[v] = bs
+                    opened.push(v)
+                }
+                open_e[v] = be
+            }
+        }
+        for v in opened {
+            sv.push(v)
+            ss.push(open_s[v])
+            se.push(open_e[v])
+            open_s[v] = -1
+            open_e[v] = -1
+        }
+    }
+    // Grouped by register, each group in position order (a stable counting
+    // sort: the segments were made in position order).
+    var count: [i64] = []
+    for v in 0..nv {
+        count.push(0)
+    }
+    for v in sv {
+        count[v] = count[v] + 1
+    }
+    var first: [i64] = []
+    var at = 0
+    for v in 0..nv {
+        first.push(at)
+        at += count[v]
+    }
+    var fill = first
+    var seg_s: [i64] = []
+    var seg_e: [i64] = []
+    for k in 0..sv.len() {
+        seg_s.push(0)
+        seg_e.push(0)
+    }
+    for k in 0..sv.len() {
+        let v = sv[k]
+        seg_s[fill[v]] = ss[k]
+        seg_e[fill[v]] = se[k]
+        fill[v] = fill[v] + 1
+    }
+    Segs{ seg_s: seg_s, seg_e: seg_e, first: first, count: count, occ: occ }
+}
+
+// ----- a register's occupancy: a bit per position ---------------------------------
+
+fn mask(lo: i64, hi: i64) -> i64 {
+    if hi - lo >= 63 {
+        return -1
+    }
+    (1.shl(hi - lo + 1) - 1).shl(lo)
+}
+
+/// Whether any position in `s..e` is taken.
+fn busy(bits: [i64], s: i64, e: i64) -> bool {
+    var p = s
+    while p <= e {
+        let w = p / 64
+        let lo = p % 64
+        var hi = e - 64 * w
+        if hi > 63 {
+            hi = 63
+        }
+        if bits[w].bit_and(mask(lo, hi)) != 0 {
+            return true
+        }
+        p = 64 * (w + 1)
+    }
+    false
+}
+
+/// Takes (or frees) every position in `s..e`.
+fn mark(inout bits: [i64], s: i64, e: i64, on: bool) {
+    var p = s
+    while p <= e {
+        let w = p / 64
+        let lo = p % 64
+        var hi = e - 64 * w
+        if hi > 63 {
+            hi = 63
+        }
+        let m = mask(lo, hi)
+        bits[w] = if on { bits[w].bit_or(m) } else { bits[w].bit_and(m.bit_not()) }
+        p = 64 * (w + 1)
+    }
+}
+
+// ----- the priority queue: a binary max-heap of keys -------------------------------
+
+fn heap_push(inout h: [i64], k: i64) {
+    h.push(k)
+    var i = h.len() - 1
+    while i > 0 {
+        let p = (i - 1) / 2
+        if h[p] >= h[i] {
+            return
+        }
+        let t = h[p]
+        h[p] = h[i]
+        h[i] = t
+        i = p
+    }
+}
+
+fn heap_pop(inout h: [i64]) -> i64 {
+    let top = h[0]
+    let last = h.pop() ?? 0
+    if h.len() == 0 {
+        return top
+    }
+    h[0] = last
+    var i = 0
+    let n = h.len()
+    while true {
+        let l = 2 * i + 1
+        let r = l + 1
+        var m = i
+        if l < n and h[l] > h[m] {
+            m = l
+        }
+        if r < n and h[r] > h[m] {
+            m = r
+        }
+        if m == i {
+            return top
+        }
+        let t = h[m]
+        h[m] = h[i]
+        h[i] = t
+        i = m
+    }
+    top
+}
+
+/// How many times a value may be evicted before it keeps what it has.
+let MAX_EVICT = 4
+
+/// Allocates every virtual register of `vc`, as `regalloc.allocate` does and
+/// under the same `max_regs` and `corrupt`.
+pub fn allocate(vc: VCode, max_regs: i64, corrupt: i64) -> Alloc ! str {
+    let lv = regalloc.intervals(vc)
+    let sg = segments(vc)
+    let nv = vc.nvregs
+    if nv >= 1048576 {
+        fail("{vc.sym}: too many virtual registers ({nv})")
+    }
+    var allowed: [bool] = []
+    for r in 0..regalloc.NPHYS {
+        allowed.push(max_regs < 0)
+    }
+    if max_regs >= 0 {
+        for cls in [mach.CLS_INT, mach.CLS_FP] {
+            let so = regalloc.stress_order(cls)
+            for k in 0..so.len() {
+                if k < max_regs {
+                    allowed[so[k]] = true
+                }
+            }
+        }
+    }
+    var cand_caller: [[i64]] = []
+    var cand_callee: [[i64]] = []
+    for cls in [mach.CLS_INT, mach.CLS_FP] {
+        var a: [i64] = []
+        for r in regalloc.caller_order(cls) {
+            if allowed[r] {
+                a.push(r)
+            }
+        }
+        cand_caller.push(a)
+        var b: [i64] = []
+        for r in regalloc.callee_order(cls) {
+            if allowed[r] {
+                b.push(r)
+            }
+        }
+        cand_callee.push(b)
+    }
+    // Hints, from the moves: a physical register the value is moved to or
+    // from, and the values it is moved to or from.
+    var hint_phys: [[i64]] = []
+    var hint_vreg: [[i64]] = []
+    for v in 0..nv {
+        hint_phys.push([])
+        hint_vreg.push([])
+    }
+    for i in 0..vc.mop.len() {
+        let m = vc.mop[i]
+        if m != mach.A_MOV and m != mach.A_FMOV {
+            continue
+        }
+        let d = vc.rd[i]
+        let s = if m == mach.A_MOV { vc.rm[i] } else { vc.rn[i] }
+        if d < 0 or s < 0 or d == mach.R_ZR or s == mach.R_ZR or d == mach.R_SP or s == mach.R_SP {
+            continue
+        }
+        let dv = mach.is_vreg(d)
+        let svr = mach.is_vreg(s)
+        if dv and svr {
+            hint_vreg[d - mach.VR].push(s - mach.VR)
+            hint_vreg[s - mach.VR].push(d - mach.VR)
+        } else if dv {
+            hint_phys[d - mach.VR].push(s)
+        } else if svr {
+            hint_phys[s - mach.VR].push(d)
+        }
+    }
+    // Lengths, weights, and the queue.
+    let npos = 2 * vc.mop.len() + 2
+    var len: [i64] = []
+    var weight: [i64] = []
+    var across: [bool] = []
+    var heap: [i64] = []
+    for v in 0..nv {
+        var n = 0
+        var x = false
+        for k in sg.first[v]..(sg.first[v] + sg.count[v]) {
+            n += sg.seg_e[k] - sg.seg_s[k] + 1
+            if regalloc.crosses_call(lv, sg.seg_s[k], sg.seg_e[k]) {
+                x = true
+            }
+        }
+        len.push(n)
+        across.push(x)
+        weight.push(if n > 0 { sg.occ[v] * 65536 / (n + 1) } else { 0 })
+        if sg.count[v] > 0 {
+            heap_push(heap, n * 1048576 + (1048575 - v))
+        }
+    }
+    var loc: [i64] = []
+    var evicted: [i64] = []
+    for v in 0..nv {
+        loc.push(regalloc.LOC_NONE)
+        evicted.push(0)
+    }
+    // Per physical register, a bit per position, and the values it holds.
+    let nwords = npos / 64 + 1
+    var occ: [[i64]] = []
+    var holders: [[i64]] = []
+    for r in 0..regalloc.NPHYS {
+        var bits: [i64] = []
+        if allowed[r] {
+            for k in 0..nwords {
+                bits.push(0)
+            }
+        }
+        occ.push(bits)
+        holders.push([])
+    }
+    var spilled: [i64] = []
+    while heap.len() > 0 {
+        let key = heap_pop(heap)
+        let v = 1048575 - key.bit_and(1048575)
+        if loc[v] != regalloc.LOC_NONE {
+            continue
+        }
+        let cls = vc.vcls[v]
+        let f0 = sg.first[v]
+        let fn_ = sg.count[v]
+        // The registers it may have: the hinted ones first.
+        var cands: [i64] = []
+        var usable: [bool] = []
+        for r in 0..regalloc.NPHYS {
+            usable.push(false)
+        }
+        if not across[v] {
+            for r in cand_caller[cls] {
+                usable[r] = true
+            }
+        }
+        for r in cand_callee[cls] {
+            usable[r] = true
+        }
+        for r in hint_phys[v] {
+            if r >= 0 and r < regalloc.NPHYS and usable[r] {
+                cands.push(r)
+            }
+        }
+        for w in hint_vreg[v] {
+            let r = loc[w]
+            if r >= 0 and r < regalloc.LOC_SPILL and usable[r] {
+                cands.push(r)
+            }
+        }
+        if not across[v] {
+            for r in cand_caller[cls] {
+                cands.push(r)
+            }
+        }
+        for r in cand_callee[cls] {
+            cands.push(r)
+        }
+        // A free one.
+        var chosen = -1
+        for r in cands {
+            if chosen < 0 {
+                var ok = true
+                for k in f0..(f0 + fn_) {
+                    if ok and (regalloc.fixed_overlap(lv, r, sg.seg_s[k], sg.seg_e[k]) or busy(occ[r], sg.seg_s[k], sg.seg_e[k])) {
+                        ok = false
+                    }
+                }
+                if ok {
+                    chosen = r
+                }
+            }
+        }
+        if chosen < 0 {
+            // One to buy: every value holding it where this one lives is
+            // cheaper to spill, and has not been evicted too often; the
+            // cheapest such register by its most expensive holder.
+            var best = -1
+            var best_cost = 0
+            var best_ws: [i64] = []
+            for r in cands {
+                var ok = true
+                for k in f0..(f0 + fn_) {
+                    if ok and regalloc.fixed_overlap(lv, r, sg.seg_s[k], sg.seg_e[k]) {
+                        ok = false
+                    }
+                }
+                if not ok {
+                    continue
+                }
+                var ws: [i64] = []
+                var cost = 0
+                for w in holders[r] {
+                    if not ok {
+                        continue
+                    }
+                    if overlaps(sg, v, w) {
+                        if weight[w] >= weight[v] or evicted[w] >= MAX_EVICT {
+                            ok = false
+                        } else {
+                            ws.push(w)
+                            if weight[w] > cost {
+                                cost = weight[w]
+                            }
+                        }
+                    }
+                }
+                if ok and ws.len() > 0 and (best < 0 or cost < best_cost) {
+                    best = r
+                    best_cost = cost
+                    best_ws = ws
+                }
+            }
+            if best >= 0 {
+                for w in best_ws {
+                    for k in sg.first[w]..(sg.first[w] + sg.count[w]) {
+                        mark(occ[best], sg.seg_s[k], sg.seg_e[k], false)
+                    }
+                    var kept: [i64] = []
+                    for x in holders[best] {
+                        if x != w {
+                            kept.push(x)
+                        }
+                    }
+                    holders[best] = kept
+                    loc[w] = regalloc.LOC_NONE
+                    evicted[w] = evicted[w] + 1
+                    heap_push(heap, len[w] * 1048576 + (1048575 - w))
+                }
+                chosen = best
+            }
+        }
+        if chosen >= 0 {
+            for k in f0..(f0 + fn_) {
+                mark(occ[chosen], sg.seg_s[k], sg.seg_e[k], true)
+            }
+            holders[chosen].push(v)
+            loc[v] = chosen
+        } else {
+            // Neither free nor for sale: to the stack.
+            loc[v] = regalloc.LOC_SPILL
+            spilled.push(v)
+        }
+    }
+    // Spill slots, shared by spilled values whose hulls do not overlap, as
+    // linear scan shares them: visited by start.
+    var keys: [i64] = []
+    for v in spilled {
+        keys.push((lv.start[v] + 1) * 1048576 + v)
+    }
+    keys.sort()
+    var slot_end: [i64] = []
+    for key in keys {
+        let v = key.bit_and(1048575)
+        loc[v] = regalloc.LOC_SPILL + regalloc.spill_slot(slot_end, lv.start[v], lv.end[v])
+    }
+    let nspill = slot_end.len()
+    var corrupted = 0
+    if corrupt != regalloc.PLANT_NONE {
+        corrupted = regalloc.plant(vc, loc, corrupt)
+    }
+    regalloc.rewrite(vc, loc, nspill, corrupted)
+}
+
+/// Whether two values are live at the same position.
+fn overlaps(sg: Segs, v: i64, w: i64) -> bool {
+    var i = sg.first[v]
+    var j = sg.first[w]
+    let ie = i + sg.count[v]
+    let je = j + sg.count[w]
+    if i == ie or j == je or sg.seg_e[ie - 1] < sg.seg_s[j] or sg.seg_e[je - 1] < sg.seg_s[i] {
+        return false
+    }
+    while i < ie and j < je {
+        if sg.seg_e[i] < sg.seg_s[j] {
+            i += 1
+        } else if sg.seg_e[j] < sg.seg_s[i] {
+            j += 1
+        } else {
+            return true
+        }
+    }
+    false
+}

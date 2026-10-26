@@ -1,8 +1,11 @@
 // `s3`: the self-hosted backend's driver (docs/self-hosting.md, stage S3).
 //
-//     s3 <program.tir> -o <out.o> [--max-regs N] [--listing <file>] [--ra-corrupt[=any|fp|class]]
+//     s3 <program.tir> -o <out.o> [--ra=backtrack|linear] [--max-regs N] [--listing <file>] [--ra-corrupt[=any|fp|class]]
 //     s3 --check-rules        the lowering rules' own checks
 //
+// `--ra=linear` allocates registers by linear scan, the fast allocator, in
+// place of the release one (`--ra=backtrack`, the default; docs/self-hosting.md
+// §4).
 // `--stats` prints how many functions were compiled and checked, how many
 // spill slots they needed, and how many hold doubles. `--max-regs N` lets the
 // allocator hand out only N registers of each class, so values spill (the
@@ -18,7 +21,7 @@
 //     s3 --encode-test <p>    writes <p>.s and <p>.tsv for scripts/encodetest.sh
 //
 // TIR from the Rust frontend (`grasm tir`) goes to MIR (`compiler/mir`), to
-// AArch64 code through the lowering rules, a linear-scan allocator and its
+// AArch64 code through the lowering rules, a register allocator and its
 // checker (`compiler/aarch64`), and into a relocatable Mach-O object
 // (`compiler/macho`). The object links with the system linker and the
 // existing runtime:
@@ -41,7 +44,7 @@ import aarch64
 import macho
 
 fn usage() {
-    eprint("usage: s3 <program.tir> -o <out.o> [--max-regs N] [--listing <file>] [--ra-corrupt[=any|fp|class]] [--no-rule-check] [--stats]")
+    eprint("usage: s3 <program.tir> -o <out.o> [--ra=backtrack|linear] [--max-regs N] [--listing <file>] [--ra-corrupt[=any|fp|class]] [--no-rule-check] [--stats]")
     eprint("       s3 --check-rules | --forms | --encode-test <prefix>")
     exit(2)
 }
@@ -419,6 +422,12 @@ fn main() {
                 usage()
                 return
             }
+            i += 1
+        } else if x == "--ra=linear" {
+            opts.ra = aarch64.RA_LINEAR
+            i += 1
+        } else if x == "--ra=backtrack" {
+            opts.ra = aarch64.RA_BACKTRACK
             i += 1
         } else if x == "--no-rule-check" {
             check = false

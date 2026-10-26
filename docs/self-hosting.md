@@ -1024,6 +1024,36 @@ and line -- the sample of instructions whose right line the source alone
 says -- with no row past the end of its file (`s3controls`: `dwarf-line`
 shifts every line by one).
 
+### 6.5 S3 part five: the release allocator
+
+`compiler/aarch64/src/backtrack.gr` is the allocator §4 asks of release
+builds, after regalloc2's and LLVM's greedy allocator without their
+splitting. Each virtual register's live range is what it is -- a segment per
+block it is live in -- rather than linear scan's hull from first to last
+live point, so two values whose hulls overlap but whose lives do not can
+share a register. Values are taken longest first from a heap; when no
+register is free, the values holding the one it could have are evicted if
+every one of them has a lower spill weight -- its uses and definitions, each
+counted eight times per enclosing loop, over the length of its range -- and
+requeued, and a value evicted four times keeps what it has next; only a value
+that can neither find a register nor buy one is spilled. A register a move
+hints at is tried first: the physical register a call's argument or result
+moves through, or the one the other side of a block argument's move already
+holds, so the move becomes one from a register to itself, which emission
+drops. The constraints, the spill code and the checker are linear scan's.
+It is the driver's default; linear scan stays for fast builds
+(`--ra=linear`). `ra_check` holds both to the checker and the Cranelift
+build's output: the release allocator at 0, 2 and 5 registers of each class,
+linear scan with every register and with 2 (`s3controls`: `backtrack` lets a
+register held by another value read as free, and the checker must refuse
+it).
+
+Over the 648 programs of the subset, the release allocator's objects hold
+11,202,505 instruction words to linear scan's 18,210,217 (38% fewer) and
+20,514 spill slots to 121,785 (83% fewer), with linear scan's objects
+byte-identical to those before it was written; every function passes the
+checker under both.
+
 ## 7. Bootstrap and trust
 
 - **During the migration:** stage 0 is the Rust-built `grasm`.
@@ -1130,9 +1160,10 @@ Measured, not estimated; each line is a gate's result on master.
   `str.parse_u64_base`; docs/known-issues.md) -- and every object carries
   a DWARF line table: `dwarfdump --verify` finds no error in any of the
   648, and 108,370 instructions that load a literal written once map to
-  that literal's file and line. What §6 still asks of S3 and `compiler/`
-  does not have: the release (backtracking) allocator, and benchmarks
-  against the Cranelift build.
+  that literal's file and line. The release allocator (§6.5), backtracking
+  by spill weight, is the driver's default, with linear scan kept for fast
+  builds. What §6 still asks of S3 and `compiler/` does not have:
+  benchmarks against the Cranelift build.
 - **Not started:** S2 (the frontend in Grasm), S4 (the linker), S5 (the
   runtime in Grasm), S6 (self-compilation), S7-S9.
 

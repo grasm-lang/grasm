@@ -1,5 +1,6 @@
 // Register allocation: linear scan (Poletto and Sarkar, "Linear Scan
-// Register Allocation", TOPLAS 1999).
+// Register Allocation", TOPLAS 1999), the fast one; `backtrack.gr` is the
+// release one, and shares what follows the choice of locations.
 //
 // Each virtual register gets one lifetime interval, from the first point it
 // is live to the last, computed from block liveness, and keeps one location
@@ -165,11 +166,11 @@ pub fn defs_f(m: i64, d: i64, n: i64, mm: i64, a: i64, imm: i64, imm2: i64) -> [
     defs_of(m, d, n, mm, a, imm, imm2).regs
 }
 
-fn uses_at(vc: VCode, i: i64) -> [i64] {
+pub fn uses_at(vc: VCode, i: i64) -> [i64] {
     uses_f(vc.mop[i], vc.rd[i], vc.rn[i], vc.rm[i], vc.ra[i], vc.imm[i], vc.imm2[i])
 }
 
-fn defs_at(vc: VCode, i: i64) -> [i64] {
+pub fn defs_at(vc: VCode, i: i64) -> [i64] {
     defs_f(vc.mop[i], vc.rd[i], vc.rn[i], vc.rm[i], vc.ra[i], vc.imm[i], vc.imm2[i])
 }
 
@@ -193,7 +194,7 @@ pub fn callee_saved(r: i64) -> bool {
 }
 
 /// The registers handed out, in the order they are tried.
-fn caller_order(cls: i64) -> [i64] {
+pub fn caller_order(cls: i64) -> [i64] {
     if cls == mach.CLS_FP {
         var out: [i64] = []
         for k in 16..29 {
@@ -207,7 +208,7 @@ fn caller_order(cls: i64) -> [i64] {
     [9, 10, 11, 12, 13, 14, 8, 7, 6, 5, 4, 3, 2, 1, 0]
 }
 
-fn callee_order(cls: i64) -> [i64] {
+pub fn callee_order(cls: i64) -> [i64] {
     if cls == mach.CLS_FP {
         var out: [i64] = []
         for k in 8..16 {
@@ -221,7 +222,7 @@ fn callee_order(cls: i64) -> [i64] {
 /// Under `max_regs`, the registers kept, in this order: a few of each kind,
 /// so a starved allocation still has somewhere to put a value that lives
 /// across a call. The same count is kept of each file.
-fn stress_order(cls: i64) -> [i64] {
+pub fn stress_order(cls: i64) -> [i64] {
     if cls == mach.CLS_FP {
         let d = mach.R_D0
         return [d + 16, d + 8, d + 17, d + 9, d + 18, d + 10, d + 19, d + 11, d + 20, d + 12, d + 21, d + 13, d + 22, d + 14, d + 23, d + 15, d + 24, d + 25, d + 26, d + 27, d + 28, d + 7, d + 6, d + 5, d + 4, d + 3, d + 2, d + 1, d]
@@ -255,7 +256,7 @@ type Live = {
     pr_maxto: [[i64]],
 }
 
-fn intervals(vc: VCode) -> Live {
+pub fn intervals(vc: VCode) -> Live {
     let nb = vcode.nblocks(vc)
     let nv = vc.nvregs
     // Which virtual registers are read in a block they were not written in
@@ -486,7 +487,7 @@ fn extend(inout lv: Live, v: i64, p: i64) {
 
 /// Whether a fixed range of register `r` overlaps `[s, e]`: among the
 /// ranges starting at or before `e`, whether the furthest end reaches `s`.
-fn fixed_overlap(lv: Live, r: i64, s: i64, e: i64) -> bool {
+pub fn fixed_overlap(lv: Live, r: i64, s: i64, e: i64) -> bool {
     let froms = lv.pr_from[r]
     var lo = 0
     var hi = froms.len()
@@ -503,7 +504,7 @@ fn fixed_overlap(lv: Live, r: i64, s: i64, e: i64) -> bool {
 
 /// Whether a call lies strictly inside `(s, e)`; the calls are in program
 /// order.
-fn crosses_call(lv: Live, s: i64, e: i64) -> bool {
+pub fn crosses_call(lv: Live, s: i64, e: i64) -> bool {
     let calls = lv.calls
     var lo = 0
     var hi = calls.len()
@@ -678,7 +679,7 @@ pub fn allocate(vc: VCode, max_regs: i64, corrupt: i64) -> Alloc ! str {
 /// slot is shared only by intervals that never overlap, and a function whose
 /// spilled values each live briefly -- a long list literal -- needs a few
 /// slots, not one per value.
-fn spill_slot(inout slot_end: [i64], s: i64, e: i64) -> i64 {
+pub fn spill_slot(inout slot_end: [i64], s: i64, e: i64) -> i64 {
     for k in 0..slot_end.len() {
         if slot_end[k] < s {
             slot_end[k] = e
@@ -717,7 +718,7 @@ fn is_fp_vreg(vc: VCode, o: i64) -> bool {
 /// conservative hull, and two that overlap may never be live at once, in
 /// which case sharing a register is a correct allocation and the checker is
 /// right to accept it.
-fn plant(vc: VCode, inout loc: [i64], kind: i64) -> i64 {
+pub fn plant(vc: VCode, inout loc: [i64], kind: i64) -> i64 {
     let fp_only = kind == PLANT_FP
     if kind == PLANT_CLASS {
         for v in 0..loc.len() {
@@ -800,7 +801,7 @@ pub fn spill_offset(al: Alloc, k: i64) -> i64 {
 
 /// Rewrites every operand to its location, with reloads and spills around
 /// the instructions that touch a spilled register.
-fn rewrite(vc: VCode, loc: [i64], nspill: i64, corrupted: i64) -> Alloc ! str {
+pub fn rewrite(vc: VCode, loc: [i64], nspill: i64, corrupted: i64) -> Alloc ! str {
     var al = Alloc{
         mop: [], rd: [], rn: [], rm: [], ra: [], imm: [], imm2: [], cc: [], tgt: [],
         symk: [], sym_id: [], od: [], on: [], om: [], oa: [], kind: [], slot: [],

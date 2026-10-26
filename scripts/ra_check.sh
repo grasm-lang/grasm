@@ -17,6 +17,9 @@
 #     left, and meets block arguments in the stack. The checker must pass
 #     each, and each binary must still print and exit as the Cranelift build
 #     does. That spilling happened is asserted from the driver's own count.
+#     The default allocator is the release one (`backtrack.gr`); the fast one
+#     (`--ra=linear`, `regalloc.gr`) runs the same way with every register
+#     and with 2, so both are held to the checker and to the output.
 #   * control -- with `--ra-corrupt` the driver plants the classic allocator
 #     bug, one register given to two intervals that overlap, in every function
 #     where two such intervals exist; the checker must catch every one. Two
@@ -95,14 +98,22 @@ for k in "${!S3_SRC[@]}"; do
     fi
     $S3_RUN "$WORK/p.cl" >"$WORK/cl.out" 2>"$WORK/cl.err" </dev/null
     cl_code=$?
-    for regs in 0 2 5; do
+    for cfg in 0 2 5 linear:-1 linear:2; do
         runs=$((runs + 1))
         rm -f "$WORK/p.o"
-        "$S3" "$tir" -o "$WORK/p.o" --max-regs "$regs" --stats >"$WORK/s3.out" 2>"$WORK/s3.err"
+        ra=""
+        regs=$cfg
+        what="$cfg registers"
+        case "$cfg" in
+            linear:-1) ra="--ra=linear"; regs=-1; what="the linear-scan allocator" ;;
+            linear:*) ra="--ra=linear"; regs=${cfg#linear:}; what="the linear-scan allocator and $regs registers" ;;
+        esac
+        # shellcheck disable=SC2086
+        "$S3" "$tir" -o "$WORK/p.o" --max-regs "$regs" $ra --stats >"$WORK/s3.out" 2>"$WORK/s3.err"
         code=$?
         if [ "$code" != 0 ]; then
             fail=$((fail + 1))
-            FAILED+=("$src — with $regs registers the backend answered $code: $(head -3 "$WORK/s3.err" | tr '\n' ' ')")
+            FAILED+=("$src — with $what the backend answered $code: $(head -3 "$WORK/s3.err" | tr '\n' ' ')")
             continue
         fi
         # functions: F   checked: C   spill slots: S   words: W   with doubles: D
@@ -111,7 +122,7 @@ for k in "${!S3_SRC[@]}"; do
         prog_fp=$dbl
         if [ "$c" != "$f" ]; then
             fail=$((fail + 1))
-            FAILED+=("$src — with $regs registers only $c of $f functions passed the checker")
+            FAILED+=("$src — with $what only $c of $f functions passed the checker")
             continue
         fi
         if [ "$regs" = 0 ] && [ "$s" -gt 0 ]; then
@@ -119,7 +130,7 @@ for k in "${!S3_SRC[@]}"; do
         fi
         if ! s3_link "$WORK/p.o" "$WORK/p.s3" "$WORK/link.log"; then
             fail=$((fail + 1))
-            FAILED+=("$src — with $regs registers the object does not link")
+            FAILED+=("$src — with $what the object does not link")
             continue
         fi
         $S3_RUN "$WORK/p.s3" >"$WORK/s3run.out" 2>"$WORK/s3run.err" </dev/null
@@ -128,8 +139,8 @@ for k in "${!S3_SRC[@]}"; do
             pass=$((pass + 1))
         else
             fail=$((fail + 1))
-            FAILED+=("$src — with $regs registers: exit $cl_code (Cranelift) vs $s3_code (s3)")
-            echo "MISMATCH: $src with $regs registers (exit $cl_code vs $s3_code)"
+            FAILED+=("$src — with $what: exit $cl_code (Cranelift) vs $s3_code (s3)")
+            echo "MISMATCH: $src with $what (exit $cl_code vs $s3_code)"
             diff "$WORK/cl.out" "$WORK/s3run.out" | head -6 | sed 's/^/  /'
         fi
     done
