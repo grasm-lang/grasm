@@ -2055,6 +2055,69 @@ fn an_incremental_rebuild_sees_a_changed_struct_layout() {
     build_and_run("3 1", "after main changed the layout");
 }
 
+/// An incremental `--native` rebuild recompiles the callers of a function that
+/// became recursive.
+///
+/// A function that can reach itself takes a hidden stack-floor argument, so
+/// recursion is part of its ABI -- and it is read from the body, which no
+/// signature shows. Editing only the helper so `f` calls itself left `main`'s
+/// key as it was, the reused `main` passed `n` where `f` now read the floor,
+/// and the binary ran on garbage. Found when an incremental build of
+/// `compiler/link` stopped with "stack overflow: recursion too deep" on every
+/// input after a loop was added to one of its functions.
+#[test]
+fn an_incremental_rebuild_sees_a_function_become_recursive() {
+    let w = Work::new("incfloor");
+    let dir = w.0.join("proj");
+    std::fs::create_dir_all(&dir).unwrap();
+    let helper = dir.join("helper.gr");
+    let main = dir.join("main.gr");
+    let out = dir.join("app");
+    std::fs::write(
+        &main,
+        "import helper\n\nfn main() {\n    print(\"{helper.f(5)} {helper.f(40)}\")\n}\n",
+    )
+    .unwrap();
+
+    let build_and_run = |expect: &str, what: &str| {
+        let (code, msg) = run(&[
+            "build",
+            main.to_str().unwrap(),
+            "--native",
+            "-o",
+            out.to_str().unwrap(),
+        ]);
+        assert_eq!(code, 0, "{what}: {msg}");
+        let got = Command::new(&out).output().expect("runs");
+        assert!(
+            got.status.success(),
+            "{what}: the binary failed with {:?}: {}",
+            got.status,
+            String::from_utf8_lossy(&got.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&got.stdout).trim(),
+            expect,
+            "{what}"
+        );
+    };
+
+    std::fs::write(&helper, "pub fn f(n: i64) -> i64 {\n    n + 1\n}\n").unwrap();
+    build_and_run("6 41", "straight-line f");
+
+    // The same answers, now by recursion; `main` is untouched.
+    std::fs::write(
+        &helper,
+        "pub fn f(n: i64) -> i64 {\n    if n <= 0 {\n        1\n    } else {\n        f(n - 1) + 1\n    }\n}\n",
+    )
+    .unwrap();
+    build_and_run("6 41", "after f became recursive");
+
+    // And back: the floor argument goes away again.
+    std::fs::write(&helper, "pub fn f(n: i64) -> i64 {\n    n + 1\n}\n").unwrap();
+    build_and_run("6 41", "after f stopped recursing");
+}
+
 /// `grasm test --contracts` fuzzes each function's `ensures` with inputs its
 /// `requires` accepts, and reports a counterexample when one is broken
 /// ([T-CONTRACT-ENSURES]; MASTERPLAN §9.5's third level).

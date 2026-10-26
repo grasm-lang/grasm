@@ -135,6 +135,7 @@ run_gate fuzz_rtfmt    scripts/fuzz_rtfmt.sh
 run_gate fuzz_rtmath   scripts/fuzz_rtmath.sh
 run_gate rtcontrols    scripts/rtcontrols.sh
 run_gate reprotest     scripts/reprotest.sh
+run_gate inctest       python3 scripts/inctest.py
 run_gate brokertest    scripts/broker_test.sh
 run_gate audiodiff     scripts/audio_diff.sh
 run_gate mixertest     scripts/mixer_test.sh

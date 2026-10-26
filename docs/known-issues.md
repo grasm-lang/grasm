@@ -5,13 +5,13 @@ Every defect that is known and not fixed, with its severity from
 to paste. S1 and S2 block a release; S3 and S4 do not, and this file is what
 makes shipping them honest rather than quiet.
 
-**Open S1: one (an incremental native build, below); one under
-investigation (below). Open S2: none. Open S3: none. Open S4: none.**
+**Open S1: none confirmed; one under investigation (below). Open S2: none.
+Open S3: none. Open S4: none.**
 
 ## Found on 2026-10-26 by S5 part one (the runtime in Grasm)
 
 **An incremental `grasm build --native` of `compiler/link` gave a linker
-that panics on every input -- *open, S1, in the Rust compiler's incremental
+that panics on every input -- *closed, S1, in the Rust compiler's incremental
 build*.** Changing one module of `compiler/link` (`src/interpose.gr`: a
 loop that fills a `Map[i64, bool]` was added to `apply`, nothing else) and
 rebuilding with the object cache gave a binary that stops at once with
@@ -31,6 +31,25 @@ check failing -- is not in it. Not reduced further and not fixed: the fix
 is in the Rust compiler, which S5 does not touch. Until then, S5's tools
 are built with `--no-incremental`; the gates build theirs in a fresh
 directory each run.
+
+Closed the same day. The cached `main` and a cold-built `main` had the same
+key and different code: `_g_main_run` passed `apply`'s `l` in `x0` where
+the rebuilt `interpose` now read its stack floor, and `l` in `x1`. Whether a
+function takes the floor is `recursive_functions`' answer, read from bodies.
+It counts a function as able to reach itself when its body *names* a
+function without calling it (a function value may be handed on), and it
+matches those names against every function in the program, unqualified --
+so the loop's new locals made `apply` floor-taking, an ABI change no
+signature shows. `layout_fingerprint` now carries the sorted set of
+floor-taking functions, so any change to it recompiles every module. The
+regression test is `an_incremental_rebuild_sees_a_function_become_recursive`
+(without the fix its binary dies on signal 11), and the new gate `inctest`
+holds five kinds of cross-module edit -- a constant, a struct's layout,
+recursion, a name clash, generic instantiations -- to "a rebuild over a
+warm cache is byte-identical to a cold build, both ways", with a planted
+stale object caught in each. Run on the compiler before the fix, it fails:
+the warm build segfaults one way and prints `6088108833` for `41` the
+other. Built incrementally again, `compiler/link` links.
 
 **Which of two equally short digit strings a double prints as is not
 specified -- *not a defect; [L-DISPLAY] is silent*.** `print(1000000000000000.25)`

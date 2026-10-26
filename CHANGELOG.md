@@ -21,6 +21,18 @@ migration note here; anything `experimental` may change in any release. See
 
 ### Fixed
 
+- **An incremental `grasm build --native` could link a caller compiled for
+  the wrong calling convention.** A function that can reach itself takes a
+  hidden stack-floor argument, which is decided from bodies, and the object
+  cache did not key on it: editing one module so a function became
+  recursive (or stopped being) reused its callers' objects, which then
+  passed their first argument where the floor was read. The binary crashed,
+  or printed a wrong answer with exit 0; a `--no-incremental` build was
+  right. Found as an incremental build of `compiler/link` that stopped with
+  "stack overflow: recursion too deep" on every input. The set of
+  floor-taking functions is now part of every module's key, and a new gate,
+  `inctest`, requires a rebuild over a warm cache to be byte-identical to a
+  cold one across five kinds of edit.
 - **`+=` on a string field or list element was a use after free in the
   compiled build** from its second application on: the old string was
   released once by `+` and again by the write. `c.tag += "+"` twice on a

@@ -364,15 +364,33 @@ pub fn layout_fingerprint(program: &grasm_sema::loader::Program) -> String {
     // module takes the address of ([T-FN-ADDR]).
     let c = &analysis.c_facts;
     let (cells, _) = c.tls_layout();
+    // Which functions take the hidden stack-floor argument is part of their
+    // ABI, and it is read from bodies: `recursive_functions` follows calls by
+    // name, so a body that starts calling `set` can make its function look
+    // recursive when some other function named `set` is in a cycle. An edit
+    // to one module then changed how every caller of that function must call
+    // it, while each caller's key -- its own source and the signatures --
+    // stayed the same: the reused caller passed its first argument where the
+    // callee now read the floor, and `compiler/link` built that way stopped
+    // with "stack overflow: recursion too deep" on every input. Sorted:
+    // the set is a `HashSet`, and its order must not reach a key.
+    let views: Vec<(String, &AstModule, HashMap<String, String>)> = program
+        .files
+        .iter()
+        .map(|f| (f.name.clone(), &f.module, f.imports.clone()))
+        .collect();
+    let mut floor: Vec<String> = recursive_functions(&views).into_iter().collect();
+    floor.sort();
     let entries = format!(
-        "c entries: {} exports: {} cells: {}",
+        "c entries: {} exports: {} cells: {}\nfloor: {}",
         c.addressed.iter().cloned().collect::<Vec<_>>().join(","),
         c.exports.join(","),
         cells
             .iter()
             .map(|(k, v)| format!("{k}@{v}"))
             .collect::<Vec<_>>()
-            .join(",")
+            .join(","),
+        floor.join(",")
     );
     if std::env::var("GRASM_VALUES").is_ok_and(|v| v == "0") {
         return format!("values off\n{entries}");
