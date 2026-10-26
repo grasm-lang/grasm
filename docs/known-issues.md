@@ -5,7 +5,41 @@ Every defect that is known and not fixed, with its severity from
 to paste. S1 and S2 block a release; S3 and S4 do not, and this file is what
 makes shipping them honest rather than quiet.
 
-**Open S1: none. Open S2: none. Open S3: none. Open S4: none.**
+**Open S1: none confirmed; one under investigation (below). Open S2: none.
+Open S3: none. Open S4: none.**
+
+## Under investigation since 2026-10-26: refusals by the system's security policy
+
+**Freshly linked binaries are sometimes refused at launch under heavy load --
+*open, cause not shown*.** During S4's gate run with `grasm-link` linking
+every native build, the kernel log recorded `ASP: Security policy would not
+allow process` 21 times at 15:33 for `fuzz_mapkeys`' `p.bin`, and twice
+earlier for `fuzz_operators`' `s3.bin`. The program is killed (`-9`, empty
+output), the generator counts a disagreement, and the same seed passes on
+rerun. Every refusal not planted by `linkcontrols`' bad-signature control was
+of a binary `grasm-link` wrote, and they came in bursts while `syspolicyd`
+was busy and the load average was 20-100.
+
+What is known:
+
+- The same symptom, `-9` with empty output at high load and passing on
+  rerun, was seen with `cc`-linked binaries before S4. It was not traced to
+  this message then. The kernel log keeps these messages only for hours
+  under this machine's volume (on 2026-10-26 it reached back to 08:00), so
+  there is no record of the earlier ones.
+- It could not be reproduced on demand: 30 fresh links of each of
+  `grasm-link`, `grasm-link -tool_version 1115.7.3` and `cc` + `strip`, 30
+  links of each reusing one inode, and three alternating `fuzz_mapkeys` runs
+  with each linker all launched every time.
+- `grasm-link`'s output is byte-identical to `ld` + `strip -no_uuid` except
+  that `LC_BUILD_VERSION` carries no `ld` tool entry, and `codesign -v
+  --strict` accepts every output (`linktest`).
+
+Until it is shown either way, `GRASM_LINKER=cc` links with the system's
+`cc` as before. To settle it: run the generators under load with each
+linker in alternation, recording every refusal from `log stream --predicate
+'eventMessage CONTAINS "Security policy would not allow"'` against which
+linker wrote the binary.
 
 ## Found on 2026-10-25 by the generators' third engine (S3, part five)
 
