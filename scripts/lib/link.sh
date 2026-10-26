@@ -64,13 +64,16 @@ link_args() {
 }
 
 # The C fixtures (`scripts/fixtures/link/`): what neither backend emits but a
-# Mach-O linker must get right. Each is `name|sources|exported symbols`;
-# `link_fixture_build NAME` compiles one with `cc -c` into $WORK/fx/NAME/,
+# Mach-O linker must get right. Each is `name|sources|exported symbols`, a
+# source ending in `.py` being a program that writes the C (`pages.py`,
+# too large to keep); `link_fixture_build NAME` compiles one with `cc -c`
+# (-O1) into $WORK/fx/NAME/,
 # links the reference there with cc (`ref`), and sets FX_OBJS and FX_FLAGS to
 # the objects and the flags compiler/link takes for the same link.
 LINK_FIXTURES=(
     "tlv|tlv_a.c tlv_b.c|"
     "export|export.c|_only_by_name"
+    "pages|pages.py|"
 )
 
 link_fixture_build() {
@@ -85,8 +88,14 @@ link_fixture_build() {
         FX_FLAGS=(-dead_strip)
         local ccflags=(-Wl,-dead_strip)
         for s in $srcs; do
-            cc -c "scripts/fixtures/link/$s" -o "$dir/${s%.c}.o" || return 1
-            FX_OBJS+=("$dir/${s%.c}.o")
+            local c="scripts/fixtures/link/$s"
+            if [ "${s%.py}" != "$s" ]; then
+                c="$dir/${s%.py}.c"
+                python3 "scripts/fixtures/link/$s" >"$c" || return 1
+            fi
+            local o="$dir/$(basename "${c%.c}").o"
+            cc -O1 -c "$c" -o "$o" || return 1
+            FX_OBJS+=("$o")
         done
         for s in $exports; do
             FX_FLAGS+=(-exported_symbol "$s")

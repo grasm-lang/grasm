@@ -7,10 +7,15 @@
 // nothing to say getting encoding 0; an entry dropped when it repeats the one
 // before with no LSDA on either and no DWARF; personalities numbered by first
 // use; the encodings used more than once in a common table, most used first
-// and ties by value; an LSDA index; then second-level pages, compressed. Two
+// and ties by value; an LSDA index; then second-level pages, compressed. Four
 // things are ld-prime's rather than ld64's, read off its output: the
 // sentinel entry's address is the end of the last function, not one past
-// it, and page-specific encodings are numbered in address order.
+// it; pages are filled in address order, the last one short, with their
+// page-specific encodings numbered in address order; the index has room
+// for ld64's worst case (regular pages of 511 entries, plus one), zeroed
+// where unused; every page after the first starts on 8 bytes; and the
+// section is padded to 8. The corpus's largest program needs one page;
+// generated C with 2,000 to 6,000 functions (2 to 6 pages) checked the rest.
 import rd
 import state
 import deadstrip
@@ -284,7 +289,10 @@ pub fn unwind_info(l: Ld, text: i64, delta: i64, got_base: i64) -> bytes {
     let common_off = 28
     let pers_off = common_off + 4 * common_list.len()
     let index_off = pers_off + 4 * pers_list.len()
-    let lsda_off = index_off + 12 * (npages + 2)
+    // ld-prime reserves the index for ld64's worst case -- regular pages of
+    // 511 entries, plus one -- and zeroes what it does not use.
+    let reserved = (u.func.len() - 1) / 511 + 3
+    let lsda_off = index_off + 12 * reserved
     let pages_off = lsda_off + 8 * lsda_func.len()
     var out = byte_builder()
     rd.w32(out, 1)
@@ -300,28 +308,38 @@ pub fn unwind_info(l: Ld, text: i64, delta: i64, got_base: i64) -> bytes {
     for p in pers_list {
         rd.w32(out, p)
     }
+    // Every page after the first starts on 8 bytes.
+    var page_at: [i64] = []
     var at = pages_off
+    for k in 0..npages {
+        if k > 0 {
+            at = rd.align_up(at, 8)
+        }
+        page_at.push(at)
+        at += page_bytes[k].len()
+    }
     for k in 0..npages {
         let f = page_first[k]
         rd.w32(out, u.addr[f])
-        rd.w32(out, at)
+        rd.w32(out, page_at[k])
         rd.w32(out, lsda_off + 8 * lsda_before[f])
-        at += page_bytes[k].len()
     }
     let lastf = all.func.len() - 1
     rd.w32(out, all.addr[lastf] + all.size[lastf])
     rd.w32(out, 0)
     rd.w32(out, lsda_off + 8 * lsda_func.len())
-    // ld-prime leaves room for one index entry more than it writes, zeroed.
-    for _k in 0..3 {
+    for _k in 0..(3 * (reserved - npages - 1)) {
         rd.w32(out, 0)
     }
     for k in 0..lsda_func.len() {
         rd.w32(out, lsda_func[k])
         rd.w32(out, lsda_at[k])
     }
-    for pb in page_bytes {
-        out.push_bytes(pb)
+    for k in 0..npages {
+        while out.len() < page_at[k] {
+            out.push_byte(0)
+        }
+        out.push_bytes(page_bytes[k])
     }
     // ld-prime's section is a whole number of 8-byte words.
     rd.wpad(out, 8)
