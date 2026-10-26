@@ -678,6 +678,80 @@ did not are the raw-memory programs (four from part two, and T-TLS) waiting
 for the sandbox another branch is adding to it. Seventeen planted faults, one
 per engine per feature at least, were each caught.
 
+### 5.6 The runtime dialect: what S5 part two needs (proposed)
+
+Written 2026-10-26, after S5 part one (§6.7) moved the runtime's stateless
+families and stopped where state begins. Not built; this is the design to
+build to, and the owner may still reject it.
+
+**What is missing.** Four things the Rust runtime has and the systems subset
+does not give, each found by part one:
+
+1. *Process-wide state:* the box allocator's pool and live count, the
+   interned boxes, the reference slab, channels, and the map seed -- one per
+   process, shared by every thread.
+2. *Fixed bytes:* panic texts and variant names, which part one could only
+   store as code (`compiler/rt/gen_text.py`), because a string literal is a
+   counted value and the runtime must not allocate to say it is out of
+   memory.
+3. *The runtime's own per-thread state:* part of the runtime is the thing
+   that hands out §5.3's per-thread block, and a runtime compiled on its own
+   would lay its cells out at the same offsets as the program's.
+4. *The context switch* §5.5 deferred: `ctx_switch` and `ctx_init`.
+
+**The proposal: a dialect, not a language change.** The language stays
+frozen until S9, and none of the four is something a program should be
+able to write. So they are given to exactly one kind of package -- one
+whose manifest says `runtime = true`, which only `compiler/rt` does -- and
+the checker refuses each of them anywhere else, by name ("a process cell
+is the runtime's; this package is not one"). A runtime package is compiled
+only by the Grasm backend (`compiler/s3 --runtime`), never run by an
+interpreter and never built by Cranelift, so the two-engine rule does not
+reach it; what holds it to account is §6.7's gates -- `rtswap` over the
+whole corpus, the leak and use-after-free runs, and a fuzz per family
+against the Rust runtime.
+
+- `process_local POOL: i64` declares a *process cell*: one per process, of
+  a layout type, zero at start, reached only through `mem_process(POOL)`,
+  an `addr`, inside `unsafe`, performing `mem` -- §5.3's rules with one
+  difference that matters: every thread sees the same cell. So every
+  access to one that more than one thread can reach is atomic
+  ([L-LIB-ATOMIC]), or under a lock built from atomics; a plain load or
+  store there is a data race, and the runtime's lint (`rtlint`, new) refuses
+  any non-atomic access to a process cell outside a function marked as
+  holding its lock. This is Rust's `static X: AtomicU64`, not `static mut`:
+  the owner's rule against unsound global mutable state stands, and safe
+  Grasm still cannot reach a cell at all. Natively a zeroed symbol in
+  `__DATA,__bss`, addressed by `adrp`/`add`; no runtime call.
+- `mem_static("text")` takes a string *literal*, never a value, and gives
+  the `addr` of its UTF-8 bytes, NUL-terminated, in `__TEXT,__cstring`;
+  its length is the literal's, known when it is compiled
+  (`mem_static_len("text")`). Writing through it is undefined
+  ([E-MEM-UNCHECKED]); the bytes are read-only pages, so it faults.
+- `thread_local` in a runtime package compiles to Mach-O thread-local
+  variables (`__thread_vars`, `__thread_bss`, `TLVP_LOAD_PAGE21`/
+  `PAGEOFF12`), which the S4 linker already links and `linkdiff` checks
+  against ld on a fixture -- so the runtime's cells are its own and never
+  share the program's block. The program's cells keep §5.3's block, which
+  the runtime then hands out.
+- `ctx_switch(from: addr, to: addr)` and `ctx_init(ctx, stack_top, entry,
+  arg)` as §5.5 specifies them, lowered by the aarch64 rules: a leaf that
+  saves x19-x28, x29, x30, sp and d8-d15 and signs nothing, so
+  return-address signing keeps working on both sides of a switch.
+
+**Rust changes.** Only the frontend's: parsing `process_local`, typing the
+four operations and the manifest flag, the checker's refusals, and their
+TIR forms (`(processlocal ...)`, `(mstatic "...")`, `(ctxswitch ...)`), so
+`grasm tir` can hand a runtime package to `compiler/s3`. The interpreter
+and the Cranelift backend refuse a runtime package by name.
+
+**Gates.** `rtswap` with each family as it moves; a fuzz of process cells
+under threads C starts (the counter `fuzz_tls` already runs, on a shared
+cell); `rtlint`'s refusals as conformance cases of the dialect; the
+context switch against a model of which fiber runs, with pointer
+authentication on, as §5.5 asks; and the checker's refusals outside a
+runtime package, one per facility.
+
 ## 6. Order of work
 
 Each stage ends with its exit criteria met and every gate green. Stages
