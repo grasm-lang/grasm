@@ -1056,6 +1056,80 @@ checker under both. On the benchmarks, timed in the same rounds, its code's
 time over linear scan's has a geometric mean of 0.976 (§11; one session,
 under load).
 
+### 6.6 S4: the linker
+
+`compiler/link` is a Mach-O linker for arm64 written in Grasm: it takes the
+objects either backend writes, the runtime archive and the libraries a
+program's `links` names, and writes the signed executable `cc` used to.
+`grasm build --native` runs it as `grasm-link`, found where `grasm` finds the
+runtime; `GRASM_LINKER=cc` links with `cc` instead, for one release.
+
+**What goes in.** The runtime archive `libgrasm_rt_abi.a` (401 LLVM-built
+members, with a `__.SYMDEF` table of contents and `#1/` long names) uses
+nine relocation types: 10,553 `UNSIGNED` (in `__DATA,__const`, `__data`,
+`__eh_frame`, `__compact_unwind` and the DWARF), 7,793 `BRANCH26`, 3,424
+`PAGE21` and 3,439 `PAGEOFF12`, 173 each of `GOT_LOAD_PAGE21` and
+`_PAGEOFF12`, 314 `ADDEND`, 166 `SUBTRACTOR` (with as many `UNSIGNED`, in
+`__eh_frame`) and 17 `POINTER_TO_GOT` (personalities, in `__eh_frame`); none
+of the `TLVP` pair and no scattered relocation. Its sections: `__text`,
+`__const`, `__cstring`, `__literal4/8/16`, `__gcc_except_tab`,
+`__eh_frame`, `__compact_unwind`, `__DATA,__const`, `__data`, `__common`,
+`__bss`, DWARF, and `__LLVM,__bitcode` -- no thread-local or initializer
+section. 100 of the members are not `MH_SUBSECTIONS_VIA_SYMBOLS`, so each of
+their sections is one atom. The Cranelift backend's objects add
+`GOT_LOAD` references to their own data; the Grasm backend's, DWARF and
+`l_` string labels. What comes from neither is taken from C fixtures
+(`scripts/fixtures/link/`): thread-local variables (`TLVP` relocations,
+descriptors bound to `__tlv_bootstrap`, the template), an export only
+`dlsym` reaches, and 4,000 functions whose unwind information needs four
+second-level pages where the corpus's largest program needs one.
+
+**How it lays out.** As ld-prime does, which is not published, so its output
+is the specification: every rule is in `compiler/link/src/main.gr`'s header,
+each found by comparing its map file and bytes with ld's. The ones that
+decide the most: files in command-line order with an archive's members by
+their index in it; atoms in input order, cold functions last; sections in
+the order the files first show them, `__literal*` into `__TEXT,__const`;
+`__TEXT` placed against its end with room for the load commands ld would
+have written; only anonymous C strings merged; a GOT load of something
+defined here made an `add`; imports numbered by their first pointer;
+`__unwind_info` as ld64 builds it with four differences. The default output
+is what the native build shipped -- ld's, then `strip -no_uuid` -- so the
+linker writes `strip`'s symbol table, its re-encoded export trie and its
+signature too.
+
+**What it leaves out**, and why each is allowed: an LC_UUID when stripping,
+as shipped (with symbols, a SHA-256 hash of the image, since ld's is an MD5
+over a debug map this linker does not write); a tool entry in
+LC_BUILD_VERSION, since it is not ld; the debug map, whose N_OSO entries
+would name objects in a directory deleted after the build, with their
+times. It refuses by name what nothing it is given needs: x86_64, arm64e,
+output other than an executable, common symbols, initializers, a
+thread-local variable from a dylib, frameworks.
+
+**What checks it.** `linktest` links every corpus program twice -- the
+Cranelift backend's objects as the native build captured them, and the
+Grasm backend's for the programs in its subset -- and requires each to run
+exactly as its `cc`-linked build does, to pass `codesign -v --strict`, and
+to be the same bytes when linked again; the C fixtures likewise, against
+`cc`'s link of them.
+`linkdiff` holds a quarter of the corpus and every program with an `export
+fn`, a thread-local cell or a `links` to ld-prime: byte for byte against the
+shipped build (given ld's tool entry, `-tool_version`, the one thing the
+linker does not write), and, unstripped, `dyld_info -fixups -exports`, `nm
+-m`, `otool -l` and every section's bytes against `cc`'s link of the same
+objects; the C fixtures, symbol tables included, and the whole runtime --
+all 401 members as objects, without dead-stripping -- likewise. `linkcontrols`
+plants six faults in copies of the linker and `codesig` -- a `BRANCH26` one
+instruction off, a `PAGEOFF12` scaled wrongly, each GOT entry bound to the
+wrong import, one page's hash wrong in the signature, an `export fn` dropped
+by dead-stripping, a thread-local descriptor left unbound -- and requires
+the gates to fail on each, for its reason. Two are caught by `linkdiff`
+alone: the three loads a wrongly scaled `PAGEOFF12` changes in `hello` are
+on paths it never runs, and a descriptor left unbound runs anyway, because
+dyld writes its own thunk into every descriptor it loads -- only the image
+is wrong, and `dyld_info -fixups` says so.
+
 ## 7. Bootstrap and trust
 
 - **During the migration:** stage 0 is the Rust-built `grasm`.
@@ -1078,7 +1152,9 @@ under load).
 `tirdiff` (TIR from both frontends), `tirinterp` (TIR interpreter against
 the Rust interpreter), `lexdiff`, `parsediff`, `diagdiff`, `encdiff`
 (encodings against `llvm-mc`), `objcheck` (objects through `otool`, `nm`,
-`dwarfdump`, `ld`), `linkdiff` (our linker against ld-prime), `rtswap`
+`dwarfdump`, `ld`), `linktest` (the corpus linked by our linker runs as
+it does linked by `cc`), `linkdiff` (our linker against ld-prime) and
+`linkcontrols` (§6.6), `rtswap`
 (corpus on the Grasm runtime), `fixpoint` (stage 2 = stage 3), `ddc`,
 `selfperf` (compile speed and benchmark budgets), and the existing fuzzers
 pointed at each new component. Every new gate ships with controls showing
@@ -1124,7 +1200,7 @@ Decided 2026-10-20:
    systems subset (§5).
 5. **Linux** in S7.
 
-## 11. Where it stands (2026-10-25)
+## 11. Where it stands (2026-10-26)
 
 Measured, not estimated; each line is a gate's result on master.
 
@@ -1177,11 +1253,33 @@ Measured, not estimated; each line is a gate's result on master.
   rows, which swing by about 10% under load: these figures are as taken,
   not as `bench.sh` would publish them, and want repeating on a quiet
   machine. Why the gap is what it is per program was not measured.
-- **Not started:** S2 (the frontend in Grasm), S4 (the linker), S5 (the
-  runtime in Grasm), S6 (self-compilation), S7-S9.
+- **S4 done.** `compiler/link` (§6.6, about 4,400 lines of Grasm) links
+  the native build on arm64 macOS, and `cc` is left as `GRASM_LINKER=cc`
+  for one release. `linktest`: all 651 corpus programs with a `main` --
+  the three SDL ones included -- linked from the Cranelift backend's objects
+  and the 648 of the Grasm backend's subset from its own, with the three C
+  fixtures: 1,302 links, each made twice and the two compared, every one
+  running exactly as its `cc`-linked build and accepted by `codesign -v
+  --strict`. `linkdiff`: 168 sampled programs are the very
+  bytes the native build shipped through `cc` and `strip -no_uuid` (given
+  ld's tool entry), and their unstripped links, the three C fixtures and the
+  whole runtime agree with ld-prime's through `dyld_info`, `nm`, `otool -l`
+  and section by section. `linkcontrols` catches all six planted faults.
+  The whole gate suite but `s3controls` (which S4 does not touch) ran with
+  `grasm-link` linking every native build: 187 of its 193 gates passed at
+  once. Of the other six, two were this work's own mistakes, since fixed
+  (`fmttest`, an unformatted file; `gold`, `fresh.sh` run from
+  `ProjectGold/`); two lacked a Python environment a fresh checkout does not
+  have and pass with it (`rmcptest`, `xxhashtest`); and two lost programs to
+  SIGKILL and pass rerun -- seven of `fuzz_mapkeys`'s binaries refused by
+  AppleSystemPolicy while the machine's network changed (the same seed then
+  passed, and six alternating runs with `grasm-link` and with `cc` saw no
+  refusal), and one of `difftest`'s.
+- **Not started:** S2 (the frontend in Grasm), S5 (the runtime in Grasm),
+  S6 (self-compilation), S7-S9.
 
-Order from here follows the critical path S3 -> S4 -> S6, one stage at a
-time; S2 and S5 follow.
+With S4 done, S6 waits on S3's last steps and on S2 and S5, the frontend
+and the runtime in Grasm; they come next, one stage at a time.
 
 ## References
 
