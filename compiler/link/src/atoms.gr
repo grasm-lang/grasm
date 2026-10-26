@@ -110,8 +110,7 @@ pub fn atomize(inout l: Ld, fi: i64) -> () ! str {
         // its pointers, whatever their section says: ld-prime makes both
         // afresh (a descriptor in `__thread_vars` is 8-aligned in its output
         // where clang's section is byte-aligned).
-        let natural = if role != state.ROLE_LITERAL and l.s_flags[si].bit_and(255) != 0x13 { -1 }
-            else if l.s_flags[si].bit_and(255) == 3 { 2 } else if l.s_flags[si].bit_and(255) == 14 { 4 } else { 3 }
+        let natural = natural_p2(role, l.s_flags[si].bit_and(255))
         if natural > p2 {
             p2 = natural
         }
@@ -184,6 +183,16 @@ pub fn atomize(inout l: Ld, fi: i64) -> () ! str {
             fail("{l.f_path[fi]}: relocations in zero-fill section {l.s_name[si]}")
         }
     }
+}
+
+/// The alignment (a power of two) an atom of this kind has whatever its
+/// section says, or -1: a literal's own size, a thread-local descriptor's
+/// pointer size.
+fn natural_p2(role: i64, ty: i64) -> i64 {
+    if role == state.ROLE_LITERAL {
+        return if ty == 3 { 2 } else if ty == 4 { 3 } else { 4 }
+    }
+    if ty == 0x13 { 3 } else { -1 }
 }
 
 pub fn is_zerofill(flags: i64) -> bool {

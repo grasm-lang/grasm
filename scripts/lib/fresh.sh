@@ -35,13 +35,17 @@ fresh_or_stop() {
 # way every other native build is.
 linker_fresh() {
     [ "$(uname -s)-$(uname -m)" = Darwin-arm64 ] || return 0
-    local out=target/release/grasm-link newer
+    # From the checkout's root, wherever the gate runs from (ProjectGold/run.sh
+    # runs in ProjectGold/).
+    local root
+    root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd) || return 1
+    local out="$root/target/release/grasm-link" newer
     if [ -x "$out" ]; then
-        newer=$(find compiler/link packages/codesig packages/exporttrie packages/crypto_hash \
+        newer=$(cd "$root" && find compiler/link packages/codesig packages/exporttrie packages/crypto_hash \
             packages/machoread packages/sha1 packages/sha512 target/release/grasm -newer "$out" 2>/dev/null | head -1)
         [ -z "$newer" ] && return 0
     fi
-    GRASM_LINKER=cc target/release/grasm build compiler/link/src/main.gr --native -o "$out.stage" >/dev/null &&
-        GRASM_LINKER="$PWD/$out.stage" target/release/grasm build compiler/link/src/main.gr --native -o "$out" >/dev/null &&
+    GRASM_LINKER=cc "$root/target/release/grasm" build "$root/compiler/link/src/main.gr" --native -o "$out.stage" >/dev/null &&
+        GRASM_LINKER="$out.stage" "$root/target/release/grasm" build "$root/compiler/link/src/main.gr" --native -o "$out" >/dev/null &&
         rm -f "$out.stage"
 }
