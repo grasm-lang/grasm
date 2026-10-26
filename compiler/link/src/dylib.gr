@@ -285,17 +285,17 @@ pub fn read_macho(inout l: Ld, path: str, data: bytes) -> i64 ! str {
         Ok(es) -> es
         Err(_) -> []
     }
+    // Every name in the trie, a re-export (flag 8) included: the library
+    // offers it, so a symbol bound to it is found at run time.
     for e in entries {
-        if e.flags.bit_and(8) == 0 or true {
-            if not l.dy_sym.has(e.name) {
-                l.dy_sym.set(e.name, di)
-            }
-            if e.flags.bit_and(4) != 0 {
-                l.dy_weak.set(e.name, true)
-            }
-            if e.flags.bit_and(3) == 1 {
-                l.dy_tlv.set(e.name, true)
-            }
+        if not l.dy_sym.has(e.name) {
+            l.dy_sym.set(e.name, di)
+        }
+        if e.flags.bit_and(4) != 0 {
+            l.dy_weak.set(e.name, true)
+        }
+        if e.flags.bit_and(3) == 1 {
+            l.dy_tlv.set(e.name, true)
         }
     }
     di
