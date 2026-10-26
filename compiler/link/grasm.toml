@@ -1,0 +1,19 @@
+[package]
+name = "link"
+version = "0.1.0"
+entry = "src/main.gr"
+
+# Links arm64 Mach-O objects and archives into a signed executable
+# (docs/self-hosting.md, stage S4). It reads its inputs and the SDK's
+# text-based stubs and writes one file; it starts no process. `unsafe` is
+# for one C call, chmod(2), which makes the output executable.
+capabilities = ["io", "unsafe"]
+
+[dependencies.codesig]
+path = "../../packages/codesig"
+
+[dependencies.exporttrie]
+path = "../../packages/exporttrie"
+
+[dependencies.crypto_hash]
+path = "../../packages/crypto_hash"

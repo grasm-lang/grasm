@@ -1,0 +1,352 @@
+// `link`: the Grasm linker for arm64 Mach-O (docs/self-hosting.md, stage S4).
+//
+//     link [options] <inputs> -o <output>
+//
+// Inputs are relocatable objects (`.o`), static archives (`.a`), and dynamic
+// libraries as Mach-O files (`.dylib`) or text-based stubs (`.tbd`), in
+// command-line order; `-l<name>` finds `lib<name>.tbd`, `.dylib` or `.a` in
+// each `-L` directory and then the SDK's `usr/lib`. libSystem is linked
+// last, as `cc` links it, unless `-nostdlib`.
+//
+//     -o <file>                the executable to write (default a.out)
+//     -e <symbol>              the entry point (default _main)
+//     -dead_strip              keep only what the entry and the exports reach
+//     -exported_symbol <sym>   export only these (repeatable); each is kept
+//     -L<dir>, -l<name>        library search
+//     -syslibroot <sdk>        the SDK (default: $SDKROOT, else the Command
+//                              Line Tools' or Xcode's MacOSX.sdk)
+//     -strip                   the symbol table `strip -no_uuid` leaves, and
+//                              no LC_UUID: what `grasm build --native` ships
+//     -no_uuid                 no LC_UUID
+//     -map <file>              an ld-style map of every atom's address
+//     -nostdlib                do not link libSystem
+//
+// The output is a position-independent MH_EXECUTE laid out as ld-prime lays
+// out the same inputs (`layout.gr`), with its fixups chained
+// (DYLD_CHAINED_PTR_64_OFFSET), an export trie, function starts, a symbol
+// table, compact unwind information, and an ad-hoc linker signature written
+// by `codesig`. Nothing in it depends on time, paths or hash order: the same
+// inputs give the same bytes.
+//
+// Exit status: 0 written; 1 the link failed (undefined or duplicate symbols,
+// an input this linker does not take); 2 bad usage.
+import rd
+import state
+import objfile
+import archive
+import dylib
+import resolve
+import atoms
+import deadstrip
+import layout
+import unwind
+import apply
+import image
+import ldmap
+
+fn usage() {
+    eprint("usage: link [-o out] [-e sym] [-dead_strip] [-exported_symbol sym]... [-L dir] [-l name] [-syslibroot sdk] [-strip] [-no_uuid] [-map file] [-nostdlib] inputs...")
+    exit(2)
+}
+
+fn sdk_path(l: Ld) -> str {
+    if l.syslibroot != "" {
+        return l.syslibroot
+    }
+    let env_root = env("SDKROOT") ?? ""
+    if env_root != "" {
+        return env_root
+    }
+    let clt = "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk"
+    if file_exists(clt + "/SDKSettings.json") {
+        return clt
+    }
+    "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk"
+}
+
+/// The SDK's version, from its SDKSettings.json, as packed x.y.z.
+fn sdk_version(sdk: str) -> i64 {
+    let text = match read_file(sdk + "/SDKSettings.json") {
+        Ok(t) -> t
+        Err(_) -> ""
+    }
+    let key = "\"Version\":\""
+    match text.index_of(key) {
+        Some(i) -> {
+            let rest = text.substr(i + key.len(), 32)
+            match rest.index_of("\"") {
+                Some(j) -> dylib.parse_version(rest.substr(0, j))
+                None -> 0
+            }
+        }
+        None -> 0
+    }
+}
+
+fn find_library(l: Ld, name: str, sdk: str) -> str {
+    var dirs: [str] = []
+    for d in l.lib_dirs {
+        dirs.push(d)
+    }
+    dirs.push(sdk + "/usr/lib")
+    dirs.push(sdk + "/usr/local/lib")
+    for d in dirs {
+        for ext in [".tbd", ".dylib", ".a"] {
+            let p = d + "/lib" + name + ext
+            if file_exists(p) {
+                return p
+            }
+        }
+    }
+    ""
+}
+
+/// Reads one input by its kind.
+fn load(inout l: Ld, path: str, pos: i64) -> () ! str {
+    if path.ends_with(".tbd") {
+        let text = match read_file(path) {
+            Ok(t) -> t
+            Err(e) -> fail("cannot read {path}: {e}")
+        }
+        let _di = try dylib.read_tbd(l, path, text)
+        return
+    }
+    let d = match read_bytes(path) {
+        Ok(b) -> b
+        Err(e) -> fail("cannot read {path}: {e}")
+    }
+    if d.len() >= 8 and d.slice(0, 8).to_str() == "!<arch>\n" {
+        try archive.read(l, path, d, pos)
+    } else if path.ends_with(".dylib") {
+        let _di = try dylib.read_macho(l, path, d)
+    } else {
+        let fi = try objfile.read(l, path, d, pos * 1000000)
+        l.direct.push(fi)
+    }
+}
+
+fn run(inout l: Ld) -> () ! str {
+    let sdk = sdk_path(l)
+    if l.sdk == 0 {
+        l.sdk = sdk_version(sdk)
+        let target = env("MACOSX_DEPLOYMENT_TARGET") ?? ""
+        l.minos = if target != "" { dylib.parse_version(target) } else { l.sdk }
+    }
+    // Inputs, in order; libSystem last.
+    var kinds = l.in_kind
+    var args = l.in_arg
+    if not l.nostdlib {
+        kinds.push("l")
+        args.push("System")
+    }
+    for k in 0..kinds.len() {
+        var path = args[k]
+        if kinds[k] == "l" {
+            path = find_library(l, args[k], sdk)
+            if path == "" {
+                fail("library '{args[k]}' not found")
+            }
+        }
+        try load(l, path, k + 1)
+    }
+    // The header's symbol, then every object's, then archive members on demand.
+    let hdr = resolve.gsym(l, "__mh_execute_header")
+    l.g_kind[hdr] = state.G_SYNTH
+    for fi in l.direct {
+        try resolve.add_file(l, fi)
+    }
+    try resolve.load_members(l)
+    let _missing = resolve.bind_dylibs(l)
+    // Layout order of the files.
+    var files: [i64] = []
+    for fi in 0..l.f_path.len() {
+        files.push(fi)
+    }
+    files.sort_by(|fi| l.f_key[fi])
+    for fi in files {
+        try atoms.atomize(l, fi)
+    }
+    for fi in files {
+        try atoms.resolve_relocs(l, fi)
+        try atoms.read_compact_unwind(l, fi)
+        try atoms.read_eh_frame(l, fi)
+    }
+    atoms.merge_literals(l, files)
+    if (env("LINK_DEBUG") ?? "") != "" {
+        var with_cu = 0
+        for a in 0..l.a_cu.len() {
+            if l.a_cu[a] >= 0 {
+                with_cu += 1
+            }
+        }
+        eprint("debug: {l.cu_atom.len()} compact unwind entries, {with_cu} atoms with one, {l.eh_atom.len()} eh records")
+    }
+    try deadstrip.mark(l, files)
+    let undef = deadstrip.undefined(l, files)
+    if undef.len() > 0 {
+        fail("Undefined symbols for architecture arm64:\n" + undef.join("\n") + "\nld: symbol(s) not found for architecture arm64")
+    }
+    try layout.sections(l, files)
+    for o in l.o_order {
+        if l.o_kind[o] == layout.K_ATOMS {
+            layout.pack(l, o)
+        }
+    }
+    // __unwind_info and __eh_frame close __TEXT.
+    let text = l.o_order[0]
+    let eh = unwind.eh_frame(l, files)
+    let ui_size = unwind.unwind_info(l, text, 0, 0).len()
+    var tail: [i64] = []
+    var ui = -1
+    if ui_size > 0 {
+        ui = l.o_seg.len()
+        l.o_seg.push("__TEXT")
+        l.o_name.push("__unwind_info")
+        l.o_flags.push(0)
+        l.o_p2.push(2)
+        l.o_addr.push(0)
+        l.o_size.push(ui_size)
+        l.o_off.push(0)
+        l.o_atoms.push([])
+        l.o_kind.push(layout.K_UNWIND)
+        tail.push(ui)
+    }
+    if eh >= 0 {
+        tail.push(eh)
+    }
+    var order: [i64] = []
+    for k in 0..l.o_order.len() {
+        if k == l.text_tail {
+            for t in tail {
+                order.push(t)
+            }
+        }
+        order.push(l.o_order[k])
+    }
+    if l.text_tail >= l.o_order.len() {
+        for t in tail {
+            order.push(t)
+        }
+    }
+    l.o_order = order
+    let header_size = 32 + image.commands_size(l)
+    let le_off = layout.place(l, header_size)
+    var body = bytes_filled(le_off, 0)
+    let fx = try apply.contents(l, body)
+    let got_o = unwind.got_section(l)
+    let got_base = if got_o >= 0 { l.o_addr[got_o] - layout.BASE } else { 0 }
+    if ui >= 0 {
+        let ub = unwind.unwind_info(l, text, 0 - layout.BASE, got_base)
+        if ub.len() != ui_size {
+            fail("__unwind_info changed size between layout and writing ({ui_size} then {ub.len()})")
+        }
+        body.copy_from(l.o_off[ui], ub)
+    }
+    if eh >= 0 {
+        let eb = try unwind.eh_bytes(l, eh)
+        body.copy_from(l.o_off[eh], eb)
+    }
+    let eg = l.g_map.get(l.entry) ?? -1
+    let ey = l.g_def[eg]
+    let ea = l.y_atom[ey]
+    let entry_addr = l.a_addr[l.a_canon[ea]] + (l.y_value[ey] - l.s_addr[l.y_sect[ey]] - l.a_off[ea])
+    let file = try image.finish(l, files, body, fx, entry_addr, le_off)
+    if l.map_path != "" {
+        match write_file(l.map_path, ldmap.text(l, files)) {
+            Ok(_) -> ()
+            Err(e) -> fail("cannot write {l.map_path}: {e}")
+        }
+    }
+    // Written beside the output and renamed over it, as ld does, so a
+    // running copy of the old file is never rewritten under itself.
+    let tmp = l.out + ".link-tmp"
+    match write_bytes(tmp, file) {
+        Ok(_) -> ()
+        Err(e) -> fail("cannot write {l.out}: {e}")
+    }
+    let rc = unsafe { chmod(tmp, 493) }
+    if rc != 0 {
+        let _gone: () ! IoError = remove_file(tmp)
+        fail("cannot make {l.out} executable")
+    }
+    match rename_file(tmp, l.out) {
+        Ok(_) -> ()
+        Err(e) -> fail("cannot write {l.out}: {e}")
+    }
+}
+
+/// The one C function this program calls: the language has no way to set a
+/// file's permissions, and an executable has to be executable (0755).
+extern fn chmod(path: str, mode: i64) -> i64
+
+fn main() {
+    let a = args()
+    var l = state.new_ld()
+    var i = 0
+    while i < a.len() {
+        let x = a[i]
+        let has_next = i + 1 < a.len()
+        if x == "-o" and has_next {
+            l.out = a[i + 1]
+            i += 2
+        } else if x == "-e" and has_next {
+            l.entry = a[i + 1]
+            i += 2
+        } else if x == "-dead_strip" {
+            l.dead_strip = true
+            i += 1
+        } else if x == "-exported_symbol" and has_next {
+            l.exp_list.push(a[i + 1])
+            l.exp_set.set(a[i + 1], true)
+            i += 2
+        } else if x == "-syslibroot" and has_next {
+            l.syslibroot = a[i + 1]
+            i += 2
+        } else if x == "-map" and has_next {
+            l.map_path = a[i + 1]
+            i += 2
+        } else if x == "-strip" {
+            l.strip = true
+            l.uuid = false
+            i += 1
+        } else if x == "-no_uuid" {
+            l.uuid = false
+            i += 1
+        } else if x == "-tool_version" and has_next {
+            l.tool_version = dylib.parse_version(a[i + 1])
+            i += 2
+        } else if x == "-nostdlib" {
+            l.nostdlib = true
+            i += 1
+        } else if x == "-L" and has_next {
+            l.lib_dirs.push(a[i + 1])
+            i += 2
+        } else if x.starts_with("-L") {
+            l.lib_dirs.push(x.substr(2, x.len() - 2))
+            i += 1
+        } else if x.starts_with("-l") and x.len() > 2 {
+            l.in_kind.push("l")
+            l.in_arg.push(x.substr(2, x.len() - 2))
+            i += 1
+        } else if x.starts_with("-") {
+            eprint("link: unknown option {x}")
+            usage()
+            return
+        } else {
+            l.in_kind.push("o")
+            l.in_arg.push(x)
+            i += 1
+        }
+    }
+    if l.in_arg.len() == 0 {
+        usage()
+        return
+    }
+    match run(l) {
+        Ok(_) -> exit(0)
+        Err(e) -> {
+            eprint(e)
+            exit(1)
+        }
+    }
+}

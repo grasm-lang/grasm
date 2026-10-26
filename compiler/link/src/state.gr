@@ -1,0 +1,249 @@
+// The linker's state: every input file, section, symbol, atom and
+// relocation, each in arrays indexed by an integer id (structure of arrays,
+// docs/self-hosting.md §3.5). One `Ld` value is threaded `inout` through the
+// passes in `main.gr`.
+
+/// Section roles, decided when an object is read.
+pub let ROLE_NORMAL = 0
+/// S_ATTR_DEBUG sections (DWARF), `__LLVM` bitcode: never copied.
+pub let ROLE_DROP = 1
+/// `__LD,__compact_unwind`: read into `cu_*`, never copied.
+pub let ROLE_CUNWIND = 2
+/// `__TEXT,__eh_frame`: CIEs and FDEs, one atom each.
+pub let ROLE_EHFRAME = 3
+/// S_CSTRING_LITERALS: one atom per string, merged by content.
+pub let ROLE_CSTRING = 4
+/// S_4/8/16BYTE_LITERALS: fixed-size atoms, merged by content.
+pub let ROLE_LITERAL = 5
+
+/// What a relocation, once resolved, points at.
+pub let T_NONE = 0
+/// An atom of this link, `r_tatom` + `r_toff`.
+pub let T_ATOM = 1
+/// A global symbol bound at run time (`r_tg`): an import from a dylib.
+pub let T_IMPORT = 2
+/// `__mh_execute_header`.
+pub let T_HEADER = 3
+
+/// Global symbol kinds.
+pub let G_UNDEF = 0
+pub let G_DEFINED = 1
+pub let G_DYLIB = 2
+/// Defined by the linker itself (`__mh_execute_header`).
+pub let G_SYNTH = 3
+
+type Ld = {
+    // ----- options
+    out: str,
+    entry: str,
+    dead_strip: bool,
+    /// `-exported_symbol` names (with their underscore), and whether any was given.
+    exp_list: [str],
+    exp_set: Map[str, bool],
+    /// Write the symbol table `strip` leaves (and no UUID unless asked).
+    strip: bool,
+    uuid: bool,
+    map_path: str,
+    syslibroot: str,
+    lib_dirs: [str],
+    /// Positional inputs in command-line order: kind ("o" a path, "l" a
+    /// library name) and the argument.
+    in_kind: [str],
+    in_arg: [str],
+    minos: i64,
+    sdk: i64,
+    ident: str,
+    nostdlib: bool,
+    /// `-tool_version`: an LD tool entry in LC_BUILD_VERSION, for comparison only.
+    tool_version: i64,
+    /// Objects named on the command line, in order.
+    direct: [i64],
+    // ----- object files, archive members included once loaded
+    f_path: [str],
+    f_data: [bytes],
+    /// The order files are laid out in: command-line position, then the
+    /// member's index in its archive.
+    f_key: [i64],
+    f_subsec: [bool],
+    f_sec0: [i64],
+    f_nsec: [i64],
+    f_sym0: [i64],
+    f_nsym: [i64],
+    // ----- archives
+    ar_path: [str],
+    ar_data: [bytes],
+    ar_pos: [i64],
+    /// Symbol name -> member header offset, from the archive's table of contents.
+    ar_toc: [Map[str, i64]],
+    /// Member header offset -> its index among the archive's members.
+    ar_index: [Map[i64, i64]],
+    /// Member header offsets already loaded (any archive), keyed "archive:offset".
+    ar_loaded: Map[str, i64],
+    // ----- dylibs
+    dl_install: [str],
+    dl_cur: [i64],
+    dl_compat: [i64],
+    /// Exported names -> dylib index (first dylib on the line that has it).
+    dy_sym: Map[str, i64],
+    dy_weak: Map[str, bool],
+    dy_tlv: Map[str, bool],
+    // ----- input sections
+    s_file: [i64],
+    s_name: [str],
+    s_seg: [str],
+    s_addr: [i64],
+    s_size: [i64],
+    s_off: [i64],
+    s_p2: [i64],
+    s_reloff: [i64],
+    s_nreloc: [i64],
+    s_flags: [i64],
+    s_role: [i64],
+    s_atom0: [i64],
+    s_natom: [i64],
+    s_rel0: [i64],
+    s_nrel: [i64],
+    /// The output section, once known.
+    s_out: [i64],
+    // ----- input symbols
+    y_file: [i64],
+    y_name: [str],
+    y_type: [i64],
+    y_sect: [i64],
+    y_desc: [i64],
+    y_value: [i64],
+    y_atom: [i64],
+    y_g: [i64],
+    // ----- atoms
+    a_sec: [i64],
+    a_off: [i64],
+    a_size: [i64],
+    a_p2: [i64],
+    a_mod: [i64],
+    a_live: [bool],
+    a_addr: [i64],
+    a_sym: [i64],
+    a_canon: [i64],
+    a_rel0: [i64],
+    a_nrel: [i64],
+    a_cu: [i64],
+    a_fde: [i64],
+    a_cold: [bool],
+    a_named: [bool],
+    // ----- relocations, decoded; a SUBTRACTOR is folded into the UNSIGNED after it
+    r_sec: [i64],
+    r_off: [i64],
+    r_type: [i64],
+    r_len: [i64],
+    r_pcrel: [bool],
+    r_sym: [i64],
+    r_tsec: [i64],
+    r_addend: [i64],
+    r_subsym: [i64],
+    r_subsec: [i64],
+    r_atom: [i64],
+    /// Resolved: T_* kind, atom and offset, or global symbol.
+    r_tkind: [i64],
+    r_tatom: [i64],
+    r_toff: [i64],
+    r_tg: [i64],
+    /// The subtrahend, for a SUBTRACTOR pair: atom and offset (or -1).
+    r_satom: [i64],
+    r_soff: [i64],
+    // ----- compact unwind entries, from `__LD,__compact_unwind`
+    cu_atom: [i64],
+    cu_len: [i64],
+    cu_enc: [i64],
+    /// Personality: a global symbol id or -1; LSDA: atom (+ offset) or -1.
+    cu_pers_g: [i64],
+    cu_pers_atom: [i64],
+    cu_lsda: [i64],
+    cu_lsda_off: [i64],
+    // ----- eh_frame records (atoms in an ROLE_EHFRAME section)
+    eh_atom: [i64],
+    eh_cie: [bool],
+    /// An FDE's CIE (an eh index), the function atom it describes, and its LSDA atom.
+    eh_of: [i64],
+    eh_func: [i64],
+    eh_lsda: [i64],
+    /// A CIE's personality: global symbol or -1.
+    eh_pers_g: [i64],
+    eh_pers_atom: [i64],
+    // ----- global symbols
+    g_map: Map[str, i64],
+    g_name: [str],
+    g_kind: [i64],
+    /// The input symbol that defines it.
+    g_def: [i64],
+    g_dylib: [i64],
+    g_weak: [bool],
+    g_pext: [bool],
+    g_tlv: [bool],
+    /// Whether a live reference needs it, and its synthesized slots.
+    g_used: [bool],
+    g_got: [i64],
+    g_stub: [i64],
+    g_import: [i64],
+    /// Referenced weakly by every object that names it (N_WEAK_REF).
+    g_weakref: [bool],
+    // ----- output
+    o_seg: [str],
+    o_name: [str],
+    o_flags: [i64],
+    o_p2: [i64],
+    o_addr: [i64],
+    o_size: [i64],
+    o_off: [i64],
+    o_atoms: [[i64]],
+    o_kind: [i64],
+    /// Output sections in address order.
+    o_order: [i64],
+    /// Where `__unwind_info` and `__eh_frame` go in `o_order`.
+    text_tail: i64,
+    /// Segments: (vmaddr, vmsize, fileoff, filesize).
+    seg_text_size: i64,
+    seg_dc: (i64, i64, i64, i64),
+    seg_data: (i64, i64, i64, i64),
+    seg_linkedit_addr: i64,
+    /// A GOT slot holding a local atom's address, by atom.
+    a_got: Map[i64, i64],
+    /// `__eh_frame` records kept, in output order (eh indexes), and each
+    /// one's offset in the section.
+    eh_keep: [i64],
+    eh_out_off: Map[i64, i64],
+    /// GOT slots: what each holds -- a global symbol or an atom.
+    got_g: [i64],
+    got_atom: [i64],
+    got_name: [str],
+    /// Stubs: the global symbol each calls through.
+    stub_g: [i64],
+    /// Imports in chained-fixup order: global symbol ids.
+    imp_g: [i64],
+    errors: [str],
+    warnings: [str],
+}
+
+pub fn new_ld() -> Ld {
+    Ld{
+        out: "a.out", entry: "_main", dead_strip: false, exp_list: [], exp_set: {}, strip: false, uuid: true,
+        map_path: "", syslibroot: "", lib_dirs: [], in_kind: [], in_arg: [], minos: 0, sdk: 0, ident: "", nostdlib: false, tool_version: 0, direct: [],
+        f_path: [], f_data: [], f_key: [], f_subsec: [], f_sec0: [], f_nsec: [], f_sym0: [], f_nsym: [],
+        ar_path: [], ar_data: [], ar_pos: [], ar_toc: [], ar_index: [], ar_loaded: {},
+        dl_install: [], dl_cur: [], dl_compat: [], dy_sym: {}, dy_weak: {}, dy_tlv: {},
+        s_file: [], s_name: [], s_seg: [], s_addr: [], s_size: [], s_off: [], s_p2: [], s_reloff: [], s_nreloc: [],
+        s_flags: [], s_role: [], s_atom0: [], s_natom: [], s_rel0: [], s_nrel: [], s_out: [],
+        y_file: [], y_name: [], y_type: [], y_sect: [], y_desc: [], y_value: [], y_atom: [], y_g: [],
+        a_sec: [], a_off: [], a_size: [], a_p2: [], a_mod: [], a_live: [], a_addr: [], a_sym: [], a_canon: [],
+        a_rel0: [], a_nrel: [], a_cu: [], a_fde: [], a_cold: [], a_named: [],
+        r_sec: [], r_off: [], r_type: [], r_len: [], r_pcrel: [], r_sym: [], r_tsec: [], r_addend: [], r_subsym: [],
+        r_subsec: [], r_atom: [], r_tkind: [], r_tatom: [], r_toff: [], r_tg: [], r_satom: [], r_soff: [],
+        cu_atom: [], cu_len: [], cu_enc: [], cu_pers_g: [], cu_pers_atom: [], cu_lsda: [], cu_lsda_off: [],
+        eh_atom: [], eh_cie: [], eh_of: [], eh_func: [], eh_lsda: [], eh_pers_g: [], eh_pers_atom: [],
+        g_map: {}, g_name: [], g_kind: [], g_def: [], g_dylib: [], g_weak: [], g_pext: [], g_tlv: [], g_used: [],
+        g_got: [], g_stub: [], g_import: [], g_weakref: [],
+        o_seg: [], o_name: [], o_flags: [], o_p2: [], o_addr: [], o_size: [], o_off: [], o_atoms: [], o_kind: [], o_order: [],
+        text_tail: 0, seg_text_size: 0, seg_dc: (0, 0, 0, 0), seg_data: (0, 0, 0, 0), seg_linkedit_addr: 0, a_got: {},
+        eh_keep: [], eh_out_off: {},
+        got_g: [], got_atom: [], got_name: [], stub_g: [], imp_g: [], errors: [], warnings: [],
+    }
+}

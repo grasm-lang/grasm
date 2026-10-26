@@ -1,0 +1,391 @@
+// Where everything goes: the output sections, their order, the atoms in
+// each, the stubs and GOT slots the code needs, and every address.
+//
+// Section order, as ld-prime lays it out: in `__TEXT`, `__text` first and
+// `__stubs` after it, then every other section in the order the input files
+// first show it (files in layout order, each file's sections in its own
+// order), then `__unwind_info` and `__eh_frame` last. `__TEXT,__literal4`,
+// `__literal8` and `__literal16` go into `__TEXT,__const`; `__DATA,__const`
+// moves to `__DATA_CONST`, after `__got`. In `__DATA`, the sections with
+// contents and then the zero-fill ones, each in first-seen order.
+//
+// Atoms keep the files' layout order and, within a file, their input order;
+// in `__text`, a function marked N_COLD_FUNC goes after all the others.
+//
+// The `__TEXT` segment is laid out forwards and then moved up against its
+// end, rounded down to its largest alignment, so the slack is between the
+// load commands and the first section (ld64's `setLoadCommandsPadding`
+// keeps at least 32 bytes there).
+import rd
+import state
+import objfile
+import atoms
+import deadstrip
+
+pub let K_ATOMS = 0
+pub let K_STUBS = 1
+pub let K_GOT = 2
+pub let K_UNWIND = 3
+pub let K_EHFRAME = 4
+
+pub let PAGE = 16384
+pub let BASE = 0x100000000
+
+/// The output section an input section's atoms go to: (segment, section).
+pub fn out_of(seg: str, name: str, flags: i64) -> (str, str) {
+    let ty = flags.bit_and(255)
+    if seg == "__TEXT" and (ty == 3 or ty == 4 or ty == 14) {
+        return ("__TEXT", "__const")
+    }
+    if seg == "__DATA" and name == "__const" {
+        return ("__DATA_CONST", "__const")
+    }
+    if seg == "__DATA" and ty == 9 {
+        return ("__DATA_CONST", "__mod_init_func")
+    }
+    (seg, name)
+}
+
+fn new_out(inout l: Ld, seg: str, name: str, flags: i64) -> i64 {
+    let o = l.o_seg.len()
+    l.o_seg.push(seg)
+    l.o_name.push(name)
+    l.o_flags.push(flags)
+    l.o_p2.push(0)
+    l.o_addr.push(0)
+    l.o_size.push(0)
+    l.o_off.push(0)
+    l.o_atoms.push([])
+    l.o_kind.push(K_ATOMS)
+    o
+}
+
+/// The name a GOT slot, stub or import sorts by.
+fn target_name(l: Ld, kind: i64, a: i64, g: i64) -> str {
+    if g >= 0 {
+        return l.g_name[g]
+    }
+    if a >= 0 and l.a_sym[a] >= 0 {
+        return l.y_name[l.a_sym[a]]
+    }
+    ""
+}
+
+/// Decides the output sections and fills them with the live atoms.
+pub fn sections(inout l: Ld, files: [i64]) -> () ! str {
+    // First-seen order of each output section within its segment.
+    var seen: Map[str, i64] = {}
+    var order_text: [i64] = []
+    var order_dc: [i64] = []
+    var order_data: [i64] = []
+    var order_zf: [i64] = []
+    var order_other: [i64] = []
+    var by_name: Map[str, i64] = {}
+    var cold: [i64] = []
+    for fi in files {
+        let sec0 = l.f_sec0[fi]
+        for si in sec0..(sec0 + l.f_nsec[fi]) {
+            let role = l.s_role[si]
+            if role == state.ROLE_DROP or role == state.ROLE_CUNWIND or role == state.ROLE_EHFRAME {
+                continue
+            }
+            let a0 = l.s_atom0[si]
+            var any = false
+            for a in a0..(a0 + l.s_natom[si]) {
+                if l.a_live[a] {
+                    any = true
+                    break
+                }
+            }
+            if not any {
+                continue
+            }
+            let (seg, name) = out_of(l.s_seg[si], l.s_name[si], l.s_flags[si])
+            let key = seg + "," + name
+            var o = by_name.get(key) ?? -1
+            if o < 0 {
+                let ty = l.s_flags[si].bit_and(255)
+                let flags = if seg == "__TEXT" and name == "__const" and l.s_name[si] != "__const" { 0 } else { l.s_flags[si] }
+                o = new_out(l, seg, name, flags)
+                by_name.set(key, o)
+                if seg == "__TEXT" {
+                    if name != "__text" {
+                        order_text.push(o)
+                    }
+                } else if seg == "__DATA_CONST" {
+                    order_dc.push(o)
+                } else if seg == "__DATA" {
+                    if atoms.is_zerofill(l.s_flags[si]) {
+                        order_zf.push(o)
+                    } else {
+                        order_data.push(o)
+                    }
+                } else {
+                    order_other.push(o)
+                }
+            }
+            l.s_out[si] = o
+            for a in a0..(a0 + l.s_natom[si]) {
+                if l.a_live[a] {
+                    if l.a_cold[a] and name == "__text" and seg == "__TEXT" {
+                        cold.push(a)
+                    } else {
+                        l.o_atoms[o].push(a)
+                    }
+                }
+            }
+        }
+    }
+    var text = by_name.get("__TEXT,__text") ?? -1
+    if text < 0 {
+        text = new_out(l, "__TEXT", "__text", 0x80000400)
+    }
+    for a in cold {
+        l.o_atoms[text].push(a)
+    }
+    // Stubs, GOT slots and imports, each sorted by name.
+    try synthesize(l, files)
+    var final: [i64] = [text]
+    if l.stub_g.len() > 0 {
+        let s = new_out(l, "__TEXT", "__stubs", 0x80000408)
+        l.o_kind[s] = K_STUBS
+        l.o_p2[s] = 2
+        l.o_size[s] = 12 * l.stub_g.len()
+        final.push(s)
+    }
+    for o in order_text {
+        final.push(o)
+    }
+    // __unwind_info and __eh_frame are added by the unwind pass, which
+    // knows whether there is anything to put in them.
+    l.text_tail = final.len()
+    if l.got_name.len() > 0 {
+        let g = new_out(l, "__DATA_CONST", "__got", 6)
+        l.o_kind[g] = K_GOT
+        l.o_p2[g] = 3
+        l.o_size[g] = 8 * l.got_name.len()
+        final.push(g)
+    }
+    for o in order_dc {
+        final.push(o)
+    }
+    for o in order_data {
+        final.push(o)
+    }
+    for o in order_zf {
+        final.push(o)
+    }
+    for o in order_other {
+        final.push(o)
+    }
+    l.o_order = final
+}
+
+/// Which imports need a stub, which targets a GOT slot, and the import table.
+fn synthesize(inout l: Ld, files: [i64]) -> () ! str {
+    var stub: Map[str, i64] = {}
+    var got: Map[str, (i64, i64)] = {}
+    var imp: Map[str, i64] = {}
+    for fi in files {
+        let sec0 = l.f_sec0[fi]
+        for si in sec0..(sec0 + l.f_nsec[fi]) {
+            let a0 = l.s_atom0[si]
+            let eh = l.s_role[si] == state.ROLE_EHFRAME
+            for a in a0..(a0 + l.s_natom[si]) {
+                if not l.a_live[a] {
+                    continue
+                }
+                for r in l.a_rel0[a]..(l.a_rel0[a] + l.a_nrel[a]) {
+                    let t = l.r_type[r]
+                    let k = l.r_tkind[r]
+                    let g = l.r_tg[r]
+                    if eh and t != objfile.R_POINTER_TO_GOT {
+                        continue
+                    }
+                    if k == state.T_IMPORT {
+                        l.g_used[g] = true
+                        let name = l.g_name[g]
+                        if t == objfile.R_BRANCH26 {
+                            stub.set(name, g)
+                            got.set(name, (g, -1))
+                            imp.set(name, g)
+                        } else if t == objfile.R_GOT_PAGE21 or t == objfile.R_GOT_PAGEOFF12 or t == objfile.R_POINTER_TO_GOT {
+                            got.set(name, (g, -1))
+                            imp.set(name, g)
+                        } else if t == objfile.R_UNSIGNED and l.r_len[r] == 3 {
+                            imp.set(name, g)
+                        } else if t == objfile.R_TLVP_PAGE21 or t == objfile.R_TLVP_PAGEOFF12 {
+                            fail("a thread-local variable imported from a dylib ({name}) is not supported")
+                        } else {
+                            fail("{l.f_path[fi]}: a {objfile.reloc_name(t)} relocation to {name}, which is in a dylib")
+                        }
+                    } else if k == state.T_ATOM and t == objfile.R_POINTER_TO_GOT {
+                        let ta = l.a_canon[l.r_tatom[r]]
+                        let name = if g >= 0 { l.g_name[g] } else { target_name(l, 0, ta, -1) }
+                        got.set(name, (-1, ta))
+                    } else if k == state.T_NONE {
+                        // Reported by `deadstrip.undefined`.
+                        ()
+                    }
+                }
+            }
+        }
+        // A compact unwind entry's personality is called through the GOT too.
+        let sec0b = l.f_sec0[fi]
+        for si in sec0b..(sec0b + l.f_nsec[fi]) {
+            let a0 = l.s_atom0[si]
+            for a in a0..(a0 + l.s_natom[si]) {
+                let c = l.a_cu[a]
+                if c < 0 or not l.a_live[a] or deadstrip.needs_fde(l, a) {
+                    continue
+                }
+                let pg = l.cu_pers_g[c]
+                let pa = l.cu_pers_atom[c]
+                if pg >= 0 and l.g_kind[pg] == state.G_DYLIB {
+                    l.g_used[pg] = true
+                    got.set(l.g_name[pg], (pg, -1))
+                    imp.set(l.g_name[pg], pg)
+                } else if pa >= 0 {
+                    let ta = l.a_canon[pa]
+                    let name = if pg >= 0 { l.g_name[pg] } else { target_name(l, 0, ta, -1) }
+                    got.set(name, (-1, ta))
+                }
+            }
+        }
+    }
+    for (name, g) in stub.entries() {
+        l.g_stub[g] = l.stub_g.len()
+        l.stub_g.push(g)
+    }
+    for (name, ga) in got.entries() {
+        let (g, a) = ga
+        if g >= 0 {
+            l.g_got[g] = l.got_name.len()
+        } else {
+            l.a_got.set(a, l.got_name.len())
+        }
+        l.got_g.push(g)
+        l.got_atom.push(a)
+        l.got_name.push(name)
+    }
+    for (name, g) in imp.entries() {
+        l.g_import[g] = l.imp_g.len()
+        l.imp_g.push(g)
+    }
+}
+
+/// Lays out one output section's atoms from offset 0: each atom's offset
+/// in `a_addr` (made absolute later), and the section's size and alignment.
+pub fn pack(inout l: Ld, o: i64) {
+    var off = 0
+    var p2 = l.o_p2[o]
+    for a in l.o_atoms[o] {
+        let m = 1.shl(l.a_p2[a])
+        let cur = off % m
+        let want = l.a_mod[a]
+        if cur != want {
+            off += if want > cur { want - cur } else { want + m - cur }
+        }
+        l.a_addr[a] = off
+        off += l.a_size[a]
+        if l.a_p2[a] > p2 {
+            p2 = l.a_p2[a]
+        }
+    }
+    l.o_p2[o] = p2
+    if l.o_kind[o] == K_ATOMS {
+        l.o_size[o] = off
+    }
+}
+
+/// Assigns every segment and section its address and file offset, given the
+/// size of the header and load commands. Answers the end of `__DATA`'s
+/// file contents (where `__LINKEDIT` starts).
+pub fn place(inout l: Ld, header_size: i64) -> i64 {
+    // __TEXT: forwards from 0, then moved against the segment's end.
+    var off = 0
+    var maxp2 = 0
+    var text: [i64] = []
+    for o in l.o_order {
+        if l.o_seg[o] == "__TEXT" {
+            text.push(o)
+        }
+    }
+    for o in text {
+        let al = 1.shl(l.o_p2[o])
+        off = rd.align_up(off, al)
+        l.o_addr[o] = off
+        off += l.o_size[o]
+        if l.o_p2[o] > maxp2 {
+            maxp2 = l.o_p2[o]
+        }
+    }
+    let total = off
+    let big = 1.shl(maxp2)
+    var seg_end = rd.align_up(header_size + 32 + total, PAGE)
+    var start = (seg_end - total) / big * big
+    while start < header_size + 32 {
+        seg_end += PAGE
+        start = (seg_end - total) / big * big
+    }
+    for o in text {
+        l.o_addr[o] = BASE + start + l.o_addr[o]
+        l.o_off[o] = l.o_addr[o] - BASE
+    }
+    l.seg_text_size = seg_end
+    // __DATA_CONST, then __DATA: forwards from a page boundary each.
+    var addr = BASE + seg_end
+    var fileoff = seg_end
+    for seg in ["__DATA_CONST", "__DATA"] {
+        let seg_start = addr
+        var any = false
+        var file_end = addr
+        for o in l.o_order {
+            if l.o_seg[o] != seg {
+                continue
+            }
+            any = true
+            addr = rd.align_up(addr, 1.shl(l.o_p2[o]))
+            l.o_addr[o] = addr
+            if is_zf(l, o) {
+                l.o_off[o] = 0
+            } else {
+                l.o_off[o] = fileoff + (addr - seg_start)
+                file_end = addr + l.o_size[o]
+            }
+            addr += l.o_size[o]
+        }
+        if any {
+            let vmsize = rd.align_up(addr - seg_start, PAGE)
+            let filesize = rd.align_up(file_end - seg_start, PAGE)
+            if seg == "__DATA_CONST" {
+                l.seg_dc = (seg_start, vmsize, fileoff, filesize)
+            } else {
+                l.seg_data = (seg_start, vmsize, fileoff, filesize)
+            }
+            addr = seg_start + vmsize
+            fileoff += filesize
+        } else {
+            if seg == "__DATA_CONST" {
+                l.seg_dc = (0, 0, 0, 0)
+            } else {
+                l.seg_data = (0, 0, 0, 0)
+            }
+        }
+    }
+    // Other segments are not produced by the inputs this linker takes.
+    l.seg_linkedit_addr = addr
+    // Atoms: absolute addresses.
+    for o in l.o_order {
+        if l.o_kind[o] == K_ATOMS {
+            for a in l.o_atoms[o] {
+                l.a_addr[a] = l.o_addr[o] + l.a_addr[a]
+            }
+        }
+    }
+    fileoff
+}
+
+pub fn is_zf(l: Ld, o: i64) -> bool {
+    atoms.is_zerofill(l.o_flags[o])
+}

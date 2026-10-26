@@ -296,6 +296,13 @@ fn text_size(image: bytes) -> i64 ! CodesigError {
 /// The image with its signature written as ld writes it, for a thin
 /// 64-bit image whose LC_CODE_SIGNATURE space is already laid out.
 pub fn linker_sign(image: bytes, identifier: str) -> bytes ! CodesigError {
+    return try linker_sign_limit(image, identifier, try text_size(image))
+}
+
+/// `linker_sign` with the executable segment limit given: `strip`, which
+/// re-signs what it strips in the same linker-signed form, writes the size
+/// of the whole `__TEXT` segment there where ld-prime writes `__text`'s.
+pub fn linker_sign_limit(image: bytes, identifier: str, exec_limit: i64) -> bytes ! CodesigError {
     let (off, size) = try location(image, 0)
     let h = machoread.header(image, 0) ?? fail(CsMalformed("not a Mach-O image"))
     let ident = identifier.to_bytes().to_list()
@@ -304,7 +311,7 @@ pub fn linker_sign(image: bytes, identifier: str) -> bytes ! CodesigError {
     let cd_len = hash_off + 32 * pages
     var cd = put(put(put(put(put(put(put(put(put([], 4208856066, 4), cd_len, 4), 132096, 4), 131074, 4), hash_off, 4), 88, 4), 0, 4), pages, 4), off, 4)
     cd = put(put(put(put(put(put(put(put(cd, 32, 1), 2, 1), 0, 1), 12, 1), 0, 4), 0, 4), 0, 4), 0, 4)
-    cd = put(put(put(put(cd, 0, 8), 0, 8), try text_size(image), 8), if h.file_type == 2 { 1 } else { 0 }, 8)
+    cd = put(put(put(put(cd, 0, 8), 0, 8), exec_limit, 8), if h.file_type == 2 { 1 } else { 0 }, 8)
     for b in ident {
         cd.push(b)
     }

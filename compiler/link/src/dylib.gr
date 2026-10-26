@@ -1,0 +1,302 @@
+// Dynamic libraries a program links against: what each is called at run
+// time (its install name and versions, for LC_LOAD_DYLIB) and which symbols
+// it exports, so an undefined symbol can be bound to the library that has it
+// (two-level namespace: every import names its library's ordinal).
+//
+// Two forms are read. A text-based stub (`.tbd`, TAPI version 4, the YAML
+// the SDK ships for every system library): its documents name a library
+// each, the first the one asked for and the rest the libraries it
+// re-exports, and only entries whose targets include `arm64-macos` count.
+// And a Mach-O dylib (thin, or the arm64 slice of a fat file): LC_ID_DYLIB
+// and the export trie.
+//
+// A symbol a library re-exports from another (libSystem re-exports
+// libsystem_c, libsystem_malloc and the rest) binds to the library on the
+// command line, which is how `dyld_info` shows `libSystem/_malloc`.
+import rd
+import state
+import exporttrie
+
+/// "1351" or "1800.85" or "1.2.3" as the packed x.y.z of a load command.
+pub fn parse_version(s: str) -> i64 {
+    let parts = s.trim().split(".")
+    var v = 0
+    var shift = 16
+    for k in 0..parts.len() {
+        if k > 2 {
+            break
+        }
+        let n = parts[k].parse_int() ?? 0
+        v = v.bit_or(n.shl(shift))
+        shift -= 8
+    }
+    v
+}
+
+type TbdDoc = {
+    install: str,
+    cur: i64,
+    compat: i64,
+    reexported: [str],
+    syms: [str],
+    weak: [str],
+    tlv: [str],
+}
+
+fn unquote(s: str) -> str {
+    let t = s.trim()
+    if t.len() >= 2 and ((t.starts_with("'") and t.ends_with("'")) or (t.starts_with("\"") and t.ends_with("\""))) {
+        return t.substr(1, t.len() - 2)
+    }
+    t
+}
+
+/// The items of a flow sequence `[ a, 'b', c ]`.
+fn flow_items(text: str) -> [str] {
+    var t = text.trim()
+    if t.starts_with("[") {
+        t = t.substr(1, t.len() - 1)
+    }
+    if t.ends_with("]") {
+        t = t.substr(0, t.len() - 1)
+    }
+    var out: [str] = []
+    for part in t.split(",") {
+        let u = unquote(part)
+        if u != "" {
+            out.push(u)
+        }
+    }
+    out
+}
+
+/// Reads the documents of a TAPI v4 text stub.
+fn parse_tbd(path: str, text: str) -> [TbdDoc] ! str {
+    let lines = text.lines()
+    var docs: [TbdDoc] = []
+    var cur = TbdDoc{ install: "", cur: 0x10000, compat: 0x10000, reexported: [], syms: [], weak: [], tlv: [] }
+    var in_doc = false
+    var top = ""
+    var item_ok = false
+    var i = 0
+    while i < lines.len() {
+        var line = lines[i]
+        i += 1
+        if line.starts_with("---") {
+            if in_doc {
+                docs.push(cur)
+            }
+            if not line.contains("!tapi-tbd") or line.contains("!tapi-tbd-v") {
+                fail("{path}: only TAPI version 4 text stubs are read; this one starts '{line}'")
+            }
+            cur = TbdDoc{ install: "", cur: 0x10000, compat: 0x10000, reexported: [], syms: [], weak: [], tlv: [] }
+            in_doc = true
+            top = ""
+            continue
+        }
+        if line.starts_with("...") {
+            if in_doc {
+                docs.push(cur)
+            }
+            in_doc = false
+            continue
+        }
+        if line.trim() == "" or line.trim().starts_with("#") {
+            continue
+        }
+        // A key and its value; a flow sequence may continue on later lines.
+        let colon = match line.index_of(":") {
+            Some(c) -> c
+            None -> -1
+        }
+        if colon < 0 {
+            continue
+        }
+        let indent = line.len() - line.trim_start().len()
+        var key = line.substr(0, colon).trim()
+        if key.starts_with("- ") {
+            key = key.substr(2, key.len() - 2).trim()
+        }
+        var value = line.substr(colon + 1, line.len() - colon - 1).trim()
+        if value.starts_with("[") {
+            while not value.contains("]") and i < lines.len() {
+                value = value + " " + lines[i].trim()
+                i += 1
+            }
+        }
+        if indent == 0 {
+            top = key
+            if key == "install-name" {
+                cur.install = unquote(value)
+            } else if key == "current-version" {
+                cur.cur = parse_version(unquote(value))
+            } else if key == "compatibility-version" {
+                cur.compat = parse_version(unquote(value))
+            }
+            continue
+        }
+        if key == "targets" {
+            item_ok = flow_items(value).contains("arm64-macos")
+            continue
+        }
+        if not item_ok {
+            continue
+        }
+        if top == "reexported-libraries" and key == "libraries" {
+            for x in flow_items(value) {
+                cur.reexported.push(x)
+            }
+        } else if top == "exports" or top == "reexports" {
+            if key == "symbols" {
+                for x in flow_items(value) {
+                    cur.syms.push(x)
+                }
+            } else if key == "weak-symbols" {
+                for x in flow_items(value) {
+                    cur.syms.push(x)
+                    cur.weak.push(x)
+                }
+            } else if key == "thread-local-symbols" {
+                for x in flow_items(value) {
+                    cur.syms.push(x)
+                    cur.tlv.push(x)
+                }
+            } else if key == "objc-classes" {
+                for x in flow_items(value) {
+                    cur.syms.push("_OBJC_CLASS_$_" + x)
+                    cur.syms.push("_OBJC_METACLASS_$_" + x)
+                }
+            } else if key == "objc-eh-types" {
+                for x in flow_items(value) {
+                    cur.syms.push("_OBJC_EHTYPE_$_" + x)
+                }
+            } else if key == "objc-ivars" {
+                for x in flow_items(value) {
+                    cur.syms.push("_OBJC_IVAR_$_" + x)
+                }
+            }
+        }
+    }
+    if in_doc {
+        docs.push(cur)
+    }
+    if docs.len() == 0 {
+        fail("{path}: no text-stub document in it")
+    }
+    docs
+}
+
+fn add_exports(inout l: Ld, di: i64, doc: TbdDoc) {
+    for s in doc.syms {
+        if not l.dy_sym.has(s) {
+            l.dy_sym.set(s, di)
+        }
+    }
+    for s in doc.weak {
+        l.dy_weak.set(s, true)
+    }
+    for s in doc.tlv {
+        l.dy_tlv.set(s, true)
+    }
+}
+
+/// Adds a library read from a `.tbd`; answers its index.
+pub fn read_tbd(inout l: Ld, path: str, text: str) -> i64 ! str {
+    let docs = try parse_tbd(path, text)
+    let main = docs[0]
+    let di = l.dl_install.len()
+    l.dl_install.push(main.install)
+    l.dl_cur.push(main.cur)
+    l.dl_compat.push(main.compat)
+    add_exports(l, di, main)
+    // The re-exported libraries, and theirs, as far as the file describes them.
+    var want: [str] = main.reexported
+    var seen: Map[str, bool] = {}
+    seen.set(main.install, true)
+    var k = 0
+    while k < want.len() {
+        let name = want[k]
+        k += 1
+        if seen.has(name) {
+            continue
+        }
+        seen.set(name, true)
+        for d in docs {
+            if d.install == name {
+                add_exports(l, di, d)
+                for x in d.reexported {
+                    want.push(x)
+                }
+            }
+        }
+    }
+    di
+}
+
+fn be32(d: bytes, at: i64) -> i64 {
+    d.at(at).shl(24).bit_or(d.at(at + 1).shl(16)).bit_or(d.at(at + 2).shl(8)).bit_or(d.at(at + 3))
+}
+
+/// Adds a Mach-O dylib; answers its index.
+pub fn read_macho(inout l: Ld, path: str, data: bytes) -> i64 ! str {
+    var at = 0
+    if data.len() >= 8 and be32(data, 0) == 0xcafebabe {
+        let n = be32(data, 4)
+        var found = -1
+        for k in 0..n {
+            let e = 8 + 20 * k
+            if be32(data, e) == 0x0100000c {
+                found = be32(data, e + 8)
+            }
+        }
+        if found < 0 {
+            fail("{path}: a universal file with no arm64 slice")
+        }
+        at = found
+    }
+    if rd.u32(data, at) != 0xfeedfacf or rd.u32(data, at + 4) != 0x0100000c {
+        fail("{path}: not an arm64 Mach-O library")
+    }
+    if rd.u32(data, at + 12) != 6 {
+        fail("{path}: not a dynamic library")
+    }
+    let ncmds = rd.u32(data, at + 16)
+    var p = at + 32
+    var install = ""
+    var cur = 0
+    var compat = 0
+    for _c in 0..ncmds {
+        let cmd = rd.u32(data, p)
+        if cmd == 0xd {
+            install = rd.cstr(data, p + rd.u32(data, p + 8))
+            cur = rd.u32(data, p + 16)
+            compat = rd.u32(data, p + 20)
+        }
+        p += rd.u32(data, p + 4)
+    }
+    if install == "" {
+        fail("{path}: a dynamic library without LC_ID_DYLIB")
+    }
+    let di = l.dl_install.len()
+    l.dl_install.push(install)
+    l.dl_cur.push(cur)
+    l.dl_compat.push(compat)
+    let entries = match exporttrie.exports(data, at) {
+        Ok(es) -> es
+        Err(_) -> []
+    }
+    for e in entries {
+        if e.flags.bit_and(8) == 0 or true {
+            if not l.dy_sym.has(e.name) {
+                l.dy_sym.set(e.name, di)
+            }
+            if e.flags.bit_and(4) != 0 {
+                l.dy_weak.set(e.name, true)
+            }
+            if e.flags.bit_and(3) == 1 {
+                l.dy_tlv.set(e.name, true)
+            }
+        }
+    }
+    di
+}

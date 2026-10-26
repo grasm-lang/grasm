@@ -1,0 +1,264 @@
+// Section contents: every live atom copied to its place, its relocations
+// applied, the stubs and GOT written, and the pointers dyld must fix
+// recorded for the chained-fixup pass.
+//
+// A GOT load of something defined in this image does not go through the
+// GOT: the `ldr` becomes an `add` of the address itself, as ld-prime does
+// (ld64's kindStoreARM64GOTLeaPageOff12). A call to a dylib goes through a
+// stub, which loads the GOT slot dyld binds.
+import rd
+import state
+import objfile
+import layout
+
+/// The pointers dyld fixes: where, and either a rebase to an image offset or
+/// a bind to an import with an addend.
+type Fixups = {
+    addr: [i64],
+    bind: [bool],
+    target: [i64],
+    addend: [i64],
+}
+
+fn fail_at(l: Ld, a: i64, r: i64, why: str) -> str {
+    let si = l.a_sec[a]
+    let who = if l.a_sym[a] >= 0 { l.y_name[l.a_sym[a]] } else { l.s_seg[si] + "," + l.s_name[si] }
+    "{l.f_path[l.s_file[si]]}: {objfile.reloc_name(l.r_type[r])} at {who}+{rd.hex(l.r_off[r] - l.a_off[a])}: {why}"
+}
+
+/// The address a relocation's target has: an atom, the header, or (for a
+/// call) the import's stub.
+fn target_addr(l: Ld, r: i64) -> i64 {
+    let k = l.r_tkind[r]
+    if k == state.T_ATOM {
+        return l.a_addr[l.a_canon[l.r_tatom[r]]] + l.r_toff[r]
+    }
+    if k == state.T_HEADER {
+        return layout.BASE
+    }
+    -1
+}
+
+fn got_slot_addr(l: Ld, got_o: i64, r: i64) -> i64 {
+    let g = l.r_tg[r]
+    if l.r_tkind[r] == state.T_IMPORT {
+        return l.o_addr[got_o] + 8 * l.g_got[g]
+    }
+    let slot = l.a_got.get(l.a_canon[l.r_tatom[r]]) ?? -1
+    if slot < 0 {
+        return -1
+    }
+    l.o_addr[got_o] + 8 * slot
+}
+
+fn stub_addr(l: Ld, stubs_o: i64, g: i64) -> i64 {
+    l.o_addr[stubs_o] + 12 * l.g_stub[g]
+}
+
+fn page(x: i64) -> i64 {
+    x.shr(12)
+}
+
+fn adrp(insn: i64, delta_pages: i64) -> i64 {
+    let lo = delta_pages.bit_and(3)
+    let hi = delta_pages.shr(2).bit_and(0x7ffff)
+    insn.bit_and(0x9f00001f).bit_or(lo.shl(29)).bit_or(hi.shl(5))
+}
+
+/// A load/store or add's 12-bit immediate set to the low bits of `target`,
+/// scaled as the instruction's access size requires; "" or why not.
+fn pageoff(insn: i64, target: i64) -> (i64, str) {
+    var off = target.bit_and(0xfff)
+    if insn.bit_and(0x08000000) != 0 {
+        var shift = insn.ushr(30).bit_and(3)
+        if shift == 0 and insn.bit_and(0x04800000) == 0x04800000 {
+            shift = 4
+        }
+        let m = 1.shl(shift) - 1
+        if off.bit_and(m) != 0 {
+            return (insn, "a {8 * (m + 1)}-bit load or store of an address not aligned for it ({rd.hex(target)})")
+        }
+        off = off.ushr(shift)
+    }
+    (insn.bit_and(0xffc003ff).bit_or(off.shl(10)), "")
+}
+
+fn word(buf: bytes, at: i64) -> i64 {
+    rd.u32(buf, at)
+}
+
+/// Writes every section's contents into `buf` (the image up to `__LINKEDIT`)
+/// and answers the pointers dyld must fix.
+pub fn contents(inout l: Ld, inout buf: bytes) -> Fixups ! str {
+    var fx = Fixups{ addr: [], bind: [], target: [], addend: [] }
+    var stubs_o = -1
+    var got_o = -1
+    for o in l.o_order {
+        if l.o_kind[o] == layout.K_STUBS {
+            stubs_o = o
+        } else if l.o_kind[o] == layout.K_GOT {
+            got_o = o
+        }
+    }
+    for o in l.o_order {
+        if l.o_kind[o] != layout.K_ATOMS or layout.is_zf(l, o) {
+            continue
+        }
+        let writable = l.o_seg[o] != "__TEXT"
+        for a in l.o_atoms[o] {
+            let si = l.a_sec[a]
+            let d = l.f_data[l.s_file[si]]
+            let src = l.s_off[si] + l.a_off[a]
+            let dst = l.o_off[o] + (l.a_addr[a] - l.o_addr[o])
+            buf.copy_from(dst, d.slice(src, src + l.a_size[a]))
+            for r in l.a_rel0[a]..(l.a_rel0[a] + l.a_nrel[a]) {
+                let t = l.r_type[r]
+                let field = l.r_off[r] - l.a_off[a]
+                let at = dst + field
+                let pc = l.a_addr[a] + field
+                let k = l.r_tkind[r]
+                if k == state.T_NONE {
+                    fail(fail_at(l, a, r, "undefined symbol {if l.r_tg[r] >= 0 { l.g_name[l.r_tg[r]] } else { "?" }}"))
+                }
+                if t == objfile.R_BRANCH26 {
+                    let target = if k == state.T_IMPORT { stub_addr(l, stubs_o, l.r_tg[r]) + l.r_addend[r] } else { target_addr(l, r) + l.r_addend[r] }
+                    let delta = target - pc
+                    if delta < -134217728 or delta >= 134217728 {
+                        fail(fail_at(l, a, r, "the branch target is out of range ({rd.hex(delta)})"))
+                    }
+                    rd.put32(buf, at, word(buf, at).bit_and(0xfc000000).bit_or(delta.shr(2).bit_and(0x3ffffff)))
+                } else if t == objfile.R_PAGE21 or t == objfile.R_PAGEOFF12 {
+                    if k == state.T_IMPORT {
+                        fail(fail_at(l, a, r, "a direct reference to {l.g_name[l.r_tg[r]]}, which is in a dylib"))
+                    }
+                    let target = target_addr(l, r) + l.r_addend[r]
+                    if t == objfile.R_PAGE21 {
+                        rd.put32(buf, at, adrp(word(buf, at), page(target) - page(pc)))
+                    } else {
+                        let (w, why) = pageoff(word(buf, at), target)
+                        if why != "" {
+                            fail(fail_at(l, a, r, why))
+                        }
+                        rd.put32(buf, at, w)
+                    }
+                } else if t == objfile.R_GOT_PAGE21 or t == objfile.R_GOT_PAGEOFF12 {
+                    let via_got = k == state.T_IMPORT
+                    let target = if via_got { got_slot_addr(l, got_o, r) } else { target_addr(l, r) + l.r_addend[r] }
+                    if t == objfile.R_GOT_PAGE21 {
+                        rd.put32(buf, at, adrp(word(buf, at), page(target) - page(pc)))
+                    } else {
+                        let insn = word(buf, at)
+                        if via_got {
+                            let (w, why) = pageoff(insn, target)
+                            if why != "" {
+                                fail(fail_at(l, a, r, why))
+                            }
+                            rd.put32(buf, at, w)
+                        } else {
+                            // ldr xD, [xN, #got] -> add xD, xN, #target
+                            if insn.bit_and(0xffc00000) != 0xf9400000 {
+                                fail(fail_at(l, a, r, "a GOT load that is not a 64-bit ldr ({rd.hex(insn)})"))
+                            }
+                            rd.put32(buf, at, 0x91000000.bit_or(target.bit_and(0xfff).shl(10)).bit_or(insn.bit_and(0x3ff)))
+                        }
+                    }
+                } else if t == objfile.R_UNSIGNED {
+                    let c = if l.r_len[r] == 3 { rd.u64(d, src + field) } else { rd.s32(d, src + field) }
+                    if l.r_satom[r] >= 0 {
+                        let s = l.a_addr[l.a_canon[l.r_satom[r]]] + l.r_soff[r]
+                        // `c` already holds the target's own addend; the
+                        // input places of both ends are what it was computed from.
+                        let v = target_addr(l, r) - s + (c - pair_input_delta(l, r))
+                        if l.r_len[r] == 3 {
+                            rd.put64(buf, at, v)
+                        } else {
+                            rd.put32(buf, at, v)
+                        }
+                        continue
+                    }
+                    if l.r_len[r] != 3 {
+                        fail(fail_at(l, a, r, "a 32-bit absolute address, which a position-independent image cannot hold"))
+                    }
+                    if not writable {
+                        fail(fail_at(l, a, r, "an absolute address in {l.o_seg[o]},{l.o_name[o]}, which dyld cannot write"))
+                    }
+                    if pc % 4 != 0 {
+                        fail(fail_at(l, a, r, "a pointer that is not 4-byte aligned"))
+                    }
+                    let addend = if l.r_sym[r] >= 0 { c } else { 0 }
+                    if k == state.T_IMPORT {
+                        fx.addr.push(pc)
+                        fx.bind.push(true)
+                        fx.target.push(l.g_import[l.r_tg[r]])
+                        fx.addend.push(addend)
+                    } else {
+                        let v = target_addr(l, r) + addend
+                        fx.addr.push(pc)
+                        fx.bind.push(false)
+                        fx.target.push(v - layout.BASE)
+                        fx.addend.push(0)
+                        rd.put64(buf, at, v)
+                    }
+                } else if t == objfile.R_POINTER_TO_GOT {
+                    let slot = got_slot_addr(l, got_o, r)
+                    if slot < 0 {
+                        fail(fail_at(l, a, r, "no GOT slot for its target"))
+                    }
+                    if l.r_pcrel[r] {
+                        rd.put32(buf, at, slot - pc)
+                    } else {
+                        fail(fail_at(l, a, r, "an absolute POINTER_TO_GOT"))
+                    }
+                } else {
+                    fail(fail_at(l, a, r, "this relocation type is not supported"))
+                }
+            }
+        }
+    }
+    // The stubs: adrp x16, slot@PAGE; ldr x16, [x16, slot@PAGEOFF]; br x16.
+    if stubs_o >= 0 {
+        for i in 0..l.stub_g.len() {
+            let g = l.stub_g[i]
+            let pc = l.o_addr[stubs_o] + 12 * i
+            let slot = l.o_addr[got_o] + 8 * l.g_got[g]
+            let at = l.o_off[stubs_o] + 12 * i
+            rd.put32(buf, at, adrp(0x90000010, page(slot) - page(pc)))
+            rd.put32(buf, at + 4, 0xf9400210.bit_or(slot.bit_and(0xfff).ushr(3).shl(10)))
+            rd.put32(buf, at + 8, 0xd61f0200)
+        }
+    }
+    // The GOT: a bind for each import, a rebase for each local target.
+    if got_o >= 0 {
+        for i in 0..l.got_name.len() {
+            let addr = l.o_addr[got_o] + 8 * i
+            if l.got_g[i] >= 0 {
+                fx.addr.push(addr)
+                fx.bind.push(true)
+                fx.target.push(l.g_import[l.got_g[i]])
+                fx.addend.push(0)
+            } else {
+                let v = l.a_addr[l.a_canon[l.got_atom[i]]]
+                fx.addr.push(addr)
+                fx.bind.push(false)
+                fx.target.push(v - layout.BASE)
+                fx.addend.push(0)
+                rd.put64(buf, l.o_off[got_o] + 8 * i, v)
+            }
+        }
+    }
+    fx
+}
+
+/// For a SUBTRACTOR pair, what the stored addend was computed against: the
+/// input addresses of the two ends (target - subtrahend).
+fn pair_input_delta(l: Ld, r: i64) -> i64 {
+    let ta = l.r_tatom[r]
+    let sa = l.r_satom[r]
+    let t_in = l.s_addr[l.a_sec[ta]] + l.a_off[ta] + l.r_toff[r]
+    let s_in = l.s_addr[l.a_sec[sa]] + l.a_off[sa] + l.r_soff[r]
+    // An extern pair's stored value is the addend alone; nothing to remove.
+    if l.r_sym[r] >= 0 and l.r_subsym[r] >= 0 {
+        return 0
+    }
+    t_in - s_in
+}

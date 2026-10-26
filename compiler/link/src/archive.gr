@@ -1,0 +1,85 @@
+// Static archives (`ar`): the BSD layout macOS writes, with `#1/<len>`
+// long names (the name is the first <len> bytes of the member's data) and a
+// table of contents, `__.SYMDEF` or `__.SYMDEF SORTED` (32-bit offsets) or
+// `__.SYMDEF_64`, mapping each defined global to its member's header.
+//
+// A member is loaded when a symbol still undefined is in the table of
+// contents, as ld does. Its place in the output is the archive's place on the
+// command line and then the member's index in the archive, whatever order the
+// members were pulled in, so the layout does not depend on resolution order.
+import rd
+import state
+
+fn header_size(d: bytes, at: i64) -> i64 ! str {
+    if at + 60 > d.len() {
+        fail("a member header past the end")
+    }
+    let text = d.slice(at + 48, at + 58).to_str().trim()
+    text.parse_int() ?? fail("a member size that is not a number: '{text}'")
+}
+
+/// The member at header offset `at`: (name, data start, data end).
+pub fn member(d: bytes, at: i64) -> (str, i64, i64) ! str {
+    let size = try header_size(d, at)
+    let raw = d.slice(at, at + 16).to_str().trim()
+    let start = at + 60
+    if raw.starts_with("#1/") {
+        let n = raw.substr(3, raw.len() - 3).parse_int() ?? fail("a bad long name '{raw}'")
+        let name = rd.cstr(d.slice(start, start + n), 0)
+        return (name, start + n, start + size)
+    }
+    let name = if raw.ends_with("/") { raw.substr(0, raw.len() - 1) } else { raw }
+    (name, start, start + size)
+}
+
+/// Reads the archive's members and table of contents into the linker.
+pub fn read(inout l: Ld, path: str, d: bytes, pos: i64) -> () ! str {
+    if d.len() < 8 or d.slice(0, 8).to_str() != "!<arch>\n" {
+        fail("{path}: not an archive")
+    }
+    var index: Map[i64, i64] = {}
+    var toc: Map[str, i64] = {}
+    var at = 8
+    var k = 0
+    var saw_toc = false
+    while at + 60 <= d.len() {
+        let (name, start, end) = match member(d, at) {
+            Ok(m) -> m
+            Err(e) -> fail("{path}: {e}")
+        }
+        if end > d.len() {
+            fail("{path}: member {name} runs past the end")
+        }
+        if name.starts_with("__.SYMDEF") {
+            saw_toc = true
+            let wide = name.starts_with("__.SYMDEF_64")
+            let body = d.slice(start, end)
+            let esz = if wide { 16 } else { 8 }
+            let rsize = if wide { rd.u64(body, 0) } else { rd.u32(body, 0) }
+            let first = if wide { 8 } else { 4 }
+            let n = rsize / esz
+            let sbase = first + rsize + (if wide { 8 } else { 4 })
+            for i in 0..n {
+                let e = first + esz * i
+                let strx = if wide { rd.u64(body, e) } else { rd.u32(body, e) }
+                let off = if wide { rd.u64(body, e + 8) } else { rd.u32(body, e + 4) }
+                let sym = rd.cstr(body, sbase + strx)
+                if not toc.has(sym) {
+                    toc.set(sym, off)
+                }
+            }
+        } else {
+            index.set(at, k)
+            k += 1
+        }
+        at = end + (end % 2)
+    }
+    if not saw_toc {
+        fail("{path}: the archive has no table of contents (run ranlib)")
+    }
+    l.ar_path.push(path)
+    l.ar_data.push(d)
+    l.ar_pos.push(pos)
+    l.ar_toc.push(toc)
+    l.ar_index.push(index)
+}

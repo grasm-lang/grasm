@@ -1,0 +1,514 @@
+// Atoms: the pieces ld moves and drops independently.
+//
+// In an object marked MH_SUBSECTIONS_VIA_SYMBOLS a section is cut at every
+// symbol's address (an N_ALT_ENTRY symbol stays inside the atom before it),
+// and at its start if no symbol is there. Without the flag a section is one
+// atom. A C-string section is cut after every NUL and a literal section into
+// its fixed-size pieces, and those are merged by content across the link: a
+// reference to any copy is a reference to the first, by layout order. An
+// `__eh_frame` is cut into its CIEs and FDEs.
+//
+// An atom keeps its offset modulo its section's alignment wherever it goes,
+// as ld64 does (`Section::alignmentForAddress`).
+import rd
+import state
+import objfile
+
+/// Cuts every section of file `fi` into atoms.
+pub fn atomize(inout l: Ld, fi: i64) -> () ! str {
+    let d = l.f_data[fi]
+    let sec0 = l.f_sec0[fi]
+    let y0 = l.f_sym0[fi]
+    let ny = l.f_nsym[fi]
+    // The symbols of each section, by address.
+    var by_sec: [[i64]] = []
+    for _k in 0..l.f_nsec[fi] {
+        by_sec.push([])
+    }
+    for y in y0..(y0 + ny) {
+        let s = l.y_sect[y]
+        if s >= 0 {
+            by_sec[s - sec0].push(y)
+        }
+    }
+    for k in 0..l.f_nsec[fi] {
+        let si = sec0 + k
+        let role = l.s_role[si]
+        l.s_atom0[si] = l.a_sec.len()
+        if role == state.ROLE_DROP or role == state.ROLE_CUNWIND {
+            continue
+        }
+        let size = l.s_size[si]
+        let addr = l.s_addr[si]
+        let zerofill = is_zerofill(l.s_flags[si])
+        var cuts: [i64] = []
+        if role == state.ROLE_CSTRING {
+            let off = l.s_off[si]
+            var start = 0
+            var p = 0
+            while p < size {
+                if d.at(off + p) == 0 {
+                    cuts.push(start)
+                    start = p + 1
+                }
+                p += 1
+            }
+            if start < size {
+                cuts.push(start)
+            }
+        } else if role == state.ROLE_LITERAL {
+            let ty = l.s_flags[si].bit_and(255)
+            let w = if ty == 3 { 4 } else if ty == 4 { 8 } else { 16 }
+            if size % w != 0 {
+                fail("{l.f_path[fi]}: {l.s_seg[si]},{l.s_name[si]} is not a whole number of {w}-byte literals")
+            }
+            var p = 0
+            while p < size {
+                cuts.push(p)
+                p += w
+            }
+        } else if role == state.ROLE_EHFRAME {
+            let off = l.s_off[si]
+            var p = 0
+            while p + 4 <= size {
+                cuts.push(p)
+                let len = rd.u32(d, off + p)
+                if len == 0xffffffff {
+                    fail("{l.f_path[fi]}: a 64-bit eh_frame record")
+                }
+                if len == 0 {
+                    break
+                }
+                p += 4 + len
+            }
+        } else {
+            cuts.push(0)
+            if l.f_subsec[fi] {
+                for y in by_sec[k] {
+                    if l.y_desc[y].bit_and(0x200) != 0 {
+                        continue
+                    }
+                    let o = l.y_value[y] - addr
+                    if o > 0 and o < size {
+                        cuts.push(o)
+                    }
+                }
+            }
+        }
+        cuts.sort()
+        var uniq: [i64] = []
+        for c in cuts {
+            if uniq.len() == 0 or uniq[uniq.len() - 1] != c {
+                uniq.push(c)
+            }
+        }
+        if size == 0 {
+            uniq = []
+        }
+        var p2 = l.s_p2[si]
+        if role == state.ROLE_LITERAL {
+            // A literal is aligned to its size, whatever its section says.
+            let ty = l.s_flags[si].bit_and(255)
+            let natural = if ty == 3 { 2 } else if ty == 4 { 3 } else { 4 }
+            if natural > p2 {
+                p2 = natural
+            }
+        }
+        let m = 1.shl(p2)
+        for i in 0..uniq.len() {
+            let o = uniq[i]
+            let end = if i + 1 < uniq.len() { uniq[i + 1] } else { size }
+            l.a_sec.push(si)
+            l.a_off.push(o)
+            l.a_size.push(end - o)
+            l.a_p2.push(p2)
+            l.a_mod.push(if role == state.ROLE_LITERAL { 0 } else { (addr + o) % m })
+            l.a_live.push(false)
+            l.a_addr.push(0)
+            l.a_sym.push(-1)
+            l.a_canon.push(l.a_sec.len() - 1)
+            l.a_rel0.push(0)
+            l.a_nrel.push(0)
+            l.a_cu.push(-1)
+            l.a_fde.push(-1)
+            l.a_cold.push(false)
+            l.a_named.push(false)
+        }
+        l.s_natom[si] = uniq.len()
+        // Each symbol into the atom that holds it; the atom's name is the
+        // first non-local, else the first, symbol at its start.
+        let a0 = l.s_atom0[si]
+        let na = uniq.len()
+        for y in by_sec[k] {
+            let o = l.y_value[y] - addr
+            let a = find_atom(l, a0, na, o)
+            if a < 0 {
+                continue
+            }
+            l.y_atom[y] = a
+            if l.a_off[a] == o {
+                let cur = l.a_sym[a]
+                if cur < 0 or (l.y_type[cur].bit_and(1) == 0 and l.y_type[y].bit_and(1) != 0) {
+                    l.a_sym[a] = y
+                }
+                if l.y_desc[y].bit_and(0x400) != 0 {
+                    l.a_cold[a] = true
+                }
+                let nm = l.y_name[y]
+                if not (nm.starts_with("l") or nm.starts_with("L")) {
+                    l.a_named[a] = true
+                }
+            }
+        }
+        // Each relocation into the atom that holds it.
+        let r0 = l.s_rel0[si]
+        let nr = l.s_nrel[si]
+        var j = 0
+        for a in a0..(a0 + na) {
+            let lo = l.a_off[a]
+            let hi = lo + l.a_size[a]
+            while j < nr and l.r_off[r0 + j] < lo {
+                j += 1
+            }
+            l.a_rel0[a] = r0 + j
+            var c = 0
+            while j < nr and l.r_off[r0 + j] < hi {
+                l.r_atom[r0 + j] = a
+                j += 1
+                c += 1
+            }
+            l.a_nrel[a] = c
+        }
+        if zerofill and nr > 0 {
+            fail("{l.f_path[fi]}: relocations in zero-fill section {l.s_name[si]}")
+        }
+    }
+}
+
+pub fn is_zerofill(flags: i64) -> bool {
+    let ty = flags.bit_and(255)
+    ty == 1 or ty == 0x0c or ty == 0x12
+}
+
+/// The atom of a section (atoms `a0`..`a0+na`) holding offset `o`; an offset
+/// at the very end belongs to the last atom.
+pub fn find_atom(l: Ld, a0: i64, na: i64, o: i64) -> i64 {
+    if na == 0 {
+        return -1
+    }
+    var lo = 0
+    var hi = na - 1
+    while lo < hi {
+        let mid = (lo + hi + 1) / 2
+        if l.a_off[a0 + mid] <= o {
+            lo = mid
+        } else {
+            hi = mid - 1
+        }
+    }
+    let a = a0 + lo
+    if o < l.a_off[a] {
+        return -1
+    }
+    a
+}
+
+/// The atom and offset at input address `addr` of section `si`.
+pub fn at_address(l: Ld, si: i64, addr: i64) -> (i64, i64) {
+    let o = addr - l.s_addr[si]
+    let a = find_atom(l, l.s_atom0[si], l.s_natom[si], o)
+    if a < 0 {
+        return (-1, 0)
+    }
+    (a, o - l.a_off[a])
+}
+
+/// The value stored at a relocation's place in the input, `len` 2 or 3.
+pub fn content(l: Ld, r: i64) -> i64 {
+    let si = l.r_sec[r]
+    let d = l.f_data[l.s_file[si]]
+    let at = l.s_off[si] + l.r_off[r]
+    if l.r_len[r] == 3 { rd.u64(d, at) } else if l.r_len[r] == 2 { rd.s32(d, at) } else { 0 }
+}
+
+/// Where input symbol `y` resolves to: (T_* kind, atom, offset, global).
+pub fn sym_target(l: Ld, y: i64) -> (i64, i64, i64, i64) {
+    let g = l.y_g[y]
+    if g >= 0 {
+        let k = l.g_kind[g]
+        if k == state.G_DEFINED {
+            let def = l.g_def[g]
+            let a = l.y_atom[def]
+            return (state.T_ATOM, a, l.y_value[def] - l.s_addr[l.y_sect[def]] - l.a_off[a], g)
+        }
+        if k == state.G_DYLIB {
+            return (state.T_IMPORT, -1, 0, g)
+        }
+        if k == state.G_SYNTH {
+            return (state.T_HEADER, -1, 0, g)
+        }
+        return (state.T_NONE, -1, 0, g)
+    }
+    let a = l.y_atom[y]
+    if a < 0 {
+        return (state.T_NONE, -1, 0, -1)
+    }
+    (state.T_ATOM, a, l.y_value[y] - l.s_addr[l.y_sect[y]] - l.a_off[a], -1)
+}
+
+/// Resolves the targets of every relocation of file `fi`.
+pub fn resolve_relocs(inout l: Ld, fi: i64) -> () ! str {
+    let sec0 = l.f_sec0[fi]
+    for si in sec0..(sec0 + l.f_nsec[fi]) {
+        let r0 = l.s_rel0[si]
+        for r in r0..(r0 + l.s_nrel[si]) {
+            let t = l.r_type[r]
+            let y = l.r_sym[r]
+            if y >= 0 {
+                let (k, a, o, g) = sym_target(l, y)
+                l.r_tkind[r] = k
+                l.r_tatom[r] = a
+                l.r_toff[r] = o
+                l.r_tg[r] = g
+            } else {
+                // Section-relative: an absolute pointer's place holds the
+                // target's input address; elsewhere the target is the
+                // section's own address plus nothing we can read, which
+                // arm64 objects never ask for.
+                let ts = l.r_tsec[r]
+                if t != objfile.R_UNSIGNED {
+                    fail("{l.f_path[fi]}: a section-relative {objfile.reloc_name(t)} relocation in {l.s_seg[si]},{l.s_name[si]}")
+                }
+                let (a, o) = at_address(l, ts, content(l, r))
+                if a < 0 {
+                    fail("{l.f_path[fi]}: a pointer to {rd.hex(content(l, r))}, outside {l.s_seg[ts]},{l.s_name[ts]}")
+                }
+                l.r_tkind[r] = state.T_ATOM
+                l.r_tatom[r] = a
+                l.r_toff[r] = o
+            }
+            if l.r_subsym[r] >= 0 {
+                let (k, a, o, _g) = sym_target(l, l.r_subsym[r])
+                if k != state.T_ATOM {
+                    fail("{l.f_path[fi]}: a SUBTRACTOR from {l.y_name[l.r_subsym[r]]}, which is not defined in this link")
+                }
+                l.r_satom[r] = a
+                l.r_soff[r] = o
+            } else if l.r_subsec[r] >= 0 {
+                fail("{l.f_path[fi]}: a section-relative SUBTRACTOR in {l.s_seg[si]},{l.s_name[si]}")
+            }
+        }
+    }
+}
+
+/// Reads file `fi`'s compact unwind entries and binds each to its function.
+pub fn read_compact_unwind(inout l: Ld, fi: i64) -> () ! str {
+    let d = l.f_data[fi]
+    let sec0 = l.f_sec0[fi]
+    for si in sec0..(sec0 + l.f_nsec[fi]) {
+        if l.s_role[si] != state.ROLE_CUNWIND {
+            continue
+        }
+        let n = l.s_size[si] / 32
+        let r0 = l.s_rel0[si]
+        let nr = l.s_nrel[si]
+        var j = 0
+        for e in 0..n {
+            let base = 32 * e
+            var func = -1
+            var func_off = 0
+            var pers_g = -1
+            var pers_atom = -1
+            var lsda = -1
+            var lsda_off = 0
+            while j < nr and l.r_off[r0 + j] < base + 32 {
+                let r = r0 + j
+                j += 1
+                let field = l.r_off[r] - base
+                let y = l.r_sym[r]
+                var a = -1
+                var o = 0
+                var g = -1
+                if y >= 0 {
+                    let (k, ta, to, tg) = sym_target(l, y)
+                    a = ta
+                    o = to + content(l, r)
+                    g = if k == state.T_IMPORT { tg } else { -1 }
+                } else {
+                    let (ta, to) = at_address(l, l.r_tsec[r], content(l, r))
+                    a = ta
+                    o = to
+                }
+                if field == 0 {
+                    func = a
+                    func_off = o
+                } else if field == 16 {
+                    pers_g = g
+                    pers_atom = if g < 0 { a } else { -1 }
+                    if g < 0 and y >= 0 and l.y_g[y] >= 0 {
+                        pers_g = l.y_g[y]
+                    }
+                } else if field == 24 {
+                    lsda = a
+                    lsda_off = o
+                }
+            }
+            if func < 0 {
+                fail("{l.f_path[fi]}: compact unwind entry {e} names no function")
+            }
+            let ci = l.cu_atom.len()
+            l.cu_atom.push(func)
+            l.cu_len.push(rd.u32(d, l.s_off[si] + base + 8))
+            l.cu_enc.push(rd.u32(d, l.s_off[si] + base + 12))
+            l.cu_pers_g.push(pers_g)
+            l.cu_pers_atom.push(pers_atom)
+            l.cu_lsda.push(lsda)
+            l.cu_lsda_off.push(lsda_off)
+            if func_off == 0 and l.a_cu[func] < 0 {
+                l.a_cu[func] = ci
+            }
+        }
+    }
+}
+
+/// Reads file `fi`'s eh_frame records: which function each FDE describes,
+/// its CIE and LSDA, and each CIE's personality.
+pub fn read_eh_frame(inout l: Ld, fi: i64) -> () ! str {
+    let d = l.f_data[fi]
+    let sec0 = l.f_sec0[fi]
+    for si in sec0..(sec0 + l.f_nsec[fi]) {
+        if l.s_role[si] != state.ROLE_EHFRAME {
+            continue
+        }
+        let a0 = l.s_atom0[si]
+        let na = l.s_natom[si]
+        let base_eh = l.eh_atom.len()
+        // First every record, so an FDE can name its CIE by index.
+        for a in a0..(a0 + na) {
+            let off = l.s_off[si] + l.a_off[a]
+            let id = rd.u32(d, off + 4)
+            l.eh_atom.push(a)
+            l.eh_cie.push(id == 0)
+            l.eh_of.push(-1)
+            l.eh_func.push(-1)
+            l.eh_lsda.push(-1)
+            l.eh_pers_g.push(-1)
+            l.eh_pers_atom.push(-1)
+        }
+        for i in 0..na {
+            let a = a0 + i
+            let e = base_eh + i
+            let off = l.s_off[si] + l.a_off[a]
+            if l.eh_cie[e] {
+                // The personality is the one pointer a CIE carries.
+                for r in l.a_rel0[a]..(l.a_rel0[a] + l.a_nrel[a]) {
+                    if l.r_type[r] == objfile.R_POINTER_TO_GOT or l.r_type[r] == objfile.R_UNSIGNED {
+                        l.eh_pers_g[e] = l.r_tg[r]
+                        l.eh_pers_atom[e] = if l.r_tkind[r] == state.T_ATOM { l.r_tatom[r] } else { -1 }
+                    }
+                }
+                continue
+            }
+            let cie_off = l.a_off[a] + 4 - rd.u32(d, off + 4)
+            let ca = find_atom(l, a0, na, cie_off)
+            if ca < 0 or l.a_off[ca] != cie_off {
+                fail("{l.f_path[fi]}: an FDE whose CIE is not a record")
+            }
+            l.eh_of[e] = base_eh + (ca - a0)
+            for r in l.a_rel0[a]..(l.a_rel0[a] + l.a_nrel[a]) {
+                let field = l.r_off[r] - l.a_off[a]
+                if field == 8 {
+                    l.eh_func[e] = l.r_tatom[r]
+                } else if field > 8 {
+                    l.eh_lsda[e] = l.r_tatom[r]
+                }
+            }
+            if l.eh_func[e] < 0 {
+                // No relocation: the field holds the function's address
+                // relative to itself.
+                let fa = l.s_addr[si] + l.a_off[a] + 8 + rd.u64(d, off + 8)
+                let text = find_text_atom(l, fi, fa)
+                l.eh_func[e] = text
+            }
+            if l.eh_func[e] >= 0 and l.a_fde[l.eh_func[e]] < 0 {
+                l.a_fde[l.eh_func[e]] = e
+            }
+        }
+    }
+}
+
+fn find_text_atom(l: Ld, fi: i64, addr: i64) -> i64 {
+    let sec0 = l.f_sec0[fi]
+    for si in sec0..(sec0 + l.f_nsec[fi]) {
+        if addr >= l.s_addr[si] and addr < l.s_addr[si] + l.s_size[si] and l.s_role[si] == state.ROLE_NORMAL {
+            let (a, o) = at_address(l, si, addr)
+            if o == 0 {
+                return a
+            }
+        }
+    }
+    -1
+}
+
+/// Merges C strings and literals by content: every copy's `a_canon` is the
+/// first copy in layout order. `files` is the files in that order.
+pub fn merge_literals(inout l: Ld, files: [i64]) {
+    var first: Map[str, i64] = {}
+    for fi in files {
+        let sec0 = l.f_sec0[fi]
+        let d = l.f_data[fi]
+        for si in sec0..(sec0 + l.f_nsec[fi]) {
+            let role = l.s_role[si]
+            if role != state.ROLE_CSTRING and role != state.ROLE_LITERAL {
+                continue
+            }
+            let kind = if role == state.ROLE_CSTRING { l.s_seg[si] + "," + l.s_name[si] } else { "{l.s_flags[si].bit_and(255)}" }
+            let a0 = l.s_atom0[si]
+            for a in a0..(a0 + l.s_natom[si]) {
+                // A literal with a name of its own keeps it: only anonymous
+                // ones (no symbol, or only an `l`/`L` local label) merge.
+                if named(l, a) {
+                    continue
+                }
+                let at = l.s_off[si] + l.a_off[a]
+                let key = kind + ":" + content_key(d.slice(at, at + l.a_size[a]))
+                match first.get(key) {
+                    Some(c) -> {
+                        l.a_canon[a] = c
+                    }
+                    None -> {
+                        first.set(key, a)
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Bytes as a map key: the text itself when it is ASCII, else hex.
+fn content_key(b: bytes) -> str {
+    var ascii = true
+    for i in 0..b.len() {
+        if b.at(i) >= 128 {
+            ascii = false
+            break
+        }
+    }
+    if ascii {
+        return "a" + b.to_str()
+    }
+    let digits = "0123456789abcdef"
+    var sb = str_builder()
+    sb.push_str("h")
+    for i in 0..b.len() {
+        let x = b.at(i)
+        sb.push_str(digits.substr(x.ushr(4), 1))
+        sb.push_str(digits.substr(x.bit_and(15), 1))
+    }
+    sb.to_str()
+}
+
+/// Whether a symbol other than an assembler-local `l`/`L` label starts in atom `a`.
+fn named(l: Ld, a: i64) -> bool {
+    l.a_named[a]
+}

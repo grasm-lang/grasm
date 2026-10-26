@@ -1,0 +1,138 @@
+// Little-endian reads from a byte string, and the writes that go with them.
+
+pub fn u8(d: bytes, at: i64) -> i64 {
+    d.at(at)
+}
+
+pub fn u16(d: bytes, at: i64) -> i64 {
+    d.at(at).bit_or(d.at(at + 1).shl(8))
+}
+
+pub fn u32(d: bytes, at: i64) -> i64 {
+    d.at(at).bit_or(d.at(at + 1).shl(8)).bit_or(d.at(at + 2).shl(16)).bit_or(d.at(at + 3).shl(24))
+}
+
+pub fn u64(d: bytes, at: i64) -> i64 {
+    u32(d, at).bit_or(u32(d, at + 4).shl(32))
+}
+
+/// A 32-bit field read as a signed number.
+pub fn s32(d: bytes, at: i64) -> i64 {
+    sext(u32(d, at), 32)
+}
+
+/// `v`'s low `bits` bits as a two's-complement number.
+pub fn sext(v: i64, bits: i64) -> i64 {
+    if bits >= 64 {
+        return v
+    }
+    let m = v.bit_and(1.shl(bits) - 1)
+    if m.bit_and(1.shl(bits - 1)) != 0 { m - 1.shl(bits) } else { m }
+}
+
+/// The NUL-terminated string at `at`.
+pub fn cstr(d: bytes, at: i64) -> str {
+    var e = at
+    let n = d.len()
+    while e < n and d.at(e) != 0 {
+        e += 1
+    }
+    d.slice(at, e).to_str()
+}
+
+/// A fixed 16-byte name field.
+pub fn name16(d: bytes, at: i64) -> str {
+    var e = at
+    while e < at + 16 and d.at(e) != 0 {
+        e += 1
+    }
+    d.slice(at, e).to_str()
+}
+
+pub fn align_up(x: i64, a: i64) -> i64 {
+    (x + a - 1) / a * a
+}
+
+// ----- writing into a fixed buffer ---------------------------------------------
+
+pub fn put8(inout b: bytes, at: i64, v: i64) {
+    b.set(at, v.bit_and(255))
+}
+
+pub fn put16(inout b: bytes, at: i64, v: i64) {
+    b.set(at, v.bit_and(255))
+    b.set(at + 1, v.ushr(8).bit_and(255))
+}
+
+pub fn put32(inout b: bytes, at: i64, v: i64) {
+    b.set(at, v.bit_and(255))
+    b.set(at + 1, v.ushr(8).bit_and(255))
+    b.set(at + 2, v.ushr(16).bit_and(255))
+    b.set(at + 3, v.ushr(24).bit_and(255))
+}
+
+pub fn put64(inout b: bytes, at: i64, v: i64) {
+    put32(b, at, v)
+    put32(b, at + 4, v.ushr(32))
+}
+
+// ----- appending to a builder ---------------------------------------------------
+
+pub fn w8(inout b: ByteBuilder, v: i64) {
+    b.push_byte(v.bit_and(255))
+}
+
+pub fn w16(inout b: ByteBuilder, v: i64) {
+    b.push_byte(v.bit_and(255))
+    b.push_byte(v.ushr(8).bit_and(255))
+}
+
+pub fn w32(inout b: ByteBuilder, v: i64) {
+    b.push_byte(v.bit_and(255))
+    b.push_byte(v.ushr(8).bit_and(255))
+    b.push_byte(v.ushr(16).bit_and(255))
+    b.push_byte(v.ushr(24).bit_and(255))
+}
+
+pub fn w64(inout b: ByteBuilder, v: i64) {
+    w32(b, v)
+    w32(b, v.ushr(32))
+}
+
+/// A 16-byte name field, NUL-padded.
+pub fn wname(inout b: ByteBuilder, s: str) {
+    let bs = s.to_bytes()
+    for k in 0..16 {
+        if k < bs.len() {
+            b.push_byte(bs.at(k))
+        } else {
+            b.push_byte(0)
+        }
+    }
+}
+
+pub fn wuleb(inout b: ByteBuilder, v: i64) {
+    var x = v
+    while true {
+        let byte = x.bit_and(127)
+        x = x.ushr(7)
+        if x == 0 {
+            b.push_byte(byte)
+            break
+        }
+        b.push_byte(byte.bit_or(128))
+    }
+}
+
+pub fn wpad(inout b: ByteBuilder, align: i64) {
+    while b.len() % align != 0 {
+        b.push_byte(0)
+    }
+}
+
+pub fn hex(v: i64) -> str {
+    if v < 0 {
+        return "-0x" + (0 - v).to_base(16)
+    }
+    "0x" + v.to_base(16)
+}

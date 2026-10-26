@@ -1,0 +1,135 @@
+// Liveness: which atoms the output keeps.
+//
+// With `-dead_strip`, as ld does for an executable: the roots are the entry
+// point, every name given with `-exported_symbol`, any atom whose symbol is
+// N_NO_DEAD_STRIP or whose section is S_ATTR_NO_DEAD_STRIP, and the
+// initializer and terminator lists; a global symbol is not a root by being
+// global. From a live atom, everything its relocations reach is live, and
+// for a live function its LSDA and personality. Its FDE is live when the
+// function has no compact unwind entry or one that defers to DWARF, the only
+// case an `__eh_frame` record is emitted for (ld64's compact_unwind pass).
+// Without `-dead_strip` every atom of every loaded file is live.
+import state
+import objfile
+
+/// Whether function atom `a`'s unwind information has to come from its FDE.
+pub fn needs_fde(l: Ld, a: i64) -> bool {
+    if l.a_fde[a] < 0 {
+        return false
+    }
+    let c = l.a_cu[a]
+    c < 0 or l.cu_enc[c].bit_and(0x0f000000) == 0x03000000
+}
+
+fn push(inout l: Ld, inout work: [i64], a: i64) {
+    if a < 0 {
+        return
+    }
+    let c = l.a_canon[a]
+    if not l.a_live[c] {
+        l.a_live[c] = true
+        work.push(c)
+    }
+}
+
+pub fn mark(inout l: Ld, files: [i64]) -> () ! str {
+    var work: [i64] = []
+    if not l.dead_strip {
+        for fi in files {
+            let sec0 = l.f_sec0[fi]
+            for si in sec0..(sec0 + l.f_nsec[fi]) {
+                if l.s_role[si] == state.ROLE_EHFRAME {
+                    continue
+                }
+                let a0 = l.s_atom0[si]
+                for a in a0..(a0 + l.s_natom[si]) {
+                    push(l, work, a)
+                }
+            }
+        }
+    }
+    // The entry point and the exports.
+    let eg = l.g_map.get(l.entry) ?? -1
+    if eg < 0 or l.g_kind[eg] != state.G_DEFINED {
+        fail("entry point ({l.entry}) undefined")
+    }
+    push(l, work, l.y_atom[l.g_def[eg]])
+    for name in l.exp_list {
+        let g = l.g_map.get(name) ?? -1
+        if g < 0 or l.g_kind[g] != state.G_DEFINED {
+            fail("cannot export {name}: it is not defined")
+        }
+        push(l, work, l.y_atom[l.g_def[g]])
+    }
+    for fi in files {
+        let sec0 = l.f_sec0[fi]
+        for si in sec0..(sec0 + l.f_nsec[fi]) {
+            let f = l.s_flags[si]
+            let ty = f.bit_and(255)
+            if f.bit_and(0x10000000) != 0 or ty == 9 or ty == 10 {
+                if l.s_role[si] != state.ROLE_DROP and l.s_role[si] != state.ROLE_CUNWIND {
+                    let a0 = l.s_atom0[si]
+                    for a in a0..(a0 + l.s_natom[si]) {
+                        push(l, work, a)
+                    }
+                }
+            }
+        }
+        let y0 = l.f_sym0[fi]
+        for y in y0..(y0 + l.f_nsym[fi]) {
+            if l.y_atom[y] >= 0 and l.y_desc[y].bit_and(0x20) != 0 {
+                push(l, work, l.y_atom[y])
+            }
+        }
+    }
+    while work.len() > 0 {
+        let a = work.pop() ?? -1
+        let si = l.a_sec[a]
+        if l.s_role[si] == state.ROLE_EHFRAME {
+            continue
+        }
+        for r in l.a_rel0[a]..(l.a_rel0[a] + l.a_nrel[a]) {
+            if l.r_tkind[r] == state.T_ATOM {
+                push(l, work, l.r_tatom[r])
+            }
+        }
+        let c = l.a_cu[a]
+        if c >= 0 {
+            push(l, work, l.cu_lsda[c])
+            push(l, work, l.cu_pers_atom[c])
+        }
+        if needs_fde(l, a) {
+            let e = l.a_fde[a]
+            l.a_live[l.eh_atom[e]] = true
+            let cie = l.eh_of[e]
+            l.a_live[l.eh_atom[cie]] = true
+            push(l, work, l.eh_lsda[e])
+            push(l, work, l.eh_pers_atom[cie])
+        }
+    }
+}
+
+/// The undefined names live code reaches, with a file that reaches each.
+pub fn undefined(l: Ld, files: [i64]) -> [str] {
+    var seen: Map[i64, bool] = {}
+    var out: [str] = []
+    for fi in files {
+        let sec0 = l.f_sec0[fi]
+        for si in sec0..(sec0 + l.f_nsec[fi]) {
+            let a0 = l.s_atom0[si]
+            for a in a0..(a0 + l.s_natom[si]) {
+                if not l.a_live[a] {
+                    continue
+                }
+                for r in l.a_rel0[a]..(l.a_rel0[a] + l.a_nrel[a]) {
+                    if l.r_tkind[r] == state.T_NONE and l.r_tg[r] >= 0 and not seen.has(l.r_tg[r]) {
+                        seen.set(l.r_tg[r], true)
+                        let who = if l.a_sym[a] >= 0 { l.y_name[l.a_sym[a]] + " in " } else { "" }
+                        out.push("  \"{l.g_name[l.r_tg[r]]}\", referenced from:\n      {who}{l.f_path[fi]}")
+                    }
+                }
+            }
+        }
+    }
+    out
+}

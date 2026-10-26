@@ -1,0 +1,103 @@
+// `-map`: every atom's address, size, file and name, in the layout of
+// ld's own map file, so the two can be compared line by line.
+import rd
+import state
+import layout
+
+fn hex8(v: i64) -> str {
+    "0x" + v.to_base(16).to_upper().pad_start(8, "0")
+}
+
+fn hexaddr(v: i64) -> str {
+    "0x" + v.to_base(16).to_upper()
+}
+
+fn idx(k: i64) -> str {
+    "[" + "{k}".pad_start(3, " ") + "]"
+}
+
+/// A string as ld's map writes one: C escapes for the control characters.
+fn escape(s: str) -> str {
+    s.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t")
+}
+
+fn atom_name(l: Ld, a: i64) -> str {
+    let si = l.a_sec[a]
+    if l.s_role[si] == state.ROLE_CSTRING and (l.a_sym[a] < 0 or l.y_name[l.a_sym[a]].starts_with("l")) {
+        let d = l.f_data[l.s_file[si]]
+        let at = l.s_off[si] + l.a_off[a]
+        let n = if l.a_size[a] > 0 { l.a_size[a] - 1 } else { 0 }
+        return "literal string: \"" + escape(d.slice(at, at + n).to_str()) + "\""
+    }
+    if l.a_sym[a] >= 0 {
+        return l.y_name[l.a_sym[a]]
+    }
+    "anon"
+}
+
+pub fn text(l: Ld, files: [i64]) -> str {
+    var s = str_builder()
+    s.push_str("# Path: {l.out}\n# Arch: arm64\n# Object files:\n[  0] linker synthesized\n")
+    var fidx: Map[i64, i64] = {}
+    var k = 1
+    for fi in files {
+        fidx.set(fi, k)
+        s.push_str(idx(k) + " " + l.f_path[fi] + "\n")
+        k += 1
+    }
+    let dl0 = k
+    for d in l.dl_install {
+        s.push_str(idx(k) + " " + d + "\n")
+        k += 1
+    }
+    s.push_str("# Sections:\n# Address\tSize    \tSegment\tSection\n")
+    for o in l.o_order {
+        s.push_str(hexaddr(l.o_addr[o]) + "\t" + hex8(l.o_size[o]) + "\t" + l.o_seg[o] + "\t" + l.o_name[o] + "\n")
+    }
+    s.push_str("# Symbols:\n# Address\tSize    \tFile  Name\n")
+    for o in l.o_order {
+        let kind = l.o_kind[o]
+        if kind == layout.K_ATOMS {
+            for a in l.o_atoms[o] {
+                let fi = l.s_file[l.a_sec[a]]
+                s.push_str(hexaddr(l.a_addr[a]) + "\t" + hex8(l.a_size[a]) + "\t" + idx(fidx.get(fi) ?? 0) + " " + atom_name(l, a) + "\n")
+            }
+        } else if kind == layout.K_STUBS {
+            for i in 0..l.stub_g.len() {
+                let g = l.stub_g[i]
+                s.push_str(hexaddr(l.o_addr[o] + 12 * i) + "\t" + hex8(12) + "\t" + idx(dl0 + l.g_dylib[g]) + " " + l.g_name[g] + ".stub\n")
+            }
+        } else if kind == layout.K_GOT {
+            for i in 0..l.got_name.len() {
+                let g = l.got_g[i]
+                let f = if g >= 0 { dl0 + l.g_dylib[g] } else { fidx.get(l.s_file[l.a_sec[l.got_atom[i]]]) ?? 0 }
+                s.push_str(hexaddr(l.o_addr[o] + 8 * i) + "\t" + hex8(8) + "\t" + idx(f) + " " + l.got_name[i] + ".got\n")
+            }
+        } else if kind == layout.K_EHFRAME {
+            for e in l.eh_keep {
+                let a = l.eh_atom[e]
+                let fi = l.s_file[l.a_sec[a]]
+                let at = l.o_addr[o] + (l.eh_out_off.get(e) ?? 0)
+                let name = if l.eh_cie[e] { "anon" } else if l.eh_func[e] >= 0 { "FDE for: " + atom_name(l, l.eh_func[e]) } else { "FDE" }
+                s.push_str(hexaddr(at) + "\t" + hex8(l.a_size[a]) + "\t" + idx(fidx.get(fi) ?? 0) + " " + name + "\n")
+            }
+        }
+    }
+    s.push_str("# Dead Stripped Symbols:\n# Address\tSize    \tFile  Name\n")
+    for fi in files {
+        let sec0 = l.f_sec0[fi]
+        for si in sec0..(sec0 + l.f_nsec[fi]) {
+            let role = l.s_role[si]
+            if role == state.ROLE_DROP or role == state.ROLE_CUNWIND or role == state.ROLE_EHFRAME {
+                continue
+            }
+            let a0 = l.s_atom0[si]
+            for a in a0..(a0 + l.s_natom[si]) {
+                if not l.a_live[l.a_canon[a]] {
+                    s.push_str("<<dead>>\t" + hex8(l.a_size[a]) + "\t" + idx(fidx.get(fi) ?? 0) + " " + atom_name(l, a) + "\n")
+                }
+            }
+        }
+    }
+    s.to_str()
+}

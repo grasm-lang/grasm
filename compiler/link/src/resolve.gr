@@ -1,0 +1,137 @@
+// Symbol resolution: one global table of names, filled from every loaded
+// object, with archive members loaded while a name is still undefined and
+// the dylibs consulted for what no object defines.
+//
+// A strong definition beats a weak one (N_WEAK_DEF); two strong definitions
+// of one name are an error naming both files; of two weak ones the one laid
+// out first wins, so the answer does not depend on the order members were
+// pulled in. A private external (N_PEXT) takes part like any global and is
+// never exported.
+import rd
+import state
+import objfile
+import archive
+
+pub fn gsym(inout l: Ld, name: str) -> i64 {
+    match l.g_map.get(name) {
+        Some(g) -> g
+        None -> {
+            let g = l.g_name.len()
+            l.g_map.set(name, g)
+            l.g_name.push(name)
+            l.g_kind.push(state.G_UNDEF)
+            l.g_def.push(-1)
+            l.g_dylib.push(-1)
+            l.g_weak.push(false)
+            l.g_pext.push(false)
+            l.g_tlv.push(false)
+            l.g_used.push(false)
+            l.g_got.push(-1)
+            l.g_stub.push(-1)
+            l.g_import.push(-1)
+            l.g_weakref.push(true)
+            g
+        }
+    }
+}
+
+/// Enters one file's global symbols into the table.
+pub fn add_file(inout l: Ld, fi: i64) -> () ! str {
+    let y0 = l.f_sym0[fi]
+    for y in y0..(y0 + l.f_nsym[fi]) {
+        let ty = l.y_type[y]
+        if ty.bit_and(0xe0) != 0 or ty.bit_and(1) == 0 {
+            continue
+        }
+        let kind = ty.bit_and(0x0e)
+        let name = l.y_name[y]
+        let g = gsym(l, name)
+        l.y_g[y] = g
+        if kind == 0 {
+            if l.y_value[y] != 0 {
+                fail("{l.f_path[fi]}: {name} is a common symbol, which this linker does not take")
+            }
+            if l.y_desc[y].bit_and(0x40) == 0 {
+                l.g_weakref[g] = false
+            }
+            continue
+        }
+        if kind != 0x0e {
+            fail("{l.f_path[fi]}: {name} has symbol type {kind}, which this linker does not take")
+        }
+        let weak = l.y_desc[y].bit_and(0x80) != 0
+        let pext = ty.bit_and(0x10) != 0
+        let k = l.g_kind[g]
+        if k == state.G_DEFINED {
+            let old = l.g_def[g]
+            let old_weak = l.g_weak[g]
+            if not old_weak and not weak {
+                fail("duplicate symbol '{name}' in:\n    {l.f_path[l.y_file[old]]}\n    {l.f_path[fi]}")
+            }
+            let replace = if old_weak and not weak { true } else if old_weak and weak { l.f_key[fi] < l.f_key[l.y_file[old]] } else { false }
+            if not replace {
+                continue
+            }
+        }
+        l.g_kind[g] = state.G_DEFINED
+        l.g_def[g] = y
+        l.g_weak[g] = weak
+        l.g_pext[g] = pext
+        l.g_tlv[g] = l.s_flags[l.y_sect[y]].bit_and(255) == 0x13
+    }
+}
+
+/// Loads archive members until no undefined name is in any archive's table
+/// of contents.
+pub fn load_members(inout l: Ld) -> () ! str {
+    var next = 0
+    while next < l.g_name.len() {
+        let g = next
+        next += 1
+        if l.g_kind[g] != state.G_UNDEF {
+            continue
+        }
+        let name = l.g_name[g]
+        for a in 0..l.ar_path.len() {
+            match l.ar_toc[a].get(name) {
+                Some(at) -> {
+                    let key = "{a}:{at}"
+                    if l.ar_loaded.has(key) {
+                        continue
+                    }
+                    let d = l.ar_data[a]
+                    let (mname, start, end) = match archive.member(d, at) {
+                        Ok(m) -> m
+                        Err(e) -> fail("{l.ar_path[a]}: {e}")
+                    }
+                    let idx = l.ar_index[a].get(at) ?? 0
+                    let fkey = l.ar_pos[a] * 1000000 + idx + 1
+                    let fi = try objfile.read(l, "{l.ar_path[a]}({mname})", d.slice(start, end), fkey)
+                    l.ar_loaded.set(key, fi)
+                    try add_file(l, fi)
+                    break
+                }
+                None -> ()
+            }
+        }
+    }
+}
+
+/// Binds what is still undefined to the dylibs; answers the names nothing defines.
+pub fn bind_dylibs(inout l: Ld) -> [i64] {
+    var missing: [i64] = []
+    for g in 0..l.g_name.len() {
+        if l.g_kind[g] != state.G_UNDEF {
+            continue
+        }
+        match l.dy_sym.get(l.g_name[g]) {
+            Some(di) -> {
+                l.g_kind[g] = state.G_DYLIB
+                l.g_dylib[g] = di
+                l.g_tlv[g] = l.dy_tlv.has(l.g_name[g])
+            }
+            None -> missing.push(g)
+        }
+    }
+    missing
+}

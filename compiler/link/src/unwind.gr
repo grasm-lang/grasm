@@ -1,0 +1,394 @@
+// Unwind information: `__eh_frame` (the FDEs a function's compact encoding
+// defers to, and their CIEs) and `__unwind_info` (a two-level index of every
+// function's compact encoding, which the unwinder reads first).
+//
+// `__unwind_info` is built as ld64's compact_unwind pass builds it
+// (`UnwindInfoAtom`): one entry per function in `__text`, a function with
+// nothing to say getting encoding 0; an entry dropped when it repeats the one
+// before with no LSDA on either and no DWARF; personalities numbered by first
+// use; the encodings used more than once in a common table, most used first
+// and ties by value; an LSDA index; then second-level pages, compressed. Two
+// things are ld-prime's rather than ld64's, read off its output: the
+// sentinel entry's address is the end of the last function, not one past
+// it, and page-specific encodings are numbered in address order.
+import rd
+import state
+import deadstrip
+import layout
+
+pub let MODE_DWARF = 0x03000000
+pub let HAS_LSDA = 0x40000000
+
+/// Chooses the `__eh_frame` records to keep and lays them out; adds the
+/// output section (before `__unwind_info` is known) and answers it, or -1.
+pub fn eh_frame(inout l: Ld, files: [i64]) -> i64 {
+    var of_atom: Map[i64, i64] = {}
+    for e in 0..l.eh_atom.len() {
+        of_atom.set(l.eh_atom[e], e)
+    }
+    var keep: [i64] = []
+    var fdes = 0
+    var flags = 0x6800000b
+    var p2 = 3
+    for fi in files {
+        let sec0 = l.f_sec0[fi]
+        for si in sec0..(sec0 + l.f_nsec[fi]) {
+            if l.s_role[si] != state.ROLE_EHFRAME {
+                continue
+            }
+            let a0 = l.s_atom0[si]
+            for a in a0..(a0 + l.s_natom[si]) {
+                if l.a_live[a] {
+                    let e = of_atom.get(a) ?? -1
+                    keep.push(e)
+                    if not l.eh_cie[e] {
+                        fdes += 1
+                    }
+                    flags = l.s_flags[si]
+                    p2 = l.s_p2[si]
+                }
+            }
+        }
+    }
+    if fdes == 0 {
+        return -1
+    }
+    var off = 0
+    for e in keep {
+        l.eh_out_off.set(e, off)
+        off += l.a_size[l.eh_atom[e]]
+    }
+    l.eh_keep = keep
+    let o = l.o_seg.len()
+    l.o_seg.push("__TEXT")
+    l.o_name.push("__eh_frame")
+    l.o_flags.push(flags)
+    l.o_p2.push(p2)
+    l.o_addr.push(0)
+    l.o_size.push(off)
+    l.o_off.push(0)
+    l.o_atoms.push([])
+    l.o_kind.push(layout.K_EHFRAME)
+    o
+}
+
+/// One function's unwind entry.
+type UEntries = {
+    func: [i64],
+    addr: [i64],
+    size: [i64],
+    enc: [i64],
+    lsda: [i64],
+    pers: [i64],
+}
+
+fn got_addr_of(l: Ld, g: i64, a: i64, got_base: i64) -> i64 {
+    if g >= 0 and l.g_got[g] >= 0 {
+        return got_base + 8 * l.g_got[g]
+    }
+    if a >= 0 {
+        let slot = l.a_got.get(l.a_canon[a]) ?? -1
+        if slot >= 0 {
+            return got_base + 8 * slot
+        }
+    }
+    -1
+}
+
+/// The image offset of atom `a` + `off`, or -1.
+fn img(l: Ld, a: i64, off: i64, delta: i64) -> i64 {
+    if a < 0 {
+        return -1
+    }
+    l.a_addr[l.a_canon[a]] + off + delta
+}
+
+/// Every function's entry, in address order. `delta` turns `a_addr` into an
+/// image offset; `got_base` is the GOT's image offset.
+fn entries(l: Ld, text: i64, delta: i64, got_base: i64) -> UEntries {
+    var u = UEntries{ func: [], addr: [], size: [], enc: [], lsda: [], pers: [] }
+    for a in l.o_atoms[text] {
+        if l.a_size[a] == 0 {
+            continue
+        }
+        var enc = 0
+        var lsda = -1
+        var pers = -1
+        if deadstrip.needs_fde(l, a) {
+            let e = l.a_fde[a]
+            enc = MODE_DWARF.bit_or(l.eh_out_off.get(e) ?? 0)
+            lsda = img(l, l.eh_lsda[e], 0, delta)
+            let cie = l.eh_of[e]
+            pers = got_addr_of(l, l.eh_pers_g[cie], l.eh_pers_atom[cie], got_base)
+        } else if l.a_cu[a] >= 0 {
+            let c = l.a_cu[a]
+            enc = l.cu_enc[c]
+            lsda = img(l, l.cu_lsda[c], l.cu_lsda_off[c], delta)
+            pers = got_addr_of(l, l.cu_pers_g[c], l.cu_pers_atom[c], got_base)
+        }
+        if lsda >= 0 {
+            enc = enc.bit_or(HAS_LSDA)
+        }
+        u.func.push(a)
+        u.addr.push(l.a_addr[a] + delta)
+        u.size.push(l.a_size[a])
+        u.enc.push(enc)
+        u.lsda.push(lsda)
+        u.pers.push(pers)
+    }
+    u
+}
+
+fn is_dwarf(enc: i64) -> bool {
+    enc.bit_and(0x0f000000) == MODE_DWARF
+}
+
+/// The `__unwind_info` section's bytes. Before layout, `delta` is 0 and the
+/// addresses are offsets in `__text`; only its size is used then.
+pub fn unwind_info(l: Ld, text: i64, delta: i64, got_base: i64) -> bytes {
+    let all = entries(l, text, delta, got_base)
+    if all.func.len() == 0 {
+        return bytes_filled(0, 0)
+    }
+    // Drop an entry that repeats the one before it.
+    var u = UEntries{ func: [], addr: [], size: [], enc: [], lsda: [], pers: [] }
+    var last_enc = -1
+    var last_pers = -2
+    var last_lsda = false
+    for i in 0..all.func.len() {
+        let enc = all.enc[i]
+        let has_lsda = all.lsda[i] >= 0
+        if is_dwarf(enc) or enc != last_enc or all.pers[i] != last_pers or has_lsda or last_lsda {
+            u.func.push(all.func[i])
+            u.addr.push(all.addr[i])
+            u.size.push(all.size[i])
+            u.enc.push(enc)
+            u.lsda.push(all.lsda[i])
+            u.pers.push(all.pers[i])
+        }
+        last_enc = enc
+        last_pers = all.pers[i]
+        last_lsda = has_lsda
+    }
+    // Personalities, numbered from 1 by first use.
+    var pers_index: Map[i64, i64] = {}
+    var pers_list: [i64] = []
+    for i in 0..u.func.len() {
+        let p = u.pers[i]
+        if p >= 0 {
+            var k = pers_index.get(p) ?? 0
+            if k == 0 {
+                pers_list.push(p)
+                k = pers_list.len()
+                pers_index.set(p, k)
+            }
+            u.enc[i] = u.enc[i].bit_or(k.shl(28))
+        }
+    }
+    // Common encodings: used more than once, most used first, ties by value.
+    var count: Map[i64, i64] = {}
+    var most = 0
+    for i in 0..u.func.len() {
+        let enc = u.enc[i]
+        if is_dwarf(enc) {
+            continue
+        }
+        let c = (count.get(enc) ?? 0) + 1
+        count.set(enc, c)
+        if c > 1 and c > most {
+            most = c
+        }
+    }
+    var common: Map[i64, i64] = {}
+    var common_list: [i64] = []
+    var usages = most
+    while usages > 1 {
+        for (enc, c) in count.entries() {
+            if c == usages and common_list.len() < 127 {
+                common.set(enc, common_list.len())
+                common_list.push(enc)
+            }
+        }
+        usages -= 1
+    }
+    // The LSDA index, and where each function's run of it starts.
+    var lsda_func: [i64] = []
+    var lsda_at: [i64] = []
+    var lsda_before: [i64] = []
+    for i in 0..u.func.len() {
+        lsda_before.push(lsda_func.len())
+        if u.lsda[i] >= 0 {
+            lsda_func.push(u.addr[i])
+            lsda_at.push(u.lsda[i])
+        }
+    }
+    // Second-level pages, filled in address order.
+    var page_first: [i64] = []
+    var page_bytes: [bytes] = []
+    var i = 0
+    let n = u.func.len()
+    while i < n {
+        var specific: Map[i64, i64] = {}
+        var spec_list: [i64] = []
+        var idx: [i64] = []
+        var j = i
+        while j < n {
+            let enc = u.enc[j]
+            var ei = -1
+            var new_spec = false
+            if not is_dwarf(enc) and common.has(enc) {
+                ei = common.get(enc) ?? 0
+            } else if not is_dwarf(enc) and specific.has(enc) {
+                ei = specific.get(enc) ?? 0
+            } else {
+                ei = common_list.len() + spec_list.len()
+                new_spec = true
+            }
+            if ei > 255 {
+                break
+            }
+            if u.addr[j] - u.addr[i] > 0x00ffff00 {
+                break
+            }
+            let used = 12 + 4 * (idx.len() + 1) + 4 * (spec_list.len() + (if new_spec { 1 } else { 0 }))
+            if used > 4096 {
+                break
+            }
+            if new_spec {
+                spec_list.push(enc)
+                if not is_dwarf(enc) {
+                    specific.set(enc, ei)
+                }
+            }
+            idx.push(ei)
+            j += 1
+        }
+        var b = byte_builder()
+        rd.w32(b, 3)
+        rd.w16(b, 12)
+        rd.w16(b, idx.len())
+        rd.w16(b, 12 + 4 * idx.len())
+        rd.w16(b, spec_list.len())
+        for k in 0..idx.len() {
+            rd.w32(b, (u.addr[i + k] - u.addr[i]).bit_and(0xffffff).bit_or(idx[k].shl(24)))
+        }
+        for e in spec_list {
+            rd.w32(b, e)
+        }
+        page_first.push(i)
+        page_bytes.push(b.to_bytes())
+        i = j
+    }
+    // The header, the tables, the index, then the pages.
+    let npages = page_first.len()
+    let common_off = 28
+    let pers_off = common_off + 4 * common_list.len()
+    let index_off = pers_off + 4 * pers_list.len()
+    let lsda_off = index_off + 12 * (npages + 2)
+    let pages_off = lsda_off + 8 * lsda_func.len()
+    var out = byte_builder()
+    rd.w32(out, 1)
+    rd.w32(out, common_off)
+    rd.w32(out, common_list.len())
+    rd.w32(out, pers_off)
+    rd.w32(out, pers_list.len())
+    rd.w32(out, index_off)
+    rd.w32(out, npages + 1)
+    for e in common_list {
+        rd.w32(out, e)
+    }
+    for p in pers_list {
+        rd.w32(out, p)
+    }
+    var at = pages_off
+    for k in 0..npages {
+        let f = page_first[k]
+        rd.w32(out, u.addr[f])
+        rd.w32(out, at)
+        rd.w32(out, lsda_off + 8 * lsda_before[f])
+        at += page_bytes[k].len()
+    }
+    let lastf = all.func.len() - 1
+    rd.w32(out, all.addr[lastf] + all.size[lastf])
+    rd.w32(out, 0)
+    rd.w32(out, lsda_off + 8 * lsda_func.len())
+    // ld-prime leaves room for one index entry more than it writes, zeroed.
+    for _k in 0..3 {
+        rd.w32(out, 0)
+    }
+    for k in 0..lsda_func.len() {
+        rd.w32(out, lsda_func[k])
+        rd.w32(out, lsda_at[k])
+    }
+    for pb in page_bytes {
+        out.push_bytes(pb)
+    }
+    // ld-prime's section is a whole number of 8-byte words.
+    rd.wpad(out, 8)
+    out.to_bytes()
+}
+
+/// The `__eh_frame` section's bytes once every address is known: each kept
+/// record copied, its CIE pointer, function, LSDA and personality fields
+/// rewritten for where things now are.
+pub fn eh_bytes(l: Ld, o: i64) -> bytes ! str {
+    var buf = bytes_filled(l.o_size[o], 0)
+    let base = l.o_addr[o]
+    let got_o = got_section(l)
+    for e in l.eh_keep {
+        let a = l.eh_atom[e]
+        let si = l.a_sec[a]
+        let d = l.f_data[l.s_file[si]]
+        let src = l.s_off[si] + l.a_off[a]
+        let at = l.eh_out_off.get(e) ?? 0
+        buf.copy_from(at, d.slice(src, src + l.a_size[a]))
+        let here = base + at
+        if not l.eh_cie[e] {
+            let cie_at = l.eh_out_off.get(l.eh_of[e]) ?? 0
+            rd.put32(buf, at + 4, at + 4 - cie_at)
+        }
+        for r in l.a_rel0[a]..(l.a_rel0[a] + l.a_nrel[a]) {
+            let field = l.r_off[r] - l.a_off[a]
+            let t = l.r_type[r]
+            let where = here + field
+            if t == 7 {
+                // POINTER_TO_GOT: 32 bits, from the field to the slot.
+                let slot = got_addr_of(l, if l.r_tkind[r] == state.T_IMPORT { l.r_tg[r] } else { l.r_tg[r] }, l.r_tatom[r], l.o_addr[got_o])
+                if slot < 0 {
+                    fail("an eh_frame personality without a GOT slot")
+                }
+                // What the assembler left in the field is not an addend
+                // (LLVM stores 1 - the field's offset); ld ignores it too.
+                rd.put32(buf, at + field, slot - where)
+            } else if t == 0 and l.r_satom[r] >= 0 {
+                // A pc-relative pointer written as target - (section start) + k.
+                let s_in = l.s_addr[l.a_sec[l.r_satom[r]]] + l.a_off[l.r_satom[r]] + l.r_soff[r]
+                let f_in = l.s_addr[si] + l.a_off[a] + field
+                let k = content_at(d, src + field, l.r_len[r]) - s_in + f_in
+                let target = l.a_addr[l.a_canon[l.r_tatom[r]]] + l.r_toff[r]
+                let v = target + k - where
+                if l.r_len[r] == 3 {
+                    rd.put64(buf, at + field, v)
+                } else {
+                    rd.put32(buf, at + field, v)
+                }
+            } else {
+                fail("an eh_frame relocation of type {t} this linker does not rewrite")
+            }
+        }
+    }
+    buf
+}
+
+fn content_at(d: bytes, at: i64, len: i64) -> i64 {
+    if len == 3 { rd.u64(d, at) } else { rd.s32(d, at) }
+}
+
+pub fn got_section(l: Ld) -> i64 {
+    for o in l.o_order {
+        if l.o_kind[o] == layout.K_GOT {
+            return o
+        }
+    }
+    -1
+}

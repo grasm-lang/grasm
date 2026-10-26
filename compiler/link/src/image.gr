@@ -1,0 +1,886 @@
+// The image around the sections: `__LINKEDIT` (chained fixups, export trie,
+// function starts, data in code, symbol table, indirect symbols, strings,
+// code signature), the load commands and the header -- in the order and
+// shape ld-prime writes them, or, with `strip`, as `strip -no_uuid` leaves
+// them (what `grasm build --native` has shipped).
+import rd
+import state
+import layout
+import apply
+import exporttrie
+import codesig
+import crypto_hash
+
+/// One output symbol table entry.
+type Syms = {
+    name: [str],
+    ty: [i64],
+    sect: [i64],
+    desc: [i64],
+    value: [i64],
+}
+
+fn new_syms() -> Syms {
+    Syms{ name: [], ty: [], sect: [], desc: [], value: [] }
+}
+
+fn add_sym(inout s: Syms, name: str, ty: i64, sect: i64, desc: i64, value: i64) {
+    s.name.push(name)
+    s.ty.push(ty)
+    s.sect.push(sect)
+    s.desc.push(desc)
+    s.value.push(value)
+}
+
+/// A name as ld-prime writes it: a ThinLTO promotion suffix, `.llvm.` and
+/// digits, removed.
+pub fn clean_name(n: str) -> str {
+    match n.index_of(".llvm.") {
+        Some(i) -> {
+            let rest = n.substr(i + 6, n.len() - i - 6)
+            if rest.len() == 0 {
+                return n
+            }
+            for c in rest.codes() {
+                if c < 48 or c > 57 {
+                    return n
+                }
+            }
+            n.substr(0, i)
+        }
+        None -> n
+    }
+}
+
+/// The output section ordinal (from 1) of each output section.
+fn ordinals(l: Ld) -> Map[i64, i64] {
+    var m: Map[i64, i64] = {}
+    var k = 1
+    for o in l.o_order {
+        m.set(o, k)
+        k += 1
+    }
+    m
+}
+
+/// Whether global `g` is exported by the trie.
+pub fn exported(l: Ld, g: i64) -> bool {
+    if l.g_kind[g] != state.G_DEFINED or l.g_pext[g] {
+        return false
+    }
+    let a = l.y_atom[l.g_def[g]]
+    if a < 0 or not l.a_live[l.a_canon[a]] {
+        return false
+    }
+    if l.exp_list.len() > 0 {
+        return l.exp_set.has(l.g_name[g])
+    }
+    true
+}
+
+fn sym_addr(l: Ld, y: i64) -> i64 {
+    let a = l.y_atom[y]
+    l.a_addr[l.a_canon[a]] + (l.y_value[y] - l.s_addr[l.y_sect[y]] - l.a_off[a])
+}
+
+/// The symbol table, as (locals, exported, undefined) in that order.
+fn symbols(l: Ld, files: [i64]) -> (Syms, i64, i64, i64) {
+    let ord = ordinals(l)
+    var locals = new_syms()
+    var lkey: [(i64, i64)] = []
+    var n = 0
+    for fi in files {
+        let y0 = l.f_sym0[fi]
+        for y in y0..(y0 + l.f_nsym[fi]) {
+            let ty = l.y_type[y]
+            if ty.bit_and(0xe0) != 0 or ty.bit_and(0x0e) != 0x0e {
+                continue
+            }
+            let a = l.y_atom[y]
+            if a < 0 {
+                continue
+            }
+            let ca = l.a_canon[a]
+            if not l.a_live[ca] {
+                continue
+            }
+            let name = l.y_name[y]
+            if name.starts_with("l") or name.starts_with("L") {
+                continue
+            }
+            var pext = false
+            if ty.bit_and(1) != 0 {
+                let g = l.y_g[y]
+                if l.g_def[g] != y {
+                    continue
+                }
+                if exported(l, g) {
+                    continue
+                }
+                pext = true
+            } else if ty.bit_and(0x10) != 0 {
+                pext = true
+            }
+            let o = l.s_out[l.a_sec[ca]]
+            let addr = sym_addr(l, y)
+            add_sym(locals, clean_name(name), if pext { 0x1e } else { 0x0e }, ord.get(o) ?? 0, 0, addr)
+            lkey.push((addr, n))
+            n += 1
+        }
+    }
+    // Locals by address, then in the order the inputs list them.
+    var idx: [i64] = []
+    for i in 0..n {
+        idx.push(i)
+    }
+    idx.sort_by(|i| lkey[i])
+    var out = new_syms()
+    for i in idx {
+        add_sym(out, locals.name[i], locals.ty[i], locals.sect[i], locals.desc[i], locals.value[i])
+    }
+    let nlocal = out.name.len()
+    // Exported symbols, by name; __mh_execute_header among them.
+    var ext: [(str, i64)] = [("__mh_execute_header", -1)]
+    for g in 0..l.g_name.len() {
+        if exported(l, g) {
+            ext.push((l.g_name[g], g))
+        }
+    }
+    ext.sort_by(|e| e.0)
+    for (name, g) in ext {
+        if g < 0 {
+            add_sym(out, name, 0x0f, 1, 0x10, layout.BASE)
+        } else {
+            let y = l.g_def[g]
+            let a = l.a_canon[l.y_atom[y]]
+            let desc = if l.g_weak[g] { 0x80 } else { 0 }
+            add_sym(out, name, 0x0f, ord.get(l.s_out[l.a_sec[a]]) ?? 0, desc, sym_addr(l, y))
+        }
+    }
+    let next = out.name.len() - nlocal
+    // Imports, by name.
+    var und: [(str, i64)] = []
+    for g in l.imp_g {
+        und.push((l.g_name[g], g))
+    }
+    und.sort_by(|e| e.0)
+    for (name, g) in und {
+        let ordinal = l.g_dylib[g] + 1
+        add_sym(out, name, 0x01, 0, ordinal.shl(8), 0)
+    }
+    let nund = out.name.len() - nlocal - next
+    (out, nlocal, next, nund)
+}
+
+/// The symbol table `strip -no_uuid` leaves: its marker, then the header
+/// symbol (and the exports it is told to keep), then the imports.
+fn stripped_symbols(l: Ld) -> (Syms, i64, i64, i64) {
+    let ord = ordinals(l)
+    var out = new_syms()
+    add_sym(out, "radr://5614542", 0x3c, 0, 0, 0x5614542)
+    var ext: [(str, i64)] = [("__mh_execute_header", -1)]
+    if l.exp_list.len() > 0 {
+        for g in 0..l.g_name.len() {
+            if exported(l, g) {
+                ext.push((l.g_name[g], g))
+            }
+        }
+    }
+    ext.sort_by(|e| e.0)
+    for (name, g) in ext {
+        if g < 0 {
+            add_sym(out, name, 0x0f, 1, 0x10, layout.BASE)
+        } else {
+            let y = l.g_def[g]
+            let a = l.a_canon[l.y_atom[y]]
+            let desc = if l.g_weak[g] { 0x80 } else { 0 }
+            add_sym(out, name, 0x0f, ord.get(l.s_out[l.a_sec[a]]) ?? 0, desc, sym_addr(l, y))
+        }
+    }
+    let next = out.name.len() - 1
+    var und: [(str, i64)] = []
+    for g in l.imp_g {
+        und.push((l.g_name[g], g))
+    }
+    und.sort_by(|e| e.0)
+    for (name, g) in und {
+        add_sym(out, name, 0x01, 0, (l.g_dylib[g] + 1).shl(8), 0)
+    }
+    (out, 1, next, out.name.len() - 1 - next)
+}
+
+/// The string table and each symbol's offset in it.
+fn strings(s: Syms, strip: bool, nlocal: i64) -> (bytes, [i64]) {
+    var b = byte_builder()
+    var at: [i64] = []
+    for _i in 0..s.name.len() {
+        at.push(0)
+    }
+    if strip {
+        // strip(1): four NULs, then every name but its marker's, then the marker's.
+        rd.w32(b, 0)
+        for i in 0..s.name.len() {
+            if i < nlocal {
+                continue
+            }
+            at[i] = b.len()
+            b.push_str(s.name[i])
+            b.push_byte(0)
+        }
+        for i in 0..nlocal {
+            at[i] = b.len()
+            b.push_str(s.name[i])
+            b.push_byte(0)
+        }
+    } else {
+        // ld: a space, then the exported and imported names, then the locals.
+        b.push_byte(32)
+        b.push_byte(0)
+        for i in nlocal..s.name.len() {
+            at[i] = b.len()
+            b.push_str(s.name[i])
+            b.push_byte(0)
+        }
+        for i in 0..nlocal {
+            at[i] = b.len()
+            b.push_str(s.name[i])
+            b.push_byte(0)
+        }
+    }
+    rd.wpad(b, 8)
+    (b.to_bytes(), at)
+}
+
+/// LC_DYLD_CHAINED_FIXUPS' payload, and the image with each pointer's chain
+/// written in (DYLD_CHAINED_PTR_64_OFFSET, 16 KiB pages).
+fn chained(inout l: Ld, inout buf: bytes, fx: Fixups) -> bytes ! str {
+    // Fixups by address.
+    var idx: [i64] = []
+    for i in 0..fx.addr.len() {
+        idx.push(i)
+    }
+    idx.sort_by(|i| fx.addr[i])
+    // Segments in load-command order: __PAGEZERO, __TEXT, __DATA_CONST?, __DATA?, __LINKEDIT.
+    var segs: [(str, i64, i64, i64)] = [("__PAGEZERO", 0, 0, 0), ("__TEXT", layout.BASE, l.seg_text_size, 0)]
+    if l.seg_dc.1 > 0 {
+        segs.push(("__DATA_CONST", l.seg_dc.0, l.seg_dc.1, l.seg_dc.2))
+    }
+    if l.seg_data.1 > 0 {
+        segs.push(("__DATA", l.seg_data.0, l.seg_data.1, l.seg_data.2))
+    }
+    segs.push(("__LINKEDIT", 0, 0, 0))
+    var b = byte_builder()
+    rd.w32(b, 0)
+    rd.w32(b, 32)
+    rd.w32(b, 0)
+    rd.w32(b, 0)
+    rd.w32(b, l.imp_g.len())
+    rd.w32(b, 1)
+    rd.w32(b, 0)
+    rd.wpad(b, 8)
+    let image_at = b.len()
+    rd.w32(b, segs.len())
+    for _s in segs {
+        rd.w32(b, 0)
+    }
+    var seg_info: [i64] = []
+    for _s in segs {
+        seg_info.push(0)
+    }
+    for si in 0..segs.len() {
+        let (name, start, size, fileoff) = segs[si]
+        if name != "__DATA_CONST" and name != "__DATA" {
+            continue
+        }
+        var mine: [i64] = []
+        for i in idx {
+            if fx.addr[i] >= start and fx.addr[i] < start + size {
+                mine.push(i)
+            }
+        }
+        if mine.len() == 0 {
+            continue
+        }
+        let npages = size / layout.PAGE
+        rd.wpad(b, 8)
+        seg_info[si] = b.len() - image_at
+        rd.w32(b, 22 + 2 * npages)
+        rd.w16(b, layout.PAGE)
+        rd.w16(b, 6)
+        rd.w64(b, start - layout.BASE)
+        rd.w32(b, 0)
+        rd.w16(b, npages)
+        var starts: [i64] = []
+        for _p in 0..npages {
+            starts.push(0xffff)
+        }
+        for k in 0..mine.len() {
+            let i = mine[k]
+            let off = fx.addr[i] - start
+            let pg = off / layout.PAGE
+            if starts[pg] == 0xffff {
+                starts[pg] = off % layout.PAGE
+            }
+            // The next fixup on this page, in 4-byte strides.
+            var next = 0
+            if k + 1 < mine.len() {
+                let off2 = fx.addr[mine[k + 1]] - start
+                if off2 / layout.PAGE == pg {
+                    next = (off2 - off) / 4
+                }
+            }
+            let at = fileoff + off
+            var v = 0
+            if fx.bind[i] {
+                if fx.addend[i] < 0 or fx.addend[i] > 255 {
+                    fail("a bound pointer with addend {fx.addend[i]}, which DYLD_CHAINED_PTR_64 cannot hold")
+                }
+                v = fx.target[i].bit_and(0xffffff).bit_or(fx.addend[i].shl(24)).bit_or(next.shl(51)).bit_or(1.shl(63))
+            } else {
+                let t = fx.target[i]
+                if t < 0 or t >= 1.shl(36) {
+                    fail("a rebase target out of range: {rd.hex(t)}")
+                }
+                v = t.bit_or(next.shl(51))
+            }
+            rd.put64(buf, at, v)
+        }
+        for s in starts {
+            rd.w16(b, s)
+        }
+    }
+    rd.wpad(b, 4)
+    let imports_at = b.len()
+    // The names, after a NUL.
+    var pool = byte_builder()
+    pool.push_byte(0)
+    var name_at: [i64] = []
+    for g in l.imp_g {
+        name_at.push(pool.len())
+        pool.push_str(l.g_name[g])
+        pool.push_byte(0)
+    }
+    for k in 0..l.imp_g.len() {
+        let g = l.imp_g[k]
+        let weak = if l.g_weakref[g] { 1 } else { 0 }
+        let ordinal = l.g_dylib[g] + 1
+        if ordinal > 240 or name_at[k] >= 1.shl(23) {
+            fail("too many libraries or too long a name table for DYLD_CHAINED_IMPORT")
+        }
+        rd.w32(b, ordinal.bit_or(weak.shl(8)).bit_or(name_at[k].shl(9)))
+    }
+    rd.wpad(b, 8)
+    let symbols_at = b.len()
+    b.push_bytes(pool.to_bytes())
+    rd.wpad(b, 8)
+    var out = b.to_bytes()
+    rd.put32(out, 8, imports_at)
+    rd.put32(out, 12, symbols_at)
+    for si in 0..seg_info.len() {
+        rd.put32(out, image_at + 4 + 4 * si, seg_info[si])
+    }
+    out
+}
+
+/// LC_FUNCTION_STARTS' payload: each function's address as a ULEB128 delta
+/// from the one before, the first from the image base.
+fn function_starts(l: Ld) -> bytes {
+    var b = byte_builder()
+    var last = layout.BASE
+    for o in l.o_order {
+        if l.o_seg[o] != "__TEXT" or l.o_name[o] != "__text" {
+            continue
+        }
+        for a in l.o_atoms[o] {
+            if l.a_size[a] == 0 {
+                continue
+            }
+            let d = l.a_addr[a] - last
+            if d != 0 {
+                rd.wuleb(b, d)
+                last = l.a_addr[a]
+            }
+        }
+    }
+    b.push_byte(0)
+    rd.wpad(b, 8)
+    b.to_bytes()
+}
+
+fn trie(l: Ld) -> bytes {
+    var es: [ExportEntry] = [ExportEntry{ name: "__mh_execute_header", flags: 0, value: 0, resolver: 0, import_name: "" }]
+    for g in 0..l.g_name.len() {
+        if exported(l, g) {
+            let y = l.g_def[g]
+            var flags = 0
+            if l.g_weak[g] {
+                flags = 4
+            }
+            if l.g_tlv[g] {
+                flags = flags.bit_or(1)
+            }
+            es.push(ExportEntry{ name: l.g_name[g], flags: flags, value: sym_addr(l, y) - layout.BASE, resolver: 0, import_name: "" })
+        }
+    }
+    let full = exporttrie.encode(es)
+    if not l.strip {
+        return full
+    }
+    // strip(1) rebuilds the trie from the symbols it keeps -- the header's,
+    // and the exports it is told to keep -- with ld64's encoder, and leaves
+    // it in the space ld's trie had, zero-filled.
+    var kept: [ExportEntry] = []
+    for e in es {
+        if e.name == "__mh_execute_header" or l.exp_list.len() > 0 {
+            kept.push(e)
+        }
+    }
+    kept.sort_by(|e| e.name)
+    let small = ld64_trie(kept)
+    var out = bytes_filled(full.len(), 0)
+    out.copy_from(0, small)
+    out
+}
+
+/// A trie as ld64 (and strip) encode one: nodes in the order a walk of each
+/// name in turn first reaches them, offsets iterated until every ULEB128 has
+/// settled (ld64's `mach_o::trie::makeTrie`).
+fn ld64_trie(es: [ExportEntry]) -> bytes {
+    // Node 0 is the root; each node's edges as (string, child), its
+    // cumulative name, and the entry ending there (-1 if none).
+    var edges: [[(str, i64)]] = [[]]
+    var cum: [str] = [""]
+    var entry: [i64] = [-1]
+    for k in 0..es.len() {
+        let name = es[k].name
+        var node = 0
+        var placed = false
+        while not placed {
+            let partial = name.substr(cum[node].len(), name.len() - cum[node].len())
+            var went = false
+            for i in 0..edges[node].len() {
+                let (s, child) = edges[node][i]
+                if partial.starts_with(s) {
+                    node = child
+                    went = true
+                    break
+                }
+                var j = s.len() - 1
+                var split = false
+                while j > 0 {
+                    if partial.starts_with(s.substr(0, j)) {
+                        // A -> C becomes A -> B -> C.
+                        let b = edges.len()
+                        edges.push([(s.substr(j, s.len() - j), child)])
+                        cum.push(cum[child].substr(0, cum[child].len() - (s.len() - j)))
+                        entry.push(-1)
+                        var es_node = edges[node]
+                        es_node[i] = (s.substr(0, j), b)
+                        edges[node] = es_node
+                        node = b
+                        split = true
+                        break
+                    }
+                    j -= 1
+                }
+                if split {
+                    went = true
+                    break
+                }
+            }
+            if not went {
+                let n = edges.len()
+                edges.push([])
+                cum.push(name)
+                entry.push(k)
+                var es_node = edges[node]
+                es_node.push((partial, n))
+                edges[node] = es_node
+                placed = true
+            }
+        }
+    }
+    // The order nodes are first reached in, name by name.
+    var order: [i64] = []
+    var seen: [bool] = []
+    for _n in 0..edges.len() {
+        seen.push(false)
+    }
+    for e in es {
+        var node = 0
+        while true {
+            if not seen[node] {
+                seen[node] = true
+                order.push(node)
+            }
+            let partial = e.name.substr(cum[node].len(), e.name.len() - cum[node].len())
+            var next = -1
+            for (s, child) in edges[node] {
+                if s.len() > 0 and partial.starts_with(s) {
+                    next = child
+                    break
+                }
+            }
+            if next < 0 {
+                break
+            }
+            node = next
+        }
+    }
+    var off: [i64] = []
+    for _n in 0..edges.len() {
+        off.push(0)
+    }
+    var more = true
+    while more {
+        more = false
+        var at = 0
+        for n in order {
+            var size = 1
+            if entry[n] >= 0 {
+                let x = es[entry[n]]
+                size = uleb_size(x.flags) + uleb_size(x.value)
+                size += uleb_size(size)
+            }
+            size += 1
+            for (s, child) in edges[n] {
+                size += s.to_bytes().len() + 1 + uleb_size(off[child])
+            }
+            if off[n] != at {
+                more = true
+            }
+            off[n] = at
+            at += size
+        }
+    }
+    var b = byte_builder()
+    for n in order {
+        if entry[n] >= 0 {
+            let x = es[entry[n]]
+            var t = byte_builder()
+            rd.wuleb(t, x.flags)
+            rd.wuleb(t, x.value)
+            rd.wuleb(b, t.len())
+            b.push_bytes(t.to_bytes())
+        } else {
+            b.push_byte(0)
+        }
+        b.push_byte(edges[n].len())
+        for (s, child) in edges[n] {
+            b.push_str(s)
+            b.push_byte(0)
+            rd.wuleb(b, off[child])
+        }
+    }
+    b.to_bytes()
+}
+
+fn uleb_size(v: i64) -> i64 {
+    var n = 1
+    var x = v.ushr(7)
+    while x != 0 {
+        n += 1
+        x = x.ushr(7)
+    }
+    n
+}
+
+fn wseg(inout b: ByteBuilder, name: str, vmaddr: i64, vmsize: i64, fileoff: i64, filesize: i64, prot: i64, nsects: i64, flags: i64) {
+    rd.w32(b, 0x19)
+    rd.w32(b, 72 + 80 * nsects)
+    rd.wname(b, name)
+    rd.w64(b, vmaddr)
+    rd.w64(b, vmsize)
+    rd.w64(b, fileoff)
+    rd.w64(b, filesize)
+    rd.w32(b, prot)
+    rd.w32(b, prot)
+    rd.w32(b, nsects)
+    rd.w32(b, flags)
+}
+
+fn wlinkedit_cmd(inout b: ByteBuilder, cmd: i64, off: i64, size: i64) {
+    rd.w32(b, cmd)
+    rd.w32(b, 16)
+    rd.w32(b, off)
+    rd.w32(b, size)
+}
+
+/// The size of the load commands, which layout needs before it can place anything.
+pub fn commands_size(l: Ld) -> i64 {
+    var n = 72
+    for seg in ["__TEXT", "__DATA_CONST", "__DATA"] {
+        var k = 0
+        for o in l.o_order {
+            if l.o_seg[o] == seg {
+                k += 1
+            }
+        }
+        if k > 0 or seg == "__TEXT" {
+            n += 72 + 80 * k
+        }
+    }
+    n += 72
+    n += 16 + 16 + 24 + 80 + 32
+    if l.uuid {
+        n += 24
+    }
+    n += 24 + 16 + 24
+    if l.tool_version > 0 {
+        n += 8
+    }
+    for d in l.dl_install {
+        n += rd.align_up(24 + d.to_bytes().len() + 1, 8)
+    }
+    n += 16 + 16 + 16
+    n
+}
+
+fn ncmds(l: Ld) -> i64 {
+    var n = 2
+    if l.seg_dc.1 > 0 {
+        n += 1
+    }
+    if l.seg_data.1 > 0 {
+        n += 1
+    }
+    n += 1
+    n += 5
+    if l.uuid {
+        n += 1
+    }
+    n += 3 + l.dl_install.len() + 3
+    n
+}
+
+/// The whole file: `body` holds the image up to `__LINKEDIT` with the
+/// sections already written; `fx` the pointers to fix.
+pub fn finish(inout l: Ld, files: [i64], body: bytes, fx: Fixups, entry_addr: i64, le_off: i64) -> bytes ! str {
+    var img = body
+    let fixups = try chained(l, img, fx)
+    let tri = trie(l)
+    let starts = function_starts(l)
+    let (syms, nlocal, nextdef, nund) = if l.strip { stripped_symbols(l) } else { symbols(l, files) }
+    let (strtab, stroff_of) = strings(syms, l.strip, nlocal)
+    // Indirect symbols: each stub's import, then each GOT slot's.
+    var sym_index: Map[str, i64] = {}
+    for i in (nlocal + nextdef)..syms.name.len() {
+        sym_index.set(syms.name[i], i)
+    }
+    var indirect: [i64] = []
+    for g in l.stub_g {
+        indirect.push(sym_index.get(l.g_name[g]) ?? 0)
+    }
+    for i in 0..l.got_name.len() {
+        if l.got_g[i] >= 0 {
+            indirect.push(sym_index.get(l.g_name[l.got_g[i]]) ?? 0)
+        } else {
+            indirect.push(0x80000000)
+        }
+    }
+    // __LINKEDIT, in ld's order.
+    var le = byte_builder()
+    let fixups_off = le_off + le.len()
+    le.push_bytes(fixups)
+    let trie_off = le_off + le.len()
+    le.push_bytes(tri)
+    let starts_off = le_off + le.len()
+    le.push_bytes(starts)
+    let dic_off = le_off + le.len()
+    let symoff = le_off + le.len()
+    for i in 0..syms.name.len() {
+        rd.w32(le, stroff_of[i])
+        rd.w8(le, syms.ty[i])
+        rd.w8(le, syms.sect[i])
+        rd.w16(le, syms.desc[i])
+        rd.w64(le, syms.value[i])
+    }
+    let indoff = le_off + le.len()
+    for x in indirect {
+        rd.w32(le, x)
+    }
+    rd.wpad(le, 8)
+    let stroff = le_off + le.len()
+    le.push_bytes(strtab)
+    rd.wpad(le, 16)
+    let sig_off = le_off + le.len()
+    let ident = if l.ident != "" { l.ident } else { basename(l.out) }
+    let pages = (sig_off + 4095) / 4096
+    let sig_size = 12 + 8 + 88 + ident.to_bytes().len() + 1 + 32 * pages
+    for _k in 0..sig_size {
+        le.push_byte(0)
+    }
+    let le_bytes = le.to_bytes()
+    let file_size = le_off + le_bytes.len()
+    // The load commands.
+    let ord_sections = l.o_order
+    var c = byte_builder()
+    wseg(c, "__PAGEZERO", 0, layout.BASE, 0, 0, 0, 0, 0)
+    for seg in ["__TEXT", "__DATA_CONST", "__DATA"] {
+        var secs: [i64] = []
+        for o in ord_sections {
+            if l.o_seg[o] == seg {
+                secs.push(o)
+            }
+        }
+        if secs.len() == 0 and seg != "__TEXT" {
+            continue
+        }
+        if seg == "__TEXT" {
+            wseg(c, seg, layout.BASE, l.seg_text_size, 0, l.seg_text_size, 5, secs.len(), 0)
+        } else if seg == "__DATA_CONST" {
+            wseg(c, seg, l.seg_dc.0, l.seg_dc.1, l.seg_dc.2, l.seg_dc.3, 3, secs.len(), 0x10)
+        } else {
+            wseg(c, seg, l.seg_data.0, l.seg_data.1, l.seg_data.2, l.seg_data.3, 3, secs.len(), 0)
+        }
+        for o in secs {
+            rd.wname(c, l.o_name[o])
+            rd.wname(c, l.o_seg[o])
+            rd.w64(c, l.o_addr[o])
+            rd.w64(c, l.o_size[o])
+            rd.w32(c, if layout.is_zf(l, o) { 0 } else { l.o_off[o] })
+            rd.w32(c, l.o_p2[o])
+            rd.w32(c, 0)
+            rd.w32(c, 0)
+            rd.w32(c, l.o_flags[o])
+            if l.o_kind[o] == layout.K_STUBS {
+                rd.w32(c, 0)
+                rd.w32(c, 12)
+            } else if l.o_kind[o] == layout.K_GOT {
+                rd.w32(c, l.stub_g.len())
+                rd.w32(c, 0)
+            } else {
+                rd.w32(c, 0)
+                rd.w32(c, 0)
+            }
+            rd.w32(c, 0)
+        }
+    }
+    wseg(c, "__LINKEDIT", l.seg_linkedit_addr, rd.align_up(file_size - le_off, layout.PAGE), le_off, file_size - le_off, 1, 0, 0)
+    wlinkedit_cmd(c, 0x80000034, fixups_off, fixups.len())
+    wlinkedit_cmd(c, 0x80000033, trie_off, tri.len())
+    rd.w32(c, 2)
+    rd.w32(c, 24)
+    rd.w32(c, symoff)
+    rd.w32(c, syms.name.len())
+    rd.w32(c, stroff)
+    rd.w32(c, strtab.len())
+    rd.w32(c, 0xb)
+    rd.w32(c, 80)
+    rd.w32(c, 0)
+    rd.w32(c, nlocal)
+    rd.w32(c, nlocal)
+    rd.w32(c, nextdef)
+    rd.w32(c, nlocal + nextdef)
+    rd.w32(c, nund)
+    for _k in 0..6 {
+        rd.w32(c, 0)
+    }
+    rd.w32(c, if indirect.len() > 0 { indoff } else { 0 })
+    rd.w32(c, indirect.len())
+    for _k in 0..4 {
+        rd.w32(c, 0)
+    }
+    rd.w32(c, 0xe)
+    rd.w32(c, 32)
+    rd.w32(c, 12)
+    c.push_str("/usr/lib/dyld")
+    rd.wpad(c, 8)
+    let uuid_at = c.len() + 32
+    if l.uuid {
+        rd.w32(c, 0x1b)
+        rd.w32(c, 24)
+        for _k in 0..16 {
+            c.push_byte(0)
+        }
+    }
+    // No tool entry: this linker is not ld, and claiming to be a version of
+    // it would be false. `-tool_version` writes one (LD, that version), for
+    // linkdiff's byte comparison with ld's output and nothing else.
+    rd.w32(c, 0x32)
+    rd.w32(c, if l.tool_version > 0 { 32 } else { 24 })
+    rd.w32(c, 1)
+    rd.w32(c, l.minos)
+    rd.w32(c, l.sdk)
+    if l.tool_version > 0 {
+        rd.w32(c, 1)
+        rd.w32(c, 3)
+        rd.w32(c, l.tool_version)
+    } else {
+        rd.w32(c, 0)
+    }
+    rd.w32(c, 0x2a)
+    rd.w32(c, 16)
+    rd.w64(c, 0)
+    rd.w32(c, 0x80000028)
+    rd.w32(c, 24)
+    rd.w64(c, entry_addr - layout.BASE)
+    rd.w64(c, 0)
+    for k in 0..l.dl_install.len() {
+        let name = l.dl_install[k]
+        let size = rd.align_up(24 + name.to_bytes().len() + 1, 8)
+        rd.w32(c, 0xc)
+        rd.w32(c, size)
+        rd.w32(c, 24)
+        rd.w32(c, 2)
+        rd.w32(c, l.dl_cur[k])
+        rd.w32(c, l.dl_compat[k])
+        c.push_str(name)
+        c.push_byte(0)
+        rd.wpad(c, 8)
+    }
+    wlinkedit_cmd(c, 0x26, starts_off, starts.len())
+    wlinkedit_cmd(c, 0x29, dic_off, 0)
+    wlinkedit_cmd(c, 0x1d, sig_off, sig_size)
+    let cmds = c.to_bytes()
+    if 32 + cmds.len() > l.o_addr[l.o_order[0]] - layout.BASE {
+        fail("the load commands do not fit before the first section")
+    }
+    let flags = 0x200085
+    var h = byte_builder()
+    rd.w32(h, 0xfeedfacf)
+    rd.w32(h, 0x0100000c)
+    rd.w32(h, 0)
+    rd.w32(h, 2)
+    rd.w32(h, ncmds(l))
+    rd.w32(h, cmds.len())
+    rd.w32(h, flags)
+    rd.w32(h, 0)
+    h.push_bytes(cmds)
+    img.copy_from(0, h.to_bytes())
+    var file = img.concat(le_bytes)
+    if l.uuid {
+        // A content hash, not a timestamp: two links of the same inputs agree.
+        let digest = crypto_hash.sha256_of(file.slice(0, sig_off))
+        for k in 0..16 {
+            var v = digest.at(k)
+            if k == 6 {
+                v = v.bit_and(0x0f).bit_or(0x80)
+            } else if k == 8 {
+                v = v.bit_and(0x3f).bit_or(0x80)
+            }
+            file.set(uuid_at + 8 + k, v)
+        }
+    }
+    // ld-prime's executable segment limit is the size of __text; strip's,
+    // re-signing, the size of the __TEXT segment.
+    let limit = if l.strip { l.seg_text_size } else { text_section_size(l) }
+    match codesig.linker_sign_limit(file, ident, limit) {
+        Ok(signed) -> signed
+        Err(e) -> fail("signing: {e}")
+    }
+}
+
+fn text_section_size(l: Ld) -> i64 {
+    for o in l.o_order {
+        if l.o_seg[o] == "__TEXT" and l.o_name[o] == "__text" {
+            return l.o_size[o]
+        }
+    }
+    0
+}
+
+pub fn basename(p: str) -> str {
+    let parts = p.split("/")
+    parts[parts.len() - 1]
+}
