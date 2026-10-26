@@ -240,6 +240,10 @@ pub fn sym_target(l: Ld, y: i64) -> (i64, i64, i64, i64) {
         if k == state.G_DEFINED {
             let def = l.g_def[g]
             let a = l.y_atom[def]
+            if a < 0 {
+                // Defined in a section that is not linked (debug, unwind).
+                return (state.T_NONE, -1, 0, g)
+            }
             return (state.T_ATOM, a, l.y_value[def] - l.s_addr[l.y_sect[def]] - l.a_off[a], g)
         }
         if k == state.G_DYLIB {
