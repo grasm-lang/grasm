@@ -109,18 +109,20 @@ link_fixture_build() {
 }
 
 # Whether SDL2 can be found where `cc` would find it, with LIBRARY_PATH set
-# as `scripts/sdltest.sh` sets it; answers on stdout.
+# (and exported, for the builds) as `scripts/sdltest.sh` sets it: SDL=yes or
+# SDL=no. Called directly, not in `$(...)`, whose export would not reach
+# this shell.
 link_sdl_present() {
     if [ -z "${LIBRARY_PATH:-}" ] && command -v brew >/dev/null 2>&1; then
         LIBRARY_PATH="$(brew --prefix)/lib"
         export LIBRARY_PATH
     fi
+    SDL=no
     local d
-    for d in ${LIBRARY_PATH:-} /usr/local/lib; do
+    for d in ${LIBRARY_PATH//:/ } /usr/local/lib; do
         if [ -e "$d/libSDL2.dylib" ]; then
-            echo yes
+            SDL=yes
             return 0
         fi
     done
-    echo no
 }

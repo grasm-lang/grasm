@@ -57,7 +57,7 @@ s3_driver
 s3_runtime
 s3_collect
 EXTRA=${LINK_EXTRA:-}
-SDL=$(link_sdl_present)
+link_sdl_present
 LD_VERSION=$(ld -v 2>&1 | head -1 | sed -E 's/.*ld-([0-9.]+).*/\1/')
 case "$LD_VERSION" in
 [0-9]*) ;;

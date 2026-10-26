@@ -53,7 +53,7 @@ s3_driver
 s3_runtime
 s3_collect
 EXTRA=${LINK_EXTRA:-}
-SDL=$(link_sdl_present)
+link_sdl_present
 
 considered=0
 cl_pass=0
