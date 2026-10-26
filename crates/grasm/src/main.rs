@@ -968,6 +968,34 @@ fn run() -> ExitCode {
             }
             ExitCode::SUCCESS
         }
+        // The parser's output, for holding a second frontend to this one
+        // (docs/self-hosting.md, S2): `{:?}` of the module's AST on one
+        // line -- every node with its span, the documentation and the wide
+        // literals -- then each diagnostic on a line of its own. One file,
+        // its imports not followed: this is the parser, not the loader.
+        Some("ast") => {
+            let Some(path) = args.get(1) else {
+                eprintln!("usage: grasm ast <file.gr>");
+                return ExitCode::FAILURE;
+            };
+            let src = match std::fs::read_to_string(path) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("error: cannot read `{path}`: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let out = grasm_syntax::parse(&src);
+            println!("{:?}", out.module);
+            for d in &out.diagnostics {
+                println!("{d:?}");
+            }
+            if out.diagnostics.is_empty() {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            }
+        }
         Some("version") | Some("--version") => {
             // From the manifest, so a release cannot ship a version string
             // that disagrees with the version it was built at — this one said
@@ -1031,6 +1059,7 @@ fn run() -> ExitCode {
                 "  journal <file> [--full]      what a recorded run read from outside itself"
             );
             eprintln!("  tokens <file.gr>             dump lexer output (debug)");
+            eprintln!("  ast <file.gr>                dump parser output: AST and diagnostics (debug)");
             eprintln!("  version                      print version");
             if asked {
                 ExitCode::SUCCESS

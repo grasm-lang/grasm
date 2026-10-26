@@ -5,8 +5,72 @@ Every defect that is known and not fixed, with its severity from
 to paste. S1 and S2 block a release; S3 and S4 do not, and this file is what
 makes shipping them honest rather than quiet.
 
-**Open S1: none confirmed; one under investigation (below). Open S2: none.
-Open S3: none. Open S4: none.**
+**Open S1: one, the lexer's panic on `"\é"` (below); one more under
+investigation. Open S2: none. Open S3: one, a block whose value is a map
+literal. Open S4: two, a nested interpolation's spans and a backslash at the
+end of a file.**
+
+## Found on 2026-10-27 by S2 part one (the frontend in Grasm)
+
+Each was found by holding `compiler/front` to the Rust frontend
+(`tokentest`, `asttest`, `parsediag`, `fuzz_front`) and each is in the Rust
+frontend, which S2 does not change. Where the Rust frontend gives an answer
+-- a wrong one -- the Grasm frontend gives the same, so the two stay
+comparable and both are fixed together; where it crashes, the Grasm one does
+what was meant, and the gates count the crash apart.
+
+**The lexer panics on a backslash before a character of more than one byte
+-- *open, S1*.** `"\é"` is a whole program that aborts `grasm check`,
+`grasm tokens` and every other command with `panicked at
+crates/grasm_syntax/src/lexer.rs:706:37: end byte index 7 is out of bounds`
+(exit 134), and `"\éa"` with "byte index … is not a char boundary". The
+unknown-escape path in `lex_string` takes one byte after the backslash,
+so the error token ends inside the character, and the next token starts on
+a continuation byte that `lex_operator` slices as the start of one. The
+fix is to take the whole character, as the Grasm lexer does: it reports
+``unknown escape `\é` `` and goes on. `fuzz_front` and `parsediag` count
+these programs as Rust panics, apart from agreement, and fail on any other.
+
+**A block whose value is a map literal is refused -- *open, S3*.**
+
+```
+fn f() {
+    let x = { {"a": 1} }
+}
+```
+
+is "expected `:` but found `}`" at the outer brace, and recovery then turns
+the next statement into a top-level declaration. `{` is first read as a map
+([G-MAP-BLOCK-AMBIG]); a failed reading that read a `key :` is a map with an
+error in it, and `map_committed` records that. But the flag is one per
+parser, and the inner map literal set it, so the outer reading, which failed
+at its own missing `:`, is taken as committed too. Saving the flag around
+each reading fixes it. The Grasm parser shares the flag the same way.
+
+**A nested interpolation's spans count from the wrong place -- *open,
+S4*.** In `"a{ "{b}" }c"` the AST gives `b` the span 3..4, an offset in the
+outer interpolation's text, not in the file (52..53 in a file where the
+string starts at 46). An interpolation's tokens are shifted to the file's
+offsets, but the offsets inside their string tokens are not, so an
+interpolation inside an interpolation is parsed at the inner text's offset
+alone; a diagnostic in it points at the start of the file. The Grasm parser
+reproduces the offsets.
+
+**A backslash at the end of a file is "unknown escape `\\0`" -- *open,
+S4*.** A file ending `"abc\` reports ``unknown escape `\\0` `` -- the byte
+read past the end is 0, rendered with `escape_debug` and a second
+backslash -- and its end-of-file token sits one byte past the end. The
+string is unterminated, and that is what it should say. The Grasm lexer
+reproduces it.
+
+**An interpolation inside a block inside an interpolation takes exponential
+time.** `"{ {"{ {"{ { … 1 … } }"} }"} }"` takes 1.0 s to parse at 20 levels
+and 16.5 s at 24 in `grasm check`'s parser, doubling with each level. A
+`{` is read as a map and, failing that, again as a block, and the memo that
+made that linear for plain braces (`not_a_map`) belongs to one parser: an
+interpolation is parsed by a parser of its own, made afresh each time its
+string is read, so both readings of every level parse everything inside it
+again. The Grasm parser does the same work, about twenty times slower.
 
 ## Found on 2026-10-26 by S5 part one (the runtime in Grasm)
 

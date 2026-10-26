@@ -1,0 +1,9 @@
+[package]
+name = "front"
+version = "0.1.0"
+entry = "src/main.gr"
+
+# The compiler's frontend in Grasm (docs/self-hosting.md, stage S2): reads a
+# source file and prints what the Rust frontend's dump of it prints. It
+# reads files and writes to stdout and stderr, nothing else.
+capabilities = ["io"]

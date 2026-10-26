@@ -1,0 +1,280 @@
+// The concrete syntax tree: built from the parser's events (parse.gr), it
+// holds every token of the file once, in order, under the node that read
+// it -- an interpolation's tokens under the string they came from -- so it
+// prints the source back byte for byte, trivia and all (`print_back`).
+//
+// Nodes are kept in arrays: a node's children are `elems[first .. first +
+// count]`, each a node id (>= 0) or a token, -(id + 1), where token ids
+// number every token stream end to end: the file's first, then each
+// interpolation's. `post` lists the nodes in the order they were completed,
+// children before parents, which is the order the AST is built in.
+//
+// Both directions -- building and printing -- are loops over explicit
+// stacks: nothing here recurses per level of nesting.
+import lex
+import syn
+import parse
+
+type Cst = {
+    regions: [Lexed],
+    // Every token, by global id: its stream, and its place in it.
+    g_reg: [i64],
+    g_pos: [i64],
+    g_kind: [i64],
+    g_start: [i64],
+    g_end: [i64],
+    g_ival: [i64],
+    g_jval: [i64],
+    g_virt: [bool],
+    reg_base: [i64],
+    // Nodes.
+    kind: [i64],
+    s: [i64],
+    e: [i64],
+    s2: [i64],
+    e2: [i64],
+    // The token stream a node's tokens are in.
+    reg: [i64],
+    first: [i64],
+    count: [i64],
+    elems: [i64],
+    post: [i64],
+    root: i64,
+}
+
+/// Builds the tree from a finished parse.
+pub fn build(p: Parser) -> Cst {
+    let regions = p.regions
+    var g_reg_l: [i64] = []
+    var g_pos_l: [i64] = []
+    var g_kind_l: [i64] = []
+    var g_start_l: [i64] = []
+    var g_end_l: [i64] = []
+    var g_ival_l: [i64] = []
+    var g_jval_l: [i64] = []
+    var g_virt_l: [bool] = []
+    var reg_base_l: [i64] = []
+    var kind_l: [i64] = []
+    var s_l: [i64] = []
+    var e_l: [i64] = []
+    var s2_l: [i64] = []
+    var e2_l: [i64] = []
+    var reg_l: [i64] = []
+    var first_l: [i64] = []
+    var count_l: [i64] = []
+    var elems_l: [i64] = []
+    var post_l: [i64] = []
+    var root = -1
+    for r in 0..regions.len() {
+        reg_base_l.push(g_kind_l.len())
+        let lx = regions[r]
+        for t in 0..lx.kind.len() {
+            g_reg_l.push(r)
+            g_pos_l.push(t)
+            g_kind_l.push(lx.kind[t])
+            g_start_l.push(lx.start[t])
+            g_end_l.push(lx.end[t])
+            g_ival_l.push(lx.ival[t])
+            g_jval_l.push(lx.jval[t])
+            g_virt_l.push(lx.virt[t])
+        }
+    }
+    let ev = p.ev
+    let n = ev.len() / 9
+    var consumed: [bool] = []
+    for _ in 0..n {
+        consumed.push(false)
+    }
+    // Open nodes, innermost last, and where each one's children begin in
+    // `pending`.
+    var open: [i64] = []
+    var marks: [i64] = []
+    var pending: [i64] = []
+    // The token stream being read and the next token in it, with the ones
+    // set aside for an interpolation's.
+    var cur_reg = 0
+    var cur_pos = 0
+    var saved_reg: [i64] = []
+    var saved_pos: [i64] = []
+    var chain: [i64] = []
+    for ei in 0..n {
+        if ev[(ei) * 9 + 0] == 0 {
+            if ev[(ei) * 9 + 1] < 0 or consumed[ei] {
+                continue
+            }
+            // This node and every node `precede` put around it, outermost
+            // first.
+            chain = [ei]
+            var f = ev[(ei) * 9 + 3]
+            while f >= 0 {
+                if ev[(f) * 9 + 1] < 0 {
+                    break
+                }
+                consumed[f] = true
+                chain.push(f)
+                f = ev[(f) * 9 + 3]
+            }
+            // The tokens before it belong to the node around it.
+            let upto = ev[(ei) * 9 + 2]
+            let base = reg_base_l[cur_reg]
+            while cur_pos < upto {
+                pending.push(0 - (base + cur_pos) - 1)
+                cur_pos += 1
+            }
+            var k = chain.len() - 1
+            while k >= 0 {
+                let evi = chain[k]
+                let id = kind_l.len()
+                kind_l.push(ev[(evi) * 9 + 1])
+                s_l.push(ev[(evi) * 9 + 5])
+                e_l.push(ev[(evi) * 9 + 6])
+                s2_l.push(ev[(evi) * 9 + 7])
+                e2_l.push(ev[(evi) * 9 + 8])
+                first_l.push(0)
+                count_l.push(0)
+                pending.push(id)
+                open.push(id)
+                marks.push(pending.len())
+                if ev[(evi) * 9 + 4] >= 0 {
+                    // An interpolation: its tokens are another stream's.
+                    saved_reg.push(cur_reg)
+                    saved_pos.push(cur_pos)
+                    cur_reg = ev[(evi) * 9 + 4]
+                    cur_pos = 0
+                }
+                reg_l.push(cur_reg)
+                k -= 1
+            }
+        } else {
+            let id = open.pop() ?? -1
+            let mark = marks.pop() ?? 0
+            let nk = kind_l[id]
+            // An interpolation or the file takes the rest of its stream, end
+            // of file included; any other node the tokens up to its end.
+            var upto = ev[(ei) * 9 + 2]
+            let lx_len = regions[cur_reg].kind.len()
+            if nk == syn.N_INTERP or nk == syn.N_INTERP_FAILED or nk == syn.N_ROOT {
+                upto = lx_len
+            }
+            let base = reg_base_l[cur_reg]
+            while cur_pos < upto {
+                pending.push(0 - (base + cur_pos) - 1)
+                cur_pos += 1
+            }
+            first_l[id] = elems_l.len()
+            count_l[id] = pending.len() - mark
+            for j in mark..pending.len() {
+                elems_l.push(pending[j])
+            }
+            while pending.len() > mark {
+                pending.pop()
+            }
+            post_l.push(id)
+            if nk == syn.N_INTERP or nk == syn.N_INTERP_FAILED {
+                cur_reg = saved_reg.pop() ?? 0
+                cur_pos = saved_pos.pop() ?? 0
+            }
+            if nk == syn.N_ROOT {
+                root = id
+            }
+        }
+    }
+    Cst{ regions: regions, g_reg: g_reg_l, g_pos: g_pos_l, g_kind: g_kind_l, g_start: g_start_l, g_end: g_end_l, g_ival: g_ival_l, g_jval: g_jval_l, g_virt: g_virt_l, reg_base: reg_base_l, kind: kind_l, s: s_l, e: e_l, s2: s2_l, e2: e2_l, reg: reg_l, first: first_l, count: count_l, elems: elems_l, post: post_l, root: root }
+}
+
+/// The source the tree holds, printed back from it: each token of the
+/// file's stream with the trivia before it, in tree order. A token's
+/// trivia is what lies between it and the token before it *in the stream*,
+/// not the one printed before it, so a token the tree lost, repeated or put
+/// out of order shows in the bytes. An interpolation's tokens are inside
+/// its string's and are not printed again; a token the parser put in is not
+/// printed at all.
+pub fn print_back(c: Cst, src: bytes) -> bytes {
+    let n = src.len()
+    // Where each of the file's tokens' trivia begins.
+    let len0 = c.regions[0].kind.len()
+    var lead: [i64] = []
+    var prev = 0
+    for t in 0..len0 {
+        lead.push(prev.min(c.g_start[t].min(n)))
+        if not c.g_virt[t] {
+            prev = c.g_end[t].min(n)
+        }
+    }
+    var out = byte_builder()
+    var stack: [i64] = [c.root]
+    var idx: [i64] = [0]
+
+    while stack.len() > 0 {
+        let top = stack.len() - 1
+        let node = stack[top]
+        let i = idx[top]
+        if i >= c.count[node] {
+            stack.pop()
+            idx.pop()
+            continue
+        }
+        idx[top] = i + 1
+        let el = c.elems[c.first[node] + i]
+        if el >= 0 {
+            let k = c.kind[el]
+            if k != syn.N_INTERP and k != syn.N_INTERP_FAILED {
+                stack.push(el)
+                idx.push(0)
+            }
+            continue
+        }
+        let t = 0 - el - 1
+        if c.g_reg[t] != 0 or c.g_virt[t] {
+            continue
+        }
+        let s = c.g_start[t].min(n)
+        let e = c.g_end[t].min(n).max(s)
+        out.push_bytes(src.slice(lead[t], s))
+        out.push_bytes(src.slice(s, e))
+    }
+    // Nothing after the end-of-file token: what follows the last token is
+    // that token's trivia, so the tree must hold it.
+    out.to_bytes()
+}
+
+/// The tree as text, a node a line, for reading.
+pub fn dump(c: Cst, src: bytes) -> str {
+    var out = str_builder()
+    var stack: [i64] = [c.root]
+    var idx: [i64] = [0]
+    out.push_str("{syn.node_name(c.kind[c.root])}\n")
+    while stack.len() > 0 {
+        let top = stack.len() - 1
+        let node = stack[top]
+        let i = idx[top]
+        if i >= c.count[node] {
+            stack.pop()
+            idx.pop()
+            continue
+        }
+        idx[top] = i + 1
+        let el = c.elems[c.first[node] + i]
+        let pad = "  ".repeat(stack.len())
+        if el >= 0 {
+            var sp = ""
+            if c.s[el] >= 0 {
+                sp = " {c.s[el]}..{c.e[el]}"
+            }
+            out.push_str("{pad}{syn.node_name(c.kind[el])}{sp}\n")
+            stack.push(el)
+            idx.push(0)
+        } else {
+            let t = 0 - el - 1
+            var where = ""
+            if c.g_reg[t] != 0 {
+                where = " [stream {c.g_reg[t]}]"
+            }
+            if c.g_virt[t] {
+                where = where + " [put in]"
+            }
+            out.push_str("{pad}{lex.kind_name(c.g_kind[t])} {c.g_start[t]}..{c.g_end[t]}{where}\n")
+        }
+    }
+    out.to_str()
+}

@@ -1,0 +1,353 @@
+// `front`: the Grasm compiler's frontend, written in Grasm
+// (docs/self-hosting.md, stage S2).
+//
+//     front tokens <file.gr>    the token stream, as `grasm tokens` prints it
+//     front ast <file.gr>       the AST and the parser's diagnostics, as
+//                               `grasm ast` prints them
+//     front cst <file.gr> -o <out>
+//                               the source printed back from the CST
+//     front tree <file.gr>      the CST, a node a line, for reading
+//
+// Every command reads one file and prints what the Rust frontend's command
+// of the same name prints for it, byte for byte; the gates hold it to that.
+//
+//     rdebug.gr   Rust's `{:?}` of strings and floats, which the dumps use
+//     lex.gr      the lexer
+//     syn.gr      the kinds of CST node
+//     parse.gr    the parser, which makes the CST as events
+//     cst.gr      the CST, built from the events, and printed back
+//     ast.gr      the AST, built from the CST, and printed
+import rdebug
+import lex
+import syn
+import parse
+import cst
+import ast
+
+fn usage() {
+    eprint("usage: front tokens <file.gr>")
+    eprint("       front ast <file.gr>")
+    eprint("       front cst <file.gr> -o <out>")
+    eprint("       front tree <file.gr>")
+    exit(2)
+}
+
+/// Whether `b` is UTF-8 as Rust's `str::from_utf8` accepts it.
+fn utf8_valid(b: bytes) -> bool {
+    let n = b.len()
+    var i = 0
+    while i < n {
+        let c = b.at(i)
+        if c < 128 {
+            i += 1
+            continue
+        }
+        var len = 0
+        var lo = 128
+        var hi = 191
+        if c >= 194 and c <= 223 {
+            len = 2
+        } else if c >= 224 and c <= 239 {
+            len = 3
+            if c == 224 {
+                lo = 160
+            } else if c == 237 {
+                hi = 159
+            }
+        } else if c >= 240 and c <= 244 {
+            len = 4
+            if c == 240 {
+                lo = 144
+            } else if c == 244 {
+                hi = 143
+            }
+        } else {
+            return false
+        }
+        if i + len > n {
+            return false
+        }
+        let c1 = b.at(i + 1)
+        if c1 < lo or c1 > hi {
+            return false
+        }
+        for k in 2..len {
+            let ck = b.at(i + k)
+            if ck < 128 or ck > 191 {
+                return false
+            }
+        }
+        i += len
+    }
+    true
+}
+
+/// Reads a source file as the Rust frontend does, or says why it cannot.
+fn read_source(path: str) -> bytes {
+    match read_bytes(path) {
+        Ok(b) -> {
+            if not utf8_valid(b) {
+                eprint("error: cannot read `{path}`: stream did not contain valid UTF-8")
+                exit(1)
+            }
+            b
+        }
+        Err(e) -> {
+            eprint("error: cannot read `{path}`: {e}")
+            exit(1)
+            bytes_of([])
+        }
+    }
+}
+
+/// Offsets of each line's first byte, for 1-based line and column.
+type LineIndex = { starts: [i64] }
+
+fn line_index(src: bytes) -> LineIndex {
+    var starts = [0]
+    for i in 0..src.len() {
+        if src.at(i) == 10 {
+            starts.push(i + 1)
+        }
+    }
+    LineIndex{ starts: starts }
+}
+
+/// (line, column) of byte offset `off`, both from 1.
+fn line_col(ix: LineIndex, off: i64) -> (i64, i64) {
+    var a = 0
+    var b = ix.starts.len()
+    // The last line start not after `off`.
+    while b - a > 1 {
+        let m = (a + b) / 2
+        if ix.starts[m] <= off {
+            a = m
+        } else {
+            b = m
+        }
+    }
+    (a + 1, off - ix.starts[a] + 1)
+}
+
+/// One token as `{:?}` of the Rust `TokenKind` prints it.
+fn push_token_debug(inout out: ByteBuilder, esc: EscTable, lx: Lexed, i: i64) {
+    let k = lx.kind[i]
+    if k == lex.T_IDENT {
+        out.push_str("Ident(")
+        rdebug.push_str_debug(out, esc, lx.text[lx.ival[i]])
+        out.push_str(")")
+    } else if k == lex.T_INT {
+        out.push_str("Int({lx.ival[i]})")
+    } else if k == lex.T_WIDEINT {
+        out.push_str("WideInt({rdebug.u64_display(lx.ival[i])})")
+    } else if k == lex.T_FLOAT {
+        out.push_str("Float({rdebug.f64_debug(lx.floats[lx.ival[i]])})")
+    } else if k == lex.T_STR {
+        out.push_str("Str([")
+        let first = lx.ival[i]
+        for p in first..first + lx.jval[i] {
+            if p > first {
+                out.push_str(", ")
+            }
+            if lx.part_kind[p] == 0 {
+                out.push_str("Text(")
+                rdebug.push_str_debug(out, esc, lx.part_text[p])
+                out.push_str(")")
+            } else {
+                out.push_str("Interp \{ src: ")
+                rdebug.push_str_debug(out, esc, lx.part_text[p])
+                out.push_str(", offset: {lx.part_off[p]} }")
+            }
+        }
+        out.push_str("])")
+    } else {
+        out.push_str(lex.kind_name(k))
+    }
+}
+
+/// `grasm tokens`: each token's line, column and kind on stdout, each
+/// lexical error on stderr; exit 1 when there was one.
+fn cmd_tokens(path: str) {
+    let src = read_source(path)
+    let esc = rdebug.new_esc_table()
+    let lx = lex.lex(src, false)
+    let ix = line_index(src)
+    var out = byte_builder()
+    var had_error = false
+    for i in 0..lx.kind.len() {
+        let (line, col) = line_col(ix, lx.start[i])
+        if lx.kind[i] == lex.T_ERROR {
+            had_error = true
+            eprint("{path}:{line}:{col}: error: {lx.text[lx.ival[i]]}")
+        } else {
+            out.push_str("{line}:{col}\t")
+            push_token_debug(out, esc, lx, i)
+            out.push_byte(10)
+        }
+    }
+    write_stdout(out)
+    if had_error {
+        exit(1)
+    }
+}
+
+/// Writes what was built, which ends in a newline, as `print` would write
+/// it without that last newline.
+fn write_stdout(b: ByteBuilder) {
+    let n = b.len()
+    if n == 0 {
+        return
+    }
+    let all = b.to_bytes()
+    print(all.slice(0, n - 1).to_str())
+}
+
+/// `grasm ast`: `{:?}` of the module on one line, then each diagnostic on
+/// one; exit 1 when there was one.
+fn cmd_ast(path: str) {
+    let src = read_source(path)
+    let esc = rdebug.new_esc_table()
+    let lx = lex.lex(src, true)
+    let p = parse.parse(src, lx)
+    let c = cst.build(p)
+    let m = ast.build(c, src, p.wide_ints, lx.doc_start, lx.doc_end, lx.doc_text)
+    var out = ast.print_module(m, esc)
+    out.push_byte(10)
+    for i in 0..p.d_s.len() {
+        out.push_str("Diagnostic \{ severity: Error, span: Span \{ start: {p.d_s[i]}, end: {p.d_e[i]} }, message: ")
+        rdebug.push_str_debug(out, esc, p.d_msg[i])
+        if p.d_help[i] == "" {
+            out.push_str(", help: None }")
+        } else {
+            out.push_str(", help: Some(")
+            rdebug.push_str_debug(out, esc, p.d_help[i])
+            out.push_str(") }")
+        }
+        out.push_byte(10)
+    }
+    write_stdout(out)
+    if p.d_s.len() > 0 {
+        exit(1)
+    }
+}
+
+/// The source printed back from the CST, into `out`.
+fn cmd_cst(path: str, outp: str) {
+    let src = read_source(path)
+    let lx = lex.lex(src, true)
+    let p = parse.parse(src, lx)
+    let c = cst.build(p)
+    match write_bytes(outp, cst.print_back(c, src)) {
+        Ok(_) -> ()
+        Err(e) -> {
+            eprint("error: cannot write `{outp}`: {e}")
+            exit(1)
+        }
+    }
+}
+
+fn cmd_tree(path: str) {
+    let src = read_source(path)
+    let lx = lex.lex(src, true)
+    let p = parse.parse(src, lx)
+    let c = cst.build(p)
+    print(cst.dump(c, src))
+}
+
+/// Times the frontend's stages over the files listed, one path a line,
+/// read into memory first: lexing alone, then lexing and parsing into the
+/// CST, then all of that and the AST. Prints the lines and each stage's
+/// nanoseconds, best of `rounds`.
+fn cmd_bench(list: str, rounds: i64) {
+    var srcs: [bytes] = []
+    var lines = 0
+    match read_file(list) {
+        Ok(text) -> {
+            for path in text.lines() {
+                if path != "" {
+                    let b = read_source(path)
+                    for i in 0..b.len() {
+                        if b.at(i) == 10 {
+                            lines += 1
+                        }
+                    }
+                    srcs.push(b)
+                }
+            }
+        }
+        Err(e) -> {
+            eprint("error: cannot read `{list}`: {e}")
+            exit(1)
+        }
+    }
+    var best_lex = 0
+    var best_parse = 0
+    var best_ast = 0
+    var tokens = 0
+    var nodes = 0
+    for r in 0..rounds {
+        var t0 = monotonic_nanos()
+        var nt = 0
+        for src in srcs {
+            let lx = lex.lex(src, true)
+            nt += lx.kind.len()
+        }
+        let lex_ns = monotonic_nanos() - t0
+        t0 = monotonic_nanos()
+        var nn = 0
+        for src in srcs {
+            let lx = lex.lex(src, true)
+            let p = parse.parse(src, lx)
+            let c = cst.build(p)
+            nn += c.kind.len()
+        }
+        let parse_ns = monotonic_nanos() - t0
+        t0 = monotonic_nanos()
+        for src in srcs {
+            let lx = lex.lex(src, true)
+            let p = parse.parse(src, lx)
+            let c = cst.build(p)
+            let m = ast.build(c, src, p.wide_ints, lx.doc_start, lx.doc_end, lx.doc_text)
+            nn += m.decls.len() * 0
+        }
+        let ast_ns = monotonic_nanos() - t0
+        if r == 0 or lex_ns < best_lex {
+            best_lex = lex_ns
+        }
+        if r == 0 or parse_ns < best_parse {
+            best_parse = parse_ns
+        }
+        if r == 0 or ast_ns < best_ast {
+            best_ast = ast_ns
+        }
+        tokens = nt
+        nodes = nn
+    }
+    print("files: {srcs.len()}   lines: {lines}   tokens: {tokens}   cst nodes: {nodes}")
+    print("lex_ns: {best_lex}   lex_parse_cst_ns: {best_parse}   lex_parse_cst_ast_ns: {best_ast}")
+}
+
+fn main() {
+    let a = args()
+    if a.len() == 3 and a[0] == "bench" {
+        cmd_bench(a[1], a[2].parse_int() ?? 3)
+        return
+    }
+    if a.len() == 2 and a[0] == "tokens" {
+        cmd_tokens(a[1])
+        return
+    }
+    if a.len() == 2 and a[0] == "ast" {
+        cmd_ast(a[1])
+        return
+    }
+    if a.len() == 4 and a[0] == "cst" and a[2] == "-o" {
+        cmd_cst(a[1], a[3])
+        return
+    }
+    if a.len() == 2 and a[0] == "tree" {
+        cmd_tree(a[1])
+        return
+    }
+    usage()
+}

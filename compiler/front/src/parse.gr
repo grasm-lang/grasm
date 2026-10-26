@@ -1,0 +1,3632 @@
+// The parser: hand-written recursive descent over the token stream, making
+// a lossless concrete syntax tree with error nodes (docs/self-hosting.md
+// §4). It is held to the Rust parser (`crates/grasm_syntax/src/parser.rs`)
+// decision for decision -- the same newline modes, the same lookaheads and
+// rewinds, the same recovery, the same nesting budget -- because what it is
+// judged on is that the AST built from its tree (ast.gr) and its first
+// diagnostic are the Rust parser's, on every file in the repository and on
+// whatever the fuzzer makes.
+//
+// The tree is made as events, as rust-analyzer's parser makes it: a node is
+// started (a marker) and later completed with its kind, or left as a
+// tombstone if the construct failed, in which case its tokens fall to the
+// node around it -- the N_ERROR node recovery makes. A node that turns out to
+// have a node before it as its first child (`a + b` once `+` is seen) is
+// started after the fact, by `precede`. Tokens are not events: a node owns
+// the tokens consumed between its events, so a rewind is a truncation and a
+// skipped newline is never lost.
+//
+// Depth. The Rust parser caps the depth of the tree at 2048 levels, charged
+// as it charges them; past that it reports "code is nested too deeply" and
+// stops. This parser charges the same levels at the same tokens. Within
+// the cap it recurses, as the Rust one does, a few calls per level; the
+// shapes the cap does not bound -- a chain of `^` or `??`, `else if` after
+// `else if` -- are loops here, so no input reaches the language's
+// 10,000-call guarantee.
+import lex
+import syn
+
+let MAX_NESTING = 2048
+
+// Newline modes.
+let KEEP = 0
+let SKIP = 1
+
+/// What a parse function made: whether it succeeded, the AST kind of an
+/// expression (syn.X_*) or the token of an identifier, the span the Rust
+/// parser gives it, and the marker of the node made for it.
+type Res = { ok: bool, k: i64, s: i64, e: i64, m: i64 }
+
+fn bad() -> Res {
+    Res{ ok: false, k: 0, s: 0, e: 0, m: -1 }
+}
+
+fn good(k: i64, s: i64, e: i64, m: i64) -> Res {
+    Res{ ok: true, k: k, s: s, e: e, m: m }
+}
+
+// The kinds of TypeExpr, for the checks an `impl` makes of its type.
+let Y_NAME = 1
+let Y_LIST = 2
+let Y_REF = 3
+let Y_FALLIBLE = 4
+let Y_TUPLE = 5
+let Y_UNION = 6
+let Y_FN = 7
+
+/// A type, with what an `impl` asks of it: the name, when it is a bare
+/// one-segment name; a named type's arguments, each as a bare name or ""
+/// with its span; a list's element likewise.
+type TyRes = {
+    ok: bool,
+    k: i64,
+    s: i64,
+    e: i64,
+    m: i64,
+    simple: str,
+    nseg: i64,
+    args_name: [str],
+    args_s: [i64],
+    args_e: [i64],
+    elem_name: str,
+    elem_s: i64,
+    elem_e: i64,
+}
+
+fn ty_bad() -> TyRes {
+    TyRes{ ok: false, k: 0, s: 0, e: 0, m: -1, simple: "", nseg: 0, args_name: [], args_s: [], args_e: [], elem_name: "", elem_s: 0, elem_e: 0 }
+}
+
+fn ty_plain(k: i64, s: i64, e: i64, m: i64) -> TyRes {
+    TyRes{ ok: true, k: k, s: s, e: e, m: m, simple: "", nseg: 0, args_name: [], args_s: [], args_e: [], elem_name: "", elem_s: 0, elem_e: 0 }
+}
+
+/// A parameter list: each parameter's mode (0 let, 1 inout, 2 own) and
+/// span, and the first one's name.
+type ParamsRes = { ok: bool, modes: [i64], s: [i64], e: [i64], first: str }
+
+type Parser = {
+    // The tokens being parsed: the file's, or an interpolation's.
+    lx: Lexed,
+    reg: i64,
+    // Every token stream the tree refers to: 0 the file, then one per
+    // interpolation parsed, in the order they were started.
+    regions: [Lexed],
+    i: i64,
+    modes: [i64],
+    d_s: [i64],
+    d_e: [i64],
+    d_msg: [str],
+    d_help: [str],
+    // In a condition, `Name {` is not a struct literal ([G-STRUCT-AMBIG]).
+    no_struct_lit: bool,
+    // The state fields of the actor whose method is being parsed.
+    actor_fields: [str],
+    in_actor: bool,
+    depth: i64,
+    // Positions of `{` already found not to open a map literal.
+    not_a_map: Map[i64, bool],
+    map_committed: bool,
+    // Where each decimal literal past `i64` was written, as the Rust parser
+    // records them -- a rewound attempt's included.
+    wide_ints: [i64],
+    src: bytes,
+    // The events, once the parse is done (`parse` puts them here): nine
+    // numbers an event -- 0 start or 1 finish; a start's node kind, -1 for
+    // a tombstone; the token position; the start `precede` made for it, -1
+    // for none; the token stream an interpolation's node opens; the node's
+    // spans. While parsing they are the `ev` every function is handed.
+    ev: [i64],
+}
+
+fn new_parser(lx: Lexed, src: bytes) -> Parser {
+    Parser{ lx: lx, reg: 0, regions: [], i: 0, modes: [0], d_s: [], d_e: [], d_msg: [], d_help: [],
+        no_struct_lit: false, actor_fields: [], in_actor: false, depth: 0, not_a_map: {},
+        map_committed: false, wide_ints: [], src: src, ev: [] }
+}
+
+/// Parses a whole file.
+pub fn parse(src: bytes, lx: Lexed) -> Parser {
+    var p = new_parser(lx, src)
+    var ev: [i64] = []
+    p.regions.push(lex.empty_lexed())
+    let root = ev_start(p, ev)
+    parse_module_decls(p, ev)
+    ev_complete(p, ev, root, syn.N_ROOT, -1, -1)
+    p.regions[0] = p.lx
+    p.ev = ev
+    p
+}
+
+// ---------------------------------------------------------------------
+// Events
+// ---------------------------------------------------------------------
+
+fn ev_start(inout p: Parser, inout ev: [i64]) -> i64 {
+    let m = ev.len() / 9
+    ev.push(0)
+    ev.push(-1)
+    ev.push(p.i)
+    ev.push(-1)
+    ev.push(-1)
+    ev.push(-1)
+    ev.push(-1)
+    ev.push(-1)
+    ev.push(-1)
+    m
+}
+
+fn ev_complete(inout p: Parser, inout ev: [i64], m: i64, kind: i64, s: i64, e: i64) {
+    ev[m * 9 + 1] = kind
+    ev[m * 9 + 5] = s
+    ev[m * 9 + 6] = e
+    ev.push(1)
+    ev.push(kind)
+    ev.push(p.i)
+    ev.push(-1)
+    ev.push(-1)
+    ev.push(-1)
+    ev.push(-1)
+    ev.push(-1)
+    ev.push(-1)
+}
+
+fn ev_set2(inout p: Parser, inout ev: [i64], m: i64, s2: i64, e2: i64) {
+    ev[m * 9 + 7] = s2
+    ev[m * 9 + 8] = e2
+}
+
+/// A start before the completed node `m`, which becomes its first child.
+fn ev_precede(inout p: Parser, inout ev: [i64], m: i64) -> i64 {
+    let n = ev_start(p, ev)
+    ev[n * 9 + 2] = ev[m * 9 + 2]
+    ev[m * 9 + 3] = n
+    n
+}
+
+/// A marker that turned out not to be needed.
+fn ev_abandon(inout p: Parser, inout ev: [i64], m: i64) {
+    if m == ev.len() / 9 - 1 {
+        ev_truncate(p, ev, m)
+    }
+}
+
+fn ev_truncate(inout p: Parser, inout ev: [i64], n: i64) {
+    while ev.len() > n * 9 {
+        ev.pop()
+    }
+}
+
+// ---------------------------------------------------------------------
+// Diagnostics
+// ---------------------------------------------------------------------
+
+fn diag(inout p: Parser, inout ev: [i64], s: i64, e: i64, msg: str) {
+    p.d_s.push(s)
+    p.d_e.push(e)
+    p.d_msg.push(msg)
+    p.d_help.push("")
+}
+
+fn diag_help(inout p: Parser, inout ev: [i64], s: i64, e: i64, msg: str, help: str) {
+    p.d_s.push(s)
+    p.d_e.push(e)
+    p.d_msg.push(msg)
+    p.d_help.push(help)
+}
+
+fn diag_truncate(inout p: Parser, inout ev: [i64], n: i64) {
+    while p.d_s.len() > n {
+        p.d_s.pop()
+        p.d_e.pop()
+        p.d_msg.pop()
+        p.d_help.pop()
+    }
+}
+
+/// What to write instead, for an operator Grasm does not have.
+fn spelled_differently(k: i64) -> str {
+    if k == lex.T_COLONCOLON {
+        "paths use `.`, as in `utils.helper`"
+    } else if k == lex.T_FATARROW {
+        "match arms use `->`, not `=>`"
+    } else if k == lex.T_AT {
+        "there is no `@`; bind a name with `let`"
+    } else if k == lex.T_QUESTION or k == lex.T_QUESTIONDOT {
+        "an `Option` is opened with `??` or `match`, and a fallible value with `try`"
+    } else if k == lex.T_BANG {
+        "negation is `not`, as in `not done`"
+    } else {
+        ""
+    }
+}
+
+fn error_here(inout p: Parser, inout ev: [i64], msg: str) {
+    let s = cur_s(p, ev)
+    let e = p.lx.end[p.i]
+    let h = spelled_differently(cur(p, ev))
+    if h == "" {
+        diag(p, ev, s, e, msg)
+    } else {
+        diag_help(p, ev, s, e, msg, h)
+    }
+}
+
+// ---------------------------------------------------------------------
+// The token stream
+// ---------------------------------------------------------------------
+
+/// The kind of token `j`, or -1 past the end of the stream.
+fn tk(p: Parser, j: i64) -> i64 {
+    if j >= 0 and j < p.lx.kind.len() {
+        p.lx.kind[j]
+    } else {
+        -1
+    }
+}
+
+fn ident_text(p: Parser, j: i64) -> str {
+    p.lx.text[p.lx.ival[j]]
+}
+
+/// Whether token `j` is the identifier `w`.
+fn is_word(p: Parser, j: i64, w: i64) -> bool {
+    tk(p, j) == lex.T_IDENT and p.lx.jval[j] == w
+}
+
+fn mode(p: Parser) -> i64 {
+    p.modes[p.modes.len() - 1]
+}
+
+/// Past newlines, when the current mode ignores them.
+fn normalize(inout p: Parser, inout ev: [i64]) {
+    if mode(p) == SKIP {
+        while p.lx.kind[p.i] == lex.T_NEWLINE {
+            p.i += 1
+        }
+    }
+}
+
+fn cur(inout p: Parser, inout ev: [i64]) -> i64 {
+    normalize(p, ev)
+    p.lx.kind[p.i]
+}
+
+fn cur_s(inout p: Parser, inout ev: [i64]) -> i64 {
+    normalize(p, ev)
+    p.lx.start[p.i]
+}
+
+fn cur_e(inout p: Parser, inout ev: [i64]) -> i64 {
+    normalize(p, ev)
+    p.lx.end[p.i]
+}
+
+fn bump(inout p: Parser, inout ev: [i64]) -> i64 {
+    normalize(p, ev)
+    let t = p.i
+    let k = p.lx.kind[t]
+    if k != lex.T_EOF {
+        p.i += 1
+    }
+    if k == lex.T_LPAREN or k == lex.T_LBRACKET {
+        p.modes.push(SKIP)
+    } else if k == lex.T_LBRACE {
+        p.modes.push(KEEP)
+    } else if (k == lex.T_RPAREN or k == lex.T_RBRACKET or k == lex.T_RBRACE) and p.modes.len() > 1 {
+        // The file's own mode is never popped.
+        p.modes.pop()
+    }
+    t
+}
+
+fn at(inout p: Parser, inout ev: [i64], k: i64) -> bool {
+    cur(p, ev) == k
+}
+
+fn eat(inout p: Parser, inout ev: [i64], k: i64) -> bool {
+    if at(p, ev, k) {
+        bump(p, ev)
+        true
+    } else {
+        false
+    }
+}
+
+/// `TokenKind::describe` of token `j`.
+fn describe(p: Parser, j: i64) -> str {
+    let k = p.lx.kind[j]
+    if k == lex.T_IDENT {
+        "identifier `{ident_text(p, j)}`"
+    } else if k == lex.T_INT {
+        "integer `{p.lx.ival[j]}`"
+    } else if k == lex.T_WIDEINT {
+        "integer `{p.lx.ival[j].as_u64()}`"
+    } else if k == lex.T_FLOAT {
+        "float `{display_f64(p.lx.floats[p.lx.ival[j]])}`"
+    } else if k == lex.T_STR {
+        "string literal"
+    } else if k == lex.T_NEWLINE {
+        "end of line"
+    } else if k == lex.T_EOF {
+        "end of file"
+    } else if k == lex.T_ERROR {
+        "invalid token ({p.lx.text[p.lx.ival[j]]})"
+    } else {
+        "`" + lex.kind_text(k) + "`"
+    }
+}
+
+/// Rust's `{}` of an `f64`.
+fn display_f64(v: f64) -> str {
+    let s = v.to_str()
+    if s.ends_with(".0") {
+        return s.substr(0, s.len() - 2)
+    }
+    s
+}
+
+fn kind_describe(k: i64) -> str {
+    "`" + lex.kind_text(k) + "`"
+}
+
+/// `expect`: the token's index, or -1 with "expected X but found Y".
+fn expect(inout p: Parser, inout ev: [i64], k: i64) -> i64 {
+    if at(p, ev, k) {
+        return bump(p, ev)
+    }
+    let s = cur_s(p, ev)
+    let e = p.lx.end[p.i]
+    let found = describe(p, p.i)
+    let msg = "expected {kind_describe(k)} but found {found}"
+    let op = wrapped_operator_ahead(p)
+    if op != "" {
+        diag_help(p, ev, s, e, msg, "the next line starts with `{op}`, so this statement ended here — a newline ends a statement unless the line *ends* in an operator. Move the `{op}` up to the end of this line, or wrap the whole expression in parentheses")
+    } else {
+        diag(p, ev, s, e, msg)
+    }
+    -1
+}
+
+/// Whether the token just consumed began a line.
+fn at_line_start(p: Parser) -> bool {
+    var j = p.i
+    while j > 0 {
+        j -= 1
+        let k = tk(p, j)
+        if k == lex.T_NEWLINE {
+            return true
+        }
+        if j + 1 == p.i {
+            continue
+        }
+        return false
+    }
+    false
+}
+
+/// The binary operator that begins the next line, if one does.
+fn wrapped_operator_ahead(p: Parser) -> str {
+    if tk(p, p.i) != lex.T_NEWLINE {
+        return ""
+    }
+    var j = p.i
+    while tk(p, j) == lex.T_NEWLINE {
+        j += 1
+    }
+    let k = tk(p, j)
+    if k == lex.KW_AND {
+        "and"
+    } else if k == lex.KW_OR {
+        "or"
+    } else if k == lex.T_PLUS {
+        "+"
+    } else if k == lex.T_MINUS {
+        "-"
+    } else if k == lex.T_STAR {
+        "*"
+    } else if k == lex.T_SLASH {
+        "/"
+    } else if k == lex.T_PERCENT {
+        "%"
+    } else if k == lex.T_EQEQ {
+        "=="
+    } else if k == lex.T_NOTEQ {
+        "!="
+    } else if k == lex.T_LT {
+        "<"
+    } else if k == lex.T_GT {
+        ">"
+    } else if k == lex.T_LTEQ {
+        "<="
+    } else if k == lex.T_GTEQ {
+        ">="
+    } else if k == lex.T_PIPEGT {
+        "|>"
+    } else {
+        ""
+    }
+}
+
+/// The spelling of a binary operator token, for diagnostics; `-` is not
+/// one, since it is also unary.
+fn binary_operator_name(k: i64) -> str {
+    if k == lex.T_MINUS {
+        return ""
+    }
+    if k == lex.KW_AND or k == lex.KW_OR or k == lex.T_PLUS or k == lex.T_STAR or k == lex.T_SLASH or
+    k == lex.T_PERCENT or k == lex.T_EQEQ or k == lex.T_NOTEQ or k == lex.T_LT or k == lex.T_GT or
+    k == lex.T_LTEQ or k == lex.T_GTEQ or k == lex.T_PIPEGT{
+        return lex.kind_text(k)
+    }
+    ""
+}
+
+/// Whether the token after the current one, newlines aside, is `{`.
+fn block_follows(p: Parser) -> bool {
+    var j = p.i + 1
+    while tk(p, j) == lex.T_NEWLINE {
+        j += 1
+    }
+    tk(p, j) == lex.T_LBRACE
+}
+
+fn skip_newlines(inout p: Parser, inout ev: [i64]) {
+    while p.lx.kind[p.i] == lex.T_NEWLINE {
+        p.i += 1
+    }
+}
+
+fn enter_nested(inout p: Parser, inout ev: [i64]) -> bool {
+    if p.depth >= MAX_NESTING {
+        error_here(p, ev, "code is nested too deeply")
+        // No useful recovery from pathological nesting.
+        while p.lx.kind[p.i] != lex.T_EOF {
+            p.i += 1
+        }
+        return false
+    }
+    p.depth += 1
+    true
+}
+
+/// Panic-mode recovery: to the next statement boundary.
+fn sync_stmt(inout p: Parser, inout ev: [i64]) {
+    while true {
+        let k = p.lx.kind[p.i]
+        if k == lex.T_NEWLINE or k == lex.T_EOF or k == lex.T_RBRACE {
+            break
+        }
+        bump(p, ev)
+    }
+}
+
+/// Recovery at declaration level: to the next declaration keyword, and the
+/// newline modes reset.
+fn sync_decl(inout p: Parser, inout ev: [i64]) {
+    while true {
+        let k = p.lx.kind[p.i]
+        if k == lex.T_EOF or k == lex.KW_FN or k == lex.KW_PUB or k == lex.KW_TYPE or k == lex.KW_EFFECT or
+        k == lex.KW_TEST or k == lex.KW_IMPORT{
+            break
+        }
+        // Only a real `bench "..."` header ends recovery.
+        if is_word(p, p.i, lex.W_BENCH) and tk(p, p.i + 1) == lex.T_STR {
+            break
+        }
+        p.i += 1
+    }
+    p.modes = [KEEP]
+}
+
+/// An identifier: `m` is its token.
+fn ident(inout p: Parser, inout ev: [i64]) -> Res {
+    let s = cur_s(p, ev)
+    let e = p.lx.end[p.i]
+    if cur(p, ev) == lex.T_IDENT {
+        let t = bump(p, ev)
+        return good(0, s, e, t)
+    }
+    let found = describe(p, p.i)
+    diag(p, ev, s, e, "expected an identifier but found {found}")
+    bad()
+}
+
+/// A name in binding position, where `_` binds nothing; `k` is 1 for `_`.
+fn binding_ident(inout p: Parser, inout ev: [i64]) -> Res {
+    if at(p, ev, lex.T_UNDERSCORE) {
+        let s = cur_s(p, ev)
+        let e = p.lx.end[p.i]
+        let t = bump(p, ev)
+        return good(1, s, e, t)
+    }
+    ident(p, ev)
+}
+
+// ---------------------------------------------------------------------
+// Module and declarations
+// ---------------------------------------------------------------------
+
+fn parse_module_decls(inout p: Parser, inout ev: [i64]) {
+    while true {
+        skip_newlines(p, ev)
+        if cur(p, ev) == lex.T_EOF {
+            break
+        }
+        let before = p.i
+        let m = ev_start(p, ev)
+        if parse_decl(p, ev) {
+            ev_abandon(p, ev, m)
+        } else {
+            sync_decl(p, ev)
+            // Recovery must consume something, or the same token comes
+            // back around forever.
+            if p.i == before {
+                p.i += 1
+            }
+            ev_complete(p, ev, m, syn.N_ERROR, -1, -1)
+        }
+    }
+}
+
+fn b2i(b: bool) -> i64 {
+    if b {
+        1
+    } else {
+        0
+    }
+}
+
+fn parse_decl(inout p: Parser, inout ev: [i64]) -> bool {
+    let m = ev_start(p, ev)
+    let is_pub = eat(p, ev, lex.KW_PUB)
+    cur(p, ev)
+    if is_word(p, p.i, lex.W_BENCH) and tk(p, p.i + 1) == lex.T_STR {
+        return parse_bench_decl(p, ev, m)
+    }
+    cur(p, ev)
+    let linear_type = is_word(p, p.i, lex.W_LINEAR) and tk(p, p.i + 1) == lex.KW_TYPE
+    // `actor Counter { ... }`: `actor` is a word only here.
+    if is_word(p, p.i, lex.W_ACTOR) and tk(p, p.i + 1) == lex.T_IDENT {
+        return parse_actor(p, ev, is_pub, m)
+    }
+    // `export fn f(..)`.
+    if is_word(p, p.i, lex.W_EXPORT) and tk(p, p.i + 1) == lex.KW_FN {
+        bump(p, ev)
+        return parse_fn_with_self(p, ev, is_pub, false, m, true)
+    }
+    // `thread_local POOL: addr` ([T-TLS]).
+    if is_word(p, p.i, lex.W_THREAD_LOCAL) and tk(p, p.i + 1) == lex.T_IDENT and tk(p, p.i + 2) == lex.T_COLON {
+        let s = cur_s(p, ev)
+        let se = p.lx.end[p.i]
+        bump(p, ev)
+        let name = ident(p, ev)
+        if not name.ok {
+            return false
+        }
+        if expect(p, ev, lex.T_COLON) < 0 {
+            return false
+        }
+        let ty = parse_type(p, ev)
+        if not ty.ok {
+            return false
+        }
+        ev_complete(p, ev, m, syn.N_THREAD_LOCAL, s.min(ty.s), se.max(ty.e))
+        ev_set2(p, ev, m, b2i(is_pub), 0)
+        return true
+    }
+    let k = cur(p, ev)
+    if k == lex.KW_FN {
+        return parse_fn_with_self(p, ev, is_pub, false, m, false)
+    }
+    if is_word(p, p.i, lex.W_EXTERN) {
+        return parse_extern(p, ev, is_pub, m)
+    }
+    if k == lex.KW_LET {
+        return parse_const(p, ev, is_pub, m)
+    }
+    if k == lex.KW_TYPE {
+        return parse_type_decl(p, ev, is_pub, false, m)
+    }
+    if k == lex.T_IDENT and linear_type {
+        bump(p, ev)
+        return parse_type_decl(p, ev, is_pub, true, m)
+    }
+    if k == lex.KW_EFFECT {
+        return parse_effect_decl(p, ev, m)
+    }
+    if k == lex.KW_TEST {
+        return parse_test_decl(p, ev, m)
+    }
+    if k == lex.KW_IMPORT {
+        return parse_import(p, ev, m)
+    }
+    if k == lex.KW_INTERFACE {
+        return parse_interface(p, ev, is_pub, m)
+    }
+    if k == lex.KW_IMPL {
+        return parse_impl(p, ev, m)
+    }
+    let found = describe(p, p.i)
+    error_here(p, ev, "expected a declaration (`fn`, `let`, `type`, `effect`, `interface`, `impl`, `test`, `bench`, `import`) but found {found}")
+    false
+}
+
+fn parse_extern(inout p: Parser, inout ev: [i64], is_pub: bool, m: i64) -> bool {
+    let s = cur_s(p, ev)
+    let se = p.lx.end[p.i]
+    bump(p, ev)
+    if expect(p, ev, lex.KW_FN) < 0 {
+        return false
+    }
+    if not ident(p, ev).ok {
+        return false
+    }
+    if not parse_params_self(p, ev, false).ok {
+        return false
+    }
+    if eat(p, ev, lex.T_ARROW) {
+        let rm = ev_start(p, ev)
+        let t = parse_type(p, ev)
+        if not t.ok {
+            return false
+        }
+        ev_complete(p, ev, rm, syn.N_RET, t.s, t.e)
+    }
+    ev_complete(p, ev, m, syn.N_EXTERN, s.min(p.lx.start[p.i - 1]), se.max(p.lx.end[p.i - 1]))
+    ev_set2(p, ev, m, b2i(is_pub), 0)
+    true
+}
+
+fn parse_const(inout p: Parser, inout ev: [i64], is_pub: bool, m: i64) -> bool {
+    let s = cur_s(p, ev)
+    let se = p.lx.end[p.i]
+    if expect(p, ev, lex.KW_LET) < 0 {
+        return false
+    }
+    if not ident(p, ev).ok {
+        return false
+    }
+    if eat(p, ev, lex.T_COLON) {
+        if not parse_type_nested(p, ev).ok {
+            return false
+        }
+    }
+    if expect(p, ev, lex.T_EQ) < 0 {
+        return false
+    }
+    skip_newlines(p, ev)
+    let init = parse_expr(p, ev)
+    if not init.ok {
+        return false
+    }
+    ev_complete(p, ev, m, syn.N_CONST, s.min(init.s), se.max(init.e))
+    ev_set2(p, ev, m, b2i(is_pub), 0)
+    true
+}
+
+/// A function, or -- with `has_self` -- a method of an `impl`, an
+/// interface or an actor, whose first parameter may be the word `self`.
+/// `m` is the declaration's marker; `export` says it was `export fn`.
+fn parse_fn_with_self(inout p: Parser, inout ev: [i64], is_pub: bool, has_self: bool, m: i64, export: bool) -> bool {
+    let s = cur_s(p, ev)
+    let se = p.lx.end[p.i]
+    if expect(p, ev, lex.KW_FN) < 0 {
+        return false
+    }
+    if not ident(p, ev).ok {
+        return false
+    }
+    if not parse_generics(p, ev).ok {
+        return false
+    }
+    let params = parse_params_self(p, ev, has_self)
+    if not params.ok {
+        return false
+    }
+    if not parse_fn_tail(p, ev) {
+        return false
+    }
+    let nc = parse_contracts(p, ev)
+    if nc < 0 {
+        return false
+    }
+    if nc > 0 {
+        if has_self {
+            diag(p, ev, first_contract_s(p, ev, m), first_contract_e(p, ev, m), "an `impl` method cannot carry contracts yet; state them on a function it calls")
+            return false
+        }
+        skip_newlines(p, ev)
+    }
+    let body = parse_block(p, ev)
+    if not body.ok {
+        return false
+    }
+    if nc > 0 {
+        // Lowered by the AST builder; the one thing that can fail is here.
+        for k in 0..params.modes.len() {
+            if params.modes[k] != 0 {
+                diag(p, ev, params.s[k], params.e[k], "a function with contracts takes its parameters by value for now; `inout` and `own` are not supported")
+                return false
+            }
+        }
+    }
+    ev_complete(p, ev, m, syn.N_FN, s.min(body.s), se.max(body.e))
+    ev_set2(p, ev, m, b2i(is_pub), b2i(export))
+    true
+}
+
+/// The span of the first contract clause after marker `m` (its keyword).
+fn first_contract_s(p: Parser, ev: [i64], m: i64) -> i64 {
+    for j in m..(ev.len() / 9) {
+        if ev[(j) * 9 + 0] == 0 and ev[(j) * 9 + 1] == syn.N_CONTRACT {
+            return ev[(j) * 9 + 5]
+        }
+    }
+    0
+}
+
+fn first_contract_e(p: Parser, ev: [i64], m: i64) -> i64 {
+    for j in m..(ev.len() / 9) {
+        if ev[(j) * 9 + 0] == 0 and ev[(j) * 9 + 1] == syn.N_CONTRACT {
+            return ev[(j) * 9 + 6]
+        }
+    }
+    0
+}
+
+/// `requires c` and `ensures |r| c` clauses: how many, or -1 on failure.
+fn parse_contracts(inout p: Parser, inout ev: [i64]) -> i64 {
+    var n = 0
+    while true {
+        let save = p.i
+        skip_newlines(p, ev)
+        cur(p, ev)
+        if is_word(p, p.i, lex.W_REQUIRES) {
+            let cm = ev_start(p, ev)
+            let s = cur_s(p, ev)
+            let e = p.lx.end[p.i]
+            bump(p, ev)
+            let prev = p.no_struct_lit
+            p.no_struct_lit = true
+            let cond = parse_expr(p, ev)
+            p.no_struct_lit = prev
+            if not cond.ok {
+                return -1
+            }
+            ev_complete(p, ev, cm, syn.N_CONTRACT, s, e)
+            ev_set2(p, ev, cm, cond.s, cond.e)
+            n += 1
+        } else if is_word(p, p.i, lex.W_ENSURES) {
+            let cm = ev_start(p, ev)
+            let s = cur_s(p, ev)
+            let e = p.lx.end[p.i]
+            bump(p, ev)
+            let open = cur_s(p, ev)
+            if expect(p, ev, lex.T_PIPE) < 0 {
+                return -1
+            }
+            if not ident(p, ev).ok {
+                return -1
+            }
+            if expect(p, ev, lex.T_PIPE) < 0 {
+                return -1
+            }
+            let prev = p.no_struct_lit
+            p.no_struct_lit = true
+            let cond = parse_expr(p, ev)
+            p.no_struct_lit = prev
+            if not cond.ok {
+                return -1
+            }
+            ev_complete(p, ev, cm, syn.N_CONTRACT, s, e)
+            ev_set2(p, ev, cm, open.min(cond.s), open.max(cond.e))
+            n += 1
+        } else {
+            p.i = save
+            return n
+        }
+    }
+    n
+}
+
+/// `[T, U]`, each optionally bounded: `[T: Show + Ord, U]`. `k` is how
+/// many parameters carry a bound.
+fn parse_generics(inout p: Parser, inout ev: [i64]) -> Res {
+    if not at(p, ev, lex.T_LBRACKET) {
+        return good(0, 0, 0, -1)
+    }
+    let gm = ev_start(p, ev)
+    bump(p, ev)
+    var bounded = 0
+    while true {
+        if at(p, ev, lex.T_RBRACKET) {
+            break
+        }
+        let one = ev_start(p, ev)
+        if not ident(p, ev).ok {
+            return bad()
+        }
+        var nb = 0
+        if eat(p, ev, lex.T_COLON) {
+            while true {
+                if not parse_path(p, ev).ok {
+                    return bad()
+                }
+                nb += 1
+                if not eat(p, ev, lex.T_PLUS) {
+                    break
+                }
+            }
+        }
+        if nb > 0 {
+            bounded += 1
+        }
+        ev_complete(p, ev, one, syn.N_GENERIC, -1, -1)
+        if not eat(p, ev, lex.T_COMMA) {
+            break
+        }
+    }
+    if expect(p, ev, lex.T_RBRACKET) < 0 {
+        return bad()
+    }
+    ev_complete(p, ev, gm, syn.N_GENERICS, -1, -1)
+    good(bounded, 0, 0, gm)
+}
+
+/// The names of the generic parameters in the N_GENERICS node at `gm`.
+fn generic_names(p: Parser, ev: [i64], gm: i64) -> [str] {
+    var out: [str] = []
+    if gm < 0 {
+        return out
+    }
+    // Each N_GENERIC's first token is its name.
+    var j = gm + 1
+    var depth = 0
+    while j < (ev.len() / 9) {
+        if ev[(j) * 9 + 0] == 0 {
+            if depth == 0 and ev[(j) * 9 + 1] == syn.N_GENERIC {
+                out.push(ident_text(p, ev[(j) * 9 + 2]))
+            }
+            depth += 1
+        } else {
+            if depth == 0 {
+                break
+            }
+            depth -= 1
+        }
+        j += 1
+    }
+    out
+}
+
+/// `interface Show { fn show(self) -> str }`.
+fn parse_interface(inout p: Parser, inout ev: [i64], is_pub: bool, m: i64) -> bool {
+    let s = cur_s(p, ev)
+    let se = p.lx.end[p.i]
+    if expect(p, ev, lex.KW_INTERFACE) < 0 {
+        return false
+    }
+    if not ident(p, ev).ok {
+        return false
+    }
+    if expect(p, ev, lex.T_LBRACE) < 0 {
+        return false
+    }
+    while true {
+        skip_newlines(p, ev)
+        if at(p, ev, lex.T_RBRACE) {
+            break
+        }
+        let sm = ev_start(p, ev)
+        let ms = cur_s(p, ev)
+        let mse = p.lx.end[p.i]
+        if expect(p, ev, lex.KW_FN) < 0 {
+            return false
+        }
+        if not ident(p, ev).ok {
+            return false
+        }
+        if not parse_params_self(p, ev, true).ok {
+            return false
+        }
+        if not parse_fn_tail(p, ev) {
+            return false
+        }
+        ev_complete(p, ev, sm, syn.N_SIG, ms.min(p.lx.start[p.i - 1]), mse.max(p.lx.end[p.i - 1]))
+    }
+    let rb = expect(p, ev, lex.T_RBRACE)
+    if rb < 0 {
+        return false
+    }
+    ev_complete(p, ev, m, syn.N_INTERFACE, s.min(p.lx.start[rb]), se.max(p.lx.end[rb]))
+    ev_set2(p, ev, m, b2i(is_pub), 0)
+    true
+}
+
+/// `impl Show for Point { fn show(self) -> str { ... } }`. Its methods are
+/// lowered to functions by the AST builder; one made before the `impl`
+/// fails still reaches the module, as in the Rust parser, so a failed
+/// `impl` whose header was read is kept as N_IMPL_PARTIAL.
+fn parse_impl(inout p: Parser, inout ev: [i64], m: i64) -> bool {
+    let s = cur_s(p, ev)
+    let se = p.lx.end[p.i]
+    if expect(p, ev, lex.KW_IMPL) < 0 {
+        return false
+    }
+    var gens: [str] = []
+    if at(p, ev, lex.T_LBRACKET) {
+        let g = parse_generics(p, ev)
+        if not g.ok {
+            return false
+        }
+        gens = generic_names(p, ev, g.m)
+    }
+    if not parse_path(p, ev).ok {
+        return false
+    }
+    if cur(p, ev) == lex.KW_FOR {
+        bump(p, ev)
+    } else {
+        let found = describe(p, p.i)
+        error_here(p, ev, "expected `for` after the interface name, as in `impl Show for Point`, but found {found}")
+        return false
+    }
+    let ty = parse_type(p, ev)
+    if not ty.ok {
+        return false
+    }
+    // The shape the `impl` is for ([T-INTERFACE-GENERIC]).
+    if ty.k == Y_NAME and ty.nseg == 1 {
+        for a in 0..ty.args_name.len() {
+            if not gens.contains(ty.args_name[a]) or ty.args_name[a] == "" {
+                diag(p, ev, ty.args_s[a], ty.args_e[a], "a generic `impl` applies its type to its own parameters, as in `impl[T] Show for Pair[T]` ([T-INTERFACE-GENERIC])")
+                return false
+            }
+        }
+    } else if ty.k == Y_LIST {
+        if ty.elem_name == "" or not gens.contains(ty.elem_name) {
+            diag(p, ev, ty.elem_s, ty.elem_e, "an `impl` for a list is for every element type, written `impl[T] Show for [T]` ([T-INTERFACE-GENERIC])")
+            return false
+        }
+    } else {
+        diag(p, ev, ty.s, ty.e, "an `impl` is for a declared type, a list, or for `i64`, `f64`, `bool` or `str` ([T-INTERFACE])")
+        return false
+    }
+    if expect(p, ev, lex.T_LBRACE) < 0 {
+        return false
+    }
+    var made = 0
+    while true {
+        skip_newlines(p, ev)
+        if at(p, ev, lex.T_RBRACE) {
+            break
+        }
+        let fm = ev_start(p, ev)
+        if not parse_fn_with_self(p, ev, false, true, fm, false) {
+            if made > 0 {
+                ev_complete(p, ev, m, syn.N_IMPL_PARTIAL, s, p.lx.end[p.i - 1].max(s))
+            }
+            return false
+        }
+        made += 1
+    }
+    let rb = expect(p, ev, lex.T_RBRACE)
+    if rb < 0 {
+        if made > 0 {
+            ev_complete(p, ev, m, syn.N_IMPL_PARTIAL, s, s)
+        }
+        return false
+    }
+    ev_complete(p, ev, m, syn.N_IMPL, s.min(p.lx.start[rb]), se.max(p.lx.end[rb]))
+    true
+}
+
+/// `actor Name(params) { var f: T = e ... fn m(inout self, ...) { ... } }`
+/// ([E-ACTOR]), lowered by the AST builder. Before each method is parsed,
+/// `self.f` for a state field `f` is rewritten in its tokens as
+/// `self.§state.f`, the two tokens put in taking the `.`'s span, as the Rust
+/// parser rewrites them.
+fn parse_actor(inout p: Parser, inout ev: [i64], is_pub: bool, m: i64) -> bool {
+    let s = cur_s(p, ev)
+    let se = p.lx.end[p.i]
+    bump(p, ev)
+    if not ident(p, ev).ok {
+        return false
+    }
+    if at(p, ev, lex.T_LPAREN) {
+        if not parse_params_self(p, ev, false).ok {
+            return false
+        }
+    }
+    if expect(p, ev, lex.T_LBRACE) < 0 {
+        return false
+    }
+    var fields: [str] = []
+    var methods = 0
+    while true {
+        skip_newlines(p, ev)
+        if at(p, ev, lex.T_RBRACE) {
+            break
+        }
+        if at(p, ev, lex.KW_VAR) {
+            let vm = ev_start(p, ev)
+            let vs = cur_s(p, ev)
+            let ve = p.lx.end[p.i]
+            bump(p, ev)
+            if methods > 0 {
+                diag(p, ev, vs, ve, "an actor's state is declared before its methods ([E-ACTOR])")
+                return actor_fail(p, ev, m, s, methods)
+            }
+            let fname = ident(p, ev)
+            if not fname.ok {
+                return actor_fail(p, ev, m, s, methods)
+            }
+            if expect(p, ev, lex.T_COLON) < 0 {
+                return actor_fail(p, ev, m, s, methods)
+            }
+            if not parse_type(p, ev).ok {
+                return actor_fail(p, ev, m, s, methods)
+            }
+            if expect(p, ev, lex.T_EQ) < 0 {
+                return actor_fail(p, ev, m, s, methods)
+            }
+            let init = parse_expr(p, ev)
+            if not init.ok {
+                return actor_fail(p, ev, m, s, methods)
+            }
+            ev_complete(p, ev, vm, syn.N_ACTOR_VAR, vs.min(init.s), ve.max(init.e))
+            fields.push(ident_text(p, fname.m))
+            continue
+        }
+        if at(p, ev, lex.KW_FN) {
+            actor_state_reads(p, ev, fields)
+            let saved_fields = p.actor_fields
+            let saved_in = p.in_actor
+            p.actor_fields = fields
+            p.in_actor = true
+            let fm = ev_start(p, ev)
+            let ok = parse_fn_with_self(p, ev, true, true, fm, false)
+            p.actor_fields = saved_fields
+            p.in_actor = saved_in
+            if not ok {
+                return actor_fail(p, ev, m, s, methods)
+            }
+            // The method's first parameter must be `self`.
+            if not first_param_is_self(p, ev, fm) {
+                diag(p, ev, fn_name_s(p, ev, fm), fn_name_e(p, ev, fm), "an actor method takes `self` or `inout self` first ([E-ACTOR])")
+                // Not lowered: the Rust parser returns before pushing it.
+                ev[(fm) * 9 + 1] = syn.N_ERROR
+                return actor_fail(p, ev, m, s, methods)
+            }
+            methods += 1
+            continue
+        }
+        let found = describe(p, p.i)
+        error_here(p, ev, "expected `var` or `fn` in an actor ([E-ACTOR]), but found {found}")
+        return actor_fail(p, ev, m, s, methods)
+    }
+    let rb = expect(p, ev, lex.T_RBRACE)
+    if rb < 0 {
+        return actor_fail(p, ev, m, s, methods)
+    }
+    ev_complete(p, ev, m, syn.N_ACTOR, s.min(p.lx.start[rb]), se.max(p.lx.end[rb]))
+    ev_set2(p, ev, m, b2i(is_pub), 0)
+    true
+}
+
+fn actor_fail(inout p: Parser, inout ev: [i64], m: i64, s: i64, methods: i64) -> bool {
+    if methods > 0 {
+        ev_complete(p, ev, m, syn.N_ACTOR_PARTIAL, s, s)
+    }
+    false
+}
+
+/// The name token of the N_FN whose start event is `fm`: the first
+/// identifier after its `fn`.
+fn fn_name_tok(p: Parser, ev: [i64], fm: i64) -> i64 {
+    var j = ev[(fm) * 9 + 2]
+    while p.lx.kind[j] != lex.KW_FN {
+        j += 1
+    }
+    j + 1
+}
+
+fn fn_name_s(p: Parser, ev: [i64], fm: i64) -> i64 {
+    p.lx.start[fn_name_tok(p, ev, fm)]
+}
+
+fn fn_name_e(p: Parser, ev: [i64], fm: i64) -> i64 {
+    p.lx.end[fn_name_tok(p, ev, fm)]
+}
+
+/// Whether the method at `fm` has `self` (or `inout self`) first: its
+/// N_PARAMS' first child is an N_SELF_PARAM.
+fn first_param_is_self(p: Parser, ev: [i64], fm: i64) -> bool {
+    var j = fm + 1
+    var depth = 0
+    while j < (ev.len() / 9) {
+        if ev[(j) * 9 + 0] == 0 {
+            if ev[(j) * 9 + 1] == syn.N_PARAMS and depth == 0 {
+                // Its first child event, if any, is the first parameter.
+                let n = j + 1
+                return n < (ev.len() / 9) and ev[(n) * 9 + 0] == 0 and ev[(n) * 9 + 1] == syn.N_SELF_PARAM
+            }
+            depth += 1
+        } else {
+            if depth == 0 {
+                return false
+            }
+            depth -= 1
+        }
+        j += 1
+    }
+    false
+}
+
+/// Puts `§state` `.` after `self .` before each state field read, from the
+/// current token to the end of the method about to be parsed.
+fn actor_state_reads(inout p: Parser, inout ev: [i64], fields: [str]) {
+    // The method's body ends at the `}` that closes its first `{`.
+    var depth = 0
+    var seen_body = false
+    var end = p.lx.kind.len()
+    var j = p.i
+    while j < p.lx.kind.len() {
+        let k = p.lx.kind[j]
+        if k == lex.T_LBRACE {
+            depth += 1
+            seen_body = true
+        } else if k == lex.T_RBRACE {
+            depth -= 1
+            if seen_body and depth == 0 {
+                end = j
+                break
+            }
+        }
+        j += 1
+    }
+    state_reads(p.lx, p.i, end, fields)
+}
+
+/// The rewrite itself, on the tokens `from..to` of `lx`.
+fn state_reads(inout lx: Lexed, from: i64, to0: i64, fields: [str]) {
+    var to = to0.min(lx.kind.len())
+    var j = from
+    // Rebuilt in one pass rather than inserted into, which would move the
+    // rest of the stream once per read.
+    var hits: [i64] = []
+    while j + 2 < to {
+        let is_self = lx.kind[j] == lex.T_IDENT and lx.text[lx.ival[j]] == "self"
+        let dot = lx.kind[j + 1] == lex.T_DOT
+        let field = lx.kind[j + 2] == lex.T_IDENT and fields.contains(lx.text[lx.ival[j + 2]])
+        if is_self and dot and field {
+            hits.push(j + 2)
+            j += 2
+            continue
+        }
+        j += 1
+    }
+    if hits.is_empty() {
+        return
+    }
+    lx.text.push("\u{a7}state")
+    let name_ix = lx.text.len() - 1
+    var nk: [i64] = []
+    var ns: [i64] = []
+    var ne: [i64] = []
+    var ni: [i64] = []
+    var nj: [i64] = []
+    var nv: [bool] = []
+    var h = 0
+    for t in 0..lx.kind.len() {
+        if h < hits.len() and hits[h] == t {
+            // The `.` before is token t - 1.
+            let ds = lx.start[t - 1]
+            let de = lx.end[t - 1]
+            nk.push(lex.T_IDENT)
+            ns.push(ds)
+            ne.push(de)
+            ni.push(name_ix)
+            nj.push(0)
+            nv.push(true)
+            nk.push(lex.T_DOT)
+            ns.push(ds)
+            ne.push(de)
+            ni.push(0)
+            nj.push(0)
+            nv.push(true)
+            h += 1
+        }
+        nk.push(lx.kind[t])
+        ns.push(lx.start[t])
+        ne.push(lx.end[t])
+        ni.push(lx.ival[t])
+        nj.push(lx.jval[t])
+        nv.push(lx.virt[t])
+    }
+    lx.kind = nk
+    lx.start = ns
+    lx.end = ne
+    lx.ival = ni
+    lx.jval = nj
+    lx.virt = nv
+}
+
+/// A parameter list. With `has_self`, the first parameter may be the bare
+/// word `self`.
+fn parse_params_self(inout p: Parser, inout ev: [i64], has_self: bool) -> ParamsRes {
+    var out = ParamsRes{ ok: false, modes: [], s: [], e: [], first: "" }
+    let pm = ev_start(p, ev)
+    if expect(p, ev, lex.T_LPAREN) < 0 {
+        return out
+    }
+    while true {
+        if at(p, ev, lex.T_RPAREN) {
+            break
+        }
+        let one = ev_start(p, ev)
+        let s = cur_s(p, ev)
+        let e0 = p.lx.end[p.i]
+        // `inout self`: an actor method that changes its state.
+        let inout_self = has_self and cur(p, ev) == lex.KW_INOUT and is_word(p, p.i + 1, lex.W_SELF)
+        if inout_self {
+            bump(p, ev)
+        }
+        cur(p, ev)
+        if is_word(p, p.i, lex.W_SELF) and tk(p, p.i + 1) != lex.T_COLON {
+            if not has_self {
+                error_here(p, ev, "`self` is a parameter of an interface or `impl` method only ([T-INTERFACE])")
+                return out
+            }
+            if out.modes.len() > 0 {
+                error_here(p, ev, "`self` must be the first parameter")
+                return out
+            }
+            if not ident(p, ev).ok {
+                return out
+            }
+            var mode = 0
+            if inout_self {
+                mode = 1
+            }
+            out.modes.push(mode)
+            out.s.push(s)
+            out.e.push(e0)
+            out.first = "self"
+            ev_complete(p, ev, one, syn.N_SELF_PARAM, s, e0)
+            ev_set2(p, ev, one, mode, 0)
+            if not eat(p, ev, lex.T_COMMA) {
+                break
+            }
+            continue
+        }
+        var mode = 0
+        if eat(p, ev, lex.KW_INOUT) {
+            mode = 1
+        } else if eat(p, ev, lex.KW_OWN) {
+            mode = 2
+        }
+        let name = ident(p, ev)
+        if not name.ok {
+            return out
+        }
+        if expect(p, ev, lex.T_COLON) < 0 {
+            return out
+        }
+        let ty = parse_type_nested(p, ev)
+        if not ty.ok {
+            return out
+        }
+        if out.modes.len() == 0 {
+            out.first = ident_text(p, name.m)
+        }
+        out.modes.push(mode)
+        out.s.push(s.min(ty.s))
+        out.e.push(e0.max(ty.e))
+        ev_complete(p, ev, one, syn.N_PARAM, s.min(ty.s), e0.max(ty.e))
+        ev_set2(p, ev, one, mode, 0)
+        if not eat(p, ev, lex.T_COMMA) {
+            break
+        }
+    }
+    if expect(p, ev, lex.T_RPAREN) < 0 {
+        return out
+    }
+    ev_complete(p, ev, pm, syn.N_PARAMS, -1, -1)
+    out.ok = true
+    out
+}
+
+/// One entry in an effect row, where `unsafe` is a capability's name.
+fn parse_row_entry(inout p: Parser, inout ev: [i64]) -> bool {
+    if at(p, ev, lex.KW_UNSAFE) {
+        let um = ev_start(p, ev)
+        let s = cur_s(p, ev)
+        let e = p.lx.end[p.i]
+        bump(p, ev)
+        ev_complete(p, ev, um, syn.N_ROW_UNSAFE, s, e)
+        return true
+    }
+    parse_path(p, ev).ok
+}
+
+/// `-> Ret ! Err / {effects}`, every piece optional.
+fn parse_fn_tail(inout p: Parser, inout ev: [i64]) -> bool {
+    if at(p, ev, lex.T_ARROW) {
+        let rm = ev_start(p, ev)
+        bump(p, ev)
+        let t = parse_type(p, ev)
+        if not t.ok {
+            return false
+        }
+        ev_complete(p, ev, rm, syn.N_RET, t.s, t.e)
+    }
+    if at(p, ev, lex.T_BANG) {
+        let em = ev_start(p, ev)
+        bump(p, ev)
+        let t = parse_type(p, ev)
+        if not t.ok {
+            return false
+        }
+        ev_complete(p, ev, em, syn.N_ERRTY, t.s, t.e)
+    }
+    if at(p, ev, lex.T_SLASH) {
+        let fm = ev_start(p, ev)
+        bump(p, ev)
+        if expect(p, ev, lex.T_LBRACE) < 0 {
+            return false
+        }
+        while true {
+            skip_newlines(p, ev)
+            if at(p, ev, lex.T_RBRACE) {
+                break
+            }
+            if not parse_row_entry(p, ev) {
+                return false
+            }
+            if not eat(p, ev, lex.T_COMMA) {
+                break
+            }
+        }
+        skip_newlines(p, ev)
+        if expect(p, ev, lex.T_RBRACE) < 0 {
+            return false
+        }
+        ev_complete(p, ev, fm, syn.N_EFFECTS, -1, -1)
+    }
+    true
+}
+
+/// `a.b.c`: `k` is how many segments.
+fn parse_path(inout p: Parser, inout ev: [i64]) -> Res {
+    let pm = ev_start(p, ev)
+    let first = ident(p, ev)
+    if not first.ok {
+        return bad()
+    }
+    var e = first.e
+    var n = 1
+    while at(p, ev, lex.T_DOT) {
+        bump(p, ev)
+        let seg = ident(p, ev)
+        if not seg.ok {
+            return bad()
+        }
+        e = e.max(seg.e)
+        n += 1
+    }
+    ev_complete(p, ev, pm, syn.N_PATH, first.s, e)
+    good(n, first.s, e, pm)
+}
+
+fn parse_type_decl(inout p: Parser, inout ev: [i64], is_pub: bool, linear: bool, m: i64) -> bool {
+    let s = cur_s(p, ev)
+    let se = p.lx.end[p.i]
+    if expect(p, ev, lex.KW_TYPE) < 0 {
+        return false
+    }
+    if not ident(p, ev).ok {
+        return false
+    }
+    let g = parse_generics(p, ev)
+    if not g.ok {
+        return false
+    }
+    if g.k > 0 {
+        error_here(p, ev, "a type's parameters take no bounds; bound the functions that use it")
+        return false
+    }
+    if expect(p, ev, lex.T_EQ) < 0 {
+        return false
+    }
+    skip_newlines(p, ev)
+    var end = 0
+    var end_s = 0
+    if at(p, ev, lex.T_LBRACE) {
+        if not parse_field_block(p, ev) {
+            return false
+        }
+        end = p.lx.end[p.i - 1]
+        end_s = p.lx.start[p.i - 1]
+    } else if at(p, ev, lex.T_PIPE) {
+        let vsm = ev_start(p, ev)
+        while eat(p, ev, lex.T_PIPE) {
+            let vm = ev_start(p, ev)
+            let vname = ident(p, ev)
+            if not vname.ok {
+                return false
+            }
+            var ve = vname.e
+            if eat(p, ev, lex.T_LPAREN) {
+                while true {
+                    if at(p, ev, lex.T_RPAREN) {
+                        break
+                    }
+                    let fm = ev_start(p, ev)
+                    let fname = ident(p, ev)
+                    if not fname.ok {
+                        return false
+                    }
+                    if expect(p, ev, lex.T_COLON) < 0 {
+                        return false
+                    }
+                    let fty = parse_type_nested(p, ev)
+                    if not fty.ok {
+                        return false
+                    }
+                    ev_complete(p, ev, fm, syn.N_FIELD_DEF, fname.s.min(fty.s), fname.e.max(fty.e))
+                    if not eat(p, ev, lex.T_COMMA) {
+                        break
+                    }
+                }
+                let rp = expect(p, ev, lex.T_RPAREN)
+                if rp < 0 {
+                    return false
+                }
+                ve = ve.max(p.lx.end[rp])
+            }
+            ev_complete(p, ev, vm, syn.N_VARIANT, vname.s, ve)
+            // Newlines may come before the next `|`.
+            let save = p.i
+            skip_newlines(p, ev)
+            if not at(p, ev, lex.T_PIPE) {
+                p.i = save
+                break
+            }
+        }
+        end = p.lx.end[p.i - 1]
+        end_s = p.lx.start[p.i - 1]
+        ev_complete(p, ev, vsm, syn.N_VARIANTS, -1, -1)
+    } else {
+        let am = ev_start(p, ev)
+        let ty = parse_type_nested(p, ev)
+        if not ty.ok {
+            return false
+        }
+        end = ty.e
+        end_s = ty.s
+        ev_complete(p, ev, am, syn.N_ALIAS, -1, -1)
+    }
+    ev_complete(p, ev, m, syn.N_TYPE_DECL, s.min(end_s), se.max(end))
+    ev_set2(p, ev, m, b2i(is_pub), b2i(linear))
+    true
+}
+
+/// `{ field: T, other: U }` -- commas and/or newlines separate.
+fn parse_field_block(inout p: Parser, inout ev: [i64]) -> bool {
+    let bm = ev_start(p, ev)
+    if expect(p, ev, lex.T_LBRACE) < 0 {
+        return false
+    }
+    while true {
+        skip_newlines(p, ev)
+        if at(p, ev, lex.T_RBRACE) {
+            break
+        }
+        let fm = ev_start(p, ev)
+        let name = ident(p, ev)
+        if not name.ok {
+            return false
+        }
+        if expect(p, ev, lex.T_COLON) < 0 {
+            return false
+        }
+        let ty = parse_type_nested(p, ev)
+        if not ty.ok {
+            return false
+        }
+        ev_complete(p, ev, fm, syn.N_FIELD_DEF, name.s.min(ty.s), name.e.max(ty.e))
+        let had_sep = eat(p, ev, lex.T_COMMA)
+        let at_nl = p.lx.kind[p.i] == lex.T_NEWLINE
+        if not had_sep and not at_nl {
+            break
+        }
+    }
+    skip_newlines(p, ev)
+    if expect(p, ev, lex.T_RBRACE) < 0 {
+        return false
+    }
+    ev_complete(p, ev, bm, syn.N_FIELDS, -1, -1)
+    true
+}
+
+fn parse_effect_decl(inout p: Parser, inout ev: [i64], m: i64) -> bool {
+    let s = cur_s(p, ev)
+    let se = p.lx.end[p.i]
+    if expect(p, ev, lex.KW_EFFECT) < 0 {
+        return false
+    }
+    if not ident(p, ev).ok {
+        return false
+    }
+    if expect(p, ev, lex.T_LBRACE) < 0 {
+        return false
+    }
+    while true {
+        skip_newlines(p, ev)
+        if at(p, ev, lex.T_RBRACE) {
+            break
+        }
+        let sm = ev_start(p, ev)
+        let os = cur_s(p, ev)
+        let ose = p.lx.end[p.i]
+        if expect(p, ev, lex.KW_FN) < 0 {
+            return false
+        }
+        if not ident(p, ev).ok {
+            return false
+        }
+        if not parse_params_self(p, ev, false).ok {
+            return false
+        }
+        if not parse_fn_tail(p, ev) {
+            return false
+        }
+        ev_complete(p, ev, sm, syn.N_SIG, os.min(p.lx.start[p.i - 1]), ose.max(p.lx.end[p.i - 1]))
+    }
+    let rb = expect(p, ev, lex.T_RBRACE)
+    if rb < 0 {
+        return false
+    }
+    ev_complete(p, ev, m, syn.N_EFFECT, s.min(p.lx.start[rb]), se.max(p.lx.end[rb]))
+    true
+}
+
+/// Whether the string token `t` is one text part and nothing else.
+fn plain_string(p: Parser, t: i64) -> bool {
+    p.lx.jval[t] == 1 and p.lx.part_kind[p.lx.ival[t]] == 0
+}
+
+fn parse_test_decl(inout p: Parser, inout ev: [i64], m: i64) -> bool {
+    let s = cur_s(p, ev)
+    let se = p.lx.end[p.i]
+    if expect(p, ev, lex.KW_TEST) < 0 {
+        return false
+    }
+    if cur(p, ev) == lex.T_STR {
+        let t = bump(p, ev)
+        if not plain_string(p, t) {
+            error_here(p, ev, "test names cannot contain interpolation")
+            return false
+        }
+    } else {
+        error_here(p, ev, "expected a string name after `test`")
+        return false
+    }
+    // A parameter list makes it a property test.
+    if cur(p, ev) == lex.T_LPAREN {
+        if not parse_params_self(p, ev, false).ok {
+            return false
+        }
+    }
+    let body = parse_block(p, ev)
+    if not body.ok {
+        return false
+    }
+    ev_complete(p, ev, m, syn.N_TEST, s.min(body.s), se.max(body.e))
+    true
+}
+
+/// `bench "name" { ... }`; `bench` is a word only before a string.
+fn parse_bench_decl(inout p: Parser, inout ev: [i64], m: i64) -> bool {
+    let s = cur_s(p, ev)
+    let se = p.lx.end[p.i]
+    bump(p, ev)
+    if cur(p, ev) == lex.T_STR {
+        let t = bump(p, ev)
+        if not plain_string(p, t) {
+            error_here(p, ev, "benchmark names cannot contain interpolation")
+            return false
+        }
+    } else {
+        error_here(p, ev, "expected a string name after `bench`")
+        return false
+    }
+    let body = parse_block(p, ev)
+    if not body.ok {
+        return false
+    }
+    ev_complete(p, ev, m, syn.N_BENCH, s.min(body.s), se.max(body.e))
+    true
+}
+
+fn parse_import(inout p: Parser, inout ev: [i64], m: i64) -> bool {
+    let s = cur_s(p, ev)
+    let se = p.lx.end[p.i]
+    if expect(p, ev, lex.KW_IMPORT) < 0 {
+        return false
+    }
+    let path = parse_path(p, ev)
+    if not path.ok {
+        return false
+    }
+    ev_complete(p, ev, m, syn.N_IMPORT, s.min(path.s), se.max(path.e))
+    true
+}
+
+// ---------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------
+
+/// A type where `T ! E` is one: a parameter, a field, an argument.
+fn parse_type_nested(inout p: Parser, inout ev: [i64]) -> TyRes {
+    let inner = parse_type(p, ev)
+    if not inner.ok {
+        return inner
+    }
+    if not at(p, ev, lex.T_BANG) {
+        return inner
+    }
+    let fm = ev_precede(p, ev, inner.m)
+    bump(p, ev)
+    let err = parse_type(p, ev)
+    if not err.ok {
+        return ty_bad()
+    }
+    let s = inner.s.min(err.s)
+    let e = inner.e.max(err.e)
+    if at(p, ev, lex.T_BANG) {
+        // `T ! E ! E` is not one type.
+        error_here(p, ev, "a type can carry only one `!`")
+        return ty_bad()
+    }
+    ev_complete(p, ev, fm, syn.N_TY_FALLIBLE, s, e)
+    ty_plain(Y_FALLIBLE, s, e, fm)
+}
+
+fn parse_type(inout p: Parser, inout ev: [i64]) -> TyRes {
+    // Types nest, and everything that walks one recurses.
+    if not enter_nested(p, ev) {
+        return ty_bad()
+    }
+    // The atom's kind decided here, in this frame: a level of nesting
+    // costs this call and the one for the kind.
+    let s = cur_s(p, ev)
+    let e0 = p.lx.end[p.i]
+    let k = cur(p, ev)
+    var r = ty_bad()
+    if k == lex.T_IDENT {
+        r = parse_type_atom_1(p, ev, s, e0, k)
+    } else if k == lex.KW_FN {
+        r = parse_type_atom_2(p, ev, s, e0, k)
+    } else if k == lex.T_LBRACKET {
+        r = parse_type_atom_3(p, ev, s, e0, k)
+    } else if k == lex.KW_REF {
+        r = parse_type_atom_4(p, ev, s, e0, k)
+    } else if k == lex.T_LPAREN {
+        r = parse_type_atom_5(p, ev, s, e0, k)
+    } else {
+        diag(p, ev, s, e0, "expected a type but found {describe(p, p.i)}")
+    }
+    p.depth -= 1
+    r
+}
+
+/// A type's name and span, as an `impl`'s checks want an argument.
+fn simple_of(t: TyRes) -> str {
+    if t.k == Y_NAME and t.nseg == 1 and t.args_name.len() == 0 and t.simple != "" {
+        t.simple
+    } else {
+        ""
+    }
+}
+
+
+fn parse_type_atom_1(inout p: Parser, inout ev: [i64], s: i64, e0: i64, k: i64) -> TyRes {
+    let tm = ev_start(p, ev)
+    let path = parse_path(p, ev)
+    if not path.ok {
+        return ty_bad()
+    }
+    var simple = ""
+    if path.k == 1 {
+        simple = ident_text(p, ev[(path.m) * 9 + 2])
+    }
+    var args_name: [str] = []
+    var args_s: [i64] = []
+    var args_e: [i64] = []
+    var e = path.e
+    var ns = path.s
+    var has_args = false
+    if at(p, ev, lex.T_LBRACKET) {
+        has_args = true
+        let am = ev_start(p, ev)
+        bump(p, ev)
+        while true {
+            if at(p, ev, lex.T_RBRACKET) {
+                break
+            }
+            let a = parse_type_nested(p, ev)
+            if not a.ok {
+                return ty_bad()
+            }
+            args_name.push(simple_of(a))
+            args_s.push(a.s)
+            args_e.push(a.e)
+            if not eat(p, ev, lex.T_COMMA) {
+                break
+            }
+        }
+        let rb = expect(p, ev, lex.T_RBRACKET)
+        if rb < 0 {
+            return ty_bad()
+        }
+        e = e.max(p.lx.end[rb])
+        ns = ns.min(p.lx.start[rb])
+        ev_complete(p, ev, am, syn.N_TY_ARGS, -1, -1)
+    }
+    ev_complete(p, ev, tm, syn.N_TY_NAME, ns, e)
+    var out = ty_plain(Y_NAME, ns, e, tm)
+    out.nseg = path.k
+    out.args_name = args_name
+    out.args_s = args_s
+    out.args_e = args_e
+    if not has_args {
+        out.simple = simple
+    }
+    return out
+}
+
+fn parse_type_atom_2(inout p: Parser, inout ev: [i64], s: i64, e0: i64, k: i64) -> TyRes {
+    // `fn(A, B) -> R / {io}`.
+    let tm = ev_start(p, ev)
+    bump(p, ev)
+    if expect(p, ev, lex.T_LPAREN) < 0 {
+        return ty_bad()
+    }
+    while true {
+        if at(p, ev, lex.T_RPAREN) {
+            break
+        }
+        if not parse_type_nested(p, ev).ok {
+            return ty_bad()
+        }
+        if not eat(p, ev, lex.T_COMMA) {
+            break
+        }
+    }
+    let rp = expect(p, ev, lex.T_RPAREN)
+    if rp < 0 {
+        return ty_bad()
+    }
+    var fs = s.min(p.lx.start[rp])
+    var e = e0.max(p.lx.end[rp])
+    // The return absorbs the `!`: `fn(i64) -> i64 ! E` can fail.
+    if at(p, ev, lex.T_ARROW) {
+        let rm = ev_start(p, ev)
+        bump(p, ev)
+        let t = parse_type_nested(p, ev)
+        if not t.ok {
+            return ty_bad()
+        }
+        fs = fs.min(t.s)
+        e = e.max(t.e)
+        ev_complete(p, ev, rm, syn.N_RET, t.s, t.e)
+    } else {
+        // The unit return gets the span so far.
+        ev_set2(p, ev, tm, fs, e)
+    }
+    if at(p, ev, lex.T_SLASH) {
+        let fxm = ev_start(p, ev)
+        bump(p, ev)
+        if expect(p, ev, lex.T_LBRACE) < 0 {
+            return ty_bad()
+        }
+        while true {
+            skip_newlines(p, ev)
+            if at(p, ev, lex.T_RBRACE) {
+                break
+            }
+            if not parse_row_entry(p, ev) {
+                return ty_bad()
+            }
+            if not eat(p, ev, lex.T_COMMA) {
+                break
+            }
+        }
+        skip_newlines(p, ev)
+        let rb = expect(p, ev, lex.T_RBRACE)
+        if rb < 0 {
+            return ty_bad()
+        }
+        fs = fs.min(p.lx.start[rb])
+        e = e.max(p.lx.end[rb])
+        ev_complete(p, ev, fxm, syn.N_EFFECTS, -1, -1)
+    }
+    let s2 = ev[(tm) * 9 + 7]
+    let e2 = ev[(tm) * 9 + 8]
+    ev_complete(p, ev, tm, syn.N_TY_FN, fs, e)
+    ev_set2(p, ev, tm, s2, e2)
+    return ty_plain(Y_FN, fs, e, tm)
+}
+
+fn parse_type_atom_3(inout p: Parser, inout ev: [i64], s: i64, e0: i64, k: i64) -> TyRes {
+    let tm = ev_start(p, ev)
+    bump(p, ev)
+    let inner = parse_type_nested(p, ev)
+    if not inner.ok {
+        return ty_bad()
+    }
+    let rb = expect(p, ev, lex.T_RBRACKET)
+    if rb < 0 {
+        return ty_bad()
+    }
+    let e = e0.max(p.lx.end[rb])
+    let ls = s.min(p.lx.start[rb])
+    ev_complete(p, ev, tm, syn.N_TY_LIST, ls, e)
+    var out = ty_plain(Y_LIST, ls, e, tm)
+    out.elem_name = simple_of(inner)
+    out.elem_s = inner.s
+    out.elem_e = inner.e
+    return out
+}
+
+fn parse_type_atom_4(inout p: Parser, inout ev: [i64], s: i64, e0: i64, k: i64) -> TyRes {
+    // The referent has no `!`: `ref Node ! E` is `(ref Node) ! E`.
+    let tm = ev_start(p, ev)
+    bump(p, ev)
+    let inner = parse_type(p, ev)
+    if not inner.ok {
+        return ty_bad()
+    }
+    let e = e0.max(inner.e)
+    let rs = s.min(inner.s)
+    ev_complete(p, ev, tm, syn.N_TY_REF, rs, e)
+    return ty_plain(Y_REF, rs, e, tm)
+}
+
+fn parse_type_atom_5(inout p: Parser, inout ev: [i64], s: i64, e0: i64, k: i64) -> TyRes {
+    let tm = ev_start(p, ev)
+    bump(p, ev)
+    if at(p, ev, lex.T_RPAREN) {
+        let rp = bump(p, ev)
+        let e = e0.max(p.lx.end[rp])
+        let ts = s.min(p.lx.start[rp])
+        ev_complete(p, ev, tm, syn.N_TY_TUPLE, ts, e)
+        return ty_plain(Y_TUPLE, ts, e, tm)
+    }
+    let first = parse_type_nested(p, ev)
+    if not first.ok {
+        return ty_bad()
+    }
+    if at(p, ev, lex.T_PIPE) {
+        while eat(p, ev, lex.T_PIPE) {
+            if not parse_type_nested(p, ev).ok {
+                return ty_bad()
+            }
+        }
+        let rp = expect(p, ev, lex.T_RPAREN)
+        if rp < 0 {
+            return ty_bad()
+        }
+        let e = e0.max(p.lx.end[rp])
+        let us = s.min(p.lx.start[rp])
+        ev_complete(p, ev, tm, syn.N_TY_UNION, us, e)
+        return ty_plain(Y_UNION, us, e, tm)
+    }
+    if at(p, ev, lex.T_COMMA) {
+        while eat(p, ev, lex.T_COMMA) {
+            if at(p, ev, lex.T_RPAREN) {
+                break
+            }
+            if not parse_type_nested(p, ev).ok {
+                return ty_bad()
+            }
+        }
+        let rp = expect(p, ev, lex.T_RPAREN)
+        if rp < 0 {
+            return ty_bad()
+        }
+        let e = e0.max(p.lx.end[rp])
+        let ts = s.min(p.lx.start[rp])
+        ev_complete(p, ev, tm, syn.N_TY_TUPLE, ts, e)
+        return ty_plain(Y_TUPLE, ts, e, tm)
+    }
+    if expect(p, ev, lex.T_RPAREN) < 0 {
+        return ty_bad()
+    }
+    // `(T)` is `T`.
+    ev_complete(p, ev, tm, syn.N_TY_PAREN, first.s, first.e)
+    var out = first
+    out.m = tm
+    return out
+}
+
+// ---------------------------------------------------------------------
+// Blocks and statements
+// ---------------------------------------------------------------------
+
+fn parse_block(inout p: Parser, inout ev: [i64]) -> Res {
+    if not enter_nested(p, ev) {
+        return bad()
+    }
+    let r = parse_block_inner(p, ev)
+    p.depth -= 1
+    r
+}
+
+fn parse_block_inner(inout p: Parser, inout ev: [i64]) -> Res {
+    let bm = ev_start(p, ev)
+    let s = cur_s(p, ev)
+    let be = p.lx.end[p.i]
+    if expect(p, ev, lex.T_LBRACE) < 0 {
+        return bad()
+    }
+    while true {
+        skip_newlines(p, ev)
+        if at(p, ev, lex.T_RBRACE) or cur(p, ev) == lex.T_EOF {
+            break
+        }
+        let sm = ev_start(p, ev)
+        let st = parse_stmt(p, ev)
+        if st.ok {
+            ev_abandon(p, ev, sm)
+            // A statement ends at a newline, a `}` or the end of the file.
+            if p.lx.kind[p.i] != lex.T_NEWLINE and not at(p, ev, lex.T_RBRACE) and cur(p, ev) != lex.T_EOF {
+                let found = describe(p, p.i)
+                error_here(p, ev, "expected end of line after statement but found {found}")
+                let em = ev_start(p, ev)
+                sync_stmt(p, ev)
+                ev_complete(p, ev, em, syn.N_ERROR, -1, -1)
+            }
+        } else {
+            sync_stmt(p, ev)
+            ev_complete(p, ev, sm, syn.N_ERROR, -1, -1)
+        }
+    }
+    let rb = expect(p, ev, lex.T_RBRACE)
+    if rb < 0 {
+        return bad()
+    }
+    let bs = s.min(p.lx.start[rb])
+    let e = p.lx.end[rb].max(be)
+    ev_complete(p, ev, bm, syn.N_BLOCK, bs, e)
+    good(syn.X_BLOCK, bs, e, bm)
+}
+
+/// A statement; `k` is its node kind, and the span the Rust parser gives
+/// it (an expression statement's is the expression's).
+fn parse_stmt(inout p: Parser, inout ev: [i64]) -> Res {
+    let s = cur_s(p, ev)
+    let e0 = p.lx.end[p.i]
+    // `parallel {`, `spawn {`, `concurrent {`, `go {`: contextual.
+    if cur(p, ev) == lex.T_IDENT and stmt_scope_here(p, ev) {
+        return parse_scope_stmt(p, ev, s, e0)
+    }
+    let k = cur(p, ev)
+    if k == lex.KW_LET or k == lex.KW_VAR {
+        return parse_stmt_1(p, ev, s, e0, k)
+    }
+    if k == lex.KW_RETURN {
+        return parse_stmt_2(p, ev, s, e0, k)
+    }
+    if k == lex.KW_BREAK {
+        return parse_stmt_3(p, ev, s, e0, k)
+    }
+    if k == lex.KW_CONTINUE {
+        return parse_stmt_4(p, ev, s, e0, k)
+    }
+    if k == lex.KW_WHILE {
+        return parse_stmt_5(p, ev, s, e0, k)
+    }
+    if k == lex.KW_FOR {
+        return parse_stmt_6(p, ev, s, e0, k)
+    }
+    if k == lex.KW_WITH {
+        return parse_stmt_7(p, ev, s, e0, k)
+    }
+    parse_expr_stmt(p, ev)
+}
+
+/// Whether the cursor is on `parallel`, `spawn`, `concurrent` or `go` with
+/// a block after it.
+fn stmt_scope_here(inout p: Parser, inout ev: [i64]) -> bool {
+    let w = p.lx.jval[p.i]
+    (w == lex.W_PARALLEL or w == lex.W_CONCURRENT or w == lex.W_SPAWN or w == lex.W_GO) and block_follows(p)
+}
+
+fn parse_scope_stmt(inout p: Parser, inout ev: [i64], s: i64, e0: i64) -> Res {
+    let w = p.lx.jval[p.i]
+    let concurrent = w == lex.W_CONCURRENT or w == lex.W_GO
+    let is_parallel = w == lex.W_PARALLEL or w == lex.W_CONCURRENT
+    let m = ev_start(p, ev)
+    bump(p, ev)
+    let body = parse_block(p, ev)
+    if not body.ok {
+        return bad()
+    }
+    let e = e0.max(body.e)
+    let ss = s.min(body.s)
+    var kind = syn.N_SPAWN
+    if is_parallel {
+        kind = syn.N_PARALLEL
+    }
+    ev_complete(p, ev, m, kind, ss, e)
+    ev_set2(p, ev, m, b2i(concurrent), 0)
+    good(kind, ss, e, m)
+}
+
+/// An expression statement, or an assignment.
+fn parse_expr_stmt(inout p: Parser, inout ev: [i64]) -> Res {
+    let expr = parse_expr(p, ev)
+    if not expr.ok {
+        return bad()
+    }
+    let op = cur(p, ev)
+    if op == lex.T_EQ or op == lex.T_PLUSEQ or op == lex.T_MINUSEQ or op == lex.T_STAREQ or op == lex.T_SLASHEQ {
+        let am = ev_precede(p, ev, expr.m)
+        bump(p, ev)
+        skip_newlines(p, ev)
+        let value = parse_expr(p, ev)
+        if not value.ok {
+            return bad()
+        }
+        let ss = expr.s.min(value.s)
+        let se = expr.e.max(value.e)
+        if not is_place(expr.k) {
+            diag_help(p, ev, expr.s, expr.e, "invalid assignment target", "only variables, fields, and index expressions can be assigned to")
+        }
+        ev_complete(p, ev, am, syn.N_ASSIGN, ss, se)
+        return good(syn.N_ASSIGN, ss, se, am)
+    }
+    let xm = ev_precede(p, ev, expr.m)
+    ev_complete(p, ev, xm, syn.N_EXPR_STMT, expr.s, expr.e)
+    good(syn.N_EXPR_STMT, expr.s, expr.e, xm)
+}
+
+fn parse_stmt_1(inout p: Parser, inout ev: [i64], s: i64, e0: i64, k: i64) -> Res {
+    let m = ev_start(p, ev)
+    let mutable = k == lex.KW_VAR
+    bump(p, ev)
+    // `let (a, b) = pair`.
+    if at(p, ev, lex.T_LPAREN) {
+        let nm = ev_start(p, ev)
+        bump(p, ev)
+        while true {
+            if at(p, ev, lex.T_RPAREN) {
+                break
+            }
+            if not binding_ident(p, ev).ok {
+                return bad()
+            }
+            if not eat(p, ev, lex.T_COMMA) {
+                break
+            }
+        }
+        if expect(p, ev, lex.T_RPAREN) < 0 {
+            return bad()
+        }
+        ev_complete(p, ev, nm, syn.N_NAMES, -1, -1)
+        if expect(p, ev, lex.T_EQ) < 0 {
+            return bad()
+        }
+        skip_newlines(p, ev)
+        let init = parse_expr(p, ev)
+        if not init.ok {
+            return bad()
+        }
+        let e = e0.max(init.e)
+        let ss = s.min(init.s)
+        ev_complete(p, ev, m, syn.N_LET_TUPLE, ss, e)
+        ev_set2(p, ev, m, b2i(mutable), 0)
+        return good(syn.N_LET_TUPLE, ss, e, m)
+    }
+    if not binding_ident(p, ev).ok {
+        return bad()
+    }
+    if eat(p, ev, lex.T_COLON) {
+        if not parse_type_nested(p, ev).ok {
+            return bad()
+        }
+    }
+    if expect(p, ev, lex.T_EQ) < 0 {
+        return bad()
+    }
+    skip_newlines(p, ev)
+    let init = parse_expr(p, ev)
+    if not init.ok {
+        return bad()
+    }
+    let e = e0.max(init.e)
+    let ss = s.min(init.s)
+    ev_complete(p, ev, m, syn.N_LET, ss, e)
+    ev_set2(p, ev, m, b2i(mutable), 0)
+    return good(syn.N_LET, ss, e, m)
+}
+
+fn parse_stmt_2(inout p: Parser, inout ev: [i64], s: i64, e0: i64, k: i64) -> Res {
+    let m = ev_start(p, ev)
+    bump(p, ev)
+    var e = e0
+    if p.lx.kind[p.i] == lex.T_NEWLINE or at(p, ev, lex.T_RBRACE) {
+        ev_complete(p, ev, m, syn.N_RETURN, s, e)
+        return good(syn.N_RETURN, s, e, m)
+    }
+    let v = parse_expr(p, ev)
+    if not v.ok {
+        return bad()
+    }
+    e = e.max(v.e)
+    ev_complete(p, ev, m, syn.N_RETURN, s.min(v.s), e)
+    return good(syn.N_RETURN, s.min(v.s), e, m)
+}
+
+fn parse_stmt_3(inout p: Parser, inout ev: [i64], s: i64, e0: i64, k: i64) -> Res {
+    let m = ev_start(p, ev)
+    bump(p, ev)
+    ev_complete(p, ev, m, syn.N_BREAK, s, e0)
+    return good(syn.N_BREAK, s, e0, m)
+}
+
+fn parse_stmt_4(inout p: Parser, inout ev: [i64], s: i64, e0: i64, k: i64) -> Res {
+    let m = ev_start(p, ev)
+    bump(p, ev)
+    ev_complete(p, ev, m, syn.N_CONTINUE, s, e0)
+    return good(syn.N_CONTINUE, s, e0, m)
+}
+
+fn parse_stmt_5(inout p: Parser, inout ev: [i64], s: i64, e0: i64, k: i64) -> Res {
+    let m = ev_start(p, ev)
+    bump(p, ev)
+    if not parse_cond_expr(p, ev).ok {
+        return bad()
+    }
+    let body = parse_block(p, ev)
+    if not body.ok {
+        return bad()
+    }
+    let e = e0.max(body.e)
+    let ss = s.min(body.s)
+    ev_complete(p, ev, m, syn.N_WHILE, ss, e)
+    return good(syn.N_WHILE, ss, e, m)
+}
+
+fn parse_stmt_6(inout p: Parser, inout ev: [i64], s: i64, e0: i64, k: i64) -> Res {
+    let m = ev_start(p, ev)
+    bump(p, ev)
+    // `for (a, b) in pairs`.
+    if at(p, ev, lex.T_LPAREN) {
+        let nm = ev_start(p, ev)
+        bump(p, ev)
+        while true {
+            if at(p, ev, lex.T_RPAREN) {
+                break
+            }
+            if not binding_ident(p, ev).ok {
+                return bad()
+            }
+            if not eat(p, ev, lex.T_COMMA) {
+                break
+            }
+        }
+        let rs = cur_s(p, ev)
+        let re = p.lx.end[p.i]
+        if expect(p, ev, lex.T_RPAREN) < 0 {
+            return bad()
+        }
+        ev_complete(p, ev, nm, syn.N_NAMES, rs, re)
+    } else {
+        if not binding_ident(p, ev).ok {
+            return bad()
+        }
+    }
+    if expect(p, ev, lex.KW_IN) < 0 {
+        return bad()
+    }
+    if not parse_cond_expr(p, ev).ok {
+        return bad()
+    }
+    let body = parse_block(p, ev)
+    if not body.ok {
+        return bad()
+    }
+    let e = e0.max(body.e)
+    let ss = s.min(body.s)
+    ev_complete(p, ev, m, syn.N_FOR, ss, e)
+    return good(syn.N_FOR, ss, e, m)
+}
+
+fn parse_stmt_7(inout p: Parser, inout ev: [i64], s: i64, e0: i64, k: i64) -> Res {
+    let m = ev_start(p, ev)
+    bump(p, ev)
+    if not parse_path(p, ev).ok {
+        return bad()
+    }
+    if expect(p, ev, lex.KW_HANDLEDBY) < 0 {
+        return bad()
+    }
+    if not parse_expr(p, ev).ok {
+        return bad()
+    }
+    let body = parse_block(p, ev)
+    if not body.ok {
+        return bad()
+    }
+    let e = e0.max(body.e)
+    let ss = s.min(body.s)
+    ev_complete(p, ev, m, syn.N_WITH, ss, e)
+    return good(syn.N_WITH, ss, e, m)
+}
+
+fn parse_stmt_8(inout p: Parser, inout ev: [i64], s: i64, e0: i64, k: i64) -> Res {
+    return bad()
+}
+
+fn is_place(k: i64) -> bool {
+    k == syn.X_IDENT or k == syn.X_FIELD or k == syn.X_INDEX
+}
+
+/// Condition position: `Name {` opens the body, not a struct literal.
+fn parse_cond_expr(inout p: Parser, inout ev: [i64]) -> Res {
+    let saved = p.no_struct_lit
+    p.no_struct_lit = true
+    let r = parse_expr(p, ev)
+    p.no_struct_lit = saved
+    r
+}
+
+// ---------------------------------------------------------------------
+// Expressions
+// ---------------------------------------------------------------------
+
+pub fn parse_expr(inout p: Parser, inout ev: [i64]) -> Res {
+    if not enter_nested(p, ev) {
+        return bad()
+    }
+    // A folded operator charges a level and releases nothing; the whole
+    // chain is released here, when the expression is done.
+    let saved = p.depth
+    let r = climb(p, ev, 0)
+    p.depth = saved - 1
+    r
+}
+
+/// Two `|` written side by side: `||`.
+fn at_double_pipe(inout p: Parser, inout ev: [i64]) -> bool {
+    if not at(p, ev, lex.T_PIPE) {
+        return false
+    }
+    let here_e = p.lx.end[p.i]
+    tk(p, p.i + 1) == lex.T_PIPE and p.lx.start[p.i + 1] == here_e
+}
+
+/// Charges one level for a folded binary operator.
+fn fold(inout p: Parser, inout ev: [i64]) -> bool {
+    enter_nested(p, ev)
+}
+
+/// `BinaryOp`, in the Rust enum's order.
+pub let OP_ADD = 0
+pub let OP_SUB = 1
+pub let OP_MUL = 2
+pub let OP_DIV = 3
+pub let OP_REM = 4
+pub let OP_POW = 5
+pub let OP_EQ = 6
+pub let OP_NOTEQ = 7
+pub let OP_LT = 8
+pub let OP_LTEQ = 9
+pub let OP_GT = 10
+pub let OP_GTEQ = 11
+pub let OP_AND = 12
+pub let OP_OR = 13
+pub let OP_COALESCE = 14
+
+fn op_of(k: i64) -> i64 {
+    if k == lex.T_PLUS {
+        OP_ADD
+    } else if k == lex.T_MINUS {
+        OP_SUB
+    } else if k == lex.T_STAR {
+        OP_MUL
+    } else if k == lex.T_SLASH {
+        OP_DIV
+    } else if k == lex.T_PERCENT {
+        OP_REM
+    } else if k == lex.T_EQEQ {
+        OP_EQ
+    } else if k == lex.T_NOTEQ {
+        OP_NOTEQ
+    } else if k == lex.T_LT {
+        OP_LT
+    } else if k == lex.T_LTEQ {
+        OP_LTEQ
+    } else if k == lex.T_GT {
+        OP_GT
+    } else {
+        OP_GTEQ
+    }
+}
+
+fn binary(inout p: Parser, inout ev: [i64], lhs: Res, op: i64, rhs: Res, am: i64) -> Res {
+    let s = lhs.s.min(rhs.s)
+    let e = lhs.e.max(rhs.e)
+    ev_complete(p, ev, am, syn.N_BINARY, s, e)
+    ev_set2(p, ev, am, op, 0)
+    good(syn.X_BINARY, s, e, am)
+}
+
+/// The binary operator at the cursor and its level, loosest first: `or`
+/// 0, `and` 1, comparisons 2, `..` 3, `??` 4, `|>` 5, `+ -` 6, `* / %` 7;
+/// -1 for none. (`&&` and `||` are `and` and `or` misspelt.)
+fn level_here(inout p: Parser, inout ev: [i64]) -> i64 {
+    let k = cur(p, ev)
+    if k == lex.KW_OR or at_double_pipe(p, ev) {
+        0
+    } else if k == lex.KW_AND or k == lex.T_AMPAMP {
+        1
+    } else if k == lex.T_EQEQ or k == lex.T_NOTEQ or k == lex.T_LT or k == lex.T_LTEQ or k == lex.T_GT or k == lex.T_GTEQ {
+        2
+    } else if k == lex.T_DOTDOT or k == lex.T_DOTDOTEQ {
+        3
+    } else if k == lex.T_QQ {
+        4
+    } else if k == lex.T_PIPEGT {
+        5
+    } else if k == lex.T_PLUS or k == lex.T_MINUS {
+        6
+    } else if k == lex.T_STAR or k == lex.T_SLASH or k == lex.T_PERCENT {
+        7
+    } else {
+        -1
+    }
+}
+
+/// The binary levels, by precedence climbing: the expression whose
+/// operators are all at level `min` or tighter.
+///
+/// The Rust parser has a function per level, each calling the next, so an
+/// operand costs a call per level; here one loop decides, and a bracketed
+/// operand costs a handful of calls rather than a dozen. The trees, the
+/// diagnostics and the levels charged are the same, in the same order: a
+/// left-associative level folds after its right side is read, as
+/// `parse_additive` does; `??` reads its chain and folds from the right, as
+/// the Rust recursion unwinds; a `..` takes one right side and only right
+/// after its left one, since `parse_range` is not a loop.
+fn climb(inout p: Parser, inout ev: [i64], min: i64) -> Res {
+    var lhs = parse_unary(p, ev)
+    if not lhs.ok {
+        return lhs
+    }
+    if at(p, ev, lex.T_CARET) {
+        lhs = power_chain(p, ev, lhs)
+        if not lhs.ok {
+            return lhs
+        }
+    }
+    // Whether an operator at level 3 or looser was folded here: after one,
+    // a `..` is not this expression's.
+    var low_done = false
+    while true {
+        let lv = level_here(p, ev)
+        if lv < 0 or lv < min or (lv == 3 and low_done) {
+            break
+        }
+        if lv <= 3 {
+            low_done = true
+        }
+        if lv == 0 {
+            let am = ev_precede(p, ev, lhs.m)
+            if at_double_pipe(p, ev) {
+                let s = cur_s(p, ev)
+                let e = p.lx.end[p.i + 1]
+                diag_help(p, ev, s, s.max(e), "`||` is written `or` in Grasm", "replace `||` with `or`")
+                bump(p, ev)
+            }
+            bump(p, ev)
+            skip_newlines(p, ev)
+            let rhs = climb(p, ev, 1)
+            if not rhs.ok {
+                return bad()
+            }
+            if not fold(p, ev) {
+                return bad()
+            }
+            lhs = binary(p, ev, lhs, OP_OR, rhs, am)
+        } else if lv == 1 {
+            let am = ev_precede(p, ev, lhs.m)
+            if at(p, ev, lex.T_AMPAMP) {
+                let s = cur_s(p, ev)
+                let e = p.lx.end[p.i]
+                diag_help(p, ev, s, e, "`&&` is written `and` in Grasm", "replace `&&` with `and`")
+            }
+            bump(p, ev)
+            skip_newlines(p, ev)
+            let rhs = climb(p, ev, 2)
+            if not rhs.ok {
+                return bad()
+            }
+            if not fold(p, ev) {
+                return bad()
+            }
+            lhs = binary(p, ev, lhs, OP_AND, rhs, am)
+        } else if lv == 3 {
+            let range_tok = cur(p, ev)
+            let am = ev_precede(p, ev, lhs.m)
+            bump(p, ev)
+            let rhs = climb(p, ev, 4)
+            if not rhs.ok {
+                return bad()
+            }
+            let s = lhs.s.min(rhs.s)
+            let e = lhs.e.max(rhs.e)
+            ev_complete(p, ev, am, syn.N_RANGE, s, e)
+            ev_set2(p, ev, am, b2i(range_tok == lex.T_DOTDOTEQ), 0)
+            lhs = good(syn.X_RANGE, s, e, am)
+        } else if lv == 4 {
+            lhs = coalesce_chain(p, ev, lhs)
+            if not lhs.ok {
+                return bad()
+            }
+        } else if lv == 5 {
+            lhs = pipe_stage(p, ev, lhs)
+            if not lhs.ok {
+                return bad()
+            }
+        } else {
+            // Comparisons, `+ -` and `* / %`: left-associative.
+            let am = ev_precede(p, ev, lhs.m)
+            let op = op_of(p.lx.kind[bump(p, ev)])
+            skip_newlines(p, ev)
+            let rhs = climb(p, ev, lv + 1)
+            if not rhs.ok {
+                return bad()
+            }
+            if not fold(p, ev) {
+                return bad()
+            }
+            lhs = binary(p, ev, lhs, op, rhs, am)
+        }
+    }
+    lhs
+}
+
+
+/// A `??` chain after `lhs`: each `??` opens a node around everything
+/// after its left operand, and the folds come innermost first.
+fn coalesce_chain(inout p: Parser, inout ev: [i64], lhs: Res) -> Res {
+    var opens: [i64] = []
+    var lefts: [Res] = [lhs]
+    var last = lhs
+    while at(p, ev, lex.T_QQ) {
+        opens.push(ev_precede(p, ev, last.m))
+        bump(p, ev)
+        skip_newlines(p, ev)
+        last = climb(p, ev, 5)
+        if not last.ok {
+            return bad()
+        }
+        lefts.push(last)
+    }
+    var acc = last
+    var k = opens.len() - 1
+    while k >= 0 {
+        if not fold(p, ev) {
+            return bad()
+        }
+        let l = lefts[k]
+        let s = l.s.min(acc.s)
+        let e = l.e.max(acc.e)
+        ev_complete(p, ev, opens[k], syn.N_COALESCE, s, e)
+        acc = good(syn.X_BINARY, s, e, opens[k])
+        k -= 1
+    }
+    acc
+}
+
+/// `x |> f(a)` is `f(x, a)`; the AST builder rewrites it. A stage deepens
+/// the tree as a folded operator does.
+fn pipe_stage(inout p: Parser, inout ev: [i64], lhs: Res) -> Res {
+    if not enter_nested(p, ev) {
+        return bad()
+    }
+    let am = ev_precede(p, ev, lhs.m)
+    bump(p, ev)
+    skip_newlines(p, ev)
+    let rhs = climb(p, ev, 6)
+    if not rhs.ok {
+        return bad()
+    }
+    let s = lhs.s.min(rhs.s)
+    let e = lhs.e.max(rhs.e)
+    ev_complete(p, ev, am, syn.N_PIPE, s, e)
+    if rhs.k == syn.X_CALL or rhs.k == syn.X_METHOD {
+        return good(rhs.k, s, e, am)
+    }
+    if rhs.k == syn.X_IDENT or rhs.k == syn.X_FIELD {
+        return good(syn.X_CALL, s, e, am)
+    }
+    diag_help(p, ev, rhs.s, rhs.e, "right side of `|>` must be a function or call", "write `value |> f` or `value |> f(more, args)`")
+    // The right side, unchanged, is the result.
+    good(rhs.k, rhs.s, rhs.e, am)
+}
+
+
+
+
+fn postfix_call(inout p: Parser, inout ev: [i64], expr: Res) -> Res {
+    let cm = ev_precede(p, ev, expr.m)
+    let am = ev_start(p, ev)
+    bump(p, ev)
+    if not parse_call_args(p, ev) {
+        return bad()
+    }
+    let rp = expect(p, ev, lex.T_RPAREN)
+    if rp < 0 {
+        return bad()
+    }
+    ev_complete(p, ev, am, syn.N_ARGS, -1, -1)
+    let s = expr.s.min(p.lx.start[rp])
+    let e = expr.e.max(p.lx.end[rp])
+    ev_complete(p, ev, cm, syn.N_CALL, s, e)
+    var xk = syn.X_CALL
+    if expr.k == syn.X_FIELD {
+        xk = syn.X_METHOD
+    }
+    good(xk, s, e, cm)
+}
+
+fn postfix_index(inout p: Parser, inout ev: [i64], expr: Res) -> Res {
+    let im = ev_precede(p, ev, expr.m)
+    bump(p, ev)
+    if not parse_expr(p, ev).ok {
+        return bad()
+    }
+    let rb = expect(p, ev, lex.T_RBRACKET)
+    if rb < 0 {
+        return bad()
+    }
+    let s = expr.s.min(p.lx.start[rb])
+    let e = expr.e.max(p.lx.end[rb])
+    ev_complete(p, ev, im, syn.N_INDEX, s, e)
+    good(syn.X_INDEX, s, e, im)
+}
+
+fn postfix_field(inout p: Parser, inout ev: [i64], expr: Res) -> Res {
+    let fm = ev_precede(p, ev, expr.m)
+    bump(p, ev)
+    // `pair.0`: a component, named by its digits.
+    var ne = 0
+    var ns = 0
+    if cur(p, ev) == lex.T_INT {
+        ns = cur_s(p, ev)
+        ne = p.lx.end[p.i]
+        bump(p, ev)
+    } else {
+        let name = ident(p, ev)
+        if not name.ok {
+            return bad()
+        }
+        ns = name.s
+        ne = name.e
+    }
+    let s = expr.s.min(ns)
+    let e = expr.e.max(ne)
+    ev_complete(p, ev, fm, syn.N_FIELD, s, e)
+    good(syn.X_FIELD, s, e, fm)
+}
+
+/// Right-associative: `2^3^2` is `2^(3^2)`. The Rust parser recurses per
+/// `^` and charges no level for it; this loops.
+fn power_chain(inout p: Parser, inout ev: [i64], first: Res) -> Res {
+    var opens: [i64] = []
+    var lefts: [Res] = [first]
+    var last = first
+    while at(p, ev, lex.T_CARET) {
+        opens.push(ev_precede(p, ev, last.m))
+        bump(p, ev)
+        skip_newlines(p, ev)
+        last = parse_unary(p, ev)
+        if not last.ok {
+            return bad()
+        }
+        lefts.push(last)
+    }
+    var acc = last
+    var k = opens.len() - 1
+    while k >= 0 {
+        let lhs = lefts[k]
+        let s = lhs.s.min(acc.s)
+        let e = lhs.e.max(acc.e)
+        ev_complete(p, ev, opens[k], syn.N_POW, s, e)
+        acc = good(syn.X_BINARY, s, e, opens[k])
+        k -= 1
+    }
+    acc
+}
+
+/// Prefix `-`, `not` and `try`, each a level as each is a call of
+/// `parse_unary` in the Rust parser; then the operand and its postfix
+/// chain (`parse_postfix`, `parse_primary`). One frame for all of it:
+/// this is the path every level of nesting takes.
+fn parse_unary(inout p: Parser, inout ev: [i64]) -> Res {
+    let base = p.depth
+    var marks: [i64] = []
+    var starts: [i64] = []
+    var ends: [i64] = []
+    var kinds: [i64] = []
+    while true {
+        if not enter_nested(p, ev) {
+            p.depth = base
+            return bad()
+        }
+        let k = cur(p, ev)
+        if k == lex.T_MINUS or k == lex.KW_NOT or k == lex.KW_TRY {
+            marks.push(ev_start(p, ev))
+            starts.push(cur_s(p, ev))
+            ends.push(p.lx.end[p.i])
+            kinds.push(k)
+            bump(p, ev)
+            continue
+        }
+        break
+    }
+    // The operand: a primary expression, then its postfix chain. A
+    // postfix step's level is the enclosing expression's to release; each
+    // prefix level releases only its own, as `parse_unary` does.
+    var r = bad()
+    {
+        let s = cur_s(p, ev)
+        let e0 = p.lx.end[p.i]
+        let k = cur(p, ev)
+        if k == lex.T_INT {
+            r = parse_primary_1(p, ev, s, e0, k)
+        } else if k == lex.T_WIDEINT {
+            r = parse_primary_2(p, ev, s, e0, k)
+        } else if k == lex.T_FLOAT {
+            r = parse_primary_3(p, ev, s, e0, k)
+        } else if k == lex.KW_TRUE or k == lex.KW_FALSE {
+            r = parse_primary_4(p, ev, s, e0, k)
+        } else if k == lex.T_STR {
+            r = parse_primary_5(p, ev, s, e0, k)
+            // `region {`: contextual, and not in a condition ([L-CONTEXTUAL]).
+        } else if k == lex.T_IDENT and p.lx.jval[p.i] == lex.W_REGION and not p.no_struct_lit and block_follows(p) {
+            r = parse_primary_6(p, ev, s, e0, k)
+        } else if k == lex.T_IDENT {
+            r = parse_primary_7(p, ev, s, e0, k)
+        } else if k == lex.T_LPAREN {
+            r = parse_primary_8(p, ev, s, e0, k)
+        } else if k == lex.T_LBRACKET {
+            r = parse_primary_9(p, ev, s, e0, k)
+        } else if k == lex.KW_IF {
+            r = parse_if(p, ev)
+        } else if k == lex.KW_MATCH {
+            r = parse_match(p, ev)
+        } else if k == lex.KW_UNSAFE {
+            r = parse_primary_12(p, ev, s, e0, k)
+        } else if k == lex.KW_REF {
+            r = parse_primary_13(p, ev, s, e0, k)
+        } else if k == lex.T_LBRACE {
+            r = parse_brace_expr(p, ev)
+        } else if k == lex.T_PIPE {
+            r = parse_closure(p, ev)
+        } else {
+            r = primary_error(p, ev, s, e0, k)
+        }
+    }
+    if r.ok {
+        while true {
+            let k = cur(p, ev)
+            // A postfix chain deepens the tree as a folded operator does.
+            if k == lex.T_LPAREN or k == lex.T_DOT or k == lex.T_LBRACKET {
+                if not enter_nested(p, ev) {
+                    p.depth -= marks.len() + 1
+                    return bad()
+                }
+            }
+            if k == lex.T_LPAREN {
+                r = postfix_call(p, ev, r)
+            } else if k == lex.T_LBRACKET {
+                r = postfix_index(p, ev, r)
+            } else if k == lex.T_DOT {
+                r = postfix_field(p, ev, r)
+            } else {
+                break
+            }
+            if not r.ok {
+                p.depth -= marks.len() + 1
+                return r
+            }
+        }
+    }
+    p.depth -= marks.len() + 1
+    if not r.ok {
+        return r
+    }
+    var j = marks.len() - 1
+    while j >= 0 {
+        let s = starts[j].min(r.s)
+        let e = ends[j].max(r.e)
+        var ck = syn.N_UNARY
+        var xk = syn.X_UNARY
+        if kinds[j] == lex.KW_TRY {
+            ck = syn.N_TRY
+            xk = syn.X_TRY
+        }
+        ev_complete(p, ev, marks[j], ck, s, e)
+        ev_set2(p, ev, marks[j], kinds[j], 0)
+        r = good(xk, s, e, marks[j])
+        j -= 1
+    }
+    r
+}
+
+/// No expression starts here: what was found, and the word to reach for
+/// when it is an operator other languages have.
+fn primary_error(inout p: Parser, inout ev: [i64], s: i64, e0: i64, k: i64) -> Res {
+    // An operator other languages spell differently, or a wrapped
+    // expression's operator at the start of a line.
+    var hint = ""
+    if k == lex.T_BANG {
+        hint = "negation is `not`, as in `not done`"
+    } else if at_line_start(p) {
+        let op = binary_operator_name(k)
+        if op != "" {
+            hint = "a newline ends a statement unless the line *ends* in an operator, so the previous line was complete. Move this `{op}` up to the end of it, or wrap the whole expression in parentheses"
+        }
+    }
+    let msg = "expected an expression but found {describe(p, p.i)}"
+    if hint == "" {
+        diag(p, ev, s, e0, msg)
+    } else {
+        diag_help(p, ev, s, e0, msg, hint)
+    }
+    bad()
+}
+
+fn parse_call_args(inout p: Parser, inout ev: [i64]) -> bool {
+    let saved = p.no_struct_lit
+    p.no_struct_lit = false
+    while true {
+        if at(p, ev, lex.T_RPAREN) {
+            break
+        }
+        if not parse_expr(p, ev).ok {
+            p.no_struct_lit = saved
+            return false
+        }
+        if not eat(p, ev, lex.T_COMMA) {
+            break
+        }
+    }
+    p.no_struct_lit = saved
+    true
+}
+
+/// An interpolation's source, parsed as one expression from its own
+/// tokens, at a depth one more than the string's, by a parser of its own --
+/// here, this one with its state set aside, as the Rust parser makes a new
+/// one. `ok` says an expression came back.
+fn parse_interp(inout p: Parser, inout ev: [i64], src: str, offset: i64) -> bool {
+    var sub = lex.lex(src.to_bytes(), false)
+    for t in 0..sub.kind.len() {
+        sub.start[t] = sub.start[t] + offset
+        sub.end[t] = sub.end[t] + offset
+    }
+    // Inside an actor's method `"{self.n}"` reads the state.
+    if p.in_actor {
+        state_reads(sub, 0, sub.kind.len(), p.actor_fields)
+    }
+    let reg = p.regions.len()
+    p.regions.push(lex.empty_lexed())
+    let im = ev_start(p, ev)
+    ev[(im) * 9 + 4] = reg
+    // The string's parser, set aside.
+    let saved_lx = p.lx
+    let saved_reg = p.reg
+    let saved_i = p.i
+    let saved_modes = p.modes
+    let saved_nsl = p.no_struct_lit
+    let saved_depth = p.depth
+    let saved_map = p.not_a_map
+    let saved_committed = p.map_committed
+    p.lx = sub
+    p.reg = reg
+    p.i = 0
+    p.modes = [KEEP]
+    p.no_struct_lit = false
+    p.depth = saved_depth + 1
+    p.not_a_map = {}
+    p.map_committed = false
+    skip_newlines(p, ev)
+    let r = parse_expr(p, ev)
+    // Everything between the braces is one expression ([L-INTERP-ONE]).
+    skip_newlines(p, ev)
+    if r.ok and not at(p, ev, lex.T_EOF) {
+        let s = cur_s(p, ev)
+        let e = p.lx.end[p.i]
+        diag_help(p, ev, s, e, "unexpected extra input inside `\{...}` — an interpolation holds one expression", "close the interpolation before this, or join the parts with an operator")
+    }
+    let done = p.lx
+    p.lx = saved_lx
+    p.reg = saved_reg
+    p.i = saved_i
+    p.modes = saved_modes
+    p.no_struct_lit = saved_nsl
+    p.depth = saved_depth
+    p.not_a_map = saved_map
+    p.map_committed = saved_committed
+    p.regions[reg] = done
+    if r.ok {
+        ev_complete(p, ev, im, syn.N_INTERP, r.s, r.e)
+    } else {
+        ev_complete(p, ev, im, syn.N_INTERP_FAILED, -1, -1)
+    }
+    r.ok
+}
+
+
+fn parse_primary_1(inout p: Parser, inout ev: [i64], s: i64, e0: i64, k: i64) -> Res {
+    let m = ev_start(p, ev)
+    bump(p, ev)
+    ev_complete(p, ev, m, syn.N_INT, s, e0)
+    return good(syn.X_INT, s, e0, m)
+}
+
+fn parse_primary_2(inout p: Parser, inout ev: [i64], s: i64, e0: i64, k: i64) -> Res {
+    // Its bits, and where it was written ([T-U64]).
+    let m = ev_start(p, ev)
+    bump(p, ev)
+    p.wide_ints.push(s)
+    ev_complete(p, ev, m, syn.N_INT, s, e0)
+    return good(syn.X_INT, s, e0, m)
+}
+
+fn parse_primary_3(inout p: Parser, inout ev: [i64], s: i64, e0: i64, k: i64) -> Res {
+    let m = ev_start(p, ev)
+    bump(p, ev)
+    ev_complete(p, ev, m, syn.N_FLOAT, s, e0)
+    return good(syn.X_FLOAT, s, e0, m)
+}
+
+fn parse_primary_4(inout p: Parser, inout ev: [i64], s: i64, e0: i64, k: i64) -> Res {
+    let m = ev_start(p, ev)
+    bump(p, ev)
+    ev_complete(p, ev, m, syn.N_BOOL, s, e0)
+    return good(syn.X_BOOL, s, e0, m)
+}
+
+fn parse_primary_5(inout p: Parser, inout ev: [i64], s: i64, e0: i64, k: i64) -> Res {
+    let m = ev_start(p, ev)
+    let t = bump(p, ev)
+    let first = p.lx.ival[t]
+    let count = p.lx.jval[t]
+    for q in first..first + count {
+        if p.lx.part_kind[q] == 1 {
+            let isrc = p.lx.part_text[q]
+            let ioff = p.lx.part_off[q]
+            if not parse_interp(p, ev, isrc, ioff) {
+                diag(p, ev, s, e0, "invalid expression inside string interpolation")
+            }
+        }
+    }
+    ev_complete(p, ev, m, syn.N_STR, s, e0)
+    return good(syn.X_STR, s, e0, m)
+}
+
+fn parse_primary_6(inout p: Parser, inout ev: [i64], s: i64, e0: i64, k: i64) -> Res {
+    let m = ev_start(p, ev)
+    bump(p, ev)
+    let b = parse_block(p, ev)
+    if not b.ok {
+        return bad()
+    }
+    ev_complete(p, ev, m, syn.N_REGION, b.s, b.e)
+    return good(syn.X_REGION, b.s, b.e, m)
+}
+
+fn parse_primary_7(inout p: Parser, inout ev: [i64], s: i64, e0: i64, k: i64) -> Res {
+    let m = ev_start(p, ev)
+    bump(p, ev)
+    ev_complete(p, ev, m, syn.N_NAME, s, e0)
+    let id = good(syn.X_IDENT, s, e0, m)
+    // `Name{ ... }`, where a struct literal may be.
+    if not p.no_struct_lit and at(p, ev, lex.T_LBRACE) {
+        return parse_struct_lit_or_ident(p, ev, id)
+    }
+    return id
+}
+
+fn parse_primary_8(inout p: Parser, inout ev: [i64], s: i64, e0: i64, k: i64) -> Res {
+    let m = ev_start(p, ev)
+    bump(p, ev)
+    if at(p, ev, lex.T_RPAREN) {
+        let rp = bump(p, ev)
+        let e = e0.max(p.lx.end[rp])
+        let ts = s.min(p.lx.start[rp])
+        ev_complete(p, ev, m, syn.N_TUPLE, ts, e)
+        return good(syn.X_TUPLE, ts, e, m)
+    }
+    let saved = p.no_struct_lit
+    p.no_struct_lit = false
+    let first = parse_expr(p, ev)
+    if not first.ok {
+        return bad()
+    }
+    if at(p, ev, lex.T_COMMA) {
+        while eat(p, ev, lex.T_COMMA) {
+            if at(p, ev, lex.T_RPAREN) {
+                break
+            }
+            if not parse_expr(p, ev).ok {
+                return bad()
+            }
+        }
+        let rp = expect(p, ev, lex.T_RPAREN)
+        if rp < 0 {
+            return bad()
+        }
+        p.no_struct_lit = saved
+        let e = e0.max(p.lx.end[rp])
+        let ts = s.min(p.lx.start[rp])
+        ev_complete(p, ev, m, syn.N_TUPLE, ts, e)
+        return good(syn.X_TUPLE, ts, e, m)
+    }
+    if expect(p, ev, lex.T_RPAREN) < 0 {
+        return bad()
+    }
+    p.no_struct_lit = saved
+    // `(x)` is `x`.
+    ev_complete(p, ev, m, syn.N_PAREN, first.s, first.e)
+    return good(first.k, first.s, first.e, m)
+}
+
+fn parse_primary_9(inout p: Parser, inout ev: [i64], s: i64, e0: i64, k: i64) -> Res {
+    let m = ev_start(p, ev)
+    bump(p, ev)
+    let saved = p.no_struct_lit
+    p.no_struct_lit = false
+    while true {
+        if at(p, ev, lex.T_RBRACKET) {
+            break
+        }
+        if not parse_expr(p, ev).ok {
+            return bad()
+        }
+        if not eat(p, ev, lex.T_COMMA) {
+            break
+        }
+    }
+    let rb = expect(p, ev, lex.T_RBRACKET)
+    if rb < 0 {
+        return bad()
+    }
+    p.no_struct_lit = saved
+    let e = e0.max(p.lx.end[rb])
+    let ls = s.min(p.lx.start[rb])
+    ev_complete(p, ev, m, syn.N_LIST, ls, e)
+    return good(syn.X_LIST, ls, e, m)
+}
+
+fn parse_primary_12(inout p: Parser, inout ev: [i64], s: i64, e0: i64, k: i64) -> Res {
+    let m = ev_start(p, ev)
+    bump(p, ev)
+    let b = parse_block(p, ev)
+    if not b.ok {
+        return bad()
+    }
+    ev_complete(p, ev, m, syn.N_UNSAFE, b.s, b.e)
+    return good(syn.X_UNSAFE, b.s, b.e, m)
+}
+
+fn parse_primary_13(inout p: Parser, inout ev: [i64], s: i64, e0: i64, k: i64) -> Res {
+    // `ref(v)`: a call of `ref`.
+    let m = ev_start(p, ev)
+    bump(p, ev)
+    if expect(p, ev, lex.T_LPAREN) < 0 {
+        return bad()
+    }
+    let saved = p.no_struct_lit
+    p.no_struct_lit = false
+    if not parse_expr(p, ev).ok {
+        return bad()
+    }
+    p.no_struct_lit = saved
+    let rp = expect(p, ev, lex.T_RPAREN)
+    if rp < 0 {
+        return bad()
+    }
+    let e = e0.max(p.lx.end[rp])
+    let rs = s.min(p.lx.start[rp])
+    ev_complete(p, ev, m, syn.N_REF_CALL, rs, e)
+    ev_set2(p, ev, m, s, e0)
+    return good(syn.X_CALL, rs, e, m)
+}
+
+/// `Name{ field: v, ... }`, or -- when what follows the brace is not
+/// `ident :` or `..` -- the bare name, the brace left for whatever comes
+/// next (`handled_by h { ... }`).
+fn parse_struct_lit_or_ident(inout p: Parser, inout ev: [i64], name: Res) -> Res {
+    let save_i = p.i
+    let save_modes = p.modes.len()
+    let save_diags = p.d_s.len()
+    bump(p, ev)
+    skip_newlines(p, ev)
+    var is_struct = false
+    let k = cur(p, ev)
+    if k == lex.T_IDENT {
+        var j = p.i + 1
+        while p.lx.kind[j] == lex.T_NEWLINE {
+            j += 1
+        }
+        is_struct = p.lx.kind[j] == lex.T_COLON
+    } else if k == lex.T_DOTDOT {
+        is_struct = true
+    }
+    p.i = save_i
+    while p.modes.len() > save_modes {
+        p.modes.pop()
+    }
+    diag_truncate(p, ev, save_diags)
+    if is_struct {
+        return parse_struct_lit(p, ev, name)
+    }
+    name
+}
+
+fn parse_struct_lit(inout p: Parser, inout ev: [i64], name: Res) -> Res {
+    let m = ev_precede(p, ev, name.m)
+    if expect(p, ev, lex.T_LBRACE) < 0 {
+        return bad()
+    }
+    skip_newlines(p, ev)
+    if at(p, ev, lex.T_DOTDOT) {
+        let bm = ev_start(p, ev)
+        bump(p, ev)
+        let saved = p.no_struct_lit
+        p.no_struct_lit = false
+        let base = parse_expr(p, ev)
+        if not base.ok {
+            return bad()
+        }
+        p.no_struct_lit = saved
+        ev_complete(p, ev, bm, syn.N_STRUCT_BASE, base.s, base.e)
+        eat(p, ev, lex.T_COMMA)
+    }
+    while true {
+        skip_newlines(p, ev)
+        if at(p, ev, lex.T_RBRACE) {
+            break
+        }
+        let fm = ev_start(p, ev)
+        if not ident(p, ev).ok {
+            return bad()
+        }
+        if expect(p, ev, lex.T_COLON) < 0 {
+            return bad()
+        }
+        skip_newlines(p, ev)
+        let saved = p.no_struct_lit
+        p.no_struct_lit = false
+        if not parse_expr(p, ev).ok {
+            return bad()
+        }
+        p.no_struct_lit = saved
+        ev_complete(p, ev, fm, syn.N_FIELD_INIT, -1, -1)
+        let had_sep = eat(p, ev, lex.T_COMMA)
+        let at_nl = p.lx.kind[p.i] == lex.T_NEWLINE
+        if not had_sep and not at_nl {
+            break
+        }
+    }
+    skip_newlines(p, ev)
+    let rb = expect(p, ev, lex.T_RBRACE)
+    if rb < 0 {
+        return bad()
+    }
+    let e = name.e.max(p.lx.end[rb])
+    let ss = name.s.min(p.lx.start[rb])
+    ev_complete(p, ev, m, syn.N_STRUCT_LIT, ss, e)
+    good(syn.X_STRUCT, ss, e, m)
+}
+
+/// `if c { } else if d { } else { }`. A chain of `else if` nests, and
+/// the Rust parser recurses for each without charging a level; this loops.
+fn parse_if(inout p: Parser, inout ev: [i64]) -> Res {
+    var marks: [i64] = []
+    var spans_s: [i64] = []
+    var spans_e: [i64] = []
+    var else_marks: [i64] = []
+    var tail_s = 0
+    var tail_e = 0
+    var has_tail = false
+    while true {
+        let m = ev_start(p, ev)
+        let s = cur_s(p, ev)
+        let se = p.lx.end[p.i]
+        if expect(p, ev, lex.KW_IF) < 0 {
+            return bad()
+        }
+        if not parse_cond_expr(p, ev).ok {
+            return bad()
+        }
+        let then_b = parse_block(p, ev)
+        if not then_b.ok {
+            return bad()
+        }
+        marks.push(m)
+        spans_s.push(s.min(then_b.s))
+        spans_e.push(se.max(then_b.e))
+        // `else` may come after a newline.
+        let save = p.i
+        skip_newlines(p, ev)
+        if at(p, ev, lex.KW_ELSE) {
+            let em = ev_start(p, ev)
+            bump(p, ev)
+            if at(p, ev, lex.KW_IF) {
+                else_marks.push(em)
+                continue
+            }
+            let b = parse_block(p, ev)
+            if not b.ok {
+                return bad()
+            }
+            ev_complete(p, ev, em, syn.N_ELSE, b.s, b.e)
+            tail_s = b.s
+            tail_e = b.e
+            has_tail = true
+            break
+        }
+        p.i = save
+        break
+    }
+    // Complete from the innermost `if` out, each span taking in what
+    // follows its `else`.
+    let last_ix = marks.len() - 1
+    var j = last_ix
+    var inner_s = tail_s
+    var inner_e = tail_e
+    var last = bad()
+    while j >= 0 {
+        var s = spans_s[j]
+        var e = spans_e[j]
+        if j < last_ix {
+            // Its `else if`, holding the `if` inside.
+            ev_complete(p, ev, else_marks[j], syn.N_ELSE_IF, inner_s, inner_e)
+            s = s.min(inner_s)
+            e = e.max(inner_e)
+        } else if has_tail {
+            s = s.min(inner_s)
+            e = e.max(inner_e)
+        }
+        ev_complete(p, ev, marks[j], syn.N_IF, s, e)
+        last = good(syn.X_IF, s, e, marks[j])
+        inner_s = s
+        inner_e = e
+        j -= 1
+    }
+    last
+}
+
+fn parse_match(inout p: Parser, inout ev: [i64]) -> Res {
+    let m = ev_start(p, ev)
+    let s = cur_s(p, ev)
+    let se = p.lx.end[p.i]
+    if expect(p, ev, lex.KW_MATCH) < 0 {
+        return bad()
+    }
+    if not parse_cond_expr(p, ev).ok {
+        return bad()
+    }
+    if expect(p, ev, lex.T_LBRACE) < 0 {
+        return bad()
+    }
+    while true {
+        skip_newlines(p, ev)
+        if at(p, ev, lex.T_RBRACE) {
+            break
+        }
+        if not parse_arm(p, ev) {
+            return bad()
+        }
+    }
+    let rb = expect(p, ev, lex.T_RBRACE)
+    if rb < 0 {
+        return bad()
+    }
+    let e = se.max(p.lx.end[rb])
+    let ms = s.min(p.lx.start[rb])
+    ev_complete(p, ev, m, syn.N_MATCH, ms, e)
+    good(syn.X_MATCH, ms, e, m)
+}
+
+/// One arm of a `match`: pattern, guard, `->` and body.
+fn parse_arm(inout p: Parser, inout ev: [i64]) -> bool {
+    let am = ev_start(p, ev)
+    var pat = parse_pattern(p, ev)
+    if not pat.ok {
+        return false
+    }
+    // `A | B -> ...`, at arm level only.
+    if at(p, ev, lex.T_PIPE) {
+        let om = ev_precede(p, ev, pat.m)
+        var last = pat
+        while eat(p, ev, lex.T_PIPE) {
+            last = parse_pattern(p, ev)
+            if not last.ok {
+                return false
+            }
+        }
+        let os = pat.s.min(last.s)
+        let oe = pat.e.max(last.e)
+        ev_complete(p, ev, om, syn.N_PAT_OR, os, oe)
+        pat = good(0, os, oe, om)
+    }
+    if at(p, ev, lex.KW_IF) {
+        let gm = ev_start(p, ev)
+        bump(p, ev)
+        if not parse_cond_expr(p, ev).ok {
+            return false
+        }
+        ev_complete(p, ev, gm, syn.N_GUARD, -1, -1)
+    }
+    if expect(p, ev, lex.T_ARROW) < 0 {
+        return false
+    }
+    skip_newlines(p, ev)
+    // `-> {}` is an arm that does nothing; `-> break` is `-> { break }`.
+    let empty_brace = at(p, ev, lex.T_LBRACE) and brace_is_empty(p)
+    let k = cur(p, ev)
+    var body = bad()
+    if k == lex.T_LBRACE and empty_brace {
+        let bm = ev_start(p, ev)
+        let b = parse_block(p, ev)
+        if not b.ok {
+            return false
+        }
+        ev_complete(p, ev, bm, syn.N_BLOCK_EXPR, b.s, b.e)
+        body = good(syn.X_BLOCK, b.s, b.e, bm)
+    } else if k == lex.KW_BREAK or k == lex.KW_CONTINUE or k == lex.KW_RETURN {
+        let bm = ev_start(p, ev)
+        let st = parse_stmt(p, ev)
+        if not st.ok {
+            return false
+        }
+        ev_complete(p, ev, bm, syn.N_ARM_STMT, st.s, st.e)
+        body = good(syn.X_BLOCK, st.s, st.e, bm)
+    } else {
+        let ex = parse_expr(p, ev)
+        if not ex.ok {
+            return false
+        }
+        let op = cur(p, ev)
+        if op == lex.T_EQ or op == lex.T_PLUSEQ or op == lex.T_MINUSEQ or op == lex.T_STAREQ or op == lex.T_SLASHEQ {
+            let asm = ev_precede(p, ev, ex.m)
+            bump(p, ev)
+            skip_newlines(p, ev)
+            let value = parse_expr(p, ev)
+            if not value.ok {
+                return false
+            }
+            let ss = ex.s.min(value.s)
+            let se = ex.e.max(value.e)
+            if not is_place(ex.k) {
+                diag_help(p, ev, ex.s, ex.e, "invalid assignment target", "only variables, fields, and index expressions can be assigned to")
+            }
+            ev_complete(p, ev, asm, syn.N_ARM_ASSIGN, ss, se)
+            body = good(syn.X_BLOCK, ss, se, asm)
+        } else {
+            body = ex
+        }
+    }
+    let as_ = pat.s.min(body.s)
+    let ae = pat.e.max(body.e)
+    ev_complete(p, ev, am, syn.N_ARM, as_, ae)
+    true
+}
+
+
+/// Whether the `{` at the cursor closes at once, newlines aside.
+fn brace_is_empty(p: Parser) -> bool {
+    var j = p.i + 1
+    while tk(p, j) == lex.T_NEWLINE {
+        j += 1
+    }
+    tk(p, j) == lex.T_RBRACE
+}
+
+/// `{` opens a map literal or a block: read it as a map, and rewind to a
+/// block if that does not fit ([G-MAP-BLOCK-AMBIG]).
+fn parse_brace_expr(inout p: Parser, inout ev: [i64]) -> Res {
+    let mark_i = p.i
+    let mark_modes = p.modes
+    let mark_diags = p.d_s.len()
+    let mark_ev = (ev.len() / 9)
+    if not p.not_a_map.has(mark_i) {
+        p.map_committed = false
+        // The map reading, in this frame: a brace costs one call, not two.
+        let m = ev_start(p, ev)
+        let s = cur_s(p, ev)
+        let se = p.lx.end[p.i]
+        var done = false
+        var end_s = 0
+        var end_e = 0
+        if expect(p, ev, lex.T_LBRACE) >= 0 {
+            skip_newlines(p, ev)
+            if at(p, ev, lex.T_RBRACE) {
+                end_s = cur_s(p, ev)
+                end_e = cur_e(p, ev)
+                bump(p, ev)
+                done = true
+            } else {
+                while true {
+                    let em = ev_start(p, ev)
+                    if not parse_expr(p, ev).ok {
+                        break
+                    }
+                    skip_newlines(p, ev)
+                    if expect(p, ev, lex.T_COLON) < 0 {
+                        break
+                    }
+                    p.map_committed = true
+                    skip_newlines(p, ev)
+                    if not parse_expr(p, ev).ok {
+                        break
+                    }
+                    ev_complete(p, ev, em, syn.N_MAP_ENTRY, -1, -1)
+                    skip_newlines(p, ev)
+                    if at(p, ev, lex.T_COMMA) {
+                        bump(p, ev)
+                        skip_newlines(p, ev)
+                        if at(p, ev, lex.T_RBRACE) {
+                            end_s = cur_s(p, ev)
+                            end_e = cur_e(p, ev)
+                            bump(p, ev)
+                            done = true
+                            break
+                        }
+                        continue
+                    }
+                    if at(p, ev, lex.T_RBRACE) {
+                        end_s = cur_s(p, ev)
+                        end_e = cur_e(p, ev)
+                        bump(p, ev)
+                        done = true
+                    }
+                    break
+                }
+            }
+        }
+        if done {
+            ev_complete(p, ev, m, syn.N_MAP, s.min(end_s), se.max(end_e))
+            return good(syn.X_MAP, s.min(end_s), se.max(end_e), m)
+        }
+        // A `key :` was read, so this is a map and the error is in it.
+        if p.map_committed {
+            return bad()
+        }
+        p.not_a_map.set(mark_i, true)
+    }
+    p.i = mark_i
+    p.modes = mark_modes
+    diag_truncate(p, ev, mark_diags)
+    ev_truncate(p, ev, mark_ev)
+    let bm = ev_start(p, ev)
+    let b = parse_block(p, ev)
+    if not b.ok {
+        return bad()
+    }
+    ev_complete(p, ev, bm, syn.N_BLOCK_EXPR, b.s, b.e)
+    good(syn.X_BLOCK, b.s, b.e, bm)
+}
+
+
+fn parse_closure(inout p: Parser, inout ev: [i64]) -> Res {
+    let m = ev_start(p, ev)
+    let s = cur_s(p, ev)
+    let se = p.lx.end[p.i]
+    let pm = ev_start(p, ev)
+    if expect(p, ev, lex.T_PIPE) < 0 {
+        return bad()
+    }
+    if not at(p, ev, lex.T_PIPE) {
+        while true {
+            if not ident(p, ev).ok {
+                return bad()
+            }
+            if not eat(p, ev, lex.T_COMMA) {
+                break
+            }
+        }
+    }
+    if expect(p, ev, lex.T_PIPE) < 0 {
+        return bad()
+    }
+    ev_complete(p, ev, pm, syn.N_CLOSURE_PARAMS, -1, -1)
+    var body = bad()
+    if at(p, ev, lex.T_LBRACE) {
+        let bm = ev_start(p, ev)
+        let b = parse_block(p, ev)
+        if not b.ok {
+            return bad()
+        }
+        ev_complete(p, ev, bm, syn.N_BLOCK_EXPR, b.s, b.e)
+        body = good(syn.X_BLOCK, b.s, b.e, bm)
+    } else {
+        body = parse_expr(p, ev)
+        if not body.ok {
+            return bad()
+        }
+    }
+    let e = se.max(body.e)
+    ev_complete(p, ev, m, syn.N_CLOSURE, s.min(body.s), e)
+    good(syn.X_CLOSURE, s.min(body.s), e, m)
+}
+
+// ---------------------------------------------------------------------
+// Patterns
+// ---------------------------------------------------------------------
+
+fn parse_pattern(inout p: Parser, inout ev: [i64]) -> Res {
+    if not enter_nested(p, ev) {
+        return bad()
+    }
+    // The pattern's kind decided here, in this frame.
+    let s = cur_s(p, ev)
+    let e0 = p.lx.end[p.i]
+    let k = cur(p, ev)
+    var r = bad()
+    if k == lex.T_UNDERSCORE {
+        r = parse_pattern_inner_1(p, ev, s, e0, k)
+    } else if k == lex.T_INT {
+        r = parse_pattern_inner_2(p, ev, s, e0, k)
+    } else if k == lex.T_WIDEINT {
+        r = parse_pattern_inner_3(p, ev, s, e0, k)
+    } else if k == lex.T_MINUS {
+        r = parse_pattern_inner_4(p, ev, s, e0, k)
+    } else if k == lex.KW_TRUE or k == lex.KW_FALSE {
+        r = parse_pattern_inner_5(p, ev, s, e0, k)
+    } else if k == lex.T_STR {
+        r = parse_pattern_inner_6(p, ev, s, e0, k)
+    } else if k == lex.T_IDENT {
+        r = parse_pattern_inner_7(p, ev, s, e0, k)
+    } else if k == lex.T_LPAREN {
+        r = parse_pattern_inner_8(p, ev, s, e0, k)
+    } else {
+        diag(p, ev, s, e0, "expected a pattern but found {describe(p, p.i)}")
+    }
+    p.depth -= 1
+    r
+}
+
+
+fn parse_pattern_inner_1(inout p: Parser, inout ev: [i64], s: i64, e0: i64, k: i64) -> Res {
+    let m = ev_start(p, ev)
+    bump(p, ev)
+    ev_complete(p, ev, m, syn.N_PAT_WILD, s, e0)
+    return good(0, s, e0, m)
+}
+
+fn parse_pattern_inner_2(inout p: Parser, inout ev: [i64], s: i64, e0: i64, k: i64) -> Res {
+    let m = ev_start(p, ev)
+    bump(p, ev)
+    ev_complete(p, ev, m, syn.N_PAT_INT, s, e0)
+    return good(0, s, e0, m)
+}
+
+fn parse_pattern_inner_3(inout p: Parser, inout ev: [i64], s: i64, e0: i64, k: i64) -> Res {
+    let m = ev_start(p, ev)
+    bump(p, ev)
+    p.wide_ints.push(s)
+    ev_complete(p, ev, m, syn.N_PAT_INT, s, e0)
+    return good(0, s, e0, m)
+}
+
+fn parse_pattern_inner_4(inout p: Parser, inout ev: [i64], s: i64, e0: i64, k: i64) -> Res {
+    let m = ev_start(p, ev)
+    bump(p, ev)
+    let ns = cur_s(p, ev)
+    let ne = p.lx.end[p.i]
+    if cur(p, ev) == lex.T_INT {
+        bump(p, ev)
+        ev_complete(p, ev, m, syn.N_PAT_NEG, s.min(ns), e0.max(ne))
+        return good(0, s.min(ns), e0.max(ne), m)
+    }
+    error_here(p, ev, "expected an integer after `-` in pattern")
+    return bad()
+}
+
+fn parse_pattern_inner_5(inout p: Parser, inout ev: [i64], s: i64, e0: i64, k: i64) -> Res {
+    let m = ev_start(p, ev)
+    bump(p, ev)
+    ev_complete(p, ev, m, syn.N_PAT_BOOL, s, e0)
+    return good(0, s, e0, m)
+}
+
+fn parse_pattern_inner_6(inout p: Parser, inout ev: [i64], s: i64, e0: i64, k: i64) -> Res {
+    let m = ev_start(p, ev)
+    let t = bump(p, ev)
+    let n = p.lx.jval[t]
+    if n == 1 and p.lx.part_kind[p.lx.ival[t]] == 0 {
+        ev_complete(p, ev, m, syn.N_PAT_STR, s, e0)
+        return good(0, s, e0, m)
+    }
+    if n == 0 {
+        ev_complete(p, ev, m, syn.N_PAT_STR, s, e0)
+        return good(0, s, e0, m)
+    }
+    diag(p, ev, s, e0, "string patterns cannot contain interpolation")
+    return bad()
+}
+
+fn parse_pattern_inner_7(inout p: Parser, inout ev: [i64], s: i64, e0: i64, k: i64) -> Res {
+    let m = ev_start(p, ev)
+    let path = parse_path(p, ev)
+    if not path.ok {
+        return bad()
+    }
+    if at(p, ev, lex.T_LPAREN) {
+        bump(p, ev)
+        while true {
+            if at(p, ev, lex.T_RPAREN) {
+                break
+            }
+            if not parse_pattern(p, ev).ok {
+                return bad()
+            }
+            if not eat(p, ev, lex.T_COMMA) {
+                break
+            }
+        }
+        let rp = expect(p, ev, lex.T_RPAREN)
+        if rp < 0 {
+            return bad()
+        }
+        let e = path.e.max(p.lx.end[rp])
+        let vs = path.s.min(p.lx.start[rp])
+        ev_complete(p, ev, m, syn.N_PAT_VARIANT, vs, e)
+        ev_set2(p, ev, m, 1, 0)
+        return good(0, vs, e, m)
+    }
+    if path.k > 1 {
+        ev_complete(p, ev, m, syn.N_PAT_VARIANT, path.s, path.e)
+        return good(0, path.s, path.e, m)
+    }
+    ev_complete(p, ev, m, syn.N_PAT_BIND, path.s, path.e)
+    return good(0, path.s, path.e, m)
+}
+
+fn parse_pattern_inner_8(inout p: Parser, inout ev: [i64], s: i64, e0: i64, k: i64) -> Res {
+    let m = ev_start(p, ev)
+    bump(p, ev)
+    while true {
+        if at(p, ev, lex.T_RPAREN) {
+            break
+        }
+        if not parse_pattern(p, ev).ok {
+            return bad()
+        }
+        if not eat(p, ev, lex.T_COMMA) {
+            break
+        }
+    }
+    let rp = expect(p, ev, lex.T_RPAREN)
+    if rp < 0 {
+        return bad()
+    }
+    let e = e0.max(p.lx.end[rp])
+    let ts = s.min(p.lx.start[rp])
+    ev_complete(p, ev, m, syn.N_PAT_TUPLE, ts, e)
+    return good(0, ts, e, m)
+}

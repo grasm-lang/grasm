@@ -1,0 +1,271 @@
+// The kinds of CST node the parser makes (parse.gr) and the tree builder
+// keeps (cst.gr). A node covers a run of tokens with their trivia; the
+// parser also writes on it the span the Rust parser would give the AST node
+// it becomes (`s`, `e`) and, for a few kinds, a second span (`s2`, `e2`).
+//
+// N_ERROR is what error recovery leaves: a construct that failed and the
+// tokens skipped after it. It keeps every token, so the tree still prints
+// the source back, and the AST built from the tree has nothing from it --
+// as the Rust parser's has nothing from a declaration or statement it gave
+// up on.
+
+pub let N_ROOT = 1
+pub let N_ERROR = 2
+
+// Declarations.
+pub let N_FN = 10
+pub let N_EXTERN = 11
+pub let N_CONST = 12
+pub let N_TYPE_DECL = 13
+pub let N_EFFECT = 14
+pub let N_TEST = 15
+pub let N_BENCH = 16
+pub let N_IMPORT = 17
+pub let N_INTERFACE = 18
+pub let N_IMPL = 19
+pub let N_ACTOR = 20
+pub let N_THREAD_LOCAL = 21
+// An `impl` or `actor` that failed after some of its methods were made:
+// those methods reach the module all the same (parse.gr, `lowered`).
+pub let N_IMPL_PARTIAL = 22
+pub let N_ACTOR_PARTIAL = 23
+
+// Pieces of declarations.
+pub let N_GENERICS = 30
+pub let N_GENERIC = 31
+pub let N_PARAMS = 32
+pub let N_PARAM = 33
+pub let N_SELF_PARAM = 34
+pub let N_RET = 35
+pub let N_ERRTY = 36
+pub let N_EFFECTS = 37
+pub let N_CONTRACT = 38
+pub let N_PATH = 39
+pub let N_FIELDS = 40
+pub let N_FIELD_DEF = 41
+pub let N_VARIANT = 42
+pub let N_SIG = 43
+pub let N_ACTOR_VAR = 44
+pub let N_ROW_UNSAFE = 45
+pub let N_VARIANTS = 46
+pub let N_ALIAS = 47
+
+// Types.
+pub let N_TY_NAME = 50
+pub let N_TY_FN = 51
+pub let N_TY_LIST = 52
+pub let N_TY_REF = 53
+pub let N_TY_TUPLE = 54
+pub let N_TY_UNION = 55
+pub let N_TY_PAREN = 56
+pub let N_TY_FALLIBLE = 57
+pub let N_TY_ARGS = 58
+
+// Blocks and statements.
+pub let N_BLOCK = 60
+pub let N_LET = 61
+pub let N_LET_TUPLE = 62
+pub let N_ASSIGN = 63
+pub let N_RETURN = 64
+pub let N_BREAK = 65
+pub let N_CONTINUE = 66
+pub let N_WHILE = 67
+pub let N_FOR = 68
+pub let N_WITH = 69
+pub let N_PARALLEL = 70
+pub let N_SPAWN = 71
+pub let N_NAMES = 72
+pub let N_EXPR_STMT = 73
+
+// Expressions.
+pub let N_INT = 80
+pub let N_FLOAT = 81
+pub let N_BOOL = 82
+pub let N_STR = 83
+pub let N_INTERP = 84
+pub let N_INTERP_FAILED = 85
+pub let N_NAME = 86
+pub let N_LIST = 87
+pub let N_MAP = 88
+pub let N_MAP_ENTRY = 89
+pub let N_TUPLE = 90
+pub let N_PAREN = 91
+pub let N_STRUCT_LIT = 92
+pub let N_FIELD_INIT = 93
+pub let N_STRUCT_BASE = 94
+pub let N_CALL = 95
+pub let N_ARGS = 96
+pub let N_FIELD = 97
+pub let N_INDEX = 98
+pub let N_UNARY = 99
+pub let N_BINARY = 100
+pub let N_PIPE = 101
+pub let N_RANGE = 102
+pub let N_IF = 103
+pub let N_ELSE = 104
+pub let N_MATCH = 105
+pub let N_ARM = 106
+pub let N_BLOCK_EXPR = 107
+pub let N_REGION = 108
+pub let N_UNSAFE = 109
+pub let N_TRY = 110
+pub let N_CLOSURE = 111
+pub let N_CLOSURE_PARAMS = 112
+pub let N_REF_CALL = 113
+pub let N_ARM_STMT = 114
+pub let N_ARM_ASSIGN = 115
+pub let N_GUARD = 116
+pub let N_COALESCE = 117
+pub let N_POW = 118
+pub let N_ELSE_IF = 119
+
+// Patterns.
+pub let N_PAT_WILD = 130
+pub let N_PAT_INT = 131
+pub let N_PAT_NEG = 132
+pub let N_PAT_BOOL = 133
+pub let N_PAT_STR = 134
+pub let N_PAT_BIND = 135
+pub let N_PAT_VARIANT = 136
+pub let N_PAT_TUPLE = 137
+pub let N_PAT_OR = 138
+
+// The AST kind of an expression, which is what several of the parser's
+// decisions turn on (a place to assign to, a callee to pipe into) and is
+// not always the CST kind: parentheses are transparent, and a call of a
+// field read is a method call.
+pub let X_INT = 1
+pub let X_FLOAT = 2
+pub let X_BOOL = 3
+pub let X_STR = 4
+pub let X_IDENT = 5
+pub let X_LIST = 6
+pub let X_MAP = 7
+pub let X_TUPLE = 8
+pub let X_STRUCT = 9
+pub let X_CALL = 10
+pub let X_METHOD = 11
+pub let X_FIELD = 12
+pub let X_INDEX = 13
+pub let X_UNARY = 14
+pub let X_BINARY = 15
+pub let X_RANGE = 16
+pub let X_IF = 17
+pub let X_MATCH = 18
+pub let X_BLOCK = 19
+pub let X_REGION = 20
+pub let X_UNSAFE = 21
+pub let X_TRY = 22
+pub let X_CLOSURE = 23
+
+pub fn node_name(k: i64) -> str {
+    match k {
+        1 -> "ROOT"
+        2 -> "ERROR"
+        10 -> "FN"
+        11 -> "EXTERN"
+        12 -> "CONST"
+        13 -> "TYPE_DECL"
+        14 -> "EFFECT"
+        15 -> "TEST"
+        16 -> "BENCH"
+        17 -> "IMPORT"
+        18 -> "INTERFACE"
+        19 -> "IMPL"
+        20 -> "ACTOR"
+        21 -> "THREAD_LOCAL"
+        22 -> "IMPL_PARTIAL"
+        23 -> "ACTOR_PARTIAL"
+        30 -> "GENERICS"
+        31 -> "GENERIC"
+        32 -> "PARAMS"
+        33 -> "PARAM"
+        34 -> "SELF_PARAM"
+        35 -> "RET"
+        36 -> "ERRTY"
+        37 -> "EFFECTS"
+        38 -> "CONTRACT"
+        39 -> "PATH"
+        40 -> "FIELDS"
+        41 -> "FIELD_DEF"
+        42 -> "VARIANT"
+        43 -> "SIG"
+        44 -> "ACTOR_VAR"
+        45 -> "ROW_UNSAFE"
+        46 -> "VARIANTS"
+        47 -> "ALIAS"
+        50 -> "TY_NAME"
+        51 -> "TY_FN"
+        52 -> "TY_LIST"
+        53 -> "TY_REF"
+        54 -> "TY_TUPLE"
+        55 -> "TY_UNION"
+        56 -> "TY_PAREN"
+        57 -> "TY_FALLIBLE"
+        58 -> "TY_ARGS"
+        60 -> "BLOCK"
+        61 -> "LET"
+        62 -> "LET_TUPLE"
+        63 -> "ASSIGN"
+        64 -> "RETURN"
+        65 -> "BREAK"
+        66 -> "CONTINUE"
+        67 -> "WHILE"
+        68 -> "FOR"
+        69 -> "WITH"
+        70 -> "PARALLEL"
+        71 -> "SPAWN"
+        72 -> "NAMES"
+        73 -> "EXPR_STMT"
+        80 -> "INT"
+        81 -> "FLOAT"
+        82 -> "BOOL"
+        83 -> "STR"
+        84 -> "INTERP"
+        85 -> "INTERP_FAILED"
+        86 -> "NAME"
+        87 -> "LIST"
+        88 -> "MAP"
+        89 -> "MAP_ENTRY"
+        90 -> "TUPLE"
+        91 -> "PAREN"
+        92 -> "STRUCT_LIT"
+        93 -> "FIELD_INIT"
+        94 -> "STRUCT_BASE"
+        95 -> "CALL"
+        96 -> "ARGS"
+        97 -> "FIELD"
+        98 -> "INDEX"
+        99 -> "UNARY"
+        100 -> "BINARY"
+        101 -> "PIPE"
+        102 -> "RANGE"
+        103 -> "IF"
+        104 -> "ELSE"
+        105 -> "MATCH"
+        106 -> "ARM"
+        107 -> "BLOCK_EXPR"
+        108 -> "REGION"
+        109 -> "UNSAFE"
+        110 -> "TRY"
+        111 -> "CLOSURE"
+        112 -> "CLOSURE_PARAMS"
+        113 -> "REF_CALL"
+        114 -> "ARM_STMT"
+        115 -> "ARM_ASSIGN"
+        116 -> "GUARD"
+        117 -> "COALESCE"
+        118 -> "POW"
+        119 -> "ELSE_IF"
+        130 -> "PAT_WILD"
+        131 -> "PAT_INT"
+        132 -> "PAT_NEG"
+        133 -> "PAT_BOOL"
+        134 -> "PAT_STR"
+        135 -> "PAT_BIND"
+        136 -> "PAT_VARIANT"
+        137 -> "PAT_TUPLE"
+        138 -> "PAT_OR"
+        _ -> "?{k}"
+    }
+}

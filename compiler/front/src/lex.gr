@@ -1,0 +1,1165 @@
+// The lexer: Grasm source to the token stream the Rust frontend's lexer
+// (`crates/grasm_syntax/src/lexer.rs`) produces, token for token -- every
+// kind, span, literal value and lexical error, and its message.
+//
+// What the parser and `grasm tokens` see is that stream. It is also the
+// lossless one: tokens are kept in source order, so whatever lies between
+// one token's end and the next one's start -- spaces, comments, a newline
+// absorbed before a leading `.` -- is that token's leading trivia, and the
+// CST prints the source back from the two (cst.gr).
+//
+// The stream is kept as parallel arrays, one entry per token. A token's
+// payload is in `ival`/`jval`: an integer's bits; a float's index in
+// `floats`; a string's first part and part count; an identifier's or an
+// error's index in `text`.
+
+// Token kinds, in the order of the Rust `TokenKind`.
+pub let T_IDENT = 0
+pub let T_INT = 1
+pub let T_WIDEINT = 2
+pub let T_FLOAT = 3
+pub let T_STR = 4
+pub let KW_FN = 5
+pub let KW_PUB = 6
+pub let KW_LET = 7
+pub let KW_VAR = 8
+pub let KW_OWN = 9
+pub let KW_INOUT = 10
+pub let KW_TYPE = 11
+pub let KW_INTERFACE = 12
+pub let KW_IMPL = 13
+pub let KW_EFFECT = 14
+pub let KW_WITH = 15
+pub let KW_HANDLEDBY = 16
+pub let KW_MATCH = 17
+pub let KW_IF = 18
+pub let KW_ELSE = 19
+pub let KW_FOR = 20
+pub let KW_WHILE = 21
+pub let KW_UNSAFE = 22
+pub let KW_REF = 23
+pub let KW_IN = 24
+pub let KW_RETURN = 25
+pub let KW_TRY = 26
+pub let KW_TRUE = 27
+pub let KW_FALSE = 28
+pub let KW_BREAK = 29
+pub let KW_CONTINUE = 30
+pub let KW_AND = 31
+pub let KW_OR = 32
+pub let KW_NOT = 33
+pub let KW_IMPORT = 34
+pub let KW_TEST = 35
+pub let T_LPAREN = 36
+pub let T_RPAREN = 37
+pub let T_LBRACE = 38
+pub let T_RBRACE = 39
+pub let T_LBRACKET = 40
+pub let T_RBRACKET = 41
+pub let T_COMMA = 42
+pub let T_DOT = 43
+pub let T_DOTDOT = 44
+pub let T_DOTDOTEQ = 45
+pub let T_COLON = 46
+pub let T_COLONCOLON = 47
+pub let T_ARROW = 48
+pub let T_FATARROW = 49
+pub let T_PIPE = 50
+pub let T_PIPEGT = 51
+pub let T_AMPAMP = 52
+pub let T_PIPEPIPE = 53
+pub let T_PLUS = 54
+pub let T_MINUS = 55
+pub let T_STAR = 56
+pub let T_SLASH = 57
+pub let T_PERCENT = 58
+pub let T_CARET = 59
+pub let T_EQ = 60
+pub let T_EQEQ = 61
+pub let T_NOTEQ = 62
+pub let T_LT = 63
+pub let T_LTEQ = 64
+pub let T_GT = 65
+pub let T_GTEQ = 66
+pub let T_BANG = 67
+pub let T_QUESTION = 68
+pub let T_QUESTIONDOT = 69
+pub let T_QQ = 70
+pub let T_PLUSEQ = 71
+pub let T_MINUSEQ = 72
+pub let T_STAREQ = 73
+pub let T_SLASHEQ = 74
+pub let T_UNDERSCORE = 75
+pub let T_AT = 76
+pub let T_NEWLINE = 77
+pub let T_ERROR = 78
+pub let T_EOF = 79
+
+/// The variant's name in the Rust `TokenKind`, as `{:?}` prints it.
+pub fn kind_name(k: i64) -> str {
+    match k {
+        0 -> "Ident"
+        1 -> "Int"
+        2 -> "WideInt"
+        3 -> "Float"
+        4 -> "Str"
+        5 -> "KwFn"
+        6 -> "KwPub"
+        7 -> "KwLet"
+        8 -> "KwVar"
+        9 -> "KwOwn"
+        10 -> "KwInout"
+        11 -> "KwType"
+        12 -> "KwInterface"
+        13 -> "KwImpl"
+        14 -> "KwEffect"
+        15 -> "KwWith"
+        16 -> "KwHandledBy"
+        17 -> "KwMatch"
+        18 -> "KwIf"
+        19 -> "KwElse"
+        20 -> "KwFor"
+        21 -> "KwWhile"
+        22 -> "KwUnsafe"
+        23 -> "KwRef"
+        24 -> "KwIn"
+        25 -> "KwReturn"
+        26 -> "KwTry"
+        27 -> "KwTrue"
+        28 -> "KwFalse"
+        29 -> "KwBreak"
+        30 -> "KwContinue"
+        31 -> "KwAnd"
+        32 -> "KwOr"
+        33 -> "KwNot"
+        34 -> "KwImport"
+        35 -> "KwTest"
+        36 -> "LParen"
+        37 -> "RParen"
+        38 -> "LBrace"
+        39 -> "RBrace"
+        40 -> "LBracket"
+        41 -> "RBracket"
+        42 -> "Comma"
+        43 -> "Dot"
+        44 -> "DotDot"
+        45 -> "DotDotEq"
+        46 -> "Colon"
+        47 -> "ColonColon"
+        48 -> "Arrow"
+        49 -> "FatArrow"
+        50 -> "Pipe"
+        51 -> "PipeGt"
+        52 -> "AmpAmp"
+        53 -> "PipePipe"
+        54 -> "Plus"
+        55 -> "Minus"
+        56 -> "Star"
+        57 -> "Slash"
+        58 -> "Percent"
+        59 -> "Caret"
+        60 -> "Eq"
+        61 -> "EqEq"
+        62 -> "NotEq"
+        63 -> "Lt"
+        64 -> "LtEq"
+        65 -> "Gt"
+        66 -> "GtEq"
+        67 -> "Bang"
+        68 -> "Question"
+        69 -> "QuestionDot"
+        70 -> "QuestionQuestion"
+        71 -> "PlusEq"
+        72 -> "MinusEq"
+        73 -> "StarEq"
+        74 -> "SlashEq"
+        75 -> "Underscore"
+        76 -> "At"
+        77 -> "Newline"
+        78 -> "Error"
+        _ -> "Eof"
+    }
+}
+
+/// The text of a keyword or punctuation token (`TokenKind::text`).
+pub fn kind_text(k: i64) -> str {
+    match k {
+        5 -> "fn"
+        6 -> "pub"
+        7 -> "let"
+        8 -> "var"
+        9 -> "own"
+        10 -> "inout"
+        11 -> "type"
+        12 -> "interface"
+        13 -> "impl"
+        14 -> "effect"
+        15 -> "with"
+        16 -> "handled_by"
+        17 -> "match"
+        18 -> "if"
+        19 -> "else"
+        20 -> "for"
+        21 -> "while"
+        22 -> "unsafe"
+        23 -> "ref"
+        24 -> "in"
+        25 -> "return"
+        26 -> "try"
+        27 -> "true"
+        28 -> "false"
+        29 -> "break"
+        30 -> "continue"
+        31 -> "and"
+        32 -> "or"
+        33 -> "not"
+        34 -> "import"
+        35 -> "test"
+        36 -> "("
+        37 -> ")"
+        38 -> "\{"
+        39 -> "}"
+        40 -> "["
+        41 -> "]"
+        42 -> ","
+        43 -> "."
+        44 -> ".."
+        45 -> "..="
+        46 -> ":"
+        47 -> "::"
+        48 -> "->"
+        49 -> "=>"
+        50 -> "|"
+        51 -> "|>"
+        52 -> "&&"
+        53 -> "||"
+        54 -> "+"
+        55 -> "-"
+        56 -> "*"
+        57 -> "/"
+        58 -> "%"
+        59 -> "^"
+        60 -> "="
+        61 -> "=="
+        62 -> "!="
+        63 -> "<"
+        64 -> "<="
+        65 -> ">"
+        66 -> ">="
+        67 -> "!"
+        68 -> "?"
+        69 -> "?."
+        70 -> "??"
+        71 -> "+="
+        72 -> "-="
+        73 -> "*="
+        74 -> "/="
+        75 -> "_"
+        76 -> "@"
+        _ -> ""
+    }
+}
+
+// The words that are keywords only in one place ([L-CONTEXTUAL]), as an
+// identifier token's `jval`, so the parser asks with an integer.
+pub let W_REGION = 1
+pub let W_PARALLEL = 2
+pub let W_SPAWN = 3
+pub let W_CONCURRENT = 4
+pub let W_GO = 5
+pub let W_BENCH = 6
+pub let W_ACTOR = 7
+pub let W_EXPORT = 8
+pub let W_THREAD_LOCAL = 9
+pub let W_EXTERN = 10
+pub let W_LINEAR = 11
+pub let W_SELF = 12
+pub let W_REQUIRES = 13
+pub let W_ENSURES = 14
+
+/// Keywords by text, as their kind, and contextual words as 100 + code:
+/// one hash per identifier rather than a comparison per keyword.
+fn word_table() -> Map[str, i64] {
+    var m: Map[str, i64] = {}
+    for k in 5..36 {
+        m.set(kind_text(k), k)
+    }
+    m.set("region", 101)
+    m.set("parallel", 102)
+    m.set("spawn", 103)
+    m.set("concurrent", 104)
+    m.set("go", 105)
+    m.set("bench", 106)
+    m.set("actor", 107)
+    m.set("export", 108)
+    m.set("thread_local", 109)
+    m.set("extern", 110)
+    m.set("linear", 111)
+    m.set("self", 112)
+    m.set("requires", 113)
+    m.set("ensures", 114)
+    m
+}
+
+fn keyword_of(s: str) -> i64 {
+    match s {
+        "fn" -> 5
+        "pub" -> 6
+        "let" -> 7
+        "var" -> 8
+        "own" -> 9
+        "inout" -> 10
+        "type" -> 11
+        "interface" -> 12
+        "impl" -> 13
+        "effect" -> 14
+        "with" -> 15
+        "handled_by" -> 16
+        "match" -> 17
+        "if" -> 18
+        "else" -> 19
+        "for" -> 20
+        "while" -> 21
+        "unsafe" -> 22
+        "ref" -> 23
+        "in" -> 24
+        "return" -> 25
+        "try" -> 26
+        "true" -> 27
+        "false" -> 28
+        "break" -> 29
+        "continue" -> 30
+        "and" -> 31
+        "or" -> 32
+        "not" -> 33
+        "import" -> 34
+        "test" -> 35
+        _ -> -1
+    }
+}
+
+/// A lexed source: the token stream and the `///` lines.
+type Lexed = {
+    kind: [i64],
+    start: [i64],
+    end: [i64],
+    ival: [i64],
+    jval: [i64],
+    text: [str],
+    floats: [f64],
+    // A string token's parts: text (0) or an interpolation (1), whose
+    // `part_text` is its source and `part_off` that source's offset.
+    part_kind: [i64],
+    part_text: [str],
+    part_off: [i64],
+    doc_start: [i64],
+    doc_end: [i64],
+    doc_text: [str],
+    // A token the parser put in that the source does not hold (an actor's
+    // `self.§state`, parse.gr); never one the lexer makes.
+    virt: [bool],
+}
+
+pub fn empty_lexed() -> Lexed {
+    Lexed{ kind: [], start: [], end: [], ival: [], jval: [], text: [], floats: [],
+        part_kind: [], part_text: [], part_off: [], doc_start: [], doc_end: [], doc_text: [],
+        virt: [] }
+}
+
+type LexState = {
+    src: bytes,
+    n: i64,
+    // The token just made was `.`: a number is then a tuple component.
+    after_dot: bool,
+    // Where an unterminated `/*` began, or -1.
+    unterminated: i64,
+    words: Map[str, i64],
+}
+
+fn peek(lx: LexState, pos: i64) -> i64 {
+    if pos < lx.n {
+        lx.src.at(pos)
+    } else {
+        0
+    }
+}
+
+fn peek2(lx: LexState, pos: i64) -> i64 {
+    if pos + 1 < lx.n {
+        lx.src.at(pos + 1)
+    } else {
+        0
+    }
+}
+
+fn byte_at(lx: LexState, i: i64) -> i64 {
+    if i >= 0 and i < lx.n {
+        lx.src.at(i)
+    } else {
+        0
+    }
+}
+
+fn is_digit(c: i64) -> bool {
+    c >= 48 and c <= 57
+}
+
+fn is_alpha(c: i64) -> bool {
+    (c >= 65 and c <= 90) or (c >= 97 and c <= 122)
+}
+
+fn is_ident_continue(c: i64) -> bool {
+    is_alpha(c) or is_digit(c) or c == 95
+}
+
+fn utf8_len(b: i64) -> i64 {
+    if b < 128 {
+        1
+    } else if b >= 192 and b <= 223 {
+        2
+    } else if b >= 224 and b <= 239 {
+        3
+    } else {
+        4
+    }
+}
+
+/// The code point of the UTF-8 sequence at `i`, which is `len` bytes long.
+fn decode_at(src: bytes, i: i64, len: i64) -> i64 {
+    let n = src.len()
+    let c = src.at(i)
+    if len == 1 {
+        return c
+    }
+    var cp = c.bit_and(7)
+    if len == 2 {
+        cp = c.bit_and(31)
+    } else if len == 3 {
+        cp = c.bit_and(15)
+    }
+    var k = 1
+    while k < len and i + k < n {
+        cp = cp * 64 + src.at(i + k).bit_and(63)
+        k += 1
+    }
+    cp
+}
+
+/// Rust's `char::is_whitespace`: Unicode's White_Space.
+pub fn is_unicode_ws(cp: i64) -> bool {
+    (cp >= 9 and cp <= 13) or cp == 32 or cp == 133 or cp == 160 or cp == 5760 or
+    (cp >= 8192 and cp <= 8202) or cp == 8232 or cp == 8233 or cp == 8239 or
+    cp == 8287 or cp == 12288
+}
+
+/// Rust's `char::is_control`: general category Cc.
+fn is_control(cp: i64) -> bool {
+    cp < 32 or (cp >= 127 and cp <= 159)
+}
+
+/// Whether every character of `b[from..to]` is whitespace (`str::trim`).
+fn all_ws(b: bytes, from: i64, to: i64) -> bool {
+    var i = from
+    while i < to {
+        let len = utf8_len(b.at(i))
+        if not is_unicode_ws(decode_at(b, i, len)) {
+            return false
+        }
+        i += len
+    }
+    true
+}
+
+fn push_tok(inout tb: [i64], kind: i64, start: i64, end: i64, ival: i64, jval: i64) {
+    tb.push(kind)
+    tb.push(start)
+    tb.push(end)
+    tb.push(ival)
+    tb.push(jval)
+}
+
+fn push_error(inout tb: [i64], inout out: Lexed, start: i64, end: i64, msg: str) {
+    out.text.push(msg)
+    push_tok(tb, T_ERROR, start, end, out.text.len() - 1, 0)
+}
+
+/// Lexes `src`. `docs` says whether to keep the `///` lines (only a whole
+/// file's are; an interpolation's are dropped, as the Rust lexer's `lex`
+/// drops them).
+///
+/// The tokens are made into `tb`, five numbers a token -- kind, start, end
+/// and the two payloads -- and the position is `pos`: both whole variables,
+/// which a write reaches at once, where a write through a struct's field
+/// costs tens of nanoseconds.
+pub fn lex(src: bytes, docs: bool) -> Lexed {
+    var lx = LexState{ src: src, n: src.len(), after_dot: false, unterminated: -1, words: word_table() }
+    var out = empty_lexed()
+    var pos = 0
+    var tb: [i64] = []
+    while true {
+        next_token(lx, pos, tb, out, docs)
+        let last = tb.len() - 5
+        let k = tb[last]
+        lx.after_dot = k == T_DOT
+        // A newline before a leading `.` or `?.` is not a statement
+        // boundary ([L-LEADING-DOT]); consecutive newlines collapse into
+        // one, its span covering them all.
+        if (k == T_DOT or k == T_QUESTIONDOT) and last > 0 and tb[last - 5] == T_NEWLINE {
+            for f in 0..5 {
+                tb[last - 5 + f] = tb[last + f]
+            }
+            pop_tok(tb)
+        } else if k == T_NEWLINE and last > 0 and tb[last - 5] == T_NEWLINE {
+            tb[last - 3] = tb[last + 2].max(tb[last - 3])
+            tb[last - 4] = tb[last + 1].min(tb[last - 4])
+            pop_tok(tb)
+        }
+        if k == T_EOF {
+            break
+        }
+    }
+    if lx.unterminated >= 0 {
+        // Before the end-of-file token, as the Rust lexer inserts it.
+        let at = lx.unterminated
+        let eof_s = tb[tb.len() - 4]
+        let eof_e = tb[tb.len() - 3]
+        pop_tok(tb)
+        push_error(tb, out, at, at + 2, "unterminated `/* ... */` comment — these nest, so an inner `/*` needs its own `*/`")
+        push_tok(tb, T_EOF, eof_s, eof_e, 0, 0)
+    }
+    var kind: [i64] = []
+    var start: [i64] = []
+    var end: [i64] = []
+    var ival: [i64] = []
+    var jval: [i64] = []
+    var virt: [bool] = []
+    var t = 0
+    while t < tb.len() {
+        kind.push(tb[t])
+        start.push(tb[t + 1])
+        end.push(tb[t + 2])
+        ival.push(tb[t + 3])
+        jval.push(tb[t + 4])
+        virt.push(false)
+        t += 5
+    }
+    out.kind = kind
+    out.start = start
+    out.end = end
+    out.ival = ival
+    out.jval = jval
+    out.virt = virt
+    out
+}
+
+fn pop_tok(inout tb: [i64]) {
+    for _ in 0..5 {
+        tb.pop()
+    }
+}
+
+fn next_token(inout lx: LexState, inout pos: i64, inout tb: [i64], inout out: Lexed, docs: bool) {
+    skip_trivia(lx, pos, tb, out, docs)
+    let start = pos
+    if pos >= lx.n {
+        push_tok(tb, T_EOF, start, start, 0, 0)
+        return
+    }
+    let b = peek(lx, pos)
+    if b == 10 {
+        pos += 1
+        push_tok(tb, T_NEWLINE, start, pos, 0, 0)
+    } else if b == 34 {
+        lex_string(lx, pos, tb, out)
+    } else if is_digit(b) {
+        lex_number(lx, pos, tb, out)
+    } else if b == 95 {
+        if is_ident_continue(peek2(lx, pos)) {
+            lex_ident(lx, pos, tb, out)
+        } else {
+            pos += 1
+            push_tok(tb, T_UNDERSCORE, start, pos, 0, 0)
+        }
+    } else if is_alpha(b) {
+        lex_ident(lx, pos, tb, out)
+    } else {
+        lex_operator(lx, pos, tb, out)
+    }
+}
+
+/// Spaces, tabs, carriage returns and comments -- line, doc and nested
+/// block. Newlines are tokens and stay.
+fn skip_trivia(inout lx: LexState, inout pos: i64, inout tb: [i64], inout out: Lexed, docs: bool) {
+    while true {
+        // A byte order mark at the very start of the file ([L-ENCODING]).
+        if pos == 0 and lx.n >= 3 and lx.src.at(0) == 239 and lx.src.at(1) == 187 and lx.src.at(2) == 191 {
+            pos = 3
+            continue
+        }
+        let c = peek(lx, pos)
+        if c == 32 or c == 9 or c == 13 {
+            pos += 1
+        } else if c == 47 and peek2(lx, pos) == 47 {
+            let start = pos
+            // `///` is documentation; `//` and `////` are not.
+            let is_doc = byte_at(lx, pos + 2) == 47 and byte_at(lx, pos + 3) != 47
+            while pos < lx.n and peek(lx, pos) != 10 {
+                pos += 1
+            }
+            if is_doc and docs {
+                var from = start + 3
+                if from < pos and lx.src.at(from) == 32 {
+                    from += 1
+                }
+                out.doc_start.push(start)
+                out.doc_end.push(pos)
+                out.doc_text.push(lx.src.slice(from, pos).to_str())
+            }
+        } else if c == 47 and peek2(lx, pos) == 42 {
+            let opened = pos
+            pos += 2
+            var depth = 1
+            while depth > 0 and pos < lx.n {
+                if peek(lx, pos) == 47 and peek2(lx, pos) == 42 {
+                    pos += 2
+                    depth += 1
+                } else if peek(lx, pos) == 42 and peek2(lx, pos) == 47 {
+                    pos += 2
+                    depth -= 1
+                } else {
+                    pos += 1
+                }
+            }
+            // Running out of file does not end a comment ([L-COMMENT-BLOCK]).
+            if depth > 0 {
+                lx.unterminated = opened
+            }
+        } else {
+            break
+        }
+    }
+}
+
+fn lex_ident(inout lx: LexState, inout pos: i64, inout tb: [i64], inout out: Lexed) {
+    let start = pos
+    while is_ident_continue(peek(lx, pos)) {
+        pos += 1
+    }
+    let text = lx.src.slice(start, pos).to_str()
+    let code = lx.words.get(text) ?? 0
+    if code > 0 and code < 100 {
+        push_tok(tb, code, start, pos, 0, 0)
+    } else {
+        out.text.push(text)
+        var word = 0
+        if code > 100 {
+            word = code - 100
+        }
+        push_tok(tb, T_IDENT, start, pos, out.text.len() - 1, word)
+    }
+}
+
+/// The value of digits `d` (ASCII, underscores already gone) in `radix`,
+/// as a u64's bits, or -1 in `ok` when it is past 64 bits. The caller has
+/// checked every digit.
+fn digits_value(d: bytes, radix: i64) -> (i64, bool) {
+    var v: u64 = 0
+    let r = radix.as_u64()
+    for k in 0..d.len() {
+        let c = d.at(k)
+        var dv = c - 48
+        if c >= 97 {
+            dv = c - 87
+        } else if c >= 65 {
+            dv = c - 55
+        }
+        match v.checked_mul(r) {
+            Some(m) -> match m.checked_add(dv.as_u64()) {
+                Some(s) -> {
+                    v = s
+                }
+                None -> {
+                    return (0, false)
+                }
+            }
+            None -> {
+                return (0, false)
+            }
+        }
+    }
+    (v.as_i64(), true)
+}
+
+fn digit_ok(c: i64, radix: i64) -> bool {
+    if radix == 2 {
+        c == 48 or c == 49
+    } else {
+        is_digit(c) or (c >= 97 and c <= 102) or (c >= 65 and c <= 70)
+    }
+}
+
+/// `b[from..to]` without its underscores.
+fn without_underscores(b: bytes, from: i64, to: i64) -> bytes {
+    var out = byte_builder()
+    for k in from..to {
+        let c = b.at(k)
+        if c != 95 {
+            out.push_byte(c)
+        }
+    }
+    out.to_bytes()
+}
+
+fn lex_number(inout lx: LexState, inout pos: i64, inout tb: [i64], inout out: Lexed) {
+    let start = pos
+    // Hex and binary are bit patterns: all 64 bits are writable ([L-INT]).
+    if peek(lx, pos) == 48 and (peek2(lx, pos) == 120 or peek2(lx, pos) == 98) {
+        var radix = 2
+        if peek2(lx, pos) == 120 {
+            radix = 16
+        }
+        pos += 2
+        let digits_start = pos
+        while is_alpha(peek(lx, pos)) or is_digit(peek(lx, pos)) or peek(lx, pos) == 95 {
+            pos += 1
+        }
+        let text = without_underscores(lx.src, digits_start, pos)
+        var bad = -1
+        for k in 0..text.len() {
+            if bad < 0 and not digit_ok(text.at(k), radix) {
+                bad = text.at(k)
+            }
+        }
+        if text.len() > 0 and bad < 0 {
+            let (v, ok) = digits_value(text, radix)
+            if ok {
+                push_tok(tb, T_INT, start, pos, v, 0)
+                return
+            }
+        }
+        let lit = lx.src.slice(start, pos).to_str()
+        var why = ""
+        if text.len() == 0 {
+            why = "it has no digits"
+        } else if bad < 0 {
+            var fit = 64
+            if radix == 16 {
+                fit = 16
+            }
+            why = "it is more than 64 bits ({text.len()} digits, and {fit} fit)"
+        } else {
+            why = "`{bad.to_char()}` is not a base-{radix} digit"
+        }
+        push_error(tb, out, start, pos, "invalid numeric literal `{lit}` — {why}")
+        return
+    }
+    var is_float = false
+    while is_digit(peek(lx, pos)) or peek(lx, pos) == 95 {
+        pos += 1
+    }
+    // A fraction -- but `1..5` is a range and `t.1.0` two components.
+    if not lx.after_dot and peek(lx, pos) == 46 and is_digit(peek2(lx, pos)) {
+        is_float = true
+        pos += 1
+        while is_digit(peek(lx, pos)) or peek(lx, pos) == 95 {
+            pos += 1
+        }
+    }
+    let e = peek(lx, pos)
+    if (e == 101 or e == 69) and (is_digit(peek2(lx, pos)) or ((peek2(lx, pos) == 43 or peek2(lx, pos) == 45) and is_digit(byte_at(lx, pos + 2)))) {
+        is_float = true
+        pos += 1
+        if peek(lx, pos) == 43 or peek(lx, pos) == 45 {
+            pos += 1
+        }
+        while is_digit(peek(lx, pos)) {
+            pos += 1
+        }
+    }
+    let text = without_underscores(lx.src, start, pos)
+    if is_float {
+        let t = text.to_str()
+        match t.parse_float() {
+            Some(v) -> {
+                out.floats.push(v)
+                push_tok(tb, T_FLOAT, start, pos, out.floats.len() - 1, 0)
+            }
+            None -> push_error(tb, out, start, pos, "invalid float literal `{t}`")
+        }
+        return
+    }
+    let (v, ok) = digits_value(text, 10)
+    if not ok {
+        push_error(tb, out, start, pos, "integer literal `{text.to_str()}` is too large — the largest integer is 18446744073709551615, a `u64`, and the largest `i64` 9223372036854775807")
+    } else if v < 0 {
+        // Past `i64` and within `u64` ([T-U64]).
+        push_tok(tb, T_WIDEINT, start, pos, v, 0)
+    } else {
+        push_tok(tb, T_INT, start, pos, v, 0)
+    }
+}
+
+/// A `"""…"""` raw block: every byte between the delimiters, a newline
+/// right after the opening one dropped.
+fn lex_raw_string(inout lx: LexState, inout pos: i64, inout tb: [i64], inout out: Lexed) {
+    let start = pos
+    pos += 3
+    if pos < lx.n and peek(lx, pos) == 10 {
+        pos += 1
+    }
+    let from = pos
+    while pos < lx.n and not (peek(lx, pos) == 34 and byte_at(lx, pos + 1) == 34 and byte_at(lx, pos + 2) == 34) {
+        pos += 1
+    }
+    if pos >= lx.n {
+        push_error(tb, out, start, pos, "unterminated `\"\"\"` string")
+        return
+    }
+    let text = lx.src.slice(from, pos).to_str()
+    pos += 3
+    out.part_kind.push(0)
+    out.part_text.push(text)
+    out.part_off.push(0)
+    push_tok(tb, T_STR, start, pos, out.part_kind.len() - 1, 1)
+}
+
+/// The byte after a lone backslash, as `char::escape_debug` renders it.
+fn escape_debug_byte(c: i64) -> str {
+    if c == 0 {
+        "\\0"
+    } else if c == 9 {
+        "\\t"
+    } else if c == 13 {
+        "\\r"
+    } else if c == 10 {
+        "\\n"
+    } else if c == 92 {
+        "\\\\"
+    } else if c == 34 {
+        "\\\""
+    } else if c == 39 {
+        "\\'"
+    } else if c < 32 or c == 127 {
+        "\\u\{" + c.to_base(16) + "}"
+    } else if c < 128 {
+        c.to_char()
+    } else {
+        // A whole character; the Rust lexer took one byte of it and then
+        // panicked slicing the source (docs/known-issues.md).
+        "?"
+    }
+}
+
+fn lex_string(inout lx: LexState, inout pos: i64, inout tb: [i64], inout out: Lexed) {
+    // `"""…"""` -- a raw block.
+    if byte_at(lx, pos + 1) == 34 and byte_at(lx, pos + 2) == 34 {
+        lex_raw_string(lx, pos, tb, out)
+        return
+    }
+    let start = pos
+    pos += 1
+    let first_part = out.part_kind.len()
+    var cur = byte_builder()
+    while true {
+        if pos >= lx.n or peek(lx, pos) == 10 {
+            drop_parts(out, first_part)
+            push_error(tb, out, start, pos, "unterminated string literal")
+            return
+        }
+        let c = peek(lx, pos)
+        if c == 34 {
+            pos += 1
+            break
+        } else if c == 92 {
+            pos += 1
+            let esc = peek(lx, pos)
+            pos += 1
+            if esc == 110 {
+                cur.push_byte(10)
+            } else if esc == 116 {
+                cur.push_byte(9)
+            } else if esc == 114 {
+                cur.push_byte(13)
+            } else if esc == 92 {
+                cur.push_byte(92)
+            } else if esc == 34 {
+                cur.push_byte(34)
+            } else if esc == 48 {
+                cur.push_byte(0)
+            } else if esc == 123 {
+                cur.push_byte(123)
+            } else if esc == 125 {
+                cur.push_byte(125)
+            } else if esc == 117 {
+                // `\u{1F600}` -- a character by its code point ([L-ESCAPE]).
+                if peek(lx, pos) != 123 {
+                    drop_parts(out, first_part)
+                    push_error(tb, out, start, pos, "`\\u` needs braces, as in `\\u\{1F600}`")
+                    return
+                }
+                pos += 1
+                let digits_at = pos
+                while pos < lx.n and peek(lx, pos) != 125 and peek(lx, pos) != 34 and peek(lx, pos) != 10 and pos - digits_at < 6 {
+                    pos += 1
+                }
+                if pos >= lx.n or peek(lx, pos) != 125 {
+                    drop_parts(out, first_part)
+                    push_error(tb, out, start, pos, "unterminated `\\u\{...}` escape — write up to six hex digits, then `}`")
+                    return
+                }
+                let digits = lx.src.slice(digits_at, pos)
+                pos += 1
+                var ok = digits.len() > 0 and digits.len() <= 6
+                for k in 0..digits.len() {
+                    if not digit_ok(digits.at(k), 16) {
+                        ok = false
+                    }
+                }
+                var cp = -1
+                if ok {
+                    let (v, _) = digits_value(digits, 16)
+                    if v < 55296 or (v > 57343 and v < 1114112) {
+                        cp = v
+                    }
+                }
+                if cp < 0 {
+                    drop_parts(out, first_part)
+                    push_error(tb, out, start, pos, "`\\u\{" + digits.to_str() + "}` is not a character — write up to six hex digits naming a code point below U+110000, and not a surrogate")
+                    return
+                }
+                cur.push_str(cp.to_char())
+            } else {
+                var shown = escape_debug_byte(esc)
+                if esc >= 128 {
+                    // The whole character, not its first byte.
+                    let len = utf8_len(esc)
+                    let at = pos - 1
+                    pos = (at + len).min(lx.n)
+                    shown = lx.src.slice(at, pos).to_str()
+                }
+                drop_parts(out, first_part)
+                push_error(tb, out, start, pos, "unknown escape `\\" + shown + "`")
+                return
+            }
+        } else if c == 123 {
+            // An interpolation: its raw source, up to the balancing `}`.
+            pos += 1
+            let expr_start = pos
+            var depth = 1
+            while depth > 0 {
+                if pos >= lx.n or peek(lx, pos) == 10 {
+                    drop_parts(out, first_part)
+                    push_error(tb, out, start, pos, "unterminated `\{...}` interpolation in string — for a literal `\{` write `\\\{`")
+                    return
+                }
+                let d = peek(lx, pos)
+                pos += 1
+                if d == 92 {
+                    // An escape covers the byte after it.
+                    if pos < lx.n {
+                        pos += 1
+                    }
+                } else if d == 123 {
+                    depth += 1
+                } else if d == 125 {
+                    depth -= 1
+                }
+            }
+            if all_ws(lx.src, expr_start, pos - 1) {
+                drop_parts(out, first_part)
+                push_error(tb, out, start, pos, "an empty `\{}` in a string interpolates nothing — write `\\\{}` for literal braces, or put an expression between them")
+                return
+            }
+            if cur.len() > 0 {
+                out.part_kind.push(0)
+                out.part_text.push(cur.to_str())
+                out.part_off.push(0)
+                cur = byte_builder()
+            }
+            out.part_kind.push(1)
+            out.part_text.push(lx.src.slice(expr_start, pos - 1).to_str())
+            out.part_off.push(expr_start)
+        } else {
+            // One UTF-8 character, never split.
+            let len = utf8_len(c)
+            let end = (pos + len).min(lx.n)
+            cur.push_bytes(lx.src.slice(pos, end))
+            pos = end
+        }
+    }
+    if cur.len() > 0 or out.part_kind.len() == first_part {
+        out.part_kind.push(0)
+        out.part_text.push(cur.to_str())
+        out.part_off.push(0)
+    }
+    push_tok(tb, T_STR, start, pos, first_part, out.part_kind.len() - first_part)
+}
+
+/// Takes back the parts a string that turned out to be an error had added.
+fn drop_parts(inout out: Lexed, first: i64) {
+    while out.part_kind.len() > first {
+        out.part_kind.pop()
+        out.part_text.pop()
+        out.part_off.pop()
+    }
+}
+
+fn lex_operator(inout lx: LexState, inout pos: i64, inout tb: [i64], inout out: Lexed) {
+    let start = pos
+    let b = peek(lx, pos)
+    pos += 1
+    var kind = -1
+    if b == 40 {
+        kind = T_LPAREN
+    } else if b == 41 {
+        kind = T_RPAREN
+    } else if b == 123 {
+        kind = T_LBRACE
+    } else if b == 125 {
+        kind = T_RBRACE
+    } else if b == 91 {
+        kind = T_LBRACKET
+    } else if b == 93 {
+        kind = T_RBRACKET
+    } else if b == 44 {
+        kind = T_COMMA
+    } else if b == 64 {
+        kind = T_AT
+    } else if b == 46 {
+        if peek(lx, pos) == 46 {
+            pos += 1
+            if peek(lx, pos) == 61 {
+                pos += 1
+                kind = T_DOTDOTEQ
+            } else {
+                kind = T_DOTDOT
+            }
+        } else {
+            kind = T_DOT
+        }
+    } else if b == 58 {
+        if peek(lx, pos) == 58 {
+            pos += 1
+            kind = T_COLONCOLON
+        } else {
+            kind = T_COLON
+        }
+    } else if b == 45 {
+        if peek(lx, pos) == 62 {
+            pos += 1
+            kind = T_ARROW
+        } else if peek(lx, pos) == 61 {
+            pos += 1
+            kind = T_MINUSEQ
+        } else {
+            kind = T_MINUS
+        }
+    } else if b == 61 {
+        if peek(lx, pos) == 61 {
+            pos += 1
+            kind = T_EQEQ
+        } else if peek(lx, pos) == 62 {
+            pos += 1
+            kind = T_FATARROW
+        } else {
+            kind = T_EQ
+        }
+    } else if b == 124 {
+        // Never merged into `||`: that is also a closure with no
+        // parameters, which only the parser can tell apart.
+        if peek(lx, pos) == 62 {
+            pos += 1
+            kind = T_PIPEGT
+        } else {
+            kind = T_PIPE
+        }
+    } else if b == 43 {
+        if peek(lx, pos) == 61 {
+            pos += 1
+            kind = T_PLUSEQ
+        } else {
+            kind = T_PLUS
+        }
+    } else if b == 42 {
+        if peek(lx, pos) == 61 {
+            pos += 1
+            kind = T_STAREQ
+        } else {
+            kind = T_STAR
+        }
+    } else if b == 47 {
+        if peek(lx, pos) == 61 {
+            pos += 1
+            kind = T_SLASHEQ
+        } else {
+            kind = T_SLASH
+        }
+    } else if b == 37 {
+        kind = T_PERCENT
+    } else if b == 94 {
+        kind = T_CARET
+    } else if b == 33 {
+        if peek(lx, pos) == 61 {
+            pos += 1
+            kind = T_NOTEQ
+        } else {
+            kind = T_BANG
+        }
+    } else if b == 60 {
+        if peek(lx, pos) == 61 {
+            pos += 1
+            kind = T_LTEQ
+        } else {
+            kind = T_LT
+        }
+    } else if b == 62 {
+        if peek(lx, pos) == 61 {
+            pos += 1
+            kind = T_GTEQ
+        } else {
+            kind = T_GT
+        }
+    } else if b == 63 {
+        if peek(lx, pos) == 46 {
+            pos += 1
+            kind = T_QUESTIONDOT
+        } else if peek(lx, pos) == 63 {
+            pos += 1
+            kind = T_QQ
+        } else {
+            kind = T_QUESTION
+        }
+    }
+    if kind >= 0 {
+        push_tok(tb, kind, start, pos, 0, 0)
+        return
+    }
+    // Anything else is one character, never split.
+    let len = utf8_len(b)
+    pos = (start + len).min(lx.n)
+    if b == 92 {
+        push_error(tb, out, start, pos, "unexpected character `\\` — a nested string inside a `\{...}` interpolation needs no escaping; write the quotes plainly")
+        return
+    }
+    if b == 38 {
+        if peek(lx, pos) == 38 {
+            pos += 1
+            push_tok(tb, T_AMPAMP, start, pos, 0, 0)
+            return
+        }
+        push_error(tb, out, start, pos, "unexpected character `&` — a reference is written `ref T`, and `&&` is written `and`")
+        return
+    }
+    let cp = decode_at(lx.src, start, pos - start)
+    if is_control(cp) or is_unicode_ws(cp) or cp == 65279 or (cp >= 8203 and cp <= 8207) or cp == 8288 {
+        var named = ""
+        if cp == 65279 {
+            named = " (a byte order mark — legal only at the very start of a file)"
+        } else if cp == 8203 {
+            named = " (a zero-width space)"
+        }
+        push_error(tb, out, start, pos, "unexpected character U+" + cp.to_base(16).to_upper().pad_start(4, "0") + named)
+        return
+    }
+    push_error(tb, out, start, pos, "unexpected character `" + lx.src.slice(start, pos).to_str() + "`")
+}

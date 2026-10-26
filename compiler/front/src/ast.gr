@@ -1,0 +1,2465 @@
+// The AST, built from the CST (cst.gr), and printed as the Rust frontend's
+// `grasm ast` prints its own: `{:?}` of `grasm_syntax::ast::Module`, then
+// each diagnostic.
+//
+// The tree is the Rust one node for node, desugarings included, because the
+// Rust parser makes them as it parses and the AST is what it hands on: an
+// `impl`'s methods become functions named `method@Type` beside it; an actor
+// becomes a state type, a handle type, a constructor and an `impl`; a
+// function with contracts becomes a wrapper, a body and one function per
+// clause; `x |> f(a)` is `f(x, a)`; `for (a, b) in xs` binds through a
+// hidden name; `ref(v)` is a call. The CST keeps what was written; this is
+// where it becomes what is meant.
+//
+// Nodes live in arrays and point at each other by id. A node has a kind,
+// a span, a run of integer slots in `pool` -- child ids, -1 for an absent
+// `Option`, or plain values -- and one string. Lists are A_VEC nodes. The
+// builder visits the CST's nodes children-first, in one loop, and the
+// printer walks an explicit stack: neither recurses per level, so an
+// `else if` chain or a `^` chain as long as the input is costs nothing.
+import lex
+import syn
+import rdebug
+import cst
+
+pub let A_VEC = 1
+pub let A_IDENT = 2
+pub let A_PATH = 3
+pub let A_PARAM = 4
+pub let A_FIELD_DEF = 5
+pub let A_VARIANT_DEF = 6
+pub let A_FNSIG = 7
+pub let A_BLOCK = 8
+pub let A_ARM = 9
+pub let A_PAIR = 10
+pub let A_PAIR_STR = 11
+
+pub let D_FN = 20
+pub let D_CONST = 21
+pub let D_EXTERN = 22
+pub let D_TLS = 23
+pub let D_TYPE = 24
+pub let D_EFFECT = 25
+pub let D_TEST = 26
+pub let D_BENCH = 27
+pub let D_IMPORT = 28
+pub let D_INTERFACE = 29
+pub let D_IMPL = 30
+
+pub let B_STRUCT = 35
+pub let B_SUM = 36
+pub let B_ALIAS = 37
+
+pub let Y_NAME = 40
+pub let Y_LIST = 41
+pub let Y_REF = 42
+pub let Y_FALLIBLE = 43
+pub let Y_TUPLE = 44
+pub let Y_UNION = 45
+pub let Y_FN = 46
+
+pub let S_LET = 50
+pub let S_LET_TUPLE = 51
+pub let S_ASSIGN = 52
+pub let S_EXPR = 53
+pub let S_RETURN = 54
+pub let S_BREAK = 55
+pub let S_CONTINUE = 56
+pub let S_WHILE = 57
+pub let S_FOR = 58
+pub let S_PARALLEL = 59
+pub let S_SPAWN = 60
+pub let S_WITH = 61
+
+pub let E_INT = 70
+pub let E_FLOAT = 71
+pub let E_BOOL = 72
+pub let E_STR = 73
+pub let E_IDENT = 74
+pub let E_LIST = 75
+pub let E_MAP = 76
+pub let E_TUPLE = 77
+pub let E_STRUCT = 78
+pub let E_CALL = 79
+pub let E_METHOD = 80
+pub let E_FIELD = 81
+pub let E_INDEX = 82
+pub let E_UNARY = 83
+pub let E_BINARY = 84
+pub let E_RANGE = 85
+pub let E_IF = 86
+pub let E_MATCH = 87
+pub let E_BLOCK = 88
+pub let E_REGION = 89
+pub let E_UNSAFE = 90
+pub let E_TRY = 91
+pub let E_CLOSURE = 92
+pub let PC_TEXT = 95
+pub let PC_EXPR = 96
+pub let EB_ELSE = 97
+pub let EB_ELSEIF = 98
+
+pub let P_WILD = 100
+pub let P_INT = 101
+pub let P_BOOL = 102
+pub let P_STR = 103
+pub let P_BIND = 104
+pub let P_VARIANT = 105
+pub let P_TUPLE = 106
+pub let P_OR = 107
+
+type Ast = {
+    k: [i64],
+    s: [i64],
+    e: [i64],
+    off: [i64],
+    n: [i64],
+    t: [str],
+    pool: [i64],
+    fl: [f64],
+}
+
+/// What the builder works on: the tree, the AST being made, each CST
+/// node's AST node, and the declarations each one lowers to.
+type Builder = {
+    c: Cst,
+    res: [i64],
+    low_off: [i64],
+    low_n: [i64],
+    low_pool: [i64],
+    src: bytes,
+}
+
+/// A module's AST: its declarations, documentation, and where each
+/// decimal literal past `i64` was written.
+type ModuleAst = {
+    a: Ast,
+    decls: [i64],
+    doc_keys: [i64],
+    doc_vals: [str],
+    wide_ints: [i64],
+}
+
+fn mk(inout a: Ast, kind: i64, s: i64, e: i64, slots: [i64], t: str) -> i64 {
+    let id = a.k.len()
+    a.k.push(kind)
+    a.s.push(s)
+    a.e.push(e)
+    a.off.push(a.pool.len())
+    a.n.push(slots.len())
+    a.t.push(t)
+    for x in slots {
+        a.pool.push(x)
+    }
+    id
+}
+
+fn slot(a: Ast, id: i64, i: i64) -> i64 {
+    a.pool[a.off[id] + i]
+}
+
+fn slots_of(a: Ast, id: i64) -> [i64] {
+    a.pool.slice(a.off[id], a.off[id] + a.n[id])
+}
+
+fn vec(inout a: Ast, ids: [i64]) -> i64 {
+    mk(a, A_VEC, -1, -1, ids, "")
+}
+
+/// A copy of node `id` with slot `i` set to `v`.
+fn with_slot(inout a: Ast, id: i64, i: i64, v: i64) -> i64 {
+    var sl = slots_of(a, id)
+    sl[i] = v
+    mk(a, a.k[id], a.s[id], a.e[id], sl, a.t[id])
+}
+
+fn ident_at(inout a: Ast, name: str, s: i64, e: i64) -> i64 {
+    mk(a, A_IDENT, s, e, [], name)
+}
+
+// ---------------------------------------------------------------------
+// Reading the CST
+// ---------------------------------------------------------------------
+
+fn nk(b: Builder, n: i64) -> i64 {
+    b.c.kind[n]
+}
+
+/// The children of node `n`: node ids, and tokens as -(id + 1).
+fn elems(b: Builder, n: i64) -> [i64] {
+    b.c.elems.slice(b.c.first[n], b.c.first[n] + b.c.count[n])
+}
+
+/// The child nodes of `n`, error nodes left out.
+fn kid_nodes(b: Builder, n: i64) -> [i64] {
+    var out: [i64] = []
+    for el in elems(b, n) {
+        if el >= 0 and b.c.kind[el] != syn.N_ERROR {
+            out.push(el)
+        }
+    }
+    out
+}
+
+/// The tokens directly under `n`, as global token ids.
+fn kid_toks(b: Builder, n: i64) -> [i64] {
+    var out: [i64] = []
+    for el in elems(b, n) {
+        if el < 0 {
+            out.push(0 - el - 1)
+        }
+    }
+    out
+}
+
+/// The first child node of `n` whose kind is `k`, or -1.
+fn kid_of(b: Builder, n: i64, k: i64) -> i64 {
+    for el in elems(b, n) {
+        if el >= 0 and b.c.kind[el] == k {
+            return el
+        }
+    }
+    -1
+}
+
+fn tok_kind(b: Builder, t: i64) -> i64 {
+    b.c.g_kind[t]
+}
+
+fn tok_text(b: Builder, t: i64) -> str {
+    b.c.regions[b.c.g_reg[t]].text[b.c.g_ival[t]]
+}
+
+/// The first token directly under `n` of kind `k`, or -1.
+fn tok_of(b: Builder, n: i64, k: i64) -> i64 {
+    for el in elems(b, n) {
+        if el < 0 and b.c.g_kind[0 - el - 1] == k {
+            return 0 - el - 1
+        }
+    }
+    -1
+}
+
+/// The first identifier directly under `n` after its first token of kind
+/// `after` (any position when `after` is -1).
+fn ident_tok_after(b: Builder, n: i64, after: i64) -> i64 {
+    var seen = after < 0
+    for el in elems(b, n) {
+        if el < 0 {
+            let t = 0 - el - 1
+            let k = b.c.g_kind[t]
+            if seen and k == lex.T_IDENT {
+                return t
+            }
+            if k == after {
+                seen = true
+            }
+        }
+    }
+    -1
+}
+
+/// The `i`-th identifier token directly under `n`.
+fn nth_ident(b: Builder, n: i64, i: i64) -> i64 {
+    var seen = 0
+    for el in elems(b, n) {
+        if el < 0 and b.c.g_kind[0 - el - 1] == lex.T_IDENT {
+            if seen == i {
+                return 0 - el - 1
+            }
+            seen += 1
+        }
+    }
+    -1
+}
+
+fn ident_of_tok(inout b: Builder, inout a: Ast, t: i64) -> i64 {
+    let name = tok_text(b, t)
+    ident_at(a, name, b.c.g_start[t], b.c.g_end[t])
+}
+
+/// A name in binding position: `_` binds a fresh unwritable name.
+fn binding_of_tok(inout b: Builder, inout a: Ast, t: i64) -> i64 {
+    let s = b.c.g_start[t]
+    if b.c.g_kind[t] == lex.T_UNDERSCORE {
+        return ident_at(a, "\u{1}wild{s}", s, b.c.g_end[t])
+    }
+    ident_of_tok(b, a, t)
+}
+
+fn is_type_node(k: i64) -> bool {
+    k == syn.N_TY_NAME or k == syn.N_TY_FN or k == syn.N_TY_LIST or k == syn.N_TY_REF or
+    k == syn.N_TY_TUPLE or k == syn.N_TY_UNION or k == syn.N_TY_PAREN or k == syn.N_TY_FALLIBLE
+}
+
+fn is_expr_node(k: i64) -> bool {
+    (k >= syn.N_INT and k <= syn.N_REF_CALL and k != syn.N_INTERP and k != syn.N_INTERP_FAILED and
+        k != syn.N_MAP_ENTRY and k != syn.N_FIELD_INIT and k != syn.N_STRUCT_BASE and k != syn.N_ARGS and
+        k != syn.N_ELSE and k != syn.N_ARM and k != syn.N_CLOSURE_PARAMS) or
+    k == syn.N_COALESCE or k == syn.N_POW
+}
+
+fn is_stmt_node(k: i64) -> bool {
+    k >= syn.N_LET and k <= syn.N_EXPR_STMT and k != syn.N_NAMES
+}
+
+fn is_pat_node(k: i64) -> bool {
+    k >= syn.N_PAT_WILD and k <= syn.N_PAT_OR
+}
+
+/// The AST ids of the child nodes of `n` that `pick` accepts.
+fn kid_res_types(b: Builder, n: i64) -> [i64] {
+    var out: [i64] = []
+    for el in elems(b, n) {
+        if el >= 0 and is_type_node(b.c.kind[el]) {
+            out.push(b.res[el])
+        }
+    }
+    out
+}
+
+fn kid_res_exprs(b: Builder, n: i64) -> [i64] {
+    var out: [i64] = []
+    for el in elems(b, n) {
+        if el >= 0 and is_expr_node(b.c.kind[el]) {
+            out.push(b.res[el])
+        }
+    }
+    out
+}
+
+fn kid_res_pats(b: Builder, n: i64) -> [i64] {
+    var out: [i64] = []
+    for el in elems(b, n) {
+        if el >= 0 and is_pat_node(b.c.kind[el]) {
+            out.push(b.res[el])
+        }
+    }
+    out
+}
+
+/// The AST of the child node of `n` of kind `k`, or -1.
+fn res_of_kind(b: Builder, n: i64, k: i64) -> i64 {
+    let c = kid_of(b, n, k)
+    if c < 0 {
+        return -1
+    }
+    b.res[c]
+}
+
+// ---------------------------------------------------------------------
+// Building
+// ---------------------------------------------------------------------
+
+pub fn build(c: Cst, src: bytes, wide_ints: [i64], doc_start: [i64], doc_end: [i64], doc_text: [str]) -> ModuleAst {
+    var a = Ast{ k: [], s: [], e: [], off: [], n: [], t: [], pool: [], fl: [] }
+    var b = Builder{ c: c,
+        res: [], low_off: [], low_n: [], low_pool: [], src: src }
+    for _ in 0..c.kind.len() {
+        b.res.push(-1)
+        b.low_off.push(0)
+        b.low_n.push(0)
+    }
+    var decls: [i64] = []
+    for n in c.post {
+        if c.kind[n] == syn.N_ROOT {
+            decls = build_root(b, a, n)
+        } else {
+            let r = build_node(b, a, n)
+            b.res[n] = r
+        }
+    }
+    var m = ModuleAst{ a: a, decls: decls, doc_keys: [], doc_vals: [], wide_ints: wide_ints }
+    attach_docs(m, src, doc_start, doc_end, doc_text)
+    m
+}
+
+fn set_lowered(inout b: Builder, inout a: Ast, n: i64, ids: [i64]) {
+    b.low_off[n] = b.low_pool.len()
+    b.low_n[n] = ids.len()
+    for x in ids {
+        b.low_pool.push(x)
+    }
+}
+
+fn lowered_of(b: Builder, n: i64) -> [i64] {
+    b.low_pool.slice(b.low_off[n], b.low_off[n] + b.low_n[n])
+}
+
+/// The module's declarations in order, each followed by what it lowered
+/// to -- and before that, the methods of any `impl` or actor that failed
+/// since the last one, as the Rust parser's queue hands them on.
+fn build_root(inout b: Builder, inout a: Ast, n: i64) -> [i64] {
+    var decls: [i64] = []
+    var pending: [i64] = []
+    for el in elems(b, n) {
+        if el < 0 {
+            continue
+        }
+        let k = b.c.kind[el]
+        if k == syn.N_ERROR {
+            for x in elems(b, el) {
+                if x >= 0 and (b.c.kind[x] == syn.N_IMPL_PARTIAL or b.c.kind[x] == syn.N_ACTOR_PARTIAL) {
+                    for d in lowered_of(b, x) {
+                        pending.push(d)
+                    }
+                }
+            }
+            continue
+        }
+        if b.res[el] < 0 {
+            continue
+        }
+        decls.push(b.res[el])
+        for d in pending {
+            decls.push(d)
+        }
+        pending = []
+        for d in lowered_of(b, el) {
+            decls.push(d)
+        }
+    }
+    decls
+}
+
+fn build_node(inout b: Builder, inout a: Ast, n: i64) -> i64 {
+    let k = b.c.kind[n]
+    let s = b.c.s[n]
+    let e = b.c.e[n]
+    if k == syn.N_PATH {
+        var segs: [i64] = []
+        for t in kid_toks(b, n) {
+            if b.c.g_kind[t] == lex.T_IDENT {
+                segs.push(ident_of_tok(b, a, t))
+            }
+        }
+        let v = vec(a, segs)
+        return mk(a, A_PATH, s, e, [v], "")
+    }
+    if k == syn.N_ROW_UNSAFE {
+        let id = ident_at(a, "unsafe", s, e)
+        let v = vec(a, [id])
+        return mk(a, A_PATH, s, e, [v], "")
+    }
+    if is_type_node(k) {
+        return build_type(b, a, n)
+    }
+    if k == syn.N_PARAM {
+        let t = ident_tok_after(b, n, -1)
+        let name = ident_of_tok(b, a, t)
+        let ty = kid_res_types(b, n)[0]
+        return mk(a, A_PARAM, s, e, [b.c.s2[n], name, ty], "")
+    }
+    if k == syn.N_SELF_PARAM {
+        // Its type is the `impl`'s, the interface's `Self` or the actor's
+        // handle, filled in by the declaration around it.
+        let t = ident_tok_after(b, n, -1)
+        let name = ident_of_tok(b, a, t)
+        return mk(a, A_PARAM, s, e, [b.c.s2[n], name, -1], "")
+    }
+    if k == syn.N_FIELD_DEF {
+        let name = ident_of_tok(b, a, ident_tok_after(b, n, -1))
+        let ty = kid_res_types(b, n)[0]
+        return mk(a, A_FIELD_DEF, s, e, [name, ty], "")
+    }
+    if k == syn.N_VARIANT {
+        let name = ident_of_tok(b, a, ident_tok_after(b, n, -1))
+        var fields: [i64] = []
+        for x in kid_nodes(b, n) {
+            if b.c.kind[x] == syn.N_FIELD_DEF {
+                fields.push(b.res[x])
+            }
+        }
+        let v = vec(a, fields)
+        return mk(a, A_VARIANT_DEF, s, e, [name, v], "")
+    }
+    if k == syn.N_SIG {
+        return build_sig(b, a, n)
+    }
+    if k == syn.N_BLOCK {
+        var stmts: [i64] = []
+        for x in kid_nodes(b, n) {
+            if is_stmt_node(b.c.kind[x]) {
+                stmts.push(b.res[x])
+            }
+        }
+        let v = vec(a, stmts)
+        return mk(a, A_BLOCK, s, e, [v], "")
+    }
+    if is_stmt_node(k) {
+        return build_stmt(b, a, n)
+    }
+    if is_pat_node(k) {
+        return build_pattern(b, a, n)
+    }
+    if k == syn.N_FN {
+        return build_fn_decl(b, a, n)
+    }
+    if k == syn.N_ARM {
+        return build_arm(b, a, n)
+    }
+    if k == syn.N_INTERP {
+        let xs = kid_res_exprs(b, n)
+        if xs.len() > 0 {
+            return xs[0]
+        }
+        return -1
+    }
+    if is_expr_node(k) or k == syn.N_ARM_STMT or k == syn.N_ARM_ASSIGN {
+        return build_expr(b, a, n)
+    }
+    if k == syn.N_EXTERN or k == syn.N_CONST or k == syn.N_TYPE_DECL or k == syn.N_EFFECT or k == syn.N_TEST or
+    k == syn.N_BENCH or k == syn.N_IMPORT or k == syn.N_INTERFACE or k == syn.N_IMPL or k == syn.N_ACTOR or
+    k == syn.N_THREAD_LOCAL or k == syn.N_IMPL_PARTIAL or k == syn.N_ACTOR_PARTIAL{
+        return build_decl(b, a, n)
+    }
+    // A node its parent reads: a list of parameters, arguments, and so on.
+    -1
+}
+
+// --- types ------------------------------------------------------------
+
+fn build_type(inout b: Builder, inout a: Ast, n: i64) -> i64 {
+    let k = b.c.kind[n]
+    let s = b.c.s[n]
+    let e = b.c.e[n]
+    if k == syn.N_TY_NAME {
+        let path = res_of_kind(b, n, syn.N_PATH)
+        let am = kid_of(b, n, syn.N_TY_ARGS)
+        var args: [i64] = []
+        if am >= 0 {
+            args = kid_res_types(b, am)
+        }
+        let v = vec(a, args)
+        return mk(a, Y_NAME, s, e, [path, v], "")
+    }
+    if k == syn.N_TY_FN {
+        let params = vec(a, kid_res_types(b, n))
+        let rm = kid_of(b, n, syn.N_RET)
+        var ret = -1
+        if rm >= 0 {
+            ret = kid_res_types(b, rm)[0]
+        } else {
+            let unit = vec(a, [])
+            ret = mk(a, Y_TUPLE, b.c.s2[n], b.c.e2[n], [unit], "")
+        }
+        var fx: [i64] = []
+        let fm = kid_of(b, n, syn.N_EFFECTS)
+        if fm >= 0 {
+            fx = row_paths(b, fm)
+        }
+        let fxv = vec(a, fx)
+        return mk(a, Y_FN, s, e, [params, ret, fxv], "")
+    }
+    if k == syn.N_TY_LIST {
+        return mk(a, Y_LIST, s, e, [kid_res_types(b, n)[0]], "")
+    }
+    if k == syn.N_TY_REF {
+        return mk(a, Y_REF, s, e, [kid_res_types(b, n)[0]], "")
+    }
+    if k == syn.N_TY_TUPLE {
+        let v = vec(a, kid_res_types(b, n))
+        return mk(a, Y_TUPLE, s, e, [v], "")
+    }
+    if k == syn.N_TY_UNION {
+        let v = vec(a, kid_res_types(b, n))
+        return mk(a, Y_UNION, s, e, [v], "")
+    }
+    if k == syn.N_TY_PAREN {
+        return kid_res_types(b, n)[0]
+    }
+    // N_TY_FALLIBLE
+    let ts = kid_res_types(b, n)
+    mk(a, Y_FALLIBLE, s, e, [ts[0], ts[1]], "")
+}
+
+/// The paths of an effect row.
+fn row_paths(b: Builder, n: i64) -> [i64] {
+    var out: [i64] = []
+    for x in kid_nodes(b, n) {
+        let k = b.c.kind[x]
+        if k == syn.N_PATH or k == syn.N_ROW_UNSAFE {
+            out.push(b.res[x])
+        }
+    }
+    out
+}
+
+/// `t` with every bare `Self` replaced by `with` ([T-INTERFACE]).
+fn replace_self(inout a: Ast, t: i64, rep: i64) -> i64 {
+    if t < 0 {
+        return t
+    }
+    let k = a.k[t]
+    if k == Y_NAME {
+        let path = slot(a, t, 0)
+        let args = slot(a, t, 1)
+        let segs = slot(a, path, 0)
+        if a.n[args] == 0 and a.n[segs] == 1 and a.t[slot(a, segs, 0)] == "Self" {
+            return rep
+        }
+        var nargs: [i64] = []
+        var changed = false
+        for x in slots_of(a, args) {
+            let y = replace_self(a, x, rep)
+            nargs.push(y)
+            if y != x {
+                changed = true
+            }
+        }
+        if not changed {
+            return t
+        }
+        let v = vec(a, nargs)
+        return mk(a, Y_NAME, a.s[t], a.e[t], [path, v], "")
+    }
+    if k == Y_LIST or k == Y_REF {
+        let x = slot(a, t, 0)
+        let y = replace_self(a, x, rep)
+        if y == x {
+            return t
+        }
+        return mk(a, k, a.s[t], a.e[t], [y], "")
+    }
+    if k == Y_FALLIBLE {
+        let x0 = slot(a, t, 0)
+        let x1 = slot(a, t, 1)
+        let y0 = replace_self(a, x0, rep)
+        let y1 = replace_self(a, x1, rep)
+        if y0 == x0 and y1 == x1 {
+            return t
+        }
+        return mk(a, k, a.s[t], a.e[t], [y0, y1], "")
+    }
+    if k == Y_TUPLE or k == Y_UNION {
+        let items = slot(a, t, 0)
+        var ys: [i64] = []
+        var changed = false
+        for x in slots_of(a, items) {
+            let y = replace_self(a, x, rep)
+            ys.push(y)
+            if y != x {
+                changed = true
+            }
+        }
+        if not changed {
+            return t
+        }
+        let v = vec(a, ys)
+        return mk(a, k, a.s[t], a.e[t], [v], "")
+    }
+    // A function type keeps its `Self`.
+    t
+}
+
+/// `Self`, as an interface's signatures have it: a name spanning the
+/// interface's name.
+fn self_type(inout a: Ast, s: i64, e: i64) -> i64 {
+    let id = ident_at(a, "Self", s, e)
+    let segs = vec(a, [id])
+    let path = mk(a, A_PATH, s, e, [segs], "")
+    let args = vec(a, [])
+    mk(a, Y_NAME, s, e, [path, args], "")
+}
+
+/// A one-segment named type, as an actor's handle and state are written.
+fn named_type(inout a: Ast, name: str, s: i64, e: i64) -> i64 {
+    let id = ident_at(a, name, s, e)
+    let segs = vec(a, [id])
+    let path = mk(a, A_PATH, s, e, [segs], "")
+    let args = vec(a, [])
+    mk(a, Y_NAME, s, e, [path, args], "")
+}
+
+// --- declarations -----------------------------------------------------
+
+/// Generic parameters and their bounds: (names VEC, bounds VEC of VECs).
+fn generics_of(inout b: Builder, inout a: Ast, gm: i64) -> (i64, i64) {
+    var names: [i64] = []
+    var bounds: [i64] = []
+    if gm >= 0 {
+        for g in kid_nodes(b, gm) {
+            if b.c.kind[g] != syn.N_GENERIC {
+                continue
+            }
+            names.push(ident_of_tok(b, a, ident_tok_after(b, g, -1)))
+            var these: [i64] = []
+            for x in kid_nodes(b, g) {
+                if b.c.kind[x] == syn.N_PATH {
+                    these.push(b.res[x])
+                }
+            }
+            bounds.push(vec(a, these))
+        }
+    }
+    let nv = vec(a, names)
+    let bv = vec(a, bounds)
+    (nv, bv)
+}
+
+fn params_of(inout b: Builder, inout a: Ast, n: i64) -> i64 {
+    let pm = kid_of(b, n, syn.N_PARAMS)
+    var ps: [i64] = []
+    if pm >= 0 {
+        for x in kid_nodes(b, pm) {
+            let k = b.c.kind[x]
+            if k == syn.N_PARAM or k == syn.N_SELF_PARAM {
+                ps.push(b.res[x])
+            }
+        }
+    }
+    vec(a, ps)
+}
+
+/// `-> R`, `! E` and `/ {row}` of a signature: (ret, err, effects), each
+/// -1 when absent.
+fn tail_of(inout b: Builder, inout a: Ast, n: i64) -> (i64, i64, i64) {
+    var ret = -1
+    var err = -1
+    var fx = -1
+    let rm = kid_of(b, n, syn.N_RET)
+    if rm >= 0 {
+        ret = kid_res_types(b, rm)[0]
+    }
+    let em = kid_of(b, n, syn.N_ERRTY)
+    if em >= 0 {
+        err = kid_res_types(b, em)[0]
+    }
+    let fm = kid_of(b, n, syn.N_EFFECTS)
+    if fm >= 0 {
+        fx = vec(a, row_paths(b, fm))
+    }
+    (ret, err, fx)
+}
+
+fn build_sig(inout b: Builder, inout a: Ast, n: i64) -> i64 {
+    let name = ident_of_tok(b, a, ident_tok_after(b, n, lex.KW_FN))
+    let params = params_of(b, a, n)
+    let (ret, err, fx) = tail_of(b, a, n)
+    mk(a, A_FNSIG, b.c.s[n], b.c.e[n], [name, params, ret, err, fx], "")
+}
+
+// FnDecl slots.
+let F_PUB = 0
+let F_EXPORT = 1
+let F_NAME = 2
+let F_GENERICS = 3
+let F_BOUNDS = 4
+let F_PARAMS = 5
+let F_RET = 6
+let F_ERR = 7
+let F_EFFECTS = 8
+let F_BODY = 9
+
+/// A function. With contracts, the wrapper the Rust parser lowers it to,
+/// the clause functions and the body going to `lowered`.
+fn build_fn_decl(inout b: Builder, inout a: Ast, n: i64) -> i64 {
+    let name = ident_of_tok(b, a, ident_tok_after(b, n, lex.KW_FN))
+    let (gens, bounds) = generics_of(b, a, kid_of(b, n, syn.N_GENERICS))
+    let params = params_of(b, a, n)
+    let (ret, err, fx) = tail_of(b, a, n)
+    let body = res_of_kind(b, n, syn.N_BLOCK)
+    let f = mk(a, D_FN, b.c.s[n], b.c.e[n], [b.c.s2[n], b.c.e2[n], name, gens, bounds, params, ret, err, fx, body], "")
+    var contracts: [i64] = []
+    for x in kid_nodes(b, n) {
+        if b.c.kind[x] == syn.N_CONTRACT {
+            contracts.push(x)
+        }
+    }
+    if contracts.is_empty() {
+        return f
+    }
+    lower_contracts(b, a, n, f, contracts)
+}
+
+/// The source of a span with its whitespace runs closed up, as a contract's
+/// panic quotes its clause.
+fn quote(src: bytes, s: i64, e: i64) -> str {
+    if s < 0 or e > src.len() or s > e {
+        return "contract"
+    }
+    var words: [str] = []
+    var i = s
+    while i < e {
+        while i < e and is_ws_at(src, i) {
+            i += ws_len(src, i)
+        }
+        let w0 = i
+        while i < e and not is_ws_at(src, i) {
+            i += char_len(src.at(i))
+        }
+        if i > w0 {
+            words.push(src.slice(w0, i.min(e)).to_str())
+        }
+    }
+    words.join(" ")
+}
+
+fn char_len(c: i64) -> i64 {
+    if c < 128 {
+        1
+    } else if c < 224 {
+        2
+    } else if c < 240 {
+        3
+    } else {
+        4
+    }
+}
+
+fn code_at(src: bytes, i: i64) -> i64 {
+    let c = src.at(i)
+    let len = char_len(c)
+    if len == 1 {
+        return c
+    }
+    var cp = c.bit_and(7)
+    if len == 2 {
+        cp = c.bit_and(31)
+    } else if len == 3 {
+        cp = c.bit_and(15)
+    }
+    for k in 1..len {
+        if i + k < src.len() {
+            cp = cp * 64 + src.at(i + k).bit_and(63)
+        }
+    }
+    cp
+}
+
+fn is_ws_at(src: bytes, i: i64) -> bool {
+    lex.is_unicode_ws(code_at(src, i))
+}
+
+fn ws_len(src: bytes, i: i64) -> i64 {
+    char_len(src.at(i))
+}
+
+/// Contracts, lowered as `Parser::lower_contracts` lowers them: every
+/// synthetic node gets a zero-width span of its own, counted up from the
+/// declaration's start in the order the Rust code makes them.
+fn lower_contracts(inout b: Builder, inout a: Ast, n: i64, f: i64, contracts: [i64]) -> i64 {
+    let sp_s = a.s[f]
+    let sp_e = a.e[f]
+    let name = a.t[slot(a, f, F_NAME)]
+    let fparams = slot(a, f, F_PARAMS)
+    let limit = (sp_e - 1).max(0)
+    var next = sp_s
+    // param_args
+    var param_args: [i64] = []
+    for pid in slots_of(a, fparams) {
+        let pname = a.t[slot(a, pid, 1)]
+        let at = next.min(limit)
+        next += 1
+        let id = ident_at(a, pname, at, at)
+        param_args.push(mk(a, E_IDENT, at, at, [id], ""))
+    }
+    // ok_ty: the unit type's span is taken whether or not it is used.
+    let ok_at = next.min(limit)
+    next += 1
+    var ok_ty = slot(a, f, F_RET)
+    if ok_ty < 0 {
+        let unit = vec(a, [])
+        ok_ty = mk(a, Y_TUPLE, ok_at, ok_at, [unit], "")
+    }
+    // bool_ty: the segment, the path, the name.
+    let seg_at = next.min(limit)
+    next += 1
+    let path_at = next.min(limit)
+    next += 1
+    let name_at = next.min(limit)
+    next += 1
+    let bool_id = ident_at(a, "bool", seg_at, seg_at)
+    let bool_segs = vec(a, [bool_id])
+    let bool_path = mk(a, A_PATH, path_at, path_at, [bool_segs], "")
+    let no_args = vec(a, [])
+    let bool_ty = mk(a, Y_NAME, name_at, name_at, [bool_path, no_args], "")
+    var stmts: [i64] = []
+    var post: [i64] = []
+    var nr = 0
+    var ne = 0
+    var lowered: [i64] = []
+    for cn in contracts {
+        let text = quote(b.src, b.c.s2[cn], b.c.e2[cn])
+        let cs = b.c.s[cn]
+        let ce = b.c.e[cn]
+        let binder_t = ident_tok_after(b, cn, lex.T_PIPE)
+        let is_ensures = binder_t >= 0
+        var params = slots_of(a, fparams)
+        var helper = ""
+        var msg = ""
+        if not is_ensures {
+            nr += 1
+            helper = "{name}@requires{nr}"
+            msg = "requires `{text}` failed in `{name}`"
+        } else {
+            ne += 1
+            let bid = ident_of_tok(b, a, binder_t)
+            params.push(mk(a, A_PARAM, b.c.g_start[binder_t], b.c.g_end[binder_t], [0, bid, ok_ty], ""))
+            helper = "{name}@ensures{ne}"
+            msg = "ensures `{text}` failed in `{name}`"
+        }
+        let cond = kid_res_exprs(b, cn)[0]
+        let hname = ident_at(a, helper, cs, ce)
+        let pv = vec(a, params)
+        let fxv = vec(a, [])
+        let cstmt = mk(a, S_EXPR, -1, -1, [cond], "")
+        let cstmts = vec(a, [cstmt])
+        let hbody = mk(a, A_BLOCK, cs, ce, [cstmts], "")
+        lowered.push(mk(a, D_FN, cs, ce, [0, 0, hname, slot(a, f, F_GENERICS), slot(a, f, F_BOUNDS), pv, bool_ty, -1, fxv, hbody], ""))
+        var args = param_args
+        if is_ensures {
+            let at = next.min(limit)
+            next += 1
+            let rid = ident_at(a, "\u{a7}result", at, at)
+            args.push(mk(a, E_IDENT, at, at, [rid], ""))
+        }
+        // check(helper, args, msg)
+        let a1 = next.min(limit)
+        next += 1
+        let a2 = next.min(limit)
+        next += 1
+        let hid = ident_at(a, helper, a1, a1)
+        let callee = mk(a, E_IDENT, a1, a1, [hid], "")
+        let argv = vec(a, args)
+        let call = mk(a, E_CALL, a2, a2, [callee, argv], "")
+        let a3 = next.min(limit)
+        next += 1
+        let unary = mk(a, E_UNARY, a3, a3, [1, call], "")
+        let a4 = next.min(limit)
+        next += 1
+        let text_piece = mk(a, PC_TEXT, -1, -1, [], msg)
+        let pieces = vec(a, [text_piece])
+        let str_e = mk(a, E_STR, a4, a4, [pieces], "")
+        let a5 = next.min(limit)
+        next += 1
+        let a6 = next.min(limit)
+        next += 1
+        let pid = ident_at(a, "panic", a5, a5)
+        let pcallee = mk(a, E_IDENT, a5, a5, [pid], "")
+        let pargs = vec(a, [str_e])
+        let pcall = mk(a, E_CALL, a6, a6, [pcallee, pargs], "")
+        let pstmt = mk(a, S_EXPR, -1, -1, [pcall], "")
+        let a7 = next.min(limit)
+        next += 1
+        let then_stmts = vec(a, [pstmt])
+        let then_b = mk(a, A_BLOCK, a7, a7, [then_stmts], "")
+        let a8 = next.min(limit)
+        next += 1
+        let if_e = mk(a, E_IF, a8, a8, [unary, then_b, -1], "")
+        let check = mk(a, S_EXPR, -1, -1, [if_e], "")
+        if is_ensures {
+            post.push(check)
+        } else {
+            stmts.push(check)
+        }
+    }
+    let body_name = "{name}@body"
+    let r1 = next.min(limit)
+    next += 1
+    let r2 = next.min(limit)
+    next += 1
+    let bid = ident_at(a, body_name, r1, r1)
+    let bcallee = mk(a, E_IDENT, r1, r1, [bid], "")
+    let bargs = vec(a, param_args)
+    var run = mk(a, E_CALL, r2, r2, [bcallee, bargs], "")
+    if slot(a, f, F_ERR) >= 0 {
+        let r3 = next.min(limit)
+        next += 1
+        run = mk(a, E_TRY, r3, r3, [run], "")
+    }
+    let l1 = next.min(limit)
+    next += 1
+    let l2 = next.min(limit)
+    next += 1
+    let res_id = ident_at(a, "\u{a7}result", l1, l1)
+    stmts.push(mk(a, S_LET, l2, l2, [0, res_id, -1, run], ""))
+    for x in post {
+        stmts.push(x)
+    }
+    let l3 = next.min(limit)
+    next += 1
+    let rid2 = ident_at(a, "\u{a7}result", l3, l3)
+    let rexpr = mk(a, E_IDENT, l3, l3, [rid2], "")
+    stmts.push(mk(a, S_EXPR, -1, -1, [rexpr], ""))
+    let old_body = slot(a, f, F_BODY)
+    let sv = vec(a, stmts)
+    let wbody = mk(a, A_BLOCK, a.s[old_body], a.e[old_body], [sv], "")
+    let wrapper = with_slot(a, f, F_BODY, wbody)
+    // The body, under its own name.
+    let fname = slot(a, f, F_NAME)
+    let bname = ident_at(a, body_name, a.s[fname], a.e[fname])
+    var body_fn = with_slot(a, f, F_NAME, bname)
+    body_fn = with_slot(a, body_fn, F_PUB, 0)
+    body_fn = with_slot(a, body_fn, F_EXPORT, 0)
+    lowered.push(body_fn)
+    set_lowered(b, a, n, lowered)
+    wrapper
+}
+
+fn build_decl(inout b: Builder, inout a: Ast, n: i64) -> i64 {
+    let k = b.c.kind[n]
+    let s = b.c.s[n]
+    let e = b.c.e[n]
+    if k == syn.N_CONST {
+        let name = ident_of_tok(b, a, ident_tok_after(b, n, lex.KW_LET))
+        let tys = kid_res_types(b, n)
+        var ty = -1
+        if tys.len() > 0 {
+            ty = tys[0]
+        }
+        let init = kid_res_exprs(b, n)[0]
+        return mk(a, D_CONST, s, e, [b.c.s2[n], name, ty, init], "")
+    }
+    if k == syn.N_EXTERN {
+        let name = ident_of_tok(b, a, ident_tok_after(b, n, lex.KW_FN))
+        let params = params_of(b, a, n)
+        let rm = kid_of(b, n, syn.N_RET)
+        var ret = -1
+        if rm >= 0 {
+            ret = kid_res_types(b, rm)[0]
+        }
+        return mk(a, D_EXTERN, s, e, [b.c.s2[n], name, params, ret], "")
+    }
+    if k == syn.N_THREAD_LOCAL {
+        let name = ident_of_tok(b, a, nth_ident(b, n, 1))
+        let ty = kid_res_types(b, n)[0]
+        return mk(a, D_TLS, s, e, [b.c.s2[n], name, ty], "")
+    }
+    if k == syn.N_TYPE_DECL {
+        let name = ident_of_tok(b, a, ident_tok_after(b, n, lex.KW_TYPE))
+        let (gens, _) = generics_of(b, a, kid_of(b, n, syn.N_GENERICS))
+        var body = -1
+        let fm = kid_of(b, n, syn.N_FIELDS)
+        let vm = kid_of(b, n, syn.N_VARIANTS)
+        if fm >= 0 {
+            var fs: [i64] = []
+            for x in kid_nodes(b, fm) {
+                if b.c.kind[x] == syn.N_FIELD_DEF {
+                    fs.push(b.res[x])
+                }
+            }
+            let v = vec(a, fs)
+            body = mk(a, B_STRUCT, -1, -1, [v], "")
+        } else if vm >= 0 {
+            var vs: [i64] = []
+            for x in kid_nodes(b, vm) {
+                if b.c.kind[x] == syn.N_VARIANT {
+                    vs.push(b.res[x])
+                }
+            }
+            let v = vec(a, vs)
+            body = mk(a, B_SUM, -1, -1, [v], "")
+        } else {
+            let am = kid_of(b, n, syn.N_ALIAS)
+            body = mk(a, B_ALIAS, -1, -1, [kid_res_types(b, am)[0]], "")
+        }
+        return mk(a, D_TYPE, s, e, [b.c.s2[n], b.c.e2[n], name, gens, body], "")
+    }
+    if k == syn.N_EFFECT {
+        let name = ident_of_tok(b, a, ident_tok_after(b, n, lex.KW_EFFECT))
+        var ops: [i64] = []
+        for x in kid_nodes(b, n) {
+            if b.c.kind[x] == syn.N_SIG {
+                ops.push(b.res[x])
+            }
+        }
+        let v = vec(a, ops)
+        return mk(a, D_EFFECT, s, e, [name, v], "")
+    }
+    if k == syn.N_TEST or k == syn.N_BENCH {
+        let st = tok_of(b, n, lex.T_STR)
+        let lx = b.c.regions[b.c.g_reg[st]]
+        let name = lx.part_text[b.c.g_ival[st]]
+        let body = res_of_kind(b, n, syn.N_BLOCK)
+        if k == syn.N_BENCH {
+            return mk(a, D_BENCH, s, e, [body], name)
+        }
+        let params = params_of(b, a, n)
+        return mk(a, D_TEST, s, e, [params, body], name)
+    }
+    if k == syn.N_IMPORT {
+        return mk(a, D_IMPORT, s, e, [res_of_kind(b, n, syn.N_PATH)], "")
+    }
+    if k == syn.N_INTERFACE {
+        let nt = ident_tok_after(b, n, lex.KW_INTERFACE)
+        let name = ident_of_tok(b, a, nt)
+        let self_ty = self_type(a, b.c.g_start[nt], b.c.g_end[nt])
+        var methods: [i64] = []
+        for x in kid_nodes(b, n) {
+            if b.c.kind[x] == syn.N_SIG {
+                methods.push(fill_self_sig(a, b.res[x], self_ty))
+            }
+        }
+        let v = vec(a, methods)
+        return mk(a, D_INTERFACE, s, e, [b.c.s2[n], name, v], "")
+    }
+    if k == syn.N_IMPL or k == syn.N_IMPL_PARTIAL {
+        return build_impl(b, a, n)
+    }
+    // N_ACTOR, N_ACTOR_PARTIAL
+    build_actor(b, a, n)
+}
+
+/// A signature whose `self` parameter takes the type `ty`.
+fn fill_self_sig(inout a: Ast, sig: i64, ty: i64) -> i64 {
+    let params = slot(a, sig, 1)
+    var ps: [i64] = []
+    var changed = false
+    for p in slots_of(a, params) {
+        if slot(a, p, 2) < 0 {
+            ps.push(with_slot(a, p, 2, ty))
+            changed = true
+        } else {
+            ps.push(p)
+        }
+    }
+    if not changed {
+        return sig
+    }
+    let v = vec(a, ps)
+    with_slot(a, sig, 1, v)
+}
+
+/// The type an `impl` is for, and its shape's name.
+fn impl_type_name(a: Ast, ty: i64) -> str {
+    if a.k[ty] == Y_NAME {
+        let path = slot(a, ty, 0)
+        let segs = slot(a, path, 0)
+        return a.t[slot(a, segs, 0)]
+    }
+    "[]"
+}
+
+fn concat_vec(inout a: Ast, x: i64, y: i64) -> i64 {
+    var all = slots_of(a, x)
+    for z in slots_of(a, y) {
+        all.push(z)
+    }
+    vec(a, all)
+}
+
+/// An `impl`: the header, and each method lowered to `method@Type`.
+fn build_impl(inout b: Builder, inout a: Ast, n: i64) -> i64 {
+    let (gens, bounds) = generics_of(b, a, kid_of(b, n, syn.N_GENERICS))
+    let iface = res_of_kind(b, n, syn.N_PATH)
+    let ty = kid_res_types(b, n)[0]
+    let type_name = impl_type_name(a, ty)
+    var methods: [i64] = []
+    var lowered: [i64] = []
+    for x in kid_nodes(b, n) {
+        if b.c.kind[x] != syn.N_FN {
+            continue
+        }
+        var f = b.res[x]
+        // `self` is the implementing type, and so is every `Self`.
+        var ps: [i64] = []
+        for p in slots_of(a, slot(a, f, F_PARAMS)) {
+            var pt = slot(a, p, 2)
+            if pt < 0 {
+                pt = ty
+            }
+            let rt = replace_self(a, pt, ty)
+            if rt != slot(a, p, 2) {
+                ps.push(with_slot(a, p, 2, rt))
+            } else {
+                ps.push(p)
+            }
+        }
+        let pv = vec(a, ps)
+        f = with_slot(a, f, F_PARAMS, pv)
+        let f_f_ret_v = replace_self(a, slot(a, f, F_RET), ty)
+        f = with_slot(a, f, F_RET, f_f_ret_v)
+        let f_f_err_v = replace_self(a, slot(a, f, F_ERR), ty)
+        f = with_slot(a, f, F_ERR, f_f_err_v)
+        if slot(a, f, F_EFFECTS) < 0 {
+            let empty = vec(a, [])
+            f = with_slot(a, f, F_EFFECTS, empty)
+        }
+        if a.n[gens] > 0 {
+            let f_f_generics_v = concat_vec(a, gens, slot(a, f, F_GENERICS))
+            f = with_slot(a, f, F_GENERICS, f_f_generics_v)
+            let f_f_bounds_v = concat_vec(a, bounds, slot(a, f, F_BOUNDS))
+            f = with_slot(a, f, F_BOUNDS, f_f_bounds_v)
+        }
+        let old_name = slot(a, f, F_NAME)
+        let mname = a.t[old_name]
+        let lowered_name = "{mname}@{type_name}"
+        methods.push(mk(a, A_PAIR_STR, -1, -1, [old_name], lowered_name))
+        let new_name = ident_at(a, lowered_name, a.s[old_name], a.e[old_name])
+        f = with_slot(a, f, F_NAME, new_name)
+        f = with_slot(a, f, F_PUB, 1)
+        lowered.push(f)
+    }
+    set_lowered(b, a, n, lowered)
+    if b.c.kind[n] == syn.N_IMPL_PARTIAL {
+        return -1
+    }
+    let mv = vec(a, methods)
+    mk(a, D_IMPL, b.c.s[n], b.c.e[n], [iface, ty, gens, bounds, mv], type_name)
+}
+
+/// An actor ([E-ACTOR]): its methods as `m@Name`, then its state type, its
+/// constructor and an `impl` of `§actor`; the handle type is the
+/// declaration itself.
+fn build_actor(inout b: Builder, inout a: Ast, n: i64) -> i64 {
+    let nt = nth_ident(b, n, 1)
+    let aname = tok_text(b, nt)
+    let ns = b.c.g_start[nt]
+    let ne = b.c.g_end[nt]
+    let name = ident_of_tok(b, a, nt)
+    let handle_ty = named_type(a, aname, ns, ne)
+    var fields: [i64] = []
+    var inits: [i64] = []
+    var methods: [i64] = []
+    var lowered: [i64] = []
+    for x in kid_nodes(b, n) {
+        let k = b.c.kind[x]
+        if k == syn.N_ACTOR_VAR {
+            let fname = ident_of_tok(b, a, ident_tok_after(b, x, lex.KW_VAR))
+            let fty = kid_res_types(b, x)[0]
+            fields.push(mk(a, A_FIELD_DEF, b.c.s[x], b.c.e[x], [fname, fty], ""))
+            inits.push(kid_res_exprs(b, x)[0])
+        } else if k == syn.N_FN {
+            var f = b.res[x]
+            var ps: [i64] = []
+            var first = true
+            for p in slots_of(a, slot(a, f, F_PARAMS)) {
+                var q = p
+                // The handle is shared, not moved.
+                if first {
+                    q = with_slot(a, q, 0, 0)
+                    first = false
+                }
+                var pt = slot(a, q, 2)
+                if pt < 0 {
+                    pt = handle_ty
+                }
+                let q_2_v = replace_self(a, pt, handle_ty)
+                q = with_slot(a, q, 2, q_2_v)
+                ps.push(q)
+            }
+            let pv = vec(a, ps)
+            f = with_slot(a, f, F_PARAMS, pv)
+            let f_f_ret_v = replace_self(a, slot(a, f, F_RET), handle_ty)
+            f = with_slot(a, f, F_RET, f_f_ret_v)
+            let f_f_err_v = replace_self(a, slot(a, f, F_ERR), handle_ty)
+            f = with_slot(a, f, F_ERR, f_f_err_v)
+            let old_name = slot(a, f, F_NAME)
+            let lowered_name = "{a.t[old_name]}@{aname}"
+            methods.push(mk(a, A_PAIR_STR, -1, -1, [old_name], lowered_name))
+            let new_name = ident_at(a, lowered_name, a.s[old_name], a.e[old_name])
+            f = with_slot(a, f, F_NAME, new_name)
+            f = with_slot(a, f, F_PUB, 1)
+            lowered.push(f)
+        }
+    }
+    if b.c.kind[n] == syn.N_ACTOR_PARTIAL {
+        set_lowered(b, a, n, lowered)
+        return -1
+    }
+    let is_pub = b.c.s2[n]
+    let s = b.c.s[n]
+    let e = b.c.e[n]
+    let state_name = "{aname}@state"
+    // Synthetic nodes: zero-width spans from the declaration's start.
+    var pairs: [i64] = []
+    for i in 0..fields.len() {
+        pairs.push(mk(a, A_PAIR, -1, -1, [slot(a, fields[i], 0), inits[i]], ""))
+    }
+    let sid0 = ident_at(a, state_name, s, s)
+    let ssegs = vec(a, [sid0])
+    let spath = mk(a, A_PATH, s, s, [ssegs], "")
+    let pv = vec(a, pairs)
+    let state_lit = mk(a, E_STRUCT, s + 1, s + 1, [spath, -1, pv], "")
+    let refid = ident_at(a, "ref", s + 2, s + 2)
+    let refcallee = mk(a, E_IDENT, s + 2, s + 2, [refid], "")
+    let refargs = vec(a, [state_lit])
+    let cell = mk(a, E_CALL, s + 3, s + 3, [refcallee, refargs], "")
+    let slot_id = ident_at(a, "\u{a7}state", s + 4, s + 4)
+    let hid = ident_at(a, aname, s + 5, s + 5)
+    let hsegs = vec(a, [hid])
+    let hpath = mk(a, A_PATH, s + 5, s + 5, [hsegs], "")
+    let hpair = mk(a, A_PAIR, -1, -1, [slot_id, cell], "")
+    let hfields = vec(a, [hpair])
+    let handle = mk(a, E_STRUCT, s + 6, s + 6, [hpath, -1, hfields], "")
+    let state_id = ident_at(a, state_name, ns, ne)
+    let no_gens = vec(a, [])
+    let fv = vec(a, fields)
+    let sbody = mk(a, B_STRUCT, -1, -1, [fv], "")
+    lowered.push(mk(a, D_TYPE, s, e, [is_pub, 0, state_id, no_gens, sbody], ""))
+    let hstmt = mk(a, S_EXPR, -1, -1, [handle], "")
+    let hstmts = vec(a, [hstmt])
+    let cbody = mk(a, A_BLOCK, s + 7, s + 7, [hstmts], "")
+    let cparams = params_of(b, a, n)
+    let no_bounds = vec(a, [])
+    let no_gens2 = vec(a, [])
+    lowered.push(mk(a, D_FN, s, e, [is_pub, 0, name, no_gens2, no_bounds, cparams, handle_ty, -1, -1, cbody], ""))
+    let aid = ident_at(a, "\u{a7}actor", ns, ne)
+    let asegs = vec(a, [aid])
+    let apath = mk(a, A_PATH, ns, ne, [asegs], "")
+    let mv = vec(a, methods)
+    let ig = vec(a, [])
+    let ib = vec(a, [])
+    lowered.push(mk(a, D_IMPL, s, e, [apath, handle_ty, ig, ib, mv], aname))
+    set_lowered(b, a, n, lowered)
+    // The handle: one field, `§state: ref Name@state`.
+    let state_ty = named_type(a, state_name, ns, ne)
+    let ref_ty = mk(a, Y_REF, ns, ne, [state_ty], "")
+    let hfield = mk(a, A_FIELD_DEF, s, e, [slot_id, ref_ty], "")
+    let hfv = vec(a, [hfield])
+    let hbody = mk(a, B_STRUCT, -1, -1, [hfv], "")
+    let no_gens3 = vec(a, [])
+    mk(a, D_TYPE, s, e, [is_pub, 0, name, no_gens3, hbody], "")
+}
+
+// --- statements -------------------------------------------------------
+
+fn build_stmt(inout b: Builder, inout a: Ast, n: i64) -> i64 {
+    let k = b.c.kind[n]
+    let s = b.c.s[n]
+    let e = b.c.e[n]
+    if k == syn.N_LET {
+        var bt = -1
+        for t in kid_toks(b, n) {
+            let tk = b.c.g_kind[t]
+            if bt < 0 and (tk == lex.T_IDENT or tk == lex.T_UNDERSCORE) {
+                bt = t
+            }
+        }
+        let name = binding_of_tok(b, a, bt)
+        let tys = kid_res_types(b, n)
+        var ty = -1
+        if tys.len() > 0 {
+            ty = tys[0]
+        }
+        let init = kid_res_exprs(b, n)[0]
+        return mk(a, S_LET, s, e, [b.c.s2[n], name, ty, init], "")
+    }
+    if k == syn.N_LET_TUPLE {
+        let names = names_of(b, a, kid_of(b, n, syn.N_NAMES))
+        let nv = vec(a, names)
+        let init = kid_res_exprs(b, n)[0]
+        return mk(a, S_LET_TUPLE, s, e, [b.c.s2[n], nv, init], "")
+    }
+    if k == syn.N_ASSIGN {
+        return assign_of(b, a, n)
+    }
+    if k == syn.N_EXPR_STMT {
+        return mk(a, S_EXPR, -1, -1, [kid_res_exprs(b, n)[0]], "")
+    }
+    if k == syn.N_RETURN {
+        let xs = kid_res_exprs(b, n)
+        var v = -1
+        if xs.len() > 0 {
+            v = xs[0]
+        }
+        return mk(a, S_RETURN, s, e, [v], "")
+    }
+    if k == syn.N_BREAK {
+        return mk(a, S_BREAK, s, e, [], "")
+    }
+    if k == syn.N_CONTINUE {
+        return mk(a, S_CONTINUE, s, e, [], "")
+    }
+    if k == syn.N_WHILE {
+        let cond = kid_res_exprs(b, n)[0]
+        let body = res_of_kind(b, n, syn.N_BLOCK)
+        return mk(a, S_WHILE, s, e, [cond, body], "")
+    }
+    if k == syn.N_FOR {
+        let iter = kid_res_exprs(b, n)[0]
+        var body = res_of_kind(b, n, syn.N_BLOCK)
+        let nm = kid_of(b, n, syn.N_NAMES)
+        var var_id = -1
+        if nm >= 0 {
+            // `for (a, b) in xs`: each element bound to a hidden name and
+            // split at the top of the body.
+            let rs = b.c.s[nm]
+            let re = b.c.e[nm]
+            var_id = ident_at(a, "\u{1}each", rs, re)
+            let names = names_of(b, a, nm)
+            if names.len() > 0 {
+                let nv = vec(a, names)
+                let init = mk(a, E_IDENT, rs, re, [var_id], "")
+                let lt = mk(a, S_LET_TUPLE, rs, re, [0, nv, init], "")
+                var stmts = [lt]
+                for x in slots_of(a, slot(a, body, 0)) {
+                    stmts.push(x)
+                }
+                let sv = vec(a, stmts)
+                body = mk(a, A_BLOCK, a.s[body], a.e[body], [sv], "")
+            }
+        } else {
+            var bt = -1
+            for t in kid_toks(b, n) {
+                let tk = b.c.g_kind[t]
+                if bt < 0 and (tk == lex.T_IDENT or tk == lex.T_UNDERSCORE) {
+                    bt = t
+                }
+            }
+            var_id = binding_of_tok(b, a, bt)
+        }
+        return mk(a, S_FOR, s, e, [var_id, iter, body], "")
+    }
+    if k == syn.N_WITH {
+        let path = res_of_kind(b, n, syn.N_PATH)
+        let handler = kid_res_exprs(b, n)[0]
+        let body = res_of_kind(b, n, syn.N_BLOCK)
+        return mk(a, S_WITH, s, e, [path, handler, body], "")
+    }
+    // N_PARALLEL, N_SPAWN
+    let body = res_of_kind(b, n, syn.N_BLOCK)
+    var kind = S_SPAWN
+    if k == syn.N_PARALLEL {
+        kind = S_PARALLEL
+    }
+    mk(a, kind, s, e, [body, b.c.s2[n]], "")
+}
+
+fn names_of(inout b: Builder, inout a: Ast, nm: i64) -> [i64] {
+    var out: [i64] = []
+    for t in kid_toks(b, nm) {
+        let tk = b.c.g_kind[t]
+        if tk == lex.T_IDENT or tk == lex.T_UNDERSCORE {
+            out.push(binding_of_tok(b, a, t))
+        }
+    }
+    out
+}
+
+/// `AssignOp` of the operator token in node `n`.
+fn assign_of(inout b: Builder, inout a: Ast, n: i64) -> i64 {
+    var op = 0
+    for t in kid_toks(b, n) {
+        let tk = b.c.g_kind[t]
+        if tk == lex.T_PLUSEQ {
+            op = 1
+        } else if tk == lex.T_MINUSEQ {
+            op = 2
+        } else if tk == lex.T_STAREQ {
+            op = 3
+        } else if tk == lex.T_SLASHEQ {
+            op = 4
+        }
+    }
+    let xs = kid_res_exprs(b, n)
+    mk(a, S_ASSIGN, b.c.s[n], b.c.e[n], [xs[0], op, xs[1]], "")
+}
+
+// --- expressions ------------------------------------------------------
+
+fn build_expr(inout b: Builder, inout a: Ast, n: i64) -> i64 {
+    let k = b.c.kind[n]
+    let s = b.c.s[n]
+    let e = b.c.e[n]
+    if k == syn.N_INT {
+        var t = tok_of(b, n, lex.T_INT)
+        if t < 0 {
+            t = tok_of(b, n, lex.T_WIDEINT)
+        }
+        return mk(a, E_INT, s, e, [b.c.g_ival[t]], "")
+    }
+    if k == syn.N_FLOAT {
+        let t = tok_of(b, n, lex.T_FLOAT)
+        let v = b.c.regions[b.c.g_reg[t]].floats[b.c.g_ival[t]]
+        a.fl.push(v)
+        return mk(a, E_FLOAT, s, e, [a.fl.len() - 1], "")
+    }
+    if k == syn.N_BOOL {
+        var v = 0
+        if tok_of(b, n, lex.KW_TRUE) >= 0 {
+            v = 1
+        }
+        return mk(a, E_BOOL, s, e, [v], "")
+    }
+    if k == syn.N_STR {
+        let t = tok_of(b, n, lex.T_STR)
+        let lx = b.c.regions[b.c.g_reg[t]]
+        let first = b.c.g_ival[t]
+        let count = b.c.g_jval[t]
+        var interps: [i64] = []
+        for x in kid_nodes(b, n) {
+            let xk = b.c.kind[x]
+            if xk == syn.N_INTERP or xk == syn.N_INTERP_FAILED {
+                interps.push(x)
+            }
+        }
+        var pieces: [i64] = []
+        var q = 0
+        for pi in first..first + count {
+            if lx.part_kind[pi] == 0 {
+                pieces.push(mk(a, PC_TEXT, -1, -1, [], lx.part_text[pi]))
+            } else {
+                let x = interps[q]
+                q += 1
+                if b.c.kind[x] == syn.N_INTERP and b.res[x] >= 0 {
+                    pieces.push(mk(a, PC_EXPR, -1, -1, [b.res[x]], ""))
+                }
+            }
+        }
+        let v = vec(a, pieces)
+        return mk(a, E_STR, s, e, [v], "")
+    }
+    if k == syn.N_NAME {
+        let id = ident_of_tok(b, a, tok_of(b, n, lex.T_IDENT))
+        return mk(a, E_IDENT, s, e, [id], "")
+    }
+    if k == syn.N_LIST or k == syn.N_TUPLE {
+        let v = vec(a, kid_res_exprs(b, n))
+        var kind = E_LIST
+        if k == syn.N_TUPLE {
+            kind = E_TUPLE
+        }
+        return mk(a, kind, s, e, [v], "")
+    }
+    if k == syn.N_PAREN {
+        return kid_res_exprs(b, n)[0]
+    }
+    if k == syn.N_MAP {
+        var pairs: [i64] = []
+        for x in kid_nodes(b, n) {
+            if b.c.kind[x] == syn.N_MAP_ENTRY {
+                let kv = kid_res_exprs(b, x)
+                pairs.push(mk(a, A_PAIR, -1, -1, [kv[0], kv[1]], ""))
+            }
+        }
+        let v = vec(a, pairs)
+        return mk(a, E_MAP, s, e, [v], "")
+    }
+    if k == syn.N_STRUCT_LIT {
+        let nm = kid_of(b, n, syn.N_NAME)
+        let id = slot(a, b.res[nm], 0)
+        let segs = vec(a, [id])
+        let path = mk(a, A_PATH, a.s[id], a.e[id], [segs], "")
+        var base = -1
+        let bm = kid_of(b, n, syn.N_STRUCT_BASE)
+        if bm >= 0 {
+            base = kid_res_exprs(b, bm)[0]
+        }
+        var fields: [i64] = []
+        for x in kid_nodes(b, n) {
+            if b.c.kind[x] == syn.N_FIELD_INIT {
+                let fname = ident_of_tok(b, a, ident_tok_after(b, x, -1))
+                let v = kid_res_exprs(b, x)[0]
+                fields.push(mk(a, A_PAIR, -1, -1, [fname, v], ""))
+            }
+        }
+        let fv = vec(a, fields)
+        return mk(a, E_STRUCT, s, e, [path, base, fv], "")
+    }
+    if k == syn.N_CALL {
+        let callee = kid_res_exprs(b, n)[0]
+        let am = kid_of(b, n, syn.N_ARGS)
+        let args = vec(a, kid_res_exprs(b, am))
+        if a.k[callee] == E_FIELD {
+            return mk(a, E_METHOD, s, e, [slot(a, callee, 0), slot(a, callee, 1), args], "")
+        }
+        return mk(a, E_CALL, s, e, [callee, args], "")
+    }
+    if k == syn.N_FIELD {
+        let recv = kid_res_exprs(b, n)[0]
+        // The name is the last token: an identifier, or a component's
+        // digits.
+        let toks = kid_toks(b, n)
+        let t = toks[toks.len() - 1]
+        var name = -1
+        if b.c.g_kind[t] == lex.T_INT {
+            name = ident_at(a, "{b.c.g_ival[t]}", b.c.g_start[t], b.c.g_end[t])
+        } else {
+            name = ident_of_tok(b, a, t)
+        }
+        return mk(a, E_FIELD, s, e, [recv, name], "")
+    }
+    if k == syn.N_INDEX {
+        let xs = kid_res_exprs(b, n)
+        return mk(a, E_INDEX, s, e, [xs[0], xs[1]], "")
+    }
+    if k == syn.N_UNARY {
+        var op = 0
+        if b.c.s2[n] == lex.KW_NOT {
+            op = 1
+        }
+        return mk(a, E_UNARY, s, e, [op, kid_res_exprs(b, n)[0]], "")
+    }
+    if k == syn.N_TRY {
+        return mk(a, E_TRY, s, e, [kid_res_exprs(b, n)[0]], "")
+    }
+    if k == syn.N_BINARY or k == syn.N_COALESCE or k == syn.N_POW {
+        let xs = kid_res_exprs(b, n)
+        var op = b.c.s2[n]
+        if k == syn.N_COALESCE {
+            op = 14
+        } else if k == syn.N_POW {
+            op = 5
+        }
+        return mk(a, E_BINARY, s, e, [op, xs[0], xs[1]], "")
+    }
+    if k == syn.N_PIPE {
+        let xs = kid_res_exprs(b, n)
+        let lhs = xs[0]
+        let rhs = xs[1]
+        let rk = a.k[rhs]
+        if rk == E_CALL {
+            var args = [lhs]
+            for x in slots_of(a, slot(a, rhs, 1)) {
+                args.push(x)
+            }
+            let v = vec(a, args)
+            return mk(a, E_CALL, s, e, [slot(a, rhs, 0), v], "")
+        }
+        if rk == E_METHOD {
+            var args = [lhs]
+            for x in slots_of(a, slot(a, rhs, 2)) {
+                args.push(x)
+            }
+            let v = vec(a, args)
+            return mk(a, E_METHOD, s, e, [slot(a, rhs, 0), slot(a, rhs, 1), v], "")
+        }
+        if rk == E_IDENT or rk == E_FIELD {
+            let v = vec(a, [lhs])
+            return mk(a, E_CALL, s, e, [rhs, v], "")
+        }
+        // Reported by the parser; the right side stands.
+        return rhs
+    }
+    if k == syn.N_RANGE {
+        let xs = kid_res_exprs(b, n)
+        return mk(a, E_RANGE, s, e, [xs[0], xs[1], b.c.s2[n]], "")
+    }
+    if k == syn.N_IF {
+        let cond = kid_res_exprs(b, n)[0]
+        let then_b = res_of_kind(b, n, syn.N_BLOCK)
+        var els = -1
+        let em = kid_of(b, n, syn.N_ELSE)
+        let eim = kid_of(b, n, syn.N_ELSE_IF)
+        if em >= 0 {
+            els = mk(a, EB_ELSE, -1, -1, [res_of_kind(b, em, syn.N_BLOCK)], "")
+        } else if eim >= 0 {
+            els = mk(a, EB_ELSEIF, -1, -1, [res_of_kind(b, eim, syn.N_IF)], "")
+        }
+        return mk(a, E_IF, s, e, [cond, then_b, els], "")
+    }
+    if k == syn.N_MATCH {
+        let scrut = kid_res_exprs(b, n)[0]
+        var arms: [i64] = []
+        for x in kid_nodes(b, n) {
+            if b.c.kind[x] == syn.N_ARM {
+                arms.push(b.res[x])
+            }
+        }
+        let v = vec(a, arms)
+        return mk(a, E_MATCH, s, e, [scrut, v], "")
+    }
+    if k == syn.N_BLOCK_EXPR {
+        return mk(a, E_BLOCK, s, e, [res_of_kind(b, n, syn.N_BLOCK)], "")
+    }
+    if k == syn.N_REGION {
+        return mk(a, E_REGION, s, e, [res_of_kind(b, n, syn.N_BLOCK)], "")
+    }
+    if k == syn.N_UNSAFE {
+        return mk(a, E_UNSAFE, s, e, [res_of_kind(b, n, syn.N_BLOCK)], "")
+    }
+    if k == syn.N_CLOSURE {
+        let pm = kid_of(b, n, syn.N_CLOSURE_PARAMS)
+        var ps: [i64] = []
+        for t in kid_toks(b, pm) {
+            if b.c.g_kind[t] == lex.T_IDENT {
+                ps.push(ident_of_tok(b, a, t))
+            }
+        }
+        let pv = vec(a, ps)
+        let body = kid_res_exprs(b, n)[0]
+        return mk(a, E_CLOSURE, s, e, [pv, body], "")
+    }
+    if k == syn.N_REF_CALL {
+        let rid = ident_at(a, "ref", b.c.s2[n], b.c.e2[n])
+        let callee = mk(a, E_IDENT, b.c.s2[n], b.c.e2[n], [rid], "")
+        let args = vec(a, kid_res_exprs(b, n))
+        return mk(a, E_CALL, s, e, [callee, args], "")
+    }
+    if k == syn.N_ARM_STMT {
+        var st = -1
+        for x in kid_nodes(b, n) {
+            if is_stmt_node(b.c.kind[x]) {
+                st = b.res[x]
+            }
+        }
+        let sv = vec(a, [st])
+        let blk = mk(a, A_BLOCK, s, e, [sv], "")
+        return mk(a, E_BLOCK, s, e, [blk], "")
+    }
+    // N_ARM_ASSIGN
+    let asg = assign_of(b, a, n)
+    let sv = vec(a, [asg])
+    let blk = mk(a, A_BLOCK, s, e, [sv], "")
+    mk(a, E_BLOCK, s, e, [blk], "")
+}
+
+fn build_arm(inout b: Builder, inout a: Ast, n: i64) -> i64 {
+    let pat = kid_res_pats(b, n)[0]
+    var guard = -1
+    let gm = kid_of(b, n, syn.N_GUARD)
+    if gm >= 0 {
+        guard = kid_res_exprs(b, gm)[0]
+    }
+    var body = -1
+    for x in kid_nodes(b, n) {
+        let k = b.c.kind[x]
+        if k == syn.N_ARM_STMT or k == syn.N_ARM_ASSIGN or (is_expr_node(k) and k != syn.N_GUARD) {
+            body = b.res[x]
+        }
+    }
+    mk(a, A_ARM, b.c.s[n], b.c.e[n], [pat, guard, body], "")
+}
+
+// --- patterns ---------------------------------------------------------
+
+fn build_pattern(inout b: Builder, inout a: Ast, n: i64) -> i64 {
+    let k = b.c.kind[n]
+    let s = b.c.s[n]
+    let e = b.c.e[n]
+    if k == syn.N_PAT_WILD {
+        return mk(a, P_WILD, s, e, [], "")
+    }
+    if k == syn.N_PAT_INT {
+        var t = tok_of(b, n, lex.T_INT)
+        if t < 0 {
+            t = tok_of(b, n, lex.T_WIDEINT)
+        }
+        return mk(a, P_INT, s, e, [b.c.g_ival[t]], "")
+    }
+    if k == syn.N_PAT_NEG {
+        let v = b.c.g_ival[tok_of(b, n, lex.T_INT)]
+        // Wrapping: the least `i64` negates to itself.
+        var neg = v
+        if v != -9223372036854775807 - 1 {
+            neg = 0 - v
+        }
+        return mk(a, P_INT, s, e, [neg], "")
+    }
+    if k == syn.N_PAT_BOOL {
+        var v = 0
+        if tok_of(b, n, lex.KW_TRUE) >= 0 {
+            v = 1
+        }
+        return mk(a, P_BOOL, s, e, [v], "")
+    }
+    if k == syn.N_PAT_STR {
+        let t = tok_of(b, n, lex.T_STR)
+        let lx = b.c.regions[b.c.g_reg[t]]
+        var text = ""
+        if b.c.g_jval[t] > 0 {
+            text = lx.part_text[b.c.g_ival[t]]
+        }
+        return mk(a, P_STR, s, e, [], text)
+    }
+    if k == syn.N_PAT_BIND {
+        let path = res_of_kind(b, n, syn.N_PATH)
+        let segs = slot(a, path, 0)
+        return mk(a, P_BIND, -1, -1, [slot(a, segs, 0)], "")
+    }
+    if k == syn.N_PAT_VARIANT {
+        let path = res_of_kind(b, n, syn.N_PATH)
+        let v = vec(a, kid_res_pats(b, n))
+        return mk(a, P_VARIANT, s, e, [path, v], "")
+    }
+    let v = vec(a, kid_res_pats(b, n))
+    if k == syn.N_PAT_TUPLE {
+        return mk(a, P_TUPLE, s, e, [v], "")
+    }
+    mk(a, P_OR, s, e, [v], "")
+}
+
+// ---------------------------------------------------------------------
+// Documentation
+// ---------------------------------------------------------------------
+
+/// Files each run of consecutive `///` lines under the declaration that
+/// follows it, keyed by that declaration's start; a later run for the same
+/// declaration replaces an earlier one, as a map insert does.
+fn attach_docs(inout m: ModuleAst, src: bytes, ds: [i64], de: [i64], dt: [str]) {
+    if ds.is_empty() {
+        return
+    }
+    var starts: [i64] = []
+    for d in m.decls {
+        starts.push(m.a.s[d])
+    }
+    starts.sort()
+    var keys: [i64] = []
+    var vals: [str] = []
+    var i = 0
+    while i < ds.len() {
+        var j = i + 1
+        while j < ds.len() and adjacent(src, de[j - 1], ds[j]) {
+            j += 1
+        }
+        let end = de[j - 1]
+        var found = -1
+        for st in starts {
+            if found < 0 and st >= end {
+                found = st
+            }
+        }
+        if found >= 0 {
+            var text = dt.slice(i, j).join("\n")
+            var replaced = false
+            for q in 0..keys.len() {
+                if keys[q] == found {
+                    vals[q] = text
+                    replaced = true
+                }
+            }
+            if not replaced {
+                keys.push(found)
+                vals.push(text)
+            }
+        }
+        i = j
+    }
+    // In key order, as a BTreeMap iterates.
+    var order: [i64] = []
+    for q in 0..keys.len() {
+        order.push(q)
+    }
+    order.sort_by(|q| keys[q])
+    for q in order {
+        m.doc_keys.push(keys[q])
+        m.doc_vals.push(vals[q])
+    }
+}
+
+/// Whether only whitespace with exactly one newline lies between two doc
+/// lines.
+fn adjacent(src: bytes, a: i64, b: i64) -> bool {
+    if a > b or b > src.len() {
+        return true
+    }
+    var newlines = 0
+    var i = a
+    while i < b {
+        if not is_ws_at(src, i) {
+            return false
+        }
+        if src.at(i) == 10 {
+            newlines += 1
+        }
+        i += ws_len(src, i)
+    }
+    newlines == 1
+}
+
+// ---------------------------------------------------------------------
+// Printing, as `{:?}` of the Rust AST
+// ---------------------------------------------------------------------
+
+/// The printer's work: a stack of node ids to print, -1 for a piece of
+/// text, which is in `texts` at the same depth.
+type Printer = { nodes: [i64], texts: [str] }
+
+fn w_text(inout w: Printer, t: str) {
+    w.nodes.push(-1)
+    w.texts.push(t)
+}
+
+fn w_node(inout w: Printer, id: i64) {
+    w.nodes.push(id)
+    w.texts.push("")
+}
+
+fn span_text(s: i64, e: i64) -> str {
+    "Span \{ start: {s}, end: {e} }"
+}
+
+fn bool_text(v: i64) -> str {
+    if v != 0 {
+        "true"
+    } else {
+        "false"
+    }
+}
+
+/// Pushes, in reverse, the pieces a node prints as: `parts` is text and
+/// node ids in order, an id given as a string "#n".
+fn push_seq(inout w: Printer, items_t: [str], items_n: [i64]) {
+    var i = items_n.len() - 1
+    while i >= 0 {
+        if items_n[i] == -2 {
+            w_text(w, items_t[i])
+        } else if items_n[i] == -3 {
+            w_text(w, "None")
+        } else {
+            w_node(w, items_n[i])
+        }
+        i -= 1
+    }
+}
+
+/// A sequence being built: text pieces and node ids.
+type Seq = { t: [str], n: [i64] }
+
+fn sq() -> Seq {
+    Seq{ t: [], n: [] }
+}
+
+fn st(inout q: Seq, t: str) {
+    q.t.push(t)
+    q.n.push(-2)
+}
+
+fn sn(inout q: Seq, id: i64) {
+    q.t.push("")
+    q.n.push(id)
+}
+
+/// An `Option`: `None`, or `Some(...)`.
+fn so(inout q: Seq, id: i64) {
+    if id < 0 {
+        st(q, "None")
+    } else {
+        st(q, "Some(")
+        sn(q, id)
+        st(q, ")")
+    }
+}
+
+pub fn binop_name(op: i64) -> str {
+    match op {
+        0 -> "Add"
+        1 -> "Sub"
+        2 -> "Mul"
+        3 -> "Div"
+        4 -> "Rem"
+        5 -> "Pow"
+        6 -> "Eq"
+        7 -> "NotEq"
+        8 -> "Lt"
+        9 -> "LtEq"
+        10 -> "Gt"
+        11 -> "GtEq"
+        12 -> "And"
+        13 -> "Or"
+        _ -> "Coalesce"
+    }
+}
+
+fn mode_name(m: i64) -> str {
+    if m == 1 {
+        "Inout"
+    } else if m == 2 {
+        "Own"
+    } else {
+        "Let"
+    }
+}
+
+fn assign_name(op: i64) -> str {
+    match op {
+        1 -> "Add"
+        2 -> "Sub"
+        3 -> "Mul"
+        4 -> "Div"
+        _ -> "Assign"
+    }
+}
+
+/// Prints the module.
+pub fn print_module(m: ModuleAst, esc: EscTable) -> ByteBuilder {
+    var out = byte_builder()
+    let a = m.a
+    var w = Printer{ nodes: [], texts: [] }
+    var q = sq()
+    st(q, "Module \{ decls: [")
+    for i in 0..m.decls.len() {
+        if i > 0 {
+            st(q, ", ")
+        }
+        sn(q, m.decls[i])
+    }
+    st(q, "], docs: \{")
+    push_seq(w, q.t, q.n)
+    run(w, a, esc, out)
+    for i in 0..m.doc_keys.len() {
+        if i > 0 {
+            out.push_str(", ")
+        }
+        out.push_str("{m.doc_keys[i]}: ")
+        rdebug.push_str_debug(out, esc, m.doc_vals[i])
+    }
+    out.push_str("}, wide_ints: [")
+    for i in 0..m.wide_ints.len() {
+        if i > 0 {
+            out.push_str(", ")
+        }
+        out.push_str("{m.wide_ints[i]}")
+    }
+    out.push_str("] }")
+    out
+}
+
+fn run(inout w: Printer, a: Ast, esc: EscTable, inout out: ByteBuilder) {
+    while w.nodes.len() > 0 {
+        let id = w.nodes.pop() ?? -1
+        let t = w.texts.pop() ?? ""
+        if id < 0 {
+            out.push_str(t)
+            continue
+        }
+        print_node(w, a, esc, out, id)
+    }
+}
+
+fn print_node(inout w: Printer, a: Ast, esc: EscTable, inout out: ByteBuilder, id: i64) {
+    let k = a.k[id]
+    let sp = span_text(a.s[id], a.e[id])
+    // Leaves are written at once.
+    if k == A_IDENT {
+        out.push_str("Ident \{ name: ")
+        rdebug.push_str_debug(out, esc, a.t[id])
+        out.push_str(", span: {sp} }")
+        return
+    }
+    if k == E_INT {
+        out.push_str("Int({slot(a, id, 0)}, {sp})")
+        return
+    }
+    if k == E_FLOAT {
+        out.push_str("Float({rdebug.f64_debug(a.fl[slot(a, id, 0)])}, {sp})")
+        return
+    }
+    if k == E_BOOL {
+        out.push_str("Bool({bool_text(slot(a, id, 0))}, {sp})")
+        return
+    }
+    if k == P_WILD {
+        out.push_str("Wildcard({sp})")
+        return
+    }
+    if k == P_INT {
+        out.push_str("Int({slot(a, id, 0)}, {sp})")
+        return
+    }
+    if k == P_BOOL {
+        out.push_str("Bool({bool_text(slot(a, id, 0))}, {sp})")
+        return
+    }
+    if k == P_STR {
+        out.push_str("Str(")
+        rdebug.push_str_debug(out, esc, a.t[id])
+        out.push_str(", {sp})")
+        return
+    }
+    if k == PC_TEXT {
+        out.push_str("Text(")
+        rdebug.push_str_debug(out, esc, a.t[id])
+        out.push_str(")")
+        return
+    }
+    if k == S_BREAK {
+        out.push_str("Break({sp})")
+        return
+    }
+    if k == S_CONTINUE {
+        out.push_str("Continue({sp})")
+        return
+    }
+    var q = sq()
+    if k == A_VEC {
+        st(q, "[")
+        for i in 0..a.n[id] {
+            if i > 0 {
+                st(q, ", ")
+            }
+            sn(q, slot(a, id, i))
+        }
+        st(q, "]")
+    } else if k == A_PATH {
+        st(q, "Path \{ segments: ")
+        sn(q, slot(a, id, 0))
+        st(q, ", span: {sp} }")
+    } else if k == A_PARAM {
+        st(q, "Param \{ mode: {mode_name(slot(a, id, 0))}, name: ")
+        sn(q, slot(a, id, 1))
+        st(q, ", ty: ")
+        sn(q, slot(a, id, 2))
+        st(q, ", span: {sp} }")
+    } else if k == A_FIELD_DEF {
+        st(q, "FieldDef \{ name: ")
+        sn(q, slot(a, id, 0))
+        st(q, ", ty: ")
+        sn(q, slot(a, id, 1))
+        st(q, ", span: {sp} }")
+    } else if k == A_VARIANT_DEF {
+        st(q, "VariantDef \{ name: ")
+        sn(q, slot(a, id, 0))
+        st(q, ", fields: ")
+        sn(q, slot(a, id, 1))
+        st(q, ", span: {sp} }")
+    } else if k == A_FNSIG {
+        st(q, "FnSig \{ name: ")
+        sn(q, slot(a, id, 0))
+        st(q, ", params: ")
+        sn(q, slot(a, id, 1))
+        st(q, ", ret: ")
+        so(q, slot(a, id, 2))
+        st(q, ", err: ")
+        so(q, slot(a, id, 3))
+        st(q, ", effects: ")
+        so(q, slot(a, id, 4))
+        st(q, ", span: {sp} }")
+    } else if k == A_BLOCK {
+        st(q, "Block \{ stmts: ")
+        sn(q, slot(a, id, 0))
+        st(q, ", span: {sp} }")
+    } else if k == A_ARM {
+        st(q, "Arm \{ pattern: ")
+        sn(q, slot(a, id, 0))
+        st(q, ", guard: ")
+        so(q, slot(a, id, 1))
+        st(q, ", body: ")
+        sn(q, slot(a, id, 2))
+        st(q, ", span: {sp} }")
+    } else if k == A_PAIR {
+        st(q, "(")
+        sn(q, slot(a, id, 0))
+        st(q, ", ")
+        sn(q, slot(a, id, 1))
+        st(q, ")")
+    } else if k == A_PAIR_STR {
+        st(q, "(")
+        sn(q, slot(a, id, 0))
+        st(q, ", " + rdebug.str_debug(esc, a.t[id]) + ")")
+    } else if k == D_FN {
+        st(q, "Fn(FnDecl \{ is_pub: {bool_text(slot(a, id, 0))}, is_export: {bool_text(slot(a, id, 1))}, name: ")
+        sn(q, slot(a, id, 2))
+        st(q, ", generics: ")
+        sn(q, slot(a, id, 3))
+        st(q, ", bounds: ")
+        sn(q, slot(a, id, 4))
+        st(q, ", params: ")
+        sn(q, slot(a, id, 5))
+        st(q, ", ret: ")
+        so(q, slot(a, id, 6))
+        st(q, ", err: ")
+        so(q, slot(a, id, 7))
+        st(q, ", effects: ")
+        so(q, slot(a, id, 8))
+        st(q, ", body: ")
+        sn(q, slot(a, id, 9))
+        st(q, ", span: {sp} })")
+    } else if k == D_CONST {
+        st(q, "Const(ConstDecl \{ is_pub: {bool_text(slot(a, id, 0))}, name: ")
+        sn(q, slot(a, id, 1))
+        st(q, ", ty: ")
+        so(q, slot(a, id, 2))
+        st(q, ", init: ")
+        sn(q, slot(a, id, 3))
+        st(q, ", span: {sp} })")
+    } else if k == D_EXTERN {
+        st(q, "Extern(ExternDecl \{ is_pub: {bool_text(slot(a, id, 0))}, name: ")
+        sn(q, slot(a, id, 1))
+        st(q, ", params: ")
+        sn(q, slot(a, id, 2))
+        st(q, ", ret: ")
+        so(q, slot(a, id, 3))
+        st(q, ", span: {sp} })")
+    } else if k == D_TLS {
+        st(q, "ThreadLocal(ThreadLocalDecl \{ is_pub: {bool_text(slot(a, id, 0))}, name: ")
+        sn(q, slot(a, id, 1))
+        st(q, ", ty: ")
+        sn(q, slot(a, id, 2))
+        st(q, ", span: {sp} })")
+    } else if k == D_TYPE {
+        st(q, "Type(TypeDecl \{ is_pub: {bool_text(slot(a, id, 0))}, is_linear: {bool_text(slot(a, id, 1))}, name: ")
+        sn(q, slot(a, id, 2))
+        st(q, ", generics: ")
+        sn(q, slot(a, id, 3))
+        st(q, ", body: ")
+        sn(q, slot(a, id, 4))
+        st(q, ", span: {sp} })")
+    } else if k == B_STRUCT {
+        st(q, "Struct(")
+        sn(q, slot(a, id, 0))
+        st(q, ")")
+    } else if k == B_SUM {
+        st(q, "Sum(")
+        sn(q, slot(a, id, 0))
+        st(q, ")")
+    } else if k == B_ALIAS {
+        st(q, "Alias(")
+        sn(q, slot(a, id, 0))
+        st(q, ")")
+    } else if k == D_EFFECT {
+        st(q, "Effect(EffectDecl \{ name: ")
+        sn(q, slot(a, id, 0))
+        st(q, ", ops: ")
+        sn(q, slot(a, id, 1))
+        st(q, ", span: {sp} })")
+    } else if k == D_TEST {
+        st(q, "Test(TestDecl \{ name: " + rdebug.str_debug(esc, a.t[id]) + ", params: ")
+        sn(q, slot(a, id, 0))
+        st(q, ", body: ")
+        sn(q, slot(a, id, 1))
+        st(q, ", span: {sp} })")
+    } else if k == D_BENCH {
+        st(q, "Bench(BenchDecl \{ name: " + rdebug.str_debug(esc, a.t[id]) + ", body: ")
+        sn(q, slot(a, id, 0))
+        st(q, ", span: {sp} })")
+    } else if k == D_IMPORT {
+        st(q, "Import(ImportDecl \{ path: ")
+        sn(q, slot(a, id, 0))
+        st(q, ", span: {sp} })")
+    } else if k == D_INTERFACE {
+        st(q, "Interface(InterfaceDecl \{ is_pub: {bool_text(slot(a, id, 0))}, name: ")
+        sn(q, slot(a, id, 1))
+        st(q, ", methods: ")
+        sn(q, slot(a, id, 2))
+        st(q, ", span: {sp} })")
+    } else if k == D_IMPL {
+        st(q, "Impl(ImplDecl \{ iface: ")
+        sn(q, slot(a, id, 0))
+        st(q, ", ty: ")
+        sn(q, slot(a, id, 1))
+        st(q, ", generics: ")
+        sn(q, slot(a, id, 2))
+        st(q, ", bounds: ")
+        sn(q, slot(a, id, 3))
+        st(q, ", type_name: " + rdebug.str_debug(esc, a.t[id]) + ", methods: ")
+        sn(q, slot(a, id, 4))
+        st(q, ", span: {sp} })")
+    } else if k == Y_NAME {
+        st(q, "Name \{ path: ")
+        sn(q, slot(a, id, 0))
+        st(q, ", args: ")
+        sn(q, slot(a, id, 1))
+        st(q, ", span: {sp} }")
+    } else if k == Y_LIST or k == Y_REF {
+        if k == Y_LIST {
+            st(q, "List(")
+        } else {
+            st(q, "Ref(")
+        }
+        sn(q, slot(a, id, 0))
+        st(q, ", {sp})")
+    } else if k == Y_FALLIBLE {
+        st(q, "Fallible(")
+        sn(q, slot(a, id, 0))
+        st(q, ", ")
+        sn(q, slot(a, id, 1))
+        st(q, ", {sp})")
+    } else if k == Y_TUPLE or k == Y_UNION {
+        if k == Y_TUPLE {
+            st(q, "Tuple(")
+        } else {
+            st(q, "Union(")
+        }
+        sn(q, slot(a, id, 0))
+        st(q, ", {sp})")
+    } else if k == Y_FN {
+        st(q, "Fn \{ params: ")
+        sn(q, slot(a, id, 0))
+        st(q, ", ret: ")
+        sn(q, slot(a, id, 1))
+        st(q, ", effects: ")
+        sn(q, slot(a, id, 2))
+        st(q, ", span: {sp} }")
+    } else if k == S_LET {
+        st(q, "Let \{ mutable: {bool_text(slot(a, id, 0))}, name: ")
+        sn(q, slot(a, id, 1))
+        st(q, ", ty: ")
+        so(q, slot(a, id, 2))
+        st(q, ", init: ")
+        sn(q, slot(a, id, 3))
+        st(q, ", span: {sp} }")
+    } else if k == S_LET_TUPLE {
+        st(q, "LetTuple \{ mutable: {bool_text(slot(a, id, 0))}, names: ")
+        sn(q, slot(a, id, 1))
+        st(q, ", init: ")
+        sn(q, slot(a, id, 2))
+        st(q, ", span: {sp} }")
+    } else if k == S_ASSIGN {
+        st(q, "Assign \{ target: ")
+        sn(q, slot(a, id, 0))
+        st(q, ", op: {assign_name(slot(a, id, 1))}, value: ")
+        sn(q, slot(a, id, 2))
+        st(q, ", span: {sp} }")
+    } else if k == S_EXPR {
+        st(q, "Expr(")
+        sn(q, slot(a, id, 0))
+        st(q, ")")
+    } else if k == S_RETURN {
+        st(q, "Return(")
+        so(q, slot(a, id, 0))
+        st(q, ", {sp})")
+    } else if k == S_WHILE {
+        st(q, "While \{ cond: ")
+        sn(q, slot(a, id, 0))
+        st(q, ", body: ")
+        sn(q, slot(a, id, 1))
+        st(q, ", span: {sp} }")
+    } else if k == S_FOR {
+        st(q, "For \{ var: ")
+        sn(q, slot(a, id, 0))
+        st(q, ", iter: ")
+        sn(q, slot(a, id, 1))
+        st(q, ", body: ")
+        sn(q, slot(a, id, 2))
+        st(q, ", span: {sp} }")
+    } else if k == S_PARALLEL or k == S_SPAWN {
+        if k == S_PARALLEL {
+            st(q, "Parallel \{ body: ")
+        } else {
+            st(q, "Spawn \{ body: ")
+        }
+        sn(q, slot(a, id, 0))
+        st(q, ", span: {sp}, concurrent: {bool_text(slot(a, id, 1))} }")
+    } else if k == S_WITH {
+        st(q, "With \{ effect: ")
+        sn(q, slot(a, id, 0))
+        st(q, ", handler: ")
+        sn(q, slot(a, id, 1))
+        st(q, ", body: ")
+        sn(q, slot(a, id, 2))
+        st(q, ", span: {sp} }")
+    } else if k == E_STR {
+        st(q, "Str(")
+        sn(q, slot(a, id, 0))
+        st(q, ", {sp})")
+    } else if k == PC_EXPR {
+        st(q, "Expr(")
+        sn(q, slot(a, id, 0))
+        st(q, ")")
+    } else if k == E_IDENT {
+        st(q, "Ident(")
+        sn(q, slot(a, id, 0))
+        st(q, ")")
+    } else if k == E_LIST or k == E_MAP or k == E_TUPLE {
+        if k == E_LIST {
+            st(q, "List(")
+        } else if k == E_MAP {
+            st(q, "Map(")
+        } else {
+            st(q, "Tuple(")
+        }
+        sn(q, slot(a, id, 0))
+        st(q, ", {sp})")
+    } else if k == E_STRUCT {
+        st(q, "StructLit \{ name: ")
+        sn(q, slot(a, id, 0))
+        st(q, ", base: ")
+        so(q, slot(a, id, 1))
+        st(q, ", fields: ")
+        sn(q, slot(a, id, 2))
+        st(q, ", span: {sp} }")
+    } else if k == E_CALL {
+        st(q, "Call \{ callee: ")
+        sn(q, slot(a, id, 0))
+        st(q, ", args: ")
+        sn(q, slot(a, id, 1))
+        st(q, ", span: {sp} }")
+    } else if k == E_METHOD {
+        st(q, "MethodCall \{ recv: ")
+        sn(q, slot(a, id, 0))
+        st(q, ", name: ")
+        sn(q, slot(a, id, 1))
+        st(q, ", args: ")
+        sn(q, slot(a, id, 2))
+        st(q, ", span: {sp} }")
+    } else if k == E_FIELD {
+        st(q, "Field \{ recv: ")
+        sn(q, slot(a, id, 0))
+        st(q, ", name: ")
+        sn(q, slot(a, id, 1))
+        st(q, ", span: {sp} }")
+    } else if k == E_INDEX {
+        st(q, "Index \{ recv: ")
+        sn(q, slot(a, id, 0))
+        st(q, ", index: ")
+        sn(q, slot(a, id, 1))
+        st(q, ", span: {sp} }")
+    } else if k == E_UNARY {
+        var op = "Neg"
+        if slot(a, id, 0) == 1 {
+            op = "Not"
+        }
+        st(q, "Unary \{ op: {op}, expr: ")
+        sn(q, slot(a, id, 1))
+        st(q, ", span: {sp} }")
+    } else if k == E_BINARY {
+        st(q, "Binary \{ op: {binop_name(slot(a, id, 0))}, lhs: ")
+        sn(q, slot(a, id, 1))
+        st(q, ", rhs: ")
+        sn(q, slot(a, id, 2))
+        st(q, ", span: {sp} }")
+    } else if k == E_RANGE {
+        st(q, "Range \{ start: ")
+        sn(q, slot(a, id, 0))
+        st(q, ", end: ")
+        sn(q, slot(a, id, 1))
+        st(q, ", inclusive: {bool_text(slot(a, id, 2))}, span: {sp} }")
+    } else if k == E_IF {
+        st(q, "If \{ cond: ")
+        sn(q, slot(a, id, 0))
+        st(q, ", then_block: ")
+        sn(q, slot(a, id, 1))
+        st(q, ", else_branch: ")
+        so(q, slot(a, id, 2))
+        st(q, ", span: {sp} }")
+    } else if k == EB_ELSE {
+        st(q, "Else(")
+        sn(q, slot(a, id, 0))
+        st(q, ")")
+    } else if k == EB_ELSEIF {
+        st(q, "ElseIf(")
+        sn(q, slot(a, id, 0))
+        st(q, ")")
+    } else if k == E_MATCH {
+        st(q, "Match \{ scrutinee: ")
+        sn(q, slot(a, id, 0))
+        st(q, ", arms: ")
+        sn(q, slot(a, id, 1))
+        st(q, ", span: {sp} }")
+    } else if k == E_BLOCK or k == E_REGION or k == E_UNSAFE {
+        if k == E_BLOCK {
+            st(q, "Block(")
+        } else if k == E_REGION {
+            st(q, "Region(")
+        } else {
+            st(q, "Unsafe(")
+        }
+        sn(q, slot(a, id, 0))
+        st(q, ")")
+    } else if k == E_TRY {
+        st(q, "Try \{ expr: ")
+        sn(q, slot(a, id, 0))
+        st(q, ", span: {sp} }")
+    } else if k == E_CLOSURE {
+        st(q, "Closure \{ params: ")
+        sn(q, slot(a, id, 0))
+        st(q, ", body: ")
+        sn(q, slot(a, id, 1))
+        st(q, ", span: {sp} }")
+    } else if k == P_BIND {
+        st(q, "Bind(")
+        sn(q, slot(a, id, 0))
+        st(q, ")")
+    } else if k == P_VARIANT {
+        st(q, "Variant \{ path: ")
+        sn(q, slot(a, id, 0))
+        st(q, ", fields: ")
+        sn(q, slot(a, id, 1))
+        st(q, ", span: {sp} }")
+    } else if k == P_TUPLE or k == P_OR {
+        if k == P_TUPLE {
+            st(q, "Tuple(")
+        } else {
+            st(q, "Or(")
+        }
+        sn(q, slot(a, id, 0))
+        st(q, ", {sp})")
+    } else {
+        st(q, "<node {k}>")
+    }
+    push_seq(w, q.t, q.n)
+}

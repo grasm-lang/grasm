@@ -1539,6 +1539,70 @@ design for each before those families move. Fibers need `ctx_switch` and
 `ctx_init` from the backend (§5.5). And no timing: the Grasm runtime's code
 has been measured for correctness only.
 
+### 6.8 S2 part one: the lexer and the parser
+
+`compiler/front` is the frontend in Grasm, up to the AST: the lexer, a
+parser that builds a lossless concrete syntax tree with error nodes, and
+the AST built from that tree. Each is held to the Rust frontend's output,
+not to a description of it, because the Rust frontend's output is what
+every later stage was built against: `grasm tokens` for the lexer, and for
+the rest a dump added beside it, `grasm ast <file.gr>` -- `{:?}` of
+`grasm_syntax::parse`'s module on one line, every node with its span, the
+documentation and the wide literals, then each diagnostic on a line of its
+own. That command is the one change this part makes to the Rust compiler.
+
+**The lexer** (`lex.gr`) produces the Rust lexer's stream token for token:
+every kind, span, literal value, lexical error and message, the leading-dot
+rule, newline runs merged, the unterminated comment's error placed before
+the end of the file. Debug's escapes need Rust's own tables of printable
+and grapheme-extending characters; `scripts/gen_rustdebug.rs` reads them
+from the `rustc` that built `grasm` and writes them into `rdebug.gr`.
+
+**The tree.** The parser (`parse.gr`) makes events, as rust-analyzer's does:
+a node is started and later completed with its kind, or left a tombstone if
+its construct failed, and its tokens then fall to the node around it --
+the error node recovery makes. A node found to have a node before it as its
+first child (`a + b`, once `+` is seen) is started after the fact. Tokens
+are not events: a node owns what was consumed between its events, so a
+rewind is a truncation and a newline skipped in a bracket is never lost.
+`cst.gr` builds the tree, with an interpolation's tokens under the string
+they came from, and prints it back: each token with the trivia between it
+and the token before it in the stream, so a token lost, repeated or moved
+shows in the bytes.
+
+**Decision for decision.** The AST must be the Rust parser's, after error
+recovery as well, so the parser makes the same decisions: the same newline
+modes, lookaheads and rewinds (a `{` read as a map and, failing that, as a
+block, with the same memo), the same recovery points, the same 2048-level
+nesting budget charged at the same tokens. Its quirks are kept where they
+change the output, and the ones that are Rust bugs are recorded in
+docs/known-issues.md rather than copied silently. The AST builder
+(`ast.gr`) visits the tree children-first in one loop and makes every
+desugaring the Rust parser makes as it goes -- `impl` methods as
+`method@Type`, actors, contracts, pipelines, `for (a, b)`, `ref(v)` -- and
+the methods of an `impl` or actor that failed part-way, which the Rust
+parser's queue hands to the next declaration.
+
+**Depth.** The Rust parser caps the tree at 2048 levels and recurses
+within that on a 256 MB stack. The Grasm one recurses too, within the same
+cap, and must stay inside the 6 MB a native Grasm thread has: precedence
+climbing in one loop replaces the Rust parser's function per binary level,
+unary, postfix and primary share a frame, and the shapes the cap does not
+bound -- `^` and `??` chains, `else if` after `else if` -- are loops. With
+the cap lifted it reaches 960 to 2,900 levels depending on the shape, at
+least a third past where the cap stops it. Building the tree, building the
+AST and printing it are loops over explicit stacks.
+
+**What it cost to make fast.** A write through a struct's field costs about
+25 ns and 3.5 ns more for each field the struct has (measured: a push to a
+list field of a 24-field struct takes 130-160 ns, to a list held in its own
+variable 1-3 ns); a struct field passed `inout` is copied in and out, so a
+push inside the call copies the list. The lexer's position and token
+buffer, the parser's events and the tree builder's arrays are therefore
+whole variables, and each struct is assembled once at the end; the first
+AST builder, which passed the AST as a field, took 7.6 s on a 7,000-line
+file and now takes 30 ms. The rest of the compiler will want the same.
+
 ## 7. Bootstrap and trust
 
 - **During the migration:** stage 0 is the Rust-built `grasm`.
@@ -1611,7 +1675,7 @@ Decided 2026-10-20:
    systems subset (§5).
 5. **Linux** in S7.
 
-## 11. Where it stands (2026-10-26)
+## 11. Where it stands (2026-10-27)
 
 Measured, not estimated; each line is a gate's result on master.
 
@@ -1702,8 +1766,47 @@ Measured, not estimated; each line is a gate's result on master.
   16,500,000 math calls identical; `rtcontrols` caught all ten checks of
   nine planted faults. One difference between the runtimes was found, on the
   Grasm side, and fixed (`min`/`max` of a signalling NaN).
-- **Not started:** S2 (the frontend in Grasm), S6 (self-compilation),
-  S7-S9; S5 past part one.
+- **S2 part one done** (§6.8): the lexer and the parser in Grasm
+  (`compiler/front`, about 8,500 lines of Grasm), with a lossless CST and the AST
+  built from it, held to the Rust frontend through `grasm tokens` and the new
+  `grasm ast`. `tokentest`: all 1,888 `.gr` files git tracks, 3,797,541
+  tokens, every stream identical, stdout, stderr and exit status. `asttest`:
+  the same 1,888 files, every AST dump identical -- the five the Rust parser
+  rejects included, after recovery, with all six of their diagnostics -- and
+  every CST printed back to its source byte for byte. `parsediag`: 1,480
+  programs (the 65 conformance negatives, 815 programs read out of the Rust
+  test suites' string literals, 600 from the fuzzer's generator): 706 the
+  Rust parser rejects, each with the same first diagnostic from both; 770
+  accepted by both; 4 on which the Rust lexer panics, the recorded panic.
+  `fuzz_front`: 1,500 mutated, deep, literal, Unicode and random programs,
+  1,484 agreeing on tokens, AST and every diagnostic, 1,248 of them with
+  diagnostics, 16 the recorded Rust panic, none declined, none disagreeing.
+  `frontcontrols` caught all seven planted faults (a token's start and its
+  end one byte off, `while` lexed as a name, `+` and `*` swapped, an error
+  node dropped from the CST, an expected-token diagnostic one byte off, the
+  fuzzer skipping). Five defects of the Rust frontend were found and
+  recorded in docs/known-issues.md, none fixed in Rust: a lexer panic
+  (S1), a block whose value is a map refused (S3), two wrong diagnostics
+  (S4) and exponential time on interpolations nested in blocks. Speed, on
+  the corpus (1,736 files, 450,038 lines), read into memory, best of three
+  per run, median of five runs interleaving the two, 2026-10-27 at 02:11 with
+  the load average 3.1-5.4:
+
+  | stage | Rust frontend | Grasm frontend | Grasm / Rust time |
+  |---|---:|---:|---:|
+  | lex | 4,219k lines/s (107 ms) | 804k lines/s (560 ms) | 5.2x |
+  | lex, parse to the CST | -- | 193k lines/s (2,334 ms) | |
+  | lex, parse, AST | 1,395k lines/s (323 ms) | 113k lines/s (3,977 ms) | 12.3x |
+
+  The Rust side is `grasm_syntax` built at `opt-level=3` with one codegen
+  unit, timed by a harness (not the `grasm` binary); the Grasm side is
+  `front bench` built `--native`. The Rust frontend's `check`, quoted at
+  365-400k lines/s, includes the checker; the Grasm frontend has none yet.
+  Where the time goes was measured once: field writes (§6.8) were most of
+  it until the hot state moved into whole variables, and the AST builder,
+  which still writes through the AST's fields, is 40% of what is left.
+- **Not started:** S2 past part one (resolver, checker, TIR), S6
+  (self-compilation), S7-S9; S5 past part one.
 
 With S4 done, S6 waits on S3's last steps and on S2 and S5, the frontend
 and the runtime in Grasm; they come next, one stage at a time.

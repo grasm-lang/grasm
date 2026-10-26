@@ -134,6 +134,10 @@ run_gate rtswap        scripts/rtswap.sh
 run_gate fuzz_rtfmt    scripts/fuzz_rtfmt.sh
 run_gate fuzz_rtmath   scripts/fuzz_rtmath.sh
 run_gate rtcontrols    scripts/rtcontrols.sh
+run_gate tokentest     scripts/tokentest.sh
+run_gate asttest       scripts/asttest.sh
+run_gate parsediag     scripts/parsediag.sh
+run_gate frontcontrols scripts/frontcontrols.sh
 run_gate reprotest     scripts/reprotest.sh
 run_gate inctest       python3 scripts/inctest.py
 run_gate brokertest    scripts/broker_test.sh
