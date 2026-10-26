@@ -1,0 +1,42 @@
+// `print`'s pieces: a compiled `print("n = {n}")` is a run of calls, one per
+// piece, then a newline ([L-DISPLAY]). The numbers and booleans are turned
+// into text here; the text goes through the Rust runtime's
+// `grasm_out_text`, into the one buffer every writer in the program shares --
+// which stream it is (`eprint` brackets its pieces with
+// `grasm_out_to_stderr`), when it is flushed (each newline, `grasm_out_nl`)
+// and what a panic or an exit flushes first all belong to that buffer, and
+// it stays the Rust runtime's until the last Rust writer has moved
+// (docs/self-hosting.md §6.7, "state").
+import fmt
+import sys
+
+extern fn grasm_out_text(p: addr, n: i64)
+
+fn emit(p: addr, n: i64) {
+    unsafe { grasm_out_text(p, n) }
+}
+
+export fn grt_out_i64(v: i64) {
+    let b = sys.alloc(fmt.INT_MAX)
+    emit(b, fmt.i64_text(v, b))
+    sys.dealloc(b)
+}
+
+/// A `u64`, as the unsigned number its bits are ([T-U64]).
+export fn grt_out_u64(v: i64) {
+    let b = sys.alloc(fmt.INT_MAX)
+    emit(b, fmt.u64_text(v.as_u64(), b))
+    sys.dealloc(b)
+}
+
+export fn grt_out_f64(v: f64) {
+    let b = sys.alloc(fmt.F64_MAX)
+    emit(b, fmt.f64_text(v, b))
+    sys.dealloc(b)
+}
+
+export fn grt_out_bool(v: i8) {
+    let b = sys.alloc(8)
+    emit(b, fmt.bool_text(v != 0, b))
+    sys.dealloc(b)
+}

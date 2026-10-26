@@ -129,6 +129,11 @@ run_gate s3controls    scripts/s3controls.sh
 run_gate linktest      scripts/linktest.sh
 run_gate linkdiff      scripts/linkdiff.sh
 run_gate linkcontrols  scripts/linkcontrols.sh
+run_gate rtlayout      scripts/rtlayout.sh
+run_gate rtswap        scripts/rtswap.sh
+run_gate fuzz_rtfmt    scripts/fuzz_rtfmt.sh
+run_gate fuzz_rtmath   scripts/fuzz_rtmath.sh
+run_gate rtcontrols    scripts/rtcontrols.sh
 run_gate reprotest     scripts/reprotest.sh
 run_gate brokertest    scripts/broker_test.sh
 run_gate audiodiff     scripts/audio_diff.sh

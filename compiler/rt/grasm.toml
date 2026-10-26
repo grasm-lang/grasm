@@ -1,0 +1,10 @@
+[package]
+name = "rt"
+version = "0.1.0"
+entry = "src/main.gr"
+
+# The runtime compiled programs link, being rewritten in Grasm one family of
+# functions at a time (docs/self-hosting.md §6.7, stage S5). It is the C ABI
+# the backends call -- `export fn` -- over raw memory, and it calls the C
+# library and, for what has not moved yet, the Rust runtime by `extern fn`.
+capabilities = ["io", "unsafe", "mem"]

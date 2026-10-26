@@ -1,0 +1,83 @@
+# The runtime's families and where each symbol stands (docs/self-hosting.md
+# §6.7). `scripts/rtswap.sh` reads this and holds the Grasm runtime to it.
+#
+#   <family> <name>    moved: the Grasm runtime exports `grt_<name>`, and
+#                      every program's `grasm_<name>` must bind to it
+#   state <name> ...   the Grasm runtime may call the Rust runtime's
+#                      `grasm_<name>`: state the Rust code still linked shares
+#   backend <name> ... the backend emits a call to `grasm_<name>` in the
+#                      Grasm runtime's own code, as it does in any program's
+#
+# A moved name the Grasm runtime does not export, an export not listed here,
+# or a call to any other `grasm_` name fails the gate: that is a family
+# falling back to Rust without saying so.
+
+math pow_i64
+math pow_u64
+math pow_f64
+math f64_rem
+math i64_abs
+math i64_min
+math i64_max
+math f64_abs
+math f64_sqrt
+math f64_floor
+math f64_ceil
+math f64_round
+math f64_min
+math f64_max
+math f64_sin
+math f64_cos
+math f64_tan
+math f64_asin
+math f64_acos
+math f64_atan
+math f64_sinh
+math f64_cosh
+math f64_tanh
+math f64_exp
+math f64_ln
+math f64_log2
+math f64_log10
+math f64_cbrt
+math f64_to_radians
+math f64_to_degrees
+math f64_atan2
+math f64_hypot
+math f64_log
+math f64_is_nan
+math f64_is_finite
+
+panic panic_div_zero
+panic panic_rem_zero
+panic panic_assert
+panic panic_neg_pow
+
+fmt out_i64
+fmt out_u64
+fmt out_f64
+fmt out_bool
+fmt str_from_i64
+fmt str_from_u64
+fmt str_from_f64
+fmt str_from_bool
+fmt str_build_i64
+fmt str_build_f64
+fmt str_build_bool
+fmt str_pin_i64
+
+strings str_len
+strings str_byte_len
+strings str_is_empty
+strings str_eq
+strings str_cmp
+
+rc val_inc
+rc val_dec
+
+state box_unit     the box allocator: its pool, its live count, the open region
+state val_dec      a box whose count reached zero, released: every payload's walk, the pool, the live count
+state out_text     the output buffer every writer shares, flushed by newlines, panics and exits
+state panic_msg    the way out of a panic: flush stdout, write stderr, exit 101
+backend panic_div_zero   `/` checks its divisor
+backend panic_rem_zero   `%` checks its divisor

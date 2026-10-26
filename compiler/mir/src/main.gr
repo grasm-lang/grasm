@@ -15,21 +15,25 @@ import ssa
 
 /// Reads a program's TIR and builds the MIR of every function `main`
 /// reaches, plus the C entry point. A program outside the subset is an
-/// error naming every construct that put it there.
-pub fn build(src: bytes) -> MirProg ! str {
+/// error naming every construct that put it there. The runtime written in
+/// Grasm (`lib`) is every function its `export fn`s reach, with no C entry
+/// point of its own.
+pub fn build(src: bytes, lib: bool) -> MirProg ! str {
     let t0 = try sexp.read(src)
     let mo = try mono.monomorphize(t0)
     let t = mo.t
-    var info = try prog.index(t)
+    var info = try prog.index(t, lib)
     info.field_ty = mo.field_ty
     var errors: [str] = []
-    let me = info.c_elem[info.main_c]
-    if sexp.kids(t, sexp.kids(t, me)[0]).len() > 0 {
-        errors.push("outside the subset: `main` takes parameters")
-    }
-    let mret = sexp.word(t, me, 4)
-    if mret != "unit" {
-        errors.push("outside the subset: `main` answers {mret}")
+    if not lib {
+        let me = info.c_elem[info.main_c]
+        if sexp.kids(t, sexp.kids(t, me)[0]).len() > 0 {
+            errors.push("outside the subset: `main` takes parameters")
+        }
+        let mret = sexp.word(t, me, 4)
+        if mret != "unit" {
+            errors.push("outside the subset: `main` answers {mret}")
+        }
     }
     var fns: [MirFn] = []
     var strs: [str] = []
@@ -70,7 +74,8 @@ pub fn build(src: bytes) -> MirProg ! str {
         }
     }
     var q = 0
-    var done_own = false
+    // The runtime has no C entry point of its own.
+    var done_own = lib
     while true {
         var c = -2
         if q < order.len() {

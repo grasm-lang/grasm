@@ -5,8 +5,45 @@ Every defect that is known and not fixed, with its severity from
 to paste. S1 and S2 block a release; S3 and S4 do not, and this file is what
 makes shipping them honest rather than quiet.
 
-**Open S1: none confirmed; one under investigation (below). Open S2: none.
-Open S3: none. Open S4: none.**
+**Open S1: one (an incremental native build, below); one under
+investigation (below). Open S2: none. Open S3: none. Open S4: none.**
+
+## Found on 2026-10-26 by S5 part one (the runtime in Grasm)
+
+**An incremental `grasm build --native` of `compiler/link` gave a linker
+that panics on every input -- *open, S1, in the Rust compiler's incremental
+build*.** Changing one module of `compiler/link` (`src/interpose.gr`: a
+loop that fills a `Map[i64, bool]` was added to `apply`, nothing else) and
+rebuilding with the object cache gave a binary that stops at once with
+`panic: stack overflow: recursion too deep`, whatever it links; the same
+source built with `--no-incremental` is right, and the two binaries differ.
+It reproduces every time: on the S5 branch, build `compiler/link` with the
+version of `interpose.gr` before that loop, then put the loop back and
+build again, both incrementally, and run the second binary on any object
+(the version without the loop built incrementally links; the version with
+it built incrementally on top of that panics; the same built clean links).
+The cache key
+(`layout_fingerprint` in `crates/grasm_native`) covers C entries, exports,
+thread-local cells, value structs and inline fields; something else that
+one module's code decides for another's -- the stack-floor argument a
+recursive function takes is the first suspect, since the panic is that
+check failing -- is not in it. Not reduced further and not fixed: the fix
+is in the Rust compiler, which S5 does not touch. Until then, S5's tools
+are built with `--no-incremental`; the gates build theirs in a fresh
+directory each run.
+
+**Which of two equally short digit strings a double prints as is not
+specified -- *not a defect; [L-DISPLAY] is silent*.** `print(1000000000000000.25)`
+prints `1000000000000000.3` in every engine; Python's `repr` gives
+`1000000000000000.2`. The double's exact value is halfway between the two,
+both have the fewest digits that read back as it, and [L-DISPLAY] asks for
+the fewest digits and no more. Rust's `core::num::flt2dec` breaks the tie
+away from zero (its Dragon4 rounds the last digit up when what remains is
+exactly half); Python, JavaScript and Ryu take the even digit. The Grasm
+runtime prints what the Rust one does, as it must, and
+`scripts/fuzz_rtfmt.sh` checks that each such case against Python is
+exactly this tie (19 of the 20,000 doubles its last run held to Python). If
+the clause is ever made to say which, all three engines change together.
 
 ## Under investigation since 2026-10-26: refusals by the system's security policy
 

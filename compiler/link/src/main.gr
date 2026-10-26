@@ -25,6 +25,13 @@
 //     -tool_version <x.y.z>    an LD tool entry in LC_BUILD_VERSION, which
 //                              this linker otherwise leaves out; only for
 //                              comparing bytes with ld (scripts/linkdiff.sh)
+//     -interpose <obj>         link <obj>, a runtime written in Grasm, in
+//                              front of the runtime archive: the other
+//                              objects' references to `_grasm_<name>` bind
+//                              to its `_grt_<name>` where it defines one
+//                              (interpose.gr; docs/self-hosting.md §6.7)
+//     -interpose_log <file>    which runtime names those objects took from
+//                              each side: `grasm <name>` or `rust <name>`
 //
 // The output is a position-independent MH_EXECUTE laid out as ld-prime
 // (here ld-1115.7.3, the Command Line Tools') lays out the same inputs, with its fixups chained
@@ -102,9 +109,10 @@ import unwind
 import apply
 import image
 import ldmap
+import interpose
 
 fn usage() {
-    eprint("usage: link [-o out] [-e sym] [-dead_strip] [-exported_symbol sym]... [-L dir] [-l name] [-syslibroot sdk] [-strip] [-no_uuid] [-map file] [-nostdlib] inputs...")
+    eprint("usage: link [-o out] [-e sym] [-dead_strip] [-exported_symbol sym]... [-L dir] [-l name] [-syslibroot sdk] [-strip] [-no_uuid] [-map file] [-nostdlib] [-interpose obj] [-interpose_log file] inputs...")
     exit(2)
 }
 
@@ -182,7 +190,7 @@ fn find_library(l: Ld, name: str, sdk: str) -> str {
 }
 
 /// Reads one input by its kind.
-fn load(inout l: Ld, path: str, pos: i64) -> () ! str {
+fn load(inout l: Ld, path: str, kind: str, pos: i64) -> () ! str {
     if path.ends_with(".tbd") {
         let text = match read_file(path) {
             Ok(t) -> t
@@ -202,6 +210,9 @@ fn load(inout l: Ld, path: str, pos: i64) -> () ! str {
     } else {
         let fi = try objfile.read(l, path, d, pos * 1000000)
         l.direct.push(fi)
+        if kind == "i" {
+            l.ip_file = fi
+        }
     }
 }
 
@@ -227,11 +238,28 @@ fn run(inout l: Ld) -> () ! str {
                 fail("library '{args[k]}' not found")
             }
         }
-        try load(l, path, k + 1)
+        try load(l, path, kinds[k], k + 1)
     }
     // The header's symbol, then every object's, then archive members on demand.
     let hdr = resolve.gsym(l, "__mh_execute_header")
     l.g_kind[hdr] = state.G_SYNTH
+    // The program's references to the runtime the interposed object
+    // provides take its names before any symbol is entered.
+    if l.ip_file < 0 and l.ip_log != "" {
+        fail("-interpose_log without -interpose")
+    }
+    let ip_lines = interpose.apply(l)
+    if l.ip_log != "" {
+        var text = str_builder()
+        for line in ip_lines {
+            text.push_str(line)
+            text.push_str("\n")
+        }
+        match write_file(l.ip_log, text.to_str()) {
+            Ok(_) -> ()
+            Err(e) -> fail("cannot write {l.ip_log}: {e}")
+        }
+    }
     for fi in l.direct {
         try resolve.add_file(l, fi)
     }
@@ -398,6 +426,18 @@ fn main() {
         } else if x == "-nostdlib" {
             l.nostdlib = true
             i += 1
+        } else if x == "-interpose" and has_next {
+            if l.in_kind.contains("i") {
+                eprint("link: -interpose given twice")
+                usage()
+                return
+            }
+            l.in_kind.push("i")
+            l.in_arg.push(a[i + 1])
+            i += 2
+        } else if x == "-interpose_log" and has_next {
+            l.ip_log = a[i + 1]
+            i += 2
         } else if x == "-L" and has_next {
             l.lib_dirs.push(a[i + 1])
             i += 2

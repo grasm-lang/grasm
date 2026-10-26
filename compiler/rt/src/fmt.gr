@@ -1,0 +1,499 @@
+// Numbers as text, bit-identical to the Rust runtime's: integers in decimal,
+// and a float as Rust's `{}` writes it with `.0` added to a whole number
+// ([L-DISPLAY], `float_text` in the Rust runtime).
+//
+// Rust's `{}` on an `f64` is the shortest digit string that reads back as
+// the same double, laid out without an exponent: `1e300` is a one and three
+// hundred zeros, `5e-324` is `0.` and 323 zeros and a five. Rust finds the
+// digits with Grisu and falls back to Dragon4 when Grisu cannot be sure;
+// both find the shortest digits closest to the value, so they agree
+// whenever Grisu answers, and this is Dragon4 alone, written as `core`'s
+// `flt2dec::strategy::dragon::format_shortest` is -- the same decoding of the
+// double into a value and the half-gaps to its neighbours
+// (`flt2dec::decoder::decode`), the same estimate of the decimal exponent,
+// the same bignum steps, the same rounding at the end -- over 32-bit limbs
+// in raw memory. `scripts/fuzz_rtfmt.py` holds it to the Rust runtime over
+// millions of doubles.
+//
+// Every writer here stores at an address it is given and answers how many
+// bytes it wrote; the callers own the memory. The longest text is a negative
+// subnormal: `-0.` and 323 zeros and 17 digits, 344 bytes (`F64_MAX`).
+import text
+import sys
+
+/// Room enough for any `f64_text`.
+pub let F64_MAX = 352
+/// Room enough for any integer's decimal text (20 digits and a sign).
+pub let INT_MAX = 24
+
+// ----- integers ---------------------------------------------------------------
+
+/// `v`, unsigned, in decimal at `at`.
+pub fn u64_text(v: u64, at: addr) -> i64 {
+    // Written backwards into the top of `at .. at + 20`, then moved down.
+    var n = v
+    var i = 20
+    while true {
+        i -= 1
+        unsafe { at.offset(i).store_u8((n % 10).as_u8() + 48) }
+        n = n / 10
+        if n == 0 {
+            break
+        }
+    }
+    let len = 20 - i
+    var k = 0
+    while k < len {
+        unsafe { at.offset(k).store_u8(at.offset(i + k).load_u8()) }
+        k += 1
+    }
+    len
+}
+
+/// `v` in decimal at `at`: a `-`, then its magnitude, taken unsigned so that
+/// `i64`'s minimum has one.
+pub fn i64_text(v: i64, at: addr) -> i64 {
+    if v >= 0 {
+        return u64_text(v.as_u64(), at)
+    }
+    unsafe { at.store_u8(45) }
+    1 + u64_text((0 - v).as_u64(), unsafe { at.offset(1) })
+}
+
+/// `true` or `false`.
+pub fn bool_text(v: bool, at: addr) -> i64 {
+    if v { text.true_word(at) } else { text.false_word(at) }
+}
+
+// ----- a bignum ---------------------------------------------------------------
+//
+// `core`'s `Big32x40`: forty 32-bit limbs, least significant first, and how
+// many are in use. Laid out at an address as the count (8 bytes) and the
+// limbs (4 bytes each).
+
+fn size(b: addr) -> i64 {
+    unsafe { b.load_i64() }
+}
+
+fn set_size(b: addr, n: i64) {
+    unsafe { b.store_i64(n) }
+}
+
+fn limb(b: addr, i: i64) -> u64 {
+    unsafe { b.offset(8 + 4 * i).load_u32().as_u64() }
+}
+
+fn set_limb(b: addr, i: i64, v: u64) {
+    unsafe { b.offset(8 + 4 * i).store_u32(v.as_u32()) }
+}
+
+fn big_zero(b: addr) {
+    var i = 0
+    while i < 21 {
+        unsafe { b.offset(8 * i).store_i64(0) }
+        i += 1
+    }
+}
+
+fn big_from_u64(b: addr, v: u64) {
+    big_zero(b)
+    var x = v
+    var n = 0
+    while x > 0 {
+        set_limb(b, n, x.bit_and(0xffff_ffff))
+        x = x.ushr(32)
+        n += 1
+    }
+    set_size(b, n)
+}
+
+fn big_copy(dst: addr, src: addr) {
+    var i = 0
+    while i < 21 {
+        unsafe { dst.offset(8 * i).store_i64(src.offset(8 * i).load_i64()) }
+        i += 1
+    }
+}
+
+/// -1, 0 or 1 as `a` is less than, equal to or greater than `b`.
+fn big_cmp(a: addr, b: addr) -> i64 {
+    var i = size(a)
+    if size(b) > i {
+        i = size(b)
+    }
+    i -= 1
+    while i >= 0 {
+        let x = limb(a, i)
+        let y = limb(b, i)
+        if x != y {
+            return if x < y { -1 } else { 1 }
+        }
+        i -= 1
+    }
+    0
+}
+
+/// `a += b`.
+fn big_add(a: addr, b: addr) {
+    var n = size(a)
+    if size(b) > n {
+        n = size(b)
+    }
+    var carry: u64 = 0
+    var i = 0
+    while i < n {
+        let s = limb(a, i) + limb(b, i) + carry
+        set_limb(a, i, s.bit_and(0xffff_ffff))
+        carry = s.ushr(32)
+        i += 1
+    }
+    if carry > 0 {
+        set_limb(a, n, carry)
+        n += 1
+    }
+    set_size(a, n)
+}
+
+/// `a -= b`, where `a >= b`.
+fn big_sub(a: addr, b: addr) {
+    var n = size(a)
+    if size(b) > n {
+        n = size(b)
+    }
+    var borrow = 0
+    var i = 0
+    while i < n {
+        var d = limb(a, i).as_i64() - limb(b, i).as_i64() - borrow
+        if d < 0 {
+            d += 4294967296
+            borrow = 1
+        } else {
+            borrow = 0
+        }
+        set_limb(a, i, d.as_u64())
+        i += 1
+    }
+    while n > 0 and limb(a, n - 1) == 0 {
+        n -= 1
+    }
+    set_size(a, n)
+}
+
+/// `a *= m`, where `m < 2^32`.
+fn big_mul_small(a: addr, m: u64) {
+    var n = size(a)
+    var carry: u64 = 0
+    var i = 0
+    while i < n {
+        let p = limb(a, i) * m + carry
+        set_limb(a, i, p.bit_and(0xffff_ffff))
+        carry = p.ushr(32)
+        i += 1
+    }
+    if carry > 0 {
+        set_limb(a, n, carry)
+        n += 1
+    }
+    set_size(a, n)
+}
+
+/// `a *= 2^bits`.
+fn big_mul_pow2(a: addr, bits: i64) {
+    let words = bits / 32
+    let shift = bits % 32
+    let n = size(a)
+    if n == 0 {
+        return
+    }
+    // Whole limbs first, from the top down.
+    var i = n - 1
+    while i >= 0 {
+        set_limb(a, i + words, limb(a, i))
+        i -= 1
+    }
+    var j = 0
+    while j < words {
+        set_limb(a, j, 0)
+        j += 1
+    }
+    var m = n + words
+    if shift > 0 {
+        // Then the bits, carrying each limb's top into the next.
+        let top = limb(a, m - 1).ushr(32 - shift)
+        var k = m - 1
+        while k > words {
+            let v = limb(a, k).shl(shift).bit_or(limb(a, k - 1).ushr(32 - shift))
+            set_limb(a, k, v.bit_and(0xffff_ffff))
+            k -= 1
+        }
+        set_limb(a, words, limb(a, words).shl(shift).bit_and(0xffff_ffff))
+        if top > 0 {
+            set_limb(a, m, top)
+            m += 1
+        }
+    }
+    set_size(a, m)
+}
+
+/// `a *= 10^n`.
+fn big_mul_pow10(a: addr, n: i64) {
+    var k = n
+    while k >= 9 {
+        big_mul_small(a, 1000000000)
+        k -= 9
+    }
+    var p: u64 = 1
+    while k > 0 {
+        p = p * 10
+        k -= 1
+    }
+    if p > 1 {
+        big_mul_small(a, p)
+    }
+}
+
+// ----- shortest digits: `core`'s Dragon4 ------------------------------------------
+
+/// Whether `c` (a comparison's -1, 0 or 1) is "less" under `core`'s
+/// `rounding`: `a <= b` when the interval includes its ends, `a < b` when not.
+fn below(c: i64, inclusive: bool) -> bool {
+    if inclusive { c <= 0 } else { c < 0 }
+}
+
+/// `core`'s `estimate_scaling_factor`: `k0` with `10^(k0-1) < m * 2^e <=
+/// 10^(k0+1)`, never above the true exponent.
+fn estimate_k(m: u64, e: i64) -> i64 {
+    let nbits = 64 - (m - 1).leading_zeros()
+    ((nbits + e) * 1292913986).shr(32)
+}
+
+/// The shortest digits of `mant * 2^exp`, whose neighbours are `minus` below
+/// and `plus` above (in units of `2^exp`, halved), written at `digits`;
+/// answers how many, and sets `k` so the value is `0.d1d2.. * 10^k`.
+fn shortest(mant: u64, minus: u64, plus: u64, exp: i64, inclusive: bool, digits: addr, inout k_out: i64) -> i64 {
+    let work = sys.alloc_zeroed(8 * 168)
+    let m = work
+    let mn = unsafe { work.offset(168) }
+    let pl = unsafe { work.offset(2 * 168) }
+    let sc = unsafe { work.offset(3 * 168) }
+    let sc2 = unsafe { work.offset(4 * 168) }
+    let sc4 = unsafe { work.offset(5 * 168) }
+    let sc8 = unsafe { work.offset(6 * 168) }
+    let tmp = unsafe { work.offset(7 * 168) }
+    var k = estimate_k(mant + plus, exp)
+    big_from_u64(m, mant)
+    big_from_u64(mn, minus)
+    big_from_u64(pl, plus)
+    big_from_u64(sc, 1)
+    if exp < 0 {
+        big_mul_pow2(sc, 0 - exp)
+    } else {
+        big_mul_pow2(m, exp)
+        big_mul_pow2(mn, exp)
+        big_mul_pow2(pl, exp)
+    }
+    if k >= 0 {
+        big_mul_pow10(sc, k)
+    } else {
+        big_mul_pow10(m, 0 - k)
+        big_mul_pow10(mn, 0 - k)
+        big_mul_pow10(pl, 0 - k)
+    }
+    // The estimate is low by one when `mant + plus` reaches `scale`.
+    big_copy(tmp, m)
+    big_add(tmp, pl)
+    if below(big_cmp(sc, tmp), inclusive) {
+        k += 1
+    } else {
+        big_mul_small(m, 10)
+        big_mul_small(mn, 10)
+        big_mul_small(pl, 10)
+    }
+    big_copy(sc2, sc)
+    big_mul_pow2(sc2, 1)
+    big_copy(sc4, sc)
+    big_mul_pow2(sc4, 2)
+    big_copy(sc8, sc)
+    big_mul_pow2(sc8, 3)
+    var down = false
+    var up = false
+    var i = 0
+    while true {
+        // One digit: `floor(mant / scale)`, by subtracting 8, 4, 2 and 1
+        // times the scale.
+        var d = 0
+        if big_cmp(m, sc8) >= 0 {
+            big_sub(m, sc8)
+            d += 8
+        }
+        if big_cmp(m, sc4) >= 0 {
+            big_sub(m, sc4)
+            d += 4
+        }
+        if big_cmp(m, sc2) >= 0 {
+            big_sub(m, sc2)
+            d += 2
+        }
+        if big_cmp(m, sc) >= 0 {
+            big_sub(m, sc)
+            d += 1
+        }
+        unsafe { digits.offset(i).store_u8((48 + d).as_u8()) }
+        i += 1
+        // Stop when the digits so far are within reach of the value from
+        // below (`down`) or from above (`up`).
+        down = below(big_cmp(m, mn), inclusive)
+        big_copy(tmp, m)
+        big_add(tmp, pl)
+        up = below(big_cmp(sc, tmp), inclusive)
+        if down or up {
+            break
+        }
+        big_mul_small(m, 10)
+        big_mul_small(mn, 10)
+        big_mul_small(pl, 10)
+    }
+    // Round the last digit up when only `up` holds, or when both do and
+    // what remains is at least half the scale.
+    var round = up and not down
+    if up and down {
+        big_mul_pow2(m, 1)
+        round = big_cmp(m, sc) >= 0
+    }
+    if round {
+        // `core`'s `round_up`: the last digit that is not a 9 goes up and
+        // the nines after it become zeros; all nines become `1000..` with
+        // one more digit and the exponent one higher.
+        var j = i - 1
+        while j >= 0 and unsafe { digits.offset(j).load_u8() } == 57 {
+            j -= 1
+        }
+        if j >= 0 {
+            unsafe { digits.offset(j).store_u8(digits.offset(j).load_u8() + 1) }
+            var z = j + 1
+            while z < i {
+                unsafe { digits.offset(z).store_u8(48) }
+                z += 1
+            }
+        } else {
+            unsafe { digits.store_u8(49) }
+            var z = 1
+            while z < i {
+                unsafe { digits.offset(z).store_u8(48) }
+                z += 1
+            }
+            unsafe { digits.offset(i).store_u8(48) }
+            i += 1
+            k += 1
+        }
+    }
+    sys.dealloc(work)
+    k_out = k
+    i
+}
+
+/// `x` as the Rust runtime's `float_text` writes it, at `at`.
+pub fn f64_text(x: f64, at: addr) -> i64 {
+    let bits = x.to_bits().as_u64()
+    let negative = bits.ushr(63) == 1
+    let field = bits.ushr(52).bit_and(0x7ff).as_i64()
+    let frac = bits.bit_and(0x000f_ffff_ffff_ffff)
+    if field == 0x7ff {
+        if frac != 0 {
+            return text.nan_word(at)
+        }
+        if negative {
+            unsafe { at.store_u8(45) }
+            return 1 + text.inf_word(unsafe { at.offset(1) })
+        }
+        return text.inf_word(at)
+    }
+    var n = 0
+    if negative {
+        unsafe { at.store_u8(45) }
+        n = 1
+    }
+    if field == 0 and frac == 0 {
+        // `0`, and the point `float_text` adds.
+        unsafe {
+            at.offset(n).store_u8(48)
+            at.offset(n + 1).store_u8(46)
+            at.offset(n + 2).store_u8(48)
+        }
+        return n + 3
+    }
+    // `core`'s `decode`, from `integer_decode`'s mantissa and exponent.
+    var mant: u64 = 0
+    var exp = 0
+    if field == 0 {
+        mant = frac.shl(1)
+        exp = 0 - 1075
+    } else {
+        mant = frac.bit_or(0x0010_0000_0000_0000)
+        exp = field - 1075
+    }
+    let inclusive = mant.bit_and(1) == 0
+    var minus: u64 = 1
+    var plus: u64 = 1
+    if field != 0 {
+        if mant == 0x0010_0000_0000_0000 {
+            mant = mant.shl(2)
+            plus = 2
+            exp -= 2
+        } else {
+            mant = mant.shl(1)
+            exp -= 1
+        }
+    }
+    let digits = sys.alloc(32)
+    var k = 0
+    let count = shortest(mant, minus, plus, exp, inclusive, digits, k)
+    // `core`'s `digits_to_dec_str` with no fraction digits asked for, then
+    // `float_text`'s `.0` when there is no point.
+    if k <= 0 {
+        unsafe {
+            at.offset(n).store_u8(48)
+            at.offset(n + 1).store_u8(46)
+        }
+        n += 2
+        var z = 0
+        while z < 0 - k {
+            unsafe { at.offset(n).store_u8(48) }
+            n += 1
+            z += 1
+        }
+        n = copy_digits(digits, 0, count, at, n)
+    } else if k < count {
+        n = copy_digits(digits, 0, k, at, n)
+        unsafe { at.offset(n).store_u8(46) }
+        n += 1
+        n = copy_digits(digits, k, count, at, n)
+    } else {
+        n = copy_digits(digits, 0, count, at, n)
+        var z = 0
+        while z < k - count {
+            unsafe { at.offset(n).store_u8(48) }
+            n += 1
+            z += 1
+        }
+        unsafe {
+            at.offset(n).store_u8(46)
+            at.offset(n + 1).store_u8(48)
+        }
+        n += 2
+    }
+    sys.dealloc(digits)
+    n
+}
+
+/// Digits `from .. to` of `digits`, at `at + n`; answers the new `n`.
+fn copy_digits(digits: addr, from: i64, to: i64, at: addr, n: i64) -> i64 {
+    var i = from
+    var w = n
+    while i < to {
+        unsafe { at.offset(w).store_u8(digits.offset(i).load_u8()) }
+        w += 1
+        i += 1
+    }
+    w
+}

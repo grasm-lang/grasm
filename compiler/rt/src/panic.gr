@@ -1,0 +1,88 @@
+// Panics: the message, and the way out ([E-PANIC-EXIT]).
+//
+// A panic flushes what the program has written to stdout, writes `panic:
+// <message>` to stderr and exits 101. The buffers it flushes are the Rust
+// runtime's, and every Rust function still linked writes and panics through
+// them, so the way out stays the Rust runtime's `grasm_panic_msg` until the
+// output buffers move (docs/self-hosting.md §6.7, "state"); what moves here
+// is which panics there are and what each says.
+import text
+import sys
+
+extern fn grasm_panic_msg(p: addr, n: i64)
+
+/// Room for any of `text`'s messages. Never freed: nothing returns from a
+/// panic.
+fn buf() -> addr {
+    sys.alloc(64)
+}
+
+pub fn div_zero() {
+    let b = buf()
+    let n = text.div_zero(b)
+    unsafe { grasm_panic_msg(b, n) }
+}
+
+pub fn rem_zero() {
+    let b = buf()
+    let n = text.rem_zero(b)
+    unsafe { grasm_panic_msg(b, n) }
+}
+
+pub fn assert_failed() {
+    let b = buf()
+    let n = text.assert_failed(b)
+    unsafe { grasm_panic_msg(b, n) }
+}
+
+pub fn neg_pow() {
+    let b = buf()
+    let n = text.neg_pow(b)
+    unsafe { grasm_panic_msg(b, n) }
+}
+
+pub fn uaf_inc() {
+    let b = buf()
+    let n = text.uaf_inc(b)
+    unsafe { grasm_panic_msg(b, n) }
+}
+
+pub fn uaf_dec() {
+    let b = buf()
+    let n = text.uaf_dec(b)
+    unsafe { grasm_panic_msg(b, n) }
+}
+
+export fn grt_panic_div_zero() {
+    div_zero()
+}
+
+export fn grt_panic_rem_zero() {
+    rem_zero()
+}
+
+export fn grt_panic_assert() {
+    assert_failed()
+}
+
+export fn grt_panic_neg_pow() {
+    neg_pow()
+}
+
+pub fn byte_len_not_str() {
+    let b = buf()
+    let n = text.byte_len_not_str(b)
+    unsafe { grasm_panic_msg(b, n) }
+}
+
+pub fn expected_str() {
+    let b = buf()
+    let n = text.expected_str(b)
+    unsafe { grasm_panic_msg(b, n) }
+}
+
+pub fn len_not_str() {
+    let b = buf()
+    let n = text.len_not_str(b)
+    unsafe { grasm_panic_msg(b, n) }
+}

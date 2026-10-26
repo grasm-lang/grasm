@@ -1,0 +1,191 @@
+// Strings, read: their length in bytes, whether empty, equality and order.
+//
+// The text of a string value is inline in its box or in a `String` the box
+// holds (`layout.gr`, "Str"); these find it and read it, and allocate
+// nothing. Equality and order are the bytes', as Rust's `str` has them:
+// UTF-8's byte order is its code points' order.
+import layout
+import panic
+import sys
+
+extern fn memcmp(a: addr, b: addr, n: i64) -> i32
+
+/// Text shorter than this is counted on each `len` rather than indexed: the
+/// Rust runtime's `LEN_CACHE_MIN`. When the index is built decides only how
+/// fast `len` is, never what it answers.
+let LEN_CACHE_MIN = 256
+/// A `CharIndex`'s size: its `Vec` and its `u32` count, padded to 8.
+let INDEX_BYTES = 32
+
+/// Where `v`'s text is, with its length in `n`; the null address when `v`
+/// is not a string.
+pub fn text_of(v: addr, inout n: i64) -> addr {
+    unsafe {
+        if v.offset(layout.TAG).load_u8().as_i64() != layout.TAG_STR {
+            n = 0
+            return mem_addr(0)
+        }
+        if v.offset(layout.STR_DISC).load_u8().as_i64() == layout.STR_INLINE {
+            n = v.offset(layout.STR_LEN).load_u8().as_i64()
+            return v.offset(layout.STR_BYTES)
+        }
+        let s = v.offset(layout.STR_STRING)
+        n = s.offset(layout.VEC_LEN).load_i64()
+        s.offset(layout.VEC_PTR).load_addr()
+    }
+}
+
+fn is_str(v: addr) -> bool {
+    unsafe { v.offset(layout.TAG).load_u8().as_i64() == layout.TAG_STR }
+}
+
+export fn grt_str_byte_len(v: addr) -> i64 {
+    if not is_str(v) {
+        panic.byte_len_not_str()
+    }
+    var n = 0
+    let _p = text_of(v, n)
+    n
+}
+
+export fn grt_str_is_empty(v: addr) -> i8 {
+    if not is_str(v) {
+        panic.expected_str()
+    }
+    var n = 0
+    let _p = text_of(v, n)
+    if n == 0 { 1 } else { 0 }
+}
+
+/// Whether the `n` bytes at `p` are all ASCII.
+fn ascii(p: addr, n: i64) -> bool {
+    var i = 0
+    while i + 8 <= n {
+        if unsafe { p.offset(i).load_u64() }.bit_and(0x8080_8080_8080_8080) != 0 {
+            return false
+        }
+        i += 8
+    }
+    while i < n {
+        if unsafe { p.offset(i).load_u8() } >= 128 {
+            return false
+        }
+        i += 1
+    }
+    true
+}
+
+/// Whether the byte at `p + i` starts a character: it does not continue one.
+fn starts(p: addr, i: i64) -> bool {
+    unsafe { p.offset(i).load_u8() }.bit_and(0xc0) != 0x80
+}
+
+fn count_chars(p: addr, n: i64) -> i64 {
+    var c = 0
+    var i = 0
+    while i < n {
+        if starts(p, i) {
+            c += 1
+        }
+        i += 1
+    }
+    c
+}
+
+/// Characters, not bytes ([L-LIB-STR]), as `RtStr::char_len` answers: short
+/// text is counted; text of `LEN_CACHE_MIN` bytes and more is counted once
+/// into the string's character index, which every later question reads --
+/// `while i < s.len()` over long text would otherwise be quadratic. The
+/// index is the Rust runtime's `CharIndex`: for ASCII a count and no
+/// offsets, otherwise the byte offset of every character, which its `substr`
+/// and `code_at` read; it is published as `IndexCell::set` publishes it,
+/// unless another thread got there first.
+export fn grt_str_len(v: addr) -> i64 {
+    if not is_str(v) {
+        panic.len_not_str()
+    }
+    var n = 0
+    let p = text_of(v, n)
+    if n < LEN_CACHE_MIN {
+        return if ascii(p, n) { n } else { count_chars(p, n) }
+    }
+    unsafe {
+        let cell = v.offset(layout.STR_INDEX)
+        let have = cell.atomic_load_i64(Acquire)
+        if have != 0 {
+            return mem_addr(have).offset(layout.CHARINDEX_COUNT).load_u32().as_i64()
+        }
+        let made = sys.alloc(INDEX_BYTES)
+        let vec = made.offset(layout.CHARINDEX_VEC)
+        var count = n
+        var offs = mem_addr(layout.U32_DANGLING)
+        var cap = 0
+        if not ascii(p, n) {
+            count = count_chars(p, n)
+            offs = sys.alloc(4 * count)
+            cap = count
+            var j = 0
+            var i = 0
+            while i < n {
+                if starts(p, i) {
+                    offs.offset(4 * j).store_u32(i.as_u32())
+                    j += 1
+                }
+                i += 1
+            }
+        }
+        vec.offset(layout.VEC_PTR).store_addr(offs)
+        vec.offset(layout.VEC_LEN).store_i64(cap)
+        vec.offset(layout.VEC_CAP).store_i64(cap)
+        made.offset(layout.CHARINDEX_COUNT).store_u32(count.as_u32())
+        let was = cell.atomic_cas_i64(0, made.as_i64(), AcqRel)
+        if was != 0 {
+            if cap > 0 {
+                sys.dealloc(offs)
+            }
+            sys.dealloc(made)
+            return mem_addr(was).offset(layout.CHARINDEX_COUNT).load_u32().as_i64()
+        }
+        count
+    }
+}
+
+/// Equal texts; anything that is not a pair of strings is unequal.
+export fn grt_str_eq(a: addr, b: addr) -> i8 {
+    if not is_str(a) or not is_str(b) {
+        return 0
+    }
+    var na = 0
+    var nb = 0
+    let pa = text_of(a, na)
+    let pb = text_of(b, nb)
+    if na != nb {
+        return 0
+    }
+    if na == 0 {
+        return 1
+    }
+    if unsafe { memcmp(pa, pb, na) } == 0 { 1 } else { 0 }
+}
+
+/// -1, 0 or 1 by the texts' bytes; 0 when either is not a string.
+export fn grt_str_cmp(a: addr, b: addr) -> i64 {
+    if not is_str(a) or not is_str(b) {
+        return 0
+    }
+    var na = 0
+    var nb = 0
+    let pa = text_of(a, na)
+    let pb = text_of(b, nb)
+    let m = if na < nb { na } else { nb }
+    if m > 0 {
+        let c = unsafe { memcmp(pa, pb, m) }
+        if c < 0 {
+            return -1
+        }
+        if c > 0 {
+            return 1
+        }
+    }
+    if na < nb { -1 } else if na > nb { 1 } else { 0 }
+}

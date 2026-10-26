@@ -1137,6 +1137,334 @@ on paths it never runs, and a descriptor left unbound runs anyway, because
 dyld writes its own thunk into every descriptor it loads -- only the image
 is wrong, and `dyld_info -fixups` says so.
 
+### 6.7 S5 part one: the runtime in Grasm, beside the Rust one
+
+**The inventory, measured.** `libgrasm_rt_abi.a` exports 345 C entry
+points, `_grasm_*`, over 17,362 lines of Rust in the five crates a compiled
+program links (`grasm_rt` 12,429 with `tasks.rs`, `grasm_sys` 3,594,
+`grasm_fiber` 561, `grasm_journal` 660, `grasm_rt_abi` 118).
+`scripts/rtinventory.py` measures the table below and reproduces it. Two
+sources, each for what it can say exactly:
+
+- *the compiled archive*: each family's entry points are followed through
+  the relocations of the archive's 401 objects to every function they can
+  reach; that gives the machine code by crate, the modules of `core`,
+  `alloc` and `hashbrown` reached, and the C library functions called. It
+  is exact for what was compiled, inlined code counted in its caller.
+- *the source*: the lines of the entry points themselves, and of the items
+  (functions, types with their `impl` blocks, statics) their calls and types
+  reach, split into the lines only this family reaches and the lines it
+  shares with others. Naming is not calling, so the second figure is an
+  estimate; about 4,400 lines -- the value representation, `display`, the
+  release walk, the panic path -- are reached by every family.
+- *the corpus*: which entry points the corpus's objects name in a
+  relocation (`scripts/rtswap.sh`, every program with a `main` but the SDL
+  ones). The Cranelift backend declares every runtime function in every
+  object, used or not, so an undefined symbol alone says nothing.
+
+| family | entry points | named by the corpus | moved to Grasm | Rust lines: entry points / reached only here / shared | machine code reached, KB: ours / `core`+`alloc` / `hashbrown` | from `core`, `alloc`, `hashbrown` beyond the common set | C library beyond the common set |
+|---|---:|---:|---:|---|---|---|---|
+| values and counting | 22 | 18 | 2 | 380 / 462 / 4,560 | 27.3 / 12.2 / 0.8 | `alloc::collections`, `alloc::vec`, `hashbrown::map` | `getenv` (the leak check), `memcmp`, `memmove`, `strlen` |
+| number formatting and parsing | 19 | 17 | 8 | 223 / 300 / 4,494 | 22.2 / 36.6 / 0.3 | `core::num` (`flt2dec`, `dec2flt`), `core::char`, `core::unicode`, `alloc::fmt`, `alloc::string` | `bzero`, `memmove`, `memset` |
+| output | 9 | 9 | 4 | 71 / 84 / 4,364 | 25.5 / 38.7 / 0.3 | `core::num`, `alloc::fmt`, `alloc::string` | `bzero`, `memcmp`, `memset` |
+| panics, exit, stack floor | 13 | 12 | 4 | 151 / 142 / 4,488 | 23.9 / 40.2 / 0.8 | `core::num`, `alloc::fmt`, `alloc::string`, `hashbrown::map` | `bzero`, `memcmp`, `memset` |
+| math | 38 | 33 | 35 | 202 / 314 / 4,382 | 5.5 / 6.5 / 0.3 | -- | libm: `sin` ... `tanh`, `pow`, `fmod`, `hypot`, `cbrt`, `sqrt` (19) |
+| strings | 51 | 49 | 5 | 696 / 685 / 4,841 | 43.3 / 61.1 / 0.3 | `core::unicode`, `core::char`, `core::num`, `alloc::ffi`, `alloc::str`, `alloc::string` | `bzero`, `memcmp`, `memset`, `strlen` |
+| bytes | 21 | 21 | 0 | 312 / 381 / 4,711 | 35.1 / 16.6 / 3.0 | `alloc::fmt`, `alloc::string` | files: `open`, `read`, `close`, `strerror`; `memchr`, `calloc` |
+| lists and ranges | 52 | 46 | 0 | 1,238 / 1,383 / 4,733 | 68.3 / 78.4 / 3.5 | `core::num`, `alloc::str`, `alloc::string`, `hashbrown::map` | directories: `opendir`, `readdir`, `closedir`; files |
+| maps and hashing | 15 | 14 | 0 | 334 / 402 / 4,364 | 39.2 / 47.2 / 3.6 | `hashbrown::map`, `core::num`, `alloc::slice`, `alloc::string` | `getentropy` (the hash seed) |
+| structs, variants, tuples, results | 29 | 29 | 0 | 619 / 631 / 4,389 | 22.0 / 8.5 / 0.3 | -- | `memcmp` |
+| function values, effect handlers | 15 | 14 | 0 | 218 / 201 / 4,592 | 29.1 / 14.4 / 3.0 | `alloc::fmt`, `alloc::string` | files (the journal) |
+| generational references | 6 | 6 | 0 | 186 / 189 / 4,417 | 13.9 / 8.1 / 0.3 | -- | -- |
+| args, files, clock, net, proc, C, raw memory | 42 | 42 | 0 | 539 / 2,604 / 5,034 | 94.4 / 19.1 / 3.0 | `alloc::fmt`, `alloc::string` | 55: sockets, `getaddrinfo`, `kqueue`/`kevent`, `fork`/`execvp`/`waitpid`/`pipe`/`poll`, the file system, `clock_gettime`, `nanosleep`, `pthread_create` and `rwlock`s |
+| tasks, channels, fibers, parallelism | 13 | 13 | 0 | 597 / 945 / 4,535 | 42.5 / 19.5 / 0.3 | `alloc::boxed`, `alloc::collections` | `mmap`, `mprotect`, `munmap` (fiber stacks), `pthread_create`/`join`, `sysconf` |
+| **all** | **345** | **323** | **58** | 17,362 in the five crates | | | |
+
+Every family reaches the same sixteen C functions: `malloc`, `realloc`,
+`free`, `posix_memalign` and `memcpy` (the global allocator), `write` and
+`exit` (output and the way out), `__error`, and the `pthread` mutex and key
+functions behind the output buffers' locks and the thread-local state.
+Beyond them, what each reaches is the table's last column: libm for math,
+`getentropy` for maps, the file system and sockets and `fork`/`execvp` for
+args/files/net/proc, `mmap`/`mprotect` and `pthread_create` for the tasks.
+From Rust's own libraries every family takes `alloc::alloc`,
+`alloc::raw_vec` and `alloc::sync`, `core::fmt` and `core::panicking` (the
+panic messages are `format!`ed), and `hashbrown::raw` (any value's release
+can reach a map's); beyond those, number formatting and parsing takes
+`core::num` (Grisu and Dragon4 in `flt2dec`, and `dec2flt`), strings
+`core::unicode` and `core::char`, maps `hashbrown::map`, tasks
+`alloc::collections` and `alloc::boxed`.
+
+The corpus's objects -- the Cranelift backend's for the 648 programs with a
+`main` that link no system library -- name 323 of the 345 entry points. The
+22 they never name include four the backends do without a call (`f64_abs`,
+`f64_sqrt`, `f64_floor`, `f64_ceil` are an instruction each) and two reached
+only from inside the runtime (`pow_u64` and `panic_neg_pow`, through
+`pow_i64`); the rest are `env_data`, `live_allocations`,
+`map_get_ptr_bytes`, `range_start`, `range_end`, `range_inclusive`,
+`region_push`, `region_pop`, `str_build_end_inline`, `str_from_u64`,
+`str_parse_u64_base`, `u64_to_char`, `val_release`, `vals_data`, `vals_len`
+and `vals_pin`. `scripts/fuzz_rtmath.sh` calls the math ones by name for
+that reason, and `fuzz_rtfmt` reaches `str_from_u64`.
+
+**How a Grasm runtime is built.** `compiler/rt/` is a Grasm package in the
+systems subset (§5): `addr` and raw memory, atomics, `extern fn` to the C
+library, and an `export fn` per C entry point. It is built by our own
+toolchain -- `grasm tir compiler/rt/src/main.gr`, then `s3 rt.tir -o rt.o
+--runtime` -- and nothing in it is Rust's or Cranelift's. `--runtime` is the
+one thing the Grasm backend lacked (`compiler/mir`, `compiler/s3`): a
+program has a `main` and is reached from it; the runtime has none, is
+reached from its exports, and gets no C entry point of its own; and its
+calls to C are its own, so they are not reported to `grasm_foreign_call`,
+which under `GRASM_REPLAY` would refuse them as a program's. Objects of
+programs built without the flag are unchanged: the same TIR compiled by the
+backend before and after gives the same bytes (109 corpus programs
+compared). The backend's own lowering still calls the Rust runtime in two
+places in the runtime's code -- `/` and `%` check their divisor through
+`grasm_panic_div_zero` and `grasm_panic_rem_zero` -- and `families.txt`
+lists both as the backend's. The code keeps four rules, each for a reason
+the language gives:
+
+- *no Grasm heap value* -- no `str`, list, map, struct, tuple or closure,
+  only layout types and raw memory -- because every heap value is made by
+  the runtime being written;
+- *no thread-local cell*: a program's cells and the runtime's would share
+  the one block `grasm_tls_block` hands out, laid out by each compilation
+  separately, so they would overlap. Per-thread runtime state waits for the
+  backend to give the runtime cells of its own (Mach-O thread-local
+  variables, which `compiler/link` already links);
+- *no process-wide state*: Grasm has no global, by design (§5.3). The Rust
+  runtime keeps a few -- the map hash seed, the interned boxes, the
+  reference slab, the channel table -- and they stay there until a way to
+  hold one is designed (a §5-style addition, not made here);
+- *fixed text is code*: Grasm has no static bytes, so each message is a
+  function storing its words (`compiler/rt/src/text.gr`, written by
+  `gen_text.py`, which the gates check is current).
+
+A Grasm `export fn` may not be named `grasm_*` ([T-EXPORT] reserves it for
+the toolchain), so the runtime's are `grt_<name>`, and the linker binds
+them (below). That keeps the reservation, the checker and the language as
+they are.
+
+**How it coexists with the Rust archive: interposition by our linker.**
+`compiler/link -interpose rt.o` loads the Grasm runtime's object in front
+of `libgrasm_rt_abi.a`, and every reference *from another object named on
+the command line* -- the program's -- to `_grasm_<name>` binds to
+`_grt_<name>` where `rt.o` defines one. Every other reference binds as it
+would without it: the Grasm runtime's own `extern fn grasm_<name>` reaches
+the archive's, and the archive's members reach each other. That is what
+dyld's interposing does for a dylib, and for the same two reasons. The
+replacement can call the original, which is how a family that has moved
+uses what has not. And nothing the original binds internally is
+redirected -- which is not a loss: almost every call inside the Rust
+runtime is to an internal function (`alloc`, `dec`, `display`, `emit`),
+not to its exported name, and no link-time step can redirect those. Nothing
+in the archive is renamed or dropped, so a family is moved by defining its
+`grt_` names and nothing else. `-interpose_log` writes which runtime names
+the program's objects took from each side, which is what the gates count.
+
+The other two designs the brief offered were weighed and not taken. *Our
+definitions over the archive's for the same name* needs the Grasm runtime
+to define `_grasm_*`, which [T-EXPORT] forbids, and a rule for the
+archive's own references that either reaches Grasm code from inside Rust
+code that cannot be redirected anyway, or does not -- in which case it is
+interposition. *A link-time rename of the archive's replaced symbols* works
+the same at run time but leaves the archive's own symbol table lying about
+what it defines; interposition states the binding where it is made.
+
+**State moves last.** The Rust code that is still linked keeps using its
+own state directly -- `alloc` takes a box from its pool and counts it live,
+`rt_panic` flushes its own stdout buffer, `display` writes through `emit`
+-- and none of that can be pointed at Grasm without changing the Rust
+runtime. So each piece of state stays the Rust runtime's until the last
+Rust code that touches it has moved, and the Grasm runtime reaches it
+through the entry point that owns it. Four are used today, and
+`compiler/rt/families.txt` lists them as `state`: `grasm_box_unit` (a fresh
+box from the pool, counted live, `ARENA` and registered when a region is
+open), `grasm_val_dec` on a box at count one (its release: the walk over
+every kind of payload, the pool, the live count), `grasm_out_text` (the
+output buffer every writer shares, flushed by each newline, panic and
+exit), and `grasm_panic_msg` (the way out of a panic: flush stdout, write
+`panic: <message>` to stderr, exit 101). The order this forces is the
+strangler's: logic family by family now; then the release walk, once every
+payload's layout has moved; then the allocator, the output buffers and the
+panic path together, with the last Rust that uses them. No Rust change was
+needed or made.
+
+**The layouts the two share** (`compiler/rt/src/layout.gr`), from the Rust
+source and, where Rust chose them, measured by `compiler/rt/probe/layout.gr`
+-- a program linked with the Rust runtime that makes values through its
+entry points and reads their bytes:
+
+| what | layout | how known |
+|---|---|---|
+| a box, `RtVal` | 64 bytes, `repr(C)`: the count at 0 (an `AtomicI64`), the payload's tag at 8, its fields from 9 or 16 | source, measured |
+| counts | `IMMORTAL` = `i64::MAX` (interned and literal values), `ARENA` = `i64::MAX - 1` (owned by an open region), `POISON` = `i64::MIN + 0x5EAD` (freed, poisoned build); a pooled free box holds the next one's address | source, measured (`POISON` in a probe linked with the poisoned runtime) |
+| payload tags | `RtPayload` is `repr(u8)`, tags in declaration order: I64 0, Unit 1, Ref 2, F64 3, Bool 4, Str 5, Env 6, Handler 7, Range 8, Bytes 9, List 10, Tuple 11, ListScalar 12, Map 13, Struct 14, Variant 15, Fn 16, ListVals 17, U64 18, StrBuf 19, ByteBuf 20 | source; 17 measured |
+| scalars | I64, F64, Ref, U64 the word at 16; Bool the byte at 9 | measured |
+| a string, `Str(RtStr)` | `StrData<38>` at 16 with a tag byte of its own (0 inline, 1 heap); inline: length at 17, bytes 18..56, zero past the text (two inline strings compare as whole arrays); heap: a `String` at 24; the character index (`AtomicPtr<CharIndex>`, null until built) at 56 | measured |
+| the character index | a `Box<CharIndex>` of 32 bytes: a `Vec<u32>` of each character's byte offset at 0 (empty, pointing at 4, for ASCII), the `u32` count at 24; built by `len` for text of 256 bytes and more, published by compare-and-swap | measured |
+| `Vec<T>`, `String` | capacity at 0, pointer at 8, length at 16; an empty `Vec<u8>` points at 1 and grows to 8 first | measured |
+| an interpolation builder | the handle is a `Box<String>`: the `String` at the handle | source, measured |
+| lists, tuples | `ListData`, `repr(u8)` at 16: 0 inline (length at 17, four pointers 24..56), 1 heap (a `Vec` at 24) | source (`layout` module) |
+| scalar lists | kind byte at 9; `ScalarData`, `repr(u8)` at 16: 0 words, 1 bytes (bools); its `Vec` at 24 | source |
+| structs | the `StructTy` pointer at 16; `StructFields`, `repr(u8)` at 24: inline (length at 25, four words 32..64) or a `Vec` at 32; the backends' `StructDesc` is `repr(C)` (§6.1) | source |
+| bytes | `RtBytes`, `repr(C)` at 16: pointer, length, `Arc<Vec<u8>>` | source |
+| variants, `Fn`, `Env`, `Handler`, `Range`, `StrBuf`, `ByteBuf` | each variant's fields in declaration order from 16, since the variant's struct is `repr(C)` (a variant: two `&str`, then `VFields`; `Fn`: code, environment, `Option<String>` name); inside them Rust's own order (a `&str`'s two words, `VFields`, the `Option`'s niche, a `Vec`'s three) | source; not yet measured |
+| maps | a `hashbrown` table of `(MapKey, *mut RtVal)` with the per-process `MapHash`: a 64-bit seed from `getentropy`, mixed by a wyhash-style 128-bit multiply-fold (not SipHash) | not yet measured |
+
+`scripts/rtlayout.sh` holds every constant in `layout.gr` (40) to the
+probe's measurement by name, and the nine the Rust source states outright
+(the `layout` module's tag and offsets, the sentinels, the inline capacity,
+the box size) to the source too.
+
+**The families moved: 58 entry points.** `compiler/rt/families.txt` lists
+them; each program's references to them bind to Grasm:
+
+- *math* (35): integer power (wrapping, a negative exponent panics),
+  `%` on floats (`fmod`), `abs`/`min`/`max`, rounding, and the libm
+  wrappers, calling libm as the Rust runtime does; `core`'s own arithmetic
+  (`to_radians`, `to_degrees`, `log(b)`) is written as `core` writes it,
+  and `min`/`max` are LLVM's `minnum`/`maxnum`: arm64's `fminnm` and
+  `fmaxnm` (libm's `fmin`/`fmax`), on operands whose signalling NaNs are
+  made quiet first.
+  `int_checked`, `int_saturating` and `int_try` answer `Option`s and wait
+  for the variant layout.
+- *number formatting* (12): `print`'s integers, `u64`s, floats and booleans
+  (`out_*`), `to_str` of each (`str_from_*`), their pieces of an
+  interpolated string (`str_build_*`), and `str_pin_i64`. A float is the
+  shortest digits that read back as itself, by Dragon4 as `core` writes it
+  (`flt2dec::strategy::dragon::format_shortest`, over 32-bit limbs in raw
+  memory, with `decode` and `estimate_scaling_factor` as `core` has them),
+  laid out as Rust's `{}` lays it out and given `.0` when it has no point.
+  Rust tries Grisu first and falls back to Dragon4; both find the shortest
+  digits closest to the value, so Dragon4 alone should give Rust's bytes,
+  and `fuzz_rtfmt` finds it does over four million doubles. Not
+  yet: parsing (`Option`s), `to_base` and `to_fixed`, and appending to a
+  string in place (`str_append_*`, which spills and grows a string's own
+  storage).
+- *panics* (4): division and remainder by zero, a failed assertion, a
+  negative exponent -- their messages, through the Rust runtime's way out.
+- *strings, read* (5): `len` (characters: short text counted, longer
+  text counted once into the string's character index exactly as the Rust
+  runtime builds it, so that its `substr` and `code_at` read what this
+  wrote), `byte_len`, `is_empty`, `==` and `cmp` (the bytes' order, which is
+  UTF-8's code-point order).
+- *reference counting* (2): `grasm_val_inc` and `grasm_val_dec` -- the
+  count, its sentinels, and a check for the poisoned build's `POISON` that
+  panics as the Rust runtime does there; a count reaching zero is released
+  by the Rust runtime from one (state, above).
+
+**The gates** (`scripts/`, in `allgates.sh`; `gatecheck` reads them as it
+reads every gate), each run on this tree on 2026-10-26:
+
+- `rtswap`: every corpus program with a `main`, built by `grasm build
+  --native` with `scripts/lib/rtswap_link` as its linker -- so the same
+  objects are linked as they ship and with the Grasm runtime interposed --
+  and the Grasm backend's objects for its subset, linked both ways the same;
+  both binaries run with stdin closed and must print, write to stderr and
+  exit identically; then both again against the poisoned runtime, which must
+  agree and report no use after free. Each swapped link's log is held to
+  `families.txt`: a moved name taken from Rust fails the program. "programs
+  with a main: 651, external set aside: 3; Cranelift objects: identical:
+  648, failed: 0, timed out: 0; runtime names the programs reference: 323
+  distinct, 51 taken from Grasm and 272 from Rust; per program, 4756
+  references bound to Grasm and 31587 to Rust; programs that took nothing
+  from Grasm (compared nothing): 12; poisoned runtime: agreeing with no use
+  after free: 648; Grasm backend objects: in the subset: 648, identical:
+  648". The twelve that took nothing print only fixed text or nothing at
+  all; they are named in the gate's output.
+- `rtlayout`: "layout constants: 40, measured and equal: 40, also stated by
+  the Rust source: 9, POISON measured in the poisoned runtime".
+- `fuzz_rtfmt`: `compiler/rt/probe/fmtfuzz.gr` built both ways, a million
+  draws in twenty seeded chunks, compared by hash; 20,000 of the doubles
+  also against Python's `repr` laid out as Rust lays it out. "chunks
+  identical: 20 of 20 (1000000 draws: 4000000 doubles and 6000000 integers
+  formatted, each on both runtimes)"; "against Python: 20000 doubles, 19981
+  the same, 19 exact ties Rust breaks away from zero, 0 differing
+  otherwise".
+- `fuzz_rtmath`: `compiler/rt/probe/mathfuzz.gr`, every math entry point
+  called by its C name, answers compared as bits. "chunks identical: 10 of
+  10 (500000 draws, 16500000 calls of 33 entry points on each runtime)".
+- `rtcontrols`: nine planted faults, each required to fail its gate for
+  its reason: `dec` taking two (`rtswap` on `examples/`: a crash), a double
+  one digit short and a string one byte long (`fuzz_rtfmt`), `min` of a
+  signalling NaN as libm has it (`fuzz_rtmath`), `len` one too many
+  (`rtswap` on the string conformance programs), a panic exiting 1
+  (`rtswap` on `E-DIV-ZERO`: "exit 101 (Rust runtime) vs 1"), the inline
+  length moved a byte (`rtlayout`, and `fuzz_rtfmt`), and two fallbacks to
+  Rust -- a moved function no longer exported, and one calling Rust's own
+  (`rtswap`'s check of `families.txt`, before any program runs). "checks of
+  planted faults: 10, caught: 10, missed: 0". That the faults planted in the
+  Grasm runtime's code change what programs print is also what shows the
+  programs run that code.
+- `scripts/rtwith.sh <command>` runs any gate or generator with every native
+  program it builds -- by `grasm build --native` and by the Grasm backend
+  (`scripts/lib/s3engine.py`) -- linked with the Grasm runtime in front;
+  `leakcheck` and all twenty-two generators were run through it, each
+  after a canary build showed the switch in effect. `leakcheck`: "leak-free:
+  623, leaking: 0, not compiled: 0, external: 3, timed out: 0, crashed: 0,
+  ended before the check: 25" (the 25 it knows end early). Every generator
+  passed: among them `fuzz_differential` "programs: 500, mismatched: 0",
+  `fuzz_operators` "cells: 176, disagreed: 0", `fuzz_panics` "programs:
+  104, disagreed: 0", `fuzz_exits` "programs: 85, disagreed: 0",
+  `fuzz_intwidth` "checked lines: 19900, disagreed: 0", `fuzz_laws` "laws:
+  218, broken: 0" and `fuzz_s3` "programs: 60, identical: 60". `usecheck`
+  itself was not run -- it builds a poisoned runtime with cargo into the
+  checkout -- but `rtswap`'s poisoned run is its method, over the same
+  programs.
+
+The backend change (`--runtime`) was followed by the S3 gates, with the
+backend built from this tree: `s3subset` "identical: 648, mismatched: 0";
+`objtest` "objects: 648, reproducible: 648, literal loads on their lines:
+108370, with problems: 0"; `ra_check` "programs: 648, stressed runs: 3240,
+identical: 3240, failed: 0", its controls 43,494 of 43,494 caught;
+`fuzz_s3` "programs: 60, compared: 60, identical: 60". The linker change
+(`-interpose`) leaves every other link as it was: the 648 corpus programs'
+objects linked by the shipped `grasm-link` and by this tree's are the same
+bytes, all 648; `linktest`, `linkdiff` and `linkcontrols` were not run
+again.
+
+**Differences found.** One between the two runtimes, and the Grasm side
+was wrong: `min` and `max` with a signalling NaN. `fuzz_rtmath` found
+`min(sNaN, 1.0)` answered NaN where the Rust runtime answers `1.0`: libm's
+`fmin` is `fminnm`, which takes a signalling NaN as a NaN, and LLVM's
+`minnum` quiets its operands before `fminnm`. The Grasm runtime now does the
+same, and `rtcontrols` plants the old code back (`nan-min`) to show the
+fuzz sees it. No corpus program makes a signalling NaN, so `rtswap` could
+not have. Against an independent witness one more, shared by both runtimes
+and by the interpreter: when a double lies exactly halfway between the two
+shortest digit strings, Rust's `flt2dec` takes the one farther from zero --
+`1000000000000000.25` prints as `1000000000000000.3` -- where Python's
+`repr` (and JavaScript, and Ryu) take the even one, `...0.2`. [L-DISPLAY] asks for the fewest digits and
+does not say which, so neither is wrong; it is recorded in
+docs/known-issues.md, and `fuzz_rtfmt` checks every such case is exactly
+that tie. One fault outside the runtime was found and is recorded there,
+open: an incremental native build of `compiler/link` that ran out of its
+stack floor at once, where a clean build of the same source is right. And
+one correction to what this stage was told: map hashing is not SipHash. The
+Rust runtime's comment says, and its code is, wyhash's multiply-fold keyed
+by a 64-bit seed drawn once per process from `getentropy` -- resistant to
+keys chosen in advance, not to an attacker who measures the live table, as
+the comment says -- and part two must keep exactly that.
+
+**Left for part two.** The rest of strings (`substr`, `code_at` and the
+rest over the character index, Unicode case mapping, splitting into lists,
+concatenation and appending in place), lists
+(`ListData`, `ScalarData`, the total order `sort` uses), structs, variants
+and `Option`s (variant names need static bytes, or text built once per
+thread), number parsing, `to_base`, `to_fixed`, `str_append_*`, bytes,
+references, function values and handlers -- each a family over layouts this
+section writes down, and each moved the same way. Then the release walk,
+once every payload's layout is in Grasm; then the allocator, its live
+count, regions and the leak check, the output buffers, `out_val` and the
+panic and exit path together. Maps need a process-wide seed, the interned
+boxes and the reference slab process-wide state, and the runtime's
+per-thread state cells of its own: the language and the backend need a
+design for each before those families move. Fibers need `ctx_switch` and
+`ctx_init` from the backend (§5.5). And no timing: the Grasm runtime's code
+has been measured for correctness only.
+
 ## 7. Bootstrap and trust
 
 - **During the migration:** stage 0 is the Rust-built `grasm`.
@@ -1162,7 +1490,9 @@ the Rust interpreter), `lexdiff`, `parsediff`, `diagdiff`, `encdiff`
 `dwarfdump`, `ld`), `linktest` (the corpus linked by our linker runs as
 it does linked by `cc`), `linkdiff` (our linker against ld-prime) and
 `linkcontrols` (§6.6), `rtswap`
-(corpus on the Grasm runtime), `fixpoint` (stage 2 = stage 3), `ddc`,
+(corpus on the Grasm runtime), `rtlayout` (the layouts both runtimes
+share), `fuzz_rtfmt` (number formatting against the Rust runtime) and
+`rtcontrols` (§6.7), `fixpoint` (stage 2 = stage 3), `ddc`,
 `selfperf` (compile speed and benchmark budgets), and the existing fuzzers
 pointed at each new component. Every new gate ships with controls showing
 it fails on a planted fault.
@@ -1282,8 +1612,24 @@ Measured, not estimated; each line is a gate's result on master.
   AppleSystemPolicy while the machine's network changed (the same seed then
   passed, and six alternating runs with `grasm-link` and with `cc` saw no
   refusal), and one of `difftest`'s.
-- **Not started:** S2 (the frontend in Grasm), S5 (the runtime in Grasm),
-  S6 (self-compilation), S7-S9.
+- **S5 part one done** (§6.7). The Rust runtime's 345 entry points are
+  inventoried by family, measured from the archive and the source, and the
+  corpus names 323 of them. `compiler/rt` is the runtime in Grasm, built by
+  the Grasm backend (`s3 --runtime`) and linked in front of the Rust one by
+  `compiler/link -interpose`: 58 entry points moved -- math (35), number
+  formatting with Rust's shortest floats by Dragon4 (12), the panics'
+  messages (4), strings read (5) and reference counting (2) -- over 40
+  layout constants held to a probe of the Rust runtime. The box allocator,
+  the release walk, the output buffers and the panic path stay the Rust
+  runtime's state until the last Rust code that uses them moves. `rtswap`:
+  all 648 corpus programs that link no system library print and exit
+  identically on both runtimes, from both backends' objects and against the
+  poisoned runtime; `fuzz_rtfmt` 4,000,000 doubles and `fuzz_rtmath`
+  16,500,000 math calls identical; `rtcontrols` caught all ten checks of
+  nine planted faults. One difference between the runtimes was found, on the
+  Grasm side, and fixed (`min`/`max` of a signalling NaN).
+- **Not started:** S2 (the frontend in Grasm), S6 (self-compilation),
+  S7-S9; S5 past part one.
 
 With S4 done, S6 waits on S3's last steps and on S2 and S5, the frontend
 and the runtime in Grasm; they come next, one stage at a time.

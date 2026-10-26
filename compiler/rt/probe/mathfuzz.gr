@@ -1,0 +1,118 @@
+// Every entry point of the math family, called by its C name, for
+// `scripts/fuzz_rtmath.sh`, which builds this twice -- on the Rust runtime
+// and with the Grasm runtime interposed -- and requires the same bytes out.
+//
+//     mathfuzz <seed> <count>
+//
+// Called by name because the backends inline some of them -- `sqrt`,
+// `floor`, `ceil`, `abs` are one instruction each -- so no corpus program
+// reaches those entry points at all. Each answer is printed as its bits, so
+// a NaN's payload and a zero's sign count. The arguments are any 64 bits,
+// the special values (zeros, infinities, NaNs, the extremes, subnormals),
+// halves (where rounding ties), and small integers. The last call is a
+// negative integer exponent, which panics.
+//
+// `is_nan` and `is_finite` are left out: they answer an `i8`, which an
+// `extern fn` in a program cannot declare the way the backend declares the
+// runtime's own. The corpus reaches both.
+
+extern fn grasm_pow_i64(b: i64, e: i64) -> i64
+extern fn grasm_pow_u64(b: i64, e: i64) -> i64
+extern fn grasm_pow_f64(b: f64, e: f64) -> f64
+extern fn grasm_f64_rem(a: f64, b: f64) -> f64
+extern fn grasm_i64_abs(v: i64) -> i64
+extern fn grasm_i64_min(a: i64, b: i64) -> i64
+extern fn grasm_i64_max(a: i64, b: i64) -> i64
+extern fn grasm_f64_abs(v: f64) -> f64
+extern fn grasm_f64_sqrt(v: f64) -> f64
+extern fn grasm_f64_floor(v: f64) -> f64
+extern fn grasm_f64_ceil(v: f64) -> f64
+extern fn grasm_f64_round(v: f64) -> f64
+extern fn grasm_f64_min(a: f64, b: f64) -> f64
+extern fn grasm_f64_max(a: f64, b: f64) -> f64
+extern fn grasm_f64_sin(v: f64) -> f64
+extern fn grasm_f64_cos(v: f64) -> f64
+extern fn grasm_f64_tan(v: f64) -> f64
+extern fn grasm_f64_asin(v: f64) -> f64
+extern fn grasm_f64_acos(v: f64) -> f64
+extern fn grasm_f64_atan(v: f64) -> f64
+extern fn grasm_f64_sinh(v: f64) -> f64
+extern fn grasm_f64_cosh(v: f64) -> f64
+extern fn grasm_f64_tanh(v: f64) -> f64
+extern fn grasm_f64_exp(v: f64) -> f64
+extern fn grasm_f64_ln(v: f64) -> f64
+extern fn grasm_f64_log2(v: f64) -> f64
+extern fn grasm_f64_log10(v: f64) -> f64
+extern fn grasm_f64_cbrt(v: f64) -> f64
+extern fn grasm_f64_to_radians(v: f64) -> f64
+extern fn grasm_f64_to_degrees(v: f64) -> f64
+extern fn grasm_f64_atan2(a: f64, b: f64) -> f64
+extern fn grasm_f64_hypot(a: f64, b: f64) -> f64
+extern fn grasm_f64_log(a: f64, b: f64) -> f64
+
+fn next(inout s: u64) -> u64 {
+    s = s.bit_xor(s.ushr(12))
+    s = s.bit_xor(s.shl(25))
+    s = s.bit_xor(s.ushr(27))
+    s * 2685821657736338717
+}
+
+fn special(k: i64) -> i64 {
+    let table = [0, 1.shl(63), 0x7ff0_0000_0000_0000, 0xfff0_0000_0000_0000, 0x7ff8_0000_0000_0000, 0x7ff0_0000_0000_0001, 0xfff8_0000_0000_1234, 1, 0x000f_ffff_ffff_ffff, 0x0010_0000_0000_0000, 0x7fef_ffff_ffff_ffff, 0x3ff0_0000_0000_0000, 0xbff0_0000_0000_0000, 0x3fe0_0000_0000_0000, 0xbfe0_0000_0000_0000, 0x4004_0000_0000_0000]
+    table[k % table.len()]
+}
+
+fn draw(inout s: u64) -> f64 {
+    let w = next(s)
+    let c = (w % 5).as_i64()
+    let r = next(s)
+    if c == 0 {
+        return r.as_i64().from_bits()
+    }
+    if c == 1 {
+        return special((r % 64).as_i64()).from_bits()
+    }
+    if c == 2 {
+        // n + 0.5, a tie for rounding.
+        return ((r % 2001).as_i64() - 1000).as_f64() + 0.5
+    }
+    if c == 3 {
+        return ((r % 2001).as_i64() - 1000).as_f64() / 8.0
+    }
+    // Between -10 and 10, where the functions are defined.
+    (r % 2000001).as_i64().as_f64() / 100000.0 - 10.0
+}
+
+fn bits(x: f64) -> i64 {
+    x.to_bits()
+}
+
+fn main() / {io, unsafe} {
+    let a = args()
+    if a.len() < 2 {
+        eprint("usage: mathfuzz <seed> <count>")
+        exit(2)
+    }
+    var s: u64 = (a[0].parse_int() ?? 1).as_u64() * 2 + 1
+    let count = a[1].parse_int() ?? 0
+    var i = 0
+    while i < count {
+        let x = draw(s)
+        let y = draw(s)
+        let n = next(s).as_i64()
+        let m = if n.bit_and(1) == 0 { n.shr(40) } else { n }
+        let e = (next(s) % 70).as_i64()
+        unsafe {
+            print("{bits(grasm_f64_abs(x))} {bits(grasm_f64_sqrt(x))} {bits(grasm_f64_floor(x))} {bits(grasm_f64_ceil(x))} {bits(grasm_f64_round(x))}")
+            print("{bits(grasm_f64_sin(x))} {bits(grasm_f64_cos(x))} {bits(grasm_f64_tan(x))} {bits(grasm_f64_asin(x))} {bits(grasm_f64_acos(x))} {bits(grasm_f64_atan(x))}")
+            print("{bits(grasm_f64_sinh(x))} {bits(grasm_f64_cosh(x))} {bits(grasm_f64_tanh(x))} {bits(grasm_f64_exp(x))} {bits(grasm_f64_ln(x))} {bits(grasm_f64_log2(x))} {bits(grasm_f64_log10(x))}")
+            print("{bits(grasm_f64_cbrt(x))} {bits(grasm_f64_to_radians(x))} {bits(grasm_f64_to_degrees(x))}")
+            print("{bits(grasm_f64_min(x, y))} {bits(grasm_f64_max(x, y))} {bits(grasm_f64_rem(x, y))} {bits(grasm_pow_f64(x, y))} {bits(grasm_f64_atan2(x, y))} {bits(grasm_f64_hypot(x, y))} {bits(grasm_f64_log(x, y))}")
+            print("{grasm_i64_abs(m)} {grasm_i64_min(m, n)} {grasm_i64_max(m, n)} {grasm_pow_i64(m.shr(50), e)} {grasm_pow_u64(m, n)}")
+        }
+        i += 1
+    }
+    unsafe {
+        print(grasm_pow_i64(3, -1))
+    }
+}

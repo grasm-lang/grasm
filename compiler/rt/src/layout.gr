@@ -1,0 +1,92 @@
+// The memory layouts the Grasm runtime shares with the Rust one
+// (docs/self-hosting.md §6.7, "Layouts"): every box either side makes, the
+// other reads and frees, so they must agree to the byte.
+//
+// Each constant is a byte offset, a tag or a sentinel, written down from
+// `crates/grasm_rt/src/lib.rs`; where Rust chose the layout itself -- a
+// `Vec`'s fields, a `String`'s, the inline/heap enum inside a string -- it was
+// measured. `scripts/rtlayout.sh` holds every `pub let` here to the value
+// `compiler/rt/probe/layout.gr` measures in a program linked with the Rust
+// runtime, by name, and fails on any it does not measure.
+
+// ----- every box: `RtVal`, `repr(C)`, 64 bytes (a `const` assertion in Rust)
+
+/// The reference count, an `AtomicI64`.
+pub let RC = 0
+/// The payload's variant tag: `RtPayload` is `repr(u8)`, so the tag is its
+/// first byte and each variant's fields follow at their own alignment.
+pub let TAG = 8
+pub let BOX_SIZE = 64
+
+/// A count `inc` and `dec` leave alone: interned and literal values.
+pub let IMMORTAL = 9223372036854775807
+/// A count meaning "owned by an open region" ([T-REGION]): also left alone.
+pub let ARENA = 9223372036854775806
+/// The count a freed box holds in the poisoned build (`--features
+/// grasm_rt/poison`); no live count, sentinel or pool link is ever this.
+pub let POISON = -9223372036854751571
+
+// ----- `RtPayload`'s tags, in declaration order
+
+pub let TAG_I64 = 0
+pub let TAG_UNIT = 1
+pub let TAG_REF = 2
+pub let TAG_F64 = 3
+pub let TAG_BOOL = 4
+pub let TAG_STR = 5
+pub let TAG_BYTES = 9
+pub let TAG_LIST = 10
+pub let TAG_TUPLE = 11
+pub let TAG_LIST_SCALAR = 12
+pub let TAG_MAP = 13
+pub let TAG_VARIANT = 15
+pub let TAG_FN = 16
+pub let TAG_U64 = 18
+pub let TAG_STRBUF = 19
+pub let TAG_BYTEBUF = 20
+
+// ----- scalar payloads
+
+/// `I64`, `F64`, `Ref` and `U64` hold their word here.
+pub let WORD_AT = 16
+/// `Bool` holds its byte right after the tag.
+pub let BOOL_AT = 9
+
+// ----- `Str(RtStr)`: `StrData<38>` (an enum Rust laid out with a tag byte of
+// its own), then the character index, an `AtomicPtr` (null until built)
+
+/// `StrData`'s discriminant byte, and its two values.
+pub let STR_DISC = 16
+pub let STR_INLINE = 0
+pub let STR_HEAP = 1
+/// Inline text: its length byte and its bytes.
+pub let STR_LEN = 17
+pub let STR_BYTES = 18
+/// How many bytes fit inline (`INLINE_STR_CAP`).
+pub let STR_CAP = 38
+/// Heap text: the `String`, a `Vec<u8>`.
+pub let STR_STRING = 24
+/// The character index (`IndexCell`).
+pub let STR_INDEX = 56
+
+// ----- `Vec<T>` and `String`: three words in an order Rust does not promise
+// (`vec_layout` in the Rust runtime measures it at startup too)
+
+pub let VEC_PTR = 8
+pub let VEC_LEN = 16
+pub let VEC_CAP = 0
+/// What an empty `Vec<u8>` holds for a pointer: a dangling, aligned, non-null
+/// address, never freed.
+pub let U8_DANGLING = 1
+/// The capacity a `Vec<u8>` grows to first (`RawVec`'s minimum for 1-byte
+/// elements).
+pub let U8_MIN_CAP = 8
+
+// ----- the character index a string's `len` builds for text of 256 bytes
+// and more (`CharIndex`, boxed: 32 bytes)
+
+/// Where its `Vec<u32>` of character starts is, and its `u32` count.
+pub let CHARINDEX_VEC = 0
+pub let CHARINDEX_COUNT = 24
+/// What an empty `Vec<u32>` holds for a pointer.
+pub let U32_DANGLING = 4

@@ -1,8 +1,13 @@
 // `s3`: the self-hosted backend's driver (docs/self-hosting.md, stage S3).
 //
-//     s3 <program.tir> -o <out.o> [--ra=backtrack|linear] [--max-regs N] [--listing <file>] [--ra-corrupt[=any|fp|class]]
+//     s3 <program.tir> -o <out.o> [--ra=backtrack|linear] [--max-regs N] [--listing <file>] [--ra-corrupt[=any|fp|class]] [--runtime]
 //     s3 --check-rules        the lowering rules' own checks
 //
+// `--runtime` compiles the runtime written in Grasm (docs/self-hosting.md
+// §6.7) rather than a program: every function its `export fn`s reach and no
+// C entry point -- it has no `main` -- and its calls to C are the runtime's
+// own, so they are not reported to `grasm_foreign_call` as a program's are
+// (a replay refuses a program's C calls, never the runtime's).
 // `--ra=linear` allocates registers by linear scan, the fast allocator, in
 // place of the release one (`--ra=backtrack`, the default; docs/self-hosting.md
 // §4).
@@ -44,7 +49,7 @@ import aarch64
 import macho
 
 fn usage() {
-    eprint("usage: s3 <program.tir> -o <out.o> [--ra=backtrack|linear] [--max-regs N] [--listing <file>] [--ra-corrupt[=any|fp|class]] [--no-rule-check] [--stats]")
+    eprint("usage: s3 <program.tir> -o <out.o> [--ra=backtrack|linear] [--max-regs N] [--listing <file>] [--ra-corrupt[=any|fp|class]] [--no-rule-check] [--stats] [--runtime]")
     eprint("       s3 --check-rules | --forms | --encode-test <prefix>")
     exit(2)
 }
@@ -188,7 +193,7 @@ fn reloc_symbol(p: MirProg, symk: i64, id: i64) -> str {
 }
 
 /// Compiles a TIR file into an object file. Answers the exit status.
-fn compile(inp: str, out: str, opts: A64Opts, listing: str, check: bool, stats: bool) -> i64 {
+fn compile(inp: str, out: str, opts: A64Opts, listing: str, check: bool, stats: bool, lib: bool) -> i64 {
     let src = match read_bytes(inp) {
         Ok(b) -> b
         Err(e) -> {
@@ -196,7 +201,7 @@ fn compile(inp: str, out: str, opts: A64Opts, listing: str, check: bool, stats: 
             return 2
         }
     }
-    let p = match mir.build(src) {
+    let p = match mir.build(src, lib) {
         Ok(x) -> x
         Err(msg) -> {
             eprint(msg)
@@ -400,6 +405,7 @@ fn main() {
     var opts = aarch64.default_opts()
     var check = true
     var stats = false
+    var lib = false
     var i = 0
     while i < a.len() {
         let x = a[i]
@@ -435,6 +441,9 @@ fn main() {
         } else if x == "--stats" {
             stats = true
             i += 1
+        } else if x == "--runtime" {
+            lib = true
+            i += 1
         } else if x.starts_with("-") or inp != "" {
             usage()
             return
@@ -447,5 +456,5 @@ fn main() {
         usage()
         return
     }
-    exit(compile(inp, out, opts, listing, check, stats))
+    exit(compile(inp, out, opts, listing, check, stats, lib))
 }

@@ -1,0 +1,40 @@
+// The C library calls every family makes: memory. The Rust runtime's global
+// allocator is `malloc`, `realloc` and `free` (`grasm_rt_abi`), so a buffer
+// either side allocates the other can grow or free -- a `String`'s or a
+// `Vec`'s included -- and these are those three calls.
+
+extern fn malloc(n: i64) -> addr
+extern fn calloc(n: i64, size: i64) -> addr
+extern fn realloc(p: addr, n: i64) -> addr
+extern fn free(p: addr)
+
+/// `n` bytes, uninitialised.
+pub fn alloc(n: i64) -> addr {
+    unsafe { malloc(n) }
+}
+
+/// `n` zeroed bytes.
+pub fn alloc_zeroed(n: i64) -> addr {
+    unsafe { calloc(n, 1) }
+}
+
+pub fn grow(p: addr, n: i64) -> addr {
+    unsafe { realloc(p, n) }
+}
+
+pub fn dealloc(p: addr) {
+    unsafe { free(p) }
+}
+
+/// Copies `n` bytes from `src` to `dst`; the two do not overlap.
+pub fn copy(dst: addr, src: addr, n: i64) {
+    var i = 0
+    while i + 8 <= n {
+        unsafe { dst.offset(i).store_u64(src.offset(i).load_u64()) }
+        i += 8
+    }
+    while i < n {
+        unsafe { dst.offset(i).store_u8(src.offset(i).load_u8()) }
+        i += 1
+    }
+}

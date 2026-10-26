@@ -58,6 +58,11 @@ type Ld = {
     tool_version: i64,
     /// Objects named on the command line, in order.
     direct: [i64],
+    /// `-interpose`: the file index of the runtime object linked in front of
+    /// the runtime archive (`interpose.gr`), or -1; and where `-interpose_log`
+    /// writes what it bound, or "".
+    ip_file: i64,
+    ip_log: str,
     // ----- object files, archive members included once loaded
     f_path: [str],
     f_data: [bytes],
@@ -226,7 +231,7 @@ type Ld = {
 pub fn new_ld() -> Ld {
     Ld{
         out: "a.out", entry: "_main", dead_strip: false, exp_list: [], exp_set: {}, strip: false, uuid: true,
-        map_path: "", syslibroot: "", lib_dirs: [], in_kind: [], in_arg: [], minos: 0, sdk: 0, ident: "", nostdlib: false, tool_version: 0, direct: [],
+        map_path: "", syslibroot: "", lib_dirs: [], in_kind: [], in_arg: [], minos: 0, sdk: 0, ident: "", nostdlib: false, tool_version: 0, direct: [], ip_file: -1, ip_log: "",
         f_path: [], f_data: [], f_key: [], f_subsec: [], f_sec0: [], f_nsec: [], f_sym0: [], f_nsym: [],
         ar_path: [], ar_data: [], ar_pos: [], ar_toc: [], ar_index: [], ar_loaded: {},
         dl_install: [], dl_cur: [], dl_compat: [], dy_sym: {}, dy_weak: {}, dy_tlv: {},

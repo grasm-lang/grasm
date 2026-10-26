@@ -1,0 +1,106 @@
+// `-interpose <object>`: a runtime written in Grasm linked in front of the
+// runtime archive, one family of functions at a time (docs/self-hosting.md
+// §6.7, stage S5).
+//
+// The archive defines the runtime's C entry points, `_grasm_<name>`. The
+// Grasm runtime defines the ones it has taken over as `_grt_<name>`: a Grasm
+// `export fn` may not take a name beginning `grasm_`, which [T-EXPORT]
+// reserves for the toolchain, so the two never collide. Binding is then a
+// question of who asks:
+//
+//   * a reference from any other object named on the command line -- the
+//     program's own -- to `_grasm_<name>` binds to `_grt_<name>` when the
+//     interposed object defines that as a global;
+//   * every other reference binds as it would without the option: the
+//     interposed object's own references to `_grasm_<name>` reach the
+//     archive's definition (how the Grasm runtime calls what has not moved
+//     yet, or the state it does not own), and the archive's members reach
+//     each other.
+//
+// That is what dyld's interposing does for a dylib, and for the same reason:
+// the replacement can still call the original, and nothing the original's
+// image binds internally is redirected. Nothing in the archive is renamed or
+// dropped, so a symbol the Grasm runtime does not define is untouched, and
+// one it does define is simply not reached from the program.
+//
+// `-interpose_log <file>` writes one line per `_grasm_` name the program's
+// objects reference -- `grasm <name>` if it was bound to the Grasm runtime,
+// `rust <name>` if to the archive -- sorted by name, so a gate can count both
+// and require a family it says has moved to be taken from Grasm everywhere.
+// A name counts as referenced when a relocation names it: the Cranelift
+// backend declares every runtime function in every object, used or not, so
+// an undefined symbol alone says nothing.
+import state
+
+pub let FROM = "_grasm_"
+pub let TO = "_grt_"
+
+/// The global names the interposed object defines.
+fn defined_by(l: Ld, fi: i64) -> Map[str, bool] {
+    var out: Map[str, bool] = {}
+    let y0 = l.f_sym0[fi]
+    for y in y0..(y0 + l.f_nsym[fi]) {
+        let ty = l.y_type[y]
+        // N_EXT, not a stab, and N_SECT: a global defined here.
+        if ty.bit_and(0xe0) == 0 and ty.bit_and(1) == 1 and ty.bit_and(0x0e) == 0x0e {
+            out.set(l.y_name[y], true)
+        }
+    }
+    out
+}
+
+/// Renames the program objects' references to the runtime the interposed
+/// object provides, before any symbol is entered; answers the log lines.
+pub fn apply(inout l: Ld) -> [str] {
+    if l.ip_file < 0 {
+        return []
+    }
+    let ours = defined_by(l, l.ip_file)
+    var seen: Map[str, str] = {}
+    for fi in l.direct {
+        if fi == l.ip_file {
+            continue
+        }
+        // The symbols this file's relocations name.
+        var used: Map[i64, bool] = {}
+        for si in l.f_sec0[fi]..(l.f_sec0[fi] + l.f_nsec[fi]) {
+            for r in l.s_rel0[si]..(l.s_rel0[si] + l.s_nrel[si]) {
+                if l.r_sym[r] >= 0 {
+                    used.set(l.r_sym[r], true)
+                }
+                if l.r_subsym[r] >= 0 {
+                    used.set(l.r_subsym[r], true)
+                }
+            }
+        }
+        let y0 = l.f_sym0[fi]
+        for y in y0..(y0 + l.f_nsym[fi]) {
+            let ty = l.y_type[y]
+            // N_EXT and N_UNDF: a reference to something defined elsewhere.
+            if ty.bit_and(0xe0) != 0 or ty.bit_and(1) == 0 or ty.bit_and(0x0e) != 0 {
+                continue
+            }
+            let name = l.y_name[y]
+            if not name.starts_with(FROM) {
+                continue
+            }
+            let rest = name.substr(FROM.len(), name.len() - FROM.len())
+            let to = TO + rest
+            let named = used.has(y)
+            if ours.has(to) {
+                l.y_name[y] = to
+                if named {
+                    seen.set(rest, "grasm")
+                }
+            } else if named and not seen.has(rest) {
+                seen.set(rest, "rust")
+            }
+        }
+    }
+    var lines: [str] = []
+    for k in seen.keys() {
+        let side = seen.get(k) ?? "rust"
+        lines.push(side + " " + k)
+    }
+    lines
+}

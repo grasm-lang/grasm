@@ -1,0 +1,113 @@
+// Numbers through every path that turns one into text -- `print` (the
+// runtime's `grasm_out_*`), interpolation into a kept string
+// (`grasm_str_build_*`) and `to_str` (`grasm_str_from_*`) -- for
+// `scripts/fuzz_rtfmt.sh`, which builds this twice, on the Rust runtime and
+// with the Grasm runtime interposed, and requires the same bytes out.
+//
+//     fmtfuzz <seed> <count>          every path, every number
+//     fmtfuzz <seed> <count> bits     each double's bits and its text, one
+//                                     per line, for a check against Python
+//
+// The doubles are drawn where float printing goes wrong: any 64 bits at all
+// (every exponent, the subnormals, NaNs with payloads), powers of two and
+// their neighbours (whose lower gap is half the upper one), integers near
+// 2^53, short decimals divided by powers of ten, and values next to powers
+// of ten. The integers likewise: any bits, and values near the ends and
+// near powers of ten.
+
+fn next(inout s: u64) -> u64 {
+    // xorshift64*
+    s = s.bit_xor(s.ushr(12))
+    s = s.bit_xor(s.shl(25))
+    s = s.bit_xor(s.ushr(27))
+    s * 2685821657736338717
+}
+
+fn pow10(k: i64) -> f64 {
+    var p = 1.0
+    var i = 0
+    while i < k {
+        p = p * 10.0
+        i += 1
+    }
+    p
+}
+
+fn draw(inout s: u64) -> f64 {
+    let r = next(s)
+    let class = (r % 8).as_i64()
+    let w = next(s)
+    if class == 0 or class == 1 {
+        // Any bits.
+        return w.as_i64().from_bits()
+    }
+    if class == 2 {
+        // A power of two, or one ulp either side of it.
+        let e = (w % 2046).as_i64() + 1
+        let base = e.shl(52)
+        let d = (next(s) % 3).as_i64() - 1
+        let sign = if w.ushr(63) == 1 { 1.shl(63) } else { 0 }
+        return (base + d).bit_or(sign).from_bits()
+    }
+    if class == 3 {
+        // A subnormal.
+        return (w % 4503599627370496).as_i64().from_bits()
+    }
+    if class == 4 {
+        // An integer near 2^53, or any up to 2^63.
+        if w.bit_and(1) == 0 {
+            return ((w % 4096).as_i64() + 9007199254740992 - 2048).as_f64()
+        }
+        return w.ushr(1).as_i64().as_f64()
+    }
+    if class == 5 {
+        // A short decimal: up to six digits over a power of ten.
+        let m = (w % 1000000).as_i64().as_f64()
+        let k = (next(s) % 30).as_i64()
+        return m / pow10(k)
+    }
+    if class == 6 {
+        // A power of ten, nudged by up to two ulps.
+        let k = (w % 300).as_i64()
+        let p = pow10(k % 23)
+        let b = p.to_bits() + (next(s) % 5).as_i64() - 2
+        return b.from_bits()
+    }
+    // Scaled the other way, into tiny values.
+    let m = (w % 100000000).as_i64().as_f64()
+    m / pow10(300) / pow10((next(s) % 20).as_i64())
+}
+
+fn main() {
+    let a = args()
+    if a.len() < 2 {
+        eprint("usage: fmtfuzz <seed> <count> [bits]")
+        exit(2)
+    }
+    var s: u64 = (a[0].parse_int() ?? 1).as_u64() * 2 + 1
+    let count = a[1].parse_int() ?? 0
+    let bits = a.len() > 2 and a[2] == "bits"
+    var i = 0
+    while i < count {
+        let x = draw(s)
+        if bits {
+            print("{x.to_bits()} {x}")
+            i += 1
+            continue
+        }
+        let kept = "[{x}|{-x}]"
+        print(x)
+        print(kept)
+        print(x.to_str())
+        let w = next(s)
+        let n = if w.bit_and(3) == 0 { w.as_i64() } else if w.bit_and(3) == 1 { (w % 2000).as_i64() - 1000 } else { w.as_i64().shr((next(s) % 64).as_i64()) }
+        let u = next(s).ushr((w % 64).as_i64())
+        print(n)
+        print(u)
+        let ki = "[{n}/{u}/{n > 0}]"
+        print(ki)
+        print("{n.to_str()}/{u.to_str()}")
+        print(n > 0)
+        i += 1
+    }
+}

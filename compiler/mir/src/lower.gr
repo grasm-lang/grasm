@@ -121,6 +121,9 @@ type Vir = {
     span: [i64],
     bspan: [i64],
     fn_span: i64,
+    /// A function of the runtime written in Grasm (`TirInfo.runtime`): its
+    /// C calls are not reported to `grasm_foreign_call`.
+    quiet_c: bool,
 }
 
 pub let LIFT_CLOSURE = 0
@@ -148,7 +151,7 @@ pub fn new_vir() -> Vir {
         split_out: -1, boxed_result: false, ok_te: -1,
         lift_kind: [], lift_elem: [], lift_caps: [], lift_capte: [], ret_kind: ir.TY_I64,
         handlers: 0, loop_handlers: [], par_list: [], par_sites: [], go_list: [], par_conc: [],
-        errors: [], cur_span: -1, span: [], bspan: [], fn_span: -1,
+        errors: [], cur_span: -1, span: [], bspan: [], fn_span: -1, quiet_c: false,
     }
 }
 
@@ -1777,8 +1780,10 @@ fn lower_call_c(info: TirInfo, inout v: Vir, e: i64) -> i64 {
             vals.push(x)
         }
     }
-    let na = text_args(v, "call_c")
-    rt(v, "grasm_foreign_call", [na[0], na[1]], R_VOID)
+    if not v.quiet_c {
+        let na = text_args(v, "call_c")
+        rt(v, "grasm_foreign_call", [na[0], na[1]], R_VOID)
+    }
     let rk = ty_kind(t, ret)
     var d = -1
     if valued(rk) {
@@ -1936,8 +1941,10 @@ fn call_c_decl(inout v: Vir, t: TirTree, decl: i64, args: [i64]) -> i64 {
         }
     }
     let cname = bare_name(sexp.word(t, decl, 1))
-    let na = text_args(v, cname)
-    rt(v, "grasm_foreign_call", [na[0], na[1]], R_VOID)
+    if not v.quiet_c {
+        let na = text_args(v, cname)
+        rt(v, "grasm_foreign_call", [na[0], na[1]], R_VOID)
+    }
     let rk = if is_ty(t, ret, "addr") { ir.TY_I64 } else { ty_kind(t, ret) }
     var d = -1
     if valued(rk) {
@@ -2009,6 +2016,7 @@ pub fn extern_ok(t: TirTree, decl: i64) -> bool {
 pub fn lower_extern_wrapper(info: TirInfo, decl: i64) -> Vir {
     let t = info.t
     var v = new_vir()
+    v.quiet_c = info.runtime
     let ret = sexp.at(t, decl, 3)
     let rk = if is_ty(t, ret, "addr") { ir.TY_I64 } else { ty_kind(t, ret) }
     v.returns = valued(rk)
@@ -6700,6 +6708,7 @@ fn block_tail_te(t: TirTree, b: i64) -> i64 {
 pub fn lower_callable(info: TirInfo, c: i64) -> Vir {
     let t = info.t
     var v = new_vir()
+    v.quiet_c = info.runtime
     let e = info.c_elem[c]
     var body = -1
     if info.c_const[c] {
@@ -6897,6 +6906,7 @@ fn expr_te(t: TirTree, x: i64) -> i64 {
 pub fn lower_lifted_closure(info: TirInfo, e: i64, ids: [i64], tes: [i64]) -> Vir {
     let t = info.t
     var v = new_vir()
+    v.quiet_c = info.runtime
     let ks = sexp.kids(t, e)
     // A `go` task is a closure of no arguments over its block, answering
     // nothing: its value, if it has one, is released as it ends.

@@ -1,0 +1,59 @@
+// Reference counting: `grasm_val_inc` and `grasm_val_dec`, which compiled
+// code calls around every boxed value it copies or drops.
+//
+// The count is the box's first word, an atomic (a value may be held by more
+// than one thread), counted as the Rust runtime counts it: an interned or
+// literal value (`IMMORTAL`) and one an open region owns (`ARENA`) are left
+// alone, `inc` is relaxed and `dec` releases on the way down. A box whose
+// count is `POISON` was freed by the poisoned runtime, and touching it is the
+// panic the Rust runtime gives there; no live box holds that count, so the
+// check costs nothing else.
+//
+// What happens when a count reaches zero is not done here yet: the box goes
+// back with a count of one to the Rust runtime's `grasm_val_dec`, which
+// takes apart whatever the payload holds, every kind of it, and returns the
+// box to its pool and its live count -- the state its own allocations share
+// (docs/self-hosting.md §6.7). That walk moves when the last payload's
+// layout has.
+import layout
+import panic
+
+extern fn grasm_val_dec(v: addr)
+
+export fn grt_val_inc(v: addr) {
+    unsafe {
+        if v.as_i64() == 0 {
+            return
+        }
+        let rc = v.atomic_load_i64(Relaxed)
+        if rc == layout.POISON {
+            panic.uaf_inc()
+        }
+        if rc == layout.IMMORTAL or rc == layout.ARENA {
+            return
+        }
+        v.atomic_add_i64(1, Relaxed)
+    }
+}
+
+export fn grt_val_dec(v: addr) {
+    unsafe {
+        if v.as_i64() == 0 {
+            return
+        }
+        let rc = v.atomic_load_i64(Relaxed)
+        if rc == layout.POISON {
+            panic.uaf_dec()
+        }
+        if rc == layout.IMMORTAL or rc == layout.ARENA {
+            return
+        }
+        if v.atomic_add_i64(-1, Release) - 1 > 0 {
+            return
+        }
+        // The last reference: nothing else can reach the box, so its count
+        // is ours to set, and the Rust runtime releases it from one.
+        v.atomic_store_i64(1, Relaxed)
+        grasm_val_dec(v)
+    }
+}

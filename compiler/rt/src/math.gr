@@ -1,0 +1,212 @@
+// The math family: integer power, the float remainder, `abs`/`min`/`max`,
+// rounding, and the libm wrappers ([L-LIB-NUM], [L-LIB-MATH], [L-LIB-ROUND]).
+//
+// The Rust runtime's are `f64` methods over libm (`grasm_sys::math`), so
+// these call the same libm functions by `extern fn` and get the same bits;
+// the correctly rounded libm is its own stage (docs/self-hosting.md §4).
+// What Rust computes itself is written out here the way `core` computes it:
+// `to_radians` and `to_degrees` multiply by `core`'s constant, `log(b)` is a
+// ratio of natural logarithms, `%` is `fmod`, and `min`/`max` are LLVM's
+// `minnum`/`maxnum` -- arm64's `fminnm`/`fmaxnm`, which libm's `fmin`/`fmax`
+// are, on operands with any signalling NaN made quiet first.
+import panic
+
+extern fn sqrt(x: f64) -> f64
+extern fn cbrt(x: f64) -> f64
+extern fn pow(x: f64, y: f64) -> f64
+extern fn hypot(x: f64, y: f64) -> f64
+extern fn floor(x: f64) -> f64
+extern fn ceil(x: f64) -> f64
+extern fn round(x: f64) -> f64
+extern fn exp(x: f64) -> f64
+extern fn log(x: f64) -> f64
+extern fn log2(x: f64) -> f64
+extern fn log10(x: f64) -> f64
+extern fn sin(x: f64) -> f64
+extern fn cos(x: f64) -> f64
+extern fn tan(x: f64) -> f64
+extern fn asin(x: f64) -> f64
+extern fn acos(x: f64) -> f64
+extern fn atan(x: f64) -> f64
+extern fn atan2(y: f64, x: f64) -> f64
+extern fn sinh(x: f64) -> f64
+extern fn cosh(x: f64) -> f64
+extern fn tanh(x: f64) -> f64
+extern fn fmod(x: f64, y: f64) -> f64
+extern fn fmin(x: f64, y: f64) -> f64
+extern fn fmax(x: f64, y: f64) -> f64
+
+/// `base ^ exp` on `i64`, wrapping; a negative exponent panics.
+export fn grt_pow_i64(base: i64, exp: i64) -> i64 {
+    if exp < 0 {
+        panic.neg_pow()
+    }
+    grt_pow_u64(base, exp)
+}
+
+/// `base ^ exp` modulo 2^64 over the whole exponent, read unsigned:
+/// square and multiply, every bit of `exp` counted ([T-U64]).
+export fn grt_pow_u64(base: i64, exp: i64) -> i64 {
+    var b = base.as_u64()
+    var e = exp.as_u64()
+    var acc: u64 = 1
+    while e > 0 {
+        if e.bit_and(1) == 1 {
+            acc = acc * b
+        }
+        b = b * b
+        e = e.ushr(1)
+    }
+    acc.as_i64()
+}
+
+export fn grt_pow_f64(base: f64, e: f64) -> f64 {
+    unsafe { pow(base, e) }
+}
+
+/// `a % b` on `f64`, which Rust lowers to `fmod`.
+export fn grt_f64_rem(a: f64, b: f64) -> f64 {
+    unsafe { fmod(a, b) }
+}
+
+/// `abs` wraps: `i64`'s minimum is its own absolute value ([L-LIB-ROUND]).
+export fn grt_i64_abs(v: i64) -> i64 {
+    if v < 0 { 0 - v } else { v }
+}
+
+export fn grt_i64_min(a: i64, b: i64) -> i64 {
+    if a <= b { a } else { b }
+}
+
+export fn grt_i64_max(a: i64, b: i64) -> i64 {
+    if a >= b { a } else { b }
+}
+
+/// The sign bit cleared, NaN included, as `f64::abs` does.
+export fn grt_f64_abs(v: f64) -> f64 {
+    v.to_bits().bit_and(0x7fff_ffff_ffff_ffff).from_bits()
+}
+
+export fn grt_f64_sqrt(v: f64) -> f64 {
+    unsafe { sqrt(v) }
+}
+
+export fn grt_f64_floor(v: f64) -> f64 {
+    unsafe { floor(v) }
+}
+
+export fn grt_f64_ceil(v: f64) -> f64 {
+    unsafe { ceil(v) }
+}
+
+/// Ties away from zero ([L-LIB-ROUND]), which is libm's `round`.
+export fn grt_f64_round(v: f64) -> f64 {
+    unsafe { round(v) }
+}
+
+/// A signalling NaN made quiet, as LLVM does to `minnum`'s operands before
+/// arm64's `fminnm`, which would answer NaN for a signalling one where
+/// `f64::min` answers the other operand. Measured: `mathfuzz` found
+/// `min(sNaN, 1.0)` is `1.0` in the Rust runtime and was NaN here.
+fn quiet(x: f64) -> f64 {
+    if x != x { x.to_bits().bit_or(0x0008_0000_0000_0000).from_bits() } else { x }
+}
+
+/// `minnum`: a NaN loses to a number, either kind of NaN; two NaNs answer
+/// the first, quiet; `-0.0` is less than `0.0`.
+export fn grt_f64_min(a: f64, b: f64) -> f64 {
+    unsafe { fmin(quiet(a), quiet(b)) }
+}
+
+export fn grt_f64_max(a: f64, b: f64) -> f64 {
+    unsafe { fmax(quiet(a), quiet(b)) }
+}
+
+export fn grt_f64_sin(v: f64) -> f64 {
+    unsafe { sin(v) }
+}
+
+export fn grt_f64_cos(v: f64) -> f64 {
+    unsafe { cos(v) }
+}
+
+export fn grt_f64_tan(v: f64) -> f64 {
+    unsafe { tan(v) }
+}
+
+export fn grt_f64_asin(v: f64) -> f64 {
+    unsafe { asin(v) }
+}
+
+export fn grt_f64_acos(v: f64) -> f64 {
+    unsafe { acos(v) }
+}
+
+export fn grt_f64_atan(v: f64) -> f64 {
+    unsafe { atan(v) }
+}
+
+export fn grt_f64_sinh(v: f64) -> f64 {
+    unsafe { sinh(v) }
+}
+
+export fn grt_f64_cosh(v: f64) -> f64 {
+    unsafe { cosh(v) }
+}
+
+export fn grt_f64_tanh(v: f64) -> f64 {
+    unsafe { tanh(v) }
+}
+
+export fn grt_f64_exp(v: f64) -> f64 {
+    unsafe { exp(v) }
+}
+
+export fn grt_f64_ln(v: f64) -> f64 {
+    unsafe { log(v) }
+}
+
+export fn grt_f64_log2(v: f64) -> f64 {
+    unsafe { log2(v) }
+}
+
+export fn grt_f64_log10(v: f64) -> f64 {
+    unsafe { log10(v) }
+}
+
+export fn grt_f64_cbrt(v: f64) -> f64 {
+    unsafe { cbrt(v) }
+}
+
+/// `core`'s `to_radians`: times `PI / 180.0`, folded to this constant.
+export fn grt_f64_to_radians(v: f64) -> f64 {
+    v * 0x3f91_df46_a252_9d39.from_bits()
+}
+
+/// `core`'s `to_degrees`: times `180.0 / PI`, folded to this constant.
+export fn grt_f64_to_degrees(v: f64) -> f64 {
+    v * 0x404c_a5dc_1a63_c1f8.from_bits()
+}
+
+export fn grt_f64_atan2(a: f64, b: f64) -> f64 {
+    unsafe { atan2(a, b) }
+}
+
+export fn grt_f64_hypot(a: f64, b: f64) -> f64 {
+    unsafe { hypot(a, b) }
+}
+
+/// `a.log(b)`: a ratio of natural logarithms, as `std` computes it.
+export fn grt_f64_log(a: f64, b: f64) -> f64 {
+    unsafe { log(a) / log(b) }
+}
+
+export fn grt_f64_is_nan(x: f64) -> i8 {
+    if x != x { 1 } else { 0 }
+}
+
+/// Neither NaN nor an infinity: the exponent is not all ones.
+export fn grt_f64_is_finite(x: f64) -> i8 {
+    let e = x.to_bits().bit_and(0x7ff0_0000_0000_0000)
+    if e != 0x7ff0_0000_0000_0000 { 1 } else { 0 }
+}

@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+# The linker the S5 gates hand `grasm build --native` (GRASM_LINKER;
+# scripts/lib/rtswap.sh). It links what the build gives it as given -- the
+# program as it ships -- and again with the Grasm runtime interposed in front
+# of the Rust one, into `<out>.swap`, writing what that link bound to
+# `<out>.swaplog` (docs/self-hosting.md §6.7). When RTSWAP_POISON names a
+# poisoned Rust runtime, both are linked against it too, into `<out>.poison`
+# and `<out>.swap.poison`.
+#
+#   RTSWAP_LINK    the linker (compiler/link)
+#   RTSWAP_RT      the Grasm runtime's object
+#   RTSWAP_POISON  optional: a runtime archive built with grasm_rt/poison
+#   RTSWAP_ONLY    =1: link only with the Grasm runtime interposed, into
+#                  `<out>` itself, so whatever runs the output runs that
+#                  (`scripts/rtwith.sh`), writing what it bound to
+#                  RTSWAP_LOG if that is set
+set -u
+if [ "${RTSWAP_ONLY:-}" = 1 ]; then
+    if [ -n "${RTSWAP_LOG:-}" ]; then
+        exec "$RTSWAP_LINK" -interpose "$RTSWAP_RT" -interpose_log "$RTSWAP_LOG" "$@"
+    fi
+    exec "$RTSWAP_LINK" -interpose "$RTSWAP_RT" "$@"
+fi
+out=""
+prev=""
+for a in "$@"; do
+    if [ "$prev" = "-o" ]; then
+        out=$a
+    fi
+    prev=$a
+done
+if [ -z "$out" ]; then
+    echo "rtswap_link: no -o in the link line" >&2
+    exit 2
+fi
+
+# The link line with its output renamed to $1 and, if $2 is given, the
+# runtime archive replaced by it; into the array LINE.
+line() {
+    local to=$1 rt=$2 a p=""
+    LINE=()
+    for a in "${@:3}"; do
+        if [ "$p" = "-o" ]; then
+            a=$to
+        elif [ -n "$rt" ] && [ "${a##*/}" = libgrasm_rt_abi.a ]; then
+            a=$rt
+        fi
+        LINE+=("$a")
+        p=$a
+    done
+}
+
+"$RTSWAP_LINK" "$@" || exit $?
+line "$out.swap" "" "$@"
+"$RTSWAP_LINK" -interpose "$RTSWAP_RT" -interpose_log "$out.swaplog" "${LINE[@]}" || exit $?
+if [ -n "${RTSWAP_POISON:-}" ]; then
+    line "$out.poison" "$RTSWAP_POISON" "$@"
+    "$RTSWAP_LINK" "${LINE[@]}" || exit $?
+    line "$out.swap.poison" "$RTSWAP_POISON" "$@"
+    "$RTSWAP_LINK" -interpose "$RTSWAP_RT" "${LINE[@]}" || exit $?
+fi

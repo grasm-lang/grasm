@@ -1,0 +1,247 @@
+// Measures the layouts `compiler/rt/src/layout.gr` writes down, in a program
+// linked with the Rust runtime (docs/self-hosting.md §6.7): it makes values
+// through the runtime's own C entry points and reads their bytes. One line
+// per constant, `NAME value`; `scripts/rtlayout.sh` compares the two by name.
+//
+//     grasm build compiler/rt/probe/layout.gr --native -o probe && ./probe
+//
+// Built and linked as any program is, never with the Grasm runtime
+// interposed: what it measures is the Rust runtime.
+
+extern fn grasm_box_i64(v: i64) -> addr
+extern fn grasm_box_f64(v: f64) -> addr
+extern fn grasm_box_unit() -> addr
+extern fn grasm_box_ref(v: i64) -> addr
+extern fn grasm_box_u64(v: i64) -> addr
+extern fn grasm_str_lit(p: addr, n: i64) -> addr
+extern fn grasm_str_lit_immortal(p: addr, n: i64) -> addr
+extern fn grasm_str_len(v: addr) -> i64
+extern fn grasm_str_build() -> i64
+extern fn grasm_str_build_text(at: i64, p: i64, n: i64)
+extern fn grasm_str_build_end(at: i64) -> addr
+extern fn grasm_list_new_scalar(kind: i64) -> addr
+extern fn grasm_list_push_scalar(l: addr, bits: i64, kind: i64) -> addr
+extern fn grasm_list_new() -> addr
+extern fn grasm_list_push(l: addr, v: addr) -> addr
+extern fn grasm_tuple2(a: addr, b: addr) -> addr
+extern fn grasm_map_new() -> addr
+extern fn grasm_bytes_filled(n: i64, b: i64) -> addr
+extern fn grasm_strbuf_new() -> addr
+extern fn grasm_bytebuf_new() -> addr
+extern fn grasm_variant_new(tp: addr, tl: i64, vp: addr, vl: i64) -> addr
+extern fn grasm_fn_new(code: i64, env: addr, np: addr, nl: i64) -> addr
+extern fn grasm_region_push()
+extern fn grasm_region_pop()
+extern fn grasm_val_dec(v: addr)
+
+fn say(name: str, v: i64) {
+    print("{name} {v}")
+}
+
+/// The offset of the first of words `at .. at + n*8` that holds `want`, or -1.
+fn find_word(a: addr, from: i64, n: i64, want: i64) -> i64 / {unsafe, mem} {
+    var k = 0
+    while k < n {
+        if unsafe { a.offset(from + 8 * k).load_i64() } == want {
+            return 8 * k
+        }
+        k += 1
+    }
+    -1
+}
+
+/// The offset of the first byte in `at .. at + n` equal to `want`, or -1.
+fn find_byte(a: addr, from: i64, n: i64, want: i64) -> i64 / {unsafe, mem} {
+    var k = 0
+    while k < n {
+        if unsafe { a.offset(from + k).load_u8() }.as_i64() == want {
+            return from + k
+        }
+        k += 1
+    }
+    -1
+}
+
+/// `n` bytes of the letter `c` in fresh memory.
+fn letters(c: i64, n: i64) -> addr / {unsafe, mem} {
+    let t = unsafe { mem_alloc(n + 8, 8) }
+    var k = 0
+    while k < n {
+        unsafe { t.offset(k).store_u8(c.as_u8()) }
+        k += 1
+    }
+    t
+}
+
+fn main() / {io, unsafe, mem} {
+    unsafe {
+        // The header: a fresh box counts one, and a float's word follows the tag.
+        let f = grasm_box_f64(1.5)
+        say("RC", find_word(f, 0, 8, 1))
+        say("BOX_SIZE", 64)
+        say("TAG", if f.offset(8).load_u8().as_i64() == 3 and f.offset(16).load_f64() == 1.5 { 8 } else { -1 })
+        say("TAG_F64", f.offset(8).load_u8().as_i64())
+        say("WORD_AT", if f.offset(16).load_f64() == 1.5 { 16 } else { -1 })
+        grasm_val_dec(f)
+        // A freed box's count: what the poisoned runtime marks it with, which
+        // only a probe linked with that runtime measures (the ordinary one
+        // keeps the box in its pool, the count a link in the chain).
+        say("POISON", f.load_i64())
+
+        // Interned and region-owned counts. The interned boxes are one block,
+        // `false` and `true` and then -128 up (`interned_base`), so `true` is
+        // the box before -128's -- reached that way because `grasm_box_bool`
+        // takes an `i8` the Cranelift build declares its own way.
+        let t = grasm_box_i64(-128).offset(-64)
+        say("IMMORTAL", t.load_i64())
+        say("TAG_BOOL", t.offset(8).load_u8().as_i64())
+        say("BOOL_AT", find_byte(t, 9, 7, 1))
+        grasm_region_push()
+        let r = grasm_box_unit()
+        say("ARENA", r.load_i64())
+        grasm_region_pop()
+
+        let i = grasm_box_i64(123456789)
+        say("TAG_I64", i.offset(8).load_u8().as_i64())
+        grasm_val_dec(i)
+        let u = grasm_box_unit()
+        say("TAG_UNIT", u.offset(8).load_u8().as_i64())
+        grasm_val_dec(u)
+        let rf = grasm_box_ref(77)
+        say("TAG_REF", rf.offset(8).load_u8().as_i64())
+        grasm_val_dec(rf)
+        let w = grasm_box_u64(99)
+        say("TAG_U64", w.offset(8).load_u8().as_i64())
+        grasm_val_dec(w)
+
+        // A short string: inline.
+        let abc = letters(97, 3)
+        abc.offset(1).store_u8(98)
+        abc.offset(2).store_u8(99)
+        let s = grasm_str_lit(abc, 3)
+        say("TAG_STR", s.offset(8).load_u8().as_i64())
+        say("STR_BYTES", find_byte(s, 16, 48, 97))
+        say("STR_LEN", find_byte(s, 16, 48, 3))
+        let inline_disc = s.offset(16).load_u8().as_i64()
+        say("STR_INLINE", inline_disc)
+        say("STR_INDEX", if s.offset(56).load_i64() == 0 { 56 } else { -1 })
+        grasm_val_dec(s)
+        // The longest inline string and the shortest on the heap.
+        let l38 = letters(120, 39)
+        let s38 = grasm_str_lit(l38, 38)
+        let s39 = grasm_str_lit(l38, 39)
+        let d38 = s38.offset(16).load_u8().as_i64()
+        let d39 = s39.offset(16).load_u8().as_i64()
+        say("STR_CAP", if d38 == inline_disc and d39 != inline_disc { 38 } else { -1 })
+        say("STR_HEAP", d39)
+        say("STR_DISC", if d38 != d39 { 16 } else { -1 })
+        grasm_val_dec(s38)
+
+        // A `String` whose three words all differ: a builder holding three
+        // bytes has capacity eight.
+        let b = grasm_str_build()
+        let bp = mem_addr(b)
+        // The program's first builder is a fresh `String::new()`, which has
+        // not allocated: two of its words are zero and the third is the
+        // dangling pointer.
+        let w0 = bp.load_i64()
+        let w1 = bp.offset(8).load_i64()
+        let w2 = bp.offset(16).load_i64()
+        var dangling = -1
+        if w1 == 0 and w2 == 0 {
+            dangling = w0
+        } else if w0 == 0 and w2 == 0 {
+            dangling = w1
+        } else if w0 == 0 and w1 == 0 {
+            dangling = w2
+        }
+        let three = letters(122, 3)
+        grasm_str_build_text(b, three.as_i64(), 3)
+        let len_at = find_word(bp, 0, 3, 3)
+        let cap_at = find_word(bp, 0, 3, 8)
+        say("VEC_LEN", len_at)
+        say("VEC_CAP", cap_at)
+        say("U8_MIN_CAP", bp.offset(cap_at).load_i64())
+        // The pointer is the word that is neither, and holds the bytes.
+        let ptr_at = 24 - len_at - cap_at
+        let p = mem_addr(bp.offset(ptr_at).load_i64())
+        say("VEC_PTR", if p.load_u8().as_i64() == 122 { ptr_at } else { -1 })
+        say("U8_DANGLING", dangling)
+        let built = grasm_str_build_end(b)
+        grasm_val_dec(built)
+
+        // The character index, which `len` builds for text of 256 bytes and
+        // more: a `Box<CharIndex>`, its count a `u32` beside a `Vec<u32>` of
+        // where each character starts. 150 two-byte characters, then 300
+        // bytes of ASCII, whose index has a count and no offsets.
+        let wide = letters(0, 300)
+        var k = 0
+        while k < 300 {
+            wide.offset(k).store_u8(195)
+            wide.offset(k + 1).store_u8(169)
+            k += 2
+        }
+        let ws = grasm_str_lit(wide, 300)
+        let chars = grasm_str_len(ws)
+        let ix = mem_addr(ws.offset(56).load_i64())
+        // The `Vec` is the three words whose length is 150 and whose
+        // offsets run 0, 2, 4.
+        var vec_at = -1
+        var at = 0
+        while at <= 8 {
+            let p = ix.offset(at + ptr_at).load_i64()
+            if ix.offset(at + len_at).load_i64() == 150 and p > 65536 {
+                let o = mem_addr(p)
+                if o.load_u32().as_i64() == 0 and o.offset(4).load_u32().as_i64() == 2 and o.offset(596).load_u32().as_i64() == 298 {
+                    vec_at = at
+                }
+            }
+            at += 8
+        }
+        let count_at = if vec_at == 0 { 24 } else { 0 }
+        say("CHARINDEX_VEC", vec_at)
+        say("CHARINDEX_COUNT", if chars == 150 and ix.offset(count_at).load_u32().as_i64() == 150 { count_at } else { -1 })
+        grasm_val_dec(ws)
+        let flat = letters(97, 300)
+        let fs = grasm_str_lit(flat, 300)
+        let _n = grasm_str_len(fs)
+        let fx = mem_addr(fs.offset(56).load_i64())
+        say("U32_DANGLING", if fx.offset(vec_at + len_at).load_i64() == 0 and fx.offset(vec_at + cap_at).load_i64() == 0 and fx.offset(count_at).load_u32().as_i64() == 300 { fx.offset(vec_at + ptr_at).load_i64() } else { -1 })
+        grasm_val_dec(fs)
+
+        // The heap string's `String` sits at STR_STRING, in the same order.
+        let hp = s39.offset(24)
+        say("STR_STRING", if hp.offset(len_at).load_i64() == 39 and mem_addr(hp.offset(ptr_at).load_i64()).load_u8().as_i64() == 120 { 24 } else { -1 })
+        grasm_val_dec(s39)
+
+        // The other payloads' tags.
+        let sl = grasm_list_push_scalar(grasm_list_new_scalar(0), 5, 0)
+        say("TAG_LIST_SCALAR", sl.offset(8).load_u8().as_i64())
+        grasm_val_dec(sl)
+        let bl = grasm_list_push(grasm_list_new(), grasm_box_f64(2.5))
+        say("TAG_LIST", bl.offset(8).load_u8().as_i64())
+        grasm_val_dec(bl)
+        let tp = grasm_tuple2(grasm_box_f64(1.0), grasm_box_f64(2.0))
+        say("TAG_TUPLE", tp.offset(8).load_u8().as_i64())
+        grasm_val_dec(tp)
+        let m = grasm_map_new()
+        say("TAG_MAP", m.offset(8).load_u8().as_i64())
+        grasm_val_dec(m)
+        let by = grasm_bytes_filled(4, 7)
+        say("TAG_BYTES", by.offset(8).load_u8().as_i64())
+        grasm_val_dec(by)
+        let sb = grasm_strbuf_new()
+        say("TAG_STRBUF", sb.offset(8).load_u8().as_i64())
+        grasm_val_dec(sb)
+        let bb = grasm_bytebuf_new()
+        say("TAG_BYTEBUF", bb.offset(8).load_u8().as_i64())
+        grasm_val_dec(bb)
+        let names = letters(65, 2)
+        let v = grasm_variant_new(names, 1, names.offset(1), 1)
+        say("TAG_VARIANT", v.offset(8).load_u8().as_i64())
+        grasm_val_dec(v)
+        let fv = grasm_fn_new(0, mem_addr(0), names, 0)
+        say("TAG_FN", fv.offset(8).load_u8().as_i64())
+        grasm_val_dec(fv)
+    }
+}

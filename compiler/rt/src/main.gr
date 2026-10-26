@@ -1,0 +1,53 @@
+// `rt`: the runtime compiled programs link, in Grasm (docs/self-hosting.md
+// §6.7, stage S5), against today's ABI -- the C entry points of
+// `libgrasm_rt_abi.a` and the memory layouts its values have.
+//
+// It moves one family of functions at a time, and until the last one has
+// moved the Rust archive is linked behind it:
+//
+//     grasm tir compiler/rt/src/main.gr > rt.tir
+//     s3 rt.tir -o rt.o --runtime
+//     grasm-link <program objects> -interpose rt.o libgrasm_rt_abi.a ...
+//
+// Each `export fn grt_<name>` here is the program's `grasm_<name>`: the
+// linker binds the program's references to it (`-interpose`), and the Grasm
+// runtime's own `extern fn grasm_<name>` declarations still reach the
+// archive's. Those are of two kinds, and `scripts/rtswap.sh` holds both to a
+// list: a family that has not moved yet, and the *state* the Rust code that
+// is still linked keeps using -- the box allocator and its live count, the
+// output buffers, the panic and exit path -- which moves last, with the last
+// of that code.
+//
+// The rules the code keeps:
+//
+//   * no Grasm heap value -- no `str`, list, map, struct or closure: only
+//     the layout types and raw memory, so nothing here calls the runtime
+//     it is part of to make one;
+//   * no thread-local cell and no process-wide state: the program's cells
+//     share one block with the runtime's, laid out by the program's own
+//     compilation, and Grasm has no global;
+//   * fixed text is code (`text.gr`, written by `gen_text.py`);
+//   * every layout it reads or writes is in `layout.gr` and checked against
+//     the Rust runtime's by `scripts/rtlayout.sh`.
+//
+// The families, each in its own module:
+//
+//     math     integer power, `%` on floats, abs/min/max, rounding, libm
+//     panic    the panics' messages; the way out is still Rust's
+//     fmt      integers and floats as text, bit-identical to Rust's `{}`
+//     out      `print`'s pieces, written through the Rust runtime's buffer
+//     numstr   numbers as string values and as interpolated pieces
+//     strread  strings read: length in bytes, emptiness, equality, order
+//     val      reference counting
+//
+// and three that serve them: `layout`, `text` and `sys` (the C library).
+import math
+import panic
+import text
+import layout
+import fmt
+import out
+import numstr
+import strread
+import val
+import sys

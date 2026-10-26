@@ -31,6 +31,9 @@ type TirInfo = {
     /// The field types of instantiated generic types (`mono.field_types`),
     /// by `mono.field_key`.
     field_ty: Map[str, i64],
+    /// The runtime written in Grasm (`index`'s `lib`): its C calls are its
+    /// own and are not reported to `grasm_foreign_call`.
+    runtime: bool,
 }
 
 /// Keeps a symbol to the characters every tool accepts.
@@ -102,14 +105,19 @@ fn callees_of(info: TirInfo, root: i64) -> [i64] {
     out
 }
 
-/// Indexes the program and answers the whole-program questions.
-pub fn index(t: TirTree) -> TirInfo ! str {
+/// Indexes the program and answers the whole-program questions. The
+/// runtime written in Grasm (`lib`, docs/self-hosting.md §6.7) is reached
+/// from its `export fn`s instead of from `main`, which it does not have and
+/// whose entry it does not get.
+pub fn index(t: TirTree, lib: bool) -> TirInfo ! str {
     var info = TirInfo{
         t: t, c_name: [], c_elem: [], c_const: [], fn_ix: {}, const_ix: {}, main_c: -1,
         e0: [], en: [], edges: [], reach: [], recursive: [], sym: [], type_ix: {}, field_ty: {},
+        runtime: lib,
     }
     var main_name = ""
     var consts: [i64] = []
+    var exported: [str] = []
     for r in t.roots {
         let k = sexp.kw(t, r)
         if k == "type" {
@@ -124,6 +132,8 @@ pub fn index(t: TirTree) -> TirInfo ! str {
             consts.push(r)
         } else if k == "main" {
             main_name = sexp.word(t, r, 1)
+        } else if k == "export" {
+            exported.push(sexp.word(t, r, 1))
         }
     }
     for r in consts {
@@ -133,12 +143,27 @@ pub fn index(t: TirTree) -> TirInfo ! str {
         info.c_elem.push(r)
         info.c_const.push(true)
     }
-    if main_name == "" {
-        fail("the program has no `main`")
-    }
-    info.main_c = info.fn_ix.get(main_name) ?? -1
-    if info.main_c < 0 {
-        fail("`main` names `{main_name}`, which is not a function")
+    var roots: [i64] = []
+    if lib {
+        for name in exported {
+            let c = info.fn_ix.get(name) ?? -1
+            if c < 0 {
+                fail("`export` names `{name}`, which is not a function")
+            }
+            roots.push(c)
+        }
+        if roots.is_empty() {
+            fail("the library exports nothing")
+        }
+    } else {
+        if main_name == "" {
+            fail("the program has no `main`")
+        }
+        info.main_c = info.fn_ix.get(main_name) ?? -1
+        if info.main_c < 0 {
+            fail("`main` names `{main_name}`, which is not a function")
+        }
+        roots.push(info.main_c)
     }
     let n = info.c_name.len()
     for c in 0..n {
@@ -151,8 +176,8 @@ pub fn index(t: TirTree) -> TirInfo ! str {
         info.reach.push(false)
         info.recursive.push(false)
     }
-    // What `main` reaches.
-    var work: [i64] = [info.main_c]
+    // What `main` reaches, or a library's exports.
+    var work: [i64] = roots
     while not work.is_empty() {
         let c = work.pop() ?? 0
         if info.reach[c] {

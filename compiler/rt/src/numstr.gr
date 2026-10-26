@@ -1,0 +1,132 @@
+// Numbers made into text that the program keeps: `n.to_str()`, and the
+// numbers and booleans of an interpolated string, `"x = {x}"`.
+//
+// Interpolation builds in a buffer the Rust runtime hands out
+// (`grasm_str_build`, a `String` it keeps per thread for its capacity) and
+// turns into a value when done (`grasm_str_build_end`); the pieces between
+// are appended here, into that `String`, grown as `RawVec` grows it. A value
+// of text is a box the Rust runtime's allocator gives (`grasm_box_unit`: its
+// pool, its live count and the open region are state the Rust code still
+// linked shares, docs/self-hosting.md §6.7) with its payload written here,
+// as `RtStr::of` writes one.
+import fmt
+import sys
+import layout
+
+extern fn grasm_box_unit() -> addr
+
+/// Appends `n` bytes at `p` to the `String` at `s`, growing it as `RawVec`
+/// does: to twice its capacity, or to what is needed if that is more, and
+/// never to less than `U8_MIN_CAP`.
+pub fn string_push(s: addr, p: addr, n: i64) {
+    let cap = unsafe { s.offset(layout.VEC_CAP).load_i64() }
+    let len = unsafe { s.offset(layout.VEC_LEN).load_i64() }
+    var ptr = unsafe { s.offset(layout.VEC_PTR).load_addr() }
+    if len + n > cap {
+        var want = cap * 2
+        if want < len + n {
+            want = len + n
+        }
+        if want < layout.U8_MIN_CAP {
+            want = layout.U8_MIN_CAP
+        }
+        // An empty `String` holds a dangling pointer, never allocated.
+        ptr = if cap == 0 { sys.alloc(want) } else { sys.grow(ptr, want) }
+        unsafe {
+            s.offset(layout.VEC_PTR).store_addr(ptr)
+            s.offset(layout.VEC_CAP).store_i64(want)
+        }
+    }
+    sys.copy(unsafe { ptr.offset(len) }, p, n)
+    unsafe { s.offset(layout.VEC_LEN).store_i64(len + n) }
+}
+
+/// A new string value holding the `n` bytes at `p`.
+pub fn new_str(p: addr, n: i64) -> addr {
+    let v = unsafe { grasm_box_unit() }
+    unsafe {
+        v.offset(layout.TAG).store_u8(layout.TAG_STR.as_u8())
+        v.offset(layout.STR_INDEX).store_i64(0)
+    }
+    if n <= layout.STR_CAP {
+        // Inline. The bytes past the text are zero, as `StrData::of` leaves
+        // them: two inline strings are compared as whole arrays.
+        let at = unsafe { v.offset(layout.STR_BYTES) }
+        var k = 0
+        while k < layout.STR_CAP {
+            unsafe { at.offset(k).store_u8(0) }
+            k += 1
+        }
+        sys.copy(at, p, n)
+        unsafe {
+            v.offset(layout.STR_DISC).store_u8(layout.STR_INLINE.as_u8())
+            v.offset(layout.STR_LEN).store_u8(n.as_u8())
+        }
+    } else {
+        let buf = sys.alloc(n)
+        sys.copy(buf, p, n)
+        let s = unsafe { v.offset(layout.STR_STRING) }
+        unsafe {
+            v.offset(layout.STR_DISC).store_u8(layout.STR_HEAP.as_u8())
+            s.offset(layout.VEC_PTR).store_addr(buf)
+            s.offset(layout.VEC_LEN).store_i64(n)
+            s.offset(layout.VEC_CAP).store_i64(n)
+        }
+    }
+    v
+}
+
+export fn grt_str_from_i64(v: i64) -> addr {
+    let b = sys.alloc(fmt.INT_MAX)
+    let s = new_str(b, fmt.i64_text(v, b))
+    sys.dealloc(b)
+    s
+}
+
+/// A `u64` as text, unsigned ([T-U64]).
+export fn grt_str_from_u64(v: i64) -> addr {
+    let b = sys.alloc(fmt.INT_MAX)
+    let s = new_str(b, fmt.u64_text(v.as_u64(), b))
+    sys.dealloc(b)
+    s
+}
+
+export fn grt_str_from_f64(v: f64) -> addr {
+    let b = sys.alloc(fmt.F64_MAX)
+    let s = new_str(b, fmt.f64_text(v, b))
+    sys.dealloc(b)
+    s
+}
+
+export fn grt_str_from_bool(v: i8) -> addr {
+    let b = sys.alloc(8)
+    let s = new_str(b, fmt.bool_text(v != 0, b))
+    sys.dealloc(b)
+    s
+}
+
+/// An integer's digits appended to the builder `at` (a `String`).
+export fn grt_str_build_i64(at: i64, v: i64) {
+    let b = sys.alloc(fmt.INT_MAX)
+    string_push(unsafe { mem_addr(at) }, b, fmt.i64_text(v, b))
+    sys.dealloc(b)
+}
+
+/// A float, by its bits, appended to the builder `at`.
+export fn grt_str_build_f64(at: i64, bits: i64) {
+    let b = sys.alloc(fmt.F64_MAX)
+    string_push(unsafe { mem_addr(at) }, b, fmt.f64_text(bits.from_bits(), b))
+    sys.dealloc(b)
+}
+
+export fn grt_str_build_bool(at: i64, v: i64) {
+    let b = sys.alloc(8)
+    string_push(unsafe { mem_addr(at) }, b, fmt.bool_text(v != 0, b))
+    sys.dealloc(b)
+}
+
+/// An integer's digits at `data + at`, in a buffer the caller has made room
+/// in; answers how many.
+export fn grt_str_pin_i64(data: i64, at: i64, v: i64) -> i64 {
+    fmt.i64_text(v, unsafe { mem_addr(data).offset(at) })
+}
