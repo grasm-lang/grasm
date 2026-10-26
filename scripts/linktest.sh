@@ -187,7 +187,8 @@ for k in "${!S3_SRC[@]}"; do
         FAILED+=("$src (s3) — the backend fails: $(head -2 "$WORK/s3.err" | tr '\n' ' ')")
         continue
     fi
-    if ! s3_link "$WORK/p.o" "$WORK/s3cc" "$WORK/cclink.log"; then
+    # The reference is cc's link, whatever S3_LINKER says.
+    if ! S3_LINKER= s3_link "$WORK/p.o" "$WORK/s3cc" "$WORK/cclink.log"; then
         s3_fail=$((s3_fail + 1))
         FAILED+=("$src (s3) — cc does not link it: $(head -2 "$WORK/cclink.log" | tr '\n' ' ')")
         continue

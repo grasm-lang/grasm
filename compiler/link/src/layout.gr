@@ -217,7 +217,6 @@ fn synthesize(inout l: Ld, files: [i64]) -> () ! str {
                         continue
                     }
                     if k == state.T_IMPORT {
-                        l.g_used[g] = true
                         let name = l.g_name[g]
                         if t == objfile.R_BRANCH26 {
                             stub.set(name, g)
@@ -256,7 +255,6 @@ fn synthesize(inout l: Ld, files: [i64]) -> () ! str {
                 let pg = l.cu_pers_g[c]
                 let pa = l.cu_pers_atom[c]
                 if pg >= 0 and l.g_kind[pg] == state.G_DYLIB {
-                    l.g_used[pg] = true
                     got.set(l.g_name[pg], (pg, -1))
                     imp.set(l.g_name[pg], pg)
                 } else if pa >= 0 {

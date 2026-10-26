@@ -179,8 +179,7 @@ type Ld = {
     g_weak: [bool],
     g_pext: [bool],
     g_tlv: [bool],
-    /// Whether a live reference needs it, and its synthesized slots.
-    g_used: [bool],
+    /// Its synthesized slots: GOT entry, stub, import.
     g_got: [i64],
     g_stub: [i64],
     g_import: [i64],
@@ -222,8 +221,6 @@ type Ld = {
     stub_g: [i64],
     /// Imports in chained-fixup order: global symbol ids.
     imp_g: [i64],
-    errors: [str],
-    warnings: [str],
 }
 
 pub fn new_ld() -> Ld {
@@ -242,11 +239,11 @@ pub fn new_ld() -> Ld {
         r_subsec: [], r_atom: [], r_tkind: [], r_tatom: [], r_toff: [], r_tg: [], r_satom: [], r_soff: [],
         cu_atom: [], cu_len: [], cu_enc: [], cu_pers_g: [], cu_pers_atom: [], cu_lsda: [], cu_lsda_off: [],
         eh_atom: [], eh_cie: [], eh_of: [], eh_func: [], eh_lsda: [], eh_pers_g: [], eh_pers_atom: [],
-        g_map: {}, g_name: [], g_kind: [], g_def: [], g_dylib: [], g_weak: [], g_pext: [], g_tlv: [], g_used: [],
+        g_map: {}, g_name: [], g_kind: [], g_def: [], g_dylib: [], g_weak: [], g_pext: [], g_tlv: [],
         g_got: [], g_stub: [], g_import: [], g_weakref: [],
         o_seg: [], o_name: [], o_flags: [], o_p2: [], o_addr: [], o_size: [], o_off: [], o_atoms: [], o_kind: [], o_order: [],
         text_tail: 0, seg_text_size: 0, seg_dc: (0, 0, 0, 0), seg_data: (0, 0, 0, 0), seg_linkedit_addr: 0, a_got: {},
         eh_keep: [], eh_out_off: {}, tlv_template: 0, tlv_any: false,
-        got_g: [], got_atom: [], got_name: [], stub_g: [], imp_g: [], errors: [], warnings: [],
+        got_g: [], got_atom: [], got_name: [], stub_g: [], imp_g: [],
     }
 }

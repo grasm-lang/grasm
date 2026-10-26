@@ -14,8 +14,9 @@
 //     -dead_strip              keep only what the entry and the exports reach
 //     -exported_symbol <sym>   export only these (repeatable); each is kept
 //     -L<dir>, -l<name>        library search
-//     -syslibroot <sdk>        the SDK (default: $SDKROOT, else the Command
-//                              Line Tools' or Xcode's MacOSX.sdk)
+//     -syslibroot <sdk>        the SDK (default: $SDKROOT, else MacOSX.sdk
+//                              in DEVELOPER_DIR or xcode-select's directory,
+//                              as xcrun finds it)
 //     -strip                   the symbol table `strip -no_uuid` leaves, and
 //                              no LC_UUID: what `grasm build --native` ships
 //     -no_uuid                 no LC_UUID
@@ -115,11 +116,24 @@ fn sdk_path(l: Ld) -> str {
     if env_root != "" {
         return env_root
     }
-    let clt = "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk"
-    if file_exists(clt + "/SDKSettings.json") {
-        return clt
+    // The developer directory xcrun would use: DEVELOPER_DIR, else the one
+    // xcode-select chose, else the Command Line Tools', else Xcode's.
+    var dirs: [str] = []
+    let dev = env("DEVELOPER_DIR") ?? ""
+    if dev != "" {
+        dirs.push(dev)
     }
-    "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk"
+    dirs.push("/var/db/xcode_select_link")
+    dirs.push("/Library/Developer/CommandLineTools")
+    dirs.push("/Applications/Xcode.app/Contents/Developer")
+    for d in dirs {
+        for sdk in [d + "/SDKs/MacOSX.sdk", d + "/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk"] {
+            if file_exists(sdk + "/SDKSettings.json") {
+                return sdk
+            }
+        }
+    }
+    "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk"
 }
 
 /// The SDK's version, from its SDKSettings.json, as packed x.y.z.
