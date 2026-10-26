@@ -2908,13 +2908,17 @@ fn lower_binary(info: TirInfo, inout v: Vir, e: i64) -> i64 {
         return konst(v, 0)
     }
     if op == "pow" {
-        if ot != ir.TY_I64 {
-            bad(v, "outside the subset: `^` on {ty_text(t, e, 4)} {span_of(t, e)}")
-            return konst(v, 0)
-        }
         let a = value_of(info, v, ks[0])
         let b = value_of(info, v, ks[1])
-        return callrt(v, ir.RT_POW_I64, [a, b])
+        // `u64` by its own runtime function, whose exponent is never
+        // negative ([T-U64]); a narrower width as `i64` -- a negative
+        // exponent panics -- wrapped to the width after, as every other
+        // operator at a width is, and as the Cranelift build does.
+        if ot == ir.TY_U64 {
+            return rt(v, "grasm_pow_u64", [a, b], R_WORD)
+        }
+        let r = callrt(v, ir.RT_POW_I64, [a, b])
+        return wrap(v, ot, r)
     }
     if op != "add" and op != "sub" and op != "mul" and op != "div" and op != "rem" {
         bad(v, "outside the subset: operator `{op}` {span_of(t, e)}")
@@ -4764,6 +4768,7 @@ fn lower_method(info: TirInfo, inout v: Vir, e: i64) -> i64 {
         "str.parse_int/0" -> read_method(info, v, e, "grasm_str_parse_int", "", [], R_BOX)
         "str.parse_int_base/1" -> read_method(info, v, e, "grasm_str_parse_int_base", "w", [], R_BOX)
         "str.parse_u64/0" -> read_method(info, v, e, "grasm_str_parse_u64", "", [], R_BOX)
+        "str.parse_u64_base/1" -> read_method(info, v, e, "grasm_str_parse_u64_base", "w", [], R_BOX)
         "str.code_at/1" -> read_method(info, v, e, "grasm_str_code_at", "w", [], R_WORD)
         "str.lines/0" -> read_method(info, v, e, "grasm_str_lines", "", [], R_BOX)
         "str.words/0" -> read_method(info, v, e, "grasm_str_words", "", [], R_BOX)
@@ -5029,6 +5034,7 @@ pub fn method_known(sig: str) -> bool {
         "str.parse_int/0" -> true
         "str.parse_int_base/1" -> true
         "str.parse_u64/0" -> true
+        "str.parse_u64_base/1" -> true
         "str.code_at/1" -> true
         "str.lines/0" -> true
         "str.words/0" -> true

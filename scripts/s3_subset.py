@@ -60,7 +60,7 @@ register and travels in d0..d7 (AAPCS64).
        deref                               `r.value`, of a held type
        variant                             of a sum type, every field held
        binary add sub mul div rem          on an integer type or f64
-       binary pow                          on i64 or f64
+       binary pow                          on an integer type or f64
        binary eq ne lt le gt ge            on an integer type, f64, bool or
                                            addr
        binary eq ne                        on a reference (identity), or unit
@@ -253,7 +253,7 @@ METHODS = {
     "str.ends_with/1", "str.index_of/1", "str.to_lower/0", "str.to_upper/0",
     "str.trim/0", "str.trim_start/0", "str.trim_end/0", "str.replace/2",
     "str.repeat/1", "str.pad_start/2", "str.pad_end/2", "str.parse_int/0",
-    "str.parse_int_base/1", "str.parse_u64/0", "str.code_at/1", "str.lines/0",
+    "str.parse_int_base/1", "str.parse_u64/0", "str.parse_u64_base/1", "str.code_at/1", "str.lines/0",
     "str.words/0", "str.to_bytes/0",
     "list.len/0", "list.is_empty/0", "list.get/1", "list.contains/1", "list.join/1",
     "list.sum/0", "list.rev/0", "list.slice/2", "list.first/0", "list.last/0",
@@ -790,7 +790,7 @@ class Checker:
             if atom(ot) not in INTS and ot != "bool" and ot != "f64":
                 self.bad(f"`{op}` on {show(ot)} {span(e)}")
         elif op == "pow":
-            if ot != "i64" and ot != "f64":
+            if atom(ot) not in INTS and ot != "f64":
                 self.bad(f"`^` on {show(ot)} {span(e)}")
         elif op in ("add", "sub", "mul", "div", "rem"):
             if atom(ot) not in INTS and ot != "f64":

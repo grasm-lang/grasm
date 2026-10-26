@@ -7,6 +7,27 @@ makes shipping them honest rather than quiet.
 
 **Open S1: none. Open S2: none. Open S3: none. Open S4: none.**
 
+## Found on 2026-10-25 by the generators' third engine (S3, part five)
+
+**The Grasm backend refused `^` on every integer type but `i64` -- *closed,
+a gap in the backend*.** `scripts/fuzz_intwidth.py` was the first
+generator run with the Grasm backend as its third engine
+(`scripts/lib/s3engine.py`), and the backend declined all forty of its
+programs: "outside the subset: `^` on i32" (and `i8`, `i16`, `u8`, `u16`,
+`u32`, `u64`). Declined is not agreed, so with nothing compared the
+generator failed, as it is built to. No corpus program has `^` at a width,
+so `s3subset` could not see it. The Cranelift build computes `a ^ b` at a
+width as `i64` and wraps the answer to the width, and `u64` by its own
+runtime function, whose exponent is never negative; the Grasm backend now
+does the same, and the subset rule says so. Neither engine was wrong.
+
+**The Grasm backend refused `str.parse_u64_base` -- *closed, a gap in the
+backend*.** Found the same way, by `scripts/fuzz_laws.py`: one law of its
+218 was declined ("method `parse_u64_base` on str"), and no corpus program
+calls it. It is now the Cranelift build's call of
+`grasm_str_parse_u64_base`, as `parse_int_base` already was; all 218 laws
+agree on the three engines.
+
 ## Found on 2026-10-25 by the Grasm backend (S3, part four)
 
 **`+=` on a string field or element, twice, was a use after free in the
