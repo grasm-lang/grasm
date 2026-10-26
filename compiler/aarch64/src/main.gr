@@ -63,7 +63,7 @@ pub fn compile_fn(f: MirFn, rs: [Rule], ccm: [i64], fccm: [i64], opts: A64Opts, 
     if errs.len() > 0 {
         // Code the checker refused is not encoded: an operand in the wrong
         // register file is no instruction at all.
-        let none = A64Code{ sym: f.sym, words: [], rel_off: [], rel_kind: [], rel_symk: [], rel_sym: [], asm: [], frame: 0, nspill: al.nspill, nsaved: 0 }
+        let none = A64Code{ sym: f.sym, words: [], rel_off: [], rel_kind: [], rel_symk: [], rel_sym: [], asm: [], frame: 0, nspill: al.nspill, nsaved: 0, row_word: [], row_src: [] }
         return A64Result{ code: none, ra_errors: errs, corrupted: al.corrupted, vcode_text: vtext }
     }
     let code = try emit.emit(al, f.sym, opts.want_asm, callee_sym, rt_syms)

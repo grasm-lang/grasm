@@ -113,6 +113,14 @@ type Vir = {
     /// `concurrent` one: what a `spawn` belongs to.
     par_conc: [bool],
     errors: [str],
+    // Where the code comes from, for the line table: the span start (a
+    // global TIR offset) of the expression being lowered, recorded on every
+    // instruction emitted and every block's terminator; -1 where no source
+    // line stands for the code. `fn_span` is the function's own.
+    cur_span: i64,
+    span: [i64],
+    bspan: [i64],
+    fn_span: i64,
 }
 
 pub let LIFT_CLOSURE = 0
@@ -140,7 +148,7 @@ pub fn new_vir() -> Vir {
         split_out: -1, boxed_result: false, ok_te: -1,
         lift_kind: [], lift_elem: [], lift_caps: [], lift_capte: [], ret_kind: ir.TY_I64,
         handlers: 0, loop_handlers: [], par_list: [], par_sites: [], go_list: [], par_conc: [],
-        errors: [],
+        errors: [], cur_span: -1, span: [], bspan: [], fn_span: -1,
     }
 }
 
@@ -165,6 +173,7 @@ fn new_block(inout v: Vir) -> i64 {
     v.btv.push(-1)
     v.btt.push(-1)
     v.btf.push(-1)
+    v.bspan.push(-1)
     id
 }
 
@@ -199,6 +208,7 @@ fn emit(inout v: Vir, op: i64, dst: i64, a: i64, b: i64, imm: i64) -> i64 {
     v.imm.push(imm)
     v.ca0.push(v.cargs.len())
     v.can.push(0)
+    v.span.push(v.cur_span)
     id
 }
 
@@ -210,6 +220,7 @@ fn finish(inout v: Vir, k: i64, val: i64, t: i64, f: i64) {
     v.btv[b] = val
     v.btt[b] = t
     v.btf[b] = f
+    v.bspan[b] = v.cur_span
     v.open = false
 }
 
@@ -2496,6 +2507,28 @@ fn node_ty(t: TirTree, e: i64) -> i64 {
 }
 
 /// Where a node is, for a message: its first `@start:end`.
+/// Where a node's span starts and ends (`@start:end`), or -1 when it has none.
+fn span_start(t: TirTree, e: i64) -> i64 {
+    let w = span_of(t, e)
+    if w == "" {
+        return -1
+    }
+    let parts = w.substr(1, w.len() - 1).split(":")
+    parts[0].parse_int() ?? -1
+}
+
+fn span_end(t: TirTree, e: i64) -> i64 {
+    let w = span_of(t, e)
+    if w == "" {
+        return -1
+    }
+    let parts = w.substr(1, w.len() - 1).split(":")
+    if parts.len() < 2 {
+        return -1
+    }
+    parts[1].parse_int() ?? -1
+}
+
 fn span_of(t: TirTree, e: i64) -> str {
     if t.kind[e] != 2 {
         return ""
@@ -2560,6 +2593,18 @@ fn lower_expr(info: TirInfo, inout v: Vir, e: i64) -> i64 {
         bad(v, "outside the subset: a bare atom where an expression was expected")
         return -1
     }
+    let outer = v.cur_span
+    let at = span_start(t, e)
+    if at >= 0 {
+        v.cur_span = at
+    }
+    let x = lower_expr_at(info, v, e)
+    v.cur_span = outer
+    x
+}
+
+fn lower_expr_at(info: TirInfo, inout v: Vir, e: i64) -> i64 {
+    let t = info.t
     let k = sexp.kw(t, e)
     match k {
         "int" -> lower_int(info, v, e)
@@ -3276,6 +3321,10 @@ fn lower_panic(info: TirInfo, inout v: Vir, arg: i64) {
     if sexp.kw(t, arg) == "str" {
         let pieces = sexp.kids(t, arg)
         if pieces.len() == 1 and sexp.kw(t, pieces[0]) == "text" {
+            let at = span_start(t, arg)
+            if at >= 0 {
+                v.cur_span = at
+            }
             let args = text_args(v, sexp.word(t, pieces[0], 1))
             callrt(v, ir.RT_PANIC_MSG, args)
             return
@@ -3546,6 +3595,11 @@ fn lower_block(info: TirInfo, inout v: Vir, e: i64) -> i64 {
             discard(v, x)
         }
     }
+    // What leaving the block releases is its closing brace's.
+    let end = span_end(t, e)
+    if end > 0 {
+        v.cur_span = end - 1
+    }
     close_scope(v)
     last
 }
@@ -3680,6 +3734,17 @@ fn sub_pat(info: TirInfo, inout v: Vir, p: i64, x: i64, xte: i64, no: PatFail) {
 /// through when it matches, with its names bound (each owning a reference
 /// of its own when boxed), and branches to `no` when it does not.
 fn lower_pat(info: TirInfo, inout v: Vir, p: i64, s: i64, ste: i64, no: PatFail) {
+    // A pattern's tests are its own line's, as an expression's code is.
+    let outer = v.cur_span
+    let at = span_start(info.t, p)
+    if at >= 0 {
+        v.cur_span = at
+    }
+    lower_pat_at(info, v, p, s, ste, no)
+    v.cur_span = outer
+}
+
+fn lower_pat_at(info: TirInfo, inout v: Vir, p: i64, s: i64, ste: i64, no: PatFail) {
     let t = info.t
     let sty = ty_kind(t, ste)
     match sexp.kw(t, p) {
@@ -6665,6 +6730,8 @@ pub fn lower_callable(info: TirInfo, c: i64) -> Vir {
         }
         body = sexp.kids(t, e)[1]
     }
+    v.fn_span = span_start(t, body)
+    v.cur_span = v.fn_span
     // The function's own scope: its parameters.
     open_scope(v)
     if info.recursive[c] {
@@ -6729,6 +6796,11 @@ pub fn lower_callable(info: TirInfo, c: i64) -> Vir {
         switch_to(v, ok)
     }
     let x = lower_expr(info, v, body)
+    // Falling off the end is the closing brace's.
+    let body_end = span_end(t, body)
+    if body_end > 0 {
+        v.cur_span = body_end - 1
+    }
     if v.open and (v.split_out >= 0 or v.boxed_result) {
         leave_with(t, v, x, block_tail_te(t, body))
     }
@@ -6837,6 +6909,8 @@ pub fn lower_lifted_closure(info: TirInfo, e: i64, ids: [i64], tes: [i64]) -> Vi
         params = sexp.kids(t, ks[0])
     }
     let body = if task { ks[0] } else { ks[1] }
+    v.fn_span = span_start(t, e)
+    v.cur_span = v.fn_span
     if not task and ty_head(t, rte) == "fallible" {
         v.returns = true
         v.ok_te = ty_arg(t, rte, 1)
@@ -6882,6 +6956,10 @@ pub fn lower_lifted_closure(info: TirInfo, e: i64, ids: [i64], tes: [i64]) -> Vi
         }
     }
     let x = lower_expr(info, v, body)
+    let body_end = span_end(t, body)
+    if body_end > 0 {
+        v.cur_span = body_end - 1
+    }
     if v.open and v.boxed_result {
         leave_with(t, v, x, expr_te(t, body))
     }

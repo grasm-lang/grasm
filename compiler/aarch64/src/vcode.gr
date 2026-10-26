@@ -37,6 +37,12 @@ type VCode = {
     sym_id: [i64],
     bi0: [i64],
     bni: [i64],
+    /// Per instruction, the source offset it was selected for (`MirFn.ispan`),
+    /// -1 for none; `cur_src` is what `push` records; `span0` is the
+    /// function's own, for its prologue.
+    src: [i64],
+    cur_src: i64,
+    span0: i64,
 }
 
 pub let SYM_NONE = 0
@@ -52,7 +58,7 @@ pub fn new_vcode(sym: str) -> VCode {
     VCode{
         sym: sym, nvregs: 0, vcls: [], nparams: 0, nreg_int: 0, nreg_fp: 0, nslots: 0, nout: 0,
         mop: [], rd: [], rn: [], rm: [], ra: [], imm: [], imm2: [], cc: [], tgt: [],
-        symk: [], sym_id: [], bi0: [], bni: [],
+        symk: [], sym_id: [], bi0: [], bni: [], src: [], cur_src: -1, span0: -1,
     }
 }
 
@@ -69,6 +75,7 @@ pub fn push(inout vc: VCode, mop: i64, rd: i64, rn: i64, rm: i64) -> i64 {
     vc.tgt.push(-1)
     vc.symk.push(0)
     vc.sym_id.push(-1)
+    vc.src.push(vc.cur_src)
     i
 }
 

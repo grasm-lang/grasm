@@ -7,7 +7,9 @@
 //     LC_SEGMENT_64           one unnamed segment: __text, __cstring, __const,
 //                             and __DATA,__data for what the runtime writes
 //                             into (a struct descriptor's cache), with its
-//                             pointers as ARM64_RELOC_UNSIGNED relocations
+//                             pointers as ARM64_RELOC_UNSIGNED relocations;
+//                             then the __DWARF sections of the line table
+//                             (`dwarf.gr`), as clang places them
 //     LC_BUILD_VERSION        macOS; the Cranelift build omits it, and ld then
 //                             warns "no platform load command found"
 //     LC_SYMTAB, LC_DYSYMTAB  locals, then defined externals, then undefined
@@ -18,8 +20,11 @@
 // may move or drop each function and string independently, so no
 // displacement between two of them can be fixed here.
 //
-// Nothing depends on time, paths or hash order: two compilations of the same
-// TIR are the same bytes (`scripts/objtest.sh`).
+// Nothing depends on time or hash order: two compilations of the same TIR in
+// the same directory are the same bytes (`scripts/objtest.sh`). The one path
+// that is not TIR's is the compile unit's directory, which the caller gives,
+// as clang records its working directory.
+import dwarf
 
 type MoObj = {
     /// The code, one 32-bit instruction word per element.
@@ -46,6 +51,9 @@ type MoObj = {
     wbytes: [bytes],
     wrel_off: [i64],
     wrel_sym: [str],
+    /// The line table and what it needs (`dwarf.gr`), written when `debug`.
+    debug: bool,
+    dw: DwUnit,
 }
 
 pub let R_UNSIGNED = 0
@@ -60,8 +68,13 @@ pub let R_GOT_PAGEOFF12 = 6
 pub fn new_obj() -> MoObj {
     MoObj{
         text: [], fsym: [], foff: [], fext: [], rel_off: [], rel_kind: [], rel_sym: [], dsym: [], dbytes: [],
-        wsym: [], wbytes: [], wrel_off: [], wrel_sym: [],
+        wsym: [], wbytes: [], wrel_off: [], wrel_sym: [], debug: false, dw: dwarf.new_unit(),
     }
+}
+
+/// An empty line table, for the caller to fill (`dwarf.gr`).
+pub fn new_unit() -> DwUnit {
+    dwarf.new_unit()
 }
 
 // ----- bytes ----------------------------------------------------------------------
@@ -161,12 +174,23 @@ pub fn write(o: MoObj) -> bytes ! str {
         nsect += 1
         data_sect = nsect
     }
+    // The debug sections, if any: abbreviations, the compile unit, its
+    // strings and the line table, in the order clang writes them.
+    var dw = dwarf.sections(dwarf.new_unit(), [], 0)
+    if o.debug {
+        dw = dwarf.sections(o.dw, o.foff, text_size)
+        nsect += 4
+    }
     // Addresses within the segment.
     let text_addr = 0
     let cstr_addr = text_size
     let const_addr = cstr_addr + cstr_size
     let data_addr = if data_sect > 0 { align_up(const_addr + const_size, 8) } else { const_addr + const_size }
-    let vmsize = data_addr + data_size
+    let abbrev_addr = data_addr + data_size
+    let info_addr = abbrev_addr + dw.abbrev.len()
+    let dstr_addr = info_addr + dw.info.len()
+    let line_addr = dstr_addr + dw.str.len()
+    let vmsize = if o.debug { line_addr + dw.line.len() } else { data_addr + data_size }
     // Where each datum sits.
     var daddr: [i64] = []
     var dsect: [i64] = []
@@ -341,6 +365,22 @@ pub fn write(o: MoObj) -> bytes ! str {
         put32(drels, sym.bit_or(3.shl(25)).bit_or(1.shl(27)).bit_or(R_UNSIGNED.shl(28)))
         dq -= 1
     }
+    // The debug sections' addresses: 64-bit absolute, against `__text`
+    // (section 1) rather than a symbol, last address first, as clang's.
+    var irels = byte_builder()
+    var ik = dw.info_rel.len() - 1
+    while ik >= 0 {
+        put32(irels, dw.info_rel[ik])
+        put32(irels, 1.bit_or(3.shl(25)).bit_or(R_UNSIGNED.shl(28)))
+        ik -= 1
+    }
+    var lrels = byte_builder()
+    var lk = dw.line_rel.len() - 1
+    while lk >= 0 {
+        put32(lrels, dw.line_rel[lk])
+        put32(lrels, 1.bit_or(3.shl(25)).bit_or(R_UNSIGNED.shl(28)))
+        lk -= 1
+    }
 
     // Layout.
     let seg_cmd_size = 72 + 80 * nsect
@@ -348,7 +388,9 @@ pub fn write(o: MoObj) -> bytes ! str {
     let data_off = align_up(32 + sizeofcmds, 16)
     let rel_off = align_up(data_off + vmsize, 8)
     let drel_off = rel_off + rels.len()
-    let sym_off = align_up(drel_off + drels.len(), 8)
+    let irel_off = drel_off + drels.len()
+    let lrel_off = irel_off + irels.len()
+    let sym_off = align_up(lrel_off + lrels.len(), 8)
     let str_off = sym_off + 16 * nsyms
 
     var b = byte_builder()
@@ -430,6 +472,29 @@ pub fn write(o: MoObj) -> bytes ! str {
         put32(b, 0)
         put32(b, 0)
     }
+    if o.debug {
+        // S_REGULAR with S_ATTR_DEBUG, byte-aligned: the linker leaves them
+        // in the object, for `dsymutil` and debuggers.
+        let names = ["__debug_abbrev", "__debug_info", "__debug_str", "__debug_line"]
+        let addrs = [abbrev_addr, info_addr, dstr_addr, line_addr]
+        let sizes = [dw.abbrev.len(), dw.info.len(), dw.str.len(), dw.line.len()]
+        let roffs = [0, if dw.info_rel.len() > 0 { irel_off } else { 0 }, 0, if dw.line_rel.len() > 0 { lrel_off } else { 0 }]
+        let nrels = [0, dw.info_rel.len(), 0, dw.line_rel.len()]
+        for k in 0..4 {
+            name16(b, names[k])
+            name16(b, "__DWARF")
+            put64(b, addrs[k])
+            put64(b, sizes[k])
+            put32(b, data_off + addrs[k])
+            put32(b, 0)
+            put32(b, roffs[k])
+            put32(b, nrels[k])
+            put32(b, 0x02000000)
+            put32(b, 0)
+            put32(b, 0)
+            put32(b, 0)
+        }
+    }
     // LC_BUILD_VERSION: macOS, minimum 11.0, SDK 11.0, no tools.
     put32(b, 0x32)
     put32(b, 24)
@@ -482,12 +547,23 @@ pub fn write(o: MoObj) -> bytes ! str {
             }
         }
     }
+    if o.debug {
+        while b.len() < data_off + abbrev_addr {
+            put8(b, 0)
+        }
+        b.push_bytes(dw.abbrev)
+        b.push_bytes(dw.info)
+        b.push_bytes(dw.str)
+        b.push_bytes(dw.line)
+    }
     if b.len() != data_off + vmsize {
         fail("section contents end at {b.len()}, not {data_off + vmsize}")
     }
     pad_to(b, 8)
     b.push_bytes(rels.to_bytes())
     b.push_bytes(drels.to_bytes())
+    b.push_bytes(irels.to_bytes())
+    b.push_bytes(lrels.to_bytes())
     pad_to(b, 8)
     // nlist_64
     for k in 0..nsyms {

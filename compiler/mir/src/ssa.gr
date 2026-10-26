@@ -246,6 +246,7 @@ pub fn to_ssa(v: Vir, name: str, sym: str) -> MirFn ! str {
     f.returns = v.returns
     f.nslots = v.nslots
     f.floor = v.floor >= 0
+    f.span0 = v.fn_span
     var cur: [i64] = []
     var stamp: [i64] = []
     for x in 0..nv {
@@ -276,6 +277,7 @@ pub fn to_ssa(v: Vir, name: str, sym: str) -> MirFn ! str {
                 f.imm.push(0)
                 f.ca0.push(f.cargs.len())
                 f.can.push(0)
+                f.ispan.push(v.fn_span)
                 cur[x] = nvals
                 stamp[x] = 0
                 nvals += 1
@@ -333,10 +335,12 @@ pub fn to_ssa(v: Vir, name: str, sym: str) -> MirFn ! str {
             f.imm.push(v.imm[i])
             f.ca0.push(ca0)
             f.can.push(f.cargs.len() - ca0)
+            f.ispan.push(v.span[i])
         }
         f.bni.push(f.op.len() - f.bi0[nbi])
         let k = v.btk[b]
         f.tk.push(k)
+        f.tspan.push(v.bspan[b])
         var tv = -1
         if (k == ir.M_BRIF or k == ir.M_RET) and v.btv[b] >= 0 {
             let x = v.btv[b]
@@ -674,6 +678,7 @@ fn remove_dead(inout f: MirFn) {
     var imm: [i64] = []
     var ca0: [i64] = []
     var can: [i64] = []
+    var ispan: [i64] = []
     var bi0: [i64] = []
     var bni: [i64] = []
     for b in 0..nb {
@@ -689,6 +694,7 @@ fn remove_dead(inout f: MirFn) {
             imm.push(f.imm[i])
             ca0.push(f.ca0[i])
             can.push(f.can[i])
+            ispan.push(f.ispan[i])
         }
         bni.push(op.len() - bi0[b])
     }
@@ -699,12 +705,14 @@ fn remove_dead(inout f: MirFn) {
     f.imm = imm
     f.ca0 = ca0
     f.can = can
+    f.ispan = ispan
     f.bi0 = bi0
     f.bni = bni
 }
 
-fn add_jump_block(inout f: MirFn, target: i64, a0: i64, n: i64) -> i64 {
+fn add_jump_block(inout f: MirFn, target: i64, a0: i64, n: i64, span: i64) -> i64 {
     let id = ir.nblocks(f)
+    f.tspan.push(span)
     f.bp0.push(f.bparams.len())
     f.bnp.push(0)
     f.bi0.push(f.op.len())
@@ -735,12 +743,12 @@ fn split_edges(inout f: MirFn) {
             continue
         }
         if f.tan[b] > 0 {
-            let nbk = add_jump_block(f, f.tt[b], f.ta0[b], f.tan[b])
+            let nbk = add_jump_block(f, f.tt[b], f.ta0[b], f.tan[b], f.tspan[b])
             f.tt[b] = nbk
             f.tan[b] = 0
         }
         if f.fan[b] > 0 {
-            let nbk = add_jump_block(f, f.tf[b], f.fa0[b], f.fan[b])
+            let nbk = add_jump_block(f, f.tf[b], f.fa0[b], f.fan[b], f.tspan[b])
             f.tf[b] = nbk
             f.fan[b] = 0
         }

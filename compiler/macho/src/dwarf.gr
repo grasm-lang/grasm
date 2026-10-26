@@ -1,0 +1,330 @@
+// The debug information an object carries: DWARF 4 line tables, and the
+// little a line table needs to be found (docs/self-hosting.md, S3).
+//
+//     __debug_abbrev   the shapes of the entries below
+//     __debug_info     one compile unit -- its name, directory, the whole of
+//                      `__text` -- and a subprogram per function, so a
+//                      debugger can name the function an address is in
+//     __debug_str      the strings those entries name, each once
+//     __debug_line     the line table: one sequence per function, a row
+//                      wherever the source line changes
+//
+// This is what clang writes for C under `-gdwarf-4`, less the types and
+// variables: on Darwin the linker leaves debug sections in the object, and
+// `dsymutil` (or a debugger reading the objects in place) relocates them
+// through the executable's debug map. An address in them -- a compile unit's
+// or a subprogram's `DW_AT_low_pc`, a sequence's `DW_LNE_set_address` -- is a
+// `__text` address with an `ARM64_RELOC_UNSIGNED` relocation against the
+// section, as clang's are; offsets from one debug section into another are
+// plain numbers, as they are there.
+//
+// Line numbers come from the caller: the driver maps each instruction's
+// source offset (TIR's spans) to a file and a line.
+
+type DwUnit = {
+    producer: str,
+    /// The compile unit's name: the program's first file.
+    name: str,
+    comp_dir: str,
+    /// The line table's files, in TIR's loader order; rows name them from 1.
+    files: [str],
+    /// Per function, as `MoObj.fsym` has them: its name, its declaration's
+    /// file and line (0 and 0 when no source line stands for it).
+    fn_name: [str],
+    fn_file: [i64],
+    fn_line: [i64],
+    /// The rows, function by function, each function's in address order:
+    /// its index, the byte offset in it, the file (from 1) and the line
+    /// (0 for code no source line stands for).
+    row_fn: [i64],
+    row_off: [i64],
+    row_file: [i64],
+    row_line: [i64],
+}
+
+pub fn new_unit() -> DwUnit {
+    DwUnit{
+        producer: "", name: "", comp_dir: "", files: [], fn_name: [], fn_file: [], fn_line: [],
+        row_fn: [], row_off: [], row_file: [], row_line: [],
+    }
+}
+
+/// The four sections and, in `__debug_info` and `__debug_line`, the byte
+/// offsets of the 8-byte `__text` addresses the linker must relocate.
+type DwSections = {
+    abbrev: bytes,
+    info: bytes,
+    str: bytes,
+    line: bytes,
+    info_rel: [i64],
+    line_rel: [i64],
+}
+
+// Tags, attributes, forms (DWARF 4, §7.5).
+let TAG_COMPILE_UNIT = 0x11
+let TAG_SUBPROGRAM = 0x2e
+let AT_NAME = 0x03
+let AT_STMT_LIST = 0x10
+let AT_LOW_PC = 0x11
+let AT_HIGH_PC = 0x12
+let AT_COMP_DIR = 0x1b
+let AT_PRODUCER = 0x25
+let AT_DECL_FILE = 0x3a
+let AT_DECL_LINE = 0x3b
+let FORM_ADDR = 0x01
+let FORM_DATA4 = 0x06
+let FORM_STRP = 0x0e
+let FORM_UDATA = 0x0f
+let FORM_SEC_OFFSET = 0x17
+
+// Line-number opcodes (§6.2.5).
+let LNS_COPY = 1
+let LNS_ADVANCE_PC = 2
+let LNS_ADVANCE_LINE = 3
+let LNS_SET_FILE = 4
+let LNE_END_SEQUENCE = 1
+let LNE_SET_ADDRESS = 2
+
+fn put8(inout b: ByteBuilder, v: i64) {
+    b.push_byte(v.bit_and(255))
+}
+
+fn put16(inout b: ByteBuilder, v: i64) {
+    put8(b, v)
+    put8(b, v.ushr(8))
+}
+
+fn put32(inout b: ByteBuilder, v: i64) {
+    put16(b, v)
+    put16(b, v.ushr(16))
+}
+
+fn put64(inout b: ByteBuilder, v: i64) {
+    put32(b, v)
+    put32(b, v.ushr(32))
+}
+
+fn uleb(inout b: ByteBuilder, v: i64) {
+    var x = v
+    while true {
+        let byte = x.bit_and(127)
+        x = x.ushr(7)
+        if x == 0 {
+            put8(b, byte)
+            return
+        }
+        put8(b, byte.bit_or(128))
+    }
+}
+
+fn sleb(inout b: ByteBuilder, v: i64) {
+    var x = v
+    while true {
+        let byte = x.bit_and(127)
+        x = x.shr(7)
+        let done = (x == 0 and byte.bit_and(64) == 0) or (x == -1 and byte.bit_and(64) != 0)
+        if done {
+            put8(b, byte)
+            return
+        }
+        put8(b, byte.bit_or(128))
+    }
+}
+
+fn cstr(inout b: ByteBuilder, s: str) {
+    b.push_str(s)
+    put8(b, 0)
+}
+
+/// `__debug_str`, each string once, in the order first asked for.
+type StrPool = {
+    b: ByteBuilder,
+    at: Map[str, i64],
+}
+
+fn intern(inout p: StrPool, s: str) -> i64 {
+    match p.at.get(s) {
+        Some(k) -> k
+        None -> {
+            let k = p.b.len()
+            cstr(p.b, s)
+            p.at.set(s, k)
+            k
+        }
+    }
+}
+
+/// The debug sections for code laid out as `foff` says (each function's byte
+/// offset in `__text`, ascending) in a `__text` of `text_size` bytes.
+pub fn sections(u: DwUnit, foff: [i64], text_size: i64) -> DwSections {
+    let nf = foff.len()
+    var fsize: [i64] = []
+    for k in 0..nf {
+        let end = if k + 1 < nf { foff[k + 1] } else { text_size }
+        fsize.push(end - foff[k])
+    }
+
+    // __debug_abbrev
+    var ab = byte_builder()
+    uleb(ab, 1)
+    uleb(ab, TAG_COMPILE_UNIT)
+    put8(ab, 1)
+    for pair in [[AT_PRODUCER, FORM_STRP], [AT_NAME, FORM_STRP], [AT_STMT_LIST, FORM_SEC_OFFSET], [AT_COMP_DIR, FORM_STRP], [AT_LOW_PC, FORM_ADDR], [AT_HIGH_PC, FORM_DATA4]] {
+        uleb(ab, pair[0])
+        uleb(ab, pair[1])
+    }
+    put8(ab, 0)
+    put8(ab, 0)
+    // A function with a declaration's line, and one without (code no source
+    // line stands for: the C entry, wrappers).
+    uleb(ab, 2)
+    uleb(ab, TAG_SUBPROGRAM)
+    put8(ab, 0)
+    for pair in [[AT_LOW_PC, FORM_ADDR], [AT_HIGH_PC, FORM_DATA4], [AT_NAME, FORM_STRP], [AT_DECL_FILE, FORM_UDATA], [AT_DECL_LINE, FORM_UDATA]] {
+        uleb(ab, pair[0])
+        uleb(ab, pair[1])
+    }
+    put8(ab, 0)
+    put8(ab, 0)
+    uleb(ab, 3)
+    uleb(ab, TAG_SUBPROGRAM)
+    put8(ab, 0)
+    for pair in [[AT_LOW_PC, FORM_ADDR], [AT_HIGH_PC, FORM_DATA4], [AT_NAME, FORM_STRP]] {
+        uleb(ab, pair[0])
+        uleb(ab, pair[1])
+    }
+    put8(ab, 0)
+    put8(ab, 0)
+    put8(ab, 0)
+
+    // __debug_info
+    var sp = StrPool{ b: byte_builder(), at: {} }
+    var body = byte_builder()
+    var info_rel: [i64] = []
+    // The header is 11 bytes: the length, the version, the abbreviations'
+    // offset and the address size.
+    uleb(body, 1)
+    put32(body, intern(sp, u.producer))
+    put32(body, intern(sp, u.name))
+    put32(body, 0)
+    put32(body, intern(sp, u.comp_dir))
+    info_rel.push(11 + body.len())
+    put64(body, 0)
+    put32(body, text_size)
+    for k in 0..nf {
+        if fsize[k] <= 0 {
+            continue
+        }
+        let with_line = u.fn_line[k] > 0
+        uleb(body, if with_line { 2 } else { 3 })
+        info_rel.push(11 + body.len())
+        put64(body, foff[k])
+        put32(body, fsize[k])
+        put32(body, intern(sp, u.fn_name[k]))
+        if with_line {
+            uleb(body, u.fn_file[k])
+            uleb(body, u.fn_line[k])
+        }
+    }
+    put8(body, 0)
+    var info = byte_builder()
+    put32(info, 7 + body.len())
+    put16(info, 4)
+    put32(info, 0)
+    put8(info, 8)
+    info.push_bytes(body.to_bytes())
+
+    // __debug_line: the header after its length, version and header length.
+    var hdr = byte_builder()
+    put8(hdr, 1)
+    put8(hdr, 1)
+    put8(hdr, 1)
+    put8(hdr, -5)
+    put8(hdr, 14)
+    put8(hdr, 13)
+    for n in [0, 1, 1, 1, 1, 0, 0, 0, 1, 0, 0, 1] {
+        put8(hdr, n)
+    }
+    // No include directories: each file is named as the loader was given
+    // it, relative to the compile unit's directory if not absolute.
+    put8(hdr, 0)
+    for f in u.files {
+        cstr(hdr, f)
+        uleb(hdr, 0)
+        uleb(hdr, 0)
+        uleb(hdr, 0)
+    }
+    put8(hdr, 0)
+    var prog = byte_builder()
+    var prog_rel: [i64] = []
+    var r = 0
+    let nr = u.row_fn.len()
+    for k in 0..nf {
+        // This function's rows.
+        let r0 = r
+        while r < nr and u.row_fn[r] == k {
+            r += 1
+        }
+        if fsize[k] <= 0 or r == r0 {
+            continue
+        }
+        put8(prog, 0)
+        uleb(prog, 9)
+        put8(prog, LNE_SET_ADDRESS)
+        prog_rel.push(prog.len())
+        put64(prog, foff[k])
+        var file = 1
+        var line = 1
+        var off = 0
+        var first = true
+        for q in r0..r {
+            if not first and u.row_file[q] == file and u.row_line[q] == line {
+                continue
+            }
+            if u.row_off[q] >= fsize[k] {
+                break
+            }
+            if u.row_file[q] != file {
+                put8(prog, LNS_SET_FILE)
+                uleb(prog, u.row_file[q])
+                file = u.row_file[q]
+            }
+            if u.row_line[q] != line {
+                put8(prog, LNS_ADVANCE_LINE)
+                sleb(prog, u.row_line[q] - line)
+                line = u.row_line[q]
+            }
+            if u.row_off[q] != off {
+                put8(prog, LNS_ADVANCE_PC)
+                uleb(prog, u.row_off[q] - off)
+                off = u.row_off[q]
+            }
+            put8(prog, LNS_COPY)
+            first = false
+        }
+        if fsize[k] > off {
+            put8(prog, LNS_ADVANCE_PC)
+            uleb(prog, fsize[k] - off)
+        }
+        put8(prog, 0)
+        uleb(prog, 1)
+        put8(prog, LNE_END_SEQUENCE)
+    }
+    var lt = byte_builder()
+    // unit_length counts from after itself: the version (2), the header
+    // length (4), the header and the program.
+    put32(lt, 2 + 4 + hdr.len() + prog.len())
+    put16(lt, 4)
+    put32(lt, hdr.len())
+    lt.push_bytes(hdr.to_bytes())
+    let pbase = lt.len()
+    lt.push_bytes(prog.to_bytes())
+    var line_rel: [i64] = []
+    for o in prog_rel {
+        line_rel.push(pbase + o)
+    }
+    DwSections{
+        abbrev: ab.to_bytes(), info: info.to_bytes(), str: sp.b.to_bytes(), line: lt.to_bytes(),
+        info_rel: info_rel, line_rel: line_rel,
+    }
+}

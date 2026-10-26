@@ -17,11 +17,15 @@
 #     than a tool's presentation of it);
 #   * link with `cc` and the runtime, with nothing on the linker's output:
 #     the Cranelift build's objects make `ld` warn that they name no platform,
-#     and this writer's must not.
-#
-# Not run: `dwarfdump --verify`. This stage emits no DWARF yet (line tables
-# are S3 part two), and verifying an object with no debug information would
-# pass while checking nothing.
+#     and this writer's must not;
+#   * carry a DWARF line table `dwarfdump --verify` finds no error in, its
+#     addresses relocated against `__text` (`s3_macho.py relocs`);
+#   * map, by `dwarfdump --debug-line`, every instruction that loads the
+#     address of a string literal written once in the program to the file
+#     and line that literal is on, and no row past the end of its file
+#     (`s3_macho.py lines`). The literals are the sample of instructions
+#     whose right line is known from the source alone; their count is held
+#     to a floor, so a table that maps nothing cannot pass.
 set -uo pipefail
 cd "$(dirname "$0")/.."
 GRASM=${GRASM:-./target/release/grasm}
@@ -41,6 +45,7 @@ s3_collect
 checked=0
 identical=0
 problems=0
+lines_checked=0
 declare -a FAILED=()
 mkdir -p "$WORK/a" "$WORK/b/deeper"
 
@@ -82,6 +87,15 @@ for k in "${!S3_SRC[@]}"; do
     if ! python3 scripts/s3_macho.py relocs "$a" >"$WORK/relocs.txt" 2>&1; then
         bad="$bad; relocations: $(head -2 "$WORK/relocs.txt" | tr '\n' ' ')"
     fi
+    if ! dwarfdump --verify "$a" >"$WORK/verify.txt" 2>&1 || ! grep -cx "No errors." "$WORK/verify.txt" >/dev/null; then
+        bad="$bad; dwarfdump --verify: $(grep -iE 'error|warning' "$WORK/verify.txt" | head -2 | tr '\n' ' ')"
+    fi
+    if python3 scripts/s3_macho.py lines "$a" "$tir" >"$WORK/lines.txt" 2>&1; then
+        n=$(sed -n 's/.*literal loads checked: \([0-9]*\).*/\1/p' "$WORK/lines.txt" | tail -1)
+        lines_checked=$((lines_checked + ${n:-0}))
+    else
+        bad="$bad; line table: $(head -2 "$WORK/lines.txt" | tr '\n' ' ')"
+    fi
     if s3_link "$a" "$WORK/prog" "$WORK/link.txt"; then
         if [ -s "$WORK/link.txt" ]; then
             bad="$bad; the linker said: $(head -2 "$WORK/link.txt" | tr '\n' ' ')"
@@ -95,7 +109,7 @@ for k in "${!S3_SRC[@]}"; do
     fi
 done
 
-echo "objects: $checked   reproducible: $identical   with problems: $problems"
+echo "objects: $checked   reproducible: $identical   literal loads on their lines: $lines_checked   with problems: $problems"
 if [ ${#FAILED[@]} -gt 0 ]; then
     echo
     echo "FAILED:"
@@ -107,5 +121,13 @@ if [ -z "${DIRS:-}" ] && [ "$checked" -lt "$S3_SUBSET_FLOOR" ]; then
     echo "only $checked objects were checked; the subset's floor is $S3_SUBSET_FLOOR"
     exit 1
 fi
+# The line tables' sample: 108,370 instructions loading a literal written
+# once were looked up when the table was written (2026-10-25); far fewer is
+# a check that stopped finding its sample, which would pass on any table.
+if [ -z "${DIRS:-}" ] && [ "$lines_checked" -lt 100000 ]; then
+    echo "only $lines_checked literal loads were looked up in the line tables; the floor is 100000"
+    exit 1
+fi
+[ "$lines_checked" -gt 0 ] || { echo "no instruction was looked up in a line table"; exit 1; }
 [ "$checked" -gt 0 ] || { echo "nothing was checked"; exit 1; }
 exit 0

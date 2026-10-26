@@ -188,7 +188,16 @@ pub fn build(src: bytes) -> MirProg ! str {
     if errors.len() > 0 {
         fail(errors.join("\n"))
     }
-    MirProg{ fns: fns, callee_sym: callee_sym, strs: strs, rt_syms: rt_syms, descs: descs }
+    // The source files the spans index, for the line table.
+    var files: [str] = []
+    var fbase: [i64] = []
+    for r in t0.roots {
+        if sexp.kw(t0, r) == "file" {
+            files.push(sexp.word(t0, r, 3))
+            fbase.push(sexp.word(t0, r, 4).parse_int() ?? 0)
+        }
+    }
+    MirProg{ fns: fns, callee_sym: callee_sym, strs: strs, rt_syms: rt_syms, descs: descs, files: files, fbase: fbase }
 }
 
 /// The lifted functions found so far: by key (`c<element>` for a closure,

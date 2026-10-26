@@ -41,6 +41,11 @@ type A64Code = {
     frame: i64,
     nspill: i64,
     nsaved: i64,
+    /// The line table's rows for this function: from word `row_word[k]` on,
+    /// the code is source offset `row_src[k]`'s (-1: no source line), each
+    /// row a change from the one before.
+    row_word: [i64],
+    row_src: [i64],
 }
 
 type Emit = {
@@ -57,6 +62,27 @@ type Emit = {
     fx_reg: [i64],
     fx_cc: [i64],
     fx_tgt: [i64],
+    row_word: [i64],
+    row_src: [i64],
+}
+
+/// Code from here on is source offset `src`'s, if that is a change.
+fn at_src(inout e: Emit, src: i64) {
+    let n = e.row_src.len()
+    if n > 0 and e.row_src[n - 1] == src {
+        return
+    }
+    if n > 0 and e.row_word[n - 1] == e.words.len() {
+        // Nothing was emitted for the row before: this one replaces it.
+        e.row_src[n - 1] = src
+        if n > 1 and e.row_src[n - 2] == src {
+            e.row_src.pop()
+            e.row_word.pop()
+        }
+        return
+    }
+    e.row_word.push(e.words.len())
+    e.row_src.push(src)
 }
 
 fn word(inout e: Emit, m: i64, rd: i64, rn: i64, rm: i64, imm: i64, imm2: i64) -> () ! str {
@@ -110,6 +136,7 @@ pub fn emit(al: Alloc, sym: str, want_asm: bool, callee_sym: [str], rt_names: [s
     var e = Emit{
         words: [], rel_off: [], rel_kind: [], rel_symk: [], rel_sym: [], asm: [],
         want_asm: want_asm, fx_word: [], fx_mop: [], fx_reg: [], fx_cc: [], fx_tgt: [],
+        row_word: [], row_src: [],
     }
     var pairs_a: [i64] = []
     var pairs_b: [i64] = []
@@ -133,7 +160,8 @@ pub fn emit(al: Alloc, sym: str, want_asm: bool, callee_sym: [str], rt_names: [s
     }
     let slots = al.nout + al.nslots + al.nspill
     let frame = (8 * slots + 15).bit_and(-16)
-    // Prologue.
+    // Prologue: the function's own line.
+    at_src(e, al.span0)
     let pac = try mach.encode(mach.A_PACIBSP, -1, -1, -1, -1, 0, 0, -1, 0)
     e.words.push(pac)
     if want_asm {
@@ -170,6 +198,7 @@ pub fn emit(al: Alloc, sym: str, want_asm: bool, callee_sym: [str], rt_names: [s
                 i += 1
                 continue
             }
+            at_src(e, al.src[i])
             if m == mach.P_RETURN {
                 try adjust_sp(e, frame, false)
                 var fk = fpairs_a.len() - 1
@@ -257,5 +286,6 @@ pub fn emit(al: Alloc, sym: str, want_asm: bool, callee_sym: [str], rt_names: [s
         sym: sym, words: e.words, rel_off: e.rel_off, rel_kind: e.rel_kind,
         rel_symk: e.rel_symk, rel_sym: e.rel_sym, asm: e.asm,
         frame: frame, nspill: al.nspill, nsaved: 2 * (pairs_a.len() + fpairs_a.len()),
+        row_word: e.row_word, row_src: e.row_src,
     }
 }

@@ -426,6 +426,13 @@ type MirFn = {
     ca0: [i64],
     can: [i64],
     cargs: [i64],
+    // Where each came from, for the line table (DWARF `__debug_line`): per
+    // instruction and per block's terminator, the offset in TIR's global
+    // span space of the expression it was lowered from, or -1 for code no
+    // source line stands for; and the function's own, for its prologue.
+    ispan: [i64],
+    tspan: [i64],
+    span0: i64,
 }
 
 pub fn new_fn(name: str, sym: str) -> MirFn {
@@ -434,6 +441,7 @@ pub fn new_fn(name: str, sym: str) -> MirFn {
         bp0: [], bnp: [], bparams: [], bi0: [], bni: [],
         tk: [], tv: [], tt: [], tf: [], ta0: [], tan: [], fa0: [], fan: [], targs: [],
         op: [], res: [], a: [], b: [], imm: [], ca0: [], can: [], cargs: [],
+        ispan: [], tspan: [], span0: -1,
     }
 }
 
@@ -450,6 +458,10 @@ type MirProg = {
     rt_syms: [str],
     /// The struct descriptors `M_DATAADDR` names, by id.
     descs: [MirDesc],
+    /// TIR's source files, in loader order: each path as given to the
+    /// loader and the base offset of its spans (docs/tir.md §2).
+    files: [str],
+    fbase: [i64],
 }
 
 /// A struct type's descriptor, as the runtime's `StructDesc` reads it

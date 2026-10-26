@@ -984,6 +984,46 @@ on `()`, the two builders, the bit operations at a width (`clz`, `rbit`,
 Cranelift build's lowering. Thirty-three new instruction forms, every one in
 `encodetest` against `clang -c`.
 
+### 6.4 S3 part five: the fuzzers, the line table, the benchmarks
+
+**The generators pointed at it.** Twenty of the twenty-two
+`scripts/fuzz_*.py` build native programs; each now hands every program the
+Cranelift build accepts to a third engine, `scripts/lib/s3engine.py` --
+one copy, imported by all of them. It builds the program the way the S3
+gates build the corpus (`grasm tir`, `compiler/s3`, `cc` with the runtime),
+runs it beside the Cranelift binary with the same arguments, environment
+and input, and requires the same stdout, exit status and stderr, and
+nothing live at exit when the Cranelift build returns from `main`. A program
+the backend refuses by name (exit 3) is counted as declined, with its
+reasons, and never as agreeing; anything else is a failure; and a generator
+whose engine compared nothing fails, so an engine that silently skipped
+every program cannot read as one that agreed with all of them
+(`s3controls`: `engine-skip`, `engine-unused`). The other two are
+`fuzz_rows`, which only asks the checker, and `fuzz_s3`, which was written
+for this backend. A disagreement names the engine `grasm run` sides with.
+
+**The line table.** Every MIR instruction and terminator records the span
+start of the TIR expression it was lowered from (a pattern's, for its
+tests; a block's closing brace, for what leaving the block releases; the
+function body's, for the prologue), and selection, allocation and emission
+carry it to each word: a reload or a spill is its instruction's. The driver
+maps each offset to a file and a line by reading the source files TIR names
+(a file it cannot read maps to line 0, with a warning), and the Mach-O
+writer adds what clang writes under `-gdwarf-4`, less types and variables
+(`compiler/macho/src/dwarf.gr`): `__debug_abbrev`; `__debug_info`, one
+compile unit over the whole of `__text` (its name the program's first file,
+its directory `$PWD`) with a subprogram per function; `__debug_str`; and
+`__debug_line`, one sequence per function and a row wherever the line
+changes. Each `__text` address in them carries an `ARM64_RELOC_UNSIGNED`
+relocation against the section, as clang's do; the linker leaves the
+sections in the object, for `dsymutil` and debuggers. `objtest` requires
+`dwarfdump --verify` to find no error in any object and, through
+`dwarfdump --debug-line`, every instruction that loads the address of a
+string literal written once in the program to map to that literal's file
+and line -- the sample of instructions whose right line the source alone
+says -- with no row past the end of its file (`s3controls`: `dwarf-line`
+shifts every line by one).
+
 ## 7. Bootstrap and trust
 
 - **During the migration:** stage 0 is the Rust-built `grasm`.
@@ -1082,10 +1122,17 @@ Measured, not estimated; each line is a gate's result on master.
   function addresses and `export fn`, and the rest (§6.3). All of them run
   with nothing live at exit (those that reach the leak check; a few end by
   design before it) and no use after free under the poisoned runtime.
-  fib(35) was about 1.9x slower than Cranelift's code at part one. What
-  §6 still asks of S3 and `compiler/` does not have: DWARF line tables,
-  the release (backtracking) allocator, the differential and operator
-  fuzzers pointed at it, and benchmarks against the Cranelift build.
+  fib(35) was about 1.9x slower than Cranelift's code at part one. Part
+  five (§6.4): the twenty generators that build native programs hold the
+  Grasm backend to the Cranelift build on every program the Cranelift
+  build accepts -- at their default sizes, every program each compared
+  agreed, after two gaps they found were closed (`^` at a width,
+  `str.parse_u64_base`; docs/known-issues.md) -- and every object carries
+  a DWARF line table: `dwarfdump --verify` finds no error in any of the
+  648, and 108,370 instructions that load a literal written once map to
+  that literal's file and line. What §6 still asks of S3 and `compiler/`
+  does not have: the release (backtracking) allocator, and benchmarks
+  against the Cranelift build.
 - **Not started:** S2 (the frontend in Grasm), S4 (the linker), S5 (the
   runtime in Grasm), S6 (self-compilation), S7-S9.
 

@@ -63,9 +63,12 @@
 #   task-result  a parallel map's worker answers 0 for every integer result
 #                -> s3subset
 #
-# Part five's third engine for the generators (`scripts/lib/s3engine.py`),
-# whose faults are planted in a copy of `scripts/` instead:
+# Part five's line table, and the generators' third engine
+# (`scripts/lib/s3engine.py`), whose faults are planted in a copy of
+# `scripts/` instead:
 #
+#   dwarf-line     every line the line table records is one past the right
+#                  one -> objtest (a literal's load maps to the wrong line)
 #   engine-skip    the engine declines every program it builds
 #                  -> fuzz_operators (the Grasm backend compared nothing)
 #   engine-unused  a generator never hands a program to the engine
@@ -244,7 +247,11 @@ control task-result compiler/mir/src/lower.gr \
     $'    } else {\n        bits = konst(v, 0)\n    }\n    do_return(v, bits)' -- \
     scripts/s3subset.sh "MISMATCH:" -
 
-# Part five: the generators' third engine.
+# Part five: the line table, and the generators' third engine.
+control dwarf-line compiler/s3/src/main.gr \
+    "    (k + 1, lo + 1)" "    (k + 1, lo + 2)" -- \
+    scripts/objtest.sh "maps to line" -
+
 # script_control NAME FILE OLD NEW GATE SYMPTOM
 # The fault is planted in a copy of `scripts/` -- the generators' shared
 # engine (`scripts/lib/s3engine.py`) or a generator -- and the copied
@@ -295,10 +302,10 @@ if [ ${#MISSED[@]} -gt 0 ]; then
     printf '  %s\n' "${MISSED[@]}"
     exit 1
 fi
-# Twenty-seven gate runs over twenty-two faults, and every one must have
+# Twenty-eight gate runs over twenty-three faults, and every one must have
 # failed.
-if [ "$controls" -ne 27 ] || [ "$caught" -ne 27 ]; then
-    echo "expected 27 controls caught, ran $controls and caught $caught"
+if [ "$controls" -ne 28 ] || [ "$caught" -ne 28 ]; then
+    echo "expected 28 controls caught, ran $controls and caught $caught"
     exit 1
 fi
 exit 0

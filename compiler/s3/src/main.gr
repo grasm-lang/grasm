@@ -27,6 +27,11 @@
 //
 // It writes machine code itself; no C or assembly text is on that path.
 //
+// The object carries a DWARF line table (`compiler/macho/src/dwarf.gr`):
+// every instruction maps to the line of the TIR expression it was lowered
+// from, read from the source files TIR names. A file that cannot be read
+// maps to line 0, with a warning. The compile unit's directory is `$PWD`.
+//
 // Exit status: 0 written; 2 bad usage or unreadable input; 3 the program is
 // outside the subset this part compiles (every reason is printed); 4 the
 // allocation checker found an error; 1 anything else.
@@ -106,6 +111,67 @@ fn put64(inout b: ByteBuilder, v: i64) {
     }
 }
 
+/// Each source file's line starts, and its length (-1 if it cannot be read).
+type SrcLines = {
+    starts: [[i64]],
+    len: [i64],
+}
+
+fn src_lines(p: MirProg) -> SrcLines {
+    var out = SrcLines{ starts: [], len: [] }
+    for path in p.files {
+        match read_bytes(path) {
+            Ok(b) -> {
+                var ls: [i64] = [0]
+                for i in 0..b.len() {
+                    if b.at(i) == 10 {
+                        ls.push(i + 1)
+                    }
+                }
+                out.starts.push(ls)
+                out.len.push(b.len())
+            }
+            Err(e) -> {
+                eprint("s3: cannot read {path} for the line table ({e}); its code maps to line 0")
+                out.starts.push([])
+                out.len.push(-1)
+            }
+        }
+    }
+    out
+}
+
+/// The file (from 1) and line of global source offset `o`: line 0 when no
+/// file holds it or the file could not be read.
+fn file_line(p: MirProg, sl: SrcLines, o: i64) -> (i64, i64) {
+    if o < 0 {
+        return (1, 0)
+    }
+    var k = p.fbase.len() - 1
+    while k >= 0 and p.fbase[k] > o {
+        k -= 1
+    }
+    if k < 0 {
+        return (1, 0)
+    }
+    let local = o - p.fbase[k]
+    if sl.len[k] < 0 or local > sl.len[k] {
+        return (k + 1, 0)
+    }
+    let ls = sl.starts[k]
+    var lo = 0
+    var hi = ls.len() - 1
+    while lo < hi {
+        let mid = (lo + hi + 1) / 2
+        if ls[mid] <= local {
+            lo = mid
+        } else {
+            hi = mid - 1
+        }
+    }
+    (k + 1, lo + 1)
+}
+
 fn reloc_symbol(p: MirProg, symk: i64, id: i64) -> str {
     if symk == 1 {
         p.callee_sym[id]
@@ -158,6 +224,10 @@ fn compile(inp: str, out: str, opts: A64Opts, listing: str, check: bool, stats: 
     var corrupted = 0
     var caught = 0
     var spills = 0
+    // The line table's rows, function by function: the byte offset in the
+    // function, and the source offset of the code from there on.
+    var unit = macho.new_unit()
+    let sl = src_lines(p)
     for f in p.fns {
         match aarch64.compile_fn(f, rs, ccm, fccm, opts, p.callee_sym, p.rt_syms) {
             Ok(r) -> {
@@ -182,6 +252,18 @@ fn compile(inp: str, out: str, opts: A64Opts, listing: str, check: bool, stats: 
                 }
                 spills += r.code.nspill
                 let base = 4 * obj.text.len()
+                let fk = obj.fsym.len()
+                for q in 0..r.code.row_word.len() {
+                    let fl = file_line(p, sl, r.code.row_src[q])
+                    unit.row_fn.push(fk)
+                    unit.row_off.push(4 * r.code.row_word[q])
+                    unit.row_file.push(fl.0)
+                    unit.row_line.push(fl.1)
+                }
+                let decl = file_line(p, sl, f.span0)
+                unit.fn_name.push(f.name)
+                unit.fn_file.push(decl.0)
+                unit.fn_line.push(decl.1)
                 obj.fsym.push(f.sym)
                 obj.foff.push(base)
                 // The C entry and every `export fn`'s are global symbols.
@@ -219,6 +301,12 @@ fn compile(inp: str, out: str, opts: A64Opts, listing: str, check: bool, stats: 
     if ra_failed > 0 {
         return 4
     }
+    unit.producer = "grasm compiler/s3"
+    unit.name = if p.files.len() > 0 { p.files[0] } else { "" }
+    unit.comp_dir = env("PWD") ?? ""
+    unit.files = p.files
+    obj.debug = true
+    obj.dw = unit
     for k in 0..p.strs.len() {
         obj.dsym.push("l_.str.{k}")
         obj.dbytes.push(p.strs[k].to_bytes())

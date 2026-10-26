@@ -529,6 +529,8 @@ pub fn select(f: MirFn, rs: [Rule], ccm: [i64], fccm: [i64]) -> VCode ! str {
     }
     vc.nparams = f.nparams
     vc.nslots = f.nslots
+    vc.span0 = f.span0
+    vc.cur_src = f.span0
     // Arguments that do not fit in registers travel on the stack (AAPCS64),
     // eight bytes each: the caller stores them at the bottom of its frame,
     // where `sp` points at the call, and the callee reads them above its
@@ -572,6 +574,7 @@ pub fn select(f: MirFn, rs: [Rule], ccm: [i64], fccm: [i64]) -> VCode ! str {
             if s.absorbed[i] {
                 continue
             }
+            vc.cur_src = f.ispan[i]
             let op = f.op[i]
             if op == ir.M_CALL or op == ir.M_CALLRT or op == ir.M_CALLIND {
                 let n = f.can[i]
@@ -622,6 +625,7 @@ pub fn select(f: MirFn, rs: [Rule], ccm: [i64], fccm: [i64]) -> VCode ! str {
             try expand(vc, f, s, rs[s.rule_of[i]], ccm, fccm, i, -1, -1, -1, -1)
         }
         let k = f.tk[b]
+        vc.cur_src = f.tspan[b]
         if k == ir.M_RET {
             // The result in x0, or a double in d0.
             var rk = vcode.RES_NONE

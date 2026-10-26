@@ -71,6 +71,11 @@ type Alloc = {
     /// How many functions a deliberate corruption was applied to: the
     /// checker's control (`ra_check`).
     corrupted: i64,
+    /// Per instruction, its source offset (`VCode.src`): a reload or a
+    /// spill is its instruction's. `span0` is the function's.
+    src: [i64],
+    cur_src: i64,
+    span0: i64,
 }
 
 // ----- operands ----------------------------------------------------------------
@@ -784,6 +789,7 @@ fn push_a(inout al: Alloc, m: i64, d: i64, n: i64, mm: i64, a: i64, imm: i64, ki
     al.oa.push(-1)
     al.kind.push(kind)
     al.slot.push(slot)
+    al.src.push(al.cur_src)
     i
 }
 
@@ -800,7 +806,7 @@ fn rewrite(vc: VCode, loc: [i64], nspill: i64, corrupted: i64) -> Alloc ! str {
         symk: [], sym_id: [], od: [], on: [], om: [], oa: [], kind: [], slot: [],
         bi0: [], bni: [], nparams: vc.nparams, nreg_int: vc.nreg_int, nreg_fp: vc.nreg_fp,
         nslots: vc.nslots, nout: vc.nout, nspill: nspill, loc: loc, vcls: vc.vcls,
-        used_callee: [], corrupted: corrupted,
+        used_callee: [], corrupted: corrupted, src: [], cur_src: vc.span0, span0: vc.span0,
     }
     for r in 0..NPHYS {
         al.used_callee.push(false)
@@ -818,6 +824,7 @@ fn rewrite(vc: VCode, loc: [i64], nspill: i64, corrupted: i64) -> Alloc ! str {
         al.bi0.push(al.mop.len())
         for i in vc.bi0[b]..(vc.bi0[b] + vc.bni[b]) {
             let m = vc.mop[i]
+            al.cur_src = vc.src[i]
             var ops = [vc.rd[i], vc.rn[i], vc.rm[i], vc.ra[i]]
             let roles = [mach.role_d(m), mach.role_n(m), mach.role_m(m), mach.role_a(m)]
             var phys = [-1, -1, -1, -1]
