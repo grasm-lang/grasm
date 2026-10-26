@@ -55,6 +55,8 @@ def _lib(name):
 leaked = _lib("leaks").leaked
 # One binary, rebuilt in place, instead of one file per program (see the module).
 build_native = _lib("inplace").build
+# The Grasm backend (compiler/s3), held to the Cranelift build on each program.
+S3Engine = _lib("s3engine").Engine
 _lib("fresh").fresh_or_stop(GRASM)
 
 
@@ -317,6 +319,9 @@ def main():
     refused = []
     wrong = []
     leaks = []
+    # Its own directory: the rounds below empty `work` between programs.
+    s3work = tempfile.mkdtemp(prefix="fuzz_modules_s3_")
+    s3 = S3Engine(GRASM, s3work)
     try:
         for where in ("direct", "through a library", "transitive"):
             for name, decls, stmts in POSITIONS:
@@ -350,6 +355,7 @@ def main():
                     print(f"NATIVE REFUSED {label}\n{e2 or o2}")
                     continue
                 rc3, o3, e3 = run([exe])
+                s3.check(src, exe, label)
                 if rc3 != 0 or o3 != out:
                     disagreed.append(label + " / native")
                     print(f"DISAGREES {label}\n  interpreter: {out}\n  native: {o3} {e3}")
@@ -540,6 +546,8 @@ def main():
                     print(f"VARIANT will not build {label} ({a_ty} vs {b_ty}):\n{e2 or o2}")
                     continue
                 rc3, o3, e3 = run([exe])
+                if label == "native":
+                    s3.check(src, exe, f"variant {a_ty} vs {b_ty}")
                 if rc3 != 0 or o3 != out:
                     holes.append(f"variant/{a_ty}/{b_ty}/{label}/answer")
                     print(f"VARIANT disagrees ({a_ty} vs {b_ty}, {label})\n"
@@ -586,6 +594,7 @@ def main():
                     holes.append(f"{effect}/capabilities={caps}/answer")
                     print(f"CEILING wrong answer for `{effect}`: {out!r}")
 
+        s3_ok = s3.report()
         print(
             f"programs: {programs}   disagreed: {len(disagreed)}   "
             f"refused: {len(refused)}   wrong: {len(wrong)}   leaked: {len(leaks)}   "
@@ -599,7 +608,8 @@ def main():
             print(f"kept: {work}")
         else:
             shutil.rmtree(work, ignore_errors=True)
-    sys.exit(1 if disagreed or refused or wrong or leaks or holes else 0)
+        shutil.rmtree(s3work, ignore_errors=True)
+    sys.exit(1 if disagreed or refused or wrong or leaks or holes or not s3_ok else 0)
 
 
 if __name__ == "__main__":

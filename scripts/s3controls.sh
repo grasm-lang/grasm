@@ -32,6 +32,7 @@
 #                -> objtest (descriptor addresses with no relocation)
 #   method       `to_upper` calls the runtime's lower-casing
 #                -> s3subset
+#                -> fuzz_methods, through its third engine (S3 part five)
 #
 # Part three's doubles, function values and generics:
 #
@@ -61,6 +62,14 @@
 #                -> s3subset
 #   task-result  a parallel map's worker answers 0 for every integer result
 #                -> s3subset
+#
+# Part five's third engine for the generators (`scripts/lib/s3engine.py`),
+# whose faults are planted in a copy of `scripts/` instead:
+#
+#   engine-skip    the engine declines every program it builds
+#                  -> fuzz_operators (the Grasm backend compared nothing)
+#   engine-unused  a generator never hands a program to the engine
+#                  -> fuzz_operators (the same)
 #
 # A fault that sends a program into a loop shows as a run stopped at the
 # gates' limit (`S3_RUN_SECONDS` in `scripts/lib/s3.sh`, 20 s against well
@@ -190,7 +199,8 @@ control datarelocs compiler/macho/src/main.gr \
 control method compiler/mir/src/lower.gr \
     "\"str.to_upper/0\" -> read_method(info, v, e, \"grasm_str_upper\"" \
     "\"str.to_upper/0\" -> read_method(info, v, e, \"grasm_str_lower\"" -- \
-    scripts/s3subset.sh "MISMATCH:" -
+    scripts/s3subset.sh "MISMATCH:" - \
+    scripts/fuzz_methods.py "S3 DISAGREES" -
 
 control fp-cc compiler/aarch64/src/rules.gr \
     "        mach.C_MI," "        mach.C_LT," -- \
@@ -234,6 +244,49 @@ control task-result compiler/mir/src/lower.gr \
     $'    } else {\n        bits = konst(v, 0)\n    }\n    do_return(v, bits)' -- \
     scripts/s3subset.sh "MISMATCH:" -
 
+# Part five: the generators' third engine.
+# script_control NAME FILE OLD NEW GATE SYMPTOM
+# The fault is planted in a copy of `scripts/` -- the generators' shared
+# engine (`scripts/lib/s3engine.py`) or a generator -- and the copied
+# generator is run against the unmutated backend: an engine that stops
+# comparing must fail the generator, not leave it green.
+script_control() {
+    local name=$1 file=$2 old=$3 new=$4 gate=$5 symptom=$6
+    rm -rf "$WORK/src"
+    mkdir -p "$WORK/src"
+    cp -R compiler scripts "$WORK/src/"
+    controls=$((controls + 1))
+    if ! python3 scripts/s3_mutate.py "$WORK/src/$file" "$old" "$new"; then
+        MISSED+=("$name: the mutation does not apply")
+        return
+    fi
+    local grasm_abs rt_abs log="$WORK/$name.log"
+    grasm_abs=$(cd "$(dirname "$GRASM")" && pwd)/$(basename "$GRASM")
+    rt_abs=${S3_RT:-$PWD/target/release/libgrasm_rt_abi.a}
+    case "$rt_abs" in /*) ;; *) rt_abs="$PWD/$rt_abs" ;; esac
+    GRASM="$grasm_abs" S3_RT="$rt_abs" python3 "$WORK/src/$gate" >"$log" 2>&1
+    local code=$?
+    if [ "$code" != 0 ] && grep -cF -- "$symptom" "$log" >/dev/null; then
+        caught=$((caught + 1))
+        echo "caught: $name by $(basename "$gate" .py) (exit $code; \"$symptom\")"
+    elif [ "$code" != 0 ]; then
+        MISSED+=("$name: $(basename "$gate" .py) failed (exit $code) but not with \"$symptom\"; see its last lines below")
+        tail -5 "$log" | sed 's/^/    /'
+    else
+        MISSED+=("$name: $(basename "$gate" .py) passed with the fault in place")
+    fi
+}
+
+# The engine declines every program it builds: nothing is compared.
+script_control engine-skip scripts/lib/s3engine.py \
+    "        if c[0] == 3:" "        if c[0] in (0, 3):" \
+    scripts/fuzz_operators.py "the Grasm backend compared nothing"
+
+# A generator that never hands its programs to the engine.
+script_control engine-unused scripts/fuzz_operators.py \
+    "                s3.check(path, exe, label, interp=(rc, out))" "                pass" \
+    scripts/fuzz_operators.py "the Grasm backend compared nothing"
+
 echo
 echo "controls: $controls   caught: $caught   missed: ${#MISSED[@]}"
 if [ ${#MISSED[@]} -gt 0 ]; then
@@ -242,9 +295,10 @@ if [ ${#MISSED[@]} -gt 0 ]; then
     printf '  %s\n' "${MISSED[@]}"
     exit 1
 fi
-# Twenty-four gate runs over twenty faults, and every one must have failed.
-if [ "$controls" -ne 24 ] || [ "$caught" -ne 24 ]; then
-    echo "expected 24 controls caught, ran $controls and caught $caught"
+# Twenty-seven gate runs over twenty-two faults, and every one must have
+# failed.
+if [ "$controls" -ne 27 ] || [ "$caught" -ne 27 ]; then
+    echo "expected 27 controls caught, ran $controls and caught $caught"
     exit 1
 fi
 exit 0

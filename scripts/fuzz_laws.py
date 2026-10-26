@@ -48,6 +48,8 @@ def _lib(name):
 leaked = _lib("leaks").leaked
 # One binary, rebuilt in place, instead of one file per program (see the module).
 build_native = _lib("inplace").build
+# The Grasm backend (compiler/s3), held to the Cranelift build on each law.
+S3Engine = _lib("s3engine").Engine
 _lib("fresh").fresh_or_stop(GRASM)
 
 
@@ -881,6 +883,7 @@ def main():
     path = os.path.join(work, "p.gr")
     exe = os.path.join(work, "p.bin")
     checked, broken, rejected = 0, [], []
+    s3 = S3Engine(GRASM, work)
     try:
         for name, law in LAWS.items():
             # Anything that performs `async` needs the row, and a law written
@@ -909,6 +912,7 @@ def main():
                 rejected.append(f"{name}: native declined")
                 continue
             rc3, got, _ = run([exe])
+            s3.check(path, exe, name, interp=(rc, out))
             answers["native"] = got.strip()
             wrong = sorted(k for k, v in answers.items() if v != "ok")
             if wrong:
@@ -921,6 +925,7 @@ def main():
                 print(f"LEAKS {name}: {held}")
         for r in rejected:
             print(f"  NOT A LAW (the program does not run): {r}")
+        s3_ok = s3.report()
         print(
             f"laws: {checked}   broken: {len(broken)}   not run: {len(rejected)}"
             f"   library methods uncovered: 0   clauses uncovered: 0"
@@ -930,7 +935,7 @@ def main():
             print(f"kept: {work}")
         else:
             shutil.rmtree(work, ignore_errors=True)
-    sys.exit(1 if broken or rejected else 0)
+    sys.exit(1 if broken or rejected or not s3_ok else 0)
 
 
 if __name__ == "__main__":

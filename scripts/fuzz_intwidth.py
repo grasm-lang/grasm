@@ -67,6 +67,8 @@ def _lib(name):
 
 leaked = _lib("leaks").leaked
 build_native = _lib("inplace").build
+# The Grasm backend (compiler/s3), held to the Cranelift build on each program.
+S3Engine = _lib("s3engine").Engine
 _lib("fresh").fresh_or_stop(GRASM)
 
 KINDS = {"i8": (8, True), "i16": (16, True), "i32": (32, True),
@@ -240,6 +242,7 @@ def main():
     work = tempfile.mkdtemp(prefix="grasm_intwidth_")
     bad = 0
     checked = 0
+    s3 = S3Engine(GRASM, work)
     try:
         for idx in range(o.programs):
             src, want = program(rng, idx)
@@ -255,6 +258,7 @@ def main():
                 bad += 1
                 continue
             n = subprocess.run([exe], capture_output=True, text=True, timeout=600)
+            s3.check(path, exe, f"program {idx} (SEED={o.seed})", interp=(r.returncode, r.stdout))
             for engine, got in (("interpreter", r), ("native", n)):
                 if got.returncode != 0 or got.stdout != want:
                     bad += 1
@@ -273,6 +277,8 @@ def main():
             if held:
                 bad += 1
                 print(f"program {idx}: LEAKS {held}")
+        if not s3.report():
+            bad += 1
         print(f"programs: {o.programs}   checked lines: {checked}   disagreed: {bad}   (SEED={o.seed})")
     finally:
         if not o.keep:

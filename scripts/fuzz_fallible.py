@@ -36,6 +36,8 @@ def _lib(name):
 leaked = _lib("leaks").leaked
 # One binary, rebuilt in place, instead of one file per program (see the module).
 build_native = _lib("inplace").build
+# The Grasm backend (compiler/s3), held to the Cranelift build on each program.
+S3Engine = _lib("s3engine").Engine
 
 
 _spec = _ilu.spec_from_file_location(
@@ -128,6 +130,7 @@ def main():
     # nowhere, so a change that made `--native` decline half the corpus looked
     # exactly like a clean run.
     declined = 0
+    s3 = S3Engine(G, d)
     for s in range(base, base + count):
         open(src, "w").write(gen(s))
         # No `check` run ahead of the build: the build typechecks this same
@@ -162,6 +165,7 @@ def main():
             continue
         a, ra = run([G, "run", src])
         b, rb = run([out])
+        s3.check(src, out, f"seed={s}")
         # An error path is the one a program takes least often and frees
         # least carefully (F57).
         held = leaked(out) if rb == 0 else None
@@ -177,6 +181,8 @@ def main():
                 break
         if checked % 50 == 0:
             print(f"  {checked} compared, {mism} mismatched, {rejected} rejected", flush=True)
+    s3_ok = s3.report()
+    s3.cleanup()
     print(
         f"compared: {checked}   mismatched: {mism}   "
         f"rejected: {rejected}   declined: {declined}"
@@ -191,7 +197,7 @@ def main():
     # `scripts/nativegaps.sh` and in the tutorial's table -- or a defect.
     # Counted and not acted on, it reads as PASS while programs quietly stop
     # running: removing the F52 fix left this at `declined: 1` and exit 0.
-    sys.exit(1 if mism or declined else 0)
+    sys.exit(1 if mism or declined or not s3_ok else 0)
 
 
 main()

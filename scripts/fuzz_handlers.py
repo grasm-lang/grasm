@@ -50,6 +50,8 @@ def _lib(name):
 leaked = _lib("leaks").leaked
 # One binary, rebuilt in place, instead of one file per program (see the module).
 build_native = _lib("inplace").build
+# The Grasm backend (compiler/s3), held to the Cranelift build on each program.
+S3Engine = _lib("s3engine").Engine
 
 
 _spec = _ilu.spec_from_file_location(
@@ -266,7 +268,7 @@ def strip_trace(text):
     return "\n".join(keep)
 
 
-def check_one(src, work):
+def check_one(src, work, s3, label):
     path = os.path.join(work, "p.gr")
     with open(path, "w") as f:
         f.write(src)
@@ -301,6 +303,7 @@ def check_one(src, work):
             return ("declined", err.strip())
         return ("native build failed", err.strip())
     nr, no, ne = run([native])
+    s3.check(path, native, label, interp=(ir, io_))
     # Before the binary is removed: a handler's operations own an environment,
     # and getting its reference count wrong by one in either direction is
     # invisible in the output (F57).
@@ -325,11 +328,12 @@ def main():
     base = args.seed if args.seed is not None else random.randrange(1 << 30)
     failures, rejected, declined = [], [], []
     work = tempfile.mkdtemp(prefix="grasm_fuzz_handlers_")
+    s3 = S3Engine(GRASM, work)
     try:
         for i in range(args.count):
             seed = base + i
             src = build(random.Random(seed))
-            verdict = check_one(src, work)
+            verdict = check_one(src, work, s3, f"seed={seed}")
             if verdict is None:
                 continue
             kind, detail = verdict
@@ -346,6 +350,7 @@ def main():
         for seed, detail, src in rejected[:3]:
             first = detail.splitlines()[0] if detail else ""
             print(f"REJECTED seed={seed}: {first}\n--- source ---\n{src}")
+        s3_ok = s3.report()
         print(
             f"programs: {args.count}   mismatched: {len(failures)}   "
             f"rejected: {len(rejected)}   declined: {len(declined)}"
@@ -361,7 +366,7 @@ def main():
     # `scripts/nativegaps.sh` and in the tutorial's table -- or a defect.
     # Counted and not acted on, it reads as PASS while programs quietly stop
     # running: removing the F52 fix left this at `declined: 1` and exit 0.
-    sys.exit(1 if failures or rejected or declined else 0)
+    sys.exit(1 if failures or rejected or declined or not s3_ok else 0)
 
 
 if __name__ == "__main__":

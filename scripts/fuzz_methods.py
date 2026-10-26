@@ -46,6 +46,8 @@ def _lib(name):
 leaked = _lib("leaks").leaked
 # One binary, rebuilt in place, instead of one file per program (see the module).
 build_native = _lib("inplace").build
+# The Grasm backend (compiler/s3), held to the Cranelift build on each program.
+S3Engine = _lib("s3engine").Engine
 
 _spec = _ilu.spec_from_file_location(
     "grasm_fresh",
@@ -447,6 +449,7 @@ def main():
     exe = os.path.join(work, "p.bin")
     checked, disagreed, declined, rejected = 0, [], [], []
     covered = set()
+    s3 = S3Engine(GRASM, work)
     try:
         for ty, lit, calls in GROUPS:
             for c in calls:
@@ -484,6 +487,7 @@ def main():
                         declined.append(f"{label}: {first}")
                     continue
                 rc3, got, err3 = run([exe])
+                s3.check(path, exe, label, interp=(rc, out))
                 if rc3 == 0 and got == want:
                     # Every method that answers something boxed has to hand it
                     # over exactly once (F57).
@@ -514,6 +518,7 @@ def main():
             print(f"  NOT COVERED by this grid: {', '.join(missing)}")
         for d in declined:
             print(f"  native declined (not a defect): {d}")
+        s3_ok = s3.report()
         print(
             f"programs: {checked}   disagreed: {len(disagreed)}   "
             f"rejected: {len(rejected)}   declined: {len(declined)}"
@@ -529,7 +534,7 @@ def main():
     # `scripts/nativegaps.sh` and in the tutorial's table -- or a defect.
     # Counted and not acted on, it reads as PASS while programs quietly stop
     # running: removing the F52 fix left this at `declined: 1` and exit 0.
-    sys.exit(1 if disagreed or rejected or declined else 0)
+    sys.exit(1 if disagreed or rejected or declined or not s3_ok else 0)
 
 
 if __name__ == "__main__":

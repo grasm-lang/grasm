@@ -65,6 +65,8 @@ def _lib(name):
 
 leaked = _lib("leaks").leaked
 build_native = _lib("inplace").build
+# The Grasm backend (compiler/s3), held to the Cranelift build on each program.
+S3Engine = _lib("s3engine").Engine
 _lib("fresh").fresh_or_stop(GRASM)
 
 # name -> (bits, signed)
@@ -502,6 +504,7 @@ def main():
     work = tempfile.mkdtemp(prefix="grasm_fnaddr_")
     bad = 0
     checked = 0
+    s3 = S3Engine(GRASM, work)
     try:
         path = os.path.join(work, "p.gr")
         exe = os.path.join(work, "p.bin")
@@ -542,6 +545,7 @@ def main():
                 keep(src, idx)
                 continue
             n = subprocess.run([exe], capture_output=True, text=True, timeout=600)
+            s3.check(path, exe, f"program {idx} (SEED={o.seed})", interp=(r.returncode, r.stdout))
             compare("native", n, want, f"program {idx}", src)
             held = leaked(exe)
             if held:
@@ -560,6 +564,7 @@ def main():
                 keep(src, f"native{idx}")
                 continue
             n = subprocess.run([exe], capture_output=True, text=True, timeout=600)
+            s3.check(path, exe, f"C calling Grasm {idx} (SEED={o.seed})")
             compare("native", n, want, f"C calling Grasm {idx}", src)
             r = subprocess.run([GRASM, "run", path], capture_output=True, text=True, timeout=600)
             first = (r.stderr.strip().splitlines() or [""])[0]
@@ -658,6 +663,8 @@ def main():
         else:
             print("not arm64: the indirect call check did not run")
 
+        if not s3.report():
+            bad += 1
         print(f"programs: {o.programs}   checked lines: {checked}   disagreed: {bad}   (SEED={o.seed})")
     finally:
         if not o.keep:

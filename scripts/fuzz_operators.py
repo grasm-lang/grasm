@@ -50,6 +50,8 @@ def _lib(name):
 
 
 leaked = _lib("leaks").leaked
+# The Grasm backend, held to the Cranelift build on every accepted cell.
+S3Engine = _lib("s3engine").Engine
 # One binary, rebuilt in place, instead of one file per program (see the module).
 build_native = _lib("inplace").build
 
@@ -135,6 +137,7 @@ def main():
     path = os.path.join(work, "p.gr")
     exe = os.path.join(work, "p.bin")
     checked, bad, drifted = 0, [], []
+    s3 = S3Engine(GRASM, work)
     try:
         for name, ty, a, b in VALUES:
             for op in OPS:
@@ -168,6 +171,7 @@ def main():
                     bad.append(f"{label}: {first[0] if first else '(silent)'}")
                     continue
                 rc3, got, err3 = run([exe])
+                s3.check(path, exe, label, interp=(rc, out))
                 if (out, rc, strip_trace(err)) != (got, rc3, strip_trace(err3)):
                     bad.append(
                         f"{label}: run={(out.strip(), rc)} native={(got.strip(), rc3)}"
@@ -181,6 +185,7 @@ def main():
             print(f"DRIFTED {d}")
         for b_ in bad:
             print(f"DISAGREES {b_}")
+        s3_ok = s3.report()
         print(
             f"cells: {checked}   disagreed: {len(bad)}   drifted: {len(drifted)}"
         )
@@ -189,7 +194,7 @@ def main():
             print(f"kept: {work}")
         else:
             shutil.rmtree(work, ignore_errors=True)
-    sys.exit(1 if bad or drifted else 0)
+    sys.exit(1 if bad or drifted or not s3_ok else 0)
 
 
 if __name__ == "__main__":

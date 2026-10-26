@@ -57,6 +57,8 @@ def _lib(name):
 leaked = _lib("leaks").leaked
 # One binary, rebuilt in place, instead of one file per program (see the module).
 build_native = _lib("inplace").build
+# The Grasm backend (compiler/s3), held to the Cranelift build on each shape.
+S3Engine = _lib("s3engine").Engine
 
 _spec = _ilu.spec_from_file_location(
     "grasm_fresh",
@@ -276,6 +278,7 @@ def main():
     path = os.path.join(work, "p.gr")
     exe = os.path.join(work, "p.bin")
     checked, bad, declined = 0, [], []
+    s3 = S3Engine(GRASM, work)
     try:
         for name, ty, lit in VALUES:
             for sname, body in shapes(ty, lit).items():
@@ -305,6 +308,7 @@ def main():
                         declined.append(f"{label}: {first.split(': ', 1)[-1]}")
                     continue
                 rc3, got, err3 = run([exe])
+                s3.check(path, exe, label, interp=(rc, out))
                 if (out, rc, strip_trace(err)) != (got, rc3, strip_trace(err3)):
                     bad.append(label)
                     print(
@@ -325,6 +329,7 @@ def main():
         # it to.
         for d in declined:
             print(f"  DECLINED (every shape here should compile): {d}")
+        s3_ok = s3.report()
         print(
             f"programs: {checked}   disagreed: {len(bad)}   "
             f"declined: {len(declined)}"
@@ -334,7 +339,7 @@ def main():
             print(f"kept: {work}")
         else:
             shutil.rmtree(work, ignore_errors=True)
-    sys.exit(1 if bad or declined else 0)
+    sys.exit(1 if bad or declined or not s3_ok else 0)
 
 
 if __name__ == "__main__":

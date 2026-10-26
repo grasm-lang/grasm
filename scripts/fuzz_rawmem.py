@@ -60,6 +60,8 @@ def _lib(name):
 
 leaked = _lib("leaks").leaked
 build_native = _lib("inplace").build
+# The Grasm backend (compiler/s3), held to the Cranelift build on each program.
+S3Engine = _lib("s3engine").Engine
 _lib("fresh").fresh_or_stop(GRASM)
 
 # name -> (size, struct code); `addr` and `f64` are handled apart.
@@ -386,6 +388,7 @@ def main():
     work = tempfile.mkdtemp(prefix="grasm_rawmem_")
     bad = 0
     checked = 0
+    s3 = S3Engine(GRASM, work)
     try:
         path = os.path.join(work, "p.gr")
         exe = os.path.join(work, "p.bin")
@@ -409,6 +412,7 @@ def main():
                 keep(src, idx)
                 continue
             n = subprocess.run([exe], capture_output=True, text=True, timeout=600)
+            s3.check(path, exe, f"program {idx} (SEED={o.seed})", interp=(r.returncode, r.stdout))
             for engine, got in (("interpreter", r), ("native", n)):
                 if got.returncode != 0 or got.stdout != want:
                     bad += 1
@@ -451,6 +455,8 @@ def main():
             r = subprocess.run([GRASM, "run", path], capture_output=True, text=True, timeout=120)
             bp = build_native(GRASM, path, exe, "--native")
             n = subprocess.run([exe], capture_output=True, text=True, timeout=120) if bp.returncode == 0 else bp
+            if bp.returncode == 0:
+                s3.check(path, exe, f"{call}", interp=(r.returncode, r.stdout))
             for engine, got in (("interpreter", r), ("native", n)):
                 first = (got.stderr.strip().splitlines() or [""])[0]
                 if (got.returncode, got.stdout, first) != (101, "before\n", f"panic: {msg}"):
@@ -532,6 +538,8 @@ def main():
         else:
             print("not arm64: the atomic instruction check did not run")
 
+        if not s3.report():
+            bad += 1
         print(f"programs: {o.programs}   checked lines: {checked}   disagreed: {bad}   (SEED={o.seed})")
     finally:
         if not o.keep:

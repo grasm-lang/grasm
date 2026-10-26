@@ -1,5 +1,7 @@
 # What the S3 gates share: the backend's driver, and the corpus programs in
-# the subset it compiles (docs/self-hosting.md, stage S3).
+# the subset it compiles (docs/self-hosting.md, stage S3). The generators'
+# copy of the same build and link, for the programs they invent, is
+# `scripts/lib/s3engine.py`.
 #
 # Sourced after `corpus.sh` and `fresh.sh`, with `GRASM` and `WORK` set.
 

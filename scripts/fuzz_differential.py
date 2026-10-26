@@ -48,6 +48,8 @@ def _lib(name):
 leaked = _lib("leaks").leaked
 # One binary, rebuilt in place, instead of one file per program (see the module).
 build_native = _lib("inplace").build
+# The Grasm backend (compiler/s3), held to the Cranelift build on each program.
+S3Engine = _lib("s3engine").Engine
 
 _spec = _ilu.spec_from_file_location(
     "grasm_fresh", os.path.join(os.path.dirname(os.path.abspath(__file__)), "lib", "fresh.py")
@@ -553,7 +555,7 @@ def run(cmd, **kw):
     return subprocess.run(cmd, capture_output=True, text=True, timeout=60, **kw)
 
 
-def check(src_path, bin_path):
+def check(src_path, bin_path, s3, label):
     """"ok", "reject" (a generator bug) or "fail" (a compiler one), and detail.
 
     A program this generator emits must typecheck, and one that does not is a
@@ -573,6 +575,9 @@ def check(src_path, bin_path):
         return "fail", "native build failed:\n" + (build.stdout + build.stderr)[:600]
     interp = run([GRASM, "run", src_path])
     native = run([bin_path])
+    # Its verdict is the engine's to count; the comparison below is the
+    # interpreter's against the Cranelift build's, as before.
+    s3.check(src_path, bin_path, label, interp=(interp.returncode, interp.stdout))
     if interp.stdout != native.stdout or interp.returncode != native.returncode:
         return "fail", (
             f"exit {interp.returncode} (interp) vs {native.returncode} (native)\n"
@@ -603,6 +608,7 @@ def main():
     work = tempfile.mkdtemp(prefix="grasm_fuzz_")
     failures = []
     rejected = []
+    s3 = S3Engine(GRASM, work)
 
     print(f"generating {args.count} programs from base seed {base}")
     for i in range(args.count):
@@ -612,7 +618,7 @@ def main():
         with open(path, "w") as f:
             f.write(src)
 
-        status, detail = check(path, os.path.join(work, "p.bin"))
+        status, detail = check(path, os.path.join(work, "p.bin"), s3, f"seed {seed}")
         if status == "reject":
             rejected.append((seed, detail))
         elif status == "fail":
@@ -621,6 +627,7 @@ def main():
             print(f"  {i + 1}/{args.count}  mismatches={len(failures)}")
 
     print()
+    s3_ok = s3.report()
     print("=" * 42)
     print(f"programs: {args.count}   mismatched: {len(failures)}   rejected: {len(rejected)}")
     print("=" * 42)
@@ -638,7 +645,7 @@ def main():
     else:
         shutil.rmtree(work, ignore_errors=True)
 
-    return 1 if failures or rejected else 0
+    return 1 if failures or rejected or not s3_ok else 0
 
 
 if __name__ == "__main__":

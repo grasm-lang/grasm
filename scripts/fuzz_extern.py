@@ -58,6 +58,9 @@ def _lib(name):
 leaked = _lib("leaks").leaked
 # One binary, rebuilt in place, instead of one file per program (see the module).
 build_native = _lib("inplace").build
+# The Grasm backend (compiler/s3), held to the Cranelift build on each pointer
+# spelling.
+S3Engine = _lib("s3engine").Engine
 
 _spec = _ilu.spec_from_file_location(
     "grasm_fresh", os.path.join(os.path.dirname(os.path.abspath(__file__)), "lib", "fresh.py")
@@ -181,6 +184,7 @@ def main():
     work = tempfile.mkdtemp(prefix="grasm_fuzz_extern_")
     path = os.path.join(work, "p.gr")
     leaks, false_positives, checked = [], [], 0
+    s3 = S3Engine(GRASM, work)
     try:
         for name, spelling in SPELLINGS:
             for row, should_pass in ROWS:
@@ -229,6 +233,7 @@ def main():
                 declined.append(name)
                 continue
             rc3, out3, err3 = run([exe])
+            s3.check(path, exe, f"pointer/{name}", interp=(rc, out))
             if rc3 != 0 or out3.strip() != interp:
                 false_positives.append(f"pointer/{name}/native")
                 print(
@@ -245,6 +250,7 @@ def main():
                 print(f"POINTER LEAKS {name}: {held}\n{src}")
         if declined:
             print(f"  native declined (not a defect): {', '.join(declined)}")
+        s3_ok = s3.report()
         print(
             f"programs: {checked}   leaked: {len(leaks)}   "
             f"false positives: {len(false_positives)}"
@@ -254,7 +260,7 @@ def main():
             print(f"kept: {work}")
         else:
             shutil.rmtree(work, ignore_errors=True)
-    sys.exit(1 if leaks or false_positives else 0)
+    sys.exit(1 if leaks or false_positives or not s3_ok else 0)
 
 
 if __name__ == "__main__":

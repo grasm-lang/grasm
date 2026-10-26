@@ -48,6 +48,8 @@ def _lib(name):
 _fresh = _lib("fresh")
 # One binary, rebuilt in place, instead of one file per program (see the module).
 build_native = _lib("inplace").build
+# The Grasm backend (compiler/s3), held to the Cranelift build on each program.
+S3Engine = _lib("s3engine").Engine
 _fresh.fresh_or_stop(GRASM)
 
 
@@ -152,6 +154,7 @@ def main():
     path = os.path.join(work, "p.gr")
     exe = os.path.join(work, "p.bin")
     checked, bad, declined, rejected = 0, [], [], []
+    s3 = S3Engine(GRASM, work)
     try:
         for fname, fault in FAULTS.items():
             for ctx in CONTEXTS:
@@ -173,6 +176,7 @@ def main():
                     declined.append(f"{label}: {first[0] if first else '(silent)'}")
                     continue
                 rc3, got, err3 = run([exe])
+                s3.check(path, exe, label, interp=(rc, out))
                 if (out, rc, strip_trace(err)) != (got, rc3, strip_trace(err3)):
                     bad.append(label)
                     print(
@@ -182,6 +186,7 @@ def main():
                     )
         for d in declined:
             print(f"  DECLINED (every shape here should compile): {d}")
+        s3_ok = s3.report()
         print(
             f"programs: {checked}   disagreed: {len(bad)}   "
             f"declined: {len(declined)}   not a panic: {len(rejected)}"
@@ -191,7 +196,7 @@ def main():
             print(f"kept: {work}")
         else:
             shutil.rmtree(work, ignore_errors=True)
-    sys.exit(1 if bad or declined else 0)
+    sys.exit(1 if bad or declined or not s3_ok else 0)
 
 
 if __name__ == "__main__":

@@ -53,6 +53,8 @@ def _lib(name):
 leaked = _lib("leaks").leaked
 # One binary, rebuilt in place, instead of one file per program (see the module).
 build_native = _lib("inplace").build
+# The Grasm backend (compiler/s3), held to the Cranelift build on each place.
+S3Engine = _lib("s3engine").Engine
 
 _spec = _ilu.spec_from_file_location(
     "grasm_fresh",
@@ -206,6 +208,7 @@ def main():
     path = os.path.join(work, "p.gr")
     exe = os.path.join(work, "p.bin")
     checked, disagreed, declined, rejected = 0, [], [], []
+    s3 = S3Engine(GRASM, work)
     try:
         for pname, place, ty, value in PLACES:
             for oname, op in OPS:
@@ -236,6 +239,7 @@ def main():
                     declined.append(label)
                     continue
                 rc3, got, err3 = run([exe])
+                s3.check(path, exe, label, interp=(rc, out))
                 if rc3 != 0 or got != want:
                     disagreed.append(label)
                     print(
@@ -266,6 +270,7 @@ def main():
                     declined.append(label)
                     continue
                 rc3, got, err3 = run([exe])
+                s3.check(path, exe, label, interp=(rc, out))
                 if rc3 != 0 or got != want:
                     disagreed.append(label)
                     print(
@@ -279,6 +284,7 @@ def main():
                     print(f"LEAKS {label}: {held}\n{src}")
         if declined:
             print(f"  native declined (not a defect): {', '.join(sorted(set(declined)))}")
+        s3_ok = s3.report()
         print(
             f"programs: {checked}   disagreed: {len(disagreed)}   "
             f"rejected: {len(rejected)}   declined: {len(declined)}"
@@ -294,7 +300,7 @@ def main():
     # `scripts/nativegaps.sh` and in the tutorial's table -- or a defect.
     # Counted and not acted on, it reads as PASS while programs quietly stop
     # running: removing the F52 fix left this at `declined: 1` and exit 0.
-    sys.exit(1 if disagreed or rejected or declined else 0)
+    sys.exit(1 if disagreed or rejected or declined or not s3_ok else 0)
 
 
 if __name__ == "__main__":

@@ -45,6 +45,8 @@ def _lib(name):
 leaked = _lib("leaks").leaked
 # One binary, rebuilt in place, instead of one file per program (see the module).
 build_native = _lib("inplace").build
+# The Grasm backend (compiler/s3), held to the Cranelift build on each case.
+S3Engine = _lib("s3engine").Engine
 
 _spec = _ilu.spec_from_file_location(
     "grasm_fresh",
@@ -217,6 +219,7 @@ def main():
         cases.append((f"map-get-or/{ty}", map_program(ty, lit, key, default)))
 
     checked, bad = 0, []
+    s3 = S3Engine(GRASM, work)
     try:
         for name, src in cases:
             with open(path, "w") as f:
@@ -230,6 +233,7 @@ def main():
                 print(f"WILL NOT BUILD {name}: {err2.strip().splitlines()[0]}")
                 continue
             rc3, got, err3 = run([exe])
+            s3.check(path, exe, name, interp=(rc, out), timeout=240)
             # A fused loop builds no intermediate list, so what it does not
             # build it must not release either (F57).
             held = leaked(exe) if rc3 == 0 else None
@@ -247,6 +251,8 @@ def main():
                     b = g[i] if i < len(g) else "<nothing>"
                     if a != b:
                         print(f"  line {i + 1}: run={a!r} native={b!r}")
+        if not s3.report():
+            bad.append("the Grasm backend")
         print(f"programs: {checked}   disagreed: {len(bad)}")
     finally:
         if args.keep:
