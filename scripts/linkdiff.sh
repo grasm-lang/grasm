@@ -26,8 +26,15 @@
 #         backend's objects -- and compiler/link writes none, since those
 #         objects live in a temporary directory and an N_OSO records a path
 #         and a time. Symbols themselves are compared by `nm -m`.
-#   * the thread-local fixture (`scripts/fixtures/link/tlv_*.c`, built with
-#     `cc -c`): the same three tool comparisons against `cc`'s link.
+#   * unstripped, also every section's bytes and the fixups, trie, function
+#     starts and data in code (`scripts/link_sections.py`);
+#   * the C fixtures (`scripts/fixtures/link/`, built with `cc -c`): the same
+#     comparisons against `cc`'s link, the symbol tables included, since C
+#     objects carry no DWARF and ld writes no debug map for them;
+#   * the whole runtime: every member of `libgrasm_rt_abi.a` given as an
+#     object, after a C `main`, without -dead_strip, so every relocation,
+#     section and unwind entry it has goes through both linkers -- the same
+#     comparisons.
 #
 # Counts are derived and asserted: the sample is drawn from the same list
 # `scripts/lib/s3.sh` collects, and every program in it is compared.
@@ -84,6 +91,15 @@ otool_norm() {
         /segname / && !/__LINKEDIT/ { le = 0 }
         { print }
     '
+}
+
+# Section contents and __LINKEDIT blobs, byte for byte (scripts/link_sections.py).
+check_sections() { # LD_OUT OURS NAME [--symbols]
+    if python3 scripts/link_sections.py "$1" "$2" ${4:-} >"$WORK/s.log" 2>&1; then
+        return 0
+    fi
+    FAILED+=("$3 — sections differ: $(grep -E 'DIFFERS|missing|differ in' "$WORK/s.log" | head -3 | tr '\n' ' ')")
+    return 1
 }
 
 dyld_norm() {
@@ -184,7 +200,7 @@ for k in "${!S3_SRC[@]}"; do
         FAILED+=("$src — compiler/link failed unstripped: $(head -2 "$WORK/link.log" | tr '\n' ' ')")
         continue
     fi
-    if check_tools "$WORK/ld/p" "$WORK/u/p" "$src"; then
+    if check_tools "$WORK/ld/p" "$WORK/u/p" "$src" && check_sections "$WORK/ld/p" "$WORK/u/p" "$src"; then
         compared=$((compared + 1))
     fi
 done
@@ -204,20 +220,52 @@ for entry in "${LINK_FIXTURES[@]}"; do
         FAILED+=("fixture $name — compiler/link failed: $(head -2 "$WORK/link.log" | tr '\n' ' ')")
         continue
     fi
-    if check_tools "$WORK/fx/$name/ref" "$WORK/fx/$name/o/ref" "fixture $name"; then
+    # C objects carry no DWARF, so ld writes no debug map and the symbol
+    # tables are compared too.
+    if check_tools "$WORK/fx/$name/ref" "$WORK/fx/$name/o/ref" "fixture $name" &&
+        check_sections "$WORK/fx/$name/ref" "$WORK/fx/$name/o/ref" "fixture $name" --symbols; then
         fx=$((fx + 1))
     fi
 done
 
+# The whole runtime: every member of the archive given as an object, in
+# archive order, after a C `main`, without -dead_strip -- every function,
+# relocation and unwind entry it has, where a program keeps a sliver.
+whole=0
+mkdir -p "$WORK/rt/m" "$WORK/rt/o"
+printf 'int main(void) { return 0; }\n' >"$WORK/rt/main.c"
+members=()
+while IFS= read -r m; do
+    case "$m" in
+    __.SYMDEF*) ;;
+    *) members+=("$WORK/rt/m/$m") ;;
+    esac
+done < <(ar t "$S3_RT")
+rt_abs="$(cd "$(dirname "$S3_RT")" && pwd)/$(basename "$S3_RT")"
+if cc -c "$WORK/rt/main.c" -o "$WORK/rt/main.o" && (cd "$WORK/rt/m" && ar x "$rt_abs") &&
+    cc "$WORK/rt/main.o" "${members[@]}" -o "$WORK/rt/whole" >"$WORK/rt.log" 2>&1; then
+    # shellcheck disable=SC2086
+    if "$LINK" "$WORK/rt/main.o" "${members[@]}" $EXTRA -o "$WORK/rt/o/whole" >"$WORK/link.log" 2>&1; then
+        if check_tools "$WORK/rt/whole" "$WORK/rt/o/whole" "the whole runtime" &&
+            check_sections "$WORK/rt/whole" "$WORK/rt/o/whole" "the whole runtime"; then
+            whole=1
+        fi
+    else
+        FAILED+=("the whole runtime — compiler/link failed: $(head -2 "$WORK/link.log" | tr '\n' ' ')")
+    fi
+else
+    FAILED+=("the whole runtime — cc does not link its ${#members[@]} members: $(head -2 "$WORK/rt.log" | tr '\n' ' ')")
+fi
+
 echo
-echo "sampled: $sampled   byte-identical to the shipped build: $identical   tools agree: $compared   C fixtures agree: $fx of ${#LINK_FIXTURES[@]}   (ld $LD_VERSION)"
+echo "sampled: $sampled   byte-identical to the shipped build: $identical   tools and sections agree: $compared   C fixtures agree: $fx of ${#LINK_FIXTURES[@]}   whole runtime (${#members[@]} members) agrees: $whole   (ld $LD_VERSION)"
 if [ ${#FAILED[@]} -gt 0 ]; then
     echo
     echo "FAILED:"
     printf '  %s\n' "${FAILED[@]}"
     exit 1
 fi
-if [ "$identical" -ne "$sampled" ] || [ "$compared" -ne "$sampled" ] || [ "$fx" -ne ${#LINK_FIXTURES[@]} ]; then
+if [ "$identical" -ne "$sampled" ] || [ "$compared" -ne "$sampled" ] || [ "$fx" -ne ${#LINK_FIXTURES[@]} ] || [ "$whole" -ne 1 ]; then
     echo "not every sampled program was compared"
     exit 1
 fi
