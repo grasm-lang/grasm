@@ -98,7 +98,7 @@ echo "rejected by the Rust parser: $negatives   same first diagnostic: $same   d
 echo "accepted by both: $accepted   rust panics: $rust_panics"
 if [ ${#PANICS[@]} -gt 0 ]; then
     echo
-    echo "THE RUST PARSER PANICKED (docs/known-issues.md):"
+    echo "THE RUST PARSER PANICKED:"
     printf '  %s\n' "${PANICS[@]}" | head -20
 fi
 if [ ${#FAILED[@]} -gt 0 ]; then
@@ -113,10 +113,10 @@ fi
 if [ "$differ" -ne 0 ]; then
     exit 1
 fi
-# The one Rust panic docs/known-issues.md records: an unknown escape before
-# a multi-byte character. Any other is new and fails the run.
-if printf '%s\n' "${PANICS[@]:-}" | grep -v '^$' | grep -qv 'lexer.rs:706'; then
-    echo "a Rust panic docs/known-issues.md does not record"
+# A Rust parser panic is a Rust bug, and none is known: the one there was,
+# an unknown escape before a multi-byte character, is fixed.
+if [ "$rust_panics" -ne 0 ]; then
+    echo "the Rust parser panicked"
     exit 1
 fi
 if [ "$negatives" -lt 200 ]; then

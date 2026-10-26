@@ -483,15 +483,27 @@ impl<'a> Lexer<'a> {
                             }
                         }
                         _ => {
+                            // The whole character, not its first byte. Taking
+                            // one byte of `é` ended the error token inside the
+                            // character, and the next token started on a
+                            // continuation byte: "end byte index is out of
+                            // bounds", exit 134, from every command.
+                            let shown = if esc >= 0x80 {
+                                let at = self.pos - 1;
+                                let c = self.src[at..].chars().next().unwrap_or('\u{FFFD}');
+                                for _ in 1..c.len_utf8() {
+                                    self.bump();
+                                }
+                                c.escape_debug().to_string()
+                            } else {
+                                (esc as char).escape_debug().to_string()
+                            };
                             return self.tok(
-                                // Rendered, not pasted: the byte after a lone
-                                // backslash can be anything, and a message
-                                // carrying a raw control character shows as
-                                // nothing at all.
-                                TokenKind::Error(format!(
-                                    "unknown escape `\\{}`",
-                                    (esc as char).escape_debug()
-                                )),
+                                // Rendered, not pasted: the character after a
+                                // lone backslash can be anything, and a message
+                                // carrying a raw control or invisible character
+                                // shows as nothing at all.
+                                TokenKind::Error(format!("unknown escape `\\{shown}`")),
                                 start,
                             );
                         }
@@ -797,6 +809,23 @@ mod tests {
 
     fn kinds(src: &str) -> Vec<TokenKind> {
         lex(src).into_iter().map(|t| t.kind).collect()
+    }
+
+    /// A backslash before a character of more than one byte is an unknown
+    /// escape naming that character, and lexing goes on after it. It took
+    /// one byte, ended the error token inside the character, and aborted
+    /// every command on the next token's slice (found by the Grasm lexer's
+    /// fuzzer, S2).
+    #[test]
+    fn unknown_escape_of_a_multibyte_character() {
+        let toks = lex("\"\\é\" x");
+        assert_eq!(toks[0].kind, Error("unknown escape `\\é`".to_string()));
+        assert_eq!(toks.last().map(|t| &t.kind), Some(&Eof));
+        let toks = lex("\"\\éa\"");
+        assert_eq!(toks[0].kind, Error("unknown escape `\\é`".to_string()));
+        // An invisible one is rendered, not pasted.
+        let toks = lex("\"\\\u{200b}\"");
+        assert_eq!(toks[0].kind, Error("unknown escape `\\\\u{200b}`".to_string()));
     }
 
     #[test]

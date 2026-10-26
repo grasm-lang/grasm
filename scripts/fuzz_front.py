@@ -71,9 +71,9 @@ def _lib(name):
 
 # Rust frontend panics this gate knows: the place the panic names, and the
 # docs/known-issues.md entry that records it. Any other panic fails the run.
-KNOWN_RUST_PANICS = {
-    "crates/grasm_syntax/src/lexer.rs:706": "an unknown escape before a multi-byte character",
-}
+# Empty since the lexer took the whole character after a backslash
+# (lexer.rs:706, an unknown escape before a multi-byte character, fixed).
+KNOWN_RUST_PANICS = {}
 
 TIMEOUT = 60
 
@@ -228,7 +228,7 @@ ESCAPES = ["\\n", "\\t", "\\r", "\\\\", '\\"', "\\0", "\\{", "\\}", "\\q", "\\'"
            "\\u{1234567}", "\\u12", "\\u{12", "\\u{301}", "\\u{200d}", "\\u{feff}", "\\u{a0}", "\\u{e0001}",
            "{x}", "{ }", "{}", "{a + b}", "{\"{x}\"}", "{x", "\\", "{x}}", "{{x}}",
            # A backslash before a character of more than one byte: the Rust
-           # lexer panics on it (docs/known-issues.md).
+           # lexer panicked on it until it took the whole character.
            "\\é", "\\✓", "\\🙂"]
 
 

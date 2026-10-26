@@ -13,6 +13,8 @@
 // `floats`; a string's first part and part count; an identifier's or an
 // error's index in `text`.
 
+import rdebug
+
 // Token kinds, in the order of the Rust `TokenKind`.
 pub let T_IDENT = 0
 pub let T_INT = 1
@@ -931,11 +933,18 @@ fn lex_string(inout lx: LexState, inout pos: i64, inout tb: [i64], inout out: Le
             } else {
                 var shown = escape_debug_byte(esc)
                 if esc >= 128 {
-                    // The whole character, not its first byte.
+                    // The whole character, not its first byte, rendered as
+                    // Rust's `char::escape_debug` renders it: an invisible one
+                    // as `\u{...}`.
                     let len = utf8_len(esc)
                     let at = pos - 1
                     pos = (at + len).min(lx.n)
-                    shown = lx.src.slice(at, pos).to_str()
+                    let cp = decode_at(lx.src, at, pos - at)
+                    if rdebug.is_escaped(rdebug.new_esc_table(), cp) {
+                        shown = "\\u\{" + cp.to_base(16) + "}"
+                    } else {
+                        shown = lx.src.slice(at, pos).to_str()
+                    }
                 }
                 drop_parts(out, first_part)
                 push_error(tb, out, start, pos, "unknown escape `\\" + shown + "`")

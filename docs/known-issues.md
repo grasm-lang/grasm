@@ -5,8 +5,7 @@ Every defect that is known and not fixed, with its severity from
 to paste. S1 and S2 block a release; S3 and S4 do not, and this file is what
 makes shipping them honest rather than quiet.
 
-**Open S1: one, the lexer's panic on `"\é"` (below); one more under
-investigation. Open S2: none. Open S3: one, a block whose value is a map
+**Open S1: none confirmed; one under investigation. Open S2: none. Open S3: one, a block whose value is a map
 literal. Open S4: two, a nested interpolation's spans and a backslash at the
 end of a file.**
 
@@ -20,7 +19,7 @@ comparable and both are fixed together; where it crashes, the Grasm one does
 what was meant, and the gates count the crash apart.
 
 **The lexer panics on a backslash before a character of more than one byte
--- *open, S1*.** `"\é"` is a whole program that aborts `grasm check`,
+-- *closed, S1*.** `"\é"` is a whole program that aborts `grasm check`,
 `grasm tokens` and every other command with `panicked at
 crates/grasm_syntax/src/lexer.rs:706:37: end byte index 7 is out of bounds`
 (exit 134), and `"\éa"` with "byte index … is not a char boundary". The
@@ -30,6 +29,12 @@ a continuation byte that `lex_operator` slices as the start of one. The
 fix is to take the whole character, as the Grasm lexer does: it reports
 ``unknown escape `\é` `` and goes on. `fuzz_front` and `parsediag` count
 these programs as Rust panics, apart from agreement, and fail on any other.
+
+Closed 2026-10-27: the Rust lexer takes the whole character after the
+backslash and names it as `char::escape_debug` renders it (an invisible one
+as `\u{200b}`), and the Grasm lexer renders it the same way; the test
+`unknown_escape_of_a_multibyte_character` covers both forms. `fuzz_front`
+and `parsediag` now fail on any Rust panic at all.
 
 **A block whose value is a map literal is refused -- *open, S3*.**
 
