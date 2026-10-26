@@ -73,11 +73,26 @@ is not being added blind.
 
 ## Install
 
-Download the archive for your platform, unpack it, and put both files
-somewhere on your `PATH` — `grasm` links `libgrasm_rt.a` for native builds and
-finds it beside itself.
+A release archive holds `grasm`, `libgrasm_rt_abi.a` (what `--native` links;
+`grasm` finds it beside itself) and `BUILD-INFO`, naming the commit it was built
+from; from the release after v1.1.0, the arm64 macOS archive also holds
+`grasm-link`, Grasm's own linker. `scripts/package.sh` makes one, and before it
+writes the checksum it unpacks it into an empty directory, runs a program,
+builds it natively and runs the result. Unpack it and put the files somewhere
+on your `PATH`, together.
+
+v1.1.0 is the first release made this way, for macOS on arm64 and x86_64; it
+was checked again after publishing by downloading it (`scripts/verify_release.sh
+--tag v1.1.0`). v1.0.0 predates the script: it is two bare binaries, and
+`grasm build --native` from that download stops with "cannot find the Grasm
+runtime". v1.1.0 and earlier link native builds with a C toolchain's `cc`.
+From source, and from the next release, a native build on arm64 macOS links
+with `grasm-link` and runs no C compiler or system linker; it reads only the
+SDK's text stubs for libSystem (from the Command Line Tools or Xcode).
+Elsewhere it links with `cc` (`docs/self-hosting.md`).
 
 ```
+curl -fLO https://github.com/grasm-lang/grasm/releases/download/v1.1.0/grasm-macos-arm64.tar.gz
 tar -xzf grasm-macos-arm64.tar.gz
 cd grasm-macos-arm64
 ./grasm run hello.gr
@@ -88,11 +103,15 @@ From source:
 ```
 git clone <repo> && cd grasm
 cargo build --release --workspace     # produces target/release/grasm
+# the linker --native uses on arm64 macOS, built by the compiler (linked by
+# cc this once; the gates do this for you):
+GRASM_LINKER=cc target/release/grasm build compiler/link/src/main.gr --native -o target/release/grasm-link
 ```
 
 `grasm run` needs nothing but the binary. `grasm build --native` also needs
-`libgrasm_rt.a`, which sits next to `grasm` in both layouts; set
-`GRASM_RUNTIME` to override.
+`libgrasm_rt_abi.a`, which sits next to `grasm` in both layouts, and on arm64
+macOS `grasm-link` beside them; set `GRASM_RUNTIME` and `GRASM_LINKER` to
+override, or `GRASM_LINKER=cc` to link with `cc`.
 
 ### Your first program
 
@@ -357,22 +376,25 @@ the test suite. See `examples/documented.gr`.
 ### Native compilation
 
 `grasm build <file.gr> --native` compiles to machine code through Cranelift and
-links against `libgrasm_rt.a`. The backend covers scalars, strings, lists, maps,
+links against `libgrasm_rt_abi.a`. The backend covers scalars, strings, lists, maps,
 tuples, structs, sum types, `match` (guards + nested patterns), `Option`,
 `T ! E` fallibles with `try`/`fail`, effects with handlers, `inout`/`own`
 params, `map`/`filter` (lowered as inline loops), and multi-module programs.
 
-**Targets.** `--target <triple>` emits an object for any supported
-architecture — verified for `x86_64` (Linux + macOS), `aarch64` (Linux +
-macOS), `riscv64gc`, and big-endian `s390x`. Host builds link automatically;
-cross builds emit the object for you to link with that target's toolchain and
-a `libgrasm_rt.a` built for it:
+**Targets.** `--target <triple>` emits an object for a supported
+architecture. A unit test emits a hello-world object for `x86_64` and `aarch64`
+Linux, `riscv64gc`, big-endian `s390x` and `x86_64` macOS, and checks only that
+one was written. Objects are linked and run only on macOS here: arm64 natively
+and x86_64 under Rosetta (`scripts/crosstest.sh`). No Linux build has been
+linked or run. Host builds link automatically; cross builds emit the object
+for you to link with that target's toolchain and a `libgrasm_rt_abi.a` built
+for it:
 
 ```
 rustup target add x86_64-apple-darwin
-cargo build --release -p grasm_rt --target x86_64-apple-darwin
+cargo build --release -p grasm_rt_abi --target x86_64-apple-darwin
 grasm build app.gr --native --target x86_64-apple-darwin -o app
-cc -arch x86_64 app.o target/x86_64-apple-darwin/release/libgrasm_rt.a -o app
+cc -arch x86_64 app.o target/x86_64-apple-darwin/release/libgrasm_rt_abi.a -o app
 ```
 
 The backend also compiles structured concurrency, generic functions
@@ -443,9 +465,11 @@ run).
 `scripts/crosstest.sh` runs the same gate against a *cross-compiled* target to
 prove the backend isn't accidentally host-specific — currently **130 identical,
 0 mismatched, 0 unsupported** for x86_64 built on arm64. CI
-(`.github/workflows/ci.yml`) runs
-build + tests + clippy + the differential gate on linux-x86_64, macos-arm64,
-and macos-x86_64, plus object emission for all five architectures.
+(`.github/workflows/ci.yml`) is written to run build + tests + clippy + the
+differential gate on linux-x86_64, macos-arm64 and macos-x86_64. It has not
+run: the public repository keeps the workflow files in `ci/github-workflows/`
+until a push carrying GitHub's `workflow` scope moves them into place. The
+gates in this README ran on one arm64 Mac.
 
 `scripts/fuzz_modules.py` builds programs of more than one file, which nothing
 else here does. Twenty positions a name from another module can stand in — a
