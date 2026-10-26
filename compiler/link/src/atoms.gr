@@ -106,13 +106,14 @@ pub fn atomize(inout l: Ld, fi: i64) -> () ! str {
             uniq = []
         }
         var p2 = l.s_p2[si]
-        if role == state.ROLE_LITERAL {
-            // A literal is aligned to its size, whatever its section says.
-            let ty = l.s_flags[si].bit_and(255)
-            let natural = if ty == 3 { 2 } else if ty == 4 { 3 } else { 4 }
-            if natural > p2 {
-                p2 = natural
-            }
+        // A literal is aligned to its size, and a thread-local descriptor to
+        // its pointers, whatever their section says: ld-prime makes both
+        // afresh (a descriptor in `__thread_vars` is 8-aligned in its output
+        // where clang's section is byte-aligned).
+        let natural = if role != state.ROLE_LITERAL and l.s_flags[si].bit_and(255) != 0x13 { -1 }
+            else if l.s_flags[si].bit_and(255) == 3 { 2 } else if l.s_flags[si].bit_and(255) == 14 { 4 } else { 3 }
+        if natural > p2 {
+            p2 = natural
         }
         let m = 1.shl(p2)
         for i in 0..uniq.len() {
@@ -122,7 +123,7 @@ pub fn atomize(inout l: Ld, fi: i64) -> () ! str {
             l.a_off.push(o)
             l.a_size.push(end - o)
             l.a_p2.push(p2)
-            l.a_mod.push(if role == state.ROLE_LITERAL { 0 } else { (addr + o) % m })
+            l.a_mod.push(if natural >= 0 { 0 } else { (addr + o) % m })
             l.a_live.push(false)
             l.a_addr.push(0)
             l.a_sym.push(-1)

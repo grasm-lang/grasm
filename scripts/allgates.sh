@@ -126,6 +126,9 @@ run_gate objtest       scripts/objtest.sh
 run_gate ra_check      scripts/ra_check.sh
 run_gate s3rc          scripts/s3rc.sh
 run_gate s3controls    scripts/s3controls.sh
+run_gate linktest      scripts/linktest.sh
+run_gate linkdiff      scripts/linkdiff.sh
+run_gate linkcontrols  scripts/linkcontrols.sh
 run_gate reprotest     scripts/reprotest.sh
 run_gate brokertest    scripts/broker_test.sh
 run_gate audiodiff     scripts/audio_diff.sh

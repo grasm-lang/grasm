@@ -79,6 +79,8 @@ pub fn sections(inout l: Ld, files: [i64]) -> () ! str {
     var order_dc: [i64] = []
     var order_data: [i64] = []
     var order_zf: [i64] = []
+    var order_tdata: [i64] = []
+    var order_tbss: [i64] = []
     var order_other: [i64] = []
     var by_name: Map[str, i64] = {}
     var cold: [i64] = []
@@ -115,7 +117,13 @@ pub fn sections(inout l: Ld, files: [i64]) -> () ! str {
                 } else if seg == "__DATA_CONST" {
                     order_dc.push(o)
                 } else if seg == "__DATA" {
-                    if atoms.is_zerofill(l.s_flags[si]) {
+                    // A thread-local template -- initial values, then zeros --
+                    // follows the other data and comes before the zero fill.
+                    if ty == 0x11 {
+                        order_tdata.push(o)
+                    } else if ty == 0x12 {
+                        order_tbss.push(o)
+                    } else if atoms.is_zerofill(l.s_flags[si]) {
                         order_zf.push(o)
                     } else {
                         order_data.push(o)
@@ -170,6 +178,12 @@ pub fn sections(inout l: Ld, files: [i64]) -> () ! str {
         final.push(o)
     }
     for o in order_data {
+        final.push(o)
+    }
+    for o in order_tdata {
+        final.push(o)
+    }
+    for o in order_tbss {
         final.push(o)
     }
     for o in order_zf {
@@ -269,7 +283,7 @@ fn synthesize(inout l: Ld, files: [i64]) -> () ! str {
         l.got_name.push(name)
     }
     for (name, g) in imp.entries() {
-        l.g_import[g] = l.imp_g.len()
+        // Numbered when the fixups are chained (`image.chained`).
         l.imp_g.push(g)
     }
 }
@@ -375,6 +389,16 @@ pub fn place(inout l: Ld, header_size: i64) -> i64 {
     }
     // Other segments are not produced by the inputs this linker takes.
     l.seg_linkedit_addr = addr
+    // The thread-local template starts at the first of its sections.
+    for o in l.o_order {
+        let ty = l.o_flags[o].bit_and(255)
+        if (ty == 0x11 or ty == 0x12) and l.tlv_template == 0 {
+            l.tlv_template = l.o_addr[o]
+        }
+        if ty == 0x13 {
+            l.tlv_any = true
+        }
+    }
     // Atoms: absolute addresses.
     for o in l.o_order {
         if l.o_kind[o] == K_ATOMS {

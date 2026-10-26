@@ -260,6 +260,16 @@ fn chained(inout l: Ld, inout buf: bytes, fx: Fixups) -> bytes ! str {
         idx.push(i)
     }
     idx.sort_by(|i| fx.addr[i])
+    // Imports are numbered in the order their first pointer comes in the
+    // image, as ld-prime numbers them (the GOT, sorted by name, first).
+    var order: [i64] = []
+    for i in idx {
+        if fx.bind[i] and l.g_import[fx.target[i]] < 0 {
+            l.g_import[fx.target[i]] = order.len()
+            order.push(fx.target[i])
+        }
+    }
+    l.imp_g = order
     // Segments in load-command order: __PAGEZERO, __TEXT, __DATA_CONST?, __DATA?, __LINKEDIT.
     var segs: [(str, i64, i64, i64)] = [("__PAGEZERO", 0, 0, 0), ("__TEXT", layout.BASE, l.seg_text_size, 0)]
     if l.seg_dc.1 > 0 {
@@ -335,7 +345,7 @@ fn chained(inout l: Ld, inout buf: bytes, fx: Fixups) -> bytes ! str {
                 if fx.addend[i] < 0 or fx.addend[i] > 255 {
                     fail("a bound pointer with addend {fx.addend[i]}, which DYLD_CHAINED_PTR_64 cannot hold")
                 }
-                v = fx.target[i].bit_and(0xffffff).bit_or(fx.addend[i].shl(24)).bit_or(next.shl(51)).bit_or(1.shl(63))
+                v = l.g_import[fx.target[i]].bit_and(0xffffff).bit_or(fx.addend[i].shl(24)).bit_or(next.shl(51)).bit_or(1.shl(63))
             } else {
                 let t = fx.target[i]
                 if t < 0 or t >= 1.shl(36) {
@@ -349,7 +359,9 @@ fn chained(inout l: Ld, inout buf: bytes, fx: Fixups) -> bytes ! str {
             rd.w16(b, s)
         }
     }
-    rd.wpad(b, 4)
+    // ld-prime starts the imports, and the names after them, on 8 bytes
+    // (ld64 aligned the imports to 4).
+    rd.wpad(b, 8)
     let imports_at = b.len()
     // The names, after a NUL.
     var pool = byte_builder()
@@ -426,16 +438,20 @@ fn trie(l: Ld) -> bytes {
     if not l.strip {
         return full
     }
-    // strip(1) rebuilds the trie from the symbols it keeps -- the header's,
-    // and the exports it is told to keep -- with ld64's encoder, and leaves
-    // it in the space ld's trie had, zero-filled.
+    // strip(1) keeps the header's symbol and the exports it is told to keep
+    // (all of them, when there is an export list). When that is every
+    // export, it leaves ld's trie as it was; otherwise it rebuilds it from
+    // what it kept, with ld64's encoder, in the space ld's trie had,
+    // zero-filled.
+    if l.exp_list.len() > 0 or es.len() == 1 {
+        return full
+    }
     var kept: [ExportEntry] = []
     for e in es {
-        if e.name == "__mh_execute_header" or l.exp_list.len() > 0 {
+        if e.name == "__mh_execute_header" {
             kept.push(e)
         }
     }
-    kept.sort_by(|e| e.name)
     let small = ld64_trie(kept)
     var out = bytes_filled(full.len(), 0)
     out.copy_from(0, small)
@@ -607,6 +623,11 @@ fn wlinkedit_cmd(inout b: ByteBuilder, cmd: i64, off: i64, size: i64) {
 }
 
 /// The size of the load commands, which layout needs before it can place anything.
+///
+/// It is the size ld's commands would have -- with LC_UUID and an LD tool
+/// entry, whether or not this link writes them -- because the space left
+/// for them decides whether `__TEXT` takes another page, and ld decides it
+/// before `strip -no_uuid` removes its UUID.
 pub fn commands_size(l: Ld) -> i64 {
     var n = 72
     for seg in ["__TEXT", "__DATA_CONST", "__DATA"] {
@@ -622,13 +643,9 @@ pub fn commands_size(l: Ld) -> i64 {
     }
     n += 72
     n += 16 + 16 + 24 + 80 + 32
-    if l.uuid {
-        n += 24
-    }
+    n += 24
     n += 24 + 16 + 24
-    if l.tool_version > 0 {
-        n += 8
-    }
+    n += 8
     for d in l.dl_install {
         n += rd.align_up(24 + d.to_bytes().len() + 1, 8)
     }
@@ -706,7 +723,9 @@ pub fn finish(inout l: Ld, files: [i64], body: bytes, fx: Fixups, entry_addr: i6
     let sig_off = le_off + le.len()
     let ident = if l.ident != "" { l.ident } else { basename(l.out) }
     let pages = (sig_off + 4095) / 4096
-    let sig_size = 12 + 8 + 88 + ident.to_bytes().len() + 1 + 32 * pages
+    // The SuperBlob and its one CodeDirectory, zero-padded to 8 bytes as ld
+    // (and strip) size the space.
+    let sig_size = rd.align_up(12 + 8 + 88 + ident.to_bytes().len() + 1 + 32 * pages, 8)
     for _k in 0..sig_size {
         le.push_byte(0)
     }
@@ -836,7 +855,9 @@ pub fn finish(inout l: Ld, files: [i64], body: bytes, fx: Fixups, entry_addr: i6
     if 32 + cmds.len() > l.o_addr[l.o_order[0]] - layout.BASE {
         fail("the load commands do not fit before the first section")
     }
-    let flags = 0x200085
+    // MH_NOUNDEFS | MH_DYLDLINK | MH_TWOLEVEL | MH_PIE, and
+    // MH_HAS_TLV_DESCRIPTORS when there are thread-local variables.
+    let flags = if l.tlv_any { 0xa00085 } else { 0x200085 }
     var h = byte_builder()
     rd.w32(h, 0xfeedfacf)
     rd.w32(h, 0x0100000c)

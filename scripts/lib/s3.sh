@@ -31,10 +31,16 @@ s3_driver() {
 # explains the ~450ms that saves per program). The linker's own output goes
 # to `$3`. Fails, leaving no executable behind, when the link does. `$4`, if
 # given, is the runtime to link instead of `$S3_RT` (the RC gate's poisoned
-# one).
+# one). `S3_LINKER=<binary>` links with that instead of `cc`: compiler/link
+# (docs/self-hosting.md, stage S4), given the same objects and -dead_strip.
 s3_link() {
     local obj=$1 out=$2 log=$3 stage="$2.stage" rt=${4:-$S3_RT}
-    if ! cc "$obj" "$rt" -o "$stage" -Wl,-dead_strip >"$log" 2>&1; then
+    if [ -n "${S3_LINKER:-}" ]; then
+        if ! "$S3_LINKER" "$obj" "$rt" -dead_strip -o "$stage" >"$log" 2>&1; then
+            rm -f "$out" "$stage"
+            return 1
+        fi
+    elif ! cc "$obj" "$rt" -o "$stage" -Wl,-dead_strip >"$log" 2>&1; then
         rm -f "$out" "$stage"
         return 1
     fi

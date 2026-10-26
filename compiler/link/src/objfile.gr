@@ -64,6 +64,9 @@ pub fn read(inout l: Ld, path: str, d: bytes, key: i64) -> i64 ! str {
     if rd.u32(d, 12) != 1 {
         fail("{path}: not a relocatable object (file type {rd.u32(d, 12)})")
     }
+    if rd.u32(d, 8).bit_and(0xffffff) == 2 {
+        fail("{path}: built for arm64e, which this linker does not take (the native build is arm64)")
+    }
     let fi = l.f_path.len()
     l.f_path.push(path)
     l.f_data.push(d)
@@ -90,6 +93,12 @@ pub fn read(inout l: Ld, path: str, d: bytes, key: i64) -> i64 ! str {
                 let name = rd.name16(d, s)
                 let seg = rd.name16(d, s + 16)
                 let flags = rd.u32(d, s + 64)
+                let ty = flags.bit_and(255)
+                if (ty == 9 or ty == 10 or ty == 0x15 or ty == 0x16) and rd.u64(d, s + 40) > 0 {
+                    // ld-prime turns these into __init_offsets; nothing this
+                    // linker is given has one, so it says so rather than guess.
+                    fail("{path}: {seg},{name} holds initializers or terminators, which this linker does not take")
+                }
                 l.s_file.push(fi)
                 l.s_name.push(name)
                 l.s_seg.push(seg)

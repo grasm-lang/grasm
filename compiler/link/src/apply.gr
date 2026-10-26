@@ -162,6 +162,29 @@ pub fn contents(inout l: Ld, inout buf: bytes) -> Fixups ! str {
                             rd.put32(buf, at, 0x91000000.bit_or(target.bit_and(0xfff).shl(10)).bit_or(insn.bit_and(0x3ff)))
                         }
                     }
+                } else if t == objfile.R_TLVP_PAGE21 or t == objfile.R_TLVP_PAGEOFF12 {
+                    // A thread-local variable's descriptor, in this image:
+                    // its address, the `ldr` of it made an `add`, as for a GOT load.
+                    if k != state.T_ATOM {
+                        fail(fail_at(l, a, r, "a thread-local variable from a dylib, which this linker does not take"))
+                    }
+                    let target = target_addr(l, r) + l.r_addend[r]
+                    if t == objfile.R_TLVP_PAGE21 {
+                        rd.put32(buf, at, adrp(word(buf, at), page(target) - page(pc)))
+                    } else {
+                        let insn = word(buf, at)
+                        if insn.bit_and(0xffc00000) != 0xf9400000 {
+                            fail(fail_at(l, a, r, "a thread-local load that is not a 64-bit ldr ({rd.hex(insn)})"))
+                        }
+                        rd.put32(buf, at, 0x91000000.bit_or(target.bit_and(0xfff).shl(10)).bit_or(insn.bit_and(0x3ff)))
+                    }
+                } else if t == objfile.R_UNSIGNED and l.s_flags[l.a_sec[a]].bit_and(255) == 0x13 and field % 24 == 16 {
+                    // A descriptor's third word: its variable's offset in the
+                    // thread-local template, not an address.
+                    if k != state.T_ATOM {
+                        fail(fail_at(l, a, r, "a thread-local descriptor whose initial value is not in this image"))
+                    }
+                    rd.put64(buf, at, target_addr(l, r) + rd.u64(d, src + field) - l.tlv_template)
                 } else if t == objfile.R_UNSIGNED {
                     let c = if l.r_len[r] == 3 { rd.u64(d, src + field) } else { rd.s32(d, src + field) }
                     if l.r_satom[r] >= 0 {
@@ -189,7 +212,7 @@ pub fn contents(inout l: Ld, inout buf: bytes) -> Fixups ! str {
                     if k == state.T_IMPORT {
                         fx.addr.push(pc)
                         fx.bind.push(true)
-                        fx.target.push(l.g_import[l.r_tg[r]])
+                        fx.target.push(l.r_tg[r])
                         fx.addend.push(addend)
                     } else {
                         let v = target_addr(l, r) + addend
@@ -234,7 +257,7 @@ pub fn contents(inout l: Ld, inout buf: bytes) -> Fixups ! str {
             if l.got_g[i] >= 0 {
                 fx.addr.push(addr)
                 fx.bind.push(true)
-                fx.target.push(l.g_import[l.got_g[i]])
+                fx.target.push(l.got_g[i])
                 fx.addend.push(0)
             } else {
                 let v = l.a_addr[l.a_canon[l.got_atom[i]]]

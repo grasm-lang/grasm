@@ -1,0 +1,25 @@
+#!/bin/bash
+# A `cc` for the linker gates (scripts/linktest.sh, scripts/linkdiff.sh) to put
+# first on PATH while `grasm build --native` runs with GRASM_LINKER=cc: it
+# copies every object the build links into $LINKCC_DIR and writes the link
+# line to $LINKCC_DIR/args (`OBJ <copy>` per object, `ARG <arg>` for the
+# rest, in order), then runs the real cc on the original arguments. The build
+# itself is untouched; the gates get the very objects and flags it linked.
+if [ -n "${LINKCC_DIR:-}" ]; then
+    mkdir -p "$LINKCC_DIR"
+    : >"$LINKCC_DIR/args"
+    n=0
+    for a in "$@"; do
+        case "$a" in
+        *.o)
+            cp "$a" "$LINKCC_DIR/obj$n.o"
+            echo "OBJ obj$n.o" >>"$LINKCC_DIR/args"
+            n=$((n + 1))
+            ;;
+        *)
+            echo "ARG $a" >>"$LINKCC_DIR/args"
+            ;;
+        esac
+    done
+fi
+exec /usr/bin/cc "$@"

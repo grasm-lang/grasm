@@ -1214,9 +1214,10 @@ def run(cmd, timeout=20, env=None):
 
 
 def link_in_place(obj, out):
-    """Links `obj` into `out`, keeping `out`'s inode (`lib/inplace.py`)."""
+    """Links `obj` into `out`, keeping `out`'s inode (`lib/inplace.py`), with
+    `cc` or the linker `S3_LINKER` names (`lib/s3engine.py`)."""
     stage = out + ".stage"
-    p = subprocess.run(["cc", obj, RUNTIME, "-o", stage, "-Wl,-dead_strip"], capture_output=True, text=True)
+    p = subprocess.run(_lib("s3engine").link_command(obj, RUNTIME, stage), capture_output=True, text=True)
     if p.returncode != 0:
         return p
     data = open(stage, "rb").read()

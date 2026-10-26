@@ -31,7 +31,9 @@ that agreed with all of them.
 `S3=<binary>` uses that driver instead of building one, and `S3_EXTRA` adds
 arguments to each compilation, as the S3 gates take them (the controls in
 `scripts/s3controls.sh` point them at a broken one). `S3_RT=` names the
-runtime to link.
+runtime to link, and `S3_LINKER=` a linker to link with instead of `cc`
+(compiler/link, docs/self-hosting.md stage S4), as `scripts/lib/s3.sh` takes
+it.
 """
 
 import os
@@ -56,6 +58,15 @@ def _run(cmd, timeout, env=None, stdin=None, cwd=None):
         return p.returncode, p.stdout, p.stderr
     except subprocess.TimeoutExpired:
         return 124, b"", b"timeout"
+
+
+def link_command(obj, rt, exe):
+    """The command that links an object with the runtime: `cc`, or the linker
+    `S3_LINKER` names, with -dead_strip either way."""
+    linker = os.environ.get("S3_LINKER")
+    if linker:
+        return [linker, obj, rt, "-dead_strip", "-o", exe]
+    return ["cc", obj, rt, "-o", exe, "-Wl,-dead_strip"]
 
 
 def _clean(err):
@@ -115,8 +126,7 @@ class Engine:
     def _link(self):
         """Links the object into `self.exe`, keeping its inode (`lib/inplace.py`)."""
         stage = self.exe + ".stage"
-        p = subprocess.run(["cc", self.obj, self.rt, "-o", stage, "-Wl,-dead_strip"],
-                           capture_output=True, text=True)
+        p = subprocess.run(link_command(self.obj, self.rt, stage), capture_output=True, text=True)
         if p.returncode != 0 or not os.path.exists(stage):
             if os.path.exists(stage):
                 os.remove(stage)

@@ -210,6 +210,9 @@ type Ld = {
     /// `__eh_frame` records kept, in output order (eh indexes), and each
     /// one's offset in the section.
     eh_keep: [i64],
+    /// Where the thread-local template starts, and whether there are descriptors.
+    tlv_template: i64,
+    tlv_any: bool,
     eh_out_off: Map[i64, i64],
     /// GOT slots: what each holds -- a global symbol or an atom.
     got_g: [i64],
@@ -243,7 +246,7 @@ pub fn new_ld() -> Ld {
         g_got: [], g_stub: [], g_import: [], g_weakref: [],
         o_seg: [], o_name: [], o_flags: [], o_p2: [], o_addr: [], o_size: [], o_off: [], o_atoms: [], o_kind: [], o_order: [],
         text_tail: 0, seg_text_size: 0, seg_dc: (0, 0, 0, 0), seg_data: (0, 0, 0, 0), seg_linkedit_addr: 0, a_got: {},
-        eh_keep: [], eh_out_off: {},
+        eh_keep: [], eh_out_off: {}, tlv_template: 0, tlv_any: false,
         got_g: [], got_atom: [], got_name: [], stub_g: [], imp_g: [], errors: [], warnings: [],
     }
 }

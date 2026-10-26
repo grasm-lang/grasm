@@ -5,8 +5,9 @@
 // Inputs are relocatable objects (`.o`), static archives (`.a`), and dynamic
 // libraries as Mach-O files (`.dylib`) or text-based stubs (`.tbd`), in
 // command-line order; `-l<name>` finds `lib<name>.tbd`, `.dylib` or `.a` in
-// each `-L` directory and then the SDK's `usr/lib`. libSystem is linked
-// last, as `cc` links it, unless `-nostdlib`.
+// each `-L` directory, then LIBRARY_PATH's, /usr/local/lib and the SDK's
+// `usr/lib`, as `cc` would. libSystem is linked last, as `cc` links it,
+// unless `-nostdlib`.
 //
 //     -o <file>                the executable to write (default a.out)
 //     -e <symbol>              the entry point (default _main)
@@ -20,13 +21,70 @@
 //     -no_uuid                 no LC_UUID
 //     -map <file>              an ld-style map of every atom's address
 //     -nostdlib                do not link libSystem
+//     -tool_version <x.y.z>    an LD tool entry in LC_BUILD_VERSION, which
+//                              this linker otherwise leaves out; only for
+//                              comparing bytes with ld (scripts/linkdiff.sh)
 //
-// The output is a position-independent MH_EXECUTE laid out as ld-prime lays
-// out the same inputs (`layout.gr`), with its fixups chained
-// (DYLD_CHAINED_PTR_64_OFFSET), an export trie, function starts, a symbol
-// table, compact unwind information, and an ad-hoc linker signature written
-// by `codesig`. Nothing in it depends on time, paths or hash order: the same
-// inputs give the same bytes.
+// The output is a position-independent MH_EXECUTE laid out as ld-prime
+// (here ld-1115.7.3, the Command Line Tools') lays out the same inputs, with its fixups chained
+// (DYLD_CHAINED_PTR_64_OFFSET, arm64 without pointer authentication, as the
+// native build is), an export trie, function starts, a symbol table, compact
+// unwind information, and an ad-hoc linker signature written by `codesig`.
+// Nothing in it depends on time, paths or hash order: the same inputs give
+// the same bytes. With `-strip` and `-tool_version`, the corpus links to the
+// very bytes `cc` and `strip -no_uuid` give (`scripts/linkdiff.sh`).
+//
+// What ld-prime does that this copies, found by comparing its output -- its
+// source is not published; ld64's is, and is where the rest comes from:
+//
+//   * atoms in file order -- an archive's members by their index in the
+//     archive, whatever order they were loaded in -- and in input order in
+//     a file; an N_COLD_FUNC function after every other one in `__text`;
+//   * an atom keeps its offset modulo its section's alignment (ld64), but a
+//     literal is aligned to its size whatever its section says;
+//   * sections: `__text`, `__stubs`, the rest in the order the files first
+//     show them, `__unwind_info` and `__eh_frame` last; `__literal4/8/16`
+//     go into `__TEXT,__const`, `__DATA,__const` into `__DATA_CONST`; a
+//     thread-local template after the other data, before the zero fill;
+//   * `__TEXT` laid out forwards and moved against the segment's end,
+//     rounded down to its largest alignment, with at least 32 bytes after
+//     the load commands ld would write -- LC_UUID and a tool entry included,
+//     since it decides before `strip` takes the UUID out;
+//   * C strings and literals merged by content, first copy kept -- but only
+//     anonymous ones: a string with a symbol of its own (not an `l`/`L`
+//     label) is never merged;
+//   * a GOT load of something defined here becomes `adrp`+`add` with no
+//     slot; POINTER_TO_GOT always gets one, and ignores what LLVM left in its
+//     field; GOT slots and stubs sorted by name; imports numbered by where
+//     their first pointer is; optimization hints not applied (the code is
+//     identical without them);
+//   * chained fixups as ld64 lays them out, but the imports and the names
+//     after them start on 8 bytes;
+//   * `__unwind_info` as ld64 builds it, except: the sentinel entry is the
+//     end of the last function (ld64: one past it), page-specific encodings
+//     are numbered in address order, one index entry more is reserved than
+//     written, and the section is padded to 8 bytes;
+//   * the symbol table: locals by address, with `l`/`L` labels dropped and
+//     a `.llvm.<digits>` suffix taken off; private externs as N_PEXT locals;
+//     the strings " \0", then exports, imports and locals;
+//   * the signature's executable segment limit is `__text`'s size (codesig);
+//   * a thread-local descriptor's third word is its variable's offset in
+//     the template, and the descriptor's thunk is bound to __tlv_bootstrap.
+//
+// And what `strip -no_uuid` does after it, for `-strip`: a symbol table of
+// the `radr://5614542` marker, the header symbol, the exports it was told
+// to keep and the imports; the strings four NULs, those names, the marker's;
+// the export trie re-encoded by ld64's algorithm and zero-filled to the old
+// trie's size; the signature redone with the whole `__TEXT` as the limit.
+//
+// Where this linker's output differs from ld's, on purpose: no LC_UUID with
+// `-strip` (as shipped), and with symbols a SHA-256 content hash rather than
+// ld's MD5; no tool entry in LC_BUILD_VERSION; no debug map (N_OSO stabs) --
+// the objects it would point at are in a directory deleted after the build,
+// and an N_OSO records a path and a time; and local symbols at one address
+// may be listed in another order. Not taken, and refused by name: x86_64,
+// arm64e, dylib or bundle output, common symbols, initializers
+// (`__mod_init_func`), a thread-local variable from a dylib, frameworks.
 //
 // Exit status: 0 written; 1 the link failed (undefined or duplicate symbols,
 // an input this linker does not take); 2 bad usage.
@@ -84,10 +142,18 @@ fn sdk_version(sdk: str) -> i64 {
 }
 
 fn find_library(l: Ld, name: str, sdk: str) -> str {
+    // As cc searches: the -L directories, then LIBRARY_PATH's, then
+    // /usr/local/lib (which clang always passes), then the SDK's.
     var dirs: [str] = []
     for d in l.lib_dirs {
         dirs.push(d)
     }
+    for d in (env("LIBRARY_PATH") ?? "").split(":") {
+        if d != "" {
+            dirs.push(d)
+        }
+    }
+    dirs.push("/usr/local/lib")
     dirs.push(sdk + "/usr/lib")
     dirs.push(sdk + "/usr/local/lib")
     for d in dirs {

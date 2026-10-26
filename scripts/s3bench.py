@@ -29,7 +29,8 @@ load.
 
     scripts/s3bench.py [--rounds N] [--programs a,b,..] [--variant NAME=ARGS]...
 
-`S3=<binary>` times that driver; `S3_RT=` names the runtime.
+`S3=<binary>` times that driver; `S3_RT=` names the runtime; `S3_LINKER=`
+links with that linker instead of `cc` (`scripts/lib/s3engine.py`).
 """
 
 import argparse
@@ -46,6 +47,9 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 GRASM = os.environ.get("GRASM") or os.path.join(ROOT, "target", "release", "grasm")
 RUNTIME = os.environ.get("S3_RT") or os.path.join(ROOT, "target", "release", "libgrasm_rt_abi.a")
 PROGRAMS = ["fib", "sieve", "matmul", "wordfreq", "tree", "sort", "parmap", "parwords"]
+
+sys.path.insert(0, os.path.join(ROOT, "scripts", "lib"))
+from s3engine import link_command  # noqa: E402
 
 
 def load():
@@ -113,7 +117,7 @@ def main():
                 if p.returncode != 0:
                     print(f"{prog}: the Grasm backend ({name}) answered {p.returncode}: {p.stderr[:300]}")
                     return 1
-                p = subprocess.run(["cc", obj, RUNTIME, "-o", exe, "-Wl,-dead_strip"], capture_output=True, text=True)
+                p = subprocess.run(link_command(obj, RUNTIME, exe), capture_output=True, text=True)
                 if p.returncode != 0:
                     print(f"{prog}: the object ({name}) does not link: {p.stderr[:300]}")
                     return 1
