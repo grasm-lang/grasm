@@ -235,7 +235,7 @@ fn synthesize(inout l: Ld, files: [i64]) -> () ! str {
                     } else if k == state.T_ATOM and t == objfile.R_POINTER_TO_GOT {
                         let ta = l.a_canon[l.r_tatom[r]]
                         let name = if g >= 0 { l.g_name[g] } else { target_name(l, 0, ta, -1) }
-                        got.set(name, (-1, ta))
+                        got.set(local_key(name, ta), (-1, ta))
                     } else if k == state.T_NONE {
                         // Reported by `deadstrip.undefined`.
                         ()
@@ -260,7 +260,7 @@ fn synthesize(inout l: Ld, files: [i64]) -> () ! str {
                 } else if pa >= 0 {
                     let ta = l.a_canon[pa]
                     let name = if pg >= 0 { l.g_name[pg] } else { target_name(l, 0, ta, -1) }
-                    got.set(name, (-1, ta))
+                    got.set(local_key(name, ta), (-1, ta))
                 }
             }
         }
@@ -269,7 +269,7 @@ fn synthesize(inout l: Ld, files: [i64]) -> () ! str {
         l.g_stub[g] = l.stub_g.len()
         l.stub_g.push(g)
     }
-    for (name, ga) in got.entries() {
+    for (key, ga) in got.entries() {
         let (g, a) = ga
         if g >= 0 {
             l.g_got[g] = l.got_name.len()
@@ -278,12 +278,18 @@ fn synthesize(inout l: Ld, files: [i64]) -> () ! str {
         }
         l.got_g.push(g)
         l.got_atom.push(a)
-        l.got_name.push(name)
+        l.got_name.push(if g >= 0 { key } else { key.split("\u{0}")[0] })
     }
     for (name, g) in imp.entries() {
         // Numbered when the fixups are chained (`image.chained`).
         l.imp_g.push(g)
     }
+}
+
+/// A GOT slot's key for something defined here: its name, then its atom, so
+/// two locals of one name keep a slot each and still sort by name.
+fn local_key(name: str, a: i64) -> str {
+    name + "\u{0}" + "{a}".pad_start(12, "0")
 }
 
 /// Lays out one output section's atoms from offset 0: each atom's offset
