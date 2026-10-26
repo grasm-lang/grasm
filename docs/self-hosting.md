@@ -1052,7 +1052,9 @@ Over the 648 programs of the subset, the release allocator's objects hold
 11,202,505 instruction words to linear scan's 18,210,217 (38% fewer) and
 20,514 spill slots to 121,785 (83% fewer), with linear scan's objects
 byte-identical to those before it was written; every function passes the
-checker under both.
+checker under both. On the benchmarks, timed in the same rounds, its code's
+time over linear scan's has a geometric mean of 0.976 (§11; one session,
+under load).
 
 ## 7. Bootstrap and trust
 
@@ -1162,8 +1164,19 @@ Measured, not estimated; each line is a gate's result on master.
   648, and 108,370 instructions that load a literal written once map to
   that literal's file and line. The release allocator (§6.5), backtracking
   by spill weight, is the driver's default, with linear scan kept for fast
-  builds. What §6 still asks of S3 and `compiler/` does not have:
-  benchmarks against the Cranelift build.
+  builds. Benchmarks against the Cranelift build (`scripts/s3bench.py`:
+  `scripts/bench.sh`'s eight programs, 21 rounds interleaving the three
+  binaries, medians), one session on 2026-10-26 at 04:26: the Grasm
+  backend's time over Cranelift's, linear scan / release allocator --
+  fib 1.497 / 1.460, sieve 6.875 / 6.771, matmul 12.869 / 12.847,
+  wordfreq 3.168 / 3.161, tree 1.957 / 1.954, sort 1.292 / 1.291,
+  parmap 2.060 / 2.058, parwords 6.271 / 5.402; geometric mean 3.289 /
+  3.209; the release allocator over linear scan 0.976 (parwords 0.861,
+  the rest 0.975-0.999). The load average was 2.70 when it started and
+  rose to 2.81-3.37 from fib to sort and 5.0-6.4 over the two parallel
+  rows, which swing by about 10% under load: these figures are as taken,
+  not as `bench.sh` would publish them, and want repeating on a quiet
+  machine. Why the gap is what it is per program was not measured.
 - **Not started:** S2 (the frontend in Grasm), S4 (the linker), S5 (the
   runtime in Grasm), S6 (self-compilation), S7-S9.
 
