@@ -1005,6 +1005,69 @@ fn run() -> ExitCode {
                 ExitCode::FAILURE
             }
         }
+        // A manifest as the toolchain's TOML reader reads it, for holding
+        // `packages/toml` to it (docs/self-hosting.md, S2 part two; S8): every
+        // key as a dotted path, in byte order, a tab, then its kind and value
+        // -- `str "..."` (quoted as TIR quotes), `int N`, `bool true`,
+        // `array [...]`. The entries of an array of tables follow, the arrays
+        // by name, each entry numbered (`bin[1].name`) and in the file's
+        // order, the keys sorted within it, so a key read into the wrong
+        // entry shows. A file the reader refuses prints `refused` and why.
+        Some("toml") => {
+            let Some(path) = args.get(1) else {
+                eprintln!("usage: grasm toml <file.toml>");
+                return ExitCode::FAILURE;
+            };
+            let text = match std::fs::read_to_string(path) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("error: cannot read `{path}`: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            fn value(v: &grasm_pkg::toml::Value) -> String {
+                match v {
+                    grasm_pkg::toml::Value::Str(s) => format!("str {}", grasm_tir::quote(s)),
+                    grasm_pkg::toml::Value::Int(n) => format!("int {n}"),
+                    grasm_pkg::toml::Value::Bool(b) => format!("bool {b}"),
+                    grasm_pkg::toml::Value::Arr(items) => {
+                        let parts: Vec<String> = items.iter().map(value).collect();
+                        format!("array [{}]", parts.join(", "))
+                    }
+                }
+            }
+            match grasm_pkg::toml::parse(&text) {
+                Ok(doc) => {
+                    let mut lines: Vec<String> = Vec::new();
+                    let path_of = |table: &str, key: &str| {
+                        if table.is_empty() {
+                            key.to_string()
+                        } else {
+                            format!("{table}.{key}")
+                        }
+                    };
+                    for (table, kv) in &doc.tables {
+                        for (k, v) in kv {
+                            lines.push(format!("{}\t{}", path_of(table, k), value(v)));
+                        }
+                    }
+                    lines.sort();
+                    // A BTreeMap: the arrays by name, each entry's keys sorted.
+                    for (name, entries) in &doc.arrays {
+                        for (i, kv) in entries.iter().enumerate() {
+                            for (k, v) in kv {
+                                lines.push(format!("{name}[{i}].{k}\t{}", value(v)));
+                            }
+                        }
+                    }
+                    for l in lines {
+                        println!("{l}");
+                    }
+                }
+                Err(e) => println!("refused {e}"),
+            }
+            ExitCode::SUCCESS
+        }
         Some("version") | Some("--version") => {
             // From the manifest, so a release cannot ship a version string
             // that disagrees with the version it was built at — this one said
@@ -1069,6 +1132,7 @@ fn run() -> ExitCode {
             );
             eprintln!("  tokens <file.gr>             dump lexer output (debug)");
             eprintln!("  ast <file.gr>                dump parser output: AST and diagnostics (debug)");
+            eprintln!("  toml <file.toml>             dump a manifest as the TOML reader reads it (debug)");
             eprintln!("  version                      print version");
             if asked {
                 ExitCode::SUCCESS
