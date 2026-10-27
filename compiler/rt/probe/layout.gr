@@ -33,6 +33,10 @@ extern fn grasm_fn_new(code: i64, env: addr, np: addr, nl: i64) -> addr
 extern fn grasm_region_push()
 extern fn grasm_region_pop()
 extern fn grasm_val_dec(v: addr)
+extern fn grasm_builder_push_str(b: addr, s: addr) -> addr
+extern fn grasm_bytebuf_push_byte(b: addr, x: i64) -> addr
+extern fn grasm_variant_new1(tp: addr, tl: i64, vp: addr, vl: i64, a: addr) -> addr
+extern fn grasm_variant_new2(tp: addr, tl: i64, vp: addr, vl: i64, a: addr, b: addr) -> addr
 
 fn say(name: str, v: i64) {
     print("{name} {v}")
@@ -217,10 +221,32 @@ fn main() / {io, unsafe, mem} {
         // The other payloads' tags.
         let sl = grasm_list_push_scalar(grasm_list_new_scalar(0), 5, 0)
         say("TAG_LIST_SCALAR", sl.offset(8).load_u8().as_i64())
+        // Its `Vec`: one word, 5.
+        let sv = sl.offset(24)
+        say("SCALAR_VEC", if sv.offset(len_at).load_i64() == 1 and mem_addr(sv.offset(ptr_at).load_i64()).load_i64() == 5 { 24 } else { -1 })
         grasm_val_dec(sl)
-        let bl = grasm_list_push(grasm_list_new(), grasm_box_f64(2.5))
+        let e0 = grasm_box_f64(2.5)
+        let bl = grasm_list_push(grasm_list_new(), e0)
         say("TAG_LIST", bl.offset(8).load_u8().as_i64())
-        grasm_val_dec(bl)
+        // One element: inline, its length byte and its pointer.
+        let ldisc = bl.offset(16).load_u8().as_i64()
+        say("LIST_INLINE", ldisc)
+        say("LIST_LEN", find_byte(bl, 17, 7, 1))
+        let vals_at = find_word(bl, 16, 6, e0.as_i64())
+        say("LIST_VALS", if vals_at >= 0 { 16 + vals_at } else { -1 })
+        // Five: a `Vec` of them.
+        var hl = bl
+        var k5 = 0
+        while k5 < 4 {
+            hl = grasm_list_push(hl, grasm_box_f64(3.5))
+            k5 += 1
+        }
+        let hdisc = hl.offset(16).load_u8().as_i64()
+        say("LIST_HEAP", hdisc)
+        say("LIST_DISC", if hdisc != ldisc { 16 } else { -1 })
+        let hv = hl.offset(24)
+        say("LIST_VEC", if hv.offset(len_at).load_i64() == 5 and mem_addr(hv.offset(ptr_at).load_i64()).load_i64() == e0.as_i64() { 24 } else { -1 })
+        grasm_val_dec(hl)
         let tp = grasm_tuple2(grasm_box_f64(1.0), grasm_box_f64(2.0))
         say("TAG_TUPLE", tp.offset(8).load_u8().as_i64())
         grasm_val_dec(tp)
@@ -229,19 +255,76 @@ fn main() / {io, unsafe, mem} {
         grasm_val_dec(m)
         let by = grasm_bytes_filled(4, 7)
         say("TAG_BYTES", by.offset(8).load_u8().as_i64())
+        // The window over the `Arc`'s buffer, and the `Arc`: one strong
+        // count, one weak, and the `Vec` of four bytes of 7.
+        var owner_at = -1
+        var o = 16
+        while o < 64 {
+            let arc = mem_addr(by.offset(o).load_i64())
+            if arc.as_i64() > 65536 and arc.as_i64() % 8 == 0 and arc.load_i64() == 1 and arc.offset(8).load_i64() == 1 and arc.offset(16 + len_at).load_i64() == 4 and mem_addr(arc.offset(16 + ptr_at).load_i64()).load_u8().as_i64() == 7 {
+                owner_at = o
+            }
+            o += 8
+        }
+        say("BYTES_OWNER", owner_at)
+        let arc0 = mem_addr(by.offset(owner_at).load_i64())
+        say("ARC_STRONG", if arc0.load_i64() == 1 { 0 } else { -1 })
+        say("ARC_WEAK", if arc0.offset(8).load_i64() == 1 { 8 } else { -1 })
+        say("ARC_DATA", if mem_addr(arc0.offset(16 + ptr_at).load_i64()).load_u8().as_i64() == 7 { 16 } else { -1 })
         grasm_val_dec(by)
         let sb = grasm_strbuf_new()
         say("TAG_STRBUF", sb.offset(8).load_u8().as_i64())
-        grasm_val_dec(sb)
+        // Its `String` holding "xyz".
+        let xyz = letters(120, 3)
+        xyz.offset(1).store_u8(121)
+        xyz.offset(2).store_u8(122)
+        let sb3 = grasm_builder_push_str(sb, grasm_str_lit(xyz, 3))
+        let st = sb3.offset(16)
+        say("STRBUF_STRING", if st.offset(len_at).load_i64() == 3 and mem_addr(st.offset(ptr_at).load_i64()).offset(2).load_u8().as_i64() == 122 { 16 } else { -1 })
+        grasm_val_dec(sb3)
         let bb = grasm_bytebuf_new()
         say("TAG_BYTEBUF", bb.offset(8).load_u8().as_i64())
-        grasm_val_dec(bb)
+        let bb1 = grasm_bytebuf_push_byte(bb, 77)
+        let bv = bb1.offset(16)
+        say("BYTEBUF_VEC", if bv.offset(len_at).load_i64() == 1 and mem_addr(bv.offset(ptr_at).load_i64()).load_u8().as_i64() == 77 { 16 } else { -1 })
+        grasm_val_dec(bb1)
         let names = letters(65, 2)
         let v = grasm_variant_new(names, 1, names.offset(1), 1)
         say("TAG_VARIANT", v.offset(8).load_u8().as_i64())
         grasm_val_dec(v)
+        // One field: the field itself in the word, a count of one.
+        let fa = grasm_box_f64(4.5)
+        let v1 = grasm_variant_new1(names, 1, names.offset(1), 1, fa)
+        let fields_at = find_word(v1, 16, 6, fa.as_i64())
+        let vf = if fields_at >= 0 { 16 + fields_at } else { -1 }
+        say("VARIANT_FIELDS", vf)
+        say("VARIANT_NFIELDS", if vf > 0 and v1.offset(vf + 8).load_i64() == 1 { vf + 8 } else { -1 })
+        grasm_val_dec(v1)
+        // Two: a slice of them, and a count of two.
+        let fb = grasm_box_f64(5.5)
+        let fc = grasm_box_f64(6.5)
+        let v2 = grasm_variant_new2(names, 1, names.offset(1), 1, fb, fc)
+        let slice = mem_addr(v2.offset(vf).load_i64())
+        if not (slice.load_i64() == fb.as_i64() and slice.offset(8).load_i64() == fc.as_i64() and v2.offset(vf + 8).load_i64() == 2) {
+            say("VARIANT_FIELDS", -1)
+        }
+        grasm_val_dec(v2)
         let fv = grasm_fn_new(0, mem_addr(0), names, 0)
         say("TAG_FN", fv.offset(8).load_u8().as_i64())
+        // No name: `None`, in the capacity word of the `Option<String>`.
+        let none_at = 32 + cap_at
+        let none = fv.offset(none_at).load_i64()
         grasm_val_dec(fv)
+        // A named one with an environment: its code, its environment box,
+        // its name's `String`.
+        let envbox = grasm_box_f64(7.5)
+        let fn2 = grasm_fn_new(4242, envbox, names, 2)
+        let env_at = find_word(fn2, 16, 6, envbox.as_i64())
+        say("FN_ENV", if env_at >= 0 { 16 + env_at } else { -1 })
+        let nm = fn2.offset(32)
+        let named = nm.offset(len_at).load_i64() == 2 and mem_addr(nm.offset(ptr_at).load_i64()).offset(1).load_u8().as_i64() == 65
+        say("FN_NAME", if named { 32 } else { -1 })
+        say("FN_NAME_NONE", if named and none != nm.offset(cap_at).load_i64() and none < 0 { none } else { 0 })
+        grasm_val_dec(fn2)
     }
 }

@@ -1,0 +1,176 @@
+// The release walk against the Rust runtime's (docs/self-hosting.md §6.9):
+// random values of every kind the walk takes apart -- strings inline, on the
+// heap and with a character index, lists inline and on the heap, tuples,
+// scalar lists, both builders, variants, function values and closures,
+// bytes and windows sharing their buffer -- nested in each other and around
+// kinds the Rust runtime still takes apart (maps, structs),
+// some held across rounds so that what is dropped is shared, and dropped.
+// After each round it prints a checksum of what it built and how many boxes
+// are live, so a box the walk leaks or frees twice shows as a difference
+// between the two builds, which `scripts/fuzz_rtrelease.sh` compares; the
+// buffers are the gate's to watch, through `leaks` and `MallocScribble`.
+//
+//     releasefuzz <seed> <rounds>
+extern fn grasm_live_allocations() -> i64
+
+type Pair = { name: str, items: [str] }
+
+fn double(x: i64) -> i64 {
+    2 * x
+}
+
+fn next(inout s: i64) -> i64 {
+    s = s * 6364136223846793005 + 1442695040888963407
+    s.ushr(17)
+}
+
+fn pick(inout s: i64, n: i64) -> i64 {
+    next(s) % n
+}
+
+/// A string of one of the shapes a box holds: short and inline, long and on
+/// the heap, or long, not ASCII, with its character index built.
+fn text(inout s: i64) -> str {
+    let k = pick(s, 4)
+    var b = str_builder()
+    if k == 0 {
+        let n = pick(s, 12)
+        for i in 0..n {
+            b.push_str("abcdefghij".substr(pick(s, 10), 1))
+        }
+        return b.to_str()
+    }
+    if k == 1 {
+        let n = 39 + pick(s, 60)
+        for i in 0..n {
+            b.push_str("xyz".substr(pick(s, 3), 1))
+        }
+        return b.to_str()
+    }
+    let n = 200 + pick(s, 40)
+    for i in 0..n {
+        b.push_str(if pick(s, 2) == 0 { "é" } else { "a" })
+    }
+    let t = b.to_str()
+    if k == 2 and t.len() < 0 {
+        return ""
+    }
+    t
+}
+
+fn texts(inout s: i64, n: i64) -> [str] {
+    var out: [str] = []
+    for i in 0..n {
+        out.push(text(s))
+    }
+    out
+}
+
+fn numbers(inout s: i64, n: i64) -> [i64] {
+    var out: [i64] = []
+    for i in 0..n {
+        out.push(pick(s, 1000))
+    }
+    out
+}
+
+/// One round's values, made and dropped; answers a checksum of what they
+/// held, so both builds are seen to build the same values.
+fn round(inout s: i64, inout keep: [[str]]) -> i64 {
+    var sum = 0
+    // Lists of strings, inline (four or fewer) and on the heap, some kept.
+    let a = texts(s, pick(s, 9))
+    sum += a.len()
+    if pick(s, 3) == 0 {
+        keep.push(a)
+    }
+    // Lists of lists, sharing what is kept.
+    var nest: [[str]] = []
+    for i in 0..pick(s, 6) {
+        if keep.len() > 0 and pick(s, 2) == 0 {
+            nest.push(keep[pick(s, keep.len())])
+        } else {
+            nest.push(texts(s, pick(s, 7)))
+        }
+    }
+    sum += nest.len()
+    // Tuples and scalar lists.
+    let tup = (text(s), numbers(s, pick(s, 20)))
+    sum += tup.1.len()
+    var flags: [bool] = []
+    for i in 0..pick(s, 30) {
+        flags.push(pick(s, 2) == 0)
+    }
+    sum += flags.len()
+    let grid = [numbers(s, pick(s, 5)), numbers(s, pick(s, 50))]
+    sum += grid.len()
+    // Builders.
+    var sb = str_builder()
+    for i in 0..pick(s, 40) {
+        sb.push_str(text(s))
+    }
+    sum += sb.to_str().len() % 7
+    var bb = byte_builder()
+    for i in 0..pick(s, 100) {
+        bb.push_byte(pick(s, 256))
+    }
+    sum += bb.len()
+    // Kinds the Rust runtime takes apart, inside lists the walk takes apart.
+    var maps: [Map[str, [str]]] = []
+    for i in 0..pick(s, 3) {
+        var m: Map[str, [str]] = {}
+        for j in 0..pick(s, 5) {
+            m.set(text(s), texts(s, pick(s, 4)))
+        }
+        maps.push(m)
+    }
+    sum += maps.len()
+    var opts: [Option[[str]]] = []
+    for i in 0..pick(s, 4) {
+        opts.push(if pick(s, 2) == 0 { Some(texts(s, 3)) } else { None })
+    }
+    sum += opts.len()
+    var pairs: [Pair] = []
+    for i in 0..pick(s, 4) {
+        pairs.push(Pair{ name: text(s), items: texts(s, pick(s, 6)) })
+    }
+    sum += pairs.len()
+    let captured = texts(s, 2)
+    let f = |x| x + captured.len()
+    sum += f(1)
+    let raw = bytes_filled(pick(s, 50) + 4, 7)
+    sum += raw.len()
+    // Windows share the buffer's `Arc`, kept and dropped in either order.
+    var windows: [bytes] = []
+    for i in 0..pick(s, 4) {
+        windows.push(raw.slice(1, 3))
+    }
+    sum += windows.len()
+    // Named function values, and closures held in a list.
+    var fns: [fn(i64) -> i64] = []
+    for i in 0..pick(s, 3) {
+        fns.push(double)
+        fns.push(|x| x + captured.len())
+    }
+    for g in fns {
+        sum += g(2)
+    }
+    // Drop some of what is kept.
+    while keep.len() > 8 {
+        keep.remove(pick(s, keep.len()))
+    }
+    sum
+}
+
+fn main() / {io, unsafe} {
+    let a = args()
+    var s = (a[0].parse_int() ?? 1) * 7919 + 13
+    let rounds = a[1].parse_int() ?? 10
+    let base = unsafe { grasm_live_allocations() }
+    var keep: [[str]] = []
+    for r in 0..rounds {
+        let sum = round(s, keep)
+        let live = unsafe { grasm_live_allocations() } - base
+        print("{r} {sum} {live}")
+    }
+}

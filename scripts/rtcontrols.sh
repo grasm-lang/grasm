@@ -19,6 +19,11 @@
 #   fallback-gone   a moved function no longer exported, so programs take
 #                   Rust's again
 #   fallback-call   a moved function calling Rust's own instead of working
+#   release-children the release walk not releasing a list's elements
+#   release-leak    the release walk not freeing a heap string's buffer, which
+#                   only `leaks` sees
+#   release-arc     the release walk dropping a `bytes` value's last strong
+#                   count without freeing the `Arc` itself
 #
 # `RT_CONTROLS=<regex>` runs only the controls it matches. `RT_POISON=` as
 # for `scripts/rtswap.sh`.
@@ -136,6 +141,28 @@ if control layout-moved; then
         { echo "error: layout-moved does not build"; exit 1; }
     expect layout-moved 'STR_LEN is 18 in layout.gr, 17 in the Rust runtime' env RT_POISON= RT_LAYOUT="$WORK/layout-moved/src/layout.gr" bash scripts/rtlayout.sh
     expect layout-moved 'the two runtimes differ' env RTFMT_CHUNKS=1 RTFMT_COUNT=2000 RTFMT_PY=100 bash scripts/fuzz_rtfmt.sh
+fi
+
+if control release-children; then
+    plant release-children src/release.gr '        if to_zero(c) {
+            push(stack, cap, pending, c)
+        }' '        if to_zero(c) {
+        }' || { echo "error: release-children does not build"; exit 1; }
+    expect release-children 'the two runtimes differ' env RTREL_SEEDS=2 RTREL_ROUNDS=20 RTREL_LEAKS=0 bash scripts/fuzz_rtrelease.sh
+fi
+
+if control release-leak; then
+    plant release-leak src/release.gr '            if v.offset(layout.STR_DISC).load_u8().as_i64() == layout.STR_HEAP {
+                free_vec(v.offset(layout.STR_STRING))
+            }' '' || { echo "error: release-leak does not build"; exit 1; }
+    expect release-leak 'FAIL: f.swap seed 1: Process [0-9]+: [1-9][0-9]* leaks' env RTREL_SEEDS=1 RTREL_ROUNDS=20 RTREL_LEAKS=1 bash scripts/fuzz_rtrelease.sh
+fi
+
+if control release-arc; then
+    plant release-arc src/release.gr '                if arc.offset(layout.ARC_WEAK).atomic_add_i64(-1, Release) == 1 {
+                    sys.dealloc(arc)
+                }' '' || { echo "error: release-arc does not build"; exit 1; }
+    expect release-arc 'FAIL: f.swap seed 1: Process [0-9]+: [1-9][0-9]* leaks' env RTREL_SEEDS=1 RTREL_ROUNDS=20 RTREL_LEAKS=1 bash scripts/fuzz_rtrelease.sh
 fi
 
 if control fallback-gone; then

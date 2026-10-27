@@ -133,6 +133,7 @@ run_gate rtlayout      scripts/rtlayout.sh
 run_gate rtswap        scripts/rtswap.sh
 run_gate fuzz_rtfmt    scripts/fuzz_rtfmt.sh
 run_gate fuzz_rtmath   scripts/fuzz_rtmath.sh
+run_gate fuzz_rtrelease scripts/fuzz_rtrelease.sh
 run_gate rtcontrols    scripts/rtcontrols.sh
 run_gate rtdialect     scripts/rtdialect.sh
 run_gate rtdialectcontrols scripts/rtdialectcontrols.sh

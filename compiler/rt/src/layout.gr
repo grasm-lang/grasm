@@ -90,3 +90,43 @@ pub let CHARINDEX_VEC = 0
 pub let CHARINDEX_COUNT = 24
 /// What an empty `Vec<u32>` holds for a pointer.
 pub let U32_DANGLING = 4
+
+// ----- lists and tuples: `ListData`, `repr(u8)` at 16 -- inline, a length
+// byte and four box pointers; or a `Vec` of them (the Rust runtime's
+// `layout` module states the inline ones)
+
+pub let LIST_DISC = 16
+pub let LIST_INLINE = 0
+pub let LIST_HEAP = 1
+pub let LIST_LEN = 17
+pub let LIST_VALS = 24
+pub let LIST_VEC = 24
+
+// ----- the payloads whose buffer is all they own
+
+/// A scalar list's `ScalarData` (`repr(u8)` at 16): its `Vec` of words or bytes.
+pub let SCALAR_VEC = 24
+/// A `StrBuilder`'s `String`, its first field.
+pub let STRBUF_STRING = 16
+/// A `ByteBuilder`'s `Vec<u8>`.
+pub let BYTEBUF_VEC = 16
+
+// ----- variants, function values, bytes
+
+/// A variant's `VFields` after its two names: a word and a count. No field,
+/// a null word; one, the field itself in the word; two or more, a boxed
+/// slice of them, the variant's own.
+pub let VARIANT_FIELDS = 48
+pub let VARIANT_NFIELDS = 56
+/// A function value's environment box, and its name, an `Option<String>`
+/// whose capacity word holds FN_NAME_NONE for `None`.
+pub let FN_ENV = 24
+pub let FN_NAME = 32
+pub let FN_NAME_NONE = -1
+/// `RtBytes` (`repr(C)`): the window's address and length, then the
+/// `Arc<Vec<u8>>` that owns the buffer -- its strong and weak counts and
+/// the `Vec`, as `ArcInner` (`repr(C)`) lays them out.
+pub let BYTES_OWNER = 32
+pub let ARC_STRONG = 0
+pub let ARC_WEAK = 8
+pub let ARC_DATA = 16

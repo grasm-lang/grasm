@@ -1,0 +1,165 @@
+// The release walk, part one (docs/self-hosting.md §6.7, "state"; §6.9):
+// what happens when a box's count reaches zero.
+//
+// Everything the box was the last owner of goes too, and the walk is a loop
+// over a list of pending boxes, never recursion: a list a hundred thousand
+// deep is an ordinary thing for a parser to build ([E-RECURSION-DEPTH]).
+// For the payloads whose layout `layout.gr` holds -- strings, lists, tuples,
+// scalar lists, the two builders, variants, function values and bytes --
+// the walk is here: each child is released, and those that reach zero are
+// taken apart in turn; then the payload's own buffers are freed, as the Rust
+// runtime's `drop` frees them (its global allocator is `malloc` and `free`),
+// and the payload is left a `Unit`, which owns nothing. Every other payload
+// -- maps, structs, environments, handlers, lists of value structs -- is
+// still taken apart by the Rust runtime, children and all.
+//
+// Either way the box itself goes back with a count of one to the Rust
+// runtime's `grasm_val_dec`, which takes the count to zero, finds a `Unit`
+// (or a payload it walks itself), and returns the box to its pool and its
+// live count: the allocator is still the Rust runtime's state, and moves
+// with the live count and regions, next.
+import layout
+import sys
+
+extern fn grasm_val_dec(v: addr)
+
+/// Drops one reference to `c`, answering whether it was the last: as the
+/// Rust runtime's `release_to_zero` counts -- nothing for a null pointer, an
+/// interned or literal value, or one an open region owns.
+fn to_zero(c: addr) -> bool {
+    unsafe {
+        if c.as_i64() == 0 {
+            return false
+        }
+        let rc = c.atomic_load_i64(Relaxed)
+        if rc == layout.IMMORTAL or rc == layout.ARENA {
+            return false
+        }
+        c.atomic_add_i64(-1, Release) - 1 <= 0
+    }
+}
+
+/// Adds `c` to the pending boxes, growing their array as a `Vec` would.
+fn push(inout stack: addr, inout cap: i64, inout n: i64, c: addr) {
+    if n == cap {
+        let want = if cap == 0 { 16 } else { cap * 2 }
+        if cap == 0 {
+            stack = sys.alloc(8 * want)
+        } else {
+            stack = sys.grow(stack, 8 * want)
+        }
+        cap = want
+    }
+    unsafe {
+        stack.offset(8 * n).store_addr(c)
+    }
+    n += 1
+}
+
+/// Frees a `Vec`'s or a `String`'s buffer, which an empty one never had.
+fn free_vec(v: addr) {
+    unsafe {
+        if v.offset(layout.VEC_CAP).load_i64() > 0 {
+            sys.dealloc(v.offset(layout.VEC_PTR).load_addr())
+        }
+    }
+}
+
+/// Releases each of `n` box pointers at `at`, keeping those that reached zero.
+fn children(at: addr, n: i64, inout stack: addr, inout cap: i64, inout pending: i64) {
+    var k = 0
+    while k < n {
+        let c = unsafe { at.offset(8 * k).load_addr() }
+        if to_zero(c) {
+            push(stack, cap, pending, c)
+        }
+        k += 1
+    }
+}
+
+/// Takes box `v`'s payload apart, if it is one this walk knows: its children
+/// to the pending boxes, its buffers freed, and the payload left a `Unit`.
+fn take_apart(v: addr, inout stack: addr, inout cap: i64, inout pending: i64) {
+    unsafe {
+        let tag = v.offset(layout.TAG).load_u8().as_i64()
+        if tag == layout.TAG_LIST or tag == layout.TAG_TUPLE {
+            if v.offset(layout.LIST_DISC).load_u8().as_i64() == layout.LIST_INLINE {
+                let n = v.offset(layout.LIST_LEN).load_u8().as_i64()
+                children(v.offset(layout.LIST_VALS), n, stack, cap, pending)
+            } else {
+                let vec = v.offset(layout.LIST_VEC)
+                children(vec.offset(layout.VEC_PTR).load_addr(), vec.offset(layout.VEC_LEN).load_i64(), stack, cap, pending)
+                free_vec(vec)
+            }
+        } else if tag == layout.TAG_LIST_SCALAR {
+            free_vec(v.offset(layout.SCALAR_VEC))
+        } else if tag == layout.TAG_STR {
+            if v.offset(layout.STR_DISC).load_u8().as_i64() == layout.STR_HEAP {
+                free_vec(v.offset(layout.STR_STRING))
+            }
+            let ix = mem_addr(v.offset(layout.STR_INDEX).atomic_load_i64(Acquire))
+            if ix.as_i64() != 0 {
+                free_vec(ix.offset(layout.CHARINDEX_VEC))
+                sys.dealloc(ix)
+            }
+        } else if tag == layout.TAG_STRBUF {
+            free_vec(v.offset(layout.STRBUF_STRING))
+        } else if tag == layout.TAG_BYTEBUF {
+            free_vec(v.offset(layout.BYTEBUF_VEC))
+        } else if tag == layout.TAG_VARIANT {
+            // No field, the field itself in the word, or a slice of them.
+            let n = v.offset(layout.VARIANT_NFIELDS).load_i64()
+            if n == 1 {
+                children(v.offset(layout.VARIANT_FIELDS), 1, stack, cap, pending)
+            } else if n >= 2 {
+                let at = v.offset(layout.VARIANT_FIELDS).load_addr()
+                children(at, n, stack, cap, pending)
+                sys.dealloc(at)
+            }
+        } else if tag == layout.TAG_FN {
+            children(v.offset(layout.FN_ENV), 1, stack, cap, pending)
+            let name = v.offset(layout.FN_NAME)
+            if name.offset(layout.VEC_CAP).load_i64() != layout.FN_NAME_NONE {
+                free_vec(name)
+            }
+        } else if tag == layout.TAG_BYTES {
+            // The `Arc`'s drop: the last strong count frees the buffer, and
+            // the last weak count -- the one the strong ones hold together --
+            // the `Arc` itself.
+            let arc = v.offset(layout.BYTES_OWNER).load_addr()
+            if arc.offset(layout.ARC_STRONG).atomic_add_i64(-1, Release) == 1 {
+                free_vec(arc.offset(layout.ARC_DATA))
+                if arc.offset(layout.ARC_WEAK).atomic_add_i64(-1, Release) == 1 {
+                    sys.dealloc(arc)
+                }
+            }
+        } else {
+            return
+        }
+        v.offset(layout.TAG).store_u8(layout.TAG_UNIT.as_u8())
+    }
+}
+
+/// Releases box `v`, whose count has just reached zero, and everything it
+/// was the last owner of.
+pub fn walk(v: addr) {
+    var stack = unsafe { mem_addr(0) }
+    var cap = 0
+    var pending = 0
+    var cur = v
+    while true {
+        take_apart(cur, stack, cap, pending)
+        unsafe {
+            cur.atomic_store_i64(1, Relaxed)
+            grasm_val_dec(cur)
+        }
+        if pending == 0 {
+            break
+        }
+        pending -= 1
+        cur = unsafe { stack.offset(8 * pending).load_addr() }
+    }
+    if cap > 0 {
+        sys.dealloc(stack)
+    }
+}

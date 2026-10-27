@@ -43,6 +43,7 @@
 //     numstr   numbers as string values and as interpolated pieces
 //     strread  strings read: length in bytes, emptiness, equality, order
 //     val      reference counting
+//     release  the release walk, for the payloads whose layout has moved
 //
 // and three that serve them: `layout`, `text` and `sys` (the C library).
 import math
@@ -54,4 +55,5 @@ import out
 import numstr
 import strread
 import val
+import release
 import sys

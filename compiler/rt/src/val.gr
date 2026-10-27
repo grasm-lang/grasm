@@ -9,16 +9,14 @@
 // panic the Rust runtime gives there; no live box holds that count, so the
 // check costs nothing else.
 //
-// What happens when a count reaches zero is not done here yet: the box goes
-// back with a count of one to the Rust runtime's `grasm_val_dec`, which
-// takes apart whatever the payload holds, every kind of it, and returns the
-// box to its pool and its live count -- the state its own allocations share
-// (docs/self-hosting.md §6.7). That walk moves when the last payload's
-// layout has.
+// What happens when a count reaches zero is `release.gr`'s: the walk over
+// what the box was the last owner of, here for the payloads whose layout
+// has moved and the Rust runtime's for the rest, and the box handed back to
+// the Rust runtime's pool and live count, the state its own allocations
+// share (docs/self-hosting.md §6.7, §6.9).
 import layout
 import panic
-
-extern fn grasm_val_dec(v: addr)
+import release
 
 export fn grt_val_inc(v: addr) {
     unsafe {
@@ -51,9 +49,7 @@ export fn grt_val_dec(v: addr) {
         if v.atomic_add_i64(-1, Release) - 1 > 0 {
             return
         }
-        // The last reference: nothing else can reach the box, so its count
-        // is ours to set, and the Rust runtime releases it from one.
-        v.atomic_store_i64(1, Relaxed)
-        grasm_val_dec(v)
+        // The last reference: nothing else can reach the box.
+        release.walk(v)
     }
 }

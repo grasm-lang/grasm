@@ -76,7 +76,7 @@ rc val_inc
 rc val_dec
 
 state box_unit     the box allocator: its pool, its live count, the open region
-state val_dec      a box whose count reached zero, released: every payload's walk, the pool, the live count
+state val_dec      a box handed back at count one: the pool, the live count, and the walk of each payload release.gr does not take apart yet
 state out_text     the output buffer every writer shares, flushed by newlines, panics and exits
 state panic_msg    the way out of a panic: flush stdout, write stderr, exit 101
 backend panic_div_zero   `/` checks its divisor

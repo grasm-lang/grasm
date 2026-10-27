@@ -1619,10 +1619,11 @@ file and now takes 30 ms. The rest of the compiler will want the same.
 
 §5.6's design, built on 2026-10-27, and steps one to three of the brief:
 the dialect in both frontends, its lowering by the Grasm backend, and the
-lint that guards it. The runtime's state has not moved yet: the box
-allocator, the release walk, the output buffer, the panic path and the map
-seed are still the Rust runtime's, and compiler/rt uses no part of the
-dialect so far.
+lint that guards it; and the first part of step four, the release walk for
+the payloads whose layout is held. The rest of the runtime's state has not
+moved: the box allocator, its pool and live count, regions, the output
+buffer, the panic path and the map seed are still the Rust runtime's, and
+compiler/rt uses no part of the dialect yet.
 
 **The dialect, in both frontends.** A package whose `grasm.toml` says
 `runtime = true` may write `process_local NAME: T`, `mem_process(NAME)`,
@@ -1655,7 +1656,8 @@ called `ctx_switch`. Nothing in the repository was, and
 probes are ordinary programs the Cranelift build links with the Rust
 runtime, so they became a package of their own
 (`compiler/rt/probe/grasm.toml`) rather than part of a package the Cranelift
-build now refuses. The Grasm runtime's TIR is byte for byte what it was.
+build now refuses. Saying `runtime = true` left the Grasm runtime's TIR
+byte for byte what it was.
 
 **Lowered by the Grasm backend** (`s3 --runtime`; without the flag a TIR
 holding any part of the dialect is refused by name before anything else):
@@ -1712,17 +1714,18 @@ may touch it plainly (a C function, `call_c`, `ctx_switch`, `ctx_init`,
 in memory, or returned to C by an `export fn`); a call of a lock-holding
 function from one that neither holds the lock nor takes it (a
 compare-and-swap on the lock's own cell); and a mark that names no integer
-process cell of the module. Marks are doc
-comments -- `/// rtlint: guarded by POOL_LOCK` above a cell, `/// rtlint:
-holds POOL_LOCK` above a function -- so they sit beside what they say.
-"Derived from" is followed through every value computed from the address
-(locals, `offset`, `as_i64` and back through `mem_addr`, arithmetic,
-branches) and across calls both ways, to a fixpoint over the program; a
-value read out of memory, and a `bool`, are not the cell's address. Atomic
-access is allowed anywhere. What the marks say -- that a function marked as
-holding a lock is entered only with it held -- is checked only as far as its
-callers go: each must hold the lock or take it. Its conformance cases are `scripts/fixtures/rtlint`, one module
-each, saying in `//! rtlint:` lines what they must get.
+process cell of the module. Marks are doc comments -- `/// rtlint: guarded
+by POOL_LOCK` above a cell, `/// rtlint: holds POOL_LOCK` above a function
+-- so they sit beside what they say. "Derived from" is followed through
+every value computed from the address (locals, `offset`, `as_i64` and back
+through `mem_addr`, arithmetic, branches, loop variables, pattern bindings)
+and across calls both ways, to a fixpoint over the program; a value read out
+of memory, and a `bool`, are not the cell's address. Atomic access is
+allowed anywhere. What a mark claims -- that a function marked as holding a
+lock is entered only with it held -- is checked only as far as its callers
+go: each must hold the lock or take it. Its conformance cases are
+`scripts/fixtures/rtlint`, one module each, saying in `//! rtlint:` lines
+what they must get.
 
 **The gates**, each run on this tree on 2026-10-27, with this worktree's
 compiler:
@@ -1749,22 +1752,113 @@ compiler:
   thread-local getter answering the descriptor instead of calling its thunk
   ("the main thread's cells did not start at zero"). "controls: 5   caught:
   5   missed: 0".
-- `rtlint` (new): "packages: 2   process cells: 6   functions: 133
-  refused: 0" (compiler/rt and the fixture); "cases: 17   as expected: 17
-  refusals: 16"; two controls caught of two -- a plain store planted in the
-  fixture's `fx_hit`, refused as "a plain store of process cell
-  `main::HITS` outside a function holding its lock", and the lint planted
-  to take a plain store for an atomic one, which fails its cases.
+- `rtlint` (new): "packages: 2   process cells: 6   functions: 139
+  refused: 0" (compiler/rt and the dialect's fixture); "cases: 19   as
+  expected: 19   refusals: 18"; two controls caught of two -- a plain store
+  planted in the fixture's `fx_hit`, refused as "a plain store of process
+  cell `main::HITS` outside a function holding its lock", and the lint
+  planted to take a plain store for an atomic one, which fails its cases.
+  The lint before it followed loop variables and pattern bindings missed
+  two of the cases (`bad_loop`, `bad_match`).
 - `encodetest`: "forms: 106   cases: 6416   identical: 6416   different:
   0", "emittable forms: 106   with no cases: 0" -- the six new forms among
   them.
-- {{OTHER GATES}}
+- The ones the Rust change can reach, on this tree's Rust code and corpus:
+  `difftest` "identical: 648   mismatched: 0   unsupported: 0   external: 3
+  timed out: 0"; `tirtest` "emitted: 1671   holes: 0   not checking: 66
+  emitted twice: 335   unstable: 0" (the sixty-sixth not checking is
+  T-RUNTIME, which says it should not); `wasmtest` "identical: 508
+  mismatched: 0   skipped: 143"; `clippy` clean; `unittests` 772 passed, 0
+  failed; `grammar`, `gfmttest` "checked: 1532   disagreeing: 0".
+- The S5 gates on the final tree: `rtswap` "programs with a main: 651
+  external set aside: 3"; "Cranelift objects: identical: 648   failed: 0
+  timed out: 0"; "runtime names the programs reference: 323 distinct, 51
+  taken from Grasm and 272 from Rust; per program, 4756 references bound to
+  Grasm and 31587 to Rust"; "programs that took nothing from Grasm (compared
+  nothing): 12"; "poisoned runtime: agreeing with no use after free: 648";
+  "Grasm backend objects: in the subset: 648   identical: 648". `rtlayout`
+  "layout constants: 58   measured and equal: 58   also stated by the Rust
+  source: 14   POISON measured in the poisoned runtime". `fuzz_rtfmt`
+  "chunks identical: 20 of 20 (1000000 draws: 4000000 doubles and 6000000
+  integers formatted, each on both runtimes)"; `fuzz_rtmath` "chunks
+  identical: 10 of 10 (500000 draws, 16500000 calls of 33 entry points on
+  each runtime)"; `rtcontrols` "checks of planted faults: 13   caught: 13
+  missed: 0"; `leakcheck` through `rtwith.sh` (the switch shown in effect
+  first) "leak-free: 623   leaking: 0   not compiled: 0   external: 3   timed
+  out: 0   crashed: 0   ended before the check: 25".
+- The backend's and the linker's: `s3subset` "identical: 648   mismatched:
+  0   timed out: 0   no TIR: 0"; `objtest` "objects: 648   reproducible:
+  648   literal loads on their lines: 108370   with problems: 0" and
+  "runtime objects: 2   reproducible: 2"; `ra_check` "programs: 648
+  stressed runs: 3240   identical: 3240   failed: 0", its control 43494 of
+  43494 caught; `fuzz_s3` "programs: 60   compared: 60   identical: 60";
+  `inctest` 5 scenarios, 5 stale objects caught; `linktest` "Cranelift
+  objects: identical: 651" and "Grasm backend objects: in the subset: 648
+  identical: 648   failed: 0"; `linkdiff` "sampled: 168   byte-identical to
+  the shipped build: 168   tools and sections agree: 168   C fixtures agree:
+  3 of 3   whole runtime (401 members) agrees: 1"; `reprotest` "built
+  twice: 160   differ: 0".
+- The frontend's: `tokentest` "files: 1913   identical: 1913   mismatched:
+  0", "tokens: 3809090"; `asttest` "files: 1913   AST identical: 1913",
+  "CST printed back: 1913   not: 0"; `parsediag` "programs: 1489",
+  "rejected by the Rust parser: 709   same first diagnostic: 709   differ:
+  0"; `fuzz_front` "programs: 1500   agreed: 1500   declined: 0
+  disagreed: 0"; `frontcontrols` "controls: 8   caught: 8   missed: 0".
+  And `gatecheck`, `fmttest` (1907 formatted, none not), `linttest`,
+  `fuzz_tls`, `fuzz_rawmem`, `fuzz_fnaddr` and `fuzz_laws` (218 laws, none
+  broken) passed.
+- Not run: the whole suite, `s3controls`, `s3rc`, `linkcontrols`,
+  `usecheck`, and the site's regeneration.
 
-**What is left** -- steps four and five of the brief, not started: moving
-the runtime's state (the release walk, then the allocator, its live count,
+**The release walk, part one** (step four begun). When a program's
+`grasm_val_dec` takes a count to zero, the walk over what the box was the
+last owner of is now Grasm's (`compiler/rt/src/release.gr`) for strings --
+inline, on the heap, with a character index -- lists and tuples, inline and
+on the heap, scalar lists, the two builders, variants (no field, one held in
+place, or a slice of them), function values (the environment box and an
+`Option<String>` name) and bytes (the window's `Arc`, its last strong count
+freeing the buffer and its last weak count the `Arc`): each element
+released, those that reach zero taken apart in turn from a list of pending
+boxes (a loop, never recursion), the payload's buffers freed as the Rust
+runtime's `drop` frees them (its global allocator is `malloc` and `free`),
+and the payload left a `Unit`. The box then goes back with a count of one to
+the Rust runtime's `grasm_val_dec` -- its `state` entry already -- which
+finds a `Unit` and returns the box to its pool and its live count. Maps,
+structs, environments, handlers and lists of value structs are still taken
+apart there, children and all; so is every release inside the Rust
+runtime's own code, which calls its walk directly. Eighteen layout constants
+are new (`LIST_*`, `SCALAR_VEC`, `STRBUF_STRING`, `BYTEBUF_VEC`,
+`VARIANT_*`, `FN_*`, `BYTES_OWNER`, `ARC_*`), each measured by the probe, and
+the five the Rust `layout` module states held to it too. One was not what it
+was assumed to be: an `Option<String>`'s `None` is a capacity word of -1 in
+this build of the Rust runtime, not the `isize::MAX + 1` one might expect,
+which only the measurement says. No Rust change.
+
+Its gate is `fuzz_rtrelease` (new): `compiler/rt/probe/releasefuzz.gr`
+builds random values of every kind the walk takes apart, nested in each
+other and around the kinds it does not, some held across rounds so what is
+dropped is shared, `bytes` windows sharing one buffer, named function values
+and closures, and drops them; built as `rtswap` builds a program, the two
+builds run every seed under `MallocScribble` and must print the same
+checksum and live box count each round, and a few seeds run under `leaks
+--atExit`, where a buffer the walk forgets is a leak the box counts would not
+see. "seeds identical: 20 of 20 (1200 rounds, each build under
+MallocScribble)   leaks runs: 6   leaking: 0". `rtcontrols` gains three
+planted faults, all caught: the walk not releasing a list's elements ("seed
+1: the two runtimes differ"), not freeing a heap string's buffer ("f.swap
+seed 1: ... 506 leaks for 222128 total leaked bytes"), and dropping a
+`bytes` value's last strong count without freeing its `Arc` ("19 leaks for
+912 total leaked bytes"), which also shows the programs run this code.
+`rtlayout`: "layout constants: 58   measured and equal: 58   also stated by
+the Rust source: 14".
+
+**What is left** -- the rest of step four and all of step five: the release
+walk for the other payloads, whose layouts are not yet held (a map's
+`hashbrown` table and its keys, `StructTy` and a struct's fields, `Env`,
+`Handler`, a list of value structs); then the allocator, its pool and live count,
 regions and the leak check, the output buffers with `out_val` and the panic
-and exit path, maps with the Rust runtime's hashing kept bit for bit, then
-the stateless families that remain), and the fibers on `ctx_switch` against
+and exit path, maps with the Rust runtime's hashing kept bit for bit, and
+the stateless families that remain; and the fibers on `ctx_switch` against
 a model of which fiber runs. What this part gives them: process cells for
 the pool, the live count, the interned boxes, the reference slab, the
 channel table and the map seed; static bytes for the panic texts and
@@ -1798,7 +1892,10 @@ it does linked by `cc`), `linkdiff` (our linker against ld-prime) and
 `linkcontrols` (§6.6), `rtswap`
 (corpus on the Grasm runtime), `rtlayout` (the layouts both runtimes
 share), `fuzz_rtfmt` (number formatting against the Rust runtime) and
-`rtcontrols` (§6.7), `fixpoint` (stage 2 = stage 3), `ddc`,
+`rtcontrols` (§6.7), `rtdialect` and `rtdialectcontrols` (the runtime
+dialect as the Grasm backend lowers it, driven from C), `rtlint` (no plain
+access to a process cell outside its lock) and `fuzz_rtrelease` (the release
+walk against the Rust runtime's) (§6.9), `fixpoint` (stage 2 = stage 3), `ddc`,
 `selfperf` (compile speed and benchmark budgets), and the existing fuzzers
 pointed at each new component. Every new gate ships with controls showing
 it fails on a planted fault.
@@ -1973,16 +2070,26 @@ Measured, not estimated; each line is a gate's result on master.
   Where the time goes was measured once: field writes (§6.8) were most of
   it until the hot state moved into whole variables, and the AST builder,
   which still writes through the AST's fields, is 40% of what is left.
-- **S5 part two, steps one to three done** (§6.9): the runtime dialect
-  of §5.6 -- process cells, static bytes, the runtime's own thread-local
-  cells and the context switch -- usable only in a package whose manifest
-  says `runtime = true`, refused by name everywhere else and by both other
-  engines, in the Rust frontend and in compiler/front alike; lowered by the
-  Grasm backend (`s3 --runtime`) to `__bss` symbols, `__cstring` bytes,
-  Mach-O thread-local variables and leaves that switch contexts without
-  signing anything; and guarded by `rtlint`, which refuses a plain access
-  to a process cell outside a function holding its lock. {{GATES11}} The
-  state itself has not moved (steps four and five).
+- **S5 part two, steps one to three done, step four begun** (§6.9): the
+  runtime dialect of §5.6 -- process cells, static bytes, the runtime's own
+  thread-local cells and the context switch -- usable only in a package
+  whose manifest says `runtime = true`, refused by name everywhere else and
+  by both other engines, in the Rust frontend and in compiler/front alike;
+  lowered by the Grasm backend (`s3 --runtime`) to `__bss` symbols,
+  `__cstring` bytes, Mach-O thread-local variables and leaves that switch
+  contexts without signing anything; and guarded by `rtlint`, which refuses
+  a plain access to a process cell outside a function holding its lock. The
+  release walk is Grasm's for strings, lists, tuples, scalar lists, the
+  builders, variants, function values and bytes; the other payloads' walk,
+  the allocator, the output buffers, the panic path, maps and fibers are
+  not moved yet. `rtswap`: all 648 corpus programs that link no system
+  library print and exit identically on both runtimes, from both backends'
+  objects and against the poisoned runtime; `rtdialect` drives every part
+  of the dialect from C, linked by `compiler/link` and by `cc`;
+  `fuzz_rtrelease` 20 seeds and 1,200 rounds identical, nothing leaking;
+  `rtcontrols` 13 of 13, `rtdialectcontrols` 5 of 5 and `rtlint`'s 2 of 2
+  planted faults caught. One fact bounds the switch's test: this machine's
+  arm64 processes run with the return-address keys off.
 - **Not started:** S2 past part one (resolver, checker, TIR), S6
   (self-compilation), S7-S9; S5's state families and fibers (steps four
   and five of part two).

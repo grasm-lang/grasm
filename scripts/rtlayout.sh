@@ -102,6 +102,11 @@ stated("BOX_SIZE", r"size_of::<RtVal>\(\) == (\d+)\)", lambda m: int(m.group(1))
 stated("IMMORTAL", r"const IMMORTAL: i64 = i64::MAX;", lambda m: I64_MAX)
 stated("ARENA", r"const ARENA: i64 = i64::MAX - 1;", lambda m: I64_MAX - 1)
 stated("POISON", r"const POISON: i64 = i64::MIN \+ 0x([0-9A-Fa-f]+);", lambda m: I64_MIN + int(m.group(1), 16))
+stated("LIST_DISC", r"pub const LIST_DATA_TAG: usize = (\d+);", lambda m: int(m.group(1)))
+stated("LIST_LEN", r"pub const LIST_INLINE_LEN: usize = (\d+);", lambda m: int(m.group(1)))
+stated("LIST_VALS", r"pub const LIST_INLINE_VALS: usize = (\d+);", lambda m: int(m.group(1)))
+stated("LIST_INLINE", r"pub const INLINE: u8 = (\d+);", lambda m: int(m.group(1)))
+stated("SCALAR_VEC", r"pub const SCALAR_VEC: usize = (\d+);", lambda m: int(m.group(1)))
 
 bad = 0
 compared = 0
