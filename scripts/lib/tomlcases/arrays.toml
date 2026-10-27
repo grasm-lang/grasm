@@ -1,0 +1,28 @@
+# Arrays of tables, which no manifest in the repository writes yet: every
+# reader must put each key in the entry it was written in (scripts/tomldiff.sh).
+[package]
+name = "fixture"
+version = "0.1.0"
+
+[[bin]]
+name = "first"
+path = "src/first.gr"
+
+[[bin]]
+name = "second"
+path = "src/second.gr"
+release = true
+
+[[bin]]
+
+[[test]]
+name = "t"
+args = ["a", "b"]
+
+[[bin]]
+name = "fourth"
+path = "src/fourth.gr"
+
+[dependencies.lib]
+path = "../lib"
+version = "^1.0.0"

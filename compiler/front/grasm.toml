@@ -7,3 +7,9 @@ entry = "src/main.gr"
 # source file and prints what the Rust frontend's dump of it prints. It
 # reads files and writes to stdout and stderr, nothing else.
 capabilities = ["io"]
+
+# Manifests are read with the TOML package (docs/self-hosting.md, S2 part
+# two: the loader).
+[dependencies.toml]
+path = "../../packages/toml"
+version = "^1.0.0"

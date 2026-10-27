@@ -142,6 +142,12 @@ run_gate tokentest     scripts/tokentest.sh
 run_gate asttest       scripts/asttest.sh
 run_gate parsediag     scripts/parsediag.sh
 run_gate frontcontrols scripts/frontcontrols.sh
+run_gate loaddiff      scripts/loaddiff.sh
+run_gate tomldiff      scripts/tomldiff.sh
+run_gate tirdiff       scripts/tirdiff.sh
+run_gate tirrefuse     scripts/tirrefuse.sh
+run_gate frontsmoke    scripts/frontsmoke.sh
+run_gate tircontrols   scripts/tircontrols.sh
 run_gate reprotest     scripts/reprotest.sh
 run_gate inctest       python3 scripts/inctest.py
 run_gate brokertest    scripts/broker_test.sh

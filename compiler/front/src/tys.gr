@@ -1,0 +1,711 @@
+// The checker's types (crates/grasm_sema/src/types.rs), interned: a type is
+// an id into flat arrays, and two ids are equal exactly when the types are,
+// so `==` on ids is the Rust checker's structural `==` on `Type`. An
+// inference variable is a type of its own (`K_VAR`), and the unifier's
+// substitution is an array indexed by variable.
+//
+// Rows (the `{io, Clock}` of a function type) are interned too: a sorted
+// list of effect names, by id, with -1 for the row a type does not
+// constrain (`None` in the Rust checker).
+//
+// The named type definitions -- the prelude's `Option`, `IoError` and
+// `Chan`, then every `type` and every effect's handler -- live here as well,
+// because printing a type needs their names.
+
+pub let K_ERROR = 0
+pub let K_I64 = 1
+pub let K_F64 = 2
+pub let K_BOOL = 3
+pub let K_STR = 4
+pub let K_BYTES = 5
+pub let K_STRBUF = 6
+pub let K_BYTEBUF = 7
+pub let K_ADDR = 8
+pub let K_UNIT = 9
+pub let K_RANGE = 10
+pub let K_INT = 11
+pub let K_TUPLE = 20
+pub let K_LIST = 21
+pub let K_REF = 22
+pub let K_MAP = 23
+pub let K_NAMED = 24
+pub let K_FN = 25
+pub let K_FALLIBLE = 26
+pub let K_UNION = 27
+pub let K_VAR = 28
+pub let K_GENERIC = 29
+
+// The fixed ids of the leaves, made first by `new_tys`.
+pub let ERROR = 0
+pub let I64 = 1
+pub let F64 = 2
+pub let BOOL = 3
+pub let STR = 4
+pub let BYTES = 5
+pub let STRBUF = 6
+pub let BYTEBUF = 7
+pub let ADDR = 8
+pub let UNIT = 9
+pub let RANGE = 10
+// I8, I16, I32, U8, U16, U32, U64: 11 + the IntKind's position.
+pub let INT0 = 11
+
+/// Int kinds in the Rust `IntKind` order.
+pub fn int_name(k: i64) -> str {
+    match k {
+        0 -> "i8"
+        1 -> "i16"
+        2 -> "i32"
+        3 -> "u8"
+        4 -> "u16"
+        5 -> "u32"
+        _ -> "u64"
+    }
+}
+
+pub fn int_of_name(s: str) -> i64 {
+    match s {
+        "i8" -> 0
+        "i16" -> 1
+        "i32" -> 2
+        "u8" -> 3
+        "u16" -> 4
+        "u32" -> 5
+        "u64" -> 6
+        _ -> -1
+    }
+}
+
+pub fn int_bits(k: i64) -> i64 {
+    if k == 0 or k == 3 {
+        8
+    } else if k == 1 or k == 4 {
+        16
+    } else if k == 2 or k == 5 {
+        32
+    } else {
+        64
+    }
+}
+
+pub fn int_signed(k: i64) -> bool {
+    k <= 2
+}
+
+type Tys = {
+    k: [i64],
+    a: [i64],
+    b: [i64],
+    c: [i64],
+    off: [i64],
+    n: [i64],
+    pool: [i64],
+    hv: [bool],
+    intern: Map[str, i64],
+    subst: [i64],
+    var_ty: [i64],
+    row_names: [[str]],
+    row_key: Map[str, i64],
+    // Named type definitions. A definition's body is its variants; a struct
+    // has one, named "", holding its fields.
+    d_name: [str],
+    d_gen: [[str]],
+    d_sum: [bool],
+    d_v0: [i64],
+    d_vn: [i64],
+    by_name: Map[str, i64],
+    v_name: [str],
+    v_f0: [i64],
+    v_fn: [i64],
+    f_name: [str],
+    f_ty: [i64],
+}
+
+pub let OPTION = 0
+pub let IOERROR = 1
+pub let CHAN = 2
+
+pub fn new_tys() -> Tys {
+    var t = Tys{ k: [], a: [], b: [], c: [], off: [], n: [], pool: [], hv: [], intern: map(), subst: [], var_ty: [], row_names: [], row_key: map(), d_name: [], d_gen: [], d_sum: [], d_v0: [], d_vn: [], by_name: map(), v_name: [], v_f0: [], v_fn: [], f_name: [], f_ty: [] }
+    for kk in 0..11 {
+        mk(t, kk, 0, 0, -1, [])
+    }
+    for ik in 0..7 {
+        mk(t, K_INT, ik, 0, -1, [])
+    }
+    // Prelude: type Option[T] = | Some(v: T) | None
+    let g0 = generic(t, 0)
+    let opt = add_def(t, "Option", ["T"])
+    set_sum(t, opt, ["Some", "None"], [["v"], []], [[g0], []])
+    let ioe = add_def(t, "IoError", [])
+    set_sum(t, ioe, ["NotFound", "IoFailed"], [["path"], ["msg"]], [[STR], [STR]])
+    let ch = add_def(t, "Chan", ["T"])
+    set_struct(t, ch, [], [])
+    t
+}
+
+fn key_of(k: i64, a: i64, b: i64, c: i64, items: [i64]) -> str {
+    var s = "{k}:{a}:{b}:{c}"
+    for x in items {
+        s = s + ",{x}"
+    }
+    s
+}
+
+/// The id of the type with these parts, made if it is new.
+pub fn mk(inout t: Tys, k: i64, a: i64, b: i64, c: i64, items: [i64]) -> i64 {
+    let key = key_of(k, a, b, c, items)
+    match t.intern.get(key) {
+        Some(id) -> return id
+        None -> ()
+    }
+    let id = t.k.len()
+    t.k.push(k)
+    t.a.push(a)
+    t.b.push(b)
+    t.c.push(c)
+    t.off.push(t.pool.len())
+    t.n.push(items.len())
+    var hv = k == K_VAR or k == K_ERROR
+    if k == K_LIST or k == K_REF {
+        hv = t.hv[a]
+    } else if k == K_MAP or k == K_FALLIBLE {
+        hv = t.hv[a] or t.hv[b]
+    } else if k == K_FN {
+        hv = t.hv[a]
+    }
+    for x in items {
+        t.pool.push(x)
+        if t.hv[x] {
+            hv = true
+        }
+    }
+    t.hv.push(hv)
+    t.intern.set(key, id)
+    id
+}
+
+pub fn items(t: Tys, id: i64) -> [i64] {
+    t.pool.slice(t.off[id], t.off[id] + t.n[id])
+}
+
+pub fn item(t: Tys, id: i64, i: i64) -> i64 {
+    t.pool[t.off[id] + i]
+}
+
+pub fn int_ty(k: i64) -> i64 {
+    INT0 + k
+}
+
+pub fn list(inout t: Tys, x: i64) -> i64 {
+    mk(t, K_LIST, x, 0, -1, [])
+}
+
+pub fn reft(inout t: Tys, x: i64) -> i64 {
+    mk(t, K_REF, x, 0, -1, [])
+}
+
+pub fn mapt(inout t: Tys, k: i64, v: i64) -> i64 {
+    mk(t, K_MAP, k, v, -1, [])
+}
+
+pub fn tuple(inout t: Tys, xs: [i64]) -> i64 {
+    mk(t, K_TUPLE, 0, 0, -1, xs)
+}
+
+pub fn union(inout t: Tys, xs: [i64]) -> i64 {
+    mk(t, K_UNION, 0, 0, -1, xs)
+}
+
+pub fn named(inout t: Tys, id: i64, args: [i64]) -> i64 {
+    mk(t, K_NAMED, id, 0, -1, args)
+}
+
+pub fn fallible(inout t: Tys, ok: i64, err: i64) -> i64 {
+    mk(t, K_FALLIBLE, ok, err, -1, [])
+}
+
+/// A function type: its parameters, result and row (-1 unconstrained).
+pub fn fnt(inout t: Tys, params: [i64], ret: i64, row: i64) -> i64 {
+    mk(t, K_FN, ret, 0, row, params)
+}
+
+pub fn generic(inout t: Tys, i: i64) -> i64 {
+    mk(t, K_GENERIC, i, 0, -1, [])
+}
+
+pub fn option_of(inout t: Tys, x: i64) -> i64 {
+    named(t, OPTION, [x])
+}
+
+/// A fresh inference variable.
+pub fn fresh(inout t: Tys) -> i64 {
+    let v = t.subst.len()
+    t.subst.push(-1)
+    let id = mk(t, K_VAR, v, 0, -1, [])
+    t.var_ty.push(id)
+    id
+}
+
+// ---------------------------------------------------------------------
+// Rows
+// ---------------------------------------------------------------------
+
+/// The id of a row, given its names in any order and possibly repeated.
+pub fn row_of(inout t: Tys, names: [str]) -> i64 {
+    var s = names
+    s.sort()
+    var u: [str] = []
+    for x in s {
+        if u.len() == 0 or u[u.len() - 1] != x {
+            u.push(x)
+        }
+    }
+    let key = u.join(",")
+    match t.row_key.get(key) {
+        Some(id) -> return id
+        None -> ()
+    }
+    let id = t.row_names.len()
+    t.row_names.push(u)
+    t.row_key.set(key, id)
+    id
+}
+
+pub fn row_names(t: Tys, r: i64) -> [str] {
+    if r < 0 {
+        return []
+    }
+    t.row_names[r]
+}
+
+// ---------------------------------------------------------------------
+// Definitions
+// ---------------------------------------------------------------------
+
+pub fn add_def(inout t: Tys, name: str, gens: [str]) -> i64 {
+    let id = t.d_name.len()
+    t.d_name.push(name)
+    t.d_gen.push(gens)
+    t.d_sum.push(false)
+    t.d_v0.push(t.v_name.len())
+    t.d_vn.push(0)
+    t.by_name.set(name, id)
+    id
+}
+
+pub fn set_struct(inout t: Tys, id: i64, names: [str], tys: [i64]) {
+    t.d_sum[id] = false
+    t.d_v0[id] = t.v_name.len()
+    t.d_vn[id] = 1
+    t.v_name.push("")
+    t.v_f0.push(t.f_name.len())
+    t.v_fn.push(names.len())
+    for i in 0..names.len() {
+        t.f_name.push(names[i])
+        t.f_ty.push(tys[i])
+    }
+}
+
+pub fn set_sum(inout t: Tys, id: i64, vnames: [str], fnames: [[str]], ftys: [[i64]]) {
+    t.d_sum[id] = true
+    t.d_v0[id] = t.v_name.len()
+    t.d_vn[id] = vnames.len()
+    for i in 0..vnames.len() {
+        t.v_name.push(vnames[i])
+        t.v_f0.push(-1)
+        t.v_fn.push(0)
+    }
+    for i in 0..vnames.len() {
+        let v = t.d_v0[id] + i
+        t.v_f0[v] = t.f_name.len()
+        t.v_fn[v] = fnames[i].len()
+        for j in 0..fnames[i].len() {
+            t.f_name.push(fnames[i][j])
+            t.f_ty.push(ftys[i][j])
+        }
+    }
+}
+
+/// A struct's field names and types (empty for a sum).
+pub fn struct_fields(t: Tys, id: i64) -> ([str], [i64]) {
+    if t.d_sum[id] or t.d_vn[id] == 0 {
+        return ([], [])
+    }
+    let v = t.d_v0[id]
+    let f0 = t.v_f0[v]
+    (t.f_name.slice(f0, f0 + t.v_fn[v]), t.f_ty.slice(f0, f0 + t.v_fn[v]))
+}
+
+pub fn is_struct(t: Tys, id: i64) -> bool {
+    not t.d_sum[id]
+}
+
+pub fn variant_count(t: Tys, id: i64) -> i64 {
+    if t.d_sum[id] {
+        t.d_vn[id]
+    } else {
+        0
+    }
+}
+
+pub fn variant_name(t: Tys, id: i64, i: i64) -> str {
+    t.v_name[t.d_v0[id] + i]
+}
+
+pub fn variant_index(t: Tys, id: i64, name: str) -> i64 {
+    if not t.d_sum[id] {
+        return -1
+    }
+    for i in 0..t.d_vn[id] {
+        if t.v_name[t.d_v0[id] + i] == name {
+            return i
+        }
+    }
+    -1
+}
+
+pub fn variant_fields(t: Tys, id: i64, i: i64) -> ([str], [i64]) {
+    let v = t.d_v0[id] + i
+    let f0 = t.v_f0[v]
+    (t.f_name.slice(f0, f0 + t.v_fn[v]), t.f_ty.slice(f0, f0 + t.v_fn[v]))
+}
+
+pub fn def_of(t: Tys, name: str) -> i64 {
+    t.by_name.get(name) ?? -1
+}
+
+// ---------------------------------------------------------------------
+// Unification
+// ---------------------------------------------------------------------
+
+/// Follows substitutions one level at a time until a non-variable or an
+/// unbound variable.
+pub fn shallow(t: Tys, x: i64) -> i64 {
+    var y = x
+    while t.k[y] == K_VAR {
+        let s = t.subst[t.a[y]]
+        if s < 0 {
+            return y
+        }
+        y = s
+    }
+    y
+}
+
+/// Fully applies the substitution.
+pub fn resolve(inout t: Tys, x: i64) -> i64 {
+    if not t.hv[x] {
+        return x
+    }
+    let y = shallow(t, x)
+    let k = t.k[y]
+    if k == K_TUPLE or k == K_UNION or k == K_NAMED {
+        var xs: [i64] = []
+        for i in items(t, y) {
+            xs.push(resolve(t, i))
+        }
+        return mk(t, k, t.a[y], 0, -1, xs)
+    }
+    if k == K_LIST or k == K_REF {
+        let inner = resolve(t, t.a[y])
+        return mk(t, k, inner, 0, -1, [])
+    }
+    if k == K_MAP or k == K_FALLIBLE {
+        let p = resolve(t, t.a[y])
+        let q = resolve(t, t.b[y])
+        return mk(t, k, p, q, -1, [])
+    }
+    if k == K_FN {
+        var ps: [i64] = []
+        for i in items(t, y) {
+            ps.push(resolve(t, i))
+        }
+        let r = resolve(t, t.a[y])
+        return mk(t, K_FN, r, 0, t.c[y], ps)
+    }
+    y
+}
+
+fn occurs(t: Tys, v: i64, x: i64) -> bool {
+    let y = shallow(t, x)
+    let k = t.k[y]
+    if k == K_VAR {
+        return t.a[y] == v
+    }
+    if k == K_TUPLE or k == K_UNION or k == K_NAMED {
+        for i in items(t, y) {
+            if occurs(t, v, i) {
+                return true
+            }
+        }
+        return false
+    }
+    if k == K_LIST or k == K_REF {
+        return occurs(t, v, t.a[y])
+    }
+    if k == K_MAP or k == K_FALLIBLE {
+        return occurs(t, v, t.a[y]) or occurs(t, v, t.b[y])
+    }
+    if k == K_FN {
+        for i in items(t, y) {
+            if occurs(t, v, i) {
+                return true
+            }
+        }
+        return occurs(t, v, t.a[y])
+    }
+    false
+}
+
+/// Unifies two types; false on a mismatch (the caller reports it).
+pub fn unify(inout t: Tys, x: i64, y: i64) -> bool {
+    let a = shallow(t, x)
+    let b = shallow(t, y)
+    let ka = t.k[a]
+    let kb = t.k[b]
+    if ka == K_ERROR or kb == K_ERROR {
+        return true
+    }
+    if ka == K_VAR {
+        if kb == K_VAR and t.a[b] == t.a[a] {
+            return true
+        }
+        if occurs(t, t.a[a], b) {
+            return false
+        }
+        t.subst[t.a[a]] = b
+        return true
+    }
+    if kb == K_VAR {
+        return unify(t, b, a)
+    }
+    if ka != kb {
+        return false
+    }
+    if ka == K_INT or ka == K_GENERIC {
+        return t.a[a] == t.a[b]
+    }
+    if ka < K_TUPLE {
+        return true
+    }
+    if ka == K_TUPLE or ka == K_UNION {
+        if t.n[a] != t.n[b] {
+            return false
+        }
+        for i in 0..t.n[a] {
+            if not unify(t, item(t, a, i), item(t, b, i)) {
+                return false
+            }
+        }
+        return true
+    }
+    if ka == K_LIST or ka == K_REF {
+        return unify(t, t.a[a], t.a[b])
+    }
+    if ka == K_MAP or ka == K_FALLIBLE {
+        return unify(t, t.a[a], t.a[b]) and unify(t, t.b[a], t.b[b])
+    }
+    if ka == K_NAMED {
+        if t.a[a] != t.a[b] or t.n[a] != t.n[b] {
+            return false
+        }
+        for i in 0..t.n[a] {
+            if not unify(t, item(t, a, i), item(t, b, i)) {
+                return false
+            }
+        }
+        return true
+    }
+    if ka == K_FN {
+        if t.n[a] != t.n[b] {
+            return false
+        }
+        for i in 0..t.n[a] {
+            if not unify(t, item(t, a, i), item(t, b, i)) {
+                return false
+            }
+        }
+        return unify(t, t.a[a], t.a[b])
+    }
+    false
+}
+
+/// `Generic(i)` replaced by `args[i]`: instantiating a generic definition.
+pub fn subst_generics(inout t: Tys, x: i64, args: [i64]) -> i64 {
+    let k = t.k[x]
+    if k == K_GENERIC {
+        let i = t.a[x]
+        if i < args.len() {
+            return args[i]
+        }
+        return ERROR
+    }
+    if k == K_TUPLE or k == K_UNION or k == K_NAMED {
+        var xs: [i64] = []
+        for i in items(t, x) {
+            xs.push(subst_generics(t, i, args))
+        }
+        return mk(t, k, t.a[x], 0, -1, xs)
+    }
+    if k == K_LIST or k == K_REF {
+        let inner = subst_generics(t, t.a[x], args)
+        return mk(t, k, inner, 0, -1, [])
+    }
+    if k == K_MAP or k == K_FALLIBLE {
+        let p = subst_generics(t, t.a[x], args)
+        let q = subst_generics(t, t.b[x], args)
+        return mk(t, k, p, q, -1, [])
+    }
+    if k == K_FN {
+        var ps: [i64] = []
+        for i in items(t, x) {
+            ps.push(subst_generics(t, i, args))
+        }
+        let r = subst_generics(t, t.a[x], args)
+        return mk(t, K_FN, r, 0, t.c[x], ps)
+    }
+    x
+}
+
+/// Whether a resolved type still holds an unsolved variable or an error
+/// (the TIR emitter's `holds_var`).
+pub fn holds_var(t: Tys, x: i64) -> bool {
+    let k = t.k[x]
+    if k == K_ERROR {
+        return true
+    }
+    if k == K_TUPLE or k == K_UNION or k == K_NAMED {
+        for i in items(t, x) {
+            if holds_var(t, i) {
+                return true
+            }
+        }
+        return false
+    }
+    if k == K_LIST or k == K_REF {
+        return holds_var(t, t.a[x])
+    }
+    if k == K_MAP or k == K_FALLIBLE {
+        return holds_var(t, t.a[x]) or holds_var(t, t.b[x])
+    }
+    if k == K_FN {
+        for i in items(t, x) {
+            if holds_var(t, i) {
+                return true
+            }
+        }
+        return holds_var(t, t.a[x])
+    }
+    false
+}
+
+// ---------------------------------------------------------------------
+// Display: the checker's `TypeDisplay`, which diagnostics and a few
+// decisions (`show(..).contains('_')`) read.
+// ---------------------------------------------------------------------
+
+pub fn show(inout t: Tys, x: i64) -> str {
+    let r = resolve(t, x)
+    var b = str_builder()
+    write_ty(t, r, b)
+    b.to_str()
+}
+
+fn write_ty(t: Tys, x: i64, inout b: StrBuilder) {
+    let k = t.k[x]
+    if k == K_REF {
+        b.push_str("ref ")
+        write_ty(t, t.a[x], b)
+    } else if k == K_I64 {
+        b.push_str("i64")
+    } else if k == K_INT {
+        b.push_str(int_name(t.a[x]))
+    } else if k == K_F64 {
+        b.push_str("f64")
+    } else if k == K_BOOL {
+        b.push_str("bool")
+    } else if k == K_STR {
+        b.push_str("str")
+    } else if k == K_BYTES {
+        b.push_str("bytes")
+    } else if k == K_STRBUF {
+        b.push_str("StrBuilder")
+    } else if k == K_BYTEBUF {
+        b.push_str("ByteBuilder")
+    } else if k == K_ADDR {
+        b.push_str("addr")
+    } else if k == K_UNIT {
+        b.push_str("()")
+    } else if k == K_RANGE {
+        b.push_str("range")
+    } else if k == K_TUPLE {
+        b.push_str("(")
+        var i = 0
+        for y in items(t, x) {
+            if i > 0 {
+                b.push_str(", ")
+            }
+            write_ty(t, y, b)
+            i += 1
+        }
+        b.push_str(")")
+    } else if k == K_LIST {
+        b.push_str("[")
+        write_ty(t, t.a[x], b)
+        b.push_str("]")
+    } else if k == K_MAP {
+        b.push_str("Map[")
+        write_ty(t, t.a[x], b)
+        b.push_str(", ")
+        write_ty(t, t.b[x], b)
+        b.push_str("]")
+    } else if k == K_NAMED {
+        b.push_str(t.d_name[t.a[x]])
+        if t.n[x] > 0 {
+            b.push_str("[")
+            var i = 0
+            for y in items(t, x) {
+                if i > 0 {
+                    b.push_str(", ")
+                }
+                write_ty(t, y, b)
+                i += 1
+            }
+            b.push_str("]")
+        }
+    } else if k == K_FN {
+        b.push_str("fn(")
+        var i = 0
+        for y in items(t, x) {
+            if i > 0 {
+                b.push_str(", ")
+            }
+            write_ty(t, y, b)
+            i += 1
+        }
+        b.push_str(") -> ")
+        write_ty(t, t.a[x], b)
+    } else if k == K_FALLIBLE {
+        write_ty(t, t.a[x], b)
+        b.push_str(" ! ")
+        write_ty(t, t.b[x], b)
+    } else if k == K_UNION {
+        b.push_str("(")
+        var i = 0
+        for y in items(t, x) {
+            if i > 0 {
+                b.push_str(" | ")
+            }
+            write_ty(t, y, b)
+            i += 1
+        }
+        b.push_str(")")
+    } else if k == K_VAR {
+        b.push_str("_")
+    } else if k == K_GENERIC {
+        b.push_str("T{t.a[x]}")
+    } else {
+        b.push_str("<error>")
+    }
+}

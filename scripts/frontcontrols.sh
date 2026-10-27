@@ -42,8 +42,12 @@ plant() {
     local name=$1 file=$2
     shift 2
     rm -rf "${WORK:?}/$name.src"
-    cp -R compiler/front "$WORK/$name.src"
-    if ! python3 - "$WORK/$name.src/src/$file" "$@" <<'EOF'; then
+    # The frontend reads manifests with packages/toml, a dependency named by
+    # a path relative to it, so the copy keeps the two where they are.
+    mkdir -p "$WORK/$name.src/compiler" "$WORK/$name.src/packages"
+    cp -R compiler/front "$WORK/$name.src/compiler/front"
+    cp -R packages/toml "$WORK/$name.src/packages/toml"
+    if ! python3 - "$WORK/$name.src/compiler/front/src/$file" "$@" <<'EOF'; then
 import sys
 path = sys.argv[1]
 pairs = sys.argv[2:]
@@ -57,7 +61,7 @@ open(path, "w").write(text)
 EOF
         return 1
     fi
-    "$GRASM" build "$WORK/$name.src/src/main.gr" --native -o "$WORK/$name" >"$WORK/$name.log" 2>&1
+    "$GRASM" build "$WORK/$name.src/compiler/front/src/main.gr" --native -o "$WORK/$name" >"$WORK/$name.log" 2>&1
 }
 
 # expect NAME WHY GATE...: the gate, run against the planted build, fails

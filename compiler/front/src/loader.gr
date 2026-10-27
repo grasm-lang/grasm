@@ -1,0 +1,1667 @@
+// The loader (crates/grasm_sema/src/loader.rs, and the package resolution
+// `grasm` runs before it): from an entry file, every module it imports, with
+// the names, aliases, paths and span bases the Rust loader gives them.
+//
+// `import utils` loads `utils.gr` beside the importing file; `import lib.math`
+// loads `lib/math.gr`; a name a package's manifest declares as a dependency
+// loads that package's entry file, and a module inside a package resolves its
+// imports inside that package. Modules are taken from a stack -- the last
+// import written is loaded first -- and each file's spans start where the
+// previous file's ended, plus one.
+//
+// Manifests are read twice over, as the Rust toolchain reads them: the
+// package graph through `packages/toml` (the root's manifest checked as
+// `grasm_pkg::Manifest` checks it, then every path dependency), and the
+// loader's own questions -- a package's dependencies and their paths, its
+// entry file, whether it is a runtime package -- line by line, as
+// loader.rs asks them.
+import lex
+import parse
+import cst
+import ast
+import toml
+
+let MAX_PACKAGE_DEPTH = 64
+
+/// Everything loading produced.
+type Loaded = {
+    names: [str],
+    aliases: [str],
+    paths: [str],
+    srcs: [bytes],
+    bases: [i64],
+    imp_alias: [[str]],
+    imp_full: [[str]],
+    mods: [ModuleAst],
+    /// The loader's diagnostics and the parser's, as messages.
+    diags: [str],
+    /// Module name -> runtime package name ([T-RUNTIME]).
+    runtime: Map[str, str],
+    /// Module-name prefixes that are dependency packages.
+    deps: [str],
+    /// A failure before any module was read ("error: ..."), or "".
+    fatal: str,
+}
+
+// ---------------------------------------------------------------------
+// Paths, as std::path treats the relative paths the loader builds
+// ---------------------------------------------------------------------
+
+/// `Path::parent`: everything before the last component, or None (as "\0")
+/// for a path with no parent.
+pub fn parent(p: str) -> str {
+    if p == "" or p == "/" {
+        return "\0"
+    }
+    var q = p
+    while q.len() > 1 and q.ends_with("/") {
+        q = q.substr(0, q.len() - 1)
+    }
+    match last_slash(q) {
+        Some(i) -> {
+            if i == 0 {
+                return "/"
+            }
+            var r = q.substr(0, i)
+            while r.len() > 1 and r.ends_with("/") {
+                r = r.substr(0, r.len() - 1)
+            }
+            r
+        }
+        None -> ""
+    }
+}
+
+fn last_slash(s: str) -> Option[i64] {
+    let b = s.to_bytes()
+    var i = b.len() - 1
+    while i >= 0 {
+        if b.at(i) == 47 {
+            return Some(i)
+        }
+        i -= 1
+    }
+    None
+}
+
+/// `Path::join`.
+pub fn join(dir: str, rel: str) -> str {
+    if rel.starts_with("/") or dir == "" {
+        return rel
+    }
+    if dir.ends_with("/") {
+        return dir + rel
+    }
+    dir + "/" + rel
+}
+
+/// `Path::file_stem` of the last component.
+fn file_stem(p: str) -> str {
+    var name = p
+    match last_slash(p) {
+        Some(i) -> name = p.substr(i + 1, p.len() - i - 1)
+        None -> ()
+    }
+    let b = name.to_bytes()
+    var i = b.len() - 1
+    while i > 0 {
+        if b.at(i) == 46 {
+            return name.substr(0, i)
+        }
+        i -= 1
+    }
+    name
+}
+
+/// loader.rs `tidy`: `.` dropped and `..` collapsed lexically.
+pub fn tidy(path: str) -> str {
+    var parts: [str] = []
+    if path.starts_with("/") {
+        parts.push("/")
+    }
+    for seg in path.split("/") {
+        if seg == "" or seg == "." {
+            continue
+        }
+        if seg == ".." {
+            let n = parts.len()
+            if n > 0 and parts[n - 1] == "/" {
+                continue
+            }
+            if n > 0 and parts[n - 1] != ".." {
+                parts.pop()
+                continue
+            }
+        }
+        parts.push(seg)
+    }
+    if parts.len() == 0 {
+        return path
+    }
+    if parts[0] == "/" {
+        return "/" + parts.slice(1, parts.len()).join("/")
+    }
+    parts.join("/")
+}
+
+/// A directory's real path. The Rust toolchain asks the file system; this
+/// collapses it lexically, which agrees wherever no symbolic link is on
+/// the way.
+fn real_dir(d: str) -> str {
+    tidy(d)
+}
+
+fn dotted_to_path(name: str) -> str {
+    name.replace(".", "/")
+}
+
+fn first_seg(name: str) -> str {
+    match name.index_of(".") {
+        Some(i) -> name.substr(0, i)
+        None -> name
+    }
+}
+
+fn after_first_seg(name: str) -> str {
+    match name.index_of(".") {
+        Some(i) -> name.substr(i + 1, name.len() - i - 1)
+        None -> ""
+    }
+}
+
+fn last_seg(name: str) -> str {
+    let parts = name.split(".")
+    parts[parts.len() - 1]
+}
+
+fn read_text(path: str) -> Option[str] {
+    match read_bytes(path) {
+        Ok(b) -> {
+            if utf8_ok(b) {
+                Some(b.to_str())
+            } else {
+                None
+            }
+        }
+        Err(_) -> None
+    }
+}
+
+/// Whether `b` is UTF-8 as Rust's `str::from_utf8` accepts it.
+pub fn utf8_ok(b: bytes) -> bool {
+    let n = b.len()
+    var i = 0
+    while i < n {
+        let c = b.at(i)
+        if c < 128 {
+            i += 1
+            continue
+        }
+        var len = 0
+        var lo = 128
+        var hi = 191
+        if c >= 194 and c <= 223 {
+            len = 2
+        } else if c >= 224 and c <= 239 {
+            len = 3
+            if c == 224 {
+                lo = 160
+            } else if c == 237 {
+                hi = 159
+            }
+        } else if c >= 240 and c <= 244 {
+            len = 4
+            if c == 240 {
+                lo = 144
+            } else if c == 244 {
+                hi = 143
+            }
+        } else {
+            return false
+        }
+        if i + len > n {
+            return false
+        }
+        let c1 = b.at(i + 1)
+        if c1 < lo or c1 > hi {
+            return false
+        }
+        for k in 2..len {
+            let ck = b.at(i + k)
+            if ck < 128 or ck > 191 {
+                return false
+            }
+        }
+        i += len
+    }
+    true
+}
+
+// ---------------------------------------------------------------------
+// Manifests, line by line, as loader.rs reads them
+// ---------------------------------------------------------------------
+
+/// The text before the first `#`, trimmed.
+fn uncomment(raw: str) -> str {
+    match raw.index_of("#") {
+        Some(i) -> raw.substr(0, i).trim()
+        None -> raw.trim()
+    }
+}
+
+fn split_eq(line: str) -> Option[(str, str)] {
+    match line.index_of("=") {
+        Some(i) -> Some((line.substr(0, i), line.substr(i + 1, line.len() - i - 1)))
+        None -> None
+    }
+}
+
+/// `trim_matches('"')`.
+fn trim_quotes(s: str) -> str {
+    var a = 0
+    var b = s.len()
+    let bs = s.to_bytes()
+    while a < b and bs.at(a) == 34 {
+        a += 1
+    }
+    while b > a and bs.at(b - 1) == 34 {
+        b -= 1
+    }
+    bs.slice(a, b).to_str()
+}
+
+/// `trim_end_matches(']')`.
+fn trim_end_brackets(s: str) -> str {
+    var b = s.len()
+    let bs = s.to_bytes()
+    while b > 0 and bs.at(b - 1) == 93 {
+        b -= 1
+    }
+    bs.slice(0, b).to_str()
+}
+
+fn manifest_text(dir: str) -> Option[str] {
+    let p = join(dir, "grasm.toml")
+    if not file_exists(p) {
+        return None
+    }
+    read_text(p)
+}
+
+/// The directory holding the nearest `grasm.toml` at or above `dir`, and
+/// its text; ("\0", "") when there is none.
+fn find_manifest(dir: str) -> (str, str) {
+    var here = dir
+    while here != "\0" {
+        match manifest_text(here) {
+            Some(text) -> return (here, text)
+            None -> ()
+        }
+        here = parent(here)
+    }
+    ("\0", "")
+}
+
+/// A package's dependencies that have a path: name -> directory.
+fn package_dependencies(dir: str) -> Map[str, str] {
+    var out: Map[str, str] = map()
+    let (root, text) = find_manifest(dir)
+    if root == "\0" {
+        return out
+    }
+    var current = "\0"
+    for raw in text.lines() {
+        let line = uncomment(raw)
+        if line.starts_with("[") {
+            let name = trim_end_brackets(line.substr(1, line.len() - 1)).trim()
+            if name.starts_with("dependencies.") {
+                current = name.substr(13, name.len() - 13).trim()
+            } else {
+                current = "\0"
+            }
+            continue
+        }
+        if current == "\0" {
+            continue
+        }
+        match split_eq(line) {
+            Some((k, v)) -> {
+                if k.trim() == "path" {
+                    out.set(current, join(root, trim_quotes(v.trim())))
+                }
+            }
+            None -> ()
+        }
+    }
+    out
+}
+
+/// Every dependency name a package declares, path or not, in order.
+fn dependency_names(dir: str) -> [str] {
+    var out: [str] = []
+    let (root, text) = find_manifest(dir)
+    if root == "\0" {
+        return out
+    }
+    for raw in text.lines() {
+        let line = uncomment(raw)
+        if line.starts_with("[") {
+            let name = trim_end_brackets(line.substr(1, line.len() - 1)).trim()
+            if name.starts_with("dependencies.") {
+                out.push(name.substr(13, name.len() - 13).trim())
+            }
+        }
+    }
+    out
+}
+
+/// The package holding `dir`, if its `[package]` says `runtime = true`;
+/// "\0" otherwise.
+fn runtime_package(dir: str) -> str {
+    let (root, text) = find_manifest(dir)
+    if root == "\0" {
+        return "\0"
+    }
+    var in_package = false
+    var name = ""
+    var runtime = false
+    for raw in text.lines() {
+        let line = uncomment(raw)
+        if line.starts_with("[") {
+            in_package = trim_end_brackets(line.substr(1, line.len() - 1)).trim() == "package"
+            continue
+        }
+        if in_package {
+            match split_eq(line) {
+                Some((k, v)) -> {
+                    let key = k.trim()
+                    if key == "runtime" {
+                        runtime = v.trim() == "true"
+                    } else if key == "name" {
+                        name = trim_quotes(v.trim())
+                    }
+                }
+                None -> ()
+            }
+        }
+    }
+    if runtime {
+        name
+    } else {
+        "\0"
+    }
+}
+
+/// A package's entry file: its declared `entry`, or `src/main.gr`.
+fn package_entry(dir: str) -> str {
+    var entry = "src/main.gr"
+    match manifest_text(dir) {
+        Some(text) -> {
+            for raw in text.lines() {
+                let l = uncomment(raw)
+                match split_eq(l) {
+                    Some((k, v)) -> {
+                        if k.trim() == "entry" {
+                            entry = trim_quotes(v.trim())
+                            break
+                        }
+                    }
+                    None -> ()
+                }
+            }
+        }
+        None -> ()
+    }
+    if entry.starts_with("/") or has_parent_component(entry) {
+        return join(dir, "src/main.gr")
+    }
+    join(dir, entry)
+}
+
+fn has_parent_component(p: str) -> bool {
+    for seg in p.split("/") {
+        if seg == ".." {
+            return true
+        }
+    }
+    false
+}
+
+/// A module path inside a package, following that package's own
+/// dependencies; "\0" when there is none.
+fn resolve_in_package(pkg_dir: str, rest: str, depth: i64) -> str {
+    let entry = package_entry(pkg_dir)
+    if rest == "" {
+        return entry
+    }
+    if depth > MAX_PACKAGE_DEPTH {
+        return "\0"
+    }
+    let src_dir = parent(entry)
+    if src_dir == "\0" {
+        return "\0"
+    }
+    let direct = join(src_dir, dotted_to_path(rest) + ".gr")
+    if file_exists(direct) {
+        return direct
+    }
+    let head = first_seg(rest)
+    let tail = after_first_seg(rest)
+    match package_dependencies(src_dir).get(head) {
+        Some(d) -> return resolve_in_package(d, tail, depth + 1)
+        None -> ()
+    }
+    direct
+}
+
+/// Every package reachable from `dir`, named by the prefix its modules
+/// carry, best first by (length, prefix) so each is reached first by its
+/// shortest name. Returns whether the walk stopped at the depth backstop.
+fn collect_packages(prefix: str, dir: str, resolved: Map[str, str], inout out: Map[str, str], inout out_keys: [str], depth: i64) -> bool {
+    var expanded: Map[str, bool] = map()
+    var truncated = false
+    // The queue, kept sorted by (length, prefix, dir, depth).
+    var q_len: [i64] = [prefix.len()]
+    var q_pre: [str] = [prefix]
+    var q_dir: [str] = [dir]
+    var q_dep: [i64] = [depth]
+    while q_len.len() > 0 {
+        // Take the least.
+        var best = 0
+        for i in 1..q_len.len() {
+            if queue_less(q_len[i], q_pre[i], q_dir[i], q_dep[i], q_len[best], q_pre[best], q_dir[best], q_dep[best]) {
+                best = i
+            }
+        }
+        let pre = q_pre[best]
+        let d = q_dir[best]
+        let dep = q_dep[best]
+        q_len.remove(best)
+        q_pre.remove(best)
+        q_dir.remove(best)
+        q_dep.remove(best)
+        if dep > MAX_PACKAGE_DEPTH {
+            truncated = true
+            continue
+        }
+        if out.has(pre) {
+            continue
+        }
+        out.set(pre, d)
+        out_keys.push(pre)
+        let rd = real_dir(d)
+        if expanded.has(rd) {
+            continue
+        }
+        expanded.set(rd, true)
+        var src_dir = parent(package_entry(d))
+        if src_dir == "\0" {
+            src_dir = d
+        }
+        var subs = package_dependencies(src_dir)
+        for name in dependency_names(src_dir) {
+            if not subs.has(name) {
+                match resolved.get(name) {
+                    Some(rd2) -> subs.set(name, rd2)
+                    None -> ()
+                }
+            }
+        }
+        for name in subs.keys() {
+            let child = pre + "." + name
+            let sub = subs.get(name) ?? ""
+            // A BTreeSet: an equal element already queued is not added twice.
+            var dup = false
+            for i in 0..q_pre.len() {
+                if q_pre[i] == child and q_dir[i] == sub and q_dep[i] == dep + 1 {
+                    dup = true
+                }
+            }
+            if not dup {
+                q_len.push(child.len())
+                q_pre.push(child)
+                q_dir.push(sub)
+                q_dep.push(dep + 1)
+            }
+        }
+    }
+    truncated
+}
+
+fn queue_less(l1: i64, p1: str, d1: str, e1: i64, l2: i64, p2: str, d2: str, e2: i64) -> bool {
+    if l1 != l2 {
+        return l1 < l2
+    }
+    if p1 != p2 {
+        return p1 < p2
+    }
+    if d1 != d2 {
+        return d1 < d2
+    }
+    e1 < e2
+}
+
+/// The longest prefix in `keys` that `name` is or is under, or "\0".
+fn longest_prefix(keys: [str], name: str) -> str {
+    var best = "\0"
+    for p in keys {
+        if name == p or name.starts_with(p + ".") {
+            if best == "\0" or p.len() > best.len() {
+                best = p
+            }
+        }
+    }
+    best
+}
+
+// ---------------------------------------------------------------------
+// The package graph, as `grasm` resolves it before loading
+// (crates/grasm/src/main.rs `registry_packages`, grasm_pkg `resolve`)
+// ---------------------------------------------------------------------
+
+/// A manifest as grasm_pkg reads it: its package name, its dependencies
+/// (sorted by name) with their paths ("\0" for none) and version
+/// requirements ("\0" for none), and its version; or why it is refused.
+type Manifest = {
+    ok: bool,
+    why: str,
+    name: str,
+    version: str,
+    dep_names: [str],
+    dep_paths: [str],
+    dep_reqs: [str],
+    /// The capability ceiling, when the manifest declares one.
+    has_caps: bool,
+    caps: [str],
+    entry: str,
+}
+
+fn bad_manifest(why: str) -> Manifest {
+    Manifest{ ok: false, why: why, name: "", version: "", dep_names: [], dep_paths: [], dep_reqs: [], has_caps: false, caps: [], entry: "" }
+}
+
+fn version_ok(v: str) -> bool {
+    let parts = v.split(".")
+    if parts.len() != 3 {
+        return false
+    }
+    for p in parts {
+        if p == "" {
+            return false
+        }
+        for c in p.chars() {
+            if c < "0" or c > "9" {
+                return false
+            }
+        }
+    }
+    true
+}
+
+fn version_nums(v: str) -> [i64] {
+    var out: [i64] = []
+    for p in v.split(".") {
+        out.push(p.parse_int() ?? 0)
+    }
+    out
+}
+
+/// Whether a requirement (`=1.2.3`, `^1.2.3`, `1.2.3`) is well formed.
+fn req_version(r: str) -> str {
+    let t = r.trim()
+    if t.starts_with("=") {
+        return t.substr(1, t.len() - 1).trim()
+    }
+    if t.starts_with("^") {
+        return t.substr(1, t.len() - 1).trim()
+    }
+    t
+}
+
+fn req_matches(r: str, v: str) -> bool {
+    let exact = r.trim().starts_with("=")
+    let want = version_nums(req_version(r))
+    let got = version_nums(v)
+    if exact {
+        return want[0] == got[0] and want[1] == got[1] and want[2] == got[2]
+    }
+    // got < want?
+    if got[0] != want[0] {
+        if got[0] < want[0] {
+            return false
+        }
+    } else if got[1] != want[1] {
+        if got[1] < want[1] {
+            return false
+        }
+    } else if got[2] < want[2] {
+        return false
+    }
+    if want[0] > 0 {
+        got[0] == want[0]
+    } else if want[1] > 0 {
+        got[0] == 0 and got[1] == want[1]
+    } else {
+        got[0] == 0 and got[1] == 0 and got[2] == want[2]
+    }
+}
+
+fn is_identifier(name: str) -> bool {
+    let kws = ["and", "as", "bench", "break", "const", "continue", "effect", "else", "extern", "fail", "false", "fn", "for", "handled_by", "if", "import", "in", "inout", "let", "match", "not", "or", "own", "parallel", "pub", "ref", "region", "return", "spawn", "test", "true", "try", "type", "unsafe", "var", "while", "with"]
+    if name == "" {
+        return false
+    }
+    let b = name.to_bytes()
+    let c0 = b.at(0)
+    if not ((c0 >= 65 and c0 <= 90) or (c0 >= 97 and c0 <= 122) or c0 == 95) {
+        return false
+    }
+    for i in 1..b.len() {
+        let c = b.at(i)
+        if not ((c >= 65 and c <= 90) or (c >= 97 and c <= 122) or (c >= 48 and c <= 57) or c == 95) {
+            return false
+        }
+    }
+    not kws.contains(name)
+}
+
+/// `Manifest::load`: the manifest in `dir`, read through packages/toml and
+/// checked as grasm_pkg checks it.
+fn load_manifest(dir: str) -> Manifest {
+    let path = join(dir, "grasm.toml")
+    let text = match read_text(path) {
+        Some(t) -> t
+        None -> return bad_manifest("cannot read {path}")
+    }
+    let doc = toml.parse(text)
+    if not doc.ok {
+        return bad_manifest("{tidy(path)}: line {doc.line}: {doc.why}")
+    }
+    var has_package = false
+    for k in doc.keys {
+        if k.starts_with("package.") {
+            has_package = true
+        }
+    }
+    if not has_package {
+        return bad_manifest("{tidy(path)}: manifest is missing a [package] table")
+    }
+    let name = toml.text_of(doc, "package.name", "\0")
+    if name == "\0" {
+        return bad_manifest("{tidy(path)}: [package] is missing `name`")
+    }
+    if name == "" {
+        return bad_manifest("{tidy(path)}: [package] name must not be empty")
+    }
+    let version = toml.text_of(doc, "package.version", "\0")
+    if version == "\0" {
+        return bad_manifest("{tidy(path)}: [package] is missing `version`")
+    }
+    if not version_ok(version) {
+        return bad_manifest("{tidy(path)}: version `{version}` is not `MAJOR.MINOR.PATCH` (e.g. `0.1.0`)")
+    }
+    var has_caps = false
+    var caps: [str] = []
+    match toml.get(doc, "package.capabilities") {
+        Some(v) -> {
+            if not all_texts(v) {
+                return bad_manifest("{tidy(path)}: `capabilities` must be an array of strings")
+            }
+            has_caps = true
+            caps = toml.texts_of(doc, "package.capabilities")
+        }
+        None -> ()
+    }
+    match toml.get(doc, "package.links") {
+        Some(v) -> {
+            if not all_texts(v) {
+                return bad_manifest("{tidy(path)}: `links` must be an array of strings")
+            }
+            for lib in toml.texts_of(doc, "package.links") {
+                if not link_name_ok(lib) {
+                    return bad_manifest("{tidy(path)}: `links` entry `{lib}` is not a library name")
+                }
+            }
+        }
+        None -> ()
+    }
+    let entry = toml.text_of(doc, "package.entry", "src/main.gr")
+    if entry.starts_with("/") {
+        return bad_manifest("{tidy(path)}: `entry` must be a path inside the package: `{entry}` is absolute")
+    }
+    if has_parent_component(entry) {
+        return bad_manifest("{tidy(path)}: `entry` must be a path inside the package: `{entry}` leaves it with `..`")
+    }
+    if not entry.to_lower().ends_with(".gr") {
+        return bad_manifest("{tidy(path)}: `entry` must name a `.gr` file: `{entry}` is not one")
+    }
+    match toml.get(doc, "package.runtime") {
+        Some(v) -> {
+            if toml.kind(v) != "bool" {
+                return bad_manifest("{tidy(path)}: `runtime` must be `true` or `false`")
+            }
+        }
+        None -> ()
+    }
+    let keys = ["name", "version", "capabilities", "entry", "links", "runtime"]
+    for k in toml.keys_under(doc, "package") {
+        if not keys.contains(k) {
+            return bad_manifest("{tidy(path)}: `[package]` has no key `{k}`")
+        }
+    }
+    for k in doc.keys {
+        if not k.contains(".") {
+            return bad_manifest("{tidy(path)}: `{k}` is written above the first table header")
+        }
+        let head = first_seg(k)
+        if head != "package" and head != "dependencies" {
+            return bad_manifest("{tidy(path)}: `[{head}]` is not a table this manifest has")
+        }
+    }
+    var dep_names = toml.keys_under(doc, "dependencies")
+    dep_names.sort()
+    var paths: [str] = []
+    var reqs: [str] = []
+    for d in dep_names {
+        for k in toml.keys_under(doc, "dependencies.{d}") {
+            if k != "path" and k != "version" {
+                return bad_manifest("{tidy(path)}: dependency `{d}` has no key `{k}`")
+            }
+        }
+        let p = toml.text_of(doc, "dependencies.{d}.path", "\0")
+        let r = toml.text_of(doc, "dependencies.{d}.version", "\0")
+        if r != "\0" and not version_ok(req_version(r)) {
+            return bad_manifest("{tidy(path)}: dependency `{d}`: version `{req_version(r)}` is not `MAJOR.MINOR.PATCH` (e.g. `0.1.0`)")
+        }
+        if p == "\0" and r == "\0" {
+            return bad_manifest("{tidy(path)}: dependency `{d}` needs a `path` or a `version`")
+        }
+        paths.push(p)
+        reqs.push(r)
+    }
+    if not is_identifier(name) {
+        return bad_manifest("{tidy(path)}: `{name}` is not a usable package name")
+    }
+    Manifest{ ok: true, why: "", name: name, version: version, dep_names: dep_names, dep_paths: paths, dep_reqs: reqs, has_caps: has_caps, caps: caps, entry: entry }
+}
+
+/// Whether a value is an array of strings.
+fn all_texts(v: ref TomlValue) -> bool {
+    match v {
+        Array(items) -> {
+            for it in items {
+                if toml.kind(it) != "string" {
+                    return false
+                }
+            }
+            true
+        }
+        _ -> false
+    }
+}
+
+/// A library name a link line may take: letters, digits, `_`, `-`, `.` and
+/// `+`, starting with a letter, a digit or `_`.
+fn link_name_ok(name: str) -> bool {
+    if name == "" {
+        return false
+    }
+    let b = name.to_bytes()
+    for i in 0..b.len() {
+        let c = b.at(i)
+        let alnum = (c >= 48 and c <= 57) or (c >= 65 and c <= 90) or (c >= 97 and c <= 122)
+        if i == 0 and not (alnum or c == 95) {
+            return false
+        }
+        if not (alnum or c == 95 or c == 45 or c == 46 or c == 43) {
+            return false
+        }
+    }
+    true
+}
+
+/// The packages `grasm_pkg::resolve` reaches from `root_dir`, in its order,
+/// as (name, directory); `why` set when resolution fails.
+type Resolution = { ok: bool, why: str, names: [str], dirs: [str], mfs: [Manifest] }
+
+pub fn resolve_graph(root_dir: str) -> Resolution {
+    var r = Resolution{ ok: true, why: "", names: [], dirs: [], mfs: [] }
+    let root = load_manifest(root_dir)
+    if not root.ok {
+        r.ok = false
+        r.why = root.why
+        return r
+    }
+    let reg = discover_registry(root_dir)
+    let (sok, swhy, sel_names, sel_versions) = select_versions(root_dir, reg)
+    if not sok {
+        r.ok = false
+        r.why = swhy
+        return r
+    }
+    var sel: Map[str, str] = map()
+    for i in 0..sel_names.len() {
+        sel.set(sel_names[i], sel_versions[i])
+    }
+    var visiting: [str] = []
+    var done_names: [str] = []
+    var done_dirs: [str] = []
+    visit(root_dir, reg, sel, r, visiting, done_names, done_dirs)
+    r
+}
+
+// ---------------------------------------------------------------------
+// The registry (grasm_pkg `Registry`, `select_versions`): a directory of
+// `name/version/` packages, found from `GRASM_REGISTRY` or as the nearest
+// `.grasm/registry` above the package; each name gets the lowest version
+// at or above the highest floor anyone in the graph states.
+// ---------------------------------------------------------------------
+
+/// The registry's root, or "\0" when there is none.
+fn discover_registry(from: str) -> str {
+    match env("GRASM_REGISTRY") {
+        Some(d) -> return d
+        None -> ()
+    }
+    var start = from
+    if not from.starts_with("/") {
+        match env("PWD") {
+            Some(cwd) -> start = tidy(join(cwd, from))
+            None -> ()
+        }
+    }
+    var here = start
+    while here != "\0" {
+        let cand = join(join(here, ".grasm"), "registry")
+        match list_dir(cand) {
+            Ok(_) -> return cand
+            Err(_) -> ()
+        }
+        here = parent(here)
+    }
+    "\0"
+}
+
+fn version_less(a: str, b: str) -> bool {
+    let x = version_nums(a)
+    let y = version_nums(b)
+    for i in 0..3 {
+        if x[i] != y[i] {
+            return x[i] < y[i]
+        }
+    }
+    false
+}
+
+/// Every version of `name` the registry holds.
+fn registry_versions(reg: str, name: str) -> [str] {
+    var out: [str] = []
+    match list_dir(join(reg, name)) {
+        Ok(entries) -> {
+            for v in entries {
+                if version_ok(v) and file_exists(join(join(join(reg, name), v), "grasm.toml")) {
+                    out.push(v)
+                }
+            }
+        }
+        Err(_) -> ()
+    }
+    out
+}
+
+/// Minimal version selection: (ok, why, names, versions).
+fn select_versions(root_dir: str, reg: str) -> (bool, str, [str], [str]) {
+    var floor_names: [str] = []
+    var floors: [str] = []
+    var sel_names: [str] = []
+    var sel: [str] = []
+    for _ in 0..1000 {
+        let (cok, cwhy, req_on, req_req) = collect_requirements(root_dir, reg, sel_names, sel)
+        if not cok {
+            return (false, cwhy, [], [])
+        }
+        var raised = false
+        for i in 0..req_on.len() {
+            let fl = req_version(req_req[i])
+            var at = -1
+            for j in 0..floor_names.len() {
+                if floor_names[j] == req_on[i] {
+                    at = j
+                }
+            }
+            if at < 0 {
+                floor_names.push(req_on[i])
+                floors.push(fl)
+                at = floor_names.len() - 1
+            } else if version_less(floors[at], fl) {
+                floors[at] = fl
+            }
+            var cur = fl
+            for j in 0..sel_names.len() {
+                if sel_names[j] == req_on[i] {
+                    cur = sel[j]
+                }
+            }
+            if version_less(cur, floors[at]) {
+                raised = true
+            }
+        }
+        // In name order, as the floors' map holds them.
+        var sorted_names = floor_names
+        sorted_names.sort()
+        var order: [i64] = []
+        for nm in sorted_names {
+            for i in 0..floor_names.len() {
+                if floor_names[i] == nm {
+                    order.push(i)
+                }
+            }
+        }
+        var next_names: [str] = []
+        var next: [str] = []
+        for i in order {
+            if reg == "\0" {
+                return (false, "dependency `{floor_names[i]}` has no path and there is no registry", [], [])
+            }
+            var pick = "\0"
+            for v in registry_versions(reg, floor_names[i]) {
+                if not version_less(v, floors[i]) and (pick == "\0" or version_less(v, pick)) {
+                    pick = v
+                }
+            }
+            if pick == "\0" {
+                return (false, "no version of `{floor_names[i]}` at or above {floors[i]}", [], [])
+            }
+            next_names.push(floor_names[i])
+            next.push(pick)
+        }
+        if next_names == sel_names and next == sel and not raised {
+            for i in 0..req_on.len() {
+                for j in 0..sel_names.len() {
+                    if sel_names[j] == req_on[i] and not req_matches(req_req[i], sel[j]) {
+                        return (false, "no version of `{req_on[i]}` satisfies every requirement", [], [])
+                    }
+                }
+            }
+            return (true, "", sel_names, sel)
+        }
+        sel_names = next_names
+        sel = next
+    }
+    (false, "version selection did not settle", [], [])
+}
+
+/// Every registry requirement stated in the graph, given the versions
+/// selected so far: (ok, why, on, requirement).
+fn collect_requirements(root_dir: str, reg: str, sel_names: [str], sel: [str]) -> (bool, str, [str], [str]) {
+    var on: [str] = []
+    var reqs: [str] = []
+    var seen: Map[str, bool] = map()
+    var queue: [str] = [root_dir]
+    while queue.len() > 0 {
+        let dir = queue.pop() ?? ""
+        let key = real_dir(dir)
+        if seen.has(key) {
+            continue
+        }
+        seen.set(key, true)
+        let m = load_manifest(dir)
+        if not m.ok {
+            return (false, m.why, [], [])
+        }
+        for i in 0..m.dep_names.len() {
+            if m.dep_paths[i] != "\0" {
+                let d = join(dir, m.dep_paths[i])
+                if file_exists(join(d, "grasm.toml")) {
+                    let dm = load_manifest(d)
+                    if not dm.ok {
+                        return (false, dm.why, [], [])
+                    }
+                    queue.push(d)
+                }
+            } else {
+                on.push(m.dep_names[i])
+                reqs.push(m.dep_reqs[i])
+                if reg != "\0" {
+                    for j in 0..sel_names.len() {
+                        if sel_names[j] == m.dep_names[i] {
+                            let d = join(join(reg, m.dep_names[i]), sel[j])
+                            if file_exists(join(d, "grasm.toml")) {
+                                let dm = load_manifest(d)
+                                if not dm.ok {
+                                    return (false, dm.why, [], [])
+                                }
+                                queue.push(d)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    (true, "", on, reqs)
+}
+
+fn visit(dir: str, reg: str, sel: Map[str, str], inout r: Resolution, inout visiting: [str], inout done_names: [str], inout done_dirs: [str]) {
+    if not r.ok {
+        return
+    }
+    let m = load_manifest(dir)
+    if not m.ok {
+        r.ok = false
+        r.why = m.why
+        return
+    }
+    let here = real_dir(dir)
+    for i in 0..done_names.len() {
+        if done_names[i] == m.name {
+            if done_dirs[i] != here {
+                r.ok = false
+                r.why = "package `{m.name}` resolves to two different directories"
+            }
+            return
+        }
+    }
+    if visiting.contains(m.name) {
+        r.ok = false
+        r.why = "dependency cycle"
+        return
+    }
+    visiting.push(m.name)
+    for i in 0..m.dep_names.len() {
+        var dep_dir = ""
+        if m.dep_paths[i] != "\0" {
+            dep_dir = join(dir, m.dep_paths[i])
+        } else {
+            let v = sel.get(m.dep_names[i]) ?? "\0"
+            if reg == "\0" or v == "\0" {
+                r.ok = false
+                r.why = "dependency `{m.dep_names[i]}` has no path and no version was selected for it"
+                return
+            }
+            dep_dir = join(join(reg, m.dep_names[i]), v)
+        }
+        if not file_exists(join(dep_dir, "grasm.toml")) {
+            r.ok = false
+            r.why = "dependency `{m.dep_names[i]}` of `{m.name}`: no grasm.toml at {tidy(dep_dir)}"
+            return
+        }
+        let dm = load_manifest(dep_dir)
+        if not dm.ok {
+            r.ok = false
+            r.why = dm.why
+            return
+        }
+        if dm.name != m.dep_names[i] {
+            r.ok = false
+            r.why = "dependency `{m.dep_names[i]}` of `{m.name}` resolves to a package named `{dm.name}`"
+            return
+        }
+        if m.dep_reqs[i] != "\0" and not req_matches(m.dep_reqs[i], dm.version) {
+            r.ok = false
+            r.why = "dependency `{m.dep_names[i]}` of `{m.name}`: requires {m.dep_reqs[i]}, but {dep_dir} is {dm.version}"
+            return
+        }
+        visit(dep_dir, reg, sel, r, visiting, done_names, done_dirs)
+        if not r.ok {
+            return
+        }
+    }
+    visiting.pop()
+    done_names.push(m.name)
+    done_dirs.push(here)
+    r.names.push(m.name)
+    r.dirs.push(dir)
+    r.mfs.push(m)
+}
+
+/// `registry_packages`: every package in the entry package's graph but the
+/// entry's own, by name. `fatal` is set when the toolchain stops here.
+type Graph = { fatal: str, names: [str], dirs: [str] }
+
+fn registry_packages(entry: str) -> Graph {
+    var here = parent(entry)
+    var pkg_dir = "\0"
+    while here != "\0" {
+        if file_exists(join(here, "grasm.toml")) {
+            pkg_dir = here
+            break
+        }
+        here = parent(here)
+    }
+    if pkg_dir == "\0" {
+        return Graph{ fatal: "", names: [], dirs: [] }
+    }
+    let root = load_manifest(pkg_dir)
+    if not root.ok {
+        return Graph{ fatal: root.why, names: [], dirs: [] }
+    }
+    var all_paths = true
+    for p in root.dep_paths {
+        if p == "\0" {
+            all_paths = false
+        }
+    }
+    let res = resolve_graph(pkg_dir)
+    if not res.ok {
+        if all_paths {
+            return Graph{ fatal: "", names: [], dirs: [] }
+        }
+        return Graph{ fatal: res.why, names: [], dirs: [] }
+    }
+    var g = Graph{ fatal: "", names: [], dirs: [] }
+    let me = real_dir(pkg_dir)
+    for i in 0..res.names.len() {
+        if real_dir(res.dirs[i]) != me {
+            g.names.push(res.names[i])
+            g.dirs.push(res.dirs[i])
+        }
+    }
+    g
+}
+
+// ---------------------------------------------------------------------
+// Loading
+// ---------------------------------------------------------------------
+
+/// What resolving a module name needs: the package prefixes and their
+/// directories, the canonical name of each package, and the entry's own
+/// declarations.
+type Ctx = {
+    entry_src_dir: str,
+    entry_src: str,
+    deps: Map[str, str],
+    resolved: Map[str, str],
+    prefix_keys: [str],
+    prefix_dirs: Map[str, str],
+    canon: Map[str, str],
+    entry_declares: [str],
+    dep_names: [str],
+    found: Map[str, str],
+    runtime: Map[str, str],
+}
+
+/// The module name an import written in `importer` as `written` resolves
+/// to, or "\0" to keep the one derived from the prefix.
+fn canonical(cx: Ctx, importer: str, written: str) -> str {
+    let p = longest_prefix(cx.prefix_keys, importer)
+    var pkg_dir = cx.entry_src_dir
+    if p != "\0" {
+        let d = cx.prefix_dirs.get(p) ?? ""
+        let par = parent(package_entry(d))
+        if par == "\0" {
+            pkg_dir = d
+        } else {
+            pkg_dir = par
+        }
+    }
+    if file_exists(join(pkg_dir, dotted_to_path(written) + ".gr")) {
+        return "\0"
+    }
+    let root = first_seg(written)
+    let subs = package_dependencies(pkg_dir)
+    var dir = "\0"
+    match subs.get(root) {
+        Some(d) -> dir = d
+        None -> {
+            if dependency_names(pkg_dir).contains(root) {
+                match cx.resolved.get(root) {
+                    Some(d) -> dir = d
+                    None -> ()
+                }
+            }
+        }
+    }
+    if dir == "\0" {
+        return "\0"
+    }
+    let want = match cx.canon.get(real_dir(dir)) {
+        Some(w) -> w
+        None -> return "\0"
+    }
+    match written.index_of(".") {
+        Some(i) -> want + "." + written.substr(i + 1, written.len() - i - 1)
+        None -> want
+    }
+}
+
+fn note(inout cx: Ctx, name: str, path: str) {
+    cx.found.set(name, tidy(path))
+    let par = parent(path)
+    if par != "\0" {
+        let pkg = runtime_package(par)
+        if pkg != "\0" {
+            cx.runtime.set(name, pkg)
+        }
+    }
+}
+
+/// The source of module `name`, or "\0" when it cannot be found.
+fn provide(inout cx: Ctx, name: str) -> str {
+    if name == "main" {
+        return cx.entry_src
+    }
+    let p = longest_prefix(cx.prefix_keys, name)
+    if p != "\0" {
+        let d = cx.prefix_dirs.get(p) ?? ""
+        var rest = name.substr(p.len(), name.len() - p.len())
+        while rest.starts_with(".") {
+            rest = rest.substr(1, rest.len() - 1)
+        }
+        let path = resolve_in_package(d, rest, 0)
+        if path == "\0" {
+            return "\0"
+        }
+        match read_text(path) {
+            Some(src) -> {
+                note(cx, name, path)
+                return src
+            }
+            None -> return "\0"
+        }
+    }
+    let rel = dotted_to_path(name) + ".gr"
+    let sibling = join(cx.entry_src_dir, rel)
+    match read_text(sibling) {
+        Some(src) -> {
+            note(cx, name, sibling)
+            return src
+        }
+        None -> ()
+    }
+    let root = first_seg(name)
+    if not cx.entry_declares.contains(root) {
+        return "\0"
+    }
+    let dep_dir = match cx.deps.get(root) {
+        Some(d) -> d
+        None -> return "\0"
+    }
+    let rest = after_first_seg(name)
+    let path = resolve_in_package(dep_dir, rest, 0)
+    if path == "\0" {
+        return "\0"
+    }
+    match read_text(path) {
+        Some(src) -> {
+            note(cx, name, path)
+            src
+        }
+        None -> "\0"
+    }
+}
+
+fn empty_loaded(fatal: str) -> Loaded {
+    Loaded{ names: [], aliases: [], paths: [], srcs: [], bases: [], imp_alias: [], imp_full: [], mods: [], diags: [], runtime: map(), deps: [], fatal: fatal }
+}
+
+/// Loads the program whose entry file is `entry_path`.
+pub fn load(entry_path: str) -> Loaded {
+    let g = registry_packages(entry_path)
+    if g.fatal != "" {
+        return empty_loaded(g.fatal)
+    }
+    var resolved: Map[str, str] = map()
+    for i in 0..g.names.len() {
+        resolved.set(g.names[i], g.dirs[i])
+    }
+    load_with(entry_path, resolved)
+}
+
+/// `load_from_disk_with`: the program from `entry_path`, given the package
+/// directories already resolved, by name.
+pub fn load_with(entry_path: str, resolved: Map[str, str]) -> Loaded {
+    var entry_src_dir = parent(entry_path)
+    if entry_src_dir == "\0" {
+        entry_src_dir = ""
+    }
+    let entry_display = tidy(entry_path)
+    let entry_bytes = match read_bytes(entry_path) {
+        Ok(b) -> b
+        Err(e) -> return empty_loaded("cannot read `{entry_display}`: {e}")
+    }
+    if not utf8_ok(entry_bytes) {
+        return empty_loaded("cannot read `{entry_display}`: stream did not contain valid UTF-8")
+    }
+    let entry_src = entry_bytes.to_str()
+    // A source bundle carries its own modules; there is nothing on disk to
+    // look for.
+    if entry_src.trim_start().starts_with("//!module ") {
+        return load_bundle(entry_src)
+    }
+    var deps = package_dependencies(entry_src_dir)
+    for name in resolved.keys() {
+        deps.set(name, resolved.get(name) ?? "")
+    }
+    var all_prefixes: Map[str, str] = map()
+    var all_keys: [str] = []
+    var truncated = false
+    let declared = dependency_names(entry_src_dir)
+    for name in declared {
+        match deps.get(name) {
+            Some(d) -> {
+                if collect_packages(name, d, resolved, all_prefixes, all_keys, 0) {
+                    truncated = true
+                }
+            }
+            None -> ()
+        }
+    }
+    // One name per package: the shortest prefix, then the least.
+    var sorted_keys = all_keys
+    sort_prefixes(sorted_keys)
+    var canon: Map[str, str] = map()
+    for p in sorted_keys {
+        let key = real_dir(all_prefixes.get(p) ?? "")
+        if not canon.has(key) {
+            canon.set(key, p)
+        }
+    }
+    var dep_names: [str] = []
+    for k in canon.keys() {
+        let v = canon.get(k) ?? ""
+        if not dep_names.contains(v) {
+            dep_names.push(v)
+        }
+    }
+    var cx = Ctx{ entry_src_dir: entry_src_dir, entry_src: entry_src, deps: deps, resolved: resolved, prefix_keys: all_keys, prefix_dirs: all_prefixes, canon: canon, entry_declares: declared, dep_names: dep_names, found: map(), runtime: map() }
+    let ep = parent(entry_path)
+    if ep != "\0" {
+        let pkg = runtime_package(ep)
+        if pkg != "\0" {
+            cx.runtime.set("main", pkg)
+        }
+    }
+    let entry_alias = file_stem(entry_path)
+    var out = empty_loaded("")
+    var loaded: Map[str, bool] = map()
+    var q_name: [str] = ["main"]
+    var q_disp: [str] = [entry_display]
+    var base = 0
+    while q_name.len() > 0 {
+        let name = q_name.pop() ?? ""
+        let display = q_disp.pop() ?? ""
+        if loaded.has(name) {
+            continue
+        }
+        loaded.set(name, true)
+        let src = provide(cx, name)
+        if src == "\0" {
+            out.diags.push("cannot load module `{name}`")
+            continue
+        }
+        let sb = src.to_bytes()
+        let lx = lex.lex(sb, true)
+        let p = parse.parse(sb, lx)
+        let c = cst.build(p)
+        let m = ast.build(c, sb, p.wide_ints, lx.doc_start, lx.doc_end, lx.doc_text)
+        for i in 0..p.d_msg.len() {
+            out.diags.push(p.d_msg[i])
+        }
+        let owner = longest_prefix(dep_names, name)
+        var ia: [str] = []
+        var ifull: [str] = []
+        for d in m.decls {
+            if m.a.k[d] != ast.D_IMPORT {
+                continue
+            }
+            let path = m.a.pool[m.a.off[d]]
+            let sv = m.a.pool[m.a.off[path]]
+            let segs = m.a.pool.slice(m.a.off[sv], m.a.off[sv] + m.a.n[sv])
+            var parts: [str] = []
+            for s in segs {
+                parts.push(m.a.t[s])
+            }
+            let written = parts.join(".")
+            var alias = ""
+            if parts.len() > 0 {
+                alias = parts[parts.len() - 1]
+            }
+            var full = written
+            if owner != "\0" {
+                full = owner + "." + written
+            }
+            let cn = canonical(cx, name, written)
+            if cn != "\0" {
+                full = cn
+            }
+            if full == entry_alias {
+                full = "main"
+            }
+            var dup = -1
+            for j in 0..ia.len() {
+                if ia[j] == alias {
+                    dup = j
+                }
+            }
+            if dup >= 0 {
+                out.diags.push("duplicate import alias `{alias}` in module `{name}`")
+                ifull[dup] = full
+            } else {
+                ia.push(alias)
+                ifull.push(full)
+            }
+            q_name.push(full)
+            q_disp.push(dotted_to_path(full) + ".gr")
+        }
+        out.names.push(name)
+        out.aliases.push(last_seg(name))
+        out.paths.push(cx.found.get(name) ?? display)
+        out.srcs.push(sb)
+        out.bases.push(base)
+        out.imp_alias.push(ia)
+        out.imp_full.push(ifull)
+        out.mods.push(m)
+        base += sb.len() + 1
+    }
+    out.runtime = cx.runtime
+    out.deps = dep_names
+    out
+}
+
+/// A source bundle (loader.rs `load_from_source_bundle`): every module of a
+/// program in one file, each after a `//!module NAME` line, the entry
+/// first. An import names a module of the bundle by its qualified name, its
+/// written one, or the one module whose name ends with it.
+fn load_bundle(src: str) -> Loaded {
+    var names: [str] = []
+    var bodies: [str] = []
+    var cur = "\0"
+    var body = str_builder()
+    for line in src.lines() {
+        if line.starts_with("//!module ") {
+            if cur != "\0" {
+                names.push(cur)
+                bodies.push(body.to_str())
+            }
+            cur = line.substr(10, line.len() - 10).trim()
+            body = str_builder()
+        } else if cur != "\0" {
+            body.push_str(line)
+            body.push_str("\n")
+        }
+    }
+    if cur != "\0" {
+        names.push(cur)
+        bodies.push(body.to_str())
+    }
+    var table: Map[str, str] = map()
+    for i in 0..names.len() {
+        table.set(names[i], bodies[i])
+    }
+    var entry = "main"
+    if names.len() > 0 {
+        entry = names[0]
+    }
+    var out = empty_loaded("")
+    var loaded: Map[str, bool] = map()
+    var q_name: [str] = [entry]
+    var q_disp: [str] = [if entry == "main" { "<bundle>" } else { "<bundle>:" + entry }]
+    var base = 0
+    while q_name.len() > 0 {
+        let name = q_name.pop() ?? ""
+        let display = q_disp.pop() ?? ""
+        if loaded.has(name) {
+            continue
+        }
+        loaded.set(name, true)
+        let msrc = match table.get(name) {
+            Some(x) -> x
+            None -> {
+                out.diags.push("cannot load module `{name}`")
+                continue
+            }
+        }
+        let sb = msrc.to_bytes()
+        let lx = lex.lex(sb, true)
+        let ps = parse.parse(sb, lx)
+        let c = cst.build(ps)
+        let m = ast.build(c, sb, ps.wide_ints, lx.doc_start, lx.doc_end, lx.doc_text)
+        for i in 0..ps.d_msg.len() {
+            out.diags.push(ps.d_msg[i])
+        }
+        var ia: [str] = []
+        var ifull: [str] = []
+        for d in m.decls {
+            if m.a.k[d] != ast.D_IMPORT {
+                continue
+            }
+            let path = m.a.pool[m.a.off[d]]
+            let sv = m.a.pool[m.a.off[path]]
+            let segs = m.a.pool.slice(m.a.off[sv], m.a.off[sv] + m.a.n[sv])
+            var parts: [str] = []
+            for sg in segs {
+                parts.push(m.a.t[sg])
+            }
+            let written = parts.join(".")
+            var alias = ""
+            if parts.len() > 0 {
+                alias = parts[parts.len() - 1]
+            }
+            var full = written
+            let nested = name + "." + written
+            if table.has(nested) {
+                full = nested
+            } else if table.has(written) {
+                full = written
+            } else {
+                var hit = "\0"
+                var many = false
+                for k in table.keys() {
+                    if k.ends_with("." + written) {
+                        if hit != "\0" {
+                            many = true
+                        }
+                        hit = k
+                    }
+                }
+                if hit != "\0" and not many {
+                    full = hit
+                }
+            }
+            var dup = -1
+            for j in 0..ia.len() {
+                if ia[j] == alias {
+                    dup = j
+                }
+            }
+            if dup >= 0 {
+                out.diags.push("duplicate import alias `{alias}` in module `{name}`")
+                ifull[dup] = full
+            } else {
+                ia.push(alias)
+                ifull.push(full)
+            }
+            q_name.push(full)
+            q_disp.push(dotted_to_path(full) + ".gr")
+        }
+        out.names.push(name)
+        out.aliases.push(last_seg(name))
+        out.paths.push(display)
+        out.srcs.push(sb)
+        out.bases.push(base)
+        out.imp_alias.push(ia)
+        out.imp_full.push(ifull)
+        out.mods.push(m)
+        base += sb.len() + 1
+    }
+    out
+}
+
+fn sort_prefixes(inout xs: [str]) {
+    // Insertion sort by (length, text): the lists are short.
+    for i in 1..xs.len() {
+        var j = i
+        while j > 0 and prefix_less(xs[j], xs[j - 1]) {
+            let tmp = xs[j]
+            xs[j] = xs[j - 1]
+            xs[j - 1] = tmp
+            j -= 1
+        }
+    }
+}
+
+fn prefix_less(a: str, b: str) -> bool {
+    if a.len() != b.len() {
+        return a.len() < b.len()
+    }
+    a < b
+}
+
+/// The file lines `grasm tir` begins with: each module's name, alias, path
+/// and base, then its imports sorted by alias.
+pub fn print_files(l: Loaded) -> str {
+    var b = str_builder()
+    for i in 0..l.names.len() {
+        b.push_str("(file {quote(l.names[i])} {quote(l.aliases[i])} {quote(l.paths[i])} {l.bases[i]}")
+        var pairs: [str] = []
+        for j in 0..l.imp_alias[i].len() {
+            pairs.push(quote(l.imp_alias[i][j]) + " " + quote(l.imp_full[i][j]))
+        }
+        pairs.sort()
+        for pr in pairs {
+            b.push_str("\n  (import {pr})")
+        }
+        b.push_str(")\n")
+    }
+    b.to_str()
+}
+
+/// A string as a JSON string literal, as TIR writes one.
+pub fn quote(s: str) -> str {
+    var b = str_builder()
+    b.push_str("\"")
+    for c in s.chars() {
+        if c == "\"" {
+            b.push_str("\\\"")
+        } else if c == "\\" {
+            b.push_str("\\\\")
+        } else if c == "\n" {
+            b.push_str("\\n")
+        } else if c == "\r" {
+            b.push_str("\\r")
+        } else if c == "\t" {
+            b.push_str("\\t")
+        } else {
+            let code = c.code_at(0)
+            if code < 32 or code == 127 {
+                b.push_str("\\u{hex4(code)}")
+            } else {
+                b.push_str(c)
+            }
+        }
+    }
+    b.push_str("\"")
+    b.to_str()
+}
+
+fn hex4(n: i64) -> str {
+    let digits = "0123456789abcdef"
+    var s = ""
+    var v = n
+    for i in 0..4 {
+        s = digits.substr(v % 16, 1) + s
+        v = v / 16
+    }
+    s
+}

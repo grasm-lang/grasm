@@ -200,4 +200,6 @@ def main():
     sys.exit(1 if mism or declined or not s3_ok else 0)
 
 
-main()
+# Run, not when imported: scripts/fuzz_tir.py uses `gen`.
+if __name__ == "__main__":
+    main()

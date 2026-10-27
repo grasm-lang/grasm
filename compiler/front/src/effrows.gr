@@ -1,0 +1,813 @@
+// Effect rows (crates/grasm_sema/src/effects.rs, `rows_and_closures`): every
+// function's inferred row and every closure literal's, by a syntactic
+// fixpoint over the call graph. The checker needs them before it types
+// anything, since a function's row is part of its type ([T-FN-TYPE-ROW]).
+//
+// This is the first of the two passes effects.rs runs: the one with no
+// rows from the checker yet, so a value's row comes only from the names it
+// mentions. The second, which reports, is the checker's to call.
+import ast
+import prog
+import builtin_rows
+
+type Eff = {
+    keys: [str],
+    decl: [i64],
+    module: [str],
+    index: Map[str, i64],
+    effect_names: Map[str, bool],
+    externs: Map[str, bool],
+    rows: [[str]],
+    h_eff: [str],
+    h_mod: [str],
+    h_row: [[str]],
+    // The second pass only: what the checker worked out for function
+    // values and for calls through fields, and the dependency packages.
+    vrows: Map[i64, [str]],
+    crows: Map[i64, [str]],
+    pkgs: [str],
+}
+
+/// Names a body binds and the offset each comes into scope at.
+type Fnb = { at: Map[str, i64] }
+
+pub fn bind_name(inout f: Fnb, name: str, at: i64) {
+    match f.at.get(name) {
+        Some(prev) -> {
+            if at < prev {
+                f.at.set(name, at)
+            }
+        }
+        None -> f.at.set(name, at)
+    }
+}
+
+pub fn shadowed(f: Fnb, name: str, at: i64) -> bool {
+    match f.at.get(name) {
+        Some(from) -> at >= from
+        None -> false
+    }
+}
+
+/// A set of effect names, kept as a map for membership.
+pub fn add(inout out: Map[str, bool], e: str, active: [str]) {
+    if not active.contains(e) {
+        out.set(e, true)
+    }
+}
+
+pub fn sorted_keys(m: Map[str, bool]) -> [str] {
+    var ks = m.keys()
+    ks.sort()
+    ks
+}
+
+fn is_prefix_module(module: str, pkg: str) -> bool {
+    module == pkg or module.starts_with(pkg + ".")
+}
+
+/// The package a module belongs to: the longest dependency prefix, or "".
+pub fn package_of(x: Eff, module: str) -> str {
+    var best = ""
+    var found = false
+    for d in x.pkgs {
+        if is_prefix_module(module, d) and (not found or d.len() > best.len()) {
+            best = d
+            found = true
+        }
+    }
+    best
+}
+
+fn value_row(x: Eff, p: Prog, e: i64, active: [str], inout out: Map[str, bool]) -> bool {
+    match x.vrows.get(prog.ekey(p, e)) {
+        Some(r) -> {
+            for ef in r {
+                add(out, ef, active)
+            }
+            true
+        }
+        None -> false
+    }
+}
+
+pub fn resolve_call(x: Eff, current: str, name: str) -> i64 {
+    x.index.get(current + "::" + name) ?? -1
+}
+
+pub fn resolve_qualified(x: Eff, p: Prog, mi: i64, alias: str, name: str) -> i64 {
+    let target = prog.import_of(p, mi, alias)
+    if target == "\0" {
+        return -1
+    }
+    x.index.get(target + "::" + name) ?? -1
+}
+
+pub fn contribute(x: Eff, f: i64, active: [str], inout out: Map[str, bool]) {
+    for e in x.rows[f] {
+        add(out, e, active)
+    }
+}
+
+/// An empty table, for asking questions that need no rows.
+pub fn build_empty() -> Eff {
+    Eff{ keys: [], decl: [], module: [], index: map(), effect_names: map(), externs: map(), rows: [], h_eff: [], h_mod: [], h_row: [], vrows: map(), crows: map(), pkgs: [] }
+}
+
+pub fn build(p: Prog) -> Eff {
+    build_with(p, map(), map(), [])
+}
+
+/// The second pass: the same fixpoint, told the rows the checker found and
+/// which modules are dependency packages.
+pub fn build_with(p: Prog, vrows: Map[i64, [str]], crows: Map[i64, [str]], pkgs: [str]) -> Eff {
+    var x = Eff{ keys: [], decl: [], module: [], index: map(), effect_names: map(), externs: map(), rows: [], h_eff: [], h_mod: [], h_row: [], vrows: vrows, crows: crows, pkgs: pkgs }
+    index_decls(x, p)
+    solve_rows(x, p)
+    x
+}
+
+fn index_decls(inout x: Eff, p: Prog) {
+    for mi in 0..p.m_name.len() {
+        let mname = p.m_name[mi]
+        for d in p.m_decls[mi] {
+            let k = prog.kind(p, d)
+            if k == ast.D_FN {
+                let q = mname + "::" + prog.name(p, prog.sl(p, d, 2))
+                match x.index.get(q) {
+                    Some(i) -> {
+                        // A map insert: the later declaration replaces it.
+                        x.decl[i] = d
+                    }
+                    None -> {
+                        x.index.set(q, x.keys.len())
+                        x.keys.push(q)
+                        x.decl.push(d)
+                        x.module.push(mname)
+                        x.rows.push([])
+                    }
+                }
+            } else if k == ast.D_EFFECT {
+                x.effect_names.set(prog.name(p, prog.sl(p, d, 0)), true)
+            } else if k == ast.D_EXTERN {
+                x.externs.set(mname + "::" + prog.name(p, prog.sl(p, d, 1)), true)
+            }
+        }
+    }
+}
+
+/// The rows alone, with no handler's rows charged where it is installed:
+/// what `effects_of_program` computes for a package's ceiling.
+pub fn build_rows_only(p: Prog, vrows: Map[i64, [str]], crows: Map[i64, [str]], pkgs: [str]) -> Eff {
+    var x = build_empty()
+    x.vrows = vrows
+    x.crows = crows
+    x.pkgs = pkgs
+    index_decls(x, p)
+    solve_fn_rows(x, p)
+    x
+}
+
+pub fn solve_rows(inout x: Eff, p: Prog) {
+    while true {
+        solve_fn_rows(x, p)
+        let (he, hm, hr) = compute_handler_rows(x, p)
+        if same_handler_rows(x, he, hm, hr) {
+            break
+        }
+        x.h_eff = he
+        x.h_mod = hm
+        x.h_row = hr
+        for i in 0..x.rows.len() {
+            x.rows[i] = []
+        }
+    }
+}
+
+fn same_handler_rows(x: Eff, he: [str], hm: [str], hr: [[str]]) -> bool {
+    if he.len() != x.h_eff.len() {
+        return false
+    }
+    for i in 0..he.len() {
+        var found = false
+        for j in 0..x.h_eff.len() {
+            if x.h_eff[j] == he[i] and x.h_mod[j] == hm[i] {
+                found = true
+                if x.h_row[j] != hr[i] {
+                    return false
+                }
+            }
+        }
+        if not found {
+            return false
+        }
+    }
+    true
+}
+
+pub fn fn_bindings(p: Prog, d: i64) -> Fnb {
+    var f = Fnb{ at: map() }
+    for prm in prog.items(p, prog.sl(p, d, 5)) {
+        bind_name(f, prog.name(p, prog.sl(p, prm, 1)), 0)
+    }
+    collect_fn_bindings(p, prog.sl(p, d, 9), f)
+    f
+}
+
+fn solve_fn_rows(inout x: Eff, p: Prog) {
+    while true {
+        var changed = false
+        for i in 0..x.keys.len() {
+            let d = x.decl[i]
+            let current = x.module[i]
+            let mi = prog.module_index(p, current)
+            var out: Map[str, bool] = map()
+            var active: [str] = []
+            let f = fn_bindings(p, d)
+            walk_block(x, p, mi, current, prog.sl(p, d, 9), active, f, out)
+            let row = sorted_keys(out)
+            if row != x.rows[i] {
+                x.rows[i] = row
+                changed = true
+            }
+        }
+        if not changed {
+            break
+        }
+    }
+}
+
+fn compute_handler_rows(x: Eff, p: Prog) -> ([str], [str], [[str]]) {
+    var he: [str] = []
+    var hm: [str] = []
+    var hr: [[str]] = []
+    for i in 0..x.keys.len() {
+        let d = x.decl[i]
+        let current = x.module[i]
+        let mi = prog.module_index(p, current)
+        var lits: [i64] = []
+        collect_lits_block(p, prog.sl(p, d, 9), false, lits)
+        for lit in lits {
+            let tname = prog.path_last(p, prog.sl(p, lit, 0))
+            if not tname.ends_with("Handler") {
+                continue
+            }
+            let eff_name = tname.substr(0, tname.len() - 7)
+            if not x.effect_names.has(eff_name) {
+                continue
+            }
+            var out: Map[str, bool] = map()
+            var active: [str] = []
+            let f = fn_bindings(p, d)
+            walk_expr(x, p, mi, current, lit, active, f, out)
+            var at = -1
+            for j in 0..he.len() {
+                if he[j] == eff_name and hm[j] == current {
+                    at = j
+                }
+            }
+            if at < 0 {
+                he.push(eff_name)
+                hm.push(current)
+                hr.push(sorted_keys(out))
+            } else {
+                var merged: Map[str, bool] = map()
+                for e in hr[at] {
+                    merged.set(e, true)
+                }
+                for e in out.keys() {
+                    merged.set(e, true)
+                }
+                hr[at] = sorted_keys(merged)
+            }
+        }
+    }
+    (he, hm, hr)
+}
+
+/// Every closure literal's row, keyed by its span start.
+pub fn closure_rows(x: Eff, p: Prog) -> Map[i64, [str]] {
+    var res: Map[i64, [str]] = map()
+    for i in 0..x.keys.len() {
+        let d = x.decl[i]
+        let current = x.module[i]
+        let mi = prog.module_index(p, current)
+        var lits: [i64] = []
+        collect_lits_block(p, prog.sl(p, d, 9), true, lits)
+        for lit in lits {
+            var out: Map[str, bool] = map()
+            var active: [str] = []
+            let f = fn_bindings(p, d)
+            walk_expr(x, p, mi, current, prog.sl(p, lit, 1), active, f, out)
+            res.set(prog.es(p, lit), sorted_keys(out))
+        }
+    }
+    res
+}
+
+/// The row of function `q`, or None (as "\0" first) when it has none.
+pub fn row_of(x: Eff, q: str) -> Option[[str]] {
+    match x.index.get(q) {
+        Some(i) -> Some(x.rows[i])
+        None -> None
+    }
+}
+
+// ---------------------------------------------------------------------
+// Collecting literals: struct literals (`closures` false) or closure
+// literals (true), as collect_handler_lits / collect_closure_lits walk.
+// ---------------------------------------------------------------------
+
+fn collect_lits_block(p: Prog, b: i64, closures: bool, inout out: [i64]) {
+    for st in prog.stmts(p, b) {
+        let k = prog.kind(p, st)
+        if k == ast.S_LET {
+            collect_lits(p, prog.sl(p, st, 3), closures, out)
+        } else if k == ast.S_ASSIGN {
+            collect_lits(p, prog.sl(p, st, 2), closures, out)
+            if closures {
+                collect_lits(p, prog.sl(p, st, 0), closures, out)
+            }
+        } else if k == ast.S_EXPR {
+            collect_lits(p, prog.sl(p, st, 0), closures, out)
+        } else if k == ast.S_RETURN {
+            let v = prog.sl(p, st, 0)
+            if v >= 0 {
+                collect_lits(p, v, closures, out)
+            }
+        } else if k == ast.S_WHILE {
+            collect_lits(p, prog.sl(p, st, 0), closures, out)
+            collect_lits_block(p, prog.sl(p, st, 1), closures, out)
+        } else if k == ast.S_FOR {
+            collect_lits(p, prog.sl(p, st, 1), closures, out)
+            collect_lits_block(p, prog.sl(p, st, 2), closures, out)
+        } else if k == ast.S_WITH {
+            collect_lits(p, prog.sl(p, st, 1), closures, out)
+            collect_lits_block(p, prog.sl(p, st, 2), closures, out)
+        } else if k == ast.S_PARALLEL or k == ast.S_SPAWN {
+            collect_lits_block(p, prog.sl(p, st, 0), closures, out)
+        }
+    }
+}
+
+fn collect_lits(p: Prog, e: i64, closures: bool, inout out: [i64]) {
+    let k = prog.kind(p, e)
+    if k == ast.E_CLOSURE {
+        if closures {
+            out.push(e)
+        }
+        collect_lits(p, prog.sl(p, e, 1), closures, out)
+    } else if k == ast.E_STRUCT {
+        if not closures {
+            out.push(e)
+        }
+        let base = prog.sl(p, e, 1)
+        if base >= 0 {
+            collect_lits(p, base, closures, out)
+        }
+        for pr in prog.items(p, prog.sl(p, e, 2)) {
+            collect_lits(p, prog.sl(p, pr, 1), closures, out)
+        }
+    } else if k == ast.E_CALL {
+        collect_lits(p, prog.sl(p, e, 0), closures, out)
+        for a in prog.items(p, prog.sl(p, e, 1)) {
+            collect_lits(p, a, closures, out)
+        }
+    } else if k == ast.E_METHOD {
+        collect_lits(p, prog.sl(p, e, 0), closures, out)
+        for a in prog.items(p, prog.sl(p, e, 2)) {
+            collect_lits(p, a, closures, out)
+        }
+    } else if k == ast.E_LIST or k == ast.E_TUPLE {
+        for i in prog.items(p, prog.sl(p, e, 0)) {
+            collect_lits(p, i, closures, out)
+        }
+    } else if k == ast.E_MAP {
+        for pr in prog.items(p, prog.sl(p, e, 0)) {
+            collect_lits(p, prog.sl(p, pr, 0), closures, out)
+            collect_lits(p, prog.sl(p, pr, 1), closures, out)
+        }
+    } else if k == ast.E_BINARY {
+        collect_lits(p, prog.sl(p, e, 1), closures, out)
+        collect_lits(p, prog.sl(p, e, 2), closures, out)
+    } else if k == ast.E_UNARY {
+        collect_lits(p, prog.sl(p, e, 1), closures, out)
+    } else if k == ast.E_TRY {
+        collect_lits(p, prog.sl(p, e, 0), closures, out)
+    } else if k == ast.E_FIELD {
+        collect_lits(p, prog.sl(p, e, 0), closures, out)
+    } else if k == ast.E_INDEX {
+        collect_lits(p, prog.sl(p, e, 0), closures, out)
+        collect_lits(p, prog.sl(p, e, 1), closures, out)
+    } else if k == ast.E_BLOCK or k == ast.E_UNSAFE or k == ast.E_REGION {
+        collect_lits_block(p, prog.sl(p, e, 0), closures, out)
+    } else if k == ast.E_IF {
+        collect_lits(p, prog.sl(p, e, 0), closures, out)
+        collect_lits_block(p, prog.sl(p, e, 1), closures, out)
+        let eb = prog.sl(p, e, 2)
+        if eb >= 0 {
+            if prog.kind(p, eb) == ast.EB_ELSE {
+                collect_lits_block(p, prog.sl(p, eb, 0), closures, out)
+            } else {
+                collect_lits(p, prog.sl(p, eb, 0), closures, out)
+            }
+        }
+    } else if k == ast.E_MATCH {
+        collect_lits(p, prog.sl(p, e, 0), closures, out)
+        for arm in prog.items(p, prog.sl(p, e, 1)) {
+            collect_lits(p, prog.sl(p, arm, 2), closures, out)
+        }
+    } else if k == ast.E_STR {
+        for pc in prog.items(p, prog.sl(p, e, 0)) {
+            if prog.kind(p, pc) == ast.PC_EXPR {
+                collect_lits(p, prog.sl(p, pc, 0), closures, out)
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
+// Bindings
+// ---------------------------------------------------------------------
+
+pub fn collect_fn_bindings(p: Prog, b: i64, inout f: Fnb) {
+    for st in prog.stmts(p, b) {
+        let k = prog.kind(p, st)
+        if k == ast.S_LET {
+            let nm = prog.sl(p, st, 1)
+            bind_name(f, prog.name(p, nm), prog.s(p, nm))
+            seed_closure_params(p, prog.sl(p, st, 3), f)
+        } else if k == ast.S_FOR {
+            let v = prog.sl(p, st, 0)
+            bind_name(f, prog.name(p, v), prog.s(p, v))
+            collect_fn_bindings(p, prog.sl(p, st, 2), f)
+        } else if k == ast.S_WHILE {
+            collect_fn_bindings(p, prog.sl(p, st, 1), f)
+        } else if k == ast.S_PARALLEL or k == ast.S_SPAWN {
+            collect_fn_bindings(p, prog.sl(p, st, 0), f)
+        } else if k == ast.S_WITH {
+            collect_fn_bindings(p, prog.sl(p, st, 2), f)
+        } else if k == ast.S_EXPR {
+            seed_closure_params(p, prog.sl(p, st, 0), f)
+        } else if k == ast.S_RETURN {
+            let v = prog.sl(p, st, 0)
+            if v >= 0 {
+                seed_closure_params(p, v, f)
+            }
+        }
+    }
+}
+
+pub fn seed_closure_params(p: Prog, e: i64, inout f: Fnb) {
+    let k = prog.kind(p, e)
+    if k == ast.E_CLOSURE {
+        let body = prog.sl(p, e, 1)
+        for prm in prog.items(p, prog.sl(p, e, 0)) {
+            bind_name(f, prog.name(p, prm), prog.es(p, body))
+        }
+    }
+    for sub in shallow_kids(p, e) {
+        seed_closure_params(p, sub, f)
+    }
+}
+
+/// `walk_exprs_shallow`: the direct subexpressions it visits.
+fn shallow_kids(p: Prog, e: i64) -> [i64] {
+    let k = prog.kind(p, e)
+    if k == ast.E_CLOSURE {
+        return [prog.sl(p, e, 1)]
+    }
+    if k == ast.E_UNARY {
+        return [prog.sl(p, e, 1)]
+    }
+    if k == ast.E_TRY {
+        return [prog.sl(p, e, 0)]
+    }
+    if k == ast.E_BINARY {
+        return [prog.sl(p, e, 1), prog.sl(p, e, 2)]
+    }
+    if k == ast.E_CALL {
+        var out = [prog.sl(p, e, 0)]
+        for a in prog.items(p, prog.sl(p, e, 1)) {
+            out.push(a)
+        }
+        return out
+    }
+    if k == ast.E_METHOD {
+        var out = [prog.sl(p, e, 0)]
+        for a in prog.items(p, prog.sl(p, e, 2)) {
+            out.push(a)
+        }
+        return out
+    }
+    if k == ast.E_FIELD {
+        return [prog.sl(p, e, 0)]
+    }
+    if k == ast.E_INDEX {
+        return [prog.sl(p, e, 0), prog.sl(p, e, 1)]
+    }
+    if k == ast.E_LIST or k == ast.E_TUPLE {
+        return prog.items(p, prog.sl(p, e, 0))
+    }
+    if k == ast.E_MAP {
+        var out: [i64] = []
+        for pr in prog.items(p, prog.sl(p, e, 0)) {
+            out.push(prog.sl(p, pr, 0))
+            out.push(prog.sl(p, pr, 1))
+        }
+        return out
+    }
+    if k == ast.E_STR {
+        var out: [i64] = []
+        for pc in prog.items(p, prog.sl(p, e, 0)) {
+            if prog.kind(p, pc) == ast.PC_EXPR {
+                out.push(prog.sl(p, pc, 0))
+            }
+        }
+        return out
+    }
+    []
+}
+
+// ---------------------------------------------------------------------
+// The walk
+// ---------------------------------------------------------------------
+
+pub fn walk_block(x: Eff, p: Prog, mi: i64, current: str, b: i64, inout active: [str], f: Fnb, inout out: Map[str, bool]) {
+    for st in prog.stmts(p, b) {
+        walk_stmt(x, p, mi, current, st, active, f, out)
+    }
+}
+
+pub fn walk_stmt(x: Eff, p: Prog, mi: i64, current: str, st: i64, inout active: [str], f: Fnb, inout out: Map[str, bool]) {
+    let k = prog.kind(p, st)
+    if k == ast.S_LET {
+        walk_expr(x, p, mi, current, prog.sl(p, st, 3), active, f, out)
+    } else if k == ast.S_LET_TUPLE {
+        walk_expr(x, p, mi, current, prog.sl(p, st, 2), active, f, out)
+    } else if k == ast.S_ASSIGN {
+        walk_expr(x, p, mi, current, prog.sl(p, st, 0), active, f, out)
+        walk_expr(x, p, mi, current, prog.sl(p, st, 2), active, f, out)
+    } else if k == ast.S_EXPR {
+        walk_expr(x, p, mi, current, prog.sl(p, st, 0), active, f, out)
+    } else if k == ast.S_RETURN {
+        let v = prog.sl(p, st, 0)
+        if v >= 0 {
+            walk_expr(x, p, mi, current, v, active, f, out)
+        }
+    } else if k == ast.S_WHILE {
+        walk_expr(x, p, mi, current, prog.sl(p, st, 0), active, f, out)
+        walk_block(x, p, mi, current, prog.sl(p, st, 1), active, f, out)
+    } else if k == ast.S_FOR {
+        walk_expr(x, p, mi, current, prog.sl(p, st, 1), active, f, out)
+        walk_block(x, p, mi, current, prog.sl(p, st, 2), active, f, out)
+    } else if k == ast.S_PARALLEL or k == ast.S_SPAWN {
+        add(out, "async", active)
+        walk_block(x, p, mi, current, prog.sl(p, st, 0), active, f, out)
+    } else if k == ast.S_WITH {
+        let handler = prog.sl(p, st, 1)
+        walk_expr(x, p, mi, current, handler, active, f, out)
+        let eff_name = prog.dotted(p, prog.sl(p, st, 0))
+        if prog.kind(p, handler) != ast.E_STRUCT {
+            let here = package_of(x, current)
+            for i in 0..x.h_eff.len() {
+                if x.h_eff[i] != eff_name or package_of(x, x.h_mod[i]) != here {
+                    continue
+                }
+                for e in x.h_row[i] {
+                    add(out, e, active)
+                }
+            }
+        }
+        active.push(eff_name)
+        walk_block(x, p, mi, current, prog.sl(p, st, 2), active, f, out)
+        active.pop()
+    }
+}
+
+pub fn walk_expr(x: Eff, p: Prog, mi: i64, current: str, e: i64, inout active: [str], f: Fnb, inout out: Map[str, bool]) {
+    let k = prog.kind(p, e)
+    if k != ast.E_CLOSURE {
+        value_row(x, p, e, active, out)
+    }
+    if k == ast.E_INT or k == ast.E_FLOAT or k == ast.E_BOOL {
+        return
+    }
+    if k == ast.E_IDENT {
+        let id = prog.sl(p, e, 0)
+        let nm = prog.name(p, id)
+        if x.externs.has(current + "::" + nm) {
+            add(out, "io", active)
+        }
+        if not shadowed(f, nm, prog.s(p, id)) {
+            let q = resolve_call(x, current, nm)
+            if q >= 0 {
+                contribute(x, q, active, out)
+            }
+        }
+        value_row(x, p, e, active, out)
+        return
+    }
+    if k == ast.E_STR {
+        for pc in prog.items(p, prog.sl(p, e, 0)) {
+            if prog.kind(p, pc) == ast.PC_EXPR {
+                walk_expr(x, p, mi, current, prog.sl(p, pc, 0), active, f, out)
+            }
+        }
+        return
+    }
+    if k == ast.E_LIST or k == ast.E_TUPLE {
+        for i in prog.items(p, prog.sl(p, e, 0)) {
+            walk_expr(x, p, mi, current, i, active, f, out)
+        }
+        return
+    }
+    if k == ast.E_MAP {
+        for pr in prog.items(p, prog.sl(p, e, 0)) {
+            walk_expr(x, p, mi, current, prog.sl(p, pr, 0), active, f, out)
+            walk_expr(x, p, mi, current, prog.sl(p, pr, 1), active, f, out)
+        }
+        return
+    }
+    if k == ast.E_STRUCT {
+        let base = prog.sl(p, e, 1)
+        if base >= 0 {
+            walk_expr(x, p, mi, current, base, active, f, out)
+        }
+        for pr in prog.items(p, prog.sl(p, e, 2)) {
+            walk_expr(x, p, mi, current, prog.sl(p, pr, 1), active, f, out)
+        }
+        return
+    }
+    if k == ast.E_CALL {
+        let callee = prog.sl(p, e, 0)
+        if prog.kind(p, callee) == ast.E_IDENT {
+            let id = prog.sl(p, callee, 0)
+            let nm = prog.name(p, id)
+            for eff in builtin_rows.row_of(nm) {
+                add(out, eff, active)
+            }
+            if x.externs.has(current + "::" + nm) {
+                add(out, "io", active)
+            }
+            var done = false
+            if not shadowed(f, nm, prog.s(p, id)) {
+                let q = resolve_call(x, current, nm)
+                if q >= 0 {
+                    contribute(x, q, active, out)
+                    done = true
+                }
+            }
+            if not done {
+                value_row(x, p, callee, active, out)
+            }
+        } else {
+            value_row(x, p, callee, active, out)
+            walk_expr(x, p, mi, current, callee, active, f, out)
+        }
+        for a in prog.items(p, prog.sl(p, e, 1)) {
+            walk_expr(x, p, mi, current, a, active, f, out)
+        }
+        return
+    }
+    if k == ast.E_METHOD {
+        let recv = prog.sl(p, e, 0)
+        let mname = prog.name(p, prog.sl(p, e, 1))
+        match x.crows.get(prog.ekey(p, e)) {
+            Some(r) -> {
+                for ef in r {
+                    add(out, ef, active)
+                }
+                walk_expr(x, p, mi, current, recv, active, f, out)
+                for a in prog.items(p, prog.sl(p, e, 2)) {
+                    walk_expr(x, p, mi, current, a, active, f, out)
+                }
+                return
+            }
+            None -> ()
+        }
+        var resolved_qualified = false
+        if prog.kind(p, recv) == ast.E_IDENT {
+            let tid = prog.sl(p, recv, 0)
+            let tn = prog.name(p, tid)
+            let sh = shadowed(f, tn, prog.s(p, tid))
+            var q = -1
+            if not sh {
+                q = resolve_qualified(x, p, mi, tn, mname)
+            }
+            if not sh and x.effect_names.has(tn) {
+                add(out, tn, active)
+            } else if not sh and q >= 0 {
+                contribute(x, q, active, out)
+                resolved_qualified = true
+            } else {
+                walk_expr(x, p, mi, current, recv, active, f, out)
+            }
+        } else {
+            walk_expr(x, p, mi, current, recv, active, f, out)
+        }
+        if resolved_qualified {
+            // Already charged.
+        } else if x.externs.has(current + "::" + mname) {
+            out.set("io", true)
+            out.set("unsafe", true)
+        } else {
+            let q = resolve_call(x, current, mname)
+            if q >= 0 {
+                contribute(x, q, active, out)
+            }
+        }
+        for a in prog.items(p, prog.sl(p, e, 2)) {
+            walk_expr(x, p, mi, current, a, active, f, out)
+        }
+        return
+    }
+    if k == ast.E_FIELD {
+        let recv = prog.sl(p, e, 0)
+        let fname = prog.name(p, prog.sl(p, e, 1))
+        var qualified = false
+        if prog.kind(p, recv) == ast.E_IDENT {
+            let aid = prog.sl(p, recv, 0)
+            let an = prog.name(p, aid)
+            if not shadowed(f, an, prog.s(p, aid)) {
+                let target = prog.import_of(p, mi, an)
+                if target != "\0" {
+                    if x.externs.has(target + "::" + fname) {
+                        out.set("io", true)
+                        out.set("unsafe", true)
+                        qualified = true
+                    } else {
+                        let q = resolve_qualified(x, p, mi, an, fname)
+                        if q >= 0 {
+                            contribute(x, q, active, out)
+                            qualified = true
+                        }
+                    }
+                }
+            }
+        }
+        if not qualified {
+            walk_expr(x, p, mi, current, recv, active, f, out)
+        }
+        return
+    }
+    if k == ast.E_INDEX {
+        walk_expr(x, p, mi, current, prog.sl(p, e, 0), active, f, out)
+        walk_expr(x, p, mi, current, prog.sl(p, e, 1), active, f, out)
+        return
+    }
+    if k == ast.E_UNARY {
+        walk_expr(x, p, mi, current, prog.sl(p, e, 1), active, f, out)
+        return
+    }
+    if k == ast.E_TRY {
+        walk_expr(x, p, mi, current, prog.sl(p, e, 0), active, f, out)
+        return
+    }
+    if k == ast.E_BINARY {
+        walk_expr(x, p, mi, current, prog.sl(p, e, 1), active, f, out)
+        walk_expr(x, p, mi, current, prog.sl(p, e, 2), active, f, out)
+        return
+    }
+    if k == ast.E_RANGE {
+        walk_expr(x, p, mi, current, prog.sl(p, e, 0), active, f, out)
+        walk_expr(x, p, mi, current, prog.sl(p, e, 1), active, f, out)
+        return
+    }
+    if k == ast.E_IF {
+        walk_expr(x, p, mi, current, prog.sl(p, e, 0), active, f, out)
+        walk_block(x, p, mi, current, prog.sl(p, e, 1), active, f, out)
+        let eb = prog.sl(p, e, 2)
+        if eb >= 0 {
+            if prog.kind(p, eb) == ast.EB_ELSE {
+                walk_block(x, p, mi, current, prog.sl(p, eb, 0), active, f, out)
+            } else {
+                walk_expr(x, p, mi, current, prog.sl(p, eb, 0), active, f, out)
+            }
+        }
+        return
+    }
+    if k == ast.E_MATCH {
+        walk_expr(x, p, mi, current, prog.sl(p, e, 0), active, f, out)
+        for arm in prog.items(p, prog.sl(p, e, 1)) {
+            let g = prog.sl(p, arm, 1)
+            if g >= 0 {
+                walk_expr(x, p, mi, current, g, active, f, out)
+            }
+            walk_expr(x, p, mi, current, prog.sl(p, arm, 2), active, f, out)
+        }
+        return
+    }
+    if k == ast.E_BLOCK or k == ast.E_REGION {
+        walk_block(x, p, mi, current, prog.sl(p, e, 0), active, f, out)
+        return
+    }
+    if k == ast.E_UNSAFE {
+        out.set("unsafe", true)
+        walk_block(x, p, mi, current, prog.sl(p, e, 0), active, f, out)
+        return
+    }
+    if k == ast.E_CLOSURE {
+        walk_expr(x, p, mi, current, prog.sl(p, e, 1), active, f, out)
+    }
+}

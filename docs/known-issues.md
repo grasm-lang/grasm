@@ -5,9 +5,69 @@ Every defect that is known and not fixed, with its severity from
 to paste. S1 and S2 block a release; S3 and S4 do not, and this file is what
 makes shipping them honest rather than quiet.
 
-**Open S1: none confirmed; one under investigation. Open S2: none. Open S3: one, a block whose value is a map
-literal. Open S4: two, a nested interpolation's spans and a backslash at the
-end of a file.**
+**Open S1: one, a native build passing a struct argument as a later
+`inout` argument left it; one under investigation. Open S2: none. Open S3:
+two, a block whose value is a map literal and a statement `if` whose
+branches' values differ, refused natively. Open S4: two, a nested
+interpolation's spans and a backslash at the end of a file.**
+
+## Found on 2026-10-27 by S2 part two (the checker and TIR in Grasm)
+
+Each was found while building `compiler/front`'s checker with the Rust
+compiler, and each is in the Rust compiler's native backend, which S2 does
+not change. Neither is fixed; `compiler/front` is written around both.
+
+**A native build passes a struct argument that a later `inout` argument
+changes as it is after the change -- *open, S1*.**
+
+```
+type T = { xs: [i64] }
+
+fn add(inout t: T, v: i64) -> i64 {
+    t.xs.push(v)
+    t.xs.len() - 1
+}
+
+fn get(t: T, i: i64) -> i64 {
+    t.xs.len() * 100 + i
+}
+
+fn main() {
+    var u = T{ xs: [] }
+    print("{get(u, add(u, 7))}")
+}
+```
+
+`grasm run` prints `0`: arguments are evaluated left to right and `get`'s
+first one is the value `u` had before `add` ran, which is what the language
+says. `grasm build --native` prints `100`: the struct is handed to `get` as
+it is after `add` pushed into it. An index read through the same value
+(`t.k[f(t)]` where `f` takes `inout t`) reads the old value in both engines,
+so the two engines disagree only for an argument. The Grasm frontend binds
+such a call's result first, as the language's own advice for this shape
+says, so neither engine's reading reaches it.
+
+**An `if` used as a statement whose branches end in values of different
+types is refused by the native backend -- *open, S3*.**
+
+```
+fn f(x: i64) -> i64 {
+    if x == 1 {
+        true
+    } else {
+        3
+    }
+    7
+}
+```
+
+checks clean -- the `if` is a statement, so its branches' values are thrown
+away and need not agree ([E-IF-VALUE]) -- and `grasm run` prints `7` for
+`f(1)`; `grasm build --native` refuses the program with "codegen bug in `f`:
+Compilation error: Verifier errors". An `else if` chain fails the same way.
+The branches' values have to be dropped where they are made, and the
+Cranelift lowering joins them at a block whose parameter has one type.
+`compiler/front` writes such a branch's last call as `let _ = ...`.
 
 ## Found on 2026-10-27 by S2 part one (the frontend in Grasm)
 
@@ -59,7 +119,13 @@ string starts at 46). An interpolation's tokens are shifted to the file's
 offsets, but the offsets inside their string tokens are not, so an
 interpolation inside an interpolation is parsed at the inner text's offset
 alone; a diagnostic in it points at the start of the file. The Grasm parser
-reproduces the offsets.
+reproduces the offsets. S2 part two found that they are not moved by a
+module's base either: in an imported module they are the offsets they would
+be in the entry file, so a type error there is reported in the entry file
+(`main.gr:1:8` for one in `lib.gr`), and the checker's facts for those nodes,
+kept by span, are filed under the same keys as any node of the entry module
+at those offsets. Six programs in the repository have such an interpolation
+in an imported module; `compiler/front` reproduces the spans there too.
 
 **A backslash at the end of a file is "unknown escape `\\0`" -- *open,
 S4*.** A file ending `"abc\` reports ``unknown escape `\\0` `` -- the byte

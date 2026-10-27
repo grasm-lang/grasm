@@ -1,0 +1,342 @@
+// Capability ceilings (crates/grasm/src/main.rs `check_dependency_ceilings`,
+// grasm_pkg `effects_of_package`, effects.rs `effects_of_program` and
+// `effects_by_package`): every package in the program's graph whose manifest
+// declares `capabilities` is held to them -- what the package performs on its
+// own, read from each of its source files loaded and checked as a program of
+// its own, and what it performs in this program. A breach refuses the
+// program, as `grasm tir` and `grasm check` refuse it.
+import ast
+import prog
+import tys
+import sema
+import loader
+import effrows
+import lex
+import parse
+import cst
+
+/// The breaches, one message each; none when the program is within every
+/// ceiling or is not in a package.
+pub fn check(entry_path: str, p: Prog, c: Ck, inout t: Tys) -> [str] {
+    var here = loader.parent(entry_path)
+    var pkg_dir = "\0"
+    while here != "\0" {
+        if file_exists(loader.join(here, "grasm.toml")) {
+            pkg_dir = here
+            break
+        }
+        here = loader.parent(here)
+    }
+    if pkg_dir == "\0" {
+        return []
+    }
+    let res = loader.resolve_graph(pkg_dir)
+    if not res.ok {
+        return [res.why]
+    }
+    var out: [str] = []
+    var by_pkg_done = false
+    var by_pkg: Map[str, [str]] = map()
+    for i in 0..res.names.len() {
+        let m = res.mfs[i]
+        if not m.has_caps {
+            continue
+        }
+        let (ok, why, performed) = effects_of_package(res.dirs[i], m)
+        if not ok {
+            out.push("cannot check the capability ceiling of `{m.name}`: {why}")
+            continue
+        }
+        if not by_pkg_done {
+            by_pkg = effects_by_package(p, c, t)
+            by_pkg_done = true
+        }
+        var all: Map[str, bool] = map()
+        for e in performed {
+            all.set(e, true)
+        }
+        for e in by_pkg.get(m.name) ?? [] {
+            all.set(e, true)
+        }
+        var exceeded: [str] = []
+        for e in effrows.sorted_keys(all) {
+            if not m.caps.contains(e) {
+                exceeded.push(e)
+            }
+        }
+        if exceeded.len() > 0 {
+            out.push("package `{m.name}` performs `{exceeded.join("`, `")}` but its manifest only permits {m.caps}")
+        }
+    }
+    out
+}
+
+fn value_tables(c: Ck, inout t: Tys) -> (Map[i64, [str]], Map[i64, [str]]) {
+    var vr: Map[i64, [str]] = map()
+    for k in c.value_rows.keys() {
+        vr.set(k, tys.row_names(t, c.value_rows.get(k) ?? -1))
+    }
+    var cr: Map[i64, [str]] = map()
+    for k in c.callee_rows.keys() {
+        cr.set(k, tys.row_names(t, c.callee_rows.get(k) ?? -1))
+    }
+    (vr, cr)
+}
+
+/// What each package performs in this program, by the prefix its modules
+/// carry ("" for the entry package): the rows of what escapes it.
+fn effects_by_package(p: Prog, c: Ck, inout t: Tys) -> Map[str, [str]] {
+    let (vr, cr) = value_tables(c, t)
+    let x = effrows.build_with(p, vr, cr, p.deps)
+    var acc: Map[str, Map[str, bool]] = map()
+    for i in 0..x.keys.len() {
+        let d = x.decl[i]
+        let name = prog.name(p, prog.sl(p, d, 2))
+        let escapes = prog.sl(p, d, 0) != 0 or name == "main"
+        if not escapes {
+            continue
+        }
+        let owner = effrows.package_of(x, x.module[i])
+        var m = acc.get(owner) ?? map()
+        for e in x.rows[i] {
+            m.set(e, true)
+        }
+        acc.set(owner, m)
+    }
+    var out: Map[str, [str]] = map()
+    for k in acc.keys() {
+        out.set(k, effrows.sorted_keys(acc.get(k) ?? map()))
+    }
+    out
+}
+
+/// What a package performs on its own: its entry file and every other
+/// source file it has, each loaded and checked as a program. Not ok, with
+/// why, when one of them cannot be.
+fn effects_of_package(dir: str, m: Manifest) -> (bool, str, [str]) {
+    let entry = loader.join(dir, m.entry)
+    if not file_exists(entry) {
+        return (false, "package `{m.name}`: entry file {entry} does not exist", [])
+    }
+    var owng: Map[str, str] = map()
+    let r = loader.resolve_graph(dir)
+    if r.ok {
+        for i in 0..r.names.len() {
+            owng.set(r.names[i], r.dirs[i])
+        }
+    }
+    var all: Map[str, bool] = map()
+    var files = [entry]
+    for f in source_files(dir) {
+        if f != entry {
+            files.push(f)
+        }
+    }
+    for f in files {
+        let (ok, why, row) = effects_of_file(f, owng)
+        if not ok {
+            return (false, "package `{m.name}`: {why}", [])
+        }
+        for e in row {
+            all.set(e, true)
+        }
+    }
+    (true, "", effrows.sorted_keys(all))
+}
+
+fn effects_of_file(path: str, owng: Map[str, str]) -> (bool, str, [str]) {
+    let l = loader.load_with(path, owng)
+    if l.fatal != "" {
+        return (false, l.fatal, [])
+    }
+    if l.diags.len() > 0 {
+        return (false, "`{loader.tidy(path)}` — {l.diags[0]}", [])
+    }
+    let p = prog.build(l)
+    let (c, t0) = sema.check_program(p)
+    var t = t0
+    if c.d_s.len() > 0 {
+        return (false, "`{loader.tidy(path)}` — {c.d_msg[0]}", [])
+    }
+    (true, "", effects_of_program(p, c, t))
+}
+
+fn is_foreign(p: Prog, module: str) -> bool {
+    for d in p.deps {
+        if module == d or module.starts_with(d + ".") {
+            return true
+        }
+    }
+    false
+}
+
+/// What a program needs from outside its package: the rows of what escapes
+/// it, its exports (and `unsafe` for each), its documentation examples, its
+/// tests and benchmarks.
+fn effects_of_program(p: Prog, c: Ck, inout t: Tys) -> [str] {
+    let (vr, cr) = value_tables(c, t)
+    let x = effrows.build_rows_only(p, vr, cr, p.deps)
+    let entry_module = p.m_name[0]
+    var all: Map[str, bool] = map()
+    for i in 0..x.keys.len() {
+        let module = x.module[i]
+        if is_foreign(p, module) {
+            continue
+        }
+        let d = x.decl[i]
+        let name = prog.name(p, prog.sl(p, d, 2))
+        let is_pub = prog.sl(p, d, 0) != 0
+        let is_export = prog.sl(p, d, 1) != 0
+        if is_pub or (module == entry_module and name == "main") or is_export {
+            for e in x.rows[i] {
+                all.set(e, true)
+            }
+        }
+        if is_export {
+            all.set("unsafe", true)
+        }
+    }
+    for mi in 0..p.m_name.len() {
+        let module = p.m_name[mi]
+        if is_foreign(p, module) {
+            continue
+        }
+        for d in p.m_decls[mi] {
+            match p.docs.get(prog.s(p, d)) {
+                Some(doc) -> {
+                    for src in fenced_blocks(doc) {
+                        for e in example_row(x, p, mi, module, src) {
+                            all.set(e, true)
+                        }
+                    }
+                }
+                None -> ()
+            }
+        }
+    }
+    for mi in 0..p.m_name.len() {
+        let module = p.m_name[mi]
+        if is_foreign(p, module) {
+            continue
+        }
+        for d in p.m_decls[mi] {
+            let k = prog.kind(p, d)
+            if k != ast.D_TEST and k != ast.D_BENCH {
+                continue
+            }
+            let body = if k == ast.D_TEST { prog.sl(p, d, 1) } else { prog.sl(p, d, 0) }
+            var f = Fnb{ at: map() }
+            effrows.collect_fn_bindings(p, body, f)
+            var row: Map[str, bool] = map()
+            var active: [str] = []
+            effrows.walk_block(x, p, mi, module, body, active, f, row)
+            for e in row.keys() {
+                all.set(e, true)
+            }
+        }
+    }
+    effrows.sorted_keys(all)
+}
+
+/// The row of one documentation example, run as the body of a function in
+/// the module it documents; none when it does not parse.
+fn example_row(x: Eff, p: Prog, mi: i64, module: str, src: str) -> [str] {
+    let wrapped = "fn __doc_example() \{\n" + src + "\n}\n"
+    let sb = wrapped.to_bytes()
+    let lx = lex.lex(sb, true)
+    let ps = parse.parse(sb, lx)
+    if ps.d_s.len() > 0 {
+        return []
+    }
+    let c2 = cst.build(ps)
+    let mo = ast.build(c2, sb, ps.wide_ints, lx.doc_start, lx.doc_end, lx.doc_text)
+    let fp = prog.fragment(mo, module, p.m_imp_alias[mi], p.m_imp_full[mi])
+    var row: Map[str, bool] = map()
+    for d in mo.decls {
+        if prog.kind(fp, d) != ast.D_FN {
+            continue
+        }
+        let body = prog.sl(fp, d, 9)
+        var f = Fnb{ at: map() }
+        effrows.collect_fn_bindings(fp, body, f)
+        var active: [str] = []
+        effrows.walk_block(x, fp, 0, module, body, active, f, row)
+    }
+    effrows.sorted_keys(row)
+}
+
+/// The fenced code blocks of a documentation comment that are Grasm: an
+/// empty info string or `grasm`; `# ` hides a setup line's marker.
+fn fenced_blocks(doc: str) -> [str] {
+    var blocks: [str] = []
+    var current: [str] = []
+    var open = false
+    var skipping = false
+    for line in doc.lines() {
+        let trimmed = line.trim_start()
+        if trimmed.starts_with("```") {
+            if skipping {
+                skipping = false
+                continue
+            }
+            if open {
+                blocks.push(current.join("\n"))
+                current = []
+                open = false
+            } else {
+                let info = trimmed.substr(3, trimmed.len() - 3).trim()
+                if info == "" or info == "grasm" {
+                    open = true
+                    current = []
+                } else {
+                    skipping = true
+                }
+            }
+            continue
+        }
+        if open {
+            if trimmed.starts_with("# ") {
+                current.push(trimmed.substr(2, trimmed.len() - 2))
+            } else {
+                current.push(line)
+            }
+        }
+    }
+    if open {
+        blocks.push(current.join("\n"))
+    }
+    blocks
+}
+
+/// Every `.gr` file under a directory, sorted.
+fn source_files(dir: str) -> [str] {
+    var out: [str] = []
+    var seen: Map[str, bool] = map()
+    collect_sources(dir, out, seen)
+    out.sort()
+    out
+}
+
+fn collect_sources(dir: str, inout out: [str], inout seen: Map[str, bool]) {
+    let real = loader.tidy(dir)
+    if seen.has(real) {
+        return
+    }
+    seen.set(real, true)
+    match list_dir(dir) {
+        Ok(names) -> {
+            for n in names {
+                let path = loader.join(dir, n)
+                match list_dir(path) {
+                    Ok(_) -> collect_sources(path, out, seen)
+                    Err(_) -> {
+                        if n.to_lower().ends_with(".gr") {
+                            out.push(path)
+                        }
+                    }
+                }
+            }
+        }
+        Err(_) -> ()
+    }
+}

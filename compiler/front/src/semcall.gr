@@ -1,0 +1,1060 @@
+// Calls (check.rs `infer_call`, `check_fn_call_in`): built-in free
+// functions, variant constructors, declared functions with their type
+// arguments, function values; and the raw-memory and runtime-dialect
+// built-ins.
+import ast
+import prog
+import tys
+import sema
+
+fn io_err(inout t: Tys) -> i64 {
+    tys.named(t, tys.IOERROR, [])
+}
+
+fn fallible_io(inout t: Tys, ok: i64) -> i64 {
+    let e = io_err(t)
+    tys.fallible(t, ok, e)
+}
+
+fn arity(inout c: Ck, args: [i64], want: i64, s: i64, e: i64, msg: str) -> bool {
+    if args.len() != want {
+        sema.err(c, s, e, msg)
+        return false
+    }
+    true
+}
+
+pub fn infer_call(inout c: Ck, inout t: Tys, p: Prog, e: i64) -> i64 {
+    let callee = prog.sl(p, e, 0)
+    let args = prog.items(p, prog.sl(p, e, 1))
+    let s = prog.s(p, e)
+    let en = prog.e(p, e)
+    let key = prog.key(s, en)
+    if prog.kind(p, callee) == ast.E_IDENT {
+        let id = prog.sl(p, callee, 0)
+        let name = prog.name(p, id)
+        if sema.lookup(c, name) < 0 {
+            sema.tir_call(c, key, sema.CR_BUILTIN, name, [])
+            let r = builtin_call(c, t, p, name, id, args, s, en)
+            if r != -2 {
+                return r
+            }
+            match c.variants.get(name) {
+                Some(cands) -> {
+                    if cands.len() == 1 {
+                        sema.tir_call(c, key, sema.CR_VARIANT, "", [])
+                        return sema.instantiate_variant(c, t, p, sema.vdef(cands[0]), sema.vidx(cands[0]), args, s, en)
+                    }
+                    if cands.len() > 1 {
+                        let ownv = sema.own_variant(c, t, cands)
+                        if ownv >= 0 {
+                            sema.tir_call(c, key, sema.CR_VARIANT, "", [])
+                            return sema.instantiate_variant(c, t, p, sema.vdef(ownv), sema.vidx(ownv), args, s, en)
+                        }
+                        return sema.err(c, prog.s(p, id), prog.e(p, id), "`{name}` is ambiguous — variant of multiple types")
+                    }
+                }
+                None -> ()
+            }
+            let fid = sema.lookup_fn(c, name)
+            if fid >= 0 {
+                sema.require_unsafe(c, name, prog.s(p, id), prog.e(p, id))
+                return check_fn_call_in(c, t, p, c.cur, name, fid, args, s, en)
+            }
+        }
+    }
+    if prog.kind(p, callee) == ast.E_IDENT {
+        sema.reject_region_escape(c, p, prog.sl(p, callee, 0), "call")
+    }
+    sema.tir_call(c, key, sema.CR_VALUE, "", [])
+    let ct = sema.infer_expr(c, t, p, callee)
+    sema.force_deferred(c, t, p, ct)
+    let r = tys.shallow(t, ct)
+    if t.k[r] == tys.K_FN {
+        let params = tys.items(t, r)
+        if args.len() != params.len() {
+            return sema.err(c, s, en, "expected {params.len()} argument(s), got {args.len()}")
+        }
+        for i in 0..args.len() {
+            sema.check_expr(c, t, p, args[i], params[i])
+        }
+        return t.a[r]
+    }
+    if t.k[r] == tys.K_ERROR {
+        return tys.ERROR
+    }
+    sema.err(c, s, en, "`{tys.show(t, r)}` is not callable")
+}
+
+/// A built-in free function's type, or -2 when `name` is not one.
+fn builtin_call(inout c: Ck, inout t: Tys, p: Prog, name: str, id: i64, args: [i64], s: i64, e: i64) -> i64 {
+    if name == "print" or name == "eprint" {
+        if args.len() != 1 {
+            return sema.err(c, s, e, "{name} takes exactly 1 argument")
+        }
+        let ty = sema.infer_expr(c, t, p, args[0])
+        if t.k[tys.shallow(t, ty)] == tys.K_FALLIBLE {
+            sema.err(c, prog.es(p, args[0]), prog.ee(p, args[0]), "cannot {name} a fallible value")
+        }
+        return tys.UNIT
+    }
+    if name == "assert" {
+        if args.len() == 1 {
+            sema.check_expr(c, t, p, args[0], tys.BOOL)
+        } else {
+            return sema.err(c, s, e, "assert takes exactly 1 argument")
+        }
+        return tys.UNIT
+    }
+    if name == "assert_eq" {
+        if args.len() != 2 {
+            return sema.err(c, s, e, "assert_eq takes exactly 2 arguments")
+        }
+        let ty = sema.infer_expr(c, t, p, args[0])
+        sema.check_expr(c, t, p, args[1], ty)
+        return tys.UNIT
+    }
+    if name == "panic" {
+        if args.len() != 1 {
+            return sema.err(c, s, e, "panic takes exactly 1 argument (message)")
+        }
+        sema.check_expr(c, t, p, args[0], tys.STR)
+        return tys.fresh(t)
+    }
+    if name == "tcp_listen" or name == "tcp_accept" or name == "tcp_read" or name == "tcp_read_bytes" or name == "net_port" or name == "udp_bind" or name == "udp_recv" {
+        var gives = tys.STR
+        if name == "tcp_listen" or name == "udp_bind" or name == "tcp_accept" or name == "net_port" {
+            gives = tys.I64
+        } else if name == "udp_recv" or name == "tcp_read_bytes" {
+            gives = tys.BYTES
+        }
+        if args.len() != 1 {
+            return sema.err(c, s, e, "{name} takes exactly 1 argument")
+        }
+        sema.check_expr(c, t, p, args[0], tys.I64)
+        return fallible_io(t, gives)
+    }
+    if name == "udp_recv_from" {
+        if args.len() != 1 {
+            return sema.err(c, s, e, "udp_recv_from takes exactly 1 argument")
+        }
+        sema.check_expr(c, t, p, args[0], tys.I64)
+        let tri = tys.tuple(t, [tys.BYTES, tys.STR, tys.I64])
+        return fallible_io(t, tri)
+    }
+    if name == "proc_run" {
+        if args.len() != 2 {
+            return sema.err(c, s, e, "proc_run takes 2 arguments (program, arguments)")
+        }
+        sema.check_expr(c, t, p, args[0], tys.STR)
+        let ls = tys.list(t, tys.STR)
+        sema.check_expr(c, t, p, args[1], ls)
+        let tri = tys.tuple(t, [tys.I64, tys.STR, tys.STR])
+        return fallible_io(t, tri)
+    }
+    if name == "proc_pipeline" {
+        if args.len() != 2 {
+            return sema.err(c, s, e, "proc_pipeline takes 2 arguments (stages, input)")
+        }
+        let ls = tys.list(t, tys.STR)
+        let stage = tys.tuple(t, [tys.STR, ls])
+        let stages = tys.list(t, stage)
+        sema.check_expr(c, t, p, args[0], stages)
+        sema.check_expr(c, t, p, args[1], tys.STR)
+        let tri = tys.tuple(t, [tys.I64, tys.STR, tys.STR])
+        return fallible_io(t, tri)
+    }
+    if name == "net_wait" {
+        if args.len() != 2 {
+            return sema.err(c, s, e, "net_wait takes 2 arguments (handles, timeout_ms)")
+        }
+        let handles = tys.list(t, tys.I64)
+        sema.check_expr(c, t, p, args[0], handles)
+        sema.check_expr(c, t, p, args[1], tys.I64)
+        return fallible_io(t, handles)
+    }
+    if name == "net_workers" {
+        if args.len() != 2 {
+            return sema.err(c, s, e, "net_workers takes 2 arguments (n, f)")
+        }
+        sema.check_expr(c, t, p, args[0], tys.I64)
+        let out = tys.fresh(t)
+        let f = tys.fnt(t, [tys.I64], out, -1)
+        check_parallel_fn(c, t, p, args[1], f)
+        return tys.list(t, out)
+    }
+    if name == "udp_send" {
+        if args.len() != 4 {
+            return sema.err(c, s, e, "udp_send takes 4 arguments (handle, host, port, bytes)")
+        }
+        sema.check_expr(c, t, p, args[0], tys.I64)
+        sema.check_expr(c, t, p, args[1], tys.STR)
+        sema.check_expr(c, t, p, args[2], tys.I64)
+        sema.check_expr(c, t, p, args[3], tys.BYTES)
+        return fallible_io(t, tys.I64)
+    }
+    if name == "tcp_peer" {
+        if args.len() != 1 {
+            return sema.err(c, s, e, "tcp_peer takes exactly 1 argument")
+        }
+        sema.check_expr(c, t, p, args[0], tys.I64)
+        let pr = tys.tuple(t, [tys.STR, tys.I64])
+        return fallible_io(t, pr)
+    }
+    if name == "tcp_listen_on" or name == "tcp_connect" {
+        if args.len() != 2 {
+            return sema.err(c, s, e, "{name} takes 2 arguments (host, port)")
+        }
+        sema.check_expr(c, t, p, args[0], tys.STR)
+        sema.check_expr(c, t, p, args[1], tys.I64)
+        return fallible_io(t, tys.I64)
+    }
+    if name == "tcp_write" or name == "tcp_write_bytes" {
+        if args.len() != 2 {
+            return sema.err(c, s, e, "{name} takes 2 arguments")
+        }
+        sema.check_expr(c, t, p, args[0], tys.I64)
+        let payload = if name == "tcp_write" { tys.STR } else { tys.BYTES }
+        sema.check_expr(c, t, p, args[1], payload)
+        return fallible_io(t, tys.UNIT)
+    }
+    if name == "net_close" {
+        if args.len() != 1 {
+            return sema.err(c, s, e, "net_close takes exactly 1 argument")
+        }
+        sema.check_expr(c, t, p, args[0], tys.I64)
+        return tys.UNIT
+    }
+    if name == "read_file" {
+        if args.len() != 1 {
+            return sema.err(c, s, e, "read_file takes exactly 1 argument (path)")
+        }
+        sema.check_expr(c, t, p, args[0], tys.STR)
+        return fallible_io(t, tys.STR)
+    }
+    if name == "write_file" {
+        if args.len() != 2 {
+            return sema.err(c, s, e, "write_file takes 2 arguments (path, content)")
+        }
+        sema.check_expr(c, t, p, args[0], tys.STR)
+        sema.check_expr(c, t, p, args[1], tys.STR)
+        return fallible_io(t, tys.UNIT)
+    }
+    if name == "file_exists" {
+        if args.len() != 1 {
+            return sema.err(c, s, e, "file_exists takes exactly 1 argument (path)")
+        }
+        sema.check_expr(c, t, p, args[0], tys.STR)
+        return tys.BOOL
+    }
+    if name == "bytes_of" {
+        if args.len() != 1 {
+            return sema.err(c, s, e, "bytes_of takes exactly 1 argument (a list of 0..255)")
+        }
+        let li = tys.list(t, tys.I64)
+        sema.check_expr(c, t, p, args[0], li)
+        return tys.BYTES
+    }
+    if name == "bytes_filled" {
+        if args.len() != 2 {
+            return sema.err(c, s, e, "bytes_filled takes exactly 2 arguments")
+        }
+        sema.check_expr(c, t, p, args[0], tys.I64)
+        sema.check_expr(c, t, p, args[1], tys.I64)
+        return tys.BYTES
+    }
+    if name == "mem_alloc" or name == "mem_free" or name == "mem_addr" or name == "mem_size_of" or name == "mem_align_of" or name == "mem_fn_addr" or name == "mem_tls" {
+        return check_mem_fn(c, t, p, name, id, args, s, e)
+    }
+    if name == "mem_process" or name == "mem_static" or name == "mem_static_len" or name == "ctx_switch" or name == "ctx_init" {
+        return check_runtime_fn(c, t, p, name, id, args, s, e)
+    }
+    if name == "str_builder" or name == "byte_builder" {
+        if args.len() > 0 {
+            return sema.err(c, s, e, "{name} takes no arguments")
+        }
+        return if name == "str_builder" { tys.STRBUF } else { tys.BYTEBUF }
+    }
+    if name == "random_bytes" {
+        if args.len() != 1 {
+            return sema.err(c, s, e, "random_bytes takes exactly 1 argument (count)")
+        }
+        sema.check_expr(c, t, p, args[0], tys.I64)
+        return fallible_io(t, tys.BYTES)
+    }
+    if name == "read_bytes" {
+        if args.len() != 1 {
+            return sema.err(c, s, e, "read_bytes takes exactly 1 argument (path)")
+        }
+        sema.check_expr(c, t, p, args[0], tys.STR)
+        return fallible_io(t, tys.BYTES)
+    }
+    if name == "read_bytes_at" {
+        if args.len() != 3 {
+            return sema.err(c, s, e, "read_bytes_at takes 3 arguments (path, offset, count)")
+        }
+        sema.check_expr(c, t, p, args[0], tys.STR)
+        sema.check_expr(c, t, p, args[1], tys.I64)
+        sema.check_expr(c, t, p, args[2], tys.I64)
+        return fallible_io(t, tys.BYTES)
+    }
+    if name == "file_size" {
+        if args.len() != 1 {
+            return sema.err(c, s, e, "file_size takes exactly 1 argument (path)")
+        }
+        sema.check_expr(c, t, p, args[0], tys.STR)
+        return fallible_io(t, tys.I64)
+    }
+    if name == "append_bytes" or name == "write_bytes" {
+        if args.len() != 2 {
+            return sema.err(c, s, e, "{name} takes 2 arguments (path, bytes)")
+        }
+        sema.check_expr(c, t, p, args[0], tys.STR)
+        sema.check_expr(c, t, p, args[1], tys.BYTES)
+        return fallible_io(t, tys.UNIT)
+    }
+    if name == "sync_file" {
+        if args.len() != 1 {
+            return sema.err(c, s, e, "sync_file takes exactly 1 argument (path)")
+        }
+        sema.check_expr(c, t, p, args[0], tys.STR)
+        return fallible_io(t, tys.UNIT)
+    }
+    if name == "rename_file" {
+        if args.len() != 2 {
+            return sema.err(c, s, e, "rename_file takes 2 arguments (from, to)")
+        }
+        sema.check_expr(c, t, p, args[0], tys.STR)
+        sema.check_expr(c, t, p, args[1], tys.STR)
+        return fallible_io(t, tys.UNIT)
+    }
+    if name == "make_dir" or name == "make_dir_new" or name == "remove_file" {
+        if args.len() != 1 {
+            return sema.err(c, s, e, "{name} takes exactly 1 argument (path)")
+        }
+        sema.check_expr(c, t, p, args[0], tys.STR)
+        return fallible_io(t, tys.UNIT)
+    }
+    if name == "list_dir" {
+        if args.len() != 1 {
+            return sema.err(c, s, e, "list_dir takes exactly 1 argument (path)")
+        }
+        sema.check_expr(c, t, p, args[0], tys.STR)
+        let ls = tys.list(t, tys.STR)
+        return fallible_io(t, ls)
+    }
+    if name == "chan_new" {
+        if args.len() > 1 {
+            return sema.err(c, s, e, "`chan_new` takes at most 1 argument (how many values it buffers)")
+        }
+        if args.len() == 1 {
+            sema.check_expr(c, t, p, args[0], tys.I64)
+        }
+        let v = tys.fresh(t)
+        return tys.named(t, tys.CHAN, [v])
+    }
+    if name == "chan_select" {
+        if args.len() != 1 {
+            return sema.err(c, s, e, "`chan_select` takes 1 argument, a list of channels")
+        }
+        let v = tys.fresh(t)
+        let ch = tys.named(t, tys.CHAN, [v])
+        let want = tys.list(t, ch)
+        sema.check_expr(c, t, p, args[0], want)
+        return tys.I64
+    }
+    if name == "chan_send" or name == "chan_recv" or name == "chan_close" {
+        let want = if name == "chan_send" { 2 } else { 1 }
+        if args.len() != want {
+            return sema.err(c, s, e, "{name} takes {want} argument(s), got {args.len()}")
+        }
+        let v = tys.fresh(t)
+        let ch = tys.named(t, tys.CHAN, [v])
+        sema.check_expr(c, t, p, args[0], ch)
+        if name == "chan_send" {
+            sema.check_expr(c, t, p, args[1], v)
+            let sent = tys.resolve(t, v)
+            if sema.task_shares_ref(c, t, sent) {
+                sema.err(c, prog.es(p, args[1]), prog.ee(p, args[1]), "a channel cannot carry a `ref`: the task receiving it would share the cell with the one sending it")
+            }
+            return tys.UNIT
+        }
+        if name == "chan_recv" {
+            return tys.option_of(t, v)
+        }
+        return tys.UNIT
+    }
+    if name == "args" {
+        if args.len() > 0 {
+            return sema.err(c, s, e, "args takes no arguments")
+        }
+        return tys.list(t, tys.STR)
+    }
+    if name == "map" {
+        if args.len() > 0 {
+            return sema.err(c, s, e, "map() takes no arguments — add entries with .set(k, v)")
+        }
+        let k = tys.fresh(t)
+        let v = tys.fresh(t)
+        let mt = tys.mapt(t, k, v)
+        c.el_s.push(s)
+        c.el_len.push(e - s)
+        c.el_t.push(mt)
+        return mt
+    }
+    if (name == "pi" or name == "e") and sema.lookup_fn(c, name) < 0 {
+        if args.len() > 0 {
+            return sema.err(c, s, e, "{name} takes no arguments")
+        }
+        return tys.F64
+    }
+    if name == "ref" and sema.lookup_fn(c, "ref") < 0 {
+        if args.len() != 1 {
+            return sema.err(c, s, e, "ref takes exactly 1 argument (the value)")
+        }
+        let inner = sema.infer_expr(c, t, p, args[0])
+        return tys.reft(t, inner)
+    }
+    if (name == "release" or name == "alive") and sema.lookup_fn(c, name) < 0 {
+        if args.len() != 1 {
+            return sema.err(c, s, e, "{name} takes exactly 1 argument (a `ref`)")
+        }
+        let ty = sema.infer_expr(c, t, p, args[0])
+        let rr = tys.resolve(t, ty)
+        let rk = t.k[rr]
+        if not (rk == tys.K_REF or rk == tys.K_ERROR) {
+            return sema.err(c, prog.es(p, args[0]), prog.ee(p, args[0]), "{name} expects a `ref`, not `{tys.show(t, ty)}`")
+        }
+        return if name == "release" { tys.UNIT } else { tys.BOOL }
+    }
+    if name == "now_millis" or name == "monotonic_millis" or name == "monotonic_nanos" {
+        if args.len() > 0 {
+            return sema.err(c, s, e, "{name} takes no arguments")
+        }
+        return tys.I64
+    }
+    if name == "sleep_millis" {
+        if args.len() != 1 {
+            return sema.err(c, s, e, "sleep_millis takes 1 argument (milliseconds)")
+        }
+        sema.check_expr(c, t, p, args[0], tys.I64)
+        return tys.UNIT
+    }
+    if name == "env" {
+        if args.len() != 1 {
+            return sema.err(c, s, e, "env takes exactly 1 argument (the variable name)")
+        }
+        sema.check_expr(c, t, p, args[0], tys.STR)
+        return tys.option_of(t, tys.STR)
+    }
+    if name == "exit" {
+        if args.len() != 1 {
+            return sema.err(c, s, e, "exit takes exactly 1 argument (the status code)")
+        }
+        sema.check_expr(c, t, p, args[0], tys.I64)
+        return tys.fresh(t)
+    }
+    if name == "input" {
+        if args.len() > 0 {
+            return sema.err(c, s, e, "input takes no arguments")
+        }
+        return tys.STR
+    }
+    if name == "Ok" or name == "Err" {
+        if args.len() != 1 {
+            return sema.err(c, s, e, "`{name}` takes exactly 1 argument")
+        }
+        let inner = sema.infer_expr(c, t, p, args[0])
+        let other = tys.fresh(t)
+        if name == "Ok" {
+            return tys.fallible(t, inner, other)
+        }
+        return tys.fallible(t, other, inner)
+    }
+    if name == "fail" {
+        if args.len() != 1 {
+            return sema.err(c, s, e, "fail takes exactly 1 argument (the error value)")
+        }
+        if c.region_depth > 0 {
+            sema.err(c, s, e, "cannot `fail` from inside a region")
+        }
+        let et = sema.infer_expr(c, t, p, args[0])
+        if c.fn_err_ty >= 0 {
+            if not sema.err_fits(c, t, et, c.fn_err_ty) {
+                sema.err(c, s, e, "`fail` raises `{tys.show(t, et)}` but this function declares `{tys.show(t, c.fn_err_ty)}`")
+            }
+        } else {
+            sema.err(c, s, e, "`fail` used in a function that declares no error type")
+        }
+        return tys.fresh(t)
+    }
+    -2
+}
+
+fn check_region_call_in(inout c: Ck, inout t: Tys, p: Prog, owner: str, name: str, args: [i64], s: i64, e: i64) {
+    if c.region_depth == 0 {
+        return
+    }
+    let row = sema.row_of_qualified(c, t, owner, name)
+    if row >= 0 {
+        for ef in tys.row_names(t, row) {
+            if not (ef == "io" or ef == "async" or ef == "unsafe" or ef == "mem") {
+                sema.err(c, s, e, "cannot call `{name}` inside a region — it performs `{ef}`")
+                break
+            }
+        }
+    }
+    for a in args {
+        if prog.kind(p, a) == ast.E_CLOSURE {
+            continue
+        }
+        let ty = sema.infer_expr(c, t, p, a)
+        if sema.carries_fn(c, t, ty) {
+            sema.err(c, prog.es(p, a), prog.ee(p, a), "cannot pass a function into a call inside a region")
+        }
+    }
+}
+
+/// A place as its root name and the field names along it ("[]" for an
+/// index), or "\0" root when it is not one.
+fn place_path(p: Prog, e: i64) -> [str] {
+    let k = prog.kind(p, e)
+    if k == ast.E_IDENT {
+        return [prog.name(p, prog.sl(p, e, 0))]
+    }
+    if k == ast.E_FIELD {
+        var r = place_path(p, prog.sl(p, e, 0))
+        if r.len() == 0 {
+            return []
+        }
+        r.push("." + prog.name(p, prog.sl(p, e, 1)))
+        return r
+    }
+    if k == ast.E_INDEX {
+        var r = place_path(p, prog.sl(p, e, 0))
+        if r.len() == 0 {
+            return []
+        }
+        r.push("[]")
+        return r
+    }
+    []
+}
+
+fn places_overlap(a: [str], b: [str]) -> bool {
+    if a[0] != b[0] {
+        return false
+    }
+    let n = if a.len() < b.len() { a.len() } else { b.len() }
+    for i in 1..n {
+        if a[i] != b[i] {
+            return false
+        }
+    }
+    true
+}
+
+pub fn check_fn_call_in(inout c: Ck, inout t: Tys, p: Prog, owner: str, name: str, fid: i64, args: [i64], s: i64, e: i64) -> i64 {
+    check_region_call_in(c, t, p, owner, name, args, s, e)
+    var fresh: [i64] = []
+    for _ in 0..c.fn_ngen[fid] {
+        fresh.push(tys.fresh(t))
+    }
+    sema.tir_call(c, prog.key(s, e), sema.CR_FN, owner + "::" + name, fresh)
+    let bounds = c.fn_bounds[fid]
+    var bi = 0
+    while bi < fresh.len() and bi < bounds.len() {
+        if bounds[bi] != "" {
+            c.bo_var.push(fresh[bi])
+            c.bo_ifaces.push(sema.bounds_list(bounds[bi]))
+            c.bo_s.push(s)
+            c.bo_e.push(e)
+            c.bo_bounds.push(c.current_bounds)
+            c.bo_names.push(c.current_generics)
+        }
+        bi += 1
+    }
+    let params = c.fn_params[fid]
+    if args.len() != params.len() {
+        return sema.err(c, s, e, "`{name}` expects {params.len()} argument(s), got {args.len()}")
+    }
+    for i in 0..args.len() {
+        let want = tys.subst_generics(t, params[i], fresh)
+        sema.check_expr(c, t, p, args[i], want)
+    }
+    if fresh.len() > 0 {
+        for i in 0..args.len() {
+            let want = tys.subst_generics(t, params[i], fresh)
+            require_map_keys_within(c, t, want, prog.es(p, args[i]), prog.ee(p, args[i]))
+        }
+        let ret = tys.subst_generics(t, c.fn_ret[fid], fresh)
+        require_map_keys_within(c, t, ret, s, e)
+        if c.fn_err[fid] >= 0 {
+            let er = tys.subst_generics(t, c.fn_err[fid], fresh)
+            require_map_keys_within(c, t, er, s, e)
+        }
+        c.pk_name.push(owner + "::" + name)
+        c.pk_fresh.push(fresh)
+        c.pk_s.push(s)
+        c.pk_e.push(e)
+        c.pk_owner.push(c.key_owner)
+    }
+    if c.with_eff.len() > 0 {
+        sema.reject_handler_escape_through_call(c, t, p, args, fid, s, e)
+    }
+    let modes = c.fn_modes[fid]
+    var inout_roots: [str] = []
+    var inout_s: [i64] = []
+    var inout_e: [i64] = []
+    var inout_places: [[str]] = []
+    var own_roots: [str] = []
+    var i = 0
+    while i < args.len() and i < params.len() and i < modes.len() {
+        let a = args[i]
+        let mode = modes[i]
+        if mode == 2 {
+            if prog.kind(p, a) == ast.E_IDENT {
+                let id = prog.sl(p, a, 0)
+                let nm = prog.name(p, id)
+                let b = sema.lookup(c, nm)
+                if b >= 0 and not c.b_owned[b] and c.b_kind[b] == sema.BK_PARAM and sema.is_linear(c, t, c.b_ty[b]) {
+                    sema.err(c, prog.s(p, id), prog.e(p, id), "cannot give away `{nm}`: it is lent to this function, not owned by it")
+                }
+                if not is_copy(t, params[i]) and sema.lookup(c, nm) >= 0 {
+                    sema.mark_moved(c, p, id)
+                    own_roots.push(nm)
+                }
+            }
+        } else if mode == 1 {
+            let pp = place_path(p, a)
+            var tuple_comp = false
+            if pp.len() > 0 {
+                for j in 1..pp.len() {
+                    if pp[j].starts_with(".") and sema.all_digits(pp[j].substr(1, pp[j].len() - 1)) {
+                        tuple_comp = true
+                    }
+                }
+            }
+            if tuple_comp {
+                sema.err(c, prog.es(p, a), prog.ee(p, a), "cannot pass a tuple component as `inout`")
+                i += 1
+                continue
+            }
+            let root = sema.place_root(p, a)
+            if root >= 0 {
+                let nm = prog.name(p, root)
+                sema.reject_region_escape(c, p, root, "pass `inout`")
+                let b0 = sema.lookup(c, nm)
+                var root_is_ref = b0 >= 0 and t.k[c.b_ty[b0]] == tys.K_REF
+                if not root_is_ref {
+                    root_is_ref = sema.path_crosses_ref(c, t, p, a)
+                }
+                if root_is_ref {
+                    sema.err(c, prog.s(p, root), prog.e(p, root), "cannot pass `{nm}` as `inout` — it is reached through a `ref`")
+                }
+                let b = sema.lookup(c, nm)
+                if b >= 0 and not c.b_mut[b] and not root_is_ref {
+                    sema.err(c, prog.s(p, root), prog.e(p, root), "cannot pass `{nm}` as `inout` — it is immutable")
+                }
+                sema.reject_capture_write(c, t, p, root, "pass", " as `inout`")
+                if pp.len() > 0 {
+                    for prev in inout_places {
+                        if places_overlap(prev, pp) {
+                            sema.err(c, prog.s(p, root), prog.e(p, root), "`{nm}` is passed as `inout` twice in one call")
+                            break
+                        }
+                    }
+                    inout_places.push(pp)
+                }
+                inout_roots.push(nm)
+                inout_s.push(prog.s(p, root))
+                inout_e.push(prog.e(p, root))
+            } else {
+                sema.err(c, prog.es(p, a), prog.ee(p, a), "`inout` argument must be a variable, field, or index expression")
+            }
+        }
+        i += 1
+    }
+    for j in 0..inout_roots.len() {
+        if own_roots.contains(inout_roots[j]) {
+            c.d_s.push(inout_s[j])
+            c.d_e.push(inout_e[j])
+            c.d_msg.push("`{inout_roots[j]}` is both moved (`ownv`) and mutated (`inout`) in one call")
+        }
+    }
+    let ret = tys.subst_generics(t, c.fn_ret[fid], fresh)
+    if c.fn_err[fid] >= 0 {
+        let er = tys.subst_generics(t, c.fn_err[fid], fresh)
+        return tys.fallible(t, ret, er)
+    }
+    ret
+}
+
+fn is_copy(inout t: Tys, x: i64) -> bool {
+    let r = tys.resolve(t, x)
+    let k = t.k[r]
+    k == tys.K_I64 or k == tys.K_INT or k == tys.K_F64 or k == tys.K_BOOL or k == tys.K_UNIT or k == tys.K_RANGE or k == tys.K_REF
+}
+
+// ---------------------------------------------------------------------
+// Map keys and parallel functions
+// ---------------------------------------------------------------------
+
+pub fn require_map_keys_within(inout c: Ck, inout t: Tys, x: i64, s: i64, e: i64) {
+    let r = tys.resolve(t, x)
+    let k = t.k[r]
+    if k == tys.K_MAP {
+        require_map_key(c, t, t.a[r], s, e)
+        require_map_keys_within(c, t, t.b[r], s, e)
+    } else if k == tys.K_LIST {
+        require_map_keys_within(c, t, t.a[r], s, e)
+    } else if k == tys.K_TUPLE {
+        for i in tys.items(t, r) {
+            require_map_keys_within(c, t, i, s, e)
+        }
+    } else if k == tys.K_FALLIBLE {
+        require_map_keys_within(c, t, t.a[r], s, e)
+    }
+}
+
+pub fn require_map_key(inout c: Ck, inout t: Tys, k: i64, s: i64, e: i64) {
+    if not map_key_ok(c, t, k) {
+        sema.err(c, s, e, "map keys must be an integer type, `str`, `bool` or a tuple of those, not `{tys.show(t, k)}`")
+    }
+}
+
+fn map_key_ok(inout c: Ck, inout t: Tys, x: i64) -> bool {
+    let r = tys.resolve(t, x)
+    let k = t.k[r]
+    if k == tys.K_TUPLE {
+        var ok = t.n[r] > 0
+        for i in tys.items(t, r) {
+            if not map_key_ok(c, t, i) {
+                ok = false
+            }
+        }
+        return ok
+    }
+    if k == tys.K_GENERIC and c.key_owner != "\0" {
+        sema.set_add_pub(c.key_generics, c.key_owner, t.a[r])
+    }
+    k == tys.K_I64 or k == tys.K_INT or k == tys.K_STR or k == tys.K_BOOL or k == tys.K_VAR or k == tys.K_GENERIC or k == tys.K_ERROR
+}
+
+pub fn check_parallel_fn(inout c: Ck, inout t: Tys, p: Prog, arg: i64, want: i64) {
+    if prog.kind(p, arg) == ast.E_IDENT {
+        let id = prog.sl(p, arg, 0)
+        match c.let_closure.get(prog.name(p, id)) {
+            Some(at) -> {
+                c.pn_at.push(at)
+                c.pn_name.push(prog.name(p, id))
+                c.pn_s.push(prog.s(p, id))
+                c.pn_e.push(prog.e(p, id))
+            }
+            None -> ()
+        }
+    }
+    let outer = c.parallel_fn_floor
+    c.parallel_fn_floor = sema.depth(c)
+    sema.check_expr(c, t, p, arg, want)
+    c.parallel_fn_floor = outer
+}
+
+pub fn reject_parallel_ref_elem(inout c: Ck, inout t: Tys, elem: i64, name: str, s: i64, e: i64) {
+    let r = tys.resolve(t, elem)
+    if t.k[r] == tys.K_GENERIC {
+        if c.key_owner != "\0" {
+            sema.set_add_pub(c.par_generics, c.key_owner, t.a[r])
+        }
+        return
+    }
+    if not sema.carries_ref(c, t, elem) {
+        return
+    }
+    sema.err(c, s, e, "`{name}` cannot process `{tys.show(t, elem)}` — it reaches a `ref`, which every element would share")
+}
+
+// ---------------------------------------------------------------------
+// Raw memory and the runtime dialect
+// ---------------------------------------------------------------------
+
+fn tls_cell(inout c: Ck, p: Prog, arg: i64) -> str {
+    var found = "\0"
+    if prog.kind(p, arg) == ast.E_IDENT {
+        let nm = prog.name(p, prog.sl(p, arg, 0))
+        if sema.lookup(c, nm) < 0 {
+            let key = c.cur + "::" + nm
+            if c.cells.has(key) {
+                found = key
+            }
+        }
+    }
+    if found == "\0" {
+        sema.err(c, prog.es(p, arg), prog.ee(p, arg), "`mem_tls` takes the name of a `thread_local` cell this module declares")
+    }
+    found
+}
+
+fn process_cell(inout c: Ck, p: Prog, arg: i64) -> str {
+    var found = "\0"
+    if prog.kind(p, arg) == ast.E_IDENT {
+        let nm = prog.name(p, prog.sl(p, arg, 0))
+        if sema.lookup(c, nm) < 0 {
+            let key = c.cur + "::" + nm
+            if c.pcells.has(key) {
+                found = key
+            }
+        }
+    }
+    if found == "\0" {
+        sema.err(c, prog.es(p, arg), prog.ee(p, arg), "`mem_process` takes the name of a `process_local` cell this module declares")
+    }
+    found
+}
+
+/// The function `mem_fn_addr` names, recorded; false when refused.
+fn fn_addr_target(inout c: Ck, inout t: Tys, p: Prog, arg: i64, key: i64) -> bool {
+    var q = ""
+    var as_ = prog.es(p, arg)
+    var ae = prog.ee(p, arg)
+    let k = prog.kind(p, arg)
+    if k == ast.E_IDENT {
+        let id = prog.sl(p, arg, 0)
+        let nm = prog.name(p, id)
+        if sema.lookup(c, nm) < 0 {
+            q = c.cur + "::" + nm
+            as_ = prog.s(p, id)
+            ae = prog.e(p, id)
+        }
+    } else if k == ast.E_FIELD {
+        let recv = prog.sl(p, arg, 0)
+        let fname = prog.sl(p, arg, 1)
+        if prog.kind(p, recv) == ast.E_IDENT {
+            let mn = prog.name(p, prog.sl(p, recv, 0))
+            if sema.lookup(c, mn) < 0 {
+                let target = prog.import_of(p, c.cur_mi, mn)
+                if target != "\0" {
+                    q = target + "::" + prog.name(p, fname)
+                    as_ = prog.s(p, fname)
+                    ae = prog.e(p, fname)
+                }
+            }
+        }
+    }
+    let fid = sema.fn_of(c, q)
+    if fid < 0 {
+        sema.err(c, as_, ae, "`mem_fn_addr` takes the name of a declared function")
+        return false
+    }
+    if c.extern_names.has(q) {
+        c.cop_kind.set(key, sema.CO_FNADDR)
+        c.cop_s.set(key, q)
+        return true
+    }
+    if not q.starts_with(c.cur + "::") and not c.fn_pub[fid] {
+        sema.err(c, as_, ae, "function `{q}` is private to its module")
+        return false
+    }
+    let sig = sema.c_entry_sig(c, t, q, fid, as_, ae, "have its address taken")
+    if sig == "\0" {
+        return false
+    }
+    c.c_sigs.set(q, sig)
+    c.cop_kind.set(key, sema.CO_FNADDR)
+    c.cop_s.set(key, q)
+    true
+}
+
+/// The layout type `mem_size_of(T)` names, or "".
+fn mem_layout_arg(inout c: Ck, inout t: Tys, p: Prog, arg: i64, fname: str) -> str {
+    if prog.kind(p, arg) != ast.E_IDENT {
+        sema.err(c, prog.es(p, arg), prog.ee(p, arg), "`{fname}` takes a type, written as its name")
+        return ""
+    }
+    let id = prog.sl(p, arg, 0)
+    let ty = resolve_named(c, t, p, id)
+    if ty == tys.ERROR {
+        return ""
+    }
+    let m = sema.memty_of(t, ty)
+    if m == "" {
+        sema.err(c, prog.s(p, id), prog.e(p, id), "`{tys.show(t, ty)}` has no layout in raw memory")
+    }
+    m
+}
+
+/// `resolve_type` of a bare name written as an identifier.
+pub fn resolve_named(inout c: Ck, inout t: Tys, p: Prog, id: i64) -> i64 {
+    let name = prog.name(p, id)
+    let s = prog.s(p, id)
+    let e = prog.e(p, id)
+    for i in 0..c.current_generics.len() {
+        if c.current_generics[i] == name {
+            return tys.generic(t, i)
+        }
+    }
+    let ik = tys.int_of_name(name)
+    if ik >= 0 {
+        return tys.int_ty(ik)
+    }
+    if name == "i64" or name == "int" {
+        return tys.I64
+    }
+    if name == "usize" or name == "f32" {
+        return sema.err(c, s, e, "`{name}` is not implemented yet")
+    }
+    if name == "f64" or name == "float" {
+        return tys.F64
+    }
+    if name == "bool" {
+        return tys.BOOL
+    }
+    if name == "str" {
+        return tys.STR
+    }
+    if name == "bytes" {
+        return tys.BYTES
+    }
+    if name == "StrBuilder" {
+        return tys.STRBUF
+    }
+    if name == "ByteBuilder" {
+        return tys.BYTEBUF
+    }
+    if name == "addr" {
+        return tys.ADDR
+    }
+    if name == "range" {
+        return tys.RANGE
+    }
+    if name == "Map" {
+        return sema.err(c, s, e, "`Map` takes exactly 2 type arguments: Map[K, V]")
+    }
+    match c.aliases.get(name) {
+        Some(a) -> return a
+        None -> ()
+    }
+    let id2 = tys.def_of(t, name)
+    if id2 >= 0 {
+        let want = t.d_gen[id2].len()
+        if want != 0 {
+            return sema.err(c, s, e, "type `{name}` expects {want} type argument(s), got 0")
+        }
+        return tys.named(t, id2, [])
+    }
+    sema.err(c, s, e, "unknown type `{name}`")
+}
+
+fn check_mem_fn(inout c: Ck, inout t: Tys, p: Prog, name: str, id: i64, args: [i64], s: i64, e: i64) -> i64 {
+    let key = prog.key(s, e)
+    sema.require_unsafe_mem(c, name, prog.s(p, id), prog.e(p, id))
+    let want = if name == "mem_alloc" { 2 } else { 1 }
+    if args.len() != want {
+        return sema.err(c, s, e, "`{name}` takes {want} argument(s), got {args.len()}")
+    }
+    if name == "mem_alloc" {
+        sema.check_expr(c, t, p, args[0], tys.I64)
+        sema.check_expr(c, t, p, args[1], tys.I64)
+        c.mem_kind.set(key, sema.MO_OTHER)
+        return tys.ADDR
+    }
+    if name == "mem_free" {
+        sema.check_expr(c, t, p, args[0], tys.ADDR)
+        c.mem_kind.set(key, sema.MO_OTHER)
+        return tys.UNIT
+    }
+    if name == "mem_addr" {
+        sema.check_expr(c, t, p, args[0], tys.I64)
+        c.mem_kind.set(key, sema.MO_OTHER)
+        return tys.ADDR
+    }
+    if name == "mem_fn_addr" {
+        if not fn_addr_target(c, t, p, args[0], key) {
+            return tys.ERROR
+        }
+        c.mem_kind.set(key, sema.MO_FNADDR)
+        return tys.ADDR
+    }
+    if name == "mem_tls" {
+        let cell = tls_cell(c, p, args[0])
+        if cell == "\0" {
+            return tys.ERROR
+        }
+        c.cop_kind.set(key, sema.CO_TLS)
+        c.cop_s.set(key, cell)
+        c.mem_kind.set(key, sema.MO_TLS)
+        return tys.ADDR
+    }
+    let m = mem_layout_arg(c, t, p, args[0], name)
+    if m == "" {
+        return tys.ERROR
+    }
+    if name == "mem_size_of" {
+        c.mem_kind.set(key, sema.MO_SIZE)
+    } else {
+        c.mem_kind.set(key, sema.MO_ALIGN)
+    }
+    c.mem_s.set(key, m)
+    tys.I64
+}
+
+fn check_runtime_fn(inout c: Ck, inout t: Tys, p: Prog, name: str, id: i64, args: [i64], s: i64, e: i64) -> i64 {
+    let key = prog.key(s, e)
+    if not sema.runtime_only(c, prog.s(p, id), prog.e(p, id), "`{name}`") {
+        return tys.ERROR
+    }
+    sema.require_unsafe_mem(c, name, prog.s(p, id), prog.e(p, id))
+    var want = 1
+    if name == "ctx_switch" {
+        want = 2
+    } else if name == "ctx_init" {
+        want = 4
+    }
+    if args.len() != want {
+        return sema.err(c, s, e, "`{name}` takes {want} argument(s), got {args.len()}")
+    }
+    if name == "mem_process" {
+        let cell = process_cell(c, p, args[0])
+        if cell == "\0" {
+            return tys.ERROR
+        }
+        c.cop_kind.set(key, sema.CO_PROCESS)
+        c.cop_s.set(key, cell)
+        c.mem_kind.set(key, sema.MO_PROCESS)
+        return tys.ADDR
+    }
+    if name == "mem_static" or name == "mem_static_len" {
+        var text = "\0"
+        let a = args[0]
+        if prog.kind(p, a) == ast.E_STR {
+            var b = str_builder()
+            var ok = true
+            for pc in prog.items(p, prog.sl(p, a, 0)) {
+                if prog.kind(p, pc) == ast.PC_TEXT {
+                    b.push_str(prog.text(p, pc))
+                } else {
+                    ok = false
+                }
+            }
+            if ok {
+                text = b.to_str()
+            }
+        }
+        if text == "\0" {
+            return sema.err(c, prog.es(p, a), prog.ee(p, a), "`{name}` takes a string literal")
+        }
+        c.cop_kind.set(key, sema.CO_STATIC)
+        c.cop_s.set(key, text)
+        if name == "mem_static" {
+            c.mem_kind.set(key, sema.MO_STATIC)
+            return tys.ADDR
+        }
+        c.mem_kind.set(key, sema.MO_STATICLEN)
+        return tys.I64
+    }
+    for a in args {
+        sema.check_expr(c, t, p, a, tys.ADDR)
+    }
+    c.mem_kind.set(key, sema.MO_OTHER)
+    tys.UNIT
+}

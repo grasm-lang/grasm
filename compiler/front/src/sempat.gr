@@ -1,0 +1,600 @@
+// `match`, patterns and closures (check.rs `infer_match_with`,
+// `check_pattern`, `missing_for`, `infer_closure`).
+import ast
+import prog
+import tys
+import sema
+
+/// Separates a constructor from a refutable payload tag.
+fn payload_sep() -> str {
+    "\u{2}"
+}
+
+fn tag_with_payload(name: str, subs: [str]) -> str {
+    var all_none = true
+    for s in subs {
+        if s != "\0" {
+            all_none = false
+        }
+    }
+    if all_none {
+        return name
+    }
+    if subs.len() == 1 {
+        return name + payload_sep() + subs[0]
+    }
+    name + payload_sep() + "?"
+}
+
+fn is_whole_call(p: Prog, e: i64) -> bool {
+    let n = sema.call_name(p, e)
+    n == "Ok" or n == "Err"
+}
+
+pub fn infer_match_with(inout c: Ck, inout t: Tys, p: Prog, scrut: i64, arms: [i64], s: i64, e: i64, want: i64) -> i64 {
+    var st = sema.infer_expr(c, t, p, scrut)
+    sema.force_deferred(c, t, p, st)
+    let rs = tys.resolve(t, st)
+    if t.k[rs] == tys.K_REF {
+        st = t.a[rs]
+    }
+    var result = want
+    if result < 0 {
+        result = tys.fresh(t)
+    }
+    var covered: [str] = []
+    var has_irrefutable = false
+    let before = sema.moved_snapshot(c)
+    var arm_states: [[bool]] = []
+    var deferred: [i64] = []
+    for arm in arms {
+        sema.restore_moved(c, before)
+        sema.push_scope(c)
+        c.dc_depth += 1
+        c.df_depth += 1
+        let tag = check_pattern(c, t, p, prog.sl(p, arm, 0), st)
+        let guard = prog.sl(p, arm, 1)
+        if guard >= 0 {
+            sema.check_expr(c, t, p, guard, tys.BOOL)
+        } else {
+            if tag == "\0" {
+                has_irrefutable = true
+            } else {
+                for x in tag.split("\u{1}") {
+                    covered.push(x)
+                }
+            }
+        }
+        let body = prog.sl(p, arm, 2)
+        if sema.defers_to_context(p, body) {
+            deferred.push(body)
+        } else {
+            let arm_ty = sema.infer_expr(c, t, p, body)
+            if not tys.unify(t, arm_ty, result) {
+                let merged = sema.merge_fallible_branches_at(c, t, p, arm_ty, result, -1, -1)
+                if merged >= 0 {
+                    if t.k[tys.shallow(t, arm_ty)] != tys.K_FALLIBLE {
+                        let k = prog.ekey(p, body)
+                        c.ok_wrapped.set(k, true)
+                        c.f_wraps.set(k, merged)
+                    }
+                    tys.unify(t, result, merged)
+                } else {
+                    let mark = sema.errs(c)
+                    sema.check_expr(c, t, p, body, result)
+                    if sema.errs(c) > mark {
+                        sema.truncate_errs(c, mark)
+                        sema.unify_or_report(c, t, prog.es(p, body), prog.ee(p, body), arm_ty, result)
+                    }
+                }
+            }
+        }
+        sema.run_deferred_closures(c, t, p, c.dc_depth)
+        c.dc_depth -= 1
+        sema.settle_deferred_fields(c, t, p, c.df_depth)
+        c.df_depth -= 1
+        sema.pop_scope(c)
+        arm_states.push(sema.moved_snapshot(c))
+    }
+    // Ok/Err bodies first, keeping the order otherwise.
+    var ordered: [i64] = []
+    for b in deferred {
+        if is_whole_call(p, b) {
+            ordered.push(b)
+        }
+    }
+    for b in deferred {
+        if not is_whole_call(p, b) {
+            ordered.push(b)
+        }
+    }
+    for body in ordered {
+        let r = tys.shallow(t, result)
+        if t.k[r] == tys.K_FALLIBLE {
+            if not is_whole_call(p, body) {
+                let ok = t.a[r]
+                let k = prog.ekey(p, body)
+                c.ok_wrapped.set(k, true)
+                c.f_wraps.set(k, r)
+                sema.check_expr(c, t, p, body, ok)
+                continue
+            }
+        }
+        sema.check_expr(c, t, p, body, result)
+    }
+    sema.restore_moved(c, before)
+    var leaves: [bool] = []
+    for arm in arms {
+        leaves.push(sema.expr_leaves(p, prog.sl(p, arm, 2)))
+    }
+    if arm_states.len() > 0 {
+        sema.merge_branches(c, t, arm_states, leaves, s, e)
+    }
+    if not has_irrefutable {
+        let missing = missing_for(c, t, st, covered)
+        var shown: [str] = []
+        for m in missing {
+            if not covered.contains(m) {
+                shown.push(m)
+            }
+        }
+        if shown.len() > 0 {
+            sema.err(c, s, e, "match is not exhaustive — missing `{shown.join("`, `")}`")
+        }
+    }
+    result
+}
+
+/// Which constructors of `x` no arm covers.
+fn missing_for(inout c: Ck, inout t: Tys, x: i64, covered: [str]) -> [str] {
+    let r = tys.resolve(t, x)
+    let k = t.k[r]
+    var missing: [str] = []
+    if k == tys.K_NAMED {
+        let def = t.a[r]
+        if t.d_sum[def] {
+            let targs = tys.items(t, r)
+            for vi in 0..tys.variant_count(t, def) {
+                if not variant_is_covered(c, t, def, vi, targs, covered) {
+                    missing.push(tys.variant_name(t, def, vi))
+                }
+            }
+        } else {
+            missing.push("_")
+        }
+    } else if k == tys.K_BOOL {
+        for n in ["true", "false"] {
+            if not covered.contains(n) {
+                missing.push(n)
+            }
+        }
+    } else if k == tys.K_FALLIBLE {
+        if not tag_is_covered(c, t, "Ok", t.a[r], covered) {
+            missing.push("Ok")
+        }
+        if not tag_is_covered(c, t, "Err", t.b[r], covered) {
+            missing.push("Err")
+        }
+    } else if k == tys.K_TUPLE and t.n[r] > 0 and t.n[r] <= 8 and all_bool(t, r) {
+        let n = t.n[r]
+        var bits = 0
+        var total = 1
+        for _ in 0..n {
+            total = total * 2
+        }
+        while bits < total {
+            var combo: [str] = []
+            var v = bits
+            for _ in 0..n {
+                if v % 2 == 1 {
+                    combo.push("true")
+                } else {
+                    combo.push("false")
+                }
+                v = v / 2
+            }
+            var is_cov = false
+            for tag in covered {
+                if tag.starts_with("(") and tag.ends_with(")") and tag.len() >= 2 {
+                    let inner = tag.substr(1, tag.len() - 2)
+                    let parts = inner.split(", ")
+                    if parts.len() == n {
+                        var all = true
+                        for i in 0..n {
+                            if not (parts[i] == "_" or parts[i] == combo[i]) {
+                                all = false
+                            }
+                        }
+                        if all {
+                            is_cov = true
+                        }
+                    }
+                }
+            }
+            if not is_cov {
+                missing.push("(" + combo.join(", ") + ")")
+            }
+            bits += 1
+        }
+    } else if k == tys.K_ERROR {
+        missing = []
+    } else {
+        missing.push("_")
+    }
+    var out: [str] = []
+    for m in missing {
+        if not covered.contains(m) {
+            out.push(m)
+        }
+    }
+    out
+}
+
+fn all_bool(inout t: Tys, r: i64) -> bool {
+    for i in tys.items(t, r) {
+        if tys.resolve(t, i) != tys.BOOL {
+            return false
+        }
+    }
+    true
+}
+
+fn variant_is_covered(inout c: Ck, inout t: Tys, def: i64, vi: i64, targs: [i64], covered: [str]) -> bool {
+    let vname = tys.variant_name(t, def, vi)
+    if covered.contains(vname) {
+        return true
+    }
+    let (_, ftys) = tys.variant_fields(t, def, vi)
+    if ftys.len() != 1 {
+        return false
+    }
+    let want = tys.subst_generics(t, ftys[0], targs)
+    tag_is_covered(c, t, vname, want, covered)
+}
+
+fn tag_is_covered(inout c: Ck, inout t: Tys, tag: str, payload: i64, covered: [str]) -> bool {
+    if covered.contains(tag) {
+        return true
+    }
+    let prefix = tag + payload_sep()
+    var subs: [str] = []
+    for cv in covered {
+        if cv.starts_with(prefix) {
+            subs.push(cv.substr(prefix.len(), cv.len() - prefix.len()))
+        }
+    }
+    if subs.len() == 0 or subs.contains("?") {
+        return false
+    }
+    missing_for(c, t, payload, subs).len() == 0
+}
+
+fn live_in_top_scope(c: Ck) -> i64 {
+    if c.sc_start.len() == 0 {
+        return 0
+    }
+    let start = c.sc_start[c.sc_start.len() - 1]
+    var n = 0
+    for i in start..c.b_name.len() {
+        if not c.b_dead[i] {
+            n += 1
+        }
+    }
+    n
+}
+
+/// Checks a pattern against `expected`, binding names; the constructor tag
+/// it covers, or "\0" when irrefutable.
+fn check_pattern(inout c: Ck, inout t: Tys, p: Prog, pat: i64, expected: i64) -> str {
+    let k = prog.kind(p, pat)
+    let s = prog.ps(p, pat)
+    let e = prog.pe(p, pat)
+    if k == ast.P_OR {
+        var tags: [str] = []
+        var irrefutable = false
+        for a in prog.items(p, prog.sl(p, pat, 0)) {
+            let before = live_in_top_scope(c)
+            let tg = check_pattern(c, t, p, a, expected)
+            if tg == "\0" {
+                irrefutable = true
+            } else {
+                tags.push(tg)
+            }
+            let after = live_in_top_scope(c)
+            if after > before {
+                sema.err(c, prog.ps(p, a), prog.pe(p, a), "an alternative in `a | b` cannot bind a name")
+            }
+        }
+        if irrefutable {
+            return "\0"
+        }
+        return tags.join("\u{1}")
+    }
+    if k == ast.P_WILD {
+        return "\0"
+    }
+    if k == ast.P_INT {
+        if p.wide.has(s) {
+            sema.err(c, s, e, "a pattern names a value from 0 to 9223372036854775807")
+            return "<int>"
+        }
+        let v = prog.sl(p, pat, 0)
+        let r = tys.shallow(t, expected)
+        if t.k[r] == tys.K_INT {
+            let ik = t.a[r]
+            if ik == 6 and v < 0 {
+                sema.err(c, s, e, "a pattern on a `u64` names a value from 0 to 9223372036854775807")
+            } else if not int_fits(ik, v) {
+                sema.err(c, s, e, "`{v}` does not fit in `{tys.int_name(ik)}`")
+            }
+            return "<int>"
+        }
+        sema.unify_or_report(c, t, s, e, tys.I64, expected)
+        return "<int>"
+    }
+    if k == ast.P_BOOL {
+        sema.unify_or_report(c, t, s, e, tys.BOOL, expected)
+        if prog.sl(p, pat, 0) != 0 {
+            return "true"
+        }
+        return "false"
+    }
+    if k == ast.P_STR {
+        sema.unify_or_report(c, t, s, e, tys.STR, expected)
+        return "<str>"
+    }
+    if k == ast.P_BIND {
+        let id = prog.sl(p, pat, 0)
+        let name = prog.name(p, id)
+        let r = tys.resolve(t, expected)
+        if t.k[r] == tys.K_FALLIBLE and (name == "Ok" or name == "Err") {
+            sema.err(c, prog.s(p, id), prog.e(p, id), "variant `{name}` has 1 field(s) — bind them: `{name}(..)`")
+            return name
+        }
+        if t.k[r] == tys.K_NAMED and t.d_sum[t.a[r]] {
+            let def = t.a[r]
+            let vi = tys.variant_index(t, def, name)
+            if vi >= 0 {
+                let (fs, _) = tys.variant_fields(t, def, vi)
+                if fs.len() > 0 {
+                    sema.err(c, prog.s(p, id), prog.e(p, id), "variant `{name}` has {fs.len()} field(s) — bind them: `{name}(..)`")
+                }
+                return name
+            }
+        }
+        sema.bind(c, p, id, expected, false)
+        return "\0"
+    }
+    if k == ast.P_VARIANT {
+        let path = prog.sl(p, pat, 0)
+        let vname = prog.path_last(p, path)
+        let fields = prog.items(p, prog.sl(p, pat, 1))
+        let r = tys.resolve(t, expected)
+        if t.k[r] == tys.K_FALLIBLE {
+            if vname == "Ok" or vname == "Err" {
+                var sub = "\0"
+                if fields.len() == 1 {
+                    let inner = if vname == "Ok" { t.a[r] } else { t.b[r] }
+                    sub = check_pattern(c, t, p, fields[0], inner)
+                } else {
+                    sema.err(c, s, e, "`{vname}` pattern takes exactly 1 binding")
+                }
+                return tag_with_payload(vname, [sub])
+            }
+            sema.err(c, s, e, "matching a fallible value — use `Ok(..)` and `Err(..)` arms")
+            return vname
+        }
+        if t.k[r] == tys.K_ERROR {
+            return vname
+        }
+        if t.k[r] != tys.K_NAMED {
+            sema.err(c, s, e, "pattern `{vname}(..)` cannot match a `{tys.show(t, r)}`")
+            return vname
+        }
+        let def = t.a[r]
+        let targs = tys.items(t, r)
+        if prog.path_len(p, path) == 2 {
+            let tname = prog.name(p, prog.items(p, prog.sl(p, path, 0))[0])
+            if tname != t.d_name[def] {
+                sema.err(c, prog.s(p, path), prog.e(p, path), "pattern names `{tname}` but the value is `{t.d_name[def]}`")
+            }
+        }
+        if not t.d_sum[def] {
+            sema.err(c, s, e, "struct values are matched with bindings, not variants")
+            return vname
+        }
+        let vi = tys.variant_index(t, def, vname)
+        if vi >= 0 {
+            let (_, ftys) = tys.variant_fields(t, def, vi)
+            if fields.len() != ftys.len() {
+                sema.err(c, s, e, "variant `{vname}` has {ftys.len()} field(s), pattern binds {fields.len()}")
+            }
+            var subs: [str] = []
+            var i = 0
+            while i < fields.len() and i < ftys.len() {
+                let want = tys.subst_generics(t, ftys[i], targs)
+                subs.push(check_pattern(c, t, p, fields[i], want))
+                i += 1
+            }
+            return tag_with_payload(vname, subs)
+        }
+        sema.err(c, s, e, "`{t.d_name[def]}` has no variant `{vname}`")
+        return vname
+    }
+    // P_TUPLE
+    let items = prog.items(p, prog.sl(p, pat, 0))
+    var subs: [str] = []
+    let r = tys.resolve(t, expected)
+    if t.k[r] == tys.K_TUPLE {
+        let mts = tys.items(t, r)
+        if items.len() != mts.len() {
+            sema.err(c, s, e, "tuple pattern has {items.len()} element(s) but the value has {mts.len()}")
+        }
+        var i = 0
+        while i < items.len() and i < mts.len() {
+            subs.push(check_pattern(c, t, p, items[i], mts[i]))
+            i += 1
+        }
+    } else if t.k[r] != tys.K_ERROR {
+        sema.err(c, s, e, "tuple pattern cannot match `{tys.show(t, r)}`")
+    }
+    var all_none = true
+    for x in subs {
+        if x != "\0" {
+            all_none = false
+        }
+    }
+    if all_none {
+        return "\0"
+    }
+    var combo: [str] = []
+    for x in subs {
+        if x == "\0" {
+            combo.push("_")
+        } else {
+            combo.push(x)
+        }
+    }
+    "(" + combo.join(", ") + ")"
+}
+
+fn int_fits(k: i64, v: i64) -> bool {
+    if k == 6 {
+        return v >= 0
+    }
+    let bits = tys.int_bits(k)
+    var lim = 1
+    for _ in 0..bits - 1 {
+        lim = lim * 2
+    }
+    if tys.int_signed(k) {
+        return v >= 0 - lim and v <= lim - 1
+    }
+    v >= 0 and v <= lim * 2 - 1
+}
+
+/// A closure literal, against an expected function type (-1 for none).
+pub fn infer_closure(inout c: Ck, inout t: Tys, p: Prog, e: i64, expected: i64) -> i64 {
+    let params = prog.items(p, prog.sl(p, e, 0))
+    let body = prog.sl(p, e, 1)
+    let start = prog.s(p, e)
+    var exp_fn = false
+    if expected >= 0 and t.k[expected] == tys.K_FN {
+        exp_fn = true
+    }
+    var param_tys: [i64] = []
+    if exp_fn and t.n[expected] == params.len() {
+        param_tys = tys.items(t, expected)
+    } else {
+        for _ in params {
+            param_tys.push(tys.fresh(t))
+        }
+    }
+    if exp_fn and t.n[expected] != params.len() {
+        sema.err(c, start, prog.e(p, e), "closure takes {params.len()} parameter(s) but {t.n[expected]} are expected")
+    }
+    let own_row = c.closure_rows.get(start) ?? -1
+    if expected < 0 and params.len() > 0 {
+        if c.dc_depth > 0 {
+            let ret = tys.fresh(t)
+            sema.defer_closure(c, params, body, param_tys, ret, start)
+            c.closure_types.set(start, ret)
+            c.closure_types.set(prog.es(p, body), ret)
+            return tys.fnt(t, param_tys, ret, own_row)
+        }
+    }
+    sema.push_scope(c)
+    c.closure_floors.push(sema.depth(c) - 1)
+    let saved_conc = c.concurrent_depth
+    c.concurrent_depth = 0
+    let saved_touch = c.closure_touches_outside_ref
+    c.closure_touches_outside_ref = false
+    var i = 0
+    while i < params.len() and i < param_tys.len() {
+        sema.bind(c, p, params[i], param_tys[i], false)
+        i += 1
+    }
+    c.dc_depth += 1
+    var want_ret = -1
+    if exp_fn {
+        want_ret = tys.resolve(t, t.a[expected])
+    }
+    let saved_err = c.fn_err_ty
+    var closure_ret = -1
+    if want_ret >= 0 and t.k[want_ret] == tys.K_FALLIBLE {
+        closure_ret = t.a[want_ret]
+    } else if want_ret >= 0 {
+        closure_ret = want_ret
+    } else {
+        closure_ret = tys.fresh(t)
+    }
+    let saved_fn_ret = c.fn_ret_ty
+    c.fn_ret_ty = closure_ret
+    let saved_loop = c.loop_depth
+    c.loop_depth = 0
+    var ret = -1
+    if want_ret >= 0 and t.k[want_ret] == tys.K_FALLIBLE {
+        c.fn_err_ty = t.b[want_ret]
+        let produced = sema.infer_expr(c, t, p, body)
+        if tys.unify(t, produced, want_ret) {
+            ret = want_ret
+        } else {
+            sema.check_expr(c, t, p, body, t.a[want_ret])
+            ret = want_ret
+        }
+    } else {
+        if not c.hof_closures.has(start) {
+            c.fn_err_ty = -1
+        }
+        var w = -1
+        if want_ret >= 0 {
+            let sh = tys.shallow(t, want_ret)
+            if t.k[sh] != tys.K_VAR and t.k[sh] != tys.K_ERROR {
+                w = want_ret
+            }
+        }
+        if w >= 0 {
+            let mark = sema.errs(c)
+            sema.check_expr(c, t, p, body, w)
+            if sema.errs(c) > mark {
+                var cs: [i64] = []
+                var ce: [i64] = []
+                var cm: [str] = []
+                for j in mark..c.d_s.len() {
+                    cs.push(c.d_s[j])
+                    ce.push(c.d_e[j])
+                    cm.push(c.d_msg[j])
+                }
+                sema.truncate_errs(c, mark)
+                let inferred = sema.infer_expr(c, t, p, body)
+                if sema.errs(c) == mark {
+                    for j in 0..cs.len() {
+                        c.d_s.push(cs[j])
+                        c.d_e.push(ce[j])
+                        c.d_msg.push(cm[j])
+                    }
+                }
+                ret = inferred
+            } else {
+                ret = w
+            }
+        } else {
+            ret = sema.infer_expr(c, t, p, body)
+        }
+    }
+    c.fn_err_ty = saved_err
+    c.fn_ret_ty = saved_fn_ret
+    c.loop_depth = saved_loop
+    sema.run_deferred_closures(c, t, p, c.dc_depth)
+    c.dc_depth -= 1
+    c.concurrent_depth = saved_conc
+    c.closure_floors.pop()
+    sema.pop_scope(c)
+    if c.closure_touches_outside_ref {
+        c.ref_touching.set(start, true)
+    }
+    c.closure_touches_outside_ref = saved_touch
+    c.closure_types.set(start, ret)
+    c.closure_types.set(prog.es(p, body), ret)
+    tys.fnt(t, param_tys, ret, own_row)
+}

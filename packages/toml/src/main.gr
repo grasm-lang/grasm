@@ -24,10 +24,14 @@ type TomlValue =
 
 type TomlError = { why: str, line: i64 }
 
-type Doc = { keys: [str], values: [ref TomlValue], ok: bool, why: str, line: i64 }
+/// `keys[i]` is the dotted path of `values[i]`. `entries[i]` is the same path
+/// with the entry of an array of tables it was written in: after the second
+/// `[[bin]]`, `name = "b"` is `bin.name` in `keys` and `bin[1].name` here, so
+/// a reader that needs to know which entry a key belongs to can.
+type Doc = { keys: [str], values: [ref TomlValue], entries: [str], ok: bool, why: str, line: i64 }
 
 fn refused(why: str, line: i64) -> Doc {
-    Doc{ keys: [], values: [], ok: false, why: why, line: line }
+    Doc{ keys: [], values: [], entries: [], ok: false, why: why, line: line }
 }
 
 /// Every key in the document, flattened to a dotted path.
@@ -38,7 +42,13 @@ fn refused(why: str, line: i64) -> Doc {
 pub fn parse(text: str) -> Doc {
     var keys: [str] = []
     var values: [ref TomlValue] = []
+    var entries: [str] = []
     var prefix = ""
+    // The same prefix with the entry of an array of tables, and how many
+    // entries each array has had so far.
+    var entry_prefix = ""
+    var array_names: [str] = []
+    var array_counts: [i64] = []
     var line_no = 0
     for raw in text.lines() {
         line_no = line_no + 1
@@ -52,17 +62,34 @@ pub fn parse(text: str) -> Doc {
             }
             var inner = line.substr(1, line.len() - 2)
             // `[[a.b]]` is an array of tables. Every entry after it belongs to
-            // the same path here; distinguishing the members is more structure
-            // than a flat reader needs, and pretending otherwise would lose
-            // the earlier ones silently.
+            // the same path in `keys`, which is what a flat reader asks for;
+            // `entries` says which entry.
+            var array = false
             if inner.starts_with("[") and inner.ends_with("]") {
                 inner = inner.substr(1, inner.len() - 2)
+                array = true
             }
             let name = unquote_path(inner.trim())
             if name.is_empty() {
                 return refused("a table header with no name", line_no)
             }
             prefix = name
+            entry_prefix = name
+            if array {
+                var at = -1
+                for i in 0..array_names.len() {
+                    if array_names[i] == name {
+                        at = i
+                    }
+                }
+                if at < 0 {
+                    array_names.push(name)
+                    array_counts.push(0)
+                    at = array_names.len() - 1
+                }
+                entry_prefix = name + "[{array_counts[at]}]"
+                array_counts[at] = array_counts[at] + 1
+            }
             continue
         }
         match line.index_of("=") {
@@ -77,29 +104,32 @@ pub fn parse(text: str) -> Doc {
                     Err(e) -> return refused(e.why, e.line)
                     Ok(v) -> {
                         let full = if prefix.is_empty() { key } else { prefix + "." + key }
+                        let placed = if entry_prefix.is_empty() { key } else { entry_prefix + "." + key }
                         keys.push(full)
                         values.push(v)
+                        entries.push(placed)
                         // An inline table is also reachable by its members'
                         // dotted paths, which is what makes
                         // `dependencies.json.version` work whether the file
                         // wrote it inline or as a header.
-                        flatten_into(full, v, keys, values)
+                        flatten_into(full, placed, v, keys, values, entries)
                     }
                 }
             }
         }
     }
-    Doc{ keys: keys, values: values, ok: true, why: "", line: 0 }
+    Doc{ keys: keys, values: values, entries: entries, ok: true, why: "", line: 0 }
 }
 
-fn flatten_into(prefix: str, v: ref TomlValue, inout keys: [str], inout values: [ref TomlValue]) {
+fn flatten_into(prefix: str, placed: str, v: ref TomlValue, inout keys: [str], inout values: [ref TomlValue], inout entries: [str]) {
     match v {
         Table(ks, vs) -> {
             for i in 0..ks.len() {
                 let full = prefix + "." + ks[i]
                 keys.push(full)
                 values.push(vs[i])
-                flatten_into(full, vs[i], keys, values)
+                entries.push(placed + "." + ks[i])
+                flatten_into(full, placed + "." + ks[i], vs[i], keys, values, entries)
             }
         }
         _ -> {}

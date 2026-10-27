@@ -303,6 +303,12 @@ S0 in progress. The Rust emitter lives in `crates/grasm_tir`; the checker
 records the decisions it makes (name resolution, call and method targets,
 type arguments) in tables for it, so no resolution is done twice.
 
+The second frontend is `compiler/front` (docs/self-hosting.md §6.10): its
+loader, checker and emitter in Grasm, recording the same decisions keyed by
+the same spans and printing them the same way (`front tir`). `tirdiff` holds
+its text to `grasm tir`'s, byte for byte, on every program in the
+repository; `fuzz_tir` on generated programs and near-misses.
+
 The TIR interpreter is `tools/tirinterp`, written in Grasm and built
 natively. It reads the text form with its own reader and runs `main` from
 the TIR alone, and `scripts/tirinterp.sh` holds it to `grasm run`: every

@@ -1872,6 +1872,145 @@ channel table and the map seed; static bytes for the panic texts and
 variant names `gen_text.py` now writes as code; the runtime's own
 per-thread cells; and the switch. Nothing has been timed.
 
+### 6.10 S2 part two: the loader, the checker and TIR
+
+`compiler/front` now goes from the AST to TIR: `front tir P` loads the
+program, checks it and prints what `grasm tir P` prints, byte for byte, or
+refuses it where `grasm tir` refuses it. About 14,000 lines of Grasm were
+added to part one's 8,500:
+
+| file | what it is | the Rust it follows |
+|---|---|---|
+| `loader.gr` | the module graph: imports, packages, manifests through `packages/toml`, the registry and minimal version selection, source bundles, runtime packages | `grasm_sema/src/loader.rs`, `grasm_pkg`'s `Manifest`, `resolve`, `Registry` |
+| `prog.gr` | the loaded program's ASTs in one set of arrays, node ids and spans made global as `parse_with_offset` makes them | |
+| `tys.gr` | types interned (an id per type, so `==` is structural equality), the unifier's substitution, type definitions, the display diagnostics use | `types.rs` |
+| `effrows.gr` | the effect-row fixpoint the checker needs before it types anything, and closure literals' rows | `effects.rs` `rows_and_closures` |
+| `sema.gr`, `semcall.gr`, `semmeth.gr`, `sempat.gr` | the checker: declarations, statements, inference, calls and built-ins, methods and fields, `match`, patterns, closures | `check.rs`, `mem.rs`, `builtins.rs` |
+| `effcheck.gr` | the effect pass that reports: declared rows, `main` and tests, constants, actors, parallel operations, rows written in types | `effects.rs` `check_effects_multi_with` |
+| `ceiling.gr` | every package's capability ceiling, from its own sources and from the program | `grasm`'s `check_dependency_ceilings`, `effects_of_package`, `effects_of_program`, `effects_by_package` |
+| `emit.gr` | TIR's text | `grasm_tir/src/lib.rs` |
+
+**Decision for decision.** The checker records what the Rust one records,
+keyed by the same spans, in the same order: an expression's type is written
+each time it is inferred and the last write stands; a type it was checked
+against fills in only where nothing was inferred; a name, a call and a method
+call are recorded when resolved and overwritten when resolved again; a closure
+literal's return type is filed under its own start and its body's, so a
+closure that is the body of another has the outer one's -- and the TIR says
+`fallible` or `total` accordingly. The Rust checker's order of work is kept
+wherever it shows: closure bodies wait to the end of their block and run
+last first, field reads on a type not yet known wait with them, the arms of a
+`match` whose value takes its type from the others (an integer literal, a list
+of them, `Ok` of one) are checked after the rest, the ones that build `Ok` or
+`Err` first, a probe whose diagnostics are thrown away (an alias
+resolved before its target, the prefix of an assignment's place) still leaves
+the types it inferred behind. `_` is named after the offset it was written at,
+and the Rust parser writes that offset in the program's numbering, so the
+merged AST renames it.
+
+**Data-oriented, as §6.8 found it has to be.** A type is an id into flat
+arrays, interned by its parts; the checker's state is one flat struct of
+arrays and maps, never a container inside a container that is written to;
+bindings are a flat stack with each scope's start; TIR nodes are made into an
+arena children first -- the order the Rust emitter numbers variables in -- and
+printed from it once. Two things about the language bit and are recorded in
+docs/known-issues.md: a native build passes a struct argument as a later
+`inout` argument in the same call left it, where the language and `grasm
+run` pass it as it was (S1); and an `if` used as a statement whose branches'
+values differ in type is refused by the native backend (S3). The frontend is
+written so that neither reaches it.
+
+**The gates.**
+
+- `loaddiff`: for every corpus program, the modules `front files` loads --
+  names, aliases, paths, span bases, imports -- against the file lines of
+  `grasm tir`; a program that does not load must not load for both.
+- `tomldiff`: every manifest git tracks, read by `packages/toml`, by the Rust
+  toolchain's reader (`grasm toml`, a dump added for this gate and the one
+  change this part makes to the Rust compiler) and by Python's `tomllib`.
+  No manifest writes an array of tables, so two files in
+  `scripts/lib/tomlcases` do; each entry is printed with its number and in
+  the file's order, so a key read into the wrong entry shows, which
+  `packages/toml` could not say before: its `Doc` now carries each key's
+  `entries` path (`bin[1].name`) beside the flat one.
+- `tirdiff`: every corpus program and every other `.gr` file git tracks,
+  `front tir` against `grasm tir`, byte for byte, or refused by both; every
+  tenth emitted twice and compared.
+- `tirrefuse`: the conformance negatives and the programs inline in the Rust
+  test suites, refused by both or accepted by both with the same TIR.
+- `fuzz_tir`: ten generators -- the differential, generics, fallible,
+  integer-width, map-key, handler, backend, effect-row, package-row and
+  module-graph fuzzers' -- and one edit in nearly half the programs that
+  usually breaks the types and keeps the syntax; the same TIR or both
+  refuse, every engine counted.
+- `frontsmoke`: every fourth conformance program that says what it prints,
+  its TIR made by `compiler/front`, run by `tools/tirinterp` and compiled by
+  `compiler/s3`, linked by `compiler/link`; each must print and exit as
+  `grasm run` does.
+- `tircontrols`: a package's import of one of its dependencies resolved to
+  the top-level module of that name, an integer literal checked against `u8`
+  typed `i64`, a call's type arguments made apart from the
+  ones it was checked with, a called function's last effect left out of a
+  row, a type mismatch accepted, `index` printed with its span before its
+  type, two keys' values traded between the entries of an array of tables
+  by `packages/toml`, the fuzzer skipping an engine.
+
+**What they found, 2026-10-27**, each run once after the full suite's last
+run on the main checkout had finished, with that checkout's compiler and
+`compiler/front` built from this one, the load average 4-6 from other work
+on the machine:
+
+| gate | result |
+|---|---|
+| `loaddiff` | 1,737 programs: 1,671 load the same modules (5,403 modules; 321 programs with a package's own dependency), 64 load in both and are refused later, 2 load in neither, 0 disagree |
+| `tomldiff` | 1,444 files (1,442 manifests and the two cases): all 1,444 read alike by the three readers, 9,559 keys; 0 disagree |
+| `tirdiff` | 1,925 files: 1,858 the same TIR, 67 refused by both, 0 disagree, 0 holes; 6,024 modules and 420 MB of TIR compared; 185 emitted twice, all stable |
+| `tirrefuse` | 889 programs (66 conformance negatives, 823 from the Rust test suites): 582 refused by both, all 66 negatives among them; 307 accepted by both with the same TIR; 0 disagree; 0 Rust panics |
+| `fuzz_tir` | 700 programs (the gate's size): 434 the same TIR, 266 refused by both, 0 disagree; once at 20,000 (seed 101): 12,427 and 7,573, 0 disagree, 0 Rust panics |
+| `frontsmoke` | 47 programs: 47 through `tirinterp` and 47 compiled by s3 and linked by grasm-link, each printing and exiting as `grasm run` does |
+| `tircontrols` | 8 planted faults, 8 caught, each by its gate and for its reason |
+
+Part one's gates, run again over the larger frontend: `tokentest` and
+`asttest` 1,925 of 1,925 files identical, `parsediag` 707 refusals with the
+same first diagnostic, `frontcontrols` 8 of 8, `fuzz_front` 1,500 of 1,500.
+
+The first full `tirdiff` disagreed on six programs, all for one reason: an
+interpolation inside an interpolation in an imported module, whose spans the
+Rust parser does not move by the module's base. That is the Rust side's
+defect, recorded with part one's entry for it in docs/known-issues.md;
+`compiler/front` now reproduces it. No other disagreement was found.
+
+**Speed.** Each program's whole `grasm tir` against its whole `front tir`
+(`scripts/tirspeed.py`): processes, start-up included, alternating which
+runs first program by program, five rounds, the median; lines are those of
+every module a program loads. 2026-10-27, 12:55-13:06, load average 4.0-6.2:
+
+| programs | lines | `grasm tir` | `front tir` | front / Rust time |
+|---|---:|---:|---:|---:|
+| `compiler/front`, `compiler/s3`, `tools/tirinterp`, `compiler/link`, `compiler/rt` | 55,665 | 7.3k lines/s | 3.3k lines/s | 2.19x |
+| every tenth corpus file, the 167 both accept | 175,341 | 17.3k lines/s | 10.2k lines/s | 1.69x |
+
+Most of the gap on packages is the capability ceilings: like the Rust
+frontend, `compiler/front` checks every source file of every package whose
+manifest states capabilities as a program of its own, and it checks more
+slowly. With `ceiling.check` taken out of a copy, single runs: `compiler/front`
+7.69 s to 1.90 s, `compiler/s3` 2.30 to 0.53, `compiler/link` 0.81 to 0.18
+(`grasm tir`, ceilings included: 2.88, 0.88, 0.40). `tools/tirinterp`,
+whose manifest states no capabilities, is 5.38 s either way against
+`grasm tir`'s 3.22. The Rust side cannot be timed without its ceilings
+without changing it, so nothing finer is claimed.
+
+**What is left for part three:** the diagnostics. The Grasm checker refuses
+where the Rust one refuses, but what it says -- the message, the span, the
+help -- is compared with nothing, and many messages are shorter than the
+Rust ones. Past TIR, nothing a command does on its own is ported (`grasm
+check`'s output, `deps`, the lockfile). One known way the loader could
+answer differently: it compares directories by their text, collapsing `.`
+and `..`, where the Rust one asks the file system, so a symbolic link, or
+one directory named both relatively and absolutely in one package graph,
+could be two directories to it and one to Rust. No program in the
+repository does either.
+
 ## 7. Bootstrap and trust
 
 - **During the migration:** stage 0 is the Rust-built `grasm`.
@@ -1902,7 +2041,11 @@ share), `fuzz_rtfmt` (number formatting against the Rust runtime) and
 `rtcontrols` (§6.7), `rtdialect` and `rtdialectcontrols` (the runtime
 dialect as the Grasm backend lowers it, driven from C), `rtlint` (no plain
 access to a process cell outside its lock) and `fuzz_rtrelease` (the release
-walk against the Rust runtime's) (§6.9), `fixpoint` (stage 2 = stage 3), `ddc`,
+walk against the Rust runtime's) (§6.9), `loaddiff` (the module graph
+against the Rust loader's), `tomldiff` (every manifest read by
+`packages/toml`, the Rust reader and `tomllib`), `tirrefuse` (what the Rust
+frontend refuses, the Grasm one refuses), `fuzz_tir`, `frontsmoke` (front to
+binary through Grasm alone) and `tircontrols` (§6.10), `fixpoint` (stage 2 = stage 3), `ddc`,
 `selfperf` (compile speed and benchmark budgets), and the existing fuzzers
 pointed at each new component. Every new gate ships with controls showing
 it fails on a planted fault.
@@ -2077,6 +2220,20 @@ Measured, not estimated; each line is a gate's result on master.
   Where the time goes was measured once: field writes (§6.8) were most of
   it until the hot state moved into whole variables, and the AST builder,
   which still writes through the AST's fields, is 40% of what is left.
+- **S2 part two done** (§6.10): the loader, the checker and TIR emission in
+  Grasm (about 14,000 more lines in `compiler/front`), held to `grasm tir`.
+  `tirdiff`: all 1,925 `.gr` files git tracks, 1,858 the same TIR byte for
+  byte and 67 refused by both, none disagreeing; `loaddiff`: 1,671 of 1,737
+  programs load the same modules and the rest are refused by both; `tomldiff`:
+  1,444 manifests and cases read alike by `packages/toml`, the Rust reader and
+  `tomllib`; `tirrefuse`: 889 programs, 582 refused by both and 307 the same
+  TIR; `fuzz_tir`: 20,000 generated programs and near-misses with no
+  disagreement; `frontsmoke`: 47 programs from `compiler/front` through
+  `tirinterp` and through s3 and grasm-link, each as `grasm run`;
+  `tircontrols` 8 of 8. Two defects of the Rust native backend found and
+  recorded (S1, S3), and one more fact about a Rust parser defect already
+  recorded (S4). `front tir` takes 1.7-2.2 times `grasm tir`'s time; the
+  checker's diagnostics are part three.
 - **S5 part two, steps one to three done, step four begun** (§6.9): the
   runtime dialect of §5.6 -- process cells, static bytes, the runtime's own
   thread-local cells and the context switch -- usable only in a package
@@ -2097,7 +2254,7 @@ Measured, not estimated; each line is a gate's result on master.
   `rtcontrols` 13 of 13, `rtdialectcontrols` 5 of 5 and `rtlint`'s 2 of 2
   planted faults caught. One fact bounds the switch's test: this machine's
   arm64 processes run with the return-address keys off.
-- **Not started:** S2 past part one (resolver, checker, TIR), S6
+- **Not started:** S2 part three (the diagnostics' words and spans), S6
   (self-compilation), S7-S9; S5's state families and fibers (steps four
   and five of part two).
 

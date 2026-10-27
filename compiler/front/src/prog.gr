@@ -1,0 +1,432 @@
+// A loaded program as the checker reads it: every module's AST in one set
+// of arrays, with node ids and spans made global -- each file's spans moved
+// to start at its base, as the Rust loader's `parse_with_offset` gives them
+// -- so a span names one place in one file, and the checker's tables can be
+// keyed by span the way the Rust checker's are.
+import ast
+import loader
+
+type Prog = {
+    a: Ast,
+    m_name: [str],
+    m_alias: [str],
+    m_path: [str],
+    m_base: [i64],
+    m_src: [bytes],
+    m_decls: [[i64]],
+    m_imp_alias: [[str]],
+    m_imp_full: [[str]],
+    /// Span starts of decimal literals past `i64`, every module's.
+    wide: Map[i64, bool],
+    /// Modules of a runtime package ([T-RUNTIME]).
+    runtime: [str],
+    /// Module-name prefixes that are dependency packages.
+    deps: [str],
+    /// `///` documentation, by the start of the declaration it precedes.
+    docs: Map[i64, str],
+}
+
+/// A program of one parsed fragment (a documentation example), answering
+/// for module `name` with that module's imports: node ids and spans are the
+/// fragment's own.
+pub fn fragment(m: ModuleAst, name: str, imp_alias: [str], imp_full: [str]) -> Prog {
+    Prog{ a: m.a, m_name: [name], m_alias: [name], m_path: [""], m_base: [0], m_src: [], m_decls: [m.decls], m_imp_alias: [imp_alias], m_imp_full: [imp_full], wide: map(), runtime: [], deps: [], docs: map() }
+}
+
+/// Which slots of a node of kind `k` hold node ids (or -1 for none), as a
+/// bit mask; -1 means every slot (a list).
+fn id_mask(k: i64) -> i64 {
+    match k {
+        1 -> -1
+        3 -> 1
+        4 -> 6
+        5 -> 3
+        6 -> 3
+        7 -> 31
+        8 -> 1
+        9 -> 7
+        10 -> 3
+        11 -> 1
+        20 -> 1020
+        21 -> 14
+        22 -> 14
+        23 -> 6
+        24 -> 28
+        25 -> 3
+        26 -> 3
+        27 -> 1
+        28 -> 1
+        29 -> 6
+        30 -> 31
+        31 -> 6
+        35 -> 1
+        36 -> 1
+        37 -> 1
+        40 -> 3
+        41 -> 1
+        42 -> 1
+        43 -> 3
+        44 -> 1
+        45 -> 1
+        46 -> 7
+        50 -> 14
+        51 -> 6
+        52 -> 5
+        53 -> 1
+        54 -> 1
+        57 -> 3
+        58 -> 7
+        59 -> 1
+        60 -> 1
+        61 -> 7
+        73 -> 1
+        74 -> 1
+        75 -> 1
+        76 -> 1
+        77 -> 1
+        78 -> 7
+        79 -> 3
+        80 -> 7
+        81 -> 3
+        82 -> 3
+        83 -> 2
+        84 -> 6
+        85 -> 3
+        86 -> 7
+        87 -> 3
+        88 -> 1
+        89 -> 1
+        90 -> 1
+        91 -> 1
+        92 -> 3
+        96 -> 1
+        97 -> 1
+        98 -> 1
+        104 -> 1
+        105 -> 3
+        106 -> 1
+        107 -> 1
+        _ -> 0
+    }
+}
+
+pub fn build(l: Loaded) -> Prog {
+    var k: [i64] = []
+    var s: [i64] = []
+    var e: [i64] = []
+    var off: [i64] = []
+    var n: [i64] = []
+    var t: [str] = []
+    var pool: [i64] = []
+    var fl: [f64] = []
+    var decls: [[i64]] = []
+    var wide: Map[i64, bool] = map()
+    var docs: Map[i64, str] = map()
+    for mi in 0..l.mods.len() {
+        let m = l.mods[mi]
+        let a = m.a
+        let base = l.bases[mi]
+        let id0 = k.len()
+        let p0 = pool.len()
+        let f0 = fl.len()
+        let deep = nested_interpolation(a)
+        var deep_ints: Map[i64, bool] = map()
+        var flat_ints: Map[i64, bool] = map()
+        for id in 0..a.k.len() {
+            if a.k[id] == ast.E_INT {
+                if deep[id] {
+                    deep_ints.set(a.s[id], true)
+                } else {
+                    flat_ints.set(a.s[id], true)
+                }
+            }
+        }
+        for id in 0..a.k.len() {
+            let kind = a.k[id]
+            k.push(kind)
+            if deep[id] {
+                s.push(a.s[id])
+                e.push(a.e[id])
+            } else if a.s[id] >= 0 {
+                s.push(a.s[id] + base)
+                e.push(a.e[id] + base)
+            } else {
+                s.push(a.s[id])
+                e.push(a.e[id])
+            }
+            off.push(a.off[id] + p0)
+            n.push(a.n[id])
+            // `_` is named after where it was written (`\u{1}wild<start>`),
+            // and the Rust parser writes that start in the program's
+            // offsets.
+            let txt = a.t[id]
+            if kind == ast.A_IDENT and txt.starts_with("\u{1}wild") and not deep[id] {
+                let num = txt.substr(5, txt.len() - 5).parse_int() ?? 0
+                t.push("\u{1}wild{num + base}")
+            } else {
+                t.push(txt)
+            }
+            let mask = id_mask(kind)
+            for i in 0..a.n[id] {
+                let v = a.pool[a.off[id] + i]
+                if kind == ast.E_FLOAT {
+                    pool.push(v + f0)
+                } else if (mask == -1 or (mask / pow2(i)) % 2 == 1) and v >= 0 {
+                    pool.push(v + id0)
+                } else {
+                    pool.push(v)
+                }
+            }
+        }
+        for x in a.fl {
+            fl.push(x)
+        }
+        var ds: [i64] = []
+        for d in m.decls {
+            ds.push(d + id0)
+        }
+        decls.push(ds)
+        for w in m.wide_ints {
+            if deep_ints.has(w) and not flat_ints.has(w) {
+                wide.set(w, true)
+            } else {
+                wide.set(w + base, true)
+            }
+        }
+        for di in 0..m.doc_keys.len() {
+            docs.set(m.doc_keys[di] + base, m.doc_vals[di])
+        }
+    }
+    var rt: [str] = []
+    for name in l.runtime.keys() {
+        rt.push(name)
+    }
+    Prog{ a: Ast{ k: k, s: s, e: e, off: off, n: n, t: t, pool: pool, fl: fl }, m_name: l.names, m_alias: l.aliases, m_path: l.paths, m_base: l.bases, m_src: l.srcs, m_decls: decls, m_imp_alias: l.imp_alias, m_imp_full: l.imp_full, wide: wide, runtime: rt, deps: l.deps, docs: docs }
+}
+
+/// The nodes inside an interpolation inside an interpolation. The Rust
+/// parser lexes an interpolation's text again to parse it, and the offsets of
+/// the interpolations in that text are counted from its start and never
+/// moved by the module's base: their spans are the same in every module, so
+/// they stay as the module's own AST has them. Children are made before
+/// their parents, so one pass from the last node down settles every depth.
+fn nested_interpolation(a: Ast) -> [bool] {
+    var depth: [i64] = []
+    for _ in 0..a.k.len() {
+        depth.push(0)
+    }
+    var id = a.k.len() - 1
+    while id >= 0 {
+        let kind = a.k[id]
+        let mask = id_mask(kind)
+        var d = depth[id]
+        if kind == ast.PC_EXPR {
+            d += 1
+        }
+        if kind != ast.E_FLOAT {
+            for i in 0..a.n[id] {
+                let v = a.pool[a.off[id] + i]
+                if (mask == -1 or (mask / pow2(i)) % 2 == 1) and v >= 0 and v < id and depth[v] < d {
+                    depth[v] = d
+                }
+            }
+        }
+        id -= 1
+    }
+    var out: [bool] = []
+    for x in depth {
+        out.push(x >= 2)
+    }
+    out
+}
+
+fn pow2(i: i64) -> i64 {
+    var r = 1
+    for _ in 0..i {
+        r = r * 2
+    }
+    r
+}
+
+// ---------------------------------------------------------------------
+// Reading the merged AST
+// ---------------------------------------------------------------------
+
+pub fn kind(p: Prog, id: i64) -> i64 {
+    p.a.k[id]
+}
+
+/// Slot `i` of node `id`.
+pub fn sl(p: Prog, id: i64, i: i64) -> i64 {
+    p.a.pool[p.a.off[id] + i]
+}
+
+/// The items of a list node.
+pub fn items(p: Prog, v: i64) -> [i64] {
+    p.a.pool.slice(p.a.off[v], p.a.off[v] + p.a.n[v])
+}
+
+pub fn count(p: Prog, v: i64) -> i64 {
+    p.a.n[v]
+}
+
+/// The text of an identifier node.
+pub fn name(p: Prog, ident: i64) -> str {
+    p.a.t[ident]
+}
+
+pub fn text(p: Prog, id: i64) -> str {
+    p.a.t[id]
+}
+
+/// An expression's span start, as `Expr::span()` gives it.
+pub fn es(p: Prog, x: i64) -> i64 {
+    let k = p.a.k[x]
+    if k == ast.E_IDENT or k == ast.E_BLOCK or k == ast.E_REGION or k == ast.E_UNSAFE {
+        return p.a.s[sl(p, x, 0)]
+    }
+    p.a.s[x]
+}
+
+pub fn ee(p: Prog, x: i64) -> i64 {
+    let k = p.a.k[x]
+    if k == ast.E_IDENT or k == ast.E_BLOCK or k == ast.E_REGION or k == ast.E_UNSAFE {
+        return p.a.e[sl(p, x, 0)]
+    }
+    p.a.e[x]
+}
+
+/// A pattern's span, as `Pattern::span()` gives it.
+pub fn ps(p: Prog, x: i64) -> i64 {
+    if p.a.k[x] == ast.P_BIND {
+        return p.a.s[sl(p, x, 0)]
+    }
+    p.a.s[x]
+}
+
+pub fn pe(p: Prog, x: i64) -> i64 {
+    if p.a.k[x] == ast.P_BIND {
+        return p.a.e[sl(p, x, 0)]
+    }
+    p.a.e[x]
+}
+
+/// A node's own span.
+pub fn s(p: Prog, x: i64) -> i64 {
+    p.a.s[x]
+}
+
+pub fn e(p: Prog, x: i64) -> i64 {
+    p.a.e[x]
+}
+
+/// A span as one map key.
+pub fn key(s: i64, e: i64) -> i64 {
+    s * 4294967296 + e
+}
+
+pub fn ekey(p: Prog, x: i64) -> i64 {
+    key(es(p, x), ee(p, x))
+}
+
+/// A path node's segments joined with dots.
+pub fn dotted(p: Prog, path: i64) -> str {
+    var parts: [str] = []
+    for seg in items(p, sl(p, path, 0)) {
+        parts.push(p.a.t[seg])
+    }
+    parts.join(".")
+}
+
+/// The last segment's name of a path node.
+pub fn path_last(p: Prog, path: i64) -> str {
+    let segs = items(p, sl(p, path, 0))
+    if segs.len() == 0 {
+        return ""
+    }
+    p.a.t[segs[segs.len() - 1]]
+}
+
+pub fn path_len(p: Prog, path: i64) -> i64 {
+    p.a.n[sl(p, path, 0)]
+}
+
+/// A type expression's span.
+pub fn ty_s(p: Prog, te: i64) -> i64 {
+    p.a.s[te]
+}
+
+pub fn ty_e(p: Prog, te: i64) -> i64 {
+    p.a.e[te]
+}
+
+/// The statements of a block node.
+pub fn stmts(p: Prog, blk: i64) -> [i64] {
+    items(p, sl(p, blk, 0))
+}
+
+/// The last statement of a block, or -1.
+pub fn last_stmt(p: Prog, blk: i64) -> i64 {
+    let v = sl(p, blk, 0)
+    let n = p.a.n[v]
+    if n == 0 {
+        return -1
+    }
+    p.a.pool[p.a.off[v] + n - 1]
+}
+
+/// The expression a block ends with as `Stmt::Expr`, or -1.
+pub fn tail_expr(p: Prog, blk: i64) -> i64 {
+    let st = last_stmt(p, blk)
+    if st >= 0 and p.a.k[st] == ast.S_EXPR {
+        return sl(p, st, 0)
+    }
+    -1
+}
+
+/// A statement's span (`stmt_span`).
+pub fn stmt_s(p: Prog, st: i64) -> i64 {
+    if p.a.k[st] == ast.S_EXPR {
+        return es(p, sl(p, st, 0))
+    }
+    p.a.s[st]
+}
+
+pub fn stmt_e(p: Prog, st: i64) -> i64 {
+    if p.a.k[st] == ast.S_EXPR {
+        return ee(p, sl(p, st, 0))
+    }
+    p.a.e[st]
+}
+
+/// Which module a global span belongs to.
+pub fn module_of_span(p: Prog, start: i64) -> i64 {
+    var best = 0
+    for i in 0..p.m_base.len() {
+        if start >= p.m_base[i] {
+            best = i
+        }
+    }
+    best
+}
+
+/// The module index of a module name, or -1.
+pub fn module_index(p: Prog, name: str) -> i64 {
+    for i in 0..p.m_name.len() {
+        if p.m_name[i] == name {
+            return i
+        }
+    }
+    -1
+}
+
+/// The target module an alias names in module `m`, or "\0".
+pub fn import_of(p: Prog, m: i64, alias: str) -> str {
+    let al = p.m_imp_alias[m]
+    for i in 0..al.len() {
+        if al[i] == alias {
+            return p.m_imp_full[m][i]
+        }
+    }
+    "\0"
+}

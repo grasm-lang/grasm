@@ -1,0 +1,1421 @@
+// Fields and method calls (check.rs `infer_field`, `field_type_of`,
+// `infer_method_call`, `interface_method`, `builtin_method`).
+import ast
+import prog
+import tys
+import sema
+import semcall
+
+pub fn infer_field(inout c: Ck, inout t: Tys, p: Prog, e: i64) -> i64 {
+    let recv = prog.sl(p, e, 0)
+    let nm = prog.sl(p, e, 1)
+    let name = prog.name(p, nm)
+    let s = prog.s(p, e)
+    let en = prog.e(p, e)
+    let key = prog.key(s, en)
+    let recv_is_free_ident = prog.kind(p, recv) == ast.E_IDENT and sema.lookup(c, prog.name(p, prog.sl(p, recv, 0))) < 0
+    if recv_is_free_ident {
+        let tname = prog.name(p, prog.sl(p, recv, 0))
+        let def = tys.def_of(t, tname)
+        if def >= 0 {
+            if t.d_sum[def] {
+                let vi = tys.variant_index(t, def, name)
+                if vi >= 0 {
+                    sema.tir_name(c, key, sema.NR_VARIANT, "", [])
+                    return sema.instantiate_variant(c, t, p, def, vi, [], s, en)
+                }
+            }
+            return sema.err(c, s, en, "type `{tname}` has no variant `{name}`")
+        }
+    }
+    var recv_ty0 = -1
+    if not recv_is_free_ident {
+        let rt0 = sema.infer_expr(c, t, p, recv)
+        recv_ty0 = rt0
+        let r = tys.resolve(t, rt0)
+        if t.k[r] == tys.K_NAMED and c.handler_ids.has(t.a[r]) {
+            let (fnames, _) = tys.struct_fields(t, t.a[r])
+            if fnames.contains(name) {
+                return sema.err(c, s, en, "`{name}` is an operation of a handler, not a field to read")
+            }
+        }
+    }
+    if recv_is_free_ident {
+        let alias = prog.name(p, prog.sl(p, recv, 0))
+        let target = prog.import_of(p, c.cur_mi, alias)
+        if target != "\0" {
+            let qual = target + "::" + name
+            match c.consts.get(qual) {
+                Some(ty) -> {
+                    if c.const_pub.get(qual) ?? false {
+                        sema.tir_name(c, key, sema.NR_CONST, qual, [])
+                        return ty
+                    }
+                    return sema.err(c, prog.s(p, nm), prog.e(p, nm), "constant `{name}` in module `{target}` is private")
+                }
+                None -> ()
+            }
+            let fid = sema.fn_of(c, qual)
+            if fid >= 0 {
+                if c.fn_pub[fid] {
+                    var ret = c.fn_ret[fid]
+                    if c.fn_err[fid] >= 0 {
+                        ret = tys.fallible(t, c.fn_ret[fid], c.fn_err[fid])
+                    }
+                    var fresh: [i64] = []
+                    for _ in 0..c.fn_ngen[fid] {
+                        fresh.push(tys.fresh(t))
+                    }
+                    sema.tir_name(c, key, sema.NR_FN, qual, fresh)
+                    let own_row = sema.row_of_qualified(c, t, target, name)
+                    var ps: [i64] = []
+                    for x in c.fn_params[fid] {
+                        ps.push(tys.subst_generics(t, x, fresh))
+                    }
+                    let r = tys.subst_generics(t, ret, fresh)
+                    return tys.fnt(t, ps, r, own_row)
+                }
+                return sema.err(c, prog.s(p, nm), prog.e(p, nm), "function `{name}` in module `{target}` is private")
+            }
+            return sema.err(c, prog.s(p, nm), prog.e(p, nm), "module `{target}` has no function `{name}`")
+        }
+    }
+    var recv_ty = recv_ty0
+    if recv_ty < 0 {
+        recv_ty = sema.infer_expr(c, t, p, recv)
+    }
+    if t.k[tys.shallow(t, recv_ty)] == tys.K_VAR and c.df_depth > 0 {
+        let out = tys.fresh(t)
+        sema.defer_field(c, recv_ty, nm, out)
+        return out
+    }
+    field_type_of(c, t, p, recv_ty, nm, s, en)
+}
+
+/// The type of `recv.name`, with the receiver's type already inferred.
+pub fn field_type_of(inout c: Ck, inout t: Tys, p: Prog, recv_ty: i64, nm: i64, s: i64, e: i64) -> i64 {
+    let name = prog.name(p, nm)
+    var rt = tys.resolve(t, recv_ty)
+    var through_ref = false
+    if t.k[rt] == tys.K_REF {
+        rt = t.a[rt]
+        through_ref = true
+    }
+    let sh = tys.shallow(t, rt)
+    let referent_is_struct = t.k[sh] == tys.K_NAMED and tys.is_struct(t, t.a[sh])
+    if through_ref and name == "value" and not referent_is_struct and t.k[sh] != tys.K_TUPLE {
+        return rt
+    }
+    if t.k[sh] == tys.K_TUPLE {
+        if sema.all_digits(name) and name != "" {
+            let i = name.parse_int() ?? -1
+            if i >= 0 and i < t.n[sh] {
+                return tys.item(t, sh, i)
+            }
+            return sema.err(c, s, e, "this tuple has {t.n[sh]} component(s), so there is no `.{name}`")
+        }
+        return sema.err(c, s, e, "a tuple has no field `{name}`")
+    }
+    if t.k[sh] == tys.K_NAMED {
+        let def = t.a[sh]
+        if tys.is_struct(t, def) {
+            let (fnames, ftys) = tys.struct_fields(t, def)
+            for i in 0..fnames.len() {
+                if fnames[i] == name {
+                    return tys.subst_generics(t, ftys[i], tys.items(t, sh))
+                }
+            }
+            return sema.err(c, prog.s(p, nm), prog.e(p, nm), "`{t.d_name[def]}` has no field `{name}`")
+        }
+        return sema.err(c, prog.s(p, nm), prog.e(p, nm), "`{t.d_name[def]}` is a sum type — fields are accessed via `match`")
+    }
+    if t.k[sh] == tys.K_ERROR {
+        return tys.ERROR
+    }
+    sema.err(c, prog.s(p, nm), prog.e(p, nm), "`{tys.show(t, sh)}` has no field `{name}`")
+}
+
+fn is_mutating(name: str) -> bool {
+    match name {
+        "push" | "pop" | "set" | "delete" | "sort" | "sort_by" | "remove" | "fill" | "copy_from" | "push_str" | "push_byte" | "push_bytes" -> true
+        _ -> false
+    }
+}
+
+pub fn infer_method_call(inout c: Ck, inout t: Tys, p: Prog, e: i64) -> i64 {
+    let recv = prog.sl(p, e, 0)
+    let nm = prog.sl(p, e, 1)
+    let name = prog.name(p, nm)
+    let args = prog.items(p, prog.sl(p, e, 2))
+    let s = prog.s(p, e)
+    let en = prog.e(p, e)
+    let key = prog.key(s, en)
+    let recv_is_free_ident = prog.kind(p, recv) == ast.E_IDENT and sema.lookup(c, prog.name(p, prog.sl(p, recv, 0))) < 0
+    if recv_is_free_ident {
+        let alias = prog.name(p, prog.sl(p, recv, 0))
+        let target = prog.import_of(p, c.cur_mi, alias)
+        if target != "\0" {
+            let qual = target + "::" + name
+            let fid = sema.fn_of(c, qual)
+            if fid >= 0 {
+                if c.fn_pub[fid] {
+                    if c.unsafe_depth == 0 and c.extern_names.has(qual) {
+                        sema.err(c, prog.s(p, nm), prog.e(p, nm), "`{name}` is a C function, so it can only be used inside `unsafe`")
+                    }
+                    sema.tir_method(c, key, sema.MR_MODULE, "", "")
+                    return semcall.check_fn_call_in(c, t, p, target, name, fid, args, s, en)
+                }
+                return sema.err(c, prog.s(p, nm), prog.e(p, nm), "function `{name}` in module `{target}` is private")
+            }
+            match c.variants.get(name) {
+                Some(cands) -> {
+                    if cands.len() == 1 {
+                        sema.tir_method(c, key, sema.MR_VARIANT, "", "")
+                        return sema.instantiate_variant(c, t, p, sema.vdef(cands[0]), sema.vidx(cands[0]), args, s, en)
+                    }
+                }
+                None -> ()
+            }
+            return sema.err(c, prog.s(p, nm), prog.e(p, nm), "module `{target}` has no function `{name}`")
+        }
+    }
+    if recv_is_free_ident {
+        let ename = prog.name(p, prog.sl(p, recv, 0))
+        let ei = c.eff_index.get(ename) ?? -1
+        if ei >= 0 {
+            if c.region_depth > 0 {
+                sema.err(c, s, en, "cannot perform effect `{ename}.{name}` inside a region")
+            }
+            var op = -1
+            for i in c.eff_op0[ei]..c.eff_op0[ei] + c.eff_opn[ei] {
+                if c.op_name[i] == name and op < 0 {
+                    op = i
+                }
+            }
+            if op < 0 {
+                return sema.err(c, prog.s(p, nm), prog.e(p, nm), "effect `{ename}` has no operation `{name}`")
+            }
+            let params = c.op_params[op]
+            if args.len() != params.len() {
+                return sema.err(c, s, en, "effect operation `{ename}.{name}` takes {params.len()} argument(s), got {args.len()}")
+            }
+            sema.tir_method(c, key, sema.MR_EFFECTOP, ename, name)
+            for i in 0..args.len() {
+                sema.check_expr(c, t, p, args[i], params[i])
+            }
+            return c.op_ret[op]
+        }
+    }
+    if recv_is_free_ident {
+        let tname = prog.name(p, prog.sl(p, recv, 0))
+        let def = tys.def_of(t, tname)
+        if def >= 0 {
+            if t.d_sum[def] {
+                let vi = tys.variant_index(t, def, name)
+                if vi >= 0 {
+                    sema.tir_method(c, key, sema.MR_VARIANT, "", "")
+                    return sema.instantiate_variant(c, t, p, def, vi, args, s, en)
+                }
+            }
+            return sema.err(c, s, en, "type `{tname}` has no variant `{name}`")
+        }
+    }
+    if c.region_depth > 0 and is_mutating(name) {
+        let root = sema.place_root(p, recv)
+        if root >= 0 {
+            sema.reject_region_escape(c, p, root, "mutate")
+        }
+    }
+    if c.go_floor >= 0 and is_mutating(name) {
+        let root = sema.place_root(p, recv)
+        if root >= 0 {
+            sema.reject_task_write(c, p, root)
+        }
+    }
+    let recv_ty = sema.infer_expr(c, t, p, recv)
+    sema.force_deferred(c, t, p, recv_ty)
+    let recv_res = tys.resolve(t, recv_ty)
+    let im = interface_method(c, t, p, recv_res, recv, nm, args, s, en)
+    if im != -2 {
+        return im
+    }
+    let bm = builtin_method(c, t, p, recv_res, recv, nm, args, s, en)
+    if bm != -2 {
+        sema.tir_method(c, key, sema.MR_BUILTIN, "", "")
+        return bm
+    }
+    let fid = sema.lookup_fn(c, name)
+    if fid >= 0 and ufcs_accepts(c, t, fid, recv_res) {
+        sema.require_unsafe(c, name, prog.s(p, nm), prog.e(p, nm))
+        var full = [recv]
+        for a in args {
+            full.push(a)
+        }
+        sema.tir_method(c, key, sema.MR_UFCS, "", "")
+        return semcall.check_fn_call_in(c, t, p, c.cur, name, fid, full, s, en)
+    }
+    if struct_field_type(c, t, recv_res, name) >= 0 {
+        sema.tir_method(c, key, sema.MR_FIELDFN, "", "")
+        let ft = infer_field_of_call(c, t, p, recv, nm, s, en)
+        let r = tys.shallow(t, ft)
+        if t.k[r] == tys.K_FN {
+            if t.c[r] >= 0 {
+                c.callee_rows.set(key, t.c[r])
+            }
+            let params = tys.items(t, r)
+            if args.len() != params.len() {
+                return sema.err(c, s, en, "`{name}` expects {params.len()} argument(s), got {args.len()}")
+            }
+            for i in 0..args.len() {
+                sema.check_expr(c, t, p, args[i], params[i])
+            }
+            return t.a[r]
+        }
+    }
+    let rr = tys.resolve(t, recv_ty)
+    if t.k[rr] == tys.K_ERROR {
+        return tys.ERROR
+    }
+    if t.k[rr] == tys.K_VAR {
+        return tys.fresh(t)
+    }
+    sema.err(c, prog.s(p, nm), prog.e(p, nm), "no method `{name}` on `{tys.show(t, recv_ty)}`")
+}
+
+/// `infer_field(recv, name, span)` with the method call's own span, as
+/// the Rust checker calls it for a function held in a field.
+fn infer_field_of_call(inout c: Ck, inout t: Tys, p: Prog, recv: i64, nm: i64, s: i64, en: i64) -> i64 {
+    let name = prog.name(p, nm)
+    let key = prog.key(s, en)
+    let recv_is_free_ident = prog.kind(p, recv) == ast.E_IDENT and sema.lookup(c, prog.name(p, prog.sl(p, recv, 0))) < 0
+    if recv_is_free_ident {
+        let tname = prog.name(p, prog.sl(p, recv, 0))
+        let def = tys.def_of(t, tname)
+        if def >= 0 {
+            if t.d_sum[def] {
+                let vi = tys.variant_index(t, def, name)
+                if vi >= 0 {
+                    sema.tir_name(c, key, sema.NR_VARIANT, "", [])
+                    return sema.instantiate_variant(c, t, p, def, vi, [], s, en)
+                }
+            }
+            return sema.err(c, s, en, "type `{tname}` has no variant `{name}`")
+        }
+    }
+    var recv_ty0 = -1
+    if not recv_is_free_ident {
+        let rt0 = sema.infer_expr(c, t, p, recv)
+        recv_ty0 = rt0
+        let r = tys.resolve(t, rt0)
+        if t.k[r] == tys.K_NAMED and c.handler_ids.has(t.a[r]) {
+            let (fnames, _) = tys.struct_fields(t, t.a[r])
+            if fnames.contains(name) {
+                return sema.err(c, s, en, "`{name}` is an operation of a handler, not a field to read")
+            }
+        }
+    }
+    if recv_is_free_ident {
+        let alias = prog.name(p, prog.sl(p, recv, 0))
+        let target = prog.import_of(p, c.cur_mi, alias)
+        if target != "\0" {
+            let qual = target + "::" + name
+            match c.consts.get(qual) {
+                Some(ty) -> {
+                    if c.const_pub.get(qual) ?? false {
+                        sema.tir_name(c, key, sema.NR_CONST, qual, [])
+                        return ty
+                    }
+                    return sema.err(c, prog.s(p, nm), prog.e(p, nm), "constant `{name}` in module `{target}` is private")
+                }
+                None -> ()
+            }
+            let fid = sema.fn_of(c, qual)
+            if fid >= 0 {
+                if c.fn_pub[fid] {
+                    var ret = c.fn_ret[fid]
+                    if c.fn_err[fid] >= 0 {
+                        ret = tys.fallible(t, c.fn_ret[fid], c.fn_err[fid])
+                    }
+                    var fresh: [i64] = []
+                    for _ in 0..c.fn_ngen[fid] {
+                        fresh.push(tys.fresh(t))
+                    }
+                    sema.tir_name(c, key, sema.NR_FN, qual, fresh)
+                    let own_row = sema.row_of_qualified(c, t, target, name)
+                    var ps: [i64] = []
+                    for x in c.fn_params[fid] {
+                        ps.push(tys.subst_generics(t, x, fresh))
+                    }
+                    let r = tys.subst_generics(t, ret, fresh)
+                    return tys.fnt(t, ps, r, own_row)
+                }
+                return sema.err(c, prog.s(p, nm), prog.e(p, nm), "function `{name}` in module `{target}` is private")
+            }
+            return sema.err(c, prog.s(p, nm), prog.e(p, nm), "module `{target}` has no function `{name}`")
+        }
+    }
+    var recv_ty = recv_ty0
+    if recv_ty < 0 {
+        recv_ty = sema.infer_expr(c, t, p, recv)
+    }
+    if t.k[tys.shallow(t, recv_ty)] == tys.K_VAR and c.df_depth > 0 {
+        let out = tys.fresh(t)
+        sema.defer_field(c, recv_ty, nm, out)
+        return out
+    }
+    field_type_of(c, t, p, recv_ty, nm, s, en)
+}
+
+fn compatible(t: Tys, a: i64, b: i64) -> bool {
+    let ka = t.k[a]
+    let kb = t.k[b]
+    if ka == tys.K_VAR or kb == tys.K_VAR or ka == tys.K_GENERIC or kb == tys.K_GENERIC or ka == tys.K_ERROR or kb == tys.K_ERROR {
+        return true
+    }
+    if ka == tys.K_LIST and kb == tys.K_LIST {
+        return compatible(t, t.a[a], t.a[b])
+    }
+    if ka == tys.K_REF and kb == tys.K_REF {
+        return compatible(t, t.a[a], t.a[b])
+    }
+    if ka == tys.K_REF or kb == tys.K_REF {
+        return false
+    }
+    if ka == tys.K_MAP and kb == tys.K_MAP {
+        return compatible(t, t.a[a], t.a[b]) and compatible(t, t.b[a], t.b[b])
+    }
+    if ka == tys.K_TUPLE and kb == tys.K_TUPLE {
+        if t.n[a] != t.n[b] {
+            return false
+        }
+        for i in 0..t.n[a] {
+            if not compatible(t, tys.item(t, a, i), tys.item(t, b, i)) {
+                return false
+            }
+        }
+        return true
+    }
+    if ka == tys.K_NAMED and kb == tys.K_NAMED {
+        return t.a[a] == t.a[b]
+    }
+    if ka == tys.K_FALLIBLE and kb == tys.K_FALLIBLE {
+        return compatible(t, t.a[a], t.a[b])
+    }
+    if ka == tys.K_FN and kb == tys.K_FN {
+        return true
+    }
+    a == b
+}
+
+fn ufcs_accepts(c: Ck, inout t: Tys, fid: i64, recv: i64) -> bool {
+    let ps = c.fn_params[fid]
+    if ps.len() == 0 {
+        return false
+    }
+    let a = tys.resolve(t, ps[0])
+    let b = tys.resolve(t, recv)
+    compatible(t, a, b)
+}
+
+/// The declared type of `field` on a struct type, or -1.
+fn struct_field_type(c: Ck, inout t: Tys, x: i64, field: str) -> i64 {
+    let r = tys.shallow(t, x)
+    let k = t.k[r]
+    if k == tys.K_NAMED {
+        let def = t.a[r]
+        if not tys.is_struct(t, def) {
+            return -1
+        }
+        let (fnames, ftys) = tys.struct_fields(t, def)
+        for i in 0..fnames.len() {
+            if fnames[i] == field {
+                return ftys[i]
+            }
+        }
+        return -1
+    }
+    if k == tys.K_TUPLE {
+        if field == "" or not sema.all_digits(field) {
+            return -1
+        }
+        let i = field.parse_int() ?? -1
+        if i >= 0 and i < t.n[r] {
+            return tys.item(t, r, i)
+        }
+        return -1
+    }
+    if k == tys.K_REF {
+        let inner = tys.resolve(t, t.a[r])
+        let ik = t.k[inner]
+        if field == "value" and not (ik == tys.K_NAMED or ik == tys.K_TUPLE) {
+            return inner
+        }
+        return struct_field_type(c, t, inner, field)
+    }
+    -1
+}
+
+/// A method an interface provides: through a bound on a generic receiver,
+/// or an `impl` for its type. -2 when neither applies.
+fn interface_method(inout c: Ck, inout t: Tys, p: Prog, recv_res: i64, recv: i64, nm: i64, args: [i64], s: i64, e: i64) -> i64 {
+    let name = prog.name(p, nm)
+    let key = prog.key(s, e)
+    if t.k[recv_res] == tys.K_GENERIC {
+        let i = t.a[recv_res]
+        var gname = "T"
+        if i < c.current_generics.len() {
+            gname = c.current_generics[i]
+        }
+        var bounds: [str] = []
+        if i < c.current_bounds.len() {
+            bounds = sema.bounds_list(c.current_bounds[i])
+        }
+        var sig = -1
+        for b in bounds {
+            let idecl = c.interfaces.get(b) ?? -1
+            if idecl >= 0 and sig < 0 {
+                for m in prog.items(p, prog.sl(p, idecl, 2)) {
+                    if prog.name(p, prog.sl(p, m, 0)) == name and sig < 0 {
+                        sig = m
+                    }
+                }
+            }
+        }
+        if sig < 0 {
+            if sema.lookup_fn(c, name) >= 0 {
+                return -2
+            }
+            return sema.err(c, prog.s(p, nm), prog.e(p, nm), "`{gname}` has no method `{name}`")
+        }
+        let fx = prog.sl(p, sig, 4)
+        if fx >= 0 and prog.count(p, fx) > 0 {
+            var row: [str] = []
+            for pth in prog.items(p, fx) {
+                row.push(prog.name(p, prog.items(p, prog.sl(p, pth, 0))[0]))
+            }
+            c.callee_rows.set(key, tys.row_of(t, row))
+        }
+        var names: [str] = []
+        for _ in 0..i + 1 {
+            names.push("")
+        }
+        names[i] = "Self"
+        var params: [i64] = []
+        let sps = prog.items(p, prog.sl(p, sig, 1))
+        for j in 1..sps.len() {
+            params.push(sema.resolve_type(c, t, p, prog.sl(p, sps[j], 2), names))
+        }
+        var ret = tys.UNIT
+        if prog.sl(p, sig, 2) >= 0 {
+            ret = sema.resolve_type(c, t, p, prog.sl(p, sig, 2), names)
+        }
+        if args.len() != params.len() {
+            return sema.err(c, s, e, "`{name}` takes {params.len()} argument(s), got {args.len()}")
+        }
+        for j in 0..args.len() {
+            sema.check_expr(c, t, p, args[j], params[j])
+        }
+        var bound = ""
+        var found = false
+        for b in bounds {
+            let idecl = c.interfaces.get(b) ?? -1
+            if idecl >= 0 and not found {
+                for m in prog.items(p, prog.sl(p, idecl, 2)) {
+                    if prog.name(p, prog.sl(p, m, 0)) == name {
+                        found = true
+                    }
+                }
+                if found {
+                    bound = b
+                }
+            }
+        }
+        sema.tir_method(c, key, sema.MR_BOUND, bound, "")
+        return ret
+    }
+    let ik = sema.impl_key(t, recv_res)
+    if ik == "\0" {
+        return -2
+    }
+    let slot = ik + "\t" + name
+    let qual = c.impls_q.get(slot) ?? "\0"
+    if qual == "\0" {
+        return -2
+    }
+    // `rsplit_once("::")`.
+    let parts = qual.split("::")
+    let fname = parts[parts.len() - 1]
+    let owner = qual.substr(0, qual.len() - fname.len() - 2)
+    let fid = sema.fn_of(c, qual)
+    if fid < 0 {
+        return -2
+    }
+    var full = [recv]
+    for a in args {
+        full.push(a)
+    }
+    sema.tir_method(c, key, sema.MR_INTERFACE, "", "")
+    semcall.check_fn_call_in(c, t, p, owner, fname, fid, full, s, e)
+}
+
+fn check_cmp(inout c: Ck, inout t: Tys, p: Prog, recv: i64, args: [i64], s: i64, e: i64) -> i64 {
+    let ty = sema.infer_expr(c, t, p, recv)
+    if args.len() != 1 {
+        sema.err(c, s, e, "`cmp` takes exactly 1 argument")
+        return tys.I64
+    }
+    sema.check_expr(c, t, p, args[0], ty)
+    tys.I64
+}
+
+/// Mutating methods need a mutable receiver root.
+fn require_mutable(inout c: Ck, inout t: Tys, p: Prog, recv: i64, nm: i64) {
+    let name = prog.name(p, nm)
+    var root = recv
+    while prog.kind(p, root) == ast.E_FIELD or prog.kind(p, root) == ast.E_INDEX {
+        if prog.kind(p, root) == ast.E_FIELD {
+            let f = prog.name(p, prog.sl(p, root, 1))
+            if sema.all_digits(f) {
+                sema.err(c, prog.s(p, root), prog.e(p, root), "cannot use `{name}` on a tuple component")
+                return
+            }
+        }
+        root = prog.sl(p, root, 0)
+    }
+    let through_ref = sema.path_crosses_ref(c, t, p, recv)
+    if prog.kind(p, root) == ast.E_IDENT {
+        let id = prog.sl(p, root, 0)
+        let rn = prog.name(p, id)
+        sema.reject_region_escape(c, p, id, "mutate")
+        let b = sema.lookup(c, rn)
+        if b >= 0 and not c.b_mut[b] and not through_ref {
+            sema.err(c, prog.s(p, id), prog.e(p, id), "cannot mutate `{rn}` — it is immutable")
+        }
+        sema.reject_capture_write(c, t, p, id, "mutate", "")
+        let rt = sema.infer_expr(c, t, p, recv)
+        sema.reject_handler_escape(c, t, p, recv, rt)
+    } else {
+        sema.err(c, prog.es(p, recv), prog.ee(p, recv), "cannot use `{name}` on a temporary")
+    }
+    return
+}
+
+fn fnt1(inout t: Tys, param: i64, ret: i64) -> i64 {
+    tys.fnt(t, [param], ret, -1)
+}
+
+/// A built-in method's type, or -2 when the receiver's type has none of
+/// that name.
+fn builtin_method(inout c: Ck, inout t: Tys, p: Prog, recv_ty: i64, recv: i64, nm: i64, args: [i64], s: i64, e: i64) -> i64 {
+    let name = prog.name(p, nm)
+    let k = t.k[recv_ty]
+    if k == tys.K_LIST {
+        let elem = t.a[recv_ty]
+        if name == "len" {
+            ar(c, args, 0, name, s, e)
+            return tys.I64
+        }
+        if name == "push" {
+            require_mutable(c, t, p, recv, nm)
+            if ar(c, args, 1, name, s, e) {
+                sema.check_expr(c, t, p, args[0], elem)
+            }
+            return tys.UNIT
+        }
+        if name == "pop" {
+            require_mutable(c, t, p, recv, nm)
+            ar(c, args, 0, name, s, e)
+            return tys.option_of(t, elem)
+        }
+        if name == "get" {
+            if ar(c, args, 1, name, s, e) {
+                sema.check_expr(c, t, p, args[0], tys.I64)
+            }
+            return tys.option_of(t, elem)
+        }
+        if name == "contains" {
+            if ar(c, args, 1, name, s, e) {
+                sema.check_expr(c, t, p, args[0], elem)
+            }
+            return tys.BOOL
+        }
+        if name == "map" {
+            let out = tys.fresh(t)
+            if ar(c, args, 1, name, s, e) {
+                let f = fnt1(t, elem, out)
+                sema.check_expr(c, t, p, args[0], f)
+            }
+            return tys.list(t, out)
+        }
+        if name == "fold" {
+            let acc = tys.fresh(t)
+            if ar(c, args, 2, name, s, e) {
+                let f = tys.fnt(t, [acc, elem], acc, -1)
+                if sema.is_int_literal(p, args[0]) and tys.shallow(t, elem) == tys.F64 {
+                    tys.unify(t, acc, tys.F64)
+                }
+                sema.check_expr(c, t, p, args[0], acc)
+                sema.check_expr(c, t, p, args[1], f)
+            }
+            return acc
+        }
+        if name == "par_map" {
+            let out = tys.fresh(t)
+            if ar(c, args, 1, name, s, e) {
+                semcall.reject_parallel_ref_elem(c, t, elem, name, s, e)
+                let f = fnt1(t, elem, out)
+                semcall.check_parallel_fn(c, t, p, args[0], f)
+            }
+            return tys.list(t, out)
+        }
+        if name == "filter" or name == "par_filter" {
+            if ar(c, args, 1, name, s, e) {
+                let f = fnt1(t, elem, tys.BOOL)
+                if name == "par_filter" {
+                    semcall.reject_parallel_ref_elem(c, t, elem, name, s, e)
+                    semcall.check_parallel_fn(c, t, p, args[0], f)
+                } else {
+                    sema.check_expr(c, t, p, args[0], f)
+                }
+            }
+            return tys.list(t, elem)
+        }
+        if name == "any" or name == "all" {
+            if ar(c, args, 1, name, s, e) {
+                let f = fnt1(t, elem, tys.BOOL)
+                sema.check_expr(c, t, p, args[0], f)
+            }
+            return tys.BOOL
+        }
+        if name == "find" {
+            if ar(c, args, 1, name, s, e) {
+                let f = fnt1(t, elem, tys.BOOL)
+                sema.check_expr(c, t, p, args[0], f)
+            }
+            return tys.option_of(t, elem)
+        }
+        if name == "min" or name == "max" {
+            ar(c, args, 0, name, s, e)
+            if not sema.is_ordered(t, elem) {
+                sema.err(c, s, e, "cannot take min/max of `{tys.show(t, elem)}` values")
+            }
+            return tys.option_of(t, elem)
+        }
+        if name == "is_empty" {
+            ar(c, args, 0, name, s, e)
+            return tys.BOOL
+        }
+        if name == "sum" {
+            ar(c, args, 0, name, s, e)
+            let r = tys.shallow(t, elem)
+            let rk = t.k[r]
+            if not (rk == tys.K_I64 or rk == tys.K_INT or rk == tys.K_F64 or rk == tys.K_VAR or rk == tys.K_ERROR) {
+                sema.err(c, s, e, "cannot sum a list of `{tys.show(t, elem)}`")
+            }
+            if rk == tys.K_VAR {
+                tys.unify(t, elem, tys.I64)
+                return tys.I64
+            }
+            return r
+        }
+        if name == "join" {
+            if ar(c, args, 1, name, s, e) {
+                sema.check_expr(c, t, p, args[0], tys.STR)
+            }
+            if not tys.unify(t, elem, tys.STR) {
+                sema.err(c, s, e, "`join` needs `[str]`, found list of `{tys.show(t, elem)}`")
+            }
+            return tys.STR
+        }
+        if name == "rev" {
+            ar(c, args, 0, name, s, e)
+            return tys.list(t, elem)
+        }
+        if name == "slice" {
+            if ar(c, args, 2, name, s, e) {
+                sema.check_expr(c, t, p, args[0], tys.I64)
+                sema.check_expr(c, t, p, args[1], tys.I64)
+            }
+            return tys.list(t, elem)
+        }
+        if name == "first" or name == "last" {
+            ar(c, args, 0, name, s, e)
+            return tys.option_of(t, elem)
+        }
+        if name == "sort" {
+            require_mutable(c, t, p, recv, nm)
+            ar(c, args, 0, name, s, e)
+            let el = tys.shallow(t, elem)
+            if not sema.is_ordered(t, el) {
+                sema.err(c, s, e, "`{tys.show(t, elem)}` has no order, so `sort` cannot arrange it")
+            }
+            return tys.UNIT
+        }
+        if name == "remove" {
+            require_mutable(c, t, p, recv, nm)
+            if ar(c, args, 1, name, s, e) {
+                sema.check_expr(c, t, p, args[0], tys.I64)
+            }
+            return elem
+        }
+        if name == "enumerate" {
+            ar(c, args, 0, name, s, e)
+            let pr = tys.tuple(t, [tys.I64, elem])
+            return tys.list(t, pr)
+        }
+        if name == "zip" {
+            let other = tys.fresh(t)
+            if ar(c, args, 1, name, s, e) {
+                let lo = tys.list(t, other)
+                sema.check_expr(c, t, p, args[0], lo)
+            }
+            let pr = tys.tuple(t, [elem, other])
+            return tys.list(t, pr)
+        }
+        if name == "sort_by" {
+            require_mutable(c, t, p, recv, nm)
+            let key = tys.fresh(t)
+            if ar(c, args, 1, name, s, e) {
+                let f = fnt1(t, elem, key)
+                sema.check_expr(c, t, p, args[0], f)
+                let kk = tys.shallow(t, key)
+                if not sema.is_ordered(t, kk) {
+                    sema.err(c, s, e, "`{tys.show(t, key)}` has no order, so `sort_by` cannot use it as a key")
+                }
+            }
+            return tys.UNIT
+        }
+        return -2
+    }
+    if k == tys.K_STR {
+        if name == "cmp" {
+            return check_cmp(c, t, p, recv, args, s, e)
+        }
+        if name == "len" or name == "byte_len" {
+            ar(c, args, 0, name, s, e)
+            return tys.I64
+        }
+        if name == "contains" or name == "starts_with" or name == "ends_with" {
+            if ar(c, args, 1, name, s, e) {
+                sema.check_expr(c, t, p, args[0], tys.STR)
+            }
+            return tys.BOOL
+        }
+        if name == "split" {
+            if ar(c, args, 1, name, s, e) {
+                sema.check_expr(c, t, p, args[0], tys.STR)
+            }
+            return tys.list(t, tys.STR)
+        }
+        if name == "chars" or name == "lines" or name == "words" {
+            ar(c, args, 0, name, s, e)
+            return tys.list(t, tys.STR)
+        }
+        if name == "pad_start" or name == "pad_end" {
+            if ar(c, args, 2, name, s, e) {
+                sema.check_expr(c, t, p, args[0], tys.I64)
+                sema.check_expr(c, t, p, args[1], tys.STR)
+            }
+            return tys.STR
+        }
+        if name == "is_empty" {
+            ar(c, args, 0, name, s, e)
+            return tys.BOOL
+        }
+        if name == "trim" or name == "trim_start" or name == "trim_end" or name == "to_upper" or name == "to_lower" {
+            ar(c, args, 0, name, s, e)
+            return tys.STR
+        }
+        if name == "code_at" {
+            if ar(c, args, 1, name, s, e) {
+                sema.check_expr(c, t, p, args[0], tys.I64)
+            }
+            return tys.I64
+        }
+        if name == "codes" {
+            ar(c, args, 0, name, s, e)
+            return tys.list(t, tys.I64)
+        }
+        if name == "to_bytes" {
+            ar(c, args, 0, name, s, e)
+            return tys.BYTES
+        }
+        if name == "repeat" {
+            if ar(c, args, 1, name, s, e) {
+                sema.check_expr(c, t, p, args[0], tys.I64)
+            }
+            return tys.STR
+        }
+        if name == "replace" {
+            if ar(c, args, 2, name, s, e) {
+                sema.check_expr(c, t, p, args[0], tys.STR)
+                sema.check_expr(c, t, p, args[1], tys.STR)
+            }
+            return tys.STR
+        }
+        if name == "substr" {
+            if ar(c, args, 2, name, s, e) {
+                sema.check_expr(c, t, p, args[0], tys.I64)
+                sema.check_expr(c, t, p, args[1], tys.I64)
+            }
+            return tys.STR
+        }
+        if name == "index_of" {
+            if ar(c, args, 1, name, s, e) {
+                sema.check_expr(c, t, p, args[0], tys.STR)
+            }
+            return tys.option_of(t, tys.I64)
+        }
+        if name == "parse_int" {
+            ar(c, args, 0, name, s, e)
+            return tys.option_of(t, tys.I64)
+        }
+        if name == "parse_int_base" {
+            if ar(c, args, 1, name, s, e) {
+                sema.check_expr(c, t, p, args[0], tys.I64)
+            }
+            return tys.option_of(t, tys.I64)
+        }
+        if name == "parse_u64" {
+            ar(c, args, 0, name, s, e)
+            return tys.option_of(t, tys.int_ty(6))
+        }
+        if name == "parse_u64_base" {
+            if ar(c, args, 1, name, s, e) {
+                sema.check_expr(c, t, p, args[0], tys.I64)
+            }
+            return tys.option_of(t, tys.int_ty(6))
+        }
+        if name == "parse_float" {
+            ar(c, args, 0, name, s, e)
+            return tys.option_of(t, tys.F64)
+        }
+        return -2
+    }
+    if k == tys.K_RANGE {
+        if name == "to_list" {
+            ar(c, args, 0, name, s, e)
+            return tys.list(t, tys.I64)
+        }
+        if name == "map" {
+            let out = tys.fresh(t)
+            if ar(c, args, 1, name, s, e) {
+                let f = fnt1(t, tys.I64, out)
+                sema.check_expr(c, t, p, args[0], f)
+            }
+            return tys.list(t, out)
+        }
+        if name == "filter" {
+            if ar(c, args, 1, name, s, e) {
+                let f = fnt1(t, tys.I64, tys.BOOL)
+                sema.check_expr(c, t, p, args[0], f)
+            }
+            return tys.list(t, tys.I64)
+        }
+        if name == "sum" or name == "len" {
+            ar(c, args, 0, name, s, e)
+            return tys.I64
+        }
+        return -2
+    }
+    if k == tys.K_BYTES {
+        if name == "len" {
+            ar(c, args, 0, name, s, e)
+            return tys.I64
+        }
+        if name == "at" {
+            if ar(c, args, 1, name, s, e) {
+                sema.check_expr(c, t, p, args[0], tys.I64)
+            }
+            return tys.I64
+        }
+        if name == "slice" {
+            if ar(c, args, 2, name, s, e) {
+                sema.check_expr(c, t, p, args[0], tys.I64)
+                sema.check_expr(c, t, p, args[1], tys.I64)
+            }
+            return tys.BYTES
+        }
+        if name == "concat" {
+            if ar(c, args, 1, name, s, e) {
+                sema.check_expr(c, t, p, args[0], tys.BYTES)
+            }
+            return tys.BYTES
+        }
+        if name == "index_of" {
+            if ar(c, args, 2, name, s, e) {
+                sema.check_expr(c, t, p, args[0], tys.I64)
+                sema.check_expr(c, t, p, args[1], tys.I64)
+            }
+            return tys.option_of(t, tys.I64)
+        }
+        if name == "set" {
+            if ar(c, args, 2, name, s, e) {
+                sema.check_expr(c, t, p, args[0], tys.I64)
+                sema.check_expr(c, t, p, args[1], tys.I64)
+                require_mutable(c, t, p, recv, nm)
+            }
+            return tys.UNIT
+        }
+        if name == "fill" {
+            if ar(c, args, 1, name, s, e) {
+                sema.check_expr(c, t, p, args[0], tys.I64)
+                require_mutable(c, t, p, recv, nm)
+            }
+            return tys.UNIT
+        }
+        if name == "copy_from" {
+            if ar(c, args, 2, name, s, e) {
+                sema.check_expr(c, t, p, args[0], tys.I64)
+                sema.check_expr(c, t, p, args[1], tys.BYTES)
+                require_mutable(c, t, p, recv, nm)
+            }
+            return tys.UNIT
+        }
+        if name == "to_list" {
+            ar(c, args, 0, name, s, e)
+            return tys.list(t, tys.I64)
+        }
+        if name == "to_str" {
+            ar(c, args, 0, name, s, e)
+            return tys.STR
+        }
+        if name == "is_empty" {
+            ar(c, args, 0, name, s, e)
+            return tys.BOOL
+        }
+        return -2
+    }
+    if k == tys.K_ADDR {
+        return check_mem_method(c, t, p, nm, args, s, e)
+    }
+    if k == tys.K_STRBUF or k == tys.K_BYTEBUF {
+        let bytes = k == tys.K_BYTEBUF
+        if name == "push_str" {
+            if ar(c, args, 1, name, s, e) {
+                sema.check_expr(c, t, p, args[0], tys.STR)
+                require_mutable(c, t, p, recv, nm)
+            }
+            return tys.UNIT
+        }
+        if name == "push_byte" and bytes {
+            if ar(c, args, 1, name, s, e) {
+                sema.check_expr(c, t, p, args[0], tys.I64)
+                require_mutable(c, t, p, recv, nm)
+            }
+            return tys.UNIT
+        }
+        if name == "push_bytes" and bytes {
+            if ar(c, args, 1, name, s, e) {
+                sema.check_expr(c, t, p, args[0], tys.BYTES)
+                require_mutable(c, t, p, recv, nm)
+            }
+            return tys.UNIT
+        }
+        if name == "set" and bytes {
+            if ar(c, args, 2, name, s, e) {
+                sema.check_expr(c, t, p, args[0], tys.I64)
+                sema.check_expr(c, t, p, args[1], tys.I64)
+                require_mutable(c, t, p, recv, nm)
+            }
+            return tys.UNIT
+        }
+        if name == "at" and bytes {
+            if ar(c, args, 1, name, s, e) {
+                sema.check_expr(c, t, p, args[0], tys.I64)
+            }
+            return tys.I64
+        }
+        if name == "len" {
+            ar(c, args, 0, name, s, e)
+            return tys.I64
+        }
+        if name == "is_empty" {
+            ar(c, args, 0, name, s, e)
+            return tys.BOOL
+        }
+        if name == "to_str" {
+            ar(c, args, 0, name, s, e)
+            return tys.STR
+        }
+        if name == "to_bytes" and bytes {
+            ar(c, args, 0, name, s, e)
+            return tys.BYTES
+        }
+        return -2
+    }
+    if k == tys.K_TUPLE and name == "cmp" {
+        return check_cmp(c, t, p, recv, args, s, e)
+    }
+    if k == tys.K_I64 or k == tys.K_INT {
+        let me = recv_ty
+        if name.starts_with("as_") {
+            let tk = tys.int_of_name(name.substr(3, name.len() - 3))
+            if tk >= 0 {
+                ar(c, args, 0, name, s, e)
+                return tys.int_ty(tk)
+            }
+        }
+        if name.starts_with("try_") {
+            let tk = tys.int_of_name(name.substr(4, name.len() - 4))
+            if tk >= 0 {
+                ar(c, args, 0, name, s, e)
+                return tys.option_of(t, tys.int_ty(tk))
+            }
+        }
+        if name == "cmp" {
+            return check_cmp(c, t, p, recv, args, s, e)
+        }
+        if name == "from_bits" and me == tys.I64 {
+            ar(c, args, 0, name, s, e)
+            return tys.F64
+        }
+        if name == "as_f64" {
+            ar(c, args, 0, name, s, e)
+            return tys.F64
+        }
+        if name == "as_i64" {
+            ar(c, args, 0, name, s, e)
+            return tys.I64
+        }
+        if name == "try_i64" {
+            ar(c, args, 0, name, s, e)
+            return tys.option_of(t, tys.I64)
+        }
+        if name == "to_char" {
+            ar(c, args, 0, name, s, e)
+            return tys.STR
+        }
+        if name == "abs" or name == "bit_not" or name == "swap_bytes" {
+            ar(c, args, 0, name, s, e)
+            return me
+        }
+        if name == "min" or name == "max" or name == "saturating_add" or name == "saturating_sub" or name == "saturating_mul" or name == "bit_and" or name == "bit_or" or name == "bit_xor" {
+            if ar(c, args, 1, name, s, e) {
+                sema.check_expr(c, t, p, args[0], me)
+            }
+            return me
+        }
+        if name == "checked_add" or name == "checked_sub" or name == "checked_mul" {
+            if ar(c, args, 1, name, s, e) {
+                sema.check_expr(c, t, p, args[0], me)
+            }
+            return tys.option_of(t, me)
+        }
+        if name == "shl" or name == "shr" or name == "ushr" or name == "rotate_left" or name == "rotate_right" {
+            if ar(c, args, 1, name, s, e) {
+                sema.check_expr(c, t, p, args[0], tys.I64)
+            }
+            return me
+        }
+        if name == "count_ones" or name == "leading_zeros" or name == "trailing_zeros" {
+            ar(c, args, 0, name, s, e)
+            return tys.I64
+        }
+        if name == "to_str" {
+            ar(c, args, 0, name, s, e)
+            return tys.STR
+        }
+        if name == "to_base" {
+            if ar(c, args, 1, name, s, e) {
+                sema.check_expr(c, t, p, args[0], tys.I64)
+            }
+            return tys.STR
+        }
+        return -2
+    }
+    if k == tys.K_F64 {
+        if name == "cmp" {
+            return check_cmp(c, t, p, recv, args, s, e)
+        }
+        if name == "is_nan" or name == "is_finite" {
+            ar(c, args, 0, name, s, e)
+            return tys.BOOL
+        }
+        if name == "to_fixed" {
+            if ar(c, args, 1, name, s, e) {
+                sema.check_expr(c, t, p, args[0], tys.I64)
+            }
+            return tys.STR
+        }
+        if name == "as_i64" or name == "to_bits" {
+            ar(c, args, 0, name, s, e)
+            return tys.I64
+        }
+        if name.starts_with("as_") {
+            let tk = tys.int_of_name(name.substr(3, name.len() - 3))
+            if tk >= 0 {
+                ar(c, args, 0, name, s, e)
+                return tys.int_ty(tk)
+            }
+        }
+        if name == "abs" or name == "sqrt" or name == "floor" or name == "ceil" or name == "round" or name == "sin" or name == "cos" or name == "tan" or name == "asin" or name == "acos" or name == "atan" or name == "sinh" or name == "cosh" or name == "tanh" or name == "exp" or name == "ln" or name == "log2" or name == "log10" or name == "cbrt" or name == "to_radians" or name == "to_degrees" {
+            ar(c, args, 0, name, s, e)
+            return tys.F64
+        }
+        if name == "atan2" or name == "hypot" or name == "log" or name == "min" or name == "max" {
+            if ar(c, args, 1, name, s, e) {
+                sema.check_expr(c, t, p, args[0], tys.F64)
+            }
+            return tys.F64
+        }
+        if name == "to_str" {
+            ar(c, args, 0, name, s, e)
+            return tys.STR
+        }
+        return -2
+    }
+    if k == tys.K_MAP {
+        let kt = t.a[recv_ty]
+        let vt = t.b[recv_ty]
+        if name == "set" {
+            require_mutable(c, t, p, recv, nm)
+            if ar(c, args, 2, name, s, e) {
+                sema.check_expr(c, t, p, args[0], kt)
+                sema.check_expr(c, t, p, args[1], vt)
+                semcall.require_map_key(c, t, kt, s, e)
+            }
+            return tys.UNIT
+        }
+        if name == "get" {
+            if ar(c, args, 1, name, s, e) {
+                sema.check_expr(c, t, p, args[0], kt)
+                semcall.require_map_key(c, t, kt, s, e)
+            }
+            return tys.option_of(t, vt)
+        }
+        if name == "has" {
+            if ar(c, args, 1, name, s, e) {
+                sema.check_expr(c, t, p, args[0], kt)
+            }
+            return tys.BOOL
+        }
+        if name == "delete" {
+            require_mutable(c, t, p, recv, nm)
+            if ar(c, args, 1, name, s, e) {
+                sema.check_expr(c, t, p, args[0], kt)
+            }
+            return tys.BOOL
+        }
+        if name == "len" {
+            ar(c, args, 0, name, s, e)
+            return tys.I64
+        }
+        if name == "is_empty" {
+            ar(c, args, 0, name, s, e)
+            return tys.BOOL
+        }
+        if name == "keys" {
+            ar(c, args, 0, name, s, e)
+            return tys.list(t, kt)
+        }
+        if name == "values" {
+            ar(c, args, 0, name, s, e)
+            return tys.list(t, vt)
+        }
+        if name == "entries" {
+            ar(c, args, 0, name, s, e)
+            let pr = tys.tuple(t, [kt, vt])
+            return tys.list(t, pr)
+        }
+        return -2
+    }
+    if k == tys.K_NAMED and t.a[recv_ty] == tys.OPTION {
+        let inner = tys.item(t, recv_ty, 0)
+        if name == "is_some" or name == "is_none" {
+            ar(c, args, 0, name, s, e)
+            return tys.BOOL
+        }
+        if name == "unwrap_or" {
+            if ar(c, args, 1, name, s, e) {
+                sema.check_expr(c, t, p, args[0], inner)
+            }
+            return inner
+        }
+        if name == "expect" {
+            if ar(c, args, 1, name, s, e) {
+                sema.check_expr(c, t, p, args[0], tys.STR)
+            }
+            return inner
+        }
+        return -2
+    }
+    -2
+}
+
+fn ar(inout c: Ck, args: [i64], want: i64, name: str, s: i64, e: i64) -> bool {
+    if args.len() != want {
+        sema.err(c, s, e, "`{name}` takes {want} argument(s), got {args.len()}")
+        return false
+    }
+    true
+}
+
+// ---------------------------------------------------------------------
+// Methods on an address ([L-LIB-MEM], [L-LIB-ATOMIC], [L-LIB-CALL-C])
+// ---------------------------------------------------------------------
+
+fn order_ok(op: str, o: str) -> bool {
+    if op == "load" {
+        return o == "Relaxed" or o == "Acquire" or o == "SeqCst"
+    }
+    if op == "store" {
+        return o == "Relaxed" or o == "Release" or o == "SeqCst"
+    }
+    true
+}
+
+fn is_order(o: str) -> bool {
+    o == "Relaxed" or o == "Acquire" or o == "Release" or o == "AcqRel" or o == "SeqCst"
+}
+
+fn layout_name(n: str) -> bool {
+    n == "i8" or n == "i16" or n == "i32" or n == "i64" or n == "u8" or n == "u16" or n == "u32" or n == "u64" or n == "f64" or n == "addr"
+}
+
+fn check_mem_method(inout c: Ck, inout t: Tys, p: Prog, nm: i64, args: [i64], s: i64, e: i64) -> i64 {
+    let name = prog.name(p, nm)
+    let key = prog.key(s, e)
+    // `mem::method`: what the name is, or nothing.
+    var kind = ""
+    var lt = ""
+    var aop = ""
+    if name == "offset" or name == "diff" or name == "as_i64" {
+        kind = name
+    } else if name == "call_c" {
+        kind = "call_c"
+    } else if name.starts_with("atomic_") {
+        let rest = name.substr(7, name.len() - 7)
+        match rest.index_of("_") {
+            Some(i) -> {
+                let op = rest.substr(0, i)
+                let ty = rest.substr(i + 1, rest.len() - i - 1)
+                if (op == "load" or op == "store" or op == "cas" or op == "add") and layout_name(ty) and ty != "f64" and ty != "addr" {
+                    kind = "atomic"
+                    aop = op
+                    lt = ty
+                }
+            }
+            None -> ()
+        }
+    } else if name.starts_with("load_") and layout_name(name.substr(5, name.len() - 5)) {
+        kind = "load"
+        lt = name.substr(5, name.len() - 5)
+    } else if name.starts_with("store_") and layout_name(name.substr(6, name.len() - 6)) {
+        kind = "store"
+        lt = name.substr(6, name.len() - 6)
+    }
+    if kind == "" {
+        return -2
+    }
+    sema.require_unsafe_mem(c, name, prog.s(p, nm), prog.e(p, nm))
+    if kind == "call_c" {
+        c.callee_rows.set(key, tys.row_of(t, ["mem", "io", "unsafe"]))
+        return check_call_c(c, t, p, nm, args, s, e)
+    }
+    c.callee_rows.set(key, tys.row_of(t, ["mem"]))
+    if kind == "atomic" {
+        var values = 0
+        if aop == "store" or aop == "add" {
+            values = 1
+        } else if aop == "cas" {
+            values = 2
+        }
+        if args.len() != values + 1 {
+            return sema.err(c, s, e, "`{name}` takes {values + 1} argument(s), got {args.len()}")
+        }
+        let lty = sema.memty_ty(lt)
+        for i in 0..values {
+            sema.check_expr(c, t, p, args[i], lty)
+        }
+        let last = args[values]
+        var order = ""
+        if prog.kind(p, last) == ast.E_IDENT {
+            let o = prog.name(p, prog.sl(p, last, 0))
+            if is_order(o) {
+                order = o
+            }
+        }
+        if order == "" {
+            return sema.err(c, prog.es(p, last), prog.ee(p, last), "`{name}` takes a memory ordering, written as its name")
+        }
+        if not order_ok(aop, order) {
+            return sema.err(c, prog.es(p, last), prog.ee(p, last), "an atomic {aop} cannot be `{order}`")
+        }
+        c.mem_kind.set(key, sema.MO_ATOMIC)
+        c.mem_s.set(key, order.to_lower())
+        if aop == "store" {
+            return tys.UNIT
+        }
+        return lty
+    }
+    var params: [i64] = []
+    var ret = tys.UNIT
+    if kind == "offset" {
+        params = [tys.I64]
+        ret = tys.ADDR
+    } else if kind == "diff" {
+        params = [tys.ADDR]
+        ret = tys.I64
+    } else if kind == "as_i64" {
+        ret = tys.I64
+    } else if kind == "load" {
+        ret = sema.memty_ty(lt)
+    } else {
+        params = [sema.memty_ty(lt)]
+    }
+    if args.len() != params.len() {
+        return sema.err(c, s, e, "`{name}` takes {params.len()} argument(s), got {args.len()}")
+    }
+    for i in 0..args.len() {
+        sema.check_expr(c, t, p, args[i], params[i])
+    }
+    c.mem_kind.set(key, sema.MO_OTHER)
+    ret
+}
+
+fn check_call_c(inout c: Ck, inout t: Tys, p: Prog, nm: i64, args: [i64], s: i64, e: i64) -> i64 {
+    let key = prog.key(s, e)
+    if args.len() == 0 or prog.kind(p, args[0]) != ast.E_IDENT {
+        return sema.err(c, s, e, "`call_c` takes a signature first, written as the name of a type alias")
+    }
+    let tid = prog.sl(p, args[0], 0)
+    let ty = semcall.resolve_named(c, t, p, tid)
+    if ty == tys.ERROR {
+        return tys.ERROR
+    }
+    if t.k[ty] != tys.K_FN {
+        return sema.err(c, prog.s(p, tid), prog.e(p, tid), "`call_c` takes a function type, and `{tys.show(t, ty)}` is not one")
+    }
+    let params = tys.items(t, ty)
+    let ret = t.a[ty]
+    var ok = true
+    for x in params {
+        if not sema.is_c_param_type(t, x) {
+            sema.err(c, prog.s(p, tid), prog.e(p, tid), "`{tys.show(t, x)}` has no C representation")
+            ok = false
+        }
+    }
+    if t.k[ret] != tys.K_UNIT and not sema.is_c_abi_type(t, ret) {
+        sema.err(c, prog.s(p, tid), prog.e(p, tid), "`{tys.show(t, ret)}` has no C representation")
+        ok = false
+    }
+    let values = args.slice(1, args.len())
+    if values.len() != params.len() {
+        return sema.err(c, s, e, "`call_c` through `{prog.name(p, tid)}` takes {params.len()} argument(s) after the signature, got {values.len()}")
+    }
+    for i in 0..values.len() {
+        sema.check_expr(c, t, p, values[i], params[i])
+    }
+    if not ok {
+        return tys.ERROR
+    }
+    let sig = sema.c_sig_of(t, params, ret)
+    if sig == "\0" {
+        return tys.ERROR
+    }
+    c.mem_kind.set(key, sema.MO_CALLC)
+    c.cop_kind.set(key, sema.CO_CALLC)
+    c.cop_s.set(key, sig)
+    ret
+}

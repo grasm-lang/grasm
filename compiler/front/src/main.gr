@@ -23,6 +23,12 @@ import syn
 import parse
 import cst
 import ast
+import loader
+import prog
+import sema
+import emit
+import ceiling
+import toml
 
 fn usage() {
     eprint("usage: front tokens <file.gr>")
@@ -327,8 +333,154 @@ fn cmd_bench(list: str, rounds: i64) {
     print("lex_ns: {best_lex}   lex_parse_cst_ns: {best_parse}   lex_parse_cst_ast_ns: {best_ast}")
 }
 
+/// A manifest as `packages/toml` reads it: every key as a dotted path, in
+/// byte order, with its value's kind and the value -- a string JSON-quoted,
+/// an array's items in brackets. An inline table's members are listed under
+/// their own paths and the table itself is not. The entries of an array of
+/// tables follow, the arrays by name, each entry numbered (`bin[1].name`)
+/// and in the file's order, the keys sorted within it -- so a key read into
+/// the wrong entry shows. A file the reader refuses prints `refused` and its
+/// reason.
+fn cmd_toml(path: str) {
+    let text = match read_file(path) {
+        Ok(t) -> t
+        Err(e) -> {
+            eprint("error: cannot read `{path}`: {e}")
+            exit(1)
+            ""
+        }
+    }
+    let doc = toml.parse(text)
+    if not doc.ok {
+        print("refused line {doc.line}: {doc.why}")
+        return
+    }
+    // Each line behind a sort key: "0" and the line for a plain key; "1",
+    // the array's name, the entry's number and the line for an entry's.
+    var lines: [str] = []
+    for i in 0..doc.keys.len() {
+        let v = doc.values[i]
+        if toml.kind(v) == "table" {
+            continue
+        }
+        let at = doc.entries[i]
+        let line = at + "\t" + toml_value(v)
+        match at.index_of("[") {
+            None -> lines.push("0" + line)
+            Some(open) -> {
+                let close = at.index_of("]") ?? open
+                let n = at.substr(open + 1, close - open - 1)
+                lines.push("1" + at.substr(0, open) + "\u{1}" + n.pad_start(12, "0") + "\u{1}" + line)
+            }
+        }
+    }
+    lines.sort()
+    for l in lines {
+        if l.starts_with("0") {
+            print(l.substr(1, l.len() - 1))
+        } else {
+            let parts = l.split("\u{1}")
+            print(parts[2])
+        }
+    }
+}
+
+fn toml_value(v: ref TomlValue) -> str {
+    match v {
+        Text(s) -> "str " + loader.quote(s)
+        Int(n) -> "int {n}"
+        Float(x) -> "float {x}"
+        Bool(b) -> if b { "bool true" } else { "bool false" }
+        Array(items) -> {
+            var parts: [str] = []
+            for it in items {
+                parts.push(toml_value(it))
+            }
+            "array [" + parts.join(", ") + "]"
+        }
+        Table(ks, vs) -> "table"
+    }
+}
+
+/// The modules a program loads, as the file lines `grasm tir` begins with.
+/// Exit 2 when a module, or the package graph, cannot be loaded; a module
+/// that loads and does not parse is listed, its diagnostics on stderr.
+fn cmd_files(path: str) {
+    let l = loader.load(path)
+    if l.fatal != "" {
+        eprint("error: {l.fatal}")
+        exit(2)
+    }
+    var unloadable = false
+    for d in l.diags {
+        eprint("error: {d}")
+        if d.starts_with("cannot load module") {
+            unloadable = true
+        }
+    }
+    print(loader.print_files(l).trim_end())
+    if unloadable {
+        exit(2)
+    }
+}
+
+/// `grasm tir`: the program's TIR, or why it has none.
+fn cmd_tir(path: str) {
+    let l = loader.load(path)
+    if l.fatal != "" {
+        eprint("error: {l.fatal}")
+        exit(1)
+    }
+    if l.diags.len() > 0 {
+        for d in l.diags {
+            eprint("error: {d}")
+        }
+        exit(1)
+    }
+    let p = prog.build(l)
+    let (c, t0) = sema.check_program(p)
+    var t = t0
+    if c.d_s.len() > 0 {
+        for i in 0..c.d_s.len() {
+            eprint("error: {c.d_msg[i]} @{c.d_s[i]}:{c.d_e[i]}")
+        }
+        exit(1)
+    }
+    // A dependency's capability ceiling is a build guarantee, so it is held
+    // here, on the path every command takes.
+    let breaches = ceiling.check(path, p, c, t)
+    if breaches.len() > 0 {
+        for b in breaches {
+            eprint("error: {b}")
+        }
+        exit(1)
+    }
+    let (text, holes) = emit.emit(c, t, p)
+    let b = text.to_bytes()
+    print(b.slice(0, b.len() - 1).to_str())
+    if holes.len() > 0 {
+        for h in holes {
+            eprint("hole {h}")
+        }
+        eprint("{holes.len()} hole(s)")
+        exit(1)
+    }
+}
+
 fn main() {
     let a = args()
+    if a.len() == 2 and a[0] == "tir" {
+        cmd_tir(a[1])
+        return
+    }
+    if a.len() == 2 and a[0] == "toml" {
+        cmd_toml(a[1])
+        return
+    }
+    if a.len() == 2 and a[0] == "files" {
+        cmd_files(a[1])
+        return
+    }
     if a.len() == 3 and a[0] == "bench" {
         cmd_bench(a[1], a[2].parse_int() ?? 3)
         return

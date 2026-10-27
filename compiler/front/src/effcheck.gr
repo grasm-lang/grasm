@@ -1,0 +1,943 @@
+// The effect pass that reports (effects.rs `check_effects_multi_with`): the
+// same row fixpoint as effrows.gr, now told the rows the checker worked out
+// for function values and for calls through fields, and held to what the
+// program declares -- a function's written row, `main`'s and each test's
+// leftover, a constant that performs, an actor method that waits, a
+// parallel operation's function, a function handed to a parameter or
+// stored under a type whose row it exceeds.
+import ast
+import prog
+import effrows
+import builtin_rows
+
+let MAX_ALIAS_DEPTH = 32
+
+type Ec = {
+    x: Eff,
+    aliases: Map[str, i64],
+    type_rows: Map[str, [str]],
+    d_s: [i64],
+    d_e: [i64],
+    d_msg: [str],
+}
+
+fn report(inout ec: Ec, s: i64, e: i64, msg: str) {
+    ec.d_s.push(s)
+    ec.d_e.push(e)
+    ec.d_msg.push(msg)
+}
+
+/// The diagnostics, as (start, end, message).
+pub fn check(p: Prog, vrows: Map[i64, [str]], crows: Map[i64, [str]]) -> ([i64], [i64], [str]) {
+    let x = effrows.build_with(p, vrows, crows, p.deps)
+    var aliases: Map[str, i64] = map()
+    for mi in 0..p.m_name.len() {
+        for d in p.m_decls[mi] {
+            if prog.kind(p, d) == ast.D_TYPE {
+                let body = prog.sl(p, d, 4)
+                if prog.kind(p, body) == ast.B_ALIAS {
+                    aliases.set(prog.name(p, prog.sl(p, d, 2)), prog.sl(p, body, 0))
+                }
+            }
+        }
+    }
+    var ec = Ec{ x: x, aliases: aliases, type_rows: map(), d_s: [], d_e: [], d_msg: [] }
+    ec.type_rows = collect_type_rows(p, aliases)
+    // Constants.
+    for mi in 0..p.m_name.len() {
+        let current = p.m_name[mi]
+        for d in p.m_decls[mi] {
+            if prog.kind(p, d) != ast.D_CONST {
+                continue
+            }
+            let init = prog.sl(p, d, 3)
+            if makes_ref(p, init) {
+                report(ec, prog.es(p, init), prog.ee(p, init), "a constant's value cannot take a reference")
+            }
+            var row: Map[str, bool] = map()
+            var active: [str] = []
+            let f = Fnb{ at: map() }
+            effrows.walk_expr(ec.x, p, mi, current, init, active, f, row)
+            if row.len() > 0 {
+                report(ec, prog.es(p, init), prog.ee(p, init), "a constant's value cannot perform effects, and this performs `{effrows.sorted_keys(row).join("`, `")}`")
+            }
+        }
+    }
+    // Actors' methods may not wait.
+    for mi in 0..p.m_name.len() {
+        for d in p.m_decls[mi] {
+            if prog.kind(p, d) != ast.D_IMPL or prog.path_last(p, prog.sl(p, d, 0)) != "\u{a7}actor" {
+                continue
+            }
+            for pr in prog.items(p, prog.sl(p, d, 4)) {
+                let key = p.m_name[mi] + "::" + prog.text(p, pr)
+                match effrows.row_of(ec.x, key) {
+                    Some(r) -> {
+                        if r.contains("async") {
+                            let mn = prog.sl(p, pr, 0)
+                            report(ec, prog.s(p, mn), prog.e(p, mn), "`{prog.name(p, mn)}` of actor `{prog.text(p, d)}` performs `async`")
+                        }
+                    }
+                    None -> ()
+                }
+            }
+        }
+    }
+    // Declared rows are upper bounds.
+    for i in 0..ec.x.keys.len() {
+        let d = ec.x.decl[i]
+        let fx = prog.sl(p, d, 8)
+        if fx < 0 {
+            continue
+        }
+        let nm = prog.sl(p, d, 2)
+        let fname = prog.name(p, nm)
+        var declared: [str] = []
+        for pth in prog.items(p, fx) {
+            let dn = prog.dotted(p, pth)
+            if not declared.contains(dn) {
+                declared.push(dn)
+            }
+        }
+        declared.sort()
+        for dn in declared {
+            let base = first_seg(dn)
+            if not builtin_rows.is_capability(base) and not ec.x.effect_names.has(base) {
+                report(ec, prog.s(p, nm), prog.e(p, nm), "function `{fname}` declares unknown effect `{dn}`")
+            }
+        }
+        var missing: [str] = []
+        for ef in ec.x.rows[i] {
+            var ok = declared.contains(ef)
+            for dn in declared {
+                if first_seg(dn) == ef {
+                    ok = true
+                }
+            }
+            if not ok {
+                missing.push(ef)
+            }
+        }
+        if missing.len() > 0 {
+            report(ec, prog.s(p, nm), prog.e(p, nm), "function `{fname}` performs effect(s) `{missing.join("`, `")}` not in its declared row")
+        }
+    }
+    // `main`: only capabilities may remain.
+    match ec.x.index.get("main::main") {
+        Some(mi) -> {
+            var left: [str] = []
+            for ef in ec.x.rows[mi] {
+                if not builtin_rows.is_capability(ef) {
+                    left.push(ef)
+                }
+            }
+            if left.len() > 0 {
+                let nm = prog.sl(p, ec.x.decl[mi], 2)
+                report(ec, prog.s(p, nm), prog.e(p, nm), "`main` has unhandled effect(s) `{left.join("`, `")}`")
+            }
+        }
+        None -> ()
+    }
+    // Tests and benchmarks, as `main`.
+    for mi in 0..p.m_name.len() {
+        let current = p.m_name[mi]
+        for d in p.m_decls[mi] {
+            let k = prog.kind(p, d)
+            if k != ast.D_TEST and k != ast.D_BENCH {
+                continue
+            }
+            let body = if k == ast.D_TEST { prog.sl(p, d, 1) } else { prog.sl(p, d, 0) }
+            var f = Fnb{ at: map() }
+            effrows.collect_fn_bindings(p, body, f)
+            var row: Map[str, bool] = map()
+            var active: [str] = []
+            effrows.walk_block(ec.x, p, mi, current, body, active, f, row)
+            var left: [str] = []
+            for ef in effrows.sorted_keys(row) {
+                if not builtin_rows.is_capability(ef) {
+                    left.push(ef)
+                }
+            }
+            if left.len() > 0 {
+                report(ec, prog.s(p, d), prog.e(p, d), "{if k == ast.D_TEST { "test" } else { "bench" }} \"{prog.text(p, d)}\" has unhandled effect(s) `{left.join("`, `")}`")
+            }
+        }
+    }
+    // Parallel operations, function arguments, declared bindings.
+    for mi in 0..p.m_name.len() {
+        let current = p.m_name[mi]
+        for d in p.m_decls[mi] {
+            let k = prog.kind(p, d)
+            var body = -1
+            var f = Fnb{ at: map() }
+            if k == ast.D_FN {
+                body = prog.sl(p, d, 9)
+                for prm in prog.items(p, prog.sl(p, d, 5)) {
+                    effrows.bind_name(f, prog.name(p, prog.sl(p, prm, 1)), 0)
+                }
+            } else if k == ast.D_TEST {
+                body = prog.sl(p, d, 1)
+            } else if k == ast.D_BENCH {
+                body = prog.sl(p, d, 0)
+            } else {
+                continue
+            }
+            effrows.collect_fn_bindings(p, body, f)
+            check_par_map_block(ec, p, mi, current, body, f)
+            check_fn_args_block(ec, p, mi, current, body, f)
+            var dn: [str] = []
+            var dr: [[str]] = []
+            check_declared_rows_block(ec, p, mi, current, body, f, dn, dr)
+        }
+    }
+    (ec.d_s, ec.d_e, ec.d_msg)
+}
+
+fn first_seg(s: str) -> str {
+    match s.index_of(".") {
+        Some(i) -> s.substr(0, i)
+        None -> s
+    }
+}
+
+// ---------------------------------------------------------------------
+// Rows written in types
+// ---------------------------------------------------------------------
+
+fn resolve_alias(ec: Ec, p: Prog, te: i64, depth: i64) -> i64 {
+    if depth > MAX_ALIAS_DEPTH {
+        return te
+    }
+    if prog.kind(p, te) == ast.Y_NAME {
+        let path = prog.sl(p, te, 0)
+        if prog.count(p, prog.sl(p, te, 1)) == 0 and prog.path_len(p, path) == 1 {
+            match ec.aliases.get(prog.path_last(p, path)) {
+                Some(body) -> return resolve_alias(ec, p, body, depth + 1)
+                None -> ()
+            }
+        }
+    }
+    te
+}
+
+fn fn_row_names(p: Prog, te: i64) -> [str] {
+    var out: Map[str, bool] = map()
+    for pth in prog.items(p, prog.sl(p, te, 2)) {
+        out.set(prog.dotted(p, pth), true)
+    }
+    effrows.sorted_keys(out)
+}
+
+/// `declared_row`: the row of a written function type, aliases followed;
+/// None when it is not one.
+fn declared_row(ec: Ec, p: Prog, te: i64) -> Option[[str]] {
+    let r = resolve_alias(ec, p, te, 0)
+    if prog.kind(p, r) == ast.Y_FN {
+        return Some(fn_row_names(p, r))
+    }
+    None
+}
+
+fn union(a: Option[[str]], b: Option[[str]]) -> Option[[str]] {
+    match a {
+        Some(x) -> match b {
+            Some(y) -> {
+                var m: Map[str, bool] = map()
+                for e in x {
+                    m.set(e, true)
+                }
+                for e in y {
+                    m.set(e, true)
+                }
+                Some(effrows.sorted_keys(m))
+            }
+            None -> Some(x)
+        }
+        None -> b
+    }
+}
+
+fn declared_row_within(ec: Ec, p: Prog, te: i64, depth: i64) -> Option[[str]] {
+    if depth > MAX_ALIAS_DEPTH {
+        return None
+    }
+    let r = resolve_alias(ec, p, te, 0)
+    let k = prog.kind(p, r)
+    if k == ast.Y_FN {
+        return Some(fn_row_names(p, r))
+    }
+    if k == ast.Y_LIST or k == ast.Y_REF {
+        return declared_row_within(ec, p, prog.sl(p, r, 0), depth + 1)
+    }
+    if k == ast.Y_FALLIBLE {
+        return union(declared_row_within(ec, p, prog.sl(p, r, 0), depth + 1), declared_row_within(ec, p, prog.sl(p, r, 1), depth + 1))
+    }
+    if k == ast.Y_NAME {
+        var found: Option[[str]] = None
+        let last = prog.path_last(p, prog.sl(p, r, 0))
+        match ec.type_rows.get(last) {
+            Some(rr) -> found = Some(rr)
+            None -> ()
+        }
+        for a in prog.items(p, prog.sl(p, r, 1)) {
+            found = union(found, declared_row_within(ec, p, a, depth + 1))
+        }
+        return found
+    }
+    // Union, tuple
+    var found: Option[[str]] = None
+    for i in prog.items(p, prog.sl(p, r, 0)) {
+        match declared_row_within(ec, p, i, depth + 1) {
+            Some(rr) -> found = union(found, Some(rr))
+            None -> ()
+        }
+    }
+    found
+}
+
+fn declared_row_shallow(ec: Ec, p: Prog, te: i64, depth: i64) -> Option[[str]] {
+    if depth > MAX_ALIAS_DEPTH {
+        return None
+    }
+    let r = resolve_alias(ec, p, te, 0)
+    let k = prog.kind(p, r)
+    if k == ast.Y_FN {
+        return Some(fn_row_names(p, r))
+    }
+    if k == ast.Y_LIST or k == ast.Y_REF {
+        return declared_row_shallow(ec, p, prog.sl(p, r, 0), depth + 1)
+    }
+    if k == ast.Y_FALLIBLE {
+        return union(declared_row_shallow(ec, p, prog.sl(p, r, 0), depth + 1), declared_row_shallow(ec, p, prog.sl(p, r, 1), depth + 1))
+    }
+    var found: Option[[str]] = None
+    let v = if k == ast.Y_NAME { prog.sl(p, r, 1) } else { prog.sl(p, r, 0) }
+    for i in prog.items(p, v) {
+        found = union(found, declared_row_shallow(ec, p, i, depth + 1))
+    }
+    found
+}
+
+fn collect_type_names(ec: Ec, p: Prog, te: i64, inout out: Map[str, bool], depth: i64) {
+    if depth > MAX_ALIAS_DEPTH {
+        return
+    }
+    let r = resolve_alias(ec, p, te, 0)
+    let k = prog.kind(p, r)
+    if k == ast.Y_FN {
+        for x in prog.items(p, prog.sl(p, r, 0)) {
+            collect_type_names(ec, p, x, out, depth + 1)
+        }
+        collect_type_names(ec, p, prog.sl(p, r, 1), out, depth + 1)
+    } else if k == ast.Y_LIST or k == ast.Y_REF {
+        collect_type_names(ec, p, prog.sl(p, r, 0), out, depth + 1)
+    } else if k == ast.Y_FALLIBLE {
+        collect_type_names(ec, p, prog.sl(p, r, 0), out, depth + 1)
+        collect_type_names(ec, p, prog.sl(p, r, 1), out, depth + 1)
+    } else if k == ast.Y_NAME {
+        out.set(prog.path_last(p, prog.sl(p, r, 0)), true)
+        for a in prog.items(p, prog.sl(p, r, 1)) {
+            collect_type_names(ec, p, a, out, depth + 1)
+        }
+    } else {
+        for i in prog.items(p, prog.sl(p, r, 0)) {
+            collect_type_names(ec, p, i, out, depth + 1)
+        }
+    }
+}
+
+fn collect_type_rows(p: Prog, aliases: Map[str, i64]) -> Map[str, [str]] {
+    let ec0 = Ec{ x: effrows.build_empty(), aliases: aliases, type_rows: map(), d_s: [], d_e: [], d_msg: [] }
+    var ownm: Map[str, Map[str, bool]] = map()
+    var names_order: [str] = []
+    var mentions: Map[str, [str]] = map()
+    for mi in 0..p.m_name.len() {
+        for d in p.m_decls[mi] {
+            if prog.kind(p, d) != ast.D_TYPE {
+                continue
+            }
+            let name = prog.name(p, prog.sl(p, d, 2))
+            let body = prog.sl(p, d, 4)
+            var parts: [i64] = []
+            if prog.kind(p, body) == ast.B_STRUCT {
+                for f in prog.items(p, prog.sl(p, body, 0)) {
+                    parts.push(prog.sl(p, f, 1))
+                }
+            } else if prog.kind(p, body) == ast.B_SUM {
+                for v in prog.items(p, prog.sl(p, body, 0)) {
+                    for f in prog.items(p, prog.sl(p, v, 1)) {
+                        parts.push(prog.sl(p, f, 1))
+                    }
+                }
+            } else {
+                parts.push(prog.sl(p, body, 0))
+            }
+            var e_own = ownm.get(name) ?? map()
+            if not ownm.has(name) {
+                names_order.push(name)
+            }
+            for te in parts {
+                match declared_row_shallow(ec0, p, te, 0) {
+                    Some(r) -> {
+                        for ef in r {
+                            e_own.set(ef, true)
+                        }
+                    }
+                    None -> ()
+                }
+            }
+            ownm.set(name, e_own)
+            var ment: Map[str, bool] = map()
+            for m in mentions.get(name) ?? [] {
+                ment.set(m, true)
+            }
+            for te in parts {
+                collect_type_names(ec0, p, te, ment, 0)
+            }
+            mentions.set(name, ment.keys())
+        }
+    }
+    for _ in 0..names_order.len() + 1 {
+        var changed = false
+        for n in names_order {
+            var e = ownm.get(n) ?? map()
+            let before = e.len()
+            for m in mentions.get(n) ?? [] {
+                if m == n {
+                    continue
+                }
+                match ownm.get(m) {
+                    Some(mo) -> {
+                        for ef in mo.keys() {
+                            e.set(ef, true)
+                        }
+                    }
+                    None -> ()
+                }
+            }
+            if e.len() != before {
+                changed = true
+            }
+            ownm.set(n, e)
+        }
+        if not changed {
+            break
+        }
+    }
+    var out: Map[str, [str]] = map()
+    for n in names_order {
+        out.set(n, effrows.sorted_keys(ownm.get(n) ?? map()))
+    }
+    out
+}
+
+// ---------------------------------------------------------------------
+// The checks over bodies
+// ---------------------------------------------------------------------
+
+/// `par_fn_row`: the row of a function handed over to be run.
+fn par_fn_row(ec: Ec, p: Prog, mi: i64, current: str, func: i64, f: Fnb, inout active: [str], inout out: Map[str, bool]) {
+    match ec.x.vrows.get(prog.ekey(p, func)) {
+        Some(r) -> {
+            for ef in r {
+                effrows.add(out, ef, active)
+            }
+            return
+        }
+        None -> ()
+    }
+    let k = prog.kind(p, func)
+    if k == ast.E_BLOCK or k == ast.E_UNSAFE or k == ast.E_REGION {
+        let tt = prog.tail_expr(p, prog.sl(p, func, 0))
+        if tt >= 0 {
+            par_fn_row(ec, p, mi, current, tt, f, active, out)
+        }
+        return
+    }
+    if k == ast.E_IDENT {
+        let id = prog.sl(p, func, 0)
+        let nm = prog.name(p, id)
+        let sh = effrows.shadowed(f, nm, prog.s(p, id))
+        if not sh and ec.x.externs.has(current + "::" + nm) {
+            out.set("io", true)
+            return
+        }
+        if not sh {
+            let q = effrows.resolve_call(ec.x, current, nm)
+            if q >= 0 {
+                for ef in ec.x.rows[q] {
+                    out.set(ef, true)
+                }
+                return
+            }
+        }
+        return
+    }
+    if k == ast.E_FIELD {
+        let recv = prog.sl(p, func, 0)
+        let fname = prog.name(p, prog.sl(p, func, 1))
+        if prog.kind(p, recv) == ast.E_IDENT {
+            let aid = prog.sl(p, recv, 0)
+            let an = prog.name(p, aid)
+            if not effrows.shadowed(f, an, prog.s(p, aid)) {
+                let target = prog.import_of(p, mi, an)
+                if target != "\0" {
+                    if ec.x.externs.has(target + "::" + fname) {
+                        out.set("io", true)
+                        return
+                    }
+                    let q = effrows.resolve_qualified(ec.x, p, mi, an, fname)
+                    if q >= 0 {
+                        for ef in ec.x.rows[q] {
+                            out.set(ef, true)
+                        }
+                        return
+                    }
+                }
+            }
+        }
+    }
+    if k == ast.E_BINARY {
+        par_fn_row(ec, p, mi, current, prog.sl(p, func, 1), f, active, out)
+        par_fn_row(ec, p, mi, current, prog.sl(p, func, 2), f, active, out)
+        return
+    }
+    effrows.walk_expr(ec.x, p, mi, current, func, active, f, out)
+}
+
+/// `carried_row`: the row of the function value an expression produces.
+fn carried_row(ec: Ec, p: Prog, mi: i64, current: str, e: i64, f: Fnb, depth: i64, inout out: Map[str, bool]) {
+    if depth > 16 {
+        return
+    }
+    let k = prog.kind(p, e)
+    if k == ast.E_CLOSURE {
+        var active: [str] = []
+        effrows.walk_expr(ec.x, p, mi, current, prog.sl(p, e, 1), active, f, out)
+    } else if k == ast.E_IDENT {
+        var active: [str] = []
+        par_fn_row(ec, p, mi, current, e, f, active, out)
+    } else if k == ast.E_CALL {
+        let callee = prog.sl(p, e, 0)
+        if prog.kind(p, callee) == ast.E_IDENT {
+            let nm = prog.name(p, prog.sl(p, callee, 0))
+            let args = prog.items(p, prog.sl(p, e, 1))
+            if nm == "Some" or nm == "Ok" or nm == "Err" {
+                for a in args {
+                    carried_row(ec, p, mi, current, a, f, depth + 1, out)
+                }
+                return
+            }
+            let q = effrows.resolve_call(ec.x, current, nm)
+            if q >= 0 and prog.count(p, prog.sl(p, ec.x.decl[q], 3)) > 0 {
+                for a in args {
+                    carried_row(ec, p, mi, current, a, f, depth + 1, out)
+                }
+            }
+        }
+    } else if k == ast.E_METHOD {
+        let n = prog.name(p, prog.sl(p, e, 1))
+        if n == "map" or n == "par_map" or n == "filter" or n == "par_filter" or n == "fold" or n == "find" {
+            for a in prog.items(p, prog.sl(p, e, 2)) {
+                if prog.kind(p, a) == ast.E_CLOSURE {
+                    carried_row(ec, p, mi, current, prog.sl(p, a, 1), f, depth + 1, out)
+                }
+            }
+        }
+    } else if k == ast.E_BINARY {
+        carried_row(ec, p, mi, current, prog.sl(p, e, 1), f, depth + 1, out)
+        carried_row(ec, p, mi, current, prog.sl(p, e, 2), f, depth + 1, out)
+    } else if k == ast.E_LIST or k == ast.E_TUPLE {
+        for i in prog.items(p, prog.sl(p, e, 0)) {
+            carried_row(ec, p, mi, current, i, f, depth + 1, out)
+        }
+    } else if k == ast.E_MAP {
+        for pr in prog.items(p, prog.sl(p, e, 0)) {
+            carried_row(ec, p, mi, current, prog.sl(p, pr, 1), f, depth + 1, out)
+        }
+    } else if k == ast.E_IF {
+        let tt = prog.tail_expr(p, prog.sl(p, e, 1))
+        if tt >= 0 {
+            carried_row(ec, p, mi, current, tt, f, depth + 1, out)
+        }
+        let eb = prog.sl(p, e, 2)
+        if eb >= 0 {
+            if prog.kind(p, eb) == ast.EB_ELSE {
+                let et = prog.tail_expr(p, prog.sl(p, eb, 0))
+                if et >= 0 {
+                    carried_row(ec, p, mi, current, et, f, depth + 1, out)
+                }
+            } else {
+                carried_row(ec, p, mi, current, prog.sl(p, eb, 0), f, depth + 1, out)
+            }
+        }
+    } else if k == ast.E_MATCH {
+        for arm in prog.items(p, prog.sl(p, e, 1)) {
+            carried_row(ec, p, mi, current, prog.sl(p, arm, 2), f, depth + 1, out)
+        }
+    } else if k == ast.E_BLOCK or k == ast.E_UNSAFE or k == ast.E_REGION {
+        let tt = prog.tail_expr(p, prog.sl(p, e, 0))
+        if tt >= 0 {
+            carried_row(ec, p, mi, current, tt, f, depth + 1, out)
+        }
+    }
+}
+
+fn over_of(row: Map[str, bool], allowed: [str]) -> [str] {
+    var over: [str] = []
+    for ef in effrows.sorted_keys(row) {
+        if not allowed.contains(ef) {
+            over.push(ef)
+        }
+    }
+    over
+}
+
+fn check_par_map_block(inout ec: Ec, p: Prog, mi: i64, current: str, b: i64, f: Fnb) {
+    var funcs: [i64] = []
+    var ss: [i64] = []
+    var es: [i64] = []
+    var net: [bool] = []
+    par_maps_block(p, b, funcs, ss, es, net)
+    for i in 0..funcs.len() {
+        var row: Map[str, bool] = map()
+        var active: [str] = []
+        par_fn_row(ec, p, mi, current, funcs[i], f, active, row)
+        var allowed: [str] = []
+        if net[i] {
+            allowed = ["net"]
+        }
+        let over = over_of(row, allowed)
+        if over.len() == 0 {
+            continue
+        }
+        if net[i] {
+            report(ec, ss[i], es[i], "`net_workers` runs a function that may perform only `net`, but the one given performs `{over.join("`, `")}`")
+        } else {
+            report(ec, ss[i], es[i], "this parallel operation needs an effect-free function, but the one given performs `{over.join("`, `")}`")
+        }
+    }
+}
+
+fn par_maps_block(p: Prog, b: i64, inout funcs: [i64], inout ss: [i64], inout es: [i64], inout net: [bool]) {
+    for st in prog.stmts(p, b) {
+        let k = prog.kind(p, st)
+        if k == ast.S_LET {
+            par_maps_expr(p, prog.sl(p, st, 3), funcs, ss, es, net)
+        } else if k == ast.S_ASSIGN {
+            par_maps_expr(p, prog.sl(p, st, 0), funcs, ss, es, net)
+            par_maps_expr(p, prog.sl(p, st, 2), funcs, ss, es, net)
+        } else if k == ast.S_EXPR {
+            par_maps_expr(p, prog.sl(p, st, 0), funcs, ss, es, net)
+        } else if k == ast.S_RETURN {
+            let v = prog.sl(p, st, 0)
+            if v >= 0 {
+                par_maps_expr(p, v, funcs, ss, es, net)
+            }
+        } else if k == ast.S_WHILE {
+            par_maps_expr(p, prog.sl(p, st, 0), funcs, ss, es, net)
+            par_maps_block(p, prog.sl(p, st, 1), funcs, ss, es, net)
+        } else if k == ast.S_FOR {
+            par_maps_expr(p, prog.sl(p, st, 1), funcs, ss, es, net)
+            par_maps_block(p, prog.sl(p, st, 2), funcs, ss, es, net)
+        } else if k == ast.S_PARALLEL or k == ast.S_SPAWN {
+            par_maps_block(p, prog.sl(p, st, 0), funcs, ss, es, net)
+        } else if k == ast.S_WITH {
+            par_maps_expr(p, prog.sl(p, st, 1), funcs, ss, es, net)
+            par_maps_block(p, prog.sl(p, st, 2), funcs, ss, es, net)
+        }
+    }
+}
+
+fn par_maps_expr(p: Prog, e: i64, inout funcs: [i64], inout ss: [i64], inout es: [i64], inout net: [bool]) {
+    let k = prog.kind(p, e)
+    if k == ast.E_METHOD {
+        let n = prog.name(p, prog.sl(p, e, 1))
+        let args = prog.items(p, prog.sl(p, e, 2))
+        if (n == "par_map" or n == "par_filter") and args.len() > 0 {
+            funcs.push(args[0])
+            ss.push(prog.s(p, e))
+            es.push(prog.e(p, e))
+            net.push(false)
+        }
+    }
+    if k == ast.E_CALL and sema_call_name(p, e) == "net_workers" {
+        let args = prog.items(p, prog.sl(p, e, 1))
+        if args.len() > 1 {
+            funcs.push(args[1])
+            ss.push(prog.s(p, e))
+            es.push(prog.e(p, e))
+            net.push(true)
+        }
+    }
+    if k == ast.E_METHOD {
+        par_maps_expr(p, prog.sl(p, e, 0), funcs, ss, es, net)
+        for a in prog.items(p, prog.sl(p, e, 2)) {
+            par_maps_expr(p, a, funcs, ss, es, net)
+        }
+    } else if k == ast.E_CALL {
+        par_maps_expr(p, prog.sl(p, e, 0), funcs, ss, es, net)
+        for a in prog.items(p, prog.sl(p, e, 1)) {
+            par_maps_expr(p, a, funcs, ss, es, net)
+        }
+    } else if k == ast.E_BINARY {
+        par_maps_expr(p, prog.sl(p, e, 1), funcs, ss, es, net)
+        par_maps_expr(p, prog.sl(p, e, 2), funcs, ss, es, net)
+    } else if k == ast.E_UNARY {
+        par_maps_expr(p, prog.sl(p, e, 1), funcs, ss, es, net)
+    } else if k == ast.E_TRY or k == ast.E_FIELD {
+        par_maps_expr(p, prog.sl(p, e, 0), funcs, ss, es, net)
+    } else if k == ast.E_INDEX {
+        par_maps_expr(p, prog.sl(p, e, 0), funcs, ss, es, net)
+        par_maps_expr(p, prog.sl(p, e, 1), funcs, ss, es, net)
+    } else if k == ast.E_LIST or k == ast.E_TUPLE {
+        for i in prog.items(p, prog.sl(p, e, 0)) {
+            par_maps_expr(p, i, funcs, ss, es, net)
+        }
+    } else if k == ast.E_MAP {
+        for pr in prog.items(p, prog.sl(p, e, 0)) {
+            par_maps_expr(p, prog.sl(p, pr, 0), funcs, ss, es, net)
+            par_maps_expr(p, prog.sl(p, pr, 1), funcs, ss, es, net)
+        }
+    } else if k == ast.E_STR {
+        for pc in prog.items(p, prog.sl(p, e, 0)) {
+            if prog.kind(p, pc) == ast.PC_EXPR {
+                par_maps_expr(p, prog.sl(p, pc, 0), funcs, ss, es, net)
+            }
+        }
+    } else if k == ast.E_CLOSURE {
+        par_maps_expr(p, prog.sl(p, e, 1), funcs, ss, es, net)
+    } else if k == ast.E_BLOCK or k == ast.E_UNSAFE or k == ast.E_REGION {
+        par_maps_block(p, prog.sl(p, e, 0), funcs, ss, es, net)
+    } else if k == ast.E_IF {
+        par_maps_expr(p, prog.sl(p, e, 0), funcs, ss, es, net)
+        par_maps_block(p, prog.sl(p, e, 1), funcs, ss, es, net)
+        let eb = prog.sl(p, e, 2)
+        if eb >= 0 {
+            if prog.kind(p, eb) == ast.EB_ELSE {
+                par_maps_block(p, prog.sl(p, eb, 0), funcs, ss, es, net)
+            } else {
+                par_maps_expr(p, prog.sl(p, eb, 0), funcs, ss, es, net)
+            }
+        }
+    } else if k == ast.E_MATCH {
+        par_maps_expr(p, prog.sl(p, e, 0), funcs, ss, es, net)
+        for arm in prog.items(p, prog.sl(p, e, 1)) {
+            let g = prog.sl(p, arm, 1)
+            if g >= 0 {
+                par_maps_expr(p, g, funcs, ss, es, net)
+            }
+            par_maps_expr(p, prog.sl(p, arm, 2), funcs, ss, es, net)
+        }
+    }
+}
+
+fn sema_call_name(p: Prog, e: i64) -> str {
+    let callee = prog.sl(p, e, 0)
+    if prog.kind(p, callee) != ast.E_IDENT {
+        return "\0"
+    }
+    prog.name(p, prog.sl(p, callee, 0))
+}
+
+/// Calls in a block, as (callee as written, call node).
+fn calls_block(p: Prog, b: i64, inout names: [str], inout calls: [i64]) {
+    for st in prog.stmts(p, b) {
+        let k = prog.kind(p, st)
+        if k == ast.S_LET {
+            calls_expr(p, prog.sl(p, st, 3), names, calls)
+        } else if k == ast.S_ASSIGN {
+            calls_expr(p, prog.sl(p, st, 0), names, calls)
+            calls_expr(p, prog.sl(p, st, 2), names, calls)
+        } else if k == ast.S_EXPR {
+            calls_expr(p, prog.sl(p, st, 0), names, calls)
+        } else if k == ast.S_RETURN {
+            let v = prog.sl(p, st, 0)
+            if v >= 0 {
+                calls_expr(p, v, names, calls)
+            }
+        } else if k == ast.S_WHILE {
+            calls_expr(p, prog.sl(p, st, 0), names, calls)
+            calls_block(p, prog.sl(p, st, 1), names, calls)
+        } else if k == ast.S_FOR {
+            calls_expr(p, prog.sl(p, st, 1), names, calls)
+            calls_block(p, prog.sl(p, st, 2), names, calls)
+        } else if k == ast.S_PARALLEL or k == ast.S_SPAWN {
+            calls_block(p, prog.sl(p, st, 0), names, calls)
+        } else if k == ast.S_WITH {
+            calls_expr(p, prog.sl(p, st, 1), names, calls)
+            calls_block(p, prog.sl(p, st, 2), names, calls)
+        }
+    }
+}
+
+fn calls_expr(p: Prog, e: i64, inout names: [str], inout calls: [i64]) {
+    let k = prog.kind(p, e)
+    if k == ast.E_CALL {
+        let callee = prog.sl(p, e, 0)
+        let ck = prog.kind(p, callee)
+        if ck == ast.E_IDENT {
+            names.push(prog.name(p, prog.sl(p, callee, 0)))
+            calls.push(e)
+        } else if ck == ast.E_FIELD {
+            let recv = prog.sl(p, callee, 0)
+            if prog.kind(p, recv) == ast.E_IDENT {
+                names.push(prog.name(p, prog.sl(p, recv, 0)) + "." + prog.name(p, prog.sl(p, callee, 1)))
+                calls.push(e)
+            }
+        }
+        for a in prog.items(p, prog.sl(p, e, 1)) {
+            calls_expr(p, a, names, calls)
+        }
+    } else if k == ast.E_METHOD {
+        let recv = prog.sl(p, e, 0)
+        if prog.kind(p, recv) == ast.E_IDENT {
+            names.push(prog.name(p, prog.sl(p, recv, 0)) + "." + prog.name(p, prog.sl(p, e, 1)))
+            calls.push(e)
+        }
+        calls_expr(p, recv, names, calls)
+        for a in prog.items(p, prog.sl(p, e, 2)) {
+            calls_expr(p, a, names, calls)
+        }
+    } else if k == ast.E_STR {
+        for pc in prog.items(p, prog.sl(p, e, 0)) {
+            if prog.kind(p, pc) == ast.PC_EXPR {
+                calls_expr(p, prog.sl(p, pc, 0), names, calls)
+            }
+        }
+    } else if k == ast.E_LIST or k == ast.E_TUPLE {
+        for i in prog.items(p, prog.sl(p, e, 0)) {
+            calls_expr(p, i, names, calls)
+        }
+    } else if k == ast.E_MAP {
+        for pr in prog.items(p, prog.sl(p, e, 0)) {
+            calls_expr(p, prog.sl(p, pr, 0), names, calls)
+            calls_expr(p, prog.sl(p, pr, 1), names, calls)
+        }
+    } else if k == ast.E_BINARY {
+        calls_expr(p, prog.sl(p, e, 1), names, calls)
+        calls_expr(p, prog.sl(p, e, 2), names, calls)
+    } else if k == ast.E_UNARY {
+        calls_expr(p, prog.sl(p, e, 1), names, calls)
+    } else if k == ast.E_TRY or k == ast.E_FIELD {
+        calls_expr(p, prog.sl(p, e, 0), names, calls)
+    } else if k == ast.E_INDEX {
+        calls_expr(p, prog.sl(p, e, 0), names, calls)
+        calls_expr(p, prog.sl(p, e, 1), names, calls)
+    } else if k == ast.E_IF {
+        calls_expr(p, prog.sl(p, e, 0), names, calls)
+        calls_block(p, prog.sl(p, e, 1), names, calls)
+        let eb = prog.sl(p, e, 2)
+        if eb >= 0 {
+            if prog.kind(p, eb) == ast.EB_ELSE {
+                calls_block(p, prog.sl(p, eb, 0), names, calls)
+            } else {
+                calls_expr(p, prog.sl(p, eb, 0), names, calls)
+            }
+        }
+    } else if k == ast.E_BLOCK or k == ast.E_UNSAFE or k == ast.E_REGION {
+        calls_block(p, prog.sl(p, e, 0), names, calls)
+    } else if k == ast.E_MATCH {
+        calls_expr(p, prog.sl(p, e, 0), names, calls)
+        for arm in prog.items(p, prog.sl(p, e, 1)) {
+            calls_expr(p, prog.sl(p, arm, 2), names, calls)
+        }
+    } else if k == ast.E_CLOSURE {
+        calls_expr(p, prog.sl(p, e, 1), names, calls)
+    }
+}
+
+fn check_fn_args_block(inout ec: Ec, p: Prog, mi: i64, current: str, b: i64, f: Fnb) {
+    var names: [str] = []
+    var calls: [i64] = []
+    calls_block(p, b, names, calls)
+    for ci in 0..names.len() {
+        let callee = names[ci]
+        var q = -1
+        match callee.index_of(".") {
+            Some(i) -> q = effrows.resolve_qualified(ec.x, p, mi, callee.substr(0, i), callee.substr(i + 1, callee.len() - i - 1))
+            None -> q = effrows.resolve_call(ec.x, current, callee)
+        }
+        if q < 0 {
+            continue
+        }
+        let call = calls[ci]
+        let args = if prog.kind(p, call) == ast.E_CALL { prog.items(p, prog.sl(p, call, 1)) } else { prog.items(p, prog.sl(p, call, 2)) }
+        let params = prog.items(p, prog.sl(p, ec.x.decl[q], 5))
+        var i = 0
+        while i < args.len() and i < params.len() {
+            let te = prog.sl(p, params[i], 2)
+            match declared_row(ec, p, te) {
+                Some(allowed) -> {
+                    var row: Map[str, bool] = map()
+                    var active: [str] = []
+                    par_fn_row(ec, p, mi, current, args[i], f, active, row)
+                    let over = over_of(row, allowed)
+                    if over.len() > 0 {
+                        report(ec, prog.es(p, args[i]), prog.ee(p, args[i]), "`{prog.name(p, prog.sl(p, params[i], 1))}` expects a function that performs less, but this one performs `{over.join("`, `")}`")
+                    }
+                }
+                None -> ()
+            }
+            i += 1
+        }
+    }
+}
+
+fn check_declared_rows_block(inout ec: Ec, p: Prog, mi: i64, current: str, b: i64, f: Fnb, inout dn: [str], inout dr: [[str]]) {
+    for st in prog.stmts(p, b) {
+        let k = prog.kind(p, st)
+        if k == ast.S_LET and prog.sl(p, st, 2) >= 0 {
+            match declared_row_within(ec, p, prog.sl(p, st, 2), 0) {
+                Some(allowed) -> {
+                    let name = prog.name(p, prog.sl(p, st, 1))
+                    var found = false
+                    for i in 0..dn.len() {
+                        if dn[i] == name {
+                            dr[i] = allowed
+                            found = true
+                        }
+                    }
+                    if not found {
+                        dn.push(name)
+                        dr.push(allowed)
+                    }
+                    report_row_over(ec, p, mi, current, prog.sl(p, st, 3), f, allowed)
+                }
+                None -> ()
+            }
+        } else if k == ast.S_ASSIGN and prog.kind(p, prog.sl(p, st, 0)) == ast.E_IDENT {
+            let name = prog.name(p, prog.sl(p, prog.sl(p, st, 0), 0))
+            for i in 0..dn.len() {
+                if dn[i] == name {
+                    report_row_over(ec, p, mi, current, prog.sl(p, st, 2), f, dr[i])
+                }
+            }
+        } else if k == ast.S_WHILE {
+            check_declared_rows_block(ec, p, mi, current, prog.sl(p, st, 1), f, dn, dr)
+        } else if k == ast.S_FOR {
+            check_declared_rows_block(ec, p, mi, current, prog.sl(p, st, 2), f, dn, dr)
+        } else if k == ast.S_WITH {
+            check_declared_rows_block(ec, p, mi, current, prog.sl(p, st, 2), f, dn, dr)
+        } else if k == ast.S_PARALLEL or k == ast.S_SPAWN {
+            check_declared_rows_block(ec, p, mi, current, prog.sl(p, st, 0), f, dn, dr)
+        }
+    }
+}
+
+fn report_row_over(inout ec: Ec, p: Prog, mi: i64, current: str, e: i64, f: Fnb, allowed: [str]) {
+    var row: Map[str, bool] = map()
+    carried_row(ec, p, mi, current, e, f, 0, row)
+    let over = over_of(row, allowed)
+    if over.len() > 0 {
+        report(ec, prog.es(p, e), prog.ee(p, e), "this type says the function performs less, but the value performs `{over.join("`, `")}`")
+    }
+}
+
+/// Whether a `ref(...)` call is anywhere among the calls of an expression.
+fn makes_ref(p: Prog, e: i64) -> bool {
+    var names: [str] = []
+    var calls: [i64] = []
+    calls_expr(p, e, names, calls)
+    names.contains("ref")
+}

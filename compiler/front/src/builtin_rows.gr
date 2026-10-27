@@ -1,0 +1,30 @@
+// What each built-in free function performs (crates/grasm_sema/src/
+// builtins.rs), and the names the checker treats as built in
+// (check.rs `BUILTIN_FREE_FNS`).
+
+pub fn row_of(name: str) -> [str] {
+    match name {
+        "chan_send" | "chan_recv" | "chan_select" | "chan_close" -> ["async"]
+        "print" | "eprint" | "input" | "read_file" | "write_file" | "read_bytes" | "read_bytes_at" | "append_bytes" | "file_size" | "sync_file" | "rename_file" | "write_bytes" | "file_exists" | "remove_file" | "make_dir" | "make_dir_new" | "list_dir" | "args" | "env" | "now_millis" | "monotonic_millis" | "monotonic_nanos" | "sleep_millis" | "random_bytes" -> ["io"]
+        "tcp_listen" | "tcp_listen_on" | "tcp_connect" | "tcp_accept" | "tcp_read" | "tcp_read_bytes" | "tcp_write" | "tcp_write_bytes" | "net_close" | "net_wait" | "net_port" | "tcp_peer" | "net_workers" | "udp_bind" | "udp_send" | "udp_recv" | "udp_recv_from" -> ["net"]
+        "proc_run" | "proc_pipeline" -> ["proc"]
+        "mem_alloc" | "mem_free" | "mem_addr" | "mem_size_of" | "mem_align_of" | "mem_fn_addr" | "mem_tls" | "mem_process" | "mem_static" | "mem_static_len" | "ctx_switch" | "ctx_init" -> ["mem"]
+        _ -> []
+    }
+}
+
+/// `BUILTIN_FREE_FNS`: the language's own free functions.
+pub fn is_free_fn(name: str) -> bool {
+    match name {
+        "chan_new" | "chan_send" | "chan_recv" | "chan_select" | "chan_close" | "print" | "eprint" | "tcp_listen" | "tcp_listen_on" | "tcp_connect" | "tcp_accept" | "tcp_read" | "tcp_read_bytes" | "tcp_write" | "tcp_write_bytes" | "net_close" | "net_wait" | "net_workers" | "net_port" | "tcp_peer" | "udp_bind" | "udp_send" | "udp_recv" | "udp_recv_from" | "proc_run" | "proc_pipeline" | "read_file" | "write_file" | "file_exists" | "remove_file" | "make_dir" | "make_dir_new" | "bytes_of" | "bytes_filled" | "str_builder" | "byte_builder" | "mem_alloc" | "mem_free" | "mem_addr" | "mem_size_of" | "mem_align_of" | "mem_fn_addr" | "mem_tls" | "mem_process" | "mem_static" | "mem_static_len" | "ctx_switch" | "ctx_init" | "read_bytes" | "read_bytes_at" | "append_bytes" | "file_size" | "sync_file" | "rename_file" | "write_bytes" | "list_dir" | "input" | "args" | "now_millis" | "monotonic_millis" | "monotonic_nanos" | "sleep_millis" | "random_bytes" | "env" | "exit" | "panic" | "assert" | "assert_eq" -> true
+        _ -> false
+    }
+}
+
+/// The capabilities the runtime discharges (`effects::is_capability`).
+pub fn is_capability(e: str) -> bool {
+    match e {
+        "io" | "async" | "unsafe" | "net" | "proc" | "mem" -> true
+        _ -> false
+    }
+}

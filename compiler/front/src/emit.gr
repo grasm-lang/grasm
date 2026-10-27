@@ -1,0 +1,1456 @@
+// TIR in its text form (crates/grasm_tir/src/lib.rs, docs/tir.md): the
+// program walked beside what the checker recorded. Nothing is resolved here
+// that the checker did not decide; anything it did not record is a hole,
+// printed `?` and reported, and a program with one has no TIR.
+//
+// Nodes are made children first, as the Rust emitter makes them -- the
+// order variables are numbered in is the order the walk reaches their
+// binding sites -- into an arena, and printed from it at the end.
+import ast
+import prog
+import tys
+import sema
+import loader
+import rdebug
+
+type Em = {
+    nh: [str],
+    noff: [i64],
+    nn: [i64],
+    kpool: [i64],
+    holes: [str],
+    sc_name: [str],
+    sc_id: [i64],
+    sc_start: [i64],
+    next_var: i64,
+    mi: i64,
+    rb_on: bool,
+    rb_name: [str],
+    rb_id: [i64],
+}
+
+fn node(inout m: Em, head: str, kids: [i64]) -> i64 {
+    let id = m.nh.len()
+    m.nh.push(head)
+    m.noff.push(m.kpool.len())
+    m.nn.push(kids.len())
+    for k in kids {
+        m.kpool.push(k)
+    }
+    id
+}
+
+fn leaf(inout m: Em, head: str) -> i64 {
+    node(m, head, [])
+}
+
+fn hole(inout m: Em, what: str) -> str {
+    m.holes.push(what)
+    "?"
+}
+
+fn sp(s: i64, e: i64) -> str {
+    "@{s}:{e}"
+}
+
+fn q(s: str) -> str {
+    loader.quote(s)
+}
+
+/// Writes node `id` at `depth`, its children on lines of their own.
+fn write(m: Em, id: i64, depth: i64, inout b: StrBuilder) {
+    for _ in 0..depth {
+        b.push_str("  ")
+    }
+    b.push_str("(")
+    b.push_str(m.nh[id])
+    for i in 0..m.nn[id] {
+        b.push_str("\n")
+        write(m, m.kpool[m.noff[id] + i], depth + 1, b)
+    }
+    b.push_str(")")
+}
+
+// ---------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------
+
+pub fn ty(t: Tys, x: i64) -> str {
+    let k = t.k[x]
+    if k == tys.K_I64 {
+        return "i64"
+    }
+    if k == tys.K_INT {
+        return tys.int_name(t.a[x])
+    }
+    if k == tys.K_F64 {
+        return "f64"
+    }
+    if k == tys.K_BOOL {
+        return "bool"
+    }
+    if k == tys.K_STR {
+        return "str"
+    }
+    if k == tys.K_BYTES {
+        return "bytes"
+    }
+    if k == tys.K_STRBUF {
+        return "strbuilder"
+    }
+    if k == tys.K_BYTEBUF {
+        return "bytebuilder"
+    }
+    if k == tys.K_ADDR {
+        return "addr"
+    }
+    if k == tys.K_UNIT {
+        return "unit"
+    }
+    if k == tys.K_RANGE {
+        return "range"
+    }
+    if k == tys.K_TUPLE {
+        return ty_list(t, "tuple", tys.items(t, x))
+    }
+    if k == tys.K_UNION {
+        return ty_list(t, "union", tys.items(t, x))
+    }
+    if k == tys.K_LIST {
+        return "(list {ty(t, t.a[x])})"
+    }
+    if k == tys.K_REF {
+        return "(ref {ty(t, t.a[x])})"
+    }
+    if k == tys.K_MAP {
+        return "(map {ty(t, t.a[x])} {ty(t, t.b[x])})"
+    }
+    if k == tys.K_NAMED {
+        let name = q(t.d_name[t.a[x]])
+        if t.n[x] == 0 {
+            return "(named {name})"
+        }
+        var parts: [str] = []
+        for a in tys.items(t, x) {
+            parts.push(ty(t, a))
+        }
+        return "(named {name} {parts.join(" ")})"
+    }
+    if k == tys.K_FN {
+        var ps: [str] = []
+        for a in tys.items(t, x) {
+            ps.push(ty(t, a))
+        }
+        return "(fn ({ps.join(" ")}) {ty(t, t.a[x])} {row_text(t, t.c[x])})"
+    }
+    if k == tys.K_FALLIBLE {
+        return "(fallible {ty(t, t.a[x])} {ty(t, t.b[x])})"
+    }
+    if k == tys.K_GENERIC {
+        return "(generic {t.a[x]})"
+    }
+    if k == tys.K_VAR {
+        return "never"
+    }
+    "?"
+}
+
+/// A type resolved, then printed.
+fn rty(inout t: Tys, x: i64) -> str {
+    let r = tys.resolve(t, x)
+    ty(t, r)
+}
+
+fn row_text(t: Tys, r: i64) -> str {
+    if r < 0 {
+        return "(row *)"
+    }
+    var s = "(row"
+    for e in t.row_names[r] {
+        s = s + " " + e
+    }
+    s + ")"
+}
+
+fn ty_list(t: Tys, head: str, xs: [i64]) -> str {
+    var s = "(" + head
+    for x in xs {
+        s = s + " " + ty(t, x)
+    }
+    s + ")"
+}
+
+// ---------------------------------------------------------------------
+// What the checker recorded
+// ---------------------------------------------------------------------
+
+/// The settled type of the expression at `k`, or -1 (`expr_type_of`).
+fn type_of(c: Ck, inout t: Tys, k: i64) -> i64 {
+    var raw = -1
+    match c.f_types.get(k) {
+        Some(x) -> raw = x
+        None -> {
+            match c.f_checked.get(k) {
+                Some(x) -> raw = x
+                None -> ()
+            }
+        }
+    }
+    if raw < 0 {
+        return -1
+    }
+    let r = tys.resolve(t, raw)
+    if tys.holds_var(t, r) {
+        return -1
+    }
+    r
+}
+
+fn expr_ty(c: Ck, inout t: Tys, inout m: Em, k: i64) -> str {
+    let r = type_of(c, t, k)
+    if r < 0 {
+        return hole(m, "expression type")
+    }
+    ty(t, r)
+}
+
+fn head(c: Ck, inout t: Tys, inout m: Em, kw: str, s: i64, e: i64) -> str {
+    let tt = expr_ty(c, t, m, prog.key(s, e))
+    "{kw} {tt} {sp(s, e)}"
+}
+
+fn bind_ty(c: Ck, inout t: Tys, inout m: Em, p: Prog, ident: i64) -> str {
+    match c.f_binds.get(prog.key(prog.s(p, ident), prog.e(p, ident))) {
+        Some(x) -> {
+            let r = tys.resolve(t, x)
+            if not tys.holds_var(t, r) {
+                return ty(t, r)
+            }
+        }
+        None -> ()
+    }
+    hole(m, "type of binding `{prog.name(p, ident)}`")
+}
+
+// ---------------------------------------------------------------------
+// Scopes
+// ---------------------------------------------------------------------
+
+fn begin_fn(inout m: Em) {
+    m.sc_name = []
+    m.sc_id = []
+    m.sc_start = []
+    m.next_var = 0
+    m.rb_on = false
+    m.rb_name = []
+    m.rb_id = []
+}
+
+fn push_scope(inout m: Em) {
+    m.sc_start.push(m.sc_name.len())
+}
+
+fn pop_scope(inout m: Em) {
+    let start = m.sc_start.pop() ?? 0
+    while m.sc_name.len() > start {
+        m.sc_name.pop()
+        m.sc_id.pop()
+    }
+}
+
+fn declare(inout m: Em, name: str) -> i64 {
+    let id = m.next_var
+    m.next_var += 1
+    if m.sc_start.len() == 0 {
+        push_scope(m)
+    }
+    m.sc_name.push(name)
+    m.sc_id.push(id)
+    id
+}
+
+fn lookup(m: Em, name: str) -> i64 {
+    var i = m.sc_name.len() - 1
+    while i >= 0 {
+        if m.sc_name[i] == name {
+            return m.sc_id[i]
+        }
+        i -= 1
+    }
+    -1
+}
+
+fn var_atom(c: Ck, inout t: Tys, inout m: Em, p: Prog, ident: i64, mutable: bool) -> str {
+    let id = declare(m, prog.name(p, ident))
+    let bt = bind_ty(c, t, m, p, ident)
+    let mu = if mutable { "var" } else { "let" }
+    "{id} {q(prog.name(p, ident))} {mu} {bt}"
+}
+
+// ---------------------------------------------------------------------
+// The program
+// ---------------------------------------------------------------------
+
+/// The TIR text of a checked program, and its holes.
+pub fn emit(c: Ck, inout t: Tys, p: Prog) -> (str, [str]) {
+    var m = Em{ nh: [], noff: [], nn: [], kpool: [], holes: [], sc_name: [], sc_id: [], sc_start: [], next_var: 0, mi: 0, rb_on: false, rb_name: [], rb_id: [] }
+    var tops: [i64] = []
+    for mi in 0..p.m_name.len() {
+        var pairs: [str] = []
+        let al = p.m_imp_alias[mi]
+        for j in 0..al.len() {
+            pairs.push(q(al[j]) + " " + q(p.m_imp_full[mi][j]))
+        }
+        pairs.sort()
+        var kids: [i64] = []
+        for pr in pairs {
+            kids.push(leaf(m, "import " + pr))
+        }
+        tops.push(node(m, "file {q(p.m_name[mi])} {q(p.m_alias[mi])} {q(p.m_path[mi])} {p.m_base[mi]}", kids))
+    }
+    for d in 0..t.d_name.len() {
+        tops.push(typedef_node(t, m, d))
+    }
+    var enames = c.eff_index.keys()
+    enames.sort()
+    for en in enames {
+        let ei = c.eff_index.get(en) ?? 0
+        var kids: [i64] = []
+        for oi in c.eff_op0[ei]..c.eff_op0[ei] + c.eff_opn[ei] {
+            var ps: [str] = []
+            for x in c.op_params[oi] {
+                ps.push(rty(t, x))
+            }
+            kids.push(leaf(m, "op {q(c.op_name[oi])} ({ps.join(" ")}) {rty(t, c.op_ret[oi])}"))
+        }
+        tops.push(node(m, "effect {q(en)}", kids))
+    }
+    for mi in 0..p.m_name.len() {
+        m.mi = mi
+        let module = p.m_name[mi]
+        for d in p.m_decls[mi] {
+            let n = decl_node(c, t, m, p, module, d)
+            if n >= 0 {
+                tops.push(n)
+            }
+            if prog.kind(p, d) == ast.D_FN and prog.sl(p, d, 1) != 0 {
+                let qq = module + "::" + prog.name(p, prog.sl(p, d, 2))
+                tops.push(leaf(m, "export {q(qq)}"))
+            }
+        }
+    }
+    if c.fn_index.has("main::main") {
+        tops.push(leaf(m, "main {q("main::main")}"))
+    }
+    var b = str_builder()
+    b.push_str("(tir 1)\n")
+    for n in tops {
+        write(m, n, 0, b)
+        b.push_str("\n")
+    }
+    (b.to_str(), m.holes)
+}
+
+fn typedef_node(t: Tys, inout m: Em, d: i64) -> i64 {
+    var gens: [str] = []
+    for g in t.d_gen[d] {
+        gens.push(q(g))
+    }
+    var hd = "type {q(t.d_name[d])} (generics"
+    if gens.len() > 0 {
+        hd = hd + " " + gens.join(" ")
+    }
+    hd = hd + ")"
+    if not t.d_sum[d] {
+        let (fns, fts) = tys.struct_fields(t, d)
+        var fk: [i64] = []
+        for i in 0..fns.len() {
+            fk.push(leaf(m, "field {q(fns[i])} {ty(t, fts[i])}"))
+        }
+        let st = node(m, "struct", fk)
+        return node(m, hd, [st])
+    }
+    var vk: [i64] = []
+    for vi in 0..tys.variant_count(t, d) {
+        let (fns, fts) = tys.variant_fields(t, d, vi)
+        var fk: [i64] = []
+        for i in 0..fns.len() {
+            fk.push(leaf(m, "field {q(fns[i])} {ty(t, fts[i])}"))
+        }
+        vk.push(node(m, "variant {q(tys.variant_name(t, d, vi))}", fk))
+    }
+    let sm = node(m, "sum", vk)
+    node(m, hd, [sm])
+}
+
+fn decl_node(c: Ck, inout t: Tys, inout m: Em, p: Prog, module: str, d: i64) -> i64 {
+    let k = prog.kind(p, d)
+    if k == ast.D_FN {
+        return fn_node(c, t, m, p, module, d)
+    }
+    if k == ast.D_TLS or k == ast.D_PLS {
+        let qq = module + "::" + prog.name(p, prog.sl(p, d, 1))
+        var tt = ""
+        if k == ast.D_TLS {
+            match c.cells.get(qq) {
+                Some(x) -> tt = x
+                None -> tt = hole(m, "a cell's type")
+            }
+            return leaf(m, "threadlocal {q(qq)} {tt}")
+        }
+        match c.pcells.get(qq) {
+            Some(x) -> tt = x
+            None -> tt = hole(m, "a process cell's type")
+        }
+        return leaf(m, "processlocal {q(qq)} {tt}")
+    }
+    if k == ast.D_CONST {
+        let qq = module + "::" + prog.name(p, prog.sl(p, d, 1))
+        var tt = ""
+        match c.consts.get(qq) {
+            Some(x) -> tt = rty(t, x)
+            None -> tt = hole(m, "constant type")
+        }
+        begin_fn(m)
+        let init = expr(c, t, m, p, prog.sl(p, d, 3))
+        return node(m, "const {q(qq)} {tt}", [init])
+    }
+    if k == ast.D_EXTERN {
+        let qq = module + "::" + prog.name(p, prog.sl(p, d, 1))
+        let fid = sema.fn_of(c, qq)
+        var sig = ""
+        if fid >= 0 {
+            var ps: [str] = []
+            for x in c.fn_params[fid] {
+                ps.push(rty(t, x))
+            }
+            sig = "({ps.join(" ")}) {rty(t, c.fn_ret[fid])}"
+        } else {
+            sig = hole(m, "extern signature")
+        }
+        return leaf(m, "extern {q(qq)} {sig}")
+    }
+    if k == ast.D_IMPL {
+        var kids: [i64] = []
+        for pr in prog.items(p, prog.sl(p, d, 4)) {
+            let mn = prog.name(p, prog.sl(p, pr, 0))
+            kids.push(leaf(m, "method {q(mn)} {q(module + "::" + prog.text(p, pr))}"))
+        }
+        return node(m, "impl {q(prog.dotted(p, prog.sl(p, d, 0)))} {q(prog.text(p, d))}", kids)
+    }
+    if k == ast.D_INTERFACE {
+        var kids: [i64] = []
+        for sg in prog.items(p, prog.sl(p, d, 2)) {
+            kids.push(leaf(m, "method {q(prog.name(p, prog.sl(p, sg, 0)))}"))
+        }
+        return node(m, "interface {q(prog.name(p, prog.sl(p, d, 1)))}", kids)
+    }
+    if k == ast.D_TEST {
+        begin_fn(m)
+        push_scope(m)
+        var ps: [i64] = []
+        for prm in prog.items(p, prog.sl(p, d, 0)) {
+            ps.push(param_node(c, t, m, p, prm))
+        }
+        let body = block(c, t, m, p, prog.sl(p, d, 1))
+        pop_scope(m)
+        let pn = node(m, "params", ps)
+        return node(m, "test {q(prog.text(p, d))}", [pn, body])
+    }
+    if k == ast.D_BENCH {
+        begin_fn(m)
+        push_scope(m)
+        let body = block(c, t, m, p, prog.sl(p, d, 0))
+        pop_scope(m)
+        return node(m, "bench {q(prog.text(p, d))}", [body])
+    }
+    -1
+}
+
+fn fn_node(c: Ck, inout t: Tys, inout m: Em, p: Prog, module: str, d: i64) -> i64 {
+    let qq = module + "::" + prog.name(p, prog.sl(p, d, 2))
+    let fid = sema.fn_of(c, qq)
+    begin_fn(m)
+    push_scope(m)
+    var ps: [i64] = []
+    for prm in prog.items(p, prog.sl(p, d, 5)) {
+        ps.push(param_node(c, t, m, p, prm))
+    }
+    let body = block(c, t, m, p, prog.sl(p, d, 9))
+    pop_scope(m)
+    var gens: [str] = []
+    for g in prog.items(p, prog.sl(p, d, 3)) {
+        gens.push(q(prog.name(p, g)))
+    }
+    var ret = ""
+    var errs = ""
+    var row = ""
+    var bounds = ""
+    if fid >= 0 {
+        ret = rty(t, c.fn_ret[fid])
+        if c.fn_err[fid] >= 0 {
+            errs = rty(t, c.fn_err[fid])
+        } else {
+            errs = "none"
+        }
+        let r = c.fn_rows.get(qq) ?? -1
+        if r >= 0 {
+            row = row_text(t, r)
+        } else {
+            row = "(row *)"
+        }
+        var bs: [str] = []
+        for b in c.fn_bounds[fid] {
+            var qs: [str] = []
+            for x in sema.bounds_list(b) {
+                qs.push(q(x))
+            }
+            bs.push("(" + qs.join(" ") + ")")
+        }
+        bounds = bs.join(" ")
+    } else {
+        let h = hole(m, "function signature")
+        ret = h
+        errs = h
+        row = h
+        bounds = h
+    }
+    var hd = "fn {q(qq)} (generics"
+    if gens.len() > 0 {
+        hd = hd + " " + gens.join(" ")
+    }
+    hd = hd + ") (bounds"
+    if bounds != "" {
+        hd = hd + " " + bounds
+    }
+    hd = hd + ") {ret} {errs} {row}"
+    let pn = node(m, "params", ps)
+    node(m, hd, [pn, body])
+}
+
+fn param_node(c: Ck, inout t: Tys, inout m: Em, p: Prog, prm: i64) -> i64 {
+    let mode = prog.sl(p, prm, 0)
+    let mn = if mode == 1 { "inout" } else if mode == 2 { "own" } else { "let" }
+    let id_node = prog.sl(p, prm, 1)
+    let id = declare(m, prog.name(p, id_node))
+    let tt = bind_ty(c, t, m, p, id_node)
+    leaf(m, "param {mn} {id} {q(prog.name(p, id_node))} {tt}")
+}
+
+// ---------------------------------------------------------------------
+// Statements
+// ---------------------------------------------------------------------
+
+fn block(c: Ck, inout t: Tys, inout m: Em, p: Prog, b: i64) -> i64 {
+    push_scope(m)
+    var kids: [i64] = []
+    for st in prog.stmts(p, b) {
+        kids.push(stmt(c, t, m, p, st))
+    }
+    pop_scope(m)
+    node(m, "block {sp(prog.s(p, b), prog.e(p, b))}", kids)
+}
+
+fn stmt(c: Ck, inout t: Tys, inout m: Em, p: Prog, st: i64) -> i64 {
+    let k = prog.kind(p, st)
+    let s = prog.s(p, st)
+    let e = prog.e(p, st)
+    if k == ast.S_LET {
+        let init = expr(c, t, m, p, prog.sl(p, st, 3))
+        let v = var_atom(c, t, m, p, prog.sl(p, st, 1), prog.sl(p, st, 0) != 0)
+        return node(m, "let {v}", [init])
+    }
+    if k == ast.S_LET_TUPLE {
+        let init = expr(c, t, m, p, prog.sl(p, st, 2))
+        var vars: [i64] = []
+        let mutable = prog.sl(p, st, 0) != 0
+        for n in prog.items(p, prog.sl(p, st, 1)) {
+            let v = var_atom(c, t, m, p, n, mutable)
+            vars.push(leaf(m, "var {v}"))
+        }
+        let vn = node(m, "vars", vars)
+        return node(m, "lettuple", [vn, init])
+    }
+    if k == ast.S_ASSIGN {
+        let op = prog.sl(p, st, 1)
+        let opn = match op {
+            1 -> "add"
+            2 -> "sub"
+            3 -> "mul"
+            4 -> "div"
+            _ -> "set"
+        }
+        let target = prog.sl(p, st, 0)
+        let tt = expr_ty(c, t, m, prog.ekey(p, target))
+        let pl = place(c, t, m, p, target)
+        let value = expr(c, t, m, p, prog.sl(p, st, 2))
+        return node(m, "assign {opn} {tt}", [pl, value])
+    }
+    if k == ast.S_EXPR {
+        return expr(c, t, m, p, prog.sl(p, st, 0))
+    }
+    if k == ast.S_RETURN {
+        let v = prog.sl(p, st, 0)
+        if v >= 0 {
+            let x = expr(c, t, m, p, v)
+            return node(m, "return {sp(s, e)}", [x])
+        }
+        return leaf(m, "return {sp(s, e)}")
+    }
+    if k == ast.S_BREAK {
+        return leaf(m, "break {sp(s, e)}")
+    }
+    if k == ast.S_CONTINUE {
+        return leaf(m, "continue {sp(s, e)}")
+    }
+    if k == ast.S_WHILE {
+        let cn = expr(c, t, m, p, prog.sl(p, st, 0))
+        let b = block(c, t, m, p, prog.sl(p, st, 1))
+        return node(m, "while {sp(s, e)}", [cn, b])
+    }
+    if k == ast.S_FOR {
+        let iter = prog.sl(p, st, 1)
+        let it_t = type_of(c, t, prog.ekey(p, iter))
+        var kind = ""
+        if it_t >= 0 and t.k[it_t] == tys.K_RANGE {
+            kind = "range"
+        } else if it_t >= 0 and t.k[it_t] == tys.K_LIST {
+            kind = "list"
+        } else if it_t >= 0 and t.k[it_t] == tys.K_STR {
+            kind = "str"
+        } else if it_t >= 0 and t.k[it_t] == tys.K_BYTES {
+            kind = "bytes"
+        } else {
+            kind = hole(m, "iterable kind")
+        }
+        let it = expr(c, t, m, p, iter)
+        push_scope(m)
+        let v = var_atom(c, t, m, p, prog.sl(p, st, 0), false)
+        let b = block(c, t, m, p, prog.sl(p, st, 2))
+        pop_scope(m)
+        let vn = leaf(m, "var {v}")
+        return node(m, "for {kind} {sp(s, e)}", [vn, it, b])
+    }
+    if k == ast.S_PARALLEL {
+        let proved = c.parallel_ok.has(s)
+        let b = block(c, t, m, p, prog.sl(p, st, 0))
+        let cc = if prog.sl(p, st, 1) != 0 { "concurrent" } else { "sequential" }
+        let pv = if proved { "proved" } else { "unproved" }
+        return node(m, "parallel {cc} {pv} {sp(s, e)}", [b])
+    }
+    if k == ast.S_SPAWN {
+        let b = block(c, t, m, p, prog.sl(p, st, 0))
+        let cc = if prog.sl(p, st, 1) != 0 { "concurrent" } else { "sequential" }
+        return node(m, "spawn {cc} {sp(s, e)}", [b])
+    }
+    // S_WITH
+    let h = expr(c, t, m, p, prog.sl(p, st, 1))
+    let b = block(c, t, m, p, prog.sl(p, st, 2))
+    node(m, "with {q(prog.dotted(p, prog.sl(p, st, 0)))} {sp(s, e)}", [h, b])
+}
+
+/// Whether `x` (resolved) is a struct or a tuple.
+fn struct_or_tuple(t: Tys, x: i64) -> bool {
+    let k = t.k[x]
+    if k == tys.K_TUPLE {
+        return true
+    }
+    k == tys.K_NAMED and tys.is_struct(t, t.a[x])
+}
+
+fn place(c: Ck, inout t: Tys, inout m: Em, p: Prog, target: i64) -> i64 {
+    let k = prog.kind(p, target)
+    if k == ast.E_IDENT {
+        let id = prog.sl(p, target, 0)
+        let v = lookup(m, prog.name(p, id))
+        if v >= 0 {
+            return leaf(m, "local {v} {sp(prog.s(p, id), prog.e(p, id))}")
+        }
+        let h = hole(m, "assignment to unknown local `{prog.name(p, id)}`")
+        return leaf(m, "local {h}")
+    }
+    if k == ast.E_FIELD {
+        let recv = prog.sl(p, target, 0)
+        let nm = prog.sl(p, target, 1)
+        let name = prog.name(p, nm)
+        let s = prog.s(p, target)
+        let e = prog.e(p, target)
+        let rt = type_of(c, t, prog.ekey(p, recv))
+        if rt >= 0 and t.k[rt] == tys.K_REF {
+            if name == "value" and not struct_or_tuple(t, t.a[rt]) {
+                let r = place(c, t, m, p, recv)
+                return node(m, "deref {sp(s, e)}", [r])
+            }
+        }
+        let idx = field_index(c, t, m, prog.ekey(p, recv), name)
+        let r = place(c, t, m, p, recv)
+        return node(m, "field {idx} {sp(s, e)}", [r])
+    }
+    if k == ast.E_INDEX {
+        let r = place(c, t, m, p, prog.sl(p, target, 0))
+        let i = expr(c, t, m, p, prog.sl(p, target, 1))
+        return node(m, "index {sp(prog.s(p, target), prog.e(p, target))}", [r, i])
+    }
+    let h = hole(m, "assignment target")
+    leaf(m, "place {h}")
+}
+
+// ---------------------------------------------------------------------
+// Expressions
+// ---------------------------------------------------------------------
+
+fn hex16(bits: i64) -> str {
+    let digits = "0123456789abcdef"
+    var hi = bits.ushr(32)
+    var lo = bits.bit_and(4294967295)
+    var s = ""
+    for _ in 0..8 {
+        s = digits.substr(lo % 16, 1) + s
+        lo = lo / 16
+    }
+    for _ in 0..8 {
+        s = digits.substr(hi % 16, 1) + s
+        hi = hi / 16
+    }
+    s
+}
+
+fn float_leaf(inout m: Em, v: f64, s: i64, e: i64) -> i64 {
+    leaf(m, "float f64 {sp(s, e)} 0x{hex16(v.to_bits())}")
+}
+
+fn expr(c: Ck, inout t: Tys, inout m: Em, p: Prog, e: i64) -> i64 {
+    let n = expr_inner(c, t, m, p, e)
+    let k = prog.ekey(p, e)
+    if c.ok_wrapped.has(k) {
+        var tt = ""
+        var ok = false
+        match c.f_wraps.get(k) {
+            Some(x) -> {
+                let r = tys.resolve(t, x)
+                if not tys.holds_var(t, r) {
+                    tt = ty(t, r)
+                    ok = true
+                }
+            }
+            None -> ()
+        }
+        if not ok {
+            tt = hole(m, "type an ok half is wrapped into")
+        }
+        return node(m, "wrapok {tt} {sp(prog.es(p, e), prog.ee(p, e))}", [n])
+    }
+    n
+}
+
+fn is_promoted_literal(c: Ck, p: Prog, e: i64) -> bool {
+    let k = prog.kind(p, e)
+    if k == ast.E_INT {
+        return c.float_lits.has(prog.s(p, e))
+    }
+    if k == ast.E_UNARY and prog.sl(p, e, 0) == 0 {
+        return is_promoted_literal(c, p, prog.sl(p, e, 1))
+    }
+    false
+}
+
+fn expr_inner(c: Ck, inout t: Tys, inout m: Em, p: Prog, e: i64) -> i64 {
+    let k = prog.kind(p, e)
+    let s = prog.es(p, e)
+    let en = prog.ee(p, e)
+    if k == ast.E_INT {
+        let v = prog.sl(p, e, 0)
+        if c.float_lits.has(s) {
+            return float_leaf(m, v.as_f64(), s, en)
+        }
+        let h = head(c, t, m, "int", s, en)
+        if h.starts_with("int u64 ") {
+            return leaf(m, "{h} {rdebug.u64_display(v)}")
+        }
+        return leaf(m, "{h} {v}")
+    }
+    if k == ast.E_FLOAT {
+        return float_leaf(m, p.a.fl[prog.sl(p, e, 0)], s, en)
+    }
+    if k == ast.E_BOOL {
+        let h = head(c, t, m, "bool", s, en)
+        let b = if prog.sl(p, e, 0) != 0 { "true" } else { "false" }
+        return leaf(m, "{h} {b}")
+    }
+    if k == ast.E_STR {
+        let h = head(c, t, m, "str", s, en)
+        var kids: [i64] = []
+        for pc in prog.items(p, prog.sl(p, e, 0)) {
+            if prog.kind(p, pc) == ast.PC_TEXT {
+                kids.push(leaf(m, "text {q(prog.text(p, pc))}"))
+            } else {
+                let x = expr(c, t, m, p, prog.sl(p, pc, 0))
+                kids.push(node(m, "value", [x]))
+            }
+        }
+        return node(m, h, kids)
+    }
+    if k == ast.E_IDENT {
+        return ident(c, t, m, p, prog.sl(p, e, 0))
+    }
+    if k == ast.E_LIST or k == ast.E_TUPLE {
+        let kw = if k == ast.E_LIST { "list" } else { "tuple" }
+        let h = head(c, t, m, kw, s, en)
+        var kids: [i64] = []
+        for x in prog.items(p, prog.sl(p, e, 0)) {
+            kids.push(expr(c, t, m, p, x))
+        }
+        return node(m, h, kids)
+    }
+    if k == ast.E_MAP {
+        let h = head(c, t, m, "maplit", s, en)
+        var kids: [i64] = []
+        for pr in prog.items(p, prog.sl(p, e, 0)) {
+            let kk = expr(c, t, m, p, prog.sl(p, pr, 0))
+            let vv = expr(c, t, m, p, prog.sl(p, pr, 1))
+            kids.push(node(m, "entry", [kk, vv]))
+        }
+        return node(m, h, kids)
+    }
+    if k == ast.E_STRUCT {
+        let h = head(c, t, m, "struct", s, en)
+        var kids: [i64] = []
+        for pr in prog.items(p, prog.sl(p, e, 2)) {
+            let fname = prog.name(p, prog.sl(p, pr, 0))
+            let idx = field_index(c, t, m, prog.key(s, en), fname)
+            let x = expr(c, t, m, p, prog.sl(p, pr, 1))
+            kids.push(node(m, "field {idx}", [x]))
+        }
+        let base = prog.sl(p, e, 1)
+        if base >= 0 {
+            let x = expr(c, t, m, p, base)
+            kids.push(node(m, "base", [x]))
+        }
+        return node(m, h, kids)
+    }
+    if k == ast.E_CALL {
+        return call(c, t, m, p, e)
+    }
+    if k == ast.E_METHOD {
+        return method_call(c, t, m, p, e)
+    }
+    if k == ast.E_FIELD {
+        return field(c, t, m, p, e)
+    }
+    if k == ast.E_INDEX {
+        let h = head(c, t, m, "index", s, en)
+        let r = expr(c, t, m, p, prog.sl(p, e, 0))
+        let i = expr(c, t, m, p, prog.sl(p, e, 1))
+        return node(m, h, [r, i])
+    }
+    if k == ast.E_UNARY {
+        let op = prog.sl(p, e, 0)
+        let inner = prog.sl(p, e, 1)
+        if op == 0 and prog.kind(p, inner) == ast.E_INT {
+            let isp = prog.ekey(p, inner)
+            if type_of(c, t, isp) < 0 {
+                let tt = expr_ty(c, t, m, prog.key(s, en))
+                var lit = -1
+                let is_ = prog.s(p, inner)
+                let ie = prog.e(p, inner)
+                if c.float_lits.has(is_) {
+                    lit = float_leaf(m, prog.sl(p, inner, 0).as_f64(), is_, ie)
+                } else {
+                    lit = leaf(m, "int {tt} {sp(is_, ie)} {prog.sl(p, inner, 0)}")
+                }
+                return node(m, "unary {tt} {sp(s, en)} neg {tt}", [lit])
+            }
+        }
+        let h = head(c, t, m, "unary", s, en)
+        let ot = expr_ty(c, t, m, prog.ekey(p, inner))
+        let opn = if op == 0 { "neg" } else { "not" }
+        let x = expr(c, t, m, p, inner)
+        return node(m, "{h} {opn} {ot}", [x])
+    }
+    if k == ast.E_BINARY {
+        let h = head(c, t, m, "binary", s, en)
+        let lhs = prog.sl(p, e, 1)
+        var ot = ""
+        if is_promoted_literal(c, p, lhs) {
+            ot = "f64"
+        } else {
+            ot = expr_ty(c, t, m, prog.ekey(p, lhs))
+        }
+        let opn = match prog.sl(p, e, 0) {
+            0 -> "add"
+            1 -> "sub"
+            2 -> "mul"
+            3 -> "div"
+            4 -> "rem"
+            5 -> "pow"
+            6 -> "eq"
+            7 -> "ne"
+            8 -> "lt"
+            9 -> "le"
+            10 -> "gt"
+            11 -> "ge"
+            12 -> "and"
+            13 -> "or"
+            _ -> "coalesce"
+        }
+        let l = expr(c, t, m, p, lhs)
+        let r = expr(c, t, m, p, prog.sl(p, e, 2))
+        return node(m, "{h} {opn} {ot}", [l, r])
+    }
+    if k == ast.E_RANGE {
+        let h = head(c, t, m, "range", s, en)
+        let a = expr(c, t, m, p, prog.sl(p, e, 0))
+        let b = expr(c, t, m, p, prog.sl(p, e, 1))
+        let inc = if prog.sl(p, e, 2) != 0 { "inclusive" } else { "exclusive" }
+        return node(m, "{h} {inc}", [a, b])
+    }
+    if k == ast.E_IF {
+        let h = head(c, t, m, "if", s, en)
+        let cn = expr(c, t, m, p, prog.sl(p, e, 0))
+        let th = block(c, t, m, p, prog.sl(p, e, 1))
+        var kids = [cn, th]
+        let eb = prog.sl(p, e, 2)
+        if eb >= 0 {
+            if prog.kind(p, eb) == ast.EB_ELSE {
+                let b = block(c, t, m, p, prog.sl(p, eb, 0))
+                kids.push(node(m, "else", [b]))
+            } else {
+                let x = expr(c, t, m, p, prog.sl(p, eb, 0))
+                kids.push(node(m, "elseif", [x]))
+            }
+        }
+        return node(m, h, kids)
+    }
+    if k == ast.E_MATCH {
+        let h = head(c, t, m, "match", s, en)
+        let scrut = prog.sl(p, e, 0)
+        let st = type_of(c, t, prog.ekey(p, scrut))
+        let sn = expr(c, t, m, p, scrut)
+        var kids = [sn]
+        for arm in prog.items(p, prog.sl(p, e, 1)) {
+            push_scope(m)
+            let pn = pattern(c, t, m, p, prog.sl(p, arm, 0), st)
+            var ak = [pn]
+            let g = prog.sl(p, arm, 1)
+            if g >= 0 {
+                let gx = expr(c, t, m, p, g)
+                ak.push(node(m, "guard", [gx]))
+            }
+            ak.push(expr(c, t, m, p, prog.sl(p, arm, 2)))
+            pop_scope(m)
+            kids.push(node(m, "arm {sp(prog.s(p, arm), prog.e(p, arm))}", ak))
+        }
+        return node(m, h, kids)
+    }
+    if k == ast.E_BLOCK or k == ast.E_REGION or k == ast.E_UNSAFE {
+        let kw = if k == ast.E_BLOCK { "blockexpr" } else if k == ast.E_REGION { "region" } else { "unsafe" }
+        let h = head(c, t, m, kw, s, en)
+        let b = block(c, t, m, p, prog.sl(p, e, 0))
+        return node(m, h, [b])
+    }
+    if k == ast.E_TRY {
+        let h = head(c, t, m, "try", s, en)
+        let x = expr(c, t, m, p, prog.sl(p, e, 0))
+        return node(m, h, [x])
+    }
+    // E_CLOSURE
+    let h = head(c, t, m, "closure", s, en)
+    var fallible = false
+    match c.closure_types.get(s) {
+        Some(x) -> fallible = t.k[tys.shallow(t, x)] == tys.K_FALLIBLE
+        None -> ()
+    }
+    push_scope(m)
+    var ps: [i64] = []
+    for prm in prog.items(p, prog.sl(p, e, 0)) {
+        let v = var_atom(c, t, m, p, prm, false)
+        ps.push(leaf(m, "var {v}"))
+    }
+    let b = expr(c, t, m, p, prog.sl(p, e, 1))
+    pop_scope(m)
+    let fl = if fallible { "fallible" } else { "total" }
+    let pn = node(m, "params", ps)
+    node(m, "{h} {fl}", [pn, b])
+}
+
+fn targs_text(c: Ck, inout t: Tys, inout m: Em, xs: [i64]) -> str {
+    var s = "(targs"
+    for x in xs {
+        let r = tys.resolve(t, x)
+        s = s + " "
+        if tys.holds_var(t, r) {
+            s = s + hole(m, "type argument")
+        } else {
+            s = s + ty(t, r)
+        }
+    }
+    s + ")"
+}
+
+fn ident(c: Ck, inout t: Tys, inout m: Em, p: Prog, id: i64) -> i64 {
+    let s = prog.s(p, id)
+    let e = prog.e(p, id)
+    let k = prog.key(s, e)
+    let nk = c.n_kind.get(k) ?? 0
+    let name = prog.name(p, id)
+    if nk == sema.NR_LOCAL {
+        let h = head(c, t, m, "local", s, e)
+        let v = lookup(m, name)
+        if v >= 0 {
+            return leaf(m, "{h} {v}")
+        }
+        let x = hole(m, "local `{name}` not in scope")
+        return leaf(m, "{h} {x}")
+    }
+    if nk == sema.NR_VARIANT {
+        let h = head(c, t, m, "variant", s, e)
+        let v = variant_ref(c, t, m, k, name)
+        return leaf(m, "{h} {v}")
+    }
+    if nk == sema.NR_CONST {
+        let h = head(c, t, m, "const", s, e)
+        return leaf(m, "{h} {q(c.n_q.get(k) ?? "")}")
+    }
+    if nk == sema.NR_FN {
+        let h = head(c, t, m, "fnref", s, e)
+        let ta = targs_text(c, t, m, c.n_targs.get(k) ?? [])
+        return leaf(m, "{h} {q(c.n_q.get(k) ?? "")} {ta}")
+    }
+    let x = hole(m, "what `{name}` names")
+    leaf(m, "name {x} {q(name)}")
+}
+
+fn variant_ref(c: Ck, inout t: Tys, inout m: Em, k: i64, name: str) -> str {
+    let parts = name.split(".")
+    let short = parts[parts.len() - 1]
+    let tt = type_of(c, t, k)
+    variant_of(t, m, tt, short)
+}
+
+fn variant_of(t: Tys, inout m: Em, tt: i64, short: str) -> str {
+    if tt >= 0 and t.k[tt] == tys.K_NAMED {
+        let def = t.a[tt]
+        if t.d_sum[def] {
+            let i = tys.variant_index(t, def, short)
+            if i >= 0 {
+                return "{q(t.d_name[def])} {i}"
+            }
+        }
+    }
+    hole(m, "variant `{short}`")
+}
+
+fn call(c: Ck, inout t: Tys, inout m: Em, p: Prog, e: i64) -> i64 {
+    let s = prog.s(p, e)
+    let en = prog.e(p, e)
+    let k = prog.key(s, en)
+    let callee = prog.sl(p, e, 0)
+    let args = prog.items(p, prog.sl(p, e, 1))
+    let ck = c.c_kind.get(k) ?? 0
+    if ck == sema.CR_BUILTIN {
+        let name = c.c_q.get(k) ?? ""
+        var h = ""
+        if (name == "fail" or name == "panic" or name == "exit") and type_of(c, t, k) < 0 {
+            h = "builtin never {sp(s, en)}"
+        } else {
+            h = head(c, t, m, "builtin", s, en)
+        }
+        let kids = mem_args(c, t, m, p, args, k)
+        return node(m, "{h} {q(name)}", kids)
+    }
+    if ck == sema.CR_FN {
+        return fn_call(c, t, m, p, c.c_q.get(k) ?? "", c.c_targs.get(k) ?? [], -1, args, s, en)
+    }
+    if ck == sema.CR_VARIANT {
+        let h = head(c, t, m, "variant", s, en)
+        var name = ""
+        if prog.kind(p, callee) == ast.E_IDENT {
+            name = prog.name(p, prog.sl(p, callee, 0))
+        }
+        let v = variant_ref(c, t, m, k, name)
+        var kids: [i64] = []
+        for a in args {
+            kids.push(expr(c, t, m, p, a))
+        }
+        return node(m, "{h} {v}", kids)
+    }
+    if ck == sema.CR_VALUE {
+        let h = head(c, t, m, "callvalue", s, en)
+        var kids = [expr(c, t, m, p, callee)]
+        for a in args {
+            kids.push(expr(c, t, m, p, a))
+        }
+        return node(m, h, kids)
+    }
+    let x = hole(m, "what a call reaches")
+    leaf(m, "call {x}")
+}
+
+/// A built-in's arguments; a raw-memory one's names are names.
+fn mem_args(c: Ck, inout t: Tys, inout m: Em, p: Prog, args: [i64], k: i64) -> [i64] {
+    let mk = c.mem_kind.get(k) ?? 0
+    if mk == sema.MO_SIZE or mk == sema.MO_ALIGN {
+        return [leaf(m, "type {c.mem_s.get(k) ?? ""}")]
+    }
+    if mk == sema.MO_ATOMIC {
+        var kids: [i64] = []
+        for i in 0..args.len() - 1 {
+            kids.push(expr(c, t, m, p, args[i]))
+        }
+        let last = args[args.len() - 1]
+        kids.push(leaf(m, "order {c.mem_s.get(k) ?? ""} {sp(prog.es(p, last), prog.ee(p, last))}"))
+        return kids
+    }
+    if mk == sema.MO_TLS {
+        if (c.cop_kind.get(k) ?? 0) == sema.CO_TLS {
+            return [leaf(m, "tlsname {q(c.cop_s.get(k) ?? "")}")]
+        }
+        return [leaf(m, hole(m, "the cell an address names"))]
+    }
+    if mk == sema.MO_FNADDR {
+        if (c.cop_kind.get(k) ?? 0) == sema.CO_FNADDR {
+            return [leaf(m, "fnname {q(c.cop_s.get(k) ?? "")}")]
+        }
+        return [leaf(m, hole(m, "the function an address names"))]
+    }
+    if mk == sema.MO_CALLC {
+        var kids: [i64] = []
+        if (c.cop_kind.get(k) ?? 0) == sema.CO_CALLC {
+            kids.push(leaf(m, "sig {c.cop_s.get(k) ?? ""}"))
+        } else {
+            kids.push(leaf(m, hole(m, "a call's C signature")))
+        }
+        for i in 1..args.len() {
+            kids.push(expr(c, t, m, p, args[i]))
+        }
+        return kids
+    }
+    if mk == sema.MO_PROCESS {
+        if (c.cop_kind.get(k) ?? 0) == sema.CO_PROCESS {
+            return [leaf(m, "processname {q(c.cop_s.get(k) ?? "")}")]
+        }
+        return [leaf(m, hole(m, "the process cell an address names"))]
+    }
+    if mk == sema.MO_STATIC or mk == sema.MO_STATICLEN {
+        if (c.cop_kind.get(k) ?? 0) == sema.CO_STATIC {
+            return [leaf(m, "mstatic {q(c.cop_s.get(k) ?? "")}")]
+        }
+        return [leaf(m, hole(m, "the literal a static names"))]
+    }
+    var kids: [i64] = []
+    for a in args {
+        kids.push(expr(c, t, m, p, a))
+    }
+    kids
+}
+
+fn fn_call(c: Ck, inout t: Tys, inout m: Em, p: Prog, qq: str, targs: [i64], recv: i64, args: [i64], s: i64, e: i64) -> i64 {
+    let fid = sema.fn_of(c, qq)
+    let is_extern = fid >= 0 and c.extern_names.has(qq)
+    let kw = if is_extern { "callextern" } else { "call" }
+    let h = head(c, t, m, kw, s, e)
+    let ta = targs_text(c, t, m, targs)
+    var kids: [i64] = []
+    if recv >= 0 {
+        kids.push(expr(c, t, m, p, recv))
+    }
+    for a in args {
+        kids.push(expr(c, t, m, p, a))
+    }
+    node(m, "{h} {q(qq)} {ta}", kids)
+}
+
+fn method_call(c: Ck, inout t: Tys, inout m: Em, p: Prog, e: i64) -> i64 {
+    let s = prog.s(p, e)
+    let en = prog.e(p, e)
+    let k = prog.key(s, en)
+    let recv = prog.sl(p, e, 0)
+    let nm = prog.sl(p, e, 1)
+    let name = prog.name(p, nm)
+    let args = prog.items(p, prog.sl(p, e, 2))
+    let mk = c.m_kind.get(k) ?? 0
+    let ck = c.c_kind.get(k) ?? 0
+    if mk == sema.MR_MODULE {
+        if ck == sema.CR_FN {
+            return fn_call(c, t, m, p, c.c_q.get(k) ?? "", c.c_targs.get(k) ?? [], -1, args, s, en)
+        }
+        let x = hole(m, "module function")
+        return leaf(m, "call {x}")
+    }
+    if mk == sema.MR_INTERFACE or mk == sema.MR_UFCS {
+        if ck == sema.CR_FN {
+            return fn_call(c, t, m, p, c.c_q.get(k) ?? "", c.c_targs.get(k) ?? [], recv, args, s, en)
+        }
+        let x = hole(m, "method's function")
+        return leaf(m, "call {x}")
+    }
+    if mk == sema.MR_BOUND {
+        let h = head(c, t, m, "boundcall", s, en)
+        var kids = [expr(c, t, m, p, recv)]
+        for a in args {
+            kids.push(expr(c, t, m, p, a))
+        }
+        return node(m, "{h} {q(c.m_a.get(k) ?? "")} {q(name)}", kids)
+    }
+    if mk == sema.MR_EFFECTOP {
+        let h = head(c, t, m, "effectop", s, en)
+        var kids: [i64] = []
+        for a in args {
+            kids.push(expr(c, t, m, p, a))
+        }
+        return node(m, "{h} {q(c.m_a.get(k) ?? "")} {q(c.m_b.get(k) ?? "")}", kids)
+    }
+    if mk == sema.MR_VARIANT {
+        let h = head(c, t, m, "variant", s, en)
+        let v = variant_ref(c, t, m, k, name)
+        var kids: [i64] = []
+        for a in args {
+            kids.push(expr(c, t, m, p, a))
+        }
+        return node(m, "{h} {v}", kids)
+    }
+    if mk == sema.MR_BUILTIN {
+        let h = head(c, t, m, "method", s, en)
+        var kids = [expr(c, t, m, p, recv)]
+        for x in mem_args(c, t, m, p, args, k) {
+            kids.push(x)
+        }
+        return node(m, "{h} {q(name)}", kids)
+    }
+    if mk == sema.MR_FIELDFN {
+        let h = head(c, t, m, "callvalue", s, en)
+        let rt = type_of(c, t, prog.ekey(p, recv))
+        let ns = prog.s(p, nm)
+        let ne = prog.e(p, nm)
+        if rt >= 0 and t.k[rt] == tys.K_TUPLE and sema.all_digits(name) and name != "" {
+            let i = name.parse_int() ?? -1
+            if i >= 0 and i < t.n[rt] {
+                let ft = ty(t, tys.item(t, rt, i))
+                let r = expr(c, t, m, p, recv)
+                let f = node(m, "tuplefield {ft} {sp(ns, ne)} {name}", [r])
+                var kids = [f]
+                for a in args {
+                    kids.push(expr(c, t, m, p, a))
+                }
+                return node(m, h, kids)
+            }
+        }
+        let idx = field_index(c, t, m, prog.ekey(p, recv), name)
+        let ft = field_type(c, t, m, prog.ekey(p, recv), name)
+        let r = expr(c, t, m, p, recv)
+        let f = node(m, "field {ft} {sp(ns, ne)} {idx}", [r])
+        var kids = [f]
+        for a in args {
+            kids.push(expr(c, t, m, p, a))
+        }
+        return node(m, h, kids)
+    }
+    let x = hole(m, "how `.{name}` dispatched")
+    leaf(m, "method {x}")
+}
+
+fn field(c: Ck, inout t: Tys, inout m: Em, p: Prog, e: i64) -> i64 {
+    let s = prog.s(p, e)
+    let en = prog.e(p, e)
+    let k = prog.key(s, en)
+    let recv = prog.sl(p, e, 0)
+    let nm = prog.sl(p, e, 1)
+    let name = prog.name(p, nm)
+    let nk = c.n_kind.get(k) ?? 0
+    if nk == sema.NR_VARIANT {
+        let h = head(c, t, m, "variant", s, en)
+        let v = variant_ref(c, t, m, k, name)
+        return leaf(m, "{h} {v}")
+    }
+    if nk == sema.NR_CONST {
+        let h = head(c, t, m, "const", s, en)
+        return leaf(m, "{h} {q(c.n_q.get(k) ?? "")}")
+    }
+    if nk == sema.NR_FN {
+        let h = head(c, t, m, "fnref", s, en)
+        let ta = targs_text(c, t, m, c.n_targs.get(k) ?? [])
+        return leaf(m, "{h} {q(c.n_q.get(k) ?? "")} {ta}")
+    }
+    if prog.kind(p, recv) == ast.E_IDENT {
+        let rid = prog.sl(p, recv, 0)
+        let rn = prog.name(p, rid)
+        if lookup(m, rn) < 0 and not c.n_kind.has(prog.key(prog.s(p, rid), prog.e(p, rid))) {
+            let target = prog.import_of(p, m.mi, rn)
+            if target != "\0" {
+                let h = head(c, t, m, "const", s, en)
+                return leaf(m, "{h} {q(target + "::" + name)}")
+            }
+        }
+    }
+    let rt = type_of(c, t, prog.ekey(p, recv))
+    var through = rt
+    if rt >= 0 and t.k[rt] == tys.K_REF {
+        through = t.a[rt]
+        if name == "value" and not struct_or_tuple(t, t.a[rt]) {
+            let h = head(c, t, m, "deref", s, en)
+            let r = expr(c, t, m, p, recv)
+            return node(m, h, [r])
+        }
+    }
+    if through >= 0 and t.k[through] == tys.K_TUPLE {
+        let h = head(c, t, m, "tuplefield", s, en)
+        let r = expr(c, t, m, p, recv)
+        return node(m, "{h} {name}", [r])
+    }
+    let h = head(c, t, m, "field", s, en)
+    let idx = field_index(c, t, m, prog.ekey(p, recv), name)
+    let r = expr(c, t, m, p, recv)
+    node(m, "{h} {idx}", [r])
+}
+
+/// The position of field `name` in the struct type at `k`, through a `ref`.
+fn field_index(c: Ck, inout t: Tys, inout m: Em, k: i64, name: str) -> str {
+    var tt = type_of(c, t, k)
+    if tt >= 0 and t.k[tt] == tys.K_REF {
+        tt = t.a[tt]
+    }
+    if tt >= 0 and t.k[tt] == tys.K_NAMED and tys.is_struct(t, t.a[tt]) {
+        let (fns, _) = tys.struct_fields(t, t.a[tt])
+        for i in 0..fns.len() {
+            if fns[i] == name {
+                return "{i}"
+            }
+        }
+    }
+    hole(m, "field `{name}`")
+}
+
+fn field_type(c: Ck, inout t: Tys, inout m: Em, k: i64, name: str) -> str {
+    var tt = type_of(c, t, k)
+    if tt >= 0 and t.k[tt] == tys.K_REF {
+        tt = t.a[tt]
+    }
+    if tt >= 0 and t.k[tt] == tys.K_NAMED and tys.is_struct(t, t.a[tt]) {
+        let (fns, fts) = tys.struct_fields(t, t.a[tt])
+        for i in 0..fns.len() {
+            if fns[i] == name {
+                let its = tys.items(t, tt)
+                let st = tys.subst_generics(t, fts[i], its)
+                return ty(t, st)
+            }
+        }
+    }
+    hole(m, "type of field `{name}`")
+}
+
+// ---------------------------------------------------------------------
+// Patterns
+// ---------------------------------------------------------------------
+
+fn pattern(c: Ck, inout t: Tys, inout m: Em, p: Prog, pat: i64, tt: i64) -> i64 {
+    if tt >= 0 and t.k[tt] == tys.K_REF {
+        return pattern(c, t, m, p, pat, t.a[tt])
+    }
+    let k = prog.kind(p, pat)
+    let s = prog.ps(p, pat)
+    let e = prog.pe(p, pat)
+    if k == ast.P_WILD {
+        return leaf(m, "pwild {sp(s, e)}")
+    }
+    if k == ast.P_INT {
+        return leaf(m, "pint {sp(s, e)} {prog.sl(p, pat, 0)}")
+    }
+    if k == ast.P_BOOL {
+        let b = if prog.sl(p, pat, 0) != 0 { "true" } else { "false" }
+        return leaf(m, "pbool {sp(s, e)} {b}")
+    }
+    if k == ast.P_STR {
+        return leaf(m, "pstr {sp(s, e)} {q(prog.text(p, pat))}")
+    }
+    if k == ast.P_BIND {
+        let id = prog.sl(p, pat, 0)
+        let name = prog.name(p, id)
+        if not c.f_binds.has(prog.key(prog.s(p, id), prog.e(p, id))) {
+            if tt >= 0 and t.k[tt] == tys.K_NAMED and t.d_sum[t.a[tt]] {
+                let i = tys.variant_index(t, t.a[tt], name)
+                if i >= 0 {
+                    return leaf(m, "pvariant {sp(s, e)} {q(t.d_name[t.a[tt]])} {i}")
+                }
+            }
+        }
+        if m.rb_on {
+            for j in 0..m.rb_name.len() {
+                if m.rb_name[j] == name {
+                    return leaf(m, "pbind {sp(s, e)} {m.rb_id[j]}")
+                }
+            }
+        }
+        let v = var_atom(c, t, m, p, id, false)
+        return leaf(m, "pbind {sp(s, e)} {v}")
+    }
+    if k == ast.P_VARIANT {
+        let path = prog.sl(p, pat, 0)
+        let short = prog.path_last(p, path)
+        let fields = prog.items(p, prog.sl(p, pat, 1))
+        if tt >= 0 and t.k[tt] == tys.K_FALLIBLE and (short == "Ok" or short == "Err") {
+            let inner = if short == "Ok" { t.a[tt] } else { t.b[tt] }
+            let kw = if short == "Ok" { "pok" } else { "perr" }
+            var kids: [i64] = []
+            for f in fields {
+                kids.push(pattern(c, t, m, p, f, inner))
+            }
+            return node(m, "{kw} {sp(s, e)}", kids)
+        }
+        let v = variant_of(t, m, tt, short)
+        var ftys: [i64] = []
+        if tt >= 0 and t.k[tt] == tys.K_NAMED and t.d_sum[t.a[tt]] {
+            let vi = tys.variant_index(t, t.a[tt], short)
+            if vi >= 0 {
+                let (_, fts) = tys.variant_fields(t, t.a[tt], vi)
+                for ft in fts {
+                    ftys.push(tys.subst_generics(t, ft, tys.items(t, tt)))
+                }
+            }
+        }
+        var kids: [i64] = []
+        for i in 0..fields.len() {
+            let ft = if i < ftys.len() { ftys[i] } else { -1 }
+            kids.push(pattern(c, t, m, p, fields[i], ft))
+        }
+        return node(m, "pvariant {sp(s, e)} {v}", kids)
+    }
+    if k == ast.P_TUPLE {
+        var ts: [i64] = []
+        if tt >= 0 and t.k[tt] == tys.K_TUPLE {
+            ts = tys.items(t, tt)
+        }
+        var kids: [i64] = []
+        let items = prog.items(p, prog.sl(p, pat, 0))
+        for i in 0..items.len() {
+            let it = if i < ts.len() { ts[i] } else { -1 }
+            kids.push(pattern(c, t, m, p, items[i], it))
+        }
+        return node(m, "ptuple {sp(s, e)}", kids)
+    }
+    // P_OR
+    let alts = prog.items(p, prog.sl(p, pat, 0))
+    var kids: [i64] = []
+    if alts.len() > 0 {
+        let before = m.sc_name.len()
+        kids.push(pattern(c, t, m, p, alts[0], tt))
+        var bn: [str] = []
+        var bi: [i64] = []
+        for j in before..m.sc_name.len() {
+            bn.push(m.sc_name[j])
+            bi.push(m.sc_id[j])
+        }
+        let s_on = m.rb_on
+        let s_n = m.rb_name
+        let s_i = m.rb_id
+        m.rb_on = true
+        m.rb_name = bn
+        m.rb_id = bi
+        for j in 1..alts.len() {
+            kids.push(pattern(c, t, m, p, alts[j], tt))
+        }
+        m.rb_on = s_on
+        m.rb_name = s_n
+        m.rb_id = s_i
+    }
+    node(m, "por {sp(s, e)}", kids)
+}
