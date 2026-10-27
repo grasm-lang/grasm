@@ -383,9 +383,16 @@ dyld signs code pointers, and Cranelift has no `arm64e` target. An address is
 used exactly as it was given and is never stripped, so `call_c` is a plain
 `blr`. A future target that signs code pointers (`arm64e`, in S3 or S7) must
 sign in `mem_fn_addr` and authenticate in `call_c` (`blraaz`); it is written
-here so it is not lost. Return addresses *are* signed: Cranelift turns on
-`sign_return_address` with the B key for every function on macOS
-(`pacibsp`/`retab`), and a C entry is a function like any other.
+here so it is not lost. Return addresses are signed in the code: Cranelift
+turns on `sign_return_address` with the B key for every function on macOS
+(`pacibsp`/`retab`), and a C entry is a function like any other. But the
+signature is not enforced. Measured 2026-10-27 (S5 part two, `rtdialect`):
+in an `arm64` process on this machine `pacibsp` leaves the return address
+unchanged, because the system enables the pointer-authentication keys only
+for `arm64e` processes, so a corrupted return address would not be caught
+by `retab`. The instructions are kept, and they cost what they cost, so that
+an `arm64e` build enforces them unchanged. Showing them enforced needs an
+`arm64e` process, which nothing here builds yet.
 
 **Interpreter.** It has no machine code for a Grasm function and cannot make
 any, so:
