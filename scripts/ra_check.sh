@@ -28,6 +28,10 @@
 #     `--ra-corrupt=class`, a double given the general register of its
 #     number. Every function that holds a double in a register (the driver's
 #     `with doubles` count) must have the class error planted and caught.
+#
+# `S3_STOP_AT_FIRST=1` (the mutation controls', `scripts/s3controls.sh`)
+# stops at the first program that fails: a planted fault needs one program to
+# show it, not the whole corpus.
 set -uo pipefail
 cd "$(dirname "$0")/.."
 GRASM=${GRASM:-./target/release/grasm}
@@ -44,6 +48,8 @@ trap 'rm -rf "$WORK"' EXIT
 s3_driver
 s3_runtime
 s3_collect
+STOP=${S3_STOP_AT_FIRST:-}
+stopped=0
 
 programs=0
 runs=0
@@ -86,6 +92,10 @@ corrupt() {
 }
 
 for k in "${!S3_SRC[@]}"; do
+    if [ -n "$STOP" ] && [ "$fail" -gt 0 ]; then
+        stopped=1
+        break
+    fi
     [ "${S3_RULE[$k]}" = "in" ] || continue
     src=${S3_SRC[$k]}
     tir=${S3_TIR[$k]}
@@ -177,6 +187,11 @@ if [ ${#FAILED[@]} -gt 0 ]; then
     echo
     echo "FAILED:"
     printf '  %s\n' "${FAILED[@]}"
+fi
+if [ "$stopped" = 1 ]; then
+    echo
+    echo "stopped at the first failure (S3_STOP_AT_FIRST); the counts above are partial"
+    exit 1
 fi
 [ "$fail" -eq 0 ] || exit 1
 [ "$pass" -eq "$runs" ] || exit 1

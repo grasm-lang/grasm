@@ -125,8 +125,9 @@ control() {
         controls=$((controls + 1))
         local log="$WORK/$name-$(basename "$gate" .sh).log"
         local code stop
-        # First with `S3_STOP_AT_FIRST=1`, which `s3subset` and `s3rc` take
-        # to stop at the first program that fails (the others ignore it).
+        # First with `S3_STOP_AT_FIRST=1`, which `s3subset`, `s3rc`,
+        # `objtest` and `ra_check` take to stop at the first program that
+        # fails (the fuzzers ignore it).
         # A run that stopped early and shows the symptom settles the control:
         # the full run prints the same first failure, and more. One that does
         # not is run again in full and judged on that, so an early stop can

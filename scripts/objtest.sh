@@ -26,6 +26,10 @@
 #     (`s3_macho.py lines`). The literals are the sample of instructions
 #     whose right line is known from the source alone; their count is held
 #     to a floor, so a table that maps nothing cannot pass.
+#
+# `S3_STOP_AT_FIRST=1` (the mutation controls', `scripts/s3controls.sh`)
+# stops at the first program with a problem: a planted fault needs one object
+# to show it, not the whole corpus.
 set -uo pipefail
 cd "$(dirname "$0")/.."
 GRASM=${GRASM:-./target/release/grasm}
@@ -41,6 +45,8 @@ trap 'rm -rf "$WORK"' EXIT
 s3_driver
 s3_runtime
 s3_collect
+STOP=${S3_STOP_AT_FIRST:-}
+stopped=0
 
 checked=0
 identical=0
@@ -50,6 +56,10 @@ declare -a FAILED=()
 mkdir -p "$WORK/a" "$WORK/b/deeper"
 
 for k in "${!S3_SRC[@]}"; do
+    if [ -n "$STOP" ] && [ "$problems" -gt 0 ]; then
+        stopped=1
+        break
+    fi
     [ "${S3_RULE[$k]}" = "in" ] || continue
     src=${S3_SRC[$k]}
     tir=${S3_TIR[$k]}
@@ -152,6 +162,11 @@ if [ ${#FAILED[@]} -gt 0 ]; then
     echo
     echo "FAILED:"
     printf '  %s\n' "${FAILED[@]}"
+fi
+if [ "$stopped" = 1 ]; then
+    echo
+    echo "stopped at the first failure (S3_STOP_AT_FIRST); the counts above are partial"
+    exit 1
 fi
 [ "$problems" -eq 0 ] || exit 1
 [ "$identical" -eq "$checked" ] || exit 1
