@@ -4,7 +4,7 @@
 
 <p align="center">
   <a href="https://grasm-lang.github.io"><img src="https://img.shields.io/badge/grasm--lang.github.io-visit-3DDC97?style=for-the-badge&labelColor=0A101C" alt="website"></a>
-  <img src="https://img.shields.io/badge/v1.0.0-pre--alpha-17A2A2?style=for-the-badge&labelColor=0A101C" alt="v1.0.0">
+  <img src="https://img.shields.io/badge/v1.1.0-pre--alpha-17A2A2?style=for-the-badge&labelColor=0A101C" alt="v1.1.0">
   <img src="https://img.shields.io/badge/gates-103%20green%20·%201%20red-F6AE2D?style=for-the-badge&labelColor=0A101C" alt="gates">
   <img src="https://img.shields.io/badge/GC-none-3DDC97?style=for-the-badge&labelColor=0A101C" alt="no GC">
 </p>

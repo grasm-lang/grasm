@@ -1,9 +1,5 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 360" width="1200" height="360" role="img" aria-label="Grasm — nothing happens that the code did not declare">
   <defs>
-    <linearGradient id="wm" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0" stop-color="#5BF0AE"/>
-      <stop offset="1" stop-color="#17A2A2"/>
-    </linearGradient>
     <radialGradient id="glow" cx="0.14" cy="0.08" r="0.75">
       <stop offset="0" stop-color="#3DDC97" stop-opacity="0.20"/>
       <stop offset="1" stop-color="#3DDC97" stop-opacity="0"/>
@@ -12,17 +8,19 @@
       <stop offset="0" stop-color="#3DDC97" stop-opacity="0.9"/>
       <stop offset="1" stop-color="#17A2A2" stop-opacity="0"/>
     </linearGradient>
+    <linearGradient id="logo" x1="0" y1="0" x2="287" y2="81" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#5BF0AE"/><stop offset="1" stop-color="#17A2A2"/></linearGradient>
   </defs>
 
   <rect x="0" y="0" width="1200" height="360" rx="20" fill="#0A101C"/>
   <rect x="0" y="0" width="1200" height="360" rx="20" fill="url(#glow)"/>
   <rect x="0.75" y="0.75" width="1198.5" height="358.5" rx="19.25" fill="none" stroke="#1C2838" stroke-width="1.5"/>
 
-  <g transform="translate(72,96)">
-    <path d="M12 0 0 6.9v13.8L12 27.6l12-6.9V6.9L12 0Z" fill="none" stroke="#3DDC97" stroke-width="1.8" stroke-linejoin="round" transform="translate(0,-21)"/>
-    <text x="38" y="2" font-family="ui-monospace,SFMono-Regular,Menlo,monospace" font-size="72" font-weight="700" fill="url(#wm)" letter-spacing="-2">grasm</text>
-    <rect x="266" y="-30" width="78" height="26" rx="13" fill="#132031" stroke="#24364C"/>
-    <text x="305" y="-11" text-anchor="middle" font-family="ui-monospace,SFMono-Regular,Menlo,monospace" font-size="13" fill="#7F94AB">v1.0.0</text>
+  <g transform="translate(74,40) scale(0.85)">
+    <g fill="none" stroke="url(#logo)" stroke-width="10" stroke-linecap="round" stroke-linejoin="round"><circle cx="24" cy="24" r="19"/><path d="M43 5 V57 A19 19 0 0 1 24 76 H9"/><path d="M65 43 V24 A19 19 0 0 1 84 5 H89"/><circle cx="127" cy="24" r="19"/><path d="M146 5 V43"/><path d="M196 5 H178 A9.5 9.5 0 0 0 178 24 H186 A9.5 9.5 0 0 1 186 43 H168"/><path d="M218 43 V21 A16 16 0 0 1 250 21 V43 M250 21 A16 16 0 0 1 282 21 V43"/></g>
+  </g>
+  <g font-family="ui-monospace,SFMono-Regular,Menlo,monospace">
+    <rect x="336" y="48" width="78" height="26" rx="13" fill="#132031" stroke="#24364C"/>
+    <text x="375" y="66" text-anchor="middle" font-size="13" fill="#7F94AB">v1.1.0</text>
   </g>
 
   <rect x="74" y="122" width="300" height="2" fill="url(#rule)"/>
