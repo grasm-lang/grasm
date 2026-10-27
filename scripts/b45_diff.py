@@ -673,7 +673,12 @@ while objects < 6 or range_cases[0] < 10:
 # --- compact unwind ---------------------------------------------------------------------------------------
 
 def objdump_unwind(path):
-    lines = run(["objdump", "--unwind-info", path]).decode().splitlines()
+    # `--arch=all`: without it, objdump shows a fat image's every slice only
+    # when none is the host's own architecture, and just the arm64 one when
+    # there is. Most of the system's fat binaries are x86_64 and arm64e, so
+    # they agreed; /usr/bin/trace and a few others carry arm64 too, and one
+    # drawn at random failed the gate on 2026-10-28 with every slice right.
+    lines = run(["objdump", "--unwind-info", "--arch=all", path]).decode().splitlines()
     k = next((i for i, l in enumerate(lines) if l == "Contents of __unwind_info section:"), len(lines))
     return "\n".join(lines[k:])
 
