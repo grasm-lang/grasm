@@ -157,6 +157,11 @@ pub struct Manifest {
     pub dependencies: Vec<Dependency>,
     /// Entry source file, relative to the manifest. Defaults to `src/main.gr`.
     pub entry: String,
+    /// `runtime = true`: the runtime compiled programs link, written in Grasm
+    /// (`compiler/rt`, docs/self-hosting.md §5.6). Only such a package may use
+    /// the runtime dialect ([T-RUNTIME]), and it is compiled only by the Grasm
+    /// backend: the interpreter and the Cranelift build refuse it.
+    pub runtime: bool,
     pub dir: PathBuf,
 }
 
@@ -273,6 +278,12 @@ outside that set is executed but recorded nowhere"
             }
         }
 
+        let runtime = match pkg.get("runtime") {
+            None => false,
+            Some(toml::Value::Bool(b)) => *b,
+            Some(_) => return Err("`runtime` must be `true` or `false`".into()),
+        };
+
         let mut dependencies = Vec::new();
         for (dep_name, table) in doc.subtables("dependencies") {
             let path = table.get("path").and_then(|v| v.as_str()).map(String::from);
@@ -308,7 +319,8 @@ outside that set is executed but recorded nowhere"
         // column said so. `entrypoint` for `entry` silently kept the default.
         // A key in no table at all — written above `[package]` — was ignored
         // the same way.
-        const PACKAGE_KEYS: &[&str] = &["name", "version", "capabilities", "entry", "links"];
+        const PACKAGE_KEYS: &[&str] =
+            &["name", "version", "capabilities", "entry", "links", "runtime"];
         if let Some(pkg) = doc.table("package") {
             if let Some(k) = pkg.keys().find(|k| !PACKAGE_KEYS.contains(&k.as_str())) {
                 return Err(format!(
@@ -376,6 +388,7 @@ and not a keyword"
             links,
             dependencies,
             entry,
+            runtime,
             dir: dir.to_path_buf(),
         })
     }

@@ -247,3 +247,15 @@ Map[K, i64]`, which puts the key type nowhere in its parameters, let
 parameter reaching a map only inside the body is named in no part of the
 signature at all: `fn tally[T](xs: [T]) -> i64` holding a `Map[T, i64]` let
 `tally([1.5, 2.5])` through.
+
+## spec/library.md ([L-LIB-SUM]), moved 2026-10-27
+
+This held only in the compiled backend for a long time. The interpreter decides
+int-versus-float from the elements, and an empty list has none, so an empty
+float sum was `0` under `grasm run` and `0.0` from a native binary — and a
+float method on the result panicked with `no method to_fixed on 0`, in the
+engine this specification calls normative, on the empty-average case every
+reporting program has. It was recorded here as a known deviation on the
+grounds that fixing it needed the interpreter to carry element types. It did
+not: the checker knows the sum is an `f64` and can say so, which is the same
+answer it now gives for a promoted literal ([T-INT-TO-FLOAT-CARRIED]).

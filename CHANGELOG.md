@@ -153,6 +153,14 @@ migration note here; anything `experimental` may change in any release. See
   calling thread's cell, only inside `unsafe` and under `mem` ([T-TLS]).
 - **Tuple map keys**: a key may be a tuple of key types, `Map[(str, i64),
   V]`, iterating component by component ([T-MAP-KEY], [E-MAP-ORDER]).
+- **The runtime dialect, for the runtime written in Grasm alone**
+  ([T-RUNTIME]): a package whose manifest says `runtime = true` may declare
+  process cells (`process_local`) and use `mem_process`, `mem_static`,
+  `mem_static_len`, `ctx_switch` and `ctx_init`; only the Grasm backend
+  compiles such a package, and `grasm run`, `test`, `bench` and the
+  Cranelift build refuse it. Every other package is refused each part by
+  name. The five names are now built in, so no package may declare a
+  function called one of them.
 
 ### Changed
 

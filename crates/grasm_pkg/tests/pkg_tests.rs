@@ -82,6 +82,26 @@ fn parses_a_full_manifest() {
     assert_eq!(m.dependencies[0].path.as_deref(), Some("../utils"));
 }
 
+/// `runtime = true` marks the runtime written in Grasm ([T-RUNTIME]); it is a
+/// boolean, absent means false, and nothing else is accepted for it.
+#[test]
+fn the_runtime_flag_is_a_boolean() {
+    let m = Manifest::parse(&manifest("demo", None, &[]), Path::new("/tmp")).unwrap();
+    assert!(!m.runtime);
+    let m = Manifest::parse(
+        "[package]\nname = \"rt\"\nversion = \"0.1.0\"\nruntime = true\n",
+        Path::new("/tmp"),
+    )
+    .unwrap();
+    assert!(m.runtime);
+    let e = Manifest::parse(
+        "[package]\nname = \"rt\"\nversion = \"0.1.0\"\nruntime = \"yes\"\n",
+        Path::new("/tmp"),
+    )
+    .expect_err("a string is not a boolean");
+    assert!(e.contains("`runtime` must be `true` or `false`"), "got: {e}");
+}
+
 #[test]
 fn absent_capabilities_means_unrestricted() {
     let m = Manifest::parse(&manifest("demo", None, &[]), Path::new("/tmp")).unwrap();

@@ -57,6 +57,7 @@ pub fn decl_span(d: &Decl) -> Span {
         Decl::Const(c) => c.span,
         Decl::Extern(e) => e.span,
         Decl::ThreadLocal(t) => t.span,
+        Decl::ProcessLocal(t) => t.span,
         Decl::Type(t) => t.span,
         Decl::Effect(e) => e.span,
         Decl::Test(t) => t.span,
@@ -76,6 +77,9 @@ pub enum Decl {
     Extern(ExternDecl),
     /// `thread_local POOL: addr` — a per-thread cell ([T-TLS]).
     ThreadLocal(ThreadLocalDecl),
+    /// `process_local POOL: i64` -- one cell per process, the runtime
+    /// dialect's alone ([T-RUNTIME]).
+    ProcessLocal(ProcessLocalDecl),
     Type(TypeDecl),
     Effect(EffectDecl),
     Test(TestDecl),
@@ -147,6 +151,17 @@ pub struct ExternDecl {
 /// zero at the start of each, reached only through `mem_tls(NAME)`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ThreadLocalDecl {
+    pub is_pub: bool,
+    pub name: Ident,
+    pub ty: TypeExpr,
+    pub span: Span,
+}
+
+/// A process cell ([T-RUNTIME]): one value of a layout type per process,
+/// zero at start, reached only through `mem_process(NAME)`, and declared only
+/// in a package whose manifest says `runtime = true`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProcessLocalDecl {
     pub is_pub: bool,
     pub name: Ident,
     pub ty: TypeExpr,

@@ -35,9 +35,27 @@ pub struct Program {
     /// imports the way the original load did. Dropping it re-created the
     /// bug the `deps` parameter exists to fix, one layer up.
     pub deps: HashSet<String>,
+    /// The modules of a package whose manifest says `runtime = true`, each
+    /// with that package's name: the runtime written in Grasm, and the only
+    /// code that may use the runtime dialect ([T-RUNTIME], docs/self-hosting.md
+    /// §5.6). Read from the manifests on disk, so a program loaded from
+    /// anywhere else has none.
+    pub runtime_modules: std::collections::BTreeMap<String, String>,
 }
 
 impl Program {
+    /// Why `engine` -- the interpreter, or the Cranelift build -- will not
+    /// take this program: it holds a runtime package, which only the Grasm
+    /// backend compiles ([T-RUNTIME]).
+    pub fn runtime_refusal(&self, engine: &str) -> Option<String> {
+        let pkg = self.runtime_modules.values().next()?;
+        Some(format!(
+            "package `{pkg}` is a runtime package (`runtime = true` in its grasm.toml), so \
+{engine} does not take it: the runtime written in Grasm is compiled only by the Grasm \
+backend, `s3 --runtime` ([T-RUNTIME])"
+        ))
+    }
+
     /// Which file owns a span, for diagnostic rendering.
     pub fn file_of(&self, span: Span) -> usize {
         self.files
@@ -294,6 +312,7 @@ pub fn load_with_resolved_imports(
         files,
         diagnostics,
         deps: deps.clone(),
+        runtime_modules: std::collections::BTreeMap::new(),
     }
 }
 
@@ -683,8 +702,18 @@ so `{root}`'s dependencies past that point were not resolved as package names"
     // annotation that followed it landed on nothing.
     let found: std::cell::RefCell<HashMap<String, String>> =
         std::cell::RefCell::new(HashMap::new());
+    // And which of them a runtime package holds ([T-RUNTIME]), asked of the
+    // manifest above the file itself, so a dependency answers for itself.
+    let runtime: std::cell::RefCell<std::collections::BTreeMap<String, String>> =
+        std::cell::RefCell::new(std::collections::BTreeMap::new());
+    if let Some(pkg) = entry_path.parent().and_then(runtime_package) {
+        runtime.borrow_mut().insert("main".to_string(), pkg);
+    }
     let note = |name: &str, path: &std::path::Path| {
         found.borrow_mut().insert(name.to_string(), tidy(path));
+        if let Some(pkg) = path.parent().and_then(runtime_package) {
+            runtime.borrow_mut().insert(name.to_string(), pkg);
+        }
     };
     let pkg_dirs = all_prefixes.clone();
     let entry_declares = dependency_names(&entry_src_dir);
@@ -755,7 +784,34 @@ so `{root}`'s dependencies past that point were not resolved as package names"
             f.path.clone_from(real);
         }
     }
+    program.runtime_modules = runtime.into_inner();
     Ok(program)
+}
+
+/// The name of the package holding `dir`, if its `[package]` table says
+/// `runtime = true` ([T-RUNTIME]). Read the way the rest of this file reads a
+/// manifest, line by line; `grasm_pkg` refuses any other value for the key,
+/// so a manifest this misreads does not load at all.
+fn runtime_package(dir: &std::path::Path) -> Option<String> {
+    let (_, text) = find_manifest(dir)?;
+    let mut in_package = false;
+    let mut name = String::new();
+    let mut runtime = false;
+    for raw in text.lines() {
+        let line = raw.split('#').next().unwrap_or("").trim();
+        if let Some(rest) = line.strip_prefix('[') {
+            in_package = rest.trim_end_matches(']').trim() == "package";
+            continue;
+        }
+        if let (true, Some((key, value))) = (in_package, line.split_once('=')) {
+            match key.trim() {
+                "runtime" => runtime = value.trim() == "true",
+                "name" => name = value.trim().trim_matches('"').to_string(),
+                _ => {}
+            }
+        }
+    }
+    runtime.then_some(name)
 }
 
 /// How deep a package graph may nest.

@@ -595,8 +595,10 @@ fn parse_decl(inout p: Parser, inout ev: [i64]) -> bool {
         bump(p, ev)
         return parse_fn_with_self(p, ev, is_pub, false, m, true)
     }
-    // `thread_local POOL: addr` ([T-TLS]).
-    if is_word(p, p.i, lex.W_THREAD_LOCAL) and tk(p, p.i + 1) == lex.T_IDENT and tk(p, p.i + 2) == lex.T_COLON {
+    // `thread_local POOL: addr` ([T-TLS]), and the runtime dialect's
+    // `process_local POOL: i64` ([T-RUNTIME]).
+    let process = is_word(p, p.i, lex.W_PROCESS_LOCAL)
+    if (process or is_word(p, p.i, lex.W_THREAD_LOCAL)) and tk(p, p.i + 1) == lex.T_IDENT and tk(p, p.i + 2) == lex.T_COLON {
         let s = cur_s(p, ev)
         let se = p.lx.end[p.i]
         bump(p, ev)
@@ -611,7 +613,8 @@ fn parse_decl(inout p: Parser, inout ev: [i64]) -> bool {
         if not ty.ok {
             return false
         }
-        ev_complete(p, ev, m, syn.N_THREAD_LOCAL, s.min(ty.s), se.max(ty.e))
+        let kind = if process { syn.N_PROCESS_LOCAL } else { syn.N_THREAD_LOCAL }
+        ev_complete(p, ev, m, kind, s.min(ty.s), se.max(ty.e))
         ev_set2(p, ev, m, b2i(is_pub), 0)
         return true
     }

@@ -82,7 +82,7 @@ KEYWORDS = ("fn pub let var own inout type interface impl effect with handled_by
 PUNCT = ("( ) [ ] { } , . .. ..= : :: -> => | |> && || + - * / % ^ = == != < <= > >= ! ? ?. ?? "
          "+= -= *= /= _ @").split()
 WORDS = ["x", "y", "f", "g", "xs", "Some", "None", "Ok", "Err", "self", "Self", "parallel", "spawn",
-         "region", "bench", "actor", "extern", "export", "linear", "thread_local", "requires",
+         "region", "bench", "actor", "extern", "export", "linear", "thread_local", "process_local", "requires",
          "ensures", "concurrent", "go", "i64", "str", "Point", "print", "main"]
 LITERALS = ["0", "1", "42", "0x1F", "0b101", "1.5", "2e10", "1_000", '""', '"s"', '"a{x}b"',
             '"\\n"', '"""raw"""', "18446744073709551615", "9223372036854775808"]

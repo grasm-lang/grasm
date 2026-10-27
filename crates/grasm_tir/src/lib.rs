@@ -350,6 +350,15 @@ impl<'a> Emitter<'a> {
                 };
                 Some(Node::leaf(format!("threadlocal {} {ty}", quote(&q))))
             }
+            // [T-RUNTIME]: a process cell, likewise.
+            Decl::ProcessLocal(t) => {
+                let q = format!("{module}::{}", t.name.name);
+                let ty = match self.an.c_facts.process_cells.get(&q) {
+                    Some(ty) => ty.name().to_string(),
+                    None => self.hole(t.span, "a process cell's type"),
+                };
+                Some(Node::leaf(format!("processlocal {} {ty}", quote(&q))))
+            }
             Decl::Const(c) => {
                 let q = format!("{module}::{}", c.name.name);
                 let t = match self.facts.consts.get(&q) {
@@ -1150,6 +1159,24 @@ impl<'a> Emitter<'a> {
                 kids.extend(args.iter().skip(1).map(|a| self.expr(a)));
                 kids
             }
+            // [T-RUNTIME]: a process cell and a literal's bytes are names,
+            // and are not evaluated: the literal is never a `str` value.
+            Some(MemOp::Runtime(grasm_sema::mem::RtOp::Process(_))) => {
+                match self.an.c_facts.ops.get(&key(span)) {
+                    Some(grasm_sema::mem::COp::Process { cell }) => {
+                        vec![Node::leaf(format!("processname {}", quote(cell)))]
+                    }
+                    _ => vec![Node::leaf(self.hole(span, "the process cell an address names"))],
+                }
+            }
+            Some(MemOp::Runtime(
+                grasm_sema::mem::RtOp::Static | grasm_sema::mem::RtOp::StaticLen,
+            )) => match self.an.c_facts.ops.get(&key(span)) {
+                Some(grasm_sema::mem::COp::Static { text }) => {
+                    vec![Node::leaf(format!("mstatic {}", quote(text)))]
+                }
+                _ => vec![Node::leaf(self.hole(span, "the literal a static names"))],
+            },
             _ => args.iter().map(|a| self.expr(a)).collect(),
         }
     }

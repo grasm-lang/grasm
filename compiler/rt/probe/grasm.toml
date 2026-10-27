@@ -1,0 +1,12 @@
+[package]
+name = "rtprobe"
+version = "0.1.0"
+entry = "layout.gr"
+
+# Programs that measure and exercise the Rust runtime the Grasm one is held
+# to (docs/self-hosting.md §6.7): `layout.gr` reads its values' bytes,
+# `fmtfuzz.gr` and `mathfuzz.gr` call its entry points by their C names.
+# Each is an ordinary program built by `grasm build --native`, so this is a
+# package of its own and not part of `compiler/rt`, which is a runtime
+# package the Cranelift build refuses.
+capabilities = ["io", "unsafe", "mem"]

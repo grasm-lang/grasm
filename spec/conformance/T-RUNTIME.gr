@@ -1,0 +1,32 @@
+//! tag: T-RUNTIME
+//! expect: error
+//! a process cell is the runtime's; this package is not one
+//! `mem_process` is the runtime's; this package is not one
+//! `mem_static` is the runtime's; this package is not one
+//! `mem_static_len` is the runtime's; this package is not one
+//! `ctx_switch` is the runtime's; this package is not one
+//! `ctx_init` is the runtime's; this package is not one
+// The runtime dialect belongs to the runtime written in Grasm, a package whose
+// grasm.toml says `runtime = true`. Anywhere else each part of it is refused
+// by name, even inside `unsafe` with `mem` declared: a process cell, a
+// literal's static bytes and their number, and the context switch. The
+// language every other package sees is unchanged, except that the dialect's
+// five names are built in, as every built-in's name is: a function may not
+// take one.
+process_local LIVE: i64
+
+fn dialect(a: addr) -> i64 / {unsafe, mem} {
+    unsafe {
+        let p = mem_process(LIVE)
+        let s = mem_static("out of memory")
+        ctx_switch(a, s)
+        ctx_init(a, s, s, p)
+        mem_static_len("out of memory")
+    }
+}
+
+fn main() {
+    // `process_local` is a word only before a name and a colon.
+    let process_local = 3
+    print("{process_local}")
+}

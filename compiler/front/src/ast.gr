@@ -45,6 +45,7 @@ pub let D_BENCH = 27
 pub let D_IMPORT = 28
 pub let D_INTERFACE = 29
 pub let D_IMPL = 30
+pub let D_PLS = 31
 
 pub let B_STRUCT = 35
 pub let B_SUM = 36
@@ -510,7 +511,7 @@ fn build_node(inout b: Builder, inout a: Ast, n: i64) -> i64 {
     }
     if k == syn.N_EXTERN or k == syn.N_CONST or k == syn.N_TYPE_DECL or k == syn.N_EFFECT or k == syn.N_TEST or
     k == syn.N_BENCH or k == syn.N_IMPORT or k == syn.N_INTERFACE or k == syn.N_IMPL or k == syn.N_ACTOR or
-    k == syn.N_THREAD_LOCAL or k == syn.N_IMPL_PARTIAL or k == syn.N_ACTOR_PARTIAL{
+    k == syn.N_THREAD_LOCAL or k == syn.N_IMPL_PARTIAL or k == syn.N_ACTOR_PARTIAL or k == syn.N_PROCESS_LOCAL{
         return build_decl(b, a, n)
     }
     // A node its parent reads: a list of parameters, arguments, and so on.
@@ -1021,10 +1022,11 @@ fn build_decl(inout b: Builder, inout a: Ast, n: i64) -> i64 {
         }
         return mk(a, D_EXTERN, s, e, [b.c.s2[n], name, params, ret], "")
     }
-    if k == syn.N_THREAD_LOCAL {
+    if k == syn.N_THREAD_LOCAL or k == syn.N_PROCESS_LOCAL {
         let name = ident_of_tok(b, a, nth_ident(b, n, 1))
         let ty = kid_res_types(b, n)[0]
-        return mk(a, D_TLS, s, e, [b.c.s2[n], name, ty], "")
+        let d = if k == syn.N_PROCESS_LOCAL { D_PLS } else { D_TLS }
+        return mk(a, d, s, e, [b.c.s2[n], name, ty], "")
     }
     if k == syn.N_TYPE_DECL {
         let name = ident_of_tok(b, a, ident_tok_after(b, n, lex.KW_TYPE))
@@ -2166,6 +2168,12 @@ fn print_node(inout w: Printer, a: Ast, esc: EscTable, inout out: ByteBuilder, i
         st(q, ", span: {sp} })")
     } else if k == D_TLS {
         st(q, "ThreadLocal(ThreadLocalDecl \{ is_pub: {bool_text(slot(a, id, 0))}, name: ")
+        sn(q, slot(a, id, 1))
+        st(q, ", ty: ")
+        sn(q, slot(a, id, 2))
+        st(q, ", span: {sp} })")
+    } else if k == D_PLS {
+        st(q, "ProcessLocal(ProcessLocalDecl \{ is_pub: {bool_text(slot(a, id, 0))}, name: ")
         sn(q, slot(a, id, 1))
         st(q, ", ty: ")
         sn(q, slot(a, id, 2))

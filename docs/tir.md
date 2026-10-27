@@ -46,7 +46,7 @@ program
   externs  : [externdef]
   fns      : [fndef]        -- functions, impl methods, contract functions
   exports  : [fn id]        -- each `export fn`, printed right after its fn
-  cells    : [celldef]      -- each `thread_local`, in source order with the rest
+  cells    : [celldef]      -- each `thread_local` and `process_local`, in source order with the rest
   impls    : [impldef]      -- (interface, type) -> fn ids
   tests    : [testdef]
   benches  : [benchdef]
@@ -96,6 +96,7 @@ param     = mode (let | inout | own), var id, type
 constdef  = qualified name, type, init expr
 externdef = name, params, ret
 celldef   = qualified name, layout type        -- printed (threadlocal "m::C" u16)
+                                                --      or (processlocal "m::C" i64)
 effectdef = name, ops [(name, params, ret)]   -- printed (op name (params) ret)
 impldef   = interface name, type (as written), generics, [(method name, fn id)]
 testdef   = name, params, body
@@ -171,7 +172,16 @@ argument, is `(order acquire)` with its span (`relaxed`, `acquire`,
 [L-LIB-CALL-C], [T-TLS]): the function `mem_fn_addr` takes is `(fnname "module::f")`,
 the signature that is `call_c`'s first argument is `(sig (i64 str) i64)`,
 `unit` for no result, and the cell `mem_tls` takes is
-`(tlsname "module::C")`. A consumer must not evaluate any of them. Every other
+`(tlsname "module::C")`. A consumer must not evaluate any of them.
+
+The runtime dialect ([T-RUNTIME], docs/self-hosting.md §5.6), which only a
+package whose manifest says `runtime = true` may use, adds two more names and
+no new node: the cell `mem_process` takes is `(processname "module::C")`, and
+the literal `mem_static` and `mem_static_len` take is `(mstatic "text")`, its
+text JSON-escaped -- never a `str` value, since the runtime makes those.
+`ctx_switch` and `ctx_init` are ordinary `builtin` nodes over addresses. A
+runtime package's TIR is consumed only by the Grasm backend, built with
+`--runtime`; nothing in the corpus can contain these forms. Every other
 raw-memory operation is an ordinary `builtin` (`mem_alloc`, ...) or `method`
 (`offset`, `load_u8`, `atomic_cas_i64`, `call_c`, ...) node. A `method` node
 is a raw-memory one exactly when its receiver's type is `addr`, since an

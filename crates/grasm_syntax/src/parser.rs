@@ -638,9 +638,10 @@ impl Parser {
             f.is_export = true;
             return Ok(Decl::Fn(f));
         }
-        // `thread_local POOL: addr` ([T-TLS]): a word only before a name and
-        // a colon, as `linear` is before `type`.
-        let cell = matches!(self.cur(), TokenKind::Ident(n) if n == "thread_local")
+        // `thread_local POOL: addr` ([T-TLS]), and the runtime dialect's
+        // `process_local POOL: i64` ([T-RUNTIME]): each a word only before a
+        // name and a colon, as `linear` is before `type`.
+        let cell = matches!(self.cur(), TokenKind::Ident(n) if n == "thread_local" || n == "process_local")
             && matches!(
                 self.toks.get(self.i + 1).map(|t| &t.kind),
                 Some(TokenKind::Ident(_))
@@ -650,12 +651,21 @@ impl Parser {
                 Some(TokenKind::Colon)
             );
         if cell {
+            let process = matches!(self.cur(), TokenKind::Ident(n) if n == "process_local");
             let start = self.cur_span();
             self.bump();
             let name = self.ident()?;
             self.expect(&TokenKind::Colon)?;
             let ty = self.parse_type()?;
             let span = start.merge(ty.span());
+            if process {
+                return Ok(Decl::ProcessLocal(ProcessLocalDecl {
+                    is_pub,
+                    name,
+                    ty,
+                    span,
+                }));
+            }
             return Ok(Decl::ThreadLocal(ThreadLocalDecl {
                 is_pub,
                 name,

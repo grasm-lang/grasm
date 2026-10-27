@@ -153,16 +153,6 @@ this method is for taking an element out of the middle.
 **[L-LIB-SUM]** `xs.sum()` of an empty list is the zero of the element type:
 `0` for `[i64]`, `0.0` for `[f64]`.
 
-This held only in the compiled backend for a long time. The interpreter decides
-int-versus-float from the elements, and an empty list has none, so an empty
-float sum was `0` under `grasm run` and `0.0` from a native binary — and a
-float method on the result panicked with `no method to_fixed on 0`, in the
-engine this specification calls normative, on the empty-average case every
-reporting program has. It was recorded here as a known deviation on the
-grounds that fixing it needed the interpreter to carry element types. It did
-not: the checker knows the sum is an `f64` and can say so, which is the same
-answer it now gives for a promoted literal ([T-INT-TO-FLOAT-CARRIED]).
-
 **[L-LIB-CMP]** `a.cmp(b)` answers `-1`, `0` or `1` in exactly the order
 `sort` uses — [L-LIB-SORT-NAN]'s total order for floats included. It exists
 because that order was specified, used internally, and callable by nothing: a
@@ -868,6 +858,7 @@ it is aligned (1, 2, 4 or 8 bytes); memory is little-endian.
 | `a.as_i64()` | `-> i64` | its integer: `mem_addr(a.as_i64()) == a` |
 | `a.load_T()`, `a.store_T(v)` | `-> T`, `(T)` | the `T` at `a`; puts `v` there |
 | `mem_tls(C)` | `-> addr` | the calling thread's cell `C`, written as a name ([T-TLS]) |
+| `mem_process`, `mem_static`, `mem_static_len`, `ctx_switch`, `ctx_init` | | a runtime package's alone ([T-RUNTIME]) |
 
 `mem_alloc` panics on a negative size, an alignment that is not a power of two
 from 1 to 4096, a size past 2^40, and a request the system cannot meet; zero

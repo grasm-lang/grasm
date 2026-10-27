@@ -278,6 +278,7 @@ pub let W_LINEAR = 11
 pub let W_SELF = 12
 pub let W_REQUIRES = 13
 pub let W_ENSURES = 14
+pub let W_PROCESS_LOCAL = 15
 
 /// Keywords by text, as their kind, and contextual words as 100 + code:
 /// one hash per identifier rather than a comparison per keyword.
@@ -300,6 +301,7 @@ fn word_table() -> Map[str, i64] {
     m.set("self", 112)
     m.set("requires", 113)
     m.set("ensures", 114)
+    m.set("process_local", 115)
     m
 }
 

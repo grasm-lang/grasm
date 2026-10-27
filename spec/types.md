@@ -1018,6 +1018,18 @@ cannot reach a cell, and Grasm starts a thread only for work that performs
 nothing ([T-PAR-MAP-PURE]), so two threads meet in one only through C. The
 tasks of a thread share its cells.
 
+**[T-RUNTIME]** Only a package whose `grasm.toml` says `runtime = true`, the
+runtime written in Grasm, may use these; each is refused by name elsewhere:
+`process_local C: T`, a [T-TLS] cell but one per process, reached by
+`mem_process(C)`; `mem_static("text")`, the address of a literal's read-only,
+NUL-terminated bytes, and `mem_static_len("text")`, their number;
+`ctx_switch(from, to)`, saving the calling context at `from` and resuming `to`;
+`ctx_init(ctx, top, entry, arg)`, a context whose first resumption calls
+`entry(arg)` below `top`. Each is a raw-memory operation ([T-MEM-UNSAFE]) whose
+cell or literal is a name. Only the Grasm backend compiles such a package. Every
+access to a process cell is atomic or under a lock; the runtime's lint refuses
+any other.
+
 **[T-MODULE-NS]** Functions are per-module; types and effects share one global
 namespace, so a type name may not be declared twice across a program — and an
 *effect* is one of the things that claims a name, two of them in fact: `effect

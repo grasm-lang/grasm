@@ -3881,6 +3881,13 @@ fn every_effectful_builtin_is_named_in_conformance() {
         .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
     let mut absent = Vec::new();
     for b in grasm_sema::builtins::effectful() {
+        // The runtime dialect cannot be named outside a runtime package
+        // ([T-RUNTIME]), and a conformance program is not one: its `mem` is
+        // held to the row by `the_runtime_dialect_is_a_runtime_package_s_alone`
+        // in the CLI tests, which builds such a package.
+        if grasm_sema::mem::RtOp::of(b.name).is_some() {
+            continue;
+        }
         if !src.contains(b.name) {
             absent.push(b.name);
         }

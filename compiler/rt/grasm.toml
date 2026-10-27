@@ -8,3 +8,9 @@ entry = "src/main.gr"
 # the backends call -- `export fn` -- over raw memory, and it calls the C
 # library and, for what has not moved yet, the Rust runtime by `extern fn`.
 capabilities = ["io", "unsafe", "mem"]
+
+# The one runtime package ([T-RUNTIME], docs/self-hosting.md §5.6): it alone
+# may use process cells, static bytes, its own thread-local variables and the
+# context switch, and only the Grasm backend (`s3 --runtime`) compiles it --
+# the interpreter and the Cranelift build refuse it by name.
+runtime = true

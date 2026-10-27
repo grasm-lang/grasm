@@ -348,6 +348,11 @@ pub const BUILTIN_FREE_FNS: &[&str] = &[
     "mem_align_of",
     "mem_fn_addr",
     "mem_tls",
+    "mem_process",
+    "mem_static",
+    "mem_static_len",
+    "ctx_switch",
+    "ctx_init",
     "read_bytes",
     "read_bytes_at",
     "append_bytes",
@@ -397,7 +402,12 @@ pub fn check_program(program: &crate::loader::Program) -> Analysis {
             imports: f.imports.clone(),
         })
         .collect();
-    check_modules_in(&files, &program.deps.iter().cloned().collect(), false)
+    check_modules_in(
+        &files,
+        &program.deps.iter().cloned().collect(),
+        false,
+        &program.runtime_modules,
+    )
 }
 
 /// [`check_program`], recording every decision TIR needs
@@ -413,11 +423,21 @@ pub fn check_program_tir(program: &crate::loader::Program) -> Analysis {
             imports: f.imports.clone(),
         })
         .collect();
-    check_modules_in(&files, &program.deps.iter().cloned().collect(), true)
+    check_modules_in(
+        &files,
+        &program.deps.iter().cloned().collect(),
+        true,
+        &program.runtime_modules,
+    )
 }
 
 fn check_modules(files: &[ModuleView]) -> Analysis {
-    check_modules_in(files, &std::collections::BTreeSet::new(), false)
+    check_modules_in(
+        files,
+        &std::collections::BTreeSet::new(),
+        false,
+        &std::collections::BTreeMap::new(),
+    )
 }
 
 /// `check_modules`, told which module names are dependency packages.
@@ -432,9 +452,11 @@ fn check_modules_in(
     files: &[ModuleView],
     packages: &std::collections::BTreeSet<String>,
     record_tir: bool,
+    runtime: &std::collections::BTreeMap<String, String>,
 ) -> Analysis {
     let mut c = Checker::new();
     c.record_tir = record_tir;
+    c.runtime_modules = runtime.keys().cloned().collect();
     // The effect fixpoint runs first: a function's row is part of its type,
     // and nothing can be typed until the rows are known ([T-FN-TYPE-ROW]).
     let (rows, closure_rows) = crate::effects::rows_and_closures(files);
@@ -501,6 +523,7 @@ fn check_modules_in(
     for f in files {
         c.current_module = f.name.clone();
         c.collect_thread_locals(f.module);
+        c.collect_process_locals(f.module);
     }
     for f in files {
         c.current_module = f.name.clone();
@@ -917,6 +940,9 @@ struct Checker {
     uni: Unifier,
     diags: Vec<Diagnostic>,
     current_module: String,
+    /// The modules of a runtime package ([T-RUNTIME]): the only ones that
+    /// may use the runtime dialect.
+    runtime_modules: std::collections::HashSet<String>,
     /// Type parameters that reach a map key inside a generic function's own
     /// body, by qualified function name.
     ///
@@ -1231,6 +1257,7 @@ impl Checker {
             uni: Unifier::new(),
             diags: Vec::new(),
             current_module: "main".to_string(),
+            runtime_modules: std::collections::HashSet::new(),
             key_generics: HashMap::new(),
             par_generics: HashMap::new(),
             pending_par_checks: Vec::new(),
@@ -4460,6 +4487,163 @@ or addr -- and never a value the runtime counts ([T-TLS])",
         }
     }
 
+    /// Whether the module being checked is in a runtime package
+    /// ([T-RUNTIME]); if not, says that `what` is the runtime's.
+    fn runtime_only(&mut self, at: Span, what: &str) -> bool {
+        if self.runtime_modules.contains(&self.current_module) {
+            return true;
+        }
+        self.error_help(
+            at,
+            format!("{what} is the runtime's; this package is not one"),
+            "the runtime dialect -- process cells, static bytes and the context switch -- \
+belongs to the runtime written in Grasm alone, a package whose grasm.toml says `runtime = \
+true`; every other package keeps the language as it is ([T-RUNTIME])",
+        );
+        false
+    }
+
+    /// `process_local NAME: T` ([T-RUNTIME]): a layout type, one per process,
+    /// private to the module, declared only in a runtime package.
+    fn collect_process_locals(&mut self, module: &Module) {
+        for decl in &module.decls {
+            let Decl::ProcessLocal(t) = decl else { continue };
+            if !self.runtime_only(t.span, "a process cell") {
+                continue;
+            }
+            let key = format!("{}::{}", self.current_module, t.name.name);
+            if self.fns.contains_key(&key)
+                || self.consts.contains_key(&key)
+                || self.c_facts.cells.contains_key(&key)
+                || self.c_facts.process_cells.contains_key(&key)
+            {
+                self.error(t.name.span, format!("duplicate name `{}`", t.name.name));
+                continue;
+            }
+            if t.is_pub {
+                self.error_help(
+                    t.name.span,
+                    format!("process cell `{}` cannot be `pub`", t.name.name),
+                    "a cell is private to its module; hand out its address from a `pub fn` \
+whose body is `unsafe`",
+                );
+            }
+            let ty = self.resolve_type(&t.ty, &[]);
+            if matches!(ty, Type::Error) {
+                continue;
+            }
+            match crate::mem::MemTy::of(&ty) {
+                Some(m) => {
+                    self.c_facts.process_cells.insert(key, m);
+                }
+                None => {
+                    let shown = self.show(&ty);
+                    self.error_help(
+                        t.ty.span(),
+                        format!("a process cell cannot hold `{shown}`"),
+                        "a cell holds a layout type -- i8, i16, i32, i64, u8, u16, u32, u64, f64 \
+or addr -- and never a value the runtime counts ([T-RUNTIME])",
+                    );
+                }
+            }
+        }
+    }
+
+    /// The runtime dialect's free functions ([T-RUNTIME]): refused by name
+    /// outside a runtime package, and inside one raw-memory operations
+    /// ([T-MEM-UNSAFE]) like the rest.
+    fn check_runtime_fn(&mut self, id: &Ident, args: &[Expr], span: Span) -> Type {
+        use crate::mem::{MemOp, RtOp};
+        let Some(op) = RtOp::of(&id.name) else {
+            return Type::Error;
+        };
+        if !self.runtime_only(id.span, &format!("`{}`", id.name)) {
+            return Type::Error;
+        }
+        self.require_unsafe_mem(&id.name, id.span);
+        let want = match op {
+            RtOp::CtxSwitch => 2,
+            RtOp::CtxInit => 4,
+            _ => 1,
+        };
+        if args.len() != want {
+            return self.error(
+                span,
+                format!("`{}` takes {want} argument(s), got {}", id.name, args.len()),
+            );
+        }
+        let (op, ret) = match op {
+            RtOp::Process(_) => {
+                let Some((cell, t)) = self.process_cell(&args[0]) else {
+                    return Type::Error;
+                };
+                self.c_facts
+                    .ops
+                    .insert((span.start, span.end), crate::mem::COp::Process { cell });
+                (RtOp::Process(t), Type::Addr)
+            }
+            RtOp::Static | RtOp::StaticLen => {
+                let text = match &args[0] {
+                    Expr::Str(pieces, _) => pieces
+                        .iter()
+                        .map(|p| match p {
+                            grasm_syntax::ast::StrPiece::Text(t) => Some(t.as_str()),
+                            grasm_syntax::ast::StrPiece::Expr(_) => None,
+                        })
+                        .collect::<Option<String>>(),
+                    _ => None,
+                };
+                let Some(text) = text else {
+                    return self.error_help(
+                        args[0].span(),
+                        format!("`{}` takes a string literal", id.name),
+                        "its bytes are fixed when the runtime is compiled, so the text is \
+written at the call, with no interpolation, and is never a value ([T-RUNTIME])",
+                    );
+                };
+                self.c_facts
+                    .ops
+                    .insert((span.start, span.end), crate::mem::COp::Static { text });
+                if op == RtOp::Static {
+                    (op, Type::Addr)
+                } else {
+                    (op, Type::I64)
+                }
+            }
+            RtOp::CtxSwitch | RtOp::CtxInit => {
+                for a in args {
+                    self.check_expr(a, &Type::Addr);
+                }
+                (op, Type::Unit)
+            }
+        };
+        self.mem_ops
+            .insert((span.start, span.end), MemOp::Runtime(op));
+        ret
+    }
+
+    /// The cell `mem_process`'s argument names ([T-RUNTIME]), as `tls_cell`
+    /// reads `mem_tls`'s.
+    fn process_cell(&mut self, arg: &Expr) -> Option<(String, crate::mem::MemTy)> {
+        let found = match arg {
+            Expr::Ident(id) if self.lookup(&id.name).is_none() => {
+                let key = format!("{}::{}", self.current_module, id.name);
+                self.c_facts.process_cells.get(&key).map(|t| (key, *t))
+            }
+            _ => None,
+        };
+        if found.is_none() {
+            self.error_help(
+                arg.span(),
+                "`mem_process` takes the name of a `process_local` cell this module declares"
+                    .to_string(),
+                "declare one with `process_local NAME: T`; a cell is private to its module, so \
+another module is handed its address by a function ([T-RUNTIME])",
+            );
+        }
+        found
+    }
+
     /// The function `mem_fn_addr`'s argument names ([T-FN-ADDR]): written as
     /// a name, `f` or `module.f`, and never evaluated. A Grasm function must
     /// have a signature C can call; a C function already has one.
@@ -6904,6 +7088,11 @@ only a number or a `bool` can come out — compute what you need and yield that"
                     "mem_alloc" | "mem_free" | "mem_addr" | "mem_size_of" | "mem_align_of"
                     | "mem_fn_addr" | "mem_tls" => {
                         return self.check_mem_fn(id, args, span);
+                    }
+                    // The runtime dialect ([T-RUNTIME]).
+                    "mem_process" | "mem_static" | "mem_static_len" | "ctx_switch"
+                    | "ctx_init" => {
+                        return self.check_runtime_fn(id, args, span);
                     }
                     // [L-LIB-BUILDER]: an empty one of each.
                     "str_builder" | "byte_builder" => {

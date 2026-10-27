@@ -2971,3 +2971,108 @@ fn a_cell_is_private_to_its_module() {
     let (code, text) = run(&["run", main.to_str().unwrap()]);
     assert_eq!((code, text.trim()), (0, "5"), "{text}");
 }
+
+const RUNTIME_MANIFEST: &str = "[package]\nname = \"rtpkg\"\nversion = \"0.1.0\"\nruntime = true\ncapabilities = [\"unsafe\", \"mem\"]\n";
+
+/// The runtime dialect ([T-RUNTIME]) checks in a package that says
+/// `runtime = true`, prints its TIR forms, and is refused by name by both
+/// engines that are not the Grasm backend. The same source in a package
+/// without the flag is refused part by part.
+#[test]
+fn the_runtime_dialect_is_a_runtime_package_s_alone() {
+    let w = Work::new("runtime_dialect");
+    let src = "process_local LIVE: i64\nthread_local POOL: addr\n\nexport fn grt_bump() -> i64 {\n    unsafe {\n        let a = mem_process(LIVE)\n        a.atomic_add_i64(1, SeqCst)\n        let s = mem_static(\"no \\\"room\\\"\\n\")\n        ctx_switch(a, mem_tls(POOL))\n        ctx_init(a, s, s, a)\n        mem_static_len(\"no \\\"room\\\"\\n\") + a.atomic_load_i64(SeqCst)\n    }\n}\n\nfn main() {\n}\n";
+    let dir = w.package("rtpkg", RUNTIME_MANIFEST, src);
+    let entry = app_entry(&dir);
+    let (code, text) = run(&["check", &entry]);
+    assert_eq!(code, 0, "{text}");
+    let (code, tir) = run(&["tir", &entry]);
+    assert_eq!(code, 0, "{tir}");
+    for form in [
+        "(processlocal \"main::LIVE\" i64)",
+        "(threadlocal \"main::POOL\" addr)",
+        "\"mem_process\"\n            (processname \"main::LIVE\")",
+        "(mstatic \"no \\\"room\\\"\\n\")",
+        "\"ctx_switch\"",
+        "\"ctx_init\"",
+        "(builtin i64 @",
+    ] {
+        assert!(tir.contains(form), "no `{form}` in:\n{tir}");
+    }
+    let (code, text) = run(&["run", &entry]);
+    assert_eq!(code, 1, "{text}");
+    assert!(
+        text.contains("package `rtpkg` is a runtime package (`runtime = true` in its grasm.toml), so the interpreter does not take it"),
+        "{text}"
+    );
+    let out = w.0.join("rt.bin");
+    let (code, text) = run(&["build", &entry, "--native", "-o", out.to_str().unwrap()]);
+    assert_eq!(code, 1, "{text}");
+    assert!(
+        text.contains("package `rtpkg` is a runtime package (`runtime = true` in its grasm.toml), so the Cranelift build does not take it"),
+        "{text}"
+    );
+
+    let plain = w.package(
+        "plain",
+        "[package]\nname = \"plain\"\nversion = \"0.1.0\"\ncapabilities = [\"unsafe\", \"mem\"]\n",
+        src,
+    );
+    let (code, text) = run(&["check", &app_entry(&plain)]);
+    assert_eq!(code, 1, "{text}");
+    for what in [
+        "a process cell",
+        "`mem_process`",
+        "`mem_static`",
+        "`mem_static_len`",
+        "`ctx_switch`",
+        "`ctx_init`",
+    ] {
+        assert!(
+            text.contains(&format!("{what} is the runtime's; this package is not one")),
+            "{what}: {text}"
+        );
+    }
+
+    // Inside a runtime package the dialect keeps raw memory's rules, and a
+    // process cell [T-TLS]'s.
+    for (bad, said) in [
+        ("process_local A: str\n", "a process cell cannot hold `str`"),
+        ("pub process_local A: i64\n", "process cell `A` cannot be `pub`"),
+        ("process_local A: i64\nthread_local A: u8\n", "duplicate name `A`"),
+        (
+            "process_local A: i64\n\nfn f() -> addr {\n    mem_process(A)\n}\n",
+            "`mem_process` reaches raw memory, so it can only be used inside `unsafe`",
+        ),
+        (
+            "fn f() -> addr / {unsafe, mem} {\n    unsafe {\n        mem_process(B)\n    }\n}\n",
+            "`mem_process` takes the name of a `process_local` cell this module declares",
+        ),
+        (
+            "fn f(s: str) -> addr / {unsafe, mem} {\n    unsafe {\n        mem_static(s)\n    }\n}\n",
+            "`mem_static` takes a string literal",
+        ),
+        (
+            "fn f(n: i64) -> i64 / {unsafe, mem} {\n    unsafe {\n        mem_static_len(\"n = {n}\")\n    }\n}\n",
+            "`mem_static_len` takes a string literal",
+        ),
+        (
+            "fn f(a: addr) / {unsafe, mem} {\n    unsafe {\n        ctx_switch(a, 1)\n    }\n}\n",
+            "expected `addr`",
+        ),
+        // Each is charged `mem`, as every raw-memory operation is.
+        (
+            "fn f() -> i64 / {unsafe} {\n    unsafe {\n        mem_static_len(\"x\")\n    }\n}\n",
+            "function `f` performs effect(s) `mem` not in its declared row",
+        ),
+        (
+            "fn f(a: addr) / {unsafe} {\n    unsafe {\n        ctx_switch(a, a)\n        ctx_init(a, a, a, a)\n    }\n}\n",
+            "function `f` performs effect(s) `mem` not in its declared row",
+        ),
+    ] {
+        std::fs::write(dir.join("src/main.gr"), bad).unwrap();
+        let (code, text) = run(&["check", &entry]);
+        assert_eq!(code, 1, "{bad}: {text}");
+        assert!(text.contains(said), "{bad}: wanted `{said}` in {text}");
+    }
+}

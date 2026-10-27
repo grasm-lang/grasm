@@ -7,7 +7,7 @@ before it is listed as stable.
 `crates/grasm_spec` fails if a clause here is missing, unknown, or listed twice,
 so this file cannot drift away from the specification it describes.
 
-Today: 167 stable, 25 provisional, 82 experimental, of 274.
+Today: 167 stable, 25 provisional, 83 experimental, of 275.
 
 ## Stable
 
@@ -266,6 +266,7 @@ May change or be removed in any release. New surface starts here.
 - `T-EXPORT` — experimental
 - `L-LIB-CALL-C` — experimental
 - `T-TLS` — experimental
+- `T-RUNTIME` — experimental
 - `L-LIB-EPRINT` — experimental
 - `L-LIB-FS` — experimental
 - `L-LIB-NET` — experimental

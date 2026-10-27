@@ -120,6 +120,11 @@ control error-dropped 'NOT LOSSLESS' scripts/asttest.sh cst.gr \
                     pending.push(id)
                 }
                 open.push(id)'
+# The runtime dialect's declaration ([T-RUNTIME]) read as a thread-local
+# cell: spec/conformance/T-RUNTIME.gr declares one, so the AST differs.
+control process-as-tls 'MISMATCH' scripts/asttest.sh ast.gr \
+    '        let d = if k == syn.N_PROCESS_LOCAL { D_PLS } else { D_TLS }' \
+    '        let d = D_TLS'
 control diag-span 'differ: [1-9]' scripts/parsediag.sh parse.gr \
     '    let s = cur_s(p, ev)
     let e = p.lx.end[p.i]
@@ -150,4 +155,4 @@ echo "controls: $ran   caught: $caught   missed: $missed"
 if [ ${#MISSED[@]} -gt 0 ]; then
     printf '  %s\n' "${MISSED[@]}"
 fi
-[ "$missed" -eq 0 ] && [ "$caught" -eq 7 ]
+[ "$missed" -eq 0 ] && [ "$caught" -eq "$ran" ] && [ "$ran" -ge 8 ]

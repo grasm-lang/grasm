@@ -209,6 +209,40 @@ pub enum MemOp {
     /// `mem_tls(C)` ([T-TLS]), a cell of this layout type; which cell is in
     /// [`CFacts::ops`].
     Tls(MemTy),
+    /// One of the runtime dialect's operations ([T-RUNTIME]), usable only in
+    /// a runtime package and compiled only by the Grasm backend.
+    Runtime(RtOp),
+}
+
+/// The runtime dialect's operations ([T-RUNTIME], docs/self-hosting.md §5.6).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RtOp {
+    /// `mem_process(C)`, a process cell of this layout type; which cell is in
+    /// [`CFacts::ops`].
+    Process(MemTy),
+    /// `mem_static("text")`: the address of the literal's bytes; which
+    /// literal is in [`CFacts::ops`].
+    Static,
+    /// `mem_static_len("text")`: their number.
+    StaticLen,
+    /// `ctx_switch(from, to)`.
+    CtxSwitch,
+    /// `ctx_init(ctx, stack_top, entry, arg)`.
+    CtxInit,
+}
+
+impl RtOp {
+    /// The dialect's free functions, by name.
+    pub fn of(name: &str) -> Option<RtOp> {
+        Some(match name {
+            "mem_process" => RtOp::Process(MemTy::I64),
+            "mem_static" => RtOp::Static,
+            "mem_static_len" => RtOp::StaticLen,
+            "ctx_switch" => RtOp::CtxSwitch,
+            "ctx_init" => RtOp::CtxInit,
+            _ => return None,
+        })
+    }
 }
 
 /// What a method name on an `addr` asks for, before its ordering (if any) is
@@ -261,6 +295,11 @@ pub const FREE_FNS: &[&str] = &[
     "mem_align_of",
     "mem_fn_addr",
     "mem_tls",
+    "mem_process",
+    "mem_static",
+    "mem_static_len",
+    "ctx_switch",
+    "ctx_init",
 ];
 
 /// The largest alignment `mem_alloc` takes: a page, which is the most any
@@ -316,6 +355,10 @@ pub enum COp {
     CallC(CSig),
     /// `mem_tls(C)`: the cell, qualified.
     Tls { cell: String },
+    /// `mem_process(C)`: the process cell, qualified ([T-RUNTIME]).
+    Process { cell: String },
+    /// `mem_static("..")` and `mem_static_len("..")`: the literal's text.
+    Static { text: String },
 }
 
 /// Everything the engines need about the C boundary and per-thread cells,
@@ -333,6 +376,9 @@ pub struct CFacts {
     pub addressed: std::collections::BTreeSet<String>,
     /// Every `thread_local` cell, qualified, and its layout type ([T-TLS]).
     pub cells: std::collections::BTreeMap<String, MemTy>,
+    /// Every `process_local` cell, qualified, and its layout type
+    /// ([T-RUNTIME]).
+    pub process_cells: std::collections::BTreeMap<String, MemTy>,
 }
 
 impl CFacts {

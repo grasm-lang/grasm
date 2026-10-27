@@ -460,6 +460,34 @@ pub const BUILTINS: &[Builtin] = &[
         row: MEM_ROW,
         journal: Journal::Untouched,
     },
+    // The runtime dialect ([T-RUNTIME]): a process cell, a literal's bytes
+    // and their number, and the context switch. Refused outside a runtime
+    // package by the checker; raw-memory operations inside one.
+    Builtin {
+        name: "mem_process",
+        row: MEM_ROW,
+        journal: Journal::Untouched,
+    },
+    Builtin {
+        name: "mem_static",
+        row: MEM_ROW,
+        journal: Journal::Untouched,
+    },
+    Builtin {
+        name: "mem_static_len",
+        row: MEM_ROW,
+        journal: Journal::Untouched,
+    },
+    Builtin {
+        name: "ctx_switch",
+        row: MEM_ROW,
+        journal: Journal::Untouched,
+    },
+    Builtin {
+        name: "ctx_init",
+        row: MEM_ROW,
+        journal: Journal::Untouched,
+    },
     Builtin {
         name: "exit",
         row: PURE,

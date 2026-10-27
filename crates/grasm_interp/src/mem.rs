@@ -81,6 +81,7 @@ impl Heap {
             MemOp::FnAddr | MemOp::CallC | MemOp::Tls(_) => {
                 unreachable!("run by the interpreter itself")
             }
+            MemOp::Runtime(_) => Err("the runtime dialect is only compiled ([T-RUNTIME])".into()),
             MemOp::Atomic(op, t, _) => {
                 let what = format!("atomic_{}_{}", op.name(), t.name());
                 match op {

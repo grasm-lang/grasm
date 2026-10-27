@@ -419,6 +419,9 @@ fn compile_object_scoped(
     target: Option<&str>,
     only_module: Option<&str>,
 ) -> Result<(), String> {
+    if let Some(why) = program.runtime_refusal("the Cranelift build") {
+        return Err(why);
+    }
     let mut flags = settings::builder();
     flags.set("is_pic", "true").map_err(|e| e.to_string())?;
     flags.set("opt_level", "speed").map_err(|e| e.to_string())?;
@@ -2250,6 +2253,7 @@ arguments nor the type this is bound to",
                 | Decl::Effect(_)
                 | Decl::Interface(_)
                 | Decl::ThreadLocal(_)
+                | Decl::ProcessLocal(_)
                 | Decl::Impl(_) => {}
             }
         }
@@ -14461,6 +14465,8 @@ this case",
             (MemOp::FnAddr, _) => return self.fn_addr(span),
             (MemOp::CallC, Some(r)) => return self.call_c(r, args, span),
             (MemOp::Tls(_), _) => return self.tls_addr(span),
+            // Refused with its package ([T-RUNTIME]); never reached.
+            (MemOp::Runtime(_), _) => return nope(span, "the runtime dialect"),
             _ => {}
         }
         let at = match recv {
@@ -14504,7 +14510,7 @@ this case",
                 return Ok(None);
             }
             MemOp::FromInt | MemOp::ToInt => (at, VType::I64),
-            MemOp::FnAddr | MemOp::CallC | MemOp::Tls(_) => {
+            MemOp::FnAddr | MemOp::CallC | MemOp::Tls(_) | MemOp::Runtime(_) => {
                 return nope(span, "a function address or a cell here")
             }
             MemOp::Size(t) | MemOp::Align(t) => {

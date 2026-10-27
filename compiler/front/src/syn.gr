@@ -29,6 +29,8 @@ pub let N_THREAD_LOCAL = 21
 // those methods reach the module all the same (parse.gr, `lowered`).
 pub let N_IMPL_PARTIAL = 22
 pub let N_ACTOR_PARTIAL = 23
+// `process_local POOL: i64`, the runtime dialect's ([T-RUNTIME]).
+pub let N_PROCESS_LOCAL = 24
 
 // Pieces of declarations.
 pub let N_GENERICS = 30
@@ -176,6 +178,7 @@ pub fn node_name(k: i64) -> str {
         21 -> "THREAD_LOCAL"
         22 -> "IMPL_PARTIAL"
         23 -> "ACTOR_PARTIAL"
+        24 -> "PROCESS_LOCAL"
         30 -> "GENERICS"
         31 -> "GENERIC"
         32 -> "PARAMS"

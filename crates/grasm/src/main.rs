@@ -222,7 +222,7 @@ fn run() -> ExitCode {
                 .skip(1)
                 .cloned()
                 .collect();
-            let program = match load_and_check(path) {
+            let program = match load_to_run(path, "the interpreter") {
                 Ok(p) => p,
                 Err(code) => return code,
             };
@@ -257,7 +257,7 @@ fn run() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
-            let program = match load_and_check(&path) {
+            let program = match load_to_run(&path, "the interpreter") {
                 Ok(p) => p,
                 Err(code) => return code,
             };
@@ -279,7 +279,7 @@ fn run() -> ExitCode {
                 return ExitCode::FAILURE;
             };
             let filter = flag_value(&args[1..], "--filter").unwrap_or_default();
-            let program = match load_and_check(&path) {
+            let program = match load_to_run(&path, "the interpreter") {
                 Ok(p) => p,
                 Err(code) => return code,
             };
@@ -484,6 +484,15 @@ fn run() -> ExitCode {
                     )
             }) {
                 eprintln!("error: no `main` function");
+                return ExitCode::FAILURE;
+            }
+            let engine = if args.iter().any(|a| a == "--native") {
+                "the Cranelift build"
+            } else {
+                "the interpreter"
+            };
+            if let Some(why) = program.runtime_refusal(engine) {
+                eprintln!("error: {why}");
                 return ExitCode::FAILURE;
             }
             // One `.gr` holding the whole program, for an embedder that cannot
@@ -1303,6 +1312,18 @@ fn imports_used_for_types(entry: &std::path::Path, src: &str) -> Vec<String> {
         }
     }
     used
+}
+
+/// [`load_and_check`], for a command that runs the program on `engine`: a
+/// runtime package is the Grasm backend's alone, and is refused by name
+/// ([T-RUNTIME]).
+fn load_to_run(path: &str, engine: &str) -> Result<Program, ExitCode> {
+    let program = load_and_check(path)?;
+    if let Some(why) = program.runtime_refusal(engine) {
+        eprintln!("error: {why}");
+        return Err(ExitCode::FAILURE);
+    }
+    Ok(program)
 }
 
 /// Load (following imports), typecheck, render diagnostics per file.
