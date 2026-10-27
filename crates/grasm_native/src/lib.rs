@@ -14230,7 +14230,11 @@ this case",
         //
         // Only when no *other* argument mentions the parameter's name: binding
         // it early would otherwise change what that argument reads, which is
-        // the `f(x, x)` hazard the two-step binding exists for.
+        // the `f(x, x)` hazard the two-step binding exists for. Nor the
+        // local's own name: bound early and lent, it has one owner, so another
+        // argument taking it `inout` changes it in place before the body
+        // reads it. `get(u, add(u, 7))` spliced read `u` as `add` left it,
+        // where `grasm run` reads the arguments left to right.
         let lent: Vec<bool> = self
             .lookup_fn(name)
             .map(|sg| sg.borrowed.clone())
@@ -14248,7 +14252,7 @@ this case",
                     collect_idents(b, &mut others);
                 }
             }
-            if others.contains(&p.name.name) {
+            if others.contains(&p.name.name) || others.contains(&id.name) {
                 continue;
             }
             let Some((var, vt)) = self.lookup(&id.name) else {
@@ -17126,11 +17130,16 @@ this case",
                             continue;
                         }
                         // Lent rather than given; see `param_is_borrowed`.
-                        // The receiver is parameter zero on this path.
+                        // The receiver is parameter zero on this path. Not
+                        // when a later argument names the variable, as in the
+                        // plain-call path.
                         if callee_borrowed.get(i + 1).copied().unwrap_or(false) {
                             if let Expr::Ident(n) = a {
                                 if let Some((var, vt)) = self.lookup(&n.name) {
-                                    if vt.boxed() && &vt == want {
+                                    if vt.boxed()
+                                        && &vt == want
+                                        && !later_reads(&args[i + 1..], &n.name)
+                                    {
                                         vals.push(self.b.use_var(var));
                                         continue;
                                     }
@@ -18976,10 +18985,17 @@ type parameters",
             // of the call. A plain name is passed as it stands; anything else
             // is a temporary that somebody must still release, so it is
             // evaluated owned and released after the call returns.
+            //
+            // Not when a later argument names the same variable, though. Lent,
+            // the value has one owner, so a later argument taking it `inout`
+            // changes it in place before the call: `get(u, add(u, 7))` gave
+            // `get` the struct as `add` left it, where `grasm run` reads the
+            // arguments left to right and passes `u` as it was. Given a
+            // reference of its own there, the `inout` write copies.
             if callee_borrowed.get(i).copied().unwrap_or(false) {
                 if let Expr::Ident(n) = a {
                     if let Some((var, vt)) = self.lookup(&n.name) {
-                        if vt.boxed() && &vt == want {
+                        if vt.boxed() && &vt == want && !later_reads(&args[i + 1..], &n.name) {
                             vals.push(self.b.use_var(var));
                             continue;
                         }

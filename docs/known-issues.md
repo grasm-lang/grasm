@@ -5,8 +5,7 @@ Every defect that is known and not fixed, with its severity from
 to paste. S1 and S2 block a release; S3 and S4 do not, and this file is what
 makes shipping them honest rather than quiet.
 
-**Open S1: one, a native build passing a struct argument as a later
-`inout` argument left it; one under investigation. Open S2: none. Open S3:
+**Open S1: none confirmed; one under investigation. Open S2: none. Open S3:
 two, a block whose value is a map literal and a statement `if` whose
 branches' values differ, refused natively. Open S4: two, a nested
 interpolation's spans and a backslash at the end of a file.**
@@ -18,7 +17,7 @@ compiler, and each is in the Rust compiler's native backend, which S2 does
 not change. Neither is fixed; `compiler/front` is written around both.
 
 **A native build passes a struct argument that a later `inout` argument
-changes as it is after the change -- *open, S1*.**
+changes as it is after the change -- *closed, S1*.**
 
 ```
 type T = { xs: [i64] }
@@ -46,6 +45,22 @@ it is after `add` pushed into it. An index read through the same value
 so the two engines disagree only for an argument. The Grasm frontend binds
 such a call's result first, as the language's own advice for this shape
 says, so neither engine's reading reaches it.
+
+Closed 2026-10-27. Three paths of the Cranelift backend lend a variable to a
+parameter the callee only reads, without a reference of its own: a plain
+call's argument, a method call's argument after the receiver, and a small
+callee spliced in place (`try_inline` binds the variable to the parameter
+before the other arguments are evaluated). Lent, the value has one owner, so
+the later `inout` callee changed it in place. Each now lends only when no
+other argument names the variable, and takes a reference otherwise, so the
+`inout` write copies. The splice was also a use after free when an
+*earlier* argument replaced the variable: `first(reset(p), p)` bound `p`
+lent before `reset` ran, `reset` released the struct `p` had held, and the
+body read it -- the old contents with the ordinary runtime, "field access on
+non-struct" with the poisoned one `s3rc` links. `cli_tests`'
+`an_argument_is_read_before_a_later_inout_argument_changes_it` covers each
+path, and fails with any one of the three changes undone. The Grasm backend
+(`compiler/s3`) gave `grasm run`'s answer on every reproducer.
 
 **An `if` used as a statement whose branches end in values of different
 types is refused by the native backend -- *open, S3*.**

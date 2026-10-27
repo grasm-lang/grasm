@@ -3076,3 +3076,96 @@ fn the_runtime_dialect_is_a_runtime_package_s_alone() {
         assert!(text.contains(said), "{bad}: wanted `{said}` in {text}");
     }
 }
+
+/// Arguments are read left to right, so an argument that names a variable
+/// passes it as it was before a later argument takes it `inout`. Three paths
+/// of the native backend lent such a variable without a reference of its own
+/// -- a plain call's argument (`checked`, which is not spliced), a method
+/// call's argument, and a small callee spliced in place -- and the `inout` callee, finding one owner, changed it
+/// in place before the call: `get(u, add(u, 7))` passed `u` as `add` left
+/// it, and an earlier argument that replaced the variable left a later one
+/// reading the old value. `grasm run` was right throughout.
+#[test]
+fn an_argument_is_read_before_a_later_inout_argument_changes_it() {
+    let w = Work::new("inoutorder");
+    let src = w.0.join("main.gr");
+    let out = w.0.join("app");
+    std::fs::write(
+        &src,
+        r#"type P = { a: i64, s: str }
+type Q = { k: i64 }
+
+fn bump(inout p: P) -> i64 {
+    p.a = p.a + 1
+    p.a
+}
+
+fn reset(inout p: P) -> i64 {
+    p = P{ a: 100, s: "fresh" }
+    p.a
+}
+
+fn small(a: P, b: i64) -> i64 { a.a * 10 + b }
+fn first(b: i64, a: P) -> str { "{a.a} {a.s} {b}" }
+
+fn big(a: P, b: i64) -> i64 {
+    var t = 0
+    var i = 0
+    while i < 3 {
+        t = t + a.a * 10 + b
+        i = i + 1
+    }
+    t
+}
+
+fn checked(a: P, b: i64) -> i64 ! str {
+    if b < 0 {
+        fail("negative")
+    }
+    a.a * 10 + b
+}
+
+fn mix(q: Q, a: P, b: i64) -> i64 {
+    var t = 0
+    var i = 0
+    while i < 3 {
+        t = t + q.k + a.a * 10 + b
+        i = i + 1
+    }
+    t
+}
+
+fn main() {
+    var p = P{ a: 0, s: "old" }
+    print("{small(p, bump(p))}")
+    p = P{ a: 0, s: "old" }
+    print("{big(p, bump(p))}")
+    p = P{ a: 0, s: "old" }
+    print("{small(p, small(p, bump(p)))}")
+    p = P{ a: 0, s: "old" }
+    let q = Q{ k: 1 }
+    print("{q.mix(p, bump(p))}")
+    p = P{ a: 0, s: "old" }
+    print("{checked(p, bump(p)) ?? -1}")
+    p = P{ a: 1, s: "old" }
+    print(first(reset(p), p))
+}
+"#,
+    )
+    .unwrap();
+    let want = "1\n3\n1\n6\n1\n100 fresh 100";
+    let (code, text) = run(&["run", src.to_str().unwrap()]);
+    assert_eq!(code, 0, "{text}");
+    assert_eq!(text.trim(), want, "grasm run");
+    let (code, msg) = run(&[
+        "build",
+        src.to_str().unwrap(),
+        "--native",
+        "-o",
+        out.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "{msg}");
+    let got = Command::new(&out).output().expect("runs");
+    assert!(got.status.success(), "{:?}", got.status);
+    assert_eq!(String::from_utf8_lossy(&got.stdout).trim(), want, "native");
+}
