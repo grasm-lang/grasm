@@ -29,7 +29,9 @@
 #
 # `S3=<binary>` tests that driver instead of building one, and `S3_EXTRA`
 # adds arguments to each compilation: the mutation controls
-# (`scripts/s3controls.sh`) use both.
+# (`scripts/s3controls.sh`) use both. `S3_STOP_AT_FIRST=1`, also theirs,
+# stops at the first program that fails: a planted fault needs one program to
+# show it, not the whole corpus.
 set -uo pipefail
 cd "$(dirname "$0")/.."
 GRASM=${GRASM:-./target/release/grasm}
@@ -47,6 +49,8 @@ s3_driver
 s3_runtime
 s3_collect
 EXTRA=${S3_EXTRA:-}
+STOP=${S3_STOP_AT_FIRST:-}
+stopped=0
 
 in_subset=0
 out_subset=0
@@ -60,6 +64,10 @@ declare -a IN=()
 declare -a EXTERNAL=()
 
 for k in "${!S3_SRC[@]}"; do
+    if [ -n "$STOP" ] && [ $((fail + timedout)) -gt 0 ]; then
+        stopped=1
+        break
+    fi
     src=${S3_SRC[$k]}
     tir=${S3_TIR[$k]}
     rule=${S3_RULE[$k]}
@@ -147,6 +155,11 @@ if [ ${#FAILED[@]} -gt 0 ]; then
     echo
     echo "FAILED:"
     printf '  %s\n' "${FAILED[@]}"
+fi
+if [ "$stopped" = 1 ]; then
+    echo
+    echo "stopped at the first failure (S3_STOP_AT_FIRST); the counts above are partial"
+    exit 1
 fi
 
 # Every program was in or out, and every one in was compared or failed: the

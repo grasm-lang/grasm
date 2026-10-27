@@ -25,7 +25,8 @@
 #
 # `S3_POISON_RT=<libgrasm_rt_abi.a>` names a poisoned runtime instead of
 # building one (into `target/s3rc-poison`, a staticlib of a few megabytes).
-# `S3=` and `S3_EXTRA` as in `scripts/s3subset.sh`, for the controls.
+# `S3=`, `S3_EXTRA` and `S3_STOP_AT_FIRST` as in `scripts/s3subset.sh`, for
+# the controls.
 set -uo pipefail
 cd "$(dirname "$0")/.."
 GRASM=${GRASM:-./target/release/grasm}
@@ -42,6 +43,8 @@ trap 'rm -rf "$WORK"' EXIT
 s3_driver
 s3_runtime
 EXTRA=${S3_EXTRA:-}
+STOP=${S3_STOP_AT_FIRST:-}
+stopped=0
 
 POISON_RT=${S3_POISON_RT:-}
 if [ -z "$POISON_RT" ]; then
@@ -73,6 +76,10 @@ declare -a FAILED=()
 
 for k in "${!S3_SRC[@]}"; do
     [ "${S3_RULE[$k]}" = "in" ] || continue
+    if [ -n "$STOP" ] && [ $((leaked + uaf + failed)) -gt 0 ]; then
+        stopped=1
+        break
+    fi
     src=${S3_SRC[$k]}
     tir=${S3_TIR[$k]}
     programs=$((programs + 1))
@@ -159,6 +166,10 @@ if [ ${#FAILED[@]} -gt 0 ]; then
     echo
     echo "FAILED:"
     printf '  %s\n' "${FAILED[@]}"
+fi
+if [ "$stopped" = 1 ]; then
+    echo
+    echo "stopped at the first failure (S3_STOP_AT_FIRST); the counts above are partial"
 fi
 [ "$leaked" -eq 0 ] && [ "$uaf" -eq 0 ] && [ "$failed" -eq 0 ] || exit 1
 # Every program was accounted for, twice.

@@ -124,22 +124,37 @@ control() {
         [ "$extra" = "-" ] && extra=""
         controls=$((controls + 1))
         local log="$WORK/$name-$(basename "$gate" .sh).log"
-        git ls-files --others --exclude-standard | sort >"$WORK/untracked-before"
-        case "$gate" in
-            *.py) S3="$driver" S3_EXTRA="$extra" python3 "$gate" >"$log" 2>&1 ;;
-            *) S3="$driver" S3_EXTRA="$extra" "$gate" >"$log" 2>&1 ;;
-        esac
-        local code=$?
-        # A mutated backend can make a program write wherever it can reach.
-        # The extra-dec and rc-select faults free a string still in use, and
-        # under them L-LIB-FS wrote files named `c` and `b` into the
-        # repository root, which `litter` then reported. Remove what this
-        # run created, and say so.
-        git ls-files --others --exclude-standard | sort | comm -13 "$WORK/untracked-before" - |
-            while read -r stray; do
-                rm -f -- "$stray"
-                echo "    removed $stray, written by the $name build"
-            done
+        local code stop
+        # First with `S3_STOP_AT_FIRST=1`, which `s3subset` and `s3rc` take
+        # to stop at the first program that fails (the others ignore it).
+        # A run that stopped early and shows the symptom settles the control:
+        # the full run prints the same first failure, and more. One that does
+        # not is run again in full and judged on that, so an early stop can
+        # catch a fault but never decides that one was missed.
+        for stop in 1 ""; do
+            git ls-files --others --exclude-standard | sort >"$WORK/untracked-before"
+            case "$gate" in
+                *.py) S3="$driver" S3_EXTRA="$extra" S3_STOP_AT_FIRST="$stop" python3 "$gate" >"$log" 2>&1 ;;
+                *) S3="$driver" S3_EXTRA="$extra" S3_STOP_AT_FIRST="$stop" "$gate" >"$log" 2>&1 ;;
+            esac
+            code=$?
+            # A mutated backend can make a program write wherever it can
+            # reach. The extra-dec and rc-select faults free a string still
+            # in use, and under them L-LIB-FS wrote files named `c` and `b`
+            # into the repository root, which `litter` then reported. Remove
+            # what this run created, and say so.
+            git ls-files --others --exclude-standard | sort | comm -13 "$WORK/untracked-before" - |
+                while read -r stray; do
+                    rm -f -- "$stray"
+                    echo "    removed $stray, written by the $name build"
+                done
+            if [ "$code" != 0 ] && grep -qF -- "$symptom" "$log"; then
+                break
+            fi
+            if [ "$code" != 0 ] && grep -qiE -- "timed out after" "$log"; then
+                break
+            fi
+        done
         if [ "$code" != 0 ] && grep -cF -- "$symptom" "$log" >/dev/null; then
             caught=$((caught + 1))
             echo "caught: $name by $(basename "$gate" .sh) (exit $code; \"$symptom\")"
