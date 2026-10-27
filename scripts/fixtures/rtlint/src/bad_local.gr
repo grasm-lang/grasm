@@ -1,0 +1,12 @@
+//! rtlint: plain: a plain store of process cell `bad_local::PAIR`
+// Through a local and an offset: still the cell's bytes.
+process_local PAIR: i64
+
+pub fn second(v: i64) {
+    unsafe {
+        let a = mem_process(PAIR)
+        var b = a
+        b = b.offset(0)
+        b.store_i64(v)
+    }
+}

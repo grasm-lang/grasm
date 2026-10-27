@@ -414,6 +414,9 @@ fn expand(inout vc: VCode, f: MirFn, s: Sel, ru: Rule, ccm: [i64], fccm: [i64], 
         } else if tm.sym == rules.Y_GOT {
             vc.symk[x] = vcode.SYM_GOT
             vc.sym_id[x] = own_imm
+        } else if tm.sym == rules.Y_CELL {
+            vc.symk[x] = vcode.SYM_CELL
+            vc.sym_id[x] = own_imm
         }
     }
     ()

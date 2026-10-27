@@ -1,0 +1,23 @@
+//! rtlint: plain: a plain store of process cell `bad_wrong_lock::TOTAL`
+// Holding a lock is no licence for a cell that lock does not guard.
+process_local LOCK: i64
+process_local OTHER: i64
+
+/// rtlint: guarded by OTHER
+process_local TOTAL: i64
+
+/// rtlint: holds LOCK
+fn set_locked(v: i64) {
+    unsafe {
+        mem_process(TOTAL).store_i64(v)
+    }
+}
+
+pub fn set(v: i64) {
+    unsafe {
+        while mem_process(LOCK).atomic_cas_i64(0, 1, Acquire) != 0 {
+        }
+        set_locked(v)
+        mem_process(LOCK).atomic_store_i64(0, Release)
+    }
+}

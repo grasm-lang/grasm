@@ -153,9 +153,12 @@ def cmd_relocs(path):
             problems.append(f"relocation {k} at {addr:#x} has length {length}")
         w = words[addr // 4]
         # 5 and 6: a C function's address through its GOT slot
-        # (ARM64_RELOC_GOT_LOAD_PAGE21, _PAGEOFF12).
+        # (ARM64_RELOC_GOT_LOAD_PAGE21, _PAGEOFF12); 8 and 9: a thread-local
+        # variable's descriptor, in the runtime's object
+        # (ARM64_RELOC_TLVP_LOAD_PAGE21, _PAGEOFF12).
         want = {2: (is_bl, 1, "bl"), 3: (is_adrp, 1, "adrp"), 4: (is_add_imm64, 0, "add"),
-                5: (is_adrp, 1, "adrp"), 6: (is_ldr_imm64, 0, "ldr")}.get(rtype)
+                5: (is_adrp, 1, "adrp"), 6: (is_ldr_imm64, 0, "ldr"),
+                8: (is_adrp, 1, "adrp"), 9: (is_ldr_imm64, 0, "ldr")}.get(rtype)
         if want is None:
             problems.append(f"relocation {k} at {addr:#x} has type {rtype}, which this backend never writes")
             continue
@@ -172,9 +175,10 @@ def cmd_relocs(path):
     for i, w in enumerate(words):
         if is_bl(w) and rel.get(4 * i) != 2:
             problems.append(f"the `bl` at {4 * i:#x} has no BRANCH26 relocation")
-        if is_adrp(w) and rel.get(4 * i) not in (3, 5):
+        if is_adrp(w) and rel.get(4 * i) not in (3, 5, 8):
             problems.append(f"the `adrp` at {4 * i:#x} has no PAGE21 relocation")
     ndata = check_data_relocs(data, syms, problems)
+    ndata += check_tlv_relocs(data, syms, problems)
     ndebug = check_debug_relocs(data, t, problems)
     for p in problems[:20]:
         print(p)
@@ -428,6 +432,46 @@ def cmd_lines(obj, tir):
         print(p)
     print(f"line rows: {nrows}   literal loads checked: {checked}   wrong: {len(problems)}")
     return 1 if problems else 0
+
+
+def check_tlv_relocs(data, syms, problems):
+    """`__DATA,__thread_vars` holds the runtime's thread-local variables'
+    descriptors, three words each, as clang lays them out: the thunk, a
+    64-bit absolute relocation against `__tlv_bootstrap`; a key; and the
+    template, one against the descriptor's own `<name>$tlv$init` in
+    `__thread_bss`. Exactly those two relocations per descriptor. Answers
+    how many there are."""
+    secs, _ = sections(data)
+    d = secs.get(("__DATA", "__thread_vars"))
+    if d is None:
+        return 0
+    if d["size"] % 24:
+        problems.append(f"__thread_vars is {d['size']} bytes, not a whole number of descriptors")
+        return 0
+    tv_sect = 1 + list(secs.values()).index(d)
+    desc = {value - d["addr"]: name for name, ntype, nsect, value in syms if nsect == tv_sect}
+    got = {}
+    for k in range(d["nreloc"]):
+        addr, info = struct.unpack_from("<iI", data, d["reloff"] + 8 * k)
+        symnum = info & 0xFFFFFF
+        length = (info >> 25) & 3
+        rtype = info >> 28
+        if rtype != 0 or length != 3 or (info >> 24) & 1 or not (info >> 27) & 1 or symnum >= len(syms):
+            problems.append(f"__thread_vars relocation {k} at {addr:#x} is not a 64-bit absolute one against a symbol")
+            continue
+        got[addr] = syms[symnum][0]
+    for off in range(0, d["size"], 24):
+        name = desc.get(off)
+        if name is None:
+            problems.append(f"the descriptor at __thread_vars+{off:#x} has no symbol")
+            continue
+        if got.get(off) != "__tlv_bootstrap":
+            problems.append(f"{name}'s thunk is bound to {got.get(off)}, not __tlv_bootstrap")
+        if got.get(off + 16) != name + "$tlv$init":
+            problems.append(f"{name}'s template is {got.get(off + 16)}, not {name}$tlv$init")
+        if got.get(off + 8) is not None:
+            problems.append(f"{name}'s key carries a relocation")
+    return len(got)
 
 
 def check_data_relocs(data, syms, problems):

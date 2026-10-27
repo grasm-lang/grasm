@@ -1,0 +1,9 @@
+//! rtlint: escapes: process cell `bad_escape_export::CELL`'s address returned to C by an `export fn`
+// C may touch whatever it is handed however it likes.
+process_local CELL: i64
+
+export fn rt_fixture_cell() -> addr {
+    unsafe {
+        mem_process(CELL).offset(0)
+    }
+}

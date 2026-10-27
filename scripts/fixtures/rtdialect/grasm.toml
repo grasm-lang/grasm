@@ -1,0 +1,12 @@
+[package]
+name = "rtdialect"
+version = "0.1.0"
+entry = "src/main.gr"
+
+# The runtime dialect's fixture ([T-RUNTIME], docs/self-hosting.md §5.6):
+# every part of the dialect, compiled by the Grasm backend with `--runtime`
+# and driven from C by scripts/rtdialect.sh. A runtime package because the
+# dialect is usable nowhere else; it is test data, never linked into a
+# program, and compiler/rt is the one runtime anything ships.
+capabilities = ["unsafe", "mem"]
+runtime = true

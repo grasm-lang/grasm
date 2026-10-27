@@ -1,0 +1,11 @@
+[package]
+name = "rtlintcases"
+version = "0.1.0"
+entry = "src/main.gr"
+
+# rtlint's conformance cases ([T-RUNTIME], scripts/rtlint.py): one module
+# per case, each saying in `//! rtlint:` lines the refusals it must get, or
+# `ok`. A runtime package because process cells exist nowhere else; test
+# data, never compiled into anything.
+capabilities = ["io", "unsafe", "mem"]
+runtime = true

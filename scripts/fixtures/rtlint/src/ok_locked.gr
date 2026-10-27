@@ -1,0 +1,27 @@
+//! rtlint: ok
+// A cell guarded by a lock built from atomics, touched plainly only in a
+// function marked as holding it, which is called only where the lock is
+// taken.
+process_local LOCK: i64
+
+/// rtlint: guarded by LOCK
+process_local TOTAL: i64
+
+/// rtlint: holds LOCK
+fn add_locked(v: i64) -> i64 {
+    unsafe {
+        let a = mem_process(TOTAL)
+        a.store_i64(a.load_i64() + v)
+        a.load_i64()
+    }
+}
+
+pub fn add(v: i64) -> i64 {
+    unsafe {
+        while mem_process(LOCK).atomic_cas_i64(0, 1, Acquire) != 0 {
+        }
+        let r = add_locked(v)
+        mem_process(LOCK).atomic_store_i64(0, Release)
+        r
+    }
+}

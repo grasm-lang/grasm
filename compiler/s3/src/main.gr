@@ -7,7 +7,12 @@
 // §6.7) rather than a program: every function its `export fn`s reach and no
 // C entry point -- it has no `main` -- and its calls to C are the runtime's
 // own, so they are not reported to `grasm_foreign_call` as a program's are
-// (a replay refuses a program's C calls, never the runtime's).
+// (a replay refuses a program's C calls, never the runtime's). Its dialect
+// ([T-RUNTIME], §5.6) is lowered here too: each process cell a zeroed
+// symbol of `__bss`, each literal `mem_static` names in `__cstring`, its own
+// `thread_local` cells Mach-O thread-local variables, and the context
+// switch and the variables' getters leaves this driver writes into the
+// object (`compiler/aarch64/src/leaves.gr`).
 // `--ra=linear` allocates registers by linear scan, the fast allocator, in
 // place of the release one (`--ra=backtrack`, the default; docs/self-hosting.md
 // §4).
@@ -187,9 +192,53 @@ fn reloc_symbol(p: MirProg, symk: i64, id: i64) -> str {
         "_" + p.rt_syms[id]
     } else if symk == 4 {
         "l_.desc.{id}"
+    } else if symk == 6 {
+        ir.cell_sym(p.pcells[id])
     } else {
         "l_.str.{id}"
     }
+}
+
+/// The runtime dialect's leaves the runtime's calls reach ([T-RUNTIME]),
+/// each once, appended to the object as local functions; their code maps
+/// to no source line.
+fn add_leaves(p: MirProg, inout obj: MoObj, inout unit: DwUnit, listing: bool, inout text: StrBuilder) -> () ! str {
+    var done: Map[str, bool] = {}
+    for name in p.rt_syms {
+        for lf in try aarch64.leaves_for(name, p.tcells) {
+            if done.has(lf.sym) {
+                continue
+            }
+            done.set(lf.sym, true)
+            let base = 4 * obj.text.len()
+            let fk = obj.fsym.len()
+            unit.row_fn.push(fk)
+            unit.row_off.push(0)
+            unit.row_file.push(1)
+            unit.row_line.push(0)
+            unit.fn_name.push(lf.sym)
+            unit.fn_file.push(0)
+            unit.fn_line.push(0)
+            obj.fsym.push(lf.sym)
+            obj.foff.push(base)
+            obj.fext.push(false)
+            for w in lf.words {
+                obj.text.push(w)
+            }
+            for k in 0..lf.rel_off.len() {
+                obj.rel_off.push(base + lf.rel_off[k])
+                obj.rel_kind.push(lf.rel_kind[k])
+                obj.rel_sym.push(lf.rel_name[k])
+            }
+            if listing {
+                text.push_str("{lf.sym}:   ; a leaf of the runtime dialect\n")
+                for line in lf.asm {
+                    text.push_str("    " + line + "\n")
+                }
+            }
+        }
+    }
+    ()
 }
 
 /// Compiles a TIR file into an object file. Answers the exit status.
@@ -308,6 +357,22 @@ fn compile(inp: str, out: str, opts: A64Opts, listing: str, check: bool, stats: 
     }
     if ra_failed > 0 {
         return 4
+    }
+    match add_leaves(p, obj, unit, listing != "", text) {
+        Ok(_) -> ()
+        Err(msg) -> {
+            eprint("s3: a leaf of the runtime dialect: {msg}")
+            return 1
+        }
+    }
+    // The runtime's process cells and its own thread-local variables.
+    for k in 0..p.pcells.len() {
+        obj.zsym.push(ir.cell_sym(p.pcells[k]))
+        obj.zsize.push(p.psize[k])
+    }
+    for k in 0..p.tcells.len() {
+        obj.tsym.push(ir.tlv_var_sym(p.tcells[k]))
+        obj.tsize.push(p.tsize[k])
     }
     unit.producer = "grasm compiler/s3"
     unit.name = if p.files.len() > 0 { p.files[0] } else { "" }

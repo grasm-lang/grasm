@@ -84,6 +84,8 @@ pub let Y_STR = 3
 pub let Y_DATA = 4
 /// A C function, through the global offset table ([T-FN-ADDR]).
 pub let Y_GOT = 5
+/// The runtime's process cell ([T-RUNTIME]).
+pub let Y_CELL = 6
 
 // Guards.
 pub let G_ANY = 0
@@ -262,6 +264,11 @@ pub fn rules() -> [Rule] {
     var gldr = t(mach.A_LDR_GOT, S_RES, S_RES, S_NONE)
     gldr.sym = Y_GOT
     rs.push(r("gotaddr", ir.M_GOTADDR, G_ANY, [gadrp, gldr]))
+    var cadrp = t(mach.A_ADRP, S_RES, S_NONE, S_NONE)
+    cadrp.sym = Y_CELL
+    var cpageoff = t(mach.A_ADDPO, S_RES, S_RES, S_NONE)
+    cpageoff.sym = Y_CELL
+    rs.push(r("celladdr", ir.M_CELLADDR, G_ANY, [cadrp, cpageoff]))
     rs.push(r("getsp", ir.M_GETSP, G_ANY, [ti(mach.A_ADDI, S_RES, S_SP, 0, 0)]))
     rs.push(r("slotaddr", ir.M_SLOTADDR, G_ANY, [ti(mach.A_ADDI, S_RES, S_SP, K_SLOT, 0)]))
     rs.push(r("load", ir.M_LOAD, G_ANY, [ti(mach.A_LDR, S_RES, S_A, 0, 0)]))
@@ -339,7 +346,7 @@ pub fn ruled_ops() -> [i64] {
         ir.M_ICONST, ir.M_ADD, ir.M_SUB, ir.M_MUL, ir.M_SDIV, ir.M_UDIV, ir.M_SREM, ir.M_UREM,
         ir.M_AND, ir.M_OR, ir.M_XOR, ir.M_SHL, ir.M_SSHR, ir.M_USHR, ir.M_NEG, ir.M_NOT,
         ir.M_SEXT8, ir.M_SEXT16, ir.M_SEXT32, ir.M_UEXT8, ir.M_UEXT16, ir.M_UEXT32,
-        ir.M_ICMP, ir.M_STRADDR, ir.M_DATAADDR, ir.M_FNADDR, ir.M_GOTADDR, ir.M_GETSP, ir.M_SLOTADDR, ir.M_LOAD, ir.M_STORE,
+        ir.M_ICMP, ir.M_STRADDR, ir.M_DATAADDR, ir.M_FNADDR, ir.M_GOTADDR, ir.M_CELLADDR, ir.M_GETSP, ir.M_SLOTADDR, ir.M_LOAD, ir.M_STORE,
         ir.M_FCONST, ir.M_FADD, ir.M_FSUB, ir.M_FMUL, ir.M_FDIV, ir.M_FNEG, ir.M_FABS, ir.M_FSQRT,
         ir.M_FFLOOR, ir.M_FCEIL, ir.M_FCMP, ir.M_SCVTF, ir.M_UCVTF, ir.M_FCVTZS, ir.M_FCVTZU,
         ir.M_FBITS, ir.M_FFROMBITS, ir.M_FLOAD, ir.M_FSTORE,

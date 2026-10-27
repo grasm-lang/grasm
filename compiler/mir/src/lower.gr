@@ -1602,6 +1602,11 @@ fn layout_of(name: str) -> i64 {
     ir.ty_of_name(parts[parts.len() - 1])
 }
 
+/// The bytes a layout type takes, for the driver.
+pub fn layout_bytes(k: i64) -> i64 {
+    layout_size(k)
+}
+
 /// The bytes a layout type takes.
 fn layout_size(k: i64) -> i64 {
     if k == ir.TY_I8 or k == ir.TY_U8 {
@@ -1613,6 +1618,21 @@ fn layout_size(k: i64) -> i64 {
     } else {
         8
     }
+}
+
+/// Process cell `name`'s index among the program's (`(processlocal "m::C"
+/// T)`, in TIR's order), which `M_CELLADDR` names; -1 for none.
+fn process_cell(t: TirTree, name: str) -> i64 {
+    var k = 0
+    for r in t.roots {
+        if sexp.kw(t, r) == "processlocal" {
+            if sexp.word(t, r, 1) == name {
+                return k
+            }
+            k += 1
+        }
+    }
+    -1
 }
 
 /// Thread-local cell `name`'s offset in the block every thread gets, and the
@@ -3410,6 +3430,57 @@ fn lower_builtin(info: TirInfo, inout v: Vir, e: i64) -> i64 {
     if name == "mem_addr" and ks.len() == 1 {
         // The address whose integer is `n`: the same word.
         return value_of(info, v, ks[0])
+    }
+    if name == "mem_tls" and ks.len() == 1 and sexp.kw(t, ks[0]) == "tlsname" and info.runtime {
+        // [T-RUNTIME]: the runtime's own cell is a Mach-O thread-local
+        // variable, never the program's block, which the runtime hands out;
+        // its getter is a leaf the backend writes (`leaves.gr`).
+        return rt(v, ir.rt_tlv_getter(sexp.word(t, ks[0], 1)), [], R_WORD)
+    }
+    if name == "mem_process" and ks.len() == 1 and sexp.kw(t, ks[0]) == "processname" {
+        // [T-RUNTIME]: a zeroed symbol of `__bss`, one per process.
+        let k = process_cell(t, sexp.word(t, ks[0], 1))
+        if not info.runtime or k < 0 {
+            bad(v, "outside the subset: a process cell outside the runtime (`--runtime`) {span_of(t, e)}")
+            return konst(v, 0)
+        }
+        let d = new_var(v, ir.TY_I64)
+        emit(v, ir.M_CELLADDR, d, -1, -1, k)
+        return d
+    }
+    if (name == "mem_static" or name == "mem_static_len") and ks.len() == 1 and sexp.kw(t, ks[0]) == "mstatic" {
+        // [T-RUNTIME]: a literal's bytes, never a counted value. They end
+        // in a NUL: in `__cstring`, where the object writer adds it, or in
+        // `__const` with one of their own when the text holds a NUL already.
+        let text = sexp.word(t, ks[0], 1)
+        if not info.runtime {
+            bad(v, "outside the subset: `{name}` outside the runtime (`--runtime`) {span_of(t, e)}")
+            return konst(v, 0)
+        }
+        if name == "mem_static_len" {
+            return konst(v, text.to_bytes().len())
+        }
+        var held = text
+        if text.contains(0.to_char()) {
+            held = text + 0.to_char()
+        }
+        let p = new_var(v, ir.TY_I64)
+        emit(v, ir.M_STRADDR, p, -1, -1, str_id(v, held))
+        return p
+    }
+    if (name == "ctx_switch" and ks.len() == 2) or (name == "ctx_init" and ks.len() == 4) {
+        // [T-RUNTIME]: a call of a leaf the backend writes (`leaves.gr`), so
+        // the calling convention decides what the switch may change.
+        if not info.runtime {
+            bad(v, "outside the subset: `{name}` outside the runtime (`--runtime`) {span_of(t, e)}")
+            return -1
+        }
+        var args: [i64] = []
+        for k in ks {
+            args.push(value_of(info, v, k))
+        }
+        rt(v, if name == "ctx_switch" { ir.RT_CTX_SWITCH } else { ir.RT_CTX_INIT }, args, R_VOID)
+        return -1
     }
     if name == "mem_tls" and ks.len() == 1 and sexp.kw(t, ks[0]) == "tlsname" {
         // [T-TLS]: the calling thread's block of cells, made by the runtime

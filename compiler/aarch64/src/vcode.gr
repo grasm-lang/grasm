@@ -53,6 +53,8 @@ pub let SYM_DATA = 4
 /// A C function's address, through the global offset table: the symbol is
 /// one of the program's runtime-symbol pool, defined by a library.
 pub let SYM_GOT = 5
+/// The runtime's process cell `sym_id` ([T-RUNTIME]).
+pub let SYM_CELL = 6
 
 pub fn new_vcode(sym: str) -> VCode {
     VCode{

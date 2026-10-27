@@ -155,6 +155,9 @@ pub let M_ACAS64 = 110
 /// The address of C function `imm` (a runtime-symbol id, as `M_CALLRT`'s),
 /// through the global offset table ([T-FN-ADDR]).
 pub let M_GOTADDR = 111
+/// The address of the runtime's process cell `imm` (`MirProg.pcells`), a
+/// zeroed symbol of `__bss` ([T-RUNTIME]).
+pub let M_CELLADDR = 112
 
 /// The atomic of class `base` (`M_ALOAD8`, `M_ASTORE8`, `M_AADD8`,
 /// `M_ACAS8`) at `size` bytes.
@@ -359,6 +362,48 @@ pub fn rt_name(id: i64) -> str {
     }
 }
 
+// ----- the runtime dialect's symbols ([T-RUNTIME]) ------------------------------
+// The runtime written in Grasm (`--runtime`) keeps process cells as zeroed
+// symbols of `__bss`, its own thread-local cells as Mach-O thread-local
+// variables, and reaches the context switch and each variable through
+// leaves the backend writes (`compiler/aarch64/src/leaves.gr`), called as
+// runtime functions are. Their names hold a `.`, which no Grasm name can,
+// so none of them can meet a symbol the program declares.
+
+/// The context switch and the context maker, as runtime-function names.
+pub let RT_CTX_SWITCH = "grt.ctx_switch"
+pub let RT_CTX_INIT = "grt.ctx_init"
+
+/// The getter of runtime thread-local cell `cell` (a qualified name), as a
+/// runtime-function name: its symbol is this with `_` in front.
+pub fn rt_tlv_getter(cell: str) -> str {
+    "grt.tlv." + dialect_part(cell)
+}
+
+/// Thread-local cell `cell`'s variable: its descriptor in `__thread_vars`;
+/// its zeroed template is this with `$tlv$init` after it.
+pub fn tlv_var_sym(cell: str) -> str {
+    "_grt.tls." + dialect_part(cell)
+}
+
+/// Process cell `cell`'s symbol: zeroed bytes in `__bss`.
+pub fn cell_sym(cell: str) -> str {
+    "_grt.cell." + dialect_part(cell)
+}
+
+/// `m::C` as `m.C`, with any character a tool might trip on made `_`.
+fn dialect_part(q: str) -> str {
+    var out = str_builder()
+    for c in q.replace("::", ".").codes() {
+        if (c >= 48 and c <= 57) or (c >= 65 and c <= 90) or (c >= 97 and c <= 122) or c == 95 or c == 46 {
+            out.push_str(c.to_char())
+        } else {
+            out.push_str("_")
+        }
+    }
+    out.to_str()
+}
+
 /// The fixed runtime symbols, by id: the start of every program's pool.
 pub fn rt_fixed() -> [str] {
     var out: [str] = []
@@ -462,6 +507,13 @@ type MirProg = {
     /// loader and the base offset of its spans (docs/tir.md §2).
     files: [str],
     fbase: [i64],
+    /// The runtime's process cells (`M_CELLADDR`'s `imm` indexes these) and
+    /// its own thread-local cells, each a qualified name with its size in
+    /// bytes, in TIR's order ([T-RUNTIME]); empty for a program.
+    pcells: [str],
+    psize: [i64],
+    tcells: [str],
+    tsize: [i64],
 }
 
 /// A struct type's descriptor, as the runtime's `StructDesc` reads it
@@ -583,13 +635,14 @@ pub fn op_name(op: i64) -> str {
         109 -> "acas32"
         110 -> "acas64"
         111 -> "gotaddr"
+        112 -> "celladdr"
         _ -> "op?"
     }
 }
 
 /// How many value operands an instruction reads from `a` and `b`.
 pub fn nreads(op: i64) -> i64 {
-    if op == M_ICONST or op == M_STRADDR or op == M_GETSP or op == M_SLOTADDR or op == M_CALL or op == M_CALLRT or op == M_DATAADDR or op == M_FCONST or op == M_FNADDR or op == M_GOTADDR {
+    if op == M_ICONST or op == M_STRADDR or op == M_GETSP or op == M_SLOTADDR or op == M_CALL or op == M_CALLRT or op == M_DATAADDR or op == M_FCONST or op == M_FNADDR or op == M_GOTADDR or op == M_CELLADDR {
         0
     } else if op == M_COPY or op == M_NEG or op == M_NOT or (op >= M_SEXT8 and op <= M_UEXT32) or op == M_LOAD or op == M_INC or op == M_DEC or op == M_CALLIND {
         1
@@ -645,6 +698,8 @@ pub fn print_fn(f: MirFn, callee_sym: [str], rt_syms: [str]) -> str {
                 line = line + " s{f.imm[i]}"
             } else if op == M_DATAADDR {
                 line = line + " d{f.imm[i]}"
+            } else if op == M_CELLADDR {
+                line = line + " c{f.imm[i]}"
             } else if op == M_ICMP {
                 line = line + "." + cc_name(f.imm[i]) + " {vname(f.a[i])}, {vname(f.b[i])}"
             } else if op == M_CALL {

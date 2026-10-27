@@ -1,0 +1,14 @@
+//! rtlint: ok
+// A comparison of addresses is a `bool`, not an address.
+process_local A: i64
+process_local B: i64
+
+export fn rt_fixture_apart() -> i64 {
+    unsafe {
+        if mem_process(A) != mem_process(B) and mem_process(A).as_i64() % 8 == 0 {
+            1
+        } else {
+            0
+        }
+    }
+}

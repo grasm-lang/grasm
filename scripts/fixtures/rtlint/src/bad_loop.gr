@@ -1,0 +1,12 @@
+//! rtlint: plain: a plain store of process cell `bad_loop::BASE`
+// A loop's variable walks what it is given: here, the cell's bytes.
+process_local BASE: i64
+
+pub fn sweep() {
+    unsafe {
+        let a = mem_process(BASE).as_i64()
+        for p in a..(a + 8) {
+            mem_addr(p).store_u8(0)
+        }
+    }
+}

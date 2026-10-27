@@ -1,0 +1,12 @@
+//! rtlint: handed: process cell `bad_handed::CTX`'s address handed to `ctx_switch`
+//! rtlint: handed: process cell `bad_handed::CTX`'s address handed to `mem_free`
+// The context switch stores registers plainly, and a cell was never
+// allocated.
+process_local CTX: i64
+
+pub fn away(to: addr) {
+    unsafe {
+        ctx_switch(mem_process(CTX), to)
+        mem_free(mem_process(CTX))
+    }
+}

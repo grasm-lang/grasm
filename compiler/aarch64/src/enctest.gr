@@ -272,6 +272,35 @@ pub fn cases() -> EncCases ! str {
                 let rn = reg_for(g, k, 1, mach.R_SP)
                 try add(c, m, rd, rn, -1, -1, 0, 0, -1, 0, "_s3_encode_ext{k % 3}")
             }
+        } else if m == mach.A_ADRP_TLV {
+            // Through a thread-local variable's descriptor, left undefined
+            // here as the GOT cases' symbols are.
+            for k in 0..31 {
+                try add(c, m, k, -1, -1, -1, 0, 0, -1, 0, "_s3_encode_tlv{k % 3}")
+            }
+        } else if m == mach.A_LDR_TLV {
+            for k in 0..n {
+                let rd = reg_for(g, k, 0, mach.R_ZR)
+                let rn = reg_for(g, k, 1, mach.R_SP)
+                try add(c, m, rd, rn, -1, -1, 0, 0, -1, 0, "_s3_encode_tlv{k % 3}")
+            }
+        } else if m >= mach.A_STP_OFF and m <= mach.A_FLDP_OFF {
+            // No write-back, so the base may be one of the pair; loading both
+            // halves into one register is still unpredictable.
+            var k = 0
+            var made = 0
+            while made < n {
+                let rt = any_reg(g, m, k, 0, mach.R_ZR)
+                let rt2 = any_reg(g, m, k, 2, mach.R_ZR)
+                let rn = reg_for(g, k, 1, mach.R_SP)
+                let w = if k < 128 { k - 64 } else { pick(g, -64, 63) }
+                k += 1
+                if (m == mach.A_LDP_OFF or m == mach.A_FLDP_OFF) and rt == rt2 {
+                    continue
+                }
+                try add(c, m, rt, rn, rt2, -1, 8 * w, 0, -1, 0, "")
+                made += 1
+            }
         } else if m >= mach.A_LDRB and m <= mach.A_STRW {
             let sz = mach.access_size(m)
             for k in 0..n {

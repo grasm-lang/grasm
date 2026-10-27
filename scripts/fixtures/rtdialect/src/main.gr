@@ -1,0 +1,245 @@
+// The runtime dialect, every part of it, for scripts/rtdialect.sh to drive
+// from C (driver.c) once the Grasm backend has compiled it with `--runtime`
+// ([T-RUNTIME], docs/self-hosting.md §5.6):
+//
+//   * process cells of every layout width, one per process: each starts
+//     zero, each has an address of its own, and threads C starts add to one
+//     of them atomically;
+//   * static bytes: literals with escapes, non-ASCII text, an empty one and
+//     one holding a NUL, each NUL-terminated and read-only, with their
+//     lengths;
+//   * the runtime's own thread-local cells: zero on every thread, one copy
+//     per thread;
+//   * the context switch: fibers on stacks C maps, each yielding from a
+//     call two deep and keeping its values across every switch.
+//
+// Every access to a process cell here is atomic, as the runtime's lint
+// requires of the runtime itself (scripts/rtlint.py).
+
+process_local HITS: i64
+process_local BYTE: u8
+process_local HALF: u16
+process_local WORD: u32
+process_local RATIO: f64
+process_local HELD: addr
+thread_local MINE: i64
+thread_local SMALL: u16
+
+/// 1 when every process cell reads zero.
+export fn fx_cells_zero() -> i64 {
+    unsafe {
+        var z = 1
+        if mem_process(HITS).atomic_load_i64(SeqCst) != 0 {
+            z = 0
+        }
+        if mem_process(BYTE).atomic_load_u8(SeqCst) != 0 {
+            z = 0
+        }
+        if mem_process(HALF).atomic_load_u16(SeqCst) != 0 {
+            z = 0
+        }
+        if mem_process(WORD).atomic_load_u32(SeqCst) != 0 {
+            z = 0
+        }
+        if mem_process(RATIO).atomic_load_u64(SeqCst) != 0 {
+            z = 0
+        }
+        if mem_process(HELD).atomic_load_i64(SeqCst) != 0 {
+            z = 0
+        }
+        z
+    }
+}
+
+/// How many of the cells sit at a multiple of 8, apart from every other
+/// and at the same address each time they are asked for. A cell's address
+/// never leaves the runtime (the lint refuses that), so the checking is
+/// done here.
+export fn fx_cells_apart() -> i64 {
+    unsafe {
+        let a = mem_process(HITS).as_i64()
+        let b = mem_process(BYTE).as_i64()
+        let c = mem_process(HALF).as_i64()
+        let d = mem_process(WORD).as_i64()
+        let e = mem_process(RATIO).as_i64()
+        let f = mem_process(HELD).as_i64()
+        var n = apart(a, b, c, d, e, f) + apart(b, a, c, d, e, f) + apart(c, a, b, d, e, f)
+        n += apart(d, a, b, c, e, f) + apart(e, a, b, c, d, f) + apart(f, a, b, c, d, e)
+        if mem_process(HITS) != mem_process(HITS) {
+            n = 0
+        }
+        n
+    }
+}
+
+/// 1 when `x` is a nonzero multiple of 8 equal to none of the others.
+fn apart(x: i64, p: i64, q: i64, r: i64, s: i64, t: i64) -> i64 {
+    if x != 0 and x % 8 == 0 and x != p and x != q and x != r and x != s and x != t {
+        1
+    } else {
+        0
+    }
+}
+
+/// One more hit, from any thread; the count after it.
+export fn fx_hit() -> i64 {
+    unsafe {
+        mem_process(HITS).atomic_add_i64(1, SeqCst) + 1
+    }
+}
+
+export fn fx_hits() -> i64 {
+    unsafe {
+        mem_process(HITS).atomic_load_i64(SeqCst)
+    }
+}
+
+/// Stores `v` in the byte cell and answers what it held.
+export fn fx_swap_byte(v: i64) -> i64 {
+    unsafe {
+        let c = mem_process(BYTE)
+        var old = c.atomic_load_u8(SeqCst)
+        while c.atomic_cas_u8(old, v.as_u8(), SeqCst) != old {
+            old = c.atomic_load_u8(SeqCst)
+        }
+        old.as_i64()
+    }
+}
+
+/// Literal `k`'s bytes, 0 to 5; 5 is literal 0 written again.
+export fn fx_static(k: i64) -> addr {
+    unsafe {
+        if k == 0 {
+            return mem_static("out of memory")
+        }
+        if k == 1 {
+            return mem_static("")
+        }
+        if k == 2 {
+            return mem_static("tab\there \"quoted\" back\\slash\n")
+        }
+        if k == 3 {
+            return mem_static("é ✓ 𝄞")
+        }
+        if k == 4 {
+            return mem_static("nul\0inside")
+        }
+        mem_static("out of memory")
+    }
+}
+
+/// Literal `k`'s length in bytes.
+export fn fx_static_len(k: i64) -> i64 {
+    unsafe {
+        if k == 0 {
+            return mem_static_len("out of memory")
+        }
+        if k == 1 {
+            return mem_static_len("")
+        }
+        if k == 2 {
+            return mem_static_len("tab\there \"quoted\" back\\slash\n")
+        }
+        if k == 3 {
+            return mem_static_len("é ✓ 𝄞")
+        }
+        if k == 4 {
+            return mem_static_len("nul\0inside")
+        }
+        mem_static_len("out of memory")
+    }
+}
+
+/// Adds `n` to this thread's cell and answers it.
+export fn fx_mine_add(n: i64) -> i64 {
+    unsafe {
+        let a = mem_tls(MINE)
+        a.store_i64(a.load_i64() + n)
+        a.load_i64()
+    }
+}
+
+export fn fx_mine_addr() -> addr {
+    unsafe {
+        mem_tls(MINE)
+    }
+}
+
+/// This thread's narrow cell, wrapping at 16 bits.
+export fn fx_small_add(n: i64) -> i64 {
+    unsafe {
+        let a = mem_tls(SMALL)
+        a.store_u16(a.load_u16() + n.as_u16())
+        a.load_u16().as_i64()
+    }
+}
+
+export fn fx_switch(from: addr, to: addr) {
+    unsafe {
+        ctx_switch(from, to)
+    }
+}
+
+export fn fx_init(ctx: addr, top: addr, entry: addr, arg: addr) {
+    unsafe {
+        ctx_init(ctx, top, entry, arg)
+    }
+}
+
+// A fiber's record, laid out by driver.c: its own context, the context it
+// yields to, the shared log and its length's cell, its number, how many
+// rounds it runs, and where it leaves its total.
+let R_SELF = 0
+let R_BACK = 8
+let R_LOG = 16
+let R_LEN = 24
+let R_ID = 32
+let R_ROUNDS = 40
+let R_TOTAL = 48
+
+fn log(rec: addr, v: i64) {
+    unsafe {
+        let len = rec.offset(R_LEN).load_addr()
+        let n = len.load_i64()
+        rec.offset(R_LOG).load_addr().offset(8 * n).store_i64(v)
+        len.store_i64(n + 1)
+    }
+}
+
+fn yield_back(rec: addr) {
+    unsafe {
+        ctx_switch(rec.offset(R_SELF).load_addr(), rec.offset(R_BACK).load_addr())
+    }
+}
+
+/// One round: logged, then a switch away from two calls deep, then a value
+/// computed from what was held across the switch.
+fn round(rec: addr, acc: i64, i: i64) -> i64 {
+    let held = acc * 3 + i
+    let id = unsafe { rec.offset(R_ID).load_i64() }
+    log(rec, id * 1000 + i)
+    yield_back(rec)
+    let back = unsafe { rec.offset(R_ID).load_i64() }
+    if back != id {
+        return -1
+    }
+    held % 1000003
+}
+
+/// A fiber's entry, which `ctx_init` makes the first resumption call.
+export fn fx_fiber(rec: addr) {
+    unsafe {
+        let rounds = rec.offset(R_ROUNDS).load_i64()
+        var acc = rec.offset(R_ID).load_i64()
+        var i = 0
+        while i < rounds {
+            acc = round(rec, acc, i)
+            i += 1
+        }
+        rec.offset(R_TOTAL).store_i64(acc)
+        log(rec, rec.offset(R_ID).load_i64() * 1000 + 999)
+        while true {
+            yield_back(rec)
+        }
+    }
+}

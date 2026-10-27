@@ -1,0 +1,10 @@
+//! rtlint: escapes: process cell `bad_escape_store::CELL`'s address stored in memory, where the lint cannot follow it
+// An address put in memory comes back as a value read out of it, which the
+// lint takes for somebody else's memory: so it may not go there.
+process_local CELL: i64
+
+pub fn stash(slot: addr) {
+    unsafe {
+        slot.store_addr(mem_process(CELL))
+    }
+}

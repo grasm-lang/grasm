@@ -109,6 +109,44 @@ for k in "${!S3_SRC[@]}"; do
     fi
 done
 
+# The runtime's objects ([T-RUNTIME], `s3 --runtime`): compiler/rt and the
+# dialect's fixture, which hold what no program does -- process cells in
+# `__bss`, thread-local variables and their TLVP relocations, the leaves --
+# each compiled twice, the same bytes, read by otool and nm, their
+# relocations and line table checked.
+rt_checked=0
+rt_identical=0
+for entry in compiler/rt/src/main.gr scripts/fixtures/rtdialect/src/main.gr; do
+    rt_checked=$((rt_checked + 1))
+    bad=""
+    rm -f "$WORK/a/r.o" "$WORK/b/deeper/r.o"
+    if ! "$GRASM" tir "$entry" >"$WORK/r.tir" 2>"$WORK/r.log" ||
+        ! "$S3" "$WORK/r.tir" -o "$WORK/a/r.o" --runtime >>"$WORK/r.log" 2>&1 ||
+        ! "$S3" "$WORK/r.tir" -o "$WORK/b/deeper/r.o" --runtime >>"$WORK/r.log" 2>&1; then
+        problems=$((problems + 1))
+        FAILED+=("$entry — the backend does not compile it: $(head -1 "$WORK/r.log")")
+        continue
+    fi
+    if cmp -s "$WORK/a/r.o" "$WORK/b/deeper/r.o"; then
+        rt_identical=$((rt_identical + 1))
+    else
+        bad="$bad; two compilations differ"
+    fi
+    otool -l "$WORK/a/r.o" >"$WORK/otool.txt" 2>&1 || bad="$bad; otool -l refuses it"
+    nm "$WORK/a/r.o" >"$WORK/nm.txt" 2>&1 || bad="$bad; nm refuses it"
+    if ! python3 scripts/s3_macho.py relocs "$WORK/a/r.o" >"$WORK/relocs.txt" 2>&1; then
+        bad="$bad; relocations: $(head -2 "$WORK/relocs.txt" | tr '\n' ' ')"
+    fi
+    if ! dwarfdump --verify "$WORK/a/r.o" >"$WORK/verify.txt" 2>&1 || ! grep -cx "No errors." "$WORK/verify.txt" >/dev/null; then
+        bad="$bad; dwarfdump --verify: $(grep -iE 'error|warning' "$WORK/verify.txt" | head -2 | tr '\n' ' ')"
+    fi
+    if [ -n "$bad" ]; then
+        problems=$((problems + 1))
+        FAILED+=("$entry (--runtime)${bad}")
+    fi
+done
+
+echo "runtime objects: $rt_checked   reproducible: $rt_identical"
 echo "objects: $checked   reproducible: $identical   literal loads on their lines: $lines_checked   with problems: $problems"
 if [ ${#FAILED[@]} -gt 0 ]; then
     echo
@@ -117,6 +155,7 @@ if [ ${#FAILED[@]} -gt 0 ]; then
 fi
 [ "$problems" -eq 0 ] || exit 1
 [ "$identical" -eq "$checked" ] || exit 1
+[ "$rt_identical" -eq 2 ] || exit 1
 if [ -z "${DIRS:-}" ] && [ "$checked" -lt "$S3_SUBSET_FLOOR" ]; then
     echo "only $checked objects were checked; the subset's floor is $S3_SUBSET_FLOOR"
     exit 1

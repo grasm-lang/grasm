@@ -134,6 +134,9 @@ run_gate rtswap        scripts/rtswap.sh
 run_gate fuzz_rtfmt    scripts/fuzz_rtfmt.sh
 run_gate fuzz_rtmath   scripts/fuzz_rtmath.sh
 run_gate rtcontrols    scripts/rtcontrols.sh
+run_gate rtdialect     scripts/rtdialect.sh
+run_gate rtdialectcontrols scripts/rtdialectcontrols.sh
+run_gate rtlint        scripts/rtlint.sh
 run_gate tokentest     scripts/tokentest.sh
 run_gate asttest       scripts/asttest.sh
 run_gate parsediag     scripts/parsediag.sh

@@ -1,0 +1,12 @@
+//! rtlint: plain: a plain store of process cell `bad_match::CELL`
+// A pattern binds what it matches.
+process_local CELL: i64
+
+pub fn poke(k: i64) {
+    unsafe {
+        match mem_process(CELL).as_i64() + k {
+            0 -> ()
+            n -> mem_addr(n).store_i64(1)
+        }
+    }
+}

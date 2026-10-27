@@ -18,6 +18,7 @@ import backtrack
 import check
 import emit
 import enctest
+import leaves
 import mir.ir
 
 type A64Opts = {
@@ -109,6 +110,10 @@ pub fn emittable_forms() -> [str] {
     for m in [mach.A_MOV, mach.A_BL, mach.A_LDR, mach.A_STR, mach.A_PACIBSP, mach.A_STP_PRE, mach.A_LDP_POST, mach.A_ADDI, mach.A_SUBI, mach.A_RETAB, mach.A_B, mach.A_BCOND, mach.A_CBZ, mach.A_CBNZ, mach.A_FMOV, mach.A_FLDR, mach.A_FSTR, mach.A_FSTP_PRE, mach.A_FLDP_POST, mach.A_BLR] {
         seen[m] = true
     }
+    // The runtime dialect's leaves (`leaves.gr`).
+    for m in leaves.leaf_mops() {
+        seen[m] = true
+    }
     var out: [str] = []
     for m in 0..mach.NMOPS {
         if seen[m] {
@@ -120,4 +125,10 @@ pub fn emittable_forms() -> [str] {
 
 pub fn encode_cases() -> EncCases ! str {
     enctest.cases()
+}
+
+/// The fixed leaves the runtime's call of `rt_name` needs ([T-RUNTIME]),
+/// given its thread-local cells; none when the name is not one of them.
+pub fn leaves_for(rt_name: str, cells: [str]) -> [A64Leaf] ! str {
+    leaves.leaves_for(rt_name, cells)
 }

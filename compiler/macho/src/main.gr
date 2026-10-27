@@ -8,8 +8,13 @@
 //                             and __DATA,__data for what the runtime writes
 //                             into (a struct descriptor's cache), with its
 //                             pointers as ARM64_RELOC_UNSIGNED relocations;
-//                             then the __DWARF sections of the line table
-//                             (`dwarf.gr`), as clang places them
+//                             the runtime's thread-local variables'
+//                             descriptors (__DATA,__thread_vars); then the
+//                             __DWARF sections of the line table
+//                             (`dwarf.gr`), as clang places them; and last,
+//                             taking no room in the file, the zero-filled
+//                             __thread_bss and __bss: the templates of those
+//                             variables and the runtime's process cells
 //     LC_BUILD_VERSION        macOS; the Cranelift build omits it, and ld then
 //                             warns "no platform load command found"
 //     LC_SYMTAB, LC_DYSYMTAB  locals, then defined externals, then undefined
@@ -51,6 +56,19 @@ type MoObj = {
     wbytes: [bytes],
     wrel_off: [i64],
     wrel_sym: [str],
+    /// Zeroed data in `__DATA,__bss`, each a local symbol of its own, of
+    /// `zsize` bytes at a multiple of 8: the runtime's process cells
+    /// ([T-RUNTIME]).
+    zsym: [str],
+    zsize: [i64],
+    /// Thread-local variables, as clang lays them out: a local descriptor
+    /// `tsym` of three words in `__DATA,__thread_vars` -- the thunk
+    /// (`__tlv_bootstrap`, bound by the linker), a key, and the address of
+    /// the variable's template -- and the template `tsym$tlv$init`, `tsize`
+    /// zeroed bytes at a multiple of 8 in `__DATA,__thread_bss`. Code finds a
+    /// descriptor through `R_TLVP_PAGE21` and `R_TLVP_PAGEOFF12`.
+    tsym: [str],
+    tsize: [i64],
     /// The line table and what it needs (`dwarf.gr`), written when `debug`.
     debug: bool,
     dw: DwUnit,
@@ -64,11 +82,16 @@ pub let R_PAGEOFF12 = 4
 /// its offset in the page (`ARM64_RELOC_GOT_LOAD_PAGE21`, `_PAGEOFF12`).
 pub let R_GOT_PAGE21 = 5
 pub let R_GOT_PAGEOFF12 = 6
+/// A thread-local variable's descriptor: its page, pc-relative, and its
+/// offset in the page (`ARM64_RELOC_TLVP_LOAD_PAGE21`, `_PAGEOFF12`).
+pub let R_TLVP_PAGE21 = 8
+pub let R_TLVP_PAGEOFF12 = 9
 
 pub fn new_obj() -> MoObj {
     MoObj{
         text: [], fsym: [], foff: [], fext: [], rel_off: [], rel_kind: [], rel_sym: [], dsym: [], dbytes: [],
-        wsym: [], wbytes: [], wrel_off: [], wrel_sym: [], debug: false, dw: dwarf.new_unit(),
+        wsym: [], wbytes: [], wrel_off: [], wrel_sym: [], zsym: [], zsize: [], tsym: [], tsize: [], debug: false,
+        dw: dwarf.new_unit(),
     }
 }
 
@@ -174,6 +197,11 @@ pub fn write(o: MoObj) -> bytes ! str {
         nsect += 1
         data_sect = nsect
     }
+    var tvars_sect = -1
+    if o.tsym.len() > 0 {
+        nsect += 1
+        tvars_sect = nsect
+    }
     // The debug sections, if any: abbreviations, the compile unit, its
     // strings and the line table, in the order clang writes them.
     var dw = dwarf.sections(dwarf.new_unit(), [], 0)
@@ -181,16 +209,44 @@ pub fn write(o: MoObj) -> bytes ! str {
         dw = dwarf.sections(o.dw, o.foff, text_size)
         nsect += 4
     }
+    // The zero-filled sections come last, as they do in clang's objects.
+    var tbss_sect = -1
+    var bss_sect = -1
+    if o.tsym.len() > 0 {
+        nsect += 1
+        tbss_sect = nsect
+    }
+    if o.zsym.len() > 0 {
+        nsect += 1
+        bss_sect = nsect
+    }
     // Addresses within the segment.
     let text_addr = 0
     let cstr_addr = text_size
     let const_addr = cstr_addr + cstr_size
     let data_addr = if data_sect > 0 { align_up(const_addr + const_size, 8) } else { const_addr + const_size }
-    let abbrev_addr = data_addr + data_size
+    let tvars_addr = if tvars_sect > 0 { align_up(data_addr + data_size, 8) } else { data_addr + data_size }
+    let tvars_size = 24 * o.tsym.len()
+    let abbrev_addr = tvars_addr + tvars_size
     let info_addr = abbrev_addr + dw.abbrev.len()
     let dstr_addr = info_addr + dw.info.len()
     let line_addr = dstr_addr + dw.str.len()
-    let vmsize = if o.debug { line_addr + dw.line.len() } else { data_addr + data_size }
+    let filesize = if o.debug { line_addr + dw.line.len() } else { tvars_addr + tvars_size }
+    var tbss_off: [i64] = []
+    var tbss_size = 0
+    for k in 0..o.tsym.len() {
+        tbss_off.push(tbss_size)
+        tbss_size += align_up(o.tsize[k], 8)
+    }
+    var bss_off: [i64] = []
+    var bss_size = 0
+    for k in 0..o.zsym.len() {
+        bss_off.push(bss_size)
+        bss_size += align_up(o.zsize[k], 8)
+    }
+    let tbss_addr = align_up(filesize, 8)
+    let bss_addr = tbss_addr + tbss_size
+    let vmsize = if tbss_size + bss_size > 0 { bss_addr + bss_size } else { filesize }
     // Where each datum sits.
     var daddr: [i64] = []
     var dsect: [i64] = []
@@ -248,6 +304,28 @@ pub fn write(o: MoObj) -> bytes ! str {
         ssect.push(data_sect)
         svalue.push(data_addr + wsym_off[k])
     }
+    for k in 0..o.tsym.len() {
+        defined.set(o.tsym[k], sname.len())
+        sname.push(o.tsym[k])
+        stype.push(14)
+        ssect.push(tvars_sect)
+        svalue.push(tvars_addr + 24 * k)
+    }
+    for k in 0..o.tsym.len() {
+        let init = o.tsym[k] + "$tlv$init"
+        defined.set(init, sname.len())
+        sname.push(init)
+        stype.push(14)
+        ssect.push(tbss_sect)
+        svalue.push(tbss_addr + tbss_off[k])
+    }
+    for k in 0..o.zsym.len() {
+        defined.set(o.zsym[k], sname.len())
+        sname.push(o.zsym[k])
+        stype.push(14)
+        ssect.push(bss_sect)
+        svalue.push(bss_addr + bss_off[k])
+    }
     let nlocal = sname.len()
     var ext: [str] = []
     for k in 0..o.fsym.len() {
@@ -283,6 +361,10 @@ pub fn write(o: MoObj) -> bytes ! str {
             seen.set(s, 1)
             undef.push(s)
         }
+    }
+    if o.tsym.len() > 0 and not seen.has("__tlv_bootstrap") {
+        seen.set("__tlv_bootstrap", 1)
+        undef.push("__tlv_bootstrap")
     }
     undef.sort()
     for name in undef {
@@ -328,9 +410,9 @@ pub fn write(o: MoObj) -> bytes ! str {
         }
         let kind = o.rel_kind[k]
         var pcrel = 0
-        if kind == R_BRANCH26 or kind == R_PAGE21 or kind == R_GOT_PAGE21 {
+        if kind == R_BRANCH26 or kind == R_PAGE21 or kind == R_GOT_PAGE21 or kind == R_TLVP_PAGE21 {
             pcrel = 1
-        } else if kind != R_PAGEOFF12 and kind != R_GOT_PAGEOFF12 {
+        } else if kind != R_PAGEOFF12 and kind != R_GOT_PAGEOFF12 and kind != R_TLVP_PAGEOFF12 {
             fail("relocation kind {kind} is not one this writer knows")
         }
         put32(rels, o.rel_off[k])
@@ -365,6 +447,19 @@ pub fn write(o: MoObj) -> bytes ! str {
         put32(drels, sym.bit_or(3.shl(25)).bit_or(1.shl(27)).bit_or(R_UNSIGNED.shl(28)))
         dq -= 1
     }
+    // The thread-local descriptors' two pointers each -- the thunk and the
+    // template -- 64-bit absolute, last address first, as clang's.
+    var trels = byte_builder()
+    var tk = o.tsym.len() - 1
+    while tk >= 0 {
+        let init = defined.get(o.tsym[tk] + "$tlv$init") ?? -1
+        let boot = defined.get("__tlv_bootstrap") ?? -1
+        put32(trels, 24 * tk + 16)
+        put32(trels, init.bit_or(3.shl(25)).bit_or(1.shl(27)).bit_or(R_UNSIGNED.shl(28)))
+        put32(trels, 24 * tk)
+        put32(trels, boot.bit_or(3.shl(25)).bit_or(1.shl(27)).bit_or(R_UNSIGNED.shl(28)))
+        tk -= 1
+    }
     // The debug sections' addresses: 64-bit absolute, against `__text`
     // (section 1) rather than a symbol, last address first, as clang's.
     var irels = byte_builder()
@@ -386,9 +481,10 @@ pub fn write(o: MoObj) -> bytes ! str {
     let seg_cmd_size = 72 + 80 * nsect
     let sizeofcmds = seg_cmd_size + 24 + 24 + 80
     let data_off = align_up(32 + sizeofcmds, 16)
-    let rel_off = align_up(data_off + vmsize, 8)
+    let rel_off = align_up(data_off + filesize, 8)
     let drel_off = rel_off + rels.len()
-    let irel_off = drel_off + drels.len()
+    let trel_off = drel_off + drels.len()
+    let irel_off = trel_off + trels.len()
     let lrel_off = irel_off + irels.len()
     let sym_off = align_up(lrel_off + lrels.len(), 8)
     let str_off = sym_off + 16 * nsyms
@@ -410,7 +506,7 @@ pub fn write(o: MoObj) -> bytes ! str {
     put64(b, 0)
     put64(b, vmsize)
     put64(b, data_off)
-    put64(b, vmsize)
+    put64(b, filesize)
     put32(b, 7)
     put32(b, 7)
     put32(b, nsect)
@@ -472,6 +568,21 @@ pub fn write(o: MoObj) -> bytes ! str {
         put32(b, 0)
         put32(b, 0)
     }
+    if tvars_sect > 0 {
+        // S_THREAD_LOCAL_VARIABLES, aligned to 2^3.
+        name16(b, "__thread_vars")
+        name16(b, "__DATA")
+        put64(b, tvars_addr)
+        put64(b, tvars_size)
+        put32(b, data_off + tvars_addr)
+        put32(b, 3)
+        put32(b, trel_off)
+        put32(b, 2 * o.tsym.len())
+        put32(b, 0x13)
+        put32(b, 0)
+        put32(b, 0)
+        put32(b, 0)
+    }
     if o.debug {
         // S_REGULAR with S_ATTR_DEBUG, byte-aligned: the linker leaves them
         // in the object, for `dsymutil` and debuggers.
@@ -494,6 +605,36 @@ pub fn write(o: MoObj) -> bytes ! str {
             put32(b, 0)
             put32(b, 0)
         }
+    }
+    if tbss_sect > 0 {
+        // S_THREAD_LOCAL_ZEROFILL, aligned to 2^3, nothing in the file.
+        name16(b, "__thread_bss")
+        name16(b, "__DATA")
+        put64(b, tbss_addr)
+        put64(b, tbss_size)
+        put32(b, 0)
+        put32(b, 3)
+        put32(b, 0)
+        put32(b, 0)
+        put32(b, 0x12)
+        put32(b, 0)
+        put32(b, 0)
+        put32(b, 0)
+    }
+    if bss_sect > 0 {
+        // S_ZEROFILL, aligned to 2^3, nothing in the file.
+        name16(b, "__bss")
+        name16(b, "__DATA")
+        put64(b, bss_addr)
+        put64(b, bss_size)
+        put32(b, 0)
+        put32(b, 3)
+        put32(b, 0)
+        put32(b, 0)
+        put32(b, 0x01)
+        put32(b, 0)
+        put32(b, 0)
+        put32(b, 0)
     }
     // LC_BUILD_VERSION: macOS, minimum 11.0, SDK 11.0, no tools.
     put32(b, 0x32)
@@ -547,6 +688,16 @@ pub fn write(o: MoObj) -> bytes ! str {
             }
         }
     }
+    if tvars_sect > 0 {
+        while b.len() < data_off + tvars_addr {
+            put8(b, 0)
+        }
+        // Each descriptor's words are zero: the linker writes the thunk and
+        // the template's place in them.
+        for k in 0..tvars_size {
+            put8(b, 0)
+        }
+    }
     if o.debug {
         while b.len() < data_off + abbrev_addr {
             put8(b, 0)
@@ -556,12 +707,13 @@ pub fn write(o: MoObj) -> bytes ! str {
         b.push_bytes(dw.str)
         b.push_bytes(dw.line)
     }
-    if b.len() != data_off + vmsize {
-        fail("section contents end at {b.len()}, not {data_off + vmsize}")
+    if b.len() != data_off + filesize {
+        fail("section contents end at {b.len()}, not {data_off + filesize}")
     }
     pad_to(b, 8)
     b.push_bytes(rels.to_bytes())
     b.push_bytes(drels.to_bytes())
+    b.push_bytes(trels.to_bytes())
     b.push_bytes(irels.to_bytes())
     b.push_bytes(lrels.to_bytes())
     pad_to(b, 8)

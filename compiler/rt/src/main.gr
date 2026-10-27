@@ -23,10 +23,14 @@
 //   * no Grasm heap value -- no `str`, list, map, struct or closure: only
 //     the layout types and raw memory, so nothing here calls the runtime
 //     it is part of to make one;
-//   * no thread-local cell and no process-wide state: the program's cells
-//     share one block with the runtime's, laid out by the program's own
-//     compilation, and Grasm has no global;
-//   * fixed text is code (`text.gr`, written by `gen_text.py`);
+//   * state only through the runtime dialect, which this package alone may
+//     use (`runtime = true`, [T-RUNTIME], docs/self-hosting.md §5.6): what is
+//     one per process in `process_local` cells, every access to one atomic
+//     or under a lock built from atomics, as `scripts/rtlint.py` requires;
+//     what is one per thread in its own `thread_local` cells, which the Grasm
+//     backend makes Mach-O thread-local variables, never the program's block;
+//   * fixed text is code (`text.gr`, written by `gen_text.py`) until the
+//     panic path moves; `mem_static` can hold it as bytes;
 //   * every layout it reads or writes is in `layout.gr` and checked against
 //     the Rust runtime's by `scripts/rtlayout.sh`.
 //

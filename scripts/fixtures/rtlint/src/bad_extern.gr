@@ -1,0 +1,11 @@
+//! rtlint: handed: process cell `bad_extern::BUF`'s address handed to C function `bad_extern::memset`
+// C touches what it is handed however it likes.
+process_local BUF: i64
+
+extern fn memset(p: addr, c: i32, n: i64) -> addr
+
+pub fn clear() {
+    unsafe {
+        memset(mem_process(BUF), 0, 8)
+    }
+}

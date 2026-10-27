@@ -1,0 +1,199 @@
+// The runtime dialect's leaves ([T-RUNTIME], docs/self-hosting.md §5.5 and
+// §5.6): fixed functions the backend writes into the runtime's object when
+// its code calls them, each reached by `bl` from compiled code as any C
+// function is, so the calling convention -- not the allocator -- decides
+// what a call to one may change.
+//
+//     _grt.ctx_switch(from, to)   saves this context at `from`, resumes `to`
+//     _grt.ctx_init(ctx, top, entry, arg)
+//                                 a context whose first resumption calls
+//                                 `entry(arg)` on the stack below `top`
+//     _grt.ctx_start              where that first resumption lands
+//     _grt.tlv.<cell>             the address of the calling thread's copy
+//                                 of a runtime thread-local variable
+//
+// A context is CTX_SIZE bytes: x19..x28 in pairs from 0, x29 and x30 at 80,
+// sp at 96, a word kept zero at 104, then d8..d15 in pairs from 112 -- what
+// AAPCS64 has a callee preserve, and nothing else, since a switch is a call
+// to whoever made it.
+//
+// `ctx_switch` and `ctx_init` are leaves with no frame of their own: they
+// sign and authenticate nothing. The return address `ctx_switch` saves is
+// the one `bl` left in x30, unsigned, and it returns with a plain `ret`
+// into whichever context it loaded: each function on the other stack signed
+// its own return address against that stack's `sp` on entry (`pacibsp`)
+// and authenticates it on the way out (`retab`), and the stack comes back
+// with the context, so return-address signing keeps working on both sides
+// of a switch. `_grt.ctx_start` is entered by that `ret` with `x19` the
+// entry and `x20` its argument; the entry never returns, and if it does the
+// `brk` stops the program. The thread-local getter is an ordinary function
+// with a frame, signed as every compiled function is: it calls the
+// variable's thunk (`__tlv_bootstrap`'s, bound by the linker), which
+// answers the address in x0.
+import mach
+import mir.ir
+
+type A64Leaf = {
+    sym: str,
+    words: [i64],
+    /// Relocations: byte offset in the leaf, kind (`emit.REL_*`, plus
+    /// `REL_TLVP_PAGE21` and `REL_TLVP_PAGEOFF12`), the symbol.
+    rel_off: [i64],
+    rel_kind: [i64],
+    rel_name: [str],
+    asm: [str],
+}
+
+pub let CTX_SIZE = 176
+/// Where `sp` is kept in a context.
+pub let CTX_SP = 96
+/// Where the saved d8..d15 begin.
+pub let CTX_D8 = 112
+
+pub let REL_PAGE21 = 3
+pub let REL_PAGEOFF12 = 4
+/// `ARM64_RELOC_TLVP_LOAD_PAGE21` and `_PAGEOFF12`: a thread-local
+/// variable's descriptor, its page and its offset in it.
+pub let REL_TLVP_PAGE21 = 8
+pub let REL_TLVP_PAGEOFF12 = 9
+
+fn new_leaf(sym: str) -> A64Leaf {
+    A64Leaf{ sym: sym, words: [], rel_off: [], rel_kind: [], rel_name: [], asm: [] }
+}
+
+fn put(inout l: A64Leaf, m: i64, rd: i64, rn: i64, rm: i64, imm: i64) -> () ! str {
+    let w = try mach.encode(m, rd, rn, rm, -1, imm, 0, -1, 0)
+    l.words.push(w)
+    l.asm.push(mach.asm_text(m, rd, rn, rm, -1, imm, 0, -1, 0, ""))
+    ()
+}
+
+/// An instruction the linker completes against `name`.
+fn put_rel(inout l: A64Leaf, m: i64, rd: i64, rn: i64, kind: i64, name: str) -> () ! str {
+    l.rel_off.push(4 * l.words.len())
+    l.rel_kind.push(kind)
+    l.rel_name.push(name)
+    let w = try mach.encode(m, rd, rn, -1, -1, 0, 0, -1, 0)
+    l.words.push(w)
+    l.asm.push(mach.asm_text(m, rd, rn, -1, -1, 0, 0, -1, 0, name))
+    ()
+}
+
+/// `ctx_switch(from: x0, to: x1)`.
+fn switch_leaf() -> A64Leaf ! str {
+    var l = new_leaf("_grt.ctx_switch")
+    var k = 0
+    while k < 6 {
+        try put(l, mach.A_STP_OFF, 19 + 2 * k, 0, 20 + 2 * k, 16 * k)
+        k += 1
+    }
+    // `mov x9, sp`, then the word.
+    try put(l, mach.A_ADDI, 9, mach.R_SP, -1, 0)
+    try put(l, mach.A_STR, 9, 0, -1, CTX_SP)
+    k = 0
+    while k < 4 {
+        try put(l, mach.A_FSTP_OFF, mach.R_D0 + 8 + 2 * k, 0, mach.R_D0 + 9 + 2 * k, CTX_D8 + 16 * k)
+        k += 1
+    }
+    k = 0
+    while k < 6 {
+        try put(l, mach.A_LDP_OFF, 19 + 2 * k, 1, 20 + 2 * k, 16 * k)
+        k += 1
+    }
+    try put(l, mach.A_LDR, 9, 1, -1, CTX_SP)
+    // `mov sp, x9`.
+    try put(l, mach.A_ADDI, mach.R_SP, 9, -1, 0)
+    k = 0
+    while k < 4 {
+        try put(l, mach.A_FLDP_OFF, mach.R_D0 + 8 + 2 * k, 1, mach.R_D0 + 9 + 2 * k, CTX_D8 + 16 * k)
+        k += 1
+    }
+    try put(l, mach.A_RET, -1, -1, -1, 0)
+    l
+}
+
+/// `ctx_init(ctx: x0, top: x1, entry: x2, arg: x3)`.
+fn init_leaf() -> A64Leaf ! str {
+    var l = new_leaf("_grt.ctx_init")
+    // sp: the top rounded down to 16 bytes, as AAPCS64 keeps it.
+    try put(l, mach.A_MOVZ, 10, -1, -1, 4)
+    try put(l, mach.A_LSRV, 9, 1, 10, 0)
+    try put(l, mach.A_LSLV, 9, 9, 10, 0)
+    try put(l, mach.A_STR, 9, 0, -1, CTX_SP)
+    try put(l, mach.A_STR, mach.R_ZR, 0, -1, CTX_SP + 8)
+    // x19 the entry, x20 its argument, the rest zero; x29 zero, so a
+    // backtrace stops at the start; x30 where the first resumption lands.
+    try put(l, mach.A_STP_OFF, 2, 0, 3, 0)
+    var k = 1
+    while k < 5 {
+        try put(l, mach.A_STP_OFF, mach.R_ZR, 0, mach.R_ZR, 16 * k)
+        k += 1
+    }
+    try put_rel(l, mach.A_ADRP, 10, -1, REL_PAGE21, "_grt.ctx_start")
+    l.rel_off.push(4 * l.words.len())
+    l.rel_kind.push(REL_PAGEOFF12)
+    l.rel_name.push("_grt.ctx_start")
+    l.words.push(try mach.encode(mach.A_ADDPO, 10, 10, -1, -1, 0, 0, -1, 0))
+    l.asm.push(mach.asm_text(mach.A_ADDPO, 10, 10, -1, -1, 0, 0, -1, 0, "_grt.ctx_start"))
+    try put(l, mach.A_STP_OFF, mach.R_ZR, 0, 10, 80)
+    k = 0
+    while k < 4 {
+        try put(l, mach.A_STP_OFF, mach.R_ZR, 0, mach.R_ZR, CTX_D8 + 16 * k)
+        k += 1
+    }
+    try put(l, mach.A_RET, -1, -1, -1, 0)
+    l
+}
+
+/// Where a context made by `ctx_init` first resumes.
+fn start_leaf() -> A64Leaf ! str {
+    var l = new_leaf("_grt.ctx_start")
+    try put(l, mach.A_MOV, 0, -1, 20, 0)
+    try put(l, mach.A_BLR, -1, 19, -1, 0)
+    try put(l, mach.A_BRK, -1, -1, -1, 1)
+    l
+}
+
+/// The address of the calling thread's copy of runtime thread-local
+/// variable `cell`.
+fn tlv_get(cell: str) -> A64Leaf ! str {
+    var l = new_leaf("_" + ir.rt_tlv_getter(cell))
+    let v = ir.tlv_var_sym(cell)
+    try put(l, mach.A_PACIBSP, -1, -1, -1, 0)
+    try put(l, mach.A_STP_PRE, mach.R_FP, mach.R_SP, 30, -16)
+    try put(l, mach.A_ADDI, mach.R_FP, mach.R_SP, -1, 0)
+    try put_rel(l, mach.A_ADRP_TLV, 0, -1, REL_TLVP_PAGE21, v)
+    try put_rel(l, mach.A_LDR_TLV, 0, 0, REL_TLVP_PAGEOFF12, v)
+    try put(l, mach.A_LDR, 16, 0, -1, 0)
+    try put(l, mach.A_BLR, -1, 16, -1, 0)
+    try put(l, mach.A_LDP_POST, mach.R_FP, mach.R_SP, 30, 16)
+    try put(l, mach.A_RETAB, -1, -1, -1, 0)
+    l
+}
+
+/// The leaves a runtime that calls `rt_name` (a `MirProg.rt_syms` name such
+/// as `grt.ctx_switch`) needs, given its thread-local cells: none when the
+/// name is not one of them.
+pub fn leaves_for(rt_name: str, cells: [str]) -> [A64Leaf] ! str {
+    if rt_name == ir.RT_CTX_SWITCH {
+        return [try switch_leaf()]
+    }
+    if rt_name == ir.RT_CTX_INIT {
+        return [try init_leaf(), try start_leaf()]
+    }
+    for c in cells {
+        if rt_name == ir.rt_tlv_getter(c) {
+            return [try tlv_get(c)]
+        }
+    }
+    []
+}
+
+/// Every form a leaf writes, for `emittable_forms`.
+pub fn leaf_mops() -> [i64] {
+    [
+        mach.A_STP_OFF, mach.A_LDP_OFF, mach.A_FSTP_OFF, mach.A_FLDP_OFF, mach.A_ADDI, mach.A_STR, mach.A_LDR,
+        mach.A_RET, mach.A_MOVZ, mach.A_LSRV, mach.A_LSLV, mach.A_ADRP, mach.A_ADDPO, mach.A_MOV, mach.A_BLR,
+        mach.A_BRK, mach.A_PACIBSP, mach.A_STP_PRE, mach.A_ADRP_TLV, mach.A_LDR_TLV, mach.A_LDP_POST, mach.A_RETAB,
+    ]
+}

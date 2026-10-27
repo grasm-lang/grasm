@@ -1,0 +1,9 @@
+//! rtlint: plain: a plain store of process cell `bad_store::CELL` outside a function holding its lock
+// A plain store to a shared cell: a data race between threads.
+process_local CELL: i64
+
+pub fn set(v: i64) {
+    unsafe {
+        mem_process(CELL).store_i64(v)
+    }
+}

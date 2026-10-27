@@ -678,11 +678,11 @@ did not are the raw-memory programs (four from part two, and T-TLS) waiting
 for the sandbox another branch is adding to it. Seventeen planted faults, one
 per engine per feature at least, were each caught.
 
-### 5.6 The runtime dialect: what S5 part two needs (proposed)
+### 5.6 The runtime dialect: what S5 part two needs
 
 Written 2026-10-26, after S5 part one (§6.7) moved the runtime's stateless
-families and stopped where state begins. Not built; this is the design to
-build to, and the owner may still reject it.
+families and stopped where state begins, as the design to build to; built
+on 2026-10-27 (§6.9), with the differences the status below lists.
 
 **What is missing.** Four things the Rust runtime has and the systems subset
 does not give, each found by part one:
@@ -751,6 +751,18 @@ cell); `rtlint`'s refusals as conformance cases of the dialect; the
 context switch against a model of which fiber runs, with pointer
 authentication on, as §5.5 asks; and the checker's refusals outside a
 runtime package, one per facility.
+
+**Status.** Built to this design on 2026-10-27 (§6.9), with four
+differences. The switch and the context maker are ordinary `builtin` nodes
+in TIR, as every other raw-memory operation is, not a `(ctxswitch ...)`
+form; `mem_process` names its cell as `(processname "m::C")` and the static
+literal is `(mstatic "...")` under a `builtin`. They are lowered to calls of
+leaves the backend writes into the runtime's object rather than inline, so
+the calling convention says what a switch may change, and the runtime's
+own thread-local variable is reached through a getter leaf for the same
+reason. rtlint's marks are doc comments (`/// rtlint: guarded by L`,
+`/// rtlint: holds L`). And the five names are built in for every package,
+as every built-in's is: no package declared one.
 
 ## 6. Order of work
 
@@ -1603,6 +1615,162 @@ whole variables, and each struct is assembled once at the end; the first
 AST builder, which passed the AST as a field, took 7.6 s on a 7,000-line
 file and now takes 30 ms. The rest of the compiler will want the same.
 
+### 6.9 S5 part two: the runtime dialect
+
+§5.6's design, built on 2026-10-27, and steps one to three of the brief:
+the dialect in both frontends, its lowering by the Grasm backend, and the
+lint that guards it. The runtime's state has not moved yet: the box
+allocator, the release walk, the output buffer, the panic path and the map
+seed are still the Rust runtime's, and compiler/rt uses no part of the
+dialect so far.
+
+**The dialect, in both frontends.** A package whose `grasm.toml` says
+`runtime = true` may write `process_local NAME: T`, `mem_process(NAME)`,
+`mem_static("text")`, `mem_static_len("text")`, `ctx_switch(from, to)` and
+`ctx_init(ctx, top, entry, arg)` ([T-RUNTIME]). compiler/rt says it, and
+two fixtures under `scripts/fixtures` exist to test it; nothing else does.
+Anywhere else the checker refuses each part by name, with one diagnostic
+per use: "a process cell is the runtime's; this package is not one",
+"`ctx_switch` is the runtime's; this package is not one". Inside one, each
+is a raw-memory operation -- inside `unsafe`, performing `mem` -- whose
+cell or literal is a name, never a value; a process cell keeps [T-TLS]'s
+rules (a layout type, private to its module, never `pub`). The manifest's
+key is a boolean `grasm_pkg` parses; the loader reads it from the manifest
+above each file, as it already reads dependencies, and hands the checker
+the runtime package's modules. `grasm run`, `test`, `bench`, a bundled
+build and the Cranelift build refuse a runtime package by name before they
+do anything ("package `rt` is a runtime package (`runtime = true` in its
+grasm.toml), so the interpreter does not take it ..."), and the interpreter
+panics if it ever reaches a dialect operation. TIR gains `(processlocal
+"m::C" i64)`, `(processname "m::C")` and `(mstatic "...")`; the switch and
+the context maker are ordinary `builtin` nodes over addresses rather than
+the `(ctxswitch ...)` §5.6 proposed, as every other raw-memory operation
+is. compiler/front lexes and parses `process_local` as the Rust parser
+does, a word only before a name and a colon.
+
+What changed for every other package is one thing: the five names are
+built in, as every built-in's name is, so a function can no longer be
+called `ctx_switch`. Nothing in the repository was, and
+`no_builtin_takes_a_name_the_corpus_already_uses` holds it so. compiler/rt's
+probes are ordinary programs the Cranelift build links with the Rust
+runtime, so they became a package of their own
+(`compiler/rt/probe/grasm.toml`) rather than part of a package the Cranelift
+build now refuses. The Grasm runtime's TIR is byte for byte what it was.
+
+**Lowered by the Grasm backend** (`s3 --runtime`; without the flag a TIR
+holding any part of the dialect is refused by name before anything else):
+
+- a process cell is a local symbol `_grt.cell.<module>.<name>` in
+  `__DATA,__bss` (S_ZEROFILL, eight-byte aligned, no room in the file),
+  addressed by `adrp`/`add` -- a new MIR operation, `celladdr`, and one rule;
+- `mem_static` is the literal's address in `__TEXT,__cstring`, where the
+  object writer ends it with a NUL; a literal holding a NUL of its own goes
+  to `__TEXT,__const` with one added. `mem_static_len` is a constant;
+- the runtime's own `thread_local` cells are Mach-O thread-local variables,
+  laid out as clang lays them out: a descriptor `_grt.tls.<module>.<name>`
+  in `__thread_vars` whose thunk is bound to `__tlv_bootstrap` and whose
+  third word is the template `..$tlv$init` in `__thread_bss`. `mem_tls` of
+  one calls a getter the backend writes, `_grt.tlv.<module>.<name>`:
+  `adrp`/`ldr` through the TLVP relocations, the thunk called, a frame and
+  `pacibsp`/`retab` like any compiled function. A program's cells keep
+  §5.3's block, which is laid out by the program and never meets these;
+- `ctx_switch` and `ctx_init` are calls of leaves the backend writes into the
+  object (`compiler/aarch64/src/leaves.gr`) -- `bl`, so the calling
+  convention, not the allocator, decides what a switch may change, which is
+  what a switch is to whoever made it. A context is 176 bytes: x19..x28,
+  x29 and x30 in pairs, sp, a zero word, d8..d15. `_grt.ctx_switch` stores
+  the caller's and loads the other's with ten `stp` and ten `ldp` and a
+  plain `ret`; `_grt.ctx_init` writes a context whose sp is the top rounded
+  down to sixteen, whose x19 and x20 are the entry and its argument, whose
+  x29 is zero and whose x30 is `_grt.ctx_start`, which moves the argument
+  to x0, calls the entry with `blr` and stops at a `brk` should it return.
+  None of the three signs or authenticates anything: the return address
+  the switch saves is the one `bl` left unsigned in x30, each function on
+  either stack signed its own against that stack's sp on entry and
+  authenticates it on return, and the stack comes back with the context.
+  One fact about this machine bounds what that shows: in an arm64 (not
+  arm64e) process the return-address keys are off -- `pacibsp` leaves an
+  address as it was, which `rtdialect` reports -- so the signing on both
+  sides of a switch is there and runs, but nothing enforces it. Showing it
+  enforced needs an arm64e process, and none was built here.
+
+Six instruction forms are new -- `stp`/`ldp` of general and floating-point
+pairs at a signed offset without write-back, and `adrp`/`ldr` through
+TLVP relocations -- and each is in `encodetest`. The object writer gains
+the zero-filled sections (after the DWARF ones, so a segment's file size and
+memory size now differ, as in clang's objects) and `__thread_vars` with its
+relocations. An object with none of these is byte for byte what it was:
+the same TIR compiled by the backend before and after gives the same bytes
+for all 110 corpus programs compared (every sixth one with a `main`).
+
+**`rtlint`** (`scripts/rtlint.py`, gate `scripts/rtlint.sh`) reads a runtime
+package's TIR and refuses, by function and line, a plain `load_T` or
+`store_T` through an address derived from a process cell outside a function
+marked as holding the cell's lock; such an address handed to anything that
+may touch it plainly (a C function, `call_c`, `ctx_switch`, `ctx_init`,
+`mem_free`); such an address put where the lint cannot follow it (stored
+in memory, or returned to C by an `export fn`); a call of a lock-holding
+function from one that neither holds the lock nor takes it (a
+compare-and-swap on the lock's own cell); and a mark that names no integer
+process cell of the module. Marks are doc
+comments -- `/// rtlint: guarded by POOL_LOCK` above a cell, `/// rtlint:
+holds POOL_LOCK` above a function -- so they sit beside what they say.
+"Derived from" is followed through every value computed from the address
+(locals, `offset`, `as_i64` and back through `mem_addr`, arithmetic,
+branches) and across calls both ways, to a fixpoint over the program; a
+value read out of memory, and a `bool`, are not the cell's address. Atomic
+access is allowed anywhere. What the marks say -- that a function marked as
+holding a lock is entered only with it held -- is checked only as far as its
+callers go: each must hold the lock or take it. Its conformance cases are `scripts/fixtures/rtlint`, one module
+each, saying in `//! rtlint:` lines what they must get.
+
+**The gates**, each run on this tree on 2026-10-27, with this worktree's
+compiler:
+
+- `rtdialect` (new): `scripts/fixtures/rtdialect`, every part of the
+  dialect, compiled twice by `s3 --runtime` (the same bytes), its forms
+  read back with `otool`, `nm` and `dwarfdump --verify`, then linked with a
+  C driver and the Rust runtime by `compiler/link` and by `cc` and run:
+  "object: process cells 6, thread-local variables 2, TLVP relocations 4,
+  leaves unsigned 3, functions signed 39"; "runs: 2 of 2   checks passed in
+  the compiler/link build: 5 of 5" -- the cells zero, 8-aligned and apart;
+  six threads adding 100,000 each to one cell, 600,000; five literals'
+  bytes, lengths and NULs, and a write to one killed by a signal in a child;
+  four threads each finding the runtime's thread-local cells zero and their
+  own; three fibers switched round-robin for 200 rounds, 603 switches, each
+  log entry and each fiber's total as the model says. And "pointer
+  authentication: off (pacibsp leaves the address as it was)".
+- `rtdialectcontrols` (new): five planted faults in the backend, each
+  caught for its reason: the switch not saving x19 and x20 (the driver,
+  built `-O2`, dies with a signal), the switch signing its return address
+  (the object check), every process cell given the first one's symbol
+  ("0 of 6 cells are 8-aligned, apart from the others and fixed"),
+  `mem_static_len` a byte long ("literal 0 is 14 bytes, not 13"), and the
+  thread-local getter answering the descriptor instead of calling its thunk
+  ("the main thread's cells did not start at zero"). "controls: 5   caught:
+  5   missed: 0".
+- `rtlint` (new): "packages: 2   process cells: 6   functions: 133
+  refused: 0" (compiler/rt and the fixture); "cases: 17   as expected: 17
+  refusals: 16"; two controls caught of two -- a plain store planted in the
+  fixture's `fx_hit`, refused as "a plain store of process cell
+  `main::HITS` outside a function holding its lock", and the lint planted
+  to take a plain store for an atomic one, which fails its cases.
+- `encodetest`: "forms: 106   cases: 6416   identical: 6416   different:
+  0", "emittable forms: 106   with no cases: 0" -- the six new forms among
+  them.
+- {{OTHER GATES}}
+
+**What is left** -- steps four and five of the brief, not started: moving
+the runtime's state (the release walk, then the allocator, its live count,
+regions and the leak check, the output buffers with `out_val` and the panic
+and exit path, maps with the Rust runtime's hashing kept bit for bit, then
+the stateless families that remain), and the fibers on `ctx_switch` against
+a model of which fiber runs. What this part gives them: process cells for
+the pool, the live count, the interned boxes, the reference slab, the
+channel table and the map seed; static bytes for the panic texts and
+variant names `gen_text.py` now writes as code; the runtime's own
+per-thread cells; and the switch. Nothing has been timed.
+
 ## 7. Bootstrap and trust
 
 - **During the migration:** stage 0 is the Rust-built `grasm`.
@@ -1805,8 +1973,19 @@ Measured, not estimated; each line is a gate's result on master.
   Where the time goes was measured once: field writes (§6.8) were most of
   it until the hot state moved into whole variables, and the AST builder,
   which still writes through the AST's fields, is 40% of what is left.
+- **S5 part two, steps one to three done** (§6.9): the runtime dialect
+  of §5.6 -- process cells, static bytes, the runtime's own thread-local
+  cells and the context switch -- usable only in a package whose manifest
+  says `runtime = true`, refused by name everywhere else and by both other
+  engines, in the Rust frontend and in compiler/front alike; lowered by the
+  Grasm backend (`s3 --runtime`) to `__bss` symbols, `__cstring` bytes,
+  Mach-O thread-local variables and leaves that switch contexts without
+  signing anything; and guarded by `rtlint`, which refuses a plain access
+  to a process cell outside a function holding its lock. {{GATES11}} The
+  state itself has not moved (steps four and five).
 - **Not started:** S2 past part one (resolver, checker, TIR), S6
-  (self-compilation), S7-S9; S5 past part one.
+  (self-compilation), S7-S9; S5's state families and fibers (steps four
+  and five of part two).
 
 With S4 done, S6 waits on S3's last steps and on S2 and S5, the frontend
 and the runtime in Grasm; they come next, one stage at a time.

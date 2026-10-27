@@ -20,6 +20,14 @@ import ssa
 /// point of its own.
 pub fn build(src: bytes, lib: bool) -> MirProg ! str {
     let t0 = try sexp.read(src)
+    if not lib {
+        // The runtime dialect is the runtime's ([T-RUNTIME]): a program's
+        // TIR never holds it, and the runtime's is compiled with `--runtime`.
+        let form = dialect_form(t0)
+        if form != "" {
+            fail("outside the subset: {form} outside the runtime (`--runtime`)")
+        }
+    }
     let mo = try mono.monomorphize(t0)
     let t = mo.t
     var info = try prog.index(t, lib)
@@ -202,7 +210,53 @@ pub fn build(src: bytes, lib: bool) -> MirProg ! str {
             fbase.push(sexp.word(t0, r, 4).parse_int() ?? 0)
         }
     }
-    MirProg{ fns: fns, callee_sym: callee_sym, strs: strs, rt_syms: rt_syms, descs: descs, files: files, fbase: fbase }
+    // The runtime's process cells and its own thread-local cells
+    // ([T-RUNTIME]), in TIR's order: the object holds a symbol for each.
+    // A program's thread-local cells are the runtime's block instead.
+    var pcells: [str] = []
+    var psize: [i64] = []
+    var tcells: [str] = []
+    var tsize: [i64] = []
+    for r in t0.roots {
+        let k = sexp.kw(t0, r)
+        if k == "processlocal" or (k == "threadlocal" and lib) {
+            let size = lower.layout_bytes(ir.ty_of_name(sexp.word(t0, r, 2)))
+            if k == "processlocal" {
+                pcells.push(sexp.word(t0, r, 1))
+                psize.push(size)
+            } else {
+                tcells.push(sexp.word(t0, r, 1))
+                tsize.push(size)
+            }
+        }
+    }
+    MirProg{
+        fns: fns, callee_sym: callee_sym, strs: strs, rt_syms: rt_syms, descs: descs, files: files, fbase: fbase,
+        pcells: pcells, psize: psize, tcells: tcells, tsize: tsize,
+    }
+}
+
+/// The first of the runtime dialect's forms TIR `t` holds, named, or "".
+fn dialect_form(t: TirTree) -> str {
+    for e in 0..t.kind.len() {
+        if t.kind[e] != 2 {
+            continue
+        }
+        let k = sexp.kw(t, e)
+        if k == "processlocal" {
+            return "process cell `{sexp.word(t, e, 1)}`"
+        }
+        if k == "mstatic" {
+            return "static bytes (`mem_static`)"
+        }
+        if k == "builtin" {
+            let name = sexp.word(t, e, 3)
+            if name == "ctx_switch" or name == "ctx_init" or name == "mem_process" {
+                return "`{name}`"
+            }
+        }
+    }
+    ""
 }
 
 /// The lifted functions found so far: by key (`c<element>` for a closure,

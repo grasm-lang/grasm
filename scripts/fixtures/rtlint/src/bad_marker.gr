@@ -1,0 +1,15 @@
+//! rtlint: marker: lock `bad_marker::NOPE` is not a process cell of the module
+//! rtlint: marker: lock `bad_marker::RATIO` is a `f64` cell, not an integer one
+//! rtlint: marker: `guarded by` is not a mark rtlint reads here
+// Marks that name nothing, or a lock no compare-and-swap can take.
+process_local RATIO: f64
+
+/// rtlint: guarded by RATIO
+process_local A: i64
+
+/// rtlint: holds NOPE
+fn f() {
+}
+
+/// rtlint: guarded by
+process_local B: i64

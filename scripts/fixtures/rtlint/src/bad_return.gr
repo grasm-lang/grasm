@@ -1,0 +1,15 @@
+//! rtlint: plain: a plain load of process cell `bad_return::CELL`
+// Through a function's result.
+process_local CELL: i64
+
+fn cell() -> addr {
+    unsafe {
+        mem_process(CELL)
+    }
+}
+
+pub fn read() -> i64 {
+    unsafe {
+        cell().load_i64()
+    }
+}

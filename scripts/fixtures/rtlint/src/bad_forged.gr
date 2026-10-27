@@ -1,0 +1,10 @@
+//! rtlint: plain: a plain store of process cell `bad_forged::CELL`
+// Through the address's integer and back: forging does not launder it.
+process_local CELL: i64
+
+pub fn sneak(v: i64) {
+    unsafe {
+        let n = mem_process(CELL).as_i64()
+        mem_addr(n + 0).store_i64(v)
+    }
+}

@@ -1,0 +1,14 @@
+//! rtlint: ok
+// Atomic access to a process cell is allowed anywhere: loads, stores,
+// fetch-adds and compare-and-swaps, at every width.
+process_local COUNT: i64
+process_local FLAG: u8
+
+pub fn bump() -> i64 {
+    unsafe {
+        mem_process(FLAG).atomic_store_u8(1, Release)
+        let was = mem_process(COUNT).atomic_add_i64(1, AcqRel)
+        let seen = mem_process(COUNT).atomic_cas_i64(was + 1, was + 2, SeqCst)
+        seen + mem_process(FLAG).atomic_load_u8(Acquire).as_i64()
+    }
+}

@@ -121,6 +121,8 @@ fn sym_text(symk: i64, id: i64, callee_sym: [str], rt_names: [str]) -> str {
         "l_.str.{id}"
     } else if symk == vcode.SYM_DATA {
         "l_.desc.{id}"
+    } else if symk == vcode.SYM_CELL {
+        "<process cell {id}>"
     } else {
         "?"
     }

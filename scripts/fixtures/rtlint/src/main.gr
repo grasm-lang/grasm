@@ -1,0 +1,21 @@
+// rtlint's conformance cases (scripts/rtlint.py --cases): each module is
+// one case and says what it expects; this file only reaches them all.
+import bad_caller
+import bad_escape_export
+import bad_escape_store
+import bad_extern
+import bad_forged
+import bad_handed
+import bad_load
+import bad_local
+import bad_loop
+import bad_marker
+import bad_match
+import bad_param
+import bad_return
+import bad_store
+import bad_wrong_lock
+import ok_atomic
+import ok_compared
+import ok_loaded
+import ok_locked

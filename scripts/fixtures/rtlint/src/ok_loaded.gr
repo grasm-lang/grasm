@@ -1,0 +1,12 @@
+//! rtlint: ok
+// What a cell holds is not the cell: an address read out of one is
+// somebody else's memory.
+process_local HEAD: addr
+
+pub fn push(node: addr) {
+    unsafe {
+        let old = mem_addr(mem_process(HEAD).atomic_load_i64(Acquire))
+        old.store_i64(1)
+        node.store_addr(old)
+    }
+}

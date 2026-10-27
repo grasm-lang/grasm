@@ -1,0 +1,9 @@
+//! rtlint: plain: a plain load of process cell `bad_load::CELL` outside a function holding its lock
+// A plain load races with any thread storing.
+process_local CELL: u32
+
+pub fn get() -> u32 {
+    unsafe {
+        mem_process(CELL).load_u32()
+    }
+}

@@ -1,0 +1,16 @@
+//! rtlint: plain: a plain store of process cell `bad_param::CELL`
+// Through a parameter: whatever else `poke` is handed, it is handed the cell.
+process_local CELL: i64
+
+fn poke(a: addr, v: i64) {
+    unsafe {
+        a.store_i64(v)
+    }
+}
+
+pub fn both(other: addr) {
+    poke(other, 1)
+    unsafe {
+        poke(mem_process(CELL), 2)
+    }
+}
