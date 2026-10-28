@@ -1,0 +1,1822 @@
+// Lists and ranges ([L-LIB-LIST], [L-LIB-RANGE-OPS]; docs/self-hosting.md
+// §6.11), made, read and changed as the Rust runtime does.
+//
+// A list is one of three things. A list of boxes keeps four or fewer in the
+// box and more in a `Vec` it spills to once, with room for eight. A scalar
+// list keeps its elements' bits -- a word each, a byte each for bools -- in
+// a `Vec`. A list of value structs keeps their words (`structs.gr`). Every
+// write goes to a list nothing else holds: one held more than once is copied
+// first, and the copy holds what its elements hold. Every `Vec` here grows as
+// Rust's does -- twice what it had, or what is asked if more, and never
+// fewer than four words or eight bytes -- and one made from a known count is
+// made exactly that long, so a loop the backend runs over a list's buffer
+// (`append_begin`, `pin`) sees the same room it would on the Rust runtime.
+//
+// The empty lists -- one of boxes, one per scalar kind -- are made once for
+// the process and never freed: a push to one copies it, as to any list held
+// more than once.
+//
+// Sorting is stable and by the order `cmp` uses (`equal.order`); a sort of
+// scalars has no two equal elements that differ, so a stable sort gives what
+// Rust's unstable one does. `sort_by` compares its keys as boxes compare,
+// which is how the Rust runtime compares them: a reference or a bool key is
+// equal to every other.
+import layout
+import sys
+import alloc
+import val
+import vals
+import strread
+import numstr
+import display
+import maps
+import equal
+import structs
+import panic
+
+extern fn memcmp(a: addr, b: addr, n: i64) -> i32
+
+/// The empty lists: a table of seven words -- the list of boxes, then a
+/// scalar list for each kind code 0 to 5 -- made once.
+process_local EMPTIES: i64
+/// The layout constants a push of a scalar reads, copied once into a block
+/// of eight words (`quick`): a module-level `let` is a call each time it is
+/// read, and eight of them were most of a push.
+process_local QUICK: i64
+
+fn tag(v: addr) -> i64 {
+    unsafe { v.offset(layout.TAG).load_u8() }.as_i64()
+}
+
+fn rc(v: addr) -> i64 {
+    unsafe { v.atomic_load_i64(Relaxed) }
+}
+
+fn word(v: addr) -> i64 {
+    unsafe { v.offset(layout.WORD_AT).load_i64() }
+}
+
+fn say(p: addr, n: i64) {
+    panic.say(p, n)
+}
+
+fn unreachable() {
+    unsafe { say(mem_static("internal error: entered unreachable code"), mem_static_len("internal error: entered unreachable code")) }
+}
+
+/// `{what} {i} out of bounds (len {n})`.
+fn bounds(what: addr, wn: i64, i: i64, n: i64) {
+    let t = display.text_new()
+    display.put(t, what, wn)
+    display.put_byte(t, 32)
+    display.put_int(t, i)
+    unsafe { display.put(t, mem_static(" out of bounds (len "), mem_static_len(" out of bounds (len ")) }
+    display.put_int(t, n)
+    display.put_byte(t, 41)
+    unsafe { grasm_panic_msg(display.text_ptr(t), display.text_len(t)) }
+}
+
+extern fn grasm_panic_msg(p: addr, n: i64)
+
+fn index_bounds(i: i64, n: i64) {
+    structs.panic_index(i, n)
+}
+
+// ----- a `Vec` ---------------------------------------------------------------
+
+fn vec_ptr(v: addr) -> addr {
+    unsafe { v.offset(layout.VEC_PTR).load_addr() }
+}
+
+fn vec_len(v: addr) -> i64 {
+    unsafe { v.offset(layout.VEC_LEN).load_i64() }
+}
+
+fn vec_cap(v: addr) -> i64 {
+    unsafe { v.offset(layout.VEC_CAP).load_i64() }
+}
+
+fn set_len(v: addr, n: i64) {
+    unsafe { v.offset(layout.VEC_LEN).store_i64(n) }
+}
+
+fn set_vec(v: addr, p: addr, len: i64, cap: i64) {
+    unsafe {
+        v.offset(layout.VEC_PTR).store_addr(p)
+        v.offset(layout.VEC_LEN).store_i64(len)
+        v.offset(layout.VEC_CAP).store_i64(cap)
+    }
+}
+
+/// An empty `Vec`'s address for elements of `size` bytes: their alignment.
+fn dangling(size: i64) -> addr {
+    unsafe { mem_addr(if size == 1 { layout.U8_DANGLING } else { layout.WORDS_DANGLING }) }
+}
+
+/// An empty `Vec` with room for exactly `cap`, as `with_capacity` makes one.
+fn vec_exact(v: addr, cap: i64, size: i64) {
+    let p = if cap > 0 { sys.alloc(cap * size) } else { dangling(size) }
+    set_vec(v, p, 0, cap)
+}
+
+/// `Vec::reserve(more)`: nothing when there is room; otherwise twice the
+/// capacity or what is needed, whichever is more, and at least four words
+/// or eight bytes.
+fn vec_reserve(v: addr, more: i64, size: i64) {
+    let len = vec_len(v)
+    let cap = vec_cap(v)
+    if cap - len >= more {
+        return
+    }
+    var want = 2 * cap
+    if want < len + more {
+        want = len + more
+    }
+    let least = if size == 1 { 8 } else { 4 }
+    if want < least {
+        want = least
+    }
+    let p = if cap == 0 { sys.alloc(want * size) } else { sys.grow(vec_ptr(v), want * size) }
+    unsafe {
+        v.offset(layout.VEC_PTR).store_addr(p)
+        v.offset(layout.VEC_CAP).store_i64(want)
+    }
+}
+
+fn vec_push(v: addr, w: i64, size: i64) {
+    vec_reserve(v, 1, size)
+    let len = vec_len(v)
+    unsafe {
+        if size == 1 {
+            vec_ptr(v).offset(len).store_u8(w.as_u8())
+        } else {
+            vec_ptr(v).offset(8 * len).store_i64(w)
+        }
+    }
+    set_len(v, len + 1)
+}
+
+/// Frees a `Vec`'s buffer, when it has one.
+fn vec_free(v: addr) {
+    if vec_cap(v) > 0 {
+        sys.dealloc(vec_ptr(v))
+    }
+}
+
+// ----- a list of boxes --------------------------------------------------------
+
+fn is_inline(l: addr) -> bool {
+    unsafe { l.offset(layout.LIST_DISC).load_u8() }.as_i64() == layout.LIST_INLINE
+}
+
+/// A list's (or tuple's) elements, their count in `n`.
+fn items(l: addr, inout n: i64) -> addr {
+    unsafe {
+        if is_inline(l) {
+            n = l.offset(layout.LIST_LEN).load_u8().as_i64()
+            return l.offset(layout.LIST_VALS)
+        }
+        let v = l.offset(layout.LIST_VEC)
+        n = vec_len(v)
+        vec_ptr(v)
+    }
+}
+
+fn count(l: addr) -> i64 {
+    var n = 0
+    let _ = items(l, n)
+    n
+}
+
+fn at(p: addr, i: i64) -> addr {
+    unsafe { p.offset(8 * i).load_addr() }
+}
+
+/// A new, empty list of boxes (or tuple), its four slots empty.
+fn fresh(t: i64) -> addr {
+    let l = alloc.take()
+    unsafe {
+        l.offset(layout.TAG).store_u8(t.as_u8())
+        l.offset(layout.LIST_DISC).store_u8(layout.LIST_INLINE.as_u8())
+        l.offset(layout.LIST_LEN).store_u8(0.as_u8())
+        var i = 0
+        while i < 4 {
+            l.offset(layout.LIST_VALS + 8 * i).store_i64(0)
+            i += 1
+        }
+    }
+    l
+}
+
+/// A list of boxes (or tuple) of `n` in a `Vec` exactly that long -- what a
+/// collected `Vec` makes -- its elements to be written at `out`.
+fn heap_list(t: i64, n: i64, inout out: addr) -> addr {
+    let l = alloc.take()
+    unsafe {
+        l.offset(layout.TAG).store_u8(t.as_u8())
+        l.offset(layout.LIST_DISC).store_u8(layout.LIST_HEAP.as_u8())
+        let v = l.offset(layout.LIST_VEC)
+        vec_exact(v, n, 8)
+        set_len(v, n)
+        out = vec_ptr(v)
+    }
+    l
+}
+
+/// `ListData::push`: into the box while there is room, then once to a
+/// `Vec` with room for eight.
+fn push_item(l: addr, e: addr) {
+    unsafe {
+        if is_inline(l) {
+            let n = l.offset(layout.LIST_LEN).load_u8().as_i64()
+            if n < 4 {
+                l.offset(layout.LIST_VALS + 8 * n).store_addr(e)
+                l.offset(layout.LIST_LEN).store_u8((n + 1).as_u8())
+                return
+            }
+            let buf = sys.alloc(64)
+            sys.copy(buf, l.offset(layout.LIST_VALS), 32)
+            buf.offset(32).store_addr(e)
+            l.offset(layout.LIST_DISC).store_u8(layout.LIST_HEAP.as_u8())
+            set_vec(l.offset(layout.LIST_VEC), buf, 5, 8)
+            return
+        }
+        vec_push(l.offset(layout.LIST_VEC), e.as_i64(), 8)
+    }
+}
+
+/// Removes element `i`, shifting the rest down, as `ListData::remove`.
+fn remove_item(l: addr, i: i64) -> addr {
+    var n = 0
+    let p = items(l, n)
+    let out = at(p, i)
+    var j = i
+    while j + 1 < n {
+        unsafe { p.offset(8 * j).store_addr(p.offset(8 * (j + 1)).load_addr()) }
+        j += 1
+    }
+    unsafe {
+        if is_inline(l) {
+            l.offset(layout.LIST_LEN).store_u8((n - 1).as_u8())
+        } else {
+            set_len(l.offset(layout.LIST_VEC), n - 1)
+        }
+    }
+    out
+}
+
+// ----- a scalar list ----------------------------------------------------------
+
+/// The element kind a backend code names: 0 integer, 1 float, 3 reference,
+/// 5 `u64`, anything else a bool (`ScalarKind::from_i64`).
+fn kind_of_code(code: i64) -> i64 {
+    if code == 0 {
+        return layout.SK_I64
+    }
+    if code == 1 {
+        return layout.SK_F64
+    }
+    if code == 3 {
+        return layout.SK_REF
+    }
+    if code == 5 {
+        return layout.SK_U64
+    }
+    layout.SK_BOOL
+}
+
+/// And the code a kind has (`ScalarKind::to_i64`).
+fn code_of(sk: i64) -> i64 {
+    if sk == layout.SK_I64 {
+        return 0
+    }
+    if sk == layout.SK_F64 {
+        return 1
+    }
+    if sk == layout.SK_REF {
+        return 3
+    }
+    if sk == layout.SK_U64 {
+        return 5
+    }
+    2
+}
+
+fn skind(l: addr) -> i64 {
+    unsafe { l.offset(layout.SCALAR_KIND_AT).load_u8() }.as_i64()
+}
+
+fn sdata(l: addr) -> addr {
+    unsafe { l.offset(layout.SCALAR_VEC) }
+}
+
+fn is_bytes(l: addr) -> bool {
+    unsafe { l.offset(layout.SCALAR_DISC).load_u8() }.as_i64() == layout.SCALAR_BYTES
+}
+
+fn width(l: addr) -> i64 {
+    if is_bytes(l) { 1 } else { 8 }
+}
+
+fn slen(l: addr) -> i64 {
+    vec_len(sdata(l))
+}
+
+fn sget(l: addr, i: i64) -> i64 {
+    unsafe {
+        if is_bytes(l) {
+            return vec_ptr(sdata(l)).offset(i).load_u8().as_i64()
+        }
+        vec_ptr(sdata(l)).offset(8 * i).load_i64()
+    }
+}
+
+fn sset(l: addr, i: i64, bits: i64) {
+    unsafe {
+        if is_bytes(l) {
+            vec_ptr(sdata(l)).offset(i).store_u8(if bits != 0 { 1.as_u8() } else { 0.as_u8() })
+        } else {
+            vec_ptr(sdata(l)).offset(8 * i).store_i64(bits)
+        }
+    }
+}
+
+fn spush(l: addr, bits: i64) {
+    if is_bytes(l) {
+        vec_push(sdata(l), if bits != 0 { 1 } else { 0 }, 1)
+    } else {
+        vec_push(sdata(l), bits, 8)
+    }
+}
+
+/// A new scalar list of kind `sk`, empty: bytes for bools, words otherwise.
+fn new_scalar(sk: i64) -> addr {
+    let l = alloc.take()
+    scalar_into(l, sk)
+    l
+}
+
+fn scalar_into(l: addr, sk: i64) {
+    let size = if sk == layout.SK_BOOL { 1 } else { 8 }
+    unsafe {
+        l.offset(layout.TAG).store_u8(layout.TAG_LIST_SCALAR.as_u8())
+        l.offset(layout.SCALAR_KIND_AT).store_u8(sk.as_u8())
+        l.offset(layout.SCALAR_DISC).store_u8(if size == 1 { layout.SCALAR_BYTES.as_u8() } else { layout.SCALAR_WORDS.as_u8() })
+    }
+    set_vec(sdata(l), dangling(size), 0, 0)
+}
+
+/// A box of an element of kind `sk`, as `scalar_box` makes it.
+fn box_of(sk: i64, bits: i64) -> addr {
+    structs.scalar_box(code_of(sk), bits)
+}
+
+/// A box's bits as an element of kind `sk`; an integer becomes a float for a
+/// float list. Anything else is the wrong type.
+fn unbox(sk: i64, v: addr) -> i64 {
+    let t = tag(v)
+    if sk == layout.SK_I64 and t == layout.TAG_I64 {
+        return word(v)
+    }
+    if sk == layout.SK_U64 and t == layout.TAG_U64 {
+        return word(v)
+    }
+    if sk == layout.SK_REF and t == layout.TAG_REF {
+        return word(v)
+    }
+    if sk == layout.SK_F64 and t == layout.TAG_F64 {
+        return word(v)
+    }
+    if sk == layout.SK_F64 and t == layout.TAG_I64 {
+        return word(v).as_f64().to_bits()
+    }
+    if sk == layout.SK_BOOL and t == layout.TAG_BOOL {
+        return unsafe { v.offset(layout.BOOL_AT).load_u8() }.as_i64()
+    }
+    unsafe { say(mem_static("scalar list element of the wrong type"), mem_static_len("scalar list element of the wrong type")) }
+    0
+}
+
+// ----- the empty lists, and copy-on-write --------------------------------------
+
+/// An empty list made for the process, never freed: of boxes for slot 0,
+/// of the kind code `slot - 1` otherwise.
+fn empty(slot: i64) -> addr {
+    unsafe {
+        var table = mem_process(EMPTIES).atomic_load_i64(Acquire)
+        if table == 0 {
+            let made = sys.alloc(56)
+            var i = 0
+            while i < 7 {
+                let b = sys.alloc(layout.BOX_SIZE)
+                b.store_i64(layout.IMMORTAL)
+                if i == 0 {
+                    b.offset(layout.TAG).store_u8(layout.TAG_LIST.as_u8())
+                    b.offset(layout.LIST_DISC).store_u8(layout.LIST_INLINE.as_u8())
+                    b.offset(layout.LIST_LEN).store_u8(0.as_u8())
+                    var k = 0
+                    while k < 4 {
+                        b.offset(layout.LIST_VALS + 8 * k).store_i64(0)
+                        k += 1
+                    }
+                } else {
+                    scalar_into(b, kind_of_code(i - 1))
+                }
+                made.offset(8 * i).store_addr(b)
+                i += 1
+            }
+            let was = mem_process(EMPTIES).atomic_cas_i64(0, made.as_i64(), AcqRel)
+            if was != 0 {
+                var j = 0
+                while j < 7 {
+                    sys.dealloc(made.offset(8 * j).load_addr())
+                    j += 1
+                }
+                sys.dealloc(made)
+                table = was
+            } else {
+                table = made.as_i64()
+            }
+        }
+        mem_addr(table).offset(8 * slot).load_addr()
+    }
+}
+
+fn empty_scalar(sk: i64) -> addr {
+    let code = code_of(sk)
+    empty(1 + code)
+}
+
+/// The list itself when nothing else holds it, otherwise a copy that nothing
+/// else does -- holding what the list's elements hold -- the caller's count
+/// on `l` moved to it.
+fn cow(l: addr) -> addr {
+    if rc(l) == 1 {
+        return l
+    }
+    let t = tag(l)
+    var out = unsafe { mem_addr(0) }
+    if t == layout.TAG_LIST {
+        out = fresh(layout.TAG_LIST)
+        var n = 0
+        let p = items(l, n)
+        var i = 0
+        while i < n {
+            let e = at(p, i)
+            val.inc(e)
+            push_item(out, e)
+            i += 1
+        }
+    } else if t == layout.TAG_LIST_SCALAR {
+        out = new_scalar(skind(l))
+        let size = width(l)
+        let n = slen(l)
+        vec_exact(sdata(out), n, size)
+        sys.copy(vec_ptr(sdata(out)), vec_ptr(sdata(l)), n * size)
+        set_len(sdata(out), n)
+    } else {
+        unsafe { say(mem_static("list op on non-list"), mem_static_len("list op on non-list")) }
+    }
+    val.dec(l)
+    out
+}
+
+/// A list of boxes turned in place into a scalar list of kind `sk`, each
+/// element's bits taken and the box released.
+fn to_scalar(l: addr, sk: i64) {
+    if tag(l) != layout.TAG_LIST {
+        return
+    }
+    let size = if sk == layout.SK_BOOL { 1 } else { 8 }
+    let v = sys.alloc(24)
+    set_vec(v, dangling(size), 0, 0)
+    var n = 0
+    let p = items(l, n)
+    var i = 0
+    while i < n {
+        let e = at(p, i)
+        let bits = unbox(sk, e)
+        vec_push(v, if size == 1 { if bits != 0 { 1 } else { 0 } } else { bits }, size)
+        val.dec(e)
+        i += 1
+    }
+    if not is_inline(l) {
+        vec_free(unsafe { l.offset(layout.LIST_VEC) })
+    }
+    scalar_into(l, sk)
+    sys.copy(sdata(l), v, 24)
+    sys.dealloc(v)
+}
+
+// ----- making lists -------------------------------------------------------------
+
+export fn grt_list_new() -> addr {
+    empty(0)
+}
+
+export fn grt_list_new_scalar(kind: i64) -> addr {
+    empty_scalar(kind_of_code(kind))
+}
+
+/// An empty list of boxes with room for `n`: in the box for four or fewer,
+/// a `Vec` of exactly `n` past that. A count of nothing, or past what could
+/// be meant, reserves nothing.
+export fn grt_list_new_cap(n: i64) -> addr {
+    if n <= 0 {
+        return empty(0)
+    }
+    let l = fresh(layout.TAG_LIST)
+    if n > 4 and n <= 17179869184 {
+        unsafe {
+            l.offset(layout.LIST_DISC).store_u8(layout.LIST_HEAP.as_u8())
+            vec_exact(l.offset(layout.LIST_VEC), n, 8)
+        }
+    }
+    l
+}
+
+export fn grt_list_new_scalar_cap(kind: i64, n: i64) -> addr {
+    let sk = kind_of_code(kind)
+    if n <= 0 {
+        return empty_scalar(sk)
+    }
+    let l = new_scalar(sk)
+    if n <= 17179869184 {
+        vec_reserve(sdata(l), n, width(l))
+    }
+    l
+}
+
+/// `n` copies of one element, in a buffer exactly that long.
+export fn grt_list_fill_scalar(kind: i64, n: i64, bits: i64) -> addr {
+    let sk = kind_of_code(kind)
+    if n <= 0 {
+        return empty_scalar(sk)
+    }
+    let size = if sk == layout.SK_BOOL { 1 } else { 8 }
+    if n > 8589934592 / size {
+        let t = display.text_new()
+        unsafe { display.put(t, mem_static("a list of "), mem_static_len("a list of ")) }
+        display.put_int(t, n)
+        unsafe {
+            display.put(t, mem_static(" elements would need more memory than one can hold"), mem_static_len(" elements would need more memory than one can hold"))
+            grasm_panic_msg(display.text_ptr(t), display.text_len(t))
+        }
+    }
+    let l = new_scalar(sk)
+    let v = sdata(l)
+    vec_exact(v, n, size)
+    let p = vec_ptr(v)
+    var i = 0
+    unsafe {
+        if size == 1 {
+            let b = if bits != 0 { 1.as_u8() } else { 0.as_u8() }
+            while i < n {
+                p.offset(i).store_u8(b)
+                i += 1
+            }
+        } else {
+            while i < n {
+                p.offset(8 * i).store_i64(bits)
+                i += 1
+            }
+        }
+    }
+    set_len(v, n)
+    l
+}
+
+/// A scalar list of the `n` words at `words`. Bools become a byte each in
+/// the words' own buffer, as an in-place `collect` leaves it: room for
+/// eight times as many.
+export fn grt_list_from_words(kind: i64, words: addr, n: i64) -> addr {
+    let sk = kind_of_code(kind)
+    if n <= 0 {
+        return empty_scalar(sk)
+    }
+    let l = new_scalar(sk)
+    let v = sdata(l)
+    let buf = sys.alloc(8 * n)
+    var i = 0
+    unsafe {
+        if sk == layout.SK_BOOL {
+            while i < n {
+                buf.offset(i).store_u8(if words.offset(8 * i).load_i64() != 0 { 1.as_u8() } else { 0.as_u8() })
+                i += 1
+            }
+            set_vec(v, buf, n, 8 * n)
+        } else {
+            sys.copy(buf, words, 8 * n)
+            set_vec(v, buf, n, n)
+        }
+    }
+    l
+}
+
+// ----- pushing and writing --------------------------------------------------------
+
+/// Push honouring copy-on-write; the element's count moves into the list.
+export fn grt_list_push(l: addr, e: addr) -> addr {
+    let t = tag(l)
+    if rc(l) == 1 {
+        if t == layout.TAG_LIST {
+            if not is_inline(l) or count(l) < 4 {
+                push_item(l, e)
+                return l
+            }
+        }
+    } else if t == layout.TAG_LIST and is_inline(l) and count(l) == 0 {
+        // The first push onto `[]`: a new list of one, nothing copied.
+        let out = fresh(layout.TAG_LIST)
+        push_item(out, e)
+        val.dec(l)
+        return out
+    }
+    let target = cow(l)
+    let tt = tag(target)
+    if tt == layout.TAG_LIST {
+        push_item(target, e)
+    } else if tt == layout.TAG_LIST_SCALAR {
+        spush(target, unbox(skind(target), e))
+        val.dec(e)
+    } else {
+        unreachable()
+    }
+    target
+}
+
+/// Appends an element's bits; to a list of boxes, its box.
+/// The constants `grt_list_push_scalar` reads, made once: `TAG`,
+/// `TAG_LIST_SCALAR`, `SCALAR_DISC`, `SCALAR_WORDS`, `SCALAR_VEC`, `VEC_LEN`,
+/// `VEC_CAP`, `VEC_PTR`, a word each in that order.
+fn quick() -> addr {
+    unsafe {
+        let have = mem_process(QUICK).atomic_load_i64(Acquire)
+        if have != 0 {
+            return mem_addr(have)
+        }
+        let t = sys.alloc(64)
+        t.store_i64(layout.TAG)
+        t.offset(8).store_i64(layout.TAG_LIST_SCALAR)
+        t.offset(16).store_i64(layout.SCALAR_DISC)
+        t.offset(24).store_i64(layout.SCALAR_WORDS)
+        t.offset(32).store_i64(layout.SCALAR_VEC)
+        t.offset(40).store_i64(layout.VEC_LEN)
+        t.offset(48).store_i64(layout.VEC_CAP)
+        t.offset(56).store_i64(layout.VEC_PTR)
+        let was = mem_process(QUICK).atomic_cas_i64(0, t.as_i64(), AcqRel)
+        if was != 0 {
+            sys.dealloc(t)
+            return mem_addr(was)
+        }
+        t
+    }
+}
+
+export fn grt_list_push_scalar(l: addr, bits: i64, kind: i64) -> addr {
+    // A word list nothing else holds, with room: written out, reading the
+    // layout from `quick`'s block rather than calling for each constant. A
+    // list literal of computed values is built by a push per element, and a
+    // program that reads one in a loop builds it every time: `casefolddiff`,
+    // built by the Grasm backend, took 26.9 s on this runtime against 3.5 s
+    // on the Rust one through the general path below, almost all of it here.
+    unsafe {
+        let q = mem_process(QUICK).atomic_load_i64(Acquire)
+        if q != 0 and l.atomic_load_i64(Relaxed) == 1 {
+            let t = mem_addr(q)
+            if l.offset(t.load_i64()).load_u8().as_i64() == t.offset(8).load_i64() and l.offset(t.offset(16).load_i64()).load_u8().as_i64() == t.offset(24).load_i64() {
+                let v = l.offset(t.offset(32).load_i64())
+                let len_at = t.offset(40).load_i64()
+                let len = v.offset(len_at).load_i64()
+                if len < v.offset(t.offset(48).load_i64()).load_i64() {
+                    v.offset(t.offset(56).load_i64()).load_addr().offset(8 * len).store_i64(bits)
+                    v.offset(len_at).store_i64(len + 1)
+                    return l
+                }
+            }
+        }
+        if q == 0 {
+            let _ = quick()
+        }
+    }
+    if rc(l) == 1 and tag(l) == layout.TAG_LIST_SCALAR and not is_bytes(l) {
+        vec_push(sdata(l), bits, 8)
+        return l
+    }
+    let target = cow(l)
+    let t = tag(target)
+    if t == layout.TAG_LIST_SCALAR {
+        spush(target, bits)
+    } else if t == layout.TAG_LIST {
+        push_item(target, structs.scalar_box(kind, bits))
+    } else {
+        unsafe { say(mem_static("push on non-list"), mem_static_len("push on non-list")) }
+    }
+    target
+}
+
+/// `xs[i] = v` honouring copy-on-write; `v`'s count moves into the list.
+export fn grt_list_set(l: addr, i: i64, v: addr) -> addr {
+    let target = cow(l)
+    let t = tag(target)
+    if t == layout.TAG_LIST {
+        var n = 0
+        let p = items(target, n)
+        if i < 0 or i >= n {
+            index_bounds(i, n)
+        }
+        let old = at(p, i)
+        if old == v {
+            val.dec(v)
+        } else {
+            val.dec(old)
+            unsafe { p.offset(8 * i).store_addr(v) }
+        }
+    } else if t == layout.TAG_LIST_SCALAR {
+        let n = slen(target)
+        if i < 0 or i >= n {
+            index_bounds(i, n)
+        }
+        sset(target, i, unbox(skind(target), v))
+        val.dec(v)
+    } else {
+        unreachable()
+    }
+    target
+}
+
+export fn grt_list_set_scalar(l: addr, i: i64, bits: i64, kind: i64) -> addr {
+    let target = cow(l)
+    let t = tag(target)
+    if t == layout.TAG_LIST_SCALAR {
+        let n = slen(target)
+        if i < 0 or i >= n {
+            index_bounds(i, n)
+        }
+        sset(target, i, bits)
+    } else if t == layout.TAG_LIST {
+        var n = 0
+        let p = items(target, n)
+        if i < 0 or i >= n {
+            index_bounds(i, n)
+        }
+        val.dec(at(p, i))
+        unsafe { p.offset(8 * i).store_addr(structs.scalar_box(kind, bits)) }
+    } else {
+        unsafe { say(mem_static("index on non-list"), mem_static_len("index on non-list")) }
+    }
+    target
+}
+
+/// Room for `n` more in a list about to be pushed to `n` times (no more than
+/// 2^24): a value list's words or a scalar list's buffer grown once, the
+/// list unshared first. A list of boxes is left as it is.
+export fn grt_list_reserve(l: addr, n: i64) -> addr {
+    if n <= 0 {
+        return l
+    }
+    let m = if n < 16777216 { n } else { 16777216 }
+    let t = tag(l)
+    if t == layout.TAG_LIST_VALS {
+        let ty = unsafe { l.offset(layout.VALS_TY).load_addr() }
+        var w = unsafe { ty.offset(layout.STRUCTTY_WIDTH).load_i64() }
+        if w < 1 {
+            w = 1
+        }
+        let words = unsafe { l.offset(layout.VALS_VEC) }
+        if rc(l) == 1 {
+            vec_reserve(words, m * w, 8)
+            return l
+        }
+        let len = vec_len(words)
+        let copy = alloc.take()
+        unsafe {
+            copy.offset(layout.TAG).store_u8(layout.TAG_LIST_VALS.as_u8())
+            copy.offset(layout.VALS_TY).store_addr(ty)
+            let cw = copy.offset(layout.VALS_VEC)
+            vec_exact(cw, len + m * w, 8)
+            sys.copy(vec_ptr(cw), vec_ptr(words), 8 * len)
+            set_len(cw, len)
+            vals.dup_type(ty, vec_ptr(cw), len)
+        }
+        val.dec(l)
+        return copy
+    }
+    if t == layout.TAG_LIST_SCALAR {
+        let target = cow(l)
+        vec_reserve(sdata(target), m, width(target))
+        return target
+    }
+    l
+}
+
+/// Takes element `i` (from the end when negative) out of a list of boxes
+/// nothing else holds, leaving the shared `false` in its place; nothing
+/// otherwise.
+export fn grt_list_take(l: addr, i: i64) -> addr {
+    if rc(l) != 1 or tag(l) != layout.TAG_LIST {
+        return unsafe { mem_addr(0) }
+    }
+    var n = 0
+    let p = items(l, n)
+    let k = if i < 0 { n + i } else { i }
+    if k < 0 or k >= n {
+        return unsafe { mem_addr(0) }
+    }
+    let out = at(p, k)
+    unsafe { p.offset(8 * k).store_addr(structs.scalar_box(2, 0)) }
+    out
+}
+
+// ----- a loop's view of a scalar list ----------------------------------------------
+
+/// Unshared, and turned into a scalar list of `kind` if it is a list of
+/// boxes: what a loop writing straight into the buffer needs.
+fn opened(l: addr, kind: i64) -> addr {
+    let target = cow(l)
+    to_scalar(target, kind_of_code(kind))
+    target
+}
+
+export fn grt_list_append_begin(l: addr, kind: i64, out_data: addr, out_len: addr, out_cap: addr) -> addr {
+    let target = opened(l, kind)
+    unsafe {
+        if tag(target) == layout.TAG_LIST_SCALAR {
+            let v = sdata(target)
+            out_data.store_addr(vec_ptr(v))
+            out_len.store_i64(vec_len(v))
+            out_cap.store_i64(vec_cap(v))
+        } else {
+            out_data.store_i64(0)
+            out_len.store_i64(0)
+            out_cap.store_i64(0)
+        }
+    }
+    target
+}
+
+/// Room for one more past the `len` written, the buffer handed out again.
+export fn grt_list_append_grow(l: addr, len: i64, out_data: addr, out_cap: addr) {
+    unsafe {
+        if tag(l) == layout.TAG_LIST_SCALAR {
+            let v = sdata(l)
+            set_len(v, len)
+            vec_reserve(v, 1, width(l))
+            out_data.store_addr(vec_ptr(v))
+            out_cap.store_i64(vec_cap(v))
+        } else {
+            out_data.store_i64(0)
+            out_cap.store_i64(0)
+        }
+    }
+}
+
+export fn grt_list_append_end(l: addr, len: i64) {
+    if tag(l) == layout.TAG_LIST_SCALAR {
+        set_len(sdata(l), len)
+    }
+}
+
+export fn grt_list_pin(l: addr, kind: i64, out_data: addr, out_len: addr) -> addr {
+    let target = opened(l, kind)
+    unsafe {
+        if tag(target) == layout.TAG_LIST_SCALAR {
+            out_data.store_addr(vec_ptr(sdata(target)))
+            out_len.store_i64(slen(target))
+        } else {
+            out_data.store_i64(0)
+            out_len.store_i64(0)
+        }
+    }
+    target
+}
+
+// ----- reading ---------------------------------------------------------------------
+
+export fn grt_list_len(l: addr) -> i64 {
+    let t = tag(l)
+    if t == layout.TAG_LIST or t == layout.TAG_TUPLE {
+        return count(l)
+    }
+    if t == layout.TAG_LIST_SCALAR {
+        return slen(l)
+    }
+    if t == layout.TAG_LIST_VALS {
+        unsafe {
+            var w = l.offset(layout.VALS_TY).load_addr().offset(layout.STRUCTTY_WIDTH).load_i64()
+            if w < 1 {
+                w = 1
+            }
+            return vec_len(l.offset(layout.VALS_VEC)) / w
+        }
+    }
+    unsafe { say(mem_static("len on non-list"), mem_static_len("len on non-list")) }
+    0
+}
+
+fn not_list() {
+    unsafe { say(mem_static("expected a list"), mem_static_len("expected a list")) }
+}
+
+export fn grt_list_is_empty(l: addr) -> i8 {
+    let t = tag(l)
+    var n = 0
+    if t == layout.TAG_LIST {
+        n = count(l)
+    } else if t == layout.TAG_LIST_SCALAR {
+        n = slen(l)
+    } else {
+        not_list()
+    }
+    if n == 0 { 1.as_i8() } else { 0.as_i8() }
+}
+
+/// Element `i`, borrowed: no count is touched.
+export fn grt_list_borrow_at(l: addr, i: i64) -> addr {
+    let t = tag(l)
+    if t != layout.TAG_LIST and t != layout.TAG_TUPLE {
+        unsafe { say(mem_static("borrowed index on a list of scalars"), mem_static_len("borrowed index on a list of scalars")) }
+    }
+    var n = 0
+    let p = items(l, n)
+    if i < 0 or i >= n {
+        index_bounds(i, n)
+    }
+    at(p, i)
+}
+
+/// Element `i`, the caller's to hold; a scalar's box.
+export fn grt_list_get(l: addr, i: i64) -> addr {
+    let t = tag(l)
+    if t == layout.TAG_LIST or t == layout.TAG_TUPLE {
+        var n = 0
+        let p = items(l, n)
+        if i < 0 or i >= n {
+            index_bounds(i, n)
+        }
+        let e = at(p, i)
+        val.inc(e)
+        return e
+    }
+    if t == layout.TAG_LIST_SCALAR {
+        let n = slen(l)
+        if i < 0 or i >= n {
+            index_bounds(i, n)
+        }
+        return box_of(skind(l), sget(l, i))
+    }
+    unsafe { say(mem_static("index on non-list"), mem_static_len("index on non-list")) }
+    unsafe { mem_addr(0) }
+}
+
+export fn grt_list_get_scalar(l: addr, i: i64, kind: i64) -> i64 {
+    let t = tag(l)
+    if t == layout.TAG_LIST_SCALAR {
+        let n = slen(l)
+        if i < 0 or i >= n {
+            index_bounds(i, n)
+        }
+        return sget(l, i)
+    }
+    if t == layout.TAG_LIST or t == layout.TAG_TUPLE {
+        var n = 0
+        let p = items(l, n)
+        if i < 0 or i >= n {
+            index_bounds(i, n)
+        }
+        return unbox(kind_of_code(kind), at(p, i))
+    }
+    unsafe { say(mem_static("index on non-list"), mem_static_len("index on non-list")) }
+    0
+}
+
+/// `xs.get(i)`: `Some` of the element, or `None` out of range.
+export fn grt_list_get_opt(l: addr, i: i64) -> addr {
+    let t = tag(l)
+    if t == layout.TAG_LIST_SCALAR {
+        if i < 0 or i >= slen(l) {
+            return maps.option(unsafe { mem_addr(0) })
+        }
+        return maps.option(box_of(skind(l), sget(l, i)))
+    }
+    if t == layout.TAG_LIST {
+        var n = 0
+        let p = items(l, n)
+        if i < 0 or i >= n {
+            return maps.option(unsafe { mem_addr(0) })
+        }
+        let e = at(p, i)
+        val.inc(e)
+        return maps.option(e)
+    }
+    unsafe { say(mem_static("get on non-list"), mem_static_len("get on non-list")) }
+    unsafe { mem_addr(0) }
+}
+
+/// The first (`last` false) or last element, as an `Option`.
+fn end_of(l: addr, last: bool) -> addr {
+    let t = tag(l)
+    if t == layout.TAG_LIST {
+        var n = 0
+        let p = items(l, n)
+        if n == 0 {
+            return maps.option(unsafe { mem_addr(0) })
+        }
+        let e = at(p, if last { n - 1 } else { 0 })
+        val.inc(e)
+        return maps.option(e)
+    }
+    if t == layout.TAG_LIST_SCALAR {
+        let n = slen(l)
+        if n == 0 {
+            return maps.option(unsafe { mem_addr(0) })
+        }
+        return maps.option(box_of(skind(l), sget(l, if last { n - 1 } else { 0 })))
+    }
+    not_list()
+    unsafe { mem_addr(0) }
+}
+
+export fn grt_list_first(l: addr) -> addr {
+    end_of(l, false)
+}
+
+export fn grt_list_last(l: addr) -> addr {
+    end_of(l, true)
+}
+
+/// Pop honouring copy-on-write; the popped element, as an `Option`, to `out`.
+export fn grt_list_pop(l: addr, out: addr) -> addr {
+    let target = cow(l)
+    let t = tag(target)
+    unsafe {
+        if t == layout.TAG_LIST {
+            var n = 0
+            let p = items(target, n)
+            if n == 0 {
+                out.store_addr(maps.option(mem_addr(0)))
+            } else {
+                let e = at(p, n - 1)
+                if is_inline(target) {
+                    target.offset(layout.LIST_LEN).store_u8((n - 1).as_u8())
+                } else {
+                    set_len(target.offset(layout.LIST_VEC), n - 1)
+                }
+                out.store_addr(maps.option(e))
+            }
+        } else if t == layout.TAG_LIST_SCALAR {
+            let n = slen(target)
+            if n == 0 {
+                out.store_addr(maps.option(mem_addr(0)))
+            } else {
+                let bits = sget(target, n - 1)
+                set_len(sdata(target), n - 1)
+                out.store_addr(maps.option(box_of(skind(target), bits)))
+            }
+        } else {
+            unreachable()
+        }
+    }
+    target
+}
+
+/// Removes element `i`, the removed element to `out`; out of range panics,
+/// as indexing does.
+export fn grt_list_remove(l: addr, i: i64, out: addr) -> addr {
+    let n = grt_list_len(l)
+    if i < 0 or i >= n {
+        unsafe { bounds(mem_static("remove"), 6, i, n) }
+    }
+    unsafe { out.store_addr(grt_list_get(l, i)) }
+    let target = cow(l)
+    let t = tag(target)
+    if t == layout.TAG_LIST {
+        val.dec(remove_item(target, i))
+    } else if t == layout.TAG_LIST_SCALAR {
+        // What the Rust runtime collects the others into: nothing for none,
+        // otherwise four words doubled until they fit -- then a byte each,
+        // in place, for bools.
+        let size = width(target)
+        let m = n - 1
+        var cap = 0
+        if m > 0 {
+            cap = 4
+            while cap < m {
+                cap = 2 * cap
+            }
+        }
+        let v = sdata(target)
+        let old = vec_ptr(v)
+        let oldcap = vec_cap(v)
+        let buf = if cap > 0 { sys.alloc(8 * cap) } else { dangling(8) }
+        var k = 0
+        var j = 0
+        unsafe {
+            while j < n {
+                if j != i {
+                    if size == 1 {
+                        buf.offset(k).store_u8(old.offset(j).load_u8())
+                    } else {
+                        buf.offset(8 * k).store_i64(old.offset(8 * j).load_i64())
+                    }
+                    k += 1
+                }
+                j += 1
+            }
+        }
+        if oldcap > 0 {
+            sys.dealloc(old)
+        }
+        if size == 1 {
+            // An empty `Vec<i64>` collects into an empty `Vec<u8>`.
+            set_vec(v, if cap > 0 { buf } else { dangling(1) }, m, 8 * cap)
+        } else {
+            set_vec(v, buf, m, cap)
+        }
+    } else {
+        unreachable()
+    }
+    target
+}
+
+// ----- whole lists -----------------------------------------------------------------
+
+/// The elements reversed, in a new list.
+export fn grt_list_rev(l: addr) -> addr {
+    let t = tag(l)
+    if t == layout.TAG_LIST {
+        var n = 0
+        let p = items(l, n)
+        var o = unsafe { mem_addr(0) }
+        let out = heap_list(layout.TAG_LIST, n, o)
+        var i = 0
+        while i < n {
+            let e = at(p, i)
+            val.inc(e)
+            unsafe { o.offset(8 * (n - 1 - i)).store_addr(e) }
+            i += 1
+        }
+        return out
+    }
+    if t != layout.TAG_LIST_SCALAR {
+        not_list()
+    }
+    let out = new_scalar(skind(l))
+    let size = width(l)
+    let n = slen(l)
+    let v = sdata(out)
+    vec_exact(v, n, size)
+    let src = vec_ptr(sdata(l))
+    let dst = vec_ptr(v)
+    var i = 0
+    unsafe {
+        while i < n {
+            if size == 1 {
+                dst.offset(n - 1 - i).store_u8(src.offset(i).load_u8())
+            } else {
+                dst.offset(8 * (n - 1 - i)).store_i64(src.offset(8 * i).load_i64())
+            }
+            i += 1
+        }
+    }
+    set_len(v, n)
+    out
+}
+
+/// `a..b` of a list, both clamped into it; empty when `a` is past `b`.
+export fn grt_list_slice(l: addr, a: i64, b: i64) -> addr {
+    let t = tag(l)
+    var len = 0
+    if t == layout.TAG_LIST {
+        len = count(l)
+    } else if t == layout.TAG_LIST_SCALAR {
+        len = slen(l)
+    } else {
+        not_list()
+    }
+    let s = if a < 0 { 0 } else if a > len { len } else { a }
+    let e = if b < 0 { 0 } else if b > len { len } else { b }
+    let m = if s <= e { e - s } else { 0 }
+    if t == layout.TAG_LIST {
+        var n = 0
+        let p = items(l, n)
+        var o = unsafe { mem_addr(0) }
+        let out = heap_list(layout.TAG_LIST, m, o)
+        var i = 0
+        while i < m {
+            let x = at(p, s + i)
+            val.inc(x)
+            unsafe { o.offset(8 * i).store_addr(x) }
+            i += 1
+        }
+        return out
+    }
+    let out = new_scalar(skind(l))
+    if s <= e {
+        let size = width(l)
+        let v = sdata(out)
+        vec_exact(v, m, size)
+        sys.copy(vec_ptr(v), unsafe { vec_ptr(sdata(l)).offset(s * size) }, m * size)
+        set_len(v, m)
+    }
+    out
+}
+
+/// `a + b`: a scalar list when both are of one kind, a list of boxes
+/// otherwise.
+export fn grt_list_concat(a: addr, b: addr) -> addr {
+    let ta = tag(a)
+    let tb = tag(b)
+    if ta != layout.TAG_LIST and ta != layout.TAG_LIST_SCALAR {
+        not_list()
+    }
+    if tb != layout.TAG_LIST and tb != layout.TAG_LIST_SCALAR {
+        not_list()
+    }
+    if ta == layout.TAG_LIST_SCALAR and tb == layout.TAG_LIST_SCALAR and skind(a) == skind(b) {
+        let out = new_scalar(skind(a))
+        let size = width(a)
+        let na = slen(a)
+        let v = sdata(out)
+        vec_exact(v, na, size)
+        sys.copy(vec_ptr(v), vec_ptr(sdata(a)), na * size)
+        set_len(v, na)
+        var i = 0
+        let nb = slen(b)
+        while i < nb {
+            spush(out, sget(b, i))
+            i += 1
+        }
+        return out
+    }
+    let out = fresh(layout.TAG_LIST)
+    // `Vec::new()`, then pushed to.
+    unsafe {
+        out.offset(layout.LIST_DISC).store_u8(layout.LIST_HEAP.as_u8())
+        set_vec(out.offset(layout.LIST_VEC), dangling(8), 0, 0)
+    }
+    let v = unsafe { out.offset(layout.LIST_VEC) }
+    var side = 0
+    while side < 2 {
+        let x = if side == 0 { a } else { b }
+        if tag(x) == layout.TAG_LIST {
+            var n = 0
+            let p = items(x, n)
+            var i = 0
+            while i < n {
+                let e = at(p, i)
+                val.inc(e)
+                vec_push(v, unsafe { e.as_i64() }, 8)
+                i += 1
+            }
+        } else {
+            let n = slen(x)
+            var i = 0
+            while i < n {
+                vec_push(v, unsafe { box_of(skind(x), sget(x, i)).as_i64() }, 8)
+                i += 1
+            }
+        }
+        side += 1
+    }
+    out
+}
+
+fn total(bits: i64) -> i64 {
+    bits.bit_xor(bits.shr(63).ushr(1))
+}
+
+fn three(a: i64, b: i64) -> i64 {
+    if a < b { -1 } else if a > b { 1 } else { 0 }
+}
+
+fn three_u(a: i64, b: i64) -> i64 {
+    let x = a.as_u64()
+    let y = b.as_u64()
+    if x < y { -1 } else if x > y { 1 } else { 0 }
+}
+
+/// Two boxes in the order `cmp` uses (`cmp_vals`); the common cases here,
+/// the rest from `equal.order`.
+fn cmp(a: addr, b: addr) -> i64 {
+    let ta = tag(a)
+    let tb = tag(b)
+    if ta == tb {
+        if ta == layout.TAG_I64 {
+            return three(word(a), word(b))
+        }
+        if ta == layout.TAG_F64 {
+            return three(total(word(a)), total(word(b)))
+        }
+        if ta == layout.TAG_STR {
+            var na = 0
+            var nb = 0
+            let pa = strread.text_of(a, na)
+            let pb = strread.text_of(b, nb)
+            let m = if na < nb { na } else { nb }
+            let c = if m == 0 { 0 } else { unsafe { memcmp(pa, pb, m) }.as_i64() }
+            return if c < 0 { -1 } else if c > 0 { 1 } else { three(na, nb) }
+        }
+    }
+    equal.order(a, b)
+}
+
+/// Two scalar elements of kind `sk` in `scalar_cmp`'s order -- or, with
+/// `boxed`, in the order their boxes have, where a reference or a bool is
+/// equal to every other.
+fn cmp_bits(sk: i64, x: i64, y: i64, boxed: bool) -> i64 {
+    if sk == layout.SK_I64 {
+        return three(x, y)
+    }
+    if sk == layout.SK_REF {
+        return if boxed { 0 } else { three(x, y) }
+    }
+    if sk == layout.SK_U64 {
+        return three_u(x, y)
+    }
+    if sk == layout.SK_F64 {
+        return three(total(x), total(y))
+    }
+    0
+}
+
+/// How two items compare for a sort. Mode 0: boxes. Mode 1: scalar bits of
+/// kind `sk`. Mode 2: positions into the key list `keys`, a list of boxes.
+/// Mode 3: positions into `keys`, a scalar list compared as its boxes.
+fn compare(mode: i64, x: i64, y: i64, sk: i64, keys: addr) -> i64 {
+    unsafe {
+        if mode == 0 {
+            return cmp(mem_addr(x), mem_addr(y))
+        }
+        if mode == 1 {
+            return cmp_bits(sk, x, y, false)
+        }
+        if mode == 2 {
+            var n = 0
+            let p = items(keys, n)
+            return cmp(at(p, x), at(p, y))
+        }
+    }
+    cmp_bits(sk, sget(keys, x), sget(keys, y), true)
+}
+
+/// Sorts the `n` words at `xs` stably: a merge of runs doubling in length.
+fn msort(xs: addr, n: i64, mode: i64, sk: i64, keys: addr) {
+    if n < 2 {
+        return
+    }
+    let tmp = sys.alloc(8 * n)
+    var src = xs
+    var dst = tmp
+    var w = 1
+    unsafe {
+        while w < n {
+            var lo = 0
+            while lo < n {
+                let mid = if lo + w < n { lo + w } else { n }
+                let hi = if lo + 2 * w < n { lo + 2 * w } else { n }
+                var i = lo
+                var j = mid
+                var k = lo
+                while i < mid and j < hi {
+                    let x = src.offset(8 * i).load_i64()
+                    let y = src.offset(8 * j).load_i64()
+                    if compare(mode, y, x, sk, keys) < 0 {
+                        dst.offset(8 * k).store_i64(y)
+                        j += 1
+                    } else {
+                        dst.offset(8 * k).store_i64(x)
+                        i += 1
+                    }
+                    k += 1
+                }
+                while i < mid {
+                    dst.offset(8 * k).store_i64(src.offset(8 * i).load_i64())
+                    i += 1
+                    k += 1
+                }
+                while j < hi {
+                    dst.offset(8 * k).store_i64(src.offset(8 * j).load_i64())
+                    j += 1
+                    k += 1
+                }
+                lo = hi
+            }
+            let s = src
+            src = dst
+            dst = s
+            w = 2 * w
+        }
+    }
+    if src != xs {
+        sys.copy(xs, src, 8 * n)
+    }
+    sys.dealloc(tmp)
+}
+
+/// Sorted in place, honouring copy-on-write. Bools have no order and stay
+/// as they are.
+export fn grt_list_sort(l: addr) -> addr {
+    let target = cow(l)
+    let t = tag(target)
+    if t == layout.TAG_LIST {
+        var n = 0
+        let p = items(target, n)
+        msort(p, n, 0, 0, unsafe { mem_addr(0) })
+    } else if t == layout.TAG_LIST_SCALAR {
+        if not is_bytes(target) {
+            msort(vec_ptr(sdata(target)), slen(target), 1, skind(target), unsafe { mem_addr(0) })
+        }
+    } else {
+        unreachable()
+    }
+    target
+}
+
+/// Sorted by a parallel list of keys, one per element, stably.
+export fn grt_list_sort_by(l: addr, keys: addr) -> addr {
+    let n = grt_list_len(l)
+    if grt_list_len(keys) != n {
+        unsafe { say(mem_static("sort_by: one key per element"), mem_static_len("sort_by: one key per element")) }
+    }
+    let order = sys.alloc(8 * n + 8)
+    var i = 0
+    while i < n {
+        unsafe { order.offset(8 * i).store_i64(i) }
+        i += 1
+    }
+    let kt = tag(keys)
+    if n >= 2 {
+        if kt == layout.TAG_LIST or kt == layout.TAG_TUPLE {
+            msort(order, n, 2, 0, keys)
+        } else if kt == layout.TAG_LIST_SCALAR {
+            msort(order, n, 3, skind(keys), keys)
+        } else {
+            unsafe { say(mem_static("index on non-list"), mem_static_len("index on non-list")) }
+        }
+    }
+    let target = cow(l)
+    let t = tag(target)
+    if t == layout.TAG_LIST {
+        var m = 0
+        let p = items(target, m)
+        let src = sys.alloc(8 * n + 8)
+        sys.copy(src, p, 8 * n)
+        var d = 0
+        unsafe {
+            while d < n {
+                p.offset(8 * d).store_i64(src.offset(8 * order.offset(8 * d).load_i64()).load_i64())
+                d += 1
+            }
+        }
+        sys.dealloc(src)
+    } else if t == layout.TAG_LIST_SCALAR {
+        let src = sys.alloc(8 * n + 8)
+        var d = 0
+        while d < n {
+            unsafe { src.offset(8 * d).store_i64(sget(target, d)) }
+            d += 1
+        }
+        d = 0
+        while d < n {
+            sset(target, d, unsafe { src.offset(8 * order.offset(8 * d).load_i64()).load_i64() })
+            d += 1
+        }
+        sys.dealloc(src)
+    } else {
+        unreachable()
+    }
+    sys.dealloc(order)
+    target
+}
+
+/// `[(index, element)]`.
+export fn grt_list_enumerate(l: addr) -> addr {
+    let n = grt_list_len(l)
+    var o = unsafe { mem_addr(0) }
+    let out = heap_list(layout.TAG_LIST, n, o)
+    var i = 0
+    while i < n {
+        let pair = structs.pair(structs.scalar_box(0, i), grt_list_get(l, i))
+        unsafe { o.offset(8 * i).store_addr(pair) }
+        i += 1
+    }
+    out
+}
+
+/// `[(a, b)]` up to the shorter of the two.
+export fn grt_list_zip(a: addr, b: addr) -> addr {
+    let na = grt_list_len(a)
+    let nb = grt_list_len(b)
+    let n = if na < nb { na } else { nb }
+    var o = unsafe { mem_addr(0) }
+    let out = heap_list(layout.TAG_LIST, n, o)
+    var i = 0
+    while i < n {
+        let x = grt_list_get(a, i)
+        let pair = structs.pair(x, grt_list_get(b, i))
+        unsafe { o.offset(8 * i).store_addr(pair) }
+        i += 1
+    }
+    out
+}
+
+/// Whether an element equals `needle`: boxes by `==`; a scalar list's
+/// elements only against a box of their own kind, floats as floats.
+export fn grt_list_contains(l: addr, needle: addr) -> i8 {
+    let t = tag(l)
+    var hit = false
+    if t == layout.TAG_LIST {
+        var n = 0
+        let p = items(l, n)
+        var i = 0
+        while i < n and not hit {
+            hit = equal.equal(at(p, i), needle)
+            i += 1
+        }
+    } else if t == layout.TAG_LIST_SCALAR {
+        let sk = skind(l)
+        let nt = tag(needle)
+        let fits = (sk == layout.SK_I64 and nt == layout.TAG_I64) or (sk == layout.SK_U64 and nt == layout.TAG_U64) or (sk == layout.SK_REF and nt == layout.TAG_REF) or (sk == layout.SK_F64 and nt == layout.TAG_F64) or (sk == layout.SK_BOOL and nt == layout.TAG_BOOL)
+        if fits {
+            let want = if sk == layout.SK_BOOL { unsafe { needle.offset(layout.BOOL_AT).load_u8() }.as_i64() } else { word(needle) }
+            let n = slen(l)
+            var i = 0
+            while i < n and not hit {
+                let b = sget(l, i)
+                if sk == layout.SK_F64 {
+                    hit = b.from_bits() == want.from_bits()
+                } else if sk == layout.SK_BOOL {
+                    hit = (b != 0) == (want != 0)
+                } else {
+                    hit = b == want
+                }
+                i += 1
+            }
+        }
+    } else {
+        not_list()
+    }
+    if hit { 1.as_i8() } else { 0.as_i8() }
+}
+
+/// The elements shown and joined by `sep`.
+export fn grt_list_join(l: addr, sep: addr) -> addr {
+    let t = tag(l)
+    var ns = 0
+    let ps = strread.text_of(sep, ns)
+    let b = display.text_new()
+    if t == layout.TAG_LIST {
+        var n = 0
+        let p = items(l, n)
+        var i = 0
+        while i < n {
+            if i > 0 {
+                display.put(b, ps, ns)
+            }
+            let s = display.shown(at(p, i))
+            display.put(b, display.text_ptr(s), display.text_len(s))
+            display.text_free(s)
+            i += 1
+        }
+    } else if t == layout.TAG_LIST_SCALAR {
+        let sk = skind(l)
+        let n = slen(l)
+        var i = 0
+        while i < n {
+            if i > 0 {
+                display.put(b, ps, ns)
+            }
+            display.put_scalar(b, sk, sget(l, i))
+            i += 1
+        }
+    } else {
+        not_list()
+    }
+    let out = numstr.new_str(display.text_ptr(b), display.text_len(b))
+    display.text_free(b)
+    out
+}
+
+/// Integers summed, wrapping; a `u64` the same, being the same bits.
+export fn grt_list_sum_i64(l: addr) -> i64 {
+    let t = tag(l)
+    var s = 0
+    if t == layout.TAG_LIST {
+        var n = 0
+        let p = items(l, n)
+        var i = 0
+        while i < n {
+            let e = at(p, i)
+            let et = tag(e)
+            if et == layout.TAG_I64 or et == layout.TAG_U64 {
+                s += word(e)
+            }
+            i += 1
+        }
+    } else if t == layout.TAG_LIST_SCALAR {
+        let sk = skind(l)
+        if sk == layout.SK_I64 or sk == layout.SK_U64 {
+            let n = slen(l)
+            var i = 0
+            while i < n {
+                s += sget(l, i)
+                i += 1
+            }
+        }
+    } else {
+        not_list()
+    }
+    s
+}
+
+/// Floats summed, in order; integers among boxes as floats. A list of boxes
+/// starts its sum at 0.0, a scalar list at -0.0 (`Iterator::sum`), so `-0.0`
+/// alone sums to itself only there.
+export fn grt_list_sum_f64(l: addr) -> f64 {
+    if grt_list_len(l) == 0 {
+        return 0.0
+    }
+    let t = tag(l)
+    if t == layout.TAG_LIST {
+        var s = 0.0
+        var n = 0
+        let p = items(l, n)
+        var i = 0
+        while i < n {
+            let e = at(p, i)
+            let et = tag(e)
+            if et == layout.TAG_F64 {
+                s = s + word(e).from_bits()
+            } else if et == layout.TAG_I64 {
+                s = s + word(e).as_f64()
+            }
+            i += 1
+        }
+        return s
+    }
+    if t == layout.TAG_LIST_SCALAR {
+        let sk = skind(l)
+        if sk == layout.SK_F64 or sk == layout.SK_I64 {
+            var s = 1.shl(63).from_bits()
+            let n = slen(l)
+            var i = 0
+            while i < n {
+                let b = sget(l, i)
+                s = s + if sk == layout.SK_F64 { b.from_bits() } else { b.as_f64() }
+                i += 1
+            }
+            return s
+        }
+        return 0.0
+    }
+    not_list()
+    0.0
+}
+
+/// The least (`want_max` 0) or greatest element as an `Option`: the first
+/// of equals.
+export fn grt_list_min_max(l: addr, want_max: i8) -> addr {
+    let most = want_max.as_i64() != 0
+    let t = tag(l)
+    if t == layout.TAG_LIST {
+        var n = 0
+        let p = items(l, n)
+        if n == 0 {
+            return maps.option(unsafe { mem_addr(0) })
+        }
+        var best = at(p, 0)
+        var i = 1
+        while i < n {
+            let e = at(p, i)
+            let o = cmp(e, best)
+            if (most and o > 0) or (not most and o < 0) {
+                best = e
+            }
+            i += 1
+        }
+        val.inc(best)
+        return maps.option(best)
+    }
+    if t == layout.TAG_LIST_SCALAR {
+        let n = slen(l)
+        if n == 0 {
+            return maps.option(unsafe { mem_addr(0) })
+        }
+        let sk = skind(l)
+        var best = sget(l, 0)
+        var i = 1
+        while i < n {
+            let b = sget(l, i)
+            let o = cmp_bits(sk, b, best, false)
+            if (most and o > 0) or (not most and o < 0) {
+                best = b
+            }
+            i += 1
+        }
+        return maps.option(box_of(sk, best))
+    }
+    not_list()
+    unsafe { mem_addr(0) }
+}
+
+// ----- ranges held as values -----------------------------------------------------
+
+export fn grt_range_new(start: i64, end: i64, inclusive: i8) -> addr {
+    let r = alloc.take()
+    unsafe {
+        r.offset(layout.TAG).store_u8(layout.TAG_RANGE.as_u8())
+        r.offset(layout.RANGE_START).store_i64(start)
+        r.offset(layout.RANGE_END).store_i64(end)
+        r.offset(layout.RANGE_INCL).store_u8(if inclusive.as_i64() != 0 { 1.as_u8() } else { 0.as_u8() })
+    }
+    r
+}
+
+fn range_of(r: addr, what: addr, wn: i64) {
+    if tag(r) != layout.TAG_RANGE {
+        let t = display.text_new()
+        display.put(t, what, wn)
+        unsafe {
+            display.put(t, mem_static(": not a range"), mem_static_len(": not a range"))
+            grasm_panic_msg(display.text_ptr(t), display.text_len(t))
+        }
+    }
+}
+
+fn incl(r: addr) -> bool {
+    unsafe { r.offset(layout.RANGE_INCL).load_u8() }.as_i64() != 0
+}
+
+/// The elements, as a scalar list; empty when the range is.
+export fn grt_range_to_list(r: addr) -> addr {
+    unsafe { range_of(r, mem_static("range_to_list"), 13) }
+    let start = unsafe { r.offset(layout.RANGE_START).load_i64() }
+    let end = unsafe { r.offset(layout.RANGE_END).load_i64() }
+    let last = if incl(r) { end } else { end - 1 }
+    let l = new_scalar(layout.SK_I64)
+    if start <= last {
+        // As many as there are, though no more than 2^32 - 1 words four
+        // times over; and at least four.
+        let span = (last - start).as_u64()
+        let most = 17179869180
+        var want = if span >= (most - 1).as_u64() { most } else { (span.as_i64()) + 1 }
+        if want < 4 {
+            want = 4
+        }
+        let v = sdata(l)
+        vec_exact(v, want, 8)
+        var i = start
+        var k = 0
+        var going = true
+        while going {
+            if k == vec_cap(v) {
+                vec_reserve(v, 1, 8)
+            }
+            unsafe { vec_ptr(v).offset(8 * k).store_i64(i) }
+            k += 1
+            set_len(v, k)
+            if i == last {
+                going = false
+            } else {
+                i += 1
+            }
+        }
+    }
+    l
+}
+
+/// How many elements, without making them; no more than `i64::MAX`.
+export fn grt_range_len(r: addr) -> i64 {
+    unsafe { range_of(r, mem_static("range_len"), 9) }
+    let start = unsafe { r.offset(layout.RANGE_START).load_i64() }
+    let end = unsafe { r.offset(layout.RANGE_END).load_i64() }
+    let max = 9223372036854775807
+    if incl(r) {
+        if end < start {
+            return 0
+        }
+        let d = (end - start).as_u64()
+        return if d >= max.as_u64() { max } else { d.as_i64() + 1 }
+    }
+    if end <= start {
+        return 0
+    }
+    let d = (end - start).as_u64()
+    if d > max.as_u64() { max } else { d.as_i64() }
+}
+
+export fn grt_range_start(r: addr) -> i64 {
+    unsafe { range_of(r, mem_static("range_start"), 11) }
+    unsafe { r.offset(layout.RANGE_START).load_i64() }
+}
+
+export fn grt_range_end(r: addr) -> i64 {
+    unsafe { range_of(r, mem_static("range_end"), 9) }
+    unsafe { r.offset(layout.RANGE_END).load_i64() }
+}
+
+export fn grt_range_inclusive(r: addr) -> i8 {
+    unsafe { range_of(r, mem_static("range_inclusive"), 15) }
+    if incl(r) { 1.as_i8() } else { 0.as_i8() }
+}

@@ -14,9 +14,9 @@
 // runtime's own `extern fn grasm_<name>` declarations still reach the
 // archive's. Those are of two kinds, and `scripts/rtswap.sh` holds both to a
 // list: a family that has not moved yet, and the *state* the Rust code that
-// is still linked keeps using -- the box allocator and its live count, the
-// output buffers, the panic and exit path -- which moves last, with the last
-// of that code.
+// is still linked keeps using -- the output buffers and the panic and exit
+// path, which move with the last Rust code that writes, and the Rust half of
+// the allocator's ledger (`alloc.gr`, `leak.gr`).
 //
 // The rules the code keeps:
 //
@@ -29,8 +29,8 @@
 //     or under a lock built from atomics, as `scripts/rtlint.py` requires;
 //     what is one per thread in its own `thread_local` cells, which the Grasm
 //     backend makes Mach-O thread-local variables, never the program's block;
-//   * fixed text is code (`text.gr`, written by `gen_text.py`) until the
-//     panic path moves; `mem_static` can hold it as bytes;
+//   * fixed text is static bytes (`mem_static`): a message is never a value
+//     the runtime would have to make to say it;
 //   * every layout it reads or writes is in `layout.gr` and checked against
 //     the Rust runtime's by `scripts/rtlayout.sh`.
 //
@@ -43,12 +43,16 @@
 //     numstr   numbers as string values and as interpolated pieces
 //     strread  strings read: length in bytes, emptiness, equality, order
 //     val      reference counting
-//     release  the release walk, for the payloads whose layout has moved
+//     release  the release walk, for every payload
+//     alloc    the box allocator: pools, live counts, interned boxes
+//     boxes    scalars boxed and unboxed, and the layout check
+//     region   regions opened and swept
+//     leak     how many boxes are live, and the leak check
+//     vals     value structs released and copied by their descriptor
 //
-// and three that serve them: `layout`, `text` and `sys` (the C library).
+// and two that serve them: `layout` and `sys` (the C library).
 import math
 import panic
-import text
 import layout
 import fmt
 import out
@@ -56,4 +60,23 @@ import numstr
 import strread
 import val
 import release
+import alloc
+import boxes
+import region
+import leak
+import vals
+import keys
+import maps
+import equal
+import display
+import structs
+import refs
+import funcs
+import bytes
+import lists
+import strings
+import case
+import numparse
+import fiber
+import tasks
 import sys

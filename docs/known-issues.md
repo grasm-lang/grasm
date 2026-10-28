@@ -5,10 +5,93 @@ Every defect that is known and not fixed, with its severity from
 to paste. S1 and S2 block a release; S3 and S4 do not, and this file is what
 makes shipping them honest rather than quiet.
 
-**Open S1: none confirmed; one under investigation. Open S2: none. Open S3:
-two, a block whose value is a map literal and a statement `if` whose
-branches' values differ, refused natively. Open S4: two, a nested
-interpolation's spans and a backslash at the end of a file.**
+**Open S1: one, the interpreter losing a wake for an outer `concurrent`
+block's task while a nested block runs; one under investigation. Open S2:
+none. Open S3: two, a block whose value is a map literal and a statement
+`if` whose branches' values differ, refused natively. Open S4: two, a nested
+interpolation's spans and a backslash at the end of a file. Latent: one, the
+Rust runtime's region sweep, which no compiled program reaches.**
+
+## Found on 2026-10-27 by S5 part three (the runtime's state, in Grasm)
+
+Each was found while holding the Grasm runtime to the Rust one; neither is
+in code S5 replaces in the Rust tree, so neither is fixed there. The Grasm
+runtime does what each should.
+
+**The interpreter loses a wake meant for an outer `concurrent` block's task
+while a nested block runs, and reports a deadlock -- *open, S1, in the
+interpreter's scheduler*.**
+
+```
+fn main() / {io, async} {
+    let ch = chan_new()
+    concurrent {
+        go {
+            chan_send(ch, 1)
+            print("sent")
+        }
+        go {
+            print("got {chan_recv(ch)}")
+        }
+        go {
+            let inner = chan_new()
+            concurrent {
+                go {
+                    chan_send(inner, 2)
+                }
+                go {
+                    print("inner {chan_recv(inner)}")
+                }
+            }
+        }
+    }
+}
+```
+
+A native build, on the Rust runtime and on the Grasm one, prints `got
+Some(1)`, `inner Some(2)`, `sent` and exits 0. `grasm run` prints the first
+two lines and then `panic: deadlock: every task is waiting on a channel, and
+nothing left can send or receive`, exit 101. The first task's rendezvous
+send is taken by the second, which wakes the first; the wake is made while
+the third task's nested block is the one scheduling, and the nested
+scheduler does not leave it for the outer one -- the native schedulers keep
+wakes for another block (`Chans::ready`, keyed by block, in
+`crates/grasm_rt/src/tasks.rs` and `compiler/rt/src/tasks.gr`), and
+[E-SCHEDULE] has the woken task run. Not fixed: S5 does not change the
+interpreter. `scripts/fuzz_rttasks.sh` holds the runtimes to the
+interpreter only on rounds without nested blocks for this reason.
+
+**The Rust runtime's region sweep can free a box and then release it again
+-- *latent; it becomes S1 if the backend ever sweeps regions*.**
+
+```
+extern fn grasm_region_push()
+extern fn grasm_region_pop()
+extern fn grasm_box_f64(v: f64) -> addr
+extern fn grasm_list_new() -> addr
+extern fn grasm_list_push(l: addr, v: addr) -> addr
+
+fn main() / {io, unsafe, mem} {
+    unsafe {
+        grasm_region_push()
+        let x = grasm_box_f64(1.5)
+        let _l = grasm_list_push(grasm_list_new(), x)
+        grasm_region_pop()
+    }
+}
+```
+
+Against the poisoned runtime (`--features grasm_rt/poison`) this ends
+`panic: use after free: dec on a value already released`, exit 101; against
+the ordinary one, with `GRASM_LEAK_CHECK=1`, `leak: -1 allocation(s) still
+live at exit`, exit 7 -- the box was freed twice. With the Grasm runtime
+interposed, both end with nothing live. `grasm_region_pop` frees each of the region's boxes
+in turn and only then looks at the next box's children: the list's element
+is the earlier box, already freed, and it is released again as a child
+living outside the region. The backend never opens a region
+(`REGION_SWEEP` is false in `crates/grasm_native`), so no compiled program
+reaches it. The Grasm runtime's sweep (`compiler/rt/src/region.gr`) finds
+every child outside the region before it frees anything.
 
 ## Found on 2026-10-27 by S2 part two (the checker and TIR in Grasm)
 

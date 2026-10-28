@@ -2011,6 +2011,195 @@ one directory named both relatively and absolutely in one package graph,
 could be two directories to it and one to Rust. No program in the
 repository does either.
 
+### 6.11 S5 part three: the runtime's state, the stateless families, fibers
+
+Written 2026-10-27. Part two (§6.9) left the release walk for half the
+payloads, the allocator, the output and panic path, maps, the stateless
+families and the fibers in Rust. Of the runtime's 345 entry points 285 now
+come from Grasm (58 at the end of part one), by the inventory's families
+(§6.7):
+
+| family | entry points | from Grasm | what stays Rust's, and why |
+|---|---:|---:|---|
+| values and counting | 22 | 22 | |
+| number formatting and parsing | 19 | 19 | |
+| output | 9 | 6 | `out_text`, `out_nl`, `out_to_stderr`: the buffer (below) |
+| panics, exit, stack floor | 13 | 10 | `panic_msg`, `exit`, `report_main_err`: the way out (below) |
+| math | 38 | 38 | |
+| strings | 51 | 49 | `str_c_new`, `str_c_free`: C copies, with their own count |
+| bytes | 21 | 20 | `append_bytes`: a file, journaled |
+| lists and ranges | 52 | 51 | `list_dir`: a directory, journaled |
+| maps and hashing | 15 | 15 | |
+| structs, variants, tuples, results | 29 | 29 | |
+| function values, effect handlers | 15 | 14 | `env`: an environment variable, journaled (the inventory's pattern files it here) |
+| generational references | 6 | 6 | |
+| args, files, clock, net, proc, C, raw memory | 42 | 0 | not in this part |
+| tasks, channels, fibers, parallelism | 13 | 6 | `par_*`, `net_workers*`: the worker threads, not in this part |
+| **all** | **345** | **285** | |
+
+`compiler/rt` is 13,238 lines of Grasm in 31 modules. Every family that
+moved has a gate holding it to the Rust runtime -- a program built twice,
+on the Rust runtime and with the Grasm one interposed, run over seeds and
+required to print and exit the same -- and planted faults `rtcontrols`
+catches; the runtime it builds is checked against the corpus by `rtswap`.
+
+**The corpus**, with the Grasm runtime interposed:
+
+- `rtswap`: "Cranelift objects: identical: 648   failed: 0   timed out:
+  0", "poisoned runtime: agreeing with no use after free: 648   timed out
+  (not compared): 0" and "Grasm backend objects: in the subset: 648
+  identical: 648   timed out: 0";
+- `leakcheck` through `rtwith.sh`: "leak-free: 623   leaking: 0   not
+  compiled: 0   external: 3   timed out: 0   crashed: 0   ended before
+  the check: 25";
+- `usecheck` through `rtwith.sh`: "clean: 648   use-after-free: 0   out of
+  memory: 0   external: 3   declined: 0   timed out: 0";
+- `rtcontrols`: "checks of planted faults: 65   caught: 65   missed: 0".
+
+**Step one: the rest of the release walk.** Maps (the `hashbrown` table,
+its control bytes and entries, and each `MapKey` with its inline or heap
+text and tuple keys), structs (a `StructTy` and its kinds, offsets, element
+descriptors and name; four fields in the box or more in a `Vec`), `Env`,
+`Handler`, and lists of value structs with inline strings, lists and
+nested value lists, walked iteratively as the Rust `dec_walk` walks them.
+Every offset, tag and sentinel the walk and the families read is a
+constant in `layout.gr` the probe measures from the Rust runtime and
+`rtlayout` holds: "layout constants: 149   measured and equal: 148   also
+stated by the Rust source: 52   held to the source alone: 1". The range's
+three fields, held to the source alone before, are measured now by handing
+the Rust runtime a box made by hand; the one left is the state a `OnceLock`
+is in while its value is made, which nothing outside can see.
+`fuzz_rtrelease` builds every kind nested in every other, with handlers and
+value lists and regions: "seeds identical: 20 of 20 (1200 rounds, each build under MallocScribble)   leaks runs: 8   leaking: 0 (with workers: 16 blocks against the Rust build's 16, of sizes 16 128, 8 workers)   poisoned runtime: 5 of 5 seeds agreeing with no use after free".
+
+**Step two: the allocator.** A box is 64 bytes from either side, and either
+side may free a box the other made, so the two allocators keep one ledger:
+each thread's block (`alloc.gr`, a runtime thread-local cell) holds its
+pool of freed boxes, its live and made counts and its open regions; a
+`pthread` key's destructor folds an ending thread's counts into process
+cells and frees its pool. Only the sum of the two sides' live counts means
+anything, so `live_allocations` is the sum, and the leak check hands this
+side's balance to the Rust ledger -- a box made there for each one live
+here, a box of nothing freed there for each one this side freed beyond what
+it made -- before the Rust check counts. Whether the Rust build behind is
+the poisoned one (`grasm_rt/poison`), whose freed boxes count `POISON`, is
+asked once by handing it a box of nothing; then this side's frees keep
+their boxes out of circulation too. Regions open on both sides at once
+(`region.gr`), and this side's sweep finds every child outside the region
+before it frees anything -- which the Rust sweep does not
+(docs/known-issues.md, latent).
+
+**Step three: output and the end of a program -- the texts moved, the
+buffer did not.** The panic texts and variant names are static bytes
+(`mem_static`), and `gen_text.py` and the module it wrote are gone;
+showing a value (`display.gr`: `out_val`, `str_from_val`, interpolation,
+`panic_value`) is Grasm's and iterative. The output buffer and the way out
+of a panic stay the Rust runtime's: the Rust code still linked -- the
+families below that have not moved -- panics through its own `rt_panic`,
+which flushes its own stdout buffer before it writes the message and
+exits, and a buffer on this side would be written after the message, or
+lost. They move with the last Rust code that can panic.
+
+**Step four: maps, hashed bit for bit.** `maps.gr` is the Rust runtime's
+`MapTable`: `hashbrown` 0.15's table (groups of eight control bytes,
+triangular probing, tombstones, growth at seven eighths, rehashing in
+place) over the Rust runtime's `MapHasher` -- a keyed multiply-fold of the
+128-bit product's halves, fed what `#[derive(Hash)]` feeds it. Each map
+keeps the seed it was made with; this side draws its own once per process
+from `getentropy`, as secret as the Rust one's, and a map either side made
+is hashed with its own seed whichever side touches it. Iteration is in key
+order ([E-MAP-ORDER]), so no output depends on the seed. `fuzz_rtmaps`
+pins `getentropy` in the program, so both runtimes draw the same seed, and
+compares every table's control bytes and entries after every operation:
+"pinned seeds with every table identical: 30 of 30   unpinned seeds identical: 5 of 5   (1500 operations each; map names taken from Grasm: 13)".
+
+**Step five: the stateless families**, each with its gate:
+
+- equality and order (`equal.gr`): "seeds identical: 20 of 20 (6000 rounds, 198000 answers of == and cmp on each runtime)";
+- showing values (`display.gr`): "seeds identical: 20 of 20 (2000 rounds, 2981282 bytes of values shown on each runtime)";
+- structs, variants, tuples, results and value lists (`structs.gr`):
+  "seeds identical: 20 of 20 (6000 rounds, 920501 bytes of what was read on each runtime; names of the family taken from Grasm: 25)";
+- generational references (`refs.gr`, the heap in process cells behind a
+  lock built from a compare-and-swap): "seeds identical: 20 of 20 (16000 rounds, 20 ending in the stale-reference panic, every other run leak-free)";
+- function values, environments and effect handlers (`funcs.gr`), held
+  through the gates of the families that make and call them
+  (`fuzz_rtrelease`, `fuzz_rteq`, `fuzz_rtshow`) and the corpus;
+- `bytes` and the builders (`bytes.gr`): "seeds identical: 20 of 20 (6000 rounds)   panics identical: 6 of 6   names of the family taken from Grasm: 22";
+- lists and ranges (`lists.gr`): "seeds identical: 20 of 20 (4000 rounds, each leak-free)   panics identical: 6 of 6   names of the family taken from Grasm: 41";
+- strings (`strings.gr`): "seeds identical: 20 of 20 (2000 rounds, each leak-free)   panics identical: 6 of 6   names of the family taken from Grasm: 53";
+- upper and lower case (`case.gr`, over tables `scripts/rtcase.py` makes
+  from the Rust runtime's own answers for every code point): "code points 0 to 10ffff identical: lowercase changes 1488, uppercase 1580, case-ignorable 2794, cased 4364";
+- integers and floats read from text, `to_fixed`, integers held to a width,
+  and `assert_eq` (`numparse.gr`; a float is read by `core`'s own
+  arbitrary-precision decimal algorithm, correctly rounded):
+  "seeds identical: 20 of 20 (6000 rounds, each leak-free)   panics identical: 6 of 6   names of the family taken from Grasm: 10".
+
+**Step six: fibers.** `fiber.gr` is `grasm_fiber`: a stack mapped with a
+guard page, kept for the next fiber of its size, entered and left with
+`ctx_switch` and laid out with `ctx_init`; and the stack floor, a runtime
+thread-local cell that a task's fiber swaps for its own. `tasks.gr` is the
+Rust runtime's scheduler and channel table, the table in process cells
+behind a lock `rtlint` holds every access to. The model of which fiber runs
+is the interpreter's scheduler, a third implementation of [E-SCHEDULE]:
+`fuzz_rttasks` runs random tasks over random channels, each task printing
+what it does, compiled on both runtimes and under `grasm run`:
+"seeds identical on both runtimes: 20 of 20 (1600 rounds, 18751 lines of schedule, each leak-free)   flat seeds as the interpreter schedules them: 20   panics identical: 6 of 6   names of the family taken from Grasm: 8". It found the interpreter losing a wake meant for an outer
+block's task while a nested block runs (docs/known-issues.md, S1, open),
+so nested blocks are held to the two runtimes only.
+
+Pointer authentication, measured on this machine (an Apple M1 Pro,
+`hw.optional.arm.FEAT_PAuth` 1, no FPAC): the programs are arm64, not
+arm64e, and in an arm64 process the return-address keys are off --
+`rtdialect`: "pointer authentication: off (pacibsp leaves the address as
+it was)". Of the runtime object's 1,306 functions, 1,303 begin with
+`pacibsp` -- all but `ctx_init`, `ctx_start` and `ctx_switch`, the leaves --
+and a switch keeps each stack's signed return addresses with that stack: the
+signing runs on both sides of every switch, and nothing here shows it
+enforced. Nothing more is claimed.
+
+**Differences from the Rust runtime.** Each found, and which side is
+wrong:
+
+- The region sweep's use after free (above): the Rust side; latent.
+- A value nested deeper than the Rust runtime's own walks reach in 6 MiB
+  of stack is shown and compared by this side, which walks iteratively: a
+  struct nested 200,000 deep shows as 4,888,910 bytes and equals itself on
+  this side and under `grasm run`, where the Rust runtime ends `panic: stack
+  overflow: recursion too deep`. [E-RECURSION-DEPTH] bounds a program's
+  recursion, not a runtime's, so neither side breaks a clause; the
+  interpreter and this side agree. No program in the corpus or the fuzzers
+  builds such a value.
+- `sort_by` compares a scalar key list's elements as their boxes would
+  compare without making the boxes, so `GRASM_ALLOC_STATS` counts fewer
+  allocations on this side for such a sort; what is sorted is the same.
+  Lists built by `split`, `words`, `lines` and `chars`, and a scalar list
+  after `remove`, have the same elements and may have other capacities.
+- Where the Rust runtime leaks (the losing `StructTy` of a race to make
+  one) this side frees; where it copies a handler's names this side
+  borrows them. Neither is visible to a program.
+
+**What is left** for S5: the output buffer and the way out of a panic,
+together with the families that still reach the Rust panic -- arguments,
+files, clocks, the network, processes, C strings and raw memory (42 entry
+points, with the journal that records and replays them) and the parallel
+workers (`par_map`, `par_filter`, `net_workers`); then S5's exit (§6), the
+corpus, `leakcheck`, `usecheck`, the fuzzers and the benchmarks with the
+Grasm runtime linked in place of `libgrasm_rt_abi.a`, which needs all of
+them.
+
+**Time**, measured once, not benchmarked: `rtswap`'s first run on this tree
+timed out one program, `casefolddiff` built by the Grasm backend, past its
+20 s. Alone, at a load average of 3.4 to 4, it took 26.9 s on the Grasm
+runtime and 3.5 s on the Rust one: almost all of it pushing scalars, a list
+literal of computed values being rebuilt by a push per element each time it
+is read, and each push reading eight layout constants through eight calls,
+since a module-level `let` compiled by the Grasm backend is a call to a
+function returning it. A long copy now goes to `memcpy`, and the push's
+common case reads its constants from a block made once: 7.0 s against 3.8 s
+(the Cranelift build of it, timed once with `rtswap` running beside it: 1.5 s
+against 0.8 s). Every other read of a layout
+constant in the runtime is still a call; nothing else has been timed.
+
 ## 7. Bootstrap and trust
 
 - **During the migration:** stage 0 is the Rust-built `grasm`.
@@ -2090,7 +2279,7 @@ Decided 2026-10-20:
    systems subset (§5).
 5. **Linux** in S7.
 
-## 11. Where it stands (2026-10-27)
+## 11. Where it stands (2026-10-28)
 
 Measured, not estimated; each line is a gate's result on master.
 
@@ -2254,9 +2443,31 @@ Measured, not estimated; each line is a gate's result on master.
   `rtcontrols` 13 of 13, `rtdialectcontrols` 5 of 5 and `rtlint`'s 2 of 2
   planted faults caught. One fact bounds the switch's test: this machine's
   arm64 processes run with the return-address keys off.
+- **S5 part three: steps one, two, four, five and six done, step three in
+  part** (§6.11): 285 of the 345 entry points come from Grasm -- every
+  family but output and the way out of a panic, which the Rust code still
+  linked panics through; arguments, files, clocks, the network, processes,
+  C strings and raw memory; and the parallel workers -- with the release
+  walk for every payload, the allocator as a second allocator keeping one
+  ledger with the Rust one, maps hashed bit for bit, and fibers, the stack
+  floor and channels on `ctx_switch`. `rtswap`: all 648 corpus programs
+  that link no system library identical on both runtimes from both
+  backends' objects, and against the poisoned runtime with no use after
+  free; `leakcheck` through `rtwith.sh` 623 leak-free, none leaking (25 end
+  before the check); `usecheck` through it 648 clean; eleven new gates, one
+  per family (`fuzz_rtmaps` to `fuzz_rttasks`), identical on every seed,
+  `fuzz_rtcase` on every code point and `fuzz_rttasks` against the
+  interpreter's scheduler too; `rtcontrols` 65 of 65 planted faults caught.
+  Two defects found and recorded, neither fixed: the interpreter loses a
+  wake for an outer `concurrent` block's task while a nested block runs
+  (S1), and the Rust runtime's region sweep frees a box before it has read
+  it (latent: no compiled program sweeps a region). Measured once: one
+  corpus program built by the Grasm backend took 7.0 s on this runtime
+  against 3.8 s on the Rust one.
 - **Not started:** S2 part three (the diagnostics' words and spans), S6
-  (self-compilation), S7-S9; S5's state families and fibers (steps four
-  and five of part two).
+  (self-compilation), S7-S9; S5's last families -- output and the way out of
+  a panic, arguments, files, clocks, the network, processes, C strings, raw
+  memory and the parallel workers -- and its exit.
 
 With S4 done, S6 waits on S3's last steps and on S2 and S5, the frontend
 and the runtime in Grasm; they come next, one stage at a time.

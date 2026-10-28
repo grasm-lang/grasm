@@ -1,0 +1,226 @@
+// Structs, variants, tuples and results on the Grasm runtime against the
+// Rust runtime's (docs/self-hosting.md §6.11), for `scripts/fuzz_rtstructs.sh`,
+// which builds this twice -- on the Rust runtime and with the Grasm runtime
+// interposed -- and requires the same bytes out.
+//
+//     structfuzz <seed> <rounds>
+//
+// Each round builds structs of four fields or fewer and of more, with
+// scalar fields of every kind among the boxed ones; reads their fields,
+// writes them -- in place, and into a struct something else still holds,
+// which copies it first -- and pushes to a list field in place; makes
+// variants of no field, one, two and three; `Option`s and results, taken
+// apart by `match` and by `try`, with scalar and boxed payloads; tuples of
+// two, three and four; and lists of value structs with inline string and
+// list fields, pushed, indexed and walked. It prints what it read, and how
+// many boxes are live, so a count either side gets wrong is seen too.
+
+extern fn grasm_live_allocations() -> i64
+
+type Small = { a: i64, b: str, c: f64, d: bool }
+type Wide = { n: i64, s: str, u: u64, f: f64, xs: [str], flag: bool }
+type Node = { v: i64, kids: [Node] }
+type Cell = { name: str, nums: [i64], k: i64 }
+type Mark = { label: str, w: i64 }
+type Shape = | Circle(r: f64) | Rect(w: f64, h: f64) | Tri(a: i64, b: i64, c: str) | Dot
+type E = | Bad(why: str) | Worse
+
+fn next(inout s: i64) -> i64 {
+    s = s * 6364136223846793005 + 1442695040888963407
+    s.ushr(17)
+}
+
+fn pick(inout s: i64, n: i64) -> i64 {
+    next(s) % n
+}
+
+fn word(inout s: i64) -> str {
+    let k = pick(s, 4)
+    if k == 0 {
+        return "w"
+    }
+    if k == 1 {
+        return "a word past the inline capacity of a string box"
+    }
+    if k == 2 {
+        return ""
+    }
+    "é"
+}
+
+fn shape(inout s: i64) -> Shape {
+    let k = pick(s, 4)
+    if k == 0 {
+        return Circle(pick(s, 9).as_f64())
+    }
+    if k == 1 {
+        return Rect(0.5, pick(s, 9).as_f64())
+    }
+    if k == 2 {
+        return Tri(pick(s, 9), pick(s, 9), word(s))
+    }
+    Dot
+}
+
+fn area(sh: Shape) -> f64 {
+    match sh {
+        Circle(r) -> r * r
+        Rect(w, h) -> w * h
+        Tri(a, b, c) -> (a + b + c.len()).as_f64()
+        Dot -> 0.0
+    }
+}
+
+fn maybe_fail(inout s: i64) -> i64 ! E {
+    let k = pick(s, 4)
+    if k == 0 {
+        fail(Bad(word(s)))
+    }
+    if k == 1 {
+        fail(Worse)
+    }
+    pick(s, 100)
+}
+
+fn maybe_text(inout s: i64) -> str ! E {
+    if pick(s, 3) == 0 {
+        fail(Bad("no"))
+    }
+    word(s)
+}
+
+fn chain(inout s: i64) -> i64 ! E {
+    let a = try maybe_fail(s)
+    let t = try maybe_text(s)
+    a + t.len()
+}
+
+fn tree(inout s: i64, depth: i64) -> Node {
+    var kids: [Node] = []
+    if depth > 0 {
+        for i in 0..pick(s, 3) {
+            kids.push(tree(s, depth - 1))
+        }
+    }
+    Node{ v: pick(s, 50), kids: kids }
+}
+
+fn weigh(n: Node) -> i64 {
+    var t = n.v
+    for k in n.kids {
+        t += weigh(k)
+    }
+    t
+}
+
+fn round(inout s: i64) -> str {
+    var out = str_builder()
+    // Structs: read, written in place, written while shared.
+    var sm = Small{ a: pick(s, 9), b: word(s), c: 0.25, d: pick(s, 2) == 0 }
+    out.push_str("{sm.a} {sm.b.len()} {sm.c} {sm.d} ")
+    let kept = sm
+    sm.a = sm.a + 1
+    sm.b = word(s)
+    sm.d = not sm.d
+    out.push_str("{sm.a} {kept.a} {sm.b.len()} {kept.b.len()} {sm.d} {kept.d} ")
+    var w = Wide{ n: pick(s, 9), s: word(s), u: pick(s, 9).as_u64(), f: 1.5, xs: [], flag: false }
+    for i in 0..pick(s, 5) {
+        w.xs.push(word(s))
+    }
+    let wk = w
+    w.xs.push("more")
+    w.f = w.f * 2.0
+    w.u = w.u + 1.as_u64()
+    out.push_str("{w.xs.len()} {wk.xs.len()} {w.f} {wk.f} {w.u} {wk.u} {w.s.len()} {w.flag} ")
+    out.push_str("{b(sm == kept)} {b(w == wk)} ")
+    // Variants of every arity, and `Option`s.
+    let shapes = [shape(s), shape(s), shape(s)]
+    for sh in shapes {
+        out.push_str("{area(sh)} ")
+    }
+    let o: Option[str] = if pick(s, 2) == 0 { Some(word(s)) } else { None }
+    match o {
+        Some(t) -> out.push_str("some {t.len()} ")
+        None -> out.push_str("none ")
+    }
+    // Results: matched, and through `try`.
+    match maybe_fail(s) {
+        Ok(v) -> out.push_str("ok {v} ")
+        Err(e) -> out.push_str("err {e} ")
+    }
+    match chain(s) {
+        Ok(v) -> out.push_str("chain {v} ")
+        Err(e) -> out.push_str("chain err {e} ")
+    }
+    // Tuples.
+    let t2 = (pick(s, 9), word(s))
+    let t3 = (pick(s, 9), word(s), pick(s, 2) == 0)
+    let t4 = (pick(s, 9), word(s), 0.5, [pick(s, 3)])
+    out.push_str("{t2.0} {t2.1.len()} {t3.2} {t4.3.len()} {t4.2} ")
+    // Value structs: a tree of them, and a list with inline fields.
+    let tr = tree(s, 3)
+    out.push_str("{weigh(tr)} ")
+    var cells: [Cell] = []
+    for i in 0..pick(s, 6) {
+        cells.push(Cell{ name: word(s), nums: [pick(s, 9), pick(s, 9)], k: i })
+    }
+    var total = 0
+    for c in cells {
+        total += c.name.len() + c.nums.len() + c.k
+        for x in c.nums {
+            total += x
+        }
+    }
+    if cells.len() > 0 {
+        total += cells[0].k + cells[cells.len() - 1].name.len()
+    }
+    // Another list of value structs, written element by element in a loop
+    // (the list held open in place), its inline string compared.
+    var marks: [Mark] = []
+    for i in 0..pick(s, 5) {
+        marks.push(Mark{ label: word(s), w: i })
+    }
+    for i in 0..marks.len() {
+        marks[i].w = marks[i].w + i
+    }
+    for m in marks {
+        total += m.w
+        if m.label == "w" {
+            total += 1000
+        }
+    }
+    // One on its own, its inline fields freed when it goes.
+    let lone = Cell{ name: word(s), nums: [1, 2, 3], k: 5 }
+    total += lone.name.len() + lone.nums.len()
+    out.push_str("{total} ")
+    // Results kept as values, defaulted, and taken apart later.
+    let dflt = maybe_fail(s) ?? 7
+    out.push_str("{dflt} ")
+    var results: [i64 ! E] = []
+    for i in 0..pick(s, 4) {
+        results.push(maybe_fail(s))
+    }
+    for r in results {
+        match r {
+            Ok(v) -> out.push_str("r{v} ")
+            Err(e) -> out.push_str("e{e} ")
+        }
+    }
+    out.to_str()
+}
+
+fn b(v: bool) -> i64 {
+    if v { 1 } else { 0 }
+}
+
+fn main() / {io, unsafe} {
+    let a = args()
+    var s = (a[0].parse_int() ?? 1) * 7919 + 37
+    let rounds = a[1].parse_int() ?? 10
+    let base = unsafe { grasm_live_allocations() }
+    for r in 0..rounds {
+        let line = round(s)
+        let live = unsafe { grasm_live_allocations() } - base
+        print("{line} | {live}")
+    }
+}

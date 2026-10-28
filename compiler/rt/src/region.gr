@@ -1,0 +1,94 @@
+// Regions ([T-REGION], Tier 1): a scope whose allocations are owned by it
+// and freed in one sweep at its closing brace, `grasm_region_push` and
+// `grasm_region_pop`. No compiled program calls them today -- the Cranelift
+// backend's `REGION_SWEEP` is off until the checker closes two escape routes
+// (MASTERPLAN §8.3) -- but the runtime half is the runtime's, and moves with
+// the allocator (docs/self-hosting.md §6.11).
+//
+// A box this runtime makes while a region is open counts `ARENA` and is
+// recorded in the innermost region (`alloc.take`). The Rust code still
+// linked records its own in its own regions, so each push and pop is also
+// the Rust runtime's, and the sweep is in three steps: first what every one
+// of this side's boxes holds from outside the region is found, while every
+// box of the region on either side still counts `ARENA`; then the Rust
+// runtime sweeps its own boxes, finding this side's still `ARENA` and
+// leaving them; then what was found outside is released and this side's
+// boxes are freed, without walking into their children, each of which the
+// region owns and frees by its own record. Finding first is not the Rust
+// sweep's order, which frees each box before looking at the next one's
+// children and so takes a box it has just freed for one from outside
+// (docs/known-issues.md); the Rust side's sweep keeps that.
+import layout
+import sys
+import alloc
+import release
+import val
+
+extern fn grasm_region_push()
+extern fn grasm_region_pop()
+
+export fn grt_region_push() {
+    unsafe {
+        let l = alloc.local()
+        let depth = l.offset(alloc.L_DEPTH).load_i64()
+        let cap = l.offset(alloc.L_RCAP).load_i64()
+        if depth == cap {
+            let want = if cap == 0 { 4 } else { 2 * cap }
+            let recs = if cap == 0 { sys.alloc(want * alloc.REC_SIZE) } else { sys.grow(l.offset(alloc.L_REGIONS).load_addr(), want * alloc.REC_SIZE) }
+            l.offset(alloc.L_REGIONS).store_addr(recs)
+            l.offset(alloc.L_RCAP).store_i64(want)
+        }
+        let r = l.offset(alloc.L_REGIONS).load_addr().offset(depth * alloc.REC_SIZE)
+        r.store_i64(0)
+        r.offset(8).store_i64(0)
+        r.offset(16).store_i64(0)
+        l.offset(alloc.L_DEPTH).store_i64(depth + 1)
+        grasm_region_push()
+    }
+}
+
+export fn grt_region_pop() {
+    unsafe {
+        let l = alloc.local()
+        let depth = l.offset(alloc.L_DEPTH).load_i64()
+        if depth == 0 {
+            grasm_region_pop()
+            return
+        }
+        let r = l.offset(alloc.L_REGIONS).load_addr().offset((depth - 1) * alloc.REC_SIZE)
+        let boxes = r.load_addr()
+        let n = r.offset(8).load_i64()
+        let cap = r.offset(16).load_i64()
+        r.store_i64(0)
+        r.offset(8).store_i64(0)
+        r.offset(16).store_i64(0)
+        l.offset(alloc.L_DEPTH).store_i64(depth - 1)
+        var out = mem_addr(0)
+        var ocap = 0
+        var on = 0
+        var i = 0
+        while i < n {
+            release.outside_children(boxes.offset(8 * i).load_addr(), out, ocap, on)
+            i += 1
+        }
+        grasm_region_pop()
+        var j = 0
+        while j < on {
+            val.dec(out.offset(8 * j).load_addr())
+            j += 1
+        }
+        i = 0
+        while i < n {
+            let p = boxes.offset(8 * i).load_addr()
+            release.drop_payload(p)
+            alloc.give(p)
+            i += 1
+        }
+        if ocap > 0 {
+            sys.dealloc(out)
+        }
+        if cap > 0 {
+            sys.dealloc(boxes)
+        }
+    }
+}

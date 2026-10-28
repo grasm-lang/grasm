@@ -1,0 +1,237 @@
+// Upper and lower case ([L-LIB-STR]; docs/self-hosting.md §6.11), as the
+// Rust runtime's `to_uppercase` and `to_lowercase` have them.
+//
+// Each character maps to one to three by the tables in `casemap.gr`, made
+// from the Rust runtime's own answers (`scripts/rtcase.py`) and read once
+// into sorted arrays the first time a case is asked for. The one mapping
+// that depends on its neighbours is Greek capital sigma's, lowercased to
+// final `ς` at the end of a word and to `σ` elsewhere: final when, skipping
+// case-ignorable characters, a cased one comes before it and none comes
+// after (Unicode's `Final_Sigma`, as `str::to_lowercase` tests it).
+import layout
+import sys
+import strings
+import numstr
+import display
+import casemap
+
+/// The tables, each read from its text once: a count, then its records.
+process_local LOWER: i64
+process_local UPPER: i64
+process_local IGNORABLE: i64
+process_local CASED: i64
+
+let SIGMA = 931
+let SMALL_SIGMA = 963
+let FINAL_SIGMA = 962
+
+fn hex(c: i64) -> i64 {
+    if c <= 57 { c - 48 } else { c - 87 }
+}
+
+/// The hex records at `p` (`n` bytes), `per` fields each -- a missing one
+/// 0 -- after their count.
+fn parse(p: addr, n: i64, per: i64) -> addr {
+    var count = 1
+    var i = 0
+    while i < n {
+        if strings.byte(p, i) == 44 {
+            count += 1
+        }
+        i += 1
+    }
+    let t = sys.alloc_zeroed(8 + 8 * per * count)
+    unsafe { t.store_i64(count) }
+    var r = 0
+    var f = 0
+    var v = 0
+    i = 0
+    while i <= n {
+        let c = if i < n { strings.byte(p, i) } else { 44 }
+        if c == 44 or c == 32 {
+            unsafe { t.offset(8 + 8 * (per * r + f)).store_i64(v) }
+            v = 0
+            if c == 44 {
+                r += 1
+                f = 0
+            } else {
+                f += 1
+            }
+        } else {
+            v = 16 * v + hex(c)
+        }
+        i += 1
+    }
+    t
+}
+
+fn lower_table() -> addr {
+    unsafe {
+        let have = mem_process(LOWER).atomic_load_i64(Acquire)
+        if have != 0 {
+            return mem_addr(have)
+        }
+        let t = parse(casemap.lower_text(), casemap.lower_text_len(), 4)
+        let was = mem_process(LOWER).atomic_cas_i64(0, t.as_i64(), AcqRel)
+        if was != 0 {
+            sys.dealloc(t)
+            return mem_addr(was)
+        }
+        t
+    }
+}
+
+fn upper_table() -> addr {
+    unsafe {
+        let have = mem_process(UPPER).atomic_load_i64(Acquire)
+        if have != 0 {
+            return mem_addr(have)
+        }
+        let t = parse(casemap.upper_text(), casemap.upper_text_len(), 4)
+        let was = mem_process(UPPER).atomic_cas_i64(0, t.as_i64(), AcqRel)
+        if was != 0 {
+            sys.dealloc(t)
+            return mem_addr(was)
+        }
+        t
+    }
+}
+
+fn ignorable_table() -> addr {
+    unsafe {
+        let have = mem_process(IGNORABLE).atomic_load_i64(Acquire)
+        if have != 0 {
+            return mem_addr(have)
+        }
+        let t = parse(casemap.ignorable_text(), casemap.ignorable_text_len(), 2)
+        let was = mem_process(IGNORABLE).atomic_cas_i64(0, t.as_i64(), AcqRel)
+        if was != 0 {
+            sys.dealloc(t)
+            return mem_addr(was)
+        }
+        t
+    }
+}
+
+fn cased_table() -> addr {
+    unsafe {
+        let have = mem_process(CASED).atomic_load_i64(Acquire)
+        if have != 0 {
+            return mem_addr(have)
+        }
+        let t = parse(casemap.cased_text(), casemap.cased_text_len(), 2)
+        let was = mem_process(CASED).atomic_cas_i64(0, t.as_i64(), AcqRel)
+        if was != 0 {
+            sys.dealloc(t)
+            return mem_addr(was)
+        }
+        t
+    }
+}
+
+fn field(t: addr, per: i64, r: i64, f: i64) -> i64 {
+    unsafe { t.offset(8 + 8 * (per * r + f)).load_i64() }
+}
+
+/// The last record whose first field is at most `c`; -1 when none is.
+fn last_at_most(t: addr, per: i64, c: i64) -> i64 {
+    var lo = 0
+    var hi = unsafe { t.load_i64() }
+    while lo < hi {
+        let mid = (lo + hi) / 2
+        if field(t, per, mid, 0) <= c {
+            lo = mid + 1
+        } else {
+            hi = mid
+        }
+    }
+    lo - 1
+}
+
+fn in_ranges(t: addr, c: i64) -> bool {
+    let r = last_at_most(t, 2, c)
+    r >= 0 and c <= field(t, 2, r, 1)
+}
+
+/// Character `c` put into `b` as its case in table `t`, itself when the
+/// table does not name it.
+fn put_mapped(b: addr, t: addr, c: i64, scratch: addr) {
+    let r = last_at_most(t, 4, c)
+    if r < 0 or field(t, 4, r, 0) != c {
+        display.put(b, scratch, strings.encode(c, scratch))
+        return
+    }
+    var f = 1
+    while f < 4 {
+        let m = field(t, 4, r, f)
+        if m != 0 {
+            display.put(b, scratch, strings.encode(m, scratch))
+        }
+        f += 1
+    }
+}
+
+/// Whether the capital sigma at byte `i` of the `n` at `p` ends a word.
+fn final_sigma(p: addr, n: i64, i: i64) -> bool {
+    let ign = ignorable_table()
+    let cas = cased_table()
+    var before = false
+    var j = i
+    var going = true
+    while going and j > 0 {
+        let k = strings.back(p, j)
+        let c = strings.decode(p, k)
+        if in_ranges(ign, c) {
+            j = k
+        } else {
+            before = in_ranges(cas, c)
+            going = false
+        }
+    }
+    if not before {
+        return false
+    }
+    var after = false
+    var a = i + 2
+    going = true
+    while going and a < n {
+        let c = strings.decode(p, a)
+        if in_ranges(ign, c) {
+            a += strings.width(strings.byte(p, a))
+        } else {
+            after = in_ranges(cas, c)
+            going = false
+        }
+    }
+    not after
+}
+
+fn convert(s: addr, up: bool) -> addr {
+    var n = 0
+    let p = strings.text(s, n)
+    let t = if up { upper_table() } else { lower_table() }
+    let b = display.text_new()
+    let scratch = sys.alloc(8)
+    var i = 0
+    while i < n {
+        let c = strings.decode(p, i)
+        if not up and c == SIGMA {
+            display.put(b, scratch, strings.encode(if final_sigma(p, n, i) { FINAL_SIGMA } else { SMALL_SIGMA }, scratch))
+        } else {
+            put_mapped(b, t, c, scratch)
+        }
+        i += strings.width(strings.byte(p, i))
+    }
+    sys.dealloc(scratch)
+    let out = numstr.new_str(display.text_ptr(b), display.text_len(b))
+    display.text_free(b)
+    out
+}
+
+export fn grt_str_upper(s: addr) -> addr {
+    convert(s, true)
+}
+
+export fn grt_str_lower(s: addr) -> addr {
+    convert(s, false)
+}

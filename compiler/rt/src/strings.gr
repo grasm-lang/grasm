@@ -1,0 +1,1118 @@
+// Strings ([L-LIB-STR]; docs/self-hosting.md §6.11): made, built, joined,
+// cut and searched as the Rust runtime does.
+//
+// A string's text is in its box when it fits (38 bytes) and in a `String`
+// otherwise, with a character index beside it once one is wanted: for text
+// that is all ASCII a count with no offsets, the byte offset *being* the
+// character's, and for other text the offset of every character. A string
+// nothing else holds is appended to where it is -- spilling out of the box
+// into a `String` twice as long as it needs, at least 32 -- and its index is
+// dropped, having described the old text; one held more than once is copied
+// first. Text a program writes in `"{...}"` is built in a `String` kept per
+// thread for its room (`alloc.gr` keeps eight), and a long result takes that
+// `String` with it, leaving one sixteen bytes longer for the next.
+//
+// Whitespace is Unicode's `White_Space`, as `char::is_whitespace` has it;
+// `lines` splits after each `\n` and drops one `\r` before it, as
+// `str::lines` does; `replace` and `split` take matches left to right and
+// never overlapping, and an empty pattern matches between every character.
+import layout
+import sys
+import alloc
+import boxes
+import val
+import release
+import strread
+import numstr
+import display
+import maps
+import bytes
+import fmt
+import panic
+
+extern fn memcmp(a: addr, b: addr, n: i64) -> i32
+extern fn grasm_panic_msg(p: addr, n: i64)
+
+let MAX_ALLOC = 8589934592
+let LEN_CACHE_MIN = 256
+
+fn tag(v: addr) -> i64 {
+    unsafe { v.offset(layout.TAG).load_u8() }.as_i64()
+}
+
+fn rc(v: addr) -> i64 {
+    unsafe { v.atomic_load_i64(Relaxed) }
+}
+
+fn say(p: addr, n: i64) {
+    panic.say(p, n)
+}
+
+/// Panics with the text in buffer `t`.
+fn say_text(t: addr) {
+    unsafe { grasm_panic_msg(display.text_ptr(t), display.text_len(t)) }
+}
+
+/// `v`'s text, its length in `n` (`as_str`): anything else is a panic.
+pub fn text(v: addr, inout n: i64) -> addr {
+    if tag(v) != layout.TAG_STR {
+        unsafe { say(mem_static("expected a string"), mem_static_len("expected a string")) }
+    }
+    strread.text_of(v, n)
+}
+
+fn is_inline(v: addr) -> bool {
+    unsafe { v.offset(layout.STR_DISC).load_u8() }.as_i64() == layout.STR_INLINE
+}
+
+fn string_of(v: addr) -> addr {
+    unsafe { v.offset(layout.STR_STRING) }
+}
+
+pub fn byte(p: addr, i: i64) -> i64 {
+    unsafe { p.offset(i).load_u8() }.as_i64()
+}
+
+/// Drops a string's character index: it described the text before.
+fn forget_index(v: addr) {
+    unsafe {
+        let cell = v.offset(layout.STR_INDEX)
+        let ix = cell.atomic_load_i64(Acquire)
+        if ix != 0 {
+            release.free_vec(mem_addr(ix).offset(layout.CHARINDEX_VEC))
+            sys.dealloc(mem_addr(ix))
+            cell.atomic_store_i64(0, Release)
+        }
+    }
+}
+
+/// A string of the `na` bytes at `pa` then the `nb` at `pb`: inline when
+/// they fit, in a `String` exactly as long when not (`RtStr::concat`).
+fn joined(pa: addr, na: i64, pb: addr, nb: i64) -> addr {
+    let v = alloc.take()
+    let total = na + nb
+    unsafe {
+        v.offset(layout.TAG).store_u8(layout.TAG_STR.as_u8())
+        v.offset(layout.STR_INDEX).store_i64(0)
+        if total <= layout.STR_CAP {
+            let at = v.offset(layout.STR_BYTES)
+            var k = 0
+            while k < layout.STR_CAP {
+                at.offset(k).store_u8(0)
+                k += 1
+            }
+            sys.copy(at, pa, na)
+            sys.copy(at.offset(na), pb, nb)
+            v.offset(layout.STR_DISC).store_u8(layout.STR_INLINE.as_u8())
+            v.offset(layout.STR_LEN).store_u8(total.as_u8())
+        } else {
+            let buf = sys.alloc(total)
+            sys.copy(buf, pa, na)
+            sys.copy(buf.offset(na), pb, nb)
+            v.offset(layout.STR_DISC).store_u8(layout.STR_HEAP.as_u8())
+            let s = string_of(v)
+            s.offset(layout.VEC_PTR).store_addr(buf)
+            s.offset(layout.VEC_LEN).store_i64(total)
+            s.offset(layout.VEC_CAP).store_i64(total)
+        }
+    }
+    v
+}
+
+/// The `n` bytes at `p` appended to string `v`, which nothing else holds
+/// (`RtStr::push_str`): in the box while they fit, then once into a
+/// `String` with room for twice what it holds (32 at least).
+fn push_text(v: addr, p: addr, n: i64) {
+    forget_index(v)
+    if is_inline(v) {
+        unsafe {
+            let at = v.offset(layout.STR_LEN).load_u8().as_i64()
+            let bytes_at = v.offset(layout.STR_BYTES)
+            if at + n <= layout.STR_CAP {
+                sys.copy(bytes_at.offset(at), p, n)
+                v.offset(layout.STR_LEN).store_u8((at + n).as_u8())
+                return
+            }
+            var want = (at + n) * 2
+            if want < 32 {
+                want = 32
+            }
+            let buf = sys.alloc(want)
+            sys.copy(buf, bytes_at, at)
+            sys.copy(buf.offset(at), p, n)
+            v.offset(layout.STR_DISC).store_u8(layout.STR_HEAP.as_u8())
+            let s = string_of(v)
+            s.offset(layout.VEC_PTR).store_addr(buf)
+            s.offset(layout.VEC_LEN).store_i64(at + n)
+            s.offset(layout.VEC_CAP).store_i64(want)
+        }
+        return
+    }
+    numstr.string_push(string_of(v), p, n)
+}
+
+/// Appends in place to a string nothing else holds, whose text is in a
+/// `String` and which has no index; false when any of that is not so.
+fn append_fast(a: addr, p: addr, n: i64) -> bool {
+    if rc(a) != 1 or tag(a) != layout.TAG_STR or is_inline(a) {
+        return false
+    }
+    if unsafe { a.offset(layout.STR_INDEX).atomic_load_i64(Acquire) } != 0 {
+        return false
+    }
+    numstr.string_push(string_of(a), p, n)
+    true
+}
+
+fn not_strings() {
+    unsafe { say(mem_static("concat on non-strings"), mem_static_len("concat on non-strings")) }
+}
+
+/// `a + <the n bytes at p>`, `a`'s count moving here: in place when nothing
+/// else holds `a`, a new string otherwise.
+fn append_text(a: addr, p: addr, n: i64) -> addr {
+    if append_fast(a, p, n) {
+        return a
+    }
+    if tag(a) != layout.TAG_STR {
+        not_strings()
+    }
+    if rc(a) == 1 {
+        push_text(a, p, n)
+        return a
+    }
+    var na = 0
+    let pa = strread.text_of(a, na)
+    let out = joined(pa, na, p, n)
+    val.dec(a)
+    out
+}
+
+// ----- literals, joining, appending ------------------------------------------
+
+/// A string of the `n` bytes at `p`, an invalid sequence among them made
+/// U+FFFD (`String::from_utf8_lossy`).
+fn lossy_into(v: addr, p: addr, n: i64) {
+    if bytes.valid_utf8(p, n) {
+        numstr.fill_str(v, p, n)
+        return
+    }
+    let t = bytes.lossy(p, n)
+    numstr.fill_str(v, display.text_ptr(t), display.text_len(t))
+    display.text_free(t)
+}
+
+export fn grt_str_lit(p: addr, n: i64) -> addr {
+    let v = alloc.take()
+    lossy_into(v, p, n)
+    v
+}
+
+/// A literal made once for the process and never freed: not counted live,
+/// and `inc` and `dec` pass it by.
+export fn grt_str_lit_immortal(p: addr, n: i64) -> addr {
+    let v = sys.alloc(layout.BOX_SIZE)
+    unsafe { v.atomic_store_i64(layout.IMMORTAL, Relaxed) }
+    lossy_into(v, p, n)
+    v
+}
+
+export fn grt_str_concat(a: addr, b: addr) -> addr {
+    if tag(a) != layout.TAG_STR or tag(b) != layout.TAG_STR {
+        not_strings()
+    }
+    var na = 0
+    var nb = 0
+    let pa = strread.text_of(a, na)
+    let pb = strread.text_of(b, nb)
+    joined(pa, na, pb, nb)
+}
+
+/// `a + b` where `a` is not used again: `a`'s count moves here, `b` is
+/// borrowed.
+export fn grt_str_append(a: addr, b: addr) -> addr {
+    if tag(a) != layout.TAG_STR or tag(b) != layout.TAG_STR {
+        not_strings()
+    }
+    var nb = 0
+    let pb = strread.text_of(b, nb)
+    append_text(a, pb, nb)
+}
+
+export fn grt_str_append_text(a: addr, p: addr, n: i64) -> addr {
+    append_text(a, p, n)
+}
+
+export fn grt_str_append_i64(a: addr, v: i64) -> addr {
+    let b = sys.alloc(fmt.INT_MAX)
+    let out = append_text(a, b, fmt.i64_text(v, b))
+    sys.dealloc(b)
+    out
+}
+
+export fn grt_str_append_f64(a: addr, bits: i64) -> addr {
+    let b = sys.alloc(fmt.F64_MAX)
+    let out = append_text(a, b, fmt.f64_text(bits.from_bits(), b))
+    sys.dealloc(b)
+    out
+}
+
+export fn grt_str_append_bool(a: addr, v: i64) -> addr {
+    let b = sys.alloc(8)
+    let out = append_text(a, b, fmt.bool_text(v != 0, b))
+    sys.dealloc(b)
+    out
+}
+
+// ----- a string opened for a loop that only appends -------------------------
+
+fn not_string_append() {
+    unsafe { say(mem_static("append to a non-string"), mem_static_len("append to a non-string")) }
+}
+
+/// The string, unshared, without an index and in a `String` (64 bytes of
+/// room if it was in the box), its buffer, length and room handed out.
+export fn grt_str_pin_begin(a: addr, out_data: addr, out_len: addr, out_cap: addr) -> addr {
+    var t = a
+    if rc(a) != 1 {
+        if tag(a) != layout.TAG_STR {
+            not_string_append()
+        }
+        var n = 0
+        let p = strread.text_of(a, n)
+        t = numstr.new_str(p, n)
+        val.dec(a)
+    }
+    if tag(t) != layout.TAG_STR {
+        not_string_append()
+    }
+    forget_index(t)
+    unsafe {
+        if is_inline(t) {
+            let n = t.offset(layout.STR_LEN).load_u8().as_i64()
+            let buf = sys.alloc(64)
+            sys.copy(buf, t.offset(layout.STR_BYTES), n)
+            t.offset(layout.STR_DISC).store_u8(layout.STR_HEAP.as_u8())
+            let s = string_of(t)
+            s.offset(layout.VEC_PTR).store_addr(buf)
+            s.offset(layout.VEC_LEN).store_i64(n)
+            s.offset(layout.VEC_CAP).store_i64(64)
+        }
+        let s = string_of(t)
+        out_data.store_addr(s.offset(layout.VEC_PTR).load_addr())
+        out_len.store_i64(s.offset(layout.VEC_LEN).load_i64())
+        out_cap.store_i64(s.offset(layout.VEC_CAP).load_i64())
+    }
+    t
+}
+
+export fn grt_str_pin_grow(a: addr, len: i64, want: i64, out_data: addr, out_cap: addr) {
+    if tag(a) != layout.TAG_STR {
+        not_string_append()
+    }
+    if is_inline(a) {
+        unsafe { say(mem_static("append to a string that was not opened"), mem_static_len("append to a string that was not opened")) }
+    }
+    let s = string_of(a)
+    unsafe {
+        s.offset(layout.VEC_LEN).store_i64(len)
+        numstr.string_reserve(s, if want < 1 { 1 } else { want })
+        out_data.store_addr(s.offset(layout.VEC_PTR).load_addr())
+        out_cap.store_i64(s.offset(layout.VEC_CAP).load_i64())
+    }
+}
+
+export fn grt_str_pin_end(a: addr, len: i64) {
+    if tag(a) != layout.TAG_STR {
+        not_string_append()
+    }
+    forget_index(a)
+    if not is_inline(a) {
+        unsafe { string_of(a).offset(layout.VEC_LEN).store_i64(len) }
+    }
+}
+
+export fn grt_str_pin_text(data: i64, at: i64, p: addr, len: i64) -> i64 {
+    sys.copy(unsafe { mem_addr(data).offset(at) }, p, len)
+    len
+}
+
+// ----- builders ----------------------------------------------------------------
+
+fn handle(at: i64) -> addr {
+    unsafe { mem_addr(at) }
+}
+
+/// A builder: one this thread kept, emptied, or a new `String`.
+export fn grt_str_build() -> i64 {
+    let l = alloc.local()
+    unsafe {
+        let n = l.offset(alloc.L_NBUILD).load_i64()
+        if n > 0 {
+            let h = l.offset(alloc.L_BUILD).load_addr().offset(8 * (n - 1)).load_addr()
+            l.offset(alloc.L_NBUILD).store_i64(n - 1)
+            h.offset(layout.VEC_LEN).store_i64(0)
+            return h.as_i64()
+        }
+        let h = sys.alloc(24)
+        h.offset(layout.VEC_PTR).store_i64(layout.U8_DANGLING)
+        h.offset(layout.VEC_LEN).store_i64(0)
+        h.offset(layout.VEC_CAP).store_i64(0)
+        h.as_i64()
+    }
+}
+
+/// A builder back to this thread, for its room; past eight, freed.
+fn give_back(h: addr) {
+    let l = alloc.local()
+    unsafe {
+        let n = l.offset(alloc.L_NBUILD).load_i64()
+        if n < alloc.BUILDERS_MAX {
+            var kept = l.offset(alloc.L_BUILD).load_addr()
+            if kept.as_i64() == 0 {
+                kept = sys.alloc(8 * alloc.BUILDERS_MAX)
+                l.offset(alloc.L_BUILD).store_addr(kept)
+            }
+            kept.offset(8 * n).store_addr(h)
+            l.offset(alloc.L_NBUILD).store_i64(n + 1)
+            return
+        }
+    }
+    release.free_vec(h)
+    sys.dealloc(h)
+}
+
+/// A builder's `String` handed on, and in its place one with room for as
+/// much again and sixteen more.
+fn renew(h: addr, len: i64) {
+    unsafe {
+        h.offset(layout.VEC_PTR).store_addr(sys.alloc(len + 16))
+        h.offset(layout.VEC_LEN).store_i64(0)
+        h.offset(layout.VEC_CAP).store_i64(len + 16)
+    }
+}
+
+export fn grt_str_build_text(at: i64, p: i64, n: i64) {
+    numstr.string_push(handle(at), unsafe { mem_addr(p) }, n)
+}
+
+export fn grt_str_build_str(at: i64, v: addr) {
+    if tag(v) != layout.TAG_STR {
+        unsafe { say(mem_static("interpolating a non-string as a string"), mem_static_len("interpolating a non-string as a string")) }
+    }
+    var n = 0
+    let p = strread.text_of(v, n)
+    numstr.string_push(handle(at), p, n)
+}
+
+/// The string built: a short one copied into its box, a long one taking the
+/// builder's `String`.
+export fn grt_str_build_end(at: i64) -> addr {
+    let h = handle(at)
+    let len = unsafe { h.offset(layout.VEC_LEN).load_i64() }
+    var out = unsafe { mem_addr(0) }
+    if len > layout.STR_CAP {
+        out = alloc.take()
+        unsafe {
+            out.offset(layout.TAG).store_u8(layout.TAG_STR.as_u8())
+            out.offset(layout.STR_INDEX).store_i64(0)
+            out.offset(layout.STR_DISC).store_u8(layout.STR_HEAP.as_u8())
+            sys.copy(string_of(out), h, 24)
+        }
+        renew(h, len)
+    } else {
+        out = numstr.new_str(unsafe { h.offset(layout.VEC_PTR).load_addr() }, len)
+        unsafe { h.offset(layout.VEC_LEN).store_i64(0) }
+    }
+    give_back(h)
+    out
+}
+
+/// The builder's `String` made an inline string field's three words at
+/// `out`, with no string value between.
+export fn grt_str_build_end_inline(at: i64, out: addr) {
+    let h = handle(at)
+    let len = unsafe { h.offset(layout.VEC_LEN).load_i64() }
+    sys.copy(out, h, 24)
+    renew(h, len)
+    give_back(h)
+}
+
+export fn grt_str_build_ptr(at: i64) -> addr {
+    unsafe { handle(at).offset(layout.VEC_PTR).load_addr() }
+}
+
+export fn grt_str_build_len(at: i64) -> i64 {
+    unsafe { handle(at).offset(layout.VEC_LEN).load_i64() }
+}
+
+export fn grt_str_build_discard(at: i64) {
+    let h = handle(at)
+    unsafe { h.offset(layout.VEC_LEN).store_i64(0) }
+    give_back(h)
+}
+
+// ----- characters ----------------------------------------------------------------
+
+/// How many bytes the character starting with `b` takes.
+pub fn width(b: i64) -> i64 {
+    if b < 128 {
+        return 1
+    }
+    if b < 224 {
+        return 2
+    }
+    if b < 240 {
+        return 3
+    }
+    4
+}
+
+/// The code point of the character at byte `i`.
+pub fn decode(p: addr, i: i64) -> i64 {
+    let b = byte(p, i)
+    if b < 128 {
+        return b
+    }
+    if b < 224 {
+        return b.bit_and(31).shl(6).bit_or(byte(p, i + 1).bit_and(63))
+    }
+    if b < 240 {
+        return b.bit_and(15).shl(12).bit_or(byte(p, i + 1).bit_and(63).shl(6)).bit_or(byte(p, i + 2).bit_and(63))
+    }
+    b.bit_and(7).shl(18).bit_or(byte(p, i + 1).bit_and(63).shl(12)).bit_or(byte(p, i + 2).bit_and(63).shl(6)).bit_or(byte(p, i + 3).bit_and(63))
+}
+
+/// Where the character ending just before byte `e` starts.
+pub fn back(p: addr, e: i64) -> i64 {
+    var j = e - 1
+    while j > 0 and byte(p, j).bit_and(192) == 128 {
+        j -= 1
+    }
+    j
+}
+
+/// Code point `c` as UTF-8 at `out`; answers how many bytes.
+pub fn encode(c: i64, out: addr) -> i64 {
+    unsafe {
+        if c < 128 {
+            out.store_u8(c.as_u8())
+            return 1
+        }
+        if c < 2048 {
+            out.store_u8(c.shr(6).bit_or(192).as_u8())
+            out.offset(1).store_u8(c.bit_and(63).bit_or(128).as_u8())
+            return 2
+        }
+        if c < 65536 {
+            out.store_u8(c.shr(12).bit_or(224).as_u8())
+            out.offset(1).store_u8(c.shr(6).bit_and(63).bit_or(128).as_u8())
+            out.offset(2).store_u8(c.bit_and(63).bit_or(128).as_u8())
+            return 3
+        }
+        out.store_u8(c.shr(18).bit_or(240).as_u8())
+        out.offset(1).store_u8(c.shr(12).bit_and(63).bit_or(128).as_u8())
+        out.offset(2).store_u8(c.shr(6).bit_and(63).bit_or(128).as_u8())
+        out.offset(3).store_u8(c.bit_and(63).bit_or(128).as_u8())
+        4
+    }
+}
+
+/// Unicode's `White_Space`, as `char::is_whitespace`.
+fn white(c: i64) -> bool {
+    if c <= 32 {
+        return c == 32 or (c >= 9 and c <= 13)
+    }
+    if c < 133 {
+        return false
+    }
+    c == 133 or c == 160 or c == 5760 or (c >= 8192 and c <= 8202) or c == 8232 or c == 8233 or c == 8239 or c == 8287 or c == 12288
+}
+
+/// The string's character index, with an offset for every character: the
+/// one it has, or one built and published now (only text that is not flat
+/// is asked for one).
+fn char_index(v: addr) -> addr {
+    unsafe {
+        let cell = v.offset(layout.STR_INDEX)
+        let have = cell.atomic_load_i64(Acquire)
+        if have != 0 {
+            return mem_addr(have)
+        }
+        var n = 0
+        let p = strread.text_of(v, n)
+        let count = strread.count_chars(p, n)
+        let made = sys.alloc(32)
+        let offs = if count > 0 { sys.alloc(4 * count) } else { mem_addr(layout.U32_DANGLING) }
+        var j = 0
+        var i = 0
+        while i < n {
+            if strread.starts(p, i) {
+                offs.offset(4 * j).store_u32(i.as_u32())
+                j += 1
+            }
+            i += 1
+        }
+        let vec = made.offset(layout.CHARINDEX_VEC)
+        vec.offset(layout.VEC_PTR).store_addr(offs)
+        vec.offset(layout.VEC_LEN).store_i64(count)
+        vec.offset(layout.VEC_CAP).store_i64(count)
+        made.offset(layout.CHARINDEX_COUNT).store_u32(count.as_u32())
+        let was = cell.atomic_cas_i64(0, made.as_i64(), AcqRel)
+        if was != 0 {
+            if count > 0 {
+                sys.dealloc(offs)
+            }
+            sys.dealloc(made)
+            return mem_addr(was)
+        }
+        made
+    }
+}
+
+/// Whether every character is one byte (`RtStr::is_flat`): what an index
+/// says if there is one, the text itself when short, and an index made by
+/// counting otherwise.
+fn is_flat(v: addr) -> bool {
+    unsafe {
+        let cell = v.offset(layout.STR_INDEX)
+        let ix = cell.atomic_load_i64(Acquire)
+        if ix != 0 {
+            return mem_addr(ix).offset(layout.CHARINDEX_VEC).offset(layout.VEC_LEN).load_i64() == 0
+        }
+        var n = 0
+        let p = strread.text_of(v, n)
+        if n < LEN_CACHE_MIN {
+            return strread.ascii(p, n)
+        }
+        let _ = strread.length(v)
+        let made = cell.atomic_load_i64(Acquire)
+        if made != 0 {
+            return mem_addr(made).offset(layout.CHARINDEX_VEC).offset(layout.VEC_LEN).load_i64() == 0
+        }
+        strread.ascii(p, n)
+    }
+}
+
+/// The byte offset of character `i`, which is at most the count.
+fn byte_at(v: addr, i: i64) -> i64 {
+    if is_flat(v) {
+        return i
+    }
+    let ix = char_index(v)
+    unsafe {
+        let offs = ix.offset(layout.CHARINDEX_VEC)
+        if i < offs.offset(layout.VEC_LEN).load_i64() {
+            return offs.offset(layout.VEC_PTR).load_addr().offset(4 * i).load_u32().as_i64()
+        }
+    }
+    var n = 0
+    let _ = strread.text_of(v, n)
+    n
+}
+
+/// `{n} {what}` and the rest, for a panic.
+fn number_panic(head: addr, hn: i64, n: i64, tail: addr, tn: i64) {
+    let t = display.text_new()
+    display.put(t, head, hn)
+    display.put_int(t, n)
+    display.put(t, tail, tn)
+    say_text(t)
+}
+
+export fn grt_str_code_at(s: addr, i: i64) -> i64 {
+    if tag(s) != layout.TAG_STR {
+        unsafe { say(mem_static("code_at on non-string"), mem_static_len("code_at on non-string")) }
+    }
+    let n = strread.length(s)
+    if i < 0 or i >= n {
+        let t = display.text_new()
+        unsafe { display.put(t, mem_static("code_at "), 8) }
+        display.put_int(t, i)
+        unsafe { display.put(t, mem_static(" out of bounds (len "), mem_static_len(" out of bounds (len ")) }
+        display.put_int(t, n)
+        display.put_byte(t, 41)
+        say_text(t)
+    }
+    var m = 0
+    let p = strread.text_of(s, m)
+    if is_flat(s) {
+        return byte(p, i)
+    }
+    decode(p, byte_at(s, i))
+}
+
+/// Characters `start` to `start + len`, both held to the text.
+export fn grt_str_substr(s: addr, start: i64, len: i64) -> addr {
+    if tag(s) != layout.TAG_STR {
+        unsafe { say(mem_static("substr on non-string"), mem_static_len("substr on non-string")) }
+    }
+    let n = strread.length(s)
+    let a = if start < 0 { 0 } else if start > n { n } else { start }
+    let add = if len < 0 { 0 } else { len }
+    var e = if add > 9223372036854775807 - a { 9223372036854775807 } else { a + add }
+    if e > n {
+        e = n
+    }
+    let ba = byte_at(s, a)
+    let bb = byte_at(s, e)
+    var m = 0
+    let p = strread.text_of(s, m)
+    numstr.new_str(unsafe { p.offset(ba) }, bb - ba)
+}
+
+/// Where `q` (`m` bytes) first occurs in `p` (`n` bytes) at or after byte
+/// `from`, by byte; -1 when nowhere.
+fn find(p: addr, n: i64, q: addr, m: i64, from: i64) -> i64 {
+    if m == 0 {
+        return from
+    }
+    let first = byte(q, 0)
+    var i = from
+    while i + m <= n {
+        if byte(p, i) == first {
+            if unsafe { memcmp(p.offset(i), q, m) } == 0 {
+                return i
+            }
+        }
+        i += 1
+    }
+    -1
+}
+
+export fn grt_str_contains(a: addr, b: addr) -> i8 {
+    var n = 0
+    var m = 0
+    let p = text(a, n)
+    let q = text(b, m)
+    if find(p, n, q, m, 0) >= 0 { 1.as_i8() } else { 0.as_i8() }
+}
+
+export fn grt_str_starts_with(a: addr, b: addr) -> i8 {
+    var n = 0
+    var m = 0
+    let p = text(a, n)
+    let q = text(b, m)
+    if m <= n and (m == 0 or unsafe { memcmp(p, q, m) } == 0) { 1.as_i8() } else { 0.as_i8() }
+}
+
+export fn grt_str_ends_with(a: addr, b: addr) -> i8 {
+    var n = 0
+    var m = 0
+    let p = text(a, n)
+    let q = text(b, m)
+    if m <= n and (m == 0 or unsafe { memcmp(p.offset(n - m), q, m) } == 0) { 1.as_i8() } else { 0.as_i8() }
+}
+
+/// Where `needle` first occurs, counted in characters, as an `Option`.
+export fn grt_str_index_of(s: addr, needle: addr) -> addr {
+    var n = 0
+    var m = 0
+    let p = text(s, n)
+    let q = text(needle, m)
+    let at = find(p, n, q, m, 0)
+    if at < 0 {
+        return maps.option(unsafe { mem_addr(0) })
+    }
+    let idx = if is_flat(s) { at } else { strread.count_chars(p, at) }
+    maps.option(boxes.fresh_int(idx))
+}
+
+// ----- strings cut into lists ------------------------------------------------------
+
+/// A list of boxes holding the `n` words at `items`, in a `Vec` exactly that
+/// long; the words are the list's now.
+fn list_of(items: addr, n: i64) -> addr {
+    let l = alloc.take()
+    unsafe {
+        l.offset(layout.TAG).store_u8(layout.TAG_LIST.as_u8())
+        l.offset(layout.LIST_DISC).store_u8(layout.LIST_HEAP.as_u8())
+        let v = l.offset(layout.LIST_VEC)
+        let buf = if n > 0 { sys.alloc(8 * n) } else { mem_addr(layout.WORDS_DANGLING) }
+        sys.copy(buf, items, 8 * n)
+        v.offset(layout.VEC_PTR).store_addr(buf)
+        v.offset(layout.VEC_LEN).store_i64(n)
+        v.offset(layout.VEC_CAP).store_i64(n)
+    }
+    l
+}
+
+/// A string of each character of the `n` bytes at `p`, pushed to the list
+/// being collected.
+fn each_char(p: addr, n: i64, inout st: addr, inout cap: i64, inout k: i64) {
+    var i = 0
+    while i < n {
+        let w = width(byte(p, i))
+        release.push(st, cap, k, numstr.new_str(unsafe { p.offset(i) }, w))
+        i += w
+    }
+}
+
+fn collected(st: addr, cap: i64, k: i64) -> addr {
+    let l = list_of(st, k)
+    if cap > 0 {
+        sys.dealloc(st)
+    }
+    l
+}
+
+export fn grt_str_chars(s: addr) -> addr {
+    var n = 0
+    let p = text(s, n)
+    var st = unsafe { mem_addr(0) }
+    var cap = 0
+    var k = 0
+    each_char(p, n, st, cap, k)
+    collected(st, cap, k)
+}
+
+/// The pieces between each `sep`; with an empty `sep`, each character.
+export fn grt_str_split(s: addr, sep: addr) -> addr {
+    var n = 0
+    var m = 0
+    let p = text(s, n)
+    let q = text(sep, m)
+    var st = unsafe { mem_addr(0) }
+    var cap = 0
+    var k = 0
+    if m == 0 {
+        each_char(p, n, st, cap, k)
+    } else {
+        var from = 0
+        var going = true
+        while going {
+            let at = find(p, n, q, m, from)
+            if at < 0 {
+                release.push(st, cap, k, numstr.new_str(unsafe { p.offset(from) }, n - from))
+                going = false
+            } else {
+                release.push(st, cap, k, numstr.new_str(unsafe { p.offset(from) }, at - from))
+                from = at + m
+            }
+        }
+    }
+    collected(st, cap, k)
+}
+
+/// Each line: split after every `\n`, which is dropped with one `\r`
+/// before it; no line after a final `\n`.
+export fn grt_str_lines(s: addr) -> addr {
+    var n = 0
+    let p = text(s, n)
+    var st = unsafe { mem_addr(0) }
+    var cap = 0
+    var k = 0
+    var from = 0
+    while from < n {
+        var e = from
+        while e < n and byte(p, e) != 10 {
+            e += 1
+        }
+        if e < n {
+            var stop = e
+            if stop > from and byte(p, stop - 1) == 13 {
+                stop -= 1
+            }
+            release.push(st, cap, k, numstr.new_str(unsafe { p.offset(from) }, stop - from))
+            from = e + 1
+        } else {
+            release.push(st, cap, k, numstr.new_str(unsafe { p.offset(from) }, n - from))
+            from = n
+        }
+    }
+    collected(st, cap, k)
+}
+
+/// The runs of characters between whitespace, never empty.
+export fn grt_str_words(s: addr) -> addr {
+    var n = 0
+    let p = text(s, n)
+    var st = unsafe { mem_addr(0) }
+    var cap = 0
+    var k = 0
+    var i = 0
+    var start = -1
+    while i < n {
+        let w = width(byte(p, i))
+        let sp = white(decode(p, i))
+        if sp and start >= 0 {
+            release.push(st, cap, k, numstr.new_str(unsafe { p.offset(start) }, i - start))
+            start = -1
+        } else if not sp and start < 0 {
+            start = i
+        }
+        i += w
+    }
+    if start >= 0 {
+        release.push(st, cap, k, numstr.new_str(unsafe { p.offset(start) }, n - start))
+    }
+    collected(st, cap, k)
+}
+
+/// Every code point, a scalar list of integers grown one push at a time.
+export fn grt_str_codes(s: addr) -> addr {
+    var n = 0
+    let p = text(s, n)
+    let count = strread.count_chars(p, n)
+    var cap = 0
+    if count > 0 {
+        cap = 4
+        while cap < count {
+            cap = 2 * cap
+        }
+    }
+    let l = alloc.take()
+    unsafe {
+        l.offset(layout.TAG).store_u8(layout.TAG_LIST_SCALAR.as_u8())
+        l.offset(layout.SCALAR_KIND_AT).store_u8(layout.SK_I64.as_u8())
+        l.offset(layout.SCALAR_DISC).store_u8(layout.SCALAR_WORDS.as_u8())
+        let buf = if cap > 0 { sys.alloc(8 * cap) } else { mem_addr(layout.WORDS_DANGLING) }
+        var i = 0
+        var j = 0
+        while i < n {
+            buf.offset(8 * j).store_i64(decode(p, i))
+            j += 1
+            i += width(byte(p, i))
+        }
+        let v = l.offset(layout.SCALAR_VEC)
+        v.offset(layout.VEC_PTR).store_addr(buf)
+        v.offset(layout.VEC_LEN).store_i64(count)
+        v.offset(layout.VEC_CAP).store_i64(cap)
+    }
+    l
+}
+
+// ----- trimming, repeating, replacing, padding ----------------------------------
+
+/// Bytes of whitespace at the start of the `n` at `p`.
+pub fn lead(p: addr, n: i64) -> i64 {
+    var i = 0
+    while i < n and white(decode(p, i)) {
+        i += width(byte(p, i))
+    }
+    i
+}
+
+/// Where the whitespace at the end of `p[from..n]` starts.
+pub fn trail(p: addr, n: i64, from: i64) -> i64 {
+    var e = n
+    var going = true
+    while going and e > from {
+        let j = back(p, e)
+        if white(decode(p, j)) {
+            e = j
+        } else {
+            going = false
+        }
+    }
+    e
+}
+
+export fn grt_str_trim(s: addr) -> addr {
+    var n = 0
+    let p = text(s, n)
+    let a = lead(p, n)
+    let e = trail(p, n, a)
+    numstr.new_str(unsafe { p.offset(a) }, e - a)
+}
+
+export fn grt_str_trim_start(s: addr) -> addr {
+    var n = 0
+    let p = text(s, n)
+    let a = lead(p, n)
+    numstr.new_str(unsafe { p.offset(a) }, n - a)
+}
+
+export fn grt_str_trim_end(s: addr) -> addr {
+    var n = 0
+    let p = text(s, n)
+    numstr.new_str(p, trail(p, n, 0))
+}
+
+export fn grt_str_repeat(s: addr, k: i64) -> addr {
+    var n = 0
+    let p = text(s, n)
+    if k < 0 {
+        unsafe { say(mem_static("repeat count must be a non-negative int"), mem_static_len("repeat count must be a non-negative int")) }
+    }
+    if n > 0 and k > MAX_ALLOC / n {
+        unsafe { number_panic(mem_static("repeat would need more memory than a string can hold ("), mem_static_len("repeat would need more memory than a string can hold ("), k, mem_static(" copies)"), 8) }
+    }
+    let total = n * k
+    let buf = sys.alloc(total + 1)
+    var i = 0
+    while i < k {
+        sys.copy(unsafe { buf.offset(i * n) }, p, n)
+        i += 1
+    }
+    let out = numstr.new_str(buf, total)
+    sys.dealloc(buf)
+    out
+}
+
+/// `s` with every match of `from` replaced by `to`, left to right; an empty
+/// `from` matches before every character and at the end.
+export fn grt_str_replace(s: addr, from: addr, to: addr) -> addr {
+    var n = 0
+    var m = 0
+    var r = 0
+    let p = text(s, n)
+    let q = text(from, m)
+    let w = text(to, r)
+    let t = display.text_new()
+    if m == 0 {
+        var i = 0
+        while i < n {
+            display.put(t, w, r)
+            let c = width(byte(p, i))
+            display.put(t, unsafe { p.offset(i) }, c)
+            i += c
+        }
+        display.put(t, w, r)
+    } else {
+        var last = 0
+        var going = true
+        while going {
+            let at = find(p, n, q, m, last)
+            if at < 0 {
+                going = false
+            } else {
+                display.put(t, unsafe { p.offset(last) }, at - last)
+                display.put(t, w, r)
+                last = at + m
+            }
+        }
+        display.put(t, unsafe { p.offset(last) }, n - last)
+    }
+    let out = numstr.new_str(display.text_ptr(t), display.text_len(t))
+    display.text_free(t)
+    out
+}
+
+/// `s` padded to `width` characters with `fill`'s characters, cycled and
+/// cut to fit, before it or after.
+export fn grt_str_pad(s: addr, width_to: i64, fill: addr, at_start: i8) -> addr {
+    var n = 0
+    var fl = 0
+    let p = text(s, n)
+    let fp = text(fill, fl)
+    if fl == 0 {
+        unsafe { say(mem_static("pad fill must not be empty"), mem_static_len("pad fill must not be empty")) }
+    }
+    let len = strread.length(s)
+    if width_to > MAX_ALLOC {
+        unsafe { number_panic(mem_static("pad width "), 10, width_to, mem_static(" is larger than a string can hold"), mem_static_len(" is larger than a string can hold")) }
+    }
+    let goal = if width_to < 0 { 0 } else { width_to }
+    let count = if goal > len { goal - len } else { 0 }
+    let t = display.text_new()
+    if at_start.as_i64() == 0 {
+        display.put(t, p, n)
+    }
+    var made = 0
+    var i = 0
+    while made < count {
+        if i >= fl {
+            i = 0
+        }
+        let c = width(byte(fp, i))
+        display.put(t, unsafe { fp.offset(i) }, c)
+        i += c
+        made += 1
+    }
+    if at_start.as_i64() != 0 {
+        display.put(t, p, n)
+    }
+    let out = numstr.new_str(display.text_ptr(t), display.text_len(t))
+    display.text_free(t)
+    out
+}
+
+export fn grt_str_to_bytes(v: addr) -> addr {
+    var n = 0
+    let p = text(v, n)
+    bytes.bytes_copy(p, n)
+}
+
+// ----- code points and bases -------------------------------------------------------
+
+fn char_string(c: i64) -> addr {
+    let b = sys.alloc(8)
+    let s = numstr.new_str(b, encode(c, b))
+    sys.dealloc(b)
+    s
+}
+
+fn scalar_value(c: i64) -> bool {
+    c >= 0 and c <= 1114111 and not (c >= 55296 and c <= 57343)
+}
+
+export fn grt_i64_to_char(n: i64) -> addr {
+    if not scalar_value(n) {
+        let t = display.text_new()
+        display.put_int(t, n)
+        unsafe { display.put(t, mem_static(" is not a Unicode code point"), mem_static_len(" is not a Unicode code point")) }
+        say_text(t)
+    }
+    char_string(n)
+}
+
+export fn grt_u64_to_char(v: i64) -> addr {
+    if v < 0 or not scalar_value(v) {
+        let t = display.text_new()
+        let b = sys.alloc(fmt.INT_MAX)
+        display.put(t, b, fmt.u64_text(v.as_u64(), b))
+        sys.dealloc(b)
+        unsafe { display.put(t, mem_static(" is not a Unicode code point"), mem_static_len(" is not a Unicode code point")) }
+        say_text(t)
+    }
+    char_string(v)
+}
+
+fn bad_base(base: i64) {
+    unsafe { number_panic(mem_static("to_base takes a base in 2..36, not "), mem_static_len("to_base takes a base in 2..36, not "), base, mem_static(""), 0) }
+}
+
+/// The digits of `u` in `base`, `0-9a-z`, ending at `end` and written
+/// backwards; answers where they start.
+fn digits(u: u64, base: i64, out: addr, end: i64) -> i64 {
+    let b = base.as_u64()
+    var x = u
+    var i = end
+    var going = true
+    while going {
+        i -= 1
+        let d = (x % b).as_i64()
+        unsafe { out.offset(i).store_u8((if d < 10 { 48 + d } else { 87 + d }).as_u8()) }
+        x = x / b
+        going = x != 0.as_u64()
+    }
+    i
+}
+
+export fn grt_i64_to_base(v: i64, base: i64) -> addr {
+    if base < 2 or base > 36 {
+        bad_base(base)
+    }
+    let buf = sys.alloc(72)
+    let mag = if v < 0 { (0 - v).as_u64() } else { v.as_u64() }
+    var i = digits(mag, base, buf, 72)
+    if v < 0 {
+        i -= 1
+        unsafe { buf.offset(i).store_u8(45.as_u8()) }
+    }
+    let s = numstr.new_str(unsafe { buf.offset(i) }, 72 - i)
+    sys.dealloc(buf)
+    s
+}
+
+export fn grt_u64_to_base(v: i64, base: i64) -> addr {
+    if base < 2 or base > 36 {
+        bad_base(base)
+    }
+    let buf = sys.alloc(72)
+    let i = digits(v.as_u64(), base, buf, 72)
+    let s = numstr.new_str(unsafe { buf.offset(i) }, 72 - i)
+    sys.dealloc(buf)
+    s
+}

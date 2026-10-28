@@ -1,0 +1,368 @@
+// Generational references ([T-REF-GENERATIONAL], docs/self-hosting.md §6.11):
+// `ref(v)` puts a value in a heap shared by the whole process and answers a
+// slot and that slot's generation packed in one word; a read checks the
+// generation, so a reference to a released slot is a deterministic panic,
+// never a read of the slot's next occupant.
+//
+// The heap is one per process, as the Rust runtime's `SLAB` is: three arrays
+// -- each slot's value (null once released), each slot's generation, the
+// released slots waiting to be used again -- held in process cells and
+// guarded by a lock built from a compare-and-swap (`SLAB_LOCK`), which every
+// function touching them takes or holds (`scripts/rtlint.py` checks both).
+// A generation that cannot count on retires its slot rather than wrap, so no
+// reference ever matches a later occupant. What the heap still holds at the
+// end is released before the leak check counts (`leak.gr`): a reference the
+// program never released is a root, like a global, not a leak.
+import layout
+import sys
+import release
+import val
+import alloc
+import structs
+import panic
+
+/// The lock: 0 free, 1 held.
+process_local SLAB_LOCK: i64
+/// rtlint: guarded by SLAB_LOCK
+process_local SLOTS: i64
+/// rtlint: guarded by SLAB_LOCK
+process_local GENS: i64
+/// rtlint: guarded by SLAB_LOCK
+process_local NSLOTS: i64
+/// rtlint: guarded by SLAB_LOCK
+process_local SLOTCAP: i64
+/// rtlint: guarded by SLAB_LOCK
+process_local FREE: i64
+/// rtlint: guarded by SLAB_LOCK
+process_local NFREE: i64
+/// rtlint: guarded by SLAB_LOCK
+process_local FREECAP: i64
+
+fn unlock() {
+    unsafe { mem_process(SLAB_LOCK).atomic_store_i64(0, Release) }
+}
+
+fn stale() {
+    unsafe { panic.say(mem_static("stale reference: the value it pointed to was released"), mem_static_len("stale reference: the value it pointed to was released")) }
+}
+
+fn pack(i: i64, gen: i64) -> i64 {
+    i.shl(32).bit_or(gen.bit_and(0xffff_ffff))
+}
+
+fn index_of(r: i64) -> i64 {
+    r.shr(32).bit_and(0xffff_ffff)
+}
+
+fn gen_of(r: i64) -> i64 {
+    r.bit_and(0xffff_ffff)
+}
+
+/// rtlint: holds SLAB_LOCK
+fn slot(i: i64) -> addr {
+    unsafe { mem_addr(mem_process(SLOTS).load_i64()).offset(8 * i) }
+}
+
+/// rtlint: holds SLAB_LOCK
+fn gen(i: i64) -> addr {
+    unsafe { mem_addr(mem_process(GENS).load_i64()).offset(8 * i) }
+}
+
+/// rtlint: holds SLAB_LOCK
+fn live(i: i64, g: i64) -> bool {
+    unsafe { i < mem_process(NSLOTS).load_i64() and gen(i).load_i64() == g }
+}
+
+/// rtlint: holds SLAB_LOCK
+fn grow_slots() {
+    unsafe {
+        let n = mem_process(NSLOTS).load_i64()
+        let cap = mem_process(SLOTCAP).load_i64()
+        if n < cap {
+            return
+        }
+        let want = if cap == 0 { 16 } else { 2 * cap }
+        let slots = if cap == 0 { sys.alloc(8 * want) } else { sys.grow(mem_addr(mem_process(SLOTS).load_i64()), 8 * want) }
+        let gens = if cap == 0 { sys.alloc(8 * want) } else { sys.grow(mem_addr(mem_process(GENS).load_i64()), 8 * want) }
+        mem_process(SLOTS).store_i64(slots.as_i64())
+        mem_process(GENS).store_i64(gens.as_i64())
+        mem_process(SLOTCAP).store_i64(want)
+    }
+}
+
+/// rtlint: holds SLAB_LOCK
+fn push_free(i: i64) {
+    unsafe {
+        let n = mem_process(NFREE).load_i64()
+        let cap = mem_process(FREECAP).load_i64()
+        if n == cap {
+            let want = if cap == 0 { 16 } else { 2 * cap }
+            let a = if cap == 0 { sys.alloc(8 * want) } else { sys.grow(mem_addr(mem_process(FREE).load_i64()), 8 * want) }
+            mem_process(FREE).store_i64(a.as_i64())
+            mem_process(FREECAP).store_i64(want)
+        }
+        mem_addr(mem_process(FREE).load_i64()).offset(8 * n).store_i64(i)
+        mem_process(NFREE).store_i64(n + 1)
+    }
+}
+
+/// rtlint: holds SLAB_LOCK
+fn new_slot(v: addr) -> i64 {
+    unsafe {
+        let nf = mem_process(NFREE).load_i64()
+        if nf > 0 {
+            let i = mem_addr(mem_process(FREE).load_i64()).offset(8 * (nf - 1)).load_i64()
+            mem_process(NFREE).store_i64(nf - 1)
+            slot(i).store_addr(v)
+            return pack(i, gen(i).load_i64())
+        }
+        grow_slots()
+        let i = mem_process(NSLOTS).load_i64()
+        slot(i).store_addr(v)
+        gen(i).store_i64(0)
+        mem_process(NSLOTS).store_i64(i + 1)
+        pack(i, 0)
+    }
+}
+
+/// The value at slot `i` of generation `g` with a count for the caller,
+/// or null when the reference is stale.
+/// rtlint: holds SLAB_LOCK
+fn get_held(i: i64, g: i64) -> addr {
+    unsafe {
+        if not live(i, g) {
+            return mem_addr(0)
+        }
+        let p = slot(i).load_addr()
+        if p.as_i64() != 0 {
+            val.inc(p)
+        }
+        p
+    }
+}
+
+/// rtlint: holds SLAB_LOCK
+fn set_held(i: i64, g: i64, v: addr) -> addr {
+    unsafe {
+        if not live(i, g) or slot(i).load_i64() == 0 {
+            return mem_addr(-1)
+        }
+        let old = slot(i).load_addr()
+        slot(i).store_addr(v)
+        old
+    }
+}
+
+/// rtlint: holds SLAB_LOCK
+fn release_held(i: i64, g: i64) -> addr {
+    unsafe {
+        if not live(i, g) {
+            return mem_addr(0)
+        }
+        let v = slot(i).load_addr()
+        slot(i).store_i64(0)
+        // The generation moves whether or not anything was there; one that
+        // cannot (32 bits used up) retires the slot instead.
+        if g < 0xffff_ffff {
+            gen(i).store_i64(g + 1)
+            push_free(i)
+        }
+        v
+    }
+}
+
+/// rtlint: holds SLAB_LOCK
+fn alive_held(i: i64, g: i64) -> bool {
+    unsafe { live(i, g) and slot(i).load_i64() != 0 }
+}
+
+export fn grt_ref_new(v: addr) -> i64 {
+    // The lock, taken here: a compare-and-swap until it is ours.
+    unsafe {
+        while mem_process(SLAB_LOCK).atomic_cas_i64(0, 1, Acquire) != 0 {}
+    }
+    let r = new_slot(v)
+    unlock()
+    r
+}
+
+/// The value a reference names, owned by the caller; a stale one panics.
+export fn grt_ref_get(r: i64) -> addr {
+    // The lock, taken here: a compare-and-swap until it is ours.
+    unsafe {
+        while mem_process(SLAB_LOCK).atomic_cas_i64(0, 1, Acquire) != 0 {}
+    }
+    let p = get_held(index_of(r), gen_of(r))
+    unlock()
+    if unsafe { p.as_i64() } == 0 {
+        stale()
+    }
+    p
+}
+
+/// Replaces what a reference names, releasing what it named.
+export fn grt_ref_set(r: i64, v: addr) {
+    // The lock, taken here: a compare-and-swap until it is ours.
+    unsafe {
+        while mem_process(SLAB_LOCK).atomic_cas_i64(0, 1, Acquire) != 0 {}
+    }
+    let old = set_held(index_of(r), gen_of(r), v)
+    unlock()
+    if unsafe { old.as_i64() } == -1 {
+        stale()
+    }
+    val.dec(old)
+}
+
+/// Releases a slot: every reference to it is stale from now. Releasing a
+/// slot twice does nothing the second time.
+export fn grt_ref_release(r: i64) {
+    // The lock, taken here: a compare-and-swap until it is ours.
+    unsafe {
+        while mem_process(SLAB_LOCK).atomic_cas_i64(0, 1, Acquire) != 0 {}
+    }
+    let v = release_held(index_of(r), gen_of(r))
+    unlock()
+    val.dec(v)
+}
+
+export fn grt_ref_alive(r: i64) -> i8 {
+    // The lock, taken here: a compare-and-swap until it is ours.
+    unsafe {
+        while mem_process(SLAB_LOCK).atomic_cas_i64(0, 1, Acquire) != 0 {}
+    }
+    let a = alive_held(index_of(r), gen_of(r))
+    unlock()
+    if a { 1.as_i8() } else { 0.as_i8() }
+}
+
+/// A copy of `p` -- a struct, a list or a scalar list -- that nothing else
+/// holds, for a write through a reference; null for anything else, which
+/// is written whole instead.
+fn fresh_copy(p: addr) -> addr {
+    unsafe {
+        let t = p.offset(layout.TAG).load_u8().as_i64()
+        if t == layout.TAG_STRUCT {
+            return structs.copy_struct(p)
+        }
+        if t == layout.TAG_LIST {
+            var n = 0
+            var at = p.offset(layout.LIST_VALS)
+            n = p.offset(layout.LIST_LEN).load_u8().as_i64()
+            if p.offset(layout.LIST_DISC).load_u8().as_i64() != layout.LIST_INLINE {
+                at = p.offset(layout.LIST_VEC).offset(layout.VEC_PTR).load_addr()
+                n = p.offset(layout.LIST_VEC).offset(layout.VEC_LEN).load_i64()
+            }
+            let l = alloc.take()
+            l.offset(layout.TAG).store_u8(layout.TAG_LIST.as_u8())
+            l.offset(layout.LIST_DISC).store_u8(layout.LIST_HEAP.as_u8())
+            let buf = if n > 0 { sys.alloc(8 * n) } else { mem_addr(layout.WORDS_DANGLING) }
+            var i = 0
+            while i < n {
+                let e = at.offset(8 * i).load_addr()
+                val.inc(e)
+                buf.offset(8 * i).store_addr(e)
+                i += 1
+            }
+            let vec = l.offset(layout.LIST_VEC)
+            vec.offset(layout.VEC_PTR).store_addr(buf)
+            vec.offset(layout.VEC_LEN).store_i64(n)
+            vec.offset(layout.VEC_CAP).store_i64(n)
+            return l
+        }
+        if t == layout.TAG_LIST_SCALAR {
+            // `ScalarData::duplicate`: the same kind and the same elements,
+            // in a buffer exactly as long.
+            let l = alloc.take()
+            sys.copy(l.offset(8), p.offset(8), 16)
+            let from = p.offset(layout.SCALAR_VEC)
+            let n = from.offset(layout.VEC_LEN).load_i64()
+            let bytes = p.offset(layout.SCALAR_DISC).load_u8().as_i64() == layout.SCALAR_BYTES
+            let size = if bytes { 1 } else { 8 }
+            let buf = if n > 0 { sys.alloc(size * n) } else { mem_addr(if bytes { layout.U8_DANGLING } else { layout.WORDS_DANGLING }) }
+            sys.copy(buf, from.offset(layout.VEC_PTR).load_addr(), size * n)
+            let vec = l.offset(layout.SCALAR_VEC)
+            vec.offset(layout.VEC_PTR).store_addr(buf)
+            vec.offset(layout.VEC_LEN).store_i64(n)
+            vec.offset(layout.VEC_CAP).store_i64(n)
+            return l
+        }
+        mem_addr(0)
+    }
+}
+
+/// rtlint: holds SLAB_LOCK
+fn unique_held(i: i64, g: i64, inout old: addr) -> addr {
+    unsafe {
+        if not live(i, g) or slot(i).load_i64() == 0 {
+            return mem_addr(0)
+        }
+        let p = slot(i).load_addr()
+        if p.atomic_load_i64(Relaxed) == 1 {
+            return p
+        }
+        let fresh = fresh_copy(p)
+        if fresh.as_i64() == 0 {
+            return p
+        }
+        slot(i).store_addr(fresh)
+        old = p
+        fresh
+    }
+}
+
+/// What a reference names, made the heap's alone first so a write through
+/// it is seen by every holder of the reference; borrowed, not owned.
+export fn grt_ref_make_unique(r: i64) -> addr {
+    var old = unsafe { mem_addr(0) }
+    // The lock, taken here: a compare-and-swap until it is ours.
+    unsafe {
+        while mem_process(SLAB_LOCK).atomic_cas_i64(0, 1, Acquire) != 0 {}
+    }
+    let p = unique_held(index_of(r), gen_of(r), old)
+    unlock()
+    if unsafe { p.as_i64() } == 0 {
+        stale()
+    }
+    val.dec(old)
+    p
+}
+
+/// Releases everything the heap still holds and empties it: what the leak
+/// check does first, so a reference never released is not counted a leak.
+pub fn drain() {
+    var held = unsafe { mem_addr(0) }
+    var cap = 0
+    var n = 0
+    // The lock, taken here: a compare-and-swap until it is ours.
+    unsafe {
+        while mem_process(SLAB_LOCK).atomic_cas_i64(0, 1, Acquire) != 0 {}
+    }
+    take_all(held, cap, n)
+    unlock()
+    var k = 0
+    while k < n {
+        val.dec(unsafe { held.offset(8 * k).load_addr() })
+        k += 1
+    }
+    if cap > 0 {
+        sys.dealloc(held)
+    }
+}
+
+/// rtlint: holds SLAB_LOCK
+fn take_all(inout held: addr, inout cap: i64, inout n: i64) {
+    unsafe {
+        let count = mem_process(NSLOTS).load_i64()
+        var i = 0
+        while i < count {
+            let p = slot(i).load_addr()
+            if p.as_i64() != 0 {
+                release.push(held, cap, n, p)
+            }
+            i += 1
+        }
+        mem_process(NSLOTS).store_i64(0)
+        mem_process(NFREE).store_i64(0)
+    }
+}

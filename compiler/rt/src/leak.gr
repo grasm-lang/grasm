@@ -1,0 +1,83 @@
+// How many boxes are live, and the leak check at the end of `main`
+// (docs/self-hosting.md §6.11).
+//
+// Two allocators keep one ledger between them (`alloc.gr`): this runtime's
+// counts the boxes it makes and frees, and the Rust runtime's, still linked,
+// the boxes its own code makes and frees; a box made on one side and freed
+// on the other leaves each count off by one the other way, and only the sum
+// says what is live. So `live_allocations` is the sum for this thread. The
+// leak check's verdict needs the Rust runtime's whole half, which it alone
+// can read -- the counts its ended workers left in a static. So, when the
+// check is asked for, this side first releases the roots it keeps -- what
+// the reference heap (`refs.gr`) and the channels (`tasks.gr`) still hold --
+// then hands its whole balance, every thread's, to the Rust ledger through
+// the Rust runtime's own entry points, and lets its check count and report:
+// a box made there by `grasm_box_unit` for each one live here, and for each
+// one this side freed beyond what it made, a box of nothing given to
+// `grasm_val_dec` to free. `GRASM_ALLOC_STATS` reports how many boxes were
+// made in all, so then every box made here is made there too and the
+// surplus freed. Done only when one of the two variables is set, as the Rust
+// check does nothing otherwise.
+import layout
+import sys
+import alloc
+import refs
+import tasks
+
+extern fn getenv(name: addr) -> addr
+extern fn grasm_live_allocations() -> i64
+extern fn grasm_check_leaks()
+extern fn grasm_box_unit() -> addr
+extern fn grasm_val_dec(v: addr)
+
+/// Boxes live on this thread, this side's and the Rust runtime's together.
+export fn grt_live_allocations() -> i64 {
+    unsafe { grasm_live_allocations() + alloc.local().offset(alloc.L_LIVE).load_i64() }
+}
+
+/// Moves `n` boxes of this side's ledger to the Rust runtime's: `n` boxes it
+/// makes and keeps, or for a negative `n`, `-n` boxes of nothing it frees.
+fn hand_over(n: i64) {
+    var k = 0
+    while k < n {
+        unsafe { grasm_box_unit() }
+        k += 1
+    }
+    while k > n {
+        unsafe {
+            let b = sys.alloc(layout.BOX_SIZE)
+            b.offset(layout.TAG).store_u8(layout.TAG_UNIT.as_u8())
+            b.atomic_store_i64(1, Relaxed)
+            grasm_val_dec(b)
+        }
+        k -= 1
+    }
+}
+
+export fn grt_check_leaks() {
+    unsafe {
+        let stats = getenv(mem_static("GRASM_ALLOC_STATS")).as_i64() != 0
+        let check = getenv(mem_static("GRASM_LEAK_CHECK")).as_i64() != 0
+        if check {
+            // What the reference heap still holds is a root, like a global:
+            // released first, as the Rust runtime releases its own.
+            refs.drain()
+            // And so is what a channel still holds.
+            tasks.drain()
+        }
+        if stats or check {
+            let l = alloc.local()
+            let live = l.offset(alloc.L_LIVE).load_i64() + alloc.escaped(true)
+            let made = l.offset(alloc.L_MADE).load_i64() + alloc.escaped_made(true)
+            l.offset(alloc.L_LIVE).store_i64(0)
+            l.offset(alloc.L_MADE).store_i64(0)
+            if stats {
+                hand_over(made)
+                hand_over(live - made)
+            } else {
+                hand_over(live)
+            }
+        }
+        grasm_check_leaks()
+    }
+}

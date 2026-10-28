@@ -1,0 +1,174 @@
+// A value struct held outside a box (docs/values.md): its words in a stack
+// slot or a list, released or copied by its type's descriptor --
+// `grasm_val_release` when one goes out of scope, `grasm_val_dup` when a
+// bit-for-bit copy of one must come to own what it holds
+// (docs/self-hosting.md §6.11).
+//
+// The descriptor is the backend's (`StructDesc`, `repr(C)`), and the kinds
+// it lists are those the Rust runtime's `desc_ty` builds the type's
+// `StructTy` from, its width derived from them the same way; this runtime
+// reads them there and builds nothing.
+import layout
+import sys
+import release
+import val
+
+/// The kinds of the type `d` describes, `DESC_FIELD_SIZE` bytes apart.
+fn kinds(d: addr) -> addr {
+    unsafe { d.offset(layout.DESC_FIELDS + layout.DESC_FIELD_KIND) }
+}
+
+fn nfields(d: addr) -> i64 {
+    unsafe { d.offset(layout.DESC_NFIELDS).load_i64() }
+}
+
+/// Its element descriptors, one word a field.
+fn elems(d: addr) -> addr {
+    unsafe { d.offset(layout.DESC_FIELDS + nfields(d) * layout.DESC_FIELD_SIZE) }
+}
+
+/// The words one value of the type takes, at least one.
+fn width(d: addr) -> i64 {
+    let w = release.width_of(kinds(d), layout.DESC_FIELD_SIZE, nfields(d))
+    let width = if w < 0 { -w } else { w }
+    if width < 1 { 1 } else { width }
+}
+
+/// Releases everything the value at `p` owns, leaving its words behind.
+export fn grt_val_release(desc: addr, p: addr) {
+    var stack = unsafe { mem_addr(0) }
+    var cap = 0
+    var pending = 0
+    var work = unsafe { mem_addr(0) }
+    var wcap = 0
+    var wn = 0
+    release.release_words(kinds(desc), layout.DESC_FIELD_SIZE, nfields(desc), elems(desc), p, width(desc), stack, cap, pending, work, wcap, wn)
+    release.release_work(stack, cap, pending, work, wcap, wn)
+    release.walk_pending(stack, cap, pending)
+    if cap > 0 {
+        sys.dealloc(stack)
+    }
+}
+
+/// A copy of the `Vec` whose three words are at `f`, its elements `size`
+/// bytes each, written over them: exactly as long as it is, as `clone`
+/// makes it, and with no buffer at all when it is empty.
+fn clone_vec(f: addr, size: i64, dangling: i64) {
+    unsafe {
+        let len = f.offset(layout.VEC_LEN).load_i64()
+        if len == 0 {
+            f.offset(layout.VEC_PTR).store_i64(dangling)
+            f.offset(layout.VEC_CAP).store_i64(0)
+            return
+        }
+        let copy = sys.alloc(len * size)
+        sys.copy(copy, f.offset(layout.VEC_PTR).load_addr(), len * size)
+        f.offset(layout.VEC_PTR).store_addr(copy)
+        f.offset(layout.VEC_CAP).store_i64(len)
+    }
+}
+
+/// Makes `nwords` words at `words` -- whole values of the type of the kinds
+/// at `kinds`, copied bit for bit from values that still own what they hold
+/// -- own their own, as `StructTy::dup_words` does: every box counted up and
+/// every inline buffer copied; each inline list of values copied is added to
+/// `work` (its element descriptor, its new buffer and length) for its own
+/// elements to be made owners in turn.
+fn dup_words(kinds: addr, stride: i64, n: i64, words: addr, nwords: i64, elems: addr, inout work: addr, inout wcap: i64, inout wn: i64) {
+    unsafe {
+        let signed = release.width_of(kinds, stride, n)
+        let inline = signed > 0
+        let width = if inline { signed } else { -signed }
+        let w = if width < 1 { 1 } else { width }
+        var i = 0
+        if not inline {
+            var any = false
+            while i < w {
+                if release.kind_at(kinds, stride, n, i) == layout.FK_BOXED {
+                    any = true
+                }
+                i += 1
+            }
+            if not any {
+                return
+            }
+            var k = 0
+            var j = 0
+            while j < nwords {
+                if release.kind_at(kinds, stride, n, k) == layout.FK_BOXED {
+                    val.inc(words.offset(8 * j).load_addr())
+                }
+                k += 1
+                if k == w {
+                    k = 0
+                }
+                j += 1
+            }
+            return
+        }
+        let count = nwords / w
+        var e = 0
+        while e < count {
+            let el = words.offset(8 * w * e)
+            var at = 0
+            i = 0
+            while i < n {
+                let k = release.kind_at(kinds, stride, n, i)
+                let f = el.offset(8 * at)
+                if k == layout.FK_BOXED {
+                    val.inc(f.load_addr())
+                } else if k == layout.FK_INLIST {
+                    clone_vec(f, 8, layout.WORDS_DANGLING)
+                } else if k == layout.FK_INSTR {
+                    clone_vec(f, 1, layout.U8_DANGLING)
+                } else if k == layout.FK_INVALS {
+                    clone_vec(f, 8, layout.WORDS_DANGLING)
+                    release.push(work, wcap, wn, elems.offset(8 * i).load_addr())
+                    release.push(work, wcap, wn, f.offset(layout.VEC_PTR).load_addr())
+                    release.push(work, wcap, wn, mem_addr(f.offset(layout.VEC_LEN).load_i64()))
+                }
+                at += release.kind_width(k)
+                i += 1
+            }
+            e += 1
+        }
+    }
+}
+
+/// Makes `nwords` words at `p` -- values of the type `ty` (a `StructTy`),
+/// copied bit for bit -- own their own.
+pub fn dup_type(ty: addr, p: addr, nwords: i64) {
+    var work = unsafe { mem_addr(0) }
+    var wcap = 0
+    var wn = 0
+    unsafe {
+        let kinds = ty.offset(layout.STRUCTTY_KINDS)
+        dup_words(kinds.offset(layout.VEC_PTR).load_addr(), 1, kinds.offset(layout.VEC_LEN).load_i64(), p, nwords, ty.offset(layout.STRUCTTY_ELEMS).offset(layout.VEC_PTR).load_addr(), work, wcap, wn)
+    }
+    finish(work, wcap, wn)
+}
+
+/// Makes each inline list of values copied, waiting in `work`, own what its
+/// elements hold, until none is left.
+fn finish(inout work: addr, inout wcap: i64, inout wn: i64) {
+    while wn > 0 {
+        let d = unsafe { work.offset(8 * (wn - 3)).load_addr() }
+        let at = unsafe { work.offset(8 * (wn - 2)).load_addr() }
+        let len = unsafe { work.offset(8 * (wn - 1)).load_i64() }
+        wn -= 3
+        dup_words(kinds(d), layout.DESC_FIELD_SIZE, nfields(d), at, len, elems(d), work, wcap, wn)
+    }
+    if wcap > 0 {
+        sys.dealloc(work)
+    }
+}
+
+/// Makes the value at `p`, a bit-for-bit copy of one that still owns what it
+/// holds, own its own.
+export fn grt_val_dup(desc: addr, p: addr) {
+    var work = unsafe { mem_addr(0) }
+    var wcap = 0
+    var wn = 0
+    dup_words(kinds(desc), layout.DESC_FIELD_SIZE, nfields(desc), p, width(desc), elems(desc), work, wcap, wn)
+    finish(work, wcap, wn)
+}

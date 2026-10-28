@@ -13,7 +13,16 @@
 #     tags, the count sentinels, the inline string capacity, the box size.
 #
 # Every constant must be measured, every measurement must be a constant, and
-# a constant the source also states must agree with it. The probe is also
+# a constant the source also states must agree with it -- with one
+# exception, named in SOURCE_ONLY below: the state a `OnceLock` is in while
+# its value is being made, which is never there to be seen from outside and
+# is held to `grasm_sys`'s source alone. A range, which no program can make
+# through an entry point it may declare (`grasm_range_new` takes an `i8` that
+# a program's `extern fn` cannot declare as the backend does), is measured
+# by handing the Rust runtime one made by hand and asking it for the fields;
+# its offsets are also derived from `RtPayload`'s declaration (`repr(u8)`,
+# so each variant's fields follow its tag as a `repr(C)` struct's). Every
+# payload tag is held to that declaration's order as well as to the probe. The probe is also
 # linked with the poisoned runtime, to measure its freed-box count: built as
 # `scripts/s3rc.sh` builds it, or named by `RT_POISON=<archive built with
 # grasm_rt/poison>`; with `RT_POISON=` empty that one is held to the source
@@ -107,10 +116,65 @@ stated("LIST_LEN", r"pub const LIST_INLINE_LEN: usize = (\d+);", lambda m: int(m
 stated("LIST_VALS", r"pub const LIST_INLINE_VALS: usize = (\d+);", lambda m: int(m.group(1)))
 stated("LIST_INLINE", r"pub const INLINE: u8 = (\d+);", lambda m: int(m.group(1)))
 stated("SCALAR_VEC", r"pub const SCALAR_VEC: usize = (\d+);", lambda m: int(m.group(1)))
+stated("TAG_STRUCT", r"pub const TAG_STRUCT: u8 = (\d+);", lambda m: int(m.group(1)))
+stated("FK_F64", r"pub const FK_F64: u8 = (\d+);", lambda m: int(m.group(1)))
+stated("FK_BOOL", r"pub const FK_BOOL: u8 = (\d+);", lambda m: int(m.group(1)))
+stated("FK_REF", r"pub const FK_REF: u8 = (\d+);", lambda m: int(m.group(1)))
+stated("FK_UNIT", r"pub const FK_UNIT: u8 = (\d+);", lambda m: int(m.group(1)))
+stated("FK_U64", r"pub const FK_U64: u8 = (\d+);", lambda m: int(m.group(1)))
+stated("SCALAR_DISC", r"pub const SCALAR_DATA_TAG: usize = (\d+);", lambda m: int(m.group(1)))
+stated("BYTES_PTR", r"pub const BYTES_PTR: usize = (\d+);", lambda m: int(m.group(1)))
+stated("BYTES_LEN", r"pub const BYTES_LEN: usize = (\d+);", lambda m: int(m.group(1)))
+stated("TAG_LIST_VALS", r"pub const TAG_LIST_VALS: u8 = (\d+);", lambda m: int(m.group(1)))
+stated("STRUCT_DISC", r"pub const STRUCT_FIELDS_TAG: usize = (\d+);", lambda m: int(m.group(1)))
+stated("STRUCT_LEN", r"pub const STRUCT_INLINE_LEN: usize = (\d+);", lambda m: int(m.group(1)))
+stated("STRUCT_VALS", r"pub const STRUCT_INLINE_VALS: usize = (\d+);", lambda m: int(m.group(1)))
+stated("STRUCT_INLINE", r"pub const INLINE: u8 = (\d+);", lambda m: int(m.group(1)))
+stated("VALS_VEC", r"pub const VALS_VEC: usize = (\d+);", lambda m: int(m.group(1)))
+stated("FK_BOXED", r"pub const FK_BOXED: u8 = (\d+);", lambda m: int(m.group(1)))
+stated("FK_INLIST", r"pub const FK_INLIST: u8 = (\d+);", lambda m: int(m.group(1)))
+stated("FK_INVALS", r"pub const FK_INVALS: u8 = (\d+);", lambda m: int(m.group(1)))
+stated("FK_INSTR", r"pub const FK_INSTR: u8 = (\d+);", lambda m: int(m.group(1)))
+
+# `RtPayload`'s variants in declaration order: each one's tag. And the fields
+# of the ones whose layout is held to the source alone.
+body = rust_text.split("pub enum RtPayload {", 1)[1].split("\n}\n", 1)[0]
+variants = re.findall(r"^    ([A-Z]\w*)\s*(?:\(|\{|,)", body, re.M)
+camel = {"ListScalar": "LIST_SCALAR", "ListVals": "LIST_VALS", "StrBuf": "STRBUF", "ByteBuf": "BYTEBUF"}
+for i, v in enumerate(variants):
+    source["TAG_" + camel.get(v, v.upper())] = i
+m = re.search(r"^    Range \{\s*start: i64,\s*end: i64,\s*inclusive: bool,\s*\},", body, re.M)
+if not m:
+    print("FAIL: the Rust source's `Range` is no longer `{ start: i64, end: i64, inclusive: bool }`")
+    sys.exit(1)
+# After the tag byte at 8, each field at its own alignment.
+source["RANGE_START"] = 16
+source["RANGE_END"] = 24
+source["RANGE_INCL"] = 32
+# The runtime's `OnceLock` is `grasm_sys`'s: its state while a value is being
+# made is never there to be seen from outside.
+sys_text = open(rust_path.replace("grasm_rt/src/lib.rs", "grasm_sys/src/lib.rs")).read()
+m = re.search(r"const SETTING: u8 = (\d+);", sys_text)
+if not m:
+    print("FAIL: grasm_sys no longer states the OnceLock's SETTING")
+    sys.exit(1)
+source["ONCE_SETTING"] = int(m.group(1))
+SOURCE_ONLY = {"ONCE_SETTING"}
 
 bad = 0
 compared = 0
+source_only = 0
 for name, value in sorted(grasm.items()):
+    if name in SOURCE_ONLY:
+        if name in measured:
+            print(f"FAIL: {name} is measured, so it is not one the source alone holds")
+            bad = 1
+        elif source.get(name) != value:
+            print(f"FAIL: {name} is {value} in layout.gr, {source.get(name)} in the Rust source")
+            bad = 1
+        else:
+            source_only += 1
+        continue
     if name == "POISON":
         # Only a probe linked with the poisoned runtime sees it.
         if "POISON" in poisoned:
@@ -135,10 +199,10 @@ for name in sorted(measured):
     if name not in grasm:
         print(f"FAIL: the probe measures {name}, which layout.gr does not write down")
         bad = 1
-witnessed = sum(1 for n in grasm if n in source)
+witnessed = sum(1 for n in grasm if n in source and n not in SOURCE_ONLY)
 poison_note = "measured in the poisoned runtime" if "POISON" in poisoned else "held to the source only"
-print(f"layout constants: {len(grasm)}   measured and equal: {compared}   also stated by the Rust source: {witnessed}   POISON {poison_note}")
-expected = len(grasm) if "POISON" in poisoned else len(grasm) - 1
-if bad or compared != expected or len(grasm) < 30:
+print(f"layout constants: {len(grasm)}   measured and equal: {compared}   also stated by the Rust source: {witnessed}   held to the source alone: {source_only}   POISON {poison_note}")
+expected = len(grasm) - len(SOURCE_ONLY) if "POISON" in poisoned else len(grasm) - len(SOURCE_ONLY) - 1
+if bad or compared != expected or source_only != len(SOURCE_ONLY) or len(grasm) < 30:
     sys.exit(1)
 EOF

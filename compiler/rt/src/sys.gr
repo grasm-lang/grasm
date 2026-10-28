@@ -1,12 +1,14 @@
 // The C library calls every family makes: memory. The Rust runtime's global
 // allocator is `malloc`, `realloc` and `free` (`grasm_rt_abi`), so a buffer
 // either side allocates the other can grow or free -- a `String`'s or a
-// `Vec`'s included -- and these are those three calls.
+// `Vec`'s included -- and these are those three calls; with `memcpy` for a
+// long copy.
 
 extern fn malloc(n: i64) -> addr
 extern fn calloc(n: i64, size: i64) -> addr
 extern fn realloc(p: addr, n: i64) -> addr
 extern fn free(p: addr)
+extern fn memcpy(dst: addr, src: addr, n: i64) -> addr
 
 /// `n` bytes, uninitialised.
 pub fn alloc(n: i64) -> addr {
@@ -26,8 +28,15 @@ pub fn dealloc(p: addr) {
     unsafe { free(p) }
 }
 
-/// Copies `n` bytes from `src` to `dst`; the two do not overlap.
+/// Copies `n` bytes from `src` to `dst`; the two do not overlap. A long
+/// copy is the C library's, as `to_vec` and `extend_from_slice` make it in
+/// the Rust runtime: a list literal of constants copies its whole table
+/// each time it is read, and word by word that was most of `casefolddiff`.
 pub fn copy(dst: addr, src: addr, n: i64) {
+    if n >= 64 {
+        unsafe { memcpy(dst, src, n) }
+        return
+    }
     var i = 0
     while i + 8 <= n {
         unsafe { dst.offset(i).store_u64(src.offset(i).load_u64()) }

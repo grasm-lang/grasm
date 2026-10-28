@@ -34,13 +34,18 @@ pub let TAG_REF = 2
 pub let TAG_F64 = 3
 pub let TAG_BOOL = 4
 pub let TAG_STR = 5
+pub let TAG_ENV = 6
+pub let TAG_HANDLER = 7
+pub let TAG_RANGE = 8
 pub let TAG_BYTES = 9
 pub let TAG_LIST = 10
 pub let TAG_TUPLE = 11
 pub let TAG_LIST_SCALAR = 12
 pub let TAG_MAP = 13
+pub let TAG_STRUCT = 14
 pub let TAG_VARIANT = 15
 pub let TAG_FN = 16
+pub let TAG_LIST_VALS = 17
 pub let TAG_U64 = 18
 pub let TAG_STRBUF = 19
 pub let TAG_BYTEBUF = 20
@@ -90,6 +95,8 @@ pub let CHARINDEX_VEC = 0
 pub let CHARINDEX_COUNT = 24
 /// What an empty `Vec<u32>` holds for a pointer.
 pub let U32_DANGLING = 4
+/// And an empty `Vec<i64>`.
+pub let WORDS_DANGLING = 8
 
 // ----- lists and tuples: `ListData`, `repr(u8)` at 16 -- inline, a length
 // byte and four box pointers; or a `Vec` of them (the Rust runtime's
@@ -104,20 +111,41 @@ pub let LIST_VEC = 24
 
 // ----- the payloads whose buffer is all they own
 
-/// A scalar list's `ScalarData` (`repr(u8)` at 16): its `Vec` of words or bytes.
+/// A scalar list's `ScalarData` (`repr(u8)` at 16, its tag first): its `Vec`
+/// of words, or of bytes (booleans).
+pub let SCALAR_DISC = 16
+pub let SCALAR_WORDS = 0
+pub let SCALAR_BYTES = 1
 pub let SCALAR_VEC = 24
-/// A `StrBuilder`'s `String`, its first field.
+/// Its elements' kind, a `ScalarKind` after the tag -- Rust's numbering of
+/// the variants, not the backend's.
+pub let SCALAR_KIND_AT = 9
+pub let SK_I64 = 0
+pub let SK_F64 = 1
+pub let SK_BOOL = 2
+pub let SK_REF = 3
+pub let SK_U64 = 4
+/// A `StrBuilder`'s `String`, its first field, and its character count.
 pub let STRBUF_STRING = 16
+pub let STRBUF_CHARS = 40
 /// A `ByteBuilder`'s `Vec<u8>`.
 pub let BYTEBUF_VEC = 16
 
 // ----- variants, function values, bytes
 
+/// A variant's type name and its own name, each a `&str`: the text's address
+/// and then its length.
+pub let VARIANT_TYPE = 16
+pub let VARIANT_NAME = 32
+pub let STRREF_PTR = 0
+pub let STRREF_LEN = 8
 /// A variant's `VFields` after its two names: a word and a count. No field,
 /// a null word; one, the field itself in the word; two or more, a boxed
 /// slice of them, the variant's own.
 pub let VARIANT_FIELDS = 48
 pub let VARIANT_NFIELDS = 56
+/// A function value's code address.
+pub let FN_CODE = 16
 /// A function value's environment box, and its name, an `Option<String>`
 /// whose capacity word holds FN_NAME_NONE for `None`.
 pub let FN_ENV = 24
@@ -126,7 +154,139 @@ pub let FN_NAME_NONE = -1
 /// `RtBytes` (`repr(C)`): the window's address and length, then the
 /// `Arc<Vec<u8>>` that owns the buffer -- its strong and weak counts and
 /// the `Vec`, as `ArcInner` (`repr(C)`) lays them out.
+pub let BYTES_PTR = 16
+pub let BYTES_LEN = 24
 pub let BYTES_OWNER = 32
 pub let ARC_STRONG = 0
 pub let ARC_WEAK = 8
 pub let ARC_DATA = 16
+
+// ----- maps: `Map(MapTable)` at 16, a `hashbrown` table (0.15) of
+// `(MapKey, *mut RtVal)` with the process's `MapHash`. Rust laid all of it
+// out, so every number here is measured.
+
+/// The table: its control bytes (one per bucket, then a copy of the first
+/// group), the bucket count less one, how many more fit, how many there are.
+/// An empty table points at a shared group and has a mask of 0.
+pub let MAP_CTRL = 16
+pub let MAP_MASK = 24
+pub let MAP_GROWTH = 32
+pub let MAP_ITEMS = 40
+/// The `MapHash`: the seed every table of the process starts from.
+pub let MAP_SEED = 48
+/// Control bytes are read eight at a time (NEON's `Group` on arm64).
+pub let MAP_GROUP = 8
+/// Entries count down from the control bytes, bucket `i`'s at
+/// `ctrl - (i + 1) * MAP_ENTRY`; its key first, its value's box after.
+pub let MAP_ENTRY = 32
+pub let MAP_ENTRY_VAL = 24
+/// A `MapKey` is 24 bytes, its kind in its first word: a long string's
+/// `String` there (its capacity, never negative), or one of these, past any
+/// capacity -- Rust's niche.
+pub let MAPKEY_SIZE = 24
+pub let MAPKEY_BOOL = -9223372036854775808
+pub let MAPKEY_I64 = -9223372036854775807
+pub let MAPKEY_U64 = -9223372036854775805
+pub let MAPKEY_TUPLE = -9223372036854775804
+pub let KEYSTR_INLINE = -1
+/// Where an integer, a `u64` or a tuple's slice is; a bool's byte.
+pub let MAPKEY_AT = 8
+pub let MAPKEY_BOOL_AT = 8
+/// A long key's `String`, from the key's start.
+pub let KEYSTR_STRING = 0
+/// A short key's bytes (up to fifteen) and its length byte.
+pub let KEYSTR_BYTES = 8
+pub let KEYSTR_LEN = 23
+/// A tuple key's boxed slice of keys: its address and its length.
+pub let MAPKEY_TUPLE_PTR = 8
+pub let MAPKEY_TUPLE_LEN = 16
+
+// ----- structs: `Struct { ty, fields }` -- the `StructTy` the type's
+// descriptor caches, then `StructFields` (`repr(u8)`), inline (a length byte
+// and four words) or a `Vec` (the Rust runtime's `layout` module states the
+// inline ones)
+
+pub let STRUCT_TY = 16
+pub let STRUCT_DISC = 24
+pub let STRUCT_INLINE = 0
+pub let STRUCT_HEAP = 1
+pub let STRUCT_LEN = 25
+pub let STRUCT_VALS = 32
+pub let STRUCT_VEC = 32
+
+/// A `StructTy`: what each field holds (a `Vec<u8>` of kinds), and each
+/// field's element descriptor when it is an inline list of values (a
+/// `Vec<usize>`). Where each field starts and how wide a value is follow from
+/// the kinds, as the Rust runtime derives them.
+pub let STRUCTTY_KINDS = 24
+pub let STRUCTTY_ELEMS = 72
+/// The type's name, a `&str`, and its fields' names, a `Vec<&str>`.
+pub let STRUCTTY_NAME = 96
+pub let STRUCTTY_FIELDS = 0
+/// Where each field starts in a value's words (a `Vec<usize>`), how many
+/// words a value takes, and whether any field is inline (a byte).
+pub let STRUCTTY_OFFS = 48
+pub let STRUCTTY_WIDTH = 128
+pub let STRUCTTY_INLINE = 136
+/// The type's shared empty value list, a `OnceLock<usize>` (the runtime's
+/// own): its value, and its state byte, UNSET until made and READY after.
+pub let STRUCTTY_EMPTY = 112
+pub let STRUCTTY_EMPTY_STATE = 120
+pub let ONCE_UNSET = 0
+pub let ONCE_READY = 2
+/// The state while the first one to get there makes the value, which no
+/// program can catch it in: held to the source of the runtime's `OnceLock`.
+pub let ONCE_SETTING = 1
+/// What a `StructTy` takes, boxed.
+pub let STRUCTTY_SIZE = 144
+
+/// The backend's descriptor (`StructDesc`, `repr(C)`): the `StructTy` it
+/// caches, the field count, and a (name, length, kind) triple per field,
+/// then a word per field -- an inline value list's element descriptor.
+pub let DESC_CACHE = 0
+pub let DESC_NFIELDS = 24
+pub let DESC_FIELDS = 32
+pub let DESC_FIELD_SIZE = 24
+pub let DESC_FIELD_KIND = 16
+
+/// Field kinds: a box; an inline list of words, of values, or a string's
+/// bytes, each three words (a `Vec`'s); every other kind is a scalar's bits
+/// in one word.
+pub let FK_BOXED = 0
+pub let FK_F64 = 2
+pub let FK_BOOL = 3
+pub let FK_REF = 4
+pub let FK_UNIT = 5
+pub let FK_U64 = 9
+pub let FK_INLIST = 6
+pub let FK_INVALS = 7
+pub let FK_INSTR = 8
+
+/// A list of value structs: its `StructTy`, and every element's words in
+/// one `Vec<i64>`.
+pub let VALS_TY = 16
+pub let VALS_VEC = 24
+
+// ----- environments and handlers
+
+/// `Env { words, boxed }`: a `Vec<i64>` of captures and a `Vec<bool>` saying
+/// which are boxes.
+pub let ENV_WORDS = 16
+pub let ENV_BOXED = 40
+/// `Handler { effect, ops }`: the effect's name, a `String`, and a `Vec` of
+/// operations, each a name (`String`), the code's address and an environment
+/// box (or null), 40 bytes.
+pub let HANDLER_EFFECT = 16
+pub let HANDLER_OPS = 40
+pub let OP_SIZE = 40
+pub let OP_NAME = 0
+pub let OP_CODE = 24
+pub let OP_ENV = 32
+
+// ----- ranges: `Range { start, end, inclusive }`, after the tag at its own
+// alignment. No program can make one through an entry point it may declare,
+// so the probe hands the Rust runtime one made by hand and asks it for each.
+
+pub let RANGE_START = 16
+pub let RANGE_END = 24
+pub let RANGE_INCL = 32

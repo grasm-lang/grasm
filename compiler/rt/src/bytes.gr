@@ -1,0 +1,717 @@
+// `bytes` and the builders ([L-LIB-BYTES], [L-LIB-BUILDER];
+// docs/self-hosting.md §6.11).
+//
+// A `bytes` value is a window -- an address and a length -- on a buffer an
+// `Arc<Vec<u8>>` owns: `slice` makes another window on the same buffer, with
+// one more strong count, rather than a copy. A write lands in place only in a
+// value nothing else holds whose window is its whole buffer and whose `Arc`
+// is held once (`Arc::get_mut`); anything else is copied first. Bytes made
+// into text are UTF-8 checked, and an invalid sequence becomes U+FFFD as
+// Rust's `from_utf8_lossy` replaces it: one for each longest prefix of a
+// sequence that could have been valid.
+//
+// A builder grows at its end, in place when nothing else holds it and a copy
+// first when something does; a `StrBuilder` keeps its character count.
+import layout
+import sys
+import alloc
+import boxes
+import val
+import strread
+import numstr
+import display
+import maps
+import panic
+
+extern fn memchr(p: addr, c: i32, n: i64) -> addr
+extern fn grasm_panic_msg(p: addr, n: i64)
+
+/// The largest buffer the runtime makes, as the Rust runtime's `MAX_ALLOC`.
+let MAX_ALLOC = 8589934592
+
+fn tag(v: addr) -> i64 {
+    unsafe { v.offset(layout.TAG).load_u8() }.as_i64()
+}
+
+fn set_vec(v: addr, p: addr, len: i64, cap: i64) {
+    unsafe {
+        v.offset(layout.VEC_PTR).store_addr(p)
+        v.offset(layout.VEC_LEN).store_i64(len)
+        v.offset(layout.VEC_CAP).store_i64(cap)
+    }
+}
+
+// ----- messages with numbers in them ------------------------------------------
+
+/// Panics with the text built in `t`.
+fn say_text(t: addr) {
+    unsafe { grasm_panic_msg(display.text_ptr(t), display.text_len(t)) }
+}
+
+/// `index {i} out of bounds (len {n})`.
+fn out_of_bounds(i: i64, n: i64) {
+    let t = display.text_new()
+    unsafe {
+        display.put(t, mem_static("index "), 6)
+        display.put_int(t, i)
+        display.put(t, mem_static(" out of bounds (len "), mem_static_len(" out of bounds (len "))
+        display.put_int(t, n)
+        display.put_byte(t, 41)
+    }
+    say_text(t)
+}
+
+/// `slice {from}..{end} out of bounds (len {n})`.
+fn slice_bounds(from: i64, end: i64, n: i64) {
+    let t = display.text_new()
+    unsafe {
+        display.put(t, mem_static("slice "), 6)
+        display.put_int(t, from)
+        display.put(t, mem_static(".."), 2)
+        display.put_int(t, end)
+        display.put(t, mem_static(" out of bounds (len "), mem_static_len(" out of bounds (len "))
+        display.put_int(t, n)
+        display.put_byte(t, 41)
+    }
+    say_text(t)
+}
+
+/// The byte `n` is, or `{n} is not a byte — {op} takes values in 0..255`.
+fn byte_or_panic(n: i64, op: addr, opn: i64) -> i64 {
+    if n < 0 or n > 255 {
+        let t = display.text_new()
+        display.put_int(t, n)
+        unsafe {
+            display.put(t, mem_static(" is not a byte — "), mem_static_len(" is not a byte — "))
+            display.put(t, op, opn)
+            display.put(t, mem_static(" takes values in 0..255"), mem_static_len(" takes values in 0..255"))
+        }
+        say_text(t)
+    }
+    n
+}
+
+// ----- the buffer and its windows -----------------------------------------------
+
+/// A `bytes` value owning the `Vec` (`p`, `len`, `cap`), in a new `Arc`.
+fn new_bytes(p: addr, len: i64, cap: i64) -> addr {
+    let arc = sys.alloc(layout.ARC_DATA + 24)
+    let v = alloc.take()
+    unsafe {
+        arc.offset(layout.ARC_STRONG).store_i64(1)
+        arc.offset(layout.ARC_WEAK).store_i64(1)
+        set_vec(arc.offset(layout.ARC_DATA), p, len, cap)
+        v.offset(layout.TAG).store_u8(layout.TAG_BYTES.as_u8())
+        v.offset(layout.BYTES_PTR).store_addr(p)
+        v.offset(layout.BYTES_LEN).store_i64(len)
+        v.offset(layout.BYTES_OWNER).store_addr(arc)
+    }
+    v
+}
+
+/// A `bytes` value holding a copy of the `n` bytes at `p`, its buffer
+/// exactly as long.
+pub fn bytes_copy(p: addr, n: i64) -> addr {
+    let buf = if n > 0 { sys.alloc(n) } else { unsafe { mem_addr(layout.U8_DANGLING) } }
+    sys.copy(buf, p, n)
+    new_bytes(buf, n, n)
+}
+
+/// A `bytes` value's window, its length in `n`; none for anything else.
+fn window(v: addr, inout n: i64) -> addr {
+    unsafe {
+        if tag(v) != layout.TAG_BYTES {
+            n = 0
+            return mem_addr(layout.U8_DANGLING)
+        }
+        n = v.offset(layout.BYTES_LEN).load_i64()
+        v.offset(layout.BYTES_PTR).load_addr()
+    }
+}
+
+/// Whether a write may land in `v` where it is: nothing else holds the
+/// value, its window is its whole buffer, and the buffer's `Arc` is held once.
+fn writable(v: addr) -> bool {
+    unsafe {
+        if v.atomic_load_i64(Relaxed) != 1 or tag(v) != layout.TAG_BYTES {
+            return false
+        }
+        let arc = v.offset(layout.BYTES_OWNER).load_addr()
+        let data = arc.offset(layout.ARC_DATA)
+        v.offset(layout.BYTES_PTR).load_i64() == data.offset(layout.VEC_PTR).load_i64() and v.offset(layout.BYTES_LEN).load_i64() == data.offset(layout.VEC_LEN).load_i64() and arc.offset(layout.ARC_STRONG).atomic_load_i64(Acquire) == 1 and arc.offset(layout.ARC_WEAK).atomic_load_i64(Acquire) == 1
+    }
+}
+
+/// The value a write may land in: `v` itself, or a copy of its window that
+/// nothing else holds, `v` released.
+fn own_bytes(v: addr) -> addr {
+    if writable(v) {
+        return v
+    }
+    if tag(v) != layout.TAG_BYTES {
+        unsafe { panic.say(mem_static("a write to a value that is not bytes"), mem_static_len("a write to a value that is not bytes")) }
+    }
+    var n = 0
+    let p = window(v, n)
+    let fresh = bytes_copy(p, n)
+    val.dec(v)
+    fresh
+}
+
+export fn grt_bytes_ptr(v: addr) -> addr {
+    if tag(v) != layout.TAG_BYTES {
+        unsafe { panic.say(mem_static("bytes_ptr on a value that is not bytes"), mem_static_len("bytes_ptr on a value that is not bytes")) }
+    }
+    unsafe { v.offset(layout.BYTES_PTR).load_addr() }
+}
+
+/// A list of integers in 0..255 as bytes: a scalar list's words, or a list
+/// of boxed integers.
+export fn grt_bytes_of(l: addr) -> addr {
+    let t = tag(l)
+    var n = 0
+    var vals = unsafe { mem_addr(0) }
+    unsafe {
+        if t == layout.TAG_LIST_SCALAR {
+            let s = l.offset(layout.SCALAR_VEC)
+            n = s.offset(layout.VEC_LEN).load_i64()
+            vals = sys.alloc(8 * n + 8)
+            let p = s.offset(layout.VEC_PTR).load_addr()
+            let words = l.offset(layout.SCALAR_DISC).load_u8().as_i64() == layout.SCALAR_WORDS
+            var i = 0
+            while i < n {
+                vals.offset(8 * i).store_i64(if words { p.offset(8 * i).load_i64() } else { p.offset(i).load_u8().as_i64() })
+                i += 1
+            }
+        } else if t == layout.TAG_LIST {
+            var at = l.offset(layout.LIST_VALS)
+            n = l.offset(layout.LIST_LEN).load_u8().as_i64()
+            if l.offset(layout.LIST_DISC).load_u8().as_i64() != layout.LIST_INLINE {
+                at = l.offset(layout.LIST_VEC).offset(layout.VEC_PTR).load_addr()
+                n = l.offset(layout.LIST_VEC).offset(layout.VEC_LEN).load_i64()
+            }
+            vals = sys.alloc(8 * n + 8)
+            var i = 0
+            while i < n {
+                let e = at.offset(8 * i).load_addr()
+                if tag(e) != layout.TAG_I64 {
+                    panic.say(mem_static("bytes_of expects a list of integers"), mem_static_len("bytes_of expects a list of integers"))
+                }
+                vals.offset(8 * i).store_i64(e.offset(layout.WORD_AT).load_i64())
+                i += 1
+            }
+        } else {
+            panic.say(mem_static("bytes_of expects a list"), mem_static_len("bytes_of expects a list"))
+        }
+        let buf = if n > 0 { sys.alloc(n) } else { mem_addr(layout.U8_DANGLING) }
+        var i = 0
+        while i < n {
+            let x = byte_or_panic(vals.offset(8 * i).load_i64(), mem_static("bytes_of"), 8)
+            buf.offset(i).store_u8(x.as_u8())
+            i += 1
+        }
+        sys.dealloc(vals)
+        new_bytes(buf, n, n)
+    }
+}
+
+export fn grt_bytes_len(v: addr) -> i64 {
+    var n = 0
+    let _ = window(v, n)
+    n
+}
+
+export fn grt_bytes_at(v: addr, i: i64) -> i64 {
+    var n = 0
+    let p = window(v, n)
+    if i < 0 or i >= n {
+        out_of_bounds(i, n)
+    }
+    unsafe { p.offset(i).load_u8() }.as_i64()
+}
+
+/// `from..end` of `v`: a window on the same buffer, not a copy.
+export fn grt_bytes_slice(v: addr, from: i64, end: i64) -> addr {
+    if tag(v) != layout.TAG_BYTES {
+        return bytes_copy(unsafe { mem_addr(layout.U8_DANGLING) }, 0)
+    }
+    var n = 0
+    let p = window(v, n)
+    if from < 0 or end < from or end > n {
+        slice_bounds(from, end, n)
+    }
+    let w = alloc.take()
+    unsafe {
+        let arc = v.offset(layout.BYTES_OWNER).load_addr()
+        arc.offset(layout.ARC_STRONG).atomic_add_i64(1, Relaxed)
+        w.offset(layout.TAG).store_u8(layout.TAG_BYTES.as_u8())
+        w.offset(layout.BYTES_PTR).store_addr(p.offset(from))
+        w.offset(layout.BYTES_LEN).store_i64(end - from)
+        w.offset(layout.BYTES_OWNER).store_addr(arc)
+    }
+    w
+}
+
+/// The first place at or after `from` holding `byte`, as an `Option`.
+export fn grt_bytes_index_of(v: addr, byte: i64, from: i64) -> addr {
+    var n = 0
+    let p = window(v, n)
+    if from < 0 or from > n {
+        let t = display.text_new()
+        unsafe {
+            display.put(t, mem_static("index_of from "), mem_static_len("index_of from "))
+            display.put_int(t, from)
+            display.put(t, mem_static(" out of bounds (len "), mem_static_len(" out of bounds (len "))
+            display.put_int(t, n)
+            display.put_byte(t, 41)
+        }
+        say_text(t)
+    }
+    if byte < 0 or byte > 255 {
+        return maps.option(unsafe { mem_addr(0) })
+    }
+    let at = unsafe { memchr(p.offset(from), byte.as_i32(), n - from) }
+    if unsafe { at.as_i64() } == 0 {
+        return maps.option(unsafe { mem_addr(0) })
+    }
+    maps.option(boxes.int(from + unsafe { at.diff(p.offset(from)) }))
+}
+
+/// `a + b`: a new buffer, as `to_vec` and then `extend_from_slice` grow one.
+export fn grt_bytes_concat(a: addr, b: addr) -> addr {
+    var na = 0
+    var nb = 0
+    let pa = window(a, na)
+    let pb = window(b, nb)
+    var cap = na
+    if na + nb > cap {
+        cap = if 2 * cap > na + nb { 2 * cap } else { na + nb }
+        if cap < 8 {
+            cap = 8
+        }
+    }
+    let buf = if cap > 0 { sys.alloc(cap) } else { unsafe { mem_addr(layout.U8_DANGLING) } }
+    sys.copy(buf, pa, na)
+    sys.copy(unsafe { buf.offset(na) }, pb, nb)
+    new_bytes(buf, na + nb, cap)
+}
+
+export fn grt_bytes_set(v: addr, i: i64, b: i64) -> addr {
+    var n = 0
+    let _ = window(v, n)
+    if i < 0 or i >= n {
+        out_of_bounds(i, n)
+    }
+    let x = byte_or_panic(b, unsafe { mem_static("set") }, 3)
+    let t = own_bytes(v)
+    unsafe { t.offset(layout.BYTES_PTR).load_addr().offset(i).store_u8(x.as_u8()) }
+    t
+}
+
+export fn grt_bytes_fill(v: addr, b: i64) -> addr {
+    let x = byte_or_panic(b, unsafe { mem_static("fill") }, 4)
+    let t = own_bytes(v)
+    var n = 0
+    let p = window(t, n)
+    var i = 0
+    while i < n {
+        unsafe { p.offset(i).store_u8(x.as_u8()) }
+        i += 1
+    }
+    t
+}
+
+export fn grt_bytes_copy_from(v: addr, at: i64, src: addr) -> addr {
+    var n = 0
+    var m = 0
+    let _ = window(v, n)
+    let _ = window(src, m)
+    if at < 0 or at > n or at + m > n {
+        let t = display.text_new()
+        unsafe {
+            display.put(t, mem_static("copy_from writes "), mem_static_len("copy_from writes "))
+            display.put_int(t, m)
+            display.put(t, mem_static(" bytes at "), mem_static_len(" bytes at "))
+            display.put_int(t, at)
+            display.put(t, mem_static(", past the end (len "), mem_static_len(", past the end (len "))
+            display.put_int(t, n)
+            display.put_byte(t, 41)
+        }
+        say_text(t)
+    }
+    // The value copied into itself: the bounds make that the whole of it at
+    // 0, already done.
+    if v == src {
+        return v
+    }
+    let t = own_bytes(v)
+    var k = 0
+    let from = window(src, k)
+    sys.copy(unsafe { t.offset(layout.BYTES_PTR).load_addr().offset(at) }, from, m)
+    t
+}
+
+export fn grt_bytes_filled(n: i64, b: i64) -> addr {
+    if n < 0 {
+        let t = display.text_new()
+        unsafe {
+            display.put(t, mem_static("bytes_filled: a buffer cannot have "), mem_static_len("bytes_filled: a buffer cannot have "))
+            display.put_int(t, n)
+            display.put(t, mem_static(" bytes"), 6)
+        }
+        say_text(t)
+    }
+    if n > MAX_ALLOC {
+        let t = display.text_new()
+        unsafe {
+            display.put(t, mem_static("bytes_filled would need more memory than a buffer can hold ("), mem_static_len("bytes_filled would need more memory than a buffer can hold ("))
+            display.put_int(t, n)
+            display.put(t, mem_static(" bytes)"), 7)
+        }
+        say_text(t)
+    }
+    let x = byte_or_panic(b, unsafe { mem_static("bytes_filled") }, 12)
+    let buf = if n > 0 { sys.alloc(n) } else { unsafe { mem_addr(layout.U8_DANGLING) } }
+    var i = 0
+    while i < n {
+        unsafe { buf.offset(i).store_u8(x.as_u8()) }
+        i += 1
+    }
+    new_bytes(buf, n, n)
+}
+
+/// A list of each byte, boxed: boxes of their own, never the interned ones.
+export fn grt_bytes_to_list(v: addr) -> addr {
+    var n = 0
+    let p = window(v, n)
+    let l = alloc.take()
+    unsafe {
+        l.offset(layout.TAG).store_u8(layout.TAG_LIST.as_u8())
+        l.offset(layout.LIST_DISC).store_u8(layout.LIST_HEAP.as_u8())
+        let buf = if n > 0 { sys.alloc(8 * n) } else { mem_addr(layout.WORDS_DANGLING) }
+        var i = 0
+        while i < n {
+            let b = alloc.take()
+            b.offset(layout.TAG).store_u8(layout.TAG_I64.as_u8())
+            b.offset(layout.WORD_AT).store_i64(p.offset(i).load_u8().as_i64())
+            buf.offset(8 * i).store_addr(b)
+            i += 1
+        }
+        set_vec(l.offset(layout.LIST_VEC), buf, n, n)
+    }
+    l
+}
+
+// ----- bytes as text --------------------------------------------------------------
+
+fn at(p: addr, n: i64, i: i64) -> i64 {
+    if i >= n {
+        return 0
+    }
+    unsafe { p.offset(i).load_u8() }.as_i64()
+}
+
+fn cont(b: i64) -> bool {
+    b >= 128 and b < 192
+}
+
+/// How many bytes from `i` are the longest prefix of a valid sequence --
+/// all of one when the sequence is complete -- with whether it is complete:
+/// the step `Utf8Chunks` takes. 1 and incomplete for a byte no sequence
+/// begins with.
+fn step(p: addr, n: i64, i: i64, inout whole: bool) -> i64 {
+    let b = at(p, n, i)
+    whole = false
+    if b < 128 {
+        whole = true
+        return 1
+    }
+    let b1 = at(p, n, i + 1)
+    if b >= 0xc2 and b <= 0xdf {
+        if not cont(b1) {
+            return 1
+        }
+        whole = true
+        return 2
+    }
+    if b >= 0xe0 and b <= 0xef {
+        let ok = (b == 0xe0 and b1 >= 0xa0 and b1 <= 0xbf) or (b >= 0xe1 and b <= 0xec and cont(b1)) or (b == 0xed and b1 >= 0x80 and b1 <= 0x9f) or (b >= 0xee and cont(b1))
+        if not ok {
+            return 1
+        }
+        if not cont(at(p, n, i + 2)) {
+            return 2
+        }
+        whole = true
+        return 3
+    }
+    if b >= 0xf0 and b <= 0xf4 {
+        let ok = (b == 0xf0 and b1 >= 0x90 and b1 <= 0xbf) or (b >= 0xf1 and b <= 0xf3 and cont(b1)) or (b == 0xf4 and b1 >= 0x80 and b1 <= 0x8f)
+        if not ok {
+            return 1
+        }
+        if not cont(at(p, n, i + 2)) {
+            return 2
+        }
+        if not cont(at(p, n, i + 3)) {
+            return 3
+        }
+        whole = true
+        return 4
+    }
+    1
+}
+
+/// A string of the `n` bytes at `p`: their text when they are UTF-8, else
+/// with each invalid sequence -- as long as it could have been valid --
+/// one U+FFFD, as `from_utf8_lossy` makes it.
+pub fn text_of_bytes(p: addr, n: i64) -> addr {
+    if valid_utf8(p, n) {
+        return numstr.new_str(p, n)
+    }
+    let t = lossy(p, n)
+    let s = numstr.new_str(display.text_ptr(t), display.text_len(t))
+    display.text_free(t)
+    s
+}
+
+/// Whether the `n` bytes at `p` are UTF-8.
+pub fn valid_utf8(p: addr, n: i64) -> bool {
+    var i = 0
+    while i < n {
+        var whole = false
+        let k = step(p, n, i, whole)
+        if not whole {
+            return false
+        }
+        i += k
+    }
+    true
+}
+
+/// The `n` bytes at `p` with each invalid sequence one U+FFFD, in a text
+/// buffer (`display.text_new`) the caller frees.
+pub fn lossy(p: addr, n: i64) -> addr {
+    let t = display.text_new()
+    var i = 0
+    while i < n {
+        var whole = false
+        let k = step(p, n, i, whole)
+        if whole {
+            display.put(t, unsafe { p.offset(i) }, k)
+        } else {
+            display.put(t, unsafe { mem_static("\u{fffd}") }, 3)
+        }
+        i += k
+    }
+    t
+}
+
+export fn grt_bytes_to_str(v: addr) -> addr {
+    var n = 0
+    let p = window(v, n)
+    text_of_bytes(p, n)
+}
+
+export fn grt_bytes_slice_to_str(v: addr, from: i64, end: i64) -> addr {
+    var n = 0
+    let p = window(v, n)
+    if from < 0 or end < from or end > n {
+        slice_bounds(from, end, n)
+    }
+    text_of_bytes(unsafe { p.offset(from) }, end - from)
+}
+
+// ----- builders -----------------------------------------------------------------
+
+
+export fn grt_strbuf_new() -> addr {
+    let b = alloc.take()
+    unsafe {
+        b.offset(layout.TAG).store_u8(layout.TAG_STRBUF.as_u8())
+        set_vec(b.offset(layout.STRBUF_STRING), mem_addr(layout.U8_DANGLING), 0, 0)
+        b.offset(layout.STRBUF_CHARS).store_i64(0)
+    }
+    b
+}
+
+export fn grt_bytebuf_new() -> addr {
+    let b = alloc.take()
+    unsafe {
+        b.offset(layout.TAG).store_u8(layout.TAG_BYTEBUF.as_u8())
+        set_vec(b.offset(layout.BYTEBUF_VEC), mem_addr(layout.U8_DANGLING), 0, 0)
+    }
+    b
+}
+
+/// The `Vec` a builder grows: a `StrBuilder`'s `String`, a `ByteBuilder`'s
+/// bytes.
+fn builder_vec(b: addr) -> addr {
+    unsafe {
+        if tag(b) == layout.TAG_STRBUF {
+            return b.offset(layout.STRBUF_STRING)
+        }
+        b.offset(layout.BYTEBUF_VEC)
+    }
+}
+
+/// `b`, or a copy of it this caller alone holds -- its buffer exactly as
+/// long -- `b` released.
+fn own_builder(b: addr) -> addr {
+    unsafe {
+        if b.atomic_load_i64(Relaxed) == 1 {
+            return b
+        }
+    }
+    let t = tag(b)
+    if t != layout.TAG_STRBUF and t != layout.TAG_BYTEBUF {
+        unsafe { panic.say(mem_static("an append to a value that is not a builder"), mem_static_len("an append to a value that is not a builder")) }
+    }
+    let c = alloc.take()
+    unsafe {
+        sys.copy(c.offset(8), b.offset(8), 56)
+        let v = builder_vec(b)
+        let n = v.offset(layout.VEC_LEN).load_i64()
+        let buf = if n > 0 { sys.alloc(n) } else { mem_addr(layout.U8_DANGLING) }
+        sys.copy(buf, v.offset(layout.VEC_PTR).load_addr(), n)
+        set_vec(builder_vec(c), buf, n, n)
+    }
+    val.dec(b)
+    c
+}
+
+/// Appends `n` bytes at `p` to a builder this caller alone holds, grown as
+/// `RawVec` grows a `Vec<u8>`; a `StrBuilder` counts `chars` more
+/// characters. Past what memory can hold is a panic.
+fn append(b: addr, p: addr, n: i64, chars: i64) {
+    let t = tag(b)
+    if t != layout.TAG_STRBUF and t != layout.TAG_BYTEBUF {
+        unsafe { panic.say(mem_static("an append to a value that is not a builder"), mem_static_len("an append to a value that is not a builder")) }
+    }
+    let v = builder_vec(b)
+    unsafe {
+        let len = v.offset(layout.VEC_LEN).load_i64()
+        if len + n > MAX_ALLOC {
+            let m = display.text_new()
+            display.put(m, mem_static("a builder would need more memory than one can hold ("), mem_static_len("a builder would need more memory than one can hold ("))
+            display.put_int(m, len + n)
+            display.put(m, mem_static(" bytes)"), 7)
+            say_text(m)
+        }
+        let cap = v.offset(layout.VEC_CAP).load_i64()
+        if len + n > cap {
+            var want = 2 * cap
+            if want < len + n {
+                want = len + n
+            }
+            if want < 8 {
+                want = 8
+            }
+            let buf = if cap == 0 { sys.alloc(want) } else { sys.grow(v.offset(layout.VEC_PTR).load_addr(), want) }
+            v.offset(layout.VEC_PTR).store_addr(buf)
+            v.offset(layout.VEC_CAP).store_i64(want)
+        }
+        sys.copy(v.offset(layout.VEC_PTR).load_addr().offset(len), p, n)
+        v.offset(layout.VEC_LEN).store_i64(len + n)
+        if t == layout.TAG_STRBUF {
+            b.offset(layout.STRBUF_CHARS).store_i64(b.offset(layout.STRBUF_CHARS).load_i64() + chars)
+        }
+    }
+}
+
+/// `b.push_str(s)`, `s` borrowed.
+export fn grt_builder_push_str(b: addr, s: addr) -> addr {
+    if tag(s) != layout.TAG_STR {
+        unsafe { panic.say(mem_static("push_str expects a str"), mem_static_len("push_str expects a str")) }
+    }
+    let chars = strread.length(s)
+    let t = own_builder(b)
+    var n = 0
+    let p = strread.text_of(s, n)
+    append(t, p, n, chars)
+    t
+}
+
+export fn grt_bytebuf_push_byte(b: addr, x: i64) -> addr {
+    let byte = byte_or_panic(x, unsafe { mem_static("push_byte") }, 9)
+    let t = own_builder(b)
+    let one = sys.alloc(8)
+    unsafe { one.store_u8(byte.as_u8()) }
+    append(t, one, 1, 1)
+    sys.dealloc(one)
+    t
+}
+
+export fn grt_bytebuf_push_bytes(b: addr, bs: addr) -> addr {
+    var n = 0
+    let p = window(bs, n)
+    let t = own_builder(b)
+    append(t, p, n, n)
+    t
+}
+
+/// Characters in a `StrBuilder`, bytes in a `ByteBuilder`.
+export fn grt_builder_len(b: addr) -> i64 {
+    unsafe {
+        let t = tag(b)
+        if t == layout.TAG_STRBUF {
+            return b.offset(layout.STRBUF_CHARS).load_i64()
+        }
+        if t == layout.TAG_BYTEBUF {
+            return b.offset(layout.BYTEBUF_VEC).offset(layout.VEC_LEN).load_i64()
+        }
+        panic.say(mem_static("len on a value that is not a builder"), mem_static_len("len on a value that is not a builder"))
+        0
+    }
+}
+
+export fn grt_bytebuf_set(b: addr, i: i64, x: i64) -> addr {
+    let n = grt_builder_len(b)
+    if i < 0 or i >= n {
+        out_of_bounds(i, n)
+    }
+    let byte = byte_or_panic(x, unsafe { mem_static("set") }, 3)
+    let t = own_builder(b)
+    if tag(t) == layout.TAG_BYTEBUF {
+        unsafe { t.offset(layout.BYTEBUF_VEC).offset(layout.VEC_PTR).load_addr().offset(i).store_u8(byte.as_u8()) }
+    }
+    t
+}
+
+export fn grt_bytebuf_at(b: addr, i: i64) -> i64 {
+    if tag(b) != layout.TAG_BYTEBUF {
+        unsafe { panic.say(mem_static("at on a value that is not a byte builder"), mem_static_len("at on a value that is not a byte builder")) }
+    }
+    let v = unsafe { b.offset(layout.BYTEBUF_VEC) }
+    let n = unsafe { v.offset(layout.VEC_LEN).load_i64() }
+    if i < 0 or i >= n {
+        out_of_bounds(i, n)
+    }
+    unsafe { v.offset(layout.VEC_PTR).load_addr().offset(i).load_u8() }.as_i64()
+}
+
+/// What a builder holds as a `str`: a `StrBuilder`'s text, a
+/// `ByteBuilder`'s bytes as text, invalid sequences replaced.
+export fn grt_builder_to_str(b: addr) -> addr {
+    let t = tag(b)
+    unsafe {
+        if t == layout.TAG_STRBUF {
+            let v = b.offset(layout.STRBUF_STRING)
+            return numstr.new_str(v.offset(layout.VEC_PTR).load_addr(), v.offset(layout.VEC_LEN).load_i64())
+        }
+        if t == layout.TAG_BYTEBUF {
+            let v = b.offset(layout.BYTEBUF_VEC)
+            return text_of_bytes(v.offset(layout.VEC_PTR).load_addr(), v.offset(layout.VEC_LEN).load_i64())
+        }
+        panic.say(mem_static("to_str on a value that is not a builder"), mem_static_len("to_str on a value that is not a builder"))
+        mem_addr(0)
+    }
+}
+
+export fn grt_bytebuf_to_bytes(b: addr) -> addr {
+    if tag(b) != layout.TAG_BYTEBUF {
+        unsafe { panic.say(mem_static("to_bytes on a value that is not a byte builder"), mem_static_len("to_bytes on a value that is not a byte builder")) }
+    }
+    let v = unsafe { b.offset(layout.BYTEBUF_VEC) }
+    unsafe { bytes_copy(v.offset(layout.VEC_PTR).load_addr(), v.offset(layout.VEC_LEN).load_i64()) }
+}

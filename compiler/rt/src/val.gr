@@ -5,20 +5,19 @@
 // than one thread), counted as the Rust runtime counts it: an interned or
 // literal value (`IMMORTAL`) and one an open region owns (`ARENA`) are left
 // alone, `inc` is relaxed and `dec` releases on the way down. A box whose
-// count is `POISON` was freed by the poisoned runtime, and touching it is the
+// count is `POISON` was freed by the poisoned build, and touching it is the
 // panic the Rust runtime gives there; no live box holds that count, so the
 // check costs nothing else.
 //
 // What happens when a count reaches zero is `release.gr`'s: the walk over
-// what the box was the last owner of, here for the payloads whose layout
-// has moved and the Rust runtime's for the rest, and the box handed back to
-// the Rust runtime's pool and live count, the state its own allocations
-// share (docs/self-hosting.md §6.7, §6.9).
+// what the box was the last owner of, and the box back to this runtime's
+// allocator (docs/self-hosting.md §6.7, §6.9, §6.11).
 import layout
 import panic
 import release
 
-export fn grt_val_inc(v: addr) {
+/// One more reference to `v`.
+pub fn inc(v: addr) {
     unsafe {
         if v.as_i64() == 0 {
             return
@@ -34,7 +33,8 @@ export fn grt_val_inc(v: addr) {
     }
 }
 
-export fn grt_val_dec(v: addr) {
+/// One fewer reference to `v`, and its release when that was the last.
+pub fn dec(v: addr) {
     unsafe {
         if v.as_i64() == 0 {
             return
@@ -52,4 +52,12 @@ export fn grt_val_dec(v: addr) {
         // The last reference: nothing else can reach the box.
         release.walk(v)
     }
+}
+
+export fn grt_val_inc(v: addr) {
+    inc(v)
+}
+
+export fn grt_val_dec(v: addr) {
+    dec(v)
 }

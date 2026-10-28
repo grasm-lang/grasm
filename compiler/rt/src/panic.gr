@@ -4,53 +4,39 @@
 // <message>` to stderr and exits 101. The buffers it flushes are the Rust
 // runtime's, and every Rust function still linked writes and panics through
 // them, so the way out stays the Rust runtime's `grasm_panic_msg` until the
-// output buffers move (docs/self-hosting.md §6.7, "state"); what moves here
-// is which panics there are and what each says.
-import text
-import sys
-
+// output buffers move (docs/self-hosting.md §6.7, "state"; §6.11); what moves
+// here is which panics there are and what each says. Each message is static
+// bytes (`mem_static`), read-only and NUL-terminated, so saying it allocates
+// nothing -- a runtime out of memory can still say so.
 extern fn grasm_panic_msg(p: addr, n: i64)
 
-/// Room for any of `text`'s messages. Never freed: nothing returns from a
-/// panic.
-fn buf() -> addr {
-    sys.alloc(64)
+/// Panics with the `n` bytes of text at `p`, static bytes (`mem_static`).
+pub fn say(p: addr, n: i64) {
+    unsafe { grasm_panic_msg(p, n) }
 }
 
 pub fn div_zero() {
-    let b = buf()
-    let n = text.div_zero(b)
-    unsafe { grasm_panic_msg(b, n) }
+    unsafe { say(mem_static("division by zero"), mem_static_len("division by zero")) }
 }
 
 pub fn rem_zero() {
-    let b = buf()
-    let n = text.rem_zero(b)
-    unsafe { grasm_panic_msg(b, n) }
+    unsafe { say(mem_static("remainder by zero"), mem_static_len("remainder by zero")) }
 }
 
 pub fn assert_failed() {
-    let b = buf()
-    let n = text.assert_failed(b)
-    unsafe { grasm_panic_msg(b, n) }
+    unsafe { say(mem_static("assertion failed"), mem_static_len("assertion failed")) }
 }
 
 pub fn neg_pow() {
-    let b = buf()
-    let n = text.neg_pow(b)
-    unsafe { grasm_panic_msg(b, n) }
+    unsafe { say(mem_static("negative integer exponent (use floats)"), mem_static_len("negative integer exponent (use floats)")) }
 }
 
 pub fn uaf_inc() {
-    let b = buf()
-    let n = text.uaf_inc(b)
-    unsafe { grasm_panic_msg(b, n) }
+    unsafe { say(mem_static("use after free: inc on a value already released"), mem_static_len("use after free: inc on a value already released")) }
 }
 
 pub fn uaf_dec() {
-    let b = buf()
-    let n = text.uaf_dec(b)
-    unsafe { grasm_panic_msg(b, n) }
+    unsafe { say(mem_static("use after free: dec on a value already released"), mem_static_len("use after free: dec on a value already released")) }
 }
 
 export fn grt_panic_div_zero() {
@@ -70,19 +56,13 @@ export fn grt_panic_neg_pow() {
 }
 
 pub fn byte_len_not_str() {
-    let b = buf()
-    let n = text.byte_len_not_str(b)
-    unsafe { grasm_panic_msg(b, n) }
+    unsafe { say(mem_static("byte_len on non-string"), mem_static_len("byte_len on non-string")) }
 }
 
 pub fn expected_str() {
-    let b = buf()
-    let n = text.expected_str(b)
-    unsafe { grasm_panic_msg(b, n) }
+    unsafe { say(mem_static("expected a string"), mem_static_len("expected a string")) }
 }
 
 pub fn len_not_str() {
-    let b = buf()
-    let n = text.len_not_str(b)
-    unsafe { grasm_panic_msg(b, n) }
+    unsafe { say(mem_static("len on non-string"), mem_static_len("len on non-string")) }
 }

@@ -1,0 +1,182 @@
+// Map keys as the table stores them (docs/self-hosting.md §6.11): a
+// `MapKey` of 24 bytes in each entry, its kind in its first word -- what a
+// key is, its text, and their order, which is the order iteration presents
+// a map in ([E-MAP-ORDER]). `maps.gr` searches and changes tables of them;
+// `display.gr` shows a map through them.
+import layout
+import sys
+import release
+
+extern fn memcmp(a: addr, b: addr, n: i64) -> i32
+
+/// A stored key's kind: the variant's index in `MapKey` -- `Bool` 0, `I64` 1,
+/// `Str` 2, `U64` 3, `Tuple` 4 -- read from its first word, which a long
+/// string's `String` fills with its capacity.
+pub fn kind(k: addr) -> i64 {
+    let w = unsafe { k.load_i64() }
+    if w >= 0 or w == layout.KEYSTR_INLINE {
+        return 2
+    }
+    if w == layout.MAPKEY_BOOL {
+        return 0
+    }
+    if w == layout.MAPKEY_I64 {
+        return 1
+    }
+    if w == layout.MAPKEY_U64 {
+        return 3
+    }
+    4
+}
+
+/// A stored string key's text, its length in `n`.
+pub fn key_text(k: addr, inout n: i64) -> addr {
+    unsafe {
+        if k.load_i64() == layout.KEYSTR_INLINE {
+            n = k.offset(layout.KEYSTR_LEN).load_u8().as_i64()
+            return k.offset(layout.KEYSTR_BYTES)
+        }
+        let s = k.offset(layout.KEYSTR_STRING)
+        n = s.offset(layout.VEC_LEN).load_i64()
+        s.offset(layout.VEC_PTR).load_addr()
+    }
+}
+
+/// Stored keys `a` and `b` in `MapKey`'s derived order: by variant (`Bool`,
+/// `I64`, `Str`, `U64`, `Tuple`), then false before true, integers signed,
+/// text by its bytes then its length, `u64`s unsigned, and tuples component
+/// by component, then by length. -1, 0 or 1.
+pub fn key_cmp(a: addr, b: addr) -> i64 {
+    // Pairs to compare, and after a tuple's components the pair of lengths
+    // (marked by a third word of 1) to settle it when they all agree.
+    var stack = unsafe { mem_addr(0) }
+    var cap = 0
+    var n = 0
+    release.push(stack, cap, n, a)
+    release.push(stack, cap, n, b)
+    release.push(stack, cap, n, unsafe { mem_addr(0) })
+    var out = 0
+    while n > 0 and out == 0 {
+        let mark = unsafe { stack.offset(8 * (n - 1)).load_i64() }
+        let y = unsafe { stack.offset(8 * (n - 2)).load_addr() }
+        let x = unsafe { stack.offset(8 * (n - 3)).load_addr() }
+        n -= 3
+        if mark == 1 {
+            let lx = unsafe { x.as_i64() }
+            let ly = unsafe { y.as_i64() }
+            out = if lx < ly { -1 } else if lx > ly { 1 } else { 0 }
+        } else {
+            let kx = kind(x)
+            let ky = kind(y)
+            if kx != ky {
+                out = if kx < ky { -1 } else { 1 }
+            } else if kx == 0 {
+                let bx = unsafe { x.offset(layout.MAPKEY_BOOL_AT).load_u8() }.as_i64()
+                let by = unsafe { y.offset(layout.MAPKEY_BOOL_AT).load_u8() }.as_i64()
+                out = if bx < by { -1 } else if bx > by { 1 } else { 0 }
+            } else if kx == 1 {
+                let ix = unsafe { x.offset(layout.MAPKEY_AT).load_i64() }
+                let iy = unsafe { y.offset(layout.MAPKEY_AT).load_i64() }
+                out = if ix < iy { -1 } else if ix > iy { 1 } else { 0 }
+            } else if kx == 3 {
+                let ux = unsafe { x.offset(layout.MAPKEY_AT).load_u64() }
+                let uy = unsafe { y.offset(layout.MAPKEY_AT).load_u64() }
+                out = if ux < uy { -1 } else if ux > uy { 1 } else { 0 }
+            } else if kx == 2 {
+                var nx = 0
+                var ny = 0
+                let px = key_text(x, nx)
+                let py = key_text(y, ny)
+                let m = if nx < ny { nx } else { ny }
+                let c = if m == 0 { 0 } else { unsafe { memcmp(px, py, m) }.as_i64() }
+                out = if c < 0 { -1 } else if c > 0 { 1 } else if nx < ny { -1 } else if nx > ny { 1 } else { 0 }
+            } else {
+                let lx = unsafe { x.offset(layout.MAPKEY_TUPLE_LEN).load_i64() }
+                let ly = unsafe { y.offset(layout.MAPKEY_TUPLE_LEN).load_i64() }
+                let ax = unsafe { x.offset(layout.MAPKEY_TUPLE_PTR).load_addr() }
+                let ay = unsafe { y.offset(layout.MAPKEY_TUPLE_PTR).load_addr() }
+                release.push(stack, cap, n, unsafe { mem_addr(lx) })
+                release.push(stack, cap, n, unsafe { mem_addr(ly) })
+                release.push(stack, cap, n, unsafe { mem_addr(1) })
+                let m = if lx < ly { lx } else { ly }
+                var i = m - 1
+                while i >= 0 {
+                    release.push(stack, cap, n, unsafe { ax.offset(i * layout.MAPKEY_SIZE) })
+                    release.push(stack, cap, n, unsafe { ay.offset(i * layout.MAPKEY_SIZE) })
+                    release.push(stack, cap, n, unsafe { mem_addr(0) })
+                    i -= 1
+                }
+            }
+        }
+    }
+    if cap > 0 {
+        sys.dealloc(stack)
+    }
+    out
+}
+
+/// The entries of `m` (their addresses), in key order, `n` of them: merge
+/// sorted, which is what any sort of keys that are all different gives.
+pub fn sorted(m: addr, n: i64) -> addr {
+    let ctrl = ctrl_of(m)
+    let mask = mask_of(m)
+    var a = sys.alloc(8 * n + 8)
+    var b = sys.alloc(8 * n + 8)
+    var k = 0
+    if n > 0 {
+        var i = 0
+        while i <= mask {
+            if byte(ctrl, i) < 128 {
+                unsafe { a.offset(8 * k).store_addr(entry(ctrl, i)) }
+                k += 1
+            }
+            i += 1
+        }
+    }
+    var width = 1
+    while width < n {
+        var lo = 0
+        while lo < n {
+            let mid = if lo + width < n { lo + width } else { n }
+            let hi = if lo + 2 * width < n { lo + 2 * width } else { n }
+            var x = lo
+            var y = mid
+            var o = lo
+            while o < hi {
+                let take_x = y >= hi or (x < mid and key_cmp(unsafe { a.offset(8 * x).load_addr() }, unsafe { a.offset(8 * y).load_addr() }) <= 0)
+                if take_x {
+                    unsafe { b.offset(8 * o).store_addr(a.offset(8 * x).load_addr()) }
+                    x += 1
+                } else {
+                    unsafe { b.offset(8 * o).store_addr(a.offset(8 * y).load_addr()) }
+                    y += 1
+                }
+                o += 1
+            }
+            lo = hi
+        }
+        let t = a
+        a = b
+        b = t
+        width = width * 2
+    }
+    sys.dealloc(b)
+    a
+}
+
+/// Bucket `i`'s entry: they count down from the control bytes.
+pub fn entry(ctrl: addr, i: i64) -> addr {
+    unsafe { ctrl.offset(-(i + 1) * layout.MAP_ENTRY) }
+}
+
+fn ctrl_of(m: addr) -> addr {
+    unsafe { m.offset(layout.MAP_CTRL).load_addr() }
+}
+
+fn mask_of(m: addr) -> i64 {
+    unsafe { m.offset(layout.MAP_MASK).load_i64() }
+}
+
+fn byte(ctrl: addr, i: i64) -> i64 {
+    unsafe { ctrl.offset(i).load_u8() }.as_i64()
+}

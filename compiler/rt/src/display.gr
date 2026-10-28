@@ -1,0 +1,590 @@
+// Values as text (docs/self-hosting.md §6.11): what `print` writes for a
+// boxed value and what interpolating one makes ([L-DISPLAY]), byte for byte
+// the Rust runtime's `display` -- `grasm_out_val`, `grasm_str_from_val`,
+// `grasm_out_ref` and `grasm_panic_value`.
+//
+// Lists `[a, b]`, tuples `(a, b)`, maps `{k: v}` in key order, structs
+// `Name{f: v}` (a scalar field shown as the value it is), variants `Name` or
+// `Name(a, b)`, ranges `a..b` and `a..=b`, `bytes` and byte builders in hex
+// after `0x`, references `ref#slot.generation`, function values `<fn name>`
+// or `<closure>`, handlers `EffectHandler{op: <closure>}`, a list of value
+// structs as the structs it holds; strings as their text, with no quotes.
+// The Rust runtime recurses and gives up past its stack budget with
+// "stack overflow: recursion too deep"; this keeps what it has still to
+// write on a list of its own, so a value nested deeper than that is written
+// out (docs/known-issues.md).
+import layout
+import sys
+import fmt
+import strread
+import keys
+import release
+import numstr
+
+extern fn grasm_out_text(p: addr, n: i64)
+extern fn grasm_panic_msg(p: addr, n: i64)
+
+// ----- text being made: a block of three words, its bytes, length, room
+
+pub fn text_new() -> addr {
+    let b = sys.alloc(24)
+    unsafe {
+        b.store_addr(sys.alloc(64))
+        b.offset(8).store_i64(0)
+        b.offset(16).store_i64(64)
+    }
+    b
+}
+
+pub fn text_free(b: addr) {
+    sys.dealloc(unsafe { b.load_addr() })
+    sys.dealloc(b)
+}
+
+pub fn text_ptr(b: addr) -> addr {
+    unsafe { b.load_addr() }
+}
+
+pub fn text_len(b: addr) -> i64 {
+    unsafe { b.offset(8).load_i64() }
+}
+
+/// Room for `n` more bytes; where they go.
+fn text_room(b: addr, n: i64) -> addr {
+    unsafe {
+        let len = b.offset(8).load_i64()
+        var cap = b.offset(16).load_i64()
+        if len + n > cap {
+            while len + n > cap {
+                cap = cap * 2
+            }
+            b.store_addr(sys.grow(b.load_addr(), cap))
+            b.offset(16).store_i64(cap)
+        }
+        b.load_addr().offset(len)
+    }
+}
+
+pub fn put(b: addr, p: addr, n: i64) {
+    if n > 0 {
+        sys.copy(text_room(b, n), p, n)
+        unsafe { b.offset(8).store_i64(text_len(b) + n) }
+    }
+}
+
+pub fn put_byte(b: addr, c: i64) {
+    unsafe {
+        text_room(b, 1).store_u8(c.as_u8())
+        b.offset(8).store_i64(text_len(b) + 1)
+    }
+}
+
+pub fn put_int(b: addr, v: i64) {
+    let at = text_room(b, fmt.INT_MAX)
+    let n = fmt.i64_text(v, at)
+    unsafe { b.offset(8).store_i64(text_len(b) + n) }
+}
+
+fn put_unsigned(b: addr, v: i64) {
+    let at = text_room(b, fmt.INT_MAX)
+    let n = fmt.u64_text(v.as_u64(), at)
+    unsafe { b.offset(8).store_i64(text_len(b) + n) }
+}
+
+fn put_float(b: addr, bits: i64) {
+    let at = text_room(b, fmt.F64_MAX)
+    let n = fmt.f64_text(bits.from_bits(), at)
+    unsafe { b.offset(8).store_i64(text_len(b) + n) }
+}
+
+fn put_bool(b: addr, v: bool) {
+    let at = text_room(b, 8)
+    let n = fmt.bool_text(v, at)
+    unsafe { b.offset(8).store_i64(text_len(b) + n) }
+}
+
+/// A reference as the slot it names: `ref#index.generation`.
+fn put_ref(b: addr, r: i64) {
+    unsafe { put(b, mem_static("ref#"), mem_static_len("ref#")) }
+    put_int(b, r.shr(32).bit_and(0xffff_ffff))
+    put_byte(b, 46)
+    put_int(b, r.bit_and(0xffff_ffff))
+}
+
+/// `0x` and each byte as two lowercase hex digits.
+fn put_hex(b: addr, p: addr, n: i64) {
+    put_byte(b, 48)
+    put_byte(b, 120)
+    var i = 0
+    while i < n {
+        let x = unsafe { p.offset(i).load_u8() }.as_i64()
+        put_byte(b, hex_digit(x.ushr(4)))
+        put_byte(b, hex_digit(x.bit_and(15)))
+        i += 1
+    }
+}
+
+fn hex_digit(d: i64) -> i64 {
+    if d < 10 { 48 + d } else { 87 + d }
+}
+
+/// A `Vec`'s or `String`'s bytes, its three words at `v`.
+fn put_vec(b: addr, v: addr) {
+    unsafe { put(b, v.offset(layout.VEC_PTR).load_addr(), v.offset(layout.VEC_LEN).load_i64()) }
+}
+
+/// A `&str`'s text, its two words at `s`.
+fn put_strref(b: addr, s: addr) {
+    unsafe { put(b, s.offset(layout.STRREF_PTR).load_addr(), s.offset(layout.STRREF_LEN).load_i64()) }
+}
+
+/// A scalar's bits shown as the value its kind says, as `box_field_bits` and
+/// then `display` would: a float, a bool, a reference, a unit, a `u64`, and
+/// anything else an integer.
+fn put_field_bits(b: addr, kind: i64, bits: i64) {
+    if kind == layout.FK_F64 {
+        put_float(b, bits)
+    } else if kind == layout.FK_BOOL {
+        put_bool(b, bits != 0)
+    } else if kind == layout.FK_REF {
+        put_ref(b, bits)
+    } else if kind == layout.FK_UNIT {
+        unsafe { put(b, mem_static("()"), 2) }
+    } else if kind == layout.FK_U64 {
+        put_unsigned(b, bits)
+    } else {
+        put_int(b, bits)
+    }
+}
+
+/// A scalar list's element shown as `scalar_display` shows it.
+pub fn put_scalar(b: addr, kind: i64, bits: i64) {
+    if kind == layout.SK_F64 {
+        put_float(b, bits)
+    } else if kind == layout.SK_BOOL {
+        put_bool(b, bits != 0)
+    } else if kind == layout.SK_REF {
+        put_ref(b, bits)
+    } else if kind == layout.SK_U64 {
+        put_unsigned(b, bits)
+    } else {
+        put_int(b, bits)
+    }
+}
+
+// ----- what is still to write: a list of (what, a, b) triples, written
+// from the end, so each thing's parts are pushed in reverse
+
+/// A value, its box at `a`.
+let W_VAL = 0
+/// `b` bytes of text at `a`.
+let W_TEXT = 1
+/// A stored map key at `a`, shown as its boxed value would be.
+let W_KEY = 2
+/// A field of a value struct: its kind `b`, its words at `a`; its type's
+/// element descriptor (for a list of values) under it.
+let W_WORDS = 3
+
+fn task(inout st: addr, inout cap: i64, inout n: i64, what: i64, a: addr, b: i64) {
+    release.push(st, cap, n, unsafe { mem_addr(what) })
+    release.push(st, cap, n, a)
+    release.push(st, cap, n, unsafe { mem_addr(b) })
+}
+
+fn text(inout st: addr, inout cap: i64, inout n: i64, p: addr, len: i64) {
+    task(st, cap, n, W_TEXT, p, len)
+}
+
+/// Pushes `count` things (`kind` with `a` = base + i * stride) and the
+/// separators between them, then the opener -- in reverse.
+fn items(inout st: addr, inout cap: i64, inout n: i64, what: i64, base: addr, stride: i64, count: i64, deref: bool) {
+    var i = count - 1
+    while i >= 0 {
+        let at = unsafe { base.offset(i * stride) }
+        let a = if deref { unsafe { at.load_addr() } } else { at }
+        task(st, cap, n, what, a, 0)
+        if i > 0 {
+            unsafe { text(st, cap, n, mem_static(", "), 2) }
+        }
+        i -= 1
+    }
+}
+
+/// Writes value `v` into `b`.
+fn show(b: addr, v: addr) {
+    var st = unsafe { mem_addr(0) }
+    var cap = 0
+    var n = 0
+    task(st, cap, n, W_VAL, v, 0)
+    while n > 0 {
+        let what = unsafe { st.offset(8 * (n - 3)).load_i64() }
+        let a = unsafe { st.offset(8 * (n - 2)).load_addr() }
+        let c = unsafe { st.offset(8 * (n - 1)).load_i64() }
+        n -= 3
+        if what == W_TEXT {
+            put(b, a, c)
+        } else if what == W_KEY {
+            show_key(b, a, st, cap, n)
+        } else if what == W_WORDS {
+            show_vals(b, a, st, cap, n)
+        } else {
+            show_one(b, a, st, cap, n)
+        }
+    }
+    if cap > 0 {
+        sys.dealloc(st)
+    }
+}
+
+/// One stored map key: a bool, an integer, a `u64`, text, or a tuple.
+fn show_key(b: addr, k: addr, inout st: addr, inout cap: i64, inout n: i64) {
+    unsafe {
+        let w = k.load_i64()
+        if w >= 0 or w == layout.KEYSTR_INLINE {
+            if w == layout.KEYSTR_INLINE {
+                put(b, k.offset(layout.KEYSTR_BYTES), k.offset(layout.KEYSTR_LEN).load_u8().as_i64())
+            } else {
+                put_vec(b, k.offset(layout.KEYSTR_STRING))
+            }
+        } else if w == layout.MAPKEY_BOOL {
+            put_bool(b, k.offset(layout.MAPKEY_BOOL_AT).load_u8().as_i64() != 0)
+        } else if w == layout.MAPKEY_I64 {
+            put_int(b, k.offset(layout.MAPKEY_AT).load_i64())
+        } else if w == layout.MAPKEY_U64 {
+            put_unsigned(b, k.offset(layout.MAPKEY_AT).load_i64())
+        } else {
+            text(st, cap, n, mem_static(")"), 1)
+            items(st, cap, n, W_KEY, k.offset(layout.MAPKEY_TUPLE_PTR).load_addr(), layout.MAPKEY_SIZE, k.offset(layout.MAPKEY_TUPLE_LEN).load_i64(), false)
+            text(st, cap, n, mem_static("("), 1)
+        }
+    }
+}
+
+/// A list of value structs, `[Name{f: v, ..}, ..]`: pushed element by
+/// element, each field by its kind.
+fn show_vals(b: addr, v: addr, inout st: addr, inout cap: i64, inout n: i64) {
+    unsafe {
+        let ty = v.offset(layout.VALS_TY).load_addr()
+        let kp = ty.offset(layout.STRUCTTY_KINDS).offset(layout.VEC_PTR).load_addr()
+        let nk = ty.offset(layout.STRUCTTY_KINDS).offset(layout.VEC_LEN).load_i64()
+        let names = ty.offset(layout.STRUCTTY_FIELDS).offset(layout.VEC_PTR).load_addr()
+        let nnames = ty.offset(layout.STRUCTTY_FIELDS).offset(layout.VEC_LEN).load_i64()
+        let elems = ty.offset(layout.STRUCTTY_ELEMS).offset(layout.VEC_PTR).load_addr()
+        let signed = release.width_of(kp, 1, nk)
+        let width = if signed < 0 { -signed } else { signed }
+        let w = if width < 1 { 1 } else { width }
+        let words = v.offset(layout.VALS_VEC).offset(layout.VEC_PTR).load_addr()
+        let nwords = v.offset(layout.VALS_VEC).offset(layout.VEC_LEN).load_i64()
+        let count = (nwords + w - 1) / w
+        text(st, cap, n, mem_static("]"), 1)
+        var e = count - 1
+        while e >= 0 {
+            let el = words.offset(8 * w * e)
+            text(st, cap, n, mem_static("}"), 1)
+            // Field by field, from the last: each `name: value`.
+            var at = w
+            var i = nk - 1
+            while i >= 0 {
+                let k = release.kind_at(kp, 1, nk, i)
+                at -= release.kind_width(k)
+                field(st, cap, n, el.offset(8 * at), k, elems.offset(8 * i).load_addr())
+                text(st, cap, n, mem_static(": "), 2)
+                if i < nnames {
+                    text(st, cap, n, names.offset(16 * i).load_addr(), names.offset(16 * i + 8).load_i64())
+                } else {
+                    text(st, cap, n, mem_static("?"), 1)
+                }
+                if i > 0 {
+                    text(st, cap, n, mem_static(", "), 2)
+                }
+                i -= 1
+            }
+            text(st, cap, n, mem_static("\{"), 1)
+            put_later_strref(st, cap, n, ty.offset(layout.STRUCTTY_NAME))
+            if e > 0 {
+                text(st, cap, n, mem_static(", "), 2)
+            }
+            e -= 1
+        }
+        text(st, cap, n, mem_static("["), 1)
+    }
+}
+
+/// A `&str` at `s`, to be written in its turn.
+fn put_later_strref(inout st: addr, inout cap: i64, inout n: i64, s: addr) {
+    unsafe { text(st, cap, n, s.offset(layout.STRREF_PTR).load_addr(), s.offset(layout.STRREF_LEN).load_i64()) }
+}
+
+/// A value struct's field of kind `k`, its words at `f`, pushed: a box, an
+/// inline string's text, an inline list of integers `[1, 2]`, an inline
+/// list of values `[n values]`, or a scalar shown as its kind's value.
+fn field(inout st: addr, inout cap: i64, inout n: i64, f: addr, k: i64, elem: addr) {
+    unsafe {
+        if k == layout.FK_BOXED {
+            task(st, cap, n, W_VAL, f.load_addr(), 0)
+        } else if k == layout.FK_INSTR {
+            text(st, cap, n, f.offset(layout.VEC_PTR).load_addr(), f.offset(layout.VEC_LEN).load_i64())
+        } else {
+            // Written now, into text of its own that the list of things to
+            // write then holds -- freed when the whole value is written.
+            let t = text_new()
+            if k == layout.FK_INLIST {
+                put_byte(t, 91)
+                let p = f.offset(layout.VEC_PTR).load_addr()
+                let len = f.offset(layout.VEC_LEN).load_i64()
+                var i = 0
+                while i < len {
+                    if i > 0 {
+                        put(t, mem_static(", "), 2)
+                    }
+                    put_int(t, p.offset(8 * i).load_i64())
+                    i += 1
+                }
+                put_byte(t, 93)
+            } else if k == layout.FK_INVALS {
+                let en = elem.offset(layout.DESC_NFIELDS).load_i64()
+                let ew = release.width_of(elem.offset(layout.DESC_FIELDS + layout.DESC_FIELD_KIND), layout.DESC_FIELD_SIZE, en)
+                let ewidth = if ew < 0 { -ew } else { ew }
+                put_byte(t, 91)
+                put_int(t, f.offset(layout.VEC_LEN).load_i64() / (if ewidth < 1 { 1 } else { ewidth }))
+                put(t, mem_static(" values]"), mem_static_len(" values]"))
+            } else {
+                put_field_bits(t, k, f.load_i64())
+            }
+            keep(t)
+            text(st, cap, n, text_ptr(t), text_len(t))
+        }
+    }
+}
+
+thread_local KEPT: i64
+thread_local KEPT_N: i64
+thread_local KEPT_CAP: i64
+
+/// Holds a piece of text written ahead of its turn until `forget` frees it.
+fn keep(t: addr) {
+    unsafe {
+        var arr = mem_tls(KEPT).load_addr()
+        var c = mem_tls(KEPT_CAP).load_i64()
+        var k = mem_tls(KEPT_N).load_i64()
+        release.push(arr, c, k, t)
+        mem_tls(KEPT).store_addr(arr)
+        mem_tls(KEPT_CAP).store_i64(c)
+        mem_tls(KEPT_N).store_i64(k)
+    }
+}
+
+fn forget() {
+    unsafe {
+        let arr = mem_tls(KEPT).load_addr()
+        var k = mem_tls(KEPT_N).load_i64()
+        while k > 0 {
+            k -= 1
+            text_free(arr.offset(8 * k).load_addr())
+        }
+        mem_tls(KEPT_N).store_i64(0)
+    }
+}
+
+/// One value: a scalar or text written now; anything with parts pushed.
+fn show_one(b: addr, v: addr, inout st: addr, inout cap: i64, inout n: i64) {
+    unsafe {
+        let tag = v.offset(layout.TAG).load_u8().as_i64()
+        if tag == layout.TAG_I64 {
+            put_int(b, v.offset(layout.WORD_AT).load_i64())
+        } else if tag == layout.TAG_U64 {
+            put_unsigned(b, v.offset(layout.WORD_AT).load_i64())
+        } else if tag == layout.TAG_F64 {
+            put_float(b, v.offset(layout.WORD_AT).load_i64())
+        } else if tag == layout.TAG_BOOL {
+            put_bool(b, v.offset(layout.BOOL_AT).load_u8().as_i64() != 0)
+        } else if tag == layout.TAG_STR {
+            var len = 0
+            let p = strread.text_of(v, len)
+            put(b, p, len)
+        } else if tag == layout.TAG_UNIT {
+            put(b, mem_static("()"), 2)
+        } else if tag == layout.TAG_REF {
+            put_ref(b, v.offset(layout.WORD_AT).load_i64())
+        } else if tag == layout.TAG_RANGE {
+            put_int(b, v.offset(layout.RANGE_START).load_i64())
+            if v.offset(layout.RANGE_INCL).load_u8().as_i64() != 0 {
+                put(b, mem_static("..="), 3)
+            } else {
+                put(b, mem_static(".."), 2)
+            }
+            put_int(b, v.offset(layout.RANGE_END).load_i64())
+        } else if tag == layout.TAG_BYTES {
+            put_hex(b, v.offset(layout.BYTES_PTR).load_addr(), v.offset(layout.BYTES_LEN).load_i64())
+        } else if tag == layout.TAG_BYTEBUF {
+            let vec = v.offset(layout.BYTEBUF_VEC)
+            put_hex(b, vec.offset(layout.VEC_PTR).load_addr(), vec.offset(layout.VEC_LEN).load_i64())
+        } else if tag == layout.TAG_STRBUF {
+            put_vec(b, v.offset(layout.STRBUF_STRING))
+        } else if tag == layout.TAG_ENV {
+            put(b, mem_static("<environment>"), mem_static_len("<environment>"))
+        } else if tag == layout.TAG_FN {
+            let name = v.offset(layout.FN_NAME)
+            if name.offset(layout.VEC_CAP).load_i64() == layout.FN_NAME_NONE {
+                put(b, mem_static("<closure>"), mem_static_len("<closure>"))
+            } else {
+                put(b, mem_static("<fn "), 4)
+                put_vec(b, name)
+                put_byte(b, 62)
+            }
+        } else if tag == layout.TAG_HANDLER {
+            put_vec(b, v.offset(layout.HANDLER_EFFECT))
+            put(b, mem_static("Handler\{"), mem_static_len("Handler\{"))
+            let ops = v.offset(layout.HANDLER_OPS)
+            let op = ops.offset(layout.VEC_PTR).load_addr()
+            let nops = ops.offset(layout.VEC_LEN).load_i64()
+            var i = 0
+            while i < nops {
+                if i > 0 {
+                    put(b, mem_static(", "), 2)
+                }
+                put_vec(b, op.offset(i * layout.OP_SIZE + layout.OP_NAME))
+                put(b, mem_static(": <closure>"), mem_static_len(": <closure>"))
+                i += 1
+            }
+            put_byte(b, 125)
+        } else if tag == layout.TAG_LIST or tag == layout.TAG_TUPLE {
+            let close = if tag == layout.TAG_LIST { mem_static("]") } else { mem_static(")") }
+            let open = if tag == layout.TAG_LIST { mem_static("[") } else { mem_static("(") }
+            var at = v.offset(layout.LIST_VALS)
+            var len = v.offset(layout.LIST_LEN).load_u8().as_i64()
+            if v.offset(layout.LIST_DISC).load_u8().as_i64() != layout.LIST_INLINE {
+                at = v.offset(layout.LIST_VEC).offset(layout.VEC_PTR).load_addr()
+                len = v.offset(layout.LIST_VEC).offset(layout.VEC_LEN).load_i64()
+            }
+            text(st, cap, n, close, 1)
+            items(st, cap, n, W_VAL, at, 8, len, true)
+            text(st, cap, n, open, 1)
+        } else if tag == layout.TAG_LIST_SCALAR {
+            let kind = v.offset(layout.SCALAR_KIND_AT).load_u8().as_i64()
+            let vec = v.offset(layout.SCALAR_VEC)
+            let p = vec.offset(layout.VEC_PTR).load_addr()
+            let len = vec.offset(layout.VEC_LEN).load_i64()
+            let bytes = v.offset(layout.SCALAR_DISC).load_u8().as_i64() == layout.SCALAR_BYTES
+            put_byte(b, 91)
+            var i = 0
+            while i < len {
+                if i > 0 {
+                    put(b, mem_static(", "), 2)
+                }
+                let bits = if bytes { p.offset(i).load_u8().as_i64() } else { p.offset(8 * i).load_i64() }
+                put_scalar(b, kind, bits)
+                i += 1
+            }
+            put_byte(b, 93)
+        } else if tag == layout.TAG_VARIANT {
+            put_strref(b, v.offset(layout.VARIANT_NAME))
+            let nf = v.offset(layout.VARIANT_NFIELDS).load_i64()
+            if nf > 0 {
+                let at = if nf == 1 { v.offset(layout.VARIANT_FIELDS) } else { v.offset(layout.VARIANT_FIELDS).load_addr() }
+                text(st, cap, n, mem_static(")"), 1)
+                items(st, cap, n, W_VAL, at, 8, nf, true)
+                text(st, cap, n, mem_static("("), 1)
+            }
+        } else if tag == layout.TAG_STRUCT {
+            let ty = v.offset(layout.STRUCT_TY).load_addr()
+            let kp = ty.offset(layout.STRUCTTY_KINDS).offset(layout.VEC_PTR).load_addr()
+            let nk = ty.offset(layout.STRUCTTY_KINDS).offset(layout.VEC_LEN).load_i64()
+            let names = ty.offset(layout.STRUCTTY_FIELDS).offset(layout.VEC_PTR).load_addr()
+            let nnames = ty.offset(layout.STRUCTTY_FIELDS).offset(layout.VEC_LEN).load_i64()
+            var at = v.offset(layout.STRUCT_VALS)
+            var len = v.offset(layout.STRUCT_LEN).load_u8().as_i64()
+            if v.offset(layout.STRUCT_DISC).load_u8().as_i64() != layout.STRUCT_INLINE {
+                at = v.offset(layout.STRUCT_VEC).offset(layout.VEC_PTR).load_addr()
+                len = v.offset(layout.STRUCT_VEC).offset(layout.VEC_LEN).load_i64()
+            }
+            put_strref(b, ty.offset(layout.STRUCTTY_NAME))
+            put_byte(b, 123)
+            text(st, cap, n, mem_static("}"), 1)
+            var i = len - 1
+            while i >= 0 {
+                let k = release.kind_at(kp, 1, nk, i)
+                if k == layout.FK_BOXED {
+                    task(st, cap, n, W_VAL, at.offset(8 * i).load_addr(), 0)
+                } else {
+                    let t = text_new()
+                    put_field_bits(t, k, at.offset(8 * i).load_i64())
+                    keep(t)
+                    text(st, cap, n, text_ptr(t), text_len(t))
+                }
+                text(st, cap, n, mem_static(": "), 2)
+                if i < nnames {
+                    text(st, cap, n, names.offset(16 * i).load_addr(), names.offset(16 * i + 8).load_i64())
+                } else {
+                    text(st, cap, n, mem_static("?"), 1)
+                }
+                if i > 0 {
+                    text(st, cap, n, mem_static(", "), 2)
+                }
+                i -= 1
+            }
+        } else if tag == layout.TAG_MAP {
+            // Iteration, so in key order ([E-MAP-ORDER]).
+            let count = v.offset(layout.MAP_ITEMS).load_i64()
+            let order = keys.sorted(v, count)
+            text(st, cap, n, mem_static("}"), 1)
+            var i = count - 1
+            while i >= 0 {
+                let e = order.offset(8 * i).load_addr()
+                task(st, cap, n, W_VAL, e.offset(layout.MAP_ENTRY_VAL).load_addr(), 0)
+                text(st, cap, n, mem_static(": "), 2)
+                task(st, cap, n, W_KEY, e, 0)
+                if i > 0 {
+                    text(st, cap, n, mem_static(", "), 2)
+                }
+                i -= 1
+            }
+            sys.dealloc(order)
+            put_byte(b, 123)
+        } else if tag == layout.TAG_LIST_VALS {
+            show_vals(b, v, st, cap, n)
+        }
+    }
+}
+
+/// Value `v` as text in a buffer of its own: `text_ptr`, `text_len`, and
+/// `text_free` after.
+pub fn shown(v: addr) -> addr {
+    let b = text_new()
+    show(b, v)
+    forget()
+    b
+}
+
+export fn grt_out_val(v: addr) {
+    let b = shown(v)
+    unsafe { grasm_out_text(text_ptr(b), text_len(b)) }
+    text_free(b)
+}
+
+export fn grt_out_ref(r: i64) {
+    let b = text_new()
+    put_ref(b, r)
+    unsafe { grasm_out_text(text_ptr(b), text_len(b)) }
+    text_free(b)
+}
+
+export fn grt_str_from_val(v: addr) -> addr {
+    let b = shown(v)
+    let s = numstr.new_str(text_ptr(b), text_len(b))
+    text_free(b)
+    s
+}
+
+/// A panic whose message is a value: a string's text, or anything else
+/// shown.
+export fn grt_panic_value(v: addr) {
+    if unsafe { v.offset(layout.TAG).load_u8() }.as_i64() == layout.TAG_STR {
+        var len = 0
+        let p = strread.text_of(v, len)
+        unsafe { grasm_panic_msg(p, len) }
+        return
+    }
+    let b = shown(v)
+    unsafe { grasm_panic_msg(text_ptr(b), text_len(b)) }
+}

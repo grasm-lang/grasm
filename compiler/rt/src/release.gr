@@ -1,27 +1,25 @@
-// The release walk, part one (docs/self-hosting.md §6.7, "state"; §6.9):
-// what happens when a box's count reaches zero.
+// The release walk (docs/self-hosting.md §6.7, "state"; §6.9; §6.11): what
+// happens when a box's count reaches zero.
 //
 // Everything the box was the last owner of goes too, and the walk is a loop
 // over a list of pending boxes, never recursion: a list a hundred thousand
 // deep is an ordinary thing for a parser to build ([E-RECURSION-DEPTH]).
-// For the payloads whose layout `layout.gr` holds -- strings, lists, tuples,
-// scalar lists, the two builders, variants, function values and bytes --
-// the walk is here: each child is released, and those that reach zero are
-// taken apart in turn; then the payload's own buffers are freed, as the Rust
-// runtime's `drop` frees them (its global allocator is `malloc` and `free`),
-// and the payload is left a `Unit`, which owns nothing. Every other payload
-// -- maps, structs, environments, handlers, lists of value structs -- is
-// still taken apart by the Rust runtime, children and all.
-//
-// Either way the box itself goes back with a count of one to the Rust
-// runtime's `grasm_val_dec`, which takes the count to zero, finds a `Unit`
-// (or a payload it walks itself), and returns the box to its pool and its
-// live count: the allocator is still the Rust runtime's state, and moves
-// with the live count and regions, next.
+// Every payload is taken apart here, by the layouts `layout.gr` holds, in
+// two halves as the Rust runtime's `dec_walk` and `drop_in_place` take it:
+// its children -- each released, and those reaching zero taken apart in
+// turn -- and then its own buffers, freed as its `drop` frees them (the Rust
+// runtime's global allocator is `malloc` and `free`), leaving a `Unit`. The
+// kinds: strings, lists, tuples, scalar lists, the two builders, variants,
+// function values and bytes; maps (the `hashbrown` table, its keys and its
+// values); structs (the fields their type's kinds say are boxes); lists of
+// value structs (every element's words read by the same kinds, and the
+// inline lists of values among them through a list of their own);
+// environments and handlers. The box then goes back to this runtime's
+// allocator (`alloc.gr`). A release inside the Rust runtime's own code still
+// takes its own walk to its own allocator, which no link redirects.
 import layout
 import sys
-
-extern fn grasm_val_dec(v: addr)
+import alloc
 
 /// Drops one reference to `c`, answering whether it was the last: as the
 /// Rust runtime's `release_to_zero` counts -- nothing for a null pointer, an
@@ -39,8 +37,8 @@ fn to_zero(c: addr) -> bool {
     }
 }
 
-/// Adds `c` to the pending boxes, growing their array as a `Vec` would.
-fn push(inout stack: addr, inout cap: i64, inout n: i64, c: addr) {
+/// Adds `c` to an array of words, growing it as a `Vec` would.
+pub fn push(inout stack: addr, inout cap: i64, inout n: i64, c: addr) {
     if n == cap {
         let want = if cap == 0 { 16 } else { cap * 2 }
         if cap == 0 {
@@ -57,7 +55,7 @@ fn push(inout stack: addr, inout cap: i64, inout n: i64, c: addr) {
 }
 
 /// Frees a `Vec`'s or a `String`'s buffer, which an empty one never had.
-fn free_vec(v: addr) {
+pub fn free_vec(v: addr) {
     unsafe {
         if v.offset(layout.VEC_CAP).load_i64() > 0 {
             sys.dealloc(v.offset(layout.VEC_PTR).load_addr())
@@ -77,19 +75,303 @@ fn children(at: addr, n: i64, inout stack: addr, inout cap: i64, inout pending: 
     }
 }
 
-/// Takes box `v`'s payload apart, if it is one this walk knows: its children
-/// to the pending boxes, its buffers freed, and the payload left a `Unit`.
-fn take_apart(v: addr, inout stack: addr, inout cap: i64, inout pending: i64) {
+/// Frees a map key's buffers: a long string's, and a tuple's slice of keys
+/// with whatever those keys hold. A tuple may hold tuples, so the slices wait
+/// in a list of their own -- each one's address and length, read out of the
+/// key that held it before that key's own slice is freed -- rather than
+/// being taken apart by recursion.
+pub fn drop_key(key: addr) {
+    unsafe {
+        let w = key.load_i64()
+        if w >= 0 {
+            // A `String`: the word is its capacity.
+            free_vec(key.offset(layout.KEYSTR_STRING))
+            return
+        }
+        if w != layout.MAPKEY_TUPLE {
+            return
+        }
+        var slices = mem_addr(0)
+        var cap = 0
+        var n = 0
+        push(slices, cap, n, key.offset(layout.MAPKEY_TUPLE_PTR).load_addr())
+        push(slices, cap, n, mem_addr(key.offset(layout.MAPKEY_TUPLE_LEN).load_i64()))
+        while n > 0 {
+            let at = slices.offset(8 * (n - 2)).load_addr()
+            let len = slices.offset(8 * (n - 1)).load_i64()
+            n -= 2
+            var i = 0
+            while i < len {
+                let k = at.offset(i * layout.MAPKEY_SIZE)
+                let kw = k.load_i64()
+                if kw >= 0 {
+                    free_vec(k.offset(layout.KEYSTR_STRING))
+                } else if kw == layout.MAPKEY_TUPLE {
+                    push(slices, cap, n, k.offset(layout.MAPKEY_TUPLE_PTR).load_addr())
+                    push(slices, cap, n, mem_addr(k.offset(layout.MAPKEY_TUPLE_LEN).load_i64()))
+                }
+                i += 1
+            }
+            // A boxed slice of no keys never allocated.
+            if len > 0 {
+                sys.dealloc(at)
+            }
+        }
+        if cap > 0 {
+            sys.dealloc(slices)
+        }
+    }
+}
+
+/// Words a field of kind `k` takes: three for an inline list or string (a
+/// `Vec`'s), one for anything else.
+pub fn kind_width(k: i64) -> i64 {
+    if k == layout.FK_INLIST or k == layout.FK_INVALS or k == layout.FK_INSTR { 3 } else { 1 }
+}
+
+/// Field `i`'s kind, of `n` kinds at `kinds`, `stride` bytes apart: a field
+/// past them is a box, as `StructTy::boxed` has it.
+pub fn kind_at(kinds: addr, stride: i64, n: i64, i: i64) -> i64 {
+    if i >= n {
+        return layout.FK_BOXED
+    }
+    unsafe { kinds.offset(i * stride).load_u8() }.as_i64()
+}
+
+/// How many words a value of a type with `n` fields of the kinds at `kinds`
+/// takes, as `StructTy` derives its `width`; negative when none is inline.
+pub fn width_of(kinds: addr, stride: i64, n: i64) -> i64 {
+    var width = 0
+    var inline = false
+    var i = 0
+    while i < n {
+        let fw = kind_width(kind_at(kinds, stride, n, i))
+        width += fw
+        if fw > 1 {
+            inline = true
+        }
+        i += 1
+    }
+    if inline { width } else { -width }
+}
+
+/// Releases what `nwords` words at `words` -- whole values of a type with `n`
+/// fields of the kinds at `kinds` (`stride` bytes apart) and their element
+/// descriptors at `elems` -- own, as `StructTy::release_words` does: every
+/// box released (those reaching zero to the pending boxes), every inline
+/// buffer freed, and every inline list of values added to `work` -- its
+/// element descriptor and its `Vec`'s three words, taken out of the element
+/// -- for the caller to release in turn.
+pub fn release_words(kinds: addr, stride: i64, n: i64, elems: addr, words: addr, nwords: i64, inout stack: addr, inout cap: i64, inout pending: i64, inout work: addr, inout wcap: i64, inout wn: i64) {
+    unsafe {
+        let signed = width_of(kinds, stride, n)
+        let inline = signed > 0
+        let width = if inline { signed } else { -signed }
+        let w = if width < 1 { 1 } else { width }
+        var i = 0
+        if not inline {
+            // A word a field: a box wherever the kinds say so, counted round
+            // every word there is.
+            var any = false
+            while i < w {
+                if kind_at(kinds, stride, n, i) == layout.FK_BOXED {
+                    any = true
+                }
+                i += 1
+            }
+            if not any {
+                return
+            }
+            var k = 0
+            var j = 0
+            while j < nwords {
+                if kind_at(kinds, stride, n, k) == layout.FK_BOXED {
+                    children(words.offset(8 * j), 1, stack, cap, pending)
+                }
+                k += 1
+                if k == w {
+                    k = 0
+                }
+                j += 1
+            }
+            return
+        }
+        // Whole elements only, each field from where it starts.
+        let count = nwords / w
+        var e = 0
+        while e < count {
+            let el = words.offset(8 * w * e)
+            var at = 0
+            i = 0
+            while i < n {
+                let k = kind_at(kinds, stride, n, i)
+                let f = el.offset(8 * at)
+                if k == layout.FK_BOXED {
+                    children(f, 1, stack, cap, pending)
+                } else if k == layout.FK_INLIST or k == layout.FK_INSTR {
+                    free_vec(f)
+                } else if k == layout.FK_INVALS {
+                    push(work, wcap, wn, elems.offset(8 * i).load_addr())
+                    push(work, wcap, wn, f.offset(layout.VEC_PTR).load_addr())
+                    push(work, wcap, wn, mem_addr(f.offset(layout.VEC_LEN).load_i64()))
+                    push(work, wcap, wn, mem_addr(f.offset(layout.VEC_CAP).load_i64()))
+                }
+                at += kind_width(k)
+                i += 1
+            }
+            e += 1
+        }
+    }
+}
+
+/// Releases each inline list of values waiting in `work` -- by the kinds of
+/// its element type's descriptor, from which `desc_ty` builds that type's
+/// `StructTy` -- and frees its buffer, until none is left; then `work`.
+pub fn release_work(inout stack: addr, inout cap: i64, inout pending: i64, inout work: addr, inout wcap: i64, inout wn: i64) {
+    unsafe {
+        while wn > 0 {
+            // Four words: the element descriptor, then the `Vec`'s address,
+            // length and capacity.
+            let d = work.offset(8 * (wn - 4)).load_addr()
+            let p = work.offset(8 * (wn - 3)).load_addr()
+            let len = work.offset(8 * (wn - 2)).load_i64()
+            let c = work.offset(8 * (wn - 1)).load_i64()
+            wn -= 4
+            // `inline_vec`: no capacity, no buffer and nothing in it.
+            if c != 0 {
+                let n = d.offset(layout.DESC_NFIELDS).load_i64()
+                let fields = d.offset(layout.DESC_FIELDS)
+                release_words(fields.offset(layout.DESC_FIELD_KIND), layout.DESC_FIELD_SIZE, n, fields.offset(n * layout.DESC_FIELD_SIZE), p, len, stack, cap, pending, work, wcap, wn)
+                sys.dealloc(p)
+            }
+        }
+        if wcap > 0 {
+            sys.dealloc(work)
+        }
+        wcap = 0
+    }
+}
+
+/// The boxes a struct holds in its fields, and how many: four or fewer in
+/// the box itself, more in a `Vec`.
+fn struct_fields(v: addr) -> addr {
+    unsafe {
+        if v.offset(layout.STRUCT_DISC).load_u8().as_i64() != layout.STRUCT_INLINE {
+            return v.offset(layout.STRUCT_VEC).offset(layout.VEC_PTR).load_addr()
+        }
+        v.offset(layout.STRUCT_VALS)
+    }
+}
+
+fn struct_len(v: addr) -> i64 {
+    unsafe {
+        if v.offset(layout.STRUCT_DISC).load_u8().as_i64() != layout.STRUCT_INLINE {
+            return v.offset(layout.STRUCT_VEC).offset(layout.VEC_LEN).load_i64()
+        }
+        v.offset(layout.STRUCT_LEN).load_u8().as_i64()
+    }
+}
+
+/// Box `v`'s children, as `dec_walk` finds them kind by kind: each released,
+/// and those reaching zero to the pending boxes.
+fn release_children(v: addr, inout stack: addr, inout cap: i64, inout pending: i64) {
     unsafe {
         let tag = v.offset(layout.TAG).load_u8().as_i64()
         if tag == layout.TAG_LIST or tag == layout.TAG_TUPLE {
             if v.offset(layout.LIST_DISC).load_u8().as_i64() == layout.LIST_INLINE {
-                let n = v.offset(layout.LIST_LEN).load_u8().as_i64()
-                children(v.offset(layout.LIST_VALS), n, stack, cap, pending)
+                children(v.offset(layout.LIST_VALS), v.offset(layout.LIST_LEN).load_u8().as_i64(), stack, cap, pending)
             } else {
                 let vec = v.offset(layout.LIST_VEC)
                 children(vec.offset(layout.VEC_PTR).load_addr(), vec.offset(layout.VEC_LEN).load_i64(), stack, cap, pending)
-                free_vec(vec)
+            }
+        } else if tag == layout.TAG_VARIANT {
+            // No field, the field itself in the word, or a slice of them.
+            let n = v.offset(layout.VARIANT_NFIELDS).load_i64()
+            if n == 1 {
+                children(v.offset(layout.VARIANT_FIELDS), 1, stack, cap, pending)
+            } else if n >= 2 {
+                children(v.offset(layout.VARIANT_FIELDS).load_addr(), n, stack, cap, pending)
+            }
+        } else if tag == layout.TAG_FN {
+            children(v.offset(layout.FN_ENV), 1, stack, cap, pending)
+        } else if tag == layout.TAG_MAP {
+            // Each full bucket's value; a full bucket's control byte has its
+            // top bit clear. The shared empty table (a mask of 0) has none.
+            let mask = v.offset(layout.MAP_MASK).load_i64()
+            if mask != 0 and v.offset(layout.MAP_ITEMS).load_i64() > 0 {
+                let ctrl = v.offset(layout.MAP_CTRL).load_addr()
+                var i = 0
+                while i <= mask {
+                    if ctrl.offset(i).load_u8().as_i64() < 128 {
+                        children(ctrl.offset(-(i + 1) * layout.MAP_ENTRY + layout.MAP_ENTRY_VAL), 1, stack, cap, pending)
+                    }
+                    i += 1
+                }
+            }
+        } else if tag == layout.TAG_STRUCT {
+            // The fields the type's kinds say are boxes.
+            let kinds = v.offset(layout.STRUCT_TY).load_addr().offset(layout.STRUCTTY_KINDS)
+            let kp = kinds.offset(layout.VEC_PTR).load_addr()
+            let nk = kinds.offset(layout.VEC_LEN).load_i64()
+            let at = struct_fields(v)
+            let n = struct_len(v)
+            var i = 0
+            while i < n {
+                if kind_at(kp, 1, nk, i) == layout.FK_BOXED {
+                    children(at.offset(8 * i), 1, stack, cap, pending)
+                }
+                i += 1
+            }
+        } else if tag == layout.TAG_LIST_VALS {
+            // Every element's words by the type's kinds, then the inline
+            // lists of values they held.
+            var work = mem_addr(0)
+            var wcap = 0
+            var wn = 0
+            let ty = v.offset(layout.VALS_TY).load_addr()
+            let kinds = ty.offset(layout.STRUCTTY_KINDS)
+            let vec = v.offset(layout.VALS_VEC)
+            release_words(kinds.offset(layout.VEC_PTR).load_addr(), 1, kinds.offset(layout.VEC_LEN).load_i64(), ty.offset(layout.STRUCTTY_ELEMS).offset(layout.VEC_PTR).load_addr(), vec.offset(layout.VEC_PTR).load_addr(), vec.offset(layout.VEC_LEN).load_i64(), stack, cap, pending, work, wcap, wn)
+            release_work(stack, cap, pending, work, wcap, wn)
+        } else if tag == layout.TAG_ENV {
+            // The words the flags say are boxes, and not null.
+            let words = v.offset(layout.ENV_WORDS)
+            let flags = v.offset(layout.ENV_BOXED)
+            let wp = words.offset(layout.VEC_PTR).load_addr()
+            let fp = flags.offset(layout.VEC_PTR).load_addr()
+            let nw = words.offset(layout.VEC_LEN).load_i64()
+            let nf = flags.offset(layout.VEC_LEN).load_i64()
+            let n = if nw < nf { nw } else { nf }
+            var i = 0
+            while i < n {
+                if fp.offset(i).load_u8().as_i64() != 0 and wp.offset(8 * i).load_i64() != 0 {
+                    children(wp.offset(8 * i), 1, stack, cap, pending)
+                }
+                i += 1
+            }
+        } else if tag == layout.TAG_HANDLER {
+            // Each operation's environment.
+            let ops = v.offset(layout.HANDLER_OPS)
+            let op = ops.offset(layout.VEC_PTR).load_addr()
+            let n = ops.offset(layout.VEC_LEN).load_i64()
+            var i = 0
+            while i < n {
+                children(op.offset(i * layout.OP_SIZE + layout.OP_ENV), 1, stack, cap, pending)
+                i += 1
+            }
+        }
+    }
+}
+
+/// Frees what box `v`'s payload owns other than its children -- its
+/// buffers, as the payload's `drop_in_place` frees them -- and leaves it a
+/// `Unit`, which owns nothing.
+pub fn drop_payload(v: addr) {
+    unsafe {
+        let tag = v.offset(layout.TAG).load_u8().as_i64()
+        if tag == layout.TAG_LIST or tag == layout.TAG_TUPLE {
+            if v.offset(layout.LIST_DISC).load_u8().as_i64() != layout.LIST_INLINE {
+                free_vec(v.offset(layout.LIST_VEC))
             }
         } else if tag == layout.TAG_LIST_SCALAR {
             free_vec(v.offset(layout.SCALAR_VEC))
@@ -107,17 +389,11 @@ fn take_apart(v: addr, inout stack: addr, inout cap: i64, inout pending: i64) {
         } else if tag == layout.TAG_BYTEBUF {
             free_vec(v.offset(layout.BYTEBUF_VEC))
         } else if tag == layout.TAG_VARIANT {
-            // No field, the field itself in the word, or a slice of them.
-            let n = v.offset(layout.VARIANT_NFIELDS).load_i64()
-            if n == 1 {
-                children(v.offset(layout.VARIANT_FIELDS), 1, stack, cap, pending)
-            } else if n >= 2 {
-                let at = v.offset(layout.VARIANT_FIELDS).load_addr()
-                children(at, n, stack, cap, pending)
-                sys.dealloc(at)
+            // Only a slice of two or more fields is the variant's own.
+            if v.offset(layout.VARIANT_NFIELDS).load_i64() >= 2 {
+                sys.dealloc(v.offset(layout.VARIANT_FIELDS).load_addr())
             }
         } else if tag == layout.TAG_FN {
-            children(v.offset(layout.FN_ENV), 1, stack, cap, pending)
             let name = v.offset(layout.FN_NAME)
             if name.offset(layout.VEC_CAP).load_i64() != layout.FN_NAME_NONE {
                 free_vec(name)
@@ -133,6 +409,45 @@ fn take_apart(v: addr, inout stack: addr, inout cap: i64, inout pending: i64) {
                     sys.dealloc(arc)
                 }
             }
+        } else if tag == layout.TAG_MAP {
+            // Every key's buffers, then the table's one allocation: the
+            // entries below the control bytes, their size rounded up to a
+            // group.
+            let mask = v.offset(layout.MAP_MASK).load_i64()
+            if mask != 0 {
+                let ctrl = v.offset(layout.MAP_CTRL).load_addr()
+                if v.offset(layout.MAP_ITEMS).load_i64() > 0 {
+                    var i = 0
+                    while i <= mask {
+                        if ctrl.offset(i).load_u8().as_i64() < 128 {
+                            drop_key(ctrl.offset(-(i + 1) * layout.MAP_ENTRY))
+                        }
+                        i += 1
+                    }
+                }
+                let data = ((mask + 1) * layout.MAP_ENTRY + layout.MAP_GROUP - 1) / layout.MAP_GROUP * layout.MAP_GROUP
+                sys.dealloc(ctrl.offset(-data))
+            }
+        } else if tag == layout.TAG_STRUCT {
+            if v.offset(layout.STRUCT_DISC).load_u8().as_i64() != layout.STRUCT_INLINE {
+                free_vec(v.offset(layout.STRUCT_VEC))
+            }
+        } else if tag == layout.TAG_LIST_VALS {
+            free_vec(v.offset(layout.VALS_VEC))
+        } else if tag == layout.TAG_ENV {
+            free_vec(v.offset(layout.ENV_WORDS))
+            free_vec(v.offset(layout.ENV_BOXED))
+        } else if tag == layout.TAG_HANDLER {
+            let ops = v.offset(layout.HANDLER_OPS)
+            let op = ops.offset(layout.VEC_PTR).load_addr()
+            let n = ops.offset(layout.VEC_LEN).load_i64()
+            var i = 0
+            while i < n {
+                free_vec(op.offset(i * layout.OP_SIZE + layout.OP_NAME))
+                i += 1
+            }
+            free_vec(ops)
+            free_vec(v.offset(layout.HANDLER_EFFECT))
         } else {
             return
         }
@@ -140,26 +455,130 @@ fn take_apart(v: addr, inout stack: addr, inout cap: i64, inout pending: i64) {
     }
 }
 
+/// Adds `c` to `out` when it is a box a region does not own: what the
+/// region's sweep releases rather than frees.
+fn outside(c: addr, inout out: addr, inout cap: i64, inout n: i64) {
+    unsafe {
+        if c.as_i64() != 0 and c.atomic_load_i64(Relaxed) != layout.ARENA {
+            push(out, cap, n, c)
+        }
+    }
+}
+
+/// The children of a region's box `v` that the region does not own, to
+/// `out`: for the kinds `grasm_region_pop` asks, and no others -- lists and
+/// tuples, maps, structs' boxed fields, variants, handlers' environments and
+/// environments' boxed words.
+pub fn outside_children(v: addr, inout out: addr, inout cap: i64, inout n: i64) {
+    unsafe {
+        let tag = v.offset(layout.TAG).load_u8().as_i64()
+        if tag == layout.TAG_LIST or tag == layout.TAG_TUPLE {
+            var at = v.offset(layout.LIST_VALS)
+            var len = v.offset(layout.LIST_LEN).load_u8().as_i64()
+            if v.offset(layout.LIST_DISC).load_u8().as_i64() != layout.LIST_INLINE {
+                at = v.offset(layout.LIST_VEC).offset(layout.VEC_PTR).load_addr()
+                len = v.offset(layout.LIST_VEC).offset(layout.VEC_LEN).load_i64()
+            }
+            var i = 0
+            while i < len {
+                outside(at.offset(8 * i).load_addr(), out, cap, n)
+                i += 1
+            }
+        } else if tag == layout.TAG_VARIANT {
+            let len = v.offset(layout.VARIANT_NFIELDS).load_i64()
+            if len == 1 {
+                outside(v.offset(layout.VARIANT_FIELDS).load_addr(), out, cap, n)
+            } else if len >= 2 {
+                let at = v.offset(layout.VARIANT_FIELDS).load_addr()
+                var i = 0
+                while i < len {
+                    outside(at.offset(8 * i).load_addr(), out, cap, n)
+                    i += 1
+                }
+            }
+        } else if tag == layout.TAG_MAP {
+            let mask = v.offset(layout.MAP_MASK).load_i64()
+            if mask != 0 and v.offset(layout.MAP_ITEMS).load_i64() > 0 {
+                let ctrl = v.offset(layout.MAP_CTRL).load_addr()
+                var i = 0
+                while i <= mask {
+                    if ctrl.offset(i).load_u8().as_i64() < 128 {
+                        outside(ctrl.offset(-(i + 1) * layout.MAP_ENTRY + layout.MAP_ENTRY_VAL).load_addr(), out, cap, n)
+                    }
+                    i += 1
+                }
+            }
+        } else if tag == layout.TAG_STRUCT {
+            let kinds = v.offset(layout.STRUCT_TY).load_addr().offset(layout.STRUCTTY_KINDS)
+            let kp = kinds.offset(layout.VEC_PTR).load_addr()
+            let nk = kinds.offset(layout.VEC_LEN).load_i64()
+            let at = struct_fields(v)
+            let len = struct_len(v)
+            var i = 0
+            while i < len {
+                if kind_at(kp, 1, nk, i) == layout.FK_BOXED {
+                    outside(at.offset(8 * i).load_addr(), out, cap, n)
+                }
+                i += 1
+            }
+        } else if tag == layout.TAG_ENV {
+            let wp = v.offset(layout.ENV_WORDS).offset(layout.VEC_PTR).load_addr()
+            let fp = v.offset(layout.ENV_BOXED).offset(layout.VEC_PTR).load_addr()
+            let nw = v.offset(layout.ENV_WORDS).offset(layout.VEC_LEN).load_i64()
+            let nf = v.offset(layout.ENV_BOXED).offset(layout.VEC_LEN).load_i64()
+            let len = if nw < nf { nw } else { nf }
+            var i = 0
+            while i < len {
+                if fp.offset(i).load_u8().as_i64() != 0 {
+                    outside(wp.offset(8 * i).load_addr(), out, cap, n)
+                }
+                i += 1
+            }
+        } else if tag == layout.TAG_HANDLER {
+            let op = v.offset(layout.HANDLER_OPS).offset(layout.VEC_PTR).load_addr()
+            let len = v.offset(layout.HANDLER_OPS).offset(layout.VEC_LEN).load_i64()
+            var i = 0
+            while i < len {
+                outside(op.offset(i * layout.OP_SIZE + layout.OP_ENV).load_addr(), out, cap, n)
+                i += 1
+            }
+        }
+    }
+}
+
+/// Walks the pending boxes -- each one's count has reached zero -- until
+/// none is left: children, buffers, and the box back to the allocator.
+pub fn walk_pending(inout stack: addr, inout cap: i64, inout pending: i64) {
+    while pending > 0 {
+        pending -= 1
+        let cur = unsafe { stack.offset(8 * pending).load_addr() }
+        release_children(cur, stack, cap, pending)
+        drop_payload(cur)
+        alloc.give(cur)
+    }
+}
+
 /// Releases box `v`, whose count has just reached zero, and everything it
 /// was the last owner of.
 pub fn walk(v: addr) {
+    // The pending boxes' array is made only when a child reaches zero: most
+    // releases have none.
     var stack = unsafe { mem_addr(0) }
     var cap = 0
     var pending = 0
-    var cur = v
-    while true {
-        take_apart(cur, stack, cap, pending)
-        unsafe {
-            cur.atomic_store_i64(1, Relaxed)
-            grasm_val_dec(cur)
-        }
-        if pending == 0 {
-            break
-        }
-        pending -= 1
-        cur = unsafe { stack.offset(8 * pending).load_addr() }
-    }
+    release_children(v, stack, cap, pending)
+    drop_payload(v)
+    alloc.give(v)
+    walk_pending(stack, cap, pending)
     if cap > 0 {
         sys.dealloc(stack)
+    }
+}
+
+/// Drops one reference to `v`, releasing it if that was the last: the walk
+/// `dec` reaches from inside this runtime.
+pub fn dec(v: addr) {
+    if to_zero(v) {
+        walk(v)
     }
 }

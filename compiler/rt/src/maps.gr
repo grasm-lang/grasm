@@ -1,0 +1,1223 @@
+// Maps (docs/self-hosting.md §6.11): the Rust runtime's `MapTable` -- a
+// `hashbrown` 0.15 table of `(MapKey, *mut RtVal)` with its `MapHash` --
+// made, searched and changed here exactly as the Rust runtime and the
+// `hashbrown` it links do, so either runtime can take up a map the other
+// left: the same hash for the same seed, every entry in the same bucket, the
+// same control bytes, the same growth and the same tombstones.
+//
+// The hash is the Rust runtime's `MapHasher`: a 64-bit state started at the
+// map's seed and mixed by a multiply-fold (the 128-bit product of two words,
+// its halves xored), fed what `#[derive(Hash)]` feeds it for a `MapKey` --
+// the variant's index, then the payload; a string's bytes then `0xff`; a
+// tuple's length then each component. It is resistant to keys chosen in
+// advance, not to an attacker who watches the table (the Rust runtime's
+// comment says so too), and that is kept: each map carries the seed it was
+// made with, and this runtime draws its own once per process from
+// `getentropy`, as secret as the Rust runtime's and as fixed for the
+// process. A map either side made is hashed with its own seed whichever side
+// touches it.
+//
+// The table: buckets a power of two, a control byte each (EMPTY 0xff,
+// DELETED 0x80, or the hash's top seven bits for a full one) followed by a
+// copy of the first group of eight; entries counting down from the control
+// bytes; probing a group of eight at a time, triangularly; seven in eight
+// buckets usable once a table has eight or more. Iteration presents keys in
+// their order ([E-MAP-ORDER]), so no output depends on where an entry sits;
+// the fuzz (`scripts/fuzz_rtmaps.sh`) holds the placement itself to the Rust
+// runtime's with the seed pinned on both sides.
+import layout
+import sys
+import alloc
+import release
+import val
+import numstr
+import strread
+import panic
+import boxes
+import keys
+import display
+
+extern fn getentropy(p: addr, n: i64) -> i32
+extern fn memcmp(a: addr, b: addr, n: i64) -> i32
+
+/// This runtime's seed for the maps it makes, drawn once; and whether it is
+/// there yet (0 no, 1 being drawn, 2 yes).
+process_local SEED: i64
+process_local SEED_STATE: i64
+/// The group of eight EMPTY control bytes every empty table points at.
+process_local EMPTY_GROUP: i64
+
+let EMPTY = 255
+let DELETED = 128
+let GROUP = 8
+
+fn s0() -> u64 {
+    0xa076_1d64_78bd_642f
+}
+
+fn s1() -> u64 {
+    0xe703_7ed1_a0b4_28db
+}
+
+fn s2() -> u64 {
+    0x8ebc_6af0_9c88_c6e3
+}
+
+// ----- the hash ---------------------------------------------------------------
+
+/// The 128-bit product of `a` and `b`, its two halves xored: `mix`.
+fn mix(a: u64, b: u64) -> u64 {
+    let mask: u64 = 0xffff_ffff
+    let al = a.bit_and(mask)
+    let ah = a.ushr(32)
+    let bl = b.bit_and(mask)
+    let bh = b.ushr(32)
+    let ll = al * bl
+    let lh = al * bh
+    let hl = ah * bl
+    let hh = ah * bh
+    let mid = ll.ushr(32) + lh.bit_and(mask) + hl.bit_and(mask)
+    let lo = mid.shl(32).bit_or(ll.bit_and(mask))
+    let hi = hh + lh.ushr(32) + hl.ushr(32) + mid.ushr(32)
+    lo.bit_xor(hi)
+}
+
+/// One word into the state: `write_u64`, which every integer, a bool, a
+/// variant's index and a length go through.
+fn word(h: u64, w: u64) -> u64 {
+    mix(h.bit_xor(w), s1())
+}
+
+/// The last one to seven bytes of text, as `load_tail` reads them.
+fn tail(p: addr, n: i64) -> u64 {
+    unsafe {
+        if n >= 4 {
+            let lo = p.load_u32().as_u64()
+            let hi = p.offset(n - 4).load_u32().as_u64()
+            return lo.bit_or(hi.shl(8 * (n - 4)))
+        }
+        let a = p.load_u8().as_u64()
+        let b = p.offset(n / 2).load_u8().as_u64()
+        let c = p.offset(n - 1).load_u8().as_u64()
+        a.bit_or(b.shl(8 * (n / 2))).bit_or(c.shl(8 * (n - 1)))
+    }
+}
+
+/// Text into the state: `write`, its length first, then eight bytes at a
+/// time and the tail; and `write_str`'s `0xff` after it.
+fn text(h: u64, p: addr, n: i64) -> u64 {
+    var s = h.bit_xor(n.as_u64() * s0())
+    var i = 0
+    while i + 8 <= n {
+        s = mix(s.bit_xor(unsafe { p.offset(i).load_u64() }), s1())
+        i += 8
+    }
+    if i < n {
+        s = mix(s.bit_xor(tail(unsafe { p.offset(i) }, n - i)), s2())
+    }
+    word(s, 255)
+}
+
+fn finish(h: u64) -> u64 {
+    mix(h, s2())
+}
+
+
+
+/// The hash of the stored key `k` under `seed`: the key and every key a
+/// tuple holds, depth first, each its index and then its payload.
+pub fn hash_key(seed: u64, k: addr) -> u64 {
+    var h = seed
+    var stack = unsafe { mem_addr(0) }
+    var cap = 0
+    var n = 0
+    release.push(stack, cap, n, k)
+    while n > 0 {
+        n -= 1
+        let x = unsafe { stack.offset(8 * n).load_addr() }
+        let kd = keys.kind(x)
+        h = word(h, kd.as_u64())
+        if kd == 0 {
+            h = word(h, unsafe { x.offset(layout.MAPKEY_BOOL_AT).load_u8() }.as_u64())
+        } else if kd == 1 or kd == 3 {
+            h = word(h, unsafe { x.offset(layout.MAPKEY_AT).load_u64() })
+        } else if kd == 2 {
+            var len = 0
+            let p = keys.key_text(x, len)
+            h = text(h, p, len)
+        } else {
+            let at = unsafe { x.offset(layout.MAPKEY_TUPLE_PTR).load_addr() }
+            let len = unsafe { x.offset(layout.MAPKEY_TUPLE_LEN).load_i64() }
+            h = word(h, len.as_u64())
+            var i = len - 1
+            while i >= 0 {
+                release.push(stack, cap, n, unsafe { at.offset(i * layout.MAPKEY_SIZE) })
+                i -= 1
+            }
+        }
+    }
+    if cap > 0 {
+        sys.dealloc(stack)
+    }
+    finish(h)
+}
+
+/// The hash of a string key with the text `p`, `n` bytes long.
+fn hash_text(seed: u64, p: addr, n: i64) -> u64 {
+    finish(text(word(seed, 2), p, n))
+}
+
+// ----- keys -------------------------------------------------------------------
+
+/// Whether stored keys `a` and `b` are equal, as `MapKey`'s derived `==`
+/// has it: the same variant, and the same payload -- text by its bytes,
+/// tuples component by component.
+fn key_eq(a: addr, b: addr) -> bool {
+    var stack = unsafe { mem_addr(0) }
+    var cap = 0
+    var n = 0
+    release.push(stack, cap, n, a)
+    release.push(stack, cap, n, b)
+    var same = true
+    while n > 0 and same {
+        let y = unsafe { stack.offset(8 * (n - 1)).load_addr() }
+        let x = unsafe { stack.offset(8 * (n - 2)).load_addr() }
+        n -= 2
+        let kd = keys.kind(x)
+        if kd != keys.kind(y) {
+            same = false
+        } else if kd == 0 {
+            same = unsafe { x.offset(layout.MAPKEY_BOOL_AT).load_u8() == y.offset(layout.MAPKEY_BOOL_AT).load_u8() }
+        } else if kd == 1 or kd == 3 {
+            same = unsafe { x.offset(layout.MAPKEY_AT).load_i64() == y.offset(layout.MAPKEY_AT).load_i64() }
+        } else if kd == 2 {
+            var nx = 0
+            var ny = 0
+            let px = keys.key_text(x, nx)
+            let py = keys.key_text(y, ny)
+            same = nx == ny and (nx == 0 or unsafe { memcmp(px, py, nx) } == 0)
+        } else {
+            let len = unsafe { x.offset(layout.MAPKEY_TUPLE_LEN).load_i64() }
+            if len != unsafe { y.offset(layout.MAPKEY_TUPLE_LEN).load_i64() } {
+                same = false
+            } else {
+                let ax = unsafe { x.offset(layout.MAPKEY_TUPLE_PTR).load_addr() }
+                let ay = unsafe { y.offset(layout.MAPKEY_TUPLE_PTR).load_addr() }
+                var i = 0
+                while i < len {
+                    release.push(stack, cap, n, unsafe { ax.offset(i * layout.MAPKEY_SIZE) })
+                    release.push(stack, cap, n, unsafe { ay.offset(i * layout.MAPKEY_SIZE) })
+                    i += 1
+                }
+            }
+        }
+    }
+    if cap > 0 {
+        sys.dealloc(stack)
+    }
+    same
+}
+
+/// Whether stored key `k` is the string with text `p`, `n` bytes.
+fn key_eq_text(k: addr, p: addr, n: i64) -> bool {
+    if keys.kind(k) != 2 {
+        return false
+    }
+    var len = 0
+    let q = keys.key_text(k, len)
+    len == n and (n == 0 or unsafe { memcmp(q, p, n) } == 0)
+}
+
+/// Writes at `out` the stored key for the text `p`, `n` bytes, as
+/// `KeyStr::of` makes it: fifteen bytes or fewer inline, zero after the
+/// text; more in a `String` of exactly their length.
+fn key_of_text(p: addr, n: i64, out: addr) {
+    unsafe {
+        if n <= 15 {
+            out.store_i64(layout.KEYSTR_INLINE)
+            var i = 0
+            while i < 15 {
+                out.offset(layout.KEYSTR_BYTES + i).store_u8(0)
+                i += 1
+            }
+            sys.copy(out.offset(layout.KEYSTR_BYTES), p, n)
+            out.offset(layout.KEYSTR_LEN).store_u8(n.as_u8())
+            return
+        }
+        let buf = sys.alloc(n)
+        sys.copy(buf, p, n)
+        let s = out.offset(layout.KEYSTR_STRING)
+        s.offset(layout.VEC_CAP).store_i64(n)
+        s.offset(layout.VEC_PTR).store_addr(buf)
+        s.offset(layout.VEC_LEN).store_i64(n)
+    }
+}
+
+/// The address of element `i` of a list or tuple box.
+fn element(v: addr, i: i64) -> addr {
+    unsafe {
+        if v.offset(layout.LIST_DISC).load_u8().as_i64() == layout.LIST_INLINE {
+            return v.offset(layout.LIST_VALS + 8 * i).load_addr()
+        }
+        v.offset(layout.LIST_VEC).offset(layout.VEC_PTR).load_addr().offset(8 * i).load_addr()
+    }
+}
+
+fn length(v: addr) -> i64 {
+    unsafe {
+        if v.offset(layout.LIST_DISC).load_u8().as_i64() == layout.LIST_INLINE {
+            return v.offset(layout.LIST_LEN).load_u8().as_i64()
+        }
+        v.offset(layout.LIST_VEC).offset(layout.VEC_LEN).load_i64()
+    }
+}
+
+/// Panics as `MapKey::of` does on a value no key can be made of, with the
+/// value shown.
+fn invalid_key(v: addr) {
+    let shown = display.shown(v)
+    unsafe {
+        let n = display.text_len(shown)
+        let p = display.text_ptr(shown)
+        let lead = mem_static_len("invalid map key `")
+        let msg = sys.alloc(lead + n + 1)
+        sys.copy(msg, mem_static("invalid map key `"), lead)
+        sys.copy(msg.offset(lead), p, n)
+        msg.offset(lead + n).store_u8(96)
+        panic.say(msg, lead + n + 1)
+    }
+}
+
+/// Writes at `out` the stored key for the value `v`, as `MapKey::of` makes
+/// it: a bool, an integer, a `u64`, a string, or a tuple of those -- its
+/// components in a boxed slice of keys made here.
+fn key_of(v: addr, out: addr) {
+    var stack = unsafe { mem_addr(0) }
+    var cap = 0
+    var n = 0
+    release.push(stack, cap, n, v)
+    release.push(stack, cap, n, out)
+    while n > 0 {
+        let o = unsafe { stack.offset(8 * (n - 1)).load_addr() }
+        let x = unsafe { stack.offset(8 * (n - 2)).load_addr() }
+        n -= 2
+        let tag = unsafe { x.offset(layout.TAG).load_u8() }.as_i64()
+        unsafe {
+            if tag == layout.TAG_BOOL {
+                o.store_i64(layout.MAPKEY_BOOL)
+                o.offset(layout.MAPKEY_BOOL_AT).store_u8(x.offset(layout.BOOL_AT).load_u8())
+            } else if tag == layout.TAG_I64 {
+                o.store_i64(layout.MAPKEY_I64)
+                o.offset(layout.MAPKEY_AT).store_i64(x.offset(layout.WORD_AT).load_i64())
+            } else if tag == layout.TAG_U64 {
+                o.store_i64(layout.MAPKEY_U64)
+                o.offset(layout.MAPKEY_AT).store_i64(x.offset(layout.WORD_AT).load_i64())
+            } else if tag == layout.TAG_STR {
+                var len = 0
+                let p = strread.text_of(x, len)
+                key_of_text(p, len, o)
+            } else if tag == layout.TAG_TUPLE {
+                let len = length(x)
+                let slice = if len > 0 { sys.alloc(len * layout.MAPKEY_SIZE) } else { mem_addr(8) }
+                o.store_i64(layout.MAPKEY_TUPLE)
+                o.offset(layout.MAPKEY_TUPLE_PTR).store_addr(slice)
+                o.offset(layout.MAPKEY_TUPLE_LEN).store_i64(len)
+                var i = len - 1
+                while i >= 0 {
+                    release.push(stack, cap, n, element(x, i))
+                    release.push(stack, cap, n, slice.offset(i * layout.MAPKEY_SIZE))
+                    i -= 1
+                }
+            } else {
+                invalid_key(x)
+            }
+        }
+    }
+    if cap > 0 {
+        sys.dealloc(stack)
+    }
+}
+
+/// Writes at `dst` a copy of the stored key at `src` that owns its own
+/// buffers, as `MapKey`'s `clone` makes one: each `String` and each slice
+/// exactly as long as it is.
+fn key_clone(src: addr, dst: addr) {
+    var stack = unsafe { mem_addr(0) }
+    var cap = 0
+    var n = 0
+    release.push(stack, cap, n, src)
+    release.push(stack, cap, n, dst)
+    while n > 0 {
+        let o = unsafe { stack.offset(8 * (n - 1)).load_addr() }
+        let x = unsafe { stack.offset(8 * (n - 2)).load_addr() }
+        n -= 2
+        sys.copy(o, x, layout.MAPKEY_SIZE)
+        let w = unsafe { x.load_i64() }
+        unsafe {
+            if w >= 0 {
+                let s = x.offset(layout.KEYSTR_STRING)
+                let len = s.offset(layout.VEC_LEN).load_i64()
+                let d = o.offset(layout.KEYSTR_STRING)
+                if len == 0 {
+                    d.offset(layout.VEC_PTR).store_i64(layout.U8_DANGLING)
+                } else {
+                    let buf = sys.alloc(len)
+                    sys.copy(buf, s.offset(layout.VEC_PTR).load_addr(), len)
+                    d.offset(layout.VEC_PTR).store_addr(buf)
+                }
+                d.offset(layout.VEC_CAP).store_i64(len)
+            } else if w == layout.MAPKEY_TUPLE {
+                let len = x.offset(layout.MAPKEY_TUPLE_LEN).load_i64()
+                let from = x.offset(layout.MAPKEY_TUPLE_PTR).load_addr()
+                let slice = if len > 0 { sys.alloc(len * layout.MAPKEY_SIZE) } else { mem_addr(8) }
+                o.offset(layout.MAPKEY_TUPLE_PTR).store_addr(slice)
+                var i = 0
+                while i < len {
+                    release.push(stack, cap, n, from.offset(i * layout.MAPKEY_SIZE))
+                    release.push(stack, cap, n, slice.offset(i * layout.MAPKEY_SIZE))
+                    i += 1
+                }
+            }
+        }
+    }
+    if cap > 0 {
+        sys.dealloc(stack)
+    }
+}
+
+
+// ----- the table --------------------------------------------------------------
+
+fn ctrl_of(m: addr) -> addr {
+    unsafe { m.offset(layout.MAP_CTRL).load_addr() }
+}
+
+fn mask_of(m: addr) -> i64 {
+    unsafe { m.offset(layout.MAP_MASK).load_i64() }
+}
+
+fn items_of(m: addr) -> i64 {
+    unsafe { m.offset(layout.MAP_ITEMS).load_i64() }
+}
+
+fn growth_of(m: addr) -> i64 {
+    unsafe { m.offset(layout.MAP_GROWTH).load_i64() }
+}
+
+pub fn seed_of(m: addr) -> u64 {
+    unsafe { m.offset(layout.MAP_SEED).load_u64() }
+}
+
+
+fn byte(ctrl: addr, i: i64) -> i64 {
+    unsafe { ctrl.offset(i).load_u8() }.as_i64()
+}
+
+/// The top seven bits of a hash: a full bucket's control byte.
+fn h2(hash: u64) -> i64 {
+    hash.ushr(57).bit_and(127).as_i64()
+}
+
+/// Buckets usable in a table of `mask + 1`: all but one below eight, seven
+/// in eight from there.
+fn capacity(mask: i64) -> i64 {
+    if mask < 8 { mask } else { (mask + 1) / 8 * 7 }
+}
+
+/// Buckets for `cap` entries: four, eight or sixteen below fifteen (and
+/// never fewer than three's worth, for an entry of this size), else the
+/// power of two above eight sevenths of it.
+fn buckets_for(cap: i64) -> i64 {
+    if cap < 15 {
+        let c = if cap < 3 { 3 } else { cap }
+        return if c < 4 { 4 } else if c < 8 { 8 } else { 16 }
+    }
+    let want = cap * 8 / 7
+    var b = 1
+    while b < want {
+        b = b * 2
+    }
+    b
+}
+
+/// Sets bucket `i`'s control byte and its copy past the end.
+fn set_ctrl(ctrl: addr, mask: i64, i: i64, b: i64) {
+    unsafe {
+        ctrl.offset(i).store_u8(b.as_u8())
+        ctrl.offset((i - GROUP).bit_and(mask) + GROUP).store_u8(b.as_u8())
+    }
+}
+
+/// The first bucket of a group of eight from `pos` whose control byte is
+/// EMPTY or DELETED, or -1.
+fn first_special(ctrl: addr, pos: i64) -> i64 {
+    var j = 0
+    while j < GROUP {
+        if byte(ctrl, pos + j) >= 128 {
+            return j
+        }
+        j += 1
+    }
+    -1
+}
+
+fn has_empty(ctrl: addr, pos: i64) -> bool {
+    var j = 0
+    while j < GROUP {
+        if byte(ctrl, pos + j) == EMPTY {
+            return true
+        }
+        j += 1
+    }
+    false
+}
+
+/// Where an entry with hash `hash` would go: the first EMPTY or DELETED
+/// bucket along its probe -- in a table smaller than a group, past a full
+/// bucket the trailing bytes made look free, the first one from the start.
+fn insert_slot(ctrl: addr, mask: i64, hash: u64) -> i64 {
+    var pos = hash.as_i64().bit_and(mask)
+    var stride = 0
+    while true {
+        let j = first_special(ctrl, pos)
+        if j >= 0 {
+            var i = (pos + j).bit_and(mask)
+            if byte(ctrl, i) < 128 {
+                i = first_special(ctrl, 0)
+            }
+            return i
+        }
+        stride += GROUP
+        pos = (pos + stride).bit_and(mask)
+    }
+    -1
+}
+
+/// The bucket holding the string key with text `p`, `n` bytes, or -1.
+fn find_text(m: addr, hash: u64, p: addr, n: i64) -> i64 {
+    let ctrl = ctrl_of(m)
+    let mask = mask_of(m)
+    let tag = h2(hash)
+    var pos = hash.as_i64().bit_and(mask)
+    var stride = 0
+    while true {
+        var j = 0
+        while j < GROUP {
+            if byte(ctrl, pos + j) == tag {
+                let i = (pos + j).bit_and(mask)
+                if key_eq_text(keys.entry(ctrl, i), p, n) {
+                    return i
+                }
+            }
+            j += 1
+        }
+        if has_empty(ctrl, pos) {
+            return -1
+        }
+        stride += GROUP
+        pos = (pos + stride).bit_and(mask)
+    }
+    -1
+}
+
+/// The bucket holding a key equal to the stored key `k`, or -1.
+pub fn find_key(m: addr, hash: u64, k: addr) -> i64 {
+    let ctrl = ctrl_of(m)
+    let mask = mask_of(m)
+    let tag = h2(hash)
+    var pos = hash.as_i64().bit_and(mask)
+    var stride = 0
+    while true {
+        var j = 0
+        while j < GROUP {
+            if byte(ctrl, pos + j) == tag {
+                let i = (pos + j).bit_and(mask)
+                if key_eq(keys.entry(ctrl, i), k) {
+                    return i
+                }
+            }
+            j += 1
+        }
+        if has_empty(ctrl, pos) {
+            return -1
+        }
+        stride += GROUP
+        pos = (pos + stride).bit_and(mask)
+    }
+    -1
+}
+
+/// The shared group of EMPTY bytes empty tables point at, made once.
+fn empty_group() -> addr {
+    unsafe {
+        let have = mem_process(EMPTY_GROUP).atomic_load_i64(Acquire)
+        if have != 0 {
+            return mem_addr(have)
+        }
+        let g = sys.alloc(GROUP)
+        g.store_i64(-1)
+        let was = mem_process(EMPTY_GROUP).atomic_cas_i64(0, g.as_i64(), AcqRel)
+        if was != 0 {
+            sys.dealloc(g)
+            return mem_addr(was)
+        }
+        g
+    }
+}
+
+/// A table of `buckets` buckets, every control byte EMPTY, into map `m`.
+fn new_table(m: addr, buckets: i64) {
+    unsafe {
+        let base = sys.alloc(buckets * layout.MAP_ENTRY + buckets + GROUP)
+        let ctrl = base.offset(buckets * layout.MAP_ENTRY)
+        var i = 0
+        while i < buckets + GROUP {
+            ctrl.offset(i).store_u8(255)
+            i += 1
+        }
+        m.offset(layout.MAP_CTRL).store_addr(ctrl)
+        m.offset(layout.MAP_MASK).store_i64(buckets - 1)
+        m.offset(layout.MAP_GROWTH).store_i64(capacity(buckets - 1))
+        m.offset(layout.MAP_ITEMS).store_i64(0)
+    }
+}
+
+/// Frees a table's one allocation; the shared empty one has none.
+fn free_table(ctrl: addr, mask: i64) {
+    if mask != 0 {
+        sys.dealloc(unsafe { ctrl.offset(-(mask + 1) * layout.MAP_ENTRY) })
+    }
+}
+
+/// Moves every entry of `m` into a new table with room for `cap`, in bucket
+/// order, each to where its hash puts it there; frees the old one.
+fn resize(m: addr, cap: i64) {
+    let old = ctrl_of(m)
+    let old_mask = mask_of(m)
+    let items = items_of(m)
+    let seed = seed_of(m)
+    new_table(m, buckets_for(cap))
+    let ctrl = ctrl_of(m)
+    let mask = mask_of(m)
+    if items > 0 {
+        var i = 0
+        while i <= old_mask {
+            if byte(old, i) < 128 {
+                let e = keys.entry(old, i)
+                let hash = hash_key(seed, e)
+                let at = insert_slot(ctrl, mask, hash)
+                set_ctrl(ctrl, mask, at, h2(hash))
+                sys.copy(keys.entry(ctrl, at), e, layout.MAP_ENTRY)
+            }
+            i += 1
+        }
+    }
+    unsafe {
+        m.offset(layout.MAP_GROWTH).store_i64(growth_of(m) - items)
+        m.offset(layout.MAP_ITEMS).store_i64(items)
+    }
+    free_table(old, old_mask)
+}
+
+/// Swaps entries `a` and `b`, a word at a time.
+fn swap_entries(x: addr, y: addr) {
+    var k = 0
+    while k < layout.MAP_ENTRY {
+        unsafe {
+            let w = x.offset(k).load_i64()
+            x.offset(k).store_i64(y.offset(k).load_i64())
+            y.offset(k).store_i64(w)
+        }
+        k += 8
+    }
+}
+
+/// Puts every entry back where its hash would put it now, in the same
+/// allocation: what `rehash_in_place` does when tombstones hold the room a
+/// table needs.
+fn rehash_in_place(m: addr) {
+    let ctrl = ctrl_of(m)
+    let mask = mask_of(m)
+    let buckets = mask + 1
+    let seed = seed_of(m)
+    // Every full byte DELETED, every special one EMPTY, a group at a time;
+    // then the copy past the end made again.
+    var g = 0
+    while g < buckets {
+        var j = 0
+        while j < GROUP {
+            let b = byte(ctrl, g + j)
+            unsafe { ctrl.offset(g + j).store_u8(if b >= 128 { 255.as_u8() } else { 128.as_u8() }) }
+            j += 1
+        }
+        g += GROUP
+    }
+    if buckets < GROUP {
+        sys.copy(unsafe { ctrl.offset(GROUP) }, ctrl, buckets)
+    } else {
+        sys.copy(unsafe { ctrl.offset(buckets) }, ctrl, GROUP)
+    }
+    var i = 0
+    while i < buckets {
+        if byte(ctrl, i) == DELETED {
+            var moving = true
+            while moving {
+                let hash = hash_key(seed, keys.entry(ctrl, i))
+                let to = insert_slot(ctrl, mask, hash)
+                let pos = hash.as_i64().bit_and(mask)
+                if ((i - pos).bit_and(mask)) / GROUP == ((to - pos).bit_and(mask)) / GROUP {
+                    set_ctrl(ctrl, mask, i, h2(hash))
+                    moving = false
+                } else {
+                    let prev = byte(ctrl, to)
+                    set_ctrl(ctrl, mask, to, h2(hash))
+                    if prev == EMPTY {
+                        set_ctrl(ctrl, mask, i, EMPTY)
+                        sys.copy(keys.entry(ctrl, to), keys.entry(ctrl, i), layout.MAP_ENTRY)
+                        moving = false
+                    } else {
+                        swap_entries(keys.entry(ctrl, i), keys.entry(ctrl, to))
+                    }
+                }
+            }
+        }
+        i += 1
+    }
+    unsafe { m.offset(layout.MAP_GROWTH).store_i64(capacity(mask) - items_of(m)) }
+}
+
+/// Room for `more` entries: nothing when there is; else the tombstones
+/// cleared in place when that leaves half the table free, or a table with
+/// room for at least one more than this one holds.
+fn reserve(m: addr, more: i64) {
+    if more <= growth_of(m) {
+        return
+    }
+    let want = items_of(m) + more
+    let full = capacity(mask_of(m))
+    if want <= full / 2 {
+        rehash_in_place(m)
+    } else {
+        resize(m, if want > full + 1 { want } else { full + 1 })
+    }
+}
+
+/// A new entry's bucket for hash `hash`, counted in -- the caller writes the
+/// entry -- after making room as `HashMap::insert` does.
+fn insert_new(m: addr, hash: u64) -> i64 {
+    reserve(m, 1)
+    let ctrl = ctrl_of(m)
+    let mask = mask_of(m)
+    let i = insert_slot(ctrl, mask, hash)
+    unsafe {
+        if byte(ctrl, i) == EMPTY {
+            m.offset(layout.MAP_GROWTH).store_i64(growth_of(m) - 1)
+        }
+        set_ctrl(ctrl, mask, i, h2(hash))
+        m.offset(layout.MAP_ITEMS).store_i64(items_of(m) + 1)
+    }
+    i
+}
+
+/// Takes bucket `i`'s entry out of the table: its control byte EMPTY when
+/// the groups around it have an EMPTY byte near enough that no probe could
+/// have passed it -- one more usable bucket -- else DELETED.
+fn erase(m: addr, i: i64) {
+    let ctrl = ctrl_of(m)
+    let mask = mask_of(m)
+    let before = (i - GROUP).bit_and(mask)
+    // Non-EMPTY bytes at the end of the group before, and at the start of
+    // the group at `i`.
+    var lead = 0
+    var j = GROUP - 1
+    while j >= 0 and byte(ctrl, before + j) != EMPTY {
+        lead += 1
+        j -= 1
+    }
+    var trail = 0
+    j = 0
+    while j < GROUP and byte(ctrl, i + j) != EMPTY {
+        trail += 1
+        j += 1
+    }
+    var b = DELETED
+    if lead + trail < GROUP {
+        b = EMPTY
+        unsafe { m.offset(layout.MAP_GROWTH).store_i64(growth_of(m) + 1) }
+    }
+    set_ctrl(ctrl, mask, i, b)
+    unsafe { m.offset(layout.MAP_ITEMS).store_i64(items_of(m) - 1) }
+}
+
+// ----- maps -------------------------------------------------------------------
+
+/// This runtime's seed, drawn from the operating system once: a failure to
+/// read it is a panic, never a weaker seed.
+fn process_seed() -> u64 {
+    unsafe {
+        if mem_process(SEED_STATE).atomic_load_i64(Acquire) == 2 {
+            return mem_process(SEED).atomic_load_u64(Acquire)
+        }
+        if mem_process(SEED_STATE).atomic_cas_i64(0, 1, AcqRel) == 0 {
+            let at = sys.alloc(8)
+            if getentropy(at, 8) != 0 {
+                panic.say(mem_static("cannot read the operating system's entropy to seed map hashing"), mem_static_len("cannot read the operating system's entropy to seed map hashing"))
+            }
+            mem_process(SEED).atomic_store_u64(at.load_u64(), Release)
+            sys.dealloc(at)
+            mem_process(SEED_STATE).atomic_store_i64(2, Release)
+        }
+        while mem_process(SEED_STATE).atomic_load_i64(Acquire) != 2 {}
+        mem_process(SEED).atomic_load_u64(Acquire)
+    }
+}
+
+/// An empty map: the shared empty table, and this process's seed.
+fn new_map() -> addr {
+    let m = alloc.take()
+    unsafe {
+        m.offset(layout.TAG).store_u8(layout.TAG_MAP.as_u8())
+        m.offset(layout.MAP_CTRL).store_addr(empty_group())
+        m.offset(layout.MAP_MASK).store_i64(0)
+        m.offset(layout.MAP_GROWTH).store_i64(0)
+        m.offset(layout.MAP_ITEMS).store_i64(0)
+        m.offset(layout.MAP_SEED).store_u64(process_seed())
+        m.offset(layout.MAP_SEED + 8).store_i64(0)
+    }
+    m
+}
+
+fn is_map(m: addr) -> bool {
+    unsafe { m.offset(layout.TAG).load_u8() }.as_i64() == layout.TAG_MAP
+}
+
+fn not_map(what: i64) {
+    unsafe {
+        if what == 0 {
+            panic.say(mem_static("get on non-map"), mem_static_len("get on non-map"))
+        } else if what == 1 {
+            panic.say(mem_static("has on non-map"), mem_static_len("has on non-map"))
+        } else if what == 2 {
+            panic.say(mem_static("len on non-map"), mem_static_len("len on non-map"))
+        } else if what == 3 {
+            panic.say(mem_static("keys on non-map"), mem_static_len("keys on non-map"))
+        } else if what == 4 {
+            panic.say(mem_static("entries on non-map"), mem_static_len("entries on non-map"))
+        } else if what == 5 {
+            panic.say(mem_static("values on non-map"), mem_static_len("values on non-map"))
+        } else if what == 6 {
+            panic.say(mem_static("is_empty on non-map"), mem_static_len("is_empty on non-map"))
+        } else {
+            panic.say(mem_static("map op on non-map"), mem_static_len("map op on non-map"))
+        }
+    }
+}
+
+/// The map itself when nothing else holds it, else a copy that nothing else
+/// does, as `cow_map` makes one: its entries in bucket order, each key
+/// copied and each value counted once more, into a table with room for them
+/// all and this process's seed; the one given loses a count.
+fn owned(m: addr) -> addr {
+    unsafe {
+        if m.atomic_load_i64(Relaxed) == 1 {
+            return m
+        }
+        if not is_map(m) {
+            not_map(7)
+        }
+        let items = items_of(m)
+        let copy = new_map()
+        if items > 0 {
+            new_table(copy, buckets_for(items))
+        }
+        let from = ctrl_of(m)
+        let fmask = mask_of(m)
+        let seed = seed_of(copy)
+        if items > 0 {
+            var i = 0
+            while i <= fmask {
+                if byte(from, i) < 128 {
+                    let e = keys.entry(from, i)
+                    let v = e.offset(layout.MAP_ENTRY_VAL).load_addr()
+                    val.inc(v)
+                    let hash = hash_key(seed, e)
+                    let at = insert_new(copy, hash)
+                    let d = keys.entry(ctrl_of(copy), at)
+                    key_clone(e, d)
+                    d.offset(layout.MAP_ENTRY_VAL).store_addr(v)
+                }
+                i += 1
+            }
+        }
+        val.dec(m)
+        copy
+    }
+}
+
+/// The bucket of value `k` as a key in `m`, or -1: a string's text hashed
+/// and compared where it is; any other key made, as `MapKey::of` makes it,
+/// for the search, and freed after.
+fn lookup(m: addr, k: addr) -> i64 {
+    unsafe {
+        let tag = k.offset(layout.TAG).load_u8().as_i64()
+        if tag == layout.TAG_STR {
+            var n = 0
+            let p = strread.text_of(k, n)
+            return find_text(m, hash_text(seed_of(m), p, n), p, n)
+        }
+        let probe = sys.alloc(layout.MAPKEY_SIZE)
+        key_of(k, probe)
+        let at = find_key(m, hash_key(seed_of(m), probe), probe)
+        release.drop_key(probe)
+        sys.dealloc(probe)
+        at
+    }
+}
+
+/// A new entry for value `k` as a key, holding `v`.
+fn insert_value(m: addr, k: addr, v: addr) {
+    unsafe {
+        let probe = sys.alloc(layout.MAPKEY_SIZE)
+        key_of(k, probe)
+        let at = insert_new(m, hash_key(seed_of(m), probe))
+        let e = keys.entry(ctrl_of(m), at)
+        sys.copy(e, probe, layout.MAPKEY_SIZE)
+        e.offset(layout.MAP_ENTRY_VAL).store_addr(v)
+        sys.dealloc(probe)
+    }
+}
+
+/// A new entry for the string key with text `p`, `n` bytes, holding `v`.
+fn insert_text(m: addr, p: addr, n: i64, v: addr) {
+    let at = insert_new(m, hash_text(seed_of(m), p, n))
+    let e = keys.entry(ctrl_of(m), at)
+    key_of_text(p, n, e)
+    unsafe { e.offset(layout.MAP_ENTRY_VAL).store_addr(v) }
+}
+
+/// Bucket `i`'s value.
+fn value_at(m: addr, i: i64) -> addr {
+    unsafe { keys.entry(ctrl_of(m), i).offset(layout.MAP_ENTRY_VAL).load_addr() }
+}
+
+fn set_value_at(m: addr, i: i64, v: addr) {
+    unsafe { keys.entry(ctrl_of(m), i).offset(layout.MAP_ENTRY_VAL).store_addr(v) }
+}
+
+export fn grt_map_new() -> addr {
+    new_map()
+}
+
+/// `m.set(k, v)`: the value replaced when the key is there (the key already
+/// in the table kept), else a new entry. The key's count is spent here.
+export fn grt_map_set(m: addr, k: addr, v: addr) -> addr {
+    let t = owned(m)
+    let at = lookup(t, k)
+    if at >= 0 {
+        let old = value_at(t, at)
+        set_value_at(t, at, v)
+        val.dec(old)
+    } else {
+        insert_value(t, k, v)
+    }
+    val.dec(k)
+    t
+}
+
+/// `m.set(k, v)` with the key's text at `p`, no string value made for it.
+export fn grt_map_set_bytes(m: addr, p: addr, n: i64, v: addr) -> addr {
+    let t = owned(m)
+    let at = find_text(t, hash_text(seed_of(t), p, n), p, n)
+    if at >= 0 {
+        let old = value_at(t, at)
+        set_value_at(t, at, v)
+        val.dec(old)
+    } else {
+        insert_text(t, p, n, v)
+    }
+    t
+}
+
+/// The value for `k` with a count for the caller, or null.
+export fn grt_map_get_ptr(m: addr, k: addr) -> addr {
+    if not is_map(m) {
+        not_map(0)
+    }
+    let at = lookup(m, k)
+    if at < 0 {
+        return unsafe { mem_addr(0) }
+    }
+    let v = value_at(m, at)
+    val.inc(v)
+    v
+}
+
+export fn grt_map_get_ptr_bytes(m: addr, p: addr, n: i64) -> addr {
+    if not is_map(m) {
+        not_map(0)
+    }
+    let at = find_text(m, hash_text(seed_of(m), p, n), p, n)
+    if at < 0 {
+        return unsafe { mem_addr(0) }
+    }
+    let v = value_at(m, at)
+    val.inc(v)
+    v
+}
+
+/// A variant of `Option`, `Some` holding `v` or `None`, its names static
+/// bytes: variants are told apart by their names' text, never by where the
+/// names are.
+pub fn option(v: addr) -> addr {
+    let o = alloc.take()
+    unsafe {
+        o.offset(layout.TAG).store_u8(layout.TAG_VARIANT.as_u8())
+        let t = o.offset(layout.VARIANT_TYPE)
+        t.offset(layout.STRREF_PTR).store_addr(mem_static("Option"))
+        t.offset(layout.STRREF_LEN).store_i64(mem_static_len("Option"))
+        let nm = o.offset(layout.VARIANT_NAME)
+        if v.as_i64() == 0 {
+            nm.offset(layout.STRREF_PTR).store_addr(mem_static("None"))
+            nm.offset(layout.STRREF_LEN).store_i64(mem_static_len("None"))
+            o.offset(layout.VARIANT_FIELDS).store_i64(0)
+            o.offset(layout.VARIANT_NFIELDS).store_i64(0)
+        } else {
+            nm.offset(layout.STRREF_PTR).store_addr(mem_static("Some"))
+            nm.offset(layout.STRREF_LEN).store_i64(mem_static_len("Some"))
+            o.offset(layout.VARIANT_FIELDS).store_addr(v)
+            o.offset(layout.VARIANT_NFIELDS).store_i64(1)
+        }
+    }
+    o
+}
+
+export fn grt_map_get(m: addr, k: addr) -> addr {
+    if not is_map(m) {
+        not_map(0)
+    }
+    let at = lookup(m, k)
+    if at < 0 {
+        return option(unsafe { mem_addr(0) })
+    }
+    let v = value_at(m, at)
+    val.inc(v)
+    option(v)
+}
+
+export fn grt_map_has(m: addr, k: addr) -> i8 {
+    if not is_map(m) {
+        not_map(1)
+    }
+    if lookup(m, k) >= 0 { 1.as_i8() } else { 0.as_i8() }
+}
+
+/// `m.delete(k)`: the entry taken out and its value released; whether it
+/// was there written at `found`.
+export fn grt_map_delete(m: addr, k: addr, found: addr) -> addr {
+    let t = owned(m)
+    let at = lookup(t, k)
+    unsafe {
+        if at < 0 {
+            found.store_u8(0)
+            return t
+        }
+        let e = keys.entry(ctrl_of(t), at)
+        let v = e.offset(layout.MAP_ENTRY_VAL).load_addr()
+        erase(t, at)
+        release.drop_key(e)
+        val.dec(v)
+        found.store_u8(1)
+    }
+    t
+}
+
+export fn grt_map_len(m: addr) -> i64 {
+    if not is_map(m) {
+        not_map(2)
+    }
+    items_of(m)
+}
+
+export fn grt_map_is_empty(m: addr) -> i8 {
+    if not is_map(m) {
+        not_map(6)
+    }
+    if items_of(m) == 0 { 1.as_i8() } else { 0.as_i8() }
+}
+
+/// `n` counted in at bucket `at`: `m.set(k, (m.get(k) ?? d) + n)` in one
+/// probe. A value that is small has an interned box; a box nothing else
+/// holds is written where it is; else a new box.
+fn add_at(t: addr, at: i64, delta: i64) {
+    unsafe {
+        let cur = value_at(t, at)
+        if cur.offset(layout.TAG).load_u8().as_i64() != layout.TAG_I64 {
+            panic.say(mem_static("map_add on a map whose values are not integers"), mem_static_len("map_add on a map whose values are not integers"))
+        }
+        let new = cur.offset(layout.WORD_AT).load_i64() + delta
+        if new >= alloc.SMALL_MIN and new <= alloc.SMALL_MAX {
+            set_value_at(t, at, boxes.int(new))
+            val.dec(cur)
+        } else if cur.atomic_load_i64(Relaxed) == 1 {
+            cur.offset(layout.WORD_AT).store_i64(new)
+        } else {
+            set_value_at(t, at, boxes.int(new))
+            val.dec(cur)
+        }
+    }
+}
+
+export fn grt_map_add_i64(m: addr, k: addr, delta: i64, default: i64) -> addr {
+    let t = owned(m)
+    let at = lookup(t, k)
+    if at >= 0 {
+        add_at(t, at, delta)
+    } else {
+        insert_value(t, k, boxes.int(default + delta))
+    }
+    val.dec(k)
+    t
+}
+
+export fn grt_map_add_i64_bytes(m: addr, p: addr, n: i64, delta: i64, default: i64) -> addr {
+    let t = owned(m)
+    let at = find_text(t, hash_text(seed_of(t), p, n), p, n)
+    if at >= 0 {
+        add_at(t, at, delta)
+    } else {
+        insert_text(t, p, n, boxes.int(default + delta))
+    }
+    t
+}
+
+// ----- iteration, in key order ------------------------------------------------
+
+
+/// A list box holding `n` elements in a `Vec` exactly that long -- what
+/// `alloc(List(vec.into()))` makes of a collected `Vec` -- with its buffer.
+fn heap_list(tag: i64, n: i64, inout at: addr) -> addr {
+    let l = alloc.take()
+    unsafe {
+        l.offset(layout.TAG).store_u8(tag.as_u8())
+        l.offset(layout.LIST_DISC).store_u8(layout.LIST_HEAP.as_u8())
+        let vec = l.offset(layout.LIST_VEC)
+        at = if n > 0 { sys.alloc(8 * n) } else { mem_addr(layout.WORDS_DANGLING) }
+        vec.offset(layout.VEC_PTR).store_addr(at)
+        vec.offset(layout.VEC_LEN).store_i64(n)
+        vec.offset(layout.VEC_CAP).store_i64(n)
+    }
+    l
+}
+
+/// A value for the stored key `k`, as `MapKey::boxed` makes it: a bool's and
+/// a small integer's interned box, a `u64`, a string, or a tuple of those --
+/// its components in a `Vec` of their own.
+fn box_key(k: addr) -> addr {
+    var stack = unsafe { mem_addr(0) }
+    var cap = 0
+    var n = 0
+    var out = unsafe { mem_addr(0) }
+    // Pairs: a key, and where its value goes (null for the outermost).
+    release.push(stack, cap, n, k)
+    release.push(stack, cap, n, unsafe { mem_addr(0) })
+    while n > 0 {
+        let to = unsafe { stack.offset(8 * (n - 1)).load_addr() }
+        let x = unsafe { stack.offset(8 * (n - 2)).load_addr() }
+        n -= 2
+        let kd = keys.kind(x)
+        var v = unsafe { mem_addr(0) }
+        unsafe {
+            if kd == 0 {
+                v = boxes.boolean(x.offset(layout.MAPKEY_BOOL_AT).load_u8().as_i64() != 0)
+            } else if kd == 1 {
+                v = boxes.int(x.offset(layout.MAPKEY_AT).load_i64())
+            } else if kd == 3 {
+                v = boxes.unsigned(x.offset(layout.MAPKEY_AT).load_i64())
+            } else if kd == 2 {
+                var len = 0
+                let p = keys.key_text(x, len)
+                v = numstr.new_str(p, len)
+            } else {
+                let len = x.offset(layout.MAPKEY_TUPLE_LEN).load_i64()
+                let parts = x.offset(layout.MAPKEY_TUPLE_PTR).load_addr()
+                var slots = mem_addr(0)
+                v = heap_list(layout.TAG_TUPLE, len, slots)
+                var i = len - 1
+                while i >= 0 {
+                    release.push(stack, cap, n, parts.offset(i * layout.MAPKEY_SIZE))
+                    release.push(stack, cap, n, slots.offset(8 * i))
+                    i -= 1
+                }
+            }
+            if to.as_i64() == 0 {
+                out = v
+            } else {
+                to.store_addr(v)
+            }
+        }
+    }
+    if cap > 0 {
+        sys.dealloc(stack)
+    }
+    out
+}
+
+/// What iteration presents, as a list in key order: the keys (0), the
+/// values (1), or (key, value) tuples (2).
+fn listing(m: addr, what: i64) -> addr {
+    let n = items_of(m)
+    let order = keys.sorted(m, n)
+    var at = unsafe { mem_addr(0) }
+    let l = heap_list(layout.TAG_LIST, n, at)
+    var i = 0
+    while i < n {
+        let e = unsafe { order.offset(8 * i).load_addr() }
+        let v = unsafe { e.offset(layout.MAP_ENTRY_VAL).load_addr() }
+        var item = unsafe { mem_addr(0) }
+        if what == 0 {
+            item = box_key(e)
+        } else if what == 1 {
+            val.inc(v)
+            item = v
+        } else {
+            // A pair, in the box itself.
+            let kv = box_key(e)
+            val.inc(v)
+            item = alloc.take()
+            unsafe {
+                item.offset(layout.TAG).store_u8(layout.TAG_TUPLE.as_u8())
+                item.offset(layout.LIST_DISC).store_u8(layout.LIST_INLINE.as_u8())
+                item.offset(layout.LIST_LEN).store_u8(2.as_u8())
+                item.offset(layout.LIST_VALS).store_addr(kv)
+                item.offset(layout.LIST_VALS + 8).store_addr(v)
+                item.offset(layout.LIST_VALS + 16).store_i64(0)
+                item.offset(layout.LIST_VALS + 24).store_i64(0)
+            }
+        }
+        unsafe { at.offset(8 * i).store_addr(item) }
+        i += 1
+    }
+    sys.dealloc(order)
+    l
+}
+
+export fn grt_map_keys(m: addr) -> addr {
+    if not is_map(m) {
+        not_map(3)
+    }
+    listing(m, 0)
+}
+
+export fn grt_map_values(m: addr) -> addr {
+    if not is_map(m) {
+        not_map(5)
+    }
+    listing(m, 1)
+}
+
+export fn grt_map_entries(m: addr) -> addr {
+    if not is_map(m) {
+        not_map(4)
+    }
+    listing(m, 2)
+}

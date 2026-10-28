@@ -1,0 +1,861 @@
+// Concurrent tasks and channels (docs/concurrency.md; docs/self-hosting.md
+// §6.11), scheduled exactly as the Rust runtime and the interpreter schedule
+// them ([E-SCHEDULE]).
+//
+// Tasks are fibers (`fiber.gr`) on the thread that ran the `concurrent`
+// block, one running at a time, switching only when a channel operation has
+// to wait. They start runnable in the order their `go`s ran; a round runs
+// whatever is runnable at its start, in order, and a task that gives way is
+// runnable again only when a channel operation wakes it -- the longest
+// waiting on that side of that channel, one at a time; closing wakes all.
+// When nothing is runnable and some task is alive, every task is waiting and
+// nothing can wake one: a deadlock, and a panic ([E-DEADLOCK]).
+//
+// Channels live in one table for the process, as the Rust runtime's do -- a
+// channel is a plain integer, and a `par_map` worker may make one -- held in
+// process cells guarded by a lock built from a compare-and-swap
+// (`CHAN_LOCK`). A wake is delivered to the block that owns the task, which
+// need not be the one waking it; and a waiter that has since been woken or
+// has ended is skipped, by a flag per task per block. What channels still
+// hold at the end is released before the leak check counts (`leak.gr`).
+import layout
+import sys
+import alloc
+import val
+import maps
+import funcs
+import fiber
+import panic
+
+/// The lock: 0 free, 1 held.
+process_local CHAN_LOCK: i64
+/// The channels: an array of their records, how many, and room for how many.
+/// rtlint: guarded by CHAN_LOCK
+process_local CHANS: i64
+/// rtlint: guarded by CHAN_LOCK
+process_local NCHANS: i64
+/// rtlint: guarded by CHAN_LOCK
+process_local CHANCAP: i64
+/// Tasks woken, for whichever scheduler owns each: a queue of (block, slot).
+/// rtlint: guarded by CHAN_LOCK
+process_local READY: i64
+/// The open blocks: (id, flags, slots) records -- a flag per slot, set while
+/// that task is really in a queue -- how many, and room.
+/// rtlint: guarded by CHAN_LOCK
+process_local BLOCKS: i64
+/// rtlint: guarded by CHAN_LOCK
+process_local NBLOCKS: i64
+/// rtlint: guarded by CHAN_LOCK
+process_local BLOCKCAP: i64
+/// The last block id handed out.
+/// rtlint: guarded by CHAN_LOCK
+process_local NEXT_BLOCK: i64
+
+/// The block running on this thread and the slot of the task in it, so a
+/// channel operation that has to wait knows whom to queue.
+thread_local HERE_BLOCK: i64
+thread_local HERE_SLOT: i64
+
+/// Room below a task's floor for the runtime's own frames.
+let TASK_MARGIN = 524288
+
+// A channel: senders waiting for room and receivers waiting for a value
+// (queues of (block, slot)), the values it holds (a queue), how many it
+// holds before a send waits (0 a rendezvous), whether closed, and how many
+// values have been sent and taken.
+let C_ROOM = 0
+let C_VALUE = 8
+let C_BUF = 16
+let C_CAP = 24
+let C_CLOSED = 32
+let C_SENT = 40
+let C_TAKEN = 48
+let C_SIZE = 56
+
+// A queue: its buffer, room (in entries), first entry and length; `w` words
+// an entry.
+let Q_BUF = 0
+let Q_CAP = 8
+let Q_HEAD = 16
+let Q_LEN = 24
+
+let ROOM = 0
+let VALUE = 1
+
+fn say(p: addr, n: i64) {
+    panic.say(p, n)
+}
+
+fn deadlock() {
+    unsafe { say(mem_static("deadlock: every task is waiting on a channel, and nothing left can send or receive"), mem_static_len("deadlock: every task is waiting on a channel, and nothing left can send or receive")) }
+}
+
+// ----- queues ---------------------------------------------------------------------
+
+fn q_new() -> addr {
+    sys.alloc_zeroed(32)
+}
+
+fn q_len(q: addr) -> i64 {
+    unsafe { q.offset(Q_LEN).load_i64() }
+}
+
+/// Entry `i` from the front, word `k` of it.
+fn q_at(q: addr, w: i64, i: i64, k: i64) -> i64 {
+    unsafe {
+        let cap = q.offset(Q_CAP).load_i64()
+        let at = (q.offset(Q_HEAD).load_i64() + i) % cap
+        q.offset(Q_BUF).load_addr().offset(8 * (w * at + k)).load_i64()
+    }
+}
+
+fn q_push(q: addr, w: i64, a: i64, b: i64) {
+    unsafe {
+        let n = q.offset(Q_LEN).load_i64()
+        let cap = q.offset(Q_CAP).load_i64()
+        if n == cap {
+            // Into a new buffer, in order from the front.
+            let want = if cap == 0 { 8 } else { 2 * cap }
+            let buf = sys.alloc(8 * w * want)
+            var i = 0
+            while i < n {
+                buf.offset(8 * w * i).store_i64(q_at(q, w, i, 0))
+                if w > 1 {
+                    buf.offset(8 * (w * i + 1)).store_i64(q_at(q, w, i, 1))
+                }
+                i += 1
+            }
+            if cap > 0 {
+                sys.dealloc(q.offset(Q_BUF).load_addr())
+            }
+            q.offset(Q_BUF).store_addr(buf)
+            q.offset(Q_CAP).store_i64(want)
+            q.offset(Q_HEAD).store_i64(0)
+        }
+        let c = q.offset(Q_CAP).load_i64()
+        let at = (q.offset(Q_HEAD).load_i64() + n) % c
+        let slot = q.offset(Q_BUF).load_addr().offset(8 * w * at)
+        slot.store_i64(a)
+        if w > 1 {
+            slot.offset(8).store_i64(b)
+        }
+        q.offset(Q_LEN).store_i64(n + 1)
+    }
+}
+
+/// The front entry's words into `a` and `b`, removed; false when empty.
+fn q_pop(q: addr, w: i64, inout a: i64, inout b: i64) -> bool {
+    unsafe {
+        let n = q.offset(Q_LEN).load_i64()
+        if n == 0 {
+            return false
+        }
+        a = q_at(q, w, 0, 0)
+        b = if w > 1 { q_at(q, w, 0, 1) } else { 0 }
+        let cap = q.offset(Q_CAP).load_i64()
+        q.offset(Q_HEAD).store_i64((q.offset(Q_HEAD).load_i64() + 1) % cap)
+        q.offset(Q_LEN).store_i64(n - 1)
+        true
+    }
+}
+
+fn q_free(q: addr) {
+    unsafe {
+        if q.offset(Q_CAP).load_i64() > 0 {
+            sys.dealloc(q.offset(Q_BUF).load_addr())
+        }
+    }
+    sys.dealloc(q)
+}
+
+// ----- the table, under its lock ----------------------------------------------------
+
+fn lock() {
+    unsafe {
+        while mem_process(CHAN_LOCK).atomic_cas_i64(0, 1, Acquire) != 0 {}
+    }
+}
+
+fn unlock() {
+    unsafe { mem_process(CHAN_LOCK).atomic_store_i64(0, Release) }
+}
+
+/// rtlint: holds CHAN_LOCK
+fn chan(at: i64) -> addr {
+    unsafe { mem_addr(mem_process(CHANS).load_i64()).offset(8 * at).load_addr() }
+}
+
+/// rtlint: holds CHAN_LOCK
+fn nchans() -> i64 {
+    unsafe { mem_process(NCHANS).load_i64() }
+}
+
+/// rtlint: holds CHAN_LOCK
+fn ready() -> addr {
+    unsafe {
+        var q = mem_process(READY).load_i64()
+        if q == 0 {
+            q = q_new().as_i64()
+            mem_process(READY).store_i64(q)
+        }
+        mem_addr(q)
+    }
+}
+
+/// The record of block `id`; null when it is not open.
+/// rtlint: holds CHAN_LOCK
+fn block_of(id: i64) -> addr {
+    unsafe {
+        let n = mem_process(NBLOCKS).load_i64()
+        let t = mem_addr(mem_process(BLOCKS).load_i64())
+        var i = 0
+        while i < n {
+            if t.offset(24 * i).load_i64() == id {
+                return t.offset(24 * i)
+            }
+            i += 1
+        }
+        mem_addr(0)
+    }
+}
+
+/// rtlint: holds CHAN_LOCK
+fn open_block(id: i64, slots: i64) {
+    unsafe {
+        let n = mem_process(NBLOCKS).load_i64()
+        let cap = mem_process(BLOCKCAP).load_i64()
+        if n == cap {
+            let want = if cap == 0 { 4 } else { 2 * cap }
+            let t = if cap == 0 { sys.alloc(24 * want) } else { sys.grow(mem_addr(mem_process(BLOCKS).load_i64()), 24 * want) }
+            mem_process(BLOCKS).store_i64(t.as_i64())
+            mem_process(BLOCKCAP).store_i64(want)
+        }
+        let r = mem_addr(mem_process(BLOCKS).load_i64()).offset(24 * n)
+        r.store_i64(id)
+        r.offset(8).store_addr(sys.alloc_zeroed(slots + 8))
+        r.offset(16).store_i64(slots)
+        mem_process(NBLOCKS).store_i64(n + 1)
+    }
+}
+
+/// Forgets block `id` and any wake still waiting for it.
+/// rtlint: holds CHAN_LOCK
+fn close_block(id: i64) {
+    unsafe {
+        let n = mem_process(NBLOCKS).load_i64()
+        let t = mem_addr(mem_process(BLOCKS).load_i64())
+        var kept = 0
+        var i = 0
+        while i < n {
+            let r = t.offset(24 * i)
+            if r.load_i64() == id {
+                sys.dealloc(r.offset(8).load_addr())
+            } else {
+                if kept != i {
+                    sys.copy(t.offset(24 * kept), r, 24)
+                }
+                kept += 1
+            }
+            i += 1
+        }
+        mem_process(NBLOCKS).store_i64(kept)
+    }
+    let q = ready()
+    let m = q_len(q)
+    var k = 0
+    while k < m {
+        var b = 0
+        var s = 0
+        let _ = q_pop(q, 2, b, s)
+        if b != id {
+            q_push(q, 2, b, s)
+        }
+        k += 1
+    }
+}
+
+/// The flag of slot `s` of block `b`; null when there is none.
+/// rtlint: holds CHAN_LOCK
+fn flag(b: i64, s: i64) -> addr {
+    let r = block_of(b)
+    unsafe {
+        if r.as_i64() == 0 or s < 0 or s >= r.offset(16).load_i64() {
+            return mem_addr(0)
+        }
+        r.offset(8).load_addr().offset(s)
+    }
+}
+
+/// rtlint: holds CHAN_LOCK
+fn mark_waiting(b: i64, s: i64) {
+    let f = flag(b, s)
+    if unsafe { f.as_i64() } != 0 {
+        unsafe { f.store_u8(1.as_u8()) }
+    }
+}
+
+/// Whether that waiter was really waiting, the flag cleared; false for an
+/// entry a retry left behind.
+/// rtlint: holds CHAN_LOCK
+fn take_waiting(b: i64, s: i64) -> bool {
+    let f = flag(b, s)
+    unsafe {
+        if f.as_i64() != 0 and f.load_u8().as_i64() != 0 {
+            f.store_u8(0.as_u8())
+            return true
+        }
+    }
+    false
+}
+
+/// rtlint: holds CHAN_LOCK
+fn is_waiting(b: i64, s: i64) -> bool {
+    let f = flag(b, s)
+    unsafe { f.as_i64() != 0 and f.load_u8().as_i64() != 0 }
+}
+
+/// Wakes the longest-waiting task on one side of channel `at`, skipping
+/// entries left behind.
+/// rtlint: holds CHAN_LOCK
+fn wake_one(at: i64, side: i64) {
+    let c = chan(at)
+    let q = unsafe { c.offset(if side == ROOM { C_ROOM } else { C_VALUE }).load_addr() }
+    var b = 0
+    var s = 0
+    while q_pop(q, 2, b, s) {
+        if is_waiting(b, s) {
+            let _ = take_waiting(b, s)
+            q_push(ready(), 2, b, s)
+            return
+        }
+    }
+}
+
+/// Closing changes every waiter's answer: wakes both sides.
+/// rtlint: holds CHAN_LOCK
+fn wake_all(at: i64) {
+    let c = chan(at)
+    var side = 0
+    while side < 2 {
+        let q = unsafe { c.offset(if side == 0 { C_ROOM } else { C_VALUE }).load_addr() }
+        var b = 0
+        var s = 0
+        while q_pop(q, 2, b, s) {
+            if take_waiting(b, s) {
+                q_push(ready(), 2, b, s)
+            }
+        }
+        side += 1
+    }
+}
+
+/// The index of channel `ch`; anything else is a panic.
+/// rtlint: holds CHAN_LOCK
+fn index(ch: i64) -> i64 {
+    if ch < 0 or ch >= nchans() {
+        unlock()
+        unsafe { say(mem_static("not a channel"), mem_static_len("not a channel")) }
+    }
+    ch
+}
+
+/// rtlint: holds CHAN_LOCK
+fn index_of(ch: i64) -> i64 {
+    index(ch)
+}
+
+// ----- waiting ---------------------------------------------------------------------
+
+/// A channel operation that cannot go ahead: inside a task, join the queue
+/// on `side` of each of the `n` channels at `on` and give way; outside every
+/// task there is nobody to give way to.
+fn wait(on: addr, n: i64, side: i64) {
+    if not fiber.in_fiber() {
+        unsafe { say(mem_static("deadlock: every task is waiting on a channel, and nothing left can send or receive -- a channel operation outside every `go` cannot wait for one; move it into a task"), mem_static_len("deadlock: every task is waiting on a channel, and nothing left can send or receive -- a channel operation outside every `go` cannot wait for one; move it into a task")) }
+    }
+    let b = unsafe { mem_tls(HERE_BLOCK).load_i64() }
+    let s = unsafe { mem_tls(HERE_SLOT).load_i64() }
+    unsafe {
+        while mem_process(CHAN_LOCK).atomic_cas_i64(0, 1, Acquire) != 0 {}
+    }
+    mark_waiting(b, s)
+    var i = 0
+    while i < n {
+        let at = unsafe { on.offset(8 * i).load_i64() }
+        if at < nchans() {
+            let c = chan(at)
+            q_push(unsafe { c.offset(if side == ROOM { C_ROOM } else { C_VALUE }).load_addr() }, 2, b, s)
+        }
+        i += 1
+    }
+    unlock()
+    fiber.suspend()
+}
+
+fn wait_one(at: i64, side: i64) {
+    let on = sys.alloc(8)
+    unsafe { on.store_i64(at) }
+    wait(on, 1, side)
+    sys.dealloc(on)
+}
+
+// ----- channel operations -------------------------------------------------------------
+
+export fn grt_chan_new(cap: i64) -> i64 {
+    let c = sys.alloc_zeroed(C_SIZE)
+    unsafe {
+        c.offset(C_ROOM).store_addr(q_new())
+        c.offset(C_VALUE).store_addr(q_new())
+        c.offset(C_BUF).store_addr(q_new())
+        c.offset(C_CAP).store_i64(if cap < 0 { 0 } else { cap })
+        while mem_process(CHAN_LOCK).atomic_cas_i64(0, 1, Acquire) != 0 {}
+    }
+    let id = add_chan(c)
+    unlock()
+    id
+}
+
+/// rtlint: holds CHAN_LOCK
+fn add_chan(c: addr) -> i64 {
+    unsafe {
+        let n = mem_process(NCHANS).load_i64()
+        let cap = mem_process(CHANCAP).load_i64()
+        if n == cap {
+            let want = if cap == 0 { 8 } else { 2 * cap }
+            let t = if cap == 0 { sys.alloc(8 * want) } else { sys.grow(mem_addr(mem_process(CHANS).load_i64()), 8 * want) }
+            mem_process(CHANS).store_i64(t.as_i64())
+            mem_process(CHANCAP).store_i64(want)
+        }
+        mem_addr(mem_process(CHANS).load_i64()).offset(8 * n).store_addr(c)
+        mem_process(NCHANS).store_i64(n + 1)
+        n
+    }
+}
+
+/// What a send does under the lock: 0 to wait for room, 1 done, 2 to see
+/// whether its value was taken; a ticket kept in `ticket`.
+/// rtlint: holds CHAN_LOCK
+fn send_step(at: i64, v: addr, inout ticket: i64) -> i64 {
+    let c = chan(at)
+    unsafe {
+        if ticket >= 0 {
+            return if c.offset(C_TAKEN).load_i64() > ticket { 1 } else { 0 }
+        }
+        if c.offset(C_CLOSED).load_i64() != 0 {
+            unlock()
+            say(mem_static("send on a closed channel"), mem_static_len("send on a closed channel"))
+        }
+        let cap = c.offset(C_CAP).load_i64()
+        let buf = c.offset(C_BUF).load_addr()
+        if cap == 0 or q_len(buf) < cap {
+            q_push(buf, 1, v.as_i64(), 0)
+            let sent = c.offset(C_SENT).load_i64() + 1
+            c.offset(C_SENT).store_i64(sent)
+            wake_one(at, VALUE)
+            if cap > 0 {
+                return 1
+            }
+            ticket = sent - 1
+            return 2
+        }
+        0
+    }
+}
+
+/// `chan_send(ch, v)`; takes the count on `v`.
+export fn grt_chan_send(ch: i64, v: addr) {
+    unsafe {
+        while mem_process(CHAN_LOCK).atomic_cas_i64(0, 1, Acquire) != 0 {}
+    }
+    let at = index_of(ch)
+    unlock()
+    var ticket = -1
+    var going = true
+    while going {
+        unsafe {
+            while mem_process(CHAN_LOCK).atomic_cas_i64(0, 1, Acquire) != 0 {}
+        }
+        let step = send_step(at, v, ticket)
+        unlock()
+        if step == 1 {
+            going = false
+        } else if step == 0 {
+            wait_one(at, ROOM)
+        }
+    }
+}
+
+/// What a receive does under the lock: the value, `Some` or `None`, or null
+/// to wait.
+/// rtlint: holds CHAN_LOCK
+fn recv_step(at: i64) -> addr {
+    let c = chan(at)
+    unsafe {
+        var v = 0
+        var unused = 0
+        if q_pop(c.offset(C_BUF).load_addr(), 1, v, unused) {
+            c.offset(C_TAKEN).store_i64(c.offset(C_TAKEN).load_i64() + 1)
+            wake_one(at, ROOM)
+            return maps.option(mem_addr(v))
+        }
+        if c.offset(C_CLOSED).load_i64() != 0 {
+            return maps.option(mem_addr(0))
+        }
+        mem_addr(0)
+    }
+}
+
+/// `chan_recv(ch)`: `Some(v)`, or `None` once closed and drained.
+export fn grt_chan_recv(ch: i64) -> addr {
+    unsafe {
+        while mem_process(CHAN_LOCK).atomic_cas_i64(0, 1, Acquire) != 0 {}
+    }
+    let at = index_of(ch)
+    unlock()
+    while true {
+        unsafe {
+            while mem_process(CHAN_LOCK).atomic_cas_i64(0, 1, Acquire) != 0 {}
+        }
+        let out = recv_step(at)
+        unlock()
+        if unsafe { out.as_i64() } != 0 {
+            return out
+        }
+        wait_one(at, VALUE)
+    }
+    unsafe { mem_addr(0) }
+}
+
+/// The first of the `n` channels at `ats` that holds a value or is closed;
+/// -1 when none does.
+/// rtlint: holds CHAN_LOCK
+fn select_step(ats: addr, n: i64) -> i64 {
+    var i = 0
+    while i < n {
+        let c = chan(unsafe { ats.offset(8 * i).load_i64() })
+        unsafe {
+            if q_len(c.offset(C_BUF).load_addr()) > 0 or c.offset(C_CLOSED).load_i64() != 0 {
+                return i
+            }
+        }
+        i += 1
+    }
+    -1
+}
+
+/// A list of boxes' elements, their count in `n`.
+fn items(l: addr, inout n: i64) -> addr {
+    unsafe {
+        if l.offset(layout.LIST_DISC).load_u8().as_i64() == layout.LIST_INLINE {
+            n = l.offset(layout.LIST_LEN).load_u8().as_i64()
+            return l.offset(layout.LIST_VALS)
+        }
+        let v = l.offset(layout.LIST_VEC)
+        n = v.offset(layout.VEC_LEN).load_i64()
+        v.offset(layout.VEC_PTR).load_addr()
+    }
+}
+
+/// The channels a list names, as `scalar_words` reads them, into a new
+/// array; their count in `n`.
+fn words_of(l: addr, inout n: i64) -> addr {
+    let t = unsafe { l.offset(layout.TAG).load_u8() }.as_i64()
+    if t == layout.TAG_LIST_SCALAR {
+        unsafe {
+            let v = l.offset(layout.SCALAR_VEC)
+            n = v.offset(layout.VEC_LEN).load_i64()
+            let p = v.offset(layout.VEC_PTR).load_addr()
+            let bytes = l.offset(layout.SCALAR_DISC).load_u8().as_i64() == layout.SCALAR_BYTES
+            let out = sys.alloc(8 * n + 8)
+            var i = 0
+            while i < n {
+                out.offset(8 * i).store_i64(if bytes { p.offset(i).load_u8().as_i64() } else { p.offset(8 * i).load_i64() })
+                i += 1
+            }
+            return out
+        }
+    }
+    if t != layout.TAG_LIST {
+        unsafe { say(mem_static("chan_select on a non-list"), mem_static_len("chan_select on a non-list")) }
+    }
+    let at = items(l, n)
+    let out = sys.alloc(8 * n + 8)
+    var i = 0
+    while i < n {
+        let e = unsafe { at.offset(8 * i).load_addr() }
+        let et = unsafe { e.offset(layout.TAG).load_u8() }.as_i64()
+        unsafe {
+            if et == layout.TAG_I64 or et == layout.TAG_U64 or et == layout.TAG_F64 {
+                out.offset(8 * i).store_i64(e.offset(layout.WORD_AT).load_i64())
+            } else if et == layout.TAG_BOOL {
+                out.offset(8 * i).store_i64(e.offset(layout.BOOL_AT).load_u8().as_i64())
+            } else {
+                say(mem_static("chan_select on a list of non-scalars"), mem_static_len("chan_select on a list of non-scalars"))
+            }
+        }
+        i += 1
+    }
+    out
+}
+
+/// `chan_select(chs)`: the index of the first channel a `chan_recv` would
+/// not wait on, waiting until there is one. Borrows the list.
+export fn grt_chan_select(chs: addr) -> i64 {
+    var n = 0
+    let ats = words_of(chs, n)
+    if n == 0 {
+        unsafe { say(mem_static("`chan_select` of no channels would wait forever"), mem_static_len("`chan_select` of no channels would wait forever")) }
+    }
+    unsafe {
+        while mem_process(CHAN_LOCK).atomic_cas_i64(0, 1, Acquire) != 0 {}
+    }
+    var i = 0
+    while i < n {
+        unsafe { ats.offset(8 * i).store_i64(index_of(ats.offset(8 * i).load_i64())) }
+        i += 1
+    }
+    unlock()
+    while true {
+        unsafe {
+            while mem_process(CHAN_LOCK).atomic_cas_i64(0, 1, Acquire) != 0 {}
+        }
+        let k = select_step(ats, n)
+        unlock()
+        if k >= 0 {
+            sys.dealloc(ats)
+            return k
+        }
+        wait(ats, n, VALUE)
+    }
+    0
+}
+
+/// rtlint: holds CHAN_LOCK
+fn close_step(ch: i64) {
+    let at = index(ch)
+    let c = chan(at)
+    unsafe {
+        if c.offset(C_CLOSED).load_i64() != 0 {
+            unlock()
+            say(mem_static("closing a channel that is already closed"), mem_static_len("closing a channel that is already closed"))
+        }
+        c.offset(C_CLOSED).store_i64(1)
+    }
+    wake_all(at)
+}
+
+export fn grt_chan_close(ch: i64) {
+    unsafe {
+        while mem_process(CHAN_LOCK).atomic_cas_i64(0, 1, Acquire) != 0 {}
+    }
+    close_step(ch)
+    unlock()
+}
+
+/// rtlint: holds CHAN_LOCK
+fn drain_held() -> addr {
+    // Every value still in a channel, into one array (count first).
+    var total = 0
+    var i = 0
+    while i < nchans() {
+        total += q_len(unsafe { chan(i).offset(C_BUF).load_addr() })
+        i += 1
+    }
+    let out = sys.alloc(8 * total + 8)
+    unsafe { out.store_i64(total) }
+    var k = 0
+    i = 0
+    while i < nchans() {
+        let q = unsafe { chan(i).offset(C_BUF).load_addr() }
+        var v = 0
+        var unused = 0
+        while q_pop(q, 1, v, unused) {
+            unsafe { out.offset(8 + 8 * k).store_i64(v) }
+            k += 1
+        }
+        i += 1
+    }
+    out
+}
+
+/// Releases every value still sitting in a channel, for the leak check.
+pub fn drain() {
+    unsafe {
+        while mem_process(CHAN_LOCK).atomic_cas_i64(0, 1, Acquire) != 0 {}
+    }
+    let held = drain_held()
+    unlock()
+    let n = unsafe { held.load_i64() }
+    var i = 0
+    while i < n {
+        val.dec(unsafe { held.offset(8 + 8 * i).load_addr() })
+        i += 1
+    }
+    sys.dealloc(held)
+}
+
+// ----- the scheduler ----------------------------------------------------------------
+
+type Body = fn(addr)
+
+/// Where a task's fiber starts: runs the task -- a closure of no arguments
+/// the compiler lifted, which takes its environment's count -- releases it,
+/// and leaves for the last time.
+fn task_entry(rec: addr) {
+    unsafe {
+        let task = rec.offset(fiber.F_ARG).load_addr()
+        let code = funcs.fn_code(task)
+        let env = funcs.fn_env(task)
+        mem_addr(code).call_c(Body, env)
+        val.dec(task)
+    }
+    fiber.finish(rec)
+}
+
+// A slot: its task (null once taken to run, or ended), its fiber (null
+// before it first runs) and that fiber's floor.
+let S_TASK = 0
+let S_FIBER = 8
+let S_FLOOR = 16
+
+/// rtlint: holds CHAN_LOCK
+fn new_block(n: i64) -> i64 {
+    unsafe {
+        let id = mem_process(NEXT_BLOCK).load_i64() + 1
+        mem_process(NEXT_BLOCK).store_i64(id)
+        open_block(id, n)
+        id
+    }
+}
+
+/// rtlint: holds CHAN_LOCK
+fn waiting_now(b: i64, s: i64) -> bool {
+    is_waiting(b, s)
+}
+
+/// The wakes meant for block `b` onto `runnable`, the others left.
+/// rtlint: holds CHAN_LOCK
+fn take_wakes(b: i64, runnable: addr) {
+    let q = ready()
+    let m = q_len(q)
+    var k = 0
+    while k < m {
+        var wb = 0
+        var ws = 0
+        let _ = q_pop(q, 2, wb, ws)
+        if wb == b {
+            q_push(runnable, 1, ws, 0)
+        } else {
+            q_push(q, 2, wb, ws)
+        }
+        k += 1
+    }
+}
+
+/// rtlint: holds CHAN_LOCK
+fn end_block(b: i64) {
+    close_block(b)
+}
+
+/// Runs a `concurrent` block's tasks to their end. `tasks` is the list of
+/// function values its `go`s made, in the order they ran; it stays the
+/// caller's.
+export fn grt_conc_run(tasks: addr) {
+    if unsafe { tasks.offset(layout.TAG).load_u8() }.as_i64() != layout.TAG_LIST {
+        unsafe { say(mem_static("`concurrent` without its task list"), mem_static_len("`concurrent` without its task list")) }
+    }
+    var n = 0
+    let given = items(tasks, n)
+    if n == 0 {
+        return
+    }
+    let slots = sys.alloc_zeroed(24 * n)
+    let runnable = q_new()
+    var i = 0
+    while i < n {
+        let f = unsafe { given.offset(8 * i).load_addr() }
+        // The task's own count, released when it ends.
+        val.inc(f)
+        unsafe { slots.offset(24 * i + S_TASK).store_addr(f) }
+        q_push(runnable, 1, i, 0)
+        i += 1
+    }
+    var alive = n
+    unsafe {
+        while mem_process(CHAN_LOCK).atomic_cas_i64(0, 1, Acquire) != 0 {}
+    }
+    let block = new_block(n)
+    unlock()
+    let outer_block = unsafe { mem_tls(HERE_BLOCK).load_i64() }
+    let outer_slot = unsafe { mem_tls(HERE_SLOT).load_i64() }
+    let round = q_new()
+    var going = true
+    while going {
+        // One round is whatever is runnable at its start.
+        var k = 0
+        var unused = 0
+        while q_pop(runnable, 1, k, unused) {
+            q_push(round, 1, k, 0)
+        }
+        var s = 0
+        while q_pop(round, 1, s, unused) {
+            let rec = unsafe { slots.offset(24 * s) }
+            let f = unsafe { rec.offset(S_TASK).load_addr() }
+            if unsafe { f.as_i64() } != 0 {
+                unsafe {
+                    rec.offset(S_TASK).store_i64(0)
+                    mem_tls(HERE_BLOCK).store_i64(block)
+                    mem_tls(HERE_SLOT).store_i64(s)
+                }
+                var fb = unsafe { rec.offset(S_FIBER).load_addr() }
+                if unsafe { fb.as_i64() } == 0 {
+                    fb = fiber.new_fiber(fiber.BUDGET + TASK_MARGIN, unsafe { mem_fn_addr(task_entry) }, f)
+                    unsafe {
+                        rec.offset(S_FIBER).store_addr(fb)
+                        rec.offset(S_FLOOR).store_i64(fiber.bottom(fb) + TASK_MARGIN)
+                    }
+                }
+                let outer = fiber.swap_floor(unsafe { rec.offset(S_FLOOR).load_i64() })
+                let done = fiber.resume(fb)
+                let _ = fiber.swap_floor(outer)
+                if done {
+                    alive -= 1
+                    fiber.drop_fiber(fb)
+                    unsafe { rec.offset(S_FIBER).store_i64(0) }
+                } else {
+                    unsafe {
+                        while mem_process(CHAN_LOCK).atomic_cas_i64(0, 1, Acquire) != 0 {}
+                    }
+                    let w = waiting_now(block, s)
+                    unlock()
+                    if not w {
+                        q_push(runnable, 1, s, 0)
+                    }
+                    unsafe { rec.offset(S_TASK).store_addr(f) }
+                }
+            }
+        }
+        if alive == 0 {
+            going = false
+        } else {
+            unsafe {
+                while mem_process(CHAN_LOCK).atomic_cas_i64(0, 1, Acquire) != 0 {}
+            }
+            take_wakes(block, runnable)
+            unlock()
+            if q_len(runnable) == 0 {
+                deadlock()
+            }
+        }
+    }
+    unsafe {
+        mem_tls(HERE_BLOCK).store_i64(outer_block)
+        mem_tls(HERE_SLOT).store_i64(outer_slot)
+        while mem_process(CHAN_LOCK).atomic_cas_i64(0, 1, Acquire) != 0 {}
+    }
+    end_block(block)
+    unlock()
+    q_free(round)
+    q_free(runnable)
+    sys.dealloc(slots)
+}

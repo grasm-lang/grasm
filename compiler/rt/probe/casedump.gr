@@ -1,0 +1,45 @@
+// Every code point's case as the runtime it is linked with has it, for
+// `scripts/rtcase.py` to make `compiler/rt/src/casemap.gr` from (on the Rust
+// runtime) and for `scripts/fuzz_rtcase.sh` to compare the two runtimes by
+// (on both).
+//
+//     casedump [<from> <to>]
+//
+// For each scalar value, a line when it changes case -- `L` and its
+// lowercase, `U` and its uppercase, each one to three code points -- and a
+// line for what the final-sigma rule sees in it: `I` when it is skipped as
+// case-ignorable, `C` when it is cased and not skipped. The rule's answers
+// are what tell those apart: `cΣ` ends in `ς` only when `c` is cased and not
+// ignorable, and `AcΣ` only when `c` is either.
+
+fn codes(s: str) -> str {
+    s.codes().map(|c| c.to_base(16)).join(" ")
+}
+
+fn main() {
+    let a = args()
+    let from = if a.len() > 1 { a[0].parse_int() ?? 0 } else { 0 }
+    let to = if a.len() > 1 { a[1].parse_int() ?? 1114111 } else { 1114111 }
+    var c = from
+    while c <= to {
+        if c < 55296 or c > 57343 {
+            let s = c.to_char()
+            let lo = s.to_lower()
+            let up = s.to_upper()
+            if lo != s {
+                print("L {c.to_base(16)} {codes(lo)}")
+            }
+            if up != s {
+                print("U {c.to_base(16)} {codes(up)}")
+            }
+            let alone = "{s}Σ".to_lower().ends_with("ς")
+            let after = "A{s}Σ".to_lower().ends_with("ς")
+            if after and not alone {
+                print("I {c.to_base(16)}")
+            } else if alone {
+                print("C {c.to_base(16)}")
+            }
+        }
+        c += 1
+    }
+}

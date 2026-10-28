@@ -1,0 +1,208 @@
+// Numbers read and written on the Grasm runtime against the Rust runtime's
+// (docs/self-hosting.md §6.11), for `scripts/fuzz_rtparse.sh`, which builds
+// this twice -- on the Rust runtime and with the Grasm runtime interposed --
+// and requires the same bytes out and the same way out.
+//
+//     parsefuzz <seed> <rounds> [<panic>]
+//
+// Each round reads integers in base 10 and in bases 2 to 36, signed and
+// unsigned, at and past their ends, with signs, spaces and stray characters;
+// reads floats of every shape -- long mantissas, exponents past either end,
+// subnormals, halfway cases, `inf`, `nan` and near misses -- printing each
+// one's bits; writes doubles of every kind to 0 to 17 places, exact ties
+// among them; holds integers to every width by `try_`, `checked_` and
+// `saturating_`; and asserts values equal. With a panic number, the run
+// ends in one of the family's panics.
+
+fn next(inout s: i64) -> i64 {
+    s = s * 6364136223846793005 + 1442695040888963407
+    s.ushr(17)
+}
+
+fn pick(inout s: i64, n: i64) -> i64 {
+    next(s) % n
+}
+
+fn digits(inout s: i64, n: i64, base: i64) -> str {
+    let all = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    var out = ""
+    for i in 0..n {
+        let k = pick(s, base)
+        let up = pick(s, 2) == 0 and k >= 10
+        out = out + all.substr(if up { k + 26 } else { k }, 1)
+    }
+    out
+}
+
+fn sign(inout s: i64) -> str {
+    let k = pick(s, 6)
+    if k == 0 {
+        return "-"
+    }
+    if k == 1 {
+        return "+"
+    }
+    ""
+}
+
+fn space(inout s: i64) -> str {
+    let k = pick(s, 8)
+    if k == 0 {
+        return " "
+    }
+    if k == 1 {
+        return "\t\n"
+    }
+    if k == 2 {
+        return "\u{3000}"
+    }
+    ""
+}
+
+fn noise(inout s: i64, t: str) -> str {
+    let k = pick(s, 12)
+    if k == 0 {
+        return t + "x"
+    }
+    if k == 1 {
+        return "_" + t
+    }
+    if k == 2 {
+        return t.substr(0, t.len() / 2) + " " + t.substr(t.len() / 2, 99)
+    }
+    t
+}
+
+fn integer_text(inout s: i64, base: i64) -> str {
+    let fixed = ["9223372036854775807", "9223372036854775808", "-9223372036854775808", "-9223372036854775809", "18446744073709551615", "18446744073709551616", "+", "-", "", " ", "+-1", "1_000", "0x1f", "-0", "+0", "00000000000000000000000000012", "7fffffffffffffff", "8000000000000000", "-8000000000000000", "ffffffffffffffff", "10000000000000000"]
+    if pick(s, 4) == 0 {
+        return fixed[pick(s, fixed.len())]
+    }
+    space(s) + sign(s) + noise(s, digits(s, 1 + pick(s, 22), base)) + space(s)
+}
+
+fn float_text(inout s: i64) -> str {
+    let fixed = ["inf", "Infinity", "INF", "NaN", "nAn", "-nan", "+inf", "infinit", "infinityy", "-Infinity", ".", "e5", "1e", "1e+", ".e1", "1.e1", "+.5", "-.5e-3", "9007199254740993", "2.2250738585072011e-308", "2.2250738585072014e-308", "4.9406564584124654e-324", "2.4703282292062327e-324", "2.4703282292062328e-324", "1.7976931348623157e308", "1.7976931348623158e308", "1.7976931348623159e308", "1e400", "-1e400", "1e-400", "0.1", "0.30000000000000004", "123456789012345678901234567890", "1e2147483648", "1e-2147483648", "0e999999", "00.000e-7", "1.5E+3", "5e-324", "8.98846567431158e307"]
+    if pick(s, 4) == 0 {
+        return space(s) + fixed[pick(s, fixed.len())] + space(s)
+    }
+    var t = sign(s)
+    let k = pick(s, 10)
+    let whole = if k == 0 { 0 } else if k < 8 { 1 + pick(s, 20) } else { 300 + pick(s, 600) }
+    t = t + digits(s, whole, 10)
+    if pick(s, 2) == 0 {
+        t = t + "." + digits(s, pick(s, if pick(s, 5) == 0 { 800 } else { 20 }), 10)
+    }
+    if pick(s, 2) == 0 {
+        let e = pick(s, 5)
+        let mag = if e == 0 { pick(s, 10) } else if e < 4 { pick(s, 340) } else { pick(s, 100000) }
+        t = t + (if pick(s, 2) == 0 { "e" } else { "E" }) + sign(s) + "{mag}"
+    }
+    noise(s, t)
+}
+
+/// A double of every kind: any bits at all, or a decimal-looking one, or an
+/// exact tie at some number of places.
+fn double(inout s: i64) -> f64 {
+    let k = pick(s, 6)
+    if k == 0 {
+        return (next(s) * 2862933555777941757 + next(s)).from_bits()
+    }
+    if k == 1 {
+        return (pick(s, 2000001) - 1000000).as_f64() / 1000.0
+    }
+    if k == 2 {
+        return (pick(s, 20001) - 10000).as_f64() / 8.0
+    }
+    if k == 3 {
+        return (pick(s, 2001) - 1000).as_f64() * 0.005
+    }
+    if k == 4 {
+        let e = pick(s, 40) - 20
+        var x = (pick(s, 1000) + 1).as_f64()
+        var i = 0
+        while i < e {
+            x = x * 10.0
+            i += 1
+        }
+        while i > e {
+            x = x / 10.0
+            i -= 1
+        }
+        return x
+    }
+    (pick(s, 64) + 1).as_f64() / 1024.0
+}
+
+fn round(inout s: i64) -> str {
+    var out = str_builder()
+    for i in 0..6 {
+        let t = integer_text(s, 10)
+        out.push_str("{t.parse_int()} {t.parse_u64()} ")
+        let base = 2 + pick(s, 35)
+        let tb = integer_text(s, base)
+        out.push_str("{tb.parse_int_base(base)} {tb.parse_u64_base(base)} ")
+    }
+    for i in 0..8 {
+        let t = float_text(s)
+        match t.parse_float() {
+            Some(x) -> out.push_str("{x}/{x.to_bits()} ")
+            None -> out.push_str("none ")
+        }
+    }
+    for i in 0..6 {
+        let x = double(s)
+        let p = pick(s, 18)
+        out.push_str("{x.to_fixed(p)} ")
+    }
+    let a = next(s) * 7 - next(s)
+    let b = next(s) - next(s) * 3
+    let small = pick(s, 600) - 300
+    let other = pick(s, 600) - 300
+    out.push_str("{a.try_i8()} {small.try_i8()} {small.try_u8()} {a.try_i16()} {small.try_u16()} {a.try_i32()} {a.try_u32()} {a.try_u64()} ")
+    out.push_str("{a.as_u64().try_i64()} {a.as_u64().try_u32()} {small.as_u64().try_u8()} ")
+    out.push_str("{a.checked_add(b)} {a.checked_sub(b)} {a.checked_mul(b)} {small.checked_mul(other)} ")
+    out.push_str("{a.saturating_add(b)} {a.saturating_sub(b)} {a.saturating_mul(b)} {small.saturating_mul(other)} ")
+    let x8 = small.as_i8()
+    let y8 = other.as_i8()
+    out.push_str("{x8.checked_add(y8)} {x8.checked_mul(y8)} {x8.saturating_add(y8)} {x8.saturating_sub(y8)} {x8.saturating_mul(y8)} ")
+    let xu = small.as_u8()
+    let yu = other.as_u8()
+    out.push_str("{xu.checked_sub(yu)} {xu.saturating_sub(yu)} {xu.saturating_add(yu)} {xu.checked_mul(yu)} ")
+    let x32 = a.as_i32()
+    let y32 = b.as_i32()
+    out.push_str("{x32.checked_mul(y32)} {x32.saturating_mul(y32)} {x32.saturating_add(y32)} ")
+    let ua = a.as_u64()
+    let ub = b.as_u64()
+    out.push_str("{ua.checked_add(ub)} {ua.checked_sub(ub)} {ua.checked_mul(ub)} {ua.saturating_add(ub)} {ua.saturating_sub(ub)} {ua.saturating_mul(ub)} ")
+    let l = [a, b, small]
+    assert_eq(l, [a, b, small])
+    assert_eq("{a}", "{a}")
+    assert_eq(Some(small), Some(small))
+    out.to_str()
+}
+
+fn main() {
+    let a = args()
+    var s = (a[0].parse_int() ?? 1) * 7919 + 43
+    let rounds = a[1].parse_int() ?? 10
+    for r in 0..rounds {
+        print(round(s))
+    }
+    if a.len() > 2 {
+        let k = a[2].parse_int() ?? 0
+        if k == 0 {
+            print("{(1.5).to_fixed(18)}")
+        } else if k == 1 {
+            print("{"12".parse_int_base(37)}")
+        } else if k == 2 {
+            print("{"12".parse_u64_base(1)}")
+        } else if k == 3 {
+            assert_eq([1, 2], [1, 3])
+        } else if k == 4 {
+            assert_eq("a{k}", "b")
+        } else {
+            assert_eq(Some(1.5), None)
+        }
+    }
+}

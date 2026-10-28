@@ -1,0 +1,948 @@
+// Structs, variants, tuples and results (docs/self-hosting.md §6.11): made,
+// read and changed as the Rust runtime makes, reads and changes them.
+//
+// A struct's type is a `StructTy` built once from the backend's descriptor
+// and cached in it (`desc_ty`), laid out here exactly as the Rust runtime
+// lays one out, so either runtime takes up a type the other built: its
+// field names, kinds, where each field starts in a value's words, element
+// descriptors, name, the shared empty value list, width and whether any
+// field is inline. A struct's fields are pointers -- or a scalar's bits,
+// where the type's kinds say so -- four or fewer in the box, more in a `Vec`;
+// a write to one the struct shares copies the struct first. A variant holds
+// its type's name and its own (`&str`s into the program's data), and no
+// field, the field in its word, or a slice of them; a result is a variant
+// of the type `!`. Tuples are lists sealed.
+//
+// Lists of value structs (docs/values.md) are here too, beside the types
+// they hold: made empty and shared, pushed to, copied before a write when
+// shared, and read by address.
+import layout
+import sys
+import alloc
+import boxes
+import release
+import val
+import vals
+import strread
+import numstr
+import panic
+import fmt
+
+extern fn memcmp(a: addr, b: addr, n: i64) -> i32
+extern fn grasm_panic_msg(p: addr, n: i64)
+
+fn tag(v: addr) -> i64 {
+    unsafe { v.offset(layout.TAG).load_u8() }.as_i64()
+}
+
+fn say(p: addr, n: i64) {
+    panic.say(p, n)
+}
+
+/// A `Vec`'s three words at `v`: its buffer, length and capacity.
+fn set_vec(v: addr, p: addr, len: i64, cap: i64) {
+    unsafe {
+        v.offset(layout.VEC_PTR).store_addr(p)
+        v.offset(layout.VEC_LEN).store_i64(len)
+        v.offset(layout.VEC_CAP).store_i64(cap)
+    }
+}
+
+/// A buffer of `n` elements of `size` bytes, as `Vec::with_capacity` makes
+/// one: none at all, and the alignment for an address, when `n` is 0.
+fn buffer(n: i64, size: i64, align: i64) -> addr {
+    if n == 0 {
+        return unsafe { mem_addr(align) }
+    }
+    sys.alloc(n * size)
+}
+
+// ----- types ------------------------------------------------------------------
+
+/// The type a descriptor stands for, built on first use and cached in it:
+/// `desc_ty`. Two threads reaching an unbuilt descriptor at once both build
+/// one and one wins the exchange; the loser frees its own, which nothing saw.
+pub fn type_of(d: addr) -> addr {
+    unsafe {
+        let cached = d.offset(layout.DESC_CACHE).atomic_load_i64(Acquire)
+        if cached != 0 {
+            return mem_addr(cached)
+        }
+        let n = d.offset(layout.DESC_NFIELDS).load_i64()
+        let triples = d.offset(layout.DESC_FIELDS)
+        let names = buffer(n, 16, 8)
+        let kinds = buffer(n, 1, 1)
+        let elems = buffer(n, 8, 8)
+        let offs = buffer(n, 8, 8)
+        var width = 0
+        var inline = false
+        var i = 0
+        while i < n {
+            let t = triples.offset(i * layout.DESC_FIELD_SIZE)
+            names.offset(16 * i).store_i64(t.load_i64())
+            names.offset(16 * i + 8).store_i64(t.offset(8).load_i64())
+            let k = t.offset(layout.DESC_FIELD_KIND).load_i64()
+            kinds.offset(i).store_u8(k.as_u8())
+            elems.offset(8 * i).store_i64(triples.offset(n * layout.DESC_FIELD_SIZE + 8 * i).load_i64())
+            offs.offset(8 * i).store_i64(width)
+            let w = release.kind_width(k.bit_and(255))
+            width += w
+            if w > 1 {
+                inline = true
+            }
+            i += 1
+        }
+        let ty = sys.alloc(layout.STRUCTTY_SIZE)
+        set_vec(ty.offset(layout.STRUCTTY_FIELDS), names, n, n)
+        set_vec(ty.offset(layout.STRUCTTY_KINDS), kinds, n, n)
+        set_vec(ty.offset(layout.STRUCTTY_OFFS), offs, n, n)
+        set_vec(ty.offset(layout.STRUCTTY_ELEMS), elems, n, n)
+        let name = ty.offset(layout.STRUCTTY_NAME)
+        name.offset(layout.STRREF_PTR).store_i64(d.offset(8).load_i64())
+        name.offset(layout.STRREF_LEN).store_i64(d.offset(16).load_i64())
+        ty.offset(layout.STRUCTTY_EMPTY).store_i64(0)
+        ty.offset(layout.STRUCTTY_EMPTY_STATE).store_i64(0)
+        ty.offset(layout.STRUCTTY_EMPTY_STATE).store_u8(layout.ONCE_UNSET.as_u8())
+        ty.offset(layout.STRUCTTY_WIDTH).store_i64(width)
+        ty.offset(layout.STRUCTTY_INLINE).store_i64(0)
+        ty.offset(layout.STRUCTTY_INLINE).store_u8(if inline { 1.as_u8() } else { 0.as_u8() })
+        let was = d.offset(layout.DESC_CACHE).atomic_cas_i64(0, ty.as_i64(), AcqRel)
+        if was != 0 {
+            if n > 0 {
+                sys.dealloc(names)
+                sys.dealloc(kinds)
+                sys.dealloc(elems)
+                sys.dealloc(offs)
+            }
+            sys.dealloc(ty)
+            return mem_addr(was)
+        }
+        ty
+    }
+}
+
+fn kinds_ptr(ty: addr) -> addr {
+    unsafe { ty.offset(layout.STRUCTTY_KINDS).offset(layout.VEC_PTR).load_addr() }
+}
+
+fn kinds_len(ty: addr) -> i64 {
+    unsafe { ty.offset(layout.STRUCTTY_KINDS).offset(layout.VEC_LEN).load_i64() }
+}
+
+/// Field `i`'s kind; a box past the kinds there are.
+fn kind_of(ty: addr, i: i64) -> i64 {
+    release.kind_at(kinds_ptr(ty), 1, kinds_len(ty), i)
+}
+
+fn boxed(ty: addr, i: i64) -> bool {
+    kind_of(ty, i) == layout.FK_BOXED
+}
+
+/// The field named by the `n` bytes at `p`: its position, or -1.
+fn field_named(ty: addr, p: addr, n: i64) -> i64 {
+    unsafe {
+        let names = ty.offset(layout.STRUCTTY_FIELDS).offset(layout.VEC_PTR).load_addr()
+        let count = ty.offset(layout.STRUCTTY_FIELDS).offset(layout.VEC_LEN).load_i64()
+        var i = 0
+        while i < count {
+            let len = names.offset(16 * i + 8).load_i64()
+            if len == n and (n == 0 or memcmp(names.offset(16 * i).load_addr(), p, n) == 0) {
+                return i
+            }
+            i += 1
+        }
+        -1
+    }
+}
+
+// ----- scalars in fields --------------------------------------------------------
+
+/// A box for a scalar field's bits, as `box_field_bits` makes one: a float,
+/// a bool, a reference, a unit, a `u64`, or an integer.
+pub fn box_bits(kind: i64, bits: i64) -> addr {
+    if kind == layout.FK_F64 {
+        return boxes.float(bits.from_bits())
+    }
+    if kind == layout.FK_BOOL {
+        return boxes.boolean(bits != 0)
+    }
+    if kind == layout.FK_REF {
+        return boxes.reference(bits)
+    }
+    if kind == layout.FK_UNIT {
+        return boxes.unit()
+    }
+    if kind == layout.FK_U64 {
+        return boxes.unsigned(bits)
+    }
+    boxes.int(bits)
+}
+
+/// A scalar's bits out of the box it came in: `unbox_field_bits`.
+pub fn bits_of(v: addr) -> i64 {
+    unsafe {
+        let t = tag(v)
+        if t == layout.TAG_I64 or t == layout.TAG_U64 or t == layout.TAG_F64 or t == layout.TAG_REF {
+            return v.offset(layout.WORD_AT).load_i64()
+        }
+        if t == layout.TAG_BOOL {
+            return v.offset(layout.BOOL_AT).load_u8().as_i64()
+        }
+        if t == layout.TAG_UNIT {
+            return 0
+        }
+        say(mem_static("a boxed value stored into a scalar field"), mem_static_len("a boxed value stored into a scalar field"))
+        0
+    }
+}
+
+// ----- structs ------------------------------------------------------------------
+
+/// A struct's field pointers, and how many.
+fn fields(s: addr, inout n: i64) -> addr {
+    unsafe {
+        if s.offset(layout.STRUCT_DISC).load_u8().as_i64() != layout.STRUCT_INLINE {
+            n = s.offset(layout.STRUCT_VEC).offset(layout.VEC_LEN).load_i64()
+            return s.offset(layout.STRUCT_VEC).offset(layout.VEC_PTR).load_addr()
+        }
+        n = s.offset(layout.STRUCT_LEN).load_u8().as_i64()
+        s.offset(layout.STRUCT_VALS)
+    }
+}
+
+/// A struct box of type `ty` holding the `n` words at `from`: four or fewer
+/// in the box (the rest null), more in a `Vec` exactly that long.
+fn new_struct(ty: addr, from: addr, n: i64) -> addr {
+    let s = alloc.take()
+    unsafe {
+        s.offset(layout.TAG).store_u8(layout.TAG_STRUCT.as_u8())
+        s.offset(layout.STRUCT_TY).store_addr(ty)
+        if n <= 4 {
+            s.offset(layout.STRUCT_DISC).store_u8(layout.STRUCT_INLINE.as_u8())
+            s.offset(layout.STRUCT_LEN).store_u8(n.as_u8())
+            var i = 0
+            while i < 4 {
+                s.offset(layout.STRUCT_VALS + 8 * i).store_i64(if i < n { from.offset(8 * i).load_i64() } else { 0 })
+                i += 1
+            }
+        } else {
+            s.offset(layout.STRUCT_DISC).store_u8(layout.STRUCT_HEAP.as_u8())
+            let buf = sys.alloc(8 * n)
+            sys.copy(buf, from, 8 * n)
+            set_vec(s.offset(layout.STRUCT_VEC), buf, n, n)
+        }
+    }
+    s
+}
+
+fn not_struct() {
+    unsafe { say(mem_static("field access on non-struct"), mem_static_len("field access on non-struct")) }
+}
+
+fn no_field() {
+    unsafe { say(mem_static("no such field"), mem_static_len("no such field")) }
+}
+
+export fn grt_struct_make(desc: addr, argv: addr) -> addr {
+    let ty = type_of(desc)
+    new_struct(ty, argv, unsafe { desc.offset(layout.DESC_NFIELDS).load_i64() })
+}
+
+/// A boxed field, lent: no count touched.
+export fn grt_struct_borrow_at(s: addr, i: i64) -> addr {
+    if tag(s) != layout.TAG_STRUCT {
+        not_struct()
+    }
+    let ty = unsafe { s.offset(layout.STRUCT_TY).load_addr() }
+    if not boxed(ty, i) {
+        unsafe { say(mem_static("a borrowed read of a scalar field"), mem_static_len("a borrowed read of a scalar field")) }
+    }
+    var n = 0
+    let at = fields(s, n)
+    if i < 0 or i >= n {
+        no_field()
+    }
+    unsafe { at.offset(8 * i).load_addr() }
+}
+
+/// A scalar field's bits; a boxed one's bits out of its box.
+export fn grt_struct_scalar_at(s: addr, i: i64) -> i64 {
+    if tag(s) != layout.TAG_STRUCT {
+        not_struct()
+    }
+    let ty = unsafe { s.offset(layout.STRUCT_TY).load_addr() }
+    var n = 0
+    let at = fields(s, n)
+    if i < 0 or i >= n {
+        no_field()
+    }
+    let w = unsafe { at.offset(8 * i).load_i64() }
+    if not boxed(ty, i) {
+        return w
+    }
+    let v = unsafe { mem_addr(w) }
+    let t = tag(v)
+    unsafe {
+        if t == layout.TAG_I64 or t == layout.TAG_U64 or t == layout.TAG_F64 or t == layout.TAG_REF {
+            return v.offset(layout.WORD_AT).load_i64()
+        }
+        if t == layout.TAG_BOOL {
+            return v.offset(layout.BOOL_AT).load_u8().as_i64()
+        }
+        if t == layout.TAG_UNIT {
+            return 0
+        }
+        say(mem_static("scalar field access on a boxed field"), mem_static_len("scalar field access on a boxed field"))
+    }
+    0
+}
+
+/// Field `i` with a count for the caller; a scalar one boxed.
+export fn grt_struct_get_at(s: addr, i: i64) -> addr {
+    if tag(s) != layout.TAG_STRUCT {
+        not_struct()
+    }
+    let ty = unsafe { s.offset(layout.STRUCT_TY).load_addr() }
+    var n = 0
+    let at = fields(s, n)
+    if i < 0 or i >= n {
+        no_field()
+    }
+    let w = unsafe { at.offset(8 * i).load_addr() }
+    if not boxed(ty, i) {
+        return box_bits(kind_of(ty, i), unsafe { w.as_i64() })
+    }
+    val.inc(w)
+    w
+}
+
+/// The field named by the `n` bytes at `p`, as `get_at` gives one.
+export fn grt_struct_get(s: addr, p: addr, n: i64) -> addr {
+    if tag(s) != layout.TAG_STRUCT {
+        not_struct()
+    }
+    let ty = unsafe { s.offset(layout.STRUCT_TY).load_addr() }
+    let i = field_named(ty, p, n)
+    var count = 0
+    let at = fields(s, count)
+    if i < 0 or i >= count {
+        no_field()
+    }
+    let w = unsafe { at.offset(8 * i).load_addr() }
+    if not boxed(ty, i) {
+        return box_bits(kind_of(ty, i), unsafe { w.as_i64() })
+    }
+    val.inc(w)
+    w
+}
+
+/// A boxed field moved out of a struct nothing else holds, `false`'s
+/// interned box left in its place; null when the struct is shared or the
+/// field a scalar.
+export fn grt_struct_take(s: addr, p: addr, n: i64) -> addr {
+    unsafe {
+        if s.atomic_load_i64(Relaxed) != 1 {
+            return mem_addr(0)
+        }
+    }
+    if tag(s) != layout.TAG_STRUCT {
+        not_struct()
+    }
+    let ty = unsafe { s.offset(layout.STRUCT_TY).load_addr() }
+    let i = field_named(ty, p, n)
+    if i >= 0 {
+        if not boxed(ty, i) {
+            return unsafe { mem_addr(0) }
+        }
+        var count = 0
+        let at = fields(s, count)
+        if i < count {
+            let w = unsafe { at.offset(8 * i).load_addr() }
+            unsafe { at.offset(8 * i).store_addr(boxes.boolean(false)) }
+            return w
+        }
+    }
+    no_field()
+    unsafe { mem_addr(0) }
+}
+
+/// A copy of struct `s`, each boxed field counted once more.
+pub fn copy_struct(s: addr) -> addr {
+    let ty = unsafe { s.offset(layout.STRUCT_TY).load_addr() }
+    var n = 0
+    let at = fields(s, n)
+    var i = 0
+    while i < n {
+        if boxed(ty, i) {
+            val.inc(unsafe { at.offset(8 * i).load_addr() })
+        }
+        i += 1
+    }
+    new_struct(ty, at, n)
+}
+
+/// The struct itself when nothing else holds it, else a copy that nothing
+/// else does; the one given loses a count.
+fn own_struct(s: addr) -> addr {
+    unsafe {
+        if s.atomic_load_i64(Relaxed) == 1 {
+            return s
+        }
+    }
+    if tag(s) != layout.TAG_STRUCT {
+        unsafe { say(mem_static("set_field on non-struct"), mem_static_len("set_field on non-struct")) }
+    }
+    let copy = copy_struct(s)
+    val.dec(s)
+    copy
+}
+
+/// Stores `v` in field `i` of struct `t`, which nothing else holds: a
+/// scalar's bits, out of its box; a box, releasing the one it replaces -- or,
+/// when it is the same box, the surplus count the caller handed over.
+fn store(t: addr, i: i64, v: addr) {
+    let ty = unsafe { t.offset(layout.STRUCT_TY).load_addr() }
+    var n = 0
+    let at = fields(t, n)
+    if not boxed(ty, i) {
+        let b = bits_of(v)
+        val.dec(v)
+        if i < 0 or i >= n {
+            no_field()
+        }
+        unsafe { at.offset(8 * i).store_i64(b) }
+        return
+    }
+    if i < 0 or i >= n {
+        no_field()
+    }
+    let old = unsafe { at.offset(8 * i).load_addr() }
+    if old == v {
+        val.dec(v)
+    } else {
+        val.dec(old)
+        unsafe { at.offset(8 * i).store_addr(v) }
+    }
+}
+
+export fn grt_struct_set_field_at(s: addr, i: i64, v: addr) -> addr {
+    let t = own_struct(s)
+    store(t, i, v)
+    t
+}
+
+export fn grt_struct_set_field(s: addr, p: addr, n: i64, v: addr) -> addr {
+    let t = own_struct(s)
+    let ty = unsafe { t.offset(layout.STRUCT_TY).load_addr() }
+    let i = field_named(ty, p, n)
+    if i < 0 {
+        no_field()
+    }
+    store(t, i, v)
+    t
+}
+
+// ----- variants and results ---------------------------------------------------
+
+fn new_variant(tp: addr, tl: i64, np: addr, nl: i64) -> addr {
+    let v = alloc.take()
+    unsafe {
+        v.offset(layout.TAG).store_u8(layout.TAG_VARIANT.as_u8())
+        v.offset(layout.VARIANT_TYPE + layout.STRREF_PTR).store_addr(tp)
+        v.offset(layout.VARIANT_TYPE + layout.STRREF_LEN).store_i64(tl)
+        v.offset(layout.VARIANT_NAME + layout.STRREF_PTR).store_addr(np)
+        v.offset(layout.VARIANT_NAME + layout.STRREF_LEN).store_i64(nl)
+        v.offset(layout.VARIANT_FIELDS).store_i64(0)
+        v.offset(layout.VARIANT_NFIELDS).store_i64(0)
+    }
+    v
+}
+
+export fn grt_variant_new(tp: addr, tl: i64, np: addr, nl: i64) -> addr {
+    new_variant(tp, tl, np, nl)
+}
+
+export fn grt_variant_new1(tp: addr, tl: i64, np: addr, nl: i64, a: addr) -> addr {
+    let v = new_variant(tp, tl, np, nl)
+    unsafe {
+        v.offset(layout.VARIANT_FIELDS).store_addr(a)
+        v.offset(layout.VARIANT_NFIELDS).store_i64(1)
+    }
+    v
+}
+
+export fn grt_variant_new2(tp: addr, tl: i64, np: addr, nl: i64, a: addr, b: addr) -> addr {
+    let v = new_variant(tp, tl, np, nl)
+    let slice = sys.alloc(16)
+    unsafe {
+        slice.store_addr(a)
+        slice.offset(8).store_addr(b)
+        v.offset(layout.VARIANT_FIELDS).store_addr(slice)
+        v.offset(layout.VARIANT_NFIELDS).store_i64(2)
+    }
+    v
+}
+
+/// One more field: none becomes the one in the word, one a slice of two,
+/// a slice one longer.
+export fn grt_variant_push(v: addr, x: addr) {
+    if tag(v) != layout.TAG_VARIANT {
+        unsafe { say(mem_static("variant_push on non-variant"), mem_static_len("variant_push on non-variant")) }
+    }
+    unsafe {
+        let n = v.offset(layout.VARIANT_NFIELDS).load_i64()
+        if n == 0 {
+            v.offset(layout.VARIANT_FIELDS).store_addr(x)
+        } else {
+            let slice = sys.alloc(8 * (n + 1))
+            if n == 1 {
+                slice.store_addr(v.offset(layout.VARIANT_FIELDS).load_addr())
+            } else {
+                let old = v.offset(layout.VARIANT_FIELDS).load_addr()
+                sys.copy(slice, old, 8 * n)
+                sys.dealloc(old)
+            }
+            slice.offset(8 * n).store_addr(x)
+            v.offset(layout.VARIANT_FIELDS).store_addr(slice)
+        }
+        v.offset(layout.VARIANT_NFIELDS).store_i64(n + 1)
+    }
+}
+
+/// Where a variant's fields are.
+fn vfields(v: addr) -> addr {
+    unsafe {
+        if v.offset(layout.VARIANT_NFIELDS).load_i64() == 1 {
+            return v.offset(layout.VARIANT_FIELDS)
+        }
+        v.offset(layout.VARIANT_FIELDS).load_addr()
+    }
+}
+
+export fn grt_variant_field(v: addr, i: i64) -> addr {
+    if tag(v) != layout.TAG_VARIANT {
+        unsafe { say(mem_static("variant_field on non-variant"), mem_static_len("variant_field on non-variant")) }
+    }
+    let f = unsafe { vfields(v).offset(8 * i).load_addr() }
+    val.inc(f)
+    f
+}
+
+/// Whether variant `v`'s name is the `n` bytes at `p`.
+fn named(v: addr, p: addr, n: i64) -> bool {
+    unsafe {
+        let np = v.offset(layout.VARIANT_NAME + layout.STRREF_PTR).load_addr()
+        let nl = v.offset(layout.VARIANT_NAME + layout.STRREF_LEN).load_i64()
+        nl == n and (np == p or n == 0 or memcmp(np, p, n) == 0)
+    }
+}
+
+export fn grt_variant_is(v: addr, p: addr, n: i64) -> i8 {
+    if tag(v) == layout.TAG_VARIANT and named(v, p, n) { 1.as_i8() } else { 0.as_i8() }
+}
+
+fn is_ok(v: addr) -> bool {
+    unsafe { named(v, mem_static("Ok"), 2) }
+}
+
+export fn grt_ok_new(x: addr) -> addr {
+    unsafe { grt_variant_new1(mem_static("!"), 1, mem_static("Ok"), 2, x) }
+}
+
+export fn grt_err_new(x: addr) -> addr {
+    unsafe { grt_variant_new1(mem_static("!"), 1, mem_static("Err"), 3, x) }
+}
+
+export fn grt_is_ok(v: addr) -> i8 {
+    if tag(v) == layout.TAG_VARIANT and is_ok(v) { 1.as_i8() } else { 0.as_i8() }
+}
+
+/// The payload of a result `res` the caller gives up: moved out when nothing
+/// else holds the result, else counted once more; then the result released.
+fn take_payload(res: addr) -> addr {
+    let f = unsafe { vfields(res).load_addr() }
+    unsafe {
+        if res.atomic_load_i64(Relaxed) == 1 {
+            res.offset(layout.VARIANT_FIELDS).store_i64(0)
+            res.offset(layout.VARIANT_NFIELDS).store_i64(0)
+        } else {
+            val.inc(f)
+        }
+    }
+    val.dec(res)
+    f
+}
+
+/// `try`: an `Ok`'s payload, owned, and the result released; null for an
+/// `Err`, the result untouched.
+export fn grt_try_take(res: addr) -> addr {
+    if tag(res) != layout.TAG_VARIANT {
+        unsafe { say(mem_static("try on a value that is not a result"), mem_static_len("try on a value that is not a result")) }
+    }
+    if not is_ok(res) {
+        return unsafe { mem_addr(0) }
+    }
+    take_payload(res)
+}
+
+export fn grt_try_take_bits(res: addr, out: addr) -> i8 {
+    let p = grt_try_take(res)
+    if unsafe { p.as_i64() } == 0 {
+        return 0.as_i8()
+    }
+    unsafe { out.store_i64(bits_of(p)) }
+    val.dec(p)
+    1.as_i8()
+}
+
+/// A result taken apart: the payload word at `out` -- a scalar `Ok`'s bits
+/// (`kind` 0 to 4, 4 a unit), else its box, owned -- and 0 for `Ok`, 1 for
+/// `Err`. The result is released.
+export fn grt_result_split(res: addr, out: addr, kind: i64) -> i8 {
+    if tag(res) != layout.TAG_VARIANT {
+        unsafe { say(mem_static("a result that is not one"), mem_static_len("a result that is not one")) }
+    }
+    let ok = is_ok(res)
+    let p = take_payload(res)
+    unsafe {
+        if ok and kind >= 0 {
+            out.store_i64(if kind == 4 { 0 } else { bits_of(p) })
+            val.dec(p)
+        } else {
+            out.store_addr(p)
+        }
+    }
+    if ok { 0.as_i8() } else { 1.as_i8() }
+}
+
+/// A box of `bits` of a scalar list's element kind as the backend numbers
+/// them -- 0 integer, 1 float, 3 reference, 5 `u64`, anything else a bool --
+/// as `scalar_box` makes one.
+pub fn scalar_box(code: i64, bits: i64) -> addr {
+    if code == 0 {
+        return boxes.int(bits)
+    }
+    if code == 1 {
+        return boxes.float(bits.from_bits())
+    }
+    if code == 3 {
+        return boxes.reference(bits)
+    }
+    if code == 5 {
+        return boxes.unsigned(bits)
+    }
+    boxes.boolean(bits != 0)
+}
+
+/// The inverse of `result_split`: a result from a tag and a payload word.
+export fn grt_result_box(t: i64, word: i64, kind: i64) -> addr {
+    if t != 0 {
+        return grt_err_new(unsafe { mem_addr(word) })
+    }
+    let p = if kind < 0 { unsafe { mem_addr(word) } } else if kind == 4 { boxes.int(0) } else { scalar_box(kind, word) }
+    grt_ok_new(p)
+}
+
+// ----- tuples -----------------------------------------------------------------
+
+fn small_tuple(a: addr, b: addr, c: addr, n: i64) -> addr {
+    let t = alloc.take()
+    unsafe {
+        t.offset(layout.TAG).store_u8(layout.TAG_TUPLE.as_u8())
+        t.offset(layout.LIST_DISC).store_u8(layout.LIST_INLINE.as_u8())
+        t.offset(layout.LIST_LEN).store_u8(n.as_u8())
+        t.offset(layout.LIST_VALS).store_addr(a)
+        t.offset(layout.LIST_VALS + 8).store_addr(b)
+        t.offset(layout.LIST_VALS + 16).store_addr(c)
+        t.offset(layout.LIST_VALS + 24).store_i64(0)
+    }
+    t
+}
+
+export fn grt_tuple2(a: addr, b: addr) -> addr {
+    pair(a, b)
+}
+
+/// A pair, in the box, as `ListData::pair` makes one.
+pub fn pair(a: addr, b: addr) -> addr {
+    small_tuple(a, b, unsafe { mem_addr(0) }, 2)
+}
+
+export fn grt_tuple3(a: addr, b: addr, c: addr) -> addr {
+    small_tuple(a, b, c, 3)
+}
+
+/// A list just built, sealed as a tuple: the same elements, shown in
+/// parentheses.
+export fn grt_tuple_seal(v: addr) -> addr {
+    if tag(v) == layout.TAG_LIST {
+        unsafe { v.offset(layout.TAG).store_u8(layout.TAG_TUPLE.as_u8()) }
+    }
+    v
+}
+
+// ----- inline fields ----------------------------------------------------------
+
+/// A `Vec`'s parts written as an inline field's three words at `out`.
+fn inline_parts(out: addr, p: addr, len: i64, cap: i64) {
+    set_vec(out, p, len, cap)
+}
+
+/// A list handed to a struct literal for an inline list field: its words
+/// taken when nothing else holds it, copied otherwise; the caller's count on
+/// it spent here.
+export fn grt_inline_absorb_list(l: addr, out: addr) {
+    let unique = unsafe { l.atomic_load_i64(Relaxed) } == 1
+    let t = tag(l)
+    unsafe {
+        if t == layout.TAG_LIST_VALS {
+            let w = l.offset(layout.VALS_VEC)
+            let p = w.offset(layout.VEC_PTR).load_addr()
+            let len = w.offset(layout.VEC_LEN).load_i64()
+            if unique {
+                inline_parts(out, p, len, w.offset(layout.VEC_CAP).load_i64())
+                set_vec(w, mem_addr(layout.WORDS_DANGLING), 0, 0)
+            } else {
+                let copy = buffer(len, 8, layout.WORDS_DANGLING)
+                sys.copy(copy, p, 8 * len)
+                vals.dup_type(l.offset(layout.VALS_TY).load_addr(), copy, len)
+                inline_parts(out, copy, len, len)
+            }
+        } else if t == layout.TAG_LIST_SCALAR {
+            let s = l.offset(layout.SCALAR_VEC)
+            let len = s.offset(layout.VEC_LEN).load_i64()
+            let words = l.offset(layout.SCALAR_DISC).load_u8().as_i64() == layout.SCALAR_WORDS
+            if unique and words {
+                inline_parts(out, s.offset(layout.VEC_PTR).load_addr(), len, s.offset(layout.VEC_CAP).load_i64())
+                set_vec(s, mem_addr(layout.WORDS_DANGLING), 0, 0)
+            } else {
+                let copy = buffer(len, 8, layout.WORDS_DANGLING)
+                let p = s.offset(layout.VEC_PTR).load_addr()
+                var i = 0
+                while i < len {
+                    copy.offset(8 * i).store_i64(if words { p.offset(8 * i).load_i64() } else { p.offset(i).load_u8().as_i64() })
+                    i += 1
+                }
+                inline_parts(out, copy, len, len)
+            }
+        } else if t == layout.TAG_LIST and list_len(l) == 0 {
+            inline_parts(out, mem_addr(layout.WORDS_DANGLING), 0, 0)
+        } else {
+            say(mem_static("an inline list field given something that is not a list"), mem_static_len("an inline list field given something that is not a list"))
+        }
+    }
+    val.dec(l)
+}
+
+fn list_len(l: addr) -> i64 {
+    unsafe {
+        if l.offset(layout.LIST_DISC).load_u8().as_i64() == layout.LIST_INLINE {
+            return l.offset(layout.LIST_LEN).load_u8().as_i64()
+        }
+        l.offset(layout.LIST_VEC).offset(layout.VEC_LEN).load_i64()
+    }
+}
+
+/// A string handed to a struct literal for an inline string field: its
+/// bytes copied, exactly as long as it is; the caller's count spent here.
+export fn grt_inline_absorb_str(s: addr, out: addr) {
+    if tag(s) != layout.TAG_STR {
+        unsafe { say(mem_static("an inline string field given something that is not a string"), mem_static_len("an inline string field given something that is not a string")) }
+    }
+    var n = 0
+    let p = strread.text_of(s, n)
+    let copy = buffer(n, 1, layout.U8_DANGLING)
+    sys.copy(copy, p, n)
+    inline_parts(out, copy, n, n)
+    val.dec(s)
+}
+
+export fn grt_inline_free_words(w: addr) {
+    release.free_vec(w)
+}
+
+export fn grt_inline_free_bytes(w: addr) {
+    release.free_vec(w)
+}
+
+/// An inline string field as a string value.
+export fn grt_inline_str_box(p: addr, n: i64) -> addr {
+    numstr.new_str(p, n)
+}
+
+// ----- lists of value structs ---------------------------------------------------
+
+fn width_of(ty: addr) -> i64 {
+    let w = unsafe { ty.offset(layout.STRUCTTY_WIDTH).load_i64() }
+    if w < 1 { 1 } else { w }
+}
+
+/// The type's shared empty list, made once (`empty.get_or_init`): immortal,
+/// never counted, its words a `Vec` that never allocated.
+export fn grt_vals_new(desc: addr) -> addr {
+    let ty = type_of(desc)
+    unsafe {
+        let state = ty.offset(layout.STRUCTTY_EMPTY_STATE)
+        while true {
+            if state.atomic_load_u8(Acquire).as_i64() == layout.ONCE_READY {
+                return ty.offset(layout.STRUCTTY_EMPTY).load_addr()
+            }
+            if state.atomic_cas_u8(layout.ONCE_UNSET.as_u8(), layout.ONCE_SETTING.as_u8(), AcqRel).as_i64() == layout.ONCE_UNSET {
+                let l = sys.alloc(layout.BOX_SIZE)
+                l.atomic_store_i64(layout.IMMORTAL, Relaxed)
+                l.offset(layout.TAG).store_u8(layout.TAG_LIST_VALS.as_u8())
+                l.offset(layout.VALS_TY).store_addr(ty)
+                set_vec(l.offset(layout.VALS_VEC), mem_addr(layout.WORDS_DANGLING), 0, 0)
+                ty.offset(layout.STRUCTTY_EMPTY).store_addr(l)
+                state.atomic_store_u8(layout.ONCE_READY.as_u8(), Release)
+                return l
+            }
+        }
+        mem_addr(0)
+    }
+}
+
+/// A new value list of type `ty` holding a copy of `len` words at `p`, each
+/// value's boxes counted up and inline buffers copied, with room for `cap`.
+fn copy_vals(ty: addr, p: addr, len: i64, cap: i64) -> addr {
+    let buf = buffer(cap, 8, layout.WORDS_DANGLING)
+    sys.copy(buf, p, 8 * len)
+    vals.dup_type(ty, buf, len)
+    let l = alloc.take()
+    unsafe {
+        l.offset(layout.TAG).store_u8(layout.TAG_LIST_VALS.as_u8())
+        l.offset(layout.VALS_TY).store_addr(ty)
+        set_vec(l.offset(layout.VALS_VEC), buf, len, cap)
+    }
+    l
+}
+
+/// Room for `more` words in the `Vec` at `w`, grown as `RawVec` grows one:
+/// to twice its capacity, or what is needed, and never to fewer than four.
+fn reserve_words(w: addr, more: i64) {
+    unsafe {
+        let len = w.offset(layout.VEC_LEN).load_i64()
+        let cap = w.offset(layout.VEC_CAP).load_i64()
+        if len + more <= cap {
+            return
+        }
+        var want = cap * 2
+        if want < len + more {
+            want = len + more
+        }
+        if want < 4 {
+            want = 4
+        }
+        let p = if cap == 0 { sys.alloc(8 * want) } else { sys.grow(w.offset(layout.VEC_PTR).load_addr(), 8 * want) }
+        w.offset(layout.VEC_PTR).store_addr(p)
+        w.offset(layout.VEC_CAP).store_i64(want)
+    }
+}
+
+/// Appends one value's words from `src`, its boxed fields handed over;
+/// answers the list, a copy first when it was shared.
+export fn grt_vals_push(l: addr, src: addr) -> addr {
+    var t = l
+    unsafe {
+        if l.atomic_load_i64(Relaxed) != 1 {
+            if tag(l) != layout.TAG_LIST_VALS {
+                say(mem_static("push to a value list that is not one"), mem_static_len("push to a value list that is not one"))
+            }
+            let ty = l.offset(layout.VALS_TY).load_addr()
+            let w = width_of(ty)
+            let words = l.offset(layout.VALS_VEC)
+            let len = words.offset(layout.VEC_LEN).load_i64()
+            let room = if len + w > 4 * w { len + w } else { 4 * w }
+            t = copy_vals(ty, words.offset(layout.VEC_PTR).load_addr(), len, room)
+            val.dec(l)
+        }
+        let ty = t.offset(layout.VALS_TY).load_addr()
+        let w = ty.offset(layout.STRUCTTY_WIDTH).load_i64()
+        let words = t.offset(layout.VALS_VEC)
+        reserve_words(words, w)
+        let len = words.offset(layout.VEC_LEN).load_i64()
+        sys.copy(words.offset(layout.VEC_PTR).load_addr().offset(8 * len), src, 8 * w)
+        words.offset(layout.VEC_LEN).store_i64(len + w)
+    }
+    t
+}
+
+/// The list when nothing else holds it, else a copy nothing else does.
+export fn grt_vals_unshare(l: addr) -> addr {
+    unsafe {
+        if l.atomic_load_i64(Relaxed) == 1 {
+            return l
+        }
+        if tag(l) != layout.TAG_LIST_VALS {
+            say(mem_static("write into a value list that is not one"), mem_static_len("write into a value list that is not one"))
+        }
+        let words = l.offset(layout.VALS_VEC)
+        let len = words.offset(layout.VEC_LEN).load_i64()
+        let copy = copy_vals(l.offset(layout.VALS_TY).load_addr(), words.offset(layout.VEC_PTR).load_addr(), len, len)
+        val.dec(l)
+        copy
+    }
+}
+
+export fn grt_vals_pin(l: addr, data_out: addr, len_out: addr) -> addr {
+    let mine = grt_vals_unshare(l)
+    unsafe {
+        if tag(mine) != layout.TAG_LIST_VALS {
+            say(mem_static("pin of a value list that is not one"), mem_static_len("pin of a value list that is not one"))
+        }
+        let words = mine.offset(layout.VALS_VEC)
+        data_out.store_addr(words.offset(layout.VEC_PTR).load_addr())
+        len_out.store_i64(words.offset(layout.VEC_LEN).load_i64() / width_of(mine.offset(layout.VALS_TY).load_addr()))
+    }
+    mine
+}
+
+export fn grt_vals_data(l: addr) -> addr {
+    if tag(l) != layout.TAG_LIST_VALS {
+        unsafe { say(mem_static("words of a value list that is not one"), mem_static_len("words of a value list that is not one")) }
+    }
+    unsafe { l.offset(layout.VALS_VEC).offset(layout.VEC_PTR).load_addr() }
+}
+
+export fn grt_vals_len(l: addr) -> i64 {
+    if tag(l) != layout.TAG_LIST_VALS {
+        unsafe { say(mem_static("length of a value list that is not one"), mem_static_len("length of a value list that is not one")) }
+    }
+    unsafe { l.offset(layout.VALS_VEC).offset(layout.VEC_LEN).load_i64() / width_of(l.offset(layout.VALS_TY).load_addr()) }
+}
+
+/// Element `i`'s words, borrowed; an index out of range panics as every
+/// list index does.
+export fn grt_vals_at(l: addr, i: i64) -> addr {
+    if tag(l) != layout.TAG_LIST_VALS {
+        unsafe { say(mem_static("index into a value list that is not one"), mem_static_len("index into a value list that is not one")) }
+    }
+    unsafe {
+        let w = width_of(l.offset(layout.VALS_TY).load_addr())
+        let n = l.offset(layout.VALS_VEC).offset(layout.VEC_LEN).load_i64() / w
+        if i < 0 or i >= n {
+            panic_index(i, n)
+        }
+        l.offset(layout.VALS_VEC).offset(layout.VEC_PTR).load_addr().offset(8 * w * i)
+    }
+}
+
+/// `index {i} out of bounds (len {n})`.
+pub fn panic_index(i: i64, n: i64) {
+    unsafe {
+        let msg = sys.alloc(96)
+        var at = 0
+        sys.copy(msg, mem_static("index "), 6)
+        at = 6
+        at += fmt.i64_text(i, msg.offset(at))
+        sys.copy(msg.offset(at), mem_static(" out of bounds (len "), mem_static_len(" out of bounds (len "))
+        at += mem_static_len(" out of bounds (len ")
+        at += fmt.i64_text(n, msg.offset(at))
+        msg.offset(at).store_u8(41)
+        grasm_panic_msg(msg, at + 1)
+    }
+}
+
+export fn grt_panic_index(i: i64, n: i64) {
+    panic_index(i, n)
+}

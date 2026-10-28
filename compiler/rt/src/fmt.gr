@@ -18,7 +18,6 @@
 // Every writer here stores at an address it is given and answers how many
 // bytes it wrote; the callers own the memory. The longest text is a negative
 // subnormal: `-0.` and 323 zeros and 17 digits, 344 bytes (`F64_MAX`).
-import text
 import sys
 
 /// Room enough for any `f64_text`.
@@ -62,7 +61,14 @@ pub fn i64_text(v: i64, at: addr) -> i64 {
 
 /// `true` or `false`.
 pub fn bool_text(v: bool, at: addr) -> i64 {
-    if v { text.true_word(at) } else { text.false_word(at) }
+    unsafe {
+        if v {
+            sys.copy(at, mem_static("true"), mem_static_len("true"))
+            return mem_static_len("true")
+        }
+        sys.copy(at, mem_static("false"), mem_static_len("false"))
+        mem_static_len("false")
+    }
 }
 
 // ----- a bignum ---------------------------------------------------------------
@@ -71,23 +77,23 @@ pub fn bool_text(v: bool, at: addr) -> i64 {
 // many are in use. Laid out at an address as the count (8 bytes) and the
 // limbs (4 bytes each).
 
-fn size(b: addr) -> i64 {
+pub fn size(b: addr) -> i64 {
     unsafe { b.load_i64() }
 }
 
-fn set_size(b: addr, n: i64) {
+pub fn set_size(b: addr, n: i64) {
     unsafe { b.store_i64(n) }
 }
 
-fn limb(b: addr, i: i64) -> u64 {
+pub fn limb(b: addr, i: i64) -> u64 {
     unsafe { b.offset(8 + 4 * i).load_u32().as_u64() }
 }
 
-fn set_limb(b: addr, i: i64, v: u64) {
+pub fn set_limb(b: addr, i: i64, v: u64) {
     unsafe { b.offset(8 + 4 * i).store_u32(v.as_u32()) }
 }
 
-fn big_zero(b: addr) {
+pub fn big_zero(b: addr) {
     var i = 0
     while i < 21 {
         unsafe { b.offset(8 * i).store_i64(0) }
@@ -95,7 +101,7 @@ fn big_zero(b: addr) {
     }
 }
 
-fn big_from_u64(b: addr, v: u64) {
+pub fn big_from_u64(b: addr, v: u64) {
     big_zero(b)
     var x = v
     var n = 0
@@ -198,7 +204,7 @@ fn big_mul_small(a: addr, m: u64) {
 }
 
 /// `a *= 2^bits`.
-fn big_mul_pow2(a: addr, bits: i64) {
+pub fn big_mul_pow2(a: addr, bits: i64) {
     let words = bits / 32
     let shift = bits % 32
     let n = size(a)
@@ -236,7 +242,7 @@ fn big_mul_pow2(a: addr, bits: i64) {
 }
 
 /// `a *= 10^n`.
-fn big_mul_pow10(a: addr, n: i64) {
+pub fn big_mul_pow10(a: addr, n: i64) {
     var k = n
     while k >= 9 {
         big_mul_small(a, 1000000000)
@@ -399,14 +405,19 @@ pub fn f64_text(x: f64, at: addr) -> i64 {
     let field = bits.ushr(52).bit_and(0x7ff).as_i64()
     let frac = bits.bit_and(0x000f_ffff_ffff_ffff)
     if field == 0x7ff {
-        if frac != 0 {
-            return text.nan_word(at)
+        unsafe {
+            if frac != 0 {
+                sys.copy(at, mem_static("NaN"), mem_static_len("NaN"))
+                return mem_static_len("NaN")
+            }
+            if negative {
+                at.store_u8(45)
+                sys.copy(at.offset(1), mem_static("inf"), mem_static_len("inf"))
+                return 1 + mem_static_len("inf")
+            }
+            sys.copy(at, mem_static("inf"), mem_static_len("inf"))
+            return mem_static_len("inf")
         }
-        if negative {
-            unsafe { at.store_u8(45) }
-            return 1 + text.inf_word(unsafe { at.offset(1) })
-        }
-        return text.inf_word(at)
     }
     var n = 0
     if negative {

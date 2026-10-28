@@ -1,0 +1,443 @@
+// Structural equality and the order of boxed values (docs/self-hosting.md
+// §6.11): `grasm_val_eq`, what `==` on a boxed value calls, and
+// `grasm_val_cmp`, what `cmp` and `<` on tuples call.
+//
+// Equality is the Rust runtime's ([E-EQ-STRUCTURAL]): lists and tuples
+// element by element, maps entry by entry, structs by their type's name and
+// then field by field (a scalar field by its kind: a float as a float, so
+// NaN is unequal to itself), variants by both names and then their fields,
+// ranges by their bounds, function values by their code and captures,
+// scalar lists element by element whether held as scalars or as boxes, and
+// every scalar by its value; anything of two different kinds is unequal. A
+// pair whose parts need comparing pushes them onto a list of pairs still to
+// compare -- a loop, so a value a hundred thousand deep compares as a
+// shallow one does.
+//
+// The order: integers and `u64`s by value, floats by the total order a sort
+// uses (`total_cmp`, [L-LIB-SORT-NAN]), strings by their bytes, tuples
+// component by component and then by length; anything else is equal.
+import layout
+import sys
+import release
+import strread
+import maps
+import keys
+
+extern fn memcmp(a: addr, b: addr, n: i64) -> i32
+
+fn tag(v: addr) -> i64 {
+    unsafe { v.offset(layout.TAG).load_u8() }.as_i64()
+}
+
+fn word(v: addr) -> i64 {
+    unsafe { v.offset(layout.WORD_AT).load_i64() }
+}
+
+/// Whether `n` bytes at `p` and `m` at `q` are the same bytes.
+fn same_bytes(p: addr, n: i64, q: addr, m: i64) -> bool {
+    n == m and (n == 0 or unsafe { memcmp(p, q, n) } == 0)
+}
+
+/// A `&str` (its address and length at `s`) against another.
+fn same_strref(s: addr, t: addr) -> bool {
+    unsafe {
+        same_bytes(s.offset(layout.STRREF_PTR).load_addr(), s.offset(layout.STRREF_LEN).load_i64(), t.offset(layout.STRREF_PTR).load_addr(), t.offset(layout.STRREF_LEN).load_i64())
+    }
+}
+
+/// A `Vec`'s or `String`'s bytes (its three words at `v`) against another's.
+fn same_vec(v: addr, w: addr) -> bool {
+    unsafe {
+        same_bytes(v.offset(layout.VEC_PTR).load_addr(), v.offset(layout.VEC_LEN).load_i64(), w.offset(layout.VEC_PTR).load_addr(), w.offset(layout.VEC_LEN).load_i64())
+    }
+}
+
+/// Two floats, as floats: NaN unequal to everything, the zeros equal.
+fn same_float(a: i64, b: i64) -> bool {
+    a.from_bits() == b.from_bits()
+}
+
+/// A list or tuple box's length, and where its element pointers are.
+fn items(v: addr, inout n: i64) -> addr {
+    unsafe {
+        if v.offset(layout.LIST_DISC).load_u8().as_i64() == layout.LIST_INLINE {
+            n = v.offset(layout.LIST_LEN).load_u8().as_i64()
+            return v.offset(layout.LIST_VALS)
+        }
+        n = v.offset(layout.LIST_VEC).offset(layout.VEC_LEN).load_i64()
+        v.offset(layout.LIST_VEC).offset(layout.VEC_PTR).load_addr()
+    }
+}
+
+/// A scalar list's length, and its element `i`'s bits.
+fn scalar_len(v: addr) -> i64 {
+    unsafe { v.offset(layout.SCALAR_VEC).offset(layout.VEC_LEN).load_i64() }
+}
+
+fn scalar_at(v: addr, i: i64) -> i64 {
+    unsafe {
+        let p = v.offset(layout.SCALAR_VEC).offset(layout.VEC_PTR).load_addr()
+        if v.offset(layout.SCALAR_DISC).load_u8().as_i64() == layout.SCALAR_BYTES {
+            return p.offset(i).load_u8().as_i64()
+        }
+        p.offset(8 * i).load_i64()
+    }
+}
+
+fn scalar_kind(v: addr) -> i64 {
+    unsafe { v.offset(layout.SCALAR_KIND_AT).load_u8() }.as_i64()
+}
+
+/// A struct's fields: where they are, and how many.
+fn fields(v: addr, inout n: i64) -> addr {
+    unsafe {
+        if v.offset(layout.STRUCT_DISC).load_u8().as_i64() != layout.STRUCT_INLINE {
+            n = v.offset(layout.STRUCT_VEC).offset(layout.VEC_LEN).load_i64()
+            return v.offset(layout.STRUCT_VEC).offset(layout.VEC_PTR).load_addr()
+        }
+        n = v.offset(layout.STRUCT_LEN).load_u8().as_i64()
+        v.offset(layout.STRUCT_VALS)
+    }
+}
+
+/// A variant's fields: none, the one in its word, or a slice of them.
+fn vfields(v: addr, inout n: i64) -> addr {
+    unsafe {
+        n = v.offset(layout.VARIANT_NFIELDS).load_i64()
+        if n == 1 {
+            return v.offset(layout.VARIANT_FIELDS)
+        }
+        v.offset(layout.VARIANT_FIELDS).load_addr()
+    }
+}
+
+/// Element `i` of scalar list `s` (of kind `k`) against the box `b`: the
+/// same value when the box holds that kind's.
+fn scalar_vs_box(k: i64, bits: i64, b: addr) -> bool {
+    let t = tag(b)
+    if k == layout.SK_I64 {
+        return t == layout.TAG_I64 and word(b) == bits
+    }
+    if k == layout.SK_U64 {
+        return t == layout.TAG_U64 and word(b) == bits
+    }
+    if k == layout.SK_REF {
+        return t == layout.TAG_REF and word(b) == bits
+    }
+    if k == layout.SK_F64 {
+        return t == layout.TAG_F64 and same_float(bits, word(b))
+    }
+    if k == layout.SK_BOOL {
+        return t == layout.TAG_BOOL and (bits != 0) == (unsafe { b.offset(layout.BOOL_AT).load_u8() }.as_i64() != 0)
+    }
+    false
+}
+
+/// One pair: whether it is equal as far as can be said without comparing
+/// its parts, which go onto the list of pairs still to compare.
+fn step(x: addr, y: addr, inout work: addr, inout cap: i64, inout n: i64) -> bool {
+    let tx = tag(x)
+    let ty = tag(y)
+    unsafe {
+        if tx == layout.TAG_RANGE and ty == layout.TAG_RANGE {
+            return x.offset(layout.RANGE_START).load_i64() == y.offset(layout.RANGE_START).load_i64() and x.offset(layout.RANGE_END).load_i64() == y.offset(layout.RANGE_END).load_i64() and x.offset(layout.RANGE_INCL).load_u8() == y.offset(layout.RANGE_INCL).load_u8()
+        }
+        if (tx == layout.TAG_LIST and ty == layout.TAG_LIST) or (tx == layout.TAG_TUPLE and ty == layout.TAG_TUPLE) {
+            var nx = 0
+            var ny = 0
+            let ax = items(x, nx)
+            let ay = items(y, ny)
+            if nx != ny {
+                return false
+            }
+            var i = 0
+            while i < nx {
+                release.push(work, cap, n, ax.offset(8 * i).load_addr())
+                release.push(work, cap, n, ay.offset(8 * i).load_addr())
+                i += 1
+            }
+            return true
+        }
+        if tx == layout.TAG_MAP and ty == layout.TAG_MAP {
+            let items_x = x.offset(layout.MAP_ITEMS).load_i64()
+            if items_x != y.offset(layout.MAP_ITEMS).load_i64() {
+                return false
+            }
+            let mask = x.offset(layout.MAP_MASK).load_i64()
+            if mask == 0 or items_x == 0 {
+                return true
+            }
+            let ctrl = x.offset(layout.MAP_CTRL).load_addr()
+            let yseed = maps.seed_of(y)
+            var i = 0
+            while i <= mask {
+                if ctrl.offset(i).load_u8().as_i64() < 128 {
+                    let e = keys.entry(ctrl, i)
+                    let at = maps.find_key(y, maps.hash_key(yseed, e), e)
+                    if at < 0 {
+                        return false
+                    }
+                    release.push(work, cap, n, e.offset(layout.MAP_ENTRY_VAL).load_addr())
+                    release.push(work, cap, n, keys.entry(y.offset(layout.MAP_CTRL).load_addr(), at).offset(layout.MAP_ENTRY_VAL).load_addr())
+                }
+                i += 1
+            }
+            return true
+        }
+        if tx == layout.TAG_STRUCT and ty == layout.TAG_STRUCT {
+            let t1 = x.offset(layout.STRUCT_TY).load_addr()
+            let t2 = y.offset(layout.STRUCT_TY).load_addr()
+            if not same_strref(t1.offset(layout.STRUCTTY_NAME), t2.offset(layout.STRUCTTY_NAME)) {
+                return false
+            }
+            var nx = 0
+            var ny = 0
+            let fx = fields(x, nx)
+            let fy = fields(y, ny)
+            if nx != ny {
+                return false
+            }
+            let kinds = t1.offset(layout.STRUCTTY_KINDS)
+            let kp = kinds.offset(layout.VEC_PTR).load_addr()
+            let nk = kinds.offset(layout.VEC_LEN).load_i64()
+            var i = 0
+            while i < nx {
+                let k = release.kind_at(kp, 1, nk, i)
+                let a = fx.offset(8 * i).load_i64()
+                let b = fy.offset(8 * i).load_i64()
+                if k == layout.FK_BOXED {
+                    release.push(work, cap, n, mem_addr(a))
+                    release.push(work, cap, n, mem_addr(b))
+                } else if k == layout.FK_F64 {
+                    if not same_float(a, b) {
+                        return false
+                    }
+                } else if a != b {
+                    return false
+                }
+                i += 1
+            }
+            return true
+        }
+        if tx == layout.TAG_VARIANT and ty == layout.TAG_VARIANT {
+            if not same_strref(x.offset(layout.VARIANT_TYPE), y.offset(layout.VARIANT_TYPE)) or not same_strref(x.offset(layout.VARIANT_NAME), y.offset(layout.VARIANT_NAME)) {
+                return false
+            }
+            var nx = 0
+            var ny = 0
+            let fx = vfields(x, nx)
+            let fy = vfields(y, ny)
+            if nx != ny {
+                return false
+            }
+            var i = 0
+            while i < nx {
+                release.push(work, cap, n, fx.offset(8 * i).load_addr())
+                release.push(work, cap, n, fy.offset(8 * i).load_addr())
+                i += 1
+            }
+            return true
+        }
+        if tx != ty {
+            // A scalar list against a list of boxes, either way round: the
+            // same logical list arrives in either.
+            if tx == layout.TAG_LIST_SCALAR and ty == layout.TAG_LIST {
+                return scalars_vs_boxes(x, y)
+            }
+            if tx == layout.TAG_LIST and ty == layout.TAG_LIST_SCALAR {
+                return scalars_vs_boxes(y, x)
+            }
+            return false
+        }
+        if tx == layout.TAG_I64 or tx == layout.TAG_U64 or tx == layout.TAG_REF {
+            return word(x) == word(y)
+        }
+        if tx == layout.TAG_UNIT {
+            return true
+        }
+        if tx == layout.TAG_F64 {
+            return same_float(word(x), word(y))
+        }
+        if tx == layout.TAG_BOOL {
+            return x.offset(layout.BOOL_AT).load_u8() == y.offset(layout.BOOL_AT).load_u8()
+        }
+        if tx == layout.TAG_STR {
+            var nx = 0
+            var ny = 0
+            let px = strread.text_of(x, nx)
+            let py = strread.text_of(y, ny)
+            return same_bytes(px, nx, py, ny)
+        }
+        if tx == layout.TAG_STRBUF {
+            return same_vec(x.offset(layout.STRBUF_STRING), y.offset(layout.STRBUF_STRING))
+        }
+        if tx == layout.TAG_BYTEBUF {
+            return same_vec(x.offset(layout.BYTEBUF_VEC), y.offset(layout.BYTEBUF_VEC))
+        }
+        if tx == layout.TAG_BYTES {
+            return same_bytes(x.offset(layout.BYTES_PTR).load_addr(), x.offset(layout.BYTES_LEN).load_i64(), y.offset(layout.BYTES_PTR).load_addr(), y.offset(layout.BYTES_LEN).load_i64())
+        }
+        if tx == layout.TAG_FN {
+            // The same code over the same captures: the same environment,
+            // or two that are equal.
+            if x.offset(layout.FN_CODE).load_i64() != y.offset(layout.FN_CODE).load_i64() {
+                return false
+            }
+            let e1 = x.offset(layout.FN_ENV).load_addr()
+            let e2 = y.offset(layout.FN_ENV).load_addr()
+            if e1 == e2 {
+                return true
+            }
+            if e1.as_i64() == 0 or e2.as_i64() == 0 {
+                return false
+            }
+            release.push(work, cap, n, e1)
+            release.push(work, cap, n, e2)
+            return true
+        }
+        if tx == layout.TAG_LIST_SCALAR {
+            let k = scalar_kind(x)
+            if k != scalar_kind(y) {
+                return false
+            }
+            let len = scalar_len(x)
+            if len != scalar_len(y) {
+                return false
+            }
+            var i = 0
+            while i < len {
+                let a = scalar_at(x, i)
+                let b = scalar_at(y, i)
+                if k == layout.SK_F64 {
+                    if not same_float(a, b) {
+                        return false
+                    }
+                } else if a != b {
+                    return false
+                }
+                i += 1
+            }
+            return true
+        }
+        false
+    }
+}
+
+/// A scalar list `s` against a list of boxes `l`, element by element.
+fn scalars_vs_boxes(s: addr, l: addr) -> bool {
+    var nl = 0
+    let at = items(l, nl)
+    let len = scalar_len(s)
+    if len != nl {
+        return false
+    }
+    let k = scalar_kind(s)
+    var i = 0
+    while i < len {
+        if not scalar_vs_box(k, scalar_at(s, i), unsafe { at.offset(8 * i).load_addr() }) {
+            return false
+        }
+        i += 1
+    }
+    true
+}
+
+/// Whether `a` and `b` are structurally equal.
+pub fn equal(a: addr, b: addr) -> bool {
+    var work = unsafe { mem_addr(0) }
+    var cap = 0
+    var n = 0
+    release.push(work, cap, n, a)
+    release.push(work, cap, n, b)
+    var same = true
+    while n > 0 and same {
+        let y = unsafe { work.offset(8 * (n - 1)).load_addr() }
+        let x = unsafe { work.offset(8 * (n - 2)).load_addr() }
+        n -= 2
+        same = step(x, y, work, cap, n)
+    }
+    if cap > 0 {
+        sys.dealloc(work)
+    }
+    same
+}
+
+export fn grt_val_eq(a: addr, b: addr) -> i8 {
+    if equal(a, b) { 1.as_i8() } else { 0.as_i8() }
+}
+
+/// A float's bits made into an integer that orders as `total_cmp` orders
+/// the float: a negative one's bits but the sign turned over.
+fn total_key(bits: i64) -> i64 {
+    bits.bit_xor(bits.shr(63).ushr(1))
+}
+
+fn three(a: i64, b: i64) -> i64 {
+    if a < b { -1 } else if a > b { 1 } else { 0 }
+}
+
+/// `a` against `b`: -1, 0 or 1. Tuples push their components and, beneath
+/// them, their lengths (marked by a third word of 1), for when every
+/// component agrees.
+pub fn order(a: addr, b: addr) -> i64 {
+    var work = unsafe { mem_addr(0) }
+    var cap = 0
+    var n = 0
+    release.push(work, cap, n, a)
+    release.push(work, cap, n, b)
+    release.push(work, cap, n, unsafe { mem_addr(0) })
+    var out = 0
+    while n > 0 and out == 0 {
+        let mark = unsafe { work.offset(8 * (n - 1)).load_i64() }
+        let y = unsafe { work.offset(8 * (n - 2)).load_addr() }
+        let x = unsafe { work.offset(8 * (n - 3)).load_addr() }
+        n -= 3
+        if mark == 1 {
+            out = three(unsafe { x.as_i64() }, unsafe { y.as_i64() })
+        } else {
+            let tx = tag(x)
+            let ty = tag(y)
+            if tx == layout.TAG_I64 and ty == layout.TAG_I64 {
+                out = three(word(x), word(y))
+            } else if tx == layout.TAG_U64 and ty == layout.TAG_U64 {
+                let ux = word(x).as_u64()
+                let uy = word(y).as_u64()
+                out = if ux < uy { -1 } else if ux > uy { 1 } else { 0 }
+            } else if tx == layout.TAG_F64 and ty == layout.TAG_F64 {
+                out = three(total_key(word(x)), total_key(word(y)))
+            } else if tx == layout.TAG_STR and ty == layout.TAG_STR {
+                var nx = 0
+                var ny = 0
+                let px = strread.text_of(x, nx)
+                let py = strread.text_of(y, ny)
+                let m = if nx < ny { nx } else { ny }
+                let c = if m == 0 { 0 } else { unsafe { memcmp(px, py, m) }.as_i64() }
+                out = if c < 0 { -1 } else if c > 0 { 1 } else { three(nx, ny) }
+            } else if tx == layout.TAG_TUPLE and ty == layout.TAG_TUPLE {
+                var nx = 0
+                var ny = 0
+                let ax = items(x, nx)
+                let ay = items(y, ny)
+                release.push(work, cap, n, unsafe { mem_addr(nx) })
+                release.push(work, cap, n, unsafe { mem_addr(ny) })
+                release.push(work, cap, n, unsafe { mem_addr(1) })
+                let m = if nx < ny { nx } else { ny }
+                var i = m - 1
+                while i >= 0 {
+                    release.push(work, cap, n, unsafe { ax.offset(8 * i).load_addr() })
+                    release.push(work, cap, n, unsafe { ay.offset(8 * i).load_addr() })
+                    release.push(work, cap, n, unsafe { mem_addr(0) })
+                    i -= 1
+                }
+            }
+        }
+    }
+    if cap > 0 {
+        sys.dealloc(work)
+    }
+    out
+}
+
+export fn grt_val_cmp(a: addr, b: addr) -> i64 {
+    order(a, b)
+}

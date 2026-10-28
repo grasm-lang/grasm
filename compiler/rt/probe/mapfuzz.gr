@@ -1,0 +1,410 @@
+// Maps on the Grasm runtime against the Rust runtime's, placement and all
+// (docs/self-hosting.md §6.11), for `scripts/fuzz_rtmaps.sh`, which builds
+// this twice -- on the Rust runtime and with the Grasm runtime interposed --
+// and requires the same lines out.
+//
+//     mapfuzz <seed> <ops> [<pin>]
+//
+// With a pin, the seed every map is hashed with is pinned on both sides:
+// this program exports `getentropy`, which replaces the C library's for the
+// whole program ([T-EXPORT]), and answers the pin's bytes -- the only way
+// either runtime draws its seed. Then every operation's line carries a
+// digest of the whole table it touched: the entry count, the bucket mask,
+// how many more fit, every control byte and its copy past the end, and each
+// full bucket's key and value; so an entry in another bucket, a tombstone
+// where the other side left an empty byte, a table grown at another moment
+// or a hash one bit different is a different line. Without one, each side
+// draws its own seed as it does in any program, and the lines carry only
+// what does not depend on it: answers, lengths, and what iteration presents.
+//
+// The operations, on a handful of maps, some shared so a change copies the
+// map first: `set` with keys of every kind (small and large integers,
+// `u64`s, booleans, short and long strings, tuples and tuples of tuples) and
+// `set` by a string's bytes; `get`, `get_ptr` and `get_ptr` by bytes;
+// `delete`, sometimes most of a large map's entries, so that tombstones
+// accumulate, and of a map filled to the brim, so that later insertions
+// rehash the table in place; counting with
+// `add_i64` and by bytes; `keys`, `values` and `entries`, walked. Calls are
+// by the entry points' C names, as a compiled program makes them.
+
+extern fn grasm_map_new() -> addr
+extern fn grasm_map_set(m: addr, k: addr, v: addr) -> addr
+extern fn grasm_map_set_bytes(m: addr, p: addr, n: i64, v: addr) -> addr
+extern fn grasm_map_get(m: addr, k: addr) -> addr
+extern fn grasm_map_get_ptr(m: addr, k: addr) -> addr
+extern fn grasm_map_get_ptr_bytes(m: addr, p: addr, n: i64) -> addr
+extern fn grasm_map_delete(m: addr, k: addr, found: addr) -> addr
+extern fn grasm_map_len(m: addr) -> i64
+extern fn grasm_map_keys(m: addr) -> addr
+extern fn grasm_map_values(m: addr) -> addr
+extern fn grasm_map_entries(m: addr) -> addr
+extern fn grasm_map_add_i64(m: addr, k: addr, delta: i64, default: i64) -> addr
+extern fn grasm_map_add_i64_bytes(m: addr, p: addr, n: i64, delta: i64, default: i64) -> addr
+extern fn grasm_box_i64(v: i64) -> addr
+extern fn grasm_box_u64(v: i64) -> addr
+extern fn grasm_box_f64(v: f64) -> addr
+extern fn grasm_str_lit(p: addr, n: i64) -> addr
+extern fn grasm_tuple2(a: addr, b: addr) -> addr
+extern fn grasm_val_inc(v: addr)
+extern fn grasm_val_dec(v: addr)
+extern fn grasm_live_allocations() -> i64
+
+/// The pin, plus one; 0 when there is none.
+thread_local PIN: i64
+
+/// Replaces the C library's: the pin's eight bytes when there is one, else
+/// the system's, read as the C library would (`/dev/urandom` through
+/// `arc4random_buf`).
+export fn getentropy(p: addr, n: i64) -> i32 {
+    unsafe {
+        let pin = mem_tls(PIN).load_i64()
+        if pin != 0 {
+            var i = 0
+            while i < n {
+                p.offset(i).store_u8((pin - 1).ushr(8 * (i % 8)).bit_and(255).as_u8())
+                i += 1
+            }
+            return 0.as_i32()
+        }
+        arc4random_buf(p, n)
+        0.as_i32()
+    }
+}
+
+extern fn arc4random_buf(p: addr, n: i64)
+
+fn next(inout s: i64) -> i64 {
+    s = s * 6364136223846793005 + 1442695040888963407
+    s.ushr(17)
+}
+
+fn pick(inout s: i64, n: i64) -> i64 {
+    next(s) % n
+}
+
+/// FNV-1a over a word's bytes.
+fn fnv(h: i64, w: i64) -> i64 {
+    var x = h
+    var i = 0
+    while i < 8 {
+        x = x.bit_xor(w.ushr(8 * i).bit_and(255)) * 1099511628211
+        i += 1
+    }
+    x
+}
+
+/// `n` bytes from the text of a key named by `k`: a short word, or a long
+/// one past what a key keeps inline.
+fn text_of(k: i64, long: bool, at: addr) -> i64 / {unsafe, mem} {
+    var n = 0
+    var v = k
+    while n < 4 or v > 0 {
+        unsafe { at.offset(n).store_u8((97 + v % 26).as_u8()) }
+        v = v / 26
+        n += 1
+    }
+    if long {
+        while n < 40 {
+            unsafe { at.offset(n).store_u8((65 + (k + n) % 26).as_u8()) }
+            n += 1
+        }
+    }
+    n
+}
+
+/// A key value of kind `kind` named by `k`.
+fn key(kind: i64, k: i64) -> addr / {io, unsafe, mem} {
+    unsafe {
+        if kind == 0 {
+            return grasm_box_i64(k - 50)
+        }
+        if kind == 1 {
+            return grasm_box_i64(k * 1000003 + 5000)
+        }
+        if kind == 2 {
+            return grasm_box_u64(k * 7 + 1)
+        }
+        if kind == 3 {
+            // `false` or `true`: the interned boxes before -128's.
+            return grasm_box_i64(-128).offset(if k % 2 == 0 { -128 } else { -64 })
+        }
+        let buf = mem_alloc(64, 8)
+        if kind == 4 or kind == 5 {
+            let n = text_of(k, kind == 5, buf)
+            let v = grasm_str_lit(buf, n)
+            mem_free(buf)
+            return v
+        }
+        let n = text_of(k, k % 3 == 0, buf)
+        let s = grasm_str_lit(buf, n)
+        mem_free(buf)
+        if kind == 6 {
+            return grasm_tuple2(grasm_box_i64(k % 7), s)
+        }
+        grasm_tuple2(grasm_tuple2(s, grasm_box_i64(-128).offset(if k % 2 == 0 { -128 } else { -64 })), grasm_box_u64(k))
+    }
+}
+
+/// A digest of the value box `v`: its tag and payload, text by its bytes,
+/// lists and tuples by their elements.
+fn value_digest(h: i64, v: addr) -> i64 / {unsafe, mem} {
+    if unsafe { v.as_i64() } == 0 {
+        return fnv(h, 7)
+    }
+    let tag = unsafe { v.offset(8).load_u8() }.as_i64()
+    var x = fnv(h, tag)
+    if tag == 0 or tag == 3 or tag == 18 {
+        return fnv(x, unsafe { v.offset(16).load_i64() })
+    }
+    if tag == 4 {
+        return fnv(x, unsafe { v.offset(9).load_u8() }.as_i64())
+    }
+    if tag == 5 {
+        var p = unsafe { v.offset(18) }
+        var n = unsafe { v.offset(17).load_u8() }.as_i64()
+        if unsafe { v.offset(16).load_u8() }.as_i64() != 0 {
+            p = unsafe { mem_addr(v.offset(32).load_i64()) }
+            n = unsafe { v.offset(40).load_i64() }
+        }
+        x = fnv(x, n)
+        var i = 0
+        while i < n {
+            x = fnv(x, unsafe { p.offset(i).load_u8() }.as_i64())
+            i += 1
+        }
+        return x
+    }
+    if tag == 10 or tag == 11 {
+        var n = unsafe { v.offset(17).load_u8() }.as_i64()
+        var at = unsafe { v.offset(24) }
+        let heap = unsafe { v.offset(16).load_u8() }.as_i64() != 0
+        if heap {
+            n = unsafe { v.offset(40).load_i64() }
+            at = unsafe { mem_addr(v.offset(32).load_i64()) }
+        }
+        x = fnv(fnv(x, n), if heap { 1 } else { 0 })
+        var i = 0
+        while i < n {
+            x = value_digest(x, unsafe { mem_addr(at.offset(8 * i).load_i64()) })
+            i += 1
+        }
+        return x
+    }
+    if tag == 15 {
+        // A variant: its name's length, and its one field or none.
+        x = fnv(x, unsafe { v.offset(40).load_i64() })
+        if unsafe { v.offset(56).load_i64() } == 1 {
+            x = value_digest(x, unsafe { mem_addr(v.offset(48).load_i64()) })
+        }
+        return x
+    }
+    x
+}
+
+/// A digest of the stored key at `e`: its first word, and its payload --
+/// text, or each component of a tuple.
+fn key_digest(h: i64, e: addr) -> i64 / {unsafe, mem} {
+    let w = unsafe { e.load_i64() }
+    var x = fnv(h, if w >= 0 { 0 } else { w })
+    if w >= 0 or w == -1 {
+        var p = unsafe { e.offset(8) }
+        var n = unsafe { e.offset(23).load_u8() }.as_i64()
+        if w >= 0 {
+            p = unsafe { mem_addr(e.offset(8).load_i64()) }
+            n = unsafe { e.offset(16).load_i64() }
+            x = fnv(x, if w == n { 1 } else { 0 })
+        }
+        x = fnv(x, n)
+        var i = 0
+        while i < n {
+            x = fnv(x, unsafe { p.offset(i).load_u8() }.as_i64())
+            i += 1
+        }
+        return x
+    }
+    if w == -9223372036854775808 {
+        return fnv(x, unsafe { e.offset(8).load_u8() }.as_i64())
+    }
+    if w == -9223372036854775804 {
+        let at = unsafe { mem_addr(e.offset(8).load_i64()) }
+        let n = unsafe { e.offset(16).load_i64() }
+        x = fnv(x, n)
+        var i = 0
+        while i < n {
+            x = key_digest(x, unsafe { at.offset(24 * i) })
+            i += 1
+        }
+        return x
+    }
+    fnv(x, unsafe { e.offset(8).load_i64() })
+}
+
+/// A digest of map `m`'s whole table: its counts, every control byte and
+/// the copy after them, and every full bucket's key and value. The table's
+/// words are where `compiler/rt/src/layout.gr` has them (held to the Rust
+/// runtime by `scripts/rtlayout.sh`).
+fn table_digest(m: addr) -> i64 / {unsafe, mem} {
+    let ctrl = unsafe { mem_addr(m.offset(16).load_i64()) }
+    let mask = unsafe { m.offset(24).load_i64() }
+    var x = fnv(fnv(fnv(1469598103934665603, unsafe { m.offset(40).load_i64() }), mask), unsafe { m.offset(32).load_i64() })
+    var i = 0
+    // An empty table points at a shared group of eight, and has no more.
+    let nctrl = if mask == 0 { 8 } else { mask + 1 + 8 }
+    while i < nctrl {
+        let c = unsafe { ctrl.offset(i).load_u8() }.as_i64()
+        x = fnv(x, c)
+        if i <= mask and c < 128 {
+            let e = unsafe { ctrl.offset(-(i + 1) * 32) }
+            x = key_digest(x, e)
+            x = value_digest(x, unsafe { mem_addr(e.offset(24).load_i64()) })
+        }
+        i += 1
+    }
+    x
+}
+
+/// A digest of a list a map gave, element by element, and its release.
+fn list_digest(l: addr) -> i64 / {io, unsafe, mem} {
+    let x = value_digest(1469598103934665603, l)
+    unsafe { grasm_val_dec(l) }
+    x
+}
+
+fn main() / {io, unsafe, mem} {
+    let a = args()
+    var s = (a[0].parse_int() ?? 1) * 7919 + 17
+    let ops = a[1].parse_int() ?? 200
+    let pinned = a.len() > 2
+    if pinned {
+        unsafe { mem_tls(PIN).store_i64((a[2].parse_int() ?? 0) + 1) }
+    }
+    let base = unsafe { grasm_live_allocations() }
+    // The maps, in raw memory rather than a list, so that nothing the
+    // program holds itself is counted live at the end.
+    let nmaps = 4
+    let maps = unsafe { mem_alloc(8 * nmaps, 8) }
+    var counts = unsafe { grasm_map_new() }
+    for i in 0..nmaps {
+        unsafe { maps.offset(8 * i).store_addr(grasm_map_new()) }
+    }
+    let found = unsafe { mem_alloc(8, 8) }
+    let buf = unsafe { mem_alloc(64, 8) }
+    var made = 0
+    for op in 0..ops {
+        let which = pick(s, nmaps)
+        var m = unsafe { maps.offset(8 * which).load_addr() }
+        let kind = pick(s, 8)
+        let k = pick(s, 60)
+        let r = pick(s, 100)
+        var said = 0
+        if r < 40 {
+            made += 1
+            let v = unsafe { grasm_box_f64(made.as_f64() + 0.5) }
+            if kind == 4 and pick(s, 2) == 0 {
+                let n = text_of(k, false, buf)
+                m = unsafe { grasm_map_set_bytes(m, buf, n, v) }
+            } else {
+                m = unsafe { grasm_map_set(m, key(kind, k), v) }
+            }
+        } else if r < 52 {
+            let kv = key(kind, k)
+            let g = unsafe { grasm_map_get(m, kv) }
+            said = value_digest(0, g)
+            unsafe {
+                grasm_val_dec(g)
+                grasm_val_dec(kv)
+            }
+        } else if r < 60 {
+            let kv = key(kind, k)
+            let g = unsafe { grasm_map_get_ptr(m, kv) }
+            said = value_digest(0, g)
+            unsafe {
+                grasm_val_dec(g)
+                grasm_val_dec(kv)
+            }
+            let n = text_of(k, kind == 5, buf)
+            let g2 = unsafe { grasm_map_get_ptr_bytes(m, buf, n) }
+            said = value_digest(said, g2)
+            unsafe { grasm_val_dec(g2) }
+        } else if r < 74 {
+            let kv = key(kind, k)
+            m = unsafe { grasm_map_delete(m, kv, found) }
+            said = unsafe { found.load_u8() }.as_i64()
+            unsafe { grasm_val_dec(kv) }
+        } else if r < 82 {
+            let kv = key(kind % 7, k)
+            counts = unsafe { grasm_map_add_i64(counts, kv, k - 20, pick(s, 3)) }
+            let n = text_of(k, kind == 5, buf)
+            counts = unsafe { grasm_map_add_i64_bytes(counts, buf, n, 1, 0) }
+            said = if pinned { table_digest(counts) } else { unsafe { grasm_map_len(counts) } }
+        } else if r < 88 {
+            said = list_digest(unsafe { grasm_map_keys(m) })
+            said = fnv(said, list_digest(unsafe { grasm_map_values(m) }))
+            said = fnv(said, list_digest(unsafe { grasm_map_entries(m) }))
+            said = fnv(said, list_digest(unsafe { grasm_map_entries(counts) }))
+        } else if r < 93 {
+            // Shared, so the next change copies it.
+            let other = pick(s, nmaps)
+            if other != which {
+                unsafe {
+                    grasm_val_dec(maps.offset(8 * other).load_addr())
+                    grasm_val_inc(m)
+                }
+                unsafe { maps.offset(8 * other).store_addr(m) }
+            }
+        } else if r < 96 {
+            // A burst: many entries, then most of them deleted, leaving
+            // tombstones for later insertions to reckon with.
+            let n = 20 + pick(s, 300)
+            for j in 0..n {
+                made += 1
+                let v = unsafe { grasm_box_f64(made.as_f64()) }
+                m = unsafe { grasm_map_set(m, key(j % 7, 1000 + j + k * 13), v) }
+            }
+            for j in 0..n {
+                if pick(s, 10) < 8 {
+                    let kv = key(j % 7, 1000 + j + k * 13)
+                    m = unsafe { grasm_map_delete(m, kv, found) }
+                    unsafe { grasm_val_dec(kv) }
+                }
+            }
+        } else if r < 98 {
+            // A fresh map filled to the brim -- seven in eight of its buckets,
+            // so no room is left -- then most of it deleted, which in a table
+            // that full leaves tombstones, then new keys until the room runs
+            // out with few entries live: the table is rehashed where it is.
+            unsafe { grasm_val_dec(m) }
+            m = unsafe { grasm_map_new() }
+            let brim = 7 * 8.shl(3 + pick(s, 4)) / 8
+            for j in 0..brim {
+                made += 1
+                m = unsafe { grasm_map_set(m, key(1 + j % 2, 5000 + j), grasm_box_f64(made.as_f64())) }
+            }
+            for j in 0..brim {
+                if pick(s, 10) < 6 {
+                    let kv = key(1 + j % 2, 5000 + j)
+                    m = unsafe { grasm_map_delete(m, kv, found) }
+                    unsafe { grasm_val_dec(kv) }
+                }
+            }
+            for j in 0..brim / 2 {
+                made += 1
+                m = unsafe { grasm_map_set(m, key(1 + j % 2, 90000 + j), grasm_box_f64(made.as_f64())) }
+            }
+        } else {
+            // A fresh map in place of this one.
+            unsafe { grasm_val_dec(m) }
+            m = unsafe { grasm_map_new() }
+        }
+        unsafe { maps.offset(8 * which).store_addr(m) }
+        let len = unsafe { grasm_map_len(m) }
+        let d = if pinned { table_digest(m) } else { len }
+        print("{op} {which} {r} {said} {len} {d}")
+    }
+    for i in 0..nmaps {
+        unsafe { grasm_val_dec(maps.offset(8 * i).load_addr()) }
+    }
+    unsafe { grasm_val_dec(counts) }
+    let live = unsafe { grasm_live_allocations() } - base
+    print("live {live}")
+}

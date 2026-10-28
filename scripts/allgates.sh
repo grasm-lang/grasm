@@ -134,6 +134,17 @@ run_gate rtswap        scripts/rtswap.sh
 run_gate fuzz_rtfmt    scripts/fuzz_rtfmt.sh
 run_gate fuzz_rtmath   scripts/fuzz_rtmath.sh
 run_gate fuzz_rtrelease scripts/fuzz_rtrelease.sh
+run_gate fuzz_rtmaps   scripts/fuzz_rtmaps.sh
+run_gate fuzz_rteq     scripts/fuzz_rteq.sh
+run_gate fuzz_rtshow   scripts/fuzz_rtshow.sh
+run_gate fuzz_rtstructs scripts/fuzz_rtstructs.sh
+run_gate fuzz_rtrefs   scripts/fuzz_rtrefs.sh
+run_gate fuzz_rtbytes  scripts/fuzz_rtbytes.sh
+run_gate fuzz_rtlists  scripts/fuzz_rtlists.sh
+run_gate fuzz_rtstrings scripts/fuzz_rtstrings.sh
+run_gate fuzz_rtcase   scripts/fuzz_rtcase.sh
+run_gate fuzz_rtparse  scripts/fuzz_rtparse.sh
+run_gate fuzz_rttasks  scripts/fuzz_rttasks.sh
 run_gate rtcontrols    scripts/rtcontrols.sh
 run_gate rtdialect     scripts/rtdialect.sh
 run_gate rtdialectcontrols scripts/rtdialectcontrols.sh

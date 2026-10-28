@@ -7,6 +7,9 @@
 #                      `grasm_<name>`: state the Rust code still linked shares
 #   backend <name> ... the backend emits a call to `grasm_<name>` in the
 #                      Grasm runtime's own code, as it does in any program's
+#   uses <name> ...    the Grasm runtime calls the Rust runtime's
+#                      `grasm_<name>`, a family that has not moved, for a part
+#                      of its own work it names (never in place of a moved one)
 #
 # A moved name the Grasm runtime does not export, an export not listed here,
 # or a call to any other `grasm_` name fails the gate: that is a family
@@ -75,8 +78,252 @@ strings str_cmp
 rc val_inc
 rc val_dec
 
-state box_unit     the box allocator: its pool, its live count, the open region
-state val_dec      a box handed back at count one: the pool, the live count, and the walk of each payload release.gr does not take apart yet
+values box_i64
+values box_f64
+values box_unit
+values box_bool
+values box_ref
+values box_u64
+values unbox_i64
+values unbox_f64
+values unbox_bool
+values region_push
+values region_pop
+values live_allocations
+values check_leaks
+values layout_check
+values layout_check_bytes
+values layout_check_lists
+values val_release
+values val_dup
+values val_eq
+values val_cmp
+
+structs struct_make
+structs struct_borrow_at
+structs struct_scalar_at
+structs struct_get_at
+structs struct_get
+structs struct_take
+structs struct_set_field_at
+structs struct_set_field
+structs variant_new
+structs variant_new1
+structs variant_new2
+structs variant_push
+structs variant_field
+structs variant_is
+structs ok_new
+structs err_new
+structs is_ok
+structs try_take
+structs try_take_bits
+structs result_split
+structs result_box
+structs tuple2
+structs tuple3
+structs tuple_seal
+structs inline_absorb_list
+structs inline_absorb_str
+structs inline_free_words
+structs inline_free_bytes
+structs inline_str_box
+
+lists vals_new
+lists vals_push
+lists vals_unshare
+lists vals_pin
+lists vals_data
+lists vals_len
+lists vals_at
+
+panic panic_index
+
+funcs fn_new
+funcs fn_code
+funcs fn_env
+funcs env_new
+funcs env_set
+funcs env_data
+funcs handler_new
+funcs handler_add
+funcs handler_install
+funcs handler_push
+funcs handler_op
+funcs handler_env
+funcs handler_pop
+funcs handler_lookup
+
+lists list_new
+lists list_new_cap
+lists list_new_scalar
+lists list_new_scalar_cap
+lists list_fill_scalar
+lists list_from_words
+lists list_push
+lists list_push_scalar
+lists list_set
+lists list_set_scalar
+lists list_reserve
+lists list_take
+lists list_append_begin
+lists list_append_grow
+lists list_append_end
+lists list_pin
+lists list_len
+lists list_is_empty
+lists list_borrow_at
+lists list_get
+lists list_get_scalar
+lists list_get_opt
+lists list_first
+lists list_last
+lists list_pop
+lists list_remove
+lists list_rev
+lists list_slice
+lists list_concat
+lists list_sort
+lists list_sort_by
+lists list_enumerate
+lists list_zip
+lists list_contains
+lists list_join
+lists list_sum_i64
+lists list_sum_f64
+lists list_min_max
+lists range_new
+lists range_to_list
+lists range_len
+lists range_start
+lists range_end
+lists range_inclusive
+
+bytes bytes_ptr
+bytes bytes_of
+bytes bytes_len
+bytes bytes_at
+bytes bytes_slice
+bytes bytes_index_of
+bytes bytes_concat
+bytes bytes_set
+bytes bytes_fill
+bytes bytes_copy_from
+bytes bytes_filled
+bytes bytes_to_list
+bytes bytes_to_str
+bytes bytes_slice_to_str
+bytes bytebuf_new
+bytes bytebuf_push_byte
+bytes bytebuf_push_bytes
+bytes bytebuf_set
+bytes bytebuf_at
+bytes bytebuf_to_bytes
+
+strings str_lit
+strings str_lit_immortal
+strings str_build
+strings str_build_text
+strings str_build_str
+strings str_build_end
+strings str_build_end_inline
+strings str_build_len
+strings str_build_ptr
+strings str_build_discard
+strings str_concat
+strings str_append
+strings str_append_text
+strings str_append_i64
+strings str_append_f64
+strings str_append_bool
+strings str_pin_begin
+strings str_pin_grow
+strings str_pin_end
+strings str_pin_text
+strings str_contains
+strings str_starts_with
+strings str_ends_with
+strings str_index_of
+strings str_substr
+strings str_code_at
+strings str_codes
+strings str_chars
+strings str_split
+strings str_lines
+strings str_words
+strings str_trim
+strings str_trim_start
+strings str_trim_end
+strings str_repeat
+strings str_replace
+strings str_pad
+strings str_to_bytes
+strings i64_to_char
+strings u64_to_char
+strings i64_to_base
+strings u64_to_base
+strings str_upper
+strings str_lower
+parsing str_parse_int
+parsing str_parse_int_base
+parsing str_parse_u64
+parsing str_parse_u64_base
+parsing str_parse_float
+parsing f64_to_fixed
+parsing int_try
+parsing int_checked
+parsing int_saturating
+parsing assert_eq
+
+tasks chan_new
+tasks chan_send
+tasks chan_recv
+tasks chan_select
+tasks chan_close
+tasks conc_run
+panic stack_floor
+panic stack_check
+panic panic_stack
+
+strings strbuf_new
+strings builder_push_str
+strings builder_len
+strings builder_to_str
+
+refs ref_new
+refs ref_get
+refs ref_set
+refs ref_release
+refs ref_alive
+refs ref_make_unique
+
+display out_val
+display out_ref
+display str_from_val
+display panic_value
+
+maps map_new
+maps map_set
+maps map_set_bytes
+maps map_get
+maps map_get_ptr
+maps map_get_ptr_bytes
+maps map_has
+maps map_delete
+maps map_len
+maps map_is_empty
+maps map_keys
+maps map_values
+maps map_entries
+maps map_add_i64
+maps map_add_i64_bytes
+
+state box_unit          the Rust ledger: a box made there for one this side holds live (leak.gr)
+state val_dec           the Rust ledger: a box of nothing freed there, for one this side freed beyond what it made; and the question whether that build is the poisoned one (alloc.gr)
+state live_allocations  the Rust ledger's count for this thread, added to this side's
+state check_leaks       the Rust check: both ledgers counted and reported, this side's roots (references, channels) released first
+state region_push       the Rust code's own region, opened with this side's
+state region_pop        the Rust code's own region, swept between this side's finding and its freeing
 state out_text     the output buffer every writer shares, flushed by newlines, panics and exits
 state panic_msg    the way out of a panic: flush stdout, write stderr, exit 101
 backend panic_div_zero   `/` checks its divisor

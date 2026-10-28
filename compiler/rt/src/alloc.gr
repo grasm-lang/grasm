@@ -1,0 +1,327 @@
+// The box allocator (docs/self-hosting.md §6.7 "state", §6.11): where a
+// value's 64-byte box comes from and goes back to, how many are live, the
+// regions a box is made inside, and the interned boxes.
+//
+// Per thread, as the Rust runtime's `Local` is: a pool of freed boxes (a
+// chain through their count words, at most `POOL_CAP` long), how many boxes
+// this thread made and has not freed, how many it made in all (what
+// `GRASM_ALLOC_STATS` reports), and the open regions. They are words in a
+// block the thread makes on its first allocation, found through the
+// runtime's own thread-local cell `LOCAL`. A thread that ends hands its
+// balance to the process (`ESCAPED`, `ESCAPED_MADE`) and its pooled boxes
+// to `free`, from the destructor of a `pthread` key made once per process --
+// what the Rust runtime's workers do in `hand_back_live` and its `Pool`'s
+// `Drop`.
+//
+// Process-wide, in process cells, every access atomic (`scripts/rtlint.py`):
+// that key, the escaped balances, the interned boxes (`false`, `true`, and
+// -128 to 1024, immortal, made once), and whether the Rust runtime linked
+// behind this one is the poisoned build, asked once.
+//
+// Two allocators, one ledger. The Rust code still linked makes and frees
+// boxes through its own pool and count, which no link can redirect (§6.7),
+// and a box either side made may be freed by the other: then one side's
+// count goes up for a box the other's goes down for. Each count alone is
+// wrong and their sum is right, so `live` here is this side's half; `leak.gr`
+// adds the two.
+import layout
+import sys
+import panic
+
+extern fn pthread_key_create(key: addr, dtor: addr) -> i32
+extern fn pthread_key_delete(key: i64) -> i32
+extern fn pthread_setspecific(key: i64, v: addr) -> i32
+extern fn munmap(a: addr, len: i64) -> i32
+extern fn grasm_val_dec(v: addr)
+
+/// A freed box past this many in a thread's pool goes back to `free`.
+let POOL_CAP = 65536
+
+/// The integers boxed once for the whole process.
+pub let SMALL_MIN = -128
+pub let SMALL_MAX = 1024
+
+// A thread's block: its pool's first box and length, its live and made
+// counts, how many regions are open, and the regions' records (three words
+// each: an array of the region's boxes, its length and its capacity) with
+// room for how many.
+let L_HEAD = 0
+let L_POOL = 8
+pub let L_LIVE = 16
+pub let L_MADE = 24
+pub let L_DEPTH = 32
+pub let L_REGIONS = 40
+pub let L_RCAP = 48
+/// The thread's string builders kept for their room (`strings.gr`): an
+/// array of up to `BUILDERS_MAX` of them, and how many it holds.
+pub let L_BUILD = 56
+pub let L_NBUILD = 64
+/// The fiber stacks it keeps for the next fiber (`fiber.gr`): an array of
+/// (base, length) pairs, up to `STACKS_MAX`, and how many it holds.
+pub let L_STACKS = 72
+pub let L_NSTACKS = 80
+let L_SIZE = 88
+pub let BUILDERS_MAX = 8
+pub let STACKS_MAX = 64
+pub let REC_SIZE = 24
+
+thread_local LOCAL: i64
+
+/// The `pthread` key whose destructor ends a thread's block, plus one; 0
+/// until it is made.
+process_local KEY: i64
+/// What threads that have ended left live, and made, on this side.
+process_local ESCAPED: i64
+process_local ESCAPED_MADE: i64
+/// 0 until asked; then 1 for the ordinary Rust runtime, 2 for the poisoned.
+process_local POISONED: i64
+/// The interned boxes' block, 0 until made.
+process_local INTERNED: i64
+
+/// The key, made by the first thread to need it; a thread that loses the
+/// race to make it gives its own back.
+fn key() -> i64 {
+    unsafe {
+        let k = mem_process(KEY).atomic_load_i64(Acquire)
+        if k != 0 {
+            return k - 1
+        }
+        let at = sys.alloc(8)
+        if pthread_key_create(at, mem_fn_addr(thread_end)) != 0 {
+            panic.say(mem_static("cannot make the allocator's thread key"), mem_static_len("cannot make the allocator's thread key"))
+        }
+        let mine = at.load_i64()
+        sys.dealloc(at)
+        let was = mem_process(KEY).atomic_cas_i64(0, mine + 1, AcqRel)
+        if was != 0 {
+            pthread_key_delete(mine)
+            return was - 1
+        }
+        mine
+    }
+}
+
+/// This thread's block, made on its first use, with the key's destructor
+/// armed for it.
+pub fn local() -> addr {
+    unsafe {
+        let cell = mem_tls(LOCAL)
+        let l = cell.load_i64()
+        if l != 0 {
+            return mem_addr(l)
+        }
+        let b = sys.alloc_zeroed(L_SIZE)
+        cell.store_i64(b.as_i64())
+        pthread_setspecific(key(), b)
+        b
+    }
+}
+
+/// A thread ending: what it left live and made goes to the process's
+/// balance, its pooled boxes, region records and kept builders to `free`,
+/// its kept fiber stacks to `munmap`. `pthread` clears
+/// the key's value before it calls this with the block, and the thread's cell
+/// is cleared too, so a box made on this thread after it -- by another key's
+/// destructor -- starts a block of its own, ended in turn, rather than
+/// using this one freed.
+fn thread_end(b: addr) {
+    unsafe {
+        mem_tls(LOCAL).store_i64(0)
+        mem_process(ESCAPED).atomic_add_i64(b.offset(L_LIVE).load_i64(), AcqRel)
+        mem_process(ESCAPED_MADE).atomic_add_i64(b.offset(L_MADE).load_i64(), AcqRel)
+        var p = b.offset(L_HEAD).load_i64()
+        while p != 0 {
+            let next = mem_addr(p).atomic_load_i64(Relaxed)
+            sys.dealloc(mem_addr(p))
+            p = next
+        }
+        // The records past the open regions hold nothing: a pop empties its own.
+        let recs = b.offset(L_REGIONS).load_addr()
+        var r = 0
+        while r < b.offset(L_DEPTH).load_i64() {
+            let a = recs.offset(r * REC_SIZE)
+            if a.offset(16).load_i64() > 0 {
+                sys.dealloc(a.load_addr())
+            }
+            r += 1
+        }
+        if b.offset(L_RCAP).load_i64() > 0 {
+            sys.dealloc(recs)
+        }
+        // The builders kept: each a `String`, its buffer then itself.
+        let kept = b.offset(L_BUILD).load_addr()
+        var k = 0
+        while k < b.offset(L_NBUILD).load_i64() {
+            let h = kept.offset(8 * k).load_addr()
+            if h.offset(layout.VEC_CAP).load_i64() > 0 {
+                sys.dealloc(h.offset(layout.VEC_PTR).load_addr())
+            }
+            sys.dealloc(h)
+            k += 1
+        }
+        if kept.as_i64() != 0 {
+            sys.dealloc(kept)
+        }
+        // The fiber stacks kept: unmapped.
+        let stacks = b.offset(L_STACKS).load_addr()
+        var s = 0
+        while s < b.offset(L_NSTACKS).load_i64() {
+            munmap(stacks.offset(16 * s).load_addr(), stacks.offset(16 * s + 8).load_i64())
+            s += 1
+        }
+        if stacks.as_i64() != 0 {
+            sys.dealloc(stacks)
+        }
+        sys.dealloc(b)
+    }
+}
+
+/// What ended threads left live and made on this side; `take` empties them.
+pub fn escaped(take: bool) -> i64 {
+    unsafe {
+        if not take {
+            return mem_process(ESCAPED).atomic_load_i64(Acquire)
+        }
+        var v = mem_process(ESCAPED).atomic_load_i64(Acquire)
+        while mem_process(ESCAPED).atomic_cas_i64(v, 0, AcqRel) != v {
+            v = mem_process(ESCAPED).atomic_load_i64(Acquire)
+        }
+        v
+    }
+}
+
+pub fn escaped_made(take: bool) -> i64 {
+    unsafe {
+        if not take {
+            return mem_process(ESCAPED_MADE).atomic_load_i64(Acquire)
+        }
+        var v = mem_process(ESCAPED_MADE).atomic_load_i64(Acquire)
+        while mem_process(ESCAPED_MADE).atomic_cas_i64(v, 0, AcqRel) != v {
+            v = mem_process(ESCAPED_MADE).atomic_load_i64(Acquire)
+        }
+        v
+    }
+}
+
+/// Whether the Rust runtime behind this one is the poisoned build
+/// (`grasm_rt/poison`), whose freed boxes stay out of circulation counting
+/// `POISON`: asked once, by handing it a box of nothing and looking at it.
+/// Its live count loses one for that box, so this side's gains one, and the
+/// two counts still add up.
+pub fn poisoned() -> bool {
+    unsafe {
+        let known = mem_process(POISONED).atomic_load_i64(Acquire)
+        if known != 0 {
+            return known == 2
+        }
+        let b = sys.alloc(layout.BOX_SIZE)
+        b.offset(layout.TAG).store_u8(layout.TAG_UNIT.as_u8())
+        b.atomic_store_i64(1, Relaxed)
+        grasm_val_dec(b)
+        let l = local()
+        l.offset(L_LIVE).store_i64(l.offset(L_LIVE).load_i64() + 1)
+        let answer = if b.atomic_load_i64(Relaxed) == layout.POISON { 2 } else { 1 }
+        mem_process(POISONED).atomic_store_i64(answer, Release)
+        answer == 2
+    }
+}
+
+/// The interned boxes: `false`, `true`, then `SMALL_MIN` to `SMALL_MAX`, each
+/// counting `IMMORTAL`, in one block for the process. A thread that loses
+/// the race to make it frees its own, which nothing has seen.
+pub fn interned() -> addr {
+    unsafe {
+        let have = mem_process(INTERNED).atomic_load_i64(Acquire)
+        if have != 0 {
+            return mem_addr(have)
+        }
+        let n = 2 + SMALL_MAX - SMALL_MIN + 1
+        let t = sys.alloc(n * layout.BOX_SIZE)
+        var i = 0
+        while i < n {
+            let b = t.offset(i * layout.BOX_SIZE)
+            b.atomic_store_i64(layout.IMMORTAL, Relaxed)
+            if i < 2 {
+                b.offset(layout.TAG).store_u8(layout.TAG_BOOL.as_u8())
+                b.offset(layout.BOOL_AT).store_u8(i.as_u8())
+            } else {
+                b.offset(layout.TAG).store_u8(layout.TAG_I64.as_u8())
+                b.offset(layout.WORD_AT).store_i64(SMALL_MIN + i - 2)
+            }
+            i += 1
+        }
+        let was = mem_process(INTERNED).atomic_cas_i64(0, t.as_i64(), AcqRel)
+        if was != 0 {
+            sys.dealloc(t)
+            return mem_addr(was)
+        }
+        t
+    }
+}
+
+/// Adds box `p` to the innermost open region's boxes.
+fn region_add(l: addr, p: addr) {
+    unsafe {
+        let r = l.offset(L_REGIONS).load_addr().offset((l.offset(L_DEPTH).load_i64() - 1) * REC_SIZE)
+        let n = r.offset(8).load_i64()
+        let cap = r.offset(16).load_i64()
+        if n == cap {
+            let want = if cap == 0 { 8 } else { 2 * cap }
+            r.store_addr(if cap == 0 { sys.alloc(8 * want) } else { sys.grow(r.load_addr(), 8 * want) })
+            r.offset(16).store_i64(want)
+        }
+        r.load_addr().offset(8 * n).store_addr(p)
+        r.offset(8).store_i64(n + 1)
+    }
+}
+
+/// A box for a new value: counted live on this thread, its count 1 -- or
+/// `ARENA`, and one of the innermost region's, while a region is open -- and
+/// its payload a `Unit`, which the caller replaces.
+pub fn take() -> addr {
+    unsafe {
+        let l = local()
+        l.offset(L_LIVE).store_i64(l.offset(L_LIVE).load_i64() + 1)
+        l.offset(L_MADE).store_i64(l.offset(L_MADE).load_i64() + 1)
+        var p = l.offset(L_HEAD).load_addr()
+        if p.as_i64() == 0 {
+            p = sys.alloc(layout.BOX_SIZE)
+        } else {
+            l.offset(L_HEAD).store_i64(p.atomic_load_i64(Relaxed))
+            l.offset(L_POOL).store_i64(l.offset(L_POOL).load_i64() - 1)
+        }
+        p.offset(layout.TAG).store_u8(layout.TAG_UNIT.as_u8())
+        if l.offset(L_DEPTH).load_i64() > 0 {
+            p.atomic_store_i64(layout.ARENA, Relaxed)
+            region_add(l, p)
+        } else {
+            p.atomic_store_i64(1, Relaxed)
+        }
+        p
+    }
+}
+
+/// Gives back a box whose count has reached zero and whose payload owns
+/// nothing now: one fewer live on this thread, and the box to this thread's
+/// pool, or past `POOL_CAP` to `free`. With the poisoned build behind, it is
+/// kept out of circulation instead, a `Unit` counting `POISON`, so a later
+/// touch of it is caught.
+pub fn give(p: addr) {
+    unsafe {
+        let l = local()
+        l.offset(L_LIVE).store_i64(l.offset(L_LIVE).load_i64() - 1)
+        if poisoned() {
+            p.offset(layout.TAG).store_u8(layout.TAG_UNIT.as_u8())
+            p.atomic_store_i64(layout.POISON, Relaxed)
+            return
+        }
+        let n = l.offset(L_POOL).load_i64()
+        if n >= POOL_CAP {
+            sys.dealloc(p)
+            return
+        }
+        p.atomic_store_i64(l.offset(L_HEAD).load_i64(), Relaxed)
+        l.offset(L_HEAD).store_addr(p)
+        l.offset(L_POOL).store_i64(n + 1)
+    }
+}

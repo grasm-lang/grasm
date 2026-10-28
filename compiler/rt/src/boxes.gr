@@ -1,0 +1,161 @@
+// Scalars in boxes and out of them, and the layout check a compiled program
+// makes first (docs/self-hosting.md §6.11).
+//
+// A box comes from this runtime's allocator (`alloc.gr`); `false`, `true`
+// and the integers from -128 to 1024 are the interned boxes, shared and
+// never counted. Unboxing a box of the wrong kind is the panic the Rust
+// runtime gives, worded the same.
+import layout
+import alloc
+import panic
+
+/// A box of `kind` holding the word `w`.
+fn word_box(kind: i64, w: i64) -> addr {
+    let p = alloc.take()
+    unsafe {
+        p.offset(layout.TAG).store_u8(kind.as_u8())
+        p.offset(layout.WORD_AT).store_i64(w)
+    }
+    p
+}
+
+/// An integer's box of its own, never an interned one: what
+/// `alloc(RtPayload::I64(v))` makes.
+pub fn fresh_int(v: i64) -> addr {
+    word_box(layout.TAG_I64, v)
+}
+
+/// An integer's box: an interned one when it is small.
+pub fn int(v: i64) -> addr {
+    if v >= alloc.SMALL_MIN and v <= alloc.SMALL_MAX {
+        return unsafe { alloc.interned().offset((v - alloc.SMALL_MIN + 2) * layout.BOX_SIZE) }
+    }
+    word_box(layout.TAG_I64, v)
+}
+
+/// A `u64`'s box.
+pub fn unsigned(v: i64) -> addr {
+    word_box(layout.TAG_U64, v)
+}
+
+/// The interned box of `false` or `true`.
+pub fn boolean(v: bool) -> addr {
+    unsafe { alloc.interned().offset(if v { layout.BOX_SIZE } else { 0 }) }
+}
+
+/// A float's box.
+pub fn float(v: f64) -> addr {
+    let p = alloc.take()
+    unsafe {
+        p.offset(layout.TAG).store_u8(layout.TAG_F64.as_u8())
+        p.offset(layout.WORD_AT).store_f64(v)
+    }
+    p
+}
+
+/// A reference's box, and the unit value's.
+pub fn reference(v: i64) -> addr {
+    word_box(layout.TAG_REF, v)
+}
+
+pub fn unit() -> addr {
+    alloc.take()
+}
+
+export fn grt_box_i64(v: i64) -> addr {
+    int(v)
+}
+
+/// The unit value: a box of its own, as any other.
+export fn grt_box_unit() -> addr {
+    unit()
+}
+
+/// A packed reference, kept a reference so it prints as one.
+export fn grt_box_ref(v: i64) -> addr {
+    reference(v)
+}
+
+/// A `u64`'s word, kept a `u64` so it is read unsigned ([T-U64]).
+export fn grt_box_u64(v: i64) -> addr {
+    unsigned(v)
+}
+
+export fn grt_box_f64(v: f64) -> addr {
+    float(v)
+}
+
+export fn grt_box_bool(v: i8) -> addr {
+    boolean(v != 0)
+}
+
+/// An `i64`'s word, and the same word of a `u64` or a reference; a unit
+/// gives 0, the bits it does not have.
+export fn grt_unbox_i64(v: addr) -> i64 {
+    unsafe {
+        let tag = v.offset(layout.TAG).load_u8().as_i64()
+        if tag == layout.TAG_I64 or tag == layout.TAG_U64 or tag == layout.TAG_REF {
+            return v.offset(layout.WORD_AT).load_i64()
+        }
+        if tag == layout.TAG_UNIT {
+            return 0
+        }
+        panic.say(mem_static("unbox: not an i64"), mem_static_len("unbox: not an i64"))
+        0
+    }
+}
+
+export fn grt_unbox_f64(v: addr) -> f64 {
+    unsafe {
+        if v.offset(layout.TAG).load_u8().as_i64() == layout.TAG_F64 {
+            return v.offset(layout.WORD_AT).load_f64()
+        }
+        panic.say(mem_static("unbox: not an f64"), mem_static_len("unbox: not an f64"))
+        0.0
+    }
+}
+
+export fn grt_unbox_bool(v: addr) -> i8 {
+    unsafe {
+        if v.offset(layout.TAG).load_u8().as_i64() == layout.TAG_BOOL {
+            return if v.offset(layout.BOOL_AT).load_u8().as_i64() != 0 { 1.as_i8() } else { 0.as_i8() }
+        }
+        panic.say(mem_static("unbox: not a bool"), mem_static_len("unbox: not a bool"))
+        0.as_i8()
+    }
+}
+
+/// Eight numbers below 256 packed one per byte, the first lowest: what
+/// `i64::from_le_bytes` makes of them.
+fn pack(a: i64, b: i64, c: i64, d: i64, e: i64, f: i64, g: i64, h: i64) -> i64 {
+    a + 256 * (b + 256 * (c + 256 * (d + 256 * (e + 256 * (f + 256 * (g + 256 * h))))))
+}
+
+fn wrong_layout() {
+    unsafe {
+        panic.say(mem_static("this program was compiled for a different runtime layout -- rebuild it with the grasm that matches this runtime"), mem_static_len("this program was compiled for a different runtime layout -- rebuild it with the grasm that matches this runtime"))
+    }
+}
+
+/// The compiled program's copy of where a box's tag, a list's elements and a
+/// struct's fields are, against this runtime's: a program built for another
+/// layout stops here, saying so, before it reads one wrongly.
+export fn grt_layout_check(packed: i64) {
+    if packed != pack(layout.TAG, layout.TAG_LIST, layout.LIST_DISC, layout.LIST_LEN, layout.LIST_VALS, layout.STRUCT_VALS, layout.LIST_INLINE, layout.TAG_STRUCT) {
+        wrong_layout()
+    }
+}
+
+/// The same for `bytes`: its tag, its buffer's address and its length.
+export fn grt_layout_check_bytes(packed: i64) {
+    if packed != pack(layout.TAG_BYTES, layout.BYTES_PTR, layout.BYTES_LEN, 0, 0, 0, 0, 0) {
+        wrong_layout()
+    }
+}
+
+/// The same for scalar lists and value lists, and a `Vec`'s three words.
+export fn grt_layout_check_lists(packed: i64) {
+    if packed != pack(layout.TAG_LIST_SCALAR, layout.SCALAR_DISC, layout.SCALAR_VEC, layout.VEC_PTR, layout.VEC_LEN, layout.VEC_CAP, layout.TAG_LIST_VALS, layout.VALS_VEC) {
+        wrong_layout()
+    }
+}

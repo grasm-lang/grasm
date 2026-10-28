@@ -1,0 +1,228 @@
+// Fibers and the stack floor (docs/concurrency.md; docs/self-hosting.md
+// §5.5, §6.11): what `grasm_fiber` and the Rust runtime's floor were.
+//
+// A fiber is a function running on a stack of its own -- mapped with a
+// guard page below it that faults rather than let a deep recursion write
+// into whatever lies beneath -- entered and left by `ctx_switch`. `resume`
+// runs it until it calls `suspend` or ends and comes back to whoever resumed
+// it; everything stays on one thread. A finished fiber's stack is kept for
+// the next fiber of the same size, up to 64 a thread and none larger than
+// 8 MiB and 64 KiB, so a program that starts a hundred thousand short tasks
+// maps one stack, not a hundred thousand.
+//
+// The floor is the lowest stack address a recursion may reach before it is
+// stopped with a panic ([E-RECURSION-DEPTH]): per thread, set 6 MiB below
+// the first address it is asked about, and while a task runs, its fiber's
+// (`tasks.gr` sets it). Compiled code fetches it once where a recursion is
+// entered (`stack_floor`) or asks on entry (`stack_check`).
+import layout
+import sys
+import alloc
+import panic
+
+extern fn mmap(a: addr, len: i64, prot: i32, flags: i32, fd: i32, off: i64) -> addr
+extern fn mprotect(a: addr, len: i64, prot: i32) -> i32
+extern fn munmap(a: addr, len: i64) -> i32
+
+/// This thread's floor, 0 until first asked; and the fiber running on it, 0
+/// outside every fiber.
+thread_local FLOOR: i64
+thread_local CURRENT: i64
+
+/// How deep a recursion may go below where the floor was first asked for
+/// (the Rust runtime's `STACK_BUDGET`).
+pub let BUDGET = 6291456
+
+let PAGE = 16384
+let POOL_STACK_MAX = 8454144
+
+// A fiber: its own context while it is suspended, its resumer's while it
+// runs (each `ctx_switch`'s 176 bytes), its stack's base and length, whether
+// it has ended, and the argument its entry is called with.
+let F_OWN = 0
+let F_BACK = 176
+let F_BASE = 352
+let F_LEN = 360
+let F_DONE = 368
+pub let F_ARG = 376
+let F_SIZE = 384
+
+fn overflow() {
+    unsafe { panic.say(mem_static("stack overflow: recursion too deep"), mem_static_len("stack overflow: recursion too deep")) }
+}
+
+/// `sp` less the budget, or 0 when that would pass below 0.
+fn below(sp: i64) -> i64 {
+    if sp.as_u64() < BUDGET.as_u64() { 0 } else { sp - BUDGET }
+}
+
+export fn grt_stack_floor(sp: i64) -> i64 {
+    unsafe {
+        let cell = mem_tls(FLOOR)
+        let f = cell.load_i64()
+        if f == 0 {
+            let set = below(sp)
+            cell.store_i64(set)
+            return set
+        }
+        f
+    }
+}
+
+export fn grt_stack_check(sp: i64) {
+    unsafe {
+        let cell = mem_tls(FLOOR)
+        let f = cell.load_i64()
+        if f == 0 {
+            cell.store_i64(below(sp))
+            return
+        }
+        if sp.as_u64() < f.as_u64() {
+            overflow()
+        }
+    }
+}
+
+export fn grt_panic_stack() {
+    overflow()
+}
+
+/// Makes `f` this thread's floor, answering the one it replaces.
+pub fn swap_floor(f: i64) -> i64 {
+    unsafe {
+        let cell = mem_tls(FLOOR)
+        let old = cell.load_i64()
+        cell.store_i64(f)
+        old
+    }
+}
+
+// ----- stacks -------------------------------------------------------------------
+
+/// A stack of at least `size` usable bytes and a guard page below them: one
+/// this thread kept of exactly that length, or a new mapping. Its base and
+/// length go to `f`.
+fn take_stack(f: addr, size: i64) {
+    var usable = (size + PAGE - 1) / PAGE * PAGE
+    if usable < PAGE {
+        usable = PAGE
+    }
+    let len = usable + PAGE
+    let l = alloc.local()
+    unsafe {
+        let kept = l.offset(alloc.L_STACKS).load_addr()
+        var i = l.offset(alloc.L_NSTACKS).load_i64() - 1
+        while i >= 0 {
+            if kept.offset(16 * i + 8).load_i64() == len {
+                // Taken out, the last one put in its place.
+                let n = l.offset(alloc.L_NSTACKS).load_i64()
+                f.offset(F_BASE).store_addr(kept.offset(16 * i).load_addr())
+                f.offset(F_LEN).store_i64(len)
+                kept.offset(16 * i).store_i64(kept.offset(16 * (n - 1)).load_i64())
+                kept.offset(16 * i + 8).store_i64(kept.offset(16 * (n - 1) + 8).load_i64())
+                l.offset(alloc.L_NSTACKS).store_i64(n - 1)
+                return
+            }
+            i -= 1
+        }
+        let base = mmap(mem_addr(0), len, 3.as_i32(), 4098.as_i32(), -1.as_i32(), 0)
+        if base.as_i64() == 0 or base.as_i64() == -1 {
+            // `assert!` with a formatted message, which the Rust runtime's
+            // panic handler cannot print.
+            panic.say(mem_static("(message needs formatting)"), mem_static_len("(message needs formatting)"))
+        }
+        let _ = mprotect(base, PAGE, 0.as_i32())
+        f.offset(F_BASE).store_addr(base)
+        f.offset(F_LEN).store_i64(len)
+    }
+}
+
+/// A fiber's stack back to this thread, kept if there is room and it is
+/// small enough, unmapped otherwise.
+fn give_stack(f: addr) {
+    let l = alloc.local()
+    unsafe {
+        let base = f.offset(F_BASE).load_addr()
+        let len = f.offset(F_LEN).load_i64()
+        let n = l.offset(alloc.L_NSTACKS).load_i64()
+        if n < alloc.STACKS_MAX and len <= POOL_STACK_MAX {
+            var kept = l.offset(alloc.L_STACKS).load_addr()
+            if kept.as_i64() == 0 {
+                kept = sys.alloc(16 * alloc.STACKS_MAX)
+                l.offset(alloc.L_STACKS).store_addr(kept)
+            }
+            kept.offset(16 * n).store_addr(base)
+            kept.offset(16 * n + 8).store_i64(len)
+            l.offset(alloc.L_NSTACKS).store_i64(n + 1)
+            return
+        }
+        let _ = munmap(base, len)
+    }
+}
+
+// ----- fibers -------------------------------------------------------------------
+
+/// A fiber that will call `entry(f)` -- a C-convention function that never
+/// returns -- on a stack of at least `size` bytes, with `arg` at `F_ARG`.
+pub fn new_fiber(size: i64, entry: addr, arg: addr) -> addr {
+    let f = sys.alloc_zeroed(F_SIZE)
+    take_stack(f, size)
+    unsafe {
+        f.offset(F_ARG).store_addr(arg)
+        let top = f.offset(F_BASE).load_addr().offset(f.offset(F_LEN).load_i64())
+        ctx_init(f.offset(F_OWN), top, entry, f)
+    }
+    f
+}
+
+/// Runs fiber `f` until it suspends or ends; whether it has ended.
+pub fn resume(f: addr) -> bool {
+    unsafe {
+        if f.offset(F_DONE).load_i64() != 0 {
+            panic.say(mem_static("resuming a fiber that has finished"), mem_static_len("resuming a fiber that has finished"))
+        }
+        let cell = mem_tls(CURRENT)
+        let outer = cell.load_i64()
+        cell.store_i64(f.as_i64())
+        ctx_switch(f.offset(F_BACK), f.offset(F_OWN))
+        mem_tls(CURRENT).store_i64(outer)
+        f.offset(F_DONE).load_i64() != 0
+    }
+}
+
+/// Gives control back to whoever resumed the running fiber; returns when
+/// it is resumed again.
+pub fn suspend() {
+    unsafe {
+        let me = mem_addr(mem_tls(CURRENT).load_i64())
+        if me.as_i64() == 0 {
+            panic.say(mem_static("`suspend` outside a fiber"), mem_static_len("`suspend` outside a fiber"))
+        }
+        ctx_switch(me.offset(F_OWN), me.offset(F_BACK))
+    }
+}
+
+/// Marks the running fiber ended and leaves it for the last time.
+pub fn finish(f: addr) {
+    unsafe {
+        f.offset(F_DONE).store_i64(1)
+        while true {
+            ctx_switch(f.offset(F_OWN), f.offset(F_BACK))
+        }
+    }
+}
+
+pub fn in_fiber() -> bool {
+    unsafe { mem_tls(CURRENT).load_i64() != 0 }
+}
+
+/// The lowest address of the fiber's usable stack, above its guard page.
+pub fn bottom(f: addr) -> i64 {
+    unsafe { f.offset(F_BASE).load_i64() + PAGE }
+}
+
+/// A fiber done with: its stack back, its record freed.
+pub fn drop_fiber(f: addr) {
+    give_stack(f)
+    sys.dealloc(f)
+}

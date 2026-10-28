@@ -1,27 +1,31 @@
 // Numbers made into text that the program keeps: `n.to_str()`, and the
 // numbers and booleans of an interpolated string, `"x = {x}"`.
 //
-// Interpolation builds in a buffer the Rust runtime hands out
-// (`grasm_str_build`, a `String` it keeps per thread for its capacity) and
-// turns into a value when done (`grasm_str_build_end`); the pieces between
-// are appended here, into that `String`, grown as `RawVec` grows it. A value
-// of text is a box the Rust runtime's allocator gives (`grasm_box_unit`: its
-// pool, its live count and the open region are state the Rust code still
-// linked shares, docs/self-hosting.md §6.7) with its payload written here,
-// as `RtStr::of` writes one.
+// Interpolation builds in a `String` kept per thread for its capacity
+// (`strings.gr`, `str_build`) and turned into a value when done; the
+// numbers between are appended here, grown as `RawVec` grows it. A value
+// of text is a box from this runtime's allocator (`alloc.gr`) with its
+// payload written here, as `RtStr::of` writes one.
 import fmt
 import sys
 import layout
-
-extern fn grasm_box_unit() -> addr
+import alloc
 
 /// Appends `n` bytes at `p` to the `String` at `s`, growing it as `RawVec`
 /// does: to twice its capacity, or to what is needed if that is more, and
 /// never to less than `U8_MIN_CAP`.
 pub fn string_push(s: addr, p: addr, n: i64) {
+    string_reserve(s, n)
+    let len = unsafe { s.offset(layout.VEC_LEN).load_i64() }
+    sys.copy(unsafe { s.offset(layout.VEC_PTR).load_addr().offset(len) }, p, n)
+    unsafe { s.offset(layout.VEC_LEN).store_i64(len + n) }
+}
+
+/// Room for `n` more bytes in the `String` (or any `Vec<u8>`) at `s`, as
+/// `Vec::reserve` makes it.
+pub fn string_reserve(s: addr, n: i64) {
     let cap = unsafe { s.offset(layout.VEC_CAP).load_i64() }
     let len = unsafe { s.offset(layout.VEC_LEN).load_i64() }
-    var ptr = unsafe { s.offset(layout.VEC_PTR).load_addr() }
     if len + n > cap {
         var want = cap * 2
         if want < len + n {
@@ -31,19 +35,25 @@ pub fn string_push(s: addr, p: addr, n: i64) {
             want = layout.U8_MIN_CAP
         }
         // An empty `String` holds a dangling pointer, never allocated.
-        ptr = if cap == 0 { sys.alloc(want) } else { sys.grow(ptr, want) }
+        let ptr = unsafe { s.offset(layout.VEC_PTR).load_addr() }
+        let grown = if cap == 0 { sys.alloc(want) } else { sys.grow(ptr, want) }
         unsafe {
-            s.offset(layout.VEC_PTR).store_addr(ptr)
+            s.offset(layout.VEC_PTR).store_addr(grown)
             s.offset(layout.VEC_CAP).store_i64(want)
         }
     }
-    sys.copy(unsafe { ptr.offset(len) }, p, n)
-    unsafe { s.offset(layout.VEC_LEN).store_i64(len + n) }
 }
 
 /// A new string value holding the `n` bytes at `p`.
 pub fn new_str(p: addr, n: i64) -> addr {
-    let v = unsafe { grasm_box_unit() }
+    let v = alloc.take()
+    fill_str(v, p, n)
+    v
+}
+
+/// Box `v` made a string of the `n` bytes at `p`, as `RtStr::of` makes one:
+/// inline when they fit, in a `String` exactly as long when not.
+pub fn fill_str(v: addr, p: addr, n: i64) {
     unsafe {
         v.offset(layout.TAG).store_u8(layout.TAG_STR.as_u8())
         v.offset(layout.STR_INDEX).store_i64(0)
@@ -73,7 +83,6 @@ pub fn new_str(p: addr, n: i64) -> addr {
             s.offset(layout.VEC_CAP).store_i64(n)
         }
     }
-    v
 }
 
 export fn grt_str_from_i64(v: i64) -> addr {

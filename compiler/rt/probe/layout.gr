@@ -37,6 +37,25 @@ extern fn grasm_builder_push_str(b: addr, s: addr) -> addr
 extern fn grasm_bytebuf_push_byte(b: addr, x: i64) -> addr
 extern fn grasm_variant_new1(tp: addr, tl: i64, vp: addr, vl: i64, a: addr) -> addr
 extern fn grasm_variant_new2(tp: addr, tl: i64, vp: addr, vl: i64, a: addr, b: addr) -> addr
+extern fn grasm_map_set(m: addr, k: addr, v: addr) -> addr
+extern fn grasm_val_inc(v: addr)
+extern fn grasm_struct_make(desc: addr, argv: addr) -> addr
+extern fn grasm_struct_get_at(s: addr, i: i64) -> addr
+extern fn grasm_vals_new(desc: addr) -> addr
+extern fn grasm_vals_push(l: addr, src: addr) -> addr
+extern fn grasm_vals_at(l: addr, i: i64) -> addr
+extern fn grasm_val_dup(desc: addr, p: addr)
+extern fn grasm_val_release(desc: addr, p: addr)
+extern fn grasm_env_new(n: i64) -> addr
+extern fn grasm_env_data(e: addr) -> addr
+extern fn grasm_handler_new(p: addr, n: i64) -> addr
+extern fn grasm_handler_add(h: addr, p: addr, n: i64, code: i64, env: addr)
+extern fn grasm_range_start(r: addr) -> i64
+extern fn grasm_range_end(r: addr) -> i64
+extern fn grasm_range_len(r: addr) -> i64
+extern fn malloc(n: i64) -> addr
+extern fn free(p: addr)
+extern fn malloc_size(p: addr) -> i64
 
 fn say(name: str, v: i64) {
     print("{name} {v}")
@@ -75,6 +94,635 @@ fn letters(c: i64, n: i64) -> addr / {unsafe, mem} {
         k += 1
     }
     t
+}
+
+/// The byte offset of the first of `n` words from `a + from` that holds
+/// `want`, counted from `a`; or -1.
+fn word_at(a: addr, from: i64, n: i64, want: i64) -> i64 / {unsafe, mem} {
+    let o = find_word(a, from, n, want)
+    if o < 0 { -1 } else { from + o }
+}
+
+/// A struct descriptor laid out as the backend writes one (`StructDesc`,
+/// `repr(C)`): the cache word, the type's name, the field count, a (name,
+/// length, kind) triple per field, then a word per field -- an inline value
+/// list's element descriptor, or 0.
+fn desc(kinds: [i64], aux: [i64]) -> addr / {unsafe, mem} {
+    let n = kinds.len()
+    let d = unsafe { mem_alloc(32 + 32 * n + 8, 8) }
+    unsafe {
+        d.offset(8).store_addr(letters(84, 1))
+        d.offset(16).store_i64(1)
+        d.offset(24).store_i64(n)
+    }
+    var i = 0
+    while i < n {
+        unsafe {
+            d.offset(32 + 24 * i).store_addr(letters(97 + i, 1))
+            d.offset(40 + 24 * i).store_i64(1)
+            d.offset(48 + 24 * i).store_i64(kinds[i])
+            d.offset(32 + 24 * n + 8 * i).store_i64(aux[i])
+        }
+        i += 1
+    }
+    d
+}
+
+/// Whether `n` bytes at `p` are `want`'s, in order.
+fn bytes_are(p: addr, want: [i64]) -> bool / {unsafe, mem} {
+    var i = 0
+    while i < want.len() {
+        if unsafe { p.offset(i).load_u8() }.as_i64() != want[i] {
+            return false
+        }
+        i += 1
+    }
+    true
+}
+
+/// The `Vec` among `n` words from `a + from` whose length is `len` and whose
+/// first element (a byte when `bytes`, else a word) is `first`: its offset
+/// from `a`, or -1. `skip` is an offset not to answer.
+fn vec_at(a: addr, from: i64, n: i64, cap_at: i64, ptr_at: i64, len_at: i64, len: i64, bytes: bool, first: i64, skip: i64) -> i64 / {io, unsafe, mem} {
+    var o = from
+    while o + 24 <= from + 8 * n {
+        if o != skip {
+            let l = unsafe { a.offset(o + len_at).load_i64() }
+            let c = unsafe { a.offset(o + cap_at).load_i64() }
+            let p = unsafe { a.offset(o + ptr_at).load_i64() }
+            if l == len and c >= len and p > 4294967296 and unsafe { malloc_size(mem_addr(p)) } > 0 {
+                let got = if bytes { unsafe { mem_addr(p).load_u8() }.as_i64() } else { unsafe { mem_addr(p).load_i64() } }
+                if got == first {
+                    return o
+                }
+            }
+        }
+        o += 8
+    }
+    -1
+}
+
+/// Maps: a `hashbrown` table of `(MapKey, *mut RtVal)` with the process's
+/// seed, at 16 in the box (`Map(MapTable)`).
+fn measure_maps(cap_at: i64, ptr_at: i64, len_at: i64) / {io, unsafe, mem} {
+    unsafe {
+        // Five integer keys: eight buckets (mask 7), room for two more
+        // (growth_left 2), five items.
+        var m = grasm_map_new()
+        var held: [i64] = []
+        var k = 0
+        while k < 5 {
+            let v = grasm_box_f64(1.5)
+            held.push(v.as_i64())
+            m = grasm_map_set(m, grasm_box_i64(100000 + k), v)
+            k += 1
+        }
+        let mask_at = word_at(m, 16, 5, 7)
+        let growth_at = word_at(m, 16, 5, 2)
+        let items_at = word_at(m, 16, 5, 5)
+        // The control bytes: eight, five of them full (top bit clear), and the
+        // eight after them a copy of the first eight.
+        var ctrl_at = -1
+        var o = 16
+        while o < 56 {
+            let p = m.offset(o).load_i64()
+            // The seed is a word too, and may look like an address: only one
+            // that ends eight entries of a `malloc` block is read.
+            if p > 4294967296 and o != mask_at and o != growth_at and o != items_at and malloc_size(mem_addr(p - 256)) > 0 {
+                let c = mem_addr(p)
+                var full = 0
+                var same = true
+                var b = 0
+                while b < 8 {
+                    if c.offset(b).load_u8().as_i64() < 128 {
+                        full += 1
+                    }
+                    if c.offset(b).load_u8() != c.offset(8 + b).load_u8() {
+                        same = false
+                    }
+                    b += 1
+                }
+                if full == 5 and same {
+                    ctrl_at = o
+                }
+            }
+            o += 8
+        }
+        say("MAP_CTRL", ctrl_at)
+        say("MAP_MASK", mask_at)
+        say("MAP_GROWTH", growth_at)
+        say("MAP_ITEMS", items_at)
+        let ctrl = mem_addr(m.offset(ctrl_at).load_i64())
+        // The entries count down from the control bytes, bucket i's at
+        // ctrl - (i + 1) * size: the size and the value's place are those
+        // for which every full bucket holds one of the five values.
+        var entry = -1
+        var val_at = -1
+        var size = 16
+        while size <= 64 and entry < 0 {
+            var v = 0
+            while v < size and entry < 0 {
+                var good = true
+                var i = 0
+                while i < 8 {
+                    if ctrl.offset(i).load_u8().as_i64() < 128 {
+                        let w = ctrl.offset(-(i + 1) * size + v).load_i64()
+                        if not held.contains(w) {
+                            good = false
+                        }
+                    }
+                    i += 1
+                }
+                if good {
+                    entry = size
+                    val_at = v
+                }
+                v += 8
+            }
+            size += 8
+        }
+        say("MAP_ENTRY", entry)
+        say("MAP_ENTRY_VAL", val_at)
+        // The key: its integer, and before it a word the same in all five.
+        var int_at = -1
+        var tag_at = -1
+        var w = 0
+        while w < entry {
+            var ints = true
+            var same = true
+            var first = 0
+            var seen = false
+            var i = 0
+            while i < 8 {
+                if ctrl.offset(i).load_u8().as_i64() < 128 {
+                    let x = ctrl.offset(-(i + 1) * entry + w).load_i64()
+                    if x < 100000 or x > 100004 {
+                        ints = false
+                    }
+                    if seen and x != first {
+                        same = false
+                    }
+                    first = x
+                    seen = true
+                }
+                i += 1
+            }
+            if ints and int_at < 0 {
+                int_at = w
+            }
+            if same and w != val_at and tag_at < 0 {
+                tag_at = w
+            }
+            w += 8
+        }
+        say("MAPKEY_AT", if tag_at == 0 { int_at } else { -1 })
+        // The table's allocation starts at its first bucket's entry, below
+        // the last: `malloc` knows it, with the control bytes in it.
+        let base = ctrl.offset(-8 * entry)
+        let room = malloc_size(base)
+        // The seed: the word left, the same in every map of the process.
+        var seed_at = -1
+        o = 16
+        while o < 56 {
+            if o != ctrl_at and o != mask_at and o != growth_at and o != items_at {
+                seed_at = o
+            }
+            o += 8
+        }
+        let m2 = grasm_map_new()
+        say("MAP_SEED", if m2.offset(seed_at).load_i64() == m.offset(seed_at).load_i64() { seed_at } else { -1 })
+        grasm_val_dec(m2)
+        grasm_val_dec(m)
+
+        // One key of each kind, alone in a table of four buckets.
+        var tags: [i64] = []
+        var key_bytes = -1
+        var key_len = -1
+        var heap = false
+        var bool_at = -1
+        var kind = 0
+        while kind < 6 {
+            let key = if kind == 0 {
+                grasm_box_i64(777777)
+            } else if kind == 1 {
+                grasm_box_u64(888888)
+            } else if kind == 2 {
+                // "abcde", inline in the key.
+                let t = letters(97, 5)
+                t.offset(1).store_u8(98)
+                t.offset(2).store_u8(99)
+                t.offset(3).store_u8(100)
+                t.offset(4).store_u8(101)
+                grasm_str_lit(t, 5)
+            } else if kind == 3 {
+                grasm_str_lit(letters(65, 30), 30)
+            } else if kind == 4 {
+                grasm_tuple2(grasm_box_i64(5555), grasm_str_lit(letters(97, 3), 3))
+            } else {
+                // `true`, the interned box before -128's.
+                grasm_box_i64(-128).offset(-64)
+            }
+            let m1 = grasm_map_set(grasm_map_new(), key, grasm_box_f64(2.5))
+            let c1 = mem_addr(m1.offset(ctrl_at).load_i64())
+            var at = -1
+            var i = 0
+            while i < 4 {
+                if c1.offset(i).load_u8().as_i64() < 128 {
+                    at = i
+                }
+                i += 1
+            }
+            let e = c1.offset(-(at + 1) * entry)
+            tags.push(e.load_i64())
+            if kind == 0 {
+                // The group: a table of four buckets keeps its control bytes'
+                // first `width` again after its own, starting at `4`; the
+                // full bucket's byte comes back at `width + at`.
+                var j = 4
+                var group = -1
+                while j < 40 and group < 0 {
+                    if j != at and c1.offset(j).load_u8() == c1.offset(at).load_u8() {
+                        group = j - at
+                    }
+                    j += 1
+                }
+                say("MAP_GROUP", if room >= 8 * entry + 8 + group { group } else { -1 })
+            }
+            if kind == 4 {
+                // The tuple's components: a boxed slice of keys, its pointer
+                // and its length, each key `size` bytes.
+                let tl = word_at(e, 8, 2, 2)
+                let tp = if tl == 16 { 8 } else { 16 }
+                let slice = mem_addr(e.offset(tp).load_i64())
+                say("MAPKEY_TUPLE_PTR", tp)
+                say("MAPKEY_TUPLE_LEN", tl)
+                var sz = -1
+                var s = 16
+                while s <= 48 {
+                    if slice.load_i64() == tags[0] and slice.offset(8).load_i64() == 5555 and slice.offset(s).load_i64() == tags[2] and slice.offset(s + 8).load_u8().as_i64() == 97 {
+                        sz = s
+                    }
+                    s += 8
+                }
+                say("MAPKEY_SIZE", sz)
+            }
+            if kind == 2 {
+                key_bytes = find_byte(e, 0, 24, 97)
+                key_len = find_byte(e, 9, 15, 5)
+            }
+            if kind == 3 {
+                // A long key is a `String` of its own where the others' tag
+                // is: its capacity, never negative.
+                heap = e.offset(len_at).load_i64() == 30 and e.offset(cap_at).load_i64() >= 30 and mem_addr(e.offset(ptr_at).load_i64()).load_u8().as_i64() == 65
+            }
+            if kind == 5 {
+                bool_at = find_byte(e, 8, 8, 1)
+            }
+            grasm_val_dec(m1)
+            kind += 1
+        }
+        say("MAPKEY_I64", tags[0])
+        say("MAPKEY_U64", tags[1])
+        say("KEYSTR_INLINE", tags[2])
+        say("MAPKEY_TUPLE", tags[4])
+        say("MAPKEY_BOOL", tags[5])
+        say("KEYSTR_BYTES", key_bytes)
+        say("KEYSTR_LEN", key_len)
+        say("KEYSTR_STRING", if heap and tags[3] >= 0 and tags[0] < 0 and tags[1] < 0 and tags[2] < 0 and tags[4] < 0 and tags[5] < 0 { 0 } else { -1 })
+        say("MAPKEY_BOOL_AT", bool_at)
+    }
+}
+
+/// Structs, value lists, environments and handlers.
+fn measure_structs(cap_at: i64, ptr_at: i64, len_at: i64) / {io, unsafe, mem} {
+    unsafe {
+        // Which kind is a box: a struct of one field of kind k holding a box
+        // the probe keeps a count on, released with the struct only for that
+        // kind.
+        var boxed = -1
+        var k = 0
+        while k < 10 {
+            let x = grasm_box_f64(9.5)
+            grasm_val_inc(x)
+            let argv = mem_alloc(8, 8)
+            argv.store_addr(x)
+            let s = grasm_struct_make(desc([k], [0]), argv)
+            grasm_val_dec(s)
+            if x.load_i64() == 1 {
+                boxed = if boxed == -1 { k } else { -2 }
+            } else {
+                grasm_val_dec(x)
+            }
+            grasm_val_dec(x)
+            k += 1
+        }
+        say("FK_BOXED", boxed)
+        // Which kind is a float: a field of that kind holding 1.5's bits comes
+        // back from `struct_get_at` boxed as one.
+        // And which kind is a float, a bool, a reference, a unit or a `u64`:
+        // a field of that kind comes back from `struct_get_at` boxed as one
+        // (1.5's bits, or 1); every other scalar kind comes back an integer.
+        var float_kind = -1
+        var bool_kind = -1
+        var ref_kind = -1
+        var unit_kind = -1
+        var u64_kind = -1
+        k = 0
+        while k < 10 {
+            if k != boxed {
+                for bits in [0, 1] {
+                    let argv = mem_alloc(8, 8)
+                    if bits == 0 {
+                        argv.store_f64(1.5)
+                    } else {
+                        argv.store_i64(1)
+                    }
+                    let s = grasm_struct_make(desc([k], [0]), argv)
+                    let b = grasm_struct_get_at(s, 0)
+                    let t = b.offset(8).load_u8().as_i64()
+                    if bits == 0 and t == 3 and b.offset(16).load_f64() == 1.5 {
+                        float_kind = if float_kind == -1 { k } else { -2 }
+                    }
+                    if bits == 1 and t == 4 and b.offset(9).load_u8().as_i64() == 1 {
+                        bool_kind = if bool_kind == -1 { k } else { -2 }
+                    }
+                    if bits == 1 and t == 2 and b.offset(16).load_i64() == 1 {
+                        ref_kind = if ref_kind == -1 { k } else { -2 }
+                    }
+                    if bits == 1 and t == 1 {
+                        unit_kind = if unit_kind == -1 { k } else { -2 }
+                    }
+                    if bits == 1 and t == 18 and b.offset(16).load_i64() == 1 {
+                        u64_kind = if u64_kind == -1 { k } else { -2 }
+                    }
+                    grasm_val_dec(b)
+                    grasm_val_dec(s)
+                }
+            }
+            k += 1
+        }
+        say("FK_F64", float_kind)
+        say("FK_BOOL", bool_kind)
+        say("FK_REF", ref_kind)
+        say("FK_UNIT", unit_kind)
+        say("FK_U64", u64_kind)
+
+        // A value list of six fields of kinds 0 7 1 2 8 6, whose second is a
+        // list of values of a one-field type.
+        let ed = desc([1], [0])
+        let d6 = desc([0, 7, 1, 2, 8, 6], [0, ed.as_i64(), 0, 0, 0, 0])
+        let l = grasm_vals_new(d6)
+        let ty = mem_addr(d6.load_i64())
+        say("DESC_CACHE", if ty.as_i64() != 0 and l.offset(16).load_i64() == ty.as_i64() { 0 } else { -1 })
+        say("VALS_TY", if l.offset(16).load_i64() == ty.as_i64() { 16 } else { -1 })
+        say("TAG_LIST_VALS", l.offset(8).load_u8().as_i64())
+        // Its kinds and its element descriptors, two `Vec`s of six in the
+        // `StructTy` the descriptor now caches.
+        var kinds_at = -1
+        var elems_at = -1
+        var o = 0
+        while o + 24 <= 160 {
+            let p = mem_addr(ty.offset(o + ptr_at).load_i64())
+            if ty.offset(o + len_at).load_i64() == 6 and p.as_i64() > 4294967296 and malloc_size(p) > 0 {
+                if bytes_are(p, [0, 7, 1, 2, 8, 6]) {
+                    kinds_at = o
+                }
+                if p.load_i64() == 0 and p.offset(8).load_i64() == ed.as_i64() and p.offset(16).load_i64() == 0 {
+                    elems_at = o
+                }
+            }
+            o += 8
+        }
+        say("STRUCTTY_KINDS", kinds_at)
+        say("STRUCTTY_ELEMS", elems_at)
+        // The type's name, a `&str`: the descriptor's name, one byte.
+        let tname = d6.offset(8).load_i64()
+        let name_at = word_at(ty, 0, 20, tname)
+        say("STRUCTTY_NAME", if name_at >= 0 and ty.offset(name_at + 8).load_i64() == 1 { name_at } else { -1 })
+        // Its field names, a `Vec<&str>` of six: the first the descriptor's
+        // first field's name.
+        var fields_at = -1
+        let fname = d6.offset(32).load_i64()
+        o = 0
+        while o + 24 <= 160 {
+            let p = mem_addr(ty.offset(o + ptr_at).load_i64())
+            if ty.offset(o + len_at).load_i64() == 6 and p.as_i64() > 4294967296 and malloc_size(p) > 0 {
+                if p.load_i64() == fname and p.offset(8).load_i64() == 1 {
+                    fields_at = o
+                }
+            }
+            o += 8
+        }
+        say("STRUCTTY_FIELDS", fields_at)
+        // Where each field starts, in words: a `Vec<usize>` of 0 1 4 5 6 9
+        // for kinds of widths 1 3 1 1 3 3; and the twelve words a value takes;
+        // and whether any field is inline, a byte.
+        var offs_at = -1
+        o = 0
+        while o + 24 <= 160 {
+            let p = mem_addr(ty.offset(o + ptr_at).load_i64())
+            if ty.offset(o + len_at).load_i64() == 6 and p.as_i64() > 4294967296 and malloc_size(p) > 0 {
+                if p.load_i64() == 0 and p.offset(8).load_i64() == 1 and p.offset(16).load_i64() == 4 and p.offset(40).load_i64() == 9 {
+                    offs_at = o
+                }
+            }
+            o += 8
+        }
+        say("STRUCTTY_OFFS", offs_at)
+        // The words after the four `Vec`s and the name.
+        let tail = name_at + 16
+        say("STRUCTTY_WIDTH", word_at(ty, tail, 4, 12))
+        say("STRUCTTY_INLINE", find_byte(ty, tail + 24, 8, 1))
+        // The shared empty list of the type, a `OnceLock<usize>`: its value
+        // and, beside it, its state -- UNSET before the first `vals_new` on
+        // a fresh type, READY after.
+        let dq = desc([1, 1], [0, 0])
+        let argq = mem_alloc(16, 8)
+        let sq = grasm_struct_make(dq, argq)
+        let tq = mem_addr(dq.load_i64())
+        var before: [i64] = []
+        var j = 0
+        while j < 32 {
+            before.push(tq.offset(tail + j).load_u8().as_i64())
+            j += 1
+        }
+        let eq = grasm_vals_new(dq)
+        let value_at = word_at(tq, tail, 4, eq.as_i64())
+        var state_at = -1
+        j = 0
+        while j < 32 {
+            let now = tq.offset(tail + j).load_u8().as_i64()
+            if now != before[j] and (tail + j < value_at or tail + j >= value_at + 8) {
+                state_at = tail + j
+            }
+            j += 1
+        }
+        say("STRUCTTY_EMPTY", value_at)
+        say("STRUCTTY_EMPTY_STATE", state_at)
+        say("ONCE_UNSET", if state_at >= 0 { before[state_at - tail] } else { -1 })
+        say("ONCE_READY", if state_at >= 0 { tq.offset(state_at).load_u8().as_i64() } else { -1 })
+        // Its size: the fields found, laid end to end with nothing between
+        // them (four `Vec`s, the name, the empty list, the width, the flag),
+        // rounded to a word -- `malloc` rounds what it hands out too far to
+        // say it.
+        let flag_at = find_byte(ty, tail + 24, 8, 1)
+        let tiled = fields_at == 0 and kinds_at == 24 and offs_at == 48 and elems_at == 72 and name_at == 96 and value_at == 112 and state_at == 120 and word_at(ty, tail, 4, 12) == 128 and flag_at == 136
+        say("STRUCTTY_SIZE", if tiled { (flag_at + 8) / 8 * 8 } else { -1 })
+        grasm_val_dec(sq)
+        // The descriptor read where it was written: the count at 24, the
+        // triples from 32, 24 bytes each, the kind third.
+        let read = kinds_at >= 0 and elems_at >= 0
+        say("DESC_NFIELDS", if read { 24 } else { -1 })
+        say("DESC_FIELDS", if read { 32 } else { -1 })
+        say("DESC_FIELD_SIZE", if read { 24 } else { -1 })
+        say("DESC_FIELD_KIND", if read { 16 } else { -1 })
+
+        // How many words a field of each kind takes in a value list: the
+        // distance between two pushed elements, each all zero.
+        let zero = mem_alloc(32, 8)
+        let eb = desc([boxed], [0])
+        var wide: [i64] = []
+        k = 0
+        while k < 10 {
+            let lk = grasm_vals_push(grasm_vals_push(grasm_vals_new(desc([k], [eb.as_i64()])), zero), zero)
+            let width = grasm_vals_at(lk, 1).diff(grasm_vals_at(lk, 0)) / 8
+            if width == 3 {
+                wide.push(k)
+            } else if width != 1 {
+                wide.push(-100)
+            }
+            grasm_val_dec(lk)
+            k += 1
+        }
+        // Of the three-word kinds: which copies words and which bytes (a copy
+        // of a field holding two words), and which releases what its
+        // elements hold (a field holding one word, a box).
+        var inlist = -1
+        var invals = -1
+        var instr = -1
+        for kk in wide {
+            if kk < 0 {
+                continue
+            }
+            let buf = malloc(16)
+            buf.store_i64(1229782938247303441)
+            buf.offset(8).store_i64(2459565876494606882)
+            let w = mem_alloc(24, 8)
+            w.offset(ptr_at).store_addr(buf)
+            w.offset(len_at).store_i64(2)
+            w.offset(cap_at).store_i64(2)
+            grasm_val_dup(desc([kk], [ed.as_i64()]), w)
+            let copy = mem_addr(w.offset(ptr_at).load_i64())
+            let words = copy.as_i64() != buf.as_i64() and copy.offset(8).load_i64() == 2459565876494606882
+            free(copy)
+            free(buf)
+            let x = grasm_box_f64(8.5)
+            grasm_val_inc(x)
+            let b1 = malloc(8)
+            b1.store_addr(x)
+            w.offset(ptr_at).store_addr(b1)
+            w.offset(len_at).store_i64(1)
+            w.offset(cap_at).store_i64(1)
+            grasm_val_release(desc([kk], [eb.as_i64()]), w)
+            let releases = x.load_i64() == 1
+            if not releases {
+                grasm_val_dec(x)
+            }
+            grasm_val_dec(x)
+            if not words {
+                instr = if instr == -1 { kk } else { -2 }
+            } else if releases {
+                invals = if invals == -1 { kk } else { -2 }
+            } else {
+                inlist = if inlist == -1 { kk } else { -2 }
+            }
+        }
+        let three = wide.len() == 3
+        say("FK_INLIST", if three { inlist } else { -1 })
+        say("FK_INVALS", if three { invals } else { -1 })
+        say("FK_INSTR", if three { instr } else { -1 })
+        // A value list's words: a `Vec` at 24, two elements of one word.
+        let five = mem_alloc(8, 8)
+        five.store_i64(5)
+        let l2 = grasm_vals_push(grasm_vals_push(grasm_vals_new(ed), five), five)
+        say("VALS_VEC", vec_at(l2, 24, 3, cap_at, ptr_at, len_at, 2, false, 5, -1))
+        // The shared empty list of a type: a `Vec<i64>` that never allocated.
+        let empty = grasm_vals_new(ed)
+        say("WORDS_DANGLING", if empty.offset(24 + len_at).load_i64() == 0 and empty.offset(24 + cap_at).load_i64() == 0 { empty.offset(24 + ptr_at).load_i64() } else { -1 })
+        grasm_val_dec(l2)
+
+        // A struct box: its type, then `StructFields` -- inline, a length
+        // byte and four words, or a `Vec`.
+        let a = grasm_box_f64(1.25)
+        let b = grasm_box_f64(2.25)
+        let argv2 = mem_alloc(16, 8)
+        argv2.store_addr(a)
+        argv2.offset(8).store_addr(b)
+        let d2 = desc([boxed, boxed], [0, 0])
+        let s2 = grasm_struct_make(d2, argv2)
+        say("TAG_STRUCT", s2.offset(8).load_u8().as_i64())
+        say("STRUCT_TY", if s2.offset(16).load_i64() == d2.load_i64() { 16 } else { -1 })
+        say("STRUCT_LEN", find_byte(s2, 25, 7, 2))
+        say("STRUCT_VALS", word_at(s2, 24, 5, a.as_i64()))
+        let argv6 = mem_alloc(48, 8)
+        var i = 0
+        while i < 6 {
+            argv6.offset(8 * i).store_addr(if i == 0 { a } else { grasm_box_f64(3.25) })
+            i += 1
+        }
+        grasm_val_inc(a)
+        let s6 = grasm_struct_make(desc([boxed, boxed, boxed, boxed, boxed, boxed], [0, 0, 0, 0, 0, 0]), argv6)
+        let idisc = s2.offset(24).load_u8().as_i64()
+        let hdisc = s6.offset(24).load_u8().as_i64()
+        say("STRUCT_DISC", if idisc != hdisc { 24 } else { -1 })
+        say("STRUCT_INLINE", idisc)
+        say("STRUCT_HEAP", hdisc)
+        say("STRUCT_VEC", vec_at(s6, 32, 3, cap_at, ptr_at, len_at, 6, false, a.as_i64(), -1))
+        grasm_val_dec(s2)
+        grasm_val_dec(s6)
+
+        // An environment of three words: the words, and whether each is a box.
+        let e = grasm_env_new(3)
+        let data = grasm_env_data(e)
+        data.store_i64(11)
+        data.offset(8).store_i64(22)
+        data.offset(16).store_i64(33)
+        say("TAG_ENV", e.offset(8).load_u8().as_i64())
+        let words_at = vec_at(e, 16, 6, cap_at, ptr_at, len_at, 3, false, 11, -1)
+        say("ENV_WORDS", words_at)
+        say("ENV_BOXED", vec_at(e, 16, 6, cap_at, ptr_at, len_at, 3, true, 0, words_at))
+        grasm_val_dec(e)
+
+        // A handler: its effect's name, and its operations -- a name, the
+        // code's address and an environment box each.
+        let h = grasm_handler_new(letters(69, 3), 3)
+        let env = grasm_box_f64(4.5)
+        grasm_handler_add(h, letters(111, 2), 2, 4660, mem_addr(0))
+        grasm_handler_add(h, letters(112, 4), 4, 4661, env)
+        let eff_at = vec_at(h, 16, 6, cap_at, ptr_at, len_at, 3, true, 69, -1)
+        say("TAG_HANDLER", h.offset(8).load_u8().as_i64())
+        say("HANDLER_EFFECT", eff_at)
+        // The `Vec` of operations: two, the first's name's capacity first or
+        // not, so it is found by its length and nothing else.
+        var opsv = -1
+        o = 16
+        while o + 24 <= 64 {
+            if o != eff_at and h.offset(o + len_at).load_i64() == 2 and h.offset(o + cap_at).load_i64() >= 2 {
+                opsv = o
+            }
+            o += 8
+        }
+        say("HANDLER_OPS", opsv)
+        let ops = mem_addr(h.offset(opsv + ptr_at).load_i64())
+        let code0 = word_at(ops, 0, 6, 4660)
+        let code1 = word_at(ops, 0, 12, 4661)
+        let opsize = code1 - code0
+        say("OP_SIZE", opsize)
+        say("OP_CODE", code0)
+        say("OP_ENV", word_at(ops.offset(opsize), 0, 5, env.as_i64()))
+        say("OP_NAME", vec_at(ops, 0, 5, cap_at, ptr_at, len_at, 2, true, 111, -1))
+        grasm_val_dec(h)
+    }
 }
 
 fn main() / {io, unsafe, mem} {
@@ -224,6 +872,40 @@ fn main() / {io, unsafe, mem} {
         // Its `Vec`: one word, 5.
         let sv = sl.offset(24)
         say("SCALAR_VEC", if sv.offset(len_at).load_i64() == 1 and mem_addr(sv.offset(ptr_at).load_i64()).load_i64() == 5 { 24 } else { -1 })
+        // `ScalarData`'s tag: words for integers, bytes for booleans.
+        let bools = grasm_list_push_scalar(grasm_list_new_scalar(2), 1, 2)
+        let wdisc = sl.offset(16).load_u8().as_i64()
+        let bdisc = bools.offset(16).load_u8().as_i64()
+        say("SCALAR_DISC", if wdisc != bdisc and mem_addr(bools.offset(24 + ptr_at).load_i64()).load_u8().as_i64() == 1 { 16 } else { -1 })
+        say("SCALAR_WORDS", wdisc)
+        say("SCALAR_BYTES", bdisc)
+        // The element kind each scalar list keeps after its tag, for the
+        // backend's numbers 0 (i64), 1 (f64), 2 (bool), 3 (ref), 5 (u64).
+        var kinds_seen: [i64] = []
+        for code in [0, 1, 2, 3, 5] {
+            let l = grasm_list_push_scalar(grasm_list_new_scalar(code), 1, code)
+            kinds_seen.push(l.offset(9).load_u8().as_i64())
+            grasm_val_dec(l)
+        }
+        var distinct = true
+        for x in kinds_seen {
+            var c = 0
+            for y in kinds_seen {
+                if x == y {
+                    c += 1
+                }
+            }
+            if c != 1 {
+                distinct = false
+            }
+        }
+        say("SCALAR_KIND_AT", if distinct { 9 } else { -1 })
+        say("SK_I64", kinds_seen[0])
+        say("SK_F64", kinds_seen[1])
+        say("SK_BOOL", kinds_seen[2])
+        say("SK_REF", kinds_seen[3])
+        say("SK_U64", kinds_seen[4])
+        grasm_val_dec(bools)
         grasm_val_dec(sl)
         let e0 = grasm_box_f64(2.5)
         let bl = grasm_list_push(grasm_list_new(), e0)
@@ -267,6 +949,10 @@ fn main() / {io, unsafe, mem} {
             o += 8
         }
         say("BYTES_OWNER", owner_at)
+        // The window: its address, at the buffer's bytes, and its length.
+        let window = word_at(by, 16, 6, 4)
+        say("BYTES_LEN", window)
+        say("BYTES_PTR", if mem_addr(by.offset(16).load_i64()).load_u8().as_i64() == 7 and window == 24 { 16 } else { -1 })
         let arc0 = mem_addr(by.offset(owner_at).load_i64())
         say("ARC_STRONG", if arc0.load_i64() == 1 { 0 } else { -1 })
         say("ARC_WEAK", if arc0.offset(8).load_i64() == 1 { 8 } else { -1 })
@@ -281,6 +967,8 @@ fn main() / {io, unsafe, mem} {
         let sb3 = grasm_builder_push_str(sb, grasm_str_lit(xyz, 3))
         let st = sb3.offset(16)
         say("STRBUF_STRING", if st.offset(len_at).load_i64() == 3 and mem_addr(st.offset(ptr_at).load_i64()).offset(2).load_u8().as_i64() == 122 { 16 } else { -1 })
+        // And its count of characters: three, after the `String`.
+        say("STRBUF_CHARS", word_at(sb3, 40, 3, 3))
         grasm_val_dec(sb3)
         let bb = grasm_bytebuf_new()
         say("TAG_BYTEBUF", bb.offset(8).load_u8().as_i64())
@@ -291,6 +979,13 @@ fn main() / {io, unsafe, mem} {
         let names = letters(65, 2)
         let v = grasm_variant_new(names, 1, names.offset(1), 1)
         say("TAG_VARIANT", v.offset(8).load_u8().as_i64())
+        // Its type's name and its own, two `&str`s: an address, then a length.
+        let type_at = word_at(v, 16, 6, names.as_i64())
+        let name_at = word_at(v, 16, 6, names.offset(1).as_i64())
+        say("VARIANT_TYPE", type_at)
+        say("VARIANT_NAME", name_at)
+        say("STRREF_PTR", if type_at >= 0 { 0 } else { -1 })
+        say("STRREF_LEN", if v.offset(type_at + 8).load_i64() == 1 and v.offset(name_at + 8).load_i64() == 1 { 8 } else { -1 })
         grasm_val_dec(v)
         // One field: the field itself in the word, a count of one.
         let fa = grasm_box_f64(4.5)
@@ -321,10 +1016,65 @@ fn main() / {io, unsafe, mem} {
         let fn2 = grasm_fn_new(4242, envbox, names, 2)
         let env_at = find_word(fn2, 16, 6, envbox.as_i64())
         say("FN_ENV", if env_at >= 0 { 16 + env_at } else { -1 })
+        say("FN_CODE", word_at(fn2, 16, 6, 4242))
         let nm = fn2.offset(32)
         let named = nm.offset(len_at).load_i64() == 2 and mem_addr(nm.offset(ptr_at).load_i64()).offset(1).load_u8().as_i64() == 65
         say("FN_NAME", if named { 32 } else { -1 })
         say("FN_NAME_NONE", if named and none != nm.offset(cap_at).load_i64() and none < 0 { none } else { 0 })
         grasm_val_dec(fn2)
+
+        // A range, as the Rust runtime reads one. No program can make one
+        // through an entry point it may declare (`grasm_range_new` takes an
+        // `i8`), so a box is made by hand: the payload tag the declaration's
+        // order gives -- a wrong one would end the probe in a panic -- and a
+        // distinct word at every place a field could be, asked for its start
+        // and end. Then, with only those two set, its length with each other
+        // byte set to 1 in turn: the one that adds an element is `inclusive`.
+        let rg = malloc(64)
+        var ro = 0
+        while ro < 64 {
+            rg.offset(ro).store_i64(0)
+            ro += 8
+        }
+        rg.store_i64(1)
+        rg.offset(8).store_u8(8.as_u8())
+        ro = 16
+        while ro < 64 {
+            rg.offset(ro).store_i64(1000 * ro)
+            ro += 8
+        }
+        let rs = grasm_range_start(rg)
+        let re = grasm_range_end(rg)
+        let rs_at = if rs % 1000 == 0 and rs >= 16000 and rs < 64000 { rs / 1000 } else { -1 }
+        let re_at = if re % 1000 == 0 and re >= 16000 and re < 64000 { re / 1000 } else { -1 }
+        say("TAG_RANGE", if rs_at > 0 and re_at > 0 { 8 } else { -1 })
+        say("RANGE_START", rs_at)
+        say("RANGE_END", re_at)
+        ro = 16
+        while ro < 64 {
+            if ro != rs_at and ro != re_at {
+                rg.offset(ro).store_i64(0)
+            }
+            ro += 8
+        }
+        let span = grasm_range_len(rg)
+        var incl_at = -1
+        var rb = 9
+        while rb < 64 {
+            let inside = (rs_at >= 0 and rb >= rs_at and rb < rs_at + 8) or (re_at >= 0 and rb >= re_at and rb < re_at + 8)
+            if not inside {
+                rg.offset(rb).store_u8(1.as_u8())
+                if grasm_range_len(rg) == span + 1 and incl_at < 0 {
+                    incl_at = rb
+                }
+                rg.offset(rb).store_u8(0.as_u8())
+            }
+            rb += 1
+        }
+        say("RANGE_INCL", incl_at)
+        free(rg)
+
+        measure_maps(cap_at, ptr_at, len_at)
+        measure_structs(cap_at, ptr_at, len_at)
     }
 }

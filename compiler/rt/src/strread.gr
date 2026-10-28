@@ -35,7 +35,7 @@ pub fn text_of(v: addr, inout n: i64) -> addr {
     }
 }
 
-fn is_str(v: addr) -> bool {
+pub fn is_str(v: addr) -> bool {
     unsafe { v.offset(layout.TAG).load_u8().as_i64() == layout.TAG_STR }
 }
 
@@ -58,7 +58,7 @@ export fn grt_str_is_empty(v: addr) -> i8 {
 }
 
 /// Whether the `n` bytes at `p` are all ASCII.
-fn ascii(p: addr, n: i64) -> bool {
+pub fn ascii(p: addr, n: i64) -> bool {
     var i = 0
     while i + 8 <= n {
         if unsafe { p.offset(i).load_u64() }.bit_and(0x8080_8080_8080_8080) != 0 {
@@ -76,11 +76,11 @@ fn ascii(p: addr, n: i64) -> bool {
 }
 
 /// Whether the byte at `p + i` starts a character: it does not continue one.
-fn starts(p: addr, i: i64) -> bool {
+pub fn starts(p: addr, i: i64) -> bool {
     unsafe { p.offset(i).load_u8() }.bit_and(0xc0) != 0x80
 }
 
-fn count_chars(p: addr, n: i64) -> i64 {
+pub fn count_chars(p: addr, n: i64) -> i64 {
     var c = 0
     var i = 0
     while i < n {
@@ -100,7 +100,7 @@ fn count_chars(p: addr, n: i64) -> i64 {
 /// offsets, otherwise the byte offset of every character, which its `substr`
 /// and `code_at` read; it is published as `IndexCell::set` publishes it,
 /// unless another thread got there first.
-export fn grt_str_len(v: addr) -> i64 {
+pub fn length(v: addr) -> i64 {
     if not is_str(v) {
         panic.len_not_str()
     }
@@ -166,6 +166,10 @@ export fn grt_str_eq(a: addr, b: addr) -> i8 {
         return 1
     }
     if unsafe { memcmp(pa, pb, na) } == 0 { 1 } else { 0 }
+}
+
+export fn grt_str_len(v: addr) -> i64 {
+    length(v)
 }
 
 /// -1, 0 or 1 by the texts' bytes; 0 when either is not a string.

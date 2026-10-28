@@ -1,0 +1,13 @@
+[package]
+name = "rttasks"
+version = "0.1.0"
+entry = "taskfuzz.gr"
+
+# The program that holds the Grasm runtime's tasks, channels and fibers to
+# the Rust runtime's and to the interpreter's scheduler
+# (`scripts/fuzz_rttasks.sh`). A package of its own beside `compiler/rt`
+# rather than with the other probes in `compiler/rt/probe`: it waits on
+# channels (`async`), and a package inside `compiler/rt`'s directory is held
+# to `compiler/rt`'s capabilities when the runtime is built from the
+# repository's root, which `async` is not among.
+capabilities = ["io", "async"]

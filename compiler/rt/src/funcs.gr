@@ -1,0 +1,340 @@
+// Function values, captured environments and effect handlers
+// (docs/self-hosting.md §6.11).
+//
+// A function value is its code's address, the environment box it closed over
+// (or none) and, for a named function, its name -- an `Option<String>` the
+// Rust runtime lays out, `None` its capacity word's niche. An environment is
+// a run of machine words, the captures, and beside them which of the words
+// are boxes. A handler value is its effect's name and each operation's name,
+// code and environment box.
+//
+// Installed handlers are a stack per thread, innermost last, as the Rust
+// runtime's `HANDLERS` is: each frame an effect's name and its operations'
+// names, code and environment words. An operation resolves to the innermost
+// frame for its effect, and that frame alone: one without the operation is
+// an unhandled effect even with an outer frame that has it. The names are
+// borrowed -- from the program's data, or from the handler value a `with`
+// installed, which lives as long as the frame -- where the Rust runtime
+// copies them; nothing reads them after the frame is popped either way.
+import layout
+import sys
+import alloc
+import val
+import panic
+
+extern fn memcmp(a: addr, b: addr, n: i64) -> i32
+extern fn grasm_panic_msg(p: addr, n: i64)
+
+fn tag(v: addr) -> i64 {
+    unsafe { v.offset(layout.TAG).load_u8() }.as_i64()
+}
+
+fn set_vec(v: addr, p: addr, len: i64, cap: i64) {
+    unsafe {
+        v.offset(layout.VEC_PTR).store_addr(p)
+        v.offset(layout.VEC_LEN).store_i64(len)
+        v.offset(layout.VEC_CAP).store_i64(cap)
+    }
+}
+
+/// A `String` of the `n` bytes at `p`, exactly as long, at `s`.
+fn string_at(s: addr, p: addr, n: i64) {
+    let buf = if n > 0 { sys.alloc(n) } else { unsafe { mem_addr(layout.U8_DANGLING) } }
+    sys.copy(buf, p, n)
+    set_vec(s, buf, n, n)
+}
+
+// ----- function values --------------------------------------------------------
+
+export fn grt_fn_new(code: i64, env: addr, np: addr, nl: i64) -> addr {
+    let f = alloc.take()
+    unsafe {
+        f.offset(layout.TAG).store_u8(layout.TAG_FN.as_u8())
+        f.offset(layout.FN_CODE).store_i64(code)
+        f.offset(layout.FN_ENV).store_addr(env)
+        let name = f.offset(layout.FN_NAME)
+        if nl > 0 {
+            string_at(name, np, nl)
+        } else {
+            name.offset(layout.VEC_CAP).store_i64(layout.FN_NAME_NONE)
+            name.offset(layout.VEC_PTR).store_i64(0)
+            name.offset(layout.VEC_LEN).store_i64(0)
+        }
+    }
+    f
+}
+
+export fn grt_fn_code(v: addr) -> i64 {
+    if tag(v) != layout.TAG_FN {
+        unsafe { panic.say(mem_static("call of a non-function value"), mem_static_len("call of a non-function value")) }
+    }
+    unsafe { v.offset(layout.FN_CODE).load_i64() }
+}
+
+/// The captured environment, with a count for the caller.
+export fn grt_fn_env(v: addr) -> addr {
+    if tag(v) != layout.TAG_FN {
+        unsafe { panic.say(mem_static("environment of a non-function value"), mem_static_len("environment of a non-function value")) }
+    }
+    let e = unsafe { v.offset(layout.FN_ENV).load_addr() }
+    val.inc(e)
+    e
+}
+
+pub fn fn_code(v: addr) -> i64 {
+    grt_fn_code(v)
+}
+
+pub fn fn_env(v: addr) -> addr {
+    grt_fn_env(v)
+}
+
+// ----- environments -------------------------------------------------------------
+
+/// `n` words, all zero and none of them a box.
+export fn grt_env_new(n: i64) -> addr {
+    let count = if n < 0 { 0 } else { n }
+    let e = alloc.take()
+    unsafe {
+        e.offset(layout.TAG).store_u8(layout.TAG_ENV.as_u8())
+        let words = if count > 0 { sys.alloc_zeroed(8 * count) } else { mem_addr(layout.WORDS_DANGLING) }
+        let flags = if count > 0 { sys.alloc_zeroed(count) } else { mem_addr(layout.U8_DANGLING) }
+        set_vec(e.offset(layout.ENV_WORDS), words, count, count)
+        set_vec(e.offset(layout.ENV_BOXED), flags, count, count)
+    }
+    e
+}
+
+/// One capture: its bits, and whether they are a box (whose count the
+/// environment takes).
+export fn grt_env_set(e: addr, i: i64, bits: i64, is_boxed: i8) {
+    if tag(e) != layout.TAG_ENV {
+        unsafe { panic.say(mem_static("env_set: not an environment"), mem_static_len("env_set: not an environment")) }
+    }
+    let at = if i < 0 { 0 } else { i }
+    unsafe {
+        let words = e.offset(layout.ENV_WORDS)
+        if at < words.offset(layout.VEC_LEN).load_i64() {
+            words.offset(layout.VEC_PTR).load_addr().offset(8 * at).store_i64(bits)
+            e.offset(layout.ENV_BOXED).offset(layout.VEC_PTR).load_addr().offset(at).store_u8(if is_boxed != 0 { 1.as_u8() } else { 0.as_u8() })
+        }
+    }
+}
+
+/// Where the captures are: the lifted operation reads them there.
+export fn grt_env_data(e: addr) -> addr {
+    if tag(e) != layout.TAG_ENV {
+        unsafe { panic.say(mem_static("env_data: not an environment"), mem_static_len("env_data: not an environment")) }
+    }
+    unsafe { e.offset(layout.ENV_WORDS).offset(layout.VEC_PTR).load_addr() }
+}
+
+// ----- handler values ---------------------------------------------------------
+
+export fn grt_handler_new(p: addr, n: i64) -> addr {
+    let h = alloc.take()
+    unsafe {
+        h.offset(layout.TAG).store_u8(layout.TAG_HANDLER.as_u8())
+        string_at(h.offset(layout.HANDLER_EFFECT), p, n)
+        set_vec(h.offset(layout.HANDLER_OPS), mem_addr(layout.WORDS_DANGLING), 0, 0)
+    }
+    h
+}
+
+/// One more operation: its name, code and environment box (whose count the
+/// handler takes), the `Vec` grown as `RawVec` grows one.
+export fn grt_handler_add(h: addr, p: addr, n: i64, code: i64, env: addr) {
+    if tag(h) != layout.TAG_HANDLER {
+        unsafe { panic.say(mem_static("handler_add: not a handler"), mem_static_len("handler_add: not a handler")) }
+    }
+    unsafe {
+        let ops = h.offset(layout.HANDLER_OPS)
+        let len = ops.offset(layout.VEC_LEN).load_i64()
+        let cap = ops.offset(layout.VEC_CAP).load_i64()
+        if len == cap {
+            let want = if cap == 0 { 4 } else { 2 * cap }
+            let buf = if cap == 0 { sys.alloc(layout.OP_SIZE * want) } else { sys.grow(ops.offset(layout.VEC_PTR).load_addr(), layout.OP_SIZE * want) }
+            ops.offset(layout.VEC_PTR).store_addr(buf)
+            ops.offset(layout.VEC_CAP).store_i64(want)
+        }
+        let op = ops.offset(layout.VEC_PTR).load_addr().offset(len * layout.OP_SIZE)
+        string_at(op.offset(layout.OP_NAME), p, n)
+        op.offset(layout.OP_CODE).store_i64(code)
+        op.offset(layout.OP_ENV).store_addr(env)
+        ops.offset(layout.VEC_LEN).store_i64(len + 1)
+    }
+}
+
+// ----- the stack of installed handlers ------------------------------------------
+
+/// This thread's frames: an array of FRAME words each, how many, how many fit.
+thread_local FRAMES: i64
+thread_local NFRAMES: i64
+thread_local FRAMECAP: i64
+
+// A frame: its effect's name (address, length), and its operations (an
+// array of OPW words each, how many, how many fit).
+let FRAME = 40
+let F_NAME = 0
+let F_LEN = 8
+let F_OPS = 16
+let F_NOPS = 24
+let F_CAP = 32
+// An operation: its name (address, length), its code, its environment.
+let OPW = 32
+
+fn frame(i: i64) -> addr {
+    unsafe { mem_addr(mem_tls(FRAMES).load_i64()).offset(i * FRAME) }
+}
+
+fn push_frame(p: addr, n: i64) {
+    unsafe {
+        let count = mem_tls(NFRAMES).load_i64()
+        let cap = mem_tls(FRAMECAP).load_i64()
+        if count == cap {
+            let want = if cap == 0 { 8 } else { 2 * cap }
+            let a = if cap == 0 { sys.alloc(FRAME * want) } else { sys.grow(mem_addr(mem_tls(FRAMES).load_i64()), FRAME * want) }
+            mem_tls(FRAMES).store_i64(a.as_i64())
+            mem_tls(FRAMECAP).store_i64(want)
+        }
+        let f = frame(count)
+        f.offset(F_NAME).store_addr(p)
+        f.offset(F_LEN).store_i64(n)
+        f.offset(F_OPS).store_i64(0)
+        f.offset(F_NOPS).store_i64(0)
+        f.offset(F_CAP).store_i64(0)
+        mem_tls(NFRAMES).store_i64(count + 1)
+    }
+}
+
+/// An operation into the innermost frame, when there is one.
+fn push_op(p: addr, n: i64, code: i64, env: i64) {
+    unsafe {
+        let count = mem_tls(NFRAMES).load_i64()
+        if count == 0 {
+            return
+        }
+        let f = frame(count - 1)
+        let k = f.offset(F_NOPS).load_i64()
+        let cap = f.offset(F_CAP).load_i64()
+        if k == cap {
+            let want = if cap == 0 { 4 } else { 2 * cap }
+            let a = if cap == 0 { sys.alloc(OPW * want) } else { sys.grow(f.offset(F_OPS).load_addr(), OPW * want) }
+            f.offset(F_OPS).store_addr(a)
+            f.offset(F_CAP).store_i64(want)
+        }
+        let op = f.offset(F_OPS).load_addr().offset(k * OPW)
+        op.store_addr(p)
+        op.offset(8).store_i64(n)
+        op.offset(16).store_i64(code)
+        op.offset(24).store_i64(env)
+        f.offset(F_NOPS).store_i64(k + 1)
+    }
+}
+
+fn same(p: addr, n: i64, q: addr, m: i64) -> bool {
+    n == m and (n == 0 or unsafe { memcmp(p, q, n) } == 0)
+}
+
+/// The operation `op` of the innermost frame for effect `e`: its address
+/// among the frame's operations, or null -- also when that frame has no
+/// such operation, whatever frames outside it have.
+fn resolve(ep: addr, el: i64, op: addr, ol: i64) -> addr {
+    unsafe {
+        var i = mem_tls(NFRAMES).load_i64() - 1
+        while i >= 0 {
+            let f = frame(i)
+            if same(f.offset(F_NAME).load_addr(), f.offset(F_LEN).load_i64(), ep, el) {
+                let ops = f.offset(F_OPS).load_addr()
+                var k = 0
+                while k < f.offset(F_NOPS).load_i64() {
+                    let o = ops.offset(k * OPW)
+                    if same(o.load_addr(), o.offset(8).load_i64(), op, ol) {
+                        return o
+                    }
+                    k += 1
+                }
+                return mem_addr(0)
+            }
+            i -= 1
+        }
+        mem_addr(0)
+    }
+}
+
+export fn grt_handler_push(p: addr, n: i64) {
+    push_frame(p, n)
+}
+
+export fn grt_handler_op(p: addr, n: i64, code: i64, env: i64) {
+    push_op(p, n, code, env)
+}
+
+/// Pops the innermost frame, freeing its operations.
+export fn grt_handler_pop() {
+    unsafe {
+        let count = mem_tls(NFRAMES).load_i64()
+        if count == 0 {
+            return
+        }
+        let f = frame(count - 1)
+        if f.offset(F_CAP).load_i64() > 0 {
+            sys.dealloc(f.offset(F_OPS).load_addr())
+        }
+        mem_tls(NFRAMES).store_i64(count - 1)
+    }
+}
+
+/// Installs a handler value: a frame of its effect and every operation, each
+/// with the address its environment's captures are at (or null).
+export fn grt_handler_install(h: addr) {
+    if tag(h) != layout.TAG_HANDLER {
+        unsafe { panic.say(mem_static("handler_install: not a handler"), mem_static_len("handler_install: not a handler")) }
+    }
+    unsafe {
+        let eff = h.offset(layout.HANDLER_EFFECT)
+        push_frame(eff.offset(layout.VEC_PTR).load_addr(), eff.offset(layout.VEC_LEN).load_i64())
+        let ops = h.offset(layout.HANDLER_OPS)
+        let base = ops.offset(layout.VEC_PTR).load_addr()
+        var k = 0
+        while k < ops.offset(layout.VEC_LEN).load_i64() {
+            let o = base.offset(k * layout.OP_SIZE)
+            let env = o.offset(layout.OP_ENV).load_addr()
+            let data = if env.as_i64() == 0 { 0 } else { grt_env_data(env).as_i64() }
+            let name = o.offset(layout.OP_NAME)
+            push_op(name.offset(layout.VEC_PTR).load_addr(), name.offset(layout.VEC_LEN).load_i64(), o.offset(layout.OP_CODE).load_i64(), data)
+            k += 1
+        }
+    }
+}
+
+/// The environment of the innermost handler for `effect.op`, or null.
+export fn grt_handler_env(ep: addr, el: i64, op: addr, ol: i64) -> addr {
+    let o = resolve(ep, el, op, ol)
+    if unsafe { o.as_i64() } == 0 {
+        return o
+    }
+    unsafe { o.offset(24).load_addr() }
+}
+
+/// The code of the innermost handler for `effect.op`; none is a panic.
+export fn grt_handler_lookup(ep: addr, el: i64, op: addr, ol: i64) -> addr {
+    let o = resolve(ep, el, op, ol)
+    unsafe {
+        if o.as_i64() != 0 {
+            return o.offset(16).load_addr()
+        }
+        // `unhandled effect `E.op` — no handler installed`
+        let lead = mem_static_len("unhandled effect `")
+        let tail = mem_static_len("` — no handler installed")
+        let n = lead + el + 1 + ol + tail
+        let msg = sys.alloc(n)
+        sys.copy(msg, mem_static("unhandled effect `"), lead)
+        sys.copy(msg.offset(lead), ep, el)
+        msg.offset(lead + el).store_u8(46)
+        sys.copy(msg.offset(lead + el + 1), op, ol)
+        sys.copy(msg.offset(lead + el + 1 + ol), mem_static("` — no handler installed"), tail)
+        grasm_panic_msg(msg, n)
+        mem_addr(0)
+    }
+}

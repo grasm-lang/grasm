@@ -2,18 +2,79 @@
 // random values of every kind the walk takes apart -- strings inline, on the
 // heap and with a character index, lists inline and on the heap, tuples,
 // scalar lists, both builders, variants, function values and closures,
-// bytes and windows sharing their buffer -- nested in each other and around
-// kinds the Rust runtime still takes apart (maps, structs),
-// some held across rounds so that what is dropped is shared, and dropped.
-// After each round it prints a checksum of what it built and how many boxes
-// are live, so a box the walk leaks or frees twice shows as a difference
-// between the two builds, which `scripts/fuzz_rtrelease.sh` compares; the
-// buffers are the gate's to watch, through `leaks` and `MallocScribble`.
+// bytes and windows sharing their buffer, maps keyed by every kind of key
+// (integers, `u64`s, booleans, short and long strings, tuples and tuples of
+// tuples) with some entries deleted, structs of four fields or fewer and of
+// more, with scalar fields among the boxed ones, lists of value structs with
+// inline string and list fields (and, made through the runtime's entry
+// points, inline lists of values), handler values with the environments
+// their operations capture, boxes made on `par_map`'s workers and released
+// here, and a region's boxes swept -- nested in each other, some held across rounds
+// so that what is dropped is shared, and dropped. After each round it prints
+// a checksum of what it built and how many boxes are live, so a box the walk
+// leaks or frees twice shows as a difference between the two builds, which
+// `scripts/fuzz_rtrelease.sh` compares; the buffers are the gate's to watch,
+// through `leaks` and `MallocScribble`.
 //
-//     releasefuzz <seed> <rounds>
+//     releasefuzz <seed> <rounds> [<rounds on par_map's workers>]
 extern fn grasm_live_allocations() -> i64
+extern fn grasm_vals_new(desc: addr) -> addr
+extern fn grasm_vals_push(l: addr, src: addr) -> addr
+extern fn grasm_inline_absorb_list(l: addr, out: addr)
+extern fn grasm_list_new_scalar(kind: i64) -> addr
+extern fn grasm_list_push_scalar(l: addr, bits: i64, kind: i64) -> addr
+extern fn grasm_box_f64(v: f64) -> addr
+extern fn grasm_val_dec(v: addr)
+extern fn grasm_val_inc(v: addr)
+extern fn grasm_region_push()
+extern fn grasm_region_pop()
+extern fn grasm_box_i64(v: i64) -> addr
+extern fn grasm_str_from_i64(v: i64) -> addr
+extern fn grasm_list_new() -> addr
+extern fn grasm_list_push(l: addr, v: addr) -> addr
 
 type Pair = { name: str, items: [str] }
+
+/// Six fields, two of them scalars: kept in maps, so boxed, its fields in a
+/// `Vec` of their own.
+type Wide = { a: str, b: i64, c: f64, d: [str], e: bool, f: u64 }
+
+/// Four fields, inline in the box; compared, so boxed.
+type Small = { s: str, n: i64, t: [i64], x: f64 }
+
+/// Only read, built and listed: a value struct, its string and its list of
+/// integers inline in the list's words.
+type Cell = { name: str, nums: [i64], k: i64, tag: str }
+
+/// A value struct whose list of its own kind is a boxed field.
+type Node = { v: i64, kids: [Node] }
+
+effect Ask {
+    fn word() -> str
+    fn num() -> i64
+}
+
+fn asking() -> i64 / {Ask} {
+    Ask.word().len() + Ask.num()
+}
+
+fn tree(inout s: i64, depth: i64) -> Node {
+    var kids: [Node] = []
+    if depth > 0 {
+        for i in 0..pick(s, 4) {
+            kids.push(tree(s, depth - 1))
+        }
+    }
+    Node{ v: pick(s, 100), kids: kids }
+}
+
+fn weigh(n: Node) -> i64 {
+    var t = n.v
+    for k in n.kids {
+        t += weigh(k)
+    }
+    t
+}
 
 fn double(x: i64) -> i64 {
     2 * x
@@ -155,6 +216,65 @@ fn round(inout s: i64, inout keep: [[str]]) -> i64 {
     for g in fns {
         sum += g(2)
     }
+    // Maps keyed by every kind of key, some entries deleted again.
+    var mi: Map[i64, [str]] = {}
+    var mu: Map[u64, Wide] = {}
+    var mb: Map[bool, str] = {}
+    var mt: Map[(i64, str), [i64]] = {}
+    var mn: Map[((str, bool), u64), Small] = {}
+    for i in 0..pick(s, 12) {
+        let k = pick(s, 40)
+        mi.set(k, texts(s, pick(s, 3)))
+        mb.set(pick(s, 2) == 0, text(s))
+        mt.set((k, text(s)), numbers(s, pick(s, 6)))
+        let w = Wide{ a: text(s), b: k, c: 0.5, d: texts(s, pick(s, 3)), e: pick(s, 2) == 0, f: k.as_u64() }
+        mu.set(k.as_u64(), w)
+        let sm = Small{ s: text(s), n: k, t: numbers(s, pick(s, 4)), x: 1.5 }
+        mn.set(((text(s), pick(s, 2) == 0), k.as_u64()), sm)
+        if pick(s, 4) == 0 {
+            let _ = mi.delete(pick(s, 40))
+            let _ = mu.delete(pick(s, 40).as_u64())
+        }
+    }
+    sum += mi.len() + mu.len() + mb.len() + mt.len() + mn.len()
+    var smalls: [Small] = []
+    for v in mn.values() {
+        if v == v {
+            smalls.push(v)
+        }
+    }
+    sum += smalls.len()
+    var mis: [Map[i64, [str]]] = []
+    if pick(s, 2) == 0 {
+        mis.push(mi)
+    }
+    sum += mis.len()
+    // Value structs: inline strings and lists in a list's words, and trees
+    // whose children are value lists.
+    var cells: [Cell] = []
+    for i in 0..pick(s, 8) {
+        cells.push(Cell{ name: text(s), nums: numbers(s, pick(s, 5)), k: i, tag: text(s) })
+    }
+    for c in cells {
+        sum += c.name.len() + c.nums.len() + c.k + c.tag.len()
+        for x in c.nums {
+            sum += x % 3
+        }
+    }
+    let t = tree(s, pick(s, 4))
+    sum += weigh(t) % 1000
+    // Handler values and the environments their operations capture.
+    var hs: [AskHandler] = []
+    for i in 0..pick(s, 3) {
+        let w = text(s)
+        let ns = numbers(s, pick(s, 4))
+        hs.push(AskHandler{ word: || w, num: || ns.len() })
+    }
+    for h in hs {
+        with Ask handled_by h {
+            sum += asking()
+        }
+    }
     // Drop some of what is kept.
     while keep.len() > 8 {
         keep.remove(pick(s, keep.len()))
@@ -162,15 +282,159 @@ fn round(inout s: i64, inout keep: [[str]]) -> i64 {
     sum
 }
 
-fn main() / {io, unsafe} {
+thread_local INNER: i64
+thread_local OUTER: i64
+
+/// A struct descriptor laid out as the backend writes one (`StructDesc`):
+/// the cache word, the type's name, the field count, a (name, length, kind)
+/// triple per field, then a word per field -- an inline value list's
+/// element descriptor, or 0.
+fn desc(kinds: [i64], aux: [i64]) -> addr / {unsafe, mem} {
+    let n = kinds.len()
+    let d = unsafe { mem_alloc(32 + 32 * n + 8, 8) }
+    let name = unsafe { mem_alloc(8, 8) }
+    unsafe {
+        name.store_u8(84)
+        d.offset(8).store_addr(name)
+        d.offset(16).store_i64(1)
+        d.offset(24).store_i64(n)
+    }
+    var i = 0
+    while i < n {
+        unsafe {
+            d.offset(32 + 24 * i).store_addr(name)
+            d.offset(40 + 24 * i).store_i64(1)
+            d.offset(48 + 24 * i).store_i64(kinds[i])
+            d.offset(32 + 24 * n + 8 * i).store_i64(aux[i])
+        }
+        i += 1
+    }
+    d
+}
+
+/// A list of values whose elements hold an inline list of values -- of a
+/// type with a boxed field and an inline list of integers -- and a box:
+/// built through the Rust runtime's entry points and dropped, since no
+/// program the compiler writes makes one (it offers only strings and lists
+/// of scalars inline) and the walk takes them apart all the same.
+fn nested(inout s: i64, outer: addr, inner: addr) -> i64 / {io, unsafe, mem} {
+    var total = 0
+    var lo = unsafe { grasm_vals_new(outer) }
+    for i in 0..pick(s, 5) {
+        var li = unsafe { grasm_vals_new(inner) }
+        for j in 0..pick(s, 4) {
+            var sl = unsafe { grasm_list_new_scalar(0) }
+            for q in 0..pick(s, 6) {
+                sl = unsafe { grasm_list_push_scalar(sl, q, 0) }
+            }
+            unsafe {
+                let src = mem_alloc(32, 8)
+                src.store_addr(grasm_box_f64(0.5 + j.as_f64()))
+                grasm_inline_absorb_list(sl, src.offset(8))
+                li = grasm_vals_push(li, src)
+                mem_free(src)
+            }
+            total += 1
+        }
+        unsafe {
+            let src = mem_alloc(32, 8)
+            grasm_inline_absorb_list(li, src)
+            src.offset(24).store_addr(grasm_box_f64(1.5))
+            lo = grasm_vals_push(lo, src)
+            mem_free(src)
+        }
+        total += 1
+    }
+    unsafe { grasm_val_dec(lo) }
+    total
+}
+
+/// A region, opened and swept through the runtime's entry points (no
+/// compiled program opens one while the backend's sweep is off): boxes made
+/// inside it, the region's own, and lists made inside it holding boxes made
+/// outside, which the sweep releases rather than frees. Nothing inside it
+/// holds another thing made inside it, which the Rust runtime's sweep gets
+/// wrong (docs/known-issues.md).
+fn region(inout s: i64) -> i64 / {io, unsafe, mem} {
+    var held: [addr] = []
+    for i in 0..pick(s, 4) {
+        held.push(unsafe { grasm_box_f64(2.5 + i.as_f64()) })
+    }
+    var total = 0
+    unsafe {
+        grasm_region_push()
+        for i in 0..pick(s, 6) {
+            let k = pick(s, 3)
+            if k == 0 {
+                let _ = grasm_box_f64(1.5)
+            } else if k == 1 {
+                let _ = grasm_box_i64(100000 + pick(s, 1000))
+            } else {
+                let _ = grasm_str_from_i64(pick(s, 100000))
+            }
+            total += 1
+        }
+        for h in held {
+            if pick(s, 2) == 0 {
+                grasm_val_inc(h)
+                let _ = grasm_list_push(grasm_list_new(), h)
+                total += 1
+            }
+        }
+        grasm_region_pop()
+        for h in held {
+            grasm_val_dec(h)
+        }
+    }
+    total
+}
+
+fn main() / {io, unsafe, mem} {
     let a = args()
     var s = (a[0].parse_int() ?? 1) * 7919 + 13
     let rounds = a[1].parse_int() ?? 10
+    let worker_rounds = if a.len() > 2 { a[2].parse_int() ?? rounds } else { rounds }
     let base = unsafe { grasm_live_allocations() }
+    // The two value types `nested` lists: a box and an inline list of
+    // integers (kinds 0 and 6); an inline list of those and a box (7, 0).
+    let inner = desc([0, 6], [0, 0])
+    let outer = desc([7, 0], [unsafe { inner.as_i64() }, 0])
+    // Held where `leaks` looks at exit, as a compiled program's descriptors
+    // are in its data: they and the types the runtime builds from them live
+    // as long as the program.
+    unsafe {
+        mem_tls(INNER).store_addr(inner)
+        mem_tls(OUTER).store_addr(outer)
+    }
+    // Whether a box freed is the next one made: so with the ordinary build,
+    // whose pool hands it back; never with the poisoned one, which keeps a
+    // freed box out of circulation to catch a later touch of it.
+    unsafe {
+        let x = grasm_box_f64(0.25)
+        let at = x.as_i64()
+        grasm_val_dec(x)
+        let y = grasm_box_f64(0.75)
+        let again = y.as_i64() == at
+        print("reused {again}")
+        grasm_val_dec(y)
+    }
     var keep: [[str]] = []
     for r in 0..rounds {
-        let sum = round(s, keep)
+        let sum = round(s, keep) + nested(s, outer, inner) + region(s)
         let live = unsafe { grasm_live_allocations() } - base
         print("{r} {sum} {live}")
     }
+    // Values made on `par_map`'s workers -- by both runtimes' code -- and
+    // released here: each side's count on each thread, and what ended
+    // workers hand back, which only the leak check at exit adds up, since
+    // how many a worker makes is the scheduler's. Long enough to be split
+    // whatever its cost.
+    var total = 0
+    for r in 0..worker_rounds {
+        let made = numbers(s, 256 + pick(s, 300)).par_map(|n| [n.to_str(), "<{n}>"])
+        for m in made {
+            total += m[0].len() + m[1].len()
+        }
+    }
+    print("workers {total}")
 }
