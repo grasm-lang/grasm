@@ -95,15 +95,28 @@ for f in scripts/*.sh ProjectGold/run.sh; do
         piped=$((piped + 1))
     fi
 done
+# A gate `allgates.sh` runs by its path has to be executable, here and in
+# git. Eleven runtime fuzz gates were committed 0644 on 2026-10-28: run as
+# `bash scripts/x.sh` while they were written, each passed, and the first
+# suite run to reach them got "Permission denied", exit 126, from every one.
+notexec=0
+for path in $(grep -oE '^run_gate +[a-z0-9_]+ +(scripts|ProjectGold)/[A-Za-z0-9_./-]+' scripts/allgates.sh | awk '{print $3}' | sort -u); do
+    mode=$(git ls-files -s -- "$path" | awk '{print $1}')
+    if [ ! -x "$path" ] || [ "$mode" != 100755 ]; then
+        echo "  $path: allgates.sh runs it by its path, and it is not executable (git mode ${mode:-untracked})."
+        notexec=$((notexec + 1))
+    fi
+done
+
 # Kept apart from the total. The summary used to print the running total
 # under the label `undefined`, so one `grep -q` finding read as "undefined: 1"
 # and sent a reader looking for a helper that did not exist -- the count was
 # right and the name was wrong, which is worse than a wrong count because it
 # is believed.
 undefined=$bad
-bad=$((bad + piped))
+bad=$((bad + piped + notexec))
 
 echo "=========================================="
-echo "gate helpers checked: $checked   undefined: $undefined   corpus copied: $copied   grep -q under pipefail: $piped"
+echo "gate helpers checked: $checked   undefined: $undefined   corpus copied: $copied   grep -q under pipefail: $piped   gates not executable: $notexec"
 echo "=========================================="
 [ "$bad" = 0 ]
