@@ -227,7 +227,7 @@ The budgets, measured rather than asserted:
 | Budget | §19.2 target | Today |
 |---|---|---|
 | Core constructs | ≤ 30 | **37** |
-| Reference interpreter | ≤ 5,000 lines | **9046** |
+| Reference interpreter | ≤ 5,000 lines | **9992** |
 | Specification | ≤ 50 pages | **~70 pages** |
 
 None of the three is met, and all three are measured on every run. The

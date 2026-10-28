@@ -746,6 +746,15 @@ it, as `spec/core.md` says.
 > been the thing that grew**, the last two demanded by a program that hit a
 > wall. What would shrink it is moving builtins out of the engine into Grasm,
 > which needs a standard library written in the language.
+>
+> Then → 9,992 on 2026-10-28. From 9046, recorded on 2026-08-31, it had
+> drifted to 9,948 inside the 10% margin -- tasks and channels, interfaces,
+> fixed-width integers, raw memory and thread-local cells came in meanwhile
+> -- and the fix for the scheduler's lost wake in nested `concurrent` blocks
+> (S1, above) took it past the margin: the waiters are kept per block now, as
+> both compiled runtimes keep them. The fix was written at 79 lines and cut
+> to 44 before it was recorded. This time it was the engine and not the
+> library that grew, to be right.
 
 **Paid for again on 2026-10-20, by [T-U64].** The `u64` clause and its library
 rows took the spec to 3,561 lines, 71 pages. The history below came out of

@@ -96,45 +96,17 @@ fn next(state: &mut u64) -> u64 {
 }
 
 impl Chans {
-    /// Makes room for a block's slots, so marking one is an index.
-    fn open_block(&mut self, block: u64, slots: usize) {
-        self.waiting.push((block, vec![false; slots]));
-    }
-
-    /// Forgets a block, which a `concurrent` block does when it returns.
-    fn close_block(&mut self, block: u64) {
-        self.waiting.retain(|(b, _)| *b != block);
-        self.ready.retain(|(b, _)| *b != block);
-    }
-
-    fn mark_waiting(&mut self, who: Waiter) {
-        if let Some((_, flags)) = self.waiting.iter_mut().find(|(b, _)| *b == who.0) {
-            if let Some(f) = flags.get_mut(who.1) {
-                *f = true;
-            }
-        }
+    /// Whether `who` is in some channel's wait queue; `None` once its block
+    /// has returned.
+    fn flag(&mut self, who: Waiter) -> Option<&mut bool> {
+        let (_, flags) = self.waiting.iter_mut().find(|(b, _)| *b == who.0)?;
+        flags.get_mut(who.1)
     }
 
     /// True if that waiter was really waiting, and clears it. False for an
     /// entry a retry left behind.
     fn take_waiting(&mut self, who: Waiter) -> bool {
-        if let Some((_, flags)) = self.waiting.iter_mut().find(|(b, _)| *b == who.0) {
-            if let Some(f) = flags.get_mut(who.1) {
-                if *f {
-                    *f = false;
-                    return true;
-                }
-            }
-        }
-        false
-    }
-
-    fn is_waiting(&self, who: Waiter) -> bool {
-        self.waiting
-            .iter()
-            .find(|(b, _)| *b == who.0)
-            .and_then(|(_, flags)| flags.get(who.1).copied())
-            .unwrap_or(false)
+        self.flag(who).is_some_and(|f| std::mem::replace(f, false))
     }
 
     /// Wakes the longest-waiting task on `id`, if any, by moving it to the
@@ -146,33 +118,23 @@ impl Chans {
     /// scheduler takes each slot once per round, which makes the second
     /// wake-up a no-op rather than a double resume.
     fn wake_one(&mut self, id: usize, side: Side) {
-        let Some(c) = self.chans.get_mut(id) else {
-            return;
-        };
-        let queue = match side {
-            Side::Room => &mut c.want_room,
-            Side::Value => &mut c.want_value,
-        };
-        let mut taken = None;
-        while let Some(who) = queue.pop_front() {
-            // `self.waiting` and not `is_waiting`: the queue still borrows
-            // `self.chans`.
-            if self
-                .waiting
-                .iter()
-                .find(|(b, _)| *b == who.0)
-                .and_then(|(_, f)| f.get(who.1).copied())
-                .unwrap_or(false)
-            {
-                taken = Some(who);
-                break;
+        loop {
+            let Some(c) = self.chans.get_mut(id) else {
+                return;
+            };
+            let queue = match side {
+                Side::Room => &mut c.want_room,
+                Side::Value => &mut c.want_value,
+            };
+            let Some(who) = queue.pop_front() else {
+                return;
+            };
+            // A stale entry -- woken by another channel, or finished -- is
+            // passed over rather than spending the wake on it.
+            if self.take_waiting(who) {
+                self.ready.push_back(who);
+                return;
             }
-            // Stale: that slot was woken by another channel, or has
-            // finished. Keep looking rather than spending the wake on it.
-        }
-        if let Some(who) = taken {
-            self.take_waiting(who);
-            self.ready.push_back(who);
         }
     }
 
@@ -311,7 +273,9 @@ impl<'a, W: Write> Interp<'a, W> {
                 {
                     let mut guard = self.chans.borrow_mut();
                     let me = guard.running;
-                    guard.mark_waiting(me);
+                    if let Some(f) = guard.flag(me) {
+                        *f = true;
+                    }
                     for &id in on {
                         if let Some(c) = guard.chans.get_mut(id) {
                             match side {
@@ -518,7 +482,7 @@ impl<'a, W: Write> Interp<'a, W> {
             let mut guard = self.chans.borrow_mut();
             guard.next_block += 1;
             let block = guard.next_block;
-            guard.open_block(block, slots.len());
+            guard.waiting.push((block, vec![false; slots.len()]));
             (block, guard.running)
         };
 
@@ -586,7 +550,7 @@ impl<'a, W: Write> Interp<'a, W> {
                     // It gave way. If it joined a channel's queue, that queue
                     // will wake it; if it gave way without blocking, it is
                     // still runnable.
-                    if !self.chans.borrow().is_waiting((block, i)) {
+                    if !self.chans.borrow_mut().flag((block, i)).is_some_and(|f| *f) {
                         runnable.push_back(i);
                     }
                     slots[i] = Some(entry);
@@ -623,7 +587,8 @@ impl<'a, W: Write> Interp<'a, W> {
         {
             let mut guard = self.chans.borrow_mut();
             guard.running = outer_running;
-            guard.close_block(block);
+            guard.waiting.retain(|(b, _)| *b != block);
+            guard.ready.retain(|(b, _)| *b != block);
         }
         let mut live: Vec<_> = slots.into_iter().flatten().collect();
 
