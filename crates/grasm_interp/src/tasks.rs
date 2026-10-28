@@ -42,13 +42,12 @@ pub struct Chans {
     /// How many `concurrent` blocks have run tasks, so the test runner can
     /// tell a test that has a schedule to vary from one that has none.
     pub(crate) blocks_run: u64,
-    /// Which task slot is running, so a channel operation that has to wait
-    /// knows whom to enqueue. Set by the scheduler around each resume.
-    pub(crate) running: usize,
-    /// For the slot that just gave way: the channels it waits on. A `select`
-    /// waits on several, and is woken by whichever moves first.
-    pub(crate) blocked_on: Vec<usize>,
-    /// Whether each slot is currently in some channel's wait queue.
+    /// Which block's task slot is running, so a channel operation that has
+    /// to wait knows whom to enqueue. Set by the scheduler around each
+    /// resume, and put back when a nested block returns.
+    pub(crate) running: Waiter,
+    /// Whether each slot of each open block is currently in some channel's
+    /// wait queue.
     ///
     /// A blocked operation retries in a loop, so a task re-joins a queue
     /// every time it gives way, and a queue accumulates entries for slots
@@ -56,11 +55,21 @@ pub struct Chans {
     /// spends its wake on a stale entry and the task that was actually
     /// waiting is never resumed -- which reports a deadlock on a program
     /// that has none.
-    pub(crate) waiting: Vec<bool>,
-    /// Slots a channel operation has woken and the scheduler has not yet
-    /// taken. Draining this rather than resuming every live task is what
-    /// makes a round O(runnable) instead of O(live) ([E-SCHEDULE]).
-    pub(crate) ready: VecDeque<usize>,
+    ///
+    /// Per block, as the compiled runtimes keep it: a task of one
+    /// `concurrent` block can run another, and while the inner one
+    /// schedules, a task of the outer one can still be woken -- by a channel
+    /// operation the outer block's tasks made before it. One table of slots
+    /// for both lost that wake: the inner block cleared it, and the outer
+    /// block then reported a deadlock in a program that has none.
+    pub(crate) waiting: Vec<(u64, Vec<bool>)>,
+    /// Waiters a channel operation has woken and their block's scheduler has
+    /// not yet taken. Draining this rather than resuming every live task is
+    /// what makes a round O(runnable) instead of O(live) ([E-SCHEDULE]).
+    pub(crate) ready: VecDeque<Waiter>,
+    /// Ids handed to `concurrent` blocks, so a nested block's slots are not
+    /// mistaken for its parent's.
+    pub(crate) next_block: u64,
     /// Tier 2's slab, while it is in transit between interpreters. A `ref`
     /// (an actor's state is one) names a slot in *the* slab, so there can be
     /// only one; each task's interpreter holds it while it runs and puts it
@@ -71,6 +80,10 @@ pub struct Chans {
 }
 
 pub(crate) type Slab = (Vec<(Option<Value>, u32)>, Vec<u32>);
+
+/// Which `concurrent` block a waiting task belongs to, and which of its
+/// slots it is.
+pub(crate) type Waiter = (u64, usize);
 
 /// SplitMix64: a fixed, portable generator, so a seed names the same orders
 /// on every machine.
@@ -83,7 +96,47 @@ fn next(state: &mut u64) -> u64 {
 }
 
 impl Chans {
-    /// The order this round visits `n` tasks in.
+    /// Makes room for a block's slots, so marking one is an index.
+    fn open_block(&mut self, block: u64, slots: usize) {
+        self.waiting.push((block, vec![false; slots]));
+    }
+
+    /// Forgets a block, which a `concurrent` block does when it returns.
+    fn close_block(&mut self, block: u64) {
+        self.waiting.retain(|(b, _)| *b != block);
+        self.ready.retain(|(b, _)| *b != block);
+    }
+
+    fn mark_waiting(&mut self, who: Waiter) {
+        if let Some((_, flags)) = self.waiting.iter_mut().find(|(b, _)| *b == who.0) {
+            if let Some(f) = flags.get_mut(who.1) {
+                *f = true;
+            }
+        }
+    }
+
+    /// True if that waiter was really waiting, and clears it. False for an
+    /// entry a retry left behind.
+    fn take_waiting(&mut self, who: Waiter) -> bool {
+        if let Some((_, flags)) = self.waiting.iter_mut().find(|(b, _)| *b == who.0) {
+            if let Some(f) = flags.get_mut(who.1) {
+                if *f {
+                    *f = false;
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    fn is_waiting(&self, who: Waiter) -> bool {
+        self.waiting
+            .iter()
+            .find(|(b, _)| *b == who.0)
+            .and_then(|(_, flags)| flags.get(who.1).copied())
+            .unwrap_or(false)
+    }
+
     /// Wakes the longest-waiting task on `id`, if any, by moving it to the
     /// ready list. Exactly one: a value, or a space for one, serves one
     /// waiter, and waking the rest only to have them wait again is the
@@ -100,14 +153,26 @@ impl Chans {
             Side::Room => &mut c.want_room,
             Side::Value => &mut c.want_value,
         };
-        while let Some(slot) = queue.pop_front() {
-            if self.waiting.get(slot).copied().unwrap_or(false) {
-                self.waiting[slot] = false;
-                self.ready.push_back(slot);
-                return;
+        let mut taken = None;
+        while let Some(who) = queue.pop_front() {
+            // `self.waiting` and not `is_waiting`: the queue still borrows
+            // `self.chans`.
+            if self
+                .waiting
+                .iter()
+                .find(|(b, _)| *b == who.0)
+                .and_then(|(_, f)| f.get(who.1).copied())
+                .unwrap_or(false)
+            {
+                taken = Some(who);
+                break;
             }
             // Stale: that slot was woken by another channel, or has
             // finished. Keep looking rather than spending the wake on it.
+        }
+        if let Some(who) = taken {
+            self.take_waiting(who);
+            self.ready.push_back(who);
         }
     }
 
@@ -134,8 +199,8 @@ struct Chan {
     /// buffer just as full, waits again, and the receiver that could have
     /// gone on is never reached. That reports a deadlock on a program that
     /// has none, which is what one queue did here.
-    want_room: VecDeque<usize>,
-    want_value: VecDeque<usize>,
+    want_room: VecDeque<Waiter>,
+    want_value: VecDeque<Waiter>,
     buf: VecDeque<Value>,
     /// How many values it holds before a send waits; 0 is a rendezvous.
     cap: usize,
@@ -246,10 +311,7 @@ impl<'a, W: Write> Interp<'a, W> {
                 {
                     let mut guard = self.chans.borrow_mut();
                     let me = guard.running;
-                    guard.blocked_on.clear();
-                    if me < guard.waiting.len() {
-                        guard.waiting[me] = true;
-                    }
+                    guard.mark_waiting(me);
                     for &id in on {
                         if let Some(c) = guard.chans.get_mut(id) {
                             match side {
@@ -258,7 +320,6 @@ impl<'a, W: Write> Interp<'a, W> {
                             }
                         }
                     }
-                    guard.blocked_on.extend_from_slice(on);
                 }
                 self.park_slab();
                 grasm_fiber::suspend();
@@ -397,12 +458,11 @@ impl<'a, W: Write> Interp<'a, W> {
         *progress += 1;
         // Closing is the one case that wakes *all* of them: every waiter's
         // answer changes, and none will wait on this channel again.
-        let mut woken: VecDeque<usize> = core::mem::take(&mut c.want_room);
+        let mut woken: VecDeque<Waiter> = core::mem::take(&mut c.want_room);
         woken.extend(core::mem::take(&mut c.want_value));
-        for slot in woken {
-            if guard.waiting.get(slot).copied().unwrap_or(false) {
-                guard.waiting[slot] = false;
-                guard.ready.push_back(slot);
+        for who in woken {
+            if guard.take_waiting(who) {
+                guard.ready.push_back(who);
             }
         }
         Ok(Value::Unit)
@@ -454,12 +514,13 @@ impl<'a, W: Write> Interp<'a, W> {
         let mut slots: Vec<Option<_>> = live.drain(..).map(Some).collect();
         let mut runnable: VecDeque<usize> = (0..slots.len()).collect();
         let mut alive = slots.len();
-        {
+        let (block, outer_running) = {
             let mut guard = self.chans.borrow_mut();
-            guard.ready.clear();
-            guard.waiting.clear();
-            guard.waiting.resize(slots.len(), false);
-        }
+            guard.next_block += 1;
+            let block = guard.next_block;
+            guard.open_block(block, slots.len());
+            (block, guard.running)
+        };
 
         let result = loop {
             let mut failed: Option<Flow> = None;
@@ -481,11 +542,10 @@ impl<'a, W: Write> Interp<'a, W> {
                 };
                 {
                     let mut guard = self.chans.borrow_mut();
-                    guard.running = i;
-                    guard.blocked_on.clear();
+                    guard.running = (block, i);
                     // About to run, so not waiting -- whatever queues still
                     // hold its slot are stale from here on.
-                    guard.waiting[i] = false;
+                    guard.take_waiting((block, i));
                 }
                 // The depth check measures the stack it runs on, and that is
                 // now this task's -- not the thread's, whose floor lies far
@@ -526,7 +586,7 @@ impl<'a, W: Write> Interp<'a, W> {
                     // It gave way. If it joined a channel's queue, that queue
                     // will wake it; if it gave way without blocking, it is
                     // still runnable.
-                    if self.chans.borrow().blocked_on.is_empty() {
+                    if !self.chans.borrow().is_waiting((block, i)) {
                         runnable.push_back(i);
                     }
                     slots[i] = Some(entry);
@@ -539,13 +599,32 @@ impl<'a, W: Write> Interp<'a, W> {
             if alive == 0 {
                 break Ok(Value::Unit);
             }
-            runnable.extend(self.chans.borrow_mut().ready.drain(..));
+            // Take the wake-ups meant for this block, and leave any for the
+            // block around it: a task of that one may have been woken before
+            // this block started, and its own scheduler takes it when this
+            // block's task gives way.
+            {
+                let mut guard = self.chans.borrow_mut();
+                let all: VecDeque<Waiter> = std::mem::take(&mut guard.ready);
+                for who in all {
+                    if who.0 == block {
+                        runnable.push_back(who.1);
+                    } else {
+                        guard.ready.push_back(who);
+                    }
+                }
+            }
             if runnable.is_empty() {
                 // Every live task is in a wait queue and no channel can move:
                 // nothing will ever wake them ([E-DEADLOCK]).
                 break Err(Flow::Panic(DEADLOCK.to_string()));
             }
         };
+        {
+            let mut guard = self.chans.borrow_mut();
+            guard.running = outer_running;
+            guard.close_block(block);
+        }
         let mut live: Vec<_> = slots.into_iter().flatten().collect();
 
         // A task still suspended here is abandoned with the block: its fiber

@@ -5,8 +5,7 @@ Every defect that is known and not fixed, with its severity from
 to paste. S1 and S2 block a release; S3 and S4 do not, and this file is what
 makes shipping them honest rather than quiet.
 
-**Open S1: one, the interpreter losing a wake for an outer `concurrent`
-block's task while a nested block runs; one under investigation. Open S2:
+**Open S1: none confirmed; one under investigation. Open S2:
 none. Open S3: two, a block whose value is a map literal and a statement
 `if` whose branches' values differ, refused natively. Open S4: two, a nested
 interpolation's spans and a backslash at the end of a file. Latent: one, the
@@ -19,7 +18,7 @@ in code S5 replaces in the Rust tree, so neither is fixed there. The Grasm
 runtime does what each should.
 
 **The interpreter loses a wake meant for an outer `concurrent` block's task
-while a nested block runs, and reports a deadlock -- *open, S1, in the
+while a nested block runs, and reports a deadlock -- *closed, S1, in the
 interpreter's scheduler*.**
 
 ```
@@ -57,9 +56,19 @@ the third task's nested block is the one scheduling, and the nested
 scheduler does not leave it for the outer one -- the native schedulers keep
 wakes for another block (`Chans::ready`, keyed by block, in
 `crates/grasm_rt/src/tasks.rs` and `compiler/rt/src/tasks.gr`), and
-[E-SCHEDULE] has the woken task run. Not fixed: S5 does not change the
-interpreter. `scripts/fuzz_rttasks.sh` holds the runtimes to the
-interpreter only on rounds without nested blocks for this reason.
+[E-SCHEDULE] has the woken task run.
+
+Closed 2026-10-28. The interpreter's scheduler kept one table of waiting
+slots and one ready list for every block, and a nested block cleared both
+when it started: the outer block's woken task was forgotten. It now keys
+them as the compiled runtimes do -- a waiter is a block and a slot, each
+block takes only its own wake-ups and leaves the rest for the block around
+it, and the running slot is put back when a nested block returns. The
+reproducer prints the three lines and exits 0, as both native builds do.
+On `compiler/rttasks/taskfuzz.gr`'s seeds 1 to 20 with nested blocks, the
+fixed interpreter prints and exits as the native build on all 20, and the
+old one differed on all 20. `scripts/fuzz_rttasks.sh` now holds nested
+rounds to the interpreter too.
 
 **The Rust runtime's region sweep can free a box and then release it again
 -- *latent; it becomes S1 if the backend ever sweeps regions*.**

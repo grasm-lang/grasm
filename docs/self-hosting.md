@@ -2144,8 +2144,9 @@ is the interpreter's scheduler, a third implementation of [E-SCHEDULE]:
 `fuzz_rttasks` runs random tasks over random channels, each task printing
 what it does, compiled on both runtimes and under `grasm run`:
 "seeds identical on both runtimes: 20 of 20 (1600 rounds, 18751 lines of schedule, each leak-free)   flat seeds as the interpreter schedules them: 20   panics identical: 6 of 6   names of the family taken from Grasm: 8". It found the interpreter losing a wake meant for an outer
-block's task while a nested block runs (docs/known-issues.md, S1, open),
-so nested blocks are held to the two runtimes only.
+block's task while a nested block runs (docs/known-issues.md, S1), so
+nested blocks were held to the two runtimes only until it was fixed on
+2026-10-28; they are held to the interpreter too now.
 
 Pointer authentication, measured on this machine (an Apple M1 Pro,
 `hw.optional.arm.FEAT_PAuth` 1, no FPAC): the programs are arm64, not
@@ -2458,9 +2459,9 @@ Measured, not estimated; each line is a gate's result on master.
   per family (`fuzz_rtmaps` to `fuzz_rttasks`), identical on every seed,
   `fuzz_rtcase` on every code point and `fuzz_rttasks` against the
   interpreter's scheduler too; `rtcontrols` 65 of 65 planted faults caught.
-  Two defects found and recorded, neither fixed: the interpreter loses a
-  wake for an outer `concurrent` block's task while a nested block runs
-  (S1), and the Rust runtime's region sweep frees a box before it has read
+  Two defects found and recorded: the interpreter lost a wake for an outer
+  `concurrent` block's task while a nested block ran (S1, fixed 2026-10-28
+  after the stage), and the Rust runtime's region sweep frees a box before it has read
   it (latent: no compiled program sweeps a region). Measured once: one
   corpus program built by the Grasm backend took 7.0 s on this runtime
   against 3.8 s on the Rust one.

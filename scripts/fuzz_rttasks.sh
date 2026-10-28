@@ -13,13 +13,13 @@
 # interposed (`scripts/lib/rtswap.sh`); the swapped build must take the
 # family's names from the Grasm runtime. Every seed must print and exit the
 # same from both builds, with the leak check on and finding nothing live;
-# each seed's rounds without nested blocks (`flat`) must also print and exit
-# as `grasm run` does -- the interpreter's scheduler being the model of
-# which fiber runs, held apart from either runtime's; and each of the
-# family's panics must end both builds the same way and the interpreter
-# with the same first line. Nested blocks are not held to the interpreter:
-# it loses a wake meant for an outer block's task while a nested block runs
-# (docs/known-issues.md), which both runtimes deliver.
+# each seed's rounds, with nested blocks and without them (`flat`), must also
+# print and exit as `grasm run` does -- the interpreter's scheduler being the
+# model of which fiber runs, held apart from either runtime's; and each of
+# the family's panics must end both builds the same way and the interpreter
+# with the same first line. Until 2026-10-28 the nested rounds were held to
+# the two runtimes only: the interpreter lost a wake meant for an outer
+# block's task while a nested block ran (docs/known-issues.md, closed).
 #
 #   RTTASKS_SEEDS (20) seeds of RTTASKS_ROUNDS (40) rounds. `RT_OBJ=`, `S3=`
 #   and `LINK=` as for `scripts/rtswap.sh`.
@@ -97,6 +97,7 @@ while [ "$k" -le "$SEEDS" ]; do
         exit 1
     fi
     lines=$((lines + $(wc -l <"$WORK/a.out")))
+    model "$k" "$ROUNDS" || exit 1
     both "$k" "$ROUNDS" flat || exit 1
     model "$k" "$ROUNDS" flat || exit 1
     same=$((same + 1))
@@ -115,5 +116,5 @@ while [ "$p" -le 5 ]; do
     panics=$((panics + 1))
     p=$((p + 1))
 done
-echo "seeds identical on both runtimes: $same of $SEEDS ($((2 * SEEDS * ROUNDS)) rounds, $lines lines of schedule, each leak-free)   flat seeds as the interpreter schedules them: $modelled   panics identical: $panics of 6   names of the family taken from Grasm: $taken"
+echo "seeds identical on both runtimes: $same of $SEEDS ($((2 * SEEDS * ROUNDS)) rounds, $lines lines of schedule, each leak-free)   seeds as the interpreter schedules them, nested and flat: $modelled   panics identical: $panics of 6   names of the family taken from Grasm: $taken"
 [ "$same" -eq "$SEEDS" ] && [ "$SEEDS" -ge 1 ]

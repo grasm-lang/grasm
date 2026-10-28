@@ -3169,3 +3169,57 @@ fn main() {
     assert!(got.status.success(), "{:?}", got.status);
     assert_eq!(String::from_utf8_lossy(&got.stdout).trim(), want, "native");
 }
+
+/// A task of an outer `concurrent` block woken while a nested block is the
+/// one scheduling stays woken: the nested block takes only its own wake-ups.
+/// The interpreter used to clear the outer block's and report a deadlock;
+/// both native runtimes always ran it.
+#[test]
+fn a_nested_concurrent_block_leaves_the_outer_blocks_wakes() {
+    let w = Work::new("nestedwake");
+    let src = w.0.join("main.gr");
+    let out = w.0.join("app");
+    std::fs::write(
+        &src,
+        r#"fn main() / {io, async} {
+    let ch = chan_new()
+    concurrent {
+        go {
+            chan_send(ch, 1)
+            print("sent")
+        }
+        go {
+            print("got {chan_recv(ch)}")
+        }
+        go {
+            let inner = chan_new()
+            concurrent {
+                go {
+                    chan_send(inner, 2)
+                }
+                go {
+                    print("inner {chan_recv(inner)}")
+                }
+            }
+        }
+    }
+}
+"#,
+    )
+    .unwrap();
+    let want = "got Some(1)\ninner Some(2)\nsent";
+    let (code, text) = run(&["run", src.to_str().unwrap()]);
+    assert_eq!(code, 0, "{text}");
+    assert_eq!(text.trim(), want, "grasm run");
+    let (code, msg) = run(&[
+        "build",
+        src.to_str().unwrap(),
+        "--native",
+        "-o",
+        out.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "{msg}");
+    let got = Command::new(&out).output().expect("runs");
+    assert!(got.status.success(), "{:?}", got.status);
+    assert_eq!(String::from_utf8_lossy(&got.stdout).trim(), want, "native");
+}
