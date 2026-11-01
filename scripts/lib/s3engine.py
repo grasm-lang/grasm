@@ -33,7 +33,8 @@ arguments to each compilation, as the S3 gates take them (the controls in
 `scripts/s3controls.sh` point them at a broken one). `S3_RT=` names the
 runtime to link, and `S3_LINKER=` a linker to link with instead of `cc`
 (compiler/link, docs/self-hosting.md stage S4), as `scripts/lib/s3.sh` takes
-it.
+it; `FRONT=` a frontend to make the TIR with in place of `grasm tir`
+(`compiler/front`'s `front tir`; `scripts/withstage.sh`, §6.14).
 """
 
 import os
@@ -161,9 +162,10 @@ class Engine:
         for path in (self.tir, self.obj):
             if os.path.exists(path):
                 os.remove(path)
-        t = _run([self.grasm, "tir", src], timeout=120, cwd=cwd)
+        t = _run([os.environ.get("FRONT") or self.grasm, "tir", src], timeout=120, cwd=cwd)
         if t[0] != 0:
-            return self._fail(label, f"`grasm tir` failed ({t[0]}): {_short(t[2])}")
+            tool = "front tir" if os.environ.get("FRONT") else "grasm tir"
+            return self._fail(label, f"`{tool}` failed ({t[0]}): {_short(t[2])}")
         with open(self.tir, "wb") as f:
             f.write(t[1])
         c = _run([self.driver, self.tir, "-o", self.obj] + self.extra, timeout=120)

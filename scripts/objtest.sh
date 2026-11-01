@@ -29,7 +29,8 @@
 #
 # `S3_STOP_AT_FIRST=1` (the mutation controls', `scripts/s3controls.sh`)
 # stops at the first program with a problem: a planted fault needs one object
-# to show it, not the whole corpus.
+# to show it, not the whole corpus. `FRONT=` makes every TIR, the runtimes'
+# too, with that frontend in place of `grasm tir` (`scripts/withstage.sh`).
 set -uo pipefail
 cd "$(dirname "$0")/.."
 GRASM=${GRASM:-./target/release/grasm}
@@ -130,7 +131,7 @@ for entry in compiler/rt/src/main.gr scripts/fixtures/rtdialect/src/main.gr; do
     rt_checked=$((rt_checked + 1))
     bad=""
     rm -f "$WORK/a/r.o" "$WORK/b/deeper/r.o"
-    if ! "$GRASM" tir "$entry" >"$WORK/r.tir" 2>"$WORK/r.log" ||
+    if ! "${FRONT:-$GRASM}" tir "$entry" >"$WORK/r.tir" 2>"$WORK/r.log" ||
         ! "$S3" "$WORK/r.tir" -o "$WORK/a/r.o" --runtime >>"$WORK/r.log" 2>&1 ||
         ! "$S3" "$WORK/r.tir" -o "$WORK/b/deeper/r.o" --runtime >>"$WORK/r.log" 2>&1; then
         problems=$((problems + 1))

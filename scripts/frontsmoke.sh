@@ -99,7 +99,7 @@ while IFS= read -r f; do
     rm -f "$WORK/p" "$WORK/p.o"
 done <"$WORK/programs"
 
-echo "programs: $listed   through tirinterp as grasm run: $interp_same   compiled by s3, linked by grasm-link, as grasm run: $native_same   outside s3's subset: $outside"
+echo "programs: $listed   through tirinterp as grasm run: $interp_same   compiled by s3, linked by $(basename "$LINKER"), as grasm run: $native_same   outside s3's subset: $outside"
 if [ ${#FAILED[@]} -gt 0 ]; then
     echo
     echo "FAILED:"

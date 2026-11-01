@@ -1265,7 +1265,8 @@ def main():
         with open(src, "w") as f:
             f.write(src_text)
         tir = os.path.join(work, "p.tir")
-        p = subprocess.run([GRASM, "tir", src], capture_output=True, text=True)
+        # `FRONT=` makes the TIR with that frontend (scripts/withstage.sh).
+        p = subprocess.run([os.environ.get("FRONT") or GRASM, "tir", src], capture_output=True, text=True)
         if p.returncode != 0:
             # The generator wrote something the checker refuses: a generator
             # bug, counted and shown, never compared.

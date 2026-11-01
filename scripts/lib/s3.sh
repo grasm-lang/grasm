@@ -67,7 +67,9 @@ s3_runtime() {
 # `S3_RULE[k]` ("in" or "out: <reasons>"). A program that emits no TIR is
 # recorded in `S3_NOTIR` and fails the gate: `tirtest` requires the whole
 # corpus to emit. The work is `scripts/s3_collect.py`'s, which emits the TIR
-# eight programs at a time and asks the rule of each, in the corpus's order.
+# eight programs at a time and asks the rule of each, in the corpus's order;
+# with `grasm tir`, or with `$FRONT tir` when `FRONT=` names a frontend
+# (`scripts/withstage.sh`).
 s3_collect() {
     S3_SRC=()
     S3_TIR=()

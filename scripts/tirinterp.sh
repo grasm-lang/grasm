@@ -29,6 +29,11 @@
 #
 # Then the raw-memory sandbox's panics, from `tools/tirinterp/panics`, which
 # are not corpus programs; the section that runs them says why.
+#
+# `TIRINTERP=` names a prebuilt interpreter and `FRONT=` a frontend to make
+# the TIR with (`front tir`) in place of `grasm tir`: `scripts/withstage.sh`
+# runs this with a stage of the self-built compiler (docs/self-hosting.md
+# §6.14).
 set -uo pipefail
 cd "$(dirname "$0")/.."
 GRASM=${GRASM:-./target/release/grasm}
@@ -44,12 +49,16 @@ trap 'rm -rf "$WORK"' EXIT
 
 # Built here, natively and once, so the gate cannot pass against an
 # interpreter from before the source it claims to check.
-TIRINTERP="$WORK/tirinterp"
-if ! "$GRASM" build tools/tirinterp/src/main.gr --native -o "$TIRINTERP" >"$WORK/build.log" 2>&1; then
-    echo "error: tools/tirinterp does not build:"
-    sed 's/^/  /' "$WORK/build.log"
-    exit 1
+TIRINTERP=${TIRINTERP:-}
+if [ -z "$TIRINTERP" ]; then
+    TIRINTERP="$WORK/tirinterp"
+    if ! "$GRASM" build tools/tirinterp/src/main.gr --native -o "$TIRINTERP" >"$WORK/build.log" 2>&1; then
+        echo "error: tools/tirinterp does not build:"
+        sed 's/^/  /' "$WORK/build.log"
+        exit 1
+    fi
 fi
+EMIT=${FRONT:-$GRASM}
 
 roundtrip=0
 rt_failed=0
@@ -66,7 +75,7 @@ for src in $(corpus_programs); do
         continue
     fi
     tir="$WORK/p.tir"
-    if ! "$GRASM" tir "$src" >"$tir" 2>"$WORK/emit.err"; then
+    if ! "$EMIT" tir "$src" >"$tir" 2>"$WORK/emit.err"; then
         rt_failed=$((rt_failed + 1))
         FAILED+=("$src — emits no TIR: $(head -1 "$WORK/emit.err")")
         continue
@@ -130,7 +139,7 @@ for src in tools/tirinterp/panics/*.gr; do
     [ -e "$src" ] || continue
     panic_files=$((panic_files + 1))
     tir="$WORK/p.tir"
-    if ! "$GRASM" tir "$src" >"$tir" 2>"$WORK/emit.err"; then
+    if ! "$EMIT" tir "$src" >"$tir" 2>"$WORK/emit.err"; then
         panic_fail=$((panic_fail + 1))
         FAILED+=("$src — emits no TIR: $(head -1 "$WORK/emit.err")")
         continue

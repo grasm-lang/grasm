@@ -13,9 +13,10 @@ RT_SRC=compiler/rt/src/main.gr
 RT_FAMILIES=compiler/rt/families.txt
 
 # Builds the runtime whose package is the directory `$1` (its `src/main.gr`)
-# into object `$2` with the Grasm backend (`$S3`): `grasm tir`, then `s3
-# --runtime`. With `$3` = poison, from a copy of it whose `build.gr` says so.
-# Answers whether it built; why not goes to `$2.log`.
+# into object `$2` with the Grasm backend (`$S3`): `grasm tir` (or `$FRONT
+# tir`, when `FRONT=` names a frontend), then `s3 --runtime`. With `$3` =
+# poison, from a copy of it whose `build.gr` says so. Answers whether it
+# built; why not goes to `$2.log`.
 rtswap_build() {
     local dir=$1 obj=$2 flavour=${3:-}
     if [ "$flavour" = poison ]; then
@@ -28,7 +29,7 @@ rtswap_build() {
         sed -i '' 's/^pub let POISON = false$/pub let POISON = true/' "$obj.src/src/build.gr"
         dir="$obj.src"
     fi
-    "$GRASM" tir "$dir/src/main.gr" >"$obj.tir" 2>"$obj.log" &&
+    "${FRONT:-$GRASM}" tir "$dir/src/main.gr" >"$obj.tir" 2>"$obj.log" &&
         "$S3" "$obj.tir" -o "$obj" --runtime >>"$obj.log" 2>&1
 }
 

@@ -56,7 +56,8 @@ fail() {
     echo "FAIL: $1"
 }
 
-if ! "$GRASM" tir "$FX/src/main.gr" >"$WORK/fx.tir" 2>"$WORK/tir.log"; then
+# `FRONT=` makes the fixture's TIR with that frontend (`scripts/withstage.sh`).
+if ! "${FRONT:-$GRASM}" tir "$FX/src/main.gr" >"$WORK/fx.tir" 2>"$WORK/tir.log"; then
     echo "error: the fixture does not emit TIR:"
     sed 's/^/  /' "$WORK/tir.log" | head -20
     exit 1

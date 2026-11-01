@@ -16,6 +16,12 @@ program that links a system library, which the S3 gates set aside.
 in the input's order; library modules (no `(main` in their TIR) are left out.
 The TIR is emitted eight programs at a time -- it is most of the gates' time --
 and the verdict is `scripts/s3_subset.py`'s, computed in this process.
+
+`FRONT=<binary>` emits the TIR with that frontend (`compiler/front`'s `front
+tir`) in place of `grasm tir`: `scripts/withstage.sh` runs the S3 gates with
+a stage of the self-built compiler that way (docs/self-hosting.md §6.14).
+Which system libraries a program links is asked of `grasm links` either way;
+the Grasm frontend has no such command until S8.
 """
 import os
 import subprocess
@@ -31,7 +37,7 @@ def one(args):
     with open(src, encoding="utf-8") as f:
         if any(line.rstrip("\n") == "//! expect: error" for line in f):
             return None
-    r = subprocess.run([grasm, "tir", src], capture_output=True, text=True)
+    r = subprocess.run([os.environ.get("FRONT") or grasm, "tir", src], capture_output=True, text=True)
     if r.returncode != 0:
         first = (r.stderr.strip().splitlines() or [""])[0]
         return ("NOTIR", src, first)
