@@ -9,13 +9,45 @@ makes shipping them honest rather than quiet.
 under investigation; and one in `compiler/front`, which no release ships
 yet, `front tir` printing nothing for a TIR of 4 GB. Open S2: none. Open S3:
 two, a block whose value is a map literal and a statement `if` whose
-branches' values differ, refused natively. Open S4: eight, a nested
-interpolation's spans, a backslash at the end of a file, and six in `grasm
+branches' values differ, refused natively. Open S4: nine, a nested
+interpolation's spans, a backslash at the end of a file, six in `grasm
 check`'s diagnostics: carets placed by bytes, "did you mean" in hash order,
 a type shown as `_`, a contract's row breach reported twice, a ceiling
-refusal without its reason, and a `match`'s names unbound after an error.
-Latent: one, the Rust runtime's region sweep, which no compiled program
-reaches.**
+refusal without its reason, and a `match`'s names unbound after an error;
+and one in `compiler/s3`, which no release ships yet, an object naming the
+directory it was compiled in. Latent: one, the Rust runtime's region sweep,
+which no compiled program reaches.**
+
+## Found on 2026-11-01 by S6 (the compiler built by itself)
+
+S6 built the Grasm compiler with itself and found it a fixed point at the
+first attempt (docs/self-hosting.md §6.14): nothing failed to compile, link
+or run, and no artifact differed between stages or between two builds of one.
+What it found is one thing an artifact carries that §3's "no paths" says it
+should not.
+
+**An object names the directory it was compiled in -- *open, S4, in
+compiler/s3*.** `s3` writes `$PWD` into every object as DWARF's compile
+directory (`DW_AT_comp_dir`), so one TIR compiled in two directories makes two
+objects that differ in that string and in every offset after it:
+
+```
+cd /a/grasm && s3 p.tir -o /tmp/1.o
+cd /b/grasm && s3 p.tir -o /tmp/2.o     # same p.tir, same sources
+cmp /tmp/1.o /tmp/2.o                   # differ, in __debug_str
+```
+
+The executables do not carry it -- the linker writes no debug map -- so stage
+2 built from a copy of the sources at another path has the same four
+executables and the same TIR, and objects that differ only there; the
+`fixpoint` and `stagediff` gates build every stage from the checkout's root
+for this reason. Two builders in two directories get the same programs and
+not the same objects. The poisoned runtime's object, built from a copy of
+`compiler/rt`, carries that copy's path the same way, in its TIR's file
+lines too. The fix is a compile directory the build names rather than the
+process's (`-fdebug-prefix-map`'s job in clang), with `objtest`'s line-table
+checks run against it; not done in S6, which changes no output of the
+compiler.
 
 ## Found on 2026-10-31 by S2 part three (the diagnostics in Grasm)
 

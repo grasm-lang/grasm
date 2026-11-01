@@ -2653,9 +2653,322 @@ cannot reproduce (a hash order); `front tir`'s empty output for a TIR of 4 GB;
 and everything past `check` a command does on its own -- `deps`, the
 lockfile, `fmt`, `lint` -- which is S8's.
 
+### 6.14 S6: self-compilation
+
+Written 2026-11-01. The Grasm compiler, built by the Rust one, builds itself,
+and what it builds builds the same bytes again: stage 3 is stage 2.
+
+**What "the compiler" is at this stage.** Not the `grasm` command, whose
+seventeen subcommands are S8, but the pipeline the gates already drive from a
+source file to a running program -- four programs:
+
+| program | what it does | Grasm it is compiled from, packages included |
+|---|---|---:|
+| `compiler/front` | source to TIR (`front tir`), and the frontend's other commands (`check`, `tokens`, `ast`, `cst`, `files`, `toml`) | 25,561 lines, 21 modules |
+| `compiler/s3`, with `compiler/mir`, `compiler/aarch64` and `compiler/macho` | TIR to a Mach-O object; with `--runtime`, the runtime's | 17,242 lines, 21 modules |
+| `compiler/link` | objects to a signed executable | 6,238 lines, 21 modules |
+| `compiler/rt` | the runtime every program links, the object `s3 --runtime` makes | 19,121 lines, 44 modules |
+
+68,162 lines in all. Those four, because together they take a program from
+source to a running binary with nothing else on the way -- `front tir P.gr >
+P.tir`, `s3 P.tir -o P.o`, `link -interpose rt.o P.o -dead_strip -o P` -- and
+no fewer do. What strings them together is a shell function
+(`scripts/lib/stages.sh`) where `grasm build` will be; that driver is S8's.
+`tools/tirinterp`, the TIR interpreter (7,076 lines), is built beside them
+the same way, because `frontsmoke` takes it, and is compared like them; it is
+not part of the compiler. The largest program built natively before S3 was
+about 15,000 lines in 19 packages (§2); `compiler/front` alone is 25,561.
+
+**The stages** (`scripts/lib/stages.sh`):
+
+- **Stage 1**: `front`, `s3`, `link` and `tirinterp`, each built by the Rust
+  `grasm build --native --no-incremental` with `GRASM_LINKER=cc` --
+  Cranelift, the Rust runtime, the system linker. It has no runtime of its
+  own: its programs run on the Rust one.
+- **Stage 2**: every program built by stage 1 alone. Stage 1's `front` makes
+  each program's TIR, stage 1's `s3` its object and the runtime's -- and the
+  poisoned runtime's, which the use-after-free runs link (`rt.poison`, from a
+  copy of `compiler/rt` whose `build.gr` says so, as `scripts/lib/rtswap.sh`
+  makes it) -- and stage 1's `link` the executable, with that runtime and
+  nothing else: `-interpose rt.o` and no runtime archive on the line, so
+  every runtime name a program uses binds to the Grasm runtime or the link
+  fails. No Rust runtime, no `cc`, no `grasm`. Neither stage 1's nor stage
+  2's `front`, `s3` and `link` import `exec`, `fork`, `spawn`, `system` or
+  `popen` (`nm -u`): they cannot start a process, so nothing like `cc` can be
+  on the path.
+- **Stage 3**: the same with stage 2's programs.
+
+**Step one: stage 2 exists.** It built at the first attempt, and so did stage
+3: no TIR the Grasm frontend refused, no construct the backend lacked, no
+symbol the linker could not resolve, no runtime entry missing. Nothing in the
+compiler was changed for it and nothing in the programs it compiled, so there
+was nothing of that kind to record. Why it went so smoothly was not measured;
+the backend, the linker and the runtime had each been held to every corpus
+program with a `main` (`s3subset`, `linktest`, `rtswap`), and `frontsmoke` had
+taken 47 programs from `compiler/front` through `s3` and `grasm-link`.
+
+**Step two: stage 2 is right.** Every gate that takes the Grasm toolchain's
+binaries ran with stage 2's, through `scripts/withstage.sh` (below): stage 2's
+`front` makes every TIR they make, its `s3` every object, its `link` every
+link they make with `compiler/link`, and what the Grasm backend writes is
+linked by stage 2's `link` with stage 2's runtime alone. What they compare
+against is what it is on the stage-1 path: `grasm tir`, `grasm check`, `grasm
+run`, the Cranelift build as it ships, ld-prime, `clang`. 2026-11-01, on this
+branch, the kept stage 2 of `fixpoint` (whose digests are below), beside the
+same gates on the stage-1 path and other work, at a one-minute load average
+between 3 and 61:
+
+| gate | what of stage 2 it runs | with stage 2 |
+|---|---|---|
+| `tokentest` | `front` | 1,974 files identical, 4,111,888 tokens |
+| `asttest` | `front` | 1,974 ASTs identical, 1,974 CSTs printed back |
+| `parsediag` | `front` | 1,495 programs: 701 the Rust parser refuses, the same first diagnostic for all 701; 794 accepted by both |
+| `fuzz_front` | `front` | 1,500 of 1,500 agreed, 1,264 with diagnostics |
+| `loaddiff` | `front` | 1,737 programs: 1,671 the same modules (5,403), 64 loaded and refused by both, 2 unloadable by both, none disagreeing |
+| `tomldiff` | `front` | 1,446 manifests read alike by the three readers |
+| `tirdiff` | `front` | 1,974 files: 1,907 the same TIR (6,593 modules, 452,610,978 bytes), 67 refused by both, none disagreeing; 190 emitted twice, none unstable |
+| `tirrefuse` | `front` | 895 programs: 582 refused by both, 313 the same TIR, none disagreeing |
+| `fuzz_tir` | `front` | 700 programs: 434 the same TIR, 266 refused by both, none disagreeing |
+| `diagdiff` | `front` | 4,244 programs: 1,437 refused with the same output (the 66 conformance negatives among them), 2,807 accepted by both, none differing; 114,791 diagnostics and 36,163 help lines compared; the 67 package cases and the 674 long chains the same |
+| `fuzz_diag` | `front` | 2,200 of 2,200 the same output (seed 3), 7,565 diagnostics and 2,476 help lines compared |
+| `frontsmoke` | `front`, `tirinterp`, `s3`, `link`, `rt` | 47 of 47 through `tirinterp` and 47 of 47 compiled, linked on the runtime alone and run, each as `grasm run` |
+| `encodetest` | `s3` | 106 forms, 6,416 encodings identical to `clang`'s |
+| `s3subset` | `front`, `s3`, `link`, `rt` | 648 of 648 identical to the Cranelift build |
+| `objtest` | `front`, `s3` | 648 objects and the 2 runtime objects reproducible, 108,370 literal loads on their lines, no problem |
+| `linktest` | `link`, with `front` and `s3` for its Grasm-backend half | 651 programs from the Cranelift objects (SDL ones included) and 648 from the Grasm backend's, each running as its `cc` link does, and the 3 C fixtures: 2,604 links, each made twice and the same |
+| `linkdiff` | `link`, `front`, `s3` | 168 of 168 the bytes the native build ships; tools and sections agree on all 168, the 3 fixtures and the whole runtime |
+| `rtswap` | `link`, `rt`, `rt.poison`, `s3`, `front` | 648 of 648 identical on the Rust runtime and on stage 2's alone, all 323 runtime names from Grasm; 648 agreeing with no use after free on the poisoned builds; 648 of 648 of the Grasm backend's objects |
+| `rtdialect` | `front`, `s3`, `link` | 2 of 2 runs, 5 of 5 checks |
+| the 16 `fuzz_rt*` gates | `link`, `rt` (their probes are Cranelift builds) | every seed identical on both runtimes, in each of the 16 |
+| `tirinterp` | `tirinterp`, `front` | 651 of 651 programs run as `grasm run` runs them, 1,671 TIRs read and printed back the same, 25 of 25 sandbox panics the same |
+| `s3rc` | `front`, `s3` (with `S3_LINKER` unset, so its poisoned links are the Rust runtime's) | 623 leak-free and 648 clean under the poisoned runtime, no use after free |
+| `leakcheck`, `usecheck`, through `scripts/rtwith.sh` | `link`, `rt`, `rt.poison` | 623 leak-free, none leaking (25 end before the check); 648 clean under stage 2's poisoned runtime |
+| the 21 generators with the Grasm backend as an engine (`fuzz_builder` to `fuzz_tls`, and `fuzz_s3`) | `front`, `s3`, `link`, `rt` | all 21 pass. 17 passed at once; four lost a binary to SIGKILL at loads of 2 to 67 and passed when rerun -- in three a reference (20 Cranelift binaries in `fuzz_captures` at a load of 43, one each in `fuzz_generics` and `fuzz_handlers`), in one a binary stage 2 built (`fuzz_fallible`'s seed 311, which its rerun, over the same seeds, ran and agreed on); `fuzz_generics` lost one more Cranelift binary on its first rerun, whose program runs to the same output when built again, and passed on its second. On the first runs 3,410 programs were offered to the Grasm backend through `scripts/lib/s3engine.py` and 3,407 agreed, 3,288 leak-checked, the other 3 being the comparisons a SIGKILL ended; `fuzz_s3` 60 of 60 identical |
+
+Each of them passed on the stage-1 path too: rerun on this branch (below),
+but for `leakcheck`, `usecheck` and the 20 generators other than `fuzz_s3`,
+which passed in the main checkout's run of the same morning on `07c50893`
+(this branch less S2 part three's frontend, which they do not use, and the
+`FRONT=` switch, which was unset). And `stagediff` (below) holds stage 1 to
+stage 2 directly: **every artifact the two compilers make of the corpus is
+the same bytes** -- the runtime and the poisoned runtime each makes; `front tir` of all 1,974 `.gr` files git tracks
+and the corpus holds, 1,907 the same TIR and 67 refused with the same
+diagnostics; and for all 760 programs with a `main` among them, 757 the same
+object and the same executable, with the 3 that link SDL set aside. So stage 2
+makes what stage 1 makes of the whole corpus.
+
+**Which gates of `scripts/allgates.sh` ran with stage 2, and which cannot
+yet.** The suite is 238 gates. With stage 2: the ones in the table
+above, and `fixpoint` and `stagediff`, which build their own stages. The rest:
+
+- *Takes a stage's binaries, not run with stage 2 here:* `ra_check`
+  (`S3=`), for the time: 56 minutes on the stage-1 path, of which most is
+  `s3` allocating under stress, so about three and a half hours on stage 2's.
+  Its allocation checker is part of `s3` and ran on every function of every
+  object stage 2 compiled above.
+- *Cannot take one, by design:* the seven mutation controls (`frontcontrols`,
+  `tircontrols`, `diagcontrols`, `s3controls`, `linkcontrols`, `rtcontrols`,
+  `rtdialectcontrols`) each build their own broken copy of a component with
+  `grasm build --native`. A control of the self-built compiler is a fault
+  planted in its source and carried through the stages, which is what
+  `fixpointcontrols` does.
+- *Use the Rust toolchain only:* everything else. They build and run programs
+  with `grasm build --native`, `grasm run`, `grasm check` or `grasm test` --
+  `difftest`, `leakcheck` and `usecheck` as the suite runs them, `agreetest`,
+  `nativegaps`, `reprotest`, `inctest`, `crosstest`, `wasmtest`, the package
+  gates and every `*diff` oracle gate, `gold`, `depth`, `panics`,
+  `northstar`, the generators' two other engines -- and the Grasm compiler
+  has no such commands until S8 (`front check` is the one it has, and
+  `diagdiff` holds it to `grasm check`); or they check `grasm tir`'s own
+  output (`tirtest`), a generated source file (`tirccall`), the Rust runtime
+  (`rtlayout`, which probes it), `compiler/rt`'s source through `grasm tir`
+  (`rtlint`), the Rust code (`clippy`, `unittests`), the formatter, the
+  linter and the grammar (`fmttest`, `linttest`, `gfmttest`, `grammar`), or
+  the tree and the gates themselves (`gatecheck`, `findings`, `litter`,
+  `sitefacts`, `site`).
+
+**On the stage-1 path**, on this branch the same day, every S2 to S5 gate
+and this stage's passed: `tokentest`, `asttest` (1,974 files each),
+`parsediag` (701 and 794), `fuzz_front` (1,500), `tomldiff` (1,446),
+`loaddiff` (1,671), `tirdiff` (1,907 the same TIR, 67 refused by both),
+`tirrefuse`, `fuzz_tir`, `diagdiff` (4,244), `fuzz_diag` (2,200),
+`frontsmoke` (47 and 47), `tirtest` (1,671 emitted, no holes), `tirinterp`
+(651), `frontcontrols` 8 of 8, `tircontrols` 8 of 8, `diagcontrols` 9 of 9;
+`s3subset` and `difftest` (648 each), `objtest` (648, 108,370 literal loads),
+`encodetest` (106 forms), `ra_check` (648 programs in 3,240 stressed runs,
+243,010 functions checked, 43,489 planted allocation errors caught),
+`s3rc` (623 leak-free, 648 clean under poison), `fuzz_s3` (60),
+`s3controls` 29 of 29, `inctest` (5 of 5), `reprotest` (160 built twice, none
+differing); `linktest` (651, 648 and 3), `linkdiff` (168), `linkcontrols` 9 of
+9; `rtswap` (648), `rtlayout` (148 of 149 constants measured and equal, one
+held to the source), `rtlint`, `rtdialect`, `rtcontrols` 80 of 80,
+`rtdialectcontrols` 5 of 5 and the 16 `fuzz_rt*` gates; `fixpoint` (48 of 48),
+`gatecheck` (after the one `grep -q` on a log in `withstage.sh`, which it
+refuses under `pipefail`, became `grep -c`), `fmttest` and `linttest`;
+`fixpointcontrols` 6 of 6 (below).
+
+**Step three: the fixed point.** Stage 3 is stage 2, byte for byte -- every
+executable, every object, every TIR, both runtimes -- at the first attempt,
+and each stage is the same bytes when built twice. Stage 3, 2026-11-01:
+
+| artifact | bytes | SHA-256 |
+|---|---:|---|
+| `front` | 1,504,040 | `6bf45168eabd60477bd1120ae243185a84853dcea171c85a6a2b8837f988f5a9` |
+| `s3` | 909,680 | `4fb60de7f6de7e8458ea5c029f475abab54bfffea0980d10aeac4cde95e9c481` |
+| `link` | 467,144 | `aa5c203476cd9550757434302a4f07d9d1a9dd332eb0beac2902f8bf58a85819` |
+| `tirinterp` | 608,168 | `b675cc84752c3c5cbea4855f70a47ba5ef46001a8439e2d1f6c73404e2678374` |
+| `rt.o` | 595,200 | `34fdb81c7123e91dda996a1676297d72f6143a7f586622c7c51792ee0bc019a5` |
+| `front.o` | 2,185,320 | `aeb5cef5a9b691f53b599ac1d718fa6773f8ec4a1b38d79743d10ababe406878` |
+| `s3.o` | 1,365,504 | `e103f9eff2bd89baf314b86bc02307a38ed7cc0c27c1a2c63b399095a1297238` |
+| `link.o` | 433,640 | `60eadc4cc9b1765949436ad9680aa7ac0f44f6367b3975d141d51377ed3f6bce` |
+| `tirinterp.o` | 575,816 | `ed6b7d507a4ee30da586f5e04050166cfa05f7214386023e38799cfb54bf0826` |
+
+`rt.poison.o` (598,168 bytes) is left out: it carries the path of the copy it
+was built from (below), so its digest belongs to one run. The objects carry
+the checkout's directory, so theirs hold only for a build from the one
+directory they were measured in; the executables' hold from any directory. Stage 1's binaries, Cranelift's code on the Rust runtime, are
+larger: `front` 2,083,208 bytes, `s3` 1,320,192, `link` 643,624, `tirinterp`
+867,208. And stage 2's outputs on the corpus are stage 3's: `stagediff` with
+the kept stage 2 and stage 3: 1,974 files' TIR or diagnostics, 757 objects
+and 757 executables of the 760 programs with a `main`, all the same; and
+each tool's process time within 0.3% (1.00x), as one binary's should be.
+
+**What a stage's bytes depend on**, found by building and comparing; each is
+why the gates build the way they do.
+
+- An object carries the directory it was compiled in -- `s3` writes `$PWD` as
+  DWARF's compile directory -- and its TIR the source paths it was given; so
+  two stages' objects compare only when built from one directory, as every
+  gate builds them, from the checkout's root. The executables carry neither:
+  no path is in any of them (`strings`), and stage 2 built by the same stage 1
+  from a copy of the sources at another path has the same TIR and the same
+  four executables, and objects that differ in that one string.
+- An executable carries its own file name: the ad-hoc signature's identifier
+  is the name it was written as, as ld's is, so two links of the same inputs
+  compare only under one name (`stagediff` writes both under one, as
+  `reprotest` does).
+- The poisoned runtime is built from a copy of `compiler/rt`, and its TIR and
+  object carry the copy's path; every stage of one run shares one copy.
+- Stage 2 does not depend on how stage 1 was built: a stage 1 linked by
+  `grasm-link` instead of `cc`, and one built by the Rust compiler as rebuilt
+  at `5ed6777f`, made the same stage 2 and stage 3 to the byte.
+- No hash order, address, clock or uninitialised byte reached an artifact:
+  every stage built twice is the same bytes, in each of four `fixpoint` runs,
+  and so is everything stage 2 and stage 3 make of the corpus.
+- `monotonic_nanos()` answers 0 at its first call in a process -- it counts
+  "since an unnamed moment" ([L-LIB-CLOCK]), and the moment is that call --
+  so a planted clock has to read `now_millis()`, as `fixpointcontrols` does.
+
+**The gates.**
+
+- `fixpoint`: builds stage 1, stage 2 twice by stage 1 and stage 3 twice by
+  stage 2, and compares every artifact a stage holds -- each runtime's TIR
+  and object, each executable's TIR, object and executable, sixteen -- three
+  ways: the two stage 2s and the two stage 3s with each other, where a
+  difference is a compiler that answers one input two ways
+  (NONDETERMINISTIC, named by whose compiler it is, Cranelift's build or our
+  own), and stage 3 with stage 2, where a difference from a deterministic
+  stage 2 is NOT A FIXED POINT: a miscompile that only compiling the compiler
+  shows. Objects are compared and not only executables, because an object
+  holds a line table the executable does not. It holds stage 2's six TIRs,
+  which stage 1's `front` made, to `grasm tir`'s; asserts the count compared
+  (48, derived from the stages' lists) and that the four programs of the
+  compiler are among them; and prints each build's cost and stage 3's sizes
+  and SHA-256s. About eight minutes.
+- `stagediff`: two compilers' output on the corpus, byte for byte -- stage 1
+  against stage 2 by default, built there, or any two kept stages
+  (`STAGE_A=`, `STAGE_B=`). The runtime and the poisoned runtime each makes
+  (TIR and object); `front tir` of every corpus program and every `.gr` file
+  git tracks -- exit status, TIR and diagnostics; for every program with a
+  `main` both accept, `s3`'s answer and object; and the executable each
+  compiler's `link` makes of its own object with its own runtime. Nothing is
+  run; whether the programs are right is the other gates' question. Floors:
+  1,800 files' TIR and the subset's 620 executables. 43 minutes for stage 1
+  against stage 2 and 71 for stage 2 against stage 3, two programs at a time
+  at loads of 4 to 21.
+- `fixpointcontrols`: four faults planted in a copy of the compiler's
+  sources, all caught, six checks in all -- `s3` writing the clock into every
+  object (NONDETERMINISTIC, stage 1's compiler run twice); `s3` writing a
+  program's functions in the order of a hash seeded by `random_bytes`, as a
+  hash table seeded per process iterates (the same); `s3` compiling the
+  function `main::file_line` with every 1 that is added made 2 -- a function
+  only `s3` itself has, the one that finds a line for the line table (NOT A
+  FIXED POINT, with nothing nondeterministic) -- with two more checks of that
+  one: stage 1 with the fault compiles 62 of 62 sampled corpus programs to
+  the bytes it does without it and stage 3's executables are stage 2's, so
+  only the objects' line tables show it, and `stagediff` of stage 1 against
+  stage 2 finds 20 of 20 sampled programs' objects differing; and the gate
+  told to leave its last comparison out (compared 47 of 48).
+- `scripts/withstage.sh <gate>` runs any gate with every binary of the Grasm
+  toolchain it takes being a stage's -- stage 2 built there, or the stage
+  `STAGE=` names: `FRONT`, `TIRINTERP`, `S3`, `LINK`, `RT_OBJ` and
+  `RT_OBJ_POISON`, and as `S3_LINKER` and `LINKER` `scripts/lib/stage_link`,
+  which links what the Grasm backend wrote with the stage's `link` and the
+  stage's runtime alone. What the gate compares against is left as it is.
+  First it takes `examples/hello.gr` through the stage and stops unless that
+  runs as `grasm run` runs it with every runtime name from the stage's
+  runtime.
+- The switches the gates lacked: the S3 gates' TIR (`scripts/s3_collect.py`),
+  `objtest`'s runtime objects, `rtdialect`'s fixture, the S5 gates' runtime
+  build (`scripts/lib/rtswap.sh`), the generators' third engine
+  (`scripts/lib/s3engine.py`) and `fuzz_s3` make their TIR with `$FRONT tir`
+  when `FRONT=` names a frontend; `tirinterp` takes `TIRINTERP=` and `FRONT=`.
+
+**Cost.** Each stage's build, every step timed as `fixpoint` times it (wall
+time, `/usr/bin/time -l`'s peak memory): three rounds, the stages interleaved
+(1, 2, 3; then 3, 2, 1; then 1, 2, 3), the median of each step, 2026-11-01
+18:56-19:10 with nothing else of this work running and a one-minute load
+average of 4.6 to 6.2 from other work on the machine -- so not to be quoted.
+The three `fixpoint` runs of that day, at loads of 3 to 25, gave the same
+totals to within 2%. Each program's steps added up, and the largest peak of
+any of them:
+
+| program | stage 1 (Rust `grasm build`) | stage 2 (by stage 1) | stage 3 (by stage 2) | stage 3 / stage 2 |
+|---|---:|---:|---:|---:|
+| `front` | 4.35 s, 126 MiB | 14.00 s, 176 MiB | 53.55 s, 169 MiB | 3.83x |
+| `s3` | 1.44 s, 88 MiB | 6.05 s, 141 MiB | 24.69 s, 130 MiB | 4.08x |
+| `link` | 0.66 s, 57 MiB | 2.07 s, 58 MiB | 7.65 s, 57 MiB | 3.70x |
+| `tirinterp` | 3.51 s, 54 MiB | 6.52 s, 75 MiB | 20.91 s, 72 MiB | 3.21x |
+| `rt` | -- | 9.73 s, 103 MiB | 37.23 s, 102 MiB | 3.83x |
+| `rt.poison` | -- | 9.63 s, 104 MiB | 37.35 s, 103 MiB | 3.88x |
+| **all**, median of the rounds' totals | **9.9 s**, 126 MiB | **48.2 s**, 176 MiB | **181.3 s**, 169 MiB | **3.76x** |
+
+Stage 2 and stage 3 do the same work -- the same inputs, the same bytes out
+-- so the last column is the price of our backend's code against Cranelift's
+on the compiler's own work: by tool, `front tir` 3.75x (35.8 s against 134.4
+s), `s3` 3.97x (11.0 s against 43.5 s), `link` 2.87x (1.2 s against 3.4 s).
+On the corpus `stagediff` measured the same, two programs at a time at a
+load of 3.9 rising to 21: `front tir` 3.66x (842 s of process time against
+3,079 s), `s3` 2.41x (243 s against 586 s), `link` 3.12x (63 s against 197
+s); stage 2 against stage 3 there, the same binary twice, 1.00x. Where the gap comes from was not measured. The four
+executables take the Rust compiler 9.9 s, stage 1 28.6 s (2.9x) and stage 2
+106.8 s (10.8x); the two runtimes, which the Rust compiler does not build,
+19.4 s and 74.6 s more. Peak memory stays under 180 MiB at every stage. The
+binaries' sizes are in step three's table.
+
+**S6's exit.** §6 asks for stage 2 and stage 3 bit-identical, and every gate
+passing with stage 2 as the compiler. The first is met, held by `fixpoint`
+and its controls. The second is met for every gate that can take the compiler
+but `ra_check` -- each one in the table -- and stage 2 is stage 1, artifact
+for artifact, on the whole corpus. What is left is the rest of the suite: the gates that build,
+run, check or test through the `grasm` command, whose subcommands are S8; the
+mutation controls, which build their own broken components with Rust's `grasm
+build`; and `ra_check`, not yet run with stage 2's `s3`. Found and not fixed,
+in docs/known-issues.md: an object names the directory it was compiled in, so
+the fixed point holds for builds from one directory (the executables from
+any). Until S8 the Rust `grasm` stays stage 0 and the driver of everything
+the Grasm compiler does not yet do.
+
 ## 7. Bootstrap and trust
 
-- **During the migration:** stage 0 is the Rust-built `grasm`.
+- **During the migration:** stage 0 is the Rust-built `grasm`. S6 names
+  the stages after it (§6.14): stage 1 is the Grasm compiler --
+  `compiler/front`, `compiler/s3`, `compiler/link` and the runtime
+  `compiler/rt` -- built by stage 0 with Cranelift, the Rust runtime and the
+  system linker; stage 2 is that compiler built by stage 1 alone, on its own
+  runtime; stage 3 is built by stage 2, and `fixpoint` holds it to stage 2's
+  bytes. What stage 0 is did not change: it is the Rust `grasm` until the
+  cutover, and builds nothing of stage 2 but stage 1.
 - **After the cutover:** stage 0 is a pinned previous release, its SHA-256
   in the repository. Policy as Go's: release 1.N builds with release
   1.(N-1) or later, so any commit builds from a downloadable binary.
@@ -2687,7 +3000,9 @@ walk against the Rust runtime's) (§6.9), `loaddiff` (the module graph
 against the Rust loader's), `tomldiff` (every manifest read by
 `packages/toml`, the Rust reader and `tomllib`), `tirrefuse` (what the Rust
 frontend refuses, the Grasm one refuses), `fuzz_tir`, `frontsmoke` (front to
-binary through Grasm alone) and `tircontrols` (§6.10), `fixpoint` (stage 2 = stage 3), `ddc`,
+binary through Grasm alone) and `tircontrols` (§6.10), `fixpoint` (stage 2
+= stage 3), `stagediff` (two stages' output on the corpus) and
+`fixpointcontrols` (§6.14), `ddc`,
 `selfperf` (compile speed and benchmark budgets), and the existing fuzzers
 pointed at each new component. Every new gate ships with controls showing
 it fails on a planted fault.
@@ -2958,10 +3273,31 @@ Measured, not estimated; each line is a gate's result on master.
   on the generated files that measured the Rust frontend's 365-400k (390-450k
   today), measured under load and not to be quoted. Open: `front tir`
   prints nothing for a TIR of 4 GB.
-- **Not started:** S6 (self-compilation), S7-S9.
+- **S6 done but for the gates that need S8** (§6.14): the Grasm compiler --
+  `compiler/front`, `compiler/s3`, `compiler/link` and the runtime
+  `compiler/rt`, 68,162 lines -- built by the Rust one (stage 1) builds
+  itself (stage 2) with no Rust runtime, no `cc` and no `grasm` on the way,
+  and stage 2 builds a stage 3 that is the same bytes: every executable,
+  object, TIR and runtime, at the first attempt, with nothing in the compiler
+  changed for it. `fixpoint` holds stage 3 to stage 2 and each stage to
+  itself built twice, 48 artifacts; `stagediff` holds stage 2's output on
+  the corpus to stage 1's and stage 3's to stage 2's -- 1,974 files' TIR or
+  diagnostics, 757 objects and 757 executables, the same bytes -- and
+  `fixpointcontrols` catches its four planted faults (six checks). Every gate
+  that takes the Grasm toolchain's binaries but `ra_check` passed with stage
+  2's (`scripts/withstage.sh`): the S2 frontend gates, the S3 backend gates,
+  the S4 linker gates, the S5 runtime gates with `leakcheck` and `usecheck`,
+  `tirinterp` and the 21 generators with the Grasm backend as an engine. The
+  gates that build, run, check or test through the `grasm` command cannot take
+  it until S8. One thing found and not fixed: an object names the directory it
+  was compiled in. Building the compiler takes 48 s by stage 1 and 181 s by
+  stage 2 -- our backend's code 3.8 times Cranelift's on the compiler's own
+  work -- measured under load and not to be quoted.
+- **Not started:** S7-S9.
 
-With S4 done, S6 waits on S3's last steps and on S2 and S5, the frontend
-and the runtime in Grasm; they come next, one stage at a time.
+S7 and S8 come next. S8 is also what S6's exit leaves: the `grasm` command's
+subcommands in Grasm, so that the gates which build, run, check and test
+through it can take the self-built compiler too.
 
 ## References
 
