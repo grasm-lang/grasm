@@ -5,11 +5,202 @@ Every defect that is known and not fixed, with its severity from
 to paste. S1 and S2 block a release; S3 and S4 do not, and this file is what
 makes shipping them honest rather than quiet.
 
-**Open S1: none confirmed; one under investigation. Open S2: none. Open
-S3: two, a block whose value is a map literal and a statement `if` whose
-branches' values differ, refused natively. Open S4: two, a nested
-interpolation's spans and a backslash at the end of a file. Latent: one,
-the Rust runtime's region sweep, which no compiled program reaches.**
+**Open S1: one, a `^` chain of 100,000 terms aborting `grasm check`; one
+under investigation; and one in `compiler/front`, which no release ships
+yet, `front tir` printing nothing for a TIR of 4 GB. Open S2: none. Open S3:
+two, a block whose value is a map literal and a statement `if` whose
+branches' values differ, refused natively. Open S4: eight, a nested
+interpolation's spans, a backslash at the end of a file, and six in `grasm
+check`'s diagnostics: carets placed by bytes, "did you mean" in hash order,
+a type shown as `_`, a contract's row breach reported twice, a ceiling
+refusal without its reason, and a `match`'s names unbound after an error.
+Latent: one, the Rust runtime's region sweep, which no compiled program
+reaches.**
+
+## Found on 2026-10-31 by S2 part three (the diagnostics in Grasm)
+
+Each was found by holding `front check` to `grasm check` byte for byte
+(`diagdiff`, `fuzz_diag`). All but one are in the Rust frontend, which S2
+does not change, and none is fixed there: where its output is deterministic
+the Grasm frontend reproduces it, so the two stay comparable and are fixed
+together, and the one that is not deterministic it cannot reproduce. The
+other is in `compiler/front` itself.
+
+**A `^` chain is not charged to the nesting cap, and a long one aborts
+`grasm check` -- *open, S1*.** [G-NEST-LIMIT] counts a folded operator as one
+level and promises a diagnostic past the cap, never a crash. The Rust parser
+charges a `??` chain ("code is nested too deeply" past 2048) and does not
+charge a `^` chain or an `else if` chain, which it parses in a loop: `let x =
+2 ^ 2 ^ ... ^ 2` with 6,000 terms is accepted, and with 100,000 `grasm check`
+dies with "fatal runtime error: stack overflow, aborting" (exit 134) --
+`grasm ast` parses it, so it is the checker's recursion down the right-nested
+tree that exhausts the 256 MiB stack, somewhere between 50,000 terms (still
+accepted) and 100,000. An `else if` chain of 100,000 is checked. The Grasm
+parser makes the same decisions, so it accepts both chains too, and
+`compiler/front` checks the 100,000-term chain: `front check` says `ok`, or
+the program's own diagnostics, where `grasm check` aborts (next entry).
+
+**`compiler/front` exhausted its recursion budget on a long `^` or `else if`
+chain -- *closed, S1, in compiler/front*.** The checker recursed down a
+right-nested `^` chain and down an `else if` chain as the Rust one does, and
+a native Grasm thread stops a recursion 6 MiB down ([E-RECURSION-DEPTH]), so
+`front check` and `front tir` panicked with "stack overflow: recursion too
+deep" (exit 101) on a `^` chain of about 3,700 terms or more (3,500 was
+checked, 4,000 was not) and an `else if` chain of a few thousand (4,000 with a
+bound condition was checked, 6,000 was not), where `grasm check` accepts them.
+Found by `fuzz_diag`'s run at 22,000 programs (seed 101): two copies of one
+6,000-term `^` chain from `fuzz_front`'s deep generator. The parser and the
+AST builder iterate these shapes (§6.8); the checker's binary operators and
+`if` did not, and the effect pass's walks survived 6,000 terms and overflowed
+at 20,000.
+
+Closed 2026-11-01 without touching the cap or the thread's stack. `infer_expr`
+and `check_expr` hand an arithmetic operator and an `if` to `sema.spine`, which
+makes the same calls in the same order with the right operand or the `else if`
+on a work stack and the rest of the node's work in a frame; `emit.expr` does
+the same for TIR, and `emit.write` prints the node tree from a stack; and every
+other walk `front check` and `front tir` make over an expression (the effect
+rows and the effect pass, the ceilings' effect sites, the checker's predicates
+on branches) walks the right operand and the `else if` in a loop. `front
+check` now agrees with `grasm check` on both chains at 6,000, 20,000, 50,000
+and 100,000 terms (the `^` chain at 100,000 excepted, where `grasm check`
+aborts and `front check` answers), in fifteen positions -- a binding, a
+function's last expression, a `return`, an argument, an interpolation, a
+fallible function, a closure, a `while` condition, a `parallel` block, a test,
+a constant, a `match` arm, a float chain, an annotated binding, a type error
+-- and `front tir` with `grasm tir` at 3,000 and 6,000 terms (both) and
+20,000 (`^`). `diagdiff` holds both chains at 6,000, 20,000 and 50,000, and
+their TIR at 6,000.
+
+**`front tir` printed nothing for a TIR of 4.0 GB -- *open, in
+compiler/front*.** An `else if` chain of 20,000 terms has a TIR of 4,003,372,658
+bytes -- each level is indented one step further, so the text grows with the
+square of the chain -- which `grasm tir` prints, and `front tir` printed one
+empty line and exited 0. The `^` chain of 20,000 (about 800 MB) is printed
+alike by both. Not investigated: the likely place is a string past 2^31 bytes
+in `cmd_tir`'s copies or in the runtime's output. The gates compare TIR up to
+361 MB.
+
+
+
+**A caret is placed by bytes on a line of characters -- *open, S4*.**
+
+```
+fn main() {
+    let s = "héllo" + nope + "wörld" + also
+}
+```
+
+`grasm check` reports `nope` at column 24 and `also` at 42 -- byte columns --
+and pads the caret line with that many spaces, so the first caret sits one
+column right of `nope` and the second two right of `also`; and the carets are
+capped by the characters left on the line after a byte column, so `also`, at
+the end of the line, gets two carets for four letters. `Diagnostic::render`
+mixes the two units: `LineIndex::line_col` counts bytes and `window` cuts and
+counts characters. On a line longer than 120 characters the window is cut by
+characters around a byte column, so with forty two-byte characters before
+the span the caret lands forty columns past it. The quoted line also keeps a
+tab, under a pad of spaces, and a `\r` before its end. The Grasm frontend
+renders all of it the same way.
+
+**"did you mean" lists its candidates in a different order on every run --
+*open, S4*.** With `pub fn helper()` in each of `alpha.gr`, `beta.gr`,
+`gamma.gr` and `delta.gr`:
+
+```
+import alpha
+import beta
+import gamma
+import delta
+fn main() {
+    print(helper())
+}
+```
+
+eight runs of `grasm check` gave seven orders of `` `alpha.helper` or
+`beta.helper` or ... `` in the help of "unknown name `helper`". The
+candidates come from the module's import table, a `HashMap`. The Grasm
+frontend lists them by alias; with one candidate the two agree, and with two
+or more no byte-for-byte comparison can be made. No program in the
+repository, the Rust test suites or the fuzzers' output has two.
+
+**A diagnostic names a type the checker knows as `_` -- *open, S4*.**
+
+```
+fn add1(n: i64) -> i64 {
+    n + 1
+}
+
+fn dbl(n: i64) -> i64 {
+    n * 2
+}
+
+fn main() {
+    let add1 = [dbl, add1]
+    let xs = [add1, dbl]
+    let y = xs[0](3)
+}
+```
+
+says "`[_]` is not callable" of a value whose type is `[fn(i64) -> i64]`
+(the line before, "expected `[fn(i64) -> i64]`, found `fn(i64) -> i64`",
+names it in full). The callee's type is resolved only at its top before it is
+displayed, so every variable inside it shows as `_` whether or not it is
+bound; "cannot iterate over", "cannot index into" and "`try` applied to a
+value that cannot fail" display the same way. Found by `fuzz_diag`, in a
+generics program one renamed identifier from well typed. The Grasm frontend
+displays these types the same way (`tys.show_shallow`).
+
+**A function with a contract reports its declared row's breach twice --
+*open, S4*.**
+
+```
+fn loud(n: i64) -> bool {
+    print("checking")
+    n > 0
+}
+
+fn f(n: i64) -> i64 / {}
+    requires loud(n)
+{
+    print("body")
+    n
+}
+```
+
+prints "function `f` performs effect(s) `io` not in its declared row" twice,
+at the same span and with the same help, and counts it twice in "N error(s)
+found": the function and the body its contracts are lowered around
+(`f@body`) each carry the declared row, and each is reported under the
+source name. The Grasm frontend reports both.
+
+**"cannot check the capability ceiling" does not say why -- *open, S4*.** A
+dependency declaring `capabilities = []` with one source file that does not
+parse -- `lib/tests/broken.gr` holding `fn t( {` -- refuses every consumer
+with "cannot check the capability ceiling of `lib` — refusing to build
+against a dependency whose reach is unknown" and nothing else. The reason,
+with the file and its first diagnostic, is computed (`first_failure`,
+"`lib/tests/broken.gr` — expected ...") and dropped by
+`check_dependency_ceilings`. The Grasm frontend prints the same line.
+
+**A `match` on a value whose type is an error does not bind its arms' names
+-- *open, S4*.**
+
+```
+fn main() {
+    let s = "abc"
+    match s.nope() {
+        Some(i) -> print("{i + 1}")
+        None -> ()
+    }
+}
+```
+
+reports "no method `nope` on `str`" and then "unknown name `i`" with the
+help "check the spelling, or declare it with `let` first" -- of a name the
+pattern declares. Only the `match` cascades; `for x in nope()` and
+`let (a, b) = nope2()` report the unknown function alone. The Grasm frontend
+reports both.
 
 ## Found on 2026-10-28 by S5 part four (the rest of the runtime, in Grasm)
 
@@ -376,7 +567,11 @@ be in the entry file, so a type error there is reported in the entry file
 (`main.gr:1:8` for one in `lib.gr`), and the checker's facts for those nodes,
 kept by span, are filed under the same keys as any node of the entry module
 at those offsets. Six programs in the repository have such an interpolation
-in an imported module; `compiler/front` reproduces the spans there too.
+in an imported module; `compiler/front` reproduces the spans there too. S2
+part three found the same of the parser's diagnostics: an expression missing
+inside such an interpolation in `lib.gr` is "expected an expression but found
+end of file" at `main.gr:1:8`, under the entry file's first line, before the
+right diagnostic in `lib.gr` -- and `compiler/front` renders both.
 
 **A backslash at the end of a file is "unknown escape `\\0`" -- *open,
 S4*.** A file ending `"abc\` reports ``unknown escape `\\0` `` -- the byte

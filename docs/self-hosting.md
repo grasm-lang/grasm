@@ -829,10 +829,16 @@ the LSP on the query engine, DAP, packages, journal and replay, `doc` and
 The manifest stays `grasm.toml`: self-hosting changes who reads it, not its
 format (decided 2026-10-26; a manifest in Grasm's own syntax, as Zig's
 `.zon`, would cost every TOML-aware tool and a migration of every package,
-and the language is frozen until S9). Its reader becomes `packages/toml` in
-place of `crates/grasm_pkg/src/toml.rs`, with a gate the package lacks
-today: every manifest in the repository, and fuzzed ones, parsed by both
-and by Python's `tomllib`, agreeing.
+and the language is frozen until S9). Until then the Rust toolchain is the
+oracle, so `compiler/front`'s loader reads manifests with `rtoml.gr`, a port
+of the Rust reader `crates/grasm_pkg/src/toml.rs`, and its diagnostics about
+a manifest are the Rust ones (§6.13); `packages/toml`, a reader of TOML
+itself, serves only `front toml`, which `tomldiff` holds to the Rust reader
+and to Python's `tomllib` on every manifest in the repository. S8 leaves
+exactly one reader: either `rtoml.gr` is promoted into `packages/toml`, or
+`packages/toml` replaces it in the loader, with `tomldiff` -- every manifest
+in the repository, and fuzzed ones, read by it and by `tomllib`, agreeing --
+held over the one that stays, so no two TOML readers survive the cutover.
 
 **S9. Cutover.** A release built entirely by stage 2; the DDC check
 published; Rust removed from the main branch and kept on the tag
@@ -2009,7 +2015,7 @@ answer differently: it compares directories by their text, collapsing `.`
 and `..`, where the Rust one asks the file system, so a symbolic link, or
 one directory named both relatively and absolutely in one package graph,
 could be two directories to it and one to Rust. No program in the
-repository does either.
+repository does either. (Part three made it ask the file system, §6.13.)
 
 ### 6.11 S5 part three: the runtime's state, the stateless families, fibers
 
@@ -2429,6 +2435,224 @@ one round in eight now also sorts 33 to 232 of each; `rtcontrols` adds
 `list-radix` (the sort stopped after its first byte) and `map-group-empty`
 (a tombstone read as empty), both caught by their fuzz.
 
+### 6.13 S2 part three: the diagnostics, and S2's exit
+
+`compiler/front` now says what the Rust frontend says: `front check P` prints
+what `grasm check P` prints -- stdout, stderr and the exit status, byte for
+byte. That is every diagnostic of the loader and the parser, or else of the
+checker and the effect pass, in Rust's order, each as `file:line:column:
+error: message` with its source line quoted, the carets under it and its
+help; the count line; then the capability ceilings' breaches with their
+help; or ``ok: `P` has no errors``. Before this the Grasm checker refused where
+the Rust one refused, in shorter words and with no help, as `error: <msg>
+@<start>:<end>`. `compiler/front` grew from about 22,950 lines of Grasm to
+24,500 (1,960 added, 410 removed):
+
+| file | what changed |
+|---|---|
+| `main.gr` | `front check`, with the argument checks `grasm` makes; `render` (`Diagnostic::render`, its window on a long line included) and `render_all` (`render_diags`: each diagnostic in the file that owns its span) |
+| `sema.gr`, `semcall.gr`, `semmeth.gr`, `sempat.gr`, `effcheck.gr` | a help beside every diagnostic that has one in Rust (about 170 sites), the messages that were shorter worded as Rust words them, the checker's and the effect pass's diagnostics sorted as `check_modules_in` sorts them |
+| `loader.gr` | the load diagnostics with their spans and help; "cannot load module" with every place it looked (`tried`, `candidates_in_package`); manifests read and checked as `Manifest::parse` checks them and the graph resolved as `grasm_pkg::resolve` resolves it, in their words; directories compared by asking the file system |
+| `rtoml.gr` | new: the Rust toolchain's own TOML reader, `grasm_pkg/src/toml.rs`, line for line |
+| `ceiling.gr` | a breach worded as `CapabilityViolation` displays it, with `ceiling_help`'s help and where each effect is performed (`effect_sites_of_package`) |
+| `parse.gr`, `tys.gr` | which parse diagnostics the Rust parser leaves unmoved by a module's base; a type displayed resolved only at its top |
+
+**Decision for decision.** The order is Rust's: the loader's and the parser's
+diagnostics in load order, unsorted, or else the checker's and the effect
+pass's together, sorted by start and stably, so two at one start keep the
+order they were made in. A diagnostic is made once per span and message, as
+`push_diag` makes it, except where the Rust checker pushes past that (a move
+in a loop, `own` and `inout` of one value in one call, the generic
+constructors and empty literals settled at the end), where the Grasm checker
+pushes too and prints the duplicate Rust prints. The rendering keeps Rust's
+mix of units: the column counts bytes, the caret pad is that many spaces, the
+carets are capped by the characters left on the quoted line, and a line past
+120 characters is cut by characters around that byte column. Where Rust shows
+a type resolved only at its top -- "`[_]` is not callable" -- so does the Grasm
+checker. An I/O error is worded as Rust's `io::Error` displays it, `No such
+file or directory (os error 2)`: the runtime's `IoError` carries the
+system's message, and its number is looked up in this system's table.
+
+**Manifests are read by the Rust toolchain's reader.** What `grasm check`
+says about a manifest is what `grasm_pkg/src/toml.rs` says: it reads line by
+line, takes a string, an integer, a boolean or a one-line array, refuses a
+float, an inline table or an array across lines, and words a refusal `line
+N: ...`. `packages/toml` reads TOML itself and answers otherwise on every one
+of those, so the loader now reads manifests with `rtoml.gr`, a port of the
+Rust reader, and checks them in `Manifest::parse`'s order and words: the
+`[package]` table, its name and version, the capabilities and links, the
+entry, `runtime`, each dependency's version and path, then the unknown keys
+of `[package]`, keys above the first header, unknown tables, a dependency's
+unknown keys, and last the name as an identifier. `packages/toml` stays the
+reader stage S8 moves the toolchain to, held to the Rust reader and to
+`tomllib` by `tomldiff`, and `front toml` still reads with it.
+
+**A directory is compared by asking the file system.** Part two's loader
+compared directories by their text, collapsing `.` and `..` (§6.10). It now
+calls `realpath(3)` where the Rust toolchain calls `std::fs::canonicalize`:
+the package graph's directories, `same_dir`, the registry's discovery and the
+"resolves to two different directories" message, which prints the canonical
+paths. That is an `extern fn`, so `compiler/front` declares `unsafe` in its
+manifest; it passes a `bytes` buffer for the answer, as `packages/termios`
+does, and needs no `mem`. A dependency reached by its real path and through a
+symbolic link was two packages to part two's loader and one to Rust; it is
+one to both now.
+
+**The gates.**
+
+- `diagdiff`: `front check` against `grasm check`, stdout, stderr and exit
+  status byte for byte, over the conformance negatives, the programs inline
+  in the Rust test suites, 67 package graphs `scripts/lib/diagcases.py`
+  writes -- a broken manifest, dependency, import or ceiling each, nothing in
+  the repository having one, and three that are right in an unusual way: a
+  dependency through a symbolic link and by its real path, one named
+  relatively and absolutely, an entry package through a link -- a `^` chain
+  and an `else if` chain (as a value and as statements) of 6,000, 20,000 and
+  50,000 terms each (`scripts/lib/chains.py`), with `front tir` against
+  `grasm tir` by digest for the 6,000-term ones, 700 programs `fuzz_tir.py
+  --emit` makes, and every corpus file and `.gr` file git tracks. Every negative and every case must give the same output, and
+  floors on refusals, rendered diagnostics, help lines, unrendered errors,
+  ceiling breaches and accepted programs keep a run that compared too little
+  from passing.
+- `fuzz_diag`: `fuzz_tir`'s ten generators, with one of its edits in more
+  than half the programs (half of the package graphs), and `fuzz_front`'s
+  generator for the parser, each program through both `check`s; the same
+  bytes, or the run fails. Every engine must be compared, enough refusals,
+  diagnostics, help lines and accepted programs seen, and the Grasm side's
+  output read for every program counted as agreeing.
+- `diagcontrols`: nine planted faults -- "unknown name" reworded, its span
+  one byte late, its help dropped, the checker's and the effect pass's
+  diagnostics left unsorted, a diagnostic added beside one, a ceiling
+  breach's `performed: ... at ...` dropped, the manifest reader's words
+  changed, the fuzzer taking every program as agreeing without running the
+  Grasm side, the fuzzer skipping an engine.
+- `tirspeed.py` times `check` as well as `tir` (`--command check`), and the
+  generated programs `docs/compile-speed.md` measured (`--generated`).
+
+**What they found, 2026-11-01**, 04:59 to 06:10, on this branch rebased on
+`07c50893` with the main checkout's compiler as rebuilt at 04:56, a targeted
+suite running beside them, the one-minute load average between 2.4 and 5.1:
+
+| gate | result |
+|---|---|
+| `diagdiff` | 4,244 programs (66 conformance negatives, 829 from the Rust test suites, 67 package cases, 674 long chains and deep shapes, 700 from `fuzz_tir`, 1,908 from the corpus): 1,437 refused with the same output, all 66 negatives, all 67 cases and all 674 chains among the programs that agree; 2,807 accepted by both; 0 differ; 0 Rust panics; 114,791 rendered diagnostics, 36,163 help lines, 81 unrendered errors and 30 ceiling breaches compared; the two 6,000-term chains' TIR the same |
+| `fuzz_diag` | 2,200 programs (the gate's size, seed 3): 2,200 the same output, 1,142 refused and 1,058 accepted, 7,565 diagnostics and 2,476 help lines compared; once at 22,000 (seed 101): 22,000 the same, 11,510 refused and 10,490 accepted, 68,533 diagnostics and 34,991 help lines -- where, before the checker walked its chains on a stack (below), 2 had differed |
+| `diagcontrols` | 9 planted faults, 9 caught, each by its gate and for its reason |
+
+Part one's and part two's gates, run again over the larger frontend:
+`tokentest` and `asttest` 1,974 of 1,974 files identical (4,111,888 tokens;
+every CST printed back), `parsediag` 701 refusals with the same first
+diagnostic and 794 accepted by both, `fuzz_front` 1,500 of 1,500,
+`frontcontrols` 8 of 8; `loaddiff` 1,671 of 1,737 programs loading the same
+modules, the rest refused by both; `tomldiff` 1,446 files read alike by the
+three readers; `tirdiff` 1,974 files, 1,907 the same TIR and 67 refused by
+both, none disagreeing, 190 emitted twice and stable; `tirrefuse` 582 refused
+by both and 313 the same TIR of 895; `fuzz_tir` 700 programs, 434 the same
+TIR and 266 refused by both; `frontsmoke` 47 of 47 through `tirinterp` and
+through s3 and grasm-link; `tircontrols` 8 of 8; `tirtest` 1,671 emitted,
+no holes; `gatecheck`, `fmttest` (1,968 formatted, none not), `linttest`
+(none broke) and the litter check (no new untracked file, no new top-level
+entry) clean.
+
+**What it found about the Rust frontend.** Seven defects, and one more fact
+about one already recorded, each in docs/known-issues.md with a reproducer
+and none fixed in Rust. The Grasm frontend reproduces the six that are
+diagnostics, so the two stay comparable and are fixed together; it cannot
+reproduce a hash order, and where the Rust checker crashes it answers:
+
+- a `^` chain is not charged to [G-NEST-LIMIT]'s cap, and one of 100,000
+  terms aborts `grasm check` with a stack overflow (S1);
+- a caret is placed by bytes on a line of characters, under a pad of spaces
+  beside a tab, and past its span on a long line (S4);
+- "did you mean" lists its candidates in hash order, different on every run
+  -- the one the Grasm frontend cannot reproduce: it lists them by alias, and
+  nothing in the repository, the Rust tests or the fuzzers' output has two
+  (S4);
+- a type the checker knows is shown as `_` (S4);
+- a function with a contract reports its declared row's breach twice (S4);
+- "cannot check the capability ceiling" drops the reason it computed (S4);
+- a `match` on a value whose type is an error reports its arms' own names as
+  unknown (S4);
+- and, already recorded, a nested interpolation's spans: part three found
+  the parser's diagnostics there rendered against the entry file's first
+  line.
+
+**What it found about the Grasm frontend.** Before this part: one message
+misspelt (`ownv` for `own`), about 25 worded shorter than Rust's, no help
+anywhere, the ceilings' messages its own (`["io"]` for `` `io` ``), the
+loader's "cannot load module" naming the qualified module and not where it
+looked, the manifests read and worded otherwise, and a package through a
+symbolic link refused. The large fuzz run found one more: the checker recursed
+down a `^` chain and an `else if` chain as the Rust one does, and a native
+Grasm thread stops a recursion 6 MiB down, so `front check` and `front tir`
+panicked on a `^` chain of about 3,700 terms and an `else if` chain of a few
+thousand that `grasm check` accepts; the nesting cap counts neither chain
+(the parser iterates both, §6.8). Fixed without the cap or the stack:
+`infer_expr` and `check_expr` give an arithmetic operator and an `if` to
+`sema.spine`, which makes the same calls in the same order with the right
+operand or the `else if` on a work stack and the rest of the node's work in a
+frame; `emit.expr` does the same for TIR and `emit.write` prints from a stack;
+and every other walk over an expression -- the effect rows and the effect
+pass, the ceilings' sites, the checker's predicates on branches -- takes the
+right operand and the `else if` in a loop. Both chains now check alike at
+6,000, 20,000, 50,000 and 100,000 terms in fifteen positions (a binding, a
+function's last expression, a `return`, an argument, an interpolation, a
+fallible function's tail, a closure, a `while` condition, a `parallel` block,
+a test, a constant, a `match` arm, floats, an annotation, a type error),
+except a `^` chain of 100,000, which aborts `grasm check` and which `front
+check` answers. One more, open: `front tir` printed nothing for an `else if`
+chain of 20,000, whose TIR is 4.0 GB (docs/known-issues.md).
+
+**Speed.** Each program's whole `grasm check` against its whole `front check`
+(`scripts/tirspeed.py --command check`): processes, start-up included,
+alternating which runs first, five rounds, the median; lines are those of
+every module a program loads, counted from `grasm tir`'s file lines.
+2026-11-01, 02:58-03:06, both niced, beside the main checkout's full suite
+at a one-minute load average of 3.6 to 5.4 -- **not to be quoted**:
+
+| programs | lines | `grasm check` | `front check` | front / Rust time |
+|---|---:|---:|---:|---:|
+| `compiler/front`, `compiler/s3`, `tools/tirinterp`, `compiler/link`, `compiler/rt` | 74,513 | 8.8k lines/s | 2.9k lines/s | 3.00x |
+| every tenth corpus program, the 168 both accept with the same output | 205,855 | 22.4k lines/s | 9.3k lines/s | 2.40x |
+
+The 365-400k lines/s quoted for the Rust frontend's `check` (§2, §11) is
+`docs/compile-speed.md`'s measurement of 2026-10-07: `grasm check`, parse and
+typecheck, a whole process, best of five, on one generated file at each of
+four sizes (`benchmarks/compile/gen.py` 200, 1000, 3000 and 7000, a record
+type, a sum type and three functions per unit), lines as the file's lines.
+The same programs today (`tirspeed.py --generated`, best of five,
+alternating, 02:57 at a load of 4.0 to 4.5, so these are not to be quoted
+either):
+
+| lines | `grasm check` | `front check` | front / Rust time |
+|---:|---:|---:|---:|
+| 5,052 | 15.8 ms, 320k lines/s | 87.7 ms, 58k lines/s | 5.55x |
+| 25,052 | 55.2 ms, 454k lines/s | 415.6 ms, 60k lines/s | 7.53x |
+| 75,052 | 174.7 ms, 430k lines/s | 1,266.2 ms, 59k lines/s | 7.25x |
+| 175,052 | 449.2 ms, 390k lines/s | 3,022.7 ms, 58k lines/s | 6.73x |
+
+So on that measure the Grasm frontend checks about 58-60k lines/s, linearly
+in the size of the file, against the Rust frontend's 390-450k here; on the
+corpus it takes 2.4 times the Rust frontend's time and on the compiler's own
+packages 3.0 times, where most of the difference is the capability ceilings
+(§6.10). Where the time goes on one large file was not measured. Walking
+arithmetic and `if` on work stacks costs `front check` about 6% there: on the
+175,052-line file, eleven alternating rounds at 06:11, load 2.6 to 2.9 (not
+to be quoted either), the median went from 3,016 ms to 3,206 ms (best 2,983
+to 3,186), `grasm check` 454 ms.
+
+**S2's exit.** §6 asks for token streams identical to `grasm tokens`
+(`tokentest`), AST dumps identical (`asttest`), TIR identical for every
+corpus program (`tirdiff`), the same diagnostics at the same spans for every
+conformance and `check_tests` case (`diagdiff`, which holds every Rust test
+suite's programs, not only `check_tests`', and the whole output, not only the
+spans), a fuzz gate feeding both frontends (`fuzz_front`, `fuzz_tir`,
+`fuzz_diag`), and check speed measured against the Rust frontend's figure
+(above). Each is met. What is left: the one Rust output the Grasm frontend
+cannot reproduce (a hash order); `front tir`'s empty output for a TIR of 4 GB;
+and everything past `check` a command does on its own -- `deps`, the
+lockfile, `fmt`, `lint` -- which is S8's.
+
 ## 7. Bootstrap and trust
 
 - **During the migration:** stage 0 is the Rust-built `grasm`.
@@ -2508,7 +2732,7 @@ Decided 2026-10-20:
    systems subset (§5).
 5. **Linux** in S7.
 
-## 11. Where it stands (2026-10-28)
+## 11. Where it stands (2026-11-01)
 
 Measured, not estimated; each line is a gate's result on master.
 
@@ -2713,8 +2937,28 @@ Measured, not estimated; each line is a gate's result on master.
   benchmarks, measured once at a load of 2.4 to 2.6 on 8 cores: every
   program passes, `fib`, `sieve` and `matmul` within 9% of the Rust
   runtime, `tree` 1.86x, `wordfreq` 3.38x and `sort` 3.92x slower.
-- **Not started:** S2 part three (the diagnostics' words and spans), S6
-  (self-compilation), S7-S9.
+- **S2 part three done, and S2's exit criteria met** (§6.13): `front check`
+  prints what `grasm check` prints, byte for byte -- every diagnostic with its
+  line, column, quoted line, carets and help, in Rust's order, the count
+  line, the ceilings' breaches with where each effect happens, or `ok` --
+  with the manifests read by a port of the Rust toolchain's own TOML reader,
+  directories compared by `realpath`, and the uncapped `^` and `else if`
+  chains walked on work stacks. `diagdiff`: 4,244 programs (the conformance
+  negatives, the Rust test suites' programs, 67 package cases, 674 long
+  chains and deep shapes, 700 fuzzer programs, the corpus), 1,437 refused and
+  2,807 accepted with the same output, none differing; `fuzz_diag` 2,200 of
+  2,200 the same, and at 22,000 (seed 101) 22,000 of 22,000; `diagcontrols`
+  9 of 9. Both chains check alike at 6,000 to 100,000 terms but for the `^`
+  chain of 100,000, which aborts `grasm check` (a recorded Rust defect) and
+  which `front check` answers. Seven defects of the Rust frontend found and
+  recorded, none fixed in Rust, the six that are diagnostics reproduced by the
+  Grasm frontend; part one's and part two's gates pass over the larger
+  frontend. `front check` takes 2.4 times `grasm check`'s time on the corpus
+  and 3.0 times on the compiler's packages, and checks about 55-60k lines/s
+  on the generated files that measured the Rust frontend's 365-400k (390-450k
+  today), measured under load and not to be quoted. Open: `front tir`
+  prints nothing for a TIR of 4 GB.
+- **Not started:** S6 (self-compilation), S7-S9.
 
 With S4 done, S6 waits on S3's last steps and on S2 and S5, the frontend
 and the runtime in Grasm; they come next, one stage at a time.
