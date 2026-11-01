@@ -2393,6 +2393,42 @@ which this part gave fast paths (`lists.gr`'s `msort_words`, `structs.gr`'s
 from about 5.9x to 4.0x and `tree` from 2.2x to 1.9x. `wordfreq`, which
 leans on maps and strings, is not profiled here.
 
+**Since, in the runtime's source** (2026-11-01; the backend unchanged).
+Profiled with `sample` on each program scaled up and priced by A/B runs of
+the two builds, a single machine at a load average of 4 to 15, so the times
+are not to be quoted: `rtbench.py` on a quiet machine is what to quote.
+
+- An integer interpolated into a string (`str_build_i64`) took a scratch
+  buffer from `malloc` and gave it back every time; its digits are now
+  written into the builder's room when there is enough for them, which is
+  the Rust runtime's case too (its digits on its stack, `push_str` growing
+  nothing), and `str_from_i64` writes them into the string's box.
+- A map's hash called a function for each of its three multipliers, now
+  literal constants; a probe compared the eight control bytes of a group
+  one call each, and now matches all eight in one word, exactly, as
+  `hashbrown`'s generic group does (`matching`, `empties`); a map's
+  copy-on-write, the uncommon case, is a function apart, so the common case
+  saves no registers.
+- `sys.copy` under 64 bytes copied word by word and then byte by byte; it
+  now copies two words that overlap, as the C library does.
+- A list of integers, `u64`s or floats sorted itself by a merge sort
+  (`msort_words`); words equal after `ordered_keys` are the same bits, so
+  any sort that orders them is the same sort, and it is now a radix sort
+  by bytes from the lowest (`rsort_words`), a pass skipped where every
+  word has the same byte, by insertion at 32 or fewer.
+
+`wordfreq` scaled to 40 million words went from 4.95 s to 3.33 s of user
+time (the Rust runtime's build 1.32 s); `sort` of 20 million integers
+takes 0.41 s against the Rust runtime's 0.42 s; `tree` did not move. What
+is left of the gap on `wordfreq` and `tree` is mostly this backend's: every
+small function a call, every register saved on entry whichever way a
+function goes, constants and offsets not folded into instructions. The
+list fuzz (`compiler/rt/probe/listfuzz.gr`) sorted lists of at most 40
+integers, 12 floats and 8 `u64`s, which the radix sort would not reach, so
+one round in eight now also sorts 33 to 232 of each; `rtcontrols` adds
+`list-radix` (the sort stopped after its first byte) and `map-group-empty`
+(a tombstone read as empty), both caught by their fuzz.
+
 ## 7. Bootstrap and trust
 
 - **During the migration:** stage 0 is the Rust-built `grasm`.

@@ -85,19 +85,37 @@ pub fn fill_str(v: addr, p: addr, n: i64) {
     }
 }
 
-export fn grt_str_from_i64(v: i64) -> addr {
-    let b = sys.alloc(fmt.INT_MAX)
-    let s = new_str(b, fmt.i64_text(v, b))
-    sys.dealloc(b)
+/// A new string value holding an integer's digits, written straight into
+/// its box: any integer's text fits inline (`INT_MAX` is less than
+/// `STR_CAP`), so no scratch buffer is made, as `RtStr::of_i64` makes none.
+/// The bytes past the text are zero, as `fill_str` leaves them.
+fn int_str(v: i64, unsigned: bool) -> addr {
+    let s = alloc.take()
+    unsafe {
+        s.offset(layout.TAG).store_u8(layout.TAG_STR.as_u8())
+        s.offset(layout.STR_INDEX).store_i64(0)
+    }
+    let at = unsafe { s.offset(layout.STR_BYTES) }
+    let n = if unsigned { fmt.u64_text(v.as_u64(), at) } else { fmt.i64_text(v, at) }
+    var k = n
+    while k < layout.STR_CAP {
+        unsafe { at.offset(k).store_u8(0) }
+        k += 1
+    }
+    unsafe {
+        s.offset(layout.STR_DISC).store_u8(layout.STR_INLINE.as_u8())
+        s.offset(layout.STR_LEN).store_u8(n.as_u8())
+    }
     s
+}
+
+export fn grt_str_from_i64(v: i64) -> addr {
+    int_str(v, false)
 }
 
 /// A `u64` as text, unsigned ([T-U64]).
 export fn grt_str_from_u64(v: i64) -> addr {
-    let b = sys.alloc(fmt.INT_MAX)
-    let s = new_str(b, fmt.u64_text(v.as_u64(), b))
-    sys.dealloc(b)
-    s
+    int_str(v, true)
 }
 
 export fn grt_str_from_f64(v: f64) -> addr {
@@ -114,10 +132,52 @@ export fn grt_str_from_bool(v: i8) -> addr {
     s
 }
 
-/// An integer's digits appended to the builder `at` (a `String`).
+/// How long `v`'s decimal text is, its sign counted.
+fn i64_len(v: i64) -> i64 {
+    var n = if v < 0 { (0 - v).as_u64() } else { v.as_u64() }
+    var len = if v < 0 { 2 } else { 1 }
+    while n >= 10 {
+        n = n / 10
+        len += 1
+    }
+    len
+}
+
+/// `v`'s decimal text, the `len` bytes `i64_len` counts, written at `to`
+/// and nothing past them: a `-`, then its magnitude, taken unsigned as
+/// `fmt.i64_text` takes it.
+fn put_i64(v: i64, len: i64, to: addr) {
+    var n = if v < 0 { (0 - v).as_u64() } else { v.as_u64() }
+    var i = len
+    while true {
+        i -= 1
+        unsafe { to.offset(i).store_u8((n % 10).as_u8() + 48) }
+        n = n / 10
+        if n == 0 {
+            break
+        }
+    }
+    if v < 0 {
+        unsafe { to.store_u8(45) }
+    }
+}
+
+/// An integer's digits appended to the builder `at` (a `String`): written
+/// in place when it has room for them, as a builder used before nearly
+/// always has, so neither a scratch buffer nor growth -- the Rust runtime's
+/// digits on its stack and `push_str` make none either; else through a
+/// scratch buffer, grown as `push_str` grows it.
 export fn grt_str_build_i64(at: i64, v: i64) {
+    let s = unsafe { mem_addr(at) }
+    let len = unsafe { s.offset(layout.VEC_LEN).load_i64() }
+    let n = i64_len(v)
+    if unsafe { s.offset(layout.VEC_CAP).load_i64() } - len >= n {
+        put_i64(v, n, unsafe { s.offset(layout.VEC_PTR).load_addr().offset(len) })
+        unsafe { s.offset(layout.VEC_LEN).store_i64(len + n) }
+        return
+    }
     let b = sys.alloc(fmt.INT_MAX)
-    string_push(unsafe { mem_addr(at) }, b, fmt.i64_text(v, b))
+    string_push(s, b, fmt.i64_text(v, b))
     sys.dealloc(b)
 }
 

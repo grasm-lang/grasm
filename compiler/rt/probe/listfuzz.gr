@@ -91,6 +91,29 @@ fn round(inout s: i64) -> str {
     out.push_str("{by} {xs.map(|x| x * 2)} {xs.filter(|x| x > 0)} ")
     out.push_str("{xs.enumerate().len()} {xs.zip(sorted).slice(0, 3)} ")
     out.push_str("{xs.map(|x| "{x}").join("-")} ")
+    // Now and then lists long enough to be sorted by their bytes
+    // (`rsort_words`): integers of every width and both signs, `u64`s with
+    // and without the top bit, and floats with -0.0 and NaN among them; each
+    // sorted list summed by position, so an element out of place shows.
+    if pick(s, 8) == 0 {
+        var big: [i64] = []
+        var ubig: [u64] = []
+        var fbig: [f64] = []
+        for i in 0..(33 + pick(s, 200)) {
+            let k = pick(s, 2000001) - 1000000
+            big.push(if pick(s, 4) == 0 { k * 9000000000000 } else { k })
+            ubig.push(if pick(s, 3) == 0 { k.as_u64() } else { pick(s, 70000).as_u64() })
+            fbig.push(float(s))
+        }
+        big.sort()
+        ubig.sort()
+        fbig.sort()
+        var h = 0
+        for i in 0..big.len() {
+            h = (h * 31 + big[i] % 1000003 + ubig[i].as_i64() % 1000003 + fbig[i].to_bits() % 1000003) % 1000000007
+        }
+        out.push_str("{big.len()} {h} {big.first()} {ubig.last()} {show_floats(fbig.slice(0, 4))} ")
+    }
     // A long run of pushes, reserved first.
     var long: [i64] = []
     let m = pick(s, 60)

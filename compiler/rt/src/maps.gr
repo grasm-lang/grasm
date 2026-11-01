@@ -51,17 +51,10 @@ let EMPTY = 255
 let DELETED = 128
 let GROUP = 8
 
-fn s0() -> u64 {
-    0xa076_1d64_78bd_642f
-}
-
-fn s1() -> u64 {
-    0xe703_7ed1_a0b4_28db
-}
-
-fn s2() -> u64 {
-    0x8ebc_6af0_9c88_c6e3
-}
+// The multipliers: literals, so each is its value where it is read.
+let S0: u64 = 0xa076_1d64_78bd_642f
+let S1: u64 = 0xe703_7ed1_a0b4_28db
+let S2: u64 = 0x8ebc_6af0_9c88_c6e3
 
 // ----- the hash ---------------------------------------------------------------
 
@@ -85,7 +78,7 @@ fn mix(a: u64, b: u64) -> u64 {
 /// One word into the state: `write_u64`, which every integer, a bool, a
 /// variant's index and a length go through.
 fn word(h: u64, w: u64) -> u64 {
-    mix(h.bit_xor(w), s1())
+    mix(h.bit_xor(w), S1)
 }
 
 /// The last one to seven bytes of text, as `load_tail` reads them.
@@ -106,20 +99,20 @@ fn tail(p: addr, n: i64) -> u64 {
 /// Text into the state: `write`, its length first, then eight bytes at a
 /// time and the tail; and `write_str`'s `0xff` after it.
 fn text(h: u64, p: addr, n: i64) -> u64 {
-    var s = h.bit_xor(n.as_u64() * s0())
+    var s = h.bit_xor(n.as_u64() * S0)
     var i = 0
     while i + 8 <= n {
-        s = mix(s.bit_xor(unsafe { p.offset(i).load_u64() }), s1())
+        s = mix(s.bit_xor(unsafe { p.offset(i).load_u64() }), S1)
         i += 8
     }
     if i < n {
-        s = mix(s.bit_xor(tail(unsafe { p.offset(i) }, n - i)), s2())
+        s = mix(s.bit_xor(tail(unsafe { p.offset(i) }, n - i)), S2)
     }
     word(s, 255)
 }
 
 fn finish(h: u64) -> u64 {
-    mix(h, s2())
+    mix(h, S2)
 }
 
 
@@ -451,25 +444,36 @@ fn set_ctrl(ctrl: addr, mask: i64, i: i64, b: i64) {
 /// The first bucket of a group of eight from `pos` whose control byte is
 /// EMPTY or DELETED, or -1.
 fn first_special(ctrl: addr, pos: i64) -> i64 {
-    var j = 0
-    while j < GROUP {
-        if byte(ctrl, pos + j) >= 128 {
-            return j
-        }
-        j += 1
-    }
-    -1
+    let special = group_at(ctrl, pos).bit_and(HI_BITS)
+    if special == 0 { -1 } else { special.trailing_zeros() / 8 }
 }
 
-fn has_empty(ctrl: addr, pos: i64) -> bool {
-    var j = 0
-    while j < GROUP {
-        if byte(ctrl, pos + j) == EMPTY {
-            return true
-        }
-        j += 1
-    }
-    false
+// A group of eight control bytes read as one word, byte `j` in bits
+// `8j .. 8j + 8`, as `hashbrown`'s generic `Group` reads it. The table has a
+// copy of its first group past its last bucket, so a group read anywhere
+// from bucket 0 to the last stays inside the control bytes.
+let LO_BITS: u64 = 0x0101_0101_0101_0101
+let HI_BITS: u64 = 0x8080_8080_8080_8080
+let LOW7_BITS: u64 = 0x7f7f_7f7f_7f7f_7f7f
+
+fn group_at(ctrl: addr, pos: i64) -> u64 {
+    unsafe { ctrl.offset(pos).load_u64() }
+}
+
+/// The bytes of group `g` equal to `tag`, each by its top bit, exactly: a
+/// byte is zero after the xor just when its low seven bits added to `0x7f`
+/// do not carry into the eighth and its own eighth is clear. Lowest first,
+/// as the bytes are in the group.
+fn matching(g: u64, tag: i64) -> u64 {
+    let x = g.bit_xor(tag.as_u64() * LO_BITS)
+    (x.bit_and(LOW7_BITS) + LOW7_BITS).bit_or(x).bit_or(LOW7_BITS).bit_not()
+}
+
+/// The EMPTY bytes of group `g`, each by its top bit: EMPTY is the one
+/// control byte whose top two bits are both set (DELETED is `0x80`, a full
+/// bucket's byte below `0x80`).
+fn empties(g: u64) -> u64 {
+    g.bit_and(g.shl(1)).bit_and(HI_BITS)
 }
 
 /// Where an entry with hash `hash` would go: the first EMPTY or DELETED
@@ -501,17 +505,16 @@ fn find_text(m: addr, hash: u64, p: addr, n: i64) -> i64 {
     var pos = hash.as_i64().bit_and(mask)
     var stride = 0
     while true {
-        var j = 0
-        while j < GROUP {
-            if byte(ctrl, pos + j) == tag {
-                let i = (pos + j).bit_and(mask)
-                if key_eq_text(keys.entry(ctrl, i), p, n) {
-                    return i
-                }
+        let g = group_at(ctrl, pos)
+        var hits = matching(g, tag)
+        while hits != 0 {
+            let i = (pos + hits.trailing_zeros() / 8).bit_and(mask)
+            if key_eq_text(keys.entry(ctrl, i), p, n) {
+                return i
             }
-            j += 1
+            hits = hits.bit_and(hits - 1)
         }
-        if has_empty(ctrl, pos) {
+        if empties(g) != 0 {
             return -1
         }
         stride += GROUP
@@ -528,17 +531,16 @@ pub fn find_key(m: addr, hash: u64, k: addr) -> i64 {
     var pos = hash.as_i64().bit_and(mask)
     var stride = 0
     while true {
-        var j = 0
-        while j < GROUP {
-            if byte(ctrl, pos + j) == tag {
-                let i = (pos + j).bit_and(mask)
-                if key_eq(keys.entry(ctrl, i), k) {
-                    return i
-                }
+        let g = group_at(ctrl, pos)
+        var hits = matching(g, tag)
+        while hits != 0 {
+            let i = (pos + hits.trailing_zeros() / 8).bit_and(mask)
+            if key_eq(keys.entry(ctrl, i), k) {
+                return i
             }
-            j += 1
+            hits = hits.bit_and(hits - 1)
         }
-        if has_empty(ctrl, pos) {
+        if empties(g) != 0 {
             return -1
         }
         stride += GROUP
@@ -818,10 +820,17 @@ fn not_map(what: i64) {
 /// copied and each value counted once more, into a table with room for them
 /// all and this process's seed; the one given loses a count.
 fn owned(m: addr) -> addr {
+    if unsafe { m.atomic_load_i64(Relaxed) } == 1 {
+        return m
+    }
+    copied(m)
+}
+
+/// `owned`'s copy, apart from it so that the common case, a map nothing
+/// else holds, saves none of the registers the copy needs (this backend
+/// saves a function's registers on entry, whichever way it goes).
+fn copied(m: addr) -> addr {
     unsafe {
-        if m.atomic_load_i64(Relaxed) == 1 {
-            return m
-        }
         if not is_map(m) {
             not_map(7)
         }

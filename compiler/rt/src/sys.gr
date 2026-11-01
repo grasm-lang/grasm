@@ -32,18 +32,30 @@ pub fn dealloc(p: addr) {
 /// copy is the C library's, as `to_vec` and `extend_from_slice` make it in
 /// the Rust runtime: a list literal of constants copies its whole table
 /// each time it is read, and word by word that was most of `casefolddiff`.
+/// A short one is words, the last of them overlapping the one before as the
+/// C library's are, so a string's few bytes are two loads and two stores,
+/// not one of each a byte.
 pub fn copy(dst: addr, src: addr, n: i64) {
     if n >= 64 {
         unsafe { memcpy(dst, src, n) }
         return
     }
-    var i = 0
-    while i + 8 <= n {
-        unsafe { dst.offset(i).store_u64(src.offset(i).load_u64()) }
-        i += 8
-    }
-    while i < n {
-        unsafe { dst.offset(i).store_u8(src.offset(i).load_u8()) }
-        i += 1
+    unsafe {
+        if n >= 8 {
+            var i = 0
+            while i + 8 < n {
+                dst.offset(i).store_u64(src.offset(i).load_u64())
+                i += 8
+            }
+            dst.offset(n - 8).store_u64(src.offset(n - 8).load_u64())
+        } else if n >= 4 {
+            dst.store_u32(src.load_u32())
+            dst.offset(n - 4).store_u32(src.offset(n - 4).load_u32())
+        } else if n >= 2 {
+            dst.store_u16(src.load_u16())
+            dst.offset(n - 2).store_u16(src.offset(n - 2).load_u16())
+        } else if n == 1 {
+            dst.store_u8(src.load_u8())
+        }
     }
 }

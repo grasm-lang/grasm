@@ -320,7 +320,7 @@ if control leak-escaped; then
 fi
 
 if control map-hash; then
-    plant map-hash src/maps.gr '    0x8ebc_6af0_9c88_c6e3' '    0x8ebc_6af0_9c88_c6e5' ||
+    plant map-hash src/maps.gr 'let S2: u64 = 0x8ebc_6af0_9c88_c6e3' 'let S2: u64 = 0x8ebc_6af0_9c88_c6e5' ||
         { echo "error: map-hash does not build"; exit 1; }
     expect map-hash 'pinned to .*: the two runtimes differ' env RTMAPS_SEEDS=2 RTMAPS_FREE=0 RTMAPS_OPS=300 bash scripts/fuzz_rtmaps.sh
 fi
@@ -347,6 +347,12 @@ if control map-grow; then
     plant map-grow src/maps.gr '    if cap < 15 {' '    if cap < 16 {' ||
         { echo "error: map-grow does not build"; exit 1; }
     expect map-grow 'pinned to .*: the two runtimes differ' env RTMAPS_SEEDS=4 RTMAPS_FREE=0 RTMAPS_OPS=1500 bash scripts/fuzz_rtmaps.sh
+fi
+
+if control map-group-empty; then
+    plant map-group-empty src/maps.gr '    g.bit_and(g.shl(1)).bit_and(HI_BITS)' '    g.bit_and(HI_BITS)' ||
+        { echo "error: map-group-empty does not build"; exit 1; }
+    expect map-group-empty 'pinned to .*: the two runtimes differ' env RTMAPS_SEEDS=4 RTMAPS_FREE=0 RTMAPS_OPS=1500 bash scripts/fuzz_rtmaps.sh
 fi
 
 if control map-order; then
@@ -535,6 +541,12 @@ if control list-stable; then
     plant list-stable src/lists.gr 'if compare(mode, y, x, sk, keys) < 0 {' 'if compare(mode, y, x, sk, keys) <= 0 {' ||
         { echo "error: list-stable does not build"; exit 1; }
     expect list-stable 'the two runtimes differ' env RTLISTS_SEEDS=3 RTLISTS_ROUNDS=50 bash scripts/fuzz_rtlists.sh
+fi
+
+if control list-radix; then
+    plant list-radix src/lists.gr '.load_i64() != n {' '.load_i64() != n and d < 1 {' ||
+        { echo "error: list-radix does not build"; exit 1; }
+    expect list-radix 'the two runtimes differ' env RTLISTS_SEEDS=3 RTLISTS_ROUNDS=50 bash scripts/fuzz_rtlists.sh
 fi
 
 if control list-negzero; then

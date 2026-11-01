@@ -1425,57 +1425,84 @@ fn msort(xs: addr, n: i64, mode: i64, sk: i64, keys: addr) {
     sys.dealloc(tmp)
 }
 
-/// Sorts the `n` words at `xs` in signed order, stably: `msort` with the
-/// comparison written in place, for words whose order is their signed
-/// order (`ordered_keys`).
-fn msort_words(xs: addr, n: i64) {
+/// Sorts the `n` words at `xs` in signed order, for words whose order is
+/// their signed order (`ordered_keys`), where equal words are the same bits,
+/// so that any order-correct sort is this one: by their bytes from the
+/// lowest, each pass a counting sort (stable, so the passes compose), with a
+/// pass skipped when every word has the same byte there -- integers below a
+/// million take three of the eight. A short run is sorted by insertion.
+fn rsort_words(xs: addr, n: i64) {
     if n < 2 {
         return
     }
-    let tmp = sys.alloc(8 * n)
-    var src = xs
-    var dst = tmp
-    var w = 1
+    let flip: u64 = 0x8000_0000_0000_0000
     unsafe {
-        while w < n {
-            var lo = 0
-            while lo < n {
-                let mid = if lo + w < n { lo + w } else { n }
-                let hi = if lo + 2 * w < n { lo + 2 * w } else { n }
-                var i = lo
-                var j = mid
-                var k = lo
-                while i < mid and j < hi {
-                    let x = src.offset(8 * i).load_i64()
-                    let y = src.offset(8 * j).load_i64()
-                    if y < x {
-                        dst.offset(8 * k).store_i64(y)
-                        j += 1
-                    } else {
-                        dst.offset(8 * k).store_i64(x)
-                        i += 1
-                    }
+        if n <= 32 {
+            var i = 1
+            while i < n {
+                let x = xs.offset(8 * i).load_i64()
+                var j = i
+                while j > 0 and xs.offset(8 * (j - 1)).load_i64() > x {
+                    xs.offset(8 * j).store_i64(xs.offset(8 * (j - 1)).load_i64())
+                    j -= 1
+                }
+                xs.offset(8 * j).store_i64(x)
+                i += 1
+            }
+            return
+        }
+        // Every byte's histogram, in one read of the words: the sign bit
+        // flipped, so that unsigned byte order is signed order.
+        let counts = sys.alloc_zeroed(8 * 256 * 8)
+        var i = 0
+        while i < n {
+            let k = xs.offset(8 * i).load_u64().bit_xor(flip)
+            var d = 0
+            while d < 8 {
+                let c = counts.offset(8 * (256 * d + k.ushr(8 * d).bit_and(255).as_i64()))
+                c.store_i64(c.load_i64() + 1)
+                d += 1
+            }
+            i += 1
+        }
+        let tmp = sys.alloc(8 * n)
+        var src = xs
+        var dst = tmp
+        let first = xs.load_u64().bit_xor(flip)
+        var d = 0
+        while d < 8 {
+            let c = counts.offset(8 * 256 * d)
+            if c.offset(8 * first.ushr(8 * d).bit_and(255).as_i64()).load_i64() != n {
+                // Counts made the starts of their runs.
+                var sum = 0
+                var b = 0
+                while b < 256 {
+                    let t = c.offset(8 * b).load_i64()
+                    c.offset(8 * b).store_i64(sum)
+                    sum += t
+                    b += 1
+                }
+                var k = 0
+                while k < n {
+                    let x = src.offset(8 * k).load_u64()
+                    let at = c.offset(8 * x.bit_xor(flip).ushr(8 * d).bit_and(255).as_i64())
+                    let to = at.load_i64()
+                    dst.offset(8 * to).store_u64(x)
+                    at.store_i64(to + 1)
                     k += 1
                 }
-                if i < mid {
-                    sys.copy(dst.offset(8 * k), src.offset(8 * i), 8 * (mid - i))
-                    k += mid - i
-                }
-                if j < hi {
-                    sys.copy(dst.offset(8 * k), src.offset(8 * j), 8 * (hi - j))
-                }
-                lo = hi
+                let s = src
+                src = dst
+                dst = s
             }
-            let s = src
-            src = dst
-            dst = s
-            w = 2 * w
+            d += 1
         }
+        if src != xs {
+            sys.copy(xs, src, 8 * n)
+        }
+        sys.dealloc(tmp)
+        sys.dealloc(counts)
     }
-    if src != xs {
-        sys.copy(xs, src, 8 * n)
-    }
-    sys.dealloc(tmp)
 }
 
 /// The `n` scalar words at `xs`, of kind `sk`, made words whose signed
@@ -1513,7 +1540,7 @@ export fn grt_list_sort(l: addr) -> addr {
             let p = vec_ptr(sdata(target))
             let n = slen(target)
             ordered_keys(p, n, sk)
-            msort_words(p, n)
+            rsort_words(p, n)
             ordered_keys(p, n, sk)
         }
     } else {
