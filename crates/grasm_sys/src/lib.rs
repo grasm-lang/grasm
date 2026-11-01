@@ -238,7 +238,7 @@ pub mod tls {
         pub fn try_with<R>(&self, f: impl FnOnce(&T) -> R) -> Result<R, Gone> {
             let k = self.key();
             let at = unsafe { pthread_getspecific(k) } as *mut Slot<T>;
-            if at as *const u8 == GONE {
+            if core::ptr::eq(at.cast::<u8>(), GONE) {
                 return Err(Gone);
             }
             if !at.is_null() {
@@ -255,7 +255,7 @@ pub mod tls {
         fn first_touch<R>(&self, f: impl FnOnce(&T) -> R) -> Result<R, Gone> {
             let k = self.key();
             let mut at = unsafe { pthread_getspecific(k) } as *mut Slot<T>;
-            if at as *const u8 == GONE {
+            if core::ptr::eq(at.cast::<u8>(), GONE) {
                 return Err(Gone);
             }
             if at.is_null() {
@@ -284,7 +284,7 @@ pub mod tls {
     /// so that `try_with` answers `Gone` rather than making a value nothing
     /// would free, and not an address, so that nothing is kept for it.
     #[cfg(not(target_arch = "wasm32"))]
-    const GONE: *const u8 = 1 as *const u8;
+    const GONE: *const u8 = core::ptr::dangling::<u8>();
 
     /// Run by pthreads when a thread that used this key ends.
     ///
@@ -300,7 +300,7 @@ pub mod tls {
     /// now none.
     #[cfg(not(target_arch = "wasm32"))]
     unsafe extern "C" fn drop_in_place<T>(at: *mut u8) {
-        if at.is_null() || at as *const u8 == GONE {
+        if at.is_null() || core::ptr::eq(at, GONE) {
             return;
         }
         let mut slot = Box::from_raw(at as *mut Slot<T>);

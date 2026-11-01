@@ -9461,7 +9461,7 @@ unsafe fn grasm_tcp_write_bytes_now(handle: *mut RtVal, data: *mut RtVal) -> *mu
     let wrote = socket_with(h, |s| match s {
         // Unbuffered, so there is nothing to flush after the write: `send`
         // has already handed the bytes to the kernel.
-        Socket::Stream(stream) => stream.write_all(&payload).map_err(|e| e.to_string()),
+        Socket::Stream(stream) => stream.write_all(payload).map_err(|e| e.to_string()),
         Socket::Listener(_) => Err(format!("socket {h} is a listener, not a connection")),
         Socket::Datagram(_) => Err(format!(
             "socket {h} is a datagram socket — use udp_send, which needs a destination"
@@ -9884,7 +9884,7 @@ unsafe fn grasm_udp_send_now(
         // `udp_bind` binds `0.0.0.0`, so the destination is the host's first
         // IPv4 address rather than its first address.
         Socket::Datagram(d) => crate::net::resolve_for(host.as_str(), port as u16, crate::net::AF_INET)
-            .and_then(|to| d.send_to(&payload, &to))
+            .and_then(|to| d.send_to(payload, &to))
             .map(|n| n as i64)
             .map_err(|e| e.to_string()),
         _ => Err(format!("socket {h} is not a datagram socket")),
