@@ -10,16 +10,16 @@
 // previous file's ended, plus one.
 //
 // Manifests are read twice over, as the Rust toolchain reads them: the
-// package graph through `packages/toml` (the root's manifest checked as
-// `grasm_pkg::Manifest` checks it, then every path dependency), and the
-// loader's own questions -- a package's dependencies and their paths, its
-// entry file, whether it is a runtime package -- line by line, as
-// loader.rs asks them.
+// package graph through the Rust toolchain's own TOML reader (rtoml.gr; the
+// root's manifest checked as `grasm_pkg::Manifest` checks it, then every
+// path dependency), and the loader's own questions -- a package's
+// dependencies and their paths, its entry file, whether it is a runtime
+// package -- line by line, as loader.rs asks them.
 import lex
 import parse
 import cst
 import ast
-import toml
+import rtoml
 
 let MAX_PACKAGE_DEPTH = 64
 
@@ -33,8 +33,12 @@ type Loaded = {
     imp_alias: [[str]],
     imp_full: [[str]],
     mods: [ModuleAst],
-    /// The loader's diagnostics and the parser's, as messages.
+    /// The loader's diagnostics and the parser's, as messages, with their
+    /// spans in the program's offsets and their help ("" for none).
     diags: [str],
+    d_s: [i64],
+    d_e: [i64],
+    d_help: [str],
     /// Module name -> runtime package name ([T-RUNTIME]).
     runtime: Map[str, str],
     /// Module-name prefixes that are dependency packages.
@@ -144,11 +148,68 @@ pub fn tidy(path: str) -> str {
     parts.join("/")
 }
 
-/// A directory's real path. The Rust toolchain asks the file system; this
-/// collapses it lexically, which agrees wherever no symbolic link is on
-/// the way.
-fn real_dir(d: str) -> str {
-    tidy(d)
+// `std::fs::canonicalize` is `realpath(3)`. The resolved name is written
+// into a buffer of `PATH_MAX` bytes the call is handed.
+extern fn realpath(path: str, resolved: bytes) -> i64
+
+/// `std::fs::canonicalize`: the path's absolute name with every symbolic
+/// link, `.` and `..` resolved, as the file system answers it; "\0" when it
+/// cannot be (the path does not exist).
+pub fn canonicalize(p: str) -> str {
+    if p.contains("\0") {
+        return "\0"
+    }
+    let buf = bytes_filled(1024, 0)
+    let rc = unsafe { realpath(p, buf) }
+    if rc == 0 {
+        return "\0"
+    }
+    var n = 0
+    while n < buf.len() and buf.at(n) != 0 {
+        n += 1
+    }
+    buf.slice(0, n).to_str()
+}
+
+/// loader.rs `real_dir`, grasm_pkg `canonical`: the canonical path, or the
+/// path as written when there is none.
+pub fn real_dir(d: str) -> str {
+    let c = canonicalize(d)
+    if c == "\0" {
+        return d
+    }
+    c
+}
+
+/// grasm `same_dir`: one directory, by the file system when both exist,
+/// else by their components.
+pub fn same_dir(a: str, b: str) -> bool {
+    let x = canonicalize(a)
+    let y = canonicalize(b)
+    if x != "\0" and y != "\0" {
+        return x == y
+    }
+    components(a) == components(b)
+}
+
+/// `Path::components`, as text: `.` inside a path and repeated `/` dropped.
+fn components(p: str) -> [str] {
+    var out: [str] = []
+    let segs = p.split("/")
+    for i in 0..segs.len() {
+        let s = segs[i]
+        if s == "" {
+            if i == 0 and p.starts_with("/") {
+                out.push("/")
+            }
+            continue
+        }
+        if s == "." and not (i == 0 and out.len() == 0) {
+            continue
+        }
+        out.push(s)
+    }
+    out
 }
 
 fn dotted_to_path(name: str) -> str {
@@ -580,69 +641,111 @@ fn bad_manifest(why: str) -> Manifest {
     Manifest{ ok: false, why: why, name: "", version: "", dep_names: [], dep_paths: [], dep_reqs: [], has_caps: false, caps: [], entry: "" }
 }
 
-fn version_ok(v: str) -> bool {
+/// `Version::parse`: three parts, each a `u64` as Rust parses one (an
+/// optional `+`, then digits), normalized as it displays them; none when it
+/// is not a version.
+fn version_parts(v: str) -> [str] {
     let parts = v.split(".")
     if parts.len() != 3 {
-        return false
+        return []
     }
-    for p in parts {
+    var out: [str] = []
+    for p0 in parts {
+        var p = p0
+        if p.starts_with("+") {
+            p = p.substr(1, p.len() - 1)
+        }
         if p == "" {
-            return false
+            return []
         }
         for c in p.chars() {
             if c < "0" or c > "9" {
-                return false
+                return []
             }
         }
-    }
-    true
-}
-
-fn version_nums(v: str) -> [i64] {
-    var out: [i64] = []
-    for p in v.split(".") {
-        out.push(p.parse_int() ?? 0)
+        while p.len() > 1 and p.starts_with("0") {
+            p = p.substr(1, p.len() - 1)
+        }
+        if p.len() > 20 or (p.len() == 20 and p > "18446744073709551615") {
+            return []
+        }
+        out.push(p)
     }
     out
 }
 
-/// Whether a requirement (`=1.2.3`, `^1.2.3`, `1.2.3`) is well formed.
+fn version_ok(v: str) -> bool {
+    version_parts(v).len() == 3
+}
+
+/// A version as Rust displays it: `1.2.3`.
+fn version_shown(v: str) -> str {
+    version_parts(v).join(".")
+}
+
+fn version_err(v: str) -> str {
+    "version `{v}` is not `MAJOR.MINOR.PATCH` (e.g. `0.1.0`)"
+}
+
+/// Two normalized numbers compared as numbers.
+fn num_less(a: str, b: str) -> bool {
+    if a.len() != b.len() {
+        return a.len() < b.len()
+    }
+    a < b
+}
+
+fn version_less(a: str, b: str) -> bool {
+    let x = version_parts(a)
+    let y = version_parts(b)
+    for i in 0..3 {
+        if x[i] != y[i] {
+            return num_less(x[i], y[i])
+        }
+    }
+    false
+}
+
+/// `VersionReq::parse`: `=1.2.3` exact, `^1.2.3` or `1.2.3` compatible --
+/// the version written, its sign stripped.
 fn req_version(r: str) -> str {
-    let t = r.trim()
+    let t = rtoml.rust_trim(r)
     if t.starts_with("=") {
-        return t.substr(1, t.len() - 1).trim()
+        return rtoml.rust_trim(t.substr(1, t.len() - 1))
     }
     if t.starts_with("^") {
-        return t.substr(1, t.len() - 1).trim()
+        return rtoml.rust_trim(t.substr(1, t.len() - 1))
     }
     t
 }
 
+fn req_exact(r: str) -> bool {
+    rtoml.rust_trim(r).starts_with("=")
+}
+
+/// A requirement as Rust displays it: `=1.2.3` or `^1.2.3`.
+fn req_shown(r: str) -> str {
+    if req_exact(r) {
+        return "=" + version_shown(req_version(r))
+    }
+    "^" + version_shown(req_version(r))
+}
+
 fn req_matches(r: str, v: str) -> bool {
-    let exact = r.trim().starts_with("=")
-    let want = version_nums(req_version(r))
-    let got = version_nums(v)
-    if exact {
+    let want = version_parts(req_version(r))
+    let got = version_parts(v)
+    if req_exact(r) {
         return want[0] == got[0] and want[1] == got[1] and want[2] == got[2]
     }
-    // got < want?
-    if got[0] != want[0] {
-        if got[0] < want[0] {
-            return false
-        }
-    } else if got[1] != want[1] {
-        if got[1] < want[1] {
-            return false
-        }
-    } else if got[2] < want[2] {
+    if version_less(v, req_version(r)) {
         return false
     }
-    if want[0] > 0 {
+    if want[0] != "0" {
         got[0] == want[0]
-    } else if want[1] > 0 {
-        got[0] == 0 and got[1] == want[1]
+    } else if want[1] != "0" {
+        got[0] == "0" and got[1] == want[1]
     } else {
-        got[0] == 0 and got[1] == 0 and got[2] == want[2]
+        got[0] == "0" and got[1] == "0" and got[2] == want[2]
     }
 }
 
@@ -665,139 +768,174 @@ fn is_identifier(name: str) -> bool {
     not kws.contains(name)
 }
 
-/// `Manifest::load`: the manifest in `dir`, read through packages/toml and
-/// checked as grasm_pkg checks it.
-fn load_manifest(dir: str) -> Manifest {
-    let path = join(dir, "grasm.toml")
-    let text = match read_text(path) {
-        Some(t) -> t
-        None -> return bad_manifest("cannot read {path}")
-    }
-    let doc = toml.parse(text)
-    if not doc.ok {
-        return bad_manifest("{tidy(path)}: line {doc.line}: {doc.why}")
-    }
-    var has_package = false
-    for k in doc.keys {
-        if k.starts_with("package.") {
-            has_package = true
+/// `Path::extension` is `gr`, in any case: the last component's text after
+/// its last `.`, when that `.` does not begin it.
+fn is_grasm_source(p: str) -> bool {
+    var segs: [str] = []
+    for s in p.split("/") {
+        if s != "" and s != "." {
+            segs.push(s)
         }
     }
-    if not has_package {
-        return bad_manifest("{tidy(path)}: manifest is missing a [package] table")
+    if segs.len() == 0 {
+        return false
     }
-    let name = toml.text_of(doc, "package.name", "\0")
+    let last = segs[segs.len() - 1]
+    if last == ".." {
+        return false
+    }
+    let b = last.to_bytes()
+    var dot = -1
+    for i in 0..b.len() {
+        if b.at(i) == 46 {
+            dot = i
+        }
+    }
+    dot > 0 and b.slice(dot + 1, b.len()).to_str().to_lower() == "gr"
+}
+
+/// `Manifest::load`: the manifest in `dir`, read by the Rust toolchain's
+/// own reader (rtoml.gr) and checked as `Manifest::parse` checks it, in its
+/// order and its words.
+fn load_manifest(dir: str) -> Manifest {
+    let path = join(dir, "grasm.toml")
+    let text = match read_bytes(path) {
+        Ok(b) -> {
+            if not utf8_ok(b) {
+                return bad_manifest("cannot read {path}: stream did not contain valid UTF-8")
+            }
+            b.to_str()
+        }
+        Err(e) -> return bad_manifest("cannot read {path}: {io_error_text(e)}")
+    }
+    let shown = tidy(path)
+    let (ok, why, m) = parse_manifest(text)
+    if not ok {
+        return bad_manifest("{shown}: {why}")
+    }
+    m
+}
+
+fn parse_manifest(text: str) -> (bool, str, Manifest) {
+    let none = bad_manifest("")
+    let doc = rtoml.parse(text)
+    if not doc.ok {
+        return (false, doc.why, none)
+    }
+    let pkg = rtoml.table(doc, "package")
+    if pkg < 0 {
+        return (false, "manifest is missing a [package] table", none)
+    }
+    let name = rtoml.as_str(doc, rtoml.get(doc, pkg, "name"))
     if name == "\0" {
-        return bad_manifest("{tidy(path)}: [package] is missing `name`")
+        return (false, "[package] is missing `name`", none)
     }
     if name == "" {
-        return bad_manifest("{tidy(path)}: [package] name must not be empty")
+        return (false, "[package] name must not be empty", none)
     }
-    let version = toml.text_of(doc, "package.version", "\0")
+    let version = rtoml.as_str(doc, rtoml.get(doc, pkg, "version"))
     if version == "\0" {
-        return bad_manifest("{tidy(path)}: [package] is missing `version`")
+        return (false, "[package] is missing `version`", none)
     }
     if not version_ok(version) {
-        return bad_manifest("{tidy(path)}: version `{version}` is not `MAJOR.MINOR.PATCH` (e.g. `0.1.0`)")
+        return (false, version_err(version), none)
     }
     var has_caps = false
     var caps: [str] = []
-    match toml.get(doc, "package.capabilities") {
-        Some(v) -> {
-            if not all_texts(v) {
-                return bad_manifest("{tidy(path)}: `capabilities` must be an array of strings")
-            }
-            has_caps = true
-            caps = toml.texts_of(doc, "package.capabilities")
+    let cv = rtoml.get(doc, pkg, "capabilities")
+    if cv >= 0 {
+        if not rtoml.is_str_array(doc, cv) {
+            return (false, "`capabilities` must be an array of strings", none)
         }
-        None -> ()
+        has_caps = true
+        caps = rtoml.str_array(doc, cv)
     }
-    match toml.get(doc, "package.links") {
-        Some(v) -> {
-            if not all_texts(v) {
-                return bad_manifest("{tidy(path)}: `links` must be an array of strings")
-            }
-            for lib in toml.texts_of(doc, "package.links") {
-                if not link_name_ok(lib) {
-                    return bad_manifest("{tidy(path)}: `links` entry `{lib}` is not a library name")
-                }
+    let lv = rtoml.get(doc, pkg, "links")
+    if lv >= 0 {
+        if not rtoml.is_str_array(doc, lv) {
+            return (false, "`links` must be an array of strings", none)
+        }
+        for lib in rtoml.str_array(doc, lv) {
+            if not link_name_ok(lib) {
+                return (false, "`links` entry `{lib}` is not a library name — letters, digits, `_`, `-`, `.` and `+`, and it must start with a letter, a digit or `_`", none)
             }
         }
-        None -> ()
     }
-    let entry = toml.text_of(doc, "package.entry", "src/main.gr")
+    var entry = rtoml.as_str(doc, rtoml.get(doc, pkg, "entry"))
+    if entry == "\0" {
+        entry = "src/main.gr"
+    }
     if entry.starts_with("/") {
-        return bad_manifest("{tidy(path)}: `entry` must be a path inside the package: `{entry}` is absolute")
+        return (false, "`entry` must be a path inside the package: `{entry}` is absolute", none)
     }
     if has_parent_component(entry) {
-        return bad_manifest("{tidy(path)}: `entry` must be a path inside the package: `{entry}` leaves it with `..`")
+        return (false, "`entry` must be a path inside the package: `{entry}` leaves it with `..` — the lockfile checksums, the capability ceiling and `grasm publish` all cover this package's own directory, and a file outside it is in none of them", none)
     }
-    if not entry.to_lower().ends_with(".gr") {
-        return bad_manifest("{tidy(path)}: `entry` must name a `.gr` file: `{entry}` is not one")
+    if not is_grasm_source(entry) {
+        return (false, "`entry` must name a `.gr` file: `{entry}` is not one, and the lockfile's checksum and `grasm publish` both cover this package's `.gr` sources — a file outside that set is executed but recorded nowhere", none)
     }
-    match toml.get(doc, "package.runtime") {
-        Some(v) -> {
-            if toml.kind(v) != "bool" {
-                return bad_manifest("{tidy(path)}: `runtime` must be `true` or `false`")
-            }
-        }
-        None -> ()
+    let rv = rtoml.get(doc, pkg, "runtime")
+    if rv >= 0 and doc.v_kind[rv] != rtoml.V_BOOL {
+        return (false, "`runtime` must be `true` or `false`", none)
     }
-    let keys = ["name", "version", "capabilities", "entry", "links", "runtime"]
-    for k in toml.keys_under(doc, "package") {
-        if not keys.contains(k) {
-            return bad_manifest("{tidy(path)}: `[package]` has no key `{k}`")
-        }
-    }
-    for k in doc.keys {
-        if not k.contains(".") {
-            return bad_manifest("{tidy(path)}: `{k}` is written above the first table header")
-        }
-        let head = first_seg(k)
-        if head != "package" and head != "dependencies" {
-            return bad_manifest("{tidy(path)}: `[{head}]` is not a table this manifest has")
-        }
-    }
-    var dep_names = toml.keys_under(doc, "dependencies")
-    dep_names.sort()
+    // Dependencies, in the order of their tables' names.
+    var dep_names: [str] = []
     var paths: [str] = []
     var reqs: [str] = []
-    for d in dep_names {
-        for k in toml.keys_under(doc, "dependencies.{d}") {
-            if k != "path" and k != "version" {
-                return bad_manifest("{tidy(path)}: dependency `{d}` has no key `{k}`")
+    for ti in rtoml.subtables(doc, "dependencies") {
+        let full = doc.t_names[ti]
+        let d = full.substr(13, full.len() - 13)
+        let pth = rtoml.as_str(doc, rtoml.get(doc, ti, "path"))
+        var r = "\0"
+        let vv = rtoml.get(doc, ti, "version")
+        if vv >= 0 {
+            r = rtoml.as_str(doc, vv)
+            if r == "\0" {
+                return (false, "dependency `{d}`: `version` must be a string", none)
+            }
+            if not version_ok(req_version(r)) {
+                return (false, "dependency `{d}`: {version_err(req_version(r))}", none)
             }
         }
-        let p = toml.text_of(doc, "dependencies.{d}.path", "\0")
-        let r = toml.text_of(doc, "dependencies.{d}.version", "\0")
-        if r != "\0" and not version_ok(req_version(r)) {
-            return bad_manifest("{tidy(path)}: dependency `{d}`: version `{req_version(r)}` is not `MAJOR.MINOR.PATCH` (e.g. `0.1.0`)")
+        if pth == "\0" and r == "\0" {
+            return (false, "dependency `{d}` needs a `path` or a `version`: without either there is nothing to resolve it to", none)
         }
-        if p == "\0" and r == "\0" {
-            return bad_manifest("{tidy(path)}: dependency `{d}` needs a `path` or a `version`")
-        }
-        paths.push(p)
+        dep_names.push(d)
+        paths.push(pth)
         reqs.push(r)
     }
-    if not is_identifier(name) {
-        return bad_manifest("{tidy(path)}: `{name}` is not a usable package name")
-    }
-    Manifest{ ok: true, why: "", name: name, version: version, dep_names: dep_names, dep_paths: paths, dep_reqs: reqs, has_caps: has_caps, caps: caps, entry: entry }
-}
-
-/// Whether a value is an array of strings.
-fn all_texts(v: ref TomlValue) -> bool {
-    match v {
-        Array(items) -> {
-            for it in items {
-                if toml.kind(it) != "string" {
-                    return false
-                }
-            }
-            true
+    let pkg_keys = ["name", "version", "capabilities", "entry", "links", "runtime"]
+    for k in doc.t_keys[pkg] {
+        if not pkg_keys.contains(k) {
+            return (false, "`[package]` has no key `{k}` — it takes `name`, `version`, `capabilities`, `entry`, `links`, `runtime`", none)
         }
-        _ -> false
     }
+    let root = rtoml.table(doc, "")
+    if root >= 0 and doc.t_keys[root].len() > 0 {
+        return (false, "`{doc.t_keys[root][0]}` is written above the first table header, so it belongs to no table — put it under `[package]`", none)
+    }
+    for tn in doc.t_names {
+        if tn == "" or tn == "package" or tn == "dependencies" {
+            continue
+        }
+        if tn.starts_with("dependencies.") and tn.len() > 13 {
+            continue
+        }
+        return (false, "`[{tn}]` is not a table this manifest has — it takes `[package]` and `[dependencies.<name>]`", none)
+    }
+    for ti in rtoml.subtables(doc, "dependencies") {
+        let full = doc.t_names[ti]
+        let d = full.substr(13, full.len() - 13)
+        for k in doc.t_keys[ti] {
+            if k != "path" and k != "version" {
+                return (false, "dependency `{d}` has no key `{k}` — it takes `path` or `version`", none)
+            }
+        }
+    }
+    if not is_identifier(name) {
+        return (false, "`{name}` is not a usable package name: a consumer writes `import {name}`, so it has to be a Grasm identifier — letters, digits and `_`, not starting with a digit, and not a keyword", none)
+    }
+    (true, "", Manifest{ ok: true, why: "", name: name, version: version, dep_names: dep_names, dep_paths: paths, dep_reqs: reqs, has_caps: has_caps, caps: caps, entry: entry })
 }
 
 /// A library name a link line may take: letters, digits, `_`, `-`, `.` and
@@ -846,7 +984,9 @@ pub fn resolve_graph(root_dir: str) -> Resolution {
     var visiting: [str] = []
     var done_names: [str] = []
     var done_dirs: [str] = []
-    visit(root_dir, reg, sel, r, visiting, done_names, done_dirs)
+    var done_versions: [str] = []
+    var done_by: [str] = []
+    visit(root_dir, "\0", reg, sel, r, visiting, done_names, done_dirs, done_versions, done_by)
     r
 }
 
@@ -857,16 +997,18 @@ pub fn resolve_graph(root_dir: str) -> Resolution {
 // at or above the highest floor anyone in the graph states.
 // ---------------------------------------------------------------------
 
-/// The registry's root, or "\0" when there is none.
+/// The registry's root, or "\0" when there is none: from the package's
+/// canonical directory up, or from the working directory joined to it.
 fn discover_registry(from: str) -> str {
     match env("GRASM_REGISTRY") {
         Some(d) -> return d
         None -> ()
     }
-    var start = from
-    if not from.starts_with("/") {
+    var start = canonicalize(from)
+    if start == "\0" {
+        start = from
         match env("PWD") {
-            Some(cwd) -> start = tidy(join(cwd, from))
+            Some(cwd) -> start = join(cwd, from)
             None -> ()
         }
     }
@@ -882,31 +1024,52 @@ fn discover_registry(from: str) -> str {
     "\0"
 }
 
-fn version_less(a: str, b: str) -> bool {
-    let x = version_nums(a)
-    let y = version_nums(b)
-    for i in 0..3 {
-        if x[i] != y[i] {
-            return x[i] < y[i]
-        }
-    }
-    false
-}
-
-/// Every version of `name` the registry holds.
+/// Every version of `name` the registry holds, normalized and ascending.
 fn registry_versions(reg: str, name: str) -> [str] {
     var out: [str] = []
     match list_dir(join(reg, name)) {
         Ok(entries) -> {
             for v in entries {
-                if version_ok(v) and file_exists(join(join(join(reg, name), v), "grasm.toml")) {
-                    out.push(v)
+                if version_ok(v) and is_file(join(join(join(reg, name), v), "grasm.toml")) {
+                    out.push(version_shown(v))
                 }
             }
         }
         Err(_) -> ()
     }
+    // Insertion sort by version: the lists are short.
+    for i in 1..out.len() {
+        var j = i
+        while j > 0 and version_less(out[j], out[j - 1]) {
+            let tmp = out[j]
+            out[j] = out[j - 1]
+            out[j - 1] = tmp
+            j -= 1
+        }
+    }
     out
+}
+
+/// `Path::is_file`: there, and not a directory.
+fn is_file(p: str) -> bool {
+    if not file_exists(p) {
+        return false
+    }
+    match list_dir(p) {
+        Ok(_) -> false
+        Err(_) -> true
+    }
+}
+
+/// `missing_registry`.
+fn missing_registry(name: str, req_by: [str], req_on: [str]) -> str {
+    var who = "this package"
+    for i in 0..req_on.len() {
+        if req_on[i] == name and who == "this package" {
+            who = req_by[i]
+        }
+    }
+    "`{who}` requires `{name}` from the registry, but no registry was found.\n  set GRASM_REGISTRY, or create .grasm/registry beside the package"
 }
 
 /// Minimal version selection: (ok, why, names, versions).
@@ -916,13 +1079,13 @@ fn select_versions(root_dir: str, reg: str) -> (bool, str, [str], [str]) {
     var sel_names: [str] = []
     var sel: [str] = []
     for _ in 0..1000 {
-        let (cok, cwhy, req_on, req_req) = collect_requirements(root_dir, reg, sel_names, sel)
+        let (cok, cwhy, req_by, req_on, req_req) = collect_requirements(root_dir, reg, sel_names, sel)
         if not cok {
             return (false, cwhy, [], [])
         }
         var raised = false
         for i in 0..req_on.len() {
-            let fl = req_version(req_req[i])
+            let fl = version_shown(req_version(req_req[i]))
             var at = -1
             for j in 0..floor_names.len() {
                 if floor_names[j] == req_on[i] {
@@ -961,25 +1124,40 @@ fn select_versions(root_dir: str, reg: str) -> (bool, str, [str], [str]) {
         var next: [str] = []
         for i in order {
             if reg == "\0" {
-                return (false, "dependency `{floor_names[i]}` has no path and there is no registry", [], [])
+                return (false, missing_registry(floor_names[i], req_by, req_on), [], [])
             }
+            let available = registry_versions(reg, floor_names[i])
             var pick = "\0"
-            for v in registry_versions(reg, floor_names[i]) {
+            for v in available {
                 if not version_less(v, floors[i]) and (pick == "\0" or version_less(v, pick)) {
                     pick = v
                 }
             }
             if pick == "\0" {
-                return (false, "no version of `{floor_names[i]}` at or above {floors[i]}", [], [])
+                if available.len() == 0 {
+                    return (false, "the registry has no package named `{floor_names[i]}`\n  looked in {join(reg, floor_names[i])}", [], [])
+                }
+                return (false, "the registry has no `{floor_names[i]}` at or above {floors[i]}\n  available: {available.join(", ")}", [], [])
             }
             next_names.push(floor_names[i])
             next.push(pick)
         }
         if next_names == sel_names and next == sel and not raised {
+            // `verify`: the selection satisfies everyone, or who disagrees.
             for i in 0..req_on.len() {
                 for j in 0..sel_names.len() {
                     if sel_names[j] == req_on[i] and not req_matches(req_req[i], sel[j]) {
-                        return (false, "no version of `{req_on[i]}` satisfies every requirement", [], [])
+                        var who: [str] = []
+                        for k in 0..req_on.len() {
+                            if req_on[k] == req_on[i] {
+                                let line = "  `{req_by[k]}` requires {req_shown(req_req[k])}"
+                                if not who.contains(line) {
+                                    who.push(line)
+                                }
+                            }
+                        }
+                        who.sort()
+                        return (false, "no version of `{req_on[i]}` satisfies every requirement:\n{who.join("\n")}\n  selected {sel[j]}, the lowest available at or above the highest floor\n  nothing here can be satisfied at once — one of these has to change", [], [])
                     }
                 }
             }
@@ -988,50 +1166,53 @@ fn select_versions(root_dir: str, reg: str) -> (bool, str, [str], [str]) {
         sel_names = next_names
         sel = next
     }
-    (false, "version selection did not settle", [], [])
+    (false, "version selection did not settle; is the registry changing?", [], [])
 }
 
 /// Every registry requirement stated in the graph, given the versions
-/// selected so far: (ok, why, on, requirement).
-fn collect_requirements(root_dir: str, reg: str, sel_names: [str], sel: [str]) -> (bool, str, [str], [str]) {
+/// selected so far: (ok, why, by, on, requirement). Manifests are loaded as
+/// they are queued, the last queued visited first.
+fn collect_requirements(root_dir: str, reg: str, sel_names: [str], sel: [str]) -> (bool, str, [str], [str], [str]) {
+    var by: [str] = []
     var on: [str] = []
     var reqs: [str] = []
     var seen: Map[str, bool] = map()
     var queue: [str] = [root_dir]
+    var queued: [Manifest] = [load_manifest(root_dir)]
     while queue.len() > 0 {
         let dir = queue.pop() ?? ""
+        let m = queued.pop() ?? bad_manifest("")
         let key = real_dir(dir)
         if seen.has(key) {
             continue
         }
         seen.set(key, true)
-        let m = load_manifest(dir)
-        if not m.ok {
-            return (false, m.why, [], [])
-        }
         for i in 0..m.dep_names.len() {
             if m.dep_paths[i] != "\0" {
                 let d = join(dir, m.dep_paths[i])
-                if file_exists(join(d, "grasm.toml")) {
+                if is_file(join(d, "grasm.toml")) {
                     let dm = load_manifest(d)
                     if not dm.ok {
-                        return (false, dm.why, [], [])
+                        return (false, dm.why, [], [], [])
                     }
                     queue.push(d)
+                    queued.push(dm)
                 }
             } else {
+                by.push(m.name)
                 on.push(m.dep_names[i])
                 reqs.push(m.dep_reqs[i])
                 if reg != "\0" {
                     for j in 0..sel_names.len() {
                         if sel_names[j] == m.dep_names[i] {
                             let d = join(join(reg, m.dep_names[i]), sel[j])
-                            if file_exists(join(d, "grasm.toml")) {
+                            if is_file(join(d, "grasm.toml")) {
                                 let dm = load_manifest(d)
                                 if not dm.ok {
-                                    return (false, dm.why, [], [])
+                                    return (false, dm.why, [], [], [])
                                 }
                                 queue.push(d)
+                                queued.push(dm)
                             }
                         }
                     }
@@ -1039,10 +1220,10 @@ fn collect_requirements(root_dir: str, reg: str, sel_names: [str], sel: [str]) -
             }
         }
     }
-    (true, "", on, reqs)
+    (true, "", by, on, reqs)
 }
 
-fn visit(dir: str, reg: str, sel: Map[str, str], inout r: Resolution, inout visiting: [str], inout done_names: [str], inout done_dirs: [str]) {
+fn visit(dir: str, required_by: str, reg: str, sel: Map[str, str], inout r: Resolution, inout visiting: [str], inout done_names: [str], inout done_dirs: [str], inout done_versions: [str], inout done_by: [str]) {
     if not r.ok {
         return
     }
@@ -1053,18 +1234,21 @@ fn visit(dir: str, reg: str, sel: Map[str, str], inout r: Resolution, inout visi
         return
     }
     let here = real_dir(dir)
+    let by = if required_by == "\0" { "the root package" } else { required_by }
     for i in 0..done_names.len() {
         if done_names[i] == m.name {
             if done_dirs[i] != here {
                 r.ok = false
-                r.why = "package `{m.name}` resolves to two different directories"
+                r.why = "package `{m.name}` resolves to two different directories:\n  {done_dirs[i]} is {done_versions[i]} (required by `{done_by[i]}`)\n  {here} is {m.version} (required by `{by}`)\na name resolves to one package, so these have to be the same directory"
             }
             return
         }
     }
     if visiting.contains(m.name) {
         r.ok = false
-        r.why = "dependency cycle"
+        var cycle = visiting
+        cycle.push(m.name)
+        r.why = "dependency cycle: {cycle.join(" -> ")}"
         return
     }
     visiting.push(m.name)
@@ -1073,10 +1257,15 @@ fn visit(dir: str, reg: str, sel: Map[str, str], inout r: Resolution, inout visi
         if m.dep_paths[i] != "\0" {
             dep_dir = join(dir, m.dep_paths[i])
         } else {
-            let v = sel.get(m.dep_names[i]) ?? "\0"
-            if reg == "\0" or v == "\0" {
+            if reg == "\0" {
                 r.ok = false
-                r.why = "dependency `{m.dep_names[i]}` has no path and no version was selected for it"
+                r.why = missing_registry(m.dep_names[i], [], [])
+                return
+            }
+            let v = sel.get(m.dep_names[i]) ?? "\0"
+            if v == "\0" {
+                r.ok = false
+                r.why = "internal: no version selected for `{m.dep_names[i]}`"
                 return
             }
             dep_dir = join(join(reg, m.dep_names[i]), v)
@@ -1099,10 +1288,10 @@ fn visit(dir: str, reg: str, sel: Map[str, str], inout r: Resolution, inout visi
         }
         if m.dep_reqs[i] != "\0" and not req_matches(m.dep_reqs[i], dm.version) {
             r.ok = false
-            r.why = "dependency `{m.dep_names[i]}` of `{m.name}`: requires {m.dep_reqs[i]}, but {dep_dir} is {dm.version}"
+            r.why = "dependency `{m.dep_names[i]}` of `{m.name}`: requires {req_shown(m.dep_reqs[i])}, but {dep_dir} is {version_shown(dm.version)}"
             return
         }
-        visit(dep_dir, reg, sel, r, visiting, done_names, done_dirs)
+        visit(dep_dir, m.name, reg, sel, r, visiting, done_names, done_dirs, done_versions, done_by)
         if not r.ok {
             return
         }
@@ -1110,6 +1299,8 @@ fn visit(dir: str, reg: str, sel: Map[str, str], inout r: Resolution, inout visi
     visiting.pop()
     done_names.push(m.name)
     done_dirs.push(here)
+    done_versions.push(version_shown(m.version))
+    done_by.push(by)
     r.names.push(m.name)
     r.dirs.push(dir)
     r.mfs.push(m)
@@ -1150,9 +1341,8 @@ fn registry_packages(entry: str) -> Graph {
         return Graph{ fatal: res.why, names: [], dirs: [] }
     }
     var g = Graph{ fatal: "", names: [], dirs: [] }
-    let me = real_dir(pkg_dir)
     for i in 0..res.names.len() {
-        if real_dir(res.dirs[i]) != me {
+        if not same_dir(res.dirs[i], pkg_dir) {
             g.names.push(res.names[i])
             g.dirs.push(res.dirs[i])
         }
@@ -1291,8 +1481,124 @@ fn provide(inout cx: Ctx, name: str) -> str {
     }
 }
 
+/// An I/O error as Rust's `io::Error` displays one: the system's message and
+/// its number, `No such file or directory (os error 2)`. The runtime's
+/// `IoError` carries the message alone, so the number is found from it, in
+/// this system's `strerror` table (macOS, errors 1 to 107).
+pub fn io_error_text(e: IoError) -> str {
+    let msg = match e {
+        NotFound(_) -> "No such file or directory"
+        IoFailed(m) -> m
+    }
+    let table = ["Operation not permitted", "No such file or directory", "No such process", "Interrupted system call", "Input/output error", "Device not configured", "Argument list too long", "Exec format error", "Bad file descriptor", "No child processes", "Resource deadlock avoided", "Cannot allocate memory", "Permission denied", "Bad address", "Block device required", "Resource busy", "File exists", "Cross-device link", "Operation not supported by device", "Not a directory", "Is a directory", "Invalid argument", "Too many open files in system", "Too many open files", "Inappropriate ioctl for device", "Text file busy", "File too large", "No space left on device", "Illegal seek", "Read-only file system", "Too many links", "Broken pipe", "Numerical argument out of domain", "Result too large", "Resource temporarily unavailable", "Operation now in progress", "Operation already in progress", "Socket operation on non-socket", "Destination address required", "Message too long", "Protocol wrong type for socket", "Protocol not available", "Protocol not supported", "Socket type not supported", "Operation not supported", "Protocol family not supported", "Address family not supported by protocol family", "Address already in use", "Can't assign requested address", "Network is down", "Network is unreachable", "Network dropped connection on reset", "Software caused connection abort", "Connection reset by peer", "No buffer space available", "Socket is already connected", "Socket is not connected", "Can't send after socket shutdown", "Too many references: can't splice", "Operation timed out", "Connection refused", "Too many levels of symbolic links", "File name too long", "Host is down", "No route to host", "Directory not empty", "Too many processes", "Too many users", "Disc quota exceeded", "Stale NFS file handle", "Too many levels of remote in path", "RPC struct is bad", "RPC version wrong", "RPC prog. not avail", "Program version wrong", "Bad procedure for program", "No locks available", "Function not implemented", "Inappropriate file type or format", "Authentication error", "Need authenticator", "Device power is off", "Device error", "Value too large to be stored in data type", "Bad executable (or shared library)", "Bad CPU type in executable", "Shared library version mismatch", "Malformed Mach-o file", "Operation canceled", "Identifier removed", "No message of desired type", "Illegal byte sequence", "Attribute not found", "Bad message", "EMULTIHOP (Reserved)", "No message available on STREAM", "ENOLINK (Reserved)", "No STREAM resources", "Not a STREAM", "Protocol error", "STREAM ioctl timeout", "Operation not supported on socket", "Policy not found", "State not recoverable", "Previous owner died", "Interface output queue is full", "Capabilities insufficient"]
+    for i in 0..table.len() {
+        if table[i] == msg {
+            return "{msg} (os error {i + 1})"
+        }
+    }
+    msg
+}
+
 fn empty_loaded(fatal: str) -> Loaded {
-    Loaded{ names: [], aliases: [], paths: [], srcs: [], bases: [], imp_alias: [], imp_full: [], mods: [], diags: [], runtime: map(), deps: [], fatal: fatal }
+    Loaded{ names: [], aliases: [], paths: [], srcs: [], bases: [], imp_alias: [], imp_full: [], mods: [], diags: [], d_s: [], d_e: [], d_help: [], runtime: map(), deps: [], fatal: fatal }
+}
+
+fn load_diag(inout out: Loaded, s: i64, e: i64, msg: str, help: str) {
+    out.diags.push(msg)
+    out.d_s.push(s)
+    out.d_e.push(e)
+    out.d_help.push(help)
+}
+
+/// A module's parse diagnostics, moved to the program's offsets -- all but
+/// those made inside an interpolation inside an interpolation, which the
+/// Rust parser leaves where they were.
+fn parse_diags(inout out: Loaded, ps: Parser, base: i64) {
+    for i in 0..ps.d_msg.len() {
+        if ps.d_deep[i] {
+            load_diag(out, ps.d_s[i], ps.d_e[i], ps.d_msg[i], ps.d_help[i])
+        } else {
+            load_diag(out, ps.d_s[i] + base, ps.d_e[i] + base, ps.d_msg[i], ps.d_help[i])
+        }
+    }
+}
+
+/// "cannot load module": named as the import wrote it, with every place
+/// that was tried, or the path that was looked for when nothing says more.
+fn not_loaded(written: str, display: str, candidates: [str]) -> str {
+    if candidates.len() == 0 {
+        return "cannot load module `{written}` (looked for `{display}`)"
+    }
+    "cannot load module `{written}` (looked in:\n  {candidates.join("\n  ")})"
+}
+
+/// The places `provide` looks for module `name` (loader.rs `tried`).
+fn tried(cx: Ctx, name: str, truncated: bool) -> [str] {
+    let root = first_seg(name)
+    match cx.prefix_dirs.get(root) {
+        Some(dir) -> {
+            var out: [str] = []
+            candidates_in_package(dir, after_first_seg(name), root, 0, out)
+            if truncated {
+                return ["the package graph is more than {MAX_PACKAGE_DEPTH} deep from the entry, so `{root}`'s dependencies past that point were not resolved as package names"]
+            }
+            return cap_candidates(out)
+        }
+        None -> ()
+    }
+    var out = [tidy(join(cx.entry_src_dir, dotted_to_path(name) + ".gr"))]
+    match cx.deps.get(root) {
+        Some(dir) -> {
+            if cx.entry_declares.contains(root) {
+                out.push("{tidy(package_entry(dir))} (entry file of dependency `{root}`)")
+            } else {
+                out.push("no dependency named `{root}` in grasm.toml — it is somewhere in the graph, reached through another package; add it here to import it")
+            }
+        }
+        None -> out.push("no dependency named `{root}` in grasm.toml")
+    }
+    out
+}
+
+/// At most eight candidates, the last ones, and a count of the rest.
+fn cap_candidates(out: [str]) -> [str] {
+    if out.len() <= 8 {
+        return out
+    }
+    let dropped = out.len() - 8
+    var kept = ["… {dropped} earlier candidate(s) in packages between the entry and here"]
+    for i in dropped..out.len() {
+        kept.push(out[i])
+    }
+    kept
+}
+
+/// The paths `resolve_in_package` would open, in its order.
+fn candidates_in_package(pkg_dir: str, rest: str, pkg_name: str, depth: i64, inout out: [str]) {
+    let entry = package_entry(pkg_dir)
+    if rest == "" {
+        out.push("{tidy(entry)} (entry file of dependency `{pkg_name}`)")
+        return
+    }
+    if depth > MAX_PACKAGE_DEPTH {
+        out.push("the package graph is more than {MAX_PACKAGE_DEPTH} deep from the entry, so this import was not resolved as a dependency name")
+        return
+    }
+    let src_dir = parent(entry)
+    if src_dir == "\0" {
+        return
+    }
+    out.push(tidy(join(src_dir, dotted_to_path(rest) + ".gr")))
+    let head = first_seg(rest)
+    let tail = after_first_seg(rest)
+    match package_dependencies(src_dir).get(head) {
+        Some(d) -> candidates_in_package(d, tail, head, depth + 1, out)
+        None -> {
+            if rest.contains(".") {
+                out.push("no dependency named `{head}` in `{pkg_name}`'s grasm.toml")
+            }
+        }
+    }
 }
 
 /// Loads the program whose entry file is `entry_path`.
@@ -1318,7 +1624,7 @@ pub fn load_with(entry_path: str, resolved: Map[str, str]) -> Loaded {
     let entry_display = tidy(entry_path)
     let entry_bytes = match read_bytes(entry_path) {
         Ok(b) -> b
-        Err(e) -> return empty_loaded("cannot read `{entry_display}`: {e}")
+        Err(e) -> return empty_loaded("cannot read `{entry_display}`: {io_error_text(e)}")
     }
     if not utf8_ok(entry_bytes) {
         return empty_loaded("cannot read `{entry_display}`: stream did not contain valid UTF-8")
@@ -1377,17 +1683,24 @@ pub fn load_with(entry_path: str, resolved: Map[str, str]) -> Loaded {
     var loaded: Map[str, bool] = map()
     var q_name: [str] = ["main"]
     var q_disp: [str] = [entry_display]
+    // Where each was asked for, and how the import wrote it.
+    var q_s: [i64] = [0]
+    var q_e: [i64] = [1]
+    var q_written: [str] = ["main"]
     var base = 0
     while q_name.len() > 0 {
         let name = q_name.pop() ?? ""
         let display = q_disp.pop() ?? ""
+        let asked_s = q_s.pop() ?? 0
+        let asked_e = q_e.pop() ?? 0
+        let asked_as = q_written.pop() ?? ""
         if loaded.has(name) {
             continue
         }
         loaded.set(name, true)
         let src = provide(cx, name)
         if src == "\0" {
-            out.diags.push("cannot load module `{name}`")
+            load_diag(out, asked_s, asked_e, not_loaded(asked_as, display, tried(cx, name, truncated)), "")
             continue
         }
         let sb = src.to_bytes()
@@ -1395,9 +1708,7 @@ pub fn load_with(entry_path: str, resolved: Map[str, str]) -> Loaded {
         let p = parse.parse(sb, lx)
         let c = cst.build(p)
         let m = ast.build(c, sb, p.wide_ints, lx.doc_start, lx.doc_end, lx.doc_text)
-        for i in 0..p.d_msg.len() {
-            out.diags.push(p.d_msg[i])
-        }
+        parse_diags(out, p, base)
         let owner = longest_prefix(dep_names, name)
         var ia: [str] = []
         var ifull: [str] = []
@@ -1435,7 +1746,7 @@ pub fn load_with(entry_path: str, resolved: Map[str, str]) -> Loaded {
                 }
             }
             if dup >= 0 {
-                out.diags.push("duplicate import alias `{alias}` in module `{name}`")
+                load_diag(out, m.a.s[d] + base, m.a.e[d] + base, "duplicate import alias `{alias}` in module `{name}`", "")
                 ifull[dup] = full
             } else {
                 ia.push(alias)
@@ -1443,6 +1754,9 @@ pub fn load_with(entry_path: str, resolved: Map[str, str]) -> Loaded {
             }
             q_name.push(full)
             q_disp.push(dotted_to_path(full) + ".gr")
+            q_s.push(m.a.s[d] + base)
+            q_e.push(m.a.e[d] + base)
+            q_written.push(written)
         }
         out.names.push(name)
         out.aliases.push(last_seg(name))
@@ -1497,10 +1811,16 @@ fn load_bundle(src: str) -> Loaded {
     var loaded: Map[str, bool] = map()
     var q_name: [str] = [entry]
     var q_disp: [str] = [if entry == "main" { "<bundle>" } else { "<bundle>:" + entry }]
+    var q_s: [i64] = [0]
+    var q_e: [i64] = [1]
+    var q_written: [str] = [entry]
     var base = 0
     while q_name.len() > 0 {
         let name = q_name.pop() ?? ""
         let display = q_disp.pop() ?? ""
+        let asked_s = q_s.pop() ?? 0
+        let asked_e = q_e.pop() ?? 0
+        let asked_as = q_written.pop() ?? ""
         if loaded.has(name) {
             continue
         }
@@ -1508,7 +1828,7 @@ fn load_bundle(src: str) -> Loaded {
         let msrc = match table.get(name) {
             Some(x) -> x
             None -> {
-                out.diags.push("cannot load module `{name}`")
+                load_diag(out, asked_s, asked_e, not_loaded(asked_as, display, []), "")
                 continue
             }
         }
@@ -1517,9 +1837,7 @@ fn load_bundle(src: str) -> Loaded {
         let ps = parse.parse(sb, lx)
         let c = cst.build(ps)
         let m = ast.build(c, sb, ps.wide_ints, lx.doc_start, lx.doc_end, lx.doc_text)
-        for i in 0..ps.d_msg.len() {
-            out.diags.push(ps.d_msg[i])
-        }
+        parse_diags(out, ps, base)
         var ia: [str] = []
         var ifull: [str] = []
         for d in m.decls {
@@ -1566,7 +1884,7 @@ fn load_bundle(src: str) -> Loaded {
                 }
             }
             if dup >= 0 {
-                out.diags.push("duplicate import alias `{alias}` in module `{name}`")
+                load_diag(out, m.a.s[d] + base, m.a.e[d] + base, "duplicate import alias `{alias}` in module `{name}`", "")
                 ifull[dup] = full
             } else {
                 ia.push(alias)
@@ -1574,6 +1892,9 @@ fn load_bundle(src: str) -> Loaded {
             }
             q_name.push(full)
             q_disp.push(dotted_to_path(full) + ".gr")
+            q_s.push(m.a.s[d] + base)
+            q_e.push(m.a.e[d] + base)
+            q_written.push(written)
         }
         out.names.push(name)
         out.aliases.push(last_seg(name))

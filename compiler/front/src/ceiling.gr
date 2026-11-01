@@ -14,10 +14,18 @@ import effrows
 import lex
 import parse
 import cst
+import builtin_rows
 
 /// The breaches, one message each; none when the program is within every
 /// ceiling or is not in a package.
 pub fn check(entry_path: str, p: Prog, c: Ck, inout t: Tys) -> [str] {
+    let (msgs, _) = check_with_help(entry_path, p, c, t)
+    msgs
+}
+
+/// The breaches, each with the help `grasm check` prints under it ("" for
+/// none): where the package performs each effect it should not.
+pub fn check_with_help(entry_path: str, p: Prog, c: Ck, inout t: Tys) -> ([str], [str]) {
     var here = loader.parent(entry_path)
     var pkg_dir = "\0"
     while here != "\0" {
@@ -28,13 +36,14 @@ pub fn check(entry_path: str, p: Prog, c: Ck, inout t: Tys) -> [str] {
         here = loader.parent(here)
     }
     if pkg_dir == "\0" {
-        return []
+        return ([], [])
     }
     let res = loader.resolve_graph(pkg_dir)
     if not res.ok {
-        return [res.why]
+        return ([res.why], [""])
     }
     var out: [str] = []
+    var helps: [str] = []
     var by_pkg_done = false
     var by_pkg: Map[str, [str]] = map()
     for i in 0..res.names.len() {
@@ -44,7 +53,10 @@ pub fn check(entry_path: str, p: Prog, c: Ck, inout t: Tys) -> [str] {
         }
         let (ok, why, performed) = effects_of_package(res.dirs[i], m)
         if not ok {
-            out.push("cannot check the capability ceiling of `{m.name}`: {why}")
+            // The reason is not said: `grasm check` names the package.
+            let _ = why
+            out.push("cannot check the capability ceiling of `{m.name}` — refusing to build against a dependency whose reach is unknown")
+            helps.push("")
             continue
         }
         if not by_pkg_done {
@@ -65,10 +77,277 @@ pub fn check(entry_path: str, p: Prog, c: Ck, inout t: Tys) -> [str] {
             }
         }
         if exceeded.len() > 0 {
-            out.push("package `{m.name}` performs `{exceeded.join("`, `")}` but its manifest only permits {m.caps}")
+            var caps: Map[str, bool] = map()
+            for e in m.caps {
+                caps.set(e, true)
+            }
+            var declared = "nothing"
+            if caps.len() > 0 {
+                declared = "`" + effrows.sorted_keys(caps).join("`, `") + "`"
+            }
+            out.push("package `{m.name}` performs `{exceeded.join("`, `")}` but its manifest only permits {declared}")
+            // Where each effect happens, when it has a place to point at.
+            let sites = effect_sites_of_package(res.dirs[i], m)
+            var where_at: [str] = []
+            for e in exceeded {
+                match sites.get(e) {
+                    Some(at) -> where_at.push("`{e}` at {at}")
+                    None -> ()
+                }
+            }
+            var help = "either add the capability to that package's manifest, or stop it from performing the effect"
+            if where_at.len() > 0 {
+                help = help + "\n  performed: " + where_at.join(", ")
+            }
+            helps.push(help)
+        }
+    }
+    (out, helps)
+}
+
+/// Where a package performs each effect, as `path:line:column` of the first
+/// place (grasm_pkg `effect_sites_of_package`): its entry file's program,
+/// then every other source file it has, each loaded as a program.
+fn effect_sites_of_package(dir: str, m: Manifest) -> Map[str, str] {
+    var out: Map[str, str] = map()
+    let entry = loader.join(dir, m.entry)
+    if not file_exists(entry) {
+        return out
+    }
+    var owng: Map[str, str] = map()
+    let r = loader.resolve_graph(dir)
+    if r.ok {
+        for i in 0..r.names.len() {
+            owng.set(r.names[i], r.dirs[i])
+        }
+    }
+    let l = loader.load_with(entry, owng)
+    if l.fatal != "" {
+        // `load_from_disk_with(..)?`: no sites at all.
+        return map()
+    }
+    sites_of(prog.build(l), out)
+    for f in source_files(dir) {
+        if f != entry {
+            let l2 = loader.load_with(f, owng)
+            if l2.fatal == "" {
+                sites_of(prog.build(l2), out)
+            }
         }
     }
     out
+}
+
+/// effects.rs `effect_sites`: every function's syntactic effect sites, the
+/// first one of each effect kept.
+fn sites_of(p: Prog, inout out: Map[str, str]) {
+    for mi in 0..p.m_name.len() {
+        var externs: Map[str, bool] = map()
+        var effects: Map[str, bool] = map()
+        for d in p.m_decls[mi] {
+            let k = prog.kind(p, d)
+            if k == ast.D_EXTERN {
+                externs.set(prog.name(p, prog.sl(p, d, 1)), true)
+            } else if k == ast.D_EFFECT {
+                effects.set(prog.name(p, prog.sl(p, d, 0)), true)
+            }
+        }
+        for d in p.m_decls[mi] {
+            if prog.kind(p, d) != ast.D_FN {
+                continue
+            }
+            var names: [str] = []
+            var ss: [i64] = []
+            if prog.sl(p, d, 1) != 0 {
+                let nm = prog.sl(p, d, 2)
+                names.push("unsafe")
+                ss.push(prog.s(p, nm))
+            }
+            site_block(p, prog.sl(p, d, 9), externs, effects, names, ss)
+            for i in 0..names.len() {
+                if not out.has(names[i]) {
+                    out.set(names[i], site_at(p, mi, ss[i]))
+                }
+            }
+        }
+    }
+}
+
+/// `path:line:column` of a program offset, the column in characters.
+fn site_at(p: Prog, mi: i64, start: i64) -> str {
+    let src = p.m_src[mi]
+    var off = start - p.m_base[mi]
+    if off < 0 {
+        off = 0
+    }
+    if off > src.len() {
+        off = src.len()
+    }
+    var line = 1
+    var col = 1
+    for i in 0..off {
+        let b = src.at(i)
+        if b == 10 {
+            line += 1
+            col = 1
+        } else if b < 128 or b >= 192 {
+            col += 1
+        }
+    }
+    "{p.m_path[mi]}:{line}:{col}"
+}
+
+fn site_block(p: Prog, b: i64, externs: Map[str, bool], effects: Map[str, bool], inout names: [str], inout ss: [i64]) {
+    for st in prog.stmts(p, b) {
+        let k = prog.kind(p, st)
+        if k == ast.S_LET {
+            site_expr(p, prog.sl(p, st, 3), externs, effects, names, ss)
+        } else if k == ast.S_ASSIGN {
+            site_expr(p, prog.sl(p, st, 2), externs, effects, names, ss)
+        } else if k == ast.S_EXPR {
+            site_expr(p, prog.sl(p, st, 0), externs, effects, names, ss)
+        } else if k == ast.S_RETURN {
+            let v = prog.sl(p, st, 0)
+            if v >= 0 {
+                site_expr(p, v, externs, effects, names, ss)
+            }
+        } else if k == ast.S_WHILE {
+            site_expr(p, prog.sl(p, st, 0), externs, effects, names, ss)
+            site_block(p, prog.sl(p, st, 1), externs, effects, names, ss)
+        } else if k == ast.S_FOR {
+            site_expr(p, prog.sl(p, st, 1), externs, effects, names, ss)
+            site_block(p, prog.sl(p, st, 2), externs, effects, names, ss)
+        } else if k == ast.S_WITH {
+            site_block(p, prog.sl(p, st, 2), externs, effects, names, ss)
+        } else if k == ast.S_PARALLEL or k == ast.S_SPAWN {
+            site_block(p, prog.sl(p, st, 0), externs, effects, names, ss)
+        }
+    }
+}
+
+fn is_mem_method(name: str) -> bool {
+    let layout = ["i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64", "f64", "addr"]
+    if name.starts_with("load_") {
+        return layout.contains(name.substr(5, name.len() - 5))
+    }
+    if name.starts_with("store_") {
+        return layout.contains(name.substr(6, name.len() - 6))
+    }
+    if name.starts_with("atomic_") {
+        let rest = name.substr(7, name.len() - 7)
+        match rest.index_of("_") {
+            Some(i) -> {
+                let op = rest.substr(0, i)
+                let ty = rest.substr(i + 1, rest.len() - i - 1)
+                let ok_op = op == "load" or op == "store" or op == "cas" or op == "add"
+                return ok_op and layout.contains(ty) and ty != "f64" and ty != "addr"
+            }
+            None -> return false
+        }
+    }
+    false
+}
+
+fn site_expr(p: Prog, e0: i64, externs: Map[str, bool], effects: Map[str, bool], inout names: [str], inout ss: [i64]) {
+    // A binary operator's right operand and an `else if` in this loop, not
+    // by recursion: their chains are as long as they are written.
+    var e = e0
+    while e >= 0 {
+        e = site_one(p, e, externs, effects, names, ss)
+    }
+}
+
+/// One node of `site_expr`; the node to walk next in its place, or -1.
+fn site_one(p: Prog, e: i64, externs: Map[str, bool], effects: Map[str, bool], inout names: [str], inout ss: [i64]) -> i64 {
+    let k = prog.kind(p, e)
+    if k == ast.E_CALL {
+        let callee = prog.sl(p, e, 0)
+        if prog.kind(p, callee) == ast.E_IDENT {
+            let n = prog.name(p, prog.sl(p, callee, 0))
+            for ef in builtin_rows.row_of(n) {
+                names.push(ef)
+                ss.push(prog.es(p, e))
+            }
+            if externs.has(n) {
+                names.push("io")
+                ss.push(prog.es(p, e))
+                names.push("unsafe")
+                ss.push(prog.es(p, e))
+            }
+        }
+        site_expr(p, callee, externs, effects, names, ss)
+        for a in prog.items(p, prog.sl(p, e, 1)) {
+            site_expr(p, a, externs, effects, names, ss)
+        }
+    } else if k == ast.E_METHOD {
+        let recv = prog.sl(p, e, 0)
+        if prog.kind(p, recv) == ast.E_IDENT {
+            let tn = prog.name(p, prog.sl(p, recv, 0))
+            if effects.has(tn) {
+                names.push(tn)
+                ss.push(prog.es(p, e))
+            }
+        }
+        if is_mem_method(prog.name(p, prog.sl(p, e, 1))) {
+            names.push("mem")
+            ss.push(prog.es(p, e))
+        }
+        site_expr(p, recv, externs, effects, names, ss)
+        for a in prog.items(p, prog.sl(p, e, 2)) {
+            site_expr(p, a, externs, effects, names, ss)
+        }
+    } else if k == ast.E_UNSAFE {
+        let b = prog.sl(p, e, 0)
+        names.push("unsafe")
+        ss.push(prog.s(p, b))
+        site_block(p, b, externs, effects, names, ss)
+    } else if k == ast.E_BLOCK or k == ast.E_REGION {
+        site_block(p, prog.sl(p, e, 0), externs, effects, names, ss)
+    } else if k == ast.E_IF {
+        site_expr(p, prog.sl(p, e, 0), externs, effects, names, ss)
+        site_block(p, prog.sl(p, e, 1), externs, effects, names, ss)
+        let eb = prog.sl(p, e, 2)
+        if eb >= 0 {
+            if prog.kind(p, eb) == ast.EB_ELSE {
+                site_block(p, prog.sl(p, eb, 0), externs, effects, names, ss)
+            } else {
+                return prog.sl(p, eb, 0)
+            }
+        }
+    } else if k == ast.E_MATCH {
+        site_expr(p, prog.sl(p, e, 0), externs, effects, names, ss)
+        for arm in prog.items(p, prog.sl(p, e, 1)) {
+            site_expr(p, prog.sl(p, arm, 2), externs, effects, names, ss)
+        }
+    } else if k == ast.E_CLOSURE {
+        site_expr(p, prog.sl(p, e, 1), externs, effects, names, ss)
+    } else if k == ast.E_UNARY {
+        site_expr(p, prog.sl(p, e, 1), externs, effects, names, ss)
+    } else if k == ast.E_TRY or k == ast.E_FIELD {
+        site_expr(p, prog.sl(p, e, 0), externs, effects, names, ss)
+    } else if k == ast.E_BINARY {
+        site_expr(p, prog.sl(p, e, 1), externs, effects, names, ss)
+        return prog.sl(p, e, 2)
+    } else if k == ast.E_INDEX {
+        site_expr(p, prog.sl(p, e, 0), externs, effects, names, ss)
+        site_expr(p, prog.sl(p, e, 1), externs, effects, names, ss)
+    } else if k == ast.E_LIST or k == ast.E_TUPLE {
+        for i in prog.items(p, prog.sl(p, e, 0)) {
+            site_expr(p, i, externs, effects, names, ss)
+        }
+    } else if k == ast.E_MAP {
+        for pr in prog.items(p, prog.sl(p, e, 0)) {
+            site_expr(p, prog.sl(p, pr, 0), externs, effects, names, ss)
+            site_expr(p, prog.sl(p, pr, 1), externs, effects, names, ss)
+        }
+    } else if k == ast.E_STR {
+        for pc in prog.items(p, prog.sl(p, e, 0)) {
+            if prog.kind(p, pc) == ast.PC_EXPR {
+                site_expr(p, prog.sl(p, pc, 0), externs, effects, names, ss)
+            }
+        }
+    }
+    -1
 }
 
 fn value_tables(c: Ck, inout t: Tys) -> (Map[i64, [str]], Map[i64, [str]]) {

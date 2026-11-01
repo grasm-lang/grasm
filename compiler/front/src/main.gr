@@ -7,6 +7,9 @@
 //     front cst <file.gr> -o <out>
 //                               the source printed back from the CST
 //     front tree <file.gr>      the CST, a node a line, for reading
+//     front check <file.gr>     every diagnostic, rendered, or `ok`, as
+//                               `grasm check` prints them
+//     front tir <file.gr>       the program's TIR, as `grasm tir` prints it
 //
 // Every command reads one file and prints what the Rust frontend's command
 // of the same name prints for it, byte for byte; the gates hold it to that.
@@ -31,7 +34,9 @@ import ceiling
 import toml
 
 fn usage() {
-    eprint("usage: front tokens <file.gr>")
+    eprint("usage: front check <file.gr>")
+    eprint("       front tir <file.gr>")
+    eprint("       front tokens <file.gr>")
     eprint("       front ast <file.gr>")
     eprint("       front cst <file.gr> -o <out>")
     eprint("       front tree <file.gr>")
@@ -424,6 +429,211 @@ fn cmd_files(path: str) {
     }
 }
 
+/// `Diagnostic::render`: `file:line:col: error: message`, the line quoted
+/// (a window of it when it is long) with carets under the span, and the
+/// help. Columns and widths are Rust's: the column counts bytes, the caret
+/// pad is that many spaces, and the carets are capped by the characters
+/// the quoted line has past it.
+fn render(file: str, src: bytes, s: i64, e: i64, msg: str, help: str) -> str {
+    let ix = line_index(src)
+    let (line, col) = line_col(ix, s)
+    let ls = ix.starts[line - 1]
+    var le = src.len()
+    if line < ix.starts.len() {
+        le = ix.starts[line]
+    }
+    while le > ls and src.at(le - 1) == 10 {
+        le -= 1
+    }
+    let full = src.slice(ls, le)
+    var width = e - s
+    if width < 1 {
+        width = 1
+    }
+    var avail = full.len() - (col - 1)
+    if avail < 1 {
+        avail = 1
+    }
+    if width > avail {
+        width = avail
+    }
+    // Where each character of the line starts.
+    var bounds: [i64] = []
+    for i in 0..full.len() {
+        let b = full.at(i)
+        if b < 128 or b >= 192 {
+            bounds.push(i)
+        }
+    }
+    let nchars = bounds.len()
+    var shown = full
+    var caret = col - 1
+    if nchars > 120 {
+        var want = width
+        if want > 60 {
+            want = 60
+        }
+        var start = caret - (120 - want) / 2
+        if start < 0 {
+            start = 0
+        }
+        var end = start + 120
+        if end > nchars {
+            end = nchars
+        }
+        start = end - 120
+        if start < 0 {
+            start = 0
+        }
+        var w = byte_builder()
+        if start > 0 {
+            w.push_str("...")
+        }
+        let bend = if end < nchars { bounds[end] } else { full.len() }
+        w.push_bytes(full.slice(bounds[start], bend))
+        if end < nchars {
+            w.push_str("...")
+        }
+        shown = w.to_bytes()
+        var lead = 0
+        if start > 0 {
+            lead = 3
+        }
+        caret = caret - start
+        if caret < 0 {
+            caret = 0
+        }
+        caret += lead
+    }
+    var shown_chars = 0
+    for i in 0..shown.len() {
+        let b = shown.at(i)
+        if b < 128 or b >= 192 {
+            shown_chars += 1
+        }
+    }
+    var n = shown_chars - caret
+    if n < 0 {
+        n = 0
+    }
+    if width < n {
+        n = width
+    }
+    if n < 1 {
+        n = 1
+    }
+    var out = byte_builder()
+    out.push_str("{file}:{line}:{col}: error: {msg}\n    ")
+    out.push_bytes(shown)
+    out.push_str("\n    ")
+    for _ in 0..caret {
+        out.push_byte(32)
+    }
+    for _ in 0..n {
+        out.push_byte(94)
+    }
+    if help != "" {
+        out.push_str("\n  help: {help}")
+    }
+    out.to_str()
+}
+
+/// `render_diags`: each diagnostic in the file that owns its span -- the
+/// last whose base it is not before -- then the count.
+fn render_all(paths: [str], srcs: [bytes], bases: [i64], ds: [i64], de: [i64], dm: [str], dh: [str]) {
+    var out = byte_builder()
+    for i in 0..ds.len() {
+        var f = 0
+        for j in 0..bases.len() {
+            if ds[i] >= bases[j] {
+                f = j
+            }
+        }
+        var s = ds[i] - bases[f]
+        if s < 0 {
+            s = 0
+        }
+        var e = de[i] - bases[f]
+        if e < 0 {
+            e = 0
+        }
+        out.push_str(render(paths[f], srcs[f], s, e, dm[i], dh[i]))
+        out.push_byte(10)
+    }
+    out.push_str("{ds.len()} error(s) found\n")
+    write_stderr(out)
+}
+
+/// What was built, which ends in a newline, on stderr as `eprint` would
+/// write it without that last newline.
+fn write_stderr(b: ByteBuilder) {
+    let n = b.len()
+    if n == 0 {
+        return
+    }
+    let all = b.to_bytes()
+    eprint(all.slice(0, n - 1).to_str())
+}
+
+/// `grasm check`: every diagnostic of the loader and the parser, or else of
+/// the checker and the effect pass, rendered; then the capability ceilings;
+/// or `ok`.
+fn cmd_check(path: str) {
+    let l = loader.load(path)
+    if l.fatal != "" {
+        eprint("error: {l.fatal}")
+        exit(1)
+    }
+    if l.diags.len() > 0 {
+        render_all(l.paths, l.srcs, l.bases, l.d_s, l.d_e, l.diags, l.d_help)
+        exit(1)
+    }
+    let p = prog.build(l)
+    let (c, t0) = sema.check_program(p)
+    var t = t0
+    if c.d_s.len() > 0 {
+        render_all(p.m_path, p.m_src, p.m_base, c.d_s, c.d_e, c.d_msg, c.d_help)
+        exit(1)
+    }
+    let (breaches, helps) = ceiling.check_with_help(path, p, c, t)
+    if breaches.len() > 0 {
+        var out = byte_builder()
+        for i in 0..breaches.len() {
+            out.push_str("error: {breaches[i]}\n")
+            if helps[i] != "" {
+                out.push_str("  help: {helps[i]}\n")
+            }
+        }
+        write_stderr(out)
+        exit(1)
+    }
+    print("ok: `{path}` has no errors")
+}
+
+/// What `grasm` says of `check`'s arguments before it reads any: it takes
+/// no option and one file; after `--` nothing is its own.
+fn check_args(a: [str]) {
+    var seen = false
+    for i in 1..a.len() {
+        let x = a[i]
+        if x == "--" {
+            return
+        }
+        if not x.starts_with("-") {
+            if seen {
+                eprint("error: `grasm check` takes one file, and `{x}` is a second")
+                eprint("  help: run it once per file, or put program arguments after `--`")
+                exit(1)
+            }
+            seen = true
+        } else if x != "-" {
+            eprint("error: `grasm check` has no option `{x}`")
+            eprint("  help: `grasm check` takes no options")
+            exit(1)
+        }
+    }
+}
+
 /// `grasm tir`: the program's TIR, or why it has none.
 fn cmd_tir(path: str) {
     let l = loader.load(path)
@@ -469,6 +679,15 @@ fn cmd_tir(path: str) {
 
 fn main() {
     let a = args()
+    if a.len() > 0 and a[0] == "check" {
+        check_args(a)
+        if a.len() < 2 {
+            eprint("usage: grasm check <file.gr>")
+            exit(1)
+        }
+        cmd_check(a[1])
+        return
+    }
     if a.len() == 2 and a[0] == "tir" {
         cmd_tir(a[1])
         return

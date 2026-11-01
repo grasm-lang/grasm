@@ -19,16 +19,35 @@ type Ec = {
     d_s: [i64],
     d_e: [i64],
     d_msg: [str],
+    d_help: [str],
 }
 
-fn report(inout ec: Ec, s: i64, e: i64, msg: str) {
+fn report(inout ec: Ec, s: i64, e: i64, msg: str, help: str) {
     ec.d_s.push(s)
     ec.d_e.push(e)
     ec.d_msg.push(msg)
+    ec.d_help.push(help)
 }
 
-/// The diagnostics, as (start, end, message).
-pub fn check(p: Prog, vrows: Map[i64, [str]], crows: Map[i64, [str]]) -> ([i64], [i64], [str]) {
+/// Effects as a diagnostic lists them: "`a`, `b`".
+fn listed(xs: [str]) -> str {
+    "`" + xs.join("`, `") + "`"
+}
+
+/// What a written row allows, as a diagnostic says it.
+fn shown_row(allowed: [str]) -> str {
+    var m: Map[str, bool] = map()
+    for e in allowed {
+        m.set(e, true)
+    }
+    if m.len() == 0 {
+        return "performs nothing"
+    }
+    "performs only " + listed(effrows.sorted_keys(m))
+}
+
+/// The diagnostics, as (start, end, message, help).
+pub fn check(p: Prog, vrows: Map[i64, [str]], crows: Map[i64, [str]]) -> ([i64], [i64], [str], [str]) {
     let x = effrows.build_with(p, vrows, crows, p.deps)
     var aliases: Map[str, i64] = map()
     for mi in 0..p.m_name.len() {
@@ -41,7 +60,7 @@ pub fn check(p: Prog, vrows: Map[i64, [str]], crows: Map[i64, [str]]) -> ([i64],
             }
         }
     }
-    var ec = Ec{ x: x, aliases: aliases, type_rows: map(), d_s: [], d_e: [], d_msg: [] }
+    var ec = Ec{ x: x, aliases: aliases, type_rows: map(), d_s: [], d_e: [], d_msg: [], d_help: [] }
     ec.type_rows = collect_type_rows(p, aliases)
     // Constants.
     for mi in 0..p.m_name.len() {
@@ -52,14 +71,14 @@ pub fn check(p: Prog, vrows: Map[i64, [str]], crows: Map[i64, [str]]) -> ([i64],
             }
             let init = prog.sl(p, d, 3)
             if makes_ref(p, init) {
-                report(ec, prog.es(p, init), prog.ee(p, init), "a constant's value cannot take a reference")
+                report(ec, prog.es(p, init), prog.ee(p, init), "a constant's value cannot take a reference", "a constant is evaluated wherever its name is used, so every mention would allocate a different slot — make it a function, or take the reference once inside `main`")
             }
             var row: Map[str, bool] = map()
             var active: [str] = []
             let f = Fnb{ at: map() }
             effrows.walk_expr(ec.x, p, mi, current, init, active, f, row)
             if row.len() > 0 {
-                report(ec, prog.es(p, init), prog.ee(p, init), "a constant's value cannot perform effects, and this performs `{effrows.sorted_keys(row).join("`, `")}`")
+                report(ec, prog.es(p, init), prog.ee(p, init), "a constant's value cannot perform effects, and this performs `{effrows.sorted_keys(row).join("`, `")}`", "a constant is evaluated wherever its name is used, so this would happen once per mention — make it a function instead")
             }
         }
     }
@@ -75,7 +94,7 @@ pub fn check(p: Prog, vrows: Map[i64, [str]], crows: Map[i64, [str]]) -> ([i64],
                     Some(r) -> {
                         if r.contains("async") {
                             let mn = prog.sl(p, pr, 0)
-                            report(ec, prog.s(p, mn), prog.e(p, mn), "`{prog.name(p, mn)}` of actor `{prog.text(p, d)}` performs `async`")
+                            report(ec, prog.s(p, mn), prog.e(p, mn), "`{prog.name(p, mn)}` of actor `{prog.text(p, d)}` performs `async`, and an actor's method runs to its end before any other task does", "waiting inside a method would let another task call the actor halfway through -- do the channel work in the caller ([E-ACTOR])")
                         }
                     }
                     None -> ()
@@ -103,7 +122,7 @@ pub fn check(p: Prog, vrows: Map[i64, [str]], crows: Map[i64, [str]]) -> ([i64],
         for dn in declared {
             let base = first_seg(dn)
             if not builtin_rows.is_capability(base) and not ec.x.effect_names.has(base) {
-                report(ec, prog.s(p, nm), prog.e(p, nm), "function `{fname}` declares unknown effect `{dn}`")
+                report(ec, prog.s(p, nm), prog.e(p, nm), "function `{fname}` declares unknown effect `{dn}`", "")
             }
         }
         var missing: [str] = []
@@ -119,7 +138,25 @@ pub fn check(p: Prog, vrows: Map[i64, [str]], crows: Map[i64, [str]]) -> ([i64],
             }
         }
         if missing.len() > 0 {
-            report(ec, prog.s(p, nm), prog.e(p, nm), "function `{fname}` performs effect(s) `{missing.join("`, `")}` not in its declared row")
+            let list = listed(missing)
+            let rowhelp = "add them to the `/ \{ ... }` clause or handle them inside"
+            // A lowered name says what the source wrote: a contract
+            // (`f@requiresN`), a function with contracts (`f@body`), an
+            // `impl` method (`method@Type`).
+            match fname.index_of("@") {
+                Some(at) -> {
+                    let owner = fname.substr(0, at)
+                    let kind = fname.substr(at + 1, fname.len() - at - 1)
+                    if kind.starts_with("requires") or kind.starts_with("ensures") {
+                        report(ec, prog.s(p, nm), prog.e(p, nm), "a contract performs no effects, and this one on `{owner}` performs {list}", "a contract states a fact; compute anything effectful before the call")
+                    } else if kind == "body" {
+                        report(ec, prog.s(p, nm), prog.e(p, nm), "function `{owner}` performs effect(s) {list} not in its declared row", rowhelp)
+                    } else {
+                        report(ec, prog.s(p, nm), prog.e(p, nm), "`{owner}` for `{kind}` performs {list}, and an interface method performs nothing", "declare it on the interface's method, move it to the caller, or handle it inside ([T-INTERFACE-EFFECTS])")
+                    }
+                }
+                None -> report(ec, prog.s(p, nm), prog.e(p, nm), "function `{fname}` performs effect(s) {list} not in its declared row", rowhelp)
+            }
         }
     }
     // `main`: only capabilities may remain.
@@ -133,7 +170,7 @@ pub fn check(p: Prog, vrows: Map[i64, [str]], crows: Map[i64, [str]]) -> ([i64],
             }
             if left.len() > 0 {
                 let nm = prog.sl(p, ec.x.decl[mi], 2)
-                report(ec, prog.s(p, nm), prog.e(p, nm), "`main` has unhandled effect(s) `{left.join("`, `")}`")
+                report(ec, prog.s(p, nm), prog.e(p, nm), "`main` has unhandled effect(s) {listed(left)}", "wrap the calls in `with <Effect> handled_by <handler> \{ ... }` — and if the effect comes from a *handler's own body*, the `with` goes around where that handler is installed, not around the calls to it ([E-HANDLER-OWN-ROW])")
             }
         }
         None -> ()
@@ -159,7 +196,7 @@ pub fn check(p: Prog, vrows: Map[i64, [str]], crows: Map[i64, [str]]) -> ([i64],
                 }
             }
             if left.len() > 0 {
-                report(ec, prog.s(p, d), prog.e(p, d), "{if k == ast.D_TEST { "test" } else { "bench" }} \"{prog.text(p, d)}\" has unhandled effect(s) `{left.join("`, `")}`")
+                report(ec, prog.s(p, d), prog.e(p, d), "{if k == ast.D_TEST { "test" } else { "bench" }} \"{prog.text(p, d)}\" has unhandled effect(s) {listed(left)}", "install a test handler with `with <Effect> handled_by ...`")
             }
         }
     }
@@ -190,7 +227,7 @@ pub fn check(p: Prog, vrows: Map[i64, [str]], crows: Map[i64, [str]]) -> ([i64],
             check_declared_rows_block(ec, p, mi, current, body, f, dn, dr)
         }
     }
-    (ec.d_s, ec.d_e, ec.d_msg)
+    (ec.d_s, ec.d_e, ec.d_msg, ec.d_help)
 }
 
 fn first_seg(s: str) -> str {
@@ -347,7 +384,7 @@ fn collect_type_names(ec: Ec, p: Prog, te: i64, inout out: Map[str, bool], depth
 }
 
 fn collect_type_rows(p: Prog, aliases: Map[str, i64]) -> Map[str, [str]] {
-    let ec0 = Ec{ x: effrows.build_empty(), aliases: aliases, type_rows: map(), d_s: [], d_e: [], d_msg: [] }
+    let ec0 = Ec{ x: effrows.build_empty(), aliases: aliases, type_rows: map(), d_s: [], d_e: [], d_msg: [], d_help: [] }
     var ownm: Map[str, Map[str, bool]] = map()
     var names_order: [str] = []
     var mentions: Map[str, [str]] = map()
@@ -498,8 +535,14 @@ fn par_fn_row(ec: Ec, p: Prog, mi: i64, current: str, func: i64, f: Fnb, inout a
         }
     }
     if k == ast.E_BINARY {
-        par_fn_row(ec, p, mi, current, prog.sl(p, func, 1), f, active, out)
-        par_fn_row(ec, p, mi, current, prog.sl(p, func, 2), f, active, out)
+        // The right operand last, in a loop: a `^` chain is as long as it
+        // is written.
+        var e = func
+        while prog.kind(p, e) == ast.E_BINARY and not ec.x.vrows.has(prog.ekey(p, e)) {
+            par_fn_row(ec, p, mi, current, prog.sl(p, e, 1), f, active, out)
+            e = prog.sl(p, e, 2)
+        }
+        par_fn_row(ec, p, mi, current, e, f, active, out)
         return
     }
     effrows.walk_expr(ec.x, p, mi, current, func, active, f, out)
@@ -612,9 +655,9 @@ fn check_par_map_block(inout ec: Ec, p: Prog, mi: i64, current: str, b: i64, f: 
             continue
         }
         if net[i] {
-            report(ec, ss[i], es[i], "`net_workers` runs a function that may perform only `net`, but the one given performs `{over.join("`, `")}`")
+            report(ec, ss[i], es[i], "`net_workers` runs a function that may perform only `net`, but the one given performs {listed(over)}", "the workers run at once on separate threads, so anything but the network would interleave differently between runs — return what the worker found and act on it after `net_workers` answers")
         } else {
-            report(ec, ss[i], es[i], "this parallel operation needs an effect-free function, but the one given performs `{over.join("`, `")}`")
+            report(ec, ss[i], es[i], "this parallel operation needs an effect-free function, but the one given performs {listed(over)}", "elements are processed on several cores, so an effect would interleave differently between runs — use `map` for effectful work")
         }
     }
 }
@@ -649,7 +692,17 @@ fn par_maps_block(p: Prog, b: i64, inout funcs: [i64], inout ss: [i64], inout es
     }
 }
 
-fn par_maps_expr(p: Prog, e: i64, inout funcs: [i64], inout ss: [i64], inout es: [i64], inout net: [bool]) {
+fn par_maps_expr(p: Prog, e0: i64, inout funcs: [i64], inout ss: [i64], inout es: [i64], inout net: [bool]) {
+    // A binary operator's right operand and an `else if` in this loop, not
+    // by recursion: their chains are as long as they are written.
+    var e = e0
+    while e >= 0 {
+        e = par_maps_one(p, e, funcs, ss, es, net)
+    }
+}
+
+/// One node of `par_maps_expr`; the node to walk next in its place, or -1.
+fn par_maps_one(p: Prog, e: i64, inout funcs: [i64], inout ss: [i64], inout es: [i64], inout net: [bool]) -> i64 {
     let k = prog.kind(p, e)
     if k == ast.E_METHOD {
         let n = prog.name(p, prog.sl(p, e, 1))
@@ -682,7 +735,7 @@ fn par_maps_expr(p: Prog, e: i64, inout funcs: [i64], inout ss: [i64], inout es:
         }
     } else if k == ast.E_BINARY {
         par_maps_expr(p, prog.sl(p, e, 1), funcs, ss, es, net)
-        par_maps_expr(p, prog.sl(p, e, 2), funcs, ss, es, net)
+        return prog.sl(p, e, 2)
     } else if k == ast.E_UNARY {
         par_maps_expr(p, prog.sl(p, e, 1), funcs, ss, es, net)
     } else if k == ast.E_TRY or k == ast.E_FIELD {
@@ -717,7 +770,7 @@ fn par_maps_expr(p: Prog, e: i64, inout funcs: [i64], inout ss: [i64], inout es:
             if prog.kind(p, eb) == ast.EB_ELSE {
                 par_maps_block(p, prog.sl(p, eb, 0), funcs, ss, es, net)
             } else {
-                par_maps_expr(p, prog.sl(p, eb, 0), funcs, ss, es, net)
+                return prog.sl(p, eb, 0)
             }
         }
     } else if k == ast.E_MATCH {
@@ -730,6 +783,7 @@ fn par_maps_expr(p: Prog, e: i64, inout funcs: [i64], inout ss: [i64], inout es:
             par_maps_expr(p, prog.sl(p, arm, 2), funcs, ss, es, net)
         }
     }
+    -1
 }
 
 fn sema_call_name(p: Prog, e: i64) -> str {
@@ -771,7 +825,17 @@ fn calls_block(p: Prog, b: i64, inout names: [str], inout calls: [i64]) {
     }
 }
 
-fn calls_expr(p: Prog, e: i64, inout names: [str], inout calls: [i64]) {
+fn calls_expr(p: Prog, e0: i64, inout names: [str], inout calls: [i64]) {
+    // A binary operator's right operand and an `else if` in this loop, not
+    // by recursion: their chains are as long as they are written.
+    var e = e0
+    while e >= 0 {
+        e = calls_one(p, e, names, calls)
+    }
+}
+
+/// One node of `calls_expr`; the node to walk next in its place, or -1.
+fn calls_one(p: Prog, e: i64, inout names: [str], inout calls: [i64]) -> i64 {
     let k = prog.kind(p, e)
     if k == ast.E_CALL {
         let callee = prog.sl(p, e, 0)
@@ -816,7 +880,7 @@ fn calls_expr(p: Prog, e: i64, inout names: [str], inout calls: [i64]) {
         }
     } else if k == ast.E_BINARY {
         calls_expr(p, prog.sl(p, e, 1), names, calls)
-        calls_expr(p, prog.sl(p, e, 2), names, calls)
+        return prog.sl(p, e, 2)
     } else if k == ast.E_UNARY {
         calls_expr(p, prog.sl(p, e, 1), names, calls)
     } else if k == ast.E_TRY or k == ast.E_FIELD {
@@ -832,7 +896,7 @@ fn calls_expr(p: Prog, e: i64, inout names: [str], inout calls: [i64]) {
             if prog.kind(p, eb) == ast.EB_ELSE {
                 calls_block(p, prog.sl(p, eb, 0), names, calls)
             } else {
-                calls_expr(p, prog.sl(p, eb, 0), names, calls)
+                return prog.sl(p, eb, 0)
             }
         }
     } else if k == ast.E_BLOCK or k == ast.E_UNSAFE or k == ast.E_REGION {
@@ -845,6 +909,7 @@ fn calls_expr(p: Prog, e: i64, inout names: [str], inout calls: [i64]) {
     } else if k == ast.E_CLOSURE {
         calls_expr(p, prog.sl(p, e, 1), names, calls)
     }
+    -1
 }
 
 fn check_fn_args_block(inout ec: Ec, p: Prog, mi: i64, current: str, b: i64, f: Fnb) {
@@ -874,7 +939,7 @@ fn check_fn_args_block(inout ec: Ec, p: Prog, mi: i64, current: str, b: i64, f: 
                     par_fn_row(ec, p, mi, current, args[i], f, active, row)
                     let over = over_of(row, allowed)
                     if over.len() > 0 {
-                        report(ec, prog.es(p, args[i]), prog.ee(p, args[i]), "`{prog.name(p, prog.sl(p, params[i], 1))}` expects a function that performs less, but this one performs `{over.join("`, `")}`")
+                        report(ec, prog.es(p, args[i]), prog.ee(p, args[i]), "`{prog.name(p, prog.sl(p, params[i], 1))}` expects a function that {shown_row(allowed)}, but this one performs {listed(over)}", "widen the parameter's type — `fn(..) -> .. / \{io}` — or pass a function that does not perform it")
                     }
                 }
                 None -> ()
@@ -930,7 +995,7 @@ fn report_row_over(inout ec: Ec, p: Prog, mi: i64, current: str, e: i64, f: Fnb,
     carried_row(ec, p, mi, current, e, f, 0, row)
     let over = over_of(row, allowed)
     if over.len() > 0 {
-        report(ec, prog.es(p, e), prog.ee(p, e), "this type says the function performs less, but the value performs `{over.join("`, `")}`")
+        report(ec, prog.es(p, e), prog.ee(p, e), "this type says the function {shown_row(allowed)}, but the value performs {listed(over)}", "widen the written type — `fn(..) -> .. / \{io}` — or hand over a function that does not perform it")
     }
 }
 

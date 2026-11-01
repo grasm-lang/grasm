@@ -139,7 +139,7 @@ pub fn infer_match_with(inout c: Ck, inout t: Tys, p: Prog, scrut: i64, arms: [i
             }
         }
         if shown.len() > 0 {
-            sema.err(c, s, e, "match is not exhaustive — missing `{shown.join("`, `")}`")
+            sema.err_help(c, s, e, "match is not exhaustive — missing `{shown.join("`, `")}`", "add the missing arm(s) or a final `_ ->` catch-all")
         }
     }
     result
@@ -302,7 +302,7 @@ fn check_pattern(inout c: Ck, inout t: Tys, p: Prog, pat: i64, expected: i64) ->
             }
             let after = live_in_top_scope(c)
             if after > before {
-                sema.err(c, prog.ps(p, a), prog.pe(p, a), "an alternative in `a | b` cannot bind a name")
+                sema.err_help(c, prog.ps(p, a), prog.pe(p, a), "an alternative in `a | b` cannot bind a name", "give each alternative its own arm, or match the shape without binding")
             }
         }
         if irrefutable {
@@ -315,7 +315,7 @@ fn check_pattern(inout c: Ck, inout t: Tys, p: Prog, pat: i64, expected: i64) ->
     }
     if k == ast.P_INT {
         if p.wide.has(s) {
-            sema.err(c, s, e, "a pattern names a value from 0 to 9223372036854775807")
+            sema.err_help(c, s, e, "a pattern names a value from 0 to 9223372036854775807", "a `u64` past that is matched with a guard: `n if n == 18446744073709551615` ([T-U64])")
             return "<int>"
         }
         let v = prog.sl(p, pat, 0)
@@ -323,9 +323,9 @@ fn check_pattern(inout c: Ck, inout t: Tys, p: Prog, pat: i64, expected: i64) ->
         if t.k[r] == tys.K_INT {
             let ik = t.a[r]
             if ik == 6 and v < 0 {
-                sema.err(c, s, e, "a pattern on a `u64` names a value from 0 to 9223372036854775807")
+                sema.err_help(c, s, e, "a pattern on a `u64` names a value from 0 to 9223372036854775807", "a negative number is no `u64`, and one from 2^63 up is matched with a guard: `n if n == 0xFFFF_FFFF_FFFF_FFFF` ([T-U64])")
             } else if not int_fits(ik, v) {
-                sema.err(c, s, e, "`{v}` does not fit in `{tys.int_name(ik)}`")
+                sema.err_help(c, s, e, "`{v}` does not fit in `{tys.int_name(ik)}`", "`{tys.int_name(ik)}` holds {sema.int_range(ik)}; a value outside that is not written as a literal of it ([{if ik == 6 { "T-U64" } else { "T-INT-FIXED" }}])")
             }
             return "<int>"
         }
@@ -381,7 +381,7 @@ fn check_pattern(inout c: Ck, inout t: Tys, p: Prog, pat: i64, expected: i64) ->
                 }
                 return tag_with_payload(vname, [sub])
             }
-            sema.err(c, s, e, "matching a fallible value — use `Ok(..)` and `Err(..)` arms")
+            sema.err_help(c, s, e, "matching a fallible value — use `Ok(..)` and `Err(..)` arms", "e.g. `Ok(v) -> ...` / `Err(e) -> ...`")
             return vname
         }
         if t.k[r] == tys.K_ERROR {
@@ -560,18 +560,18 @@ pub fn infer_closure(inout c: Ck, inout t: Tys, p: Prog, e: i64, expected: i64) 
                 var cs: [i64] = []
                 var ce: [i64] = []
                 var cm: [str] = []
+                var ch: [str] = []
                 for j in mark..c.d_s.len() {
                     cs.push(c.d_s[j])
                     ce.push(c.d_e[j])
                     cm.push(c.d_msg[j])
+                    ch.push(c.d_help[j])
                 }
                 sema.truncate_errs(c, mark)
                 let inferred = sema.infer_expr(c, t, p, body)
                 if sema.errs(c) == mark {
                     for j in 0..cs.len() {
-                        c.d_s.push(cs[j])
-                        c.d_e.push(ce[j])
-                        c.d_msg.push(cm[j])
+                        sema.push_diag(c, cs[j], ce[j], cm[j], ch[j])
                     }
                 }
                 ret = inferred

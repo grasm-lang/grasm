@@ -1,0 +1,414 @@
+// The Rust toolchain's manifest reader (crates/grasm_pkg/src/toml.rs), as it
+// reads: line by line, `[table]` and `[[array]]` headers, `key = value` with
+// a string, an integer, a boolean or a one-line array, comments cut at a `#`
+// outside quotes -- and its errors, in its words and at its lines.
+//
+// The loader reads manifests with this and not with `packages/toml`, because
+// what `grasm check` says about a manifest is what this reader says: a file
+// it refuses is refused with its message, and one it accepts is accepted,
+// though `packages/toml` reads TOML itself -- floats, inline tables, arrays
+// across lines -- and would answer otherwise. `packages/toml` stays the
+// reader stage S8 moves the toolchain to, held to this one and to Python's
+// `tomllib` by `tomldiff`.
+
+pub let V_STR = 0
+pub let V_INT = 1
+pub let V_BOOL = 2
+pub let V_ARR = 3
+
+/// A parsed document: its tables by name (the root is ""), each with its
+/// keys and their values, the names and keys in byte order as a `BTreeMap`
+/// keeps them; or why it was refused.
+type RDoc = {
+    ok: bool,
+    why: str,
+    t_names: [str],
+    t_keys: [[str]],
+    t_vals: [[i64]],
+    // Values, by id: the kind, a string's text, an array's items.
+    v_kind: [i64],
+    v_str: [str],
+    v_items: [[i64]],
+}
+
+fn refused(why: str) -> RDoc {
+    RDoc{ ok: false, why: why, t_names: [], t_keys: [], t_vals: [], v_kind: [], v_str: [], v_items: [] }
+}
+
+/// `toml::parse`.
+pub fn parse(src: str) -> RDoc {
+    var t_names: [str] = [""]
+    var t_keys: [[str]] = [[]]
+    var t_vals: [[i64]] = [[]]
+    var t_index: Map[str, i64] = map()
+    t_index.set("", 0)
+    var v_kind: [i64] = []
+    var v_str: [str] = []
+    var v_items: [[i64]] = []
+    // Where `key = value` lines go: a table's index, or -1 for an entry of
+    // an array of tables, whose keys nothing reads back.
+    var current = 0
+    var lineno = 0
+    for raw0 in rust_lines(src) {
+        lineno += 1
+        let line = rust_trim(strip_comment(raw0))
+        if line == "" {
+            continue
+        }
+        let at = "line {lineno}"
+        if line.starts_with("[[") {
+            let rest = line.substr(2, line.len() - 2)
+            if not rest.ends_with("]]") {
+                return refused("{at}: unclosed array-of-tables header")
+            }
+            let name = rust_trim(rest.substr(0, rest.len() - 2))
+            if name == "" {
+                return refused("{at}: empty table name")
+            }
+            current = -1
+            continue
+        }
+        if line.starts_with("[") {
+            let rest = line.substr(1, line.len() - 1)
+            if not rest.ends_with("]") {
+                return refused("{at}: unclosed table header")
+            }
+            let name = rust_trim(rest.substr(0, rest.len() - 1))
+            if name == "" {
+                return refused("{at}: empty table name")
+            }
+            if t_index.has(name) {
+                return refused("{at}: table `{name}` is defined twice")
+            }
+            t_index.set(name, t_names.len())
+            current = t_names.len()
+            t_names.push(name)
+            t_keys.push([])
+            t_vals.push([])
+            continue
+        }
+        let eq = match line.index_of("=") {
+            Some(i) -> i
+            None -> return refused("{at}: expected `key = value`")
+        }
+        let key = trim_quotes(rust_trim(line.substr(0, eq)))
+        if key == "" {
+            return refused("{at}: empty key")
+        }
+        let vtext = rust_trim(line.substr(eq + 1, line.len() - eq - 1))
+        let (vok, vwhy, vid) = parse_value(vtext, v_kind, v_str, v_items)
+        if not vok {
+            return refused("{at}: {vwhy}")
+        }
+        if current >= 0 {
+            var keys = t_keys[current]
+            if keys.contains(key) {
+                return refused("{at}: key `{key}` is set twice")
+            }
+            keys.push(key)
+            var vals = t_vals[current]
+            vals.push(vid)
+            t_keys[current] = keys
+            t_vals[current] = vals
+        }
+    }
+    // In byte order, as the Rust reader's maps hold them.
+    var order: [str] = t_names
+    order.sort()
+    var names: [str] = []
+    var keys_out: [[str]] = []
+    var vals_out: [[i64]] = []
+    for nm in order {
+        let ti = t_index.get(nm) ?? 0
+        var ks = t_keys[ti]
+        ks.sort()
+        var vs: [i64] = []
+        for k in ks {
+            for j in 0..t_keys[ti].len() {
+                if t_keys[ti][j] == k {
+                    vs.push(t_vals[ti][j])
+                }
+            }
+        }
+        names.push(nm)
+        keys_out.push(ks)
+        vals_out.push(vs)
+    }
+    RDoc{ ok: true, why: "", t_names: names, t_keys: keys_out, t_vals: vals_out, v_kind: v_kind, v_str: v_str, v_items: v_items }
+}
+
+/// `str::lines`: split at `\n`, a `\r` before it dropped, no last empty line.
+fn rust_lines(s: str) -> [str] {
+    var out: [str] = []
+    let b = s.to_bytes()
+    var start = 0
+    for i in 0..b.len() {
+        if b.at(i) == 10 {
+            var end = i
+            if end > start and b.at(end - 1) == 13 {
+                end -= 1
+            }
+            out.push(b.slice(start, end).to_str())
+            start = i + 1
+        }
+    }
+    if start < b.len() {
+        var end = b.len()
+        if end > start and b.at(end - 1) == 13 {
+            end -= 1
+        }
+        out.push(b.slice(start, end).to_str())
+    }
+    out
+}
+
+/// `str::trim`: the whitespace Rust's `char::is_whitespace` names, at both
+/// ends.
+pub fn rust_trim(s: str) -> str {
+    let cs = s.chars()
+    var a = 0
+    var b = cs.len()
+    while a < b and is_ws(cs[a]) {
+        a += 1
+    }
+    while b > a and is_ws(cs[b - 1]) {
+        b -= 1
+    }
+    cs.slice(a, b).join("")
+}
+
+fn is_ws(c: str) -> bool {
+    let n = c.code_at(0)
+    (n >= 9 and n <= 13) or n == 32 or n == 133 or n == 160 or n == 5760 or (n >= 8192 and n <= 8202) or n == 8232 or n == 8233 or n == 8239 or n == 8287 or n == 12288
+}
+
+/// `strip_comment`: everything before a `#` outside quotes; a quote turns
+/// the string on and off whatever precedes it.
+fn strip_comment(line: str) -> str {
+    let b = line.to_bytes()
+    var in_string = false
+    for i in 0..b.len() {
+        let c = b.at(i)
+        if c == 34 {
+            in_string = not in_string
+        } else if c == 35 and not in_string {
+            return b.slice(0, i).to_str()
+        }
+    }
+    line
+}
+
+/// `trim_matches('"')`: every quote at either end.
+fn trim_quotes(s: str) -> str {
+    let b = s.to_bytes()
+    var a = 0
+    var e = b.len()
+    while a < e and b.at(a) == 34 {
+        a += 1
+    }
+    while e > a and b.at(e - 1) == 34 {
+        e -= 1
+    }
+    b.slice(a, e).to_str()
+}
+
+fn parse_value(text: str, inout v_kind: [i64], inout v_str: [str], inout v_items: [[i64]]) -> (bool, str, i64) {
+    if text == "true" or text == "false" {
+        return (true, "", new_value(v_kind, v_str, v_items, V_BOOL, text, []))
+    }
+    if text.starts_with("\"") {
+        let rest = text.substr(1, text.len() - 1)
+        if not rest.ends_with("\"") {
+            return (false, "unterminated string value", -1)
+        }
+        let body = rest.substr(0, rest.len() - 1)
+        return (true, "", new_value(v_kind, v_str, v_items, V_STR, unescape(body), []))
+    }
+    if text.starts_with("[") {
+        let rest = text.substr(1, text.len() - 1)
+        if not rest.ends_with("]") {
+            return (false, "unterminated array", -1)
+        }
+        let body = rest.substr(0, rest.len() - 1)
+        var items: [i64] = []
+        for part0 in split_top_level(body) {
+            let part = rust_trim(part0)
+            if part == "" {
+                continue
+            }
+            let (ok, why, id) = parse_value(part, v_kind, v_str, v_items)
+            if not ok {
+                return (false, why, -1)
+            }
+            items.push(id)
+        }
+        return (true, "", new_value(v_kind, v_str, v_items, V_ARR, "", items))
+    }
+    if is_i64(text) {
+        return (true, "", new_value(v_kind, v_str, v_items, V_INT, text, []))
+    }
+    (false, "cannot parse value `{text}`", -1)
+}
+
+fn new_value(inout v_kind: [i64], inout v_str: [str], inout v_items: [[i64]], k: i64, s: str, items: [i64]) -> i64 {
+    v_kind.push(k)
+    v_str.push(s)
+    v_items.push(items)
+    v_kind.len() - 1
+}
+
+/// `str::parse::<i64>`: an optional sign, then decimal digits, in range.
+fn is_i64(t: str) -> bool {
+    let b = t.to_bytes()
+    var i = 0
+    var neg = false
+    if b.len() > 0 and (b.at(0) == 43 or b.at(0) == 45) {
+        neg = b.at(0) == 45
+        i = 1
+    }
+    if i >= b.len() {
+        return false
+    }
+    // The magnitude, held as a negative so `-9223372036854775808` fits.
+    var v = 0
+    while i < b.len() {
+        let c = b.at(i)
+        if c < 48 or c > 57 {
+            return false
+        }
+        let d = c - 48
+        if v < (-9223372036854775807 - 1 + d) / 10 {
+            return false
+        }
+        v = v * 10 - d
+        i += 1
+    }
+    if not neg and v == -9223372036854775807 - 1 {
+        return false
+    }
+    true
+}
+
+/// `split_top_level`: at each comma outside quotes.
+fn split_top_level(body: str) -> [str] {
+    var out: [str] = []
+    let b = body.to_bytes()
+    var start = 0
+    var in_string = false
+    for i in 0..b.len() {
+        let c = b.at(i)
+        if c == 34 {
+            in_string = not in_string
+        } else if c == 44 and not in_string {
+            out.push(b.slice(start, i).to_str())
+            start = i + 1
+        }
+    }
+    out.push(b.slice(start, b.len()).to_str())
+    out
+}
+
+/// `unescape`: `\n`, `\t`, `\"` and `\\`; any other escape kept as written.
+fn unescape(s: str) -> str {
+    var out = str_builder()
+    let cs = s.chars()
+    var i = 0
+    while i < cs.len() {
+        let c = cs[i]
+        if c != "\\" {
+            out.push_str(c)
+            i += 1
+            continue
+        }
+        if i + 1 >= cs.len() {
+            out.push_str("\\")
+            i += 1
+            continue
+        }
+        let n = cs[i + 1]
+        if n == "n" {
+            out.push_str("\n")
+        } else if n == "t" {
+            out.push_str("\t")
+        } else if n == "\"" {
+            out.push_str("\"")
+        } else if n == "\\" {
+            out.push_str("\\")
+        } else {
+            out.push_str("\\")
+            out.push_str(n)
+        }
+        i += 2
+    }
+    out.to_str()
+}
+
+// ---------------------------------------------------------------------
+// Reading a document, as `Doc`'s accessors do
+// ---------------------------------------------------------------------
+
+/// The index of table `name`, or -1.
+pub fn table(d: RDoc, name: str) -> i64 {
+    for i in 0..d.t_names.len() {
+        if d.t_names[i] == name {
+            return i
+        }
+    }
+    -1
+}
+
+/// The value of `key` in table `ti`, or -1.
+pub fn get(d: RDoc, ti: i64, key: str) -> i64 {
+    if ti < 0 {
+        return -1
+    }
+    for j in 0..d.t_keys[ti].len() {
+        if d.t_keys[ti][j] == key {
+            return d.t_vals[ti][j]
+        }
+    }
+    -1
+}
+
+/// `as_str`: the text of a string value, or "\0".
+pub fn as_str(d: RDoc, v: i64) -> str {
+    if v < 0 or d.v_kind[v] != V_STR {
+        return "\0"
+    }
+    d.v_str[v]
+}
+
+/// `as_str_array`: whether `v` is an array of strings only.
+pub fn is_str_array(d: RDoc, v: i64) -> bool {
+    if v < 0 or d.v_kind[v] != V_ARR {
+        return false
+    }
+    for x in d.v_items[v] {
+        if d.v_kind[x] != V_STR {
+            return false
+        }
+    }
+    true
+}
+
+/// The strings of an array of strings.
+pub fn str_array(d: RDoc, v: i64) -> [str] {
+    var out: [str] = []
+    for x in d.v_items[v] {
+        out.push(d.v_str[x])
+    }
+    out
+}
+
+/// `subtables(prefix)`: the tables named `prefix.<leaf>`, as table indexes,
+/// in byte order of their names.
+pub fn subtables(d: RDoc, prefix: str) -> [i64] {
+    var out: [i64] = []
+    let want = prefix + "."
+    for i in 0..d.t_names.len() {
+        if d.t_names[i].starts_with(want) {
+            out.push(i)
+        }
+    }
+    out
+}

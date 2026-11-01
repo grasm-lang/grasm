@@ -5,11 +5,15 @@ entry = "src/main.gr"
 
 # The compiler's frontend in Grasm (docs/self-hosting.md, stage S2): reads a
 # source file and prints what the Rust frontend's dump of it prints. It
-# reads files and writes to stdout and stderr, nothing else.
-capabilities = ["io"]
+# reads files and writes to stdout and stderr, and asks the file system
+# what a directory's real name is -- `realpath(3)`, called from C as the
+# Rust toolchain's `canonicalize` calls it, which is the `unsafe`.
+capabilities = ["io", "unsafe"]
 
-# Manifests are read with the TOML package (docs/self-hosting.md, S2 part
-# two: the loader).
+# The loader reads manifests with rtoml.gr, a port of the Rust toolchain's
+# own reader, so its diagnostics about one are Rust's (docs/self-hosting.md
+# §6.13). The TOML package serves only `front toml`, which tomldiff holds to
+# the Rust reader and to Python's tomllib.
 [dependencies.toml]
 path = "../../packages/toml"
 version = "^1.0.0"

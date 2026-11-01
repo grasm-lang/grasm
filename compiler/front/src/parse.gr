@@ -98,6 +98,11 @@ type Parser = {
     d_e: [i64],
     d_msg: [str],
     d_help: [str],
+    // Whether each was made inside an interpolation inside an
+    // interpolation, whose offsets the Rust parser never moves by a module's
+    // base (docs/known-issues.md, S4).
+    d_deep: [bool],
+    interp_depth: i64,
     // In a condition, `Name {` is not a struct literal ([G-STRUCT-AMBIG]).
     no_struct_lit: bool,
     // The state fields of the actor whose method is being parsed.
@@ -120,7 +125,7 @@ type Parser = {
 }
 
 fn new_parser(lx: Lexed, src: bytes) -> Parser {
-    Parser{ lx: lx, reg: 0, regions: [], i: 0, modes: [0], d_s: [], d_e: [], d_msg: [], d_help: [],
+    Parser{ lx: lx, reg: 0, regions: [], i: 0, modes: [0], d_s: [], d_e: [], d_msg: [], d_help: [], d_deep: [], interp_depth: 0,
         no_struct_lit: false, actor_fields: [], in_actor: false, depth: 0, not_a_map: {},
         map_committed: false, wide_ints: [], src: src, ev: [] }
 }
@@ -202,10 +207,7 @@ fn ev_truncate(inout p: Parser, inout ev: [i64], n: i64) {
 // ---------------------------------------------------------------------
 
 fn diag(inout p: Parser, inout ev: [i64], s: i64, e: i64, msg: str) {
-    p.d_s.push(s)
-    p.d_e.push(e)
-    p.d_msg.push(msg)
-    p.d_help.push("")
+    diag_help(p, ev, s, e, msg, "")
 }
 
 fn diag_help(inout p: Parser, inout ev: [i64], s: i64, e: i64, msg: str, help: str) {
@@ -213,6 +215,7 @@ fn diag_help(inout p: Parser, inout ev: [i64], s: i64, e: i64, msg: str, help: s
     p.d_e.push(e)
     p.d_msg.push(msg)
     p.d_help.push(help)
+    p.d_deep.push(p.interp_depth >= 2)
 }
 
 fn diag_truncate(inout p: Parser, inout ev: [i64], n: i64) {
@@ -221,6 +224,7 @@ fn diag_truncate(inout p: Parser, inout ev: [i64], n: i64) {
         p.d_e.pop()
         p.d_msg.pop()
         p.d_help.pop()
+        p.d_deep.pop()
     }
 }
 
@@ -2847,6 +2851,7 @@ fn parse_interp(inout p: Parser, inout ev: [i64], src: str, offset: i64) -> bool
     p.lx = sub
     p.reg = reg
     p.i = 0
+    p.interp_depth += 1
     p.modes = [KEEP]
     p.no_struct_lit = false
     p.depth = saved_depth + 1
@@ -2862,6 +2867,7 @@ fn parse_interp(inout p: Parser, inout ev: [i64], src: str, offset: i64) -> bool
         diag_help(p, ev, s, e, "unexpected extra input inside `\{...}` — an interpolation holds one expression", "close the interpolation before this, or join the parts with an operator")
     }
     let done = p.lx
+    p.interp_depth -= 1
     p.lx = saved_lx
     p.reg = saved_reg
     p.i = saved_i

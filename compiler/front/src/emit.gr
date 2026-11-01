@@ -57,18 +57,39 @@ fn q(s: str) -> str {
     loader.quote(s)
 }
 
-/// Writes node `id` at `depth`, its children on lines of their own.
+/// Writes node `id` at `depth`, its children on lines of their own. A
+/// work stack, not recursion: an operator chain or an `else if` chain
+/// nests its nodes as deep as it is long.
 fn write(m: Em, id: i64, depth: i64, inout b: StrBuilder) {
-    for _ in 0..depth {
-        b.push_str("  ")
+    // Each entry: a node and how many of its children are written.
+    var ids = [id]
+    var done = [0]
+    var started = [false]
+    while ids.len() > 0 {
+        let top = ids.len() - 1
+        let n = ids[top]
+        if not started[top] {
+            started[top] = true
+            for _ in 0..depth + top {
+                b.push_str("  ")
+            }
+            b.push_str("(")
+            b.push_str(m.nh[n])
+        }
+        if done[top] < m.nn[n] {
+            let kid = m.kpool[m.noff[n] + done[top]]
+            done[top] = done[top] + 1
+            b.push_str("\n")
+            ids.push(kid)
+            done.push(0)
+            started.push(false)
+            continue
+        }
+        b.push_str(")")
+        let _ = ids.pop()
+        let _ = done.pop()
+        let _ = started.pop()
     }
-    b.push_str("(")
-    b.push_str(m.nh[id])
-    for i in 0..m.nn[id] {
-        b.push_str("\n")
-        write(m, m.kpool[m.noff[id] + i], depth + 1, b)
-    }
-    b.push_str(")")
 }
 
 // ---------------------------------------------------------------------
@@ -720,7 +741,16 @@ fn float_leaf(inout m: Em, v: f64, s: i64, e: i64) -> i64 {
 }
 
 fn expr(c: Ck, inout t: Tys, inout m: Em, p: Prog, e: i64) -> i64 {
+    let ek = prog.kind(p, e)
+    if ek == ast.E_BINARY or ek == ast.E_IF {
+        return spine(c, t, m, p, e)
+    }
     let n = expr_inner(c, t, m, p, e)
+    wrap(c, t, m, p, e, n)
+}
+
+/// `expr`'s last step: an ok half wrapped as the checker recorded it.
+fn wrap(c: Ck, inout t: Tys, inout m: Em, p: Prog, e: i64, n: i64) -> i64 {
     let k = prog.ekey(p, e)
     if c.ok_wrapped.has(k) {
         var tt = ""
@@ -741,6 +771,131 @@ fn expr(c: Ck, inout t: Tys, inout m: Em, p: Prog, e: i64) -> i64 {
         return node(m, "wrapok {tt} {sp(prog.es(p, e), prog.ee(p, e))}", [n])
     }
     n
+}
+
+// An operator's right operand and an `else if` are as deep as the program
+// writes them -- the nesting cap counts neither a `^` chain nor an `else if`
+// chain -- so `expr` emits a binary operator or an `if` here, with the right
+// operand or the `else if` on a work stack and the node waiting in a frame:
+// the same walk, in the same order, making the same nodes.
+let EX_EXPR = 1
+let EX_WRAP = 2
+let EX_BIN = 3
+let EX_IF = 4
+let EX_BIN_L = 5
+
+fn ex_push(inout fk: [i64], inout fe: [i64], inout fa: [i64], inout fb: [i64], inout fs: [str], k: i64, e: i64, a: i64, b: i64, s: str) {
+    fk.push(k)
+    fe.push(e)
+    fa.push(a)
+    fb.push(b)
+    fs.push(s)
+}
+
+fn spine(c: Ck, inout t: Tys, inout m: Em, p: Prog, e0: i64) -> i64 {
+    var fk: [i64] = []
+    var fe: [i64] = []
+    var fa: [i64] = []
+    var fb: [i64] = []
+    var fs: [str] = []
+    var vals: [i64] = []
+    ex_push(fk, fe, fa, fb, fs, EX_EXPR, e0, 0, 0, "")
+    while fk.len() > 0 {
+        let k = fk.pop() ?? 0
+        let e = fe.pop() ?? 0
+        let a = fa.pop() ?? 0
+        let b = fb.pop() ?? 0
+        let s = fs.pop() ?? ""
+        if k == EX_EXPR {
+            let ek = prog.kind(p, e)
+            if not (ek == ast.E_BINARY or ek == ast.E_IF) {
+                vals.push(expr(c, t, m, p, e))
+                continue
+            }
+            ex_push(fk, fe, fa, fb, fs, EX_WRAP, e, 0, 0, "")
+            let es = prog.es(p, e)
+            let en = prog.ee(p, e)
+            if ek == ast.E_BINARY {
+                // The left operand on the stack too: a left-nested chain is
+                // as deep as the cap allows.
+                let (hd, lhs) = binary_head(c, t, m, p, e, es, en)
+                ex_push(fk, fe, fa, fb, fs, EX_BIN_L, e, 0, 0, hd)
+                ex_push(fk, fe, fa, fb, fs, EX_EXPR, lhs, 0, 0, "")
+                continue
+            }
+            let h = head(c, t, m, "if", es, en)
+            let cn = expr(c, t, m, p, prog.sl(p, e, 0))
+            let th = block(c, t, m, p, prog.sl(p, e, 1))
+            let eb = prog.sl(p, e, 2)
+            if eb < 0 {
+                vals.push(node(m, h, [cn, th]))
+                continue
+            }
+            if prog.kind(p, eb) == ast.EB_ELSE {
+                let bb = block(c, t, m, p, prog.sl(p, eb, 0))
+                let el = node(m, "else", [bb])
+                vals.push(node(m, h, [cn, th, el]))
+                continue
+            }
+            ex_push(fk, fe, fa, fb, fs, EX_IF, e, cn, th, h)
+            ex_push(fk, fe, fa, fb, fs, EX_EXPR, prog.sl(p, eb, 0), 0, 0, "")
+            continue
+        }
+        if k == EX_WRAP {
+            let n = vals.pop() ?? 0
+            vals.push(wrap(c, t, m, p, e, n))
+            continue
+        }
+        if k == EX_BIN_L {
+            let l = vals.pop() ?? 0
+            ex_push(fk, fe, fa, fb, fs, EX_BIN, e, l, 0, s)
+            ex_push(fk, fe, fa, fb, fs, EX_EXPR, prog.sl(p, e, 2), 0, 0, "")
+            continue
+        }
+        if k == EX_BIN {
+            let r = vals.pop() ?? 0
+            vals.push(node(m, s, [a, r]))
+            continue
+        }
+        if k == EX_IF {
+            let x = vals.pop() ?? 0
+            let ei = node(m, "elseif", [x])
+            vals.push(node(m, s, [a, b, ei]))
+            continue
+        }
+    }
+    vals.pop() ?? 0
+}
+
+/// A binary operator's head, with its operation and its left operand's
+/// type, and the left operand.
+fn binary_head(c: Ck, inout t: Tys, inout m: Em, p: Prog, e: i64, s: i64, en: i64) -> (str, i64) {
+    let h = head(c, t, m, "binary", s, en)
+    let lhs = prog.sl(p, e, 1)
+    var ot = ""
+    if is_promoted_literal(c, p, lhs) {
+        ot = "f64"
+    } else {
+        ot = expr_ty(c, t, m, prog.ekey(p, lhs))
+    }
+    let opn = match prog.sl(p, e, 0) {
+        0 -> "add"
+        1 -> "sub"
+        2 -> "mul"
+        3 -> "div"
+        4 -> "rem"
+        5 -> "pow"
+        6 -> "eq"
+        7 -> "ne"
+        8 -> "lt"
+        9 -> "le"
+        10 -> "gt"
+        11 -> "ge"
+        12 -> "and"
+        13 -> "or"
+        _ -> "coalesce"
+    }
+    ("{h} {opn} {ot}", lhs)
 }
 
 fn is_promoted_literal(c: Ck, p: Prog, e: i64) -> bool {

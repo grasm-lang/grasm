@@ -605,6 +605,14 @@ pub fn holds_var(t: Tys, x: i64) -> bool {
 // decisions (`show(..).contains('_')`) read.
 // ---------------------------------------------------------------------
 
+/// A type as Rust's `TypeDisplay` shows one it was handed resolved only at
+/// its top: a variable inside it, bound or not, is `_`.
+pub fn show_shallow(t: Tys, x: i64) -> str {
+    var b = str_builder()
+    write_ty(t, shallow(t, x), b)
+    b.to_str()
+}
+
 pub fn show(inout t: Tys, x: i64) -> str {
     let r = resolve(t, x)
     var b = str_builder()

@@ -5,6 +5,7 @@ import prog
 import tys
 import sema
 import semcall
+import builtin_rows
 
 pub fn infer_field(inout c: Ck, inout t: Tys, p: Prog, e: i64) -> i64 {
     let recv = prog.sl(p, e, 0)
@@ -36,7 +37,7 @@ pub fn infer_field(inout c: Ck, inout t: Tys, p: Prog, e: i64) -> i64 {
         if t.k[r] == tys.K_NAMED and c.handler_ids.has(t.a[r]) {
             let (fnames, _) = tys.struct_fields(t, t.a[r])
             if fnames.contains(name) {
-                return sema.err(c, s, en, "`{name}` is an operation of a handler, not a field to read")
+                return sema.err_help(c, s, en, "`{name}` is an operation of a handler, not a field to read", "a handler's operations are called by performing the effect inside `with ... handled_by`, which is what makes their effects count where the handler is installed")
             }
         }
     }
@@ -51,7 +52,7 @@ pub fn infer_field(inout c: Ck, inout t: Tys, p: Prog, e: i64) -> i64 {
                         sema.tir_name(c, key, sema.NR_CONST, qual, [])
                         return ty
                     }
-                    return sema.err(c, prog.s(p, nm), prog.e(p, nm), "constant `{name}` in module `{target}` is private")
+                    return sema.err_help(c, prog.s(p, nm), prog.e(p, nm), "constant `{name}` in module `{target}` is private", "mark it `pub let` to allow cross-module use")
                 }
                 None -> ()
             }
@@ -75,7 +76,7 @@ pub fn infer_field(inout c: Ck, inout t: Tys, p: Prog, e: i64) -> i64 {
                     let r = tys.subst_generics(t, ret, fresh)
                     return tys.fnt(t, ps, r, own_row)
                 }
-                return sema.err(c, prog.s(p, nm), prog.e(p, nm), "function `{name}` in module `{target}` is private")
+                return sema.err_help(c, prog.s(p, nm), prog.e(p, nm), "function `{name}` in module `{target}` is private", "mark it `pub fn` to allow cross-module use")
             }
             return sema.err(c, prog.s(p, nm), prog.e(p, nm), "module `{target}` has no function `{name}`")
         }
@@ -114,7 +115,7 @@ pub fn field_type_of(inout c: Ck, inout t: Tys, p: Prog, recv_ty: i64, nm: i64, 
             }
             return sema.err(c, s, e, "this tuple has {t.n[sh]} component(s), so there is no `.{name}`")
         }
-        return sema.err(c, s, e, "a tuple has no field `{name}`")
+        return sema.err_help(c, s, e, "a tuple has no field `{name}`", "tuple components are named by position, as in `pair.0`")
     }
     if t.k[sh] == tys.K_NAMED {
         let def = t.a[sh]
@@ -127,12 +128,12 @@ pub fn field_type_of(inout c: Ck, inout t: Tys, p: Prog, recv_ty: i64, nm: i64, 
             }
             return sema.err(c, prog.s(p, nm), prog.e(p, nm), "`{t.d_name[def]}` has no field `{name}`")
         }
-        return sema.err(c, prog.s(p, nm), prog.e(p, nm), "`{t.d_name[def]}` is a sum type — fields are accessed via `match`")
+        return sema.err_help(c, prog.s(p, nm), prog.e(p, nm), "`{t.d_name[def]}` is a sum type — fields are accessed via `match`", "match on the value to get at the variant's fields")
     }
     if t.k[sh] == tys.K_ERROR {
         return tys.ERROR
     }
-    sema.err(c, prog.s(p, nm), prog.e(p, nm), "`{tys.show(t, sh)}` has no field `{name}`")
+    sema.err(c, prog.s(p, nm), prog.e(p, nm), "`{tys.show_shallow(t, sh)}` has no field `{name}`")
 }
 
 fn is_mutating(name: str) -> bool {
@@ -160,12 +161,12 @@ pub fn infer_method_call(inout c: Ck, inout t: Tys, p: Prog, e: i64) -> i64 {
             if fid >= 0 {
                 if c.fn_pub[fid] {
                     if c.unsafe_depth == 0 and c.extern_names.has(qual) {
-                        sema.err(c, prog.s(p, nm), prog.e(p, nm), "`{name}` is a C function, so it can only be used inside `unsafe`")
+                        sema.err_help(c, prog.s(p, nm), prog.e(p, nm), "`{name}` is a C function, so it can only be used inside `unsafe`", "wrap the use in `unsafe \{ ... }`; the package must then declare the `unsafe` capability, which is what makes it visible to everyone who depends on you")
                     }
                     sema.tir_method(c, key, sema.MR_MODULE, "", "")
                     return semcall.check_fn_call_in(c, t, p, target, name, fid, args, s, en)
                 }
-                return sema.err(c, prog.s(p, nm), prog.e(p, nm), "function `{name}` in module `{target}` is private")
+                return sema.err_help(c, prog.s(p, nm), prog.e(p, nm), "function `{name}` in module `{target}` is private", "mark it `pub fn` to allow cross-module calls")
             }
             match c.variants.get(name) {
                 Some(cands) -> {
@@ -184,7 +185,7 @@ pub fn infer_method_call(inout c: Ck, inout t: Tys, p: Prog, e: i64) -> i64 {
         let ei = c.eff_index.get(ename) ?? -1
         if ei >= 0 {
             if c.region_depth > 0 {
-                sema.err(c, s, en, "cannot perform effect `{ename}.{name}` inside a region")
+                sema.err_help(c, s, en, "cannot perform effect `{ename}.{name}` inside a region", "a handler can keep what it is given, and nothing here says this one does not — which is how a value allocated inside the region would get out. Perform the effect after the closing brace, or yield a number and do the work outside")
             }
             var op = -1
             for i in c.eff_op0[ei]..c.eff_op0[ei] + c.eff_opn[ei] {
@@ -279,7 +280,65 @@ pub fn infer_method_call(inout c: Ck, inout t: Tys, p: Prog, e: i64) -> i64 {
     if t.k[rr] == tys.K_VAR {
         return tys.fresh(t)
     }
-    sema.err(c, prog.s(p, nm), prog.e(p, nm), "no method `{name}` on `{tys.show(t, recv_ty)}`")
+    let shown = tys.show(t, recv_ty)
+    // A built-in free function is not a method of anything; `|>` applies
+    // one to a value ([G-PIPE]).
+    if builtin_rows.is_free_fn(name) {
+        return sema.err_help(c, prog.s(p, nm), prog.e(p, nm), "`{name}` is a built-in function, not a method on `{shown}`", "write `x |> {name}` to pass a value to it, or `{name}(x)`")
+    }
+    // A range has no name in the type grammar, so the help names the
+    // methods it has.
+    if t.k[rr] == tys.K_RANGE {
+        let have = ["to_list", "map", "filter", "sum", "len"]
+        var near = ""
+        for m in have {
+            if near == "" and looks_like(m, name) {
+                near = "did you mean `{m}`?"
+            }
+        }
+        if near == "" {
+            near = "a range has `" + have.join("`, `") + "` — or `.to_list()` first, for anything a list can do"
+        }
+        return sema.err_help(c, prog.s(p, nm), prog.e(p, nm), "no method `{name}` on a range", near)
+    }
+    sema.err_help(c, prog.s(p, nm), prog.e(p, nm), "no method `{name}` on `{shown}`", "a free function `fn {name}({shown}, ...)` would also work here (UFCS)")
+}
+
+/// Whether `written` is one edit from `candidate`, or a prefix of it or it
+/// of `written` (check.rs `looks_like`).
+fn looks_like(candidate: str, written: str) -> bool {
+    if candidate == written {
+        return false
+    }
+    if candidate.starts_with(written) or written.starts_with(candidate) {
+        return true
+    }
+    let a = candidate.chars()
+    let b = written.chars()
+    if (a.len() - b.len()).abs() > 1 {
+        return false
+    }
+    var long = a
+    var short = b
+    if a.len() < b.len() {
+        long = b
+        short = a
+    }
+    var skipped = false
+    var i = 0
+    for ch in long {
+        if i < short.len() and short[i] == ch {
+            i += 1
+        } else if skipped {
+            return false
+        } else {
+            skipped = true
+            if long.len() == short.len() {
+                i += 1
+            }
+        }
+    }
+    true
 }
 
 /// `infer_field(recv, name, span)` with the method call's own span, as
@@ -310,7 +369,7 @@ fn infer_field_of_call(inout c: Ck, inout t: Tys, p: Prog, recv: i64, nm: i64, s
         if t.k[r] == tys.K_NAMED and c.handler_ids.has(t.a[r]) {
             let (fnames, _) = tys.struct_fields(t, t.a[r])
             if fnames.contains(name) {
-                return sema.err(c, s, en, "`{name}` is an operation of a handler, not a field to read")
+                return sema.err_help(c, s, en, "`{name}` is an operation of a handler, not a field to read", "a handler's operations are called by performing the effect inside `with ... handled_by`, which is what makes their effects count where the handler is installed")
             }
         }
     }
@@ -325,7 +384,7 @@ fn infer_field_of_call(inout c: Ck, inout t: Tys, p: Prog, recv: i64, nm: i64, s
                         sema.tir_name(c, key, sema.NR_CONST, qual, [])
                         return ty
                     }
-                    return sema.err(c, prog.s(p, nm), prog.e(p, nm), "constant `{name}` in module `{target}` is private")
+                    return sema.err_help(c, prog.s(p, nm), prog.e(p, nm), "constant `{name}` in module `{target}` is private", "mark it `pub let` to allow cross-module use")
                 }
                 None -> ()
             }
@@ -349,7 +408,7 @@ fn infer_field_of_call(inout c: Ck, inout t: Tys, p: Prog, recv: i64, nm: i64, s
                     let r = tys.subst_generics(t, ret, fresh)
                     return tys.fnt(t, ps, r, own_row)
                 }
-                return sema.err(c, prog.s(p, nm), prog.e(p, nm), "function `{name}` in module `{target}` is private")
+                return sema.err_help(c, prog.s(p, nm), prog.e(p, nm), "function `{name}` in module `{target}` is private", "mark it `pub fn` to allow cross-module use")
             }
             return sema.err(c, prog.s(p, nm), prog.e(p, nm), "module `{target}` has no function `{name}`")
         }
@@ -485,7 +544,7 @@ fn interface_method(inout c: Ck, inout t: Tys, p: Prog, recv_res: i64, recv: i64
             if sema.lookup_fn(c, name) >= 0 {
                 return -2
             }
-            return sema.err(c, prog.s(p, nm), prog.e(p, nm), "`{gname}` has no method `{name}`")
+            return sema.err_help(c, prog.s(p, nm), prog.e(p, nm), "`{gname}` has no method `{name}`", "inside a generic body a `{gname}` offers only its bounds' methods — bound it with an interface declaring `{name}`, as in `[{gname}: Show]`")
         }
         let fx = prog.sl(p, sig, 4)
         if fx >= 0 and prog.count(p, fx) > 0 {
@@ -576,7 +635,7 @@ fn require_mutable(inout c: Ck, inout t: Tys, p: Prog, recv: i64, nm: i64) {
         if prog.kind(p, root) == ast.E_FIELD {
             let f = prog.name(p, prog.sl(p, root, 1))
             if sema.all_digits(f) {
-                sema.err(c, prog.s(p, root), prog.e(p, root), "cannot use `{name}` on a tuple component")
+                sema.err_help(c, prog.s(p, root), prog.e(p, root), "cannot use `{name}` on a tuple component", "a tuple is a fixed group of values with no place to write into — bind the component to a `var`, or use a struct when the parts have names worth writing")
                 return
             }
         }
@@ -589,13 +648,13 @@ fn require_mutable(inout c: Ck, inout t: Tys, p: Prog, recv: i64, nm: i64) {
         sema.reject_region_escape(c, p, id, "mutate")
         let b = sema.lookup(c, rn)
         if b >= 0 and not c.b_mut[b] and not through_ref {
-            sema.err(c, prog.s(p, id), prog.e(p, id), "cannot mutate `{rn}` — it is immutable")
+            sema.err_help(c, prog.s(p, id), prog.e(p, id), "cannot mutate `{rn}` — it is immutable", "declare it with `var {rn}`")
         }
         sema.reject_capture_write(c, t, p, id, "mutate", "")
         let rt = sema.infer_expr(c, t, p, recv)
         sema.reject_handler_escape(c, t, p, recv, rt)
     } else {
-        sema.err(c, prog.es(p, recv), prog.ee(p, recv), "cannot use `{name}` on a temporary")
+        sema.err_help(c, prog.es(p, recv), prog.ee(p, recv), "cannot use `{name}` on a temporary", "a mutating method changes a value in place, and there is nowhere for this one to land — bind it with `var` first")
     }
     return
 }
@@ -747,7 +806,7 @@ fn builtin_method(inout c: Ck, inout t: Tys, p: Prog, recv_ty: i64, recv: i64, n
             ar(c, args, 0, name, s, e)
             let el = tys.shallow(t, elem)
             if not sema.is_ordered(t, el) {
-                sema.err(c, s, e, "`{tys.show(t, elem)}` has no order, so `sort` cannot arrange it")
+                sema.err_help(c, s, e, "`{tys.show(t, elem)}` has no order, so `sort` cannot arrange it", "only `i64`, `f64` and `str` are ordered; use `sort_by` with a key you extract from each element")
             }
             return tys.UNIT
         }
@@ -780,7 +839,7 @@ fn builtin_method(inout c: Ck, inout t: Tys, p: Prog, recv_ty: i64, recv: i64, n
                 sema.check_expr(c, t, p, args[0], f)
                 let kk = tys.shallow(t, key)
                 if not sema.is_ordered(t, kk) {
-                    sema.err(c, s, e, "`{tys.show(t, key)}` has no order, so `sort_by` cannot use it as a key")
+                    sema.err_help(c, s, e, "`{tys.show(t, key)}` has no order, so `sort_by` cannot use it as a key", "return an `i64`, `f64` or `str` from the key function")
                 }
             }
             return tys.UNIT
@@ -1337,10 +1396,16 @@ fn check_mem_method(inout c: Ck, inout t: Tys, p: Prog, nm: i64, args: [i64], s:
             }
         }
         if order == "" {
-            return sema.err(c, prog.es(p, last), prog.ee(p, last), "`{name}` takes a memory ordering, written as its name")
+            return sema.err_help(c, prog.es(p, last), prog.ee(p, last), "`{name}` takes a memory ordering, written as its name", "one of `Relaxed`, `Acquire`, `Release`, `AcqRel` or `SeqCst`; it must be known when the program is compiled, so it cannot be a value ([L-LIB-ATOMIC])")
         }
         if not order_ok(aop, order) {
-            return sema.err(c, prog.es(p, last), prog.ee(p, last), "an atomic {aop} cannot be `{order}`")
+            var allowed: [str] = []
+            for o in ["Relaxed", "Acquire", "Release", "AcqRel", "SeqCst"] {
+                if order_ok(aop, o) {
+                    allowed.push(o)
+                }
+            }
+            return sema.err_help(c, prog.es(p, last), prog.ee(p, last), "an atomic {aop} cannot be `{order}`", "a {aop} may be {allowed.join(", ")} ([L-LIB-ATOMIC])")
         }
         c.mem_kind.set(key, sema.MO_ATOMIC)
         c.mem_s.set(key, order.to_lower())
@@ -1377,7 +1442,7 @@ fn check_mem_method(inout c: Ck, inout t: Tys, p: Prog, nm: i64, args: [i64], s:
 fn check_call_c(inout c: Ck, inout t: Tys, p: Prog, nm: i64, args: [i64], s: i64, e: i64) -> i64 {
     let key = prog.key(s, e)
     if args.len() == 0 or prog.kind(p, args[0]) != ast.E_IDENT {
-        return sema.err(c, s, e, "`call_c` takes a signature first, written as the name of a type alias")
+        return sema.err_help(c, s, e, "`call_c` takes a signature first, written as the name of a type alias", "for example `type Cmp = fn(addr, addr) -> i32` and then `a.call_c(Cmp, x, y)`")
     }
     let tid = prog.sl(p, args[0], 0)
     let ty = semcall.resolve_named(c, t, p, tid)
@@ -1385,19 +1450,19 @@ fn check_call_c(inout c: Ck, inout t: Tys, p: Prog, nm: i64, args: [i64], s: i64
         return tys.ERROR
     }
     if t.k[ty] != tys.K_FN {
-        return sema.err(c, prog.s(p, tid), prog.e(p, tid), "`call_c` takes a function type, and `{tys.show(t, ty)}` is not one")
+        return sema.err_help(c, prog.s(p, tid), prog.e(p, tid), "`call_c` takes a function type, and `{tys.show(t, ty)}` is not one", "name a type alias such as `type Cmp = fn(addr, addr) -> i32`")
     }
     let params = tys.items(t, ty)
     let ret = t.a[ty]
     var ok = true
     for x in params {
         if not sema.is_c_param_type(t, x) {
-            sema.err(c, prog.s(p, tid), prog.e(p, tid), "`{tys.show(t, x)}` has no C representation")
+            sema.err_help(c, prog.s(p, tid), prog.e(p, tid), "`{tys.show(t, x)}` has no C representation", "a `call_c` parameter is what an `extern fn` may take: an integer type, `f64`, `addr`, `str` or `bytes`")
             ok = false
         }
     }
     if t.k[ret] != tys.K_UNIT and not sema.is_c_abi_type(t, ret) {
-        sema.err(c, prog.s(p, tid), prog.e(p, tid), "`{tys.show(t, ret)}` has no C representation")
+        sema.err_help(c, prog.s(p, tid), prog.e(p, tid), "`{tys.show(t, ret)}` has no C representation", "a `call_c` result is an integer type, `f64`, `addr` or nothing")
         ok = false
     }
     let values = args.slice(1, args.len())

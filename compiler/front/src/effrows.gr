@@ -350,7 +350,38 @@ fn collect_lits_block(p: Prog, b: i64, closures: bool, inout out: [i64]) {
     }
 }
 
-fn collect_lits(p: Prog, e: i64, closures: bool, inout out: [i64]) {
+fn collect_lits(p: Prog, e0: i64, closures: bool, inout out: [i64]) {
+    // A binary operator's right operand and an `else if` are walked in this
+    // loop, not by recursion: a `^` chain and an `else if` chain are as long
+    // as they are written (the nesting cap does not count them).
+    var e = e0
+    while true {
+        let k = prog.kind(p, e)
+        if k == ast.E_BINARY {
+            collect_lits(p, prog.sl(p, e, 1), closures, out)
+            e = prog.sl(p, e, 2)
+            continue
+        }
+        if k == ast.E_IF {
+            collect_lits(p, prog.sl(p, e, 0), closures, out)
+            collect_lits_block(p, prog.sl(p, e, 1), closures, out)
+            let eb = prog.sl(p, e, 2)
+            if eb >= 0 {
+                if prog.kind(p, eb) == ast.EB_ELSE {
+                    collect_lits_block(p, prog.sl(p, eb, 0), closures, out)
+                } else {
+                    e = prog.sl(p, eb, 0)
+                    continue
+                }
+            }
+            return
+        }
+        collect_lits_node(p, e, closures, out)
+        return
+    }
+}
+
+fn collect_lits_node(p: Prog, e: i64, closures: bool, inout out: [i64]) {
     let k = prog.kind(p, e)
     if k == ast.E_CLOSURE {
         if closures {
@@ -387,9 +418,6 @@ fn collect_lits(p: Prog, e: i64, closures: bool, inout out: [i64]) {
             collect_lits(p, prog.sl(p, pr, 0), closures, out)
             collect_lits(p, prog.sl(p, pr, 1), closures, out)
         }
-    } else if k == ast.E_BINARY {
-        collect_lits(p, prog.sl(p, e, 1), closures, out)
-        collect_lits(p, prog.sl(p, e, 2), closures, out)
     } else if k == ast.E_UNARY {
         collect_lits(p, prog.sl(p, e, 1), closures, out)
     } else if k == ast.E_TRY {
@@ -401,17 +429,6 @@ fn collect_lits(p: Prog, e: i64, closures: bool, inout out: [i64]) {
         collect_lits(p, prog.sl(p, e, 1), closures, out)
     } else if k == ast.E_BLOCK or k == ast.E_UNSAFE or k == ast.E_REGION {
         collect_lits_block(p, prog.sl(p, e, 0), closures, out)
-    } else if k == ast.E_IF {
-        collect_lits(p, prog.sl(p, e, 0), closures, out)
-        collect_lits_block(p, prog.sl(p, e, 1), closures, out)
-        let eb = prog.sl(p, e, 2)
-        if eb >= 0 {
-            if prog.kind(p, eb) == ast.EB_ELSE {
-                collect_lits_block(p, prog.sl(p, eb, 0), closures, out)
-            } else {
-                collect_lits(p, prog.sl(p, eb, 0), closures, out)
-            }
-        }
     } else if k == ast.E_MATCH {
         collect_lits(p, prog.sl(p, e, 0), closures, out)
         for arm in prog.items(p, prog.sl(p, e, 1)) {
@@ -458,16 +475,25 @@ pub fn collect_fn_bindings(p: Prog, b: i64, inout f: Fnb) {
     }
 }
 
-pub fn seed_closure_params(p: Prog, e: i64, inout f: Fnb) {
-    let k = prog.kind(p, e)
-    if k == ast.E_CLOSURE {
-        let body = prog.sl(p, e, 1)
-        for prm in prog.items(p, prog.sl(p, e, 0)) {
-            bind_name(f, prog.name(p, prm), prog.es(p, body))
+pub fn seed_closure_params(p: Prog, e0: i64, inout f: Fnb) {
+    // The last subexpression in this loop, not by recursion (a `^` chain).
+    var e = e0
+    while true {
+        let k = prog.kind(p, e)
+        if k == ast.E_CLOSURE {
+            let body = prog.sl(p, e, 1)
+            for prm in prog.items(p, prog.sl(p, e, 0)) {
+                bind_name(f, prog.name(p, prm), prog.es(p, body))
+            }
         }
-    }
-    for sub in shallow_kids(p, e) {
-        seed_closure_params(p, sub, f)
+        let kids = shallow_kids(p, e)
+        if kids.len() == 0 {
+            return
+        }
+        for i in 0..kids.len() - 1 {
+            seed_closure_params(p, kids[i], f)
+        }
+        e = kids[kids.len() - 1]
     }
 }
 
@@ -585,13 +611,24 @@ pub fn walk_stmt(x: Eff, p: Prog, mi: i64, current: str, st: i64, inout active: 
     }
 }
 
-pub fn walk_expr(x: Eff, p: Prog, mi: i64, current: str, e: i64, inout active: [str], f: Fnb, inout out: Map[str, bool]) {
+pub fn walk_expr(x: Eff, p: Prog, mi: i64, current: str, e0: i64, inout active: [str], f: Fnb, inout out: Map[str, bool]) {
+    // A binary operator's right operand and an `else if` are walked in this
+    // loop, not by recursion: a `^` chain and an `else if` chain are as long
+    // as they are written (the nesting cap does not count them).
+    var e = e0
+    while e >= 0 {
+        e = walk_expr_one(x, p, mi, current, e, active, f, out)
+    }
+}
+
+/// One node of `walk_expr`; the node to walk next in its place, or -1.
+fn walk_expr_one(x: Eff, p: Prog, mi: i64, current: str, e: i64, inout active: [str], f: Fnb, inout out: Map[str, bool]) -> i64 {
     let k = prog.kind(p, e)
     if k != ast.E_CLOSURE {
         value_row(x, p, e, active, out)
     }
     if k == ast.E_INT or k == ast.E_FLOAT or k == ast.E_BOOL {
-        return
+        return -1
     }
     if k == ast.E_IDENT {
         let id = prog.sl(p, e, 0)
@@ -606,7 +643,7 @@ pub fn walk_expr(x: Eff, p: Prog, mi: i64, current: str, e: i64, inout active: [
             }
         }
         value_row(x, p, e, active, out)
-        return
+        return -1
     }
     if k == ast.E_STR {
         for pc in prog.items(p, prog.sl(p, e, 0)) {
@@ -614,20 +651,20 @@ pub fn walk_expr(x: Eff, p: Prog, mi: i64, current: str, e: i64, inout active: [
                 walk_expr(x, p, mi, current, prog.sl(p, pc, 0), active, f, out)
             }
         }
-        return
+        return -1
     }
     if k == ast.E_LIST or k == ast.E_TUPLE {
         for i in prog.items(p, prog.sl(p, e, 0)) {
             walk_expr(x, p, mi, current, i, active, f, out)
         }
-        return
+        return -1
     }
     if k == ast.E_MAP {
         for pr in prog.items(p, prog.sl(p, e, 0)) {
             walk_expr(x, p, mi, current, prog.sl(p, pr, 0), active, f, out)
             walk_expr(x, p, mi, current, prog.sl(p, pr, 1), active, f, out)
         }
-        return
+        return -1
     }
     if k == ast.E_STRUCT {
         let base = prog.sl(p, e, 1)
@@ -637,7 +674,7 @@ pub fn walk_expr(x: Eff, p: Prog, mi: i64, current: str, e: i64, inout active: [
         for pr in prog.items(p, prog.sl(p, e, 2)) {
             walk_expr(x, p, mi, current, prog.sl(p, pr, 1), active, f, out)
         }
-        return
+        return -1
     }
     if k == ast.E_CALL {
         let callee = prog.sl(p, e, 0)
@@ -668,7 +705,7 @@ pub fn walk_expr(x: Eff, p: Prog, mi: i64, current: str, e: i64, inout active: [
         for a in prog.items(p, prog.sl(p, e, 1)) {
             walk_expr(x, p, mi, current, a, active, f, out)
         }
-        return
+        return -1
     }
     if k == ast.E_METHOD {
         let recv = prog.sl(p, e, 0)
@@ -682,7 +719,7 @@ pub fn walk_expr(x: Eff, p: Prog, mi: i64, current: str, e: i64, inout active: [
                 for a in prog.items(p, prog.sl(p, e, 2)) {
                     walk_expr(x, p, mi, current, a, active, f, out)
                 }
-                return
+                return -1
             }
             None -> ()
         }
@@ -720,7 +757,7 @@ pub fn walk_expr(x: Eff, p: Prog, mi: i64, current: str, e: i64, inout active: [
         for a in prog.items(p, prog.sl(p, e, 2)) {
             walk_expr(x, p, mi, current, a, active, f, out)
         }
-        return
+        return -1
     }
     if k == ast.E_FIELD {
         let recv = prog.sl(p, e, 0)
@@ -749,30 +786,29 @@ pub fn walk_expr(x: Eff, p: Prog, mi: i64, current: str, e: i64, inout active: [
         if not qualified {
             walk_expr(x, p, mi, current, recv, active, f, out)
         }
-        return
+        return -1
     }
     if k == ast.E_INDEX {
         walk_expr(x, p, mi, current, prog.sl(p, e, 0), active, f, out)
         walk_expr(x, p, mi, current, prog.sl(p, e, 1), active, f, out)
-        return
+        return -1
     }
     if k == ast.E_UNARY {
         walk_expr(x, p, mi, current, prog.sl(p, e, 1), active, f, out)
-        return
+        return -1
     }
     if k == ast.E_TRY {
         walk_expr(x, p, mi, current, prog.sl(p, e, 0), active, f, out)
-        return
+        return -1
     }
     if k == ast.E_BINARY {
         walk_expr(x, p, mi, current, prog.sl(p, e, 1), active, f, out)
-        walk_expr(x, p, mi, current, prog.sl(p, e, 2), active, f, out)
-        return
+        return prog.sl(p, e, 2)
     }
     if k == ast.E_RANGE {
         walk_expr(x, p, mi, current, prog.sl(p, e, 0), active, f, out)
         walk_expr(x, p, mi, current, prog.sl(p, e, 1), active, f, out)
-        return
+        return -1
     }
     if k == ast.E_IF {
         walk_expr(x, p, mi, current, prog.sl(p, e, 0), active, f, out)
@@ -782,10 +818,10 @@ pub fn walk_expr(x: Eff, p: Prog, mi: i64, current: str, e: i64, inout active: [
             if prog.kind(p, eb) == ast.EB_ELSE {
                 walk_block(x, p, mi, current, prog.sl(p, eb, 0), active, f, out)
             } else {
-                walk_expr(x, p, mi, current, prog.sl(p, eb, 0), active, f, out)
+                return prog.sl(p, eb, 0)
             }
         }
-        return
+        return -1
     }
     if k == ast.E_MATCH {
         walk_expr(x, p, mi, current, prog.sl(p, e, 0), active, f, out)
@@ -796,18 +832,19 @@ pub fn walk_expr(x: Eff, p: Prog, mi: i64, current: str, e: i64, inout active: [
             }
             walk_expr(x, p, mi, current, prog.sl(p, arm, 2), active, f, out)
         }
-        return
+        return -1
     }
     if k == ast.E_BLOCK or k == ast.E_REGION {
         walk_block(x, p, mi, current, prog.sl(p, e, 0), active, f, out)
-        return
+        return -1
     }
     if k == ast.E_UNSAFE {
         out.set("unsafe", true)
         walk_block(x, p, mi, current, prog.sl(p, e, 0), active, f, out)
-        return
+        return -1
     }
     if k == ast.E_CLOSURE {
         walk_expr(x, p, mi, current, prog.sl(p, e, 1), active, f, out)
     }
+    -1
 }

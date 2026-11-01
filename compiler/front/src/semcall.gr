@@ -51,7 +51,7 @@ pub fn infer_call(inout c: Ck, inout t: Tys, p: Prog, e: i64) -> i64 {
                             sema.tir_call(c, key, sema.CR_VARIANT, "", [])
                             return sema.instantiate_variant(c, t, p, sema.vdef(ownv), sema.vidx(ownv), args, s, en)
                         }
-                        return sema.err(c, prog.s(p, id), prog.e(p, id), "`{name}` is ambiguous — variant of multiple types")
+                        return sema.err_help(c, prog.s(p, id), prog.e(p, id), "`{name}` is ambiguous — variant of multiple types", "qualify it as `TypeName.Variant(...)`")
                     }
                 }
                 None -> ()
@@ -83,7 +83,7 @@ pub fn infer_call(inout c: Ck, inout t: Tys, p: Prog, e: i64) -> i64 {
     if t.k[r] == tys.K_ERROR {
         return tys.ERROR
     }
-    sema.err(c, s, en, "`{tys.show(t, r)}` is not callable")
+    sema.err(c, s, en, "`{tys.show_shallow(t, r)}` is not callable")
 }
 
 /// A built-in free function's type, or -2 when `name` is not one.
@@ -94,7 +94,7 @@ fn builtin_call(inout c: Ck, inout t: Tys, p: Prog, name: str, id: i64, args: [i
         }
         let ty = sema.infer_expr(c, t, p, args[0])
         if t.k[tys.shallow(t, ty)] == tys.K_FALLIBLE {
-            sema.err(c, prog.es(p, args[0]), prog.ee(p, args[0]), "cannot {name} a fallible value")
+            sema.err_help(c, prog.es(p, args[0]), prog.ee(p, args[0]), "cannot {name} a fallible value", "handle the error first with `try` or `match`")
         }
         return tys.UNIT
     }
@@ -211,7 +211,8 @@ fn builtin_call(inout c: Ck, inout t: Tys, p: Prog, name: str, id: i64, args: [i
     }
     if name == "tcp_write" or name == "tcp_write_bytes" {
         if args.len() != 2 {
-            return sema.err(c, s, e, "{name} takes 2 arguments")
+            let what = if name == "tcp_write" { "text" } else { "bytes" }
+            return sema.err(c, s, e, "{name} takes 2 arguments (handle, {what})")
         }
         sema.check_expr(c, t, p, args[0], tys.I64)
         let payload = if name == "tcp_write" { tys.STR } else { tys.BYTES }
@@ -257,7 +258,7 @@ fn builtin_call(inout c: Ck, inout t: Tys, p: Prog, name: str, id: i64, args: [i
     }
     if name == "bytes_filled" {
         if args.len() != 2 {
-            return sema.err(c, s, e, "bytes_filled takes exactly 2 arguments")
+            return sema.err(c, s, e, "bytes_filled takes exactly 2 arguments (a count, and a byte in 0..255)")
         }
         sema.check_expr(c, t, p, args[0], tys.I64)
         sema.check_expr(c, t, p, args[1], tys.I64)
@@ -375,7 +376,7 @@ fn builtin_call(inout c: Ck, inout t: Tys, p: Prog, name: str, id: i64, args: [i
             sema.check_expr(c, t, p, args[1], v)
             let sent = tys.resolve(t, v)
             if sema.task_shares_ref(c, t, sent) {
-                sema.err(c, prog.es(p, args[1]), prog.ee(p, args[1]), "a channel cannot carry a `ref`: the task receiving it would share the cell with the one sending it")
+                sema.err_help(c, prog.es(p, args[1]), prog.ee(p, args[1]), "a channel cannot carry a `ref`: the task receiving it would share the cell with the one sending it", "send the value itself, or wrap the shared state in an `actor` ([E-ACTOR])")
             }
             return tys.UNIT
         }
@@ -476,15 +477,15 @@ fn builtin_call(inout c: Ck, inout t: Tys, p: Prog, name: str, id: i64, args: [i
             return sema.err(c, s, e, "fail takes exactly 1 argument (the error value)")
         }
         if c.region_depth > 0 {
-            sema.err(c, s, e, "cannot `fail` from inside a region")
+            sema.err_help(c, s, e, "cannot `fail` from inside a region", "a region promises that nothing allocated inside outlives the closing brace, and an error value carries one out — yield a number from the region and fail outside it")
         }
         let et = sema.infer_expr(c, t, p, args[0])
         if c.fn_err_ty >= 0 {
             if not sema.err_fits(c, t, et, c.fn_err_ty) {
-                sema.err(c, s, e, "`fail` raises `{tys.show(t, et)}` but this function declares `{tys.show(t, c.fn_err_ty)}`")
+                sema.err_help(c, s, e, "`fail` raises `{tys.show(t, et)}` but this function declares `{tys.show(t, c.fn_err_ty)}`", "add the error type to the function's `!` clause")
             }
         } else {
-            sema.err(c, s, e, "`fail` used in a function that declares no error type")
+            sema.err_help(c, s, e, "`fail` used in a function that declares no error type", "add `! ErrorType` to the function signature")
         }
         return tys.fresh(t)
     }
@@ -499,7 +500,7 @@ fn check_region_call_in(inout c: Ck, inout t: Tys, p: Prog, owner: str, name: st
     if row >= 0 {
         for ef in tys.row_names(t, row) {
             if not (ef == "io" or ef == "async" or ef == "unsafe" or ef == "mem") {
-                sema.err(c, s, e, "cannot call `{name}` inside a region — it performs `{ef}`")
+                sema.err_help(c, s, e, "cannot call `{name}` inside a region — it performs `{ef}`", "the effect's handler is written outside the region and may keep what it is given, which is how a value allocated inside gets out — perform the effect after the closing brace")
                 break
             }
         }
@@ -510,7 +511,7 @@ fn check_region_call_in(inout c: Ck, inout t: Tys, p: Prog, owner: str, name: st
         }
         let ty = sema.infer_expr(c, t, p, a)
         if sema.carries_fn(c, t, ty) {
-            sema.err(c, prog.es(p, a), prog.ee(p, a), "cannot pass a function into a call inside a region")
+            sema.err_help(c, prog.es(p, a), prog.ee(p, a), "cannot pass a function into a call inside a region", "a function value written outside the region carries its captures, so what the region allocates could be kept — write the closure inside the region, or move the call out")
         }
     }
 }
@@ -618,7 +619,7 @@ pub fn check_fn_call_in(inout c: Ck, inout t: Tys, p: Prog, owner: str, name: st
                 let nm = prog.name(p, id)
                 let b = sema.lookup(c, nm)
                 if b >= 0 and not c.b_owned[b] and c.b_kind[b] == sema.BK_PARAM and sema.is_linear(c, t, c.b_ty[b]) {
-                    sema.err(c, prog.s(p, id), prog.e(p, id), "cannot give away `{nm}`: it is lent to this function, not owned by it")
+                    sema.err_help(c, prog.s(p, id), prog.e(p, id), "cannot give away `{nm}`: it is lent to this function, not owned by it", "take the parameter as `own` to be able to consume it ([T-LINEAR])")
                 }
                 if not is_copy(t, params[i]) and sema.lookup(c, nm) >= 0 {
                     sema.mark_moved(c, p, id)
@@ -636,7 +637,7 @@ pub fn check_fn_call_in(inout c: Ck, inout t: Tys, p: Prog, owner: str, name: st
                 }
             }
             if tuple_comp {
-                sema.err(c, prog.es(p, a), prog.ee(p, a), "cannot pass a tuple component as `inout`")
+                sema.err_help(c, prog.es(p, a), prog.ee(p, a), "cannot pass a tuple component as `inout`", "a tuple is a fixed group of values with no place to write into — bind the component to a `var` and rebuild the tuple, or use a struct when the parts have names worth writing")
                 i += 1
                 continue
             }
@@ -650,17 +651,17 @@ pub fn check_fn_call_in(inout c: Ck, inout t: Tys, p: Prog, owner: str, name: st
                     root_is_ref = sema.path_crosses_ref(c, t, p, a)
                 }
                 if root_is_ref {
-                    sema.err(c, prog.s(p, root), prog.e(p, root), "cannot pass `{nm}` as `inout` — it is reached through a `ref`")
+                    sema.err_help(c, prog.s(p, root), prog.e(p, root), "cannot pass `{nm}` as `inout` — it is reached through a `ref`", "write through the reference instead, or hold the value in a `var` and drop the reference")
                 }
                 let b = sema.lookup(c, nm)
                 if b >= 0 and not c.b_mut[b] and not root_is_ref {
-                    sema.err(c, prog.s(p, root), prog.e(p, root), "cannot pass `{nm}` as `inout` — it is immutable")
+                    sema.err_help(c, prog.s(p, root), prog.e(p, root), "cannot pass `{nm}` as `inout` — it is immutable", "declare it with `var {nm}`")
                 }
                 sema.reject_capture_write(c, t, p, root, "pass", " as `inout`")
                 if pp.len() > 0 {
                     for prev in inout_places {
                         if places_overlap(prev, pp) {
-                            sema.err(c, prog.s(p, root), prog.e(p, root), "`{nm}` is passed as `inout` twice in one call")
+                            sema.err_help(c, prog.s(p, root), prog.e(p, root), "`{nm}` is passed as `inout` twice in one call", "two exclusive references to the same value cannot coexist")
                             break
                         }
                     }
@@ -670,16 +671,14 @@ pub fn check_fn_call_in(inout c: Ck, inout t: Tys, p: Prog, owner: str, name: st
                 inout_s.push(prog.s(p, root))
                 inout_e.push(prog.e(p, root))
             } else {
-                sema.err(c, prog.es(p, a), prog.ee(p, a), "`inout` argument must be a variable, field, or index expression")
+                sema.err_help(c, prog.es(p, a), prog.ee(p, a), "`inout` argument must be a variable, field, or index expression", "temporaries cannot be mutated in place")
             }
         }
         i += 1
     }
     for j in 0..inout_roots.len() {
         if own_roots.contains(inout_roots[j]) {
-            c.d_s.push(inout_s[j])
-            c.d_e.push(inout_e[j])
-            c.d_msg.push("`{inout_roots[j]}` is both moved (`ownv`) and mutated (`inout`) in one call")
+            sema.push_diag(c, inout_s[j], inout_e[j], "`{inout_roots[j]}` is both moved (`own`) and mutated (`inout`) in one call", "a value cannot be transferred and borrowed at the same time")
         }
     }
     let ret = tys.subst_generics(t, c.fn_ret[fid], fresh)
@@ -719,7 +718,7 @@ pub fn require_map_keys_within(inout c: Ck, inout t: Tys, x: i64, s: i64, e: i64
 
 pub fn require_map_key(inout c: Ck, inout t: Tys, k: i64, s: i64, e: i64) {
     if not map_key_ok(c, t, k) {
-        sema.err(c, s, e, "map keys must be an integer type, `str`, `bool` or a tuple of those, not `{tys.show(t, k)}`")
+        sema.err_help(c, s, e, "map keys must be an integer type, `str`, `bool` or a tuple of those, not `{tys.show(t, k)}`", "use a key of those types, or a tuple of them for a key with several parts")
     }
 }
 
@@ -771,7 +770,7 @@ pub fn reject_parallel_ref_elem(inout c: Ck, inout t: Tys, elem: i64, name: str,
     if not sema.carries_ref(c, t, elem) {
         return
     }
-    sema.err(c, s, e, "`{name}` cannot process `{tys.show(t, elem)}` — it reaches a `ref`, which every element would share")
+    sema.err_help(c, s, e, "`{name}` cannot process `{tys.show(t, elem)}` — it reaches a `ref`, which every element would share", "elements are processed on several cores, so two of them reaching the same slot would race — which is what this operation exists to make impossible. Use `map` or `filter` for work over shared state, or build the references inside the function, one per element")
 }
 
 // ---------------------------------------------------------------------
@@ -790,7 +789,7 @@ fn tls_cell(inout c: Ck, p: Prog, arg: i64) -> str {
         }
     }
     if found == "\0" {
-        sema.err(c, prog.es(p, arg), prog.ee(p, arg), "`mem_tls` takes the name of a `thread_local` cell this module declares")
+        sema.err_help(c, prog.es(p, arg), prog.ee(p, arg), "`mem_tls` takes the name of a `thread_local` cell this module declares", "declare one with `thread_local NAME: T`; a cell is private to its module, so another module is handed its address by a function ([T-TLS])")
     }
     found
 }
@@ -807,7 +806,7 @@ fn process_cell(inout c: Ck, p: Prog, arg: i64) -> str {
         }
     }
     if found == "\0" {
-        sema.err(c, prog.es(p, arg), prog.ee(p, arg), "`mem_process` takes the name of a `process_local` cell this module declares")
+        sema.err_help(c, prog.es(p, arg), prog.ee(p, arg), "`mem_process` takes the name of a `process_local` cell this module declares", "declare one with `process_local NAME: T`; a cell is private to its module, so another module is handed its address by a function ([T-RUNTIME])")
     }
     found
 }
@@ -843,7 +842,7 @@ fn fn_addr_target(inout c: Ck, inout t: Tys, p: Prog, arg: i64, key: i64) -> boo
     }
     let fid = sema.fn_of(c, q)
     if fid < 0 {
-        sema.err(c, as_, ae, "`mem_fn_addr` takes the name of a declared function")
+        sema.err_help(c, as_, ae, "`mem_fn_addr` takes the name of a declared function", "write the function's name, `f` or `module.f`; a closure or a value held in a variable has no address C can call ([T-FN-ADDR])")
         return false
     }
     if c.extern_names.has(q) {
@@ -868,7 +867,7 @@ fn fn_addr_target(inout c: Ck, inout t: Tys, p: Prog, arg: i64, key: i64) -> boo
 /// The layout type `mem_size_of(T)` names, or "".
 fn mem_layout_arg(inout c: Ck, inout t: Tys, p: Prog, arg: i64, fname: str) -> str {
     if prog.kind(p, arg) != ast.E_IDENT {
-        sema.err(c, prog.es(p, arg), prog.ee(p, arg), "`{fname}` takes a type, written as its name")
+        sema.err_help(c, prog.es(p, arg), prog.ee(p, arg), "`{fname}` takes a type, written as its name", "for example `mem_size_of(u32)`")
         return ""
     }
     let id = prog.sl(p, arg, 0)
@@ -878,7 +877,7 @@ fn mem_layout_arg(inout c: Ck, inout t: Tys, p: Prog, arg: i64, fname: str) -> s
     }
     let m = sema.memty_of(t, ty)
     if m == "" {
-        sema.err(c, prog.s(p, id), prog.e(p, id), "`{tys.show(t, ty)}` has no layout in raw memory")
+        sema.err_help(c, prog.s(p, id), prog.e(p, id), "`{tys.show(t, ty)}` has no layout in raw memory", "a layout type is one of i8, i16, i32, i64, u8, u16, u32, u64, f64 and addr: the only types a load or a store moves ([L-LIB-MEM])")
     }
     m
 }
@@ -901,7 +900,7 @@ pub fn resolve_named(inout c: Ck, inout t: Tys, p: Prog, id: i64) -> i64 {
         return tys.I64
     }
     if name == "usize" or name == "f32" {
-        return sema.err(c, s, e, "`{name}` is not implemented yet")
+        return sema.not_yet(c, s, e, name)
     }
     if name == "f64" or name == "float" {
         return tys.F64
@@ -942,7 +941,7 @@ pub fn resolve_named(inout c: Ck, inout t: Tys, p: Prog, id: i64) -> i64 {
         }
         return tys.named(t, id2, [])
     }
-    sema.err(c, s, e, "unknown type `{name}`")
+    sema.err_help(c, s, e, "unknown type `{name}`", "declare it with `type` or check the spelling")
 }
 
 fn check_mem_fn(inout c: Ck, inout t: Tys, p: Prog, name: str, id: i64, args: [i64], s: i64, e: i64) -> i64 {
@@ -1041,7 +1040,7 @@ fn check_runtime_fn(inout c: Ck, inout t: Tys, p: Prog, name: str, id: i64, args
             }
         }
         if text == "\0" {
-            return sema.err(c, prog.es(p, a), prog.ee(p, a), "`{name}` takes a string literal")
+            return sema.err_help(c, prog.es(p, a), prog.ee(p, a), "`{name}` takes a string literal", "its bytes are fixed when the runtime is compiled, so the text is written at the call, with no interpolation, and is never a value ([T-RUNTIME])")
         }
         c.cop_kind.set(key, sema.CO_STATIC)
         c.cop_s.set(key, text)

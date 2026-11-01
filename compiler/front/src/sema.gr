@@ -227,10 +227,12 @@ type Ck = {
     d_s: [i64],
     d_e: [i64],
     d_msg: [str],
+    // The help line under each, "" for none.
+    d_help: [str],
 }
 
 pub fn new_ck() -> Ck {
-    var c = Ck{ f_types: map(), f_checked: map(), f_binds: map(), f_wraps: map(), n_kind: map(), n_q: map(), n_targs: map(), c_kind: map(), c_q: map(), c_targs: map(), m_kind: map(), m_a: map(), m_b: map(), ok_wrapped: map(), float_lits: map(), closure_types: map(), parallel_ok: map(), mem_kind: map(), mem_s: map(), cop_kind: map(), cop_s: map(), cells: map(), pcells: map(), c_sigs: map(), exports: [], aliases: map(), alias_names: map(), type_module: map(), fn_index: map(), fn_q: [], fn_pub: [], fn_ngen: [], fn_bounds: [], fn_params: [], fn_modes: [], fn_ret: [], fn_err: [], fn_rows: map(), extern_names: map(), closure_rows: map(), consts: map(), const_pub: map(), interfaces: map(), impls_q: map(), impls_iface: map(), impl_of: map(), linear_types: map(), actor_types: map(), handler_ids: map(), eff_index: map(), eff_handler: [], eff_op0: [], eff_opn: [], op_name: [], op_params: [], op_ret: [], variants: map(), export_names: map(), runtime_mods: map(), cur: "main", cur_mi: 0, expr_types: map(), b_name: [], b_ty: [], b_mut: [], b_kind: [], b_moved: [], b_owned: [], b_at_s: [], b_at_e: [], b_loop: [], b_scope: [], b_dead: [], sc_start: [], closure_floors: [], with_eff: [], with_floor: [], region_floors: [], unsafe_depth: 0, region_depth: 0, discarding: false, tail_fn: "\0", tail_fn_name: "\0", fn_ret_ty: tys.UNIT, fn_err_ty: -1, err_open: false, parallel_depth: 0, concurrent_depth: 0, go_floor: -1, parallel_floor: -1, tc_floor: -1, tc_base: -1, parallel_fn_floor: -1, loop_depth: 0, fn_scope_base: 0, current_generics: [], current_bounds: [], hof_closures: map(), closure_touches_outside_ref: false, dc_level: [], dc_params: [], dc_body: [], dc_ptys: [], dc_ret: [], dc_at: [], df_level: [], df_recv: [], df_name: [], df_out: [], dc_depth: 0, df_depth: 0, bo_var: [], bo_ifaces: [], bo_s: [], bo_e: [], bo_bounds: [], bo_names: [], gc_s: [], gc_e: [], gc_t: [], el_s: [], el_len: [], el_t: [], pending_disc_s: [], pending_disc_e: [], pending_disc_t: [], value_rows: map(), callee_rows: map(), key_owner: "\0", key_generics: map(), par_generics: map(), pk_name: [], pk_fresh: [], pk_s: [], pk_e: [], pk_owner: [], let_closure: map(), ref_touching: map(), pn_at: [], pn_name: [], pn_s: [], pn_e: [], d_s: [], d_e: [], d_msg: [] }
+    var c = Ck{ f_types: map(), f_checked: map(), f_binds: map(), f_wraps: map(), n_kind: map(), n_q: map(), n_targs: map(), c_kind: map(), c_q: map(), c_targs: map(), m_kind: map(), m_a: map(), m_b: map(), ok_wrapped: map(), float_lits: map(), closure_types: map(), parallel_ok: map(), mem_kind: map(), mem_s: map(), cop_kind: map(), cop_s: map(), cells: map(), pcells: map(), c_sigs: map(), exports: [], aliases: map(), alias_names: map(), type_module: map(), fn_index: map(), fn_q: [], fn_pub: [], fn_ngen: [], fn_bounds: [], fn_params: [], fn_modes: [], fn_ret: [], fn_err: [], fn_rows: map(), extern_names: map(), closure_rows: map(), consts: map(), const_pub: map(), interfaces: map(), impls_q: map(), impls_iface: map(), impl_of: map(), linear_types: map(), actor_types: map(), handler_ids: map(), eff_index: map(), eff_handler: [], eff_op0: [], eff_opn: [], op_name: [], op_params: [], op_ret: [], variants: map(), export_names: map(), runtime_mods: map(), cur: "main", cur_mi: 0, expr_types: map(), b_name: [], b_ty: [], b_mut: [], b_kind: [], b_moved: [], b_owned: [], b_at_s: [], b_at_e: [], b_loop: [], b_scope: [], b_dead: [], sc_start: [], closure_floors: [], with_eff: [], with_floor: [], region_floors: [], unsafe_depth: 0, region_depth: 0, discarding: false, tail_fn: "\0", tail_fn_name: "\0", fn_ret_ty: tys.UNIT, fn_err_ty: -1, err_open: false, parallel_depth: 0, concurrent_depth: 0, go_floor: -1, parallel_floor: -1, tc_floor: -1, tc_base: -1, parallel_fn_floor: -1, loop_depth: 0, fn_scope_base: 0, current_generics: [], current_bounds: [], hof_closures: map(), closure_touches_outside_ref: false, dc_level: [], dc_params: [], dc_body: [], dc_ptys: [], dc_ret: [], dc_at: [], df_level: [], df_recv: [], df_name: [], df_out: [], dc_depth: 0, df_depth: 0, bo_var: [], bo_ifaces: [], bo_s: [], bo_e: [], bo_bounds: [], bo_names: [], gc_s: [], gc_e: [], gc_t: [], el_s: [], el_len: [], el_t: [], pending_disc_s: [], pending_disc_e: [], pending_disc_t: [], value_rows: map(), callee_rows: map(), key_owner: "\0", key_generics: map(), par_generics: map(), pk_name: [], pk_fresh: [], pk_s: [], pk_e: [], pk_owner: [], let_closure: map(), ref_touching: map(), pn_at: [], pn_name: [], pn_s: [], pn_e: [], d_s: [], d_e: [], d_msg: [], d_help: [] }
     c.variants.set("Some", [vcode(tys.OPTION, 0)])
     c.variants.set("None", [vcode(tys.OPTION, 1)])
     c.variants.set("NotFound", [vcode(tys.IOERROR, 0)])
@@ -255,8 +257,14 @@ pub fn vidx(code: i64) -> i64 {
 // Diagnostics
 // ---------------------------------------------------------------------
 
-/// Reports an error (one per span and message) and gives the poison type.
+/// Reports an error (one per span and message: `push_diag`) and gives the
+/// poison type.
 pub fn err(inout c: Ck, s: i64, e: i64, msg: str) -> i64 {
+    err_help(c, s, e, msg, "")
+}
+
+/// `error_help`: an error with the help line under it.
+pub fn err_help(inout c: Ck, s: i64, e: i64, msg: str, help: str) -> i64 {
     for i in 0..c.d_s.len() {
         if c.d_s[i] == s and c.d_e[i] == e and c.d_msg[i] == msg {
             return tys.ERROR
@@ -265,7 +273,29 @@ pub fn err(inout c: Ck, s: i64, e: i64, msg: str) -> i64 {
     c.d_s.push(s)
     c.d_e.push(e)
     c.d_msg.push(msg)
+    c.d_help.push(help)
     tys.ERROR
+}
+
+/// `usize` and `f32`, refused until they are real ([T-INT-FIXED]).
+pub fn not_yet(inout c: Ck, s: i64, e: i64, name: str) -> i64 {
+    var what = "a platform-sized integer"
+    var instead = "i64"
+    var write = "`u64` or `i64`"
+    if name == "f32" {
+        what = "single-precision floating point"
+        instead = "f64"
+        write = "`f64`"
+    }
+    err_help(c, s, e, "`{name}` is not implemented yet: Grasm does not have {what}", "it used to be another name for `{instead}` and behaved like one; write {write} ([T-INT-FIXED])")
+}
+
+/// `diags.push`: an error pushed without the dedup `err` does.
+pub fn push_diag(inout c: Ck, s: i64, e: i64, msg: str, help: str) {
+    c.d_s.push(s)
+    c.d_e.push(e)
+    c.d_msg.push(msg)
+    c.d_help.push(help)
 }
 
 pub fn errs(c: Ck) -> i64 {
@@ -278,6 +308,7 @@ pub fn truncate_errs(inout c: Ck, mark: i64) {
         c.d_s.pop()
         c.d_e.pop()
         c.d_msg.pop()
+        c.d_help.pop()
     }
 }
 
@@ -539,13 +570,64 @@ pub fn check_program(p: Prog) -> (Ck, Tys) {
     for k in c.callee_rows.keys() {
         cr.set(k, tys.row_names(t, c.callee_rows.get(k) ?? -1))
     }
-    let (es, ee, em) = effcheck.check(p, vr, cr)
+    let (es, ee, em, eh) = effcheck.check(p, vr, cr)
     for i in 0..es.len() {
-        c.d_s.push(es[i])
-        c.d_e.push(ee[i])
-        c.d_msg.push(em[i])
+        push_diag(c, es[i], ee[i], em[i], eh[i])
     }
+    sort_diags(c)
     (c, t)
+}
+
+/// Source order, as `diagnostics.sort_by_key(|d| d.span.start)` gives it:
+/// stable, so two at one start keep the order they were reported in.
+fn sort_diags(inout c: Ck) {
+    let n = c.d_s.len()
+    var order: [i64] = []
+    for i in 0..n {
+        order.push(i)
+    }
+    // A merge sort by start, ties by the original position.
+    var buf = order
+    var width = 1
+    while width < n {
+        var lo = 0
+        while lo < n {
+            let mid = if lo + width < n { lo + width } else { n }
+            let hi = if lo + 2 * width < n { lo + 2 * width } else { n }
+            var i = lo
+            var j = mid
+            var k = lo
+            while k < hi {
+                if i < mid and (j >= hi or c.d_s[order[i]] <= c.d_s[order[j]]) {
+                    buf[k] = order[i]
+                    i += 1
+                } else {
+                    buf[k] = order[j]
+                    j += 1
+                }
+                k += 1
+            }
+            lo = hi
+        }
+        let tmp = order
+        order = buf
+        buf = tmp
+        width = width * 2
+    }
+    var ds: [i64] = []
+    var de: [i64] = []
+    var dm: [str] = []
+    var dh: [str] = []
+    for i in order {
+        ds.push(c.d_s[i])
+        de.push(c.d_e[i])
+        dm.push(c.d_msg[i])
+        dh.push(c.d_help[i])
+    }
+    c.d_s = ds
+    c.d_e = de
+    c.d_msg = dm
+    c.d_help = dh
 }
 
 fn set_module(inout c: Ck, p: Prog, mi: i64) {
@@ -560,7 +642,7 @@ fn finish(inout c: Ck, inout t: Tys, p: Prog) {
     flush_generic_checks(c, t, false)
     for i in 0..c.pn_at.len() {
         if c.ref_touching.has(c.pn_at[i]) {
-            err(c, c.pn_s[i], c.pn_e[i], "`{c.pn_name[i]}` reaches a `ref` from outside itself, so it cannot run in parallel")
+            err_help(c, c.pn_s[i], c.pn_e[i], "`{c.pn_name[i]}` reaches a `ref` from outside itself, so it cannot run in parallel", "elements are processed on several cores, so two of them reaching the same slot would race — use `map` or `filter`, or build the reference inside the function, one per element")
         }
     }
     flush_discards(c, t, p)
@@ -573,13 +655,13 @@ fn finish(inout c: Ck, inout t: Tys, p: Prog) {
     for i in 0..c.gc_s.len() {
         let shown = tys.show(t, c.gc_t[i])
         if shown.contains("_") {
-            err(c, c.gc_s[i], c.gc_e[i], "`{shown}` leaves a type parameter undetermined")
+            push_diag(c, c.gc_s[i], c.gc_e[i], "`{shown}` leaves a type parameter undetermined", "a constructor fixes only the parameters its arguments mention; annotate the binding, as in `let r: Res[i64, str] = Good(1)`")
         }
     }
     for i in 0..c.el_s.len() {
         let shown = tys.show(t, c.el_t[i])
         if shown.contains("_") and not resolved_once.has(c.el_s[i]) {
-            err(c, c.el_s[i], c.el_s[i] + c.el_len[i], "this empty literal's element type is not determined by anything")
+            push_diag(c, c.el_s[i], c.el_s[i] + c.el_len[i], "this empty literal's element type is not determined by anything", "annotate it, as in `let xs: [i64] = []` or `let m: Map[str, i64] = map()`, or use it somewhere that says what it holds")
         }
     }
 }
@@ -647,7 +729,7 @@ fn flush_generic_checks(inout c: Ck, inout t: Tys, keys: bool) {
                     continue
                 }
                 if carries_ref(c, t, ft) {
-                    err(c, c.pk_s[i], c.pk_e[i], "this call reaches a parallel operation with `{tys.show(t, ft)}`, which reaches a `ref` — every element would share it")
+                    err_help(c, c.pk_s[i], c.pk_e[i], "this call reaches a parallel operation with `{tys.show(t, ft)}`, which reaches a `ref` — every element would share it", "elements are processed on several cores, so two of them reaching the same slot would race — pass a type that holds no `ref`, or use `map` inside the callee")
                 }
             }
         }
@@ -660,7 +742,7 @@ fn flush_discards(inout c: Ck, inout t: Tys, p: Prog) {
         let r = tys.shallow(t, c.pending_disc_t[i])
         if t.k[r] == tys.K_FALLIBLE {
             let shown = tys.show(t, r)
-            err(c, c.pending_disc_s[i], c.pending_disc_e[i], "this expression can fail (`{shown}`) and its failure is discarded")
+            err_help(c, c.pending_disc_s[i], c.pending_disc_e[i], "this expression can fail (`{shown}`) and its failure is discarded", "use `try` to propagate it, `match` to handle both cases, or `??` with a fallback to say what should happen instead")
         }
     }
 }
@@ -781,7 +863,7 @@ fn duplicate_type(inout c: Ck, p: Prog, ident: i64) {
     let name = prog.name(p, ident)
     let there = c.type_module.get(name) ?? c.cur
     if there != c.cur {
-        err(c, prog.s(p, ident), prog.e(p, ident), "duplicate type name `{name}` — `{there}` declares one too")
+        err_help(c, prog.s(p, ident), prog.e(p, ident), "duplicate type name `{name}` — `{there}` declares one too", "types share one namespace across the whole program ([T-MODULE-NS]), so two packages cannot each declare a type of the same name — rename one, or, if you own neither, ask whichever is yours to prefix its types")
     } else {
         err(c, prog.s(p, ident), prog.e(p, ident), "duplicate type name `{name}`")
     }
@@ -813,13 +895,13 @@ fn collect_types(inout c: Ck, inout t: Tys, p: Prog) -> ([i64], [i64]) {
         let nm = prog.sl(p, d, 2)
         let name = prog.name(p, nm)
         if is_builtin_type_name(name) {
-            err(c, prog.s(p, nm), prog.e(p, nm), "type name `{name}` is built in")
+            err_help(c, prog.s(p, nm), prog.e(p, nm), "type name `{name}` is built in", "a declaration of it would never be reached — every use of the name resolves to the builtin; pick a different name")
             continue
         }
         let existing = tys.def_of(t, name)
         if existing >= 0 {
             if existing == tys.OPTION or existing == tys.IOERROR {
-                err(c, prog.s(p, nm), prog.e(p, nm), "type name `{name}` is reserved by the prelude")
+                err_help(c, prog.s(p, nm), prog.e(p, nm), "type name `{name}` is reserved by the prelude", "pick a different name (e.g. `AppError`)")
             } else {
                 duplicate_type(c, p, nm)
             }
@@ -835,7 +917,7 @@ fn collect_types(inout c: Ck, inout t: Tys, p: Prog) -> ([i64], [i64]) {
             c.type_module.set(name, c.cur)
             aliases.push(d)
             if prog.sl(p, d, 0) != 0 {
-                err(c, prog.s(p, nm), prog.e(p, nm), "`pub` means nothing on type `{name}`")
+                err_help(c, prog.s(p, nm), prog.e(p, nm), "`pub` means nothing on type `{name}`", "types are one namespace across the program, so every type is already reachable from every module — drop the `pub`")
             }
         } else {
             let id = tys.add_def(t, name, ident_names(p, prog.sl(p, d, 3)))
@@ -921,7 +1003,7 @@ fn resolve_type_aliases(inout c: Ck, inout t: Tys, p: Prog, decls: [i64]) {
         let name = prog.name(p, nm)
         let te = prog.sl(p, prog.sl(p, d, 4), 0)
         if names_itself(p, te, name, stuck) {
-            err(c, prog.s(p, nm), prog.e(p, nm), "type `{name}` is defined in terms of itself")
+            err_help(c, prog.s(p, nm), prog.e(p, nm), "type `{name}` is defined in terms of itself", "a `type` alias is another spelling of the type it names, so it has nowhere to stop — a struct or a sum type may refer to itself ([T-RECURSIVE]), because a value of one holds *other* values")
             c.aliases.set(name, tys.ERROR)
             continue
         }
@@ -939,14 +1021,14 @@ fn resolve_type_bodies(inout c: Ck, inout t: Tys, p: Prog, pairs: [i64]) {
         let nm = prog.sl(p, d, 2)
         let name = prog.name(p, nm)
         if prog.sl(p, d, 0) != 0 {
-            err(c, prog.s(p, nm), prog.e(p, nm), "`pub` means nothing on type `{name}`")
+            err_help(c, prog.s(p, nm), prog.e(p, nm), "`pub` means nothing on type `{name}`", "types are one namespace across the program, so every type is already reachable from every module — drop the `pub`")
         }
         let gens = ident_names(p, prog.sl(p, d, 3))
         let body = prog.sl(p, d, 4)
         if prog.kind(p, body) == ast.B_STRUCT {
             let fields = prog.items(p, prog.sl(p, body, 0))
             if fields.len() == 0 {
-                err(c, prog.s(p, nm), prog.e(p, nm), "struct `{name}` has no fields")
+                err_help(c, prog.s(p, nm), prog.e(p, nm), "struct `{name}` has no fields", "a struct needs at least one field, because `Name\{}` is a block and there would be no way to write a value; for a value that carries nothing use a sum variant, as in `type Marker = | Done`")
             }
             var fnames: [str] = []
             var ftys: [i64] = []
@@ -997,7 +1079,7 @@ fn collect_effects(inout c: Ck, inout t: Tys, p: Prog) {
         let nm = prog.sl(p, d, 0)
         let name = prog.name(p, nm)
         if builtin_rows.is_capability(name) {
-            err(c, prog.s(p, nm), prog.e(p, nm), "effect name `{name}` is reserved by the language")
+            err_help(c, prog.s(p, nm), prog.e(p, nm), "effect name `{name}` is reserved by the language", "`io`, `async`, `net`, `proc`, `unsafe` and `mem` are capabilities the runtime discharges, not effects a program declares or handles — there is no `with io handled_by` ([T-EFFECT-BUILTIN]); rename this one")
             continue
         }
         if c.eff_index.has(name) {
@@ -1006,7 +1088,11 @@ fn collect_effects(inout c: Ck, inout t: Tys, p: Prog) {
         }
         for clash in [name, name + "Handler"] {
             if tys.def_of(t, clash) >= 0 or c.alias_names.has(clash) {
-                err(c, prog.s(p, nm), prog.e(p, nm), "effect `{name}` collides with a type of that name ({clash})")
+                var what = "effect `{name}` collides with a type of that name"
+                if clash != name {
+                    what = "effect `{name}` declares `{clash}`, which collides with a type of that name"
+                }
+                err_help(c, prog.s(p, nm), prog.e(p, nm), what, "types and effects share one namespace across the program — rename one of them")
             }
         }
         let op0 = c.op_name.len()
@@ -1018,7 +1104,7 @@ fn collect_effects(inout c: Ck, inout t: Tys, p: Prog) {
             for prm in prog.items(p, prog.sl(p, op, 1)) {
                 if prog.sl(p, prm, 0) == 1 {
                     let pn = prog.sl(p, prm, 1)
-                    err(c, prog.s(p, pn), prog.e(p, pn), "effect operation `{prog.name(p, opn)}` cannot take an `inout` parameter")
+                    err_help(c, prog.s(p, pn), prog.e(p, pn), "effect operation `{prog.name(p, opn)}` cannot take an `inout` parameter", "a handler runs through a function value, so the write would land in a copy the caller never sees — return the new value from the operation instead")
                 }
             }
             for prm in prog.items(p, prog.sl(p, op, 1)) {
@@ -1071,7 +1157,7 @@ fn collect_consts(inout c: Ck, inout t: Tys, p: Prog) {
         }
         let resolved = tys.resolve(t, ty)
         if carries_ref(c, t, resolved) {
-            err(c, prog.s(p, nm), prog.e(p, nm), "constant `{prog.name(p, nm)}` holds a reference")
+            err_help(c, prog.s(p, nm), prog.e(p, nm), "constant `{prog.name(p, nm)}` holds a reference", "a constant is evaluated again at every mention, so each one would be a different slot — bind it with `let` inside a function instead")
         }
         c.consts.set(key, resolved)
         c.const_pub.set(key, prog.sl(p, d, 0) != 0)
@@ -1092,7 +1178,7 @@ fn collect_externs(inout c: Ck, inout t: Tys, p: Prog) {
         }
         let is_pub = prog.sl(p, d, 0) != 0
         if is_pub {
-            err(c, prog.s(p, nm), prog.e(p, nm), "`extern fn {name}` cannot be `pub`")
+            err_help(c, prog.s(p, nm), prog.e(p, nm), "`extern fn {name}` cannot be `pub`", "a C function is resolved by the linker for the package that declares it — wrap it in a `pub fn` whose body is `unsafe`, which is what makes the `unsafe` capability visible to everyone who depends on you")
         }
         c.extern_names.set(key, true)
         var params: [i64] = []
@@ -1109,18 +1195,23 @@ fn collect_externs(inout c: Ck, inout t: Tys, p: Prog) {
         for i in 0..prms.len() {
             if not is_c_param_type(t, params[i]) {
                 let te = prog.sl(p, prms[i], 2)
-                err(c, prog.ty_s(p, te), prog.ty_e(p, te), "`{tys.show(t, params[i])}` has no C representation")
+                err_help(c, prog.ty_s(p, te), prog.ty_e(p, te), "`{tys.show(t, params[i])}` has no C representation", "an `extern fn` parameter is an integer type, `f64`, `addr`, `str` or `bytes`")
             }
         }
         if c.export_names.has(name) {
-            err(c, prog.s(p, nm), prog.e(p, nm), "`{name}` is both an `extern fn` and an `export fn`")
+            err_help(c, prog.s(p, nm), prog.e(p, nm), "`{name}` is both an `extern fn` and an `export fn`", "they would be one symbol; call the exported function by its Grasm name")
         }
         let sig = c_sig_of(t, params, ret)
         if sig != "\0" {
             c.c_sigs.set(key, sig)
         }
         if t.k[ret] != tys.K_UNIT and not is_c_abi_type(t, ret) {
-            err(c, prog.s(p, d), prog.e(p, d), "`{tys.show(t, ret)}` has no C representation")
+            // A returned pointer is refused ([T-EXTERN-POINTER]).
+            var help = "an `extern fn` returns an integer type, `f64`, `addr` or nothing"
+            if t.k[ret] == tys.K_STR or t.k[ret] == tys.K_BYTES {
+                help = "an `extern fn` may *take* `str` and `bytes` — the pointer is valid for the call and the buffer belongs to Grasm. It may not *return* one: nothing says who owns it, how long it lives, or how long it is"
+            }
+            err_help(c, prog.s(p, d), prog.e(p, d), "`{tys.show(t, ret)}` has no C representation", help)
         }
         add_fn(c, key, is_pub, 0, [], params, modes, ret, -1)
     }
@@ -1164,7 +1255,7 @@ fn collect_fns(inout c: Ck, inout t: Tys, p: Prog) {
         let nm = prog.sl(p, d, 2)
         let name = prog.name(p, nm)
         if is_builtin_fn_name(name) {
-            err(c, prog.s(p, nm), prog.e(p, nm), "function name `{name}` is built in")
+            err_help(c, prog.s(p, nm), prog.e(p, nm), "function name `{name}` is built in", "a call would reach the builtin, never this declaration — pick a different name, or call it as a method if you meant to extend a type (UFCS)")
             continue
         }
         let key = c.cur + "::" + name
@@ -1224,11 +1315,11 @@ fn check_export(inout c: Ck, inout t: Tys, p: Prog, d: i64, key: str, fid: i64) 
     let nm = prog.sl(p, d, 2)
     let name = prog.name(p, nm)
     if reserved_symbol(name) {
-        err(c, prog.s(p, nm), prog.e(p, nm), "`{name}` cannot be exported: the toolchain gives that name to its own code")
+        err_help(c, prog.s(p, nm), prog.e(p, nm), "`{name}` cannot be exported: the toolchain gives that name to its own code", "`main` is the program's C entry, and names beginning `grasm_`, `g_`, `gc_`, `gp_`, `gpf_`, `gv_` or `gx_` are the runtime's and the compiler's")
         return
     }
     if c.export_names.has(name) {
-        err(c, prog.s(p, nm), prog.e(p, nm), "`{name}` is exported twice")
+        err_help(c, prog.s(p, nm), prog.e(p, nm), "`{name}` is exported twice", "an export's name is its C symbol, and a program can define a symbol once")
         return
     }
     c.export_names.set(name, true)
@@ -1246,16 +1337,16 @@ pub fn c_entry_sig(inout c: Ck, inout t: Tys, key: str, fid: i64, s: i64, e: i64
     let name = parts[parts.len() - 1]
     var ok = true
     if c.fn_ngen[fid] > 0 {
-        err(c, s, e, "generic function `{name}` cannot {what}")
+        err_help(c, s, e, "generic function `{name}` cannot {what}", "C calls one machine function, and a generic has one per instantiation")
         return "\0"
     }
     if c.fn_err[fid] >= 0 {
-        err(c, s, e, "fallible function `{name}` cannot {what}")
+        err_help(c, s, e, "fallible function `{name}` cannot {what}", "C has no way to receive a Grasm error; return a status code instead")
         ok = false
     }
     for m in c.fn_modes[fid] {
         if m != 0 {
-            err(c, s, e, "`{name}` cannot {what}: it has an `inout` or `own` parameter")
+            err_help(c, s, e, "`{name}` cannot {what}: it has an `inout` or `own` parameter", "C passes values, not Grasm places")
             ok = false
             break
         }
@@ -1266,7 +1357,7 @@ pub fn c_entry_sig(inout c: Ck, inout t: Tys, key: str, fid: i64, s: i64, e: i64
     }
     for x in all {
         if memty_of(t, x) == "" {
-            err(c, s, e, "`{name}` cannot {what}: `{tys.show(t, x)}` does not cross to C")
+            err_help(c, s, e, "`{name}` cannot {what}: `{tys.show(t, x)}` does not cross to C", "its parameters and result must be layout types: the integer types, `f64` and `addr` ([T-FN-ADDR])")
             ok = false
         }
     }
@@ -1278,7 +1369,7 @@ pub fn c_entry_sig(inout c: Ck, inout t: Tys, key: str, fid: i64, s: i64, e: i64
         }
     }
     if held.len() > 0 {
-        err(c, s, e, "`{name}` cannot {what}: it performs `{held.join("`, `")}`")
+        err_help(c, s, e, "`{name}` cannot {what}: it performs `{held.join("`, `")}`", "C calls it outside every `with` and outside the task scheduler, so it may perform only `io`, `net`, `proc`, `unsafe` and `mem` ([T-FN-ADDR])")
         ok = false
     }
     if not ok {
@@ -1469,7 +1560,13 @@ fn collect_impls(inout c: Ck, inout t: Tys, p: Prog) {
                 }
             }
             if extra.len() > 0 {
-                err(c, at_s, at_e, "`{mname}` for `{tname}` declares an effect `{iname}` does not")
+                var shown = "performs nothing"
+                if allowed.len() > 0 {
+                    var al = allowed
+                    al.sort()
+                    shown = "performs `" + al.join("`, `") + "`"
+                }
+                err_help(c, at_s, at_e, "`{mname}` for `{tname}` declares `{extra.join("`, `")}`, which `{iname}` does not", "`{iname}` says `{mname}` {shown}, and a caller is charged that row ([T-INTERFACE-EFFECTS])")
                 continue
             }
             let slot = tname + "\t" + mname
@@ -1504,7 +1601,7 @@ fn collect_thread_locals(inout c: Ck, inout t: Tys, p: Prog) {
             continue
         }
         if prog.sl(p, d, 0) != 0 {
-            err(c, prog.s(p, nm), prog.e(p, nm), "thread-local cell `{name}` cannot be `pub`")
+            err_help(c, prog.s(p, nm), prog.e(p, nm), "thread-local cell `{name}` cannot be `pub`", "a cell is private to its module; hand out its address from a `pub fn` whose body is `unsafe`")
         }
         let te = prog.sl(p, d, 2)
         let ty = resolve_type(c, t, p, te, [])
@@ -1515,7 +1612,7 @@ fn collect_thread_locals(inout c: Ck, inout t: Tys, p: Prog) {
         if m != "" {
             c.cells.set(key, m)
         } else {
-            err(c, prog.ty_s(p, te), prog.ty_e(p, te), "a thread-local cell cannot hold `{tys.show(t, ty)}`")
+            err_help(c, prog.ty_s(p, te), prog.ty_e(p, te), "a thread-local cell cannot hold `{tys.show(t, ty)}`", "a cell holds a layout type -- i8, i16, i32, i64, u8, u16, u32, u64, f64 or addr -- and never a value the runtime counts ([T-TLS])")
         }
     }
 }
@@ -1526,7 +1623,7 @@ pub fn runtime_only(inout c: Ck, s: i64, e: i64, what: str) -> bool {
     if c.runtime_mods.has(c.cur) {
         return true
     }
-    err(c, s, e, "{what} is the runtime's; this package is not one")
+    err_help(c, s, e, "{what} is the runtime's; this package is not one", "the runtime dialect -- process cells, static bytes and the context switch -- belongs to the runtime written in Grasm alone, a package whose grasm.toml says `runtime = true`; every other package keeps the language as it is ([T-RUNTIME])")
     false
 }
 
@@ -1546,7 +1643,7 @@ fn collect_process_locals(inout c: Ck, inout t: Tys, p: Prog) {
             continue
         }
         if prog.sl(p, d, 0) != 0 {
-            err(c, prog.s(p, nm), prog.e(p, nm), "process cell `{name}` cannot be `pub`")
+            err_help(c, prog.s(p, nm), prog.e(p, nm), "process cell `{name}` cannot be `pub`", "a cell is private to its module; hand out its address from a `pub fn` whose body is `unsafe`")
         }
         let te = prog.sl(p, d, 2)
         let ty = resolve_type(c, t, p, te, [])
@@ -1557,7 +1654,7 @@ fn collect_process_locals(inout c: Ck, inout t: Tys, p: Prog) {
         if m != "" {
             c.pcells.set(key, m)
         } else {
-            err(c, prog.ty_s(p, te), prog.ty_e(p, te), "a process cell cannot hold `{tys.show(t, ty)}`")
+            err_help(c, prog.ty_s(p, te), prog.ty_e(p, te), "a process cell cannot hold `{tys.show(t, ty)}`", "a cell holds a layout type -- i8, i16, i32, i64, u8, u16, u32, u64, f64 or addr -- and never a value the runtime counts ([T-RUNTIME])")
         }
     }
 }
@@ -1575,7 +1672,7 @@ fn check_linear_fields(inout c: Ck, inout t: Tys, p: Prog) {
         for f in prog.items(p, prog.sl(p, body, 0)) {
             let ty = resolve_type(c, t, p, prog.sl(p, f, 1), gens)
             if is_linear(c, t, ty) or holds_linear(c, t, ty) {
-                err(c, prog.s(p, f), prog.e(p, f), "field `{prog.name(p, prog.sl(p, f, 0))}` of `{prog.name(p, prog.sl(p, d, 2))}` would hold a linear value")
+                err_help(c, prog.s(p, f), prog.e(p, f), "field `{prog.name(p, prog.sl(p, f, 0))}` of `{prog.name(p, prog.sl(p, d, 2))}` would hold a linear value", "only a `linear type` may hold one, so the whole is consumed once too ([T-LINEAR-CONTAIN])")
             }
         }
     }
@@ -1629,7 +1726,7 @@ fn resolve_type_in(inout c: Ck, inout t: Tys, p: Prog, te: i64, gens: [str], sel
         let path = prog.sl(p, te, 0)
         let argn = prog.items(p, prog.sl(p, te, 1))
         if prog.path_len(p, path) > 1 {
-            return err(c, s, e, "a type is named without a module qualifier")
+            return err_help(c, s, e, "a type is named without a module qualifier", "types share one namespace across the program — write `{prog.path_last(p, path)}`")
         }
         let name = prog.path_last(p, path)
         for i in 0..gens.len() {
@@ -1647,7 +1744,7 @@ fn resolve_type_in(inout c: Ck, inout t: Tys, p: Prog, te: i64, gens: [str], sel
         } else if name == "i64" or name == "int" {
             prim = tys.I64
         } else if name == "usize" or name == "f32" {
-            return err(c, s, e, "`{name}` is not implemented yet")
+            return not_yet(c, s, e, name)
         } else if name == "f64" or name == "float" {
             prim = tys.F64
         } else if name == "bool" {
@@ -1698,7 +1795,7 @@ fn resolve_type_in(inout c: Ck, inout t: Tys, p: Prog, te: i64, gens: [str], sel
             }
             return tys.named(t, id, ra)
         }
-        return err(c, s, e, "unknown type `{name}`")
+        return err_help(c, s, e, "unknown type `{name}`", "declare it with `type` or check the spelling")
     }
     if k == ast.Y_LIST {
         let inner = sub_type(c, t, p, prog.sl(p, te, 0), gens, self_with)
@@ -1751,36 +1848,44 @@ pub fn call_name(p: Prog, e: i64) -> str {
     prog.name(p, prog.sl(p, callee, 0))
 }
 
-fn ok_half(p: Prog, e: i64) -> bool {
-    let k = prog.kind(p, e)
-    if k == ast.E_CALL {
-        let n = call_name(p, e)
-        return not (n == "Ok" or n == "Err")
-    }
-    if k == ast.E_IF {
-        let tt = prog.tail_expr(p, prog.sl(p, e, 1))
-        let t1 = if tt >= 0 { ok_half(p, tt) } else { true }
-        let eb = prog.sl(p, e, 2)
-        var f = true
-        if eb >= 0 {
+fn ok_half(p: Prog, e0: i64) -> bool {
+    // An `else if` in this loop, not by recursion: the chain is as long as
+    // it is written. Each branch's answer is ANDed in.
+    var e = e0
+    var acc = true
+    while true {
+        let k = prog.kind(p, e)
+        if k == ast.E_CALL {
+            let n = call_name(p, e)
+            return acc and not (n == "Ok" or n == "Err")
+        }
+        if k == ast.E_IF {
+            let tt = prog.tail_expr(p, prog.sl(p, e, 1))
+            let t1 = if tt >= 0 { ok_half(p, tt) } else { true }
+            acc = acc and t1
+            let eb = prog.sl(p, e, 2)
+            if eb < 0 {
+                return acc
+            }
             if prog.kind(p, eb) == ast.EB_ELSE {
                 let et = prog.tail_expr(p, prog.sl(p, eb, 0))
-                f = if et >= 0 { ok_half(p, et) } else { true }
-            } else {
-                f = ok_half(p, prog.sl(p, eb, 0))
+                let f = if et >= 0 { ok_half(p, et) } else { true }
+                return acc and f
             }
+            e = prog.sl(p, eb, 0)
+            continue
         }
-        return t1 and f
-    }
-    if k == ast.E_MATCH {
-        for arm in prog.items(p, prog.sl(p, e, 1)) {
-            if not ok_half(p, prog.sl(p, arm, 2)) {
-                return false
+        if k == ast.E_MATCH {
+            for arm in prog.items(p, prog.sl(p, e, 1)) {
+                if not ok_half(p, prog.sl(p, arm, 2)) {
+                    return false
+                }
             }
+            return acc
         }
-        return true
+        return acc
     }
-    true
+    acc
 }
 
 pub fn yields_ok_half(p: Prog, e: i64) -> bool {
@@ -1824,7 +1929,24 @@ pub fn yields_some_whole(p: Prog, e: i64) -> bool {
                 let et = prog.tail_expr(p, prog.sl(p, eb, 0))
                 return et >= 0 and yields_some_whole(p, et)
             }
-            return yields_some_whole(p, prog.sl(p, eb, 0))
+            // An `else if` chain is as long as it is written: walked here.
+            var inner = prog.sl(p, eb, 0)
+            while prog.kind(p, inner) == ast.E_IF {
+                let it = prog.tail_expr(p, prog.sl(p, inner, 1))
+                if it >= 0 and yields_some_whole(p, it) {
+                    return true
+                }
+                let ib = prog.sl(p, inner, 2)
+                if ib < 0 {
+                    return false
+                }
+                if prog.kind(p, ib) == ast.EB_ELSE {
+                    let et = prog.tail_expr(p, prog.sl(p, ib, 0))
+                    return et >= 0 and yields_some_whole(p, et)
+                }
+                inner = prog.sl(p, ib, 0)
+            }
+            return yields_some_whole(p, inner)
         }
         return false
     }
@@ -1843,33 +1965,40 @@ pub fn yields_some_whole(p: Prog, e: i64) -> bool {
     false
 }
 
-fn whole(p: Prog, e: i64) -> bool {
-    let k = prog.kind(p, e)
-    if k == ast.E_CALL {
-        return is_whole_ctor(p, e)
-    }
-    if k == ast.E_IF {
-        let tt = prog.tail_expr(p, prog.sl(p, e, 1))
-        let t1 = tt >= 0 and whole(p, tt)
-        let eb = prog.sl(p, e, 2)
-        var f = false
-        if eb >= 0 {
-            if prog.kind(p, eb) == ast.EB_ELSE {
-                let et = prog.tail_expr(p, prog.sl(p, eb, 0))
-                f = et >= 0 and whole(p, et)
-            } else {
-                f = whole(p, prog.sl(p, eb, 0))
-            }
+fn whole(p: Prog, e0: i64) -> bool {
+    // An `else if` in this loop, not by recursion; each branch ANDed in.
+    var e = e0
+    var acc = true
+    while true {
+        let k = prog.kind(p, e)
+        if k == ast.E_CALL {
+            return acc and is_whole_ctor(p, e)
         }
-        return t1 and f
-    }
-    if k == ast.E_MATCH {
-        for arm in prog.items(p, prog.sl(p, e, 1)) {
-            if not whole(p, prog.sl(p, arm, 2)) {
+        if k == ast.E_IF {
+            let tt = prog.tail_expr(p, prog.sl(p, e, 1))
+            let t1 = tt >= 0 and whole(p, tt)
+            acc = acc and t1
+            let eb = prog.sl(p, e, 2)
+            if eb < 0 {
                 return false
             }
+            if prog.kind(p, eb) == ast.EB_ELSE {
+                let et = prog.tail_expr(p, prog.sl(p, eb, 0))
+                let f = et >= 0 and whole(p, et)
+                return acc and f
+            }
+            e = prog.sl(p, eb, 0)
+            continue
         }
-        return true
+        if k == ast.E_MATCH {
+            for arm in prog.items(p, prog.sl(p, e, 1)) {
+                if not whole(p, prog.sl(p, arm, 2)) {
+                    return false
+                }
+            }
+            return acc
+        }
+        return false
     }
     false
 }
@@ -2015,23 +2144,35 @@ fn hof_stmt(p: Prog, st: i64, inout out: Map[i64, bool]) {
 }
 
 /// `walk_exprs` with `collect_hof_closures` applied to each expression.
-fn hof_expr(p: Prog, e: i64, inout out: Map[i64, bool]) {
-    let k = prog.kind(p, e)
-    if k == ast.E_METHOD {
-        let n = prog.name(p, prog.sl(p, e, 1))
-        if n == "map" or n == "par_map" or n == "filter" or n == "par_filter" or n == "fold" or n == "any" or n == "all" or n == "find" or n == "sort_by" or n == "each" {
-            for a in prog.items(p, prog.sl(p, e, 2)) {
-                if prog.kind(p, a) == ast.E_CLOSURE {
-                    out.set(prog.es(p, a), true)
+fn hof_expr(p: Prog, e0: i64, inout out: Map[i64, bool]) {
+    // The last subexpression in this loop, not by recursion: a `^` chain's
+    // right operand and an `else if` come last, and their chains are as long
+    // as they are written. What is collected is a set, so the statements are
+    // walked before it.
+    var e = e0
+    while true {
+        let k = prog.kind(p, e)
+        if k == ast.E_METHOD {
+            let n = prog.name(p, prog.sl(p, e, 1))
+            if n == "map" or n == "par_map" or n == "filter" or n == "par_filter" or n == "fold" or n == "any" or n == "all" or n == "find" or n == "sort_by" or n == "each" {
+                for a in prog.items(p, prog.sl(p, e, 2)) {
+                    if prog.kind(p, a) == ast.E_CLOSURE {
+                        out.set(prog.es(p, a), true)
+                    }
                 }
             }
         }
-    }
-    for sub in walk_kids(p, e) {
-        hof_expr(p, sub, out)
-    }
-    for st in walk_stmts_of(p, e) {
-        hof_stmt(p, st, out)
+        for st in walk_stmts_of(p, e) {
+            hof_stmt(p, st, out)
+        }
+        let kids = walk_kids(p, e)
+        if kids.len() == 0 {
+            return
+        }
+        for i in 0..kids.len() - 1 {
+            hof_expr(p, kids[i], out)
+        }
+        e = kids[kids.len() - 1]
     }
 }
 
@@ -2149,8 +2290,13 @@ pub fn idents_in(p: Prog, e: i64, inout out: [str]) {
     } else if k == ast.E_UNARY {
         idents_in(p, prog.sl(p, e, 1), out)
     } else if k == ast.E_BINARY {
-        idents_in(p, prog.sl(p, e, 1), out)
-        idents_in(p, prog.sl(p, e, 2), out)
+        // A `^` chain is as long as it is written: its right operands here.
+        var cur = e
+        while prog.kind(p, cur) == ast.E_BINARY {
+            idents_in(p, prog.sl(p, cur, 1), out)
+            cur = prog.sl(p, cur, 2)
+        }
+        idents_in(p, cur, out)
     } else if k == ast.E_CALL {
         idents_in(p, prog.sl(p, e, 0), out)
         for a in prog.items(p, prog.sl(p, e, 1)) {
@@ -2453,19 +2599,27 @@ pub fn branch_calls_fallible(c: Ck, p: Prog, e: i64) -> bool {
         return f >= 0 and c.fn_err[f] >= 0
     }
     if k == ast.E_IF {
-        let tt = prog.tail_expr(p, prog.sl(p, e, 1))
-        let t1 = tt >= 0 and branch_calls_fallible(c, p, tt)
-        let eb = prog.sl(p, e, 2)
-        var f = false
-        if eb >= 0 {
+        // An `else if` chain walked in this loop, each branch ORed in.
+        var cur = e
+        while true {
+            let tt = prog.tail_expr(p, prog.sl(p, cur, 1))
+            if tt >= 0 and branch_calls_fallible(c, p, tt) {
+                return true
+            }
+            let eb = prog.sl(p, cur, 2)
+            if eb < 0 {
+                return false
+            }
             if prog.kind(p, eb) == ast.EB_ELSE {
                 let et = prog.tail_expr(p, prog.sl(p, eb, 0))
-                f = et >= 0 and branch_calls_fallible(c, p, et)
-            } else {
-                f = branch_calls_fallible(c, p, prog.sl(p, eb, 0))
+                return et >= 0 and branch_calls_fallible(c, p, et)
+            }
+            cur = prog.sl(p, eb, 0)
+            if prog.kind(p, cur) != ast.E_IF {
+                return branch_calls_fallible(c, p, cur)
             }
         }
-        return t1 or f
+        return false
     }
     if k == ast.E_MATCH {
         for arm in prog.items(p, prog.sl(p, e, 1)) {
@@ -2528,7 +2682,11 @@ pub fn check_row_fits(inout c: Ck, inout t: Tys, got: i64, want: i64, s: i64, e:
             }
         }
         if over.len() > 0 {
-            err(c, s, e, "this expects a function that performs only what its row allows, but this one performs `{over.join("`, `")}`")
+            var shown = "performs nothing"
+            if allowed.len() > 0 {
+                shown = "performs only `" + allowed.join("`, `") + "`"
+            }
+            err_help(c, s, e, "this expects a function that {shown}, but this one performs `{over.join("`, `")}`", "widen the written row — `fn(..) -> .. / \{io}` — or use a function that does not perform it")
         }
     }
 }
@@ -2552,7 +2710,7 @@ pub fn consume(inout c: Ck, inout t: Tys, p: Prog, e: i64) {
         return
     }
     if not c.b_owned[b] and c.b_kind[b] == BK_PARAM {
-        err(c, prog.s(p, id), prog.e(p, id), "cannot give away `{name}`: it is lent to this function, not owned by it")
+        err_help(c, prog.s(p, id), prog.e(p, id), "cannot give away `{name}`: it is lent to this function, not owned by it", "take the parameter as `own` to be able to consume it ([T-LINEAR])")
         return
     }
     mark_moved(c, p, id)
@@ -2564,7 +2722,7 @@ pub fn mark_moved(inout c: Ck, p: Prog, id: i64) {
         let floor = c.closure_floors[c.closure_floors.len() - 1]
         let at = scope_of(c, name)
         if at >= 0 and at < floor {
-            err(c, prog.s(p, id), prog.e(p, id), "cannot move `{name}` here — it was captured, and would be gone the next time the closure is called")
+            err_help(c, prog.s(p, id), prog.e(p, id), "cannot move `{name}` here — it was captured, and would be gone the next time the closure is called", "move a copy instead, or take the value as a parameter of the closure")
             return
         }
     }
@@ -2572,9 +2730,7 @@ pub fn mark_moved(inout c: Ck, p: Prog, id: i64) {
     if b >= 0 {
         if c.b_loop[b] < c.loop_depth {
             // Pushed without the dedup `error` does, as the Rust checker does.
-            c.d_s.push(prog.s(p, id))
-            c.d_e.push(prog.e(p, id))
-            c.d_msg.push("cannot move `{name}` here — it would be gone in the next loop iteration")
+            push_diag(c, prog.s(p, id), prog.e(p, id), "cannot move `{name}` here — it would be gone in the next loop iteration", "move a copy instead, or restructure so the move happens outside the loop")
         } else {
             c.b_moved[b] = true
         }
@@ -2608,7 +2764,7 @@ pub fn report_unconsumed(inout c: Ck, inout t: Tys, from: i64, when: str) {
         }
     }
     for b in owed {
-        err(c, c.b_at_s[b], c.b_at_e[b], "linear value `{c.b_name[b]}` is never consumed{when}")
+        err_help(c, c.b_at_s[b], c.b_at_e[b], "linear value `{c.b_name[b]}` is never consumed{when}", "a `{tys.show(t, c.b_ty[b])}` must be handed on exactly once -- pass it to the function that finishes it, return it, or move it into another binding ([T-LINEAR])")
         let l = lookup(c, c.b_name[b])
         if l >= 0 {
             c.b_moved[l] = true
@@ -2658,7 +2814,7 @@ fn merge_linear(inout c: Ck, inout t: Tys, snaps: [[bool]], leaves: [bool], s: i
         let first = votes[0]
         for v in votes {
             if v != first {
-                err(c, s, e, "linear value `{c.b_name[i]}` is consumed on one path here and not on another")
+                err_help(c, s, e, "linear value `{c.b_name[i]}` is consumed on one path here and not on another", "every way through must consume it, or none may ([T-LINEAR])")
                 break
             }
         }
@@ -2686,7 +2842,7 @@ fn check_module(inout c: Ck, inout t: Tys, p: Prog) {
                     err(c, prog.s(p, prm), prog.e(p, prm), "a property test parameter is supplied by the runner, so it cannot be `inout` or `own`")
                 }
                 if not generatable(t, ty) {
-                    err(c, prog.s(p, prm), prog.e(p, prm), "cannot generate values of type `{tys.show(t, ty)}`")
+                    err_help(c, prog.s(p, prm), prog.e(p, prm), "cannot generate values of type `{tys.show(t, ty)}`", "property tests generate `i64`, `f64`, `bool`, `str`, lists of those, and `Option` of those")
                 }
                 let pn = prog.sl(p, prm, 1)
                 tir_bind(c, p, pn, ty)
@@ -2716,11 +2872,11 @@ fn check_fn(inout c: Ck, inout t: Tys, p: Prog, d: i64) {
     let params = prog.items(p, prog.sl(p, d, 5))
     if fname == "main" and c.cur == "main" {
         if t.k[c.fn_ret[fid]] != tys.K_UNIT {
-            err(c, prog.s(p, nm), prog.e(p, nm), "`main` produces no value")
+            err_help(c, prog.s(p, nm), prog.e(p, nm), "`main` produces no value", "drop the return type — a program's status comes from `exit(n)`, and an error reaching `main` is reported and exits 1")
         }
         if params.len() > 0 {
             let pn = prog.sl(p, params[0], 1)
-            err(c, prog.s(p, pn), prog.e(p, pn), "`main` takes no parameters")
+            err_help(c, prog.s(p, pn), prog.e(p, pn), "`main` takes no parameters", "nothing calls `main`, so there is nothing to pass it — read the command line with `args()`")
         }
     }
     c.hof_closures = map()
@@ -2791,9 +2947,9 @@ fn check_fn(inout c: Ck, inout t: Tys, p: Prog, d: i64) {
         let resolved = tys.shallow(t, body_ty)
         let may_propagate = c.fn_err_ty >= 0
         if not leaves and not may_propagate and t.k[resolved] == tys.K_FALLIBLE {
-            err(c, prog.es(p, tail), prog.ee(p, tail), "this expression can fail (`{tys.show(t, body_ty)}`) and its failure is discarded")
+            err_help(c, prog.es(p, tail), prog.ee(p, tail), "this expression can fail (`{tys.show(t, body_ty)}`) and its failure is discarded", "use `try` to propagate it, `match` to handle both cases, or `??` with a fallback to say what should happen instead")
         } else if not leaves and t.k[resolved] != tys.K_FALLIBLE and holds_fallible(c, t, resolved, 0) {
-            err(c, prog.es(p, tail), prog.ee(p, tail), "this expression holds failures (`{tys.show(t, body_ty)}`) and they are discarded")
+            err_help(c, prog.es(p, tail), prog.ee(p, tail), "this expression holds failures (`{tys.show(t, body_ty)}`) and they are discarded", "bind it and handle the failures it holds — a value nothing reads is a failure nothing reports")
         }
     }
     let ends_with_return = last >= 0 and prog.kind(p, last) == ast.S_RETURN
@@ -2812,7 +2968,7 @@ fn check_fn(inout c: Ck, inout t: Tys, p: Prog, d: i64) {
             ss = prog.stmt_s(p, last)
             se = prog.stmt_e(p, last)
         }
-        err(c, ss, se, "function `{fname}` must return `{tys.show(t, ret)}` but its body produces `{tys.show(t, body_ty)}`")
+        err_help(c, ss, se, "function `{fname}` must return `{tys.show(t, ret)}` but its body produces `{tys.show(t, body_ty)}`", "the last expression of the body is the return value")
     }
     if not ends_with_return and not block_leaves(p, body) {
         report_unconsumed(c, t, depth(c) - 1, "")
@@ -2845,7 +3001,7 @@ fn flush_bound_obligations(inout c: Ck, inout t: Tys) {
                     if j < c.bo_names[i].len() {
                         shown = c.bo_names[i][j]
                     }
-                    err(c, c.bo_s[i], c.bo_e[i], "`{shown}` is not bounded by `{iface}`")
+                    err_help(c, c.bo_s[i], c.bo_e[i], "`{shown}` is not bounded by `{iface}`", "add the bound where it is declared: `[{shown}: {iface}]`")
                 }
             }
         } else {
@@ -2853,7 +3009,7 @@ fn flush_bound_obligations(inout c: Ck, inout t: Tys) {
             for iface in c.bo_ifaces[i] {
                 let ok = key != "\0" and c.impl_of.has(iface + "\t" + key)
                 if not ok {
-                    err(c, c.bo_s[i], c.bo_e[i], "`{tys.show(t, r)}` does not implement `{iface}`")
+                    err_help(c, c.bo_s[i], c.bo_e[i], "`{tys.show(t, r)}` does not implement `{iface}`", "write `impl {iface} for {tys.show(t, r)} \{ ... }`")
                 }
             }
         }
@@ -2914,9 +3070,9 @@ pub fn check_block_with(inout c: Ck, inout t: Tys, p: Prog, b: i64, want: i64) -
                 }
                 let resolved = tys.shallow(t, ty)
                 if t.k[resolved] == tys.K_FALLIBLE {
-                    err(c, prog.stmt_s(p, st), prog.stmt_e(p, st), "this expression can fail (`{tys.show(t, ty)}`) and its failure is discarded")
+                    err_help(c, prog.stmt_s(p, st), prog.stmt_e(p, st), "this expression can fail (`{tys.show(t, ty)}`) and its failure is discarded", "use `try` to propagate it, `match` to handle both cases, or `??` with a fallback to say what should happen instead")
                 } else if holds_fallible(c, t, resolved, 0) {
-                    err(c, prog.stmt_s(p, st), prog.stmt_e(p, st), "this expression holds failures (`{tys.show(t, ty)}`) and they are discarded")
+                    err_help(c, prog.stmt_s(p, st), prog.stmt_e(p, st), "this expression holds failures (`{tys.show(t, ty)}`) and they are discarded", "bind it and handle the failures it holds — a value nothing reads is a failure nothing reports")
                 }
             }
         }
@@ -3043,7 +3199,7 @@ pub fn check_deferred_closure(inout c: Ck, inout t: Tys, p: Prog, params: [i64],
         let sh = tys.shallow(t, ptys[j])
         if t.k[sh] == tys.K_VAR {
             let pn = params[j]
-            err(c, prog.s(p, pn), prog.e(p, pn), "nothing says what `{prog.name(p, pn)}` is")
+            err_help(c, prog.s(p, pn), prog.e(p, pn), "nothing says what `{prog.name(p, pn)}` is", "a closure's parameter types come from where it is used — call it, pass it somewhere with a function type, or annotate the binding as in `let f: fn(i64) -> i64 = |x| x + 1`")
             break
         }
         j += 1
@@ -3129,7 +3285,7 @@ pub fn check_stmt(inout c: Ck, inout t: Tys, p: Prog, st: i64) -> i64 {
             let ty = infer_expr(c, t, p, init)
             let resolved = tys.shallow(t, ty)
             if t.k[resolved] == tys.K_FALLIBLE {
-                err(c, prog.es(p, init), prog.ee(p, init), "this expression can fail — its error must be handled")
+                err_help(c, prog.es(p, init), prog.ee(p, init), "this expression can fail — its error must be handled", "use `try` to propagate it, `match` to handle both cases, or annotate the binding `: {tys.show(t, resolved)}` to hold it as a value")
             }
             bound = ty
         }
@@ -3153,7 +3309,7 @@ pub fn check_stmt(inout c: Ck, inout t: Tys, p: Prog, st: i64) -> i64 {
                 let name = prog.name(p, id)
                 let b = lookup(c, name)
                 if b >= 0 and c.b_owned[b] and not c.b_moved[b] and is_linear(c, t, c.b_ty[b]) {
-                    err(c, prog.s(p, id), prog.e(p, id), "assigning to `{name}` drops a linear value that was never consumed")
+                    err_help(c, prog.s(p, id), prog.e(p, id), "assigning to `{name}` drops a linear value that was never consumed", "consume the value it holds first -- pass it to the function that finishes it")
                 }
                 if b >= 0 {
                     c.b_moved[b] = false
@@ -3185,13 +3341,13 @@ pub fn check_stmt(inout c: Ck, inout t: Tys, p: Prog, st: i64) -> i64 {
     if k == ast.S_RETURN {
         let v = prog.sl(p, st, 0)
         if c.region_depth > 0 {
-            err(c, prog.s(p, st), prog.e(p, st), "cannot `return` from inside a region")
+            err_help(c, prog.s(p, st), prog.e(p, st), "cannot `return` from inside a region", "a region promises that nothing allocated inside outlives the closing brace — yield a number from the region and return that")
         }
         if v >= 0 and c.with_eff.len() > 0 {
             let row = row_carried_by(c, t, c.fn_ret_ty)
             for e in c.with_eff {
                 if row.contains(e) {
-                    err(c, prog.es(p, v), prog.ee(p, v), "cannot return a function that performs `{e}` from inside a `with` block")
+                    err_help(c, prog.es(p, v), prog.ee(p, v), "cannot return a function that performs `{e}` from inside a `with` block", "the handler is installed only for this block, so calling the value afterwards has nowhere to send the effect — call it here, or return what it computed")
                     break
                 }
             }
@@ -3246,7 +3402,7 @@ pub fn check_stmt(inout c: Ck, inout t: Tys, p: Prog, st: i64) -> i64 {
     }
     if k == ast.S_SPAWN and prog.sl(p, st, 1) != 0 {
         if c.concurrent_depth == 0 {
-            err(c, prog.s(p, st), prog.e(p, st), "`go` outside a `concurrent` block")
+            err_help(c, prog.s(p, st), prog.e(p, st), "`go` outside a `concurrent` block", "wrap it in `concurrent \{ ... }`, which does not end until every task it started has")
         }
         let saved_loop = c.loop_depth
         let saved_go = c.go_floor
@@ -3277,7 +3433,7 @@ pub fn check_stmt(inout c: Ck, inout t: Tys, p: Prog, st: i64) -> i64 {
     }
     if k == ast.S_SPAWN {
         if c.parallel_depth == 0 {
-            err(c, prog.s(p, st), prog.e(p, st), "`spawn` outside a `parallel` block")
+            err_help(c, prog.s(p, st), prog.e(p, st), "`spawn` outside a `parallel` block", "wrap it in `parallel \{ ... }` so the task is joined before the scope exits")
         }
         let saved_loop = c.loop_depth
         let saved_f = c.tc_floor
@@ -3301,7 +3457,7 @@ pub fn check_stmt(inout c: Ck, inout t: Tys, p: Prog, st: i64) -> i64 {
             let want = tys.named(t, c.eff_handler[ei], [])
             check_expr(c, t, p, handler, want)
         } else {
-            err(c, prog.s(p, st), prog.e(p, st), "unknown effect `{ename}`")
+            err_help(c, prog.s(p, st), prog.e(p, st), "unknown effect `{ename}`", "declare it with `effect Name \{ fn op(...) -> T }`")
             infer_expr(c, t, p, handler)
         }
         c.with_eff.push(ename)
@@ -3327,7 +3483,7 @@ pub fn check_stmt(inout c: Ck, inout t: Tys, p: Prog, st: i64) -> i64 {
     } else if ik == tys.K_ERROR {
         elem = tys.ERROR
     } else {
-        elem = err(c, prog.es(p, iter), prog.ee(p, iter), "cannot iterate over `{tys.show(t, sh)}`")
+        elem = err_help(c, prog.es(p, iter), prog.ee(p, iter), "cannot iterate over `{tys.show_shallow(t, sh)}`", "iterate over a list (`[T]`), a range (`0..n`), or a string — a map iterates through `keys()`, `values()` or `entries()`")
     }
     push_scope(c)
     bind(c, p, var_id, elem, false)
@@ -3404,7 +3560,15 @@ fn pure_task_expr(c: Ck, t: Tys, p: Prog, e: i64) -> bool {
         return pure_task_expr(c, t, p, prog.sl(p, e, 1))
     }
     if k == ast.E_BINARY {
-        return pure_task_expr(c, t, p, prog.sl(p, e, 1)) and pure_task_expr(c, t, p, prog.sl(p, e, 2))
+        // A `^` chain is as long as it is written: its right operands here.
+        var cur = e
+        while prog.kind(p, cur) == ast.E_BINARY {
+            if not pure_task_expr(c, t, p, prog.sl(p, cur, 1)) {
+                return false
+            }
+            cur = prog.sl(p, cur, 2)
+        }
+        return pure_task_expr(c, t, p, cur)
     }
     if k == ast.E_CALL {
         let n = call_name(p, e)
@@ -3474,7 +3638,7 @@ pub fn require_branch_value(inout c: Ck, inout t: Tys, p: Prog, b: i64, got: i64
             ss = prog.stmt_s(p, last)
             se = prog.stmt_e(p, last)
         }
-        err(c, ss, se, "this branch must produce `{tys.show(t, want)}` but ends in a statement")
+        err_help(c, ss, se, "this branch must produce `{tys.show(t, want)}` but ends in a statement", "the last expression of a branch is its value — a `with`, `for` or `while` produces none; end the branch with the value it computes")
     }
 }
 
@@ -3551,7 +3715,7 @@ fn check_assign_target(inout c: Ck, inout t: Tys, p: Prog, target: i64) {
         if prog.kind(p, root) == ast.E_FIELD {
             let fname = prog.name(p, prog.sl(p, root, 1))
             if all_digits(fname) {
-                err(c, prog.s(p, root), prog.e(p, root), "cannot assign to a tuple component")
+                err_help(c, prog.s(p, root), prog.e(p, root), "cannot assign to a tuple component", "a tuple is a fixed group of values — rebuild it, as in `t = (5, t.1)`, or use a struct when the parts have names worth writing")
                 return
             }
         }
@@ -3567,10 +3731,16 @@ fn check_assign_target(inout c: Ck, inout t: Tys, p: Prog, target: i64) {
         let b = lookup(c, name)
         if b >= 0 {
             if not c.b_mut[b] and not through_ref {
-                err(c, prog.s(p, id), prog.e(p, id), "cannot assign to `{name}` — it is immutable")
+                var help = "declare it with `var {name}` instead of `let`"
+                if c.b_kind[b] == BK_PARAM {
+                    help = "a parameter cannot be `var` — take it as `inout {name}` to write through to the caller's value, or copy it into a local first, as in `var {name} = {name}`"
+                } else if c.b_kind[b] == BK_GEN {
+                    help = "the test runner supplies this value, so there is nothing to write back to — copy it into a local first, as in `var {name} = {name}`"
+                }
+                err_help(c, prog.s(p, id), prog.e(p, id), "cannot assign to `{name}` — it is immutable", help)
             }
         } else if c.consts.has(c.cur + "::" + name) {
-            err(c, prog.s(p, id), prog.e(p, id), "cannot assign to `{name}` — it is a constant")
+            err_help(c, prog.s(p, id), prog.e(p, id), "cannot assign to `{name}` — it is a constant", "constants have one value for the whole program; use a `var` if it needs to change")
         } else {
             err(c, prog.s(p, id), prog.e(p, id), "unknown variable `{name}`")
         }
@@ -3597,7 +3767,7 @@ pub fn reject_region_escape(inout c: Ck, p: Prog, id: i64, verb: str) {
     let floor = c.region_floors[c.region_floors.len() - 1]
     let at = scope_of(c, prog.name(p, id))
     if at >= 0 and at < floor {
-        err(c, prog.s(p, id), prog.e(p, id), "cannot {verb} `{prog.name(p, id)}` from inside a region")
+        err_help(c, prog.s(p, id), prog.e(p, id), "cannot {verb} `{prog.name(p, id)}` from inside a region", "a region promises that nothing allocated inside it outlives the closing brace, and writing to something declared outside is how a value escapes — move the declaration into the region, or compute a number and yield that")
     }
 }
 
@@ -3607,7 +3777,7 @@ pub fn reject_task_write(inout c: Ck, p: Prog, id: i64) {
     }
     let at = scope_of(c, prog.name(p, id))
     if at >= 0 and at < c.go_floor {
-        err(c, prog.s(p, id), prog.e(p, id), "a task cannot write `{prog.name(p, id)}`, which belongs outside it")
+        err_help(c, prog.s(p, id), prog.e(p, id), "a task cannot write `{prog.name(p, id)}`, which belongs outside it", "tasks share nothing mutable -- send the value on a channel and let the owner write it")
     }
 }
 
@@ -3626,7 +3796,7 @@ pub fn reject_capture_write(inout c: Ck, inout t: Tys, p: Prog, id: i64, verb: s
     }
     if bref {
         if c.parallel_fn_floor >= 0 and declared_at >= 0 and declared_at < c.parallel_fn_floor {
-            err(c, prog.s(p, id), prog.e(p, id), "cannot {verb} `{name}`{tail} inside a parallel operation — it is a `ref` from outside, so every element writes the same slot")
+            err_help(c, prog.s(p, id), prog.e(p, id), "cannot {verb} `{name}`{tail} inside a parallel operation — it is a `ref` from outside, so every element writes the same slot", "elements are processed on several cores, so this write would interleave differently between runs — use `map` for work that shares state, or return a value per element and combine the results afterwards")
         }
         return
     }
@@ -3634,7 +3804,7 @@ pub fn reject_capture_write(inout c: Ck, inout t: Tys, p: Prog, id: i64, verb: s
         return
     }
     if declared_at >= 0 and declared_at < floor {
-        err(c, prog.s(p, id), prog.e(p, id), "cannot {verb} `{name}`{tail} inside a closure — it was captured from outside")
+        err_help(c, prog.s(p, id), prog.e(p, id), "cannot {verb} `{name}`{tail} inside a closure — it was captured from outside", "a closure captures values, not bindings, so this write would change a copy nobody can see — hold it behind a `ref`, which copies as a slot rather than as a value and so is shared; or return the new value; or, where the closure is not an effect operation, thread the state through an `inout` parameter")
     }
 }
 
@@ -3653,7 +3823,7 @@ pub fn reject_handler_escape(inout c: Ck, inout t: Tys, p: Prog, target: i64, va
     let row = row_carried_by(c, t, value_ty)
     for i in 0..c.with_eff.len() {
         if declared_at < c.with_floor[i] and row.contains(c.with_eff[i]) {
-            err(c, prog.es(p, target), prog.ee(p, target), "cannot store a function that performs `{c.with_eff[i]}` in `{prog.name(p, root)}` — it was declared outside the `with` block")
+            err_help(c, prog.es(p, target), prog.ee(p, target), "cannot store a function that performs `{c.with_eff[i]}` in `{prog.name(p, root)}` — it was declared outside the `with` block", "the handler is installed only for this block, so calling the value afterwards has nowhere to send the effect — call it here, or return what it computed")
             return
         }
     }
@@ -3691,7 +3861,7 @@ pub fn reject_handler_escape_through_call(inout c: Ck, inout t: Tys, p: Prog, ar
                 if declared_at >= 0 {
                     for w in 0..c.with_eff.len() {
                         if declared_at < c.with_floor[w] and carried.contains(c.with_eff[w]) {
-                            err(c, s, e, "cannot pass a function that performs `{c.with_eff[w]}` to a call that writes to `{prog.name(p, root)}` — it was declared outside the `with` block")
+                            err_help(c, s, e, "cannot pass a function that performs `{c.with_eff[w]}` to a call that writes to `{prog.name(p, root)}` — it was declared outside the `with` block", "the handler is installed only for this block, so the value would be called afterwards with nowhere to send the effect — call it here, or store what it computed")
                             return
                         }
                     }
@@ -3711,7 +3881,7 @@ fn reject_dead_capture(inout c: Ck, p: Prog, id: i64) {
         return
     }
     if at >= c.tc_floor and at < c.tc_base {
-        err(c, prog.s(p, id), prog.e(p, id), "task body uses `{prog.name(p, id)}`, which is declared inside the `parallel` block")
+        err_help(c, prog.s(p, id), prog.e(p, id), "task body uses `{prog.name(p, id)}`, which is declared inside the `parallel` block", "tasks run after the block finishes, so that binding is gone. Declaring it before `parallel` compiles but reads the value it has *then*, which for a loop counter is its final one — give each task the value it needs before the loop advances, or have the task compute it from something that does not change")
     }
 }
 
@@ -3721,7 +3891,7 @@ pub fn require_unsafe(inout c: Ck, name: str, s: i64, e: i64) {
         return
     }
     if c.extern_names.has(c.cur + "::" + name) {
-        err(c, s, e, "`{name}` is a C function, so it can only be used inside `unsafe`")
+        err_help(c, s, e, "`{name}` is a C function, so it can only be used inside `unsafe`", "wrap the use in `unsafe \{ ... }`; the package must then declare the `unsafe` capability, which is what makes it visible to everyone who depends on you")
     }
 }
 
@@ -3729,7 +3899,7 @@ pub fn require_unsafe_mem(inout c: Ck, name: str, s: i64, e: i64) {
     if c.unsafe_depth > 0 {
         return
     }
-    err(c, s, e, "`{name}` reaches raw memory, so it can only be used inside `unsafe`")
+    err_help(c, s, e, "`{name}` reaches raw memory, so it can only be used inside `unsafe`", "wrap the use in `unsafe \{ ... }`; the package must then declare the `unsafe` and `mem` capabilities, which is what makes it visible to everyone who depends on you")
 }
 
 fn arrived_from_outside_region(c: Ck, p: Prog, e: i64) -> bool {
@@ -3806,12 +3976,39 @@ fn pow2i(b: i64) -> i64 {
     r
 }
 
-fn literal_out_of_range(inout c: Ck, s: i64, e: i64, k: i64) {
-    err(c, s, e, "this literal does not fit in `{tys.int_name(k)}`")
+/// The value a literal stands for, as `lit_value` gives it: a literal past
+/// `i64` is its `u64`, and a negation negates.
+fn lit_shown(p: Prog, v: i64, at: i64, negated: bool) -> str {
+    var n = "{v}"
+    if p.wide.has(at) {
+        n = v.as_u64().to_str()
+    }
+    if negated and n != "0" {
+        return "-" + n
+    }
+    n
+}
+
+fn literal_out_of_range(inout c: Ck, p: Prog, s: i64, e: i64, k: i64, v: i64, at: i64, negated: bool) {
+    let name = tys.int_name(k)
+    err_help(c, s, e, "`{lit_shown(p, v, at, negated)}` does not fit in `{name}`", "`{name}` holds {int_range(k)}; a value outside that is not written as a literal of it ([{if k == 6 { "T-U64" } else { "T-INT-FIXED" }}])")
+}
+
+/// `min to max` of a fixed-width integer kind.
+pub fn int_range(k: i64) -> str {
+    match k {
+        0 -> "-128 to 127"
+        1 -> "-32768 to 32767"
+        2 -> "-2147483648 to 2147483647"
+        3 -> "0 to 255"
+        4 -> "0 to 65535"
+        5 -> "0 to 4294967295"
+        _ -> "0 to 18446744073709551615"
+    }
 }
 
 fn wide_literal(inout c: Ck, s: i64, e: i64, ty: str) {
-    err(c, s, e, "this literal is too large for `{ty}`")
+    err_help(c, s, e, "this literal is too large for `{ty}`", "only a `u64` holds a number past 9223372036854775807; write it where a `u64` is expected -- an annotation, a parameter, a field, or beside another `u64` ([T-U64])")
 }
 
 fn is_wide_literal(p: Prog, e: i64) -> bool {
@@ -3831,20 +4028,27 @@ fn literal_adopts(inout c: Ck, p: Prog, lit: i64, k: i64) {
     var ok = true
     var s = 0
     var e = 0
+    var v = 0
+    var at = 0
+    var neg = false
     if lk == ast.E_INT {
-        ok = lit_fits(c, p, k, prog.sl(p, lit, 0), prog.s(p, lit), false)
+        v = prog.sl(p, lit, 0)
+        at = prog.s(p, lit)
         s = prog.s(p, lit)
         e = prog.e(p, lit)
     } else if lk == ast.E_UNARY and prog.sl(p, lit, 0) == 0 and prog.kind(p, prog.sl(p, lit, 1)) == ast.E_INT {
         let inner = prog.sl(p, lit, 1)
-        ok = lit_fits(c, p, k, prog.sl(p, inner, 0), prog.s(p, inner), true)
+        v = prog.sl(p, inner, 0)
+        at = prog.s(p, inner)
+        neg = true
         s = prog.s(p, lit)
         e = prog.e(p, lit)
     } else {
         return
     }
+    ok = lit_fits(c, p, k, v, at, neg)
     if not ok {
-        literal_out_of_range(c, s, e, k)
+        literal_out_of_range(c, p, s, e, k, v, at, neg)
     }
     c.f_types.set(prog.key(s, e), tys.int_ty(k))
 }
@@ -3854,8 +4058,225 @@ fn literal_adopts(inout c: Ck, p: Prog, lit: i64, k: i64) {
 // ---------------------------------------------------------------------
 
 pub fn check_expr(inout c: Ck, inout t: Tys, p: Prog, e: i64, expected: i64) {
+    if is_spine(p, e) {
+        let _ = spine(c, t, p, e, expected, true)
+        return
+    }
     check_expr_inner(c, t, p, e, expected)
     c.f_checked.set(prog.ekey(p, e), expected)
+}
+
+// ---------------------------------------------------------------------
+// Spines
+// ---------------------------------------------------------------------
+//
+// An arithmetic operator's right operand and an `else if` are as deep as
+// the program writes them: the nesting cap counts neither a `^` chain nor
+// an `else if` chain ([G-NEST-LIMIT]; the parser loops over both), and the
+// Rust checker accepts either at 100,000 terms. So `infer_expr` and
+// `check_expr` take such a node to `spine`, which does what they do --
+// the same calls in the same order -- with the right operand or the `else
+// if` pushed on a work stack instead of recursed into, and the rest of the
+// node's work held in a frame until its value comes back. Everything else
+// (a left operand, a condition, a block) is checked as before.
+
+/// Whether `infer_expr` and `check_expr` hand `e` to `spine`.
+fn is_spine(p: Prog, e: i64) -> bool {
+    let k = prog.kind(p, e)
+    k == ast.E_IF or (k == ast.E_BINARY and prog.sl(p, e, 0) <= 5)
+}
+
+// Tasks and the frames that finish them.
+let SP_INFER = 1
+let SP_CHECK = 2
+let SP_INFER_POST = 3
+let SP_CHECK_POST = 4
+let SP_CHECK_FALLBACK = 5
+let SP_BIN_WIDE = 6
+let SP_BIN_LIT = 7
+let SP_BIN_RESULT = 8
+let SP_IF_ELSEIF = 9
+let SP_CHECK_IF = 10
+let SP_BIN_LHS = 11
+
+fn sp_push(inout fk: [i64], inout fe: [i64], inout fa: [i64], inout fb: [i64], inout fs: [str], k: i64, e: i64, a: i64, b: i64, s: str) {
+    fk.push(k)
+    fe.push(e)
+    fa.push(a)
+    fb.push(b)
+    fs.push(s)
+}
+
+/// `infer_expr(e0)`, or `check_expr(e0, expected)` when `checking`, for a
+/// spine node; the type when inferring.
+fn spine(inout c: Ck, inout t: Tys, p: Prog, e0: i64, expected: i64, checking: bool) -> i64 {
+    var fk: [i64] = []
+    var fe: [i64] = []
+    var fa: [i64] = []
+    var fb: [i64] = []
+    var fs: [str] = []
+    // Moved-binding snapshots a frame holds, by index.
+    var snaps: [[bool]] = []
+    var vals: [i64] = []
+    if checking {
+        sp_push(fk, fe, fa, fb, fs, SP_CHECK, e0, expected, 0, "")
+    } else {
+        sp_push(fk, fe, fa, fb, fs, SP_INFER, e0, 0, 0, "")
+    }
+    while fk.len() > 0 {
+        let k = fk.pop() ?? 0
+        let e = fe.pop() ?? 0
+        let a = fa.pop() ?? 0
+        let b = fb.pop() ?? 0
+        let s = fs.pop() ?? ""
+        if k == SP_INFER {
+            if not is_spine(p, e) {
+                vals.push(infer_expr(c, t, p, e))
+                continue
+            }
+            sp_push(fk, fe, fa, fb, fs, SP_INFER_POST, e, 0, 0, "")
+            if prog.kind(p, e) == ast.E_BINARY {
+                // infer_expr_inner, then infer_binary's arithmetic: a left
+                // operand past `i64` waits for the right one; any other is
+                // inferred first, on the stack too, since a left-nested
+                // chain is as deep as the cap allows.
+                c.discarding = false
+                if is_wide_literal(p, prog.sl(p, e, 1)) {
+                    sp_push(fk, fe, fa, fb, fs, SP_BIN_WIDE, e, 0, 0, "")
+                    sp_push(fk, fe, fa, fb, fs, SP_INFER, prog.sl(p, e, 2), 0, 0, "")
+                } else {
+                    sp_push(fk, fe, fa, fb, fs, SP_BIN_LHS, e, 0, 0, "")
+                    sp_push(fk, fe, fa, fb, fs, SP_INFER, prog.sl(p, e, 1), 0, 0, "")
+                }
+                continue
+            }
+            // infer_if.
+            let (disc, then_ty, after_then, before) = if_head(c, t, p, e)
+            let eb = prog.sl(p, e, 2)
+            if eb < 0 {
+                vals.push(if_no_else(c, t, p, e, then_ty, after_then, before))
+                continue
+            }
+            restore_moved(c, before)
+            if prog.kind(p, eb) == ast.EB_ELSE {
+                let (else_ty, else_at) = if_else_block(c, t, p, e, disc)
+                vals.push(if_post(c, t, p, e, disc, then_ty, after_then, else_ty, else_at))
+                continue
+            }
+            c.discarding = disc
+            snaps.push(after_then)
+            sp_push(fk, fe, fa, fb, fs, SP_IF_ELSEIF, e, if disc { 1 } else { 0 }, then_ty, "")
+            sp_push(fk, fe, fa, fb, fs, SP_INFER, prog.sl(p, eb, 0), 0, 0, "")
+            continue
+        }
+        if k == SP_CHECK {
+            if not is_spine(p, e) {
+                check_expr(c, t, p, e, a)
+                continue
+            }
+            sp_push(fk, fe, fa, fb, fs, SP_CHECK_POST, e, a, 0, "")
+            // check_expr_inner.
+            let tail_fn = c.tail_fn
+            c.tail_fn = "\0"
+            let want = tys.shallow(t, a)
+            if prog.kind(p, e) == ast.E_IF and want != tys.UNIT and prog.sl(p, e, 2) >= 0 {
+                let then_b = prog.sl(p, e, 1)
+                let eb = prog.sl(p, e, 2)
+                check_expr(c, t, p, prog.sl(p, e, 0), tys.BOOL)
+                let before = moved_snapshot(c)
+                let want_then = branch_want(c, t, p, prog.last_stmt(p, then_b), want)
+                let tt = check_block_with(c, t, p, then_b, want_then)
+                require_branch_value(c, t, p, then_b, tt, want)
+                let after_then = moved_snapshot(c)
+                restore_moved(c, before)
+                if prog.kind(p, eb) == ast.EB_ELSE {
+                    let bb = prog.sl(p, eb, 0)
+                    let want_else = branch_want(c, t, p, prog.last_stmt(p, bb), want)
+                    let et = check_block_with(c, t, p, bb, want_else)
+                    require_branch_value(c, t, p, bb, et, want)
+                    let after_else = moved_snapshot(c)
+                    merge_branches(c, t, [after_then, after_else], [block_leaves(p, then_b), block_leaves(p, bb)], prog.es(p, e), prog.ee(p, e))
+                    continue
+                }
+                snaps.push(after_then)
+                sp_push(fk, fe, fa, fb, fs, SP_CHECK_IF, e, 0, 0, "")
+                sp_push(fk, fe, fa, fb, fs, SP_CHECK, prog.sl(p, eb, 0), want, 0, "")
+                continue
+            }
+            // The fallback: infer, then hold to what was wanted.
+            sp_push(fk, fe, fa, fb, fs, SP_CHECK_FALLBACK, e, want, 0, tail_fn)
+            sp_push(fk, fe, fa, fb, fs, SP_INFER, e, 0, 0, "")
+            continue
+        }
+        if k == SP_INFER_POST {
+            let ty = vals.pop() ?? tys.ERROR
+            vals.push(infer_post(c, t, p, e, ty))
+            continue
+        }
+        if k == SP_CHECK_POST {
+            c.f_checked.set(prog.ekey(p, e), a)
+            continue
+        }
+        if k == SP_CHECK_FALLBACK {
+            let got = vals.pop() ?? tys.ERROR
+            check_row_fits(c, t, got, a, prog.es(p, e), prog.ee(p, e))
+            if s != "\0" {
+                if not tys.unify(t, got, a) {
+                    err_help(c, prog.es(p, e), prog.ee(p, e), "function `{s}` must return `{tys.show(t, a)}` but its body produces `{tys.show(t, got)}`", "the last expression of the body is the return value")
+                }
+                continue
+            }
+            unify_or_report(c, t, prog.es(p, e), prog.ee(p, e), got, a)
+            continue
+        }
+        if k == SP_BIN_WIDE or k == SP_BIN_LIT {
+            let probe = vals.pop() ?? tys.ERROR
+            var lt = a
+            if k == SP_BIN_WIDE {
+                lt = bin_after_wide(c, t, p, e, probe)
+            } else {
+                lt = bin_after_lit(c, t, p, e, a, b, probe)
+            }
+            unify_or_report(c, t, prog.es(p, prog.sl(p, e, 2)), prog.ee(p, prog.sl(p, e, 2)), probe, lt)
+            vals.push(bin_result(c, t, p, e, lt))
+            continue
+        }
+        if k == SP_BIN_LHS {
+            // `float_aware_lhs_seen` once the left operand is inferred.
+            let lt = vals.pop() ?? tys.ERROR
+            let at = lhs_literal_at(p, prog.sl(p, e, 1))
+            if at >= 0 and tys.shallow(t, lt) == tys.I64 {
+                sp_push(fk, fe, fa, fb, fs, SP_BIN_LIT, e, lt, at, "")
+                sp_push(fk, fe, fa, fb, fs, SP_INFER, prog.sl(p, e, 2), 0, 0, "")
+            } else {
+                sp_push(fk, fe, fa, fb, fs, SP_BIN_RESULT, e, lt, 0, "")
+                sp_push(fk, fe, fa, fb, fs, SP_CHECK, prog.sl(p, e, 2), lt, 0, "")
+            }
+            continue
+        }
+        if k == SP_BIN_RESULT {
+            vals.push(bin_result(c, t, p, e, a))
+            continue
+        }
+        if k == SP_IF_ELSEIF {
+            let else_ty = vals.pop() ?? tys.ERROR
+            c.discarding = false
+            let after_then = snaps.pop() ?? []
+            let eb = prog.sl(p, e, 2)
+            vals.push(if_post(c, t, p, e, a == 1, b, after_then, else_ty, prog.sl(p, eb, 0)))
+            continue
+        }
+        if k == SP_CHECK_IF {
+            let after_then = snaps.pop() ?? []
+            let after_else = moved_snapshot(c)
+            merge_branches(c, t, [after_then, after_else], [block_leaves(p, prog.sl(p, e, 1)), false], prog.es(p, e), prog.ee(p, e))
+            continue
+        }
+    }
+    if checking {
+        return tys.UNIT
+    }
+    vals.pop() ?? tys.ERROR
 }
 
 fn check_expr_inner(inout c: Ck, inout t: Tys, p: Prog, e: i64, expected: i64) {
@@ -3875,7 +4296,7 @@ fn check_expr_inner(inout c: Ck, inout t: Tys, p: Prog, e: i64, expected: i64) {
     if k == ast.E_INT and wk == tys.K_INT {
         let ik = t.a[want]
         if not lit_fits(c, p, ik, prog.sl(p, e, 0), prog.s(p, e), false) {
-            literal_out_of_range(c, prog.s(p, e), prog.e(p, e), ik)
+            literal_out_of_range(c, p, prog.s(p, e), prog.e(p, e), ik, prog.sl(p, e, 0), prog.s(p, e), false)
         }
         c.f_types.set(prog.ekey(p, e), want)
         return
@@ -3885,7 +4306,7 @@ fn check_expr_inner(inout c: Ck, inout t: Tys, p: Prog, e: i64, expected: i64) {
         if prog.kind(p, inner) == ast.E_INT {
             let ik = t.a[want]
             if not lit_fits(c, p, ik, prog.sl(p, inner, 0), prog.s(p, inner), true) {
-                literal_out_of_range(c, prog.s(p, e), prog.e(p, e), ik)
+                literal_out_of_range(c, p, prog.s(p, e), prog.e(p, e), ik, prog.sl(p, inner, 0), prog.s(p, inner), true)
             }
             c.f_types.set(prog.ekey(p, e), want)
             return
@@ -4008,7 +4429,7 @@ fn check_expr_inner(inout c: Ck, inout t: Tys, p: Prog, e: i64, expected: i64) {
                 }
             }
             if extra.len() > 0 {
-                err(c, prog.es(p, e), prog.ee(p, e), "this closure performs `{extra.join("`, `")}`, which the expected type does not allow")
+                err_help(c, prog.es(p, e), prog.ee(p, e), "this closure performs `{extra.join("`, `")}`, which the expected type does not allow", "widen the type's effect row, or move the effect out of the closure")
             }
         }
         let got = sempat.infer_closure(c, t, p, e, want)
@@ -4020,7 +4441,7 @@ fn check_expr_inner(inout c: Ck, inout t: Tys, p: Prog, e: i64, expected: i64) {
     check_row_fits(c, t, got, want, prog.es(p, e), prog.ee(p, e))
     if tail_fn != "\0" {
         if not tys.unify(t, got, want) {
-            err(c, prog.es(p, e), prog.ee(p, e), "function `{tail_fn}` must return `{tys.show(t, want)}` but its body produces `{tys.show(t, got)}`")
+            err_help(c, prog.es(p, e), prog.ee(p, e), "function `{tail_fn}` must return `{tys.show(t, want)}` but its body produces `{tys.show(t, got)}`", "the last expression of the body is the return value")
         }
         return
     }
@@ -4036,18 +4457,65 @@ pub fn unify_or_report(inout c: Ck, inout t: Tys, s: i64, e: i64, got: i64, want
     let gr = tys.shallow(t, got)
     let wr = tys.shallow(t, want)
     if t.k[gr] == tys.K_FALLIBLE and t.k[wr] != tys.K_FALLIBLE {
-        err(c, s, e, "this expression can fail (`{g}`) but `{w}` is required")
+        err_help(c, s, e, "this expression can fail (`{g}`) but `{w}` is required", "use `try` to propagate the error or `match` to handle it")
+        return
+    }
+    let msg = "type mismatch: expected `{w}`, found `{g}`"
+    if t.k[gr] == tys.K_FN and t.k[wr] == tys.K_FN {
+        // A fallible function passed where a plain one is wanted.
+        if t.k[tys.shallow(t, t.a[gr])] == tys.K_FALLIBLE and t.k[tys.shallow(t, t.a[wr])] != tys.K_FALLIBLE {
+            err_help(c, s, e, msg, "this function can fail, and there is nowhere for the error to go once per element — wrap it in a closure that handles the failure, as in `|x| f(x) ?? fallback`")
+        } else {
+            err(c, s, e, msg)
+        }
         return
     }
     if t.k[wr] == tys.K_FALLIBLE {
         // The probe the Rust checker makes before choosing its help: it
         // unifies, so it is made here too.
         let okr = tys.resolve(t, t.a[wr])
-        if t.k[gr] != tys.K_FALLIBLE {
-            tys.unify(t, gr, okr)
+        if t.k[gr] != tys.K_FALLIBLE and tys.unify(t, gr, okr) {
+            err_help(c, s, e, msg, "a value that cannot fail is written `Ok(...)` here; in a `match`, either wrap the arms that cannot fail or add `try` to the ones that can, so every arm is the same shape")
+            return
         }
     }
-    err(c, s, e, "type mismatch: expected `{w}`, found `{g}`")
+    let wr2 = tys.shallow(t, want)
+    let mix = int_mix_help(t, gr, wr2)
+    if mix != "" {
+        err_help(c, s, e, msg, mix)
+        return
+    }
+    if (t.k[gr] == tys.K_I64 and t.k[wr2] == tys.K_F64) or (t.k[gr] == tys.K_F64 and t.k[wr2] == tys.K_I64) {
+        err_help(c, s, e, msg, "the two number types do not mix on their own — convert with `.as_f64()`, or use a literal, which does adopt the other side")
+        return
+    }
+    err(c, s, e, msg)
+}
+
+/// The help for two integer types that do not mix, or "".
+fn int_mix_help(t: Tys, got: i64, want: i64) -> str {
+    let g = int_type_name(t, got)
+    let w = int_type_name(t, want)
+    if g == "" or w == "" or g == w {
+        return ""
+    }
+    if w == "i64" and g == "u64" {
+        return "`u64` and `i64` are different types and do not convert on their own -- `.try_i64()` gives the same value or `None` past `i64`, `.as_i64()` gives the bits ([T-U64])"
+    }
+    if w == "i64" {
+        return "`{g}` and `i64` are different types and do not convert on their own -- `.as_i64()` gives the same value as an `i64`"
+    }
+    "`{g}` and `{w}` are different types and do not convert on their own -- convert with `.as_{w}()`, which wraps to the width, or `.try_{w}()`, which answers `None` when the value does not fit"
+}
+
+fn int_type_name(t: Tys, ty: i64) -> str {
+    if t.k[ty] == tys.K_I64 {
+        return "i64"
+    }
+    if t.k[ty] == tys.K_INT {
+        return tys.int_name(t.a[ty])
+    }
+    ""
 }
 
 // ---------------------------------------------------------------------
@@ -4060,6 +4528,9 @@ fn simple_expr(p: Prog, e: i64) -> bool {
 }
 
 pub fn infer_expr(inout c: Ck, inout t: Tys, p: Prog, e: i64) -> i64 {
+    if is_spine(p, e) {
+        return spine(c, t, p, e, -1, false)
+    }
     let key = prog.ekey(p, e)
     let k = prog.kind(p, e)
     var cacheable = false
@@ -4087,9 +4558,18 @@ pub fn infer_expr(inout c: Ck, inout t: Tys, p: Prog, e: i64) -> i64 {
     if cacheable {
         c.expr_types.set(key, ty)
     }
+    infer_post(c, t, p, e, ty)
+}
+
+/// What `infer_expr` does with an expression's type once it is inferred:
+/// records it, and refuses a linear value held, or a function value or a
+/// `ref` reached inside a region.
+fn infer_post(inout c: Ck, inout t: Tys, p: Prog, e: i64, ty: i64) -> i64 {
+    let key = prog.ekey(p, e)
+    let k = prog.kind(p, e)
     c.f_types.set(key, ty)
     if c.linear_types.len() > 0 and holds_linear(c, t, ty) {
-        err(c, prog.es(p, e), prog.ee(p, e), "`{tys.show(t, ty)}` would hold a linear value")
+        err_help(c, prog.es(p, e), prog.ee(p, e), "`{tys.show(t, ty)}` would hold a linear value", "a list, map, tuple, `ref`, `Option` or other generic cannot promise to consume what it holds exactly once -- keep the linear value in its own binding ([T-LINEAR-CONTAIN])")
     }
     record_value_row(c, t, key, ty)
     if k == ast.E_IDENT {
@@ -4105,24 +4585,24 @@ pub fn infer_expr(inout c: Ck, inout t: Tys, p: Prog, e: i64) -> i64 {
         if c.go_floor >= 0 {
             let at = scope_of(c, name)
             if at >= 0 and at < c.go_floor and task_shares_ref(c, t, ty) {
-                err(c, prog.s(p, id), prog.e(p, id), "a task cannot use `{name}` -- it reaches a `ref` from outside, which tasks would share")
+                err_help(c, prog.s(p, id), prog.e(p, id), "a task cannot use `{name}` -- it reaches a `ref` from outside, which tasks would share", "tasks share nothing mutable -- send the value on a channel instead")
                 return tys.ERROR
             }
         }
         if c.parallel_fn_floor >= 0 {
             let at = scope_of(c, name)
             if at >= 0 and at < c.parallel_fn_floor and carries_ref(c, t, ty) {
-                err(c, prog.s(p, id), prog.e(p, id), "cannot use `{name}` inside a parallel operation — it reaches a `ref` from outside, which every element would share")
+                err_help(c, prog.s(p, id), prog.e(p, id), "cannot use `{name}` inside a parallel operation — it reaches a `ref` from outside, which every element would share", "elements are processed on several cores, so two of them reaching the same slot would race — use `map` or `filter` for work over shared state, or build the reference inside the function, one per element")
                 return tys.ERROR
             }
         }
     }
     if c.region_depth > 0 and arrived_from_outside_region(c, p, e) and carries_fn(c, t, ty) {
-        err(c, prog.es(p, e), prog.ee(p, e), "a function value cannot be used inside a region")
+        err_help(c, prog.es(p, e), prog.ee(p, e), "a function value cannot be used inside a region", "a function written outside the region carries its captures, so what the region allocates could be kept — write the closure inside the region, or move the call out")
         return tys.ERROR
     }
     if c.region_depth > 0 and carries_ref(c, t, ty) {
-        err(c, prog.es(p, e), prog.ee(p, e), "a `ref` cannot be used inside a region")
+        err_help(c, prog.es(p, e), prog.ee(p, e), "a `ref` cannot be used inside a region", "a reference reaches storage outside the region, so what the region allocates could outlive it — move the work out of the region, or yield a number")
         return tys.ERROR
     }
     ty
@@ -4163,7 +4643,7 @@ fn infer_expr_inner(inout c: Ck, inout t: Tys, p: Prog, e: i64) -> i64 {
                 let inner = prog.sl(p, pc, 0)
                 let ty = infer_expr(c, t, p, inner)
                 if t.k[tys.shallow(t, ty)] == tys.K_FALLIBLE {
-                    err(c, prog.es(p, inner), prog.ee(p, inner), "cannot interpolate a fallible expression")
+                    err_help(c, prog.es(p, inner), prog.ee(p, inner), "cannot interpolate a fallible expression", "handle the error first with `try` or `match`")
                 }
             }
         }
@@ -4249,7 +4729,7 @@ fn infer_expr_inner(inout c: Ck, inout t: Tys, p: Prog, e: i64) -> i64 {
         let rt = infer_expr(c, t, p, recv)
         let rs = tys.shallow(t, rt)
         if t.k[rs] == tys.K_MAP {
-            return err(c, prog.s(p, e), prog.e(p, e), "cannot index into `Map[{tys.show(t, t.a[rs])}, {tys.show(t, t.b[rs])}]`")
+            return err_help(c, prog.s(p, e), prog.e(p, e), "cannot index into `Map[{tys.show(t, t.a[rs])}, {tys.show(t, t.b[rs])}]`", "a map is read with `m.get(k)`, which answers `Option` because the key may be absent")
         }
         check_expr(c, t, p, prog.sl(p, e, 1), tys.I64)
         let r2 = tys.shallow(t, rt)
@@ -4258,12 +4738,12 @@ fn infer_expr_inner(inout c: Ck, inout t: Tys, p: Prog, e: i64) -> i64 {
             return t.a[r2]
         }
         if rk == tys.K_STR {
-            return err(c, prog.s(p, e), prog.e(p, e), "strings cannot be indexed directly")
+            return err_help(c, prog.s(p, e), prog.e(p, e), "strings cannot be indexed directly", "use `.chars()` to get a list of characters")
         }
         if rk == tys.K_ERROR {
             return tys.ERROR
         }
-        return err(c, prog.s(p, e), prog.e(p, e), "cannot index into `{tys.show(t, r2)}`")
+        return err(c, prog.s(p, e), prog.e(p, e), "cannot index into `{tys.show_shallow(t, r2)}`")
     }
     if k == ast.E_UNARY {
         let inner = prog.sl(p, e, 1)
@@ -4319,7 +4799,7 @@ fn infer_expr_inner(inout c: Ck, inout t: Tys, p: Prog, e: i64) -> i64 {
         let r = tys.resolve(t, ty)
         let rk = t.k[r]
         if not (rk == tys.K_UNIT or rk == tys.K_I64 or rk == tys.K_INT or rk == tys.K_F64 or rk == tys.K_BOOL or rk == tys.K_VAR or rk == tys.K_ERROR) {
-            err(c, prog.s(p, b), prog.e(p, b), "a region cannot produce a `{tys.show(t, ty)}`")
+            err_help(c, prog.s(p, b), prog.e(p, b), "a region cannot produce a `{tys.show(t, ty)}`", "everything allocated inside a region dies at the closing brace, so only a number or a `bool` can come out — compute what you need and yield that")
         }
         return ty
     }
@@ -4331,11 +4811,29 @@ fn infer_expr_inner(inout c: Ck, inout t: Tys, p: Prog, e: i64) -> i64 {
 }
 
 fn infer_if(inout c: Ck, inout t: Tys, p: Prog, e: i64) -> i64 {
+    let (disc, then_ty, after_then, before) = if_head(c, t, p, e)
+    let eb = prog.sl(p, e, 2)
+    if eb < 0 {
+        return if_no_else(c, t, p, e, then_ty, after_then, before)
+    }
+    restore_moved(c, before)
+    if prog.kind(p, eb) == ast.EB_ELSE {
+        let (else_ty, else_at) = if_else_block(c, t, p, e, disc)
+        return if_post(c, t, p, e, disc, then_ty, after_then, else_ty, else_at)
+    }
+    let inner = prog.sl(p, eb, 0)
+    c.discarding = disc
+    let else_ty = infer_expr(c, t, p, inner)
+    c.discarding = false
+    if_post(c, t, p, e, disc, then_ty, after_then, else_ty, inner)
+}
+
+/// `infer_if` up to its `else`: whether it was discarding, the then
+/// branch's type, and the moved bindings after it and before it.
+fn if_head(inout c: Ck, inout t: Tys, p: Prog, e: i64) -> (bool, i64, [bool], [bool]) {
     let disc = c.discarding
     c.discarding = false
     check_expr(c, t, p, prog.sl(p, e, 0), tys.BOOL)
-    let es = prog.es(p, e)
-    let ee = prog.ee(p, e)
     let then_b = prog.sl(p, e, 1)
     let before = moved_snapshot(c)
     var then_ty = tys.UNIT
@@ -4345,26 +4843,29 @@ fn infer_if(inout c: Ck, inout t: Tys, p: Prog, e: i64) -> i64 {
         then_ty = check_block(c, t, p, then_b)
     }
     let after_then = moved_snapshot(c)
+    (disc, then_ty, after_then, before)
+}
+
+/// An `else` block's type and the expression its value comes from.
+fn if_else_block(inout c: Ck, inout t: Tys, p: Prog, e: i64, disc: bool) -> (i64, i64) {
+    let b = prog.sl(p, prog.sl(p, e, 2), 0)
+    var else_ty = tys.UNIT
+    if disc {
+        else_ty = check_block_discarded(c, t, p, b)
+    } else {
+        else_ty = check_block(c, t, p, b)
+    }
+    (else_ty, prog.tail_expr(p, b))
+}
+
+/// `infer_if` after its `else` or `else if`: the branches merged, and the
+/// `if`'s type.
+fn if_post(inout c: Ck, inout t: Tys, p: Prog, e: i64, disc: bool, then_ty: i64, after_then: [bool], else_ty: i64, else_at: i64) -> i64 {
+    let es = prog.es(p, e)
+    let ee = prog.ee(p, e)
+    let then_b = prog.sl(p, e, 1)
     let eb = prog.sl(p, e, 2)
     if eb >= 0 {
-        restore_moved(c, before)
-        var else_ty = tys.UNIT
-        var else_at = -1
-        if prog.kind(p, eb) == ast.EB_ELSE {
-            let b = prog.sl(p, eb, 0)
-            if disc {
-                else_ty = check_block_discarded(c, t, p, b)
-            } else {
-                else_ty = check_block(c, t, p, b)
-            }
-            else_at = prog.tail_expr(p, b)
-        } else {
-            let inner = prog.sl(p, eb, 0)
-            c.discarding = disc
-            else_ty = infer_expr(c, t, p, inner)
-            c.discarding = false
-            else_at = inner
-        }
         let after_else = moved_snapshot(c)
         let else_leaves = prog.kind(p, eb) == ast.EB_ELSE and block_leaves(p, prog.sl(p, eb, 0))
         merge_branches(c, t, [after_then, after_else], [block_leaves(p, then_b), else_leaves], es, ee)
@@ -4393,8 +4894,16 @@ fn infer_if(inout c: Ck, inout t: Tys, p: Prog, e: i64) -> i64 {
                 }
             }
         }
-        return err(c, es, ee, "the branches of this `if` have different types (`{tys.show(t, then_ty)}` and `{tys.show(t, else_ty)}`)")
+        return err_help(c, es, ee, "the branches of this `if` have different types (`{tys.show(t, then_ty)}` and `{tys.show(t, else_ty)}`)", "an `if` used as a value needs both branches to agree — give them a common type, or use it as a statement")
     }
+    tys.UNIT
+}
+
+/// `infer_if` with no `else`.
+fn if_no_else(inout c: Ck, inout t: Tys, p: Prog, e: i64, then_ty: i64, after_then: [bool], before: [bool]) -> i64 {
+    let es = prog.es(p, e)
+    let ee = prog.ee(p, e)
+    let then_b = prog.sl(p, e, 1)
     merge_branches(c, t, [after_then, before], [block_leaves(p, then_b), false], es, ee)
     var ws = es
     var we = ee
@@ -4405,9 +4914,9 @@ fn infer_if(inout c: Ck, inout t: Tys, p: Prog, e: i64) -> i64 {
     }
     let resolved = tys.shallow(t, then_ty)
     if t.k[resolved] == tys.K_FALLIBLE {
-        err(c, ws, we, "this expression can fail (`{tys.show(t, then_ty)}`) and its failure is discarded")
+        err_help(c, ws, we, "this expression can fail (`{tys.show(t, then_ty)}`) and its failure is discarded", "use `try` to propagate it, `match` to handle both cases, or `??` with a fallback to say what should happen instead")
     } else if holds_fallible(c, t, resolved, 0) {
-        err(c, ws, we, "this expression holds failures (`{tys.show(t, then_ty)}`) and they are discarded")
+        err_help(c, ws, we, "this expression holds failures (`{tys.show(t, then_ty)}`) and they are discarded", "bind it and handle the failures it holds — a value nothing reads is a failure nothing reports")
     }
     tys.UNIT
 }
@@ -4426,10 +4935,10 @@ fn infer_ident(inout c: Ck, inout t: Tys, p: Prog, id: i64) -> i64 {
             captured = at < floor
         }
         if captured and is_linear(c, t, c.b_ty[b]) {
-            return err(c, prog.s(p, id), prog.e(p, id), "a closure cannot capture the linear value `{name}`")
+            return err_help(c, prog.s(p, id), prog.e(p, id), "a closure cannot capture the linear value `{name}`", "a closure may run any number of times, so it cannot promise to consume it once ([T-LINEAR-CONTAIN]); pass it as an argument instead")
         }
         if c.b_moved[b] {
-            return err(c, prog.s(p, id), prog.e(p, id), "use of moved value `{name}`")
+            return err_help(c, prog.s(p, id), prog.e(p, id), "use of moved value `{name}`", "ownership was transferred with `own` — the value is gone here")
         }
         return c.b_ty[b]
     }
@@ -4445,7 +4954,7 @@ fn infer_ident(inout c: Ck, inout t: Tys, p: Prog, id: i64) -> i64 {
                     tir_name(c, ik, NR_VARIANT, "", [])
                     return instantiate_variant(c, t, p, vdef(ownv), vidx(ownv), [], prog.s(p, id), prog.e(p, id))
                 }
-                return err(c, prog.s(p, id), prog.e(p, id), "`{name}` is ambiguous — it names a variant of multiple types")
+                return err_help(c, prog.s(p, id), prog.e(p, id), "`{name}` is ambiguous — it names a variant of multiple types", "qualify it as `TypeName.Variant`")
             }
         }
         None -> ()
@@ -4482,7 +4991,22 @@ fn infer_ident(inout c: Ck, inout t: Tys, p: Prog, id: i64) -> i64 {
         tir_name(c, ik, NR_FN, q, [])
         return tys.fnt(t, c.fn_params[fid], ret, own_row)
     }
-    err(c, prog.s(p, id), prog.e(p, id), "unknown name `{name}`")
+    // The name is very often one that exists next door, in a module this
+    // one imports. The Rust checker lists those in its import table's hash
+    // order; this lists them by alias.
+    var qualified: [str] = []
+    let ia = p.m_imp_alias[c.cur_mi]
+    let ifull = p.m_imp_full[c.cur_mi]
+    for j in 0..ia.len() {
+        if fn_of(c, ifull[j] + "::" + name) >= 0 {
+            qualified.push("`{ia[j]}.{name}`")
+        }
+    }
+    if qualified.len() > 0 {
+        qualified.sort()
+        return err_help(c, prog.s(p, id), prog.e(p, id), "unknown name `{name}`", "did you mean {qualified.join(" or ")}?")
+    }
+    err_help(c, prog.s(p, id), prog.e(p, id), "unknown name `{name}`", "check the spelling, or declare it with `let` first")
 }
 
 /// The one candidate this module declares, when there is exactly one; -1.
@@ -4537,7 +5061,7 @@ fn infer_struct_lit(inout c: Ck, inout t: Tys, p: Prog, e: i64) -> i64 {
         return err(c, prog.s(p, path), prog.e(p, path), "unknown type `{tname}`")
     }
     if not tys.is_struct(t, def) {
-        return err(c, prog.s(p, path), prog.e(p, path), "`{tname}` is not a struct")
+        return err_help(c, prog.s(p, path), prog.e(p, path), "`{tname}` is not a struct", "sum type values are built with variant constructors")
     }
     let ngen = t.d_gen[def].len()
     let (fnames, ftys) = tys.struct_fields(t, def)
@@ -4719,7 +5243,7 @@ fn infer_binary(inout c: Ck, inout t: Tys, p: Prog, e: i64) -> i64 {
         if t.k[r] == tys.K_ERROR {
             return tys.ERROR
         }
-        return err(c, prog.es(p, lhs), prog.ee(p, lhs), "`??` needs an `Option` or a fallible value on the left, found `{tys.show(t, lt)}`")
+        return err_help(c, prog.es(p, lhs), prog.ee(p, lhs), "`??` needs an `Option` or a fallible value on the left, found `{tys.show(t, lt)}`", "`a ?? b` unwraps `a` or falls back to `b`")
     }
     // + - * / % ^
     let (lt, rhs_seen) = float_aware_lhs_seen(c, t, p, lhs, rhs)
@@ -4728,6 +5252,39 @@ fn infer_binary(inout c: Ck, inout t: Tys, p: Prog, e: i64) -> i64 {
     } else {
         check_expr(c, t, p, rhs, lt)
     }
+    bin_result(c, t, p, e, lt)
+}
+
+/// The left operand's type once the right was inferred first, when the
+/// left is a literal past `i64`.
+fn bin_after_wide(inout c: Ck, inout t: Tys, p: Prog, e: i64, probe: i64) -> i64 {
+    let lhs = prog.sl(p, e, 1)
+    let ps = tys.shallow(t, probe)
+    if t.k[ps] == tys.K_INT {
+        literal_adopts(c, p, lhs, t.a[ps])
+        return ps
+    }
+    infer_expr(c, t, p, lhs)
+}
+
+/// The left operand's type once the right was inferred after it, when
+/// the left is an `i64` literal.
+fn bin_after_lit(inout c: Ck, inout t: Tys, p: Prog, e: i64, lt: i64, at: i64, probe: i64) -> i64 {
+    let ps = tys.shallow(t, probe)
+    if ps == tys.F64 {
+        c.float_lits.set(at, true)
+        return tys.F64
+    }
+    if t.k[ps] == tys.K_INT {
+        literal_adopts(c, p, prog.sl(p, e, 1), t.a[ps])
+        return ps
+    }
+    lt
+}
+
+/// An arithmetic operator's type, from its left operand's.
+fn bin_result(inout c: Ck, inout t: Tys, p: Prog, e: i64, lt: i64) -> i64 {
+    let op = prog.sl(p, e, 0)
     let r = tys.shallow(t, lt)
     let rk = t.k[r]
     if rk == tys.K_I64 or rk == tys.K_F64 or rk == tys.K_INT {
@@ -4746,13 +5303,21 @@ fn infer_binary(inout c: Ck, inout t: Tys, p: Prog, e: i64) -> i64 {
     if rk == tys.K_ERROR {
         return tys.ERROR
     }
-    err(c, prog.s(p, e), prog.e(p, e), "cannot apply this operator to `{tys.show(t, lt)}`")
+    let opname = match op {
+        0 -> "+"
+        1 -> "-"
+        2 -> "*"
+        3 -> "/"
+        4 -> "%"
+        _ -> "^"
+    }
+    err(c, prog.s(p, e), prog.e(p, e), "cannot apply `{opname}` to `{tys.show(t, lt)}`")
 }
 
 fn infer_try(inout c: Ck, inout t: Tys, p: Prog, e: i64) -> i64 {
     let inner = prog.sl(p, e, 0)
     if c.region_depth > 0 {
-        err(c, prog.s(p, e), prog.e(p, e), "cannot `try` from inside a region")
+        err_help(c, prog.s(p, e), prog.e(p, e), "cannot `try` from inside a region", "`try` leaves the region carrying an error value, exactly as `return` and `fail` do — take the fallible call out of the region, or handle it there with `match` and yield a number")
     }
     let ty = infer_expr(c, t, p, inner)
     force_deferred(c, t, p, ty)
@@ -4760,17 +5325,17 @@ fn infer_try(inout c: Ck, inout t: Tys, p: Prog, e: i64) -> i64 {
     if t.k[r] == tys.K_FALLIBLE {
         if c.fn_err_ty >= 0 {
             if not err_fits(c, t, t.b[r], c.fn_err_ty) {
-                err(c, prog.s(p, e), prog.e(p, e), "`try` propagates `{tys.show(t, t.b[r])}` but this function only declares `{tys.show(t, c.fn_err_ty)}`")
+                err_help(c, prog.s(p, e), prog.e(p, e), "`try` propagates `{tys.show(t, t.b[r])}` but this function only declares `{tys.show(t, c.fn_err_ty)}`", "add the error type to the function's `!` clause")
             }
         } else {
-            err(c, prog.s(p, e), prog.e(p, e), "`try` used in a function that declares no error type")
+            err_help(c, prog.s(p, e), prog.e(p, e), "`try` used in a function that declares no error type", "add `! ErrorType` to the function signature, or handle with `match`")
         }
         return t.a[r]
     }
     if t.k[r] == tys.K_ERROR {
         return tys.ERROR
     }
-    err(c, prog.s(p, e), prog.e(p, e), "`try` applied to a value that cannot fail (`{tys.show(t, r)}`)")
+    err_help(c, prog.s(p, e), prog.e(p, e), "`try` applied to a value that cannot fail (`{tys.show_shallow(t, r)}`)", "remove the `try`")
 }
 
 /// Is error type `e` acceptable where `declared` is the function's?
