@@ -74,7 +74,7 @@ if ! "$FRONT" tir "$canary" >"$WORK/c.tir" 2>"$WORK/c.log" ||
     sed 's/^/  /' "$WORK/c.log" | head -10
     exit 1
 fi
-if ! grep -q '^grasm ' "$WORK/c.names" || grep -q '^rust ' "$WORK/c.names"; then
+if ! grep -c '^grasm ' "$WORK/c.names" >/dev/null || grep -c '^rust ' "$WORK/c.names" >/dev/null; then
     echo "error: $canary, linked by the stage, did not take its runtime names from the stage's runtime alone"
     exit 1
 fi
