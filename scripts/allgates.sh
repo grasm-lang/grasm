@@ -162,6 +162,8 @@ run_gate tirdiff       scripts/tirdiff.sh
 run_gate tirrefuse     scripts/tirrefuse.sh
 run_gate frontsmoke    scripts/frontsmoke.sh
 run_gate tircontrols   scripts/tircontrols.sh
+run_gate diagdiff      scripts/diagdiff.sh
+run_gate diagcontrols  scripts/diagcontrols.sh
 run_gate reprotest     scripts/reprotest.sh
 run_gate inctest       python3 scripts/inctest.py
 run_gate brokertest    scripts/broker_test.sh

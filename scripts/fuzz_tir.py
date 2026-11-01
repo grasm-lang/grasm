@@ -25,8 +25,13 @@ that skips is not a pass (`FUZZ_TIR_SKIP=<engine>` plants exactly that, for
 the controls).
 
     scripts/fuzz_tir.py [--programs N] [--seed S] [--keep DIR]
+    scripts/fuzz_tir.py --emit DIR [--programs N] [--seed S]
 
-`GRASM=` names the Rust compiler; `FRONT=` a built frontend.
+`--emit` writes the programs (a package tree for the package engines) and
+the path of each program's entry file, one a line, to `DIR/entries`, and
+runs nothing, for `scripts/diagdiff.sh`; `make_program` is the generation,
+for `scripts/fuzz_diag.py`. `GRASM=` names the Rust compiler; `FRONT=` a
+built frontend.
 """
 
 import argparse
@@ -206,12 +211,63 @@ def build_front(work):
     return front
 
 
+def make_program(engs, i, rng, work, rate=0.45, tree_rate=0.3, which=None):
+    """Program `i`, by engine `which` (by default the `i`th in turn): (engine
+    name, entry path, the edit made or None, source), or (engine name, None,
+    why, "") when the generator failed. A tree on disk has its entry edited
+    in place, sometimes; a single file is written to `work`. Draws from `rng`
+    exactly as the gate always has."""
+    name, make = engs[i % len(engs) if which is None else which]
+    prng = random.Random(rng.randrange(1 << 60))
+    try:
+        if name in ("rows-package", "modules"):
+            src = make(prng, i, work)
+        else:
+            src = make(prng, i)
+    except Exception as e:  # noqa: BLE001 -- a generator bug is reported, not hidden
+        return name, None, f"the generator failed: {type(e).__name__}: {e}", ""
+    kind = None
+    if isinstance(src, dict):
+        path = src["entry"]
+        with open(path) as f:
+            src = f.read()
+        if prng.random() < tree_rate:
+            kind, src = mutate(prng, src)
+            if kind:
+                with open(path, "w") as f:
+                    f.write(src)
+    else:
+        if prng.random() < rate:
+            kind, src = mutate(prng, src)
+        path = os.path.join(work, f"p{i}.gr")
+        with open(path, "w") as f:
+            f.write(src)
+    return name, path, kind, src
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--programs", type=int, default=700)
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--keep", default=None)
+    ap.add_argument("--emit", default=None)
     args = ap.parse_args()
+
+    if args.emit:
+        os.makedirs(args.emit, exist_ok=True)
+        engs = engines()
+        rng = random.Random(args.seed)
+        made = 0
+        with open(os.path.join(args.emit, "entries"), "w") as out:
+            for i in range(args.programs):
+                name, path, kind, _ = make_program(engs, i, rng, args.emit)
+                if path is None:
+                    print(f"error: engine `{name}`, program {i}: {kind}")
+                    return 1
+                out.write(path + "\n")
+                made += 1
+        print(f"emitted: {made}")
+        return 0
 
     work = tempfile.mkdtemp(prefix="fuzz_tir_")
     try:
@@ -223,40 +279,17 @@ def main():
                         "mutants": 0} for name, _ in engs}
         failures = []
         for i in range(args.programs):
-            name, make = engs[i % len(engs)]
+            name = engs[i % len(engs)][0]
             if skip and name == skip:
                 continue
-            prng = random.Random(rng.randrange(1 << 60))
-            try:
-                if name in ("rows-package", "modules"):
-                    src = make(prng, i, work)
-                else:
-                    src = make(prng, i)
-            except Exception as e:  # noqa: BLE001 -- a generator bug is reported, not hidden
-                failures.append((name, i, f"the generator failed: {type(e).__name__}: {e}", ""))
+            name, path, kind, src = make_program(engs, i, rng, work)
+            if path is None:
+                failures.append((name, i, kind, ""))
                 continue
             st = stats[name]
             st["made"] += 1
-            kind = None
-            if isinstance(src, dict):
-                # A tree on disk: the entry is mutated in place, sometimes.
-                path = src["entry"]
-                with open(path) as f:
-                    src = f.read()
-                if prng.random() < 0.3:
-                    kind, src = mutate(prng, src)
-                    if kind:
-                        st["mutants"] += 1
-                        with open(path, "w") as f:
-                            f.write(src)
-            else:
-                if prng.random() < 0.45:
-                    kind, src = mutate(prng, src)
-                    if kind:
-                        st["mutants"] += 1
-                path = os.path.join(work, f"p{i}.gr")
-                with open(path, "w") as f:
-                    f.write(src)
+            if kind:
+                st["mutants"] += 1
             rc, rout, rerr = run([GRASM, "tir", path])
             gc, gout, gerr = run([front, "tir", path])
             if rc is None or gc is None:
