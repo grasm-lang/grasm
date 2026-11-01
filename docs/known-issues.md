@@ -5,29 +5,22 @@ Every defect that is known and not fixed, with its severity from
 to paste. S1 and S2 block a release; S3 and S4 do not, and this file is what
 makes shipping them honest rather than quiet.
 
-**Open S1: one, a `parallel` block's task recursing past its thread's
-stack natively (SIGBUS, not the panic); one under investigation. Open S2:
-one, a `bytes` window written to a socket sending its whole buffer. Open
-S3: four, a block whose value is a map literal and a statement `if` whose
-branches' values differ, refused natively; `udp_send` to a name whose first
-address is IPv6; the Rust runtime's leak check miscounting a task's or a
-`par_filter` worker's boxes. Open S4: three, a nested interpolation's spans,
-a backslash at the end of a file, and a thread running every `par_map`
-after its first spread one alone. Latent: one, the Rust runtime's region
-sweep, which no compiled program reaches.**
+**Open S1: none confirmed; one under investigation. Open S2: none. Open
+S3: two, a block whose value is a map literal and a statement `if` whose
+branches' values differ, refused natively. Open S4: two, a nested
+interpolation's spans and a backslash at the end of a file. Latent: one,
+the Rust runtime's region sweep, which no compiled program reaches.**
 
 ## Found on 2026-10-28 by S5 part four (the rest of the runtime, in Grasm)
 
-Each was found while holding the Grasm runtime to the Rust one and is in
-code S5 replaces; none is fixed in the Rust tree, which a program built with
-the Grasm runtime alone no longer links. Each but the last can be seen by a
-program, so the Grasm runtime keeping the Rust behaviour is a choice the
-owner makes: it keeps it today, for the first four, so the two stay
-comparable; the last it does not.
+Each was found while holding the Grasm runtime to the Rust one. The Grasm
+runtime kept the first four meanwhile, so the two stayed comparable, and
+did the last right. All five were fixed in both runtimes on 2026-10-31, and
+fixing the fourth uncovered a sixth, recorded last.
 
 **A `bytes` window written to a socket sends the whole buffer it shares, not
-the window -- *open, S2, in the Rust runtime's `grasm_tcp_write_bytes` and
-`grasm_udp_send`*.**
+the window -- *closed, S2, in the Rust runtime's `grasm_tcp_write_bytes`
+and `grasm_udp_send`*.**
 
 ```
 fn main() / {io, net} {
@@ -44,12 +37,14 @@ Prints `0x010203040506`, six bytes for a value two long; `grasm run` and
 [L-LIB-NET] say `0x0102`. Both functions send `b.owner` -- the `Arc` of the
 buffer every window of it shares -- where every other reader of a `bytes`
 value reads `as_slice()`, the window. `udp_send` does the same with a
-datagram. The Grasm runtime (`compiler/rt/src/net.gr`, `owner_bytes`) sends
-what the Rust runtime sends, and `scripts/fuzz_rtsys.sh` sends windows so
-the two are held together on it.
+datagram. Closed 2026-10-31: both send the window (`as_slice()`, and
+`window_bytes` in `compiler/rt/src/net.gr`); the reproducer prints `0x0102`
+natively on both runtimes, and a cli test holds a TCP write and a datagram
+to it. Two bytes too many would have put on the wire whatever else the
+buffer held.
 
 **`udp_send` to a host name answers `Invalid argument` when the name's first
-address is IPv6 -- *open, S3, in `grasm_sys::net::resolve`*.**
+address is IPv6 -- *closed, S3, in `grasm_sys::net::resolve`*.**
 
 ```
 fn main() / {io, net} {
@@ -64,12 +59,16 @@ send fails `IoFailed(Invalid argument)`. `udp_bind` binds IPv4
 (`0.0.0.0`), and `udp_send` resolves the destination with a stream hint and
 takes the first answer, which on macOS is `::1` for `localhost`; an IPv4
 socket cannot send to it. `tcp_connect` tries every address (`connect_to`);
-`udp_send` tries one. Kept in the Grasm runtime.
+`udp_send` tries one. Closed 2026-10-31: `udp_send` sends to the name's
+first IPv4 address (`grasm_sys::net::resolve_for`, and the same choice in
+the interpreter and `compiler/rt/src/net.gr`), or its first address when it
+has none; the reproducer prints `1` natively on both runtimes and under
+`grasm run`.
 
 **A `parallel` block's tasks run on threads with the system's 512 KiB stack,
 below the recursion floor's 6 MiB, so a deep recursion in one ends in SIGBUS
-rather than the panic [E-RECURSION-DEPTH] promises -- *open, S1, in the Rust
-runtime's `par_words`*.**
+rather than the panic [E-RECURSION-DEPTH] promises -- *closed, S1, in the
+Rust runtime's `par_words`*.**
 
 ```
 fn deep(n: i64) -> i64 {
@@ -91,22 +90,29 @@ A native build exits 138 with nothing on standard error; `grasm run` ends
 `panic: stack overflow: recursion too deep`, exit 101. A `par_map`'s
 workers get 8 MiB (`WORKER_STACK`, the fix [E-RECURSION-PARALLEL] records);
 the tasks of a `parallel` block of independent tasks are started with
-`scope.spawn`, which asks for no size. Kept in the Grasm runtime
-(`compiler/rt/src/par.gr`, which starts them with the system's stack too).
+`scope.spawn`, which asks for no size. Closed 2026-10-31: each task starts
+on a worker's 8 MiB stack in both runtimes (a task that cannot start is a
+panic, as `scope.spawn`'s failure was), and its allocations are handed back
+when it ends. `deep(300000)` in a task now prints `300000 3`, as on the
+main thread; `deep(30000000)` ends in the panic, exit 101, on both
+runtimes, where it was SIGBUS.
 
 **After its first spread `par_map` or `par_filter`, a thread runs every
-later one on itself alone -- *open, S4, performance, in the Rust runtime's
-`par_words`*.** The calling thread takes chunks too, through the same
+later one on itself alone -- *closed, S4, performance, in the Rust
+runtime's `par_words`*.** The calling thread takes chunks too, through the same
 `drain` the workers run, which marks the thread as inside a parallel region
 (`IN_PARALLEL`) and never unmarks it; `workers_for` then answers 1 on that
 thread for good. A program mapping 400 costly elements three times took 74
 ms the first time and 388 ms each time after on the Rust runtime (once, at a
 load average of 33, on an 8-core machine). The answers are the same either
-way. Kept in the Grasm runtime, so the two are timed alike.
+way. Closed 2026-10-31: the calling thread is unmarked when its share is
+done, in `par_words` and `par_filter` and in `compiler/rt/src/par.gr`. The
+same program, at a load of 12: 67, 397 and 388 ms before; 71, 77 and 75 ms
+after, and 79, 84 and 86 ms on the Grasm runtime.
 
 **The leak check counts a box a `parallel` block's task made, or a
 `par_filter` worker made, as never made, so a task's string freed by `main`
-is a leak of minus one -- *open, S3, in the Rust runtime's leak check*.**
+is a leak of minus one -- *closed, S3, in the Rust runtime's leak check*.**
 
 ```
 fn word(n: i64) -> str {
@@ -131,8 +137,23 @@ allocation(s) still live at exit`, exit 7. A `par_map`'s workers hand their
 counts to the process when they end (`hand_back_live`); a task's thread and
 a `par_filter`'s workers do not. The Grasm runtime counts every thread's
 boxes when the thread ends, whatever started it (`compiler/rt/src/alloc.gr`),
-and ends `leak check: nothing live at exit`, exit 0: here the two differ,
-and the Rust side is wrong.
+and ends `leak check: nothing live at exit`, exit 0: here the two differed,
+and the Rust side was wrong. Closed 2026-10-31: a task's thread and a
+`par_filter` worker hand their counts back as a `par_map` worker does; the
+reproducer ends `leak check: nothing live at exit` on the Rust runtime too.
+
+**Every worker thread left 144 bytes behind on the Rust runtime -- *closed,
+S3, in `grasm_sys::tls`*.** Found on 2026-10-31 by the fix above: with
+every spread `par_map` starting its workers again, `fuzz_rtrelease`'s Rust
+build leaked 960 blocks where it had leaked 16, and `leaks` put them in the
+worker threads, one of 16 bytes and one of 128 per thread. A thread-local's
+destructor dropped the value but kept its box, as the way to say the value
+was gone, since POSIX may call the destructor again and does not tell it
+the key. The box now holds its key: the destructor sets the key to a marker
+that is not an address, which repeat calls and later `try_with`s read as
+gone, and frees the box. Three spread `par_map`s left 48 blocks, 3,456
+bytes; now none, and `fuzz_rtrelease` requires that neither runtime leaks a
+block with workers.
 
 ## Found on 2026-10-27 by S5 part three (the runtime's state, in Grasm)
 

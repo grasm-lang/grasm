@@ -238,14 +238,13 @@ pub mod tls {
         pub fn try_with<R>(&self, f: impl FnOnce(&T) -> R) -> Result<R, Gone> {
             let k = self.key();
             let at = unsafe { pthread_getspecific(k) } as *mut Slot<T>;
+            if at as *const u8 == GONE {
+                return Err(Gone);
+            }
             if !at.is_null() {
                 // Safety: made by this thread, and only this thread reaches
                 // it.
-                let slot = unsafe { &*at };
-                if slot.alive {
-                    return Ok(f(&slot.value));
-                }
-                return Err(Gone);
+                return Ok(f(unsafe { &(*at).value }));
             }
             self.first_touch(f)
         }
@@ -256,54 +255,57 @@ pub mod tls {
         fn first_touch<R>(&self, f: impl FnOnce(&T) -> R) -> Result<R, Gone> {
             let k = self.key();
             let mut at = unsafe { pthread_getspecific(k) } as *mut Slot<T>;
+            if at as *const u8 == GONE {
+                return Err(Gone);
+            }
             if at.is_null() {
                 at = Box::into_raw(Box::new(Slot {
-                    alive: true,
+                    key: k,
                     value: core::mem::ManuallyDrop::new((self.init)()),
                 }));
                 unsafe { pthread_setspecific(k, at as *const u8) };
             }
             // Safety: just made or previously made by this thread, and only
             // this thread can reach it.
-            let slot = unsafe { &*at };
-            if !slot.alive {
-                return Err(Gone);
-            }
-            Ok(f(&slot.value))
+            Ok(f(unsafe { &(*at).value }))
         }
     }
 
-    /// The value plus whether it is still there. The flag has to live beside
-    /// the value rather than in the descriptor, because the destructor below
-    /// is handed the value and not the key, so it has nowhere else to record
-    /// that it ran.
+    /// The value, and the key it is stored under: the destructor below is
+    /// handed the value and not the key, and it needs the key to say the
+    /// value is gone.
     #[cfg(not(target_arch = "wasm32"))]
     struct Slot<T> {
-        alive: bool,
+        key: Key,
         value: core::mem::ManuallyDrop<T>,
     }
 
+    /// What a key holds once its thread's value has been dropped: not null,
+    /// so that `try_with` answers `Gone` rather than making a value nothing
+    /// would free, and not an address, so that nothing is kept for it.
+    #[cfg(not(target_arch = "wasm32"))]
+    const GONE: *const u8 = 1 as *const u8;
+
     /// Run by pthreads when a thread that used this key ends.
     ///
-    /// The `Slot` is deliberately **not** freed. POSIX re-runs this
-    /// destructor while the key's value stays non-null -- up to
-    /// `PTHREAD_DESTRUCTOR_ITERATIONS`, four in practice -- and the
-    /// destructor is not given the key, so it cannot clear it. Freeing the
-    /// box would therefore hand the next call a dangling pointer. Keeping it
-    /// and flipping `alive` makes the repeat calls harmless and lets
-    /// `try_with` report the value as gone. The cost is one small box per
-    /// thread that touched this key, which is bounded by the number of
-    /// threads; the value's own allocations are released here as usual.
+    /// POSIX clears the key before calling this, and calls it again, up to
+    /// `PTHREAD_DESTRUCTOR_ITERATIONS` times, while the key holds anything
+    /// non-null. So the key is set to `GONE` first -- the repeat calls see it
+    /// and return, and a destructor running after this one is told the value
+    /// is gone -- and then the value and its box are freed.
+    ///
+    /// Until 2026-10-31 the box was kept, with a flag in it, as the way to say
+    /// gone: 144 bytes for every worker thread that ended. Three `par_map`s
+    /// spread over eight workers each left 48 blocks, 3,456 bytes, by `leaks`;
+    /// now none.
     #[cfg(not(target_arch = "wasm32"))]
     unsafe extern "C" fn drop_in_place<T>(at: *mut u8) {
-        if at.is_null() {
+        if at.is_null() || at as *const u8 == GONE {
             return;
         }
-        let slot = &mut *(at as *mut Slot<T>);
-        if slot.alive {
-            slot.alive = false;
-            core::mem::ManuallyDrop::drop(&mut slot.value);
-        }
+        let mut slot = Box::from_raw(at as *mut Slot<T>);
+        pthread_setspecific(slot.key, GONE);
+        core::mem::ManuallyDrop::drop(&mut slot.value);
     }
 }
 
@@ -1553,6 +1555,17 @@ pub mod net {
             return Err(Error::from_raw_os_error(crate::io::ENOENT));
         }
         Ok(out)
+    }
+
+    /// The first address of `family` that `host` resolves to, or the first
+    /// of any family when it has none: an address a socket of that family can
+    /// send to. `resolve` takes the first answer, which for `localhost` on
+    /// macOS is `::1`, and a datagram socket bound to `0.0.0.0` that is given
+    /// it fails `EINVAL`.
+    pub fn resolve_for(host: &str, port: u16, family: i32) -> Result<Addr> {
+        let all = resolve_all(host, port)?;
+        let i = all.iter().position(|a| a.family == family).unwrap_or(0);
+        Ok(all.into_iter().nth(i).expect("resolve_all answers at least one"))
     }
 
     pub fn resolve(host: &str, port: u16) -> Result<Addr> {

@@ -58,6 +58,7 @@ let SOL_SOCKET = 65535
 let SO_REUSEADDR = 4
 let IPPROTO_TCP = 6
 let TCP_NODELAY = 1
+let AF_INET = 2
 let AF_INET6 = 30
 
 let POLLIN = 1
@@ -1588,15 +1589,13 @@ fn send_all(fd: i64, p: addr, n: i64) -> i64 {
     0
 }
 
-/// The whole buffer a `bytes` value shares, not only its window: what the
-/// Rust runtime sends (`b.owner.clone()`), and so what this sends
-/// (docs/known-issues.md).
-fn owner_bytes(v: addr, inout n: i64) -> addr {
+/// A `bytes` value's window, its length in `n`: what a write or a datagram
+/// sends. Not the buffer every window of it shares, which both runtimes sent
+/// until 2026-10-31 (docs/known-issues.md).
+fn window_bytes(v: addr, inout n: i64) -> addr {
     unsafe {
-        let arc = v.offset(layout.BYTES_OWNER).load_addr()
-        let vec = arc.offset(layout.ARC_DATA)
-        n = vec.offset(layout.VEC_LEN).load_i64()
-        vec.offset(layout.VEC_PTR).load_addr()
+        n = v.offset(layout.BYTES_LEN).load_i64()
+        v.offset(layout.BYTES_PTR).load_addr()
     }
 }
 
@@ -1632,7 +1631,7 @@ fn tcp_write_bytes_now(handle: addr, data: addr) -> addr {
         return unsafe { sysv.failed(mem_static("tcp_write_bytes needs bytes"), mem_static_len("tcp_write_bytes needs bytes")) }
     }
     var n = 0
-    let p = owner_bytes(data, n)
+    let p = window_bytes(data, n)
     tcp_write_on(h, p, n)
 }
 
@@ -1782,7 +1781,7 @@ fn udp_send_now(handle: addr, host: addr, port: addr, data: addr) -> addr {
         return unsafe { sysv.failed(mem_static("udp_send takes bytes"), mem_static_len("udp_send takes bytes")) }
     }
     var dn = 0
-    let dp = owner_bytes(data, dn)
+    let dp = window_bytes(data, dn)
     let s = socket_get(h)
     if sysv.null(s) {
         return not_open(h)
@@ -1791,10 +1790,34 @@ fn udp_send_now(handle: addr, host: addr, port: addr, data: addr) -> addr {
         sock_drop(s)
         return unsafe { socket_says(h, mem_static(" is not a datagram socket"), mem_static_len(" is not a datagram socket")) }
     }
-    let recs = sys.alloc(8)
+    // The host's first IPv4 address, or its first of any family when it has
+    // none (`resolve_for`): `udp_bind` binds `0.0.0.0`, and the first answer
+    // for `localhost` is `::1`, which an IPv4 socket cannot send to.
+    let room = 64
+    let recs = sys.alloc(8 * room)
+    var i = 0
+    while i < room {
+        unsafe { recs.offset(8 * i).store_addr(addr_new()) }
+        i += 1
+    }
+    let found = resolve(hp, hn, p, true, recs, room)
+    var pick = 0
+    var k = found - 1
+    while k >= 0 {
+        if unsafe { recs.offset(8 * k).load_addr().offset(A_FAMILY).load_i64() } == AF_INET {
+            pick = k
+        }
+        k -= 1
+    }
     let a = addr_new()
-    unsafe { recs.store_addr(a) }
-    let found = resolve(hp, hn, p, false, recs, 1)
+    if found > 0 {
+        sys.copy(a, unsafe { recs.offset(8 * pick).load_addr() }, A_SIZE)
+    }
+    i = 0
+    while i < room {
+        sys.dealloc(unsafe { recs.offset(8 * i).load_addr() })
+        i += 1
+    }
     sys.dealloc(recs)
     if found < 0 {
         sys.dealloc(a)

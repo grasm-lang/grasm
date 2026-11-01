@@ -1261,7 +1261,18 @@ impl<'a, W: Write> Interp<'a, W> {
             return fail("udp_send takes bytes".to_string());
         };
         match self.sockets.get(*h as usize).and_then(Option::as_ref) {
-            Some(NetSocket::Datagram(d)) => match d.send_to(payload, (host, *port as u16)) {
+            // The host's first address of the socket's family: given
+            // `(host, port)`, `send_to` takes the first address of any, which
+            // for `localhost` on macOS is `::1`, and an IPv4 socket fails it.
+            Some(NetSocket::Datagram(d)) => match std::net::ToSocketAddrs::to_socket_addrs(&(host, *port as u16))
+                .and_then(|all| {
+                    let v4 = d.local_addr().map(|a| a.is_ipv4()).unwrap_or(true);
+                    let all: Vec<std::net::SocketAddr> = all.collect();
+                    let to = all.iter().find(|a| a.is_ipv4() == v4).or(all.first()).copied();
+                    to.ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound))
+                })
+                .and_then(|to| d.send_to(payload, to))
+            {
                 Ok(n) => Value::Ok(Rc::new(Value::Int(n as i64))),
                 Err(e) => fail(e.to_string()),
             },

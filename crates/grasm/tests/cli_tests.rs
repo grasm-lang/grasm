@@ -3170,6 +3170,125 @@ fn main() {
     assert_eq!(String::from_utf8_lossy(&got.stdout).trim(), want, "native");
 }
 
+/// Builds `src` (written under `name`) natively and runs it with the leak
+/// check on: its exit code, standard output and standard error.
+fn native_run(name: &str, src: &str) -> (i32, String, String) {
+    let w = Work::new(name);
+    let file = w.0.join("main.gr");
+    let out = w.0.join("app");
+    std::fs::write(&file, src).unwrap();
+    let (code, msg) = run(&[
+        "build",
+        file.to_str().unwrap(),
+        "--native",
+        "-o",
+        out.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "{msg}");
+    let got = Command::new(&out)
+        .env("GRASM_LEAK_CHECK", "1")
+        .output()
+        .expect("runs");
+    (
+        got.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&got.stdout).into_owned(),
+        String::from_utf8_lossy(&got.stderr).into_owned(),
+    )
+}
+
+/// A `bytes` window written to a socket sends the window: the Rust runtime
+/// sent the whole buffer every window of it shares, six bytes for a value
+/// two long, by TCP and by UDP alike.
+#[test]
+fn a_bytes_window_written_to_a_socket_is_the_window() {
+    let src = r#"fn main() / {io, net} {
+    let l = tcp_listen(0) ?? -1
+    let c = tcp_connect("127.0.0.1", net_port(l) ?? 0) ?? -1
+    let s = tcp_accept(l) ?? -1
+    let b = bytes_of([1, 2, 3, 4, 5, 6])
+    let _ = tcp_write_bytes(c, b.slice(0, 2)) ?? ()
+    print("{tcp_read_bytes(s) ?? bytes_of([])}")
+    let u = udp_bind(0) ?? -1
+    let v = udp_bind(0) ?? -1
+    let _ = udp_send(u, "127.0.0.1", net_port(v) ?? 0, b.slice(3, 5)) ?? -1
+    print("{udp_recv(v) ?? bytes_of([])}")
+}
+"#;
+    let (code, out, err) = native_run("byteswindow", src);
+    assert_eq!((code, out.trim()), (0, "0x0102\n0x0405"), "{err}");
+}
+
+/// `udp_send` to a name whose first address is IPv6 sends to its first IPv4
+/// one: `udp_bind` binds `0.0.0.0`, and `localhost` answers `::1` first.
+#[test]
+fn udp_send_to_localhost_reaches_an_ipv4_socket() {
+    let src = r#"fn main() / {io, net} {
+    let u = udp_bind(0) ?? -1
+    let p = net_port(u) ?? 0
+    print("{udp_send(u, "localhost", p, bytes_of([1])) ?? -1}")
+}
+"#;
+    let (code, out, err) = native_run("udplocal", src);
+    assert_eq!((code, out.trim()), (0, "1"), "{err}");
+    let w = Work::new("udplocalrun");
+    let file = w.0.join("main.gr");
+    std::fs::write(&file, src).unwrap();
+    let (code, text) = run(&["run", file.to_str().unwrap()]);
+    assert_eq!((code, text.trim()), (0, "1"), "grasm run");
+}
+
+/// A `parallel` block's task runs on a worker's stack, so a recursion too
+/// deep ends in the panic [E-RECURSION-DEPTH] promises; on the system's
+/// 512 KiB it ended in SIGBUS with nothing said.
+#[test]
+fn a_parallel_task_recursing_too_deep_panics() {
+    let src = r#"fn deep(n: i64) -> i64 {
+    if n <= 0 { 0 } else { deep(n - 1) + 1 }
+}
+
+fn main() / {io, async} {
+    var x = 0
+    var y = 0
+    parallel {
+        spawn { x = deep(30000000) }
+        spawn { y = deep(3) }
+    }
+    print("{x} {y}")
+}
+"#;
+    let (code, _, err) = native_run("pardeep", src);
+    assert_eq!(code, 101, "{err}");
+    assert!(
+        err.starts_with("panic: stack overflow: recursion too deep"),
+        "{err}"
+    );
+}
+
+/// What a `parallel` block's tasks allocate is counted when their threads
+/// end, so a task's string freed by `main` is not a leak of minus one.
+#[test]
+fn a_parallel_tasks_allocations_balance_in_the_leak_check() {
+    let src = r#"fn word(n: i64) -> str {
+    var s = ""
+    for i in 0..n { s = s + "ab" }
+    s
+}
+
+fn main() / {io, async} {
+    var a = ""
+    var b = ""
+    parallel {
+        spawn { a = word(30) }
+        spawn { b = word(40) }
+    }
+    print("{a.len()} {b.len()}")
+}
+"#;
+    let (code, out, err) = native_run("taskleak", src);
+    assert_eq!((code, out.trim()), (0, "60 80"), "{err}");
+    assert!(err.contains("leak check: nothing live at exit"), "{err}");
+}
+
 /// A task of an outer `concurrent` block woken while a nested block is the
 /// one scheduling stays woken: the nested block takes only its own wake-ups.
 /// The interpreter used to clear the outer block's and report a deadlock;

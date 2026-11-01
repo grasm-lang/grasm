@@ -18,12 +18,13 @@
 // from the last chunk to the first, and the calling thread taking them too,
 // so a worker that cannot start costs time and never an element. A
 // `parallel` block's tasks (`par_tasks_next`) each get a thread at once,
-// with the system's stack.
+// with a worker's stack too, and a task that cannot start is a panic.
 //
-// As the Rust runtime does, a thread that has run a parallel region's work
-// stays marked as inside one (`IN_PARALLEL`) -- the calling thread too, once
-// it has taken chunks -- and a `par_map` reached from a thread so marked runs
-// its elements one after another (docs/known-issues.md). What each thread
+// A thread running a parallel region's work is marked as inside one
+// (`IN_PARALLEL`), and a `par_map` reached from it runs its elements one
+// after another; the calling thread is unmarked when its share is done.
+// Until 2026-10-31 it stayed marked, here as in the Rust runtime, and ran
+// every later `par_map` alone (docs/known-issues.md). What each thread
 // allocated is its allocator's business (`alloc.gr`), handed to the process
 // when the thread ends, before `pthread_join` returns.
 import layout
@@ -203,6 +204,9 @@ fn spread(code: addr, env: addr, input: addr, nin: i64, out: addr, filter: bool,
         w += 1
     }
     drain(job)
+    // Not inside a region before (else `workers_for` answered 1), and not
+    // after.
+    unsafe { mem_tls(IN_PARALLEL).store_i64(0) }
     join_all(handles, started)
     sys.dealloc(handles)
     sys.dealloc(job)
@@ -227,7 +231,9 @@ fn par_words(words: addr, n: i64, code: addr, env: addr) -> addr {
     let next = unsafe { mem_tls(TASKS_NEXT).load_i64() } != 0
     unsafe { mem_tls(TASKS_NEXT).store_i64(0) }
     if next and n >= 2 and not in_parallel() {
-        // A `parallel` block's tasks: a thread each, with the system's stack.
+        // A `parallel` block's tasks: a thread each, on a worker's stack --
+        // the system's 512 KiB is below the recursion floor, and a deep
+        // recursion in a task ended in SIGBUS rather than the panic.
         let recs = sys.alloc(T_SIZE * n)
         let handles = sys.alloc(8 * n)
         var started = 0
@@ -239,9 +245,10 @@ fn par_words(words: addr, n: i64, code: addr, env: addr) -> addr {
                 t.offset(T_ENV).store_addr(env)
                 t.offset(T_X).store_i64(words.offset(8 * i).load_i64())
                 t.offset(T_OUT).store_addr(out.offset(8 * i))
-                if spawn(mem_fn_addr(task_entry), t, 0, handles.offset(8 * started)) {
-                    started += 1
+                if not spawn(mem_fn_addr(task_entry), t, WORKER_STACK, handles.offset(8 * started)) {
+                    panic.say(mem_static("parallel: cannot start a task"), mem_static_len("parallel: cannot start a task"))
                 }
+                started += 1
             }
             i += 1
         }

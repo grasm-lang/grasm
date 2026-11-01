@@ -4088,13 +4088,22 @@ unsafe fn par_words(
         // One scoped thread per task, each writing its own slot, so the
         // result is the one any order would give -- the checker proved the
         // tasks independent and effect-free.
+        // Each on a worker's stack: the system's 512 KiB is below the
+        // recursion floor, so a deep recursion in a task ended in SIGBUS
+        // rather than the panic [E-RECURSION-DEPTH] promises.
         crate::thread::scope(|scope| {
             for (o, &x) in out.iter_mut().zip(words.iter()) {
                 let env_ref = env_owned;
-                scope.spawn(move || {
-                    IN_PARALLEL.with(|f| f.set(true));
-                    *o = code(env_ref.as_ptr(), x);
-                });
+                let spawned = crate::thread::Builder::new()
+                    .stack_size(WORKER_STACK)
+                    .spawn_scoped(scope, move || {
+                        IN_PARALLEL.with(|f| f.set(true));
+                        *o = code(env_ref.as_ptr(), x);
+                        hand_back_live();
+                    });
+                if spawned.is_err() {
+                    rt_panic("parallel: cannot start a task");
+                }
             }
         });
         return out;
@@ -4157,6 +4166,10 @@ unsafe fn par_words(
             }
             drain();
         });
+        // This thread was not inside a parallel region before (else
+        // `workers_for` would have answered 1), and it is not after: left
+        // set, every later `par_map` on it ran alone.
+        IN_PARALLEL.with(|f| f.set(false));
     }
     out
 }
@@ -4607,10 +4620,15 @@ pub unsafe extern "C" fn grasm_par_filter_scalar(
                 // correctness.
                 let _ = crate::thread::Builder::new()
                     .stack_size(WORKER_STACK)
-                    .spawn_scoped(scope, drain);
+                    .spawn_scoped(scope, move || {
+                        drain();
+                        hand_back_live();
+                    });
             }
             drain();
         });
+        // As in `par_words`.
+        IN_PARALLEL.with(|f| f.set(false));
     }
 
     // Ordered compaction: this is what makes the result core-count independent.
@@ -9437,7 +9455,9 @@ unsafe fn grasm_tcp_write_bytes_now(handle: *mut RtVal, data: *mut RtVal) -> *mu
             "tcp_write_bytes needs bytes".to_string(),
         ));
     };
-    let payload = payload.owner.clone();
+    // The window, not `owner`: every window of a buffer shares it, and
+    // sending it whole put bytes on the wire the value does not hold.
+    let payload = payload.as_slice();
     let wrote = socket_with(h, |s| match s {
         // Unbuffered, so there is nothing to flush after the write: `send`
         // has already handed the bytes to the kernel.
@@ -9855,12 +9875,15 @@ unsafe fn grasm_udp_send_now(
         return err_of(io_err("IoFailed", format!("port {port} is out of range")));
     }
     let host = as_str(host).to_string();
+    // The window, as `tcp_write_bytes` sends it.
     let payload = match &(*data).payload {
-        RtPayload::Bytes(b) => b.owner.clone(),
+        RtPayload::Bytes(b) => b.as_slice(),
         _ => return err_of(io_err("IoFailed", "udp_send takes bytes".to_string())),
     };
     let sent = socket_with(h, |s| match s {
-        Socket::Datagram(d) => crate::net::resolve(host.as_str(), port as u16)
+        // `udp_bind` binds `0.0.0.0`, so the destination is the host's first
+        // IPv4 address rather than its first address.
+        Socket::Datagram(d) => crate::net::resolve_for(host.as_str(), port as u16, crate::net::AF_INET)
             .and_then(|to| d.send_to(&payload, &to))
             .map(|n| n as i64)
             .map_err(|e| e.to_string()),

@@ -2275,8 +2275,10 @@ and every way a replay stops worded the same. `open`'s mode and `fcntl`'s
 argument are variadic in C, and arm64 macOS passes a variadic argument on
 the stack: the runtime declares each with eight register parameters and
 the variadic one ninth, which the backend now passes in the first stack
-slot (below). What Rust behaviour this part found wrong and kept, and the
-one it did not keep, is in docs/known-issues.md ("Found on 2026-10-28").
+slot (below). What Rust behaviour this part found wrong is in
+docs/known-issues.md ("Found on 2026-10-28"): it kept four of the five
+defects so the runtimes stayed comparable, and all five were fixed in both
+runtimes on 2026-10-31, with a sixth the fixes uncovered.
 
 **Step three: the parallel workers** (`par.gr`): `par_map` and
 `par_filter` timed on their first element and spread over the cores when
@@ -2669,8 +2671,9 @@ Measured, not estimated; each line is a gate's result on master.
   (`fuzz_rtout`, `fuzz_rtsys`, `fuzz_rtpar`) identical on every seed,
   `fuzz_rtrelease` leak-free with workers; `rtcontrols` 78 of 78 planted
   faults caught. Five Rust runtime defects found and recorded in
-  docs/known-issues.md, the Grasm runtime keeping four for now so the two
-  stay comparable, and the backend gained three changes (§6.12). The
+  docs/known-issues.md, fixed in both runtimes on 2026-10-31 together with
+  a sixth that fixing them uncovered, and the backend gained three changes
+  (§6.12). The
   benchmarks, measured once at a load of 2.4 to 2.6 on 8 cores: every
   program passes, `fib`, `sieve` and `matmul` within 9% of the Rust
   runtime, `tree` 1.86x, `wordfreq` 3.38x and `sort` 3.92x slower.

@@ -19,17 +19,13 @@
 #     `par_map`'s workers, and neither may leak a block: a buffer the walk
 #     forgets to free is a leak there, while the box counts above would not
 #     see it. A buffer freed twice is `malloc` stopping the program, which
-#     the first check sees. With the workers, the Rust runtime leaks a small
-#     block per worker thread for each of its thread-locals the thread
-#     touched, on purpose (`grasm_sys::tls`, whose destructor keeps it) --
-#     in both builds, since its worker code runs in both -- and `leaks`, which
-#     scans memory for pointers, does not see every one of them every run
-#     (13 to 16 of the 16 here, over eight runs of the same seed). So there
-#     one seed's Grasm build may leak only blocks of the sizes its Rust build
-#     leaks, and of each size no more than there are workers (`hw.ncpu`, how
-#     many `par_map` starts): what this runtime keeps per thread it frees
-#     when the thread ends, and a block of its own left behind would be
-#     another size or one too many;
+#     the first check sees. With `par_map`'s workers, neither may leak a
+#     block either. Until 2026-10-31 the Rust runtime left one per worker
+#     thread for each of its thread-locals the thread touched
+#     (`grasm_sys::tls`, whose destructor kept the box), and this gate let the
+#     Grasm build leak only blocks of those sizes, no more than one per worker
+#     each; the destructor frees it now, and what the Grasm runtime keeps per
+#     thread it frees when the thread ends;
 #   * a few seeds are run on both builds linked with the poisoned runtime
 #     (`scripts/rtswap.sh`'s), which keeps every freed box out of circulation
 #     with a count no live box holds: they must agree, and neither may report
@@ -150,21 +146,16 @@ if [ "$LEAKRUNS" -gt 0 ]; then
     grasm_n=$n
     workers=$(sysctl -n hw.ncpu)
     rust_sizes=$(sort -un "$WORK/f.sizes" | tr '\n' ' ')
-    worker_leaks="$grasm_n blocks against the Rust build's $rust_n, of sizes ${rust_sizes% }, $workers workers"
-    if [ "$grasm_n" != "$(wc -l <"$WORK/f.swap.sizes" | tr -d ' ')" ]; then
+    worker_leaks="$grasm_n blocks, and the Rust build's $rust_n, $workers workers"
+    if [ "$rust_n" != 0 ]; then
         leaky=$((leaky + 1))
-        echo "FAIL: f.swap seed 1 with par_map's workers: leaks reported $grasm_n blocks and listed $(wc -l <"$WORK/f.swap.sizes" | tr -d ' ')"
+        echo "FAIL: f seed 1 with par_map's workers: the Rust build leaked $rust_n blocks, of sizes ${rust_sizes% }"
     fi
-    for size in $(sort -un "$WORK/f.swap.sizes"); do
-        count=$(grep -cx "$size" "$WORK/f.swap.sizes")
-        if ! grep -qx "$size" "$WORK/f.sizes"; then
-            leaky=$((leaky + 1))
-            echo "FAIL: f.swap seed 1 with par_map's workers: $count leaked blocks of $size bytes, a size the Rust build does not leak"
-        elif [ "$count" -gt "$workers" ]; then
-            leaky=$((leaky + 1))
-            echo "FAIL: f.swap seed 1 with par_map's workers: $count leaked blocks of $size bytes, more than its $workers workers"
-        fi
-    done
+    if [ "$grasm_n" != 0 ]; then
+        leaky=$((leaky + 1))
+        echo "FAIL: f.swap seed 1 with par_map's workers: the Grasm build leaked $grasm_n blocks, of sizes $(sort -un "$WORK/f.swap.sizes" | tr '
+' ' ')"
+    fi
 fi
 
 p_same=0
