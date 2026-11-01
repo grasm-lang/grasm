@@ -19,10 +19,71 @@ This is a test-harness technique and belongs nowhere near what `grasm` emits
 for a user. It leans on macOS not re-deciding about a file it has already
 admitted; if a future release decides otherwise, the gates get slower and stay
 correct, which is the right way round for that risk to fall.
+
+It does decide otherwise, some of the time. Measured 2026-11-02: two small
+programs swapped into one file this way, each run once after each swap, were
+killed by SIGKILL on 0 to 39 of 40 runs depending on the file -- the kernel
+keeping the old program's code signature for the inode -- and never printed
+anything wrong; the same swaps through a new inode each time were killed on 0
+of 130. In the fuzzers that was one program in a few hundred, read for weeks
+as "killed under load". So a run of a file written over in place (here, or by
+`s3engine`, through `reused`) that ends by SIGKILL is run once more from a
+fresh inode: the ~250ms tax for that one program, and the program's own
+answer -- one that really is killed is killed again.
 """
 
 import os
+import signal
 import subprocess
+import sys
+
+
+def _state():
+    """The files written over in place, and `subprocess.run` as it was.
+
+    Kept on `subprocess` itself, not here, because each gate loads this file
+    as a fresh module (and `s3engine` loads it again): one process, one set,
+    one wrapper.
+    """
+    st = getattr(subprocess, "_grasm_inplace", None)
+    if st is None:
+        st = {"reused": set(), "run": subprocess.run, "reruns": 0}
+        subprocess._grasm_inplace = st
+        subprocess.run = _rerun_if_killed
+    return st
+
+
+def reused(path):
+    """Records that `path` was just written over in place."""
+    _state()["reused"].add(os.path.realpath(path))
+
+
+def _rerun_if_killed(*args, **kwargs):
+    st = _state()
+    p = st["run"](*args, **kwargs)
+    if p.returncode != -signal.SIGKILL:
+        return p
+    cmd = args[0] if args else kwargs.get("args")
+    exe = cmd[0] if isinstance(cmd, (list, tuple)) and cmd else None
+    if not isinstance(exe, str):
+        return p
+    path = os.path.realpath(os.path.join(kwargs.get("cwd") or ".", exe))
+    if path not in st["reused"]:
+        return p
+    st["reused"].discard(path)
+    stage = path + ".fresh"
+    with open(path, "rb") as f:
+        data = f.read()
+    with open(stage, "wb") as f:
+        f.write(data)
+    os.chmod(stage, os.stat(path).st_mode & 0o777)
+    os.replace(stage, path)
+    st["reruns"] += 1
+    print(f"inplace: {exe} was killed by SIGKILL; run again from a fresh inode", file=sys.stderr)
+    return st["run"](*args, **kwargs)
+
+
+_state()
 
 
 def build(grasm, src, out, *extra, timeout=120, env=None):
@@ -51,6 +112,7 @@ def build(grasm, src, out, *extra, timeout=120, env=None):
             f.truncate(0)
             f.write(data)
         os.remove(stage)
+        reused(out)
     else:
         os.replace(stage, out)
     return p

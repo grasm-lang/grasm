@@ -37,11 +37,16 @@ it; `FRONT=` a frontend to make the TIR with in place of `grasm tir`
 (`compiler/front`'s `front tir`; `scripts/withstage.sh`, §6.14).
 """
 
+import importlib.util as _ilu
 import os
 import re
 import subprocess
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+_spec = _ilu.spec_from_file_location("inplace", os.path.join(os.path.dirname(os.path.abspath(__file__)), "inplace.py"))
+_inplace = _ilu.module_from_spec(_spec)
+_spec.loader.exec_module(_inplace)
 
 
 def _run(cmd, timeout, env=None, stdin=None, cwd=None):
@@ -139,6 +144,7 @@ class Engine:
                 f.truncate(0)
                 f.write(data)
             os.remove(stage)
+            _inplace.reused(self.exe)
         else:
             os.replace(stage, self.exe)
         return None
